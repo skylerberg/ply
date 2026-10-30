@@ -4,11 +4,12 @@
 //! working directory as `cwd`, the filesystem's root as `abs`, and the shipped modules as `shipped`.
 
 import compiler.load (Derives)
-import std.process (process, Captured, captured, args_step, out_step, err_step, exit_step, Stdout)
+import std.process (process, FakeProcess, captured, args_step, out_step, err_step, exit_step,
+                    Stdout)
 import units
 import units (emit, Emits)
 import compiler.cc (compilers, toolchain)
-import appends
+import update_costs
 import std.fs (fs, Dir, Missing)
 import std.json (Json, Str, Bool, Number, object, to_string)
 import std.net (net)
@@ -18,13 +19,13 @@ import std.list
 import args
 import std.cli
 import args (Flags, style_of)
-import std.cli (Help, Parsed, Refused, Run, Version, help, parse, refusal_text, value, version_line)
+import std.cli (Help, Parsed, Failed, Run, Version, help, parse, error_text, value, version_line)
 import std.env (env)
 import compiler.unit (shipped)
 import paths
 import surface
 import surface (spec)
-import report (Answer, compile_error, ok_code, reported, schema_version)
+import report (CommandOutput, compile_error, ok_code, reported, schema_version)
 import std.term (Style, red, term, Always, Auto, Never, decide, styles)
 import attest
 import bootstrap
@@ -74,11 +75,11 @@ import semantics (semantics, caching)
 
 /// `ply run` writes its own disclosures to stderr here rather than in its answer: they are about an
 /// entry that has not run yet, and the answer is collected after it has.
-fn answer_of(
+fn run_command(
   command: String,
   flags: Flags,
   parsed: Parsed,
-) -> Answer / {semantics.cached, shipped.answer, builder.git[vcs], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, shipped.version, shipped.names, shipped.module, shipped.definitions, replace::edit.item[replace], machine::Entering, shipped.runtime, builder.loaded[build], fs.remove[abs], fs.rename[abs], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.working_directory, env.variables, emit.unit, emit.compiled, toolchain.reused, appends::priced.report, literals::literal.verdicts, literals::literal.statements, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, toolchain.bodies, Derives, abort.raise, diverges, shipped.reached} =
+) -> CommandOutput / {semantics.cached, shipped.read_pack, builder.git[vcs], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, shipped.version, shipped.names, shipped.module, shipped.definitions, replace::edit.replacement_text[replace], machine::MachineAccess, shipped.runtime, builder.loaded[build], fs.remove[abs], fs.rename[abs], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.working_directory, env.variables, emit.unit, emit.compiled, toolchain.reuse_dir, update_costs::cost_checker.report, literals::evaluation.verdicts, literals::evaluation.statements, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, toolchain.bodies_dir, Derives, abort.raise, diverges, shipped.report_reached} =
   match command {
     "bootstrap" -> if flags.identity { bootstrap::identity() }
     else { bootstrap::run(flags, surface::profile_of(parsed)) },
@@ -87,7 +88,7 @@ fn answer_of(
     "cache" -> cache::run(flags),
     "callers" -> callers::run(flags),
     "check" -> check::run(flags),
-    "defs" -> defs::run(flags, spelled(parsed)),
+    "defs" -> defs::run(flags, canonical_words(parsed)),
     "hash" -> hashes::run(flags),
     "doc" -> doc::run(flags),
     "explain" -> explain::run(flags),
@@ -106,18 +107,18 @@ fn answer_of(
     "review" -> review::run(flags, claims::options_from(parsed)),
     "run" -> run::run(flags, machine::options_from(parsed)),
     "show" -> show::run(flags),
-    "std" -> if flags.answering { stdlib::answering() } else {
+    "std" -> if flags.answering { stdlib::results_identity() } else {
       match flags.out {
         Some(dir) ->
-          stdlib::answers(
+          stdlib::pack_shipped_results(
             if dir.starts_with("/") { dir } else { env.working_directory() ++ "/" ++ dir },
-            toolchain.reused(),
+            toolchain.reuse_dir(),
             env.variable("PLY_C_PHASES") != None,
           ),
         None -> stdlib::run(flags),
       }
     },
-    "test" -> run_tests::run(flags, tester::options_from(parsed), Some(spelled(parsed))),
+    "test" -> run_tests::run(flags, tester::options_from(parsed), Some(canonical_words(parsed))),
     "fmt" -> fmt::run(flags),
     "rename" -> rename::run(flags),
     _ -> panic("the parser refused the word first; `std.cli` owns this refusal"),
@@ -125,11 +126,11 @@ fn answer_of(
 
 /// `--workspace`: the command run for every package the path reaches by a path dependency, each as
 /// its own root, and then for the path itself.
-fn across(
+fn run_workspace(
   command: String,
   flags: Flags,
   parsed: Parsed,
-) -> Answer / {semantics.cached, shipped.answer, builder.git[vcs], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, shipped.version, shipped.names, shipped.module, shipped.definitions, replace::edit.item[replace], machine::Entering, shipped.runtime, builder.loaded[build], fs.remove[abs], fs.rename[abs], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.working_directory, env.variables, time.elapsed_us, emit.unit, emit.compiled, toolchain.reused, appends::priced.report, literals::literal.verdicts, literals::literal.statements, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, toolchain.bodies, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {semantics.cached, shipped.read_pack, builder.git[vcs], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, shipped.version, shipped.names, shipped.module, shipped.definitions, replace::edit.replacement_text[replace], machine::MachineAccess, shipped.runtime, builder.loaded[build], fs.remove[abs], fs.rename[abs], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.working_directory, env.variables, time.elapsed_us, emit.unit, emit.compiled, toolchain.reuse_dir, update_costs::cost_checker.report, literals::evaluation.verdicts, literals::evaluation.statements, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, toolchain.bodies_dir, Derives, abort.raise, diverges, shipped.report_reached} = {
   let deps = workspace::path_packages(sources::load_resolved(flags.paths)).map(|dir: String| {
     let r = paths::resolve(dir);
     { display: r.display, flags: { ..flags, paths: [r], root: r.display, workspace: false } }
@@ -141,9 +142,9 @@ fn across(
       None -> acc,
       Some(p) -> {
         print_lines(workspace::heading(args::style_of(flags), i, p.display));
-        let answer = answer_of(command, p.flags, parsed);
+        let answer = run_command(command, p.flags, parsed);
         if !flags.json { print_lines(answer.lines) };
-        acc.push({ display: p.display, answer: answer })
+        acc.push({ display: p.display, result: answer })
       },
     });
   workspace::combined(command, runs)
@@ -192,22 +193,22 @@ fn print_lines(lines: List<String>) -> Unit / {process.out[proc]} =
     },
   }
 
-fn complain(lines: List<String>) -> Unit / {process.err[proc]} =
+fn print_error_lines(lines: List<String>) -> Unit / {process.err[proc]} =
   match lines {
     [] -> (),
     [first, ..rest] -> {
       process.err[proc](first);
-      complain(rest)
+      print_error_lines(rest)
     },
   }
 
-fn said(
-  answer: Answer,
+fn print_output(
+  answer: CommandOutput,
   flags: Flags,
 ) -> Unit / {process.out[proc], process.err[proc], abort.raise} =
   if flags.json { process.out[proc](to_string(answer.json)) } else {
     print_lines(answer.lines);
-    complain(answer.errs)
+    print_error_lines(answer.errs)
   }
 
 /// What `body` prints as it runs, such as each test's result, goes to the output stream, or under
@@ -224,22 +225,22 @@ fn with_progress<a | e>(
 fn poll_ms() -> Int = 120
 
 /// One blank line between reports, which a stream of documents must not carry.
-fn parted(flags: Flags) -> Unit / {process.out[proc]} =
+fn print_separator(flags: Flags) -> Unit / {process.out[proc]} =
   if flags.json { () } else { process.out[proc]("") }
 
 /// `--watch`, which never returns: a report, then another one whenever the tree moves. The baseline
 /// is stamped before a run and never after — a walk after it folds a save made while it ran into
 /// the baseline, and that save is the one the next report exists to notice.
-fn watching(
+fn watch(
   flags: Flags,
   options: tester::Options,
   checkout: Option<library::Checkout>,
-) -> Int / {semantics.cached, shipped.answer, shipped.names, shipped.module, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, process.out[proc], process.err[proc], time.sleep_ms, fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variable, env.working_directory, machine::Entering, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, appends::priced.report, literals::literal.verdicts, literals::literal.statements, toolchain.bodies, Derives, abort.raise, diverges, shipped.reached, toolchain.reused} = {
+) -> Int / {semantics.cached, shipped.read_pack, shipped.names, shipped.module, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, process.out[proc], process.err[proc], time.sleep_ms, fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variable, env.working_directory, machine::MachineAccess, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, update_costs::cost_checker.report, literals::evaluation.verdicts, literals::evaluation.statements, toolchain.bodies_dir, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} = {
   let baseline = stamps_of(flags, checkout);
-  let first = library::reading(checkout, ||
-    with_progress(flags, || run_tests::iterated(flags, options, None, None)));
-  said(first.answer, flags);
-  watched(flags, options, checkout, baseline, first.held, first.embeds)
+  let first = library::with_checkout_library(checkout, ||
+    with_progress(flags, || run_tests::run_once(flags, options, None, None)));
+  print_output(first.result, flags);
+  watch_loop(flags, options, checkout, baseline, first.held, first.embeds)
 }
 
 /// What a watch compares between reports: the paths it was given, and the toolchain's library the
@@ -249,50 +250,50 @@ type Stamps = { own: Option<List<String>>, library: Option<List<String>> }
 fn stamps_of(
   flags: Flags,
   checkout: Option<library::Checkout>,
-) -> Stamps / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.resolved[cwd], fs.resolved[abs], env.working_directory, abort.raise, diverges} =
+) -> Stamps / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], env.working_directory, abort.raise, diverges} =
   {
-    own: run_tests::stamped(flags.paths),
+    own: run_tests::file_stamps(flags.paths),
     library: match checkout {
       None -> Some([]),
       Some(c) ->
-        run_tests::stamped(library::parts_of(c).map(|p: library::Part| paths::resolve(p.dir))),
+        run_tests::file_stamps(library::parts_of(c).map(|p: library::Part| paths::resolve(p.dir))),
     },
   }
 
 /// A walk that failed reports `None`, and two of those are not a tree that held still: the report
 /// is owed again, and it is the run that says what is wrong with the tree.
-fn moved(now: Option<List<String>>, baseline: Option<List<String>>) -> Bool =
+fn changed(now: Option<List<String>>, baseline: Option<List<String>>) -> Bool =
   match now {
     None -> true,
     Some(now) -> match baseline { None -> true, Some(baseline) -> now != baseline },
   }
 
 /// A file the last report's load embedded is not in the walk: it moved when it reads otherwise now.
-fn watched(
+fn watch_loop(
   flags: Flags,
   options: tester::Options,
   checkout: Option<library::Checkout>,
   baseline: Stamps,
-  held: Option<program::Timed>,
+  held: Option<program::TimedLoad>,
   embeds: List<Embed>,
-) -> Int / {semantics.cached, shipped.answer, shipped.names, shipped.module, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, process.out[proc], process.err[proc], time.sleep_ms, fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variable, env.working_directory, machine::Entering, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, appends::priced.report, literals::literal.verdicts, literals::literal.statements, toolchain.bodies, Derives, abort.raise, diverges, shipped.reached, toolchain.reused} = {
+) -> Int / {semantics.cached, shipped.read_pack, shipped.names, shipped.module, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, process.out[proc], process.err[proc], time.sleep_ms, fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variable, env.working_directory, machine::MachineAccess, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, update_costs::cost_checker.report, literals::evaluation.verdicts, literals::evaluation.statements, toolchain.bodies_dir, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} = {
   time.sleep_ms(poll_ms());
   let now = stamps_of(flags, checkout);
   // A load the library moved under answers nothing a later one may take back.
-  let library_moved = moved(now.library, baseline.library);
-  if moved(now.own, baseline.own) || library_moved || sources::embeds_moved(embeds) {
-    parted(flags);
-    let next = library::reading(checkout, ||
+  let library_moved = changed(now.library, baseline.library);
+  if changed(now.own, baseline.own) || library_moved || sources::embeds_changed(embeds) {
+    print_separator(flags);
+    let next = library::with_checkout_library(checkout, ||
       with_progress(flags, ||
-        run_tests::iterated(flags, options, if library_moved { None } else { held }, None)));
-    said(next.answer, flags);
-    watched(flags, options, checkout, now, next.held, next.embeds)
-  } else { watched(flags, options, checkout, baseline, held, embeds) }
+        run_tests::run_once(flags, options, if library_moved { None } else { held }, None)));
+    print_output(next.result, flags);
+    watch_loop(flags, options, checkout, now, next.held, next.embeds)
+  } else { watch_loop(flags, options, checkout, baseline, held, embeds) }
 }
 
 /// A parsed line as one list of words: the command, each flag with its value, the positionals and
 /// what followed `--`, so two lines that parse alike spell alike.
-fn spelled(p: Parsed) -> List<String> =
+fn canonical_words(p: Parsed) -> List<String> =
   p.path.concat(
     p.flags.flat_map(|g: cli::Given|
       match g.value { Some(v) -> ["--" ++ g.long, v], None -> ["--" ++ g.long] }),
@@ -305,7 +306,7 @@ fn spelled(p: Parsed) -> List<String> =
 fn dispatch(
   parsed: Parsed,
   styled: Bool,
-) -> Int / {semantics.cached, shipped.answer, builder.git[vcs], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, time.sleep_ms, env.variable, shipped.version, env.working_directory, shipped.names, shipped.module, shipped.definitions, replace::edit.item[replace], machine::Entering, shipped.runtime, builder.loaded[build], fs.remove[abs], fs.rename[abs], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variables, emit.unit, emit.compiled, toolchain.reused, appends::priced.report, literals::literal.verdicts, literals::literal.statements, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, toolchain.bodies, Derives, abort.raise, diverges, shipped.reached} = {
+) -> Int / {semantics.cached, shipped.read_pack, builder.git[vcs], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, time.sleep_ms, env.variable, shipped.version, env.working_directory, shipped.names, shipped.module, shipped.definitions, replace::edit.replacement_text[replace], machine::MachineAccess, shipped.runtime, builder.loaded[build], fs.remove[abs], fs.rename[abs], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variables, emit.unit, emit.compiled, toolchain.reuse_dir, update_costs::cost_checker.report, literals::evaluation.verdicts, literals::evaluation.statements, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, toolchain.bodies_dir, Derives, abort.raise, diverges, shipped.report_reached} = {
   let command = parsed.path.at_or(0, "");
   let resolved = paths::resolve_all(command, parsed);
   let at = match resolved {
@@ -313,27 +314,27 @@ fn dispatch(
     Err(pwd) -> pwd,
   };
   // A load inside the checkout that builds `ply` reads that checkout's library, not this `ply`'s.
-  let checkout = if paths::loads(command) { library::checkout_holding(at) } else { None };
+  let checkout = if paths::loads(command) { library::enclosing_checkout(at) } else { None };
   match resolved {
     // No package to load: a name may still be a builtin's or a shipped module's.
     Err(pwd) ->
-      library::reading(checkout, || {
+      library::with_checkout_library(checkout, || {
         let flags: Flags = args::from_parsed(parsed, styled, ".", []);
         let nowhere = sources::no_package(pwd);
-        let answer: Answer = if command == "doc" { doc::unrooted(flags, nowhere) }
+        let answer: CommandOutput = if command == "doc" { doc::without_project(flags, nowhere) }
         else { reported(style_of(flags), command, [nowhere], []) };
-        said(answer, flags);
+        print_output(answer, flags);
         answer.code
       }),
     Ok(resolved) -> {
       let display = match resolved.at(0) { Some(r) -> r.display, None -> "." };
       let flags: Flags = args::from_parsed(parsed, styled, display, resolved);
-      if flags.watch { watching(flags, tester::options_from(parsed), checkout) } else {
-        library::reading(checkout, || {
-          let answer: Answer = with_progress(flags, ||
-            if flags.workspace { across(command, flags, parsed) }
-            else { answer_of(command, flags, parsed) });
-          said(answer, flags);
+      if flags.watch { watch(flags, tester::options_from(parsed), checkout) } else {
+        library::with_checkout_library(checkout, || {
+          let answer: CommandOutput = with_progress(flags, ||
+            if flags.workspace { run_workspace(command, flags, parsed) }
+            else { run_command(command, flags, parsed) });
+          print_output(answer, flags);
           answer.code
         })
       }
@@ -344,7 +345,7 @@ fn dispatch(
 /// The whole line is the program's to read now: the surface is `surface.ply`'s declaration of it,
 /// and a refusal is the parser's shape — the error, the usage, and the way to help. Help and
 /// version print and exit 0; a refusal never runs a command.
-pub fn main() -> Unit / {shipped.answer, process.bound[git], process.spawn[git], process.line[proc], process.args[proc], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, time.sleep_ms, env.variable, term.is_terminal, shipped.version, env.working_directory, shipped.names, shipped.module, shipped.runtime, toolchain.bodies, shipped.binary_bytes, process.exit[proc], fs.remove[abs], fs.rename[abs], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variables, Emits, toolchain.reused, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, abort.raise, diverges, shipped.reached, shipped.entered, shipped.digests, machine::Entering} = {
+pub fn main() -> Unit / {shipped.read_pack, process.bound[git], process.spawn[git], process.line[proc], process.args[proc], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, time.sleep_ms, env.variable, term.is_terminal, shipped.version, env.working_directory, shipped.names, shipped.module, shipped.runtime, toolchain.bodies_dir, shipped.binary_size, process.exit[proc], fs.remove[abs], fs.rename[abs], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, entropy.secret, time.now_ms, env.variables, Emits, toolchain.reuse_dir, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, abort.raise, diverges, shipped.report_reached, shipped.run_root, shipped.digests, machine::MachineAccess} = {
   let argv = process.args[proc]();
   let line = spec(shipped.version());
   match parse(line, argv) {
@@ -356,19 +357,19 @@ pub fn main() -> Unit / {shipped.answer, process.bound[git], process.spawn[git],
       process.out[proc](version_line(line));
       process.exit[proc](ok_code())
     },
-    Refused(refusal) -> {
-      complain([refusal_text(line, refusal)]);
+    Failed(refusal) -> {
+      print_error_lines([error_text(line, refusal)]);
       process.exit[proc](compile_error())
     },
     Run(parsed) -> {
       let styled = styled_output(value(parsed, "color"));
       process.exit[proc](
         units::emitting(||
-          appends::pricing(||
-            literals::settling(||
+          update_costs::with_cost_cache(||
+            literals::with_evaluation_cache(||
               vcs::fetching(||
-                replace::reading(||
-                  build::reading_back(|| caching(|| dispatch(parsed, styled)))))))),
+                replace::with_replacement(||
+                  build::with_read_back(|| caching(|| dispatch(parsed, styled)))))))),
       )
     },
   }
@@ -395,7 +396,7 @@ fn styled_output(choice: Option<String>) -> Bool / {env.variable, term.is_termin
 // --- Tests ------------------------------------------------------------------
 
 /// The lines a run wrote and the code it asked to exit with, over a program that touches no tree.
-fn explained(argv: List<String>) -> Captured / {abort.raise, diverges} =
+fn run_captured(argv: List<String>) -> FakeProcess / {abort.raise, diverges} =
   handle {
     main()
   } with {
@@ -414,38 +415,39 @@ fn explained(argv: List<String>) -> Captured / {abort.raise, diverges} =
     term.is_terminal(stream) -> false,
     shipped.version() -> "0.0.0-test",
     env.working_directory() -> "/w",
-    toolchain.reused() -> panic("`ply explain` reuses no answer"),
-    toolchain.bodies() -> panic("`ply explain` emits nothing"),
+    toolchain.reuse_dir() -> panic("`ply explain` reuses no answer"),
+    toolchain.bodies_dir() -> panic("`ply explain` emits nothing"),
     shipped.runtime() -> panic("`ply explain` emits nothing"),
     shipped.definitions() -> panic("`ply explain` emits nothing"),
     shipped.names() -> panic("`ply explain` emits nothing"),
     shipped.module(name) -> panic("`ply explain` emits nothing"),
-    shipped.answer(path, offset, len) -> panic("`ply explain` loads nothing"),
-    shipped.reached(view, pulled) -> panic("`ply explain` loads nothing"),
-    shipped.entered(library, root, arguments, timeout_ms) -> panic("`ply explain` runs no deriver"),
+    shipped.read_pack(path, offset, len) -> panic("`ply explain` loads nothing"),
+    shipped.report_reached(view, pulled) -> panic("`ply explain` loads nothing"),
+    shipped.run_root(library, root, arguments, timeout_ms) ->
+      panic("`ply explain` runs no deriver"),
     shipped.digests() -> panic("`ply explain` runs no deriver"),
-    compilers.found[cc]() -> panic("`ply explain` compiles nothing"),
-    compilers.started[cc](args) -> panic("`ply explain` compiles nothing"),
-    compilers.finished[cc](job) -> panic("`ply explain` compiles nothing"),
-    compilers.found[tcc]() -> panic("`ply explain` compiles nothing"),
-    compilers.started[tcc](args) -> panic("`ply explain` compiles nothing"),
-    compilers.finished[tcc](job) -> panic("`ply explain` compiles nothing"),
+    compilers.find[cc]() -> panic("`ply explain` compiles nothing"),
+    compilers.start[cc](args) -> panic("`ply explain` compiles nothing"),
+    compilers.wait[cc](job) -> panic("`ply explain` compiles nothing"),
+    compilers.find[tcc]() -> panic("`ply explain` compiles nothing"),
+    compilers.start[tcc](args) -> panic("`ply explain` compiles nothing"),
+    compilers.wait[tcc](job) -> panic("`ply explain` compiles nothing"),
     toolchain.cache() -> panic("`ply explain` compiles nothing"),
     toolchain.jobs() -> panic("`ply explain` compiles nothing"),
-    toolchain.holds(path) -> panic("`ply explain` compiles nothing"),
-    toolchain.held(path) -> panic("`ply explain` compiles nothing"),
-    toolchain.written(path, bytes) -> panic("`ply explain` compiles nothing"),
-    toolchain.moved(from, to) -> panic("`ply explain` compiles nothing"),
-    toolchain.appended(path, bytes) -> panic("`ply explain` compiles nothing"),
-    toolchain.scratch() -> panic("`ply explain` compiles nothing"),
-    toolchain.cleared(dir) -> panic("`ply explain` compiles nothing"),
+    toolchain.exists(path) -> panic("`ply explain` compiles nothing"),
+    toolchain.read_file(path) -> panic("`ply explain` compiles nothing"),
+    toolchain.write_file(path, bytes) -> panic("`ply explain` compiles nothing"),
+    toolchain.rename(from, to) -> panic("`ply explain` compiles nothing"),
+    toolchain.append(path, bytes) -> panic("`ply explain` compiles nothing"),
+    toolchain.temp_dir() -> panic("`ply explain` compiles nothing"),
+    toolchain.remove_tree(dir) -> panic("`ply explain` compiles nothing"),
     toolchain.libraries() -> panic("`ply explain` compiles nothing"),
-    toolchain.ran(path, args) -> panic("`ply explain` runs nothing it built"),
+    toolchain.run(path, args) -> panic("`ply explain` runs nothing it built"),
     fs.kind[cwd](p) -> panic("`ply explain` reaches no tree"),
     fs.kind[abs](p) -> panic("`ply explain` reaches no tree"),
-    fs.resolved[cwd](p) -> Dir,
+    fs.resolved_kind[cwd](p) -> Dir,
     // No directory holds a `ply.pkg`: the working directory is part of no package.
-    fs.resolved[abs](p) -> Missing,
+    fs.resolved_kind[abs](p) -> Missing,
     fs.list_dir[cwd](p) -> panic("`ply explain` reaches no tree"),
     fs.list_dir[abs](p) -> panic("`ply explain` reaches no tree"),
     fs.read_file[cwd](p) -> panic("`ply explain` reaches no tree"),
@@ -533,14 +535,14 @@ fn explained(argv: List<String>) -> Captured / {abort.raise, diverges} =
     time.elapsed_us() -> 0,
     time.sleep_ms(ms) -> panic("`ply explain` waits for nothing"),
     process.line[proc]() -> panic("`ply explain` reads no replacement"),
-    shipped.binary_bytes() -> None,
+    shipped.binary_size() -> None,
     process.bound[git]() -> panic("`ply explain` fetches nothing"),
     process.spawn[git](args, dir, vars) -> panic("`ply explain` fetches nothing"),
     entering::machine.open(library) -> panic("`ply explain` opens no unit"),
     entering::machine.bind(grants) -> panic("`ply explain` binds no host"),
     entering::machine.hosting(grants) -> panic("`ply explain` binds no host"),
     entering::machine.enter(unit, root, arguments, run) -> panic("`ply explain` runs no program"),
-    entering::machine.moved(grants, trace) -> panic("`ply explain` reads no pass"),
+    entering::machine.changed_read(grants, trace) -> panic("`ply explain` reads no pass"),
     entering::machine.unbind(binding) -> panic("`ply explain` binds no host"),
     entering::machine.close(unit) -> panic("`ply explain` opens no unit"),
     return u -> io,
@@ -551,35 +553,38 @@ test "a walk that failed is not a tree that held still" {
   let same: Option<List<String>> = Some(["m.ply 1 2"]);
   let other: Option<List<String>> = Some(["m.ply 9 2"]);
   let unread: Option<List<String>> = None;
-  assert(!moved(one, same));
-  assert(moved(other, one));
+  assert(!changed(one, same));
+  assert(changed(other, one));
   // Both ends unread: equal values, and still owed a report.
-  assert(moved(unread, unread));
-  assert(moved(unread, one));
-  assert(moved(one, unread));
+  assert(changed(unread, unread));
+  assert(changed(unread, one));
+  assert(changed(one, unread));
 }
 
 test "the command word picks the command, and its code is the run's" {
-  let one = explained(["explain", "E0302"]);
+  let one = run_captured(["explain", "E0302"]);
   assert_eq(one.out, ["E0302 effect not permitted by the written row"]);
   assert_eq(one.err, []);
   assert_eq(one.code, Some(0))
 }
 
 test "a line that names no path where no package holds the working directory loads nothing" {
-  let nowhere = explained(["check"]);
+  let nowhere = run_captured(["check"]);
   assert_eq(nowhere.out, []);
   assert_eq(nowhere.code, Some(2));
-  let said = match nowhere.err.at(0) { Some(l) -> l, None -> "" };
-  assert(said.contains("no `ply.pkg` in `/w` or any directory above it"), Some(said));
+  let print_output = match nowhere.err.at(0) { Some(l) -> l, None -> "" };
+  assert(
+    print_output.contains("no `ply.pkg` in `/w` or any directory above it"),
+    Some(print_output),
+  );
   // A native is no project's, so its page needs none.
-  let builtin = explained(["doc", "List::len"]);
+  let builtin = run_captured(["doc", "List::len"]);
   assert_eq(builtin.code, Some(0));
   assert(builtin.out.len() > 0)
 }
 
 test "a command that refuses writes to the error stream and exits 2" {
-  let bad = explained(["explain", "E9999"]);
+  let bad = run_captured(["explain", "E9999"]);
   assert_eq(bad.out, []);
   assert_eq(bad.err.len(), 1);
   assert_eq(bad.code, Some(2))
@@ -587,7 +592,7 @@ test "a command that refuses writes to the error stream and exits 2" {
 
 // The keys come back in byte order, `code` before `command`, so the document is read and not matched.
 test "`--json` writes one document on the output stream and nothing else" {
-  let json = explained(["explain", "E0302", "--json"]);
+  let json = run_captured(["explain", "E0302", "--json"]);
   assert_eq(json.out.len(), 1);
   assert_eq(json.err, []);
   let text = match json.out.at(0) { Some(l) -> l, None -> "" };
@@ -598,13 +603,13 @@ test "`--json` writes one document on the output stream and nothing else" {
 }
 
 test "a word that is no command is refused, never run as `ply fmt`" {
-  let answer = explained(["frobnicate"]);
+  let answer = run_captured(["frobnicate"]);
   // Nothing on the output stream: `fmt` would have written the files it rewrote.
   assert_eq(answer.out, []);
   assert_eq(answer.code, Some(2));
-  let said = match answer.err.at(0) { Some(l) -> l, None -> "" };
-  assert(said.contains("frobnicate"));
-  assert(said.contains("unrecognized subcommand"))
+  let print_output = match answer.err.at(0) { Some(l) -> l, None -> "" };
+  assert(print_output.contains("frobnicate"));
+  assert(print_output.contains("unrecognized subcommand"))
 }
 
 test "every command the dispatch answers is one `commands` lists" {
@@ -623,22 +628,22 @@ test "every command the dispatch answers is one `commands` lists" {
 }
 
 test "a flag no command reads is refused, never taken as a path" {
-  let answer = explained(["check", "--frobnicate", "m.ply"]);
+  let answer = run_captured(["check", "--frobnicate", "m.ply"]);
   assert_eq(answer.out, []);
   assert_eq(answer.code, Some(2));
-  let said = match answer.err.at(0) { Some(l) -> l, None -> "" };
-  assert(said.contains("--frobnicate"));
-  assert(said.contains("unexpected argument"))
+  let print_output = match answer.err.at(0) { Some(l) -> l, None -> "" };
+  assert(print_output.contains("--frobnicate"));
+  assert(print_output.contains("unexpected argument"))
 }
 
 test "a global flag may stand before the command word" {
   // `ply --color never explain E0302` names `explain`, not `--color`.
-  let led = explained(["--color", "never", "explain", "E0302"]);
+  let led = run_captured(["--color", "never", "explain", "E0302"]);
   assert_eq(led.code, Some(0));
-  let plain = explained(["explain", "E0302"]);
+  let plain = run_captured(["explain", "E0302"]);
   assert_eq(led.out, plain.out);
   // A flag's value is skipped with it: `never` is not mistaken for the command.
-  let fused = explained(["--color=never", "explain", "E0302"]);
+  let fused = run_captured(["--color=never", "explain", "E0302"]);
   assert_eq(fused.out, plain.out)
 }
 
@@ -676,15 +681,15 @@ test "the environment decides colour as its conventions say, and a flag outranks
 }
 
 test "a line with no word that is not a flag names no command" {
-  let only_flags = explained(["--json", "--color", "never"]);
+  let only_flags = run_captured(["--json", "--color", "never"]);
   assert_eq(only_flags.out, []);
   assert_eq(only_flags.code, Some(2))
 }
 
 test "no command word at all is a refusal, and nothing is written" {
-  let empty = explained([]);
+  let empty = run_captured([]);
   assert_eq(empty.out, []);
-  let said = match empty.err.at(0) { Some(l) -> l, None -> "" };
-  assert(said.contains("requires a subcommand"));
+  let print_output = match empty.err.at(0) { Some(l) -> l, None -> "" };
+  assert(print_output.contains("requires a subcommand"));
   assert_eq(empty.code, Some(2))
 }

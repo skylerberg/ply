@@ -21,7 +21,7 @@ fn archive(name: String) -> Bytes / {abort.raise} =
     [] -> panic(f"no archive {name}"),
   }
 
-fn roomy() -> Limits = { entries: 100, total: 1000000, size: 1000000, path: 4096 }
+fn large_limits() -> Limits = { entries: 100, total: 1000000, size: 1000000, path: 4096 }
 
 /// A member as one line: what it is, its mode in decimal, who owns it, its size, the second it
 /// was modified at, its path, and its link.
@@ -31,39 +31,41 @@ fn line(m: Member) -> String = {
   f"{h.kind} {h.mode} {h.uid}:{h.gid} {h.uname}:{h.gname} {m.size} {seconds} {h.path} {h.link}"
 }
 
-fn lines(name: String) -> List<String> / {tar.refused, abort.raise} =
-  tar::members(archive(name), roomy()).map(line)
+fn lines(name: String) -> List<String> / {tar.fail, abort.raise} =
+  tar::members(archive(name), large_limits()).map(line)
 
 /// What a driver finds that is handed an archive `chunk` bytes at a time and asks `step` again
 /// as more arrives, never holding a member's data.
-fn fed(
+fn read_incrementally(
   whole: Bytes,
   chunk: Int,
   seen: Int,
   at: Cursor,
   found: List<String>,
   budget: Int,
-) -> List<String> / {tar.refused, abort.raise} =
+) -> List<String> / {tar.fail, abort.raise} =
   if budget <= 0 { found } else {
-    match tar::step(whole.slice(0, seen), at, roomy()) {
+    match tar::step(whole.slice(0, seen), at, large_limits()) {
       tar::End -> found,
-      tar::More(_) -> if seen >= whole.len() { found }
-      else { fed(whole, chunk, min(seen + chunk, whole.len()), at, found, budget - 1) },
-      tar::Next(m) -> fed(whole, chunk, seen, m.next, found.push(m.header.path), budget - 1),
+      tar::NeedMore(_) -> if seen >= whole.len() { found } else {
+        read_incrementally(whole, chunk, min(seen + chunk, whole.len()), at, found, budget - 1)
+      },
+      tar::Next(m) ->
+        read_incrementally(whole, chunk, seen, m.next, found.push(m.header.path), budget - 1),
     }
   }
 
 test "{f.name} reads, and what was read of it is written and read back the same" for f: Fixture in archives(
   ) {
-  let entries = tar::read(f.bytes, roomy());
+  let entries = tar::read(f.bytes, large_limits());
   assert(entries.len() > 0);
-  assert_eq(tar::decode(tar::write(entries), roomy()), Ok(entries))
+  assert_eq(tar::decode(tar::write(entries), large_limits()), Ok(entries))
 }
 
 test "{f.name} is found member by member as its bytes arrive" for f: Fixture in archives() {
   assert_eq(
-    fed(f.bytes, 300, 0, tar::start(), [], 1000),
-    tar::members(f.bytes, roomy()).map(|m: Member| m.header.path),
+    read_incrementally(f.bytes, 300, 0, tar::start(), [], 1000),
+    tar::members(f.bytes, large_limits()).map(|m: Member| m.header.path),
   )
 }
 
@@ -83,7 +85,7 @@ test "one tree reads alike from bsdtar's ustar, GNU and v7 archives, v7 naming n
   assert_eq(lines("ustar.tar"), tree("ply:staff"));
   assert_eq(lines("gnutar.tar"), tree("ply:staff"));
   assert_eq(lines("v7.tar"), tree(":"));
-  assert_eq(tar::read(archive("v7.tar"), roomy()).map(|e: Entry| e.data), [
+  assert_eq(tar::read(archive("v7.tar"), large_limits()).map(|e: Entry| e.data), [
     b"",
     b"hello, tar\n",
     b"",
@@ -96,7 +98,7 @@ test "one tree reads alike from bsdtar's ustar, GNU and v7 archives, v7 naming n
 
 test "a tree's plan makes its directories, files and links in the archive's order" {
   assert_eq(
-    tar::plan(tar::read(archive("ustar.tar"), roomy())),
+    tar::plan(tar::read(archive("ustar.tar"), large_limits())),
     Ok([
       MakeDirectory("docs", 493),
       WriteFile("docs/hard", 420, b"hello, tar\n"),
@@ -114,7 +116,7 @@ fn long_directory() -> String = "d".repeat(60) ++ "/" ++ "e".repeat(60)
 fn long_file() -> String = long_directory() ++ "/" ++ "f".repeat(120) ++ ".txt"
 
 test "a pax archive's records carry long and non-ASCII paths and times finer than a second" {
-  let read = tar::read(archive("pax.tar"), roomy());
+  let read = tar::read(archive("pax.tar"), large_limits());
   assert_eq(read.map(|e: Entry| (e.header.path, e.header.kind, e.header.modified)), [
     ("d".repeat(60), tar::Directory, Instant(1704164645000000000)),
     (long_directory(), tar::Directory, Instant(1704164645000000000)),
@@ -133,7 +135,7 @@ test "a pax archive's records carry long and non-ASCII paths and times finer tha
 
 test "GNU's long name and long link members name the member after them" {
   assert_eq(
-    tar::members(archive("gnu_long.tar"), roomy()).map(|m: Member|
+    tar::members(archive("gnu_long.tar"), large_limits()).map(|m: Member|
       (m.header.path, m.header.link, m.size)),
     [
       ("d".repeat(60), "", 0),
@@ -148,9 +150,9 @@ test "a long name is held to the path a reader was given, wherever the archive w
   let held = |name: String, path: Int|
     tar::decode(archive(name), { entries: 100, total: 1000000, size: 1000000, path: path });
   assert_eq(held("gnu_long.tar", 246).is_ok(), true);
-  assert_eq(held("gnu_long.tar", 245).err(), Some({ at: 3072, why: tar::TooLong }));
+  assert_eq(held("gnu_long.tar", 245).err(), Some({ at: 3072, reason: tar::TooLong }));
   assert_eq(held("pax.tar", 246).is_ok(), true);
-  assert_eq(held("pax.tar", 245).err(), Some({ at: 4096, why: tar::TooLong }))
+  assert_eq(held("pax.tar", 245).err(), Some({ at: 4096, reason: tar::TooLong }))
 }
 
 test "GNU's base-256 numbers read where octal digits do not reach: Python's tarfile" {
@@ -163,32 +165,32 @@ test "GNU's base-256 numbers read where octal digits do not reach: Python's tarf
 }
 
 test "a FIFO and a device are carried as their headers say, and no plan makes one" {
-  let read = tar::read(archive("special.tar"), roomy());
+  let read = tar::read(archive("special.tar"), large_limits());
   assert_eq(
     read.map(|e: Entry| (e.header.path, e.header.kind, e.header.major, e.header.minor, e.data)),
     [("pipe", tar::Fifo, 0, 0, b""), ("null", tar::CharDevice, 3, 2, b"")],
   );
-  assert_eq(tar::plan(read), Err({ index: 0, path: "pipe", why: tar::Special }));
-  assert_eq(tar::plan(read.drop(1)), Err({ index: 0, path: "null", why: tar::Special }))
+  assert_eq(tar::plan(read), Err({ index: 0, path: "pipe", reason: tar::Special }));
+  assert_eq(tar::plan(read.drop(1)), Err({ index: 0, path: "null", reason: tar::Special }))
 }
 
 test "an archive with a path that climbs out of the root reads, and is not planned" {
-  let read = tar::read(archive("traversal.tar"), roomy());
+  let read = tar::read(archive("traversal.tar"), large_limits());
   assert_eq(read.map(|e: Entry| (e.header.path, e.data)), [
     ("inside.txt", b"fine\n"),
     ("../outside.txt", b"gotcha\n"),
   ]);
-  assert_eq(tar::plan(read), Err({ index: 1, path: "../outside.txt", why: tar::Escapes }));
+  assert_eq(tar::plan(read), Err({ index: 1, path: "../outside.txt", reason: tar::Escapes }));
   assert_eq(tar::plan(read.take(1)), Ok([WriteFile("inside.txt", 420, b"fine\n")]))
 }
 
 test "an archive that makes a link and then writes beneath it reads, and is not planned" {
-  let read = tar::read(archive("through_link.tar"), roomy());
+  let read = tar::read(archive("through_link.tar"), large_limits());
   assert_eq(read.map(|e: Entry| (e.header.path, e.header.kind, e.header.link)), [
     ("way", tar::Symlink, "elsewhere"),
     ("way/planted.txt", tar::File, ""),
   ]);
-  assert_eq(tar::plan(read), Err({ index: 1, path: "way/planted.txt", why: tar::ThroughLink }))
+  assert_eq(tar::plan(read), Err({ index: 1, path: "way/planted.txt", reason: tar::ThroughLink }))
 }
 
 // --- What `std.tar` writes, and what bsdtar says of it ---------------------------
@@ -227,7 +229,7 @@ fn written_listing() -> Bytes = embed("tar/written.listing")
 
 /// A member as `tar -tv` lists one, column by column, the day it prints taken from the two
 /// instants `written_entries` uses.
-fn listed(m: Member) -> List<String> = {
+fn listing_columns(m: Member) -> List<String> = {
   let h = m.header;
   let letter = match h.kind {
     tar::Directory -> "d",
@@ -262,7 +264,7 @@ test "what write emits is the archive bsdtar listed, and lists as bsdtar listed 
   let whole = tar::write(written_entries());
   assert_eq(whole, archive("written.tar"));
   assert_eq(
-    tar::members(whole, roomy()).map(listed),
+    tar::members(whole, large_limits()).map(listing_columns),
     String::of_bytes(written_listing()).split("\n").filter(|row: String| row != "").map(
       |row: String| row.split(" ").filter(|column: String| column != ""),
     ),

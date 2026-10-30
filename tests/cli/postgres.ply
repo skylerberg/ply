@@ -4,11 +4,12 @@
 //! when the test is done. The run binds `initdb`, `postgres` and `psql` with `--exec`;
 //! a run that binds none skips these tests, except under CI, which promises a postgres.
 
-import harness (Here, Spawned, Wire, environment, fresh, reserve, said, spawned, working)
+import harness (WorkingDirectory, PlyProcess, Network, environment, empty_working_directory,
+                reserve_port, all_output, spawned, working_directory)
 import std.config (config)
 import std.fs (fs)
 import std.list
-import std.process (process, Finished, Var, exit_code, Discard, Interrupt, Keep)
+import std.process (process, CompletedProcess, Var, exit_code, Discard, Interrupt, Keep)
 import std.time (time)
 
 pub effect set Postgres = {process.read[initdb], process.write[initdb], process.read[postgres], process.write[postgres], process.read[psql], process.write[psql], config.get[env], time.read, time.write}
@@ -30,40 +31,40 @@ pub fn available() -> Bool / {Postgres, abort.raise} = {
 pub fn scram(
   name: String,
   password: String,
-) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} =
-  launched(name, "scram-sha-256", password, None)
+) -> Cluster / {WorkingDirectory, Network, Postgres, abort.raise, diverges} =
+  launch(name, "scram-sha-256", password, None)
 
 /// TCP connections send `password` in the clear, which `password` authentication asks for.
 pub fn clear_text(
   name: String,
   password: String,
-) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} =
-  launched(name, "password", password, None)
+) -> Cluster / {WorkingDirectory, Network, Postgres, abort.raise, diverges} =
+  launch(name, "password", password, None)
 
 /// [`scram`]'s cluster, speaking TLS with `certificate` and its `key` (PEM) as well as plaintext, so
 /// a client's `sslmode` decides which.
-pub fn secured(
+pub fn scram_with_tls(
   name: String,
   password: String,
   certificate: String,
   key: String,
-) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} =
-  launched(name, "scram-sha-256", password, Some((certificate, key)))
+) -> Cluster / {WorkingDirectory, Network, Postgres, abort.raise, diverges} =
+  launch(name, "scram-sha-256", password, Some((certificate, key)))
 
 /// A server without a locale starts threads on macOS before it forks, and refuses to.
-fn located() -> List<Var> = [{ name: "LC_ALL", value: "C" }]
+fn c_locale() -> List<Var> = [{ name: "LC_ALL", value: "C" }]
 
-fn ran(f: Finished) -> String / {abort.raise} =
+fn output_or_fail(f: CompletedProcess) -> String / {abort.raise} =
   if exit_code(f) == Some(0) { String::of_bytes_lossy(f.out) }
   else { panic(String::of_bytes_lossy(f.err)) }
 
-fn launched(
+fn launch(
   name: String,
   auth: String,
   password: String,
   tls: Option<(String, String)>,
-) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} = {
-  fresh();
+) -> Cluster / {WorkingDirectory, Network, Postgres, abort.raise, diverges} = {
+  empty_working_directory();
   let dir = match fs.temp_dir[cwd](".", "pg-" ++ name ++ "-") {
     Some(d) -> d,
     None -> panic("a directory for the cluster"),
@@ -74,7 +75,7 @@ fn launched(
     None -> panic("the cluster's directory has a path"),
   };
   let data = root ++ "/data";
-  let _ = ran(
+  let _ = output_or_fail(
     process.spawn[initdb](
       [
         "-D",
@@ -90,10 +91,10 @@ fn launched(
         "--pwfile=" ++ root ++ "/password",
       ],
       "",
-      environment(located()),
+      environment(c_locale()),
     ),
   );
-  let secured = match tls {
+  let scram_with_tls = match tls {
     None -> [],
     Some((certificate, key)) -> {
       let _ = fs.write_file[cwd](dir ++ "/data/server.crt", Bytes::of_string(certificate));
@@ -108,7 +109,7 @@ fn launched(
       ["-c", "ssl=on", "-c", "ssl_cert_file=server.crt", "-c", "ssl_key_file=server.key"]
     },
   };
-  let port = reserve();
+  let port = reserve_port();
   let server = match process.start[postgres](
       [
         "-D",
@@ -126,17 +127,17 @@ fn launched(
         "-c",
         "synchronous_commit=off",
       ].concat(
-        secured,
+        scram_with_tls,
       ),
       "",
-      environment(located()),
+      environment(c_locale()),
       { input: false, out: Discard, err: Keep },
     ) {
     Ok(child) -> child,
     Err(why) -> panic("postgres did not start: " ++ why),
   };
   let cluster = { dir: dir, port: port, server: server, password: password };
-  match ready(cluster, 300, "") {
+  match wait_until_ready(cluster, 300, "") {
     None -> (),
     Some(why) -> {
       let _ = process.signal[postgres](server, Interrupt);
@@ -152,16 +153,16 @@ fn launched(
 }
 
 /// Why the cluster did not answer within `tries` tenths of a second, if it did not.
-fn ready(c: Cluster, tries: Int, last: String) -> Option<String> / {Postgres, diverges} =
+fn wait_until_ready(c: Cluster, tries: Int, last: String) -> Option<String> / {Postgres, diverges} =
   if tries <= 0 { Some(last) } else {
-    let f = asked(c, "postgres", "select 1");
+    let f = run_psql(c, "postgres", "select 1");
     if exit_code(f) == Some(0) { None } else {
       time.sleep_ms(100);
-      ready(c, tries - 1, String::of_bytes_lossy(f.err))
+      wait_until_ready(c, tries - 1, String::of_bytes_lossy(f.err))
     }
   }
 
-fn asked(c: Cluster, database: String, sql: String) -> Finished / {Postgres} =
+fn run_psql(c: Cluster, database: String, sql: String) -> CompletedProcess / {Postgres} =
   process.spawn[psql](
     [
       "-h",
@@ -185,7 +186,7 @@ fn asked(c: Cluster, database: String, sql: String) -> Finished / {Postgres} =
 
 /// What `sql` printed in `database`, trimmed; a statement that fails fails the test.
 pub fn psql(c: Cluster, database: String, sql: String) -> String / {Postgres, abort.raise} =
-  ran(asked(c, database, sql)).trim()
+  output_or_fail(run_psql(c, database, sql)).trim()
 
 /// Stops the server the fast way, which ends its sessions and frees its shared memory.
 pub fn stop(c: Cluster) -> Unit / {Postgres} = {
@@ -199,21 +200,21 @@ pub fn stop(c: Cluster) -> Unit / {Postgres} = {
 pub fn program_answer(
   words: List<String>,
   flags: List<String> = [],
-) -> Result<String, String> / {Spawned, abort.raise} = {
+) -> Result<String, String> / {PlyProcess, abort.raise} = {
   let r = spawned(["run", "inner.ply"].concat(flags).concat(["--"]).concat(words));
   match r.out.filter(|l: String| l.starts_with("heard ") || l.starts_with("refused ")) {
-    [] -> panic("the program answered nothing:\n" ++ said(r)),
+    [] -> panic("the program answered nothing:\n" ++ all_output(r)),
     [line, ..] -> if line.starts_with("heard ") { Ok(line.slice(6, line.len())) }
     else { Err(line.slice(8, line.len())) },
   }
 }
 
 /// What the program's `entry` answered given a connection string `url`.
-pub fn over(
+pub fn call_with_url(
   entry: String,
   url: String,
   flags: List<String> = [],
-) -> Result<String, String> / {Spawned, abort.raise} = program_answer([entry, url], flags)
+) -> Result<String, String> / {PlyProcess, abort.raise} = program_answer([entry, url], flags)
 
 /// `postgres://ply:<password>@<host>:<port>/<database>?<query>`, the password as given.
 pub fn url(c: Cluster, host: String, database: String, query: String) -> String =

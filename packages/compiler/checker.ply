@@ -6,7 +6,7 @@
 //! answers: its diagnostics as `compiler.syntax`'s values, and where there is no error the
 //! definitions `ply defs`, `ply hash` and `ply callers` print. A hash covers a definition's
 //! structure and all it reaches and no name, comment or layout, so two checks say what an edit
-//! moved: `moved` names the definitions whose hashes differ, and a rename, a move or a reformat
+//! moved: `changed` names the definitions whose hashes differ, and a rename, a move or a reformat
 //! that is only that moves none.
 //!
 //! The check runs the compiler in the program that calls it, so it takes limits: how many sources
@@ -28,7 +28,7 @@ import compiler.store.hash.encoding (hex)
 import compiler.check.infer.checker (DefInfo)
 import compiler.syntax
 import compiler.syntax (Diagnostic, Edit, Error, Sample, Span, Warning, sample_source)
-import compiler.syntax.items (Item, IEffect, IType)
+import compiler.syntax.items (Item, EffectItem, TypeItem)
 import compiler.load
 import compiler.load (SourceFile)
 import compiler.syntax.parsing
@@ -38,7 +38,7 @@ import compiler.check.types (row_text, scheme_text)
 import compiler.unit (shipped)
 import std.bytes
 import std.list
-import std.place (place_at)
+import std.location (location_at)
 import std.gen
 import compiler.check.resolve.tables
 
@@ -50,7 +50,7 @@ pub type Source = new { path: String, text: Bytes }
 pub type Limits = new { files: Int, bytes: Int }
 
 /// Why sources were not checked.
-pub type Refusal =
+pub type InputError =
   /// More sources than the limit: how many.
   | TooManyFiles(Int)
   /// More bytes than the limit: how many.
@@ -61,11 +61,11 @@ pub type Refusal =
 /// What this module raises where it refuses.
 pub effect checker {
   /// The sources are past a limit, or one's path names no module.
-  raise refused(why: Refusal)
+  raise fail(why: InputError)
 }
 
 /// What a check asks of the binary it runs in: the shipped modules its sources import.
-pub effect set Shipped = {shipped.names, shipped.module, shipped.reached}
+pub effect set Shipped = {shipped.names, shipped.module, shipped.report_reached}
 
 /// What a definition is.
 pub type DefinitionKind = | Function | Type | Effect
@@ -95,19 +95,23 @@ pub type Definition = new {
 /// `diagnostics` holds its errors where it has any, and then `definitions` is empty; where it has
 /// none, `ok` is true, the diagnostics are its warnings, and `definitions` holds every function,
 /// type and effect of its own modules and each one of a shipped module it reaches.
-pub type Checked = new { ok: Bool, diagnostics: List<Diagnostic>, definitions: List<Definition> }
+pub type CheckResult = new {
+  ok: Bool,
+  diagnostics: List<Diagnostic>,
+  definitions: List<Definition>,
+}
 
-fn admitted(
+fn validate_sources(
   sources: List<Source>,
   limits: Limits,
-) -> List<SourceFile> / {checker.refused, abort.raise} = {
+) -> List<SourceFile> / {checker.fail, abort.raise} = {
   let bytes = sources.fold(0, |total: Int, source: Source| total + source.text.len());
-  if sources.len() > limits.files { checker.refused(TooManyFiles(sources.len())) }
-  else if bytes > limits.bytes { checker.refused(TooManyBytes(bytes)) } else {
+  if sources.len() > limits.files { checker.fail(TooManyFiles(sources.len())) }
+  else if bytes > limits.bytes { checker.fail(TooManyBytes(bytes)) } else {
     sources.map(|source: Source|
       match module_of(source.path) {
         Ok(module) -> { path: source.path, name: module, text: source.text },
-        Err(why) -> checker.refused(NotAModule(source.path, why)),
+        Err(why) -> checker.fail(NotAModule(source.path, why)),
       })
   }
 }
@@ -115,7 +119,7 @@ fn admitted(
 fn file_at(files: List<SourceFile>, module: Int) -> SourceFile =
   files.at_or(module, { path: "", name: "", text: b"" })
 
-fn said(files: List<SourceFile>, diag: Diag) -> Diagnostic =
+fn diagnostic_of(files: List<SourceFile>, diag: Diag) -> Diagnostic =
   {
     code: String::of_bytes_lossy(diag.code),
     severity: if diag.severity == b"warning" { Warning } else { Error },
@@ -125,7 +129,7 @@ fn said(files: List<SourceFile>, diag: Diag) -> Diagnostic =
       {
         path: file.path,
         span: { start: label.start, end: label.end },
-        place: place_at(file.text, label.start),
+        place: location_at(file.text, label.start),
         primary: label.primary,
         text: String::of_bytes_lossy(label.text),
       }
@@ -214,8 +218,8 @@ fn declared(
 ) -> List<Definition> / {abort.raise} =
   parsed.module.items.fold(found, |acc: List<Definition>, item: Item|
     match item {
-      IType(d) -> acc.push(declaration(tables, path, parsed.name, Type, d.name)),
-      IEffect(d) -> acc.push(declaration(tables, path, parsed.name, Effect, d.name)),
+      TypeItem(d) -> acc.push(declaration(tables, path, parsed.name, Type, d.name)),
+      EffectItem(d) -> acc.push(declaration(tables, path, parsed.name, Effect, d.name)),
       _ -> acc,
     })
 
@@ -264,20 +268,20 @@ fn definitions_of(
 pub fn checked(
   sources: List<Source>,
   limits: Limits,
-) -> Checked / {checker.refused, Shipped, abort.raise} = {
-  let own = admitted(sources, limits);
-  let answered = load::analysed(own, Map::new());
+) -> CheckResult / {checker.fail, Shipped, abort.raise} = {
+  let own = validate_sources(sources, limits);
+  let answered = load::analyse_in_memory(own, Map::new());
   match answered.out {
     Refused(diags) ->
       {
         ok: false,
-        diagnostics: diags.map(|diag: Diag| said(answered.files, diag)),
+        diagnostics: diags.map(|diag: Diag| diagnostic_of(answered.files, diag)),
         definitions: [],
       },
     Analysed(analysis) ->
       {
         ok: true,
-        diagnostics: analysis.warnings.map(|diag: Diag| said(answered.files, diag)),
+        diagnostics: analysis.warnings.map(|diag: Diag| diagnostic_of(answered.files, diag)),
         definitions: definitions_of(answered.files, own.map(|f: SourceFile| f.name), analysis),
       },
   }
@@ -288,34 +292,34 @@ pub fn checked(
 pub fn check(
   sources: List<Source>,
   limits: Limits,
-) -> Result<Checked, Refusal> / {Shipped, abort.raise} = try { checked(sources, limits) }
+) -> Result<CheckResult, InputError> / {Shipped, abort.raise} = try { checked(sources, limits) }
 
 /// `check` with no shipped module to import: for sources that import none, which then performs
 /// nothing. An import of one is the error it is where the module does not ship.
 pub fn check_alone(
   sources: List<Source>,
   limits: Limits,
-) -> Result<Checked, Refusal> / {abort.raise} =
+) -> Result<CheckResult, InputError> / {abort.raise} =
   handle {
     check(sources, limits)
   } with {
     shipped.names() -> [],
     shipped.module(name) -> None,
-    shipped.reached(view, pulled) -> (),
+    shipped.report_reached(view, pulled) -> (),
   }
 
 /// The definition named `name` program-wide.
-pub fn definition(program: Checked, name: String) -> Option<Definition> =
+pub fn definition(program: CheckResult, name: String) -> Option<Definition> =
   program.definitions.fold(None, |held: Option<Definition>, d: Definition|
     match held { Some(_) -> held, None -> if d.name == name { Some(d) } else { None } })
 
 /// Each definition's hash by its name: what two checks are compared by.
-pub fn hashes(program: Checked) -> Map<String, String> =
+pub fn hashes(program: CheckResult) -> Map<String, String> =
   program.definitions.fold(Map::new(), |held: Map<String, String>, d: Definition|
     held.insert(d.name, d.hash))
 
 /// The names of the definitions that mention `name` directly, in order.
-pub fn callers(program: Checked, name: String) -> List<String> =
+pub fn callers(program: CheckResult, name: String) -> List<String> =
   program.definitions.fold([], |held: List<String>, d: Definition|
     if d.references.fold(false, |any: Bool, r: String| any || r == name) { held.push(d.name) }
     else { held }).sort(
@@ -324,7 +328,7 @@ pub fn callers(program: Checked, name: String) -> List<String> =
 /// The names whose definitions differ between two checks, in order: one that hashes otherwise,
 /// and one only either holds. Empty exactly when the two programs are the same definitions under
 /// the same names.
-pub fn moved(before: Checked, after: Checked) -> List<String> = {
+pub fn changed(before: CheckResult, after: CheckResult) -> List<String> = {
   let was = hashes(before);
   let now = hashes(after);
   now.fold(
@@ -338,10 +342,10 @@ pub fn moved(before: Checked, after: Checked) -> List<String> = {
 
 // --- Tests ------------------------------------------------------------------
 
-fn roomy() -> Limits = { files: 16, bytes: 65536 }
+fn large_limits() -> Limits = { files: 16, bytes: 65536 }
 
-fn alone(sources: List<Source>) -> Checked / {abort.raise} =
-  match check_alone(sources, roomy()) {
+fn alone(sources: List<Source>) -> CheckResult / {abort.raise} =
+  match check_alone(sources, large_limits()) {
     Ok(program) -> program,
     Err(_) -> panic("the sources are within the limits and their paths name modules"),
   }
@@ -358,15 +362,15 @@ fn shop() -> List<Source> =
     },
   ]
 
-fn names_of(program: Checked) -> List<String> = program.definitions.map(|d: Definition| d.name)
+fn names_of(program: CheckResult) -> List<String> = program.definitions.map(|d: Definition| d.name)
 
-fn found(program: Checked, name: String) -> Definition / {abort.raise} =
+fn found(program: CheckResult, name: String) -> Definition / {abort.raise} =
   match definition(program, name) { Some(d) -> d, None -> panic("no definition is named " ++ name) }
 
 /// The names `program` lists that its own `modules` do not hold, and those it reaches from theirs
 /// through what each names, each sorted.
 fn shipped_reach(
-  program: Checked,
+  program: CheckResult,
   modules: List<String>,
 ) -> { listed: List<String>, reached: List<String> } / {abort.raise} = {
   let own = |name: String| modules.any(|m: String| name.starts_with(m ++ "."));
@@ -472,7 +476,7 @@ test "sources past a limit, and a path that names no module, are refused before 
   ];
   assert_eq(check_alone(two, { files: 1, bytes: 1000 }), Err(TooManyFiles(2)));
   assert_eq(check_alone(two, { files: 2, bytes: 20 }), Err(TooManyBytes(36)));
-  assert(match check_alone([{ path: "a-b.ply", text: b"" }], roomy()) {
+  assert(match check_alone([{ path: "a-b.ply", text: b"" }], large_limits()) {
     Err(NotAModule(path, _)) -> path == "a-b.ply",
     _ -> false,
   })
@@ -494,24 +498,24 @@ test "a rename, a reformat and a comment move no hash, and an edit moves what re
         text: source.text.replace(b"sum", b"so_far").replace(b"ps", b"prices"),
       }),
   );
-  assert_eq(moved(before, renamed), []);
+  assert_eq(changed(before, renamed), []);
   let reformatted = alone(
     shop().map(|source: Source|
       { path: source.path, text: b"// a note\n".concat(syntax::formatted(source.text)) }),
   );
-  assert_eq(moved(before, reformatted), []);
+  assert_eq(changed(before, reformatted), []);
   let edited = alone(
     shop().map(|source: Source|
       { path: source.path, text: source.text.replace(b"Cents(n) -> n", b"Cents(n) -> n + 0") }),
   );
-  assert_eq(moved(before, edited), ["main.main", "shop.prices.cents", "shop.prices.total"])
+  assert_eq(changed(before, edited), ["main.main", "shop.prices.cents", "shop.prices.total"])
 }
 
-fn sampled(source: Bytes) -> Checked / {abort.raise} = alone([{ path: "m.ply", text: source }])
+fn sampled(source: Bytes) -> CheckResult / {abort.raise} = alone([{ path: "m.ply", text: source }])
 
 /// `source` with every binding and use of `from` written `to`.
 fn rebound(source: Bytes, from: String, to: Bytes) -> Bytes / {abort.raise} =
-  match syntax::edited(
+  match syntax::apply_edits(
       source,
       syntax::walk(syntax::parse(source).tree).fold([], |edits: List<Edit>, node: syntax::Node|
         match ((syntax::kind(node), syntax::name(node))) {
@@ -530,12 +534,12 @@ fn rebound(source: Bytes, from: String, to: Bytes) -> Bytes / {abort.raise} =
 
 test "formatting a sample moves no definition's hash" {
   gen::check(syntax::samples(), |s: Sample| {
-    moved(sampled(sample_source(s)), sampled(syntax::formatted(sample_source(s)))) == []
+    changed(sampled(sample_source(s)), sampled(syntax::formatted(sample_source(s)))) == []
   })
 }
 
 test "renaming a local binder moves no definition's hash" {
   gen::check(syntax::samples(), |s: Sample| {
-    moved(sampled(sample_source(s)), sampled(rebound(sample_source(s), "y", b"held"))) == []
+    changed(sampled(sample_source(s)), sampled(rebound(sample_source(s), "y", b"held"))) == []
   })
 }

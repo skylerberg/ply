@@ -19,7 +19,7 @@
 //! - `\` makes the next character itself, and `escape` writes a text as the pattern of it alone.
 //! - A `.` that leads a segment of the path is matched only by a `.` that leads a segment of the
 //!   pattern, as `fnmatch` and the shells have it: `*.ply` matches neither `.hidden.ply` nor
-//!   `.ply`, and `**` enters no `.git`. `Options.dots` lets every wildcard match one.
+//!   `.ply`, and `**` enters no `.git`. `Options.match_hidden` lets every wildcard match one.
 //! - Case counts unless `Options.ignore_case`, which lower-cases both sides a character at a
 //!   time, by Unicode's simple mapping (`char::to_lowercase`). A text keeps its length that way,
 //!   so `?` is one character of the path whatever its case, where the full mapping makes two of
@@ -44,14 +44,14 @@ pub type Options = {
   /// Whether `A` matches `a`.
   ignore_case: Bool,
   /// Whether `*`, `?`, a class and `**` match a `.` that leads a segment.
-  dots: Bool,
+  match_hidden: Bool,
 }
 
 /// `/` between segments, case counted, and a leading `.` matched only by one written.
-pub fn options() -> Options = { separator: '/', ignore_case: false, dots: false }
+pub fn options() -> Options = { separator: '/', ignore_case: false, match_hidden: false }
 
 /// The characters from `lo` to `hi`, both among them.
-type Span = { lo: Char, hi: Char }
+type CharRange = { lo: Char, hi: Char }
 
 /// What a state of a pattern takes of a path: one character, or for `Run` and `Deep` any number.
 type Symbol =
@@ -68,7 +68,7 @@ type Symbol =
   /// Characters across segments, as `**` takes them.
   | Deep
   /// A character within a segment that is in one of the spans, or in none where the flag is set.
-  | Among(Bool, List<Span>)
+  | Among(Bool, List<CharRange>)
   /// Nothing: the pattern is matched here.
   | End
 
@@ -91,7 +91,7 @@ pub type Glob = new {
 }
 
 /// Why a pattern is refused.
-pub type Why =
+pub type ErrorKind =
   /// A `[` whose class the pattern ends inside.
   | UnclosedClass
   /// A class of no characters, `[]` or `[!]`.
@@ -108,16 +108,16 @@ pub type Why =
   | Globstar
 
 /// A refusal, and the character of the pattern it is about.
-pub type Refusal = { at: Int, why: Why }
+pub type Error = { at: Int, reason: ErrorKind }
 
 /// What `read` raises where it refuses.
 pub effect glob {
   /// The text is not a pattern of this dialect.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
 }
 
 /// A refusal's reason as a sentence, which is what a literal's diagnostic says.
-pub fn reason(why: Why) -> String =
+pub fn reason(why: ErrorKind) -> String =
   match why {
     UnclosedClass -> "this class has no closing `]`",
     EmptyClass -> "a class holds at least one character",
@@ -129,16 +129,16 @@ pub fn reason(why: Why) -> String =
   }
 
 /// The pattern compiled under `options()`, or where and why it is refused.
-pub fn compile(pattern: String) -> Result<Glob, Refusal> / {abort.raise} =
+pub fn compile(pattern: String) -> Result<Glob, Error> / {abort.raise} =
   try { read(pattern, options()) }
 
 /// The pattern compiled to read paths as `o` says, or where and why it is refused.
-pub fn compile_with(pattern: String, o: Options) -> Result<Glob, Refusal> / {abort.raise} =
+pub fn compile_with(pattern: String, o: Options) -> Result<Glob, Error> / {abort.raise} =
   try { read(pattern, o) }
 
 /// The pattern compiled to read paths as `o` says, raising `glob.refused` where `compile_with`
 /// answers `Err`.
-pub fn read(pattern: String, o: Options) -> Glob / {glob.refused, abort.raise} = {
+pub fn read(pattern: String, o: Options) -> Glob / {glob.fail, abort.raise} = {
   let written = program_of(pattern);
   let prefix = literal_prefix(written, o.separator);
   let states = states_of(if o.ignore_case { program_of(lowered(pattern)) } else { written });
@@ -158,7 +158,7 @@ pub fn read(pattern: String, o: Options) -> Glob / {glob.refused, abort.raise} =
 pub fn literal(text: String) -> Result<Glob, { message: String, offset: Int }> / {abort.raise} =
   match compile(text) {
     Ok(g) -> Ok(g),
-    Err(refused) -> Err({ message: reason(refused.why), offset: refused.at }),
+    Err(refused) -> Err({ message: reason(refused.reason), offset: refused.at }),
   }
 
 /// `text` as the pattern that matches it and nothing else under a `/` separator: each character
@@ -176,7 +176,7 @@ fn is_special(c: Char) -> Bool =
 
 /// Whether the whole of `path` matches.
 pub fn matches(g: Glob, path: String) -> Bool = {
-  let on = after(g, path);
+  let on = states_after(g, path);
   on.contains(g.states.len() - 1)
 }
 
@@ -193,44 +193,53 @@ pub fn exact(g: Glob) -> Option<String> = g.exact
 pub fn enters(g: Glob, dir: String) -> Bool = {
   let separator = String::of_chars([g.options.separator]);
   let under = if dir == "" || dir.ends_with(separator) { dir } else { dir ++ separator };
-  after(g, under).len() > 0
+  states_after(g, under).len() > 0
 }
 
 /// Where a match stands in a path: the states it may be in, those of them that lead a segment of
 /// the pattern, and whether the next character leads a segment of the path.
-type Walk = { on: Map<Int, Unit>, first: Map<Int, Unit>, leads: Bool }
+type MatchState = { on: Map<Int, Unit>, first: Map<Int, Unit>, leads: Bool }
 
 /// `text` with each character in lower case by itself, so that it keeps its length.
 fn lowered(text: String) -> String = String::of_chars(text.chars().map(Char::to_lowercase))
 
 /// The states the pattern may be in once `text` is read.
-fn after(g: Glob, text: String) -> Map<Int, Unit> =
+fn states_after(g: Glob, text: String) -> Map<Int, Unit> =
   String::chars(if g.options.ignore_case { lowered(text) } else { text }).fold(
     { on: g.start, first: g.first, leads: true },
-    |w: Walk, c: Char| stepped(g, w, c),
+    |w: MatchState, c: Char| advance(g, w, c),
   ).on
 
-fn stepped(g: Glob, w: Walk, c: Char) -> Walk = {
-  let hidden = w.leads && c == '.' && !g.options.dots;
+fn advance(g: Glob, w: MatchState, c: Char) -> MatchState = {
+  let hidden = w.leads && c == '.' && !g.options.match_hidden;
   let leads = c == g.options.separator;
-  w.on.fold({ on: Map::new(), first: Map::new(), leads: leads }, |next: Walk, at: Int, _: Unit|
-    match g.states.at(at) {
-      Some(state) if takes(state.symbol, c, g.options.separator, hidden, w.first.contains(at)) ->
-        {
-          on: joined(next.on, state.next),
-          first: if leads { joined(next.first, state.first) } else { next.first },
-          leads: leads,
-        },
-      _ -> next,
-    })
+  w.on.fold(
+    { on: Map::new(), first: Map::new(), leads: leads },
+    |next: MatchState, at: Int, _: Unit|
+      match g.states.at(at) {
+        Some(state) if accepts(
+            state.symbol,
+            c,
+            g.options.separator,
+            hidden,
+            w.first.contains(at),
+          ) ->
+          {
+            on: insert_all(next.on, state.next),
+            first: if leads { insert_all(next.first, state.first) } else { next.first },
+            leads: leads,
+          },
+        _ -> next,
+      },
+  )
 }
 
-fn joined(set: Map<Int, Unit>, more: List<Int>) -> Map<Int, Unit> =
+fn insert_all(set: Map<Int, Unit>, more: List<Int>) -> Map<Int, Unit> =
   more.fold(set, |reached: Map<Int, Unit>, to: Int| reached.insert(to, ()))
 
 /// Whether a state takes `c`. `hidden` is a `.` leading a segment of the path, which only a
 /// `Lit` that is `first`, leading its segment of the pattern, takes.
-fn takes(symbol: Symbol, c: Char, separator: Char, hidden: Bool, first: Bool) -> Bool =
+fn accepts(symbol: Symbol, c: Char, separator: Char, hidden: Bool, first: Bool) -> Bool =
   match symbol {
     Lit(written) -> c == written && (!hidden || first),
     Sep -> c == separator,
@@ -240,7 +249,8 @@ fn takes(symbol: Symbol, c: Char, separator: Char, hidden: Bool, first: Bool) ->
     End -> false,
   }
 
-fn within(spans: List<Span>, c: Char) -> Bool = spans.any(|s: Span| c >= s.lo && c <= s.hi)
+fn within(spans: List<CharRange>, c: Char) -> Bool =
+  spans.any(|s: CharRange| c >= s.lo && c <= s.hi)
 
 // --- Compiling --------------------------------------------------------------
 
@@ -258,51 +268,51 @@ type Brace = { at: Int, fork: Int, jumps: List<Int> }
 
 /// What stands before the character being read, as far as a `**` asks: a segment's start, one
 /// `*` and whether it stood at a segment's start, a `**`, or anything else.
-type Before = | Fresh | Star(Bool) | Stars | Mid
+type Before = | SegmentStart | Star(Bool) | DoubleStar | Mid
 
-type Step = | First | Item | Had(Char) | Dash(Char)
+type Step = | First | Item | PendingChar(Char) | Dash(Char)
 
-type Class = { open: Int, negated: Bool, spans: List<Span>, step: Step, escaped: Bool }
+type Class = { open: Int, negated: Bool, spans: List<CharRange>, step: Step, escaped: Bool }
 
 type Mode = | Plain | Escaped | InClass(Class)
 
-type Parsing = { at: Int, program: List<Inst>, mode: Mode, braces: List<Brace>, before: Before }
+type Parser = { at: Int, program: List<Inst>, mode: Mode, braces: List<Brace>, before: Before }
 
-fn refuse<a>(at: Int, why: Why) -> a / {glob.refused} = glob.refused({ at: at, why: why })
+fn fail<a>(at: Int, why: ErrorKind) -> a / {glob.fail} = glob.fail({ at: at, reason: why })
 
-fn program_of(pattern: String) -> List<Inst> / {glob.refused, abort.raise} =
-  finished(
+fn program_of(pattern: String) -> List<Inst> / {glob.fail, abort.raise} =
+  finish_program(
     pattern.chars().fold(
-      { at: 0, program: [], mode: Plain, braces: [], before: Fresh },
-      |p: Parsing, c: Char| {
+      { at: 0, program: [], mode: Plain, braces: [], before: SegmentStart },
+      |p: Parser, c: Char| {
         let read = match p.mode {
-          Plain -> plain(p, c),
+          Plain -> parse_plain(p, c),
           Escaped -> emit(p, Lit(c)),
-          InClass(k) -> classed(p, k, c),
+          InClass(k) -> parse_class_char(p, k, c),
         };
         { ..read, at: p.at + 1 }
       },
     ),
   )
 
-fn emit(p: Parsing, symbol: Symbol) -> Parsing =
+fn emit(p: Parser, symbol: Symbol) -> Parser =
   { ..p, program: p.program.push(Take(symbol)), mode: Plain, before: Mid }
 
-fn plain(p: Parsing, c: Char) -> Parsing / {glob.refused, abort.raise} =
-  if p.before == Stars {
+fn parse_plain(p: Parser, c: Char) -> Parser / {glob.fail, abort.raise} =
+  if p.before == DoubleStar {
     if c == '/' {
       let star = p.program.len() - 1;
       {
         ..p,
         program: p.program.set(star, Fork(star + 3)).push(Take(Deep)).push(Take(Sep)),
-        before: Fresh,
+        before: SegmentStart,
       }
-    } else { refuse(p.at - 2, Globstar) }
+    } else { fail(p.at - 2, Globstar) }
   } else if c == '*' {
     match p.before {
-      Star(true) -> { ..p, before: Stars },
-      Star(false) -> refuse(p.at - 1, Globstar),
-      Fresh -> { ..emit(p, Run), before: Star(true) },
+      Star(true) -> { ..p, before: DoubleStar },
+      Star(false) -> fail(p.at - 1, Globstar),
+      SegmentStart -> { ..emit(p, Run), before: Star(true) },
       _ -> { ..emit(p, Run), before: Star(false) },
     }
   } else if c == '?' { emit(p, One) } else if c == '[' {
@@ -314,14 +324,14 @@ fn plain(p: Parsing, c: Char) -> Parsing / {glob.refused, abort.raise} =
       braces: p.braces.push({ at: p.at, fork: p.program.len(), jumps: [] }),
       before: Mid,
     }
-  } else if c == ',' { parted(p) }
-  else if c == '}' { closed(p) }
+  } else if c == ',' { next_alternative(p) }
+  else if c == '}' { close_brace(p) }
   else if c == '\\' { { ..p, mode: Escaped } }
-  else if c == '/' { { ..emit(p, Sep), before: Fresh } }
+  else if c == '/' { { ..emit(p, Sep), before: SegmentStart } }
   else { emit(p, Lit(c)) }
 
 /// A `,`: the end of one alternative of the innermost brace and the start of its next.
-fn parted(p: Parsing) -> Parsing / {abort.raise} =
+fn next_alternative(p: Parser) -> Parser / {abort.raise} =
   match p.braces.at(p.braces.len() - 1) {
     None -> emit(p, Lit(',')),
     Some(b) -> {
@@ -340,9 +350,9 @@ fn parted(p: Parsing) -> Parsing / {abort.raise} =
   }
 
 /// A `}`: the last alternative has no other to fork to, and every earlier one goes on from here.
-fn closed(p: Parsing) -> Parsing / {glob.refused, abort.raise} =
+fn close_brace(p: Parser) -> Parser / {glob.fail, abort.raise} =
   match p.braces.at(p.braces.len() - 1) {
-    None -> refuse(p.at, UnopenedBrace),
+    None -> fail(p.at, UnopenedBrace),
     Some(b) -> {
       let end = p.program.len();
       {
@@ -357,45 +367,49 @@ fn closed(p: Parsing) -> Parsing / {glob.refused, abort.raise} =
     },
   }
 
-fn classed(p: Parsing, k: Class, c: Char) -> Parsing / {glob.refused} =
+fn parse_class_char(p: Parser, k: Class, c: Char) -> Parser / {glob.fail} =
   if k.escaped { member(p, { ..k, escaped: false }, c) }
   else if c == '\\' { { ..p, mode: InClass({ ..k, escaped: true }) } }
   else if k.step == First && (c == '!' || c == '^') {
     { ..p, mode: InClass({ ..k, negated: true, step: Item }) }
   } else if c == ']' {
     match k.step {
-      Dash(_) -> refuse(p.at, BadRange),
-      Had(lo) -> emit(p, Among(k.negated, k.spans.push({ lo: lo, hi: lo }))),
-      _ -> if k.spans.len() == 0 { refuse(k.open, EmptyClass) }
+      Dash(_) -> fail(p.at, BadRange),
+      PendingChar(lo) -> emit(p, Among(k.negated, k.spans.push({ lo: lo, hi: lo }))),
+      _ -> if k.spans.len() == 0 { fail(k.open, EmptyClass) }
       else { emit(p, Among(k.negated, k.spans)) },
     }
   } else if c == '-' {
     match k.step {
-      Had(lo) -> { ..p, mode: InClass({ ..k, step: Dash(lo) }) },
-      _ -> refuse(p.at, BadRange),
+      PendingChar(lo) -> { ..p, mode: InClass({ ..k, step: Dash(lo) }) },
+      _ -> fail(p.at, BadRange),
     }
   } else { member(p, k, c) }
 
 /// A character of a class: a range's upper end, or one that may yet open a range.
-fn member(p: Parsing, k: Class, c: Char) -> Parsing / {glob.refused} =
+fn member(p: Parser, k: Class, c: Char) -> Parser / {glob.fail} =
   match k.step {
-    Dash(lo) -> if c < lo { refuse(p.at, BadRange) }
+    Dash(lo) -> if c < lo { fail(p.at, BadRange) }
     else { { ..p, mode: InClass({ ..k, spans: k.spans.push({ lo: lo, hi: c }), step: Item }) } },
-    Had(lo) ->
-      { ..p, mode: InClass({ ..k, spans: k.spans.push({ lo: lo, hi: lo }), step: Had(c) }) },
-    _ -> { ..p, mode: InClass({ ..k, step: Had(c) }) },
+    PendingChar(lo) ->
+      {
+        ..p,
+        mode: InClass({ ..k, spans: k.spans.push({ lo: lo, hi: lo }), step: PendingChar(c) }),
+      },
+    _ -> { ..p, mode: InClass({ ..k, step: PendingChar(c) }) },
   }
 
-fn finished(p: Parsing) -> List<Inst> / {glob.refused, abort.raise} =
+fn finish_program(p: Parser) -> List<Inst> / {glob.fail, abort.raise} =
   match p.mode {
-    Escaped -> refuse(p.at - 1, TrailingEscape),
-    InClass(k) -> refuse(k.open, UnclosedClass),
+    Escaped -> fail(p.at - 1, TrailingEscape),
+    InClass(k) -> fail(k.open, UnclosedClass),
     Plain -> match p.braces.at(p.braces.len() - 1) {
-      Some(b) -> refuse(b.at, UnclosedBrace),
+      Some(b) -> fail(b.at, UnclosedBrace),
       None ->
         List::push(
-          if p.before == Stars { p.program.set(p.program.len() - 1, Take(Any)).push(Take(Deep)) }
-          else { p.program },
+          if p.before == DoubleStar {
+            p.program.set(p.program.len() - 1, Take(Any)).push(Take(Deep))
+          } else { p.program },
           Take(End),
         ),
     },
@@ -409,44 +423,48 @@ fn loops(symbol: Symbol) -> Bool = symbol == Run || symbol == Deep
 fn states_of(
   program: List<Inst>,
 ) -> { states: Array<State>, start: Map<Int, Unit>, first: Map<Int, Unit> } = {
-  let reached = reaches(program, true);
-  let led = reaches(program, false);
+  let reached = epsilon_closures(program, true);
+  let led = epsilon_closures(program, false);
   {
     states: Array::of_list(
       enumerate(program).map(|i: { index: Int, value: Inst }|
         match i.value {
           Take(symbol) -> {
-            let after = if loops(symbol) { i.index } else { i.index + 1 };
-            { symbol: symbol, next: from(reached, after).keys(), first: from(led, after).keys() }
+            let states_after = if loops(symbol) { i.index } else { i.index + 1 };
+            {
+              symbol: symbol,
+              next: closure_at(reached, states_after).keys(),
+              first: closure_at(led, states_after).keys(),
+            }
           },
           _ -> { symbol: End, next: [], first: [] },
         }),
     ),
-    start: from(reached, 0),
-    first: from(led, 0),
+    start: closure_at(reached, 0),
+    first: closure_at(led, 0),
   }
 }
 
 /// For each instruction, the states reached from it taking nothing. A loop goes on to what
 /// follows it only where `past_loops` says so.
-fn reaches(program: List<Inst>, past_loops: Bool) -> Map<Int, Map<Int, Unit>> =
+fn epsilon_closures(program: List<Inst>, past_loops: Bool) -> Map<Int, Map<Int, Unit>> =
   enumerate(program).reverse().fold(
     Map::new(),
     |done: Map<Int, Map<Int, Unit>>, i: { index: Int, value: Inst }|
       done.insert(i.index, match i.value {
         Take(symbol) ->
           Map::insert(
-            if past_loops && loops(symbol) { from(done, i.index + 1) } else { Map::new() },
+            if past_loops && loops(symbol) { closure_at(done, i.index + 1) } else { Map::new() },
             i.index,
             (),
           ),
-        Fork(to) -> from(done, i.index + 1).merge(from(done, to)),
-        Jump(to) -> from(done, to),
+        Fork(to) -> closure_at(done, i.index + 1).merge(closure_at(done, to)),
+        Jump(to) -> closure_at(done, to),
       }),
   )
 
 /// The states reached from the instruction at `at` taking nothing; none past the last.
-fn from(reached: Map<Int, Map<Int, Unit>>, at: Int) -> Map<Int, Unit> =
+fn closure_at(reached: Map<Int, Map<Int, Unit>>, at: Int) -> Map<Int, Unit> =
   reached.get_or(at, Map::new())
 
 /// The characters a pattern opens with before its first wildcard or brace, where the last
@@ -800,52 +818,52 @@ test "`{c.pattern}` over the tree is what its row lists" for c: Expanded in expa
   assert_eq(tree().filter(|path: String| matches(g, path)), c.paths)
 }
 
-type Refused = { pattern: String, at: Int, why: Why }
+type ErrorCase = { pattern: String, at: Int, reason: ErrorKind }
 
 /// The malformed patterns of Go's `matchTests`, each of which it reports for some text and this
 /// reader refuses for all.
-fn go_refused() -> List<Refused> =
+fn go_refused() -> List<ErrorCase> =
   [
-    { pattern: "[]a]", at: 0, why: EmptyClass },
-    { pattern: "[-]", at: 1, why: BadRange },
-    { pattern: "[x-]", at: 3, why: BadRange },
-    { pattern: "[-x]", at: 1, why: BadRange },
-    { pattern: "\\", at: 0, why: TrailingEscape },
-    { pattern: "[a-b-c]", at: 4, why: BadRange },
-    { pattern: "[", at: 0, why: UnclosedClass },
-    { pattern: "[^", at: 0, why: UnclosedClass },
-    { pattern: "[^bc", at: 0, why: UnclosedClass },
-    { pattern: "a[", at: 1, why: UnclosedClass },
-    { pattern: "a/b[", at: 3, why: UnclosedClass },
+    { pattern: "[]a]", at: 0, reason: EmptyClass },
+    { pattern: "[-]", at: 1, reason: BadRange },
+    { pattern: "[x-]", at: 3, reason: BadRange },
+    { pattern: "[-x]", at: 1, reason: BadRange },
+    { pattern: "\\", at: 0, reason: TrailingEscape },
+    { pattern: "[a-b-c]", at: 4, reason: BadRange },
+    { pattern: "[", at: 0, reason: UnclosedClass },
+    { pattern: "[^", at: 0, reason: UnclosedClass },
+    { pattern: "[^bc", at: 0, reason: UnclosedClass },
+    { pattern: "a[", at: 1, reason: UnclosedClass },
+    { pattern: "a/b[", at: 3, reason: UnclosedClass },
   ]
 
-fn own_refused() -> List<Refused> =
+fn own_refused() -> List<ErrorCase> =
   [
-    { pattern: "[!]", at: 0, why: EmptyClass },
-    { pattern: "[z-a]", at: 3, why: BadRange },
-    { pattern: "[a--]", at: 3, why: BadRange },
-    { pattern: "[a\\", at: 0, why: UnclosedClass },
-    { pattern: "ab\\", at: 2, why: TrailingEscape },
-    { pattern: "{a,b", at: 0, why: UnclosedBrace },
-    { pattern: "x{a,{b}", at: 1, why: UnclosedBrace },
-    { pattern: "a}", at: 1, why: UnopenedBrace },
-    { pattern: "{a}}", at: 3, why: UnopenedBrace },
-    { pattern: "a**", at: 1, why: Globstar },
-    { pattern: "**a", at: 0, why: Globstar },
-    { pattern: "a/**b", at: 2, why: Globstar },
-    { pattern: "a/b**/c", at: 3, why: Globstar },
-    { pattern: "***", at: 0, why: Globstar },
-    { pattern: "{**,a}", at: 1, why: Globstar },
-    { pattern: "{a,**}", at: 3, why: Globstar },
-    { pattern: "{a/**,b}", at: 3, why: Globstar },
-    { pattern: "a/**\\/b", at: 2, why: Globstar },
+    { pattern: "[!]", at: 0, reason: EmptyClass },
+    { pattern: "[z-a]", at: 3, reason: BadRange },
+    { pattern: "[a--]", at: 3, reason: BadRange },
+    { pattern: "[a\\", at: 0, reason: UnclosedClass },
+    { pattern: "ab\\", at: 2, reason: TrailingEscape },
+    { pattern: "{a,b", at: 0, reason: UnclosedBrace },
+    { pattern: "x{a,{b}", at: 1, reason: UnclosedBrace },
+    { pattern: "a}", at: 1, reason: UnopenedBrace },
+    { pattern: "{a}}", at: 3, reason: UnopenedBrace },
+    { pattern: "a**", at: 1, reason: Globstar },
+    { pattern: "**a", at: 0, reason: Globstar },
+    { pattern: "a/**b", at: 2, reason: Globstar },
+    { pattern: "a/b**/c", at: 3, reason: Globstar },
+    { pattern: "***", at: 0, reason: Globstar },
+    { pattern: "{**,a}", at: 1, reason: Globstar },
+    { pattern: "{a,**}", at: 3, reason: Globstar },
+    { pattern: "{a/**,b}", at: 3, reason: Globstar },
+    { pattern: "a/**\\/b", at: 2, reason: Globstar },
   ]
 
-test "`{c.pattern}` is refused where it goes wrong" for c: Refused in go_refused().concat(
+test "`{c.pattern}` is refused where it goes wrong" for c: ErrorCase in go_refused().concat(
     own_refused(),
   ) {
-  assert_eq(compile(c.pattern), Err({ at: c.at, why: c.why }));
-  assert_eq(try { read(c.pattern, options()) }, Err({ at: c.at, why: c.why }))
+  assert_eq(compile(c.pattern), Err({ at: c.at, reason: c.reason }));
+  assert_eq(try { read(c.pattern, options()) }, Err({ at: c.at, reason: c.reason }))
 }
 
 test "the separator, case and hidden segments are the options'" {
@@ -870,14 +888,14 @@ test "the separator, case and hidden segments are the options'" {
   assert(matches(cased("stra\u{df}e"), "STRA\u{df}E"));
   assert(!matches(cased("strasse"), "stra\u{df}e"));
   assert(!matches(result_glob(compile("\u{c9}")), "\u{e9}"));
-  let dotted = result_glob(compile_with("**/*", { ..options(), dots: true }));
+  let dotted = result_glob(compile_with("**/*", { ..options(), match_hidden: true }));
   assert(matches(dotted, ".git/config"));
   assert(matches(dotted, "a/.hidden"));
   assert(!matches(glob_of("**/*"), "a/.hidden"))
 }
 
-fn result_glob(r: Result<Glob, Refusal>) -> Glob / {abort.raise} =
-  match r { Ok(g) -> g, Err(e) -> panic(reason(e.why)) }
+fn result_glob(r: Result<Glob, Error>) -> Glob / {abort.raise} =
+  match r { Ok(g) -> g, Err(e) -> panic(reason(e.reason)) }
 
 type Start = { pattern: String, base: String, exact: Option<String> }
 

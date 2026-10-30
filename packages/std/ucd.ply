@@ -30,7 +30,7 @@ pub const fn license() -> String = String::of_bytes(embed("ucd/LICENSE"))
 pub type Run = { first: Int, last: Int, fields: List<Bytes> }
 
 /// A run of code points and the value a table is to hold for each of them.
-pub type Valued = { first: Int, last: Int, value: Int }
+pub type ValueRun = { first: Int, last: Int, value: Int }
 
 /// A table made for `lookup`.
 pub opaque type Table = new {
@@ -48,30 +48,31 @@ fn heading() -> Bytes = {
   Bytes::of_string(f"# Unicode {v.major}.{v.minor}.{v.update}")
 }
 
-fn refused(line: Bytes, why: String) -> String = f"`{String::of_bytes_lossy(line)}` {why}"
+fn line_error(line: Bytes, why: String) -> String = f"`{String::of_bytes_lossy(line)}` {why}"
 
-fn point(digits: Bytes, line: Bytes) -> Int / {abort.raise} =
+fn code_point(digits: Bytes, line: Bytes) -> Int / {abort.raise} =
   match digits.int_of_ascii_radix(16) {
-    Some(cp) -> if cp < 0 { panic(refused(line, "is no run of code points")) }
-    else if cp > 0x10FFFF { panic(refused(line, "is past U+10FFFF")) }
+    Some(cp) -> if cp < 0 { panic(line_error(line, "is no run of code points")) }
+    else if cp > 0x10FFFF { panic(line_error(line, "is past U+10FFFF")) }
     else { cp },
-    None -> panic(refused(line, "is no run of code points")),
+    None -> panic(line_error(line, "is no run of code points")),
   }
 
 fn run_of(line: Bytes) -> Run / {abort.raise} =
   match line.split(b";") {
-    [span, ..fields] -> if fields.len() == 0 { panic(refused(line, "holds no field")) } else {
+    [span, ..fields] -> if fields.len() == 0 { panic(line_error(line, "holds no field")) } else {
       match span.split(b"..") {
-        [one] -> { first: point(one, line), last: point(one, line), fields: fields },
-        [first, last] -> { first: point(first, line), last: point(last, line), fields: fields },
-        _ -> panic(refused(line, "is no run of code points")),
+        [one] -> { first: code_point(one, line), last: code_point(one, line), fields: fields },
+        [first, last] ->
+          { first: code_point(first, line), last: code_point(last, line), fields: fields },
+        _ -> panic(line_error(line, "is no run of code points")),
       }
     },
-    [] -> panic(refused(line, "is no run of code points")),
+    [] -> panic(line_error(line, "is no run of code points")),
   }
 
 /// The runs read so far, and the least code point the next may start at.
-type Reading = { runs: List<Run>, next: Int }
+type ReadState = { runs: List<Run>, next: Int }
 
 /// The runs a table's text holds, in code point order. Raises for a text that does not open with
 /// this version's line, for a line that is neither a comment nor a run with a field, for a run
@@ -81,12 +82,12 @@ pub fn runs(text: Bytes) -> List<Run> / {abort.raise} = {
   let lines = text.split(b"\n");
   if lines.at(0) != Some(heading()) { panic(f"a table opens with `{String::of_bytes(heading())}`") }
   else {
-    lines.fold({ runs: [], next: 0 }, |read: Reading, line: Bytes|
+    lines.fold({ runs: [], next: 0 }, |read: ReadState, line: Bytes|
       if line.len() == 0 || line.at(0) == b'#' { read } else {
         let run = run_of(line);
-        if run.last < run.first { panic(refused(line, "ends before it starts")) }
+        if run.last < run.first { panic(line_error(line, "ends before it starts")) }
         else if run.first < read.next {
-          panic(refused(line, "does not lie after the run before it"))
+          panic(line_error(line, "does not lie after the run before it"))
         } else { { runs: read.runs.push(run), next: run.last + 1 } }
       }).runs
   }
@@ -96,10 +97,10 @@ pub fn runs(text: Bytes) -> List<Run> / {abort.raise} = {
 type Span = { count: Int, value: Int }
 
 /// Every code point from zero as spans: each run's, with what lies in no run between them.
-type Covering = { spans: List<Span>, next: Int }
+type CoverState = { spans: List<Span>, next: Int }
 
-fn covering(held: List<Valued>, missing: Int) -> List<Span> / {abort.raise} = {
-  let covered = held.fold({ spans: [], next: 0 }, |acc: Covering, run: Valued|
+fn covering(held: List<ValueRun>, missing: Int) -> List<Span> / {abort.raise} = {
+  let covered = held.fold({ spans: [], next: 0 }, |acc: CoverState, run: ValueRun|
     if run.first < acc.next || run.last < run.first || run.last > 0x10FFFF {
       panic("a table's runs rise, do not meet and end by U+10FFFF")
     } else {
@@ -116,10 +117,10 @@ fn covering(held: List<Valued>, missing: Int) -> List<Span> / {abort.raise} = {
 }
 
 /// Each distinct value under a number of its own, in the order they first appear.
-type Numbered = { ids: Map<Int, Int>, values: List<Int> }
+type Numbering = { ids: Map<Int, Int>, values: List<Int> }
 
-fn numbered(spans: List<Span>) -> Numbered =
-  spans.fold({ ids: Map::new(), values: [] }, |acc: Numbered, span: Span|
+fn number_values(spans: List<Span>) -> Numbering =
+  spans.fold({ ids: Map::new(), values: [] }, |acc: Numbering, span: Span|
     if acc.ids.contains(span.value) { acc } else {
       { ids: acc.ids.insert(span.value, acc.values.len()), values: acc.values.push(span.value) }
     })
@@ -133,7 +134,7 @@ fn repeated(unit: Bytes, n: Int) -> Bytes =
   }
 
 /// The blocks met so far, each once, and the block every 256 code points read from.
-type Cut = { index: List<Int>, blocks: List<Bytes>, seen: Map<Bytes, Int> }
+type BlockState = { index: List<Int>, blocks: List<Bytes>, seen: Map<Bytes, Int> }
 
 /// The table of the runs `text` holds, each run's value what `value` makes of its fields and
 /// `missing` the value of a code point in no run. Raises where `runs` does and where `value`
@@ -153,9 +154,9 @@ pub fn table(
 /// none: what `table` makes, for a reader whose values are not a line's alone, as an index into
 /// what it gathers from every line is. Raises for runs that do not rise or that meet, for one
 /// past `U+10FFFF`, and for more than 65536 distinct values.
-pub fn table_of(valued: List<Valued>, missing: Int) -> Table / {abort.raise} = {
+pub fn table_of(valued: List<ValueRun>, missing: Int) -> Table / {abort.raise} = {
   let spans = covering(valued, missing);
-  let known = numbered(spans);
+  let known = number_values(spans);
   if known.values.len() > 65536 { panic("a table holds at most 65536 distinct values") } else {
     // Two bytes a code point, the number of its value, so that a block is compared as bytes.
     let numbers = Bytes::concat_all(
@@ -167,7 +168,7 @@ pub fn table_of(valued: List<Valued>, missing: Int) -> Table / {abort.raise} = {
     );
     let cut = range(0, 4352).fold(
       { index: [], blocks: [], seen: Map::new() },
-      |acc: Cut, i: Int| {
+      |acc: BlockState, i: Int| {
         let block = numbers.slice(i * 512, i * 512 + 512);
         match acc.seen.get(block) {
           Some(at) -> { index: acc.index.push(at), blocks: acc.blocks, seen: acc.seen },
@@ -194,33 +195,33 @@ pub fn table_of(valued: List<Valued>, missing: Int) -> Table / {abort.raise} = {
 
 /// The code points a field lists, each in hexadecimal with a blank between them: none for an
 /// empty field. Raises for a field that holds anything else.
-pub fn points(field: Bytes) -> List<Int> / {abort.raise} =
+pub fn code_points(field: Bytes) -> List<Int> / {abort.raise} =
   field.split(b" ").filter(|part: Bytes| part.len() > 0).map(|part: Bytes|
     match part.int_of_ascii_radix(16) {
-      Some(cp) -> if cp < 0 || cp > 0x10FFFF { panic(refused(field, "lists no code points")) }
+      Some(cp) -> if cp < 0 || cp > 0x10FFFF { panic(line_error(field, "lists no code points")) }
       else { cp },
-      None -> panic(refused(field, "lists no code points")),
+      None -> panic(line_error(field, "lists no code points")),
     })
 
 /// How far a mapping lies from its code point, as a table writes it in decimal with a `-` for
-/// one below: twenty bits in two's complement, which a value holds beside others and `away`
+/// one below: twenty bits in two's complement, which a value holds beside others and `apply_distance`
 /// reads. Nothing is `0`. Raises for anything else, and for a distance past `2^19`.
 pub fn distance(text: Bytes) -> Int / {abort.raise} =
   if text.len() == 0 { 0 } else {
     match text.int_of_ascii() {
       Some(d) -> if d < -0x80000 || d > 0x7FFFF {
-        panic(refused(text, "is no distance within 2^19"))
+        panic(line_error(text, "is no distance within 2^19"))
       } else { d & 0xFFFFF },
-      None -> panic(refused(text, "is no distance within 2^19")),
+      None -> panic(line_error(text, "is no distance within 2^19")),
     }
   }
 
 /// The code point that lies from `cp` the distance the low twenty bits of `held` are.
-pub fn away(cp: Int, held: Int) -> Int = cp + (held & 0xFFFFF ^ 0x80000) - 0x80000
+pub fn apply_distance(cp: Int, held: Int) -> Int = cp + (held & 0xFFFFF ^ 0x80000) - 0x80000
 
 /// Sequences of code points gathered end to end, for a table whose values are sequences: the
-/// table holds the place `gather` answers, and `sequence` reads the place back.
-pub type Gathering = {
+/// table holds the place `intern` answers, and `sequence` reads the place back.
+pub type SequencePool = {
   /// Every sequence gathered, one after another.
   points: List<Int>,
   /// Where each distinct sequence was put, so that one gathered twice is held once.
@@ -228,15 +229,15 @@ pub type Gathering = {
 }
 
 /// The gathering of nothing.
-pub fn gathering() -> Gathering = { points: [], places: Map::new() }
+pub fn empty_pool() -> SequencePool = { points: [], places: Map::new() }
 
 /// `sequence` gathered into `so_far`, and its place: where it starts, shifted five bits, and how
 /// many code points it is, so the place of a sequence that holds any is never zero, which is the
 /// place of the empty one. Raises for a sequence of more than 31.
-pub fn gather(
-  so_far: Gathering,
+pub fn intern(
+  so_far: SequencePool,
   sequence: List<Int>,
-) -> { gathering: Gathering, place: Int } / {abort.raise} =
+) -> { gathering: SequencePool, place: Int } / {abort.raise} =
   if sequence.len() > 31 { panic("a gathered sequence is at most 31 code points") }
   else if sequence.len() == 0 { { gathering: so_far, place: 0 } } else {
     match so_far.places.get(sequence) {
@@ -255,9 +256,9 @@ pub fn gather(
   }
 
 /// The sequence at `place` among the code points gathered in `points`; none for a place of zero.
-pub fn sequence(points: Array<Int>, place: Int) -> List<Int> =
+pub fn sequence(code_points: Array<Int>, place: Int) -> List<Int> =
   range(place >> 5, (place >> 5) + (place & 31)).fold([], |found: List<Int>, i: Int|
-    match points.at(i) { Some(cp) -> found.push(cp), None -> found })
+    match code_points.at(i) { Some(cp) -> found.push(cp), None -> found })
 
 /// The value `held` holds for the code point `cp`, and its missing value for an `Int` that is no
 /// code point. Two reads, whatever `cp` is.
@@ -292,25 +293,24 @@ test "a table's lines are its runs, comments apart" {
   assert_eq(runs(text_of([])), [])
 }
 
-type Stray = { line: String, why: String }
+type InvalidLineCase = { line: String, reason: String }
 
-fn strays() -> List<Stray> =
+fn invalid_lines() -> List<InvalidLineCase> =
   [
-    { line: "0041", why: "`0041` holds no field" },
-    { line: ";Lu", why: "`;Lu` is no run of code points" },
-    { line: "0041..005A..0060;Lu", why: "`0041..005A..0060;Lu` is no run of code points" },
-    { line: "004G;Lu", why: "`004G;Lu` is no run of code points" },
-    { line: "0041 ;Lu", why: "`0041 ;Lu` is no run of code points" },
-    { line: "110000;Cn", why: "`110000;Cn` is past U+10FFFF" },
-    { line: "-0041;Lu", why: "`-0041;Lu` is no run of code points" },
-    { line: "005A..0041;Lu", why: "`005A..0041;Lu` ends before it starts" },
-    { line: "0030;Nd", why: "`0030;Nd` does not lie after the run before it" },
-    { line: "005A;Lu", why: "`005A;Lu` does not lie after the run before it" },
+    { line: "0041", reason: "`0041` holds no field" },
+    { line: ";Lu", reason: "`;Lu` is no run of code points" },
+    { line: "0041..005A..0060;Lu", reason: "`0041..005A..0060;Lu` is no run of code points" },
+    { line: "004G;Lu", reason: "`004G;Lu` is no run of code points" },
+    { line: "0041 ;Lu", reason: "`0041 ;Lu` is no run of code points" },
+    { line: "110000;Cn", reason: "`110000;Cn` is past U+10FFFF" },
+    { line: "-0041;Lu", reason: "`-0041;Lu` is no run of code points" },
+    { line: "005A..0041;Lu", reason: "`005A..0041;Lu` ends before it starts" },
+    { line: "0030;Nd", reason: "`0030;Nd` does not lie after the run before it" },
+    { line: "005A;Lu", reason: "`005A;Lu` does not lie after the run before it" },
   ]
 
-test "a table whose line {c.line} follows 0041..005A is refused" for c: Stray in strays() {
-  assert_eq(try[abort.raise] { runs(text_of(["0041..005A;Lu", c.line])) }, Err(c.why))
-}
+test "a table whose line {c.line} follows 0041..005A is refused" for c: InvalidLineCase in invalid_lines(
+  ) { assert_eq(try[abort.raise] { runs(text_of(["0041..005A;Lu", c.line])) }, Err(c.reason)) }
 
 test "a table of another version, or of none, is refused" {
   let told = Err("a table opens with `# Unicode 17.0.0`");
@@ -340,7 +340,7 @@ test "a lookup answers each run's value, and the missing value everywhere else" 
 
 /// A table of `count` runs, each 257 code points from the last and 256 long, run `i` holding `i`
 /// in decimal: no two blocks alike, and more values than a byte numbers.
-fn striped(count: Int) -> Bytes / {abort.raise} =
+fn distinct_blocks_table(count: Int) -> Bytes / {abort.raise} =
   text_of(
     range(0, count).map(|i: Int|
       f"{u32_be(i * 257).hex_of()}..{u32_be(i * 257 + 255).hex_of()};{i}"),
@@ -353,7 +353,7 @@ fn number(fields: List<Bytes>) -> Int / {abort.raise} =
   }
 
 test "every code point of a table with more values than a byte numbers reads as its run says" {
-  let held = table(striped(1200), -7, number);
+  let held = table(distinct_blocks_table(1200), -7, number);
   let wrong = range(0, 1200 * 257 + 600).filter(|cp: Int|
     lookup(held, cp) != (if cp >= 1200 * 257 || cp % 257 == 256 { -7 } else { cp / 257 }));
   assert_eq(wrong, [])
@@ -373,38 +373,38 @@ test "a table of valued runs reads as one of lines does, and runs that meet or f
     0,
   ]);
   let told = Err("a table's runs rise, do not meet and end by U+10FFFF");
-  let made = |runs: List<Valued>| try[abort.raise] { lookup(table_of(runs, 0), 0) };
+  let made = |runs: List<ValueRun>| try[abort.raise] { lookup(table_of(runs, 0), 0) };
   assert_eq(made([{ first: 5, last: 9, value: 1 }, { first: 9, last: 12, value: 2 }]), told);
   assert_eq(made([{ first: 5, last: 4, value: 1 }]), told);
   assert_eq(made([{ first: 0x10FFFF, last: 0x110000, value: 1 }]), told)
 }
 
 test "a field lists its code points, and anything else in one is refused" {
-  assert_eq(points(b"0041 0300  10FFFF"), [0x41, 0x300, 0x10FFFF]);
-  assert_eq(points(b""), []);
-  assert_eq(try[abort.raise] { points(b"0041 x") }, Err("`0041 x` lists no code points"));
-  assert_eq(try[abort.raise] { points(b"110000") }, Err("`110000` lists no code points"))
+  assert_eq(code_points(b"0041 0300  10FFFF"), [0x41, 0x300, 0x10FFFF]);
+  assert_eq(code_points(b""), []);
+  assert_eq(try[abort.raise] { code_points(b"0041 x") }, Err("`0041 x` lists no code points"));
+  assert_eq(try[abort.raise] { code_points(b"110000") }, Err("`110000` lists no code points"))
 }
 
 test "a sequence gathered is read back from its place, and one gathered twice is held once" {
-  let one = gather(gathering(), [0x73, 0x73]);
-  let two = gather(one.gathering, [0x66, 0x66, 0x69]);
-  let again = gather(two.gathering, [0x73, 0x73]);
+  let one = intern(empty_pool(), [0x73, 0x73]);
+  let two = intern(one.gathering, [0x66, 0x66, 0x69]);
+  let again = intern(two.gathering, [0x73, 0x73]);
   let held = Array::of_list(again.gathering.points);
   assert_eq(held.len(), 5);
   assert_eq(again.place, one.place);
   assert_eq(sequence(held, one.place), [0x73, 0x73]);
   assert_eq(sequence(held, two.place), [0x66, 0x66, 0x69]);
   assert_eq(sequence(held, 0), []);
-  assert_eq(gather(again.gathering, []).place, 0);
-  assert_eq([b"", b"0", b"32", b"-32"].map(|text: Bytes| away(100, distance(text))), [
+  assert_eq(intern(again.gathering, []).place, 0);
+  assert_eq([b"", b"0", b"32", b"-32"].map(|text: Bytes| apply_distance(100, distance(text))), [
     100,
     100,
     132,
     68,
   ]);
   assert_eq(
-    try[abort.raise] { gather(gathering(), range(0, 32)).place },
+    try[abort.raise] { intern(empty_pool(), range(0, 32)).place },
     Err("a gathered sequence is at most 31 code points"),
   )
 }

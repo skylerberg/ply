@@ -11,29 +11,31 @@ import compiler.cc (toolchain)
 import std.env (env)
 import results
 import proof.rules (Congruence)
-import program (Timed, front_of, owned_of, own_diags, timed_load, timed_uncached, whole_of,
-                program_view)
+import program (TimedLoad, loaded_analysis, in_root_package, own_diags, timed_load, timed_uncached,
+                whole_of, program_view)
 import std.machine as entering
-import proof.world (Built, world_of)
+import proof.prover_input (ProverInputResult, prover_input_of)
 import machine
 import units
 import units (emit)
-import claims (Broken, Options, proofs, discharging, decisions, Accepted, Claim, Claimed, Collected,
-               Collection, Discharged, Refusal, Row, Verdicts, a_claim, a_counter, a_fault, a_place,
-               claim_rows, claimed_part, code_of, collected_part, collection_of, coverage_json,
-               coverage_lines, decided, detail_of, diagnostics_of, failure, label_of, laws_in,
-               mark_of, no_statics, obligation_json, a_plan, once_each, outcome_word, own_claims,
-               plan_json, proved, refusal, rows_of, Statics, statics_of)
-import proof.decide (Static)
+import claims (NotCompiled, Options, proof_store, discharging, decisions, AcceptResult, Claim,
+               OwnClaims, LoadResult, Collection, DischargeResult, Refusal, Row, Verdicts, a_claim,
+               a_counter, a_fault, a_place, claim_rows, claimed_part, exit_code_of, collected_part,
+               collection_of, coverage_json, coverage_lines, decide_claims, detail_of,
+               diagnostics_of, failure_code, label_of, laws_in, mark_of, no_static_prover,
+               obligation_json, a_plan, once_each, outcome_word, own_claims, plan_json, proved,
+               failure_output, rows_of, StaticProver, static_prover_of)
+import proof.decide (StaticResult)
 import proof.obligation (Change, Changed, Changes, Coverage, Def, Defect, Ensures, Fresh, Gap,
-                         Moved, Never, Outcome, Record, Refuted, Unchanged, UnhandledEffect,
-                         Unproved, record_map, records, review, claimed, is_specified, plural)
+                         ChangeState, Never, Outcome, ClaimSnapshot, Refuted, Unchanged,
+                         UnhandledEffect, Unproved, snapshot_map, claim_snapshots, review,
+                         has_obligations, is_specified, plural)
 import builder (builder)
 import std.fs (fs)
 import std.time (time)
 import compiler.check.resolve.tables (Diag)
-import diagnostic (Place, all_to_json)
-import report (Answer, indent, ok_code, schema_version, count_of, warning_lines)
+import diagnostic (SourceText, all_to_json)
+import report (CommandOutput, indent, ok_code, schema_version, count_of, warning_lines)
 import std.json (Json, Str, Bool, Number, Array, object, to_string, int)
 import std.list
 import std.term (Style, bold, dim, red)
@@ -43,15 +45,16 @@ import semantics (semantics)
 
 // --- How a changed definition reads ------------------------------------------
 
-fn moved_word(m: Moved) -> String =
+fn change_word(m: ChangeState) -> String =
   match m { Unchanged -> "unchanged", Changed -> "changed", Never -> "never reviewed" }
 
 fn row_of(change: Change) -> String =
   match change.implementation {
     Never -> change.name ++ " · never reviewed",
     _ -> {
-      let spec = if claimed(change) { "spec " ++ moved_word(change.spec) } else { "no spec" };
-      change.name ++ " · implementation " ++ moved_word(change.implementation) ++ " · " ++ spec
+      let spec = if has_obligations(change) { "spec " ++ change_word(change.spec) }
+      else { "no spec" };
+      change.name ++ " · implementation " ++ change_word(change.implementation) ++ " · " ++ spec
     },
   }
 
@@ -62,7 +65,7 @@ fn review_both() -> String = "review both; what is proved says how much the mach
 /// What a reader is left to do, which is the whole point of the command.
 fn advice(change: Change) -> String =
   if !is_specified(change) {
-    if claimed(change) {
+    if has_obligations(change) {
       "no obligation on this definition holds: read the implementation, line by line"
     } else { "read the implementation, line by line, exactly as today" }
   } else {
@@ -120,7 +123,7 @@ pub fn headline_of(changes: Changes) -> String / {abort.raise} =
 
 // --- The lines a reader reads --------------------------------------------------
 
-fn detail_line(style: Style, row: Row, places: List<Place>) -> String / {abort.raise} = {
+fn detail_line(style: Style, row: Row, places: List<SourceText>) -> String / {abort.raise} = {
   // What a refutation says here is that the claim stopped holding; where it fails is `ply prove`'s
   // business, and this command is read for what moved.
   let detail = match row.outcome { Refuted(_) -> "no longer holds", _ -> detail_of(row, places) };
@@ -136,7 +139,7 @@ fn entry_lines(
   style: Style,
   change: Change,
   rows: List<Row>,
-  places: List<Place>,
+  places: List<SourceText>,
 ) -> List<String> / {abort.raise} = {
   let head = [indent() ++ bold(style, row_of(change))];
   let listed = change.obligations.fold(head, |acc: List<String>, index: Int|
@@ -177,12 +180,12 @@ fn lines_of(
 // --- The document ---------------------------------------------------------------
 
 fn spec_word(change: Change) -> String =
-  if claimed(change) { moved_word(change.spec) } else { "none" }
+  if has_obligations(change) { change_word(change.spec) } else { "none" }
 
-fn change_json(change: Change, rows: List<Row>, places: List<Place>) -> Json / {abort.raise} =
+fn change_json(change: Change, rows: List<Row>, places: List<SourceText>) -> Json / {abort.raise} =
   object([
     { key: "name", value: Str(change.name) },
-    { key: "implementation", value: Str(moved_word(change.implementation)) },
+    { key: "implementation", value: Str(change_word(change.implementation)) },
     { key: "spec", value: Str(spec_word(change)) },
     { key: "specified", value: Bool(is_specified(change)) },
     { key: "advice", value: Str(advice(change)) },
@@ -240,7 +243,7 @@ fn accepted_document(
   warnings: List<Diag>,
   definitions: Int,
   code: Int,
-  places: List<Place>,
+  places: List<SourceText>,
 ) -> Json / {abort.raise} =
   object([
     { key: "schema_version", value: int(schema_version()) },
@@ -270,9 +273,13 @@ fn accepted_lines(
     warning_lines(style, warnings),
   )
 
-fn accepted_answer(style: Style, collection: Collection, a: Accepted) -> Answer / {abort.raise} = {
+fn accepted_output(
+  style: Style,
+  collection: Collection,
+  a: AcceptResult,
+) -> CommandOutput / {abort.raise} = {
   let warnings = once_each(collection.warnings.concat(a.warnings));
-  let code = if a.stored { ok_code() } else { failure() };
+  let code = if a.stored { ok_code() } else { failure_code() };
   {
     json: accepted_document(warnings, a.definitions, code, collection.places),
     lines: accepted_lines(style, warnings, a.definitions),
@@ -283,15 +290,15 @@ fn accepted_answer(style: Style, collection: Collection, a: Accepted) -> Answer 
 
 // --- The answer -------------------------------------------------------------------
 
-fn reviewed_answer(
+fn review_output(
   style: Style,
   collection: Collection,
   v: Verdicts,
   changes: Changes,
   rows: List<Row>,
-) -> Answer / {abort.raise} = {
+) -> CommandOutput / {abort.raise} = {
   let warnings = once_each(collection.warnings.concat(v.warnings));
-  let code = code_of(rows);
+  let code = exit_code_of(rows);
   {
     json: document(collection, v, changes, rows, code, warnings),
     lines: lines_of(style, collection, v, changes, rows, warnings),
@@ -304,38 +311,38 @@ fn all_of(claims: List<Claim>) -> List<Int> = range(0, claims.len())
 
 /// A review reports on everything the collection holds: what moved since the baseline a reader
 /// accepted, and what became of the claims that went with it.
-fn changed_answer<| e>(
+fn review_changes<| e>(
   style: Style,
   collection: Collection,
   use_cache: Bool,
-  statics: Statics,
-  discharge: (Collection, List<Int>, List<Static>) -> Result<Discharged, Refusal> / {discharging.decided | e},
-) -> Answer / {abort.raise, proofs.record, proofs.baselines, proofs.cached | e} = {
+  statics: StaticProver,
+  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Refusal> / {discharging.decided | e},
+) -> CommandOutput / {abort.raise, proof_store.record, proof_store.baselines, proof_store.cached | e} = {
   let wanted = all_of(collection.claims);
   let ran = handle {
-    decided(
+    decide_claims(
       collection,
       wanted,
       use_cache,
       statics,
       false,
-      |runs: List<Int>, settled: List<Static>| discharge(collection, runs, settled),
+      |runs: List<Int>, settled: List<StaticResult>| discharge(collection, runs, settled),
     )
   } with {
     decisions.known(_row) -> (),
   };
   match ran {
-    Err(why) -> refusal(style, "review", why),
+    Err(why) -> failure_output(style, "review", why),
     Ok(v) -> {
       let laws = laws_in(collection);
       let ch = review(
         collection.defs.map(|def: Def| def.name),
         laws,
-        record_map(records(collection.defs, laws)),
-        record_map(proofs.baselines(collection.defs.map(|def: Def| def.name))),
+        snapshot_map(claim_snapshots(collection.defs, laws)),
+        snapshot_map(proof_store.baselines(collection.defs.map(|def: Def| def.name))),
         claim_rows(collection, wanted, v.outcomes),
       );
-      reviewed_answer(style, collection, v, ch, rows_of(collection.claims, wanted, v))
+      review_output(style, collection, v, ch, rows_of(collection.claims, wanted, v))
     },
   }
 }
@@ -343,22 +350,22 @@ fn changed_answer<| e>(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {semantics.cached, shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, env.variable, env.working_directory, entering::machine.open, entering::machine.enter, entering::machine.close, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, emit.compiled, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, env.variable, env.working_directory, entering::machine.open, entering::machine.enter, entering::machine.close, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, emit.compiled, Derives, abort.raise, diverges, shipped.report_reached} = {
   let s: Style = style_of(flags);
-  let t: Timed = if options.no_incremental { timed_uncached(flags.paths, flags.verify_deps) }
+  let t: TimedLoad = if options.no_incremental { timed_uncached(flags.paths, flags.verify_deps) }
   else { timed_load(flags.paths, flags.verify_deps) };
   // A load refusal is the same kind of answer the machine's own refusals are, so it reads
   // through the one renderer: nothing was proved, and the diagnostics say why.
   let broken = |diags: List<Diag>|
-    refusal(s, "review", Broken({ diags: diags, places: t.program.places }));
+    failure_output(s, "review", NotCompiled({ diags: diags, places: t.program.places }));
   match program_view(t.program) {
     None -> broken(t.program.diags),
     Some(v) -> match whole_of(t.program) {
       Err(diags) -> broken(diags),
       Ok(w) -> {
         // The shipped modules' claims are the toolchain's, which its own checkout's run reviews.
-        let owned = owned_of(v.frame);
-        let built: Built = world_of(w, owned);
+        let owned = in_root_package(v.frame);
+        let built: ProverInputResult = prover_input_of(w, owned);
         results::with_review(results::store_for(flags.paths, flags.no_cache), ||
           review_over(
             s,
@@ -366,9 +373,9 @@ pub fn run(
             options,
             { places: t.program.places, warnings: own_diags(t.program.diags, v.frame) },
             own_claims(w, built),
-            statics_of(w, built.world, owned),
-            |collection: Collection, runs: List<Int>, settled: List<Static>|
-              claims::discharged_over(front_of(t, v), collection, runs, settled),
+            static_prover_of(w, built.world, owned),
+            |collection: Collection, runs: List<Int>, settled: List<StaticResult>|
+              claims::discharge_on_unit(loaded_analysis(t, v), collection, runs, settled),
           ))
       },
     },
@@ -381,15 +388,15 @@ fn review_over<| e>(
   style: Style,
   flags: Flags,
   options: Options,
-  got: Collected,
-  mine: Claimed,
-  statics: Statics,
-  discharge: (Collection, List<Int>, List<Static>) -> Result<Discharged, Refusal> / {discharging.decided | e},
-) -> Answer / {abort.raise, proofs.record, proofs.baselines, proofs.accepted, proofs.cached | e} = {
+  got: LoadResult,
+  mine: OwnClaims,
+  statics: StaticProver,
+  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Refusal> / {discharging.decided | e},
+) -> CommandOutput / {abort.raise, proof_store.record, proof_store.baselines, proof_store.accepted, proof_store.cached | e} = {
   let c = collection_of(got, mine, options);
   if flags.action == "accept" {
-    accepted_answer(style, c, proofs.accepted(records(c.defs, laws_in(c))))
-  } else { changed_answer(style, c, !flags.no_cache, statics, discharge) }
+    accepted_output(style, c, proof_store.accepted(claim_snapshots(c.defs, laws_in(c))))
+  } else { review_changes(style, c, !flags.no_cache, statics, discharge) }
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -412,8 +419,8 @@ fn no_changes() -> Changes = { reviewed: 0, changed: [], broken: 0, undischarged
 
 fn a_change(
   name: String,
-  implementation: Moved,
-  spec: Moved,
+  implementation: ChangeState,
+  spec: ChangeState,
   obligations: List<Int>,
   holding: Int,
 ) -> Change =
@@ -431,10 +438,10 @@ fn reviewed_over(
   collection: Collection,
   v: Verdicts,
   changes: Changes,
-  a: Accepted,
-) -> Answer / {abort.raise} =
+  a: AcceptResult,
+) -> CommandOutput / {abort.raise} =
   if flags.action == "accept" { accepted_over(flags, collection, a) } else {
-    reviewed_answer(
+    review_output(
       style_of(flags),
       collection,
       v,
@@ -445,13 +452,13 @@ fn reviewed_over(
 
 /// A whole run against a runtime that answers these: the baselines it holds, what it discharged, and
 /// what it made of the records it was asked to accept.
-fn ran_over(
+fn review_fixture(
   flags: Flags,
   c: Collection,
-  d: Discharged,
-  held: List<{ name: String, record: Record }>,
-  a: Accepted,
-) -> Answer / {abort.raise} =
+  d: DischargeResult,
+  baselines: List<{ name: String, record: ClaimSnapshot }>,
+  a: AcceptResult,
+) -> CommandOutput / {abort.raise} =
   handle {
     review_over(
       style_of(flags),
@@ -459,8 +466,8 @@ fn ran_over(
       claims::no_options(),
       collected_part(c),
       claimed_part(c),
-      no_statics(None),
-      |_c: Collection, runs: List<Int>, _settled: List<Static>|
+      no_static_prover(None),
+      |_c: Collection, runs: List<Int>, _settled: List<StaticResult>|
         Ok({
           ..d,
           outcomes: runs.fold([], |out: List<Outcome>, i: Int|
@@ -468,14 +475,18 @@ fn ran_over(
         }),
     )
   } with {
-    proofs.cached(keys) -> keys.map(|_k: String| None),
-    proofs.record(entries) -> [],
-    proofs.baselines(names) -> held,
-    proofs.accepted(records) -> { ..a, definitions: records.len() },
+    proof_store.cached(keys) -> keys.map(|_k: String| None),
+    proof_store.record(entries) -> [],
+    proof_store.baselines(names) -> baselines,
+    proof_store.accepted(records) -> { ..a, definitions: records.len() },
   }
 
-fn accepted_over(flags: Flags, collection: Collection, a: Accepted) -> Answer / {abort.raise} =
-  ran_over(
+fn accepted_over(
+  flags: Flags,
+  collection: Collection,
+  a: AcceptResult,
+) -> CommandOutput / {abort.raise} =
+  review_fixture(
     flags,
     collection,
     { outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] },
@@ -483,7 +494,7 @@ fn accepted_over(flags: Flags, collection: Collection, a: Accepted) -> Answer / 
     a,
   )
 
-fn nothing_accepted() -> Accepted = { definitions: 0, stored: true, warnings: [] }
+fn nothing_accepted() -> AcceptResult = { definitions: 0, stored: true, warnings: [] }
 
 fn changed_flags() -> Flags / {abort.raise} = from_argv("review", [])
 
@@ -555,7 +566,7 @@ test "an unproved obligation on a changed definition says nothing was establishe
   assert(!headline.contains("no longer hold"));
   assert_eq(answer.lines.at_or(3, ""), "   m.stored · implementation changed · spec unchanged");
   assert(answer.lines.at_or(4, "").contains("unproved"));
-  assert_eq(answer.code, failure())
+  assert_eq(answer.code, failure_code())
 }
 
 // Ply's failure refutes nothing, so the headline may only say the obligation was not proved.
@@ -564,7 +575,7 @@ test "an obligation Ply failed on under a changed definition was not proved, and
     ..a_collection(one_claim()),
     defs: [{ name: "m.double", hash: Some("h2"), specs: [] }],
   };
-  let answer = ran_over(
+  let answer = review_fixture(
     changed_flags(),
     c,
     { outcomes: [Defect(a_fault())], duration_ms: Decimal::of_int(0), warnings: [] },
@@ -655,14 +666,14 @@ test "a definition with no obligation at all reports `none` rather than a spec t
   assert_eq(row_of(a_change("m.new", Never, Never, [], 0)), "m.new · never reviewed")
 }
 
-fn three() -> Collection =
+fn three_claims() -> Collection =
   a_collection([a_claim("m.a", Ensures(0)), a_claim("m.b", Ensures(0)), a_claim("m.c", Ensures(0))])
 
 test "`--accept` records a baseline and says what a name change costs" {
-  let accepted: Accepted = { definitions: 0, stored: true, warnings: [] };
+  let accepted: AcceptResult = { definitions: 0, stored: true, warnings: [] };
   let answer = reviewed_over(
     from_argv("review", ["--accept"]),
-    three(),
+    three_claims(),
     verdicts([], 3),
     no_changes(),
     accepted,
@@ -688,10 +699,10 @@ test "a baseline that could not be stored is exit 1 and says so" {
     severity: b"error",
     fixes: [],
   };
-  let accepted: Accepted = { definitions: 0, stored: false, warnings: [e] };
+  let accepted: AcceptResult = { definitions: 0, stored: false, warnings: [e] };
   let answer = reviewed_over(
     from_argv("review", ["--accept"]),
-    three(),
+    three_claims(),
     verdicts([], 3),
     no_changes(),
     accepted,
@@ -709,7 +720,7 @@ test "a review decides what moved from the baselines the runtime holds" {
       { name: "m.same", hash: Some("h1"), specs: [] },
     ],
   };
-  let answer = ran_over(
+  let answer = review_fixture(
     changed_flags(),
     c,
     { outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] },

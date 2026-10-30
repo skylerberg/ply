@@ -1,0 +1,818 @@
+//! The scalar family's lowering read off programs: the decision each operator, literal and per-type
+//! operation takes, and a corpus that lowers, checks and prints.
+
+import compiler.check.types (Type, VariableType, NamedType, int_type, string_type, bytes_type,
+                             option_type, list_type, map_type, secret_type)
+import compiler.check.known (result_type)
+import compiler.syntax.patterns (LiteralString, LiteralDecimal, LiteralWide, LiteralUnit)
+import compiler.emit.output (Exact)
+import compiler.emit.keys
+import compiler.emit.keys (Root, RootName, root_name, root_text)
+import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFixed, AsFloat, AsDecimal,
+                               AsWideFixed, AsWord, AsSum, AsImmediate, Var, Arg, VarOperand,
+                               IntOperand, FixedOperand, CharOperand, Rvalue, Primitive, Literal,
+                               Get, Tag, Call, Native, Inst, Let, Do, If, Block)
+import compiler.emit.emit_harness (Program, program_of, lowered_root, printed_by_ir, build_failures)
+
+import compiler.emit.typed_ir (Static)
+import compiler.emit.statics (Datum, StringDatum, statics_of)
+
+/// Every value `b` binds or does, through the blocks its branches hold.
+fn values(b: Block) -> List<Rvalue> =
+  b.fold([], |acc: List<Rvalue>, i: Inst|
+    match i {
+      Let(l) -> acc.push(l.val),
+      Do(d) -> acc.push(d.val),
+      If(x) -> acc.concat(values(x.then)).concat(values(x.otherwise)),
+      _ -> acc,
+    })
+
+/// Every variable `b` binds, through the blocks its branches hold.
+fn bound_in(b: Block) -> List<Var> =
+  b.fold([], |acc: List<Var>, i: Inst|
+    match i {
+      Let(l) -> acc.push(l.var),
+      If(x) -> acc.concat(bound_in(x.then)).concat(bound_in(x.otherwise)),
+      _ -> acc,
+    })
+
+type OperatorUse = { op: Bytes, on: Representation }
+
+/// The operators root `name` of `p` applies, in order, or why it was not formed.
+fn operators_applied(p: Program, name: Bytes) -> Result<List<OperatorUse>, Bytes> / {abort.raise} = {
+  let f = lowered_root(p, name);
+  Ok(
+    values(f.body).fold([], |acc: List<OperatorUse>, v: Rvalue|
+      match v { Primitive(x) -> acc.push({ op: x.op, on: x.on }), _ -> acc }),
+  )
+}
+
+/// The roots root `name` of `p` calls by name, or why it was not formed.
+fn roots_called(p: Program, name: Bytes) -> Result<List<RootName>, Bytes> / {abort.raise} = {
+  let f = lowered_root(p, name);
+  Ok(
+    values(f.body).fold([], |acc: List<RootName>, v: Rvalue|
+      match v {
+        Call(c) -> match c.callee { Root(k) -> acc.push(root_name(k)), _ -> acc },
+        _ -> acc,
+      }),
+  )
+}
+
+/// The runtime functions root `name` of `p` calls, or why it was not formed.
+fn natives(p: Program, name: Bytes) -> Result<List<Bytes>, Bytes> / {abort.raise} = {
+  let f = lowered_root(p, name);
+  Ok(
+    values(f.body).fold([], |acc: List<Bytes>, v: Rvalue|
+      match v { Native(n) -> acc.push(n.name), _ -> acc }),
+  )
+}
+
+fn program(src: Bytes) -> Program / {abort.raise} =
+  match program_of(src) { Ok(p) -> p, Err(why) -> panic(String::of_bytes(why)) }
+
+/// The root written in `m` for operation `op` of `ty`, by its name.
+fn written_root(op: keys::TypeOp, ty: Type) -> RootName / {abort.raise} =
+  root_name(keys::generated_key(op, ty, b"m"))
+
+fn named_type(name: Bytes, args: List<Type>) -> Type = NamedType({ name: name, args: args })
+
+/// The operands of each operator root `name` of `p` applies, in order, or why it was not formed.
+fn operands(p: Program, name: Bytes) -> Result<List<List<Arg>>, Bytes> / {abort.raise} = {
+  let f = lowered_root(p, name);
+  Ok(
+    values(f.body).fold([], |acc: List<List<Arg>>, v: Rvalue|
+      match v { Primitive(x) -> acc.push(x.args), _ -> acc }),
+  )
+}
+
+/// Whether root `name` of `p` reads a field, or why it was not formed.
+fn reads(p: Program, name: Bytes) -> Result<Bool, Bytes> / {abort.raise} = {
+  let f = lowered_root(p, name);
+  Ok(values(f.body).any(|v: Rvalue| match v { Get(_) -> true, _ -> false }))
+}
+
+test "records of a known type are compared and ordered field by field, not by the runtime" {
+  let p = program(
+    Bytes::concat_all([
+      b"type P = { x: Int, name: String }\n",
+      b"type Q = { p: P, k: Char }\n",
+      b"type R = { o: Option<Int>, n: Int }\n",
+      b"fn same(a: P, b: P) -> Bool = a == b\n",
+      b"fn apart(a: Q, b: Q) -> Bool = a != b\n",
+      b"fn order(a: P, b: P) -> Ordering = compare(a, b)\n",
+      b"fn optional(a: R, b: R) -> Bool = a == b\n",
+    ]),
+  );
+  // Fields in the checker's order, each compared only where those before it were equal.
+  assert_eq(
+    operators_applied(p, b"same"),
+    Ok([{ op: b"bytes_eq", on: AsWord }, { op: b"eq", on: AsInt }]),
+  );
+  assert_eq(reads(p, b"same"), Ok(true));
+  assert_eq(natives(p, b"same"), Ok([]));
+  // An `Option` a record holds is compared by the root written for its type.
+  assert_eq(operators_applied(p, b"optional"), Ok([{ op: b"eq", on: AsInt }]));
+  assert_eq(
+    roots_called(p, b"optional"),
+    Ok([written_root(keys::ContainerWalk(b"equal"), option_type(int_type()))]),
+  );
+  assert_eq(natives(p, b"optional"), Ok([]));
+  // A record a record holds is compared field by field again.
+  assert_eq(
+    operators_applied(p, b"apart"),
+    Ok([
+      { op: b"eq", on: AsImmediate },
+      { op: b"bytes_eq", on: AsWord },
+      { op: b"eq", on: AsInt },
+      { op: b"not", on: AsBool },
+    ]),
+  );
+  assert_eq(natives(p, b"apart"), Ok([]));
+  // The first field that orders them apart decides; the sign is made the `Ordering` once.
+  assert_eq(
+    operators_applied(p, b"order"),
+    Ok([
+      { op: b"bytes_order", on: AsWord },
+      { op: b"ne", on: AsInt },
+      { op: b"order", on: AsInt },
+      { op: b"ordering", on: AsInt },
+    ]),
+  );
+  assert_eq(roots_called(p, b"order"), Ok([]))
+}
+
+fn width_representation(bits: Int, signed: Bool) -> Representation =
+  AsFixed({ bits: bits, signed: signed })
+
+test "an operator is read at the type its operands hold, a width's literal as its own bits" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn wadd(a: U8) -> U8 = a + 1u8\n",
+      b"fn half(x: Float) -> Float = 0.5 * x\n",
+      b"fn less(a: Int, b: Int) -> Bool = a < b\n",
+      b"fn wide(a: U64, b: U64) -> U64 = a * b\n",
+      b"fn big(a: U128, b: U128) -> U128 = a + b\n",
+    ]),
+  );
+  let byte = { bits: 8, signed: false };
+  assert_eq(operators_applied(p, b"wadd"), Ok([{ op: b"add", on: AsFixed(byte) }]));
+  // The literal is the width's own bits.
+  assert_eq(
+    operands(p, b"wadd").map(|xs: List<List<Arg>>| xs.map(|a: List<Arg>| a.drop(1))),
+    Ok([[FixedOperand({ width: byte, bits: 1 })]]),
+  );
+  assert_eq(operators_applied(p, b"half"), Ok([{ op: b"mul", on: AsFloat }]));
+  assert_eq(operators_applied(p, b"less"), Ok([{ op: b"lt", on: AsInt }]));
+  assert_eq(
+    operators_applied(p, b"wide"),
+    Ok([{ op: b"mul", on: width_representation(64, false) }]),
+  );
+  // A 128-bit width is its two words, its operator applied to them.
+  assert_eq(
+    operators_applied(p, b"big"),
+    Ok([{ op: b"add", on: AsWideFixed({ bits: 128, signed: false }) }]),
+  );
+  assert_eq(natives(p, b"big"), Ok([]))
+}
+
+test "an Int quotient or remainder by a literal is C's own operator, and by anything else the runtime's" {
+  let p = program(b"fn q(a: Int, b: Int) -> Int / {abort.raise} = a / -4 + a % 7 + a / b\n");
+  {
+    let f = lowered_root(p, b"q");
+    assert_eq(
+      values(f.body).fold([], |acc: List<List<Arg>>, v: Rvalue|
+        match v {
+          Primitive(x) -> if x.op == b"div" || x.op == b"rem" { acc.push(x.args.drop(1)) }
+          else { acc },
+          _ -> acc,
+        }),
+      [[IntOperand(0 - 4)], [IntOperand(7)], [VarOperand(f.params.get(1))]],
+    )
+  };
+  // C divides by the literals itself, and by a variable once it has tested it for 0 and the least
+  // `Int` over -1.
+  match printed_by_ir(p, b"q") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> {
+      assert(text.index_of(b"/ INT64_C(-4)") != None && text.index_of(b"% INT64_C(7)") != None);
+      assert(
+        text.index_of(b"rt_by_zero_p(ctx, ") != None && text.index_of(b"== INT64_MIN)") != None,
+      );
+      assert(text.index_of(b"rt_arith_p(") == None)
+    },
+  }
+}
+
+test "a Decimal is held in registers as its two words, a literal one written as them" {
+  let p = program(
+    b"fn d(a: Decimal, b: Decimal) -> Decimal = a * b - a\nfn dl(a: Decimal) -> Bool = a < 1.5m\n",
+  );
+  assert_eq(
+    operators_applied(p, b"d"),
+    Ok([{ op: b"mul", on: AsDecimal }, { op: b"sub", on: AsDecimal }]),
+  );
+  assert_eq(
+    operators_applied(p, b"dl"),
+    Ok([{ op: b"decimal", on: AsInt }, { op: b"lt", on: AsDecimal }]),
+  );
+  {
+    let f = lowered_root(p, b"dl");
+    assert_eq(bound_in(f.body).map(|v: Var| v.representation), [AsDecimal, AsBool])
+  };
+  // The head's helpers take each operand as its two words, never a box of them.
+  match printed_by_ir(p, b"d") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) ->
+      assert(
+        text.index_of(b"ply_dec_mul(p0, p1, ") != None && text.index_of(b"ply_dec_add(") != None
+          && text.index_of(b"rt_decimal") == text.index_of(b"rt_decimal_overflow_p("),
+        Some(String::of_bytes_lossy(text)),
+      ),
+  };
+  match printed_by_ir(p, b"dl") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) ->
+      assert(text.index_of(b"(PlyDec){") != None && text.index_of(b"ply_dec_order(") != None),
+  }
+}
+
+test "a Char is its own word, compared as C compares the words" {
+  let p = program(b"fn c(a: Char) -> Bool = a < 'z'\n");
+  assert_eq(operators_applied(p, b"c"), Ok([{ op: b"lt", on: AsImmediate }]));
+  assert_eq(
+    operands(p, b"c").map(|xs: List<List<Arg>>| xs.map(|a: List<Arg>| a.drop(1))),
+    Ok([[CharOperand(122)]]),
+  )
+}
+
+test "strings and byte strings are compared by their bytes, constructors of no argument by their index" {
+  let p = program(
+    Bytes::concat_all([
+      b"type Suit = | Hearts | Spades\n",
+      b"fn s(a: String, b: String) -> Bool = a == b\n",
+      b"fn bs(a: Bytes, b: Bytes) -> Bool = a != b\n",
+      b"fn suit(a: Suit, b: Suit) -> Bool = a != b\n",
+      b"fn picked(c: Bool) -> Bool = { let x = if c { Hearts } else { Spades }; let y = if c { Spades } else { Hearts }; x == y }\n",
+    ]),
+  );
+  assert_eq(operators_applied(p, b"s"), Ok([{ op: b"bytes_eq", on: AsWord }]));
+  assert_eq(operators_applied(p, b"bs"), Ok([{ op: b"bytes_ne", on: AsWord }]));
+  // Parameters cross as their one word, which is their case's place, compared as two numbers.
+  let ops = |name: Bytes|
+    match operators_applied(p, name) {
+      Ok(xs) ->
+        xs.map(|x: { op: Bytes, on: Representation }|
+          { op: x.op, sum: match x.on { AsSum(_) -> true, _ -> false } }),
+      Err(why) -> [{ op: why, sum: false }],
+    };
+  assert_eq(ops(b"suit"), [{ op: b"ne", sum: true }]);
+  assert_eq(ops(b"picked"), [{ op: b"eq", sum: true }])
+}
+
+test "an Option and a Result are compared by the roots written for their types" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn ints(a: Option<Int>, b: Option<Int>) -> Bool = a == b\n",
+      b"fn texts(a: Option<String>, b: Option<String>) -> Bool = a != b\n",
+      b"fn results(a: Result<Int, String>, b: Result<Int, String>) -> Bool = a == b\n",
+    ]),
+  );
+  let equal = |ty: Type| Ok([written_root(keys::ContainerWalk(b"equal"), ty)]);
+  assert_eq(roots_called(p, b"ints"), equal(option_type(int_type())));
+  assert_eq(roots_called(p, b"texts"), equal(option_type(string_type())));
+  assert_eq([b"ints", b"texts"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([])]);
+  assert_eq(roots_called(p, b"results"), equal(result_type(int_type(), string_type())))
+}
+
+test "two values of a declared sum are compared and ordered through roots written for it" {
+  let p = program(
+    Bytes::concat_all([
+      b"type Shape = | Circle(Int) | Square(Int, Int)\n",
+      b"fn same(a: Shape, b: Shape) -> Bool = a == b\n",
+      b"fn apart(a: Shape, b: Shape) -> Bool = a != b\n",
+      b"fn order(a: Shape, b: Shape) -> Ordering = compare(a, b)\n",
+    ]),
+  );
+  let shape = named_type(b"m.Shape", []);
+  assert_eq(roots_called(p, b"same"), Ok([written_root(keys::Equal, shape)]));
+  // The root answers a `Bool`, which `!=` negates.
+  assert_eq(operators_applied(p, b"apart"), Ok([{ op: b"not", on: AsBool }]));
+  assert_eq(roots_called(p, b"order"), Ok([written_root(keys::Order, shape)]));
+  assert_eq(operators_applied(p, b"order"), Ok([]))
+}
+
+test "a list, an array or a map is compared through the root written for its type" {
+  let p = program(
+    b"fn lists(a: List<Int>, b: List<Int>) -> Bool = a == b\nfn maps(a: Map<Int, String>, b: Map<Int, String>) -> Ordering = compare(a, b)\n",
+  );
+  assert_eq(
+    roots_called(p, b"lists"),
+    Ok([written_root(keys::ContainerWalk(b"equal"), list_type(int_type()))]),
+  );
+  {
+    let f = lowered_root(p, b"lists");
+    // The root answers a `Bool` as itself, as today's roots for containers do.
+    assert_eq(
+      values(f.body).fold([], |acc: List<Representation>, v: Rvalue|
+        match v { Call(c) -> acc.push(c.convention.result), _ -> acc }),
+      [AsBool],
+    )
+  };
+  assert_eq(
+    roots_called(p, b"maps"),
+    Ok([written_root(keys::ContainerWalk(b"ordered"), map_type(int_type(), string_type()))]),
+  )
+}
+
+test "compare at a number, a character or a string orders in C and answers its constructor" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn ci(a: Int, b: Int) -> Ordering = compare(a, b)\n",
+      b"fn cc(a: Char, b: Char) -> Ordering = compare(a, b)\n",
+      b"fn cs(a: String, b: String) -> Ordering = compare(a, b)\n",
+      b"fn cw(a: U16, b: U16) -> Ordering = compare_values(a, b)\n",
+      b"fn cd(a: Decimal, b: Decimal) -> Ordering = compare(a, b)\n",
+    ]),
+  );
+  let made = { op: b"ordering", on: AsInt };
+  assert_eq(operators_applied(p, b"ci"), Ok([{ op: b"order", on: AsInt }, made]));
+  assert_eq(operators_applied(p, b"cc"), Ok([{ op: b"order", on: AsImmediate }, made]));
+  assert_eq(operators_applied(p, b"cs"), Ok([{ op: b"bytes_order", on: AsWord }, made]));
+  assert_eq(
+    operators_applied(p, b"cw"),
+    Ok([{ op: b"order", on: width_representation(16, false) }, made]),
+  );
+  assert_eq(operators_applied(p, b"cd"), Ok([{ op: b"order", on: AsDecimal }, made]));
+  assert_eq([b"ci", b"cc", b"cs", b"cw", b"cd"].map(|n: Bytes| roots_called(p, n)), [
+    Ok([]),
+    Ok([]),
+    Ok([]),
+    Ok([]),
+    Ok([]),
+  ])
+}
+
+test "a width is converted, wrapped, rotated and saturated in place at its operands' type" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn n(x: Int) -> U8 / {abort.raise} = U8::of_int(x)\n",
+      b"fn i(a: U16) -> Int = Int::of_u16(a)\n",
+      b"fn w(a: U32, b: U32) -> U32 = a *% b\n",
+      b"fn r(a: U32) -> U32 = rotl(a, 5)\n",
+      b"fn s(a: I8, b: I8) -> I8 = a -| b\n",
+      b"fn f(n: Int) -> Float = Float::of_int(n)\n",
+      b"fn bits(x: Float) -> Int = bits_of_float(x)\n",
+    ]),
+  );
+  assert_eq(operators_applied(p, b"n"), Ok([{ op: b"of_int", on: AsInt }]));
+  assert_eq(
+    operators_applied(p, b"i"),
+    Ok([{ op: b"to_int", on: width_representation(16, false) }]),
+  );
+  assert_eq(
+    operators_applied(p, b"w"),
+    Ok([{ op: b"wrap_mul", on: width_representation(32, false) }]),
+  );
+  assert_eq(operators_applied(p, b"r"), Ok([{ op: b"rotl", on: width_representation(32, false) }]));
+  assert_eq(
+    operators_applied(p, b"s"),
+    Ok([{ op: b"saturating_sub", on: width_representation(8, true) }]),
+  );
+  assert_eq(operators_applied(p, b"f"), Ok([{ op: b"to_float", on: AsInt }]));
+  assert_eq(operators_applied(p, b"bits"), Ok([{ op: b"bits", on: AsFloat }]));
+  {
+    let f = lowered_root(p, b"n");
+    assert_eq(bound_in(f.body).map(|v: Var| v.representation), [width_representation(8, false)])
+  }
+}
+
+test "a Float function IEEE 754 fixes is its operator in place, and any other its native's over the operands' bits, nothing boxed" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn root(x: Float) -> Float = x.sqrt()\n",
+      b"fn down(x: Float) -> Float = Float::floor(x)\n",
+      b"fn angle(y: Float, x: Float) -> Float = Float::atan2(y, x)\n",
+    ]),
+  );
+  assert_eq(natives(p, b"root"), Ok([]));
+  assert_eq(operators_applied(p, b"root"), Ok([{ op: b"sqrt", on: AsFloat }]));
+  assert_eq(operators_applied(p, b"down"), Ok([{ op: b"floor", on: AsFloat }]));
+  assert_eq(natives(p, b"angle"), Ok([b"builtin_elaborated_float_atan2_p"]));
+  assert_eq(
+    operators_applied(p, b"angle"),
+    Ok([{ op: b"bits", on: AsFloat }, { op: b"bits", on: AsFloat }, { op: b"of_bits", on: AsInt }]),
+  )
+}
+
+test "a secret's length, bytes and concatenation are natives over its handle" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn n(s: Secret<Bytes>) -> Int = s.len()\n",
+      b"fn none(s: Secret<String>) -> Bool = s.is_empty()\n",
+      b"fn raw(s: Secret<String>) -> Secret<Bytes> = s.bytes()\n",
+      b"fn both(a: Secret<Bytes>, b: Secret<Bytes>) -> Secret<Bytes> = Secret::concat(a, b)\n",
+    ]),
+  );
+  assert_eq([b"n", b"none", b"raw", b"both"].map(|f: Bytes| natives(p, f)), [
+    Ok([b"builtin_elaborated_secret_len_p"]),
+    Ok([b"builtin_elaborated_secret_len_p"]),
+    Ok([b"builtin_elaborated_secret_bytes_p"]),
+    Ok([b"builtin_elaborated_secret_concat_p"]),
+  ]);
+  assert_eq(operators_applied(p, b"none"), Ok([{ op: b"eq", on: AsInt }]));
+  // What a native makes is held, and let go of, as the secret it is.
+  let secret = secret_type(bytes_type());
+  assert_eq(
+    [b"raw", b"both"].map(|f: Bytes| {
+      let x = lowered_root(p, f);
+      Ok(bound_in(x.body).map(|v: Var| v.ty))
+    }),
+    [Ok([secret]), Ok([secret])],
+  )
+}
+
+test "a value of a type variable is compared only by a specialisation, which reads its type" {
+  let p = program(b"fn same<a>(x: a, y: a) -> Bool = x != y\n");
+  assert_eq(natives(p, b"same"), Ok([]));
+  {
+    let f = lowered_root(p, b"same");
+    match f.params.at(0) {
+      Some(x) -> match x.ty {
+        VariableType(v) -> assert_eq(f.links.needs, [{ var: v, reads: Exact }]),
+        other -> assert_eq(Some(other), None),
+      },
+      None -> assert_eq(f.params.len(), 2),
+    }
+  }
+}
+
+test "a constant is a static object, a decimal or a 128-bit width its two words, and a register's written as itself" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn text() -> String = \"ply\"\n",
+      b"fn dec() -> Decimal = 2.50m\n",
+      b"fn huge() -> U128 = 7u128\n",
+      b"fn unit() -> Unit = ()\n",
+      b"fn top() -> U64 = 18446744073709551615u64\n",
+    ]),
+  );
+  // What each body binds first: a root of no parameter hands its answer back as a word after it.
+  let read = |name: Bytes| {
+    let f = lowered_root(p, name);
+    Ok(match f.body.at(0) {
+      Some(Let(l)) -> Some({ val: l.val, representation: l.var.representation }),
+      _ -> None,
+    })
+  };
+  let named = |s: Datum| Static(statics_of(s).get(0).name);
+  assert_eq(read(b"text"), Ok(Some({ val: named(StringDatum(b"ply")), representation: AsWord })));
+  // 2.50 is 250 at scale 2: the scale in the flags' bits 16 to 23, the mantissa from bit 32.
+  assert_eq(
+    read(b"dec"),
+    Ok(
+      Some({
+        val: Primitive({
+          op: b"decimal",
+          on: AsInt,
+          args: [IntOperand(2 << 16 | 250 << 32), IntOperand(0)],
+        }),
+        representation: AsDecimal,
+      }),
+    ),
+  );
+  assert_eq(
+    read(b"huge"),
+    Ok(
+      Some({
+        val: Primitive({ op: b"wide", on: AsInt, args: [IntOperand(7), IntOperand(0)] }),
+        representation: AsWideFixed({ bits: 128, signed: false }),
+      }),
+    ),
+  );
+  // `()` is no value at all.
+  assert_eq(read(b"unit"), Ok(None));
+  {
+    let f = lowered_root(p, b"top");
+    assert_eq(values(f.body).filter(|v: Rvalue| match v { Literal(_) -> true, _ -> false }), [])
+  };
+  match printed_by_ir(p, b"text") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(t) -> {
+      let address = Bytes::concat_all([
+        b"(Word)(intptr_t)&",
+        statics_of(StringDatum(b"ply")).get(0).name,
+      ]);
+      assert(t.index_of(address) != None, None)
+    },
+  }
+}
+
+test "an `Int`'s product and its wrapping and saturating operators, a 64-bit width's saturating ones, a `U64` made an `Int` and a `Decimal` made of an `Int` are written in C" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn mul(a: Int, b: Int) -> Int = a * b\n",
+      b"fn wrapped(a: Int, b: Int) -> Int = a +% b *% b\n",
+      b"fn turned(a: Int) -> Int = rotr(a, 7)\n",
+      b"fn held(a: Int, b: Int) -> Int = a -| b\n",
+      b"fn held_wide(a: U64, b: U64) -> U64 = a *| b\n",
+      b"fn back(a: U64) -> Int / {abort.raise} = Int::of_u64(a)\n",
+      b"fn dec(n: Int) -> Decimal = Decimal::of_int(n)\n",
+      b"fn scaled(d: Decimal) -> Int = d.scale()\n",
+    ]),
+  );
+  let names = [b"mul", b"wrapped", b"turned", b"held", b"held_wide", b"back", b"dec", b"scaled"];
+  assert_eq(names.map(|n: Bytes| natives(p, n)), names.map(|_: Bytes| Ok([])));
+  match printed_by_ir(p, b"mul") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(t) -> assert(t.index_of(b"ply_mul_ov(") != None && t.index_of(b"rt_arith_p(") == None, None),
+  };
+  match printed_by_ir(p, b"back") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(t) -> assert(t.index_of(b"rt_not_an_int_p(ctx, ") != None, None),
+  }
+}
+
+test "a digest hashes a scalar's encoding the native writes over its words, or a root's, in place" {
+  let p = program(
+    Bytes::concat_all([
+      b"type P = { x: Int, name: String }\n",
+      b"fn h(x: Int) -> Bytes = digest(x)\n",
+      b"fn g<a>(x: a) -> Bytes where derivable(hash, a) = digest(x)\n",
+      b"fn hr(x: P) -> Bytes = digest(x)\n",
+    ]),
+  );
+  assert_eq([b"h", b"g", b"hr"].map(|n: Bytes| natives(p, n)), [
+    // A scalar's encoding is the native's over its words, hashed in place.
+    Ok([b"builtin_elaborated_scalar_encoded_p", b"builtin_elaborated_blake3_p"]),
+    // At a type a variable leaves open, nothing: the specialisation its callers settle hashes it.
+    Ok([]),
+    // The encoding is hashed in place by the native over its bytes.
+    Ok([b"builtin_elaborated_blake3_p"]),
+  ]);
+  assert_eq(
+    roots_called(p, b"hr").map(|rs: List<RootName>|
+      rs.map(|r: RootName| root_text(r).starts_with(b"m.digest#"))),
+    Ok([true]),
+  )
+}
+
+test "a 64-bit width's product, quotient and remainder are C's, checked where they leave the width" {
+  let p = program(
+    b"fn m(a: U64, b: U64) -> U64 = a * b\nfn q(a: I64, b: I64) -> I64 / {abort.raise} = a / b\nfn r(a: U64, b: U64) -> U64 / {abort.raise} = a % b\n",
+  );
+  [b"m", b"q", b"r"].fold((), |_: Unit, n: Bytes|
+    match printed_by_ir(p, n) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(t) -> assert(t.index_of(b"rt_wide_binary") == None, Some(String::of_bytes_lossy(t))),
+    })
+}
+
+test "a 128-bit width's arithmetic is done in place over its two words, a word's or a width's checked arithmetic `Some` of the wrapped answer where it fits" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn sat(a: U128, b: U128) -> U128 = a +| b\n",
+      b"fn big(a: I128) -> Option<I128> = checked_neg(a)\n",
+    ]),
+  );
+  let wide = AsWideFixed({ bits: 128, signed: true });
+  // At 64 bits C tests the fit; the wrapped answer is the exact one where it fits.
+  let q = program(
+    Bytes::concat_all([
+      b"fn word(a: U64, b: U64) -> Option<U64> = checked_mul(a, b)\n",
+      b"fn int(a: Int) -> Option<Int> = checked_neg(a)\n",
+    ]),
+  );
+  let u64 = width_representation(64, false);
+  let i64 = width_representation(64, true);
+  assert_eq(
+    operators_applied(q, b"word"),
+    Ok([{ op: b"checked_mul", on: u64 }, { op: b"wrap_mul", on: u64 }]),
+  );
+  assert_eq(
+    operators_applied(q, b"int"),
+    Ok([{ op: b"checked_neg", on: i64 }, { op: b"wrap_sub", on: i64 }]),
+  );
+  assert_eq([b"word", b"int"].map(|n: Bytes| natives(q, n)), [Ok([]), Ok([])]);
+  assert_eq(
+    operators_applied(p, b"sat"),
+    Ok([{ op: b"saturating_add", on: AsWideFixed({ bits: 128, signed: false }) }]),
+  );
+  assert_eq(
+    operators_applied(p, b"big"),
+    Ok([{ op: b"checked_neg", on: wide }, { op: b"wrap_sub", on: wide }]),
+  );
+  assert_eq([b"sat", b"big"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([])]);
+  match printed_by_ir(p, b"sat") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(t) ->
+      assert(
+        t.index_of(b"ply_wide_sat_add(") != None && t.index_of(b"rt_wide_op") == None,
+        Some(String::of_bytes_lossy(t)),
+      ),
+  }
+}
+
+test "a width's checked arithmetic is exact in 64 bits, its answer `Some` where the width holds it" {
+  let p = program(
+    Bytes::concat_all([
+      b"fn add(a: U8, b: U8) -> Option<U8> = checked_add(a, b)\n",
+      b"fn mul(a: U32, b: U32) -> Option<U32> = checked_mul(a, b)\n",
+      b"fn neg(a: I16) -> Option<I16> = checked_neg(a)\n",
+    ]),
+  );
+  assert_eq(
+    operators_applied(p, b"add"),
+    Ok([
+      { op: b"exact_add", on: width_representation(8, false) },
+      { op: b"within", on: AsInt },
+      { op: b"narrow", on: AsInt },
+    ]),
+  );
+  // Only an unsigned 32-bit product needs the unsigned word.
+  assert_eq(
+    operators_applied(p, b"mul"),
+    Ok([
+      { op: b"exact_mul", on: width_representation(32, false) },
+      { op: b"le", on: width_representation(64, false) },
+      { op: b"narrow", on: width_representation(64, false) },
+    ]),
+  );
+  assert_eq(
+    operators_applied(p, b"neg"),
+    Ok([
+      { op: b"exact_neg", on: width_representation(16, true) },
+      { op: b"within", on: AsInt },
+      { op: b"narrow", on: AsInt },
+    ]),
+  );
+  assert_eq([b"add", b"mul", b"neg"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([]), Ok([])])
+}
+
+test "a stated witness is its constructor's tag, past the witnesses the runtime numbers itself" {
+  let p = program(
+    Bytes::concat_all([
+      b"type Length = | Metres(Int) | Millimetres(Int)\n",
+      b"key for Length by millimetres\n",
+      b"numeric for Length by { add: plus, sub: plus, mul: plus, neg: negated, of_int: metres }\n",
+      b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+      b"fn plus(a: Length, b: Length) -> Length = a\n",
+      b"fn negated(a: Length) -> Length = a\n",
+      b"fn metres(n: Int) -> Length = Metres(n)\n",
+      b"fn twice<a>(x: a) -> a\n  where numeric(a)\n= x + x\n",
+      b"fn doubled(g: Length) -> Length = twice(g)\n",
+    ]),
+  );
+  {
+    let f = lowered_root(p, b"doubled");
+    assert_eq(
+      values(f.body).fold([], |acc: List<Bytes>, v: Rvalue|
+        match v {
+          Tag(n) ->
+            acc.push(if n == b"m.Metres" || n == b"m.Millimetres" { b"a tag of Length" }
+            else { n }),
+          Primitive(x) -> if x.op == b"witness" { acc.push(b"13 +") } else { acc },
+          _ -> acc,
+        }),
+      [b"a tag of Length", b"13 +"],
+    );
+    // The name is read off the literal the elaboration writes, never from the pool.
+    assert_eq(values(f.body).filter(|v: Rvalue| match v { Literal(_) -> true, _ -> false }), [])
+  }
+}
+
+test "a declared sum's negation is the function its module states, which no native runs" {
+  let p = program(
+    Bytes::concat_all([
+      b"type Length = | Metres(Int) | Millimetres(Int)\n",
+      b"numeric for Length by { add: plus, sub: plus, mul: plus, neg: negated, of_int: metres }\n",
+      b"fn plus(a: Length, b: Length) -> Length = a\n",
+      b"fn negated(a: Length) -> Length = a\n",
+      b"fn metres(n: Int) -> Length = Metres(n)\n",
+      b"fn back(g: Length) -> Length = -g\n",
+    ]),
+  );
+  assert_eq(natives(p, b"back"), Ok([]))
+}
+
+/// The corpus as module `m` of a program.
+fn corpus_program() -> Program / {abort.raise} = program(corpus())
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Suit = | Hearts | Spades\n",
+    b"type Card = | Pip(Int) | Face(String)\n",
+    b"fn add8(a: U8, b: U8) -> U8 = a + b\n",
+    b"fn mul16(a: I16, b: I16) -> I16 = a * b\n",
+    b"fn sub64(a: I64, b: I64) -> I64 = a - b\n",
+    b"fn neg8(a: I8) -> I8 = -a\n",
+    b"fn neg64(a: I64) -> I64 = -a\n",
+    b"fn inv32(a: U32) -> U32 = ~a\n",
+    b"fn shl8(a: U8) -> U8 = a << 3\n",
+    b"fn sar(a: Int, n: Int) -> Int = a >> n\n",
+    b"fn lsr(a: Int, n: Int) -> Int = a >>> n\n",
+    b"fn mix(a: Int, b: Int) -> Int = (a ^ b) & ~a\n",
+    b"fn quotient(a: Int) -> Int / {abort.raise} = a / -4 - a % 3\n",
+    b"fn ratio(x: Float, y: Float) -> Float = x / y % 2.0\n",
+    b"fn below(x: Float, y: Float) -> Bool = x - y < 0.001\n",
+    b"fn scaled(d: Decimal, e: Decimal) -> Decimal = d * e - d\n",
+    b"fn dless(d: Decimal, e: Decimal) -> Bool = d >= e\n",
+    b"fn dneg(d: Decimal) -> Decimal = -d\n",
+    b"fn cless(a: Char, b: Char) -> Bool = a > b\n",
+    b"fn cmid(a: Char) -> Bool = a != 'm'\n",
+    b"fn texts(a: String, b: String) -> Bool = a == b\n",
+    b"fn raw(a: Bytes, b: Bytes) -> Bool = a != b\n",
+    b"fn joined(a: String, b: String) -> String = a ++ b\n",
+    b"fn ordered(a: Int, b: Int) -> Ordering = compare(a, b)\n",
+    b"fn sorted(a: String, b: String) -> Ordering = compare(a, b)\n",
+    b"fn wordered(a: U16, b: U16) -> Ordering = compare(a, b)\n",
+    b"fn bordered(a: Bool, b: Bool) -> Ordering = compare_values(a, b)\n",
+    b"fn dordered(a: Decimal, b: Decimal) -> Ordering = compare(a, b)\n",
+    b"fn cordered(a: Char, b: Char) -> Ordering = compare(a, b)\n",
+    b"fn narrowed(x: Int) -> I16 / {abort.raise} = I16::of_int(x)\n",
+    b"fn unsigned(x: Int) -> U64 / {abort.raise} = U64::of_int(x)\n",
+    b"fn widened(x: I32) -> Int = Int::of_i32(x)\n",
+    b"fn wrapped(a: U32, b: U32) -> U32 = a *% b +% rotl(a, 5)\n",
+    b"fn turned(a: U8, n: Int) -> U8 = rotr(a, n)\n",
+    b"fn clamped(a: U8, b: U8) -> U8 = a +| b\n",
+    b"fn floated(n: Int) -> Float = Float::of_int(n) + Float::of_bits(n)\n",
+    b"fn bits(x: Float) -> Int = bits_of_float(x)\n",
+    b"fn big(a: U128, b: U128) -> U128 = a + b\n",
+    b"fn bigeq(a: I128, b: I128) -> Bool = a == b\n",
+    b"fn text() -> String = \"ply\"\n",
+    b"fn dec() -> Decimal = 2.50m\n",
+    b"fn huge() -> U128 = 7u128\n",
+    b"fn unit() -> Unit = ()\n",
+    b"fn suited(a: Suit, b: Suit) -> Bool = a == b\n",
+    b"fn cards(a: Card, b: Card) -> Bool = a != b\n",
+    b"fn ranked(a: Card, b: Card) -> Ordering = compare(a, b)\n",
+    b"fn lists(a: List<Int>, b: List<Int>) -> Bool = a == b\n",
+    b"fn generic<a>(x: a, y: a) -> Bool = x != y\n",
+    b"fn same(a: Bool, b: Bool) -> Bool = a != b\n",
+    b"fn flags(a: Bool) -> Bool = !a\n",
+    b"type Pt = { x: Int, y: Int }\n",
+    b"fn points(a: Pt, b: Pt) -> Bool = a == b\n",
+    b"fn hashed(x: Int) -> Bytes = digest(x)\n",
+    b"fn checked8(a: U8, b: U8) -> Option<U8> = checked_add(a, b)\n",
+    b"fn wrapped64(a: Int, b: Int) -> Int = a *% b\n",
+  ])
+
+fn corpus_names() -> List<Bytes> =
+  [
+    b"add8",
+    b"mul16",
+    b"sub64",
+    b"neg8",
+    b"neg64",
+    b"inv32",
+    b"shl8",
+    b"sar",
+    b"lsr",
+    b"mix",
+    b"quotient",
+    b"ratio",
+    b"below",
+    b"scaled",
+    b"dless",
+    b"dneg",
+    b"cless",
+    b"cmid",
+    b"texts",
+    b"raw",
+    b"joined",
+    b"ordered",
+    b"sorted",
+    b"wordered",
+    b"bordered",
+    b"dordered",
+    b"cordered",
+    b"narrowed",
+    b"unsigned",
+    b"widened",
+    b"wrapped",
+    b"turned",
+    b"clamped",
+    b"floated",
+    b"bits",
+    b"big",
+    b"bigeq",
+    b"text",
+    b"dec",
+    b"huge",
+    b"unit",
+    b"suited",
+    b"cards",
+    b"ranked",
+    b"lists",
+    b"generic",
+    b"same",
+    b"flags",
+    b"points",
+    b"hashed",
+    b"checked8",
+    b"wrapped64",
+  ]
+
+test "the scalar corpus lowers, passes the check once its counts are placed, and prints" {
+  assert_eq(build_failures(corpus_program(), corpus_names()), [])
+}

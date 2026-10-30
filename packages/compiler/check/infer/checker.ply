@@ -3,30 +3,38 @@
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, span_bin, is_bare)
 import std.bin
 import compiler.check.member (MemberTarget, member_target_bin)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin)
-import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
-                              ImportDecl, INames, Constraint, Deriver, DEq, DOrd, DShow, DHash,
-                              DNumeric, DInteger, DKept, is_predicate, deriver_tag, SpecKind,
-                              SRequires, SEnsures, SCost, SSpace, SpecClause, Derived, parse,
-                              TDExtern, InstanceKind, is_pub, Opaque, spec_kind_bin, deriver_bin,
-                              instance_kind_bin)
-import compiler.syntax.exprs (Expr, EBinary, Param, expr_span, Tagged, prelude_module)
-import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
-                                 LDec, LChar)
-import compiler.check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn,
-                             TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified, InScope,
-                             env_depth, atoms_insert, row_empty, row_open, row_singleton,
-                             named_type, int_type, bool_type, string_type, bytes_type, float_type,
-                             decimal_type, unit_type, list_type, option_type, fn_type,
-                             fields_sorted, ints_insert, ints_union, fresh_new, fresh_ty_var,
-                             fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
-                             resolve_row, free_vars, env_bind_global, at_arguments, TyNominal,
-                             atom_bin, row_bin, type_bin, scheme_bin, TypeTable, owning_fn_type)
+import compiler.syntax.type_syntax (TypeExpr, VariableTypeExpression, NamedTypeExpression,
+                                    FunctionTypeExpression, RecordTypeExpression,
+                                    UnitTypeExpression, InvalidTypeExpression, RowExpr, AtomExpr,
+                                    Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise,
+                                    mode_bin)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, ExternItem, is_shipped, is_builtin,
+                              FnDef, ExternDef, ImportDecl, SelectedNames, Constraint, Deriver,
+                              EqDeriver, OrdDeriver, ShowDeriver, HashDeriver, NumericDeriver,
+                              IntegerDeriver, ConstantDeriver, is_predicate, deriver_tag, SpecKind,
+                              RequiresClause, EnsuresClause, CostClause, SpaceClause, SpecClause,
+                              DeriveOrigin, parse, ExternBody, InstanceKind, is_pub, Opaque,
+                              spec_kind_bin, deriver_bin, instance_kind_bin)
+import compiler.syntax.exprs (Expr, BinaryExpression, Param, expr_span, TaggedLiteral,
+                              prelude_module)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
+                                 LiteralString, LiteralBytes, LiteralEmbedded, LiteralFloat,
+                                 LiteralDecimal, LiteralChar)
+import compiler.check.types (Resource, SingletonResource, ResourceVariable, Atom, Row, Type,
+                             VariableType, NamedType, FunctionType, RecordType, Field, Scheme,
+                             Fresh, Subst, TypeEnv, UnifyResult, InScope, env_depth, atoms_insert,
+                             row_empty, row_open, row_singleton, named_type, int_type, bool_type,
+                             string_type, bytes_type, float_type, decimal_type, unit_type,
+                             list_type, option_type, fn_type, fields_sorted, ints_insert,
+                             ints_union, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var,
+                             fresh_row, subst_new, resolve_type, resolve_row, free_vars,
+                             env_bind_global, apply_arguments, NominalType, atom_bin, row_bin,
+                             type_bin, scheme_bin, TypeTable, owning_fn_type)
 import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
                              duration_type, task_type, chan_type, hold_name, hold_type, map_parts)
-import compiler.check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
-import compiler.check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label,
+import compiler.check.termination (Callee, Termination, Summary, summary_bin, termination_bin,
+                                   callee_bin)
+import compiler.check.resolve.tables (ParsedModule, Resolution, Scope, Diag, diag_bin, Label,
                                       error_with_labels, error_at, error_at_and)
 import compiler.expand.rewrite (MemberCallee)
 import std.prelude_source
@@ -36,7 +44,7 @@ import std.bytes (ascii_of_int)
 import std.option
 import std.string
 import compiler.check.guards (Guards, Contract, Clause)
-import compiler.check.lent (Passed, Takes, passed)
+import compiler.check.borrowing (ParameterMode, ParameterModes, parameter_mode)
 import compiler.check.infer.walked (WalkedNode, WalkedTree)
 import compiler.check.typed (TypedRelease)
 
@@ -87,7 +95,7 @@ pub type EffectInfo = {
   module: Bytes,
   simple_name: Bytes,
   nondet: Bool,
-  ops: List<OpInfo>,
+  operations: List<OpInfo>,
   at: Location,
 }
 
@@ -107,15 +115,15 @@ pub type DefConstraint = { deriver: Deriver, param: Int }
 
 /// A constrained alias expanded while the type `on` was collected: `on` carries the constraint for
 /// every parameter of its own that `ty` holds, the alias itself being gone from what was kept.
-pub type StatedHint = { on: Bytes, from: Bytes, deriver: Deriver, ty: Type }
+pub type AliasConstraint = { on: Bytes, from: Bytes, deriver: Deriver, ty: Type }
 
 /// The type parameters a call passes a witness for, each once, in the order the constraints first
 /// name them: one for each parameter a `numeric` or `integer` constrains, however many do.
-pub fn witnessed(constraints: List<DefConstraint>) -> List<Int> =
+pub fn witness_params(constraints: List<DefConstraint>) -> List<Int> =
   constraints.fold([], |acc: List<Int>, c: DefConstraint|
     if !is_predicate(c.deriver) || acc.contains(c.param) { acc } else { acc.push(c.param) })
 
-/// What a type's module states its values go through: `by` is the function, and `answers` what it
+/// What a type's module states its values go through: `by` is the function, and `results` what it
 /// answers over the type's own type and row parameters, as the function's signature numbers them.
 pub type InstanceInfo = {
   type_name: Bytes,
@@ -123,7 +131,7 @@ pub type InstanceInfo = {
   by: Bytes,
   params: List<Int>,
   rows: List<Int>,
-  answers: Type,
+  results: Type,
   at: Location,
 }
 
@@ -148,7 +156,7 @@ pub type DefInfo = {
   bounded: List<Atom>,
   tail_bounded: Bool,
   /// Whether its calls are known to return (`diverges` where they may not).
-  ending: Ending,
+  ending: Termination,
   /// How it calls the functions it is handed and what it answers, which callers' endings read.
   summary: Summary,
   /// Where its body can raise `abort.raise`, and why nothing there rules the raise out.
@@ -160,32 +168,32 @@ pub type DefInfo = {
 }
 
 /// Why a place in a body can raise `abort.raise`.
-pub type RaiseWhy =
+pub type RaiseReason =
   /// A builtin called where `needs`, a clause of its `requires` as the prelude writes it, is not
   /// shown.
-  | Unshown({ callee: Bytes, needs: Bytes })
+  | RequirementNotShown({ callee: Bytes, needs: Bytes })
   /// A builtin that states no `requires`: nothing a call shows rules its raise out.
-  | Unguarded(Bytes)
+  | UnguardedBuiltin(Bytes)
   /// A definition whose row names the raise.
-  | Calls(Bytes)
+  | RaisingCall(Bytes)
   /// A `/` or `%` whose divisor nothing shows is other than zero.
   | ZeroDivisor
   /// A `let` whose pattern can miss.
-  | Misses
+  | RefutableLet
   /// An operation that raises it, performed.
-  | Performed
+  | RaisingOperation
   /// A function value whose type says it may.
-  | Handed
+  | RaisingFunctionValue
 
 /// `span` counts from where the definition starts, so a raise filed for a definition is where it
 /// is wherever the definition moves to.
-pub type Raise = { span: Span, why: RaiseWhy }
+pub type Raise = { span: Span, reason: RaiseReason }
 
-derive bin for RaiseWhy
+derive bin for RaiseReason
 
 derive bin for Raise
 
-pub type RaiseNote = { span: Span, why: RaiseWhy }
+pub type RaiseNote = { span: Span, reason: RaiseReason }
 
 pub type TestInfo = {
   name: Bytes,
@@ -244,7 +252,11 @@ derive bin for LawInfo
 
 /// Where an atom entered a body's row: an operation performed here, a named definition's row,
 /// arguments alone (a builtin or constructor), or a function value.
-pub type PerformSource = | DirectPerform | PerformVia(Bytes) | PerformThroughArgs | OpaquePerform
+pub type PerformSource =
+  | DirectPerform
+  | PerformViaCall(Bytes)
+  | PerformViaArguments
+  | PerformViaFunctionValue
 
 /// `over` is the iteration the site repeats with: a call that runs it once per element of its input,
 /// or a recursive call; `None` where it runs a number of times no input decides.
@@ -256,20 +268,25 @@ pub type PerformSite = {
   over: Option<Span>,
   /// The iterations around it that wait on a callee's counts, innermost first: the first that
   /// holds is the site's, before `over`.
-  maybe: List<Maybe>,
+  maybe: List<PendingIteration>,
 }
 
 /// An iteration a call turns out to be once the definition `callee` is counted: it calls its parameter `param` a number of times that grows with its input, or, with
 /// no `param`, performs the site's own atom so.
-pub type Maybe = { callee: Bytes, param: Option<Int>, span: Span }
+pub type PendingIteration = { callee: Bytes, param: Option<Int>, span: Span }
 
 /// A row variable performed under an iteration, as a `PerformSite` is.
-pub type Repeated = { var: Int, over: Option<Span>, maybe: List<Maybe> }
+pub type RepeatedRowVariable = { var: Int, over: Option<Span>, maybe: List<PendingIteration> }
 
 /// A row variable a body performs under an iteration, as its group reads it with nothing of the
 /// walk's substitution: the parameters whose types hold the variable, and whether it is the
 /// definition's own row parameter.
-pub type RepeatedRow = { params: List<Int>, tail: Bool, over: Option<Span>, maybe: List<Maybe> }
+pub type RepeatedRow = {
+  params: List<Int>,
+  tail: Bool,
+  over: Option<Span>,
+  maybe: List<PendingIteration>,
+}
 
 /// A call of a function of the module being checked.
 pub type OwnCall = { callee: Bytes, span: Span }
@@ -294,18 +311,18 @@ pub type MemberSite = {
 }
 
 /// A tagged literal whose tag's function `name` is one of the module being checked.
-pub type TagUse = { owner: Bytes, name: Bytes, t: Tagged, callee: QName }
+pub type TagUse = { owner: Bytes, name: Bytes, t: TaggedLiteral, callee: QName }
 
 pub type OpKey = { effect: Bytes, op: Bytes, resource: Resource }
 
-pub type Numeric = { span: Span, op: Bytes, ty: Type }
+pub type NumericOperation = { span: Span, op: Bytes, ty: Type }
 
 /// A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
 pub type BitOp = { span: Span, what: Bytes, ty: Type, builtin: Bool }
 
 /// A type parameter a `numeric` or `integer` constraint makes the witness of: a hidden argument each
 /// call fills with the type it instantiates the parameter at.
-type Witnessed = { param: Bytes, integer: Bool }
+type WitnessParam = { param: Bytes, integer: Bool }
 
 /// A definition's witnessed type parameters in its scheme's order, which is the order a call passes
 /// their witnesses in.
@@ -313,7 +330,7 @@ pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
 
 /// A reference inside the group being walked that filled a member's type parameters: `args` are
 /// what it gave them, in the order the member's scheme takes them.
-pub type GroupFill = { module: Int, span: Span, callee: Bytes, args: List<Type> }
+pub type GroupInstantiation = { module: Int, span: Span, callee: Bytes, args: List<Type> }
 
 /// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
 pub type ConcatSite = { module: Int, span: Span, ty: Type }
@@ -383,7 +400,7 @@ pub type LabelApplication = {
   owner: Bytes,
 }
 
-pub type Assumed = { deriver: Deriver, vars: List<Int> }
+pub type Assumption = { deriver: Deriver, vars: List<Int> }
 
 /// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
 pub type ClauseSite = { span: Span, op: Atom, ty: Type }
@@ -419,7 +436,7 @@ pub type RegionSite = {
 pub type Brand = | HoldsOf(Bytes) | Tasks
 
 /// A local bound outside the innermost `simulate` region, read inside it.
-pub type Crossing = { binder: Int, name: Bytes, span: Span }
+pub type CapturedLocal = { binder: Int, name: Bytes, span: Span }
 
 /// A `simulate` region: `entering` names each binding from outside it whose value holds a task.
 pub type Simulation = {
@@ -484,31 +501,31 @@ pub type GroupDef = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
 
 /// The rows the driver hands in for a definition, which are taken as they are. The rest of a
 /// published interface is the written signature, which is on hand.
-pub type KnownDef = {
+pub type CachedDefinition = {
   footprint: List<Atom>,
   performed: List<Atom>,
   scaling: List<Atom>,
   repeats: List<Int>,
-  ending: Ending,
+  ending: Termination,
   summary: Summary,
   raises: List<Raise>,
   /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
 }
 
-pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
+pub type CachedTest = { footprint: List<Atom>, facts: Bytes }
 
 /// What the emitter reads of one body published from its rows: `name` is the definition, or a test
 /// as `test_owner` names it.
-pub type KeptFacts = { name: Bytes, facts: Bytes }
+pub type CachedFacts = { name: Bytes, facts: Bytes }
 
-derive bin for KeptFacts
+derive bin for CachedFacts
 
 /// What the listing root of a test over cases answers: each case's label and identity, in the
 /// table's order.
 pub fn listing_ty() -> Type / {abort.raise} =
   list_type(
-    TyRecord(
+    RecordType(
       fields_sorted([
         { name: b"identity", ty: bytes_type() },
         { name: b"label", ty: string_type() },
@@ -521,35 +538,35 @@ pub fn listing_ty() -> Type / {abort.raise} =
 /// `bounded` promises were checked when its package was.
 /// `types` holds the types the rows' facts name, by key.
 /// `walks` is how the check treats the bodies of its module's functions.
-pub type Known = {
-  defs: Map<Bytes, KnownDef>,
-  tests: Map<Bytes, KnownTest>,
+pub type CheckCache = {
+  defs: Map<Bytes, CachedDefinition>,
+  tests: Map<Bytes, CachedTest>,
   root: Int,
   types: TypeTable,
-  walks: Walks,
+  walks: BodyChecking,
 }
 
-pub fn no_known() -> Known =
-  { defs: Map::new(), tests: Map::new(), root: 1 << 62, types: Map::new(), walks: Every }
+pub fn empty_cache() -> CheckCache =
+  { defs: Map::new(), tests: Map::new(), root: 1 << 62, types: Map::new(), walks: CheckEvery }
 
 /// How a check treats the bodies of its module's functions. A function whose rows are handed in
-/// (`Known.defs`) is published from them whichever this is.
-pub type Walks =
+/// (`CheckCache.defs`) is published from them whichever this is.
+pub type BodyChecking =
   /// Each is walked, and every group settled.
-  | Every
+  | CheckEvery
   /// Those named are walked and any other is published from its signature. No group is settled.
-  | Only(List<Bytes>)
+  | CheckOnly(List<Bytes>)
   /// None is walked. One whose body another check walked, held here by function, is published
   /// from its signature and that body's row, and any other from its signature. A group is settled
   /// where every member's body or rows are in hand. The sites are what the calls on values in
   /// those bodies call.
-  | Given(Map<Bytes, HandedBody>, List<MemberSite>)
+  | ReuseBodies(Map<Bytes, ReusedBody>, List<MemberSite>)
 
 /// A body another check walked, and what the emitter reads of it as that check filed it.
-pub type HandedBody = { body: WalkedBody, facts: Bytes }
+pub type ReusedBody = { body: CheckedBody, facts: Bytes }
 
 pub type Checker = {
-  resolved: Resolved,
+  resolved: Resolution,
   modules: List<ParsedModule>,
   module: Int,
   subst: Subst,
@@ -582,7 +599,7 @@ pub type Checker = {
   /// The parameters of each definition called so far whose types hold a function.
   fn_holding: Map<Bytes, List<Int>>,
   /// How each function and builtin takes its arguments, by the name a call finds it under.
-  takings: Map<Bytes, Takes>,
+  takings: Map<Bytes, ParameterModes>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
@@ -594,9 +611,9 @@ pub type Checker = {
   /// The iteration around the expression being inferred, as `PerformSite.over` reads, and those
   /// that wait on a callee's counts.
   over: Option<Span>,
-  maybe: List<Maybe>,
+  maybe: List<PendingIteration>,
   /// Each row variable a body performs under an iteration.
-  repeated_vars: List<Repeated>,
+  repeated_vars: List<RepeatedRowVariable>,
   /// The first call into the group being settled: a recursive body performs all it does again there.
   recursed: Option<Span>,
   /// The written row of the definition being checked; empty when it wrote none, or for a test or law.
@@ -617,11 +634,11 @@ pub type Checker = {
   comparisons: List<{ module: Int, span: Span, ty: Type }>,
   scope: Int,
   constraints: Map<Bytes, List<DefConstraint>>,
-  numerics: List<Numeric>,
+  numerics: List<NumericOperation>,
   bit_ops: List<BitOp>,
-  witnessed: Map<Int, Witnessed>,
+  witnessed: Map<Int, WitnessParam>,
   witness_orders: List<WitnessOrder>,
-  group_fills: List<GroupFill>,
+  group_fills: List<GroupInstantiation>,
   /// How each definition checked so far calls the functions it is handed, and what it answers.
   summaries: Map<Bytes, Summary>,
   concats: List<ConcatSite>,
@@ -640,11 +657,11 @@ pub type Checker = {
   copied_defaults: List<{ expr: Expr, ty: Type }>,
   /// The builtin each call on a value of a language type calls, by the body walking it and the
   /// call's site.
-  builtins_on: Map<Bytes, Bytes>,
+  member_builtins: Map<Bytes, Bytes>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
-  sim_scope: Int,
-  crossings: List<Crossing>,
+  simulation_scope: Int,
+  crossings: List<CapturedLocal>,
   open_regions: List<OpenRegion>,
   regions: List<RegionSite>,
   simulations: List<Simulation>,
@@ -653,23 +670,23 @@ pub type Checker = {
   constrained_uses: List<ConstraintSite>,
   spec_kind: Option<SpecKind>,
   spec_envs: List<SpecEnv>,
-  derived: Option<Derived>,
-  known: Known,
+  derived: Option<DeriveOrigin>,
+  known: CheckCache,
   seeded: List<Bytes>,
   /// The tests published from the rows handed in, by key.
-  seeded_tests: List<Bytes>,
+  cached_tests: List<Bytes>,
   /// The definition or test whose body is being walked, which every site the walk records is
   /// filed under; empty for a clause or a law, which are walked afresh each time.
   walking: Bytes,
   binders: Map<Int, Int>,
   /// What the rows handed in say the emitter reads of each body published from them.
-  kept: List<KeptFacts>,
+  kept: List<CachedFacts>,
   /// Each rigid variable a clause sees one of its operation's own type parameters as where a value
   /// crosses at it: the perform hands the clause such a value kept, so its sites are filed `Kept`.
-  kept_vars: List<Int>,
+  keep_variables: List<Int>,
   /// Each body this check walked, as another check reads it.
-  bodies: List<WalkedBody>,
-  assumed: List<Assumed>,
+  bodies: List<CheckedBody>,
+  assumed: List<Assumption>,
   instances: List<InstanceInfo>,
   /// Filled as the declarations are collected, before any body is checked: an operator in a body
   /// reads which types state `numeric`, and `keyed_names` which state a `key`.
@@ -679,7 +696,7 @@ pub type Checker = {
   /// collected; and, once they all are, every declared type that is a resource: one of those, or
   /// one whose constructors hold one.
   released: Map<Bytes, Bytes>,
-  resourceful: List<Bytes>,
+  resource_types: List<Bytes>,
   /// Read once the declarations are collected: the shapes ordering reads, and the positions of the
   /// parameters each declared type needs ordered wherever it is written or built.
   ordering: Shapes,
@@ -690,7 +707,7 @@ pub type Checker = {
   stated: Map<Bytes, List<DefConstraint>>,
   /// A constrained alias's expansion while a type's declaration was collected: the alias is gone
   /// from the field types the collection kept, and the hint carries what its `where` asked.
-  stated_hints: List<StatedHint>,
+  alias_constraints: List<AliasConstraint>,
   /// The type whose declaration is being collected, else empty.
   collecting: Bytes,
   /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
@@ -718,12 +735,12 @@ pub fn barred(checker: Checker, place: Bytes) -> Checker =
   }
 
 /// `o`, walked from `barred(outer, ..)`, in `outer`'s place again.
-pub fn unbarred(outer: Checker, o: Inferred) -> Inferred =
+pub fn unbarred(outer: Checker, o: Inference) -> Inference =
   { ..o, checker: { ..o.checker, assignable: outer.assignable } }
 
 /// What a walk of an expression found: its type, what it performs, and the node it is in the typed
 /// tree, none where the check reported an error in it.
-pub type Inferred = { checker: Checker, ty: Type, row: Row, node: Option<WalkedNode> }
+pub type Inference = { checker: Checker, ty: Type, row: Row, node: Option<WalkedNode> }
 
 pub type WithTy = { checker: Checker, ty: Type }
 
@@ -733,36 +750,36 @@ pub type WithRow = { checker: Checker, row: Row }
 
 pub type WithName = { checker: Checker, name: Option<Bytes> }
 
-pub type Expected = { checker: Checker, ok: Bool }
+pub type ExpectResult = { checker: Checker, ok: Bool }
 
 pub type WithTys = { checker: Checker, tys: List<Type> }
 
-pub type WithSig = { checker: Checker, sig: Signature }
+pub type WithSignature = { checker: Checker, sig: Signature }
 
 pub type WithAtom = { checker: Checker, atom: Option<Atom> }
 
 pub type WithKey = { checker: Checker, key: Option<ValueKey> }
 
-pub type WithHit = { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> }
+pub type WithOperation = { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> }
 
 pub type WithResource = { checker: Checker, resource: Option<Resource> }
 
 pub type WithBodyRow = { checker: Checker, row: Row }
 
 /// A module's functions as their signatures bind them, each for every body of the module to call.
-pub type Signed = { checker: Checker, sigs: List<Signature>, members: List<GroupDef> }
+pub type BoundSignatures = { checker: Checker, sigs: List<Signature>, members: List<GroupDef> }
 
 /// A body's walk as it stands in the checker's substitution, before it is closed.
-pub type Walk = {
+pub type InferredBody = {
   checker: Checker,
   row: Row,
   performs: List<PerformSite>,
-  repeated_vars: List<Repeated>,
+  repeated_vars: List<RepeatedRowVariable>,
   raise_notes: List<RaiseNote>,
   refs: List<Bytes>,
   calls: List<OwnCall>,
   tag_uses: List<TagUse>,
-  fills: List<GroupFill>,
+  fills: List<GroupInstantiation>,
 }
 
 /// What a function's walk leaves for its group, closed: every type, atom and variable in it is as
@@ -773,9 +790,9 @@ pub type Walk = {
 /// functions, `stated` those an operator, a comparison or a constraint calls because a type states
 /// them; and what each name it reads refers to. `filed` and `count` are the rows it was published
 /// from, where its body was not walked.
-pub type Body = {
+pub type ClosedBody = {
   row: Row,
-  filed: Option<KnownDef>,
+  filed: Option<CachedDefinition>,
   count: Option<Count>,
   params: List<Type>,
   tail: Option<Int>,
@@ -791,7 +808,7 @@ pub type Body = {
   calls: List<OwnCall>,
   stated: List<OwnCall>,
   tags: List<TagRefusal>,
-  fills: List<Fill>,
+  fills: List<Instantiation>,
   names: List<NamedCallee>,
 }
 
@@ -800,11 +817,11 @@ pub type Body = {
 pub type TagRefusal = { name: Bytes, refusal: Diag }
 
 /// A parameter a call fills with a type built from its caller's own, as the type prints.
-pub type Growth = { param: Int, ty: Bytes }
+pub type GrowingArgument = { param: Int, ty: Bytes }
 
 /// A call that fills `callee`'s type parameters: those it fills with a type built from the
 /// caller's own.
-pub type Fill = { module: Int, span: Span, callee: Bytes, grows: List<Growth> }
+pub type Instantiation = { module: Int, span: Span, callee: Bytes, grows: List<GrowingArgument> }
 
 /// What a name a body reads and nothing in it binds refers to, by the site of the name.
 pub type NamedCallee = { site: Int, callee: Callee }
@@ -813,7 +830,7 @@ pub type NamedCallee = { site: Int, callee: Callee }
 /// another check reads it: what it performs with each label parameter of the definition named by
 /// its place (`filed_atoms`), `through` where it performs what its row parameter stands for too,
 /// and each place as the check that walked it counted it.
-pub type WalkedBody = {
+pub type CheckedBody = {
   name: Bytes,
   atoms: List<Atom>,
   through: Bool,
@@ -824,13 +841,13 @@ pub type WalkedBody = {
   calls: List<OwnCall>,
   stated: List<OwnCall>,
   tags: List<TagRefusal>,
-  fills: List<Fill>,
+  fills: List<Instantiation>,
   names: List<NamedCallee>,
 }
 
 derive bin for PerformSource
 
-derive bin for Maybe
+derive bin for PendingIteration
 
 derive bin for PerformSite
 
@@ -842,19 +859,19 @@ derive bin for OwnCall
 
 derive bin for TagRefusal
 
-derive bin for Growth
+derive bin for GrowingArgument
 
-derive bin for Fill
+derive bin for Instantiation
 
 derive bin for NamedCallee
 
-derive bin for WalkedBody
+derive bin for CheckedBody
 
 /// `b` with each place in it moved through `by`, read as module `module` of a check.
-pub fn moved_body(b: WalkedBody, module: Int, by: (Int) -> Int) -> WalkedBody = {
+pub fn relocated_body(b: CheckedBody, module: Int, by: (Int) -> Int) -> CheckedBody = {
   let at = |s: Span| { ..s, start: by(s.start), end: by(s.end) };
   let over = |o: Option<Span>| match o { Some(s) -> Some(at(s)), None -> None };
-  let waits = |ms: List<Maybe>| ms.map(|m: Maybe| { ..m, span: at(m.span) });
+  let waits = |ms: List<PendingIteration>| ms.map(|m: PendingIteration| { ..m, span: at(m.span) });
   let call = |c: OwnCall| { ..c, span: at(c.span) };
   {
     ..b,
@@ -873,7 +890,7 @@ pub fn moved_body(b: WalkedBody, module: Int, by: (Int) -> Int) -> WalkedBody = 
             { ..l, module: module, start: by(l.start), end: by(l.end) }),
         },
       }),
-    fills: b.fills.map(|f: Fill| { ..f, module: module, span: at(f.span) }),
+    fills: b.fills.map(|f: Instantiation| { ..f, module: module, span: at(f.span) }),
   }
 }
 
@@ -883,15 +900,15 @@ pub type ModuleFns = {
   fns: List<FnDef>,
   names: List<Bytes>,
   members: List<GroupDef>,
-  bodies: List<Body>,
+  bodies: List<ClosedBody>,
   /// What each call on a value in each body of the module calls, by the body's owner and the call's
   /// site.
   written: Map<Bytes, Map<Int, MemberCallee>>,
 }
 
 /// The sites of a body an operator, a comparison, a `Map` or a constraint is read at.
-pub type TypedSites = {
-  numerics: List<Numeric>,
+pub type DeferredSites = {
+  numerics: List<NumericOperation>,
   comparisons: List<{ module: Int, span: Span, ty: Type }>,
   map_keys: List<MapKeySite>,
   constrained: List<ConstraintSite>,
@@ -899,9 +916,9 @@ pub type TypedSites = {
 
 /// What a module's type states: its key, its show and its arithmetic in `numeric_ops`' order, each
 /// a function of the module by its qualified name.
-pub type StatedFns = { key: Option<Bytes>, show: Option<Bytes>, numeric: List<Bytes> }
+pub type InstanceFunctions = { key: Option<Bytes>, show: Option<Bytes>, numeric: List<Bytes> }
 
-pub type Reached = { seen: List<Bytes>, fns: List<Bytes> }
+pub type InstanceCalls = { seen: List<Bytes>, fns: List<Bytes> }
 
 /// What a group member performs a number of times that grows with its input: its atoms, the sites a
 /// walk of its body found them at, and the parameters it calls so.
@@ -914,14 +931,14 @@ pub type Count = {
   raises: List<Raise>,
 }
 
-pub type Generalized = { env: TypeEnv, scheme: Scheme }
+pub type Generalization = { env: TypeEnv, scheme: Scheme }
 
 /// The effect of reading a hold, which a `with_hold` region answers.
 pub fn hold() -> Bytes = b"hold"
 
 /// A read of the hold a region labelled `resource` holds.
 pub fn hold_atom(resource: Resource) -> Atom =
-  { effect: hold(), resource: resource, mode: MRead, op: None }
+  { effect: hold(), resource: resource, mode: ReadMode, op: None }
 
 /// The effect a region answers and nothing declares.
 pub fn is_region_effect(name: Bytes) -> Bool = name == hold()
@@ -973,7 +990,7 @@ pub fn report_error_at_and(
     ),
   )
 
-pub fn err_labels(
+pub fn report_error_with_labels(
   checker: Checker,
   code: Bytes,
   message: Bytes,
@@ -988,15 +1005,15 @@ pub fn plural(n: Int) -> Bytes = if n == 1 { b"" } else { b"s" }
 pub fn supplied(n: Int) -> Bytes =
   if n == 1 { b"1 was supplied" } else { ascii_of_int(n).concat(b" were supplied") }
 
-pub fn what_of(deriver: Deriver) -> Bytes =
+pub fn deriver_description(deriver: Deriver) -> Bytes =
   match deriver {
-    DEq -> b"structural equality",
-    DOrd -> b"order",
-    DShow -> b"rendering",
-    DHash -> b"content hash",
-    DNumeric -> b"arithmetic",
-    DInteger -> b"integer arithmetic",
-    DKept -> b"value a process keeps",
+    EqDeriver -> b"structural equality",
+    OrdDeriver -> b"order",
+    ShowDeriver -> b"rendering",
+    HashDeriver -> b"content hash",
+    NumericDeriver -> b"arithmetic",
+    IntegerDeriver -> b"integer arithmetic",
+    ConstantDeriver -> b"value a process keeps",
   }
 
 pub fn row_aliases(def: FnDef) -> List<Bytes> =
@@ -1024,13 +1041,12 @@ pub fn new_row_var(checker: Checker) -> { checker: Checker, var: Int } = {
   { checker: { ..checker, fresh: o.fresh }, var: o.var }
 }
 
-pub fn resolve(checker: Checker, ty: Type) -> Type / {abort.raise} =
-  with_bindings(checker.subst, ty)
+pub fn resolve(checker: Checker, ty: Type) -> Type / {abort.raise} = resolve_type(checker.subst, ty)
 
 pub fn resolve_row_in(checker: Checker, row: Row) -> Row / {abort.raise} =
   resolve_row(checker.subst, row)
 
-pub fn with_unified(checker: Checker, unified: Unified) -> Checker =
+pub fn with_unified(checker: Checker, unified: UnifyResult) -> Checker =
   { ..checker, subst: unified.subst, fresh: unified.fresh }
 
 // --- The prelude ----------------------------------------------------------------------
@@ -1040,12 +1056,13 @@ fn prelude_effect_names() -> List<Bytes> =
 
 pub fn is_prelude_effect(name: Bytes) -> Bool = prelude_effect_names().contains(name)
 
-pub fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
+pub fn simulated_effect_names() -> List<Bytes> = [b"task", b"clock", b"random"]
 
-pub fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead, op: None }
+pub fn seed_atom() -> Atom =
+  { effect: b"sim", resource: SingletonResource, mode: ReadMode, op: None }
 
 pub fn abort_atom() -> Atom =
-  { effect: b"abort", resource: RSingleton, mode: MRaise, op: Some(b"raise") }
+  { effect: b"abort", resource: SingletonResource, mode: RaiseMode, op: Some(b"raise") }
 
 fn abort_row() -> Row = row_singleton(abort_atom())
 
@@ -1056,22 +1073,22 @@ fn builtin_type_arity_map() -> Map<Bytes, Int> =
 
 pub fn builtin_type_arity(name: Bytes) -> Option<Int> = builtin_type_arity_map().get(name)
 
-fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int / {abort.raise} =
+fn index_of_bytes(xs: List<Bytes>, v: Bytes) -> Int / {abort.raise} =
   range(0, xs.len()).fold(0 - 1, |acc: Int, i: Int|
     if acc >= 0 { acc } else if xs.get(i) == v { i } else { acc })
 
 fn install_prelude_adts(checker: Checker) -> Checker / {abort.raise} =
   builtin_sums().fold(checker, |c: Checker, adt: BuiltinSum| {
     let vars = range(0, adt.params.len());
-    let result = TyCon({ name: adt.name, args: vars.map(|v: Int| TyVar(v)) });
+    let result = NamedType({ name: adt.name, args: vars.map(|v: Int| VariableType(v)) });
     range(0, adt.variants.len()).fold(c, |c2: Checker, index: Int| {
       let v = adt.variants.get(index);
       let fields = v.fields.map(|p: Bytes| {
-        let at = position_bytes(adt.params, p);
-        if at >= 0 { TyVar(at) } else { named_type(p) }
+        let at = index_of_bytes(adt.params, p);
+        if at >= 0 { VariableType(at) } else { named_type(p) }
       });
       let ty = if fields.len() == 0 { result } else { fn_type(fields, result, row_empty()) };
-      let sc = { ty_vars: vars, row_vars: [], kept_vars: [], label_vars: [], ty: ty };
+      let sc = { ty_vars: vars, row_vars: [], keep_variables: [], label_vars: [], ty: ty };
       add_ctor({ ..c2, env: env_bind_global(c2.env, v.name, sc) }, {
         name: v.name,
         module: b"",
@@ -1140,20 +1157,20 @@ fn prelude_op(
     scheme: Some({
       ty_vars: ty_vars,
       row_vars: row_vars,
-      kept_vars: [],
+      keep_variables: [],
       label_vars: [],
       ty: fn_type(params, ret, row),
     }),
   }
 
 fn pair_type(first: Type, second: Type) -> Type =
-  TyRecord([{ name: b"_0", ty: first }, { name: b"_1", ty: second }])
+  RecordType([{ name: b"_0", ty: first }, { name: b"_1", ty: second }])
 
 /// The operations whose place in a closure's row shows a channel it captured.
 pub fn channel_ops() -> List<Bytes> = [b"send", b"recv", b"close", b"select"]
 
 pub fn prelude_effects() -> List<EffectInfo> = {
-  let ta = TyVar(0);
+  let ta = VariableType(0);
   let body = fn_type([], ta, row_open(0));
   let task = task_type(ta);
   let chan = chan_type(ta);
@@ -1165,26 +1182,26 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       simple_name: b"task",
       nondet: true,
       at: none,
-      ops: [
-        prelude_op(b"spawn", MWrite, [0], [0], [body], task, row_open(0)),
+      operations: [
+        prelude_op(b"spawn", WriteMode, [0], [0], [body], task, row_open(0)),
         // A join of a cancelled task raises; `await` answers `None` for one.
-        prelude_op(b"join", MWrite, [0], [], [task], ta, abort_row()),
-        prelude_op(b"yield", MWrite, [], [], [], unit_type(), row_empty()),
+        prelude_op(b"join", WriteMode, [0], [], [task], ta, abort_row()),
+        prelude_op(b"yield", WriteMode, [], [], [], unit_type(), row_empty()),
         // Stops a task where it stands; `true` when it had not yet ended.
-        prelude_op(b"cancel", MWrite, [0], [], [task], bool_type(), row_empty()),
+        prelude_op(b"cancel", WriteMode, [0], [], [task], bool_type(), row_empty()),
         // A join that answers `None` for a cancelled task.
-        prelude_op(b"await", MWrite, [0], [], [task], option_type(ta), row_empty()),
-        prelude_op(b"channel", MWrite, [0], [], [int_type()], chan, row_empty()),
+        prelude_op(b"await", WriteMode, [0], [], [task], option_type(ta), row_empty()),
+        prelude_op(b"channel", WriteMode, [0], [], [int_type()], chan, row_empty()),
         // `false` once the channel is closed.
-        prelude_op(b"send", MWrite, [0], [], [chan, ta], bool_type(), row_empty()),
+        prelude_op(b"send", WriteMode, [0], [], [chan, ta], bool_type(), row_empty()),
         // `None` once the channel is closed and empty.
-        prelude_op(b"recv", MWrite, [0], [], [chan], option_type(ta), row_empty()),
-        prelude_op(b"close", MWrite, [0], [], [chan], unit_type(), row_empty()),
+        prelude_op(b"recv", WriteMode, [0], [], [chan], option_type(ta), row_empty()),
+        prelude_op(b"close", WriteMode, [0], [], [chan], unit_type(), row_empty()),
         // An arm is a channel beside `Some` of what to send on it, or `None` to receive; the
         // answer is the arm that went beside what it took or sent, `None` for a closed channel.
         prelude_op(
           b"select",
-          MWrite,
+          WriteMode,
           [0],
           [],
           [list_type(pair_type(chan, option_type(ta))), bool_type()],
@@ -1199,9 +1216,9 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       simple_name: b"clock",
       nondet: true,
       at: none,
-      ops: [
-        prelude_op(b"now", MRead, [], [], [], instant_type(), row_empty()),
-        prelude_op(b"sleep", MWrite, [], [], [duration_type()], unit_type(), row_empty()),
+      operations: [
+        prelude_op(b"now", ReadMode, [], [], [], instant_type(), row_empty()),
+        prelude_op(b"sleep", WriteMode, [], [], [duration_type()], unit_type(), row_empty()),
       ],
     },
     {
@@ -1210,9 +1227,9 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       simple_name: b"random",
       nondet: true,
       at: none,
-      ops: [
-        prelude_op(b"next", MWrite, [], [], [], int_type(), row_empty()),
-        prelude_op(b"below", MWrite, [], [], [int_type()], int_type(), row_empty()),
+      operations: [
+        prelude_op(b"next", WriteMode, [], [], [], int_type(), row_empty()),
+        prelude_op(b"below", WriteMode, [], [], [int_type()], int_type(), row_empty()),
       ],
     },
     {
@@ -1221,7 +1238,7 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       simple_name: b"sim",
       nondet: false,
       at: none,
-      ops: [prelude_op(b"seed", MRead, [], [], [], int_type(), row_empty())],
+      operations: [prelude_op(b"seed", ReadMode, [], [], [], int_type(), row_empty())],
     },
     {
       name: b"abort",
@@ -1229,20 +1246,27 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       simple_name: b"abort",
       nondet: false,
       at: none,
-      ops: [prelude_op(b"raise", MRaise, [0], [], [string_type()], ta, row_empty())],
+      operations: [prelude_op(b"raise", RaiseMode, [0], [], [string_type()], ta, row_empty())],
     },
     // Divergence names no operation: nothing performs it, and nothing handles it.
-    { name: b"diverges", module: b"", simple_name: b"diverges", nondet: false, at: none, ops: [] },
+    {
+      name: b"diverges",
+      module: b"",
+      simple_name: b"diverges",
+      nondet: false,
+      at: none,
+      operations: [],
+    },
   ]
 }
 
 pub fn simulated_atoms() -> List<Atom> / {abort.raise} =
   prelude_effects().fold([], |acc: List<Atom>, effect_info: EffectInfo|
-    if simulated_names().contains(effect_info.name) {
-      effect_info.ops.fold(acc, |atoms: List<Atom>, op_info: OpInfo|
+    if simulated_effect_names().contains(effect_info.name) {
+      effect_info.operations.fold(acc, |atoms: List<Atom>, op_info: OpInfo|
         atoms_insert(atoms, {
           effect: effect_info.name,
-          resource: RSingleton,
+          resource: SingletonResource,
           mode: op_info.mode,
           op: None,
         }))
@@ -1251,8 +1275,8 @@ pub fn simulated_atoms() -> List<Atom> / {abort.raise} =
 /// The operations a `simulate` region answers, each as `<effect>.<operation>`.
 pub fn simulated_ops() -> List<Bytes> / {abort.raise} =
   prelude_effects().fold([], |acc: List<Bytes>, effect_info: EffectInfo|
-    if !simulated_names().contains(effect_info.name) { acc } else {
-      effect_info.ops.fold(acc, |ops: List<Bytes>, op_info: OpInfo|
+    if !simulated_effect_names().contains(effect_info.name) { acc } else {
+      effect_info.operations.fold(acc, |ops: List<Bytes>, op_info: OpInfo|
         ops.push(Bytes::concat_all([effect_info.name, b".", op_info.name])))
     })
 
@@ -1263,7 +1287,7 @@ pub fn simulated_ops() -> List<Bytes> / {abort.raise} =
 pub type Builtin = {
   name: Bytes,
   scheme: Scheme,
-  params: List<Passed>,
+  params: List<ParameterMode>,
   doc: List<Bytes>,
   constraints: List<DefConstraint>,
   /// Each `requires` and `ensures` as the prelude writes it.
@@ -1277,7 +1301,7 @@ pub type Builtin = {
 /// What a declaration's types are read against: the variables its generic list binds, the types
 /// the prelude imports, each under the name its module declares it by, and the body of each alias
 /// of no parameter its module declares.
-type Declaring = {
+type DeclarationScope = {
   fresh: Fresh,
   tys: Map<Bytes, Type>,
   labels: Map<Bytes, Type>,
@@ -1290,11 +1314,11 @@ fn misdeclared(what: Bytes, name: Bytes) -> String =
   "the prelude " ++ String::of_bytes_lossy(what) ++ ": `" ++ String::of_bytes_lossy(name) ++ "`"
 
 fn declared_types(
-  d: Declaring,
+  d: DeclarationScope,
   tys: List<TypeExpr>,
   room: Int,
-) -> { d: Declaring, tys: List<Type> } / {abort.raise} =
-  tys.fold({ d: d, tys: [] }, |acc: { d: Declaring, tys: List<Type> }, ty: TypeExpr| {
+) -> { d: DeclarationScope, tys: List<Type> } / {abort.raise} =
+  tys.fold({ d: d, tys: [] }, |acc: { d: DeclarationScope, tys: List<Type> }, ty: TypeExpr| {
     let o = declared_type(acc.d, ty, room);
     { d: o.d, tys: acc.tys.push(o.ty) }
   })
@@ -1303,33 +1327,33 @@ fn declared_types(
 /// name, at the arguments written; an alias of its module's is the type it names, read with `room`
 /// more aliases to expand inside one another.
 fn declared_type(
-  d: Declaring,
+  d: DeclarationScope,
   ty: TypeExpr,
   room: Int,
-) -> { d: Declaring, ty: Type } / {abort.raise} =
+) -> { d: DeclarationScope, ty: Type } / {abort.raise} =
   match ty {
-    TVar(id) -> match d.tys.get(id.name) {
+    VariableTypeExpression(id) -> match d.tys.get(id.name) {
       Some(t) -> { d: d, ty: t },
       None -> panic(misdeclared(b"names a type variable no generic list binds", id.name)),
     },
-    TUnit(_) -> { d: d, ty: unit_type() },
-    TBad(_) -> panic("the prelude does not parse"),
-    TRecord(r) -> {
+    UnitTypeExpression(_) -> { d: d, ty: unit_type() },
+    InvalidTypeExpression(_) -> panic("the prelude does not parse"),
+    RecordTypeExpression(r) -> {
       let fs = r.fields.fold(
         { d: d, fs: [] },
-        |acc: { d: Declaring, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
+        |acc: { d: DeclarationScope, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
           let o = declared_type(acc.d, f.ty, room);
           { d: o.d, fs: acc.fs.push({ name: f.name.name, ty: o.ty }) }
         },
       );
-      { d: fs.d, ty: TyRecord(fields_sorted(fs.fs)) }
+      { d: fs.d, ty: RecordType(fields_sorted(fs.fs)) }
     },
-    TFn(f) -> {
+    FunctionTypeExpression(f) -> {
       let ps = declared_types(d, f.params, room);
       let r = declared_type(ps.d, f.ret, room);
       { d: r.d, ty: owning_fn_type(ps.tys, f.kept, f.once, r.ty, declared_row(r.d, f.effects)) }
     },
-    TCon(c) -> {
+    NamedTypeExpression(c) -> {
       let name = c.name.name.name;
       match d.tys.get(name) {
         Some(t) -> { d: d, ty: t },
@@ -1343,7 +1367,7 @@ fn declared_type(
           None -> match d.imported.get(name) {
             Some(full) -> {
               let args = declared_types(d, c.args, room);
-              { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+              { d: args.d, ty: NamedType({ name: full, args: args.tys }) }
             },
             None -> {
               let args = declared_types(d, c.args, room);
@@ -1359,7 +1383,7 @@ fn declared_type(
                   },
                   _ -> panic(misdeclared(b"names a hold without its region's label", name)),
                 }
-              } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+              } else { { d: args.d, ty: NamedType({ name: name, args: args.tys }) } }
             },
           },
         },
@@ -1370,33 +1394,33 @@ fn declared_type(
 /// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a mode atom of an effect
 /// its module declares or imports by name (`native.read`), which a check holds to one that declares
 /// no operation, a row variable, or none of them.
-fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
+fn declared_row(d: DeclarationScope, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
     Some(r) ->
       {
         atoms: r.atoms.fold([], |acc: List<Atom>, a: AtomExpr|
-          if is_bare(a.eff) && a.eff.name.name == b"abort"
+          if is_bare(a.effect_name) && a.effect_name.name.name == b"abort"
               && (match a.op { Some(op) -> op.name == b"raise", None -> false }) {
             atoms_insert(acc, abort_atom())
-          } else if is_bare(a.eff) && a.eff.name.name == hold()
-              && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, MRead) }) {
+          } else if is_bare(a.effect_name) && a.effect_name.name.name == hold()
+              && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, ReadMode) }) {
             match a.resource {
               Some(l) -> match d.labels.get(l.name) {
-                Some(TyVar(v)) -> atoms_insert(acc, hold_atom(RVar(v))),
+                Some(VariableType(v)) -> atoms_insert(acc, hold_atom(ResourceVariable(v))),
                 _ ->
                   panic(misdeclared(b"reads a hold under a label no generic list binds", l.name)),
               },
               None -> panic(misdeclared(b"reads a hold without its region's label", hold())),
             }
           } else {
-            match if is_bare(a.eff) && a.op == None && a.resource == None {
-                d.imported.get(a.eff.name.name)
+            match if is_bare(a.effect_name) && a.op == None && a.resource == None {
+                d.imported.get(a.effect_name.name.name)
               } else { None } {
               Some(imported) ->
                 atoms_insert(acc, {
                   effect: imported,
-                  resource: RSingleton,
+                  resource: SingletonResource,
                   mode: a.mode,
                   op: None,
                 }),
@@ -1404,7 +1428,7 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
                 panic(
                   misdeclared(
                     b"performs more than `abort.raise`, `hold.read` and a mode of an effect it names",
-                    a.eff.name.name,
+                    a.effect_name.name.name,
                   ),
                 ),
             }
@@ -1423,7 +1447,7 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
 pub fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
   imports.fold(Map::new(), |acc: Map<Bytes, Bytes>, decl: ImportDecl|
     match decl.kind {
-      INames(names) -> {
+      SelectedNames(names) -> {
         let module = decl.path.fold(b"", |path: Bytes, segment: Ident|
           Bytes::concat_all([path, segment.name, b"."]));
         names.fold(acc, |m: Map<Bytes, Bytes>, n: Ident| m.insert(n.name, module.concat(n.name)))
@@ -1434,7 +1458,7 @@ pub fn prelude_imports(imports: List<ImportDecl>) -> Map<Bytes, Bytes> =
 /// The conditions `&&` joins, each with the text it is written as.
 fn conjuncts(def: ExternDef, e: Expr) -> List<Clause> / {abort.raise} =
   match e {
-    EBinary(b) -> if b.op != b"and" { [written_clause(def, e)] }
+    BinaryExpression(b) -> if b.op != b"and" { [written_clause(def, e)] }
     else { conjuncts(def, b.lhs).concat(conjuncts(def, b.rhs)) },
     _ -> [written_clause(def, e)],
   }
@@ -1447,8 +1471,8 @@ fn written_at(def: ExternDef, span: Span) -> Bytes / {abort.raise} =
   def.written.slice(span.start - def.span.start, span.end - def.span.start)
 
 /// What a call's answer is a function of: no parameter is a function.
-fn answers_by_value(params: List<Type>) -> Bool =
-  params.fold(true, |ok: Bool, ty: Type| ok && (match ty { TyFn(_) -> false, _ -> true }))
+fn has_no_function_params(params: List<Type>) -> Bool =
+  params.fold(true, |ok: Bool, ty: Type| ok && (match ty { FunctionType(_) -> false, _ -> true }))
 
 fn contract_of(
   def: ExternDef,
@@ -1460,22 +1484,22 @@ fn contract_of(
     params: def.params.map(|p: Param| p.name.name),
     requires: def.spec.fold([], |acc: List<Clause>, c: SpecClause|
       match c.kind {
-        SRequires -> acc.concat(conjuncts(def, c.expr)),
-        SEnsures -> acc,
-        SCost -> panic(misdeclared(b"states a `cost`", def.name.name)),
-        SSpace -> panic(misdeclared(b"states a `space`", def.name.name)),
+        RequiresClause -> acc.concat(conjuncts(def, c.expr)),
+        EnsuresClause -> acc,
+        CostClause -> panic(misdeclared(b"states a `cost`", def.name.name)),
+        SpaceClause -> panic(misdeclared(b"states a `space`", def.name.name)),
       }),
     ensures: def.spec.fold([], |acc: List<Clause>, c: SpecClause|
-      match c.kind { SEnsures -> acc.push(written_clause(def, c.expr)), _ -> acc }),
+      match c.kind { EnsuresClause -> acc.push(written_clause(def, c.expr)), _ -> acc }),
     raises: row.atoms.contains(abort_atom()),
-    pure: answers_by_value(params),
+    pure: has_no_function_params(params),
     number: ret == int_type(),
     like: match ret {
-      TyVar(v) ->
+      VariableType(v) ->
         range(0, params.len()).fold(None, |acc: Option<Int>, i: Int|
           match acc {
             Some(_) -> acc,
-            None -> if params.get(i) == TyVar(v) { Some(i) } else { None },
+            None -> if params.get(i) == VariableType(v) { Some(i) } else { None },
           }),
       _ -> None,
     },
@@ -1483,7 +1507,7 @@ fn contract_of(
 
 /// `def` as the builtin `name`, its types read against `imported` and the bodies of the aliases of
 /// no parameter its module declares, `aliases`.
-pub fn declared(
+pub fn builtin_of_extern(
   name: Bytes,
   imported: Map<Bytes, Bytes>,
   def: ExternDef,
@@ -1539,13 +1563,13 @@ pub fn declared(
   // judged where it is used, by what the program declares of it.
   let keyed = params.tys.push(ret.ty).fold([], |acc: List<Type>, t: Type|
     map_key_types(t, acc)).fold([], |acc: List<Int>, k: Type|
-    ints_union(acc, ord_needs(k, Map::new())));
+    ints_union(acc, order_needs(k, Map::new())));
   let found = range(0, def.generics.types.len()).fold(
     written,
     |acc: List<DefConstraint>, i: Int|
       match tys.tys.get(def.generics.types.get(i).name) {
-        Some(TyVar(v)) -> if keyed.contains(v) {
-          insert_constraint(acc, { deriver: DOrd, param: i })
+        Some(VariableType(v)) -> if keyed.contains(v) {
+          insert_constraint(acc, { deriver: OrdDeriver, param: i })
         } else { acc },
         _ -> acc,
       },
@@ -1555,8 +1579,8 @@ pub fn declared(
     scheme: {
       ty_vars: range(0, ret.d.fresh.next_ty),
       row_vars: range(0, ret.d.fresh.next_row),
-      kept_vars: def.generics.kept.fold([], |vs: List<Int>, p: Ident|
-        match tys.tys.get(p.name) { Some(TyVar(v)) -> vs.push(v), _ -> vs }),
+      keep_variables: def.generics.kept.fold([], |vs: List<Int>, p: Ident|
+        match tys.tys.get(p.name) { Some(VariableType(v)) -> vs.push(v), _ -> vs }),
       label_vars: [],
       ty: owning_fn_type(
         params.tys,
@@ -1566,7 +1590,7 @@ pub fn declared(
         row,
       ),
     },
-    params: def.params.map(passed),
+    params: def.params.map(parameter_mode),
     doc: match def.doc { Some(d) -> d.lines, None -> [] },
     constraints: dedup_constraints(found),
     clauses: def.spec.map(|c: SpecClause| written_at(def, c.span)),
@@ -1577,9 +1601,9 @@ pub fn declared(
 
 /// A function the prelude writes in Ply, as the declaration its signature is; `source` is the
 /// prelude's text.
-fn signed_extern(source: Bytes, d: FnDef) -> ExternDef / {abort.raise} =
+fn extern_of_signature(source: Bytes, d: FnDef) -> ExternDef / {abort.raise} =
   {
-    vis: d.vis,
+    visibility: d.visibility,
     name: d.name,
     generics: d.generics,
     params: d.params,
@@ -1604,18 +1628,19 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
     let imported = prelude_imports(parsed.node.imports);
     parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
       match item {
-        IExtern(def) -> if is_builtin(prelude_module(), parsed.node, def) {
-          acc.push(declared(def.name.name, imported, def, Map::new()))
+        ExternItem(def) -> if is_builtin(prelude_module(), parsed.node, def) {
+          acc.push(builtin_of_extern(def.name.name, imported, def, Map::new()))
         } else { acc },
-        IFn(d) -> if !is_pub(d.vis) { acc } else {
-          let whole = signed_extern(source, d);
+        FunctionItem(d) -> if !is_pub(d.visibility) { acc } else {
+          let whole = extern_of_signature(source, d);
           // A `cost` or `space` bound is its body's, which the prover reads off the definition.
           let called = {
             ..whole,
-            spec: whole.spec.filter(|c: SpecClause| c.kind == SRequires || c.kind == SEnsures),
+            spec: whole.spec.filter(|c: SpecClause|
+              c.kind == RequiresClause || c.kind == EnsuresClause),
           };
           acc.push({
-            ..declared(d.name.name, imported, called, Map::new()),
+            ..builtin_of_extern(d.name.name, imported, called, Map::new()),
             clauses: whole.spec.map(|c: SpecClause| written_at(whole, c.span)),
             body: true,
           })
@@ -1631,7 +1656,7 @@ pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
 
 /// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
 pub fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
-  let bound: Checker = builtins().fold(install_prelude_adts(bare), builtin_bound);
+  let bound: Checker = builtins().fold(install_prelude_adts(bare), bind_builtin);
   prelude_effects().fold(bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
 }
 
@@ -1642,7 +1667,7 @@ pub fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
     checker,
     |c: Checker, item: Item|
       match item {
-        IExtern(def) ->
+        ExternItem(def) ->
           report_error_at(
             c,
             b"E0151",
@@ -1658,8 +1683,8 @@ pub fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
               b"write the function's body, or reach what it needs through an `effect` a handler answers",
             ],
           ),
-        IType(def) -> match def.body {
-          TDExtern ->
+        TypeItem(def) -> match def.body {
+          ExternBody ->
             report_error_at(
               c,
               b"E0151",
@@ -1689,39 +1714,39 @@ pub type ValueKey = | LocalKey(Int) | GlobalKey({ name: Bytes, prelude: Bool })
 
 pub fn mode_eq(a: Mode, b: Mode) -> Bool =
   match a {
-    MRead -> match b { MRead -> true, _ -> false },
-    MWrite -> match b { MWrite -> true, _ -> false },
-    MBad -> false,
-    MRaise -> is_raise(b),
+    ReadMode -> match b { ReadMode -> true, _ -> false },
+    WriteMode -> match b { WriteMode -> true, _ -> false },
+    InvalidMode -> false,
+    RaiseMode -> is_raise(b),
   }
 
 // --- Expressions ------------------------------------------------------------------------------
 
-pub fn lit_type(literal: Lit) -> Type / {abort.raise} =
+pub fn lit_type(literal: SourceLiteral) -> Type / {abort.raise} =
   match literal {
-    LInt(_) -> int_type(),
-    LFixed(ty, _) -> named_type(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
-    LWide(ty, _, _) -> named_type(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
-    LBool(_) -> bool_type(),
-    LStr(_) -> string_type(),
-    LBytes(_) -> bytes_type(),
-    LEmbedded(_, _) -> bytes_type(),
-    LFloat(_) -> float_type(),
-    LDec(_) -> decimal_type(),
-    LChar(_) -> char_type(),
+    LiteralInt(_) -> int_type(),
+    LiteralFixed(ty, _) -> named_type(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
+    LiteralWide(ty, _, _) -> named_type(Bytes::of_string(String::of_bytes(ty).ascii_upper())),
+    LiteralBool(_) -> bool_type(),
+    LiteralString(_) -> string_type(),
+    LiteralBytes(_) -> bytes_type(),
+    LiteralEmbedded(_, _) -> bytes_type(),
+    LiteralFloat(_) -> float_type(),
+    LiteralDecimal(_) -> decimal_type(),
+    LiteralChar(_) -> char_type(),
     _ -> unit_type(),
   }
 
-pub fn record_site(checker: Checker, atom: Atom, span: Span, source: PerformSource) -> Checker =
-  record_over(checker, atom, span, source, checker.over, checker.maybe)
+pub fn record_perform(checker: Checker, atom: Atom, span: Span, source: PerformSource) -> Checker =
+  record_perform_under(checker, atom, span, source, checker.over, checker.maybe)
 
-pub fn record_over(
+pub fn record_perform_under(
   checker: Checker,
   atom: Atom,
   span: Span,
   source: PerformSource,
   over: Option<Span>,
-  maybe: List<Maybe>,
+  maybe: List<PendingIteration>,
 ) -> Checker =
   if span.start == 0 && span.end == 0 { checker } else {
     {
@@ -1743,7 +1768,7 @@ pub fn is_direct(site: PerformSite) -> Bool =
 // --- Definitions ----------------------------------------------------------------------------------
 
 /// `b` bound where a call finds it, with what its declaration states.
-pub fn builtin_bound(c: Checker, b: Builtin) -> Checker / {abort.raise} =
+pub fn bind_builtin(c: Checker, b: Builtin) -> Checker / {abort.raise} =
   {
     ..c,
     env: env_bind_global(c.env, b.name, b.scheme),
@@ -1781,7 +1806,7 @@ pub fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> / {abor
 
 // The one predicate a `where` clause, a `Map` key type and a `derive` ask.
 
-pub type Blocked = { ty: Type, why: DeriveRefusal }
+pub type Blocker = { ty: Type, reason: DeriveRefusal }
 
 /// `params` are the type's type and label variables and `rows` its row variables, in the order a
 /// use's arguments ride.
@@ -1804,7 +1829,7 @@ pub fn derivable(
   ty: Type,
   adts: Shapes,
   assumed: List<Int>,
-) -> Option<Blocked> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], adts.len())
+) -> Option<Blocker> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], adts.len())
 
 fn first_blocked(
   deriver: Deriver,
@@ -1813,8 +1838,8 @@ fn first_blocked(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<Blocked> / {abort.raise} =
-  tys.fold(None, |acc: Option<Blocked>, ty: Type|
+) -> Option<Blocker> / {abort.raise} =
+  tys.fold(None, |acc: Option<Blocker>, ty: Type|
     match acc {
       Some(_) -> acc,
       None -> derivable_within(deriver, ty, adts, assumed, visiting, room),
@@ -1828,26 +1853,28 @@ fn derivable_within(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<Blocked> / {abort.raise} =
+) -> Option<Blocker> / {abort.raise} =
   match ty {
-    TyVar(v) -> if assumed.contains(v) { None } else { Some({ ty: ty, why: Unconstrained(v) }) },
-    TyFn(_) -> Some({ ty: ty, why: HoldsFunction }),
-    TyRecord(fs) -> first_blocked(deriver, fs.map(|f: Field| f.ty), adts, assumed, visiting, room),
-    TyNominal(n) ->
+    VariableType(v) -> if assumed.contains(v) { None }
+    else { Some({ ty: ty, reason: Unconstrained(v) }) },
+    FunctionType(_) -> Some({ ty: ty, reason: HoldsFunction }),
+    RecordType(fs) ->
+      first_blocked(deriver, fs.map(|f: Field| f.ty), adts, assumed, visiting, room),
+    NominalType(n) ->
       first_blocked(deriver, n.fields.map(|f: Field| f.ty), adts, assumed, visiting, room),
-    TyCon(c) -> match constructor_shape(deriver, c.name) {
+    NamedType(c) -> match constructor_shape(deriver, c.name) {
       Leaf -> None,
-      Refused(why) -> Some({ ty: ty, why: why }),
+      Refused(why) -> Some({ ty: ty, reason: why }),
       Structural -> first_blocked(deriver, c.args, adts, assumed, visiting, room),
       Nominal ->        // A recursive type is derivable exactly when its non-recursive parts are.
         if visiting.contains(c.name) { None } else {
           match find_adt(adts, c.name) {
             None -> None,
-            Some(adt) -> if adt.native { Some({ ty: ty, why: HoldsNative }) }
+            Some(adt) -> if adt.native { Some({ ty: ty, reason: HoldsNative }) }
             else if room <= 0 { panic("a type entered twice on one path") } else {
               first_blocked(
                 deriver,
-                adt.fields.map(|f: Type| at_arguments(f, adt.params, adt.rows, c.args)),
+                adt.fields.map(|f: Type| apply_arguments(f, adt.params, adt.rows, c.args)),
                 adts,
                 assumed,
                 visiting.push(c.name),
@@ -1861,10 +1888,10 @@ fn derivable_within(
 
 /// The variables `derivable` needs ordered to order `ty`, reading declared types through `shapes`:
 /// each one it finds unassumed, as far as a refusal no assumption lifts.
-pub fn ord_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise} =
+pub fn order_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise} =
   iterate([], vars_of_type(ty).len() + 2, |found: List<Int>|
-    match derivable(DOrd, ty, shapes, found) {
-      Some(b) -> match b.why {
+    match derivable(OrdDeriver, ty, shapes, found) {
+      Some(b) -> match b.reason {
         Unconstrained(v) -> Continue(ints_insert(found, v)),
         _ -> Stop(found),
       },
@@ -1876,15 +1903,15 @@ pub fn vars_of_type(t: Type) -> List<Int> / {abort.raise} =
 
 fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
   match t {
-    TyCon(c) -> {
+    NamedType(c) -> {
       let own = match map_parts(t) { Some(p) -> out.push(p.key), None -> out };
       c.args.fold(own, |acc: List<Type>, a: Type| map_key_types(a, acc))
     },
-    TyFn(f) ->
+    FunctionType(f) ->
       map_key_types(f.ret, f.params.fold(out, |acc: List<Type>, p: Type| map_key_types(p, acc))),
-    TyRecord(fs) -> fs.fold(out, |acc: List<Type>, f: Field| map_key_types(f.ty, acc)),
-    TyNominal(n) -> n.args.fold(out, |acc: List<Type>, a: Type| map_key_types(a, acc)),
-    TyVar(_) -> out,
+    RecordType(fs) -> fs.fold(out, |acc: List<Type>, f: Field| map_key_types(f.ty, acc)),
+    NominalType(n) -> n.args.fold(out, |acc: List<Type>, a: Type| map_key_types(a, acc)),
+    VariableType(_) -> out,
   }
 
 // --- `check_program` --------------------------------------------------------------------------------------
@@ -1903,7 +1930,7 @@ derive bin for WitnessOrder
 test "the clock and randomness declare exactly the operations a region answers itself" {
   let ops_of = |name: Bytes|
     match prelude_effects().filter(|e: EffectInfo| e.name == name) {
-      [e, ..] -> e.ops.map(|o: OpInfo| o.name),
+      [e, ..] -> e.operations.map(|o: OpInfo| o.name),
       [] -> [],
     };
   assert_eq(ops_of(b"clock"), [b"now", b"sleep"]);

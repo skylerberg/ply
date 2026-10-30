@@ -4,22 +4,24 @@
 import std.bin
 import std.list
 import compiler.syntax.parsing (Span, Ident, QName, ParseDiag, span_to, bare, dump_diags,
-                                starts_upper, minted, made_at, role_member_on, role_member_field,
-                                role_member_callee, role_spawn_let, role_spawn_binder,
-                                role_spawn_perform, role_spawn_lambda, role_spawn_call,
-                                role_spawn_read)
-import compiler.syntax.type_syntax (TFn, MWrite, nullary)
-import compiler.syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, SchemaDef,
-                              schema_guard_name, parse, dump_module)
-import compiler.syntax.calls (slotted, slot_args)
-import compiler.syntax.exprs (Expr, EVar, EApp, EBlock, EMatch, MatchArm, ELambda, ETry, EField,
-                              EPerform, EHandle, SLet, NamedArg, Tagged, HandleClause,
-                              is_exit_effect, exit_op)
-import compiler.syntax.patterns (Pattern, PCtor, PVar)
+                                starts_upper, synthetic_span, synthetic_span_at,
+                                role_member_receiver, role_member_field, role_member_callee,
+                                role_spawn_let, role_spawn_binder, role_spawn_perform,
+                                role_spawn_lambda, role_spawn_call, role_spawn_read)
+import compiler.syntax.type_syntax (FunctionTypeExpression, WriteMode, nullary)
+import compiler.syntax.items (Module, Item, FunctionItem, LawItem, SchemaItem, FnDef, Binder,
+                              SchemaDef, schema_guard_name, parse, dump_module)
+import compiler.syntax.calls (slotted, ordered_arguments)
+import compiler.syntax.exprs (Expr, NameExpression, CallExpression, BlockExpression,
+                              MatchExpression, MatchArm, LambdaExpression, PropagateExpression,
+                              FieldExpression, PerformExpression, HandleExpression, LetStatement,
+                              NamedArg, TaggedLiteral, HandleClause, is_exit_effect, exit_op)
+import compiler.syntax.patterns (Pattern, PatternConstructor, PatternVariable)
 import compiler.emit.abi
 import compiler.emit.abi (Native, native_named)
 import compiler.check.known (int_name, bool_name, float_name, decimal_name, fixed_widths)
-import compiler.expand.rewrite.shared (map_item, tagged_in, rebound, any_expr, read_at, bound_at)
+import compiler.expand.rewrite.shared (map_item, tagged_in, report_rebound_constructors, any_expr,
+                                       variable_at, binder_at)
 import compiler.expand.rewrite.try_operator (expand_try)
 
 // --- Calls on values --------------------------------------------------------------------------
@@ -40,7 +42,7 @@ pub type MemberCallee = | WrittenOut(Written) | InField
 
 /// The arguments the call at `at` of `m` on `on` passes, `args` and then `named` put where its
 /// parameters are; as written where the checker refused the call.
-fn member_passed(
+fn member_arguments(
   m: Written,
   at: Span,
   on: Expr,
@@ -50,14 +52,14 @@ fn member_passed(
   let written = [on].concat(args);
   if written.len() > m.names.len() { written } else {
     let s = slotted(m.names, m.defaults, written, named, at);
-    if s.missing.len() > 0 { written } else { slot_args(s.slots, written, named) }
+    if s.missing.len() > 0 { written } else { ordered_arguments(s.slots, written, named) }
   }
 }
 
 /// The callee `m` written at `at`, a node whose names, identifiers, have no site.
 fn member_var(m: Written, at: Span) -> Expr = {
   let named = { ..at, site: 0 };
-  EVar({
+  NameExpression({
     span: at,
     name: {
       module: if m.qualifier.len() == 0 { None } else { Some({ name: m.qualifier, span: named }) },
@@ -67,39 +69,46 @@ fn member_var(m: Written, at: Span) -> Expr = {
   })
 }
 
-fn member_called(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
+fn expand_member_call(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
   match expr {
     // A name written through its type. One the parser made (`?show::display` over a hole) can
     // stand at the span of the call it wraps.
-    EVar(v) -> match v.name.module {
+    NameExpression(v) -> match v.name.module {
       None -> expr,
       Some(of) -> if !starts_upper(of.name) { expr } else {
         match sites.get(v.span.site) { Some(WrittenOut(m)) -> member_var(m, v.span), _ -> expr }
       },
     },
-    EApp(a) -> match a.func {
-      EField(f) -> match sites.get(a.span.site) {
+    CallExpression(a) -> match a.func {
+      FieldExpression(f) -> match sites.get(a.span.site) {
         Some(WrittenOut(m)) ->
-          EApp({
+          CallExpression({
             span: a.span,
             func: member_var(m, f.span),
             named: [],
-            args: member_passed(m, a.span, f.base, a.args, a.named),
+            args: member_arguments(m, a.span, f.base, a.args, a.named),
             labels: a.labels,
           }),
         _ -> expr,
       },
       _ -> expr,
     },
-    EPerform(p) -> {
-      let on = EVar({ span: made_at(p.eff.span, p.span, role_member_on()), name: p.eff });
+    PerformExpression(p) -> {
+      let on = NameExpression({
+        span: synthetic_span_at(p.effect_name.span, p.span, role_member_receiver()),
+        name: p.effect_name,
+      });
       let labels = match p.resource { Some(r) -> [r], None -> [] };
       match sites.get(p.span.site) {
         Some(InField) ->
-          EApp({
+          CallExpression({
             span: p.span,
-            func: EField({
-              span: made_at(span_to(p.eff.span, p.op.span), p.span, role_member_field()),
+            func: FieldExpression({
+              span: synthetic_span_at(
+                span_to(p.effect_name.span, p.op.span),
+                p.span,
+                role_member_field(),
+              ),
               base: on,
               field: p.op,
             }),
@@ -108,11 +117,11 @@ fn member_called(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
             labels: labels,
           }),
         Some(WrittenOut(m)) ->
-          EApp({
+          CallExpression({
             span: p.span,
-            func: member_var(m, made_at(p.op.span, p.span, role_member_callee())),
+            func: member_var(m, synthetic_span_at(p.op.span, p.span, role_member_callee())),
             named: [],
-            args: member_passed(m, p.span, on, p.args, []),
+            args: member_arguments(m, p.span, on, p.args, []),
             labels: labels,
           }),
         None -> expr,
@@ -122,9 +131,12 @@ fn member_called(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
   }
 
 /// `def` with each call on a value in `sites`, by site, written as the call it is.
-pub fn with_member_calls(def: FnDef, sites: Map<Int, MemberCallee>) -> FnDef =
+pub fn expand_function_member_calls(def: FnDef, sites: Map<Int, MemberCallee>) -> FnDef =
   if sites.len() == 0 { def } else {
-    match map_item(IFn(def), |expr: Expr| member_called(sites, expr)) { IFn(d) -> d, _ -> def }
+    match map_item(FunctionItem(def), |expr: Expr| expand_member_call(sites, expr)) {
+      FunctionItem(d) -> d,
+      _ -> def,
+    }
   }
 
 // --- Witnesses -----------------------------------------------------------------------------
@@ -145,10 +157,10 @@ pub fn witness_code(name: Bytes) -> Int = {
 
 /// What the elaboration calls for the witness of a type that states its own arithmetic; the
 /// emitter writes it, and no runtime holds it.
-pub fn stated_witness_name() -> Bytes = b"?stated_witness"
+pub fn declared_witness_name() -> Bytes = b"?stated_witness"
 
 /// The binary operators a witnessed parameter takes, in the elaboration's numbering of them.
-pub fn numeric_ops_numbered() -> List<Bytes> =
+pub fn numeric_operators() -> List<Bytes> =
   [
     b"add",
     b"sub",
@@ -168,22 +180,22 @@ pub fn numeric_ops_numbered() -> List<Bytes> =
   ]
 
 /// The runtime's numbering of the operators a witnessed parameter takes; `-` and `~` are 0 and 1.
-pub fn numeric_op_code(op: Bytes) -> Int = {
-  let ops = numeric_ops_numbered();
+pub fn numeric_operator_code(op: Bytes) -> Int = {
+  let ops = numeric_operators();
   range(0, ops.len()).fold(0 - 1, |acc: Int, i: Int|
     if acc >= 0 { acc } else if ops.at(i) == Some(op) { i } else { acc })
 }
 
 /// A native the compiler writes calls of where no source can: the words each call passes, whether
 /// it answers one, and whether a failure of it raises rather than ending the run.
-pub type Elaborated = { name: Bytes, words: Int, answers: Bool, raises: Bool }
+pub type CompilerNative = { name: Bytes, words: Int, results: Bool, raises: Bool }
 
 /// Every native the compiler writes calls of: the elaboration's, then the emitter's, then those
 /// the emitted C calls directly over machine words.
-pub fn elaborated_natives() -> List<Elaborated> =
+pub fn compiler_natives() -> List<CompilerNative> =
   elaboration_natives().concat(emitter_natives()).concat(
     abi::natives().map(|n: Native|
-      { name: n.name, words: n.params.len(), answers: n.answer != None, raises: n.raises }),
+      { name: n.name, words: n.params.len(), results: n.result != None, raises: n.raises }),
   )
 
 /// A `Float` function the runtime answers, correctly rounded: its builtin's name, the native it is
@@ -226,26 +238,27 @@ pub fn float_exact(name: Bytes) -> Option<Bytes> =
   else { None }
 
 /// The natives the elaboration writes calls of.
-pub fn elaboration_natives() -> List<Elaborated> =
+pub fn elaboration_natives() -> List<CompilerNative> =
   [
-    { name: b"?numeric_binary", words: 4, answers: true, raises: false },
-    { name: b"?numeric_unary", words: 3, answers: true, raises: false },
-    { name: b"?hold_take", words: 1, answers: true, raises: false },
-    { name: b"?hold_bracket", words: 3, answers: true, raises: false },
-    { name: b"?hold_new", words: 1, answers: true, raises: false },
-    { name: b"?handler_init", words: 2, answers: true, raises: false },
-    { name: b"?handler_var", words: 1, answers: true, raises: false },
-    { name: b"?handler_set", words: 2, answers: true, raises: false },
+    { name: b"?numeric_binary", words: 4, results: true, raises: false },
+    { name: b"?numeric_unary", words: 3, results: true, raises: false },
+    { name: b"?hold_take", words: 1, results: true, raises: false },
+    { name: b"?hold_bracket", words: 3, results: true, raises: false },
+    { name: b"?hold_new", words: 1, results: true, raises: false },
+    { name: b"?handler_init", words: 2, results: true, raises: false },
+    { name: b"?handler_var", words: 1, results: true, raises: false },
+    { name: b"?handler_set", words: 2, results: true, raises: false },
   ]
 
 /// The natives the emitter writes calls of over a value's encoding: the runtime's encoding of a
 /// value.
-fn emitter_natives() -> List<Elaborated> =
-  [{ name: b"?encoded", words: 1, answers: true, raises: false }]
+fn emitter_natives() -> List<CompilerNative> =
+  [{ name: b"?encoded", words: 1, results: true, raises: false }]
 
 // --- Running the rewrites --------------------------------------------------------------------
 
-fn has_try(m: Module) -> Bool = any_expr(m, |expr: Expr| match expr { ETry(_) -> true, _ -> false })
+fn has_try(m: Module) -> Bool =
+  any_expr(m, |expr: Expr| match expr { PropagateExpression(_) -> true, _ -> false })
 
 /// Only when the grammar met a `?` or a law schema.
 pub fn expand(
@@ -254,50 +267,50 @@ pub fn expand(
 ) -> { module: Module, diags: List<ParseDiag> } / {abort.raise} = {
   let tried = if has_try(module) { expand_try(module, diags) }
   else { { module: module, diags: diags } };
-  let made = with_schema_fns(spawns_written(tried.module));
-  { module: made, diags: rebound(made, tried.diags) }
+  let function_item = with_schema_fns(wrap_spawned_values(tried.module));
+  { module: function_item, diags: report_rebound_constructors(function_item, tried.diags) }
 }
 
 // --- Spawned values ----------------------------------------------------------------------------
 
 /// Whether `p` spawns a value other than a lambda written there.
 fn spawns_value(
-  p: { span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr> },
+  p: { span: Span, effect_name: QName, op: Ident, resource: Option<Ident>, args: List<Expr> },
 ) -> Bool =
-  p.eff.module == None && p.eff.name.name == b"task" && p.op.name == b"spawn"
-    && (match p.args { [ELambda(_)] -> false, [_] -> true, _ -> false })
+  p.effect_name.module == None && p.effect_name.name.name == b"task" && p.op.name == b"spawn"
+    && (match p.args { [LambdaExpression(_)] -> false, [_] -> true, _ -> false })
 
 /// `task.spawn(f)` of a value other than a lambda, as the spawn of a lambda holding it,
 /// `{ let ?spawned = f; task.spawn(|| ?spawned()) }`: so what a task runs is a lambda written at
 /// its spawn, which holds the words its row takes there.
-fn spawn_written(expr: Expr) -> Expr =
+fn wrap_spawned_value(expr: Expr) -> Expr =
   match expr {
-    EPerform(p) -> if !spawns_value(p) { expr } else {
-      let at = |role: Int| minted(p.span, role);
+    PerformExpression(p) -> if !spawns_value(p) { expr } else {
+      let at = |role: Int| synthetic_span(p.span, role);
       match p.args {
         [value] ->
-          EBlock({
+          BlockExpression({
             span: p.span,
             stmts: [
-              SLet({
+              LetStatement({
                 span: at(role_spawn_let()),
-                pat: bound_at(b"?spawned", at(role_spawn_binder())),
+                pat: binder_at(b"?spawned", at(role_spawn_binder())),
                 ty: None,
                 value: value,
               }),
             ],
             tail: Some(
-              EPerform({
+              PerformExpression({
                 ..p,
                 span: at(role_spawn_perform()),
                 args: [
-                  ELambda({
+                  LambdaExpression({
                     span: at(role_spawn_lambda()),
                     params: [],
                     ret: None,
-                    body: EApp({
+                    body: CallExpression({
                       span: at(role_spawn_call()),
-                      func: read_at(b"?spawned", at(role_spawn_read())),
+                      func: variable_at(b"?spawned", at(role_spawn_read())),
                       named: [],
                       args: [],
                       labels: [],
@@ -313,10 +326,11 @@ fn spawn_written(expr: Expr) -> Expr =
     _ -> expr,
   }
 
-/// Every spawn of a value other than a lambda in `module` written as `spawn_written` says.
-fn spawns_written(module: Module) -> Module =
-  if !any_expr(module, |e: Expr| match e { EPerform(p) -> spawns_value(p), _ -> false }) { module }
-  else { { ..module, items: module.items.map(|item: Item| map_item(item, spawn_written)) } }
+/// Every spawn of a value other than a lambda in `module` written as `wrap_spawned_value` says.
+fn wrap_spawned_values(module: Module) -> Module =
+  if !any_expr(module, |e: Expr| match e { PerformExpression(p) -> spawns_value(p), _ -> false }) {
+    module
+  } else { { ..module, items: module.items.map(|item: Item| map_item(item, wrap_spawned_value)) } }
 
 // --- The law schema ----------------------------------------------------------------------------
 
@@ -331,7 +345,7 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
   let params = d.params.concat(d.binders).map(|b: Binder|
     {
       name: b.name,
-      keep: match b.ty { TFn(_) -> true, _ -> false },
+      keep: match b.ty { FunctionTypeExpression(_) -> true, _ -> false },
       ty: Some(b.ty),
       cost: None,
       space: None,
@@ -342,8 +356,8 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
     atoms: [
       // As the grammar writes an operation's atom: the checker reads its mode off the declaration.
       {
-        eff: bare(ident(b"abort")),
-        mode: MWrite,
+        effect_name: bare(ident(b"abort")),
+        mode: WriteMode,
         op: Some(ident(b"raise")),
         resource: None,
         every: false,
@@ -356,9 +370,9 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
     tail_bounded: false,
     span: at,
   };
-  let made = |name: Ident, body: Expr|
-    IFn({
-      vis: d.vis,
+  let function_item = |name: Ident, body: Expr|
+    FunctionItem({
+      visibility: d.visibility,
       name: name,
       generics: d.generics,
       params: params,
@@ -376,19 +390,20 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
       span: d.span,
     });
   match d.guard {
-    None -> [made(d.name, d.body)],
+    None -> [function_item(d.name, d.body)],
     // In the order a schema writes them, which is the order its expressions are walked in.
-    Some(g) -> [made(ident(schema_guard_name(d.name.name)), g), made(d.name, d.body)],
+    Some(g) ->
+      [function_item(ident(schema_guard_name(d.name.name)), g), function_item(d.name, d.body)],
   }
 }
 
 fn with_schema_fns(module: Module) -> Module =
   if !module.items.fold(false, |found: Bool, item: Item|
-      found || (match item { ISchema(_) -> true, _ -> false })) { module } else {
+      found || (match item { SchemaItem(_) -> true, _ -> false })) { module } else {
     {
       ..module,
       items: module.items.fold([], |acc: List<Item>, item: Item|
-        match item { ISchema(d) -> acc.push(item).concat(schema_fns(d)), _ -> acc.push(item) }),
+        match item { SchemaItem(d) -> acc.push(item).concat(schema_fns(d)), _ -> acc.push(item) }),
     }
   }
 
@@ -405,7 +420,7 @@ fn expanded_fn(src: Bytes) -> { body: Expr, codes: List<Bytes> } / {abort.raise}
   let r = parse(src);
   let x = expand(r.node, r.parser.diags);
   match x.module.items.at(0) {
-    Some(IFn(d)) -> { body: d.body, codes: x.diags.map(|d: ParseDiag| d.code) },
+    Some(FunctionItem(d)) -> { body: d.body, codes: x.diags.map(|d: ParseDiag| d.code) },
     _ -> panic("the source's first item is a function"),
   }
 }
@@ -414,14 +429,14 @@ fn expanded_fn(src: Bytes) -> { body: Expr, codes: List<Bytes> } / {abort.raise}
 /// body; nothing for any other expression.
 fn arms_of(e: Expr) -> List<{ ctor: Bytes, binds: List<Bytes>, body: Expr }> =
   match e {
-    EMatch(m) ->
+    MatchExpression(m) ->
       m.arms.map(|a: MatchArm|
         match a.pat {
-          PCtor(c) ->
+          PatternConstructor(c) ->
             {
               ctor: c.name.name.name,
               binds: c.args.fold([], |acc: List<Bytes>, p: Pattern|
-                match p { PVar(v) -> acc.push(v.name.name), _ -> acc }),
+                match p { PatternVariable(v) -> acc.push(v.name.name), _ -> acc }),
               body: a.body,
             },
           _ -> { ctor: b"", binds: [], body: a.body },
@@ -431,19 +446,22 @@ fn arms_of(e: Expr) -> List<{ ctor: Bytes, binds: List<Bytes>, body: Expr }> =
 
 /// The constructor or function an application calls, by its bare name.
 fn called(e: Expr) -> Bytes =
-  match e { EApp(a) -> match a.func { EVar(v) -> v.name.name.name, _ -> b"" }, _ -> b"" }
+  match e {
+    CallExpression(a) -> match a.func { NameExpression(v) -> v.name.name.name, _ -> b"" },
+    _ -> b"",
+  }
 
 test "a `?` on a `let` splits the block at that statement, failure arm first" {
   let x = expanded_fn(b"fn f(n: Int) -> Result<Int, Bytes> = { let x = g(n)?; Ok(x + 1) }");
   assert_eq(x.codes, []);
   // The `Ok` arm binds the `let`'s name and runs the statements after it.
   let tested = match x.body {
-    EBlock(b) -> if b.stmts.len() == 0 { b.tail } else { None },
+    BlockExpression(b) -> if b.stmts.len() == 0 { b.tail } else { None },
     _ -> None,
   };
   match tested {
     Some(m) -> {
-      assert_eq(match m { EMatch(n) -> called(n.scrutinee), _ -> b"" }, b"g");
+      assert_eq(match m { MatchExpression(n) -> called(n.scrutinee), _ -> b"" }, b"g");
       let arms = arms_of(m);
       assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
         b"Err",
@@ -452,7 +470,7 @@ test "a `?` on a `let` splits the block at that statement, failure arm first" {
       assert_eq(called(arms.get(0).body), b"Err");
       assert_eq(arms.get(1).binds, [b"x"]);
       let rest = match arms.get(1).body {
-        EBlock(b) -> match b.tail { Some(t) -> t, None -> arms.get(1).body },
+        BlockExpression(b) -> match b.tail { Some(t) -> t, None -> arms.get(1).body },
         other -> other,
       };
       assert_eq(called(rest), b"Ok")
@@ -469,7 +487,7 @@ test "a `?` inside a return-position expression lifts to its head, and an `Optio
     b"None",
     b"Some",
   ]);
-  assert_eq(match arms.get(0).body { EVar(v) -> v.name.name.name, _ -> b"" }, b"None");
+  assert_eq(match arms.get(0).body { NameExpression(v) -> v.name.name.name, _ -> b"" }, b"None");
   assert_eq(called(arms.get(1).body), b"Some")
 }
 
@@ -480,10 +498,11 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
 }
 
 /// What a raise of an exit effect carries, where `e` is one.
-fn exit_carried(e: Expr) -> Option<Expr> =
+fn exit_value(e: Expr) -> Option<Expr> =
   match e {
-    EPerform(p) -> if is_exit_effect(p.eff.name.name) && p.op.name == exit_op() { p.args.at(0) }
-    else { None },
+    PerformExpression(p) -> if is_exit_effect(p.effect_name.name.name) && p.op.name == exit_op() {
+      p.args.at(0)
+    } else { None },
     _ -> None,
   }
 
@@ -493,18 +512,21 @@ test "a `?` inside a `handle` raises its function's exit, which a `handle` aroun
   );
   assert_eq(x.codes, []);
   // The `handle` stands where a `?` of its own would: the scrutinee of the block's `match`.
-  let lifted = match x.body { EBlock(b) -> b.tail, _ -> None };
-  let around = match lifted { Some(EMatch(m)) -> Some(m.scrutinee), _ -> None };
+  let lifted = match x.body { BlockExpression(b) -> b.tail, _ -> None };
+  let around = match lifted { Some(MatchExpression(m)) -> Some(m.scrutinee), _ -> None };
   match around {
-    Some(EHandle(w)) -> {
+    Some(HandleExpression(w)) -> {
       // Its one clause answers the exit with the failure it carried, and its body is the `Ok`.
-      assert_eq(w.clauses.map(|c: HandleClause| is_exit_effect(c.eff.name.name)), [true]);
+      assert_eq(w.clauses.map(|c: HandleClause| is_exit_effect(c.effect_name.name.name)), [true]);
       assert_eq(called(w.clauses.get(0).body), b"Err");
       assert_eq(called(w.body), b"Ok");
       // Inside, the `?`'s failure arm raises the exit with what `Err` held.
       let inner = match w.body {
-        EApp(a) -> match a.args.at(0) {
-          Some(EHandle(h)) -> match h.body { EBlock(b) -> b.tail, other -> Some(other) },
+        CallExpression(a) -> match a.args.at(0) {
+          Some(HandleExpression(h)) -> match h.body {
+            BlockExpression(b) -> b.tail,
+            other -> Some(other),
+          },
           _ -> None,
         },
         _ -> None,
@@ -516,7 +538,7 @@ test "a `?` inside a `handle` raises its function's exit, which a `handle` aroun
             b"Err",
             b"Ok",
           ]);
-          assert(exit_carried(arms.get(0).body) != None, None)
+          assert(exit_value(arms.get(0).body) != None, None)
         },
         None -> assert(false, Some("the written `handle` stands inside the `Ok`")),
       }
@@ -595,7 +617,7 @@ test "a tagged literal and a `try` in a test's label or its table are read as th
     b"test \"t {hex\"01\"}\" for n: Int in [hex\"02\"] { assert(n > hex\"03\") }",
   ).node;
   assert(tagged_in(over).len() > 0);
-  assert_eq(tagged_in(over).map(|t: Tagged| t.text), [b"01", b"02", b"03"]);
+  assert_eq(tagged_in(over).map(|t: TaggedLiteral| t.text), [b"01", b"02", b"03"]);
   let refused = |src: Bytes| dump_expanded(src).contains("!E0118");
   let labelled = b"test \"t {hex\"01\"}\" for n: Int in [1] { () }";
   let tabled = b"test \"t {n}\" for n: Int in [try { g(1) }] { () }";
@@ -607,7 +629,7 @@ test "a tagged literal and a `try` in a test's label or its table are read as th
 test "a tagged literal's holes are read as a call's arguments are, and it runs as its tag's `fill`" {
   let holding = b"fn f(n: Int) -> Result<Int, Bytes> = Ok(List::len(sh\"a {g(n)?} {sh\"b\"} {try { sh\"c {n}\" }}\"))";
   // One that holds another is read before it.
-  assert_eq(tagged_in(parse(holding).node).map(|t: Tagged| t.text), [b"a ", b"b", b"c "]);
+  assert_eq(tagged_in(parse(holding).node).map(|t: TaggedLiteral| t.text), [b"a ", b"b", b"c "]);
   // A `?` in a hole is lifted to the head of what holds the literal.
   let out = dump_expanded(holding);
   assert(!out.contains(":etry;") && out.contains(":emat;"));
@@ -621,12 +643,12 @@ test "a spawn of a value other than a lambda spawns a lambda calling it, the val
   let x = expanded_fn(b"fn f(work: () -> Int) -> Task<Int> / {task.write} = task.spawn(work)");
   assert_eq(x.codes, []);
   match x.body {
-    EBlock(b) -> {
+    BlockExpression(b) -> {
       // The value is bound before the spawn, so it is what it was where the spawn is written.
       assert_eq(b.stmts.len(), 1);
       match b.tail {
-        Some(EPerform(p)) -> match p.args {
-          [ELambda(l)] -> {
+        Some(PerformExpression(p)) -> match p.args {
+          [LambdaExpression(l)] -> {
             assert_eq(l.params.len(), 0);
             assert_eq(called(l.body), b"?spawned")
           },
@@ -639,7 +661,7 @@ test "a spawn of a value other than a lambda spawns a lambda calling it, the val
   };
   // A lambda is spawned as it is written.
   match expanded_fn(b"fn g() -> Task<Int> / {task.write} = task.spawn(|| 1)").body {
-    EPerform(p) -> assert_eq(p.args.len(), 1),
+    PerformExpression(p) -> assert_eq(p.args.len(), 1),
     _ -> assert(false, Some("a lambda's spawn is left")),
   }
 }
@@ -659,11 +681,11 @@ test "a schema is also the definitions its instantiations call, `transparent` an
     ).node,
     [],
   );
-  let made = x.module.items.fold(
+  let function_item = x.module.items.fold(
     [],
     |acc: List<{ name: Bytes, params: Int, read: Bool, doc: Bool }>, item: Item|
       match item {
-        IFn(d) ->
+        FunctionItem(d) ->
           acc.push({
             name: d.name.name,
             params: d.params.len(),
@@ -673,7 +695,7 @@ test "a schema is also the definitions its instantiations call, `transparent` an
         _ -> acc,
       },
   );
-  assert_eq(made, [
+  assert_eq(function_item, [
     { name: b"s_where", params: 2, read: true, doc: true },
     { name: b"s", params: 2, read: true, doc: true },
   ])
@@ -681,20 +703,24 @@ test "a schema is also the definitions its instantiations call, `transparent` an
 
 test "a tagged literal and a `try` in a schema or in what a law instantiates one with are read once" {
   let schema = b"law schema s(f: (Int) -> Int) forall (x: Int) where x > hex\"01\" { f(x) == hex\"02\" }\n";
-  let made = b"law \"l\" = s(|n: Int| n + hex\"03\")\n";
-  let over = expand(parse(schema.concat(made)).node, []).module;
-  assert_eq(tagged_in(over).map(|t: Tagged| t.text), [b"01", b"02", b"03"]);
+  let function_item = b"law \"l\" = s(|n: Int| n + hex\"03\")\n";
+  let over = expand(parse(schema.concat(function_item)).node, []).module;
+  assert_eq(tagged_in(over).map(|t: TaggedLiteral| t.text), [b"01", b"02", b"03"]);
   // Once resolved, an instantiation's guard holds the arguments its body does.
   let resolved = over.items.map(|item: Item|
-    match item { ILaw(d) -> ILaw({ ..d, guard: Some(d.body) }), _ -> item });
-  assert_eq(tagged_in({ ..over, items: resolved }).map(|t: Tagged| t.text), [b"01", b"02", b"03"]);
+    match item { LawItem(d) -> LawItem({ ..d, guard: Some(d.body) }), _ -> item });
+  assert_eq(tagged_in({ ..over, items: resolved }).map(|t: TaggedLiteral| t.text), [
+    b"01",
+    b"02",
+    b"03",
+  ]);
   let refused = |src: Bytes| dump_expanded(src).contains("!E0118");
-  assert(!refused(schema) && !refused(schema.concat(made)));
+  assert(!refused(schema) && !refused(schema.concat(function_item)));
   assert(refused(b"type Mine = | Ok(Int) | Fine\n".concat(schema)));
   assert(
     refused(
       b"type Mine = | Ok(Int) | Fine\nlaw schema s(f: (Int) -> Int) forall (x: Int) { f(x) == x }\n".concat(
-        made,
+        function_item,
       ),
     ),
   );
@@ -706,9 +732,9 @@ test "a tagged literal and a `try` in a schema or in what a law instantiates one
 }
 
 test "the emitter's natives are its own: none is one the lowering writes, and none is named twice" {
-  let declared = elaboration_natives().map(|n: Elaborated| n.name);
-  let all = elaborated_natives().map(|n: Elaborated| n.name);
-  assert_eq(emitter_natives().filter(|n: Elaborated| declared.contains(n.name)), []);
+  let declared = elaboration_natives().map(|n: CompilerNative| n.name);
+  let all = compiler_natives().map(|n: CompilerNative| n.name);
+  assert_eq(emitter_natives().filter(|n: CompilerNative| declared.contains(n.name)), []);
   assert_eq(
     all.fold([], |seen: List<Bytes>, n: Bytes| if seen.contains(n) { seen } else { seen.push(n) }),
     all,

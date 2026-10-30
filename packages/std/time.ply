@@ -114,7 +114,7 @@ pub fn between(earlier: Instant, later: Instant) -> Duration =
 // --- Durations as text ------------------------------------------------------
 
 /// Why a reader refused a text. The last five are the ISO 8601 form's alone.
-pub type Why =
+pub type ErrorKind =
   /// Nothing is written: an empty text, a sign alone, or an ISO `P` or `T` with no component after
   /// it.
   | Empty
@@ -129,7 +129,7 @@ pub type Why =
   /// A span past what a `Duration` holds, about 292 years either way.
   | TooLong
   /// A text that does not open with `P`.
-  | Unopened
+  | MissingP
   /// A year or a month: a calendar period, which is `std.date`'s `Period` and no span of time.
   | Calendar
   /// A designator that is none of `W`, `D`, `H`, `M` and `S`.
@@ -140,17 +140,17 @@ pub type Why =
   | FractionNotLast
 
 /// A refusal, and the offset of the character it is about.
-pub type Refusal = new { why: Why, at: Int }
+pub type Error = new { reason: ErrorKind, at: Int }
 
 /// What a reader of durations raises where it refuses.
 pub effect duration {
   /// The text is not a duration of the form read.
-  raise refused(e: Refusal)
+  raise refused(e: Error)
 }
 
 /// The sentence a refusal says to whoever wrote the text.
-pub fn refusal_message(refused: Refusal) -> String =
-  match refused.why {
+pub fn refusal_message(refused: Error) -> String =
+  match refused.reason {
     Empty -> "no duration is written here",
     NoNumber -> "a number goes here: digits, with digits after a point if it has one",
     NoUnit -> "a number takes its unit after it",
@@ -158,7 +158,7 @@ pub fn refusal_message(refused: Refusal) -> String =
       "not one of the units `h`, `m`, `s`, `ms`, `us` and `ns`: a day is no fixed span",
     TooFine -> "finer than a nanosecond, the least a `Duration` holds",
     TooLong -> "past what a `Duration` holds, about 292 years",
-    Unopened -> "an ISO 8601 duration opens with `P`",
+    MissingP -> "an ISO 8601 duration opens with `P`",
     Calendar ->
       "a year or a month is a calendar period, not a span of time: `std.date`'s `Period` reads one",
     UnknownDesignator -> "not a designator: `W`, `D`, `H`, `M` and `S` are, in upper case",
@@ -176,15 +176,16 @@ pub fn render_duration(d: Duration) -> String = {
   let sign = if n < 0 { "-" } else { "" };
   if n == 0 { "0s" }
   else if below > 0 - 1000 { sign ++ Int::to_string(0 - below) ++ "ns" }
-  else if below > 0 - 1000000 { sign ++ pointed(0 - below / 1000, 0 - below % 1000, 3) ++ "us" }
-  else if below > 0 - 1000000000 {
-    sign ++ pointed(0 - below / 1000000, 0 - below % 1000000, 6) ++ "ms"
-  } else { sign ++ in_hours(below, "h", "m", "s") }
+  else if below > 0 - 1000000 {
+    sign ++ decimal_text(0 - below / 1000, 0 - below % 1000, 3) ++ "us"
+  } else if below > 0 - 1000000000 {
+    sign ++ decimal_text(0 - below / 1000000, 0 - below % 1000000, 6) ++ "ms"
+  } else { sign ++ hours_minutes_seconds(below, "h", "m", "s") }
 }
 
 /// The span `text` writes in the compound form, or why it writes none: `read_duration` with its
 /// refusal as an `Err`.
-pub fn parse_duration(text: String) -> Result<Duration, Refusal> / {abort.raise} =
+pub fn parse_duration(text: String) -> Result<Duration, Error> / {abort.raise} =
   try { read_duration(text) }
 
 /// The span `text` writes in the compound form, raising `duration.refused` where it writes none.
@@ -197,13 +198,13 @@ pub fn parse_duration(text: String) -> Result<Duration, Refusal> / {abort.raise}
 pub fn read_duration(text: String) -> Duration / {duration.refused, abort.raise} = {
   let b = Bytes::of_string(text);
   let start = sign_width(b);
-  if start >= b.len() { refuse(b, Empty, start) }
+  if start >= b.len() { fail(b, Empty, start) }
   else if b.slice(start, b.len()) == b"0" { Duration(0) } else {
     signed(
       b,
       start,
-      iterate({ at: start, below: 0 }, b.len() + 1, |s: Reading|
-        if s.at >= b.len() { Stop(s.below) } else { Continue(term(b, s)) }),
+      iterate({ at: start, below: 0 }, b.len() + 1, |s: CompoundState|
+        if s.at >= b.len() { Stop(s.below) } else { Continue(read_term(b, s)) }),
     )
   }
 }
@@ -215,13 +216,14 @@ pub fn read_duration(text: String) -> Duration / {duration.refused, abort.raise}
 pub fn render_iso_duration(d: Duration) -> String = {
   let n = as_nanos(d);
   if n == 0 { "PT0S" } else {
-    (if n < 0 { "-" } else { "" }) ++ "PT" ++ in_hours(if n > 0 { 0 - n } else { n }, "H", "M", "S")
+    (if n < 0 { "-" } else { "" }) ++ "PT"
+      ++ hours_minutes_seconds(if n > 0 { 0 - n } else { n }, "H", "M", "S")
   }
 }
 
 /// The span `text` writes as an ISO 8601 duration, or why it writes none: `read_iso_duration`
 /// with its refusal as an `Err`.
-pub fn parse_iso_duration(text: String) -> Result<Duration, Refusal> / {abort.raise} =
+pub fn parse_iso_duration(text: String) -> Result<Duration, Error> / {abort.raise} =
   try { read_iso_duration(text) }
 
 /// The span `text` writes as an ISO 8601 duration, raising `duration.refused` where it writes
@@ -236,31 +238,31 @@ pub fn parse_iso_duration(text: String) -> Result<Duration, Refusal> / {abort.ra
 pub fn read_iso_duration(text: String) -> Duration / {duration.refused, abort.raise} = {
   let b = Bytes::of_string(text);
   let start = sign_width(b);
-  if start >= b.len() { refuse(b, Empty, start) }
-  else if b.at(start) != 80 { refuse(b, Unopened, start) } else {
+  if start >= b.len() { fail(b, Empty, start) }
+  else if b.at(start) != 80 { fail(b, MissingP, start) } else {
     let read = iterate(
       { at: start + 1, below: 0, rank: 0, in_time: false, fraction_at: 0 - 1, bare: true },
       b.len() + 1,
-      |s: IsoReading| if s.at >= b.len() { Stop(s) } else { Continue(iso_step(b, s)) },
+      |s: IsoState| if s.at >= b.len() { Stop(s) } else { Continue(iso_step(b, s)) },
     );
-    if read.bare { refuse(b, Empty, read.at) } else { signed(b, start, read.below) }
+    if read.bare { fail(b, Empty, read.at) } else { signed(b, start, read.below) }
   }
 }
 
 /// Where a compound text stands, and the nanoseconds read so far, negated.
-type Reading = { at: Int, below: Int }
+type CompoundState = { at: Int, below: Int }
 
 /// Where an ISO text stands: the nanoseconds read so far, negated, the rank of the last
 /// designator, which side of the `T` it is on, where a component with a fraction began, and
 /// whether no component has followed the `P` or the `T`.
-type IsoReading = { at: Int, below: Int, rank: Int, in_time: Bool, fraction_at: Int, bare: Bool }
+type IsoState = { at: Int, below: Int, rank: Int, in_time: Bool, fraction_at: Int, bare: Bool }
 
 /// A number as written: its digits before the point, those after it without the zeros at their
 /// end, whether a point was written, and where the text stands after it.
-type Number = { whole: Bytes, fraction: Bytes, pointed: Bool, end: Int }
+type Number = { whole: Bytes, fraction: Bytes, has_point: Bool, end: Int }
 
-fn refuse<a>(b: Bytes, why: Why, at: Int) -> a / {duration.refused, abort.raise} =
-  duration.refused({ why: why, at: characters_before(b, at) })
+fn fail<a>(b: Bytes, why: ErrorKind, at: Int) -> a / {duration.refused, abort.raise} =
+  duration.refused({ reason: why, at: characters_before(b, at) })
 
 /// How many characters the first `at` bytes of a text are: the bytes that begin one.
 fn characters_before(b: Bytes, at: Int) -> Int / {abort.raise} =
@@ -271,15 +273,15 @@ fn sign_width(b: Bytes) -> Int = if b.len() > 0 && b.at(0) == 45 { 1 } else { 0 
 /// The span of nanoseconds read below zero, under the sign the text opened with.
 fn signed(b: Bytes, start: Int, below: Int) -> Duration / {duration.refused, abort.raise} =
   if start == 1 { Duration(below) }
-  else { match checked_neg(below) { Some(n) -> Duration(n), None -> refuse(b, TooLong, 0) } }
+  else { match checked_neg(below) { Some(n) -> Duration(n), None -> fail(b, TooLong, 0) } }
 
-fn term(b: Bytes, s: Reading) -> Reading / {duration.refused, abort.raise} = {
+fn read_term(b: Bytes, s: CompoundState) -> CompoundState / {duration.refused, abort.raise} = {
   let n = number_at(b, s.at, b".");
   let unit_end = b.skip_until(n.end, b"0123456789.");
-  if unit_end == n.end { refuse(b, NoUnit, n.end) } else {
+  if unit_end == n.end { fail(b, NoUnit, n.end) } else {
     match unit_nanos(b.slice(n.end, unit_end)) {
-      None -> refuse(b, UnknownUnit, n.end),
-      Some(unit) -> { at: unit_end, below: with_term(b, s.below, n, unit, s.at) },
+      None -> fail(b, UnknownUnit, n.end),
+      Some(unit) -> { at: unit_end, below: add_term(b, s.below, n, unit, s.at) },
     }
   }
 }
@@ -295,21 +297,21 @@ fn unit_nanos(unit: Bytes) -> Option<Int> =
   else if unit == b"h" { Some(3600000000000) }
   else { None }
 
-fn iso_step(b: Bytes, s: IsoReading) -> IsoReading / {duration.refused, abort.raise} =
+fn iso_step(b: Bytes, s: IsoState) -> IsoState / {duration.refused, abort.raise} =
   if b.at(s.at) == 84 {
-    if s.in_time { refuse(b, OutOfOrder, s.at) }
+    if s.in_time { fail(b, OutOfOrder, s.at) }
     else { { ..s, at: s.at + 1, in_time: true, bare: true } }
-  } else if s.fraction_at >= 0 { refuse(b, FractionNotLast, s.fraction_at) } else {
+  } else if s.fraction_at >= 0 { fail(b, FractionNotLast, s.fraction_at) } else {
     let n = number_at(b, s.at, b".,");
-    if n.end >= b.len() { refuse(b, NoUnit, n.end) } else {
+    if n.end >= b.len() { fail(b, NoUnit, n.end) } else {
       let part = iso_part(b, n.end, s.in_time);
-      if part.rank <= s.rank { refuse(b, OutOfOrder, n.end) } else {
+      if part.rank <= s.rank { fail(b, OutOfOrder, n.end) } else {
         {
           at: n.end + 1,
-          below: with_term(b, s.below, n, part.nanos, s.at),
+          below: add_term(b, s.below, n, part.nanos, s.at),
           rank: part.rank,
           in_time: s.in_time,
-          fraction_at: if n.pointed { s.at } else { 0 - 1 },
+          fraction_at: if n.has_point { s.at } else { 0 - 1 },
           bare: false,
         }
       }
@@ -324,14 +326,14 @@ fn iso_part(
 ) -> { rank: Int, nanos: Int } / {duration.refused, abort.raise} = {
   let designator = b.at(at);
   // `Y`, and an `M` before the `T`, which is a month.
-  if designator == 89 || (designator == 77 && !in_time) { refuse(b, Calendar, at) } else {
+  if designator == 89 || (designator == 77 && !in_time) { fail(b, Calendar, at) } else {
     let part = if designator == 87 { { rank: 1, nanos: 604800000000000, timed: false } }
     else if designator == 68 { { rank: 2, nanos: 86400000000000, timed: false } }
     else if designator == 72 { { rank: 3, nanos: 3600000000000, timed: true } }
     else if designator == 77 { { rank: 4, nanos: 60000000000, timed: true } }
     else if designator == 83 { { rank: 5, nanos: 1000000000, timed: true } }
-    else { refuse(b, UnknownDesignator, at) };
-    if part.timed != in_time { refuse(b, OutOfOrder, at) }
+    else { fail(b, UnknownDesignator, at) };
+    if part.timed != in_time { fail(b, OutOfOrder, at) }
     else { { rank: part.rank, nanos: part.nanos } }
   }
 }
@@ -339,18 +341,18 @@ fn iso_part(
 /// The number at `i`: digits, and digits again after one of `points`.
 fn number_at(b: Bytes, i: Int, points: Bytes) -> Number / {duration.refused, abort.raise} = {
   let whole_end = b.skip(i, b"0123456789");
-  if whole_end == i { refuse(b, NoNumber, i) }
+  if whole_end == i { fail(b, NoNumber, i) }
   else if whole_end < b.len() && points.index_of_byte(b.at(whole_end)) != None {
     let end = b.skip(whole_end + 1, b"0123456789");
-    if end == whole_end + 1 { refuse(b, NoNumber, end) } else {
+    if end == whole_end + 1 { fail(b, NoNumber, end) } else {
       {
         whole: b.slice(i, whole_end),
         fraction: without_trailing_zeros(b.slice(whole_end + 1, end)),
-        pointed: true,
+        has_point: true,
         end: end,
       }
     }
-  } else { { whole: b.slice(i, whole_end), fraction: b"", pointed: false, end: whole_end } }
+  } else { { whole: b.slice(i, whole_end), fraction: b"", has_point: false, end: whole_end } }
 }
 
 fn without_trailing_zeros(digits: Bytes) -> Bytes / {abort.raise} =
@@ -362,7 +364,7 @@ fn without_trailing_zeros(digits: Bytes) -> Bytes / {abort.raise} =
 
 /// `below` less the nanoseconds of `n` units, for the term that began at `at`. Read below zero,
 /// because the least `Duration` has no positive twin.
-fn with_term(
+fn add_term(
   b: Bytes,
   below: Int,
   n: Number,
@@ -371,11 +373,11 @@ fn with_term(
 ) -> Int / {duration.refused, abort.raise} = {
   let places = n.fraction.len();
   // Past thirteen places no unit is whole nanoseconds, and eighteen fit an `Int`.
-  if places > 18 { refuse(b, TooFine, at) } else {
+  if places > 18 { fail(b, TooFine, at) } else {
     let part = I128::of_int(match n.fraction.int_of_ascii() { Some(f) -> f, None -> 0 })
       * I128::of_int(unit);
     let scale = I128::of_int(pow(10, places));
-    if part % scale != 0i128 { refuse(b, TooFine, at) } else {
+    if part % scale != 0i128 { fail(b, TooFine, at) } else {
       let read = match Bytes::int_of_ascii(b"-" ++ n.whole) {
         None -> None,
         Some(whole) -> match checked_mul(whole, unit) {
@@ -386,25 +388,26 @@ fn with_term(
           },
         },
       };
-      match read { Some(total) -> total, None -> refuse(b, TooLong, at) }
+      match read { Some(total) -> total, None -> fail(b, TooLong, at) }
     }
   }
 }
 
 /// The hours, minutes and seconds of a span at or below zero, each before its mark and none
 /// written where it is zero.
-fn in_hours(below: Int, hour: String, minute: String, second: String) -> String = {
+fn hours_minutes_seconds(below: Int, hour: String, minute: String, second: String) -> String = {
   let hours = 0 - below / 3600000000000;
   let minutes = 0 - below % 3600000000000 / 60000000000;
   let nanos = 0 - below % 60000000000;
   (if hours == 0 { "" } else { hours.to_string() ++ hour })
     ++ (if minutes == 0 { "" } else { minutes.to_string() ++ minute })
-    ++ (if nanos == 0 { "" } else { pointed(nanos / 1000000000, nanos % 1000000000, 9) ++ second })
+    ++ (if nanos == 0 { "" }
+    else { decimal_text(nanos / 1000000000, nanos % 1000000000, 9) ++ second })
 }
 
 /// `whole`, and after a point the `places` digits of `part` without the zeros at their end; no
 /// point where `part` is zero.
-fn pointed(whole: Int, part: Int, places: Int) -> String =
+fn decimal_text(whole: Int, part: Int, places: Int) -> String =
   whole.to_string()
     ++ (if part == 0 { "" } else {
       "."
@@ -616,15 +619,15 @@ test "a duration reads back from its ISO 8601 text" {
 }
 
 /// A span in nanoseconds, and the one text a renderer writes of it.
-type Written = { nanos: Int, text: String }
+type RenderCase = { nanos: Int, text: String }
 
 /// A text, and the refusal a reader answers it with.
-type Refusing = { text: String, why: Why, at: Int }
+type ErrorCase = { text: String, reason: ErrorKind, at: Int }
 
 fn least() -> Int = 0 - 9223372036854775807 - 1
 
 test "a span has one compound text, the largest unit first and none written at zero" {
-  let texts: List<Written> = [
+  let texts: List<RenderCase> = [
     { nanos: 0, text: "0s" },
     { nanos: 1, text: "1ns" },
     { nanos: 999, text: "999ns" },
@@ -650,14 +653,14 @@ test "a span has one compound text, the largest unit first and none written at z
     { nanos: 9223372036854775807, text: "2562047h47m16.854775807s" },
     { nanos: least(), text: "-2562047h47m16.854775808s" },
   ];
-  texts.fold((), |_: Unit, c: Written| {
+  texts.fold((), |_: Unit, c: RenderCase| {
     assert_eq(render_duration(Duration(c.nanos)), c.text);
     assert_eq(parse_duration(c.text), Ok(Duration(c.nanos)))
   })
 }
 
 test "terms add in any order, and a fraction is read wherever it is whole nanoseconds" {
-  let read: List<Written> = [
+  let read: List<RenderCase> = [
     { nanos: 5400000000000, text: "90m" },
     { nanos: 5400000000000, text: "1.5h" },
     { nanos: 5400000000000, text: "30m1h" },
@@ -679,44 +682,44 @@ test "terms add in any order, and a fraction is read wherever it is whole nanose
     { nanos: least(), text: "-9223372036854775808ns" },
     { nanos: least(), text: "-9223372036s854775808ns" },
   ];
-  read.fold((), |_: Unit, c: Written| assert_eq(parse_duration(c.text), Ok(Duration(c.nanos))))
+  read.fold((), |_: Unit, c: RenderCase| assert_eq(parse_duration(c.text), Ok(Duration(c.nanos))))
 }
 
 test "a compound text is refused at the character that keeps it from being a duration" {
-  let refused: List<Refusing> = [
-    { text: "", why: Empty, at: 0 },
-    { text: "-", why: Empty, at: 1 },
-    { text: "h", why: NoNumber, at: 0 },
-    { text: "+1s", why: NoNumber, at: 0 },
-    { text: ".5s", why: NoNumber, at: 0 },
-    { text: "1.s", why: NoNumber, at: 2 },
-    { text: "1h-1m", why: UnknownUnit, at: 1 },
-    { text: "1", why: NoUnit, at: 1 },
-    { text: "1.5", why: NoUnit, at: 3 },
-    { text: "1h30", why: NoUnit, at: 4 },
-    { text: "1.5.5s", why: NoUnit, at: 3 },
-    { text: "1d", why: UnknownUnit, at: 1 },
-    { text: "1w", why: UnknownUnit, at: 1 },
-    { text: "1H", why: UnknownUnit, at: 1 },
-    { text: "1min", why: UnknownUnit, at: 1 },
-    { text: "1 h", why: UnknownUnit, at: 1 },
-    { text: "1h ", why: UnknownUnit, at: 1 },
-    { text: "1\u{b5}s1x", why: UnknownUnit, at: 4 },
-    { text: "0.5ns", why: TooFine, at: 0 },
-    { text: "1h0.0000000001s", why: TooFine, at: 2 },
-    { text: "0.00000000000001h", why: TooFine, at: 0 },
-    { text: "9223372036854775808ns", why: TooLong, at: 0 },
-    { text: "2562047h47m16.854775808s", why: TooLong, at: 0 },
-    { text: "-2562047h47m16.854775809s", why: TooLong, at: 12 },
-    { text: "2562048h", why: TooLong, at: 0 },
-    { text: "99999999999999999999h", why: TooLong, at: 0 },
+  let refused: List<ErrorCase> = [
+    { text: "", reason: Empty, at: 0 },
+    { text: "-", reason: Empty, at: 1 },
+    { text: "h", reason: NoNumber, at: 0 },
+    { text: "+1s", reason: NoNumber, at: 0 },
+    { text: ".5s", reason: NoNumber, at: 0 },
+    { text: "1.s", reason: NoNumber, at: 2 },
+    { text: "1h-1m", reason: UnknownUnit, at: 1 },
+    { text: "1", reason: NoUnit, at: 1 },
+    { text: "1.5", reason: NoUnit, at: 3 },
+    { text: "1h30", reason: NoUnit, at: 4 },
+    { text: "1.5.5s", reason: NoUnit, at: 3 },
+    { text: "1d", reason: UnknownUnit, at: 1 },
+    { text: "1w", reason: UnknownUnit, at: 1 },
+    { text: "1H", reason: UnknownUnit, at: 1 },
+    { text: "1min", reason: UnknownUnit, at: 1 },
+    { text: "1 h", reason: UnknownUnit, at: 1 },
+    { text: "1h ", reason: UnknownUnit, at: 1 },
+    { text: "1\u{b5}s1x", reason: UnknownUnit, at: 4 },
+    { text: "0.5ns", reason: TooFine, at: 0 },
+    { text: "1h0.0000000001s", reason: TooFine, at: 2 },
+    { text: "0.00000000000001h", reason: TooFine, at: 0 },
+    { text: "9223372036854775808ns", reason: TooLong, at: 0 },
+    { text: "2562047h47m16.854775808s", reason: TooLong, at: 0 },
+    { text: "-2562047h47m16.854775809s", reason: TooLong, at: 12 },
+    { text: "2562048h", reason: TooLong, at: 0 },
+    { text: "99999999999999999999h", reason: TooLong, at: 0 },
   ];
-  refused.fold((), |_: Unit, c: Refusing|
-    assert_eq(parse_duration(c.text), Err({ why: c.why, at: c.at })))
+  refused.fold((), |_: Unit, c: ErrorCase|
+    assert_eq(parse_duration(c.text), Err({ reason: c.reason, at: c.at })))
 }
 
 test "a span has one ISO 8601 text, in hours, minutes and seconds" {
-  let texts: List<Written> = [
+  let texts: List<RenderCase> = [
     { nanos: 0, text: "PT0S" },
     { nanos: 1, text: "PT0.000000001S" },
     { nanos: 250000, text: "PT0.00025S" },
@@ -729,14 +732,14 @@ test "a span has one ISO 8601 text, in hours, minutes and seconds" {
     { nanos: 9223372036854775807, text: "PT2562047H47M16.854775807S" },
     { nanos: least(), text: "-PT2562047H47M16.854775808S" },
   ];
-  texts.fold((), |_: Unit, c: Written| {
+  texts.fold((), |_: Unit, c: RenderCase| {
     assert_eq(render_iso_duration(Duration(c.nanos)), c.text);
     assert_eq(parse_iso_duration(c.text), Ok(Duration(c.nanos)))
   })
 }
 
 test "an ISO 8601 week is seven days and a day 24 hours, and the last component may be a fraction" {
-  let read: List<Written> = [
+  let read: List<RenderCase> = [
     { nanos: 86400000000000, text: "P1D" },
     { nanos: 604800000000000, text: "P1W" },
     { nanos: 1483506500000000, text: "P2W3DT4H5M6.5S" },
@@ -750,52 +753,53 @@ test "an ISO 8601 week is seven days and a day 24 hours, and the last component 
     { nanos: 0 - 86400000000000, text: "-P1D" },
     { nanos: 9223372036854775807, text: "P15250WT47H47M16.854775807S" },
   ];
-  read.fold((), |_: Unit, c: Written| assert_eq(parse_iso_duration(c.text), Ok(Duration(c.nanos))))
+  read.fold((), |_: Unit, c: RenderCase|
+    assert_eq(parse_iso_duration(c.text), Ok(Duration(c.nanos))))
 }
 
 test "an ISO 8601 text is refused at the character that keeps it from being a duration" {
-  let refused: List<Refusing> = [
-    { text: "", why: Empty, at: 0 },
-    { text: "-", why: Empty, at: 1 },
-    { text: "P", why: Empty, at: 1 },
-    { text: "PT", why: Empty, at: 2 },
-    { text: "P1DT", why: Empty, at: 4 },
-    { text: "1h", why: Unopened, at: 0 },
-    { text: "p1d", why: Unopened, at: 0 },
-    { text: "+PT1S", why: Unopened, at: 0 },
-    { text: "P1Y", why: Calendar, at: 2 },
-    { text: "P1M", why: Calendar, at: 2 },
-    { text: "P1W2M", why: Calendar, at: 4 },
-    { text: "P1Y2M3DT4H", why: Calendar, at: 2 },
-    { text: "PT1Y", why: Calendar, at: 3 },
-    { text: "PT1M2H", why: OutOfOrder, at: 5 },
-    { text: "PT1H1H", why: OutOfOrder, at: 5 },
-    { text: "P1D1W", why: OutOfOrder, at: 4 },
-    { text: "P1H", why: OutOfOrder, at: 2 },
-    { text: "P1S", why: OutOfOrder, at: 2 },
-    { text: "PT1W", why: OutOfOrder, at: 3 },
-    { text: "PT1D", why: OutOfOrder, at: 3 },
-    { text: "PTT1S", why: OutOfOrder, at: 2 },
-    { text: "PT1HT1M", why: OutOfOrder, at: 4 },
-    { text: "PT1.5H30M", why: FractionNotLast, at: 2 },
-    { text: "PT1.0H30M", why: FractionNotLast, at: 2 },
-    { text: "P0.5DT1H", why: FractionNotLast, at: 1 },
-    { text: "PT1h", why: UnknownDesignator, at: 3 },
-    { text: "PT1X", why: UnknownDesignator, at: 3 },
-    { text: "PT1 S", why: UnknownDesignator, at: 3 },
-    { text: "PT1", why: NoUnit, at: 3 },
-    { text: "PT1.5", why: NoUnit, at: 5 },
-    { text: "PTS", why: NoNumber, at: 2 },
-    { text: "PT.5S", why: NoNumber, at: 2 },
-    { text: "PT1.S", why: NoNumber, at: 4 },
-    { text: "PT-1S", why: NoNumber, at: 2 },
-    { text: "PT0.0000000001S", why: TooFine, at: 2 },
-    { text: "P15251W", why: TooLong, at: 1 },
-    { text: "P106752D", why: TooLong, at: 1 },
-    { text: "PT2562047H47M16.854775808S", why: TooLong, at: 0 },
+  let refused: List<ErrorCase> = [
+    { text: "", reason: Empty, at: 0 },
+    { text: "-", reason: Empty, at: 1 },
+    { text: "P", reason: Empty, at: 1 },
+    { text: "PT", reason: Empty, at: 2 },
+    { text: "P1DT", reason: Empty, at: 4 },
+    { text: "1h", reason: MissingP, at: 0 },
+    { text: "p1d", reason: MissingP, at: 0 },
+    { text: "+PT1S", reason: MissingP, at: 0 },
+    { text: "P1Y", reason: Calendar, at: 2 },
+    { text: "P1M", reason: Calendar, at: 2 },
+    { text: "P1W2M", reason: Calendar, at: 4 },
+    { text: "P1Y2M3DT4H", reason: Calendar, at: 2 },
+    { text: "PT1Y", reason: Calendar, at: 3 },
+    { text: "PT1M2H", reason: OutOfOrder, at: 5 },
+    { text: "PT1H1H", reason: OutOfOrder, at: 5 },
+    { text: "P1D1W", reason: OutOfOrder, at: 4 },
+    { text: "P1H", reason: OutOfOrder, at: 2 },
+    { text: "P1S", reason: OutOfOrder, at: 2 },
+    { text: "PT1W", reason: OutOfOrder, at: 3 },
+    { text: "PT1D", reason: OutOfOrder, at: 3 },
+    { text: "PTT1S", reason: OutOfOrder, at: 2 },
+    { text: "PT1HT1M", reason: OutOfOrder, at: 4 },
+    { text: "PT1.5H30M", reason: FractionNotLast, at: 2 },
+    { text: "PT1.0H30M", reason: FractionNotLast, at: 2 },
+    { text: "P0.5DT1H", reason: FractionNotLast, at: 1 },
+    { text: "PT1h", reason: UnknownDesignator, at: 3 },
+    { text: "PT1X", reason: UnknownDesignator, at: 3 },
+    { text: "PT1 S", reason: UnknownDesignator, at: 3 },
+    { text: "PT1", reason: NoUnit, at: 3 },
+    { text: "PT1.5", reason: NoUnit, at: 5 },
+    { text: "PTS", reason: NoNumber, at: 2 },
+    { text: "PT.5S", reason: NoNumber, at: 2 },
+    { text: "PT1.S", reason: NoNumber, at: 4 },
+    { text: "PT-1S", reason: NoNumber, at: 2 },
+    { text: "PT0.0000000001S", reason: TooFine, at: 2 },
+    { text: "P15251W", reason: TooLong, at: 1 },
+    { text: "P106752D", reason: TooLong, at: 1 },
+    { text: "PT2562047H47M16.854775808S", reason: TooLong, at: 0 },
   ];
-  refused.fold((), |_: Unit, c: Refusing|
-    assert_eq(parse_iso_duration(c.text), Err({ why: c.why, at: c.at })))
+  refused.fold((), |_: Unit, c: ErrorCase|
+    assert_eq(parse_iso_duration(c.text), Err({ reason: c.reason, at: c.at })))
 }
 
 test "a reader raises its refusal, and each refusal has a sentence" {
@@ -810,12 +814,12 @@ test "a reader raises its refusal, and each refusal has a sentence" {
     UnknownUnit,
     TooFine,
     TooLong,
-    Unopened,
+    MissingP,
     Calendar,
     UnknownDesignator,
     OutOfOrder,
     FractionNotLast,
-  ].map(|why: Why| refusal_message({ why: why, at: 0 }));
+  ].map(|why: ErrorKind| refusal_message({ reason: why, at: 0 }));
   assert_eq(sentences.filter(|s: String| s == "").len(), 0);
-  assert(refusal_message({ why: Calendar, at: 0 }).contains("`std.date`'s `Period`"))
+  assert(refusal_message({ reason: Calendar, at: 0 }).contains("`std.date`'s `Period`"))
 }

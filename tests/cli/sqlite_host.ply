@@ -1,8 +1,8 @@
 //! `std.sqlite` over files: a program's databases under a root the host binds, held to that root by
 //! the host's confinement and by the engine's own authorizer.
 
-import harness (Here, Ran, Spawned, project, spawned, stderr, working, write, json_of, path, int,
-                shown)
+import harness (WorkingDirectory, RunResult, PlyProcess, write_project, spawned, stderr,
+                working_directory, write, json_of, path, int, json_text)
 import std.fs
 import std.fs (fs, Entry, Dir)
 import std.json (Json)
@@ -121,17 +121,19 @@ fn sqlite_program() -> String =
 
 /// The program in a working directory holding the `root` a run binds as `app`, beside an `outside`
 /// no label names.
-fn rooted() -> Unit / {Here, abort.raise} = {
-  project([{ path: "m.ply", text: sqlite_program() }]);
+fn rooted() -> Unit / {WorkingDirectory, abort.raise} = {
+  write_project([{ path: "m.ply", text: sqlite_program() }]);
   let _ = fs.create_dir[cwd]("root");
   let _ = fs.create_dir[cwd]("outside");
 }
 
 /// The program run once over `scenarios`, in turn, by a `ply` whose `app` is `root`.
-fn run_of(scenarios: List<List<String>>) -> Ran / {Here, Spawned, abort.raise} =
+fn run_of(
+  scenarios: List<List<String>>,
+) -> RunResult / {WorkingDirectory, PlyProcess, abort.raise} =
   spawned(
     scenarios.fold(
-      ["run", "m.ply", "--fs", "app=" ++ working() ++ "/root", "--"],
+      ["run", "m.ply", "--fs", "app=" ++ working_directory() ++ "/root", "--"],
       |argv: List<String>, scenario: List<String>|
         [argv, if argv.len() > 5 { ["+"] } else { [] }, scenario].flatten(),
     ),
@@ -139,19 +141,23 @@ fn run_of(scenarios: List<List<String>>) -> Ran / {Here, Spawned, abort.raise} =
   )
 
 /// What each of `scenarios` answered, in one run of the program.
-fn answers(scenarios: List<List<String>>) -> List<String> / {Here, Spawned, abort.raise} = {
+fn answers(
+  scenarios: List<List<String>>,
+) -> List<String> / {WorkingDirectory, PlyProcess, abort.raise} = {
   let r = run_of(scenarios);
-  let said = r.out.fold([], |acc: List<String>, line: String|
+  let answer_lines = r.out.fold([], |acc: List<String>, line: String|
     if line.starts_with("answer ") { acc.push(line.slice(7, line.len())) } else { acc });
-  assert(r.code == 0 && said.len() == scenarios.len(), Some(stderr(r)));
-  said
+  assert(r.code == 0 && answer_lines.len() == scenarios.len(), Some(stderr(r)));
+  answer_lines
 }
 
-fn answer(scenario: List<String>) -> String / {Here, Spawned, abort.raise} =
+fn answer(scenario: List<String>) -> String / {WorkingDirectory, PlyProcess, abort.raise} =
   String::join(answers([scenario]), "")
 
 /// The code of the diagnostic a run of `scenario` ended with, or none where it answered.
-fn refused(scenario: List<String>) -> Option<String> / {Here, Spawned, abort.raise} = {
+fn failure_code(
+  scenario: List<String>,
+) -> Option<String> / {WorkingDirectory, PlyProcess, abort.raise} = {
   let r = run_of([scenario]);
   if r.code == 0 { None } else {
     match stderr(r).split("Error[") {
@@ -162,7 +168,7 @@ fn refused(scenario: List<String>) -> Option<String> / {Here, Spawned, abort.rai
 }
 
 /// Every file below `dir`, by its path from it, a link to a directory among them.
-fn files(dir: String) -> List<String> / {Here, abort.raise} =
+fn files(dir: String) -> List<String> / {WorkingDirectory, abort.raise} =
   match fs.walk[cwd](dir) {
     None -> [],
     Some(entries) ->
@@ -173,16 +179,17 @@ fn files(dir: String) -> List<String> / {Here, abort.raise} =
         }).sort_by(|a: String, b: String| compare(a, b) == Less),
   }
 
-fn prefix(path: String, n: Int) -> Bytes / {Here, abort.raise} =
+fn first_bytes(path: String, n: Int) -> Bytes / {WorkingDirectory, abort.raise} =
   match fs.read_file[cwd](path) { Some(b) -> b.slice(0, n), None -> b"" }
 
-fn at(path: String) -> String / {Here, abort.raise} = working() ++ "/" ++ path
+fn absolute_path(path: String) -> String / {WorkingDirectory, abort.raise} =
+  working_directory() ++ "/" ++ path
 
 /// `path`, below the working directory, as a link in `root` names it: from the link's own directory.
 fn from_root(path: String) -> String / {abort.raise} =
   if path.starts_with("root/") { path.slice(5, path.len()) } else { "../" ++ path }
 
-fn linked(link: String, to: String) -> Unit / {Here, abort.raise} =
+fn make_link(link: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
   assert(fs.symlink[cwd](link, from_root(to)), Some("a link is made"))
 
 test/nondet "the engine itself refuses every way out of the root" {
@@ -190,7 +197,7 @@ test/nondet "the engine itself refuses every way out of the root" {
   let _ = fs.write_file[cwd]("outside/secret.txt", b"secret");
   // Attach, attach by URI, vacuum into, readfile, writefile, a pragma, load_extension.
   assert_eq(
-    answer(["escapes", at("outside")]),
+    answer(["escapes", absolute_path("outside")]),
     "refused,refused,refused,statement,statement,refused,statement",
   );
   assert_eq(files("outside"), ["secret.txt"]);
@@ -199,13 +206,13 @@ test/nondet "the engine itself refuses every way out of the root" {
 
 test/nondet "a path that leaves the root is refused before anything opens" {
   rooted();
-  let outside = at("outside/abs.db");
+  let outside = absolute_path("outside/abs.db");
   ["../outside/up.db", outside, "a/../../outside/up.db"].fold((), |u: Unit, path: String|
-    assert_eq(refused(["opens", path]), Some("E0452")));
+    assert_eq(failure_code(["opens", path]), Some("E0452")));
   assert_eq(answer(["round_trip"]), "Ada,Grace");
   ["../outside/copy.db", outside].fold((), |u: Unit, path: String|
-    assert_eq(refused(["backs_up", path]), Some("E0452")));
-  assert_eq(refused(["unbound"]), Some("E0451"));
+    assert_eq(failure_code(["backs_up", path]), Some("E0452")));
+  assert_eq(failure_code(["unbound"]), Some("E0451"));
   assert_eq(files("outside"), [])
 }
 
@@ -216,14 +223,15 @@ test/nondet "a database is never opened through a symbolic link" {
   // A link to a database inside the root, a directory that is a link, links out of the root to a
   // file and to nothing, and the journal, the write-ahead log and its index the engine would open
   // beside a database, each a link to a file outside the root.
-  linked("root/link.db", "root/real.db");
-  linked("root/linked", "root/dir");
-  linked("root/out.db", "outside/out.db");
-  linked("root/gone.db", "outside/gone.db");
+  make_link("root/link.db", "root/real.db");
+  make_link("root/linked", "root/dir");
+  make_link("root/out.db", "outside/out.db");
+  make_link("root/gone.db", "outside/gone.db");
   let sides = [("_wal", "-wal"), ("_journal", "-journal"), ("_shm", "-shm")];
   sides.fold((), |u: Unit, s: (String, String)|
     match s {
-      (stem, suffix) -> linked("root/side" ++ stem ++ ".db" ++ suffix, "outside/target" ++ suffix),
+      (stem, suffix) ->
+        make_link("root/side" ++ stem ++ ".db" ++ suffix, "outside/target" ++ suffix),
     });
   assert_eq(
     answers(
@@ -235,7 +243,7 @@ test/nondet "a database is never opened through a symbolic link" {
     ["ran", "unopened", "unopened", "unopened", "unopened", "unopened"],
   );
   ["out.db", "gone.db"].fold((), |u: Unit, leaving: String|
-    assert_eq(refused(["opens", leaving]), Some("E0452")));
+    assert_eq(failure_code(["opens", leaving]), Some("E0452")));
   sides.fold((), |u: Unit, s: (String, String)|
     match s {
       (stem, suffix) -> {
@@ -251,14 +259,14 @@ test/nondet "a database is never opened through a symbolic link" {
   assert_eq(files("outside"), ["out.db"]);
   // A backup is written to a new file, never through a link already there, and a link to where
   // nothing is outside the root leaves it whether or not anything is there.
-  linked("root/copy.db", "root/missing.db");
-  linked("root/away.db", "outside/copied.db");
+  make_link("root/copy.db", "root/missing.db");
+  make_link("root/away.db", "outside/copied.db");
   assert_eq(answers([["round_trip"], ["backs_up", "copy.db"]]), ["Ada,Grace", "refused"]);
   assert(!fs.exists[cwd]("root/missing.db"), Some("the backup went through the link"));
-  assert_eq(refused(["backs_up", "away.db"]), Some("E0452"));
+  assert_eq(failure_code(["backs_up", "away.db"]), Some("E0452"));
   assert_eq(answer(["backs_up", "kept.db"]), "ran");
   assert_eq(files("outside"), ["out.db"]);
-  assert_eq(prefix("root/kept.db", 16), b"SQLite format 3\x00")
+  assert_eq(first_bytes("root/kept.db", 16), b"SQLite format 3\x00")
 }
 
 test/nondet "a connection a run leaves open is closed when the run ends" {
@@ -292,8 +300,8 @@ fn reads_people() -> String =
   \\
 
 /// `ply test` over the working directory, its `app` the root.
-fn tested_over_root() -> Json / {Here, Spawned, abort.raise} =
-  json_of(spawned(["test", "--json", "--fs", "app=" ++ working() ++ "/root"], []))
+fn tested_over_root() -> Json / {WorkingDirectory, PlyProcess, abort.raise} =
+  json_of(spawned(["test", "--json", "--fs", "app=" ++ working_directory() ++ "/root"], []))
 
 fn selected(report: Json) -> Int / {abort.raise} = int(path(report, ["selection", "selected"]))
 
@@ -304,11 +312,11 @@ test/nondet "a test's pass over a database stands until a write moves the databa
   assert_eq(answer(["round_trip"]), "Ada,Grace");
   write("reads.ply", reads_people());
   let first = tested_over_root();
-  assert(selected(first) == 1, Some(shown(first)));
+  assert(selected(first) == 1, Some(json_text(first)));
   let again = tested_over_root();
-  assert(selected(again) == 0, Some("nothing the pass read moved: " ++ shown(again)));
+  assert(selected(again) == 0, Some("nothing the pass read moved: " ++ json_text(again)));
   // A write: a table made in the database the pass read.
   assert_eq(answer(["opens", "data.db"]), "ran");
   let moved = tested_over_root();
-  assert(selected(moved) == 1, Some("the database moved under the pass: " ++ shown(moved)))
+  assert(selected(moved) == 1, Some("the database moved under the pass: " ++ json_text(moved)))
 }

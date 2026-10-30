@@ -31,10 +31,10 @@ pub type Draws = new {
 }
 
 /// A generator's answer: the value, or `None` where it gave up, and the draws after it.
-pub type Drawn<a> = { value: Option<a>, draws: Draws }
+pub type DrawResult<a> = { value: Option<a>, draws: Draws }
 
 /// How a value of `a` is drawn.
-pub type Gen<a> = | Gen((Draws) -> Drawn<a> / {abort.raise})
+pub type Gen<a> = | Gen((Draws) -> DrawResult<a> / {abort.raise})
 
 /// One run of a generator: its value, or `None` where it gave up, the draws it took, which
 /// replayed make the value again, and how many values `such_that` turned away on the way.
@@ -66,9 +66,10 @@ pub fn sample<a>(
 }
 
 /// `g` over `draws`: what a combinator of one's own is written with.
-pub fn run<a>(g: Gen<a>, draws: Draws) -> Drawn<a> / {abort.raise} = match g { Gen(f) -> f(draws) }
+pub fn run<a>(g: Gen<a>, draws: Draws) -> DrawResult<a> / {abort.raise} =
+  match g { Gen(f) -> f(draws) }
 
-fn gave_up<a>(draws: Draws) -> Drawn<a> = { value: None, draws: draws }
+fn gave_up<a>(draws: Draws) -> DrawResult<a> = { value: None, draws: draws }
 
 /// The draw at `i` of a record, which is zero past its end.
 fn draw_at(record: List<Int>, i: Int) -> Int = match record.at(i) { Some(v) -> v, None -> 0 }
@@ -163,15 +164,15 @@ pub fn option_of<a>(g: Gen<a>) -> Gen<Option<a>> =
 pub fn list_of<a>(g: Gen<a>, most: Int) -> Gen<List<a>> =
   Gen(|d: Draws| {
     let length = next(d, 1 + max(0, min(most, d.size)));
-    several(g, length.value, length.draws)
+    draw_many(g, length.value, length.draws)
   })
 
 /// A list of exactly `n` values `g` draws.
-pub fn list_of_length<a>(g: Gen<a>, n: Int) -> Gen<List<a>> = Gen(|d: Draws| several(g, n, d))
+pub fn list_of_length<a>(g: Gen<a>, n: Int) -> Gen<List<a>> = Gen(|d: Draws| draw_many(g, n, d))
 
-fn several<a>(g: Gen<a>, n: Int, draws: Draws) -> Drawn<List<a>> / {abort.raise} = {
-  let start: Drawn<List<a>> = { value: Some([]), draws: draws };
-  range(0, n).fold(start, |acc: Drawn<List<a>>, _i: Int|
+fn draw_many<a>(g: Gen<a>, n: Int, draws: Draws) -> DrawResult<List<a>> / {abort.raise} = {
+  let start: DrawResult<List<a>> = { value: Some([]), draws: draws };
+  range(0, n).fold(start, |acc: DrawResult<List<a>>, _i: Int|
     match acc.value {
       None -> acc,
       Some(xs) -> {
@@ -361,19 +362,19 @@ pub fn result_of<a, b>(ok: Gen<a>, err: Gen<b>) -> Gen<Result<a, b>> =
 // --- Checking a property -----------------------------------------------------
 
 /// How many records a walk down from a failing value replays.
-fn walk_budget() -> Int = 2000
+fn shrink_budget() -> Int = 2000
 
 /// What a property came to at one value.
-type Tried = | Held | Failed | Raised(String)
+type Outcome = | Passed | Failed | Raised(String)
 
 /// A value a property did not hold at, the draws that made it and the size it was drawn at.
-type Found<a> = { value: a, record: List<Int>, size: Int, why: Tried }
+type Counterexample<a> = { value: a, record: List<Int>, size: Int, reason: Outcome }
 
-fn tried<a | e>(holds: (a) -> Bool / {abort.raise | e}, x: a) -> Tried / e =
-  handle { if holds(x) { Held } else { Failed } } with { abort.raise(message) -> Raised(message) }
+fn tried<a | e>(holds: (a) -> Bool / {abort.raise | e}, x: a) -> Outcome / e =
+  handle { if holds(x) { Passed } else { Failed } } with { abort.raise(message) -> Raised(message) }
 
 /// What a property came to over the values a generator drew.
-pub type Checked<a> =
+pub type CheckResult<a> =
   | Holds
   /// The least value found that the property answers `false` at.
   | FailsAt(a)
@@ -390,11 +391,11 @@ pub fn checked<a | e>(
   g: Gen<a>,
   holds: (a) -> Bool / {abort.raise | e},
   cases: Int = 25,
-) -> Checked<a> / {abort.raise | e} = {
-  let start: { drawn: Int, found: Option<Found<a>> } = { drawn: 0, found: None };
+) -> CheckResult<a> / {abort.raise | e} = {
+  let start: { drawn: Int, found: Option<Counterexample<a>> } = { drawn: 0, found: None };
   let ran = range(0, cases).fold(
     start,
-    |acc: { drawn: Int, found: Option<Found<a>> }, case: Int|
+    |acc: { drawn: Int, found: Option<Counterexample<a>> }, case: Int|
       match acc.found {
         Some(_) -> acc,
         None -> {
@@ -403,11 +404,11 @@ pub fn checked<a | e>(
           match drew.value {
             None -> acc,
             Some(x) -> match tried(holds, x) {
-              Held -> { ..acc, drawn: acc.drawn + 1 },
+              Passed -> { ..acc, drawn: acc.drawn + 1 },
               why ->
                 {
                   drawn: acc.drawn + 1,
-                  found: Some({ value: x, record: drew.record, size: size, why: why }),
+                  found: Some({ value: x, record: drew.record, size: size, reason: why }),
                 },
             },
           }
@@ -417,8 +418,8 @@ pub fn checked<a | e>(
   match ran.found {
     None -> if ran.drawn > 0 { Holds } else { NothingDrawn },
     Some(first) -> {
-      let least = walked(g, holds, first);
-      match least.why {
+      let least = shrink(g, holds, first);
+      match least.reason {
         Raised(message) -> RaisesAt(least.value, message),
         _ -> FailsAt(least.value),
       }
@@ -474,7 +475,7 @@ pub fn check4<a, b, c, d | e>(
 
 /// The record `k` steps into the ways one is made smaller: half of it, all but its last draw, and
 /// then each draw in turn as zero, as its half and as one less. `None` past the last of them.
-fn lowered(record: List<Int>, k: Int) -> Option<List<Int>> =
+fn shrink_candidate(record: List<Int>, k: Int) -> Option<List<Int>> =
   if k == 0 { Some(leading(record, record.len() / 2)) }
   else if k == 1 { Some(leading(record, record.len() - 1)) } else {
     let i = (k - 2) / 3;
@@ -507,20 +508,20 @@ fn before(one: List<Int>, other: List<Int>) -> Bool =
       == Some(true)
   }
 
-fn ends_alike(one: Tried, other: Tried) -> Bool =
+fn ends_alike(one: Outcome, other: Outcome) -> Bool =
   match ((one, other)) { (Failed, Failed) -> true, (Raised(_), Raised(_)) -> true, _ -> false }
 
 /// The least value found below `first` that ends as it did, replaying records made smaller until
 /// none of the ways to make one smaller is kept, or the budget is spent.
-fn walked<a | e>(
+fn shrink<a | e>(
   g: Gen<a>,
   holds: (a) -> Bool / {abort.raise | e},
-  first: Found<a>,
-) -> Found<a> / {abort.raise | e} =
-  range(0, walk_budget()).fold(
+  first: Counterexample<a>,
+) -> Counterexample<a> / {abort.raise | e} =
+  range(0, shrink_budget()).fold(
     { found: first, way: 0 },
-    |s: { found: Found<a>, way: Int }, _step: Int|
-      match lowered(s.found.record, s.way) {
+    |s: { found: Counterexample<a>, way: Int }, _step: Int|
+      match shrink_candidate(s.found.record, s.way) {
         None -> s,
         Some(record) -> if record == s.found.record { { ..s, way: s.way + 1 } } else {
           let again = sample(g, 0, b"", s.found.size, Some(record));
@@ -528,8 +529,11 @@ fn walked<a | e>(
             None -> { ..s, way: s.way + 1 },
             Some(x) -> {
               let why = tried(holds, x);
-              if ends_alike(why, s.found.why) && before(again.record, s.found.record) {
-                { found: { value: x, record: again.record, size: s.found.size, why: why }, way: 0 }
+              if ends_alike(why, s.found.reason) && before(again.record, s.found.record) {
+                {
+                  found: { value: x, record: again.record, size: s.found.size, reason: why },
+                  way: 0,
+                }
               } else { { ..s, way: s.way + 1 } }
             },
           }

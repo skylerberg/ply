@@ -6,13 +6,14 @@ import std.bytes
 import std.string
 import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
                   VArray, VRecord, VCtor, VMap, Field)
-import domain (Ty, Var, Fn, Record, Con, Decl, Variant, find_decl, name_order)
+import domain (Sort, SortVariable, FunctionSort, RecordSort, NamedSort, Decl, Variant, find_decl,
+               name_order)
 import std.list
 
 /// The most points one search tries, and the most values one binder offers.
-fn most_points() -> Int = 4096
+fn max_points() -> Int = 4096
 
-fn most_per_binder() -> Int = 12
+fn max_per_binder() -> Int = 12
 
 /// The literals a claim and its guards are written with, by their kind.
 type Literals = { ints: List<Int>, strings: List<String>, bytes: List<Bytes> }
@@ -45,15 +46,15 @@ fn record_of(fields: List<Field>) -> Value =
   )
 
 /// `t` with each of its type variables read from `args`, by its number.
-pub fn substituted(t: Ty, args: List<Ty>) -> Ty =
+pub fn substituted(t: Sort, args: List<Sort>) -> Sort =
   match t {
-    Var(v) -> match args.at(v) { Some(a) -> a, None -> t },
-    Con(name, xs) -> Con(name, xs.map(|x: Ty| substituted(x, args))),
-    Fn(params, ret, pure) ->
-      Fn(params.map(|p: Ty| substituted(p, args)), substituted(ret, args), pure),
-    Record(fields) ->
-      Record(
-        fields.map(|f: { name: String, ty: Ty }| { name: f.name, ty: substituted(f.ty, args) }),
+    SortVariable(v) -> match args.at(v) { Some(a) -> a, None -> t },
+    NamedSort(name, xs) -> NamedSort(name, xs.map(|x: Sort| substituted(x, args))),
+    FunctionSort(params, ret, pure) ->
+      FunctionSort(params.map(|p: Sort| substituted(p, args)), substituted(ret, args), pure),
+    RecordSort(fields) ->
+      RecordSort(
+        fields.map(|f: { name: String, ty: Sort }| { name: f.name, ty: substituted(f.ty, args) }),
       ),
   }
 
@@ -67,16 +68,16 @@ fn ints(lits: Literals) -> List<Value> =
   )
 
 /// The first value each of `tys` is tried at, or nothing where one of them has none.
-fn firsts(
-  tys: List<Ty>,
+fn first_values(
+  tys: List<Sort>,
   decls: List<Decl>,
   lits: Literals,
-  room: Int,
+  depth_left: Int,
 ) -> Option<List<Value>> / {abort.raise} =
-  tys.fold(Some([]), |acc: Option<List<Value>>, t: Ty|
+  tys.fold(Some([]), |acc: Option<List<Value>>, t: Sort|
     match acc {
       None -> None,
-      Some(vs) -> match tried(t, decls, lits, room).at(0) {
+      Some(vs) -> match values_to_try(t, decls, lits, depth_left).at(0) {
         Some(v) -> Some(vs.push(v)),
         None -> None,
       },
@@ -85,18 +86,18 @@ fn firsts(
 /// The tuples the parts of one value are tried at: each of `tys` at its first value, and then each
 /// in turn at its second beside the others' first. Nothing where one of them has no value.
 fn tuples(
-  tys: List<Ty>,
+  tys: List<Sort>,
   decls: List<Decl>,
   lits: Literals,
-  room: Int,
+  depth_left: Int,
 ) -> List<List<Value>> / {abort.raise} =
-  match firsts(tys, decls, lits, room) {
+  match first_values(tys, decls, lits, depth_left) {
     None -> [],
     Some(base) ->
       range(0, tys.len()).fold([base], |out: List<List<Value>>, i: Int|
         match tys.at(i) {
           None -> out,
-          Some(t) -> match tried(t, decls, lits, room).at(1) {
+          Some(t) -> match values_to_try(t, decls, lits, depth_left).at(1) {
             Some(second) -> out.push(base.set(i, second)),
             None -> out,
           },
@@ -105,14 +106,19 @@ fn tuples(
 
 /// The values a binder of type `ty` is tried at, smallest and most literal first: none for a type
 /// nothing here makes a value of, as a function is. A type variable is tried as an `Int`, and
-/// opening a declared type spends `room`. A text is tried at two values before any literal, and a
+/// opening a declared type spends `depth_left`. A text is tried at two values before any literal, and a
 /// list at two items, so that a guard or a claim holding two of them apart has a point to tell.
-fn tried(ty: Ty, decls: List<Decl>, lits: Literals, room: Int) -> List<Value> / {abort.raise} =
+fn values_to_try(
+  ty: Sort,
+  decls: List<Decl>,
+  lits: Literals,
+  depth_left: Int,
+) -> List<Value> / {abort.raise} =
   match ty {
-    Var(_) -> ints(lits),
-    Fn(_, _, _) -> [],
-    Record(fields) ->
-      tuples(fields.map(|f: { name: String, ty: Ty }| f.ty), decls, lits, room).map(
+    SortVariable(_) -> ints(lits),
+    FunctionSort(_, _, _) -> [],
+    RecordSort(fields) ->
+      tuples(fields.map(|f: { name: String, ty: Sort }| f.ty), decls, lits, depth_left).map(
         |values: List<Value>|
           record_of(
             range(0, fields.len()).map(|i: Int|
@@ -122,7 +128,7 @@ fn tried(ty: Ty, decls: List<Decl>, lits: Literals, room: Int) -> List<Value> / 
               }),
           ),
       ),
-    Con(name, args) -> if name == "Bool" { [VBool(false), VBool(true)] }
+    NamedSort(name, args) -> if name == "Bool" { [VBool(false), VBool(true)] }
     else if name == "Unit" { [VUnit] }
     else if name == "Int" { ints(lits) } else if name == "String" {
       lits.strings.fold([VStr(""), VStr("a")], |out: List<Value>, s: String| out.push(VStr(s)))
@@ -138,7 +144,10 @@ fn tried(ty: Ty, decls: List<Decl>, lits: Literals, room: Int) -> List<Value> / 
     else if fixed_width(name) { [VFixed(name, 0u128), VFixed(name, 1u128)] }
     else if name == "List" || name == "Array" {
       let made = |items: List<Value>| if name == "List" { VList(items) } else { VArray(items) };
-      let of = match args.at(0) { Some(a) -> tried(a, decls, lits, room), None -> [] };
+      let of = match args.at(0) {
+        Some(a) -> values_to_try(a, decls, lits, depth_left),
+        None -> [],
+      };
       let short = of.take(2).fold([made([])], |out: List<Value>, v: Value| out.push(made([v])));
       match of.at(0) {
         None -> short,
@@ -150,7 +159,10 @@ fn tried(ty: Ty, decls: List<Decl>, lits: Literals, room: Int) -> List<Value> / 
     } else if name == "Map" {
       // Empty, and of the one entry its first key and first value make.
       let first = |i: Int|
-        match args.at(i) { Some(a) -> tried(a, decls, lits, room).at(0), None -> None };
+        match args.at(i) {
+          Some(a) -> values_to_try(a, decls, lits, depth_left).at(0),
+          None -> None,
+        };
       match first(0) {
         None -> [VMap([])],
         Some(k) -> match first(1) {
@@ -164,34 +176,36 @@ fn tried(ty: Ty, decls: List<Decl>, lits: Literals, room: Int) -> List<Value> / 
         Some(decl) ->
           decl.variants.fold([], |out: List<Value>, v: Variant|
             if v.fields.len() == 0 { out.push(VCtor(v.name, [])) }
-            else if room <= 0 { out } else {
-              tuples(v.fields.map(|f: Ty| substituted(f, args)), decls, lits, room - 1).fold(
-                out,
-                |acc: List<Value>, values: List<Value>| acc.push(VCtor(v.name, values)),
-              )
+            else if depth_left <= 0 { out } else {
+              tuples(
+                v.fields.map(|f: Sort| substituted(f, args)),
+                decls,
+                lits,
+                depth_left - 1,
+              ).fold(out, |acc: List<Value>, values: List<Value>| acc.push(VCtor(v.name, values)))
             }),
       }
     },
   }
 
 /// How many values each of `n` binders may offer for every tuple of them to be tried.
-fn per_binder(n: Int) -> Int =
-  range(1, most_per_binder() + 1).fold(1, |best: Int, k: Int|
-    if range(0, n).fold(1, |product: Int, _i: Int| min(product * k, most_points() + 1))
-        <= most_points() { k }
+fn values_per_binder(n: Int) -> Int =
+  range(1, max_per_binder() + 1).fold(1, |best: Int, k: Int|
+    if range(0, n).fold(1, |product: Int, _i: Int| min(product * k, max_points() + 1))
+        <= max_points() { k }
     else { best })
 
 /// Every tuple of the values `tys`, a claim's binders, are tried at, the first binder varying
 /// fastest and each offering no more than keeps the tuples within the search's budget. `literals`
 /// are what the claim and its guards are written with. Nothing where a binder has no value to try.
 pub fn candidates(
-  tys: List<Ty>,
+  tys: List<Sort>,
   decls: List<Decl>,
   literals: List<Bytes>,
 ) -> List<List<Value>> / {abort.raise} = {
   let lits = literals_of(literals);
-  let most = per_binder(tys.len());
-  let columns = tys.map(|t: Ty| tried(t, decls, lits, 2).take(most));
+  let most = values_per_binder(tys.len());
+  let columns = tys.map(|t: Sort| values_to_try(t, decls, lits, 2).take(most));
   if columns.fold(false, |none: Bool, c: List<Value>| none || c.len() == 0) { [] } else {
     let points = columns.fold(1, |n: Int, c: List<Value>| n * c.len());
     range(0, points).map(|index: Int|
@@ -211,7 +225,7 @@ pub fn candidates(
 
 // --- Tests ------------------------------------------------------------------
 
-fn int() -> Ty = Con("Int", [])
+fn int() -> Sort = NamedSort("Int", [])
 
 fn shapes() -> List<Decl> =
   [
@@ -220,8 +234,8 @@ fn shapes() -> List<Decl> =
       params: 1,
       variants: [
         { name: "m.Dot", fields: [] },
-        { name: "m.Box", fields: [Var(0), Con("Bool", [])] },
-        { name: "m.Pile", fields: [Con("m.Shape", [Var(0)])] },
+        { name: "m.Box", fields: [SortVariable(0), NamedSort("Bool", [])] },
+        { name: "m.Pile", fields: [NamedSort("m.Shape", [SortVariable(0)])] },
       ],
     },
   ]
@@ -239,7 +253,7 @@ test "an Int is tried at zero, its neighbours, and each literal of the guard wit
 }
 
 test "every tuple of the binders' values is tried, the first binder varying fastest" {
-  assert_eq(candidates([Con("Bool", []), Con("String", [])], [], [b"str id"]), [
+  assert_eq(candidates([NamedSort("Bool", []), NamedSort("String", [])], [], [b"str id"]), [
     [VBool(false), VStr("")],
     [VBool(true), VStr("")],
     [VBool(false), VStr("a")],
@@ -252,14 +266,14 @@ test "every tuple of the binders' values is tried, the first binder varying fast
 }
 
 test "a list is tried empty, at one of each of its first values, and at two of them" {
-  assert_eq(candidates([Con("List", [Con("Bool", [])])], [], []), [
+  assert_eq(candidates([NamedSort("List", [NamedSort("Bool", [])])], [], []), [
     [VList([])],
     [VList([VBool(false)])],
     [VList([VBool(true)])],
     [VList([VBool(false), VBool(false)])],
     [VList([VBool(false), VBool(true)])],
   ]);
-  assert_eq(candidates([Con("List", [Con("Unit", [])])], [], []), [
+  assert_eq(candidates([NamedSort("List", [NamedSort("Unit", [])])], [], []), [
     [VList([])],
     [VList([VUnit])],
     [VList([VUnit, VUnit])],
@@ -267,25 +281,31 @@ test "a list is tried empty, at one of each of its first values, and at two of t
 }
 
 test "a map is tried empty and with the one entry its first key and value make" {
-  assert_eq(candidates([Con("Map", [Con("String", []), int()])], [], []), [
+  assert_eq(candidates([NamedSort("Map", [NamedSort("String", []), int()])], [], []), [
     [VMap([])],
     [VMap([{ key: VStr(""), value: VInt(0) }])],
   ]);
   // A key or a value nothing here makes leaves the empty map.
-  assert_eq(candidates([Con("Map", [int(), Fn([int()], int(), true)])], [], []), [[VMap([])]])
+  assert_eq(candidates([NamedSort("Map", [int(), FunctionSort([int()], int(), true)])], [], []), [
+    [VMap([])],
+  ])
 }
 
 test "a record is tried with each field at its first value, then each in turn at its second" {
   let made = |a: Bool, b: Int|
     [VRecord([{ name: "a", value: VBool(a) }, { name: "b", value: VInt(b) }])];
   assert_eq(
-    candidates([Record([{ name: "b", ty: int() }, { name: "a", ty: Con("Bool", []) }])], [], []),
+    candidates(
+      [RecordSort([{ name: "b", ty: int() }, { name: "a", ty: NamedSort("Bool", []) }])],
+      [],
+      [],
+    ),
     [made(false, 0), made(false, 1), made(true, 0)],
   )
 }
 
 test "a declared type is tried at each variant, its fields as a record's are, a few deep" {
-  assert_eq(candidates([Con("m.Shape", [int()])], shapes(), []), [
+  assert_eq(candidates([NamedSort("m.Shape", [int()])], shapes(), []), [
     [VCtor("m.Dot", [])],
     [VCtor("m.Box", [VInt(0), VBool(false)])],
     [VCtor("m.Box", [VInt(1), VBool(false)])],
@@ -294,20 +314,20 @@ test "a declared type is tried at each variant, its fields as a record's are, a 
     [VCtor("m.Pile", [VCtor("m.Box", [VInt(0), VBool(false)])])],
   ]);
   // A type variable is tried as an `Int`.
-  assert_eq(candidates([Var(0)], [], []), candidates([int()], [], []))
+  assert_eq(candidates([SortVariable(0)], [], []), candidates([int()], [], []))
 }
 
 test "a binder nothing here makes a value of leaves nothing to try" {
-  assert_eq(candidates([int(), Fn([int()], int(), true)], [], []), []);
-  assert_eq(candidates([Con("m.Unknown", [])], [], []), [])
+  assert_eq(candidates([int(), FunctionSort([int()], int(), true)], [], []), []);
+  assert_eq(candidates([NamedSort("m.Unknown", [])], [], []), [])
 }
 
 test "many binders each offer fewer values, so the tuples stay within the budget" {
-  assert_eq(per_binder(1), 12);
-  assert_eq(per_binder(3), 12);
-  assert_eq(per_binder(4), 8);
-  assert_eq(per_binder(12), 2);
-  assert_eq(per_binder(13), 1);
+  assert_eq(values_per_binder(1), 12);
+  assert_eq(values_per_binder(3), 12);
+  assert_eq(values_per_binder(4), 8);
+  assert_eq(values_per_binder(12), 2);
+  assert_eq(values_per_binder(13), 1);
   assert_eq(candidates(range(0, 13).map(|_i: Int| int()), [], []).len(), 1);
   assert_eq(candidates(range(0, 12).map(|_i: Int| int()), [], []).len(), 4096)
 }

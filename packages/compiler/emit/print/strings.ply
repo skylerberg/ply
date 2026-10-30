@@ -3,32 +3,34 @@
 
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (span_between)
-import compiler.check.types (Type, spelled_type, int_type, string_type, bytes_type)
+import compiler.check.types (Type, encode_type, int_type, string_type, bytes_type)
 import compiler.emit.layout (header_bytes, head_field, head_words, text_head, text_bytes)
-import compiler.emit.tir.statics (is_text)
+import compiler.emit.typed_ir.statics (is_text)
 import compiler.emit.roots (builtin_helper)
-import compiler.emit.pieces (spelled)
-import compiler.emit.tir (Rep, RInt, RBool, RNum, RWord, RAddr, Var, Arg, AVar, AInt, var_said)
-import compiler.emit.tir.strings (StringOp, Made, Copied, ByteSet, ByteRead, U32Read, Grown,
-                                  Compared, Found, CharsIn, CharStart, Scanned)
-import compiler.emit.print.text (Printing, Place, printing, line, named, name_of, arg_text,
-                                 assigned, check, unprinted)
-import compiler.emit.c (KInt, KNum, ctype)
-import compiler.emit.print.counting (last_fn, free_fn, call_text, call_start)
+import compiler.emit.pieces (pieces_text)
+import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFixed, AsWord, AsAddress, Var, Arg,
+                               VarOperand, IntOperand, var_text)
+import compiler.emit.typed_ir.strings (StringOp, AllocateBytes, CopyBytes, ByteSet, ByteRead,
+                                       U32Read, AppendBytes, BytesEqual, FindBytes, CharCount,
+                                       CharStart, ScanBytes)
+import compiler.emit.print.text (Printing, InstructionContext, empty_printing, line, named, name_of,
+                                 arg_text, assigned, check, unsupported)
+import compiler.emit.c (IntKind, SizedIntKind, kind_c_type)
+import compiler.emit.print.count_functions (last_fn, free_fn, call_text, call_start)
 
 /// Operation `op` over `args`, answering into `into` where it answers.
 pub fn string_op(
-  p: Place,
-  pr: Printing,
+  p: InstructionContext,
+  printing: Printing,
   into: Option<Var>,
   op: StringOp,
   args: List<Arg>,
 ) -> Printing / {abort.raise} = {
-  let a = |k: Int| match args.at(k) { Some(x) -> arg_text(pr, x), None -> b"0" };
+  let a = |k: Int| match args.at(k) { Some(x) -> arg_text(printing, x), None -> b"0" };
   match op {
-    Copied ->
+    CopyBytes ->
       line(
-        pr,
+        printing,
         p.depth,
         Bytes::concat_all([
           b"memcpy(",
@@ -46,42 +48,49 @@ pub fn string_op(
       ),
     ByteSet ->
       line(
-        pr,
+        printing,
         p.depth,
         Bytes::concat_all([bytes_of(a(0)), b"[", a(1), b"] = (unsigned char)", a(2), b";"]),
       ),
     _ -> match into {
       None ->
-        unprinted(
+        unsupported(
           b"an operation over a string's bytes whose answer goes unread",
           ascii_of_int(args.len()),
         ),
-      Some(v) -> answered(p, pr, v, op, args.map(|x: Arg| arg_text(pr, x))),
+      Some(v) -> op_with_result(p, printing, v, op, args.map(|x: Arg| arg_text(printing, x))),
     },
   }
 }
 
-fn answered(
-  p: Place,
-  pr: Printing,
+fn op_with_result(
+  p: InstructionContext,
+  printing: Printing,
   v: Var,
   op: StringOp,
   operands: List<Bytes>,
 ) -> Printing / {abort.raise} = {
   let a = |k: Int| match operands.at(k) { Some(x) -> x, None -> b"0" };
   let d = p.depth;
-  let set = |e: Bytes| assigned(pr, d, v, c_type(v.rep), e);
+  let set = |e: Bytes| assigned(printing, d, v, c_type(v.representation), e);
   // `v` declared at `start`, then set by the C `body` writes of its name.
   let computed = |start: Bytes, body: (Bytes) -> Bytes| {
-    let declared = assigned(pr, d, v, c_type(v.rep), start);
+    let declared = assigned(printing, d, v, c_type(v.representation), start);
     line(declared, d, body(name_of(declared, v)))
   };
   match op {
-    Made -> {
-      let n = named(pr, v);
-      fresh(p, line(n.pr, d, Bytes::concat_all([b"Word ", n.name, b";"])), n.name, v.ty, a(0), a(0))
+    AllocateBytes -> {
+      let n = named(printing, v);
+      text_alloc(
+        p,
+        line(n.printing, d, Bytes::concat_all([b"Word ", n.name, b";"])),
+        n.name,
+        v.ty,
+        a(0),
+        a(0),
+      )
     },
-    Grown -> grown(p, pr, v, a(0), a(1), a(2)),
+    AppendBytes -> grown(p, printing, v, a(0), a(1), a(2)),
     ByteRead -> set(Bytes::concat_all([b"(int64_t)", at_address(a(0)), b"[", a(1), b"]"])),
     U32Read ->
       computed(b"0", |x: Bytes|
@@ -94,7 +103,7 @@ fn answered(
           x,
           b" = ply_le32(sw); }",
         ])),
-    Compared ->
+    BytesEqual ->
       set(
         Bytes::concat_all([
           b"memcmp(",
@@ -110,7 +119,7 @@ fn answered(
           b") == 0",
         ]),
       ),
-    Found ->
+    FindBytes ->
       computed(b"-1", |x: Bytes|
         Bytes::concat_all([
           b"{ const unsigned char *sh = ",
@@ -127,7 +136,7 @@ fn answered(
           x,
           b" = si; break; } }",
         ])),
-    CharsIn ->
+    CharCount ->
       computed(b"0", |x: Bytes|
         Bytes::concat_all([
           b"{ const unsigned char *sh = ",
@@ -153,7 +162,7 @@ fn answered(
           x,
           b" = si; } }",
         ])),
-    Scanned(s) ->
+    ScanBytes(s) ->
       computed(b"0", |x: Bytes|
         Bytes::concat_all([
           b"{ const unsigned char *sh = ",
@@ -184,25 +193,25 @@ fn answered(
           x,
           b" = si; break; } }",
         ])),
-    _ -> unprinted(b"an operation that answers nothing, answering", var_said(v)),
+    _ -> unsupported(b"an operation that answers nothing, answering", var_text(v)),
   }
 }
 
 /// `x` with `n` bytes from `src` appended, into `v`: in place where `x`'s one count was handed over
 /// and its room holds them, else a fresh block of twice the room needed, `x` let go of.
 fn grown(
-  p: Place,
-  pr: Printing,
+  p: InstructionContext,
+  printing: Printing,
   v: Var,
   x: Bytes,
   src: Bytes,
   n: Bytes,
 ) -> Printing / {abort.raise} = {
-  let declared = named(pr, v);
+  let declared = named(printing, v);
   let o = declared.name;
   let d = p.depth;
   let opened = line(
-    declared.pr,
+    declared.printing,
     d,
     Bytes::concat_all([
       b"Word ",
@@ -228,7 +237,7 @@ fn grown(
       b"; } else {",
     ]),
   );
-  let made = fresh(
+  let made = text_alloc(
     { ..p, depth: d + 1 },
     opened,
     o,
@@ -259,17 +268,17 @@ fn grown(
 
 /// `o`, declared already, set to a fresh block of `len` bytes with room for `room`; unprinted where
 /// `ty` is no text's type.
-fn fresh(
-  p: Place,
-  pr: Printing,
+fn text_alloc(
+  p: InstructionContext,
+  printing: Printing,
   o: Bytes,
   ty: Type,
   len: Bytes,
   room: Bytes,
 ) -> Printing / {abort.raise} =
-  if !is_text(ty) { unprinted(b"text made at a type no text has", spelled_type(ty)) } else {
+  if !is_text(ty) { unsupported(b"text made at a type no text has", encode_type(ty)) } else {
     line(
-      pr,
+      printing,
       p.depth,
       Bytes::concat_all([
         b"{ int64_t sr = ",
@@ -290,13 +299,18 @@ fn fresh(
   }
 
 /// The bytes `n` taken bytes of the context's crossing are copied into, a fresh block, into `v`.
-pub fn taken_printed(p: Place, pr: Printing, v: Var, n: Arg) -> Printing / {abort.raise} = {
-  let count = arg_text(pr, n);
-  let declared = named(pr, v);
+pub fn taken_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  n: Arg,
+) -> Printing / {abort.raise} = {
+  let count = arg_text(printing, n);
+  let declared = named(printing, v);
   let o = declared.name;
-  let made = fresh(
+  let made = text_alloc(
     p,
-    line(declared.pr, p.depth, Bytes::concat_all([b"Word ", o, b";"])),
+    line(declared.printing, p.depth, Bytes::concat_all([b"Word ", o, b";"])),
     o,
     v.ty,
     count,
@@ -320,8 +334,14 @@ pub fn taken_printed(p: Place, pr: Printing, v: Var, n: Arg) -> Printing / {abor
 }
 
 /// The address of the bytes the block `of` holds, into `v`.
-pub fn payload_printed(p: Place, pr: Printing, v: Var, of: Var) -> Printing =
-  assigned(pr, p.depth, v, c_type(v.rep), b"(Word)(intptr_t)".concat(bytes_of(name_of(pr, of))))
+pub fn payload_printed(p: InstructionContext, printing: Printing, v: Var, of: Var) -> Printing =
+  assigned(
+    printing,
+    p.depth,
+    v,
+    c_type(v.representation),
+    b"(Word)(intptr_t)".concat(bytes_of(name_of(printing, of))),
+  )
 
 /// The bytes of the block `x`, past its head, as an `unsigned char *`.
 pub fn bytes_of(x: Bytes) -> Bytes =
@@ -333,7 +353,7 @@ pub fn bytes_of(x: Bytes) -> Bytes =
     b"])",
   ])
 
-/// The address an `RAddr` holds, as an `unsigned char *`.
+/// The address an `AsAddress` holds, as an `unsigned char *`.
 fn at_address(a: Bytes) -> Bytes = Bytes::concat_all([b"((unsigned char *)(intptr_t)", a, b")"])
 
 /// Field `f` of the head of the string or byte string `x`.
@@ -341,37 +361,42 @@ pub fn text_field(x: Bytes, f: Bytes) -> Bytes = head_field(text_head(), x, f)
 
 /// The C type of what an operation here answers: an integer's, a width's, else a word, an address
 /// among them. `print.made` imports this module, so its `c_type` is not read here.
-fn c_type(r: Rep) -> Bytes =
-  match r { RInt -> ctype(KInt), RBool -> ctype(KInt), RNum(w) -> ctype(KNum(w)), _ -> b"Word" }
+fn c_type(r: Representation) -> Bytes =
+  match r {
+    AsInt -> kind_c_type(IntKind),
+    AsBool -> kind_c_type(IntKind),
+    AsFixed(w) -> kind_c_type(SizedIntKind(w)),
+    _ -> b"Word",
+  }
 
 /// Where an instruction of a root answering a word is printed, at the body's own depth.
-fn at_top() -> Place =
+fn at_top() -> InstructionContext =
   {
     u: {
       symbol: b"ply_m_1f_1",
       base: 0,
-      answer: RWord,
+      result: AsWord,
       site: None,
       arm: None,
       looping: None,
       landing: None,
       group: None,
       unwinds: [],
-      leaving: b"",
+      epilogue: b"",
     },
     at: span_between(10, 20),
     leave: b"return 0;",
     depth: 0,
   }
 
-fn local(id: Int, ty: Type, rep: Rep) -> Var = { id: id, ty: ty, rep: rep }
+fn local(id: Int, ty: Type, rep: Representation) -> Var = { id: id, ty: ty, representation: rep }
 
 /// What `op` over `args` prints, its operands' variables named `p0`, `p1`, ...
 fn printed(op: StringOp, into: Option<Var>, args: List<Arg>) -> Bytes / {abort.raise} =
-  spelled(
+  pieces_text(
     string_op(
       at_top(),
-      printing(
+      empty_printing(
         range(0, 6).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
           m.insert(i, b"p".concat(ascii_of_int(i)))),
       ),
@@ -389,7 +414,7 @@ fn place(text: Bytes, part: Bytes) -> Int =
 
 test "a fresh block takes its header, its head and its room rounded up to a word, and holds its length and room" {
   let made = |ty: Type|
-    printed(Made, Some(local(9, ty, RWord)), [AVar(local(0, int_type(), RInt))]);
+    printed(AllocateBytes, Some(local(9, ty, AsWord)), [VarOperand(local(0, int_type(), AsInt))]);
   let string = made(string_type());
   assert_eq(
     [
@@ -405,10 +430,10 @@ test "a fresh block takes its header, its head and its room rounded up to a word
 }
 
 test "a block grows in place only through its one count and its room, and is let go of by its size else" {
-  let grown = printed(Grown, Some(local(9, bytes_type(), RWord)), [
-    AVar(local(0, bytes_type(), RWord)),
-    AVar(local(1, int_type(), RAddr)),
-    AVar(local(2, int_type(), RInt)),
+  let grown = printed(AppendBytes, Some(local(9, bytes_type(), AsWord)), [
+    VarOperand(local(0, bytes_type(), AsWord)),
+    VarOperand(local(1, int_type(), AsAddress)),
+    VarOperand(local(2, int_type(), AsInt)),
   ]);
   assert(has(grown, b"ply_obj(p0)->rc == 1"), None);
   assert(has(grown, Bytes::concat_all([text_field(b"p0", b"room"), b" >= "])), None);
@@ -422,13 +447,13 @@ test "a block grows in place only through its one count and its room, and is let
 }
 
 test "bytes a crossing answered are copied into a fresh block of as many, and the copy can fail" {
-  let pr = taken_printed(
+  let printing = taken_printed(
     at_top(),
-    printing(Map::new().insert(0, b"p0")),
-    local(9, string_type(), RWord),
-    AVar(local(0, int_type(), RInt)),
+    empty_printing(Map::new().insert(0, b"p0")),
+    local(9, string_type(), AsWord),
+    VarOperand(local(0, int_type(), AsInt)),
   );
-  let t = spelled(pr.out);
+  let t = pieces_text(printing.out);
   let made = place(t, b"ply_alloc");
   let copied = place(t, b"builtin_elaborated_taken_p(ctx, ");
   assert(made > 0 && copied > made, None);

@@ -1,28 +1,30 @@
 //! The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import compiler.syntax.parsing (Span, span_between, site_digit, dummy_span, moved_by)
+import compiler.syntax.parsing (Span, span_between, node_id_base, dummy_span, moved_by)
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
-import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, IExtern, DOrd, DNumeric, deriver_text,
-                              Derived, NInvariant, parse, is_predicate)
-import compiler.syntax.exprs (Expr, prelude_module, try_places, expr_span, sees_homes)
-import compiler.expand.rewrite.shared (picked_in)
+import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, ExternItem, OrdDeriver,
+                              NumericDeriver, deriver_text, DeriveOrigin, InvariantInstance, parse,
+                              is_predicate)
+import compiler.syntax.exprs (Expr, prelude_module, try_spans, expr_span, sees_homes)
+import compiler.expand.rewrite.shared (expressions_matching)
 import std.list (zip)
-import compiler.check.types (Atom, Row, RVar, RSingleton, RAny, RNamed, Type, TyVar, TyCon, TyFn,
-                             canonical_beside, TyRecord, record_fields, Field, atoms_sorted,
+import compiler.check.types (Atom, Row, ResourceVariable, SingletonResource, AnyResource,
+                             NamedResource, Type, VariableType, NamedType, FunctionType,
+                             canonical_beside, RecordType, record_fields, Field, atoms_sorted,
                              resolve_atom, row_empty, row_open, row_singleton, without_raises,
                              int_type, bool_type, bytes_type, list_type, iter_type, fn_type,
-                             shallow, written_label, label_of, atoms_text, scheme_text, type_text,
-                             TyNominal, TypeTable, held_type, table_of, tables_joined,
-                             type_table_bin, vars_in, unit_type, type_at)
-import compiler.check.termination (Ends, Stated, Diverges, Site)
-import compiler.check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, Fix,
+                             shallow_resolve, written_label, label_of, atoms_text, scheme_text,
+                             type_text, NominalType, TypeTable, insert_type, subtable,
+                             tables_joined, type_table_bin, vars_in, unit_type, type_at)
+import compiler.check.termination (Terminates, TerminatesByDecreases, Diverges, Site)
+import compiler.check.resolve.tables (ParsedModule, Source, Resolution, Diag, Label, Edit, Fix,
                                       with_fix, insertion, qualify, error_at)
 import compiler.check.resolve (resolve_modules, ResolveSucceeded, ResolveFailed, dump_diags,
                                has_error)
-import compiler.check.resolve.defaults (Expanded)
+import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.expand.rewrite (expand)
-import compiler.expand.embed (rewritten)
+import compiler.expand.embed (inline_embeds_by_name)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.keys (test_owner, law_owner)
 import std.prelude_source
@@ -31,7 +33,7 @@ import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
 import std.string
-import compiler.check.lent (Passed, passed)
+import compiler.check.borrowing (ParameterMode, parameter_mode)
 import compiler.check.typed (TypedExpr, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
                              ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
                              typed_body_bin, typed_expr_nodes, part_key, TypedRead, TypedUpdate,
@@ -43,41 +45,44 @@ import compiler.check.typed (TypedExpr, TypedBody, ReadLocal, ReadDefinition, Re
 import compiler.check.infer.walked (WalkedTree, WalkedReading, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, settled)
 import compiler.check.infer.checker (OpInfo, EffectInfo, CtorInfo, DefConstraint, InstanceInfo,
-                                     NumericInfo, SpecInfo, DefInfo, Calls, Handed, Unguarded,
-                                     Unshown, ZeroDivisor, Raise, TestInfo, LawBinder, LawInfo,
-                                     MemberSite, WitnessOrder, LabelApplication, KnownDef,
-                                     KnownTest, KeptFacts, Known, no_known, Checker, WalkedBody,
+                                     NumericInfo, SpecInfo, DefInfo, RaisingCall,
+                                     RaisingFunctionValue, UnguardedBuiltin, RequirementNotShown,
+                                     ZeroDivisor, Raise, TestInfo, LawBinder, LawInfo, MemberSite,
+                                     WitnessOrder, LabelApplication, CachedDefinition, CachedTest,
+                                     CachedFacts, CheckCache, empty_cache, Checker, CheckedBody,
                                      report, report_error_at, resolve, resolve_row_in, abort_atom,
-                                     def_of, Builtin, declared, builtins, builtin_named,
+                                     def_of, Builtin, builtin_of_extern, builtins, builtin_named,
                                      member_site_bin, witness_order_bin, ReleaseSite)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (collect_nominals, collect_types, collect_effects,
                                           collect_ctors, check_value_namespace, refuse_irregular)
-import compiler.check.infer.expr (settle_bit_ops, settle_concats, settle_columns, settle_updates,
+import compiler.check.infer.expr (check_bit_ops, check_concats, check_columns, check_updates,
                                   kept_type)
-import compiler.check.infer.definitions (SignedModule, signed_fns, externs_of, externs_in,
-                                         walked_fns, settle_numerics, check_tests, check_laws,
+import compiler.check.infer.definitions (ModuleSignatures, bind_signatures, externs_of, externs_in,
+                                         check_bodies, check_numerics, check_tests, check_laws,
                                          check_schemas, check_specs, unlowered_of)
 import compiler.check.infer.derivable (with_orders, check_map_keys, check_constraints,
                                        settled_witness)
-import compiler.check.infer.solved (collect_stated, check_instances, attribute_generated,
+import compiler.check.infer.solved (collect_instances, check_instances, attribute_generated,
                                     check_comparisons, check_parallels, check_simulations,
-                                    check_regions, fresh_cx)
+                                    check_regions, new_checker)
 import compiler.check.infer.holes (hole_reports)
-import compiler.check.infer.resources (resourceful_types)
+import compiler.check.infer.resources (resource_types)
 
 // --- `check_program` --------------------------------------------------------------------------------------
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program
 /// compiles and runs, and the warning is the reader's.
-type Checked = { checker: Checker, ok: Bool }
+type CheckResult = { checker: Checker, ok: Bool }
 
-pub fn check_program(resolved: Resolved, mods: List<ParsedModule>) -> Checked / {abort.raise} =
-  check_program_with(resolved, mods, no_known())
+pub fn check_program(
+  resolved: Resolution,
+  mods: List<ParsedModule>,
+) -> CheckResult / {abort.raise} = check_program_with(resolved, mods, empty_cache())
 
 /// Every diagnostic, deduplicated, when any is an error; a warning alone is not one.
 pub fn check_diagnostics(
-  resolved: Resolved,
+  resolved: Resolution,
   mods: List<ParsedModule>,
 ) -> List<Diag> / {abort.raise} = {
   let out = check_program(resolved, mods);
@@ -98,21 +103,21 @@ pub type CheckOutput = {
   /// The definitions published from the rows handed in rather than from a walk of their bodies.
   seeded: List<Bytes>,
   /// The same for tests, by key.
-  seeded_tests: List<Bytes>,
+  cached_tests: List<Bytes>,
   /// What the emitter reads of the bodies walked, and of each body published from its rows what
   /// those rows held, so no body it lowers is walked again.
   facts: EmitFacts,
-  kept: List<KeptFacts>,
+  kept: List<CachedFacts>,
   instances: List<InstanceInfo>,
   numeric_types: List<NumericInfo>,
 }
 
 /// What a check of the program publishes, beside each body it walked as another check reads it.
-pub fn check_front_with(
-  resolved: Resolved,
+pub fn check_output_with(
+  resolved: Resolution,
   mods: List<ParsedModule>,
-  known: Known,
-) -> { checked: CheckOutput, bodies: List<WalkedBody> } / {abort.raise} = {
+  known: CheckCache,
+) -> { checked: CheckOutput, bodies: List<CheckedBody> } / {abort.raise} = {
   let out = check_program_with(resolved, mods, known);
   let failed = has_error(out.checker.diags);
   {
@@ -126,7 +131,7 @@ pub fn check_front_with(
       effects: out.checker.effects,
       ctors: out.checker.ctors,
       seeded: out.checker.seeded,
-      seeded_tests: out.checker.seeded_tests,
+      cached_tests: out.checker.cached_tests,
       facts: facts_of(out.checker),
       kept: out.checker.kept,
       instances: out.checker.instances,
@@ -155,7 +160,7 @@ fn canonical_def(d: DefInfo) -> DefInfo / {abort.raise} = {
 }
 
 /// The one purity the root keys, the emitter's constant table and the seam's memo all read.
-pub fn published_pure(def_info: DefInfo) -> Bool =
+pub fn is_pure_definition(def_info: DefInfo) -> Bool =
   without_raises(def_info.footprint).len() == 0 && def_info.constraints.len() == 0
 
 /// What the emitter needs from the checker: the definitions published pure, for its constant table,
@@ -173,15 +178,15 @@ pub type EmitFacts = {
 derive bin for EmitFacts
 
 /// What the emitter reads of one owner's bodies.
-pub type RootFacts = { members: List<MemberSite>, types: TypeTable, bodies: List<TypedBody<Bytes>> }
+pub type BodyFacts = { members: List<MemberSite>, types: TypeTable, bodies: List<TypedBody<Bytes>> }
 
-derive bin for RootFacts
+derive bin for BodyFacts
 
-pub fn no_root_facts() -> RootFacts = { members: [], types: Map::new(), bodies: [] }
+pub fn no_body_facts() -> BodyFacts = { members: [], types: Map::new(), bodies: [] }
 
 /// The nodes of `all` the types `bodies` name are made of, which is all a table of them needs.
 pub fn types_named(all: TypeTable, bodies: List<TypedBody<Bytes>>) -> TypeTable / {abort.raise} =
-  table_of(all, bodies.fold([], |acc: List<Bytes>, b: TypedBody<Bytes>| acc.concat(keys_in(b))))
+  subtable(all, bodies.fold([], |acc: List<Bytes>, b: TypedBody<Bytes>| acc.concat(keys_in(b))))
 
 /// Every type key `b` names, in the order a walk meets them.
 fn keys_in(b: TypedBody<Bytes>) -> List<Bytes> / {abort.raise} =
@@ -221,43 +226,43 @@ pub fn facts_kept(
 
 /// Each owner's facts, by the definition, test or law whose body they are of, each naming its
 /// types in all of `facts.types`.
-pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
-  let into = |m: Map<Bytes, RootFacts>, owner: Bytes, add: (RootFacts) -> RootFacts|
+pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, BodyFacts> = {
+  let into = |m: Map<Bytes, BodyFacts>, owner: Bytes, add: (BodyFacts) -> BodyFacts|
     m.insert(
       owner,
-      add(match m.get(owner) { Some(f) -> f, None -> { ..no_root_facts(), types: facts.types } }),
+      add(match m.get(owner) { Some(f) -> f, None -> { ..no_body_facts(), types: facts.types } }),
     );
-  let called = facts.members.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: MemberSite|
-    into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
-  facts.bodies.fold(called, |m: Map<Bytes, RootFacts>, x: TypedBody<Bytes>|
-    into(m, x.owner, |f: RootFacts| { ..f, bodies: f.bodies.push(x) }))
+  let called = facts.members.fold(Map::new(), |m: Map<Bytes, BodyFacts>, x: MemberSite|
+    into(m, x.owner, |f: BodyFacts| { ..f, members: f.members.push(x) }));
+  facts.bodies.fold(called, |m: Map<Bytes, BodyFacts>, x: TypedBody<Bytes>|
+    into(m, x.owner, |f: BodyFacts| { ..f, bodies: f.bodies.push(x) }))
 }
 
 /// `facts` filed under `owner` in `module`.
-fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
+fn with_owner(facts: BodyFacts, module: Int, owner: Bytes) -> BodyFacts =
   {
     members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
     types: facts.types,
     bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
   }
 
-/// The encoding `filed_facts` writes, its first byte; bytes of another are no facts.
-fn facts_encoding() -> Int = 6
+/// The encoding `encode_facts` writes, its first byte; bytes of another are no facts.
+fn facts_format() -> Int = 6
 
 /// One owner's facts as its row files them: each place counted in the body's item, which no edit
 /// elsewhere, cut of its module or check of part of it moves.
-pub fn filed_facts(facts: RootFacts) -> Bytes / {abort.raise} =
+pub fn encode_facts(facts: BodyFacts) -> Bytes / {abort.raise} =
 
   // A row names its types by key; the table they are read from goes with the rows, held once.
-  byte_of_int(facts_encoding()).concat(
-    bin::encode(owned_by({ ..facts, types: Map::new() }, 0, b""), root_facts_bin()),
+  byte_of_int(facts_format()).concat(
+    bin::encode(with_owner({ ..facts, types: Map::new() }, 0, b""), body_facts_bin()),
   )
 
 /// A row's facts read back for the body of `owner` in `module`; none for bytes that are no facts.
-pub fn facts_at(filed: Bytes, module: Int, owner: Bytes) -> Option<RootFacts> / {abort.raise} =
-  if filed.len() == 0 || filed.at(0) != facts_encoding() { None } else {
-    match bin::decode(filed.slice(1, filed.len()), root_facts_bin()) {
-      Ok(f) -> Some(owned_by(f, module, owner)),
+pub fn decode_facts(filed: Bytes, module: Int, owner: Bytes) -> Option<BodyFacts> / {abort.raise} =
+  if filed.len() == 0 || filed.at(0) != facts_format() { None } else {
+    match bin::decode(filed.slice(1, filed.len()), body_facts_bin()) {
+      Ok(f) -> Some(with_owner(f, module, owner)),
       Err(_) -> None,
     }
   }
@@ -279,7 +284,7 @@ fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
   let keyed = keyed_bodies(settled_bodies(checker), checker.known.types);
   {
     pure: checker.defs.fold([], |acc: List<Bytes>, def_info: DefInfo|
-      if published_pure(def_info) { acc.push(def_info.name) } else { acc }),
+      if is_pure_definition(def_info) { acc.push(def_info.name) } else { acc }),
     orders: checker.witness_orders,
     members: grouped(checker.member_sites, |x: MemberSite| x.owner),
     types: keyed.types,
@@ -330,9 +335,9 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
       Some(d) -> { rows: by_place(d.scheme.row_vars), labels: by_place(d.scheme.label_vars) },
       None -> { rows: Map::new(), labels: Map::new() },
     };
-    let ty = |t: Type| numbered(resolve(checker, t), types, checker.kept_vars);
+    let ty = |t: Type| numbered(resolve(checker, t), types, checker.keep_variables);
     let row = |r: Row| row_numbered(resolve_row_in(checker, r), rows);
-    let placed = |sp: Span| moved_by(sp, 0 - b.base);
+    let labelled_diagnostics = |sp: Span| moved_by(sp, 0 - b.base);
     let here = match released.get(b.owner) { Some(at) -> at, None -> Map::new() };
     // A definition a `numeric` or `integer` constraint makes witnesses of takes them first.
     let witnesses = match owner {
@@ -349,7 +354,10 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
       ty: ty,
       witness: |t: Type|
         match resolve(checker, t) {
-          TyVar(v) -> match checker.witnessed.get(v) { Some(w) -> Some(w.param), None -> None },
+          VariableType(v) -> match checker.witnessed.get(v) {
+            Some(w) -> Some(w.param),
+            None -> None,
+          },
           _ -> None,
         },
       row: row,
@@ -374,7 +382,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
           WalkedDefinition(x) -> {
             let scheme = match def_of(checker, x.key) { Some(d) -> Some(d.scheme), None -> None };
             let args = if x.args.len() > 0 { x.args }
-            else { match scheme { Some(sc) -> sc.ty_vars.map(TyVar), None -> [] } };
+            else { match scheme { Some(sc) -> sc.ty_vars.map(VariableType), None -> [] } };
             let filled = match scheme {
               Some(sc) ->
                 sc.row_vars.map(|v: Int|
@@ -408,7 +416,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
           Some(fs) -> Some(fs.map(|f: Field| f.name).filter(|n: Bytes| !sets.contains(n))),
           None -> None,
         },
-      span: placed,
+      span: labelled_diagnostics,
       released: |site: Int| match here.get(site) { Some(xs) -> xs, None -> [] },
     };
     match settled(b.body, settling) {
@@ -418,7 +426,8 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
           module: b.module,
           part: b.part,
           params: witnesses.concat(
-            b.params.map(|p: TypedParam<Type>| { ..p, ty: ty(p.ty), span: placed(p.span) }),
+            b.params.map(|p: TypedParam<Type>|
+              { ..p, ty: ty(p.ty), span: labelled_diagnostics(p.span) }),
           ),
           body: body,
         }),
@@ -463,11 +472,11 @@ fn labels_settled(
     match acc {
       None -> None,
       Some(ls) -> {
-        let t = shallow(checker.subst, label);
+        let t = shallow_resolve(checker.subst, label);
         match label_of(t) {
           Some(n) -> Some(ls.push(LabelNamed(n))),
           None -> match t {
-            TyVar(w) -> match labels.get(w) {
+            VariableType(w) -> match labels.get(w) {
               Some(i) -> Some(ls.push(LabelParam(i))),
               None -> None,
             },
@@ -484,7 +493,7 @@ fn keyed_bodies(
 ) -> { bodies: List<TypedBody<Bytes>>, types: TypeTable } / {abort.raise} = {
   let keying = {
     ty: |t: Type, s: { table: TypeTable, keyed: Map<Type, Bytes> }| {
-      let h = held_once(s.table, s.keyed, t);
+      let h = intern_type(s.table, s.keyed, t);
       { ty: h.key, state: { table: h.table, keyed: h.keyed } }
     },
     row: |r: Row| r,
@@ -511,14 +520,17 @@ type RowNumbering = { rows: Map<Int, Int>, labels: Map<Int, Int> }
 fn row_numbered(row: Row, numbering: RowNumbering) -> Row / {abort.raise} =
   {
     atoms: if !row.atoms.fold(false, |found: Bool, a: Atom|
-        found || (match a.resource { RVar(_) -> true, _ -> false })) { row.atoms }
+        found || (match a.resource { ResourceVariable(_) -> true, _ -> false })) { row.atoms }
     else { atoms_sorted(row.atoms.map(|a: Atom| atom_numbered(a, numbering.labels))) },
     tail: match row.tail { None -> None, Some(v) -> numbering.rows.get(v) },
   }
 
 /// `atom` with its label variable read in `labels`.
 fn atom_numbered(atom: Atom, labels: Map<Int, Int>) -> Atom =
-  match atom.resource { RVar(v) -> { ..atom, resource: RVar(place_among(labels, v)) }, _ -> atom }
+  match atom.resource {
+    ResourceVariable(v) -> { ..atom, resource: ResourceVariable(place_among(labels, v)) },
+    _ -> atom,
+  }
 
 /// `v`'s place in `numbering`, `-1` for a variable it does not number.
 fn place_among(numbering: Map<Int, Int>, v: Int) -> Int =
@@ -538,7 +550,7 @@ fn law_sorts(checker: Checker) -> Map<Bytes, Map<Int, Int>> / {abort.raise} =
     ))
 
 /// `ty` held in `table`, found in `keyed` where it was held already.
-fn held_once(
+fn intern_type(
   table: TypeTable,
   keyed: Map<Type, Bytes>,
   ty: Type,
@@ -546,7 +558,7 @@ fn held_once(
   match keyed.get(ty) {
     Some(key) -> { table: table, keyed: keyed, key: key },
     None -> {
-      let h = held_type(table, ty);
+      let h = insert_type(table, ty);
       { table: h.table, keyed: keyed.insert(ty, h.key), key: h.key }
     },
   }
@@ -559,22 +571,22 @@ fn numbered(ty: Type, numbering: Map<Int, Int>, kept: List<Int>) -> Type =
   if !renumbers(ty) { ty } else {
     let again = |t: Type| numbered(t, numbering, kept);
     match ty {
-      TyVar(v) -> match numbering.get(v) {
-        Some(i) -> TyVar(i),
+      VariableType(v) -> match numbering.get(v) {
+        Some(i) -> VariableType(i),
         None -> if kept.contains(v) { kept_type() } else { unit_type() },
       },
-      TyCon(c) -> TyCon({ ..c, args: c.args.map(again) }),
-      TyFn(f) ->
-        TyFn({
+      NamedType(c) -> NamedType({ ..c, args: c.args.map(again) }),
+      FunctionType(f) ->
+        FunctionType({
           kept: [],
           once: false,
           params: f.params.map(again),
           ret: again(f.ret),
           effects: row_empty(),
         }),
-      TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: again(f.ty) })),
-      TyNominal(x) ->
-        TyNominal({
+      RecordType(fs) -> RecordType(fs.map(|f: Field| { ..f, ty: again(f.ty) })),
+      NominalType(x) ->
+        NominalType({
           ..x,
           args: x.args.map(again),
           fields: x.fields.map(|f: Field| { ..f, ty: again(f.ty) }),
@@ -585,55 +597,55 @@ fn numbered(ty: Type, numbering: Map<Int, Int>, kept: List<Int>) -> Type =
 /// Whether `numbered` makes something else of `ty`: it holds a variable, or a function with a row.
 fn renumbers(ty: Type) -> Bool =
   match ty {
-    TyVar(_) -> true,
-    TyCon(c) -> c.args.fold(false, |found: Bool, a: Type| found || renumbers(a)),
-    TyFn(f) ->
+    VariableType(_) -> true,
+    NamedType(c) -> c.args.fold(false, |found: Bool, a: Type| found || renumbers(a)),
+    FunctionType(f) ->
       f.effects.atoms.len() > 0 || f.effects.tail != None
         || f.params.fold(false, |found: Bool, p: Type| found || renumbers(p))
         || renumbers(f.ret),
-    TyRecord(fs) -> fs.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
-    TyNominal(x) ->
+    RecordType(fs) -> fs.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
+    NominalType(x) ->
       x.args.fold(false, |found: Bool, a: Type| found || renumbers(a))
         || x.fields.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
   }
 
 /// What a check of a program found: which definitions end, which end by the measures they state,
 /// and each body it settled.
-pub type Elaborated = {
+pub type ElaborationResult = {
   ends: Map<Bytes, Bool>,
   stated: Map<Bytes, Bool>,
   bodies: List<TypedBody<Type>>,
 }
 
-pub fn elaborated(
-  resolved: Resolved,
+pub fn elaborate(
+  resolved: Resolution,
   mods: List<ParsedModule>,
-) -> Option<Elaborated> / {abort.raise} = {
+) -> Option<ElaborationResult> / {abort.raise} = {
   let out = check_program(resolved, mods);
   if has_error(out.checker.diags) { None } else {
     Some({
-      ends: ended(out.checker.defs),
-      stated: stated(out.checker.defs),
+      ends: terminating_definitions(out.checker.defs),
+      stated: measured_definitions(out.checker.defs),
       bodies: settled_bodies(out.checker),
     })
   }
 }
 
-pub fn ended(defs: List<DefInfo>) -> Map<Bytes, Bool> =
+pub fn terminating_definitions(defs: List<DefInfo>) -> Map<Bytes, Bool> =
   defs.fold(Map::new(), |acc: Map<Bytes, Bool>, def_info: DefInfo|
-    match def_info.ending { Ends -> acc.insert(def_info.name, true), _ -> acc })
+    match def_info.ending { Terminates -> acc.insert(def_info.name, true), _ -> acc })
 
 /// The ones whose group descends only once the measures it states are counted: a proof owes those.
-pub fn stated(defs: List<DefInfo>) -> Map<Bytes, Bool> =
+pub fn measured_definitions(defs: List<DefInfo>) -> Map<Bytes, Bool> =
   defs.fold(Map::new(), |acc: Map<Bytes, Bool>, def_info: DefInfo|
-    match def_info.ending { Stated -> acc.insert(def_info.name, true), _ -> acc })
+    match def_info.ending { TerminatesByDecreases -> acc.insert(def_info.name, true), _ -> acc })
 
 /// The bodies a check of `mods` settles, with the definitions `known` holds rows for published from
 /// them rather than walked.
 pub fn bodies_with(
-  resolved: Resolved,
+  resolved: Resolution,
   mods: List<ParsedModule>,
-  known: Known,
+  known: CheckCache,
 ) -> Option<List<TypedBody<Type>>> / {abort.raise} = {
   let out = check_program_with(resolved, mods, known);
   if has_error(out.checker.diags) { None } else { Some(settled_bodies(out.checker)) }
@@ -664,9 +676,9 @@ pub fn bodies_read(
 /// and a law's as `test_owner` and `law_owner` name them; none for an item with no body.
 pub fn item_owner(module: Bytes, item: Item) -> Bytes / {abort.raise} =
   match item {
-    IFn(d) -> qualify(module, d.name.name),
-    ITest(d) -> test_owner(module, d.name),
-    ILaw(d) -> law_owner(module, d.name),
+    FunctionItem(d) -> qualify(module, d.name.name),
+    TestItem(d) -> test_owner(module, d.name),
+    LawItem(d) -> law_owner(module, d.name),
     _ -> b"",
   }
 
@@ -727,10 +739,10 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
 /// A settled label is the resource it names, or the enclosing definition's own label parameter.
 fn label_named(checker: Checker, a: LabelApplication, v: Int) -> Option<Bytes> / {abort.raise} =
   if v < 0 { None } else {
-    let t = shallow(checker.subst, TyVar(v));
+    let t = shallow_resolve(checker.subst, VariableType(v));
     match label_of(t) {
       Some(n) -> Some(n),
-      None -> match t { TyVar(w) -> param_named(a.params, w), _ -> None },
+      None -> match t { VariableType(w) -> param_named(a.params, w), _ -> None },
     }
   }
 
@@ -739,22 +751,22 @@ fn param_named(params: Map<Bytes, Int>, v: Int) -> Option<Bytes> =
     match acc { Some(_) -> acc, None -> if w == v { Some(k) } else { None } })
 
 pub fn check_program_with(
-  resolved: Resolved,
+  resolved: Resolution,
   mods: List<ParsedModule>,
-  known: Known,
-) -> Checked / {abort.raise} = {
-  let c0 = fresh_cx(resolved, mods, known);
+  known: CheckCache,
+) -> CheckResult / {abort.raise} = {
+  let c0 = new_checker(resolved, mods, known);
   let declared: Checker = resolved.order.fold(c0, |checker: Checker, i: Int| {
     let m = mods.get(i);
     let c1: Checker = { ..checker, module: i };
     let typed: Checker = collect_nominals(collect_effects(collect_types(c1, m), m), m);
-    collect_stated(check_value_namespace(refuse_irregular(collect_ctors(typed, m), m), m), m)
+    collect_instances(check_value_namespace(refuse_irregular(collect_ctors(typed, m), m), m), m)
   });
-  let declared: Checker = { ..declared, resourceful: resourceful_types(declared) };
+  let declared: Checker = { ..declared, resource_types: resource_types(declared) };
   let signed = resolved.order.fold(
     { checker: with_orders(declared), by: Map::new() },
-    |acc: { checker: Checker, by: Map<Int, SignedModule> }, i: Int| {
-      let o = signed_fns({ ..acc.checker, module: i }, mods.get(i));
+    |acc: { checker: Checker, by: Map<Int, ModuleSignatures> }, i: Int| {
+      let o = bind_signatures({ ..acc.checker, module: i }, mods.get(i));
       { checker: o.checker, by: acc.by.insert(i, o.signed) }
     },
   );
@@ -773,7 +785,7 @@ pub fn check_program_with(
     |checker: Checker, i: Int| {
       let m = mods.get(i);
       match signed.by.get(i) {
-        Some(s) -> check_specs(walked_fns({ ..checker, module: i }, m, s), m),
+        Some(s) -> check_specs(check_bodies({ ..checker, module: i }, m, s), m),
         None -> panic("a module of the program was not signed"),
       }
     },
@@ -784,8 +796,8 @@ pub fn check_program_with(
       mods.get(i),
     ));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-  let settled: Checker = settle_columns(
-    settle_bit_ops(settle_numerics(settle_concats(settle_updates(check_instances(tested))))),
+  let settled: Checker = check_columns(
+    check_bit_ops(check_numerics(check_concats(check_updates(check_instances(tested))))),
   );
   let constrained: Checker = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(settled))),
@@ -877,7 +889,7 @@ fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
             b";",
             dump_flag(effect_info.nondet),
             b";",
-            Bytes::join(effect_info.ops.map(dump_op), b","),
+            Bytes::join(effect_info.operations.map(dump_op), b","),
             b";",
           ]),
       ),
@@ -911,10 +923,15 @@ fn dedup_diags(diags: List<Diag>) -> List<Diag> =
       else { { seen: acc.seen.insert(diag, true), kept: acc.kept.push(diag) } },
   ).kept
 
-type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
+type ExpandedSource = {
+  name: Bytes,
+  module: Module,
+  derived: List<DeriveOrigin>,
+  diags: List<Diag>,
+}
 
 /// Each source parsed with the rewrites and every `derive` expanded, with no embed read for it.
-fn parsed_all(sources: List<Source>) -> List<Parsed> / {abort.raise} =
+fn parsed_all(sources: List<Source>) -> List<ExpandedSource> / {abort.raise} =
   range(0, sources.len()).map(|i: Int| {
     let s = sources.get(i);
     let r = parse(s.src);
@@ -922,7 +939,7 @@ fn parsed_all(sources: List<Source>) -> List<Parsed> / {abort.raise} =
     let d: Expansion = expand_derives(i, s.name, x.module);
     {
       name: s.name,
-      module: rewritten(Map::new(), s.name, d.module).module,
+      module: inline_embeds_by_name(Map::new(), s.name, d.module).module,
       derived: d.derived,
       diags: d.diags,
     }
@@ -930,10 +947,10 @@ fn parsed_all(sources: List<Source>) -> List<Parsed> / {abort.raise} =
 
 /// The driver's order: parse with the rewrites, expand every `derive`, resolve. The dump of the
 /// stage that reported, where one did.
-fn resolved_all(sources: List<Source>) -> Result<Expanded, Bytes> / {abort.raise} = {
+fn resolved_all(sources: List<Source>) -> Result<ResolvedProgram, Bytes> / {abort.raise} = {
   let parsed = parsed_all(sources);
-  let expansion = parsed.fold([], |acc: List<Diag>, p: Parsed| acc.concat(p.diags));
-  let mods = parsed.map(|p: Parsed| { name: p.name, module: p.module, derived: p.derived });
+  let expansion = parsed.fold([], |acc: List<Diag>, p: ExpandedSource| acc.concat(p.diags));
+  let mods = parsed.map(|p: ExpandedSource| { name: p.name, module: p.module, derived: p.derived });
   if expansion.len() > 0 { Err(b"X;".concat(dump_diags(expansion))) } else {
     match resolve_modules(mods) {
       ResolveFailed(ds) -> Err(b"X;".concat(dump_diags(ds))),
@@ -954,26 +971,35 @@ pub fn check_dump(sources: List<Source>) -> String / {abort.raise} =
     }),
   )
 
-fn dump_outcome(out: Checked) -> Bytes / {abort.raise} =
+fn dump_outcome(out: CheckResult) -> Bytes / {abort.raise} =
   if out.ok { dump_checked(out.checker) }
   else { b"X;".concat(dump_diags(dedup_diags(out.checker.diags))) }
 
 /// What a checked program publishes, as the interfaces a second check of it would be handed.
-fn known_of(checker: Checker) -> Known = {
-  let defs = checker.defs.fold(Map::new(), |acc: Map<Bytes, KnownDef>, def_info: DefInfo|
-    acc.insert(def_info.name, {
-      footprint: def_info.footprint,
-      performed: def_info.performed,
-      scaling: def_info.scaling,
-      repeats: def_info.repeats,
-      ending: def_info.ending,
-      summary: def_info.summary,
-      raises: def_info.raises,
-      facts: b"",
-    }));
-  let tests = checker.tests.fold(Map::new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
+fn cache_of(checker: Checker) -> CheckCache = {
+  let defs = checker.defs.fold(
+    Map::new(),
+    |acc: Map<Bytes, CachedDefinition>, def_info: DefInfo|
+      acc.insert(def_info.name, {
+        footprint: def_info.footprint,
+        performed: def_info.performed,
+        scaling: def_info.scaling,
+        repeats: def_info.repeats,
+        ending: def_info.ending,
+        summary: def_info.summary,
+        raises: def_info.raises,
+        facts: b"",
+      }),
+  );
+  let tests = checker.tests.fold(Map::new(), |acc: Map<Bytes, CachedTest>, t: TestInfo|
     acc.insert(t.key, { footprint: t.footprint, facts: b"" }));
-  { ..no_known(), defs: defs, tests: tests, root: checker.known.root, types: checker.known.types }
+  {
+    ..empty_cache(),
+    defs: defs,
+    tests: tests,
+    root: checker.known.root,
+    types: checker.known.types,
+  }
 }
 
 /// `check_dump`'s answer, and the program's checked a second time from the interfaces the first
@@ -992,7 +1018,7 @@ pub fn check_dumps(sources: List<Source>) -> Dumps / {abort.raise} = {
       {
         walked: walked,
         seeded: if !first.ok { walked }
-        else { dump_outcome(check_program_with(x.r, x.mods, known_of(first.checker))) },
+        else { dump_outcome(check_program_with(x.r, x.mods, cache_of(first.checker))) },
       }
     },
   };
@@ -1017,7 +1043,7 @@ test "the dump writes each definition, test, law, effect and constructor of a pr
 }
 
 /// What `check_dump` checks of one module `m` holding `src`, which resolves.
-fn checked_m(src: Bytes) -> Checked / {abort.raise} =
+fn checked_m(src: Bytes) -> CheckResult / {abort.raise} =
   match resolved_all([{ name: b"m", src: src }]) {
     Err(refused) -> panic("`m` does not resolve: " ++ String::of_bytes_lossy(refused)),
     Ok(x) -> check_program(x.r, x.mods),
@@ -1031,7 +1057,7 @@ fn checker_m(src: Bytes) -> Checker / {abort.raise} = {
 }
 
 /// A definition as the dump writes its scheme, its footprint and what its body performs.
-type Defined = { scheme: Bytes, footprint: Bytes, performed: Bytes }
+type DefinitionDump = { scheme: Bytes, footprint: Bytes, performed: Bytes }
 
 fn info_of(checker: Checker, name: Bytes) -> DefInfo / {abort.raise} =
   match checker.defs.filter(|d: DefInfo| d.name == name) {
@@ -1039,7 +1065,7 @@ fn info_of(checker: Checker, name: Bytes) -> DefInfo / {abort.raise} =
     [] -> panic("no definition is named " ++ String::of_bytes_lossy(name)),
   }
 
-fn defined(checker: Checker, name: Bytes) -> Defined / {abort.raise} = {
+fn defined(checker: Checker, name: Bytes) -> DefinitionDump / {abort.raise} = {
   let d = info_of(checker, name);
   {
     scheme: scheme_text(d.scheme),
@@ -1054,7 +1080,7 @@ fn scheme_of(src: Bytes, name: Bytes) -> Bytes / {abort.raise} =
 
 /// Each diagnostic a check of `m` holding `src` raises: its code, then the source each of its labels
 /// covers, in the order it lists them.
-fn placed(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
+fn labelled_diagnostics(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
   dedup_diags(checked_m(src).checker.diags).map(|diag: Diag|
     [diag.code].concat(diag.labels.map(|label: Label| src.slice(label.start, label.end))))
 
@@ -1084,7 +1110,7 @@ fn nodes_where(checker: Checker, picked: (Span) -> Bool) -> List<TypedExpr<Type>
 
 /// Whether `s` is the place of a node written from `at.start` to `at.end`, none made for another.
 fn written_over(s: Span, at: Span) -> Bool =
-  s.start == at.start && s.end == at.end && s.site > 0 && s.site < site_digit()
+  s.start == at.start && s.end == at.end && s.site > 0 && s.site < node_id_base()
 
 /// The type of each node written from `at.start` to `at.end`, a function's written without its row.
 fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
@@ -1092,7 +1118,7 @@ fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
 
 /// The expression of module 0 of the check behind `checker` written from `at.start` to `at.end`.
 fn written_node(checker: Checker, at: Span) -> Expr / {abort.raise} =
-  match picked_in(checker.modules.get(0).module, |e: Expr|
+  match expressions_matching(checker.modules.get(0).module, |e: Expr|
       expr_span(e).start == at.start && expr_span(e).end == at.end) {
     [e, ..] -> e,
     [] -> panic("no node is written there"),
@@ -1100,7 +1126,7 @@ fn written_node(checker: Checker, at: Span) -> Expr / {abort.raise} =
 
 fn shown(t: Type) -> Bytes / {abort.raise} =
   match t {
-    TyFn(f) ->
+    FunctionType(f) ->
       Bytes::concat_all([b"(", Bytes::join(f.params.map(shown), b", "), b") -> ", shown(f.ret)]),
     other -> type_text(other),
   }
@@ -1129,10 +1155,10 @@ fn row_text(row: Row) -> Bytes / {abort.raise} = {
 
 fn atom_placed_text(atom: Atom) -> Bytes / {abort.raise} = {
   let resource = match atom.resource {
-    RSingleton -> b"",
-    RAny -> b"[*]",
-    RNamed(n) -> Bytes::concat_all([b"[", n, b"]"]),
-    RVar(v) -> Bytes::concat_all([b"[", place_text(b"l", v), b"]"]),
+    SingletonResource -> b"",
+    AnyResource -> b"[*]",
+    NamedResource(n) -> Bytes::concat_all([b"[", n, b"]"]),
+    ResourceVariable(v) -> Bytes::concat_all([b"[", place_text(b"l", v), b"]"]),
   };
   Bytes::concat_all([
     atom.effect,
@@ -1332,7 +1358,7 @@ test "a try holds its body's row, and the clauses it is written out with perform
   ]);
   let checker = rowed_m(src);
   let one = expr_span(written_node(checker, placed_in(src, b"try { digit", b"\n")));
-  let at = try_places(one);
+  let at = try_spans(one);
   assert_eq(rows_at(checker, one), [b"{m.log.write, m.parse.bad}"]);
   assert_eq(rows_at(checker, at.ret), [b"{}"]);
   assert_eq(rows_at(checker, at.clause), [b"{}"])
@@ -1392,7 +1418,7 @@ test "the parts of the handle a try is written out as stand where the rewrite pu
   let typed = |at: Span|
     nodes_where(checker, |s: Span| s == at).map(|e: TypedExpr<Type>| shown(e.ty));
   let one = expr_span(written_node(checker, placed_in(src, b"try { digit", b"\n")));
-  let at = try_places(one);
+  let at = try_spans(one);
   let result = b"Result<Int, String>";
   assert_eq(typed(one), [result]);
   assert_eq(typed(at.ok), [b"(Int) -> ".concat(result)]);
@@ -1401,7 +1427,7 @@ test "the parts of the handle a try is written out as stand where the rewrite pu
   // A raise of several values is carried as the record of them, which has a place of its own.
   let lookup = b"try { lookup(key) }";
   let s = placed_in(src, lookup, lookup).start;
-  let several = try_places(expr_span(written_node(checker, span_between(s, s + lookup.len()))));
+  let several = try_spans(expr_span(written_node(checker, span_between(s, s + lookup.len()))));
   assert_eq(typed(several.carried).len(), 1)
 }
 
@@ -1498,7 +1524,7 @@ test "a clause on a label parameter discharges what the generic body performs" {
 
 test "an unknown name is told the name in scope a slip of the hand would make it" {
   // Each diagnostic's code, the name it is placed at, and whether a note offers `count`.
-  let noted = |call: Bytes| {
+  let with_note_effect = |call: Bytes| {
     let src = b"fn count(n: Int) -> Int = n\nfn go() -> Int = ".concat(call);
     check_diags(src).map(|diag: Diag|
       {
@@ -1508,10 +1534,10 @@ test "an unknown name is told the name in scope a slip of the hand would make it
         offered: diag.notes_text.any(|note: Bytes| note.index_of(b"count") != None),
       })
   };
-  assert_eq(noted(b"cuont(2)"), [{ code: b"E0101", at: b"cuont", offered: true }]);
-  assert_eq(noted(b"counts(2)"), [{ code: b"E0101", at: b"counts", offered: true }]);
-  assert_eq(noted(b"breadth(2)"), [{ code: b"E0101", at: b"breadth", offered: false }]);
-  assert_eq(noted(b"cnt(2)"), [{ code: b"E0101", at: b"cnt", offered: false }])
+  assert_eq(with_note_effect(b"cuont(2)"), [{ code: b"E0101", at: b"cuont", offered: true }]);
+  assert_eq(with_note_effect(b"counts(2)"), [{ code: b"E0101", at: b"counts", offered: true }]);
+  assert_eq(with_note_effect(b"breadth(2)"), [{ code: b"E0101", at: b"breadth", offered: false }]);
+  assert_eq(with_note_effect(b"cnt(2)"), [{ code: b"E0101", at: b"cnt", offered: false }])
 }
 
 test "`[*]` on an operation that takes no resource is refused" {
@@ -1880,7 +1906,7 @@ fn checked_cx(src: Bytes) -> Checker / {abort.raise} = {
   }
 }
 
-fn held_io(body: Bytes) -> Bytes =
+fn with_io_effect(body: Bytes) -> Bytes =
   b"effect io {\n  write open(n: Int) -> Int\n  write close(h: Int) -> Unit\n  write pull(h: Int) -> Int\n}\n".concat(
     body,
   )
@@ -1888,7 +1914,7 @@ fn held_io(body: Bytes) -> Bytes =
 test "a hold is read inside its region, whose row is its acquire's, its release's and its body's" {
   assert_eq(
     check_codes(
-      held_io(
+      with_io_effect(
         b"fn f() -> Int / {io.open, io.close, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(h.get()) }",
       ),
     ),
@@ -1896,7 +1922,7 @@ test "a hold is read inside its region, whose row is its acquire's, its release'
   );
   assert_eq(
     check_codes(
-      held_io(
+      with_io_effect(
         b"fn f() -> Int / {io.open, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(h.get()) }",
       ),
     ),
@@ -1941,10 +1967,10 @@ test "a function handed a hold reads it under its region's label, which the regi
 }
 
 test "the labels a call writes fill those that name no region, which the hold passed fills" {
-  let noted = b"effect log { write say[l](n: Int) -> Unit }\nfn noted<[l], [r]>(h: Hold<Int, [r]>) -> Unit / {log.write[l], hold.read[r]} = log.say[l](h.get())\n";
+  let with_note_effect = b"effect log { write say[l](n: Int) -> Unit }\nfn noted<[l], [r]>(h: Hold<Int, [r]>) -> Unit / {log.write[l], hold.read[r]} = log.say[l](h.get())\n";
   let inside = |call: Bytes|
     Bytes::concat_all([
-      noted,
+      with_note_effect,
       b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> ",
       call,
       b" }",
@@ -1973,7 +1999,7 @@ test "the labels a call writes fill those that name no region, which the hold pa
   assert_eq(
     check_codes(
       Bytes::concat_all([
-        noted,
+        with_note_effect,
         through,
         b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> through[out](|| h.get()) }",
       ]),
@@ -2481,7 +2507,7 @@ test "a test body is `Unit`, so one that ends on a value is refused with a fix t
   refuses_a_value(b"test/nondet")
 }
 
-fn net_src(rest: Bytes) -> Bytes =
+fn with_net_effect(rest: Bytes) -> Bytes =
   b"effect net { write send[s](payload: Bytes) -> Unit\n write recv[s](max: Int) -> Bytes\n write close[s]() -> Unit\n read peek[s]() -> Int }\n".concat(
     rest,
   )
@@ -2679,7 +2705,7 @@ test "an instantiation's binder settles to the `new` record what it is given tak
   assert_eq(c.diags, []);
   assert_eq(
     c.laws.map(|l: LawInfo|
-      l.binders.map(|b: LawBinder| match b.ty { TyNominal(n) -> n.name, _ -> b"" })),
+      l.binders.map(|b: LawBinder| match b.ty { NominalType(n) -> n.name, _ -> b"" })),
     [[b"m.Sign"]],
   );
   // A record of the same fields is not the `new` one.
@@ -2689,8 +2715,8 @@ test "an instantiation's binder settles to the `new` record what it is given tak
 /// The variables of `ty` in the order they first appear.
 fn variables_of(ty: Type) -> List<Int> =
   match ty {
-    TyVar(v) -> [v],
-    TyCon(c) ->
+    VariableType(v) -> [v],
+    NamedType(c) ->
       c.args.fold([], |acc: List<Int>, a: Type|
         acc.concat(variables_of(a).filter(|v: Int| !acc.contains(v)))),
     _ -> [],
@@ -2731,11 +2757,11 @@ test "an instantiation settles a type parameter its schema constrains `identity`
   assert_eq(check_codes(over(b"law \"l\" = twice(scale)")), [b"E0479"]);
   assert_eq(check_codes(over(b"law \"l\" = twice(halves)")), [b"E0479"]);
   assert_eq(check_codes(over(b"law \"l\" = twice(keyed)")), [b"E0479"]);
-  let noted = |law: Bytes, said: Bytes|
+  let with_note_effect = |law: Bytes, said: Bytes|
     check_diags(over(law)).any(|d: Diag| d.notes_text.any(|n: Bytes| n.contains(said)));
-  assert(noted(b"law \"l\" = twice(halve)", b"`NaN != NaN`"));
-  assert(noted(b"law \"l\" = twice(halves)", b"`List<Float>` holds `Float`"));
-  assert(noted(b"law \"l\" = twice(keyed)", b"`N` states a `key`"));
+  assert(with_note_effect(b"law \"l\" = twice(halve)", b"`NaN != NaN`"));
+  assert(with_note_effect(b"law \"l\" = twice(halves)", b"`List<Float>` holds `Float`"));
+  assert(with_note_effect(b"law \"l\" = twice(keyed)", b"`N` states a `key`"));
   // What the arguments leave unsettled is the law's own, constrained as the schema's was.
   let generic = checked_cx(over(b"law \"l\" = twice(same)"));
   assert_eq(generic.diags, []);
@@ -2760,7 +2786,7 @@ test "an instantiation settles a type parameter its schema constrains `identity`
 test "a handle must have a clause for every operation its body performs on an atom it handles" {
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Bytes = handle { net.send[c](b\"x\"); net.recv[c](4) } with { net.recv[c](n) -> b\"\" }",
       ),
     ),
@@ -2768,7 +2794,7 @@ test "a handle must have a clause for every operation its body performs on an at
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Bytes = handle { net.send[c](b\"x\"); net.recv[c](4) } with { net.recv[c](n) -> b\"\", net.send[c](p) -> () }",
       ),
     ),
@@ -2776,7 +2802,7 @@ test "a handle must have a clause for every operation its body performs on an at
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Int / {net.write[c]} = handle { net.send[c](b\"x\"); net.peek[c]() } with { net.peek[c]() -> 1 }",
       ),
     ),
@@ -2788,7 +2814,7 @@ test "the operations a called definition performs count, through any number of c
   let calls = b"fn push_all(p: Bytes) -> Unit / {net.send[c]} = net.send[c](p)\nfn relay(p: Bytes) -> Unit / {net.send[c]} = push_all(p)\n";
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         calls.concat(b"fn f() -> Unit = handle { relay(b\"x\") } with { net.recv[c](n) -> b\"\" }"),
       ),
     ),
@@ -2796,7 +2822,7 @@ test "the operations a called definition performs count, through any number of c
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         calls.concat(b"fn f() -> Unit = handle { relay(b\"x\") } with { net.send[c](p) -> () }"),
       ),
     ),
@@ -2804,7 +2830,7 @@ test "the operations a called definition performs count, through any number of c
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         calls.concat(
           b"fn g() -> Unit / {net.send[c]} = relay(b\"y\")\nfn f() -> Unit = handle { g() } with { net.close[c]() -> () }",
         ),
@@ -2813,7 +2839,7 @@ test "the operations a called definition performs count, through any number of c
     [b"E0305"],
   );
   let diags = check_diags(
-    net_src(
+    with_net_effect(
       calls.concat(b"fn f() -> Unit = handle { relay(b\"x\") } with { net.recv[c](n) -> b\"\" }"),
     ),
   );
@@ -2826,7 +2852,7 @@ test "the operations a called definition performs count, through any number of c
 }
 
 test "an operation a definition handles itself does not reach its callers' handles" {
-  let src = net_src(
+  let src = with_net_effect(
     b"fn quiet() -> Unit / {net.close[c]} = { handle { net.send[c](b\"x\") } with { net.send[c](p) -> () }; net.close[c]() }\nfn f() -> Unit = handle { quiet() } with { net.close[c]() -> () }",
   );
   assert_eq(check_codes(src), [])
@@ -2836,7 +2862,7 @@ test "a handle over a function value or a lambda is judged by its type" {
   let all = b"net.send[c](p) -> (), net.recv[c](n) -> b\"\", net.close[c]() -> ()";
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn run(f: () -> Unit / {net.write[c]}) -> Unit = handle { f() } with { net.recv[c](n) -> b\"\" }",
       ),
     ),
@@ -2844,7 +2870,7 @@ test "a handle over a function value or a lambda is judged by its type" {
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         Bytes::concat_all([
           b"fn run(f: () -> Unit / {net.write[c]}) -> Unit = handle { f() } with { ",
           all,
@@ -2856,16 +2882,16 @@ test "a handle over a function value or a lambda is judged by its type" {
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn run(f: () -> Unit / {net.send[c]}) -> Unit = handle { f() } with { net.send[c](p) -> () }",
       ),
     ),
     [],
   );
   let folded = b"fn f() -> Int = handle { [1, 2].fold(0, |acc: Int, x: Int| { net.send[c](b\"x\"); acc + x }) } with { ";
-  assert_eq(check_codes(net_src(folded.concat(b"net.recv[c](n) -> b\"\" }"))), [b"E0305"]);
-  assert_eq(check_codes(net_src(folded.concat(b"net.send[c](p) -> () }"))), []);
-  let diags = check_diags(net_src(folded.concat(b"net.recv[c](n) -> b\"\" }")));
+  assert_eq(check_codes(with_net_effect(folded.concat(b"net.recv[c](n) -> b\"\" }"))), [b"E0305"]);
+  assert_eq(check_codes(with_net_effect(folded.concat(b"net.send[c](p) -> () }"))), []);
+  let diags = check_diags(with_net_effect(folded.concat(b"net.recv[c](n) -> b\"\" }")));
   assert_eq(diags.map(|diag: Diag| diag.message), [
     b"this `handle` has no clause for `net.send[c]`, which its body performs",
   ]);
@@ -2895,7 +2921,7 @@ test "a handle answers what a row it holds comes to, even where that row is solv
 test "a callee written with a mode atom may perform any of its operations, so every one needs a clause" {
   let calls = b"fn relay(p: Bytes) -> Unit / {net.write[c]} = net.send[c](p)\n";
   let diags = check_diags(
-    net_src(
+    with_net_effect(
       calls.concat(b"fn f() -> Unit = handle { relay(b\"x\") } with { net.send[c](p) -> () }"),
     ),
   );
@@ -2917,7 +2943,7 @@ test "a callee written with a mode atom may perform any of its operations, so ev
   ]);
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         calls.concat(
           b"fn f() -> Unit = handle { relay(b\"x\") } with { net.send[c](p) -> (), net.recv[c](n) -> b\"\", net.close[c]() -> () }",
         ),
@@ -2927,7 +2953,7 @@ test "a callee written with a mode atom may perform any of its operations, so ev
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         calls.concat(
           b"fn f() -> Unit / {net.write[c]} = handle { relay(b\"x\") } with { net.send[c](p) -> () }",
         ),
@@ -2937,7 +2963,7 @@ test "a callee written with a mode atom may perform any of its operations, so ev
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         calls.concat(
           b"fn f() -> Int / {net.write[c]} = handle { relay(b\"x\"); 1 } with { net.peek[c]() -> 1 }",
         ),
@@ -2950,7 +2976,7 @@ test "a callee written with a mode atom may perform any of its operations, so ev
 test "an operation the written row keeps is forwarded rather than missing" {
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Unit / {net.write[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.send[c](p) -> () }",
       ),
     ),
@@ -2958,7 +2984,7 @@ test "an operation the written row keeps is forwarded rather than missing" {
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Unit / {net.read[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.send[c](p) -> () }",
       ),
     ),
@@ -2967,7 +2993,7 @@ test "an operation the written row keeps is forwarded rather than missing" {
 }
 
 test "the missing clause is named as the module would write it" {
-  let src = net_src(
+  let src = with_net_effect(
     b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }",
   );
   let diags = check_diags(src);
@@ -2990,20 +3016,27 @@ test "the missing clause is named as the module would write it" {
 }
 
 test "a written row may name an operation, which permits that operation alone" {
-  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")")), []);
-  assert_eq(check_codes(net_src(b"fn f() -> Bytes / {net.send[c]} = net.recv[c](4)")), [b"E0302"]);
+  assert_eq(
+    check_codes(with_net_effect(b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")")),
+    [],
+  );
+  assert_eq(check_codes(with_net_effect(b"fn f() -> Bytes / {net.send[c]} = net.recv[c](4)")), [
+    b"E0302",
+  ]);
   assert_eq(
     check_codes(
-      net_src(b"fn f() -> Bytes / {net.write[c]} = { net.send[c](b\"x\"); net.recv[c](4) }"),
+      with_net_effect(
+        b"fn f() -> Bytes / {net.write[c]} = { net.send[c](b\"x\"); net.recv[c](4) }",
+      ),
     ),
     [],
   );
-  assert_eq(check_codes(net_src(b"fn f() -> Int / {net.peek[c]} = net.peek[c]()")), []);
-  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.emit[c]} = ()")), [b"E0104"])
+  assert_eq(check_codes(with_net_effect(b"fn f() -> Int / {net.peek[c]} = net.peek[c]()")), []);
+  assert_eq(check_codes(with_net_effect(b"fn f() -> Unit / {net.emit[c]} = ()")), [b"E0104"])
 }
 
 test "an operation the written row does not name is refused by name, with the atom to add" {
-  let src = net_src(b"fn f() -> Bytes / {net.send[c]} = net.recv[c](4)");
+  let src = with_net_effect(b"fn f() -> Bytes / {net.send[c]} = net.recv[c](4)");
   let diags = check_diags(src);
   assert_eq(diags.map(|diag: Diag| diag.message), [
     b"effect not permitted by the signature of `f`: `m.net.recv[c]`",
@@ -3021,14 +3054,14 @@ test "an operation the written row does not name is refused by name, with the at
 }
 
 test "a function that writes no `/` performs nothing, and one whose body does is given its row" {
-  let src = net_src(b"fn f() -> Bytes = net.recv[c](4)");
+  let src = with_net_effect(b"fn f() -> Bytes = net.recv[c](4)");
   let diags = check_diags(src);
   assert_eq(diags.map(|diag: Diag| diag.message), [
     b"`f` writes no `/`, so its row is empty, and its body performs effects",
   ]);
   let fixes = fixes_of(diags);
   assert_eq(fixes.map(|fix: Fix| fix.title), [b"write the row `/ {net.recv[c]}`"]);
-  let written = net_src(b"fn f() -> Bytes / {net.recv[c]} = net.recv[c](4)");
+  let written = with_net_effect(b"fn f() -> Bytes / {net.recv[c]} = net.recv[c](4)");
   assert_eq(fixes.map(|fix: Fix| fixed_by(src, fix)), [written]);
   assert_eq(check_codes(written), []);
   let forwards = b"fn apply<| e>(f: () -> Int / e) -> Int = f()";
@@ -3042,7 +3075,7 @@ test "a function that writes no `/` performs nothing, and one whose body does is
 }
 
 test "the row a fix writes names a set wherever the row holds the whole of it" {
-  let src = net_src(
+  let src = with_net_effect(
     b"effect set Io = {net.send[c], net.peek[c]}\nfn a() -> Int / {Io} = 1\nfn b() -> Int = a()\nfn c() -> Int = net.peek[c]()",
   );
   assert_eq(fixes_of(check_diags(src)).map(|fix: Fix| fix.title), [
@@ -3050,11 +3083,11 @@ test "the row a fix writes names a set wherever the row holds the whole of it" {
     b"write the row `/ {net.peek[c]}`",
   ]);
   // An operation a named set's mode atom covers is not written again.
-  let modes = net_src(
+  let modes = with_net_effect(
     b"effect set Wire = {net.write[c], net.read[c]}\nfn a() -> Int / {Wire} = 1\nfn b() -> Int = { net.send[c](b\"x\"); a() }",
   );
   assert_eq(fixes_of(check_diags(modes)).map(|fix: Fix| fix.title), [b"write the row `/ {Wire}`"]);
-  let covered = net_src(
+  let covered = with_net_effect(
     b"fn a() -> Int / {net.write[c]} = 1\nfn b() -> Int = { net.send[c](b\"x\"); a() }",
   );
   assert_eq(fixes_of(check_diags(covered)).map(|fix: Fix| fix.title), [
@@ -3068,7 +3101,7 @@ test "a row variable nothing constrains closes on an unwritten row, and only a p
 }
 
 test "a caller is checked against what an overrunning body performs, so one check names each row" {
-  let src = net_src(
+  let src = with_net_effect(
     b"fn leaf() -> Bytes = net.recv[c](4)\nfn mid() -> Bytes = leaf()\nfn top() -> Bytes / {net.recv[c]} = mid()",
   );
   let diags = check_diags(src);
@@ -3088,11 +3121,17 @@ test "a caller is checked against what an overrunning body performs, so one chec
 test "a caller's mode atom covers a callee's operation atom, and not the reverse" {
   let narrow = b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n";
   let wide = b"fn f() -> Unit / {net.write[c]} = net.send[c](b\"x\")\n";
-  assert_eq(check_codes(net_src(narrow.concat(b"fn g() -> Unit / {net.write[c]} = f()"))), []);
-  assert_eq(check_codes(net_src(narrow.concat(b"fn g() -> Unit / {net.send[c]} = f()"))), []);
+  assert_eq(
+    check_codes(with_net_effect(narrow.concat(b"fn g() -> Unit / {net.write[c]} = f()"))),
+    [],
+  );
+  assert_eq(
+    check_codes(with_net_effect(narrow.concat(b"fn g() -> Unit / {net.send[c]} = f()"))),
+    [],
+  );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         narrow.concat(
           b"fn g() -> Unit / {net.send[c]} = f()\nfn h() -> Unit / {net.write[c]} = g()",
         ),
@@ -3100,7 +3139,7 @@ test "a caller's mode atom covers a callee's operation atom, and not the reverse
     ),
     [],
   );
-  let diags = check_diags(net_src(wide.concat(b"fn g() -> Unit / {net.send[c]} = f()")));
+  let diags = check_diags(with_net_effect(wide.concat(b"fn g() -> Unit / {net.send[c]} = f()")));
   assert_eq(diags.map(|diag: Diag| diag.code), [b"E0302"]);
   assert_eq(diags.map(|diag: Diag| diag.labels.map(|label: Label| label.text)), [
     [
@@ -3115,13 +3154,15 @@ test "a clause for an operation discharges that operation's atom" {
   let narrow = b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n";
   assert_eq(
     check_codes(
-      net_src(narrow.concat(b"fn g() -> Unit / {} = handle { f() } with { net.send[c](p) -> () }")),
+      with_net_effect(
+        narrow.concat(b"fn g() -> Unit / {} = handle { f() } with { net.send[c](p) -> () }"),
+      ),
     ),
     [],
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         narrow.concat(b"fn g() -> Unit / {} = handle { f() } with { net.recv[c](n) -> b\"\" }"),
       ),
     ),
@@ -3129,7 +3170,7 @@ test "a clause for an operation discharges that operation's atom" {
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Unit / {net.send[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.close[c]() -> () }",
       ),
     ),
@@ -3137,7 +3178,7 @@ test "a clause for an operation discharges that operation's atom" {
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> Unit / {net.close[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.close[c]() -> () }",
       ),
     ),
@@ -3186,7 +3227,7 @@ test "a clause reads what its continuation answers at the type the `handle`'s bo
   )
 }
 
-fn raising(rest: Bytes) -> List<Bytes> / {abort.raise} =
+fn raise_codes(rest: Bytes) -> List<Bytes> / {abort.raise} =
   check_codes(
     b"effect p { raise bad(n: Int) raise eof() read get() -> Int }\nfn digit(b: Int) -> Int / {p.bad} = if b < 48 { p.bad(b) } else { b - 48 }\nfn end() -> Int / {p.eof} = p.eof()\n".concat(
       rest,
@@ -3194,59 +3235,72 @@ fn raising(rest: Bytes) -> List<Bytes> / {abort.raise} =
   )
 
 test "a `raise` operation is in the row, and its clause answers for the whole `handle`" {
-  assert_eq(raising(b"fn f(b: Int) -> Int / {} = digit(b)"), [b"E0302"]);
-  assert_eq(raising(b"fn f(b: Int) -> Int / {p.read} = digit(b)"), [b"E0302"]);
+  assert_eq(raise_codes(b"fn f(b: Int) -> Int / {} = digit(b)"), [b"E0302"]);
+  assert_eq(raise_codes(b"fn f(b: Int) -> Int / {p.read} = digit(b)"), [b"E0302"]);
   assert_eq(
-    raising(
+    raise_codes(
       b"fn f(b: Int) -> Result<Int, Int> / {} = handle { digit(b) } with { p.bad(n) -> Err(n), return v -> Ok(v) }",
     ),
     [],
   );
   assert_eq(
-    raising(b"fn f(b: Int) -> Int / {} = handle { digit(b) } with { p.bad(n) -> \"x\" }"),
+    raise_codes(b"fn f(b: Int) -> Int / {} = handle { digit(b) } with { p.bad(n) -> \"x\" }"),
     [b"E0201"],
   );
   assert_eq(
-    raising(b"fn f(b: Int) -> Int / {} = handle { digit(b) } with { p.bad(n) resume k -> 0 }"),
+    raise_codes(b"fn f(b: Int) -> Int / {} = handle { digit(b) } with { p.bad(n) resume k -> 0 }"),
     [b"E0201"],
   );
-  assert_eq(raising(b"fn f() -> String / {p.eof} = p.eof()"), [])
+  assert_eq(raise_codes(b"fn f() -> String / {p.eof} = p.eof()"), [])
 }
 
 test "a clause for one raise leaves the effect's other operations to the row" {
   assert_eq(
-    raising(b"fn f(b: Int) -> Int / {p.eof} = handle { digit(b) + end() } with { p.bad(n) -> n }"),
+    raise_codes(
+      b"fn f(b: Int) -> Int / {p.eof} = handle { digit(b) + end() } with { p.bad(n) -> n }",
+    ),
     [],
   );
   assert_eq(
-    raising(b"fn f(b: Int) -> Int / {p.bad} = handle { digit(b) + p.get() } with { p.get() -> 1 }"),
+    raise_codes(
+      b"fn f(b: Int) -> Int / {p.bad} = handle { digit(b) + p.get() } with { p.get() -> 1 }",
+    ),
     [],
   );
   assert_eq(
-    raising(b"fn f(b: Int) -> Int / {} = handle { digit(b) + end() } with { p.bad(n) -> n }"),
+    raise_codes(b"fn f(b: Int) -> Int / {} = handle { digit(b) + end() } with { p.bad(n) -> n }"),
     [b"E0302"],
   )
 }
 
 test "a `try` answers the one raise its body's row names, as an `Err` of what it carried" {
-  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {} = try { digit(b) }"), []);
-  assert_eq(raising(b"fn f() -> Result<Int, Unit> / {} = try { end() }"), []);
-  assert_eq(raising(b"fn f(b: Int) -> Result<Int, String> / {} = try { digit(b) }"), [b"E0201"]);
-  assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try { 1 }"), [b"E0311"]);
+  assert_eq(raise_codes(b"fn f(b: Int) -> Result<Int, Int> / {} = try { digit(b) }"), []);
+  assert_eq(raise_codes(b"fn f() -> Result<Int, Unit> / {} = try { end() }"), []);
+  assert_eq(raise_codes(b"fn f(b: Int) -> Result<Int, String> / {} = try { digit(b) }"), [
+    b"E0201",
+  ]);
+  assert_eq(raise_codes(b"fn f() -> Result<Int, Int> / {} = try { 1 }"), [b"E0311"]);
   assert_eq(
-    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {abort.raise} = try { 1 / xs.len() }"),
+    raise_codes(
+      b"fn f(xs: List<Int>) -> Result<Int, String> / {abort.raise} = try { 1 / xs.len() }",
+    ),
     [b"E0311"],
   );
   assert_eq(
-    raising(b"fn f(xs: List<Int>) -> Result<Int, String> / {} = try[abort.raise] { 1 / xs.len() }"),
+    raise_codes(
+      b"fn f(xs: List<Int>) -> Result<Int, String> / {} = try[abort.raise] { 1 / xs.len() }",
+    ),
     [],
   );
-  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {abort.raise} = try { digit(b) / b }"), [])
+  assert_eq(
+    raise_codes(b"fn f(b: Int) -> Result<Int, Int> / {abort.raise} = try { digit(b) / b }"),
+    [],
+  )
 }
 
 test "a `?` inside a `handle` leaves the function with the failure it unwraps, held to what the function answers" {
   let parsed = b"fn parsed(b: Int) -> Result<Int, Int> = if b < 48 { Err(b) } else { Ok(b - 48) }\n";
-  let at = |rest: Bytes| raising(parsed.concat(rest));
+  let at = |rest: Bytes| raise_codes(parsed.concat(rest));
   // The exit is the function's own, so it leaves nothing in its row.
   assert_eq(
     at(
@@ -3274,23 +3328,25 @@ test "a `?` inside a `handle` leaves the function with the failure it unwraps, h
 
 test "a named `try` answers a raise its body's row names, and never what a row variable carries" {
   assert_eq(
-    raising(b"fn f<| e>(g: () -> Int / e) -> Result<Int, Unit> / e = try[p.eof] { g() }"),
+    raise_codes(b"fn f<| e>(g: () -> Int / e) -> Result<Int, Unit> / e = try[p.eof] { g() }"),
     [b"E0311"],
   );
   assert_eq(
-    raising(b"fn f<| e>(g: () -> Int / {p.eof | e}) -> Result<Int, Unit> / e = try[p.eof] { g() }"),
+    raise_codes(
+      b"fn f<| e>(g: () -> Int / {p.eof | e}) -> Result<Int, Unit> / e = try[p.eof] { g() }",
+    ),
     [],
   );
   // A lambda parameter's row is solved where the lambda is applied, and holds what the `try` answers.
   assert_eq(
-    raising(
+    raise_codes(
       b"fn f() -> Result<Int, Unit> / {} = { let run = |g| try[p.eof] { g() }; run(|| end()) }",
     ),
     [],
   )
 }
 
-fn tallied(rest: Bytes) -> List<Bytes> / {abort.raise} =
+fn tally_codes(rest: Bytes) -> List<Bytes> / {abort.raise} =
   check_codes(
     b"effect tally { write add(n: Int) -> Unit read total() -> Int }\nfn run(xs: List<Int>) -> Int / {tally.add, tally.total} = { xs.fold((), |u: Unit, x: Int| tally.add(x)); tally.total() }\n".concat(
       rest,
@@ -3299,39 +3355,39 @@ fn tallied(rest: Bytes) -> List<Bytes> / {abort.raise} =
 
 test "a handler's variables are typed by their first values, and a clause assigns them in its branches" {
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, var big: Bool = false, tally.add(n) -> { sum = sum + n; if n > 9 { big = true } }, tally.total() -> if big { 0 } else { sum } }",
     ),
     [],
   );
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { sum = \"no\" }, tally.total() -> sum }",
     ),
     [b"E0201"],
   );
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum: Int = \"no\", tally.add(n) -> (), tally.total() -> sum }",
     ),
     [b"E0201"],
   );
   // What making a variable performs is the `handle`'s, which the handler's own clauses do not answer.
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int / {} = handle { run(xs) } with { var sum = tally.total(), tally.add(n) -> (), tally.total() -> sum }",
     ),
     [b"E0302"],
   );
   // Each first value sees the variables above it, and none of them twice.
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(n: Bool) -> Int = handle { run([]) } with { var n = 10, var m = n + 1, tally.add(k) -> (), tally.total() -> m }",
     ),
     [],
   );
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var n = 0, var n = 1, tally.add(k) -> (), tally.total() -> n }",
     ),
     [b"E0105"],
@@ -3341,7 +3397,7 @@ test "a handler's variables are typed by their first values, and a clause assign
 test "only a variable of the handler whose clause it is in is assigned" {
   // A body sees none of its handler's variables.
   assert(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { sum = 1; run(xs) } with { var sum = 0, tally.add(n) -> (), tally.total() -> sum }",
     ).contains(
       b"E0314",
@@ -3349,49 +3405,49 @@ test "only a variable of the handler whose clause it is in is assigned" {
   );
   // A parameter or a `let` of the variable's name hides it.
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var n = 0, tally.add(n) -> { n = 1 }, tally.total() -> n }",
     ),
     [b"E0314"],
   );
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { let sum = 2; sum = n }, tally.total() -> sum }",
     ),
     [b"E0314"],
   );
   // An inner handler's clause assigns its own variables, not those of a handler around it.
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { handle { run([n]) } with { var m = 0, tally.add(k) -> { sum = k }, tally.total() -> m }; () }, tally.total() -> sum }",
     ),
     [b"E0314"],
   );
-  assert_eq(tallied(b"fn f(n: Int) -> Int = { n = 2; n }"), [b"E0314"])
+  assert_eq(tally_codes(b"fn f(n: Int) -> Int = { n = 2; n }"), [b"E0314"])
 }
 
 test "a clause does not assign its handler's variables where what runs may run after it returns" {
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { let g = || { sum = n }; g() }, tally.total() -> sum }",
     ),
     [b"E0315"],
   );
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { handle { sum = n; run([n]) } with { tally.add(k) -> (), tally.total() -> 0 }; () }, tally.total() -> sum }",
     ),
     [b"E0315"],
   );
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> (), tally.total() -> sum, return x -> { sum = x; sum } }",
     ),
     [b"E0315"],
   );
   // A lambda reads them.
   assert_eq(
-    tallied(
+    tally_codes(
       b"fn f(xs: List<Int>) -> Int = handle { run(xs) } with { var sum = 0, tally.add(n) -> { let g = || sum + n; sum = g() }, tally.total() -> sum }",
     ),
     [],
@@ -3399,18 +3455,21 @@ test "a clause does not assign its handler's variables where what runs may run a
 }
 
 test "a `try` over several raises names the one it answers, and the others stay in the row" {
-  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {} = try { digit(b) + end() }"), [
+  assert_eq(raise_codes(b"fn f(b: Int) -> Result<Int, Int> / {} = try { digit(b) + end() }"), [
     b"E0312",
   ]);
   assert_eq(
-    raising(b"fn f(b: Int) -> Result<Int, Int> / {p.eof} = try[p.bad] { digit(b) + end() }"),
+    raise_codes(b"fn f(b: Int) -> Result<Int, Int> / {p.eof} = try[p.bad] { digit(b) + end() }"),
     [],
   );
-  assert_eq(raising(b"fn f(b: Int) -> Result<Int, Int> / {} = try[p.bad] { digit(b) + end() }"), [
-    b"E0302",
+  assert_eq(
+    raise_codes(b"fn f(b: Int) -> Result<Int, Int> / {} = try[p.bad] { digit(b) + end() }"),
+    [b"E0302"],
+  );
+  assert_eq(raise_codes(b"fn f() -> Result<Int, Int> / {p.get} = try[p.get] { p.get() }"), [
+    b"E0313",
   ]);
-  assert_eq(raising(b"fn f() -> Result<Int, Int> / {p.get} = try[p.get] { p.get() }"), [b"E0313"]);
-  assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try[p.nope] { 1 }"), [b"E0104"])
+  assert_eq(raise_codes(b"fn f() -> Result<Int, Int> / {} = try[p.nope] { 1 }"), [b"E0104"])
 }
 
 test "a raise is in the row, and a clause for it discharges it" {
@@ -3700,7 +3759,7 @@ test "what a call that can raise ensures of its answer holds only past the call"
         checked_cx(b"fn f(b: Bytes, i: Int, n: Int) -> Int / {abort.raise} = ".concat(body)),
         b"m.f",
       ) {
-      Some(d) -> d.raises.map(|r: Raise| r.why),
+      Some(d) -> d.raises.map(|r: Raise| r.reason),
       None -> [],
     };
   // A scan that answered started inside the bytes, which says nothing where it never ran.
@@ -3709,15 +3768,15 @@ test "what a call that can raise ensures of its answer holds only past the call"
       b"if n > 0 { let stop = b.scan(i, b\" \", 0); stop } else if i >= 0 { b.slice(i, b.len()).len() } else { 0 }",
     ),
     [
-      Unshown({ callee: b"Bytes::scan", needs: b"0 <= from" }),
-      Unshown({ callee: b"Bytes::slice", needs: b"start <= end" }),
+      RequirementNotShown({ callee: b"Bytes::scan", needs: b"0 <= from" }),
+      RequirementNotShown({ callee: b"Bytes::slice", needs: b"start <= end" }),
     ],
   );
   assert_eq(
     unshown(
       b"if i < 0 { 0 } else { let stop = b.scan(i, b\" \", 0); b.slice(i, stop).len() + b.slice(i, b.len()).len() }",
     ),
-    [Unshown({ callee: b"Bytes::scan", needs: b"from <= Bytes::len(hay)" })],
+    [RequirementNotShown({ callee: b"Bytes::scan", needs: b"from <= Bytes::len(hay)" })],
   )
 }
 
@@ -3726,11 +3785,11 @@ test "a body's raises are filed with why each was kept, and a group that raises 
     b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = if i < b.len() { b.at(i) } else { 0 }\nfn both(b: Bytes, n: Int) -> Int / {abort.raise} = at(b, n) + at(b, 0) + 7 / n + panic(\"no\")\nfn walk(b: Bytes, i: Int) -> Int / {abort.raise} = if i < 0 || i >= b.len() { 0 } else { b.at(i) + walk(b, i + 1) }\nfn each(b: Bytes, f: (Int) -> Int / {abort.raise}) -> Int / {abort.raise} = range(0, b.len()).fold(0, |acc: Int, k: Int| acc + f(b.at(k)))\n",
   );
   let raises = |name: Bytes|
-    match def_of(out, name) { Some(d) -> d.raises.map(|r: Raise| r.why), None -> [] };
-  assert_eq(raises(b"m.at"), [Unshown({ callee: b"Bytes::at", needs: b"0 <= i" })]);
-  assert_eq(raises(b"m.both"), [Calls(b"m.at"), ZeroDivisor, Unguarded(b"panic")]);
+    match def_of(out, name) { Some(d) -> d.raises.map(|r: Raise| r.reason), None -> [] };
+  assert_eq(raises(b"m.at"), [RequirementNotShown({ callee: b"Bytes::at", needs: b"0 <= i" })]);
+  assert_eq(raises(b"m.both"), [RaisingCall(b"m.at"), ZeroDivisor, UnguardedBuiltin(b"panic")]);
   assert_eq(raises(b"m.walk"), []);
-  assert_eq(raises(b"m.each"), [Handed]);
+  assert_eq(raises(b"m.each"), [RaisingFunctionValue]);
   let performed = |name: Bytes|
     match def_of(out, name) { Some(d) -> d.performed.len(), None -> 0 - 1 };
   assert_eq(performed(b"m.walk"), 0);
@@ -3879,14 +3938,16 @@ test "a `const fn` answers a value a process can keep" {
 
 test "a body that performs more than its signature permits is refused" {
   assert_eq(
-    placed(b"effect log { write emit(Bytes) -> Unit }\nfn quiet() -> Unit / {} = log.emit(b\"x\")"),
+    labelled_diagnostics(
+      b"effect log { write emit(Bytes) -> Unit }\nfn quiet() -> Unit / {} = log.emit(b\"x\")",
+    ),
     [[b"E0302", b"log.emit(b\"x\")", b"{}"]],
   )
 }
 
 test "a function that performs is refused where a pure one is expected" {
   assert_eq(
-    placed(
+    labelled_diagnostics(
       b"effect log { write emit(Bytes) -> Unit }\nfn noisy(x: Int) -> Int / { log.write } = { log.emit(b\"x\"); x }\nfn apply(f: (Int) -> Int) -> Int = f(1)\nfn go() -> Int = apply(noisy)",
     ),
     [[b"E0302", b"noisy"]],
@@ -3894,7 +3955,9 @@ test "a function that performs is refused where a pure one is expected" {
 }
 
 test "an operator over a lambda parameter nothing types is refused" {
-  assert_eq(placed(b"fn f() -> Bool = { let g = |x| x + x; true }"), [[b"E0210", b"x + x"]])
+  assert_eq(labelled_diagnostics(b"fn f() -> Bool = { let g = |x| x + x; true }"), [
+    [b"E0210", b"x + x"],
+  ])
 }
 
 test "a test's footprint holds the row of what it calls and the operation it performs itself" {
@@ -3917,7 +3980,7 @@ test "a function parameter's types and row generalize" {
 
 /// The constraints a check publishes for the definition `name`, each its deriver and the type
 /// parameter it is on.
-fn published(c: Checker, name: Bytes) -> List<Bytes> / {abort.raise} =
+fn constraints_of(c: Checker, name: Bytes) -> List<Bytes> / {abort.raise} =
   info_of(c, name).constraints.map(|d: DefConstraint|
     deriver_text(d.deriver).concat(ascii_of_int(d.param)))
 
@@ -3925,12 +3988,12 @@ test "a derivable constraint is published on the type parameter it names" {
   let c = checker_m(
     b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = m.len()\nfn used() -> Int = show(2) + keyed(Map::new())",
   );
-  assert_eq(published(c, b"m.show"), [b"eq0"]);
-  assert_eq(published(c, b"m.keyed"), [b"ord0"]);
-  assert_eq(published(c, b"m.used"), []);
+  assert_eq(constraints_of(c, b"m.show"), [b"eq0"]);
+  assert_eq(constraints_of(c, b"m.keyed"), [b"ord0"]);
+  assert_eq(constraints_of(c, b"m.used"), []);
   // Implied by the `Map` the signature names, it is published as though written.
   assert_eq(
-    published(checker_m(b"pub fn keyed<k, v>(m: Map<k, v>) -> Int = m.len()"), b"m.keyed"),
+    constraints_of(checker_m(b"pub fn keyed<k, v>(m: Map<k, v>) -> Int = m.len()"), b"m.keyed"),
     [b"ord0"],
   )
 }
@@ -3965,7 +4028,7 @@ test "a program checked from its own published interfaces publishes the same thi
 
 test "a spec clause that reaches an effect through a call is refused at the call" {
   assert_eq(
-    placed(
+    labelled_diagnostics(
       b"effect log { write emit(Bytes) -> Unit }\nfn noisy() -> Bool / { log.write } = { log.emit(b\"x\"); true }\nfn f(x: Int) -> Int requires noisy() = x",
     ),
     [[b"E0417", b"noisy()", b"requires noisy()"]],
@@ -3974,7 +4037,7 @@ test "a spec clause that reaches an effect through a call is refused at the call
 
 test "functions cannot be compared and a Float cannot key a Map, judged once the module is solved" {
   assert_eq(
-    placed(
+    labelled_diagnostics(
       b"fn keyed() -> Map<Float, Int> = Map::new()\nfn same(f: (Int) -> Int, g: (Int) -> Int) -> Bool = f == g",
     ),
     [[b"E0201", b"f == g"], [b"E0206", b"Map<Float, Int>"]],
@@ -4199,11 +4262,11 @@ test "a `simulate` region keeps its own tasks, a name it shadows, and a function
   )
 }
 
-fn noted(body: Bytes) -> Bytes =
+fn with_note_effect(body: Bytes) -> Bytes =
   b"effect note { read say() -> Int }\nfn work() -> Int / {note.read} = note.say()\n".concat(body)
 
 test "a task reaching a younger region's hold through a handler around its spawn is refused" {
-  let leak = noted(
+  let leak = with_note_effect(
     b"fn leak() -> Task<Int> / {task.write} = with_hold[s](5, |x: Int| ()) { c -> handle { task.spawn(|| work()) } with { note.say() -> c.get() } }",
   );
   assert_eq(refusals(leak), [
@@ -4215,7 +4278,7 @@ test "a task reaching a younger region's hold through a handler around its spawn
   ]);
   assert_eq(
     check_codes(
-      noted(
+      with_note_effect(
         b"fn cycle() -> Int / {sim.read, abort.raise} = simulate { with_hold[s](5, |x: Int| ()) { c -> handle { task.join(task.spawn(|| work())) } with { note.say() -> c.get() } } }",
       ),
     ),
@@ -4226,7 +4289,7 @@ test "a task reaching a younger region's hold through a handler around its spawn
 test "a handler around a spawn may answer from a hold the task cannot outlive, or for the spawner alone" {
   assert_eq(
     check_codes(
-      noted(
+      with_note_effect(
         b"fn kept() -> Task<Int> / {task.write} = with_hold[s](5, |x: Int| ()) { c -> handle { task.spawn(|| work()) } with { note.say() -> 7 } }",
       ),
     ),
@@ -4234,7 +4297,7 @@ test "a handler around a spawn may answer from a hold the task cannot outlive, o
   );
   assert_eq(
     check_codes(
-      noted(
+      with_note_effect(
         b"fn root() -> Int / {task.write, abort.raise} = with_hold[s](5, |x: Int| ()) { c -> handle { let t = task.spawn(|| 1); note.say() + task.join(t) } with { note.say() -> c.get() } }",
       ),
     ),
@@ -4242,7 +4305,7 @@ test "a handler around a spawn may answer from a hold the task cannot outlive, o
   );
   assert_eq(
     check_codes(
-      noted(
+      with_note_effect(
         b"fn inside() -> Int / {sim.read, abort.raise} = with_hold[s](5, |x: Int| ()) { c -> simulate { handle { task.join(task.spawn(|| work())) } with { note.say() -> c.get() } } }",
       ),
     ),
@@ -4251,7 +4314,7 @@ test "a handler around a spawn may answer from a hold the task cannot outlive, o
   // A spawn a callee performs is judged where the callee opens regions of its own.
   assert_eq(
     check_codes(
-      noted(
+      with_note_effect(
         b"fn spawned(n: Int, running: List<Task<Int>>) -> List<Task<Int>> / {task.write, note.read} = if n <= 0 { running } else { spawned(n - 1, running.push(task.spawn(|| work()))) }\nfn joined(ts: List<Task<Int>>) -> Int / {task.write, abort.raise} = ts.fold(0, |n: Int, t: Task<Int>| n + task.join(t))\nfn serve() -> Int / {task.write, abort.raise} = with_hold[store](1, |x: Int| ()) { c -> handle { joined(spawned(2, [])) } with { note.say() -> c.get() } }",
       ),
     ),
@@ -4261,7 +4324,7 @@ test "a handler around a spawn may answer from a hold the task cannot outlive, o
 
 test "a call instantiating a constrained parameter with a function is refused at the call" {
   let src = b"fn show<a>(x: a) -> String where derivable(hash, a) = \"\"\nfn bad() -> String = show(|y: Int| y)";
-  assert_eq(placed(src), [[b"E0206", b"show", src.slice(0, 56)]])
+  assert_eq(labelled_diagnostics(src), [[b"E0206", b"show", src.slice(0, 56)]])
 }
 
 /// Each error a program raises, in the order the checker reports them.
@@ -4273,10 +4336,10 @@ fn errors_across(sources: List<Source>) -> List<Diag> / {abort.raise} = {
     let d: Expansion = expand_derives(i, s.name, x.module);
     { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
-  let early = parsed.fold([], |acc: List<Diag>, p: Parsed| acc.concat(p.diags));
+  let early = parsed.fold([], |acc: List<Diag>, p: ExpandedSource| acc.concat(p.diags));
   if early.len() > 0 { early } else {
     match resolve_modules(
-        parsed.map(|p: Parsed| { name: p.name, module: p.module, derived: p.derived }),
+        parsed.map(|p: ExpandedSource| { name: p.name, module: p.module, derived: p.derived }),
       ) {
       ResolveFailed(ds) -> ds,
       ResolveSucceeded(x) ->
@@ -4679,13 +4742,15 @@ test "a `parallel` block is the tuple of its branches, and branches may share wh
   assert_eq(check_codes(b"fn f(n: Int) -> (Bool, Int) = parallel { n + 1, n > 0 }"), [b"E0201"]);
   assert_eq(
     check_codes(
-      net_src(b"fn f() -> (Int, Int) / {net.read[c]} = parallel { net.peek[c](), net.peek[c]() }"),
+      with_net_effect(
+        b"fn f() -> (Int, Int) / {net.read[c]} = parallel { net.peek[c](), net.peek[c]() }",
+      ),
     ),
     [],
   );
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f() -> (Unit, Int) / {net.write[c], net.read[d]} = parallel { net.close[c](), net.peek[d]() }",
       ),
     ),
@@ -4695,7 +4760,7 @@ test "a `parallel` block is the tuple of its branches, and branches may share wh
 
 test "two branches that touch one resource where either writes are refused" {
   let diags = check_diags(
-    net_src(
+    with_net_effect(
       b"fn f() -> (Unit, Int) / {net.write[c], net.read[c]} = parallel { net.close[c](), net.peek[c]() }",
     ),
   );
@@ -4709,7 +4774,7 @@ test "two branches that touch one resource where either writes are refused" {
   // A label parameter may be any label.
   assert_eq(
     check_codes(
-      net_src(
+      with_net_effect(
         b"fn f<[l]>() -> (Unit, Int) / {net.write[l], net.read[c]} = parallel { net.close[l](), net.peek[c]() }",
       ),
     ),
@@ -4747,7 +4812,7 @@ test "a branch may not open a `simulate` region, whose schedule is its entry's, 
 
 // --- How many times a body performs what its row names --------------------------------------
 
-fn db_source(body: Bytes) -> Bytes =
+fn with_db_effect(body: Bytes) -> Bytes =
   b"effect db { read query[c](sql: Bytes) -> Int }\nfn lookup(id: Int) -> Int / {db.query[conn]} = db.query[conn](b\"one\")\n".concat(
     body,
   )
@@ -4760,33 +4825,33 @@ fn counted(src: Bytes, name: Bytes) -> { scaling: Bool, repeats: List<Int> } / {
   }
 
 test "a lookup performs its query a bounded number of times, and the same lookup mapped over its input scales" {
-  assert_eq(counted(db_source(b""), b"lookup"), { scaling: false, repeats: [] });
-  let mapped = db_source(
+  assert_eq(counted(with_db_effect(b""), b"lookup"), { scaling: false, repeats: [] });
+  let mapped = with_db_effect(
     b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = ids.map(lookup)\n",
   );
   assert_eq(counted(mapped, b"all"), { scaling: true, repeats: [] });
-  let lambda = db_source(
+  let lambda = with_db_effect(
     b"fn all(ids: List<Int>) -> List<Int> / {db.query[conn]} = ids.map(|id: Int| lookup(id))\n",
   );
   assert_eq(counted(lambda, b"all"), { scaling: true, repeats: [] });
   // A list the text writes out is a size no input decides.
-  let three = db_source(
+  let three = with_db_effect(
     b"fn three() -> List<Int> / {db.query[conn]} = [1, 2, 3].map(|id: Int| lookup(id))\n",
   );
   assert_eq(counted(three, b"three"), { scaling: false, repeats: [] });
   // What a mapped callback evaluates once, before the iteration, does not scale with it.
-  let once = db_source(
+  let once = with_db_effect(
     b"fn first(ids: List<Int>) -> List<Int> / {db.query[conn]} = { let n = lookup(0); ids.map(|id: Int| id + n) }\n",
   );
   assert_eq(counted(once, b"first"), { scaling: false, repeats: [] })
 }
 
 test "recursion repeats everything its body performs, and a callback's count composes through its caller" {
-  let walked = db_source(
+  let walked = with_db_effect(
     b"fn walk(ids: List<Int>) -> Int / {db.query[conn]} = match ids { [] -> 0, [id, ..rest] -> lookup(id) + walk(rest) }\n",
   );
   assert_eq(counted(walked, b"walk"), { scaling: true, repeats: [] });
-  let each = db_source(
+  let each = with_db_effect(
     b"fn each<a | e>(xs: List<a>, f: (a) -> Unit / e) -> Unit / e = xs.fold((), |u: Unit, x: a| f(x))\nfn once<a | e>(f: () -> a / e) -> a / e = f()\nfn looked(ids: List<Int>) -> Unit / {db.query[conn]} = each(ids, |id: Int| { lookup(id); () })\nfn one() -> Int / {db.query[conn]} = once(|| lookup(1))\n",
   );
   assert_eq(counted(each, b"each"), { scaling: false, repeats: [1] });
@@ -4798,7 +4863,7 @@ test "recursion repeats everything its body performs, and a callback's count com
 test "a row's `bounded` promise is held to the body, and only a definition's own row makes one" {
   assert_eq(
     check_codes(
-      db_source(
+      with_db_effect(
         b"fn batched(ids: List<Int>) -> Int / {db.query[conn] bounded} = db.query[conn](b\"in\")\n",
       ),
     ),
@@ -4806,7 +4871,7 @@ test "a row's `bounded` promise is held to the body, and only a definition's own
   );
   assert_eq(
     check_codes(
-      db_source(
+      with_db_effect(
         b"fn per_item(ids: List<Int>) -> Int / {db.query[conn] bounded} = ids.fold(0, |n: Int, id: Int| n + lookup(id))\n",
       ),
     ),
@@ -4820,7 +4885,7 @@ test "a row's `bounded` promise is held to the body, and only a definition's own
   );
   assert_eq(
     check_codes(
-      db_source(
+      with_db_effect(
         b"fn take(f: () -> Int / {db.query[conn] bounded}) -> Int / {db.query[conn]} = f()\n",
       ),
     ),
@@ -5037,25 +5102,25 @@ fn declared_as(name: Bytes) -> Builtin / {abort.raise} =
 
 test "a builtin is what the prelude declares: its scheme, its parameters' names and its doc" {
   let slice = declared_as(b"Bytes::slice");
-  assert_eq(slice.params.map(|p: Passed| p.name), [b"b", b"start", b"end"]);
+  assert_eq(slice.params.map(|p: ParameterMode| p.name), [b"b", b"start", b"end"]);
   assert_eq(slice.doc, [b"Raises out of range."]);
   // A function parameter is lent to the native as to any function, unless written `keep`.
   assert_eq(declared_as(b"List::map").params, [
-    { name: b"xs", lent: false, keep: false },
-    { name: b"f", lent: true, keep: false },
+    { name: b"xs", borrowed: false, keep: false },
+    { name: b"f", borrowed: true, keep: false },
   ]);
   match parse(b"extern fn hold<a>(f: keep (a) -> a, g: (a) -> a) -> Unit\n").node.items {
-    [IExtern(d)] ->
-      assert_eq(declared(b"hold", Map::new(), d, Map::new()).params, [
-        { name: b"f", lent: false, keep: true },
-        { name: b"g", lent: true, keep: false },
+    [ExternItem(d)] ->
+      assert_eq(builtin_of_extern(b"hold", Map::new(), d, Map::new()).params, [
+        { name: b"f", borrowed: false, keep: true },
+        { name: b"g", borrowed: true, keep: false },
       ]),
     _ -> panic("one `extern fn`"),
   };
   assert_eq(slice.scheme, {
     ty_vars: [],
     row_vars: [],
-    kept_vars: [],
+    keep_variables: [],
     label_vars: [],
     ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
   });
@@ -5066,27 +5131,31 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
   assert_eq(declared_as(b"List::map").scheme, {
     ty_vars: [0, 1],
     row_vars: [0],
-    kept_vars: [],
+    keep_variables: [],
     label_vars: [],
     ty: fn_type(
-      [list_type(TyVar(0)), fn_type([TyVar(0)], TyVar(1), row_open(0))],
-      list_type(TyVar(1)),
+      [list_type(VariableType(0)), fn_type([VariableType(0)], VariableType(1), row_open(0))],
+      list_type(VariableType(1)),
       row_open(0),
     ),
   });
   assert_eq(
     declared_as(b"iterate").scheme.ty,
     fn_type(
-      [TyVar(0), int_type(), fn_type([TyVar(0)], iter_type(TyVar(0), TyVar(1)), row_open(0))],
-      TyVar(1),
+      [
+        VariableType(0),
+        int_type(),
+        fn_type([VariableType(0)], iter_type(VariableType(0), VariableType(1)), row_open(0)),
+      ],
+      VariableType(1),
       { atoms: [abort_atom()], tail: Some(0) },
     ),
   )
 }
 
 test "a declaration's `where` is what a call must show, by the parameter's place" {
-  assert_eq(declared_as(b"compare").constraints, [{ deriver: DOrd, param: 0 }]);
-  assert_eq(declared_as(b"numeric_of_int").constraints, [{ deriver: DNumeric, param: 0 }]);
+  assert_eq(declared_as(b"compare").constraints, [{ deriver: OrdDeriver, param: 0 }]);
+  assert_eq(declared_as(b"numeric_of_int").constraints, [{ deriver: NumericDeriver, param: 0 }]);
   assert_eq(declared_as(b"List::push").constraints, [])
 }
 
@@ -5149,12 +5218,12 @@ test "a shipped module's extern spelled with an alias of its own takes and answe
 }
 
 test "a shipped module's extern performs a mode of an effect it imports, as its callers then do" {
-  let asking = { name: b"std.asking", src: b"pub nondet effect asked {}\n" };
+  let with_ask_effect = { name: b"std.asking", src: b"pub nondet effect asked {}\n" };
   let native = {
     name: b"std.native",
     src: b"import std.asking (asked)\npub extern fn size() -> Int / {asked.read}\n",
   };
-  let codes = |src: Bytes| codes_of([asking, native, { name: b"m", src: src }]);
+  let codes = |src: Bytes| codes_of([with_ask_effect, native, { name: b"m", src: src }]);
   assert_eq(
     codes(
       b"import std.asking (asked)\nimport std.native (size)\nfn f() -> Int / {asked.read} = size()\n",
@@ -5228,7 +5297,7 @@ test "an `extern type` is its shipped module's, typed by its parameters, and not
     ]),
     [b"E0217"],
   );
-  let stated = |item: Bytes|
+  let measured_definitions = |item: Bytes|
     codes_of([
       {
         name: b"std.native",
@@ -5236,11 +5305,16 @@ test "an `extern type` is its shipped module's, typed by its parameters, and not
       },
       { name: b"m", src: b"fn f() -> Int = 1\n" },
     ]);
-  assert_eq(stated(b"fn shown_node(n: Node) -> String = \"n\"\nshow for Node by shown_node\n"), [
-    b"E0217",
-  ]);
   assert_eq(
-    stated(b"numeric for Node by { of_int: of_int }\nextern fn of_int(n: Int) -> Node\n"),
+    measured_definitions(
+      b"fn shown_node(n: Node) -> String = \"n\"\nshow for Node by shown_node\n",
+    ),
+    [b"E0217"],
+  );
+  assert_eq(
+    measured_definitions(
+      b"numeric for Node by { of_int: of_int }\nextern fn of_int(n: Int) -> Node\n",
+    ),
     [b"E0217"],
   );
   // A keyed sum's `==` compares its key, and a parameter no field holds holds nothing.
@@ -5680,25 +5754,37 @@ test "a row may write diverges, the atom of a call that may not return" {
 
 test "a numeric names a total function of its own sum for each operation, once" {
   let ops = b"fn add(a: N, b: N) -> N = a\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\nfn bad(a: N, b: N) -> N / {abort.raise} = panic(\"no\")\n";
-  let stated = |record: Bytes|
+  let measured_definitions = |record: Bytes|
     check_codes(
       Bytes::concat_all([b"type N = | N(Int)\n", ops, b"numeric for N by ", record, b"\n"]),
     );
   let all = b"{ add: add, sub: add, mul: add, neg: neg, of_int: of }";
-  assert_eq(stated(all), []);
-  assert_eq(stated(Bytes::concat_all([all, b"\nnumeric for N by ", all])), [b"E0105"]);
-  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg }"), [b"E0215"]);
-  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg, of_int: of, div: add }"), [
-    b"E0215",
+  assert_eq(measured_definitions(all), []);
+  assert_eq(measured_definitions(Bytes::concat_all([all, b"\nnumeric for N by ", all])), [
+    b"E0105",
   ]);
-  assert_eq(stated(b"{ add: add, add: add, sub: add, mul: add, neg: neg, of_int: of }"), [
-    b"E0215",
+  assert_eq(measured_definitions(b"{ add: add, sub: add, mul: add, neg: neg }"), [b"E0215"]);
+  assert_eq(
+    measured_definitions(b"{ add: add, sub: add, mul: add, neg: neg, of_int: of, div: add }"),
+    [b"E0215"],
+  );
+  assert_eq(
+    measured_definitions(b"{ add: add, add: add, sub: add, mul: add, neg: neg, of_int: of }"),
+    [b"E0215"],
+  );
+  assert_eq(measured_definitions(b"{ add: add, sub: add, mul: add, neg: neg, of_int: gone }"), [
+    b"E0101",
   ]);
-  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg, of_int: gone }"), [b"E0101"]);
   // Each operation has one shape, and a row that is empty: `a + b` gains none.
-  assert_eq(stated(b"{ add: neg, sub: add, mul: add, neg: neg, of_int: of }"), [b"E0218"]);
-  assert_eq(stated(b"{ add: add, sub: add, mul: add, neg: neg, of_int: neg }"), [b"E0218"]);
-  assert_eq(stated(b"{ add: bad, sub: add, mul: add, neg: neg, of_int: of }"), [b"E0218"]);
+  assert_eq(measured_definitions(b"{ add: neg, sub: add, mul: add, neg: neg, of_int: of }"), [
+    b"E0218",
+  ]);
+  assert_eq(measured_definitions(b"{ add: add, sub: add, mul: add, neg: neg, of_int: neg }"), [
+    b"E0218",
+  ]);
+  assert_eq(measured_definitions(b"{ add: bad, sub: add, mul: add, neg: neg, of_int: of }"), [
+    b"E0218",
+  ]);
   // The type is this module's own sum, and takes no parameter a value could not say.
   assert_eq(check_codes(b"numeric for Option by { add: f }\n"), [b"E0208"]);
   assert_eq(check_codes(b"type N = Int\nnumeric for N by { add: f }\n"), [b"E0217"]);
@@ -5830,8 +5916,10 @@ test "a key is stated once, by its type's own module, for a sum" {
 }
 
 test "the function a key or a show names takes the value alone and only answers" {
-  let over = |f: Bytes, stated: Bytes|
-    check_codes(Bytes::concat_all([b"type Box<a> = | Box(a, Int)\n", f, b"\n", stated, b"\n"]));
+  let over = |f: Bytes, measured_definitions: Bytes|
+    check_codes(
+      Bytes::concat_all([b"type Box<a> = | Box(a, Int)\n", f, b"\n", measured_definitions, b"\n"]),
+    );
   assert_eq(
     over(b"fn k<a>(b: Box<a>) -> Int = match b { Box(_, n) -> n }", b"key for Box by k"),
     [],
@@ -5872,26 +5960,32 @@ test "the function a key or a show names takes the value alone and only answers"
 
 test "an invariant is stated once, by the module that alone builds its sum, of a function answering `Bool`" {
   let balance = b"pub opaque type Balance = | Balance(Int)\npub fn open() -> Balance = Balance(0)\n";
-  let stated = |f: Bytes, more: Bytes|
+  let measured_definitions = |f: Bytes, more: Bytes|
     check_codes(Bytes::concat_all([balance, f, b"\ninvariant for Balance by valid\n", more]));
   let valid = b"fn valid(b: Balance) -> Bool = match b { Balance(n) -> n >= 0 }";
-  assert_eq(stated(valid, b""), []);
+  assert_eq(measured_definitions(valid, b""), []);
   let c = checked_cx(Bytes::concat_all([balance, valid, b"\ninvariant for Balance by valid\n"]));
   assert_eq(
-    c.instances.map(|x: InstanceInfo| (x.type_name, x.kind == NInvariant, x.by, x.answers)),
+    c.instances.map(|x: InstanceInfo| (x.type_name, x.kind == InvariantInstance, x.by, x.results)),
     [(b"m.Balance", true, b"m.valid", bool_type())],
   );
-  assert_eq(stated(valid, b"invariant for Balance by valid\n"), [b"E0105"]);
-  assert_eq(stated(valid, b"fn ok(b: Balance) -> Int = 0\nkey for Balance by ok\n"), []);
+  assert_eq(measured_definitions(valid, b"invariant for Balance by valid\n"), [b"E0105"]);
+  assert_eq(
+    measured_definitions(valid, b"fn ok(b: Balance) -> Int = 0\nkey for Balance by ok\n"),
+    [],
+  );
   // It is no key: the type is compared as what it holds.
   assert_eq(c.keyed_names, []);
-  assert_eq(stated(valid, b"fn same(a: Balance, b: Balance) -> Bool = a == b\n"), []);
-  assert_eq(stated(b"fn valid(b: Balance) -> Int = 0", b""), [b"E0218"]);
-  assert_eq(stated(b"fn valid(b: Balance, n: Int) -> Bool = n > 0", b""), [b"E0218"]);
-  assert_eq(stated(b"fn valid(b: Balance) -> Bool / {abort.raise} = panic(\"no\")", b""), [
+  assert_eq(measured_definitions(valid, b"fn same(a: Balance, b: Balance) -> Bool = a == b\n"), []);
+  assert_eq(measured_definitions(b"fn valid(b: Balance) -> Int = 0", b""), [b"E0218"]);
+  assert_eq(measured_definitions(b"fn valid(b: Balance, n: Int) -> Bool = n > 0", b""), [b"E0218"]);
+  assert_eq(
+    measured_definitions(b"fn valid(b: Balance) -> Bool / {abort.raise} = panic(\"no\")", b""),
+    [b"E0218"],
+  );
+  assert_eq(measured_definitions(b"fn valid(b: Balance) -> Bool / {diverges} = valid(b)", b""), [
     b"E0218",
   ]);
-  assert_eq(stated(b"fn valid(b: Balance) -> Bool / {diverges} = valid(b)", b""), [b"E0218"]);
   assert_eq(
     check_codes(b"fn valid(o: Option<Int>) -> Bool = true\ninvariant for Option by valid\n"),
     [b"E0208"],
@@ -6075,7 +6169,7 @@ test "an effect that declares no operation is named by a mode atom, which nothin
 }
 
 /// A shipped module declaring the effect `fact` and writing `rest`, and a module performing it.
-fn real_handled(rest: Bytes) -> List<Source> =
+fn real_handler_sources(rest: Bytes) -> List<Source> =
   [
     {
       name: b"std.fact",
@@ -6088,7 +6182,7 @@ fn real_handled(rest: Bytes) -> List<Source> =
   ]
 
 /// A real handler of `fact` with parameter row `go`, answer `answer` and body `body`.
-fn handler_written(go: Bytes, answer: Bytes, body: Bytes) -> Bytes =
+fn real_handler_source(go: Bytes, answer: Bytes, body: Bytes) -> Bytes =
   Bytes::concat_all([
     b"host for fact by served\nfn served<a | e>(go: () -> a / ",
     go,
@@ -6103,10 +6197,15 @@ fn handled_body() -> Bytes = b"handle { go() } with { fact.get() -> 7, fact.put[
 
 test "an effect's real handler handles every read and write of it on every label, and only its module's toolchain declares one" {
   let whole = b"{fact.get, fact.put[*] | e}";
-  assert_eq(codes_of(real_handled(handler_written(whole, b"a / e", handled_body()))), []);
+  assert_eq(
+    codes_of(real_handler_sources(real_handler_source(whole, b"a / e", handled_body()))),
+    [],
+  );
   // A raise of the effect is the program's to answer, so it may stay in the row it answers with.
   assert_eq(
-    codes_of(real_handled(handler_written(whole, b"a / {fact.lost | e}", handled_body()))),
+    codes_of(
+      real_handler_sources(real_handler_source(whole, b"a / {fact.lost | e}", handled_body())),
+    ),
     [],
   );
   // Only a module the toolchain ships declares one.
@@ -6123,21 +6222,22 @@ test "an effect's real handler handles every read and write of it on every label
     [b"E0161"],
   );
   // Of an effect its module declares, once.
-  assert_eq(codes_of(real_handled(b"host for other by served\nfn served() -> Int = 1\n")), [
-    b"E0162",
-  ]);
+  assert_eq(
+    codes_of(real_handler_sources(b"host for other by served\nfn served() -> Int = 1\n")),
+    [b"E0162"],
+  );
   assert_eq(
     codes_of(
-      real_handled(
-        handler_written(whole, b"a / e", handled_body()).concat(b"host for fact by served\n"),
+      real_handler_sources(
+        real_handler_source(whole, b"a / e", handled_body()).concat(b"host for fact by served\n"),
       ),
     ),
     [b"E0163"],
   );
   // By a function of its module whose signature is a handler of the whole effect.
-  assert_eq(codes_of(real_handled(b"host for fact by absent\n")), [b"E0164"]);
+  assert_eq(codes_of(real_handler_sources(b"host for fact by absent\n")), [b"E0164"]);
   let unfit = |go: Bytes, answer: Bytes, body: Bytes|
-    codes_of(real_handled(handler_written(go, answer, body)));
+    codes_of(real_handler_sources(real_handler_source(go, answer, body)));
   assert_eq(unfit(b"{fact.get | e}", b"a / e", b"handle { go() } with { fact.get() -> 7 }"), [
     b"E0164",
   ]);
@@ -6148,7 +6248,7 @@ test "an effect's real handler handles every read and write of it on every label
   assert_eq(unfit(whole, b"a / {fact.get, fact.put[*] | e}", b"go()"), [b"E0164"]);
   assert_eq(
     codes_of(
-      real_handled(
+      real_handler_sources(
         b"host for fact by served\nfn served<a | e>(n: Int, go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> n, fact.put[*](x) -> () }\n",
       ),
     ),
@@ -6156,7 +6256,7 @@ test "an effect's real handler handles every read and write of it on every label
   );
   assert_eq(
     codes_of(
-      real_handled(
+      real_handler_sources(
         b"host for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e where derivable(eq, a) = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
       ),
     ),
@@ -6544,8 +6644,8 @@ test "an unordered key reaching an implied `Map` order is reported once, at the 
 }
 
 test "a shipped module's extern that names a `Map` implies its key's order" {
-  assert_eq(declared_as(b"Map::new").constraints, [{ deriver: DOrd, param: 0 }]);
-  assert_eq(declared_as(b"Map::len").constraints, [{ deriver: DOrd, param: 0 }]);
+  assert_eq(declared_as(b"Map::new").constraints, [{ deriver: OrdDeriver, param: 0 }]);
+  assert_eq(declared_as(b"Map::len").constraints, [{ deriver: OrdDeriver, param: 0 }]);
   let native = { name: b"std.native", src: b"pub extern fn size<k>(m: Map<k, Int>) -> Int\n" };
   let calls = |src: Bytes|
     codes_of([native, { name: b"m", src: b"import std.native (size)\n".concat(src) }]);
@@ -6613,11 +6713,11 @@ test "a key answers a type that is ordered and hashed, and that does not hold it
 }
 
 test "a type that states a key is ordered, hashed and derived as its key is, whatever it holds" {
-  let held = |stated: Bytes, used: Bytes|
+  let held = |measured_definitions: Bytes, used: Bytes|
     check_codes(
       Bytes::concat_all([
         b"type Reading = | Reading(Float, Int)\nfn tick(r: Reading) -> Int = match r { Reading(_, n) -> n }\n",
-        stated,
+        measured_definitions,
         b"\n",
         used,
         b"\n",
@@ -6708,7 +6808,7 @@ test "a `Columns` holds a record type of at least one field wherever its type se
 }
 
 /// A type `N` whose `+`, `-` and `*` are `add`, written as `add`, and what follows it.
-fn stating_add(add: Bytes, rest: Bytes) -> Bytes =
+fn with_numeric_add(add: Bytes, rest: Bytes) -> Bytes =
   Bytes::concat_all([
     b"type N = | Z | S(N)\nfn add(a: N, b: N) -> N = ",
     add,
@@ -6718,18 +6818,18 @@ fn stating_add(add: Bytes, rest: Bytes) -> Bytes =
 
 test "an operator at a type that states its arithmetic is a call of the function it states" {
   // A recursion through `+` descends as one through the name does.
-  assert_eq(check_codes(stating_add(b"match a { Z -> b, S(m) -> S(m + b) }", b"")), []);
-  assert_eq(check_codes(stating_add(b"match a { Z -> b, S(m) -> S(add(m, b)) }", b"")), []);
+  assert_eq(check_codes(with_numeric_add(b"match a { Z -> b, S(m) -> S(m + b) }", b"")), []);
+  assert_eq(check_codes(with_numeric_add(b"match a { Z -> b, S(m) -> S(add(m, b)) }", b"")), []);
   assert(
     refused_with(
-      stating_add(b"a + b", b""),
+      with_numeric_add(b"a + b", b""),
       b"E0302",
       b"`add` may not return, and its row does not say so",
     ),
   );
-  assert_eq(check_codes(stating_add(b"a - b", b"")), [b"E0302"]);
+  assert_eq(check_codes(with_numeric_add(b"a - b", b"")), [b"E0302"]);
   // `-a` is `neg`, which is another function and ends.
-  assert_eq(check_codes(stating_add(b"match a { Z -> -b, S(m) -> m }", b"")), [])
+  assert_eq(check_codes(with_numeric_add(b"match a { Z -> -b, S(m) -> m }", b"")), [])
 }
 
 test "a comparison, a `Map` and a constrained parameter at a type that states a key or a show call it" {
@@ -6763,17 +6863,17 @@ test "a comparison, a `Map` and a constrained parameter at a type that states a 
 }
 
 test "a body in a recursion through an operator performs everything again there" {
-  // `add` answers `noted`'s query itself, and `noted` adds: the two call one another through `+`.
-  let through = db_source(
-    stating_add(
+  // `add` answers `with_note_effect`'s query itself, and `with_note_effect` adds: the two call one another through `+`.
+  let through = with_db_effect(
+    with_numeric_add(
       b"match a { Z -> b, S(m) -> handle { noted(m, b) } with { db.query[conn](sql) -> 0 } }",
       b"fn noted(a: N, b: N) -> N / {db.query[conn] bounded} = { lookup(1); a + b }\n",
     ),
   );
   assert_eq(check_codes(through), [b"E0465"]);
   // Called by name the recursion is the same one.
-  let named = db_source(
-    stating_add(
+  let named = with_db_effect(
+    with_numeric_add(
       b"match a { Z -> b, S(m) -> handle { noted(m, b) } with { db.query[conn](sql) -> 0 } }",
       b"fn noted(a: N, b: N) -> N / {db.query[conn] bounded} = { lookup(1); add(a, b) }\n",
     ),
@@ -7048,9 +7148,9 @@ test "every way a function of a type is written calls it, a declared type's or a
   // A function of a type the program declares, a builtin of a language type, and a function a
   // language type's home module declares, each with the type of a value of it and its answer.
   let kinds = [
-    { ty: b"Box", f: b"Box::size", answer: b"Int" },
-    { ty: b"String", f: b"String::len", answer: b"Int" },
-    { ty: b"List<Int>", f: b"List::second", answer: b"Option<Int>" },
+    { ty: b"Box", f: b"Box::size", result: b"Int" },
+    { ty: b"String", f: b"String::len", result: b"Int" },
+    { ty: b"List<Int>", f: b"List::second", result: b"Option<Int>" },
   ];
   let forms = |f: Bytes|
     [
@@ -7072,17 +7172,17 @@ test "every way a function of a type is written calls it, a declared type's or a
         ]),
       },
     ];
-  kinds.fold((), |_: Unit, k: { ty: Bytes, f: Bytes, answer: Bytes }|
+  kinds.fold((), |_: Unit, k: { ty: Bytes, f: Bytes, result: Bytes }|
     forms(k.f).fold((), |_: Unit, form: Bytes| {
-      let fine = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> ", k.answer, b" = ", form, b"\n"]);
+      let fine = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> ", k.result, b" = ", form, b"\n"]);
       assert(codes_of(module(fine)) == [], Some(String::of_bytes_lossy(fine)));
       // Its answer is the function's, not the function itself.
       let wrong = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> Bool = ", form, b"\n"]);
       assert(codes_of(module(wrong)) == [b"E0201"], Some(String::of_bytes_lossy(wrong)))
     }));
   // An argument the function does not take is refused, and one written is typed.
-  kinds.fold((), |_: Unit, k: { ty: Bytes, f: Bytes, answer: Bytes }| {
-    let extra = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> ", k.answer, b" = x.", k.f, b"(1)\n"]);
+  kinds.fold((), |_: Unit, k: { ty: Bytes, f: Bytes, result: Bytes }| {
+    let extra = Bytes::concat_all([b"fn f(x: ", k.ty, b") -> ", k.result, b" = x.", k.f, b"(1)\n"]);
     assert(codes_of(module(extra)) != [], Some(String::of_bytes_lossy(extra)))
   });
   assert_eq(codes_of(module(b"fn f(s: String) -> Int = s.String::nope()\n")), [b"E0101"]);
@@ -7144,7 +7244,7 @@ test "a lent function parameter may be called, lent on, captured by a lambda len
 }
 
 /// Each way a body may hold its parameter `g` past the call, with `g` written `param`.
-fn holding(param: Bytes) -> List<Bytes> = {
+fn holding_bodies(param: Bytes) -> List<Bytes> = {
   let f = |rest: Bytes| Bytes::concat_all([b"fn f(", param, rest]);
   [
     f(b") -> (Int) -> Int = g"),
@@ -7167,9 +7267,9 @@ fn holding(param: Bytes) -> List<Bytes> = {
 }
 
 test "a lent function parameter held past the call is refused, and `keep` lets the function hold it" {
-  let lent = holding(b"g: (Int) -> Int");
+  let lent = holding_bodies(b"g: (Int) -> Int");
   assert_eq(lent.map(check_codes), lent.map(|_: Bytes| [b"E0475"]));
-  assert_eq(holding(b"g: keep (Int) -> Int").filter(|src: Bytes| check_codes(src) != []), [])
+  assert_eq(holding_bodies(b"g: keep (Int) -> Int").filter(|src: Bytes| check_codes(src) != []), [])
 }
 
 test "a refused lent parameter names the place that holds it and offers `keep`" {
@@ -7226,7 +7326,7 @@ test "a pattern binds every name it takes from a lent value to that value" {
 }
 
 /// A `handle` around `ask.get()`, its clauses `with`, in `fn f(g: <param>)`.
-fn asking(param: Bytes, rest: Bytes) -> Bytes =
+fn with_ask_effect(param: Bytes, rest: Bytes) -> Bytes =
   Bytes::concat_all([
     b"effect ask { read get() -> Int }\neffect sink { write put((Int) -> Int) -> Unit }\n",
     b"type Step = | Done(Int) | Wait(once (Int) -> Step)\n",
@@ -7247,14 +7347,17 @@ test "a continuation holds what its handler reads, and a call of it answers what
     b") -> Int = { let r = handle { let _ = ask.get(); g } with { ask.get() resume k -> apply(k, 0) }; r(1) }",
   ];
   assert_eq(
-    held.map(|rest: Bytes| check_codes(asking(b"(Int) -> Int", rest))),
+    held.map(|rest: Bytes| check_codes(with_ask_effect(b"(Int) -> Int", rest))),
     held.map(|_: Bytes| [b"E0475"]),
   );
-  assert_eq(held.filter(|rest: Bytes| check_codes(asking(b"keep (Int) -> Int", rest)) != []), []);
+  assert_eq(
+    held.filter(|rest: Bytes| check_codes(with_ask_effect(b"keep (Int) -> Int", rest)) != []),
+    [],
+  );
   // A continuation whose `handle` answers no lent value is lent on as any lent value is.
   assert_eq(
     check_codes(
-      asking(
+      with_ask_effect(
         b"(Int) -> Int",
         b") -> Int = handle { g(ask.get()) } with { ask.get() resume k -> peek(k) }",
       ),
@@ -8215,7 +8318,7 @@ test "a read inside its own recursive group settles at its definition's own vari
       TypedRead(ReadDefinition(d)) -> if d.full == b"m.len" { acc.push(d.args) } else { acc },
       _ -> acc,
     });
-  assert_eq(reads, [[TyVar(0)]])
+  assert_eq(reads, [[VariableType(0)]])
 }
 
 test "an update settles with the fields it copies from its base" {

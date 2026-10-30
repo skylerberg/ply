@@ -2,7 +2,7 @@
 //! `--exec ply` names in the scratch directory the run was started in. A command that compiles
 //! nothing may run in this process instead, in the suite's own copy of the CLI: `in_memory` over a
 //! tree held as a value, `on_disk` over the working directory. Both refuse a command that compiles
-//! the program (`compiling`), and what a check compiles to run. `serving` leaves a `ply` running for
+//! the program (`compiling`), and what a check compiles to run. `start_server` leaves a `ply` running for
 //! a test to talk to.
 
 import cli.ply (main)
@@ -12,8 +12,8 @@ import compiler.syntax.items (is_shipped)
 import cli.sources
 import cli.vcs
 import compiler.front.pkg
-import compiler.front.pkg (Supplied)
-import cli.library (Shipping, digests_of)
+import compiler.front.pkg (SuppliedPackage)
+import cli.library (ShippedFile, digests_of)
 import cli.builder (builder)
 import std.env (env)
 import compiler.unit (shipped)
@@ -22,7 +22,7 @@ import compiler.load
 import compiler.check.resolve.tables (Diag)
 import cli.diagnostic
 import cli.machine
-import cli.machine (Options, unconfigured)
+import cli.machine (Options, empty_configuration)
 import cli.replace (edit)
 import cli.surface (spec)
 import cli.library
@@ -33,7 +33,7 @@ import std.bytes
 import std.cli as command_line
 import std.config (config)
 import std.fs
-import std.fs (fs, MemFs, Entry, File, Seen)
+import std.fs (fs, MemFs, Entry, File, ScanEntry)
 import std.json
 import std.json (Json, Null, Number, Str, Array, Object)
 import std.list
@@ -42,9 +42,9 @@ import std.net (net)
 import std.os
 import std.os (os)
 import std.random (entropy)
-import std.process (process, Var, Finished, Exited, Signalled, Captured, captured, args_step,
-                    out_step, err_step, exit_step, with_input, line_step, Line, Keep, Lines,
-                    Discard, Said, Signal, Kill, Terminate)
+import std.process (process, Var, CompletedProcess, Exited, Signalled, FakeProcess, captured,
+                    args_step, out_step, err_step, exit_step, with_input, line_step, Line, Keep,
+                    Lines, Discard, LineWritten, Signal, Kill, Terminate)
 import std.term (term)
 import std.time (time)
 import std.value (Value)
@@ -57,35 +57,38 @@ import std.text (shell_join)
 
 /// The lines a run wrote to each stream, and the code it ended with: a signal's as a shell reports
 /// it, 128 and the signal's number.
-pub type Ran = { out: List<String>, err: List<String>, code: Int }
+pub type RunResult = { out: List<String>, err: List<String>, code: Int }
 
-fn ran_of(c: Captured) -> Ran =
+fn captured_result(c: FakeProcess) -> RunResult =
   { out: c.out, err: c.err, code: match c.code { Some(n) -> n, None -> 0 } }
 
-pub fn stdout(ran: Ran) -> String = String::unlines(ran.out)
+pub fn stdout(ran: RunResult) -> String = String::unlines(ran.out)
 
-pub fn stderr(ran: Ran) -> String = String::unlines(ran.err)
+pub fn stderr(ran: RunResult) -> String = String::unlines(ran.err)
 
 /// Both streams, the output first: what a test searches when it does not care which said it.
-pub fn said(ran: Ran) -> String = stdout(ran) ++ stderr(ran)
+pub fn all_output(ran: RunResult) -> String = stdout(ran) ++ stderr(ran)
 
 /// A run that exited 0, or the test fails with what it said.
-pub fn assert_ok(ran: Ran) -> Unit / {abort.raise} = assert(ran.code == 0, Some(said(ran)))
+pub fn assert_ok(ran: RunResult) -> Unit / {abort.raise} =
+  assert(ran.code == 0, Some(all_output(ran)))
 
 /// The one document `--json` writes on the output stream.
-pub fn json_of(ran: Ran) -> Json / {abort.raise} =
+pub fn json_of(ran: RunResult) -> Json / {abort.raise} =
   match json::parse_string(stdout(ran)) {
     Ok(j) -> j,
     Err(e) ->
-      panic("`--json` wrote no one document: " ++ json::error_to_string(e) ++ "\n" ++ said(ran)),
+      panic(
+        "`--json` wrote no one document: " ++ json::error_to_string(e) ++ "\n" ++ all_output(ran),
+      ),
   }
 
 /// What `main` returned, as the document `ply run --json` wrote renders it. The test fails with
 /// what the run said when `main` returned nothing.
-pub fn value_of(ran: Ran) -> String / {abort.raise} =
+pub fn value_of(ran: RunResult) -> String / {abort.raise} =
   match json::get(json_of(ran), "value") {
     Some(Str(v)) -> v,
-    _ -> panic("`main` returned no value: " ++ said(ran)),
+    _ -> panic("`main` returned no value: " ++ all_output(ran)),
   }
 
 // --- Reading a report --------------------------------------------------------
@@ -109,9 +112,9 @@ pub fn str(j: Json) -> String = match j { Str(s) -> s, _ -> "" }
 pub fn int(j: Json) -> Int =
   match j { Number(d) -> match Int::of_decimal(d, Down) { Some(n) -> n, None -> -1 }, _ -> -1 }
 
-pub fn truth(j: Json) -> Bool = match j { json::Bool(b) -> b, _ -> false }
+pub fn bool(j: Json) -> Bool = match j { json::Bool(b) -> b, _ -> false }
 
-pub fn shown(j: Json) -> String / {abort.raise} = json::to_string(j)
+pub fn json_text(j: Json) -> String / {abort.raise} = json::to_string(j)
 
 // --- The working directory ---------------------------------------------------
 
@@ -119,7 +122,7 @@ pub fn shown(j: Json) -> String / {abort.raise} = json::to_string(j)
 pub fn scratch_marker() -> String = ".ply-scratch"
 
 /// The stage every run of a test keeps what it reuses in, a `ply` it starts included: beside the
-/// test's files, hidden as a cache is. `fresh` keeps it, since the shipped modules a `ply` lays out
+/// test's files, hidden as a cache is. `empty_working_directory` keeps it, since the shipped modules a `ply` lays out
 /// there are the binary's alone, and empties what it reuses.
 fn stage() -> String = ".ply-stage"
 
@@ -128,14 +131,14 @@ pub fn reused_dir() -> String = stage() ++ "/reused"
 
 /// Where a run keeps the emitter's answers: beside the test's files, so a fresh directory holds none
 /// an earlier test kept.
-pub fn bodies() -> String = ".ply-bodies"
+pub fn bodies_dir() -> String = ".ply-bodies"
 
 /// A file of a project: its path from the project's directory, and its text.
 pub type Source = { path: String, text: String }
 
 /// The working directory emptied for one test, its marker and its stage kept, and nothing reused in
 /// the stage. One without the marker is never emptied: a run started anywhere else deletes nothing.
-pub fn fresh() -> Unit / {Here, abort.raise} =
+pub fn empty_working_directory() -> Unit / {WorkingDirectory, abort.raise} =
   match fs::listed_names(fs.list_dir[cwd](".")) {
     None -> panic("the working directory cannot be listed"),
     Some(names) -> if !names.contains(scratch_marker()) {
@@ -154,35 +157,35 @@ pub fn fresh() -> Unit / {Here, abort.raise} =
   }
 
 /// `text` at `path` under the working directory, every directory above it made.
-pub fn write(path: String, text: String) -> Unit / {Here, abort.raise} = {
+pub fn write(path: String, text: String) -> Unit / {WorkingDirectory, abort.raise} = {
   let dir = parent(path);
   if dir != "" && !fs.create_dir[cwd](dir) { panic("could not make `" ++ dir ++ "`") };
   if !fs.write_file[cwd](path, Bytes::of_string(text)) { panic("could not write `" ++ path ++ "`") }
 }
 
 /// A fresh working directory holding `files`.
-pub fn project(files: List<Source>) -> Unit / {Here, abort.raise} = {
-  fresh();
+pub fn write_project(files: List<Source>) -> Unit / {WorkingDirectory, abort.raise} = {
+  empty_working_directory();
   files.fold((), |u: Unit, source: Source| write(source.path, source.text))
 }
 
 /// A fresh working directory holding one module, `m.ply`.
-pub fn program(text: String) -> Unit / {Here, abort.raise} =
-  project([{ path: "m.ply", text: text }])
+pub fn write_program(text: String) -> Unit / {WorkingDirectory, abort.raise} =
+  write_project([{ path: "m.ply", text: text }])
 
 /// What a file under the working directory holds, as text.
-pub fn read(path: String) -> Option<String> / {Here, abort.raise} =
+pub fn read(path: String) -> Option<String> / {WorkingDirectory, abort.raise} =
   match fs.read_file[cwd](path) { Some(b) -> Some(String::of_bytes(b)), None -> None }
 
 /// The working directory's absolute path, which is the run's own.
-pub fn working() -> String / {fs.read[cwd], abort.raise} =
+pub fn working_directory() -> String / {fs.read[cwd], abort.raise} =
   match fs.canonical[cwd](".") { Some(p) -> p, None -> panic("the working directory has no path") }
 
 /// Whether the program in the working directory compiles and its unit opens.
-pub fn loads_here() -> Bool / {Here, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
+pub fn loads_here() -> Bool / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
   match load::load[cwd](".") {
     Err(_) -> false,
-    Ok(loaded) -> match cc::library[cc](cc::development(), loaded.unit) {
+    Ok(load_program) -> match cc::library[cc](cc::development(), load_program.unit) {
       Err(_) -> false,
       Ok(library) -> match entering::machine.open(library) {
         Ok(o) -> {
@@ -199,7 +202,7 @@ pub fn first_message(diags: List<Diag>) -> String =
   match diags { [d, ..] -> String::of_bytes_lossy(d.message), [] -> "no diagnostic" }
 
 /// The library the program in the working directory compiles to, and its front end.
-pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {Here, Shipped, abort.raise} =
+pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {WorkingDirectory, Shipped, abort.raise} =
   match load::load[cwd](".") {
     Err(diags) -> panic("the program loads: " ++ first_message(diags)),
     Ok(l) -> match cc::library[cc](cc::development(), l.unit) {
@@ -210,22 +213,27 @@ pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {He
 
 /// The program in the working directory compiled, its unit opened, and the binding `options` lend
 /// it: what a test enters the program's definitions on.
-pub type Loaded = { unit: Int, roots: Map<Bytes, ModuleSpan>, binding: Int, options: Options }
+pub type LoadedProgram = {
+  unit: Int,
+  roots: Map<Bytes, ModuleSpan>,
+  binding: Int,
+  options: Options,
+}
 
 /// The program in the working directory, bound as `options` lend it.
-pub fn loaded(
+pub fn load_program(
   options: Options,
-) -> Loaded / {Here, Shipped, entering::machine.open, entering::machine.bind, abort.raise} = {
+) -> LoadedProgram / {WorkingDirectory, Shipped, entering::machine.open, entering::machine.bind, abort.raise} = {
   let c = compiled_here();
   match entering::machine.open(c.library) {
     Err(why) -> panic("the program's unit opens: " ++ why),
     Ok(o) -> match entering::machine.bind(
-        machine::run_grants(options, unconfigured(), machine::Unheard, false),
+        machine::run_grants(options, empty_configuration(), machine::PlatformDefault, false),
       ) {
-      Err(refused) ->
+      Err(not_ok) ->
         panic(
           "the program binds: "
-            ++ first_message(refused.map(|f: entering::Failure| machine::unplaced(f))),
+            ++ first_message(not_ok.map(|f: entering::Failure| machine::unplaced(f))),
         ),
       Ok(binding) ->
         {
@@ -239,8 +247,8 @@ pub fn loaded(
 }
 
 /// The binding torn down and the unit closed, as a test that is done with them leaves them.
-pub fn unloaded(
-  l: Loaded,
+pub fn unload_program(
+  l: LoadedProgram,
 ) -> List<entering::Report> / {entering::machine.unbind, entering::machine.close} = {
   let reports = entering::machine.unbind(l.binding);
   entering::machine.close(l.unit);
@@ -249,8 +257,8 @@ pub fn unloaded(
 
 /// `inner.<entry>` entered at `args` under the binding, bounded as the options say: how it ended
 /// and what it used.
-pub fn entered(
-  l: Loaded,
+pub fn enter(
+  l: LoadedProgram,
   entry: String,
   args: List<Value>,
 ) -> entering::Outcome / {entering::machine.enter} =
@@ -262,23 +270,23 @@ pub fn entered(
   })
 
 /// What `inner.<entry>` answered, or what it raised.
-pub fn called(
-  l: Loaded,
+pub fn call(
+  l: LoadedProgram,
   entry: String,
   args: List<Value>,
 ) -> Result<Value, Diag> / {entering::machine.enter, abort.raise} =
-  match machine::answer_of(entered(l, entry, args), l.roots, "inner." ++ entry) {
+  match machine::result_of(enter(l, entry, args), l.roots, "inner." ++ entry) {
     Ok(v) -> Ok(v),
     Err(r) -> Err(diagnostic::shown(r)),
   }
 
-/// [`called`], where a raise is the test's failure.
-pub fn answered(
-  l: Loaded,
+/// [`call`], where a raise is the test's failure.
+pub fn call_value(
+  l: LoadedProgram,
   entry: String,
   args: List<Value>,
 ) -> Value / {entering::machine.enter, abort.raise} =
-  match called(l, entry, args) {
+  match call(l, entry, args) {
     Ok(v) -> v,
     Err(d) -> panic("`" ++ entry ++ "` answers: " ++ String::of_bytes_lossy(d.message)),
   }
@@ -299,21 +307,21 @@ pub fn repo_file(path: String) -> String / {Repo, abort.raise} =
 
 /// What the repository's `ply.work` states: where each of its packages lies.
 pub fn workspace() -> Workspace / {Repo, abort.raise} =
-  match pkg::check_workspace(Bytes::of_string(repo_file(library::file()))).workspace {
+  match pkg::check_workspace(Bytes::of_string(repo_file(library::workspace_file()))).workspace {
     Some(w) -> w,
-    None -> panic("the repository's `" ++ library::file() ++ "` checks"),
+    None -> panic("the repository's `" ++ library::workspace_file() ++ "` checks"),
   }
 
 /// Where the repository's `ply.work` places `ply`'s parts, each directory below the repository.
-pub fn parts() -> ToolchainParts / {Repo, abort.raise} =
+pub fn toolchain_parts() -> ToolchainParts / {Repo, abort.raise} =
   match workspace().toolchain {
     Some(t) -> t,
-    None -> panic("the repository's `" ++ library::file() ++ "` names the toolchain"),
+    None -> panic("the repository's `" ++ library::workspace_file() ++ "` names the toolchain"),
   }
 
 /// The `ply.pkg` of the repository's package at `dir`.
 fn manifest_at(dir: String) -> Manifest / {Repo, abort.raise} =
-  match pkg::check_source(Bytes::of_string(repo_file(dir ++ "/ply.pkg"))).manifest {
+  match pkg::check_manifest(Bytes::of_string(repo_file(dir ++ "/ply.pkg"))).manifest {
     Some(m) -> m,
     None -> panic("`" ++ dir ++ "/ply.pkg` checks"),
   }
@@ -333,7 +341,7 @@ pub fn package_dir(name: String) -> String / {Repo, abort.raise} =
 pub fn example_files() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../examples")
 
 /// What `embed_dir` read, as sources under `dir`.
-pub fn embedded(
+pub fn embedded_sources(
   files: List<{ name: String, bytes: Bytes }>,
   dir: String,
 ) -> List<Source> / {abort.raise} =
@@ -341,24 +349,24 @@ pub fn embedded(
     { path: joined(dir, f.name), text: String::of_bytes(f.bytes) })
 
 /// A hidden segment is a cache's or a tool's, never a source.
-fn is_cached(rest: String) -> Bool / {abort.raise} =
+fn is_hidden(rest: String) -> Bool / {abort.raise} =
   rest.split("/").fold(false, |hit: Bool, s: String| hit || s.starts_with("."))
 
 // --- Warm and cold -----------------------------------------------------------
 
 /// Every source under the working directory, and nothing a cache or the scratch marker holds.
-pub fn sources_here() -> List<Source> / {Here, abort.raise} =
+pub fn sources_here() -> List<Source> / {WorkingDirectory, abort.raise} =
   match fs.walk[cwd](".") {
     Some(entries) ->
       entries.fold([], |acc: List<Source>, e: Entry|
-        if e.kind != File || is_cached(e.path) { acc } else {
+        if e.kind != File || is_hidden(e.path) { acc } else {
           match read(e.path) { Some(t) -> acc.push({ path: e.path, text: t }), None -> acc }
         }),
     None -> panic("the working directory walks"),
   }
 
 /// The cache's own diagnostics, which two checks of one program may differ by.
-pub fn about_the_cache() -> List<String> = ["W0601", "W0602", "W0603"]
+pub fn cache_warning_codes() -> List<String> = ["W0601", "W0602", "W0603"]
 
 fn without(j: Json, keys: List<String>) -> Json =
   match j {
@@ -380,22 +388,22 @@ pub fn comparable(v: Json) -> Json =
           "diagnostics",
           Array(
             items(at(v, "diagnostics")).filter(|d: Json|
-              !about_the_cache().contains(str(at(d, "code")))),
+              !cache_warning_codes().contains(str(at(d, "code")))),
           ),
         ),
       ),
     other -> other,
   }
 
-/// The line `check_answer` and `cold_answer` check with.
+/// The line `warm_check_report` and `cold_check_report` check with.
 fn checking() -> List<String> = ["check", "--explain", "--json"]
 
 /// The working directory's program checked as it stands, through its memo store.
-pub fn check_answer() -> Json / {Reached, Shipped, abort.raise, diverges} =
+pub fn warm_check_report() -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   comparable(json_of(on_disk(checking())))
 
 /// The same sources checked from nothing: in memory, beside no cache.
-pub fn cold_answer() -> Json / {Hermetic, Shipped, Here, abort.raise, diverges} =
+pub fn cold_check_report() -> Json / {Hermetic, Shipped, WorkingDirectory, abort.raise, diverges} =
   comparable(json_of(in_memory(tree(sources_here()), checking())))
 
 /// Where `spawned_cold` lays the sources out: hidden, as a cache is, so no walk of them reads it.
@@ -403,27 +411,30 @@ fn cold_dir() -> String = ".cold"
 
 /// `ply ARGV` over the sources here from nothing: laid out alone in a directory of their own, with a
 /// stage of its own, so it takes nothing an earlier run filed but the emitter's answers.
-pub fn spawned_cold(argv: List<String>) -> Ran / {Spawned, Here, abort.raise} = {
+pub fn spawned_cold(argv: List<String>) -> RunResult / {PlyProcess, WorkingDirectory, abort.raise} = {
   let sources = sources_here();
   if fs.exists[cwd](cold_dir()) && !fs.remove_tree[cwd](cold_dir()) {
     panic("could not empty `" ++ cold_dir() ++ "`")
   };
   sources.fold((), |u: Unit, source: Source| write(joined(cold_dir(), source.path), source.text));
-  let own = { name: "PLY_C_STAGE", value: working() ++ "/" ++ cold_dir() ++ "/" ++ stage() };
+  let own = {
+    name: "PLY_C_STAGE",
+    value: working_directory() ++ "/" ++ cold_dir() ++ "/" ++ stage(),
+  };
   spawned_in(cold_dir(), argv, [own])
 }
 
 /// A check through the memo store answers what a cold check of the same sources does. The warm run
 /// goes first, so the store it reads is the one the last step left.
-pub fn warm_agrees(what: String) -> Json / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
-  let warm = check_answer();
-  let cold = cold_answer();
+pub fn warm_agrees(what: String) -> Json / {CliEffects, Hermetic, Shipped, abort.raise, diverges} = {
+  let warm = warm_check_report();
+  let cold = cold_check_report();
   agreeing(what, warm, cold)
 }
 
 /// `warm_agrees` with each check a `ply` of its own, for a program whose check compiles and enters
 /// part of what it reaches.
-pub fn spawned_warm_agrees(what: String) -> Json / {Spawned, Here, abort.raise} = {
+pub fn spawned_warm_agrees(what: String) -> Json / {PlyProcess, WorkingDirectory, abort.raise} = {
   let warm = comparable(json_of(spawned(checking())));
   let cold = comparable(json_of(spawned_cold(checking())));
   agreeing(what, warm, cold)
@@ -436,9 +447,9 @@ fn agreeing(what: String, warm: Json, cold: Json) -> Json / {abort.raise} = {
     Some(
       what
         ++ ": a check through the memo store answered differently from one that started cold\nwarm: "
-        ++ shown(warm)
+        ++ json_text(warm)
         ++ "\ncold: "
-        ++ shown(cold),
+        ++ json_text(cold),
     ),
   );
   warm
@@ -446,17 +457,18 @@ fn agreeing(what: String, warm: Json, cold: Json) -> Json / {abort.raise} = {
 
 /// How many modules a check took as the memo store kept them, how many it checked again, and how
 /// many of the modules it loaded ship with the toolchain, which answers them.
-pub type Seeding = { taken: Int, checked: Int, shipped: Int }
+pub type ModuleReuse = { taken: Int, checked: Int, shipped: Int }
 
-pub fn seeding() -> Seeding / {Reached, Shipped, abort.raise, diverges} = seeding_at(".")
+pub fn module_reuse() -> ModuleReuse / {CliEffects, Shipped, abort.raise, diverges} =
+  module_reuse_at(".")
 
 /// The same of the project at `dir`.
-pub fn seeding_at(dir: String) -> Seeding / {Reached, Shipped, abort.raise, diverges} = {
+pub fn module_reuse_at(dir: String) -> ModuleReuse / {CliEffects, Shipped, abort.raise, diverges} = {
   let report = json_of(on_disk(["check", dir, "--json", "--explain"]));
   let shipped = items(at(report, "modules")).len() - own_modules(report).len();
   items(path(report, ["front_end", "queries"])).fold(
     { taken: 0, checked: 0, shipped: shipped },
-    |acc: Seeding, q: Json|
+    |acc: ModuleReuse, q: Json|
       if str(at(q, "query")) == "module" {
         { ..acc, taken: int(at(q, "taken")), checked: int(at(q, "run")) }
       } else { acc },
@@ -473,24 +485,26 @@ pub type Package = { prefix: String, deps: List<String> }
 
 /// The package closure of a directory, the root first, and the directory each package of it was
 /// read from, the root's first.
-pub type Closure = { packages: List<Package>, dirs: List<String> }
+pub type PackageClosure = { packages: List<Package>, dirs: List<String> }
 
 /// `dir`'s packages as `ply` walks them and the compiler's manifest rules settle them, no module
 /// checked.
-pub fn manifest_closure(dir: String) -> Closure / {Reached, abort.raise, diverges} = {
-  let pwd = working();
+pub fn manifest_closure(dir: String) -> PackageClosure / {CliEffects, abort.raise, diverges} = {
+  let pwd = working_directory();
   handle {
-    let project = vcs::fetching(|| sources::load_resolved([paths::resolve(dir)]));
-    let pkgs = pkgs_of(project);
+    let write_project = vcs::fetching(|| sources::load_resolved([paths::resolve(dir)]));
+    let pkgs = pkgs_of(write_project);
     let settled = pkg::closure(
       pkgs,
-      project.files.map(|file: sources::File| Bytes::of_string(file.module)),
+      write_project.files.map(|file: sources::File| Bytes::of_string(file.module)),
     );
     {
       packages: settled.packages.map(|p: pkg::Package|
         { prefix: String::of_bytes(p.prefix), deps: p.deps.map(String::of_bytes) }),
-      dirs: pkgs.supplied.fold([String::of_bytes(pkgs.root)], |acc: List<String>, s: Supplied|
-        acc.push(String::of_bytes(s.root))),
+      dirs: pkgs.supplied.fold(
+        [String::of_bytes(pkgs.root)],
+        |acc: List<String>, s: SuppliedPackage| acc.push(String::of_bytes(s.root)),
+      ),
     }
   } with {
     env.working_directory() -> pwd,
@@ -501,10 +515,10 @@ pub fn manifest_closure(dir: String) -> Closure / {Reached, abort.raise, diverge
 // --- The shipped modules -----------------------------------------------------
 
 /// The shipped modules as the launcher lays them out, one flat directory of `<dotted name>.ply`,
-/// with each module of `standing` this binary does not ship among them.
-fn shipped_listing_with(standing: List<Source>) -> Option<List<fs::Listed>> / {Shipped} =
+/// with each module of `overrides` this binary does not ship among them.
+fn shipped_listing_with(overrides: List<Source>) -> Option<List<fs::Listed>> / {Shipped} =
   Some(
-    standing.fold(
+    overrides.fold(
       shipped.names().map(|n: String| n ++ ".ply"),
       |names: List<String>, source: Source|
         if !source.path.ends_with(".ply") || source.path.contains("/")
@@ -517,12 +531,12 @@ fn shipped_listing_with(standing: List<Source>) -> Option<List<fs::Listed>> / {S
 
 fn listed_file(name: String) -> fs::Listed = { name: name, kind: File }
 
-/// The shipped files `own` lists (`digests`) with `standing` in their place: each by its name, a
+/// The shipped files `own` lists (`digests`) with `overrides` in their place: each by its name, a
 /// space and its digest in hex, a line each, ascending.
-fn digests_over(standing: List<Source>, own: Bytes) -> Bytes / {abort.raise} = {
+fn digests_with_overrides(overrides: List<Source>, own: Bytes) -> Bytes / {abort.raise} = {
   let listed = own.split(b"\n").fold(Map::new(), |acc: Map<Bytes, Bytes>, line: Bytes|
     match line.index_of(b" ") { Some(at) -> acc.insert(line.slice(0, at), line), None -> acc });
-  let over = standing.fold(listed, |acc: Map<Bytes, Bytes>, source: Source| {
+  let over = overrides.fold(listed, |acc: Map<Bytes, Bytes>, source: Source| {
     let name = Bytes::of_string(source.path);
     let digest = Bytes::of_string(source.text).blake3().hex_of();
     acc.insert(name, Bytes::concat_all([name, b" ", Bytes::of_string(digest)]))
@@ -565,12 +579,12 @@ fn file_in(prefix: String, name: String) -> String / {abort.raise} =
 pub fn std_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../packages/std")
 
 /// A standard library module under its name in a program.
-pub type StdModule = { module: String, src: Bytes }
+pub type ShippedModule = { module: String, src: Bytes }
 
 /// Each module of the standard library's tree: a table whose cases each read one module, so an
 /// edit of one moves no other's.
-pub fn std_modules() -> List<StdModule> / {abort.raise} =
-  std_tree().fold([], |acc: List<StdModule>, f: { name: String, bytes: Bytes }|
+pub fn std_modules() -> List<ShippedModule> / {abort.raise} =
+  std_tree().fold([], |acc: List<ShippedModule>, f: { name: String, bytes: Bytes }|
     if !f.name.ends_with(".ply") { acc }
     else { acc.push({ module: module_in("std.", f.name), src: f.bytes }) })
 
@@ -579,8 +593,8 @@ pub fn compiler_tree() -> List<{ name: String, bytes: Bytes }> =
   embed_dir("../../packages/compiler")
 
 /// Each module of the compiler's tree, which `ply` ships beside the standard library.
-pub fn compiler_modules() -> List<StdModule> / {abort.raise} =
-  compiler_tree().fold([], |acc: List<StdModule>, f: { name: String, bytes: Bytes }|
+pub fn compiler_modules() -> List<ShippedModule> / {abort.raise} =
+  compiler_tree().fold([], |acc: List<ShippedModule>, f: { name: String, bytes: Bytes }|
     if !f.name.ends_with(".ply") { acc }
     else { acc.push({ module: module_in("compiler.", f.name), src: f.bytes }) })
 
@@ -643,7 +657,7 @@ pub fn shipped_drift() -> List<String> / {Shipped, abort.raise} = {
 /// that ships them lists its shipped files (`digests`).
 pub fn tree_digests() -> Bytes / {abort.raise} = {
   let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
-    files.fold([], |acc: List<Shipping>, f: { name: String, bytes: Bytes }|
+    files.fold([], |acc: List<ShippedFile>, f: { name: String, bytes: Bytes }|
       if f.name.ends_with(".ply") {
         acc.push({ name: module_in(prefix, f.name) ++ ".ply", path: f.name, bytes: f.bytes })
       } else { acc });
@@ -651,7 +665,7 @@ pub fn tree_digests() -> Bytes / {abort.raise} = {
     modules("std.", std_tree()).concat(modules("compiler.", compiler_tree())).concat(
       std_data().map(|d: { name: String, bytes: Bytes }|
         { name: d.name, path: d.name, bytes: d.bytes }),
-    ).filter(|s: Shipping| held_to_tree(s.name)),
+    ).filter(|s: ShippedFile| held_to_tree(s.name)),
   )
 }
 
@@ -675,16 +689,20 @@ fn path_dependencies(dir: String) -> List<String> / {Repo, abort.raise} =
 /// The packages the `ply` program run in this process is built from, beside the shipped modules it
 /// is handed: the program's own and each its `ply.pkg` reaches by a path, below the repository.
 pub fn program_packages() -> List<String> / {Repo, abort.raise} =
-  iterate({ todo: [parts().cli], seen: [] }, 64, |s: { todo: List<String>, seen: List<String> }|
-    match s.todo {
-      [] -> Stop(s.seen),
-      [dir, ..rest] -> if s.seen.contains(dir) { Continue({ ..s, todo: rest }) }
-      else { Continue({ todo: rest.concat(path_dependencies(dir)), seen: s.seen.push(dir) }) },
-    })
+  iterate(
+    { todo: [toolchain_parts().cli], seen: [] },
+    64,
+    |s: { todo: List<String>, seen: List<String> }|
+      match s.todo {
+        [] -> Stop(s.seen),
+        [dir, ..rest] -> if s.seen.contains(dir) { Continue({ ..s, todo: rest }) }
+        else { Continue({ todo: rest.concat(path_dependencies(dir)), seen: s.seen.push(dir) }) },
+      },
+  )
 
 /// Every tree a `ply` binary ships: the shipped modules' and the program's.
 pub fn shipped_dirs() -> List<String> / {Repo, abort.raise} = {
-  let t = parts();
+  let t = toolchain_parts();
   [t.std, t.compiler].concat(program_packages())
 }
 
@@ -699,73 +717,77 @@ pub fn tree(files: List<Source>) -> MemFs / {abort.raise} =
   })
 
 /// A tree whose working directory holds one module, `m.ply`.
-pub fn one(text: String) -> MemFs / {abort.raise} = tree([{ path: "m.ply", text: text }])
+pub fn one_module_tree(text: String) -> MemFs / {abort.raise} =
+  tree([{ path: "m.ply", text: text }])
 
 /// What a file under a tree's working directory holds, as text.
 pub fn file_of(t: MemFs, path: String) -> Option<String> / {abort.raise} =
-  match fs::mem_read(t, in_w(path)) { Some(b) -> Some(String::of_bytes(b)), None -> None }
+  match fs::mem_read(t, to_tree_path(path)) { Some(b) -> Some(String::of_bytes(b)), None -> None }
 
 /// What a run in memory said, and the tree it left.
-pub type Kept = { ran: Ran, tree: MemFs }
+pub type RunWithTree = { ran: RunResult, tree: MemFs }
 
 /// `ply` over `t`, nothing leaving the tree: its answer is a function of the tree and the line.
-pub fn in_memory(t: MemFs, argv: List<String>) -> Ran / {Hermetic, Shipped, abort.raise, diverges} =
-  kept_in_memory(t, argv, [], None).ran
+pub fn in_memory(
+  t: MemFs,
+  argv: List<String>,
+) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_with_tree(t, argv, [], None).ran
 
 /// `stdin` is what `ply replace` reads when no `--with` names a file.
-pub fn kept_in_memory(
+pub fn in_memory_with_tree(
   t: MemFs,
   argv: List<String>,
   vars: List<Var>,
   stdin: Option<String>,
-) -> Kept / {Hermetic, Shipped, abort.raise, diverges} = {
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} = {
   let o = over_tree(t, || on_disk_with(argv, vars, stdin));
   { ran: o.value, tree: o.tree }
 }
 
 /// Written out, so an operation `main` gains and `over_tree` misses is a type error, not a disk read.
-pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], entering::machine.read, entering::machine.write, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
+pub effect set CliEffects = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], entering::machine.read, entering::machine.write, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
 
 pub effect set Hermetic = {entering::hermetic_machine.read, entering::hermetic_machine.write}
 
 /// The test's working directory, the checkout the tests run from, `ply` run as a process with the
 /// environment it inherits, the connections a test makes to a server it started, and the wall clock
 /// it waits on them by.
-pub effect set Here = {fs.read[cwd], fs.write[cwd]}
+pub effect set WorkingDirectory = {fs.read[cwd], fs.write[cwd]}
 pub effect set Repo = {fs.read[repo]}
-pub effect set Spawned = {config.get[env], process.read[ply], process.write[ply], fs.read[cwd]}
-pub effect set Wire = {net.read[client], net.write[client], net.read[ports], net.write[ports]}
+pub effect set PlyProcess = {config.get[env], process.read[ply], process.write[ply], fs.read[cwd]}
+pub effect set Network = {net.read[client], net.write[client], net.read[ports], net.write[ports]}
 pub effect set Clock = {time.read, time.write}
 
 /// Where a run reads the shipped modules, which the harness keeps in memory and on disk alike.
-pub effect set Shipped = {shipped.module, shipped.answer, shipped.digests, shipped.names, shipped.reached, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.entered}
+pub effect set Shipped = {shipped.module, shipped.read_pack, shipped.digests, shipped.names, shipped.report_reached, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.run_root}
 
-pub type Over<a> = { value: a, tree: MemFs }
+pub type WithTree<a> = { value: a, tree: MemFs }
 
 /// `body` over `t`: clock stopped, entropy counted, families answered by their hermetic halves.
 pub fn over_tree<a | e>(
   t: MemFs,
-  body: () -> a / {Reached | e},
-) -> Over<a> / {abort.raise, Hermetic | e} =
+  body: () -> a / {CliEffects | e},
+) -> WithTree<a> / {abort.raise, Hermetic | e} =
   handle {
     body()
   } with {
     var disk = t,
     var drawn = 0,
-    fs.kind[cwd](p) -> fs::mem_kind(disk, in_w(p)),
+    fs.kind[cwd](p) -> fs::mem_kind(disk, to_tree_path(p)),
     fs.kind[abs](p) -> fs::mem_kind(disk, p),
-    fs.resolved[cwd](p) -> fs::mem_resolved(disk, in_w(p)),
-    fs.resolved[abs](p) -> fs::mem_resolved(disk, p),
-    fs.list_dir[cwd](p) -> fs::mem_list(disk, in_w(p)),
+    fs.resolved_kind[cwd](p) -> fs::mem_resolved_kind(disk, to_tree_path(p)),
+    fs.resolved_kind[abs](p) -> fs::mem_resolved_kind(disk, p),
+    fs.list_dir[cwd](p) -> fs::mem_list(disk, to_tree_path(p)),
     fs.list_dir[abs](p) -> fs::mem_list(disk, p),
-    fs.read_file[cwd](p) -> fs::mem_read(disk, in_w(p)),
+    fs.read_file[cwd](p) -> fs::mem_read(disk, to_tree_path(p)),
     fs.read_file[abs](p) -> fs::mem_read(disk, p),
-    fs.file_size[cwd](p) -> fs::mem_size(disk, in_w(p)),
+    fs.file_size[cwd](p) -> fs::mem_size(disk, to_tree_path(p)),
     fs.file_size[abs](p) -> fs::mem_size(disk, p),
-    fs.modified_ms[cwd](p) -> fs::mem_modified(disk, in_w(p)),
+    fs.modified_ms[cwd](p) -> fs::mem_modified(disk, to_tree_path(p)),
     fs.modified_ms[abs](p) -> fs::mem_modified(disk, p),
     fs.write_file[cwd](p, body) -> {
-      let w = fs::mem_write(disk, in_w(p), body);
+      let w = fs::mem_write(disk, to_tree_path(p), body);
       disk = w.fs;
       w.ok
     },
@@ -775,7 +797,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.write_secret[cwd](p, before, secret, encoding, after) -> {
-      let w = fs::mem_write_secret(disk, in_w(p), {
+      let w = fs::mem_write_secret(disk, to_tree_path(p), {
         before: before,
         secret: secret,
         encoding: encoding,
@@ -795,11 +817,11 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.read_secret[cwd](p, before, encoding, after) ->
-      fs::mem_read_secret(disk, in_w(p), before, encoding, after),
+      fs::mem_read_secret(disk, to_tree_path(p), before, encoding, after),
     fs.read_secret[abs](p, before, encoding, after) ->
       fs::mem_read_secret(disk, p, before, encoding, after),
     fs.create_dir[cwd](p) -> {
-      let w = fs::mem_create_dir(disk, in_w(p));
+      let w = fs::mem_create_dir(disk, to_tree_path(p));
       disk = w.fs;
       w.ok
     },
@@ -809,7 +831,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.remove[cwd](p) -> {
-      let w = fs::mem_remove(disk, in_w(p));
+      let w = fs::mem_remove(disk, to_tree_path(p));
       disk = w.fs;
       w.ok
     },
@@ -819,7 +841,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.rename[cwd](from, to) -> {
-      let w = fs::mem_rename(disk, in_w(from), in_w(to));
+      let w = fs::mem_rename(disk, to_tree_path(from), to_tree_path(to));
       disk = w.fs;
       w.ok
     },
@@ -828,23 +850,23 @@ pub fn over_tree<a | e>(
       disk = w.fs;
       w.ok
     },
-    fs.read_at[cwd](p, at, n) -> fs::mem_read_at(disk, in_w(p), at, n),
+    fs.read_at[cwd](p, at, n) -> fs::mem_read_at(disk, to_tree_path(p), at, n),
     fs.read_at[abs](p, at, n) -> fs::mem_read_at(disk, p, at, n),
-    fs.exists[cwd](p) -> fs::mem_exists(disk, in_w(p)),
+    fs.exists[cwd](p) -> fs::mem_exists(disk, to_tree_path(p)),
     fs.exists[abs](p) -> fs::mem_exists(disk, p),
-    fs.canonical[cwd](p) -> fs::mem_canonical(disk, "", in_w(p)),
+    fs.canonical[cwd](p) -> fs::mem_canonical(disk, "", to_tree_path(p)),
     fs.canonical[abs](p) -> fs::mem_canonical(disk, "", p),
-    fs.mode[cwd](p) -> fs::mem_mode(disk, in_w(p)),
+    fs.mode[cwd](p) -> fs::mem_mode(disk, to_tree_path(p)),
     fs.mode[abs](p) -> fs::mem_mode(disk, p),
-    fs.read_link[cwd](p) -> fs::mem_read_link(disk, in_w(p)),
+    fs.read_link[cwd](p) -> fs::mem_read_link(disk, to_tree_path(p)),
     fs.read_link[abs](p) -> fs::mem_read_link(disk, p),
-    fs.walk[cwd](p) -> match fs::mem_walk(disk, in_w(p)) {
-      Some(es) -> Some(es.map(|e: Entry| { ..e, path: out_of_w(e.path) })),
+    fs.walk[cwd](p) -> match fs::mem_walk(disk, to_tree_path(p)) {
+      Some(es) -> Some(es.map(|e: Entry| { ..e, path: from_tree_path(e.path) })),
       None -> None,
     },
     fs.walk[abs](p) -> fs::mem_walk(disk, p),
     fs.append[cwd](p, body) -> {
-      let a = fs::mem_append(disk, in_w(p), body);
+      let a = fs::mem_append(disk, to_tree_path(p), body);
       disk = a.fs;
       a.at
     },
@@ -854,7 +876,7 @@ pub fn over_tree<a | e>(
       a.at
     },
     fs.sync[cwd](p) -> {
-      let w = fs::mem_sync(disk, in_w(p));
+      let w = fs::mem_sync(disk, to_tree_path(p));
       disk = w.fs;
       w.ok
     },
@@ -864,7 +886,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.lock[cwd](p) -> {
-      let w = fs::mem_lock(disk, in_w(p));
+      let w = fs::mem_lock(disk, to_tree_path(p));
       disk = w.fs;
       w.ok
     },
@@ -874,7 +896,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.unlock[cwd](p) -> {
-      let w = fs::mem_unlock(disk, in_w(p));
+      let w = fs::mem_unlock(disk, to_tree_path(p));
       disk = w.fs;
       w.ok
     },
@@ -884,7 +906,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.copy[cwd](from, to) -> {
-      let w = fs::mem_copy(disk, in_w(from), in_w(to));
+      let w = fs::mem_copy(disk, to_tree_path(from), to_tree_path(to));
       disk = w.fs;
       w.ok
     },
@@ -894,7 +916,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.remove_tree[cwd](p) -> {
-      let w = fs::mem_remove_tree(disk, in_w(p));
+      let w = fs::mem_remove_tree(disk, to_tree_path(p));
       disk = w.fs;
       w.ok
     },
@@ -904,9 +926,9 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.temp_dir[cwd](dir, prefix) -> {
-      let m = fs::mem_temp_dir(disk, in_w(dir), prefix);
+      let m = fs::mem_temp_dir(disk, to_tree_path(dir), prefix);
       disk = m.fs;
-      match m.path { Some(p) -> Some(out_of_w(p)), None -> None }
+      match m.path { Some(p) -> Some(from_tree_path(p)), None -> None }
     },
     fs.temp_dir[abs](dir, prefix) -> {
       let m = fs::mem_temp_dir(disk, dir, prefix);
@@ -914,7 +936,7 @@ pub fn over_tree<a | e>(
       m.path
     },
     fs.set_mode[cwd](p, m) -> {
-      let w = fs::mem_set_mode(disk, in_w(p), m);
+      let w = fs::mem_set_mode(disk, to_tree_path(p), m);
       disk = w.fs;
       w.ok
     },
@@ -924,7 +946,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.symlink[cwd](p, to) -> {
-      let w = fs::mem_symlink(disk, in_w(p), to);
+      let w = fs::mem_symlink(disk, to_tree_path(p), to);
       disk = w.fs;
       w.ok
     },
@@ -934,7 +956,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.set_modified[cwd](p, ms) -> {
-      let w = fs::mem_set_modified(disk, in_w(p), ms);
+      let w = fs::mem_set_modified(disk, to_tree_path(p), ms);
       disk = w.fs;
       w.ok
     },
@@ -944,7 +966,7 @@ pub fn over_tree<a | e>(
       w.ok
     },
     fs.open[cwd](p, how) -> {
-      let o = fs::mem_open(disk, in_w(p), how);
+      let o = fs::mem_open(disk, to_tree_path(p), how);
       disk = o.fs;
       o.file
     },
@@ -983,17 +1005,17 @@ pub fn over_tree<a | e>(
       disk = w.fs;
       w.ok
     },
-    fs.stat[cwd](p) -> fs::mem_stat(disk, in_w(p)),
+    fs.stat[cwd](p) -> fs::mem_stat(disk, to_tree_path(p)),
     fs.stat[abs](p) -> fs::mem_stat(disk, p),
-    fs.scan[cwd](p, deep) -> match fs::mem_scan(disk, in_w(p), deep) {
-      Some(seen) -> Some(seen.map(|s: Seen| { ..s, path: out_of_w(s.path) })),
+    fs.scan[cwd](p, deep) -> match fs::mem_scan(disk, to_tree_path(p), deep) {
+      Some(seen) -> Some(seen.map(|s: ScanEntry| { ..s, path: from_tree_path(s.path) })),
       None -> None,
     },
     fs.scan[abs](p, deep) -> fs::mem_scan(disk, p, deep),
-    fs.space[cwd](p) -> fs::mem_space(disk, in_w(p)),
+    fs.space[cwd](p) -> fs::mem_space(disk, to_tree_path(p)),
     fs.space[abs](p) -> fs::mem_space(disk, p),
     fs.link[cwd](p, to) -> {
-      let l = fs::mem_link(disk, in_w(p), in_w(to));
+      let l = fs::mem_link(disk, to_tree_path(p), to_tree_path(to));
       disk = l.fs;
       l.done
     },
@@ -1017,36 +1039,37 @@ pub fn over_tree<a | e>(
     time.elapsed_us() -> 0,
     time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
     process.bound[git]() -> false,
-    process.spawn[git](args, dir, vars) -> panic(no_machine("`git`")),
+    process.spawn[git](args, dir, vars) -> panic(unavailable_in_memory("`git`")),
     entering::machine.open(library) -> entering::hermetic_machine.open(library),
     entering::machine.bind(grants) -> entering::hermetic_machine.bind(grants),
     entering::machine.enter(unit, root, arguments, run) ->
       entering::hermetic_machine.enter(unit, root, arguments, run),
-    entering::machine.moved(grants, trace) -> entering::hermetic_machine.moved(grants, trace),
+    entering::machine.changed_read(grants, trace) ->
+      entering::hermetic_machine.changed_read(grants, trace),
     entering::machine.hosting(grants) -> entering::hermetic_machine.hosting(grants),
     entering::machine.unbind(binding) -> entering::hermetic_machine.unbind(binding),
     entering::machine.close(unit) -> entering::hermetic_machine.close(unit),
-    net.connect[registry](_, _, _) -> panic(no_machine("a registry")),
-    net.connect_tls[registry](_, _, _) -> panic(no_machine("a registry")),
-    net.handshake[registry](_) -> panic(no_machine("a registry")),
-    net.send[registry](_, _, _) -> panic(no_machine("a registry")),
-    net.recv[registry](_, _, _) -> panic(no_machine("a registry")),
-    net.close[registry](_) -> panic(no_machine("a registry")),
+    net.connect[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.connect_tls[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.handshake[registry](_) -> panic(unavailable_in_memory("a registry")),
+    net.send[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.recv[registry](_, _, _) -> panic(unavailable_in_memory("a registry")),
+    net.close[registry](_) -> panic(unavailable_in_memory("a registry")),
     return value -> { value: value, tree: disk },
   }
 
 /// A test's working directory held in memory for its whole body, holding the scratch marker.
-pub fn scratch<| e>(body: () -> Unit / {Reached | e}) -> Unit / {abort.raise, Hermetic | e} =
+pub fn scratch<| e>(body: () -> Unit / {CliEffects | e}) -> Unit / {abort.raise, Hermetic | e} =
   over_tree(tree([{ path: scratch_marker(), text: "" }]), body).value
 
-fn no_machine(what: String) -> String =
+fn unavailable_in_memory(what: String) -> String =
   "a run in memory reaches no " ++ what ++ "; run this test against the disk, as `test/nondet`"
 
 /// A working-directory path as the tree spells it, and one the tree spelled as the working
 /// directory's.
-fn in_w(p: String) -> String / {abort.raise} = joined("w", p)
+fn to_tree_path(p: String) -> String / {abort.raise} = joined("w", p)
 
-fn out_of_w(p: String) -> String / {abort.raise} =
+fn from_tree_path(p: String) -> String / {abort.raise} =
   if p == "w" { "." } else if p.starts_with("w/") { p.slice(2, p.len()) } else { p }
 
 /// The lines a test's standard input holds, as a console hands them over: empty when it hands in
@@ -1067,7 +1090,7 @@ fn input_lines(stdin: Option<String>) -> List<String> / {abort.raise} =
 // --- The line ----------------------------------------------------------------
 
 /// The command `path` names, as the surface declares it.
-fn declared(root: command_line::Command, path: List<String>) -> Option<command_line::Body> =
+fn declared_command(root: command_line::Command, path: List<String>) -> Option<command_line::Body> =
   path.fold(Some(command_line::body(root)), |at: Option<command_line::Body>, word: String|
     match at {
       None -> None,
@@ -1099,10 +1122,10 @@ fn compiles(argv: List<String>) -> Bool / {abort.raise} =
 /// `argv` naming the working directory where it leaves its path off. A test's tree is a directory
 /// of modules that no package holds: a program when a line names it, and nothing to find when one
 /// does not.
-fn here_named(argv: List<String>) -> List<String> / {abort.raise} = {
+fn with_default_path(argv: List<String>) -> List<String> / {abort.raise} = {
   let surface = surface();
   let left_off = match command_line::parse(surface, argv) {
-    command_line::Run(p) -> match declared(surface.root, p.path) {
+    command_line::Run(p) -> match declared_command(surface.root, p.path) {
       None -> false,
       Some(node) -> match node.positionals.at(node.positionals.len() - 1) {
         Some(last) ->
@@ -1127,7 +1150,7 @@ fn here_named(argv: List<String>) -> List<String> / {abort.raise} = {
 /// the environment, the text `ply replace` reads and the shipped modules are the harness's. The
 /// command is this suite's own copy of the CLI, which refuses a command that compiles the program:
 /// that runs under `spawned`.
-pub fn on_disk(argv: List<String>) -> Ran / {Reached, Shipped, abort.raise, diverges} =
+pub fn on_disk(argv: List<String>) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
   on_disk_with(argv, [], None)
 
 /// `stdin` is what `ply replace` reads when no `--with` names a file.
@@ -1135,7 +1158,8 @@ pub fn on_disk_with(
   argv: List<String>,
   vars: List<Var>,
   stdin: Option<String>,
-) -> Ran / {Reached, Shipped, abort.raise, diverges} = on_disk_over(argv, vars, stdin, [])
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, vars, stdin, [])
 
 /// `ply` handed shipped modules in which each of `shipped`, named as it is filed, stands in for the
 /// module or data file this binary ships, or is one more: what a compiler that shipped those would
@@ -1144,7 +1168,8 @@ pub fn on_disk_with(
 pub fn on_disk_shipping(
   argv: List<String>,
   shipped: List<Source>,
-) -> Ran / {Reached, Shipped, abort.raise, diverges} = on_disk_over(argv, [], None, shipped)
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, [], None, shipped)
 
 /// `ply` handed `shipped` as every module it ships and every data file one of them embeds, beside
 /// `std.prelude`, which every module imports: what a compiler that shipped those and no other
@@ -1152,28 +1177,28 @@ pub fn on_disk_shipping(
 pub fn on_disk_shipping_only(
   argv: List<String>,
   shipped: List<Source>,
-) -> Ran / {Reached, Shipped, abort.raise, diverges} =
-  on_disk_over(argv, [], None, with_prelude_shipped(shipped), true)
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} =
+  on_disk_with_overrides(argv, [], None, with_prelude_shipped(shipped), true)
 
 /// `modules` with the toolchain's `std.prelude` past them where they hold none.
 pub fn with_prelude_shipped(modules: List<Source>) -> List<Source> / {abort.raise} =
   if modules.any(|s: Source| s.path == "std.prelude.ply") { modules }
   else { modules.push({ path: "std.prelude.ply", text: String::of_bytes(prelude_file()) }) }
 
-fn on_disk_over(
+fn on_disk_with_overrides(
   argv: List<String>,
   vars: List<Var>,
   stdin: Option<String>,
-  standing: List<Source>,
+  overrides: List<Source>,
   only: Bool = false,
-) -> Ran / {Reached, Shipped, abort.raise, diverges} = {
-  let refusing = standing.len() == 0;
+) -> RunResult / {CliEffects, Shipped, abort.raise, diverges} = {
+  let refusing = overrides.len() == 0;
   if refusing && compiles(argv) { panic(not_here(argv, "compiles the program")) };
-  let pwd = working();
+  let pwd = working_directory();
   let ran = handle {
     main()
   } with {
-    var io = with_input(captured(here_named(argv)), input_lines(stdin)),
+    var io = with_input(captured(with_default_path(argv)), input_lines(stdin)),
     process.args[proc]() -> args_step(io),
     process.out[proc](line) -> {
       io = out_step(io, line);
@@ -1181,7 +1206,7 @@ fn on_disk_over(
     process.err[proc](line) -> {
       io = err_step(io, line);
     },
-    process.exit[proc](code) resume k -> ran_of(exit_step(io, code)),
+    process.exit[proc](code) resume k -> captured_result(exit_step(io, code)),
     env.variable(name) -> var_of(vars, name),
     env.variables() -> vars,
     term.is_terminal(_) -> false,
@@ -1192,10 +1217,10 @@ fn on_disk_over(
     } else { entering::machine.open(library) },
     shipped.version() -> version(),
     // No binary is measured: which one runs a test is no part of what it asserts.
-    shipped.binary_bytes() -> None,
+    shipped.binary_size() -> None,
     env.working_directory() -> pwd,
-    toolchain.reused() -> pwd ++ "/" ++ reused_dir(),
-    toolchain.bodies() -> pwd ++ "/" ++ bodies(),
+    toolchain.reuse_dir() -> pwd ++ "/" ++ reused_dir(),
+    toolchain.bodies_dir() -> pwd ++ "/" ++ bodies_dir(),
     process.line[proc]() -> {
       let read: Line = line_step(io);
       io = read.captured;
@@ -1203,28 +1228,28 @@ fn on_disk_over(
     },
     fs.list_dir[shipped](_) -> if only {
       Some(
-        standing.filter(|source: Source| !source.path.contains("/")).map(|source: Source|
+        overrides.filter(|source: Source| !source.path.contains("/")).map(|source: Source|
           listed_file(source.path)),
       )
-    } else { shipped_listing_with(standing) },
-    fs.read_file[shipped](name) -> match standing.filter(|source: Source| source.path == name) {
+    } else { shipped_listing_with(overrides) },
+    fs.read_file[shipped](name) -> match overrides.filter(|source: Source| source.path == name) {
       [source, ..] -> Some(Bytes::of_string(source.text)),
-      [] -> if name == "digests" && standing.len() > 0 {
-        Some(digests_over(standing, if only { b"" } else { shipped.digests() }))
+      [] -> if name == "digests" && overrides.len() > 0 {
+        Some(digests_with_overrides(overrides, if only { b"" } else { shipped.digests() }))
       } else { shipped_file(name) },
     },
     // What a build checks its printed closure against is asked of the binary by name.
     shipped.names() -> if only {
-      standing.filter(|source: Source|
+      overrides.filter(|source: Source|
         source.path.ends_with(".ply") && !source.path.contains("/")).map(|source: Source|
         source.path.slice(0, source.path.len() - 4))
     } else { shipped.names() },
-    shipped.module(name) -> match standing.filter(|source: Source|
+    shipped.module(name) -> match overrides.filter(|source: Source|
         source.path == name ++ ".ply" || source.path == name) {
       [source, ..] -> if only { Some(Bytes::of_string(source.text)) } else { shipped.module(name) },
       [] -> if only { None } else { shipped.module(name) },
     },
-    return u -> ran_of(io),
+    return u -> captured_result(io),
   };
   ran
 }
@@ -1235,11 +1260,11 @@ fn on_disk_over(
 /// default to and the C cache this run was told to keep, so a child takes the emitter answers the
 /// run already holds, and nothing else, so no variable in the shell that started the run decides
 /// what a test asserts.
-fn inherited() -> List<String> = ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "PLY_C_CACHE"]
+fn inherited_variables() -> List<String> = ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "PLY_C_CACHE"]
 
 /// `vars`, then each inherited variable they do not name.
 pub fn environment(vars: List<Var>) -> List<Var> / {config.get[env]} =
-  inherited().fold(vars, |acc: List<Var>, name: String|
+  inherited_variables().fold(vars, |acc: List<Var>, name: String|
     if vars.any(|v: Var| v.name == name) { acc } else {
       match config.get[env](name) { Some(v) -> acc.push({ name: name, value: v }), None -> acc }
     })
@@ -1247,17 +1272,18 @@ pub fn environment(vars: List<Var>) -> List<Var> / {config.get[env]} =
 /// What a `ply` child is started with: `environment(vars)`, and the working directory's stage
 /// unless `vars` name one.
 fn ply_environment(vars: List<Var>) -> List<Var> / {config.get[env], fs.read[cwd], abort.raise} =
-  if vars.any(|v: Var| v.name == "PLY_C_STAGE") { environment(vars) }
-  else { environment(vars).push({ name: "PLY_C_STAGE", value: working() ++ "/" ++ stage() }) }
+  if vars.any(|v: Var| v.name == "PLY_C_STAGE") { environment(vars) } else {
+    environment(vars).push({ name: "PLY_C_STAGE", value: working_directory() ++ "/" ++ stage() })
+  }
 
 /// The words the binary is started with: `--color never` ahead of the line, so one that spells
 /// `--color` itself wins.
-fn started(argv: List<String>) -> List<String> / {abort.raise} =
-  ["--color", "never"].concat(here_named(argv))
+fn launch_arguments(argv: List<String>) -> List<String> / {abort.raise} =
+  ["--color", "never"].concat(with_default_path(argv))
 
 /// The binary `--exec ply` names, started in the working directory with `--color never` ahead of
 /// `argv`, so one that spells `--color` itself wins.
-pub fn spawned(argv: List<String>, vars: List<Var> = []) -> Ran / {Spawned, abort.raise} =
+pub fn spawned(argv: List<String>, vars: List<Var> = []) -> RunResult / {PlyProcess, abort.raise} =
   spawned_in("", argv, vars)
 
 /// As `spawned`, started in `dir` under the working directory.
@@ -1265,13 +1291,13 @@ pub fn spawned_in(
   dir: String,
   argv: List<String>,
   vars: List<Var>,
-) -> Ran / {Spawned, abort.raise} =
-  finished(process.spawn[ply](started(argv), dir, ply_environment(vars)))
+) -> RunResult / {PlyProcess, abort.raise} =
+  completed_result(process.spawn[ply](launch_arguments(argv), dir, ply_environment(vars)))
 
 /// Each of `argvs` run as `spawned` runs one, all started at once and answered in order.
-pub fn spawned_together(argvs: List<List<String>>) -> List<Ran> / {Spawned, abort.raise} = {
+pub fn spawned_together(argvs: List<List<String>>) -> List<RunResult> / {PlyProcess, abort.raise} = {
   let children = argvs.map(|argv: List<String>|
-    match process.start[ply](started(argv), "", ply_environment([]), {
+    match process.start[ply](launch_arguments(argv), "", ply_environment([]), {
         input: false,
         out: Keep,
         err: Keep,
@@ -1281,12 +1307,12 @@ pub fn spawned_together(argvs: List<List<String>>) -> List<Ran> / {Spawned, abor
     });
   children.map(|child: Int|
     match process.wait[ply](child, -1) {
-      Some(f) -> finished(f),
+      Some(f) -> completed_result(f),
       None -> panic("a wait with no timeout came back with nothing"),
     })
 }
 
-pub fn finished(f: Finished) -> Ran / {abort.raise} =
+pub fn completed_result(f: CompletedProcess) -> RunResult / {abort.raise} =
   {
     out: lines_of(f.out),
     err: lines_of(f.err),
@@ -1300,7 +1326,7 @@ pub type Server = { child: Int, port: Int }
 
 /// A port nothing listened on a moment ago, for a server to be told to take. Every test that takes
 /// one writes `ports`, so no two run at once and none is handed a port another holds.
-pub fn reserve() -> Int / {Wire, abort.raise} = {
+pub fn reserve_port() -> Int / {Network, abort.raise} = {
   let l = net.listen[ports](0);
   let port = match net.local_port[ports](l) {
     Some(p) -> p,
@@ -1311,8 +1337,12 @@ pub fn reserve() -> Int / {Wire, abort.raise} = {
 }
 
 /// The binary started as `spawned` starts it and left running, its streams kept for `ended`.
-pub fn serving(argv: List<String>, vars: List<Var>, port: Int) -> Server / {Spawned, abort.raise} =
-  match process.start[ply](started(argv), "", ply_environment(vars), {
+pub fn start_server(
+  argv: List<String>,
+  vars: List<Var>,
+  port: Int,
+) -> Server / {PlyProcess, abort.raise} =
+  match process.start[ply](launch_arguments(argv), "", ply_environment(vars), {
       input: false,
       out: Keep,
       err: Keep,
@@ -1323,16 +1353,22 @@ pub fn serving(argv: List<String>, vars: List<Var>, port: Int) -> Server / {Spaw
 
 /// The binary started as `spawned` starts it and left running, its output handed over a line at a
 /// time through `next_line` and its error stream dropped.
-pub fn speaking(argv: List<String>, vars: List<Var>) -> Server / {Spawned, abort.raise} =
-  talking(argv, vars, false)
+pub fn start_streaming(argv: List<String>, vars: List<Var>) -> Server / {PlyProcess, abort.raise} =
+  start_line_output(argv, vars, false)
 
-/// As `speaking`, with the binary's input left open: written with `process.input[ply]` and ended
+/// As `start_streaming`, with the binary's input left open: written with `process.input[ply]` and ended
 /// with `process.end_input[ply]`.
-pub fn listening(argv: List<String>, vars: List<Var>) -> Server / {Spawned, abort.raise} =
-  talking(argv, vars, true)
+pub fn start_interactive(
+  argv: List<String>,
+  vars: List<Var>,
+) -> Server / {PlyProcess, abort.raise} = start_line_output(argv, vars, true)
 
-fn talking(argv: List<String>, vars: List<Var>, input: Bool) -> Server / {Spawned, abort.raise} =
-  match process.start[ply](started(argv), "", ply_environment(vars), {
+fn start_line_output(
+  argv: List<String>,
+  vars: List<Var>,
+  input: Bool,
+) -> Server / {PlyProcess, abort.raise} =
+  match process.start[ply](launch_arguments(argv), "", ply_environment(vars), {
       input: input,
       out: Lines,
       err: Discard,
@@ -1342,15 +1378,16 @@ fn talking(argv: List<String>, vars: List<Var>, input: Bool) -> Server / {Spawne
   }
 
 /// The next line the server wrote, or `None` when it wrote none within `ms` or ended.
-pub fn next_line(server: Server, ms: Int) -> Option<String> / {Spawned} =
-  match process.output_line[ply](server.child, ms) { Said(line) -> Some(line), _ -> None }
+pub fn next_line(server: Server, ms: Int) -> Option<String> / {PlyProcess} =
+  match process.output_line[ply](server.child, ms) { LineWritten(line) -> Some(line), _ -> None }
 
 /// The binary run as `spawned` runs it, reading `input` and then the end of its input.
 pub fn spawned_reading(
   argv: List<String>,
   vars: List<Var>,
   input: String,
-) -> Ran / {Spawned, abort.raise} = finished(spawned_fed(argv, vars, Bytes::of_string(input)))
+) -> RunResult / {PlyProcess, abort.raise} =
+  completed_result(spawned_fed(argv, vars, Bytes::of_string(input)))
 
 /// As `spawned_reading`, for input and output that are not text: how the run ended, and each
 /// stream byte for byte.
@@ -1358,8 +1395,8 @@ pub fn spawned_fed(
   argv: List<String>,
   vars: List<Var>,
   input: Bytes,
-) -> Finished / {Spawned, abort.raise} =
-  match process.start[ply](started(argv), "", ply_environment(vars), {
+) -> CompletedProcess / {PlyProcess, abort.raise} =
+  match process.start[ply](launch_arguments(argv), "", ply_environment(vars), {
       input: true,
       out: Keep,
       err: Keep,
@@ -1389,7 +1426,7 @@ pub fn this_ply() -> String / {os.executable, abort.raise} =
 /// The words a shell starts `ply` with, as `spawned` starts it: `--color never` ahead of `argv`.
 /// `$PLY` is the binary, which `shell_environment` sets.
 fn shell_ply(argv: List<String>) -> String / {abort.raise} =
-  match shell_join(started(argv)) {
+  match shell_join(launch_arguments(argv)) {
     Some(words) -> "\"$PLY\" " ++ words,
     None -> panic("an argument no shell word spells"),
   }
@@ -1399,7 +1436,7 @@ fn shell_environment() -> List<Var> / {config.get[env], fs.read[cwd], os.executa
 
 /// `ply` run with its output piped into `reader`, a shell command: what the reader wrote, and on
 /// stderr what the run wrote there and then `status` and the code it exited with.
-pub fn spawned_into(argv: List<String>, reader: String) -> Finished / {Shell, abort.raise} =
+pub fn spawned_into(argv: List<String>, reader: String) -> CompletedProcess / {Shell, abort.raise} =
   process.spawn[sh](
     ["-c", "{ " ++ shell_ply(argv) ++ "; echo \"status $?\" >&2; } | " ++ reader],
     "",
@@ -1436,24 +1473,24 @@ pub fn at_terminal(argv: List<String>) -> Option<Int> / {Shell, abort.raise} =
 
 /// How long a server may take to listen. A server builds its program before it listens, cold where
 /// the compiler changed, so this bounds a server that never listens, not how fast one starts.
-fn listening_ms() -> Int = 300000
+fn listen_timeout_ms() -> Int = 300000
 
 /// A connection to the server's port that `ready` accepts, or why none came: the server exited, or
-/// nothing it answered was accepted within `listening_ms`.
+/// nothing it answered was accepted within `listen_timeout_ms`.
 pub fn connected<| e>(
   server: Server,
   ready: (Int) -> Bool / e,
-) -> Result<Int, String> / {diverges, abort.raise, Spawned, Wire, Clock | e} =
-  connected_by(server, time.elapsed_ms() + listening_ms(), listening_ms(), ready)
+) -> Result<Int, String> / {diverges, abort.raise, PlyProcess, Network, Clock | e} =
+  connected_by(server, time.elapsed_ms() + listen_timeout_ms(), listen_timeout_ms(), ready)
 
 fn connected_by<| e>(
   server: Server,
   until: Int,
   ms: Int,
   ready: (Int) -> Bool / e,
-) -> Result<Int, String> / {abort.raise, Spawned, Wire, Clock, diverges | e} =
+) -> Result<Int, String> / {abort.raise, PlyProcess, Network, Clock, diverges | e} =
   match process.wait[ply](server.child, 0) {
-    Some(f) -> Err("`ply run` exited before listening:\n" ++ said(finished(f))),
+    Some(f) -> Err("`ply run` exited before listening:\n" ++ all_output(completed_result(f))),
     None -> {
       let probe = match net.connect[client]("127.0.0.1", server.port, 250) {
         Some(c) -> if ready(c) { Some(c) } else {
@@ -1479,7 +1516,7 @@ fn connected_by<| e>(
   }
 
 /// The first connection the server takes, or the test fails saying why there was none.
-pub fn connection(server: Server) -> Int / {Spawned, Wire, Clock, abort.raise, diverges} =
+pub fn connection(server: Server) -> Int / {PlyProcess, Network, Clock, abort.raise, diverges} =
   match connected(server, |_c: Int| true) {
     Ok(c) -> c,
     Err(why) -> {
@@ -1488,62 +1525,73 @@ pub fn connection(server: Server) -> Int / {Spawned, Wire, Clock, abort.raise, d
     },
   }
 
-pub fn dial(port: Int, ms: Int) -> Option<Int> / {Wire} = net.connect[client]("127.0.0.1", port, ms)
+pub fn dial(port: Int, ms: Int) -> Option<Int> / {Network} =
+  net.connect[client]("127.0.0.1", port, ms)
 
-pub fn sent(c: Int, bytes: Bytes) -> Unit / {Wire, abort.raise} =
+pub fn send(c: Int, bytes: Bytes) -> Unit / {Network, abort.raise} =
   if !net::send_all[client](c, bytes, 10000) { panic("the other end stopped taking what was sent") }
 
 /// Everything the other end says until it closes, or falls silent for `ms`; `c` is then closed.
-pub fn heard(c: Int, ms: Int) -> String / {Wire, diverges} = {
-  let answer = net::drain[client](c, b"", ms);
+pub fn read_until_closed(c: Int, ms: Int) -> String / {Network, diverges} = {
+  let response = net::drain[client](c, b"", ms);
   net.close[client](c);
-  String::of_bytes_lossy(answer)
+  String::of_bytes_lossy(response)
 }
 
 /// `request` written, and everything said back before the other end closed.
-pub fn exchange(c: Int, request: Bytes) -> String / {Wire, abort.raise, diverges} = {
-  sent(c, request);
-  heard(c, 10000)
+pub fn exchange(c: Int, request: Bytes) -> String / {Network, abort.raise, diverges} = {
+  send(c, request);
+  read_until_closed(c, 10000)
 }
 
-pub fn hang_up(c: Int) -> Unit / {Wire} = net.close[client](c)
+pub fn hang_up(c: Int) -> Unit / {Network} = net.close[client](c)
 
-pub fn signal_to(server: Server, sig: Signal) -> Unit / {Spawned, abort.raise} =
+pub fn signal_to(server: Server, sig: Signal) -> Unit / {PlyProcess, abort.raise} =
   if !process.signal[ply](server.child, sig) { panic("the server had already ended") }
 
 /// How the server ended and what it wrote, once it has; one still running after `ms` is killed,
 /// and the test fails with `why`.
-pub fn ended(server: Server, ms: Int, why: String) -> Finished / {Spawned, abort.raise} =
+pub fn wait_for_exit(
+  server: Server,
+  ms: Int,
+  why: String,
+) -> CompletedProcess / {PlyProcess, abort.raise} =
   match process.wait[ply](server.child, ms) {
     Some(f) -> f,
     None -> {
       let _ = process.signal[ply](server.child, Kill);
       match process.wait[ply](server.child, -1) {
-        Some(f) -> panic(why ++ "\n" ++ said(finished(f))),
+        Some(f) -> panic(why ++ "\n" ++ all_output(completed_result(f))),
         None -> panic(why),
       }
     },
   }
 
 /// A server asked for a fixed number of connections and given them returns on its own, cleanly.
-pub fn returned(server: Server) -> Unit / {Spawned, abort.raise} = {
-  let f = ended(
+pub fn assert_returned_cleanly(server: Server) -> Unit / {PlyProcess, abort.raise} = {
+  let f = wait_for_exit(
     server,
     30000,
     "the server was still running 30s after every connection it was asked for; `serve` should have returned",
   );
   match f.ended {
     Exited(c) -> if c != 0 {
-      panic("the server exited " ++ c.to_string() ++ " after answering:\n" ++ said(finished(f)))
+      panic(
+        "the server exited " ++ c.to_string() ++ " after answering:\n"
+          ++ all_output(completed_result(f)),
+      )
     },
     Signalled(n) ->
-      panic("the server was killed by signal " ++ n.to_string() ++ ":\n" ++ said(finished(f))),
+      panic(
+        "the server was killed by signal " ++ n.to_string() ++ ":\n"
+          ++ all_output(completed_result(f)),
+      ),
   }
 }
 
 /// The server stopped, for a test that is done with it whatever state it is in: asked to end, so it
 /// reports what it read, and killed if it is still running a few seconds on.
-pub fn stop(server: Server) -> Unit / {Spawned} = {
+pub fn stop(server: Server) -> Unit / {PlyProcess} = {
   let _ = process.signal[ply](server.child, Terminate);
   match process.wait[ply](server.child, 5000) {
     Some(_) -> (),
@@ -1593,9 +1641,9 @@ pub fn manifest(name: String, deps: String) -> String =
     ++ deps
     ++ "], entry: None}\n"
 
-pub fn refused(report: Json) -> Bool = at(report, "ok") == json::Bool(false)
+pub fn not_ok(report: Json) -> Bool = at(report, "ok") == json::Bool(false)
 
-pub fn codes(v: Json) -> List<String> =
+pub fn diagnostic_codes(v: Json) -> List<String> =
   items(at(v, "diagnostics")).map(|d: Json| str(at(d, "code")))
 
 pub fn diagnostic(report: Json) -> Json = nth(at(report, "diagnostics"), 0)
@@ -1606,12 +1654,12 @@ pub fn failure_codes(report: Json) -> List<String> =
 
 pub fn code_of(report: Json) -> String = str(at(diagnostic(report), "code"))
 
-pub fn tested(flags: List<String>) -> Json / {Spawned, abort.raise} =
+pub fn test_report(flags: List<String>) -> Json / {PlyProcess, abort.raise} =
   json_of(spawned(["test", "--json"].concat(flags)))
 
 /// The tests a `ply test --json` report ran rather than took from a pass, by name.
 pub fn selected(report: Json) -> List<String> =
-  items(path(report, ["selection", "tests"])).filter(|t: Json| truth(at(t, "selected"))).map(
+  items(path(report, ["selection", "tests"])).filter(|t: Json| bool(at(t, "selected"))).map(
     |t: Json| str(at(t, "name")),
   )
 
@@ -1622,12 +1670,12 @@ pub fn failed(report: Json) -> List<String> =
 
 pub fn is_number(j: Json) -> Bool = match j { Number(_) -> true, _ -> false }
 
-pub fn succeeded(ran: Ran) -> Ran / {abort.raise} = {
-  assert(ran.code == 0, Some(said(ran)));
+pub fn succeeded(ran: RunResult) -> RunResult / {abort.raise} = {
+  assert(ran.code == 0, Some(all_output(ran)));
   ran
 }
 
-pub fn inspected(name: String) -> Json / {Reached, Shipped, abort.raise, diverges} =
+pub fn cache_entry(name: String) -> Json / {CliEffects, Shipped, abort.raise, diverges} =
   match items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")) {
     [m, ..] -> m,
     [] -> panic("the cache holds no `" ++ name ++ "`"),
@@ -1640,11 +1688,11 @@ pub fn dep(name: String, at_path: String) -> String =
 
 pub fn exists(p: String) -> Bool / {fs.exists[cwd]} = fs.exists[cwd](p)
 
-pub fn proved_here(flags: List<String>) -> Json / {Spawned, abort.raise} =
+pub fn proved_here(flags: List<String>) -> Json / {PlyProcess, abort.raise} =
   json_of(spawned(["prove", "--no-cache", "--json"].concat(flags)))
 
-pub fn proved(source: String) -> Json / {Spawned, Here, abort.raise} = {
-  program(source);
+pub fn proved(source: String) -> Json / {PlyProcess, WorkingDirectory, abort.raise} = {
+  write_program(source);
   proved_here([])
 }
 

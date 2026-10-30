@@ -15,21 +15,21 @@ import std.time (time)
 import args (Flags, style_of, root_of)
 import builder (builder)
 import lock
-import paths (Resolved, here)
+import paths (ResolvedPath, here)
 import program (Program, load_program)
-import report (Answer, indent, ok_code, count_of, refused, reported)
-import sources (index_path, tree_of)
+import report (CommandOutput, indent, ok_code, count_of, refused, reported)
+import sources (index_path, dependency_dir)
 import std.term (Style, green)
 import compiler.front.facts (Frame)
 import compiler.check.resolve.tables (Diag, error_at)
 import compiler.check.resolve.scopes (PackageDeps)
 import std.fs (fs, Listed, Dir, File)
 import std.json (Json, Array, Bool, Number, Str, object)
-import std.path (join, parent, below_root)
+import std.path (join, parent, strip_root)
 import std.list
 import compiler.syntax.parsing (no_module, dummy_span)
 
-fn trouble(path: String, why: String) -> Diag =
+fn not_vendored(path: String, why: String) -> Diag =
   error_at(
     b"E0502",
     no_module(),
@@ -53,7 +53,7 @@ fn files_under(
 ) -> List<String> / {fs.list_dir[abs], abort.raise} =
   if depth > 16 { [] } else {
     let position = if rel == "" { dir } else { join(dir, rel) };
-    match fs.list_dir[abs](below_root(position)) {
+    match fs.list_dir[abs](strip_root(position)) {
       None -> [],
       Some(listed) ->
         listed.fold([], |acc: List<String>, l: Listed| {
@@ -74,7 +74,7 @@ fn copy(
   from: String,
   to: String,
 ) -> Result<Unit, String> / {fs.create_dir[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  if !fs.create_dir[abs](below_root(to)) { Err("could not make `" ++ to ++ "`") }
+  if !fs.create_dir[abs](strip_root(to)) { Err("could not make `" ++ to ++ "`") }
   else { copy_all(from, to, files_under(from, "", 0)) }
 
 fn copy_all(
@@ -90,13 +90,13 @@ fn copy_one(
   to: String,
   rel: String,
 ) -> Result<Unit, String> / {fs.create_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  match fs.read_file[abs](below_root(join(from, rel))) {
+  match fs.read_file[abs](strip_root(join(from, rel))) {
     None -> Err("could not read `" ++ join(from, rel) ++ "`"),
     // A file's directory may be new and several levels deep: `create_dir` makes every missing one,
     // and one that is already there is not an error.
-    Some(text) -> if !fs.create_dir[abs](below_root(parent(join(to, rel)))) {
+    Some(text) -> if !fs.create_dir[abs](strip_root(parent(join(to, rel)))) {
       Err("could not make the directory of `" ++ join(to, rel) ++ "`")
-    } else if fs.write_file[abs](below_root(join(to, rel)), text) { Ok(()) }
+    } else if fs.write_file[abs](strip_root(join(to, rel)), text) { Ok(()) }
     else { Err("could not write `" ++ join(to, rel) ++ "`") },
   }
 
@@ -140,31 +140,31 @@ fn inserted(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_reached} = {
   let s: Style = style_of(flags);
   let r = root_of(flags);
   let loaded: Program = load_program(flags.paths, flags.verify_deps);
   match loaded.frame {
     None -> refused(s, "vendor", loaded.diags, loaded.places),
-    Some(w) -> match pinned(r, w, lock::committed(loaded.pkgs)) {
+    Some(w) -> match lock_mismatch_error(r, w, lock::committed_packages(loaded.pkgs)) {
       // A closure that is not what the lock pins is refused before anything is copied: vendoring it
       // would write down sources nobody pinned. The same check `ply build` makes, so a vendored tree
       // and an artifact are the same closure.
       Some(d) -> reported(s, "vendor", [d], loaded.places),
-      None -> copied(s, flags, r, loaded, w),
+      None -> vendor_output(s, flags, r, loaded, w),
     },
   }
 }
 
-fn pinned(
-  resolved: Resolved,
+fn lock_mismatch_error(
+  resolved: ResolvedPath,
   analysis: Frame,
   committed: List<String>,
 ) -> Option<Diag> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match lock::read(resolved) {
-    Err(why) -> Some(lock::refused(resolved, why)),
+    Err(why) -> Some(lock::unreadable_lock(resolved, why)),
     Ok(None) -> None,
-    Ok(Some(existing)) -> match lock::verified(
+    Ok(Some(existing)) -> match lock::verify(
         resolved,
         existing,
         lock::from_front(analysis.pins),
@@ -175,15 +175,15 @@ fn pinned(
     },
   }
 
-fn copied(
+fn vendor_output(
   style: Style,
   flags: Flags,
-  resolved: Resolved,
+  resolved: ResolvedPath,
   loaded: Program,
   analysis: Frame,
-) -> Answer / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  match place(resolved, layout(analysis, loaded)) {
-    Err(why) -> reported(style, "vendor", [trouble(resolved.display, why)], loaded.places),
+) -> CommandOutput / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
+  match vendor_packages(resolved, layout(analysis, loaded)) {
+    Err(why) -> reported(style, "vendor", [not_vendored(resolved.display, why)], loaded.places),
     Ok(rows) ->
       {
         json: json_of(rows, resolved.display, ok_code()),
@@ -211,26 +211,26 @@ fn layout(analysis: Frame, loaded: Program) -> List<{ want: String, dir: String 
 
 fn prefix_of(p: PackageDeps) -> String = String::of_bytes_lossy(p.prefix)
 
-fn place(
-  resolved: Resolved,
+fn vendor_packages(
+  resolved: ResolvedPath,
   rows: List<{ want: String, dir: String }>,
 ) -> Result<List<{ want: String, dir: String }>, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  match each(resolved, rows) {
+  match copy_each(resolved, rows) {
     Err(why) -> Err(why),
     Ok(_) -> {
       // The index lives in a directory the copy may have made and a project with no dependencies
       // has not: `create_dir` makes the vendor directory itself, whatever is in it.
       let path = index_path(resolved.absolute);
-      if !fs.create_dir[abs](below_root(parent(path))) {
+      if !fs.create_dir[abs](strip_root(parent(path))) {
         Err("could not make `" ++ parent(path) ++ "`")
-      } else if fs.write_file[abs](below_root(path), Bytes::of_string(index_text(rows))) {
+      } else if fs.write_file[abs](strip_root(path), Bytes::of_string(index_text(rows))) {
         Ok(rows)
       } else { Err("could not write `" ++ path ++ "`") }
     },
   }
 
-fn each(
-  resolved: Resolved,
+fn copy_each(
+  resolved: ResolvedPath,
   rows: List<{ want: String, dir: String }>,
 ) -> Result<Unit, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
   rows.fold(Ok(()), |acc: Result<Unit, String>, row: { want: String, dir: String }|
@@ -239,11 +239,11 @@ fn each(
       // The tree is what the walk reads *without* the index: a project that is already vendored must
       // not copy its own vendor directory into itself, and re-vendoring must copy what the fetch has
       // now rather than what the last vendor wrote.
-      Ok(_) -> copy(fresh(resolved, row.want), join(resolved.absolute, row.dir)),
+      Ok(_) -> copy(source_dir(resolved, row.want), join(resolved.absolute, row.dir)),
     })
 
-fn fresh(resolved: Resolved, want: String) -> String / {builder.git[vcs]} =
-  match tree_of(resolved.absolute, [], Bytes::of_string(want)) {
+fn source_dir(resolved: ResolvedPath, want: String) -> String / {builder.git[vcs]} =
+  match dependency_dir(resolved.absolute, [], Bytes::of_string(want)) {
     Some(dir) -> dir,
     // A want nothing can read is reported by the copy that follows: it fails on its first file.
     None -> join(resolved.absolute, join("vendor", want)),
@@ -251,7 +251,7 @@ fn fresh(resolved: Resolved, want: String) -> String / {builder.git[vcs]} =
 
 fn vendored_lines(
   style: Style,
-  resolved: Resolved,
+  resolved: ResolvedPath,
   rows: List<{ want: String, dir: String }>,
 ) -> List<String> / {abort.raise} = {
   let head = [

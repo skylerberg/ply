@@ -1,0 +1,771 @@
+//! `statics` — the static prover over a run's obligations: the claims it reads, lowered from the
+//! modules that own something to ask about and everything they import; each obligation's goal; and
+//! what a decision leaves a discharge to carry out.
+
+import compiler.front.diagnostics (parse_all)
+import compiler.front.seam (Analysed, Refused)
+import compiler.front.published (ClaimClause, analyse)
+import compiler.front.facts (Analysis)
+import compiler.front.rows (module_imports)
+import compiler.syntax.items (CostClause, EnsuresClause, RequiresClause, SpaceClause)
+import compiler.check.resolve.tables (ParsedModule)
+import context (Context, Claims, claims_read, context, ctor, signature, group_of, is_recursive,
+                terminates)
+import decide (Certified, Diagnosis, StaticResult, Undecided, GuardRefuted, Unwitnessed, Proved,
+               Unknown, decide_and_diagnose, to_static_result, not_attempted)
+import goal (Goal, Binder, Limits, BudgetSpent, Open, default_limits, default_prove_budget)
+import lemma (Lemma, lemma_of)
+import cost (dominated, dominated_space, stated_cost, steps)
+import space (space, stated_space)
+import lower (ResultAssumed, Blocker, DestructuringLet, Region, BoundUnshown, Unclosed, NotLowered,
+              blocker_parts)
+import measure (descent_of)
+import obligation (Builds, Cost, Ensures, Law, Space)
+import rules (CostBound, SpaceBound, Rule, Cited)
+import sort (canonical)
+import prover_input (Bounded, NotEnumerable, Measure, Obligation, TrustedLaw, ProverInput,
+                     Interleave, Run, Every, measures_in, measures_input, fallback_of,
+                     prover_input_of)
+import prover_input
+import std.list
+
+/// A proved law where it is written, which every claim below it in its module may use.
+pub type LocatedLemma = { module: Int, start: Int, lemma: Lemma }
+
+/// `proved` holds the laws a claim below them may use, and `decided` what deciding each of those laws
+/// came to, by obligation key, which a run that asks about one reads rather than deciding it twice.
+pub type Prover = {
+  cx: Context,
+  claims: Claims,
+  limits: Limits,
+  proved: List<LocatedLemma>,
+  decided: Map<String, Diagnosis>,
+  /// The definitions of this package every `ensures` of which a proof showed: what a call of one
+  /// may stand on.
+  contracts: List<String>,
+  /// By module, the modules it imports at any remove, whose proved laws its claims may use.
+  imports: List<List<Int>>,
+}
+
+/// Measures are decided first: a definition whose measures a proof shows descend, across its group, is
+/// unrolled as one the checker saw end. Then each law a later claim may use, in the order they are
+/// written, each with the ones above it in hand.
+pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort.raise} = {
+  let cx = context(claims, w);
+  let limits = { ..default_limits(), steps: budget };
+  let shown = w.measures.fold(Map::new(), |m: Map<String, Bool>, x: Measure|
+    match check_measure(cx, x, limits) { Ok([]) -> m.insert(x.owner, true), _ -> m });
+  let measured = {
+    cx: {
+      ..cx,
+      measured: shown.keys().fold(Map::new(), |m: Map<String, Bool>, name: String|
+        if group_of(cx, name).fold(true, |all: Bool, member: String|
+            all && (shown.contains(member) || !states_measure(cx, member))) { m.insert(name, true) }
+        else { m }),
+    },
+    claims: claims,
+    limits: limits,
+    proved: [],
+    decided: Map::new(),
+    contracts: [],
+    imports: w.imports,
+  };
+  // Each definition's clauses before those of the definitions that call it, so a caller stands on
+  // what its callees promise.
+  let clauses = w.obligations.filter(|o: Obligation|
+    match o.kind { Ensures(_) -> true, _ -> false });
+  let contracted = callee_first(cx, owners_of(clauses)).fold(
+    measured,
+    |p: Prover, owner: String| {
+      let own = clauses.filter(|o: Obligation| o.owner == owner);
+      // A clause the front end did not hash is no obligation, and a call would read it all the same.
+      let written = match p.claims.defs.get(owner) {
+        Some(d) -> d.spec.filter(|c: ClaimClause| c.kind == EnsuresClause).len(),
+        None -> 0,
+      };
+      let decided = own.fold(
+        { prover: p, all: own.len() > 0 && own.len() == written },
+        |acc: { prover: Prover, all: Bool }, o: Obligation|
+          match goal_of(acc.prover, o) {
+            None -> { prover: acc.prover, all: false },
+            Some(g) -> {
+              let d = decide_and_diagnose(acc.prover.cx, g, acc.prover.limits);
+              // One that is not proved here is asked again once every lemma is in hand.
+              // A proof that passed over a region or a body it did not take, or took the body to
+              // answer, holds of what the definition answers and shows nothing of whether it does.
+              match d.decision {
+                Proved(_) ->
+                  {
+                    prover: { ..acc.prover, decided: acc.prover.decided.insert(o.key, d) },
+                    all: acc.all
+                      && !d.blockers.any(|b: Blocker|
+                        b == Region || b == NotLowered || b == DestructuringLet
+                          || b == ResultAssumed),
+                  },
+                _ -> { prover: acc.prover, all: false },
+              }
+            },
+          },
+      );
+      if decided.all { { ..decided.prover, contracts: decided.prover.contracts.push(owner) } }
+      else { decided.prover }
+    },
+  );
+  // Another package's laws are its run's to prove, and lemmas wherever their module is imported.
+  let trusted = w.trusted_laws.fold(contracted, |p: Prover, t: TrustedLaw|
+    match p.claims.laws.get(t.key) {
+      None -> p,
+      Some(l) -> match lemma_of(
+          t.key,
+          t.label,
+          t.binders.map(|b: prover_input::Binder| canonical(b.ty)),
+          t.identities,
+          Some(l.body),
+          |name: String| signature(p.cx, name) != None && ctor(p.cx, name) == None,
+        ) {
+        Some(lemma) -> { ..p, proved: p.proved.push({ module: t.module, start: 0, lemma: lemma }) },
+        None -> p,
+      },
+    });
+  in_place_order(w.obligations.filter(lemma_candidate), w.imports).fold(
+    trusted,
+    |p: Prover, o: Obligation|
+      match lemma_at(p, o) {
+        None -> p,
+        Some(l) -> match goal_of(p, o) {
+          None -> p,
+          Some(g) -> {
+            let d = decide_and_diagnose(p.cx, g, limits_for(p, o));
+            let decided = { ..p, decided: p.decided.insert(o.key, d) };
+            match d.decision {
+              Proved(_) ->
+                {
+                  ..decided,
+                  proved: p.proved.push({ module: o.at.module, start: o.at.start, lemma: l }),
+                },
+              _ -> decided,
+            }
+          },
+        },
+      },
+  )
+}
+
+fn owners_of(os: List<Obligation>) -> List<String> =
+  os.fold([], |acc: List<String>, o: Obligation|
+    if acc.contains(o.owner) { acc } else { acc.push(o.owner) })
+
+/// `owners`, each after every other one its body names: a cycle is taken in the order given.
+fn callee_first(cx: Context, owners: List<String>) -> List<String> / {abort.raise} =
+  iterate(
+    { left: owners, out: [] },
+    owners.len() + 1,
+    |st: { left: List<String>, out: List<String> }|
+      match st.left {
+        [] -> Stop(st.out),
+        [first, ..] -> {
+          let ready = st.left.filter(|n: String|
+            match cx.claims.defs.get(n) {
+              Some(d) -> !d.refs.any(|r: String| r != n && st.left.contains(r)),
+              None -> true,
+            });
+          let taken = if ready.len() == 0 { [first] } else { ready };
+          Continue({
+            left: st.left.filter(|n: String| !taken.contains(n)),
+            out: st.out.concat(taken),
+          })
+        },
+      },
+  )
+
+/// A law with no guard that the static prover is asked about first.
+fn lemma_candidate(o: Obligation) -> Bool =
+  match o.kind {
+    Law(_) ->
+      o.guards.len() == 0 && (match fallback_of(o.strategy) { Some(_) -> true, None -> false }),
+    _ -> false,
+  }
+
+/// What a static search of `o` may spend: a law whose every point a run walks is settled by the walk
+/// should the search not close quickly, so it is given a short one.
+fn limits_for(p: Prover, o: Obligation) -> Limits =
+  match o.kind {
+    Law(_) -> match fallback_of(o.strategy) {
+      Some(Run(Every(_, _))) -> { ..p.limits, steps: min(p.limits.steps, enumerated_law_budget()) },
+      _ -> p.limits,
+    },
+    _ -> p.limits,
+  }
+
+fn enumerated_law_budget() -> Int = 256
+
+fn lemma_at(p: Prover, o: Obligation) -> Option<Lemma> =
+  match p.claims.laws.get(o.owner) {
+    None -> None,
+    Some(l) -> match l.guard {
+      Some(_) -> None,
+      None ->
+        lemma_of(
+          o.owner,
+          match o.kind { Law(Some(label)) -> label, _ -> o.owner },
+          o.binders.map(|b: prover_input::Binder| canonical(b.ty)),
+          o.identities,
+          Some(l.body),
+          |name: String| signature(p.cx, name) != None && ctor(p.cx, name) == None,
+        ),
+    },
+  }
+
+/// A module after every module it imports, then by module, then where each is written.
+fn in_place_order(os: List<Obligation>, imports: List<List<Int>>) -> List<Obligation> = {
+  let depth = |m: Int| match imports.at(m) { Some(xs) -> xs.len(), None -> 0 };
+  let ahead = |x: Obligation, o: Obligation|
+    depth(x.at.module) < depth(o.at.module)
+      || (depth(x.at.module) == depth(o.at.module)
+      && (x.at.module < o.at.module || (x.at.module == o.at.module && x.at.start <= o.at.start)));
+  os.fold([], |acc: List<Obligation>, o: Obligation|
+    acc.filter(|x: Obligation| ahead(x, o)).push(o).concat(
+      acc.filter(|x: Obligation| !ahead(x, o)),
+    ))
+}
+
+/// The proved laws written above `o` in its module, and those of every module its module imports.
+fn lemmas_for(p: Prover, o: Obligation) -> List<Lemma> = {
+  let imported = match p.imports.at(o.at.module) { Some(xs) -> xs, None -> [] };
+  p.proved.filter(|x: LocatedLemma|
+    (x.module == o.at.module && x.start < o.at.start) || imported.contains(x.module)).map(
+    |x: LocatedLemma| x.lemma,
+  )
+}
+
+/// A measure no proof shows descends, what kept one from it, and whether the checker reads its
+/// definition as ending without it.
+pub type UnprovedMeasure = { measure: Measure, reason: List<String>, ends: Bool }
+
+/// The measures the modules `owned` answers for state that no proof shows descend, which the checker
+/// refuses: a definition is read as ending on its measure only once a proof shows the measure.
+pub fn unproved_measures(
+  analysis: Analysis,
+  owned: (Bytes) -> Bool,
+) -> List<UnprovedMeasure> / {abort.raise} = {
+  let measures = measures_in(analysis, owned);
+  if measures.len() == 0 { [] } else {
+    let w = measures_input(analysis, measures);
+    let modules = w.measures.fold([], |acc: List<Int>, m: Measure|
+      if acc.fold(false, |seen: Bool, k: Int| seen || k == m.at.module) { acc }
+      else { acc.push(m.at.module) });
+    let cx = context(claims_for(analysis, modules, owned), w);
+    let limits = { ..default_limits(), steps: default_prove_budget() };
+    w.measures.fold([], |acc: List<UnprovedMeasure>, m: Measure| {
+      let ends = match cx.claims.defs.get(m.owner) { Some(d) -> d.ends, None -> false };
+      match check_measure(cx, m, limits) {
+        Ok([]) -> acc,
+        Ok(why) -> acc.push({ measure: m, reason: why, ends: ends }),
+        Err(why) ->
+          acc.push({ measure: m, reason: ["no proof can be stated: " ++ why], ends: ends }),
+      }
+    })
+  }
+}
+
+/// Nothing when a proof shows the measure descends; otherwise where the proof left what the prover
+/// decides. `Err` when no proof could be stated.
+fn check_measure(
+  cx: Context,
+  m: Measure,
+  limits: Limits,
+) -> Result<List<String>, String> / {abort.raise} =
+  match descent_of(cx, m.owner) {
+    Err(why) -> Err(why),
+    Ok(body) -> {
+      let d = decide_and_diagnose(
+        cx,
+        {
+          binders: m.binders.map(|b: prover_input::Binder| { name: b.name, ty: canonical(b.ty) }),
+          guards: [],
+          result: None,
+          body: Some(body),
+          lemmas: [],
+          total: group_of(cx, m.owner),
+          partial: true,
+          identities: [],
+          contracts: [],
+          induction_hypothesis: None,
+          builds: None,
+          tainted: [],
+        },
+        limits,
+      );
+      match d.decision {
+        Proved(_) -> Ok([]),
+        Unknown(u) -> if u.reason == BudgetSpent {
+          Ok(["the proof spent its " ++ limits.steps.to_string() ++ " steps"])
+        } else if d.blockers.all(|b: Blocker| b == Unclosed) {
+          Ok(["at some call the measure is negative or does not fall"])
+        } else {
+          Ok(
+            d.blockers.map(|b: Blocker| {
+              let parts = blocker_parts(b);
+              "the proof stopped at " ++ parts.kind
+                ++ (match parts.detail { Some(x) -> " `" ++ x ++ "`", None -> "" })
+            }),
+          )
+        },
+        _ -> Ok(["no proof was found"]),
+      }
+    },
+  }
+
+fn states_measure(cx: Context, name: String) -> Bool =
+  match cx.claims.defs.get(name) {
+    Some(d) -> match d.measure { Some(_) -> true, None -> false },
+    None -> false,
+  }
+
+/// The claims of the modules at `wanted` and everything they import, as `claims_read` reads them; a
+/// module not `owned` is opaque.
+pub fn claims_for(
+  analysis: Analysis,
+  wanted: List<Int>,
+  owned: (Bytes) -> Bool = |m: Bytes| true,
+) -> Claims / {abort.raise} = claims_read(analysis, import_closure(analysis.mods, wanted), owned)
+
+/// The modules the obligations are written in; a claim placed nowhere asks for every module.
+pub fn modules_of(analysis: Analysis, os: List<Obligation>) -> List<Int> =
+  os.fold([], |acc: List<Int>, obligation: Obligation|
+    if obligation.at.module >= analysis.mods.len() { range(0, analysis.mods.len()) }
+    else if acc.fold(false, |seen: Bool, m: Int| seen || m == obligation.at.module) { acc }
+    else { acc.push(obligation.at.module) })
+
+fn name_at(mods: List<ParsedModule>, i: Int) -> Bytes =
+  match mods.at(i) { Some(m) -> m.name, None -> b"" }
+
+/// `from` and every module it imports, transitively, ascending.
+fn import_closure(mods: List<ParsedModule>, from: List<Int>) -> List<Int> / {abort.raise} = {
+  let index = range(0, mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+    acc.insert(name_at(mods, i), i));
+  let seen = iterate(
+    { seen: from.fold(Map::new(), |acc: Map<Int, Bool>, i: Int| acc.insert(i, true)), stack: from },
+    mods.len() + from.len() + 1,
+    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
+      match s.stack.at(s.stack.len() - 1) {
+        None -> Stop(s.seen),
+        Some(i) -> {
+          let rest = range(0, s.stack.len() - 1).fold([], |acc: List<Int>, k: Int|
+            match s.stack.at(k) { Some(x) -> acc.push(x), None -> acc });
+          let imported = match mods.at(i) { Some(m) -> module_imports(m), None -> [] };
+          Continue(
+            imported.fold(
+              { seen: s.seen, stack: rest },
+              |acc: { seen: Map<Int, Bool>, stack: List<Int> }, name: Bytes|
+                match index.get(name) {
+                  Some(j) -> if acc.seen.contains(j) { acc }
+                  else { { seen: acc.seen.insert(j, true), stack: acc.stack.push(j) } },
+                  None -> acc,
+                },
+            ),
+          )
+        },
+      },
+  );
+  range(0, mods.len()).filter(|i: Int| seen.contains(i))
+}
+
+/// The obligation's goal, or none when no claim states it or it is a `cost` bound, which is read
+/// off its owner's body. Binder `i` is slot `i` of every clause: the binders, then `result`.
+pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
+  let binders = obligation.binders.concat(match obligation.result {
+    Some(r) -> [r],
+    None -> [],
+  }).map(|binder: prover_input::Binder| { name: binder.name, ty: canonical(binder.ty) });
+  match obligation.kind {
+    Ensures(index) -> match p.claims.defs.get(obligation.owner) {
+      None -> None,
+      Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == EnsuresClause).at(index) {
+        None -> None,
+        Some(clause) ->
+          Some({
+            binders: binders,
+            guards: d.spec.filter(|c: ClaimClause| c.kind == RequiresClause).map(
+              |c: ClaimClause| Some(c.clause.code),
+            ),
+            result: match obligation.result { Some(_) -> Some(d.body), None -> None },
+            body: Some(clause.clause.code),
+            lemmas: lemmas_for(p, obligation),
+            total: [],
+            partial: false,
+            identities: obligation.identities,
+            contracts: p.contracts.filter(|n: String| n != obligation.owner),
+            induction_hypothesis: if is_recursive(p.cx, obligation.owner)
+                && terminates(p.cx, obligation.owner) {
+              Some({ name: obligation.owner, clause: index })
+            } else { None },
+            builds: None,
+            tainted: [],
+          }),
+      },
+    },
+    Cost(_) -> None,
+    Space(_) -> None,
+    // No call is held to a `requires`, so a value is owed wherever the body builds one; a body that
+    // raises or never answers builds nothing.
+    Builds(type_name) -> match ((
+        p.claims.defs.get(obligation.owner),
+        p.cx.invariants.get(type_name),
+      )) {
+      (Some(d), Some(by)) ->
+        Some({
+          binders: binders,
+          guards: [],
+          result: Some(d.body),
+          body: None,
+          lemmas: lemmas_for(p, obligation),
+          total: [],
+          partial: true,
+          identities: obligation.identities,
+          contracts: p.contracts,
+          induction_hypothesis: None,
+          builds: Some({ type_name: type_name, by: by }),
+          tainted: [],
+        }),
+      _ -> None,
+    },
+    Law(_) -> match p.claims.laws.get(obligation.owner) {
+      None -> None,
+      Some(l) ->
+        Some({
+          binders: binders,
+          guards: match l.guard { Some(g) -> [Some(g.code)], None -> [] },
+          result: None,
+          body: Some(l.body),
+          lemmas: lemmas_for(p, obligation),
+          total: [],
+          partial: false,
+          identities: obligation.identities,
+          contracts: p.contracts,
+          induction_hypothesis: None,
+          builds: None,
+          tainted: [],
+        }),
+    },
+  }
+}
+
+/// What the static tier alone answers, and where it left the fragment: none for a claim its strategy
+/// never asks it about, or that no claim states.
+pub fn diagnosis_of(p: Prover, obligation: Obligation) -> Option<Diagnosis> / {abort.raise} =
+  match obligation.strategy {
+    Interleave(_) -> None,
+    Bounded -> match obligation.kind {
+      Cost(index) -> Some(check_cost_bound(p.cx, obligation.owner, index)),
+      Space(index) -> Some(check_space_bound(p.cx, obligation.owner, index)),
+      Builds(_) -> match goal_of(p, obligation) {
+        Some(g) -> Some(decide_and_diagnose(p.cx, g, p.limits)),
+        None -> None,
+      },
+      _ -> None,
+    },
+    _ -> match p.decided.get(obligation.key) {
+      Some(d) -> Some(d),
+      None -> match goal_of(p, obligation) {
+        Some(g) -> Some(decide_and_diagnose(p.cx, g, limits_for(p, obligation))),
+        None -> None,
+      },
+    },
+  }
+
+/// What a discharge is left to carry out, from what the static tier answered: only a claim whose
+/// strategy starts at the static prover is settled by it.
+pub fn static_result_for(obligation: Obligation, d: Option<Diagnosis>) -> StaticResult =
+  match obligation.strategy {
+    Interleave(_) -> not_attempted(),
+    _ -> match d { Some(x) -> to_static_result(x, obligation.variables), None -> not_attempted() },
+  }
+
+pub fn static_result(p: Prover, obligation: Obligation) -> StaticResult / {abort.raise} =
+  match obligation.strategy {
+    Interleave(_) -> not_attempted(),
+    _ -> static_result_for(obligation, diagnosis_of(p, obligation)),
+  }
+
+/// Whether `def`'s space grows no faster than its `index`th `space` bound, read off its body.
+fn check_space_bound(cx: Context, def: String, index: Int) -> Diagnosis / {abort.raise} = {
+  let open = |why: String|
+    { decision: Unknown({ reason: Open, steps: 0 }), blockers: [BoundUnshown(why)] };
+  match cx.claims.defs.get(def) {
+    None -> open("`" ++ def ++ "` has no claim here"),
+    Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == SpaceClause).at(index) {
+      None -> open("`" ++ def ++ "` has no such bound"),
+      Some(clause) -> {
+        let b = clause.clause.code;
+        match stated_space(b, d.params, d.spaced) {
+          None ->
+            open(
+              "only a bound of parameters' lengths, space names, zero, positive literals, sums, products and `ilog2` is read",
+            ),
+          Some(bound) -> match space(cx, def) {
+            Err(why) -> open(why),
+            Ok(held) -> if dominated_space(held, bound) {
+              {
+                decision: Proved({
+                  rules: [SpaceBound({ def: def })],
+                  steps: 1,
+                  sorts: [],
+                  guard_satisfiable: true,
+                }),
+                blockers: [],
+              }
+            } else {
+              open(
+                "its space is not within a constant times the bound at every size, zero included",
+              )
+            },
+          },
+        }
+      },
+    },
+  }
+}
+
+/// Whether `def`'s steps grow no faster than its `index`th `cost` bound, read off its body.
+fn check_cost_bound(cx: Context, def: String, index: Int) -> Diagnosis / {abort.raise} = {
+  let open = |why: String|
+    { decision: Unknown({ reason: Open, steps: 0 }), blockers: [BoundUnshown(why)] };
+  match cx.claims.defs.get(def) {
+    None -> open("`" ++ def ++ "` has no claim here"),
+    Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == CostClause).at(index) {
+      None -> open("`" ++ def ++ "` has no such bound"),
+      Some(clause) -> {
+        let b = clause.clause.code;
+        match stated_cost(b, d.params, d.cost_parameters) {
+          None ->
+            open(
+              "only a bound of parameters' lengths, cost names, positive literals, sums, products and `ilog2` is read",
+            ),
+          Some(bound) -> match steps(cx, def) {
+            Err(why) -> open(why),
+            Ok(steps) -> if dominated(steps, bound) {
+              {
+                decision: Proved({
+                  rules: [CostBound({ def: def })],
+                  steps: 1,
+                  sorts: [],
+                  guard_satisfiable: true,
+                }),
+                blockers: [],
+              }
+            } else {
+              open(
+                "its steps are not within a constant times the bound at every size, zero included",
+              )
+            },
+          },
+        }
+      },
+    },
+  }
+}
+
+// --- Tests ---------------------------------------------------------------------------
+
+fn whole_of(sources: List<{ name: Bytes, src: Bytes }>) -> Analysis / {abort.raise} =
+  match analyse(parse_all(sources)) { Refused(_) -> panic("the fixture checks"), Analysed(w) -> w }
+
+fn index_of(analysis: Analysis, name: Bytes) -> Int =
+  range(0, analysis.mods.len()).fold(-1, |found: Int, i: Int|
+    if name_at(analysis.mods, i) == name { i } else { found })
+
+fn claimed(cs: Claims) -> List<Bytes> = cs.defs.keys().map(Bytes::of_string)
+
+fn owed(analysis: Analysis, owner: String) -> Obligation / {abort.raise} =
+  match prover_input_of(analysis, prover_input::every).world.obligations.fold(
+      None,
+      |found: Option<Obligation>, o: Obligation| if o.owner == owner { Some(o) } else { found },
+    ) {
+    Some(o) -> o,
+    None -> panic("an obligation of the fixture"),
+  }
+
+test "the claims asked for are a module's and everything it imports, and nothing else" {
+  let sources = [
+    { name: b"base", src: b"pub fn one() -> Int = 1\n" },
+    {
+      name: b"app",
+      src: b"import base\nfn two() -> Int ensures result == 2 = base::one() + base::one()\n",
+    },
+    { name: b"side", src: b"fn zero(x: Int) -> Int ensures result == 0 = x - x\n" },
+  ];
+  let w = whole_of(sources);
+  let names = claimed(claims_for(w, [index_of(w, b"app")]));
+  assert(names.fold(false, |f: Bool, n: Bytes| f || n == b"base.one"));
+  assert(names.fold(false, |f: Bool, n: Bytes| f || n == b"app.two"));
+  assert(!names.fold(false, |f: Bool, n: Bytes| f || n == b"side.zero"))
+}
+
+test "an obligation is settled by what the prover decides, and only when its strategy asks" {
+  let sources = [
+    {
+      name: b"m",
+      src: b"fn same(x: Int) -> Int ensures result == x = x\nfn bump(x: Int) -> Int requires x < 10 ensures result > x = x + 1\nfn never(x: Int) -> Int requires x > 0 && x < 0 ensures result == 0 = x\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let p = prover_of(claims_for(w, [0]), prover_input_of(w, prover_input::every).world, 10000);
+  assert(match static_result(p, owed(w, "m.same")) { Certified(_) -> true, _ -> false });
+  // The guard is not valid, so only a kept case shows it admits a value.
+  let bump = owed(w, "m.bump");
+  assert(match static_result(p, bump) { Unwitnessed(_) -> true, _ -> false });
+  assert(static_result(p, owed(w, "m.never")) == GuardRefuted);
+  // An interleaving search never starts at the static prover, so nothing settles it.
+  assert(static_result(p, { ..bump, strategy: Interleave(NotEnumerable) }) == not_attempted());
+  assert(diagnosis_of(p, { ..bump, strategy: Interleave(NotEnumerable) }) == None)
+}
+
+test "a `cost` bound its owner's body shows is certified, and one it does not is left open with why" {
+  let sources = [
+    {
+      name: b"m",
+      src: b"fn total(xs: List<Int>) -> Int cost xs.len() = xs.fold(0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> Int cost 1 = xs.fold(0, |a: Int, x: Int| a + x)\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let p = prover_of(claims_for(w, [0]), prover_input_of(w, prover_input::every).world, 10000);
+  assert(match static_result(p, owed(w, "m.total")) {
+    Certified(s) -> s.rules == [CostBound({ def: "m.total" })],
+    _ -> false,
+  });
+  assert_eq(
+    static_result(p, owed(w, "m.wrong")),
+    Undecided({
+      spent: false,
+      blockers: [
+        BoundUnshown(
+          "its steps are not within a constant times the bound at every size, zero included",
+        ),
+      ],
+    }),
+  )
+}
+
+test "a `space` bound its owner's body shows is certified, and one it does not is left open with why" {
+  let sources = [
+    {
+      name: b"m",
+      src: b"fn total(xs: List<Int>) -> Int space 0 = xs.fold(0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> List<Int> space 0 = xs.map(|x: Int| x)\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let p = prover_of(claims_for(w, [0]), prover_input_of(w, prover_input::every).world, 10000);
+  assert(match static_result(p, owed(w, "m.total")) {
+    Certified(s) -> s.rules == [SpaceBound({ def: "m.total" })],
+    _ -> false,
+  });
+  assert_eq(
+    static_result(p, owed(w, "m.wrong")),
+    Undecided({
+      spent: false,
+      blockers: [
+        BoundUnshown(
+          "its space is not within a constant times the bound at every size, zero included",
+        ),
+      ],
+    }),
+  )
+}
+
+test "a module the run does not own is claimed by its specifications, and a transparent definition by its body" {
+  let sources = [
+    {
+      name: b"base",
+      src: b"pub transparent fn same(x: Int) -> Int = x\npub fn kept(x: Int) -> Int = 0 + x\n",
+    },
+    {
+      name: b"app",
+      src: b"import base\nfn quad(x: Int) -> Int ensures result == x = base::same(x)\nfn also(x: Int) -> Int ensures result == x = base::kept(x)\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let mine = |m: Bytes| m == b"app";
+  let p = prover_of(
+    claims_for(w, [index_of(w, b"app")], mine),
+    prover_input_of(w, mine).world,
+    10000,
+  );
+  assert(match static_result(p, owed(w, "app.quad")) { Certified(_) -> true, _ -> false });
+  assert(match static_result(p, owed(w, "app.also")) { Certified(_) -> false, _ -> true })
+}
+
+test "a proved law is a lemma for the claims of the modules that import its module" {
+  let sources = [
+    {
+      name: b"base",
+      src: b"pub fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }\nlaw \"counting counts\" forall (xs: List<Int>) { count(xs) == xs.len() }\n",
+    },
+    {
+      name: b"app",
+      src: b"import base\nlaw \"a push counts one more\" forall (xs: List<Int>, x: Int) { base::count(xs.push(x)) == xs.len() + 1 }\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let p = prover_of(
+    claims_for(w, range(0, w.mods.len())),
+    prover_input_of(w, prover_input::every).world,
+    10000,
+  );
+  assert(match static_result(p, owed(w, "base.counting counts")) {
+    Certified(_) -> true,
+    _ -> false,
+  });
+  assert(match static_result(p, owed(w, "app.a push counts one more")) {
+    Certified(c) ->
+      c.rules.fold(false, |f: Bool, r: Rule|
+        f || r == Cited({ law: "base.counting counts", label: "counting counts" })),
+    _ -> false,
+  })
+}
+
+test "another package's contract shows what its calls answer, not that they answer" {
+  let sources = [
+    {
+      name: b"base",
+      src: b"fn cube(n: Int) -> Int = n * n * n\npub fn same(n: Int) -> Int ensures result == n = {\n  let _ = cube(n);\n  n\n}\n",
+    },
+    {
+      name: b"app",
+      src: b"import base\nlaw \"same answers\" forall (n: Int) { base::same(n) == n }\nfn again(n: Int) -> Int ensures result == n = base::same(n)\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let mine = |m: Bytes| m == b"app";
+  let p = prover_of(
+    claims_for(w, [index_of(w, b"app")], mine),
+    prover_input_of(w, mine).world,
+    10000,
+  );
+  assert(match static_result(p, owed(w, "app.same answers")) { Certified(_) -> false, _ -> true });
+  assert(match static_result(p, owed(w, "app.again")) { Certified(_) -> true, _ -> false })
+}
+
+test "another package's law is a lemma where its module is imported, its own run proving it" {
+  let sources = [
+    {
+      name: b"base",
+      src: b"pub fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }\nlaw \"counting counts\" forall (xs: List<Int>) { count(xs) == xs.len() }\n",
+    },
+    {
+      name: b"app",
+      src: b"import base\nlaw \"a push counts one more\" forall (xs: List<Int>, x: Int) { base::count(xs.push(x)) == xs.len() + 1 }\n",
+    },
+  ];
+  let w = whole_of(sources);
+  let mine = |m: Bytes| m == b"app";
+  let p = prover_of(
+    claims_for(w, [index_of(w, b"app")], mine),
+    prover_input_of(w, mine).world,
+    10000,
+  );
+  assert(match static_result(p, owed(w, "app.a push counts one more")) {
+    Certified(_) -> true,
+    _ -> false,
+  })
+}

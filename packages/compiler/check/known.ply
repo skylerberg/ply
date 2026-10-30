@@ -2,19 +2,20 @@
 //! node types and the constructors of the built-in sums. Each type has a constructor that builds it
 //! and a recogniser that returns its parts, so no other module spells their names.
 
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type,
-                             applied_type, label_type, covariant_con, type_text, int_type,
-                             bool_type, string_type, bytes_type, float_type, decimal_type,
-                             unit_type, list_type, option_type, map_type, iter_type, secret_type)
+import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
+                             Field, named_type, applied_type, label_type, is_covariant_container,
+                             type_text, int_type, bool_type, string_type, bytes_type, float_type,
+                             decimal_type, unit_type, list_type, option_type, map_type, iter_type,
+                             secret_type)
 import compiler.check.resolve.tables (qualify)
 import compiler.syntax.exprs (prelude_module)
-import compiler.syntax.items (Item, IType, TDExtern, parse)
+import compiler.syntax.items (Item, TypeItem, ExternBody, parse)
 import std.prelude_source
 
 // --- Names ---------------------------------------------------------------------------------------
 
 /// The name of a type `check/types.ply` builds, read off its constructor so it is spelled once.
-fn name_of(ty: Type) -> Bytes = match ty { TyCon(c) -> c.name, _ -> b"" }
+fn name_of(ty: Type) -> Bytes = match ty { NamedType(c) -> c.name, _ -> b"" }
 
 pub fn int_name() -> Bytes = name_of(int_type())
 pub fn bool_name() -> Bytes = name_of(bool_type())
@@ -201,14 +202,14 @@ pub fn columns_type(row: Type) -> Type = applied_type(columns_name(), row)
 
 /// `label` is the region's label type, which the checker lays before the type held.
 pub fn hold_type(label: Type, held: Type) -> Type =
-  TyCon({ name: hold_name(), args: [label, held] })
+  NamedType({ name: hold_name(), args: [label, held] })
 pub fn task_type(answer: Type) -> Type = applied_type(task_name(), answer)
 pub fn chan_type(item: Type) -> Type = applied_type(chan_name(), item)
 pub fn result_type(ok: Type, error: Type) -> Type =
-  TyCon({ name: result_name(), args: [ok, error] })
+  NamedType({ name: result_name(), args: [ok, error] })
 pub fn list_node_type(item: Type) -> Type = applied_type(list_node_name(), item)
 pub fn map_node_type(key: Type, value: Type) -> Type =
-  TyCon({ name: map_node_name(), args: [key, value] })
+  NamedType({ name: map_node_name(), args: [key, value] })
 
 /// Raises where no fixed-width type is `width` wide.
 pub fn width_type(width: { bits: Int, signed: Bool }) -> Type / {abort.raise} =
@@ -226,13 +227,13 @@ pub fn width_named(width: { bits: Int, signed: Bool }) -> Option<Bytes> =
 
 /// The arguments of `ty` where it is the type named `name`, and none otherwise.
 fn args_named(ty: Type, name: Bytes) -> List<Type> =
-  match ty { TyCon(c) -> if c.name == name { c.args } else { [] }, _ -> [] }
+  match ty { NamedType(c) -> if c.name == name { c.args } else { [] }, _ -> [] }
 
 fn only_arg(ty: Type, name: Bytes) -> Option<Type> =
   match args_named(ty, name) { [t] -> Some(t), _ -> None }
 
 fn is_named(ty: Type, name: Bytes) -> Bool =
-  match ty { TyCon(c) -> c.name == name && c.args.len() == 0, _ -> false }
+  match ty { NamedType(c) -> c.name == name && c.args.len() == 0, _ -> false }
 
 pub fn is_int(ty: Type) -> Bool = is_named(ty, int_name())
 pub fn is_bool(ty: Type) -> Bool = is_named(ty, bool_name())
@@ -264,28 +265,28 @@ pub fn map_node_parts(ty: Type) -> Option<{ key: Type, value: Type }> =
 pub fn result_parts(ty: Type) -> Option<{ ok: Type, error: Type }> =
   match args_named(ty, result_name()) { [o, e] -> Some({ ok: o, error: e }), _ -> None }
 
-pub fn iter_parts(ty: Type) -> Option<{ state: Type, answer: Type }> =
-  match args_named(ty, iter_name()) { [s, r] -> Some({ state: s, answer: r }), _ -> None }
+pub fn iter_parts(ty: Type) -> Option<{ state: Type, result: Type }> =
+  match args_named(ty, iter_name()) { [s, r] -> Some({ state: s, result: r }), _ -> None }
 
 /// Whether `ty` names a `Secret` anywhere in it.
 pub fn mentions_secret(ty: Type) -> Bool =
   match ty {
-    TyCon(c) ->
+    NamedType(c) ->
       c.name == secret_name() || c.args.fold(false, |acc: Bool, a: Type| acc || mentions_secret(a)),
-    TyFn(f) ->
+    FunctionType(f) ->
       f.params.fold(false, |acc: Bool, p: Type| acc || mentions_secret(p))
         || mentions_secret(f.ret),
-    TyRecord(fs) -> fs.fold(false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
-    TyNominal(n) -> n.fields.fold(false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
-    TyVar(_) -> false,
+    RecordType(fs) -> fs.fold(false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+    NominalType(n) -> n.fields.fold(false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+    VariableType(_) -> false,
   }
 
 // --- Tests ---------------------------------------------------------------------------------------
 
 /// One type of each kind this module and `check/types.ply` build.
 fn built() -> List<Type> / {abort.raise} = {
-  let a = TyVar(0);
-  let b = TyVar(1);
+  let a = VariableType(0);
+  let b = VariableType(1);
   [
     int_type(),
     bool_type(),
@@ -327,8 +328,8 @@ fn prelude_externs() -> List<{ name: Bytes, arity: Int }> / {abort.raise} =
     [],
     |acc: List<{ name: Bytes, arity: Int }>, item: Item|
       match item {
-        IType(d) -> match d.body {
-          TDExtern -> acc.push({ name: d.name.name, arity: d.generics.types.len() }),
+        TypeItem(d) -> match d.body {
+          ExternBody -> acc.push({ name: d.name.name, arity: d.generics.types.len() }),
           _ -> acc,
         },
         _ -> acc,
@@ -343,7 +344,7 @@ test "each type built is one the checker or the prelude declares, at the arity i
   let labels = |t: Type| match hold_parts(t) { Some(_) -> 1, None -> 0 };
   let undeclared = built().filter(|t: Type|
     match t {
-      TyCon(c) -> arity_declared(declared, c.name) != Some(c.args.len() - labels(t)),
+      NamedType(c) -> arity_declared(declared, c.name) != Some(c.args.len() - labels(t)),
       _ -> true,
     });
   assert_eq(undeclared.map(type_text), [])
@@ -365,7 +366,7 @@ test "each recogniser returns the parts its constructor built" {
   assert_eq(map_parts(map_type(a, b)), Some({ key: a, value: b }));
   assert_eq(map_node_parts(map_node_type(a, b)), Some({ key: a, value: b }));
   assert_eq(result_parts(result_type(a, b)), Some({ ok: a, error: b }));
-  assert_eq(iter_parts(iter_type(a, b)), Some({ state: a, answer: b }));
+  assert_eq(iter_parts(iter_type(a, b)), Some({ state: a, result: b }));
   assert_eq(list_item(array_type(a)), None);
   assert(is_char(char_type()) && !is_char(list_type(char_type())), None);
   assert_eq(
@@ -388,6 +389,6 @@ test "the containers check/types.ply unifies covariantly and prints are the ones
     iter_type(a, a),
     hold,
   ];
-  assert_eq(containers.filter(|t: Type| !covariant_con(name_of(t))).map(type_text), []);
+  assert_eq(containers.filter(|t: Type| !is_covariant_container(name_of(t))).map(type_text), []);
   assert(type_text(hold).starts_with(b"Hold<Int, ["), None)
 }

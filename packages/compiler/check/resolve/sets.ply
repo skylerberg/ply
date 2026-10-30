@@ -1,28 +1,36 @@
 //! Effect sets and law schemas: what a set holds and what an instantiation of a schema states.
 
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, is_bare, span_between)
-import compiler.syntax.sites (numbered_made)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, RowExpr, AtomExpr, MRead,
-                                    mode_text)
-import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, Cases,
-                              TDSum, TDAlias, VariantDef, SpecClause, Binder, EffectSetDef, OpDef,
-                              LawDef, OfSchema, SchemaDef, SchemaIdentity, schema_named,
-                              schema_guard_name, law_type_variables, TDNominal, TDExtern)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm, HandleClause,
-                              HandlerVar, RecField, ETagged, Hole)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad)
+import compiler.syntax.node_ids (numbered_made)
+import compiler.syntax.type_syntax (TypeExpr, VariableTypeExpression, NamedTypeExpression,
+                                    FunctionTypeExpression, RecordTypeExpression, RowExpr, AtomExpr,
+                                    ReadMode, mode_text)
+import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
+                              EffectSetItem, Cases, SumBody, AliasBody, VariantDef, SpecClause,
+                              Binder, EffectSetDef, OpDef, LawDef, SchemaInstance, SchemaDef,
+                              SchemaIdentity, schema_named, schema_guard_name, law_type_variables,
+                              NominalBody, ExternBody)
+import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, BinaryExpression,
+                              UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                              MatchExpression, BlockExpression, RecordExpression,
+                              RecordUpdateExpression, PropagateExpression, FieldExpression,
+                              ListExpression, PerformExpression, HandleExpression,
+                              WithHoldExpression, SimulateExpression, ParallelExpression,
+                              InvalidExpression, HoleExpression, TryBlockExpression, Stmt,
+                              LetStatement, LetElseStatement, ExpressionStatement,
+                              AssignmentStatement, Param, NamedArg, MatchArm, HandleClause,
+                              HandlerVar, RecordLiteralField, TaggedLiteralExpression, Hole)
+import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
+                                 PatternRange, PatternConstructor, PatternRecord, PatternList,
+                                 PatternOr, PatternInvalid)
 import std.list
 import std.bytes (ascii_of_int)
-import compiler.check.resolve.tables (ParsedModule, EffectSpace, SetSpace, ValueSpace, Declared,
-                                      Binding, ModuleBinding, Scope, Label, Diag, Resolved,
+import compiler.check.resolve.tables (ParsedModule, EffectSpace, SetSpace, ValueSpace, Declaration,
+                                      Binding, ModuleBinding, Scope, Label, Diag, Resolution,
                                       lookup_declared, lookup, find_module_binding, position,
                                       qualify, label_at, error_with_labels, error_at, error_at_and,
                                       backticked)
-import compiler.check.resolve.scopes (private_name, find)
+import compiler.check.resolve.scopes (private_name_error, find)
 import compiler.expand.rewrite.shared (bare_names_read)
 
 // --- Effect sets ---------------------------------------------------------------------------
@@ -32,7 +40,7 @@ import compiler.expand.rewrite.shared (bare_names_read)
 // effect, which the row's module then reaches under a binder no import can write, so no import of
 // its own can stand in for it.
 
-pub fn reached_binder(module: Bytes) -> Bytes = b"@".concat(module)
+pub fn implicit_binder(module: Bytes) -> Bytes = b"@".concat(module)
 
 /// One atom a set stands for, and the module whose scope wrote it.
 type Member = { atom: AtomExpr, home: Int }
@@ -56,7 +64,7 @@ fn set_table(mods: List<ParsedModule>) -> SetTable / {abort.raise} =
       { ..table, by_module: table.by_module.push(Map::new()) },
       |acc: SetTable, item: Item|
         match item {
-          IEffectSet(d) -> {
+          EffectSetItem(d) -> {
             let mine = acc.by_module.get(m);
             match mine.get(d.name.name) {
               Some(first) ->
@@ -94,7 +102,7 @@ fn set_table(mods: List<ParsedModule>) -> SetTable / {abort.raise} =
         },
     ))
 
-fn unknown_set(resolved: Resolved, m: Int, qname: QName) -> Diag / {abort.raise} = {
+fn unknown_set(resolved: Resolution, m: Int, qname: QName) -> Diag / {abort.raise} = {
   let scope = resolved.scopes.get(m);
   let n = qname.name.name;
   let effect_notes = match lookup(scope.bound, EffectSpace, n) {
@@ -132,8 +140,8 @@ fn is_diverges_name(qname: QName) -> Bool = qname.module == None && qname.name.n
 
 fn diverges_expr(qname: QName) -> AtomExpr =
   {
-    eff: qname,
-    mode: MRead,
+    effect_name: qname,
+    mode: ReadMode,
     op: None,
     resource: None,
     every: false,
@@ -143,7 +151,7 @@ fn diverges_expr(qname: QName) -> AtomExpr =
 
 /// The set `qname` names in module `m`: one it declares or imports by name, or one a module binder reaches.
 fn set_named(
-  resolved: Resolved,
+  resolved: Resolution,
   table: SetTable,
   m: Int,
   qname: QName,
@@ -174,8 +182,8 @@ fn set_named(
         let module = resolved.scopes.get(mb.target).module;
         match lookup_declared(resolved.declarations.get(mb.target), SetSpace, name) {
           None -> {
-            let exported = resolved.declarations.get(mb.target).sets.filter(|d: Declared|
-              d.public).map(|d: Declared| d.name);
+            let exported = resolved.declarations.get(mb.target).sets.filter(|d: Declaration|
+              d.public).map(|d: Declaration| d.name);
             Err(
               error_at(
                 b"E0114",
@@ -200,7 +208,7 @@ fn set_named(
             )
           },
           Some(d) -> if !d.public && mb.target != m {
-            Err(private_name(m, qname.span, mb.target, d.span, SetSpace, name, module))
+            Err(private_name_error(m, qname.span, mb.target, d.span, SetSpace, name, module))
           } else {
             match table.by_module.get(mb.target).get(name) {
               Some(id) -> Ok(id),
@@ -213,7 +221,7 @@ fn set_named(
   }
 }
 
-fn set_includes(resolved: Resolved, table: SetTable) -> SetTable / {abort.raise} =
+fn set_includes(resolved: Resolution, table: SetTable) -> SetTable / {abort.raise} =
   range(0, table.nodes.len()).fold(table, |acc: SetTable, id: Int| {
     let node = acc.nodes.get(id);
     let walked = node.def.includes.fold(
@@ -323,7 +331,7 @@ fn set_cycle(table: SetTable, cycle: List<Int>) -> Diag / {abort.raise} = {
 /// The module that declares the effect `qname` names in `home`, and its name there: none for a prelude
 /// effect, or one nothing declares.
 fn effect_owner(
-  resolved: Resolved,
+  resolved: Resolution,
   home: Int,
   qname: QName,
 ) -> Option<{ target: Int, name: Bytes }> / {abort.raise} = {
@@ -348,13 +356,13 @@ fn effect_owner(
 }
 
 /// What an atom names, wherever it was written: its effect's program-wide name, mode, operation and label.
-fn member_key(resolved: Resolved, member: Member) -> Bytes / {abort.raise} = {
+fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise} = {
   let a = member.atom;
-  let eff = match effect_owner(resolved, member.home, a.eff) {
+  let eff = match effect_owner(resolved, member.home, a.effect_name) {
     Some(o) -> qualify(resolved.scopes.get(o.target).module, o.name),
-    None -> match a.eff.module {
-      Some(b) -> Bytes::concat_all([b.name, b"::", a.eff.name.name]),
-      None -> a.eff.name.name,
+    None -> match a.effect_name.module {
+      Some(b) -> Bytes::concat_all([b.name, b"::", a.effect_name.name.name]),
+      None -> a.effect_name.name.name,
     },
   };
   Bytes::concat_all([
@@ -378,7 +386,7 @@ fn insert_keyed(sorted: List<KeyedMember>, k: KeyedMember) -> List<KeyedMember> 
 }
 
 /// Ordered by what each atom names; of two that name the same, the first written is kept.
-fn canonical_members(resolved: Resolved, xs: List<Member>) -> List<Member> / {abort.raise} = {
+fn canonical_members(resolved: Resolution, xs: List<Member>) -> List<Member> / {abort.raise} = {
   let sorted = xs.fold([], |acc: List<KeyedMember>, member: Member|
     insert_keyed(acc, { key: member_key(resolved, member), member: member }));
   sorted.fold([], |acc: List<KeyedMember>, keyed: KeyedMember|
@@ -388,7 +396,7 @@ fn canonical_members(resolved: Resolved, xs: List<Member>) -> List<Member> / {ab
 
 type SetWork = { t: SetTable, done: List<Bool>, work: List<{ node: Int, visited: Bool }> }
 
-fn set_expand_all(resolved: Resolved, table: SetTable) -> SetTable / {abort.raise} = {
+fn set_expand_all(resolved: Resolution, table: SetTable) -> SetTable / {abort.raise} = {
   let n = table.nodes.len();
   let steps = table.nodes.fold(0, |acc: Int, node: SetNode| acc + node.includes.len());
   let start: SetWork = { t: table, done: range(0, n).map(|i: Int| false), work: [] };
@@ -400,7 +408,7 @@ fn set_expand_all(resolved: Resolved, table: SetTable) -> SetTable / {abort.rais
   finished.t
 }
 
-fn set_expand_step(resolved: Resolved, x: SetWork) -> SetWork / {abort.raise} = {
+fn set_expand_step(resolved: Resolution, x: SetWork) -> SetWork / {abort.raise} = {
   let top = x.work.get(x.work.len() - 1);
   let rest = x.work.take(x.work.len() - 1);
   let node = x.t.nodes.get(top.node);
@@ -436,11 +444,14 @@ fn set_expand_step(resolved: Resolved, x: SetWork) -> SetWork / {abort.raise} = 
   }
 }
 
-fn moved_to(atom: AtomExpr, span: Span) -> AtomExpr =
+fn atom_with_span(atom: AtomExpr, span: Span) -> AtomExpr =
   {
-    eff: {
-      module: match atom.eff.module { Some(b) -> Some({ name: b.name, span: span }), None -> None },
-      name: { name: atom.eff.name.name, span: span },
+    effect_name: {
+      module: match atom.effect_name.module {
+        Some(b) -> Some({ name: b.name, span: span }),
+        None -> None,
+      },
+      name: { name: atom.effect_name.name.name, span: span },
       span: span,
     },
     mode: atom.mode,
@@ -451,24 +462,29 @@ fn moved_to(atom: AtomExpr, span: Span) -> AtomExpr =
     span: span,
   }
 
-type Usable = { atom: AtomExpr, bind: Option<ModuleBinding> }
+type LocalizedAtom = { atom: AtomExpr, bind: Option<ModuleBinding> }
 
 /// A member as module `m` writes it at `span`: as written in its own module, and through the module
 /// that declares its effect anywhere else. An effect that resolves to no module, a prelude one or a
 /// misspelling, keeps its written name, and the checker answers for it where the set is named.
-fn usable(resolved: Resolved, m: Int, member: Member, span: Span) -> Usable / {abort.raise} =
+fn localize_member(
+  resolved: Resolution,
+  m: Int,
+  member: Member,
+  span: Span,
+) -> LocalizedAtom / {abort.raise} =
   if member.home == m { { atom: member.atom, bind: None } } else {
-    let moved = moved_to(member.atom, span);
-    match effect_owner(resolved, member.home, member.atom.eff) {
+    let moved = atom_with_span(member.atom, span);
+    match effect_owner(resolved, member.home, member.atom.effect_name) {
       None -> { atom: moved, bind: None },
       Some(o) -> {
         let module = resolved.scopes.get(o.target).module;
         if module.len() == 0 { { atom: moved, bind: None } } else {
-          let binder = reached_binder(module);
+          let binder = implicit_binder(module);
           {
             atom: {
               ..moved,
-              eff: {
+              effect_name: {
                 module: Some({ name: binder, span: span }),
                 name: { name: o.name, span: span },
                 span: span,
@@ -481,14 +497,14 @@ fn usable(resolved: Resolved, m: Int, member: Member, span: Span) -> Usable / {a
     }
   }
 
-fn with_reach(xs: List<ModuleBinding>, b: Option<ModuleBinding>) -> List<ModuleBinding> =
+fn add_binding_once(xs: List<ModuleBinding>, b: Option<ModuleBinding>) -> List<ModuleBinding> =
   match b {
     None -> xs,
     Some(x) -> match find_module_binding(xs, x.binder) { Some(_) -> xs, None -> xs.push(x) },
   }
 
 type RowExpander = {
-  resolved: Resolved,
+  resolved: Resolution,
   table: SetTable,
   module: Int,
   reached: List<ModuleBinding>,
@@ -499,20 +515,20 @@ type RowExpander = {
 fn made_atom(a: AtomExpr) -> AtomExpr =
   {
     ..a,
-    eff: {
-      module: match a.eff.module {
+    effect_name: {
+      module: match a.effect_name.module {
         Some(m) -> Some({ ..m, span: { ..m.span, site: 0 } }),
         None -> None,
       },
-      name: { ..a.eff.name, span: { ..a.eff.name.span, site: 0 } },
-      span: { ..a.eff.span, site: 0 },
+      name: { ..a.effect_name.name, span: { ..a.effect_name.name.span, site: 0 } },
+      span: { ..a.effect_name.span, site: 0 },
     },
     op: match a.op { Some(o) -> Some({ ..o, span: { ..o.span, site: 0 } }), None -> None },
   }
 
 type ExpandedRow = { expander: RowExpander, r: RowExpr }
 
-fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.raise} =
+fn expand_row(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.raise} =
   if row.aliases.len() == 0 { { expander: expander, r: row } } else {
     let o = row.aliases.fold(
       { expander: expander, atoms: row.atoms },
@@ -526,9 +542,17 @@ fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.ra
               acc.expander.table.nodes.get(id).members.fold(
                 acc,
                 |a: { expander: RowExpander, atoms: List<AtomExpr> }, member: Member| {
-                  let u = usable(a.expander.resolved, a.expander.module, member, qname.span);
+                  let u = localize_member(
+                    a.expander.resolved,
+                    a.expander.module,
+                    member,
+                    qname.span,
+                  );
                   {
-                    expander: { ..a.expander, reached: with_reach(a.expander.reached, u.bind) },
+                    expander: {
+                      ..a.expander,
+                      reached: add_binding_once(a.expander.reached, u.bind),
+                    },
                     atoms: a.atoms.push(made_atom(u.atom)),
                   }
                 },
@@ -549,8 +573,8 @@ fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.ra
   }
 
 /// Each row of the module with every set it names expanded; each set's own item with all it stands for.
-fn module_sets(
-  resolved: Resolved,
+fn expand_module_sets(
+  resolved: Resolution,
   table: SetTable,
   m: Int,
   parsed: ParsedModule,
@@ -567,25 +591,28 @@ fn module_sets(
     { expander: start, items: [] },
     |acc: { expander: RowExpander, items: List<Item> }, item: Item|
       match item {
-        IEffectSet(d) -> match table.by_module.get(m).get(d.name.name) {
+        EffectSetItem(d) -> match table.by_module.get(m).get(d.name.name) {
           Some(id) -> if table.nodes.get(id).def.span == d.span {
             let us = table.nodes.get(id).members.map(|member: Member|
-              usable(resolved, m, member, d.name.span));
+              localize_member(resolved, m, member, d.name.span));
             {
               expander: {
                 ..acc.expander,
                 reached: us.fold(
                   acc.expander.reached,
-                  |bindings: List<ModuleBinding>, u: Usable| with_reach(bindings, u.bind),
+                  |bindings: List<ModuleBinding>, u: LocalizedAtom|
+                    add_binding_once(bindings, u.bind),
                 ),
               },
-              items: acc.items.push(IEffectSet({ ..d, expansion: us.map(|u: Usable| u.atom) })),
+              items: acc.items.push(
+                EffectSetItem({ ..d, expansion: us.map(|u: LocalizedAtom| u.atom) }),
+              ),
             }
           } else { { ..acc, items: acc.items.push(item) } },
           None -> { ..acc, items: acc.items.push(item) },
         },
         _ -> {
-          let o = rows_item(acc.expander, item);
+          let o = expand_rows_in_item(acc.expander, item);
           {
             expander: o.expander,
             items: acc.items.push(if o.expander.rows == acc.expander.rows { o.it }
@@ -607,266 +634,293 @@ fn module_sets(
 // Every row an item writes, with the sets it names expanded. Rows are walked on lambda parameter
 // types and `let` annotations, never on a lambda's return type.
 
-fn rows_opt(
+fn expand_optional_row(
   expander: RowExpander,
   r: Option<RowExpr>,
 ) -> { expander: RowExpander, r: Option<RowExpr> } / {abort.raise} =
   match r {
     None -> { expander: expander, r: None },
     Some(x) -> {
-      let o = row_with_sets(expander, x);
+      let o = expand_row(expander, x);
       { expander: o.expander, r: Some(o.r) }
     },
   }
 
-fn rows_ty(
+fn expand_rows_in_type(
   expander: RowExpander,
   ty: TypeExpr,
 ) -> { expander: RowExpander, t: TypeExpr } / {abort.raise} =
   match ty {
-    TCon(c) -> {
-      let o = rows_tys(expander, c.args);
+    NamedTypeExpression(c) -> {
+      let o = expand_rows_in_types(expander, c.args);
       let rows = c.rows.fold(
         { expander: o.expander, rs: [] },
         |acc: { expander: RowExpander, rs: List<RowExpr> }, row: RowExpr| {
-          let r = row_with_sets(acc.expander, row);
+          let r = expand_row(acc.expander, row);
           { expander: r.expander, rs: acc.rs.push(r.r) }
         },
       );
-      { expander: rows.expander, t: TCon({ ..c, args: o.ts, rows: rows.rs }) }
+      { expander: rows.expander, t: NamedTypeExpression({ ..c, args: o.ts, rows: rows.rs }) }
     },
-    TFn(ft) -> {
-      let ps = rows_tys(expander, ft.params);
-      let r = rows_ty(ps.expander, ft.ret);
-      let e = rows_opt(r.expander, ft.effects);
-      { expander: e.expander, t: TFn({ ..ft, params: ps.ts, ret: r.t, effects: e.r }) }
+    FunctionTypeExpression(ft) -> {
+      let ps = expand_rows_in_types(expander, ft.params);
+      let r = expand_rows_in_type(ps.expander, ft.ret);
+      let e = expand_optional_row(r.expander, ft.effects);
+      {
+        expander: e.expander,
+        t: FunctionTypeExpression({ ..ft, params: ps.ts, ret: r.t, effects: e.r }),
+      }
     },
-    TRecord(r) -> {
+    RecordTypeExpression(r) -> {
       let fs = r.fields.fold(
         { expander: expander, fs: [] },
         |acc: { expander: RowExpander, fs: List<{ name: Ident, ty: TypeExpr }> }, fd: { name: Ident, ty: TypeExpr }| {
-          let o = rows_ty(acc.expander, fd.ty);
+          let o = expand_rows_in_type(acc.expander, fd.ty);
           { expander: o.expander, fs: acc.fs.push({ name: fd.name, ty: o.t }) }
         },
       );
-      { expander: fs.expander, t: TRecord({ span: r.span, fields: fs.fs }) }
+      { expander: fs.expander, t: RecordTypeExpression({ span: r.span, fields: fs.fs }) }
     },
     _ -> { expander: expander, t: ty },
   }
 
-fn rows_tys(
+fn expand_rows_in_types(
   expander: RowExpander,
   tys: List<TypeExpr>,
 ) -> { expander: RowExpander, ts: List<TypeExpr> } / {abort.raise} =
   tys.fold(
     { expander: expander, ts: [] },
     |acc: { expander: RowExpander, ts: List<TypeExpr> }, ty: TypeExpr| {
-      let o = rows_ty(acc.expander, ty);
+      let o = expand_rows_in_type(acc.expander, ty);
       { expander: o.expander, ts: acc.ts.push(o.t) }
     },
   )
 
-fn rows_opt_ty(
+fn expand_rows_in_optional_type(
   expander: RowExpander,
   ty: Option<TypeExpr>,
 ) -> { expander: RowExpander, t: Option<TypeExpr> } / {abort.raise} =
   match ty {
     None -> { expander: expander, t: None },
     Some(x) -> {
-      let o = rows_ty(expander, x);
+      let o = expand_rows_in_type(expander, x);
       { expander: o.expander, t: Some(o.t) }
     },
   }
 
-fn rows_params(
+fn expand_rows_in_parameters(
   expander: RowExpander,
   params: List<Param>,
 ) -> { expander: RowExpander, ps: List<Param> } / {abort.raise} =
   params.fold(
     { expander: expander, ps: [] },
     |acc: { expander: RowExpander, ps: List<Param> }, param: Param| {
-      let o = rows_opt_ty(acc.expander, param.ty);
+      let o = expand_rows_in_optional_type(acc.expander, param.ty);
       { expander: o.expander, ps: acc.ps.push({ ..param, ty: o.t }) }
     },
   )
 
-fn rows_exprs(
+fn expand_rows_in_expressions(
   expander: RowExpander,
   exprs: List<Expr>,
 ) -> { expander: RowExpander, xs: List<Expr> } / {abort.raise} =
   exprs.fold(
     { expander: expander, xs: [] },
     |acc: { expander: RowExpander, xs: List<Expr> }, expr: Expr| {
-      let o = rows_expr(acc.expander, expr);
+      let o = expand_rows_in_expression(acc.expander, expr);
       { expander: o.expander, xs: acc.xs.push(o.e) }
     },
   )
 
-fn rows_fields(
+fn expand_rows_in_fields(
   expander: RowExpander,
-  fields: List<RecField>,
-) -> { expander: RowExpander, fs: List<RecField> } / {abort.raise} =
+  fields: List<RecordLiteralField>,
+) -> { expander: RowExpander, fs: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { expander: expander, fs: [] },
-    |acc: { expander: RowExpander, fs: List<RecField> }, field: RecField| {
-      let o = rows_expr(acc.expander, field.value);
+    |acc: { expander: RowExpander, fs: List<RecordLiteralField> }, field: RecordLiteralField| {
+      let o = expand_rows_in_expression(acc.expander, field.value);
       { expander: o.expander, fs: acc.fs.push({ name: field.name, value: o.e }) }
     },
   )
 
-fn rows_opt_expr(
+fn expand_rows_in_optional_expression(
   expander: RowExpander,
   expr: Option<Expr>,
 ) -> { expander: RowExpander, e: Option<Expr> } / {abort.raise} =
   match expr {
     None -> { expander: expander, e: None },
     Some(x) -> {
-      let o = rows_expr(expander, x);
+      let o = expand_rows_in_expression(expander, x);
       { expander: o.expander, e: Some(o.e) }
     },
   }
 
-fn rows_expr(
+fn expand_rows_in_expression(
   expander: RowExpander,
   expr: Expr,
 ) -> { expander: RowExpander, e: Expr } / {abort.raise} =
   match expr {
-    EBinary(b) -> {
-      let l = rows_expr(expander, b.lhs);
-      let r = rows_expr(l.expander, b.rhs);
-      { expander: r.expander, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+    BinaryExpression(b) -> {
+      let l = expand_rows_in_expression(expander, b.lhs);
+      let r = expand_rows_in_expression(l.expander, b.rhs);
+      { expander: r.expander, e: BinaryExpression({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
     },
-    EUnary(u) -> {
-      let o = rows_expr(expander, u.operand);
-      { expander: o.expander, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
+    UnaryExpression(u) -> {
+      let o = expand_rows_in_expression(expander, u.operand);
+      { expander: o.expander, e: UnaryExpression({ span: u.span, op: u.op, operand: o.e }) }
     },
-    ELambda(l) -> {
-      let ps = rows_params(expander, l.params);
-      let b = rows_expr(ps.expander, l.body);
-      { expander: b.expander, e: ELambda({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }) }
+    LambdaExpression(l) -> {
+      let ps = expand_rows_in_parameters(expander, l.params);
+      let b = expand_rows_in_expression(ps.expander, l.body);
+      {
+        expander: b.expander,
+        e: LambdaExpression({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }),
+      }
     },
-    EApp(a) -> {
-      let callee = rows_expr(expander, a.func);
-      let args = rows_exprs(callee.expander, a.args);
+    CallExpression(a) -> {
+      let callee = expand_rows_in_expression(expander, a.func);
+      let args = expand_rows_in_expressions(callee.expander, a.args);
       let named = a.named.fold(
         { expander: args.expander, ns: [] },
         |acc: { expander: RowExpander, ns: List<NamedArg> }, arg: NamedArg| {
-          let o = rows_expr(acc.expander, arg.value);
+          let o = expand_rows_in_expression(acc.expander, arg.value);
           { expander: o.expander, ns: acc.ns.push({ name: arg.name, value: o.e, span: arg.span }) }
         },
       );
       {
         expander: named.expander,
-        e: EApp({ span: a.span, func: callee.e, named: named.ns, args: args.xs, labels: a.labels }),
+        e: CallExpression({
+          span: a.span,
+          func: callee.e,
+          named: named.ns,
+          args: args.xs,
+          labels: a.labels,
+        }),
       }
     },
-    EIf(i) -> {
-      let c = rows_expr(expander, i.cond);
-      let t = rows_expr(c.expander, i.then_branch);
-      let el = rows_expr(t.expander, i.else_branch);
+    IfExpression(i) -> {
+      let c = expand_rows_in_expression(expander, i.cond);
+      let t = expand_rows_in_expression(c.expander, i.then_branch);
+      let el = expand_rows_in_expression(t.expander, i.else_branch);
       {
         expander: el.expander,
-        e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }),
+        e: IfExpression({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }),
       }
     },
-    EMatch(m) -> {
-      let sc = rows_expr(expander, m.scrutinee);
+    MatchExpression(m) -> {
+      let sc = expand_rows_in_expression(expander, m.scrutinee);
       let arms = m.arms.fold(
         { expander: sc.expander, arms: [] },
         |acc: { expander: RowExpander, arms: List<MatchArm> }, arm: MatchArm| {
-          let g = rows_opt_expr(acc.expander, arm.guard);
-          let b = rows_expr(g.expander, arm.body);
+          let g = expand_rows_in_optional_expression(acc.expander, arm.guard);
+          let b = expand_rows_in_expression(g.expander, arm.body);
           {
             expander: b.expander,
             arms: acc.arms.push({ pat: arm.pat, guard: g.e, body: b.e, span: arm.span }),
           }
         },
       );
-      { expander: arms.expander, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
+      {
+        expander: arms.expander,
+        e: MatchExpression({ span: m.span, scrutinee: sc.e, arms: arms.arms }),
+      }
     },
-    EBlock(b) -> {
+    BlockExpression(b) -> {
       let stmts = b.stmts.fold(
         { expander: expander, ss: [] },
         |acc: { expander: RowExpander, ss: List<Stmt> }, stmt: Stmt|
           match stmt {
-            SLet(l) -> {
-              let t = rows_opt_ty(acc.expander, l.ty);
-              let v = rows_expr(t.expander, l.value);
+            LetStatement(l) -> {
+              let t = expand_rows_in_optional_type(acc.expander, l.ty);
+              let v = expand_rows_in_expression(t.expander, l.value);
               {
                 expander: v.expander,
-                ss: acc.ss.push(SLet({ span: l.span, pat: l.pat, ty: t.t, value: v.e })),
+                ss: acc.ss.push(LetStatement({ span: l.span, pat: l.pat, ty: t.t, value: v.e })),
               }
             },
-            SLetElse(l) -> {
-              let t = rows_opt_ty(acc.expander, l.ty);
-              let v = rows_expr(t.expander, l.value);
-              let fb = rows_expr(v.expander, l.fallback);
+            LetElseStatement(l) -> {
+              let t = expand_rows_in_optional_type(acc.expander, l.ty);
+              let v = expand_rows_in_expression(t.expander, l.value);
+              let fb = expand_rows_in_expression(v.expander, l.fallback);
               {
                 expander: fb.expander,
                 ss: acc.ss.push(
-                  SLetElse({ span: l.span, pat: l.pat, ty: t.t, value: v.e, fallback: fb.e }),
+                  LetElseStatement({
+                    span: l.span,
+                    pat: l.pat,
+                    ty: t.t,
+                    value: v.e,
+                    fallback: fb.e,
+                  }),
                 ),
               }
             },
-            SExpr(x) -> {
-              let o = rows_expr(acc.expander, x);
-              { expander: o.expander, ss: acc.ss.push(SExpr(o.e)) }
+            ExpressionStatement(x) -> {
+              let o = expand_rows_in_expression(acc.expander, x);
+              { expander: o.expander, ss: acc.ss.push(ExpressionStatement(o.e)) }
             },
-            SAssign(x) -> {
-              let o = rows_expr(acc.expander, x.value);
-              { expander: o.expander, ss: acc.ss.push(SAssign({ ..x, value: o.e })) }
+            AssignmentStatement(x) -> {
+              let o = expand_rows_in_expression(acc.expander, x.value);
+              { expander: o.expander, ss: acc.ss.push(AssignmentStatement({ ..x, value: o.e })) }
             },
           },
       );
-      let tl = rows_opt_expr(stmts.expander, b.tail);
-      { expander: tl.expander, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
+      let tl = expand_rows_in_optional_expression(stmts.expander, b.tail);
+      { expander: tl.expander, e: BlockExpression({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
     },
-    ERecord(r) -> {
-      let o = rows_fields(expander, r.fields);
-      { expander: o.expander, e: ERecord({ span: r.span, fields: o.fs }) }
+    RecordExpression(r) -> {
+      let o = expand_rows_in_fields(expander, r.fields);
+      { expander: o.expander, e: RecordExpression({ span: r.span, fields: o.fs }) }
     },
-    ERecordUpdate(r) -> {
-      let b = rows_expr(expander, r.base);
-      let o = rows_fields(b.expander, r.fields);
-      { expander: o.expander, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
+    RecordUpdateExpression(r) -> {
+      let b = expand_rows_in_expression(expander, r.base);
+      let o = expand_rows_in_fields(b.expander, r.fields);
+      { expander: o.expander, e: RecordUpdateExpression({ span: r.span, base: b.e, fields: o.fs }) }
     },
-    EField(fd) -> {
-      let o = rows_expr(expander, fd.base);
-      { expander: o.expander, e: EField({ span: fd.span, base: o.e, field: fd.field }) }
+    FieldExpression(fd) -> {
+      let o = expand_rows_in_expression(expander, fd.base);
+      { expander: o.expander, e: FieldExpression({ span: fd.span, base: o.e, field: fd.field }) }
     },
-    ETry(t) -> {
-      let o = rows_expr(expander, t.operand);
-      { expander: o.expander, e: ETry({ span: t.span, operand: o.e }) }
+    PropagateExpression(t) -> {
+      let o = expand_rows_in_expression(expander, t.operand);
+      { expander: o.expander, e: PropagateExpression({ span: t.span, operand: o.e }) }
     },
-    EList(l) -> {
-      let o = rows_exprs(expander, l.items);
-      { expander: o.expander, e: EList({ span: l.span, items: o.xs }) }
+    ListExpression(l) -> {
+      let o = expand_rows_in_expressions(expander, l.items);
+      { expander: o.expander, e: ListExpression({ span: l.span, items: o.xs }) }
     },
-    EPerform(p) -> {
-      let o = rows_exprs(expander, p.args);
+    PerformExpression(p) -> {
+      let o = expand_rows_in_expressions(expander, p.args);
       {
         expander: o.expander,
-        e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
+        e: PerformExpression({
+          span: p.span,
+          effect_name: p.effect_name,
+          op: p.op,
+          resource: p.resource,
+          args: o.xs,
+        }),
       }
     },
-    EHandle(h) -> {
+    HandleExpression(h) -> {
       let vs = h.vars.fold(
         { expander: expander, vs: [] },
         |acc: { expander: RowExpander, vs: List<HandlerVar> }, v: HandlerVar| {
-          let t = rows_opt_ty(acc.expander, v.ty);
-          let i = rows_expr(t.expander, v.init);
+          let t = expand_rows_in_optional_type(acc.expander, v.ty);
+          let i = expand_rows_in_expression(t.expander, v.init);
           { expander: i.expander, vs: acc.vs.push({ ..v, ty: t.t, init: i.e }) }
         },
       );
-      let b = rows_expr(vs.expander, h.body);
+      let b = expand_rows_in_expression(vs.expander, h.body);
       let cs = h.clauses.fold(
         { expander: b.expander, cs: [] },
         |acc: { expander: RowExpander, cs: List<HandleClause> }, c: HandleClause| {
-          let o = rows_expr(acc.expander, c.body);
+          let o = expand_rows_in_expression(acc.expander, c.body);
           {
             expander: o.expander,
             cs: acc.cs.push({
-              eff: c.eff,
+              effect_name: c.effect_name,
               op: c.op,
               resource: c.resource,
               every_label: c.every_label,
@@ -882,59 +936,62 @@ fn rows_expr(
       let r = match h.ret {
         None -> { expander: cs.expander, r: None },
         Some(rc) -> {
-          let o = rows_expr(cs.expander, rc.body);
+          let o = expand_rows_in_expression(cs.expander, rc.body);
           { expander: o.expander, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
         },
       };
       {
         expander: r.expander,
-        e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs, vars: vs.vs }),
+        e: HandleExpression({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs, vars: vs.vs }),
       }
     },
-    EWithHold(c) -> {
-      let a = rows_expr(expander, c.acquire);
-      let r = rows_expr(a.expander, c.release);
-      let b = rows_expr(r.expander, c.body);
-      { expander: b.expander, e: EWithHold({ ..c, acquire: a.e, release: r.e, body: b.e }) }
+    WithHoldExpression(c) -> {
+      let a = expand_rows_in_expression(expander, c.acquire);
+      let r = expand_rows_in_expression(a.expander, c.release);
+      let b = expand_rows_in_expression(r.expander, c.body);
+      {
+        expander: b.expander,
+        e: WithHoldExpression({ ..c, acquire: a.e, release: r.e, body: b.e }),
+      }
     },
-    ESimulate(x) -> {
-      let o = rows_expr(expander, x.body);
-      { expander: o.expander, e: ESimulate({ span: x.span, body: o.e }) }
+    SimulateExpression(x) -> {
+      let o = expand_rows_in_expression(expander, x.body);
+      { expander: o.expander, e: SimulateExpression({ span: x.span, body: o.e }) }
     },
-    ETryBlock(x) -> {
-      let o = rows_expr(expander, x.body);
-      { expander: o.expander, e: ETryBlock({ ..x, body: o.e }) }
+    TryBlockExpression(x) -> {
+      let o = expand_rows_in_expression(expander, x.body);
+      { expander: o.expander, e: TryBlockExpression({ ..x, body: o.e }) }
     },
-    EParallel(x) -> {
-      let o = rows_exprs(expander, x.branches);
-      { expander: o.expander, e: EParallel({ span: x.span, branches: o.xs }) }
+    ParallelExpression(x) -> {
+      let o = expand_rows_in_expressions(expander, x.branches);
+      { expander: o.expander, e: ParallelExpression({ span: x.span, branches: o.xs }) }
     },
-    ETagged(t) -> {
+    TaggedLiteralExpression(t) -> {
       let filled = t.holes.fold(
         { expander: expander, holes: [] },
         |acc: { expander: RowExpander, holes: List<Hole> }, h: Hole| {
-          let o = rows_expr(acc.expander, h.value);
+          let o = expand_rows_in_expression(acc.expander, h.value);
           { expander: o.expander, holes: acc.holes.push({ ..h, value: o.e }) }
         },
       );
-      { expander: filled.expander, e: ETagged({ ..t, holes: filled.holes }) }
+      { expander: filled.expander, e: TaggedLiteralExpression({ ..t, holes: filled.holes }) }
     },
     _ -> { expander: expander, e: expr },
   }
 
-fn rows_item(
+fn expand_rows_in_item(
   expander: RowExpander,
   item: Item,
 ) -> { expander: RowExpander, it: Item } / {abort.raise} =
   match item {
-    IFn(d) -> {
-      let ps = rows_params(expander, d.params);
-      let r = rows_opt_ty(ps.expander, d.ret);
-      let ef = rows_opt(r.expander, d.effects);
+    FunctionItem(d) -> {
+      let ps = expand_rows_in_parameters(expander, d.params);
+      let r = expand_rows_in_optional_type(ps.expander, d.ret);
+      let ef = expand_optional_row(r.expander, d.effects);
       let spec = d.spec.fold(
         { expander: ef.expander, xs: [] },
         |acc: { expander: RowExpander, xs: List<SpecClause> }, clause: SpecClause| {
-          let o = rows_expr(acc.expander, clause.expr);
+          let o = expand_rows_in_expression(acc.expander, clause.expr);
           {
             expander: o.expander,
             xs: acc.xs.push({ kind: clause.kind, expr: o.e, span: clause.span }),
@@ -944,15 +1001,15 @@ fn rows_item(
       let measured: { expander: RowExpander, e: Option<Expr> } = match d.decreases {
         None -> { expander: spec.expander, e: None },
         Some(e) -> {
-          let o = rows_expr(spec.expander, e);
+          let o = expand_rows_in_expression(spec.expander, e);
           { expander: o.expander, e: Some(o.e) }
         },
       };
-      let b = rows_expr(measured.expander, d.body);
+      let b = expand_rows_in_expression(measured.expander, d.body);
       {
         expander: b.expander,
-        it: IFn({
-          vis: d.vis,
+        it: FunctionItem({
+          visibility: d.visibility,
           name: d.name,
           generics: d.generics,
           params: ps.ps,
@@ -971,82 +1028,90 @@ fn rows_item(
         }),
       }
     },
-    IType(d) -> match d.body {
-      TDAlias(t) -> {
-        let o = rows_ty(expander, t);
-        { expander: o.expander, it: IType({ ..d, body: TDAlias(o.t) }) }
+    TypeItem(d) -> match d.body {
+      AliasBody(t) -> {
+        let o = expand_rows_in_type(expander, t);
+        { expander: o.expander, it: TypeItem({ ..d, body: AliasBody(o.t) }) }
       },
-      TDNominal(t) -> {
-        let o = rows_ty(expander, t);
-        { expander: o.expander, it: IType({ ..d, body: TDNominal(o.t) }) }
+      NominalBody(t) -> {
+        let o = expand_rows_in_type(expander, t);
+        { expander: o.expander, it: TypeItem({ ..d, body: NominalBody(o.t) }) }
       },
-      TDExtern -> { expander: expander, it: item },
-      TDSum(vs) -> {
+      ExternBody -> { expander: expander, it: item },
+      SumBody(vs) -> {
         let out = vs.fold(
           { expander: expander, vs: [] },
           |acc: { expander: RowExpander, vs: List<VariantDef> }, variant: VariantDef| {
-            let o = rows_tys(acc.expander, variant.fields);
+            let o = expand_rows_in_types(acc.expander, variant.fields);
             { expander: o.expander, vs: acc.vs.push({ ..variant, fields: o.ts }) }
           },
         );
-        { expander: out.expander, it: IType({ ..d, body: TDSum(out.vs) }) }
+        { expander: out.expander, it: TypeItem({ ..d, body: SumBody(out.vs) }) }
       },
     },
-    IEffect(d) -> {
-      let ops = d.ops.fold(
-        { expander: expander, ops: [] },
-        |acc: { expander: RowExpander, ops: List<OpDef> }, op: OpDef| {
-          let ps = rows_tys(acc.expander, op.params);
-          let r = rows_ty(ps.expander, op.ret);
-          { expander: r.expander, ops: acc.ops.push({ ..op, params: ps.ts, ret: r.t }) }
+    EffectItem(d) -> {
+      let ops = d.operations.fold(
+        { expander: expander, operations: [] },
+        |acc: { expander: RowExpander, operations: List<OpDef> }, op: OpDef| {
+          let ps = expand_rows_in_types(acc.expander, op.params);
+          let r = expand_rows_in_type(ps.expander, op.ret);
+          {
+            expander: r.expander,
+            operations: acc.operations.push({ ..op, params: ps.ts, ret: r.t }),
+          }
         },
       );
-      { expander: ops.expander, it: IEffect({ ..d, ops: ops.ops }) }
+      { expander: ops.expander, it: EffectItem({ ..d, operations: ops.operations }) }
     },
-    ITest(d) -> {
+    TestItem(d) -> {
       let ranged: { expander: RowExpander, cases: Option<Cases> } = match d.cases {
         None -> { expander: expander, cases: None },
         Some(c) -> {
-          let t = rows_ty(expander, c.ty);
-          let table = rows_expr(t.expander, c.table);
-          let label = rows_expr(table.expander, c.label);
+          let t = expand_rows_in_type(expander, c.ty);
+          let table = expand_rows_in_expression(t.expander, c.table);
+          let label = expand_rows_in_expression(table.expander, c.label);
           {
             expander: label.expander,
             cases: Some({ ..c, ty: t.t, table: table.e, label: label.e }),
           }
         },
       };
-      let o = rows_expr(ranged.expander, d.body);
-      { expander: o.expander, it: ITest({ ..d, cases: ranged.cases, body: o.e }) }
+      let o = expand_rows_in_expression(ranged.expander, d.body);
+      { expander: o.expander, it: TestItem({ ..d, cases: ranged.cases, body: o.e }) }
     },
-    ILaw(d) -> {
+    LawItem(d) -> {
       let bs = d.binders.fold(
         { expander: expander, binders: [] },
         |acc: { expander: RowExpander, binders: List<Binder> }, b: Binder| {
-          let o = rows_ty(acc.expander, b.ty);
+          let o = expand_rows_in_type(acc.expander, b.ty);
           {
             expander: o.expander,
             binders: acc.binders.push({ name: b.name, ty: o.t, span: b.span }),
           }
         },
       );
-      let g = rows_opt_expr(bs.expander, d.guard);
-      let b = rows_expr(g.expander, d.body);
-      { expander: b.expander, it: ILaw({ ..d, binders: bs.binders, guard: g.e, body: b.e }) }
+      let g = expand_rows_in_optional_expression(bs.expander, d.guard);
+      let b = expand_rows_in_expression(g.expander, d.body);
+      { expander: b.expander, it: LawItem({ ..d, binders: bs.binders, guard: g.e, body: b.e }) }
     },
     _ -> { expander: expander, it: item },
   }
 
 // --- Law schemas: what an instantiation states -------------------------------------------------
 
-fn has_instance(module: Module) -> Bool =
+fn has_schema_law(module: Module) -> Bool =
   module.items.fold(false, |found: Bool, item: Item|
-    found || (match item { ILaw(d) -> d.of != None, _ -> false }))
+    found || (match item { LawItem(d) -> d.of != None, _ -> false }))
 
 /// The schema's name for a binder, with `_` after it until nothing the arguments name, and no binder
 /// before it, is called that: an argument written here never reads a binder.
-fn apart(name: Bytes, args: List<Expr>, taken: List<Bytes>, room: Int) -> Bytes / {abort.raise} =
-  iterate(name, room, |n: Bytes|
+fn fresh_name(
+  name: Bytes,
+  args: List<Expr>,
+  taken: List<Bytes>,
+  budget: Int,
+) -> Bytes / {abort.raise} =
+  iterate(name, budget, |n: Bytes|
     if !taken.contains(n) && !args.any(|x: Expr| bare_names_read(x).contains(n)) { Stop(n) }
     else { Continue(n.concat(b"_")) })
 
@@ -1063,17 +1128,17 @@ fn schema_identities(schema: SchemaDef) -> List<SchemaIdentity> = {
     })
 }
 
-type Instantiation = { r: Resolved, law: LawDef, diags: List<Diag> }
+type Instantiation = { r: Resolution, law: LawDef, diags: List<Diag> }
 
 /// `law "label" = schema(f, g)` as the law it is: over the schema's binders, its guard and body
 /// the schema's definitions called with what it was given and then the binders. A name that
 /// resolves to nothing is left as written, for the checker to say what is in reach.
-fn instance(
-  r: Resolved,
+fn instantiate_law(
+  r: Resolution,
   mods: List<ParsedModule>,
   m: Int,
   d: LawDef,
-  i: OfSchema,
+  i: SchemaInstance,
   diags: List<Diag>,
 ) -> Instantiation / {abort.raise} =
   match find(r, m, ValueSpace, i.schema) {
@@ -1081,7 +1146,7 @@ fn instance(
     Some(b) -> {
       let name = i.schema.name.name;
       let home = mods.get(b.owner);
-      let args = match d.body { EApp(a) -> a.args, _ -> [] };
+      let args = match d.body { CallExpression(a) -> a.args, _ -> [] };
       match schema_named(home.module, name) {
         None ->
           {
@@ -1116,7 +1181,7 @@ fn instance(
                   b"the schema `",
                   name,
                   b"` takes ",
-                  counted(schema.params.len(), b"argument"),
+                  plural_count(schema.params.len(), b"argument"),
                   b", but ",
                   ascii_of_int(args.len()),
                   if args.len() == 1 { b" was supplied" } else { b" were supplied" },
@@ -1137,20 +1202,23 @@ fn instance(
         } else {
           let at = { ..i.span, site: 0 };
           let schema_at = { ..i.schema.span, site: 0 };
-          let through = { name: reached_binder(home.name), span: schema_at };
+          let through = { name: implicit_binder(home.name), span: schema_at };
           let end = span_between(i.span.end, i.span.end);
           let names = schema.binders.fold([], |acc: List<Bytes>, binder: Binder|
             acc.push(
-              apart(binder.name.name, args, acc, i.span.end - i.span.start + acc.len() + 2),
+              fresh_name(binder.name.name, args, acc, i.span.end - i.span.start + acc.len() + 2),
             ));
           let given = args.concat(
             names.map(|n: Bytes|
-              EVar({ span: end, name: { module: None, name: { name: n, span: end }, span: end } })),
+              NameExpression({
+                span: end,
+                name: { module: None, name: { name: n, span: end }, span: end },
+              })),
           );
           let call = |callee: Bytes, made: Span|
-            EApp({
+            CallExpression({
               span: made,
-              func: EVar({
+              func: NameExpression({
                 span: schema_at,
                 name: {
                   module: Some(through),
@@ -1163,11 +1231,15 @@ fn instance(
               labels: [],
             });
           {
-            r: reach(r, m, through.name, b.owner),
+            r: add_module_binding(r, m, through.name, b.owner),
             law: {
               ..d,
               binders: names.map(|n: Bytes|
-                { name: { name: n, span: at }, ty: TVar({ name: n, span: at }), span: at }),
+                {
+                  name: { name: n, span: at },
+                  ty: VariableTypeExpression({ name: n, span: at }),
+                  span: at,
+                }),
               guard: match schema.guard {
                 Some(_) -> Some(call(schema_guard_name(name), schema_at)),
                 None -> None,
@@ -1187,24 +1259,27 @@ fn instance(
     },
   }
 
-fn counted(n: Int, what: Bytes) -> Bytes =
+fn plural_count(n: Int, what: Bytes) -> Bytes =
   Bytes::concat_all([ascii_of_int(n), b" ", what, if n == 1 { b"" } else { b"s" }])
 
-type Instantiated = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
+type LawInstantiation = { r: Resolution, mods: List<ParsedModule>, diags: List<Diag> }
 
-pub fn instantiated(r: Resolved, mods: List<ParsedModule>) -> Instantiated / {abort.raise} =
-  range(0, mods.len()).fold({ r: r, mods: [], diags: [] }, |acc: Instantiated, m: Int| {
+pub fn instantiate_laws(
+  r: Resolution,
+  mods: List<ParsedModule>,
+) -> LawInstantiation / {abort.raise} =
+  range(0, mods.len()).fold({ r: r, mods: [], diags: [] }, |acc: LawInstantiation, m: Int| {
     let mod: ParsedModule = mods.get(m);
-    if !has_instance(mod.module) { { ..acc, mods: acc.mods.push(mod) } } else {
+    if !has_schema_law(mod.module) { { ..acc, mods: acc.mods.push(mod) } } else {
       let walked = mod.module.items.fold(
         { r: acc.r, items: [], diags: acc.diags },
-        |w: { r: Resolved, items: List<Item>, diags: List<Diag> }, item: Item|
+        |w: { r: Resolution, items: List<Item>, diags: List<Diag> }, item: Item|
           match item {
-            ILaw(d) -> match d.of {
+            LawItem(d) -> match d.of {
               None -> { ..w, items: w.items.push(item) },
               Some(i) -> {
-                let o = instance(w.r, mods, m, d, i, w.diags);
-                { r: o.r, items: w.items.push(numbered_made(ILaw(o.law))), diags: o.diags }
+                let o = instantiate_law(w.r, mods, m, d, i, w.diags);
+                { r: o.r, items: w.items.push(numbered_made(LawItem(o.law))), diags: o.diags }
               },
             },
             _ -> { ..w, items: w.items.push(item) },
@@ -1218,17 +1293,17 @@ pub fn instantiated(r: Resolved, mods: List<ParsedModule>) -> Instantiated / {ab
     }
   })
 
-type SetsExpanded = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
+type SetExpansion = { r: Resolution, mods: List<ParsedModule>, diags: List<Diag> }
 
-pub fn expand_sets(r: Resolved, mods: List<ParsedModule>) -> SetsExpanded / {abort.raise} = {
+pub fn expand_sets(r: Resolution, mods: List<ParsedModule>) -> SetExpansion / {abort.raise} = {
   let t = set_expand_all(r, set_cycles(set_includes(r, set_table(mods))));
-  range(0, mods.len()).fold({ r: r, mods: [], diags: t.diags }, |acc: SetsExpanded, m: Int| {
-    let o = module_sets(r, t, m, mods.get(m));
+  range(0, mods.len()).fold({ r: r, mods: [], diags: t.diags }, |acc: SetExpansion, m: Int| {
+    let o = expand_module_sets(r, t, m, mods.get(m));
     {
-      r: o.expander.reached.fold(acc.r, |rr: Resolved, binding: ModuleBinding|
-        reach(rr, m, binding.binder, binding.target)),
+      r: o.expander.reached.fold(acc.r, |rr: Resolution, binding: ModuleBinding|
+        add_module_binding(rr, m, binding.binder, binding.target)),
       mods: acc.mods.push(o.module),
-      diags: bytes_concat_diags(acc.diags, o.expander.diags),
+      diags: concat_diagnostics(acc.diags, o.expander.diags),
     }
   })
 }
@@ -1236,12 +1311,12 @@ pub fn expand_sets(r: Resolved, mods: List<ParsedModule>) -> SetsExpanded / {abo
 // --- Defaults: the signatures ---------------------------------------------------------------
 
 /// The module now reaches `target` under `binder`, with no span.
-pub fn reach(
-  resolved: Resolved,
+pub fn add_module_binding(
+  resolved: Resolution,
   module: Int,
   binder: Bytes,
   target: Int,
-) -> Resolved / {abort.raise} = {
+) -> Resolution / {abort.raise} = {
   let scope: Scope = resolved.scopes.get(module);
   match find_module_binding(scope.modules, binder) {
     Some(_) -> resolved,
@@ -1258,5 +1333,5 @@ pub fn reach(
 
 // --- Defaults: filling every call --------------------------------------------------------
 
-pub fn bytes_concat_diags(a: List<Diag>, b: List<Diag>) -> List<Diag> =
+pub fn concat_diagnostics(a: List<Diag>, b: List<Diag>) -> List<Diag> =
   b.fold(a, |acc: List<Diag>, diag: Diag| acc.push(diag))

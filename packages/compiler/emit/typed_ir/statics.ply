@@ -1,0 +1,97 @@
+//! Static objects a body's C names: values laid out once, at build, where the program's data lives.
+
+import std.bin
+import std.bytes (hex_digit)
+import compiler.emit.keys (RootKey, root_key_bin)
+import compiler.emit.layout (text_head)
+import compiler.check.types (Type, string_type, bytes_type)
+
+/// A static object (`Val.Static` names one): its name, `ply_k_` and the start of the digest of what
+/// it holds, so one name is one content and the unit lays each out once; and how it is laid.
+pub type StaticDef = { name: Bytes, layout: StaticLayout }
+
+/// How a static object is laid out. `StaticBlock`: as emitted code reads a block it made, an immortal
+/// count, its `head` where its type keeps one, then `words`. `StaticWords`: words with no header.
+/// `StaticStruct`: one of the machine structs `emit.layout` declares, by its name, each field in order.
+/// `StaticFile`: the bytes of a file the program embeds, by their digest, as a byte string the unit lays
+/// out from what it was handed.
+pub type StaticLayout =
+  | StaticBlock({ head: Option<StaticHead>, words: List<StaticWord> })
+  | StaticWords(List<StaticWord>)
+  | StaticStruct({ of: Bytes, fields: List<StaticWord> })
+  | StaticFile(Bytes)
+
+/// A static block's head: one of `layout.head_structs` by its name, each field set by its name.
+pub type StaticHead = { of: Bytes, fields: List<{ field: Bytes, value: Int }> }
+
+/// A word of a static object, or a field of a machine struct. `RawWord`: the integer itself.
+/// `AddressWord`: another static object's address, its low bits `tag`. `EntryWord`: a root's C function.
+/// `BytesWord`: bytes laid in place, padded with zeros to a whole word. `FieldWord`: the field table's
+/// entry of a name, which the unit writes in. `PreludeWord`: a C function the emitter's head defines, by
+/// its name.
+pub type StaticWord =
+  | RawWord(Int)
+  | AddressWord({ name: Bytes, tag: Int })
+  | EntryWord(RootKey)
+  | BytesWord(Bytes)
+  | FieldWord(Bytes)
+  | PreludeWord(Bytes)
+
+derive bin for StaticWord
+derive bin for StaticHead
+derive bin for StaticLayout
+derive bin for StaticDef
+
+/// The static laid as `laid`, named by its content: `ply_k_` and the first 32 hex digits of the
+/// blake3 of `laid`, which names the statics it addresses by their own content, so two statics share
+/// a name exactly where they hold the same.
+pub fn named_by_content(laid: StaticLayout) -> StaticDef / {abort.raise} = {
+  let digest = bin::encode(laid, static_layout_bin()).blake3().slice(0, 16);
+  {
+    name: Bytes::concat_all(
+      [b"ply_k_"].concat(
+        range(0, digest.len()).map(|i: Int|
+          hex_digit(digest.at(i) / 16).concat(hex_digit(digest.at(i) % 16))),
+      ),
+    ),
+    layout: laid,
+  }
+}
+
+/// The words `d` lays out after any header, a machine struct's fields among them; none for a file's
+/// bytes.
+pub fn words_of(d: StaticDef) -> List<StaticWord> =
+  match d.layout {
+    StaticBlock(b) -> b.words,
+    StaticWords(ws) -> ws,
+    StaticStruct(s) -> s.fields,
+    StaticFile(_) -> [],
+  }
+
+/// The roots whose C functions `d` holds, in order.
+pub fn entries_of(d: StaticDef) -> List<RootKey> =
+  words_of(d).fold([], |acc: List<RootKey>, w: StaticWord|
+    match w { EntryWord(k) -> acc.push(k), _ -> acc })
+
+/// Whether a value of `ty` is text: a `String` or `Bytes`, which a block lays out alike.
+pub fn is_text(ty: Type) -> Bool = ty == string_type() || ty == bytes_type()
+
+/// The head and words of a string's or a byte string's block holding `b`: its length and its room
+/// both `b`'s.
+pub fn text_block(b: Bytes) -> { head: Option<StaticHead>, words: List<StaticWord> } =
+  {
+    head: Some({
+      of: text_head().name,
+      fields: [{ field: b"len", value: b.len() }, { field: b"room", value: b.len() }],
+    }),
+    words: if b.len() == 0 { [] } else { [BytesWord(b)] },
+  }
+
+test "a static's name is its content's: equal contents share one, and a child's content moves its parents'" {
+  let s = named_by_content(StaticBlock(text_block(b"ply")));
+  assert_eq(named_by_content(StaticBlock(text_block(b"ply"))), s);
+  assert(named_by_content(StaticBlock(text_block(b"plz"))).name != s.name, None);
+  let parent = |child: StaticDef|
+    named_by_content(StaticWords([AddressWord({ name: child.name, tag: 0 })]));
+  assert(parent(s).name != parent(named_by_content(StaticBlock(text_block(b"plz")))).name, None)
+}

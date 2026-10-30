@@ -28,7 +28,7 @@ import std.laws (refines)
 import std.list (zip)
 import std.map
 import std.math (bit_length, div_floor, even, ilog2, rem_floor, trailing_zeros)
-import std.parallel (grain, par_fold)
+import std.parallel (grain_size, par_fold)
 import std.gen
 
 /// How a quantile is taken where it falls between two data: Hyndman and Fan's nine types, by the
@@ -101,8 +101,8 @@ pub fn empty() -> Tally =
     flawed: 0,
     least: Float::infinity(),
     greatest: Float::neg_infinity(),
-    sum: nothing(),
-    squares: times(nothing(), nothing()),
+    sum: exact_zero(),
+    squares: times(exact_zero(), exact_zero()),
   }
 
 /// `t` with `x` taken in.
@@ -144,9 +144,9 @@ pub fn summary(t: Tally) -> Option<Summary> =
       greatest: t.greatest,
       sum: ratio(t.sum, whole(1)),
       mean: ratio(t.sum, whole(t.count)),
-      population_variance: ratio(spread_of(t), pairs(t.count, t.count)),
+      population_variance: ratio(scaled_variance(t), int_product(t.count, t.count)),
       sample_variance: if t.count < 2 { None }
-      else { Some(ratio(spread_of(t), pairs(t.count, t.count - 1))) },
+      else { Some(ratio(scaled_variance(t), int_product(t.count, t.count - 1))) },
     })
   }
 
@@ -155,7 +155,7 @@ pub fn summarize(xs: List<Float>) -> Option<Summary> = summary(tally(xs))
 
 /// The count times the squares' sum, less the sum's square: the count squared times the
 /// population variance, and never negative.
-fn spread_of(t: Tally) -> Exact = less(times(whole(t.count), t.squares), times(t.sum, t.sum))
+fn scaled_variance(t: Tally) -> Exact = minus(times(whole(t.count), t.squares), times(t.sum, t.sum))
 
 /// The lesser, and of the two zeros the negative one, so the answer is the same in either order.
 fn lower(a: Float, b: Float) -> Float =
@@ -181,7 +181,7 @@ pub fn mean(xs: List<Float>) -> Option<Float> =
 /// The mean square of the distances from the mean, for data that are all there is.
 pub fn population_variance(xs: List<Float>) -> Option<Float> =
   match usable(tally(xs), 1) {
-    Some(t) -> Some(ratio(spread_of(t), pairs(t.count, t.count))),
+    Some(t) -> Some(ratio(scaled_variance(t), int_product(t.count, t.count))),
     None -> None,
   }
 
@@ -189,7 +189,7 @@ pub fn population_variance(xs: List<Float>) -> Option<Float> =
 /// variance of what `xs` is a sample of. `None` for fewer than two numbers.
 pub fn sample_variance(xs: List<Float>) -> Option<Float> =
   match usable(tally(xs), 2) {
-    Some(t) -> Some(ratio(spread_of(t), pairs(t.count, t.count - 1))),
+    Some(t) -> Some(ratio(scaled_variance(t), int_product(t.count, t.count - 1))),
     None -> None,
   }
 
@@ -203,16 +203,17 @@ pub fn sample_stdev(xs: List<Float>) -> Option<Float> =
 
 /// The least of `xs`.
 pub fn least(xs: List<Float>) -> Option<Float> =
-  if clean(xs) { Some(xs.fold(Float::infinity(), lower)) } else { None }
+  if nonempty_and_finite(xs) { Some(xs.fold(Float::infinity(), lower)) } else { None }
 
 /// The greatest of `xs`.
 pub fn greatest(xs: List<Float>) -> Option<Float> =
-  if clean(xs) { Some(xs.fold(Float::neg_infinity(), higher)) } else { None }
+  if nonempty_and_finite(xs) { Some(xs.fold(Float::neg_infinity(), higher)) } else { None }
 
 /// The range of `xs`: the greatest less the least.
 pub fn spread(xs: List<Float>) -> Option<Float> =
-  if clean(xs) { Some(xs.fold(Float::neg_infinity(), higher) - xs.fold(Float::infinity(), lower)) }
-  else { None }
+  if nonempty_and_finite(xs) {
+    Some(xs.fold(Float::neg_infinity(), higher) - xs.fold(Float::infinity(), lower))
+  } else { None }
 
 /// The value or values that occur most often, each once, in the order they first occur; none
 /// for no values.
@@ -234,7 +235,7 @@ fn usable(t: Tally, least_count: Int) -> Option<Tally> =
   if t.count < least_count || t.flawed > 0 { None } else { Some(t) }
 
 /// Whether `xs` holds a number and nothing that is none.
-fn clean(xs: List<Float>) -> Bool = xs.len() > 0 && xs.all(Float::is_finite)
+fn nonempty_and_finite(xs: List<Float>) -> Bool = xs.len() > 0 && xs.all(Float::is_finite)
 
 // --- Order ---------------------------------------------------------------------
 
@@ -248,7 +249,7 @@ pub fn median_low(xs: List<Float>) -> Option<Float> / {abort.raise} = quantile(x
 
 /// The middle of `xs` in order, and the higher of the middle two of an even count.
 pub fn median_high(xs: List<Float>) -> Option<Float> =
-  match ordered(xs) { Some(sorted) -> Some(placed(sorted, sorted.len() / 2 + 1)), None -> None }
+  match ordered(xs) { Some(sorted) -> Some(datum_at(sorted, sorted.len() / 2 + 1)), None -> None }
 
 /// The value `part` of `parts` of the way through `xs` in order, as `method` takes it: the
 /// median is `quantile(xs, 1, 2)` and the 99.9th percentile `quantile(xs, 999, 1000)`. Where it
@@ -261,7 +262,10 @@ pub fn quantile(
   method: Method = R7,
 ) -> Option<Float> / {abort.raise} =
   if parts < 1 || parts > 1 << 59 || part < 0 || part > parts { None } else {
-    match ordered(xs) { Some(sorted) -> Some(taken(sorted, part, parts, method)), None -> None }
+    match ordered(xs) {
+      Some(sorted) -> Some(sorted_quantile(sorted, part, parts, method)),
+      None -> None,
+    }
   }
 
 /// The value `percent` hundredths of the way through `xs` in order: `quantile(xs, percent, 100)`.
@@ -280,7 +284,8 @@ pub fn quantiles(
 ) -> Option<List<Float>> / {abort.raise} =
   if parts < 1 || parts > 1 << 59 { None } else {
     match ordered(xs) {
-      Some(sorted) -> Some(range(1, parts).map(|part: Int| taken(sorted, part, parts, method))),
+      Some(sorted) ->
+        Some(range(1, parts).map(|part: Int| sorted_quantile(sorted, part, parts, method))),
       None -> None,
     }
   }
@@ -309,21 +314,26 @@ pub fn histogram(xs: List<Float>, edges: List<Float>) -> Option<Histogram> = {
 
 /// `xs` in ascending order; `None` for none, and where one is a NaN or an infinity.
 fn ordered(xs: List<Float>) -> Option<List<Float>> =
-  if clean(xs) { Some(xs.sort_by(|a: Float, b: Float| a < b)) } else { None }
+  if nonempty_and_finite(xs) { Some(xs.sort_by(|a: Float, b: Float| a < b)) } else { None }
 
 /// The datum at place `k` of `sorted`, counted from one; the first for a place before it and
 /// the last for one past it.
-fn placed(sorted: List<Float>, k: Int) -> Float =
+fn datum_at(sorted: List<Float>, k: Int) -> Float =
   sorted.at_or(max(1, min(k, sorted.len())) - 1, 0.0)
 
 /// The `part` of `parts` quantile of `sorted`, which holds a number.
-fn taken(sorted: List<Float>, part: Int, parts: Int, method: Method) -> Float / {abort.raise} = {
+fn sorted_quantile(
+  sorted: List<Float>,
+  part: Int,
+  parts: Int,
+  method: Method,
+) -> Float / {abort.raise} = {
   let place = place_of(method, sorted.len(), part, parts);
   let j = Int::of_i128(div_floor(place.over, place.under));
   let past = Int::of_i128(rem_floor(place.over, place.under));
   let under = Int::of_i128(place.under);
-  let here = placed(sorted, j);
-  let next = placed(sorted, j + 1);
+  let here = datum_at(sorted, j);
+  let next = datum_at(sorted, j + 1);
   match method {
     R1 -> if past == 0 { here } else { next },
     R2 -> if past == 0 { ratio(plus(exact(here), exact(next)), whole(2)) } else { next },
@@ -360,15 +370,18 @@ fn place_of(method: Method, n: Int, part: Int, parts: Int) -> { over: I128, unde
 /// means, over one less than the count. `None` for lists of two lengths, for fewer than two
 /// pairs, and where a number is a NaN or an infinity.
 pub fn covariance(xs: List<Float>, ys: List<Float>) -> Option<Float> =
-  match paired(xs, ys) { Some(p) -> Some(ratio(p.xy, pairs(p.count, p.count - 1))), None -> None }
+  match paired_sums(xs, ys) {
+    Some(p) -> Some(ratio(p.xy, int_product(p.count, p.count - 1))),
+    None -> None,
+  }
 
 /// Pearson's correlation of `xs` and `ys`, from `-1.0` to `1.0`: the square root of its exact
 /// square, rounded, under the covariance's sign, so data on a line are exactly one or its
 /// negative. `None` where `covariance` is, and where either list is one number repeated.
 pub fn correlation(xs: List<Float>, ys: List<Float>) -> Option<Float> =
-  match paired(xs, ys) {
+  match paired_sums(xs, ys) {
     None -> None,
-    Some(p) -> if is_nothing(p.xx) || is_nothing(p.yy) { None } else {
+    Some(p) -> if is_exact_zero(p.xx) || is_exact_zero(p.yy) { None } else {
       let size = ratio(times(p.xy, p.xy), times(p.xx, p.yy)).sqrt();
       Some(if bigint::is_negative(p.xy.units) { 0.0 - size } else { size })
     },
@@ -378,12 +391,12 @@ pub fn correlation(xs: List<Float>, ys: List<Float>) -> Option<Float> =
 /// that make the squares of the `ys`' distances from it least. `None` where `covariance` is, and
 /// where the `xs` are one number repeated, which no line's slope is read from.
 pub fn linear_regression(xs: List<Float>, ys: List<Float>) -> Option<Line> =
-  match paired(xs, ys) {
+  match paired_sums(xs, ys) {
     None -> None,
-    Some(p) -> if is_nothing(p.xx) { None } else {
+    Some(p) -> if is_exact_zero(p.xx) { None } else {
       Some({
         slope: ratio(p.xy, p.xx),
-        intercept: ratio(less(times(p.y, p.xx), times(p.xy, p.x)), times(whole(p.count), p.xx)),
+        intercept: ratio(minus(times(p.y, p.xx), times(p.xy, p.x)), times(whole(p.count), p.xx)),
       })
     },
   }
@@ -391,9 +404,9 @@ pub fn linear_regression(xs: List<Float>, ys: List<Float>) -> Option<Line> =
 /// What a line through paired data is read from: the count `n`, the sums of each run, and `n`
 /// times each sum of products less the product of the sums, which is `n` squared times a
 /// population covariance.
-type Paired = { count: Int, x: Exact, y: Exact, xx: Exact, yy: Exact, xy: Exact }
+type PairedSums = { count: Int, x: Exact, y: Exact, xx: Exact, yy: Exact, xy: Exact }
 
-fn paired(xs: List<Float>, ys: List<Float>) -> Option<Paired> =
+fn paired_sums(xs: List<Float>, ys: List<Float>) -> Option<PairedSums> =
   if xs.len() != ys.len() || xs.len() < 2 || !xs.all(Float::is_finite)
       || !ys.all(Float::is_finite) { None } else {
     let n = whole(xs.len());
@@ -403,15 +416,15 @@ fn paired(xs: List<Float>, ys: List<Float>) -> Option<Paired> =
       count: xs.len(),
       x: x,
       y: y,
-      xx: less(times(n, total(xs, xs, true)), times(x, x)),
-      yy: less(times(n, total(ys, ys, true)), times(y, y)),
-      xy: less(times(n, total(xs, ys, true)), times(x, y)),
+      xx: minus(times(n, total(xs, xs, true)), times(x, x)),
+      yy: minus(times(n, total(ys, ys, true)), times(y, y)),
+      xy: minus(times(n, total(xs, ys, true)), times(x, y)),
     })
   }
 
 /// The sum of `xs`, or with `products` of each of `xs` times its pair in `ys`.
 fn total(xs: List<Float>, ys: List<Float>, products: Bool) -> Exact =
-  zip(xs, ys).fold(nothing(), |acc: Exact, pair: { first: Float, second: Float }|
+  zip(xs, ys).fold(exact_zero(), |acc: Exact, pair: { first: Float, second: Float }|
     plus(acc, if products { times(exact(pair.first), exact(pair.second)) }
     else { exact(pair.first) }))
 
@@ -420,14 +433,14 @@ fn total(xs: List<Float>, ys: List<Float>, products: Bool) -> Exact =
 /// The number `units * 2^scale`, exactly. Zero is no units at a scale above every `Float`'s.
 type Exact = { units: BigInt, scale: Int }
 
-fn nothing() -> Exact = { units: bigint::zero(), scale: 1024 }
+fn exact_zero() -> Exact = { units: bigint::zero(), scale: 1024 }
 
-fn is_nothing(a: Exact) -> Bool = bigint::is_zero(a.units)
+fn is_exact_zero(a: Exact) -> Bool = bigint::is_zero(a.units)
 
 fn whole(n: Int) -> Exact = { units: bigint::of_int(n), scale: 0 }
 
 /// `a * b`, which two counts' product may be past an `Int`.
-fn pairs(a: Int, b: Int) -> Exact = times(whole(a), whole(b))
+fn int_product(a: Int, b: Int) -> Exact = times(whole(a), whole(b))
 
 /// A finite `x`, with its units odd: the one way to write it, so sums of the same numbers have
 /// the same units at the same scale.
@@ -436,7 +449,7 @@ fn exact(x: Float) -> Exact = {
   let biased = bits >>> 52 & 0x7FF;
   let digits = if biased == 0 { bits & 0x000F_FFFF_FFFF_FFFF }
   else { bits & 0x000F_FFFF_FFFF_FFFF | 0x0010_0000_0000_0000 };
-  if digits == 0 { nothing() } else {
+  if digits == 0 { exact_zero() } else {
     let even_bits = trailing_zeros(digits);
     let odd = digits >> even_bits;
     {
@@ -455,13 +468,13 @@ fn plus(a: Exact, b: Exact) -> Exact = {
   }
 }
 
-fn less(a: Exact, b: Exact) -> Exact = plus(a, { units: -b.units, scale: b.scale })
+fn minus(a: Exact, b: Exact) -> Exact = plus(a, { units: -b.units, scale: b.scale })
 
 fn times(a: Exact, b: Exact) -> Exact = { units: a.units * b.units, scale: a.scale + b.scale }
 
 /// `n / d` for a `d` above zero, rounded to the nearest `Float`, to the even one of two as near.
 fn ratio(n: Exact, d: Exact) -> Float =
-  if is_nothing(n) { 0.0 } else {
+  if is_exact_zero(n) { 0.0 } else {
     let over = bigint::abs_value(n.units);
     // Fifty-eight or fifty-nine bits of quotient: more than a `Float` keeps, and fewer than an
     // `Int` holds. A numerator longer than that needs is cut to it first, and whether the cut
@@ -529,7 +542,7 @@ test "every method's quantiles ascend from the least to the greatest" {
   gen::check2(gen::list(gen::float()), gen::any_int(), |xs: List<Float>, pick: Int| {
     let method = [R1, R2, R3, R4, R5, R6, R7, R8, R9].at_or(rem_floor(pick, 9), R7);
     match quantiles(xs, 8, method) {
-      None -> !clean(xs),
+      None -> !nonempty_and_finite(xs),
       Some(cuts) ->
         range(0, 6).all(|i: Int| cuts.at_or(i, 0.0) <= cuts.at_or(i + 1, 0.0))
           && quantile(xs, 0, 8, method) == least(xs)
@@ -842,7 +855,8 @@ test "a run split anywhere and merged is the run tallied whole, to the bit" {
 }
 
 test "a tally folded on every core is the tally folded in turn, and so is its summary" {
-  let data = range(0, 3 * grain() + 7).map(|i: Int| Float::of_int(i * 7919 % 1013) / 7.0 + 0.1);
+  let data = range(0, 3 * grain_size() + 7).map(|i: Int|
+    Float::of_int(i * 7919 % 1013) / 7.0 + 0.1);
   let at_once = par_fold(data, empty(), push, merge);
   assert_eq(at_once, tally(data));
   assert_eq(summary(at_once), summarize(data))

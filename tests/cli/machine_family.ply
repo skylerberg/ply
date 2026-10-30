@@ -2,49 +2,52 @@
 //! `compiler.load` reads and `compiler.cc` compiles is opened, bound as the options lend it, and its
 //! definitions entered, with how each entry ended and what it used.
 
-import harness (Here, Shipped, Loaded, compiled_here, entered, loaded, project, scratch, unloaded,
-                write)
+import harness (WorkingDirectory, Shipped, LoadedProgram, compiled_here, enter, load_program,
+                write_project, scratch, unload_program, write)
 import cli.machine
 import cli.machine (Options, default_options)
 import compiler.check.resolve.tables (Diag)
-import cli.diagnostic (Raised)
+import cli.diagnostic (RuntimeDiagnostic)
 import std.fs
 import std.fs (fs)
 import std.machine as entering
 import std.value (Value, VInt)
 
 /// The capability's operations a test performs.
-effect set Driving = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
+effect set MachineAccess = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
 
 /// How one entry ended: the code it chose, its answer or what it raised, what it ended with, and
 /// what it used.
-type Ended = {
+type EntryResult = {
   exit: Option<Int>,
-  answer: Result<Value, Raised>,
+  result: Result<Value, RuntimeDiagnostic>,
   warnings: List<Diag>,
   usage: entering::Usage,
 }
 
-fn ended_of(
-  l: Loaded,
+fn entry_result(
+  l: LoadedProgram,
   name: String,
   args: List<Value>,
-) -> Ended / {entering::machine.enter, abort.raise} = {
-  let o = entered(l, name, args);
+) -> EntryResult / {entering::machine.enter, abort.raise} = {
+  let o = enter(l, name, args);
   {
     exit: o.exit,
-    answer: machine::answer_of(o, l.roots, "inner." ++ name),
+    result: machine::result_of(o, l.roots, "inner." ++ name),
     warnings: machine::warnings_of(o, l.roots),
     usage: o.usage,
   }
 }
 
 /// How `inner.main` of the module `inner` ended, entered under `options`.
-fn main_of(inner: String, options: Options) -> Ended / {Here, Shipped, Driving, abort.raise} = {
-  project([{ path: "inner.ply", text: inner }]);
-  let l = loaded(options);
-  let ended = ended_of(l, "main", []);
-  let _ = unloaded(l);
+fn main_of(
+  inner: String,
+  options: Options,
+) -> EntryResult / {WorkingDirectory, Shipped, MachineAccess, abort.raise} = {
+  write_project([{ path: "inner.ply", text: inner }]);
+  let l = load_program(options);
+  let ended = entry_result(l, "main", []);
+  let _ = unload_program(l);
   ended
 }
 
@@ -73,13 +76,13 @@ fn warns_of_the_open_span(warnings: List<Diag>) -> Unit / {abort.raise} =
     _ -> panic("one warning, not " ++ warnings.len().to_string()),
   }
 
-fn code_of(answer: Result<Value, Raised>) -> Bytes =
+fn code_of(answer: Result<Value, RuntimeDiagnostic>) -> Bytes =
   match answer { Ok(_) -> b"", Err(r) -> r.diag.code }
 
 test "a program opens, binds and enters a program, which answers its value" {
   scratch(|| {
     let ended = main_of("fn main() -> Int = 40 + 2\n", default_options());
-    assert_eq(ended.answer, Ok(VInt(42)));
+    assert_eq(ended.result, Ok(VInt(42)));
     assert_eq(ended.exit, None)
   })
 }
@@ -90,7 +93,7 @@ fn exits() -> String =
 test/nondet "a nested program may choose the exit code, where the binding lends the process" {
   let ended = main_of(exits(), default_options());
   assert_eq(ended.exit, Some(7));
-  assert_eq(code_of(ended.answer), b"")
+  assert_eq(code_of(ended.result), b"")
 }
 
 // A raise is a diagnostic value; the outer program does not unwind through it.
@@ -101,7 +104,7 @@ test "a nested raise is a value, not an unwind" {
       default_options(),
     );
     assert_eq(ended.exit, None);
-    match ended.answer {
+    match ended.result {
       Ok(_) -> panic("the raise is reported"),
       Err(r) -> {
         assert_eq(r.diag.code, b"E0502");
@@ -115,48 +118,48 @@ test "a nested raise is a value, not an unwind" {
 }
 
 test/nondet "an entry that left a span open answers W0609 beside its value" {
-  project([{ path: "inner.ply", text: leaves_a_span() }]);
-  let l = loaded(traced_quietly());
-  let ended = ended_of(l, "main", []);
-  let _ = unloaded(l);
-  assert_eq(ended.answer, Ok(VInt(3)));
+  write_project([{ path: "inner.ply", text: leaves_a_span() }]);
+  let l = load_program(traced_quietly());
+  let ended = entry_result(l, "main", []);
+  let _ = unload_program(l);
+  assert_eq(ended.result, Ok(VInt(3)));
   warns_of_the_open_span(ended.warnings)
 }
 
 test "an edited program's unit enters the new program, and opening one files nothing" {
   scratch(|| {
-    project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
-    let first = loaded(default_options());
-    assert_eq(ended_of(first, "main", []).answer, Ok(VInt(1)));
+    write_project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
+    let first = load_program(default_options());
+    assert_eq(entry_result(first, "main", []).result, Ok(VInt(1)));
     assert(
       fs.kind[cwd](".ply-cache") == fs::Missing,
       Some("opening a unit reads the library it was handed and files nothing"),
     );
     write("inner.ply", "fn main() -> Int = 2\n");
-    let again = loaded(default_options());
-    assert_eq(ended_of(again, "main", []).answer, Ok(VInt(2)));
+    let again = load_program(default_options());
+    assert_eq(entry_result(again, "main", []).result, Ok(VInt(2)));
     // The first unit stays as it was opened until it is closed.
-    assert_eq(ended_of(first, "main", []).answer, Ok(VInt(1)));
-    let _ = unloaded(first);
-    let _ = unloaded(again);
+    assert_eq(entry_result(first, "main", []).result, Ok(VInt(1)));
+    let _ = unload_program(first);
+    let _ = unload_program(again);
     ()
   })
 }
 
 test "a call enters a definition with its arguments, and says what it raised" {
   scratch(|| {
-    project([
+    write_project([
       {
         path: "inner.ply",
         text: "fn main() -> Int = 0\n\npub fn double(x: Int) -> Int = x * 2\n\npub fn boom() -> Int / {abort.raise} = panic(\"oh no\")\n",
       },
     ]);
-    let l = loaded(default_options());
-    let doubled = ended_of(l, "double", [VInt(21)]);
-    let raised = ended_of(l, "boom", []);
-    let _ = unloaded(l);
-    assert_eq(doubled.answer, Ok(VInt(42)));
-    match raised.answer {
+    let l = load_program(default_options());
+    let doubled = entry_result(l, "double", [VInt(21)]);
+    let raised = entry_result(l, "boom", []);
+    let _ = unload_program(l);
+    assert_eq(doubled.result, Ok(VInt(42)));
+    match raised.result {
       Ok(_) -> panic("`boom` answered"),
       Err(r) ->
         assert(
@@ -169,18 +172,18 @@ test "a call enters a definition with its arguments, and says what it raised" {
 
 test "a memo answers what its body did, and a call of a name never defined is declined" {
   scratch(|| {
-    project([
+    write_project([
       {
         path: "inner.ply",
         text: "fn main() -> Int = 0\n\nfn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }\n\npub fn constant() -> Int = deep(50)\n",
       },
     ]);
-    let l = loaded(default_options());
-    let answer = |name: String| ended_of(l, name, []).answer;
+    let l = load_program(default_options());
+    let answer = |name: String| entry_result(l, name, []).result;
     let ran = answer("constant");
     let remembered = answer("constant");
     let declined = answer("absent");
-    let _ = unloaded(l);
+    let _ = unload_program(l);
     assert_eq(ran, Ok(VInt(50)));
     assert_eq(remembered, Ok(VInt(50)));
     assert(declined != Ok(VInt(0)), Some("an absent name answered"))
@@ -212,18 +215,21 @@ fn churning() -> String =
   \\
 
 /// How `name(n)` ended, and what the run held when its root returned.
-fn held_by(name: String, n: Int) -> Ended / {Here, Shipped, Driving, abort.raise} = {
-  project([{ path: "inner.ply", text: churning() }]);
-  let l = loaded(default_options());
-  let ended = ended_of(l, name, [VInt(n)]);
-  let _ = unloaded(l);
+fn churn_result(
+  name: String,
+  n: Int,
+) -> EntryResult / {WorkingDirectory, Shipped, MachineAccess, abort.raise} = {
+  write_project([{ path: "inner.ply", text: churning() }]);
+  let l = load_program(default_options());
+  let ended = entry_result(l, name, [VInt(n)]);
+  let _ = unload_program(l);
   ended
 }
 
 // A server spawns per connection for as long as it runs, so its tables must follow the live tasks.
 test/nondet "a production region keeps its tables to the tasks still live" {
-  let h = held_by("churn", 200);
-  assert_eq(h.answer, Ok(VInt(200 * 201 / 2)));
+  let h = churn_result("churn", 200);
+  assert_eq(h.result, Ok(VInt(200 * 201 / 2)));
   assert(
     h.usage.scheduled <= 3,
     Some("the scheduler keeps " ++ h.usage.scheduled.to_string() ++ " tasks after 400 spawns"),
@@ -240,8 +246,8 @@ test/nondet "a production region keeps its tables to the tasks still live" {
 
 // A spawn's handle is a bridge, which a server makes per request.
 test/nondet "a production region that drops its task handles gives their native objects back" {
-  let h = held_by("fired", 10000);
-  assert_eq(h.answer, Ok(VInt(10000 * 9999 / 2)));
+  let h = churn_result("fired", 10000);
+  assert_eq(h.result, Ok(VInt(10000 * 9999 / 2)));
   assert(
     h.usage.native_objects <= 4,
     Some(h.usage.native_objects.to_string() ++ " native objects after 10000 dropped handles"),

@@ -5,18 +5,18 @@ import std.fs
 import std.fs (fs)
 import std.list
 import compiler.store.memo
-import compiler.store.memo (Read, memo, memo_keep, answer, started)
+import compiler.store.memo (Dependency, memo, memo_store, query_output, start_run)
 import compiler.store.memo_files
 import compiler.store.packs
 
 fn quoted(input: Bytes) -> Bytes / {memo.read} =
-  Bytes::concat_all([b"\"", memo.ask(b"text", input), b"\""])
+  Bytes::concat_all([b"\"", memo.fetch(b"text", input), b"\""])
 
 fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> memo::Query<| {}> =
   { name: name, hash: hash, body: body, kept: true, summarized: false }
 
 fn test_queries() -> Map<Bytes, memo::Query<| {}>> =
-  Map::new().insert(b"text", query(b"text", b"t1", memo::read_whole)).insert(
+  Map::new().insert(b"text", query(b"text", b"t1", memo::read_file)).insert(
     b"quoted",
     query(b"quoted", b"q1", quoted),
   )
@@ -28,19 +28,23 @@ fn program() -> Bytes = b"p"
 /// below it over the shipped files `files` lists, as `ply` answers a load. How many bodies ran,
 /// what the driver asked and each place the run looked at.
 fn answering<[r]>(
-  pack: Option<packs::Written>,
+  pack: Option<packs::PackFiles>,
   files: Bytes,
   text: Bytes,
-) -> { ran: Int, asked: List<Read>, looked: List<Read> } / {fs.read[r], fs.write[r], abort.raise} = {
+) -> { ran: Int, asked: List<Dependency>, looked: List<Dependency> } / {fs.read[r], fs.write[r], abort.raise} = {
   let queries = test_queries();
-  memo_files::kept[r](
+  memo_files::with_memo_store[r](
     "s",
     |path: String, offset: Int, len: Int| packs::frame_in(pack, path, offset, len),
     files,
     |_: Bytes, _: Bytes| Some(text),
     || {
-      let a = answer(queries, started(queries), b"quoted", b"a");
-      { ran: memo::ran_total(a.run), asked: memo::asked_reads(a.run), looked: memo_keep.looked() }
+      let a = query_output(queries, start_run(queries), b"quoted", b"a");
+      {
+        ran: memo::executed_count(a.run),
+        asked: memo::driver_dependencies(a.run),
+        looked: memo_store.looked(),
+      }
     },
     commands: [program()],
   )
@@ -49,35 +53,35 @@ fn answering<[r]>(
 /// `output` filed under `key` as a command's answer over what a load asked and looked at, in a run
 /// of its own that asks no query, as `ply` files one once the load is over.
 fn filing<[r]>(
-  pack: Option<packs::Written>,
+  pack: Option<packs::PackFiles>,
   files: Bytes,
   text: Bytes,
   key: Bytes,
-  load: { ran: Int, asked: List<Read>, looked: List<Read> },
+  load: { ran: Int, asked: List<Dependency>, looked: List<Dependency> },
   output: Bytes,
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
-  memo_files::kept[r](
+  memo_files::with_memo_store[r](
     "s",
     |path: String, offset: Int, len: Int| packs::frame_in(pack, path, offset, len),
     files,
     |_: Bytes, _: Bytes| Some(text),
-    || memo::recorded(test_queries(), key, program(), load.asked, load.looked, output),
+    || memo::record_output(test_queries(), key, program(), load.asked, load.looked, output),
     commands: [program()],
   )
 
 /// The command's answer filed under `key`, taken back in a run of its own as `ply` takes one back.
 fn taking<[r]>(
-  pack: Option<packs::Written>,
+  pack: Option<packs::PackFiles>,
   files: Bytes,
   text: Bytes,
   key: Bytes,
 ) -> Option<Bytes> / {fs.read[r], fs.write[r], abort.raise} =
-  memo_files::kept[r](
+  memo_files::with_memo_store[r](
     "s",
     |path: String, offset: Int, len: Int| packs::frame_in(pack, path, offset, len),
     files,
     |_: Bytes, _: Bytes| Some(text),
-    || memo::standing(test_queries(), key),
+    || memo::cached_output(test_queries(), key),
     commands: [program()],
   )
 
@@ -110,13 +114,13 @@ fn damaged(tree: fs::MemFs, payload: Bytes) -> fs::MemFs / {abort.raise} =
 
 /// The pack of what `text` and `quoted` answer of a file holding `text`, made over the files
 /// `b"files"` lists.
-fn quoted_pack(text: Bytes) -> packs::Written / {abort.raise} = {
+fn quoted_pack(text: Bytes) -> packs::PackFiles / {abort.raise} = {
   let queries = test_queries();
   let keys = [b"text", b"quoted"].map(|name: Bytes|
     match queries.get(name) { Some(q) -> memo::key_of(q, b"a"), None -> b"" });
   fs::on_mem[abs](fs::mem_of([]), || {
     answering[abs](None, b"", text);
-    memo_files::packed[abs]("s", keys, packs::as_is, memo::queries_id(queries), b"files")
+    memo_files::write_pack[abs]("s", keys, packs::uncompressed, memo::queries_id(queries), b"files")
   }).value.written
 }
 

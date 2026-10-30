@@ -10,22 +10,23 @@ import compiler.front.seam (Analysed, Refused)
 import compiler.store.hash.encoding (hex)
 import compiler.check.infer.checker (DefInfo, Builtin)
 import compiler.check.infer.definitions (externs_of)
-import compiler.check.lent (Passed, passed)
-import compiler.syntax.items (Item, IFn, IType, IEffect, IEffectSet, IExtern, ExternDef, FnDef,
-                              TypeDef, TDAlias, TDSum, TDNominal, TDExtern, VariantDef, EffectDef,
-                              OpDef, EffectSetDef, FieldDoc, SpecClause, ReturnsFresh, ReturnsParam,
-                              Vis, VPub, VPriv, SchemaDef, schema_of, member_of)
+import compiler.check.borrowing (ParameterMode, parameter_mode)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, EffectSetItem, ExternItem,
+                              ExternDef, FnDef, TypeDef, AliasBody, SumBody, NominalBody,
+                              ExternBody, VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc,
+                              SpecClause, ReturnsFresh, ReturnsParam, Visibility, Public, Private,
+                              SchemaDef, schema_of, member_of)
 import compiler.syntax.parsing (Doc, Ident, Span)
 import compiler.check.resolve.tables (ParsedModule, qualify)
-import compiler.syntax.type_syntax (TypeExpr, TRecord, ty_span, generics_text)
-import compiler.check.types (Printer, Scheme, Type, TyFn, printer_new, print_scheme, print_ty,
-                             print_row, scheme_text, row_text)
+import compiler.syntax.type_syntax (TypeExpr, RecordTypeExpression, ty_span, generics_text)
+import compiler.check.types (Printer, Scheme, Type, FunctionType, printer_new, print_scheme,
+                             print_ty, print_row, scheme_text, row_text)
 import std.bin
 import std.list
 import std.string
 
 /// A parameter as a signature writes it.
-pub type Typed = { name: String, ty: String }
+pub type TypedParameter = { name: String, ty: String }
 
 /// A variant, field or operation of a declaration, or what a module publishes.
 pub type Member = { kind: String, name: String, signature: String, doc: List<String> }
@@ -39,7 +40,7 @@ pub type Page = {
   simple: String,
   signature: String,
   ty: String,
-  params: List<Typed>,
+  params: List<TypedParameter>,
   doc: List<String>,
   clauses: List<String>,
   members: List<Member>,
@@ -54,13 +55,13 @@ pub type Page = {
 /// A module's pages: its own first, then one for each name it declares.
 pub type Pages = { pages: List<Page> }
 
-derive bin for Typed
+derive bin for TypedParameter
 derive bin for Member
 derive bin for Page
 derive bin for Pages
 
 /// What a module's pages are read from beside its text.
-pub type Decided = {
+pub type PageInputs = {
   /// What its check published of each definition, by program-wide name.
   defs: List<DefInfo>,
   /// Each definition's hash, by program-wide name.
@@ -90,14 +91,14 @@ pub fn bare_page(kind: String, name: String, signature: String) -> Page =
 // `prefix name<generics>(p: T, ...) -> R / row`, with the parameters named as the source did and
 // every variable named by one printer, so the generics, the parameters and the row agree.
 
-type Printing = { printer: Printer, pairs: List<Typed> }
+type Printing = { printer: Printer, pairs: List<TypedParameter> }
 
-pub type Signed = { text: String, params: List<Typed> }
+pub type PrintedSignature = { text: String, params: List<TypedParameter> }
 
 fn printed_params(
   printer: Printer,
   ts: List<Type>,
-  params: List<Passed>,
+  params: List<ParameterMode>,
 ) -> Printing / {abort.raise} =
   range(0, ts.len()).fold({ printer: printer, pairs: [] }, |acc: Printing, i: Int|
     match ts.at(i) {
@@ -127,18 +128,21 @@ pub fn signature(
   prefix: String,
   name: String,
   scheme: Scheme,
-  params: List<Passed>,
-) -> Signed / {abort.raise} = {
+  params: List<ParameterMode>,
+) -> PrintedSignature / {abort.raise} = {
   let full = print_scheme(printer_new(), scheme);
   match scheme.ty {
-    TyFn(f) -> {
+    FunctionType(f) -> {
       let ps: Printing = printed_params(full.printer, f.params, params);
       let row = print_row(ps.printer, f.effects);
       let effects = if row.text == b"{}" { "" } else { " / " ++ String::of_bytes_lossy(row.text) };
       let ret = print_ty(row.printer, f.ret);
       {
         text: prefix ++ name ++ generics_of(full.text) ++ "("
-          ++ String::join(ps.pairs.map(|named: Typed| named.name ++ ": " ++ named.ty), ", ")
+          ++ String::join(
+            ps.pairs.map(|named: TypedParameter| named.name ++ ": " ++ named.ty),
+            ", ",
+          )
           ++ ") -> "
           ++ String::of_bytes_lossy(ret.text)
           ++ effects,
@@ -165,40 +169,45 @@ pub fn one_line(text: String) -> String = {
 }
 
 /// A module as its pages read it: its parse, its text, and what its check and hashing decided.
-type Reading = { parsed: ParsedModule, text: Bytes, defs: Map<Bytes, DefInfo>, decided: Decided }
+type PageSource = {
+  parsed: ParsedModule,
+  text: Bytes,
+  defs: Map<Bytes, DefInfo>,
+  decided: PageInputs,
+}
 
-fn sliced(reading: Reading, span: Span) -> String / {abort.raise} =
+fn sliced(reading: PageSource, span: Span) -> String / {abort.raise} =
   if span.start > span.end || span.end > reading.text.len() { "" }
   else { one_line(String::of_bytes_lossy(reading.text.slice(span.start, span.end))) }
 
-fn visibility(v: Vis) -> String = match v { VPub -> "pub ", VPriv -> "" }
+fn visibility(v: Visibility) -> String = match v { Public -> "pub ", Private -> "" }
 
 fn fn_named(parsed: ParsedModule, name: Bytes) -> Option<FnDef> =
   parsed.module.items.fold(None, |acc: Option<FnDef>, it: Item|
     match acc {
       Some(_) -> acc,
       None -> match it {
-        IFn(d) -> if qualify(parsed.name, d.name.name) == name { Some(d) } else { None },
+        FunctionItem(d) -> if qualify(parsed.name, d.name.name) == name { Some(d) } else { None },
         _ -> None,
       },
     })
 
-fn fn_signature(def_info: DefInfo, found: Option<FnDef>) -> Signed / {abort.raise} = {
+fn fn_signature(def_info: DefInfo, found: Option<FnDef>) -> PrintedSignature / {abort.raise} = {
   let prefix = match found {
     None -> "fn ",
     Some(d) ->
-      visibility(d.vis) ++ (if d.reuse == None { "" } else { "reuse " })
+      visibility(d.visibility) ++ (if d.reuse == None { "" } else { "reuse " })
         ++ (if d.constant == None { "" } else { "const " })
         ++ "fn ",
   };
   signature(prefix, String::of_bytes_lossy(def_info.simple_name), def_info.scheme, match found {
-    Some(d) -> d.params.map(passed),
+    Some(d) -> d.params.map(parameter_mode),
     None -> [],
   })
 }
 
 /// What a caller may rely on beyond the signature: what the answer shares, then each clause as written.
-fn clauses_of(reading: Reading, d: FnDef) -> List<String> / {abort.raise} = {
+fn clauses_of(reading: PageSource, d: FnDef) -> List<String> / {abort.raise} = {
   let returns = match d.returns {
     Some(ReturnsFresh(_)) -> ["returns fresh"],
     Some(ReturnsParam(p)) -> ["returns " ++ String::of_bytes_lossy(p.name)],
@@ -208,17 +217,17 @@ fn clauses_of(reading: Reading, d: FnDef) -> List<String> / {abort.raise} = {
 }
 
 /// A schema as it is written: its parameters, its binders and guard, and the body it claims.
-fn schema_signature(reading: Reading, d: SchemaDef) -> String / {abort.raise} =
-  visibility(d.vis) ++ sliced(reading, d.span)
+fn schema_signature(reading: PageSource, d: SchemaDef) -> String / {abort.raise} =
+  visibility(d.visibility) ++ sliced(reading, d.span)
 
 // --- The pages ------------------------------------------------------------------
 
 /// A definition a schema declares is documented as the schema: what it is written as, and the laws
 /// that instantiate it.
-fn definition_page(reading: Reading, def_info: DefInfo) -> Page / {abort.raise} = {
+fn definition_page(reading: PageSource, def_info: DefInfo) -> Page / {abort.raise} = {
   let found = fn_named(reading.parsed, def_info.name);
   let schema = match found { Some(d) -> schema_of(reading.parsed.module, d), None -> None };
-  let signed: Signed = fn_signature(def_info, found);
+  let signed: PrintedSignature = fn_signature(def_info, found);
   {
     kind: match schema { Some(_) -> "law schema", None -> "definition" },
     name: String::of_bytes_lossy(def_info.name),
@@ -243,8 +252,8 @@ fn definition_page(reading: Reading, def_info: DefInfo) -> Page / {abort.raise} 
 }
 
 fn type_head(d: TypeDef) -> String =
-  visibility(d.vis) ++ (if d.opaque == None { "" } else { "opaque " })
-    ++ (match d.body { TDExtern -> "extern ", _ -> "" })
+  visibility(d.visibility) ++ (if d.opaque == None { "" } else { "opaque " })
+    ++ (match d.body { ExternBody -> "extern ", _ -> "" })
     ++ "type "
     ++ String::of_bytes_lossy(d.name.name)
     ++ String::of_bytes_lossy(generics_text(d.generics))
@@ -252,21 +261,21 @@ fn type_head(d: TypeDef) -> String =
 fn field_doc(docs: List<FieldDoc>, name: Bytes) -> List<String> =
   match docs.find(|f: FieldDoc| f.name == name) { Some(f) -> lines_of(Some(f.doc)), None -> [] }
 
-fn type_signature(reading: Reading, d: TypeDef) -> String / {abort.raise} =
+fn type_signature(reading: PageSource, d: TypeDef) -> String / {abort.raise} =
   match d.body {
-    TDAlias(t) -> match t {
-      TRecord(_) -> type_head(d),
+    AliasBody(t) -> match t {
+      RecordTypeExpression(_) -> type_head(d),
       _ -> type_head(d) ++ " = " ++ sliced(reading, ty_span(t)),
     },
     // Its fields are its members, as an alias's are; the head says it is a type of its own.
-    TDNominal(_) -> type_head(d) ++ " = new { .. }",
-    TDSum(_) -> type_head(d),
-    TDExtern -> type_head(d),
+    NominalBody(_) -> type_head(d) ++ " = new { .. }",
+    SumBody(_) -> type_head(d),
+    ExternBody -> type_head(d),
   }
 
-fn field_members(reading: Reading, d: TypeDef, t: TypeExpr) -> List<Member> / {abort.raise} =
+fn field_members(reading: PageSource, d: TypeDef, t: TypeExpr) -> List<Member> / {abort.raise} =
   match t {
-    TRecord(r) ->
+    RecordTypeExpression(r) ->
       r.fields.map(|f: { name: Ident, ty: TypeExpr }|
         {
           kind: "field",
@@ -277,10 +286,10 @@ fn field_members(reading: Reading, d: TypeDef, t: TypeExpr) -> List<Member> / {a
     _ -> [],
   }
 
-fn type_members(reading: Reading, d: TypeDef) -> List<Member> / {abort.raise} =
+fn type_members(reading: PageSource, d: TypeDef) -> List<Member> / {abort.raise} =
   match d.body {
     // An opaque sum's constructors are its module's alone, so they are no part of what it publishes.
-    TDSum(vs) -> if d.opaque != None { [] } else {
+    SumBody(vs) -> if d.opaque != None { [] } else {
       vs.map(|v: VariantDef|
         {
           kind: "variant",
@@ -289,16 +298,16 @@ fn type_members(reading: Reading, d: TypeDef) -> List<Member> / {abort.raise} =
           doc: lines_of(v.doc),
         })
     },
-    TDAlias(t) -> field_members(reading, d, t),
-    TDNominal(t) -> field_members(reading, d, t),
-    TDExtern -> [],
+    AliasBody(t) -> field_members(reading, d, t),
+    NominalBody(t) -> field_members(reading, d, t),
+    ExternBody -> [],
   }
 
 fn effect_head(d: EffectDef) -> String =
-  visibility(d.vis) ++ (if d.is_nondet { "nondet " } else { "" }) ++ "effect "
+  visibility(d.visibility) ++ (if d.is_nondet { "nondet " } else { "" }) ++ "effect "
     ++ String::of_bytes_lossy(d.name.name)
 
-fn op_member(reading: Reading, op: OpDef) -> Member / {abort.raise} =
+fn op_member(reading: PageSource, op: OpDef) -> Member / {abort.raise} =
   {
     kind: "operation",
     name: String::of_bytes_lossy(op.name.name),
@@ -306,19 +315,19 @@ fn op_member(reading: Reading, op: OpDef) -> Member / {abort.raise} =
     doc: lines_of(op.doc),
   }
 
-fn set_signature(reading: Reading, d: EffectSetDef) -> String / {abort.raise} =
-  visibility(d.vis) ++ sliced(reading, d.span)
+fn set_signature(reading: PageSource, d: EffectSetDef) -> String / {abort.raise} =
+  visibility(d.visibility) ++ sliced(reading, d.span)
 
 /// The functions of the type `d`, in its module's order: those the module publishes where it
 /// publishes the type, and every one of a type it keeps.
-fn type_functions(reading: Reading, d: TypeDef) -> List<Member> / {abort.raise} = {
+fn type_functions(reading: PageSource, d: TypeDef) -> List<Member> / {abort.raise} = {
   let parsed = reading.parsed;
   parsed.module.items.fold([], |acc: List<Member>, it: Item|
     match it {
-      IFn(f) -> match member_of(f.name.name) {
+      FunctionItem(f) -> match member_of(f.name.name) {
         None -> acc,
         Some(m) -> {
-          let kept = match ((d.vis, f.vis)) { (VPub, VPriv) -> true, _ -> false };
+          let kept = match ((d.visibility, f.visibility)) { (Public, Private) -> true, _ -> false };
           if m.of != d.name.name || kept { acc } else {
             match reading.defs.get(qualify(parsed.name, f.name.name)) {
               None -> acc,
@@ -338,7 +347,7 @@ fn type_functions(reading: Reading, d: TypeDef) -> List<Member> / {abort.raise} 
 }
 
 /// A declaration's page: what kind it is, the names it goes by, and where it is declared.
-fn declared(reading: Reading, kind: String, own: Bytes, span: Span) -> Page =
+fn declaration_page(reading: PageSource, kind: String, own: Bytes, span: Span) -> Page =
   {
     ..bare_page(kind, String::of_bytes_lossy(qualify(reading.parsed.name, own)), ""),
     simple: String::of_bytes_lossy(own),
@@ -348,13 +357,13 @@ fn declared(reading: Reading, kind: String, own: Bytes, span: Span) -> Page =
 /// The pages of what one item declares: an extern's, a type's, an effect's and each of its
 /// operations', or an effect set's. A function's page is its definition's, which its check
 /// publishes.
-fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
+fn item_pages(reading: PageSource, it: Item) -> List<Page> / {abort.raise} =
   match it {
-    IExtern(d) -> match native_of(reading, d) {
+    ExternItem(d) -> match native_of(reading, d) {
       Some(n) ->
         [
           {
-            ..declared(reading, "builtin", d.name.name, d.span),
+            ..declaration_page(reading, "builtin", d.name.name, d.span),
             signature: n.signed.text,
             ty: String::of_bytes_lossy(scheme_text(n.builtin.scheme)),
             params: n.signed.params,
@@ -364,36 +373,36 @@ fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
         ],
       None -> [],
     },
-    IType(d) ->
+    TypeItem(d) ->
       [
         {
-          ..declared(reading, "type", d.name.name, d.span),
+          ..declaration_page(reading, "type", d.name.name, d.span),
           signature: type_signature(reading, d),
           doc: lines_of(d.doc),
           members: type_members(reading, d).concat(type_functions(reading, d)),
         },
       ],
-    IEffect(d) ->
-      d.ops.fold(
+    EffectItem(d) ->
+      d.operations.fold(
         [
           {
-            ..declared(reading, "effect", d.name.name, d.span),
+            ..declaration_page(reading, "effect", d.name.name, d.span),
             signature: effect_head(d),
             doc: lines_of(d.doc),
-            members: d.ops.map(|op: OpDef| op_member(reading, op)),
+            members: d.operations.map(|op: OpDef| op_member(reading, op)),
           },
         ],
         |acc: List<Page>, op: OpDef|
           acc.push({
-            ..declared(reading, "operation", Bytes::concat_all([d.name.name, b".", op.name.name]), op.span),
+            ..declaration_page(reading, "operation", Bytes::concat_all([d.name.name, b".", op.name.name]), op.span),
             signature: sliced(reading, op.span),
             doc: lines_of(op.doc),
           }),
       ),
-    IEffectSet(d) ->
+    EffectSetItem(d) ->
       [
         {
-          ..declared(reading, "effect set", d.name.name, d.span),
+          ..declaration_page(reading, "effect set", d.name.name, d.span),
           signature: set_signature(reading, d),
           doc: lines_of(d.doc),
         },
@@ -402,9 +411,9 @@ fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
   }
 
 /// A module's extern as the checker binds it, and its signature with its parameters named.
-type Native = { builtin: Builtin, signed: Signed }
+type Native = { builtin: Builtin, signed: PrintedSignature }
 
-fn native_of(reading: Reading, d: ExternDef) -> Option<Native> / {abort.raise} = {
+fn native_of(reading: PageSource, d: ExternDef) -> Option<Native> / {abort.raise} = {
   let name = qualify(reading.parsed.name, d.name.name);
   match externs_of(reading.parsed.name, reading.parsed.module).find(|b: Builtin| b.name == name) {
     Some(b) ->
@@ -417,13 +426,13 @@ fn native_of(reading: Reading, d: ExternDef) -> Option<Native> / {abort.raise} =
 }
 
 /// What a module publishes, in its order, each with its signature and doc.
-fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
+fn module_members(reading: PageSource) -> List<Member> / {abort.raise} = {
   let parsed = reading.parsed;
   parsed.module.items.fold([], |acc: List<Member>, it: Item|
     match it {
-      IExtern(d) -> match d.vis {
-        VPriv -> acc,
-        VPub -> match native_of(reading, d) {
+      ExternItem(d) -> match d.visibility {
+        Private -> acc,
+        Public -> match native_of(reading, d) {
           Some(n) ->
             acc.push({
               kind: "builtin",
@@ -434,9 +443,9 @@ fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
           None -> acc,
         },
       },
-      IFn(d) -> match d.vis {
-        VPriv -> acc,
-        VPub -> match ((
+      FunctionItem(d) -> match d.visibility {
+        Private -> acc,
+        Public -> match ((
             reading.defs.get(qualify(parsed.name, d.name.name)),
             schema_of(parsed.module, d),
           )) {
@@ -459,9 +468,9 @@ fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
           },
         },
       },
-      IType(d) -> match d.vis {
-        VPriv -> acc,
-        VPub ->
+      TypeItem(d) -> match d.visibility {
+        Private -> acc,
+        Public ->
           acc.push({
             kind: "type",
             name: String::of_bytes_lossy(d.name.name),
@@ -469,9 +478,9 @@ fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
             doc: lines_of(d.doc),
           }),
       },
-      IEffect(d) -> match d.vis {
-        VPriv -> acc,
-        VPub ->
+      EffectItem(d) -> match d.visibility {
+        Private -> acc,
+        Public ->
           acc.push({
             kind: "effect",
             name: String::of_bytes_lossy(d.name.name),
@@ -479,9 +488,9 @@ fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
             doc: lines_of(d.doc),
           }),
       },
-      IEffectSet(d) -> match d.vis {
-        VPriv -> acc,
-        VPub ->
+      EffectSetItem(d) -> match d.visibility {
+        Private -> acc,
+        Public ->
           acc.push({
             kind: "effect set",
             name: String::of_bytes_lossy(d.name.name),
@@ -496,8 +505,12 @@ fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
 /// The pages of the module `parsed`, whose text is `text`: its own, one for each definition its
 /// check published, in that order, and one for each type, effect, operation and effect set it
 /// declares, in the order its text does.
-pub fn documented(parsed: ParsedModule, text: Bytes, decided: Decided) -> Pages / {abort.raise} = {
-  let reading: Reading = {
+pub fn module_pages(
+  parsed: ParsedModule,
+  text: Bytes,
+  decided: PageInputs,
+) -> Pages / {abort.raise} = {
+  let reading: PageSource = {
     parsed: parsed,
     text: text,
     defs: decided.defs.fold(Map::new(), |acc: Map<Bytes, DefInfo>, d: DefInfo|
@@ -537,7 +550,7 @@ fn pages_of(src: Bytes, named: Bytes, law: Bytes) -> List<Page> / {abort.raise} 
     [p] -> match analyse([p]) {
       Refused(_) -> panic("the fixture checks"),
       Analysed(w) ->
-        documented(p.module, src, {
+        module_pages(p.module, src, {
           defs: w.checked.defs,
           hashes: w.hashes.defs.fold(
             Map::new(),
@@ -596,7 +609,7 @@ test "a shipped module's extern is a builtin of its module, listed among its mem
   let src = b"//! Natives.\n\n/// Twice the number.\npub extern fn doubled(x: Int) -> Int\n\n/// Kept inside.\nextern fn hidden(x: Int) -> Int\n";
   match parse_all([{ name: b"std.native", src: src }]) {
     [p] -> {
-      let pages = documented(p.module, src, {
+      let pages = module_pages(p.module, src, {
         defs: [],
         hashes: Map::new(),
         laws: Map::new(),

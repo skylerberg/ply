@@ -1,9 +1,9 @@
 //! `ply show` and `ply replace`: a definition printed with the comment above it, and rewritten in
 //! place without moving any other definition's hash.
 
-import harness (spawned, Kept, Source, in_memory, kept_in_memory, one, tree, file_of, project, read,
-                on_disk_with, stdout, stderr, json_of, at, nth, items, str, int, truth, shown,
-                Hermetic, Shipped, manifest, value_of)
+import harness (spawned, RunWithTree, Source, in_memory, in_memory_with_tree, one_module_tree, tree,
+                file_of, write_project, read, on_disk_with, stdout, stderr, json_of, at, nth, items,
+                str, int, bool, json_text, Hermetic, Shipped, manifest, value_of)
 import std.fs (MemFs)
 import std.json (Json)
 import std.string
@@ -28,27 +28,28 @@ fn own_hashes(
   t: MemFs,
 ) -> List<{ name: String, own: String }> / {Hermetic, Shipped, abort.raise, diverges} = {
   let v = json_of(in_memory(t, ["defs", "--json"]));
-  assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
+  assert(int(at(v, "exit_code")) == 0, Some(json_text(v)));
   items(at(v, "definitions")).map(|d: Json| { name: str(at(d, "name")), own: str(at(d, "own")) })
 }
 
-fn replaced(
+fn run_with_stdin(
   t: MemFs,
   argv: List<String>,
   stdin: Option<String>,
-) -> Kept / {Hermetic, Shipped, abort.raise, diverges} = kept_in_memory(t, argv, [], stdin)
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_with_tree(t, argv, [], stdin)
 
-fn m_of(k: Kept) -> String / {abort.raise} =
+fn module_text(k: RunWithTree) -> String / {abort.raise} =
   match file_of(k.tree, "m.ply") { Some(t) -> t, None -> "" }
 
 test "show prints the definition with the comment above it and its place" {
-  let r = in_memory(one(source()), ["show", "two"]);
+  let r = in_memory(one_module_tree(source()), ["show", "two"]);
   assert(r.code == 0, Some(stderr(r)));
   assert_eq(stdout(r), two());
 
-  let v = json_of(in_memory(one(source()), ["show", "m.two", "--json"]));
+  let v = json_of(in_memory(one_module_tree(source()), ["show", "m.two", "--json"]));
   assert_eq(str(at(v, "command")), "show");
-  assert(truth(at(v, "ok")), Some(shown(v)));
+  assert(bool(at(v, "ok")), Some(json_text(v)));
   assert_eq(str(at(v, "name")), "m.two");
   assert_eq(str(at(v, "file")), "m.ply");
   assert_eq(str(at(v, "source")), two());
@@ -57,7 +58,7 @@ test "show prints the definition with the comment above it and its place" {
   );
   assert_eq(spanned, two());
 
-  let missing = json_of(in_memory(one(source()), ["show", "four", "--json"]));
+  let missing = json_of(in_memory(one_module_tree(source()), ["show", "four", "--json"]));
   assert_eq(int(at(missing, "exit_code")), 2);
   assert_eq(str(at(nth(at(missing, "diagnostics"), 0), "code")), "E0101")
 }
@@ -68,11 +69,11 @@ test "replace rewrites only the named definition and moves no other hash" {
     { path: "two.txt", text: "// Doubles the base, once.\npub fn   two() -> Int = one()*2\n" },
   ]);
   let before = own_hashes(t);
-  let k = replaced(t, ["replace", "two", "--with", "two.txt"], None);
+  let k = run_with_stdin(t, ["replace", "two", "--with", "two.txt"], None);
   assert(k.ran.code == 0, Some(stderr(k.ran)));
   assert_eq(stdout(k.ran), "replaced m.two in m.ply\n");
   assert_eq(
-    m_of(k),
+    module_text(k),
     \\// The base.
     \\fn one() -> Int = 1
     \\
@@ -92,29 +93,29 @@ test "replace rewrites only the named definition and moves no other hash" {
     });
 
   let again = json_of(
-    replaced(k.tree, ["replace", "two", "--with", "two.txt", "--json"], None).ran,
+    run_with_stdin(k.tree, ["replace", "two", "--with", "two.txt", "--json"], None).ran,
   );
   assert_eq(str(at(again, "command")), "replace");
-  assert(truth(at(again, "ok")), Some(shown(again)));
+  assert(bool(at(again, "ok")), Some(json_text(again)));
   assert_eq(str(at(again, "name")), "m.two");
   assert_eq(str(at(again, "file")), "m.ply");
-  assert(!truth(at(again, "changed")), Some(shown(again)))
+  assert(!bool(at(again, "changed")), Some(json_text(again)))
 }
 
 test "replace pointed at a file rewrites that file" {
-  let k = replaced(
-    one(source()),
+  let k = run_with_stdin(
+    one_module_tree(source()),
     ["replace", "two", "m.ply"],
     Some("pub fn two() -> Int = one() * 2\n"),
   );
   assert(k.ran.code == 0, Some(stderr(k.ran)));
   assert_eq(stdout(k.ran), "replaced m.two in m.ply\n");
-  assert_eq(m_of(k), source().replace(two(), "pub fn two() -> Int = one() * 2\n"))
+  assert_eq(module_text(k), source().replace(two(), "pub fn two() -> Int = one() * 2\n"))
 }
 
 test "a replacement that renames or breaks the program is refused and writes nothing" {
-  let renamed = replaced(
-    one(source()),
+  let renamed = run_with_stdin(
+    one_module_tree(source()),
     ["replace", "two"],
     Some("pub fn twice() -> Int = one() * 2\n"),
   );
@@ -123,29 +124,29 @@ test "a replacement that renames or breaks the program is refused and writes not
     stderr(renamed.ran).contains("E0128") && stderr(renamed.ran).contains("`fn` `twice`"),
     Some(stderr(renamed.ran)),
   );
-  assert_eq(m_of(renamed), source());
+  assert_eq(module_text(renamed), source());
 
-  let broken = replaced(
-    one(source()),
+  let broken = run_with_stdin(
+    one_module_tree(source()),
     ["replace", "two", "--json"],
     Some("pub fn two() -> Int = one() + \"1\"\n"),
   );
   let v = json_of(broken.ran);
   assert_eq(int(at(v, "exit_code")), 2);
-  assert(!truth(at(v, "changed")), Some(shown(v)));
+  assert(!bool(at(v, "changed")), Some(json_text(v)));
   assert_eq(str(at(nth(at(v, "diagnostics"), 0), "code")), "E0128");
-  assert_eq(m_of(broken), source())
+  assert_eq(module_text(broken), source())
 }
 
 test "check reports the file that would change and writes nothing" {
-  let k = replaced(
-    one(source()),
+  let k = run_with_stdin(
+    one_module_tree(source()),
     ["replace", "two", "--check"],
     Some("pub fn two() -> Int = one() * 2\n"),
   );
   assert(k.ran.code == 0, Some(stderr(k.ran)));
   assert_eq(stdout(k.ran), "would replace m.ply\n");
-  assert_eq(m_of(k), source())
+  assert_eq(module_text(k), source())
 }
 
 /// A root package over a dependency whose own module imports a sibling: re-checking a spliced
@@ -173,7 +174,7 @@ test/nondet "replace re-checks a packaged project with its own closure" {
   assert(unread.code == 2, Some("a replacement nothing read is refused: " ++ stderr(unread)));
   assert(stderr(unread).contains("new.txt"), Some(stderr(unread)));
 
-  project(packaged());
+  write_project(packaged());
   let r = on_disk_with(
     ["replace", "twice", "app"],
     [],

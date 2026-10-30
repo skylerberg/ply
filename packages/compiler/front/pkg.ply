@@ -4,15 +4,16 @@
 //! defaults: a literal, a constructor applied to literals, a record or a list.
 
 import compiler.syntax.parsing (Span, ParseDiag, error_at, dummy_span, starts_upper, parse_diag_bin)
-import compiler.syntax.items (Module, IFn, FnDef, item_span, parse)
-import compiler.syntax.exprs (Expr, ELit, EVar, EApp, ERecord, EList, RecField, expr_span)
-import compiler.syntax.patterns (LInt, LBool, LStr, LUnit)
-import compiler.syntax.type_syntax (TCon, ty_span)
+import compiler.syntax.items (Module, FunctionItem, FnDef, item_span, parse)
+import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, CallExpression,
+                              RecordExpression, ListExpression, RecordLiteralField, expr_span)
+import compiler.syntax.patterns (LiteralInt, LiteralBool, LiteralString, LiteralUnit)
+import compiler.syntax.type_syntax (NamedTypeExpression, ty_span)
 import compiler.store.hash.encoding (hex)
 import compiler.store.hash.forms (sort_bytes)
 import compiler.check.resolve.tables (Source, source_bin)
 import compiler.check.known (some_ctor, none_ctor)
-import compiler.expand.embed (EmbedAt, EmbedFile)
+import compiler.expand.embed (ModuleEmbed, EmbedFile)
 import std.json (Json, Null, Bool, Number, Str, Member, JsonCodec, object, array, variant,
                  error_to_string)
 import std.hash (blake3)
@@ -26,20 +27,20 @@ import std.bytes
 
 /// One kind of file that is a single literal: what its diagnostics call it, the file's name, the
 /// one definition it holds and the std.pkg type that definition answers.
-type Shape = { noun: Bytes, file: Bytes, def: Bytes, ty: Bytes }
+type FileKind = { noun: Bytes, file: Bytes, def: Bytes, ty: Bytes }
 
-fn manifest_shape() -> Shape =
+fn manifest_file_kind() -> FileKind =
   { noun: b"manifest", file: b"ply.pkg", def: b"package", ty: b"Manifest" }
 
-fn workspace_shape() -> Shape =
+fn workspace_file_kind() -> FileKind =
   { noun: b"workspace", file: b"ply.work", def: b"workspace", ty: b"Workspace" }
 
-pub type Checked = { manifest: Option<Manifest>, diags: List<ParseDiag> }
+pub type CheckedManifest = { manifest: Option<Manifest>, diags: List<ParseDiag> }
 
-pub fn check_source(src: Bytes) -> Checked / {abort.raise} =
-  match literal_of(src, manifest_shape()) {
+pub fn check_manifest(src: Bytes) -> CheckedManifest / {abort.raise} =
+  match literal_of(src, manifest_file_kind()) {
     Err(diags) -> { manifest: None, diags: diags },
-    Ok(l) -> match decoded(l, manifest_shape(), manifest_json()) {
+    Ok(l) -> match decoded(l, manifest_file_kind(), manifest_json()) {
       Err(diags) -> { manifest: None, diags: diags },
       Ok(m) -> validate(m, l.at),
     },
@@ -52,12 +53,12 @@ pub type CheckedWorkspace = { workspace: Option<Workspace>, diags: List<ParseDia
 /// directory once, each relative to the file and inside its directory, to an entry that is a
 /// module's name and a definition's, and to a runtime that is a cargo package's name.
 pub fn check_workspace(src: Bytes) -> CheckedWorkspace / {abort.raise} =
-  match literal_of(src, workspace_shape()) {
+  match literal_of(src, workspace_file_kind()) {
     Err(diags) -> { workspace: None, diags: diags },
-    Ok(l) -> match decoded(l, workspace_shape(), workspace_json()) {
+    Ok(l) -> match decoded(l, workspace_file_kind(), workspace_json()) {
       Err(diags) -> { workspace: None, diags: diags },
       Ok(w) -> {
-        let diags = workspace_diags(w, field_diag(l.at, workspace_shape()));
+        let diags = workspace_diags(w, field_diag(l.at, workspace_file_kind()));
         { workspace: if diags.len() == 0 { Some(w) } else { None }, diags: diags }
       },
     },
@@ -66,55 +67,55 @@ pub fn check_workspace(src: Bytes) -> CheckedWorkspace / {abort.raise} =
 /// A file's one literal as the json a derived codec reads, and where its body is.
 type Literal = { json: Json, at: Span }
 
-fn literal_of(src: Bytes, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
+fn literal_of(src: Bytes, s: FileKind) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
   let r = parse(src);
   if r.parser.diags.len() > 0 { Err(r.parser.diags) } else { literal_in(r.node, s) }
 }
 
-fn literal_in(module: Module, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort.raise} =
+fn literal_in(module: Module, s: FileKind) -> Result<Literal, List<ParseDiag>> / {abort.raise} =
   match module.items {
     [one] -> match one {
-      IFn(d) -> if d.name.name == s.def { literal_fn(d, s) } else {
+      FunctionItem(d) -> if d.name.name == s.def { literal_fn(d, s) } else {
         Err([
-          shape(
+          shape_error(
             d.name.span,
             s,
-            said([b"a ", s.noun, b"'s one definition is named `", s.def, b"`"]),
+            message_text([b"a ", s.noun, b"'s one definition is named `", s.def, b"`"]),
           ),
         ])
       },
       _ ->
         Err([
-          shape(
+          shape_error(
             item_span(one),
             s,
-            said([b"a ", s.noun, b" holds a `fn ", s.def, b"`, nothing else"]),
+            message_text([b"a ", s.noun, b" holds a `fn ", s.def, b"`, nothing else"]),
           ),
         ]),
     },
     [] ->
       Err([
-        shape(
+        shape_error(
           dummy_span(),
           s,
-          said([b"a ", s.noun, b" defines `", s.def, b"`; this file defines nothing"]),
+          message_text([b"a ", s.noun, b" defines `", s.def, b"`; this file defines nothing"]),
         ),
       ]),
     [_, two, ..rest] ->
       Err([
-        shape(
+        shape_error(
           item_span(two),
           s,
-          said([b"a ", s.noun, b" defines `", s.def, b"` and nothing else"]),
+          message_text([b"a ", s.noun, b" defines `", s.def, b"` and nothing else"]),
         ),
       ]),
   }
 
-fn said(parts: List<Bytes>) -> Bytes = Bytes::concat_all(parts)
+fn message_text(parts: List<Bytes>) -> Bytes = Bytes::concat_all(parts)
 
-fn shape(here: Span, s: Shape, message: Bytes) -> ParseDiag =
-  error_at(b"E0129", here, message, said([b"not the shape a ", s.noun, b" takes"]), [
-    said([
+fn shape_error(here: Span, s: FileKind, message: Bytes) -> ParseDiag =
+  error_at(b"E0129", here, message, message_text([b"not the shape a ", s.noun, b" takes"]), [
+    message_text([
       b"a `",
       s.file,
       b"` file is exactly `fn ",
@@ -126,37 +127,37 @@ fn shape(here: Span, s: Shape, message: Bytes) -> ParseDiag =
     ]),
   ])
 
-fn cat(xs: List<ParseDiag>, ys: List<ParseDiag>) -> List<ParseDiag> =
+fn concat_diags(xs: List<ParseDiag>, ys: List<ParseDiag>) -> List<ParseDiag> =
   ys.fold(xs, |acc: List<ParseDiag>, diag: ParseDiag| acc.push(diag))
 
-fn literal_fn(def: FnDef, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
-  let returns = said([b"`", s.def, b"` returns std.pkg's `", s.ty, b"`"]);
-  let not_it = said([b"not the ", s.noun, b" type"]);
+fn literal_fn(def: FnDef, s: FileKind) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
+  let returns = message_text([b"`", s.def, b"` returns std.pkg's `", s.ty, b"`"]);
+  let not_it = message_text([b"not the ", s.noun, b" type"]);
   let ret_diags = match def.ret {
     None ->
       [
-        shape_msg(
+        labelled_shape_error(
           def.name.span,
-          said([b"`", s.def, b"` declares its return type, std.pkg's `", s.ty, b"`"]),
+          message_text([b"`", s.def, b"` declares its return type, std.pkg's `", s.ty, b"`"]),
           b"no return type written",
         ),
       ],
     Some(t) -> match t {
-      TCon(c) -> if c.name.name.name == s.ty { [] }
-      else { [shape_msg(ty_span(t), returns, not_it)] },
-      _ -> [shape_msg(ty_span(t), returns, not_it)],
+      NamedTypeExpression(c) -> if c.name.name.name == s.ty { [] }
+      else { [labelled_shape_error(ty_span(t), returns, not_it)] },
+      _ -> [labelled_shape_error(ty_span(t), returns, not_it)],
     },
   };
   let param_diags = if def.params.len() == 0 { [] } else {
     [
-      shape_msg(
+      labelled_shape_error(
         def.name.span,
-        said([b"`", s.def, b"` takes no parameters"]),
-        said([b"a ", s.noun, b" is data; nothing is passed in"]),
+        message_text([b"`", s.def, b"` takes no parameters"]),
+        message_text([b"a ", s.noun, b" is data; nothing is passed in"]),
       ),
     ]
   };
-  let diags = cat(ret_diags, param_diags);
+  let diags = concat_diags(ret_diags, param_diags);
   if diags.len() > 0 { Err(diags) } else {
     match literal_json(def.body) {
       Err(at) ->
@@ -164,8 +165,8 @@ fn literal_fn(def: FnDef, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort
           error_at(
             b"E0130",
             at,
-            said([b"a ", s.noun, b" is a value, not something that runs"]),
-            said([b"not ", s.noun, b" data"]),
+            message_text([b"a ", s.noun, b" is a value, not something that runs"]),
+            message_text([b"not ", s.noun, b" data"]),
             [b"a literal, a constructor applied to literals, a record or a list is fine"],
           ),
         ]),
@@ -174,13 +175,13 @@ fn literal_fn(def: FnDef, s: Shape) -> Result<Literal, List<ParseDiag>> / {abort
   }
 }
 
-fn shape_msg(here: Span, message: Bytes, label: Bytes) -> ParseDiag =
+fn labelled_shape_error(here: Span, message: Bytes, label: Bytes) -> ParseDiag =
   error_at(b"E0129", here, message, label, [])
 
 /// `l` read by `codec`, or the one diagnostic that says why it does not read.
 fn decoded<a>(
   l: Literal,
-  s: Shape,
+  s: FileKind,
   codec: JsonCodec<a>,
 ) -> Result<a, List<ParseDiag>> / {abort.raise} =
   match (codec.decode)(l.json) {
@@ -190,7 +191,7 @@ fn decoded<a>(
           b"E0131",
           l.at,
           Bytes::of_string(error_to_string(e)),
-          said([b"the ", s.noun, b" does not decode"]),
+          message_text([b"the ", s.noun, b" does not decode"]),
           [],
         ),
       ]),
@@ -200,22 +201,25 @@ fn decoded<a>(
 /// `None` and `Some` encode the way the json derive encodes `Option`: null and the bare value.
 fn literal_json(expr: Expr) -> Result<Json, Span> / {abort.raise} =
   match expr {
-    ELit(v) -> match v.lit {
-      LInt(n) -> Ok(Number(Decimal::of_int(n))),
-      LBool(b) -> Ok(Bool(b)),
-      LStr(s) -> Ok(Str(String::of_bytes(s))),
-      LUnit -> Ok(Null),
+    LiteralExpression(v) -> match v.lit {
+      LiteralInt(n) -> Ok(Number(Decimal::of_int(n))),
+      LiteralBool(b) -> Ok(Bool(b)),
+      LiteralString(s) -> Ok(Str(String::of_bytes(s))),
+      LiteralUnit -> Ok(Null),
       _ -> Err(v.span),
     },
-    ERecord(r) -> fields_json(r.fields, []),
-    EList(l) -> match items_json(l.items, []) { Err(s) -> Err(s), Ok(items) -> Ok(array(items)) },
-    EApp(a) -> match a.func {
-      EVar(f) -> if a.named.len() == 0 && a.labels.len() == 0 && starts_upper(f.name.name.name) {
-        ctor_json(a.span, f.name.name.name, a.args)
-      } else { Err(a.span) },
+    RecordExpression(r) -> fields_json(r.fields, []),
+    ListExpression(l) -> match items_json(l.items, []) {
+      Err(s) -> Err(s),
+      Ok(items) -> Ok(array(items)),
+    },
+    CallExpression(a) -> match a.func {
+      NameExpression(f) -> if a.named.len() == 0 && a.labels.len() == 0
+          && starts_upper(f.name.name.name) { ctor_json(a.span, f.name.name.name, a.args) }
+      else { Err(a.span) },
       _ -> Err(a.span),
     },
-    EVar(v) -> if v.name.name.name == none_ctor() { Ok(Null) }
+    NameExpression(v) -> if v.name.name.name == none_ctor() { Ok(Null) }
     else if starts_upper(v.name.name.name) { Ok(variant(String::of_bytes(v.name.name.name), [])) }
     else { Err(v.span) },
     _ -> Err(expr_span(expr)),
@@ -238,7 +242,10 @@ fn items_json(exprs: List<Expr>, acc: List<Json>) -> Result<List<Json>, Span> / 
     },
   }
 
-fn fields_json(fields: List<RecField>, acc: List<Member>) -> Result<Json, Span> / {abort.raise} =
+fn fields_json(
+  fields: List<RecordLiteralField>,
+  acc: List<Member>,
+) -> Result<Json, Span> / {abort.raise} =
   match fields {
     [] -> Ok(object(acc)),
     [f, ..rest] -> match literal_json(f.value) {
@@ -247,8 +254,8 @@ fn fields_json(fields: List<RecField>, acc: List<Member>) -> Result<Json, Span> 
     },
   }
 
-fn validate(manifest: Manifest, here: Span) -> Checked / {abort.raise} = {
-  let bad = field_diag(here, manifest_shape());
+fn validate(manifest: Manifest, here: Span) -> CheckedManifest / {abort.raise} = {
+  let bad = field_diag(here, manifest_file_kind());
   let name_diags = if Bytes::of_string(manifest.name).len() == 0 {
     [bad(b"a manifest's `name` must not be empty")]
   } else if !is_dotted_path(manifest.name) {
@@ -261,16 +268,16 @@ fn validate(manifest: Manifest, here: Span) -> Checked / {abort.raise} = {
   };
   let version_diags = if version_ok(manifest.version) { [] }
   else { [bad(b"a manifest's `version` counts up from zero, never below")] };
-  let base = cat(name_diags, cat(prefix_diags, version_diags));
+  let base = concat_diags(name_diags, concat_diags(prefix_diags, version_diags));
   {
     manifest: if base.len() == 0 { Some(manifest) } else { None },
     diags: deps_ok(manifest.dependencies, [], base, bad),
   }
 }
 
-fn field_diag(here: Span, s: Shape) -> (Bytes) -> ParseDiag =
+fn field_diag(here: Span, s: FileKind) -> (Bytes) -> ParseDiag =
   |message: Bytes|
-    error_at(b"E0131", here, message, said([b"not a field a ", s.noun, b" accepts"]), [])
+    error_at(b"E0131", here, message, message_text([b"not a field a ", s.noun, b" accepts"]), [])
 
 /// Every directory a workspace names, in the order it names them.
 fn directories(w: Workspace) -> List<String> = {
@@ -302,7 +309,7 @@ fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> /
     if below(dir) { acc } else {
       acc.push(
         bad(
-          said([
+          message_text([
             b"`",
             Bytes::of_string(dir),
             b"` is no directory below the workspace's: names joined by `/`, none of them `.` or `..`",
@@ -312,7 +319,9 @@ fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> /
     });
   let once = range(0, dirs.len()).fold(placed, |acc: List<ParseDiag>, i: Int|
     if !dirs.take(i).contains(dirs.get(i)) { acc } else {
-      acc.push(bad(said([b"the directory `", Bytes::of_string(dirs.get(i)), b"` is named twice"])))
+      acc.push(
+        bad(message_text([b"the directory `", Bytes::of_string(dirs.get(i)), b"` is named twice"])),
+      )
     });
   match w.toolchain {
     None -> once,
@@ -320,7 +329,7 @@ fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> /
       let entered = if is_dotted_path(t.entry) && t.entry.contains(".") { once } else {
         once.push(
           bad(
-            said([
+            message_text([
               b"the entry `",
               Bytes::of_string(t.entry),
               b"` is not a module's name and a definition's, joined by a dot",
@@ -331,7 +340,11 @@ fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> /
       if cargo_name(t.runtime) { entered } else {
         entered.push(
           bad(
-            said([b"the runtime `", Bytes::of_string(t.runtime), b"` is no cargo package's name"]),
+            message_text([
+              b"the runtime `",
+              Bytes::of_string(t.runtime),
+              b"` is no cargo package's name",
+            ]),
           ),
         )
       }
@@ -405,7 +418,7 @@ fn scan_path(bs: Bytes, i: Int, seg_start: Bool) -> Bool / {abort.raise} =
   }
 
 test "a well-formed manifest checks and decodes" {
-  let got = check_source(
+  let got = check_manifest(
     b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"tool\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [{name: \"cli\", prefix: None, min: {major: 1, minor: 2, patch: 3}, source: Path(\"../cli\")}, {name: \"gitlib\", prefix: Some(\"gl\"), min: {major: 0, minor: 0, patch: 1}, source: Git(\"https://example.com/gitlib\", \"deadbee\")}, {name: \"reglib\", prefix: None, min: {major: 2, minor: 0, patch: 0}, source: Registry}], entry: Some(\"app.serve\")}",
   );
   assert_eq(got.diags, []);
@@ -423,11 +436,11 @@ test "a well-formed manifest checks and decodes" {
 }
 
 test "a manifest with anything but one fn named package is refused" {
-  assert_eq(check_source(b"type X = {a: Int}").diags.get(0).code, b"E0129");
-  assert_eq(check_source(b"fn other() -> Int = 1").diags.get(0).code, b"E0129");
-  assert_eq(check_source(b"fn package() -> Int = 1").diags.get(0).code, b"E0129");
+  assert_eq(check_manifest(b"type X = {a: Int}").diags.get(0).code, b"E0129");
+  assert_eq(check_manifest(b"fn other() -> Int = 1").diags.get(0).code, b"E0129");
+  assert_eq(check_manifest(b"fn package() -> Int = 1").diags.get(0).code, b"E0129");
   assert_eq(
-    check_source(
+    check_manifest(
       b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}\nfn extra() -> Int = 1",
     ).diags.get(
       0,
@@ -439,7 +452,7 @@ test "a manifest with anything but one fn named package is refused" {
 test "a manifest body that runs is not a value" {
   let head = b"import std.pkg (Manifest)\nfn package() -> Manifest = ";
   assert_eq(
-    check_source(
+    check_manifest(
       head
         ++ b"{name: greet(\"x\"), version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
     ).diags.get(
@@ -448,7 +461,7 @@ test "a manifest body that runs is not a value" {
     b"E0130",
   );
   assert_eq(
-    check_source(
+    check_manifest(
       head
         ++ b"{name: \"a\", version: {major: 0, minor: 0, patch: 1 + 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
     ).diags.get(
@@ -457,7 +470,7 @@ test "a manifest body that runs is not a value" {
     b"E0130",
   );
   assert_eq(
-    check_source(
+    check_manifest(
       head
         ++ b"{ let x = 1; {name: \"a\", version: {major: 0, minor: 0, patch: x}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None} }",
     ).diags.get(
@@ -486,7 +499,7 @@ fn a_dep(name: String, floor: Int, path: String) -> String =
     ++ path
     ++ "\")}"
 
-fn supplied_at(root: String, name: String, deps: List<String>) -> Supplied =
+fn supplied_at(root: String, name: String, deps: List<String>) -> SuppliedPackage =
   { root: Bytes::of_string(root), manifest: Some(a_manifest(name, deps)), modules: [] }
 
 fn a_registry_dep(name: String, floor: Int) -> String =
@@ -499,10 +512,11 @@ fn codes_of(clo: Closure) -> List<Bytes> =
 test "a registry dependency is wanted at the root's cache, whichever package declares it" {
   let app = supplied_at("/x/app", "app", [a_registry_dep("orders", 1), a_dep("lib", 0, "../lib")]);
   let lib = supplied_at("/x/lib", "lib", [a_registry_dep("money", 0)]);
-  assert_eq(wants([b"/x/app"], [app]), [b"/x/app/.ply-cache/registry/orders", b"/x/lib"]);
-  assert_eq(wants([b"/x/app", b"/x/app/.ply-cache/registry/orders", b"/x/lib"], [app, lib]), [
-    b"/x/app/.ply-cache/registry/money",
-  ]);
+  assert_eq(roots_wanted([b"/x/app"], [app]), [b"/x/app/.ply-cache/registry/orders", b"/x/lib"]);
+  assert_eq(
+    roots_wanted([b"/x/app", b"/x/app/.ply-cache/registry/orders", b"/x/lib"], [app, lib]),
+    [b"/x/app/.ply-cache/registry/money"],
+  );
   assert_eq(registry_key(b".", b"orders"), b".ply-cache/registry/orders")
 }
 
@@ -528,9 +542,9 @@ test "a registry slot never fetched, fetched below the floor, or holding another
     [],
   );
   assert_eq(codes_of(unfetched), [b"E0135"]);
-  let said = unfetched.diags.get(0).diag;
-  assert(String::of_bytes_lossy(said.message).contains("`orders` has not been fetched"));
-  assert(String::of_bytes_lossy(said.notes_text.get(0)).contains("`ply resolve`"));
+  let message_text = unfetched.diags.get(0).diag;
+  assert(String::of_bytes_lossy(message_text.message).contains("`orders` has not been fetched"));
+  assert(String::of_bytes_lossy(message_text.notes_text.get(0)).contains("`ply resolve`"));
   let below = closure(
     {
       root: b"/x/app",
@@ -624,13 +638,13 @@ test "a dependency below the floor its importer asks for is named with both vers
 test "fields that fail validation are named" {
   let head = b"import std.pkg (Manifest)\nfn package() -> Manifest = ";
   let tail = b", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}";
-  assert_eq(check_source(head ++ b"{name: \"\"" ++ tail).diags.get(0).code, b"E0131");
-  assert_eq(check_source(head ++ b"{name: \"Not A Path\"" ++ tail).diags.get(0).code, b"E0131");
-  assert_eq(check_source(head ++ b"{name: 3" ++ tail).diags.get(0).code, b"E0131");
+  assert_eq(check_manifest(head ++ b"{name: \"\"" ++ tail).diags.get(0).code, b"E0131");
+  assert_eq(check_manifest(head ++ b"{name: \"Not A Path\"" ++ tail).diags.get(0).code, b"E0131");
+  assert_eq(check_manifest(head ++ b"{name: 3" ++ tail).diags.get(0).code, b"E0131");
   let dup = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}, {name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 2}, source: Registry}], entry: None}";
-  assert_eq(check_source(dup).diags.get(0).code, b"E0131");
+  assert_eq(check_manifest(dup).diags.get(0).code, b"E0131");
   let escaping = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"../up\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}], entry: None}";
-  let refused = check_source(escaping).diags.get(0);
+  let refused = check_manifest(escaping).diags.get(0);
   assert_eq(refused.code, b"E0131");
   assert(String::of_bytes_lossy(refused.message).contains("is not a package name"))
 }
@@ -704,7 +718,7 @@ test "a workspace names each directory once, below its own, and an entry that is
 }
 
 test "a manifest is still refused in its own words" {
-  let d = check_source(b"fn other() -> Int = 1").diags.get(0);
+  let d = check_manifest(b"fn other() -> Int = 1").diags.get(0);
   assert_eq(d.message, b"a manifest's one definition is named `package`");
   assert_eq(d.notes_text, [
     b"a `ply.pkg` file is exactly `fn package() -> Manifest = ...`, with std.pkg's Manifest",
@@ -712,7 +726,7 @@ test "a manifest is still refused in its own words" {
 }
 
 test "a manifest with a syntax error reports the parse, not the shape" {
-  let got = check_source(b"fn package() -> Manifest = {name: \"a\"");
+  let got = check_manifest(b"fn package() -> Manifest = {name: \"a\"");
   assert_eq(got.diags.len(), 1);
   assert(got.diags.get(0).code != b"E0129")
 }
@@ -736,11 +750,11 @@ test "a module path scans segments, not just characters" {
 
 /// A package as a walker supplies it: the root it was found at, its manifest text when the
 /// root holds one (`None` marks a wanted root that had none), and its modules named relative.
-pub type Supplied = { root: Bytes, manifest: Option<Bytes>, modules: List<Source> }
+pub type SuppliedPackage = { root: Bytes, manifest: Option<Bytes>, modules: List<Source> }
 
 /// The packages one load is made of: the root's own manifest (`None` is the anonymous
 /// package) and everything the walk reached from it.
-pub type PackageSources = { root: Bytes, manifest: Option<Bytes>, supplied: List<Supplied> }
+pub type PackageSources = { root: Bytes, manifest: Option<Bytes>, supplied: List<SuppliedPackage> }
 
 /// One package of the settled closure: its granted module prefix, the prefixes it declares,
 /// and its decoded manifest (`None` when the root held none or the text did not check).
@@ -775,35 +789,39 @@ fn normalize(path: Bytes) -> Bytes / {abort.raise} = {
 /// The root keys a set of manifests asks for beyond the ones already known: what a walker
 /// reads next. Malformed manifests ask for nothing; their refusal is the final pass's to say.
 /// The first manifest is the root package's, whose directory holds every registry dependency.
-pub fn wants(known: List<Bytes>, manifests: List<Supplied>) -> List<Bytes> / {abort.raise} = {
+pub fn roots_wanted(
+  known: List<Bytes>,
+  manifests: List<SuppliedPackage>,
+) -> List<Bytes> / {abort.raise} = {
   let root = match manifests.at(0) { Some(s) -> s.root, None -> b"" };
-  manifests.fold([], |acc: List<Bytes>, s: Supplied|
+  manifests.fold([], |acc: List<Bytes>, s: SuppliedPackage|
     match s.manifest {
       None -> acc,
-      Some(src) -> match check_source(src).manifest {
+      Some(src) -> match check_manifest(src).manifest {
         None -> acc,
         Some(m) ->
           m.dependencies.fold(acc, |acc2: List<Bytes>, d: Dep|
             match d.source {
-              Path(p) -> wanted(known, acc2, join_normalized(s.root, Bytes::of_string(p))),
+              Path(p) -> add_wanted_root(known, acc2, join_normalized(s.root, Bytes::of_string(p))),
               // A git dependency is wanted by the key its fetch is named under, not by a path: a
               // walker that has not fetched it yet has nothing to read.
               Git(url, rev) ->
-                wanted(known, acc2, git_key(Bytes::of_string(url), Bytes::of_string(rev))),
-              Registry -> wanted(known, acc2, registry_key(root, Bytes::of_string(d.name))),
+                add_wanted_root(known, acc2, git_key(Bytes::of_string(url), Bytes::of_string(rev))),
+              Registry ->
+                add_wanted_root(known, acc2, registry_key(root, Bytes::of_string(d.name))),
             }),
       },
     })
 }
 
-fn wanted(known: List<Bytes>, acc: List<Bytes>, root: Bytes) -> List<Bytes> =
+fn add_wanted_root(known: List<Bytes>, acc: List<Bytes>, root: Bytes) -> List<Bytes> =
   if known.contains(root) || acc.contains(root) { acc } else { acc.push(root) }
 
 test "a walk's next reads are the roots its manifests ask for that it has not read" {
   let app = supplied_at("/x/app", "app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")]);
-  assert_eq(wants([b"/x/app"], [app]), [b"/x/b", b"/x/c"]);
-  assert_eq(wants([b"/x/app", b"/x/b"], [app]), [b"/x/c"]);
-  assert_eq(wants([b"/x/app"], [{ root: b"/x/app", manifest: None, modules: [] }]), [])
+  assert_eq(roots_wanted([b"/x/app"], [app]), [b"/x/b", b"/x/c"]);
+  assert_eq(roots_wanted([b"/x/app", b"/x/b"], [app]), [b"/x/c"]);
+  assert_eq(roots_wanted([b"/x/app"], [{ root: b"/x/app", manifest: None, modules: [] }]), [])
 }
 
 /// The root key a git dependency is supplied under once it is fetched: `git+<url>@<rev>`. The front
@@ -855,7 +873,7 @@ fn checked_manifests(
       match texts.get(i) {
         None -> { ..acc, manifests: acc.manifests.push(None) },
         Some(src) -> {
-          let c = check_source(src);
+          let c = check_manifest(src);
           let slot = slot_of(texts, i);
           {
             manifests: acc.manifests.push(c.manifest),
@@ -873,30 +891,33 @@ fn manifest_diag(slot: Int, code: Bytes, message: Bytes) -> { slot: Int, diag: P
   { slot: slot, diag: error_at(code, dummy_span(), message, b"in this package's manifest", []) }
 
 /// The anonymous root package alone.
-pub fn empty() -> PackageSources = { root: b"", manifest: None, supplied: [] }
+pub fn anonymous_package() -> PackageSources = { root: b"", manifest: None, supplied: [] }
 
 /// The packages of one load, judged, and the dependency modules named.
 pub fn closure(pkgs: PackageSources, root_modules: List<Bytes>) -> Closure / {abort.raise} =
-  closed(judged(pkgs, root_modules), pkgs.supplied)
+  closure_of_judged(judged(pkgs, root_modules), pkgs.supplied)
 
 /// The packages of a load as [`closure`] judges them, apart from the modules they hold.
-pub type Judged = { packages: List<Package>, diags: List<{ slot: Int, diag: ParseDiag }> }
+pub type JudgedPackages = { packages: List<Package>, diags: List<{ slot: Int, diag: ParseDiag }> }
 
 /// `j` over the modules `supplied` holds, each dependency's named by its package's prefix.
-pub fn closed(j: Judged, supplied: List<Supplied>) -> Closure / {abort.raise} =
+pub fn closure_of_judged(
+  j: JudgedPackages,
+  supplied: List<SuppliedPackage>,
+) -> Closure / {abort.raise} =
   { packages: j.packages, modules: name_modules(j.packages, supplied, 1, []), diags: j.diags }
 
 /// `j` with what spells where its packages are taken out: each package's root is its place among
 /// them, and each dependency read from a path is read from no path, so packages that move answer
 /// as they did.
-pub fn placeless(j: Judged) -> Judged / {abort.raise} =
+pub fn without_locations(j: JudgedPackages) -> JudgedPackages / {abort.raise} =
   {
     ..j,
     packages: range(0, j.packages.len()).map(|i: Int| {
       let p = j.packages.get(i);
       {
         ..p,
-        root: place_token(i),
+        root: location_placeholder(i),
         manifest: match p.manifest {
           None -> None,
           Some(m) ->
@@ -910,20 +931,20 @@ pub fn placeless(j: Judged) -> Judged / {abort.raise} =
     }),
   }
 
-/// The root [`placeless`] gives the package at `i` among a load's.
-pub fn place_token(i: Int) -> Bytes = Bytes::of_string("package " ++ i.to_string())
+/// The root [`without_locations`] gives the package at `i` among a load's.
+pub fn location_placeholder(i: Int) -> Bytes = Bytes::of_string("package " ++ i.to_string())
 
 /// The packages of one load, judged: dependencies usable, prefixes unique, the graph acyclic.
 /// `root_modules` are the root package's own module names, whose first segments may not squat on
 /// a dependency's prefix.
-pub fn judged(pkgs: PackageSources, root_modules: List<Bytes>) -> Judged / {abort.raise} = {
+pub fn judged(pkgs: PackageSources, root_modules: List<Bytes>) -> JudgedPackages / {abort.raise} = {
   let texts: List<Option<Bytes>> = pkgs.supplied.fold(
     [pkgs.manifest],
-    |acc: List<Option<Bytes>>, supplied: Supplied| acc.push(supplied.manifest),
+    |acc: List<Option<Bytes>>, supplied: SuppliedPackage| acc.push(supplied.manifest),
   );
   let roots: List<Bytes> = pkgs.supplied.fold(
     [pkgs.root],
-    |acc: List<Bytes>, supplied: Supplied| acc.push(supplied.root),
+    |acc: List<Bytes>, supplied: SuppliedPackage| acc.push(supplied.root),
   );
   let checked = checked_manifests(texts);
   let packages = range(0, roots.len()).map(|i: Int| {
@@ -938,16 +959,16 @@ pub fn judged(pkgs: PackageSources, root_modules: List<Bytes>) -> Judged / {abor
   judge(texts, roots, checked.manifests, packages, root_modules, checked.diags)
 }
 
-derive bin for Supplied
+derive bin for SuppliedPackage
 derive bin for PackageSources
 derive bin for Package
-derive bin for Judged
+derive bin for JudgedPackages
 
 /// Dependency modules in supplied order, named by their package's prefix when it decoded;
 /// the count and order a walker supplied in is the count and order named here.
 fn name_modules(
   packages: List<Package>,
-  supplied: List<Supplied>,
+  supplied: List<SuppliedPackage>,
   i: Int,
   out: List<{ pkg: Int, src: Source }>,
 ) -> List<{ pkg: Int, src: Source }> / {abort.raise} =
@@ -977,14 +998,17 @@ fn name_modules(
 // BLAKE3 digest of the modules it contributed. The digest is over the modules' names and texts in
 // name order, so neither a move nor a walk order can change it and an edit must.
 
-pub type Pinned = { name: Bytes, version: Bytes, digest: Bytes }
+pub type LockedPackage = { name: Bytes, version: Bytes, digest: Bytes }
 
 fn digest_domain() -> Bytes = b"ply.lock.package.1"
 
 /// The closure's dependencies, in package order: the root package is the project's own sources and
 /// is not pinned. A dependency is its modules and what they embed.
-pub fn pins_of(clo: Closure, embeds: List<EmbedAt> = []) -> List<Pinned> / {abort.raise} =
-  range(1, clo.packages.len()).fold([], |acc: List<Pinned>, i: Int| {
+pub fn pins_of(
+  clo: Closure,
+  embeds: List<ModuleEmbed> = [],
+) -> List<LockedPackage> / {abort.raise} =
+  range(1, clo.packages.len()).fold([], |acc: List<LockedPackage>, i: Int| {
     let p = clo.packages.get(i);
     match p.manifest {
       None -> acc,
@@ -997,13 +1021,13 @@ pub fn pins_of(clo: Closure, embeds: List<EmbedAt> = []) -> List<Pinned> / {abor
     }
   })
 
-fn package_digest(pkg: Int, clo: Closure, embeds: List<EmbedAt>) -> Bytes / {abort.raise} = {
+fn package_digest(pkg: Int, clo: Closure, embeds: List<ModuleEmbed>) -> Bytes / {abort.raise} = {
   let mine = clo.modules.filter(|m: { pkg: Int, src: Source }| m.pkg == pkg);
   let parts = mine.map(|m: { pkg: Int, src: Source }|
     Bytes::concat_all([m.src.name, b"\0", m.src.src, b"\0"]));
   let names = mine.fold(Map::new(), |acc: Map<Bytes, Bool>, m: { pkg: Int, src: Source }|
     acc.insert(m.src.name, true));
-  let embedded = embeds.filter(|embed: EmbedAt| names.contains(embed.module)).map(embed_part);
+  let embedded = embeds.filter(|embed: ModuleEmbed| names.contains(embed.module)).map(embed_part);
   let modules = Bytes::concat_all(sort_bytes(parts));
   // A package that embeds nothing keeps the digest its modules alone give it.
   let tail = if embedded.len() == 0 { b"" }
@@ -1011,7 +1035,7 @@ fn package_digest(pkg: Int, clo: Closure, embeds: List<EmbedAt>) -> Bytes / {abo
   b"b3:".concat(hex(blake3(Bytes::concat_all([digest_domain(), modules, tail]))))
 }
 
-fn embed_part(embed: EmbedAt) -> Bytes / {abort.raise} =
+fn embed_part(embed: ModuleEmbed) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     embed.module,
     b"\0",
@@ -1047,14 +1071,15 @@ fn judge(
   packages: List<Package>,
   root_modules: List<Bytes>,
   diags: List<{ slot: Int, diag: ParseDiag }>,
-) -> Judged / {abort.raise} = {
+) -> JudgedPackages / {abort.raise} = {
   let built = range(0, packages.len()).fold(
     { packages: packages, diags: diags, edges: [] },
     |acc: Pending, i: Int|
       match manifests.get(i) {
         None -> acc,
         Some(m) ->
-          m.dependencies.fold(acc, |a: Pending, d: Dep| one_dep(texts, roots, manifests, i, a, d)),
+          m.dependencies.fold(acc, |a: Pending, d: Dep|
+            judge_dependency(texts, roots, manifests, i, a, d)),
       },
   );
   let versioned = version_judgments(texts, roots, built.packages, built.edges, built.diags);
@@ -1082,7 +1107,7 @@ fn version_text(v: Version) -> Bytes =
 /// Minimal version selection: one version of a package serves a whole closure, so a name reached
 /// at two roots has no one version to pick and is refused naming both. Two manifests asking
 /// different floors of the *same* package is not an error — the highest floor wins, and the check
-/// that the package is at least that high is `one_dep`'s.
+/// that the package is at least that high is `judge_dependency`'s.
 fn version_judgments(
   texts: List<Option<Bytes>>,
   roots: List<Bytes>,
@@ -1150,7 +1175,7 @@ fn first_edge(edges: List<{ from: Int, target: Int }>, target: Int) -> Option<In
 fn cycle_text(roots: List<Bytes>, c: List<Int>) -> Bytes / {abort.raise} =
   Bytes::join(c.push(c.get(0)).map(|i: Int| roots.get(i)), b" -> ")
 
-fn one_dep(
+fn judge_dependency(
   texts: List<Option<Bytes>>,
   roots: List<Bytes>,
   manifests: List<Option<Manifest>>,
@@ -1162,7 +1187,7 @@ fn one_dep(
   match d.source {
     Git(url, rev) -> {
       let key = git_key(Bytes::of_string(url), Bytes::of_string(rev));
-      reached(
+      judge_reached_dependency(
         texts,
         roots,
         manifests,
@@ -1176,7 +1201,7 @@ fn one_dep(
     },
     Path(p) -> {
       let target = join_normalized(roots.get(i), Bytes::of_string(p));
-      reached(
+      judge_reached_dependency(
         texts,
         roots,
         manifests,
@@ -1189,7 +1214,7 @@ fn one_dep(
       )
     },
     Registry ->
-      reached(
+      judge_reached_dependency(
         texts,
         roots,
         manifests,
@@ -1211,7 +1236,7 @@ fn is_registry(d: Dep) -> Bool = match d.source { Registry -> true, _ -> false }
 /// A dependency judged at the root the walk supplied it under: it must have been read, hold a
 /// manifest, be the package a registry slot is named for, be at least the floor asked for, and call
 /// itself by the prefix it is granted. A registry slot with no manifest is one never fetched.
-fn reached(
+fn judge_reached_dependency(
   texts: List<Option<Bytes>>,
   roots: List<Bytes>,
   manifests: List<Option<Manifest>>,

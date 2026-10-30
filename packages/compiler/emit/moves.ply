@@ -7,13 +7,13 @@
 
 import compiler.syntax.parsing (Span, span_key)
 import std.bytes (ascii_of_int)
-import compiler.emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Miss, Loop, Next, Done, Return,
-                          Restart, Enter, Fail, Handle, Val, Native, Take, Get, AInt, Lambda,
-                          Closure)
+import compiler.emit.typed_ir (Fn, Block, Inst, Let, Do, If, Case, Match, Miss, Loop, Next, Done,
+                               Return, Restart, Jump, Fail, Handle, Rvalue, Native, Take, Get,
+                               IntOperand, Lambda, Closure)
 import compiler.emit.lower (root_observed)
 import compiler.emit.lower.base (read_note, capture_note, enter_note)
-import compiler.emit.lower.setting (Setting, Root)
-import compiler.emit.own (owned)
+import compiler.emit.lower.module_context (ModuleContext, Root)
+import compiler.emit.own (insert_reference_counts)
 
 /// Each read noted, by its place, each capture, by the closure's place and the slot, and each field
 /// read, by its place: whether it moves. A place noted more than once (a body run in place at more
@@ -31,22 +31,22 @@ pub fn capture_moved(m: Moves, at: Span, src: Int) -> Bool =
   m.captures.get(capture_key(at, src)) == Some(true)
 
 /// Whether the field read written at `at` takes the field out of its block.
-pub fn field_taken(m: Moves, at: Span) -> Bool = m.taken.get(span_key(at)) == Some(true)
+pub fn field_moved(m: Moves, at: Span) -> Bool = m.taken.get(span_key(at)) == Some(true)
 
 fn capture_key(at: Span, src: Int) -> Bytes =
   Bytes::concat_all([span_key(at), b"#", ascii_of_int(src)])
 
 /// The moves of root `r` of `setting` as its owned form makes them.
-pub fn root_moves(setting: Setting, r: Root) -> Moves / {abort.raise} =
-  moves_of(owned(root_observed(setting, r)))
+pub fn root_moves(setting: ModuleContext, r: Root) -> Moves / {abort.raise} =
+  moves_of(insert_reference_counts(root_observed(setting, r)))
 
 /// The moves of `f`, a root lowered observing and owned, and of each closure it makes.
 pub fn moves_of(f: Fn) -> Moves =
-  f.lambdas.fold(walked(f.body, no_moves()), |m: Moves, l: Lambda|
+  f.lambdas.fold(block_moves(f.body, no_moves()), |m: Moves, l: Lambda|
     match l { Closure(c) -> moves_of_closure(c.body, m) })
 
 fn moves_of_closure(f: Fn, m: Moves) -> Moves =
-  f.lambdas.fold(walked(f.body, m), |acc: Moves, l: Lambda|
+  f.lambdas.fold(block_moves(f.body, m), |acc: Moves, l: Lambda|
     match l { Closure(c) -> moves_of_closure(c.body, acc) })
 
 /// The slots read on some path from a point, each by its frame and number.
@@ -55,53 +55,57 @@ type Live = Map<Bytes, Bool>
 /// Where control goes other than on: a match arm's miss, a loop's next pass and its end.
 type Exits = { miss: Live, next: Live, done: Live }
 
-type Walked = { live: Live, moves: Moves }
+type BackwardState = { live: Live, moves: Moves }
 
-fn walked(b: Block, m: Moves) -> Moves = {
+fn block_moves(b: Block, m: Moves) -> Moves = {
   let none: Live = Map::new();
-  back(b, { live: none, moves: m }, { miss: none, next: none, done: none }).moves
+  scan_backward(b, { live: none, moves: m }, { miss: none, next: none, done: none }).moves
 }
 
 fn union(a: Live, b: Live) -> Live = b.fold(a, |acc: Live, k: Bytes, _: Bool| acc.insert(k, true))
 
-fn noted(map: Map<Bytes, Bool>, key: Bytes, moved: Bool) -> Map<Bytes, Bool> =
+fn record_move(map: Map<Bytes, Bool>, key: Bytes, moved: Bool) -> Map<Bytes, Bool> =
   map.insert(key, match map.get(key) { Some(was) -> was && moved, None -> moved })
 
 /// `b` walked from its end, `after` holding what is read after it.
-fn back(b: Block, after: Walked, ex: Exits) -> Walked =
-  b.fold_right(after, |i: Inst, w: Walked|
+fn scan_backward(b: Block, after: BackwardState, ex: Exits) -> BackwardState =
+  b.fold_right(after, |i: Inst, w: BackwardState|
     match i {
       Do(d) -> note(d.val, d.at, w),
       Let(l) -> {
         let fields = match l.val {
-          Take(_) -> noted(w.moves.taken, span_key(l.at), true),
-          Get(_) -> noted(w.moves.taken, span_key(l.at), false),
+          Take(_) -> record_move(w.moves.taken, span_key(l.at), true),
+          Get(_) -> record_move(w.moves.taken, span_key(l.at), false),
           _ -> w.moves.taken,
         };
         { ..w, moves: { ..w.moves, taken: fields } }
       },
       If(x) -> {
-        let t = back(x.then, w, ex);
-        let o = back(x.otherwise, { ..w, moves: t.moves }, ex);
+        let t = scan_backward(x.then, w, ex);
+        let o = scan_backward(x.otherwise, { ..w, moves: t.moves }, ex);
         { live: union(t.live, o.live), moves: o.moves }
       },
       Case(c) -> {
-        let rest = back(c.rest, w, ex);
-        c.arms.fold(rest, |acc: Walked, a: { when: Int, body: Block }| {
-          let arm = back(a.body, { ..w, moves: acc.moves }, ex);
+        let rest = scan_backward(c.rest, w, ex);
+        c.arms.fold(rest, |acc: BackwardState, a: { when: Int, body: Block }| {
+          let arm = scan_backward(a.body, { ..w, moves: acc.moves }, ex);
           { live: union(acc.live, arm.live), moves: arm.moves }
         })
       },
       // An arm that misses goes on to the next, so each is walked after the ones below it.
       Match(x) ->
-        x.arms.fold_right(back(x.rest, w, ex), |arm: Block, next: Walked|
-          back(arm, { ..w, moves: next.moves }, { ..ex, miss: next.live })),
+        x.arms.fold_right(scan_backward(x.rest, w, ex), |arm: Block, next: BackwardState|
+          scan_backward(arm, { ..w, moves: next.moves }, { ..ex, miss: next.live })),
       Miss -> { ..w, live: ex.miss },
       // A pass reads again what the next one does: the body is walked until what its start reads
       // is what its passes do.
       Loop(l) -> {
         let inner = |head: Live, moves: Moves|
-          back(l.body, { live: Map::new(), moves: moves }, { ..ex, next: head, done: w.live });
+          scan_backward(l.body, { live: Map::new(), moves: moves }, {
+            ..ex,
+            next: head,
+            done: w.live,
+          });
         let once = inner(Map::new(), w.moves);
         let twice = inner(once.live, once.moves);
         let thrice = inner(union(once.live, twice.live), twice.moves);
@@ -111,33 +115,36 @@ fn back(b: Block, after: Walked, ex: Exits) -> Walked =
       Done(_) -> { ..w, live: ex.done },
       Return(_) -> { ..w, live: Map::new() },
       Restart(_) -> { ..w, live: Map::new() },
-      Enter(_) -> { ..w, live: Map::new() },
+      Jump(_) -> { ..w, live: Map::new() },
       Fail(_) -> { ..w, live: Map::new() },
-      Handle(h) -> back(h.body, w, ex),
+      Handle(h) -> scan_backward(h.body, w, ex),
       _ -> w,
     })
 
 /// `w` before the instruction doing `v` at `at`: a read noted there moves where nothing after it
 /// reads its slot, and is read from there on; a frame entered there reads none of its slots before.
-fn note(v: Val, at: Span, w: Walked) -> Walked =
+fn note(v: Rvalue, at: Span, w: BackwardState) -> BackwardState =
   match v {
     Native(n) -> match n.args {
-      [AInt(slot), AInt(site)] -> {
+      [IntOperand(slot), IntOperand(site)] -> {
         let key = frame_key(site).concat(ascii_of_int(slot));
         let moved = !w.live.contains(key);
         if n.name == read_note() {
           {
             live: w.live.insert(key, true),
-            moves: { ..w.moves, reads: noted(w.moves.reads, span_key(at), moved) },
+            moves: { ..w.moves, reads: record_move(w.moves.reads, span_key(at), moved) },
           }
         } else if n.name == capture_note() {
           {
             live: w.live.insert(key, true),
-            moves: { ..w.moves, captures: noted(w.moves.captures, capture_key(at, slot), moved) },
+            moves: {
+              ..w.moves,
+              captures: record_move(w.moves.captures, capture_key(at, slot), moved),
+            },
           }
         } else { w }
       },
-      [AInt(site)] -> if n.name != enter_note() { w } else {
+      [IntOperand(site)] -> if n.name != enter_note() { w } else {
         let frame = frame_key(site);
         {
           ..w,

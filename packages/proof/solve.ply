@@ -1,77 +1,79 @@
 //! `solve` — the decision procedure: case analysis over a saturating congruence closure, with linear
 //! integer arithmetic at every leaf.
 
-import arith (Row, Feasibility, Infeasible, Undecided, leq, eq_rows, feasibility, nonzero)
+import linear_arithmetic (Inequality, Feasibility, Infeasible, Undecided, add_inequality,
+                          add_equality, feasibility, nonzero)
 import context (Context, Ctor, variants)
-import domain (Ty, Con, Record, Decl, Variant)
-import egraph (Classes, Pair, Joined, classes, grow, find, union, equal, distinguish, has_diseq,
-               check_diseqs, groups, Shape, shape_of, conflict)
+import domain (Sort, NamedSort, RecordSort, Decl, Variant)
+import union_find (Classes, TermPair, UnionResult, classes, grow, find, union, equal, distinguish,
+                   has_disequality, check_disequalities, groups, Shape, shape_of, conflict)
 import lower (field_sorts)
-import rules (RuleLog, Rule, note, Propositional, CaseSplit, Congruence, Injectivity,
+import rules (RuleLog, Rule, record_rule, Propositional, CaseSplit, Congruence, Injectivity,
               LinearArithmetic)
-import sort (is_con, list_elem, field_names, int_ty)
-import term (Terms, Made, Node, TInt, TBool, TLin, TApp, TCtor, TNil, TCons, TRecord, TField, TNot,
-             TAnd, TOr, TCmp, TEq, TEqualAt, TIf, TMatch, TOpaque, TFloat, TDecimal, Poly, Mono,
-             CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit, TestList, Undecidable,
-             true_id, false_id, size, node, sort_of, is_int, mk, sym, nil, cons, int_lit, add, app,
-             cmp, float_nan, float_rank, decimal_normalized, op_float_nan, op_float_rank,
-             op_decimal_normalized)
+import sort (is_named_sort, list_elem, field_names, int_sort)
+import term (Terms, InternedTerm, Node, IntTerm, BoolTerm, LinearSumTerm, ApplicationTerm,
+             ConstructorTerm, NilTerm, ConsTerm, RecordTerm, FieldTerm, NotTerm, AndTerm, OrTerm,
+             CompareTerm, EqualTerm, EqualAtTerm, IfTerm, MatchTerm, OpaqueTerm, FloatTerm,
+             DecimalTerm, LinearSum, Monomial, CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always,
+             TestCtor, TestLit, TestList, Undecidable, true_id, false_id, size, node, sort_of,
+             is_int, intern, sym, nil, cons, int_lit, add, app, cmp, float_nan, float_rank,
+             decimal_normalized, op_float_nan, op_float_rank, op_decimal_normalized)
 
-pub type Answer = | Closed | Open | Exhausted
+pub type Verdict = | Closed | Open | Exhausted
 
 pub type Solver = { terms: Terms, rules: RuleLog, budget: Int, split_depth: Int, cx: Context }
 
 /// One branch of the search: its classes, the `Int` orderings its disequality splits chose, and the
 /// disequalities it has split on.
-type Branch = { cs: Classes, int_lt: List<Pair>, split: Map<Pair, Bool> }
+type Branch = { cs: Classes, int_less_than: List<TermPair>, split: Map<TermPair, Bool> }
 
 type Split =
   | SplitBool(Int)
-  | SplitCtor({ scrutinee: Int, type_name: String, ctors: List<{ name: String, fields: List<Option<Ty>> }> })
+  | SplitCtor({ scrutinee: Int, type_name: String, ctors: List<{ name: String, fields: List<Option<Sort>> }> })
   | SplitLit(Int, Int)
-  | SplitDiseq(Int, Int)
+  | SplitDisequality(Int, Int)
   | SplitList(Int)
 
 /// A solver after a search, and what the search came to.
-pub type Searched = { sv: Solver, answer: Answer }
+pub type SearchResult = { solver: Solver, result: Verdict }
 
-fn charged(solver: Solver) -> Option<Solver> = charged_by(solver, 1)
+fn charge_step(solver: Solver) -> Option<Solver> = charge_steps(solver, 1)
 
-fn charged_by(solver: Solver, steps: Int) -> Option<Solver> =
+fn charge_steps(solver: Solver, steps: Int) -> Option<Solver> =
   if solver.budget >= steps { Some({ ..solver, budget: solver.budget - steps }) } else { None }
 
 /// A round of saturation walks every term, so it costs a step for each thousand of them: a budget
 /// bounds the work a claim takes, whatever its reading made.
 fn round_cost(solver: Solver) -> Int = 1 + size(solver.terms) / 1000
 
-fn spent(solver: Solver) -> Solver = { ..solver, budget: 0 }
+fn exhaust_budget(solver: Solver) -> Solver = { ..solver, budget: 0 }
 
-fn noted(solver: Solver, r: Rule) -> Solver = { ..solver, rules: note(solver.rules, r) }
+fn with_rule(solver: Solver, r: Rule) -> Solver = { ..solver, rules: record_rule(solver.rules, r) }
 
 /// `Closed` iff the assertions contradict each other.
 pub fn refute(
   solver: Solver,
   assertions: List<{ term: Int, polarity: Bool }>,
-) -> Searched / {abort.raise} = {
+) -> SearchResult / {abort.raise} = {
   let start = assertions.fold(
     classes(size(solver.terms)),
     |cs: Classes, a: { term: Int, polarity: Bool }|
       union(cs, a.term, if a.polarity { true_id() } else { false_id() }).cs,
   );
-  explore(solver, { cs: start, int_lt: [], split: Map::new() }, solver.split_depth)
+  explore(solver, { cs: start, int_less_than: [], split: Map::new() }, solver.split_depth)
 }
 
 /// `room` is how many splits deeper the search may go.
-fn explore(solver: Solver, branch: Branch, room: Int) -> Searched / {abort.raise} = {
+fn explore(solver: Solver, branch: Branch, room: Int) -> SearchResult / {abort.raise} = {
   let sat = saturate(solver, branch, solver.budget + 1);
-  match sat.answer {
-    Closed -> { sv: sat.sv, answer: Closed },
-    Exhausted -> { sv: sat.sv, answer: Exhausted },
-    Open -> match choose_split(sat.sv, sat.b) {
-      None -> { sv: sat.sv, answer: Open },
-      Some(split) -> if room <= 0 { { sv: sat.sv, answer: Exhausted } } else {
-        match charged(sat.sv) {
-          None -> { sv: spent(sat.sv), answer: Exhausted },
+  match sat.result {
+    Closed -> { solver: sat.solver, result: Closed },
+    Exhausted -> { solver: sat.solver, result: Exhausted },
+    Open -> match choose_split(sat.solver, sat.b) {
+      None -> { solver: sat.solver, result: Open },
+      Some(split) -> if room <= 0 { { solver: sat.solver, result: Exhausted } } else {
+        match charge_step(sat.solver) {
+          None -> { solver: exhaust_budget(sat.solver), result: Exhausted },
           Some(sv2) -> branch_on(sv2, split, sat.b, room - 1),
         }
       },
@@ -79,23 +81,28 @@ fn explore(solver: Solver, branch: Branch, room: Int) -> Searched / {abort.raise
   }
 }
 
-fn branch_on(solver: Solver, split: Split, branch: Branch, room: Int) -> Searched / {abort.raise} = {
-  let made = children(solver, split, branch);
-  let walked = made.children.fold(
-    { sv: made.sv, exhausted: false, open: false },
-    |st: { sv: Solver, exhausted: Bool, open: Bool }, child: Branch|
+fn branch_on(
+  solver: Solver,
+  split: Split,
+  branch: Branch,
+  room: Int,
+) -> SearchResult / {abort.raise} = {
+  let join_new_term = children(solver, split, branch);
+  let walked = join_new_term.children.fold(
+    { solver: join_new_term.solver, exhausted: false, open: false },
+    |st: { solver: Solver, exhausted: Bool, open: Bool }, child: Branch|
       if st.open { st } else {
-        let r = explore(st.sv, child, room);
-        match r.answer {
-          Open -> { sv: r.sv, exhausted: st.exhausted, open: true },
-          Exhausted -> { sv: r.sv, exhausted: true, open: false },
-          Closed -> { sv: r.sv, exhausted: st.exhausted, open: false },
+        let r = explore(st.solver, child, room);
+        match r.result {
+          Open -> { solver: r.solver, exhausted: st.exhausted, open: true },
+          Exhausted -> { solver: r.solver, exhausted: true, open: false },
+          Closed -> { solver: r.solver, exhausted: st.exhausted, open: false },
         }
       },
   );
   {
-    sv: walked.sv,
-    answer: if walked.open { Open } else if walked.exhausted { Exhausted } else { Closed },
+    solver: walked.solver,
+    result: if walked.open { Open } else if walked.exhausted { Exhausted } else { Closed },
   }
 }
 
@@ -105,28 +112,28 @@ fn children(
   solver: Solver,
   split: Split,
   branch: Branch,
-) -> { sv: Solver, children: List<Branch> } / {abort.raise} =
+) -> { solver: Solver, children: List<Branch> } / {abort.raise} =
   match split {
     SplitBool(t) ->
       {
-        sv: noted(solver, Propositional),
+        solver: with_rule(solver, Propositional),
         children: [joined(branch, t, true_id()), joined(branch, t, false_id())],
       },
     SplitCtor(c) -> {
-      let sv1 = noted(solver, CaseSplit({ ty: c.type_name, arms: c.ctors.len() }));
+      let sv1 = with_rule(solver, CaseSplit({ ty: c.type_name, arms: c.ctors.len() }));
       c.ctors.fold(
-        { sv: sv1, children: [] },
-        |acc: { sv: Solver, children: List<Branch> }, k: { name: String, fields: List<Option<Ty>> }| {
+        { solver: sv1, children: [] },
+        |acc: { solver: Solver, children: List<Branch> }, k: { name: String, fields: List<Option<Sort>> }| {
           let args = k.fields.fold(
-            { terms: acc.sv.terms, ids: [] },
-            |a: { terms: Terms, ids: List<Int> }, s: Option<Ty>| {
+            { terms: acc.solver.terms, ids: [] },
+            |a: { terms: Terms, ids: List<Int> }, s: Option<Sort>| {
               let m = sym(a.terms, s);
               { terms: m.terms, ids: a.ids.push(m.id) }
             },
           );
-          let applied = mk(
+          let applied = intern(
             args.terms,
-            TCtor({ name: k.name, args: args.ids }),
+            ConstructorTerm({ name: k.name, args: args.ids }),
             sort_of(args.terms, c.scrutinee),
           );
           let child = joined(
@@ -134,12 +141,12 @@ fn children(
             c.scrutinee,
             applied.id,
           );
-          { sv: { ..acc.sv, terms: applied.terms }, children: acc.children.push(child) }
+          { solver: { ..acc.solver, terms: applied.terms }, children: acc.children.push(child) }
         },
       )
     },
     SplitList(s) -> {
-      let sv1 = noted(solver, CaseSplit({ ty: "List", arms: 2 }));
+      let sv1 = with_rule(solver, CaseSplit({ ty: "List", arms: 2 }));
       let sort = sort_of(sv1.terms, s);
       let elem = match sort { Some(t) -> list_elem(t), None -> None };
       let empty = nil(sv1.terms, sort);
@@ -147,47 +154,56 @@ fn children(
       let tail = sym(head.terms, sort);
       let pair = cons(tail.terms, head.id, tail.id, sort);
       {
-        sv: { ..sv1, terms: pair.terms },
+        solver: { ..sv1, terms: pair.terms },
         children: [empty.id, pair.id].map(|applied: Int|
           joined({ ..branch, cs: grow(branch.cs, size(pair.terms)) }, s, applied)),
       }
     },
     SplitLit(s, lit) ->
       {
-        sv: noted(solver, Propositional),
+        solver: with_rule(solver, Propositional),
         children: [joined(branch, s, lit), { ..branch, cs: distinguish(branch.cs, s, lit) }],
       },
-    SplitDiseq(x, y) -> {
+    SplitDisequality(x, y) -> {
       let key = { a: if x < y { x } else { y }, b: if x < y { y } else { x } };
       {
-        sv: noted(solver, LinearArithmetic),
-        children: [{ a: x, b: y }, { a: y, b: x }].map(|lohi: Pair|
-          { ..branch, split: branch.split.insert(key, true), int_lt: branch.int_lt.push(lohi) }),
+        solver: with_rule(solver, LinearArithmetic),
+        children: [{ a: x, b: y }, { a: y, b: x }].map(|lohi: TermPair|
+          {
+            ..branch,
+            split: branch.split.insert(key, true),
+            int_less_than: branch.int_less_than.push(lohi),
+          }),
       }
     },
   }
 
-type Saturated = { sv: Solver, b: Branch, answer: Answer }
+type SaturationResult = { solver: Solver, b: Branch, result: Verdict }
 
 /// Each round charges the budget, so it bounds the rounds: `left`.
-fn saturate(solver: Solver, branch: Branch, left: Int) -> Saturated / {abort.raise} =
-  if left <= 0 { { sv: spent(solver), b: branch, answer: Exhausted } } else {
-    match charged_by(solver, round_cost(solver)) {
-      None -> { sv: spent(solver), b: branch, answer: Exhausted },
+fn saturate(solver: Solver, branch: Branch, left: Int) -> SaturationResult / {abort.raise} =
+  if left <= 0 { { solver: exhaust_budget(solver), b: branch, result: Exhausted } } else {
+    match charge_steps(solver, round_cost(solver)) {
+      None -> { solver: exhaust_budget(solver), b: branch, result: Exhausted },
       Some(sv1) -> {
         let grown = { ..branch, cs: grow(branch.cs, size(sv1.terms)) };
         let c = congruence(sv1, grown);
-        if c.b.cs.contradiction { { sv: c.sv, b: c.b, answer: Closed } } else {
-          let p = propagate(c.sv, c.b);
-          let checked = { ..p.b, cs: check_diseqs(p.b.cs) };
+        if c.b.cs.contradiction { { solver: c.solver, b: c.b, result: Closed } } else {
+          let p = propagate(c.solver, c.b);
+          let checked = { ..p.b, cs: check_disequalities(p.b.cs) };
           if checked.cs.contradiction {
-            { sv: noted(p.sv, Congruence), b: checked, answer: Closed }
-          } else if c.changed || p.changed { saturate(p.sv, checked, left - 1) } else {
-            let a = arithmetic(p.sv, checked);
-            match a.answer {
-              Infeasible -> { sv: noted(a.sv, LinearArithmetic), b: checked, answer: Closed },
+            { solver: with_rule(p.solver, Congruence), b: checked, result: Closed }
+          } else if c.changed || p.changed { saturate(p.solver, checked, left - 1) } else {
+            let a = arithmetic(p.solver, checked);
+            match a.result {
+              Infeasible ->
+                { solver: with_rule(a.solver, LinearArithmetic), b: checked, result: Closed },
               Undecided ->
-                { sv: a.sv, b: checked, answer: if a.sv.budget == 0 { Exhausted } else { Open } },
+                {
+                  solver: a.solver,
+                  b: checked,
+                  result: if a.solver.budget == 0 { Exhausted } else { Open },
+                },
             }
           }
         }
@@ -195,22 +211,22 @@ fn saturate(solver: Solver, branch: Branch, left: Int) -> Saturated / {abort.rai
     }
   }
 
-type Stepped = { sv: Solver, b: Branch, changed: Bool }
+type StepResult = { solver: Solver, b: Branch, changed: Bool }
 
 /// Merges terms whose arguments are already equal, then applies the constructor rules.
-fn congruence(solver: Solver, branch: Branch) -> Stepped / {abort.raise} = {
+fn congruence(solver: Solver, branch: Branch) -> StepResult / {abort.raise} = {
   let n = size(solver.terms);
   let walked = range(0, n).fold(
-    { sv: solver, b: branch, changed: false, seen: Map::new() },
-    |st: { sv: Solver, b: Branch, changed: Bool, seen: Map<Node, Int> }, t: Int|
-      match canonical(st.sv.terms, st.b.cs, t) {
+    { solver: solver, b: branch, changed: false, seen: Map::new() },
+    |st: { solver: Solver, b: Branch, changed: Bool, seen: Map<Node, Int> }, t: Int|
+      match canonical(st.solver.terms, st.b.cs, t) {
         None -> st,
         Some(sig) -> match st.seen.get(sig) {
           Some(other) -> {
             let j = union(st.b.cs, t, other);
             if j.changed {
               {
-                sv: noted(st.sv, Congruence),
+                solver: with_rule(st.solver, Congruence),
                 b: { ..st.b, cs: j.cs },
                 changed: true,
                 seen: st.seen,
@@ -221,20 +237,20 @@ fn congruence(solver: Solver, branch: Branch) -> Stepped / {abort.raise} = {
         },
       },
   );
-  let s = structural(walked.sv, walked.b, n);
-  { sv: s.sv, b: s.b, changed: walked.changed || s.changed }
+  let s = structural(walked.solver, walked.b, n);
+  { solver: s.solver, b: s.b, changed: walked.changed || s.changed }
 }
 
 fn canonical(terms: Terms, cs: Classes, t: Int) -> Option<Node> / {abort.raise} = {
   let f = |x: Int| find(cs, x);
   match node(terms, t) {
-    TLin(p) -> {
-      let summed = p.monomials.fold(Some(Map::new()), |acc: Option<Map<Int, I128>>, m: Mono|
+    LinearSumTerm(p) -> {
+      let summed = p.monomials.fold(Some(Map::new()), |acc: Option<Map<Int, I128>>, m: Monomial|
         match acc {
           None -> None,
           Some(mm) -> match checked_add(
               match mm.get(f(m.term)) { Some(c) -> c, None -> 0i128 },
-              m.coeff,
+              m.coefficient,
             ) {
             Some(c) -> Some(mm.insert(f(m.term), c)),
             None -> None,
@@ -244,47 +260,55 @@ fn canonical(terms: Terms, cs: Classes, t: Int) -> Option<Node> / {abort.raise} 
         None -> None,
         Some(mm) ->
           Some(
-            TLin({
-              monomials: mm.entries().fold([], |acc: List<Mono>, e: { key: Int, value: I128 }|
-                if e.value == 0i128 { acc } else { acc.push({ term: e.key, coeff: e.value }) }),
-              konst: p.konst,
+            LinearSumTerm({
+              monomials: mm.entries().fold(
+                [],
+                |acc: List<Monomial>, e: { key: Int, value: I128 }|
+                  if e.value == 0i128 { acc }
+                  else { acc.push({ term: e.key, coefficient: e.value }) },
+              ),
+              constant: p.constant,
             }),
           ),
       }
     },
-    TApp(a) -> Some(TApp({ head: f(a.head), args: a.args.map(f) })),
-    TCtor(c) -> Some(TCtor({ name: c.name, args: c.args.map(f) })),
-    TCons(c) -> Some(TCons({ head: f(c.head), tail: f(c.tail) })),
-    TRecord(fields) ->
+    ApplicationTerm(a) -> Some(ApplicationTerm({ head: f(a.head), args: a.args.map(f) })),
+    ConstructorTerm(c) -> Some(ConstructorTerm({ name: c.name, args: c.args.map(f) })),
+    ConsTerm(c) -> Some(ConsTerm({ head: f(c.head), tail: f(c.tail) })),
+    RecordTerm(fields) ->
       Some(
-        TRecord(fields.map(|x: { name: String, value: Int }| { name: x.name, value: f(x.value) })),
+        RecordTerm(
+          fields.map(|x: { name: String, value: Int }| { name: x.name, value: f(x.value) }),
+        ),
       ),
-    TField(x) -> Some(TField({ base: f(x.base), field: x.field })),
-    TNot(a) -> Some(TNot(f(a))),
-    TAnd(a, c) -> Some(TAnd(f(a), f(c))),
-    TOr(a, c) -> Some(TOr(f(a), f(c))),
-    TCmp(c) -> Some(TCmp({ op: c.op, lhs: f(c.lhs), rhs: f(c.rhs) })),
-    TEq(e) -> {
+    FieldTerm(x) -> Some(FieldTerm({ base: f(x.base), field: x.field })),
+    NotTerm(a) -> Some(NotTerm(f(a))),
+    AndTerm(a, c) -> Some(AndTerm(f(a), f(c))),
+    OrTerm(a, c) -> Some(OrTerm(f(a), f(c))),
+    CompareTerm(c) -> Some(CompareTerm({ op: c.op, lhs: f(c.lhs), rhs: f(c.rhs) })),
+    EqualTerm(e) -> {
       let x = f(e.lhs);
       let y = f(e.rhs);
-      Some(TEq({ lhs: if x < y { x } else { y }, rhs: if x < y { y } else { x } }))
+      Some(EqualTerm({ lhs: if x < y { x } else { y }, rhs: if x < y { y } else { x } }))
     },
-    TEqualAt(e) -> {
+    EqualAtTerm(e) -> {
       let x = f(e.lhs);
       let y = f(e.rhs);
       Some(
-        TEqualAt({
+        EqualAtTerm({
           lhs: if x < y { x } else { y },
           rhs: if x < y { y } else { x },
           reflexive: e.reflexive,
         }),
       )
     },
-    TIf(i) ->
-      Some(TIf({ cond: f(i.cond), then_branch: f(i.then_branch), else_branch: f(i.else_branch) })),
-    TMatch(m) ->
+    IfTerm(i) ->
       Some(
-        TMatch({
+        IfTerm({ cond: f(i.cond), then_branch: f(i.then_branch), else_branch: f(i.else_branch) }),
+      ),
+    MatchTerm(m) ->
+      Some(
+        MatchTerm({
           scrutinee: f(m.scrutinee),
           arms: m.arms.map(|arm: Arm|
             { test: arm.test, binds: arm.binds.map(f), body: f(arm.body) }),
@@ -295,40 +319,44 @@ fn canonical(terms: Terms, cs: Classes, t: Int) -> Option<Node> / {abort.raise} 
 }
 
 /// Injectivity and disjointness for constructors, list literals and record literals.
-fn structural(solver: Solver, branch: Branch, n: Int) -> Stepped / {abort.raise} =
+fn structural(solver: Solver, branch: Branch, n: Int) -> StepResult / {abort.raise} =
   groups(branch.cs, n).fold(
-    { sv: solver, b: branch, changed: false },
-    |st: Stepped, g: { rep: Int, members: List<Int> }|
+    { solver: solver, b: branch, changed: false },
+    |st: StepResult, g: { representation: Int, members: List<Int> }|
       if st.b.cs.contradiction { st } else {
         g.members.fold(
           { st: st, witness: None },
-          |acc: { st: Stepped, witness: Option<Int> }, t: Int|
+          |acc: { st: StepResult, witness: Option<Int> }, t: Int|
             if acc.st.b.cs.contradiction { acc } else {
-              match shape_of(acc.st.sv.terms, t) {
+              match shape_of(acc.st.solver.terms, t) {
                 None -> acc,
                 Some(shape) -> match acc.witness {
                   None -> { st: acc.st, witness: Some(t) },
-                  Some(previous) -> match shape_of(acc.st.sv.terms, previous) {
+                  Some(previous) -> match shape_of(acc.st.solver.terms, previous) {
                     None -> acc,
                     Some(earlier) -> match conflict(earlier, shape) {
                       Some(true) ->
                         {
                           st: {
-                            sv: noted(acc.st.sv, Injectivity),
+                            solver: with_rule(acc.st.solver, Injectivity),
                             b: { ..acc.st.b, cs: { ..acc.st.b.cs, contradiction: true } },
                             changed: true,
                           },
                           witness: acc.witness,
                         },
                       Some(false) -> {
-                        let u = unify_arguments(acc.st.sv.terms, acc.st.b, previous, t);
+                        let u = unify_arguments(acc.st.solver.terms, acc.st.b, previous, t);
                         // A `List::push` is a cell with no fields to read, so a cell that has them
                         // witnesses the class in its place.
-                        let witness = if has_fields(acc.st.sv.terms, previous) { acc.witness }
+                        let witness = if has_fields(acc.st.solver.terms, previous) { acc.witness }
                         else { Some(t) };
                         if u.changed {
                           {
-                            st: { sv: noted(acc.st.sv, Injectivity), b: u.b, changed: true },
+                            st: {
+                              solver: with_rule(acc.st.solver, Injectivity),
+                              b: u.b,
+                              changed: true,
+                            },
                             witness: witness,
                           }
                         } else { { st: { ..acc.st, b: u.b }, witness: witness } }
@@ -344,7 +372,7 @@ fn structural(solver: Solver, branch: Branch, n: Int) -> Stepped / {abort.raise}
   )
 
 fn has_fields(terms: Terms, t: Int) -> Bool / {abort.raise} =
-  match node(terms, t) { TApp(_) -> false, _ -> true }
+  match node(terms, t) { ApplicationTerm(_) -> false, _ -> true }
 
 fn unify_arguments(
   terms: Terms,
@@ -353,13 +381,16 @@ fn unify_arguments(
   y: Int,
 ) -> { b: Branch, changed: Bool } / {abort.raise} = {
   let pairs = match node(terms, x) {
-    TCtor(c) -> match node(terms, y) { TCtor(d) -> zipped(c.args, d.args), _ -> [] },
-    TCons(c) -> match node(terms, y) {
-      TCons(d) -> [{ a: c.head, b: d.head }, { a: c.tail, b: d.tail }],
+    ConstructorTerm(c) -> match node(terms, y) {
+      ConstructorTerm(d) -> zipped(c.args, d.args),
       _ -> [],
     },
-    TRecord(xs) -> match node(terms, y) {
-      TRecord(ys) ->
+    ConsTerm(c) -> match node(terms, y) {
+      ConsTerm(d) -> [{ a: c.head, b: d.head }, { a: c.tail, b: d.tail }],
+      _ -> [],
+    },
+    RecordTerm(xs) -> match node(terms, y) {
+      RecordTerm(ys) ->
         zipped(
           xs.map(|f: { name: String, value: Int }| f.value),
           ys.map(|f: { name: String, value: Int }| f.value),
@@ -368,102 +399,110 @@ fn unify_arguments(
     },
     _ -> [],
   };
-  pairs.fold({ b: branch, changed: false }, |acc: { b: Branch, changed: Bool }, pair: Pair| {
+  pairs.fold({ b: branch, changed: false }, |acc: { b: Branch, changed: Bool }, pair: TermPair| {
     let j = union(acc.b.cs, pair.a, pair.b);
     { b: { ..acc.b, cs: j.cs }, changed: acc.changed || j.changed }
   })
 }
 
-fn zipped(xs: List<Int>, ys: List<Int>) -> List<Pair> =
+fn zipped(xs: List<Int>, ys: List<Int>) -> List<TermPair> =
   range(0, if xs.len() < ys.len() { xs.len() } else { ys.len() }).fold(
     [],
-    |acc: List<Pair>, i: Int|
+    |acc: List<TermPair>, i: Int|
       match xs.at(i) {
         Some(x) -> match ys.at(i) { Some(y) -> acc.push({ a: x, b: y }), None -> acc },
         None -> acc,
       },
   )
 
-fn propagate(solver: Solver, branch: Branch) -> Stepped / {abort.raise} = {
+fn propagate(solver: Solver, branch: Branch) -> StepResult / {abort.raise} = {
   let walked = range(0, size(solver.terms)).fold(
-    { sv: solver, b: branch, changed: false },
-    |st: Stepped, t: Int| {
-      let r = propagate_one(st.sv, st.b, t);
-      { sv: r.sv, b: r.b, changed: st.changed || r.changed }
+    { solver: solver, b: branch, changed: false },
+    |st: StepResult, t: Int| {
+      let r = propagate_one(st.solver, st.b, t);
+      { solver: r.solver, b: r.b, changed: st.changed || r.changed }
     },
   );
-  let d = propagate_disequalities(walked.sv, walked.b);
-  { sv: d.sv, b: d.b, changed: walked.changed || d.changed }
+  let d = propagate_disequalities(walked.solver, walked.b);
+  { solver: d.solver, b: d.b, changed: walked.changed || d.changed }
 }
 
-fn propagate_one(solver: Solver, branch: Branch, t: Int) -> Stepped / {abort.raise} =
+fn propagate_one(solver: Solver, branch: Branch, t: Int) -> StepResult / {abort.raise} =
   match node(solver.terms, t) {
-    TNot(a) -> {
+    NotTerm(a) -> {
       let s1 = match truth(solver.terms, branch, a) {
-        Some(v) -> set(solver.terms, branch, t, !v),
+        Some(v) -> set_truth(solver.terms, branch, t, !v),
         None -> { b: branch, changed: false },
       };
       let s2 = match truth(solver.terms, s1.b, t) {
-        Some(v) -> set(solver.terms, s1.b, a, !v),
+        Some(v) -> set_truth(solver.terms, s1.b, a, !v),
         None -> { b: s1.b, changed: false },
       };
       let changed = s1.changed || s2.changed;
-      { sv: if changed { noted(solver, Propositional) } else { solver }, b: s2.b, changed: changed }
+      {
+        solver: if changed { with_rule(solver, Propositional) } else { solver },
+        b: s2.b,
+        changed: changed,
+      }
     },
-    TAnd(x, y) -> junction(solver, branch, t, x, y, true),
-    TOr(x, y) -> junction(solver, branch, t, x, y, false),
-    TEq(e) -> equality(solver, branch, t, e.lhs, e.rhs),
+    AndTerm(x, y) -> junction(solver, branch, t, x, y, true),
+    OrTerm(x, y) -> junction(solver, branch, t, x, y, false),
+    EqualTerm(e) -> equality(solver, branch, t, e.lhs, e.rhs),
     // A value is `==` to itself only where the sort's `==` is reflexive; nothing else follows.
-    TEqualAt(e) -> if e.reflexive && equal(branch.cs, e.lhs, e.rhs) {
-      let s = set(solver.terms, branch, t, true);
-      { sv: if s.changed { noted(solver, Congruence) } else { solver }, b: s.b, changed: s.changed }
-    } else { { sv: solver, b: branch, changed: false } },
-    TIf(i) -> match truth(solver.terms, branch, i.cond) {
+    EqualAtTerm(e) -> if e.reflexive && equal(branch.cs, e.lhs, e.rhs) {
+      let s = set_truth(solver.terms, branch, t, true);
+      {
+        solver: if s.changed { with_rule(solver, Congruence) } else { solver },
+        b: s.b,
+        changed: s.changed,
+      }
+    } else { { solver: solver, b: branch, changed: false } },
+    IfTerm(i) -> match truth(solver.terms, branch, i.cond) {
       Some(true) -> {
         let j = union(branch.cs, t, i.then_branch);
-        { sv: noted(solver, Propositional), b: { ..branch, cs: j.cs }, changed: j.changed }
+        { solver: with_rule(solver, Propositional), b: { ..branch, cs: j.cs }, changed: j.changed }
       },
       Some(false) -> {
         let j = union(branch.cs, t, i.else_branch);
-        { sv: noted(solver, Propositional), b: { ..branch, cs: j.cs }, changed: j.changed }
+        { solver: with_rule(solver, Propositional), b: { ..branch, cs: j.cs }, changed: j.changed }
       },
-      None -> { sv: solver, b: branch, changed: false },
+      None -> { solver: solver, b: branch, changed: false },
     },
-    TMatch(m) -> {
+    MatchTerm(m) -> {
       let r = reduce_match(solver.terms, branch, t, m.scrutinee, m.arms);
-      { sv: solver, b: r.b, changed: r.changed }
+      { solver: solver, b: r.b, changed: r.changed }
     },
-    TField(f) -> match record_field(solver.terms, branch, f.base, f.field) {
+    FieldTerm(f) -> match record_field(solver.terms, branch, f.base, f.field) {
       Some(v) -> {
         let j = union(branch.cs, t, v);
-        { sv: noted(solver, Congruence), b: { ..branch, cs: j.cs }, changed: j.changed }
+        { solver: with_rule(solver, Congruence), b: { ..branch, cs: j.cs }, changed: j.changed }
       },
-      None -> { sv: solver, b: branch, changed: false },
+      None -> { solver: solver, b: branch, changed: false },
     },
-    TApp(a) -> match literal_answer(solver.terms, branch, a.head, a.args) {
-      Some(m) -> made(solver, branch, t, m),
+    ApplicationTerm(a) -> match literal_value(solver.terms, branch, a.head, a.args) {
+      Some(m) -> join_new_term(solver, branch, t, m),
       None -> over_spine(solver, branch, t, a.head, a.args),
     },
-    _ -> { sv: solver, b: branch, changed: false },
+    _ -> { solver: solver, b: branch, changed: false },
   }
 
 /// What a `Float`'s place in the order, its being `NaN`, or a `Decimal`'s normal form is, once the
 /// search knows the value is a literal.
-fn literal_answer(
+fn literal_value(
   terms: Terms,
   branch: Branch,
   head: Int,
   args: List<Int>,
-) -> Option<Made> / {abort.raise} =
+) -> Option<InternedTerm> / {abort.raise} =
   match node(terms, head) {
-    TOpaque(name) -> match args {
+    OpaqueTerm(name) -> match args {
       [x] -> if name != op_float_rank() && name != op_float_nan()
           && name != op_decimal_normalized() { None } else {
         match first_in_class(
             branch,
             x,
             range(0, size(terms)).filter(|c: Int|
-              match node(terms, c) { TFloat(_) -> true, TDecimal(_) -> true, _ -> false }),
+              match node(terms, c) { FloatTerm(_) -> true, DecimalTerm(_) -> true, _ -> false }),
           ) {
           None -> None,
           Some(lit) -> if lit == x { None }
@@ -485,31 +524,31 @@ fn over_spine(
   t: Int,
   head: Int,
   args: List<Int>,
-) -> Stepped / {abort.raise} = {
-  let unchanged = { sv: solver, b: branch, changed: false };
+) -> StepResult / {abort.raise} = {
+  let unchanged = { solver: solver, b: branch, changed: false };
   match node(solver.terms, head) {
-    TOpaque(name) -> match args {
+    OpaqueTerm(name) -> match args {
       [xs] -> if name != "List::len" { unchanged } else {
         match known_cell(solver.terms, branch, xs) {
-          Some(TNil) -> made(solver, branch, t, int_lit(solver.terms, 0)),
+          Some(NilTerm) -> join_new_term(solver, branch, t, int_lit(solver.terms, 0)),
           known -> {
             // What a push leaves is one longer than what it was pushed onto, whatever that is.
             let shorter = match known {
-              Some(TCons(c)) -> Some(c.tail),
+              Some(ConsTerm(c)) -> Some(c.tail),
               _ -> pushed_onto(solver.terms, branch, xs),
             };
             match shorter {
               None -> unchanged,
               Some(below) -> {
-                let rest = app(solver.terms, head, [below], Some(int_ty()));
+                let rest = app(solver.terms, head, [below], Some(int_sort()));
                 let one = int_lit(rest.terms, 1);
                 // A length the search makes is a length: not negative, as one the claim made is.
                 let zero = int_lit(one.terms, 0);
                 let counted = cmp(zero.terms, Ge, rest.id, zero.id);
                 match add(counted.terms, one.id, rest.id) {
                   Some(sum) -> {
-                    let m = made(solver, branch, t, sum);
-                    let j = union(grow(m.b.cs, size(m.sv.terms)), counted.id, true_id());
+                    let m = join_new_term(solver, branch, t, sum);
+                    let j = union(grow(m.b.cs, size(m.solver.terms)), counted.id, true_id());
                     { ..m, b: { ..m.b, cs: j.cs }, changed: m.changed || j.changed }
                   },
                   None -> unchanged,
@@ -522,13 +561,13 @@ fn over_spine(
       [xs, x] -> if name != "List::push" { unchanged } else {
         let sort = sort_of(solver.terms, t);
         match known_cell(solver.terms, branch, xs) {
-          Some(TNil) -> {
+          Some(NilTerm) -> {
             let empty = nil(solver.terms, sort);
-            made(solver, branch, t, cons(empty.terms, x, empty.id, sort))
+            join_new_term(solver, branch, t, cons(empty.terms, x, empty.id, sort))
           },
-          Some(TCons(c)) -> {
+          Some(ConsTerm(c)) -> {
             let rest = app(solver.terms, head, [c.tail, x], sort);
-            made(solver, branch, t, cons(rest.terms, c.head, rest.id, sort))
+            join_new_term(solver, branch, t, cons(rest.terms, c.head, rest.id, sort))
           },
           _ -> unchanged,
         }
@@ -545,7 +584,7 @@ fn pushed_onto(terms: Terms, branch: Branch, xs: Int) -> Option<Int> / {abort.ra
     match found {
       Some(_) -> found,
       None -> match node(terms, p) {
-        TApp(a) -> match a.args {
+        ApplicationTerm(a) -> match a.args {
           [onto, _] -> if equal(branch.cs, p, xs) && is_named(terms, a.head, "List::push") {
             Some(onto)
           } else { None },
@@ -556,33 +595,33 @@ fn pushed_onto(terms: Terms, branch: Branch, xs: Int) -> Option<Int> / {abort.ra
     })
 
 fn is_named(terms: Terms, head: Int, name: String) -> Bool / {abort.raise} =
-  match node(terms, head) { TOpaque(n) -> n == name, _ -> false }
+  match node(terms, head) { OpaqueTerm(n) -> n == name, _ -> false }
 
 fn known_cell(terms: Terms, branch: Branch, xs: Int) -> Option<Node> / {abort.raise} =
   match known_list(terms, branch, xs) { Some(k) -> Some(node(terms, k)), None -> None }
 
 /// `t` joined with a term made for it, the classes grown to hold it.
-fn made(solver: Solver, branch: Branch, t: Int, m: Made) -> Stepped = {
+fn join_new_term(solver: Solver, branch: Branch, t: Int, m: InternedTerm) -> StepResult = {
   let j = union(grow(branch.cs, size(m.terms)), t, m.id);
   {
-    sv: { ..noted(solver, Congruence), terms: m.terms },
+    solver: { ..with_rule(solver, Congruence), terms: m.terms },
     b: { ..branch, cs: j.cs },
     changed: j.changed,
   }
 }
 
 /// `a != b` at `Bool` decides one side from the other.
-fn propagate_disequalities(solver: Solver, branch: Branch) -> Stepped = {
-  let walked = branch.cs.diseqs.fold(
+fn propagate_disequalities(solver: Solver, branch: Branch) -> StepResult = {
+  let walked = branch.cs.disequalities.fold(
     { b: branch, changed: false },
-    |acc: { b: Branch, changed: Bool }, d: Pair|
+    |acc: { b: Branch, changed: Bool }, d: TermPair|
       [{ a: d.a, b: d.b }, { a: d.b, b: d.a }].fold(
         acc,
-        |inner: { b: Branch, changed: Bool }, xy: Pair|
+        |inner: { b: Branch, changed: Bool }, xy: TermPair|
           if !is_bool(solver.terms, xy.b) { inner } else {
             match truth(solver.terms, inner.b, xy.a) {
               Some(v) -> {
-                let s = set(solver.terms, inner.b, xy.b, !v);
+                let s = set_truth(solver.terms, inner.b, xy.b, !v);
                 { b: s.b, changed: inner.changed || s.changed }
               },
               None -> inner,
@@ -591,49 +630,68 @@ fn propagate_disequalities(solver: Solver, branch: Branch) -> Stepped = {
       ),
   );
   {
-    sv: if walked.changed { noted(solver, Propositional) } else { solver },
+    solver: if walked.changed { with_rule(solver, Propositional) } else { solver },
     b: walked.b,
     changed: walked.changed,
   }
 }
 
 fn is_bool(terms: Terms, t: Int) -> Bool =
-  match sort_of(terms, t) { Some(s) -> is_con(s, "Bool"), None -> false }
+  match sort_of(terms, t) { Some(s) -> is_named_sort(s, "Bool"), None -> false }
 
 /// `&&` when `conjunction` holds, `||` when it does not.
-fn junction(solver: Solver, branch: Branch, t: Int, x: Int, y: Int, conjunction: Bool) -> Stepped = {
+fn junction(
+  solver: Solver,
+  branch: Branch,
+  t: Int,
+  x: Int,
+  y: Int,
+  conjunction: Bool,
+) -> StepResult = {
   let short = !conjunction;
   let left = truth(solver.terms, branch, x);
   let right = truth(solver.terms, branch, y);
-  let s1 = if left == Some(short) || right == Some(short) { set(solver.terms, branch, t, short) }
-  else if left == Some(!short) && right == Some(!short) { set(solver.terms, branch, t, !short) }
-  else { { b: branch, changed: false } };
+  let s1 = if left == Some(short) || right == Some(short) {
+    set_truth(solver.terms, branch, t, short)
+  } else if left == Some(!short) && right == Some(!short) {
+    set_truth(solver.terms, branch, t, !short)
+  } else { { b: branch, changed: false } };
   let s2 = match truth(solver.terms, s1.b, t) {
     Some(v) -> if v != short {
-      let a1 = set(solver.terms, s1.b, x, !short);
-      let a2 = set(solver.terms, a1.b, y, !short);
+      let a1 = set_truth(solver.terms, s1.b, x, !short);
+      let a2 = set_truth(solver.terms, a1.b, y, !short);
       { b: a2.b, changed: a1.changed || a2.changed }
     } else {
-      let a1 = if left == Some(!short) { set(solver.terms, s1.b, y, short) }
+      let a1 = if left == Some(!short) { set_truth(solver.terms, s1.b, y, short) }
       else { { b: s1.b, changed: false } };
-      let a2 = if right == Some(!short) { set(solver.terms, a1.b, x, short) }
+      let a2 = if right == Some(!short) { set_truth(solver.terms, a1.b, x, short) }
       else { { b: a1.b, changed: false } };
       { b: a2.b, changed: a1.changed || a2.changed }
     },
     None -> { b: s1.b, changed: false },
   };
   let changed = s1.changed || s2.changed;
-  { sv: if changed { noted(solver, Propositional) } else { solver }, b: s2.b, changed: changed }
+  {
+    solver: if changed { with_rule(solver, Propositional) } else { solver },
+    b: s2.b,
+    changed: changed,
+  }
 }
 
-fn equality(solver: Solver, branch: Branch, t: Int, lhs: Int, rhs: Int) -> Stepped / {abort.raise} = {
+fn equality(
+  solver: Solver,
+  branch: Branch,
+  t: Int,
+  lhs: Int,
+  rhs: Int,
+) -> StepResult / {abort.raise} = {
   // Extensionality holds whatever polarity the equality was asserted at.
   let ext = if !equal(branch.cs, lhs, rhs) && fields_all_equal(solver.terms, branch, lhs, rhs) {
     let j = union(branch.cs, lhs, rhs);
-    { sv: noted(solver, Congruence), b: { ..branch, cs: j.cs }, changed: j.changed }
-  } else { { sv: solver, b: branch, changed: false } };
-  let d = decide_equality(ext.sv, ext.b, t, lhs, rhs);
-  { sv: d.sv, b: d.b, changed: ext.changed || d.changed }
+    { solver: with_rule(solver, Congruence), b: { ..branch, cs: j.cs }, changed: j.changed }
+  } else { { solver: solver, b: branch, changed: false } };
+  let d = decide_equality(ext.solver, ext.b, t, lhs, rhs);
+  { solver: d.solver, b: d.b, changed: ext.changed || d.changed }
 }
 
 fn decide_equality(
@@ -642,26 +700,29 @@ fn decide_equality(
   t: Int,
   lhs: Int,
   rhs: Int,
-) -> Stepped / {abort.raise} =
+) -> StepResult / {abort.raise} =
   match truth(solver.terms, branch, t) {
     Some(true) -> {
       let j = union(branch.cs, lhs, rhs);
-      { sv: solver, b: { ..branch, cs: j.cs }, changed: j.changed }
+      { solver: solver, b: { ..branch, cs: j.cs }, changed: j.changed }
     },
-    Some(false) -> if has_diseq(branch.cs, lhs, rhs) { { sv: solver, b: branch, changed: false } }
-    else { { sv: solver, b: { ..branch, cs: distinguish(branch.cs, lhs, rhs) }, changed: true } },
+    Some(false) -> if has_disequality(branch.cs, lhs, rhs) {
+      { solver: solver, b: branch, changed: false }
+    } else {
+      { solver: solver, b: { ..branch, cs: distinguish(branch.cs, lhs, rhs) }, changed: true }
+    },
     None -> if equal(branch.cs, lhs, rhs) {
-      let s = set(solver.terms, branch, t, true);
-      { sv: noted(solver, Congruence), b: s.b, changed: s.changed }
+      let s = set_truth(solver.terms, branch, t, true);
+      { solver: with_rule(solver, Congruence), b: s.b, changed: s.changed }
     } else if distinct(solver.terms, branch, lhs, rhs) {
-      let s = set(solver.terms, branch, t, false);
-      { sv: noted(solver, Injectivity), b: s.b, changed: s.changed }
-    } else { { sv: solver, b: branch, changed: false } },
+      let s = set_truth(solver.terms, branch, t, false);
+      { solver: with_rule(solver, Injectivity), b: s.b, changed: s.changed }
+    } else { { solver: solver, b: branch, changed: false } },
   }
 
-type Taken = | TakenArm(Int) | NeedsCtor | NeedsList(Int) | NeedsLit(Int) | NotTaken
+type ArmSelection = | SelectedArm(Int) | NeedsCtor | NeedsList(Int) | NeedsLit(Int) | NoArm
 
-type ListShape = | ShapeTaken | ShapeMissed | ShapeUnknown(Int)
+type ListShape = | ShapeMatched | ShapeMismatched | ShapeUnknown(Int)
 
 fn reduce_match(
   terms: Terms,
@@ -670,18 +731,18 @@ fn reduce_match(
   scrutinee: Int,
   arms: List<Arm>,
 ) -> { b: Branch, changed: Bool } / {abort.raise} =
-  match taken_arm(terms, branch, scrutinee, arms) {
-    TakenArm(index) -> match arms.at(index) {
+  match select_arm(terms, branch, scrutinee, arms) {
+    SelectedArm(index) -> match arms.at(index) {
       None -> { b: branch, changed: false },
       Some(arm) -> {
         let j0 = union(branch.cs, t, arm.body);
         let b0 = { ..branch, cs: j0.cs };
         let fields = match known_constructor(terms, b0, scrutinee) {
           Some(applied) -> match node(terms, applied) {
-            TCtor(c) ->
+            ConstructorTerm(c) ->
               zipped(arm.binds, c.args).fold(
                 { b: b0, changed: j0.changed },
-                |acc: { b: Branch, changed: Bool }, pair: Pair| {
+                |acc: { b: Branch, changed: Bool }, pair: TermPair| {
                   let j = union(acc.b.cs, pair.a, pair.b);
                   { b: { ..acc.b, cs: j.cs }, changed: acc.changed || j.changed }
                 },
@@ -699,7 +760,7 @@ fn reduce_match(
                   match known_list(terms, st.b, st.at) {
                     None -> { ..st, stop: true },
                     Some(known) -> match node(terms, known) {
-                      TCons(c) -> match arm.binds.at(st.next) {
+                      ConsTerm(c) -> match arm.binds.at(st.next) {
                         Some(bind) -> {
                           let j = union(st.b.cs, bind, c.head);
                           {
@@ -734,40 +795,41 @@ fn reduce_match(
     _ -> { b: branch, changed: false },
   }
 
-fn taken_arm(
+fn select_arm(
   terms: Terms,
   branch: Branch,
   scrutinee: Int,
   arms: List<Arm>,
-) -> Taken / {abort.raise} =
-  match range(0, arms.len()).fold(None, |acc: Option<Taken>, index: Int|
+) -> ArmSelection / {abort.raise} =
+  match range(0, arms.len()).fold(None, |acc: Option<ArmSelection>, index: Int|
       match acc {
         Some(_) -> acc,
         None -> match arms.at(index) {
           None -> acc,
           Some(arm) -> match arm.test {
-            Always -> Some(TakenArm(index)),
+            Always -> Some(SelectedArm(index)),
             TestCtor(wanted) -> match known_constructor(terms, branch, scrutinee) {
               Some(applied) -> match node(terms, applied) {
-                TCtor(c) -> if c.name == wanted { Some(TakenArm(index)) } else { None },
+                ConstructorTerm(c) -> if c.name == wanted { Some(SelectedArm(index)) }
+                else { None },
                 _ -> None,
               },
               None -> Some(NeedsCtor),
             },
-            TestLit(literal) -> if equal(branch.cs, scrutinee, literal) { Some(TakenArm(index)) }
+            TestLit(literal) -> if equal(branch.cs, scrutinee, literal) { Some(SelectedArm(index)) }
             else if distinct(terms, branch, scrutinee, literal) { None }
             else { Some(NeedsLit(literal)) },
             TestList(l) -> match list_shape(terms, branch, scrutinee, l.fixed, l.rest) {
-              ShapeTaken -> Some(TakenArm(index)),
-              ShapeMissed -> None,
+              ShapeMatched -> Some(SelectedArm(index)),
+              ShapeMismatched -> None,
               ShapeUnknown(at) -> Some(NeedsList(at)),
             },
-            Undecidable -> Some(NotTaken),
+            Undecidable -> Some(NoArm),
           },
         },
       }) {
     Some(taken) -> taken,
-    None -> NotTaken,
+    None -> NoArm,
   }
 
 /// Walks `fixed` conses down from the scrutinee, then asks for a rest or the end.
@@ -785,8 +847,8 @@ fn list_shape(
         Some(_) -> st,
         None -> match known_list(terms, branch, st.at) {
           Some(k) -> match node(terms, k) {
-            TCons(c) -> { at: c.tail, done: None },
-            _ -> { at: st.at, done: Some(ShapeMissed) },
+            ConsTerm(c) -> { at: c.tail, done: None },
+            _ -> { at: st.at, done: Some(ShapeMismatched) },
           },
           None -> { at: st.at, done: Some(ShapeUnknown(st.at)) },
         },
@@ -794,9 +856,9 @@ fn list_shape(
   );
   match walked.done {
     Some(s) -> s,
-    None -> if rest { ShapeTaken } else {
+    None -> if rest { ShapeMatched } else {
       match known_list(terms, branch, walked.at) {
-        Some(k) -> match node(terms, k) { TNil -> ShapeTaken, _ -> ShapeMissed },
+        Some(k) -> match node(terms, k) { NilTerm -> ShapeMatched, _ -> ShapeMismatched },
         None -> ShapeUnknown(walked.at),
       }
     },
@@ -818,12 +880,12 @@ fn known_constructor(terms: Terms, branch: Branch, t: Int) -> Option<Int> =
 
 fn fields_all_equal(terms: Terms, branch: Branch, x: Int, y: Int) -> Bool / {abort.raise} =
   match sort_of(terms, x) {
-    Some(Record(left)) -> match sort_of(terms, y) {
-      Some(Record(right)) ->
+    Some(RecordSort(left)) -> match sort_of(terms, y) {
+      Some(RecordSort(right)) ->
         left.len() > 0
-          && left.map(|f: { name: String, ty: Ty }| f.name)
-          == right.map(|f: { name: String, ty: Ty }| f.name)
-          && left.fold(true, |ok: Bool, f: { name: String, ty: Ty }|
+          && left.map(|f: { name: String, ty: Sort }| f.name)
+          == right.map(|f: { name: String, ty: Sort }| f.name)
+          && left.fold(true, |ok: Bool, f: { name: String, ty: Sort }|
             ok
               && (match projection(terms, branch, x, f.name) {
                 Some(p) -> match projection(terms, branch, y, f.name) {
@@ -837,7 +899,7 @@ fn fields_all_equal(terms: Terms, branch: Branch, x: Int, y: Int) -> Bool / {abo
     _ -> false,
   }
 
-/// A record literal's field from `base`'s class, or an interned `TField` node.
+/// A record literal's field from `base`'s class, or an interned `FieldTerm` node.
 fn projection(
   terms: Terms,
   branch: Branch,
@@ -852,7 +914,7 @@ fn projection(
         match acc {
           Some(_) -> acc,
           None -> match node(terms, t) {
-            TField(f) -> if f.field == name && find(branch.cs, f.base) == rep { Some(t) }
+            FieldTerm(f) -> if f.field == name && find(branch.cs, f.base) == rep { Some(t) }
             else { None },
             _ -> None,
           },
@@ -872,7 +934,7 @@ fn record_field(
       Some(_) -> acc,
       None -> if find(branch.cs, t) != rep { None } else {
         match node(terms, t) {
-          TRecord(fields) ->
+          RecordTerm(fields) ->
             fields.fold(None, |found: Option<Int>, f: { name: String, value: Int }|
               match found {
                 Some(_) -> found,
@@ -889,7 +951,7 @@ fn truth(terms: Terms, branch: Branch, t: Int) -> Option<Bool> =
   else if equal(branch.cs, t, false_id()) { Some(false) }
   else { None }
 
-fn set(terms: Terms, branch: Branch, t: Int, value: Bool) -> { b: Branch, changed: Bool } = {
+fn set_truth(terms: Terms, branch: Branch, t: Int, value: Bool) -> { b: Branch, changed: Bool } = {
   let j = union(branch.cs, t, if value { true_id() } else { false_id() });
   { b: { ..branch, cs: j.cs }, changed: j.changed }
 }
@@ -922,8 +984,9 @@ fn choose_split(solver: Solver, branch: Branch) -> Option<Split> / {abort.raise}
     match acc {
       Some(_) -> acc,
       None -> match node(terms, t) {
-        TIf(i) -> if truth(terms, branch, i.cond) == None { Some(SplitBool(i.cond)) } else { None },
-        TMatch(m) -> match taken_arm(terms, branch, m.scrutinee, m.arms) {
+        IfTerm(i) -> if truth(terms, branch, i.cond) == None { Some(SplitBool(i.cond)) }
+        else { None },
+        MatchTerm(m) -> match select_arm(terms, branch, m.scrutinee, m.arms) {
           NeedsCtor -> constructor_split(solver, m.scrutinee),
           NeedsLit(literal) -> Some(SplitLit(m.scrutinee, literal)),
           NeedsList(at) -> Some(SplitList(at)),
@@ -940,8 +1003,8 @@ fn choose_split(solver: Solver, branch: Branch) -> Option<Split> / {abort.raise}
           Some(_) -> acc,
           None -> {
             let parts = match node(terms, t) {
-              TAnd(x, y) -> Some({ a: x, b: y, wanted: false }),
-              TOr(x, y) -> Some({ a: x, b: y, wanted: true }),
+              AndTerm(x, y) -> Some({ a: x, b: y, wanted: false }),
+              OrTerm(x, y) -> Some({ a: x, b: y, wanted: true }),
               _ -> None,
             };
             match parts {
@@ -957,7 +1020,7 @@ fn choose_split(solver: Solver, branch: Branch) -> Option<Split> / {abort.raise}
         Some(s) -> Some(s),
         None -> {
           // An `Int` disequality reaches the arithmetic only through this split.
-          let diseq = branch.cs.diseqs.fold(None, |acc: Option<Split>, d: Pair|
+          let diseq = branch.cs.disequalities.fold(None, |acc: Option<Split>, d: TermPair|
             match acc {
               Some(_) -> acc,
               None -> {
@@ -966,8 +1029,9 @@ fn choose_split(solver: Solver, branch: Branch) -> Option<Split> / {abort.raise}
                   b: if d.a < d.b { d.b } else { d.a },
                 };
                 if branch.split.contains(key) { None }
-                else if is_int(terms, d.a) && is_int(terms, d.b) { Some(SplitDiseq(d.a, d.b)) }
-                else { None }
+                else if is_int(terms, d.a) && is_int(terms, d.b) {
+                  Some(SplitDisequality(d.a, d.b))
+                } else { None }
               },
             });
           match diseq {
@@ -986,7 +1050,8 @@ fn choose_split(solver: Solver, branch: Branch) -> Option<Split> / {abort.raise}
 /// An unsettled, non-connective `Bool` term reachable from what this branch constrains; the least.
 fn undecided_atom(terms: Terms, branch: Branch) -> Option<Int> / {abort.raise} = {
   let known = range(0, size(terms)).filter(|t: Int| truth(terms, branch, t) != None);
-  let roots = branch.cs.diseqs.fold(known, |acc: List<Int>, d: Pair| acc.push(d.a).push(d.b));
+  let roots = branch.cs.disequalities.fold(known, |acc: List<Int>, d: TermPair|
+    acc.push(d.a).push(d.b));
   let walked = iterate(
     { stack: roots, seen: Map::new(), best: None },
     10000000,
@@ -999,11 +1064,11 @@ fn undecided_atom(terms: Terms, branch: Branch) -> Option<Int> / {abort.raise} =
           if st.seen.contains(t) { Continue({ ..st, stack: rest }) } else {
             let seen = st.seen.insert(t, true);
             Continue(match node(terms, t) {
-              TNot(a) -> { stack: rest.push(a), seen: seen, best: st.best },
-              TAnd(x, y) -> { stack: rest.push(x).push(y), seen: seen, best: st.best },
-              TOr(x, y) -> { stack: rest.push(x).push(y), seen: seen, best: st.best },
-              TIf(i) -> { stack: rest.push(i.cond), seen: seen, best: st.best },
-              TEq(e) -> if is_bool(terms, e.lhs) && is_bool(terms, e.rhs) {
+              NotTerm(a) -> { stack: rest.push(a), seen: seen, best: st.best },
+              AndTerm(x, y) -> { stack: rest.push(x).push(y), seen: seen, best: st.best },
+              OrTerm(x, y) -> { stack: rest.push(x).push(y), seen: seen, best: st.best },
+              IfTerm(i) -> { stack: rest.push(i.cond), seen: seen, best: st.best },
+              EqualTerm(e) -> if is_bool(terms, e.lhs) && is_bool(terms, e.rhs) {
                 { stack: rest.push(e.lhs).push(e.rhs), seen: seen, best: st.best }
               } else { atom(terms, branch, t, rest, seen, st.best) },
               _ -> atom(terms, branch, t, rest, seen, st.best),
@@ -1033,7 +1098,7 @@ fn atom(
 
 fn constructor_split(solver: Solver, scrutinee: Int) -> Option<Split> =
   match sort_of(solver.terms, scrutinee) {
-    Some(Con(type_name, args)) -> match variants(solver.cx, type_name) {
+    Some(NamedSort(type_name, args)) -> match variants(solver.cx, type_name) {
       None -> None,
       Some(decl) ->
         Some(
@@ -1043,7 +1108,10 @@ fn constructor_split(solver: Solver, scrutinee: Int) -> Option<Split> =
             ctors: decl.variants.map(|variant: Variant|
               {
                 name: variant.name,
-                fields: field_sorts({ decl: decl, variant: variant }, Some(Con(type_name, args))),
+                fields: field_sorts(
+                  { decl: decl, variant: variant },
+                  Some(NamedSort(type_name, args)),
+                ),
               }),
           }),
         ),
@@ -1054,14 +1122,14 @@ fn constructor_split(solver: Solver, scrutinee: Int) -> Option<Split> =
 fn arithmetic(
   solver: Solver,
   branch: Branch,
-) -> { sv: Solver, answer: Feasibility } / {abort.raise} = {
+) -> { solver: Solver, result: Feasibility } / {abort.raise} = {
   let terms = solver.terms;
   let f = |t: Int| find(branch.cs, t);
   let from_cmps = range(0, size(terms)).fold(
     { rows: [], relevant: Map::new() },
-    |acc: { rows: List<{ coeffs: Map<Int, I128>, konst: I128 }>, relevant: Map<Int, Bool> }, t: Int|
+    |acc: { rows: List<{ coefficients: Map<Int, I128>, constant: I128 }>, relevant: Map<Int, Bool> }, t: Int|
       match node(terms, t) {
-        TCmp(c) -> match truth(terms, branch, t) {
+        CompareTerm(c) -> match truth(terms, branch, t) {
           None -> acc,
           Some(holds) -> {
             let oriented = if (c.op == Lt && holds) || (c.op == Ge && !holds) {
@@ -1073,8 +1141,8 @@ fn arithmetic(
             } else { { a: c.rhs, b: c.lhs, slack: 0i128 } };
             {
               rows: acc.rows.push({
-                coeffs: difference(f(oriented.a), f(oriented.b)),
-                konst: oriented.slack,
+                coefficients: difference(f(oriented.a), f(oriented.b)),
+                constant: oriented.slack,
               }),
               relevant: acc.relevant.insert(f(oriented.a), true).insert(f(oriented.b), true),
             }
@@ -1083,27 +1151,27 @@ fn arithmetic(
         _ -> acc,
       },
   );
-  let comparisons = branch.int_lt.fold(
+  let comparisons = branch.int_less_than.fold(
     from_cmps,
-    |acc: { rows: List<{ coeffs: Map<Int, I128>, konst: I128 }>, relevant: Map<Int, Bool> }, p: Pair|
+    |acc: { rows: List<{ coefficients: Map<Int, I128>, constant: I128 }>, relevant: Map<Int, Bool> }, p: TermPair|
       {
-        rows: acc.rows.push({ coeffs: difference(f(p.a), f(p.b)), konst: 1i128 }),
+        rows: acc.rows.push({ coefficients: difference(f(p.a), f(p.b)), constant: 1i128 }),
         relevant: acc.relevant.insert(f(p.a), true).insert(f(p.b), true),
       },
   );
   // Only definitions a comparison reaches, so unrelated literals don't blow up elimination.
   let definitions = range(0, size(terms)).fold(
     [],
-    |acc: List<{ coeffs: Map<Int, I128>, konst: I128 }>, t: Int|
+    |acc: List<{ coefficients: Map<Int, I128>, constant: I128 }>, t: Int|
       match node(terms, t) {
-        TLin(p) -> {
+        LinearSumTerm(p) -> {
           let own = Map::new().insert(f(t), 1i128);
-          let summed = p.monomials.fold(Some(own), |m: Option<Map<Int, I128>>, x: Mono|
+          let summed = p.monomials.fold(Some(own), |m: Option<Map<Int, I128>>, x: Monomial|
             match m {
               None -> None,
               Some(mm) -> match checked_sub(
                   match mm.get(f(x.term)) { Some(c) -> c, None -> 0i128 },
-                  x.coeff,
+                  x.coefficient,
                 ) {
                 Some(c) -> Some(mm.insert(f(x.term), c)),
                 None -> None,
@@ -1111,22 +1179,23 @@ fn arithmetic(
             });
           match summed {
             None -> acc,
-            Some(mm) -> match checked_neg(p.konst) {
-              Some(k) -> acc.push({ coeffs: nonzero(mm), konst: k }),
+            Some(mm) -> match checked_neg(p.constant) {
+              Some(k) -> acc.push({ coefficients: nonzero(mm), constant: k }),
               None -> acc,
             },
           }
         },
-        TInt(k) ->
+        IntTerm(k) ->
           acc.push({
-            coeffs: Map::new().insert(f(t), 1i128),
-            konst: match checked_neg(I128::of_int(k)) { Some(n) -> n, None -> 0i128 },
+            coefficients: Map::new().insert(f(t), 1i128),
+            constant: match checked_neg(I128::of_int(k)) { Some(n) -> n, None -> 0i128 },
           }),
         _ -> acc,
       },
   );
   // A fully cancelled definition (`x == x + 1`) reaches nothing, so it is seeded as used.
-  let used0 = definitions.map(|d: { coeffs: Map<Int, I128>, konst: I128 }| d.coeffs.len() == 0);
+  let used0 = definitions.map(|d: { coefficients: Map<Int, I128>, constant: I128 }|
+    d.coefficients.len() == 0);
   let reached = iterate(
     { used: used0, relevant: comparisons.relevant },
     definitions.len() + 2,
@@ -1136,11 +1205,11 @@ fn arithmetic(
         |acc: { used: List<Bool>, relevant: Map<Int, Bool>, grew: Bool }, i: Int|
           if acc.used.at(i) == Some(true) { acc } else {
             match definitions.at(i) {
-              Some(d) -> if d.coeffs.keys().fold(false, |f2: Bool, v: Int|
+              Some(d) -> if d.coefficients.keys().fold(false, |f2: Bool, v: Int|
                   f2 || acc.relevant.contains(v)) {
                 {
                   used: acc.used.set(i, true),
-                  relevant: d.coeffs.keys().fold(acc.relevant, |r: Map<Int, Bool>, v: Int|
+                  relevant: d.coefficients.keys().fold(acc.relevant, |r: Map<Int, Bool>, v: Int|
                     r.insert(v, true)),
                   grew: true,
                 }
@@ -1153,17 +1222,21 @@ fn arithmetic(
       else { Stop({ used: next.used, relevant: next.relevant }) }
     },
   );
-  let with_defs = range(0, definitions.len()).fold([], |rows: List<Row>, i: Int|
+  let with_defs = range(0, definitions.len()).fold([], |rows: List<Inequality>, i: Int|
     if reached.used.at(i) == Some(true) {
-      match definitions.at(i) { Some(d) -> eq_rows(rows, d.coeffs, d.konst), None -> rows }
+      match definitions.at(i) {
+        Some(d) -> add_equality(rows, d.coefficients, d.constant),
+        None -> rows,
+      }
     } else { rows });
   let system = comparisons.rows.fold(
     with_defs,
-    |rows: List<Row>, r: { coeffs: Map<Int, I128>, konst: I128 }| leq(rows, r.coeffs, r.konst),
+    |rows: List<Inequality>, r: { coefficients: Map<Int, I128>, constant: I128 }|
+      add_inequality(rows, r.coefficients, r.constant),
   );
-  if system.len() == 0 { { sv: solver, answer: Undecided } } else {
+  if system.len() == 0 { { solver: solver, result: Undecided } } else {
     let settled = feasibility(system, solver.budget);
-    { sv: { ..solver, budget: settled.budget }, answer: settled.answer }
+    { solver: { ..solver, budget: settled.budget }, result: settled.result }
   }
 }
 

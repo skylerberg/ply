@@ -35,7 +35,7 @@ fn member(j: Json, name: String) -> Json =
 
 fn text(j: Json, name: String) -> String = match member(j, name) { json::Str(s) -> s, _ -> "" }
 
-fn count(j: Json, name: String) -> Int =
+fn integer(j: Json, name: String) -> Int =
   match member(j, name) {
     json::Number(n) -> match Int::of_decimal(n, Down) { Some(i) -> i, None -> 0 },
     _ -> 0,
@@ -44,7 +44,7 @@ fn count(j: Json, name: String) -> Int =
 fn items(j: Json, name: String) -> List<Json> =
   match member(j, name) { json::Array(xs) -> xs, _ -> [] }
 
-fn unhex(j: Json, name: String) -> Bytes / {abort.raise} = Bytes::of_hex(text(j, name))
+fn hex_bytes(j: Json, name: String) -> Bytes / {abort.raise} = Bytes::of_hex(text(j, name))
 
 fn flags(j: Json) -> List<String> =
   items(j, "flags").map(|f: Json| match f { json::Str(s) -> s, _ -> "" })
@@ -87,17 +87,17 @@ type Aead = {
 fn aead(file: Bytes) -> List<Aead> / {abort.raise} =
   cases(file, |group: Json, t: Json|
     {
-      id: count(t, "tcId"),
+      id: integer(t, "tcId"),
       comment: text(t, "comment"),
       result: text(t, "result"),
-      key_bits: count(group, "keySize"),
-      nonce_bits: count(group, "ivSize"),
-      key: unhex(t, "key"),
-      nonce: unhex(t, "iv"),
-      associated: unhex(t, "aad"),
-      plaintext: unhex(t, "msg"),
-      ciphertext: unhex(t, "ct"),
-      tag: unhex(t, "tag"),
+      key_bits: integer(group, "keySize"),
+      nonce_bits: integer(group, "ivSize"),
+      key: hex_bytes(t, "key"),
+      nonce: hex_bytes(t, "iv"),
+      associated: hex_bytes(t, "aad"),
+      plaintext: hex_bytes(t, "msg"),
+      ciphertext: hex_bytes(t, "ct"),
+      tag: hex_bytes(t, "tag"),
     })
 
 fn aes_gcm_all() -> List<Aead> / {abort.raise} = aead(embed("crypto/aes_gcm_test.json"))
@@ -111,22 +111,27 @@ fn xchacha20() -> List<Aead> / {abort.raise} = aead(embed("crypto/xchacha20_poly
 
 /// A vector under a nonce the caller names: a valid one seals to its ciphertext and tag and opens
 /// to its plaintext, and an invalid one opens to nothing.
-fn counted(cipher: crypto::Cipher, c: Aead) -> Unit / {abort.raise} = {
+fn check_aead(cipher: crypto::Cipher, c: Aead) -> Unit / {abort.raise} = {
   let key = match crypto::counted_key(cipher, Secret::of_bytes(c.key)) {
     Some(k) -> k,
     None -> panic("a key"),
   };
   let text = c.ciphertext.concat(c.tag);
   if c.result == "valid" {
-    assert_eq(crypto::unwatched(|| crypto::seal_at(key, c.nonce, c.plaintext, c.associated)), text);
+    assert_eq(
+      crypto::without_nonce_check(|| crypto::seal_at(key, c.nonce, c.plaintext, c.associated)),
+      text,
+    );
     assert_eq(crypto::open_at(key, c.nonce, text, c.associated), Some(c.plaintext))
   } else { assert_eq(crypto::open_at(key, c.nonce, text, c.associated), None) }
 }
 
-test "Wycheproof AES-256-GCM {c.id}: {c.comment}" for c: Aead in aes_gcm() { counted(Aes256Gcm, c) }
+test "Wycheproof AES-256-GCM {c.id}: {c.comment}" for c: Aead in aes_gcm() {
+  check_aead(Aes256Gcm, c)
+}
 
 test "Wycheproof ChaCha20-Poly1305 {c.id}: {c.comment}" for c: Aead in chacha20() {
-  counted(ChaCha20Poly1305, c)
+  check_aead(ChaCha20Poly1305, c)
 }
 
 test "Wycheproof XChaCha20-Poly1305 {c.id}: {c.comment}" for c: Aead in xchacha20() {
@@ -136,7 +141,7 @@ test "Wycheproof XChaCha20-Poly1305 {c.id}: {c.comment}" for c: Aead in xchacha2
   };
   let text = Bytes::concat_all([c.nonce, c.ciphertext, c.tag]);
   if c.result == "valid" {
-    assert_eq(crypto::seal_under(key, c.nonce, c.plaintext, c.associated), text);
+    assert_eq(crypto::seal_with_nonce(key, c.nonce, c.plaintext, c.associated), text);
     assert_eq(crypto::open(key, text, c.associated), Some(c.plaintext))
   } else { assert_eq(crypto::open(key, text, c.associated), None) }
 }
@@ -153,7 +158,7 @@ test "the AEAD files are run but for AES-GCM's other keys and nonces, to the cou
 
 // --- Signatures -------------------------------------------------------------
 
-type Signed = {
+type SignatureVector = {
   id: Int,
   comment: String,
   result: String,
@@ -163,149 +168,163 @@ type Signed = {
   signature: Bytes,
 }
 
-fn signed(file: Bytes, public: (Json) -> Bytes / {abort.raise}) -> List<Signed> / {abort.raise} =
+fn signature_vectors(
+  file: Bytes,
+  public: (Json) -> Bytes / {abort.raise},
+) -> List<SignatureVector> / {abort.raise} =
   cases(file, |group: Json, t: Json|
     {
-      id: count(t, "tcId"),
+      id: integer(t, "tcId"),
       comment: text(t, "comment"),
       result: text(t, "result"),
       flags: flags(t),
       public: public(group),
-      message: unhex(t, "msg"),
-      signature: unhex(t, "sig"),
+      message: hex_bytes(t, "msg"),
+      signature: hex_bytes(t, "sig"),
     })
 
-fn eddsa() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ed25519_test.json"), |group: Json| unhex(member(group, "publicKey"), "pk"))
+fn eddsa() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ed25519_test.json"), |group: Json|
+    hex_bytes(member(group, "publicKey"), "pk"))
 
-fn point(group: Json) -> Bytes / {abort.raise} = unhex(member(group, "publicKey"), "uncompressed")
+fn point(group: Json) -> Bytes / {abort.raise} =
+  hex_bytes(member(group, "publicKey"), "uncompressed")
 
-fn ecdsa_raw() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp256r1_sha256_p1363_test.json"), point)
+fn ecdsa_raw() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp256r1_sha256_p1363_test.json"), point)
 
-fn ecdsa_der() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp256r1_sha256_test.json"), point)
+fn ecdsa_der() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp256r1_sha256_test.json"), point)
 
-fn p384_der() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp384r1_sha384_test.json"), point)
+fn p384_der() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp384r1_sha384_test.json"), point)
 
-fn p384_raw() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp384r1_sha384_p1363_test.json"), point)
+fn p384_raw() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp384r1_sha384_p1363_test.json"), point)
 
-fn p384_sha256() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp384r1_sha256_test.json"), point)
+fn p384_sha256() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp384r1_sha256_test.json"), point)
 
-fn p521_raw() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp521r1_sha512_p1363_test.json"), point)
+fn p521_raw() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp521r1_sha512_p1363_test.json"), point)
 
-fn k256_raw() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/ecdsa_secp256k1_sha256_p1363_test.json"), point)
+fn k256_raw() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/ecdsa_secp256k1_sha256_p1363_test.json"), point)
 
-fn rsa_pkcs1() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/rsa_signature_2048_sha256_test.json"), |group: Json|
-    unhex(group, "publicKeyAsn"))
+fn rsa_pkcs1() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/rsa_signature_2048_sha256_test.json"), |group: Json|
+    hex_bytes(group, "publicKeyAsn"))
 
-fn rsa_pss() -> List<Signed> / {abort.raise} =
-  signed(embed("crypto/rsa_pss_2048_sha256_mgf1_32_test.json"), |group: Json|
-    unhex(group, "publicKeyAsn"))
+fn rsa_pss() -> List<SignatureVector> / {abort.raise} =
+  signature_vectors(embed("crypto/rsa_pss_2048_sha256_mgf1_32_test.json"), |group: Json|
+    hex_bytes(group, "publicKeyAsn"))
 
-fn checked(key: Option<crypto::VerifyingKey>, c: Signed) -> Unit / {abort.raise} =
+fn check_signature(key: Option<crypto::VerifyingKey>, c: SignatureVector) -> Unit / {abort.raise} =
   match key {
     None -> panic("a vector's key is a key"),
     Some(k) -> assert_eq(crypto::verify(k, c.message, c.signature), c.result == "valid"),
   }
 
-test "Wycheproof Ed25519 {c.id}: {c.comment}" for c: Signed in eddsa() {
-  checked(crypto::ed25519_verifying(c.public), c);
+test "Wycheproof Ed25519 {c.id}: {c.comment}" for c: SignatureVector in eddsa() {
+  check_signature(crypto::ed25519_verifying(c.public), c);
   assert_eq(ed25519::verify(c.public, c.message, c.signature), c.result == "valid")
 }
 
-test "Wycheproof ECDSA P-256, r and s: {c.id}: {c.comment}" for c: Signed in ecdsa_raw() {
-  checked(crypto::ecdsa_verifying(NistP256, Sha256, c.public, Raw), c)
+test "Wycheproof ECDSA P-256, r and s: {c.id}: {c.comment}" for c: SignatureVector in ecdsa_raw() {
+  check_signature(crypto::ecdsa_verifying(NistP256, Sha256, c.public, Raw), c)
 }
 
-test "Wycheproof ECDSA P-256, DER: {c.id}: {c.comment}" for c: Signed in ecdsa_der() {
-  checked(crypto::ecdsa_verifying(NistP256, Sha256, c.public, Der), c)
+test "Wycheproof ECDSA P-256, DER: {c.id}: {c.comment}" for c: SignatureVector in ecdsa_der() {
+  check_signature(crypto::ecdsa_verifying(NistP256, Sha256, c.public, Der), c)
 }
 
-test "Wycheproof ECDSA P-384, DER: {c.id}: {c.comment}" for c: Signed in p384_der() {
-  checked(crypto::ecdsa_verifying(NistP384, Sha384, c.public, Der), c)
+test "Wycheproof ECDSA P-384, DER: {c.id}: {c.comment}" for c: SignatureVector in p384_der() {
+  check_signature(crypto::ecdsa_verifying(NistP384, Sha384, c.public, Der), c)
 }
 
-test "Wycheproof ECDSA P-384, r and s: {c.id}: {c.comment}" for c: Signed in p384_raw() {
-  checked(crypto::ecdsa_verifying(NistP384, Sha384, c.public, Raw), c)
+test "Wycheproof ECDSA P-384, r and s: {c.id}: {c.comment}" for c: SignatureVector in p384_raw() {
+  check_signature(crypto::ecdsa_verifying(NistP384, Sha384, c.public, Raw), c)
 }
 
-test "Wycheproof ECDSA P-384 over SHA-256, DER: {c.id}: {c.comment}" for c: Signed in p384_sha256(
-  ) { checked(crypto::ecdsa_verifying(NistP384, Sha256, c.public, Der), c) }
+test "Wycheproof ECDSA P-384 over SHA-256, DER: {c.id}: {c.comment}" for c: SignatureVector in p384_sha256(
+  ) { check_signature(crypto::ecdsa_verifying(NistP384, Sha256, c.public, Der), c) }
 
-test "Wycheproof ECDSA P-521, r and s: {c.id}: {c.comment}" for c: Signed in p521_raw() {
-  checked(crypto::ecdsa_verifying(NistP521, Sha512, c.public, Raw), c)
+test "Wycheproof ECDSA P-521, r and s: {c.id}: {c.comment}" for c: SignatureVector in p521_raw() {
+  check_signature(crypto::ecdsa_verifying(NistP521, Sha512, c.public, Raw), c)
 }
 
-test "Wycheproof ECDSA secp256k1, r and s: {c.id}: {c.comment}" for c: Signed in k256_raw() {
-  checked(crypto::ecdsa_verifying(Secp256k1, Sha256, c.public, Raw), c)
+test "Wycheproof ECDSA secp256k1, r and s: {c.id}: {c.comment}" for c: SignatureVector in k256_raw(
+  ) { check_signature(crypto::ecdsa_verifying(Secp256k1, Sha256, c.public, Raw), c) }
+
+test "Wycheproof RSA PKCS #1 v1.5 {c.id}: {c.comment}" for c: SignatureVector in rsa_pkcs1() {
+  check_signature(crypto::rsa_pkcs1_verifying(c.public, Sha256), c)
 }
 
-test "Wycheproof RSA PKCS #1 v1.5 {c.id}: {c.comment}" for c: Signed in rsa_pkcs1() {
-  checked(crypto::rsa_pkcs1_verifying(c.public, Sha256), c)
-}
-
-test "Wycheproof RSA PSS {c.id}: {c.comment}" for c: Signed in rsa_pss() {
-  checked(crypto::rsa_pss_verifying(c.public, Sha256), c)
+test "Wycheproof RSA PSS {c.id}: {c.comment}" for c: SignatureVector in rsa_pss() {
+  check_signature(crypto::rsa_pss_verifying(c.public, Sha256), c)
 }
 
 test "the signature files are run whole, and the one acceptable signature is refused" {
-  assert_eq(tally(eddsa().map(|c: Signed| c.result)), { valid: 88, acceptable: 0, invalid: 63 });
-  assert_eq(tally(ecdsa_raw().map(|c: Signed| c.result)), {
+  assert_eq(tally(eddsa().map(|c: SignatureVector| c.result)), {
+    valid: 88,
+    acceptable: 0,
+    invalid: 63,
+  });
+  assert_eq(tally(ecdsa_raw().map(|c: SignatureVector| c.result)), {
     valid: 173,
     acceptable: 0,
     invalid: 89,
   });
-  assert_eq(tally(ecdsa_der().map(|c: Signed| c.result)), {
+  assert_eq(tally(ecdsa_der().map(|c: SignatureVector| c.result)), {
     valid: 174,
     acceptable: 0,
     invalid: 310,
   });
-  assert_eq(tally(p384_der().map(|c: Signed| c.result)), {
+  assert_eq(tally(p384_der().map(|c: SignatureVector| c.result)), {
     valid: 194,
     acceptable: 0,
     invalid: 310,
   });
-  assert_eq(tally(p384_raw().map(|c: Signed| c.result)), {
+  assert_eq(tally(p384_raw().map(|c: SignatureVector| c.result)), {
     valid: 193,
     acceptable: 0,
     invalid: 87,
   });
-  assert_eq(tally(p384_sha256().map(|c: Signed| c.result)), {
+  assert_eq(tally(p384_sha256().map(|c: SignatureVector| c.result)), {
     valid: 162,
     acceptable: 0,
     invalid: 310,
   });
-  assert_eq(tally(p521_raw().map(|c: Signed| c.result)), {
+  assert_eq(tally(p521_raw().map(|c: SignatureVector| c.result)), {
     valid: 231,
     acceptable: 0,
     invalid: 87,
   });
-  assert_eq(tally(k256_raw().map(|c: Signed| c.result)), {
+  assert_eq(tally(k256_raw().map(|c: SignatureVector| c.result)), {
     valid: 167,
     acceptable: 0,
     invalid: 85,
   });
-  assert_eq(tally(rsa_pkcs1().map(|c: Signed| c.result)), {
+  assert_eq(tally(rsa_pkcs1().map(|c: SignatureVector| c.result)), {
     valid: 9,
     acceptable: 1,
     invalid: 249,
   });
-  assert_eq(rsa_pkcs1().filter(|c: Signed| c.result == "acceptable").map(|c: Signed| c.flags), [
-    ["MissingNull"],
-  ]);
-  assert_eq(tally(rsa_pss().map(|c: Signed| c.result)), { valid: 63, acceptable: 0, invalid: 45 })
+  assert_eq(
+    rsa_pkcs1().filter(|c: SignatureVector| c.result == "acceptable").map(|c: SignatureVector|
+      c.flags),
+    [["MissingNull"]],
+  );
+  assert_eq(tally(rsa_pss().map(|c: SignatureVector| c.result)), {
+    valid: 63,
+    acceptable: 0,
+    invalid: 45,
+  })
 }
 
 // --- Agreement --------------------------------------------------------------
 
-type Shared = {
+type AgreementVector = {
   id: Int,
   comment: String,
   result: String,
@@ -315,37 +334,39 @@ type Shared = {
   shared: Bytes,
 }
 
-fn shared(file: Bytes) -> List<Shared> / {abort.raise} =
+fn agreement_vectors(file: Bytes) -> List<AgreementVector> / {abort.raise} =
   cases(file, |_group: Json, t: Json|
     {
-      id: count(t, "tcId"),
+      id: integer(t, "tcId"),
       comment: text(t, "comment"),
       result: text(t, "result"),
       flags: flags(t),
-      private: unhex(t, "private"),
-      public: unhex(t, "public"),
-      shared: unhex(t, "shared"),
+      private: hex_bytes(t, "private"),
+      public: hex_bytes(t, "public"),
+      shared: hex_bytes(t, "shared"),
     })
 
-fn xdh() -> List<Shared> / {abort.raise} = shared(embed("crypto/x25519_test.json"))
+fn xdh() -> List<AgreementVector> / {abort.raise} =
+  agreement_vectors(embed("crypto/x25519_test.json"))
 
-fn ecdh() -> List<Shared> / {abort.raise} = shared(embed("crypto/ecdh_secp256r1_ecpoint_test.json"))
+fn ecdh() -> List<AgreementVector> / {abort.raise} =
+  agreement_vectors(embed("crypto/ecdh_secp256r1_ecpoint_test.json"))
 
 /// The flags of an X25519 vector whose peer is refused.
-fn refused_flags() -> List<String> = ["LowOrderPublic", "SmallPublicKey", "ZeroSharedSecret"]
+fn rejected_peer_flags() -> List<String> = ["LowOrderPublic", "SmallPublicKey", "ZeroSharedSecret"]
 
-fn refused(c: Shared) -> Bool =
-  c.flags.fold(false, |any: Bool, f: String| any || refused_flags().contains(f))
+fn is_rejected(c: AgreementVector) -> Bool =
+  c.flags.fold(false, |any: Bool, f: String| any || rejected_peer_flags().contains(f))
 
-test "Wycheproof X25519 {c.id}: {c.comment}" for c: Shared in xdh() {
+test "Wycheproof X25519 {c.id}: {c.comment}" for c: AgreementVector in xdh() {
   let key = match crypto::x25519_key(Secret::of_bytes(c.private)) {
     Some(k) -> k,
     None -> panic("a key"),
   };
   let peer = match crypto::x25519_peer(c.public) { Some(p) -> p, None -> panic("a peer") };
   // A refused flag and a secret of zeros are one thing, told two ways.
-  assert_eq(refused(c), c.shared == b"\x00".repeat(32));
-  if refused(c) { assert_eq(crypto::agree(key, peer), Err(SmallOrder)) }
+  assert_eq(is_rejected(c), c.shared == b"\x00".repeat(32));
+  if is_rejected(c) { assert_eq(crypto::agree(key, peer), Err(SmallOrder)) }
   else { assert_eq(crypto::agree(key, peer), Ok(Secret::of_bytes(c.shared))) }
 }
 
@@ -355,7 +376,7 @@ fn scalar(number: Bytes) -> Bytes / {abort.raise} = {
   b"\x00".repeat(32 - digits.len()).concat(digits)
 }
 
-test "Wycheproof ECDH P-256 {c.id}: {c.comment}" for c: Shared in ecdh() {
+test "Wycheproof ECDH P-256 {c.id}: {c.comment}" for c: AgreementVector in ecdh() {
   let key = match crypto::p256_key(Secret::of_bytes(scalar(c.private))) {
     Some(k) -> k,
     None -> panic("a key"),
@@ -371,15 +392,24 @@ test "Wycheproof ECDH P-256 {c.id}: {c.comment}" for c: Shared in ecdh() {
 
 test "the agreement files are run whole, each acceptable vector by its flags' answer" {
   let x = xdh();
-  assert_eq(tally(x.map(|c: Shared| c.result)), { valid: 264, acceptable: 254, invalid: 0 });
-  assert_eq(x.filter(refused).len(), 31);
-  assert_eq(x.filter(|c: Shared| c.result == "acceptable" && !refused(c)).len(), 223);
-  assert_eq(x.filter(|c: Shared| c.result == "valid" && refused(c)).len(), 0);
+  assert_eq(tally(x.map(|c: AgreementVector| c.result)), {
+    valid: 264,
+    acceptable: 254,
+    invalid: 0,
+  });
+  assert_eq(x.filter(is_rejected).len(), 31);
+  assert_eq(x.filter(|c: AgreementVector| c.result == "acceptable" && !is_rejected(c)).len(), 223);
+  assert_eq(x.filter(|c: AgreementVector| c.result == "valid" && is_rejected(c)).len(), 0);
   let p = ecdh();
-  assert_eq(tally(p.map(|c: Shared| c.result)), { valid: 330, acceptable: 1, invalid: 24 });
-  assert_eq(p.filter(|c: Shared| c.result == "acceptable").map(|c: Shared| c.flags), [
-    ["CompressedPublic", "CompressedPoint"],
-  ])
+  assert_eq(tally(p.map(|c: AgreementVector| c.result)), {
+    valid: 330,
+    acceptable: 1,
+    invalid: 24,
+  });
+  assert_eq(
+    p.filter(|c: AgreementVector| c.result == "acceptable").map(|c: AgreementVector| c.flags),
+    [["CompressedPublic", "CompressedPoint"]],
+  )
 }
 
 // --- Keyed hashing under a secret -------------------------------------------
@@ -389,12 +419,12 @@ type Mac = { id: Int, comment: String, result: String, key: Bytes, message: Byte
 fn macs() -> List<Mac> / {abort.raise} =
   cases(embed("crypto/hmac_sha256_test.json"), |_group: Json, t: Json|
     {
-      id: count(t, "tcId"),
+      id: integer(t, "tcId"),
       comment: text(t, "comment"),
       result: text(t, "result"),
-      key: unhex(t, "key"),
-      message: unhex(t, "msg"),
-      tag: unhex(t, "tag"),
+      key: hex_bytes(t, "key"),
+      message: hex_bytes(t, "msg"),
+      tag: hex_bytes(t, "tag"),
     })
 
 test "Wycheproof HMAC-SHA-256 {c.id}: {c.comment}" for c: Mac in macs() {
@@ -402,7 +432,7 @@ test "Wycheproof HMAC-SHA-256 {c.id}: {c.comment}" for c: Mac in macs() {
   assert_eq(tags_match(whole.slice(0, c.tag.len()), c.tag), c.result == "valid")
 }
 
-type Derived = {
+type HkdfVector = {
   id: Int,
   comment: String,
   result: String,
@@ -413,20 +443,20 @@ type Derived = {
   output: Bytes,
 }
 
-fn derivations() -> List<Derived> / {abort.raise} =
+fn derivations() -> List<HkdfVector> / {abort.raise} =
   cases(embed("crypto/hkdf_sha256_test.json"), |_group: Json, t: Json|
     {
-      id: count(t, "tcId"),
+      id: integer(t, "tcId"),
       comment: text(t, "comment"),
       result: text(t, "result"),
-      key: unhex(t, "ikm"),
-      salt: unhex(t, "salt"),
-      info: unhex(t, "info"),
-      size: count(t, "size"),
-      output: unhex(t, "okm"),
+      key: hex_bytes(t, "ikm"),
+      salt: hex_bytes(t, "salt"),
+      info: hex_bytes(t, "info"),
+      size: integer(t, "size"),
+      output: hex_bytes(t, "okm"),
     })
 
-test "Wycheproof HKDF-SHA-256 {c.id}: {c.comment}" for c: Derived in derivations() {
+test "Wycheproof HKDF-SHA-256 {c.id}: {c.comment}" for c: HkdfVector in derivations() {
   let made = try { hkdf(sha256_hash(), c.salt, Secret::of_bytes(c.key), c.info, c.size) };
   if c.result == "valid" { assert_eq(made, Ok(Secret::of_bytes(c.output))) }
   else { assert_eq(made, Err(OutputLength(c.size))) }
@@ -434,7 +464,7 @@ test "Wycheproof HKDF-SHA-256 {c.id}: {c.comment}" for c: Derived in derivations
 
 test "the keyed hashing files are run whole" {
   assert_eq(tally(macs().map(|c: Mac| c.result)), { valid: 66, acceptable: 0, invalid: 108 });
-  assert_eq(tally(derivations().map(|c: Derived| c.result)), {
+  assert_eq(tally(derivations().map(|c: HkdfVector| c.result)), {
     valid: 83,
     acceptable: 0,
     invalid: 3,
@@ -449,10 +479,10 @@ fn ec_document() -> Bytes = embed("asn1/ec_key.der")
 
 fn message() -> Bytes = b"what was built"
 
-type RsaSigned = { digest: crypto::Digest, name: String, signature: String }
+type RsaSignature = { digest: crypto::Digest, name: String, signature: String }
 
 /// What `openssl dgst -sign` writes of `message()` under the RSA key, a digest each.
-fn rsa_signed() -> List<RsaSigned> =
+fn rsa_signatures() -> List<RsaSignature> =
   [
     {
       digest: Sha256,
@@ -471,7 +501,7 @@ fn rsa_signed() -> List<RsaSigned> =
     },
   ]
 
-test "the suite's RSA key signs PKCS #1 v1.5 over {c.name} as openssl does" for c: RsaSigned in rsa_signed(
+test "the suite's RSA key signs PKCS #1 v1.5 over {c.name} as openssl does" for c: RsaSignature in rsa_signatures(
   ) {
   let key = match crypto::rsa_pkcs1_signing(Secret::of_bytes(rsa_document()), c.digest) {
     Some(k) -> k,
@@ -565,7 +595,7 @@ test "the suite's EC key's signature over SHA-384 verifies under that digest's k
     Some(key) -> {
       assert(crypto::verify(key, message(), signature));
       assert(!crypto::verify(key, b"what was not", signature));
-      assert_eq(crypto::signature_of(key), crypto::EcdsaSignature(NistP256, Sha384, Der));
+      assert_eq(crypto::signature_algorithm(key), crypto::EcdsaSignature(NistP256, Sha384, Der));
       assert_eq(crypto::verifying_bytes(key), point)
     },
     None -> panic("a P-256 point"),
@@ -580,7 +610,7 @@ test "the suite's EC key's signature over SHA-384 verifies under that digest's k
 /// What `rsa_pss_signing` makes of `message()` under the suite's RSA key over each digest: a
 /// signature this module's salt makes a function of the key and the message, each verified by
 /// `openssl dgst -verify -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest`.
-fn pss_signed() -> List<RsaSigned> =
+fn pss_signatures() -> List<RsaSignature> =
   [
     {
       digest: Sha256,
@@ -599,7 +629,7 @@ fn pss_signed() -> List<RsaSigned> =
     },
   ]
 
-test "the suite's RSA key signs PSS over {c.name} as pinned, and openssl verifies it" for c: RsaSigned in pss_signed(
+test "the suite's RSA key signs PSS over {c.name} as pinned, and openssl verifies it" for c: RsaSignature in pss_signatures(
   ) {
   let key = match crypto::rsa_pss_signing(Secret::of_bytes(rsa_document()), c.digest) {
     Some(k) -> k,

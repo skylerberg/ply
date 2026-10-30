@@ -21,18 +21,18 @@
 //! table of permitted characters, are not applied, as UTS #46 does not apply them.
 
 import std.char
-import std.char (drawn_text, text_of)
+import std.char (sample_text, text_of)
 import std.list
 import std.punycode
 import std.ucd
-import std.ucd (Gathering, Run, Table, Valued)
+import std.ucd (SequencePool, Run, Table, ValueRun)
 import std.unicode
 import std.gen
 
 // --- The table --------------------------------------------------------------------
 
 /// What `ucd/idna.txt` says, made for reading.
-type Held = {
+type IdnaTable = {
   /// A word a code point: its status in the low three bits, then its Bidi_Class in four, its
   /// Joining_Type in three, a bit for a virama, a bit that says its mapping is several code
   /// points, and the mapping in twenty-two: how far the one code point lies, or the place of
@@ -104,13 +104,13 @@ fn joining(letters: Bytes) -> Int / {abort.raise} =
         _ -> panic("a joining type is D, L, R or T, and v marks a virama"),
       }))
 
-fn is_several() -> Int = 1 << 11
+fn several_bit() -> Int = 1 << 11
 
 /// The table as it is being made.
-type Making = { valued: List<Valued>, gathering: Gathering }
+type TableBuilder = { valued: List<ValueRun>, gathering: SequencePool }
 
-fn held_of(runs: List<Run>) -> Held / {abort.raise} = {
-  let made = runs.fold({ valued: [], gathering: ucd::gathering() }, |m: Making, run: Run| {
+fn idna_table_of(runs: List<Run>) -> IdnaTable / {abort.raise} = {
+  let made = runs.fold({ valued: [], gathering: ucd::empty_pool() }, |m: TableBuilder, run: Run| {
     let field = |i: Int| match run.fields.at(i) { Some(text) -> text, None -> b"" };
     let bits = status(field(0)) | bidi(field(2)) << 3 | joining(field(3));
     let mapping = field(1);
@@ -122,12 +122,12 @@ fn held_of(runs: List<Run>) -> Held / {abort.raise} = {
         gathering: m.gathering,
       }
     } else {
-      let put = ucd::gather(m.gathering, ucd::points(mapping));
+      let put = ucd::intern(m.gathering, ucd::code_points(mapping));
       {
         valued: m.valued.push({
           first: run.first,
           last: run.last,
-          value: bits | is_several() | put.place << 12,
+          value: bits | several_bit() | put.place << 12,
         }),
         gathering: put.gathering,
       }
@@ -136,7 +136,7 @@ fn held_of(runs: List<Run>) -> Held / {abort.raise} = {
   { words: ucd::table_of(made.valued, 0), points: Array::of_list(made.gathering.points) }
 }
 
-const fn held() -> Held = held_of(ucd::runs(embed("ucd/idna.txt")))
+const fn idna_table() -> IdnaTable = idna_table_of(ucd::runs(embed("ucd/idna.txt")))
 
 fn status_of(word: Int) -> Int = word & 7
 
@@ -187,7 +187,7 @@ pub fn web() -> Options =
   }
 
 /// What is wrong with a label, or with the name.
-pub type Why =
+pub type ErrorKind =
   /// A character that may not be in a domain name: one UTS #46 disallows, one that maps to
   /// something else found in a label read from Punycode, a full stop there, or, under
   /// `use_std3_ascii_rules`, an ASCII character other than a letter, a digit or a hyphen.
@@ -214,10 +214,10 @@ pub type Why =
 
 /// One thing wrong with a name: the label it is in, counted from zero, and what it is. `LongName`
 /// is of the whole name, and its label is `-1`.
-pub type Problem = { label: Int, why: Why }
+pub type Problem = { label: Int, reason: ErrorKind }
 
 /// What is wrong as a sentence, for a diagnostic.
-pub fn reason(why: Why) -> String =
+pub fn reason(why: ErrorKind) -> String =
   match why {
     Disallowed -> "a label holds a character no domain name holds",
     Hyphens -> "a label opens or closes with a hyphen, or has hyphens third and fourth",
@@ -232,36 +232,36 @@ pub fn reason(why: Why) -> String =
   }
 
 /// A name as `to_unicode` converts it, and every problem found on the way.
-pub type Converted = { name: String, problems: List<Problem> }
+pub type ConversionResult = { name: String, problems: List<Problem> }
 
 /// How converting a name to ASCII fails.
 pub effect idna {
   /// The name breaks the rules it was held to: each problem found.
-  raise refused(problems: List<Problem>)
+  raise fail(problems: List<Problem>)
 }
 
 // --- Mapping ----------------------------------------------------------------------
 
 /// `out` and then what the table maps `cp` to: itself where it is valid, a deviation or
 /// disallowed, nothing where it is ignored, and its mapping where it has one.
-fn mapped_into(table: Held, out: List<Int>, cp: Int) -> List<Int> =
+fn mapped_into(table: IdnaTable, out: List<Int>, cp: Int) -> List<Int> =
   if cp >= 0x61 && cp <= 0x7A { out.push(cp) } else {
     let word = ucd::lookup(table.words, cp);
     let kind = status_of(word);
     if kind == ignored() { out }
     else if kind != mapped() { out.push(cp) }
-    else if word & is_several() == 0 { out.push(ucd::away(cp, word >> 12)) }
+    else if word & several_bit() == 0 { out.push(ucd::apply_distance(cp, word >> 12)) }
     else { out.concat(ucd::sequence(table.points, word >> 12)) }
   }
 
 fn points_of(text: String) -> List<Int> = text.chars().map(Int::of_char)
 
 /// The labels read so far, and the one being read.
-type Cutting = { labels: List<List<Int>>, label: List<Int> }
+type LabelSplit = { labels: List<List<Int>>, label: List<Int> }
 
 /// `points` cut at each full stop.
 fn labels_of(points: List<Int>) -> List<List<Int>> = {
-  let cut = points.fold({ labels: [], label: [] }, |so_far: Cutting, cp: Int|
+  let cut = points.fold({ labels: [], label: [] }, |so_far: LabelSplit, cp: Int|
     if cp == 0x2E { { labels: so_far.labels.push(so_far.label), label: [] } }
     else { { labels: so_far.labels, label: so_far.label.push(cp) } });
   cut.labels.push(cut.label)
@@ -304,7 +304,7 @@ fn joined_after(words: Array<Int>, i: Int) -> Bool =
     else { joining_of(word) == 1 || joining_of(word) == 3 },
   }
 
-fn joiners_stand(label: List<Int>, words: Array<Int>) -> Bool =
+fn joiners_allowed(label: List<Int>, words: Array<Int>) -> Bool =
   range(0, label.len()).fold(true, |ok: Bool, i: Int|
     ok
       && (match label.at(i) {
@@ -315,7 +315,7 @@ fn joiners_stand(label: List<Int>, words: Array<Int>) -> Bool =
 
 /// What is wrong with `label` by the validity criteria of UTS #46 section 4.1, the Bidi rule
 /// apart, which is of the whole name. `read` says the label was read from Punycode.
-fn faults(table: Held, label: List<Int>, options: Options, read: Bool) -> List<Why> = {
+fn faults(table: IdnaTable, label: List<Int>, options: Options, read: Bool) -> List<ErrorKind> = {
   let words = label.map(|cp: Int| ucd::lookup(table.words, cp));
   let hyphen = |i: Int| label.at(i) == Some(0x2D);
   let allowed = |i: Int| {
@@ -325,7 +325,7 @@ fn faults(table: Held, label: List<Int>, options: Options, read: Bool) -> List<W
       && !(options.use_std3_ascii_rules && cp < 128
         && !((cp >= 0x61 && cp <= 0x7A) || (cp >= 0x30 && cp <= 0x39) || cp == 0x2D))
   };
-  let found = |why: Why, wrong: Bool| if wrong { [why] } else { [] };
+  let found = |why: ErrorKind, wrong: Bool| if wrong { [why] } else { [] };
   found(NotNormalized, read && !unicode::is_normalized(text_of(label), unicode::Nfc)).concat(
     found(
       Hyphens,
@@ -339,7 +339,7 @@ fn faults(table: Held, label: List<Int>, options: Options, read: Bool) -> List<W
       }),
     ).concat(
       found(Disallowed, !range(0, label.len()).all(allowed)).concat(
-        found(Joiner, options.check_joiners && !joiners_stand(label, Array::of_list(words))),
+        found(Joiner, options.check_joiners && !joiners_allowed(label, Array::of_list(words))),
       ),
     ),
   )
@@ -377,11 +377,11 @@ fn bidi_holds(classes: List<Int>) -> Bool =
 // --- Processing -------------------------------------------------------------------
 
 /// A label as it was converted, and what was found wrong with it.
-type Label = { points: List<Int>, wrong: List<Why> }
+type Label = { points: List<Int>, wrong: List<ErrorKind> }
 
 /// `label` converted and checked: read from Punycode where it opens `xn--`, and held to the
 /// validity criteria.
-fn converted(table: Held, label: List<Int>, options: Options) -> Label / {abort.raise} =
+fn convert_label(table: IdnaTable, label: List<Int>, options: Options) -> Label / {abort.raise} =
   if !is_ace(label) { { points: label, wrong: faults(table, label, options, false) } }
   else if !is_ascii(label) { { points: label, wrong: [Punycode] } } else {
     let encoded = text_of(label.drop(4));
@@ -402,12 +402,12 @@ fn converted(table: Held, label: List<Int>, options: Options) -> Label / {abort.
 
 /// Section 4 of UTS #46: `domain` mapped, normalized, cut into labels, and each label converted
 /// and checked, with the Bidi rule over them all.
-fn processed(domain: String, options: Options) -> List<Label> / {abort.raise} = {
-  let table = held();
+fn process_domain(domain: String, options: Options) -> List<Label> / {abort.raise} = {
+  let table = idna_table();
   let mapped = domain.chars().fold([], |out: List<Int>, c: Char|
     mapped_into(table, out, Int::of_char(c)));
   let labels = labels_of(points_of(unicode::nfc(text_of(mapped)))).map(|label: List<Int>|
-    converted(table, label, options));
+    convert_label(table, label, options));
   let classes = labels.map(|l: Label|
     l.points.map(|cp: Int| bidi_of(ucd::lookup(table.words, cp))));
   if !options.check_bidi || !classes.any(has_rtl) { labels } else {
@@ -421,8 +421,10 @@ fn processed(domain: String, options: Options) -> List<Label> / {abort.raise} = 
 
 fn problems_of(labels: List<Label>) -> List<Problem> =
   range(0, labels.len()).fold([], |found: List<Problem>, i: Int|
-    labels.at_or(i, { points: [], wrong: [] }).wrong.fold(found, |all: List<Problem>, why: Why|
-      all.push({ label: i, why: why })))
+    labels.at_or(i, { points: [], wrong: [] }).wrong.fold(
+      found,
+      |all: List<Problem>, why: ErrorKind| all.push({ label: i, reason: why }),
+    ))
 
 fn dotted(labels: List<String>) -> String =
   labels.drop(1).fold(labels.at_or(0, ""), |name: String, label: String| name ++ "." ++ label)
@@ -430,16 +432,16 @@ fn dotted(labels: List<String>) -> String =
 /// `domain` as it is shown: mapped, normalized, and every `xn--` label that is Punycode read.
 /// The name is answered whatever is wrong with it, a label that could not be read as it was
 /// written, beside every problem found.
-pub fn to_unicode(domain: String, options: Options) -> Converted / {abort.raise} = {
-  let labels = processed(domain, options);
+pub fn to_unicode(domain: String, options: Options) -> ConversionResult / {abort.raise} = {
+  let labels = process_domain(domain, options);
   { name: dotted(labels.map(|l: Label| text_of(l.points))), problems: problems_of(labels) }
 }
 
 /// `domain` as it is on the wire: `to_unicode`'s name with every label that is not ASCII written
-/// as Punycode after `xn--`. Raises `idna.refused` with every problem found, the lengths among
+/// as Punycode after `xn--`. Raises `idna.fail` with every problem found, the lengths among
 /// them under `verify_dns_length`.
-pub fn ascii(domain: String, options: Options) -> String / {idna.refused, abort.raise} = {
-  let labels = processed(domain, options);
+pub fn ascii(domain: String, options: Options) -> String / {idna.fail, abort.raise} = {
+  let labels = process_domain(domain, options);
   let written = labels.map(|l: Label|
     if is_ascii(l.points) { text_of(l.points) }
     else { "xn--" ++ punycode::encode(text_of(l.points)) });
@@ -447,18 +449,18 @@ pub fn ascii(domain: String, options: Options) -> String / {idna.refused, abort.
   let lengths = if !options.verify_dns_length { [] } else {
     range(0, written.len()).fold([], |found: List<Problem>, i: Int| {
       let length = written.at_or(i, "").len();
-      if length == 0 { found.push({ label: i, why: EmptyLabel }) }
-      else if length > 63 { found.push({ label: i, why: LongLabel }) }
+      if length == 0 { found.push({ label: i, reason: EmptyLabel }) }
+      else if length > 63 { found.push({ label: i, reason: LongLabel }) }
       else { found }
     }).concat(
       // The root's empty label and its full stop are not counted.
       if name.len() - (if name.ends_with(".") { 1 } else { 0 }) > 253 {
-        [{ label: -1, why: LongName }]
+        [{ label: -1, reason: LongName }]
       } else { [] },
     )
   };
   let problems = problems_of(labels).concat(lengths);
-  if problems.len() > 0 { idna.refused(problems) } else { name }
+  if problems.len() > 0 { idna.fail(problems) } else { name }
 }
 
 /// `ascii`, answering the problems instead of raising them.
@@ -520,7 +522,7 @@ test "a name on the wire converts to itself, and is shown as the name it came fr
 
 test "any text has an answer, and one that converts under every check converts under the web's" {
   gen::check(gen::any_int(), |seed: Int| {
-    let text = drawn_text(seed);
+    let text = sample_text(seed);
     match to_ascii(text, strict()) {
       Err(problems) -> problems.len() > 0,
       Ok(wire) -> to_ascii(text, web()) == Ok(wire) && to_unicode(text, web()).problems.len() == 0,
@@ -588,27 +590,27 @@ type Wrong = { written: String, problems: List<Problem> }
 
 fn wrong() -> List<Wrong> =
   [
-    { written: "-a.example", problems: [{ label: 0, why: Hyphens }] },
-    { written: "a-.example", problems: [{ label: 0, why: Hyphens }] },
-    { written: "ab--c.example", problems: [{ label: 0, why: Hyphens }] },
-    { written: "a_b.example", problems: [{ label: 0, why: Disallowed }] },
-    { written: "a b.example", problems: [{ label: 0, why: Disallowed }] },
-    { written: "a..b", problems: [{ label: 1, why: EmptyLabel }] },
-    { written: "example.com.", problems: [{ label: 2, why: EmptyLabel }] },
-    { written: "", problems: [{ label: 0, why: EmptyLabel }] },
-    { written: "xn--a.example", problems: [{ label: 0, why: Disallowed }] },
-    { written: "xn--abc-.example", problems: [{ label: 0, why: Punycode }] },
+    { written: "-a.example", problems: [{ label: 0, reason: Hyphens }] },
+    { written: "a-.example", problems: [{ label: 0, reason: Hyphens }] },
+    { written: "ab--c.example", problems: [{ label: 0, reason: Hyphens }] },
+    { written: "a_b.example", problems: [{ label: 0, reason: Disallowed }] },
+    { written: "a b.example", problems: [{ label: 0, reason: Disallowed }] },
+    { written: "a..b", problems: [{ label: 1, reason: EmptyLabel }] },
+    { written: "example.com.", problems: [{ label: 2, reason: EmptyLabel }] },
+    { written: "", problems: [{ label: 0, reason: EmptyLabel }] },
+    { written: "xn--a.example", problems: [{ label: 0, reason: Disallowed }] },
+    { written: "xn--abc-.example", problems: [{ label: 0, reason: Punycode }] },
     {
       written: "xn--.example",
-      problems: [{ label: 0, why: Punycode }, { label: 0, why: EmptyLabel }],
+      problems: [{ label: 0, reason: Punycode }, { label: 0, reason: EmptyLabel }],
     },
-    { written: "xn--bcher-kva\u{FC}.example", problems: [{ label: 0, why: Punycode }] },
-    { written: "xn--bcher-kv.example", problems: [{ label: 0, why: Punycode }] },
-    { written: "a.\u{301}b", problems: [{ label: 1, why: LeadingMark }] },
-    { written: "a\u{200D}b.example", problems: [{ label: 0, why: Joiner }] },
-    { written: "\u{5D0}a.example", problems: [{ label: 0, why: Bidi }] },
-    { written: "a.1\u{5D0}", problems: [{ label: 1, why: Bidi }] },
-    { written: "\u{FFFD}.example", problems: [{ label: 0, why: Disallowed }] },
+    { written: "xn--bcher-kva\u{FC}.example", problems: [{ label: 0, reason: Punycode }] },
+    { written: "xn--bcher-kv.example", problems: [{ label: 0, reason: Punycode }] },
+    { written: "a.\u{301}b", problems: [{ label: 1, reason: LeadingMark }] },
+    { written: "a\u{200D}b.example", problems: [{ label: 0, reason: Joiner }] },
+    { written: "\u{5D0}a.example", problems: [{ label: 0, reason: Bidi }] },
+    { written: "a.1\u{5D0}", problems: [{ label: 1, reason: Bidi }] },
+    { written: "\u{FFFD}.example", problems: [{ label: 0, reason: Disallowed }] },
   ]
 
 test "{c.written} is refused for what is wrong with it" for c: Wrong in wrong() {
@@ -618,11 +620,11 @@ test "{c.written} is refused for what is wrong with it" for c: Wrong in wrong() 
 test "a label is at most 63 characters on the wire and a name at most 253" {
   let label = |n: Int| String::of_chars(range(0, n).map(|_: Int| 'a'));
   assert_eq(to_ascii(label(63) ++ ".example", strict()), Ok(label(63) ++ ".example"));
-  assert_eq(to_ascii(label(64) ++ ".example", strict()), Err([{ label: 0, why: LongLabel }]));
+  assert_eq(to_ascii(label(64) ++ ".example", strict()), Err([{ label: 0, reason: LongLabel }]));
   let long = dotted([label(63), label(63), label(63), label(61)]);
   assert_eq(long.len(), 253);
   assert_eq(to_ascii(long, strict()), Ok(long));
-  assert_eq(to_ascii(long ++ "a", strict()), Err([{ label: -1, why: LongName }]));
+  assert_eq(to_ascii(long ++ "a", strict()), Err([{ label: -1, reason: LongName }]));
   assert_eq(to_ascii(label(64) ++ ".example", web()), Ok(label(64) ++ ".example"))
 }
 
@@ -634,18 +636,18 @@ test "the web's checks let through what names in use break, and keep the rest" {
     Ok("r3---sn-apo3qvuoxuxbt-j5pe.googlevideo.com"),
   );
   assert_eq(to_ascii("example.com.", web()), Ok("example.com."));
-  assert_eq(to_ascii("a\u{200D}b.example", web()), Err([{ label: 0, why: Joiner }]));
-  assert_eq(to_ascii("xn--bcher-kv.example", web()), Err([{ label: 0, why: Punycode }]))
+  assert_eq(to_ascii("a\u{200D}b.example", web()), Err([{ label: 0, reason: Joiner }]));
+  assert_eq(to_ascii("xn--bcher-kv.example", web()), Err([{ label: 0, reason: Punycode }]))
 }
 
 test "a wrong name is still shown, with what is wrong with it" {
   assert_eq(to_unicode("xn--bcher-kv.EXAMPLE", strict()), {
     name: "xn--bcher-kv.example",
-    problems: [{ label: 0, why: Punycode }],
+    problems: [{ label: 0, reason: Punycode }],
   });
   assert_eq(to_unicode("-B\u{DC}CHER.example", strict()), {
     name: "-b\u{FC}cher.example",
-    problems: [{ label: 0, why: Hyphens }],
+    problems: [{ label: 0, reason: Hyphens }],
   });
   assert_eq(to_unicode("a..b", strict()), { name: "a..b", problems: [] })
 }
@@ -654,6 +656,8 @@ test "a joiner stands after a virama, and a non-joiner between letters that join
   assert_eq(to_unicode("\u{915}\u{94D}\u{200D}\u{937}", strict()).problems, []);
   assert_eq(to_unicode("\u{915}\u{94D}\u{200C}\u{937}", strict()).problems, []);
   assert_eq(to_unicode("\u{628}\u{200C}\u{628}", strict()).problems, []);
-  assert_eq(to_unicode("\u{628}\u{200D}\u{628}", strict()).problems, [{ label: 0, why: Joiner }]);
-  assert_eq(to_unicode("a\u{200C}b", strict()).problems, [{ label: 0, why: Joiner }])
+  assert_eq(to_unicode("\u{628}\u{200D}\u{628}", strict()).problems, [
+    { label: 0, reason: Joiner },
+  ]);
+  assert_eq(to_unicode("a\u{200C}b", strict()).problems, [{ label: 0, reason: Joiner }])
 }

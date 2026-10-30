@@ -1,12 +1,13 @@
 //! Derivability: whether a type admits what a constraint or a `derive` asks of it.
 
 import compiler.syntax.parsing (Span)
-import compiler.syntax.items (Item, IFn, FnDef, Deriver, DEq, DOrd, DShow, DHash, DNumeric,
-                              DInteger, is_predicate, deriver_text, deriver_tag, IInstance,
-                              InstanceKind, NKey, NShow)
-import compiler.check.types (Type, TyVar, TyCon, TyRecord, TyFn, Field, ints_insert, ints_union,
-                             is_rigid_ty, type_text, printer_new, print_ty, TyNominal, arg_label,
-                             arg_row)
+import compiler.syntax.items (Item, FunctionItem, FnDef, Deriver, EqDeriver, OrdDeriver,
+                              ShowDeriver, HashDeriver, NumericDeriver, IntegerDeriver,
+                              is_predicate, deriver_text, deriver_tag, InstanceItem, InstanceKind,
+                              KeyInstance, ShowInstance)
+import compiler.check.types (Type, VariableType, NamedType, RecordType, FunctionType, Field,
+                             ints_insert, ints_union, is_rigid_ty, type_text, printer_new, print_ty,
+                             NominalType, arg_label, arg_row)
 import compiler.check.resolve.tables (Diag, Label, qualify, default_binder, error_at, label_at)
 import compiler.check.typed (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
 import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat,
@@ -15,15 +16,16 @@ import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, HoldsHan
 import std.bytes
 import std.option
 import std.string
-import compiler.check.infer.checker (RecordDecl, OpInfo, EffectInfo, InstanceInfo, Assumed,
+import compiler.check.infer.checker (RecordDecl, OpInfo, EffectInfo, InstanceInfo, Assumption,
                                      RigidParam, MapKeySite, ConstraintSite, DefConstraint,
-                                     StatedHint, insert_constraint, Checker, report,
-                                     report_error_at, err_labels, what_of, resolve, Blocked,
-                                     AlgebraicShape, Shapes, derivable, ord_needs, vars_of_type)
+                                     AliasConstraint, insert_constraint, Checker, report,
+                                     report_error_at, report_error_with_labels, deriver_description,
+                                     resolve, Blocker, AlgebraicShape, Shapes, derivable,
+                                     order_needs, vars_of_type)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (assume, written_signature, OrderedPart, note_parts,
-                                          note_stated_site)
-import compiler.check.infer.expr (op_free_vars, numeric_of, ordered_parts, note_stated_in)
+                                          note_type_constraint)
+import compiler.check.infer.expr (op_free_vars, numeric_of, ordered_parts, note_type_constraints_in)
 import compiler.check.known (is_integer_name, is_float, is_decimal)
 import compiler.check.infer.definitions (algebraic_shapes, is_key)
 
@@ -42,7 +44,7 @@ pub fn native_notes(blocker: Bytes, deriver: Deriver) -> List<Bytes> =
       b"`",
       blocker,
       b"` is an `extern type`: the toolchain lays out its values, and gives them no ",
-      what_of(deriver),
+      deriver_description(deriver),
     ]),
   ]
 
@@ -53,7 +55,7 @@ pub fn secret_notes(deriver: Deriver) -> List<Bytes> =
   }
 
 /// The simple name of the handle type a `HoldsHandle` refused: `Hold`, `Task` or `Chan`.
-pub fn handle_what(ty: Type) -> Bytes = match ty { TyCon(c) -> c.name, _ -> b"" }
+pub fn handle_type_name(ty: Type) -> Bytes = match ty { NamedType(c) -> c.name, _ -> b"" }
 
 /// The parameter name a refused rigid variable was declared under, else the rendered variable.
 fn param_name(params: List<RigidParam>, v: Int, fallback: Bytes) -> Bytes =
@@ -61,7 +63,7 @@ fn param_name(params: List<RigidParam>, v: Int, fallback: Bytes) -> Bytes =
 
 fn why_notes_for_map_key(
   w: DeriveRefusal,
-  b: Blocked,
+  b: Blocker,
   blocker: Bytes,
   params: List<RigidParam>,
 ) -> List<Bytes> =
@@ -76,12 +78,12 @@ fn why_notes_for_map_key(
       [
         Bytes::concat_all([
           b"a `",
-          handle_what(b.ty),
+          handle_type_name(b.ty),
           b"` names a location rather than a value, so two of them have no order",
         ]),
       ],
-    HoldsSecret -> secret_notes(DOrd),
-    HoldsNative -> native_notes(blocker, DOrd),
+    HoldsSecret -> secret_notes(OrdDeriver),
+    HoldsNative -> native_notes(blocker, OrdDeriver),
     Unconstrained(v) ->
       [
         Bytes::concat_all([
@@ -95,7 +97,7 @@ fn why_notes_for_map_key(
 fn why_notes_for_constraint(
   w: DeriveRefusal,
   deriver: Deriver,
-  b: Blocked,
+  b: Blocker,
   blocker: Bytes,
   params: List<RigidParam>,
 ) -> List<Bytes> =
@@ -106,14 +108,14 @@ fn why_notes_for_constraint(
           b"`",
           blocker,
           b"` is a function, and a function has no ",
-          what_of(deriver),
+          deriver_description(deriver),
         ]),
       ],
     HoldsHandle ->
       [
         Bytes::concat_all([
           b"a `",
-          handle_what(b.ty),
+          handle_type_name(b.ty),
           b"` names a location rather than a value, so it has no encoding",
         ]),
       ],
@@ -141,7 +143,7 @@ fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
       let m = checker.modules.get(i);
       m.module.items.fold(acc, |shapes: Shapes, item: Item|
         match item {
-          IInstance(def) -> if !is_key(def.kind) { shapes } else {
+          InstanceItem(def) -> if !is_key(def.kind) { shapes } else {
             let type_name = qualify(m.name, def.target.name);
             match shapes.get(type_name) {
               None -> shapes,
@@ -150,7 +152,7 @@ fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
                   match found {
                     Some(_) -> found,
                     None -> match it {
-                      IFn(f) -> if f.name.name == def.by.name { Some(f) } else { None },
+                      FunctionItem(f) -> if f.name.name == def.by.name { Some(f) } else { None },
                       _ -> None,
                     },
                   });
@@ -163,7 +165,7 @@ fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
                       Some(p) -> match own_params(p, type_name) {
                         Some(own) -> if vars_of_type(s.sig.ret).all(|v: Int|
                             own.params.contains(v)) {
-                          Some({ params: own.params, rows: own.rows, answer: s.sig.ret })
+                          Some({ params: own.params, rows: own.rows, result: s.sig.ret })
                         } else { None },
                         None -> None,
                       },
@@ -171,7 +173,7 @@ fn ordering_shapes(checker: Checker) -> Shapes / {abort.raise} =
                   },
                 };
                 shapes.insert(type_name, match answered {
-                  Some(a) -> { ..shape, params: a.params, rows: a.rows, fields: [a.answer] },
+                  Some(a) -> { ..shape, params: a.params, rows: a.rows, fields: [a.result] },
                   None -> { ..shape, fields: [] },
                 })
               },
@@ -188,28 +190,28 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
   let ordering = ordering_shapes(checker);
   let sums = algebraic_shapes(checker).fold(
     [],
-    |acc: List<Holding>, name: Bytes, s: AlgebraicShape|
+    |acc: List<TypeContents>, name: Bytes, s: AlgebraicShape|
       acc.push({ name: name, params: s.params, fields: s.fields }),
   );
-  let held = checker.nominals.fold(sums, |acc: List<Holding>, name: Bytes, r: RecordDecl|
+  let held = checker.nominals.fold(sums, |acc: List<TypeContents>, name: Bytes, r: RecordDecl|
     match r.ty {
-      TyNominal(n) ->
+      NominalType(n) ->
         acc.push({ name: name, params: r.ty_vars, fields: n.fields.map(|f: Field| f.ty) }),
       _ -> acc,
     });
-  let carrying = carrying_of(held.filter(|h: Holding| h.params.len() > 0), ordering);
+  let carrying = ordered_params_of(held.filter(|h: TypeContents| h.params.len() > 0), ordering);
   // A type carries what its `where` states, and what a type its fields mention states of an
   // argument a parameter of its own sits in, there or through the aliases the fields expanded.
-  let stated = stated_carrying(held, checker.stated, checker.stated_hints);
-  let declared: Checker = held.fold({ ..checker, stated: stated }, |c: Checker, h: Holding|
+  let stated = declared_type_constraints(held, checker.stated, checker.alias_constraints);
+  let declared: Checker = held.fold({ ..checker, stated: stated }, |c: Checker, h: TypeContents|
     match c.types.get(h.name) {
       None -> c,
       Some(decl) -> {
         let noted = h.fields.fold({ ..c, module: decl.owner }, |cc: Checker, f: Type|
-          note_stated_in(cc, decl.span, f));
-        let hinted = c.stated_hints.fold(noted, |cc: Checker, hint: StatedHint|
+          note_type_constraints_in(cc, decl.span, f));
+        let hinted = c.alias_constraints.fold(noted, |cc: Checker, hint: AliasConstraint|
           if hint.on != h.name { cc }
-          else { note_stated_site(cc, decl.span, hint.deriver, hint.ty, hint.from, true) });
+          else { note_type_constraint(cc, decl.span, hint.deriver, hint.ty, hint.from, true) });
         { ..hinted, module: c.module }
       },
     });
@@ -222,15 +224,15 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
     );
   let typed = held.fold(
     { ..declared, ordering: ordering, carrying: carrying, aliases: Map::new() },
-    |c: Checker, h: Holding|
+    |c: Checker, h: TypeContents|
       match c.types.get(h.name) {
         None -> c,
-        Some(decl) -> judged_at(c, decl.owner, decl.span, h.params, carried_in(h.fields)),
+        Some(decl) -> note_parts_at(c, decl.owner, decl.span, h.params, carried_in(h.fields)),
       },
   );
   typed.effects.fold(typed, |c: Checker, e: EffectInfo|
-    e.ops.fold(c, |cc: Checker, op: OpInfo|
-      judged_at(
+    e.operations.fold(c, |cc: Checker, op: OpInfo|
+      note_parts_at(
         cc,
         op.at.module,
         op.at.span,
@@ -241,7 +243,7 @@ pub fn with_orders(checker: Checker) -> Checker / {abort.raise} = {
 
 /// `parts` of what `module` declares at `span`, judged with `params` assumed ordered: what those
 /// stand for is each use's to meet.
-fn judged_at(
+fn note_parts_at(
   checker: Checker,
   module: Int,
   span: Span,
@@ -253,7 +255,7 @@ fn judged_at(
       {
         ..checker,
         module: module,
-        assumed: params.fold([], |xs: List<Assumed>, v: Int| assume(xs, DOrd, v)),
+        assumed: params.fold([], |xs: List<Assumption>, v: Int| assume(xs, OrdDeriver, v)),
       },
       span,
       parts,
@@ -263,65 +265,70 @@ fn judged_at(
 
 /// A declared type as what its values hold: its parameters and the type of everything a value of it
 /// may hold.
-type Holding = { name: Bytes, params: List<Int>, fields: List<Type> }
+type TypeContents = { name: Bytes, params: List<Int>, fields: List<Type> }
 
 /// A constraint a type carries of one of its parameters, before the parameter's position names it.
-type StatedVar = { deriver: Deriver, var: Int }
+type VariableConstraint = { deriver: Deriver, var: Int }
 
-fn push_stated(xs: List<StatedVar>, deriver: Deriver, v: Int) -> List<StatedVar> =
-  if xs.any(|x: StatedVar| x.var == v && x.deriver == deriver) { xs }
+fn push_constraint(
+  xs: List<VariableConstraint>,
+  deriver: Deriver,
+  v: Int,
+) -> List<VariableConstraint> =
+  if xs.any(|x: VariableConstraint| x.var == v && x.deriver == deriver) { xs }
   else { xs.push({ deriver: deriver, var: v }) }
 
 /// The constraints the types mentioned in `t` state of the variables their arguments hold.
-fn stated_vars(
+fn variable_constraints(
   table: Map<Bytes, List<DefConstraint>>,
   t: Type,
-  out: List<StatedVar>,
-) -> List<StatedVar> / {abort.raise} = {
+  out: List<VariableConstraint>,
+) -> List<VariableConstraint> / {abort.raise} = {
   let carried = |name: Bytes, args: List<Type>|
     match table.get(name) {
       None -> out,
       Some(cs) ->
-        cs.fold(out, |acc: List<StatedVar>, dc: DefConstraint|
+        cs.fold(out, |acc: List<VariableConstraint>, dc: DefConstraint|
           match args.at(dc.param) {
             None -> acc,
             Some(a) ->
-              vars_of_type(a).fold(acc, |b: List<StatedVar>, v: Int| push_stated(b, dc.deriver, v)),
+              vars_of_type(a).fold(acc, |b: List<VariableConstraint>, v: Int|
+                push_constraint(b, dc.deriver, v)),
           }),
     };
-  let within = |tys: List<Type>, acc: List<StatedVar>|
-    tys.fold(acc, |a: List<StatedVar>, ty: Type| stated_vars(table, ty, a));
+  let within = |tys: List<Type>, acc: List<VariableConstraint>|
+    tys.fold(acc, |a: List<VariableConstraint>, ty: Type| variable_constraints(table, ty, a));
   match t {
-    TyCon(c) -> within(c.args, carried(c.name, c.args)),
-    TyNominal(n) -> within(n.args, carried(n.name, n.args)),
-    TyRecord(fs) -> within(fs.map(|f: Field| f.ty), out),
-    TyFn(f) -> within(f.params.push(f.ret), out),
-    TyVar(_) -> out,
+    NamedType(c) -> within(c.args, carried(c.name, c.args)),
+    NominalType(n) -> within(n.args, carried(n.name, n.args)),
+    RecordType(fs) -> within(fs.map(|f: Field| f.ty), out),
+    FunctionType(f) -> within(f.params.push(f.ret), out),
+    VariableType(_) -> out,
   }
 }
 
 /// Each declared type's stated constraints: what its `where` writes, plus what a type its fields
 /// mention states of an argument a parameter of its own sits in — the least table that holds of
 /// itself, so a type that holds itself is read whole.
-fn stated_carrying(
-  held: List<Holding>,
+fn declared_type_constraints(
+  held: List<TypeContents>,
   seeds: Map<Bytes, List<DefConstraint>>,
-  hints: List<StatedHint>,
+  hints: List<AliasConstraint>,
 ) -> Map<Bytes, List<DefConstraint>> / {abort.raise} = {
-  let room = held.fold(2, |n: Int, h: Holding| n + h.params.len());
+  let room = held.fold(2, |n: Int, h: TypeContents| n + h.params.len());
   iterate(seeds, room, |table: Map<Bytes, List<DefConstraint>>| {
     let next = held.fold(
       { table: table, grew: false },
-      |acc: { table: Map<Bytes, List<DefConstraint>>, grew: Bool }, h: Holding| {
-        let needed = h.fields.fold([], |vs: List<StatedVar>, f: Type|
-          stated_vars(acc.table, f, vs));
-        let all = hints.fold(needed, |vs: List<StatedVar>, hint: StatedHint|
+      |acc: { table: Map<Bytes, List<DefConstraint>>, grew: Bool }, h: TypeContents| {
+        let needed = h.fields.fold([], |vs: List<VariableConstraint>, f: Type|
+          variable_constraints(acc.table, f, vs));
+        let all = hints.fold(needed, |vs: List<VariableConstraint>, hint: AliasConstraint|
           if hint.on != h.name { vs } else {
-            vars_of_type(hint.ty).fold(vs, |b: List<StatedVar>, v: Int|
-              push_stated(b, hint.deriver, v))
+            vars_of_type(hint.ty).fold(vs, |b: List<VariableConstraint>, v: Int|
+              push_constraint(b, hint.deriver, v))
           });
         let had = match acc.table.get(h.name) { Some(xs) -> xs, None -> [] };
-        let added = all.fold(had, |cs: List<DefConstraint>, x: StatedVar|
+        let added = all.fold(had, |cs: List<DefConstraint>, x: VariableConstraint|
           match h.params.find_index(|p: Int| p == x.var) {
             None -> cs,
             Some(i) -> if cs.any(|c: DefConstraint| c.param == i && c.deriver == x.deriver) { cs }
@@ -338,15 +345,18 @@ fn stated_carrying(
 /// The positions of the parameters each declared type needs ordered, because what it holds keys a
 /// `Map` by them, there or in a declared type it holds: the least table that holds of itself, so a
 /// type that holds itself is read whole.
-fn carrying_of(held: List<Holding>, ordering: Shapes) -> Map<Bytes, List<Int>> / {abort.raise} = {
-  let room = held.fold(2, |n: Int, h: Holding| n + h.params.len());
+fn ordered_params_of(
+  held: List<TypeContents>,
+  ordering: Shapes,
+) -> Map<Bytes, List<Int>> / {abort.raise} = {
+  let room = held.fold(2, |n: Int, h: TypeContents| n + h.params.len());
   iterate(Map::new(), room, |table: Map<Bytes, List<Int>>| {
     let next = held.fold(
       { table: table, grew: false },
-      |acc: { table: Map<Bytes, List<Int>>, grew: Bool }, h: Holding| {
+      |acc: { table: Map<Bytes, List<Int>>, grew: Bool }, h: TypeContents| {
         let needed = h.fields.fold([], |vs: List<Int>, f: Type|
           ordered_parts(acc.table, f, []).fold(vs, |ws: List<Int>, p: OrderedPart|
-            ints_union(ws, ord_needs(p.key, ordering))));
+            ints_union(ws, order_needs(p.key, ordering))));
         let ps = positions_among(h.params, needed);
         let had = match acc.table.get(h.name) { Some(xs) -> xs, None -> [] };
         if ps.len() == had.len() { acc }
@@ -362,12 +372,12 @@ fn positions_among(vars: List<Int>, keyed: List<Int>) -> List<Int> =
     match vars.at(i) { Some(v) -> keyed.contains(v), None -> false })
 
 pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
-  let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), DOrd);
+  let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), OrdDeriver);
   let walked = checker.map_keys.fold(
     { checker: { ..checker, map_keys: [] }, seen: [] },
     |acc: { checker: Checker, seen: List<SeenKey> }, site: MapKeySite| {
       let key = resolve(acc.checker, site.key);
-      match derivable(DOrd, key, ordered, with_flexible(acc.checker, key, site.assumed)) {
+      match derivable(OrdDeriver, key, ordered, with_flexible(acc.checker, key, site.assumed)) {
         None -> acc,
         Some(blocked) -> {
           let pr = print_ty(printer_new(), resolve(acc.checker, site.whole));
@@ -404,8 +414,8 @@ pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
                         b"`",
                       ]),
                   },
-                  alias_noted(
-                    why_notes_for_map_key(blocked.why, blocked, blocker, site.params),
+                  with_alias_note(
+                    why_notes_for_map_key(blocked.reason, blocked, blocker, site.params),
                     site.via,
                   ).concat(match site.carrier {
                     None -> [],
@@ -434,7 +444,7 @@ pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
 /// A key `check_map_keys` refused in `scope`, what blocked it, and whether a carrier asked it.
 type SeenKey = { scope: Int, text: Bytes, blocker: Bytes, carried: Bool }
 
-fn alias_noted(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
+fn with_alias_note(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
   if via == b"" { notes } else {
     notes.push(
       Bytes::concat_all([b"`", via, b"` is a type alias, and the `Map` is in what it names"]),
@@ -442,7 +452,7 @@ fn alias_noted(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
   }
 
 /// A case is told from another by what it holds, so its type is read through no `key`.
-fn of_case(site: ConstraintSite) -> Bool =
+fn is_case_constraint(site: ConstraintSite) -> Bool =
   site.callee == b"std.cases.listed" || site.callee == b"std.cases.chosen"
 
 pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
@@ -457,7 +467,12 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
       } else {
         let through = shapes_for(shapes, site.deriver);
         let assumed = with_flexible(acc.checker, ty, site.assumed);
-        match derivable(site.deriver, ty, if of_case(site) { adts } else { through }, assumed) {
+        match derivable(
+            site.deriver,
+            ty,
+            if is_case_constraint(site) { adts } else { through },
+            assumed,
+          ) {
           None -> acc,
           Some(blocked) -> {
             let pr = print_ty(printer_new(), ty);
@@ -478,7 +493,7 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
               let callee = default_binder(site.callee);
               let dv = deriver_text(site.deriver);
               {
-                checker: err_labels(
+                checker: report_error_with_labels(
                   acc.checker,
                   b"E0206",
                   Bytes::concat_all([b"`", rendered, b"` cannot be derived for `", dv, b"`"]),
@@ -512,13 +527,14 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
                     ),
                   ],
                   why_notes_for_constraint(
-                    blocked.why,
+                    blocked.reason,
                     site.deriver,
                     blocked,
                     blocker,
                     site.params,
                   ).concat(
-                    if of_case(site) && derivable(site.deriver, ty, through, assumed) == None {
+                    if is_case_constraint(site)
+                        && derivable(site.deriver, ty, through, assumed) == None {
                       [
                         b"a case is told from another by what it holds, so a `key` does not stand in for the type that states it",
                       ]
@@ -547,7 +563,7 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
 /// where `ty` meets no such constraint.
 pub fn settled_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
   match ty {
-    TyVar(v) -> match checker.witnessed.get(v) {
+    VariableType(v) -> match checker.witnessed.get(v) {
       Some(w) -> Some(ParamWitness(w.param)),
       None -> None,
     },
@@ -557,15 +573,15 @@ pub fn settled_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<N
 /// The witness the numeric type `ty` passes for `deriver`, or the type that states its arithmetic.
 fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
   match ty {
-    TyCon(k) -> if k.args.len() != 0 { None }
+    NamedType(k) -> if k.args.len() != 0 { None }
     else if is_integer_name(k.name) { Some(ConcreteWitness(k.name)) }
-    else if deriver == DNumeric && (is_float(ty) || is_decimal(ty)) {
+    else if deriver == NumericDeriver && (is_float(ty) || is_decimal(ty)) {
       Some(ConcreteWitness(k.name))
     }
     // `numeric(a)` holds the ordered comparisons, which a type takes from its `key`.
-    else if deriver == DNumeric {
+    else if deriver == NumericDeriver {
       match numeric_of(checker.numeric_types, k.name) {
-        Some(x) -> match instance_of(checker.instances, k.name, NKey) {
+        Some(x) -> match instance_of(checker.instances, k.name, KeyInstance) {
           Some(_) -> Some(StatedWitness(x.ctor)),
           None -> None,
         },
@@ -578,7 +594,7 @@ fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<Nume
 /// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
 fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
   match ty {
-    TyVar(v) -> if !site.assumed.contains(v) { None } else {
+    VariableType(v) -> if !site.assumed.contains(v) { None } else {
       match site.params.fold(None, |acc: Option<Bytes>, r: RigidParam|
           if r.var == v { Some(r.name) } else { acc }) {
         Some(name) -> Some(ParamWitness(name)),
@@ -617,7 +633,7 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
     match predicate_witness(checker, site, ty) {
       Some(_) -> checker,
       None -> match ty {
-        TyVar(v) -> if is_rigid_ty(checker.subst, v) {
+        VariableType(v) -> if is_rigid_ty(checker.subst, v) {
           report_error_at(
             { ..checker, module: site.module },
             b"E0201",
@@ -650,17 +666,17 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
             Bytes::concat_all([
               b"`",
               type_text(ty),
-              if site.deriver == DInteger { b"` is not an integer type" }
+              if site.deriver == IntegerDeriver { b"` is not an integer type" }
               else { b"` is not a numeric type" },
             ]),
             Bytes::concat_all([b"`", callee, b"` requires `", dv, b"(\xc2\xb7)` here"]),
-            if site.deriver == DInteger {
+            if site.deriver == IntegerDeriver {
               [b"the integer types are `Int` and the eight fixed-width integers"]
             } else {
               [
                 b"the numeric types are `Int`, the eight fixed-width integers, `Float`, `Decimal`, and a type that states `numeric` and a `key`",
               ].concat(match ty {
-                TyCon(k) -> match numeric_of(checker.numeric_types, k.name) {
+                NamedType(k) -> match numeric_of(checker.numeric_types, k.name) {
                   Some(_) ->
                     [
                       Bytes::concat_all([
@@ -702,10 +718,14 @@ pub fn instance_of(
 
 /// Whether a type that states a `key` is read through it for `deriver`: compared, ordered and hashed
 /// as what its key answers is, whatever it holds.
-fn through_key(deriver: Deriver) -> Bool = deriver == DEq || deriver == DOrd || deriver == DHash
+fn compares_through_key(deriver: Deriver) -> Bool =
+  deriver == EqDeriver || deriver == OrdDeriver || deriver == HashDeriver
 
 /// Each type's first statement of one kind, by the type's name.
-fn stated_by_type(instances: List<InstanceInfo>, kind: InstanceKind) -> Map<Bytes, InstanceInfo> =
+fn instances_by_type(
+  instances: List<InstanceInfo>,
+  kind: InstanceKind,
+) -> Map<Bytes, InstanceInfo> =
   instances.fold(Map::new(), |acc: Map<Bytes, InstanceInfo>, x: InstanceInfo|
     if x.kind != kind || acc.contains(x.type_name) { acc } else { acc.insert(x.type_name, x) })
 
@@ -714,9 +734,9 @@ fn stated_by_type(instances: List<InstanceInfo>, kind: InstanceKind) -> Map<Byte
 /// shown. An invariant changes what no deriver reads.
 pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
   if instances.len() == 0 { adts } else {
-    let keyed = through_key(deriver);
-    if !keyed && !(deriver == DShow) { adts } else {
-      let stated = stated_by_type(instances, if keyed { NKey } else { NShow });
+    let keyed = compares_through_key(deriver);
+    if !keyed && !(deriver == ShowDeriver) { adts } else {
+      let stated = instances_by_type(instances, if keyed { KeyInstance } else { ShowInstance });
       adts.fold(adts, |acc: Shapes, name: Bytes, shape: AlgebraicShape|
         match stated.get(name) {
           Some(x) ->
@@ -724,7 +744,7 @@ pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Der
               ..shape,
               params: x.params,
               rows: x.rows,
-              fields: if keyed { [x.answers] } else { [] },
+              fields: if keyed { [x.results] } else { [] },
             }),
           None -> acc,
         })
@@ -737,13 +757,13 @@ type DeriverShapes = { plain: Shapes, keyed: Shapes, shown: Shapes }
 pub fn deriver_shapes(instances: List<InstanceInfo>, adts: Shapes) -> DeriverShapes =
   {
     plain: adts,
-    keyed: instance_shapes(instances, adts, DEq),
-    shown: instance_shapes(instances, adts, DShow),
+    keyed: instance_shapes(instances, adts, EqDeriver),
+    shown: instance_shapes(instances, adts, ShowDeriver),
   }
 
 pub fn shapes_for(shapes: DeriverShapes, deriver: Deriver) -> Shapes =
-  if through_key(deriver) { shapes.keyed }
-  else if deriver == DShow { shapes.shown }
+  if compares_through_key(deriver) { shapes.keyed }
+  else if deriver == ShowDeriver { shapes.shown }
   else { shapes.plain }
 
 pub type OwnParams = { params: List<Int>, rows: List<Int> }
@@ -752,7 +772,7 @@ pub type OwnParams = { params: List<Int>, rows: List<Int> }
 /// a variable and each row argument a bare one, none of them twice.
 pub fn own_params(ty: Type, type_name: Bytes) -> Option<OwnParams> =
   match ty {
-    TyCon(c) -> if c.name != type_name { None } else {
+    NamedType(c) -> if c.name != type_name { None } else {
       c.args.fold(Some({ params: [], rows: [] }), |acc: Option<OwnParams>, a: Type|
         match acc {
           None -> None,
@@ -765,7 +785,7 @@ pub fn own_params(ty: Type, type_name: Bytes) -> Option<OwnParams> =
             None -> match arg_label(a) {
               Some(_) -> None,
               None -> match a {
-                TyVar(v) -> if own.params.contains(v) { None }
+                VariableType(v) -> if own.params.contains(v) { None }
                 else { Some({ ..own, params: own.params.push(v) }) },
                 _ -> None,
               },

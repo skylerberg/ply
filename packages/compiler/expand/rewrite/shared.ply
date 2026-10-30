@@ -3,32 +3,38 @@
 import std.list
 import compiler.check.known (ok_ctor, err_ctor)
 import compiler.syntax.parsing (Span, Ident, ParseDiag, error_at, bare)
-import compiler.syntax.patterns (Pattern, PVar)
-import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, TypeDef, TDSum,
-                              VariantDef, SpecClause, ImportDecl, INames)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, Param, MatchArm, RecField, expr_span,
-                              ETagged, Tagged, expr_nodes_mapped, expr_nodes_folded)
+import compiler.syntax.patterns (Pattern, PatternVariable)
+import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, TestItem, LawItem, SchemaItem,
+                              TypeDef, SumBody, VariantDef, SpecClause, ImportDecl, SelectedNames)
+import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, BinaryExpression,
+                              UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                              MatchExpression, BlockExpression, RecordExpression,
+                              RecordUpdateExpression, PropagateExpression, FieldExpression,
+                              ListExpression, PerformExpression, HandleExpression,
+                              WithHoldExpression, SimulateExpression, ParallelExpression,
+                              InvalidExpression, HoleExpression, TryBlockExpression, Stmt,
+                              LetStatement, LetElseStatement, ExpressionStatement,
+                              AssignmentStatement, Param, MatchArm, RecordLiteralField, expr_span,
+                              TaggedLiteralExpression, TaggedLiteral, expr_nodes_mapped,
+                              expr_nodes_folded)
 
 // --- Shared ---------------------------------------------------------------------
 
 pub fn max_alias_depth() -> Int = 16
 
 /// A read of `name` made at `at`, a node whose name, an identifier, has no site.
-pub fn read_at(name: Bytes, at: Span) -> Expr =
-  EVar({ span: at, name: bare({ name: name, span: at }) })
+pub fn variable_at(name: Bytes, at: Span) -> Expr =
+  NameExpression({ span: at, name: bare({ name: name, span: at }) })
 
 /// A binder of `name` made at `at`.
-pub fn bound_at(name: Bytes, at: Span) -> Pattern =
-  PVar({ span: at, name: { name: name, span: at } })
+pub fn binder_at(name: Bytes, at: Span) -> Pattern =
+  PatternVariable({ span: at, name: { name: name, span: at } })
 
 /// This module's own `type` items; the first declaration of a name wins.
 pub fn collect_types(module: Module) -> List<TypeDef> =
   module.items.fold([], |acc: List<TypeDef>, item: Item|
     match item {
-      IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> acc.push(d) },
+      TypeItem(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> acc.push(d) },
       _ -> acc,
     })
 
@@ -42,43 +48,45 @@ pub fn find_type(ts: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
 /// Evaluates without calling or performing anything.
 pub fn is_pure(e: Expr) -> Bool =
   match e {
-    EApp(_) -> false,
-    EPerform(_) -> false,
-    EHandle(_) -> false,
-    EWithHold(_) -> false,
-    ESimulate(_) -> false,
-    EParallel(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
-    ETry(_) -> false,
-    ETryBlock(_) -> false,
+    CallExpression(_) -> false,
+    PerformExpression(_) -> false,
+    HandleExpression(_) -> false,
+    WithHoldExpression(_) -> false,
+    SimulateExpression(_) -> false,
+    ParallelExpression(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
+    PropagateExpression(_) -> false,
+    TryBlockExpression(_) -> false,
     // A hole raises where it stands.
-    EHole(_) -> false,
-    ELit(_) -> true,
-    ETagged(t) -> t.holes.len() == 0,
-    EVar(_) -> true,
-    EBad(_) -> true,
-    EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
-    EUnary(u) -> is_pure(u.operand),
-    ELambda(l) -> is_pure(l.body),
-    EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
-    EMatch(m) ->
+    HoleExpression(_) -> false,
+    LiteralExpression(_) -> true,
+    TaggedLiteralExpression(t) -> t.holes.len() == 0,
+    NameExpression(_) -> true,
+    InvalidExpression(_) -> true,
+    BinaryExpression(b) -> is_pure(b.lhs) && is_pure(b.rhs),
+    UnaryExpression(u) -> is_pure(u.operand),
+    LambdaExpression(l) -> is_pure(l.body),
+    IfExpression(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
+    MatchExpression(m) ->
       is_pure(m.scrutinee)
         && m.arms.fold(true, |acc: Bool, arm: MatchArm|
           acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
-    EBlock(b) ->
+    BlockExpression(b) ->
       b.stmts.fold(true, |acc: Bool, stmt: Stmt|
           acc
             && (match stmt {
-              SLet(l) -> is_pure(l.value),
-              SLetElse(l) -> is_pure(l.value) && is_pure(l.fallback),
-              SExpr(x) -> is_pure(x),
-              SAssign(_) -> false,
+              LetStatement(l) -> is_pure(l.value),
+              LetElseStatement(l) -> is_pure(l.value) && is_pure(l.fallback),
+              ExpressionStatement(x) -> is_pure(x),
+              AssignmentStatement(_) -> false,
             }))
         && (match b.tail { None -> true, Some(t) -> is_pure(t) }),
-    ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
-    ERecordUpdate(r) ->
-      is_pure(r.base) && r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
-    EField(f) -> is_pure(f.base),
-    EList(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
+    RecordExpression(r) ->
+      r.fields.fold(true, |acc: Bool, f: RecordLiteralField| acc && is_pure(f.value)),
+    RecordUpdateExpression(r) ->
+      is_pure(r.base)
+        && r.fields.fold(true, |acc: Bool, f: RecordLiteralField| acc && is_pure(f.value)),
+    FieldExpression(f) -> is_pure(f.base),
+    ListExpression(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
   }
 
 // --- Record update -----------------------------------------------------------------------
@@ -88,8 +96,8 @@ pub fn is_pure(e: Expr) -> Bool =
 pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
   let go = |x: Expr| expr_nodes_mapped(x, f);
   match item {
-    IFn(d) ->
-      IFn({
+    FunctionItem(d) ->
+      FunctionItem({
         ..d,
         params: d.params.map(|param: Param|
           { ..param, default: match param.default { None -> None, Some(x) -> Some(go(x)) } }),
@@ -97,8 +105,8 @@ pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
           { kind: clause.kind, expr: go(clause.expr), span: clause.span }),
         body: go(d.body),
       }),
-    ITest(d) ->
-      ITest({
+    TestItem(d) ->
+      TestItem({
         ..d,
         cases: match d.cases {
           None -> None,
@@ -106,8 +114,8 @@ pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
         },
         body: go(d.body),
       }),
-    ILaw(d) ->
-      ILaw({
+    LawItem(d) ->
+      LawItem({
         ..d,
         guard: match d.guard { None -> None, Some(g) -> Some(go(g)) },
         body: go(d.body),
@@ -118,34 +126,37 @@ pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
 
 // --- Tagged literals -----------------------------------------------------------------------
 
-pub fn is_tagged(expr: Expr) -> Bool = match expr { ETagged(_) -> true, _ -> false }
+pub fn is_tagged(expr: Expr) -> Bool = match expr { TaggedLiteralExpression(_) -> true, _ -> false }
 
 /// Every tagged literal a module's definitions, tests and laws hold, in the order they are written.
-pub fn tagged_in(module: Module) -> List<Tagged> =
-  picked_in(module, is_tagged).fold([], |acc: List<Tagged>, e: Expr|
-    match e { ETagged(t) -> acc.push(t), _ -> acc })
+pub fn tagged_in(module: Module) -> List<TaggedLiteral> =
+  expressions_matching(module, is_tagged).fold([], |acc: List<TaggedLiteral>, e: Expr|
+    match e { TaggedLiteralExpression(t) -> acc.push(t), _ -> acc })
 
-/// Every expression `wanted` picks among those a module's definitions, tests and laws hold, in the
+/// Every expression `predicate` picks among those a module's definitions, tests and laws hold, in the
 /// order they are written, one that holds another before it.
-pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> = {
-  let picked = |e: Expr, found: List<Expr>|
+pub fn expressions_matching(module: Module, predicate: (Expr) -> Bool) -> List<Expr> = {
+  let collect_matching = |e: Expr, found: List<Expr>|
     expr_nodes_folded(e, found, |acc: List<Expr>, x: Expr|
-      if wanted(x) { acc.push(x) } else { acc });
+      if predicate(x) { acc.push(x) } else { acc });
   module.items.fold([], |acc: List<Expr>, item: Item|
     match item {
-      IFn(d) ->
-        d.spec.fold(picked(d.body, acc), |out: List<Expr>, clause: SpecClause|
-          picked(clause.expr, out)),
+      FunctionItem(d) ->
+        d.spec.fold(collect_matching(d.body, acc), |out: List<Expr>, clause: SpecClause|
+          collect_matching(clause.expr, out)),
       // Over cases, the label and the table are written before the body.
-      ITest(d) ->
-        picked(d.body, match d.cases {
+      TestItem(d) ->
+        collect_matching(d.body, match d.cases {
           None -> acc,
-          Some(c) -> picked(c.table, picked(c.label, acc)),
+          Some(c) -> collect_matching(c.table, collect_matching(c.label, acc)),
         }),
       // An instantiation's guard is given what its body is, which is picked once, in the body.
-      ILaw(d) -> {
-        let guarded = match ((d.guard, d.of)) { (Some(g), None) -> picked(g, acc), _ -> acc };
-        picked(d.body, guarded)
+      LawItem(d) -> {
+        let guarded = match ((d.guard, d.of)) {
+          (Some(g), None) -> collect_matching(g, acc),
+          _ -> acc,
+        };
+        collect_matching(d.body, guarded)
       },
       _ -> acc,
     })
@@ -155,13 +166,13 @@ pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> = {
 pub fn bare_names_read(e: Expr) -> List<Bytes> =
   expr_nodes_folded(e, [], |acc: List<Bytes>, x: Expr|
     match x {
-      EVar(v) -> if v.name.module == None { acc.push(v.name.name.name) } else { acc },
+      NameExpression(v) -> if v.name.module == None { acc.push(v.name.name.name) } else { acc },
       _ -> acc,
     })
 
 // --- The try block ---------------------------------------------------------------------------
 
-pub fn is_try_block(expr: Expr) -> Bool = match expr { ETryBlock(_) -> true, _ -> false }
+pub fn is_try_block(expr: Expr) -> Bool = match expr { TryBlockExpression(_) -> true, _ -> false }
 
 // --- What `Ok` and `Err` name ----------------------------------------------------------------
 
@@ -170,17 +181,17 @@ pub fn is_try_block(expr: Expr) -> Bool = match expr { ETryBlock(_) -> true, _ -
 // for itself, what is written out would name the module's own, so the form is refused here, with
 // the grammar: a body taken from its rows is not checked again, and would run as the other thing.
 
-type Rebound = { name: Bytes, imported: Bool }
+type OwnBinding = { name: Bytes, imported: Bool }
 
 /// The first of `names` the module binds for itself: one it imports by name, else a variant or a
 /// function it declares.
-pub fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
-  let imported = module.imports.fold(None, |acc: Option<Rebound>, d: ImportDecl|
+pub fn own_binding_among(module: Module, names: List<Bytes>) -> Option<OwnBinding> = {
+  let imported = module.imports.fold(None, |acc: Option<OwnBinding>, d: ImportDecl|
     match acc {
       Some(_) -> acc,
       None -> match d.kind {
-        INames(ns) ->
-          ns.fold(None, |b: Option<Rebound>, ident: Ident|
+        SelectedNames(ns) ->
+          ns.fold(None, |b: Option<OwnBinding>, ident: Ident|
             match b {
               Some(_) -> b,
               None -> if names.contains(ident.name) { Some({ name: ident.name, imported: true }) }
@@ -192,13 +203,13 @@ pub fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
   match imported {
     Some(_) -> imported,
     None ->
-      module.items.fold(None, |acc: Option<Rebound>, item: Item|
+      module.items.fold(None, |acc: Option<OwnBinding>, item: Item|
         match acc {
           Some(_) -> acc,
           None -> match item {
-            IType(d) -> match d.body {
-              TDSum(vs) ->
-                vs.fold(None, |b: Option<Rebound>, variant: VariantDef|
+            TypeItem(d) -> match d.body {
+              SumBody(vs) ->
+                vs.fold(None, |b: Option<OwnBinding>, variant: VariantDef|
                   match b {
                     Some(_) -> b,
                     None -> if names.contains(variant.name.name) {
@@ -207,7 +218,7 @@ pub fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
                   }),
               _ -> None,
             },
-            IFn(d) -> if names.contains(d.name.name) {
+            FunctionItem(d) -> if names.contains(d.name.name) {
               Some({ name: d.name.name, imported: false })
             } else { None },
             _ -> None,
@@ -216,7 +227,13 @@ pub fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
   }
 }
 
-fn uncaptured(span: Span, form: Bytes, lacks: Bytes, own: Rebound, answers: Bytes) -> ParseDiag =
+fn capture_error(
+  span: Span,
+  form: Bytes,
+  lacks: Bytes,
+  own: OwnBinding,
+  answers: Bytes,
+) -> ParseDiag =
   error_at(
     b"E0118",
     span,
@@ -234,13 +251,13 @@ fn uncaptured(span: Span, form: Bytes, lacks: Bytes, own: Rebound, answers: Byte
 
 /// `diags`, and a refusal for every `try` and every tagged literal of a module that binds what it
 /// would be written out with.
-pub fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
-  let tried = match bound_among(module, [ok_ctor(), err_ctor()]) {
+pub fn report_rebound_constructors(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
+  let tried = match own_binding_among(module, [ok_ctor(), err_ctor()]) {
     None -> diags,
     Some(own) ->
-      picked_in(module, is_try_block).fold(diags, |acc: List<ParseDiag>, e: Expr|
+      expressions_matching(module, is_try_block).fold(diags, |acc: List<ParseDiag>, e: Expr|
         acc.push(
-          uncaptured(
+          capture_error(
             expr_span(e),
             b"`try`",
             b"no `Result` to answer with",
@@ -249,12 +266,12 @@ pub fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
           ),
         )),
   };
-  match bound_among(module, [ok_ctor()]) {
+  match own_binding_among(module, [ok_ctor()]) {
     None -> tried,
     Some(own) ->
-      tagged_in(module).fold(tried, |acc: List<ParseDiag>, t: Tagged|
+      tagged_in(module).fold(tried, |acc: List<ParseDiag>, t: TaggedLiteral|
         acc.push(
-          uncaptured(
+          capture_error(
             t.span,
             b"a tagged literal",
             b"no `Ok` to read it through",
@@ -271,21 +288,21 @@ pub fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
   module.items.fold(false, |acc: Bool, item: Item|
     acc
       || (match item {
-        IFn(d) ->
+        FunctionItem(d) ->
           count_in(d.body, p) > 0
             || d.spec.fold(false, |b: Bool, clause: SpecClause| b || count_in(clause.expr, p) > 0)
             || d.params.fold(false, |b: Bool, param: Param|
               b || (match param.default { None -> false, Some(v) -> count_in(v, p) > 0 })),
-        ITest(d) ->
+        TestItem(d) ->
           count_in(d.body, p) > 0
             || (match d.cases {
               None -> false,
               Some(c) -> count_in(c.table, p) > 0 || count_in(c.label, p) > 0,
             }),
-        ILaw(d) ->
+        LawItem(d) ->
           count_in(d.body, p) > 0
             || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
-        ISchema(d) ->
+        SchemaItem(d) ->
           count_in(d.body, p) > 0
             || (match d.guard { None -> false, Some(g) -> count_in(g, p) > 0 }),
         _ -> false,

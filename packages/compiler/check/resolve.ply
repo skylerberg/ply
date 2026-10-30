@@ -4,24 +4,25 @@
 
 import compiler.syntax.parsing (Span, dummy_span, span_key)
 import compiler.syntax.type_syntax (AtomExpr, mode_text)
-import compiler.syntax.items (Item, IFn, FnDef, ImportDecl, parse, dump_module)
+import compiler.syntax.items (Item, FunctionItem, FnDef, ImportDecl, parse, dump_module)
 import std.list
 import std.bytes (ascii_of_int)
 import compiler.check.resolve.tables (Source, ParsedModule, TypeSpace, ValueSpace, Binding,
                                       ModuleBinding, Scope, Label, Diag, ModuleEntry, no_decls,
                                       lookup, find_module_binding, error_at, declarations_of,
                                       bindings_of)
-import compiler.check.resolve.scopes (Builder, World, PackageDeps, no_packages, index_of,
-                                      one_import, target_or_report, Cycle, traverse, cycle_diag)
-import compiler.check.resolve.sets (instantiated, expand_sets, bytes_concat_diags)
-import compiler.check.resolve.defaults (Expanded, expand)
-import compiler.syntax.sites (numbered_module, numbered_made)
+import compiler.check.resolve.scopes (ScopeBuilder, ResolutionContext, PackageDeps, no_packages,
+                                      index_of, bind_import, target_or_report, Cycle, traverse,
+                                      cycle_diag)
+import compiler.check.resolve.sets (instantiate_laws, expand_sets, concat_diagnostics)
+import compiler.check.resolve.defaults (ResolvedProgram, fill_defaults)
+import compiler.syntax.node_ids (numbered_module, numbered_made)
 import compiler.check.resolve.bindings (written, Written, Reference, Refers, Local, Unbound, Member,
                                         FieldName, CalledName, ArgumentName, Definition)
 
 // --- `resolve` ---------------------------------------------------------------------------
 
-pub type ResolveOutcome = | ResolveSucceeded(Expanded) | ResolveFailed(List<Diag>)
+pub type ResolveOutcome = | ResolveSucceeded(ResolvedProgram) | ResolveFailed(List<Diag>)
 
 pub fn resolve(sources: List<Source>) -> ResolveOutcome / {abort.raise} =
   resolve_modules(
@@ -97,10 +98,10 @@ fn resolve_with(
     shipped: packages.shipped,
   };
   let built = range(0, n).map(|i: Int| build_scope_reporting(w, i));
-  let scopes = built.map(|builder: Builder| builder.scope);
-  let edges = built.map(|builder: Builder| builder.edges);
-  let diags1 = built.fold(indexed.diags, |acc: List<Diag>, builder: Builder|
-    bytes_concat_diags(acc, builder.diags));
+  let scopes = built.map(|builder: ScopeBuilder| builder.scope);
+  let edges = built.map(|builder: ScopeBuilder| builder.edges);
+  let diags1 = built.fold(indexed.diags, |acc: List<Diag>, builder: ScopeBuilder|
+    concat_diagnostics(acc, builder.diags));
   let dfs = traverse(edges);
   let diags2 = dfs.cycles.fold(diags1, |acc: List<Diag>, cycle: Cycle|
     acc.push(cycle_diag(mods, cycle)));
@@ -115,19 +116,19 @@ fn resolve_with(
       imports: edges.map(|es: List<{ from: Int, target: Int, span: Span }>|
         es.map(|e: { from: Int, target: Int, span: Span }| e.target)),
       signatures: Map::new(),
-      sees: [],
+      visible_modules: [],
     };
-    let made = instantiated(r, mods);
-    let sets = expand_sets(made.r, made.mods);
-    if made.diags.len() > 0 { ResolveFailed(made.diags) }
+    let instantiation = instantiate_laws(r, mods);
+    let sets = expand_sets(instantiation.r, instantiation.mods);
+    if instantiation.diags.len() > 0 { ResolveFailed(instantiation.diags) }
     else if sets.diags.len() > 0 { ResolveFailed(sets.diags) } else {
-      let x = expand(sets.r, sets.mods, []);
+      let x = fill_defaults(sets.r, sets.mods, []);
       if x.diags.len() > 0 { ResolveFailed(x.diags) } else { ResolveSucceeded(x) }
     }
   }
 }
 
-fn build_scope_reporting(w: World, i: Int) -> Builder / {abort.raise} = {
+fn build_scope_reporting(w: ResolutionContext, i: Int) -> ScopeBuilder / {abort.raise} = {
   let m = w.mods.get(i);
   let start = {
     scope: { module: m.name, modules: [], selective: [], bound: w.declared.get(i) },
@@ -136,15 +137,15 @@ fn build_scope_reporting(w: World, i: Int) -> Builder / {abort.raise} = {
     edges: [],
     diags: [],
   };
-  m.module.imports.fold(start, |builder: Builder, decl: ImportDecl| {
+  m.module.imports.fold(start, |builder: ScopeBuilder, decl: ImportDecl| {
     let t = target_or_report(w, i, builder, decl);
-    match t.t { None -> t.b, Some(_) -> one_import(w, i, t.b, decl) }
+    match t.t { None -> t.b, Some(_) -> bind_import(w, i, t.b, decl) }
   })
 }
 
 // --- The dump -------------------------------------------------------------------------------
 
-fn dump_modbind(tag: Bytes, binding: ModuleBinding) -> Bytes =
+fn dump_module_binding(tag: Bytes, binding: ModuleBinding) -> Bytes =
   Bytes::concat_all([
     tag,
     b";",
@@ -177,8 +178,8 @@ fn dump_scope(i: Int, scope: Scope) -> Bytes =
     b";",
     scope.module,
     b";",
-    Bytes::concat_all(scope.modules.map(|mb: ModuleBinding| dump_modbind(b"B", mb))),
-    Bytes::concat_all(scope.selective.map(|mb: ModuleBinding| dump_modbind(b"S", mb))),
+    Bytes::concat_all(scope.modules.map(|mb: ModuleBinding| dump_module_binding(b"B", mb))),
+    Bytes::concat_all(scope.selective.map(|mb: ModuleBinding| dump_module_binding(b"S", mb))),
     Bytes::concat_all(scope.bound.values.map(|b: Binding| dump_binding(b"V", b))),
     Bytes::concat_all(scope.bound.types.map(|b: Binding| dump_binding(b"T", b))),
     Bytes::concat_all(scope.bound.effects.map(|b: Binding| dump_binding(b"E", b))),
@@ -290,9 +291,9 @@ test "two modules resolve each name to the definition it names, wherever it is w
 }
 
 /// Each atom of the first `fn`'s written row in module `m`, as the expansion left it.
-fn first_row(expanded: Expanded, m: Int) -> List<Bytes> / {abort.raise} = {
+fn first_row(expanded: ResolvedProgram, m: Int) -> List<Bytes> / {abort.raise} = {
   let f = expanded.mods.get(m).module.items.fold(None, |acc: Option<FnDef>, item: Item|
-    match acc { Some(_) -> acc, None -> match item { IFn(d) -> Some(d), _ -> None } });
+    match acc { Some(_) -> acc, None -> match item { FunctionItem(d) -> Some(d), _ -> None } });
   match f {
     None -> panic("the module writes a fn"),
     Some(d) -> match d.effects {
@@ -300,8 +301,8 @@ fn first_row(expanded: Expanded, m: Int) -> List<Bytes> / {abort.raise} = {
       Some(r) ->
         r.atoms.map(|atom: AtomExpr|
           Bytes::concat_all([
-            match atom.eff.module { Some(b) -> b.name.concat(b"::"), None -> b"" },
-            atom.eff.name.name,
+            match atom.effect_name.module { Some(b) -> b.name.concat(b"::"), None -> b"" },
+            atom.effect_name.name.name,
             b".",
             match atom.op { Some(o) -> o.name, None -> mode_text(atom.mode) },
             match atom.resource { Some(l) -> Bytes::concat_all([b"[", l.name, b"]"]), None -> b"" },
@@ -310,7 +311,7 @@ fn first_row(expanded: Expanded, m: Int) -> List<Bytes> / {abort.raise} = {
   }
 }
 
-fn resolved(sources: List<Source>) -> Expanded / {abort.raise} =
+fn resolve_or_panic(sources: List<Source>) -> ResolvedProgram / {abort.raise} =
   match resolve(sources) {
     ResolveSucceeded(x) -> x,
     ResolveFailed(ds) -> panic(String::of_bytes(b"refused: ".concat(dump_diags(ds)))),
@@ -319,14 +320,14 @@ fn resolved(sources: List<Source>) -> Expanded / {abort.raise} =
 test "a module below `std.internal` is imported by the toolchain's modules alone" {
   let internal = { name: b"std.internal.shared", src: b"pub fn one() -> Int = 1\n" };
   assert_eq(
-    refused_codes([
+    error_codes([
       internal,
       { name: b"std.user", src: b"import std.internal.shared\nfn f() -> Int = shared::one()\n" },
     ]),
     [],
   );
   assert_eq(
-    refused_codes([
+    error_codes([
       internal,
       { name: b"m", src: b"import std.internal.shared\nfn f() -> Int = shared::one()\n" },
     ]),
@@ -334,7 +335,7 @@ test "a module below `std.internal` is imported by the toolchain's modules alone
   )
 }
 
-fn refused_codes(sources: List<Source>) -> List<Bytes> / {abort.raise} =
+fn error_codes(sources: List<Source>) -> List<Bytes> / {abort.raise} =
   match resolve(sources) {
     ResolveSucceeded(_) -> [],
     ResolveFailed(ds) -> ds.map(|diag: Diag| diag.code),
@@ -344,7 +345,7 @@ fn store_base() -> Bytes =
   b"pub effect store { read get[t](k: Int) -> Int }\npub effect set Reads = {store.read[orders], log.write}\nfn own() -> Int / {Reads} = 1\n"
 
 test "a `pub` set is named by import or through its module, and means what it means where it was written" {
-  let by_name = resolved([
+  let by_name = resolve_or_panic([
     { name: b"base", src: store_base() },
     { name: b"app", src: b"import base (Reads)\nfn f() -> Int / {Reads} = 1" },
   ]);
@@ -352,7 +353,7 @@ test "a `pub` set is named by import or through its module, and means what it me
   assert_eq(first_row(by_name, 0), [b"store.read[orders]", b"log.write"]);
   assert_eq(first_row(by_name, 1), [b"@base::store.read[orders]", b"log.write"]);
   assert(find_module_binding(by_name.r.scopes.get(1).modules, b"@base") != None);
-  let through = resolved([
+  let through = resolve_or_panic([
     { name: b"base", src: store_base() },
     { name: b"app", src: b"import base\nfn f() -> Int / {base::Reads} = 1" },
   ]);
@@ -360,7 +361,7 @@ test "a `pub` set is named by import or through its module, and means what it me
 }
 
 test "a set may include another module's, and a third module names the whole of it" {
-  let x = resolved([
+  let x = resolve_or_panic([
     { name: b"base", src: store_base() },
     { name: b"mid", src: b"import base (Reads)\npub effect set All = {Reads, clock.read}" },
     { name: b"app", src: b"import mid (All)\nfn f() -> Int / {All} = 1" },
@@ -369,30 +370,30 @@ test "a set may include another module's, and a third module names the whole of 
 }
 
 test "a set is refused where it is named when nothing declares it, its module keeps it, or it names itself" {
-  assert_eq(refused_codes([{ name: b"app", src: b"fn f() -> Int / {Nope} = 1" }]), [b"E0114"]);
+  assert_eq(error_codes([{ name: b"app", src: b"fn f() -> Int / {Nope} = 1" }]), [b"E0114"]);
   let hidden = b"effect set Hidden = {log.write}\n";
   assert_eq(
-    refused_codes([
+    error_codes([
       { name: b"base", src: hidden },
       { name: b"app", src: b"import base\nfn f() -> Int / {base::Hidden} = 1" },
     ]),
     [b"E0107"],
   );
   assert_eq(
-    refused_codes([
+    error_codes([
       { name: b"base", src: hidden },
       { name: b"app", src: b"import base (Hidden)\nfn f() -> Int = 1" },
     ]),
     [b"E0107"],
   );
   assert_eq(
-    refused_codes([
+    error_codes([
       { name: b"app", src: b"effect set A = {B}\neffect set B = {A}\nfn f() -> Int / {A} = 1" },
     ]),
     [b"E0115"],
   );
   assert_eq(
-    refused_codes([
+    error_codes([
       {
         name: b"app",
         src: b"effect set A = {log.write}\neffect set A = {clock.read}\nfn f() -> Int = 1",
@@ -407,14 +408,12 @@ fn lib_and_app(lib: Bytes, app: Bytes) -> List<Source> =
 
 test "a missing module, an import cycle and two modules of one name are refused" {
   assert_eq(
-    refused_codes([
-      { name: b"app", src: b"import nowhere\nimport std.nowhere\nfn f() -> Int = 1" },
-    ]),
+    error_codes([{ name: b"app", src: b"import nowhere\nimport std.nowhere\nfn f() -> Int = 1" }]),
     [b"E0106", b"E0106"],
   );
-  assert_eq(refused_codes([{ name: b"me", src: b"import me\nfn f() -> Int = 1" }]), [b"E0109"]);
+  assert_eq(error_codes([{ name: b"me", src: b"import me\nfn f() -> Int = 1" }]), [b"E0109"]);
   assert_eq(
-    refused_codes([
+    error_codes([
       { name: b"a", src: b"import b\npub fn fa() -> Int = 1" },
       { name: b"b", src: b"import c\npub fn fb() -> Int = 1" },
       { name: b"c", src: b"import a\npub fn fc() -> Int = 1" },
@@ -422,7 +421,7 @@ test "a missing module, an import cycle and two modules of one name are refused"
     [b"E0109"],
   );
   assert_eq(
-    refused_codes([
+    error_codes([
       { name: b"twin", src: b"pub fn x() -> Int = 1" },
       { name: b"twin", src: b"pub fn y() -> Int = 2" },
     ]),
@@ -432,7 +431,7 @@ test "a missing module, an import cycle and two modules of one name are refused"
 
 test "an imported name is refused when its module keeps or lacks it, the importer declares it, or another import binds it" {
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"fn secret() -> Int = 1\npub fn shown() -> Int = 2",
         b"import lib (secret, shown, absent)\nfn f() -> Int = shown()",
@@ -441,7 +440,7 @@ test "an imported name is refused when its module keeps or lacks it, the importe
     [b"E0107", b"E0101"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"type Hidden = | H1 | H2\npub type Shown = | S1 | S2",
         b"import lib (H1, S1)\nfn f() -> Int = 1",
@@ -450,7 +449,7 @@ test "an imported name is refused when its module keeps or lacks it, the importe
     [b"E0107"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"pub fn place() -> Int = 1\npub type Order = { id: Int }",
         b"import lib (place, Order)\nfn place() -> Int = 2\ntype Order = { id: Bytes }\nfn f() -> Int = place()",
@@ -459,7 +458,7 @@ test "an imported name is refused when its module keeps or lacks it, the importe
     [b"E0108", b"E0108"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"pub fn a() -> Int = 1",
         b"import lib\nimport lib\nimport lib as lib\nfn f() -> Int = lib::a()",
@@ -468,7 +467,7 @@ test "an imported name is refused when its module keeps or lacks it, the importe
     [b"E0110", b"E0110"],
   );
   assert_eq(
-    refused_codes([
+    error_codes([
       { name: b"lib", src: b"pub fn a() -> Int = 1" },
       { name: b"other", src: b"pub fn a() -> Int = 2" },
       { name: b"app", src: b"import lib (a)\nimport other (a)\nfn f() -> Int = a()" },
@@ -499,7 +498,7 @@ test "an opaque sum's constructors stay with its module: the type is imported, a
 
 test "a module imported whole and by name resolves both ways, its type bringing the constructors" {
   assert_eq(
-    refused_codes([
+    error_codes([
       {
         name: b"base",
         src: b"pub fn one() -> Int = 1\npub type Shape = | Circle(Int) | Square(Int)\npub effect log { write emit(Bytes) -> Unit }\nfn hidden() -> Int = 2",
@@ -515,7 +514,7 @@ test "a module imported whole and by name resolves both ways, its type bringing 
 
 test "an operation takes no named argument, and a call on a binding may write one" {
   assert_eq(
-    refused_codes([
+    error_codes([
       {
         name: b"m",
         src: b"effect d { read op(k: Int) -> Int }\nfn f() -> Int / {d.op} = d.op(k: 1)",
@@ -523,7 +522,7 @@ test "an operation takes no named argument, and a call on a binding may write on
     ]),
     [b"E0123"],
   );
-  assert_eq(refused_codes([{ name: b"m", src: b"fn f(d: Int) -> Int = d.op(k: 1)" }]), [])
+  assert_eq(error_codes([{ name: b"m", src: b"fn f(d: Int) -> Int = d.op(k: 1)" }]), [])
 }
 
 fn defaults_lib() -> Bytes =
@@ -531,7 +530,7 @@ fn defaults_lib() -> Bytes =
 
 test "a call resolves with its parameters left to their defaults, and a local of a callee's name shadows it" {
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         defaults_lib(),
         b"import lib (greet, scale, run)\nfn a() -> Bytes = greet()\nfn b() -> Bytes = greet(b\"x\")\nfn c() -> Bytes = greet(times: 2)\nfn d() -> Bytes = greet(b\"x\", times: 2)\nfn e() -> Bytes = greet(times: 2, name: b\"y\")\nfn f() -> Int = scale(2)\nfn h() -> Int = run()\nfn i() -> Int = run(n: 4)\nfn j() -> Bool = assert(true)\nfn k() -> Int = { let greet = |x: Int| x; greet(1) }\nfn l() -> Int = { let run = 3; run }",
@@ -543,13 +542,13 @@ test "a call resolves with its parameters left to their defaults, and a local of
 
 test "a named argument is refused when it names no parameter or one twice, or leaves one unfilled" {
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(defaults_lib(), b"import lib (greet)\nfn e() -> Bytes = greet(nope: 1)"),
     ),
     [b"E0123"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         defaults_lib(),
         b"import lib (greet)\nfn d() -> Bytes = greet(b\"x\", times: 2, name: b\"y\")",
@@ -558,11 +557,11 @@ test "a named argument is refused when it names no parameter or one twice, or le
     [b"E0123"],
   );
   assert_eq(
-    refused_codes(lib_and_app(defaults_lib(), b"import lib (scale)\nfn g() -> Int = scale(by: 3)")),
+    error_codes(lib_and_app(defaults_lib(), b"import lib (scale)\nfn g() -> Int = scale(by: 3)")),
     [b"E0125"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         defaults_lib(),
         b"import lib (scale)\nfn h() -> Int = scale(2, 3, 4)\nfn k() -> Int = Some(x: 1)\nfn j() -> Int = { let scale = |x: Int| x; scale(x: 1) }",
@@ -574,7 +573,7 @@ test "a named argument is refused when it names no parameter or one twice, or le
 
 test "a default is refused when it calls, names a parameter, or names what its module keeps" {
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"pub fn f(n: Int = g(1)) -> Int = n\npub fn g(n: Int) -> Int = n",
         b"import lib (f)\nfn a() -> Int = f()",
@@ -583,7 +582,7 @@ test "a default is refused when it calls, names a parameter, or names what its m
     [b"E0121"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"pub fn h(n: Int, m: Int = n) -> Int = m",
         b"import lib (h)\nfn b() -> Int = h(1)",
@@ -592,7 +591,7 @@ test "a default is refused when it calls, names a parameter, or names what its m
     [b"E0121"],
   );
   assert_eq(
-    refused_codes(
+    error_codes(
       lib_and_app(
         b"fn helper() -> Int = 3\npub fn leaky(n: Int = helper) -> Int = n",
         b"import lib (leaky)\nfn a() -> Int = leaky()",

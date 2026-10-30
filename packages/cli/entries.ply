@@ -8,10 +8,10 @@ import compiler.front.rows (DefRow, Dump, EmitterRoot, ModuleRow, ModuleSpan, Or
 import compiler.front.published (analyse, dump_of)
 import compiler.check.types (Atom, atom_bin)
 import compiler.load (LoadedAnalysis, SourceFile)
-import diagnostic (Place)
+import diagnostic (SourceText)
 import entry (Main, Module)
-import listing
-import listing (Declared, declared_bin)
+import host_listing
+import host_listing (DeclaredEffect, declared_effect_bin)
 import paths
 import compiler.syntax.items (is_shipped)
 import std.bin
@@ -24,7 +24,7 @@ pub fn none() -> Entries = { mains: [], modules: [] }
 
 /// Which modules are the package being loaded, rather than a dependency's or a shipped one: only it
 /// offers an entry point. A project without packages is every module the toolchain does not ship.
-fn in_root(dump: Dump) -> (Bytes) -> Bool =
+fn in_root_package(dump: Dump) -> (Bytes) -> Bool =
   if dump.packages.len() == 0 { |module: Bytes| !is_shipped(module) } else {
     let roots = range(0, dump.ordinals.len()).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
       match ((dump.ordinals.at(i), dump.module_packages.at(i))) {
@@ -35,7 +35,7 @@ fn in_root(dump: Dump) -> (Bytes) -> Bool =
   }
 
 /// The definition an ordinal names, when it is a `fn`: `fn <name>`, then its clauses' kinds.
-fn fn_named(item: Bytes) -> Option<Bytes> / {abort.raise} =
+fn function_name(item: Bytes) -> Option<Bytes> / {abort.raise} =
   if !item.starts_with(b"fn ") { None } else {
     let rest = item.slice(3, item.len());
     match rest.index_of_byte(32) { Some(space) -> Some(rest.slice(0, space)), None -> Some(rest) }
@@ -48,9 +48,9 @@ fn path_of(front: LoadedAnalysis, module: Bytes) -> String =
     [] -> String::of_bytes_lossy(module),
   }
 
-type Picked = { seen: Map<Bytes, Bool>, mains: List<Main> }
+type FoundMains = { seen: Map<Bytes, Bool>, mains: List<Main> }
 
-fn picked(front: LoadedAnalysis, acc: Picked, def: DefRow) -> Picked =
+fn add_main(front: LoadedAnalysis, acc: FoundMains, def: DefRow) -> FoundMains =
   if acc.seen.contains(def.name) { acc } else {
     {
       seen: acc.seen.insert(def.name, true),
@@ -66,23 +66,23 @@ fn picked(front: LoadedAnalysis, acc: Picked, def: DefRow) -> Picked =
 /// Every `main` of the package being loaded, files in load order and then as written: a
 /// dependency's `main` is its own business.
 pub fn mains_of(front: LoadedAnalysis) -> List<Main> / {abort.raise} = {
-  let root = in_root(front.dump);
+  let root = in_root_package(front.dump);
   let offered = front.dump.defs.fold(Map::new(), |acc: Map<Bytes, DefRow>, def: DefRow|
     if def.simple_name == b"main" && root(def.module) { acc.insert(def.name, def) } else { acc });
-  let written: Picked = front.dump.ordinals.fold(
+  let written: FoundMains = front.dump.ordinals.fold(
     { seen: Map::new(), mains: [] },
-    |acc: Picked, o: OrdinalRow|
-      o.items.fold(acc, |inner: Picked, item: Bytes|
-        match fn_named(item) {
+    |acc: FoundMains, o: OrdinalRow|
+      o.items.fold(acc, |inner: FoundMains, item: Bytes|
+        match function_name(item) {
           None -> inner,
           Some(name) -> match offered.get(name) {
-            Some(def) -> picked(front, inner, def),
+            Some(def) -> add_main(front, inner, def),
             None -> inner,
           },
         }),
   );
-  let all: Picked = front.dump.defs.fold(written, |acc: Picked, def: DefRow|
-    if offered.contains(def.name) { picked(front, acc, def) } else { acc });
+  let all: FoundMains = front.dump.defs.fold(written, |acc: FoundMains, def: DefRow|
+    if offered.contains(def.name) { add_main(front, acc, def) } else { acc });
   all.mains
 }
 
@@ -104,10 +104,10 @@ pub fn of_front(front: LoadedAnalysis) -> Entries / {abort.raise} =
 
 /// `entries` as a line narrows them: those of the files it names, or holds under a directory it
 /// names, so a file named in a package picks its `main` among the package's.
-pub fn named(entries: Entries, resolved: List<paths::Resolved>) -> Entries =
+pub fn narrowed_to(entries: Entries, resolved: List<paths::ResolvedPath>) -> Entries =
   {
-    mains: entries.mains.filter(|m: Main| paths::names_any(resolved, m.path)),
-    modules: entries.modules.filter(|m: Module| paths::names_any(resolved, m.path)),
+    mains: entries.mains.filter(|m: Main| paths::includes_any(resolved, m.path)),
+    modules: entries.modules.filter(|m: Module| paths::includes_any(resolved, m.path)),
   }
 
 // --- What running an entry reads ------------------------------------------------
@@ -115,20 +115,20 @@ pub fn named(entries: Entries, resolved: List<paths::Resolved>) -> Entries =
 /// What running a program's entry points reads of its front end, which `ply run` keeps for a later
 /// run over the same closure and an artifact carries for its own: where each root of the unit is
 /// written, and the effects the program declares and performs, which a binding is resolved against.
-pub type Runnable = { roots: List<Rooted>, declared: List<Declared>, performed: List<Atom> }
+pub type Runnable = { roots: List<RootSpan>, declared: List<DeclaredEffect>, performed: List<Atom> }
 
 /// A root of the unit, and where its definition is written.
-pub type Rooted = { root: Bytes, at: ModuleSpan }
+pub type RootSpan = { root: Bytes, at: ModuleSpan }
 
-derive bin for Rooted
+derive bin for RootSpan
 derive bin for Runnable
 
 /// What running `front`'s entry points reads of it. A performed atom is kept once.
 pub fn runnable_of(front: LoadedAnalysis) -> Runnable / {abort.raise} =
   {
     roots: front.dump.emitter_roots.map(|r: EmitterRoot| { root: r.root, at: r.at }),
-    declared: listing::declared_of(front.dump),
-    performed: listing::performed(front.dump).fold(
+    declared: host_listing::declared_of(front.dump),
+    performed: host_listing::performed_atoms(front.dump).fold(
       Map::new(),
       |acc: Map<Bytes, Atom>, a: Atom| acc.insert(bin::encode(a, atom_bin()), a),
     ).values(
@@ -137,35 +137,40 @@ pub fn runnable_of(front: LoadedAnalysis) -> Runnable / {abort.raise} =
 
 /// Where each root of the unit is written, which a failure's sites are offsets from.
 pub fn roots_of(r: Runnable) -> Map<Bytes, ModuleSpan> =
-  r.roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, x: Rooted| m.insert(x.root, x.at))
+  r.roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, x: RootSpan| m.insert(x.root, x.at))
 
 // --- As `ply run` keeps them ----------------------------------------------------
 
 /// A `main` or a module, flat: `module` is empty for a module.
-type Held = { name: String, module: String, path: String, index: Int, start: Int, end: Int }
+type EntryRecord = { name: String, module: String, path: String, index: Int, start: Int, end: Int }
 
 /// A file the load read: a shipped module's text is kept as the load placed it, which is what an
 /// importer reads of it; any other file's is the walk's, and kept as none.
-pub type KeptFile = { path: String, name: String, text: Bytes }
+pub type CachedFile = { path: String, name: String, text: Bytes }
 
 /// What `ply run` keeps of a load: the entry points it offered, the library its unit was compiled
 /// into, the files it read, and what running it reads of its front end.
-type Kept = {
-  mains: List<Held>,
-  modules: List<Held>,
+type CachedLoad = {
+  mains: List<EntryRecord>,
+  modules: List<EntryRecord>,
   library: String,
-  files: List<KeptFile>,
+  files: List<CachedFile>,
   runnable: Runnable,
 }
 
-derive bin for Held
-derive bin for KeptFile
-derive bin for Kept
+derive bin for EntryRecord
+derive bin for CachedFile
+derive bin for CachedLoad
 
 /// What a later run over the same closure takes back of a load.
-pub type Taken = { entries: Entries, library: String, files: List<KeptFile>, runnable: Runnable }
+pub type RestoredLoad = {
+  entries: Entries,
+  library: String,
+  files: List<CachedFile>,
+  runnable: Runnable,
+}
 
-pub fn kept(
+pub fn encode_load(
   entries: Entries,
   library: String,
   files: List<SourceFile>,
@@ -200,24 +205,24 @@ pub fn kept(
         }),
       runnable: runnable,
     },
-    kept_bin(),
+    cached_load_bin(),
   )
 
-/// What `kept` filed, or `None` for bytes it did not write.
-pub fn taken(filed: Bytes) -> Option<Taken> / {abort.raise} =
-  match bin::decode(filed, kept_bin()) {
+/// What `encode_load` filed, or `None` for bytes it did not write.
+pub fn decode_load(filed: Bytes) -> Option<RestoredLoad> / {abort.raise} =
+  match bin::decode(filed, cached_load_bin()) {
     Err(_) -> None,
     Ok(k) ->
       Some({
         entries: {
-          mains: k.mains.map(|h: Held|
+          mains: k.mains.map(|h: EntryRecord|
             {
               name: h.name,
               module: h.module,
               path: h.path,
               at: { module: h.index, start: h.start, end: h.end },
             }),
-          modules: k.modules.map(|h: Held|
+          modules: k.modules.map(|h: EntryRecord|
             { name: h.name, path: h.path, at: { module: h.index, start: h.start, end: h.end } }),
         },
         library: k.library,
@@ -229,16 +234,16 @@ pub fn taken(filed: Bytes) -> Option<Taken> / {abort.raise} =
 /// The files a kept load read, over this run's walk: its modules, the shipped modules the load
 /// pulled as it placed them, then its manifests, in the order the load read them, so a span
 /// renders as this run's own front end would render it. `None` where the walk does not fit.
-pub fn placed_over(
-  files: List<KeptFile>,
-  modules: List<Place>,
-  manifests: List<Place>,
-) -> Option<List<Place>> / {abort.raise} = {
+pub fn restored_sources(
+  files: List<CachedFile>,
+  modules: List<SourceText>,
+  manifests: List<SourceText>,
+) -> Option<List<SourceText>> / {abort.raise} = {
   let own = modules.len();
   let pulled = files.len() - own - manifests.len();
   let walked = modules.concat(manifests);
   if pulled < 0 { None } else {
-    range(0, files.len()).fold(Some([]), |acc: Option<List<Place>>, i: Int|
+    range(0, files.len()).fold(Some([]), |acc: Option<List<SourceText>>, i: Int|
       match ((acc, files.at(i))) {
         (Some(placed), Some(f)) -> if i >= own && i < own + pulled {
           if is_shipped(Bytes::of_string(f.name)) {
@@ -257,20 +262,21 @@ pub fn placed_over(
 
 // --- Tests ------------------------------------------------------------------
 
-type Written = { name: String, text: String }
+type TestModule = { name: String, text: String }
 
 /// The front end's answer over `files`, each a module named by its file, and `std.prelude`, which
 /// it reads beside them.
-fn front_over(files: List<Written>) -> LoadedAnalysis / {abort.raise} =
+fn front_over(files: List<TestModule>) -> LoadedAnalysis / {abort.raise} =
   {
     dump: dump_of(
       analyse(
         parse_all(
-          files.map(|f: Written| { name: Bytes::of_string(f.name), src: Bytes::of_string(f.text) }),
+          files.map(|f: TestModule|
+            { name: Bytes::of_string(f.name), src: Bytes::of_string(f.text) }),
         ),
       ),
     ),
-    files: files.map(|f: Written|
+    files: files.map(|f: TestModule|
       { path: f.name ++ ".ply", name: f.name, text: Bytes::of_string(f.text) }).push({
       path: "<std>/prelude.ply",
       name: "std.prelude",
@@ -278,8 +284,8 @@ fn front_over(files: List<Written>) -> LoadedAnalysis / {abort.raise} =
     }),
     inputs: Map::new(),
     read_ms: 0,
-    front_ms: 0,
-    file_ms: 0,
+    front_end_ms: 0,
+    store_ms: 0,
     cached: false,
   }
 
@@ -324,17 +330,17 @@ test "what a run keeps of a load reads back as it was filed, and nothing else re
   let front = front_over([{ name: "m", text: "fn main() -> Int = 1\n" }]);
   let offered = of_front(front);
   let runnable = runnable_of(front);
-  match taken(kept(offered, "/cache/m.dylib", front.files, runnable)) {
+  match decode_load(encode_load(offered, "/cache/m.dylib", front.files, runnable)) {
     None -> panic("what `kept` wrote reads back"),
     Some(k) -> {
       assert_eq(k.entries, offered);
       assert_eq(k.library, "/cache/m.dylib");
       assert_eq(k.runnable, runnable);
       // The walk holds the program's own text; a shipped module's is the load's.
-      assert_eq(k.files.map(|f: KeptFile| f.text.len() > 0), [false, true])
+      assert_eq(k.files.map(|f: CachedFile| f.text.len() > 0), [false, true])
     },
   };
-  assert(taken(b"an entry of another shape") == None, None)
+  assert(decode_load(b"an entry of another shape") == None, None)
 }
 
 test "a run keeps the effects the program declares and the atoms it performs" {
@@ -345,7 +351,7 @@ test "a run keeps the effects the program declares and the atoms it performs" {
     },
   ]);
   let runnable = runnable_of(front);
-  assert(runnable.declared.any(|d: Declared| d.name == b"m.log"));
+  assert(runnable.declared.any(|d: DeclaredEffect| d.name == b"m.log"));
   assert(runnable.performed.any(|a: Atom| a.effect == b"m.log"))
 }
 
@@ -358,10 +364,13 @@ test "a kept load is placed over this run's walk, its shipped modules as the loa
   let m = { path: "m.ply", text: b"fn main() -> Int = 1\n" };
   let pkg = { path: "ply.pkg", text: b"fn package() -> Manifest = app()\n" };
   assert_eq(
-    placed_over(files, [m], [pkg]),
+    restored_sources(files, [m], [pkg]),
     Some([m, { path: "<std>/prelude.ply", text: b"the prelude" }, pkg]),
   );
   // A walk of more files than the load read, or one short of a module it read, does not fit.
-  assert_eq(placed_over(files, [m, m, m], [pkg]), None);
-  assert_eq(placed_over([{ path: "n.ply", name: "n", text: b"" }].concat(files), [m], [pkg]), None)
+  assert_eq(restored_sources(files, [m, m, m], [pkg]), None);
+  assert_eq(
+    restored_sources([{ path: "n.ply", name: "n", text: b"" }].concat(files), [m], [pkg]),
+    None,
+  )
 }

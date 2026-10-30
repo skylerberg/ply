@@ -1,7 +1,7 @@
 //! Cross-origin resource sharing, as the Fetch standard's CORS protocol has it: a policy as a
 //! value, the answer to a preflight, and the fields a response to a cross-origin request carries.
 //!
-//! A `Policy` is made by `policy` from what it should allow, and refuses (`cors.refused`) one that
+//! A `Policy` is made by `policy` from what it should allow, and refuses (`cors.fail`) one that
 //! admits any origin and also credentials: a browser ignores `*` beside credentials, and the usual
 //! repair, echoing whatever `Origin` arrives, hands every site a user's session. An origin is
 //! `scheme://host` with a port where it is not the scheme's own, as a browser sends it, and is
@@ -20,7 +20,7 @@ import std.ip (ip)
 import std.list
 import std.mime (is_token)
 import std.net
-import std.net (Says, net)
+import std.net (Sends, net)
 import std.string
 import std.url
 
@@ -32,7 +32,7 @@ pub type Origins =
   | Listed(List<String>)
 
 /// What a policy should allow.
-pub type Wanted = {
+pub type PolicyOptions = {
   origins: Origins,
   /// The methods a preflight may ask for; `GET`, `HEAD` and `POST` need none.
   methods: List<Method>,
@@ -43,14 +43,14 @@ pub type Wanted = {
   /// Whether a request may carry cookies and `Authorization`, and a script read its answer.
   credentials: Bool,
   /// How long a browser may keep a preflight's answer.
-  max_age_s: Option<Int>,
+  max_age_seconds: Option<Int>,
 }
 
 /// A policy `policy` made: what it allows, origins and field names in lower case.
-pub opaque type Policy = new { wanted: Wanted }
+pub opaque type Policy = new { wanted: PolicyOptions }
 
 /// Why a policy cannot be made.
-pub type Why =
+pub type Error =
   /// It admits any origin and credentials.
   | AnyOriginWithCredentials
   /// This is no origin: no `http` or `https` URL of a host alone.
@@ -61,24 +61,24 @@ pub type Why =
 /// What this module raises where it refuses.
 pub effect cors {
   /// The policy cannot be made.
-  raise refused(why: Why)
+  raise fail(why: Error)
 }
 
 /// What allows nothing but the origins it lists: no method beyond the simple ones, no field, no
 /// credentials, and no keeping a preflight's answer.
-pub fn wanted(origins: List<String>) -> Wanted =
+pub fn policy_options(origins: List<String>) -> PolicyOptions =
   {
     origins: Listed(origins),
     methods: [],
     headers: [],
     exposed: [],
     credentials: false,
-    max_age_s: None,
+    max_age_seconds: None,
   }
 
-/// The policy that allows what `w` asks, raising `cors.refused` where `make` answers `Err`.
-pub fn policy(w: Wanted) -> Policy / {cors.refused, abort.raise} =
-  if w.origins == AnyOrigin && w.credentials { cors.refused(AnyOriginWithCredentials) } else {
+/// The policy that allows what `w` asks, raising `cors.fail` where `try_policy` answers `Err`.
+pub fn policy(w: PolicyOptions) -> Policy / {cors.fail, abort.raise} =
+  if w.origins == AnyOrigin && w.credentials { cors.fail(AnyOriginWithCredentials) } else {
     let origins = match w.origins {
       AnyOrigin -> AnyOrigin,
       Listed(listed) -> Listed(listed.map(|o: String| origin_checked(o))),
@@ -89,12 +89,12 @@ pub fn policy(w: Wanted) -> Policy / {cors.refused, abort.raise} =
   }
 
 /// The policy that allows what `w` asks, or why there is none.
-pub fn make(w: Wanted) -> Result<Policy, Why> / {abort.raise} = try { policy(w) }
+pub fn try_policy(w: PolicyOptions) -> Result<Policy, Error> / {abort.raise} = try { policy(w) }
 
 /// What `p` allows.
-pub fn allows(p: Policy) -> Wanted = p.wanted
+pub fn allows(p: Policy) -> PolicyOptions = p.wanted
 
-fn origin_checked(o: String) -> String / {cors.refused, abort.raise} =
+fn origin_checked(o: String) -> String / {cors.fail, abort.raise} =
   match url::url_parse(o) {
     Ok(u) -> if (url::url_scheme(u) == "http" || url::url_scheme(u) == "https")
         && url::url_host(u) != None
@@ -102,18 +102,18 @@ fn origin_checked(o: String) -> String / {cors.refused, abort.raise} =
         && url::url_path(u) == ""
         && url::url_query(u) == None
         && url::url_fragment(u) == None { o.ascii_lower() }
-    else { cors.refused(NotAnOrigin(o)) },
-    Err(_) -> cors.refused(NotAnOrigin(o)),
+    else { cors.fail(NotAnOrigin(o)) },
+    Err(_) -> cors.fail(NotAnOrigin(o)),
   }
 
-fn field_checked(h: String) -> String / {cors.refused} =
-  if is_token(h) { h.ascii_lower() } else { cors.refused(NotAField(h)) }
+fn field_checked(h: String) -> String / {cors.fail} =
+  if is_token(h) { h.ascii_lower() } else { cors.fail(NotAField(h)) }
 
 /// The request fields a browser sends across origins without a preflight asking.
 fn safelisted() -> List<String> = ["accept", "accept-language", "content-language", "content-type"]
 
 /// The `Origin` a request names, lower case, where it names one and `p` admits it.
-fn admitted(p: Policy, req: Request) -> Option<String> =
+fn allowed_origin(p: Policy, req: Request) -> Option<String> =
   match http::header(req.headers, "origin") {
     None -> None,
     Some(o) -> {
@@ -145,12 +145,12 @@ pub fn preflight<| e>(p: Policy, req: Request) -> Response<| e> = {
         if t.len() == 0 { inner } else { inner.push(t) }
       }),
   );
-  match admitted(p, req) {
-    None -> varied(p, http::text_response(403, "this origin may not ask for that\n")),
+  match allowed_origin(p, req) {
+    None -> vary_preflight(p, http::text_response(403, "this origin may not ask for that\n")),
     Some(origin) -> if !method_allowed(p, asked_method)
         || asked_fields.any(|f: String|
           !p.wanted.headers.contains(f) && !safelisted().contains(f)) {
-      varied(p, http::text_response(403, "this origin may not ask for that\n"))
+      vary_preflight(p, http::text_response(403, "this origin may not ask for that\n"))
     } else {
       let base = with_origin(p, origin, http::response(204, b""));
       let methods = set_list(
@@ -159,7 +159,7 @@ pub fn preflight<| e>(p: Policy, req: Request) -> Response<| e> = {
         p.wanted.methods.map(http::method_name),
       );
       let fields = set_list(methods, "access-control-allow-headers", asked_fields);
-      let kept = match p.wanted.max_age_s {
+      let kept = match p.wanted.max_age_seconds {
         Some(s) ->
           {
             ..fields,
@@ -167,15 +167,15 @@ pub fn preflight<| e>(p: Policy, req: Request) -> Response<| e> = {
           },
         None -> fields,
       };
-      varied(p, kept)
+      vary_preflight(p, kept)
     },
   }
 }
 
 /// A preflight's answer says it varies by the origin and by what was asked.
-fn varied<| e>(p: Policy, r: Response<| e>) -> Response<| e> =
+fn vary_preflight<| e>(p: Policy, r: Response<| e>) -> Response<| e> =
   http::vary(
-    http::vary(varied_by_origin(p, r), "Access-Control-Request-Method"),
+    http::vary(vary_by_origin(p, r), "Access-Control-Request-Method"),
     "Access-Control-Request-Headers",
   )
 
@@ -209,36 +209,36 @@ fn with_origin<| e>(p: Policy, origin: String, r: Response<| e>) -> Response<| e
   } else { allowed }
 }
 
-fn varied_by_origin<| e>(p: Policy, r: Response<| e>) -> Response<| e> =
+fn vary_by_origin<| e>(p: Policy, r: Response<| e>) -> Response<| e> =
   match p.wanted.origins { AnyOrigin -> r, Listed(_) -> http::vary(r, "Origin") }
 
 /// `res`, the answer to `req`, with the fields `p` gives the origin `req` names: none where it
 /// names none or `p` does not admit it.
-pub fn decorated<| e>(p: Policy, req: Request, res: Response<| e>) -> Response<| e> =
-  varied_by_origin(p, match admitted(p, req) {
+pub fn with_cors_headers<| e>(p: Policy, req: Request, res: Response<| e>) -> Response<| e> =
+  vary_by_origin(p, match allowed_origin(p, req) {
     None -> res,
     Some(origin) ->
       set_list(with_origin(p, origin, res), "access-control-expose-headers", p.wanted.exposed),
   })
 
-/// A preflight answered by `preflight`, and any other request by `app`, `decorated`.
+/// A preflight answered by `preflight`, and any other request by `app`, `with_cors_headers`.
 pub fn serving<| e, s>(
   p: Policy,
   req: Request,
   app: (Request) -> Response<| s> / e,
 ) -> Response<| s> / e =
-  if is_preflight(req) { preflight(p, req) } else { decorated(p, req, app(req)) }
+  if is_preflight(req) { preflight(p, req) } else { with_cors_headers(p, req, app(req)) }
 
 // --- Tests ------------------------------------------------------------------
 
 fn shop() -> Policy / {abort.raise} =
-  match make({
-      ..wanted(["https://Shop.Example.com", "http://localhost:8080"]),
+  match try_policy({
+      ..policy_options(["https://Shop.Example.com", "http://localhost:8080"]),
       methods: [http::Put, http::Delete],
       headers: ["X-Request-Id", "Authorization"],
       exposed: ["X-Total"],
       credentials: true,
-      max_age_s: Some(600),
+      max_age_seconds: Some(600),
     }) {
     Ok(p) -> p,
     Err(_) -> panic("the shop's policy is one"),
@@ -260,16 +260,19 @@ fn asked(
 
 test "a policy that admits any origin with credentials is refused, and so is a bad origin or field" {
   assert_eq(
-    make({ ..wanted([]), origins: AnyOrigin, credentials: true }),
+    try_policy({ ..policy_options([]), origins: AnyOrigin, credentials: true }),
     Err(AnyOriginWithCredentials),
   );
   assert_eq(
-    make(wanted(["https://example.com/path"])),
+    try_policy(policy_options(["https://example.com/path"])),
     Err(NotAnOrigin("https://example.com/path")),
   );
-  assert_eq(make(wanted(["example.com"])), Err(NotAnOrigin("example.com")));
-  assert_eq(make({ ..wanted([]), headers: ["bad field"] }), Err(NotAField("bad field")));
-  assert(make({ ..wanted([]), origins: AnyOrigin }) != Err(AnyOriginWithCredentials))
+  assert_eq(try_policy(policy_options(["example.com"])), Err(NotAnOrigin("example.com")));
+  assert_eq(
+    try_policy({ ..policy_options([]), headers: ["bad field"] }),
+    Err(NotAField("bad field")),
+  );
+  assert(try_policy({ ..policy_options([]), origins: AnyOrigin }) != Err(AnyOriginWithCredentials))
 }
 
 test "a preflight from an origin the policy admits is told what it may do" {
@@ -357,7 +360,7 @@ test "a response to an admitted origin names it, and every response varies by Or
 test "a preflight and the request it cleared are answered over one connection" {
   let asked = b"OPTIONS /orders HTTP/1.1\r\nHost: api.example.com\r\nOrigin: https://shop.example.com\r\nAccess-Control-Request-Method: DELETE\r\n\r\nDELETE /orders HTTP/1.1\r\nHost: api.example.com\r\nOrigin: https://shop.example.com\r\nConnection: close\r\n\r\n";
   let ran = net::on_mem(
-    net::mem_calling(net::mem_empty(), ip::read_socket("198.51.100.4:5000"), [Says(asked)]),
+    net::mem_calling(net::mem_empty(), ip::read_socket("198.51.100.4:5000"), [Sends(asked)]),
     || {
       let listener = net.listen[listener](0);
       http::serve_connection[conn](
@@ -375,7 +378,7 @@ test "a preflight and the request it cleared are answered over one connection" {
 }
 
 test "a policy for any origin answers `*`, and without credentials" {
-  match make({ ..wanted([]), origins: AnyOrigin }) {
+  match try_policy({ ..policy_options([]), origins: AnyOrigin }) {
     Ok(p) -> {
       let r = serving(
         p,

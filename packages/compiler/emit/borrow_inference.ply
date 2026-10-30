@@ -1,0 +1,2290 @@
+//! Lending: which parameters a definition only reads, so a call lends them rather than gives them,
+//! and which answers it reads out of what it is lent, so a caller borrows them. Lean's borrow
+//! inference over the typed form, extended to answers and settled per recursion group of the call
+//! graph against what every callee outside the group hands. A definition is read as a build lowers
+//! it, a tail group's members together, so a jump from one member to another is read as one. Its
+//! handing is what every caller's code is written against.
+
+import std.bytes (ascii_of_int)
+import std.graph
+import compiler.check.types (Type, NamedType, VariableType, option_type, string_type)
+import compiler.check.resolve.tables (qualify)
+import compiler.syntax.parsing (Span, dummy_span, span_between)
+import compiler.emit.keys
+import compiler.emit.keys (RootKey, Named, Specialisation, Generated, EntryPoint, Callee, Root,
+                           Generic, TypeOp, Equal, Order, NumericFunction, Reflect, Show, Digest,
+                           ContainerWalk, Lower, Lift, Drop, Share, Keep, Dup, OnCase, OnWordForm,
+                           Unboxed, RootName, root_name, root_text, unspecialised, ReleaseResource)
+import compiler.emit.generated (container_op_reads)
+import compiler.emit.representations (Def, has_vars)
+import compiler.emit.output (GenericCall, PublishedSignature)
+import compiler.emit.layout
+import compiler.emit.layout (Always, Inline, PlainWords)
+import compiler.emit.typed_ir (param_rep, handed_at, reps_of, handed_of, all_given, ParamTaking,
+                               Carried, no_closure_evidence, Representation, AsWord, AsInt, AsBool,
+                               AsFlattened, AsListView, AsSum, Var, Arg, VarOperand, IntOperand,
+                               ZeroOperand, Rvalue, Primitive, Literal, Static, Allocate, Get, Take,
+                               Tag, Convert, Aggregate, Update, FieldWrite, Call, Apply, Native, Op,
+                               OfHandling, Allocation, ClosureAllocation, ListAllocation,
+                               CaseAllocation, LeafPath, FieldPath, ArgumentPath, CasePath,
+                               CapturePath, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop,
+                               Next, Done, Return, Restart, Jump, Handle, Reset, Destructure, Block,
+                               Fn, Member, Metered, Lambda, Closure, ParamOwnership, OwnedParam,
+                               BorrowedParam, ResultOwnership, OwnedResult, BorrowedResult,
+                               Convention, TagTest, OperationSignature, BorrowSources, IfUnique,
+                               WalkLoop, no_links, is_refcounted, operand_representation,
+                               by_signature, operands, provenance, operand_var, is_unboxing,
+                               Unspecialised, StackAllocation, may_suspend, base_allocation,
+                               is_record_word, CleanupScope, Unwinding, Fail, carried_inits)
+import compiler.emit.typed_ir.handling (Perform)
+import compiler.emit.verify (payload_of, allocates, count_shared_with)
+import compiler.emit.own (insert_reference_counts, may_reuse)
+import compiler.emit.lower.representation (passing, ByReference, value_words)
+import compiler.emit.evidence (declared_arity)
+
+/// How a definition takes the parameters it declares and hands back its answer, which every caller's
+/// code is written against: inferred from its body and its callees' handings, never written. What a
+/// root is handed past them for its row, which differs between its specialisations, it only reads.
+pub type OwnershipSignature = { params: List<ParamOwnership>, result: ResultOwnership }
+
+/// Where the uses are that settled a handing below lending: for each parameter given, the first use
+/// found to give it (`None` where it is lent); for an answer owned, the first return found to make
+/// it so.
+pub type OwnershipReasons = { params: List<Option<Span>>, result: Option<Span> }
+
+/// A definition's handing, and why it is so.
+pub type InferredOwnership = { handing: OwnershipSignature, reason: OwnershipReasons }
+
+/// A definition as the inference reads it: its root's name; its parameters and body as a build
+/// lowers them, alone or as a member of a tail group, whose members' names `group` holds in the order
+/// its `Jump`s number them (none for a root of its own); the parameters, by place, its declaration
+/// lends (E0475), which nothing inferred moves; and the form it was read from, the tail group's where
+/// it is a member, whose resets the ownership pass places.
+pub type InferenceTarget = {
+  def: RootName,
+  f: Fn,
+  group: List<RootName>,
+  borrowed: List<Int>,
+  whole: Fn,
+}
+
+/// How a callee nothing infers is handed `arity` arguments: it takes each and answers a count of its
+/// own.
+pub fn all_owned(arity: Int) -> OwnershipSignature =
+  { params: range(0, arity).map(|_: Int| OwnedParam), result: OwnedResult }
+
+/// The definitions `forms` hold as the inference reads them: each form a root or tail group as the
+/// build lowered it, which emission then counts and prints, and `declared` the parameters each
+/// definition lends by declaration, by its root's name. A specialisation takes its definition's
+/// handing and a root written for a type its fixed one, so neither is read.
+pub fn inference_targets_of(
+  declared: Map<RootName, List<Int>>,
+  forms: List<Fn>,
+) -> List<InferenceTarget> =
+  forms.fold([], |acc: List<InferenceTarget>, f: Fn|
+    match signature_name(f.key) { Some(_) -> acc.concat(targets_of(declared, f)), None -> acc })
+
+/// `into` with the parameters, by place, each of `here`, the definitions of `module`, lends by
+/// declaration (E0475), by its root's name: what `inference_targets_of` reads for them.
+pub fn declared_borrows(
+  into: Map<RootName, List<Int>>,
+  module: Bytes,
+  here: List<Def>,
+) -> Map<RootName, List<Int>> =
+  here.fold(into, |m: Map<RootName, List<Int>>, d: Def|
+    if d.borrowed.len() == 0 { m }
+    else { m.insert(root_name(Named(qualify(module, d.name))), d.borrowed) })
+
+/// Each of `group`'s definitions' handing in its order, and why: a fixpoint that starts every
+/// parameter lent but those reset for reuse and every answer borrowed of nothing, and moves each
+/// down only as far as some use forces it. An answer whose type a type variable leaves open is
+/// owned from the start: a handing holds at every specialisation, and some type holds that answer
+/// otherwise than the generic body does, made afresh (an `Option<Int>` boxes its `Int`, a record
+/// gathers its fields); so is the answer of a definition of no parameters, whose value the unit
+/// may keep for good. A call of a definition outside the group is handed as
+/// `published` holds,
+/// else as `all_owned`.
+///
+/// Settled first with no resets, then again from those of the members it still lends a counted
+/// parameter of, where any is reset: a reset only gives a parameter, so one already given stays
+/// given, and the ownership pass runs only where a handing can move.
+pub fn group_signatures(
+  group: List<InferenceTarget>,
+  published: Map<RootName, OwnershipSignature>,
+) -> List<InferredOwnership> / {abort.raise} = {
+  let plain = inferred_from(group, published, group.map(|_: InferenceTarget| Map::new()));
+  let lending = range(0, group.len()).fold(Map::new(), |m: Map<RootName, Bool>, k: Int|
+    match ((group.at(k), plain.at(k))) {
+      (Some(l), Some(x)) -> if borrows_counted(l, x.handing) && may_reuse(l.whole) {
+        m.insert(root_name(l.whole.key), true)
+      } else { m },
+      _ -> m,
+    });
+  if lending.len() == 0 { plain } else {
+    let placed = lending.fold(
+      Map::new(),
+      |m: Map<RootName, Map<Int, Span>>, name: RootName, _: Bool|
+        match group.find(|l: InferenceTarget| root_name(l.whole.key) == name) {
+          Some(l) -> m.insert(name, resets_of(l.whole)),
+          None -> m,
+        },
+    );
+    let resets = group.map(|l: InferenceTarget|
+      match placed.get(root_name(l.whole.key)) {
+        Some(r) -> by_place(r, l.f.params),
+        None -> Map::new(),
+      });
+    if resets.all(|r: Map<Int, Span>| r.len() == 0) { plain }
+    else { inferred_from(group, published, resets) }
+  }
+}
+
+/// The parameters of `l`, by place, the ownership pass resets for a constructor to reuse where every
+/// parameter of the form it was read from is given, each with where that constructor is.
+pub fn reset_params(l: InferenceTarget) -> Map<Int, Span> = by_place(resets_of(l.whole), l.f.params)
+
+/// `group`'s handings settled from every parameter lent but those `resets` names, member by member.
+fn inferred_from(
+  group: List<InferenceTarget>,
+  published: Map<RootName, OwnershipSignature>,
+  resets: List<Map<Int, Span>>,
+) -> List<InferredOwnership> / {abort.raise} =
+  iterate(
+    range(0, group.len()).fold([], |acc: List<InferredOwnership>, k: Int|
+      match group.at(k) {
+        Some(l) ->
+          acc.push(first_guess(l, match resets.at(k) { Some(r) -> r, None -> Map::new() })),
+        None -> acc,
+      }),
+    group.fold(2, |n: Int, m: InferenceTarget| n + 3 * m.f.params.len() + 2),
+    |cur: List<InferredOwnership>| {
+      let next = round(group, published, cur);
+      if handings(next) == handings(cur) { Stop(next) } else { Continue(next) }
+    },
+  )
+
+/// Whether `h` lends a parameter of `l` that holds a count.
+fn borrows_counted(l: InferenceTarget, h: OwnershipSignature) -> Bool =
+  range(0, l.f.params.len()).any(|k: Int|
+    (match l.f.params.at(k) { Some(p) -> is_refcounted(p.representation), None -> false })
+      && h.params.at(k) == Some(BorrowedParam))
+
+/// What the lending inference settled: `published` with the handing of every definition it read, by
+/// its root's name, and the recursion group of their calls and jumps each was settled with, by its
+/// members' keys.
+pub type InferenceResult = {
+  handed: Map<RootName, OwnershipSignature>,
+  groups: Map<RootName, List<RootKey>>,
+}
+
+/// `published` with the handing of every definition `lendings` holds, each recursion group of their
+/// calls and jumps settled after every group it calls.
+pub fn infer_signatures(
+  lendings: List<InferenceTarget>,
+  given: Map<RootName, OwnershipSignature>,
+  declared: Map<RootName, List<Int>>,
+) -> InferenceResult / {abort.raise} = {
+  let published = with_declared_borrows(given, declared, lendings);
+  let at = range(0, lendings.len()).fold(Map::new(), |m: Map<RootName, Int>, k: Int|
+    match lendings.at(k) { Some(l) -> m.insert(l.def, k), None -> m });
+  let out = lendings.map(|l: InferenceTarget|
+    called(l).fold([], |acc: List<Int>, d: RootName|
+      match at.get(d) { Some(k) -> acc.push(k), None -> acc }));
+  let calls = graph::of(lendings.len(), |k: Int| match out.at(k) { Some(xs) -> xs, None -> [] });
+  graph::components(calls).fold(
+    { handed: published, groups: Map::new() },
+    |done: InferenceResult, comp: List<Int>| {
+      let group = comp.fold([], |g: List<InferenceTarget>, k: Int|
+        match lendings.at(k) { Some(l) -> g.push(l), None -> g });
+      let defs = group.map(|l: InferenceTarget| l.f.key);
+      let hs = handings(group_signatures(group, done.handed));
+      range(0, group.len()).fold(done, |s: InferenceResult, k: Int|
+        match group.at(k) {
+          Some(l) -> match hs.at(k) {
+            Some(h) -> { handed: s.handed.insert(l.def, h), groups: s.groups.insert(l.def, defs) },
+            None -> s,
+          },
+          None -> s,
+        })
+    },
+  )
+}
+
+/// `published` with a handing for each definition `lendings` call that it has none for and that
+/// declares a parameter lent: that parameter lent, every one before it given.
+fn with_declared_borrows(
+  published: Map<RootName, OwnershipSignature>,
+  declared: Map<RootName, List<Int>>,
+  lendings: List<InferenceTarget>,
+) -> Map<RootName, OwnershipSignature> =
+  lendings.fold(published, |look: Map<RootName, OwnershipSignature>, l: InferenceTarget| {
+    let generics = generics_of(l.f);
+    vals_folded(l.f.body, look, |m: Map<RootName, OwnershipSignature>, v: Rvalue|
+      match v {
+        Call(c) -> match callee_def(generics, c.callee) {
+          Some(d) -> if m.contains(d) { m } else {
+            match declared.get(d) {
+              Some(lent) -> {
+                let n = lent.fold(0, |most: Int, k: Int| if k + 1 > most { k + 1 } else { most });
+                m.insert(d, {
+                  params: range(0, n).map(|k: Int|
+                    if lent.contains(k) { BorrowedParam } else { OwnedParam }),
+                  result: OwnedResult,
+                })
+              },
+              None -> m,
+            }
+          },
+          None -> m,
+        },
+        _ -> m,
+      })
+  })
+
+/// A handing as text: each parameter `lent` or `given` in order, then how it answers, each
+/// parameter a borrowed answer reads out of by place and `part` where it is only something read out
+/// of it.
+pub fn ownership_text(h: OwnershipSignature) -> Bytes =
+  Bytes::concat_all([
+    b"[",
+    Bytes::join(
+      h.params.map(|p: ParamOwnership|
+        match p { BorrowedParam -> b"lent", OwnedParam -> b"given" }),
+      b", ",
+    ),
+    b"] ",
+    match h.result {
+      OwnedResult -> b"owned",
+      BorrowedResult(from) ->
+        Bytes::concat_all([
+          b"borrowed(",
+          Bytes::join(
+            from.map(|x: { param: Int, whole: Bool }|
+              if x.whole { ascii_of_int(x.param) } else { ascii_of_int(x.param).concat(b" part") }),
+            b", ",
+          ),
+          b")",
+        ]),
+    },
+  ])
+
+/// `f` written against the handings `handed` holds by definition: a root's parameters and answer, or
+/// each tail group member's, as its definition's handing says (a specialisation's as the one it
+/// specialises, a root written for a type's as `generated_signature`), and each call's as its callee's. A
+/// closure's body takes and answers as its function type does, and its calls as their callees'.
+/// Raises where a handing's parameters are not the convention's, which no call can be written to.
+pub fn with_conventions(f: Fn, handed: Map<RootName, OwnershipSignature>) -> Fn / {abort.raise} = {
+  let own = |k: RootKey, c: Convention|
+    match key_def(k) {
+      Some(d) -> match handed.get(d) { Some(h) -> convention_for(c, h, root_text(d)), None -> c },
+      None -> match k {
+        Generated(x, _) ->
+          convention_for(c, generated_signature(x.op, c.params.len()), root_text(root_name(k))),
+        _ -> c,
+      },
+    };
+  let called = calls_with_conventions(f, generics_of(f), handed);
+  {
+    ..called,
+    convention: if f.members.len() == 0 { own(f.key, f.convention) } else { f.convention },
+    members: f.members.map(|m: Member| { ..m, convention: own(m.key, m.convention) }),
+  }
+}
+
+/// The definition root `k` runs: its own, or the one it specialises.
+fn key_def(k: RootKey) -> Option<RootName> = signature_name(unspecialised(k))
+
+/// The name the inference reads root `k`'s handing under: a definition's, a test's, a law's, a
+/// clause's or a stored root's own; none for a specialisation, which takes its definition's, a root
+/// written for a type, whose handing is fixed, or an entry.
+fn signature_name(k: RootKey) -> Option<RootName> =
+  match k {
+    Specialisation(_, _) -> None,
+    Generated(_, _) -> None,
+    EntryPoint(_) -> None,
+    _ -> Some(root_name(k)),
+  }
+
+/// `c` taking its parameters and answering as `h`, the handing of `what`. An answer borrowed holds no
+/// count of what holds none where `c` holds it: a specialisation at a scalar answers it owned. What
+/// `c` takes past the parameters `h` speaks for, the labels and words a root is handed for its row,
+/// it takes as `c` says.
+fn convention_for(c: Convention, h: OwnershipSignature, what: Bytes) -> Convention / {abort.raise} =
+  if h.params.len() > c.params.len() {
+    panic(
+      String::of_bytes_lossy(
+        Bytes::concat_all([
+          b"a handing of ",
+          ascii_of_int(h.params.len()),
+          b" parameters for a convention of ",
+          ascii_of_int(c.params.len()),
+          b": ",
+          what,
+        ]),
+      ),
+    )
+  } else {
+    {
+      ..handed_at(c, h.params),
+      answered: match h.result {
+        OwnedResult -> OwnedResult,
+        BorrowedResult(from) -> if !is_refcounted(c.result) { OwnedResult } else {
+          BorrowedResult(
+            from.filter(|x: { param: Int, whole: Bool }|
+              match param_rep(c, x.param) { Some(r) -> is_refcounted(r), None -> false }),
+          )
+        },
+      },
+    }
+  }
+
+/// `f` with each call of its body and of its closures' bodies written against its callee's handing,
+/// a generic call found among `generics`, the root's, which number its closures' calls too.
+fn calls_with_conventions(
+  f: Fn,
+  generics: List<RootName>,
+  handed: Map<RootName, OwnershipSignature>,
+) -> Fn / {abort.raise} =
+  {
+    ..f,
+    body: block_with_conventions(root_text(root_name(f.key)), generics, handed, f.body),
+    lambdas: f.lambdas.map(|l: Lambda|
+      match l {
+        Closure(c) -> Closure({ ..c, body: calls_with_conventions(c.body, generics, handed) }),
+      }),
+  }
+
+/// The definitions the generic calls of `f`, a root, and of its closures name, by the calls' number.
+fn generics_of(f: Fn) -> List<RootName> = f.links.generics.map(|g: GenericCall| root_name(g.callee))
+
+fn block_with_conventions(
+  within: Bytes,
+  generics: List<RootName>,
+  handed: Map<RootName, OwnershipSignature>,
+  b: Block,
+) -> Block / {abort.raise} =
+  b.map(|i: Inst|
+    match i {
+      Let(l) -> Let({ ..l, val: value_with_conventions(within, generics, handed, l.val) }),
+      Do(d) -> Do({ ..d, val: value_with_conventions(within, generics, handed, d.val) }),
+      If(x) ->
+        If({
+          ..x,
+          then: block_with_conventions(within, generics, handed, x.then),
+          otherwise: block_with_conventions(within, generics, handed, x.otherwise),
+        }),
+      Case(c) ->
+        Case({
+          ..c,
+          arms: c.arms.map(|a: { when: Int, body: Block }|
+            { when: a.when, body: block_with_conventions(within, generics, handed, a.body) }),
+          rest: block_with_conventions(within, generics, handed, c.rest),
+        }),
+      Match(m) ->
+        Match({
+          arms: m.arms.map(|a: Block| block_with_conventions(within, generics, handed, a)),
+          rest: block_with_conventions(within, generics, handed, m.rest),
+        }),
+      Loop(l) -> Loop({ ..l, body: block_with_conventions(within, generics, handed, l.body) }),
+      Handle(h) -> Handle({ ..h, body: block_with_conventions(within, generics, handed, h.body) }),
+      CleanupScope(Some(xs)) -> CleanupScope(Some(cleanups_with_conventions(generics, handed, xs))),
+      Fail(x) -> Fail({ ..x, letting: cleanups_with_conventions(generics, handed, x.letting) }),
+      _ -> i,
+    })
+
+/// What a failure lets go of, each handed to its type's release as that release takes it.
+fn cleanups_with_conventions(
+  generics: List<RootName>,
+  handed: Map<RootName, OwnershipSignature>,
+  xs: List<Unwinding>,
+) -> List<Unwinding> / {abort.raise} =
+  xs.map(|x: Unwinding|
+    {
+      ..x,
+      convention: convention_for(
+        x.convention,
+        signature_at(handed, generics, Root(x.callee), 1),
+        root_text(root_name(x.callee)),
+      ),
+    })
+
+fn value_with_conventions(
+  within: Bytes,
+  generics: List<RootName>,
+  handed: Map<RootName, OwnershipSignature>,
+  v: Rvalue,
+) -> Rvalue / {abort.raise} =
+  match v {
+    Call(c) ->
+      Call({
+        ..c,
+        convention: convention_for(
+          c.convention,
+          signature_at(handed, generics, c.callee, c.args.len()),
+          Bytes::concat_all([
+            match c.callee {
+              Root(k) -> root_text(root_name(k)),
+              Generic(n) -> match generics.at(n) {
+                Some(d) ->
+                  Bytes::concat_all([b"generic call ", ascii_of_int(n), b" of ", root_text(d)]),
+                None -> b"generic call ".concat(ascii_of_int(n)),
+              },
+            },
+            b" in ",
+            within,
+          ]),
+        ),
+      }),
+    _ -> v,
+  }
+
+// --- What a build lowers ---------------------------------------------------------------------
+
+/// The definitions `f` lowers as the inference reads them: `f` itself, or each member of the tail
+/// group it is, that member's arm of `f`'s body its body.
+fn targets_of(declared: Map<RootName, List<Int>>, f: Fn) -> List<InferenceTarget> = {
+  let lending = |g: Fn, group: List<RootName>| {
+    let name = root_name(g.key);
+    {
+      def: name,
+      f: g,
+      group: group,
+      borrowed: match declared.get(name) { Some(ps) -> ps, None -> [] },
+      whole: f,
+    }
+  };
+  if f.members.len() == 0 { [lending(f, [])] } else {
+    let names = f.members.map(|m: Member| root_name(m.key));
+    range(0, f.members.len()).fold([], |acc: List<InferenceTarget>, i: Int|
+      match f.members.at(i) {
+        Some(m) ->
+          acc.push(
+            lending(
+              {
+                ..f,
+                key: m.key,
+                params: m.params,
+                convention: m.convention,
+                body: arm_of(f.body, i),
+                base: m.base,
+                members: [],
+              },
+              names,
+            ),
+          ),
+        None -> acc,
+      })
+  }
+}
+
+/// Arm `i` of a tail group's body, the body of its member `i`.
+fn arm_of(b: Block, i: Int) -> Block =
+  match b {
+    [Case(c)] ->
+      c.arms.fold([], |body: Block, a: { when: Int, body: Block }|
+        if a.when == i { a.body } else { body }),
+    _ -> [],
+  }
+
+/// `resets` of the parameters `params`, by place.
+fn by_place(resets: Map<Int, Span>, params: List<Var>) -> Map<Int, Span> =
+  range(0, params.len()).fold(Map::new(), |m: Map<Int, Span>, k: Int|
+    match params.at(k) {
+      Some(p) -> match resets.get(p.id) { Some(at) -> m.insert(k, at), None -> m },
+      None -> m,
+    })
+
+/// Each parameter of `f`, or of its tail group's members, by number, whose cells the ownership pass
+/// resets for a constructor to reuse where every parameter is given (Lean's `reset`): the parameter
+/// reset itself, or the one a part it resets was read out of or is held again as. Each comes with
+/// where the constructor taking its cells is.
+fn resets_of(f: Fn) -> Map<Int, Span> = {
+  let giving = |c: Convention|
+    { ..c, params: c.params.map(|p: ParamTaking| { ..p, handed: OwnedParam }) };
+  let counted_form = insert_reference_counts({
+    ..f,
+    convention: giving(f.convention),
+    members: f.members.map(|m: Member| { ..m, convention: giving(m.convention) }),
+  });
+  let params = f.members.fold(f.params, |ps: List<Var>, m: Member| ps.concat(m.params));
+  reused(
+    {
+      held: params.fold(Map::new(), |h: Map<Int, List<Int>>, p: Var| h.insert(p.id, [p.id])),
+      tokens: Map::new(),
+      at: Map::new(),
+    },
+    counted_form.body,
+  ).at
+}
+
+/// What `resets_of` reads off a body with its counts placed: the parameters, by number, each
+/// variable is, holds or was read out of; those whose cells each reuse token holds; and each
+/// parameter whose cells a constructor takes, with where.
+type Reuse = { held: Map<Int, List<Int>>, tokens: Map<Int, List<Int>>, at: Map<Int, Span> }
+
+fn reused(r: Reuse, b: Block) -> Reuse =
+  b.fold(r, |acc: Reuse, i: Inst|
+    match i {
+      Let(l) -> {
+        let from = held_in(acc, l.val);
+        {
+          ..acc,
+          held: if from.len() == 0 { acc.held } else { acc.held.insert(l.var.id, from) },
+          at: match l.val {
+            Allocate(m) -> match m.reuse {
+              Some(t) ->
+                (match acc.tokens.get(t.id) { Some(ps) -> ps, None -> [] }).fold(
+                  acc.at,
+                  |a: Map<Int, Span>, p: Int| if a.contains(p) { a } else { a.insert(p, l.at) },
+                ),
+              None -> acc.at,
+            },
+            _ -> acc.at,
+          },
+        }
+      },
+      Assign(x) ->
+        {
+          ..acc,
+          held: acc.held.insert(x.var.id, joined(held_of(acc, x.var), arg_held(acc, x.arg))),
+        },
+      Destructure(o) ->
+        {
+          ..acc,
+          held: o.words.fold(acc.held, |h: Map<Int, List<Int>>, w: Var|
+            h.insert(w.id, held_of(acc, o.of))),
+        },
+      Reset(x) -> { ..acc, tokens: acc.tokens.insert(x.token.id, held_of(acc, x.of)) },
+      If(x) -> reused(reused(acc, x.then), x.otherwise),
+      Case(c) ->
+        c.arms.fold(reused(acc, c.rest), |a: Reuse, arm: { when: Int, body: Block }|
+          reused(a, arm.body)),
+      Match(m) -> m.arms.fold(reused(acc, m.rest), reused),
+      Loop(l) -> reused(acc, l.body),
+      Handle(h) -> reused(acc, h.body),
+      _ -> acc,
+    })
+
+/// The parameters what `val` answers holds as `reused` reads them: what it reads out of, a field
+/// taken out of a block, or what a value held again as another, with no object made, holds.
+fn held_in(r: Reuse, val: Rvalue) -> List<Int> =
+  match val {
+    Take(t) -> held_of(r, t.of),
+    Convert(p) -> if allocates(operand_representation(p.arg), p.to) { [] }
+    else { arg_held(r, p.arg) },
+    Aggregate(g) -> g.parts.fold([], |ps: List<Int>, a: Arg| joined(ps, arg_held(r, a))),
+    // Written in place, the box answered is `of`'s.
+    Update(u) ->
+      u.sets.fold(held_of(r, u.of), |ps: List<Int>, s: FieldWrite| joined(ps, arg_held(r, s.arg))),
+    _ -> match provenance(val) {
+      BorrowSources(xs) -> xs.fold([], |ps: List<Int>, x: Var| joined(ps, held_of(r, x))),
+      _ -> [],
+    },
+  }
+
+fn held_of(r: Reuse, v: Var) -> List<Int> = match r.held.get(v.id) { Some(ps) -> ps, None -> [] }
+
+fn arg_held(r: Reuse, a: Arg) -> List<Int> =
+  match operand_var(a) { Some(v) -> held_of(r, v), None -> [] }
+
+fn joined(a: List<Int>, b: List<Int>) -> List<Int> =
+  b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
+
+// --- A round -----------------------------------------------------------------------------------
+
+/// Where a variable's counted words come from: the parameters, by place, it is or holds in place
+/// (`true`) or was read out of (`false`), and whether it holds a value the body made, which lives
+/// only while the body holds it.
+type Origin = { bases: Map<Int, Bool>, fresh: Bool }
+
+/// What a body does with a value, read once its walk knows every join, and where in the text: it
+/// consumes it into what it makes, hands it to a call or an operation that takes it and may write
+/// it where it lies, hands it to parameter `param` of definition `to` by a jump to that one's start,
+/// answers it, or sets join `join` to it.
+type Use = { does: Action, at: Span }
+
+type Action =
+  | Consumes(Origin)
+  | PassesOn(Origin)
+  | Jumps({ to: RootName, param: Int, of: Origin, counts: Bool })
+  | Returns(Origin)
+  | Sets({ join: Int, of: Origin })
+
+/// A body walked: each variable's origin, the origins each closure it made holds as its captures,
+/// its uses in order, and the place of the last instruction walked that has one.
+type Walk = {
+  origins: Map<Int, Origin>,
+  captured: Map<Int, List<Origin>>,
+  uses: List<Use>,
+  at: Span,
+}
+
+/// What a walk reads beside the body: each definition's handing as this round has it, the definition
+/// each of the root's generic calls names, the definition walked, its tail group's members in the
+/// order an `Jump` numbers them, and the variables of the blocks it takes to lie in the frame.
+type WalkContext = {
+  look: Map<RootName, OwnershipSignature>,
+  generics: List<RootName>,
+  def: RootName,
+  group: List<RootName>,
+  framed: Map<Int, Bool>,
+}
+
+/// A parameter of definition `to` that a jump hands what the jumping member does not lend on, and
+/// where.
+type Jumped = { to: RootName, param: Int, at: Span }
+
+/// What a member's walk gives against a round's handings: each of its own parameters a use consumes
+/// whole, with where the first such use is, and each parameter of a member it jumps to that must be
+/// given.
+type ConsumedParams = { own: Map<Int, Span>, jumped: List<Jumped> }
+
+type MemberResult = {
+  lending: InferenceTarget,
+  cur: InferredOwnership,
+  walk: Walk,
+  gone: ConsumedParams,
+}
+
+fn first_guess(m: InferenceTarget, resets: Map<Int, Span>) -> InferredOwnership = {
+  let n = declared_arity(m.f.params);
+  let reset = |k: Int| !m.borrowed.contains(k) && resets.contains(k);
+  {
+    handing: {
+      params: range(0, n).map(|k: Int| if reset(k) { OwnedParam } else { BorrowedParam }),
+      result: if n > 0 && is_refcounted(m.f.convention.result) && !has_vars(m.f.result_type) {
+        BorrowedResult([])
+      } else { OwnedResult },
+    },
+    reason: {
+      params: range(0, n).map(|k: Int| if reset(k) { resets.get(k) } else { None }),
+      result: None,
+    },
+  }
+}
+
+fn handings(xs: List<InferredOwnership>) -> List<OwnershipSignature> =
+  xs.map(|x: InferredOwnership| x.handing)
+
+/// Each member's handing settled once against `cur`, the group's so far: a parameter is given where
+/// a use in its own body gives it, or where a member jumps to it with a value that member does not
+/// lend on.
+fn round(
+  group: List<InferenceTarget>,
+  published: Map<RootName, OwnershipSignature>,
+  cur: List<InferredOwnership>,
+) -> List<InferredOwnership> = {
+  let look = range(0, group.len()).fold(
+    published,
+    |m: Map<RootName, OwnershipSignature>, k: Int|
+      match group.at(k) {
+        Some(l) -> match cur.at(k) { Some(c) -> m.insert(l.def, c.handing), None -> m },
+        None -> m,
+      },
+  );
+  let reps = group.fold(Map::new(), |m: Map<RootName, List<Representation>>, l: InferenceTarget|
+    m.insert(l.def, l.f.params.map(|p: Var| p.representation)));
+  let found = range(0, group.len()).fold([], |acc: List<MemberResult>, k: Int|
+    match group.at(k) {
+      Some(l) -> match cur.at(k) {
+        Some(c) -> {
+          let w = member_walk(
+            {
+              look: look,
+              generics: generics_of(l.f),
+              def: l.def,
+              group: l.group,
+              framed: Map::new(),
+            },
+            l.f,
+          );
+          acc.push({
+            lending: l,
+            cur: c,
+            walk: w,
+            gone: consumed_in(c.handing, look, reps, l.f.params.map(|p: Var| p.representation), w),
+          })
+        },
+        None -> acc,
+      },
+      None -> acc,
+    });
+  let jumps = found.fold([], |js: List<Jumped>, x: MemberResult| js.concat(x.gone.jumped));
+  found.map(|x: MemberResult|
+    settled(
+      x.lending,
+      x.cur,
+      x.walk,
+      jumps.fold(x.gone.own, |g: Map<Int, Span>, j: Jumped|
+        if j.to == x.lending.def { first_at(g, j.param, j.at) } else { g }),
+    ))
+}
+
+/// A walk of root `f`'s body, each counted parameter its own base, with its blocks placed.
+fn member_walk(s: WalkContext, f: Fn) -> Walk = stack_placed_walk(s, f).walk
+
+/// A walk of `f`'s body with the blocks it makes placed: each that could lie in the frame does,
+/// until a use consumes it whole, which lays it on the heap, and the body is walked again so, until
+/// no use moves another. It ends, as each walk lays one more block on the heap or settles.
+fn stack_placed_walk(s: WalkContext, f: Fn) -> { walk: Walk, framed: Map<Int, Bool> } = {
+  let start = range(0, f.params.len()).fold(
+    { origins: Map::new(), captured: Map::new(), uses: [], at: dummy_span() },
+    |w: Walk, k: Int|
+      match f.params.at(k) {
+        Some(p) -> defined(w, p, { bases: Map::new().insert(k, true), fresh: false }),
+        None -> w,
+      },
+  );
+  let candidates = stack_candidates(f);
+  walked_until_placed(s, start, f.body, candidates, candidates.len())
+}
+
+/// `b` walked from `start` with the blocks `framed` names in the frame, again with those a use
+/// consumes laid on the heap until none is; `room` more walks at most, which is how many blocks
+/// could still go.
+fn walked_until_placed(
+  s: WalkContext,
+  start: Walk,
+  b: Block,
+  framed: Map<Int, Bool>,
+  room: Int,
+) -> { walk: Walk, framed: Map<Int, Bool> } = {
+  let w = walked({ ..s, framed: framed }, start, b);
+  let gone = escaping_blocks(w);
+  let kept = framed.fold(Map::new(), |m: Map<Int, Bool>, id: Int, _: Bool|
+    if gone.contains(id) { m } else { m.insert(id, true) });
+  if kept.len() == framed.len() || room <= 0 { { walk: w, framed: framed } }
+  else { walked_until_placed(s, start, b, kept, room - 1) }
+}
+
+/// The base a block made in the frame is to the walk: below every parameter's place.
+fn block_base(id: Int) -> Int = 0 - 1 - id
+
+/// The variables of the blocks `f` makes that could lie in its frame: each list of at most a leaf's
+/// items, where nothing in `f` may stop. A closure lies there where the lowering laid it, at an
+/// argument its callee lends. A list holding a record word stays
+/// on the heap: code reading its items at a type variable counts one by its word, which counts no
+/// record lying in a place or a slot of a frame, so only a list that takes its items keeps it.
+fn stack_candidates(f: Fn) -> Map<Int, Bool> =
+  if stops_in(f.body) { Map::new() } else {
+    vals_bound(f.body, Map::new(), |m: Map<Int, Bool>, v: Var, val: Rvalue|
+      match val {
+        Allocate(x) -> match x.made {
+          ListAllocation(n) -> if n > 0 && n <= layout::container_layouts().trie.width
+              && allocation_words(x.made, x.args) <= layout::frame_block_words()
+              && !x.args.any(|a: Arg| match a { VarOperand(y) -> is_record_word(y), _ -> false }) {
+            m.insert(v.id, true)
+          } else { m },
+          _ -> m,
+        },
+        _ -> m,
+      })
+  }
+
+/// `placed` but for the blocks `b` makes once those it made before, the closures the lowering laid
+/// in the frame among them, take `layout.frame_words` words.
+fn capped(b: Block, placed: Map<Int, Bool>) -> Map<Int, Bool> =
+  vals_bound(
+    b,
+    { kept: placed, words: 0 },
+    |acc: { kept: Map<Int, Bool>, words: Int }, v: Var, val: Rvalue|
+      match val {
+        Allocate(x) -> {
+          let w = allocation_words(base_allocation(x.made), x.args);
+          if base_allocation(x.made) != x.made { { ..acc, words: acc.words + w } }
+          else if !placed.contains(v.id) { acc }
+          else if acc.words + w > layout::frame_words() { { ..acc, kept: acc.kept.remove(v.id) } }
+          else { { ..acc, words: acc.words + w } }
+        },
+        _ -> acc,
+      },
+  ).kept
+
+/// The words a block made as `made` of `args` takes: its count, a list's head or a closure's
+/// function, and its parts, a list's each as wide as the widest.
+fn allocation_words(fresh_origin: Allocation, args: List<Arg>) -> Int = {
+  let widths = args.map(|a: Arg| max(1, value_words(operand_representation(a))));
+  match fresh_origin {
+    ListAllocation(n) -> 1 + layout::head_words(layout::list_head()) + n * widths.fold(1, max),
+    _ -> 2 + widths.fold(0, |s: Int, w: Int| s + w),
+  }
+}
+
+/// Whether anything in `b` may stop for a handler that resumes it later.
+fn stops_in(b: Block) -> Bool = vals_folded(b, false, |acc: Bool, v: Rvalue| acc || may_suspend(v))
+
+/// `acc` past each variable `b` and the blocks it holds bind to a value, with that value.
+fn vals_bound<s>(b: Block, acc: s, on: (s, Var, Rvalue) -> s) -> s =
+  b.fold(acc, |a: s, i: Inst|
+    match i {
+      Let(l) -> on(a, l.var, l.val),
+      If(x) -> vals_bound(x.otherwise, vals_bound(x.then, a, on), on),
+      Case(c) ->
+        c.arms.fold(vals_bound(c.rest, a, on), |q: s, arm: { when: Int, body: Block }|
+          vals_bound(arm.body, q, on)),
+      Match(m) -> m.arms.fold(vals_bound(m.rest, a, on), |q: s, arm: Block| vals_bound(arm, q, on)),
+      Loop(l) -> vals_bound(l.body, a, on),
+      Handle(h) -> vals_bound(h.body, a, on),
+      _ -> a,
+    })
+
+/// The variables of the blocks in the frame a use in `w` consumes whole, or carries in part or
+/// whole across a jump: none of them may die with the frame.
+fn escaping_blocks(w: Walk) -> Map<Int, Bool> = {
+  let blocks = |g: Map<Int, Bool>, o: Origin, part: Bool|
+    o.bases.fold(g, |m: Map<Int, Bool>, k: Int, whole: Bool|
+      if k < 0 && (whole || part) { m.insert(0 - 1 - k, true) } else { m });
+  w.uses.fold(Map::new(), |g: Map<Int, Bool>, u: Use|
+    match u.does {
+      Consumes(o) -> blocks(g, o, false),
+      PassesOn(o) -> blocks(g, o, false),
+      Returns(o) -> blocks(g, o, false),
+      Sets(x) -> blocks(g, x.of, false),
+      Jumps(j) -> blocks(g, j.of, true),
+    })
+}
+
+/// `f` and the closures it makes with each block a walk keeps in the frame laid there, against
+/// `look`, the handing of each definition its calls name.
+pub fn with_stack_blocks(f: Fn, look: Map<RootName, OwnershipSignature>) -> Fn = {
+  let s = {
+    look: look,
+    generics: generics_of(f),
+    def: root_name(f.key),
+    group: f.members.map(|m: Member| root_name(m.key)),
+    framed: Map::new(),
+  };
+  {
+    ..f,
+    body: block_with_stack_blocks(f.body, capped(f.body, stack_placed_walk(s, f).framed)),
+    lambdas: f.lambdas.map(|l: Lambda|
+      match l { Closure(c) -> Closure({ ..c, body: with_stack_blocks(c.body, look) }) }),
+  }
+}
+
+/// `b` with each block `framed` names laid in the frame.
+fn block_with_stack_blocks(b: Block, framed: Map<Int, Bool>) -> Block =
+  b.map(|i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Allocate(m) -> if framed.contains(l.var.id) {
+          Let({ ..l, val: Allocate({ ..m, made: StackAllocation(m.made) }) })
+        } else { i },
+        _ -> i,
+      },
+      If(x) ->
+        If({
+          ..x,
+          then: block_with_stack_blocks(x.then, framed),
+          otherwise: block_with_stack_blocks(x.otherwise, framed),
+        }),
+      Case(c) ->
+        Case({
+          ..c,
+          arms: c.arms.map(|a: { when: Int, body: Block }|
+            { when: a.when, body: block_with_stack_blocks(a.body, framed) }),
+          rest: block_with_stack_blocks(c.rest, framed),
+        }),
+      Match(m) ->
+        Match({
+          arms: m.arms.map(|a: Block| block_with_stack_blocks(a, framed)),
+          rest: block_with_stack_blocks(m.rest, framed),
+        }),
+      Loop(l) -> Loop({ ..l, body: block_with_stack_blocks(l.body, framed) }),
+      Handle(h) -> Handle({ ..h, body: block_with_stack_blocks(h.body, framed) }),
+      _ -> i,
+    })
+
+/// What walk `w` gives, against `look`, the group's handings this round, and `h`, the walked
+/// member's own: its parameter whose value is consumed, answered owned, set to an owned join or
+/// jumped with to a given place, or a part of which is handed to a call or an operation that takes
+/// it; and a parameter a jump hands, at a lent place, something the jumping member does not lend
+/// on, so nothing outlasts the jump to release it.
+fn consumed_in(
+  h: OwnershipSignature,
+  look: Map<RootName, OwnershipSignature>,
+  reps: Map<RootName, List<Representation>>,
+  own: List<Representation>,
+  w: Walk,
+) -> ConsumedParams =
+  w.uses.fold({ own: Map::new(), jumped: [] }, |g: ConsumedParams, u: Use|
+    match u.does {
+      Consumes(o) -> { ..g, own: wholes(g.own, o, u.at) },
+      PassesOn(o) -> { ..g, own: parts(g.own, o, u.at) },
+      Jumps(j) -> {
+        let lent_there = match look.get(j.to) {
+          Some(t) -> t.params.at(j.param) == Some(BorrowedParam),
+          None -> false,
+        };
+        // A lent record passed by reference is pointed at again by a jump, never written through:
+        // only a lent record passed by reference, or one laid inside such a one, outlasts it.
+        let pointed = match reps.get(j.to) {
+          Some(rs) -> match rs.at(j.param) { Some(r) -> passing(r) == ByReference, None -> false },
+          None -> false,
+        };
+        let pointable = j.of.bases.len() > 0
+          && j.of.bases.all(|k: Int, whole: Bool|
+            whole && (match own.at(k) { Some(r) -> passing(r) == ByReference, None -> false }));
+        if !lent_there { if j.counts { { ..g, own: wholes(g.own, j.of, u.at) } } else { g } }
+        else if (j.counts
+            && (j.of.fresh || j.of.bases.keys().any(|k: Int| h.params.at(k) == Some(OwnedParam))))
+            || (pointed && !pointable) {
+          { ..g, jumped: g.jumped.push({ to: j.to, param: j.param, at: u.at }) }
+        } else { g }
+      },
+      Returns(o) -> if h.result == OwnedResult { { ..g, own: wholes(g.own, o, u.at) } } else { g },
+      Sets(x) -> if owned_join(w, x.join) { { ..g, own: wholes(g.own, x.of, u.at) } } else { g },
+    })
+
+/// Member `m`'s handing and why, settled from `cur`, its own so far, its walk `w` and what this
+/// round gives of its parameters (`gone`): a parameter its declaration lends stays lent; one given
+/// before or now is given, with the place of the use that first gave it; the answer stays borrowed
+/// while every return answers only what it read out of what it is lent.
+fn settled(
+  m: InferenceTarget,
+  cur: InferredOwnership,
+  w: Walk,
+  gone: Map<Int, Span>,
+) -> InferredOwnership = {
+  let n = declared_arity(m.f.params);
+  let given = |k: Int|
+    !m.borrowed.contains(k) && (cur.handing.params.at(k) == Some(OwnedParam) || gone.contains(k));
+  let params = range(0, n).map(|k: Int| if given(k) { OwnedParam } else { BorrowedParam });
+  let answer = if cur.handing.result == OwnedResult {
+    { returned: OwnedResult, at: cur.reason.result }
+  } else { result_ownership_of(w.uses, params) };
+  {
+    handing: { params: params, result: answer.returned },
+    reason: {
+      params: range(0, n).map(|k: Int|
+        if !given(k) { None }
+        else { match cur.reason.params.at(k) { Some(Some(at)) -> Some(at), _ -> gone.get(k) } }),
+      result: answer.at,
+    },
+  }
+}
+
+/// How a body answering as `uses` say answers, its parameters handed as `params`: borrowed of every
+/// base its answers reach while none holds anything made and each base is lent, else owned, with the
+/// place of the first return that makes it so.
+fn result_ownership_of(
+  uses: List<Use>,
+  params: List<ParamOwnership>,
+) -> { returned: ResultOwnership, at: Option<Span> } =
+  match uses.fold(Ok(Map::new()), |acc: Result<Map<Int, Bool>, Span>, u: Use|
+      match acc {
+        Err(_) -> acc,
+        Ok(m) -> match u.does {
+          Returns(o) -> if o.fresh
+              || o.bases.keys().any(|k: Int| params.at(k) != Some(BorrowedParam)) { Err(u.at) }
+          else { Ok(bases_with(m, o)) },
+          _ -> acc,
+        },
+      }) {
+    Err(at) -> { returned: OwnedResult, at: Some(at) },
+    Ok(m) ->
+      {
+        returned: BorrowedResult(
+          m.fold([], |acc: List<{ param: Int, whole: Bool }>, k: Int, whole: Bool|
+            acc.push({ param: k, whole: whole })),
+        ),
+        at: None,
+      },
+  }
+
+/// Whether join `j` holds a count of its own: some value set to it was made in the body, so every
+/// value set to it is consumed.
+fn owned_join(w: Walk, j: Int) -> Bool = match w.origins.get(j) { Some(o) -> o.fresh, None -> true }
+
+fn wholes(g: Map<Int, Span>, o: Origin, at: Span) -> Map<Int, Span> =
+  o.bases.fold(g, |acc: Map<Int, Span>, k: Int, whole: Bool|
+    if whole { first_at(acc, k, at) } else { acc })
+
+/// `g` giving each parameter `o` holds or was read out of, as Lean's inference owns a value whose
+/// part is owned: a part a callee may write moves out of what is given, and out of what is lent is
+/// counted again, which leaves the write a part held twice to copy.
+fn parts(g: Map<Int, Span>, o: Origin, at: Span) -> Map<Int, Span> =
+  o.bases.fold(g, |acc: Map<Int, Span>, k: Int, _: Bool| first_at(acc, k, at))
+
+fn first_at(g: Map<Int, Span>, k: Int, at: Span) -> Map<Int, Span> =
+  if g.contains(k) { g } else { g.insert(k, at) }
+
+// --- A walk ------------------------------------------------------------------------------------
+
+fn no_origin() -> Origin = { bases: Map::new(), fresh: false }
+
+fn fresh_origin() -> Origin = { bases: Map::new(), fresh: true }
+
+fn bases_with(m: Map<Int, Bool>, o: Origin) -> Map<Int, Bool> =
+  o.bases.fold(m, |acc: Map<Int, Bool>, k: Int, whole: Bool|
+    acc.insert(k, whole || acc.get(k) == Some(true)))
+
+fn union(a: Origin, b: Origin) -> Origin =
+  { bases: bases_with(a.bases, b), fresh: a.fresh || b.fresh }
+
+/// What is read out of a value of origin `o`: a word of its own, so no base of it is that word.
+fn read_out(o: Origin) -> Origin =
+  {
+    bases: o.bases.fold(Map::new(), |m: Map<Int, Bool>, k: Int, _: Bool| m.insert(k, false)),
+    fresh: o.fresh,
+  }
+
+/// What an answer borrowed out of a value of origin `o` holds of it: read out of each parameter it
+/// reaches, but whole of a block laid in the frame, since the answer may be that block, whose count
+/// nothing takes, so keeping the answer must keep the block off the frame.
+fn borrowed_out(o: Origin) -> Origin =
+  {
+    bases: o.bases.fold(Map::new(), |m: Map<Int, Bool>, k: Int, whole: Bool|
+      m.insert(k, k < 0 && whole)),
+    fresh: o.fresh,
+  }
+
+/// `v`'s origin; one the walk never bound holds a count of its own, so nothing is lent through it.
+fn origin_of(w: Walk, v: Var) -> Origin =
+  match w.origins.get(v.id) {
+    Some(o) -> o,
+    None -> if is_refcounted(v.representation) { fresh_origin() } else { no_origin() },
+  }
+
+fn arg_origin(w: Walk, a: Arg) -> Origin =
+  match a { VarOperand(v) -> origin_of(w, v), _ -> no_origin() }
+
+/// `w` with `v` of origin `o`, where `v` holds a count or is passed by reference: a record a jump
+/// points at again must lie where its caller lent it, whether or not it holds a count.
+fn defined(w: Walk, v: Var, o: Origin) -> Walk =
+  if is_refcounted(v.representation) || passing(v.representation) == ByReference {
+    { ..w, origins: w.origins.insert(v.id, o) }
+  } else { w }
+
+fn used(w: Walk, d: Action) -> Walk = { ..w, uses: w.uses.push({ does: d, at: w.at }) }
+
+/// `w` past consuming `a`, where it holds a count: a value holding none gives nothing up.
+fn consumed(w: Walk, a: Arg) -> Walk =
+  if is_refcounted(operand_representation(a)) { used(w, Consumes(arg_origin(w, a))) } else { w }
+
+fn taken(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
+  ops.fold(w, |acc: Walk, o: { arg: Arg, takes: Bool }|
+    if o.takes { consumed(acc, o.arg) } else { acc })
+
+/// `w` past handing `a` to a call or an operation that takes it, where it holds a count.
+fn handed_on(w: Walk, a: Arg) -> Walk =
+  if is_refcounted(operand_representation(a)) { used(w, PassesOn(arg_origin(w, a))) } else { w }
+
+fn handed_all(w: Walk, ops: List<{ arg: Arg, takes: Bool }>) -> Walk =
+  ops.fold(w, |acc: Walk, o: { arg: Arg, takes: Bool }|
+    if o.takes { handed_on(acc, o.arg) } else { acc })
+
+/// Each of `args` handed to its parameter of `to` by a jump to that one's start.
+fn jumped(w: Walk, to: RootName, args: List<Arg>) -> Walk =
+  range(0, args.len()).fold(w, |a: Walk, k: Int|
+    match args.at(k) {
+      Some(x) ->
+        used(
+          a,
+          Jumps({
+            to: to,
+            param: k,
+            of: arg_origin(a, x),
+            counts: is_refcounted(operand_representation(x)),
+          }),
+        ),
+      None -> a,
+    })
+
+/// The one recursion: `b` walked in order, each use at the place of the last instruction before it
+/// that has one; a nested block is walked from the place before it, which holds again after it.
+fn walked(s: WalkContext, w: Walk, b: Block) -> Walk =
+  b.fold(w, |acc: Walk, i: Inst|
+    match i {
+      Let(l) -> {
+        let v = valued(s, { ..acc, at: l.at }, l.val, Some(l.var));
+        defined(v.walk, l.var, v.origin)
+      },
+      Do(d) -> valued(s, { ..acc, at: d.at }, d.val, None).walk,
+      Decl(v) -> defined(acc, v, no_origin()),
+      Assign(x) -> {
+        // A constant set to a counted join is held as the join's count.
+        let o = match x.arg {
+          VarOperand(_) -> arg_origin(acc, x.arg),
+          _ -> if is_refcounted(operand_representation(x.arg)) { fresh_origin() }
+          else { no_origin() },
+        };
+        let set = defined(acc, x.var, union(origin_of(acc, x.var), o));
+        if is_refcounted(x.var.representation) { used(set, Sets({ join: x.var.id, of: o })) }
+        else { set }
+      },
+      If(x) -> placed(walked(s, placed(walked(s, acc, x.then), acc.at), x.otherwise), acc.at),
+      Case(c) ->
+        placed(
+          c.arms.fold(walked(s, acc, c.rest), |a: Walk, arm: { when: Int, body: Block }|
+            walked(s, placed(a, acc.at), arm.body)),
+          acc.at,
+        ),
+      Match(m) ->
+        placed(
+          m.arms.fold(walked(s, acc, m.rest), |a: Walk, arm: Block|
+            walked(s, placed(a, acc.at), arm)),
+          acc.at,
+        ),
+      Loop(l) -> {
+        let looping = l.state.fold(
+          carried_inits(l.state).fold(acc, consumed),
+          |a: Walk, c: Carried| defined(a, c.var, fresh_origin()),
+        );
+        defined(placed(walked(s, looping, l.body), acc.at), l.result, fresh_origin())
+      },
+      Next(args) -> args.fold(acc, consumed),
+      Done(a) -> consumed(acc, a),
+      Return(a) -> if is_refcounted(operand_representation(a)) {
+        used(acc, Returns(arg_origin(acc, a)))
+      } else { acc },
+      Restart(args) -> jumped(acc, s.def, args),
+      Jump(e) -> match s.group.at(e.member) {
+        Some(to) -> jumped(acc, to, e.args),
+        None -> e.args.fold(acc, consumed),
+      },
+      Handle(h) ->
+        defined(
+          placed(walked(s, taken(acc, by_signature(h.args, h.uses)), h.body), acc.at),
+          h.result,
+          fresh_origin(),
+        ),
+      _ -> acc,
+    })
+
+fn placed(w: Walk, at: Span) -> Walk = { ..w, at: at }
+
+/// What `val`, bound to `bound` where it binds one, holds and does with its operands. It consumes
+/// what `tir.operands` says it does, but for a call, which lends what its callee lends; a function
+/// applied, which the call reads while its caller holds it; and a word held again as another
+/// (`verify.count_shared_with`), which holds what its operand holds. A value read out of another holds that
+/// one's bases as read out of them, a part of a transparent value or a sum's payload as they are.
+fn valued(
+  s: WalkContext,
+  w: Walk,
+  val: Rvalue,
+  bound: Option<Var>,
+) -> { walk: Walk, origin: Origin } = {
+  let v = valued_as(s, w, val, bound);
+  { ..v, walk: borrowed_from_blocks(blocks_taken(v.walk, w, val), val, bound, v.origin) }
+}
+
+/// `w` past a counted value `val` that holds anything of a block laid in the frame, read out of it,
+/// borrowed of it, or that block held again: that block goes on the heap, since a block in the frame
+/// holds no count to keep what is read out of it alive by, nor to promote it with.
+fn borrowed_from_blocks(w: Walk, val: Rvalue, bound: Option<Var>, o: Origin) -> Walk = {
+  let borrows = match val { Allocate(_) -> false, _ -> true };
+  let counts = match bound { Some(v) -> is_refcounted(v.representation), None -> false };
+  let blocks = o.bases.fold(Map::new(), |m: Map<Int, Bool>, k: Int, _: Bool|
+    if k < 0 { m.insert(k, true) } else { m });
+  if !borrows || !counts || blocks.len() == 0 { w }
+  else { used(w, Consumes({ bases: blocks, fresh: false })) }
+}
+
+/// `after` past what `val` takes of the blocks laid in the frame, read off `before`: anything but a
+/// call or an application, which hand what their convention gives, takes what `tir.operands` says,
+/// and a block it takes cannot die with the frame.
+fn blocks_taken(after: Walk, before: Walk, val: Rvalue) -> Walk =
+  match val {
+    Call(_) -> after,
+    Apply(_) -> after,
+    Allocate(_) -> after,
+    _ ->
+      operands(val).fold(after, |a: Walk, o: { arg: Arg, takes: Bool }|
+        if !o.takes { a } else {
+          let blocks = arg_origin(before, o.arg).bases.fold(
+            Map::new(),
+            |m: Map<Int, Bool>, k: Int, whole: Bool|
+              if k < 0 && whole { m.insert(k, true) } else { m },
+          );
+          if blocks.len() == 0 { a } else { used(a, Consumes({ bases: blocks, fresh: false })) }
+        }),
+  }
+
+fn valued_as(
+  s: WalkContext,
+  w: Walk,
+  val: Rvalue,
+  bound: Option<Var>,
+) -> { walk: Walk, origin: Origin } =
+  match val {
+    Primitive(_) -> { walk: w, origin: fresh_origin() },
+    Literal(_) -> { walk: w, origin: fresh_origin() },
+    Static(_) -> { walk: w, origin: no_origin() },
+    Tag(_) -> { walk: w, origin: no_origin() },
+    Allocate(m) -> {
+      let framed = base_allocation(m.made) != m.made
+        || (match bound { Some(to) -> s.framed.contains(to.id), None -> false });
+      // A block laid in the frame borrows what it holds, but never a block that could lie there.
+      let stored = if framed {
+        m.args.fold(w, |a: Walk, x: Arg| {
+          let o = arg_origin(w, x);
+          let blocks = o.bases.fold(Map::new(), |b: Map<Int, Bool>, k: Int, whole: Bool|
+            if k < 0 { b.insert(k, whole) } else { b });
+          if blocks.len() == 0 { a } else { used(a, Consumes({ bases: blocks, fresh: false })) }
+        })
+      } else { taken(w, operands(val)) };
+      {
+        walk: match bound {
+          Some(to) -> match m.made {
+            ClosureAllocation(_) ->
+              {
+                ..stored,
+                captured: stored.captured.insert(to.id, m.args.map(|x: Arg| arg_origin(w, x))),
+              },
+            _ -> stored,
+          },
+          None -> stored,
+        },
+        origin: match bound {
+          Some(to) -> if s.framed.contains(to.id) {
+            { bases: Map::new().insert(block_base(to.id), true), fresh: false }
+          } else { fresh_origin() },
+          None -> fresh_origin(),
+        },
+      }
+    },
+    Get(g) ->
+      {
+        walk: w,
+        origin: match g.path {
+          LeafPath(_) -> origin_of(w, g.of),
+          CapturePath(k) -> match w.captured.get(g.of.id) {
+            Some(cs) -> match cs.at(k) { Some(o) -> o, None -> read_out(origin_of(w, g.of)) },
+            None -> read_out(origin_of(w, g.of)),
+          },
+          _ -> match bound {
+            Some(y) -> if payload_of(val, y) != None { origin_of(w, g.of) }
+            else { read_out(origin_of(w, g.of)) },
+            None -> read_out(origin_of(w, g.of)),
+          },
+        },
+      },
+    Take(t) -> { walk: w, origin: read_out(origin_of(w, t.of)) },
+    Convert(p) -> match again_of(bound, val) {
+      Some(x) -> { walk: w, origin: origin_of(w, x) },
+      None -> if is_unboxing(p.arg, p.to) { { walk: w, origin: read_out(arg_origin(w, p.arg)) } }
+      else if operands(val).any(|o: { arg: Arg, takes: Bool }| o.takes) {
+        { walk: consumed(w, p.arg), origin: fresh_origin() }
+      } else { { walk: w, origin: no_origin() } },
+    },
+    // The ownership pass holds a value gathered from counted parts as a count of its own, which
+    // takes each part, but for a one-word sum gathered from one word, which holds that word again.
+    Aggregate(g) -> match again_of(bound, val) {
+      Some(x) -> { walk: w, origin: origin_of(w, x) },
+      None ->
+        {
+          walk: taken(w, operands(val)),
+          origin: if g.parts.any(|a: Arg| is_refcounted(operand_representation(a))) {
+            fresh_origin()
+          } else { no_origin() },
+        },
+    },
+    Call(c) -> {
+      let h = signature_at(s.look, s.generics, c.callee, c.args.len());
+      {
+        walk: range(0, c.args.len()).fold(w, |a: Walk, k: Int|
+          if h.params.at(k) == Some(BorrowedParam) { a }
+          else { match c.args.at(k) { Some(x) -> handed_on(a, x), None -> a } }),
+        origin: match h.result {
+          OwnedResult -> fresh_origin(),
+          BorrowedResult(from) ->
+            from.fold(no_origin(), |o: Origin, x: { param: Int, whole: Bool }|
+              match c.args.at(x.param) {
+                Some(a) ->
+                  union(o, if x.whole { arg_origin(w, a) } else { borrowed_out(arg_origin(w, a)) }),
+                None -> o,
+              }),
+        },
+      }
+    },
+    Update(_) -> { walk: taken(w, operands(val)), origin: fresh_origin() },
+    Apply(_) -> { walk: handed_all(w, operands(val).drop(1)), origin: fresh_origin() },
+    Native(n) -> { walk: handed_all(w, operands(val)), origin: result_origin(w, n.args, n.uses) },
+    Op(o) -> { walk: handed_all(w, operands(val)), origin: result_origin(w, o.args, o.uses) },
+    IfUnique(x) -> { walk: taken(w, operands(val)), origin: arg_origin(w, VarOperand(x)) },
+    WalkLoop(x) ->
+      {
+        walk: taken(w, operands(val)),
+        origin: if x.op == Share { no_origin() } else { fresh_origin() },
+      },
+    Unspecialised(_) -> { walk: taken(w, operands(val)), origin: fresh_origin() },
+  }
+
+fn again_of(bound: Option<Var>, val: Rvalue) -> Option<Var> =
+  match bound { Some(y) -> count_shared_with(y, val), None -> None }
+
+/// What an operation that answers as `uses` says answers: a count of its own, or what it read out
+/// of its first operand.
+fn result_origin(w: Walk, args: List<Arg>, uses: OperationSignature) -> Origin =
+  if uses.owned { fresh_origin() }
+  else { match args.at(0) { Some(a) -> borrowed_out(arg_origin(w, a)), None -> no_origin() } }
+
+/// How `c`, called with `arity` arguments, is handed them: a definition as `look` has it, the
+/// definition a generic call names found in `generics` by its number, a root written for a type as
+/// `generated_signature` says, anything else taking all it is handed.
+fn signature_at(
+  look: Map<RootName, OwnershipSignature>,
+  generics: List<RootName>,
+  c: Callee,
+  arity: Int,
+) -> OwnershipSignature =
+  match callee_def(generics, c) {
+    Some(d) -> match look.get(d) { Some(h) -> h, None -> all_owned(arity) },
+    None -> match c {
+      Root(k) -> match k {
+        Generated(x, _) -> generated_signature(x.op, arity),
+        _ -> all_owned(arity),
+      },
+      Generic(_) -> all_owned(arity),
+    },
+  }
+
+/// The handing of a root written for a type, `arity` operands, as its generator writes it and the
+/// runtime calls it: a comparison, a reflection, a printing, a digest, a lowering, a container's walk
+/// (but for the list a gathering walk adds to) and a lowering's loop over a list's items or entries,
+/// a share, a keep and a count taken once more only read their operands and answer afresh, and so
+/// does the entry the runtime lowers a word form through, which it lends that word; a drop, a
+/// release, a copy, a lifting and a lifting's loop take them. A case's root, and one over a value as
+/// a body holds it, hands as its operation does.
+pub fn generated_signature(op: TypeOp, arity: Int) -> OwnershipSignature =
+  {
+    params: range(0, arity).map(|k: Int| if reads(op, k) { BorrowedParam } else { OwnedParam }),
+    result: OwnedResult,
+  }
+
+/// Whether the root written for a type that does `op` only reads its operand `k`.
+fn reads(op: TypeOp, k: Int) -> Bool =
+  match op {
+    Equal -> true,
+    Order -> true,
+    NumericFunction(_) -> true,
+    Reflect -> true,
+    Show -> true,
+    Digest -> true,
+    Lower -> true,
+    Share -> true,
+    Keep -> true,
+    Dup -> true,
+    ReleaseResource -> true,
+    ContainerWalk(c) -> container_op_reads(c, k),
+    OnCase(c) -> reads(c.op, k),
+    OnWordForm(w) -> reads(w, k),
+    Unboxed(h) -> reads(h, k),
+    _ -> false,
+  }
+
+/// The definition a call of `c` runs, by name: a definition, one at type arguments, or the one a
+/// generic call names, which `generics` holds by the call's number.
+fn callee_def(generics: List<RootName>, c: Callee) -> Option<RootName> =
+  match c { Root(k) -> key_def(k), Generic(i) -> generics.at(i) }
+
+/// The definitions `l` calls or jumps to, each once: its body's callees and its tail group's
+/// members. Its closures' bodies are not read: what one does with a capture is its closure's to
+/// count.
+fn called(l: InferenceTarget) -> List<RootName> = calls_in(generics_of(l.f), l.group, l.f.body)
+
+fn calls_in(generics: List<RootName>, acc: List<RootName>, b: Block) -> List<RootName> =
+  vals_folded(b, acc, |a: List<RootName>, v: Rvalue| call_named(generics, a, v))
+
+/// `acc` folded by `on` over each value `b` and the blocks it holds bind or do.
+fn vals_folded<s>(b: Block, acc: s, on: (s, Rvalue) -> s) -> s =
+  b.fold(acc, |a: s, i: Inst|
+    match i {
+      Let(l) -> on(a, l.val),
+      Do(d) -> on(a, d.val),
+      If(x) -> vals_folded(x.otherwise, vals_folded(x.then, a, on), on),
+      Case(c) ->
+        c.arms.fold(vals_folded(c.rest, a, on), |n: s, arm: { when: Int, body: Block }|
+          vals_folded(arm.body, n, on)),
+      Match(m) ->
+        m.arms.fold(vals_folded(m.rest, a, on), |n: s, arm: Block| vals_folded(arm, n, on)),
+      Loop(l) -> vals_folded(l.body, a, on),
+      Handle(h) -> vals_folded(h.body, a, on),
+      _ -> a,
+    })
+
+/// The handing each definition `outside` names was written against by the calls of `f`'s body and
+/// of its closures' bodies, as `handed` holds it, each definition once, as an answer publishes it; a
+/// generic call found among `generics`, the root's.
+fn assumed_in(
+  f: Fn,
+  generics: List<RootName>,
+  handed: Map<RootName, OwnershipSignature>,
+  outside: (RootName) -> Bool,
+) -> List<PublishedSignature> = {
+  let added = |a: List<PublishedSignature>, p: PublishedSignature|
+    if a.any(|x: PublishedSignature| x.def == p.def) { a } else { a.push(p) };
+  let own = vals_folded(f.body, [], |a: List<PublishedSignature>, v: Rvalue|
+    match v {
+      Call(c) -> match callee_def(generics, c.callee) {
+        Some(d) -> if !outside(d) { a }
+        else { added(a, published_of(d, signature_at(handed, generics, c.callee, c.args.len()))) },
+        None -> a,
+      },
+      _ -> a,
+    });
+  f.lambdas.fold(own, |a: List<PublishedSignature>, l: Lambda|
+    match l { Closure(c) -> assumed_in(c.body, generics, handed, outside).fold(a, added) })
+}
+
+/// `h`, the handing of definition `def`, as an answer publishes it.
+pub fn published_of(def: RootName, h: OwnershipSignature) -> PublishedSignature =
+  {
+    def: def,
+    borrowed: h.params.map(|p: ParamOwnership| p == BorrowedParam),
+    borrowed_from: match h.result { OwnedResult -> None, BorrowedResult(from) -> Some(from) },
+  }
+
+/// The handings answers published as `ps`, by definition.
+pub fn signatures_from(ps: List<PublishedSignature>) -> Map<RootName, OwnershipSignature> =
+  ps.fold(Map::new(), |m: Map<RootName, OwnershipSignature>, p: PublishedSignature|
+    m.insert(p.def, {
+      params: p.borrowed.map(|l: Bool| if l { BorrowedParam } else { OwnedParam }),
+      result: match p.borrowed_from { None -> OwnedResult, Some(from) -> BorrowedResult(from) },
+    }))
+
+/// A form of the build written against the handings the inference settled: the handings of the
+/// definitions it defines as its answer publishes them; those of the definitions outside its group
+/// it was written against, a specialisation's own definition's among them; and that group, by its
+/// members' keys, where it holds more than the form's own.
+pub type InferredFn = {
+  form: Fn,
+  handings: List<PublishedSignature>,
+  assumed: List<PublishedSignature>,
+  group: List<RootKey>,
+}
+
+/// `f`, a form of the build, written against `s`: its own convention, each member's, and each of its
+/// calls' as their definitions' handings say (`with_conventions`).
+pub fn inferred_fn(f: Fn, s: InferenceResult) -> InferredFn / {abort.raise} = {
+  let lent = with_stack_blocks(with_conventions(f, s.handed), s.handed);
+  let own = if lent.members.len() == 0 { [{ key: lent.key, convention: lent.convention }] }
+  else { lent.members.map(|m: Member| { key: m.key, convention: m.convention }) };
+  let defs = own.fold([], |acc: List<RootKey>, o: { key: RootKey, convention: Convention }|
+    match signature_name(o.key) { Some(_) -> acc.push(o.key), None -> acc });
+  let group = defs.fold(defs, |acc: List<RootKey>, d: RootKey|
+    match s.groups.get(root_name(d)) {
+      Some(g) ->
+        g.fold(acc, |a: List<RootKey>, x: RootKey| if a.contains(x) { a } else { a.push(x) }),
+      None -> acc,
+    });
+  let inside = group.map(root_name);
+  // A specialisation takes as its definition hands, whichever form of the build settled that.
+  let specialised = own.fold(
+    [],
+    |acc: List<PublishedSignature>, o: { key: RootKey, convention: Convention }|
+      match o.key {
+        Specialisation(_, _) -> {
+          let d = root_name(unspecialised(o.key));
+          acc.push(
+            published_of(d, match s.handed.get(d) {
+              Some(h) -> h,
+              None -> all_owned(o.convention.params.len()),
+            }),
+          )
+        },
+        _ -> acc,
+      },
+  );
+  {
+    form: lent,
+    handings: defs.fold([], |acc: List<PublishedSignature>, d: RootKey| {
+      let n = root_name(d);
+      match s.handed.get(n) { Some(h) -> acc.push(published_of(n, h)), None -> acc }
+    }),
+    assumed: assumed_in(lent, generics_of(lent), s.handed, |d: RootName| !inside.contains(d)).fold(
+      specialised,
+      |a: List<PublishedSignature>, p: PublishedSignature|
+        if a.any(|x: PublishedSignature| x.def == p.def) { a } else { a.push(p) },
+    ),
+    group: if group.len() > defs.len() { group } else { [] },
+  }
+}
+
+fn call_named(generics: List<RootName>, a: List<RootName>, v: Rvalue) -> List<RootName> =
+  match v {
+    Call(c) -> match callee_def(generics, c.callee) {
+      Some(d) -> if a.contains(d) { a } else { a.push(d) },
+      None -> a,
+    },
+    _ -> a,
+  }
+
+fn of_type(id: Int, ty: Bytes, rep: Representation) -> Var =
+  { id: id, ty: NamedType({ name: ty, args: [] }), representation: rep }
+
+fn word(id: Int) -> Var = of_type(id, b"String", AsWord)
+
+fn tree(id: Int) -> Var = of_type(id, b"m.Tree", AsWord)
+
+fn int(id: Int) -> Var = of_type(id, b"Int", AsInt)
+
+fn flag(id: Int) -> Var = of_type(id, b"Bool", AsBool)
+
+fn bind(v: Var, val: Rvalue) -> Inst = Let({ var: v, val: val, at: dummy_span(), unwind: [] })
+
+fn given_all(params: List<Var>, answer: Representation) -> Convention =
+  {
+    params: all_given(params.map(|p: Var| p.representation)),
+    result: answer,
+    destination_passing: false,
+    answered: OwnedResult,
+  }
+
+/// Definition `m.<name>` over `params`, answering as `answer`, nothing about it declared.
+fn def_of(name: Bytes, params: List<Var>, answer: Representation, body: Block) -> InferenceTarget = {
+  let f = {
+    key: Named(qualify(b"m", name)),
+    kind: Metered,
+    params: params,
+    convention: given_all(params, answer),
+    result_type: NamedType({ name: b"T", args: [] }),
+    body: body,
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: no_links(),
+    statics: [],
+  };
+  { def: of_m(name), f: f, group: [], borrowed: [], whole: f }
+}
+
+/// The name of the root of definition `m.<name>`.
+fn of_m(name: Bytes) -> RootName = root_name(Named(qualify(b"m", name)))
+
+/// A call of `m.<name>` handing `args`, as the lowering writes one before it reads any handing.
+fn call_of(name: Bytes, args: List<Arg>) -> Rvalue =
+  Call({
+    callee: Root(Named(qualify(b"m", name))),
+    args: args,
+    convention: {
+      params: all_given(args.map(operand_representation)),
+      result: AsWord,
+      destination_passing: false,
+      answered: OwnedResult,
+    },
+    suspends: false,
+  })
+
+/// What `group` settles on, each of `published` handing `m.<name>` as it says.
+fn settled_with(
+  group: List<InferenceTarget>,
+  published: List<{ name: Bytes, handing: OwnershipSignature }>,
+) -> List<OwnershipSignature> / {abort.raise} =
+  handings(
+    group_signatures(
+      group,
+      published.fold(
+        Map::new(),
+        |m: Map<RootName, OwnershipSignature>, p: { name: Bytes, handing: OwnershipSignature }|
+          m.insert(of_m(p.name), p.handing),
+      ),
+    ),
+  )
+
+fn alone(group: List<InferenceTarget>) -> List<OwnershipSignature> / {abort.raise} =
+  settled_with(group, [])
+
+fn made_of(fresh_origin: Allocation, args: List<Arg>) -> Rvalue =
+  Allocate({ made: fresh_origin, args: args, reuse: None })
+
+test "a walk that only reads its parameters lends both" {
+  let a = word(0);
+  let t = tree(1);
+  let l = tree(2);
+  let r = tree(3);
+  let x = int(4);
+  let y = int(5);
+  let z = int(6);
+  let walk = def_of(b"walk", [a, t], AsInt, [
+    Case({
+      on: t,
+      test: TagTest([b"m.Leaf", b"m.Node"]),
+      arms: [
+        {
+          when: 1,
+          body: [
+            bind(l, Get({ of: t, path: ArgumentPath({ ctor: b"m.Node", at: 0 }) })),
+            bind(r, Get({ of: t, path: ArgumentPath({ ctor: b"m.Node", at: 1 }) })),
+            bind(x, call_of(b"walk", [VarOperand(a), VarOperand(l)])),
+            bind(y, call_of(b"walk", [VarOperand(a), VarOperand(r)])),
+            bind(z, Primitive({ op: b"add", on: AsInt, args: [VarOperand(x), VarOperand(y)] })),
+            Return(VarOperand(z)),
+          ],
+        },
+      ],
+      rest: [Return(IntOperand(0))],
+    }),
+  ]);
+  assert_eq(alone([walk]), [{ params: [BorrowedParam, BorrowedParam], result: OwnedResult }])
+}
+
+test "a parameter stored, updated in place, performed, given on, or captured by a closure that outlives the call is given" {
+  let s = word(0);
+  let r = word(1);
+  let by = |val: Rvalue| alone([def_of(b"f", [s], AsWord, [bind(r, val), Return(VarOperand(r))])]);
+  let gives = [{ params: [OwnedParam], result: OwnedResult }];
+  assert_eq(by(made_of(CaseAllocation({ case: 0, skip: 0, words: 1 }), [VarOperand(s)])), gives);
+  assert_eq(
+    by(
+      Native({
+        name: b"rt_push",
+        args: [VarOperand(s), IntOperand(1)],
+        uses: { takes: [true, false], owned: true, fails: true, suspends: false },
+      }),
+    ),
+    gives,
+  );
+  assert_eq(
+    by(
+      Op({
+        op: OfHandling(
+          Perform({
+            effect: b"m.log",
+            op: b"put",
+            index: 0,
+            resource: b"",
+            labelled: false,
+            mode: 1,
+            descriptor: b"ply_k_put",
+          }),
+        ),
+        args: [VarOperand(s)],
+        uses: { takes: [true], owned: true, fails: true, suspends: true },
+      }),
+    ),
+    gives,
+  );
+  assert_eq(by(call_of(b"keep", [VarOperand(s)])), gives);
+  assert_eq(
+    by(made_of(ClosureAllocation({ nth: 0, captures: 1, params: 1 }), [VarOperand(s)])),
+    gives,
+  );
+  // Handed to a parameter its callee lends, it stays lent.
+  assert_eq(
+    settled_with(
+      [
+        def_of(b"f", [s], AsWord, [
+          bind(r, call_of(b"look", [VarOperand(s)])),
+          Return(VarOperand(r)),
+        ]),
+      ],
+      [{ name: b"look", handing: { params: [BorrowedParam], result: OwnedResult } }],
+    ),
+    [{ params: [BorrowedParam], result: OwnedResult }],
+  )
+}
+
+test "a handing says where the use is that first gave each parameter and made the answer owned" {
+  let s = word(0);
+  let q = word(1);
+  let r = word(2);
+  let k = word(3);
+  let at = |v: Var, val: Rvalue, from: Int, to: Int|
+    Let({ var: v, val: val, at: span_between(from, to), unwind: [] });
+  let got = group_signatures(
+    [
+      def_of(b"f", [s, q], AsWord, [
+        at(r, call_of(b"look", [VarOperand(q)]), 10, 14),
+        at(k, made_of(ListAllocation(2), [VarOperand(s), VarOperand(r)]), 20, 25),
+        Return(VarOperand(k)),
+      ]),
+    ],
+    Map::new().insert(of_m(b"look"), { params: [BorrowedParam], result: OwnedResult }),
+  );
+  assert_eq(got.map(|x: InferredOwnership| x.handing), [
+    { params: [OwnedParam, BorrowedParam], result: OwnedResult },
+  ]);
+  assert_eq(got.map(|x: InferredOwnership| x.reason), [
+    { params: [Some(span_between(20, 25)), None], result: Some(span_between(20, 25)) },
+  ])
+}
+
+test "a closure laid on this frame's stack only reads its captures, whatever its body does with them" {
+  let s = word(0);
+  let k = word(1);
+  let r = int(2);
+  let c = word(0);
+  let x = int(1);
+  let with_body = |answer: Representation, body: Block| {
+    let f = def_of(b"f", [s], AsInt, [
+      bind(
+        k,
+        made_of(StackAllocation(ClosureAllocation({ nth: 0, captures: 1, params: 1 })), [
+          VarOperand(s),
+        ]),
+      ),
+      bind(r, call_of(b"each", [VarOperand(k)])),
+      Return(VarOperand(r)),
+    ]);
+    let lambda = {
+      key: Named(b"m.f"),
+      kind: Metered,
+      params: [c, x],
+      convention: given_all([c, x], answer),
+      result_type: NamedType({ name: b"T", args: [] }),
+      body: body,
+      lambdas: [],
+      base: 0,
+      members: [],
+      links: no_links(),
+      statics: [],
+    };
+    settled_with(
+      [
+        {
+          ..f,
+          f: {
+            ..f.f,
+            lambdas: [
+              Closure({
+                body: lambda,
+                captures: 1,
+                at: dummy_span(),
+                words: no_closure_evidence(),
+              }),
+            ],
+          },
+        },
+      ],
+      [{ name: b"each", handing: { params: [BorrowedParam], result: OwnedResult } }],
+    )
+  };
+  assert_eq(with_body(AsInt, [Return(IntOperand(0))]), [
+    { params: [BorrowedParam], result: OwnedResult },
+  ]);
+  // The body keeps its capture, which the closure's entry counts once more, so the owner still only
+  // lends it.
+  assert_eq(with_body(AsWord, [Return(VarOperand(c))]), [
+    { params: [BorrowedParam], result: OwnedResult },
+  ])
+}
+
+test "a constructor made of the cells of the parameter a case matched gives it, as the ownership pass resets it" {
+  // A list of strings: `Nil` the zero word, `Cons` a box of its head and its tail.
+  let list = AsSum({
+    layout: {
+      classes: [layout::Pointer],
+      cases: [
+        { test: layout::WordIs({ at: 0, value: 0 }), payload: layout::Nullary },
+        {
+          test: layout::WordOutside({ at: 0, values: [0] }),
+          payload: layout::Boxed({
+            at: 0,
+            stripped: false,
+            skip: 0,
+            layout: PlainWords([layout::Pointer, layout::Pointer]),
+          }),
+        },
+      ],
+    },
+    cases: [b"m.Nil", b"m.Cons"],
+  });
+  let xs = of_type(0, b"m.L", list);
+  let v = word(1);
+  let t = of_type(2, b"m.L", list);
+  let box = of_type(3, b"m.L", AsWord);
+  let n = of_type(4, b"m.L", list);
+  let rebuilt = |names: List<Bytes>|
+    def_of(b"cons", [xs, v], list, [
+      Case({
+        on: xs,
+        test: TagTest(names),
+        arms: [
+          {
+            when: 0,
+            body: [
+              bind(t, Get({ of: xs, path: CasePath({ case: 1, at: 1 }) })),
+              bind(
+                box,
+                made_of(CaseAllocation({ case: 1, skip: 0, words: 2 }), [
+                  VarOperand(v),
+                  VarOperand(t),
+                ]),
+              ),
+              bind(n, Aggregate({ parts: [IntOperand(1), VarOperand(box)] })),
+              Return(VarOperand(n)),
+            ],
+          },
+        ],
+        rest: [Return(ZeroOperand(list))],
+      }),
+    ]);
+  assert_eq(alone([rebuilt([b"m.Cons", b"m.Nil"])]), [
+    { params: [OwnedParam, OwnedParam], result: OwnedResult },
+  ]);
+  assert_eq(reset_params(rebuilt([b"m.Cons", b"m.Nil"])).keys(), [0]);
+  // Where the case knows it to hold another constructor its cells fit nothing, and it is lent.
+  assert_eq(alone([rebuilt([b"m.Nil", b"m.Cons"])]), [
+    { params: [BorrowedParam, OwnedParam], result: OwnedResult },
+  ]);
+  assert_eq(reset_params(rebuilt([b"m.Nil", b"m.Cons"])).keys(), []);
+  // Settled first with no resets, it settles where settling from every reset does.
+  let from_every = |l: InferenceTarget| handings(inferred_from([l], Map::new(), [reset_params(l)]));
+  assert_eq(alone([rebuilt([b"m.Cons", b"m.Nil"])]), from_every(rebuilt([b"m.Cons", b"m.Nil"])));
+  assert_eq(alone([rebuilt([b"m.Nil", b"m.Cons"])]), from_every(rebuilt([b"m.Nil", b"m.Cons"])))
+}
+
+test "a jump back to the start keeps a parameter lent while it hands on only what it is lent" {
+  let p = word(0);
+  let q = word(1);
+  let n = int(2);
+  let stop = flag(3);
+  let m = int(4);
+  let x = word(5);
+  let go = |before: Block, args: List<Arg>|
+    alone([
+      def_of(b"go", [p, q, n], AsInt, [
+        bind(stop, Primitive({ op: b"le", on: AsInt, args: [VarOperand(n), IntOperand(0)] })),
+        If({
+          cond: VarOperand(stop),
+          then: [Return(IntOperand(0))],
+          otherwise: before.concat([
+            bind(m, Primitive({ op: b"sub", on: AsInt, args: [VarOperand(n), IntOperand(1)] })),
+            Restart(args.push(VarOperand(m))),
+          ]),
+        }),
+      ]),
+    ]);
+  let lends = [{ params: [BorrowedParam, BorrowedParam, BorrowedParam], result: OwnedResult }];
+  assert_eq(go([], [VarOperand(p), VarOperand(q)]), lends);
+  assert_eq(go([], [VarOperand(q), VarOperand(p)]), lends);
+  assert_eq(
+    go([bind(x, Get({ of: p, path: FieldPath({ name: b"rest", at: 1 }) }))], [
+      VarOperand(x),
+      VarOperand(q),
+    ]),
+    lends,
+  );
+  assert_eq(go([bind(x, call_of(b"fresh", []))], [VarOperand(x), VarOperand(q)]), [
+    { params: [OwnedParam, BorrowedParam, BorrowedParam], result: OwnedResult },
+  ])
+}
+
+test "a record lent by reference stays lent across a jump only where the jump hands on a record lent so" {
+  let b = word(2);
+  let n = int(3);
+  let stop = flag(4);
+  let m = int(5);
+  // Handed on swapped, read through a block it is lent, and read so with the other handed on.
+  let jumps = |wide: Representation| {
+    let w = of_type(0, b"m.W", wide);
+    let v = of_type(1, b"m.W", wide);
+    let x = of_type(6, b"m.W", wide);
+    let go = |before: Block, args: List<Arg>|
+      match alone([
+          def_of(b"go", [w, v, b, n], AsInt, [
+            bind(stop, Primitive({ op: b"le", on: AsInt, args: [VarOperand(n), IntOperand(0)] })),
+            If({
+              cond: VarOperand(stop),
+              then: [Return(IntOperand(0))],
+              otherwise: before.concat([
+                bind(m, Primitive({ op: b"sub", on: AsInt, args: [VarOperand(n), IntOperand(1)] })),
+                Restart(args.concat([VarOperand(b), VarOperand(m)])),
+              ]),
+            }),
+          ]),
+        ]).at(
+          0,
+        ) {
+        Some(h) -> h.params,
+        None -> [],
+      };
+    let read = [bind(x, Get({ of: b, path: FieldPath({ name: b"w", at: 0 }) }))];
+    [
+      go([], [VarOperand(v), VarOperand(w)]),
+      go(read, [VarOperand(x), VarOperand(v)]),
+      go(read, [VarOperand(x), VarOperand(w)]),
+    ]
+  };
+  // Read through a block it is lent, a record lies in that block, not in storage its caller lent
+  // it, so the record it is jumped to is given; and one holding a count given is handed on given.
+  let counted_fields = range(0, layout::register_words() + 1).map(|k: Int|
+    { name: b"f".concat(ascii_of_int(k)), representation: if k == 0 { AsWord } else { AsInt } });
+  assert_eq(jumps(AsFlattened(counted_fields)), [
+    [BorrowedParam, BorrowedParam, BorrowedParam, BorrowedParam],
+    [OwnedParam, BorrowedParam, BorrowedParam, BorrowedParam],
+    [OwnedParam, OwnedParam, BorrowedParam, BorrowedParam],
+  ]);
+  // A record holding no count is pointed at all the same, but gives nothing up where it goes.
+  let scalars = range(0, layout::register_words() + 1).map(|_: Int| layout::raw());
+  let words = AsSum({
+    layout: {
+      classes: scalars,
+      cases: [
+        {
+          test: Always,
+          payload: Inline({ offset: 0, layout: PlainWords(scalars), stripped: None }),
+        },
+      ],
+    },
+    cases: [b"m.W"],
+  });
+  assert_eq(jumps(words), [
+    [BorrowedParam, BorrowedParam, BorrowedParam, BorrowedParam],
+    [OwnedParam, BorrowedParam, BorrowedParam, BorrowedParam],
+    [OwnedParam, BorrowedParam, BorrowedParam, BorrowedParam],
+  ])
+}
+
+test "a group that hands a parameter around lends it, and gives it once any member keeps it" {
+  let s = word(0);
+  let y = int(1);
+  let kept = word(2);
+  let passing = |name: Bytes, to: Bytes, keeps: Bool|
+    def_of(
+      name,
+      [s],
+      AsInt,
+      (if keeps {
+        [bind(kept, made_of(CaseAllocation({ case: 0, skip: 0, words: 1 }), [VarOperand(s)]))]
+      } else { [] }).concat([bind(y, call_of(to, [VarOperand(s)])), Return(VarOperand(y))]),
+    );
+  let lends = { params: [BorrowedParam], result: OwnedResult };
+  let gives = { params: [OwnedParam], result: OwnedResult };
+  assert_eq(alone([passing(b"ping", b"pong", false), passing(b"pong", b"ping", false)]), [
+    lends,
+    lends,
+  ]);
+  assert_eq(alone([passing(b"ping", b"pong", false), passing(b"pong", b"ping", true)]), [
+    gives,
+    gives,
+  ]);
+  // Kept two calls on, the keeping reaches the first member only once the round that follows it.
+  assert_eq(
+    alone([
+      passing(b"one", b"two", false),
+      passing(b"two", b"three", false),
+      passing(b"three", b"one", true),
+    ]),
+    [gives, gives, gives],
+  )
+}
+
+test "a tail group's member handed a value another member made is given it, and so is what it hands on" {
+  let s = word(0);
+  let n = int(1);
+  let stop = flag(2);
+  let m = int(3);
+  let fresh = word(4);
+  let member = |name: Bytes, to: Int, makes: Bool|
+    {
+      ..def_of(name, [s, n], AsInt, [bind(stop, Primitive({ op: b"le", on: AsInt, args: [VarOperand(n), IntOperand(0)] })), If({ cond: VarOperand(stop), then: [Return(IntOperand(0))], otherwise: (if makes { [bind(fresh, call_of(b"fresh", []))] } else { [] }).concat([bind(m, Primitive({ op: b"sub", on: AsInt, args: [VarOperand(n), IntOperand(1)] })), Jump({ member: to, args: [if makes { VarOperand(fresh) } else { VarOperand(s) }, VarOperand(m)] })]) })]),
+      group: [b"hop", b"skip"].map(of_m),
+    };
+  let lends = { params: [BorrowedParam, BorrowedParam], result: OwnedResult };
+  let gives = { params: [OwnedParam, BorrowedParam], result: OwnedResult };
+  assert_eq(alone([member(b"hop", 1, false), member(b"skip", 0, false)]), [lends, lends]);
+  assert_eq(alone([member(b"hop", 1, false), member(b"skip", 0, true)]), [gives, gives])
+}
+
+test "every recursion group is settled after the groups it calls" {
+  let s = word(0);
+  let r = word(1);
+  let keeps = def_of(b"keeps", [s], AsWord, [
+    bind(r, made_of(ListAllocation(1), [VarOperand(s)])),
+    Return(VarOperand(r)),
+  ]);
+  let hands = def_of(b"hands", [s], AsWord, [
+    bind(r, call_of(b"keeps", [VarOperand(s)])),
+    Return(VarOperand(r)),
+  ]);
+  let handed = infer_signatures([hands, keeps], Map::new(), Map::new()).handed;
+  assert_eq(handed.get(of_m(b"hands")), Some({ params: [OwnedParam], result: OwnedResult }));
+  assert_eq(handed.get(of_m(b"keeps")), Some({ params: [OwnedParam], result: OwnedResult }))
+}
+
+test "a parameter its declaration lends stays lent, and one it keeps is inferred" {
+  let f = word(0);
+  let r = word(1);
+  let storing = def_of(b"f", [f], AsWord, [
+    bind(r, made_of(ListAllocation(1), [VarOperand(f)])),
+    Return(VarOperand(r)),
+  ]);
+  assert_eq(alone([{ ..storing, borrowed: [0] }]), [
+    { params: [BorrowedParam], result: OwnedResult },
+  ]);
+  assert_eq(alone([storing]), [{ params: [OwnedParam], result: OwnedResult }]);
+  let reading = def_of(b"g", [f], AsInt, [Return(IntOperand(0))]);
+  assert_eq(alone([reading]), [{ params: [BorrowedParam], result: OwnedResult }])
+}
+
+test "an answer read out of what is lent is borrowed of it, and one made on any path is owned" {
+  let p = word(0);
+  let q = word(1);
+  let c = flag(2);
+  let x = word(3);
+  let j = word(4);
+  let m = word(5);
+  assert_eq(
+    alone([
+      def_of(b"name", [p], AsWord, [
+        bind(x, Get({ of: p, path: FieldPath({ name: b"name", at: 0 }) })),
+        Return(VarOperand(x)),
+      ]),
+    ]),
+    [{ params: [BorrowedParam], result: BorrowedResult([{ param: 0, whole: false }]) }],
+  );
+  let pick = |otherwise: Block|
+    def_of(b"pick", [p, q, c], AsWord, [
+      Decl(j),
+      If({
+        cond: VarOperand(c),
+        then: [Assign({ var: j, arg: VarOperand(p) })],
+        otherwise: otherwise,
+      }),
+      Return(VarOperand(j)),
+    ]);
+  assert_eq(alone([pick([Assign({ var: j, arg: VarOperand(q) })])]), [
+    {
+      params: [BorrowedParam, BorrowedParam, BorrowedParam],
+      result: BorrowedResult([{ param: 0, whole: true }, { param: 1, whole: true }]),
+    },
+  ]);
+  assert_eq(
+    alone([pick([bind(m, call_of(b"fresh", [])), Assign({ var: j, arg: VarOperand(m) })])]),
+    [{ params: [OwnedParam, BorrowedParam, BorrowedParam], result: OwnedResult }],
+  );
+  // A word held again as an `Option`'s is borrowed of it, but not where a type variable leaves the
+  // answer's type open: at `Int` the `Option` boxes the item afresh. Answered owned, it is given.
+  let some = |item: Type| {
+    let answer = option_type(item);
+    let o = { id: 6, ty: answer, representation: AsWord };
+    let l = def_of(b"some", [x], AsWord, [
+      bind(o, Aggregate({ parts: [IntOperand(1), VarOperand(x)] })),
+      Return(VarOperand(o)),
+    ]);
+    { ..l, f: { ..l.f, result_type: answer }, whole: { ..l.whole, result_type: answer } }
+  };
+  assert_eq([string_type(), VariableType(0)].map(|t: Type| alone([some(t)])), [
+    [{ params: [BorrowedParam], result: BorrowedResult([{ param: 0, whole: true }]) }],
+    [{ params: [OwnedParam], result: OwnedResult }],
+  ])
+}
+
+test "an item read out of a lent list is borrowed, and a caller keeping it lends the list but gives what it answers whole" {
+  let xs = word(0);
+  let i = int(1);
+  let x = word(2);
+  let ys = word(3);
+  let y = word(4);
+  let kept = word(5);
+  let read = Native({
+    name: b"rt_list_at",
+    args: [VarOperand(xs), VarOperand(i)],
+    uses: { takes: [false, false], owned: false, fails: true, suspends: false },
+  });
+  let item = {
+    params: [BorrowedParam, BorrowedParam],
+    result: BorrowedResult([{ param: 0, whole: false }]),
+  };
+  assert_eq(alone([def_of(b"at", [xs, i], AsWord, [bind(x, read), Return(VarOperand(x))])]), [
+    item,
+  ]);
+  let keeping = |callee: Bytes, handing: OwnershipSignature|
+    settled_with(
+      [
+        def_of(b"keep", [ys], AsWord, [
+          bind(y, call_of(callee, [VarOperand(ys), IntOperand(0)])),
+          bind(kept, made_of(ListAllocation(1), [VarOperand(y)])),
+          Return(VarOperand(kept)),
+        ]),
+      ],
+      [{ name: callee, handing: handing }],
+    );
+  assert_eq(keeping(b"at", item), [{ params: [BorrowedParam], result: OwnedResult }]);
+  assert_eq(
+    keeping(b"same", {
+      params: [BorrowedParam, BorrowedParam],
+      result: BorrowedResult([{ param: 0, whole: true }]),
+    }),
+    [{ params: [OwnedParam], result: OwnedResult }],
+  )
+}
+
+test "a root written for a type lends what it reads, and a drop takes its operand" {
+  let p = word(0);
+  let q = word(1);
+  let same = flag(2);
+  let written = |op: TypeOp, args: List<Arg>|
+    Call({
+      callee: Root(keys::generated_key(op, NamedType({ name: b"m.T", args: [] }), b"m")),
+      args: args,
+      convention: {
+        params: all_given(args.map(operand_representation)),
+        result: AsWord,
+        destination_passing: false,
+        answered: OwnedResult,
+      },
+      suspends: false,
+    });
+  assert_eq(
+    alone([
+      def_of(b"same", [p, q], AsBool, [
+        bind(same, written(Equal, [VarOperand(p), VarOperand(q)])),
+        Return(VarOperand(same)),
+      ]),
+    ]),
+    [{ params: [BorrowedParam, BorrowedParam], result: OwnedResult }],
+  );
+  assert_eq(
+    alone([
+      def_of(b"gone", [p], AsInt, [
+        Do({ val: written(Drop, [VarOperand(p)]), at: dummy_span(), unwind: [] }),
+        Return(IntOperand(0)),
+      ]),
+    ]),
+    [{ params: [OwnedParam], result: OwnedResult }],
+  );
+  // A lowering's loops read the list they walk; a lifting's take what they read onto.
+  assert_eq(
+    [
+      Lower,
+      Lift,
+      ContainerWalk(b"lower_items"),
+      ContainerWalk(b"lower_entries"),
+      ContainerWalk(b"lift_items"),
+      ContainerWalk(b"lift_entries"),
+    ].map(|op: TypeOp| generated_signature(op, 2).params),
+    [
+      [BorrowedParam, BorrowedParam],
+      [OwnedParam, OwnedParam],
+      [BorrowedParam, BorrowedParam],
+      [BorrowedParam, BorrowedParam],
+      [OwnedParam, OwnedParam],
+      [OwnedParam, OwnedParam],
+    ],
+  );
+  // A walk reads the containers it compares, and a gathering walk the one it walks, not the list it
+  // gathers onto, which it starts again with grown.
+  assert_eq(
+    [ContainerWalk(b"equal_from"), ContainerWalk(b"digest_from")].map(|op: TypeOp|
+      generated_signature(op, 3).params),
+    [[BorrowedParam, BorrowedParam, BorrowedParam], [BorrowedParam, OwnedParam, BorrowedParam]],
+  )
+}
+
+test "a handing reads as its parameters and then how it answers" {
+  assert_eq(
+    ownership_text({
+      params: [BorrowedParam, OwnedParam],
+      result: BorrowedResult([{ param: 0, whole: true }, { param: 2, whole: false }]),
+    }),
+    b"[lent, given] borrowed(0, 2 part)",
+  );
+  assert_eq(ownership_text(all_owned(0)), b"[] owned")
+}
+
+/// The convention of each call `b` makes at its top, in order.
+fn calls_written(b: Block) -> List<Convention> =
+  b.fold([], |acc: List<Convention>, i: Inst|
+    match i { Let(l) -> match l.val { Call(c) -> acc.push(c.convention), _ -> acc }, _ -> acc })
+
+test "a body is written against its own handing and each callee's, a callee nothing infers taking all" {
+  let s = word(0);
+  let r = word(1);
+  let q = word(2);
+  let f = def_of(b"f", [s], AsWord, [
+    bind(r, call_of(b"look", [VarOperand(s)])),
+    bind(q, call_of(b"other", [VarOperand(r)])),
+    Return(VarOperand(q)),
+  ]).f;
+  let read = { params: [BorrowedParam], result: BorrowedResult([{ param: 0, whole: false }]) };
+  let handed = Map::new().insert(of_m(b"f"), {
+    params: [BorrowedParam],
+    result: OwnedResult,
+  }).insert(
+    of_m(b"look"),
+    read,
+  );
+  let written = with_conventions(f, handed);
+  assert_eq(handed_of(written.convention), [BorrowedParam]);
+  assert_eq(
+    calls_written(written.body).map(|c: Convention| { params: handed_of(c), result: c.answered }),
+    [read, all_owned(1)],
+  );
+  let said = handle {
+    with_conventions(f, handed.insert(of_m(b"look"), all_owned(2)));
+    b""
+  } with {
+    abort.raise(m) -> Bytes::of_string(m),
+  };
+  assert_eq(said, b"a handing of 2 parameters for a convention of 1: m.look in m.f");
+  // A specialisation is written as the definition it specialises, a root written for a type as its
+  // fixed handing.
+  let at = { ..f, key: keys::specialisation_key(b"m.f", [], []) };
+  assert_eq(handed_of(with_conventions(at, handed).convention), [BorrowedParam]);
+  // Where a specialisation holds a scalar, what its definition answers borrowed of it is owned.
+  let borrowing = handed.insert(of_m(b"f"), read);
+  let scalar = {
+    ..at,
+    params: [int(0)],
+    convention: {
+      ..at.convention,
+      params: at.convention.params.map(|p: ParamTaking| { ..p, representation: AsInt }),
+      result: AsInt,
+    },
+  };
+  assert_eq(
+    [
+      with_conventions(at, borrowing).convention.answered,
+      with_conventions(scalar, borrowing).convention.answered,
+    ],
+    [read.result, OwnedResult],
+  );
+  let for_type = |op: TypeOp|
+    handed_of(
+      with_conventions(
+        { ..f, key: keys::generated_key(op, NamedType({ name: b"m.T", args: [] }), b"m") },
+        handed,
+      ).convention,
+    );
+  assert_eq([for_type(Equal), for_type(Drop)], [[BorrowedParam], [OwnedParam]]);
+  // A closure's generic call is numbered among its root's, which the closure's own links hold none of.
+  let generic = match call_of(b"look", [VarOperand(s)]) {
+    Call(c) -> Call({ ..c, callee: Generic(0) }),
+    other -> other,
+  };
+  let closure = {
+    ..f,
+    key: Named(b"m.f"),
+    body: [bind(r, generic), Return(VarOperand(r))],
+    links: no_links(),
+  };
+  let rooted = {
+    ..f,
+    lambdas: [
+      Closure({ body: closure, captures: 0, at: dummy_span(), words: no_closure_evidence() }),
+    ],
+    links: {
+      ..no_links(),
+      generics: [{ callee: Named(b"m.look"), args: [], carried: [], fns: [], rows: [] }],
+    },
+  };
+  match with_conventions(rooted, handed).lambdas {
+    [Closure(c)] ->
+      assert_eq(
+        calls_written(c.body.body).map(|x: Convention|
+          { params: handed_of(x), result: x.answered }),
+        [read],
+      ),
+    _ -> assert(false, None),
+  }
+}
+
+test "only a definition's own form is read, each lending what its declaration lends" {
+  let s = word(0);
+  let f = def_of(b"f", [s], AsWord, [Return(VarOperand(s))]).f;
+  let typed = NamedType({ name: b"m.T", args: [] });
+  let forms = [
+    f,
+    { ..f, key: keys::specialisation_key(b"m.f", [], []) },
+    { ..f, key: keys::generated_key(Equal, typed, b"m") },
+  ];
+  assert_eq(
+    inference_targets_of(Map::new().insert(of_m(b"f"), [0]), forms).map(|l: InferenceTarget|
+      { def: l.def, borrowed: l.borrowed }),
+    [{ def: of_m(b"f"), borrowed: [0] }],
+  )
+}

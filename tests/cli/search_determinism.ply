@@ -1,7 +1,8 @@
 //! A simulated search is a function of its seed and its program: not of the process, the worker
 //! count, the company a test keeps, a warm cache, or what ran on the thread before it.
 
-import harness (program, spawned, json_of, at, path, items, first, str, int, shown, Spawned)
+import harness (write_program, spawned, json_of, at, path, items, first, str, int, json_text,
+                PlyProcess)
 import std.json
 import std.json (Json, Object, Array, Str)
 import std.string
@@ -87,22 +88,22 @@ fn scrub(value: Json) -> Json =
   }
 
 /// `value` without where anything stands in the text, which an edit that changes no hash may move.
-fn placeless(value: Json) -> Json =
+fn without_positions(value: Json) -> Json =
   match value {
     Object(fields) ->
       Object(
         fields.fold(Map::new(), |acc: Map<String, Json>, k: String, v: Json|
           if ["start", "end", "line", "end_line", "column", "end_column"].contains(k) { acc }
-          else { acc.insert(k, placeless(v)) }),
+          else { acc.insert(k, without_positions(v)) }),
       ),
-    Array(xs) -> Array(xs.map(placeless)),
+    Array(xs) -> Array(xs.map(without_positions)),
     other -> other,
   }
 
 /// Where two artifacts first differ, as a path into them.
 fn difference(a: Json, b: Json, at_path: String) -> Option<String> / {abort.raise} =
   if a == b { None } else {
-    let plainly = Some(at_path ++ ": " ++ shown(a) ++ " against " ++ shown(b));
+    let plainly = Some(at_path ++ ": " ++ json_text(a) ++ " against " ++ json_text(b));
     match a {
       Object(x) -> match b {
         Object(y) -> {
@@ -149,33 +150,33 @@ fn agree(a: Json, b: Json, what: String) -> Unit / {abort.raise} =
 fn argv_of(args: List<String>) -> List<String> = ["test", "--json", "--no-cache"].concat(args)
 
 /// What a `ply` of its own reported.
-fn artifact(args: List<String>) -> Json / {Spawned, abort.raise} =
+fn scrubbed_report(args: List<String>) -> Json / {PlyProcess, abort.raise} =
   scrub(json_of(spawned(argv_of(args))))
 
 fn result_for(a: Json, key: String) -> Json / {abort.raise} =
   match items(at(a, "results")).filter(|r: Json| str(at(r, "key")).ends_with(key)) {
     [r, ..] -> r,
-    [] -> panic("no result for `" ++ key ++ "` in " ++ shown(a)),
+    [] -> panic("no result for `" ++ key ++ "` in " ++ json_text(a)),
   }
 
 fn is_text(j: Json) -> Bool = match j { Str(_) -> true, _ -> false }
 
 test/nondet "one seed is one artifact across separate processes" {
-  program(mixed_program());
-  let once = artifact(["--seed", "0"]);
+  write_program(mixed_program());
+  let once = scrubbed_report(["--seed", "0"]);
   range(1, 8).fold((), |u: Unit, run: Int|
     agree(
-      artifact(["--seed", "0"]),
+      scrubbed_report(["--seed", "0"]),
       once,
       "process " ++ run.to_string() ++ " produced a different artifact for one seed",
     ))
 }
 
 test/nondet "a whole search is one artifact across separate processes" {
-  program(mixed_program());
-  let once = artifact([]);
+  write_program(mixed_program());
+  let once = scrubbed_report([]);
   range(1, 6).fold((), |u: Unit, run: Int|
-    agree(artifact([]), once, "process " ++ run.to_string() ++ " searched differently"));
+    agree(scrubbed_report([]), once, "process " ++ run.to_string() ++ " searched differently"));
   // The artifact must carry the race's own failure with a seed, or this test would pass on an empty
   // run, or on one the C backend declined.
   assert(
@@ -185,45 +186,49 @@ test/nondet "a whole search is one artifact across separate processes" {
       > 0,
     Some(
       "the program must produce a seeded failure, or these comparisons prove nothing: "
-        ++ shown(once),
+        ++ json_text(once),
     ),
   )
 }
 
 test/nondet "the worker count does not reach a scheduling decision" {
-  program(mixed_program());
-  let one = artifact(["--jobs", "1"]);
+  write_program(mixed_program());
+  let one = scrubbed_report(["--jobs", "1"]);
   ["2", "3", "8", "17"].fold((), |u: Unit, jobs: String|
-    agree(artifact(["--jobs", jobs]), one, "`--jobs " ++ jobs ++ "` disagreed with `--jobs 1`"))
+    agree(
+      scrubbed_report(["--jobs", jobs]),
+      one,
+      "`--jobs " ++ jobs ++ "` disagreed with `--jobs 1`",
+    ))
 }
 
 test/nondet "running a test alone reports what it reports in company" {
-  program(mixed_program());
-  let whole = artifact([]);
+  write_program(mixed_program());
+  let whole = scrubbed_report([]);
   [
     "two increments race",
     "two increments land in some order",
     "a sleeper costs no wall clock",
   ].fold((), |u: Unit, name: String|
     assert(
-      result_for(artifact(["--filter", name]), name) == result_for(whole, name),
+      result_for(scrubbed_report(["--filter", name]), name) == result_for(whole, name),
       Some("`" ++ name ++ "` reported differently when run alone"),
     ))
 }
 
 test/nondet "a warm front-end cache does not change an interleaving" {
-  program(mixed_program());
-  let cold = artifact([]);
+  write_program(mixed_program());
+  let cold = scrubbed_report([]);
   // Populate the front-end cache, then run against it.
   let _ = spawned(["test", "--json"], []);
-  agree(artifact([]), cold, "a warm front-end cache changed what the search did")
+  agree(scrubbed_report([]), cold, "a warm front-end cache changed what the search did")
 }
 
 // A search is a function of the program, which a hash covers, so renaming locals and adding a
 // comment moves no interleaving; the comment moves only where a failure stands.
 test/nondet "an edit that changes no hash changes no interleaving" {
-  program(mixed_program());
-  let plain = artifact([]);
+  write_program(mixed_program());
+  let plain = scrubbed_report([]);
   let edited = [
     { from: "let seen =", to: "// a comment nobody reads\n  let observed =" },
     { from: "seen + 1", to: "observed + 1" },
@@ -237,44 +242,48 @@ test/nondet "an edit that changes no hash changes no interleaving" {
     edited != mixed_program(),
     Some("the edit moved nothing, so this compares a program with itself"),
   );
-  program(edited);
+  write_program(edited);
   agree(
-    placeless(artifact([])),
-    placeless(plain),
+    without_positions(scrubbed_report([])),
+    without_positions(plain),
     "renaming locals and adding a comment moved the search",
   )
 }
 
 test/nondet "the seed a failure prints replays that failure" {
-  program(mixed_program());
-  let searched = artifact([]);
+  write_program(mixed_program());
+  let searched = scrubbed_report([]);
   let failure = match items(at(searched, "failures")).filter(|f: Json| is_text(at(f, "seed"))) {
     [f, ..] -> f,
-    [] -> panic("the racy test must fail with a seed: " ++ shown(searched)),
+    [] -> panic("the racy test must fail with a seed: " ++ json_text(searched)),
   };
   assert(
     str(path(failure, ["diagnostic", "code"])) == "E0501",
-    Some("the race's own assertion is what the seed names: " ++ shown(failure)),
+    Some("the race's own assertion is what the seed names: " ++ json_text(failure)),
   );
   let seed = str(at(failure, "seed"));
-  let replayed = artifact(["--seed", seed]);
+  let replayed = scrubbed_report(["--seed", seed]);
   let again = match items(at(replayed, "failures")).filter(|f: Json| str(at(f, "seed")) == seed) {
     [f, ..] -> f,
-    [] -> panic("seed " ++ seed ++ " did not reproduce the failure: " ++ shown(replayed)),
+    [] -> panic("seed " ++ seed ++ " did not reproduce the failure: " ++ json_text(replayed)),
   };
   assert(
     path(again, ["diagnostic", "message"]) == path(failure, ["diagnostic", "message"]),
     Some("seed " ++ seed ++ " reproduced a different failure"),
   );
   // Twice more, in two more processes, because a repro that works once is not a repro.
-  range(0, 2).fold((), |u: Unit, i: Int| agree(artifact(["--seed", seed]), replayed, "a replay"))
+  range(0, 2).fold((), |u: Unit, i: Int|
+    agree(scrubbed_report(["--seed", seed]), replayed, "a replay"))
 }
 
 test/nondet "a seed actually decides which interleaving runs" {
-  program(mixed_program());
+  write_program(mixed_program());
   let verdicts = range(0, 24).fold([], |acc: List<String>, root: Int| {
     let status = str(
-      at(result_for(artifact(["--seed", root.to_string()]), "two increments race"), "status"),
+      at(
+        result_for(scrubbed_report(["--seed", root.to_string()]), "two increments race"),
+        "status",
+      ),
     );
     if acc.filter(|v: String| v == status).len() > 0 { acc } else { acc.push(status) }
   });
@@ -297,16 +306,16 @@ fn var_race(name: String) -> String =
 // thread, so a race names the variable as a fresh backend does or the report depends on what ran
 // first.
 test/nondet "every search on one thread names a race's variable alike" {
-  program(
+  write_program(
     counter_effect()
       ++ String::join(
         range(0, 3).map(|i: Int| var_race("a lost update on a variable " ++ i.to_string())),
         "",
       ),
   );
-  let run = artifact(["--jobs", "1"]);
+  let run = scrubbed_report(["--jobs", "1"]);
   let races = items(at(run, "failures")).map(|f: Json| at(f, "race"));
-  assert(races.len() == 3, Some("each copy reaches the lost update: " ++ shown(run)));
+  assert(races.len() == 3, Some("each copy reaches the lost update: " ++ json_text(run)));
   // Each copy has spans and a name of its own; what it names of the variable is the same.
   let named = |r: Json|
     [
@@ -321,7 +330,7 @@ test/nondet "every search on one thread names a race's variable alike" {
       let access = str(path(race, [side, "access"]));
       assert(
         access.contains(".counter.") && access.ends_with("[n]"),
-        Some("the counter the two tasks race on: " ++ shown(race)),
+        Some("the counter the two tasks race on: " ++ json_text(race)),
       )
     });
     assert(
@@ -405,11 +414,11 @@ fn region_in_a_helper() -> String =
 fn assert_lost_update(run: Json, total: Int, what: String) -> Unit / {abort.raise} = {
   let failure = match items(at(run, "failures")) {
     [f, ..] -> f,
-    [] -> panic(what ++ ": no interleaving failed: " ++ shown(run)),
+    [] -> panic(what ++ ": no interleaving failed: " ++ json_text(run)),
   };
   assert(
     str(path(failure, ["diagnostic", "code"])) == "E0501",
-    Some(what ++ ": " ++ shown(failure)),
+    Some(what ++ ": " ++ json_text(failure)),
   );
   let message = str(path(failure, ["diagnostic", "message"]));
   let lost = "assertion failed: expected " ++ total.to_string() ++ ", found ";
@@ -419,7 +428,7 @@ fn assert_lost_update(run: Json, total: Int, what: String) -> Unit / {abort.rais
   );
   assert(
     is_text(at(failure, "seed")),
-    Some(what ++ ": a lost update names its seed: " ++ shown(failure)),
+    Some(what ++ ": a lost update names its seed: " ++ json_text(failure)),
   )
 }
 
@@ -428,14 +437,14 @@ test/nondet "a second simulate region does not hide the first region's race" {
     { source: two_regions(), name: "two regions written out", total: 2 },
     { source: region_in_a_helper(), name: "one region reached twice through a call", total: 4 },
   ].fold((), |u: Unit, c: { source: String, name: String, total: Int }| {
-    program(c.source);
+    write_program(c.source);
     assert_lost_update(
-      artifact(["--sim", "random", "--seeds", "64"]),
+      scrubbed_report(["--sim", "random", "--seeds", "64"]),
       c.total,
       "`" ++ c.name ++ "`: the fixture must contain a reachable lost update, or it proves nothing",
     );
     assert_lost_update(
-      artifact(["--sim-budget", "1024"]),
+      scrubbed_report(["--sim-budget", "1024"]),
       c.total,
       "`" ++ c.name ++ "`: the search",
     )
@@ -502,21 +511,21 @@ fn shape_follows_a_race() -> String =
   \\
 
 test/nondet "a legal program is never reported as a simulation divergence" {
-  program(shape_follows_a_race());
-  let run = artifact([]);
+  write_program(shape_follows_a_race());
+  let run = scrubbed_report([]);
   match items(at(run, "failures")) {
     [failure, ..] -> {
       assert(
         str(path(failure, ["diagnostic", "code"])) != "E0415",
-        Some("a legal program was blamed on Ply's simulation: " ++ shown(failure)),
+        Some("a legal program was blamed on Ply's simulation: " ++ json_text(failure)),
       );
-      panic("its assertion holds in every interleaving, and a run failed: " ++ shown(failure))
+      panic("its assertion holds in every interleaving, and a run failed: " ++ json_text(failure))
     },
     [] -> (),
   };
   // Replay is checked on a branch, so a search that took none compared nothing.
   assert(
     int(path(first(items(at(run, "results"))), ["simulation", "explored"])) > 1,
-    Some(shown(run)),
+    Some(json_text(run)),
   )
 }

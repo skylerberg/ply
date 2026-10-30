@@ -1,23 +1,24 @@
 //! The rows the front end's answer holds, and what the source wrote of each.
 
 import compiler.syntax.parsing (Span, Ident, QName, is_bare, no_module, span_bin)
-import compiler.syntax.items (Item, IFn, IType, IEffect, IEffectSet, TDSum, VariantDef, SpecKind,
-                              ImportDecl, spec_kind_bin)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, EffectSetItem, SumBody,
+                              VariantDef, SpecKind, ImportDecl, spec_kind_bin)
 import compiler.syntax.type_syntax (AtomExpr)
-import compiler.check.types (Atom, RNamed, RSingleton, Scheme, Type, atoms_insert, atom_bin,
-                             scheme_bin, TypeTable, type_table_bin)
-import compiler.check.resolve.tables (ParsedModule, Diag, Resolved, EffectSpace, qualify, lookup)
+import compiler.check.types (Atom, NamedResource, SingletonResource, Scheme, Type, atoms_insert,
+                             atom_bin, scheme_bin, TypeTable, type_table_bin)
+import compiler.check.resolve.tables (ParsedModule, Diag, Resolution, EffectSpace, qualify, lookup)
 import compiler.check.resolve.scopes (find)
 import compiler.store.hash.graph (DefEntry, TestEntry, LawEntry)
-import compiler.store.hash.forms (Skeleton)
+import compiler.store.hash.forms (HashLayout)
 import compiler.check.infer.checker (Location, DefConstraint, EffectInfo, is_prelude_effect, Raise,
                                      raise_bin)
-import compiler.check.termination (Ending, Summary, ending_bin, summary_bin)
-import compiler.front.pkg (Pinned)
+import compiler.check.termination (Termination, Summary, termination_bin, summary_bin)
+import compiler.front.pkg (LockedPackage)
 import compiler.check.resolve.scopes (PackageDeps)
 import std.bin
 import std.list
-import compiler.expand.embed (EmbedAt, ItemWants, wants_of, wants_by_item, wants_in)
+import compiler.expand.embed (ModuleEmbed, ItemEmbeds, embed_requests, requests_by_item,
+                              requests_in)
 import compiler.syntax.items (parse, Derivation, derivation_bin)
 import compiler.syntax.lexer (is_ident_start)
 
@@ -28,21 +29,27 @@ pub fn span_at(module: Int, span: Span) -> ModuleSpan =
     end: span.end,
   }
 
-pub fn loc_at(location: Location) -> ModuleSpan = span_at(location.module, location.span)
+pub fn location_span(location: Location) -> ModuleSpan = span_at(location.module, location.span)
 
 // --- What the source wrote ----------------------------------------------------
 
 // What the driver reads from the tree that the checker's tables do not keep.
 
-pub type Written = { public: Bool, reuse: Bool, params: List<Placed>, literals: List<Bytes> }
+pub type WrittenFunction = {
+  public: Bool,
+  reuse: Bool,
+  params: List<SpannedName>,
+  literals: List<Bytes>,
+}
 
-fn no_written() -> Written = { public: false, reuse: false, params: [], literals: [] }
+fn no_written_function() -> WrittenFunction =
+  { public: false, reuse: false, params: [], literals: [] }
 
-pub fn fn_written(outlines: List<Outline>) -> Map<Bytes, Written> =
-  outlines.fold(Map::new(), |acc: Map<Bytes, Written>, o: Outline|
-    o.items.fold(acc, |a: Map<Bytes, Written>, item: Outlined|
+pub fn written_functions(outlines: List<Outline>) -> Map<Bytes, WrittenFunction> =
+  outlines.fold(Map::new(), |acc: Map<Bytes, WrittenFunction>, o: Outline|
+    o.items.fold(acc, |a: Map<Bytes, WrittenFunction>, item: OutlineItem|
       match item {
-        OFn(f) ->
+        OutlinedFunction(f) ->
           a.insert(qualify(o.name, f.name), {
             public: f.public,
             reuse: f.reuse,
@@ -52,8 +59,8 @@ pub fn fn_written(outlines: List<Outline>) -> Map<Bytes, Written> =
         _ -> a,
       }))
 
-pub fn written_of(m: Map<Bytes, Written>, name: Bytes) -> Written =
-  match m.get(name) { Some(w) -> w, None -> no_written() }
+pub fn written_function_of(m: Map<Bytes, WrittenFunction>, name: Bytes) -> WrittenFunction =
+  match m.get(name) { Some(w) -> w, None -> no_written_function() }
 
 // --- A module's outline ----------------------------------------------------------
 
@@ -61,7 +68,7 @@ pub fn written_of(m: Map<Bytes, Written>, name: Bytes) -> Written =
 // load of a program assembled from its modules' answers reads them there rather than parse them.
 
 /// A name, and where in its module it is written.
-pub type Placed = { name: Bytes, span: Span }
+pub type SpannedName = { name: Bytes, span: Span }
 
 /// A function as the tables read it: whether it is written `pub` and `reuse`, whether it promises
 /// what it `returns` and states a `decreases` measure, its parameters, the literals its `requires`
@@ -72,7 +79,7 @@ pub type FnOutline = {
   reuse: Bool,
   returns: Bool,
   measured: Bool,
-  params: List<Placed>,
+  params: List<SpannedName>,
   literals: List<Bytes>,
   spec: List<SpecKind>,
   constant: Bool,
@@ -87,25 +94,25 @@ pub type LawOutline = { name: Bytes, literals: List<Bytes> }
 
 pub type TypeOutline = { name: Bytes, public: Bool, arity: Int, span: Span }
 
-pub type Outlined =
-  | OFn(FnOutline)
-  | OTest(TestOutline)
-  | OLaw(LawOutline)
-  | OType(TypeOutline)
+pub type OutlineItem =
+  | OutlinedFunction(FnOutline)
+  | OutlinedTest(TestOutline)
+  | OutlinedLaw(LawOutline)
+  | OutlinedType(TypeOutline)
   /// `host` is the function its module names its real handler, by its name there.
-  | OEffect({ name: Bytes, public: Bool, host: Option<Bytes> })
+  | OutlinedEffect({ name: Bytes, public: Bool, host: Option<Bytes> })
 
 /// A module as the tables read it: its items in source order, everything it declares by its
 /// program-wide name, the modules it imports as written, each once, its effect sets, and the cuts a
 /// unit that does not lower it blanks it by.
 pub type Outline = {
   name: Bytes,
-  items: List<Outlined>,
+  items: List<OutlineItem>,
   declared: List<Bytes>,
   imports: List<Bytes>,
   /// Each schema it declares, and each schema's guard, by program-wide name.
   schemas: List<Bytes>,
-  sets: List<SetView>,
+  sets: List<EffectSetRow>,
   cuts: List<Cut>,
   /// Each type a `key`, `show` or `numeric` names, by its program-wide name: what a load reads of
   /// a module it pulls whatever the program reaches.
@@ -122,7 +129,7 @@ pub type ModuleDerivations = { module: Bytes, derivations: List<Derivation> }
 
 derive bin for ModuleDerivations
 
-derive bin for Placed
+derive bin for SpannedName
 
 derive bin for FnOutline
 
@@ -132,7 +139,7 @@ derive bin for LawOutline
 
 derive bin for TypeOutline
 
-derive bin for Outlined
+derive bin for OutlineItem
 
 derive bin for Outline
 
@@ -147,7 +154,7 @@ fn bare_prelude(qname: QName) -> Option<Bytes> =
   if is_bare(qname) && is_prelude_effect(qname.name.name) { Some(qname.name.name) } else { None }
 
 fn set_effect(
-  resolved: Resolved,
+  resolved: Resolution,
   effects: List<EffectInfo>,
   module: Int,
   qname: QName,
@@ -164,17 +171,20 @@ fn set_effect(
   }
 
 fn set_atoms(
-  resolved: Resolved,
+  resolved: Resolution,
   effects: List<EffectInfo>,
   module: Int,
   atoms: List<AtomExpr>,
 ) -> List<Atom> / {abort.raise} =
   atoms.fold([], |acc: List<Atom>, atom: AtomExpr|
-    match set_effect(resolved, effects, module, atom.eff) {
+    match set_effect(resolved, effects, module, atom.effect_name) {
       Some(eff) ->
         atoms_insert(acc, {
           effect: eff,
-          resource: match atom.resource { Some(x) -> RNamed(x.name), None -> RSingleton },
+          resource: match atom.resource {
+            Some(x) -> NamedResource(x.name),
+            None -> SingletonResource,
+          },
           mode: atom.mode,
           op: match atom.op { Some(x) -> Some(x.name), None -> None },
         }),
@@ -183,9 +193,9 @@ fn set_atoms(
 
 /// One `effect set` of a module: the simple name a row writes, the sets it includes in source
 /// order, and the expansion as program-wide atoms.
-pub type SetView = { name: Bytes, includes: List<Bytes>, atoms: List<Atom> }
+pub type EffectSetRow = { name: Bytes, includes: List<Bytes>, atoms: List<Atom> }
 
-derive bin for SetView
+derive bin for EffectSetRow
 
 // --- Module names -------------------------------------------------------------
 
@@ -224,14 +234,14 @@ pub fn module_of(path: String) -> Result<String, String> / {abort.raise} = {
 }
 
 pub fn effect_sets_of(
-  resolved: Resolved,
+  resolved: Resolution,
   effects: List<EffectInfo>,
   module: Int,
   parsed: ParsedModule,
-) -> List<SetView> / {abort.raise} =
-  parsed.module.items.fold([], |acc: List<SetView>, item: Item|
+) -> List<EffectSetRow> / {abort.raise} =
+  parsed.module.items.fold([], |acc: List<EffectSetRow>, item: Item|
     match item {
-      IEffectSet(d) ->
+      EffectSetItem(d) ->
         acc.push({
           name: d.name.name,
           includes: d.includes.map(|qname: QName| qname.name.name),
@@ -249,17 +259,17 @@ pub fn effect_sets_of(
 pub fn module_items(parsed: ParsedModule) -> List<Bytes> =
   parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
     match item {
-      IFn(d) -> acc.push(qualify(parsed.name, d.name.name)),
-      IType(d) -> {
+      FunctionItem(d) -> acc.push(qualify(parsed.name, d.name.name)),
+      TypeItem(d) -> {
         let named = acc.push(qualify(parsed.name, d.name.name));
         match d.body {
-          TDSum(vs) ->
+          SumBody(vs) ->
             vs.fold(named, |a: List<Bytes>, variant: VariantDef|
               a.push(qualify(parsed.name, variant.name.name))),
           _ -> named,
         }
       },
-      IEffect(d) -> acc.push(qualify(parsed.name, d.name.name)),
+      EffectItem(d) -> acc.push(qualify(parsed.name, d.name.name)),
       _ -> acc,
     })
 
@@ -280,7 +290,7 @@ pub fn module_row(i: Int, o: Outline, imports: List<Bytes>) -> ModuleRow =
 /// The modules each of `mods` imports, each named once, as `resolved` resolved them.
 pub fn imports_resolved(
   mods: List<ParsedModule>,
-  resolved: Resolved,
+  resolved: Resolution,
 ) -> List<List<Bytes>> / {abort.raise} =
   range(0, mods.len()).map(|i: Int|
     resolved.imports.get(i).fold([], |acc: List<Bytes>, t: Int| {
@@ -289,9 +299,9 @@ pub fn imports_resolved(
     }))
 
 /// What `outlines` lay a program's hash tables out over, as its index would.
-pub fn skeleton_of_outlines(outlines: List<Outline>) -> Skeleton =
-  outlines.fold({ nodes: [], order: [], tests: [], laws: [] }, |acc: Skeleton, o: Outline|
-    o.items.fold(acc, |a: Skeleton, item: Outlined| {
+pub fn skeleton_of_outlines(outlines: List<Outline>) -> HashLayout =
+  outlines.fold({ nodes: [], order: [], tests: [], laws: [] }, |acc: HashLayout, o: Outline|
+    o.items.fold(acc, |a: HashLayout, item: OutlineItem| {
       let node = |name: Bytes, decl: Bool|
         {
           ..a,
@@ -299,16 +309,16 @@ pub fn skeleton_of_outlines(outlines: List<Outline>) -> Skeleton =
           order: a.order.push(DefEntry(a.nodes.len())),
         };
       match item {
-        OFn(f) -> node(f.name, false),
-        OType(t) -> node(t.name, true),
-        OEffect(e) -> node(e.name, true),
-        OTest(t) ->
+        OutlinedFunction(f) -> node(f.name, false),
+        OutlinedType(t) -> node(t.name, true),
+        OutlinedEffect(e) -> node(e.name, true),
+        OutlinedTest(t) ->
           {
             ..a,
             tests: a.tests.push({ key: qualify(o.name, t.name), cases: t.cases }),
             order: a.order.push(TestEntry(a.tests.len())),
           },
-        OLaw(l) ->
+        OutlinedLaw(l) ->
           {
             ..a,
             laws: a.laws.push(qualify(o.name, l.name)),
@@ -318,7 +328,7 @@ pub fn skeleton_of_outlines(outlines: List<Outline>) -> Skeleton =
     }))
 
 /// Whether `name` is a declaration of `module` itself, not of a module beneath it.
-pub fn of_module(module: Bytes, name: Bytes) -> Bool / {abort.raise} =
+pub fn is_declared_in(module: Bytes, name: Bytes) -> Bool / {abort.raise} =
   name.starts_with(module.concat(b".")) && name.index_of_from(b".", module.len() + 1) == None
 
 // --- Cuts -------------------------------------------------------------------
@@ -342,7 +352,7 @@ pub type KeyRow = { root: Bytes, key: Bytes }
 
 /// One root the emitter offers: a definition, a spec clause, a test, the listing of a test's cases
 /// or a law part, with the arity its body is emitted at. `pure` is a definition's published purity, which lets a memo answer for
-/// it; any other root runs each time. `params` and `answer` say how what it is entered with and
+/// it; any other root runs each time. `params` and `result` say how what it is entered with and
 /// answers read at the seam. `witnesses` are the type variables whose witnesses lead `params`, which
 /// an entry from outside fills from what its arguments show of each.
 pub type EmitterRoot = {
@@ -350,8 +360,8 @@ pub type EmitterRoot = {
   arity: Int,
   pure: Bool,
   at: ModuleSpan,
-  params: List<Carry>,
-  answer: Carry,
+  params: List<Widths>,
+  result: Widths,
   witnesses: List<Int>,
 }
 
@@ -361,7 +371,7 @@ pub type EmitterRoot = {
 pub type EmitterCtor = {
   name: Bytes,
   arity: Int,
-  fields: List<Carry>,
+  fields: List<Widths>,
   key: Option<Bytes>,
   show: Option<Bytes>,
   /// The functions its type's `numeric` names, in `numeric_ops`' order; none where it states none.
@@ -374,21 +384,21 @@ pub type EmitterCtor = {
 
 /// Compiled code holds a width below 64 bits as a tagged `Int`, so only a value's type tells a `U8`
 /// from an `Int`; every other word says what it is. A carry is that type, cut to what decides a
-/// reading: `CPlain` where no width can sit, `CSum` a sum type at its parameters, whose
-/// constructor's fields read as its declaration types them, and `CVar` a type variable of the
+/// reading: `NoWidths` where no width can sit, `SumWidths` a sum type at its parameters, whose
+/// constructor's fields read as its declaration types them, and `VariableWidths` a type variable of the
 /// scheme around it, or a parameter of the declaration, by number. A function's words are never
 /// read, but a function the prover generated shows what its variables are.
-pub type Carry =
-  | CPlain
-  | CWidth(Int)
-  | CList(Carry)
-  | CMap(Carry, Carry)
-  | CRecord(List<CarriedField>)
-  | CSum(List<Carry>)
-  | CFn(List<Carry>, Carry)
-  | CVar(Int)
+pub type Widths =
+  | NoWidths
+  | FixedWidth(Int)
+  | ListWidths(Widths)
+  | MapWidths(Widths, Widths)
+  | RecordWidths(List<FieldWidths>)
+  | SumWidths(List<Widths>)
+  | FunctionWidths(List<Widths>, Widths)
+  | VariableWidths(Int)
 
-pub type CarriedField = { name: Bytes, carry: Carry }
+pub type FieldWidths = { name: Bytes, carry: Widths }
 
 /// A definition's or a test's published rows, which the checker takes in place of walking its body:
 /// what its module's check answered. A row's atoms name effects the item may never mention;
@@ -404,7 +414,7 @@ pub type KnownDefRow = {
   scaling: Bytes,
   repeats: List<Int>,
   /// Whether its calls end and how it calls what it is handed.
-  ending: Ending,
+  ending: Termination,
   summary: Summary,
   /// Where its body can raise.
   raises: List<Raise>,
@@ -452,7 +462,7 @@ pub type ModuleRow = {
   index: Int,
   items: List<Bytes>,
   imports: List<Bytes>,
-  sets: List<SetView>,
+  sets: List<EffectSetRow>,
   cuts: List<Cut>,
 }
 
@@ -520,7 +530,7 @@ pub type OpRow = {
   ret: Type,
   scheme: Option<Scheme>,
   at: ModuleSpan,
-  carries: List<Carry>,
+  carries: List<Widths>,
 }
 
 /// `host` is its real handler by program-wide name, where its module declares one: what every root
@@ -533,7 +543,7 @@ pub type EffectRow = {
   simple_name: Bytes,
   public: Bool,
   nondet: Bool,
-  ops: List<OpRow>,
+  operations: List<OpRow>,
   at: ModuleSpan,
   host: Option<Bytes>,
   waits: List<Bytes>,
@@ -565,7 +575,10 @@ pub type HashRow = {
 /// sentence hash and is empty for a test.
 pub type ItemHashRow = { key: Bytes, hash: Bytes, text: Bytes, deps: List<Bytes> }
 
-pub type HashFrame = | HDef(HashRow) | HTest(ItemHashRow) | HLaw(ItemHashRow)
+pub type HashTableRow =
+  | DefinitionHashRow(HashRow)
+  | TestHashRow(ItemHashRow)
+  | LawHashRow(ItemHashRow)
 
 pub type OrdinalRow = { module: Bytes, items: List<Bytes> }
 
@@ -576,7 +589,7 @@ pub type Dump = {
   diags: List<Diag>,
   order: List<Bytes>,
   packages: List<PackageDeps>,
-  pins: List<Pinned>,
+  pins: List<LockedPackage>,
   module_packages: List<Int>,
   modules: List<ModuleRow>,
   defs: List<DefRow>,
@@ -585,14 +598,14 @@ pub type Dump = {
   laws: List<LawRow>,
   effects: List<EffectRow>,
   ctors: List<CtorRow>,
-  hashes: List<HashFrame>,
+  hashes: List<HashTableRow>,
   hashes_digest: Bytes,
   keys: List<KeyRow>,
   emitter_roots: List<EmitterRoot>,
   emitter_ctors: List<EmitterCtor>,
   ordinals: List<OrdinalRow>,
   bodies: List<BodyRow>,
-  embeds: List<EmbedAt>,
+  embeds: List<ModuleEmbed>,
   /// What every definition and test published, which spares the emitter a walk of the bodies it
   /// does not lower.
   rows: Rows,
@@ -604,7 +617,7 @@ pub type Dump = {
 }
 
 /// A diagnostic as the answer carries it: no dedup key, and the note count is the notes.
-pub fn answered_diag(diag: Diag) -> Diag =
+pub fn normalized_diag(diag: Diag) -> Diag =
   {
     code: diag.code,
     notes: diag.notes_text.len(),
@@ -622,8 +635,8 @@ test "what a module's items ask to embed is what the module asks, each once" {
   let m = parse(
     b"fn a() -> Bytes = embed(\"x\")\nfn b() -> Bytes = embed(\"x\")\nfn c() -> List<Int> = embed_dir(\"d\").map(|f: { name: String, bytes: Bytes }| 1)\ntest \"t\" { assert(embed(\"y\").len() > 0) }\n",
   ).node;
-  assert_eq(wants_in(wants_by_item(m)), wants_of(m));
-  assert_eq(wants_by_item(m).map(|i: ItemWants| i.name), [
+  assert_eq(requests_in(requests_by_item(m)), embed_requests(m));
+  assert_eq(requests_by_item(m).map(|i: ItemEmbeds| i.name), [
     Some(b"a"),
     Some(b"b"),
     Some(b"c"),

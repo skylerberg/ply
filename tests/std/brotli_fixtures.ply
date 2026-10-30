@@ -8,7 +8,7 @@
 
 import packed_samples (names, sample)
 import std.brotli
-import std.brotli (brotli, Limits, Refusal)
+import std.brotli (brotli, Limits, Error)
 import std.bytes
 import std.seq
 import std.seq (seq)
@@ -25,82 +25,89 @@ fn file(name: String) -> Bytes / {abort.raise} =
   }
 
 /// The sample a packed file was made of, which its name opens with.
-fn plain_of(name: String) -> Bytes / {abort.raise} =
+fn uncompressed_of(name: String) -> Bytes / {abort.raise} =
   match name.split(".") { [stem, ..] -> sample(stem), [] -> panic("no name") }
 
 fn streams() -> List<File> = files().filter(|f: File| f.name.ends_with(".br"))
 
 /// The streams short enough to read once for each of their bytes.
-fn short() -> List<File> = streams().filter(|f: File| f.bytes.len() < 1200)
+fn short_streams() -> List<File> = streams().filter(|f: File| f.bytes.len() < 1200)
 
-fn roomy() -> Limits = { output: 1000000, window: 16777200 }
+fn large_limits() -> Limits = { output: 1000000, window: 16777200 }
 
-fn outcome(got: Result<Bytes, Refusal>, want: Bytes) -> String =
+fn outcome(got: Result<Bytes, Error>, want: Bytes) -> String =
   match got {
     Ok(b) -> if b == want { "same" } else { f"differs: {b.len()} bytes for {want.len()}" },
-    Err(r) -> f"refused at {r.at}: {reflect(r.why)}",
+    Err(r) -> f"refused at {r.at}: {reflect(r.reason)}",
   }
 
 test "{f.name} unpacks to its sample" for f: File in streams() {
-  assert_eq(outcome(brotli::try_decompress(f.bytes, roomy()), plain_of(f.name)), "same")
+  assert_eq(
+    outcome(brotli::try_decompress(f.bytes, large_limits()), uncompressed_of(f.name)),
+    "same",
+  )
 }
 
 /// What `packed` unpacks to, read `size` bytes at a time.
-fn streamed(
+fn decompress_in_chunks(
   packed: Bytes,
   size: Int,
   limits: Limits,
-) -> Bytes / {brotli.refused, seq.spent, abort.raise} =
-  Bytes::concat_all(seq::to_list(brotli::decoded(seq::slices(packed, size), limits), 10000000))
+) -> Bytes / {brotli.fail, seq.spent, abort.raise} =
+  Bytes::concat_all(
+    seq::to_list(brotli::decompress_stream(seq::slices(packed, size), limits), 10000000),
+  )
 
 test "{f.name} unpacks the same a chunk at a time, whatever the chunk" for f: File in streams() {
-  let whole = plain_of(f.name);
-  assert(streamed(f.bytes, 100000, roomy()) == whole);
-  assert(streamed(f.bytes, 4099, roomy()) == whole);
-  assert(f.bytes.len() > 3000 || streamed(f.bytes, 1, roomy()) == whole)
+  let whole = uncompressed_of(f.name);
+  assert(decompress_in_chunks(f.bytes, 100000, large_limits()) == whole);
+  assert(decompress_in_chunks(f.bytes, 4099, large_limits()) == whole);
+  assert(f.bytes.len() > 3000 || decompress_in_chunks(f.bytes, 1, large_limits()) == whole)
 }
 
 test "{name} survives the writer, whole and a chunk at a time" for name: String in names() {
   let plain = sample(name);
   let fast = brotli::compress(plain, brotli::Fast);
-  assert_eq(outcome(brotli::try_decompress(fast, roomy()), plain), "same");
+  assert_eq(outcome(brotli::try_decompress(fast, large_limits()), plain), "same");
   assert_eq(
-    outcome(brotli::try_decompress(brotli::compress(plain, brotli::Stored), roomy()), plain),
+    outcome(brotli::try_decompress(brotli::compress(plain, brotli::Stored), large_limits()), plain),
     "same",
   );
   let chunked = Bytes::concat_all(
-    seq::to_list(brotli::encoded(seq::slices(plain, 50000), brotli::Fast), 100000),
+    seq::to_list(brotli::compress_stream(seq::slices(plain, 50000), brotli::Fast), 100000),
   );
-  assert_eq(outcome(brotli::try_decompress(chunked, roomy()), plain), "same");
+  assert_eq(outcome(brotli::try_decompress(chunked, large_limits()), plain), "same");
   assert(fast.len() <= plain.len() + 16)
 }
 
-test "cut short anywhere, {f.name} is refused as cut short, at the cut" for f: File in short() {
+test "cut short anywhere, {f.name} is refused as cut short, at the cut" for f: File in short_streams(
+  ) {
   assert_eq(
     range(0, f.bytes.len()).filter(|n: Int|
-      brotli::try_decompress(f.bytes.slice(0, n), roomy())
-        != Err({ at: n, why: brotli::Truncated })),
+      brotli::try_decompress(f.bytes.slice(0, n), large_limits())
+        != Err({ at: n, reason: brotli::Truncated })),
     [],
   )
 }
 
 /// Whether `packed` is read whole as it is five bytes at a time, to the same bytes or the same
 /// refusal, with nothing else raised.
-fn steady(packed: Bytes) -> Bool = {
+fn chunked_matches_whole(packed: Bytes) -> Bool = {
   let limits: Limits = { output: 300000, window: 16777200 };
-  let whole: Result<Result<Bytes, Refusal>, String> = try[abort.raise] {
+  let whole: Result<Result<Bytes, Error>, String> = try[abort.raise] {
     brotli::try_decompress(packed, limits)
   };
-  let cut: Result<Result<Result<Bytes, Refusal>, Int>, String> = try[abort.raise] {
-    try[seq.spent] { try[brotli.refused] { streamed(packed, 5, limits) } }
+  let cut: Result<Result<Result<Bytes, Error>, Int>, String> = try[abort.raise] {
+    try[seq.spent] { try[brotli.fail] { decompress_in_chunks(packed, 5, limits) } }
   };
   match whole { Ok(answer) -> cut == Ok(Ok(answer)), Err(_) -> false }
 }
 
-test "whichever byte of {f.name} has a bit changed, it is read whole as it is a few bytes at a time, and only a refusal is raised" for f: File in short(
+test "whichever byte of {f.name} has a bit changed, it is read whole as it is a few bytes at a time, and only a refusal is raised" for f: File in short_streams(
   ) {
   assert_eq(
-    range(0, f.bytes.len()).filter(|i: Int| !steady(f.bytes.with_byte(i, f.bytes.at(i) ^ 0x10))),
+    range(0, f.bytes.len()).filter(|i: Int|
+      !chunked_matches_whole(f.bytes.with_byte(i, f.bytes.at(i) ^ 0x10))),
     [],
   )
 }
@@ -109,27 +116,27 @@ test "a stream that declares a window past the limit is refused before a meta-bl
   let wide = file("brief.w24.br");
   assert_eq(
     brotli::try_decompress(wide, { output: 1000000, window: 8388592 }),
-    Err({ at: 0, why: brotli::Window }),
+    Err({ at: 0, reason: brotli::Window }),
   );
   // Its first byte alone, which holds the window and the first bits of a meta-block's header, is
   // refused alike.
   assert_eq(
     brotli::try_decompress(wide.slice(0, 1), { output: 1000000, window: 8388592 }),
-    Err({ at: 0, why: brotli::Window }),
+    Err({ at: 0, reason: brotli::Window }),
   );
-  assert_eq(brotli::try_decompress(wide, roomy()), Ok(sample("brief")));
+  assert_eq(brotli::try_decompress(wide, large_limits()), Ok(sample("brief")));
   let narrow = file("prose.w10.br");
   assert_eq(
     brotli::try_decompress(narrow, { output: 1000000, window: 1007 }),
-    Err({ at: 0, why: brotli::Window }),
+    Err({ at: 0, reason: brotli::Window }),
   );
   assert_eq(brotli::try_decompress(narrow, { output: 1000000, window: 1008 }), Ok(sample("prose")));
   assert_eq(
-    brotli::try_decompress(file("brief.large.refused"), roomy()),
-    Err({ at: 0, why: brotli::LargeWindow }),
+    brotli::try_decompress(file("brief.large.refused"), large_limits()),
+    Err({ at: 0, reason: brotli::LargeWindow }),
   );
   assert(match brotli::try_decompress(file("long.q5.br"), { output: 149999, window: 16777200 }) {
-    Err(r) -> r.why == brotli::OverLimit,
+    Err(r) -> r.reason == brotli::OverLimit,
     Ok(_) -> false,
   })
 }
@@ -137,10 +144,10 @@ test "a stream that declares a window past the limit is refused before a meta-bl
 test "bytes after a stream are refused, and the first stream can be had alone" {
   let a = file("brief.q5.br");
   assert_eq(
-    brotli::try_decompress(a.concat(file("one.q0.br")), roomy()),
-    Err({ at: a.len(), why: brotli::Trailing }),
+    brotli::try_decompress(a.concat(file("one.q0.br")), large_limits()),
+    Err({ at: a.len(), reason: brotli::Trailing }),
   );
-  let first = brotli::first(a.concat(b"junk"), roomy());
+  let first = brotli::decompress_first(a.concat(b"junk"), large_limits());
   assert_eq(first.plain, sample("brief"));
   assert_eq(first.used, a.len())
 }

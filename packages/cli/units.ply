@@ -8,9 +8,9 @@ import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.unit (Emission, Made, shipped, shipped_runtime, answers_store, emitted,
+import compiler.unit (Emission, UnitContents, shipped, shipped_runtime, results_store, emitted,
                       emitter_identity, held)
-import compiler.store.kept (Record, kept_records, with_kept)
+import compiler.store.records (Record, record_store, with_record_store)
 import compiler.emit.keys (RootKey)
 import std.env (env)
 import sources
@@ -18,10 +18,10 @@ import std.fs (fs)
 import std.process (process)
 import std.random (entropy)
 import std.time (time)
-import std.path (below_root)
+import std.path (strip_root)
 
 /// A unit's C, and what it was made of, which says what each root runs.
-pub type Emitted = { text: Bytes, made: Made }
+pub type Emitted = { text: Bytes, made: UnitContents }
 
 /// A command asks for the unit a run enters, and for the library its C compiles into; what answers
 /// is `emitting`'s, which `main` runs every command under, or a handler of the asker's own. The C
@@ -50,15 +50,15 @@ fn emitted_of(
 /// What emitting a unit here reaches: the runtime it is compiled against, this program's own
 /// definitions, the emitter's among them, the answers and objects kept between runs under the
 /// toolchain's cache, the compilers, and what the environment asks to be told of it.
-pub effect set Emits = {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write}
+pub effect set Emits = {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write}
 
-fn kept_dir() -> String / {toolchain.bodies, abort.raise} = below_root(toolchain.bodies())
+fn cache_dir() -> String / {toolchain.bodies_dir, abort.raise} = strip_root(toolchain.bodies_dir())
 
 fn texts(front: LoadedAnalysis) -> List<Bytes> =
   front.files.map(|f: { path: String, name: String, text: Bytes }| f.text)
 
 /// What the emitter was asked and what was read back, said where `PLY_C_PHASES` asks.
-fn told(
+fn report_emission(
   emission: Result<Emission, Bytes>,
   identity: Bytes,
   ms: Int,
@@ -82,21 +82,21 @@ fn told(
 fn unit_of(
   front: LoadedAnalysis,
   offered: List<RootKey>,
-) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped_runtime();
   let started = time.elapsed_ms();
-  let emission = with_kept[abs, ans](answers_store(kept_dir(), runtime, identity), ||
+  let emission = with_record_store[abs, ans](results_store(cache_dir(), runtime, identity), ||
     emitted(
       runtime,
       front.dump,
       texts(front),
       front.inputs,
       offered,
-      |key: Bytes| kept_records.get[ans](key),
-      |rs: List<Record>| kept_records.put[ans](rs),
+      |key: Bytes| record_store.get[ans](key),
+      |rs: List<Record>| record_store.put[ans](rs),
     ));
-  told(emission, identity, time.elapsed_ms() - started);
+  report_emission(emission, identity, time.elapsed_ms() - started);
   emitted_of(front, emission)
 }
 
@@ -110,18 +110,18 @@ pub fn whole_emitted(
 ) -> Result<Emitted, List<Diag>> / {emit.unit, abort.raise} = emit.unit(front, every_root(front))
 
 /// The whole program's unit, as the runtime compiles it.
-pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit, abort.raise} =
+pub fn whole_text(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit, abort.raise} =
   text_of(whole_emitted(front))
 
 /// The library the whole program's unit compiles into under `profile`, or none for a run that
 /// executes nothing.
-pub fn wanted(
+pub fn wanted_library(
   front: LoadedAnalysis,
   build: Bool,
   profile: cc::Profile,
 ) -> Result<Option<String>, List<Diag>> / {emit.unit, emit.compiled, abort.raise} =
   if !build { Ok(None) } else {
-    match whole(front) {
+    match whole_text(front) {
       Err(diags) -> Err(diags),
       Ok(text) -> match library(text, profile) { Ok(l) -> Ok(Some(l)), Err(diags) -> Err(diags) },
     }
@@ -167,8 +167,8 @@ pub fn library_over(
 /// misreads the exports it writes. Where `PLY_CC` names a compiler, every unit is compiled with it.
 fn by_tcc(
   profile: cc::Profile,
-) -> Bool / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} =
-  profile.tcc && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
+) -> Bool / {compilers.find[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} =
+  profile.tcc && env.variable("PLY_CC") == None && compilers.find[tcc]() != None
     && cc::targets_x86_64_linux[tcc]()
 
 fn unbuildable(why: String) -> Diag =

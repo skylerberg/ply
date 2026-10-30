@@ -16,30 +16,42 @@ fn threshold(k: Int, bias: Int) -> Int =
   if k <= bias { 1 } else if k >= bias + 26 { 26 } else { k - bias }
 
 /// The bias for the next number, after one of `delta` among `points` characters: section 6.1.
-fn adapted(delta: Int, points: Int, first: Bool) -> Int / {abort.raise} = {
+fn adapt_bias(delta: Int, points: Int, first: Bool) -> Int / {abort.raise} = {
   let scaled = if first { delta / 700 } else { delta / 2 };
-  settled(scaled + scaled / points, 0)
+  bias_for_delta(scaled + scaled / points, 0)
 }
 
-fn settled(delta: Int, k: Int) -> Int / {abort.raise} =
-  if delta > 455 { settled(delta / 35, k + 36) } else { k + 36 * delta / (delta + 38) }
+fn bias_for_delta(delta: Int, k: Int) -> Int / {abort.raise} =
+  if delta > 455 { bias_for_delta(delta / 35, k + 36) } else { k + 36 * delta / (delta + 38) }
 
 /// The digit whose value is `d`: `a` to `z` for 0 to 25, then `0` to `9`.
 fn digit(d: Int) -> Char =
   match Char::of_int(if d < 26 { 97 + d } else { 22 + d }) { Some(c) -> c, None -> '0' }
 
 /// `out` and then `q` as a number of the variable length section 3.3 describes, its next digit
-/// at place `k`. `room` bounds the digits, which a 63-bit number never fills.
-fn written(out: List<Char>, q: Int, k: Int, bias: Int, room: Int) -> List<Char> / {abort.raise} = {
+/// at place `k`. `digits_left` bounds the digits, which a 63-bit number never fills.
+fn write_number(
+  out: List<Char>,
+  q: Int,
+  k: Int,
+  bias: Int,
+  digits_left: Int,
+) -> List<Char> / {abort.raise} = {
   let t = threshold(k, bias);
-  if q < t || room <= 0 { out.push(digit(q)) } else {
-    written(out.push(digit(t + (q - t) % (36 - t))), (q - t) / (36 - t), k + 36, bias, room - 1)
+  if q < t || digits_left <= 0 { out.push(digit(q)) } else {
+    write_number(
+      out.push(digit(t + (q - t) % (36 - t))),
+      (q - t) / (36 - t),
+      k + 36,
+      bias,
+      digits_left - 1,
+    )
   }
 }
 
 /// What is written so far, the least code point not yet handled, the count since the last one
 /// written, the bias, and how many characters are handled.
-type Encoding = { out: List<Char>, n: Int, delta: Int, bias: Int, handled: Int }
+type EncoderState = { out: List<Char>, n: Int, delta: Int, bias: Int, handled: Int }
 
 /// `text` in Punycode: ASCII letters, digits and hyphens, and whatever other ASCII `text`
 /// holds, which is kept as it is. A text that is all ASCII is itself and a hyphen.
@@ -56,7 +68,7 @@ pub fn encode(text: String) -> String / {abort.raise} = {
     bias: 72,
     handled: basic.len(),
   };
-  let done = others.fold(start, |e: Encoding, m: Int| {
+  let done = others.fold(start, |e: EncoderState, m: Int| {
     let risen = {
       out: e.out,
       n: m,
@@ -64,14 +76,14 @@ pub fn encode(text: String) -> String / {abort.raise} = {
       bias: e.bias,
       handled: e.handled,
     };
-    let passed = points.fold(risen, |s: Encoding, cp: Int|
+    let passed = points.fold(risen, |s: EncoderState, cp: Int|
       if cp < m { { out: s.out, n: s.n, delta: s.delta + 1, bias: s.bias, handled: s.handled } }
       else if cp == m {
         {
-          out: written(s.out, s.delta, 36, s.bias, 20),
+          out: write_number(s.out, s.delta, 36, s.bias, 20),
           n: s.n,
           delta: 0,
-          bias: adapted(s.delta, s.handled + 1, s.handled == basic.len()),
+          bias: adapt_bias(s.delta, s.handled + 1, s.handled == basic.len()),
           handled: s.handled + 1,
         }
       } else { s });
@@ -87,7 +99,7 @@ pub fn encode(text: String) -> String / {abort.raise} = {
 }
 
 /// The value of a digit in either case, or `-1`.
-fn value(c: Int) -> Int =
+fn digit_value(c: Int) -> Int =
   if c >= 97 && c <= 122 { c - 97 }
   else if c >= 65 && c <= 90 { c - 65 }
   else if c >= 48 && c <= 57 { c - 22 }
@@ -98,11 +110,11 @@ type Number = { i: Int, next: Int }
 
 /// The number whose digits start at `at`, added to `i` with weight `w`: `None` where the digits
 /// run out, one is no digit, or the number is past what an `Int` holds.
-fn number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -> Option<Number> =
+fn read_number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -> Option<Number> =
   match digits.at(at) {
     None -> None,
     Some(c) -> {
-      let d = value(c);
+      let d = digit_value(c);
       let t = threshold(k, bias);
       if d < 0 { None } else {
         match checked_mul(d, w) {
@@ -112,7 +124,7 @@ fn number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -> Opt
             Some(sum) -> if d < t { Some({ i: sum, next: at + 1 }) } else {
               match checked_mul(w, 36 - t) {
                 None -> None,
-                Some(heavier) -> number(digits, at + 1, sum, heavier, k + 36, bias),
+                Some(heavier) -> read_number(digits, at + 1, sum, heavier, k + 36, bias),
               }
             },
           },
@@ -123,19 +135,19 @@ fn number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -> Opt
 
 /// The text read so far as code points, the code point and place the next number counts from,
 /// the bias, and where the next number's digits start.
-type Decoding = { out: List<Int>, n: Int, i: Int, bias: Int, next: Int }
+type DecoderState = { out: List<Int>, n: Int, i: Int, bias: Int, next: Int }
 
 /// The text `encoded` is the Punycode of, or `None` where it is none: a character that is not
-/// ASCII, a number that is cut short or is no number, or one that names no character. `most`
+/// ASCII, a number that is cut short or is no number, or one that names no character. `max_length`
 /// bounds the characters of the answer, and a text of more is `None` too.
-pub fn decode(encoded: String, most: Int) -> Option<String> / {abort.raise} = {
+pub fn decode(encoded: String, max_length: Int) -> Option<String> / {abort.raise} = {
   let chars = encoded.chars().map(Int::of_char);
   let hyphen = range(0, chars.len()).fold(-1, |last: Int, i: Int|
     if chars.at(i) == Some(45) { i } else { last });
   let basic = if hyphen > 0 { chars.take(hyphen) } else { [] };
   let digits = Array::of_list(if hyphen > 0 { chars.drop(hyphen + 1) } else { chars });
-  if chars.filter(|c: Int| c >= 128).len() > 0 || basic.len() > most { None } else {
-    iterate({ out: basic, n: 128, i: 0, bias: 72, next: 0 }, digits.len() + 1, |d: Decoding|
+  if chars.filter(|c: Int| c >= 128).len() > 0 || basic.len() > max_length { None } else {
+    iterate({ out: basic, n: 128, i: 0, bias: 72, next: 0 }, digits.len() + 1, |d: DecoderState|
       if d.next >= digits.len() {
         Stop(
           Some(
@@ -145,19 +157,19 @@ pub fn decode(encoded: String, most: Int) -> Option<String> / {abort.raise} = {
           ),
         )
       } else {
-        match number(digits, d.next, d.i, 1, 36, d.bias) {
+        match read_number(digits, d.next, d.i, 1, 36, d.bias) {
           None -> Stop(None),
           Some(read) -> {
             let count = d.out.len() + 1;
             match checked_add(d.n, read.i / count) {
               None -> Stop(None),
-              Some(n) -> if count > most || Char::of_int(n) == None { Stop(None) } else {
+              Some(n) -> if count > max_length || Char::of_int(n) == None { Stop(None) } else {
                 let at = read.i % count;
                 Continue({
                   out: d.out.take(at).push(n).concat(d.out.drop(at)),
                   n: n,
                   i: at + 1,
-                  bias: adapted(read.i - d.i, count, d.i == 0),
+                  bias: adapt_bias(read.i - d.i, count, d.i == 0),
                   next: read.next,
                 })
               },

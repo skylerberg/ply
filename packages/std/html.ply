@@ -38,7 +38,7 @@
 //!
 //! The reader behind the literal is open to markup read at run time, which is how `std.template`
 //! fills one: `reader` is where a reading starts, `run` reads a text from where another ended,
-//! `hole` says how a value stands there, `joined` is where two readings of one place agree, and a
+//! `hole` says how a value stands there, `join` is where two readings of one place agree, and a
 //! `Draft` is written of runs and holes in the order they were read, so what it finishes as is
 //! still an `Html` in which no text is markup.
 
@@ -59,7 +59,7 @@ import std.value (VCtor, VList, VRecord, VStr, Value, reflect)
 /// A part of a document: markup as it is written out, characters that are escaped where they
 /// are written, or a URL the program vouches for. Only this module makes one, so no caller's text
 /// is markup.
-pub opaque type Piece = | Markup(String) | Chars(String) | Vouched(String)
+pub opaque type Piece = | Markup(String) | Chars(String) | Trusted(String)
 
 /// A fragment of a document's content, in the order it is written. Only this module builds one,
 /// so its markup is text this module read as markup and every other string in it came through
@@ -72,13 +72,13 @@ pub fn text(s: String) -> Html = { pieces: [Chars(s)] }
 /// `url` as a URL the program vouches for: where a hole is a URL it may give the URL any scheme,
 /// and is still percent-encoded; anywhere else it is `text(url)`. Never make one of text that
 /// reached the program from outside as it came.
-pub fn trusted_url(url: String) -> Html = { pieces: [Vouched(url)] }
+pub fn trusted_url(url: String) -> Html = { pieces: [Trusted(url)] }
 
 /// The fragments one after another, with nothing between them.
 pub fn fragment(parts: List<Html>) -> Html = { pieces: parts.flat_map(|h: Html| h.pieces) }
 
 fn piece_text(piece: Piece) -> String =
-  match piece { Markup(m) -> m, Chars(s) -> s, Vouched(u) -> u }
+  match piece { Markup(m) -> m, Chars(s) -> s, Trusted(u) -> u }
 
 /// The document text of `h`: its markup as it is, and its characters escaped.
 pub fn render(h: Html) -> String / {abort.raise} =
@@ -88,21 +88,21 @@ pub fn render(h: Html) -> String / {abort.raise} =
         Bytes::of_string(match piece {
           Markup(m) -> m,
           Chars(s) -> escape(s),
-          Vouched(u) -> escape(u),
+          Trusted(u) -> escape(u),
         })),
     ),
   )
 
 /// The bytes of `h` as its pieces hold them, markup and characters alike.
-fn held_bytes(h: Html) -> List<Bytes> =
+fn piece_bytes(h: Html) -> List<Bytes> =
   h.pieces.map(|piece: Piece| Bytes::of_string(piece_text(piece)))
 
 /// What `h` is as characters: its text as given, and its markup as its source.
-fn plain(h: Html) -> String = String::of_bytes_lossy(Bytes::concat_all(held_bytes(h)))
+fn raw_text(h: Html) -> String = String::of_bytes_lossy(Bytes::concat_all(piece_bytes(h)))
 
 /// How many bytes `h` holds, of markup and of characters before they are escaped: no more than
 /// its document text has, and no less than a sixth of it.
-pub fn size(h: Html) -> Int = held_bytes(h).fold(0, |n: Int, held: Bytes| n + held.len())
+pub fn size(h: Html) -> Int = piece_bytes(h).fold(0, |n: Int, held: Bytes| n + held.len())
 
 /// A URL a fragment holds: its text, and whether the program vouches for all of it.
 pub type UrlText = { text: String, trusted: Bool }
@@ -112,63 +112,67 @@ pub type UrlText = { text: String, trusted: Bool }
 pub fn url_text(h: Html) -> Option<UrlText> =
   if contains_markup(h) { None } else {
     Some({
-      text: plain(h),
+      text: raw_text(h),
       trusted: h.pieces.len() > 0
         && h.pieces.fold(true, |all: Bool, p: Piece|
-          all && (match p { Vouched(_) -> true, _ -> false })),
+          all && (match p { Trusted(_) -> true, _ -> false })),
     })
   }
 
 fn contains_markup(h: Html) -> Bool =
-  h.pieces.fold(false, |found: Bool, p: Piece| found || (match p { Markup(_) -> true, _ -> false }))
+  h.pieces.fold(false, |problem: Bool, p: Piece|
+    problem || (match p { Markup(_) -> true, _ -> false }))
 
 /// The fragment `v` shows, where `v` is what `reflect` answers of an `Html`, and `None` for any
 /// other value: how a fragment held in data is told from a text there. A `Value` is data anyone
 /// may write out, so this takes `v` as `reflect`'s; one read from outside a program, as a JSON
 /// document's is, holds no constructor and is never a fragment.
-pub fn reflected(v: Value) -> Option<Html> =
-  match v { VRecord([{ name: "pieces", value: VList(shown) }]) -> pieces_shown(shown), _ -> None }
+pub fn of_value(v: Value) -> Option<Html> =
+  match v {
+    VRecord([{ name: "pieces", value: VList(shown) }]) -> pieces_of_values(shown),
+    _ -> None,
+  }
 
-fn pieces_shown(shown: List<Value>) -> Option<Html> =
-  match Option::traverse(shown, piece_shown) {
+fn pieces_of_values(shown: List<Value>) -> Option<Html> =
+  match Option::traverse(shown, piece_of_value) {
     Some(pieces) -> Some({ pieces: pieces }),
     None -> None,
   }
 
-fn piece_shown(v: Value) -> Option<Piece> =
+fn piece_of_value(v: Value) -> Option<Piece> =
   match v {
     VCtor("std.html.Markup", [VStr(markup)]) -> Some(Markup(markup)),
     VCtor("std.html.Chars", [VStr(chars)]) -> Some(Chars(chars)),
-    VCtor("std.html.Vouched", [VStr(url)]) -> Some(Vouched(url)),
+    VCtor("std.html.Trusted", [VStr(url)]) -> Some(Trusted(url)),
     _ -> None,
   }
 
 // --- Character references ------------------------------------------------------
 
-type Written = { raw: String, written: String }
+type Escape = { raw: String, written: String }
 
 /// `&` first, so the `&` of a reference written for another character is not written again.
-fn marks() -> List<Written> =
+fn basic_escapes() -> List<Escape> =
   [{ raw: "&", written: "&amp;" }, { raw: "<", written: "&lt;" }, { raw: ">", written: "&gt;" }]
 
-fn double_quote() -> Written = { raw: "\"", written: "&quot;" }
+fn quote_escape() -> Escape = { raw: "\"", written: "&quot;" }
 
-fn referenced(s: String, references: List<Written>) -> String =
-  references.fold(s, |out: String, r: Written| out.replace(r.raw, r.written))
+fn escape_with(s: String, references: List<Escape>) -> String =
+  references.fold(s, |out: String, r: Escape| out.replace(r.raw, r.written))
 
 /// `s` with `&`, `<`, `>`, `"` and `'` as character references, which is text in an element's
 /// content and in an attribute value quoted either way.
 pub fn escape(s: String) -> String =
-  referenced(s, marks().push(double_quote()).push({ raw: "'", written: "&#39;" }))
+  escape_with(s, basic_escapes().push(quote_escape()).push({ raw: "'", written: "&#39;" }))
 
 /// `s` with `&`, `<` and `>` as character references: text in an element's content, where a quote
 /// is a character like any other. It is no attribute's value: `escape_attribute` writes one.
-pub fn escape_text(s: String) -> String = referenced(s, marks())
+pub fn escape_text(s: String) -> String = escape_with(s, basic_escapes())
 
 /// `s` with `&`, `<`, `>` and `"` as character references: the value of an attribute written
 /// between double quotes. Between single quotes a `'` would end it, and there `escape` is the
 /// text.
-pub fn escape_attribute(s: String) -> String = referenced(s, marks().push(double_quote()))
+pub fn escape_attribute(s: String) -> String = escape_with(s, basic_escapes().push(quote_escape()))
 
 /// `s` with each character reference read as the character it names, as the tokenizer reads text
 /// in an element's content. A reference is a name of the standard's table with its `;`, or the
@@ -189,32 +193,35 @@ pub fn license() -> String / {abort.raise} = String::of_bytes(embed("html/LICENS
 /// The standard's named character references, each by its name as the table spells it after the
 /// `&`: with its `;`, and for the names admitted without one also bare. `bare` is the length of
 /// the longest of those.
-type Names = { named: Map<Bytes, Bytes>, bare: Int }
+type NamedReferences = { named: Map<Bytes, Bytes>, bare: Int }
 
-const fn names() -> Names = names_in(embed("html/entities.json"))
+const fn names() -> NamedReferences = names_in(embed("html/entities.json"))
 
-fn names_in(file: Bytes) -> Names / {abort.raise} =
+fn names_in(file: Bytes) -> NamedReferences / {abort.raise} =
   match json::parse(file) {
     Ok(json::Object(entries)) ->
-      entries.fold({ named: Map::new(), bare: 0 }, |table: Names, name: String, entry: Json| {
-        let key = Bytes::of_string(name.slice(1, name.len()));
-        match json::get(entry, "characters") {
-          Some(json::Str(characters)) ->
-            {
-              named: table.named.insert(key, Bytes::of_string(characters)),
-              bare: if key.ends_with(b";") { table.bare } else { max(table.bare, key.len()) },
-            },
-          _ -> panic("`" ++ name ++ "` names no characters"),
-        }
-      }),
+      entries.fold(
+        { named: Map::new(), bare: 0 },
+        |table: NamedReferences, name: String, entry: Json| {
+          let key = Bytes::of_string(name.slice(1, name.len()));
+          match json::get(entry, "characters") {
+            Some(json::Str(characters)) ->
+              {
+                named: table.named.insert(key, Bytes::of_string(characters)),
+                bare: if key.ends_with(b";") { table.bare } else { max(table.bare, key.len()) },
+              },
+            _ -> panic("`" ++ name ++ "` names no characters"),
+          }
+        },
+      ),
     _ -> panic("the table of named character references is no JSON object"),
   }
 
 /// A character reference read: the bytes it stands for, where the text goes on after it, and the
 /// parse errors found in it.
-type Referred = { characters: Bytes, next: Int, problems: List<Problem> }
+type Reference = { characters: Bytes, next: Int, problems: List<Problem> }
 
-type Unescaping = { from: Int, amp: Option<Int>, pieces: List<Bytes> }
+type UnescapeState = { from: Int, amp: Option<Int>, pieces: List<Bytes> }
 
 fn unescaped(s: String, attribute: Bool) -> String / {abort.raise} = {
   let text = Bytes::of_string(s);
@@ -225,10 +232,10 @@ fn unescaped(s: String, attribute: Bool) -> String / {abort.raise} = {
       let pieces = iterate(
         { from: 0, amp: Some(first), pieces: [] },
         text.len() + 1,
-        |at: Unescaping|
+        |at: UnescapeState|
           match at.amp {
             None -> Stop(at.pieces.push(text.slice(at.from, text.len()))),
-            Some(amp) -> match referred(text, amp, table, attribute, true) {
+            Some(amp) -> match read_reference(text, amp, table, attribute, true) {
               None -> Continue({ ..at, amp: text.index_of_from(b"&", amp + 1) }),
               Some(read) ->
                 Continue({
@@ -249,23 +256,23 @@ fn alphanumerics() -> Bytes = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
 /// The character reference the `&` at `amp` begins, read as the tokenizer's character reference
 /// states read it (§13.2.5.77 to §13.2.5.84), or `None` where `text` ends before the reference
 /// is decided and is not the end of the input (`ended`).
-fn referred(
+fn read_reference(
   text: Bytes,
   amp: Int,
-  table: Names,
+  table: NamedReferences,
   attribute: Bool,
   ended: Bool,
-) -> Option<Referred> / {abort.raise} = {
+) -> Option<Reference> / {abort.raise} = {
   let c = text.peek(amp + 1);
   if c < 0 && !ended { None }
-  else if c == b'#' { numbered(text, amp, ended) }
-  else if is_letter(c) || is_digit(c) { named(text, amp, table, attribute, ended) }
+  else if c == b'#' { numeric_reference(text, amp, ended) }
+  else if is_letter(c) || is_digit(c) { named_reference(text, amp, table, attribute, ended) }
   else { Some({ characters: b"&", next: amp + 1, problems: [] }) }
 }
 
-fn found(error: ParseError, offset: Int) -> Problem = { error: error, offset: offset }
+fn problem(error: ParseError, offset: Int) -> Problem = { error: error, offset: offset }
 
-fn numbered(text: Bytes, amp: Int, ended: Bool) -> Option<Referred> / {abort.raise} = {
+fn numeric_reference(text: Bytes, amp: Int, ended: Bool) -> Option<Reference> / {abort.raise} = {
   let n = text.len();
   let hex = text.peek(amp + 2) == b'x' || text.peek(amp + 2) == b'X';
   let from = if hex { amp + 3 } else { amp + 2 };
@@ -274,7 +281,7 @@ fn numbered(text: Bytes, amp: Int, ended: Bool) -> Option<Referred> / {abort.rai
     Some({
       characters: text.slice(amp, from),
       next: from,
-      problems: [found(AbsenceOfDigitsInNumericCharacterReference, from)],
+      problems: [problem(AbsenceOfDigitsInNumericCharacterReference, from)],
     })
   } else {
     // Held at one past the last code point, so no run of digits overflows.
@@ -282,12 +289,12 @@ fn numbered(text: Bytes, amp: Int, ended: Bool) -> Option<Referred> / {abort.rai
       min(k * (if hex { 16 } else { 10 }) + hex_value(text.at(i)), 0x110000));
     let closed = text.peek(to) == b';';
     let next = if closed { to + 1 } else { to };
-    let missing = if closed { [] } else { [found(MissingSemicolonAfterCharacterReference, to)] };
+    let missing = if closed { [] } else { [problem(MissingSemicolonAfterCharacterReference, to)] };
     Some({
-      characters: character(numbered_character(code)),
+      characters: character(numeric_reference_character(code)),
       next: next,
-      problems: match numbered_error(code) {
-        Some(e) -> missing.push(found(e, next)),
+      problems: match numeric_reference_error(code) {
+        Some(e) -> missing.push(problem(e, next)),
         None -> missing,
       },
     })
@@ -295,7 +302,7 @@ fn numbered(text: Bytes, amp: Int, ended: Bool) -> Option<Referred> / {abort.rai
 }
 
 /// The parse error a numeric reference to `code` is (§13.2.5.84), if it is one.
-fn numbered_error(code: Int) -> Option<ParseError> =
+fn numeric_reference_error(code: Int) -> Option<ParseError> =
   if code == 0 { Some(NullCharacterReference) }
   else if code > 0x10FFFF { Some(CharacterReferenceOutsideUnicodeRange) }
   else if code >= 0xD800 && code <= 0xDFFF { Some(SurrogateCharacterReference) }
@@ -311,7 +318,7 @@ fn noncharacter(code: Int) -> Bool = (code >= 0xFDD0 && code <= 0xFDEF) || code 
 fn control(code: Int) -> Bool = code < 0x20 || (code >= 0x7F && code <= 0x9F)
 
 /// The code point a numeric reference to `code` is read as.
-fn numbered_character(code: Int) -> Int =
+fn numeric_reference_character(code: Int) -> Int =
   if code == 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) { 0xFFFD }
   else if code >= 0x80 && code <= 0x9F {
     match windows_1252().at_or(code - 0x80, 0) { 0 -> code, mapped -> mapped }
@@ -363,25 +370,25 @@ fn character(code: Int) -> Bytes =
 /// The longest name of the table that stands after the `&` at `amp`: the letters and digits there
 /// with the `;` after them, or else the longest start of them the table admits bare. Where none
 /// is a name, the letters and digits are text, and a `;` after them a parse error.
-fn named(
+fn named_reference(
   text: Bytes,
   amp: Int,
-  table: Names,
+  table: NamedReferences,
   attribute: Bool,
   ended: Bool,
-) -> Option<Referred> / {abort.raise} = {
+) -> Option<Reference> / {abort.raise} = {
   let from = amp + 1;
   let to = text.skip(from, alphanumerics());
   let whole = if text.peek(to) == b';' { table.named.get(text.slice(from, to + 1)) } else { None };
   if to >= text.len() && !ended { None } else {
     match whole {
       Some(characters) -> Some({ characters: characters, next: to + 1, problems: [] }),
-      None -> match bare(text, from, to, table) {
+      None -> match bare_reference(text, from, to, table) {
         None ->
           Some({
             characters: text.slice(amp, to),
             next: to,
-            problems: if text.peek(to) == b';' { [found(UnknownNamedCharacterReference, to)] }
+            problems: if text.peek(to) == b';' { [problem(UnknownNamedCharacterReference, to)] }
             else { [] },
           }),
         Some(read) -> {
@@ -389,7 +396,10 @@ fn named(
           if attribute && (after == b'=' || is_letter(after) || is_digit(after)) {
             Some({ characters: text.slice(amp, read.next), next: read.next, problems: [] })
           } else {
-            Some({ ..read, problems: [found(MissingSemicolonAfterCharacterReference, read.next)] })
+            Some({
+              ..read,
+              problems: [problem(MissingSemicolonAfterCharacterReference, read.next)],
+            })
           }
         },
       },
@@ -398,7 +408,12 @@ fn named(
 }
 
 /// The longest start of the letters and digits from `from` to `to` that the table admits bare.
-fn bare(text: Bytes, from: Int, to: Int, table: Names) -> Option<Referred> / {abort.raise} =
+fn bare_reference(
+  text: Bytes,
+  from: Int,
+  to: Int,
+  table: NamedReferences,
+) -> Option<Reference> / {abort.raise} =
   iterate(min(to - from, table.bare), table.bare + 1, |k: Int|
     if k < 1 { Stop(None) } else {
       match table.named.get(text.slice(from, from + k)) {
@@ -604,7 +619,7 @@ pub fn default_limits() -> Limits =
 
 /// Why a reading refused, past which limit; or this module's own defect, which no input should
 /// meet, answered as a refusal so that a reading raises nothing else.
-pub type Why =
+pub type ErrorKind =
   | TooManyTokens
   | TooManyAttributes
   | NameTooLong
@@ -613,12 +628,12 @@ pub type Why =
   | Defect(String)
 
 /// A refusal, and the byte of the input the reading stood at.
-pub type Refusal = new { offset: Int, why: Why }
+pub type Error = new { offset: Int, reason: ErrorKind }
 
 /// What this module raises.
 pub effect html {
   /// A reading passed one of its limits.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// A value written into a URL would give it this scheme, which no value may.
   raise unsafe_url(scheme: String)
 }
@@ -627,7 +642,7 @@ pub effect html {
 
 /// Which text an end tag closes: RCDATA's, RAWTEXT's, script data's, or the script data inside
 /// a `<!--` of a script.
-type Kind = | RcdataText | RawText | ScriptText | EscapedText
+type TextKind = | RcdataText | RawText | ScriptText | EscapedText
 
 /// The tokenizer's states (§13.2.5), the text states among them by the `State` they are. A
 /// character reference is read whole where it begins, so its states are none of these; an
@@ -640,9 +655,9 @@ type Mode =
   | TagOpen
   | EndTagOpen
   | TagName
-  | TextLt(Kind)
-  | TextEndOpen(Kind)
-  | TextEndName(Kind)
+  | TextLessThan(TextKind)
+  | TextEndOpen(TextKind)
+  | TextEndName(TextKind)
   | EscapeStart
   | EscapeStartDash
   | Escaped
@@ -652,7 +667,7 @@ type Mode =
   | DoubleEscaped
   | DoubleEscapedDash
   | DoubleEscapedDashDash
-  | DoubleEscapedLt
+  | DoubleEscapedLessThan
   | DoubleEscapeEnd
   | BeforeAttrName
   | AttrName
@@ -666,10 +681,10 @@ type Mode =
   | CommentStart
   | CommentStartDash
   | InComment
-  | CommentLt
-  | CommentLtBang
-  | CommentLtBangDash
-  | CommentLtBangDashDash
+  | CommentLessThan
+  | CommentLessThanBang
+  | CommentLessThanBangDash
+  | CommentLessThanBangDashDash
   | CommentEndDash
   | CommentEnd
   | CommentEndBang
@@ -683,23 +698,23 @@ type Mode =
   | AfterId(Bool)
   | BetweenIds
   | BogusDoctype
-  | PiOpen
-  | PiTarget
-  | AfterPiTarget
-  | PiData
-  | PiQuestion
+  | InstructionOpen
+  | InstructionTarget
+  | AfterInstructionTarget
+  | InstructionData
+  | InstructionQuestion
   | Ended
 
 /// A tag being read: its name's pieces, whether it is an end tag, the attributes it has kept and
 /// whether it ends with `/>`.
-type Tagging = { name: List<Bytes>, end: Bool, attributes: List<Attribute>, closing: Bool }
+type PartialTag = { name: List<Bytes>, end: Bool, attributes: List<Attribute>, closing: Bool }
 
 /// The attribute being read: its name's and value's pieces, whether it is dropped for a name the
 /// tag already has, and whether one is being read at all.
-type Attr = { name: List<Bytes>, value: List<Bytes>, dropped: Bool, open: Bool }
+type PartialAttribute = { name: List<Bytes>, value: List<Bytes>, dropped: Bool, open: Bool }
 
 /// A doctype being read, each part missing until it is written.
-type Doctyping = {
+type PartialDoctype = {
   name: Option<List<Bytes>>,
   public_id: Option<List<Bytes>>,
   system_id: Option<List<Bytes>>,
@@ -719,7 +734,7 @@ type Doctyping = {
 /// hole's reader's, which follows the URL an attribute's value holds: `urls` whether it does,
 /// `link` how the attribute holds URLs, `url` and `word` how far it is in one, `held` the
 /// attributes of the tag a hole stands in, and `stray` the first character a hole makes amiss.
-type M = {
+type Machine = {
   input: Bytes,
   at: Int,
   ended: Bool,
@@ -729,10 +744,10 @@ type M = {
   text: List<Bytes>,
   text_size: Int,
   text_from: Int,
-  tag: Tagging,
-  attr: Attr,
+  tag: PartialTag,
+  attr: PartialAttribute,
   data: List<Bytes>,
-  doctype: Doctyping,
+  doctype: PartialDoctype,
   temp: Bytes,
   last_start: Bytes,
   name_size: Int,
@@ -747,23 +762,23 @@ type M = {
   limits: Limits,
   tokens: Int,
   output: Int,
-  stop: Option<Refusal>,
+  stop: Option<Error>,
   urls: Bool,
-  link: Link,
-  url: Url,
+  link: UrlLayout,
+  url: UrlState,
   word: Bytes,
   held: List<Bytes>,
   stray: Option<Stray>,
 }
 
-fn no_tag() -> Tagging = { name: [], end: false, attributes: [], closing: false }
+fn no_tag() -> PartialTag = { name: [], end: false, attributes: [], closing: false }
 
-fn no_attr() -> Attr = { name: [], value: [], dropped: false, open: false }
+fn no_attr() -> PartialAttribute = { name: [], value: [], dropped: false, open: false }
 
-fn no_doctype() -> Doctyping = { name: None, public_id: None, system_id: None, quirks: false }
+fn no_doctype() -> PartialDoctype = { name: None, public_id: None, system_id: None, quirks: false }
 
 /// A machine at the start of `input`, which ends there where `ended`.
-fn machine(input: Bytes, s: Start, limits: Limits, switching: Bool, ended: Bool) -> M =
+fn machine(input: Bytes, s: Start, limits: Limits, switching: Bool, ended: Bool) -> Machine =
   {
     input: input,
     at: 0,
@@ -797,8 +812,8 @@ fn machine(input: Bytes, s: Start, limits: Limits, switching: Bool, ended: Bool)
     output: 0,
     stop: None,
     urls: false,
-    link: Unlinked,
-    url: Plain,
+    link: NoUrl,
+    url: NotInUrl,
     word: b"",
     held: [],
     stray: None,
@@ -822,35 +837,36 @@ fn width(input: Bytes, at: Int) -> Int / {abort.raise} = {
 
 /// The character the machine reads next as the input stream holds it, a carriage return as a line
 /// feed, or -1 at the end of the input.
-fn next_of(m: M) -> Int = {
+fn next_of(m: Machine) -> Int = {
   let c = m.input.peek(m.at);
   if c == 13 { 10 } else { c }
 }
 
 /// The bytes of the character the machine reads next.
-fn current(m: M) -> Bytes / {abort.raise} =
+fn current(m: Machine) -> Bytes / {abort.raise} =
   if m.input.peek(m.at) == 13 { b"\n" } else { m.input.slice(m.at, m.at + width(m.input, m.at)) }
 
 /// ASCII whitespace as the tokenizer reads it, a carriage return having become a line feed.
 fn is_space(c: Int) -> Bool = c == 9 || c == 10 || c == 12 || c == 32
 
 /// The machine past the character it reads next.
-fn ahead(m: M) -> M / {abort.raise} = { ..m, at: m.at + width(m.input, m.at) }
+fn ahead(m: Machine) -> Machine / {abort.raise} = { ..m, at: m.at + width(m.input, m.at) }
 
 /// The machine past the character it reads next, in `mode`.
-fn into(m: M, mode: Mode) -> M / {abort.raise} =
+fn into(m: Machine, mode: Mode) -> Machine / {abort.raise} =
   { ..m, mode: mode, at: m.at + width(m.input, m.at) }
 
 /// The machine reading its next character again, in `mode`.
-fn again(m: M, mode: Mode) -> M = { ..m, mode: mode }
+fn reconsume(m: Machine, mode: Mode) -> Machine = { ..m, mode: mode }
 
-fn fault(m: M, e: ParseError) -> M = { ..m, problems: m.problems.push(found(e, m.at)) }
+fn fault(m: Machine, e: ParseError) -> Machine =
+  { ..m, problems: m.problems.push(problem(e, m.at)) }
 
-fn refuse(m: M, why: Why) -> M =
-  match m.stop { Some(_) -> m, None -> { ..m, stop: Some({ offset: m.at, why: why }) } }
+fn fail(m: Machine, why: ErrorKind) -> Machine =
+  match m.stop { Some(_) -> m, None -> { ..m, stop: Some({ offset: m.at, reason: why }) } }
 
 /// `piece` as character tokens' characters, read from `offset`.
-fn said(m: M, piece: Bytes, offset: Int) -> M =
+fn add_text(m: Machine, piece: Bytes, offset: Int) -> Machine =
   if piece.len() == 0 { m } else {
     {
       ..m,
@@ -861,13 +877,13 @@ fn said(m: M, piece: Bytes, offset: Int) -> M =
   }
 
 /// The characters up to the first byte of `stops`, or to the end, as text.
-fn run_text(m: M, stops: Bytes) -> M / {abort.raise} = {
+fn run_text(m: Machine, stops: Bytes) -> Machine / {abort.raise} = {
   let to = m.input.skip_until(m.at, stops);
-  said({ ..m, at: to }, m.input.slice(m.at, to), m.at)
+  add_text({ ..m, at: to }, m.input.slice(m.at, to), m.at)
 }
 
 /// The characters up to the first byte of `stops`, or to the end.
-fn run_of(m: M, stops: Bytes) -> Bytes / {abort.raise} =
+fn run_of(m: Machine, stops: Bytes) -> Bytes / {abort.raise} =
   m.input.slice(m.at, m.input.skip_until(m.at, stops))
 
 /// `b` with `A` to `Z` in lower case.
@@ -878,23 +894,28 @@ fn lowered(b: Bytes) -> Bytes / {abort.raise} =
 fn upper_letters() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 /// `piece` added to the name being read, which the limits bound.
-fn name_grown(m: M, size: Int) -> M =
-  if size > m.limits.name { refuse({ ..m, name_size: size }, NameTooLong) }
+fn name_grown(m: Machine, size: Int) -> Machine =
+  if size > m.limits.name { fail({ ..m, name_size: size }, NameTooLong) }
   else { { ..m, name_size: size } }
 
 /// `piece` added to the value being read, which the limits bound.
-fn value_grown(m: M, size: Int) -> M =
-  if size > m.limits.value { refuse({ ..m, value_size: size }, ValueTooLong) }
+fn value_grown(m: Machine, size: Int) -> Machine =
+  if size > m.limits.value { fail({ ..m, value_size: size }, ValueTooLong) }
   else { { ..m, value_size: size } }
 
 /// `piece` added to the tag's name, the machine at `to`.
-fn tag_named(m: M, piece: Bytes, to: Int) -> M = {
+fn tag_named(m: Machine, piece: Bytes, to: Int) -> Machine = {
   let size = m.name_size + piece.len();
-  let grown: M = { ..m, at: to, tag: { ..m.tag, name: m.tag.name.push(piece) }, name_size: size };
-  if size > m.limits.name { refuse(grown, NameTooLong) } else { grown }
+  let grown: Machine = {
+    ..m,
+    at: to,
+    tag: { ..m.tag, name: m.tag.name.push(piece) },
+    name_size: size,
+  };
+  if size > m.limits.name { fail(grown, NameTooLong) } else { grown }
 }
 
-fn data_added(m: M, piece: Bytes) -> M =
+fn data_added(m: Machine, piece: Bytes) -> Machine =
   value_grown({ ..m, data: m.data.push(piece) }, m.value_size + piece.len())
 
 fn joined_bytes(pieces: List<Bytes>) -> String = String::of_bytes_lossy(Bytes::concat_all(pieces))
@@ -918,16 +939,16 @@ fn code_point(input: Bytes, at: Int) -> Int / {abort.raise} = {
 
 /// The input stream's parse errors in `input` from `from` (§13.2.3.5), in order: each control but
 /// ASCII whitespace and NUL, and each noncharacter, at its first byte.
-fn checked(input: Bytes, from: Int) -> List<Problem> / {abort.raise} =
+fn input_stream_problems(input: Bytes, from: Int) -> List<Problem> / {abort.raise} =
   iterate({ at: from, found: [] }, input.len() + 2, |s: { at: Int, found: List<Problem> }| {
     let i = input.skip_until(s.at, suspects());
     if i >= input.len() { Stop(s.found) } else {
       let point = code_point(input, i);
       let next = i + width(input, i);
       if noncharacter(point) {
-        Continue({ at: next, found: s.found.push(found(NoncharacterInInputStream, i)) })
+        Continue({ at: next, found: s.found.push(problem(NoncharacterInInputStream, i)) })
       } else if control(point) {
-        Continue({ at: next, found: s.found.push(found(ControlCharacterInInputStream, i)) })
+        Continue({ at: next, found: s.found.push(problem(ControlCharacterInInputStream, i)) })
       } else { Continue({ at: next, found: s.found }) }
     }
   })
@@ -950,14 +971,14 @@ fn merged(a: List<Problem>, b: List<Problem>) -> List<Problem> / {abort.raise} =
       },
   )
 
-type Taken = { problems: List<Problem>, m: M }
+type TakenProblems = { problems: List<Problem>, m: Machine }
 
 /// The parse errors found before `bound`, taken from the machine.
-fn taken(m: M, bound: Int) -> Taken / {abort.raise} =
+fn take_problems(m: Machine, bound: Int) -> TakenProblems / {abort.raise} =
   if m.problems.len() == 0 && m.checked_at >= m.checked.len() { { problems: [], m: m } }
-  else { taken_some(m, bound) }
+  else { take_some_problems(m, bound) }
 
-fn taken_some(m: M, bound: Int) -> Taken / {abort.raise} = {
+fn take_some_problems(m: Machine, bound: Int) -> TakenProblems / {abort.raise} = {
   let mine = m.problems.filter(|p: Problem| p.offset < bound);
   let rest = m.problems.filter(|p: Problem| p.offset >= bound);
   let upto = iterate(m.checked_at, m.checked.len() + 1, |i: Int|
@@ -989,32 +1010,32 @@ fn weight(t: Token) -> Int =
   }
 
 /// The machine with `t` emitted, read from `from` to `to`, after the text read before `from`.
-fn emitted(m: M, t: Token, from: Int, to: Int) -> M / {abort.raise} = {
+fn emit(m: Machine, t: Token, from: Int, to: Int) -> Machine / {abort.raise} = {
   let texted = if m.text_size == 0 { m } else {
-    let mine = taken(m, from);
-    lexeme({ ..mine.m, text: [], text_size: 0 }, {
+    let mine = take_problems(m, from);
+    push_lexeme({ ..mine.m, text: [], text_size: 0 }, {
       token: Text(joined_bytes(m.text)),
       problems: mine.problems,
       from: m.text_from,
       to: from,
     })
   };
-  let rest = taken(texted, to + 1);
-  lexeme(rest.m, { token: t, problems: rest.problems, from: from, to: to })
+  let rest = take_problems(texted, to + 1);
+  push_lexeme(rest.m, { token: t, problems: rest.problems, from: from, to: to })
 }
 
-fn lexeme(m: M, l: Lexeme) -> M = {
+fn push_lexeme(m: Machine, l: Lexeme) -> Machine = {
   let spent = if l.token == EndOfFile { m.tokens } else { m.tokens + 1 };
   let output = m.output + weight(l.token);
-  let counted: M = { ..m, out: m.out.push(l), tokens: spent, output: output };
-  if spent > m.limits.tokens { refuse(counted, TooManyTokens) }
-  else if output > m.limits.output { refuse(counted, OutputTooLong) }
+  let counted: Machine = { ..m, out: m.out.push(l), tokens: spent, output: output };
+  if spent > m.limits.tokens { fail(counted, TooManyTokens) }
+  else if output > m.limits.output { fail(counted, OutputTooLong) }
   else { counted }
 }
 
 /// The end of the input reached: what was read emitted, and nothing more read.
-fn finished(m: M) -> M / {abort.raise} =
-  { ..emitted(m, EndOfFile, m.input.len(), m.input.len()), mode: Ended }
+fn emit_end_of_file(m: Machine) -> Machine / {abort.raise} =
+  { ..emit(m, EndOfFile, m.input.len(), m.input.len()), mode: Ended }
 
 // --- Text ---------------------------------------------------------------------
 
@@ -1023,42 +1044,44 @@ fn replacement() -> Bytes = b"\xef\xbf\xbd"
 fn letters() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 /// A line feed, for the line feed or the carriage return read next.
-fn newline(m: M) -> M / {abort.raise} = said(ahead(m), b"\n", m.at)
+fn newline(m: Machine) -> Machine / {abort.raise} = add_text(ahead(m), b"\n", m.at)
 
 /// A NUL read where text is: U+FFFD, and the parse error that is.
-fn null_text(m: M) -> M / {abort.raise} =
-  said(ahead(fault(m, UnexpectedNullCharacter)), replacement(), m.at)
+fn null_text(m: Machine) -> Machine / {abort.raise} =
+  add_text(ahead(fault(m, UnexpectedNullCharacter)), replacement(), m.at)
 
 /// The character reference the `&` read next begins, read whole; the machine waits where the
 /// input it holds ends before the reference is decided.
-fn reference(m: M, attribute: Bool) -> M / {abort.raise} =
-  match referred(m.input, m.at, names(), attribute, m.ended) {
+fn reference(m: Machine, attribute: Bool) -> Machine / {abort.raise} =
+  match read_reference(m.input, m.at, names(), attribute, m.ended) {
     None -> { ..m, waiting: true },
     Some(r) -> {
-      let past: M = { ..m, problems: m.problems.concat(r.problems), at: r.next };
-      if attribute { with_value(past, r.characters, r.next) }
-      else { said(past, r.characters, m.at) }
+      let after_first_part: Machine = { ..m, problems: m.problems.concat(r.problems), at: r.next };
+      if attribute { with_value(after_first_part, r.characters, r.next) }
+      else { add_text(after_first_part, r.characters, m.at) }
     },
   }
 
-fn reading(m: M, s: State) -> M / {abort.raise} = {
+fn reading(m: Machine, s: State) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if c < 0 { if s == CdataSection { finished(fault(m, EofInCdata)) } else { finished(m) } }
-  else if c == 10 { newline(m) } else {
+  if c < 0 {
+    if s == CdataSection { emit_end_of_file(fault(m, EofInCdata)) } else { emit_end_of_file(m) }
+  } else if c == 10 { newline(m) } else {
     match s {
       Data -> if c == b'<' { { ..m, mode: TagOpen, at: m.at + 1, from: m.at } }
       else if c == b'&' { reference(m, false) }
-      else if c == 0 { said(ahead(fault(m, UnexpectedNullCharacter)), b"\x00", m.at) }
+      else if c == 0 { add_text(ahead(fault(m, UnexpectedNullCharacter)), b"\x00", m.at) }
       else { run_text(m, b"<&\r\x00") },
-      Rcdata -> if c == b'<' { { ..m, mode: TextLt(RcdataText), at: m.at + 1, from: m.at } }
+      Rcdata -> if c == b'<' { { ..m, mode: TextLessThan(RcdataText), at: m.at + 1, from: m.at } }
       else if c == b'&' { reference(m, false) }
       else if c == 0 { null_text(m) }
       else { run_text(m, b"<&\r\x00") },
-      Rawtext -> if c == b'<' { { ..m, mode: TextLt(RawText), at: m.at + 1, from: m.at } }
+      Rawtext -> if c == b'<' { { ..m, mode: TextLessThan(RawText), at: m.at + 1, from: m.at } }
       else if c == 0 { null_text(m) }
       else { run_text(m, b"<\r\x00") },
-      ScriptData -> if c == b'<' { { ..m, mode: TextLt(ScriptText), at: m.at + 1, from: m.at } }
-      else if c == 0 { null_text(m) }
+      ScriptData -> if c == b'<' {
+        { ..m, mode: TextLessThan(ScriptText), at: m.at + 1, from: m.at }
+      } else if c == 0 { null_text(m) }
       else { run_text(m, b"<\r\x00") },
       Plaintext -> if c == 0 { null_text(m) } else { run_text(m, b"\r\x00") },
       CdataSection -> if c == b']' { into(m, CdataBracket) } else { run_text(m, b"]\r") },
@@ -1066,21 +1089,21 @@ fn reading(m: M, s: State) -> M / {abort.raise} = {
   }
 }
 
-fn cdata_bracket(m: M) -> M / {abort.raise} =
+fn cdata_bracket(m: Machine) -> Machine / {abort.raise} =
   if next_of(m) == b']' { into(m, CdataEnd) }
-  else { again(said(m, b"]", m.at - 1), Reading(CdataSection)) }
+  else { reconsume(add_text(m, b"]", m.at - 1), Reading(CdataSection)) }
 
-fn cdata_end(m: M) -> M / {abort.raise} = {
+fn cdata_end(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if c == b']' { said(ahead(m), b"]", m.at - 2) }
+  if c == b']' { add_text(ahead(m), b"]", m.at - 2) }
   else if c == b'>' { into(m, Reading(Data)) }
-  else { again(said(m, b"]]", m.at - 2), Reading(CdataSection)) }
+  else { reconsume(add_text(m, b"]]", m.at - 2), Reading(CdataSection)) }
 }
 
 // --- Tags -----------------------------------------------------------------------
 
 /// A tag begun, read on in `mode`.
-fn new_tag(m: M, end: Bool, mode: Mode) -> M =
+fn new_tag(m: Machine, end: Bool, mode: Mode) -> Machine =
   {
     ..m,
     mode: mode,
@@ -1090,32 +1113,33 @@ fn new_tag(m: M, end: Bool, mode: Mode) -> M =
     held: [],
   }
 
-fn tag_open(m: M) -> M / {abort.raise} = {
+fn tag_open(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == b'!' { into(m, Declaration) }
   else if c == b'/' { into(m, EndTagOpen) }
   else if is_letter(c) { new_tag(m, false, TagName) }
-  else if c == b'?' { { ..into(m, PiOpen), temp: b"" } }
-  else if c < 0 { finished(said(fault(m, EofBeforeTagName), b"<", m.from)) }
-  else { again(said(fault(m, InvalidFirstCharacterOfTagName), b"<", m.from), Reading(Data)) }
-}
-
-fn end_tag_open(m: M) -> M / {abort.raise} = {
-  let c = next_of(m);
-  if is_letter(c) { new_tag(m, true, TagName) }
-  else if c == b'>' { into(fault(m, MissingEndTagName), Reading(Data)) }
-  else if c < 0 { finished(said(fault(m, EofBeforeTagName), b"</", m.from)) } else {
-    again({ ..fault(m, InvalidFirstCharacterOfTagName), data: [], value_size: 0 }, BogusComment)
+  else if c == b'?' { { ..into(m, InstructionOpen), temp: b"" } }
+  else if c < 0 { emit_end_of_file(add_text(fault(m, EofBeforeTagName), b"<", m.from)) } else {
+    reconsume(add_text(fault(m, InvalidFirstCharacterOfTagName), b"<", m.from), Reading(Data))
   }
 }
 
-fn tag_name(m: M) -> M / {abort.raise} = {
+fn end_tag_open(m: Machine) -> Machine / {abort.raise} = {
+  let c = next_of(m);
+  if is_letter(c) { new_tag(m, true, TagName) }
+  else if c == b'>' { into(fault(m, MissingEndTagName), Reading(Data)) }
+  else if c < 0 { emit_end_of_file(add_text(fault(m, EofBeforeTagName), b"</", m.from)) } else {
+    reconsume({ ..fault(m, InvalidFirstCharacterOfTagName), data: [], value_size: 0 }, BogusComment)
+  }
+}
+
+fn tag_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { into(m, BeforeAttrName) }
   else if c == b'/' { into(m, SelfClosing) }
   else if c == b'>' { tag_emitted(m) }
   else if c == 0 { tag_named(fault(m, UnexpectedNullCharacter), replacement(), m.at + 1) }
-  else if c < 0 { finished(fault(m, EofInTag)) } else {
+  else if c < 0 { emit_end_of_file(fault(m, EofInTag)) } else {
     let run = run_of(m, b"\t\n\x0c\r />\x00");
     tag_named(m, lowered(run), m.at + run.len())
   }
@@ -1132,8 +1156,8 @@ fn switched(name: Bytes) -> Mode =
   else { Reading(Data) }
 
 /// The tag read emitted at the `>` read next.
-fn tag_emitted(m: M) -> M / {abort.raise} = {
-  let closed = refreshed(attr_closed(m));
+fn tag_emitted(m: Machine) -> Machine / {abort.raise} = {
+  let closed = check_refresh_hole(attr_closed(m));
   let t = closed.tag;
   let name = Bytes::concat_all(t.name);
   let tag: Tag = {
@@ -1146,10 +1170,10 @@ fn tag_emitted(m: M) -> M / {abort.raise} = {
     let attributed = if t.attributes.len() > 0 { fault(closed, EndTagWithAttributes) }
     else { closed };
     let slashed = if t.closing { fault(attributed, EndTagWithTrailingSolidus) } else { attributed };
-    { ..emitted(slashed, EndTag(tag), m.from, to), at: to, mode: Reading(Data) }
+    { ..emit(slashed, EndTag(tag), m.from, to), at: to, mode: Reading(Data) }
   } else {
     {
-      ..emitted(closed, StartTag(tag), m.from, to),
+      ..emit(closed, StartTag(tag), m.from, to),
       at: to,
       mode: if m.switching { switched(name) } else { Reading(Data) },
       last_start: name,
@@ -1158,11 +1182,11 @@ fn tag_emitted(m: M) -> M / {abort.raise} = {
 }
 
 /// Whether the end tag read is one the last start tag is closed by.
-fn appropriate(m: M) -> Bool =
+fn appropriate(m: Machine) -> Bool =
   m.last_start.len() > 0 && Bytes::concat_all(m.tag.name) == m.last_start
 
 /// The state text of this kind is read in.
-fn back(kind: Kind) -> Mode =
+fn back(kind: TextKind) -> Mode =
   match kind {
     RcdataText -> Reading(Rcdata),
     RawText -> Reading(Rawtext),
@@ -1170,20 +1194,20 @@ fn back(kind: Kind) -> Mode =
     EscapedText -> Escaped,
   }
 
-fn text_lt(m: M, kind: Kind) -> M / {abort.raise} = {
+fn text_less_than(m: Machine, kind: TextKind) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == b'/' { { ..into(m, TextEndOpen(kind)), temp: b"" } }
-  else if kind == ScriptText && c == b'!' { said(into(m, EscapeStart), b"<!", m.from) }
+  else if kind == ScriptText && c == b'!' { add_text(into(m, EscapeStart), b"<!", m.from) }
   else if kind == EscapedText && is_letter(c) {
-    again({ ..said(m, b"<", m.from), temp: b"" }, DoubleEscapeStart)
-  } else { again(said(m, b"<", m.from), back(kind)) }
+    reconsume({ ..add_text(m, b"<", m.from), temp: b"" }, DoubleEscapeStart)
+  } else { reconsume(add_text(m, b"<", m.from), back(kind)) }
 }
 
-fn text_end_open(m: M, kind: Kind) -> M =
+fn text_end_open(m: Machine, kind: TextKind) -> Machine =
   if is_letter(next_of(m)) { new_tag(m, true, TextEndName(kind)) }
-  else { again(said(m, b"</", m.from), back(kind)) }
+  else { reconsume(add_text(m, b"</", m.from), back(kind)) }
 
-fn text_end_name(m: M, kind: Kind) -> M / {abort.raise} = {
+fn text_end_name(m: Machine, kind: TextKind) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_letter(c) {
     let run = m.input.slice(m.at, m.input.skip(m.at, letters()));
@@ -1191,95 +1215,95 @@ fn text_end_name(m: M, kind: Kind) -> M / {abort.raise} = {
   } else if is_space(c) && appropriate(m) { into(m, BeforeAttrName) }
   else if c == b'/' && appropriate(m) { into(m, SelfClosing) }
   else if c == b'>' && appropriate(m) { tag_emitted(m) }
-  else { again(said(m, b"</".concat(m.temp), m.from), back(kind)) }
+  else { reconsume(add_text(m, b"</".concat(m.temp), m.from), back(kind)) }
 }
 
 // --- Script data's escapes --------------------------------------------------------
 
-fn escape_start(m: M, dashes: Int) -> M / {abort.raise} =
+fn escape_start(m: Machine, dashes: Int) -> Machine / {abort.raise} =
   if next_of(m) == b'-' {
-    said(into(m, if dashes == 0 { EscapeStartDash } else { EscapedDashDash }), b"-", m.at)
-  } else { again(m, Reading(ScriptData)) }
+    add_text(into(m, if dashes == 0 { EscapeStartDash } else { EscapedDashDash }), b"-", m.at)
+  } else { reconsume(m, Reading(ScriptData)) }
 
 /// The script data escaped states (§13.2.5.20 to §13.2.5.22) and their double escaped twins
 /// (§13.2.5.27 to §13.2.5.29), by whether they are double and how many dashes were read last.
-fn escaped(m: M, double: Bool, dashes: Int) -> M / {abort.raise} = {
+fn escaped(m: Machine, double: Bool, dashes: Int) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  let plain = if double { DoubleEscaped } else { Escaped };
+  let raw_text = if double { DoubleEscaped } else { Escaped };
   if c == b'-' {
-    if dashes == 2 { said(ahead(m), b"-", m.at) } else {
+    if dashes == 2 { add_text(ahead(m), b"-", m.at) } else {
       let more = if double { if dashes == 0 { DoubleEscapedDash } else { DoubleEscapedDashDash } }
       else if dashes == 0 { EscapedDash }
       else { EscapedDashDash };
-      said(into(m, more), b"-", m.at)
+      add_text(into(m, more), b"-", m.at)
     }
   } else if c == b'<' {
-    if double { said(into(m, DoubleEscapedLt), b"<", m.at) }
-    else { { ..m, mode: TextLt(EscapedText), at: m.at + 1, from: m.at } }
-  } else if c == b'>' && dashes == 2 { said(into(m, Reading(ScriptData)), b">", m.at) }
-  else if c == 0 { again(null_text(m), plain) }
-  else if c < 0 { finished(fault(m, EofInScriptHtmlCommentLikeText)) }
-  else if dashes > 0 { again(m, plain) }
+    if double { add_text(into(m, DoubleEscapedLessThan), b"<", m.at) }
+    else { { ..m, mode: TextLessThan(EscapedText), at: m.at + 1, from: m.at } }
+  } else if c == b'>' && dashes == 2 { add_text(into(m, Reading(ScriptData)), b">", m.at) }
+  else if c == 0 { reconsume(null_text(m), raw_text) }
+  else if c < 0 { emit_end_of_file(fault(m, EofInScriptHtmlCommentLikeText)) }
+  else if dashes > 0 { reconsume(m, raw_text) }
   else if c == 10 { newline(m) }
   else { run_text(m, b"-<\r\x00") }
 }
 
 /// The script data double escape start and end states (§13.2.5.26, §13.2.5.31): letters into the
 /// temporary buffer until a space, `/` or `>` says whether a `<script` began or ended.
-fn double_escape(m: M, ending: Bool) -> M / {abort.raise} = {
+fn double_escape(m: Machine, ending: Bool) -> Machine / {abort.raise} = {
   let c = next_of(m);
   let named_script = m.temp == b"script";
   if is_space(c) || c == b'/' || c == b'>' {
     let next = if named_script == ending { Escaped } else { DoubleEscaped };
-    said(into(m, next), current(m), m.at)
+    add_text(into(m, next), current(m), m.at)
   } else if is_letter(c) {
     let run = m.input.slice(m.at, m.input.skip(m.at, letters()));
-    said({ ..m, at: m.at + run.len(), temp: m.temp.concat(lowered(run)) }, run, m.at)
-  } else { again(m, if ending { DoubleEscaped } else { Escaped }) }
+    add_text({ ..m, at: m.at + run.len(), temp: m.temp.concat(lowered(run)) }, run, m.at)
+  } else { reconsume(m, if ending { DoubleEscaped } else { Escaped }) }
 }
 
-fn double_escaped_lt(m: M) -> M / {abort.raise} =
-  if next_of(m) == b'/' { said({ ..into(m, DoubleEscapeEnd), temp: b"" }, b"/", m.at) }
-  else { again(m, DoubleEscaped) }
+fn double_escaped_less_than(m: Machine) -> Machine / {abort.raise} =
+  if next_of(m) == b'/' { add_text({ ..into(m, DoubleEscapeEnd), temp: b"" }, b"/", m.at) }
+  else { reconsume(m, DoubleEscaped) }
 
 // --- Attributes ---------------------------------------------------------------------
 
 /// The attribute being read added to its tag, unless the tag already has one of its name.
-fn attr_closed(m: M) -> M =
+fn attr_closed(m: Machine) -> Machine =
   if !m.attr.open || m.attr.dropped { { ..m, attr: no_attr() } } else {
     let kept: Attribute = { name: joined_bytes(m.attr.name), value: joined_bytes(m.attr.value) };
     { ..m, attr: no_attr(), tag: { ..m.tag, attributes: m.tag.attributes.push(kept) } }
   }
 
-fn new_attr(m: M) -> M = {
+fn new_attr(m: Machine) -> Machine = {
   let closed = attr_closed(m);
-  let opened: M = {
+  let opened: Machine = {
     ..closed,
     attr: { name: [], value: [], dropped: false, open: true },
     name_size: 0,
     value_size: 0,
-    link: Unlinked,
-    url: Plain,
+    link: NoUrl,
+    url: NotInUrl,
     word: b"",
   };
-  if closed.tag.attributes.len() + 1 > m.limits.attributes { refuse(opened, TooManyAttributes) }
+  if closed.tag.attributes.len() + 1 > m.limits.attributes { fail(opened, TooManyAttributes) }
   else { opened }
 }
 
 /// `piece` added to the attribute's name, the machine at `to`.
-fn attr_named(m: M, piece: Bytes, to: Int) -> M = {
+fn attr_named(m: Machine, piece: Bytes, to: Int) -> Machine = {
   let size = m.name_size + piece.len();
-  let grown: M = {
+  let grown: Machine = {
     ..m,
     at: to,
     attr: { ..m.attr, name: m.attr.name.push(piece) },
     name_size: size,
   };
-  if size > m.limits.name { refuse(grown, NameTooLong) } else { grown }
+  if size > m.limits.name { fail(grown, NameTooLong) } else { grown }
 }
 
 /// The attribute's name read whole: one the tag already has drops it.
-fn name_left(m: M) -> M = {
+fn name_left(m: Machine) -> Machine = {
   let name = joined_bytes(m.attr.name);
   if m.tag.attributes.fold(false, |seen: Bool, a: Attribute| seen || a.name == name) {
     { ..fault(m, DuplicateAttribute), attr: { ..m.attr, dropped: true } }
@@ -1288,32 +1312,32 @@ fn name_left(m: M) -> M = {
 
 /// `piece` added to the attribute's value, and to the URL it holds where the reader follows one;
 /// the machine at `to`.
-fn with_value(m: M, piece: Bytes, to: Int) -> M / {abort.raise} = {
+fn with_value(m: Machine, piece: Bytes, to: Int) -> Machine / {abort.raise} = {
   let size = m.value_size + piece.len();
-  let grown: M = {
+  let grown: Machine = {
     ..m,
     at: to,
     attr: { ..m.attr, value: m.attr.value.push(piece) },
     value_size: size,
   };
-  let limited = if size > m.limits.value { refuse(grown, ValueTooLong) } else { grown };
-  if m.link == Unlinked { limited } else { url_read(limited, piece) }
+  let limited = if size > m.limits.value { fail(grown, ValueTooLong) } else { grown };
+  if m.link == NoUrl { limited } else { url_read(limited, piece) }
 }
 
-fn before_attr_name(m: M) -> M / {abort.raise} = {
+fn before_attr_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { ahead(m) }
-  else if c == b'/' || c == b'>' || c < 0 { again(m, AfterAttrName) } else if c == b'=' {
-    again(
+  else if c == b'/' || c == b'>' || c < 0 { reconsume(m, AfterAttrName) } else if c == b'=' {
+    reconsume(
       attr_named(new_attr(fault(m, UnexpectedEqualsSignBeforeAttributeName)), b"=", m.at + 1),
       AttrName,
     )
-  } else { again(new_attr(m), AttrName) }
+  } else { reconsume(new_attr(m), AttrName) }
 }
 
-fn attr_name(m: M) -> M / {abort.raise} = {
+fn attr_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_space(c) || c == b'/' || c == b'>' || c < 0 { again(name_left(m), AfterAttrName) }
+  if is_space(c) || c == b'/' || c == b'>' || c < 0 { reconsume(name_left(m), AfterAttrName) }
   else if c == b'=' { into(name_left(m), BeforeAttrValue) }
   else if c == 0 { attr_named(fault(m, UnexpectedNullCharacter), replacement(), m.at + 1) }
   else if c == b'"' || c == b'\'' || c == b'<' {
@@ -1324,29 +1348,29 @@ fn attr_name(m: M) -> M / {abort.raise} = {
   }
 }
 
-fn after_attr_name(m: M) -> M / {abort.raise} = {
+fn after_attr_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { ahead(m) }
   else if c == b'/' { into(m, SelfClosing) }
   else if c == b'=' { into(m, BeforeAttrValue) }
   else if c == b'>' { tag_emitted(m) }
-  else if c < 0 { finished(fault(m, EofInTag)) }
-  else { again(new_attr(m), AttrName) }
+  else if c < 0 { emit_end_of_file(fault(m, EofInTag)) }
+  else { reconsume(new_attr(m), AttrName) }
 }
 
-fn before_attr_value(m: M) -> M / {abort.raise} = {
+fn before_attr_value(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { ahead(m) }
   else if c == b'"' || c == b'\'' { into(value_opened(m), AttrValue(c)) }
   else if c == b'>' { tag_emitted(fault(m, MissingAttributeValue)) }
-  else { again(value_opened(m), AttrValue(0)) }
+  else { reconsume(value_opened(m), AttrValue(0)) }
 }
 
-fn attr_value(m: M, quote: Int) -> M / {abort.raise} = {
+fn attr_value(m: Machine, quote: Int) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == b'&' { reference(m, true) }
   else if c == 0 { with_value(fault(m, UnexpectedNullCharacter), replacement(), m.at + 1) }
-  else if c < 0 { finished(fault(m, EofInTag)) } else if quote != 0 {
+  else if c < 0 { emit_end_of_file(fault(m, EofInTag)) } else if quote != 0 {
     if c == quote { into(m, AfterAttrValue) }
     else if c == 10 { with_value(m, b"\n", m.at + width(m.input, m.at)) } else {
       let run = run_of(m, if quote == b'"' { b"\"&\r\x00" } else { b"'&\r\x00" });
@@ -1362,40 +1386,40 @@ fn attr_value(m: M, quote: Int) -> M / {abort.raise} = {
   }
 }
 
-fn after_attr_value(m: M) -> M / {abort.raise} = {
+fn after_attr_value(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { into(m, BeforeAttrName) }
   else if c == b'/' { into(m, SelfClosing) }
   else if c == b'>' { tag_emitted(m) }
-  else if c < 0 { finished(fault(m, EofInTag)) }
-  else { again(fault(m, MissingWhitespaceBetweenAttributes), BeforeAttrName) }
+  else if c < 0 { emit_end_of_file(fault(m, EofInTag)) }
+  else { reconsume(fault(m, MissingWhitespaceBetweenAttributes), BeforeAttrName) }
 }
 
-fn self_closing(m: M) -> M / {abort.raise} = {
+fn self_closing(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == b'>' { tag_emitted({ ..m, tag: { ..m.tag, closing: true } }) }
-  else if c < 0 { finished(fault(m, EofInTag)) }
-  else { again(fault(m, UnexpectedSolidusInTag), BeforeAttrName) }
+  else if c < 0 { emit_end_of_file(fault(m, EofInTag)) }
+  else { reconsume(fault(m, UnexpectedSolidusInTag), BeforeAttrName) }
 }
 
 // --- Comments ---------------------------------------------------------------------
 
 /// The comment read emitted at the `>` read next.
-fn comment_out(m: M) -> M / {abort.raise} =
+fn emit_comment(m: Machine) -> Machine / {abort.raise} =
   {
-    ..emitted(m, Comment(joined_bytes(m.data)), m.from, m.at + 1),
+    ..emit(m, Comment(joined_bytes(m.data)), m.from, m.at + 1),
     at: m.at + 1,
     mode: Reading(Data),
     data: [],
   }
 
 /// The comment read emitted where the input ends, and the end.
-fn comment_ended(m: M) -> M / {abort.raise} =
-  finished(emitted(m, Comment(joined_bytes(m.data)), m.from, m.at))
+fn comment_ended(m: Machine) -> Machine / {abort.raise} =
+  emit_end_of_file(emit(m, Comment(joined_bytes(m.data)), m.from, m.at))
 
-fn bogus_comment(m: M) -> M / {abort.raise} = {
+fn bogus_comment(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if c == b'>' { comment_out(m) }
+  if c == b'>' { emit_comment(m) }
   else if c < 0 { comment_ended(m) }
   else if c == 0 { ahead(data_added(fault(m, UnexpectedNullCharacter), replacement())) }
   else if c == 10 { ahead(data_added(m, b"\n")) } else {
@@ -1411,7 +1435,7 @@ fn undecided(input: Bytes, at: Int) -> Bool / {abort.raise} = {
   b"--".starts_with(rest) || b"doctype".starts_with(lowered(rest)) || b"[CDATA[".starts_with(rest)
 }
 
-fn declaration(m: M) -> M / {abort.raise} =
+fn declaration(m: Machine) -> Machine / {abort.raise} =
   if m.input.starts_at(m.at, b"--") {
     { ..m, at: m.at + 2, mode: CommentStart, data: [], value_size: 0 }
   } else if lowered(m.input.slice(m.at, min(m.at + 7, m.input.len()))) == b"doctype" {
@@ -1429,17 +1453,17 @@ fn declaration(m: M) -> M / {abort.raise} =
   } else if !m.ended && undecided(m.input, m.at) { { ..m, waiting: true } }
   else { { ..fault(m, IncorrectlyOpenedComment), mode: BogusComment, data: [], value_size: 0 } }
 
-fn comment_state(m: M) -> M / {abort.raise} = {
+fn comment_state(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   match m.mode {
     CommentStart -> if c == b'-' { into(m, CommentStartDash) }
-    else if c == b'>' { comment_out(fault(m, AbruptClosingOfEmptyComment)) }
-    else { again(m, InComment) },
+    else if c == b'>' { emit_comment(fault(m, AbruptClosingOfEmptyComment)) }
+    else { reconsume(m, InComment) },
     CommentStartDash -> if c == b'-' { into(m, CommentEnd) }
-    else if c == b'>' { comment_out(fault(m, AbruptClosingOfEmptyComment)) }
+    else if c == b'>' { emit_comment(fault(m, AbruptClosingOfEmptyComment)) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
-    else { again(data_added(m, b"-"), InComment) },
-    InComment -> if c == b'<' { into(data_added(m, b"<"), CommentLt) }
+    else { reconsume(data_added(m, b"-"), InComment) },
+    InComment -> if c == b'<' { into(data_added(m, b"<"), CommentLessThan) }
     else if c == b'-' { into(m, CommentEndDash) }
     else if c == 0 { ahead(data_added(fault(m, UnexpectedNullCharacter), replacement())) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
@@ -1447,34 +1471,35 @@ fn comment_state(m: M) -> M / {abort.raise} = {
       let run = run_of(m, b"<-\r\x00");
       data_added({ ..m, at: m.at + run.len() }, run)
     },
-    CommentLt -> if c == b'!' { into(data_added(m, b"!"), CommentLtBang) }
+    CommentLessThan -> if c == b'!' { into(data_added(m, b"!"), CommentLessThanBang) }
     else if c == b'<' { ahead(data_added(m, b"<")) }
-    else { again(m, InComment) },
-    CommentLtBang -> if c == b'-' { into(m, CommentLtBangDash) } else { again(m, InComment) },
-    CommentLtBangDash -> if c == b'-' { into(m, CommentLtBangDashDash) }
-    else { again(m, CommentEndDash) },
-    CommentLtBangDashDash -> if c == b'>' || c < 0 { again(m, CommentEnd) }
-    else { again(fault(m, NestedComment), CommentEnd) },
+    else { reconsume(m, InComment) },
+    CommentLessThanBang -> if c == b'-' { into(m, CommentLessThanBangDash) }
+    else { reconsume(m, InComment) },
+    CommentLessThanBangDash -> if c == b'-' { into(m, CommentLessThanBangDashDash) }
+    else { reconsume(m, CommentEndDash) },
+    CommentLessThanBangDashDash -> if c == b'>' || c < 0 { reconsume(m, CommentEnd) }
+    else { reconsume(fault(m, NestedComment), CommentEnd) },
     CommentEndDash -> if c == b'-' { into(m, CommentEnd) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
-    else { again(data_added(m, b"-"), InComment) },
-    CommentEnd -> if c == b'>' { comment_out(m) }
+    else { reconsume(data_added(m, b"-"), InComment) },
+    CommentEnd -> if c == b'>' { emit_comment(m) }
     else if c == b'!' { into(m, CommentEndBang) }
     else if c == b'-' { ahead(data_added(m, b"-")) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
-    else { again(data_added(m, b"--"), InComment) },
+    else { reconsume(data_added(m, b"--"), InComment) },
     _ -> if c == b'-' { into(data_added(m, b"--!"), CommentEndDash) }
-    else if c == b'>' { comment_out(fault(m, IncorrectlyClosedComment)) }
+    else if c == b'>' { emit_comment(fault(m, IncorrectlyClosedComment)) }
     else if c < 0 { comment_ended(fault(m, EofInComment)) }
-    else { again(data_added(m, b"--!"), InComment) },
+    else { reconsume(data_added(m, b"--!"), InComment) },
   }
 }
 
 // --- Doctypes -----------------------------------------------------------------------
 
-fn quirked(m: M) -> M = { ..m, doctype: { ..m.doctype, quirks: true } }
+fn set_force_quirks(m: Machine) -> Machine = { ..m, doctype: { ..m.doctype, quirks: true } }
 
-fn doctype_token(m: M) -> Token =
+fn doctype_token(m: Machine) -> Token =
   Doctype({
     name: option_map_bytes(m.doctype.name),
     public_id: option_map_bytes(m.doctype.public_id),
@@ -1486,22 +1511,22 @@ fn option_map_bytes(pieces: Option<List<Bytes>>) -> Option<String> =
   match pieces { Some(p) -> Some(joined_bytes(p)), None -> None }
 
 /// The doctype read emitted at the `>` read next.
-fn doctype_out(m: M) -> M / {abort.raise} =
-  { ..emitted(m, doctype_token(m), m.from, m.at + 1), at: m.at + 1, mode: Reading(Data) }
+fn emit_doctype(m: Machine) -> Machine / {abort.raise} =
+  { ..emit(m, doctype_token(m), m.from, m.at + 1), at: m.at + 1, mode: Reading(Data) }
 
 /// The doctype read emitted, put in quirks mode, where the input ends; and the end.
-fn doctype_ended(m: M) -> M / {abort.raise} = {
-  let q = quirked(fault(m, EofInDoctype));
-  finished(emitted(q, doctype_token(q), m.from, m.at))
+fn doctype_ended(m: Machine) -> Machine / {abort.raise} = {
+  let q = set_force_quirks(fault(m, EofInDoctype));
+  emit_end_of_file(emit(q, doctype_token(q), m.from, m.at))
 }
 
-fn doctype_named(m: M, piece: Bytes) -> M = {
+fn doctype_named(m: Machine, piece: Bytes) -> Machine = {
   let name = match m.doctype.name { Some(p) -> p.push(piece), None -> [piece] };
   name_grown({ ..m, doctype: { ..m.doctype, name: Some(name) } }, m.name_size + piece.len())
 }
 
 /// `piece` added to the public or the system identifier, which begins empty where it is `None`.
-fn id_added(m: M, public: Bool, piece: Bytes) -> M = {
+fn id_added(m: Machine, public: Bool, piece: Bytes) -> Machine = {
   let grow = |id: Option<List<Bytes>>|
     match id {
       Some(p) -> Some(if piece.len() == 0 { p } else { p.push(piece) }),
@@ -1514,27 +1539,27 @@ fn id_added(m: M, public: Bool, piece: Bytes) -> M = {
   )
 }
 
-fn doctype_open(m: M) -> M / {abort.raise} = {
+fn doctype_open(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { into(m, BeforeDoctypeName) }
-  else if c == b'>' { again(m, BeforeDoctypeName) }
+  else if c == b'>' { reconsume(m, BeforeDoctypeName) }
   else if c < 0 { doctype_ended(m) }
-  else { again(fault(m, MissingWhitespaceBeforeDoctypeName), BeforeDoctypeName) }
+  else { reconsume(fault(m, MissingWhitespaceBeforeDoctypeName), BeforeDoctypeName) }
 }
 
-fn before_doctype_name(m: M) -> M / {abort.raise} = {
+fn before_doctype_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { ahead(m) } else if c == 0 {
     into(doctype_named(fault(m, UnexpectedNullCharacter), replacement()), DoctypeName)
-  } else if c == b'>' { doctype_out(quirked(fault(m, MissingDoctypeName))) }
+  } else if c == b'>' { emit_doctype(set_force_quirks(fault(m, MissingDoctypeName))) }
   else if c < 0 { doctype_ended(m) }
   else { into(doctype_named(m, lowered(current(m))), DoctypeName) }
 }
 
-fn doctype_name(m: M) -> M / {abort.raise} = {
+fn doctype_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { into(m, AfterDoctypeName) }
-  else if c == b'>' { doctype_out(m) }
+  else if c == b'>' { emit_doctype(m) }
   else if c == 0 { ahead(doctype_named(fault(m, UnexpectedNullCharacter), replacement())) }
   else if c < 0 { doctype_ended(m) } else {
     let run = run_of(m, b"\t\n\x0c\r >\x00");
@@ -1542,17 +1567,19 @@ fn doctype_name(m: M) -> M / {abort.raise} = {
   }
 }
 
-fn after_doctype_name(m: M) -> M / {abort.raise} = {
+fn after_doctype_name(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   let word = lowered(m.input.slice(m.at, min(m.at + 6, m.input.len())));
   if is_space(c) { ahead(m) }
-  else if c == b'>' { doctype_out(m) }
+  else if c == b'>' { emit_doctype(m) }
   else if c < 0 { doctype_ended(m) }
   else if word == b"public" { { ..m, at: m.at + 6, mode: AfterKeyword(true) } }
   else if word == b"system" { { ..m, at: m.at + 6, mode: AfterKeyword(false) } }
   else if !m.ended && (b"public".starts_with(word) || b"system".starts_with(word)) {
     { ..m, waiting: true }
-  } else { again(quirked(fault(m, InvalidCharacterSequenceAfterDoctypeName)), BogusDoctype) }
+  } else {
+    reconsume(set_force_quirks(fault(m, InvalidCharacterSequenceAfterDoctypeName)), BogusDoctype)
+  }
 }
 
 fn missing_quote(public: Bool) -> ParseError =
@@ -1562,33 +1589,33 @@ fn missing_quote(public: Bool) -> ParseError =
 fn missing_id(public: Bool) -> ParseError =
   if public { MissingDoctypePublicIdentifier } else { MissingDoctypeSystemIdentifier }
 
-fn after_keyword(m: M, public: Bool) -> M / {abort.raise} = {
+fn after_keyword(m: Machine, public: Bool) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { into(m, BeforeId(public)) } else if c == b'"' || c == b'\'' {
     let e = if public { MissingWhitespaceAfterDoctypePublicKeyword }
     else { MissingWhitespaceAfterDoctypeSystemKeyword };
     into(id_added(fault(m, e), public, b""), InId(public, c))
-  } else if c == b'>' { doctype_out(quirked(fault(m, missing_id(public)))) }
+  } else if c == b'>' { emit_doctype(set_force_quirks(fault(m, missing_id(public)))) }
   else if c < 0 { doctype_ended(m) }
-  else { again(quirked(fault(m, missing_quote(public))), BogusDoctype) }
+  else { reconsume(set_force_quirks(fault(m, missing_quote(public))), BogusDoctype) }
 }
 
-fn before_id(m: M, public: Bool) -> M / {abort.raise} = {
+fn before_id(m: Machine, public: Bool) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { ahead(m) }
   else if c == b'"' || c == b'\'' { into(id_added(m, public, b""), InId(public, c)) }
-  else if c == b'>' { doctype_out(quirked(fault(m, missing_id(public)))) }
+  else if c == b'>' { emit_doctype(set_force_quirks(fault(m, missing_id(public)))) }
   else if c < 0 { doctype_ended(m) }
-  else { again(quirked(fault(m, missing_quote(public))), BogusDoctype) }
+  else { reconsume(set_force_quirks(fault(m, missing_quote(public))), BogusDoctype) }
 }
 
-fn in_id(m: M, public: Bool, quote: Int) -> M / {abort.raise} = {
+fn in_id(m: Machine, public: Bool, quote: Int) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if c == quote { into(m, AfterId(public)) }
   else if c == 0 { ahead(id_added(fault(m, UnexpectedNullCharacter), public, replacement())) }
   else if c == b'>' {
     let e = if public { AbruptDoctypePublicIdentifier } else { AbruptDoctypeSystemIdentifier };
-    doctype_out(quirked(fault(m, e)))
+    emit_doctype(set_force_quirks(fault(m, e)))
   } else if c < 0 { doctype_ended(m) }
   else if c == 10 { ahead(id_added(m, public, b"\n")) } else {
     let run = run_of(m, if quote == b'"' { b"\">\r\x00" } else { b"'>\r\x00" });
@@ -1596,85 +1623,89 @@ fn in_id(m: M, public: Bool, quote: Int) -> M / {abort.raise} = {
   }
 }
 
-fn after_id(m: M, public: Bool) -> M / {abort.raise} = {
+fn after_id(m: Machine, public: Bool) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { if public { into(m, BetweenIds) } else { ahead(m) } }
-  else if c == b'>' { doctype_out(m) }
+  else if c == b'>' { emit_doctype(m) }
   else if c < 0 { doctype_ended(m) } else if public && (c == b'"' || c == b'\'') {
     into(
       id_added(fault(m, MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers), false, b""),
       InId(false, c),
     )
   } else if public {
-    again(quirked(fault(m, MissingQuoteBeforeDoctypeSystemIdentifier)), BogusDoctype)
-  } else { again(fault(m, UnexpectedCharacterAfterDoctypeSystemIdentifier), BogusDoctype) }
+    reconsume(set_force_quirks(fault(m, MissingQuoteBeforeDoctypeSystemIdentifier)), BogusDoctype)
+  } else { reconsume(fault(m, UnexpectedCharacterAfterDoctypeSystemIdentifier), BogusDoctype) }
 }
 
-fn between_ids(m: M) -> M / {abort.raise} = {
+fn between_ids(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) { ahead(m) }
-  else if c == b'>' { doctype_out(m) }
+  else if c == b'>' { emit_doctype(m) }
   else if c == b'"' || c == b'\'' { into(id_added(m, false, b""), InId(false, c)) }
-  else if c < 0 { doctype_ended(m) }
-  else { again(quirked(fault(m, MissingQuoteBeforeDoctypeSystemIdentifier)), BogusDoctype) }
+  else if c < 0 { doctype_ended(m) } else {
+    reconsume(set_force_quirks(fault(m, MissingQuoteBeforeDoctypeSystemIdentifier)), BogusDoctype)
+  }
 }
 
-fn bogus_doctype(m: M) -> M / {abort.raise} = {
+fn bogus_doctype(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if c == b'>' { doctype_out(m) }
+  if c == b'>' { emit_doctype(m) }
   else if c == 0 { ahead(fault(m, UnexpectedNullCharacter)) }
-  else if c < 0 { finished(emitted(m, doctype_token(m), m.from, m.at)) }
+  else if c < 0 { emit_end_of_file(emit(m, doctype_token(m), m.from, m.at)) }
   else { { ..m, at: m.input.skip_until(m.at + 1, b">\x00") } }
 }
 
 // --- Processing instructions -----------------------------------------------------
 
 /// The temporary buffer as a comment, `?` and the target read, reading on as a bogus one.
-fn bogus_target(m: M, e: ParseError) -> M =
-  again({ ..fault(m, e), data: [b"?".concat(m.temp)], value_size: m.temp.len() + 1 }, BogusComment)
+fn bogus_target(m: Machine, e: ParseError) -> Machine =
+  reconsume(
+    { ..fault(m, e), data: [b"?".concat(m.temp)], value_size: m.temp.len() + 1 },
+    BogusComment,
+  )
 
-fn pi_open(m: M) -> M / {abort.raise} = {
+fn instruction_open(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
-  if is_letter(c) || c == b'_' { again(m, PiTarget) }
-  else if c < 0 { finished(fault(m, EofInProcessingInstruction)) }
+  if is_letter(c) || c == b'_' { reconsume(m, InstructionTarget) }
+  else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
   else { bogus_target(m, InvalidFirstCharacterOfProcessingInstructionTarget) }
 }
 
-fn pi_target(m: M) -> M / {abort.raise} = {
+fn instruction_target(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   if is_space(c) || c == b'?' || c == b'>' {
     let target = lowered(m.temp);
     if target == b"xml" || target == b"xml-stylesheet" {
       bogus_target(m, DisallowedProcessingInstructionTarget)
-    } else { again({ ..m, data: [], value_size: 0 }, AfterPiTarget) }
+    } else { reconsume({ ..m, data: [], value_size: 0 }, AfterInstructionTarget) }
   } else if is_letter(c) || is_digit(c) || c == b'-' || c == b'_' {
     let run = m.input.slice(
       m.at,
       m.input.skip(m.at, b"-_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
     );
     name_grown({ ..m, at: m.at + run.len(), temp: m.temp.concat(run) }, m.temp.len() + run.len())
-  } else if c < 0 { finished(fault(m, EofInProcessingInstruction)) }
+  } else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
   else { bogus_target(m, InvalidProcessingInstructionTarget) }
 }
 
-fn pi_out(m: M) -> M / {abort.raise} =
+fn emit_instruction(m: Machine) -> Machine / {abort.raise} =
   {
-    ..emitted(m, Instruction(String::of_bytes_lossy(m.temp), joined_bytes(m.data)), m.from, m.at + 1),
+    ..emit(m, Instruction(String::of_bytes_lossy(m.temp), joined_bytes(m.data)), m.from, m.at + 1),
     at: m.at + 1,
     mode: Reading(Data),
     data: [],
   }
 
-fn pi_data(m: M) -> M / {abort.raise} = {
+fn instruction_data(m: Machine) -> Machine / {abort.raise} = {
   let c = next_of(m);
   match m.mode {
-    AfterPiTarget -> if is_space(c) { ahead(m) } else { again(m, PiData) },
-    PiQuestion -> if c == b'>' { pi_out(m) }
-    else if c < 0 { finished(fault(m, EofInProcessingInstruction)) }
-    else { again(data_added(m, b"?"), PiData) },
-    _ -> if c == b'?' { into(m, PiQuestion) }
-    else if c == b'>' { pi_out(m) }
-    else if c < 0 { finished(fault(m, EofInProcessingInstruction)) }
+    AfterInstructionTarget -> if is_space(c) { ahead(m) } else { reconsume(m, InstructionData) },
+    InstructionQuestion -> if c == b'>' { emit_instruction(m) }
+    else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
+    else { reconsume(data_added(m, b"?"), InstructionData) },
+    _ -> if c == b'?' { into(m, InstructionQuestion) }
+    else if c == b'>' { emit_instruction(m) }
+    else if c < 0 { emit_end_of_file(fault(m, EofInProcessingInstruction)) }
     else if c == 10 { ahead(data_added(m, b"\n")) } else {
       let run = run_of(m, b"?>\r");
       data_added({ ..m, at: m.at + run.len() }, run)
@@ -1684,7 +1715,7 @@ fn pi_data(m: M) -> M / {abort.raise} = {
 
 // --- Driving the machine -----------------------------------------------------------
 
-fn step(m: M) -> M / {abort.raise} =
+fn step(m: Machine) -> Machine / {abort.raise} =
   match m.mode {
     Reading(s) -> reading(m, s),
     CdataBracket -> cdata_bracket(m),
@@ -1692,7 +1723,7 @@ fn step(m: M) -> M / {abort.raise} =
     TagOpen -> tag_open(m),
     EndTagOpen -> end_tag_open(m),
     TagName -> tag_name(m),
-    TextLt(kind) -> text_lt(m, kind),
+    TextLessThan(kind) -> text_less_than(m, kind),
     TextEndOpen(kind) -> text_end_open(m, kind),
     TextEndName(kind) -> text_end_name(m, kind),
     EscapeStart -> escape_start(m, 0),
@@ -1704,7 +1735,7 @@ fn step(m: M) -> M / {abort.raise} =
     DoubleEscaped -> escaped(m, true, 0),
     DoubleEscapedDash -> escaped(m, true, 1),
     DoubleEscapedDashDash -> escaped(m, true, 2),
-    DoubleEscapedLt -> double_escaped_lt(m),
+    DoubleEscapedLessThan -> double_escaped_less_than(m),
     DoubleEscapeEnd -> double_escape(m, true),
     BeforeAttrName -> before_attr_name(m),
     AttrName -> attr_name(m),
@@ -1725,36 +1756,40 @@ fn step(m: M) -> M / {abort.raise} =
     AfterId(public) -> after_id(m, public),
     BetweenIds -> between_ids(m),
     BogusDoctype -> bogus_doctype(m),
-    PiOpen -> pi_open(m),
-    PiTarget -> pi_target(m),
-    AfterPiTarget | PiData | PiQuestion -> pi_data(m),
+    InstructionOpen -> instruction_open(m),
+    InstructionTarget -> instruction_target(m),
+    AfterInstructionTarget | InstructionData | InstructionQuestion -> instruction_data(m),
     Ended -> m,
     _ -> comment_state(m),
   }
 
 /// Whether the machine reads on: it has not refused, emitted a token not yet taken, ended, or
 /// come to where its input ends before more of it is decided.
-fn going(m: M) -> Bool =
+fn can_continue(m: Machine) -> Bool =
   m.stop == None && !m.waiting && m.out.len() == 0 && m.mode != Ended
     && (m.at < m.input.len() || m.ended)
 
 /// The machine with the input stream's errors in what it holds found.
-fn prescanned(m: M) -> M / {abort.raise} =
+fn scan_input_stream(m: Machine) -> Machine / {abort.raise} =
   if m.checked_to >= m.input.len() { m } else {
-    { ..m, checked: m.checked.concat(checked(m.input, m.checked_to)), checked_to: m.input.len() }
+    {
+      ..m,
+      checked: m.checked.concat(input_stream_problems(m.input, m.checked_to)),
+      checked_to: m.input.len(),
+    }
   }
 
 /// The machine read on until it emits a token, ends, refuses or waits for more input. A state
 /// that reads no character switches to one that does, so it reads a byte in four steps at most.
-fn ran(m: M) -> M / {abort.raise} =
-  iterate(prescanned(m), 4 * (m.input.len() - m.at) + 64, |s: M|
-    if going(s) { Continue(step(s)) } else { Stop(s) })
+fn run_machine(m: Machine) -> Machine / {abort.raise} =
+  iterate(scan_input_stream(m), 4 * (m.input.len() - m.at) + 64, |s: Machine|
+    if can_continue(s) { Continue(step(s)) } else { Stop(s) })
 
 /// Where a reading of tokens stands: what it has read and what it is to read next. Only this
 /// module makes one, so its state is one the tokenizer reached.
-pub opaque type Cursor = | Cursor(M)
+pub opaque type Cursor = | Cursor(Machine)
 
-fn machine_of(c: Cursor) -> M = match c { Cursor(m) -> m }
+fn machine_of(c: Cursor) -> Machine = match c { Cursor(m) -> m }
 
 /// A reading of `input` from `start`, whose text states the caller switches with `with_state`
 /// as a tree builder does.
@@ -1779,17 +1814,17 @@ pub fn with_foreign(c: Cursor, foreign: Bool) -> Cursor =
 
 /// The next token and the reading after it, or `None` after `EndOfFile`. Raises `html.refused`
 /// where the token would pass a limit.
-pub fn next(c: Cursor) -> Option<{ lexeme: Lexeme, rest: Cursor }> / {html.refused} = {
+pub fn next(c: Cursor) -> Option<{ lexeme: Lexeme, rest: Cursor }> / {html.fail} = {
   let m = machine_of(c);
   let read = if m.out.len() > 0 { m } else {
     handle {
-      ran(m)
+      run_machine(m)
     } with {
-      abort.raise(said) -> { ..m, stop: Some({ offset: m.at, why: Defect(said) }) },
+      abort.raise(add_text) -> { ..m, stop: Some({ offset: m.at, reason: Defect(add_text) }) },
     }
   };
   match read.stop {
-    Some(refusal) -> html.refused(refusal),
+    Some(refusal) -> html.fail(refusal),
     None -> match read.out {
       [] -> None,
       [first, ..rest] -> Some({ lexeme: first, rest: Cursor({ ..read, out: rest }) }),
@@ -1798,26 +1833,27 @@ pub fn next(c: Cursor) -> Option<{ lexeme: Lexeme, rest: Cursor }> / {html.refus
 }
 
 /// The reading's tokens as a sequence, each read when it is pulled.
-pub fn tokens(c: Cursor) -> Seq<Lexeme | {html.refused}> =
-  pulling(c, machine_of(c).limits.tokens + 2)
+pub fn tokens(c: Cursor) -> Seq<Lexeme | {html.fail}> =
+  token_sequence(c, machine_of(c).limits.tokens + 2)
 
-fn pulling(c: Cursor, fuel: Int) -> Seq<Lexeme | {html.refused}> =
+fn token_sequence(c: Cursor, fuel: Int) -> Seq<Lexeme | {html.fail}> =
   ||
     if fuel <= 0 { seq::Done } else {
       match next(c) {
         None -> seq::Done,
-        Some(t) -> seq::Yield(t.lexeme, pulling(t.rest, fuel - 1)),
+        Some(t) -> seq::Yield(t.lexeme, token_sequence(t.rest, fuel - 1)),
       }
     }
 
 /// Every token of the reading, `EndOfFile` last, or the refusal of the first that would pass a
 /// limit.
-pub fn tokenize(c: Cursor) -> Result<List<Lexeme>, Refusal> =
-  try { collected(c, [], machine_of(c).limits.tokens + 2) }
+pub fn tokenize(c: Cursor) -> Result<List<Lexeme>, Error> =
+  try { collect_tokens(c, [], machine_of(c).limits.tokens + 2) }
 
-fn collected(c: Cursor, acc: List<Lexeme>, fuel: Int) -> List<Lexeme> / {html.refused} =
-  if fuel <= 0 { acc }
-  else { match next(c) { None -> acc, Some(t) -> collected(t.rest, acc.push(t.lexeme), fuel - 1) } }
+fn collect_tokens(c: Cursor, acc: List<Lexeme>, fuel: Int) -> List<Lexeme> / {html.fail} =
+  if fuel <= 0 { acc } else {
+    match next(c) { None -> acc, Some(t) -> collect_tokens(t.rest, acc.push(t.lexeme), fuel - 1) }
+  }
 
 // --- URLs in attributes --------------------------------------------------------
 
@@ -1841,27 +1877,29 @@ pub fn url_value(
   match part {
     Query -> Ok(url_encode(value)),
     Path -> Ok(raw_encoded(value)),
-    Start -> schemed(raw_encoded(value), trusted, true),
-    First -> schemed(raw_encoded(value), trusted, false),
+    Start -> check_scheme(raw_encoded(value), trusted, true),
+    First -> check_scheme(raw_encoded(value), trusted, false),
   }
 
-fn schemed(url: String, trusted: Bool, opens: Bool) -> Result<String, String> / {abort.raise} = {
+fn check_scheme(url: String, trusted: Bool, opens: Bool) -> Result<String, String> / {abort.raise} = {
   let text = Bytes::of_string(url);
   let stop = text.skip_until(0, b":/?#");
   if text.peek(stop) != b':' || trusted { Ok(url) } else {
     let scheme = text.slice(0, stop);
-    if opens && allowed(lowered(scheme)) { Ok(url) } else { Err(String::of_bytes(scheme)) }
+    if opens && is_allowed_scheme(lowered(scheme)) { Ok(url) }
+    else { Err(String::of_bytes(scheme)) }
   }
 }
 
 /// The schemes a value may give a URL, and markup's own text may give one a hole stands in.
-fn allowed(scheme: Bytes) -> Bool =
+fn is_allowed_scheme(scheme: Bytes) -> Bool =
   scheme == b"http" || scheme == b"https" || scheme == b"mailto" || scheme == b"tel"
 
 /// A letter, a digit, `+`, `-` or `.`: what a URL's scheme is written in.
-fn schemes(c: Int) -> Bool = is_letter(c) || is_digit(c) || c == b'+' || c == b'-' || c == b'.'
+fn is_scheme_char(c: Int) -> Bool =
+  is_letter(c) || is_digit(c) || c == b'+' || c == b'-' || c == b'.'
 
-type Naming = { name: Bytes, open: Bool, colon: Bool }
+type SchemeScan = { name: Bytes, open: Bool, colon: Bool }
 
 /// The scheme a browser takes `url` to have, in lower case, or `None` where it takes it to have
 /// none. It reads as the URL Standard's parser does: the blanks and controls before the URL are
@@ -1872,11 +1910,11 @@ pub fn browser_scheme(url: String) -> Option<String> / {abort.raise} = {
   let bytes = Bytes::of_string(url);
   let read = range(0, bytes.len()).fold(
     { name: b"", open: true, colon: false },
-    |s: Naming, i: Int| {
+    |s: SchemeScan, i: Int| {
       let c = bytes.at(i);
       if !s.open || c == 9 || c == 10 || c == 13 || (s.name == b"" && c <= 32) { s }
       else if c == b':' { { ..s, open: false, colon: true } }
-      else if schemes(c) { { ..s, name: s.name.concat(lowered(byte_of_int(c))) } }
+      else if is_scheme_char(c) { { ..s, name: s.name.concat(lowered(byte_of_int(c))) } }
       else { { ..s, open: false } }
     },
   );
@@ -1925,90 +1963,91 @@ fn url_attributes() -> List<Bytes> =
 
 /// Whether an attribute of this name holds a URL, read past a `data-` or a namespace before it,
 /// which a script or an SVG reads the same way.
-fn links(attr: Bytes) -> Bool / {abort.raise} = {
-  let named = if attr.starts_with(b"data-") { attr.slice(5, attr.len()) } else {
+fn holds_url(attr: Bytes) -> Bool / {abort.raise} = {
+  let named_reference = if attr.starts_with(b"data-") { attr.slice(5, attr.len()) } else {
     match attr.index_of(b":") { Some(colon) -> attr.slice(colon + 1, attr.len()), None -> attr }
   };
-  url_attributes().contains(named)
+  url_attributes().contains(named_reference)
 }
 
 /// How an attribute's value holds URLs: none; one; several between spaces, as `ping`'s; the image
 /// candidates of a `srcset`, each a URL and its descriptors; or one after a refresh's delay, as the
 /// `content` of a `<meta http-equiv=refresh>` does.
-type Link = | Unlinked | One | Spaced | Candidates | Refreshing
+type UrlLayout = | NoUrl | SingleUrl | SpaceSeparatedUrls | SrcsetCandidates | RefreshUrl
 
-/// How far a value is into the URL it holds: `Plain` in an attribute that holds none, or where the
-/// reader follows none. `Fresh` is where a URL begins; `Word` the letters of what may be a scheme,
-/// kept in `word`; `Held` a first part some hole stands in; `Pathed` past that part and `Queried`
-/// past a `?` or a `#`. `Coded` is past a scheme no hole stands under. `Mixed` is what two readings
+/// How far a value is into the URL it holds: `NotInUrl` in an attribute that holds none, or where the
+/// reader follows none. `UrlStart` is where a URL begins; `SchemeLetters` the letters of what may be a scheme,
+/// kept in `word`; `HoleInFirstPart` a first part some hole stands in; `InPath` past that part and `InQuery`
+/// past a `?` or a `#`. `DisallowedScheme` is past a scheme no hole stands under. `Mixed` is what two readings
 /// left at different parts, and `Barred` what they left where one was past such a scheme or a part
-/// no hole stands in. `Described` is a `srcset` candidate's descriptors; `Delay` a refresh's delay,
-/// `Prefix` past its `;`, `Keyed` the letters of a `url` there and `AfterKey` past its `=`.
-type Url =
-  | Plain
-  | Fresh
-  | Word
-  | Held
-  | Pathed
-  | Queried
-  | Coded
+/// no hole stands in. `InDescriptors` is a `srcset` candidate's descriptors; `RefreshDelay` a refresh's delay,
+/// `AfterDelay` past its `;`, `UrlKey` the letters of a `url` there and `AfterKey` past its `=`.
+type UrlState =
+  | NotInUrl
+  | UrlStart
+  | SchemeLetters
+  | HoleInFirstPart
+  | InPath
+  | InQuery
+  | DisallowedScheme
   | Mixed
   | Barred
-  | Described
-  | Delay
-  | Prefix
-  | Keyed
+  | InDescriptors
+  | RefreshDelay
+  | AfterDelay
+  | UrlKey
   | AfterKey
 
 /// A character the markup cannot hold where it stands, by its place in the input.
 type Stray = { message: String, offset: Int }
 
 /// Whether the tag being read says it is a refresh: `http-equiv` with the value `refresh`.
-fn refresh_declared(m: M) -> Bool =
+fn refresh_declared(m: Machine) -> Bool =
   m.tag.attributes.fold(false, |seen: Bool, a: Attribute|
     seen || (a.name == "http-equiv" && a.value.ascii_lower() == "refresh"))
 
 /// The value of an attribute opened: whether and how it holds URLs, where the reader follows them.
-fn value_opened(m: M) -> M / {abort.raise} =
+fn value_opened(m: Machine) -> Machine / {abort.raise} =
   if !m.urls { m } else {
     let name = Bytes::concat_all(m.attr.name);
-    let link = if name == b"srcset" || name == b"imagesrcset" { Candidates }
-    else if name == b"ping" { Spaced }
+    let link = if name == b"srcset" || name == b"imagesrcset" { SrcsetCandidates }
+    else if name == b"ping" { SpaceSeparatedUrls }
     else if name == b"content" && Bytes::concat_all(m.tag.name) == b"meta" && refresh_declared(m) {
-      Refreshing
-    } else if links(name) { One }
-    else { Unlinked };
+      RefreshUrl
+    } else if holds_url(name) { SingleUrl }
+    else { NoUrl };
     {
       ..m,
       link: link,
-      url: match link { Unlinked -> Plain, Refreshing -> Delay, _ -> Fresh },
+      url: match link { NoUrl -> NotInUrl, RefreshUrl -> RefreshDelay, _ -> UrlStart },
       word: b"",
     }
   }
 
-type Tracked = { url: Url, word: Bytes, broken: Bool }
+type UrlScan = { url: UrlState, word: Bytes, broken: Bool }
 
 /// What follows a URL's first part at `c`, which no scheme is written in.
-fn past(c: Int) -> Url = if c == b'?' || c == b'#' { Queried } else { Pathed }
+fn after_first_part(c: Int) -> UrlState = if c == b'?' || c == b'#' { InQuery } else { InPath }
 
 /// What `c` makes of the URL a value holds, where it is no separator of URLs.
-fn url_step(t: Tracked, c: Int) -> Tracked / {abort.raise} = {
-  let to = |u: Url| { url: u, word: if u == Coded { t.word } else { b"" }, broken: false };
-  let fresh = { url: Fresh, word: b"", broken: false };
+fn url_step(t: UrlScan, c: Int) -> UrlScan / {abort.raise} = {
+  let to = |u: UrlState|
+    { url: u, word: if u == DisallowedScheme { t.word } else { b"" }, broken: false };
+  let fresh = { url: UrlStart, word: b"", broken: false };
   match t.url {
-    Delay -> if is_digit(c) || c == b'.' || is_space(c) { t }
-    else if c == b';' || c == b',' { to(Prefix) }
+    RefreshDelay -> if is_digit(c) || c == b'.' || is_space(c) { t }
+    else if c == b';' || c == b',' { to(AfterDelay) }
     else { in_url(fresh, c) },
-    Prefix -> if is_space(c) { t }
-    else if c == b'u' || c == b'U' { { url: Keyed, word: b"u", broken: false } }
+    AfterDelay -> if is_space(c) { t }
+    else if c == b'u' || c == b'U' { { url: UrlKey, word: b"u", broken: false } }
     else if c == b'"' || c == b'\'' { fresh }
     else { in_url(fresh, c) },
-    Keyed -> {
+    UrlKey -> {
       let longer = t.word.concat(lowered(byte_of_int(c)));
       if b"url".starts_with(longer) { { ..t, word: longer } }
       else if t.word == b"url" && is_space(c) { t }
       else if t.word == b"url" && c == b'=' { to(AfterKey) }
-      else { range(0, longer.len()).fold(fresh, |u: Tracked, i: Int| in_url(u, longer.at(i))) }
+      else { range(0, longer.len()).fold(fresh, |u: UrlScan, i: Int| in_url(u, longer.at(i))) }
     },
     AfterKey -> if is_space(c) { t }
     else if c == b'"' || c == b'\'' { fresh }
@@ -2018,47 +2057,49 @@ fn url_step(t: Tracked, c: Int) -> Tracked / {abort.raise} = {
 }
 
 /// What `c` makes of a URL itself, from where it begins to its query.
-fn in_url(t: Tracked, c: Int) -> Tracked / {abort.raise} = {
-  let to = |u: Url| { url: u, word: if u == Coded { t.word } else { b"" }, broken: false };
+fn in_url(t: UrlScan, c: Int) -> UrlScan / {abort.raise} = {
+  let to = |u: UrlState|
+    { url: u, word: if u == DisallowedScheme { t.word } else { b"" }, broken: false };
   match t.url {
-    Fresh -> if c <= 32 { t }
-    else if is_letter(c) { { url: Word, word: lowered(byte_of_int(c)), broken: false } }
-    else { to(past(c)) },
-    Word -> if c == 9 || c == 10 || c == 13 { t }
-    else if schemes(c) { { ..t, word: t.word.concat(lowered(byte_of_int(c))) } }
-    else if c == b':' { to(if allowed(t.word) { Pathed } else { Coded }) }
-    else { to(past(c)) },
-    Held -> if c == b':' { { ..t, broken: true } }
-    else if c == b'/' || c == b'\\' || c == b'?' || c == b'#' { to(past(c)) }
+    UrlStart -> if c <= 32 { t }
+    else if is_letter(c) { { url: SchemeLetters, word: lowered(byte_of_int(c)), broken: false } }
+    else { to(after_first_part(c)) },
+    SchemeLetters -> if c == 9 || c == 10 || c == 13 { t }
+    else if is_scheme_char(c) { { ..t, word: t.word.concat(lowered(byte_of_int(c))) } }
+    else if c == b':' { to(if is_allowed_scheme(t.word) { InPath } else { DisallowedScheme }) }
+    else { to(after_first_part(c)) },
+    HoleInFirstPart -> if c == b':' { { ..t, broken: true } }
+    else if c == b'/' || c == b'\\' || c == b'?' || c == b'#' { to(after_first_part(c)) }
     else { t },
-    Pathed -> if c == b'?' || c == b'#' { to(Queried) } else { t },
+    InPath -> if c == b'?' || c == b'#' { to(InQuery) } else { t },
     Mixed -> if c == b':' { { ..t, broken: true } }
-    else if c == b'?' || c == b'#' { to(Queried) }
+    else if c == b'?' || c == b'#' { to(InQuery) }
     else { t },
     Barred -> if c == b':' { { ..t, broken: true } } else { t },
-    Described -> if c == b',' { to(Fresh) } else { t },
+    InDescriptors -> if c == b',' { to(UrlStart) } else { t },
     _ -> t,
   }
 }
 
 /// What `c` makes of the URLs a value holds: a space between `ping`'s URLs begins the next, a
 /// space after a `srcset` candidate's URL begins its descriptors, and anything else is `url_step`.
-fn linked_step(link: Link, t: Tracked, c: Int) -> Tracked / {abort.raise} = {
+fn linked_step(link: UrlLayout, t: UrlScan, c: Int) -> UrlScan / {abort.raise} = {
   let spaced = c == 9 || c == 10 || c == 12 || c == 13 || c == 32;
-  let in_url = t.url != Fresh && t.url != Described && t.url != Plain;
-  if link == Spaced && spaced && in_url { { url: Fresh, word: b"", broken: false } }
-  else if link == Candidates && spaced && in_url { { url: Described, word: b"", broken: false } }
-  else { url_step(t, c) }
+  let in_url = t.url != UrlStart && t.url != InDescriptors && t.url != NotInUrl;
+  if link == SpaceSeparatedUrls && spaced && in_url { { url: UrlStart, word: b"", broken: false } }
+  else if link == SrcsetCandidates && spaced && in_url {
+    { url: InDescriptors, word: b"", broken: false }
+  } else { url_step(t, c) }
 }
 
 /// The machine with `piece` read into the URL its attribute's value holds; a `:` that would make
 /// a hole's value the URL's scheme is the first stray.
-fn url_read(m: M, piece: Bytes) -> M / {abort.raise} = {
+fn url_read(m: Machine, piece: Bytes) -> Machine / {abort.raise} = {
   let start = max(m.at - piece.len(), 0);
   let read = iterate(
     { i: 0, t: { url: m.url, word: m.word, broken: false }, stray: m.stray },
     piece.len() + 1,
-    |s: { i: Int, t: Tracked, stray: Option<Stray> }|
+    |s: { i: Int, t: UrlScan, stray: Option<Stray> }|
       if s.i >= piece.len() { Stop(s) } else {
         let t = linked_step(m.link, s.t, piece.at(s.i));
         let stray = if t.broken && s.stray == None {
@@ -2075,7 +2116,7 @@ fn url_read(m: M, piece: Bytes) -> M / {abort.raise} = {
 
 /// A `<meta http-equiv=refresh>` whose `content` holds a hole read before the tag said it was a
 /// refresh, and so read as no URL: a stray at the tag's end.
-fn refreshed(m: M) -> M =
+fn check_refresh_hole(m: Machine) -> Machine =
   if m.held.len() == 0 || Bytes::concat_all(m.tag.name) != b"meta" || !m.held.contains(b"content")
       || !refresh_declared(m) { m } else {
     match m.stray {
@@ -2096,12 +2137,12 @@ fn refreshed(m: M) -> M =
 /// Where a reader of markup stands after the text it has passed: in an element's content, in a
 /// tag, in an attribute's value, in a comment. It is the tokenizer, switching for the elements
 /// whose content needs no tree builder, between two texts.
-pub opaque type Context = | Context(M)
+pub opaque type Context = | Context(Machine)
 
-fn machine_at(c: Context) -> M = match c { Context(m) -> m }
+fn machine_at(c: Context) -> Machine = match c { Context(m) -> m }
 
 /// More than any text a program holds.
-fn lavish() -> Limits =
+fn unlimited() -> Limits =
   {
     tokens: 4611686018427387903,
     attributes: 4611686018427387903,
@@ -2115,7 +2156,7 @@ fn lavish() -> Limits =
 /// hole under a scheme other than `url_value` allows and a `:` that would make a hole's value
 /// the scheme. Without, what a URL names is not judged.
 pub fn reader(urls: Bool) -> Context =
-  Context({ ..machine(b"", start(), lavish(), true, false), urls: urls })
+  Context({ ..machine(b"", start(), unlimited(), true, false), urls: urls })
 
 /// A text read as markup from one place to another. Only `run` answers one, so its text is markup
 /// the reader passed whole from where it says.
@@ -2123,7 +2164,7 @@ pub opaque type Run = new { markup: String, from: Context, to: Context }
 
 /// The machine with `text` after what it holds and has not read, every place in it counted from
 /// there.
-fn fed(m: M, text: Bytes) -> M / {abort.raise} = {
+fn feed(m: Machine, text: Bytes) -> Machine / {abort.raise} = {
   let held_back = m.input.slice(m.at, m.input.len());
   {
     ..m,
@@ -2140,18 +2181,18 @@ fn fed(m: M, text: Bytes) -> M / {abort.raise} = {
   }
 }
 
-type Drained = { m: M, problems: List<Problem> }
+type DrainResult = { m: Machine, problems: List<Problem> }
 
 /// The machine read on to where its input ends or waits, its tokens let go and the parse errors
 /// they were read with kept.
-fn drained(m: M) -> Drained / {abort.raise} =
-  iterate({ m: m, problems: [] }, 4 * m.input.len() + 64, |d: Drained| {
-    let read = ran(d.m);
-    let found = read.out.fold(d.problems, |all: List<Problem>, l: Lexeme| all.concat(l.problems));
-    if read.out.len() > 0 { Continue({ m: { ..read, out: [] }, problems: found }) } else {
+fn drain(m: Machine) -> DrainResult / {abort.raise} =
+  iterate({ m: m, problems: [] }, 4 * m.input.len() + 64, |d: DrainResult| {
+    let read = run_machine(d.m);
+    let problem = read.out.fold(d.problems, |all: List<Problem>, l: Lexeme| all.concat(l.problems));
+    if read.out.len() > 0 { Continue({ m: { ..read, out: [] }, problems: problem }) } else {
       Stop({
         m: read,
-        problems: found.concat(
+        problems: problem.concat(
           read.problems.concat(read.checked.slice(read.checked_at, read.checked.len())),
         ),
       })
@@ -2160,8 +2201,8 @@ fn drained(m: M) -> Drained / {abort.raise} =
 
 /// The first parse error or stray of a reading, by its place in the text read, counted in
 /// characters from `skipped` bytes on.
-fn first_amiss(
-  d: Drained,
+fn first_problem(
+  d: DrainResult,
   text: Bytes,
   skipped: Int,
 ) -> Option<{ message: String, offset: Int }> / {abort.raise} = {
@@ -2188,8 +2229,8 @@ pub fn run(
 ) -> Result<Run, { message: String, offset: Int }> / {abort.raise} = {
   let m = machine_at(from);
   let bytes = Bytes::of_string(text);
-  let d = drained(fed(m, bytes));
-  match first_amiss(d, bytes, m.input.len() - m.at) {
+  let d = drain(feed(m, bytes));
+  match first_problem(d, bytes, m.input.len() - m.at) {
     Some(amiss) -> Err(amiss),
     None -> Ok({ markup: text, from: from, to: Context({ ..d.m, problems: [], stray: None }) }),
   }
@@ -2206,34 +2247,34 @@ pub opaque type Hole = new {
   to: Context,
 }
 
-type Stand = { place: Place, url: Option<UrlPart>, listed: Bool, m: M }
+type HolePosition = { place: Place, url: Option<UrlPart>, listed: Bool, m: Machine }
 
 /// The text element whose content the reader is in.
-fn element_of(m: M) -> String = String::of_bytes_lossy(m.last_start)
+fn element_of(m: Machine) -> String = String::of_bytes_lossy(m.last_start)
 
 /// The attributes no hole stands in, since a value there would be read as code or would decide how
 /// another attribute is read.
-fn scripted(attr: Bytes) -> Bool =
+fn is_code_attribute(attr: Bytes) -> Bool =
   attr.starts_with(b"on") || attr == b"style" || attr == b"srcdoc" || attr == b"http-equiv"
 
 /// A hole in an attribute's value, which holds `m.url` of a URL so far.
-fn in_value(m: M, place: Place) -> Result<Stand, String> = {
-  let listed = m.link == Candidates;
-  let at = |part: UrlPart, next: Url|
+fn in_value(m: Machine, place: Place) -> Result<HolePosition, String> = {
+  let listed = m.link == SrcsetCandidates;
+  let at = |part: UrlPart, next: UrlState|
     Ok({ place: place, url: Some(part), listed: listed, m: { ..m, url: next } });
   match m.url {
-    Plain ->
+    NotInUrl ->
       Ok({
         place: place,
         url: None,
         listed: false,
         m: { ..m, held: m.held.push(Bytes::concat_all(m.attr.name)) },
       }),
-    Fresh | Prefix | AfterKey -> at(Start, Held),
-    Word | Held | Keyed -> at(First, Held),
-    Pathed -> at(Path, Pathed),
-    Queried -> at(Query, Queried),
-    Coded ->
+    UrlStart | AfterDelay | AfterKey -> at(Start, HoleInFirstPart),
+    SchemeLetters | HoleInFirstPart | UrlKey -> at(First, HoleInFirstPart),
+    InPath -> at(Path, InPath),
+    InQuery -> at(Query, InQuery),
+    DisallowedScheme ->
       Err(
         "a hole stands in a URL with no scheme, or with `http`, `https`, `mailto` or `tel`: this one's is `"
           ++ String::of_bytes_lossy(m.word)
@@ -2244,13 +2285,14 @@ fn in_value(m: M, place: Place) -> Result<Stand, String> = {
       Err(
         "the markup before this hole leaves its URL's scheme unsettled, or a part no hole stands in",
       ),
-    Described -> Err("a hole in a `srcset` stands in a candidate's URL, not in its descriptors"),
-    Delay -> Err("a hole in a refresh's `content` stands in its URL, not in its delay"),
+    InDescriptors ->
+      Err("a hole in a `srcset` stands in a candidate's URL, not in its descriptors"),
+    RefreshDelay -> Err("a hole in a refresh's `content` stands in its URL, not in its delay"),
   }
 }
 
 /// Where a hole stands after the text the machine has read, and the machine past the hole.
-fn stand(m: M) -> Result<Stand, String> / {abort.raise} = {
+fn hole_position(m: Machine) -> Result<HolePosition, String> / {abort.raise} = {
   let attr = Bytes::concat_all(m.attr.name);
   let code = "a hole in `" ++ String::of_bytes_lossy(attr)
     ++ "` would be read as code, which no escaping makes text";
@@ -2263,22 +2305,22 @@ fn stand(m: M) -> Result<Stand, String> / {abort.raise} = {
     match m.mode {
       Reading(Data) -> Ok({ place: Content, url: None, listed: false, m: m }),
       Reading(Rcdata) -> Ok({ place: Characters, url: None, listed: false, m: m }),
-      AttrValue(quote) -> if scripted(attr) { Err(code) } else if quote == 0 {
+      AttrValue(quote) -> if is_code_attribute(attr) { Err(code) } else if quote == 0 {
         Err("quote the value: a hole stands inside its quotes, or as the whole of it")
       } else { in_value(m, Characters) },
-      BeforeAttrValue -> if scripted(attr) { Err(code) } else {
+      BeforeAttrValue -> if is_code_attribute(attr) { Err(code) } else {
         match in_value(value_opened(m), Value) {
           Ok(s) -> Ok({ ..s, m: { ..s.m, mode: AfterAttrValue } }),
           Err(why) -> Err(why),
         }
       },
-      Reading(_) | TextLt(_) | TextEndOpen(_) | TextEndName(_) | EscapeStart | EscapeStartDash | Escaped | EscapedDash | EscapedDashDash | DoubleEscapeStart | DoubleEscaped | DoubleEscapedDash | DoubleEscapedDashDash | DoubleEscapedLt | DoubleEscapeEnd | CdataBracket | CdataEnd ->
+      Reading(_) | TextLessThan(_) | TextEndOpen(_) | TextEndName(_) | EscapeStart | EscapeStartDash | Escaped | EscapedDash | EscapedDashDash | DoubleEscapeStart | DoubleEscaped | DoubleEscapedDash | DoubleEscapedDashDash | DoubleEscapedLessThan | DoubleEscapeEnd | CdataBracket | CdataEnd ->
         Err(raw),
-      BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLt | CommentLtBang | CommentLtBangDash | CommentLtBangDashDash | CommentEndDash | CommentEnd | CommentEndBang ->
+      BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLessThan | CommentLessThanBang | CommentLessThanBangDash | CommentLessThanBangDashDash | CommentEndDash | CommentEnd | CommentEndBang ->
         Err("a comment holds no hole"),
       DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InId(_, _) | AfterId(_) | BetweenIds | BogusDoctype ->
         Err("a doctype holds no hole"),
-      PiOpen | PiTarget | AfterPiTarget | PiData | PiQuestion ->
+      InstructionOpen | InstructionTarget | AfterInstructionTarget | InstructionData | InstructionQuestion ->
         Err("a processing instruction holds no hole"),
       _ -> Err("a hole stands in an element's content or in an attribute's value"),
     }
@@ -2287,7 +2329,7 @@ fn stand(m: M) -> Result<Stand, String> / {abort.raise} = {
 
 /// The hole a value may stand in at `at`, or why none stands there.
 pub fn hole(at: Context) -> Result<Hole, String> / {abort.raise} =
-  match stand(machine_at(at)) {
+  match hole_position(machine_at(at)) {
     Err(message) -> Err(message),
     Ok(s) -> Ok({ place: s.place, url: s.url, listed: s.listed, from: at, to: Context(s.m) }),
   }
@@ -2297,9 +2339,9 @@ pub fn hole(at: Context) -> Result<Hole, String> / {abort.raise} =
 pub fn unfinished(at: Context) -> Option<String> / {abort.raise} = {
   let m = machine_at(at);
   match m.mode {
-    Reading(Data) | TagOpen | EndTagOpen | TagName | BeforeAttrName | AttrName | AfterAttrName | BeforeAttrValue | AttrValue(_) | AfterAttrValue | SelfClosing | BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLt | CommentLtBang | CommentLtBangDash | CommentLtBangDashDash | CommentEndDash | CommentEnd | CommentEndBang | DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InId(_, _) | AfterId(_) | BetweenIds | BogusDoctype | PiOpen | PiTarget | AfterPiTarget | PiData | PiQuestion -> {
-      let d = drained({ ..m, ended: true, waiting: false });
-      match first_amiss(d, b"", 0) {
+    Reading(Data) | TagOpen | EndTagOpen | TagName | BeforeAttrName | AttrName | AfterAttrName | BeforeAttrValue | AttrValue(_) | AfterAttrValue | SelfClosing | BogusComment | Declaration | CommentStart | CommentStartDash | InComment | CommentLessThan | CommentLessThanBang | CommentLessThanBangDash | CommentLessThanBangDashDash | CommentEndDash | CommentEnd | CommentEndBang | DoctypeOpen | BeforeDoctypeName | DoctypeName | AfterDoctypeName | AfterKeyword(_) | BeforeId(_) | InId(_, _) | AfterId(_) | BetweenIds | BogusDoctype | InstructionOpen | InstructionTarget | AfterInstructionTarget | InstructionData | InstructionQuestion -> {
+      let d = drain({ ..m, ended: true, waiting: false });
+      match first_problem(d, b"", 0) {
         Some(amiss) -> Some(amiss.message),
         None -> if d.m.mode == Ended || d.m.mode == Reading(Data) { None }
         else { Some("a tag is not closed") },
@@ -2312,8 +2354,8 @@ pub fn unfinished(at: Context) -> Option<String> / {abort.raise} = {
 /// The machine with what no later character reads set aside: the text, data and tokens read, the
 /// values of the tag's attributes, which only their names are kept of, and a tag's name or an
 /// attribute's read whole, so that after either the next character must end it.
-fn level(m: M) -> M / {abort.raise} = {
-  let cleared: M = {
+fn normalize_state(m: Machine) -> Machine / {abort.raise} = {
+  let cleared: Machine = {
     ..m,
     input: m.input.slice(m.at, m.input.len()),
     at: 0,
@@ -2333,14 +2375,14 @@ fn level(m: M) -> M / {abort.raise} = {
     value_size: 0,
     attr: { ..m.attr, value: [] },
   };
-  let named = |s: M|
+  let named_reference = |s: Machine|
     {
       ..s,
       tag: { ..s.tag, attributes: names_only(s.tag.attributes) },
       held: unique_sorted(s.held),
       temp: b"",
     };
-  let unlinked = |s: M| { ..named(s), link: Unlinked, url: Plain, word: b"" };
+  let unlinked = |s: Machine| { ..named_reference(s), link: NoUrl, url: NotInUrl, word: b"" };
   match m.mode {
     Reading(Data) ->
       {
@@ -2350,15 +2392,15 @@ fn level(m: M) -> M / {abort.raise} = {
         held: [],
         last_start: b"",
         temp: b"",
-        link: Unlinked,
-        url: Plain,
+        link: NoUrl,
+        url: NotInUrl,
         word: b"",
       },
     TagName -> unlinked({ ..cleared, mode: AfterAttrValue }),
     AttrName -> unlinked({ ..attr_closed(name_left(cleared)), mode: AfterAttrValue }),
     BeforeAttrName | AfterAttrValue | SelfClosing -> unlinked(attr_closed(cleared)),
     AfterAttrName | BeforeAttrValue -> unlinked(cleared),
-    AttrValue(_) -> named(cleared),
+    AttrValue(_) -> named_reference(cleared),
     TextEndName(_) ->
       { ..cleared, tag: { ..no_tag(), name: m.tag.name, end: true }, attr: no_attr(), held: [] },
     _ ->
@@ -2367,8 +2409,8 @@ fn level(m: M) -> M / {abort.raise} = {
         tag: no_tag(),
         attr: no_attr(),
         held: [],
-        link: Unlinked,
-        url: Plain,
+        link: NoUrl,
+        url: NotInUrl,
         word: b"",
       },
   }
@@ -2392,14 +2434,15 @@ fn unique_sorted(xs: List<Bytes>) -> List<Bytes> =
 /// Inside a tag it holds the attributes either holds, is past a space only if both are, and past
 /// a name only where the next character must end it; in an attribute's URL the part is one no hole
 /// stands at unless both hold as much, until a `?` or a `#` puts both in its query.
-pub fn joined(a: Context, b: Context) -> Option<Context> / {abort.raise} = {
-  let x0 = level(machine_at(a));
-  let y0 = level(machine_at(b));
-  let gap = |s: M| s.mode == AfterAttrValue || s.mode == BeforeAttrName || s.mode == AfterAttrName;
-  let loose = |s: M| s.mode == BeforeAttrName || s.mode == AfterAttrName;
+pub fn join(a: Context, b: Context) -> Option<Context> / {abort.raise} = {
+  let x0 = normalize_state(machine_at(a));
+  let y0 = normalize_state(machine_at(b));
+  let gap = |s: Machine|
+    s.mode == AfterAttrValue || s.mode == BeforeAttrName || s.mode == AfterAttrName;
+  let loose = |s: Machine| s.mode == BeforeAttrName || s.mode == AfterAttrName;
   let both_gap = gap(x0) && gap(y0);
   let mode = if loose(x0) && loose(y0) { BeforeAttrName } else { AfterAttrValue };
-  let settled = |s: M|
+  let settled = |s: Machine|
     if !both_gap { s }
     else if s.mode == AfterAttrName { { ..attr_closed(s), mode: mode } }
     else { { ..s, mode: mode } };
@@ -2409,21 +2452,23 @@ pub fn joined(a: Context, b: Context) -> Option<Context> / {abort.raise} = {
   let held = unique_sorted(xs.held.concat(ys.held));
   let x = { ..xs, tag: { ..xs.tag, attributes: attributes }, held: held };
   let y = { ..ys, tag: { ..ys.tag, attributes: attributes }, held: held };
-  let barred = |s: M|
-    s.url != Fresh && s.url != Word && s.url != Held && s.url != Pathed && s.url != Queried
+  let barred = |s: Machine|
+    s.url != UrlStart && s.url != SchemeLetters && s.url != HoleInFirstPart && s.url != InPath
+      && s.url != InQuery
       && s.url != Mixed;
-  let mixed = |s: M| { ..s, word: b"", url: if barred(x) || barred(y) { Barred } else { Mixed } };
+  let mixed = |s: Machine|
+    { ..s, word: b"", url: if barred(x) || barred(y) { Barred } else { Mixed } };
   if x0 == y0 { Some(Context(x0)) }
   else if x == y { Some(Context(x)) }
-  else if x.url != Plain && mixed(x) == mixed(y) { Some(Context(mixed(x))) }
+  else if x.url != NotInUrl && mixed(x) == mixed(y) { Some(Context(mixed(x))) }
   else { None }
 }
 
 /// Whether what was read from `from` reads the same after `at`: `from` is `at`, or a place
-/// `joined` answered for it and another. A place that only levels to one `joined` answers is not
+/// `join` answered for it and another. A place that only levels to one `join` answers is not
 /// enough: a tag's name being read takes letters that the same tag past an attribute does not.
 fn follows(at: Context, from: Context) -> Bool / {abort.raise} =
-  at == from || joined(at, from) == Some(from)
+  at == from || join(at, from) == Some(from)
 
 /// A fragment being written: its pieces so far, and where a reader of them stands.
 pub opaque type Draft = new { pieces: List<Piece>, at: Context }
@@ -2440,8 +2485,9 @@ pub fn write(d: Draft, r: Run) -> Option<Draft> / {abort.raise} =
 /// The draft with `value` in `h` after it, written as the hole's place reads it, or `None` where
 /// `h` is no hole of the place the draft stands at.
 pub fn place(d: Draft, h: Hole, value: Html) -> Option<Draft> / {abort.raise} =
-  if follows(d.at, h.from) { Some({ pieces: d.pieces.concat(placed(h.place, value)), at: h.to }) }
-  else { None }
+  if follows(d.at, h.from) {
+    Some({ pieces: d.pieces.concat(pieces_for(h.place, value)), at: h.to })
+  } else { None }
 
 /// The fragment a draft is, or `None` where its markup is not finished: a tag, a value, a comment
 /// or an element whose content is text left open, or a parse error at its end.
@@ -2481,28 +2527,28 @@ type Slot = { place: Place, url: Option<UrlPart>, listed: Bool }
 pub opaque type Template = new { texts: List<String>, slots: List<Slot> }
 
 /// Why a literal's markup is refused, and at which character of which text.
-pub type Misplaced = { message: String, offset: Int, part: Int }
+pub type CompileError = { message: String, offset: Int, part: Int }
 
 /// What a hole's value is written as where it stands: markup in content, characters in an
 /// attribute's quotes, and a quoted value where it is the whole of one.
-fn placed(place: Place, value: Html) -> List<Piece> =
+fn pieces_for(place: Place, value: Html) -> List<Piece> =
   match place {
     Content -> value.pieces,
-    Characters -> [Chars(plain(value))],
-    Value -> [Markup("\""), Chars(plain(value)), Markup("\"")],
+    Characters -> [Chars(raw_text(value))],
+    Value -> [Markup("\""), Chars(raw_text(value)), Markup("\"")],
   }
 
-type Compiling = { at: Context, slots: List<Slot> }
+type CompileState = { at: Context, slots: List<Slot> }
 
 /// What an `html"..."` literal with holes is checked by: the texts around its holes read as
 /// markup, following each attribute's URL, or the first character, hole or end the markup cannot
 /// have where it stands. A refusal just past a text is its hole's, or the literal's end after the
 /// last.
-pub fn compile(parts: List<String>) -> Result<Template, Misplaced> / {abort.raise} = {
+pub fn compile(parts: List<String>) -> Result<Template, CompileError> / {abort.raise} = {
   let last = parts.len() - 1;
   let read = range(0, parts.len()).fold(
     Ok({ at: reader(true), slots: [] }),
-    |acc: Result<Compiling, Misplaced>, part: Int|
+    |acc: Result<CompileState, CompileError>, part: Int|
       match acc {
         Err(_) -> acc,
         Ok(c) -> {
@@ -2550,7 +2596,7 @@ pub fn fill(t: Template, holes: List<Html>) -> Html / {html.unsafe_url, abort.ra
             Some(_) -> {
               let u = match url_text(value) {
                 Some(u) -> u,
-                None -> { text: plain(value), trusted: false },
+                None -> { text: raw_text(value), trusted: false },
               };
               match url_written(slot.url, slot.listed, u) {
                 Ok(url) -> text(url),
@@ -2558,7 +2604,7 @@ pub fn fill(t: Template, holes: List<Html>) -> Html / {html.unsafe_url, abort.ra
               }
             },
           };
-          written.concat(placed(slot.place, judged))
+          written.concat(pieces_for(slot.place, judged))
         },
       }
     }),
@@ -2913,12 +2959,12 @@ test "only what reflect shows of a fragment is one" {
     trusted_url("/x"),
     match literal("<b>") { Ok(h) -> h, Err(_) -> text("") },
   ]);
-  assert_eq(reflected(reflect(page)), Some(page));
-  assert_eq(reflected(reflect(fragment([]))), Some(fragment([])));
-  assert_eq(reflected(reflect("<b>")), None);
-  assert_eq(reflected(reflect({ pieces: ["<b>"] })), None);
-  assert_eq(reflected(reflect(#{"pieces": [Markup("<b>")]})), None);
-  assert_eq(reflected(reflect({ pieces: [Markup("<b>")], more: 1 })), None)
+  assert_eq(of_value(reflect(page)), Some(page));
+  assert_eq(of_value(reflect(fragment([]))), Some(fragment([])));
+  assert_eq(of_value(reflect("<b>")), None);
+  assert_eq(of_value(reflect({ pieces: ["<b>"] })), None);
+  assert_eq(of_value(reflect(#{"pieces": [Markup("<b>")]})), None);
+  assert_eq(of_value(reflect({ pieces: [Markup("<b>")], more: 1 })), None)
 }
 
 test "a fragment is a URL where it holds no markup, and trusted where it holds only trusted URLs" {
@@ -3092,7 +3138,7 @@ test "a value written where a URL starts gives it no scheme but one allowed" {
       Err(_) -> true,
       Ok(url) -> match browser_scheme(unescape_attribute(escape(url))) {
         None -> true,
-        Some(scheme) -> allowed(Bytes::of_string(scheme)),
+        Some(scheme) -> is_allowed_scheme(Bytes::of_string(scheme)),
       },
     }
   })
@@ -3150,22 +3196,25 @@ fn read_from(from: Context, markup: String) -> Run / {abort.raise} =
   match run(from, markup) { Ok(r) -> r, Err(stray) -> panic(stray.message) }
 
 test "what was read as more of a tag's name is not written after an attribute of the tag" {
-  let named = read_from(reader(false), "<script");
-  let longer = read_from(named.to, "x>");
-  let attribute = read_from(named.to, " id='1'");
+  let named_reference = read_from(reader(false), "<script");
+  let longer = read_from(named_reference.to, "x>");
+  let attribute = read_from(named_reference.to, " id='1'");
   // Read on from the name, `x>` ends a `scriptx` and a hole after it stands in content.
   assert(match hole(longer.to) { Ok(h) -> h.place == Content, Err(_) -> false });
   let written = |runs: List<Run>|
     runs.fold(Some(draft(false)), |d: Option<Draft>, r: Run|
       match d { Some(so_far) -> write(so_far, r), None -> None });
-  assert(written([named, longer]) != None);
-  assert(written([named, attribute]) != None);
-  assert(written([named, attribute, longer]) == None);
+  assert(written([named_reference, longer]) != None);
+  assert(written([named_reference, attribute]) != None);
+  assert(written([named_reference, attribute, longer]) == None);
   // What was read from where the two are joined is written after either.
-  let either = match joined(named.to, attribute.to) { Some(c) -> c, None -> panic("apart") };
+  let either = match join(named_reference.to, attribute.to) {
+    Some(c) -> c,
+    None -> panic("apart"),
+  };
   let closed = read_from(either, " class='a'>");
-  assert(written([named, closed]) != None);
-  assert(written([named, attribute, closed]) != None);
+  assert(written([named_reference, closed]) != None);
+  assert(written([named_reference, attribute, closed]) != None);
   assert(match run(either, "x>") { Err(_) -> true, Ok(_) -> false })
 }
 
@@ -3175,7 +3224,7 @@ fn at(markup: String) -> Context / {abort.raise} =
 /// What a hole after `more` is, read from where `a` and `b` are joined: `None` where they are
 /// not, or where `more` or the hole is refused there.
 fn joined_hole(a: String, b: String, more: String) -> Option<Hole> / {abort.raise} =
-  match joined(at(a), at(b)) {
+  match join(at(a), at(b)) {
     None -> None,
     Some(both) -> match run(both, more) {
       Err(_) -> None,
@@ -3184,7 +3233,7 @@ fn joined_hole(a: String, b: String, more: String) -> Option<Hole> / {abort.rais
   }
 
 test "two places are joined where every text after them is read alike" {
-  let same = |a: String, b: String| joined(at(a), at(b)) != None;
+  let same = |a: String, b: String| join(at(a), at(b)) != None;
   assert(same("<b>x</b>", "<i class='y'>z</i> w"));
   assert(same("", "<br>"));
   assert(!same("<p", "<p>"));
@@ -3270,8 +3319,12 @@ test "a caller's state reads text as a tree builder would have it read" {
     Text("c"),
     EndOfFile,
   ]);
-  let scripted: Start = { state: ScriptData, last_start_tag: Some("script"), foreign: false };
-  assert_eq(tokens_of("if (a<b) x = '</scr' + 'ipt>';</script>", scripted), [
+  let is_code_attribute: Start = {
+    state: ScriptData,
+    last_start_tag: Some("script"),
+    foreign: false,
+  };
+  assert_eq(tokens_of("if (a<b) x = '</scr' + 'ipt>';</script>", is_code_attribute), [
     Text("if (a<b) x = '</scr' + 'ipt>';"),
     EndTag(tag("script", [])),
     EndOfFile,
@@ -3315,7 +3368,7 @@ test "a reading refuses past each of its limits, where it stands" {
   let refusal = |input: String, limits: Limits|
     match tokenize(cursor(Bytes::of_string(input), start(), limits)) {
       Ok(_) -> None,
-      Err(r) -> Some(r.why),
+      Err(r) -> Some(r.reason),
     };
   let roomy: Limits = { tokens: 100, attributes: 10, name: 10, value: 10, output: 100 };
   assert_eq(refusal("<a b=1 c=2>x", roomy), None);

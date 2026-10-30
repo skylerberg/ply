@@ -1,15 +1,15 @@
 //! Resources: a value of a type that states a `release`, a value holding one, and a function its
 //! call consumes. A value of any other type may be copied.
 
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Row, Atom,
-                             Scheme, over_arg, type_args, instantiate, unify, resolve_row,
-                             subst_new, row_empty, atoms_union)
+import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
+                             Field, Row, Atom, Scheme, is_label_or_row, type_args, instantiate,
+                             unify, resolve_row, subst_new, row_empty, atoms_union)
 import compiler.check.infer.checker (Checker, CtorInfo, resolve, def_of)
 import std.list
 
 /// Every declared type that is a resource: one that states a `release`, or one whose constructors
 /// hold a value of such a type or a `once` function, read until a round adds none.
-pub fn resourceful_types(checker: Checker) -> List<Bytes> / {abort.raise} =
+pub fn resource_types(checker: Checker) -> List<Bytes> / {abort.raise} =
   iterate(
     checker.released.fold([], |acc: List<Bytes>, name: Bytes, by: Bytes| acc.push(name)),
     checker.ctors.len() + 1,
@@ -25,30 +25,31 @@ pub fn resourceful_types(checker: Checker) -> List<Bytes> / {abort.raise} =
 /// Whether `ty`, as a declaration writes it, holds a value of one of the `known` types.
 fn names_resource(known: List<Bytes>, ty: Type) -> Bool =
   match ty {
-    TyVar(_) -> false,
-    TyCon(c) -> known.contains(c.name) || c.args.any(|a: Type| names_resource(known, a)),
-    TyFn(f) -> f.once,
-    TyRecord(fs) -> fs.any(|x: Field| names_resource(known, x.ty)),
-    TyNominal(n) -> known.contains(n.name) || n.fields.any(|x: Field| names_resource(known, x.ty)),
+    VariableType(_) -> false,
+    NamedType(c) -> known.contains(c.name) || c.args.any(|a: Type| names_resource(known, a)),
+    FunctionType(f) -> f.once,
+    RecordType(fs) -> fs.any(|x: Field| names_resource(known, x.ty)),
+    NominalType(n) ->
+      known.contains(n.name) || n.fields.any(|x: Field| names_resource(known, x.ty)),
   }
 
 /// Whether a value of `ty` is a resource, where `kept` are the type variables written `keep` of
 /// the definition it stands in, which a resource may fill.
-pub fn resource_type(checker: Checker, kept: List<Int>, ty: Type) -> Bool / {abort.raise} =
+pub fn is_resource_type(checker: Checker, kept: List<Int>, ty: Type) -> Bool / {abort.raise} =
   holds_resource(checker, kept, resolve(checker, ty))
 
 /// Whether `ty`, which binds no variable the check has solved, holds a resource.
 fn holds_resource(checker: Checker, kept: List<Int>, ty: Type) -> Bool =
   match ty {
-    TyVar(v) -> kept.contains(v),
-    TyCon(c) ->
-      !over_arg(ty)
-        && (checker.resourceful.contains(c.name)
+    VariableType(v) -> kept.contains(v),
+    NamedType(c) ->
+      !is_label_or_row(ty)
+        && (checker.resource_types.contains(c.name)
         || c.args.any(|a: Type| holds_resource(checker, kept, a))),
-    TyFn(f) -> f.once,
-    TyRecord(fs) -> fs.any(|x: Field| holds_resource(checker, kept, x.ty)),
-    TyNominal(n) ->
-      checker.resourceful.contains(n.name)
+    FunctionType(f) -> f.once,
+    RecordType(fs) -> fs.any(|x: Field| holds_resource(checker, kept, x.ty)),
+    NominalType(n) ->
+      checker.resource_types.contains(n.name)
         || n.fields.any(|x: Field| holds_resource(checker, kept, x.ty)),
   }
 
@@ -58,34 +59,37 @@ pub fn release_atoms(checker: Checker, ty: Type) -> List<Atom> / {abort.raise} =
   iterate(
     { todo: [resolve(checker, ty)], seen: [], atoms: [] },
     checker.ctors.fold(256, |n: Int, x: CtorInfo| n + 4 * (x.fields.len() + 1)),
-    |w: Gathering|
+    |w: ReleaseSearch|
       match w.todo {
         [] -> Stop(w.atoms),
-        [t, ..rest] -> Continue(gathered(checker, { ..w, todo: rest }, t)),
+        [t, ..rest] -> Continue(release_search_step(checker, { ..w, todo: rest }, t)),
       },
   )
 
 /// The types left to read, the declared types whose constructors were read, and the atoms so far.
-type Gathering = { todo: List<Type>, seen: List<Bytes>, atoms: List<Atom> }
+type ReleaseSearch = { todo: List<Type>, seen: List<Bytes>, atoms: List<Atom> }
 
 /// `w` past `ty`: its own release's atoms, or the parts it holds to read.
-fn gathered(checker: Checker, w: Gathering, ty: Type) -> Gathering / {abort.raise} = {
+fn release_search_step(
+  checker: Checker,
+  w: ReleaseSearch,
+  ty: Type,
+) -> ReleaseSearch / {abort.raise} = {
   let own = |name: Bytes|
     match checker.released.get(name) {
       None -> None,
       Some(by) -> match def_of(checker, by) {
         None -> Some([]),
-        Some(f) -> Some(filled_row(checker, f.scheme, ty).atoms),
+        Some(f) -> Some(release_row(checker, f.scheme, ty).atoms),
       },
     };
   let reading = |xs: List<Type>| { ..w, todo: w.todo.concat(xs) };
   let stated = |atoms: List<Atom>| { ..w, atoms: atoms_union(w.atoms, atoms) };
   match ty {
-    TyCon(c) -> match own(c.name) {
+    NamedType(c) -> match own(c.name) {
       Some(atoms) -> stated(atoms),
-      None -> if over_arg(ty) || w.seen.contains(c.name) || !checker.resourceful.contains(c.name) {
-        reading(type_args(c.args))
-      } else {
+      None -> if is_label_or_row(ty) || w.seen.contains(c.name)
+          || !checker.resource_types.contains(c.name) { reading(type_args(c.args)) } else {
         let fields = checker.ctors.filter(|x: CtorInfo| x.type_name == c.name).fold(
           [],
           |acc: List<Type>, x: CtorInfo| acc.concat(x.fields),
@@ -93,20 +97,20 @@ fn gathered(checker: Checker, w: Gathering, ty: Type) -> Gathering / {abort.rais
         { ..reading(type_args(c.args).concat(fields)), seen: w.seen.push(c.name) }
       },
     },
-    TyNominal(n) -> match own(n.name) {
+    NominalType(n) -> match own(n.name) {
       Some(atoms) -> stated(atoms),
       None -> reading(n.fields.map(|x: Field| x.ty)),
     },
-    TyRecord(fs) -> reading(fs.map(|x: Field| x.ty)),
+    RecordType(fs) -> reading(fs.map(|x: Field| x.ty)),
     _ -> w,
   }
 }
 
 /// The row of a release whose scheme is `scheme`, its parameter filled by the value `held`.
-fn filled_row(checker: Checker, scheme: Scheme, held: Type) -> Row / {abort.raise} = {
+fn release_row(checker: Checker, scheme: Scheme, held: Type) -> Row / {abort.raise} = {
   let o = instantiate(scheme, checker.fresh);
   match o.ty {
-    TyFn(f) -> match f.params.at(0) {
+    FunctionType(f) -> match f.params.at(0) {
       Some(p) -> {
         let u = unify(subst_new(), o.fresh, p, held);
         match u.error { Some(_) -> row_empty(), None -> resolve_row(u.subst, f.effects) }

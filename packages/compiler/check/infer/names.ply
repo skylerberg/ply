@@ -1,22 +1,23 @@
 //! Names as the checker looks them up, and what it says of one it cannot find.
 
 import compiler.syntax.parsing (Span, Ident, QName, is_bare, qname_text, starts_upper)
-import compiler.syntax.items (deriver_text, SRequires, SCost, SSpace, member_name, result_name)
+import compiler.syntax.items (deriver_text, RequiresClause, CostClause, SpaceClause, member_name,
+                              result_name)
 import compiler.syntax.exprs (sees_homes, prelude_module)
-import compiler.check.types (TyCon, TyFn, env_lookup, TyNominal)
-import compiler.check.resolve.tables (Binding, ModuleBinding, Declared, ModuleEntry, Diag,
+import compiler.check.types (NamedType, FunctionType, env_lookup, NominalType)
+import compiler.check.resolve.tables (Binding, ModuleBinding, Declaration, ModuleEntry, Diag,
                                       Namespace, ValueSpace, TypeSpace, lookup, lookup_declared,
                                       space, qualify, default_binder, error_at, label_at,
                                       backticked, describe_namespace, find_module_binding)
-import compiler.check.resolve.scopes (find, private_name, closed_ctor, declaring_type, of_binder,
-                                      of_module)
+import compiler.check.resolve.scopes (find, private_name_error, opaque_constructor_error,
+                                      locate_type, method_binder, method_binder_module)
 import std.bytes
 import std.option
 import std.string
 import std.text (closest)
 import compiler.check.infer.checker (Checker, WithName, module_name, scope_of, report,
-                                     report_error_at, err_labels, ctor_of, ValueKey, LocalKey,
-                                     GlobalKey)
+                                     report_error_at, report_error_with_labels, ctor_of, ValueKey,
+                                     LocalKey, GlobalKey)
 
 // --- Names ------------------------------------------------------------------------------
 
@@ -106,7 +107,7 @@ fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Check
   match qname.module {
     None -> checker,
     Some(binder) -> if namespace == ValueSpace
-        && declaring_type(checker.resolved, checker.module, binder.name) != None {
+        && locate_type(checker.resolved, checker.module, binder.name) != None {
       no_function_of(checker, binder.name, qname.name)
     } else {
       let scope = scope_of(checker);
@@ -133,7 +134,7 @@ fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Check
           match selective {
             Some(sel) -> {
               let module = checker.resolved.scopes.get(sel.target).module;
-              err_labels(
+              report_error_with_labels(
                 checker,
                 b"E0106",
                 message,
@@ -204,7 +205,7 @@ fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Check
             None -> {
               let exported = space(decls, namespace).fold(
                 [],
-                |acc: List<Bytes>, declared: Declared|
+                |acc: List<Bytes>, declared: Declaration|
                   if declared.public { acc.push(declared.name) } else { acc },
               );
               report_error_at(
@@ -237,19 +238,22 @@ fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Check
               )
             },
             Some(d) -> if !d.public {
-              report(checker, match kept_ctor(checker, namespace, qname, [owner]) {
-                Some(closed) -> closed,
-                None ->
-                  private_name(
-                    checker.module,
-                    qname.span,
-                    owner,
-                    d.span,
-                    namespace,
-                    qname.name.name,
-                    module,
-                  ),
-              })
+              report(
+                checker,
+                match private_constructor_diagnostic(checker, namespace, qname, [owner]) {
+                  Some(closed) -> closed,
+                  None ->
+                    private_name_error(
+                      checker.module,
+                      qname.span,
+                      owner,
+                      d.span,
+                      namespace,
+                      qname.name.name,
+                      module,
+                    ),
+                },
+              )
             } else { checker },
           }
         },
@@ -265,15 +269,16 @@ pub fn value_key(
   qname: QName,
 ) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} =
   if !is_bare(qname) {
-    match of_language_type(checker, qname) {
+    match look_up_language_type(checker, qname) {
       Found(m) ->
         {
           checker: checker,
           key: Some(GlobalKey({ name: m.callee, prelude: m.qname.module == None })),
         },
       // A capital no import binds and no module declares is a type of the language's.
-      Unnamed(of) -> { checker: no_function_of(checker, of.name, qname.name), key: None },
-      Elsewise -> {
+      NoLanguageFunction(of) ->
+        { checker: no_function_of(checker, of.name, qname.name), key: None },
+      NotLanguageType -> {
         let g: WithName = global(checker, ValueSpace, qname);
         match g.name {
           Some(n) -> { checker: g.checker, key: Some(GlobalKey({ name: n, prelude: false })) },
@@ -291,17 +296,20 @@ pub fn value_key(
 /// What a name written `T::name` is where `T` is a type of the language's, one no import binds
 /// as a module and no module in scope declares: its function so named, a builtin's `qname` with no
 /// module, or none it has.
-pub type OfLanguageType = | Found({ qname: QName, callee: Bytes }) | Unnamed(Ident) | Elsewise
+pub type LanguageTypeLookup =
+  | Found({ qname: QName, callee: Bytes })
+  | NoLanguageFunction(Ident)
+  | NotLanguageType
 
-pub fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.raise} =
+pub fn look_up_language_type(checker: Checker, qname: QName) -> LanguageTypeLookup / {abort.raise} =
   match qname.module {
-    None -> Elsewise,
-    Some(of) -> if !starts_upper(of.name) || of_module(of.name) != None
+    None -> NotLanguageType,
+    Some(of) -> if !starts_upper(of.name) || method_binder_module(of.name) != None
         || find_module_binding(scope_of(checker).modules, of.name) != None
-        || declaring_type(checker.resolved, checker.module, of.name) != None { Elsewise } else {
+        || locate_type(checker.resolved, checker.module, of.name) != None { NotLanguageType } else {
       match language_function(checker, of.name, qname.name, false) {
         Some(m) -> Found(m),
-        None -> Unnamed(of),
+        None -> NoLanguageFunction(of),
       }
     },
   }
@@ -387,7 +395,7 @@ fn imported(checker: Checker) -> List<Int> / {abort.raise} = {
 }
 
 /// What to say of a name that is a constructor one of `owners` keeps, its type being `opaque`.
-fn kept_ctor(
+fn private_constructor_diagnostic(
   checker: Checker,
   namespace: Namespace,
   qname: QName,
@@ -398,19 +406,26 @@ fn kept_ctor(
       owners.fold(None, |found: Option<Diag>, owner: Int|
         match found {
           Some(_) -> found,
-          None -> if owner == checker.module { None }
-          else { closed_ctor(checker.modules, checker.module, qname.span, owner, qname.name.name) },
+          None -> if owner == checker.module { None } else {
+            opaque_constructor_error(
+              checker.modules,
+              checker.module,
+              qname.span,
+              owner,
+              qname.name.name,
+            )
+          },
         }),
     _ -> None,
   }
 
 pub fn unknown_name(checker: Checker, qname: QName) -> Checker / {abort.raise} =
-  report(checker, unknown_name_said(checker, qname))
+  report(checker, unknown_name_diagnostic(checker, qname))
 
-pub fn unknown_name_said(checker: Checker, qname: QName) -> Diag / {abort.raise} =
+pub fn unknown_name_diagnostic(checker: Checker, qname: QName) -> Diag / {abort.raise} =
   match checker.derived {
     Some(_) -> derived_unresolved(checker, qname, b"definition"),
-    None -> match kept_named(checker, qname) {
+    None -> match private_name_diagnostic(checker, qname) {
       Some(closed) -> closed,
       None -> unknown_name_here(checker, qname),
     },
@@ -418,11 +433,11 @@ pub fn unknown_name_said(checker: Checker, qname: QName) -> Diag / {abort.raise}
 
 /// What to say of a name no scope binds where its type's module keeps it: a bare name's may be any
 /// module imported here, a qualified one's is the module it names.
-pub fn kept_named(checker: Checker, qname: QName) -> Option<Diag> / {abort.raise} =
+pub fn private_name_diagnostic(checker: Checker, qname: QName) -> Option<Diag> / {abort.raise} =
   match qname.module {
-    None -> kept_ctor(checker, ValueSpace, qname, imported(checker)),
+    None -> private_constructor_diagnostic(checker, ValueSpace, qname, imported(checker)),
     Some(binder) -> match find_module_binding(scope_of(checker).modules, binder.name) {
-      Some(binding) -> kept_ctor(checker, ValueSpace, qname, [binding.target]),
+      Some(binding) -> private_constructor_diagnostic(checker, ValueSpace, qname, [binding.target]),
       None -> None,
     },
   }
@@ -431,15 +446,15 @@ fn unknown_name_here(checker: Checker, qname: QName) -> Diag / {abort.raise} = {
   let n = qname.name.name;
   let result = if !is_bare(qname) || n != result_name() { [] } else {
     match checker.spec_kind {
-      Some(SRequires) ->
+      Some(RequiresClause) ->
         [
           b"`result` is bound only in an `ensures`: a precondition that could name the result would be a claim about a value the call has not produced yet",
         ],
-      Some(SCost) ->
+      Some(CostClause) ->
         [
           b"`result` is bound only in an `ensures`: a `cost` bound is over the parameters a call is given",
         ],
-      Some(SSpace) ->
+      Some(SpaceClause) ->
         [
           b"`result` is bound only in an `ensures`: a `space` bound is over the parameters a call is given",
         ],
@@ -502,7 +517,7 @@ pub fn language_function(
     } else {
       Some({
         qname: {
-          module: Some({ name: of_binder(scope_of(checker).module), span: name.span }),
+          module: Some({ name: method_binder(scope_of(checker).module), span: name.span }),
           name: { name: declared, span: name.span },
           span: name.span,
         },
@@ -523,9 +538,9 @@ fn builtin_or_home(
   let takes = !on_value
     || (match env_lookup(checker.env, declared) {
       Some(scheme) -> match scheme.ty {
-        TyFn(f) -> match f.params.at(0) {
-          Some(TyCon(c)) -> c.name == of,
-          Some(TyNominal(n)) -> n.name == of,
+        FunctionType(f) -> match f.params.at(0) {
+          Some(NamedType(c)) -> c.name == of,
+          Some(NominalType(n)) -> n.name == of,
           _ -> false,
         },
         _ -> false,
@@ -549,11 +564,14 @@ fn home_function(
   name: Ident,
 ) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
   let home = home_module(of);
-  let seen = match checker.resolved.sees.at(checker.module) { Some(ks) -> ks, None -> [] };
+  let seen = match checker.resolved.visible_modules.at(checker.module) {
+    Some(ks) -> ks,
+    None -> [],
+  };
   if !seen.fold(false, |found: Bool, k: Int|
       found || checker.resolved.scopes.get(k).module == home) { None } else {
     let qname = {
-      module: Some({ name: of_binder(home), span: name.span }),
+      module: Some({ name: method_binder(home), span: name.span }),
       name: { name: member_name(of, name.name), span: name.span },
       span: name.span,
     };
@@ -569,9 +587,9 @@ pub fn module_declares(checker: Checker, of: Bytes) -> Bool =
   checker.types.contains(of) || checker.nominals.contains(of)
 
 fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.raise} =
-  report(checker, no_function_said(checker, of, name))
+  report(checker, no_function_diagnostic(checker, of, name))
 
-pub fn no_function_said(checker: Checker, of: Bytes, name: Ident) -> Diag / {abort.raise} =
+pub fn no_function_diagnostic(checker: Checker, of: Bytes, name: Ident) -> Diag / {abort.raise} =
   error_at(
     b"E0101",
     checker.module,

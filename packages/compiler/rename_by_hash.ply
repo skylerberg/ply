@@ -12,28 +12,28 @@
 //! other.
 
 import compiler.checker
-import compiler.checker (Checked, Source)
+import compiler.checker (CheckResult, Source)
 import compiler.syntax
 import compiler.syntax (Edit, Function, Import, ImportedName, Name, Node)
 import std.string
 
 /// Why a rename was not made.
-type Refused =
+type RenameError =
   /// The program does not check as it stands, or its sources are past the limits: what was said.
-  | Unchecked(List<String>)
+  | CheckFailedBefore(List<String>)
   /// No function of that name is defined in that module.
   | NotDefined(String)
   /// The renamed program does not check: what was said of it.
-  | Breaks(List<String>)
+  | CheckFailedAfter(List<String>)
   /// The renamed program checks and is another program: the definitions that differ.
-  | Moves(List<String>)
+  | HashesChanged(List<String>)
 
 fn limits() -> checker::Limits = { files: 64, bytes: 1048576 }
 
-fn messages(program: Checked) -> List<String> =
+fn messages(program: CheckResult) -> List<String> =
   program.diagnostics.map(|d: syntax::Diagnostic| d.code ++ ": " ++ d.message)
 
-fn checked(sources: List<Source>) -> Result<Checked, List<String>> / {abort.raise} =
+fn check_sources(sources: List<Source>) -> Result<CheckResult, List<String>> / {abort.raise} =
   match checker::check_alone(sources, limits()) {
     Err(_) -> Err(["the sources are past what a rename reads"]),
     Ok(program) -> if program.ok { Ok(program) } else { Err(messages(program)) },
@@ -48,7 +48,7 @@ fn last_segment(module: String) -> String = {
   match parts.at(parts.len() - 1) { Some(last) -> last, None -> module }
 }
 
-fn renamed_at(node: Node, to: String) -> List<Edit> =
+fn rename_edits(node: Node, to: String) -> List<Edit> =
   match syntax::name(node) {
     Some(ident) -> [{ path: "", span: ident.span, text: Bytes::of_string(to) }],
     None -> [],
@@ -62,17 +62,22 @@ fn is_qualified_by(node: Node, binder: String) -> Bool =
 
 /// How one source names the module that defines the function: whether its uses are bare, and the
 /// binder a qualified use goes through.
-type Reach = { bare: Bool, binder: Option<String> }
+type ImportAccess = { bare: Bool, binder: Option<String> }
 
 /// What `tree`, the source of the module `own`, reaches the function `from` of `module` by.
-fn reach_of(tree: Node, own: String, module: String, from: String) -> Reach / {abort.raise} =
+fn import_access(
+  tree: Node,
+  own: String,
+  module: String,
+  from: String,
+) -> ImportAccess / {abort.raise} =
   if own == module { { bare: true, binder: None } } else {
-    syntax::children(tree).fold({ bare: false, binder: None }, |reach: Reach, node: Node|
+    syntax::children(tree).fold({ bare: false, binder: None }, |reach: ImportAccess, node: Node|
       if syntax::kind(node) != Import || !is_named(node, module) { reach } else {
         match syntax::children(node) {
           [] -> { ..reach, binder: Some(last_segment(module)) },
           parts ->
-            parts.fold(reach, |r: Reach, part: Node|
+            parts.fold(reach, |r: ImportAccess, part: Node|
               match syntax::kind(part) {
                 ImportedName -> if is_named(part, from) { { ..r, bare: true } } else { r },
                 _ -> match syntax::name(part) {
@@ -93,20 +98,21 @@ fn edits_in(
   from: String,
   to: String,
 ) -> List<Edit> / {abort.raise} = {
-  let reach = reach_of(tree, own, module, from);
+  let reach = import_access(tree, own, module, from);
   syntax::walk(tree).fold([], |edits: List<Edit>, node: Node|
     match syntax::kind(node) {
       Function -> if own == module && is_named(node, from) {
-        renamed_at(node, to).fold(edits, push_edit)
+        rename_edits(node, to).fold(edits, push_edit)
       } else { edits },
       ImportedName -> if reach.bare && own != module && is_named(node, from) {
-        renamed_at(node, to).fold(edits, push_edit)
+        rename_edits(node, to).fold(edits, push_edit)
       } else { edits },
       Name -> if !is_named(node, from) { edits } else {
         match ((syntax::qualifier(node), reach.binder)) {
-          (None, _) -> if reach.bare { renamed_at(node, to).fold(edits, push_edit) } else { edits },
+          (None, _) -> if reach.bare { rename_edits(node, to).fold(edits, push_edit) }
+          else { edits },
           (Some(_), Some(binder)) -> if is_qualified_by(node, binder) {
-            renamed_at(node, to).fold(edits, push_edit)
+            rename_edits(node, to).fold(edits, push_edit)
           } else { edits },
           (Some(_), None) -> edits,
         }
@@ -117,7 +123,7 @@ fn edits_in(
 
 fn push_edit(edits: List<Edit>, edit: Edit) -> List<Edit> = edits.push(edit)
 
-fn rewritten(
+fn rewrite_sources(
   sources: List<Source>,
   module: String,
   from: String,
@@ -125,7 +131,7 @@ fn rewritten(
 ) -> List<Source> / {abort.raise} =
   sources.map(|source: Source| {
     let edits = edits_in(syntax::parse(source.text).tree, module_of(source.path), module, from, to);
-    match syntax::edited(source.text, edits) {
+    match syntax::apply_edits(source.text, edits) {
       Some(text) -> { path: source.path, text: text },
       None -> source,
     }
@@ -139,23 +145,23 @@ fn rename(
   module: String,
   from: String,
   to: String,
-) -> Result<List<Source>, Refused> / {abort.raise} =
-  match checked(sources) {
-    Err(said) -> Err(Unchecked(said)),
+) -> Result<List<Source>, RenameError> / {abort.raise} =
+  match check_sources(sources) {
+    Err(errors) -> Err(CheckFailedBefore(errors)),
     Ok(before) -> {
       let old = module ++ "." ++ from;
       match checker::hashes(before).get(old) {
         None -> Err(NotDefined(old)),
         Some(hash) -> {
-          let after_sources = rewritten(sources, module, from, to);
-          match checked(after_sources) {
-            Err(said) -> Err(Breaks(said)),
+          let after_sources = rewrite_sources(sources, module, from, to);
+          match check_sources(after_sources) {
+            Err(errors) -> Err(CheckFailedAfter(errors)),
             Ok(after) -> {
               let expected = checker::hashes(before).remove(old).insert(module ++ "." ++ to, hash);
               if checker::hashes(after) == expected { Ok(after_sources) } else {
                 Err(
-                  Moves(
-                    checker::moved(before, after).filter(|name: String|
+                  HashesChanged(
+                    checker::changed(before, after).filter(|name: String|
                       name != old && name != module ++ "." ++ to),
                   ),
                 )
@@ -201,14 +207,14 @@ test "a rename rewrites the definition, its import and every call, and keeps eve
 }
 
 test "a renamed program holds the same definitions: each hash stands, the renamed one under its new name" {
-  let before = checked(shop());
+  let before = check_sources(shop());
   let after = match rename(shop(), "shop.prices", "total", "sum_of") {
-    Ok(renamed) -> checked(renamed),
+    Ok(renamed) -> check_sources(renamed),
     Err(_) -> Err(["the rename moves no hash"]),
   };
   match ((before, after)) {
     (Ok(was), Ok(now)) -> {
-      assert_eq(checker::moved(was, now), ["shop.prices.sum_of", "shop.prices.total"]);
+      assert_eq(checker::changed(was, now), ["shop.prices.sum_of", "shop.prices.total"]);
       assert_eq(
         checker::hashes(now).get("shop.prices.sum_of"),
         checker::hashes(was).get("shop.prices.total"),
@@ -228,17 +234,17 @@ fn capturing() -> List<Source> =
   ]
 
 test "a rename onto a name a caller binds is refused, naming the definition it would change" {
-  assert_eq(rename(capturing(), "m", "pick", "chosen"), Err(Moves(["m.main"])))
+  assert_eq(rename(capturing(), "m", "pick", "chosen"), Err(HashesChanged(["m.main"])))
 }
 
 test "a rename onto a name that is taken, of a function that is not there, or in a program that does not check is refused" {
   assert(match rename(shop(), "shop.prices", "total", "discounted") {
-    Err(Breaks(_)) -> true,
+    Err(CheckFailedAfter(_)) -> true,
     _ -> false,
   });
   assert_eq(rename(shop(), "shop.prices", "sum", "s"), Err(NotDefined("shop.prices.sum")));
   assert(match rename([{ path: "m.ply", text: b"fn f() -> Int = \"one\"\n" }], "m", "f", "g") {
-    Err(Unchecked(_)) -> true,
+    Err(CheckFailedBefore(_)) -> true,
     _ -> false,
   })
 }

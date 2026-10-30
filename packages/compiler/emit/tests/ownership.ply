@@ -1,0 +1,562 @@
+//! The ownership pass and the check over forms the lowering writes from program text.
+
+import compiler.emit.typed_ir (Inst, Block, Let, Do, Allocate, Inc, Reset, Free, If, Case, Match,
+                               Loop, Handle, Fn, Rvalue, Get, Take, Op, OfStrings, OfContainers,
+                               PayloadPath, InlineRecordPath, AsInt, AsAddress, RecordAllocation,
+                               FieldInitializer, BuiltInPlace, Update)
+import compiler.emit.typed_ir.containers (CopyOut, Retain)
+import compiler.emit.emit_harness (program_of, lowered_root, checked, printed_by_ir)
+import compiler.emit.own (insert_reference_counts)
+import compiler.emit.verify (ownership_fault)
+import compiler.emit.print.count_functions (release_fn, call_start)
+
+test "a lowered body that holds no count is left as it was, and passes the check" {
+  let src = Bytes::concat_all([
+    b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc + n) }\n",
+    b"fn pick(c: Bool, a: Float, b: Float) -> Float = if c { a * b } else { b }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let kept = |name: Bytes| {
+        let form = lowered_root(p, name);
+        let o = insert_reference_counts(form);
+        Ok(o.body == form.body && ownership_fault(o) == None)
+      };
+      assert_eq(kept(b"total"), Ok(true));
+      assert_eq(kept(b"pick"), Ok(true))
+    },
+  }
+}
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type P = { name: String, n: Int }\n",
+    b"type T = | Leaf | Node(T, Int, T)\n",
+    b"fn rename(p: P, s: String) -> P = { ..p, name: s }\n",
+    b"fn bump(p: P) -> P = { ..p, n: p.n + 1 }\n",
+    b"fn label(p: P) -> String = p.name\n",
+    b"fn size(t: T) -> Int = match t { Leaf -> 0, Node(l, _, r) -> size(l) + 1 + size(r) }\n",
+    b"fn mirror(t: T) -> T = match t { Leaf -> Leaf, Node(l, v, r) -> Node(mirror(r), v, mirror(l)) }\n",
+    b"fn first(xs: List<String>) -> String = match xs.at(0) { Some(s) -> s, None -> \"\" }\n",
+    b"fn twice(s: String) -> String = s ++ s\n",
+    b"fn pick(c: Bool, a: String, b: String) -> String = if c { a } else { b }\n",
+    b"fn applied(f: (String) -> String, s: String) -> String = f(f(s))\n",
+    b"fn adder(s: String) -> (String) -> String = |t: String| s ++ t\n",
+    b"fn count(xs: List<String>) -> Int = xs.fold(0, |n: Int, _: String| n + 1)\n",
+    b"fn grow(xs: List<String>, s: String) -> List<String> = xs.push(s)\n",
+    b"fn nested(c: Bool, d: Bool) -> Int = if c { if d { 1 } else { 2 } } else { 3 }\n",
+    b"fn looked(a: Option<Int>, b: Option<Int>) -> Int = match a { Some(x) -> match b { Some(y) -> x + y, None -> x }, None -> 0 }\n",
+    b"fn sum_both(a: Option<Int>, b: Option<Int>) -> Int = { let Some(x) = a else { 0 }; let Some(y) = b else { x }; x + y }\n",
+    b"fn both(c: Bool, o: Option<Int>) -> Bool = c && (o == Some(1))\n",
+    b"fn kept_in(o: Option<String>, d: Bool) -> String = match o { Some(s) -> if d { s } else { \"\" }, None -> \"\" }\n",
+  ])
+
+fn corpus_names() -> List<Bytes> =
+  [
+    b"rename",
+    b"bump",
+    b"label",
+    b"size",
+    b"mirror",
+    b"first",
+    b"twice",
+    b"pick",
+    b"applied",
+    b"adder",
+    b"count",
+    b"grow",
+    b"nested",
+    b"looked",
+    b"sum_both",
+    b"both",
+    b"kept_in",
+  ]
+
+/// Every instruction of `b`, those of the blocks it holds after each that holds them.
+fn insts(b: Block) -> List<Inst> =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    acc.push(i).concat(match i {
+      If(x) -> insts(x.then).concat(insts(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(insts(c.rest), |a: List<Inst>, arm: { when: Int, body: Block }|
+          a.concat(insts(arm.body))),
+      Match(m) -> m.arms.fold(insts(m.rest), |a: List<Inst>, arm: Block| a.concat(insts(arm))),
+      Loop(l) -> insts(l.body),
+      Handle(h) -> insts(h.body),
+      _ -> [],
+    }))
+
+test "the corpus lowers and passes the check, and a value read out of another is handed on with no count taken" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      assert_eq(
+        corpus_names().fold([], |acc: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
+          match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, reason: why }) }),
+        [],
+      );
+      let incs = |n: Bytes|
+        match checked(p, n) {
+          Ok(f) -> insts(f.body).filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
+          Err(_) -> 0 - 1,
+        };
+      // A record handed in as its fields gives up the leaf it is read for, an Option matched gives
+      // up its payload, which is its word, and a node held only here gives up the fields taken out
+      // of it: none is counted again.
+      assert_eq([b"rename", b"bump", b"label", b"first", b"pick", b"size", b"mirror"].map(incs), [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+      ]);
+      // The node a tree's mirror is rebuilt from lends its cells to the node it makes; the leaf,
+      // a singleton, takes none.
+      let resets = match checked(p, b"mirror") {
+        Ok(f) -> insts(f.body).filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+        Err(_) -> 0 - 1,
+      };
+      assert_eq(resets, 1)
+    },
+  }
+}
+
+/// Fields read out of a payload read out of a field of a parameter held as a word, as the
+/// compiler's `dump_test` reads them, and the same a level deeper, in a closure, a loop and a
+/// handle's body.
+fn projection_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Cases = { binder: String, label: String }\n",
+    b"type TestDef = { name: String, cases: Option<Cases>, body: String, flag: Bool, n: Int, m: Int }\n",
+    b"type Wrap = { o: Option<Option<Cases>>, a: Int, b: Int, c: Int, d: Int }\n",
+    b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"fn dump_test(t: TestDef) -> List<String> = [t.name, t.body, match t.cases { Some(c) -> c.binder ++ c.label, None -> \"\" }]\n",
+    b"fn twice_in(w: Wrap) -> String = match w.o { Some(Some(c)) -> c.binder, _ -> \"\" }\n",
+    b"fn in_lambda(t: TestDef, xs: List<Int>) -> List<String> = xs.map(|_: Int| match t.cases { Some(c) -> c.binder, None -> \"\" })\n",
+    b"fn in_loop(t: TestDef, n: Int) -> String / {abort.raise} = iterate(0, n + 1, |i: Int| if i >= n { Stop(match t.cases { Some(c) -> c.label, None -> \"\" }) } else { Continue(i + 1) })\n",
+    b"fn in_handle(t: TestDef) -> String = handle { if amb.flip() { match t.cases { Some(c) -> c.binder, None -> \"\" } } else { \"\" } } with { amb.flip() resume k -> k(true) }\n",
+    // A record held in place in a constructor, read out of an Option's payload read out of a
+    // record an Option's payload holds, as A's `takes` reads it; deeper, in a closure, and handed on.
+    b"type Ty = | TFn({ params: List<Int>, ret: Int }) | TInt\n",
+    b"type Q = { name: String, ty: Option<Ty> }\n",
+    b"fn takes(p: Option<Q>) -> Option<Int> = match p { Some(x) -> match x.ty { Some(TFn(f)) -> Some(f.params.len()), _ -> None }, None -> None }\n",
+    b"fn takes_both(p: Option<Q>) -> Int = match p { Some(x) -> match x.ty { Some(TFn(f)) -> f.params.len() + f.ret, _ -> 0 }, None -> 0 }\n",
+    b"fn takes_each(ps: List<Option<Q>>) -> List<Int> = ps.map(|p: Option<Q>| match p { Some(x) -> match x.ty { Some(TFn(f)) -> f.params.len(), _ -> 0 }, None -> 0 })\n",
+    b"fn params_of(p: Option<Q>) -> List<Int> = match p { Some(x) -> match x.ty { Some(TFn(f)) -> f.params, _ -> [] }, None -> [] }\n",
+  ])
+
+/// A list held across calls that can fail and a checked sum, then handed on.
+fn failure_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn g(n: Int) -> Int / {abort.raise} = if n > 3 { panic(\"big\") } else { n }\n",
+    b"fn grown(xs: List<Int>, n: Int) -> List<Int> / {abort.raise} = xs.push(g(n) + g(n + 1))\n",
+  ])
+
+test "a failure lets go of the list it holds on its way out, by one tail every such failure shares" {
+  match program_of(failure_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match printed_by_ir(p, b"grown") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(t) -> {
+        // The list is let go of once, by its type's release, where both calls and the sum before
+        // it is handed on go when they fail.
+        assert_eq(t.split(call_start(release_fn(), [b"ctx", b"p0"])).len() - 1, 1);
+        let targets = t.split(b"goto ").drop(1).map(|s: Bytes|
+          match s.index_of(b";") { Some(at) -> s.slice(0, at), None -> s });
+        assert(targets.len() >= 3 && targets.all(|x: Bytes| Some(x) == targets.at(0)))
+      },
+    },
+  }
+}
+
+test "a field read out of a payload read out of a parameter's field keeps the parameter held until it is read" {
+  match program_of(projection_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [
+          b"dump_test",
+          b"twice_in",
+          b"in_lambda",
+          b"in_loop",
+          b"in_handle",
+          b"takes",
+          b"takes_both",
+          b"takes_each",
+          b"params_of",
+        ].fold([], |acc: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
+          match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push({ name: n, reason: why }) }),
+        [],
+      ),
+  }
+}
+
+/// Bodies reading records that lie in place in the record holding them: one only reads them, one
+/// hands them on, one keeps one past the update that consumes its holder.
+fn inline_record_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Five = { a: Int, b: Int, c: Int, d: Int, name: String, w: (Int, Int, Int, Int) }\n",
+    b"type Holder = { id: Int, at: Int, to: Int, five: Five, other: Five, x: (Int, Int, Int, Int) }\n",
+    b"type Outer = { h: Holder, k: Int, a: Int, b: Int, c: Int, x: (Int, Int, Int, Int) }\n",
+    b"fn nudged(h: Holder, n: Int) -> Holder = { ..h, five: { ..h.five, a: n } }\n",
+    b"fn deeper(o: Outer, n: Int) -> Outer = { ..o, h: { ..o.h, five: { ..o.h.five, a: n } } }\n",
+    b"fn reads(h: Holder) -> Int = h.five.a + h.other.d\n",
+    b"fn hands(h: Holder) -> List<Five> = [h.five, h.other]\n",
+    b"fn outlives(h: Holder, n: Int) -> Five = { let f = h.five; let g = { ..h, id: n }; if g.id > f.a { f } else { g.other } }\n",
+    b"fn constant() -> Holder = { id: 1, at: 0, to: 0, five: { a: 1, b: 2, c: 3, d: 4, name: \"x\", w: (0, 0, 0, 0) }, other: { a: 5, b: 6, c: 7, d: 8, name: \"y\", w: (0, 0, 0, 0) }, x: (0, 0, 0, 0) }\n",
+    b"fn constant_case() -> Option<Five> = Some({ a: 1, b: 2, c: 3, d: 4, name: \"x\", w: (0, 0, 0, 0) })\n",
+    b"fn wrapped(h: Holder) -> Option<Five> = Some(h.five)\n",
+    b"fn erred(h: Holder) -> Result<Int, Five> = Err(h.other)\n",
+    b"fn rewrapped(h: Holder) -> { a: Five, b: Five, n: Int, at: Int, to: Int, x: (Int, Int, Int, Int) } = { a: h.five, b: h.other, n: h.id, at: h.at, to: h.to, x: (0, 0, 0, 0) }\n",
+    b"fn moved_on(h: Holder) -> Holder = { ..h, five: h.other }\n",
+    b"fn nested(n: Int) -> Holder = { id: n, at: 0, to: 0, five: { a: n, b: 1, c: 2, d: 3, name: \"x\", w: (0, 0, 0, 0) }, other: { a: 1, b: n, c: 3, d: 4, name: \"y\", w: (0, 0, 0, 0) }, x: (0, 0, 0, 0) }\n",
+  ])
+
+test "a record literal holding record literals is one box, each inner record built in its place" {
+  match program_of(inline_record_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match checked(p, b"nested") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> {
+        let makes = insts(f.body).fold([], |acc: List<List<FieldInitializer>>, i: Inst|
+          match i {
+            Let(l) -> match l.val {
+              Allocate(m) -> match m.made { RecordAllocation(shape) -> acc.push(shape), _ -> acc },
+              _ -> acc,
+            },
+            _ -> acc,
+          });
+        assert_eq(makes.len(), 1);
+        assert_eq(
+          makes.get(0).filter(|s: FieldInitializer|
+            match s { BuiltInPlace(_) -> true, _ -> false }).len(
+          ),
+          2,
+        )
+      },
+    },
+  }
+}
+
+test "an update of a record in place inside an update of its holder is one update, writing at its word" {
+  match program_of(inline_record_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [b"nudged", b"deeper"].map(|n: Bytes|
+          match checked(p, n) {
+            Ok(f) ->
+              Ok(
+                insts(f.body).fold(
+                  { updates: 0, places: 0 },
+                  |acc: { updates: Int, places: Int }, i: Inst|
+                    match i {
+                      Let(l) -> match l.val {
+                        Update(_) -> { ..acc, updates: acc.updates + 1 },
+                        Get(g) -> match g.path {
+                          InlineRecordPath(_) -> { ..acc, places: acc.places + 1 },
+                          _ -> acc,
+                        },
+                        _ -> acc,
+                      },
+                      _ -> acc,
+                    },
+                ),
+              ),
+            Err(why) -> Err(why),
+          }),
+        [Ok({ updates: 1, places: 0 }), Ok({ updates: 1, places: 0 })],
+      ),
+  }
+}
+
+/// How many records read where they lie a body keeps, and how many it takes out of a box it holds.
+fn place_reads(b: Block) -> { kept: Int, taken: Int } =
+  insts(b).fold({ kept: 0, taken: 0 }, |acc: { kept: Int, taken: Int }, i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Op(o) -> if o.op == OfContainers(Retain) { { ..acc, kept: acc.kept + 1 } } else { acc },
+        Take(t) -> match t.path {
+          InlineRecordPath(_) -> { ..acc, taken: acc.taken + 1 },
+          _ -> acc,
+        },
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
+test "a record read where it lies moves out of a box held only here, and is kept only where a count of it is taken" {
+  match program_of(inline_record_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [
+          b"reads",
+          b"hands",
+          b"outlives",
+          b"constant",
+          b"constant_case",
+          b"wrapped",
+          b"erred",
+          b"rewrapped",
+          b"moved_on",
+        ].map(|n: Bytes|
+          match checked(p, n) { Ok(f) -> Ok(place_reads(f.body)), Err(why) -> Err(why) }),
+        // Out of a box held only here a record moves; read out of one held elsewhere it is kept. A
+        // case holding a record read where it lies takes it: no sum word points into a place.
+        [
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 2 }),
+          Ok({ kept: 1, taken: 1 }),
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 1 }),
+          Ok({ kept: 0, taken: 1 }),
+          // A record made of records read where they lie copies each in: none kept, none taken.
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 0 }),
+        ],
+      ),
+  }
+}
+
+/// Buffers appended to through a record or a constructor this body holds alone, as `emit.cases`'
+/// buffer test writes them.
+fn buffer_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type S = { out: Bytes, n: Int }\n",
+    b"type W = { out: Bytes, n: Int, a: Int, b: Int }\n",
+    b"type T = | T(Bytes, Int)\n",
+    b"fn ctor(t: T, fuel: Int) -> Bytes = match t { T(out, n) -> if n <= 0 || fuel <= 0 { out } else { ctor(T(out ++ b\"x\", n - 1), fuel - 1) } }\n",
+    b"fn iterated(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n }, n + 1, |s: S| if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b\"x\", n: s.n - 1 }) })\n",
+    b"fn widened(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n, a: 0, b: 0 }, n + 1, |s: W| if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b\"x\", n: s.n - 1, a: s.a, b: s.b }) })\n",
+    b"fn guarded(t: T, k: Int) -> Bytes = match t { T(out, n) if n > k -> out ++ b\"y\", T(out, _) -> out }\n",
+    b"type G = { out: Bytes, n: Int, a: Int, b: Int, c: Int }\n",
+    b"fn regrown(g: G) -> G = { let out = g.out ++ b\"x\"; { ..g, out: out } }\n",
+    b"fn branched(g: G, stop: Bool) -> G / {abort.raise} = if stop { { ..g, n: 0 } } else { let out = g.out; { ..g, out: out ++ out.slice(0, 1) } }\n",
+    b"fn kept(g: G) -> { g: G, out: Bytes } = { let out = g.out; { g: { ..g, n: 1 }, out: out } }\n",
+    b"fn boxed(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n, a: 0, b: 0, c: 0 }, n + 1, |s: G| if s.n <= 0 { Stop(s.out) } else { Continue({ ..s, out: s.out ++ b\"x\", n: s.n - 1 }) })\n",
+  ])
+
+/// How often `b` takes a count, resets a block and makes one in a block it reset.
+fn reuse_of(b: Block) -> { incs: Int, resets: Int, reused: Int } = {
+  let all = insts(b);
+  {
+    incs: all.filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
+    resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+    reused: all.filter(|i: Inst|
+      match i {
+        Let(l) -> match l.val { Allocate(m) -> m.reuse != None, _ -> false },
+        _ -> false,
+      }).len(
+    ),
+  }
+}
+
+test "a buffer appended to through a value held alone is handed on with no count taken, its cells reused" {
+  match program_of(buffer_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let counts = |n: Bytes|
+        match checked(p, n) { Ok(f) -> Ok(reuse_of(f.body)), Err(why) -> Err(why) };
+      // A constructor of a buffer and an `Int` is those two words, with no cells to reuse: the buffer
+      // matched out of it is its one count, which moves on to the one rebuilt.
+      assert_eq(counts(b"ctor"), Ok({ incs: 0, resets: 0, reused: 0 }));
+      // A loop's state held as its leaves, as wide as the registers, moves its buffer on at each pass.
+      assert_eq(counts(b"iterated"), Ok({ incs: 0, resets: 0, reused: 0 }));
+      assert_eq(counts(b"widened"), Ok({ incs: 0, resets: 0, reused: 0 }));
+      // A record wider than the registers is a box: its buffer moves out where an update of the
+      // box writes the field back, whatever an update on another way through the body writes.
+      assert_eq(counts(b"regrown").map(|c: { incs: Int, resets: Int, reused: Int }| c.incs), Ok(0));
+      assert_eq(
+        counts(b"branched").map(|c: { incs: Int, resets: Int, reused: Int }| c.incs),
+        Ok(0),
+      );
+      // An update past the read that keeps the field keeps it whole, so the read takes a count.
+      assert_eq(counts(b"kept").map(|c: { incs: Int, resets: Int, reused: Int }| c.incs), Ok(1));
+      // A loop's state wider than the registers is a box the loop holds alone, through the lambda
+      // run in place as anywhere else.
+      assert_eq(counts(b"boxed").map(|c: { incs: Int, resets: Int, reused: Int }| c.incs), Ok(0));
+      match checked(p, b"guarded") { Ok(_) -> (), Err(why) -> assert_eq(why, b"") }
+    },
+  }
+}
+
+/// A search tree a body takes apart and remakes at its shape, in a call's arms and after a branch
+/// that leaves.
+fn tree_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type T = | Leaf | Node(T, Int, T)\n",
+    b"fn insert(t: T, k: Int) -> T = match t { Leaf -> Node(Leaf, k, Leaf), Node(l, x, r) -> if k < x { Node(insert(l, k), x, r) } else { Node(l, x, insert(r, k)) } }\n",
+    b"fn prune(t: T, k: Int) -> T = match t { Leaf -> Leaf, Node(l, x, r) -> if x == k { Leaf } else { Node(prune(l, k), x, prune(r, k)) } }\n",
+  ])
+
+test "a node a body takes apart and remakes at its shape is remade in its own box" {
+  match program_of(tree_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let counts = |n: Bytes|
+        match checked(p, n) {
+          Ok(f) -> {
+            let all = insts(f.body);
+            Ok({
+              resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+              reused: all.filter(|i: Inst|
+                match i {
+                  Let(l) -> match l.val { Allocate(m) -> m.reuse != None, _ -> false },
+                  _ -> false,
+                }).len(
+              ),
+              freed: all.filter(|i: Inst| match i { Free(_) -> true, _ -> false }).len(),
+            })
+          },
+          Err(why) -> Err(why),
+        };
+      // The node's box is reset once, and each arm that remakes the node takes it.
+      assert_eq(counts(b"insert"), Ok({ resets: 1, reused: 2, freed: 0 }));
+      // The arm that answers a leaf makes none, and gives the cells back.
+      assert_eq(counts(b"prune"), Ok({ resets: 1, reused: 1, freed: 1 }))
+    },
+  }
+}
+
+/// Programs whose bodies read the bytes of strings and byte strings: through an address each, by
+/// operations over bytes, and out of a crossing's buffer.
+fn bytes_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"fn first(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\n",
+    b"fn starts(a: String, b: String) -> Bool = a.starts_with(b)\n",
+    b"fn holds(a: String, b: String) -> Bool = a.contains(b)\n",
+    b"fn cut(b: Bytes, i: Int, j: Int) -> Bytes / {abort.raise} = b.slice(i, j)\n",
+    b"fn digested(b: Bytes) -> Bytes = b.blake3()\n",
+  ])
+
+/// `b` with each value `broken` breaks broken, through the blocks it holds.
+fn broken_in(b: Block, broken: (Inst) -> Option<Inst>) -> Block =
+  b.map(|i: Inst|
+    match broken(i) {
+      Some(x) -> x,
+      None -> match i {
+        If(x) ->
+          If({ ..x, then: broken_in(x.then, broken), otherwise: broken_in(x.otherwise, broken) }),
+        Case(c) ->
+          Case({
+            ..c,
+            arms: c.arms.map(|a: { when: Int, body: Block }|
+              { when: a.when, body: broken_in(a.body, broken) }),
+            rest: broken_in(c.rest, broken),
+          }),
+        Match(m) ->
+          Match({
+            arms: m.arms.map(|a: Block| broken_in(a, broken)),
+            rest: broken_in(m.rest, broken),
+          }),
+        Loop(l) -> Loop({ ..l, body: broken_in(l.body, broken) }),
+        Handle(h) -> Handle({ ..h, body: broken_in(h.body, broken) }),
+        _ -> i,
+      },
+    })
+
+/// An operation over bytes or a crossing's taken bytes written to take nothing and answer no count of
+/// its own, against its rule; an address read as a number.
+fn rule_violation(i: Inst) -> Option<Inst> =
+  match i {
+    Let(l) -> match l.val {
+      Op(o) -> match o.op {
+        OfStrings(_) ->
+          Some(
+            Let({
+              ..l,
+              val: Op({
+                ..o,
+                uses: { ..o.uses, takes: o.uses.takes.map(|t: Bool| !t), owned: !o.uses.owned },
+              }),
+            }),
+          ),
+        OfContainers(CopyOut) ->
+          Some(Let({ ..l, val: Op({ ..o, uses: { ..o.uses, owned: false } }) })),
+        _ -> None,
+      },
+      Get(g) -> if g.path == PayloadPath {
+        Some(Let({ ..l, var: { ..l.var, representation: AsInt } }))
+      } else { None },
+      _ -> None,
+    },
+    Do(d) -> match d.val {
+      Op(o) -> match o.op {
+        OfStrings(_) ->
+          Some(Do({ ..d, val: Op({ ..o, uses: { ..o.uses, owned: !o.uses.owned } }) })),
+        _ -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+test "bytes read through an address, operated on and taken from a crossing pass the check, which refuses each held otherwise" {
+  match program_of(bytes_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let names = [b"first", b"starts", b"holds", b"cut", b"digested"];
+      let counted = names.fold([], |acc: List<{ name: Bytes, f: Fn }>, n: Bytes|
+        match checked(p, n) {
+          Ok(f) -> acc.push({ name: n, f: f }),
+          Err(why) -> panic(String::of_bytes_lossy(n.concat(b": ").concat(why))),
+        });
+      assert_eq(counted.len(), names.len());
+      // Each body holds such a read, and read so breaks its rule: a bytes operation's counts, a
+      // crossing's taken bytes, an address held as a number.
+      assert_eq(
+        counted.filter(|c: { name: Bytes, f: Fn }| {
+          let broken = broken_in(c.f.body, rule_violation);
+          broken == c.f.body || ownership_fault({ ..c.f, body: broken }) == None
+        }).map(|c: { name: Bytes, f: Fn }| c.name),
+        [],
+      )
+    },
+  }
+}
+
+/// Bodies reading and keeping records in place out of options, records and captures.
+fn inline_shape_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Five = { a: Int, b: Int, c: Int, d: Int, name: String, w: (Int, Int, Int, Int) }\n",
+    b"type Holder = { id: Int, at: Int, to: Int, five: Five, other: Five, x: (Int, Int, Int, Int) }\n",
+    b"type Ran = { ok: Bool, run: Holder }\n",
+    b"fn opt_read(o: Option<Five>) -> Int = match o { Some(f) -> f.a, None -> 0 }\n",
+    b"fn opt_keep(o: Option<Five>) -> List<Five> = match o { Some(f) -> [f], None -> [] }\n",
+    b"fn opt_update(o: Option<Five>) -> Option<Five> = match o { Some(f) -> Some({ ..f, a: 1 }), None -> None }\n",
+    b"fn opt_two(o: Option<Five>, p: Option<Five>, z: Five) -> Five = match o { Some(f) -> match p { Some(g) -> { ..g, a: max(f.a, g.a) }, None -> f }, None -> z }\n",
+    b"fn chain(h: Holder) -> Holder = { let g = { ..h, id: 2 }; { ..g, five: { ..g.five, a: h.five.a } } }\n",
+    b"fn captured(h: Holder) -> List<Int> = [1, 2].map(|x: Int| x + h.five.a)\n",
+    b"fn folded_holder(xs: List<Int>, h: Holder) -> Holder = xs.fold(h, |s: Holder, x: Int| { ..s, id: s.id + x })\n",
+    b"fn nested_update(t: Ran) -> Holder = { ..t.run, id: t.run.id + 1 }\n",
+    b"fn given_on(t: Ran) -> List<Holder> = [t.run, { ..t.run, id: 0 }]\n",
+    b"fn kept_both(o: Option<Holder>, t: Ran) -> Holder = match o { Some(r) -> if t.ok { { ..t.run, five: r.five } } else { r }, None -> t.run }\n",
+  ])
+
+test "records in place read, kept and updated out of options, records and captures pass the check" {
+  match program_of(inline_shape_corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [
+          b"opt_read",
+          b"opt_keep",
+          b"opt_update",
+          b"opt_two",
+          b"chain",
+          b"captured",
+          b"folded_holder",
+          b"nested_update",
+          b"given_on",
+          b"kept_both",
+        ].fold([], |acc: List<Bytes>, n: Bytes|
+          match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push(n.concat(b": ").concat(why)) }),
+        [],
+      ),
+  }
+}

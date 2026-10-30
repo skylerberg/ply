@@ -1,17 +1,21 @@
 //! Declarations to types: type expressions, effects, constructors and written signatures.
 
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, is_bare)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr, MWrite, ty_span, mode_text, is_raise, ident_names)
-import compiler.syntax.items (Item, IFn, IType, IEffect, FnDef, TypeDef, TDAlias, TDSum, VariantDef,
-                              OpDef, Constraint, Deriver, DOrd, DNumeric, DInteger, is_predicate,
-                              TDNominal, TDExtern, constraint_written)
+import compiler.syntax.type_syntax (TypeExpr, VariableTypeExpression, NamedTypeExpression,
+                                    FunctionTypeExpression, RecordTypeExpression,
+                                    UnitTypeExpression, InvalidTypeExpression, RowExpr, AtomExpr,
+                                    WriteMode, ty_span, mode_text, is_raise, ident_names)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, FnDef, TypeDef, AliasBody,
+                              SumBody, VariantDef, OpDef, Constraint, Deriver, OrdDeriver,
+                              NumericDeriver, IntegerDeriver, is_predicate, NominalBody, ExternBody,
+                              constraint_written)
 import compiler.syntax.exprs (Param)
-import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
-                             TyRecord, Field, Scheme, atoms_covered, atoms_insert, row_empty,
-                             row_open, unit_type, fn_type, fields_sorted, field_get, ints_insert,
-                             mark_rigid_ty, mark_rigid_row, free_vars, env_bind_global, env_lookup,
-                             env_locals, InScope, label_type, applied_args, at_arguments, TyNominal,
+import compiler.check.types (NamedResource, SingletonResource, ResourceVariable, AnyResource, Atom,
+                             Row, Type, VariableType, NamedType, FunctionType, RecordType, Field,
+                             Scheme, atoms_covered, atoms_insert, row_empty, row_open, unit_type,
+                             fn_type, fields_sorted, field_get, ints_insert, mark_rigid_ty,
+                             mark_rigid_row, free_vars, env_bind_global, env_lookup, env_locals,
+                             InScope, label_type, applied_args, apply_arguments, NominalType,
                              owning_fn_type)
 import compiler.check.known (hold_name, hold_type, task_name, chan_name, map_parts)
 import compiler.check.resolve.tables (ParsedModule, Binding, TypeSpace, EffectSpace, qualify,
@@ -20,10 +24,10 @@ import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
 import std.string
-import compiler.check.lent (passed)
+import compiler.check.borrowing (parameter_mode)
 import compiler.check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord,
                                      DeclaredSum, TypeDecl, RecordDecl, OpInfo, EffectInfo,
-                                     Signature, Assumed, OpenRegion, Brand, HoldsOf, Tasks,
+                                     Signature, Assumption, OpenRegion, Brand, HoldsOf, Tasks,
                                      RigidParam, MapKeySite, Checker, DefConstraint, ConstraintSite,
                                      insert_constraint, dedup_constraints, WithTy, WithVar, WithRow,
                                      WithName, WithTys, WithAtom, hold, is_region_effect,
@@ -68,56 +72,60 @@ fn type_param(checker: Checker, ident: Ident) -> { checker: Checker, ty: Type } 
     },
   }
 
-pub fn conv_type(checker: Checker, ty: TypeExpr) -> { checker: Checker, ty: Type } / {abort.raise} =
-  conv_within(checker, ty, alias_room(checker))
+pub fn convert_type(
+  checker: Checker,
+  ty: TypeExpr,
+) -> { checker: Checker, ty: Type } / {abort.raise} =
+  convert_type_within(checker, ty, alias_depth_limit(checker))
 
 /// How many more aliases a conversion may expand inside one another: an alias already being
 /// expanded is refused, so each is a declared alias not yet on the stack.
-fn alias_room(checker: Checker) -> Int = checker.types.len() - checker.alias_stack.len()
+fn alias_depth_limit(checker: Checker) -> Int = checker.types.len() - checker.alias_stack.len()
 
-fn conv_within(
+fn convert_type_within(
   checker: Checker,
   ty: TypeExpr,
   room: Int,
 ) -> { checker: Checker, ty: Type } / {abort.raise} =
   match ty {
-    TVar(id) -> type_param(checker, id),
-    TUnit(_) -> { checker: checker, ty: unit_type() },
-    TBad(_) -> new_ty(checker),
-    TRecord(r) -> {
+    VariableTypeExpression(id) -> type_param(checker, id),
+    UnitTypeExpression(_) -> { checker: checker, ty: unit_type() },
+    InvalidTypeExpression(_) -> new_ty(checker),
+    RecordTypeExpression(r) -> {
       let fs = r.fields.fold(
         { checker: checker, fs: [] },
         |acc: { checker: Checker, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
-          let o: WithTy = conv_within(acc.checker, f.ty, room);
+          let o: WithTy = convert_type_within(acc.checker, f.ty, room);
           { checker: o.checker, fs: acc.fs.push({ name: f.name.name, ty: o.ty }) }
         },
       );
-      { checker: fs.checker, ty: TyRecord(fields_sorted(fs.fs)) }
+      { checker: fs.checker, ty: RecordType(fields_sorted(fs.fs)) }
     },
-    TFn(f) -> {
-      let ps: WithTys = conv_all_within(checker, f.params, room);
-      let r: WithTy = conv_within(ps.checker, f.ret, room);
+    FunctionTypeExpression(f) -> {
+      let ps: WithTys = convert_types_within(checker, f.params, room);
+      let r: WithTy = convert_type_within(ps.checker, f.ret, room);
       let eff = match f.effects {
-        Some(row) -> conv_row(r.checker, row),
+        Some(row) -> convert_row(r.checker, row),
         None -> { checker: r.checker, row: row_empty() },
       };
       { checker: eff.checker, ty: owning_fn_type(ps.tys, f.kept, f.once, r.ty, eff.row) }
     },
-    TCon(c) -> conv_con(checker, c.name, c.args, c.labels, c.rows, c.span, room),
+    NamedTypeExpression(c) ->
+      convert_constructor(checker, c.name, c.args, c.labels, c.rows, c.span, room),
   }
 
 /// The label and row arguments a use of a declared type writes.
-type Over = { labels: List<Type>, rows: List<Row> }
+type LabelRowArguments = { labels: List<Type>, rows: List<Row> }
 
-fn conv_over(
+fn convert_label_row_arguments(
   checker: Checker,
   labels: List<Ident>,
   rows: List<RowExpr>,
-) -> { checker: Checker, over: Over } / {abort.raise} = {
+) -> { checker: Checker, over: LabelRowArguments } / {abort.raise} = {
   let converted = rows.fold(
     { checker: checker, rows: [] },
     |acc: { checker: Checker, rows: List<Row> }, row: RowExpr| {
-      let o = conv_row(acc.checker, row);
+      let o = convert_row(acc.checker, row);
       { checker: o.checker, rows: acc.rows.push(o.row) }
     },
   );
@@ -127,7 +135,7 @@ fn conv_over(
       // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
       labels: labels.map(|label: Ident|
         match checker.label_params.get(label.name) {
-          Some(v) -> TyVar(v),
+          Some(v) -> VariableType(v),
           None -> label_type(label.name),
         }),
       rows: converted.rows,
@@ -137,7 +145,7 @@ fn conv_over(
 
 /// A declaration's own label and row binders, each a fresh variable, in place of whatever was in
 /// scope: a declared type is closed, so nothing in it names a parameter of the signature using it.
-fn bind_own(
+fn bind_declaration_params(
   checker: Checker,
   decl: TypeDecl,
 ) -> { checker: Checker, labels: List<Int>, rows: List<Int> } = {
@@ -165,13 +173,13 @@ fn bind_own(
   { checker: rows.checker, labels: labels.vars, rows: rows.vars }
 }
 
-fn conv_types(
+fn convert_types(
   checker: Checker,
   tys: List<TypeExpr>,
 ) -> { checker: Checker, tys: List<Type> } / {abort.raise} =
-  conv_all_within(checker, tys, alias_room(checker))
+  convert_types_within(checker, tys, alias_depth_limit(checker))
 
-fn conv_all_within(
+fn convert_types_within(
   checker: Checker,
   tys: List<TypeExpr>,
   room: Int,
@@ -179,7 +187,7 @@ fn conv_all_within(
   tys.fold(
     { checker: checker, tys: [] },
     |acc: { checker: Checker, tys: List<Type> }, ty: TypeExpr| {
-      let o: WithTy = conv_within(acc.checker, ty, room);
+      let o: WithTy = convert_type_within(acc.checker, ty, room);
       { checker: o.checker, tys: acc.tys.push(o.ty) }
     },
   )
@@ -215,13 +223,13 @@ fn arity_error(
 }
 
 /// A use whose label or row arguments are not as many as the declaration binds, told of the first.
-fn over_refused(
+fn refuse_label_row_count(
   checker: Checker,
   span: Span,
   name: Bytes,
   labels: Int,
   rows: Int,
-  over: Over,
+  over: LabelRowArguments,
 ) -> Checker / {abort.raise} =
   if over.labels.len() != labels {
     arity_error(checker, span, name, labels, over.labels.len(), b"label arguments", [
@@ -233,7 +241,7 @@ fn over_refused(
     ])
   }
 
-fn conv_con(
+fn convert_constructor(
   checker: Checker,
   name: QName,
   args: List<TypeExpr>,
@@ -249,10 +257,10 @@ fn conv_con(
       ty: match checker.ty_params.get(name.name.name) { Some(t) -> t, None -> unit_type() },
     }
   } else {
-    let converted: WithTys = conv_all_within(checker, args, room);
-    let written = conv_over(converted.checker, labels, rows);
+    let converted: WithTys = convert_types_within(checker, args, room);
+    let written = convert_label_row_arguments(converted.checker, labels, rows);
     let c: Checker = written.checker;
-    let over: Over = written.over;
+    let over: LabelRowArguments = written.over;
     match if is_bare(name) { builtin_type_arity(name.name.name) } else { None } {
       Some(arity) -> if converted.tys.len() != arity {
         new_ty(
@@ -261,18 +269,18 @@ fn conv_con(
       } else if name.name.name == hold_name() {
         // A hold's type names its region's label, as its reads do.
         if over.labels.len() != 1 || over.rows.len() != 0 {
-          new_ty(over_refused(c, span, name.name.name, 1, 0, over))
+          new_ty(refuse_label_row_count(c, span, name.name.name, 1, 0, over))
         } else {
           let label = match c.label_params.get(labels.get(0).name) {
-            Some(v) -> TyVar(v),
-            None -> label_type(region_named(c, hold(), labels.get(0).name)),
+            Some(v) -> VariableType(v),
+            None -> label_type(region_label_for(c, hold(), labels.get(0).name)),
           };
           { checker: c, ty: hold_type(label, converted.tys.get(0)) }
         }
       } else if labels.len() > 0 || rows.len() > 0 {
-        new_ty(over_refused(c, span, name.name.name, 0, 0, over))
+        new_ty(refuse_label_row_count(c, span, name.name.name, 0, 0, over))
       } else {
-        let built = TyCon({ name: name.name.name, args: converted.tys });
+        let built = NamedType({ name: name.name.name, args: converted.tys });
         { checker: note_parts(c, span, own_parts(c.carrying, built, [])), ty: built }
       },
       None -> {
@@ -296,7 +304,7 @@ fn conv_con(
               )
             } else if over.labels.len() != decl.labels.len() || over.rows.len() != decl.rows.len() {
               new_ty(
-                over_refused(
+                refuse_label_row_count(
                   g.checker,
                   span,
                   name.name.name,
@@ -308,12 +316,12 @@ fn conv_con(
             } else {
               match decl.declared {
                 DeclaredSum -> {
-                  let built = TyCon({
+                  let built = NamedType({
                     name: qualified,
                     args: applied_args(converted.tys, over.labels, over.rows),
                   });
                   {
-                    checker: note_stated(
+                    checker: note_type_constraints(
                       note_parts(g.checker, span, own_parts(g.checker.carrying, built, [])),
                       span,
                       qualified,
@@ -324,8 +332,8 @@ fn conv_con(
                 },
                 DeclaredExtern ->
                   {
-                    checker: note_stated(g.checker, span, qualified, converted.tys),
-                    ty: TyCon({
+                    checker: note_type_constraints(g.checker, span, qualified, converted.tys),
+                    ty: NamedType({
                       name: qualified,
                       args: applied_args(converted.tys, over.labels, over.rows),
                     }),
@@ -335,14 +343,14 @@ fn conv_con(
                   match o.record {
                     None -> new_ty(o.checker),
                     Some(r) -> {
-                      let built = at_arguments(
+                      let built = apply_arguments(
                         r.ty,
                         r.ty_vars,
                         r.row_vars,
                         applied_args(converted.tys, over.labels, over.rows),
                       );
                       {
-                        checker: note_stated(
+                        checker: note_type_constraints(
                           note_parts(o.checker, span, own_parts(o.checker.carrying, built, [])),
                           span,
                           qualified,
@@ -371,8 +379,8 @@ fn conv_con(
                 } else if room <= 0 { panic("an alias expanded past the aliases there are") } else {
                   // The alias's own `where` holds where it is named, and joins what the type being
                   // collected carries: the expansion keeps no trace of the alias itself.
-                  let g1 = hint_stated(
-                    note_stated(g.checker, span, qualified, converted.tys),
+                  let g1 = note_alias_constraints(
+                    note_type_constraints(g.checker, span, qualified, converted.tys),
                     qualified,
                     converted.tys,
                   );
@@ -388,7 +396,7 @@ fn conv_con(
                     && decl.rows.len() == 0;
                   match if memo { g.checker.aliases.get(qualified) } else { None } {
                     Some(m) -> {
-                      let assumed = assumed_for(g.checker, DOrd);
+                      let assumed = assumed_for(g.checker, OrdDeriver);
                       let keys = m.keys.map(|s: MapKeySite|
                         { ..s, scope: g.checker.scope, assumed: assumed });
                       {
@@ -403,7 +411,7 @@ fn conv_con(
                         |m: Map<Bytes, Type>, i: Int|
                           m.insert(decl.params.get(i), converted.tys.get(i)),
                       );
-                      let own = bind_own(
+                      let own = bind_declaration_params(
                         {
                           ..g.checker,
                           ty_params: bound,
@@ -412,12 +420,12 @@ fn conv_con(
                         },
                         decl,
                       );
-                      let body: WithTy = conv_within(own.checker, alias, room - 1);
+                      let body: WithTy = convert_type_within(own.checker, alias, room - 1);
                       let o: WithTy = if own.labels.len() == 0 && own.rows.len() == 0 { body }
                       else {
                         {
                           checker: body.checker,
-                          ty: at_arguments(
+                          ty: apply_arguments(
                             body.ty,
                             own.labels,
                             own.rows,
@@ -442,7 +450,7 @@ fn conv_con(
                           aliases: if kept {
                             o.checker.aliases.insert(qualified, {
                               t: o.ty,
-                              keys: from_index(o.checker.map_keys, before),
+                              keys: sites_from(o.checker.map_keys, before),
                             })
                           } else { o.checker.aliases },
                         },
@@ -495,11 +503,11 @@ fn declared_record(
           {
             checker: o.checker,
             vars: acc.vars.push(o.var),
-            params: acc.params.insert(p, TyVar(o.var)),
+            params: acc.params.insert(p, VariableType(o.var)),
           }
         },
       );
-      let own = bind_own(
+      let own = bind_declaration_params(
         {
           ..vars.checker,
           ty_params: vars.params,
@@ -509,9 +517,9 @@ fn declared_record(
         },
         decl,
       );
-      let o: WithTy = conv_within(own.checker, body, room - 1);
-      let fields = match o.ty { TyRecord(fs) -> fs, _ -> [] };
-      let written = match body { TRecord(r) -> r.fields, _ -> [] };
+      let o: WithTy = convert_type_within(own.checker, body, room - 1);
+      let fields = match o.ty { RecordType(fs) -> fs, _ -> [] };
+      let written = match body { RecordTypeExpression(r) -> r.fields, _ -> [] };
       // A row its functions perform is read off its fields wherever one escapes, so only what
       // names no region of its own, a `Hold`, a `Task` or a `Chan`, is refused here.
       let checked: Checker = written.fold(
@@ -530,11 +538,11 @@ fn declared_record(
           },
       );
       let record = {
-        ty: TyNominal({
+        ty: NominalType({
           name: qualified,
           args: applied_args(
-            vars.vars.map(|v: Int| TyVar(v)),
-            own.labels.map(|v: Int| TyVar(v)),
+            vars.vars.map(|v: Int| VariableType(v)),
+            own.labels.map(|v: Int| VariableType(v)),
             own.rows.map(row_open),
           ),
           fields: fields,
@@ -562,12 +570,12 @@ fn declared_record(
 pub fn collect_nominals(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item {
-      IType(def) -> {
+      TypeItem(def) -> {
         let qualified = qualify(parsed.name, def.name.name);
         match c.types.get(qualified) {
           Some(decl) -> match decl.declared {
             DeclaredRecord(body) ->
-              declared_record(c, def.name, qualified, decl, body, alias_room(c)).checker,
+              declared_record(c, def.name, qualified, decl, body, alias_depth_limit(c)).checker,
             _ -> c,
           },
           None -> c,
@@ -633,20 +641,20 @@ fn row_param(checker: Checker, ident: Ident) -> { checker: Checker, v: Option<In
       },
   }
 
-fn conv_row(checker: Checker, row: RowExpr) -> { checker: Checker, row: Row } / {abort.raise} = {
-  let o = conv_marked(checker, row);
+fn convert_row(checker: Checker, row: RowExpr) -> { checker: Checker, row: Row } / {abort.raise} = {
+  let o = convert_bounded_row(checker, row);
   { checker: refuse_marks(o.checker, row), row: o.r }
 }
 
 /// A row with the atoms it marks `bounded`.
-fn conv_marked(
+fn convert_bounded_row(
   checker: Checker,
   row: RowExpr,
 ) -> { checker: Checker, r: Row, bounded: List<Atom> } / {abort.raise} = {
   let atoms = row.atoms.fold(
     { checker: checker, atoms: [], bounded: [] },
     |acc: { checker: Checker, atoms: List<Atom>, bounded: List<Atom> }, atom: AtomExpr| {
-      let o: WithAtom = conv_atom(acc.checker, atom);
+      let o: WithAtom = convert_atom(acc.checker, atom);
       match o.atom {
         Some(x) ->
           {
@@ -684,16 +692,16 @@ fn refuse_mark(checker: Checker, span: Span) -> Checker =
     ],
   )
 
-fn refused(checker: Checker, s: Span) -> Bool =
+fn is_refused_atom(checker: Checker, s: Span) -> Bool =
   checker.refused_atoms.fold(false, |acc: Bool, x: Location|
     acc || (x.module == checker.module && x.span == s))
 
-fn refusing(checker: Checker, s: Span) -> Checker =
+fn mark_refused_atom(checker: Checker, s: Span) -> Checker =
   { ..checker, refused_atoms: checker.refused_atoms.push({ module: checker.module, span: s }) }
 
 /// `[*]` on an operation declared without a label names nothing: the atom is refused where it is
 /// written, and dropped so the row does not carry a label the operation has no room for.
-fn refuse_every(
+fn refuse_any_label(
   checker: Checker,
   span: Span,
   eff: Bytes,
@@ -710,26 +718,26 @@ fn refuse_every(
     b"declared without `[r]`",
     [],
   );
-  refusing(reported, span)
+  mark_refused_atom(reported, span)
 }
 
-pub fn conv_atom(
+pub fn convert_atom(
   checker: Checker,
   a: AtomExpr,
 ) -> { checker: Checker, atom: Option<Atom> } / {abort.raise} =
-  if refused(checker, a.span) { { checker: checker, atom: None } } else {
-    let e: WithName = effect_name(checker, a.eff);
+  if is_refused_atom(checker, a.span) { { checker: checker, atom: None } } else {
+    let e: WithName = effect_name(checker, a.effect_name);
     match e.name {
-      None -> { checker: refusing(e.checker, a.span), atom: None },
+      None -> { checker: mark_refused_atom(e.checker, a.span), atom: None },
       Some(eff) -> {
         // `[*]` is every label, which no label variable can stand for.
-        let resource = if a.every { RAny } else {
+        let resource = if a.every { AnyResource } else {
           match a.resource {
             Some(r) -> match checker.label_params.get(r.name) {
-              Some(v) -> RVar(v),
-              None -> RNamed(region_named(checker, eff, r.name)),
+              Some(v) -> ResourceVariable(v),
+              None -> NamedResource(region_label_for(checker, eff, r.name)),
             },
-            None -> RSingleton,
+            None -> SingletonResource,
           }
         };
         let info = effect_of(e.checker, eff);
@@ -739,7 +747,7 @@ pub fn conv_atom(
           Some(op) -> match info {
             Some(i) -> match op_named(i, op.name) {
               Some(o) -> if a.every && !o.resource_param {
-                { checker: refuse_every(e.checker, a.span, eff, o.name, o.at), refused: true }
+                { checker: refuse_any_label(e.checker, a.span, eff, o.name, o.at), refused: true }
               } else { { checker: e.checker, refused: false } },
               None -> { checker: e.checker, refused: false },
             },
@@ -765,8 +773,9 @@ pub fn conv_atom(
               let declares_mode = eff == b"diverges"
                 || (match info {
                   Some(i) ->
-                    i.ops.len() == 0
-                      || i.ops.fold(false, |acc: Bool, o: OpInfo| acc || mode_eq(o.mode, a.mode)),
+                    i.operations.len() == 0
+                      || i.operations.fold(false, |acc: Bool, o: OpInfo|
+                        acc || mode_eq(o.mode, a.mode)),
                   None -> true,
                 });
               if declares_mode { Some({ effect: eff, resource: resource, mode: a.mode, op: None }) }
@@ -779,8 +788,8 @@ pub fn conv_atom(
           None -> {
             let known = match info {
               Some(i) -> match a.op {
-                Some(_) -> known_modes(i).concat(known_moded_ops(i)),
-                None -> known_modes(i),
+                Some(_) -> effect_modes(i).concat(effect_moded_ops(i)),
+                None -> effect_modes(i),
               },
               None -> [],
             };
@@ -819,7 +828,7 @@ pub fn conv_atom(
               label,
               help,
             );
-            { checker: refusing(reported, a.span), atom: None }
+            { checker: mark_refused_atom(reported, a.span), atom: None }
           },
         }
       },
@@ -827,8 +836,8 @@ pub fn conv_atom(
   }
 
 /// No mode atom stands for a raise, so each one is named.
-fn known_modes(info: EffectInfo) -> List<Bytes> =
-  info.ops.fold([], |acc: List<Bytes>, op_info: OpInfo| {
+fn effect_modes(info: EffectInfo) -> List<Bytes> =
+  info.operations.fold([], |acc: List<Bytes>, op_info: OpInfo| {
     let k = Bytes::concat_all([
       info.simple_name,
       b".",
@@ -837,14 +846,17 @@ fn known_modes(info: EffectInfo) -> List<Bytes> =
     if acc.contains(k) { acc } else { acc.push(k) }
   })
 
-fn known_moded_ops(info: EffectInfo) -> List<Bytes> =
-  known_ops({ ..info, ops: info.ops.filter(|op_info: OpInfo| !is_raise(op_info.mode)) })
+fn effect_moded_ops(info: EffectInfo) -> List<Bytes> =
+  effect_ops({
+    ..info,
+    operations: info.operations.filter(|op_info: OpInfo| !is_raise(op_info.mode)),
+  })
 
-fn known_ops(info: EffectInfo) -> List<Bytes> =
-  info.ops.map(|op_info: OpInfo| Bytes::concat_all([info.simple_name, b".", op_info.name]))
+fn effect_ops(info: EffectInfo) -> List<Bytes> =
+  info.operations.map(|op_info: OpInfo| Bytes::concat_all([info.simple_name, b".", op_info.name]))
 
 pub fn op_named(info: EffectInfo, name: Bytes) -> Option<OpInfo> =
-  info.ops.fold(None, |acc: Option<OpInfo>, op_info: OpInfo|
+  info.operations.fold(None, |acc: Option<OpInfo>, op_info: OpInfo|
     match acc { Some(_) -> acc, None -> if op_info.name == name { Some(op_info) } else { None } })
 
 pub fn effect_name(
@@ -939,12 +951,12 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
         ),
       None -> {
         let declared = match def.body {
-          TDAlias(t) -> DeclaredAlias(t),
-          TDNominal(t) -> DeclaredRecord(t),
-          TDSum(_) -> DeclaredSum,
-          TDExtern -> DeclaredExtern,
+          AliasBody(t) -> DeclaredAlias(t),
+          NominalBody(t) -> DeclaredRecord(t),
+          SumBody(_) -> DeclaredSum,
+          ExternBody -> DeclaredExtern,
         };
-        let s = stated_constraints(checker, def);
+        let s = declared_constraints(checker, def);
         {
           ..s.checker,
           types: s.checker.types.insert(name, {
@@ -968,7 +980,7 @@ fn record_type(checker: Checker, parsed: ParsedModule, def: TypeDef) -> Checker 
 /// A type's `where`, by the positions of the parameters it constrains. A constraint names one of
 /// the type's own type parameters, and is no predicate: a predicate's witness is an argument each
 /// call passes, and a type is written and built with no call to pass one.
-fn stated_constraints(
+fn declared_constraints(
   checker: Checker,
   def: TypeDef,
 ) -> { checker: Checker, constraints: List<DefConstraint> } / {abort.raise} =
@@ -1034,20 +1046,20 @@ fn stated_constraints(
 
 pub fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
-    match item { IType(d) -> record_type(c, parsed, d), _ -> c })
+    match item { TypeItem(d) -> record_type(c, parsed, d), _ -> c })
 
 /// The first `Hold`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
 fn region_brand(ty: Type) -> Option<Bytes> =
   match ty {
-    TyCon(c) -> if c.name == hold_name() || scheduler_handle(c.name) { Some(c.name) }
+    NamedType(c) -> if c.name == hold_name() || is_scheduler_handle(c.name) { Some(c.name) }
     else { first_reason(c.args, region_brand) },
-    TyFn(f) -> match first_reason(f.params, region_brand) {
+    FunctionType(f) -> match first_reason(f.params, region_brand) {
       Some(b) -> Some(b),
       None -> region_brand(f.ret),
     },
-    TyRecord(fs) -> first_reason(fs, |f: Field| region_brand(f.ty)),
-    TyNominal(n) -> first_reason(n.fields, |f: Field| region_brand(f.ty)),
-    TyVar(_) -> None,
+    RecordType(fs) -> first_reason(fs, |f: Field| region_brand(f.ty)),
+    NominalType(n) -> first_reason(n.fields, |f: Field| region_brand(f.ty)),
+    VariableType(_) -> None,
   }
 
 fn reject_declared_brand(
@@ -1086,13 +1098,13 @@ fn reject_declared_brand(
 /// What the row of a function in `ty` reaches of a region: a hold, or a task or a channel.
 fn region_reach(ty: Type) -> Option<Bytes> =
   match ty {
-    TyVar(_) -> None,
-    TyCon(c) -> first_reason(c.args, region_reach),
-    TyRecord(fs) -> first_reason(fs, |f: Field| region_reach(f.ty)),
-    TyNominal(n) -> first_reason(n.fields, |f: Field| region_reach(f.ty)),
-    TyFn(f) -> if f.effects.atoms.fold(false, |b: Bool, atom: Atom| b || atom.effect == hold()) {
-      Some(b"`Hold`")
-    } else if row_brands(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
+    VariableType(_) -> None,
+    NamedType(c) -> first_reason(c.args, region_reach),
+    RecordType(fs) -> first_reason(fs, |f: Field| region_reach(f.ty)),
+    NominalType(n) -> first_reason(n.fields, |f: Field| region_reach(f.ty)),
+    FunctionType(f) -> if f.effects.atoms.fold(false, |b: Bool, atom: Atom|
+        b || atom.effect == hold()) { Some(b"`Hold`") }
+    else if row_reaches_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
       match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
     },
   }
@@ -1142,7 +1154,7 @@ fn operation_reach() -> List<Bytes> =
 pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item {
-      IEffect(def) -> {
+      EffectItem(def) -> {
         let name = qualify(parsed.name, def.name.name);
         if is_region_effect(def.name.name) {
           report_error_at(
@@ -1173,12 +1185,12 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
           match effect_of(c, name) {
             Some(prev) -> duplicate(c, def.name, prev.at, b"effect"),
             None -> {
-              let ops = def.ops.fold(
-                { checker: c, ops: [] },
-                |acc: { checker: Checker, ops: List<OpInfo> }, op: OpDef|
-                  if acc.ops.fold(false, |b: Bool, op_info: OpInfo|
+              let ops = def.operations.fold(
+                { checker: c, operations: [] },
+                |acc: { checker: Checker, operations: List<OpInfo> }, op: OpDef|
+                  if acc.operations.fold(false, |b: Bool, op_info: OpInfo|
                       b || op_info.name == op.name.name) {
-                    let prev = acc.ops.fold(dummy_span(), |span: Span, op_info: OpInfo|
+                    let prev = acc.operations.fold(dummy_span(), |span: Span, op_info: OpInfo|
                       if op_info.name == op.name.name { op_info.at.span } else { span });
                     {
                       checker: duplicate(
@@ -1187,7 +1199,7 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                         { module: acc.checker.module, span: prev },
                         b"operation",
                       ),
-                      ops: acc.ops,
+                      operations: acc.operations,
                     }
                   } else {
                     let bound: Checker = bind_ty_params(
@@ -1199,14 +1211,14 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                       ..bound,
                       assumed: bound.ty_params.fold(
                         bound.assumed,
-                        |xs: List<Assumed>, k: Bytes, t: Type|
-                          match t { TyVar(v) -> assume(xs, DOrd, v), _ -> xs },
+                        |xs: List<Assumption>, k: Bytes, t: Type|
+                          match t { VariableType(v) -> assume(xs, OrdDeriver, v), _ -> xs },
                       ),
                     };
-                    let ps: WithTys = conv_types(c1, op.params);
+                    let ps: WithTys = convert_types(c1, op.params);
                     // A raise answers nothing, so each perform of it has the type asked of it.
                     let r: WithTy = if is_raise(op.mode) { new_ty(ps.checker) }
-                    else { conv_type(ps.checker, op.ret) };
+                    else { convert_type(ps.checker, op.ret) };
                     let c2: Checker = {
                       ..r.checker,
                       ty_params: Map::new(),
@@ -1234,7 +1246,7 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                     );
                     {
                       checker: c4,
-                      ops: acc.ops.push({
+                      operations: acc.operations.push({
                         name: op.name.name,
                         mode: op.mode,
                         resource_param: op.resource_param,
@@ -1252,7 +1264,7 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                 module: parsed.name,
                 simple_name: def.name.name,
                 nondet: def.is_nondet,
-                ops: ops.ops,
+                operations: ops.operations,
                 at: location_of(ops.checker, def.span),
               })
             },
@@ -1265,11 +1277,11 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
 pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item {
-      IType(def) -> match def.body {
-        TDAlias(_) -> c,
-        TDNominal(_) -> c,
-        TDExtern -> c,
-        TDSum(variants) -> {
+      TypeItem(def) -> match def.body {
+        AliasBody(_) -> c,
+        NominalBody(_) -> c,
+        ExternBody -> c,
+        SumBody(variants) -> {
           let type_name = qualify(parsed.name, def.name.name);
           match c.types.get(type_name) {
             None -> c,
@@ -1281,17 +1293,17 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
                   {
                     checker: o.checker,
                     vars: acc.vars.push(o.var),
-                    params: acc.params.insert(p, TyVar(o.var)),
+                    params: acc.params.insert(p, VariableType(o.var)),
                   }
                 },
               );
-              let own = bind_own({ ..vars.checker, ty_params: vars.params }, decl);
+              let own = bind_declaration_params({ ..vars.checker, ty_params: vars.params }, decl);
               let c1: Checker = { ..own.checker, collecting: type_name };
-              let result = TyCon({
+              let result = NamedType({
                 name: type_name,
                 args: applied_args(
-                  vars.vars.map(|v: Int| TyVar(v)),
-                  own.labels.map(|v: Int| TyVar(v)),
+                  vars.vars.map(|v: Int| VariableType(v)),
+                  own.labels.map(|v: Int| VariableType(v)),
                   own.rows.map(row_open),
                 ),
               });
@@ -1301,7 +1313,7 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
                 match ctor_of(cc, ctor) {
                   Some(prev) -> duplicate(cc, variant.name, prev.at, b"constructor"),
                   None -> {
-                    let fs: WithTys = conv_types(cc, variant.fields);
+                    let fs: WithTys = convert_types(cc, variant.fields);
                     let checked: Checker = range(0, fs.tys.len()).fold(
                       fs.checker,
                       |c3: Checker, i: Int|
@@ -1325,7 +1337,7 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
                     let sc = {
                       ty_vars: vars.vars,
                       row_vars: own.rows,
-                      kept_vars: [],
+                      keep_variables: [],
                       label_vars: own.labels,
                       ty: ty,
                     };
@@ -1364,8 +1376,8 @@ pub fn collect_ctors(checker: Checker, parsed: ParsedModule) -> Checker / {abort
 pub fn refuse_irregular(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let generic = parsed.module.items.fold([], |acc: List<TypeDef>, item: Item|
     match item {
-      IType(def) -> match def.body {
-        TDSum(_) -> if def.generics.types.len() > 0 { acc.push(def) } else { acc },
+      TypeItem(def) -> match def.body {
+        SumBody(_) -> if def.generics.types.len() > 0 { acc.push(def) } else { acc },
         _ -> acc,
       },
       _ -> acc,
@@ -1458,7 +1470,7 @@ fn param_steps(sums: Map<Bytes, List<SumCase>>, s: Bytes) -> List<ParamStep> =
                           to: o.name.concat(b"#").concat(ascii_of_int(j)),
                           grown: grown,
                         });
-                      if arg == TyVar(p) { step(false) }
+                      if arg == VariableType(p) { step(false) }
                       else if vars_of(arg).contains(p) { step(true) }
                       else { e }
                     },
@@ -1470,17 +1482,17 @@ fn param_steps(sums: Map<Bytes, List<SumCase>>, s: Bytes) -> List<ParamStep> =
 /// none inside a function type.
 fn sums_in(sums: Map<Bytes, List<SumCase>>, t: Type) -> List<{ name: Bytes, args: List<Type> }> =
   match t {
-    TyVar(_) -> [],
-    TyFn(_) -> [],
-    TyCon(k) -> {
+    VariableType(_) -> [],
+    FunctionType(_) -> [],
+    NamedType(k) -> {
       let inner = k.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
         acc.concat(sums_in(sums, a)));
       if sums.contains(k.name) { inner.push({ name: k.name, args: k.args }) } else { inner }
     },
-    TyRecord(fs) ->
+    RecordType(fs) ->
       fs.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, f: Field|
         acc.concat(sums_in(sums, f.ty))),
-    TyNominal(x) ->
+    NominalType(x) ->
       x.fields.fold(
         x.args.fold([], |acc: List<{ name: Bytes, args: List<Type> }>, a: Type|
           acc.concat(sums_in(sums, a))),
@@ -1491,11 +1503,11 @@ fn sums_in(sums: Map<Bytes, List<SumCase>>, t: Type) -> List<{ name: Bytes, args
 /// The type variables `t` names outside function types.
 fn vars_of(t: Type) -> List<Int> =
   match t {
-    TyVar(v) -> [v],
-    TyFn(_) -> [],
-    TyCon(k) -> k.args.fold([], |acc: List<Int>, a: Type| acc.concat(vars_of(a))),
-    TyRecord(fs) -> fs.fold([], |acc: List<Int>, f: Field| acc.concat(vars_of(f.ty))),
-    TyNominal(x) -> x.args.fold([], |acc: List<Int>, a: Type| acc.concat(vars_of(a))),
+    VariableType(v) -> [v],
+    FunctionType(_) -> [],
+    NamedType(k) -> k.args.fold([], |acc: List<Int>, a: Type| acc.concat(vars_of(a))),
+    RecordType(fs) -> fs.fold([], |acc: List<Int>, f: Field| acc.concat(vars_of(f.ty))),
+    NominalType(x) -> x.args.fold([], |acc: List<Int>, a: Type| acc.concat(vars_of(a))),
   }
 
 /// Every position a chain of one or more steps leads to from `from`: no chain is longer than the
@@ -1514,12 +1526,12 @@ pub fn check_value_namespace(checker: Checker, parsed: ParsedModule) -> Checker 
     { checker: checker, seen: [] },
     |acc: { checker: Checker, seen: List<{ name: Bytes, span: Span, is_fn: Bool }> }, item: Item| {
       let declared = match item {
-        IFn(d) -> [{ name: d.name, is_fn: true }],
-        IType(d) -> match d.body {
-          TDSum(vs) -> vs.map(|variant: VariantDef| { name: variant.name, is_fn: false }),
-          TDAlias(_) -> [],
-          TDNominal(_) -> [],
-          TDExtern -> [],
+        FunctionItem(d) -> [{ name: d.name, is_fn: true }],
+        TypeItem(d) -> match d.body {
+          SumBody(vs) -> vs.map(|variant: VariantDef| { name: variant.name, is_fn: false }),
+          AliasBody(_) -> [],
+          NominalBody(_) -> [],
+          ExternBody -> [],
         },
         _ -> [],
       };
@@ -1573,14 +1585,14 @@ pub fn check_value_namespace(checker: Checker, parsed: ParsedModule) -> Checker 
 pub fn constraints_in_force(
   checker: Checker,
   cs: List<Constraint>,
-) -> List<Assumed> / {abort.raise} =
-  cs.fold([], |acc: List<Assumed>, c: Constraint|
+) -> List<Assumption> / {abort.raise} =
+  cs.fold([], |acc: List<Assumption>, c: Constraint|
     match checker.ty_params.get(c.param.name) {
-      Some(TyVar(v)) -> assume(acc, c.deriver, v),
+      Some(VariableType(v)) -> assume(acc, c.deriver, v),
       _ -> acc,
     })
 
-pub fn assume(xs: List<Assumed>, deriver: Deriver, v: Int) -> List<Assumed> / {abort.raise} = {
+pub fn assume(xs: List<Assumption>, deriver: Deriver, v: Int) -> List<Assumption> / {abort.raise} = {
   let hit = range(0, xs.len()).fold(None, |acc: Option<Int>, i: Int|
     match acc {
       Some(_) -> acc,
@@ -1624,7 +1636,7 @@ fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
     {
       ..o.checker,
       subst: mark_rigid_ty(o.checker.subst, o.var),
-      ty_params: o.checker.ty_params.insert(ident.name, TyVar(o.var)),
+      ty_params: o.checker.ty_params.insert(ident.name, VariableType(o.var)),
     }
   })
 
@@ -1635,7 +1647,7 @@ pub fn member_scheme(checker: Checker, def: FnDef, sig: Signature) -> Scheme / {
   {
     ty_vars: def.generics.types.fold([], |vs: List<Int>, ident: Ident|
       match sig.ty_params.get(ident.name) {
-        Some(TyVar(v)) -> if free.tys.contains(v) { vs.push(v) } else { vs },
+        Some(VariableType(v)) -> if free.tys.contains(v) { vs.push(v) } else { vs },
         _ -> vs,
       }),
     row_vars: def.generics.effects.fold([], |vs: List<Int>, ident: Ident|
@@ -1643,9 +1655,9 @@ pub fn member_scheme(checker: Checker, def: FnDef, sig: Signature) -> Scheme / {
         Some(v) -> if free.rows.contains(v) { vs.push(v) } else { vs },
         None -> vs,
       }),
-    kept_vars: def.generics.kept.fold([], |vs: List<Int>, ident: Ident|
+    keep_variables: def.generics.kept.fold([], |vs: List<Int>, ident: Ident|
       match sig.ty_params.get(ident.name) {
-        Some(TyVar(v)) -> if free.tys.contains(v) { vs.push(v) } else { vs },
+        Some(VariableType(v)) -> if free.tys.contains(v) { vs.push(v) } else { vs },
         _ -> vs,
       }),
     label_vars: def.generics.labels.fold([], |vs: List<Int>, ident: Ident|
@@ -1684,7 +1696,7 @@ pub fn written_signature(
       label_params: o.checker.label_params.insert(p.name, o.var),
     }
   });
-  let assumed: Checker = witnessing(
+  let assumed: Checker = note_witness_params(
     { ..labels, assumed: constraints_in_force(labels, def.constraints) },
     def.constraints,
   );
@@ -1694,8 +1706,8 @@ pub fn written_signature(
     |acc: { checker: Checker, tys: List<Type> }, p: Param|
       match p.ty {
         Some(t) -> {
-          let o: WithTy = conv_type(acc.checker, t);
-          { checker: hold_written(o.checker, t, o.ty, true), tys: acc.tys.push(o.ty) }
+          let o: WithTy = convert_type(acc.checker, t);
+          { checker: check_hold_placement(o.checker, t, o.ty, true), tys: acc.tys.push(o.ty) }
         },
         None -> {
           let o: WithTy = new_ty(acc.checker);
@@ -1705,15 +1717,15 @@ pub fn written_signature(
   );
   let ret: WithTy = match def.ret {
     Some(t) -> {
-      let o: WithTy = conv_type(params.checker, t);
-      { checker: hold_written(o.checker, t, o.ty, false), ty: o.ty }
+      let o: WithTy = convert_type(params.checker, t);
+      { checker: check_hold_placement(o.checker, t, o.ty, false), ty: o.ty }
     },
     None -> new_ty(params.checker),
   };
   // A function's row is what its signature writes: with no `/`, the empty one.
   let declared: { checker: Checker, r: Option<Row>, bounded: List<Atom> } = match def.effects {
     Some(r) -> {
-      let o = conv_marked(ret.checker, r);
+      let o = convert_bounded_row(ret.checker, r);
       { checker: o.checker, r: Some(o.r), bounded: o.bounded }
     },
     None -> { checker: ret.checker, r: Some(row_empty()), bounded: [] },
@@ -1753,18 +1765,18 @@ pub fn written_signature(
 /// function type it holds.
 fn keeps_hold(ty: Type, passed: Bool) -> Bool =
   match ty {
-    TyVar(_) -> false,
-    TyCon(c) ->
+    VariableType(_) -> false,
+    NamedType(c) ->
       (c.name == hold_name() && !passed)
         || c.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
-    TyFn(f) ->
+    FunctionType(f) ->
       f.params.fold(false, |b: Bool, p: Type| b || keeps_hold(p, true)) || keeps_hold(f.ret, false),
-    TyRecord(fs) -> fs.fold(false, |b: Bool, f: Field| b || keeps_hold(f.ty, false)),
-    TyNominal(n) -> n.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+    RecordType(fs) -> fs.fold(false, |b: Bool, f: Field| b || keeps_hold(f.ty, false)),
+    NominalType(n) -> n.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
   }
 
 /// A hold is passed down and never kept, so `Hold` is written only as a parameter's type.
-pub fn hold_written(
+pub fn check_hold_placement(
   checker: Checker,
   written: TypeExpr,
   ty: Type,
@@ -1793,7 +1805,7 @@ pub fn open_region_named(checker: Checker, name: Bytes) -> Option<OpenRegion> =
 
 /// What `name` stands for where an atom of the effect `eff` or a hold's type writes it: an open
 /// region's own label for its hold, and for any other effect the resource of that name.
-fn region_named(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
+fn region_label_for(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
   if !is_region_effect(eff) { name }
   else { match open_region_named(checker, name) { Some(region) -> region.label, None -> name } }
 
@@ -1806,12 +1818,12 @@ pub fn first_reason<a | e>(xs: List<a>, f: (a) -> Option<Bytes> / e) -> Option<B
 
 pub fn rigid_params(checker: Checker) -> List<RigidParam> =
   checker.ty_params.fold([], |acc: List<RigidParam>, k: Bytes, ty: Type|
-    match ty { TyVar(v) -> acc.push({ name: k, var: v }), _ -> acc })
+    match ty { VariableType(v) -> acc.push({ name: k, var: v }), _ -> acc })
 
 /// `integer(a)` implies `numeric(a)`, so a numeric obligation also holds of an integer parameter.
 pub fn assumed_for(checker: Checker, deriver: Deriver) -> List<Int> / {abort.raise} =
-  checker.assumed.fold([], |acc: List<Int>, a: Assumed|
-    if a.deriver == deriver || (deriver == DNumeric && a.deriver == DInteger) {
+  checker.assumed.fold([], |acc: List<Int>, a: Assumption|
+    if a.deriver == deriver || (deriver == NumericDeriver && a.deriver == IntegerDeriver) {
       a.vars.fold(acc, |b: List<Int>, v: Int| ints_insert(b, v))
     } else { acc })
 
@@ -1836,18 +1848,18 @@ pub fn own_parts(
       }
     };
   match t {
-    TyCon(c) -> match map_parts(t) {
+    NamedType(c) -> match map_parts(t) {
       Some(p) -> out.push({ key: p.key, carrier: None }),
       None -> if builtin_type_arity(c.name) != None { out } else { carried(c.name, c.args) },
     },
-    TyNominal(n) -> carried(n.name, n.args),
+    NominalType(n) -> carried(n.name, n.args),
     _ -> out,
   }
 }
 
 /// The constraints the type `name` states of its parameters, recorded of the arguments it is
 /// written or built at: each is judged once the module is solved, as a called definition's own is.
-pub fn note_stated(
+pub fn note_type_constraints(
   checker: Checker,
   span: Span,
   name: Bytes,
@@ -1864,7 +1876,7 @@ pub fn note_stated(
           match args.at(dc.param) {
             None -> c,
             Some(ty) ->
-              note_stated_site(c, span, dc.deriver, ty, name, match c.types.get(name) {
+              note_type_constraint(c, span, dc.deriver, ty, name, match c.types.get(name) {
                 Some(decl) ->
                   decl.constraints.any(|w: DefConstraint|
                     w.param == dc.param && w.deriver == dc.deriver),
@@ -1876,7 +1888,7 @@ pub fn note_stated(
 
 /// One constraint the type `callee` states, or carries from what it holds, recorded of an argument
 /// it is written or built at: judged once the module is solved, as a called definition's own is.
-pub fn note_stated_site(
+pub fn note_type_constraint(
   checker: Checker,
   span: Span,
   deriver: Deriver,
@@ -1910,7 +1922,11 @@ pub fn note_stated_site(
 /// A constrained alias expanded while a type's declaration is collected: the alias is gone from
 /// the field types the collection keeps, and the hint carries its `where` into what the type
 /// carries of its own parameters.
-fn hint_stated(checker: Checker, name: Bytes, args: List<Type>) -> Checker / {abort.raise} =
+fn note_alias_constraints(
+  checker: Checker,
+  name: Bytes,
+  args: List<Type>,
+) -> Checker / {abort.raise} =
   if checker.collecting == b"" { checker } else {
     match checker.stated.get(name) {
       None -> checker,
@@ -1921,7 +1937,7 @@ fn hint_stated(checker: Checker, name: Bytes, args: List<Type>) -> Checker / {ab
             Some(ty) ->
               {
                 ..c,
-                stated_hints: c.stated_hints.push({
+                alias_constraints: c.alias_constraints.push({
                   on: c.collecting,
                   from: name,
                   deriver: dc.deriver,
@@ -1937,23 +1953,27 @@ pub fn note_parts(
   span: Span,
   found: List<OrderedPart>,
 ) -> Checker / {abort.raise} =
-  note_sites(
+  note_map_key_sites(
     checker,
     span,
     found.map(|p: OrderedPart| { key: p.key, whole: p.key, carrier: p.carrier }),
   )
 
 /// What a site judges, the key it names and the declared type that asks it, if no `Map` does.
-pub type Judged = { key: Type, whole: Type, carrier: Option<Type> }
+pub type OrderedKey = { key: Type, whole: Type, carrier: Option<Type> }
 
-pub fn note_sites(checker: Checker, span: Span, found: List<Judged>) -> Checker / {abort.raise} =
+pub fn note_map_key_sites(
+  checker: Checker,
+  span: Span,
+  found: List<OrderedKey>,
+) -> Checker / {abort.raise} =
   if found.len() == 0 { checker } else {
-    let assumed = assumed_for(checker, DOrd);
+    let assumed = assumed_for(checker, OrdDeriver);
     let params = rigid_params(checker);
     {
       ..checker,
       map_keys: checker.map_keys.concat(
-        found.map(|j: Judged|
+        found.map(|j: OrderedKey|
           {
             module: checker.module,
             span: span,
@@ -1969,7 +1989,7 @@ pub fn note_sites(checker: Checker, span: Span, found: List<Judged>) -> Checker 
     }
   }
 
-fn from_index(sites: List<MapKeySite>, from: Int) -> List<MapKeySite> / {abort.raise} =
+fn sites_from(sites: List<MapKeySite>, from: Int) -> List<MapKeySite> / {abort.raise} =
   range(from, sites.len()).fold([], |acc: List<MapKeySite>, i: Int| acc.push(sites.get(i)))
 
 /// The sites an alias expansion recorded from `from` on, moved to where the alias was named.
@@ -1986,12 +2006,12 @@ fn relocated_keys(
   })
 
 /// The type parameters a definition's `numeric` and `integer` constraints make witnesses of.
-pub fn witnessing(checker: Checker, cs: List<Constraint>) -> Checker =
+pub fn note_witness_params(checker: Checker, cs: List<Constraint>) -> Checker =
   cs.fold(checker, |c: Checker, k: Constraint|
     if !is_predicate(k.deriver) { c } else {
       match c.ty_params.get(k.param.name) {
-        Some(TyVar(v)) -> {
-          let integer = k.deriver == DInteger
+        Some(VariableType(v)) -> {
+          let integer = k.deriver == IntegerDeriver
             || (match c.witnessed.get(v) { Some(w) -> w.integer, None -> false });
           { ..c, witnessed: c.witnessed.insert(v, { param: k.param.name, integer: integer }) }
         },
@@ -2002,18 +2022,18 @@ pub fn witnessing(checker: Checker, cs: List<Constraint>) -> Checker =
 // --- Comparisons, simulations and regions, once the module is solved ------------------------------
 
 /// A task and a channel are keys into the scheduler of the region that made them.
-pub fn scheduler_handle(name: Bytes) -> Bool = name == task_name() || name == chan_name()
+pub fn is_scheduler_handle(name: Bytes) -> Bool = name == task_name() || name == chan_name()
 
 pub fn task_op(op: Bytes) -> Atom =
-  { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
+  { effect: b"task", resource: SingletonResource, mode: WriteMode, op: Some(op) }
 
 /// A hold is reached by atoms naming its region; a task only by a join, an await or a cancel, a
 /// channel by a send, a receive, a close or a select, and either by a `simulate` around one.
-pub fn row_brands(row: Row, brand: Brand) -> Bool =
+pub fn row_reaches_brand(row: Row, brand: Brand) -> Bool =
   match brand {
     HoldsOf(r) ->
       row.atoms.fold(false, |b: Bool, atom: Atom|
-        b || (atom.effect == hold() && atom.resource == RNamed(r))),
+        b || (atom.effect == hold() && atom.resource == NamedResource(r))),
     Tasks ->
       [b"join", b"await", b"cancel"].concat(channel_ops()).fold(
         atoms_covered(row.atoms, seed_atom()),

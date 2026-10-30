@@ -28,8 +28,8 @@ import std.math (ilog2)
 import std.time (after, at_millis, millis, nanos, nanos_at, seconds)
 import std.gen
 
-/// One entry, as `held` lists it and `of_held` takes it.
-pub type Held<k, v> = {
+/// One entry, as `held` lists it and `of_entries` takes it.
+pub type Entry<k, v> = {
   key: k,
   value: v,
   /// What the entry counts toward its cache's capacity, at least one.
@@ -40,10 +40,10 @@ pub type Held<k, v> = {
 
 /// How `insert` holds an entry: what it weighs, and how long it lives, which `None` leaves
 /// unbounded.
-pub type Terms = { weight: Int, lifetime: Option<Duration> }
+pub type InsertOptions = { weight: Int, lifetime: Option<Duration> }
 
 /// An entry among the others: the keys used just before it and just after.
-type Entry<k, v> = {
+type Node<k, v> = {
   value: v,
   weight: Int,
   expires: Option<Instant>,
@@ -51,12 +51,12 @@ type Entry<k, v> = {
   newer: Option<k>,
 }
 
-/// A cache of at most `capacity` weight. `lru`, `expiring` and `of_held` make one.
+/// A cache of at most `capacity` weight. `lru`, `expiring` and `of_entries` make one.
 pub type Cache<k, v> = new {
   capacity: Int,
   /// How long an entry `put` lives; forever where `None`.
   lifetime: Option<Duration>,
-  entries: Map<k, Entry<k, v>>,
+  entries: Map<k, Node<k, v>>,
   /// The least recently used key, which eviction takes first.
   oldest: Option<k>,
   newest: Option<k>,
@@ -65,11 +65,11 @@ pub type Cache<k, v> = new {
 }
 
 /// What a read answers: the value, and the cache after the read.
-pub type Read<k, v> = { value: Option<v>, cache: Cache<k, v> }
+pub type GetResult<k, v> = { value: Option<v>, cache: Cache<k, v> }
 
 /// What a write answers: the cache after it, and the entries it pushed out, the first evicted
 /// first.
-pub type Placed<k, v> = { cache: Cache<k, v>, evicted: List<Held<k, v>> }
+pub type InsertResult<k, v> = { cache: Cache<k, v>, evicted: List<Entry<k, v>> }
 
 /// An empty cache of at most `capacity` entries, none of which expires. One of no capacity holds
 /// nothing.
@@ -84,15 +84,17 @@ pub fn expiring<k, v>(capacity: Int, lifetime: Duration) -> Cache<k, v>
 = empty(capacity, Some(lifetime))
 
 /// The cache these entries make, the least recently used first, each with the weight and the
-/// deadline it is listed with, so `of_held(capacity(c), lifetime(c), held(c))` is `c`. Entries
+/// deadline it is listed with, so `of_entries(capacity(c), lifetime(c), held(c))` is `c`. Entries
 /// past the capacity are evicted as they would be put.
-pub fn of_held<k, v>(
+pub fn of_entries<k, v>(
   capacity: Int,
   lifetime: Option<Duration>,
-  held: List<Held<k, v>>,
+  entries_by_use: List<Entry<k, v>>,
 ) -> Cache<k, v> / {abort.raise}
   where derivable(ord, k)
-= held.fold(empty(capacity, lifetime), |c: Cache<k, v>, h: Held<k, v>| placed(c, h).cache)
+=
+  entries_by_use.fold(empty(capacity, lifetime), |c: Cache<k, v>, h: Entry<k, v>|
+    insert_entry(c, h).cache)
 
 fn empty<k, v>(capacity: Int, lifetime: Option<Duration>) -> Cache<k, v>
   where derivable(ord, k)
@@ -125,7 +127,7 @@ pub fn size<k, v>(c: Cache<k, v>) -> Int
 /// The value under `key` at the reading `now`, and the cache after the read. A value answered
 /// makes its entry the most recently used; an entry at or past its deadline answers `None` and
 /// is dropped; a key the cache does not hold answers `None` and the cache as it was.
-pub fn get<k, v>(c: Cache<k, v>, key: k, now: Instant) -> Read<k, v>
+pub fn get<k, v>(c: Cache<k, v>, key: k, now: Instant) -> GetResult<k, v>
   where derivable(ord, k)
 =
   match c.entries.get(key) {
@@ -150,17 +152,17 @@ pub fn contains<k, v>(c: Cache<k, v>, key: k, now: Instant) -> Bool
 = match peek(c, key, now) { Some(_) -> true, None -> false }
 
 /// Every entry, the least recently used first, which is the order eviction takes them in.
-pub fn held<k, v>(c: Cache<k, v>) -> List<Held<k, v>>
+pub fn entries_by_use<k, v>(c: Cache<k, v>) -> List<Entry<k, v>>
   where derivable(ord, k)
 =
   range(0, c.entries.len()).fold(
     { at: c.oldest, listed: [] },
-    |s: { at: Option<k>, listed: List<Held<k, v>> }, _: Int|
+    |s: { at: Option<k>, listed: List<Entry<k, v>> }, _: Int|
       match s.at {
         None -> s,
         Some(key) -> match c.entries.get(key) {
           None -> { at: None, listed: s.listed },
-          Some(e) -> { at: e.newer, listed: s.listed.push(listing(key, e)) },
+          Some(e) -> { at: e.newer, listed: s.listed.push(entry_of(key, e)) },
         },
       },
   ).listed
@@ -168,9 +170,9 @@ pub fn held<k, v>(c: Cache<k, v>) -> List<Held<k, v>>
 /// The keys, the least recently used first.
 pub fn keys<k, v>(c: Cache<k, v>) -> List<k>
   where derivable(ord, k)
-= held(c).map(|h: Held<k, v>| h.key)
+= entries_by_use(c).map(|h: Entry<k, v>| h.key)
 
-fn listing<k, v>(key: k, e: Entry<k, v>) -> Held<k, v> =
+fn entry_of<k, v>(key: k, e: Node<k, v>) -> Entry<k, v> =
   { key: key, value: e.value, weight: e.weight, expires: e.expires }
 
 fn is_expired(expires: Option<Instant>, now: Instant) -> Bool =
@@ -192,12 +194,12 @@ pub fn insert<k, v>(
   c: Cache<k, v>,
   key: k,
   value: v,
-  terms: Terms,
+  terms: InsertOptions,
   now: Instant,
-) -> Placed<k, v> / {abort.raise}
+) -> InsertResult<k, v> / {abort.raise}
   where derivable(ord, k)
 =
-  placed(c, {
+  insert_entry(c, {
     key: key,
     value: value,
     weight: terms.weight,
@@ -213,7 +215,7 @@ pub fn remove<k, v>(c: Cache<k, v>, key: k) -> Cache<k, v>
 pub fn sweep<k, v>(c: Cache<k, v>, now: Instant) -> Cache<k, v>
   where derivable(ord, k)
 =
-  held(c).fold(c, |kept: Cache<k, v>, h: Held<k, v>|
+  entries_by_use(c).fold(c, |kept: Cache<k, v>, h: Entry<k, v>|
     if is_expired(h.expires, now) { remove(kept, h.key) } else { kept })
 
 /// `c` with no entries, its capacity and lifetime kept.
@@ -221,13 +223,13 @@ pub fn clear<k, v>(c: Cache<k, v>) -> Cache<k, v>
   where derivable(ord, k)
 = empty(c.capacity, c.lifetime)
 
-fn placed<k, v>(c: Cache<k, v>, h: Held<k, v>) -> Placed<k, v> / {abort.raise}
+fn insert_entry<k, v>(c: Cache<k, v>, h: Entry<k, v>) -> InsertResult<k, v> / {abort.raise}
   where derivable(ord, k)
 = {
   let weighed = { ..h, weight: max(h.weight, 1) };
   let without = remove(c, h.key);
   if weighed.weight > c.capacity { { cache: without, evicted: [weighed] } } else {
-    fitted(
+    evict_to_fit(
       linked(without, h.key, {
         value: h.value,
         weight: weighed.weight,
@@ -240,10 +242,10 @@ fn placed<k, v>(c: Cache<k, v>, h: Held<k, v>) -> Placed<k, v> / {abort.raise}
 }
 
 /// `c` with its least recently used entries evicted until the rest weigh no more than it holds.
-fn fitted<k, v>(c: Cache<k, v>) -> Placed<k, v> / {abort.raise}
+fn evict_to_fit<k, v>(c: Cache<k, v>) -> InsertResult<k, v> / {abort.raise}
   where derivable(ord, k)
 =
-  iterate({ cache: c, evicted: [] }, c.entries.len() + 1, |s: Placed<k, v>|
+  iterate({ cache: c, evicted: [] }, c.entries.len() + 1, |s: InsertResult<k, v>|
     if s.cache.weight <= s.cache.capacity { Stop(s) } else {
       match s.cache.oldest {
         None -> Stop(s),
@@ -252,26 +254,26 @@ fn fitted<k, v>(c: Cache<k, v>) -> Placed<k, v> / {abort.raise}
           Some(e) ->
             Continue({
               cache: unlinked(s.cache, key, e),
-              evicted: s.evicted.push(listing(key, e)),
+              evicted: s.evicted.push(entry_of(key, e)),
             }),
         },
       }
     })
 
 /// `c` without the entry `e` it holds under `key`, its neighbours joined to each other.
-fn unlinked<k, v>(c: Cache<k, v>, key: k, e: Entry<k, v>) -> Cache<k, v>
+fn unlinked<k, v>(c: Cache<k, v>, key: k, e: Node<k, v>) -> Cache<k, v>
   where derivable(ord, k)
 = {
   let apart = c.entries.remove(key);
   let behind = match e.older {
     None -> apart,
-    Some(older) -> apart.update(older, |o: Entry<k, v>| { ..o, newer: e.newer }),
+    Some(older) -> apart.update(older, |o: Node<k, v>| { ..o, newer: e.newer }),
   };
   {
     ..c,
     entries: match e.newer {
       None -> behind,
-      Some(newer) -> behind.update(newer, |n: Entry<k, v>| { ..n, older: e.older }),
+      Some(newer) -> behind.update(newer, |n: Node<k, v>| { ..n, older: e.older }),
     },
     oldest: match e.older { None -> e.newer, Some(_) -> c.oldest },
     newest: match e.newer { None -> e.older, Some(_) -> c.newest },
@@ -280,7 +282,7 @@ fn unlinked<k, v>(c: Cache<k, v>, key: k, e: Entry<k, v>) -> Cache<k, v>
 }
 
 /// `c`, which does not hold `key`, with `e` under it as the most recently used entry.
-fn linked<k, v>(c: Cache<k, v>, key: k, e: Entry<k, v>) -> Cache<k, v>
+fn linked<k, v>(c: Cache<k, v>, key: k, e: Node<k, v>) -> Cache<k, v>
   where derivable(ord, k)
 =
   {
@@ -288,7 +290,7 @@ fn linked<k, v>(c: Cache<k, v>, key: k, e: Entry<k, v>) -> Cache<k, v>
     entries: Map::insert(
       match c.newest {
         None -> c.entries,
-        Some(newest) -> c.entries.update(newest, |n: Entry<k, v>| { ..n, newer: Some(key) }),
+        Some(newest) -> c.entries.update(newest, |n: Node<k, v>| { ..n, newer: Some(key) }),
       },
       key,
       { ..e, older: c.newest, newer: None },
@@ -344,7 +346,7 @@ test "caches holding the same entries in the same order are equal, however each 
   let other = remove(put(filled(3, ["zz", "bb"]), "a", 1, at_millis(5)), "zz");
   assert_eq(keys(one), ["bb", "a"]);
   assert_eq(one, other);
-  assert_eq(of_held(3, None, held(one)), one);
+  assert_eq(of_entries(3, None, entries_by_use(one)), one);
   assert(one != filled(3, ["a", "bb"]));
   assert(one != get(filled(4, ["a", "bb"]), "a", at_millis(0)).cache)
 }
@@ -355,7 +357,7 @@ test "a bound by weight evicts as many of the oldest as the newest needs" {
   let c = weighing(weighing(weighing(lru(10), "a", 4).cache, "b", 3).cache, "c", 3).cache;
   assert_eq(weight(c), 10);
   let pushed = weighing(c, "d", 5);
-  assert_eq(pushed.evicted.map(|h: Held<String, Int>| h.key), ["a", "b"]);
+  assert_eq(pushed.evicted.map(|h: Entry<String, Int>| h.key), ["a", "b"]);
   assert_eq(keys(pushed.cache), ["c", "d"]);
   assert_eq(weight(pushed.cache), 8);
   let refused = weighing(c, "b", 11);
@@ -369,7 +371,9 @@ test "a bound by weight evicts as many of the oldest as the newest needs" {
 test "an entry is answered until its deadline and never from it on" {
   let c = put(expiring(4, seconds(60)), "a", 1, at_millis(1000));
   assert_eq(lifetime(c), Some(seconds(60)));
-  assert_eq(held(c), [{ key: "a", value: 1, weight: 1, expires: Some(at_millis(61000)) }]);
+  assert_eq(entries_by_use(c), [
+    { key: "a", value: 1, weight: 1, expires: Some(at_millis(61000)) },
+  ]);
   assert_eq(get(c, "a", at_millis(60999)).value, Some(1));
   assert_eq(peek(c, "a", at_millis(61000)), None);
   assert(!contains(c, "a", at_millis(61000)));
@@ -393,7 +397,9 @@ test "a lifetime of an entry's own, and a sweep of the ones past theirs" {
   assert_eq(keys(c), ["a", "b", "c"]);
   assert_eq(keys(sweep(c, at_millis(9))), ["a", "b", "c"]);
   assert_eq(keys(sweep(c, at_millis(10))), ["a", "c"]);
-  assert_eq(held(sweep(c, at_millis(1000))), [{ key: "c", value: 3, weight: 1, expires: None }]);
+  assert_eq(entries_by_use(sweep(c, at_millis(1000))), [
+    { key: "c", value: 3, weight: 1, expires: None },
+  ]);
   let full = put(put(c, "d", 4, at_millis(20)), "e", 5, at_millis(20));
   assert_eq(keys(full), ["b", "c", "d", "e"]);
   assert_eq(get(full, "b", at_millis(20)).value, None)
@@ -407,7 +413,7 @@ fn greeting(id: Int) -> String / {directory.name_of} = "hello " ++ directory.nam
 
 test "a handler that keeps a cache in its variable answers a question asked again from it" {
   let none: Cache<Int, String> = lru(2);
-  let ran = handle {
+  let run_script = handle {
     [1, 2, 1, 3, 2].map(greeting)
   } with {
     var state = { cache: none, looked_up: [] },
@@ -430,15 +436,15 @@ test "a handler that keeps a cache in its variable answers a question asked agai
     },
     return said -> { said: said, state: state },
   };
-  assert_eq(ran.said, [
+  assert_eq(run_script.said, [
     "hello user 1",
     "hello user 2",
     "hello user 1",
     "hello user 3",
     "hello user 2",
   ]);
-  assert_eq(ran.state.looked_up, [1, 2, 3, 2]);
-  assert_eq(keys(ran.state.cache), [3, 2])
+  assert_eq(run_script.state.looked_up, [1, 2, 3, 2]);
+  assert_eq(keys(run_script.state.cache), [3, 2])
 }
 
 /// An `Act` as a test draws one.
@@ -464,9 +470,9 @@ type Act = | Put(Int, Int) | Insert(Int, Int, Int, Int) | Get(Int) | Remove(Int)
 
 /// A cache of weight three the scripts run against, and its model: the entries as a list in
 /// order of use, the clock in milliseconds, and what each `Get` answered.
-type Model = { now: Int, held: List<Held<Int, Int>>, answers: List<Option<Int>> }
+type Model = { now: Int, held: List<Entry<Int, Int>>, results: List<Option<Int>> }
 
-type Ran = { cache: Cache<Int, Int>, now: Int, answers: List<Option<Int>> }
+type RunResult = { cache: Cache<Int, Int>, now: Int, results: List<Option<Int>> }
 
 fn a_key(n: Int) -> Int = n & 3
 
@@ -477,59 +483,69 @@ fn a_lifetime(n: Int) -> Option<Int> = if n & 7 == 0 { None } else { Some(n & 7)
 fn span_of(ms: Option<Int>) -> Option<Duration> =
   match ms { None -> None, Some(n) -> Some(millis(n)) }
 
-fn ran(lifetime: Option<Int>, script: List<Act>) -> Ran / {abort.raise} =
-  script.fold({ cache: of_held(3, span_of(lifetime), []), now: 0, answers: [] }, |r: Ran, a: Act|
-    match a {
-      Put(key, value) -> { ..r, cache: put(r.cache, a_key(key), value, at_millis(r.now)) },
-      Insert(key, value, weight, life) ->
-        {
-          ..r,
-          cache: insert(
-            r.cache,
-            a_key(key),
-            value,
-            { weight: a_weight(weight), lifetime: span_of(a_lifetime(life)) },
-            at_millis(r.now),
-          ).cache,
+fn run_script(lifetime: Option<Int>, script: List<Act>) -> RunResult / {abort.raise} =
+  script.fold(
+    { cache: of_entries(3, span_of(lifetime), []), now: 0, results: [] },
+    |r: RunResult, a: Act|
+      match a {
+        Put(key, value) -> { ..r, cache: put(r.cache, a_key(key), value, at_millis(r.now)) },
+        Insert(key, value, weight, life) ->
+          {
+            ..r,
+            cache: insert(
+              r.cache,
+              a_key(key),
+              value,
+              { weight: a_weight(weight), lifetime: span_of(a_lifetime(life)) },
+              at_millis(r.now),
+            ).cache,
+          },
+        Get(key) -> {
+          let read = get(r.cache, a_key(key), at_millis(r.now));
+          { ..r, cache: read.cache, results: r.results.push(read.value) }
         },
-      Get(key) -> {
-        let read = get(r.cache, a_key(key), at_millis(r.now));
-        { ..r, cache: read.cache, answers: r.answers.push(read.value) }
+        Remove(key) -> { ..r, cache: remove(r.cache, a_key(key)) },
+        Wait(ms) -> { ..r, now: r.now + (ms & 3) },
+        Sweep -> { ..r, cache: sweep(r.cache, at_millis(r.now)) },
       },
-      Remove(key) -> { ..r, cache: remove(r.cache, a_key(key)) },
-      Wait(ms) -> { ..r, now: r.now + (ms & 3) },
-      Sweep -> { ..r, cache: sweep(r.cache, at_millis(r.now)) },
-    })
+  )
 
-fn viewed(lifetime: Option<Int>, script: List<Act>) -> Model / {abort.raise} = {
-  let r = ran(lifetime, script);
-  { now: r.now, held: held(r.cache), answers: r.answers }
+fn observed(lifetime: Option<Int>, script: List<Act>) -> Model / {abort.raise} = {
+  let r = run_script(lifetime, script);
+  { now: r.now, held: entries_by_use(r.cache), results: r.results }
 }
 
 fn deadline(now: Int, lifetime: Option<Int>) -> Option<Instant> =
   match lifetime { None -> None, Some(ms) -> Some(at_millis(now + ms)) }
 
-fn past(h: Held<Int, Int>, now: Int) -> Bool =
+fn is_expired_at(h: Entry<Int, Int>, now: Int) -> Bool =
   match h.expires { None -> false, Some(Instant(nanoseconds)) -> now * 1000000 >= nanoseconds }
 
-fn without(held: List<Held<Int, Int>>, key: Int) -> List<Held<Int, Int>> =
-  held.filter(|h: Held<Int, Int>| h.key != key)
+fn without(entries_by_use: List<Entry<Int, Int>>, key: Int) -> List<Entry<Int, Int>> =
+  entries_by_use.filter(|h: Entry<Int, Int>| h.key != key)
 
-fn heft(held: List<Held<Int, Int>>) -> Int =
-  held.fold(0, |total: Int, h: Held<Int, Int>| total + h.weight)
+fn total_weight(entries_by_use: List<Entry<Int, Int>>) -> Int =
+  entries_by_use.fold(0, |total: Int, h: Entry<Int, Int>| total + h.weight)
 
-fn trimmed(held: List<Held<Int, Int>>) -> List<Held<Int, Int>> =
-  match held { [_, ..rest] if heft(held) > 3 -> trimmed(rest), _ -> held }
+fn trimmed(entries_by_use: List<Entry<Int, Int>>) -> List<Entry<Int, Int>> =
+  match entries_by_use {
+    [_, ..rest] if total_weight(entries_by_use) > 3 -> trimmed(rest),
+    _ -> entries_by_use,
+  }
 
-fn model_placed(held: List<Held<Int, Int>>, h: Held<Int, Int>) -> List<Held<Int, Int>> =
-  if h.weight > 3 { without(held, h.key) } else { trimmed(without(held, h.key).push(h)) }
+fn model_insert(
+  entries_by_use: List<Entry<Int, Int>>,
+  h: Entry<Int, Int>,
+) -> List<Entry<Int, Int>> =
+  if h.weight > 3 { without(entries_by_use, h.key) }
+  else { trimmed(without(entries_by_use, h.key).push(h)) }
 
-fn modelled(lifetime: Option<Int>, m: Model, a: Act) -> Model =
+fn model_step(lifetime: Option<Int>, m: Model, a: Act) -> Model =
   match a {
     Put(key, value) ->
       {
         ..m,
-        held: model_placed(m.held, {
+        held: model_insert(m.held, {
           key: a_key(key),
           value: value,
           weight: 1,
@@ -539,32 +555,32 @@ fn modelled(lifetime: Option<Int>, m: Model, a: Act) -> Model =
     Insert(key, value, weight, life) ->
       {
         ..m,
-        held: model_placed(m.held, {
+        held: model_insert(m.held, {
           key: a_key(key),
           value: value,
           weight: a_weight(weight),
           expires: deadline(m.now, a_lifetime(life)),
         }),
       },
-    Get(key) -> match m.held.filter(|h: Held<Int, Int>| h.key == a_key(key)) {
-      [h, ..] -> if past(h, m.now) {
-        { ..m, held: without(m.held, h.key), answers: m.answers.push(None) }
+    Get(key) -> match m.held.filter(|h: Entry<Int, Int>| h.key == a_key(key)) {
+      [h, ..] -> if is_expired_at(h, m.now) {
+        { ..m, held: without(m.held, h.key), results: m.results.push(None) }
       } else {
-        { ..m, held: without(m.held, h.key).push(h), answers: m.answers.push(Some(h.value)) }
+        { ..m, held: without(m.held, h.key).push(h), results: m.results.push(Some(h.value)) }
       },
-      [] -> { ..m, answers: m.answers.push(None) },
+      [] -> { ..m, results: m.results.push(None) },
     },
     Remove(key) -> { ..m, held: without(m.held, a_key(key)) },
     Wait(ms) -> { ..m, now: m.now + (ms & 3) },
-    Sweep -> { ..m, held: m.held.filter(|h: Held<Int, Int>| !past(h, m.now)) },
+    Sweep -> { ..m, held: m.held.filter(|h: Entry<Int, Int>| !is_expired_at(h, m.now)) },
   }
 
 test "an operation does to a cache what it does to a list kept in order of use" {
   gen::check2(gen::list(acts()), acts(), |x: List<Act>, y: Act|
     refines(
-      |script: List<Act>| viewed(None, script),
+      |script: List<Act>| observed(None, script),
       |script: List<Act>, a: Act| script.push(a),
-      |m: Model, a: Act| modelled(None, m, a),
+      |m: Model, a: Act| model_step(None, m, a),
       x,
       y,
     ))
@@ -572,9 +588,9 @@ test "an operation does to a cache what it does to a list kept in order of use" 
 
 test "what a cache holds weighs no more than its capacity, each entry at least one" {
   gen::check2(gen::list(acts()), gen::any_int(), |script: List<Act>, lived: Int| {
-    let c = ran(a_lifetime(lived), script).cache;
-    weight(c) <= capacity(c) && size(c) <= weight(c) && weight(c) == heft(held(c))
-      && held(c).len() == size(c)
+    let c = run_script(a_lifetime(lived), script).cache;
+    weight(c) <= capacity(c) && size(c) <= weight(c) && weight(c) == total_weight(entries_by_use(c))
+      && entries_by_use(c).len() == size(c)
   })
 }
 
@@ -584,8 +600,8 @@ test "an entry is never answered from its deadline on" {
     gen::any_int(),
     gen::any_int(),
     |script: List<Act>, lived: Int, later: Int| {
-      let c = ran(a_lifetime(lived), script).cache;
-      held(c).fold(true, |ok: Bool, h: Held<Int, Int>|
+      let c = run_script(a_lifetime(lived), script).cache;
+      entries_by_use(c).fold(true, |ok: Bool, h: Entry<Int, Int>|
         ok
           && (match h.expires {
             None -> true,

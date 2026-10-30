@@ -35,22 +35,22 @@ fn file(name: String) -> Bytes / {abort.raise} =
 
 /// One case of an RE2 log: a regexp, a string, and the line that says how RE2 matched the two
 /// in each of four ways.
-type Logged = { file: String, line: Int, pattern: String, text: String, results: String }
+type LogCase = { file: String, line: Int, pattern: String, text: String, results: String }
 
-type Reading = {
+type LogParseState = {
   strings: List<String>,
   listing: Bool,
   pattern: String,
   next: Int,
-  cases: List<Logged>,
+  cases: List<LogCase>,
 }
 
 /// The cases of a log. A stanza lists strings and then regexps, each regexp followed by one
 /// line of results a string, in the strings' order.
-fn logged(name: String) -> List<Logged> / {abort.raise} =
+fn log_cases(name: String) -> List<LogCase> / {abort.raise} =
   enumerate(file(name).split(b"\n")).fold(
     { strings: [], listing: false, pattern: "", next: 0, cases: [] },
-    |r: Reading, l: { index: Int, value: Bytes }| {
+    |r: LogParseState, l: { index: Int, value: Bytes }| {
       let first = if l.value.len() == 0 { 0 } else { l.value.at(0) };
       if l.value == b"strings" { { ..r, strings: [], listing: true } }
       else if l.value == b"regexps" { { ..r, listing: false } } else if first == 34 {
@@ -114,7 +114,7 @@ fn bytes_before(text: String, at: Int) -> Int / {abort.raise} =
 
 /// A match as a log writes one: each group's `start-end`, or `-` for a group with none and for
 /// no match at all.
-fn written(re: Regex, text: String) -> String / {abort.raise} =
+fn match_text(re: Regex, text: String) -> String / {abort.raise} =
   match regex::captures(re, text) {
     None -> "-",
     Some(c) ->
@@ -132,9 +132,9 @@ fn written(re: Regex, text: String) -> String / {abort.raise} =
 /// first match or the longest.
 fn one_way(pattern: String, text: String, o: Options) -> String / {abort.raise} =
   match regex::compile_with(pattern, o) {
-    Err(e) -> f"refused at {e.at}: {regex::reason(e.why)}",
+    Err(e) -> f"refused at {e.at}: {regex::reason(e.reason)}",
     Ok(re) -> {
-      let all = written(re, text);
+      let all = match_text(re, text);
       let first = match regex::find(re, text) {
         None -> "-",
         Some(s) -> f"{bytes_before(text, s.start)}-{bytes_before(text, s.end)}",
@@ -145,7 +145,7 @@ fn one_way(pattern: String, text: String, o: Options) -> String / {abort.raise} 
     },
   }
 
-fn four_ways(c: Logged, o: Options) -> String / {abort.raise} = {
+fn four_ways(c: LogCase, o: Options) -> String / {abort.raise} = {
   let whole = "\\A(?:" ++ c.pattern ++ ")\\z";
   String::join(
     [
@@ -160,28 +160,28 @@ fn four_ways(c: Logged, o: Options) -> String / {abort.raise} = {
 
 /// Why a case is set aside, if it is: for syntax this module refuses by name, or for the one
 /// place it reads a pattern RE2 takes otherwise.
-type Aside = | SingleBytes | Octal | BetweenBytes
+type SkipReason = | SingleBytes | Octal | BetweenBytes
 
-fn aside(c: Logged) -> Option<Aside> / {abort.raise} =
+fn skip_reason(c: LogCase) -> Option<SkipReason> / {abort.raise} =
   match regex::compile(c.pattern) {
-    Err({ why: regex::HalfCharacter, .. }) -> Some(SingleBytes),
-    Err({ why: regex::Backreference, .. }) -> Some(Octal),
+    Err({ reason: regex::HalfCharacter, .. }) -> Some(SingleBytes),
+    Err({ reason: regex::Backreference, .. }) -> Some(Octal),
     _ -> if c.pattern.contains("\\B") && Bytes::of_string(c.text).len() != c.text.len() {
       Some(BetweenBytes)
     } else { None },
   }
 
-fn kept(name: String) -> List<Logged> / {abort.raise} =
-  logged(name).filter(|c: Logged| aside(c) == None)
+fn cases_to_run(name: String) -> List<LogCase> / {abort.raise} =
+  log_cases(name).filter(|c: LogCase| skip_reason(c) == None)
 
 type Tally = { cases: Int, run: Int, single_bytes: Int, octal: Int, between_bytes: Int }
 
 fn tally(name: String) -> Tally / {abort.raise} =
-  logged(name).fold(
+  log_cases(name).fold(
     { cases: 0, run: 0, single_bytes: 0, octal: 0, between_bytes: 0 },
-    |t: Tally, c: Logged| {
+    |t: Tally, c: LogCase| {
       let counted = { ..t, cases: t.cases + 1 };
-      match aside(c) {
+      match skip_reason(c) {
         None -> { ..counted, run: t.run + 1 },
         Some(SingleBytes) -> { ..counted, single_bytes: t.single_bytes + 1 },
         Some(Octal) -> { ..counted, octal: t.octal + 1 },
@@ -190,15 +190,15 @@ fn tally(name: String) -> Tally / {abort.raise} =
     },
   )
 
-fn search_log() -> List<Logged> / {abort.raise} = kept("re2-search.txt")
+fn search_log() -> List<LogCase> / {abort.raise} = cases_to_run("re2-search.txt")
 
-fn exhaustive_part() -> List<Logged> / {abort.raise} = kept("re2-exhaustive-sample.txt")
+fn exhaustive_part() -> List<LogCase> / {abort.raise} = cases_to_run("re2-exhaustive-sample.txt")
 
 /// One state at a time, however short the subject.
-fn by_states() -> Options = { ..regex::options(), short: -1 }
+fn one_state_options() -> Options = { ..regex::options(), short: -1 }
 
 /// One state at a time with room for three, so a search runs out and goes on by threads.
-fn cramped() -> Options = { ..regex::options(), short: -1, state_limit: 3 }
+fn small_state_limit_options() -> Options = { ..regex::options(), short: -1, state_limit: 3 }
 
 test "RE2's search log is run but for the cases three rules set aside" {
   assert_eq(tally("re2-search.txt"), {
@@ -220,12 +220,12 @@ test "the part of RE2's exhaustive log is run but for the cases one rule sets as
   })
 }
 
-test "{c.file}:{c.line} is matched as RE2 matches it" for c: Logged in search_log().concat(
+test "{c.file}:{c.line} is matched as RE2 matches it" for c: LogCase in search_log().concat(
     exhaustive_part(),
   ) {
   assert_eq(four_ways(c, regex::options()), c.results);
-  assert_eq(four_ways(c, by_states()), c.results);
-  assert_eq(four_ways(c, cramped()), c.results)
+  assert_eq(four_ways(c, one_state_options()), c.results);
+  assert_eq(four_ways(c, small_state_limit_options()), c.results)
 }
 
 /// One case of AT&T's data: a pattern, a string, and what a POSIX matcher answers for them:
@@ -242,7 +242,7 @@ type Posix = {
   literal: Bool,
 }
 
-type Fields = { last: Bytes, cases: List<Posix> }
+type PosixParseState = { last: Bytes, cases: List<Posix> }
 
 /// The cases of one of AT&T's files, read as Go's `TestFowler` reads them: tabs part a line's
 /// fields, `NULL` is the empty text, `SAME` the pattern of the line before, a `$` among the
@@ -251,16 +251,16 @@ type Fields = { last: Bytes, cases: List<Posix> }
 fn posix_file(name: String) -> List<Posix> / {abort.raise} =
   enumerate(file(name).split(b"\n")).fold(
     { last: b"", cases: [] },
-    |f: Fields, l: { index: Int, value: Bytes }| {
+    |f: PosixParseState, l: { index: Int, value: Bytes }| {
       let fields = l.value.split(b"\t").filter(|x: Bytes| x.len() > 0).map(|x: Bytes|
         if x == b"NULL" { b"" } else { x });
       let flags = flags_of(fields.at_or(0, b""));
       if fields.len() < 4 || flags.len() == 0 || fields.contains(b"NIL") { f } else {
         let escaped = flags.contains(b"$");
-        let written = fields.at_or(1, b"");
-        let pattern = if written == b"SAME" { f.last }
-        else if escaped { unquoted(written, 0, written.len()) }
-        else { written };
+        let match_text = fields.at_or(1, b"");
+        let pattern = if match_text == b"SAME" { f.last }
+        else if escaped { unquoted(match_text, 0, match_text.len()) }
+        else { match_text };
         let subject = fields.at_or(2, b"");
         let one = {
           file: name,
@@ -307,7 +307,7 @@ fn posix_cases() -> List<Posix> / {abort.raise} =
   posix_all().filter(|c: Posix| c.text.is_utf8() && c.pattern.is_utf8())
 
 /// What a match of `re` in `text` is, as AT&T's data writes one, for as many groups as `pairs`.
-fn posix_written(re: Regex, text: String, pairs: Int) -> String / {abort.raise} =
+fn posix_match_text(re: Regex, text: String, pairs: Int) -> String / {abort.raise} =
   match regex::captures(re, text) {
     None -> "NOMATCH",
     Some(c) ->
@@ -331,15 +331,15 @@ test "{c.file}:{c.line} is matched as a POSIX matcher that takes RE2's submatche
   let first = if c.want.len() == 0 { 0 } else { Bytes::of_string(c.want).at(0) };
   let refusing = first >= b'A' && first <= b'Z' && c.want != "NOMATCH";
   let text = String::of_bytes(c.text);
-  let ways = [regex::options(), by_states(), cramped()];
+  let ways = [regex::options(), one_state_options(), small_state_limit_options()];
   assert_eq(
     ways.map(|o: Options|
       match regex::compile_with(posix_pattern(c), { ..o, longest: true }) {
-        Err(e) -> if refusing { c.want } else { f"refused at {e.at}: {regex::reason(e.why)}" },
+        Err(e) -> if refusing { c.want } else { f"refused at {e.at}: {regex::reason(e.reason)}" },
         Ok(re) -> if refusing { "compiled" }
         else if regex::is_match(re, text) != (c.want != "NOMATCH") {
           "is_match and captures disagree"
-        } else { posix_written(re, text, c.want.split("(").len() - 1) },
+        } else { posix_match_text(re, text, c.want.split("(").len() - 1) },
       }),
     [c.want, c.want, c.want],
   )
@@ -379,9 +379,9 @@ test "Go's table of matches is run but for the six texts that are not UTF-8" {
 
 /// The first `most` matches of a pattern compiled as `o` says, or all of them where `most` is
 /// negative, as the table writes them; or how `find_all` and `split` fail to agree with them.
-fn found(c: Finding, o: Options) -> String / {abort.raise} =
+fn find_matches_text(c: Finding, o: Options) -> String / {abort.raise} =
   match regex::compile_with(c.pattern, o) {
-    Err(e) -> f"refused at {e.at}: {regex::reason(e.why)}",
+    Err(e) -> f"refused at {e.at}: {regex::reason(e.reason)}",
     Ok(re) -> {
       let text = String::of_bytes(c.text);
       let all = regex::captures_all(re, text);
@@ -408,7 +408,7 @@ fn found(c: Finding, o: Options) -> String / {abort.raise} =
   }
 
 test "go-find.txt:{c.line} finds the matches Go finds" for c: Finding in findings() {
-  assert_eq(found(c, regex::options()), c.matches);
-  assert_eq(found(c, by_states()), c.matches);
-  assert_eq(found(c, cramped()), c.matches)
+  assert_eq(find_matches_text(c, regex::options()), c.matches);
+  assert_eq(find_matches_text(c, one_state_options()), c.matches);
+  assert_eq(find_matches_text(c, small_state_limit_options()), c.matches)
 }

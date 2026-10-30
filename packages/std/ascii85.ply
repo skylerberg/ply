@@ -11,7 +11,7 @@
 //! of a decode is the text. Five `!` where a `z` belongs, a `z` inside a group, a group past what
 //! four bytes hold, a last group of one character, a last group whose cut-off digits were not the
 //! ones `encode` cuts, and whitespace are each refused. A text a PostScript writer broke into
-//! lines is read once `unwrapped` has joined it.
+//! lines is read once `strip_whitespace` has joined it.
 
 import std.bytes (u32_be)
 import std.laws (round_trip)
@@ -24,7 +24,9 @@ pub fn encode(data: Bytes) -> String / {abort.raise}
 = {
   let n = data.len();
   String::of_bytes(
-    Bytes::concat_all(range(0, (n + 3) / 4).map(|g: Int| group(data, g * 4, min(4, n - g * 4)))),
+    Bytes::concat_all(
+      range(0, (n + 3) / 4).map(|g: Int| encode_group(data, g * 4, min(4, n - g * 4))),
+    ),
   )
 }
 
@@ -32,7 +34,7 @@ pub fn encode(data: Bytes) -> String / {abort.raise}
 pub fn decode(text: String) -> Option<Bytes> / {abort.raise} = {
   let runs = Bytes::of_string(text).split(b"z");
   let read = somes(
-    range(0, runs.len()).map(|i: Int| run_bytes(runs.at_or(i, b""), i + 1 == runs.len())),
+    range(0, runs.len()).map(|i: Int| decode_run(runs.at_or(i, b""), i + 1 == runs.len())),
   );
   // Each `z` between two runs is four zero bytes.
   if read.len() == runs.len() { Some(Bytes::join(read, b"\x00\x00\x00\x00")) } else { None }
@@ -50,7 +52,7 @@ pub fn decode_framed(text: String) -> Option<Bytes> / {abort.raise} = {
 
 /// `text` without the whitespace Adobe's readers skip: space, tab, line feed, form feed, carriage
 /// return and NUL. What a writer broke into lines is then the text a decoder here reads.
-pub fn unwrapped(text: String) -> String / {abort.raise} =
+pub fn strip_whitespace(text: String) -> String / {abort.raise} =
   String::of_bytes(
     [b" ", b"\t", b"\n", b"\x0c", b"\r", b"\x00"].fold(
       Bytes::of_string(text),
@@ -58,11 +60,11 @@ pub fn unwrapped(text: String) -> String / {abort.raise} =
     ),
   )
 
-/// The characters of the `have` bytes at `at`, one to four of them.
-fn group(data: Bytes, at: Int, have: Int) -> Bytes / {abort.raise} = {
+/// The characters of the `count` bytes at `at`, one to four of them.
+fn encode_group(data: Bytes, at: Int, count: Int) -> Bytes / {abort.raise} = {
   let v = range(0, 4).fold(0, |m: Int, k: Int|
-    m << 8 | (if k < have { data.at(at + k) } else { 0 }));
-  if v == 0 && have == 4 { b"z" } else { digits(v).slice(0, have + 1) }
+    m << 8 | (if k < count { data.at(at + k) } else { 0 }));
+  if v == 0 && count == 4 { b"z" } else { digits(v).slice(0, count + 1) }
 }
 
 /// `v` in base 85, five characters, most significant first.
@@ -71,27 +73,27 @@ fn digits(v: Int) -> Bytes / {abort.raise} =
 
 /// The bytes of the characters between two `z`s, or after the last: whole groups, and after the
 /// last `z` a shorter group too.
-fn run_bytes(run: Bytes, last: Bool) -> Option<Bytes> / {abort.raise} = {
+fn decode_run(run: Bytes, last: Bool) -> Option<Bytes> / {abort.raise} = {
   let n = run.len();
   let whole = n / 5;
   let rest = n % 5;
-  let values = range(0, whole).map(|g: Int| number(run, g * 5, 5));
+  let values = range(0, whole).map(|g: Int| group_value(run, g * 5, 5));
   if run.position(0, |c: Int| c < 33 || c > 117) != None { None }
   else if rest == 1 || (rest > 0 && !last) { None }
   else if values.fold(false, |bad: Bool, v: Int| bad || v == 0 || v > 0xFFFF_FFFF) { None } else {
     let full = Bytes::concat_all(values.map(u32_be));
     if rest == 0 { Some(full) } else {
-      let v = number(run, whole * 5, rest);
+      let v = group_value(run, whole * 5, rest);
       let tail = u32_be(v & 0xFFFF_FFFF).slice(0, rest - 1);
-      if v > 0xFFFF_FFFF || group(tail, 0, rest - 1) != run.slice(whole * 5, n) { None }
+      if v > 0xFFFF_FFFF || encode_group(tail, 0, rest - 1) != run.slice(whole * 5, n) { None }
       else { Some(full.concat(tail)) }
     }
   }
 }
 
-/// The number the `have` characters at `at` write, a short group filled with `u`.
-fn number(run: Bytes, at: Int, have: Int) -> Int / {abort.raise} =
-  range(0, 5).fold(0, |m: Int, k: Int| m * 85 + (if k < have { run.at(at + k) - 33 } else { 84 }))
+/// The number the `count` characters at `at` write, a short group filled with `u`.
+fn group_value(run: Bytes, at: Int, count: Int) -> Int / {abort.raise} =
+  range(0, 5).fold(0, |m: Int, k: Int| m * 85 + (if k < count { run.at(at + k) - 33 } else { 84 }))
 
 // --- Tests ------------------------------------------------------------------
 
@@ -159,6 +161,6 @@ test "the frame is PostScript's, and a wrapped text is read once it is unwrapped
   assert_eq(decode_framed("!!9`~>"), None);
   assert_eq(decode_framed("<~>"), None);
   assert_eq(decode_framed("<~9jqo^\n~>"), None);
-  assert_eq(unwrapped("<~9jqo^\r\n Bla\t~>\n"), "<~9jqo^Bla~>");
-  assert_eq(decode_framed(unwrapped("<~9jqo^\r\n Bla\t~>\n")), Some(b"Man is"))
+  assert_eq(strip_whitespace("<~9jqo^\r\n Bla\t~>\n"), "<~9jqo^Bla~>");
+  assert_eq(decode_framed(strip_whitespace("<~9jqo^\r\n Bla\t~>\n")), Some(b"Man is"))
 }

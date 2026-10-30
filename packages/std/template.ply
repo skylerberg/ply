@@ -69,7 +69,7 @@ import std.value (Entry, Field, VArray, VBool, VBytes, VChar, VCtor, VDecimal, V
 // --- What is read and what is refused -----------------------------------------
 
 /// Why a template is refused where it is read, or why it has no filling.
-pub type Why =
+pub type ErrorKind =
   /// A `{{` that no `}}` closes.
   | Unclosed
   /// An action that is none of the language's, with what was expected there: `a path`.
@@ -80,7 +80,7 @@ pub type Why =
   | Unopened(String)
   /// An `if` or a `for`, as written, that no `end` closes.
   | Unended(String)
-  /// Blocks nested deeper than `deepest`.
+  /// Blocks nested deeper than `max_depth`.
   | Nested
   /// As HTML: markup `std.html`'s reader refuses, with what it said.
   | Markup(String)
@@ -111,16 +111,16 @@ pub type Why =
 
 /// A template refused: the character of its text the reader stood at, that character's line and
 /// column, both from 1, and why.
-pub type Refusal = new { offset: Int, line: Int, column: Int, why: Why }
+pub type Error = new { offset: Int, line: Int, column: Int, reason: ErrorKind }
 
 /// A filling that failed: the template it failed in, `None` for the one being filled and the
 /// name of an included one otherwise; the character of that template's text its action starts
 /// at; and why.
-pub type Failure = new { partial: Option<String>, offset: Int, why: Why }
+pub type Failure = new { partial: Option<String>, offset: Int, reason: ErrorKind }
 
 /// What a filling is held to: how many bytes it may write, counted before a value's characters
 /// are escaped; how many passes its loops and includes may make between them; and how deep an
-/// include may stand inside others, which is never deeper than `deepest()` whatever is asked.
+/// include may stand inside others, which is never deeper than `max_depth()` whatever is asked.
 pub type Limits = new { output: Int, iterations: Int, depth: Int }
 
 /// Limits for a page: a mebibyte of output, ten thousand passes, and includes sixteen deep.
@@ -128,18 +128,18 @@ pub fn default_limits() -> Limits = { output: 1048576, iterations: 10000, depth:
 
 /// How deep the blocks of a template may nest, and its includes: each level nests a few calls of
 /// the program that fills it, and this many of both stay well inside what calls may nest.
-pub fn deepest() -> Int = 32
+pub fn max_depth() -> Int = 32
 
 /// What reading and filling raise where they refuse.
 pub effect template {
   /// The text is no template, or as HTML none that writes every value as text.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// The template has no filling from this data within these limits.
   raise failed(e: Failure)
 }
 
 /// A reason as a sentence.
-pub fn explain(why: Why) -> String =
+pub fn explain(why: ErrorKind) -> String =
   match why {
     Unclosed -> "this `{{` is not closed by a `}}`",
     Expected(what) -> "expected " ++ what,
@@ -149,8 +149,8 @@ pub fn explain(why: Why) -> String =
     Unopened(word) -> "this `" ++ word ++ "` has no `if` or `for` open before it",
     Unended(word) -> "this `" ++ word ++ "` is not closed by an `end`",
     Nested -> "blocks are nested deeper than a template may nest them",
-    Markup(said) -> said,
-    Misplaced(said) -> said,
+    Markup(message) -> message,
+    Misplaced(message) -> message,
     Uneven -> "the branches here leave the markup at different places",
     EscapedTwice(pipe) ->
       "the template escapes this value where it stands, so `" ++ pipe ++ "` would escape it twice",
@@ -161,8 +161,8 @@ pub fn explain(why: Why) -> String =
     TooLong -> "the output is past its limit",
     TooManyPasses -> "the loops and includes made more passes than their limit",
     TooDeep -> "includes are nested deeper than their limit",
-    Defect(said) ->
-      "std.template failed, which is its defect and no fault of the template: " ++ said,
+    Defect(message) ->
+      "std.template failed, which is its defect and no fault of the template: " ++ message,
   }
 
 /// The line and the column, both from 1, of the character at `offset` of `source`: where a
@@ -178,7 +178,7 @@ type Token = | Word(String) | Quote(String) | Number(Int) | Dot | Bar | Comma
 
 /// What an action reads: the value at a path, from the data alone where the flag is set and else
 /// from a loop's variable of the first name where there is one; or a value written out.
-type Operand = | Path(Bool, List<String>) | Written(Value)
+type Operand = | Path(Bool, List<String>) | Literal(Value)
 
 type Pipe = | AsHtml | AsUrl | AsJson | Upper | Lower | Length | Default(Operand) | Join(Operand)
 
@@ -195,14 +195,14 @@ type Action =
 
 /// A template's own text: as it is where the template is text, and as `std.html` read it where
 /// it is HTML.
-type Chunk = | Plain(String) | Read(html::Run)
+type Chunk = | Plain(String) | HtmlRun(html::Run)
 
 /// Where a value is written: anywhere in a text, and in the hole `std.html` read in markup.
 type Spot = | Anywhere | In(html::Hole)
 
 type Lit = { chunk: Chunk, size: Int, at: Int }
 
-type Shown = { value: Expr, spot: Spot, at: Int }
+type Interpolation = { value: Expr, position: Spot, at: Int }
 
 type Arm = { cond: Expr, at: Int, body: List<Node> }
 
@@ -215,35 +215,40 @@ type Loop = {
   empty: List<Node>,
 }
 
-type Included = { name: String, data: Expr, spot: Spot, at: Int }
+type Inclusion = { name: String, data: Expr, position: Spot, at: Int }
 
-type Node = | Text(Lit) | Show(Shown) | When(List<Arm>, List<Node>) | Each(Loop) | Include(Included)
+type Node =
+  | Text(Lit)
+  | Show(Interpolation)
+  | When(List<Arm>, List<Node>)
+  | Each(Loop)
+  | Include(Inclusion)
 
 /// A template once read. Only this module's readers answer one, so an HTML template's every
 /// value has a place `std.html` read for it.
 pub opaque type Template = new { markup: Bool, nodes: List<Node> }
 
 /// Where the reader stands, in characters, or what it found there.
-effect fault {
-  raise at(offset: Int, why: Why)
+effect read_error {
+  raise at(offset: Int, why: ErrorKind)
 }
 
-fn stop<a>(src: Bytes, byte: Int, why: Why) -> a / {fault.at, abort.raise} =
-  fault.at(String::of_bytes_lossy(src.slice(0, byte)).len(), why)
+fn read_error_at<a>(src: Bytes, byte: Int, why: ErrorKind) -> a / {read_error.at, abort.raise} =
+  read_error.at(String::of_bytes_lossy(src.slice(0, byte)).len(), why)
 
 fn blank() -> Bytes = b" \t\r\n"
 
-fn naming() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+fn name_characters() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
 
 /// An action's tokens, where the text goes on after its `}}`, and whether a `-` before that
 /// drops the blanks that follow.
 type Tokens = { tokens: List<Token>, next: Int, trim: Bool }
 
-type Tokening = { at: Int, tokens: List<Token> }
+type TokenizerState = { at: Int, tokens: List<Token> }
 
 type Quoted = { text: String, next: Int }
 
-type Quoting = { at: Int, parts: List<Bytes> }
+type QuoteState = { at: Int, parts: List<Bytes> }
 
 fn escaped(c: Int) -> Option<Bytes> =
   match c {
@@ -255,91 +260,95 @@ fn escaped(c: Int) -> Option<Bytes> =
   }
 
 /// The text written between the `"` before `from` and the next one.
-fn quoted(src: Bytes, from: Int, open: Int) -> Quoted / {fault.at, abort.raise} =
-  iterate({ at: from, parts: [] }, src.len() - from + 2, |s: Quoting| {
+fn read_quoted(src: Bytes, from: Int, open: Int) -> Quoted / {read_error.at, abort.raise} =
+  iterate({ at: from, parts: [] }, src.len() - from + 2, |s: QuoteState| {
     let to = src.skip_until(s.at, b"\"\\");
     let kept = s.parts.push(src.slice(s.at, to));
-    if src.peek(to) < 0 { stop(src, open, Unclosed) } else if src.peek(to) == b'"' {
+    if src.peek(to) < 0 { read_error_at(src, open, Unclosed) } else if src.peek(to) == b'"' {
       Stop({ text: String::of_bytes(Bytes::concat_all(kept)), next: to + 1 })
     } else {
       match escaped(src.peek(to + 1)) {
-        Some(written) -> Continue({ at: to + 2, parts: kept.push(written) }),
-        None -> stop(src, to, Expected("`\\\\`, `\\\"`, `\\n` or `\\t` after a `\\`")),
+        Some(fill_template) -> Continue({ at: to + 2, parts: kept.push(fill_template) }),
+        None -> read_error_at(src, to, Expected("`\\\\`, `\\\"`, `\\n` or `\\t` after a `\\`")),
       }
     }
   })
 
-fn number(src: Bytes, at: Int) -> { value: Int, next: Int } / {fault.at, abort.raise} = {
+fn read_number(src: Bytes, at: Int) -> { value: Int, next: Int } / {read_error.at, abort.raise} = {
   let negative = src.peek(at) == b'-';
   let from = if negative { at + 1 } else { at };
   let to = src.skip(from, b"0123456789");
   match src.slice(from, to).int_of_ascii() {
     Some(n) -> { value: if negative { 0 - n } else { n }, next: to },
-    None -> stop(src, at, Expected("a number an `Int` holds")),
+    None -> read_error_at(src, at, Expected("a number an `Int` holds")),
   }
 }
 
 /// The tokens of the action that opened at `open`, read from `from`.
-fn tokens(src: Bytes, from: Int, open: Int) -> Tokens / {fault.at, abort.raise} =
-  iterate({ at: from, tokens: [] }, src.len() - from + 2, |s: Tokening| {
+fn read_action_tokens(src: Bytes, from: Int, open: Int) -> Tokens / {read_error.at, abort.raise} =
+  iterate({ at: from, tokens: [] }, src.len() - from + 2, |s: TokenizerState| {
     let at = src.skip(s.at, blank());
     let c = src.peek(at);
     let one = |token: Token, next: Int| Continue({ at: next, tokens: s.tokens.push(token) });
-    if c < 0 { stop(src, open, Unclosed) } else if c == b'}' && src.peek(at + 1) == b'}' {
+    if c < 0 { read_error_at(src, open, Unclosed) } else if c == b'}' && src.peek(at + 1) == b'}' {
       Stop({ tokens: s.tokens, next: at + 2, trim: false })
     } else if c == b'-' && src.peek(at + 1) == b'}' && src.peek(at + 2) == b'}' {
       Stop({ tokens: s.tokens, next: at + 3, trim: true })
     } else if c == b'"' {
-      let read = quoted(src, at + 1, open);
+      let read = read_quoted(src, at + 1, open);
       one(Quote(read.text), read.next)
     } else if is_digit(c) || (c == b'-' && is_digit(src.peek(at + 1))) {
-      let read = number(src, at);
+      let read = read_number(src, at);
       one(Number(read.value), read.next)
     } else if is_letter(c) || c == b'_' {
-      let to = src.skip(at, naming());
+      let to = src.skip(at, name_characters());
       one(Word(String::of_bytes(src.slice(at, to))), to)
     } else if c == b'.' { one(Dot, at + 1) }
     else if c == b'|' { one(Bar, at + 1) }
     else if c == b',' { one(Comma, at + 1) }
-    else { stop(src, at, Expected("a name, a value written out, `.`, `|`, `,` or `}}`")) }
+    else { read_error_at(src, at, Expected("a name, a value written out, `.`, `|`, `,` or `}}`")) }
   })
 
 /// A comment's end, read from its `!`.
-fn commented(src: Bytes, from: Int, open: Int) -> Tokens / {fault.at, abort.raise} =
+fn skip_comment(src: Bytes, from: Int, open: Int) -> Tokens / {read_error.at, abort.raise} =
   match src.index_of_from(b"}}", from) {
-    None -> stop(src, open, Unclosed),
+    None -> read_error_at(src, open, Unclosed),
     Some(close) -> { tokens: [], next: close + 2, trim: src.peek(close - 1) == b'-' },
   }
 
-type Operated = { operand: Operand, rest: List<Token> }
+type OperandResult = { operand: Operand, rest: List<Token> }
 
-fn dotted(tokens: List<Token>, rooted: Bool, names: List<String>) -> Result<Operated, Why> =
-  match tokens {
-    [Dot, Word(name), ..rest] -> dotted(rest, rooted, names.push(name)),
+fn read_path(
+  read_action_tokens: List<Token>,
+  rooted: Bool,
+  names: List<String>,
+) -> Result<OperandResult, ErrorKind> =
+  match read_action_tokens {
+    [Dot, Word(name), ..rest] -> read_path(rest, rooted, names.push(name)),
     [Dot, ..] -> Err(Expected("a name after `.`")),
-    _ -> Ok({ operand: Path(rooted, names), rest: tokens }),
+    _ -> Ok({ operand: Path(rooted, names), rest: read_action_tokens }),
   }
 
-fn operand(tokens: List<Token>) -> Result<Operated, Why> =
-  match tokens {
-    [Quote(text), ..rest] -> Ok({ operand: Written(VStr(text)), rest: rest }),
-    [Number(n), ..rest] -> Ok({ operand: Written(VInt(n)), rest: rest }),
-    [Word("true"), ..rest] -> Ok({ operand: Written(VBool(true)), rest: rest }),
-    [Word("false"), ..rest] -> Ok({ operand: Written(VBool(false)), rest: rest }),
-    [Dot, Word(name), ..rest] -> dotted(rest, true, [name]),
+fn operand(read_action_tokens: List<Token>) -> Result<OperandResult, ErrorKind> =
+  match read_action_tokens {
+    [Quote(text), ..rest] -> Ok({ operand: Literal(VStr(text)), rest: rest }),
+    [Number(n), ..rest] -> Ok({ operand: Literal(VInt(n)), rest: rest }),
+    [Word("true"), ..rest] -> Ok({ operand: Literal(VBool(true)), rest: rest }),
+    [Word("false"), ..rest] -> Ok({ operand: Literal(VBool(false)), rest: rest }),
+    [Dot, Word(name), ..rest] -> read_path(rest, true, [name]),
     [Dot, ..rest] -> Ok({ operand: Path(true, []), rest: rest }),
-    [Word(name), ..rest] -> dotted(rest, false, [name]),
+    [Word(name), ..rest] -> read_path(rest, false, [name]),
     _ -> Err(Expected("a path, `.` or a value written out")),
   }
 
-type Piped = { pipe: Pipe, rest: List<Token> }
+type PipeResult = { pipe: Pipe, rest: List<Token> }
 
-fn pipe(name: String, tokens: List<Token>) -> Result<Piped, Why> = {
-  let plain = |p: Pipe| Ok({ pipe: p, rest: tokens });
-  let taking = |made: (Operand) -> Pipe|
-    match operand(tokens) {
+fn pipe(name: String, read_action_tokens: List<Token>) -> Result<PipeResult, ErrorKind> = {
+  let plain = |p: Pipe| Ok({ pipe: p, rest: read_action_tokens });
+  let taking = |build_template: (Operand) -> Pipe|
+    match operand(read_action_tokens) {
       Err(why) -> Err(why),
-      Ok(read) -> Ok({ pipe: made(read.operand), rest: read.rest }),
+      Ok(read) -> Ok({ pipe: build_template(read.operand), rest: read.rest }),
     };
   match name {
     "html" -> plain(AsHtml),
@@ -354,27 +363,28 @@ fn pipe(name: String, tokens: List<Token>) -> Result<Piped, Why> = {
   }
 }
 
-type Piping = { rest: List<Token>, pipes: List<Pipe> }
+type PipeState = { rest: List<Token>, pipes: List<Pipe> }
 
-fn expression(tokens: List<Token>) -> Result<Expr, Why> / {abort.raise} =
-  match operand(tokens) {
+fn expression(read_action_tokens: List<Token>) -> Result<Expr, ErrorKind> / {abort.raise} =
+  match operand(read_action_tokens) {
     Err(why) -> Err(why),
     Ok(read) ->
-      iterate({ rest: read.rest, pipes: [] }, tokens.len() + 1, |s: Piping|
+      iterate({ rest: read.rest, pipes: [] }, read_action_tokens.len() + 1, |s: PipeState|
         match s.rest {
           [] -> Stop(Ok({ from: read.operand, pipes: s.pipes })),
           [Bar, Word(name), ..rest] -> match pipe(name, rest) {
             Err(why) -> Stop(Err(why)),
-            Ok(piped) -> Continue({ rest: piped.rest, pipes: s.pipes.push(piped.pipe) }),
+            Ok(apply_pipe) ->
+              Continue({ rest: apply_pipe.rest, pipes: s.pipes.push(apply_pipe.pipe) }),
           },
           _ -> Stop(Err(Expected("`|` and a pipe's name, or the end of the action"))),
         }),
   }
 
-fn action(tokens: List<Token>) -> Result<Action, Why> / {abort.raise} = {
-  let of = |rest: List<Token>, made: (Expr) -> Action|
-    match expression(rest) { Err(why) -> Err(why), Ok(e) -> Ok(made(e)) };
-  match tokens {
+fn action(read_action_tokens: List<Token>) -> Result<Action, ErrorKind> / {abort.raise} = {
+  let of = |rest: List<Token>, build_template: (Expr) -> Action|
+    match expression(rest) { Err(why) -> Err(why), Ok(e) -> Ok(build_template(e)) };
+  match read_action_tokens {
     [] -> Err(Expected("an action between `{{` and `}}`")),
     [Word("end")] -> Ok(End),
     [Word("else")] -> Ok(Else),
@@ -388,18 +398,22 @@ fn action(tokens: List<Token>) -> Result<Action, Why> / {abort.raise} = {
     [Word("include"), Quote(name), ..rest] -> of(rest, |e: Expr| Includes(name, e)),
     [Word("include"), ..] -> Err(Expected("`include`, a template's name in quotes, and its data")),
     [Word("end"), ..] | [Word("else"), ..] -> Err(Expected("`}}` after this word")),
-    _ -> of(tokens, |e: Expr| Shows(e)),
+    _ -> of(read_action_tokens, |e: Expr| Shows(e)),
   }
 }
 
 /// A template's text between two actions, or an action, each with the character it starts at.
-type Piece = | Raw(String, Int) | Act(Action, Int)
+type Piece = | TextPiece(String, Int) | ActionPiece(Action, Int)
 
-type Lexing = { at: Int, chars: Int, trim: Bool, pieces: List<Piece> }
+type LexerState = { at: Int, chars: Int, trim: Bool, pieces: List<Piece> }
 
 /// `chunk` without the blanks at its start where `left` and at its end where `right`, and how
 /// many characters were dropped before it.
-fn trimmed(chunk: Bytes, left: Bool, right: Bool) -> { text: Bytes, dropped: Int } / {abort.raise} = {
+fn trim_blanks(
+  chunk: Bytes,
+  left: Bool,
+  right: Bool,
+) -> { text: Bytes, dropped: Int } / {abort.raise} = {
   let n = chunk.len();
   let from = if left { chunk.skip(0, blank()) } else { 0 };
   let to = if !right { n } else {
@@ -411,36 +425,37 @@ fn trimmed(chunk: Bytes, left: Bool, right: Bool) -> { text: Bytes, dropped: Int
 }
 
 /// The lexing past the text that runs to `to`, where an action opens or the template ends.
-fn texted(src: Bytes, s: Lexing, to: Int, right: Bool) -> Lexing / {abort.raise} = {
+fn add_text(src: Bytes, s: LexerState, to: Int, right: Bool) -> LexerState / {abort.raise} = {
   let chunk = src.slice(s.at, to);
-  let kept = trimmed(chunk, s.trim, right);
+  let kept = trim_blanks(chunk, s.trim, right);
   {
     at: to,
     chars: s.chars + String::of_bytes(chunk).len(),
     trim: false,
     pieces: if kept.text.len() == 0 { s.pieces }
-    else { s.pieces.push(Raw(String::of_bytes(kept.text), s.chars + kept.dropped)) },
+    else { s.pieces.push(TextPiece(String::of_bytes(kept.text), s.chars + kept.dropped)) },
   }
 }
 
-fn pieces(src: Bytes) -> List<Piece> / {fault.at, abort.raise} =
-  iterate({ at: 0, chars: 0, trim: false, pieces: [] }, src.len() + 2, |s: Lexing|
+fn lex(src: Bytes) -> List<Piece> / {read_error.at, abort.raise} =
+  iterate({ at: 0, chars: 0, trim: false, pieces: [] }, src.len() + 2, |s: LexerState|
     match src.index_of_from(b"{{", s.at) {
-      None -> Stop(texted(src, s, src.len(), false).pieces),
+      None -> Stop(add_text(src, s, src.len(), false).pieces),
       Some(open) -> {
         let trims = src.peek(open + 2) == b'-';
-        let before = texted(src, s, open, trims);
+        let before = add_text(src, s, open, trims);
         let from = if trims { open + 3 } else { open + 2 };
         let comment = src.peek(from) == b'!';
-        let read = if comment { commented(src, from, open) } else { tokens(src, from, open) };
+        let read = if comment { skip_comment(src, from, open) }
+        else { read_action_tokens(src, from, open) };
         Continue({
           at: read.next,
           chars: before.chars + String::of_bytes(src.slice(open, read.next)).len(),
           trim: read.trim,
           pieces: if comment { before.pieces } else {
             match action(read.tokens) {
-              Ok(a) -> before.pieces.push(Act(a, before.chars)),
-              Err(why) -> fault.at(before.chars, why),
+              Ok(a) -> before.pieces.push(ActionPiece(a, before.chars)),
+              Err(why) -> read_error.at(before.chars, why),
             }
           },
         })
@@ -452,74 +467,74 @@ fn pieces(src: Bytes) -> List<Piece> / {fault.at, abort.raise} =
 /// What a block being read is: the template itself; an `if`, with its finished arms, and the
 /// condition of the one being read and where it is written; an `if`'s `else`; a `for`'s body; and
 /// a `for`'s `else`.
-type Frame =
-  | Top
-  | Iffing(List<Arm>, Expr, Int)
-  | Elsing(List<Arm>)
-  | Looping(Loop)
-  | Emptying(Loop)
+type Frame = | Top | InIf(List<Arm>, Expr, Int) | InElse(List<Arm>) | InFor(Loop) | InForElse(Loop)
 
-type Open = { frame: Frame, at: Int, nodes: List<Node> }
+type OpenBlock = { frame: Frame, at: Int, nodes: List<Node> }
 
-type Building = { below: List<Open>, top: Open }
+type BlockStack = { below: List<OpenBlock>, top: OpenBlock }
 
-fn added(b: Building, n: Node) -> Building = { ..b, top: { ..b.top, nodes: b.top.nodes.push(n) } }
+fn add_node(b: BlockStack, n: Node) -> BlockStack =
+  { ..b, top: { ..b.top, nodes: b.top.nodes.push(n) } }
 
-fn opened(b: Building, frame: Frame, at: Int) -> Building / {fault.at} =
-  if b.below.len() >= deepest() { fault.at(at, Nested) }
+fn open_block(b: BlockStack, frame: Frame, at: Int) -> BlockStack / {read_error.at} =
+  if b.below.len() >= max_depth() { read_error.at(at, Nested) }
   else { { below: b.below.push(b.top), top: { frame: frame, at: at, nodes: [] } } }
 
-fn closed(b: Building, n: Node, at: Int) -> Building / {fault.at} =
+fn close_block(b: BlockStack, n: Node, at: Int) -> BlockStack / {read_error.at} =
   match b.below.last() {
-    None -> fault.at(at, Unopened("end")),
+    None -> read_error.at(at, Unopened("end")),
     Some(under) ->
       { below: b.below.take(b.below.len() - 1), top: { ..under, nodes: under.nodes.push(n) } },
   }
 
-fn acted(b: Building, action: Action, at: Int) -> Building / {fault.at} = {
+fn apply_action(b: BlockStack, action: Action, at: Int) -> BlockStack / {read_error.at} = {
   let top = b.top;
   let arms = |done: List<Arm>, cond: Expr, cond_at: Int|
     done.push({ cond: cond, at: cond_at, body: top.nodes });
   let turned = |frame: Frame| { ..b, top: { ..top, frame: frame, nodes: [] } };
   match action {
-    Shows(e) -> added(b, Show({ value: e, spot: Anywhere, at: at })),
-    Includes(name, e) -> added(b, Include({ name: name, data: e, spot: Anywhere, at: at })),
-    If(e) -> opened(b, Iffing([], e, at), at),
-    For(key, item, over) ->
-      opened(b, Looping({ key: key, item: item, over: over, at: at, body: [], empty: [] }), at),
+    Shows(e) -> add_node(b, Show({ value: e, position: Anywhere, at: at })),
+    Includes(name, e) -> add_node(b, Include({ name: name, data: e, position: Anywhere, at: at })),
+    If(e) -> open_block(b, InIf([], e, at), at),
+    For(key, item, render_with_partials) ->
+      open_block(
+        b,
+        InFor({ key: key, item: item, over: render_with_partials, at: at, body: [], empty: [] }),
+        at,
+      ),
     ElseIf(e) -> match top.frame {
-      Iffing(done, cond, cond_at) -> turned(Iffing(arms(done, cond, cond_at), e, at)),
-      _ -> fault.at(at, Unopened("else if")),
+      InIf(done, cond, cond_at) -> turned(InIf(arms(done, cond, cond_at), e, at)),
+      _ -> read_error.at(at, Unopened("else if")),
     },
     Else -> match top.frame {
-      Iffing(done, cond, cond_at) -> turned(Elsing(arms(done, cond, cond_at))),
-      Looping(l) -> turned(Emptying({ ..l, body: top.nodes })),
-      _ -> fault.at(at, Unopened("else")),
+      InIf(done, cond, cond_at) -> turned(InElse(arms(done, cond, cond_at))),
+      InFor(l) -> turned(InForElse({ ..l, body: top.nodes })),
+      _ -> read_error.at(at, Unopened("else")),
     },
     End -> match top.frame {
-      Top -> fault.at(at, Unopened("end")),
-      Iffing(done, cond, cond_at) -> closed(b, When(arms(done, cond, cond_at), []), at),
-      Elsing(done) -> closed(b, When(done, top.nodes), at),
-      Looping(l) -> closed(b, Each({ ..l, body: top.nodes }), at),
-      Emptying(l) -> closed(b, Each({ ..l, empty: top.nodes }), at),
+      Top -> read_error.at(at, Unopened("end")),
+      InIf(done, cond, cond_at) -> close_block(b, When(arms(done, cond, cond_at), []), at),
+      InElse(done) -> close_block(b, When(done, top.nodes), at),
+      InFor(l) -> close_block(b, Each({ ..l, body: top.nodes }), at),
+      InForElse(l) -> close_block(b, Each({ ..l, empty: top.nodes }), at),
     },
   }
 }
 
-fn built(pieces: List<Piece>) -> List<Node> / {fault.at} = {
-  let end = pieces.fold(
+fn build_nodes(lex: List<Piece>) -> List<Node> / {read_error.at} = {
+  let end = lex.fold(
     { below: [], top: { frame: Top, at: 0, nodes: [] } },
-    |b: Building, p: Piece|
+    |b: BlockStack, p: Piece|
       match p {
-        Raw(text, at) ->
-          added(b, Text({ chunk: Plain(text), size: Bytes::of_string(text).len(), at: at })),
-        Act(a, at) -> acted(b, a, at),
+        TextPiece(text, at) ->
+          add_node(b, Text({ chunk: Plain(text), size: Bytes::of_string(text).len(), at: at })),
+        ActionPiece(a, at) -> apply_action(b, a, at),
       },
   );
   match end.top.frame {
     Top -> end.top.nodes,
-    Looping(_) | Emptying(_) -> fault.at(end.top.at, Unended("for")),
-    Iffing(_, _, _) | Elsing(_) -> fault.at(end.top.at, Unended("if")),
+    InFor(_) | InForElse(_) -> read_error.at(end.top.at, Unended("for")),
+    InIf(_, _, _) | InElse(_) -> read_error.at(end.top.at, Unended("if")),
   }
 }
 
@@ -527,55 +542,58 @@ fn built(pieces: List<Piece>) -> List<Node> / {fault.at} = {
 
 /// Nodes with their text read as markup and their values placed, and where the reader stands
 /// after them.
-type Settled = { nodes: List<Node>, at: html::Context }
+type NodesInContext = { nodes: List<Node>, at: html::Context }
 
-type One = { node: Node, at: html::Context }
+type NodeInContext = { node: Node, at: html::Context }
 
 /// The hole a value stands in at `from`, or the refusal of a value there.
-fn held(from: html::Context, value: Expr, at: Int) -> html::Hole / {fault.at, abort.raise} =
+fn hole_at(from: html::Context, value: Expr, at: Int) -> html::Hole / {read_error.at, abort.raise} =
   match html::hole(from) {
-    Err(said) -> fault.at(at, Misplaced(said)),
+    Err(message) -> read_error.at(at, Misplaced(message)),
     Ok(h) -> match value.pipes.last() {
-      Some(AsHtml) -> fault.at(at, EscapedTwice("html")),
-      Some(AsUrl) -> if h.url == None { h } else { fault.at(at, EscapedTwice("url")) },
+      Some(AsHtml) -> read_error.at(at, EscapedTwice("html")),
+      Some(AsUrl) -> if h.url == None { h } else { read_error.at(at, EscapedTwice("url")) },
       _ -> h,
     },
   }
 
-fn settled(nodes: List<Node>, from: html::Context) -> Settled / {fault.at, abort.raise} =
-  nodes.fold({ nodes: [], at: from }, |s: Settled, n: Node| {
-    let one = settled_node(n, s.at);
+fn resolve_contexts(
+  nodes: List<Node>,
+  from: html::Context,
+) -> NodesInContext / {read_error.at, abort.raise} =
+  nodes.fold({ nodes: [], at: from }, |s: NodesInContext, n: Node| {
+    let one = resolve_context(n, s.at);
     { nodes: s.nodes.push(one.node), at: one.at }
   })
 
-fn settled_node(n: Node, from: html::Context) -> One / {fault.at, abort.raise} =
+fn resolve_context(n: Node, from: html::Context) -> NodeInContext / {read_error.at, abort.raise} =
   match n {
     Text(lit) -> match lit.chunk {
-      Read(r) -> { node: n, at: r.to },
+      HtmlRun(r) -> { node: n, at: r.to },
       Plain(text) -> match html::run(from, text) {
-        Err(stray) -> fault.at(lit.at + stray.offset, Markup(stray.message)),
-        Ok(r) -> { node: Text({ ..lit, chunk: Read(r) }), at: r.to },
+        Err(stray) -> read_error.at(lit.at + stray.offset, Markup(stray.message)),
+        Ok(r) -> { node: Text({ ..lit, chunk: HtmlRun(r) }), at: r.to },
       },
     },
-    Show(shown) -> {
-      let h = held(from, shown.value, shown.at);
-      { node: Show({ ..shown, spot: In(h) }), at: h.to }
+    Show(write_value) -> {
+      let h = hole_at(from, write_value.value, write_value.at);
+      { node: Show({ ..write_value, position: In(h) }), at: h.to }
     },
     Include(inc) -> {
-      let h = held(from, inc.data, inc.at);
-      { node: Include({ ..inc, spot: In(h) }), at: h.to }
+      let h = hole_at(from, inc.data, inc.at);
+      { node: Include({ ..inc, position: In(h) }), at: h.to }
     },
     When(arms, otherwise) -> {
-      let bodies = arms.map(|arm: Arm| settled(arm.body, from));
-      let other = settled(otherwise, from);
-      let end = bodies.fold(Some(other.at), |both: Option<html::Context>, s: Settled|
-        match both { None -> None, Some(c) -> html::joined(c, s.at) });
+      let bodies = arms.map(|arm: Arm| resolve_contexts(arm.body, from));
+      let other = resolve_contexts(otherwise, from);
+      let end = bodies.fold(Some(other.at), |both: Option<html::Context>, s: NodesInContext|
+        match both { None -> None, Some(c) -> html::join(c, s.at) });
       match end {
-        None -> fault.at(match arms { [first, ..] -> first.at, [] -> 0 }, Uneven),
+        None -> read_error.at(match arms { [first, ..] -> first.at, [] -> 0 }, Uneven),
         Some(c) ->
           {
             node: When(
-              zip_with(arms, bodies, |arm: Arm, s: Settled| { ..arm, body: s.nodes }),
+              zip_with(arms, bodies, |arm: Arm, s: NodesInContext| { ..arm, body: s.nodes }),
               other.nodes,
             ),
             at: c,
@@ -583,10 +601,10 @@ fn settled_node(n: Node, from: html::Context) -> One / {fault.at, abort.raise} =
       }
     },
     Each(l) -> {
-      let none = settled(l.empty, from);
-      let pass = passed(l, from);
-      match html::joined(pass.at, none.at) {
-        None -> fault.at(l.at, Uneven),
+      let none = resolve_contexts(l.empty, from);
+      let pass = resolve_loop_context(l, from);
+      match html::join(pass.at, none.at) {
+        None -> read_error.at(l.at, Uneven),
         Some(end) -> { node: Each({ ..l, body: pass.nodes, empty: none.nodes }), at: end },
       }
     },
@@ -595,18 +613,21 @@ fn settled_node(n: Node, from: html::Context) -> One / {fault.at, abort.raise} =
 /// A loop's body read from a place that is both where the loop starts and where a pass ends,
 /// since a pass is written after either, and that place. The body is read again only where its
 /// first reading ended somewhere its start does not cover, which a second reading then does.
-fn passed(l: Loop, from: html::Context) -> Settled / {fault.at, abort.raise} = {
-  let covers = |around: html::Context, s: Settled|
-    if html::joined(s.at, around) == Some(around) { { nodes: s.nodes, at: around } }
-    else { fault.at(l.at, Uneven) };
-  match html::joined(from, from) {
-    None -> fault.at(l.at, Uneven),
+fn resolve_loop_context(
+  l: Loop,
+  from: html::Context,
+) -> NodesInContext / {read_error.at, abort.raise} = {
+  let covers = |around: html::Context, s: NodesInContext|
+    if html::join(s.at, around) == Some(around) { { nodes: s.nodes, at: around } }
+    else { read_error.at(l.at, Uneven) };
+  match html::join(from, from) {
+    None -> read_error.at(l.at, Uneven),
     Some(start) -> {
-      let once = settled(l.body, start);
-      match html::joined(start, once.at) {
-        None -> fault.at(l.at, Uneven),
+      let once = resolve_contexts(l.body, start);
+      match html::join(start, once.at) {
+        None -> read_error.at(l.at, Uneven),
         Some(around) -> if around == start { covers(around, once) }
-        else { covers(around, settled(l.body, around)) },
+        else { covers(around, resolve_contexts(l.body, around)) },
       }
     },
   }
@@ -614,45 +635,46 @@ fn passed(l: Loop, from: html::Context) -> Settled / {fault.at, abort.raise} = {
 
 // --- Reading --------------------------------------------------------------------
 
-fn made(source: String, markup: Bool) -> Template / {fault.at, abort.raise} = {
-  let nodes = built(pieces(Bytes::of_string(source)));
+fn build_template(source: String, markup: Bool) -> Template / {read_error.at, abort.raise} = {
+  let nodes = build_nodes(lex(Bytes::of_string(source)));
   if !markup { { markup: false, nodes: nodes } } else {
-    let read = settled(nodes, html::reader(true));
+    let read = resolve_contexts(nodes, html::reader(true));
     match html::unfinished(read.at) {
-      Some(said) -> fault.at(source.len(), Markup(said)),
+      Some(message) -> read_error.at(source.len(), Markup(message)),
       None -> { markup: true, nodes: read.nodes },
     }
   }
 }
 
-fn read_as(source: String, markup: Bool) -> Template / {template.refused} =
+fn read_as(source: String, markup: Bool) -> Template / {template.fail} =
   handle {
     handle {
-      made(source, markup)
+      build_template(source, markup)
     } with {
-      fault.at(offset, why) -> {
+      read_error.at(offset, why) -> {
         let stood = position(source, offset);
-        template.refused({ offset: offset, line: stood.line, column: stood.column, why: why })
+        template.fail({ offset: offset, line: stood.line, column: stood.column, reason: why })
       },
     }
   } with {
-    abort.raise(said) -> template.refused({ offset: 0, line: 1, column: 1, why: Defect(said) }),
+    abort.raise(message) ->
+      template.fail({ offset: 0, line: 1, column: 1, reason: Defect(message) }),
   }
 
-/// The template `source` is as text, raising `template.refused` where `parse` answers `Err`.
-pub fn read(source: String) -> Template / {template.refused} = read_as(source, false)
+/// The template `source` is as text, raising `template.fail` where `parse` answers `Err`.
+pub fn read(source: String) -> Template / {template.fail} = read_as(source, false)
 
 /// The template `source` is as text, or the first place it is none: an action left open, one
 /// that is none of the language's, or a block with no `end`.
-pub fn parse(source: String) -> Result<Template, Refusal> = try { read(source) }
+pub fn parse(source: String) -> Result<Template, Error> = try { read(source) }
 
-/// The template `source` is as HTML, raising `template.refused` where `parse_html` answers `Err`.
-pub fn read_html(source: String) -> Template / {template.refused} = read_as(source, true)
+/// The template `source` is as HTML, raising `template.fail` where `parse_html` answers `Err`.
+pub fn read_html(source: String) -> Template / {template.fail} = read_as(source, true)
 
 /// The template `source` is as HTML, or the first place it is none: where `parse` refuses, where
 /// its text is no markup, where a value would stand where no escaping makes it text, and where
 /// branches leave the markup at different places.
-pub fn parse_html(source: String) -> Result<Template, Refusal> = try { read_html(source) }
+pub fn parse_html(source: String) -> Result<Template, Error> = try { read_html(source) }
 
 // --- Data -----------------------------------------------------------------------
 
@@ -676,56 +698,60 @@ pub fn of_json(j: Json) -> Value =
   }
 
 /// What a path finds: a value; a `None`; or nothing of that name.
-type Looked = | Held(Value) | Vacant | Unknown
+type Lookup = | Found(Value) | FoundNone | NotFound
 
-type Bound = { name: String, value: Value }
+type Binding = { name: String, value: Value }
 
-type Scope = { data: Value, bound: List<Bound> }
+type Scope = { data: Value, bound: List<Binding> }
 
-fn present(v: Value) -> Looked =
-  match v { VCtor("Some", [held]) -> present(held), VCtor("None", []) -> Vacant, _ -> Held(v) }
+fn lookup_value(v: Value) -> Lookup =
+  match v {
+    VCtor("Some", [hole_at]) -> lookup_value(hole_at),
+    VCtor("None", []) -> FoundNone,
+    _ -> Found(v),
+  }
 
-fn member(of: Looked, name: String) -> Looked =
+fn lookup_field(of: Lookup, name: String) -> Lookup =
   match of {
-    Held(VRecord(fields)) -> match value::field_named(fields, name) {
-      Some(v) -> present(v),
-      None -> Unknown,
+    Found(VRecord(fields)) -> match value::field_named(fields, name) {
+      Some(v) -> lookup_value(v),
+      None -> NotFound,
     },
-    Held(VMap(entries)) -> match entries.find(|e: Entry|
+    Found(VMap(entries)) -> match entries.find(|e: Entry|
         match e.key { VStr(key) -> key == name, _ -> false }) {
-      Some(e) -> present(e.value),
-      None -> Unknown,
+      Some(e) -> lookup_value(e.value),
+      None -> NotFound,
     },
-    Held(_) -> Unknown,
+    Found(_) -> NotFound,
     _ -> of,
   }
 
-fn looked(scope: Scope, operand: Operand) -> Looked =
+fn lookup_operand(scope: Scope, operand: Operand) -> Lookup =
   match operand {
-    Written(v) -> Held(v),
-    Path(_, []) -> present(scope.data),
+    Literal(v) -> Found(v),
+    Path(_, []) -> lookup_value(scope.data),
     Path(rooted, [first, ..rest]) -> match if rooted { None }
-      else { scope.bound.find_last(|b: Bound| b.name == first) } {
-      Some(b) -> rest.fold(present(b.value), member),
-      None -> rest.fold(member(present(scope.data), first), member),
+      else { scope.bound.find_last(|b: Binding| b.name == first) } {
+      Some(b) -> rest.fold(lookup_value(b.value), lookup_field),
+      None -> rest.fold(lookup_field(lookup_value(scope.data), first), lookup_field),
     },
   }
 
-fn spelled(operand: Operand) -> String =
+fn operand_text(operand: Operand) -> String =
   match operand {
-    Written(v) -> value::render(v),
+    Literal(v) -> value::render(v),
     Path(rooted, names) ->
       (if rooted || names.len() == 0 { "." } else { "" }) ++ String::join(names, "."),
   }
 
-fn kind(v: Value) -> String =
+fn describe_kind(v: Value) -> String =
   match v {
     VStr(_) | VShown(_) | VChar(_) -> "a text",
     VInt(_) | VDecimal(_) | VFloat(_) | VFixed(_, _) -> "a number",
     VBool(_) -> "a boolean",
     VList(_) | VArray(_) -> "a list",
     VMap(_) -> "a map",
-    VRecord(_) -> if html::reflected(v) == None { "a record" } else { "markup" },
+    VRecord(_) -> if html::of_value(v) == None { "a record" } else { "markup" },
     VCtor(name, _) -> "a `" ++ value::ctor_name(name) ++ "`",
     VBytes(_) -> "bytes",
     VUnit -> "`()`",
@@ -749,24 +775,24 @@ fn text(v: Value) -> Option<String> =
 type Env = { partials: Map<String, Template>, limits: Limits, partial: Option<String> }
 
 /// What is written to: the pieces of a text, or the draft of a page.
-type Sink = | Words(List<Bytes>) | Page(html::Draft)
+type Sink = | TextOutput(List<Bytes>) | HtmlOutput(html::Draft)
 
-type Filling = { out: Sink, size: Int, passes: Int }
+type FillState = { out: Sink, size: Int, passes: Int }
 
 /// What an action writes: characters, or markup.
-type Wrote = | Characters(String) | Fragment(Html)
+type Output = | Characters(String) | Fragment(Html)
 
-fn fail<a>(env: Env, at: Int, why: Why) -> a / {template.failed} =
-  template.failed({ partial: env.partial, offset: at, why: why })
+fn fail<a>(env: Env, at: Int, why: ErrorKind) -> a / {template.failed} =
+  template.failed({ partial: env.partial, offset: at, reason: why })
 
-fn crossed<a>(env: Env, at: Int) -> a / {template.failed} =
+fn mode_mismatch<a>(env: Env, at: Int) -> a / {template.failed} =
   fail(env, at, Defect("a template was written where it was not read to be"))
 
-fn needed(l: Looked, e: Expr, env: Env, at: Int) -> Value / {template.failed} =
-  match l { Held(v) -> v, _ -> fail(env, at, Missing(spelled(e.from))) }
+fn require_value(l: Lookup, e: Expr, env: Env, at: Int) -> Value / {template.failed} =
+  match l { Found(v) -> v, _ -> fail(env, at, Missing(operand_text(e.from))) }
 
 fn text_of(v: Value, env: Env, at: Int) -> String / {template.failed} =
-  match text(v) { Some(s) -> s, None -> fail(env, at, WrongKind("a text", kind(v))) }
+  match text(v) { Some(s) -> s, None -> fail(env, at, WrongKind("a text", describe_kind(v))) }
 
 fn json_of(v: Value, env: Env, at: Int) -> Json / {template.failed} =
   match v {
@@ -788,80 +814,82 @@ fn json_of(v: Value, env: Env, at: Int) -> Json / {template.failed} =
           {
             key: match e.key {
               VStr(key) -> key,
-              other -> fail(env, at, WrongKind("a text for a JSON object's key", kind(other))),
+              other ->
+                fail(env, at, WrongKind("a text for a JSON object's key", describe_kind(other))),
             },
             value: json_of(e.value, env, at),
           }),
       ),
-    VCtor("Some", [held]) -> json_of(held, env, at),
+    VCtor("Some", [hole_at]) -> json_of(hole_at, env, at),
     VCtor("None", []) -> json::Null,
-    _ -> fail(env, at, WrongKind("data JSON writes", kind(v))),
+    _ -> fail(env, at, WrongKind("data JSON writes", describe_kind(v))),
   }
 
-fn piped(
-  l: Looked,
+fn apply_pipe(
+  l: Lookup,
   p: Pipe,
   e: Expr,
   scope: Scope,
   env: Env,
   at: Int,
-) -> Looked / {template.failed, abort.raise} = {
-  let texted = |v: Value| text_of(v, env, at);
-  let given = |from: Looked| needed(from, e, env, at);
+) -> Lookup / {template.failed, abort.raise} = {
+  let add_text = |v: Value| text_of(v, env, at);
+  let given = |from: Lookup| require_value(from, e, env, at);
   match p {
-    Default(spare) -> match l { Held(_) -> l, _ -> looked(scope, spare) },
-    AsHtml -> Held(VStr(html::escape(texted(given(l))))),
-    AsUrl -> Held(VStr(url_encode(texted(given(l))))),
+    Default(spare) -> match l { Found(_) -> l, _ -> lookup_operand(scope, spare) },
+    AsHtml -> Found(VStr(html::escape(add_text(given(l))))),
+    AsUrl -> Found(VStr(url_encode(add_text(given(l))))),
     AsJson -> match l {
-      Vacant -> Held(VStr("null")),
-      _ -> Held(VStr(json::to_string(json_of(given(l), env, at)))),
+      FoundNone -> Found(VStr("null")),
+      _ -> Found(VStr(json::to_string(json_of(given(l), env, at)))),
     },
-    Upper -> Held(VStr(texted(given(l)).ascii_upper())),
-    Lower -> Held(VStr(texted(given(l)).ascii_lower())),
+    Upper -> Found(VStr(add_text(given(l)).ascii_upper())),
+    Lower -> Found(VStr(add_text(given(l)).ascii_lower())),
     Length -> match given(l) {
-      VStr(s) -> Held(VInt(s.len())),
-      VList(items) | VArray(items) -> Held(VInt(items.len())),
-      VMap(entries) -> Held(VInt(entries.len())),
-      other -> fail(env, at, WrongKind("a text, a list or a map", kind(other))),
+      VStr(s) -> Found(VInt(s.len())),
+      VList(items) | VArray(items) -> Found(VInt(items.len())),
+      VMap(entries) -> Found(VInt(entries.len())),
+      other -> fail(env, at, WrongKind("a text, a list or a map", describe_kind(other))),
     },
     Join(between) -> match given(l) {
       VList(items) | VArray(items) ->
-        Held(
+        Found(
           VStr(
             String::join(
-              items.map(|x: Value| texted(given(present(x)))),
-              texted(given(looked(scope, between))),
+              items.map(|x: Value| add_text(given(lookup_value(x)))),
+              add_text(given(lookup_operand(scope, between))),
             ),
           ),
         ),
-      other -> fail(env, at, WrongKind("a list", kind(other))),
+      other -> fail(env, at, WrongKind("a list", describe_kind(other))),
     },
   }
 }
 
-fn valued(e: Expr, scope: Scope, env: Env, at: Int) -> Looked / {template.failed, abort.raise} =
-  e.pipes.fold(looked(scope, e.from), |l: Looked, p: Pipe| piped(l, p, e, scope, env, at))
+fn evaluate(e: Expr, scope: Scope, env: Env, at: Int) -> Lookup / {template.failed, abort.raise} =
+  e.pipes.fold(lookup_operand(scope, e.from), |l: Lookup, p: Pipe|
+    apply_pipe(l, p, e, scope, env, at))
 
-fn holds(l: Looked, e: Expr, env: Env, at: Int) -> Bool / {template.failed} =
+fn is_truthy(l: Lookup, e: Expr, env: Env, at: Int) -> Bool / {template.failed} =
   match l {
-    Unknown -> fail(env, at, Missing(spelled(e.from))),
-    Vacant -> false,
-    Held(VBool(b)) -> b,
-    Held(VStr("")) | Held(VList([])) | Held(VArray([])) | Held(VMap([])) -> false,
-    Held(_) -> true,
+    NotFound -> fail(env, at, Missing(operand_text(e.from))),
+    FoundNone -> false,
+    Found(VBool(b)) -> b,
+    Found(VStr("")) | Found(VList([])) | Found(VArray([])) | Found(VMap([])) -> false,
+    Found(_) -> true,
   }
 
-type Pass = { key: Value, item: Value }
+type LoopItem = { key: Value, item: Value }
 
-fn passes(l: Looked, e: Expr, env: Env, at: Int) -> List<Pass> / {template.failed} =
-  match needed(l, e, env, at) {
+fn loop_items(l: Lookup, e: Expr, env: Env, at: Int) -> List<LoopItem> / {template.failed} =
+  match require_value(l, e, env, at) {
     VList(items) | VArray(items) ->
       enumerate(items).map(|x: { index: Int, value: Value }| { key: VInt(x.index), item: x.value }),
     VMap(entries) -> entries.map(|x: Entry| { key: x.key, item: x.value }),
-    other -> fail(env, at, WrongKind("a list or a map", kind(other))),
+    other -> fail(env, at, WrongKind("a list or a map", describe_kind(other))),
   }
 
-fn bound(scope: Scope, l: Loop, p: Pass) -> Scope = {
+fn bind_loop(scope: Scope, l: Loop, p: LoopItem) -> Scope = {
   let keyed = match l.key {
     Some(name) -> scope.bound.push({ name: name, value: p.key }),
     None -> scope.bound,
@@ -869,36 +897,40 @@ fn bound(scope: Scope, l: Loop, p: Pass) -> Scope = {
   { ..scope, bound: keyed.push({ name: l.item, value: p.item }) }
 }
 
-fn counted(f: Filling, more: Int, env: Env, at: Int) -> Filling / {template.failed} =
+fn count_output(f: FillState, more: Int, env: Env, at: Int) -> FillState / {template.failed} =
   if f.size + more > env.limits.output { fail(env, at, TooLong) }
   else { { ..f, size: f.size + more } }
 
-fn stepped(f: Filling, env: Env, at: Int) -> Filling / {template.failed} =
+fn count_pass(f: FillState, env: Env, at: Int) -> FillState / {template.failed} =
   if f.passes >= env.limits.iterations { fail(env, at, TooManyPasses) }
   else { { ..f, passes: f.passes + 1 } }
 
-fn sink(markup: Bool) -> Sink = if markup { Page(html::draft(true)) } else { Words([]) }
+fn sink(markup: Bool) -> Sink = if markup { HtmlOutput(html::draft(true)) } else { TextOutput([]) }
 
-fn finished(out: Sink, env: Env, at: Int) -> Wrote / {template.failed, abort.raise} =
+fn finish_output(out: Sink, env: Env, at: Int) -> Output / {template.failed, abort.raise} =
   match out {
-    Words(parts) -> Characters(String::of_bytes(Bytes::concat_all(parts))),
-    Page(d) -> match html::finish(d) { Some(page) -> Fragment(page), None -> crossed(env, at) },
+    TextOutput(parts) -> Characters(String::of_bytes(Bytes::concat_all(parts))),
+    HtmlOutput(d) -> match html::finish(d) {
+      Some(page) -> Fragment(page),
+      None -> mode_mismatch(env, at),
+    },
   }
 
-fn literal(lit: Lit, f: Filling, env: Env) -> Filling / {template.failed, abort.raise} = {
-  let room = counted(f, lit.size, env, lit.at);
+fn write_text(lit: Lit, f: FillState, env: Env) -> FillState / {template.failed, abort.raise} = {
+  let room = count_output(f, lit.size, env, lit.at);
   match ((lit.chunk, room.out)) {
-    (Plain(written), Words(parts)) -> { ..room, out: Words(parts.push(Bytes::of_string(written))) },
-    (Read(r), Page(d)) -> match html::write(d, r) {
-      Some(next) -> { ..room, out: Page(next) },
-      None -> crossed(env, lit.at),
+    (Plain(fill_template), TextOutput(parts)) ->
+      { ..room, out: TextOutput(parts.push(Bytes::of_string(fill_template))) },
+    (HtmlRun(r), HtmlOutput(d)) -> match html::write(d, r) {
+      Some(next) -> { ..room, out: HtmlOutput(next) },
+      None -> mode_mismatch(env, lit.at),
     },
-    _ -> crossed(env, lit.at),
+    _ -> mode_mismatch(env, lit.at),
   }
 }
 
 /// What `w` is where `h` is a URL: its text, which is no markup's, and whether it is trusted.
-fn url_of(w: Wrote, env: Env, at: Int) -> html::UrlText / {template.failed} =
+fn url_of(w: Output, env: Env, at: Int) -> html::UrlText / {template.failed} =
   match w {
     Characters(s) -> { text: s, trusted: false },
     Fragment(page) -> match html::url_text(page) {
@@ -910,24 +942,24 @@ fn url_of(w: Wrote, env: Env, at: Int) -> html::UrlText / {template.failed} =
 /// `w` written at `spot`: into a text as it is, and into a page as its hole reads it, a URL's
 /// part percent-encoded and refused where it would name a scheme no value may.
 fn put(
-  w: Wrote,
+  w: Output,
   spot: Spot,
-  f: Filling,
+  f: FillState,
   env: Env,
   at: Int,
-) -> Filling / {template.failed, abort.raise} =
+) -> FillState / {template.failed, abort.raise} =
   match f.out {
-    Words(parts) ->
+    TextOutput(parts) ->
       {
         ..f,
-        out: Words(
+        out: TextOutput(
           parts.push(
             Bytes::of_string(match w { Characters(s) -> s, Fragment(page) -> html::render(page) }),
           ),
         ),
       },
-    Page(d) -> match spot {
-      Anywhere -> crossed(env, at),
+    HtmlOutput(d) -> match spot {
+      Anywhere -> mode_mismatch(env, at),
       In(h) -> {
         let value = match ((h.url, w)) {
           (None, Characters(s)) -> html::text(s),
@@ -938,92 +970,112 @@ fn put(
           },
         };
         match html::place(d, h, value) {
-          Some(next) -> { ..f, out: Page(next) },
-          None -> crossed(env, at),
+          Some(next) -> { ..f, out: HtmlOutput(next) },
+          None -> mode_mismatch(env, at),
         }
       },
     },
   }
 
 /// A value as an action writes it: an `Html` as the markup it is, and anything else as its text.
-fn shown(
+fn write_value(
   v: Value,
   spot: Spot,
-  f: Filling,
+  f: FillState,
   env: Env,
   at: Int,
-) -> Filling / {template.failed, abort.raise} =
-  match html::reflected(v) {
-    Some(page) -> put(Fragment(page), spot, counted(f, html::size(page), env, at), env, at),
+) -> FillState / {template.failed, abort.raise} =
+  match html::of_value(v) {
+    Some(page) -> put(Fragment(page), spot, count_output(f, html::size(page), env, at), env, at),
     None -> {
-      let written = text_of(v, env, at);
-      put(Characters(written), spot, counted(f, Bytes::of_string(written).len(), env, at), env, at)
+      let fill_template = text_of(v, env, at);
+      put(
+        Characters(fill_template),
+        spot,
+        count_output(f, Bytes::of_string(fill_template).len(), env, at),
+        env,
+        at,
+      )
     },
   }
 
-type Choosing = { done: Bool, filling: Filling }
+type BranchState = { done: Bool, filling: FillState }
 
-fn filled(
+fn fill_node(
   n: Node,
   scope: Scope,
   env: Env,
   depth: Int,
-  f: Filling,
-) -> Filling / {template.failed, abort.raise} =
+  f: FillState,
+) -> FillState / {template.failed, abort.raise} =
   match n {
-    Text(lit) -> literal(lit, f, env),
+    Text(lit) -> write_text(lit, f, env),
     Show(s) ->
-      shown(needed(valued(s.value, scope, env, s.at), s.value, env, s.at), s.spot, f, env, s.at),
+      write_value(
+        require_value(evaluate(s.value, scope, env, s.at), s.value, env, s.at),
+        s.position,
+        f,
+        env,
+        s.at,
+      ),
     When(arms, otherwise) -> {
-      let chosen = arms.fold({ done: false, filling: f }, |c: Choosing, arm: Arm|
-        if c.done || !holds(valued(arm.cond, scope, env, arm.at), arm.cond, env, arm.at) { c }
+      let chosen = arms.fold({ done: false, filling: f }, |c: BranchState, arm: Arm|
+        if c.done || !is_truthy(evaluate(arm.cond, scope, env, arm.at), arm.cond, env, arm.at) { c }
         else {
           {
             done: true,
-            filling: arm.body.fold(c.filling, |a: Filling, m: Node|
-              filled(m, scope, env, depth, a)),
+            filling: arm.body.fold(c.filling, |a: FillState, m: Node|
+              fill_node(m, scope, env, depth, a)),
           }
         });
       if chosen.done { chosen.filling }
-      else { otherwise.fold(f, |a: Filling, m: Node| filled(m, scope, env, depth, a)) }
+      else { otherwise.fold(f, |a: FillState, m: Node| fill_node(m, scope, env, depth, a)) }
     },
-    Each(l) -> match passes(valued(l.over, scope, env, l.at), l.over, env, l.at) {
-      [] -> l.empty.fold(f, |a: Filling, m: Node| filled(m, scope, env, depth, a)),
+    Each(l) -> match loop_items(evaluate(l.over, scope, env, l.at), l.over, env, l.at) {
+      [] -> l.empty.fold(f, |a: FillState, m: Node| fill_node(m, scope, env, depth, a)),
       each ->
-        each.fold(f, |a: Filling, p: Pass| {
-          let inner = bound(scope, l, p);
-          l.body.fold(stepped(a, env, l.at), |b: Filling, m: Node| filled(m, inner, env, depth, b))
+        each.fold(f, |a: FillState, p: LoopItem| {
+          let inner = bind_loop(scope, l, p);
+          l.body.fold(count_pass(a, env, l.at), |b: FillState, m: Node|
+            fill_node(m, inner, env, depth, b))
         }),
     },
     Include(inc) -> if depth <= 0 { fail(env, inc.at, TooDeep) } else {
       match env.partials.get(inc.name) {
         None -> fail(env, inc.at, NoPartial(inc.name)),
         Some(t) -> {
-          let data = needed(valued(inc.data, scope, env, inc.at), inc.data, env, inc.at);
+          let data = require_value(evaluate(inc.data, scope, env, inc.at), inc.data, env, inc.at);
           let within: Env = { ..env, partial: Some(inc.name) };
           let inner = t.nodes.fold(
-            { ..stepped(f, env, inc.at), out: sink(t.markup) },
-            |a: Filling, m: Node| filled(m, { data: data, bound: [] }, within, depth - 1, a),
+            { ..count_pass(f, env, inc.at), out: sink(t.markup) },
+            |a: FillState, m: Node| fill_node(m, { data: data, bound: [] }, within, depth - 1, a),
           );
-          put(finished(inner.out, env, inc.at), inc.spot, { ..inner, out: f.out }, env, inc.at)
+          put(
+            finish_output(inner.out, env, inc.at),
+            inc.position,
+            { ..inner, out: f.out },
+            env,
+            inc.at,
+          )
         },
       }
     },
   }
 
-fn written(
+fn fill_template(
   t: Template,
   data: Value,
   partials: Map<String, Template>,
   limits: Limits,
-) -> Wrote / {template.failed, abort.raise} = {
+) -> Output / {template.failed, abort.raise} = {
   let env: Env = { partials: partials, limits: limits, partial: None };
-  let end = t.nodes.fold({ out: sink(t.markup), size: 0, passes: 0 }, |f: Filling, n: Node|
-    filled(n, { data: data, bound: [] }, env, min(limits.depth, deepest()), f));
-  finished(end.out, env, 0)
+  let end = t.nodes.fold({ out: sink(t.markup), size: 0, passes: 0 }, |f: FillState, n: Node|
+    fill_node(n, { data: data, bound: [] }, env, min(limits.depth, max_depth()), f));
+  finish_output(end.out, env, 0)
 }
 
-fn broken(said: String) -> Failure = { partial: None, offset: 0, why: Defect(said) }
+fn defect_failure(message: String) -> Failure =
+  { partial: None, offset: 0, reason: Defect(message) }
 
 /// The text `t` is with `data` in its places and each `include` filled from `partials`, raising
 /// `template.failed` where `render` answers `Err`. An HTML template's text is its document's.
@@ -1034,12 +1086,12 @@ pub fn fill(
   limits: Limits,
 ) -> String / {template.failed} =
   handle {
-    match written(t, data, partials, limits) {
+    match fill_template(t, data, partials, limits) {
       Characters(s) -> s,
       Fragment(page) -> html::render(page),
     }
   } with {
-    abort.raise(said) -> template.failed(broken(said)),
+    abort.raise(message) -> template.failed(defect_failure(message)),
   }
 
 /// The text `t` is with `data` in its places, or why it has none: a path nothing stands at, a
@@ -1061,12 +1113,12 @@ pub fn fill_html(
   limits: Limits,
 ) -> Html / {template.failed} =
   handle {
-    match written(t, data, partials, limits) {
+    match fill_template(t, data, partials, limits) {
       Characters(s) -> html::text(s),
       Fragment(page) -> page,
     }
   } with {
-    abort.raise(said) -> template.failed(broken(said)),
+    abort.raise(message) -> template.failed(defect_failure(message)),
   }
 
 /// The markup `t` is with `data` in its places, or why it has none, on `render`'s terms.
@@ -1115,7 +1167,7 @@ fn partials() -> Map<String, Template> / {abort.raise} = {
   let named = |name: String, source: String|
     {
       key: name,
-      value: match parse(source) { Ok(t) -> t, Err(r) -> panic(name ++ ": " ++ explain(r.why)) },
+      value: match parse(source) { Ok(t) -> t, Err(r) -> panic(name ++ ": " ++ explain(r.reason)) },
     };
   Map::of_entries([
     named("line", "{{ sku }}({{ qty }})"),
@@ -1125,15 +1177,15 @@ fn partials() -> Map<String, Template> / {abort.raise} = {
   ])
 }
 
-fn over(source: String, data: Value) -> Result<String, Failure> / {abort.raise} =
+fn render_with_partials(source: String, data: Value) -> Result<String, Failure> / {abort.raise} =
   match parse(source) {
     Ok(t) -> render(t, data, partials(), default_limits()),
-    Err(r) -> panic("refused: " ++ explain(r.why)),
+    Err(r) -> panic("refused: " ++ explain(r.reason)),
   }
 
-type Filled = { source: String, text: String }
+type FillCase = { source: String, text: String }
 
-fn fillings() -> List<Filled> =
+fn fill_cases() -> List<FillCase> =
   [
     { source: "Hello, {{ customer }}!", text: "Hello, Ann & Bob!" },
     { source: "{{id}} {{ paid }} {{ rate }} {{ .id }}", text: "7 true 1.50 7" },
@@ -1194,70 +1246,70 @@ fn fillings() -> List<Filled> =
     { source: "", text: "" },
   ]
 
-test "`{c.source}` is filled as the language says" for c: Filled in fillings() {
-  assert_eq(over(c.source, order()), Ok(c.text))
+test "`{c.source}` is filled as the language says" for c: FillCase in fill_cases() {
+  assert_eq(render_with_partials(c.source, order()), Ok(c.text))
 }
 
-type Failed = { source: String, offset: Int, why: Why }
+type FailureCase = { source: String, offset: Int, reason: ErrorKind }
 
-fn failings() -> List<Failed> =
+fn failure_cases() -> List<FailureCase> =
   [
-    { source: "{{ nope }}", offset: 0, why: Missing("nope") },
-    { source: "ab{{ customer.first }}", offset: 2, why: Missing("customer.first") },
-    { source: "\u{e9}{{ .lines.sku }}", offset: 1, why: Missing(".lines.sku") },
-    { source: "{{ vip }}", offset: 0, why: Missing("vip") },
-    { source: "{{ vip | upper }}", offset: 0, why: Missing("vip") },
-    { source: "{{ nope | default gone }}", offset: 0, why: Missing("nope") },
-    { source: "{{ lines }}", offset: 0, why: WrongKind("a text", "a list") },
-    { source: "{{ totals }}", offset: 0, why: WrongKind("a text", "a map") },
-    { source: "{{ . }}", offset: 0, why: WrongKind("a text", "a record") },
+    { source: "{{ nope }}", offset: 0, reason: Missing("nope") },
+    { source: "ab{{ customer.first }}", offset: 2, reason: Missing("customer.first") },
+    { source: "\u{e9}{{ .lines.sku }}", offset: 1, reason: Missing(".lines.sku") },
+    { source: "{{ vip }}", offset: 0, reason: Missing("vip") },
+    { source: "{{ vip | upper }}", offset: 0, reason: Missing("vip") },
+    { source: "{{ nope | default gone }}", offset: 0, reason: Missing("nope") },
+    { source: "{{ lines }}", offset: 0, reason: WrongKind("a text", "a list") },
+    { source: "{{ totals }}", offset: 0, reason: WrongKind("a text", "a map") },
+    { source: "{{ . }}", offset: 0, reason: WrongKind("a text", "a record") },
     {
       source: "{{ for c in customer }}{{ end }}",
       offset: 0,
-      why: WrongKind("a list or a map", "a text"),
+      reason: WrongKind("a list or a map", "a text"),
     },
     {
       source: "{{ for c in . }}{{ end }}",
       offset: 0,
-      why: WrongKind("a list or a map", "a record"),
+      reason: WrongKind("a list or a map", "a record"),
     },
-    { source: "{{ for c in nope }}{{ end }}", offset: 0, why: Missing("nope") },
-    { source: "{{ for c in vip }}{{ else }}{{ end }}", offset: 0, why: Missing("vip") },
-    { source: "x{{ if nope }}x{{ end }}", offset: 1, why: Missing("nope") },
-    { source: "{{ if due }}{{ else if nope }}{{ end }}", offset: 12, why: Missing("nope") },
-    { source: "{{ include \"gone\" }}", offset: 0, why: NoPartial("gone") },
-    { source: "{{ include \"who\" nope }}", offset: 0, why: Missing("nope") },
-    { source: "{{ tags | upper }}", offset: 0, why: WrongKind("a text", "a list") },
-    { source: "{{ id | join \",\" }}", offset: 0, why: WrongKind("a list", "a number") },
-    { source: "{{ lines | join \",\" }}", offset: 0, why: WrongKind("a text", "a record") },
+    { source: "{{ for c in nope }}{{ end }}", offset: 0, reason: Missing("nope") },
+    { source: "{{ for c in vip }}{{ else }}{{ end }}", offset: 0, reason: Missing("vip") },
+    { source: "x{{ if nope }}x{{ end }}", offset: 1, reason: Missing("nope") },
+    { source: "{{ if due }}{{ else if nope }}{{ end }}", offset: 12, reason: Missing("nope") },
+    { source: "{{ include \"gone\" }}", offset: 0, reason: NoPartial("gone") },
+    { source: "{{ include \"who\" nope }}", offset: 0, reason: Missing("nope") },
+    { source: "{{ tags | upper }}", offset: 0, reason: WrongKind("a text", "a list") },
+    { source: "{{ id | join \",\" }}", offset: 0, reason: WrongKind("a list", "a number") },
+    { source: "{{ lines | join \",\" }}", offset: 0, reason: WrongKind("a text", "a record") },
     {
       source: "{{ id | length }}",
       offset: 0,
-      why: WrongKind("a text, a list or a map", "a number"),
+      reason: WrongKind("a text, a list or a map", "a number"),
     },
-    { source: "{{ include \"again\" }}", offset: 1, why: TooDeep },
+    { source: "{{ include \"again\" }}", offset: 1, reason: TooDeep },
   ]
 
-test "`{c.source}` has no filling, and says why" for c: Failed in failings() {
-  let failed = over(c.source, order());
+test "`{c.source}` has no filling, and says why" for c: FailureCase in failure_cases() {
+  let failed = render_with_partials(c.source, order());
   assert_eq(
     failed,
     Err({
       partial: match failed { Err(f) -> f.partial, Ok(_) -> None },
       offset: c.offset,
-      why: c.why,
+      reason: c.reason,
     }),
   )
 }
 
 test "a failure in an included template names it, and where in its own text" {
   assert_eq(
-    over("{{ for l in lines }}{{ include \"line\" l.note }}{{ end }}", order()),
-    Err({ partial: Some("line"), offset: 0, why: Missing("sku") }),
+    render_with_partials("{{ for l in lines }}{{ include \"line\" l.note }}{{ end }}", order()),
+    Err({ partial: Some("line"), offset: 0, reason: Missing("sku") }),
   );
   assert_eq(
-    over("{{ include \"again\" }}", order()),
-    Err({ partial: Some("again"), offset: 1, why: TooDeep }),
+    render_with_partials("{{ include \"again\" }}", order()),
+    Err({ partial: Some("again"), offset: 1, reason: TooDeep }),
   )
 }
 
@@ -1267,7 +1319,7 @@ test "a filling stops at each of its limits" {
     Err(_) -> panic("refused"),
   };
   let within = |limits: Limits|
-    match render(t, order(), partials(), limits) { Ok(text) -> Ok(text), Err(f) -> Err(f.why) };
+    match render(t, order(), partials(), limits) { Ok(text) -> Ok(text), Err(f) -> Err(f.reason) };
   assert_eq(within({ output: 8, iterations: 6, depth: 0 }), Ok("abababab"));
   assert_eq(within({ output: 7, iterations: 6, depth: 0 }), Err(TooLong));
   assert_eq(within({ output: 8, iterations: 5, depth: 0 }), Err(TooManyPasses));
@@ -1278,7 +1330,7 @@ test "a filling stops at each of its limits" {
   let included = |limits: Limits|
     match render(looping, order(), partials(), limits) {
       Ok(text) -> Ok(text),
-      Err(f) -> Err(f.why),
+      Err(f) -> Err(f.reason),
     };
   assert_eq(included({ output: 18, iterations: 2, depth: 1 }), Ok("Ann & BobAnn & Bob"));
   assert_eq(included({ output: 17, iterations: 2, depth: 1 }), Err(TooLong));
@@ -1291,64 +1343,72 @@ test "a filling stops at each of its limits" {
         render(endless, order(), partials(), { output: 1000, iterations: 1000, depth: 1000000 }),
       Err(_) -> panic("refused"),
     },
-    Err({ partial: Some("again"), offset: 1, why: TooDeep }),
+    Err({ partial: Some("again"), offset: 1, reason: TooDeep }),
   )
 }
 
-type Refused = { source: String, offset: Int, why: Why }
+type ErrorCase = { source: String, offset: Int, reason: ErrorKind }
 
-fn refusals() -> List<Refused> =
+fn error_cases() -> List<ErrorCase> =
   [
-    { source: "a {{ b", offset: 2, why: Unclosed },
-    { source: "a {{ \"b }}", offset: 2, why: Unclosed },
-    { source: "{{! b", offset: 0, why: Unclosed },
-    { source: "{{ }}", offset: 0, why: Expected("an action between `{{` and `}}`") },
-    { source: "{{-  -}}", offset: 0, why: Expected("an action between `{{` and `}}`") },
-    { source: "{{ a | nope }}", offset: 0, why: UnknownPipe("nope") },
-    { source: "x{{ end }}", offset: 1, why: Unopened("end") },
-    { source: "{{ else }}", offset: 0, why: Unopened("else") },
-    { source: "{{ for a in b }}{{ else if c }}{{ end }}", offset: 16, why: Unopened("else if") },
-    { source: "{{ if a }}{{ else }}{{ else }}{{ end }}", offset: 20, why: Unopened("else") },
-    { source: "{{ if a }}x", offset: 0, why: Unended("if") },
-    { source: "{{ if a }}{{ for b in c }}{{ else }}", offset: 10, why: Unended("for") },
-    { source: "{{ if a }}{{ else }}", offset: 0, why: Unended("if") },
+    { source: "a {{ b", offset: 2, reason: Unclosed },
+    { source: "a {{ \"b }}", offset: 2, reason: Unclosed },
+    { source: "{{! b", offset: 0, reason: Unclosed },
+    { source: "{{ }}", offset: 0, reason: Expected("an action between `{{` and `}}`") },
+    { source: "{{-  -}}", offset: 0, reason: Expected("an action between `{{` and `}}`") },
+    { source: "{{ a | nope }}", offset: 0, reason: UnknownPipe("nope") },
+    { source: "x{{ end }}", offset: 1, reason: Unopened("end") },
+    { source: "{{ else }}", offset: 0, reason: Unopened("else") },
+    { source: "{{ for a in b }}{{ else if c }}{{ end }}", offset: 16, reason: Unopened("else if") },
+    { source: "{{ if a }}{{ else }}{{ else }}{{ end }}", offset: 20, reason: Unopened("else") },
+    { source: "{{ if a }}x", offset: 0, reason: Unended("if") },
+    { source: "{{ if a }}{{ for b in c }}{{ else }}", offset: 10, reason: Unended("for") },
+    { source: "{{ if a }}{{ else }}", offset: 0, reason: Unended("if") },
     {
       source: "{{ for a b }}",
       offset: 0,
-      why: Expected("`for item in list` or `for key, item in map`"),
+      reason: Expected("`for item in list` or `for key, item in map`"),
     },
     {
       source: "{{ a b }}",
       offset: 0,
-      why: Expected("`|` and a pipe's name, or the end of the action"),
+      reason: Expected("`|` and a pipe's name, or the end of the action"),
     },
-    { source: "{{ a. }}", offset: 0, why: Expected("a name after `.`") },
-    { source: "{{ a | default }}", offset: 0, why: Expected("a path, `.` or a value written out") },
-    { source: "{{ | upper }}", offset: 0, why: Expected("a path, `.` or a value written out") },
-    { source: "{{ end x }}", offset: 0, why: Expected("`}}` after this word") },
+    { source: "{{ a. }}", offset: 0, reason: Expected("a name after `.`") },
+    {
+      source: "{{ a | default }}",
+      offset: 0,
+      reason: Expected("a path, `.` or a value written out"),
+    },
+    { source: "{{ | upper }}", offset: 0, reason: Expected("a path, `.` or a value written out") },
+    { source: "{{ end x }}", offset: 0, reason: Expected("`}}` after this word") },
     {
       source: "{{ include who }}",
       offset: 0,
-      why: Expected("`include`, a template's name in quotes, and its data"),
+      reason: Expected("`include`, a template's name in quotes, and its data"),
     },
     {
       source: "\u{e9}{{ a $ }}",
       offset: 6,
-      why: Expected("a name, a value written out, `.`, `|`, `,` or `}}`"),
+      reason: Expected("a name, a value written out, `.`, `|`, `,` or `}}`"),
     },
     {
       source: "{{ \"a\\q\" }}",
       offset: 5,
-      why: Expected("`\\\\`, `\\\"`, `\\n` or `\\t` after a `\\`"),
+      reason: Expected("`\\\\`, `\\\"`, `\\n` or `\\t` after a `\\`"),
     },
-    { source: "{{ 99999999999999999999 }}", offset: 3, why: Expected("a number an `Int` holds") },
+    {
+      source: "{{ 99999999999999999999 }}",
+      offset: 3,
+      reason: Expected("a number an `Int` holds"),
+    },
   ]
 
-test "`{c.source}` is refused where it is no template" for c: Refused in refusals() {
+test "`{c.source}` is refused where it is no template" for c: ErrorCase in error_cases() {
   let place = position(c.source, c.offset);
   assert_eq(
     parse(c.source),
-    Err({ offset: c.offset, line: place.line, column: place.column, why: c.why }),
+    Err({ offset: c.offset, line: place.line, column: place.column, reason: c.reason }),
   );
   assert(match parse_html(c.source) { Err(_) -> true, Ok(_) -> false })
 }
@@ -1356,7 +1416,7 @@ test "`{c.source}` is refused where it is no template" for c: Refused in refusal
 test "a refusal stands at a line and a column of the template's text" {
   assert_eq(
     parse("line one\n  {{ end }}"),
-    Err({ offset: 11, line: 2, column: 3, why: Unopened("end") }),
+    Err({ offset: 11, line: 2, column: 3, reason: Unopened("end") }),
   );
   assert_eq(position("a\n\u{e9}b\nc", 5), { line: 3, column: 1 });
   assert_eq(position("abc", 99), { line: 1, column: 4 });
@@ -1364,10 +1424,10 @@ test "a refusal stands at a line and a column of the template's text" {
   let nested = |n: Int|
     String::join(range(0, n).map(|_: Int| "{{ if a }}"), "")
       ++ String::join(range(0, n).map(|_: Int| "{{ end }}"), "");
-  assert(match parse(nested(deepest())) { Ok(_) -> true, Err(_) -> false });
+  assert(match parse(nested(max_depth())) { Ok(_) -> true, Err(_) -> false });
   assert_eq(
-    parse(nested(deepest() + 1)),
-    Err({ offset: 10 * deepest(), line: 1, column: 10 * deepest() + 1, why: Nested }),
+    parse(nested(max_depth() + 1)),
+    Err({ offset: 10 * max_depth(), line: 1, column: 10 * max_depth() + 1, reason: Nested }),
   )
 }
 
@@ -1379,18 +1439,24 @@ test "a JSON document is data: its objects maps, its arrays lists and its null a
     Err(_) -> panic("no JSON"),
   };
   assert_eq(
-    over(
+    render_with_partials(
       "{{ name }} {{ n }} {{ half }} {{ on }} {{ gone | default \"-\" }} {{ at.city }} {{ tags | join \"+\" }}",
       data,
     ),
     Ok("Ann 3 0.5 true - Oslo x+y"),
   );
-  assert_eq(over("{{ for k, v in at }}{{ k }}:{{ v }}{{ end }}", data), Ok("city:Oslo"));
-  assert_eq(over("{{ if gone }}a{{ else }}b{{ end }}", data), Ok("b"));
-  assert_eq(over("{{ . | json }}", of_json(json::int(3))), Ok("3"));
+  assert_eq(
+    render_with_partials("{{ for k, v in at }}{{ k }}:{{ v }}{{ end }}", data),
+    Ok("city:Oslo"),
+  );
+  assert_eq(render_with_partials("{{ if gone }}a{{ else }}b{{ end }}", data), Ok("b"));
+  assert_eq(render_with_partials("{{ . | json }}", of_json(json::int(3))), Ok("3"));
   assert_eq(of_json(json::Null), reflect(vacant()));
   assert_eq(
-    over("{{ pieces }}", of_json(json::object([{ key: "pieces", value: json::Str("<b>") }]))),
+    render_with_partials(
+      "{{ pieces }}",
+      of_json(json::object([{ key: "pieces", value: json::Str("<b>") }])),
+    ),
     Ok("<b>"),
   )
 }
@@ -1401,7 +1467,7 @@ fn vacant() -> Option<Int> = None
 
 type Link = { label: String, kind: String }
 
-type Page = {
+type HtmlOutput = {
   name: String,
   url: String,
   q: String,
@@ -1415,7 +1481,7 @@ type Page = {
 }
 
 fn page() -> Value = {
-  let p: Page = {
+  let p: HtmlOutput = {
     name: "<b>O'Neil & \"Co\"</b>",
     url: "/a b?c=d&e",
     q: "a b&c=/",
@@ -1430,10 +1496,10 @@ fn page() -> Value = {
   reflect(p)
 }
 
-fn page_over(source: String, data: Value) -> Result<String, Failure> / {abort.raise} =
+fn render_page(source: String, data: Value) -> Result<String, Failure> / {abort.raise} =
   match parse_html(source) {
     Ok(t) -> render(t, data, html_partials(), default_limits()),
-    Err(r) -> panic("refused: " ++ explain(r.why)),
+    Err(r) -> panic("refused: " ++ explain(r.reason)),
   }
 
 fn html_partials() -> Map<String, Template> / {abort.raise} =
@@ -1442,18 +1508,18 @@ fn html_partials() -> Map<String, Template> / {abort.raise} =
       key: "link",
       value: match parse_html("<a class=\"{{ kind }}\">{{ label }}</a>") {
         Ok(t) -> t,
-        Err(r) -> panic(explain(r.why)),
+        Err(r) -> panic(explain(r.reason)),
       },
     },
     {
       key: "plain",
-      value: match parse("<{{ label }}>") { Ok(t) -> t, Err(r) -> panic(explain(r.why)) },
+      value: match parse("<{{ label }}>") { Ok(t) -> t, Err(r) -> panic(explain(r.reason)) },
     },
   ])
 
 /// The places a value stands in, after the contexts Go's `html/template` tells apart, each with
 /// what this module writes there.
-fn placings() -> List<Filled> =
+fn html_fill_cases() -> List<FillCase> =
   [
     {
       source: "<p>{{ name }}</p>",
@@ -1551,99 +1617,98 @@ fn placings() -> List<Filled> =
     },
   ]
 
-test "as HTML, `{c.source}` writes each value as its place reads it" for c: Filled in placings() {
-  assert_eq(page_over(c.source, page()), Ok(c.text))
-}
+test "as HTML, `{c.source}` writes each value as its place reads it" for c: FillCase in html_fill_cases(
+  ) { assert_eq(render_page(c.source, page()), Ok(c.text)) }
 
-fn unplaceable() -> List<Refused> =
+fn html_error_cases() -> List<ErrorCase> =
   [
     {
       source: "<script>var n = {{ n }};</script>",
       offset: 16,
-      why: Misplaced("a hole in `<script>` would be read as its code"),
+      reason: Misplaced("a hole in `<script>` would be read as its code"),
     },
     {
       source: "<style>p { width: {{ n }}px }</style>",
       offset: 18,
-      why: Misplaced("a hole in `<style>` would be read as its code"),
+      reason: Misplaced("a hole in `<style>` would be read as its code"),
     },
     {
       source: "<a onclick=\"go({{ n }})\">x</a>",
       offset: 15,
-      why: Misplaced("a hole in `onclick` would be read as code, which no escaping makes text"),
+      reason: Misplaced("a hole in `onclick` would be read as code, which no escaping makes text"),
     },
     {
       source: "<p style=\"width: {{ n }}px\">x</p>",
       offset: 17,
-      why: Misplaced("a hole in `style` would be read as code, which no escaping makes text"),
+      reason: Misplaced("a hole in `style` would be read as code, which no escaping makes text"),
     },
     {
       source: "<p {{ name }}>x</p>",
       offset: 3,
-      why: Misplaced("a hole stands in an element's content or in an attribute's value"),
+      reason: Misplaced("a hole stands in an element's content or in an attribute's value"),
     },
     {
       source: "<{{ name }}>x",
       offset: 1,
-      why: Misplaced("a hole stands in an element's content or in an attribute's value"),
+      reason: Misplaced("a hole stands in an element's content or in an attribute's value"),
     },
     {
       source: "<p class=a{{ name }}>x</p>",
       offset: 10,
-      why: Misplaced("quote the value: a hole stands inside its quotes, or as the whole of it"),
+      reason: Misplaced("quote the value: a hole stands inside its quotes, or as the whole of it"),
     },
-    { source: "<!-- {{ name }} -->", offset: 5, why: Misplaced("a comment holds no hole") },
+    { source: "<!-- {{ name }} -->", offset: 5, reason: Misplaced("a comment holds no hole") },
     {
       source: "<a href=\"javascript:go({{ n }})\">x</a>",
       offset: 23,
-      why: Misplaced(
+      reason: Misplaced(
         "a hole stands in a URL with no scheme, or with `http`, `https`, `mailto` or `tel`: this one's is `javascript`",
       ),
     },
     {
       source: "<a href=\"{{ if on }}/a{{ else }}?{{ end }}{{ n }}\">x</a>",
       offset: 42,
-      why: Misplaced("the markup before this hole leaves its URL at more than one part"),
+      reason: Misplaced("the markup before this hole leaves its URL at more than one part"),
     },
     {
       source: "<a href=\"{{ name }}://example.com\">x</a>",
       offset: 19,
-      why: Markup(
+      reason: Markup(
         "a `:` here makes the value before it the URL's scheme: write the scheme out, or let one hole hold the whole URL",
       ),
     },
     {
       source: "a < b",
       offset: 3,
-      why: Markup(html::explain(html::InvalidFirstCharacterOfTagName)),
+      reason: Markup(html::explain(html::InvalidFirstCharacterOfTagName)),
     },
-    { source: "<p>{{ n }}</p", offset: 13, why: Markup(html::explain(html::EofInTag)) },
-    { source: "<p title=\"{{ n }}", offset: 17, why: Markup(html::explain(html::EofInTag)) },
+    { source: "<p>{{ n }}</p", offset: 13, reason: Markup(html::explain(html::EofInTag)) },
+    { source: "<p title=\"{{ n }}", offset: 17, reason: Markup(html::explain(html::EofInTag)) },
     {
       source: "<p{{ for l in links }} data-{{! none }}k=\"{{ l.label }}\"{{ end }}>x</p>",
       offset: 40,
-      why: Markup(html::explain(html::DuplicateAttribute)),
+      reason: Markup(html::explain(html::DuplicateAttribute)),
     },
     {
       source: "<img srcset=\"/a.png {{ n }}x\">",
       offset: 20,
-      why: Misplaced("a hole in a `srcset` stands in a candidate's URL, not in its descriptors"),
+      reason: Misplaced("a hole in a `srcset` stands in a candidate's URL, not in its descriptors"),
     },
-    { source: "{{ if on }}<p{{ end }}>x</p>", offset: 0, why: Uneven },
-    { source: "<p{{ if on }} title=\"{{ else }}>{{ end }}", offset: 2, why: Uneven },
-    { source: "<p title=\"{{ for l in links }}\"{{ end }}>", offset: 10, why: Uneven },
-    { source: "{{ for l in links }}<p {{ end }}>", offset: 0, why: Uneven },
-    { source: "<p>{{ for l in links }}<b{{ else }}<i>{{ end }}</p>", offset: 3, why: Uneven },
-    { source: "<p>{{ name | html }}</p>", offset: 3, why: EscapedTwice("html") },
-    { source: "<a href=\"/s?q={{ q | url }}\">x</a>", offset: 14, why: EscapedTwice("url") },
-    { source: "<p>{{ include \"link\" . | html }}</p>", offset: 3, why: EscapedTwice("html") },
+    { source: "{{ if on }}<p{{ end }}>x</p>", offset: 0, reason: Uneven },
+    { source: "<p{{ if on }} title=\"{{ else }}>{{ end }}", offset: 2, reason: Uneven },
+    { source: "<p title=\"{{ for l in links }}\"{{ end }}>", offset: 10, reason: Uneven },
+    { source: "{{ for l in links }}<p {{ end }}>", offset: 0, reason: Uneven },
+    { source: "<p>{{ for l in links }}<b{{ else }}<i>{{ end }}</p>", offset: 3, reason: Uneven },
+    { source: "<p>{{ name | html }}</p>", offset: 3, reason: EscapedTwice("html") },
+    { source: "<a href=\"/s?q={{ q | url }}\">x</a>", offset: 14, reason: EscapedTwice("url") },
+    { source: "<p>{{ include \"link\" . | html }}</p>", offset: 3, reason: EscapedTwice("html") },
   ]
 
-test "as HTML, `{c.source}` is refused where it is read" for c: Refused in unplaceable() {
+test "as HTML, `{c.source}` is refused where it is read" for c: ErrorCase in html_error_cases() {
   let place = position(c.source, c.offset);
   assert_eq(
     parse_html(c.source),
-    Err({ offset: c.offset, line: place.line, column: place.column, why: c.why }),
+    Err({ offset: c.offset, line: place.line, column: place.column, reason: c.reason }),
   )
 }
 
@@ -1655,7 +1720,7 @@ test "loops nested thirty deep in an attribute are read as HTML" {
 
 test "a value that would name a URL's scheme fails the filling, unless it is vouched for" {
   let why = |source: String|
-    match page_over(source, page()) { Ok(text) -> Ok(text), Err(f) -> Err(f.why) };
+    match render_page(source, page()) { Ok(text) -> Ok(text), Err(f) -> Err(f.reason) };
   assert_eq(why("<a href=\"{{ js }}\">x</a>"), Err(UnsafeUrl("JavaScript")));
   assert_eq(why("<a href={{ js }}>x</a>"), Err(UnsafeUrl("JavaScript")));
   assert_eq(why("<a href=\"x{{ js }}\">x</a>"), Err(UnsafeUrl("JavaScript")));
@@ -1670,9 +1735,9 @@ test "a value that would name a URL's scheme fails the filling, unless it is vou
   assert_eq(why("<a href=\"{{ safe }}\">x</a>"), Ok("<a href=\"1%20%3C%202\">x</a>"));
   let bold = match html::literal("<b>x</b>") { Ok(h) -> h, Err(_) -> html::text("") };
   assert_eq(
-    match page_over("<a href=\"{{ m }}\">x</a>", reflect({ m: bold })) {
+    match render_page("<a href=\"{{ m }}\">x</a>", reflect({ m: bold })) {
       Ok(text) -> Ok(text),
-      Err(f) -> Err(f.why),
+      Err(f) -> Err(f.reason),
     },
     Err(WrongKind("the text of a URL", "markup")),
   );
@@ -1696,7 +1761,7 @@ test "a template's filling is markup or text, whichever way it was read" {
   let filled_as = |t: Template|
     match render_html(t, data, Map::new(), default_limits()) {
       Ok(page) -> html::render(page),
-      Err(f) -> explain(f.why),
+      Err(f) -> explain(f.reason),
     };
   assert_eq(filled_as(markup), "<b>a&lt;b</b>");
   assert_eq(filled_as(words), "&lt;b&gt;a&lt;b&lt;/b&gt;");
@@ -1739,8 +1804,8 @@ test "a value written into a URL never gives it a scheme but `http`, `https`, `m
   gen::check2(html::hostile(), gen::any_int(), |h: html::Hostile, n: Int| {
     let source = url_sources().at_or(n & 15, "<a href=\"{{ u }}\">x</a>");
     let data = reflect({ u: html::hostile_text(h), on: true });
-    match page_over(source, data) {
-      Err(f) -> match f.why { UnsafeUrl(_) -> true, _ -> false },
+    match render_page(source, data) {
+      Err(f) -> match f.reason { UnsafeUrl(_) -> true, _ -> false },
       Ok(text) -> match html::browser_scheme(href_of(text)) {
         None -> true,
         Some(scheme) ->
@@ -1802,15 +1867,15 @@ fn sketch_data() -> Value =
   reflect({ s: "\"'><script>&:/?#", n: 1, on: true, off: false, xs: ["a b", "'\"", ""] })
 
 fn sketch_partials() -> Map<String, Template> / {abort.raise} =
-  match parse_html("<i>{{ s }}</i>") { Ok(t) -> #{"p": t}, Err(r) -> panic(explain(r.why)) }
+  match parse_html("<i>{{ s }}</i>") { Ok(t) -> #{"p": t}, Err(r) -> panic(explain(r.reason)) }
 
 test "a template read as HTML fills to markup `std.html` reads again, and by no defect" {
   gen::check(sketches(), |k: Sketch| {
     match k {
       Sketch(source) -> match parse_html(source) {
-        Err(r) -> match r.why { Defect(_) -> false, _ -> true },
+        Err(r) -> match r.reason { Defect(_) -> false, _ -> true },
         Ok(t) -> match render(t, sketch_data(), sketch_partials(), default_limits()) {
-          Err(f) -> match f.why { Defect(_) -> false, _ -> true },
+          Err(f) -> match f.reason { Defect(_) -> false, _ -> true },
           Ok(text) -> match html::literal(text) { Ok(_) -> true, Err(_) -> false },
         },
       },
@@ -1822,9 +1887,9 @@ test "a template read as text is filled or fails, and by no defect" {
   gen::check(sketches(), |k: Sketch| {
     match k {
       Sketch(source) -> match parse(source) {
-        Err(r) -> match r.why { Defect(_) -> false, _ -> true },
+        Err(r) -> match r.reason { Defect(_) -> false, _ -> true },
         Ok(t) -> match render(t, sketch_data(), sketch_partials(), default_limits()) {
-          Err(f) -> match f.why { Defect(_) -> false, _ -> true },
+          Err(f) -> match f.reason { Defect(_) -> false, _ -> true },
           Ok(_) -> true,
         },
       },

@@ -149,15 +149,15 @@ fn flag_byte(flags: Int) -> Bytes =
   match try[abort.raise] { byte_of_int(flags & 0xFF) } { Ok(b) -> b, Err(_) -> b"\x00" }
 
 /// Why a `traceparent` was refused.
-pub type Why =
+pub type ErrorKind =
   /// Fewer than the 55 characters every version has.
   | Short
   /// Version `ff`, which the Recommendation forbids.
   | Version
   /// A character that is not a lower-case hex digit where one belongs.
-  | Digit
+  | NotHexDigit
   /// A character that is not `-` where one separates two fields.
-  | Dash
+  | MissingDash
   /// A trace id of all zeros.
   | ZeroTrace
   /// A parent id of all zeros.
@@ -167,25 +167,25 @@ pub type Why =
   | Trailing
 
 /// A refusal, and the character it was refused at.
-pub type Refusal = new { why: Why, at: Int }
+pub type Error = new { reason: ErrorKind, at: Int }
 
 /// The `traceparent` a header's text is, or why it is none.
-pub fn parse(text: String) -> Result<Traceparent, Refusal> =
-  match try[abort.raise] { parsed(Bytes::of_string(text)) } {
+pub fn parse(text: String) -> Result<Traceparent, Error> =
+  match try[abort.raise] { parse_bytes(Bytes::of_string(text)) } {
     Ok(answer) -> answer,
-    Err(_) -> Err({ why: Short, at: 0 }),
+    Err(_) -> Err({ reason: Short, at: 0 }),
   }
 
-fn parsed(raw: Bytes) -> Result<Traceparent, Refusal> / {abort.raise} = {
+fn parse_bytes(raw: Bytes) -> Result<Traceparent, Error> / {abort.raise} = {
   let n = raw.len();
-  if n < 55 { Err({ why: Short, at: n }) } else {
+  if n < 55 { Err({ reason: Short, at: n }) } else {
     match first_misplaced(raw) {
       Some(refusal) -> Err(refusal),
       None -> {
         let version = raw.slice(0, 2);
-        if version == b"ff" { Err({ why: Version, at: 0 }) }
+        if version == b"ff" { Err({ reason: Version, at: 0 }) }
         else if n > 55 && (version == b"00" || raw.at(55) != b'-') {
-          Err({ why: Trailing, at: 55 })
+          Err({ reason: Trailing, at: 55 })
         } else { ids_of(raw) }
       },
     }
@@ -193,25 +193,26 @@ fn parsed(raw: Bytes) -> Result<Traceparent, Refusal> / {abort.raise} = {
 }
 
 /// The first of the 55 characters that is not what version `00` has in its place.
-fn first_misplaced(raw: Bytes) -> Option<Refusal> / {abort.raise} =
-  range(0, 55).fold(None, |found: Option<Refusal>, i: Int| -> Option<Refusal> {
+fn first_misplaced(raw: Bytes) -> Option<Error> / {abort.raise} =
+  range(0, 55).fold(None, |found: Option<Error>, i: Int| -> Option<Error> {
     match found { Some(_) -> found, None -> misplaced(raw.at(i), i) }
   })
 
-fn misplaced(c: Int, i: Int) -> Option<Refusal> =
-  if i == 2 || i == 35 || i == 52 { if c == b'-' { None } else { Some({ why: Dash, at: i }) } }
-  else if is_lower_hex(c) { None }
-  else { Some({ why: Digit, at: i }) }
+fn misplaced(c: Int, i: Int) -> Option<Error> =
+  if i == 2 || i == 35 || i == 52 {
+    if c == b'-' { None } else { Some({ reason: MissingDash, at: i }) }
+  } else if is_lower_hex(c) { None }
+  else { Some({ reason: NotHexDigit, at: i }) }
 
 fn is_lower_hex(c: Int) -> Bool = match c { b'0'..=b'9' | b'a'..=b'f' -> true, _ -> false }
 
-fn ids_of(raw: Bytes) -> Result<Traceparent, Refusal> / {abort.raise} = {
+fn ids_of(raw: Bytes) -> Result<Traceparent, Error> / {abort.raise} = {
   let hex_at = |from: Int, to: Int|
     match hex::decode(String::of_bytes(raw.slice(from, to))) { Some(b) -> b, None -> b"" };
   match trace_id(hex_at(3, 35)) {
-    None -> Err({ why: ZeroTrace, at: 3 }),
+    None -> Err({ reason: ZeroTrace, at: 3 }),
     Some(trace) -> match span_id(hex_at(36, 52)) {
-      None -> Err({ why: ZeroParent, at: 36 }),
+      None -> Err({ reason: ZeroParent, at: 36 }),
       Some(parent) -> Ok({ trace_id: trace, parent_id: parent, flags: hex_at(53, 55).at(0) }),
     },
   }
@@ -221,16 +222,16 @@ fn ids_of(raw: Bytes) -> Result<Traceparent, Refusal> / {abort.raise} = {
 pub fn literal(text: String) -> Result<Traceparent, { message: String, offset: Int }> =
   match parse(text) {
     Ok(t) -> Ok(t),
-    Err(r) -> Err({ message: reason(r.why), offset: min(r.at, text.len()) }),
+    Err(r) -> Err({ message: reason(r.reason), offset: min(r.at, text.len()) }),
   }
 
 /// A refusal in words.
-pub fn reason(why: Why) -> String =
+pub fn reason(why: ErrorKind) -> String =
   match why {
     Short -> "a traceparent is 55 characters: `00-`, 32 hex digits, `-`, 16, `-` and 2",
     Version -> "version `ff` is not a version",
-    Digit -> "a lower-case hex digit goes here",
-    Dash -> "a `-` goes here",
+    NotHexDigit -> "a lower-case hex digit goes here",
+    MissingDash -> "a `-` goes here",
     ZeroTrace -> "a trace id is not all zeros",
     ZeroParent -> "a parent id is not all zeros",
     Trailing -> "nothing follows the flags of version `00`, and only a `-` those of a later one",
@@ -272,7 +273,8 @@ pub fn max_length() -> Int = 512
 pub fn empty() -> Tracestate = Tracestate([])
 
 /// The entries, the one last written first.
-pub fn entries(state: Tracestate) -> List<Entry> = match state { Tracestate(held) -> held }
+pub fn entries(state: Tracestate) -> List<Entry> =
+  match state { Tracestate(entry_list) -> entry_list }
 
 /// The value under `key`.
 pub fn get(state: Tracestate, key: String) -> Option<String> =
@@ -299,9 +301,12 @@ pub fn remove(state: Tracestate, key: String) -> Tracestate =
 /// lower-case letters, digits and `_-*/`, or `tenant@system`, where the tenant may open with a
 /// digit and holds up to 241 characters and the system up to 14.
 pub fn is_key(key: String) -> Bool =
-  match try[abort.raise] { key_of(Bytes::of_string(key)) } { Ok(answer) -> answer, Err(_) -> false }
+  match try[abort.raise] { is_key_bytes(Bytes::of_string(key)) } {
+    Ok(answer) -> answer,
+    Err(_) -> false,
+  }
 
-fn key_of(raw: Bytes) -> Bool / {abort.raise} =
+fn is_key_bytes(raw: Bytes) -> Bool / {abort.raise} =
   match raw.index_of_byte(b'@') {
     None -> key_part(raw, 256, false),
     Some(at) ->
@@ -320,12 +325,12 @@ fn is_key_start(c: Int, digit_first: Bool) -> Bool =
 /// Whether `value` is one a `tracestate` may hold: up to 256 printable ASCII characters, none
 /// of them `,` or `=`, the last of them not a space.
 pub fn is_value(value: String) -> Bool =
-  match try[abort.raise] { value_of(Bytes::of_string(value)) } {
+  match try[abort.raise] { is_value_bytes(Bytes::of_string(value)) } {
     Ok(answer) -> answer,
     Err(_) -> false,
   }
 
-fn value_of(raw: Bytes) -> Bool / {abort.raise} = {
+fn is_value_bytes(raw: Bytes) -> Bool / {abort.raise} = {
   let n = raw.len();
   n >= 1 && n <= 256 && raw.at(n - 1) != b' ' && range(0, n).all(|i: Int| is_value_char(raw.at(i)))
 }
@@ -333,7 +338,7 @@ fn value_of(raw: Bytes) -> Bool / {abort.raise} = {
 fn is_value_char(c: Int) -> Bool = c >= 0x20 && c <= 0x7E && c != b',' && c != b'='
 
 /// Why a `tracestate` was refused.
-pub type StateWhy =
+pub type StateErrorKind =
   /// An entry with no `=`.
   | NoValue
   /// A key outside the grammar.
@@ -341,54 +346,51 @@ pub type StateWhy =
   /// A value outside the grammar.
   | BadValue
   /// A key written twice.
-  | Twice
+  | DuplicateKey
   /// More than `max_entries` entries.
   | TooMany
 
 /// A refusal, and which list member it was refused at, counted from zero.
-pub type StateRefusal = new { why: StateWhy, member: Int }
+pub type StateError = new { reason: StateErrorKind, member: Int }
 
 /// The `tracestate` a header's text is, or why it is none. Several header lines are one text
 /// joined by commas; spaces and tabs around a member, and empty members, are passed over.
-pub fn parse_state(text: String) -> Result<Tracestate, StateRefusal> =
-  match try[abort.raise] { state_of(Bytes::of_string(text).split(b",")) } {
+pub fn parse_state(text: String) -> Result<Tracestate, StateError> =
+  match try[abort.raise] { parse_members(Bytes::of_string(text).split(b",")) } {
     Ok(answer) -> answer,
-    Err(_) -> Err({ why: NoValue, member: 0 }),
+    Err(_) -> Err({ reason: NoValue, member: 0 }),
   }
 
-fn state_of(members: List<Bytes>) -> Result<Tracestate, StateRefusal> / {abort.raise} = {
-  let start: Result<List<Entry>, StateRefusal> = Ok([]);
-  let read = range(0, members.len()).fold(
-    start,
-    |acc: Result<List<Entry>, StateRefusal>, i: Int|
-      match acc {
-        Err(_) -> acc,
-        Ok(held) -> match members.at(i) {
-          None -> acc,
-          Some(member) ->
-            member_of(held, Bytes::of_string(String::of_bytes_lossy(member).ascii_trim()), i),
-        },
+fn parse_members(members: List<Bytes>) -> Result<Tracestate, StateError> / {abort.raise} = {
+  let start: Result<List<Entry>, StateError> = Ok([]);
+  let read = range(0, members.len()).fold(start, |acc: Result<List<Entry>, StateError>, i: Int|
+    match acc {
+      Err(_) -> acc,
+      Ok(entry_list) -> match members.at(i) {
+        None -> acc,
+        Some(member) ->
+          add_member(entry_list, Bytes::of_string(String::of_bytes_lossy(member).ascii_trim()), i),
       },
-  );
-  match read { Ok(held) -> Ok(Tracestate(held)), Err(e) -> Err(e) }
+    });
+  match read { Ok(entry_list) -> Ok(Tracestate(entry_list)), Err(e) -> Err(e) }
 }
 
-fn member_of(
-  held: List<Entry>,
+fn add_member(
+  entry_list: List<Entry>,
   member: Bytes,
   i: Int,
-) -> Result<List<Entry>, StateRefusal> / {abort.raise} =
-  if member.len() == 0 { Ok(held) } else {
+) -> Result<List<Entry>, StateError> / {abort.raise} =
+  if member.len() == 0 { Ok(entry_list) } else {
     match member.index_of_byte(b'=') {
-      None -> Err({ why: NoValue, member: i }),
+      None -> Err({ reason: NoValue, member: i }),
       Some(at) -> {
         let key = String::of_bytes_lossy(member.slice(0, at));
         let value = String::of_bytes_lossy(member.slice(at + 1, member.len()));
-        if !is_key(key) { Err({ why: BadKey, member: i }) }
-        else if !is_value(value) { Err({ why: BadValue, member: i }) }
-        else if held.any(|e: Entry| e.key == key) { Err({ why: Twice, member: i }) }
-        else if held.len() >= max_entries() { Err({ why: TooMany, member: i }) }
-        else { Ok(held.push({ key: key, value: value })) }
+        if !is_key(key) { Err({ reason: BadKey, member: i }) }
+        else if !is_value(value) { Err({ reason: BadValue, member: i }) }
+        else if entry_list.any(|e: Entry| e.key == key) { Err({ reason: DuplicateKey, member: i }) }
+        else if entry_list.len() >= max_entries() { Err({ reason: TooMany, member: i }) }
+        else { Ok(entry_list.push({ key: key, value: value })) }
       },
     }
   }
@@ -397,24 +399,27 @@ fn member_of(
 /// characters. Past that, entries longer than 128 characters go first, the last of them
 /// first, and then entries from the end, which is the order the Recommendation gives.
 pub fn render_state(state: Tracestate) -> String =
-  String::join(fitted(entries(state), entries(state).len()).map(written), ",")
+  String::join(fit_entries(entries(state), entries(state).len()).map(entry_text), ",")
 
-fn written(e: Entry) -> String = e.key ++ "=" ++ e.value
+fn entry_text(e: Entry) -> String = e.key ++ "=" ++ e.value
 
-fn length_of(held: List<Entry>) -> Int =
-  held.fold(0, |n: Int, e: Entry| n + written(e).len()) + max(held.len() - 1, 0)
+fn length_of(entry_list: List<Entry>) -> Int =
+  entry_list.fold(0, |n: Int, e: Entry| n + entry_text(e).len()) + max(entry_list.len() - 1, 0)
 
-fn fitted(held: List<Entry>, left: Int) -> List<Entry> =
-  if left <= 0 || length_of(held) <= max_length() { held } else {
-    let long = range(0, held.len()).fold(None, |found: Option<Int>, i: Int|
-      match held.at(i) {
-        Some(e) -> if written(e).len() > 128 { Some(i) } else { found },
+fn fit_entries(entry_list: List<Entry>, left: Int) -> List<Entry> =
+  if left <= 0 || length_of(entry_list) <= max_length() { entry_list } else {
+    let long = range(0, entry_list.len()).fold(None, |found: Option<Int>, i: Int|
+      match entry_list.at(i) {
+        Some(e) -> if entry_text(e).len() > 128 { Some(i) } else { found },
         None -> found,
       });
-    let drop = match long { Some(i) -> i, None -> held.len() - 1 };
-    fitted(
-      range(0, held.len()).fold([], |acc: List<Entry>, i: Int|
-        match held.at(i) { Some(e) -> if i == drop { acc } else { acc.push(e) }, None -> acc }),
+    let drop = match long { Some(i) -> i, None -> entry_list.len() - 1 };
+    fit_entries(
+      range(0, entry_list.len()).fold([], |acc: List<Entry>, i: Int|
+        match entry_list.at(i) {
+          Some(e) -> if i == drop { acc } else { acc.push(e) },
+          None -> acc,
+        }),
       left - 1,
     )
   }
@@ -463,79 +468,79 @@ test "the Recommendation's example reads as its parts" {
       assert(!random(t));
       assert_eq(render(t), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
     },
-    Err(r) -> panic(reason(r.why)),
+    Err(r) -> panic(reason(r.reason)),
   }
 }
 
-type Refused = { name: String, text: String, why: Why, at: Int }
+type ErrorCase = { name: String, text: String, reason: ErrorKind, at: Int }
 
-fn refused_parents() -> List<Refused> =
+fn parent_error_cases() -> List<ErrorCase> =
   [
-    { name: "nothing", text: "", why: Short, at: 0 },
+    { name: "nothing", text: "", reason: Short, at: 0 },
     {
       name: "a flag digit short",
       text: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0",
-      why: Short,
+      reason: Short,
       at: 54,
     },
     {
       name: "version ff",
       text: "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-      why: Version,
+      reason: Version,
       at: 0,
     },
     {
       name: "an upper-case digit",
       text: "00-4BF92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-      why: Digit,
+      reason: NotHexDigit,
       at: 4,
     },
     {
       name: "a version that is no hex",
       text: "0g-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-      why: Digit,
+      reason: NotHexDigit,
       at: 1,
     },
     {
       name: "a field one digit long",
       text: "00-4bf92f3577b34da6a3ce929d0e0e47360-0f067aa0ba902b7-01",
-      why: Dash,
+      reason: MissingDash,
       at: 35,
     },
     {
       name: "a trace id of zeros",
       text: "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
-      why: ZeroTrace,
+      reason: ZeroTrace,
       at: 3,
     },
     {
       name: "a parent id of zeros",
       text: "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
-      why: ZeroParent,
+      reason: ZeroParent,
       at: 36,
     },
     {
       name: "version 00 with more after its flags",
       text: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
-      why: Trailing,
+      reason: Trailing,
       at: 55,
     },
     {
       name: "a later version with more that no dash opens",
       text: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01extra",
-      why: Trailing,
+      reason: Trailing,
       at: 55,
     },
     {
       name: "flags that are no hex",
       text: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0x",
-      why: Digit,
+      reason: NotHexDigit,
       at: 54,
     },
   ]
 
-test "a traceparent is refused: {c.name}" for c: Refused in refused_parents() {
-  assert_eq(parse(c.text), Err({ why: c.why, at: c.at }))
+test "a traceparent is refused: {c.name}" for c: ErrorCase in parent_error_cases() {
+  assert_eq(parse(c.text), Err({ reason: c.reason, at: c.at }))
 }
 
 test "a later version is read by its first 55 characters and written back as version 00" {
@@ -556,7 +561,7 @@ test "a later version is read by its first 55 characters and written back as ver
         None -> panic("a span id"),
       }
     },
-    Err(r) -> panic(reason(r.why)),
+    Err(r) -> panic(reason(r.reason)),
   }
 }
 
@@ -568,7 +573,7 @@ test "the sampled flag is set and cleared without touching the others" {
       assert_eq(with_sampled(t, true).flags, 3);
       assert_eq(with_sampled(with_sampled(t, true), false), t)
     },
-    Err(r) -> panic(reason(r.why)),
+    Err(r) -> panic(reason(r.reason)),
   }
 }
 
@@ -624,31 +629,31 @@ test "a tracestate is read in order, around its optional white space and empty m
   }
 }
 
-type StateCase = { name: String, text: String, why: StateWhy, member: Int }
+type StateCase = { name: String, text: String, reason: StateErrorKind, member: Int }
 
-fn refused_states() -> List<StateCase> =
+fn state_error_cases() -> List<StateCase> =
   [
-    { name: "a member with no value", text: "rojo=1,congo", why: NoValue, member: 1 },
-    { name: "a key in upper case", text: "Rojo=1", why: BadKey, member: 0 },
-    { name: "an empty value", text: "rojo=", why: BadValue, member: 0 },
-    { name: "a value holding an equals sign", text: "rojo=a=b", why: BadValue, member: 0 },
-    { name: "a key written twice", text: "rojo=1,congo=2,rojo=3", why: Twice, member: 2 },
+    { name: "a member with no value", text: "rojo=1,congo", reason: NoValue, member: 1 },
+    { name: "a key in upper case", text: "Rojo=1", reason: BadKey, member: 0 },
+    { name: "an empty value", text: "rojo=", reason: BadValue, member: 0 },
+    { name: "a value holding an equals sign", text: "rojo=a=b", reason: BadValue, member: 0 },
+    { name: "a key written twice", text: "rojo=1,congo=2,rojo=3", reason: DuplicateKey, member: 2 },
   ]
 
-test "a tracestate is refused: {c.name}" for c: StateCase in refused_states() {
-  assert_eq(parse_state(c.text), Err({ why: c.why, member: c.member }))
+test "a tracestate is refused: {c.name}" for c: StateCase in state_error_cases() {
+  assert_eq(parse_state(c.text), Err({ reason: c.reason, member: c.member }))
 }
 
-fn numbered(n: Int) -> String =
+fn numbered_entries(n: Int) -> String =
   String::join(range(0, n).map(|i: Int| "k" ++ i.to_string() ++ "=v"), ",")
 
 test "a tracestate holds 32 entries and no more" {
   assert_eq(
-    match parse_state(numbered(32)) { Ok(state) -> entries(state).len(), Err(_) -> -1 },
+    match parse_state(numbered_entries(32)) { Ok(state) -> entries(state).len(), Err(_) -> -1 },
     32,
   );
-  assert_eq(parse_state(numbered(33)), Err({ why: TooMany, member: 32 }));
-  match parse_state(numbered(32)) {
+  assert_eq(parse_state(numbered_entries(33)), Err({ reason: TooMany, member: 32 }));
+  match parse_state(numbered_entries(32)) {
     Ok(full) -> match put(full, "mine", "1") {
       Some(next) -> {
         assert_eq(entries(next).len(), 32);
@@ -671,11 +676,17 @@ test "an update moves its entry to the front and keeps the others in order" {
   }
 }
 
-fn wide(key: String, n: Int) -> String = key ++ "=" ++ "a".repeat(n)
+fn long_entry(key: String, n: Int) -> String = key ++ "=" ++ "a".repeat(n)
 
 test "a tracestate past 512 characters loses its long entries first, then its last ones" {
   let text = String::join(
-    [wide("a", 120), wide("long", 200), wide("b", 120), wide("c", 120), wide("d", 120)],
+    [
+      long_entry("a", 120),
+      long_entry("long", 200),
+      long_entry("b", 120),
+      long_entry("c", 120),
+      long_entry("d", 120),
+    ],
     ",",
   );
   match parse_state(text) {
@@ -685,17 +696,20 @@ test "a tracestate past 512 characters loses its long entries first, then its la
       assert(out.len() <= 512);
       assert_eq(
         out,
-        String::join([wide("a", 120), wide("b", 120), wide("c", 120), wide("d", 120)], ","),
+        String::join(
+          [long_entry("a", 120), long_entry("b", 120), long_entry("c", 120), long_entry("d", 120)],
+          ",",
+        ),
       )
     },
     Err(_) -> panic("refused"),
   };
-  let even = String::join(range(0, 6).map(|i: Int| wide("k" ++ i.to_string(), 100)), ",");
+  let even = String::join(range(0, 6).map(|i: Int| long_entry("k" ++ i.to_string(), 100)), ",");
   match parse_state(even) {
     Ok(state) ->
       assert_eq(
         render_state(state),
-        String::join(range(0, 4).map(|i: Int| wide("k" ++ i.to_string(), 100)), ","),
+        String::join(range(0, 4).map(|i: Int| long_entry("k" ++ i.to_string(), 100)), ","),
       ),
     Err(_) -> panic("refused"),
   }

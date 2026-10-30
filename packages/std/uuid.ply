@@ -65,7 +65,7 @@ pub fn uuid_gen() -> Gen<Uuid> =
     if pick == 0 { gen::constant(uuid_nil()) }
     else if pick == 1 { gen::constant(uuid_max()) } else {
       gen::map2(gen::bytes_of(16), gen::below(16), |raw: Bytes, version: Int|
-        laid_out(raw, version, variant_picked(pick)))
+        with_version_and_variant(raw, version, variant_picked(pick)))
     })
 
 fn variant_picked(pick: Int) -> UuidVariant =
@@ -109,7 +109,7 @@ pub fn literal(text: String) -> Result<Uuid, { message: String, offset: Int }> /
     None -> {
       let n = text.len();
       let stray = range(0, min(n, 36)).fold(None, |found: Option<Int>, i: Int|
-        if found != None || placed(text, i) { found } else { Some(i) });
+        if found != None || is_canonical_at(text, i) { found } else { Some(i) });
       Err(match stray {
         Some(i) ->
           { message: if hyphen_at(i) { "a `-` goes here" } else { "not a hex digit" }, offset: i },
@@ -121,7 +121,7 @@ pub fn literal(text: String) -> Result<Uuid, { message: String, offset: Int }> /
 fn hyphen_at(i: Int) -> Bool = i == 8 || i == 13 || i == 18 || i == 23
 
 /// Whether the character at `i` is what the canonical form has there.
-fn placed(text: String, i: Int) -> Bool / {abort.raise} = {
+fn is_canonical_at(text: String, i: Int) -> Bool / {abort.raise} = {
   let c = text.slice(i, i + 1);
   if hyphen_at(i) { c == "-" } else { is_hex(c.ascii_lower()) }
 }
@@ -174,7 +174,11 @@ fn field(u: Uuid, from: Int, to: Int) -> Int / {abort.raise} =
   range(from, to).fold(0, |n: Int, i: Int| n << 8 | u.octets.at(i))
 
 /// `raw`'s sixteen octets with `version` and `variant` written over the bits that state them.
-fn laid_out(raw: Bytes, version: Int, variant: UuidVariant) -> Uuid / {abort.raise} = {
+fn with_version_and_variant(
+  raw: Bytes,
+  version: Int,
+  variant: UuidVariant,
+) -> Uuid / {abort.raise} = {
   let lead = variant_bits(variant);
   {
     octets: Bytes::concat_all([
@@ -207,7 +211,7 @@ pub fn uuid_v4() -> Uuid / {entropy.next bounded, abort.raise} = {
     low_octets(entropy.next(), 6),
     low_octets(entropy.next(), 4),
   ]);
-  laid_out(raw, 4, Rfc)
+  with_version_and_variant(raw, 4, Rfc)
 }
 
 fn low_octets(n: Int, count: Int) -> Bytes / {abort.raise} = u64_be(n).slice(8 - count, 8)
@@ -238,7 +242,7 @@ pub fn uuid_namespace_x500() -> Uuid =
 /// whoever picks the names can make two that share an identifier, so it tells apart names an
 /// adversary does not choose.
 pub fn uuid_v5(namespace: Uuid, name: Bytes) -> Uuid / {abort.raise} =
-  laid_out(sha1(namespace.octets.concat(name)).slice(0, 16), 5, Rfc)
+  with_version_and_variant(sha1(namespace.octets.concat(name)).slice(0, 16), 5, Rfc)
 
 // --- Version 7 --------------------------------------------------------------
 
@@ -251,7 +255,7 @@ pub fn uuid_v5(namespace: Uuid, name: Bytes) -> Uuid / {abort.raise} =
 pub fn uuid_v7() -> Uuid / {time.now_ms bounded, entropy.next bounded, abort.raise} = {
   let ms = time.now_ms();
   let rand_a = entropy.next();
-  v7_of(stated_ms(ms), rand_a, entropy.next())
+  v7_of(clamped_ms(ms), rand_a, entropy.next())
 }
 
 /// A version 7 identifier that sorts after `previous`, the last one this maker made: `uuid_v7`
@@ -268,7 +272,7 @@ pub fn uuid_v7_after(
 ) -> Option<Uuid> / {time.now_ms bounded, entropy.next bounded, abort.raise} = {
   let ms = time.now_ms();
   let rand_a = entropy.next();
-  v7_after(previous, stated_ms(ms), rand_a, entropy.next())
+  v7_after(previous, clamped_ms(ms), rand_a, entropy.next())
 }
 
 /// `uuid_v7` of a clock reading `at` and two draws: the millisecond `at` falls in, the low twelve
@@ -289,32 +293,36 @@ pub fn uuid_v7_after_at(
 fn v7_after(previous: Uuid, now: Int, rand_a: Int, rand_b: Int) -> Option<Uuid> / {abort.raise} = {
   let last = field(previous, 0, 6);
   // The version and the counter of a version 7; anything below `0x7000` sorts before every one.
-  let held = field(previous, 6, 8);
+  let version_and_counter = field(previous, 6, 8);
   if now > last { Some(v7_of(now, rand_a, rand_b)) }
-  else if held < 0x7000 { Some(v7_of(last, rand_a, rand_b)) }
-  else if held < 0x7FFF { Some(v7_of(last, held + 1, rand_b)) }
+  else if version_and_counter < 0x7000 { Some(v7_of(last, rand_a, rand_b)) }
+  else if version_and_counter < 0x7FFF { Some(v7_of(last, version_and_counter + 1, rand_b)) }
   else if last < last_ms() { Some(v7_of(last + 1, rand_a, rand_b)) }
   else { None }
 }
 
 fn v7_of(ms: Int, rand_a: Int, rand_b: Int) -> Uuid / {abort.raise} =
-  laid_out(Bytes::concat_all([u64_be(ms).slice(2, 8), u16_be(rand_a), u64_be(rand_b)]), 7, Rfc)
+  with_version_and_variant(
+    Bytes::concat_all([u64_be(ms).slice(2, 8), u16_be(rand_a), u64_be(rand_b)]),
+    7,
+    Rfc,
+  )
 
 /// The last millisecond forty-eight bits count.
 fn last_ms() -> Int = 0xFFFF_FFFF_FFFF
 
 /// The millisecond a version 7 writes for a clock reading `ms`: one before 1970 counts as 1970,
 /// and one past the last as the last.
-fn stated_ms(ms: Int) -> Int = min(max(ms, 0), last_ms())
+fn clamped_ms(ms: Int) -> Int = min(max(ms, 0), last_ms())
 
-fn ms_of(at: Instant) -> Int = stated_ms(nanos_at(at) / 1000000)
+fn ms_of(at: Instant) -> Int = clamped_ms(nanos_at(at) / 1000000)
 
 // --- Tests ------------------------------------------------------------------
 
-fn the(text: String) -> Uuid / {abort.raise} = uuid_parse(text).expect(text)
+fn parsed(text: String) -> Uuid / {abort.raise} = uuid_parse(text).expect(text)
 
-/// A `Reading` as a test draws one.
-fn readings() -> gen::Gen<Reading> =
+/// A `V7Input` as a test draws one.
+fn v7_inputs() -> gen::Gen<V7Input> =
   gen::map3(
     gen::map(gen::any_int(), |n: Int| Instant(n)),
     gen::any_int(),
@@ -333,13 +341,13 @@ test "a UUID states a version exactly under the RFC's variant, and a time only a
   })
 }
 
-type Reading = { at: Instant, rand_a: Int, rand_b: Int }
+type V7Input = { at: Instant, rand_a: Int, rand_b: Int }
 
 test "version 7 UUIDs made one after another come out in the order made, while the clock stands, steps on or runs back" {
-  gen::check2(readings(), gen::list(readings()), |first: Reading, rest: List<Reading>| {
+  gen::check2(v7_inputs(), gen::list(v7_inputs()), |first: V7Input, rest: List<V7Input>| {
     rest.fold(
       { last: uuid_v7_at(first.at, first.rand_a, first.rand_b), ordered: true },
-      |made: { last: Uuid, ordered: Bool }, r: Reading|
+      |made: { last: Uuid, ordered: Bool }, r: V7Input|
         match uuid_v7_after_at(made.last, r.at, r.rand_a, r.rand_b) {
           Some(next) ->
             {
@@ -420,10 +428,10 @@ test "the nil and max UUIDs are all zeros and all ones, of no version" {
   assert_eq(uuid_time(uuid_max()), None)
 }
 
-type Leading = { ninth: String, variant: UuidVariant }
+type VariantCase = { ninth: String, variant: UuidVariant }
 
 /// The least and the greatest ninth octet of each variant.
-fn leading() -> List<Leading> =
+fn variant_cases() -> List<VariantCase> =
   [
     { ninth: "00", variant: Ncs },
     { ninth: "7f", variant: Ncs },
@@ -435,8 +443,8 @@ fn leading() -> List<Leading> =
     { ninth: "ff", variant: Future },
   ]
 
-test "a ninth octet of {c.ninth} is the {c.variant} variant" for c: Leading in leading() {
-  let u = the("0190f5e2-c3a7-7b6d-" ++ c.ninth ++ "1f-2a3b4c5d6e7f");
+test "a ninth octet of {c.ninth} is the {c.variant} variant" for c: VariantCase in variant_cases() {
+  let u = parsed("0190f5e2-c3a7-7b6d-" ++ c.ninth ++ "1f-2a3b4c5d6e7f");
   assert_eq(uuid_variant(u), c.variant);
   assert_eq(uuid_version(u), if c.variant == Rfc { Some(7) } else { None })
 }
@@ -473,7 +481,7 @@ fn rfc_examples() -> List<Example> =
   ]
 
 test "RFC 9562's example {c.section} is of version {c.version}" for c: Example in rfc_examples() {
-  let u = the(c.text);
+  let u = parsed(c.text);
   assert_eq(uuid_variant(u), Rfc);
   assert_eq(uuid_version(u), Some(c.version));
   assert_eq(uuid_time(u), c.made_ms.map(at_millis))
@@ -498,10 +506,10 @@ test "the {c.name} namespace is the one RFC 9562 registers" for c: Namespace in 
   assert_eq(uuid_render(c.namespace), c.text)
 }
 
-type Named = { namespace: Uuid, name: String, id: String }
+type NameCase = { namespace: Uuid, name: String, id: String }
 
 /// RFC 9562's appendix A.4 first, then what Python's `uuid.uuid5` answers.
-fn named() -> List<Named> =
+fn name_cases() -> List<NameCase> =
   [
     {
       namespace: uuid_namespace_dns(),
@@ -537,9 +545,8 @@ fn named() -> List<Named> =
     { namespace: uuid_nil(), name: "x", id: "f3e951bb-a80b-5e6c-a038-a56ee0caa25d" },
   ]
 
-test "the version 5 UUID of \"{c.name}\" in {uuid_render(c.namespace)}" for c: Named in named() {
-  assert_eq(uuid_render(uuid_v5(c.namespace, Bytes::of_string(c.name))), c.id)
-}
+test "the version 5 UUID of \"{c.name}\" in {uuid_render(c.namespace)}" for c: NameCase in name_cases(
+  ) { assert_eq(uuid_render(uuid_v5(c.namespace, Bytes::of_string(c.name))), c.id) }
 
 test "v4 overwrites the version and variant bits and nothing else" {
   let zeros = handle { uuid_v4() } with { entropy.next() -> 0 };
@@ -556,7 +563,7 @@ test "v4 overwrites the version and variant bits and nothing else" {
 test "RFC 9562's version 7 example is its millisecond and its random fields laid out" {
   let made = at_millis(1645557742000);
   let u = uuid_v7_at(made, 0xCC3, 0x18C4_DC0C_0C07_398F);
-  assert_eq(u, the("017F22E2-79B0-7CC3-98C4-DC0C0C07398F"));
+  assert_eq(u, parsed("017F22E2-79B0-7CC3-98C4-DC0C0C07398F"));
   // Only the low twelve and the low sixty-two bits of the draws are read.
   assert_eq(uuid_v7_at(made, 0x7FFF_FFFF_FFFF_FCC3, 0x58C4_DC0C_0C07_398F), u);
   // Any reading inside the millisecond is that millisecond.
@@ -609,22 +616,22 @@ test "a spent counter carries into the next millisecond, and a UUID of a lower v
   let spent = uuid_v7_at(at_millis(1000), 0xFFF, 5);
   let carried = uuid_v7_after_at(spent, at_millis(1000), 0xABC, 6);
   assert_eq(carried.map(uuid_render), Some("00000000-03e9-7abc-8000-000000000006"));
-  let random = the("00000000-03e8-4fff-bfff-ffffffffffff");
+  let random = parsed("00000000-03e8-4fff-bfff-ffffffffffff");
   let passed = uuid_v7_after_at(random, at_millis(1000), 0xABC, 6);
   assert_eq(passed.map(uuid_render), Some("00000000-03e8-7abc-8000-000000000006"));
-  let custom = the("00000000-03e8-8000-8000-000000000000");
+  let custom = parsed("00000000-03e8-8000-8000-000000000000");
   let past = uuid_v7_after_at(custom, at_millis(1000), 0xABC, 6);
   assert_eq(past.map(uuid_render), Some("00000000-03e9-7abc-8000-000000000006"))
 }
 
 test "nothing follows the last counter of the last millisecond" {
-  let nearly = the("ffffffff-ffff-7ffe-8000-000000000000");
+  let nearly = parsed("ffffffff-ffff-7ffe-8000-000000000000");
   assert_eq(
     uuid_v7_after_at(nearly, at_millis(0), 0, 9).map(uuid_render),
     Some("ffffffff-ffff-7fff-8000-000000000009"),
   );
   assert_eq(
-    uuid_v7_after_at(the("ffffffff-ffff-7fff-8000-000000000000"), at_millis(0), 0, 0),
+    uuid_v7_after_at(parsed("ffffffff-ffff-7fff-8000-000000000000"), at_millis(0), 0, 0),
     None,
   );
   assert_eq(uuid_v7_after_at(uuid_max(), at_millis(0), 0, 0), None)

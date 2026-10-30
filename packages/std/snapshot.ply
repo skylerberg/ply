@@ -41,7 +41,7 @@ import std.gen
 
 /// A directory of stored snapshots: its path as the module that embeds it writes it, which is how
 /// a failure names a file, and its files as `embed_dir` read them.
-pub type Stored = new { dir: String, files: List<{ name: String, bytes: Bytes }> }
+pub type Snapshots = new { dir: String, files: List<{ name: String, bytes: Bytes }> }
 
 /// How a rendering stands against what is stored under its name.
 pub type Verdict =
@@ -62,7 +62,7 @@ pub type Change =
 /// How storing a snapshot fails.
 pub effect snapshot {
   /// The file at `path`, under the root the run lent, could not be written.
-  raise unwritten(path: String)
+  raise write_failed(path: String)
 }
 
 /// The lines of context a diff shows around each change.
@@ -71,10 +71,10 @@ fn context() -> Int = 3
 // --- Comparing --------------------------------------------------------------
 
 /// How `text` stands against the file `name` of `stored`.
-pub fn compare(stored: Stored, name: String, text: String) -> Verdict = {
-  let now = ended(text);
+pub fn compare(stored: Snapshots, name: String, text: String) -> Verdict = {
+  let now = with_final_newline(text);
   let path = path::join(stored.dir, name);
-  match held(stored, name) {
+  match stored_text(stored, name) {
     None -> Absent(patch_text("/dev/null", path, "", now)),
     Some(was) -> if was == now { Same } else { Changed(patch_text("a/" ++ path, path, was, now)) },
   }
@@ -82,13 +82,13 @@ pub fn compare(stored: Stored, name: String, text: String) -> Verdict = {
 
 /// Fails unless the file `name` of `stored` holds `text`: with the diff from the stored text where
 /// it holds another, and with the diff that creates it where nothing is stored under the name.
-pub fn check(stored: Stored, name: String, text: String) -> Unit / {abort.raise} = {
-  let why = refusal(path::join(stored.dir, name), compare(stored, name, text));
+pub fn check(stored: Snapshots, name: String, text: String) -> Unit / {abort.raise} = {
+  let why = failure_message(path::join(stored.dir, name), compare(stored, name, text));
   assert(why == None, why)
 }
 
 /// What a failed check says: the file, what stores the rendering, and the diff that does.
-fn refusal(path: String, verdict: Verdict) -> Option<String> =
+fn failure_message(path: String, verdict: Verdict) -> Option<String> =
   match verdict {
     Same -> None,
     Absent(patch) -> Some("nothing is stored as `" ++ path ++ "`; " ++ remedy() ++ patch),
@@ -99,18 +99,18 @@ fn remedy() -> String = "`std.snapshot.accept` stores this one, as this diff doe
 
 /// The stored files that none of `names` reads, in the directory's order: snapshots no test asks
 /// for any more.
-pub fn unused(stored: Stored, names: List<String>) -> List<String> =
+pub fn unused(stored: Snapshots, names: List<String>) -> List<String> =
   list::somes(
     stored.files.map(|f: { name: String, bytes: Bytes }|
       if names.contains(f.name) { None } else { Some(f.name) }),
   )
 
-fn held(stored: Stored, name: String) -> Option<String> =
+fn stored_text(stored: Snapshots, name: String) -> Option<String> =
   stored.files.fold(None, |found: Option<String>, f: { name: String, bytes: Bytes }|
     if f.name == name { Some(String::of_bytes_lossy(f.bytes)) } else { found })
 
 /// `text` as it is stored: its last line ended, as every other is.
-fn ended(text: String) -> String =
+fn with_final_newline(text: String) -> String =
   if text == "" || text.ends_with("\n") { text } else { text ++ "\n" }
 
 fn patch_text(old: String, path: String, was: String, now: String) -> String =
@@ -128,24 +128,24 @@ pub fn accept<[l]>(
   dir: String,
   name: String,
   text: String,
-) -> Change / {fs.read_file[l], fs.create_dir[l], fs.write_file[l], snapshot.unwritten} = {
-  let now = Bytes::of_string(ended(text));
+) -> Change / {fs.read_file[l], fs.create_dir[l], fs.write_file[l], snapshot.write_failed} = {
+  let now = Bytes::of_string(with_final_newline(text));
   let path = path::join(dir, name);
   match fs.read_file[l](path) {
-    Some(was) -> if was == now { Unchanged } else { written[l](path, now, Replaced) },
-    None -> written[l](path, now, Created),
+    Some(was) -> if was == now { Unchanged } else { write_snapshot[l](path, now, Replaced) },
+    None -> write_snapshot[l](path, now, Created),
   }
 }
 
-fn written<[l]>(
+fn write_snapshot<[l]>(
   path: String,
   body: Bytes,
   change: Change,
-) -> Change / {fs.create_dir[l], fs.write_file[l], snapshot.unwritten} = {
+) -> Change / {fs.create_dir[l], fs.write_file[l], snapshot.write_failed} = {
   let above = handle { path::parent(path) } with { abort.raise(_) -> "" };
-  if above != "" && !fs.create_dir[l](above) { snapshot.unwritten(path) }
+  if above != "" && !fs.create_dir[l](above) { snapshot.write_failed(path) }
   else if fs.write_file[l](path, body) { change }
-  else { snapshot.unwritten(path) }
+  else { snapshot.write_failed(path) }
 }
 
 // --- Rendering --------------------------------------------------------------
@@ -159,15 +159,15 @@ pub fn render<a>(value: a) -> String = render_value(shown(value))
 /// lines of its own, two spaces in and ending in a comma, and close on another; so does a
 /// constructor or a tuple that holds one of those. Everything else is on one line as
 /// `std.value.render_all` writes it.
-pub fn render_value(v: Value) -> String = String::unlines(laid(v))
+pub fn render_value(v: Value) -> String = String::unlines(value_lines(v))
 
 /// `v` with the value of every record field named in `fields`, at any depth, replaced by
 /// `<masked>`: what a caller does to the fields that vary from run to run before rendering.
 pub fn masked(v: Value, fields: List<String>) -> Value =
   match v {
-    VRecord(held) ->
+    VRecord(stored_text) ->
       VRecord(
-        held.map(|f: Field|
+        stored_text.map(|f: Field|
           if fields.contains(f.name) { { name: f.name, value: VShown("<masked>") } }
           else { { name: f.name, value: masked(f.value, fields) } }),
       ),
@@ -178,46 +178,52 @@ pub fn masked(v: Value, fields: List<String>) -> Value =
     _ -> v,
   }
 
-fn laid(v: Value) -> List<String> =
+fn value_lines(v: Value) -> List<String> =
   match v {
-    VList(items) -> if items.len() == 0 { ["[]"] } else { framed("[", items.map(laid), "]") },
+    VList(items) -> if items.len() == 0 { ["[]"] }
+    else { bracketed("[", items.map(value_lines), "]") },
     VArray(items) -> if items.len() == 0 { ["Array::of_list([])"] }
-    else { framed("Array::of_list([", items.map(laid), "])") },
+    else { bracketed("Array::of_list([", items.map(value_lines), "])") },
     VMap(entries) -> if entries.len() == 0 { ["{}"] } else {
-      framed(
+      bracketed(
         "{",
         entries.map(|e: Entry|
           match e.key {
             VElided(_) -> [render_all(e.key)],
-            key -> headed(render_all(key) ++ ": ", laid(e.value)),
+            key -> prefix_first(render_all(key) ++ ": ", value_lines(e.value)),
           }),
         "}",
       )
     },
     VRecord(fields) -> if fields.len() == 0 { ["{}"] } else if is_tuple(fields) {
-      grouped("", in_place(fields.map(|f: Field| { name: f.name, lines: laid(f.value) })))
-    } else { framed("{", fields.map(|f: Field| headed(f.name ++ ": ", laid(f.value))), "}") },
+      parenthesized(
+        "",
+        in_tuple_order(fields.map(|f: Field| { name: f.name, lines: value_lines(f.value) })),
+      )
+    } else {
+      bracketed("{", fields.map(|f: Field| prefix_first(f.name ++ ": ", value_lines(f.value))), "}")
+    },
     VCtor(name, args) -> if args.len() == 0 { [ctor_name(name)] }
-    else { grouped(ctor_name(name), args.map(laid)) },
+    else { parenthesized(ctor_name(name), args.map(value_lines)) },
     _ -> [render_all(v)],
   }
 
 /// A constructor's arguments, or a tuple's items under no name, in parentheses: on one line where
 /// each is one line, and a part to a line otherwise.
-fn grouped(name: String, parts: List<List<String>>) -> List<String> =
+fn parenthesized(name: String, parts: List<List<String>>) -> List<String> =
   if parts.all(|part: List<String>| part.len() == 1) {
     [name ++ "(" ++ String::join(parts.flatten(), ", ") ++ ")"]
-  } else { framed(name ++ "(", parts, ")") }
+  } else { bracketed(name ++ "(", parts, ")") }
 
 /// A tuple's items in the order of their places: its fields come in name order, which puts `_10`
 /// before `_2`.
-fn in_place(items: List<{ name: String, lines: List<String> }>) -> List<List<String>> =
+fn in_tuple_order(items: List<{ name: String, lines: List<String> }>) -> List<List<String>> =
   range(0, items.len()).flat_map(|place: Int|
     items.flat_map(|item: { name: String, lines: List<String> }|
       if item.name == "_" ++ place.to_string() { [item.lines] } else { [] }))
 
 /// `open`, each part two spaces in with a comma after its last line, and `close`.
-fn framed(open: String, parts: List<List<String>>, close: String) -> List<String> =
+fn bracketed(open: String, parts: List<List<String>>, close: String) -> List<String> =
   parts.fold([open], |out: List<String>, part: List<String>|
     list::enumerate(part).fold(
       out,
@@ -228,12 +234,12 @@ fn framed(open: String, parts: List<List<String>>, close: String) -> List<String
   )
 
 /// `lines` with `head` before the first.
-fn headed(head: String, lines: List<String>) -> List<String> =
+fn prefix_first(head: String, lines: List<String>) -> List<String> =
   match lines { [] -> [head], [first, ..rest] -> list::prepend(head ++ first, rest) }
 
 // --- Tests ------------------------------------------------------------------
 
-fn kept(files: List<{ name: String, text: String }>) -> Stored =
+fn snapshots_of(files: List<{ name: String, text: String }>) -> Snapshots =
   {
     dir: "snapshots",
     files: files.map(|f: { name: String, text: String }|
@@ -306,7 +312,10 @@ test "masked blanks the fields named, at any depth, and leaves the rest" {
 }
 
 test "a rendering is the same as what is stored, with or without its last newline" {
-  let stored = kept([{ name: "order.txt", text: order_text() }, { name: "plain", text: "one\n" }]);
+  let stored = snapshots_of([
+    { name: "order.txt", text: order_text() },
+    { name: "plain", text: "one\n" },
+  ]);
   assert_eq(compare(stored, "order.txt", render(order())), Same);
   assert_eq(compare(stored, "plain", "one"), Same);
   assert_eq(compare(stored, "plain", "one\n"), Same);
@@ -315,7 +324,7 @@ test "a rendering is the same as what is stored, with or without its last newlin
 }
 
 test "a rendering that differs fails with the diff from the stored text, a few lines around it" {
-  let stored = kept([{ name: "order.txt", text: order_text() }]);
+  let stored = snapshots_of([{ name: "order.txt", text: order_text() }]);
   let now = render({ ..order(), buyer: "bob" });
   assert_eq(
     compare(stored, "order.txt", now),
@@ -334,7 +343,7 @@ test "a rendering that differs fails with the diff from the stored text, a few l
   );
   assert((try[abort.raise] { check(stored, "order.txt", now) }) != Ok(()));
   assert_eq(
-    refusal("snapshots/order.txt", Changed("--- a/x\n+++ b/x\n")),
+    failure_message("snapshots/order.txt", Changed("--- a/x\n+++ b/x\n")),
     Some(
       "`snapshots/order.txt` stores another rendering; `std.snapshot.accept` stores this one, as this diff does:\n--- a/x\n+++ b/x\n",
     ),
@@ -342,14 +351,14 @@ test "a rendering that differs fails with the diff from the stored text, a few l
 }
 
 test "a rendering with nothing stored under its name fails with the diff that creates it" {
-  let stored = kept([{ name: "other.txt", text: "x\n" }]);
+  let stored = snapshots_of([{ name: "other.txt", text: "x\n" }]);
   assert_eq(
     compare(stored, "new.txt", "one\ntwo"),
     Absent("--- /dev/null\n+++ b/snapshots/new.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n"),
   );
   assert((try[abort.raise] { check(stored, "new.txt", "one\ntwo") }) != Ok(()));
   assert_eq(
-    refusal("snapshots/new.txt", Absent("--- /dev/null\n")),
+    failure_message("snapshots/new.txt", Absent("--- /dev/null\n")),
     Some(
       "nothing is stored as `snapshots/new.txt`; `std.snapshot.accept` stores this one, as this diff does:\n--- /dev/null\n",
     ),
@@ -357,7 +366,7 @@ test "a rendering with nothing stored under its name fails with the diff that cr
 }
 
 test "unused names the stored files no snapshot reads" {
-  let stored = kept([
+  let stored = snapshots_of([
     { name: "a.txt", text: "" },
     { name: "old/b.txt", text: "" },
     { name: "c.txt", text: "" },
@@ -368,7 +377,7 @@ test "unused names the stored files no snapshot reads" {
 }
 
 /// The files of `tree` under `dir`, as an `embed_dir` of it would read them.
-fn stored_in(tree: fs::MemFs, dir: String, names: List<String>) -> Stored / {abort.raise} =
+fn stored_in(tree: fs::MemFs, dir: String, names: List<String>) -> Snapshots / {abort.raise} =
   {
     dir: dir,
     files: list::somes(
@@ -403,7 +412,7 @@ test "accept raises where the file cannot be written, and writes nothing" {
 }
 
 /// What `check` makes of `text` once `accept` has stored it over a directory that held `was`.
-fn accepted(was: String, text: String) -> Verdict / {abort.raise, snapshot.unwritten} = {
+fn accepted(was: String, text: String) -> Verdict / {abort.raise, snapshot.write_failed} = {
   let before = fs::mem_of([{ path: "snapshots/s.txt", body: Bytes::of_string(was) }]);
   let after = fs::on_mem[work](before, || accept[work]("snapshots", "s.txt", text));
   compare(stored_in(after.tree, "snapshots", ["s.txt"]), "s.txt", text)
@@ -430,8 +439,8 @@ test "a rendering is the same as what accepting it stored" {
 
 /// The stored text patched by the diff `compare` reports for `now`, or the stored text where it
 /// reports none.
-fn patched(was: String, now: String) -> String / {diff::diff.malformed, diff::diff.refused} =
-  match compare(kept([{ name: "s.txt", text: was }]), "s.txt", now) {
+fn patched(was: String, now: String) -> String / {diff::diff.malformed, diff::diff.fail} =
+  match compare(snapshots_of([{ name: "s.txt", text: was }]), "s.txt", now) {
     Same -> was,
     Absent(patch) -> was,
     Changed(patch) ->

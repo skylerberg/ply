@@ -6,21 +6,29 @@
 //! with its parameters unknown.
 
 import compiler.syntax.parsing (Span, Ident, QName, span_bin, span_between, bare)
-import compiler.syntax.patterns (Pattern, binder_names, PWild, PVar, PLit, PRange, PCtor, PRecord,
-                                 PList, POr, PBad, LInt, LFixed, LWide, LBad, LBool)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, HandlerVar, Param, NamedArg, MatchArm,
-                              HandleClause, RecField, expr_span, ETagged, Tagged, Hole,
-                              tagged_parser, tagged_filler)
+import compiler.syntax.patterns (Pattern, binder_names, PatternWildcard, PatternVariable,
+                                 PatternLiteral, PatternRange, PatternConstructor, PatternRecord,
+                                 PatternList, PatternOr, PatternInvalid, LiteralInt, LiteralFixed,
+                                 LiteralWide, LiteralInvalid, LiteralBool)
+import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, BinaryExpression,
+                              UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                              MatchExpression, BlockExpression, RecordExpression,
+                              RecordUpdateExpression, PropagateExpression, FieldExpression,
+                              ListExpression, PerformExpression, HandleExpression,
+                              WithHoldExpression, SimulateExpression, ParallelExpression,
+                              InvalidExpression, HoleExpression, TryBlockExpression, Stmt,
+                              LetStatement, LetElseStatement, ExpressionStatement,
+                              AssignmentStatement, HandlerVar, Param, NamedArg, MatchArm,
+                              HandleClause, RecordLiteralField, expr_span, TaggedLiteralExpression,
+                              TaggedLiteral, Hole, tagged_parser, tagged_filler)
 import compiler.syntax.items (FnDef)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, record_fields)
+import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
+                             Field, record_fields)
 import compiler.check.known (is_integer_name, bool_name, string_name, bytes_name, float_name,
                              decimal_name, char_name, unit_name, list_item, array_element,
                              columns_row, some_ctor)
-import compiler.check.semantics (Iterates, Handed, Element, Threaded, Mapped, Kept, Folded,
-                                 iterates, prelude_iterates)
+import compiler.check.callbacks (CallbackUse, CallbackArgument, Element, Accumulator, Mapped,
+                                 Filtered, Folded, callback_use, prelude_callback_use)
 import std.bin
 import std.graph
 import std.list
@@ -36,11 +44,11 @@ pub type Callee =
   | OtherCallee
 
 /// How a definition's calls are known to return.
-pub type Ending =
+pub type Termination =
   /// Every loop through its group descends a measure, and everything it reaches ends too.
-  | Ends
+  | Terminates
   /// Only by the measures its group states with `decreases`, each of which a proof must show.
-  | Stated
+  | TerminatesByDecreases
   /// A call by which it may not return: back into its group without descending, on the `loop` of
   /// calls that does not, or with no `loop` where the group is past what the check follows; or,
   /// `through`, to a definition that may not return.
@@ -116,18 +124,18 @@ pub type Group = {
   resolve: (Int, QName) -> Callee / {abort.raise},
   binders: List<Map<Int, Int>>,
   stated: (Int, Span) -> List<Callee> / {abort.raise},
-  ending_of: (Bytes) -> Ending / {abort.raise},
+  ending_of: (Bytes) -> Termination / {abort.raise},
   summary_of: (Bytes) -> Option<Summary>,
 }
 
 /// Each member's ending, which is its group's since they reach one another, told first by its own
 /// call out of the group by which it may not return; and each member's summary.
-pub type Verdict = { endings: List<Ending>, summaries: List<Summary> }
+pub type Verdict = { endings: List<Termination>, summaries: List<Summary> }
 
 // Filed with a definition's rows, so a definition taken from them answers what its body did.
 derive bin for Callee
 derive bin for Site
-derive bin for Ending
+derive bin for Termination
 derive bin for Place
 derive bin for Base
 derive bin for Linear
@@ -156,15 +164,20 @@ type Call = { callee: Int, args: List<Term>, facts: List<Fact>, span: Span }
 type Use = { param: Int, args: Option<List<Term>> }
 
 /// A definition outside the group that a body calls, or hands on as a value.
-type Outside = { name: Bytes, span: Span }
+type ExternalCall = { name: Bytes, span: Span }
 
 /// `lost` is a lambda's body nested too deep in others to be read, so the group is not read as
 /// ending.
-type Seen = { calls: List<Call>, uses: List<Use>, outside: List<Outside>, lost: Option<Span> }
+type Findings = {
+  calls: List<Call>,
+  uses: List<Use>,
+  outside: List<ExternalCall>,
+  lost: Option<Span>,
+}
 
 /// `depth` counts the lambdas whose bodies the walk is reading within one another; `results` is what
 /// each member of the group is known to answer, or `None` where it is not known to answer at all.
-type MemberContext = { group: Group, me: Int, depth: Int, results: List<Option<Term>> }
+type MemberContext = { group: Group, current: Int, depth: Int, results: List<Option<Term>> }
 
 /// The structural size of a place; `hi - lo`, which a shrinking call must find bounded below; or the
 /// measure a `decreases` states, which every call between two members stating one is owed to shrink.
@@ -184,10 +197,10 @@ type Graph = { from: Int, to: Int, arcs: List<Arc>, calls: List<Site> }
 // --- The verdict ----------------------------------------------------------------------------------
 
 pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
-  let results = settled_results(g);
+  let results = stable_results(g);
   let seen = range(0, g.defs.len()).map(|i: Int|
-    seen_of({ group: g, me: i, depth: 0, results: results }, g.defs.get(i)));
-  let calls = seen.map(|x: Seen| x.calls);
+    walk_definition({ group: g, current: i, depth: 0, results: results }, g.defs.get(i)));
+  let calls = seen.map(|x: Findings| x.calls);
   let stating = g.defs.fold(false, |acc: Bool, d: FnDef|
     acc || (match d.decreases { Some(_) -> true, None -> false }));
   let lost = range(0, seen.len()).fold(None, |acc: Option<Site>, i: Int|
@@ -197,27 +210,31 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
     });
   let own = match lost {
     Some(s) -> Diverges({ at: s, through: None, loop: [] }),
-    None -> match looping(g, calls, false) {
-      None -> Ends,
-      Some(first) -> if !stating { looped(first) }
-      else { match looping(g, calls, true) { None -> Stated, Some(again) -> looped(again) } },
+    None -> match find_non_decreasing_loop(g, calls, false) {
+      None -> Terminates,
+      Some(first) -> if !stating { divergence(first) } else {
+        match find_non_decreasing_loop(g, calls, true) {
+          None -> TerminatesByDecreases,
+          Some(again) -> divergence(again),
+        }
+      },
     },
   };
-  let out = |me: Int|
-    |e: Ending, o: Outside|
+  let out = |member: Int|
+    |e: Termination, o: ExternalCall|
       weaker(e, match (g.ending_of)(o.name) {
-        Diverges(_) -> Diverges({ at: site(g, me, o.span), through: Some(o.name), loop: [] }),
+        Diverges(_) -> Diverges({ at: site(g, member, o.span), through: Some(o.name), loop: [] }),
         other -> other,
       });
-  let settled = match own { Diverges(_) -> Ends, other -> other };
+  let settled = match own { Diverges(_) -> Terminates, other -> other };
   {
     endings: range(0, g.defs.len()).map(|i: Int|
       range(0, seen.len()).fold(
         weaker(seen.get(i).outside.fold(settled, out(i)), own),
-        |e: Ending, j: Int| seen.get(j).outside.fold(e, out(j)),
+        |e: Termination, j: Int| seen.get(j).outside.fold(e, out(j)),
       )),
     summaries: range(0, g.defs.len()).map(|i: Int|
-      summary({ group: g, me: i, depth: 0, results: results }, seen.get(i))),
+      summary({ group: g, current: i, depth: 0, results: results }, seen.get(i))),
   }
 }
 
@@ -225,51 +242,61 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
 /// are known to answer, until a round changes nothing, which every answer then holds of. A call that
 /// returned answered what its callee is known to, so a later call reads it soundly. Past a number of
 /// rounds nothing is known.
-fn settled_results(g: Group) -> List<Option<Term>> / {abort.raise} = {
+fn stable_results(g: Group) -> List<Option<Term>> / {abort.raise} = {
   let n = g.defs.len();
   let round = |rs: List<Option<Term>>|
     range(0, n).map(|i: Int| {
-      let context = { group: g, me: i, depth: 0, results: rs };
-      answered(context, entry_scope(context, g.defs.get(i)), g.defs.get(i).body)
+      let context = { group: g, current: i, depth: 0, results: rs };
+      result_term(context, entry_scope(context, g.defs.get(i)), g.defs.get(i).body)
     });
   iterate(
     { rs: range(0, n).map(|i: Int| None), k: 0 },
-    result_rounds() + 2,
+    max_result_rounds() + 2,
     |st: { rs: List<Option<Term>>, k: Int }|
-      if st.k >= result_rounds() { Stop(range(0, n).map(|i: Int| Some(UnknownTerm))) } else {
+      if st.k >= max_result_rounds() { Stop(range(0, n).map(|i: Int| Some(UnknownTerm))) } else {
         let next = round(st.rs);
         if next == st.rs { Stop(st.rs) } else { Continue({ rs: next, k: st.k + 1 }) }
       },
   )
 }
 
-fn result_rounds() -> Int = 6
+fn max_result_rounds() -> Int = 6
 
-fn looped(u: Unending) -> Ending = Diverges({ at: u.at, through: None, loop: u.loop })
+fn divergence(u: NonDecreasingLoop) -> Termination =
+  Diverges({ at: u.at, through: None, loop: u.loop })
 
 /// A loop that may not shrink any measure: its first call and all of them, or, past what the check
 /// follows, a call into the group and no loop.
-type Unending = { at: Site, loop: List<Site> }
+type NonDecreasingLoop = { at: Site, loop: List<Site> }
 
 /// The call at `span` in member `me`'s body.
-fn site(g: Group, me: Int, span: Span) -> Site / {abort.raise} = {
-  let start = g.defs.get(me).span.start;
-  { caller: g.names.get(me), span: span_between(span.start - start, span.end - start) }
+fn site(g: Group, member: Int, span: Span) -> Site / {abort.raise} = {
+  let start = g.defs.get(member).span.start;
+  { caller: g.names.get(member), span: span_between(span.start - start, span.end - start) }
 }
 
-fn weaker(a: Ending, b: Ending) -> Ending =
-  match a { Diverges(_) -> a, Stated -> match b { Diverges(_) -> b, _ -> a }, Ends -> b }
+fn weaker(a: Termination, b: Termination) -> Termination =
+  match a {
+    Diverges(_) -> a,
+    TerminatesByDecreases -> match b { Diverges(_) -> b, _ -> a },
+    Terminates -> b,
+  }
 
 /// The calls of a loop that may not shrink any measure; `None` when every loop does. With `stated`,
 /// the measures the members state count as shrinking at every call between two of them.
-fn looping(g: Group, calls: List<List<Call>>, stated: Bool) -> Option<Unending> / {abort.raise} = {
+fn find_non_decreasing_loop(
+  g: Group,
+  calls: List<List<Call>>,
+  stated: Bool,
+) -> Option<NonDecreasingLoop> / {abort.raise} = {
   let measures = spread(
     calls,
     range(0, g.defs.len()).map(|i: Int| measures_of(g, i, calls.get(i), stated)),
   );
   let graphs = range(0, g.defs.len()).fold([], |acc: List<Graph>, i: Int|
-    calls.get(i).fold(acc, |gs: List<Graph>, c: Call| added(gs, call_graph(g, measures, i, c))));
-  searched(g.defs.len(), deciding(measures, graphs))
+    calls.get(i).fold(acc, |gs: List<Graph>, c: Call|
+      add_graph(gs, call_graph(g, measures, i, c))));
+  search_loops(g.defs.len(), deciding(measures, graphs))
 }
 
 /// `graphs` with only the arcs inside a cycle of arcs, from member to member and measure to
@@ -294,7 +321,7 @@ fn deciding(measures: List<List<Measure>>, graphs: List<Graph>) -> List<Graph> /
         match component.get(node(x.from, r.a)) { Some(c) -> acc.insert(c, true), None -> acc }
       } else { acc }));
   graphs.fold([], |acc: List<Graph>, x: Graph|
-    added(acc, {
+    add_graph(acc, {
       ..x,
       arcs: x.arcs.filter(|r: Arc|
         inside(x, r)
@@ -314,34 +341,34 @@ fn shrinks(x: Graph) -> Bool =
 /// path is found once its prefix is: the first loop found that shrinks no measure, or `None` once
 /// every path is found. Past a number of paths this check does not search, the group is not read as
 /// ending.
-type Closure = {
+type GraphClosure = {
   buckets: Map<Int, List<Graph>>,
   queue: List<Graph>,
   next: Int,
-  bad: Option<Unending>,
+  bad: Option<NonDecreasingLoop>,
 }
 
-fn searched(n: Int, calls: List<Graph>) -> Option<Unending> / {abort.raise} = {
+fn search_loops(n: Int, calls: List<Graph>) -> Option<NonDecreasingLoop> / {abort.raise} = {
   let from = range(0, n).map(|i: Int| calls.filter(|x: Graph| x.from == i));
   let start = calls.fold(
     { buckets: Map::new(), queue: [], next: 0, bad: None },
-    |c: Closure, x: Graph| enqueued(c, n, x),
+    |c: GraphClosure, x: Graph| enqueue(c, n, x),
   );
-  iterate(start, closure_bound() + 2, |c: Closure|
+  iterate(start, max_closure_size() + 2, |c: GraphClosure|
     match c.bad {
       Some(_) -> Stop(c.bad),
-      None -> if c.next >= c.queue.len() { Stop(None) } else if c.queue.len() > closure_bound() {
+      None -> if c.next >= c.queue.len() { Stop(None) } else if c.queue.len() > max_closure_size() {
         Stop(Some({ at: c.queue.get(0).calls.get(0), loop: [] }))
       } else {
         let x = c.queue.get(c.next);
-        let grown = from.get(x.to).fold(c, |acc: Closure, y: Graph|
-          enqueued(acc, n, composed(x, y)));
+        let grown = from.get(x.to).fold(c, |acc: GraphClosure, y: Graph|
+          enqueue(acc, n, composed(x, y)));
         Continue({ ..grown, next: c.next + 1 })
       },
     })
 }
 
-fn enqueued(c: Closure, n: Int, x: Graph) -> Closure / {abort.raise} = {
+fn enqueue(c: GraphClosure, n: Int, x: Graph) -> GraphClosure / {abort.raise} = {
   let key = x.from * n + x.to;
   let bucket = match c.buckets.get(key) { Some(b) -> b, None -> [] };
   if bucket.fold(false, |found: Bool, y: Graph| found || same_arcs(y.arcs, x.arcs)) { c } else {
@@ -359,9 +386,9 @@ fn enqueued(c: Closure, n: Int, x: Graph) -> Closure / {abort.raise} = {
   }
 }
 
-fn closure_bound() -> Int = 10000
+fn max_closure_size() -> Int = 10000
 
-fn added(gs: List<Graph>, x: Graph) -> List<Graph> =
+fn add_graph(gs: List<Graph>, x: Graph) -> List<Graph> =
   if gs.fold(false, |found: Bool, y: Graph|
       found || (y.from == x.from && y.to == x.to && same_arcs(y.arcs, x.arcs))) { gs }
   else { gs.push(x) }
@@ -399,16 +426,16 @@ fn with_arc(xs: List<Arc>, r: Arc) -> List<Arc> / {abort.raise} =
 /// call bounds.
 fn measures_of(
   g: Group,
-  me: Int,
+  member: Int,
   calls: List<Call>,
   stated: Bool,
 ) -> List<Measure> / {abort.raise} = {
-  let sized = range(0, g.defs.get(me).params.len()).fold([], |acc: List<Measure>, i: Int| {
+  let sized = range(0, g.defs.get(member).params.len()).fold([], |acc: List<Measure>, i: Int| {
     let p = { param: i, path: [] };
     let size = acc.push(SizeMeasure(p));
-    if listed(g, me, p) { size.push(ElementMeasure(p)) } else { size }
+    if holds_list(g, member, p) { size.push(ElementMeasure(p)) } else { size }
   });
-  let params = match g.defs.get(me).decreases {
+  let params = match g.defs.get(member).decreases {
     Some(_) -> if stated { sized.push(StatedMeasure) } else { sized },
     None -> sized,
   };
@@ -437,7 +464,7 @@ fn spread(calls: List<List<Call>>, ms: List<List<Measure>>) -> List<List<Measure
     range(0, acc.len()).map(|i: Int|
       calls.get(i).fold(acc.get(i), |mine: List<Measure>, c: Call|
         acc.get(c.callee).fold(mine, |m: List<Measure>, x: Measure|
-          match measured(c, x) {
+          match measure_at_call(c, x) {
             DifferenceValue(v) -> match v.hi {
               Some(hi) -> match v.lo {
                 Some(lo) -> with_difference(m, hi.base, lo.base),
@@ -481,32 +508,37 @@ fn with_measure(xs: List<Measure>, m: Measure) -> List<Measure> =
   if xs.fold(false, |found: Bool, x: Measure| found || x == m) { xs } else { xs.push(m) }
 
 /// What one call does to each pair of the caller's and the callee's measures.
-fn call_graph(g: Group, measures: List<List<Measure>>, me: Int, c: Call) -> Graph / {abort.raise} = {
-  let mine = measures.get(me);
+fn call_graph(
+  g: Group,
+  measures: List<List<Measure>>,
+  member: Int,
+  c: Call,
+) -> Graph / {abort.raise} = {
+  let mine = measures.get(member);
   let theirs = measures.get(c.callee);
   {
-    from: me,
+    from: member,
     to: c.callee,
     arcs: range(0, theirs.len()).fold([], |acc: List<Arc>, j: Int| {
-      let value = measured(c, theirs.get(j));
+      let value = measure_at_call(c, theirs.get(j));
       range(0, mine.len()).fold(acc, |a: List<Arc>, i: Int|
-        match relation(g, me, c, mine.get(i), value) {
+        match relation(g, member, c, mine.get(i), value) {
           None -> a,
           Some(strict) -> with_arc(a, { a: i, b: j, strict: strict }),
         })
     }),
-    calls: [site(g, me, c.span)],
+    calls: [site(g, member, c.span)],
   }
 }
 
 /// A callee's measure at the call, in the caller's terms.
-type Valued =
+type MeasureValue =
   | SizeValue(Term)
   | ElementValue(Term)
   | DifferenceValue({ hi: Option<Linear>, lo: Option<Linear> })
   | StatedValue
 
-fn measured(c: Call, m: Measure) -> Valued =
+fn measure_at_call(c: Call, m: Measure) -> MeasureValue =
   match m {
     SizeMeasure(q) -> SizeValue(along(arg(c, q.param), q.path)),
     ElementMeasure(q) -> ElementValue(along(arg(c, q.param), q.path)),
@@ -562,14 +594,14 @@ fn base_at(args: List<Term>, b: Base) -> Option<Term> =
 /// `Some(true)` when the callee's measure is below the caller's, `Some(false)` when it is no larger.
 fn relation(
   g: Group,
-  me: Int,
+  member: Int,
   c: Call,
   mine: Measure,
-  value: Valued,
+  value: MeasureValue,
 ) -> Option<Bool> / {abort.raise} =
   match mine {
     SizeMeasure(p) -> match value {
-      SizeValue(t) -> size_relation(t, p, place_type(g, me, p)),
+      SizeValue(t) -> size_relation(t, p, place_type(g, member, p)),
       ElementValue(t) -> elements_below(t, p),
       _ -> None,
     },
@@ -750,7 +782,7 @@ fn field_term(fs: List<{ name: Bytes, term: Term }>, name: Bytes) -> Option<Term
 /// A value of this type has one size whatever it holds.
 fn atomic(t: Type) -> Bool =
   match t {
-    TyCon(c) ->
+    NamedType(c) ->
       c.args.len() == 0
         && (is_integer_name(c.name)
         || [
@@ -764,14 +796,14 @@ fn atomic(t: Type) -> Bool =
         ].contains(
           c.name,
         )),
-    TyFn(_) -> true,
-    TyRecord(fs) -> fs.len() == 0,
-    TyNominal(n) -> n.fields.len() == 0,
-    TyVar(_) -> false,
+    FunctionType(_) -> true,
+    RecordType(fs) -> fs.len() == 0,
+    NominalType(n) -> n.fields.len() == 0,
+    VariableType(_) -> false,
   }
 
-fn place_type(g: Group, me: Int, p: Place) -> Option<Type> / {abort.raise} =
-  match g.params.get(me).at(p.param) {
+fn place_type(g: Group, member: Int, p: Place) -> Option<Type> / {abort.raise} =
+  match g.params.get(member).at(p.param) {
     None -> None,
     Some(t) ->
       p.path.fold(Some(t), |acc: Option<Type>, f: Bytes|
@@ -787,21 +819,21 @@ fn field_type(fs: List<Field>, name: Bytes) -> Option<Type> =
     [f, ..rest] -> if f.name == name { Some(f.ty) } else { field_type(rest, name) },
   }
 
-fn integer_place(g: Group, me: Int, p: Place) -> Bool / {abort.raise} =
-  match place_type(g, me, p) {
-    Some(TyCon(c)) -> c.args.len() == 0 && is_integer_name(c.name),
+fn integer_place(g: Group, member: Int, p: Place) -> Bool / {abort.raise} =
+  match place_type(g, member, p) {
+    Some(NamedType(c)) -> c.args.len() == 0 && is_integer_name(c.name),
     _ -> false,
   }
 
 /// The place holds a list, whose elements a measure may size.
-fn listed(g: Group, me: Int, p: Place) -> Bool / {abort.raise} =
-  match place_type(g, me, p) {
+fn holds_list(g: Group, member: Int, p: Place) -> Bool / {abort.raise} =
+  match place_type(g, member, p) {
     Some(t) -> list_item(t) != None || array_element(t) != None || columns_row(t) != None,
     None -> false,
   }
 
-fn function_param(g: Group, me: Int, i: Int) -> Bool / {abort.raise} =
-  match g.params.get(me).at(i) { Some(TyFn(_)) -> true, _ -> false }
+fn function_param(g: Group, member: Int, i: Int) -> Bool / {abort.raise} =
+  match g.params.get(member).at(i) { Some(FunctionType(_)) -> true, _ -> false }
 
 // --- Terms ----------------------------------------------------------------------------------------
 
@@ -889,7 +921,7 @@ fn parts(t: Term) -> Term =
 /// entry is made of one of each, so it is smaller than anything the map is a part of.
 fn element(context: MemberContext, scope: Scope, list: Expr) -> Term / {abort.raise} =
   match list {
-    EApp(a) -> match builtin(context, scope, a.func) {
+    CallExpression(a) -> match builtin(context, scope, a.func) {
       Some(name) -> if a.args.len() != 1 { below(term(context, scope, list)) }
       else if name == b"Map::keys" || name == b"Map::values" {
         below(term(context, scope, a.args.get(0)))
@@ -959,44 +991,44 @@ fn parts_of_places(places: List<Place>) -> Term = {
 
 /// What a call of a function its entry describes answers, where the lambda it is handed answers a
 /// part of what it walks, or the accumulator a fold threads through it.
-fn iterated_answer(
+fn iterated_result(
   context: MemberContext,
   scope: Scope,
-  it: Iterates,
+  it: CallbackUse,
   args: List<Expr>,
 ) -> Term / {abort.raise} =
-  match it.answer {
-    Mapped -> match handed_lambda(context, scope, it, args, UnknownTerm) {
-      Some(inside) -> match answered(context, inside.scope, inside.body) {
+  match it.result {
+    Mapped -> match callback_lambda(context, scope, it, args, UnknownTerm) {
+      Some(inside) -> match result_term(context, inside.scope, inside.body) {
         Some(t) -> parts_of([t]),
         None -> UnknownTerm,
       },
       None -> UnknownTerm,
     },
-    Kept -> match walked_arg(it, args) {
+    Filtered -> match iterated_argument(it, args) {
       Some(xs) -> parts(term(context, scope, xs)),
       None -> UnknownTerm,
     },
-    Folded -> folded(context, scope, it, args),
+    Folded -> fold_result(context, scope, it, args),
     _ -> UnknownTerm,
   }
 
 /// The argument a function its entry describes walks the elements of.
-fn walked_arg(it: Iterates, args: List<Expr>) -> Option<Expr> =
+fn iterated_argument(it: CallbackUse, args: List<Expr>) -> Option<Expr> =
   match it.over.at(0) { Some(k) -> args.at(k), None -> None }
 
 /// The lambda a call hands as its entry's function, and the scope its body is read in: each
 /// parameter handed an element bound to one, and the one a fold threads to `threaded`.
-fn handed_lambda(
+fn callback_lambda(
   context: MemberContext,
   scope: Scope,
-  it: Iterates,
+  it: CallbackUse,
   args: List<Expr>,
   threaded: Term,
 ) -> Option<{ scope: Scope, body: Expr }> / {abort.raise} =
   match args.at(it.callback) {
-    Some(ELambda(l)) -> if l.params.len() != it.params.len() { None } else {
-      let element = match walked_arg(it, args) {
+    Some(LambdaExpression(l)) -> if l.params.len() != it.params.len() { None } else {
+      let element = match iterated_argument(it, args) {
         Some(xs) -> element(context, scope, xs),
         None -> UnknownTerm,
       };
@@ -1004,7 +1036,7 @@ fn handed_lambda(
         scope: range(0, l.params.len()).fold(scope, |s: Scope, j: Int|
           bound(s, l.params.get(j).name, match it.params.get(j) {
             Element -> element,
-            Threaded(_) -> threaded,
+            Accumulator(_) -> threaded,
             _ -> UnknownTerm,
           })),
         body: l.body,
@@ -1015,21 +1047,21 @@ fn handed_lambda(
 
 /// What a fold answers where its lambda answers its accumulator or parts: the start joined with what
 /// a round answers, so long as a second round answers nothing the first did not.
-fn folded(
+fn fold_result(
   context: MemberContext,
   scope: Scope,
-  it: Iterates,
+  it: CallbackUse,
   args: List<Expr>,
 ) -> Term / {abort.raise} =
-  match it.params.fold(None, |found: Option<Int>, h: Handed|
-      match h { Threaded(k) -> Some(k), _ -> found }) {
+  match it.params.fold(None, |found: Option<Int>, h: CallbackArgument|
+      match h { Accumulator(k) -> Some(k), _ -> found }) {
     None -> UnknownTerm,
     Some(k) -> match args.at(k) {
       None -> UnknownTerm,
       Some(init) -> {
         let round = |r: Term|
-          match handed_lambda(context, scope, it, args, r) {
-            Some(inside) -> match answered(context, inside.scope, inside.body) {
+          match callback_lambda(context, scope, it, args, r) {
+            Some(inside) -> match result_term(context, inside.scope, inside.body) {
               Some(t) -> join(r, t),
               None -> r,
             },
@@ -1054,7 +1086,7 @@ fn part_place(t: Term) -> Option<Place> =
 fn binder_of(context: MemberContext, q: QName) -> Option<Int> =
   match q.module {
     Some(_) -> None,
-    None -> match context.group.binders.at(context.me) {
+    None -> match context.group.binders.at(context.current) {
       Some(binders) -> binders.get(q.name.span.site),
       None -> None,
     },
@@ -1062,16 +1094,16 @@ fn binder_of(context: MemberContext, q: QName) -> Option<Int> =
 
 fn term(context: MemberContext, scope: Scope, e: Expr) -> Term / {abort.raise} =
   match e {
-    ELit(l) -> match l.lit {
-      LInt(k) -> Exactly({ base: None, k: k }),
+    LiteralExpression(l) -> match l.lit {
+      LiteralInt(k) -> Exactly({ base: None, k: k }),
       // A width's literal is its value where the `Int` pattern it is read as is not negative.
-      LFixed(_, k) -> if k >= 0 { Exactly({ base: None, k: k }) } else { UnknownTerm },
-      LWide(_, hi, lo) -> if hi == 0 && lo >= 0 { Exactly({ base: None, k: lo }) }
+      LiteralFixed(_, k) -> if k >= 0 { Exactly({ base: None, k: k }) } else { UnknownTerm },
+      LiteralWide(_, hi, lo) -> if hi == 0 && lo >= 0 { Exactly({ base: None, k: lo }) }
       else { UnknownTerm },
-      LBad -> UnknownTerm,
+      LiteralInvalid -> UnknownTerm,
       _ -> NoParts,
     },
-    EVar(v) -> match local_of(context, scope, v.name) {
+    NameExpression(v) -> match local_of(context, scope, v.name) {
       Some(KnownTerm(t)) -> t,
       Some(FunctionParam(i)) -> Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 }),
       Some(LetLambda(_)) -> UnknownTerm,
@@ -1081,8 +1113,8 @@ fn term(context: MemberContext, scope: Scope, e: Expr) -> Term / {abort.raise} =
         _ -> UnknownTerm,
       },
     },
-    EField(f) -> project(term(context, scope, f.base), f.field.name),
-    EBinary(b) -> if b.op == b"add" {
+    FieldExpression(f) -> project(term(context, scope, f.base), f.field.name),
+    BinaryExpression(b) -> if b.op == b"add" {
       offset(context, term(context, scope, b.lhs), term(context, scope, b.rhs))
     } else if b.op == b"sub" {
       match term(context, scope, b.rhs) {
@@ -1114,17 +1146,24 @@ fn term(context: MemberContext, scope: Scope, e: Expr) -> Term / {abort.raise} =
       }
     } else if b.op == b"rem" { remainder(context, term(context, scope, b.rhs)) }
     else { UnknownTerm },
-    ERecord(r) -> RecordTerm({ base: None, fields: field_terms(context, scope, r.fields) }),
-    EList(l) -> parts_of(l.items.map(|x: Expr| term(context, scope, x))),
-    ERecordUpdate(r) ->
+    RecordExpression(r) ->
+      RecordTerm({ base: None, fields: field_terms(context, scope, r.fields) }),
+    ListExpression(l) -> parts_of(l.items.map(|x: Expr| term(context, scope, x))),
+    RecordUpdateExpression(r) ->
       RecordTerm({
         base: Some(term(context, scope, r.base)),
         fields: field_terms(context, scope, r.fields),
       }),
-    EApp(a) -> applied_term(context, scope, a.func, a.args, a.named),
-    EIf(i) -> match branches_of_if(context, scope, i) { Some(t) -> t, None -> UnknownTerm },
-    EMatch(m) -> match branches_of_match(context, scope, m) { Some(t) -> t, None -> UnknownTerm },
-    EBlock(b) -> {
+    CallExpression(a) -> applied_term(context, scope, a.func, a.args, a.named),
+    IfExpression(i) -> match branches_of_if(context, scope, i) {
+      Some(t) -> t,
+      None -> UnknownTerm,
+    },
+    MatchExpression(m) -> match branches_of_match(context, scope, m) {
+      Some(t) -> t,
+      None -> UnknownTerm,
+    },
+    BlockExpression(b) -> {
       let r = block_scope(context, scope, b.stmts);
       match b.tail {
         None -> UnknownTerm,
@@ -1148,7 +1187,7 @@ fn block_scope(
     {
       s: statement_scope(context, acc.s, x),
       falls: match x {
-        SLetElse(l) -> joined(acc.falls, answered(context, acc.s, l.fallback)),
+        LetElseStatement(l) -> joined(acc.falls, result_term(context, acc.s, l.fallback)),
         _ -> acc.falls,
       },
     })
@@ -1156,9 +1195,10 @@ fn block_scope(
 fn field_terms(
   context: MemberContext,
   scope: Scope,
-  fs: List<RecField>,
+  fs: List<RecordLiteralField>,
 ) -> List<{ name: Bytes, term: Term }> / {abort.raise} =
-  fs.map(|field: RecField| { name: field.name.name, term: term(context, scope, field.value) })
+  fs.map(|field: RecordLiteralField|
+    { name: field.name.name, term: term(context, scope, field.value) })
 
 fn offset(context: MemberContext, a: Term, b: Term) -> Term / {abort.raise} =
   match b {
@@ -1212,7 +1252,7 @@ fn integer(context: MemberContext, l: Linear) -> Bool / {abort.raise} =
 
 fn integer_base(context: MemberContext, b: Base) -> Bool / {abort.raise} =
   match b {
-    PlaceBase(p) -> integer_place(context.group, context.me, p),
+    PlaceBase(p) -> integer_place(context.group, context.current, p),
     LengthBase(_) -> true,
     QuotientBase(q) -> integer_base(context, q.of),
     RemainderBase(r) -> integer_base(context, r.by),
@@ -1232,7 +1272,7 @@ fn applied_term(
   named: List<NamedArg>,
 ) -> Term / {abort.raise} =
   match func {
-    EVar(v) -> match callee_of(context, scope, v.name) {
+    NameExpression(v) -> match callee_of(context, scope, v.name) {
       BuiltinCallee(name) -> if args.len() == 0 { UnknownTerm }
       else if length_builtin(name) && args.len() == 1 {
         match term(context, scope, args.get(0)) {
@@ -1257,23 +1297,27 @@ fn applied_term(
       } else if name == b"Array::set" && args.len() == 3 {
         same_length(term(context, scope, args.get(0)))
       } else {
-        match prelude_iterates(name) {
-          Some(it) -> iterated_answer(context, scope, it, args),
+        match prelude_callback_use(name) {
+          Some(it) -> iterated_result(context, scope, it, args),
           None -> UnknownTerm,
         }
       },
       ConstructorCallee -> if args.len() == 1 { Wrapped(term(context, scope, args.get(0))) }
       else { parts_of(args.map(|x: Expr| term(context, scope, x))) },
-      DefinedCallee(n) -> match iterates(n) {
-        Some(it) -> iterated_answer(context, scope, it, args),
+      DefinedCallee(n) -> match callback_use(n) {
+        Some(it) -> iterated_result(context, scope, it, args),
         None -> match context.group.summary_of(n) {
           Some(sum) ->
-            translated(context, sum.result, actuals(context, scope, sum.names, args, named)),
+            term_at_call(
+              context,
+              sum.result,
+              actual_arguments(context, scope, sum.names, args, named),
+            ),
           None -> UnknownTerm,
         },
       },
       GroupMember(t) -> match context.results.at(t) {
-        Some(Some(r)) -> translated(context, r, arguments(context, scope, t, args, named)),
+        Some(Some(r)) -> term_at_call(context, r, arguments(context, scope, t, args, named)),
         _ -> UnknownTerm,
       },
       _ -> UnknownTerm,
@@ -1282,7 +1326,7 @@ fn applied_term(
   }
 
 /// A term of a callee's parameters, at a call with these arguments, in the caller's terms.
-fn translated(context: MemberContext, t: Term, args: List<Term>) -> Term / {abort.raise} =
+fn term_at_call(context: MemberContext, t: Term, args: List<Term>) -> Term / {abort.raise} =
   match t {
     Exactly(l) -> match l.base {
       None -> t,
@@ -1296,12 +1340,12 @@ fn translated(context: MemberContext, t: Term, args: List<Term>) -> Term / {abor
     PartsOf(p) -> made_of(along(actual(args, p.param), p.path)),
     RecordTerm(r) ->
       RecordTerm({
-        base: match r.base { Some(b) -> Some(translated(context, b, args)), None -> None },
+        base: match r.base { Some(b) -> Some(term_at_call(context, b, args)), None -> None },
         fields: r.fields.map(|f: { name: Bytes, term: Term }|
-          { name: f.name, term: translated(context, f.term, args) }),
+          { name: f.name, term: term_at_call(context, f.term, args) }),
       }),
     NoParts -> NoParts,
-    Wrapped(x) -> Wrapped(translated(context, x, args)),
+    Wrapped(x) -> Wrapped(term_at_call(context, x, args)),
     SameLength(p) -> same_length(along(actual(args, p.param), p.path)),
     UnknownTerm -> UnknownTerm,
     PartsOfAny(ps) ->
@@ -1328,19 +1372,19 @@ fn linear(context: MemberContext, scope: Scope, e: Expr) -> Option<Linear> / {ab
   }
 
 /// What a body answers: the terms its branches answer joined, a branch that never answers apart.
-fn answered(context: MemberContext, scope: Scope, e: Expr) -> Option<Term> / {abort.raise} =
+fn result_term(context: MemberContext, scope: Scope, e: Expr) -> Option<Term> / {abort.raise} =
   match e {
-    EIf(i) -> branches_of_if(context, scope, i),
-    EMatch(m) -> branches_of_match(context, scope, m),
-    EBlock(b) -> {
+    IfExpression(i) -> branches_of_if(context, scope, i),
+    MatchExpression(m) -> branches_of_match(context, scope, m),
+    BlockExpression(b) -> {
       let r = block_scope(context, scope, b.stmts);
       joined(r.falls, match b.tail {
         None -> Some(UnknownTerm),
-        Some(t) -> answered(context, r.s, t),
+        Some(t) -> result_term(context, r.s, t),
       })
     },
-    EApp(a) -> match a.func {
-      EVar(v) -> match callee_of(context, scope, v.name) {
+    CallExpression(a) -> match a.func {
+      NameExpression(v) -> match callee_of(context, scope, v.name) {
         BuiltinCallee(name) -> if name == b"panic" { None } else { Some(term(context, scope, e)) },
         // A member not yet known to answer has not answered here either.
         GroupMember(t) -> match context.results.at(t) {
@@ -1360,8 +1404,8 @@ fn branches_of_if(
   i: { span: Span, cond: Expr, then_branch: Expr, else_branch: Expr },
 ) -> Option<Term> / {abort.raise} =
   joined(
-    answered(context, assume(context, scope, i.cond, true), i.then_branch),
-    answered(context, assume(context, scope, i.cond, false), i.else_branch),
+    result_term(context, assume(context, scope, i.cond, true), i.then_branch),
+    result_term(context, assume(context, scope, i.cond, false), i.else_branch),
   )
 
 fn branches_of_match(
@@ -1374,7 +1418,7 @@ fn branches_of_match(
     let inside = bind(scope, arm.pat, t);
     joined(
       acc,
-      answered(
+      result_term(
         context,
         match arm.guard { Some(g) -> assume(context, inside, g, true), None -> inside },
         arm.body,
@@ -1395,19 +1439,19 @@ fn join(a: Term, b: Term) -> Term = joined_within(a, b, join_depth())
 /// a join.
 fn join_depth() -> Int = 8
 
-fn joined_within(a: Term, b: Term, room: Int) -> Term =
+fn joined_within(a: Term, b: Term, budget: Int) -> Term =
   if a == b { a }
-  else if room <= 0 { UnknownTerm } else {
+  else if budget <= 0 { UnknownTerm } else {
     match a {
       Wrapped(x) -> match b {
-        Wrapped(y) -> Wrapped(joined_within(x, y, room - 1)),
+        Wrapped(y) -> Wrapped(joined_within(x, y, budget - 1)),
         NoParts -> a,
         _ -> UnknownTerm,
       },
       RecordTerm(r) -> match b {
-        RecordTerm(q) -> record_join(r, q, room - 1),
+        RecordTerm(q) -> record_join(r, q, budget - 1),
         _ -> match r.base {
-          Some(base) -> if base == b { record_join(r, { base: Some(b), fields: [] }, room - 1) }
+          Some(base) -> if base == b { record_join(r, { base: Some(b), fields: [] }, budget - 1) }
           else { UnknownTerm },
           None -> UnknownTerm,
         },
@@ -1415,7 +1459,7 @@ fn joined_within(a: Term, b: Term, room: Int) -> Term =
       _ -> match b {
         Wrapped(_) -> if a == NoParts { b } else { UnknownTerm },
         RecordTerm(q) -> match q.base {
-          Some(base) -> if base == a { record_join({ base: Some(a), fields: [] }, q, room - 1) }
+          Some(base) -> if base == a { record_join({ base: Some(a), fields: [] }, q, budget - 1) }
           else { UnknownTerm },
           None -> UnknownTerm,
         },
@@ -1428,7 +1472,7 @@ fn joined_within(a: Term, b: Term, room: Int) -> Term =
 fn record_join(
   a: { base: Option<Term>, fields: List<{ name: Bytes, term: Term }> },
   b: { base: Option<Term>, fields: List<{ name: Bytes, term: Term }> },
-  room: Int,
+  budget: Int,
 ) -> Term =
   if a.base != b.base { UnknownTerm } else {
     let named = b.fields.fold(
@@ -1443,7 +1487,7 @@ fn record_join(
           name: n,
           term: match record_field(a, n) {
             Some(x) -> match record_field(b, n) {
-              Some(y) -> joined_within(x, y, room),
+              Some(y) -> joined_within(x, y, budget),
               None -> UnknownTerm,
             },
             None -> UnknownTerm,
@@ -1535,7 +1579,7 @@ fn entry_scope(context: MemberContext, def: FnDef) -> Scope / {abort.raise} =
     locals: range(0, def.params.len()).fold(Map::new(), |m: Map<Int, Local>, i: Int|
       m.insert(
         def.params.get(i).name.span.site,
-        if function_param(context.group, context.me, i) { FunctionParam(i) }
+        if function_param(context.group, context.current, i) { FunctionParam(i) }
         else { KnownTerm(Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 })) },
       )),
     facts: [],
@@ -1551,15 +1595,15 @@ fn unknown_params(s: Scope, ps: List<Param>) -> Scope =
 
 fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
   match p {
-    PWild(_) -> s,
-    PVar(v) -> bound(s, v.name, t),
-    PLit(_) -> s,
-    PRange(_) -> s,
-    PCtor(k) -> k.args.fold(s, |sc: Scope, x: Pattern| bind(sc, x, below(t))),
-    PRecord(r) ->
+    PatternWildcard(_) -> s,
+    PatternVariable(v) -> bound(s, v.name, t),
+    PatternLiteral(_) -> s,
+    PatternRange(_) -> s,
+    PatternConstructor(k) -> k.args.fold(s, |sc: Scope, x: Pattern| bind(sc, x, below(t))),
+    PatternRecord(r) ->
       r.fields.fold(s, |sc: Scope, f: { name: Ident, pat: Pattern }|
         bind(sc, f.pat, project(t, f.name.name))),
-    PList(l) -> {
+    PatternList(l) -> {
       let items = l.items.fold(s, |sc: Scope, x: Pattern| bind(sc, x, below(t)));
       match l.rest {
         Some(r) -> bind(items, r, if l.items.len() > 0 { tail(t) } else { t }),
@@ -1568,7 +1612,7 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
     },
     // Each alternative binds the first one's names; one whose parts differ between them is
     // unknown.
-    POr(o) -> match o.alts {
+    PatternOr(o) -> match o.alternatives {
       [] -> s,
       [first, ..others] -> {
         let one = bind(s, first, t);
@@ -1585,15 +1629,15 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
         })
       },
     },
-    PBad(_) -> s,
+    PatternInvalid(_) -> s,
   }
 
 /// A `let` of a lambda keeps the lambda, walked where it is called.
 fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {abort.raise} =
   match x {
-    SLet(l) -> match l.pat {
-      PVar(v) -> match l.value {
-        ELambda(f) ->
+    LetStatement(l) -> match l.pat {
+      PatternVariable(v) -> match l.value {
+        LambdaExpression(f) ->
           {
             ..scope,
             locals: scope.locals.insert(
@@ -1605,9 +1649,9 @@ fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {ab
       },
       _ -> bind(scope, l.pat, term(context, scope, l.value)),
     },
-    SLetElse(l) -> bind(scope, l.pat, term(context, scope, l.value)),
-    SExpr(_) -> scope,
-    SAssign(a) -> match binder_of(context, bare(a.name)) {
+    LetElseStatement(l) -> bind(scope, l.pat, term(context, scope, l.value)),
+    ExpressionStatement(_) -> scope,
+    AssignmentStatement(a) -> match binder_of(context, bare(a.name)) {
       Some(b) -> known(scope, b, UnknownTerm),
       None -> scope,
     },
@@ -1616,8 +1660,9 @@ fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {ab
 /// What holds where `e` evaluated to `truth`.
 fn assume(context: MemberContext, scope: Scope, e: Expr, truth: Bool) -> Scope / {abort.raise} =
   match e {
-    EUnary(u) -> if u.op == b"not" { assume(context, scope, u.operand, !truth) } else { scope },
-    EBinary(b) -> if b.op == b"and" {
+    UnaryExpression(u) -> if u.op == b"not" { assume(context, scope, u.operand, !truth) }
+    else { scope },
+    BinaryExpression(b) -> if b.op == b"and" {
       if truth { assume(context, assume(context, scope, b.lhs, true), b.rhs, true) } else { scope }
     } else if b.op == b"or" {
       if truth { scope }
@@ -1627,28 +1672,32 @@ fn assume(context: MemberContext, scope: Scope, e: Expr, truth: Bool) -> Scope /
         None -> scope,
         Some(l) -> match linear(context, scope, b.rhs) {
           None -> scope,
-          Some(r) -> { ..scope, facts: append_facts(scope.facts, compared(b.op, l, r, truth)) },
+          Some(r) ->
+            { ..scope, facts: append_facts(scope.facts, comparison_facts(b.op, l, r, truth)) },
         },
       }
     },
-    EBlock(b) -> if b.stmts.len() > 0 { scope }
+    BlockExpression(b) -> if b.stmts.len() > 0 { scope }
     else { match b.tail { Some(t) -> assume(context, scope, t, truth), None -> scope } },
     _ -> scope,
   }
 
 /// `xs.at(i)` on a list or an array answering `Some` puts `i` below the length, and a
 /// condition matched against `true` or `false` holds or fails as an `if` would.
-fn found_at(
+fn pattern_facts(
   context: MemberContext,
   scope: Scope,
   scrutinee: Expr,
   p: Pattern,
 ) -> Scope / {abort.raise} =
   match p {
-    PLit(l) -> match l.lit { LBool(b) -> assume(context, scope, scrutinee, b), _ -> scope },
-    PCtor(k) -> if k.name.name.name != some_ctor() { scope } else {
+    PatternLiteral(l) -> match l.lit {
+      LiteralBool(b) -> assume(context, scope, scrutinee, b),
+      _ -> scope,
+    },
+    PatternConstructor(k) -> if k.name.name.name != some_ctor() { scope } else {
       match scrutinee {
-        EApp(a) -> match builtin(context, scope, a.func) {
+        CallExpression(a) -> match builtin(context, scope, a.func) {
           Some(name) -> if (name != b"List::at" && name != b"Array::at") || a.args.len() != 2 {
             scope
           } else {
@@ -1683,14 +1732,14 @@ fn found_at(
   }
 
 /// The facts `after` holds past those `before` did, which it extends.
-fn facts_past(before: List<Fact>, after: List<Fact>) -> List<Fact> / {abort.raise} =
+fn new_facts(before: List<Fact>, after: List<Fact>) -> List<Fact> / {abort.raise} =
   range(before.len(), after.len()).map(|i: Int| after.get(i))
 
 fn irrefutable(p: Pattern) -> Bool =
   match p {
-    PWild(_) -> true,
-    PVar(_) -> true,
-    PRecord(r) ->
+    PatternWildcard(_) -> true,
+    PatternVariable(_) -> true,
+    PatternRecord(r) ->
       r.fields.fold(true, |ok: Bool, f: { name: Ident, pat: Pattern }| ok && irrefutable(f.pat)),
     _ -> false,
   }
@@ -1698,7 +1747,7 @@ fn irrefutable(p: Pattern) -> Bool =
 fn append_facts(a: List<Fact>, b: List<Fact>) -> List<Fact> =
   b.fold(a, |acc: List<Fact>, f: Fact| acc.push(f))
 
-fn compared(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
+fn comparison_facts(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
   let lt = |a: Linear, b: Linear| { lo: a, hi: b, strict: true };
   let le = |a: Linear, b: Linear| { lo: a, hi: b, strict: false };
   if truth {
@@ -1720,22 +1769,22 @@ fn compared(op: Bytes, l: Linear, r: Linear, truth: Bool) -> List<Fact> = {
 
 // --- The walk -------------------------------------------------------------------------------------
 
-fn seen_of(context: MemberContext, def: FnDef) -> Seen / {abort.raise} = {
+fn walk_definition(context: MemberContext, def: FnDef) -> Findings / {abort.raise} = {
   let s = entry_scope(context, def);
   let defaults = def.params.fold(
     { calls: [], uses: [], outside: [], lost: None },
-    |acc: Seen, p: Param| match p.default { Some(d) -> walk(context, s, acc, d), None -> acc },
+    |acc: Findings, p: Param| match p.default { Some(d) -> walk(context, s, acc, d), None -> acc },
   );
   walk(context, s, defaults, def.body)
 }
 
 /// How the definition calls each function it is handed, and what it answers.
-fn summary(context: MemberContext, x: Seen) -> Summary / {abort.raise} = {
-  let def = context.group.defs.get(context.me);
+fn summary(context: MemberContext, x: Findings) -> Summary / {abort.raise} = {
+  let def = context.group.defs.get(context.current);
   {
     names: def.params.map(|p: Param| p.name.name),
     params: range(0, def.params.len()).map(|i: Int|
-      if !function_param(context.group, context.me, i) { NotCalled } else {
+      if !function_param(context.group, context.current, i) { NotCalled } else {
         let own = x.uses.fold(CalledWith([]), |acc: Passing, u: Use|
           if u.param != i { acc } else {
             match acc {
@@ -1745,20 +1794,20 @@ fn summary(context: MemberContext, x: Seen) -> Summary / {abort.raise} = {
           });
         match own {
           CalledWith(cs) ->
-            recursed(
+            recursive_calls(
               context,
               cs,
-              x.calls.filter(|c: Call| c.callee == context.me && hands_on(c, i)),
+              x.calls.filter(|c: Call| c.callee == context.current && forwards_parameter(c, i)),
             ),
           other -> other,
         }
       }),
-    result: match context.results.at(context.me) { Some(Some(t)) -> t, _ -> UnknownTerm },
+    result: match context.results.at(context.current) { Some(Some(t)) -> t, _ -> UnknownTerm },
   }
 }
 
 /// Whether a call hands on the parameter at `i` as it is, in the same place.
-fn hands_on(c: Call, i: Int) -> Bool =
+fn forwards_parameter(c: Call, i: Int) -> Bool =
   match c.args.at(i) {
     Some(Exactly(l)) -> l.k == 0 && l.base == Some(PlaceBase({ param: i, path: [] })),
     _ -> false,
@@ -1768,7 +1817,7 @@ fn hands_on(c: Call, i: Int) -> Bool =
 /// definition's calls of itself: each of those invocations calls it as this one does, in the terms
 /// of what it was handed, so those calls are this one's too, read back through each call until no
 /// new one appears. Past a number of rounds, a call of which nothing is known stands for the rest.
-fn recursed(
+fn recursive_calls(
   context: MemberContext,
   calls: List<List<Term>>,
   selves: List<Call>,
@@ -1777,28 +1826,28 @@ fn recursed(
     let unknown = calls.get(0).map(|_: Term| UnknownTerm);
     iterate(
       { known: calls, k: 0 },
-      recursion_rounds() + 2,
+      max_recursion_rounds() + 2,
       |st: { known: List<List<Term>>, k: Int }| {
         let next = selves.fold(st.known, |acc: List<List<Term>>, c: Call|
           st.known.fold(acc, |grown: List<List<Term>>, call: List<Term>|
-            with_call(grown, call.map(|t: Term| translated(context, t, c.args)))));
+            with_call(grown, call.map(|t: Term| term_at_call(context, t, c.args)))));
         if next.len() == st.known.len() { Stop(CalledWith(st.known)) }
-        else if st.k >= recursion_rounds() { Stop(CalledWith(with_call(next, unknown))) }
+        else if st.k >= max_recursion_rounds() { Stop(CalledWith(with_call(next, unknown))) }
         else { Continue({ known: next, k: st.k + 1 }) }
       },
     )
   }
 
-fn recursion_rounds() -> Int = 6
+fn max_recursion_rounds() -> Int = 6
 
 fn with_call(xs: List<List<Term>>, call: List<Term>) -> List<List<Term>> =
   if xs.fold(false, |found: Bool, x: List<Term>| found || x == call) { xs } else { xs.push(call) }
 
-fn called(acc: Seen, x: Call) -> Seen = { ..acc, calls: acc.calls.push(x) }
+fn add_call(acc: Findings, x: Call) -> Findings = { ..acc, calls: acc.calls.push(x) }
 
-fn used(acc: Seen, u: Use) -> Seen = { ..acc, uses: acc.uses.push(u) }
+fn add_use(acc: Findings, u: Use) -> Findings = { ..acc, uses: acc.uses.push(u) }
 
-fn reached(acc: Seen, name: Bytes, span: Span) -> Seen =
+fn add_external_call(acc: Findings, name: Bytes, span: Span) -> Findings =
   { ..acc, outside: acc.outside.push({ name: name, span: span }) }
 
 /// What a free name names; a name the walk bound is its own.
@@ -1806,14 +1855,17 @@ fn callee_of(context: MemberContext, scope: Scope, q: QName) -> Callee / {abort.
   match q.module {
     None -> match local_of(context, scope, q) {
       Some(_) -> OtherCallee,
-      None -> context.group.resolve(context.me, q),
+      None -> context.group.resolve(context.current, q),
     },
-    Some(_) -> context.group.resolve(context.me, q),
+    Some(_) -> context.group.resolve(context.current, q),
   }
 
 fn builtin(context: MemberContext, scope: Scope, func: Expr) -> Option<Bytes> / {abort.raise} =
   match func {
-    EVar(v) -> match callee_of(context, scope, v.name) { BuiltinCallee(n) -> Some(n), _ -> None },
+    NameExpression(v) -> match callee_of(context, scope, v.name) {
+      BuiltinCallee(n) -> Some(n),
+      _ -> None,
+    },
     _ -> None,
   }
 
@@ -1821,34 +1873,34 @@ fn builtin(context: MemberContext, scope: Scope, func: Expr) -> Option<Bytes> / 
 fn local_of(context: MemberContext, s: Scope, q: QName) -> Option<Local> =
   match binder_of(context, q) { Some(b) -> s.locals.get(b), None -> None }
 
-fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.raise} =
+fn walk(context: MemberContext, s: Scope, acc: Findings, e: Expr) -> Findings / {abort.raise} =
   match e {
-    ELit(_) -> acc,
-    EHole(_) -> acc,
+    LiteralExpression(_) -> acc,
+    HoleExpression(_) -> acc,
     // A function named but not called here is called wherever the value goes, with nothing known.
-    EVar(v) -> match local_of(context, s, v.name) {
-      Some(FunctionParam(i)) -> used(acc, { param: i, args: None }),
+    NameExpression(v) -> match local_of(context, s, v.name) {
+      Some(FunctionParam(i)) -> add_use(acc, { param: i, args: None }),
       Some(LetLambda(f)) -> lambda_escapes(context, s, acc, f),
       Some(KnownTerm(_)) -> acc,
       None ->
-        stated_called(
+        walk_implicit_calls(
           context,
           s,
           match callee_of(context, s, v.name) {
-            GroupMember(t) -> called(acc, { callee: t, args: [], facts: [], span: v.span }),
-            DefinedCallee(n) -> reached(acc, n, v.span),
+            GroupMember(t) -> add_call(acc, { callee: t, args: [], facts: [], span: v.span }),
+            DefinedCallee(n) -> add_external_call(acc, n, v.span),
             _ -> acc,
           },
           v.span,
           [],
         ),
     },
-    EBinary(b) -> if b.op == b"and" {
+    BinaryExpression(b) -> if b.op == b"and" {
       walk(context, assume(context, s, b.lhs, true), walk(context, s, acc, b.lhs), b.rhs)
     } else if b.op == b"or" {
       walk(context, assume(context, s, b.lhs, false), walk(context, s, acc, b.lhs), b.rhs)
     } else {
-      stated_called(
+      walk_implicit_calls(
         context,
         s,
         walk(context, s, walk(context, s, acc, b.lhs), b.rhs),
@@ -1856,22 +1908,22 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
         [term(context, s, b.lhs), term(context, s, b.rhs)],
       )
     },
-    EUnary(u) ->
-      stated_called(context, s, walk(context, s, acc, u.operand), expr_span(e), [
+    UnaryExpression(u) ->
+      walk_implicit_calls(context, s, walk(context, s, acc, u.operand), expr_span(e), [
         term(context, s, u.operand),
       ]),
-    ELambda(l) -> walk(context, unknown_params(s, l.params), acc, l.body),
-    EApp(a) -> {
-      let called = stated_called(
+    LambdaExpression(l) -> walk(context, unknown_params(s, l.params), acc, l.body),
+    CallExpression(a) -> {
+      let add_call = walk_implicit_calls(
         context,
         s,
-        applied(context, s, acc, a.func, a.args, a.named, a.span),
+        walk_call(context, s, acc, a.func, a.args, a.named, a.span),
         expr_span(a.func),
         [],
       );
-      called
+      add_call
     },
-    EIf(i) -> {
+    IfExpression(i) -> {
       let cond = walk(context, s, acc, i.cond);
       walk(
         context,
@@ -1880,13 +1932,13 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
         i.else_branch,
       )
     },
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let t = term(context, s, m.scrutinee);
       // An arm whose pattern always matches is passed only when its guard fails.
       let walked = m.arms.fold(
         { seen: walk(context, s, acc, m.scrutinee), failed: [] },
-        |a: { seen: Seen, failed: List<Fact> }, arm: MatchArm| {
-          let inside = found_at(
+        |a: { seen: Findings, failed: List<Fact> }, arm: MatchArm| {
+          let inside = pattern_facts(
             context,
             bind({ ..s, facts: append_facts(s.facts, a.failed) }, arm.pat, t),
             m.scrutinee,
@@ -1905,7 +1957,7 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
                 failed: if irrefutable(arm.pat) {
                   append_facts(
                     a.failed,
-                    facts_past(inside.facts, assume(context, inside, g, false).facts),
+                    new_facts(inside.facts, assume(context, inside, g, false).facts),
                   )
                 } else { a.failed },
               },
@@ -1914,23 +1966,24 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
       );
       walked.seen
     },
-    EBlock(b) -> {
-      let r = statements(context, s, acc, b.stmts);
+    BlockExpression(b) -> {
+      let r = walk_statements(context, s, acc, b.stmts);
       match b.tail { Some(t) -> walk(context, r.s, r.acc, t), None -> r.acc }
     },
-    ERecord(r) -> r.fields.fold(acc, |a: Seen, f: RecField| walk(context, s, a, f.value)),
-    ERecordUpdate(r) ->
-      r.fields.fold(walk(context, s, acc, r.base), |a: Seen, f: RecField|
+    RecordExpression(r) ->
+      r.fields.fold(acc, |a: Findings, f: RecordLiteralField| walk(context, s, a, f.value)),
+    RecordUpdateExpression(r) ->
+      r.fields.fold(walk(context, s, acc, r.base), |a: Findings, f: RecordLiteralField|
         walk(context, s, a, f.value)),
-    ETry(t) -> walk(context, s, acc, t.operand),
-    EField(f) -> walk(context, s, acc, f.base),
-    EList(l) -> l.items.fold(acc, |a: Seen, x: Expr| walk(context, s, a, x)),
-    EPerform(p) -> p.args.fold(acc, |a: Seen, x: Expr| walk(context, s, a, x)),
-    EHandle(h) -> {
+    PropagateExpression(t) -> walk(context, s, acc, t.operand),
+    FieldExpression(f) -> walk(context, s, acc, f.base),
+    ListExpression(l) -> l.items.fold(acc, |a: Findings, x: Expr| walk(context, s, a, x)),
+    PerformExpression(p) -> p.args.fold(acc, |a: Findings, x: Expr| walk(context, s, a, x)),
+    HandleExpression(h) -> {
       // Each initializer sees the variables above it.
       let inits = h.vars.fold(
         { seen: acc, scope: s },
-        |a: { seen: Seen, scope: Scope }, v: HandlerVar|
+        |a: { seen: Findings, scope: Scope }, v: HandlerVar|
           {
             seen: walk(context, a.scope, a.seen, v.init),
             scope: bound(a.scope, v.name, UnknownTerm),
@@ -1943,113 +1996,114 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
         Some(r) -> walk(context, bound(held, r.binder, UnknownTerm), body, r.body),
         None -> body,
       };
-      h.clauses.fold(returned, |a: Seen, k: HandleClause| {
+      h.clauses.fold(returned, |a: Findings, k: HandleClause| {
         let params = k.params.fold(held, |sc: Scope, p: Ident| bound(sc, p, UnknownTerm));
         let resumed = match k.resume { Some(r) -> bound(params, r, UnknownTerm), None -> params };
         walk(context, resumed, a, k.body)
       })
     },
-    EWithHold(w) ->
+    WithHoldExpression(w) ->
       walk(
         context,
         bound(s, w.binder, UnknownTerm),
         walk(context, s, walk(context, s, acc, w.acquire), w.release),
         w.body,
       ),
-    ESimulate(x) -> walk(context, s, acc, x.body),
-    EParallel(p) -> p.branches.fold(acc, |a: Seen, x: Expr| walk(context, s, a, x)),
+    SimulateExpression(x) -> walk(context, s, acc, x.body),
+    ParallelExpression(p) -> p.branches.fold(acc, |a: Findings, x: Expr| walk(context, s, a, x)),
     // The calls a tagged literal runs as, of arguments no caller's, after its holes.
-    ETagged(t) -> {
-      let held = t.holes.fold(acc, |a: Seen, h: Hole| walk(context, s, a, h.value));
-      let parsed = tag_called(context, s, held, t, tagged_parser(t));
-      if t.holes.len() == 0 { parsed } else { tag_called(context, s, parsed, t, tagged_filler(t)) }
+    TaggedLiteralExpression(t) -> {
+      let held = t.holes.fold(acc, |a: Findings, h: Hole| walk(context, s, a, h.value));
+      let parsed = walk_tagged_call(context, s, held, t, tagged_parser(t));
+      if t.holes.len() == 0 { parsed }
+      else { walk_tagged_call(context, s, parsed, t, tagged_filler(t)) }
     },
-    EBad(_) -> acc,
-    ETryBlock(t) -> walk(context, s, acc, t.body),
+    InvalidExpression(_) -> acc,
+    TryBlockExpression(t) -> walk(context, s, acc, t.body),
   }
 
 /// The calls the expression at `span` makes because a type states them, over its `operands`: a
 /// member of as many parameters takes them all, one of a single parameter each in its turn, and
 /// any other arguments nothing is known of.
-fn stated_called(
+fn walk_implicit_calls(
   context: MemberContext,
   s: Scope,
-  acc: Seen,
+  acc: Findings,
   span: Span,
   operands: List<Term>,
-) -> Seen / {abort.raise} =
-  context.group.stated(context.me, span).fold(acc, |seen: Seen, callee: Callee|
+) -> Findings / {abort.raise} =
+  context.group.stated(context.current, span).fold(acc, |seen: Findings, callee: Callee|
     match callee {
       GroupMember(m) -> {
         let params = context.group.defs.get(m).params;
         let calls = if params.len() == operands.len() { [operands] }
         else if params.len() == 1 && operands.len() > 0 { operands.map(|t: Term| [t]) }
         else { [params.map(|_: Param| UnknownTerm)] };
-        calls.fold(seen, |a: Seen, args: List<Term>|
-          called(a, { callee: m, args: args, facts: s.facts, span: span }))
+        calls.fold(seen, |a: Findings, args: List<Term>|
+          add_call(a, { callee: m, args: args, facts: s.facts, span: span }))
       },
-      DefinedCallee(n) -> reached(seen, n, span),
+      DefinedCallee(n) -> add_external_call(seen, n, span),
       _ -> seen,
     })
 
-fn tag_called(
+fn walk_tagged_call(
   context: MemberContext,
   s: Scope,
-  acc: Seen,
-  t: Tagged,
+  acc: Findings,
+  t: TaggedLiteral,
   callee: QName,
-) -> Seen / {abort.raise} =
+) -> Findings / {abort.raise} =
   match callee_of(context, s, callee) {
     GroupMember(m) ->
-      called(acc, {
+      add_call(acc, {
         callee: m,
         args: context.group.defs.get(m).params.map(|_: Param| UnknownTerm),
         facts: s.facts,
         span: t.span,
       }),
-    DefinedCallee(n) -> reached(acc, n, t.tag.span),
+    DefinedCallee(n) -> add_external_call(acc, n, t.tag.span),
     _ -> acc,
   }
 
 /// A block's statements walked, and the scope past them.
-fn statements(
+fn walk_statements(
   context: MemberContext,
   scope: Scope,
-  acc: Seen,
+  acc: Findings,
   stmts: List<Stmt>,
-) -> { s: Scope, acc: Seen } / {abort.raise} =
-  stmts.fold({ s: scope, acc: acc }, |st: { s: Scope, acc: Seen }, x: Stmt|
+) -> { s: Scope, acc: Findings } / {abort.raise} =
+  stmts.fold({ s: scope, acc: acc }, |st: { s: Scope, acc: Findings }, x: Stmt|
     match x {
-      SLet(l) -> match l.pat {
-        PVar(_) -> match l.value {
-          ELambda(_) -> { s: statement_scope(context, st.s, x), acc: st.acc },
+      LetStatement(l) -> match l.pat {
+        PatternVariable(_) -> match l.value {
+          LambdaExpression(_) -> { s: statement_scope(context, st.s, x), acc: st.acc },
           _ -> { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
         },
         _ -> { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, l.value) },
       },
-      SLetElse(l) ->
+      LetElseStatement(l) ->
         {
           s: statement_scope(context, st.s, x),
           acc: walk(context, st.s, walk(context, st.s, st.acc, l.value), l.fallback),
         },
-      SExpr(y) -> { s: st.s, acc: walk(context, st.s, st.acc, y) },
-      SAssign(y) ->
+      ExpressionStatement(y) -> { s: st.s, acc: walk(context, st.s, st.acc, y) },
+      AssignmentStatement(y) ->
         { s: statement_scope(context, st.s, x), acc: walk(context, st.s, st.acc, y.value) },
     })
 
 /// Past this many lambdas' bodies read within one another, a body is not read.
-fn inline_bound() -> Int = 8
+fn max_inline_depth() -> Int = 8
 
 /// A `let` lambda called here with these arguments: its body, walked in the scope it was written in
 /// with what holds here.
-fn inlined(
+fn walk_inlined_lambda(
   context: MemberContext,
   s: Scope,
-  acc: Seen,
+  acc: Findings,
   f: { params: List<Param>, body: Expr, locals: Map<Int, Local> },
   args: List<Term>,
-) -> Seen / {abort.raise} =
-  if context.depth >= inline_bound() { too_deep(acc, f.body) } else {
+) -> Findings / {abort.raise} =
+  if context.depth >= max_inline_depth() { too_deep(acc, f.body) } else {
     let inside = range(0, f.params.len()).fold(
       { locals: f.locals, facts: s.facts },
       |sc: Scope, i: Int| bound(sc, f.params.get(i).name, actual(args, i)),
@@ -2060,10 +2114,10 @@ fn inlined(
 fn lambda_escapes(
   context: MemberContext,
   scope: Scope,
-  acc: Seen,
+  acc: Findings,
   f: { params: List<Param>, body: Expr, locals: Map<Int, Local> },
-) -> Seen / {abort.raise} =
-  if context.depth >= inline_bound() { too_deep(acc, f.body) } else {
+) -> Findings / {abort.raise} =
+  if context.depth >= max_inline_depth() { too_deep(acc, f.body) } else {
     walk(
       { ..context, depth: context.depth + 1 },
       unknown_params({ locals: f.locals, facts: scope.facts }, f.params),
@@ -2072,39 +2126,39 @@ fn lambda_escapes(
     )
   }
 
-fn too_deep(acc: Seen, body: Expr) -> Seen =
+fn too_deep(acc: Findings, body: Expr) -> Findings =
   match acc.lost { Some(_) -> acc, None -> { ..acc, lost: Some(expr_span(body)) } }
 
-fn applied(
+fn walk_call(
   context: MemberContext,
   scope: Scope,
-  acc: Seen,
+  acc: Findings,
   func: Expr,
   args: List<Expr>,
   named: List<NamedArg>,
   span: Span,
-) -> Seen / {abort.raise} = {
-  let walk_args = |a: Seen|
+) -> Findings / {abort.raise} = {
+  let walk_args = |a: Findings|
     named.fold(
-      args.fold(a, |x: Seen, y: Expr| walk(context, scope, x, y)),
-      |x: Seen, n: NamedArg| walk(context, scope, x, n.value),
+      args.fold(a, |x: Findings, y: Expr| walk(context, scope, x, y)),
+      |x: Findings, n: NamedArg| walk(context, scope, x, n.value),
     );
   // A function parameter handed on in its own place to the definition's own recursion does not
   // escape: that invocation calls it as this one does, which its summary reads back.
   let own_place = |i: Int, x: Expr|
     match x {
-      EVar(w) -> match local_of(context, scope, w.name) {
+      NameExpression(w) -> match local_of(context, scope, w.name) {
         Some(FunctionParam(j)) -> j == i,
         _ -> false,
       },
       _ -> false,
     };
-  let walk_recursion = |a: Seen| {
-    let names = context.group.defs.get(context.me).params.map(|p: Param| p.name.name);
+  let walk_recursion = |a: Findings| {
+    let names = context.group.defs.get(context.current).params.map(|p: Param| p.name.name);
     named.fold(
-      range(0, args.len()).fold(a, |x: Seen, i: Int|
+      range(0, args.len()).fold(a, |x: Findings, i: Int|
         if own_place(i, args.get(i)) { x } else { walk(context, scope, x, args.get(i)) }),
-      |x: Seen, n: NamedArg|
+      |x: Findings, n: NamedArg|
         match index_of(names, n.name.name) {
           Some(i) -> if own_place(i, n.value) { x } else { walk(context, scope, x, n.value) },
           None -> walk(context, scope, x, n.value),
@@ -2112,30 +2166,48 @@ fn applied(
     )
   };
   match func {
-    EVar(v) -> match local_of(context, scope, v.name) {
+    NameExpression(v) -> match local_of(context, scope, v.name) {
       Some(LetLambda(f)) ->
-        inlined(context, scope, walk_args(acc), f, args.map(|x: Expr| term(context, scope, x))),
+        walk_inlined_lambda(
+          context,
+          scope,
+          walk_args(acc),
+          f,
+          args.map(|x: Expr| term(context, scope, x)),
+        ),
       Some(FunctionParam(i)) ->
-        used(walk_args(acc), { param: i, args: Some(args.map(|x: Expr| term(context, scope, x))) }),
+        add_use(walk_args(acc), {
+          param: i,
+          args: Some(args.map(|x: Expr| term(context, scope, x))),
+        }),
       Some(KnownTerm(_)) -> walk_args(acc),
       None -> match callee_of(context, scope, v.name) {
         GroupMember(t) ->
-          called(if t == context.me { walk_recursion(acc) } else { walk_args(acc) }, {
+          add_call(if t == context.current { walk_recursion(acc) } else { walk_args(acc) }, {
             callee: t,
             args: arguments(context, scope, t, args, named),
             facts: scope.facts,
             span: span,
           }),
-        BuiltinCallee(name) -> match prelude_iterates(name) {
-          Some(it) -> iterated(context, scope, acc, args, named, it),
+        BuiltinCallee(name) -> match prelude_callback_use(name) {
+          Some(it) -> walk_iterating_call(context, scope, acc, args, named, it),
           None -> walk_args(acc),
         },
         // An entry of a function `std.prelude` writes in Ply is held to its body by `semantics`.
-        DefinedCallee(n) -> match iterates(n) {
-          Some(it) -> iterated(context, scope, reached(acc, n, v.span), args, named, it),
+        DefinedCallee(n) -> match callback_use(n) {
+          Some(it) ->
+            walk_iterating_call(context, scope, add_external_call(acc, n, v.span), args, named, it),
           None -> match context.group.summary_of(n) {
-            Some(sum) -> passed(context, scope, reached(acc, n, v.span), sum, args, named),
-            None -> walk_args(reached(acc, n, v.span)),
+            Some(sum) ->
+              walk_summarized_call(
+                context,
+                scope,
+                add_external_call(acc, n, v.span),
+                sum,
+                args,
+                named,
+              ),
+            None -> walk_args(add_external_call(acc, n, v.span)),
           },
         },
         _ -> walk_args(acc),
@@ -2153,9 +2225,15 @@ fn arguments(
   args: List<Expr>,
   named: List<NamedArg>,
 ) -> List<Term> / {abort.raise} =
-  actuals(context, scope, context.group.defs.get(t).params.map(|p: Param| p.name.name), args, named)
+  actual_arguments(
+    context,
+    scope,
+    context.group.defs.get(t).params.map(|p: Param| p.name.name),
+    args,
+    named,
+  )
 
-fn actuals(
+fn actual_arguments(
   context: MemberContext,
   scope: Scope,
   names: List<Bytes>,
@@ -2171,30 +2249,30 @@ fn actuals(
     })
 
 /// A call of a summarized definition: each function it is handed is called as the summary says.
-fn passed(
+fn walk_summarized_call(
   context: MemberContext,
   scope: Scope,
-  acc: Seen,
+  acc: Findings,
   sum: Summary,
   args: List<Expr>,
   named: List<NamedArg>,
-) -> Seen / {abort.raise} = {
-  let terms = actuals(context, scope, sum.names, args, named);
-  let at_param = |i: Int, seen: Seen, x: Expr|
+) -> Findings / {abort.raise} = {
+  let terms = actual_arguments(context, scope, sum.names, args, named);
+  let at_param = |i: Int, seen: Findings, x: Expr|
     match sum.params.at(i) {
       Some(CalledWith(calls)) ->
-        handed(
+        walk_passed_function(
           context,
           scope,
           seen,
           x,
-          calls.map(|call: List<Term>| call.map(|t: Term| translated(context, t, terms))),
+          calls.map(|call: List<Term>| call.map(|t: Term| term_at_call(context, t, terms))),
         ),
       _ -> walk(context, scope, seen, x),
     };
-  let positional = range(0, args.len()).fold(acc, |seen: Seen, i: Int|
+  let positional = range(0, args.len()).fold(acc, |seen: Findings, i: Int|
     at_param(i, seen, args.get(i)));
-  named.fold(positional, |seen: Seen, n: NamedArg|
+  named.fold(positional, |seen: Findings, n: NamedArg|
     match index_of(sum.names, n.name.name) {
       Some(i) -> at_param(i, seen, n.value),
       None -> walk(context, scope, seen, n.value),
@@ -2206,43 +2284,45 @@ fn index_of(xs: List<Bytes>, x: Bytes) -> Option<Int> / {abort.raise} =
     match found { Some(_) -> found, None -> if xs.get(i) == x { Some(i) } else { None } })
 
 /// A function handed to a callee that calls it with each of `calls`.
-fn handed(
+fn walk_passed_function(
   context: MemberContext,
   s: Scope,
-  acc: Seen,
+  acc: Findings,
   x: Expr,
   calls: List<List<Term>>,
-) -> Seen / {abort.raise} =
+) -> Findings / {abort.raise} =
   match x {
-    ELambda(l) ->
-      calls.fold(acc, |seen: Seen, call: List<Term>| {
+    LambdaExpression(l) ->
+      calls.fold(acc, |seen: Findings, call: List<Term>| {
         let inside = range(0, l.params.len()).fold(s, |sc: Scope, j: Int|
           bound(sc, l.params.get(j).name, actual(call, j)));
         walk(context, inside, seen, l.body)
       }),
-    EVar(v) -> match local_of(context, s, v.name) {
+    NameExpression(v) -> match local_of(context, s, v.name) {
       Some(LetLambda(f)) ->
-        calls.fold(acc, |seen: Seen, call: List<Term>| inlined(context, s, seen, f, call)),
+        calls.fold(acc, |seen: Findings, call: List<Term>|
+          walk_inlined_lambda(context, s, seen, f, call)),
       Some(FunctionParam(i)) ->
-        calls.fold(acc, |seen: Seen, call: List<Term>| used(seen, { param: i, args: Some(call) })),
+        calls.fold(acc, |seen: Findings, call: List<Term>|
+          add_use(seen, { param: i, args: Some(call) })),
       Some(KnownTerm(_)) -> acc,
       None -> match callee_of(context, s, v.name) {
         GroupMember(t) ->
-          calls.fold(acc, |seen: Seen, call: List<Term>|
-            called(seen, { callee: t, args: call, facts: s.facts, span: v.span })),
+          calls.fold(acc, |seen: Findings, call: List<Term>|
+            add_call(seen, { callee: t, args: call, facts: s.facts, span: v.span })),
         _ -> walk(context, s, acc, x),
       },
     },
     // A function an `if`, a `match` or a block answers is called as each branch would be.
-    EBlock(b) -> {
-      let r = statements(context, s, acc, b.stmts);
-      match b.tail { Some(t) -> handed(context, r.s, r.acc, t, calls), None -> r.acc }
+    BlockExpression(b) -> {
+      let r = walk_statements(context, s, acc, b.stmts);
+      match b.tail { Some(t) -> walk_passed_function(context, r.s, r.acc, t, calls), None -> r.acc }
     },
-    EIf(i) ->
-      handed(
+    IfExpression(i) ->
+      walk_passed_function(
         context,
         assume(context, s, i.cond, false),
-        handed(
+        walk_passed_function(
           context,
           assume(context, s, i.cond, true),
           walk(context, s, acc, i.cond),
@@ -2252,14 +2332,14 @@ fn handed(
         i.else_branch,
         calls,
       ),
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let t = term(context, s, m.scrutinee);
-      m.arms.fold(walk(context, s, acc, m.scrutinee), |seen: Seen, arm: MatchArm| {
+      m.arms.fold(walk(context, s, acc, m.scrutinee), |seen: Findings, arm: MatchArm| {
         let inside = bind(s, arm.pat, t);
         match arm.guard {
-          None -> handed(context, inside, seen, arm.body, calls),
+          None -> walk_passed_function(context, inside, seen, arm.body, calls),
           Some(g) ->
-            handed(
+            walk_passed_function(
               context,
               assume(context, inside, g, true),
               walk(context, inside, seen, g),
@@ -2274,23 +2354,23 @@ fn handed(
 
 /// A call of a function that calls the function it is handed as its entry says, handing an element
 /// of what it walks in as each `Element`.
-fn iterated(
+fn walk_iterating_call(
   context: MemberContext,
   scope: Scope,
-  acc: Seen,
+  acc: Findings,
   args: List<Expr>,
   named: List<NamedArg>,
-  it: Iterates,
-) -> Seen / {abort.raise} = {
-  let others = named.fold(acc, |seen: Seen, n: NamedArg| walk(context, scope, seen, n.value));
-  let element = match walked_arg(it, args) {
+  it: CallbackUse,
+) -> Findings / {abort.raise} = {
+  let others = named.fold(acc, |seen: Findings, n: NamedArg| walk(context, scope, seen, n.value));
+  let element = match iterated_argument(it, args) {
     Some(x) -> element(context, scope, x),
     None -> UnknownTerm,
   };
-  let call = it.params.map(|h: Handed| match h { Element -> element, _ -> UnknownTerm });
-  range(0, args.len()).fold(others, |seen: Seen, i: Int| {
+  let call = it.params.map(|h: CallbackArgument| match h { Element -> element, _ -> UnknownTerm });
+  range(0, args.len()).fold(others, |seen: Findings, i: Int| {
     let x = args.get(i);
     if i != it.callback { walk(context, scope, seen, x) }
-    else { handed(context, scope, seen, x, [call]) }
+    else { walk_passed_function(context, scope, seen, x, [call]) }
   })
 }

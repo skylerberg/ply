@@ -3,32 +3,32 @@
 //! library imports nothing of the compiler, and a compiler that ships other modules re-runs exactly
 //! what the change reached.
 
-import harness (scratch, Ran, Source, project, in_memory, tree, over_tree, on_disk_shipping,
-                on_disk_shipping_only, selected, said, json_of, at, items, first, str, shown,
-                Hermetic, Shipped, assert_ok, StdModule, std_modules)
+import harness (scratch, RunResult, Source, write_project, in_memory, tree, over_tree,
+                on_disk_shipping, on_disk_shipping_only, selected, all_output, json_of, at, items,
+                first, str, json_text, Hermetic, Shipped, assert_ok, ShippedModule, std_modules)
 import compiler.syntax.items (is_shipped, is_std)
 import compiler.syntax.exprs (prelude_module)
 import std.json (Json)
 import std.list
 import std.string
 
-fn codes_of(ran: Ran) -> List<String> / {abort.raise} =
+fn codes_of(ran: RunResult) -> List<String> / {abort.raise} =
   items(at(json_of(ran), "diagnostics")).map(|d: Json| str(at(d, "code")))
 
-fn checked(files: List<Source>) -> Ran / {Hermetic, Shipped, abort.raise, diverges} =
+fn checked(files: List<Source>) -> RunResult / {Hermetic, Shipped, abort.raise, diverges} =
   in_memory(tree(files), ["check", "--json"])
 
 /// Every definition's or declaration's hash, by its program-wide name.
-fn hash_of(answer: Json, name: String) -> String / {abort.raise} =
-  match items(at(answer, "definitions")).filter(|d: Json| str(at(d, "name")) == name) {
+fn hash_of(hash_report: Json, name: String) -> String / {abort.raise} =
+  match items(at(hash_report, "definitions")).filter(|d: Json| str(at(d, "name")) == name) {
     [d, ..] -> str(at(d, "hash")),
-    [] -> panic("`" ++ name ++ "` is not in the program: " ++ shown(answer)),
+    [] -> panic("`" ++ name ++ "` is not in the program: " ++ json_text(hash_report)),
   }
 
-fn test_hash(answer: Json, key: String) -> String / {abort.raise} =
-  match items(at(answer, "tests")).filter(|t: Json| str(at(t, "key")) == key) {
+fn test_hash(hash_report: Json, key: String) -> String / {abort.raise} =
+  match items(at(hash_report, "tests")).filter(|t: Json| str(at(t, "key")) == key) {
     [t, ..] -> str(at(t, "hash")),
-    [] -> panic("no test `" ++ key ++ "`: " ++ shown(answer)),
+    [] -> panic("no test `" ++ key ++ "`: " ++ json_text(hash_report)),
   }
 
 fn hashed(files: List<Source>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
@@ -59,26 +59,30 @@ test "nothing a project can name lands under the reserved root" {
     (),
     |u: Unit, rel: String| {
       let r = checked([{ path: rel, text: "pub fn f() -> Int = 1\n" }]);
-      assert(r.code == 0, Some("`" ++ rel ++ "` was refused: " ++ said(r)))
+      assert(r.code == 0, Some("`" ++ rel ++ "` was refused: " ++ all_output(r)))
     },
   )
 }
 
 test "naming a file under std directly cannot smuggle it in as a std module" {
-  let answer = json_of(
+  let hash_report = json_of(
     in_memory(tree([{ path: "std/json.ply", text: "pub fn parse(x: Int) -> Int = x\n" }]), [
       "check",
       "std/json.ply",
       "--json",
     ]),
   );
-  let own = items(at(answer, "modules")).map(|m: Json| str(at(m, "name"))).filter(|n: String|
-    !is_std(Bytes::of_string(n)));
-  assert(own == ["json"], Some("a file under `std/` became a `std` module: " ++ shown(answer)));
+  let own = items(at(hash_report, "modules")).map(|m: Json| str(at(m, "name"))).filter(
+    |n: String| !is_std(Bytes::of_string(n)),
+  );
   assert(
-    items(at(answer, "definitions")).filter(|d: Json| str(at(d, "name")) == "json.parse").len()
+    own == ["json"],
+    Some("a file under `std/` became a `std` module: " ++ json_text(hash_report)),
+  );
+  assert(
+    items(at(hash_report, "definitions")).filter(|d: Json| str(at(d, "name")) == "json.parse").len()
       == 1,
-    Some(shown(answer)),
+    Some(json_text(hash_report)),
   )
 }
 
@@ -106,13 +110,13 @@ test "a project module named net beside std.net is a loud collision" {
       text: "import net as mine\nimport std.net\npub fn f(c: Int) -> Bytes / {mine::net.read[conn]} = mine::drain(c, b\"\")\n",
     },
   ]);
-  assert(r.code == 0, Some("`as` disambiguates: " ++ said(r)));
+  assert(r.code == 0, Some("`as` disambiguates: " ++ all_output(r)));
   let f = first(
     items(at(json_of(r), "definitions")).filter(|d: Json| str(at(d, "name")) == "app.f"),
   );
   assert(
     items(at(f, "atoms")).map(str) == ["net.net.read[conn]"],
-    Some("the project's effect and the shipped one are not distinct: " ++ shown(f)),
+    Some("the project's effect and the shipped one are not distinct: " ++ json_text(f)),
   )
 }
 
@@ -170,14 +174,19 @@ fn imported(line: String) -> String / {abort.raise} = {
 test "no cycle can be built between a project and the shipped modules" {
   scratch(|| {
     let files = namesakes();
-    project(files);
+    write_project(files);
     assert_ok(on_disk_shipping_only(["test"], over_a_compiler()));
     // What each shipped definition references, as the load resolved it: none of the project's.
     let own = files.map(|f: Source| f.path.slice(0, f.path.len() - 4) ++ ".");
-    let answer = json_of(on_disk_shipping_only(["hash", "--json", "--deps"], over_a_compiler()));
-    let shipped = items(at(answer, "definitions")).filter(|d: Json|
+    let hash_report = json_of(
+      on_disk_shipping_only(["hash", "--json", "--deps"], over_a_compiler()),
+    );
+    let shipped = items(at(hash_report, "definitions")).filter(|d: Json|
       is_shipped(Bytes::of_string(str(at(d, "module")))));
-    assert(shipped.len() == 3, Some("the load reached each shipped definition: " ++ shown(answer)));
+    assert(
+      shipped.len() == 3,
+      Some("the load reached each shipped definition: " ++ json_text(hash_report)),
+    );
     shipped.fold((), |u: Unit, d: Json|
       items(at(d, "deps")).fold(u, |v: Unit, dep: Json|
         assert(
@@ -188,15 +197,17 @@ test "no cycle can be built between a project and the shipped modules" {
           ),
         )));
     assert(
-      items(at(answer, "definitions")).filter(|d: Json| str(at(d, "name")) == "items.parse").len()
+      items(at(hash_report, "definitions")).filter(|d: Json|
+          str(at(d, "name")) == "items.parse").len(
+        )
         == 1,
-      Some("the project's own `items` is not its own: " ++ shown(answer)),
+      Some("the project's own `items` is not its own: " ++ json_text(hash_report)),
     )
   })
 }
 
 // The compiler depends on the library, so the library importing the compiler is a cycle.
-test "{m.module} imports only library modules" for m: StdModule in std_modules() {
+test "{m.module} imports only library modules" for m: ShippedModule in std_modules() {
   String::of_bytes(m.src).split("\n").filter(|l: String| l.starts_with("import ")).fold(
     (),
     |u: Unit, l: String|
@@ -240,7 +251,7 @@ fn counted() -> Source =
 
 test "a project's load reads no test or law of a shipped module, nor what only they reach" {
   scratch(|| {
-    project([
+    write_project([
       {
         path: "m.ply",
         text: "import std.counted\n\n/// Two more.\npub fn two_more(x: Int) -> Int = counted::more(counted::more(x))\n",
@@ -285,21 +296,22 @@ fn keeping() -> List<Source> =
 
 test "an upgrade that moves no definition re-runs nothing" {
   scratch(|| {
-    project(keeping());
+    write_project(keeping());
     assert_ok(
       on_disk_shipping_only(["test"], shipping_one("1", "\n// what the last compiler shipped\n")),
     );
     let r = on_disk_shipping_only(["test"], shipping_one("1", ""));
     assert(
-      said(r).contains("selected 0 of 2 (2 cached)"),
-      Some("an upgrade that moved no definition re-ran a test:\n" ++ said(r)),
+      all_output(r).contains("selected 0 of 2 (2 cached)"),
+      Some("an upgrade that moved no definition re-ran a test:\n" ++ all_output(r)),
     )
   })
 }
 
 /// Each definition a `ply hash --json` answer lists, with its hash.
-fn hashes(answer: Json) -> List<String> =
-  items(at(answer, "definitions")).map(|d: Json| str(at(d, "name")) ++ " " ++ str(at(d, "hash")))
+fn hashes(hash_report: Json) -> List<String> =
+  items(at(hash_report, "definitions")).map(|d: Json|
+    str(at(d, "name")) ++ " " ++ str(at(d, "hash")))
 
 test "an upgrade that moved a definition re-runs the tests that reach it, and hashes as the new compiler does" {
   let older = shipping_one("2", "");
@@ -307,7 +319,7 @@ test "an upgrade that moved a definition re-runs the tests that reach it, and ha
   let cold = over_tree(tree(keeping()), ||
     json_of(on_disk_shipping_only(["hash", "--json"], newer))).value;
   scratch(|| {
-    project(keeping());
+    write_project(keeping());
     assert_ok(on_disk_shipping_only(["test"], older));
     assert_eq(selected(json_of(on_disk_shipping_only(["test", "--json"], newer))), ["two"]);
     // A store written under the older module is believed for none of what the upgrade moved.

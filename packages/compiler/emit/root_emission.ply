@@ -1,0 +1,290 @@
+//! A root's C function: its body lowered to the typed form, its counts placed, checked and printed.
+
+import compiler.syntax.parsing (dummy_span)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt)
+import compiler.check.types (Type, FunctionType, VariableType, Row, row_empty, bool_type,
+                             bytes_type, named_type, int_type, unit_type)
+import compiler.check.known (ordering_type)
+import compiler.emit.code (Code, CodeLiteral)
+import compiler.emit.typing (unknown_type)
+import compiler.emit.roots (symbol_of, entry_symbol)
+import compiler.emit.output (Tables, no_tables, EmittedRoot, Prototype, DefinitionSymbol, Exact,
+                             needs_specialisation)
+import compiler.emit.representations (Def, EmitParam, Ctors, substituted_fully, no_ctors)
+import compiler.emit.keys
+import compiler.emit.keys (RootKey, Named, Generated, Law, Clause, Order, Reflect, Show, Digest,
+                           NumericFunction, RootName, root_name, root_text, key_types,
+                           unspecialised, has_entry, ReleaseResource, ContainerWalk)
+import compiler.emit.pieces (pieces_text)
+import compiler.emit.typed_ir
+import compiler.emit.typed_ir (Fn, Lambda, Closure)
+import compiler.emit.evidence (declared_arity)
+import compiler.emit.typed_ir.statics (StaticDef, StaticStruct, RawWord, EntryWord,
+                                       named_by_content, entries_of)
+import compiler.emit.lower (root_lowered)
+import compiler.emit.lower.module_context (ModuleContext, Root, param_type)
+import compiler.emit.own (insert_reference_counts)
+import compiler.emit.release (release_needs)
+import compiler.emit.verify (ownership_fault)
+import compiler.emit.print (printed_fn)
+import compiler.emit.print.text (PrintOutput)
+import compiler.emit.print.value_printing (signature_types)
+
+/// Root `key` of the setting's module, whose text starts at `base`, whose parameters are `ps`, whose
+/// body lowers to `code`, as the typed form lowers it: each parameter of the type its scheme gives
+/// it, and its answer of the type its scheme answers.
+pub fn root_at(
+  s: ModuleContext,
+  key: RootKey,
+  base: Int,
+  ps: List<EmitParam>,
+  code: Code,
+) -> Root / {abort.raise} =
+  {
+    key: key,
+    base: base,
+    params: ps,
+    types: ps.map(param_type),
+    result_type: root_result_type(s.here, key),
+    code: code,
+    performs: row_empty(),
+  }
+
+/// What root `key` answers: what the scheme of the definition of `here` it runs answers, at the
+/// root's type arguments where it is a specialisation; what a root written for a type answers where
+/// no definition speaks for it; unknown for any other root.
+fn root_result_type(here: List<Def>, key: RootKey) -> Type / {abort.raise} = {
+  let own = unspecialised(key);
+  let args = key_types(key);
+  here.fold(generated_result_type(key), |acc: Type, d: Def|
+    if d.root != own { acc } else {
+      match d.scheme {
+        Some(sc) -> match sc.ty { FunctionType(f) -> substituted_fully(f.ret, args), _ -> acc },
+        None -> acc,
+      }
+    })
+}
+
+/// What a root no definition speaks for answers: a comparison's `Bool` or `Ordering`, a
+/// reflection's `Value`, a digest's `Bytes`, a type's stated arithmetic a value of the type, and a
+/// claim's `Bool`; unknown for any other root.
+fn generated_result_type(key: RootKey) -> Type =
+  match key {
+    Generated(w, _) -> match w.op {
+      keys::Equal -> bool_type(),
+      Order -> ordering_type(),
+      NumericFunction(_) -> w.ty,
+      Reflect -> named_type(b"std.value.Value"),
+      Show -> named_type(b"std.value.Value"),
+      Digest -> bytes_type(),
+      ReleaseResource -> unit_type(),
+      ContainerWalk(c) -> if c == b"let_go_items" { unit_type() } else { unknown_type() },
+      _ -> unknown_type(),
+    },
+    // A law's guard and body and a clause are propositions.
+    Law(_) -> bool_type(),
+    Clause(_) -> bool_type(),
+    _ -> unknown_type(),
+  }
+
+/// `run`, a step of making root `name`, its panic naming the root: each is a defect in Ply, since a
+/// checked program's every root lowers, passes the form's check and prints.
+pub fn naming<a>(name: Bytes, run: () -> a / {abort.raise}) -> a / {abort.raise} =
+  handle {
+    run()
+  } with {
+    abort.raise(m) ->
+      panic(String::of_bytes_lossy(Bytes::concat_all([b"Ply failed making `", name, b"`: "])) ++ m),
+  }
+
+/// Form `f` as an answer printed against the program's constructor table `ctors`: its counts placed
+/// and what its releases read noted among its needs, checked, and printed as an answer's text and
+/// tables; or, where its needs read a type variable's layout or type, settled by its callers.
+pub fn emitted_of(f: Fn, ctors: Ctors) -> EmittedRoot / {abort.raise} = {
+  let full = root_name(f.key);
+  naming(root_text(full), || {
+    let counted = built_form(f);
+    if needs_specialisation(counted.links.needs) { deferred_to_callers(full, counted) } else {
+      match ownership_fault(counted) {
+        Some(fault) ->
+          panic(String::of_bytes_lossy(b"its typed form fails its check: ".concat(fault))),
+        None -> {
+          let pr = printed_fn(counted, ctors);
+          { name: full, text: pieces_text(pr.pieces), tables: ir_tables(counted, pr, ctors.stated) }
+        },
+      }
+    }
+  })
+}
+
+/// Root `full`, formed as `f`, which its callers settle: no C, and the tables the unit settles its
+/// calls and its callers' by.
+fn deferred_to_callers(full: RootName, f: Fn) -> EmittedRoot =
+  {
+    name: full,
+    text: b"",
+    tables: {
+      ..no_tables(),
+      generics: {
+        calls: f.links.generics,
+        needs: f.links.needs,
+        expects: [],
+        called: f.links.called,
+        passes: f.links.passes,
+      },
+      members: f.members.map(|m: typed_ir::Member| m.key),
+    },
+  }
+
+/// `f` with its counts placed: a plain root's are placed as it is written.
+pub fn with_refcounts(f: Fn) -> Fn =
+  if f.kind == typed_ir::Plain { f } else { insert_reference_counts(f) }
+
+/// `f` as a build checks and prints it: its counts placed, and what its releases read noted among its
+/// needs, which say whether its callers settle it.
+pub fn built_form(f: Fn) -> Fn = release_needs(with_refcounts(f))
+
+/// What the root `f` printed as `pr` names of its unit, as an answer's tables hold it: a group's
+/// members by their case, the head and entry each root it holds is declared with (`stated` as
+/// `has_entry` reads it), and the statics it and its closures name.
+fn ir_tables(f: Fn, pr: PrintOutput, stated: Map<Bytes, Bool>) -> Tables / {abort.raise} = {
+  let held = if f.members.len() == 0 {
+    [{ key: f.key, arity: declared_arity(f.params), head: signature_types(f.convention) }]
+  } else {
+    f.members.map(|m: typed_ir::Member|
+      { key: m.key, arity: declared_arity(m.params), head: signature_types(m.convention) })
+  };
+  let statics = statics_named(f, []);
+  {
+    fields: pr.fields,
+    lambdas: pr.lambdas.map(pieces_text),
+    // A root whose function a static holds is the body's to ask for, as a call's is.
+    calls: statics.fold(pr.calls, |acc: List<RootKey>, d: StaticDef|
+      entries_of(d).fold(acc, |a: List<RootKey>, k: RootKey|
+        if a.contains(k) { a } else { a.push(k) })),
+    generics: {
+      calls: f.links.generics,
+      needs: f.links.needs,
+      expects: pr.expects,
+      called: f.links.called,
+      passes: f.links.passes,
+    },
+    performs: pr.performs,
+    handles: pr.handles,
+    members: f.members.map(|m: typed_ir::Member| m.key),
+    symbols: held.map(|h: { key: RootKey, arity: Int, head: Prototype }| {
+      let full = root_text(root_name(h.key));
+      {
+        symbol: symbol_of(full),
+        entry: if has_entry(h.key, h.arity, stated) { entry_symbol(full) } else { b"" },
+        head: h.head,
+      }
+    }),
+    statics: statics,
+    // The program's lending settles these, past every body's printing.
+    handings: [],
+    assumed: [],
+    group: [],
+    shared: pr.shared,
+  }
+}
+
+/// `held` and then each static `f` and its closures name that `held` does not, in the order they
+/// list them.
+fn statics_named(f: Fn, held: List<StaticDef>) -> List<StaticDef> =
+  f.lambdas.fold(
+    f.statics.fold(held, |acc: List<StaticDef>, d: StaticDef|
+      if acc.contains(d) { acc } else { acc.push(d) }),
+    |acc: List<StaticDef>, l: Lambda| match l { Closure(c) -> statics_named(c.body, acc) },
+  )
+
+/// Root `key` as the typed form lowers it from `code`, an entry's body performing `performs`.
+pub fn root_from_code(
+  s: ModuleContext,
+  base: Int,
+  key: RootKey,
+  ps: List<EmitParam>,
+  code: Code,
+  performs: Row = { atoms: [], tail: None },
+) -> Fn / {abort.raise} = root_lowered(s, { ..root_at(s, key, base, ps, code), performs: performs })
+
+fn bare_setting() -> ModuleContext =
+  {
+    module: b"m",
+    here: [],
+    imports: [],
+    ctors: no_ctors(),
+    builtins: [],
+    declared: Map::new(),
+    machine: Map::new(),
+    effects: [],
+    release: false,
+  }
+
+fn literal_code(l: SourceLiteral) -> Code =
+  { node: CodeLiteral(l), span: dummy_span(), ty: int_type() }
+
+test "a root is defined under its symbol, with the entry the runtime calls it through" {
+  let e = emitted_of(
+    root_from_code(bare_setting(), 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
+    no_ctors(),
+  );
+  let f = symbol_of(b"m.f");
+  assert_eq(e.tables.symbols.map(|d: DefinitionSymbol| d.symbol), [f]);
+  // The runtime's ABI: every root's entry takes its arguments as an array of words.
+  assert(
+    e.text.index_of(Bytes::concat_all([b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args)"]))
+      != None,
+  )
+}
+
+test "a root whose function a static holds is among the calls of the body naming the static" {
+  let dup = Named(b"m.dup#T");
+  let held = named_by_content(
+    StaticStruct({
+      of: b"PlyType",
+      fields: [
+        RawWord(1),
+        RawWord(0),
+        RawWord(0),
+        EntryWord(dup),
+        RawWord(0),
+        RawWord(0),
+        RawWord(0),
+      ],
+    }),
+  );
+  let f = root_from_code(bare_setting(), 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
+  let counted = { ..insert_reference_counts(f), statics: [held] };
+  let t = ir_tables(counted, printed_fn(counted, no_ctors()), Map::new());
+  assert(t.calls.contains(dup))
+}
+
+test "a form letting go of a value of its type variable is settled by its callers: no C, its needs in its tables" {
+  let p = { id: 0, ty: VariableType(0), representation: typed_ir::AsWord };
+  let f = {
+    key: Named(b"m.dropping"),
+    kind: typed_ir::Metered,
+    params: [p],
+    convention: {
+      params: [{ handed: typed_ir::OwnedParam, representation: typed_ir::AsWord }],
+      result: typed_ir::AsInt,
+      destination_passing: false,
+      answered: typed_ir::OwnedResult,
+    },
+    result_type: int_type(),
+    body: [typed_ir::Return(typed_ir::IntOperand(0))],
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: typed_ir::no_links(),
+    statics: [],
+  };
+  let settled = emitted_of(f, no_ctors());
+  assert_eq(settled.text, b"");
+  assert_eq(settled.tables.generics.needs, [{ var: 0, reads: Exact }]);
+  assert_eq(settled.tables.symbols, []);
+  // The same body letting go of a value of a known type is printed.
+  let known = emitted_of({ ..f, params: [{ ..p, ty: bytes_type() }] }, no_ctors());
+  assert(known.text.len() > 0 && known.tables.generics.needs == [], None)
+}

@@ -12,7 +12,7 @@
 //!
 //! A key is a `Secret`, and what reads one is the runtime: `hmac`, `hkdf` and `pbkdf2` are its, in
 //! constant time, over the hash a `Hash`'s `name` says, which is SHA-1, SHA-256, SHA-384 or
-//! SHA-512; any other is refused as `Unkeyed`. `hmac_plain` is HMAC written in Ply over any `Hash`,
+//! SHA-512; any other is refused as `UnkeyableHash`. `hmac_plain` is HMAC written in Ply over any `Hash`,
 //! for a key anyone may read: a salt, a published label, a standard's vector.
 
 import std.bytes (u32_be, u64_be, u64_le)
@@ -51,7 +51,7 @@ pub type Hash = new {
 pub type Hasher = new { hash: Hash, words: Array<Int>, seen: Int, pending: Bytes }
 
 /// Why a function here refused what it was asked for, with what was asked.
-pub type Refusal =
+pub type Error =
   /// An output length the function does not give.
   | OutputLength(Int)
   /// A key of a length the function does not take.
@@ -59,12 +59,12 @@ pub type Refusal =
   /// An iteration count below one, or past `2^32 - 1`.
   | Iterations(Int)
   /// A hash, by its name, that the runtime does not key under a `Secret`.
-  | Unkeyed(String)
+  | UnkeyableHash(String)
 
 /// What a function of this module raises where it refuses its parameters.
 pub effect hash {
   /// A length, a count or a hash is outside what the function defines.
-  raise refused(e: Refusal)
+  raise refused(e: Error)
 }
 
 /// The digest of `input` under `h`.
@@ -117,7 +117,7 @@ fn absorbed(
 
 /// The state of a Merkle–Damgård hash once its message has ended: `words` after `tail`, a one bit,
 /// zeros, and `length`, which is the message's length as the hash writes it, fill whole blocks.
-pub fn md_closed(
+pub fn merkle_damgard_finish(
   block: (Array<Int>, Int, Bytes, Int) -> Array<Int> / {abort.raise},
   block_size: Int,
   words: Array<Int>,
@@ -239,7 +239,7 @@ pub fn sha256_hash() -> Hash = {
     ]),
     block: block,
     finish: |h: Array<Int>, seen: Int, tail: Bytes| {
-      let closed = md_closed(block, 64, h, seen, tail, u64_be((seen + tail.len()) * 8));
+      let closed = merkle_damgard_finish(block, 64, h, seen, tail, u64_be((seen + tail.len()) * 8));
       Bytes::concat_all(closed.to_list().map(u32_be))
     },
   }
@@ -457,7 +457,7 @@ fn sha512_family(name: String, size: Int, start: List<Int>) -> Hash = {
     block: block,
     finish: |h: Array<Int>, seen: Int, tail: Bytes| {
       let length = zeros(8).concat(u64_be((seen + tail.len()) * 8));
-      let closed = md_closed(block, 128, h, seen, tail, length);
+      let closed = merkle_damgard_finish(block, 128, h, seen, tail, length);
       Bytes::concat_all(closed.to_list().map(u64_be)).slice(0, size)
     },
   }
@@ -632,7 +632,7 @@ fn keccak_constants() -> List<Int> =
 fn sponge(name: String, rate: Int, size: Int, suffix: Int) -> Hash = {
   let rc = Array::of_list(keccak_constants());
   let block = |s: Array<Int>, _: Int, data: Bytes, at: Int|
-    keccak_rounds(keccak_mixed(s, data, at, 0, rate / 8), rc, 0);
+    keccak_rounds(keccak_xor_block(s, data, at, 0, rate / 8), rc, 0);
   {
     name: name,
     block_size: rate,
@@ -651,7 +651,7 @@ fn sponge(name: String, rate: Int, size: Int, suffix: Int) -> Hash = {
 }
 
 /// The state with the block's first `lanes` lanes xored in, each least significant byte first.
-fn keccak_mixed(
+fn keccak_xor_block(
   s: Array<Int>,
   data: Bytes,
   at: Int,
@@ -661,7 +661,7 @@ fn keccak_mixed(
   if i >= lanes { s } else {
     let p = at + 8 * i;
     let lane = s.get(i) ^ (Int::of_u32(data.u32_le(p)) | Int::of_u32(data.u32_le(p + 4)) << 32);
-    keccak_mixed(s.set(i, lane), data, at, i + 1, lanes)
+    keccak_xor_block(s.set(i, lane), data, at, i + 1, lanes)
   }
 
 /// `rate` bytes of output a block, the state permuted between one and the next.
@@ -842,7 +842,7 @@ fn blake2b_schedule() -> Array<Int> =
   )
 
 /// BLAKE2b as RFC 7693 defines it, with a digest of sixty-four bytes and no key.
-pub fn blake2b_hash() -> Hash / {abort.raise} = blake2b_over(b"", 64)
+pub fn blake2b_hash() -> Hash / {abort.raise} = blake2b_unchecked(b"", 64)
 
 /// BLAKE2b with a digest of `size` bytes, keyed by `key` where that is not empty, which makes it a
 /// MAC with no HMAC around it. A size outside one to sixty-four is refused as an `OutputLength`,
@@ -850,11 +850,11 @@ pub fn blake2b_hash() -> Hash / {abort.raise} = blake2b_over(b"", 64)
 pub fn blake2b_with(key: Bytes, size: Int) -> Hash / {hash.refused, abort.raise} =
   if size < 1 || size > 64 { hash.refused(OutputLength(size)) }
   else if key.len() > 64 { hash.refused(KeyLength(key.len())) }
-  else { blake2b_over(key, size) }
+  else { blake2b_unchecked(key, size) }
 
 /// A key is a block of its own before the message, so the state's count runs a block ahead of what
 /// the message has had taken, and the key's block is taken when the first of the message is.
-fn blake2b_over(key: Bytes, size: Int) -> Hash / {abort.raise} = {
+fn blake2b_unchecked(key: Bytes, size: Int) -> Hash / {abort.raise} = {
   let iv = Array::of_list(sha512_initial());
   let sigma = blake2b_schedule();
   let keyed = key.len() > 0;
@@ -900,7 +900,7 @@ fn blake2b_compress(
   count: Int,
   last: Bool,
 ) -> Array<Int> / {abort.raise} = {
-  let v = blake2b_mixed(
+  let v = blake2b_rounds(
     Array::of_list(
       range(0, 16).map(|i: Int|
         if i < 8 { h.get(i) }
@@ -918,7 +918,7 @@ fn blake2b_compress(
 
 /// The ninety-six steps from `i` on, eight a round: four down the columns of `v`, then four along
 /// its diagonals.
-fn blake2b_mixed(
+fn blake2b_rounds(
   v: Array<Int>,
   sigma: Array<Int>,
   data: Bytes,
@@ -928,7 +928,7 @@ fn blake2b_mixed(
   if i >= 96 { v } else {
     let a = i & 3;
     let turn = i >>> 2 & 1;
-    blake2b_mixed(
+    blake2b_rounds(
       blake2b_g(
         v,
         a,
@@ -1002,11 +1002,11 @@ fn keyed(h: Hash, key: Bytes) -> Keyed / {abort.raise} = {
 
 /// The digest of `pad` and then `data`. `after` took the pad's blocks as if more followed, which
 /// holds only where `data` is not empty.
-fn continued(after: Hasher, pad: Bytes, data: Bytes) -> Bytes / {abort.raise} =
+fn digest_after_pad(after: Hasher, pad: Bytes, data: Bytes) -> Bytes / {abort.raise} =
   if data.len() == 0 { digest_of(after.hash, pad) } else { finish(update(after, data)) }
 
 fn tagged(k: Keyed, message: Bytes) -> Bytes / {abort.raise} =
-  continued(k.outer, k.outer_pad, continued(k.inner, k.inner_pad, message))
+  digest_after_pad(k.outer, k.outer_pad, digest_after_pad(k.inner, k.inner_pad, message))
 
 /// HMAC over `h` under a key anyone may read, as RFC 2104 defines it: a tag of `h.digest_size`
 /// bytes, over any `Hash`. Its steps follow the key, so it is for one that is public by nature, a
@@ -1019,7 +1019,7 @@ pub fn hmac_plain(h: Hash, key: Bytes, message: Bytes) -> Bytes / {abort.raise} 
 pub fn hmac(h: Hash, key: Secret<Bytes>, message: Bytes) -> Bytes / {hash.refused} =
   match Secret::hmac(h.name, key, message) {
     Some(tag) -> tag,
-    None -> hash.refused(Unkeyed(h.name)),
+    None -> hash.refused(UnkeyableHash(h.name)),
   }
 
 /// Whether `tag` is the HMAC of `message` under `key`, compared as `tags_match` compares.
@@ -1059,7 +1059,7 @@ pub fn hmac_sha512(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} 
 pub fn hkdf_extract(h: Hash, salt: Bytes, key: Secret<Bytes>) -> Secret<Bytes> / {hash.refused} =
   match Secret::hkdf_extract(h.name, salt, key) {
     Some(prk) -> prk,
-    None -> hash.refused(Unkeyed(h.name)),
+    None -> hash.refused(UnkeyableHash(h.name)),
   }
 
 /// HKDF's second step: `length` bytes out of the pseudorandom key `prk`, bound to `info`. A length
@@ -1076,7 +1076,7 @@ pub fn hkdf_expand(
   else if prk.len() < h.digest_size { hash.refused(KeyLength(prk.len())) } else {
     match Secret::hkdf_expand(h.name, prk, info, length) {
       Some(key) -> key,
-      None -> hash.refused(Unkeyed(h.name)),
+      None -> hash.refused(UnkeyableHash(h.name)),
     }
   }
 
@@ -1091,11 +1091,11 @@ pub fn hkdf(
 ) -> Secret<Bytes> / {hash.refused} = hkdf_expand(h, hkdf_extract(h, salt, key), info, length)
 
 /// The most bytes `pbkdf2` derives: a megabyte.
-pub fn pbkdf2_longest() -> Int = 1 << 20
+pub fn pbkdf2_max_length() -> Int = 1 << 20
 
 /// PBKDF2 over HMAC over `h`, as RFC 8018 defines it: `length` bytes out of a password, stretched
 /// by `iterations` rounds. An iteration count below one or past `2^32 - 1` is refused as
-/// `Iterations`, and a length below one or past `pbkdf2_longest()` as an `OutputLength`.
+/// `Iterations`, and a length below one or past `pbkdf2_max_length()` as an `OutputLength`.
 pub fn pbkdf2(
   h: Hash,
   password: Secret<Bytes>,
@@ -1104,10 +1104,10 @@ pub fn pbkdf2(
   length: Int,
 ) -> Secret<Bytes> / {hash.refused} =
   if iterations < 1 || iterations > 0xFFFF_FFFF { hash.refused(Iterations(iterations)) }
-  else if length < 1 || length > pbkdf2_longest() { hash.refused(OutputLength(length)) } else {
+  else if length < 1 || length > pbkdf2_max_length() { hash.refused(OutputLength(length)) } else {
     match Secret::pbkdf2(h.name, password, salt, iterations, length) {
       Some(key) -> key,
-      None -> hash.refused(Unkeyed(h.name)),
+      None -> hash.refused(UnkeyableHash(h.name)),
     }
   }
 
@@ -1969,8 +1969,7 @@ test "zero bytes come in any number" {
   assert_eq(zeros(0 - 1), b"")
 }
 
-fn refusal<a>(r: Result<a, Refusal>) -> Option<Refusal> =
-  match r { Ok(_) -> None, Err(e) -> Some(e) }
+fn refusal<a>(r: Result<a, Error>) -> Option<Error> = match r { Ok(_) -> None, Err(e) -> Some(e) }
 
 test "a length, a key or a count outside what a function defines is refused, with what was asked" {
   let h = sha256_hash();
@@ -1991,18 +1990,24 @@ test "a length, a key or a count outside what a function defines is refused, wit
   );
   assert_eq(try { pbkdf2(h, Secret::of_bytes(b"password"), b"salt", 1, 0) }, Err(OutputLength(0)));
   assert_eq(
-    try { pbkdf2(h, Secret::of_bytes(b"password"), b"salt", 1, pbkdf2_longest() + 1) },
-    Err(OutputLength(pbkdf2_longest() + 1)),
+    try { pbkdf2(h, Secret::of_bytes(b"password"), b"salt", 1, pbkdf2_max_length() + 1) },
+    Err(OutputLength(pbkdf2_max_length() + 1)),
   );
-  assert_eq(try { hmac(sha3_256_hash(), Secret::of_bytes(b"key"), b"") }, Err(Unkeyed("SHA3-256")));
+  assert_eq(
+    try { hmac(sha3_256_hash(), Secret::of_bytes(b"key"), b"") },
+    Err(UnkeyableHash("SHA3-256")),
+  );
   assert_eq(
     try { hkdf_extract(blake2b_hash(), b"", Secret::of_bytes(b"key")) },
-    Err(Unkeyed("BLAKE2b")),
+    Err(UnkeyableHash("BLAKE2b")),
   );
-  assert_eq(try { hkdf_expand(sha512_256_hash(), prk, b"", 16) }, Err(Unkeyed("SHA-512/256")));
+  assert_eq(
+    try { hkdf_expand(sha512_256_hash(), prk, b"", 16) },
+    Err(UnkeyableHash("SHA-512/256")),
+  );
   assert_eq(
     try { pbkdf2(sha3_512_hash(), Secret::of_bytes(b"password"), b"salt", 1, 16) },
-    Err(Unkeyed("SHA3-512")),
+    Err(UnkeyableHash("SHA3-512")),
   );
   assert_eq(try { shake128(b"", 0 - 1) }, Err(OutputLength(0 - 1)));
   assert_eq(try { shake256(b"", 0 - 1) }, Err(OutputLength(0 - 1)));

@@ -41,10 +41,10 @@ pub type Algorithm = | Sha1 | Sha256 | Sha512
 /// How a code is cut from an HMAC: under which hash, and to how many decimal digits, six to ten.
 /// RFC 4226 names six, seven and eight. The cut leaves thirty-one bits, which is short of ten
 /// whole digits: a ten-digit code starts with 0, 1 or 2 and is worth those thirty-one bits.
-pub type Form = new { algorithm: Algorithm, digits: Int }
+pub type CodeFormat = new { algorithm: Algorithm, digits: Int }
 
 /// How TOTP makes its codes: their form, how long a step lasts, and the instant steps count from.
-pub type Config = new { form: Form, step: Duration, epoch: Instant }
+pub type Config = new { form: CodeFormat, step: Duration, epoch: Instant }
 
 /// How far from the present step a verifier looks: whole steps before it and after it, a count
 /// below zero being none. One step either way allows for a slow clock and a slow typist; each
@@ -54,9 +54,9 @@ pub type Window = new { before: Int, after: Int }
 /// Whether an account's codes follow the clock or a count.
 pub type Kind =
   /// Time-based, with how long a step lasts: whole seconds, at least one.
-  | Timed(Duration)
+  | TimeBased(Duration)
   /// Counter-based, with the counter its next code is made at.
-  | Counted(Int)
+  | CounterBased(Int)
 
 /// What a provisioning URI hands an authenticator: whose key it is, the key, and how its codes
 /// are made.
@@ -67,11 +67,11 @@ pub type Provision = new {
   /// The account's name. It holds no colon and does not start with a space.
   account: String,
   key: Bytes,
-  form: Form,
+  form: CodeFormat,
 }
 
 /// Why a text is no provisioning URI.
-pub type Why =
+pub type ErrorKind =
   /// It does not start `otpauth://`.
   | NotOtpauth
   /// Its type is this, which is neither `totp` nor `hotp`.
@@ -81,7 +81,7 @@ pub type Why =
   /// Its query is not percent-encoded `name=value` pairs.
   | BadQuery
   /// It gives this parameter more than once.
-  | Twice(String)
+  | DuplicateParameter(String)
   /// It has no `secret`, or an empty one.
   | NoSecret
   /// Its `secret` is not base32.
@@ -94,7 +94,7 @@ pub type Why =
   | NoCounter
 
 /// Why a function here refused what it was asked for, with what was asked.
-pub type Refusal =
+pub type Error =
   /// A count of digits outside six to ten.
   | Digits(Int)
   /// A counter below zero.
@@ -102,19 +102,19 @@ pub type Refusal =
   /// A step that is not above zero, or one a URI cannot carry because it is not whole seconds.
   | Step(Duration)
   /// A reading before the epoch, or further past it than an `Int` of nanoseconds.
-  | Reading(Instant)
+  | TimeOutOfRange(Instant)
   /// A key to provision of this many bytes, which is under sixteen.
   | ShortKey(Int)
   /// An issuer or an account a label cannot carry: one holding a colon, or an account that starts
   /// with a space.
   | Label(String)
   /// A text that is no provisioning URI.
-  | Malformed(Why)
+  | Malformed(ErrorKind)
 
 /// What a function of this module raises where it refuses.
 pub effect totp {
   /// A parameter is outside what the function defines, or a text is no URI.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
 }
 
 /// SHA-1 codes of six digits, a step of thirty seconds, counted from the Unix epoch.
@@ -128,8 +128,8 @@ pub fn new_key() -> Bytes / {entropy.next, abort.raise} = token_bytes(20)
 /// The key a sealed `secret` names, read as a person typed it: base32 in either case, with or
 /// without its spaces, hyphens and padding. Raises `Malformed(BadSecret)` for any other text and
 /// `Malformed(NoSecret)` for an empty one, and says nothing more of either.
-pub fn sealed_key(secret: Secret<String>) -> Secret<Bytes> / {totp.refused, abort.raise} = {
-  let key = needed(base32::decode_typed_secret(secret), BadSecret);
+pub fn sealed_key(secret: Secret<String>) -> Secret<Bytes> / {totp.fail, abort.raise} = {
+  let key = required(base32::decode_typed_secret(secret), BadSecret);
   if key.is_empty() { malformed(NoSecret) } else { key }
 }
 
@@ -137,9 +137,13 @@ pub fn sealed_key(secret: Secret<String>) -> Secret<Bytes> / {totp.refused, abor
 
 /// The HOTP code of `counter` under `key`: `form.digits` decimal digits, zeros leading. Raises
 /// for a count of digits outside six to ten and for a counter below zero.
-pub fn hotp(form: Form, key: Secret<Bytes>, counter: Int) -> String / {totp.refused, abort.raise} =
-  if form.digits < 6 || form.digits > 10 { totp.refused(Digits(form.digits)) }
-  else if counter < 0 { totp.refused(Counter(counter)) } else {
+pub fn hotp(
+  form: CodeFormat,
+  key: Secret<Bytes>,
+  counter: Int,
+) -> String / {totp.fail, abort.raise} =
+  if form.digits < 6 || form.digits > 10 { totp.fail(Digits(form.digits)) }
+  else if counter < 0 { totp.fail(Counter(counter)) } else {
     let mac = match form.algorithm {
       Sha1 -> hmac_sha1(key, u64_be(counter)),
       Sha256 -> hmac_sha256(key, u64_be(counter)),
@@ -153,19 +157,19 @@ pub fn hotp(form: Form, key: Secret<Bytes>, counter: Int) -> String / {totp.refu
 
 /// The step `now` falls in: whole steps of `c.step` since `c.epoch`. Raises for a step that is
 /// not above zero and for a reading before the epoch.
-pub fn step_at(c: Config, now: Instant) -> Int / {totp.refused} = {
+pub fn step_at(c: Config, now: Instant) -> Int / {totp.fail} = {
   let step = as_nanos(c.step);
-  if step < 1 { totp.refused(Step(c.step)) } else {
+  if step < 1 { totp.fail(Step(c.step)) } else {
     match checked_sub(nanos_at(now), nanos_at(c.epoch)) {
-      Some(since) -> if since < 0 { totp.refused(Reading(now)) } else { since / step },
-      None -> totp.refused(Reading(now)),
+      Some(since) -> if since < 0 { totp.fail(TimeOutOfRange(now)) } else { since / step },
+      None -> totp.fail(TimeOutOfRange(now)),
     }
   }
 }
 
 /// The TOTP code at `now`: the HOTP code of the step `now` falls in. Raises as `hotp` and
 /// `step_at` do.
-pub fn code(c: Config, key: Secret<Bytes>, now: Instant) -> String / {totp.refused, abort.raise} =
+pub fn code(c: Config, key: Secret<Bytes>, now: Instant) -> String / {totp.fail, abort.raise} =
   hotp(c.form, key, step_at(c, now))
 
 // --- Verifying --------------------------------------------------------------
@@ -183,7 +187,7 @@ pub fn verify(
   typed: String,
   now: Instant,
   window: Window,
-) -> Option<Int> / {totp.refused, abort.raise} = verify_after(c, key, typed, now, window, None)
+) -> Option<Int> / {totp.fail, abort.raise} = verify_after(c, key, typed, now, window, None)
 
 /// `verify`, answering no step at or before `last`, the step last accepted for this key: a code
 /// used once, and any older one, is `None`. Store what this answers as the next `last`.
@@ -194,20 +198,20 @@ pub fn verify_after(
   now: Instant,
   window: Window,
   last: Option<Int>,
-) -> Option<Int> / {totp.refused, abort.raise} =
-  matched(c.form, key, typed, around(step_at(c, now), window), last)
+) -> Option<Int> / {totp.fail, abort.raise} =
+  latest_match(c.form, key, typed, around(step_at(c, now), window), last)
 
 /// The counter whose HOTP code `typed` is, among `counter` and the `ahead` after it, or `None`.
 /// The later of two that share the code is answered, and every one is computed and compared, as
 /// in `verify`. A server keeps one past the answer as its next counter. Raises as `hotp` does.
 pub fn hotp_verify(
-  form: Form,
+  form: CodeFormat,
   key: Secret<Bytes>,
   typed: String,
   counter: Int,
   ahead: Int,
-) -> Option<Int> / {totp.refused, abort.raise} =
-  matched(form, key, typed, around(counter, { before: 0, after: ahead }), None)
+) -> Option<Int> / {totp.fail, abort.raise} =
+  latest_match(form, key, typed, around(counter, { before: 0, after: ahead }), None)
 
 /// The steps of a window around `at`, earliest first, without those below zero or past an `Int`.
 fn around(at: Int, window: Window) -> List<Int> =
@@ -218,22 +222,22 @@ fn around(at: Int, window: Window) -> List<Int> =
     })
 
 /// The last of `counters` past `last` whose code is `typed`.
-fn matched(
-  form: Form,
+fn latest_match(
+  form: CodeFormat,
   key: Secret<Bytes>,
   typed: String,
   counters: List<Int>,
   last: Option<Int>,
-) -> Option<Int> / {totp.refused, abort.raise} = {
+) -> Option<Int> / {totp.fail, abort.raise} = {
   let wanted = Bytes::of_string(typed);
   counters.fold(None, |found: Option<Int>, counter: Int| {
     let same = tags_match(Bytes::of_string(hotp(form, key, counter)), wanted);
-    let fresh = past(counter, last);
+    let fresh = is_after_last(counter, last);
     if same && fresh { Some(counter) } else { found }
   })
 }
 
-fn past(counter: Int, last: Option<Int>) -> Bool =
+fn is_after_last(counter: Int, last: Option<Int>) -> Bool =
   match last { Some(accepted) -> counter > accepted, None -> true }
 
 // --- Provisioning URIs ------------------------------------------------------
@@ -243,11 +247,11 @@ fn past(counter: Int, last: Option<Int>) -> Bool =
 /// and `period` or `counter`, each written out. Raises for a key under sixteen bytes, a count of
 /// digits outside six to ten, a step that is not whole seconds or is under one, a counter below
 /// zero, and an issuer or account the label cannot carry.
-pub fn uri(p: Provision) -> String / {totp.refused, abort.raise} =
-  if p.key.len() < 16 { totp.refused(ShortKey(p.key.len())) }
-  else if p.form.digits < 6 || p.form.digits > 10 { totp.refused(Digits(p.form.digits)) }
-  else if p.issuer.contains(":") { totp.refused(Label(p.issuer)) }
-  else if p.account.contains(":") || p.account.starts_with(" ") { totp.refused(Label(p.account)) }
+pub fn uri(p: Provision) -> String / {totp.fail, abort.raise} =
+  if p.key.len() < 16 { totp.fail(ShortKey(p.key.len())) }
+  else if p.form.digits < 6 || p.form.digits > 10 { totp.fail(Digits(p.form.digits)) }
+  else if p.issuer.contains(":") { totp.fail(Label(p.issuer)) }
+  else if p.account.contains(":") || p.account.starts_with(" ") { totp.fail(Label(p.account)) }
   else {
     "otpauth://" ++ kind_name(p.kind) ++ "/" ++ label_of(p.issuer, p.account) ++ "?secret="
       ++ base32::encode_unpadded(p.key)
@@ -259,12 +263,12 @@ pub fn uri(p: Provision) -> String / {totp.refused, abort.raise} =
       ++ kind_parameter(p.kind)
   }
 
-/// What `text` provisions, raising `totp.refused` where `try_parse_uri` answers `Err`.
+/// What `text` provisions, raising `totp.fail` where `try_parse_uri` answers `Err`.
 ///
 /// `algorithm`, `digits` and `period` may be left out, and are then SHA-1, six and thirty
 /// seconds. A `secret` is read as typed: in either case, with or without its padding. A parameter
 /// this format does not name is passed over, and one it does name may appear once.
-pub fn parse_uri(text: String) -> Provision / {totp.refused, abort.raise} = {
+pub fn parse_uri(text: String) -> Provision / {totp.fail, abort.raise} = {
   let scheme = "otpauth://";
   if !text.starts_with(scheme) { malformed(NotOtpauth) } else {
     let rest = text.slice(scheme.len(), text.len());
@@ -273,15 +277,15 @@ pub fn parse_uri(text: String) -> Provision / {totp.refused, abort.raise} = {
     let mark = if tail.contains("?") { tail.find("?") } else { tail.len() };
     let query = tail.slice(min(mark + 1, tail.len()), tail.len());
     let timed = is_timed(rest.slice(0, slash));
-    let named = names_of(needed(url_decode(tail.slice(0, mark)), BadLabel));
-    let pairs = needed(query_parse(query), BadQuery);
+    let named = label_parts(required(url_decode(tail.slice(0, mark)), BadLabel));
+    let pairs = required(query_parse(query), BadQuery);
     let key = key_of(parameter(pairs, "secret"));
     let issuer = issuer_of(named.issuer, parameter(pairs, "issuer"));
     let algorithm = algorithm_of(parameter(pairs, "algorithm"));
     let digits = digits_of(pairs);
     {
-      kind: if timed { Timed(period_of(pairs)) }
-      else { Counted(needed(number(pairs, "counter", 0), NoCounter)) },
+      kind: if timed { TimeBased(period_of(pairs)) }
+      else { CounterBased(required(number(pairs, "counter", 0), NoCounter)) },
       issuer: issuer,
       account: named.account,
       key: key,
@@ -291,30 +295,30 @@ pub fn parse_uri(text: String) -> Provision / {totp.refused, abort.raise} = {
 }
 
 /// What `text` provisions, or why it is no provisioning URI.
-pub fn try_parse_uri(text: String) -> Result<Provision, Refusal> / {abort.raise} =
+pub fn try_parse_uri(text: String) -> Result<Provision, Error> / {abort.raise} =
   try { parse_uri(text) }
 
 /// How a provisioned account's codes are made, for one that follows the clock from the Unix
 /// epoch; `None` for a counter-based one.
 pub fn config_of(p: Provision) -> Option<Config> =
   match p.kind {
-    Timed(step) -> Some({ form: p.form, step: step, epoch: Instant(0) }),
-    Counted(_) -> None,
+    TimeBased(step) -> Some({ form: p.form, step: step, epoch: Instant(0) }),
+    CounterBased(_) -> None,
   }
 
-fn malformed<a>(why: Why) -> a / {totp.refused} = totp.refused(Malformed(why))
+fn malformed<a>(why: ErrorKind) -> a / {totp.fail} = totp.fail(Malformed(why))
 
-fn needed<a>(found: Option<a>, why: Why) -> a / {totp.refused} =
+fn required<a>(found: Option<a>, why: ErrorKind) -> a / {totp.fail} =
   match found { Some(x) -> x, None -> malformed(why) }
 
-fn kind_name(k: Kind) -> String = match k { Timed(_) -> "totp", Counted(_) -> "hotp" }
+fn kind_name(k: Kind) -> String = match k { TimeBased(_) -> "totp", CounterBased(_) -> "hotp" }
 
-fn kind_parameter(k: Kind) -> String / {totp.refused} =
+fn kind_parameter(k: Kind) -> String / {totp.fail} =
   match k {
-    Timed(step) -> if as_nanos(step) < 1 || as_nanos(step) % 1000000000 != 0 {
-      totp.refused(Step(step))
+    TimeBased(step) -> if as_nanos(step) < 1 || as_nanos(step) % 1000000000 != 0 {
+      totp.fail(Step(step))
     } else { "&period=" ++ Int::to_string(as_nanos(step) / 1000000000) },
-    Counted(counter) -> if counter < 0 { totp.refused(Counter(counter)) }
+    CounterBased(counter) -> if counter < 0 { totp.fail(Counter(counter)) }
     else { "&counter=" ++ counter.to_string() },
   }
 
@@ -326,31 +330,31 @@ fn label_of(issuer: String, account: String) -> String / {abort.raise} =
 
 /// A decoded label's two names: the issuer before its colon, if it has one, and the account
 /// after it without the spaces that may follow the colon.
-fn names_of(
+fn label_parts(
   label: String,
-) -> { issuer: Option<String>, account: String } / {totp.refused, abort.raise} =
+) -> { issuer: Option<String>, account: String } / {totp.fail, abort.raise} =
   match label.split(":") {
     [account] -> { issuer: None, account: account },
     [issuer, account] ->
-      { issuer: Some(issuer), account: account.slice(spaces_from(account, 0), account.len()) },
+      { issuer: Some(issuer), account: account.slice(skip_spaces(account, 0), account.len()) },
     _ -> malformed(BadLabel),
   }
 
 /// Where the spaces that start at `at` end.
-fn spaces_from(text: String, at: Int) -> Int / {abort.raise} =
+fn skip_spaces(text: String, at: Int) -> Int / {abort.raise} =
   if at >= text.len() { at }
-  else if text.slice(at, at + 1) == " " { spaces_from(text, at + 1) }
+  else if text.slice(at, at + 1) == " " { skip_spaces(text, at + 1) }
   else { at }
 
 /// The one value `pairs` gives `name`, or `None` where they give none.
-fn parameter(pairs: List<Pair>, name: String) -> Option<String> / {totp.refused} =
+fn parameter(pairs: List<Pair>, name: String) -> Option<String> / {totp.fail} =
   match pairs.filter(|p: Pair| p.name == name) {
     [] -> None,
     [only] -> Some(only.value),
-    _ -> malformed(Twice(name)),
+    _ -> malformed(DuplicateParameter(name)),
   }
 
-fn issuer_of(labelled: Option<String>, given: Option<String>) -> String / {totp.refused} =
+fn issuer_of(labelled: Option<String>, given: Option<String>) -> String / {totp.fail} =
   match labelled {
     None -> match given { Some(issuer) -> issuer, None -> "" },
     Some(issuer) -> match given {
@@ -359,12 +363,15 @@ fn issuer_of(labelled: Option<String>, given: Option<String>) -> String / {totp.
     },
   }
 
-fn key_of(secret: Option<String>) -> Bytes / {totp.refused, abort.raise} = {
-  let key = needed(base32::decode_unpadded(base32::normalize(needed(secret, NoSecret))), BadSecret);
+fn key_of(secret: Option<String>) -> Bytes / {totp.fail, abort.raise} = {
+  let key = required(
+    base32::decode_unpadded(base32::normalize(required(secret, NoSecret))),
+    BadSecret,
+  );
   if key.len() == 0 { malformed(NoSecret) } else { key }
 }
 
-fn algorithm_of(given: Option<String>) -> Algorithm / {totp.refused} =
+fn algorithm_of(given: Option<String>) -> Algorithm / {totp.fail} =
   match given {
     None -> Sha1,
     Some(name) -> {
@@ -377,11 +384,7 @@ fn algorithm_of(given: Option<String>) -> Algorithm / {totp.refused} =
   }
 
 /// The whole number `pairs` give `name`, from `least` up; `None` where they give none.
-fn number(
-  pairs: List<Pair>,
-  name: String,
-  least: Int,
-) -> Option<Int> / {totp.refused, abort.raise} =
+fn number(pairs: List<Pair>, name: String, least: Int) -> Option<Int> / {totp.fail, abort.raise} =
   match parameter(pairs, name) {
     None -> None,
     Some(text) -> match text.int_of_string() {
@@ -390,17 +393,17 @@ fn number(
     },
   }
 
-fn digits_of(pairs: List<Pair>) -> Int / {totp.refused, abort.raise} =
+fn digits_of(pairs: List<Pair>) -> Int / {totp.fail, abort.raise} =
   match number(pairs, "digits", 6) {
     None -> 6,
     Some(n) -> if n > 10 { malformed(BadValue("digits")) } else { n },
   }
 
 /// Whether a URI's type is `totp`, where `hotp` is the other.
-fn is_timed(name: String) -> Bool / {totp.refused} =
+fn is_timed(name: String) -> Bool / {totp.fail} =
   if name == "totp" { true } else if name == "hotp" { false } else { malformed(UnknownKind(name)) }
 
-fn period_of(pairs: List<Pair>) -> Duration / {totp.refused, abort.raise} =
+fn period_of(pairs: List<Pair>) -> Duration / {totp.fail, abort.raise} =
   match number(pairs, "period", 1) {
     None -> seconds(30),
     Some(n) -> match checked_mul(n, 1000000000) {
@@ -506,9 +509,9 @@ test "a form, a counter, a step or a reading outside what is defined is refused 
   assert_eq(negative, Err(Counter(0 - 1)));
   let still: Config = { ..standard(), step: seconds(0) };
   assert_eq(try { step_at(still, at_second(5)) }, Err(Step(seconds(0))));
-  assert_eq(try { step_at(standard(), at_second(0 - 1)) }, Err(Reading(at_second(0 - 1))));
+  assert_eq(try { step_at(standard(), at_second(0 - 1)) }, Err(TimeOutOfRange(at_second(0 - 1))));
   let far: Config = { ..standard(), epoch: Instant(0 - max_int()) };
-  assert_eq(try { step_at(far, Instant(max_int())) }, Err(Reading(Instant(max_int()))))
+  assert_eq(try { step_at(far, Instant(max_int())) }, Err(TimeOutOfRange(Instant(max_int()))))
 }
 
 test "a code verifies in its window and nowhere else" {
@@ -554,7 +557,7 @@ test "a code accepted once is refused the second time, and so is an older one" {
 }
 
 test "a counter-based code verifies within the look-ahead, and the counter it was made at is answered" {
-  let form: Form = { algorithm: Sha1, digits: 6 };
+  let form: CodeFormat = { algorithm: Sha1, digits: 6 };
   assert_eq(hotp_verify(form, Secret::of_bytes(rfc_key()), "969429", 0, 5), Some(3));
   assert_eq(hotp_verify(form, Secret::of_bytes(rfc_key()), "969429", 3, 0), Some(3));
   assert_eq(hotp_verify(form, Secret::of_bytes(rfc_key()), "969429", 0, 2), None);
@@ -595,7 +598,7 @@ test "the key URI format's examples are read as it reads them" {
   assert_eq(
     try_parse_uri("otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example"),
     Ok({
-      kind: Timed(seconds(30)),
+      kind: TimeBased(seconds(30)),
       issuer: "Example",
       account: "alice@google.com",
       key: hello(),
@@ -607,7 +610,7 @@ test "the key URI format's examples are read as it reads them" {
       "otpauth://totp/ACME%20Co:john.doe@email.com?secret=HXDMVJECJJWSRB3HWIZR4IFUGFTMXBOZ&issuer=ACME%20Co&algorithm=SHA1&digits=6&period=30",
     ),
     Ok({
-      kind: Timed(seconds(30)),
+      kind: TimeBased(seconds(30)),
       issuer: "ACME Co",
       account: "john.doe@email.com",
       key: b"\x3D\xC6\xCA\xA4\x82\x4A\x6D\x28\x87\x67\xB2\x33\x1E\x20\xB4\x31\x66\xCB\x85\xD9",
@@ -623,7 +626,7 @@ test "a URI is read as an app reads one: its defaults, its separators and a type
   assert_eq(
     read,
     Ok({
-      kind: Counted(7),
+      kind: CounterBased(7),
       issuer: "Big Co",
       account: "bob",
       key: hello(),
@@ -633,7 +636,7 @@ test "a URI is read as an app reads one: its defaults, its separators and a type
   assert_eq(
     try_parse_uri("otpauth://totp/bob?secret=JBSWY3DPEHPK3PXP&issuer=Big%20Co&period=60"),
     Ok({
-      kind: Timed(seconds(60)),
+      kind: TimeBased(seconds(60)),
       issuer: "Big Co",
       account: "bob",
       key: hello(),
@@ -642,50 +645,56 @@ test "a URI is read as an app reads one: its defaults, its separators and a type
   )
 }
 
-type Refused = { text: String, why: Why }
+type ErrorCase = { text: String, reason: ErrorKind }
 
-fn not_uris() -> List<Refused> =
+fn error_cases() -> List<ErrorCase> =
   [
-    { text: "", why: NotOtpauth },
-    { text: "https://totp/a?secret=JBSWY3DPEHPK3PXP", why: NotOtpauth },
-    { text: "otpauth://", why: UnknownKind("") },
-    { text: "otpauth://steam/a?secret=JBSWY3DPEHPK3PXP", why: UnknownKind("steam") },
-    { text: "otpauth://TOTP/a?secret=JBSWY3DPEHPK3PXP", why: UnknownKind("TOTP") },
-    { text: "otpauth://totp/a%ZZ?secret=JBSWY3DPEHPK3PXP", why: BadLabel },
-    { text: "otpauth://totp/a:b:c?secret=JBSWY3DPEHPK3PXP", why: BadLabel },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&issuer=%G1", why: BadQuery },
+    { text: "", reason: NotOtpauth },
+    { text: "https://totp/a?secret=JBSWY3DPEHPK3PXP", reason: NotOtpauth },
+    { text: "otpauth://", reason: UnknownKind("") },
+    { text: "otpauth://steam/a?secret=JBSWY3DPEHPK3PXP", reason: UnknownKind("steam") },
+    { text: "otpauth://TOTP/a?secret=JBSWY3DPEHPK3PXP", reason: UnknownKind("TOTP") },
+    { text: "otpauth://totp/a%ZZ?secret=JBSWY3DPEHPK3PXP", reason: BadLabel },
+    { text: "otpauth://totp/a:b:c?secret=JBSWY3DPEHPK3PXP", reason: BadLabel },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&issuer=%G1", reason: BadQuery },
     {
       text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&secret=JBSWY3DPEHPK3PXP",
-      why: Twice("secret"),
+      reason: DuplicateParameter("secret"),
     },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=6&digits=8", why: Twice("digits") },
-    { text: "otpauth://totp/a", why: NoSecret },
-    { text: "otpauth://totp/a?issuer=b", why: NoSecret },
-    { text: "otpauth://totp/a?secret=", why: NoSecret },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PX1", why: BadSecret },
-    { text: "otpauth://totp/a?secret=J", why: BadSecret },
-    { text: "otpauth://totp/b:a?secret=JBSWY3DPEHPK3PXP&issuer=c", why: TwoIssuers },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&algorithm=MD5", why: BadValue("algorithm") },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=5", why: BadValue("digits") },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=11", why: BadValue("digits") },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=six", why: BadValue("digits") },
-    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&period=0", why: BadValue("period") },
+    {
+      text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=6&digits=8",
+      reason: DuplicateParameter("digits"),
+    },
+    { text: "otpauth://totp/a", reason: NoSecret },
+    { text: "otpauth://totp/a?issuer=b", reason: NoSecret },
+    { text: "otpauth://totp/a?secret=", reason: NoSecret },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PX1", reason: BadSecret },
+    { text: "otpauth://totp/a?secret=J", reason: BadSecret },
+    { text: "otpauth://totp/b:a?secret=JBSWY3DPEHPK3PXP&issuer=c", reason: TwoIssuers },
+    {
+      text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&algorithm=MD5",
+      reason: BadValue("algorithm"),
+    },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=5", reason: BadValue("digits") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=11", reason: BadValue("digits") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=six", reason: BadValue("digits") },
+    { text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&period=0", reason: BadValue("period") },
     {
       text: "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&period=9223372036854775807",
-      why: BadValue("period"),
+      reason: BadValue("period"),
     },
-    { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP&counter=-1", why: BadValue("counter") },
-    { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP", why: NoCounter },
+    { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP&counter=-1", reason: BadValue("counter") },
+    { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP", reason: NoCounter },
   ]
 
-test "`{c.text}` is no provisioning URI" for c: Refused in not_uris() {
-  assert_eq(try_parse_uri(c.text), Err(Malformed(c.why)))
+test "`{c.text}` is no provisioning URI" for c: ErrorCase in error_cases() {
+  assert_eq(try_parse_uri(c.text), Err(Malformed(c.reason)))
 }
 
 /// A provision of the standard form for `issuer` and `account`, under a twenty-byte key.
 fn provision(issuer: String, account: String) -> Provision =
   {
-    kind: Timed(seconds(30)),
+    kind: TimeBased(seconds(30)),
     issuer: issuer,
     account: account,
     key: rfc_key(),
@@ -699,7 +708,7 @@ test "a URI writes every parameter, and percent-encodes its names" {
   );
   let counted: Provision = {
     ..provision("", "bob"),
-    kind: Counted(4),
+    kind: CounterBased(4),
     form: { algorithm: Sha256, digits: 8 },
   };
   assert_eq(
@@ -716,41 +725,41 @@ test "what a URI cannot carry is refused by name" {
   assert_eq(try { uri(provision("a:c", "b")) }, Err(Label("a:c")));
   assert_eq(try { uri(provision("a", "b:c")) }, Err(Label("b:c")));
   assert_eq(try { uri(provision("a", " b")) }, Err(Label(" b")));
-  let half: Provision = { ..provision("a", "b"), kind: Timed(Duration(1500000000)) };
+  let half: Provision = { ..provision("a", "b"), kind: TimeBased(Duration(1500000000)) };
   assert_eq(try { uri(half) }, Err(Step(Duration(1500000000))));
-  let still: Provision = { ..provision("a", "b"), kind: Timed(seconds(0)) };
+  let still: Provision = { ..provision("a", "b"), kind: TimeBased(seconds(0)) };
   assert_eq(try { uri(still) }, Err(Step(seconds(0))));
-  let behind: Provision = { ..provision("a", "b"), kind: Counted(0 - 1) };
+  let behind: Provision = { ..provision("a", "b"), kind: CounterBased(0 - 1) };
   assert_eq(try { uri(behind) }, Err(Counter(0 - 1)))
 }
 
 test "a timed provision says how its codes are made, and a counted one has no clock" {
-  let fast: Provision = { ..provision("a", "b"), kind: Timed(seconds(15)) };
+  let fast: Provision = { ..provision("a", "b"), kind: TimeBased(seconds(15)) };
   assert_eq(
     config_of(fast),
     Some({ form: { algorithm: Sha1, digits: 6 }, step: seconds(15), epoch: Instant(0) }),
   );
-  let counted: Provision = { ..provision("a", "b"), kind: Counted(0) };
+  let counted: Provision = { ..provision("a", "b"), kind: CounterBased(0) };
   assert_eq(config_of(counted), None)
 }
 
 // --- Properties -------------------------------------------------------------
 //
-// A `Provision`, a `Config` and a `Form` are not every value of their fields, so each law makes
+// A `Provision`, a `Config` and a `CodeFormat` are not every value of their fields, so each law makes
 // one of what it draws.
 
 /// A reading some whole seconds past the epoch, a step or more in.
-fn reading(ticks: Int) -> Instant = at_second(1000 + (ticks & 0xFFFF_FFFF))
+fn sample_instant(ticks: Int) -> Instant = at_second(1000 + (ticks & 0xFFFF_FFFF))
 
 /// A form of six to ten digits under one of the three hashes.
-fn form_of(n: Int) -> Form =
+fn form_of(n: Int) -> CodeFormat =
   {
     algorithm: match (n >>> 8 & 0xFF) % 3 { 0 -> Sha1, 1 -> Sha256, _ -> Sha512 },
     digits: 6 + (n & 0xFF) % 5,
   }
 
-/// A `Drawn` as a test draws one.
-fn drawns() -> gen::Gen<Drawn> =
+/// A `ProvisionInput` as a test draws one.
+fn provision_inputs() -> gen::Gen<ProvisionInput> =
   gen::map4(
     gen::text(),
     gen::text(),
@@ -776,7 +785,7 @@ test "a code verifies while its step is in the window, and its step is not answe
       let drift = drawn._2;
       let before = drawn._3;
       let after = drawn._4;
-      let made = reading(ticks);
+      let made = sample_instant(ticks);
       let by = (drift & 7) - 4;
       let window: Window = { before: before & 3, after: after & 3 };
       let step = step_at(standard(), made);
@@ -801,7 +810,7 @@ test "a code accepted once is not accepted again" {
     gen::any_int(),
     gen::any_int(),
     |key: Bytes, ticks: Int, before: Int, after: Int| {
-      let now = reading(ticks);
+      let now = sample_instant(ticks);
       let window: Window = { before: before & 3, after: after & 3 };
       let typed = code(standard(), Secret::of_bytes(key), now);
       let first = verify_after(standard(), Secret::of_bytes(key), typed, now, window, None);
@@ -813,13 +822,13 @@ test "a code accepted once is not accepted again" {
 
 /// What a test draws for a provision: any two names, any key and a number its form and kind are
 /// read off.
-type Drawn = { issuer: String, account: String, key: Bytes, n: Int }
+type ProvisionInput = { issuer: String, account: String, key: Bytes, n: Int }
 
 /// A provision `uri` writes, made of what a test drew.
-fn provisioned(d: Drawn) -> Provision =
+fn provision_of(d: ProvisionInput) -> Provision =
   {
-    kind: if d.n >>> 16 & 1 == 0 { Timed(seconds(1 + (d.n >>> 17 & 0xFFF))) }
-    else { Counted(d.n >>> 17 & 0xFFFF_FFFF) },
+    kind: if d.n >>> 16 & 1 == 0 { TimeBased(seconds(1 + (d.n >>> 17 & 0xFFF))) }
+    else { CounterBased(d.n >>> 17 & 0xFFFF_FFFF) },
     issuer: d.issuer.replace(":", ""),
     account: d.account.replace(":", "").ascii_trim_start(),
     key: d.key.concat(rfc_key()),
@@ -827,6 +836,10 @@ fn provisioned(d: Drawn) -> Provision =
   }
 
 test "a provisioning URI is read back as what it was written of" {
-  gen::check(drawns(), |x: Drawn|
-    agrees(|d: Drawn| try_parse_uri(uri(provisioned(d))), |d: Drawn| Ok(provisioned(d)), x))
+  gen::check(provision_inputs(), |x: ProvisionInput|
+    agrees(
+      |d: ProvisionInput| try_parse_uri(uri(provision_of(d))),
+      |d: ProvisionInput| Ok(provision_of(d)),
+      x,
+    ))
 }

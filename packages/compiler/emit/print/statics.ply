@@ -8,10 +8,12 @@ import compiler.emit.c (int_lit)
 import compiler.emit.keys (RootKey, Named)
 import compiler.emit.layout (MachineStruct, MachineField, head_structs)
 import compiler.emit.abi (machine_structs)
-import compiler.emit.print.head (unit_head)
-import compiler.emit.print.counting (dup_fn, last_fn, inc_shared_fn, dec_shared_last_fn)
-import compiler.emit.tir.statics (StaticDef, StaticHead, SBlock, SPlain, SStruct, SFile, StaticWord,
-                                  WRaw, WAddress, WEntry, WBytes, WField, WHead, text_block, named)
+import compiler.emit.print.unit_header (unit_header)
+import compiler.emit.print.count_functions (dup_fn, last_fn, inc_shared_fn, dec_shared_last_fn)
+import compiler.emit.typed_ir.statics (StaticDef, StaticHead, StaticBlock, StaticWords,
+                                       StaticStruct, StaticFile, StaticWord, RawWord, AddressWord,
+                                       EntryWord, BytesWord, FieldWord, PreludeWord, text_block,
+                                       named_by_content)
 
 /// The declaration of static `name` that a part naming it but not defining it writes, before its C
 /// takes the static's address.
@@ -32,13 +34,13 @@ pub fn static_c(
   entry: (RootKey) -> Bytes / {abort.raise},
   file: (Bytes) -> Bytes / {abort.raise},
 ) -> Bytes / {abort.raise} =
-  match def.laid {
-    SBlock(b) -> laid_object(def.name, headed(def.name, b.head), b.words, field),
-    SPlain(ws) -> laid_object(def.name, [], ws, field),
-    SStruct(s) -> laid_struct(def.name, s.of, s.fields, field, entry),
-    SFile(digest) -> {
+  match def.layout {
+    StaticBlock(b) -> object_definition(def.name, header_members(def.name, b.head), b.words, field),
+    StaticWords(ws) -> object_definition(def.name, [], ws, field),
+    StaticStruct(s) -> struct_definition(def.name, s.of, s.fields, field, entry),
+    StaticFile(digest) -> {
       let t = text_block(file(digest));
-      laid_object(def.name, headed(def.name, t.head), t.words, field)
+      object_definition(def.name, header_members(def.name, t.head), t.words, field)
     },
   }
 
@@ -46,7 +48,7 @@ pub fn static_c(
 type Member = { decl: Bytes, init: Bytes }
 
 /// A block's header, the immortal count alone, and its head where it has one, as members.
-fn headed(name: Bytes, head: Option<StaticHead>) -> List<Member> / {abort.raise} =
+fn header_members(name: Bytes, head: Option<StaticHead>) -> List<Member> / {abort.raise} =
   [{ decl: b"PlyObj h", init: b"{ .rc = UINT32_MAX }" }].concat(match head {
     None -> [],
     Some(h) -> [head_member(name, h)],
@@ -76,7 +78,7 @@ fn head_member(name: Bytes, h: StaticHead) -> Member / {abort.raise} =
     },
   }
 
-fn laid_object(
+fn object_definition(
   name: Bytes,
   header: List<Member>,
   words: List<StaticWord>,
@@ -85,7 +87,7 @@ fn laid_object(
   let members = range(0, words.len()).fold(header, |acc: List<Member>, i: Int|
     match word_member(i, words.get(i), field) { Some(m) -> acc.push(m), None -> acc });
   if members.len() == 0 { refused(name, b"holds no words") } else {
-    defined(
+    static_struct(
       name,
       Bytes::join(members.map(|m: Member| m.decl.concat(b";")), b" "),
       members.map(|m: Member| m.init),
@@ -103,10 +105,10 @@ fn word_member(
 ) -> Option<Member> / {abort.raise} = {
   let named_w = b"w".concat(ascii_of_int(i));
   match w {
-    WRaw(n) -> Some({ decl: b"int64_t ".concat(named_w), init: int_lit(n) }),
-    WField(f) -> Some({ decl: b"int64_t ".concat(named_w), init: int_lit(field(f)) }),
-    WAddress(a) -> Some({ decl: b"const void *".concat(named_w), init: address(a.name, a.tag) }),
-    WBytes(b) -> if b.len() == 0 { None } else {
+    RawWord(n) -> Some({ decl: b"int64_t ".concat(named_w), init: int_lit(n) }),
+    FieldWord(f) -> Some({ decl: b"int64_t ".concat(named_w), init: int_lit(field(f)) }),
+    AddressWord(a) -> Some({ decl: b"const void *".concat(named_w), init: address(a.name, a.tag) }),
+    BytesWord(b) -> if b.len() == 0 { None } else {
       Some({
         decl: Bytes::concat_all([
           b"unsigned char ",
@@ -118,8 +120,8 @@ fn word_member(
         init: c_string(b),
       })
     },
-    WEntry(_) -> panic("a root's function in a static's word no struct field types"),
-    WHead(_) -> panic("a head's function in a static's word no struct field types"),
+    EntryWord(_) -> panic("a root's function in a static's word no struct field types"),
+    PreludeWord(_) -> panic("a head's function in a static's word no struct field types"),
   }
 }
 
@@ -127,8 +129,8 @@ fn word_member(
 /// low bits. Raises on a word no function answers.
 pub fn word_c(w: StaticWord) -> Bytes / {abort.raise} =
   match w {
-    WRaw(n) -> Bytes::concat_all([b"(Word)", int_lit(n)]),
-    WAddress(a) -> Bytes::concat_all([b"(Word)(intptr_t)(", address(a.name, a.tag), b")"]),
+    RawWord(n) -> Bytes::concat_all([b"(Word)", int_lit(n)]),
+    AddressWord(a) -> Bytes::concat_all([b"(Word)(intptr_t)(", address(a.name, a.tag), b")"]),
     _ -> panic("a word no function answers"),
   }
 
@@ -141,7 +143,7 @@ fn address(name: Bytes, tag: Int) -> Bytes =
 /// name: each value converted to its field's C type, a root's function by its symbol, declared first
 /// at the field's type, so a root whose C differs from what the struct holds is refused by the
 /// compiler.
-fn laid_struct(
+fn struct_definition(
   name: Bytes,
   of: Bytes,
   values: List<StaticWord>,
@@ -188,15 +190,15 @@ fn field_value(
   let pointed = Bytes::concat_all([b"(*", f.name, b")"]);
   let cast = |e: Bytes| Bytes::concat_all([b"(", type_of_field(name, f), b")", e]);
   match w {
-    WRaw(n) -> { declared: b"", init: cast(int_lit(n)) },
-    WField(x) -> { declared: b"", init: cast(int_lit(field(x))) },
-    WAddress(a) ->
+    RawWord(n) -> { declared: b"", init: cast(int_lit(n)) },
+    FieldWord(x) -> { declared: b"", init: cast(int_lit(field(x))) },
+    AddressWord(a) ->
       {
         declared: b"",
         init: cast(if a.tag == 0 { address(a.name, 0) }
         else { Bytes::concat_all([b"(", address(a.name, a.tag), b")"]) }),
       },
-    WEntry(k) -> match f.decl.index_of(pointed) {
+    EntryWord(k) -> match f.decl.index_of(pointed) {
       None ->
         refused(name, b"holds a root's function in a field of no function's type: ".concat(f.name)),
       Some(at) -> {
@@ -212,12 +214,12 @@ fn field_value(
         }
       },
     },
-    WHead(h) -> match f.decl.index_of(pointed) {
+    PreludeWord(h) -> match f.decl.index_of(pointed) {
       None ->
         refused(name, b"holds a head's function in a field of no function's type: ".concat(f.name)),
       Some(_) -> { declared: b"", init: h },
     },
-    WBytes(_) -> refused(name, b"holds bytes in a struct's field: ".concat(f.name)),
+    BytesWord(_) -> refused(name, b"holds bytes in a struct's field: ".concat(f.name)),
   }
 }
 
@@ -241,7 +243,7 @@ fn type_of_field(name: Bytes, f: MachineField) -> Bytes / {abort.raise} = {
 fn aligned() -> Bytes = b" __attribute__((aligned(8)))"
 
 /// A static's definition from its members' declarations and their initializers in order.
-fn defined(name: Bytes, decls: Bytes, inits: List<Bytes>) -> Bytes =
+fn static_struct(name: Bytes, decls: Bytes, inits: List<Bytes>) -> Bytes =
   Bytes::concat_all([
     b"const struct ",
     name,
@@ -259,16 +261,16 @@ fn refused<a>(name: Bytes, why: Bytes) -> a / {abort.raise} =
   panic(String::of_bytes_lossy(Bytes::concat_all([b"static ", name, b" ", why])))
 
 /// Bytes per C string literal, so no literal exceeds what compilers accept.
-fn piece_len() -> Int = 2000
+fn literal_chunk_len() -> Int = 2000
 
-/// `b` as adjacent C string literals of at most `piece_len()` bytes each, a line apiece.
+/// `b` as adjacent C string literals of at most `literal_chunk_len()` bytes each, a line apiece.
 pub fn c_string(b: Bytes) -> Bytes / {abort.raise} = {
   let n = b.len();
-  let count = if n == 0 { 1 } else { (n + piece_len() - 1) / piece_len() };
+  let count = if n == 0 { 1 } else { (n + literal_chunk_len() - 1) / literal_chunk_len() };
   Bytes::join(
     range(0, count).map(|i: Int| {
-      let end = if (i + 1) * piece_len() < n { (i + 1) * piece_len() } else { n };
-      Bytes::concat_all([b"\"", escaped(b.slice(i * piece_len(), end)), b"\""])
+      let end = if (i + 1) * literal_chunk_len() < n { (i + 1) * literal_chunk_len() } else { n };
+      Bytes::concat_all([b"\"", escaped(b.slice(i * literal_chunk_len(), end)), b"\""])
     }),
     b"\n  ",
   )
@@ -276,17 +278,17 @@ pub fn c_string(b: Bytes) -> Bytes / {abort.raise} = {
 
 /// The bytes a C string literal holds as they are: the printable ones but for the quote, the
 /// backslash and `?`, which could open a trigraph.
-fn plain() -> Bytes / {abort.raise} =
+fn unescaped_bytes() -> Bytes / {abort.raise} =
   Bytes::concat_all(range(32, 127).filter(|b: Int| b != 34 && b != 63 && b != 92).map(byte_of_int))
 
 fn octal(b: Int) -> Bytes =
   Bytes::concat_all([b"\\", ascii_of_int(b / 64), ascii_of_int(b / 8 % 8), ascii_of_int(b % 8)])
 
-/// `piece` as the inside of a C string literal: every byte but `plain()`'s in octal, three digits, so
+/// `piece` as the inside of a C string literal: every byte but `unescaped_bytes()`'s in octal, three digits, so
 /// no digit after it is read into it.
 pub fn escaped(piece: Bytes) -> Bytes / {abort.raise} = {
   let n = piece.len();
-  let kept = plain();
+  let kept = unescaped_bytes();
   Bytes::concat_all(
     iterate({ from: 0, out: [] }, n + 1, |s: { from: Int, out: List<Bytes> }|
       if s.from >= n { Stop(s.out) } else {
@@ -312,14 +314,24 @@ fn no_files(_: Bytes) -> Bytes = b""
 fn has(c: Bytes, s: Bytes) -> Bool = c.index_of(s) != None
 
 test "a block's header is its immortal count alone, then its head with each field the head names" {
-  let s = static_c(named(SBlock(text_block(b"say \"hi\"?\n"))), no_fields, no_entries, no_files);
+  let s = static_c(
+    named_by_content(StaticBlock(text_block(b"say \"hi\"?\n"))),
+    no_fields,
+    no_entries,
+    no_files,
+  );
   let said = Some(String::of_bytes_lossy(s));
   assert(has(s, b"PlyObj h;") && has(s, b"{ .rc = UINT32_MAX }"), said);
   assert(has(s, b"PlyTextHead head;") && has(s, b"{ .len = 10, .room = 10 }"), said);
-  let plain = static_c(named(SPlain([WRaw(7)])), no_fields, no_entries, no_files);
-  assert(!has(plain, b"PlyObj"), Some(String::of_bytes_lossy(plain)));
+  let unescaped_bytes = static_c(
+    named_by_content(StaticWords([RawWord(7)])),
+    no_fields,
+    no_entries,
+    no_files,
+  );
+  assert(!has(unescaped_bytes, b"PlyObj"), Some(String::of_bytes_lossy(unescaped_bytes)));
   let headless = static_c(
-    named(SBlock({ head: None, words: [WRaw(7)] })),
+    named_by_content(StaticBlock({ head: None, words: [RawWord(7)] })),
     no_fields,
     no_entries,
     no_files,
@@ -332,13 +344,16 @@ test "a block's header is its immortal count alone, then its head with each fiel
   assert(has(s, b"w0[16]") && has(s, b"aligned(8)"), said);
   // An empty string is its header and head alone.
   assert(
-    !has(static_c(named(SBlock(text_block(b""))), no_fields, no_entries, no_files), b"w0"),
+    !has(
+      static_c(named_by_content(StaticBlock(text_block(b""))), no_fields, no_entries, no_files),
+      b"w0",
+    ),
     None,
   )
 }
 
 test "a static's declaration names it, so a part can take its address" {
-  let s = named(SBlock(text_block(b"x")));
+  let s = named_by_content(StaticBlock(text_block(b"x")));
   let e = static_extern(s.name);
   assert(has(e, b"extern ") && has(e, s.name), Some(String::of_bytes_lossy(e)))
 }
@@ -359,13 +374,13 @@ test "a C string literal holds printable bytes as they are, and no quote, backsl
 
 test "a word is an integer, a field's entry or an address, a tagged one an offset from the static's" {
   let c = static_c(
-    named(
-      SPlain([
-        WRaw(7),
-        WAddress({ name: b"ply_k_a", tag: 0 }),
-        WAddress({ name: b"ply_k_a", tag: 1 }),
-        WField(b"op"),
-        WRaw(0 - 9223372036854775807 - 1),
+    named_by_content(
+      StaticWords([
+        RawWord(7),
+        AddressWord({ name: b"ply_k_a", tag: 0 }),
+        AddressWord({ name: b"ply_k_a", tag: 1 }),
+        FieldWord(b"op"),
+        RawWord(0 - 9223372036854775807 - 1),
       ]),
     ),
     |f: Bytes| if f == b"op" { 12 } else { 0 },
@@ -382,8 +397,12 @@ test "a word is an integer, a field's entry or an address, a tagged one an offse
 
 test "an embedded file is a byte string's object of the bytes its digest names, cut into literals" {
   let big = Bytes::concat_all(range(0, 4100).map(|i: Int| byte_of_int(97 + i % 26)));
-  let c = static_c({ name: b"ply_k_f", laid: SFile(b"d1") }, no_fields, no_entries, |d: Bytes|
-    if d == b"d1" { big } else { b"" });
+  let c = static_c(
+    { name: b"ply_k_f", layout: StaticFile(b"d1") },
+    no_fields,
+    no_entries,
+    |d: Bytes| if d == b"d1" { big } else { b"" },
+  );
   assert(has(c, b".len = 4100, .room = 4100") && has(c, b"w0[4104]"), None);
   // No literal is longer than a C compiler takes: three, each on its own line.
   assert_eq(c.split(b"\"\n  \"").len(), 3)
@@ -391,17 +410,17 @@ test "an embedded file is a byte string's object of the bytes its digest names, 
 
 test "a machine struct's fields are cast to their types, and a root's function is declared at its field's type first" {
   let c = static_c(
-    named(
-      SStruct({
+    named_by_content(
+      StaticStruct({
         of: b"PlyType",
         fields: [
-          WRaw(5),
-          WAddress({ name: b"ply_k_s", tag: 0 }),
-          WRaw(3),
-          WEntry(Named(b"m.dup#T")),
-          WRaw(0),
-          WRaw(0),
-          WRaw(0),
+          RawWord(5),
+          AddressWord({ name: b"ply_k_s", tag: 0 }),
+          RawWord(3),
+          EntryWord(Named(b"m.dup#T")),
+          RawWord(0),
+          RawWord(0),
+          RawWord(0),
         ],
       }),
     ),
@@ -411,8 +430,8 @@ test "a machine struct's fields are cast to their types, and a root's function i
   );
   let said = Some(String::of_bytes_lossy(c));
   let declared = match c.index_of(b"m_dup_T(PlyCtx *, Word);") { Some(i) -> i, None -> 0 - 1 };
-  let defined = match c.index_of(b"const struct ") { Some(i) -> i, None -> 0 - 1 };
-  assert(declared >= 0 && declared < defined && has(c, b"PlyType s;"), said);
+  let static_struct = match c.index_of(b"const struct ") { Some(i) -> i, None -> 0 - 1 };
+  assert(declared >= 0 && declared < static_struct && has(c, b"PlyType s;"), said);
   assert(has(c, b"(const uint8_t *)&ply_k_s") && has(c, b"(Word (*)(PlyCtx *, Word))"), said)
 }
 
@@ -426,10 +445,10 @@ test "a word no slot of its static can hold is refused" {
     };
   assert(
     said(
-        named(
-          SBlock({
+        named_by_content(
+          StaticBlock({
             head: Some({ of: b"PlyTextHead", fields: [{ field: b"rc", value: 1 }] }),
-            words: [WRaw(0)],
+            words: [RawWord(0)],
           }),
         ),
       ).len(
@@ -438,12 +457,21 @@ test "a word no slot of its static can hold is refused" {
     None,
   );
   assert(
-    said(named(SBlock({ head: Some({ of: b"PlyObj", fields: [] }), words: [WRaw(0)] }))).len() > 0,
+    said(
+        named_by_content(
+          StaticBlock({ head: Some({ of: b"PlyObj", fields: [] }), words: [RawWord(0)] }),
+        ),
+      ).len(
+      )
+      > 0,
     None,
   );
-  assert(said(named(SStruct({ of: b"PlyType", fields: [WRaw(0)] }))).len() > 0, None);
-  assert(said(named(SPlain([WEntry(Named(b"m.f"))]))).len() > 0, None);
-  assert(said(named(SPlain([]))).len() > 0, None)
+  assert(
+    said(named_by_content(StaticStruct({ of: b"PlyType", fields: [RawWord(0)] }))).len() > 0,
+    None,
+  );
+  assert(said(named_by_content(StaticWords([EntryWord(Named(b"m.f"))]))).len() > 0, None);
+  assert(said(named_by_content(StaticWords([]))).len() > 0, None)
 }
 
 /// Where `needle` first stands in `hay`, or -1.
@@ -451,7 +479,7 @@ fn place_of(hay: Bytes, needle: Bytes) -> Int =
   match hay.index_of(needle) { Some(i) -> i, None -> 0 - 1 }
 
 test "the head's count helpers never write a static's or a frame block's count, so a count taken or let go of one is nothing" {
-  let h = unit_head();
+  let h = unit_header();
   let body = |name: Bytes| {
     let from = place_of(h, Bytes::concat_all([b" ", name, b"("]));
     if from < 0 { b"" }
@@ -471,7 +499,7 @@ test "the head's count helpers never write a static's or a frame block's count, 
 }
 
 test "a word a function answers is its integer, or a static's address with its low bits" {
-  assert(has(word_c(WRaw(7)), int_lit(7)), None);
-  assert(has(word_c(WAddress({ name: b"ply_k_a", tag: 0 })), b"&ply_k_a"), None);
-  assert(has(word_c(WAddress({ name: b"ply_k_a", tag: 1 })), b"&ply_k_a + 1"), None)
+  assert(has(word_c(RawWord(7)), int_lit(7)), None);
+  assert(has(word_c(AddressWord({ name: b"ply_k_a", tag: 0 })), b"&ply_k_a"), None);
+  assert(has(word_c(AddressWord({ name: b"ply_k_a", tag: 1 })), b"&ply_k_a + 1"), None)
 }

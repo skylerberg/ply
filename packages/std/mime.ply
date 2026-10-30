@@ -5,7 +5,7 @@
 //! token or a quoted string. The type, the subtype and a parameter's name are case-insensitive and
 //! kept in lower case; a value is kept as written, without its quotes. Two media types are `==`
 //! when they name one type and subtype with the same parameters in any order, and `show` writes
-//! the canonical text, quoting a value that is no token. `read` raises a `Refusal` saying where a
+//! the canonical text, quoting a value that is no token. `read` raises a `Error` saying where a
 //! text stops being a media type and why, `parse` answers it as an `Err`, and with
 //! `import std.mime`, `mime"text/html; charset=utf-8"` is the literal, checked with the program. A
 //! text is refused rather than repaired: whitespace around `=`, a parameter named twice and
@@ -54,7 +54,7 @@ key for MediaType by identity
 show for MediaType by render
 
 /// Why a text is no media type.
-pub type Why =
+pub type ErrorKind =
   /// No token where a type, a subtype, a parameter's name or its value must stand.
   | NoToken
   /// No `/` after the type.
@@ -71,58 +71,58 @@ pub type Why =
   | Trailing
 
 /// A refusal, and the byte of the text's UTF-8 it was found at.
-pub type Refusal = { at: Int, why: Why }
+pub type Error = { at: Int, reason: ErrorKind }
 
 /// Why parameters are not each one value, read as RFC 2231 writes a value in sections.
-pub type Unjoined =
+pub type JoinError =
   /// The sections of the parameter of this name do not count up from `0` one at a time, or the
   /// parameter is written both with a charset alone and in sections.
   | BadSections(String)
   /// The value of the parameter of this name cannot be read, and why `std.encoded_word` says so.
-  | BadValue(String, encoded_word::Why)
+  | BadValue(String, encoded_word::ErrorKind)
 
 /// What a reader of this module raises where it refuses.
 pub effect mime {
   /// The text is no media type.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// The parameters are not each one value.
-  raise unjoined(e: Unjoined)
+  raise unjoined(e: JoinError)
 }
 
 // --- Reading ----------------------------------------------------------------
 
-/// The media type `text` is, raising `mime.refused` where `parse` answers `Err`. Blanks around it
+/// The media type `text` is, raising `mime.fail` where `parse` answers `Err`. Blanks around it
 /// are passed over.
-pub fn read(text: String) -> MediaType / {mime.refused, abort.raise} = {
+pub fn read(text: String) -> MediaType / {mime.fail, abort.raise} = {
   let b = Bytes::of_string(text);
   let one = read_at(b, b.skip(0, blanks()));
   let end = b.skip(one.at, blanks());
-  if end < b.len() { refuse(end, Trailing) } else { one.value }
+  if end < b.len() { fail(end, Trailing) } else { one.value }
 }
 
 /// The media type `text` is, or where it stops being one and why.
-pub fn parse(text: String) -> Result<MediaType, Refusal> / {abort.raise} = try { read(text) }
+pub fn parse(text: String) -> Result<MediaType, Error> / {abort.raise} = try { read(text) }
 
 /// The media types of a comma-separated list, as an `Accept` field carries its ranges, in the
-/// order written; an empty element is passed over (RFC 9110 §5.6.1). Raises `mime.refused` where
+/// order written; an empty element is passed over (RFC 9110 §5.6.1). Raises `mime.fail` where
 /// `parse_list` answers `Err`.
-pub fn read_list(text: String) -> List<MediaType> / {mime.refused, abort.raise} = {
+pub fn read_list(text: String) -> List<MediaType> / {mime.fail, abort.raise} = {
   let b = Bytes::of_string(text);
   listed(b, 0, [], b.len() + 1)
 }
 
 /// The media types of a comma-separated list, or where it stops being one and why.
-pub fn parse_list(text: String) -> Result<List<MediaType>, Refusal> / {abort.raise} =
+pub fn parse_list(text: String) -> Result<List<MediaType>, Error> / {abort.raise} =
   try { read_list(text) }
 
 /// The parameters `text` holds from its byte `at` on, each after a `;` as a media type's are: what
-/// follows the first word of a field such as `Content-Disposition`. Raises `mime.refused` as
+/// follows the first word of a field such as `Content-Disposition`. Raises `mime.fail` as
 /// `read` does.
-pub fn read_params(text: String, at: Int) -> List<Param> / {mime.refused, abort.raise} = {
+pub fn read_params(text: String, at: Int) -> List<Param> / {mime.fail, abort.raise} = {
   let b = Bytes::of_string(text);
   let held = parameters(b, { at: at, params: [], seen: Map::new() }, b.len() + 1);
   let end = b.skip(held.at, blanks());
-  if end < b.len() { refuse(end, Trailing) } else { held.params }
+  if end < b.len() { fail(end, Trailing) } else { held.params }
 }
 
 /// What a `mime"..."` literal is checked by: the media type `read` answers, or why the text is
@@ -134,12 +134,12 @@ pub fn literal(
     Ok(m) -> Ok(m),
     Err(r) ->
       Err({
-        message: explained(r.why),
+        message: explained(r.reason),
         offset: String::of_bytes_lossy(Bytes::of_string(text).slice(0, r.at)).len(),
       }),
   }
 
-fn explained(why: Why) -> String =
+fn explained(why: ErrorKind) -> String =
   match why {
     NoToken -> "a name is expected here",
     NoSlash -> "a `/` is expected between the type and the subtype",
@@ -150,7 +150,7 @@ fn explained(why: Why) -> String =
     Trailing -> "nothing follows a media type but `;` and a parameter",
   }
 
-fn refuse<a>(at: Int, why: Why) -> a / {mime.refused} = mime.refused({ at: at, why: why })
+fn fail<a>(at: Int, why: ErrorKind) -> a / {mime.fail} = mime.fail({ at: at, reason: why })
 
 /// RFC 9110's `tchar`: what a token is made of.
 fn tchars() -> Bytes =
@@ -166,15 +166,15 @@ fn quoted_stops() -> Bytes =
 fn lowered(b: Bytes, from: Int, to: Int) -> String / {abort.raise} =
   String::of_bytes(b.slice(from, to)).ascii_lower()
 
-type One = { value: MediaType, at: Int }
+type ReadResult = { value: MediaType, at: Int }
 
 /// The media type that starts at `at`, and where the text stands after its last parameter.
-fn read_at(b: Bytes, at: Int) -> One / {mime.refused, abort.raise} = {
+fn read_at(b: Bytes, at: Int) -> ReadResult / {mime.fail, abort.raise} = {
   let slash = b.skip(at, tchars());
-  if slash == at { refuse(at, NoToken) }
-  else if b.peek(slash) != b'/' { refuse(slash, NoSlash) } else {
+  if slash == at { fail(at, NoToken) }
+  else if b.peek(slash) != b'/' { fail(slash, NoSlash) } else {
     let end = b.skip(slash + 1, tchars());
-    if end == slash + 1 { refuse(end, NoToken) } else {
+    if end == slash + 1 { fail(end, NoToken) } else {
       let held = parameters(b, { at: end, params: [], seen: Map::new() }, b.len() + 1);
       {
         value: MediaType(lowered(b, at, slash), lowered(b, slash + 1, end), held.params),
@@ -189,40 +189,40 @@ fn listed(
   at: Int,
   acc: List<MediaType>,
   left: Int,
-) -> List<MediaType> / {mime.refused, abort.raise} = {
+) -> List<MediaType> / {mime.fail, abort.raise} = {
   let start = b.skip(at, b" \t,");
   if left <= 0 { acc }
   else if start >= b.len() { acc } else {
     let one = read_at(b, start);
     let end = b.skip(one.at, blanks());
-    if end < b.len() && b.at(end) != b',' { refuse(end, Trailing) }
+    if end < b.len() && b.at(end) != b',' { fail(end, Trailing) }
     else { listed(b, end, acc.push(one.value), left - 1) }
   }
 }
 
-type Held = { at: Int, params: List<Param>, seen: Map<String, Unit> }
+type ParamScan = { at: Int, params: List<Param>, seen: Map<String, Unit> }
 
 /// The parameters from `held.at` on. `left` bounds the rounds: each takes a `;` at least.
-fn parameters(b: Bytes, held: Held, left: Int) -> Held / {mime.refused, abort.raise} = {
+fn parameters(b: Bytes, held: ParamScan, left: Int) -> ParamScan / {mime.fail, abort.raise} = {
   let semi = b.skip(held.at, blanks());
   if left <= 0 { held }
   else if b.peek(semi) != b';' { held } else {
     let start = b.skip(semi + 1, blanks());
     let equals = b.skip(start, tchars());
     if equals == start { parameters(b, { ..held, at: start }, left - 1) }
-    else if b.peek(equals) != b'=' { refuse(equals, NoEquals) }
+    else if b.peek(equals) != b'=' { fail(equals, NoEquals) }
     else { parameters(b, with_parameter(b, held, start, equals), left - 1) }
   }
 }
 
 fn with_parameter(
   b: Bytes,
-  held: Held,
+  held: ParamScan,
   start: Int,
   equals: Int,
-) -> Held / {mime.refused, abort.raise} = {
+) -> ParamScan / {mime.fail, abort.raise} = {
   let name = lowered(b, start, equals);
-  if held.seen.contains(name) { refuse(start, Repeated(name)) } else {
+  if held.seen.contains(name) { fail(start, Repeated(name)) } else {
     let value = value_at(b, equals + 1);
     {
       at: value.at,
@@ -232,32 +232,37 @@ fn with_parameter(
   }
 }
 
-type Text = { text: String, at: Int }
+type TextResult = { text: String, at: Int }
 
-fn value_at(b: Bytes, at: Int) -> Text / {mime.refused, abort.raise} =
+fn value_at(b: Bytes, at: Int) -> TextResult / {mime.fail, abort.raise} =
   if b.peek(at) == b'"' { quoted(b, at + 1, [], b.len() + 1) } else {
     let end = b.skip(at, tchars());
-    if end == at { refuse(at, NoToken) }
+    if end == at { fail(at, NoToken) }
     else { { text: String::of_bytes(b.slice(at, end)), at: end } }
   }
 
 /// The quoted string whose opening quote stands just before `at`, without its quotes and with each
 /// backslash pair as the byte it holds. `left` bounds the rounds: each takes a pair.
-fn quoted(b: Bytes, at: Int, kept: List<Bytes>, left: Int) -> Text / {mime.refused, abort.raise} = {
+fn quoted(
+  b: Bytes,
+  at: Int,
+  kept: List<Bytes>,
+  left: Int,
+) -> TextResult / {mime.fail, abort.raise} = {
   let stop = b.skip_until(at, quoted_stops());
   let so_far = kept.push(b.slice(at, stop));
   let c = b.peek(stop);
-  if left <= 0 { refuse(stop, Unclosed) }
+  if left <= 0 { fail(stop, Unclosed) }
   else if c == b'"' { { text: String::of_bytes(Bytes::concat_all(so_far)), at: stop + 1 } }
-  else if c < 0 { refuse(stop, Unclosed) }
-  else if c != b'\\' { refuse(stop, Control) }
-  else if stop + 1 >= b.len() { refuse(stop + 1, Unclosed) }
-  else if !pairs(b.at(stop + 1)) { refuse(stop + 1, Control) }
+  else if c < 0 { fail(stop, Unclosed) }
+  else if c != b'\\' { fail(stop, Control) }
+  else if stop + 1 >= b.len() { fail(stop + 1, Unclosed) }
+  else if !is_escapable(b.at(stop + 1)) { fail(stop + 1, Control) }
   else { quoted(b, stop + 2, so_far.push(b.slice(stop + 1, stop + 2)), left - 1) }
 }
 
 /// Whether a backslash may stand before the byte `c`: a tab, or anything that is no control.
-fn pairs(c: Int) -> Bool = c == b'\t' || (c >= b' ' && c != 0x7F)
+fn is_escapable(c: Int) -> Bool = c == b'\t' || (c >= b' ' && c != 0x7F)
 
 // --- Writing ----------------------------------------------------------------
 
@@ -447,9 +452,9 @@ fn weight(q: String) -> Option<Int> / {abort.raise} = {
 /// answered as it is.
 pub fn joined(held: List<Param>) -> List<Param> / {mime.unjoined, abort.raise} = {
   let read = held.map(sectioned_name);
-  let groups = read.fold(Map::new(), |m: Map<String, List<Sectioned>>, n: Sectioned|
+  let groups = read.fold(Map::new(), |m: Map<String, List<ParamSection>>, n: ParamSection|
     m.insert(n.base, List::push(match m.get(n.base) { Some(found) -> found, None -> [] }, n)));
-  read.fold({ out: [], seen: Map::new() }, |j: Joining, n: Sectioned|
+  read.fold({ out: [], seen: Map::new() }, |j: JoinState, n: ParamSection|
     if j.seen.contains(n.base) { j } else {
       {
         out: j.out.push(
@@ -462,17 +467,17 @@ pub fn joined(held: List<Param>) -> List<Param> / {mime.unjoined, abort.raise} =
 
 /// `held` with each value written in sections or with a charset as one parameter, or why they
 /// are not each one value.
-pub fn join(held: List<Param>) -> Result<List<Param>, Unjoined> / {abort.raise} =
+pub fn join(held: List<Param>) -> Result<List<Param>, JoinError> / {abort.raise} =
   try { joined(held) }
 
 /// A parameter as RFC 2231 reads its name: the name before any `*`, the section it is (`-1` for
 /// a value written whole), and whether it is extended. `starred` says the name was one of RFC
 /// 2231's at all.
-type Sectioned = { base: String, index: Int, extended: Bool, starred: Bool, value: String }
+type ParamSection = { base: String, index: Int, extended: Bool, starred: Bool, value: String }
 
-type Joining = { out: List<Param>, seen: Map<String, Unit> }
+type JoinState = { out: List<Param>, seen: Map<String, Unit> }
 
-fn sectioned_name(p: Param) -> Sectioned / {abort.raise} = {
+fn sectioned_name(p: Param) -> ParamSection / {abort.raise} = {
   let plain = { base: p.name, index: -1, extended: false, starred: false, value: p.value };
   match p.name.split("*") {
     [base, ""] -> if base == "" { plain }
@@ -486,11 +491,11 @@ fn sectioned_name(p: Param) -> Sectioned / {abort.raise} = {
 /// The section `digits` counts, where they are a count as RFC 2231 writes one, with no sign and
 /// no zero before another digit; `plain` otherwise.
 fn numbered(
-  plain: Sectioned,
+  plain: ParamSection,
   base: String,
   digits: String,
   extended: Bool,
-) -> Sectioned / {abort.raise} =
+) -> ParamSection / {abort.raise} =
   match Bytes::of_string(digits).int_of_ascii() {
     Some(n) -> if base == "" || n < 0 || n.to_string() != digits { plain }
     else { { base: base, index: n, extended: extended, starred: true, value: plain.value } },
@@ -498,46 +503,51 @@ fn numbered(
   }
 
 /// The one parameter the parameters named `base` are.
-fn whole(base: String, group: List<Sectioned>) -> Param / {mime.unjoined, abort.raise} =
-  match group.filter(|n: Sectioned| n.starred) {
+fn whole(base: String, group: List<ParamSection>) -> Param / {mime.unjoined, abort.raise} =
+  match group.filter(|n: ParamSection| n.starred) {
     [] -> { name: base, value: match group { [first, ..] -> first.value, [] -> "" } },
-    starred -> carried(base, starred),
+    starred -> join_sections(base, starred),
   }
 
 /// The parameter the sections `starred` carry: either one value written whole, or sections that
 /// count from `0`.
-fn carried(base: String, starred: List<Sectioned>) -> Param / {mime.unjoined, abort.raise} = {
-  let sections = starred.filter(|n: Sectioned| n.index >= 0).sort_by(
-    |a: Sectioned, b: Sectioned| a.index < b.index,
+fn join_sections(
+  base: String,
+  starred: List<ParamSection>,
+) -> Param / {mime.unjoined, abort.raise} = {
+  let sections = starred.filter(|n: ParamSection| n.index >= 0).sort_by(
+    |a: ParamSection, b: ParamSection| a.index < b.index,
   );
-  let counted = enumerate(sections).fold(true, |ok: Bool, s: { index: Int, value: Sectioned }|
-    ok && s.value.index == s.index);
+  let counted = enumerate(sections).fold(
+    true,
+    |ok: Bool, s: { index: Int, value: ParamSection }| ok && s.value.index == s.index,
+  );
   let wholes = starred.len() - sections.len();
   if !counted || wholes > 1 || (wholes == 1 && sections.len() > 0) {
     mime.unjoined(BadSections(base))
   } else {
     match decode_sections(
-        List::map(if wholes == 1 { starred } else { sections }, |n: Sectioned|
+        List::map(if wholes == 1 { starred } else { sections }, |n: ParamSection|
           { text: n.value, extended: n.extended }),
       ) {
       Ok(value) -> { name: base, value: value },
-      Err(r) -> mime.unjoined(BadValue(base, r.why)),
+      Err(r) -> mime.unjoined(BadValue(base, r.reason)),
     }
   }
 }
 
 /// The parameters that carry `value` under `name` as mail writes one: `name=value` where the
 /// value is printable ASCII that holds none of `"`, `\`, `'`, `%` and `*`, which readers of RFC
-/// 2231 take in more than one way, and, quoted if it must be, the parameter is at most `room`
+/// 2231 take in more than one way, and, quoted if it must be, the parameter is at most `max_length`
 /// characters; and otherwise RFC 2231's extended sections, `name*` alone or `name*0*`, `name*1*`
-/// and on, each at most `room` characters wherever one character's escapes leave room. What
+/// and on, each at most `max_length` characters wherever one character's escapes leave room. What
 /// `joined` answers `name=value` for.
-pub fn sectioned(name: String, value: String, room: Int) -> List<Param> / {abort.raise} = {
+pub fn sectioned(name: String, value: String, max_length: Int) -> List<Param> / {abort.raise} = {
   let b = Bytes::of_string(value);
-  if b.skip(0, unmarked()) == b.len() && name.len() + 1 + written(value).len() <= room {
-    [{ name: name, value: value }]
-  } else {
-    match encode_sections(value, room - name.len() - 6) {
+  if b.skip(0, plain_value_bytes()) == b.len()
+      && name.len() + 1 + written(value).len() <= max_length { [{ name: name, value: value }] }
+  else {
+    match encode_sections(value, max_length - name.len() - 6) {
       [only] -> [{ name: name ++ "*", value: only }],
       several ->
         enumerate(several).map(|s: { index: Int, value: String }|
@@ -548,7 +558,7 @@ pub fn sectioned(name: String, value: String, room: Int) -> List<Param> / {abort
 
 /// Printable ASCII but the quote, the backslash and the three characters RFC 2231 gives a
 /// meaning of its own.
-fn unmarked() -> Bytes =
+fn plain_value_bytes() -> Bytes =
   b" !#$&()+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 // --- Extensions -------------------------------------------------------------
@@ -1069,48 +1079,48 @@ test "reads {show(c.text)}" for c: Written in readable() {
   assert_eq(parse(c.canonical), parse(c.text))
 }
 
-type Refused = { text: String, at: Int, why: Why }
+type Refused = { text: String, at: Int, reason: ErrorKind }
 
 /// Texts that are no media type, each with where it stops being one and why. The colon is RFC
 /// 2046 §5.1.1's boundary that must be quoted.
 fn unreadable() -> List<Refused> =
   [
-    { text: "", at: 0, why: NoToken },
-    { text: "/html", at: 0, why: NoToken },
-    { text: "text", at: 4, why: NoSlash },
-    { text: "text html", at: 4, why: NoSlash },
-    { text: "text/", at: 5, why: NoToken },
-    { text: "text/ html", at: 5, why: NoToken },
-    { text: "text/html charset=utf-8", at: 10, why: Trailing },
-    { text: "text/html, text/plain", at: 9, why: Trailing },
-    { text: "multipart/mixed; boundary=gc0pJq0M:08jU534c0p", at: 34, why: Trailing },
-    { text: "text/html; charset", at: 18, why: NoEquals },
-    { text: "text/html; charset =utf-8", at: 18, why: NoEquals },
-    { text: "text/html; charset= utf-8", at: 19, why: NoToken },
-    { text: "text/html; charset=", at: 19, why: NoToken },
-    { text: "text/html; =utf-8", at: 11, why: Trailing },
-    { text: "text/html; charset=\"utf-8", at: 25, why: Unclosed },
-    { text: "text/html; a=\"x\\", at: 16, why: Unclosed },
-    { text: "text/html; a=\"x\\\"", at: 17, why: Unclosed },
-    { text: "text/html; a=\"x\u{7f}y\"", at: 15, why: Control },
-    { text: "text/html; a=\"x\\\u{7f}y\"", at: 16, why: Control },
-    { text: "text/html; a=1; b=2; A=3", at: 21, why: Repeated("a") },
-    { text: "text/html; a=\"x\"y", at: 16, why: Trailing },
+    { text: "", at: 0, reason: NoToken },
+    { text: "/html", at: 0, reason: NoToken },
+    { text: "text", at: 4, reason: NoSlash },
+    { text: "text html", at: 4, reason: NoSlash },
+    { text: "text/", at: 5, reason: NoToken },
+    { text: "text/ html", at: 5, reason: NoToken },
+    { text: "text/html charset=utf-8", at: 10, reason: Trailing },
+    { text: "text/html, text/plain", at: 9, reason: Trailing },
+    { text: "multipart/mixed; boundary=gc0pJq0M:08jU534c0p", at: 34, reason: Trailing },
+    { text: "text/html; charset", at: 18, reason: NoEquals },
+    { text: "text/html; charset =utf-8", at: 18, reason: NoEquals },
+    { text: "text/html; charset= utf-8", at: 19, reason: NoToken },
+    { text: "text/html; charset=", at: 19, reason: NoToken },
+    { text: "text/html; =utf-8", at: 11, reason: Trailing },
+    { text: "text/html; charset=\"utf-8", at: 25, reason: Unclosed },
+    { text: "text/html; a=\"x\\", at: 16, reason: Unclosed },
+    { text: "text/html; a=\"x\\\"", at: 17, reason: Unclosed },
+    { text: "text/html; a=\"x\u{7f}y\"", at: 15, reason: Control },
+    { text: "text/html; a=\"x\\\u{7f}y\"", at: 16, reason: Control },
+    { text: "text/html; a=1; b=2; A=3", at: 21, reason: Repeated("a") },
+    { text: "text/html; a=\"x\"y", at: 16, reason: Trailing },
   ]
 
 test "refuses {show(c.text)}" for c: Refused in unreadable() {
-  assert_eq(parse(c.text), Err({ at: c.at, why: c.why }))
+  assert_eq(parse(c.text), Err({ at: c.at, reason: c.reason }))
 }
 
 test "the raising reader raises what the other answers" {
-  assert_eq(try { read("text") }, Err({ at: 4, why: NoSlash }));
-  assert_eq(try { read_list("text/html, text") }, Err({ at: 15, why: NoSlash }))
+  assert_eq(try { read("text") }, Err({ at: 4, reason: NoSlash }));
+  assert_eq(try { read_list("text/html, text") }, Err({ at: 15, reason: NoSlash }))
 }
 
 test "a quoted string holds a blank after a backslash, and no NUL" {
   assert_eq(parse("text/plain; t=\"a\\ b\\\tc\""), parse("text/plain; t=\"a b\tc\""));
-  assert_eq(parse("text/html; a=\"x\0y\""), Err({ at: 15, why: Control }));
-  assert_eq(parse("text/html; a=\"x\\\0y\""), Err({ at: 16, why: Control }))
+  assert_eq(parse("text/html; a=\"x\0y\""), Err({ at: 15, reason: Control }));
+  assert_eq(parse("text/html; a=\"x\\\0y\""), Err({ at: 16, reason: Control }))
 }
 
 test "the parameters after a field's first word are read as a media type's are" {
@@ -1120,8 +1130,8 @@ test "the parameters after a field's first word are read as a media type's are" 
   );
   assert_eq(try { read_params("inline", 6) }, Ok([]));
   assert_eq(try { read_params("inline", 9) }, Ok([]));
-  assert_eq(try { read_params("inline; a=1 b", 6) }, Err({ at: 12, why: Trailing }));
-  assert_eq(try { read_params("inline; a=1; A=2", 6) }, Err({ at: 13, why: Repeated("a") }))
+  assert_eq(try { read_params("inline; a=1 b", 6) }, Err({ at: 12, reason: Trailing }));
+  assert_eq(try { read_params("inline; a=1; A=2", 6) }, Err({ at: 13, reason: Repeated("a") }))
 }
 
 test "RFC 9110's four spellings of one media type are equal, and a parameter's order is not read" {
@@ -1134,7 +1144,7 @@ test "RFC 9110's four spellings of one media type are equal, and a parameter's o
   );
   assert_eq(
     spellings,
-    spellings.map(|_: Result<MediaType, Refusal>| parse("text/html;charset=UTF-8")),
+    spellings.map(|_: Result<MediaType, Error>| parse("text/html;charset=UTF-8")),
   );
   assert_eq(parse("text/plain; a=1; b=2"), parse("TEXT/Plain; B=2; A=1"));
   assert(parse("text/plain; a=1") != parse("text/plain; a=2"));
@@ -1283,9 +1293,9 @@ test "lists {show(c.text)}" for c: Listed in accepted() {
 }
 
 test "a list is refused where an element is no media type" {
-  assert_eq(parse_list("text/html text/plain"), Err({ at: 10, why: Trailing }));
-  assert_eq(parse_list("text/html, plain"), Err({ at: 16, why: NoSlash }));
-  assert_eq(parse_list("text/html; a=\"x, text/plain"), Err({ at: 27, why: Unclosed }))
+  assert_eq(parse_list("text/html text/plain"), Err({ at: 10, reason: Trailing }));
+  assert_eq(parse_list("text/html, plain"), Err({ at: 16, reason: NoSlash }));
+  assert_eq(parse_list("text/html; a=\"x, text/plain"), Err({ at: 27, reason: Unclosed }))
 }
 
 test "the literal's check answers the media type, or the character the text stops being one at" {
@@ -1317,7 +1327,7 @@ fn quoted_text(text: String) -> String =
 
 /// A media type of a seed, through the makers: its names the seed's token characters, and its
 /// parameter's value what of the seed's a quoted string holds.
-fn made(s: Seed) -> MediaType =
+fn seed_media_type(s: Seed) -> MediaType =
   match media_type(tokenized(s.top), tokenized(s.subtype)) {
     Some(m) -> match with_param(m, tokenized(s.name), quoted_text(s.value)) {
       Some(set) -> set,
@@ -1326,7 +1336,7 @@ fn made(s: Seed) -> MediaType =
     None -> MediaType("x", "x", []),
   }
 
-/// The media type `made` makes of a seed, as the constructor holds it with its names in upper
+/// The media type `seed_media_type` makes of a seed, as the constructor holds it with its names in upper
 /// case.
 fn shouted(s: Seed) -> MediaType =
   MediaType(tokenized(s.top).ascii_upper(), tokenized(s.subtype).ascii_upper(), [
@@ -1345,11 +1355,12 @@ fn seeds() -> gen::Gen<Seed> =
   )
 
 test "a media type's canonical text reads back as it" {
-  gen::check(seeds(), |x: Seed| agrees(|s: Seed| parse(render(made(s))), |s: Seed| Ok(made(s)), x))
+  gen::check(seeds(), |x: Seed|
+    agrees(|s: Seed| parse(render(seed_media_type(s))), |s: Seed| Ok(seed_media_type(s)), x))
 }
 
 test "a media type is equal however its names are cased" {
-  gen::check(seeds(), |x: Seed| agrees(shouted, made, x))
+  gen::check(seeds(), |x: Seed| agrees(shouted, seed_media_type, x))
 }
 
 type Named = { ext: String, named: String }

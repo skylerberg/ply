@@ -9,7 +9,7 @@ import std.date
 import std.float
 import std.json
 import std.json (Json)
-import std.place
+import std.location
 import std.string
 import std.toml
 import std.toml (Limits, Toml)
@@ -39,10 +39,10 @@ fn documents() -> List<File> = files().filter(|f: File| f.name.ends_with(".toml"
 
 /// What is wrong with how the reader took `text`, if anything: a failure of its own answered as
 /// a refusal, a refusal placed outside the text, or a value that does not write back.
-fn mistaken(text: Bytes) -> Option<String> =
+fn reader_problem(text: Bytes) -> Option<String> =
   match toml::parse(text, limits()) {
-    Err(e) -> match e.why {
-      toml::Defect(said) -> Some(said),
+    Err(e) -> match e.reason {
+      toml::InternalError(said) -> Some(said),
       _ -> if e.line < 1 || e.column < 1 || e.offset < 0 || e.offset > text.len() {
         Some("a refusal placed outside the text")
       } else { None },
@@ -53,17 +53,17 @@ fn mistaken(text: Bytes) -> Option<String> =
 
 /// The value the suite's JSON says a document means: an object of a `type` and a `value`, both
 /// strings, is a value of that type, and any other object is a table.
-fn meant(j: Json) -> Toml / {abort.raise} =
+fn expected_toml(j: Json) -> Toml / {abort.raise} =
   match j {
     json::Object(members) -> match tagged(members) {
       Some(value) -> value,
       None ->
         toml::Table(
           members.entries().map(|m: { key: String, value: Json }|
-            { key: m.key, value: meant(m.value) }),
+            { key: m.key, value: expected_toml(m.value) }),
         ),
     },
-    json::Array(items) -> toml::Array(items.map(meant)),
+    json::Array(items) -> toml::Array(items.map(expected_toml)),
     _ -> panic("the suite's JSON is objects, arrays and tagged strings"),
   }
 
@@ -78,7 +78,7 @@ fn tagged(members: Map<String, Json>) -> Option<Toml> / {abort.raise} =
     }
   }
 
-fn held<a, e>(read: Result<a, e>, text: String) -> a / {abort.raise} =
+fn expect_ok<a, e>(read: Result<a, e>, text: String) -> a / {abort.raise} =
   match read { Ok(v) -> v, Err(_) -> panic("the suite's JSON holds " ++ text) }
 
 fn scalar(kind: String, text: String) -> Toml / {abort.raise} =
@@ -97,16 +97,16 @@ fn scalar(kind: String, text: String) -> Toml / {abort.raise} =
       }
     })
   } else if kind == "bool" { toml::Boolean(text == "true") }
-  else if kind == "datetime" { toml::OffsetDateTime(held(date::rfc3339_literal(text), text)) }
+  else if kind == "datetime" { toml::OffsetDateTime(expect_ok(date::rfc3339_literal(text), text)) }
   else if kind == "datetime-local" {
-    toml::LocalDateTime(held(date::date_time_literal(text), text))
-  } else if kind == "date-local" { toml::LocalDate(held(date::literal(text), text)) }
-  else if kind == "time-local" { toml::LocalTime(held(date::time_literal(text), text)) }
+    toml::LocalDateTime(expect_ok(date::date_time_literal(text), text))
+  } else if kind == "date-local" { toml::LocalDate(expect_ok(date::literal(text), text)) }
+  else if kind == "time-local" { toml::LocalTime(expect_ok(date::time_literal(text), text)) }
   else { panic("the suite's JSON has no type " ++ kind) }
 
 test "{c.name} means what the suite says" for c: Valid in valid() {
   let wanted = match json::parse(c.json) {
-    Ok(j) -> meant(j),
+    Ok(j) -> expected_toml(j),
     Err(e) -> panic(json::error_to_string(e)),
   };
   assert_eq(toml::parse(c.toml, limits()), Ok(wanted))
@@ -122,7 +122,7 @@ test "{c.name} cut short is read, or refused for a reason" for c: File in docume
   let stride = n / 256 + 1;
   assert_eq(
     range(0, n / stride + 1).fold([], |faults: List<String>, k: Int|
-      match mistaken(c.bytes.slice(0, k * stride)) {
+      match reader_problem(c.bytes.slice(0, k * stride)) {
         Some(said) -> faults.push(f"cut at {k * stride}: {said}"),
         None -> faults,
       }),
@@ -139,14 +139,14 @@ test "{c.name} reads back from what is written of it" for c: Valid in valid() {
 }
 
 test "{c.name} keeps its bytes as a document, and a key set in it" for c: Valid in valid() {
-  let path = [place::Key("a key no case holds")];
+  let path = [location::Key("a key no case holds")];
   match toml::parse_document(c.toml, limits()) {
-    Err(e) -> panic(toml::refusal_to_string(e)),
+    Err(e) -> panic(toml::error_message(e)),
     Ok(d) -> {
       assert_eq(toml::source(d), c.toml);
       assert_eq(Ok(toml::value(d)), toml::parse(c.toml, limits()));
       match try { toml::set(d, path, toml::Integer(7)) } {
-        Err(e) -> panic(toml::refusal_to_string(e)),
+        Err(e) -> panic(toml::error_message(e)),
         Ok(added) -> {
           assert_eq(toml::at(toml::value(added), path), Some(toml::Integer(7)));
           assert_eq(try { toml::value(toml::remove(added, path)) }, Ok(toml::value(d)))

@@ -43,10 +43,10 @@ pub type Hunk<a> = new { old_at: Int, new_at: Int, edits: List<Edit<a>> }
 /// `Differs` carries the index of the first element that is not the one the hunk kept or deleted
 /// there, `Overlaps` is a hunk that starts before the one before it ended, or before the list
 /// does, and `PastEnd` one that reaches past the list's end.
-pub type Unfit = | Differs(Int) | Overlaps | PastEnd
+pub type HunkMismatch = | Differs(Int) | Overlaps | PastEnd
 
 /// The hunk that was refused, by its index, and why.
-pub type Refusal = new { hunk: Int, why: Unfit }
+pub type Error = new { hunk: Int, reason: HunkMismatch }
 
 /// Why a text is not a unified diff.
 ///
@@ -57,14 +57,14 @@ pub type Refusal = new { hunk: Int, why: Unfit }
 pub type Fault = | Unexpected | BadRange | Miscounted | Unended | Unsupported(String)
 
 /// A fault, and the index of the line it was found at among `lines` of the text.
-pub type Malformed = new { at: Int, why: Fault }
+pub type ParseError = new { at: Int, reason: Fault }
 
 /// What this module raises where it refuses.
 pub effect diff {
   /// A hunk does not go onto the list it is applied to.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// A text is not a unified diff this module reads.
-  raise malformed(e: Malformed)
+  raise malformed(e: ParseError)
 }
 
 // --- Scripts ----------------------------------------------------------------
@@ -77,7 +77,7 @@ pub effect diff {
 /// than the shortest; within a limit of the two lengths together it never is.
 pub fn diff<a>(a: List<a>, b: List<a>, limit: Int = 256) -> List<Edit<a>>
   where derivable(eq, a)
-= tidy(written(a, b, spans(a, b, limit)))
+= tidy(edits_of_spans(a, b, spans(a, b, limit)))
 
 /// The list a script was made from: what it keeps and deletes.
 pub fn before<a>(script: List<Edit<a>>) -> List<a> =
@@ -103,47 +103,47 @@ fn sizes<a>(script: List<Edit<a>>) -> { old: Int, new: Int } =
       Insert(xs) -> { old: n.old, new: n.new + xs.len() },
     })
 
-type Tidying<a> = { keep: List<a>, gone: List<a>, come: List<a>, out: List<Edit<a>> }
+type TidyState<a> = { keep: List<a>, gone: List<a>, come: List<a>, out: List<Edit<a>> }
 
 /// A script's runs in the form `diff` answers.
 fn tidy<a>(script: List<Edit<a>>) -> List<Edit<a>> =
-  keep_out(
-    change_out(
-      script.fold({ keep: [], gone: [], come: [], out: [] }, |t: Tidying<a>, e: Edit<a>|
+  flush_keep(
+    flush_change(
+      script.fold({ keep: [], gone: [], come: [], out: [] }, |t: TidyState<a>, e: Edit<a>|
         match e {
           Keep(xs) -> if xs.len() == 0 { t } else {
-            let { keep, gone, come, out } = change_out(t);
-            { keep: joined(keep, xs), gone: gone, come: come, out: out }
+            let { keep, gone: removed_entry, come: added_entry, out } = flush_change(t);
+            { keep: joined(keep, xs), gone: removed_entry, come: added_entry, out: out }
           },
           Delete(xs) -> if xs.len() == 0 { t } else {
-            let { keep, gone, come, out } = keep_out(t);
-            { keep: keep, gone: joined(gone, xs), come: come, out: out }
+            let { keep, gone: removed_entry, come: added_entry, out } = flush_keep(t);
+            { keep: keep, gone: joined(removed_entry, xs), come: added_entry, out: out }
           },
           Insert(xs) -> if xs.len() == 0 { t } else {
-            let { keep, gone, come, out } = keep_out(t);
-            { keep: keep, gone: gone, come: joined(come, xs), out: out }
+            let { keep, gone: removed_entry, come: added_entry, out } = flush_keep(t);
+            { keep: keep, gone: removed_entry, come: joined(added_entry, xs), out: out }
           },
         }),
     ),
   ).out
 
-fn change_out<a>(t: Tidying<a>) -> Tidying<a> = {
-  let { keep, gone, come, out } = t;
-  let cut = if gone.len() == 0 { out } else { out.push(Delete(gone)) };
+fn flush_change<a>(t: TidyState<a>) -> TidyState<a> = {
+  let { keep, gone: removed_entry, come: added_entry, out } = t;
+  let cut = if removed_entry.len() == 0 { out } else { out.push(Delete(removed_entry)) };
   {
     keep: keep,
     gone: [],
     come: [],
-    out: if come.len() == 0 { cut } else { cut.push(Insert(come)) },
+    out: if added_entry.len() == 0 { cut } else { cut.push(Insert(added_entry)) },
   }
 }
 
-fn keep_out<a>(t: Tidying<a>) -> Tidying<a> = {
-  let { keep, gone, come, out } = t;
+fn flush_keep<a>(t: TidyState<a>) -> TidyState<a> = {
+  let { keep, gone: removed_entry, come: added_entry, out } = t;
   {
     keep: [],
-    gone: gone,
-    come: come,
+    gone: removed_entry,
+    come: added_entry,
     out: if keep.len() == 0 { out } else { out.push(Keep(keep)) },
   }
 }
@@ -158,7 +158,7 @@ fn slice<a>(xs: List<a>, from: Int, n: Int) -> List<a> =
 
 // --- Hunks ------------------------------------------------------------------
 
-type Cutting<a> = {
+type HunkState<a> = {
   i: Int,
   j: Int,
   gap: List<a>,
@@ -175,27 +175,33 @@ pub fn hunks<a>(script: List<Edit<a>>, context: Int) -> List<Hunk<a>> = {
   let around = if context > 0 { context } else { 0 };
   let { i: _, j: _, gap, open, old_at, new_at, done } = tidy(script).fold(
     { i: 0, j: 0, gap: [], open: [], old_at: 0, new_at: 0, done: [] },
-    |c: Cutting<a>, e: Edit<a>|
+    |c: HunkState<a>, e: Edit<a>|
       match e {
         Keep(xs) -> { ..c, i: c.i + xs.len(), j: c.j + xs.len(), gap: xs },
-        Delete(xs) -> changed(c, e, around, xs.len(), 0),
-        Insert(xs) -> changed(c, e, around, 0, xs.len()),
+        Delete(xs) -> add_change(c, e, around, xs.len(), 0),
+        Insert(xs) -> add_change(c, e, around, 0, xs.len()),
       },
   );
   if open.len() == 0 { done }
-  else { done.push({ old_at: old_at, new_at: new_at, edits: with_kept(open, gap.take(around)) }) }
+  else { done.push({ old_at: old_at, new_at: new_at, edits: with_keep(open, gap.take(around)) }) }
 }
 
 /// The cutting once the change `e`, of `gone` old and `come` new elements, is in a hunk: the open
 /// one where the kept run since its last change is no longer than both contexts, else a new one.
-fn changed<a>(c: Cutting<a>, e: Edit<a>, around: Int, gone: Int, come: Int) -> Cutting<a> = {
+fn add_change<a>(
+  c: HunkState<a>,
+  e: Edit<a>,
+  around: Int,
+  removed_entry: Int,
+  added_entry: Int,
+) -> HunkState<a> = {
   let { i, j, gap, open, old_at, new_at, done } = c;
   if open.len() > 0 && gap.len() - around <= around {
     {
-      i: i + gone,
-      j: j + come,
+      i: i + removed_entry,
+      j: j + added_entry,
       gap: [],
-      open: with_kept(open, gap).push(e),
+      open: with_keep(open, gap).push(e),
       old_at: old_at,
       new_at: new_at,
       done: done,
@@ -203,38 +209,38 @@ fn changed<a>(c: Cutting<a>, e: Edit<a>, around: Int, gone: Int, come: Int) -> C
   } else {
     let lead = gap.drop(gap.len() - around);
     {
-      i: i + gone,
-      j: j + come,
+      i: i + removed_entry,
+      j: j + added_entry,
       gap: [],
-      open: with_kept([], lead).push(e),
+      open: with_keep([], lead).push(e),
       old_at: i - lead.len(),
       new_at: j - lead.len(),
       done: if open.len() == 0 { done } else {
-        done.push({ old_at: old_at, new_at: new_at, edits: with_kept(open, gap.take(around)) })
+        done.push({ old_at: old_at, new_at: new_at, edits: with_keep(open, gap.take(around)) })
       },
     }
   }
 }
 
-fn with_kept<a>(edits: List<Edit<a>>, kept: List<a>) -> List<Edit<a>> =
+fn with_keep<a>(edits: List<Edit<a>>, kept: List<a>) -> List<Edit<a>> =
   if kept.len() == 0 { edits } else { edits.push(Keep(kept)) }
 
 // --- Applying ---------------------------------------------------------------
 
 /// A list with hunks applied, and the index each hunk went on at.
-pub type Landed<a> = new { result: List<a>, at: List<Int> }
+pub type ApplyResult<a> = new { result: List<a>, at: List<Int> }
 
-type Applying<a> = { hunk: Int, from: Int, drift: Int, out: List<a>, at: List<Int> }
+type ApplyState<a> = { hunk: Int, from: Int, drift: Int, out: List<a>, at: List<Int> }
 
 /// `to` with each hunk's deletions taken out and its insertions put in, each hunk exactly where it
 /// says it starts. Raises `diff.refused` for the first hunk whose kept and deleted elements are
 /// not the ones `to` holds there.
-pub fn apply<a>(hunks: List<Hunk<a>>, to: List<a>) -> List<a> / {diff.refused}
+pub fn apply<a>(hunks: List<Hunk<a>>, to: List<a>) -> List<a> / {diff.fail}
   where derivable(eq, a)
 = apply_near(hunks, to, 0).result
 
 /// `apply`, answering a refusal as an `Err`.
-pub fn try_apply<a>(hunks: List<Hunk<a>>, to: List<a>) -> Result<List<a>, Refusal>
+pub fn try_apply<a>(hunks: List<Hunk<a>>, to: List<a>) -> Result<List<a>, Error>
   where derivable(eq, a)
 = try { apply(hunks, to) }
 
@@ -244,17 +250,17 @@ pub fn try_apply<a>(hunks: List<Hunk<a>>, to: List<a>) -> Result<List<a>, Refusa
 /// then at the nearest places to that, a later one before an earlier one as near, never before the
 /// end of the hunk before it. A hunk with nothing kept or deleted fits anywhere, so it lands on
 /// its first try. A refusal says why the hunk does not fit at that first try.
-pub fn apply_near<a>(hunks: List<Hunk<a>>, to: List<a>, reach: Int) -> Landed<a> / {diff.refused}
+pub fn apply_near<a>(hunks: List<Hunk<a>>, to: List<a>, reach: Int) -> ApplyResult<a> / {diff.fail}
   where derivable(eq, a)
 = {
   let far = if reach > 0 { reach } else { 0 };
   let { hunk: _, from, drift: _, out, at } = hunks.fold(
     { hunk: 0, from: 0, drift: 0, out: [], at: [] },
-    |s: Applying<a>, h: Hunk<a>| {
+    |s: ApplyState<a>, h: Hunk<a>| {
       let { hunk, from, drift, out, at } = s;
       let want = before(h.edits);
-      match placed(want, to, checked_add(h.old_at, drift), from, far) {
-        Err(why) -> diff.refused({ hunk: hunk, why: why }),
+      match find_position(want, to, checked_add(h.old_at, drift), from, far) {
+        Err(why) -> diff.fail({ hunk: hunk, reason: why }),
         Ok(p) ->
           {
             hunk: hunk + 1,
@@ -271,13 +277,13 @@ pub fn apply_near<a>(hunks: List<Hunk<a>>, to: List<a>, reach: Int) -> Landed<a>
 
 /// Where `want` goes on `to`, from `floor` on and within `reach` of `guess`, or why it does not go
 /// on at `guess`, which is `None` where no `Int` holds it.
-fn placed<a>(
+fn find_position<a>(
   want: List<a>,
   to: List<a>,
   guess: Option<Int>,
   floor: Int,
   reach: Int,
-) -> Result<Int, Unfit>
+) -> Result<Int, HunkMismatch>
   where derivable(eq, a)
 = {
   let last = to.len() - want.len();
@@ -286,11 +292,11 @@ fn placed<a>(
     Some(g) -> {
       let up = if g < floor { floor } else { g };
       let down = if g > last { last } else if g <= floor { floor - 1 } else { g - 1 };
-      let p = landing(want, to, g, reach, floor, last, up, down);
+      let p = nearest_match(want, to, g, reach, floor, last, up, down);
       if p >= 0 { Ok(p) }
       else if g < floor { Err(Overlaps) }
       else if g > last { Err(PastEnd) }
-      else { Err(Differs(miss(want, to, g, 0))) }
+      else { Err(Differs(first_mismatch(want, to, g, 0))) }
     },
   }
 }
@@ -298,7 +304,7 @@ fn placed<a>(
 /// The place nearest `guess` where `to` holds `want`, among those from `floor` up to `last` and
 /// within `reach` of `guess`, or -1. `up` and `down` are the next places to try at or after `guess`
 /// and before it.
-fn landing<a>(
+fn nearest_match<a>(
   want: List<a>,
   to: List<a>,
   guess: Int,
@@ -312,11 +318,11 @@ fn landing<a>(
 =
   if up <= last && apart(up, guess) <= reach
       && (down < floor || apart(up, guess) <= apart(guess, down)) {
-    if miss(want, to, up, 0) < 0 { up }
-    else { landing(want, to, guess, reach, floor, last, up + 1, down) }
+    if first_mismatch(want, to, up, 0) < 0 { up }
+    else { nearest_match(want, to, guess, reach, floor, last, up + 1, down) }
   } else if down >= floor && apart(guess, down) <= reach {
-    if miss(want, to, down, 0) < 0 { down }
-    else { landing(want, to, guess, reach, floor, last, up, down - 1) }
+    if first_mismatch(want, to, down, 0) < 0 { down }
+    else { nearest_match(want, to, guess, reach, floor, last, up, down - 1) }
   } else { 0 - 1 }
 
 /// How far apart two indexes are, as far as an `Int` counts.
@@ -327,11 +333,11 @@ fn apart(x: Int, y: Int) -> Int =
   }
 
 /// The index in `to` of the first element from `at` on that is not `want`'s, or -1.
-fn miss<a>(want: List<a>, to: List<a>, at: Int, k: Int) -> Int
+fn first_mismatch<a>(want: List<a>, to: List<a>, at: Int, k: Int) -> Int
   where derivable(eq, a)
 =
   if k >= want.len() { 0 - 1 }
-  else if want.at(k) == to.at(at + k) { miss(want, to, at, k + 1) }
+  else if want.at(k) == to.at(at + k) { first_mismatch(want, to, at, k + 1) }
   else { at + k }
 
 /// The hunks that undo these: applied to the list these make, they answer the list these were
@@ -350,9 +356,9 @@ pub fn reverse<a>(hunks: List<Hunk<a>>) -> List<Hunk<a>> =
 // --- Merging ----------------------------------------------------------------
 
 /// One stretch of a three-way merge.
-pub type Merged<a> =
+pub type MergeChunk<a> =
   /// Elements the merge settled: unchanged, changed on one side, or changed alike on both.
-  | Settled(List<a>)
+  | Resolved(List<a>)
   /// A stretch each side changed its own way.
   | Conflict(Sides<a>)
 
@@ -362,12 +368,12 @@ pub type Sides<a> = new { base: List<a>, ours: List<a>, theirs: List<a> }
 /// A stretch of the base one side replaced: where, how many elements, and with what.
 type Swap<a> = { at: Int, gone: Int, come: List<a>, ours: Bool }
 
-type Swapping<a> = { i: Int, held: Option<Swap<a>>, out: List<Swap<a>> }
+type SwapState<a> = { i: Int, held: Option<Swap<a>>, out: List<Swap<a>> }
 
-type Merging<a> = {
+type MergeState<a> = {
   pos: Int,
-  calm: List<a>,
-  out: List<Merged<a>>,
+  clean: List<a>,
+  out: List<MergeChunk<a>>,
   open: Bool,
   lo: Int,
   hi: Int,
@@ -378,23 +384,28 @@ type Merging<a> = {
 /// `ours` and `theirs`, two lists made from `base`, as one. A stretch only one side changed is that
 /// side's, and one both changed alike is that change. Changes that overlap or touch in `base` and
 /// differ are a `Conflict`, holding all of both. `limit` is `diff`'s.
-pub fn merge<a>(base: List<a>, ours: List<a>, theirs: List<a>, limit: Int = 256) -> List<Merged<a>>
+pub fn merge<a>(
+  base: List<a>,
+  ours: List<a>,
+  theirs: List<a>,
+  limit: Int = 256,
+) -> List<MergeChunk<a>>
   where derivable(eq, a)
 = {
   let all = swaps(diff(base, ours, limit), true).concat(
     swaps(diff(base, theirs, limit), false),
   ).sort_by(|x: Swap<a>, y: Swap<a>| x.at <= y.at);
-  let { pos, calm, out, open: _, lo: _, hi: _, mine: _, yours: _ } = group_out(
+  let { pos, clean: calm, out, open: _, lo: _, hi: _, mine: _, yours: _ } = flush_group(
     base,
     all.fold(
-      { pos: 0, calm: [], out: [], open: false, lo: 0, hi: 0, mine: [], yours: [] },
-      |g: Merging<a>, s: Swap<a>| {
-        let { pos, calm, out, open, lo, hi, mine, yours } = if g.open && s.at <= g.hi { g }
-        else { group_out(base, g) };
+      { pos: 0, clean: [], out: [], open: false, lo: 0, hi: 0, mine: [], yours: [] },
+      |g: MergeState<a>, s: Swap<a>| {
+        let { pos, clean: calm, out, open, lo, hi, mine, yours } = if g.open && s.at <= g.hi { g }
+        else { flush_group(base, g) };
         let end = s.at + s.gone;
         {
           pos: pos,
-          calm: calm,
+          clean: calm,
           out: out,
           open: true,
           lo: if open { lo } else { s.at },
@@ -406,23 +417,23 @@ pub fn merge<a>(base: List<a>, ours: List<a>, theirs: List<a>, limit: Int = 256)
     ),
   );
   let rest = joined(calm, slice(base, pos, base.len() - pos));
-  if rest.len() == 0 { out } else { out.push(Settled(rest)) }
+  if rest.len() == 0 { out } else { out.push(Resolved(rest)) }
 }
 
 /// The merge with its open group, the changes from `lo` up to `hi` of `base` that touch, written:
 /// as either side's where they agree or only one changed it, else as a conflict.
-fn group_out<a>(base: List<a>, g: Merging<a>) -> Merging<a>
+fn flush_group<a>(base: List<a>, g: MergeState<a>) -> MergeState<a>
   where derivable(eq, a)
 =
   if !g.open { g } else {
-    let { pos, calm, out, open: _, lo, hi, mine, yours } = g;
+    let { pos, clean: calm, out, open: _, lo, hi, mine, yours } = g;
     let led = joined(calm, slice(base, pos, lo - pos));
     let ours = side(base, lo, hi, mine);
     let theirs = side(base, lo, hi, yours);
-    let clear = { pos: hi, calm: [], out: out, open: false, lo: 0, hi: 0, mine: [], yours: [] };
-    if yours.len() == 0 || ours == theirs { { ..clear, calm: joined(led, ours) } }
-    else if mine.len() == 0 { { ..clear, calm: joined(led, theirs) } } else {
-      let settled = if led.len() == 0 { out } else { out.push(Settled(led)) };
+    let clear = { pos: hi, clean: [], out: out, open: false, lo: 0, hi: 0, mine: [], yours: [] };
+    if yours.len() == 0 || ours == theirs { { ..clear, clean: joined(led, ours) } }
+    else if mine.len() == 0 { { ..clear, clean: joined(led, theirs) } } else {
+      let settled = if led.len() == 0 { out } else { out.push(Resolved(led)) };
       {
         ..clear,
         out: settled.push(Conflict({ base: slice(base, lo, hi - lo), ours: ours, theirs: theirs })),
@@ -443,15 +454,15 @@ fn side<a>(base: List<a>, lo: Int, hi: Int, swaps: List<Swap<a>>) -> List<a> = {
 fn swaps<a>(script: List<Edit<a>>, ours: Bool) -> List<Swap<a>> = {
   let { i: _, held, out } = tidy(script).fold(
     { i: 0, held: None, out: [] },
-    |s: Swapping<a>, e: Edit<a>| {
+    |s: SwapState<a>, e: Edit<a>| {
       let { i, held, out } = s;
       match e {
-        Keep(xs) -> { i: i + xs.len(), held: None, out: with_held(out, held) },
+        Keep(xs) -> { i: i + xs.len(), held: None, out: with_pending(out, held) },
         Delete(xs) ->
           {
             i: i + xs.len(),
             held: Some({ at: i, gone: xs.len(), come: [], ours: ours }),
-            out: with_held(out, held),
+            out: with_pending(out, held),
           },
         Insert(xs) -> match held {
           Some(w) -> { i: i, held: Some({ ..w, come: joined(w.come, xs) }), out: out },
@@ -460,18 +471,18 @@ fn swaps<a>(script: List<Edit<a>>, ours: Bool) -> List<Swap<a>> = {
       }
     },
   );
-  with_held(out, held)
+  with_pending(out, held)
 }
 
-fn with_held<a>(out: List<Swap<a>>, held: Option<Swap<a>>) -> List<Swap<a>> =
+fn with_pending<a>(out: List<Swap<a>>, held: Option<Swap<a>>) -> List<Swap<a>> =
   match held { Some(w) -> out.push(w), None -> out }
 
 /// The merged list, or `None` where a conflict is left.
-pub fn resolved<a>(merged: List<Merged<a>>) -> Option<List<a>> =
-  merged.fold(Some([]), |acc: Option<List<a>>, m: Merged<a>|
+pub fn resolved<a>(merged: List<MergeChunk<a>>) -> Option<List<a>> =
+  merged.fold(Some([]), |acc: Option<List<a>>, m: MergeChunk<a>|
     match acc {
       None -> None,
-      Some(xs) -> match m { Settled(ys) -> Some(joined(xs, ys)), Conflict(_) -> None },
+      Some(xs) -> match m { Resolved(ys) -> Some(joined(xs, ys)), Conflict(_) -> None },
     })
 
 // --- Text -------------------------------------------------------------------
@@ -498,7 +509,7 @@ pub fn text_of(lines: List<String>) -> String =
 type Numbering = { seen: Map<String, Int>, names: List<String>, ids: List<Int> }
 
 /// `ls` as numbers, a line the numbering has seen under the number it was given then.
-fn numbered(ls: List<String>, known: Numbering) -> Numbering =
+fn number_lines(ls: List<String>, known: Numbering) -> Numbering =
   ls.fold({ seen: known.seen, names: known.names, ids: [] }, |n: Numbering, l: String| {
     let { seen, names, ids } = n;
     match seen.get(l) {
@@ -510,25 +521,25 @@ fn numbered(ls: List<String>, known: Numbering) -> Numbering =
     }
   })
 
-fn unnumbered() -> Numbering = { seen: Map::new(), names: [], ids: [] }
+fn empty_numbering() -> Numbering = { seen: Map::new(), names: [], ids: [] }
 
-fn named(ids: List<Int>, names: List<String>) -> List<String> =
+fn lines_of_ids(ids: List<Int>, names: List<String>) -> List<String> =
   ids.map(|id: Int| names.at_or(id, ""))
 
 /// `diff` over the lines of two texts.
 pub fn diff_lines(a: String, b: String, limit: Int = 256) -> List<Edit<String>> = {
-  let old = numbered(lines(a), unnumbered());
-  let new = numbered(lines(b), old);
+  let old = number_lines(lines(a), empty_numbering());
+  let new = number_lines(lines(b), old);
   diff(old.ids, new.ids, limit).map(|e: Edit<Int>|
     match e {
-      Keep(ids) -> Keep(named(ids, new.names)),
-      Delete(ids) -> Delete(named(ids, new.names)),
-      Insert(ids) -> Insert(named(ids, new.names)),
+      Keep(ids) -> Keep(lines_of_ids(ids, new.names)),
+      Delete(ids) -> Delete(lines_of_ids(ids, new.names)),
+      Insert(ids) -> Insert(lines_of_ids(ids, new.names)),
     })
 }
 
 /// `text` with the hunks applied to its lines.
-pub fn patch(text: String, hunks: List<Hunk<String>>) -> String / {diff.refused} =
+pub fn patch(text: String, hunks: List<Hunk<String>>) -> String / {diff.fail} =
   text_of(apply(hunks, lines(text)))
 
 /// One file's part of a unified diff.
@@ -584,7 +595,7 @@ type Body = {
   last: Option<Line>,
 }
 
-type Reading = {
+type ParseState = {
   at: Int,
   files: List<FileDiff>,
   old: Option<String>,
@@ -603,84 +614,89 @@ pub fn parse(text: String) -> List<FileDiff> / {diff.malformed} =
 
   // Every slice is inside its line, so the clause never answers.
   handle {
-    let ended = if text == "" || text.ends_with("\n") { text } else { text ++ "\n" };
-    file_out(lines(ended).fold({ at: 0, files: [], old: None, file: None, hunk: None }, read)).files
+    let concat_with_newline = if text == "" || text.ends_with("\n") { text } else { text ++ "\n" };
+    flush_file(
+      lines(concat_with_newline).fold(
+        { at: 0, files: [], old: None, file: None, hunk: None },
+        parse_line,
+      ),
+    ).files
   } with {
-    abort.raise(_) -> diff.malformed({ at: 0, why: Unexpected }),
+    abort.raise(_) -> diff.malformed({ at: 0, reason: Unexpected }),
   }
 
 /// `parse`, answering a refusal as an `Err`.
-pub fn try_parse(text: String) -> Result<List<FileDiff>, Malformed> = try { parse(text) }
+pub fn try_parse(text: String) -> Result<List<FileDiff>, ParseError> = try { parse(text) }
 
 /// The reading one line on: a line of the open hunk's body while its counts ask for more, a `\`
 /// line just after them, and any other line as one outside a hunk.
-fn read(r: Reading, line: String) -> Reading / {diff.malformed, abort.raise} = {
+fn parse_line(r: ParseState, line: String) -> ParseState / {diff.malformed, abort.raise} = {
   let { at, files, old, file, hunk } = r;
   let rest = { at: at + 1, files: files, old: old, file: file, hunk: None };
   match hunk {
     Some(body) -> if body.old_left > 0 || body.new_left > 0 {
       { ..rest, hunk: Some(in_body(at, body, line)) }
-    } else if line.starts_with("\\") { { ..rest, hunk: Some(unended(at, body)) } }
-    else { passed(outside(hunk_out({ ..rest, at: at, hunk: Some(body) }), line)) },
-    None -> passed(outside({ ..rest, at: at }, line)),
+    } else if line.starts_with("\\") { { ..rest, hunk: Some(strip_last_newline(at, body)) } }
+    else { advance(outside(flush_hunk({ ..rest, at: at, hunk: Some(body) }), line)) },
+    None -> advance(outside({ ..rest, at: at }, line)),
   }
 }
 
-fn passed(r: Reading) -> Reading = { ..r, at: r.at + 1 }
+fn advance(r: ParseState) -> ParseState = { ..r, at: r.at + 1 }
 
 fn in_body(at: Int, body: Body, line: String) -> Body / {diff.malformed, abort.raise} =
-  if line.starts_with(" ") { taken(at, body, 0, rest(line)) }
-  else if line.starts_with("-") { taken(at, body, 0 - 1, rest(line)) }
-  else if line.starts_with("+") { taken(at, body, 1, rest(line)) }
-  else if line.starts_with("\\") { unended(at, body) }
-  else if line == "\n" { taken(at, body, 0, line) }
-  else { diff.malformed({ at: at, why: Miscounted }) }
+  if line.starts_with(" ") { add_body_line(at, body, 0, rest(line)) }
+  else if line.starts_with("-") { add_body_line(at, body, 0 - 1, rest(line)) }
+  else if line.starts_with("+") { add_body_line(at, body, 1, rest(line)) }
+  else if line.starts_with("\\") { strip_last_newline(at, body) }
+  else if line == "\n" { add_body_line(at, body, 0, line) }
+  else { diff.malformed({ at: at, reason: Miscounted }) }
 
 fn rest(line: String) -> String / {abort.raise} = line.slice(1, line.len())
 
-fn taken(at: Int, body: Body, side: Int, text: String) -> Body / {diff.malformed} = {
+fn add_body_line(at: Int, body: Body, side: Int, text: String) -> Body / {diff.malformed} = {
   let old = if side <= 0 { 1 } else { 0 };
   let new = if side >= 0 { 1 } else { 0 };
-  let { old_at, new_at, old_left, new_left, read, last } = body;
-  if old_left < old || new_left < new { diff.malformed({ at: at, why: Miscounted }) } else {
+  let { old_at, new_at, old_left, new_left, read: parse_line, last } = body;
+  if old_left < old || new_left < new { diff.malformed({ at: at, reason: Miscounted }) } else {
     {
       old_at: old_at,
       new_at: new_at,
       old_left: old_left - old,
       new_left: new_left - new,
-      read: with_last(read, last),
+      read: with_last(parse_line, last),
       last: Some({ side: side, text: text }),
     }
   }
 }
 
-fn with_last(read: List<Line>, last: Option<Line>) -> List<Line> =
-  match last { Some(l) -> read.push(l), None -> read }
+fn with_last(parse_line: List<Line>, last: Option<Line>) -> List<Line> =
+  match last { Some(l) -> parse_line.push(l), None -> parse_line }
 
-fn unended(at: Int, body: Body) -> Body / {diff.malformed, abort.raise} =
+fn strip_last_newline(at: Int, body: Body) -> Body / {diff.malformed, abort.raise} =
   match body.last {
     Some(l) -> if l.text.ends_with("\n") {
       { ..body, last: Some({ ..l, text: l.text.slice(0, l.text.len() - 1) }) }
-    } else { diff.malformed({ at: at, why: Unended }) },
-    None -> diff.malformed({ at: at, why: Unended }),
+    } else { diff.malformed({ at: at, reason: Unended }) },
+    None -> diff.malformed({ at: at, reason: Unended }),
   }
 
 /// A line that is no part of a hunk's body.
-fn outside(r: Reading, line: String) -> Reading / {diff.malformed, abort.raise} =
+fn outside(r: ParseState, line: String) -> ParseState / {diff.malformed, abort.raise} =
   match r.old {
     Some(old) -> if line.starts_with("+++ ") {
       { ..r, old: None, file: Some({ old: old, new: label(line), hunks: [] }) }
-    } else { diff.malformed({ at: r.at, why: Unexpected }) },
+    } else { diff.malformed({ at: r.at, reason: Unexpected }) },
     None -> if line.starts_with("@@ -") {
       match r.file {
         Some(_) -> { ..r, hunk: Some(header(r.at, line)) },
-        None -> diff.malformed({ at: r.at, why: Unexpected }),
+        None -> diff.malformed({ at: r.at, reason: Unexpected }),
       }
-    } else if line.starts_with("--- ") { { ..file_out(r), old: Some(label(line)) } }
-    else if passed_over(line) { file_out(r) } else {
+    } else if line.starts_with("--- ") { { ..flush_file(r), old: Some(label(line)) } }
+    else if is_ignored_line(line) { flush_file(r) } else {
       match extension(line) {
-        Some(name) -> diff.malformed({ at: r.at, why: Unsupported(name) }),
-        None -> diff.malformed({ at: r.at, why: Unexpected }),
+        Some(name) -> diff.malformed({ at: r.at, reason: Unsupported(name) }),
+        None -> diff.malformed({ at: r.at, reason: Unexpected }),
       }
     },
   }
@@ -688,7 +704,7 @@ fn outside(r: Reading, line: String) -> Reading / {diff.malformed, abort.raise} 
 /// What a `---` or `+++` line says after its marker.
 fn label(line: String) -> String / {abort.raise} = line.slice(4, line.len() - 1)
 
-fn passed_over(line: String) -> Bool =
+fn is_ignored_line(line: String) -> Bool =
   line.starts_with("diff ") || line.starts_with("index ") || line.starts_with("new file mode ")
     || line.starts_with("deleted file mode ")
 
@@ -715,7 +731,7 @@ fn header(at: Int, line: String) -> Body / {diff.malformed, abort.raise} =
         read: [],
         last: None,
       },
-    None -> diff.malformed({ at: at, why: BadRange }),
+    None -> diff.malformed({ at: at, reason: BadRange }),
   }
 
 type Range = { at: Int, count: Int }
@@ -744,17 +760,17 @@ fn range_of(text: String) -> Option<Range> / {abort.raise} = {
 }
 
 /// The reading with its open hunk, which must have every line its header counted, in its file.
-fn hunk_out(r: Reading) -> Reading / {diff.malformed} = {
+fn flush_hunk(r: ParseState) -> ParseState / {diff.malformed} = {
   let { at, files, old, file, hunk } = r;
   match hunk {
     None -> { at: at, files: files, old: old, file: file, hunk: None },
     Some(body) -> {
-      let { old_at, new_at, old_left, new_left, read, last } = body;
-      if old_left > 0 || new_left > 0 { diff.malformed({ at: at, why: Miscounted }) } else {
+      let { old_at, new_at, old_left, new_left, read: parse_line, last } = body;
+      if old_left > 0 || new_left > 0 { diff.malformed({ at: at, reason: Miscounted }) } else {
         let made: Hunk<String> = {
           old_at: old_at,
           new_at: new_at,
-          edits: runs(with_last(read, last)),
+          edits: runs(with_last(parse_line, last)),
         };
         {
           at: at,
@@ -776,10 +792,10 @@ fn hunk_out(r: Reading) -> Reading / {diff.malformed} = {
 
 /// The reading with its open file among the files read; a `---` line still waiting for its `+++`
 /// is a fault.
-fn file_out(r: Reading) -> Reading / {diff.malformed} = {
-  let { at, files, old, file, hunk } = hunk_out(r);
+fn flush_file(r: ParseState) -> ParseState / {diff.malformed} = {
+  let { at, files, old, file, hunk } = flush_hunk(r);
   match old {
-    Some(_) -> diff.malformed({ at: at, why: Unexpected }),
+    Some(_) -> diff.malformed({ at: at, reason: Unexpected }),
     None ->
       {
         at: at,
@@ -792,8 +808,8 @@ fn file_out(r: Reading) -> Reading / {diff.malformed} = {
 }
 
 /// A hunk's lines as runs, in the order they were read.
-fn runs(read: List<Line>) -> List<Edit<String>> = {
-  let { side, run, out } = read.fold(
+fn runs(parse_line: List<Line>) -> List<Edit<String>> = {
+  let { side, run, out } = parse_line.fold(
     { side: 0, run: [], out: [] },
     |s: { side: Int, run: List<String>, out: List<Edit<String>> }, l: Line| {
       let { side, run, out } = s;
@@ -813,18 +829,18 @@ pub fn merge_lines(
   ours: String,
   theirs: String,
   limit: Int = 256,
-) -> List<Merged<String>> = {
-  let o = numbered(lines(base), unnumbered());
-  let a = numbered(lines(ours), o);
-  let b = numbered(lines(theirs), a);
-  merge(o.ids, a.ids, b.ids, limit).map(|m: Merged<Int>|
+) -> List<MergeChunk<String>> = {
+  let o = number_lines(lines(base), empty_numbering());
+  let a = number_lines(lines(ours), o);
+  let b = number_lines(lines(theirs), a);
+  merge(o.ids, a.ids, b.ids, limit).map(|m: MergeChunk<Int>|
     match m {
-      Settled(ids) -> Settled(named(ids, b.names)),
+      Resolved(ids) -> Resolved(lines_of_ids(ids, b.names)),
       Conflict(c) ->
         Conflict({
-          base: named(c.base, b.names),
-          ours: named(c.ours, b.names),
-          theirs: named(c.theirs, b.names),
+          base: lines_of_ids(c.base, b.names),
+          ours: lines_of_ids(c.ours, b.names),
+          theirs: lines_of_ids(c.theirs, b.names),
         }),
     })
 }
@@ -834,13 +850,16 @@ pub fn merge_lines(
 /// A conflict's `ours` stands under `<<<<<<<` and that side's name, then `=======`, then its
 /// `theirs` above `>>>>>>>` and that side's name; an empty name leaves the marker bare. A side
 /// whose last line ends in no `\n` is given one, so a marker starts its own line.
-pub fn marked(merged: List<Merged<String>>, ours: String, theirs: String) -> String =
+pub fn merge_text(merged: List<MergeChunk<String>>, ours: String, theirs: String) -> String =
   text_of(
-    merged.fold([], |out: List<String>, m: Merged<String>|
+    merged.fold([], |out: List<String>, m: MergeChunk<String>|
       match m {
-        Settled(ls) -> out.concat(ls),
+        Resolved(ls) -> out.concat(ls),
         Conflict(c) ->
-          ended(ended(out.push(marker("<<<<<<<", ours)), c.ours).push("=======\n"), c.theirs).push(
+          concat_with_newline(
+            concat_with_newline(out.push(marker("<<<<<<<", ours)), c.ours).push("=======\n"),
+            c.theirs,
+          ).push(
             marker(">>>>>>>", theirs),
           ),
       }),
@@ -850,7 +869,7 @@ fn marker(sign: String, name: String) -> String =
   if name == "" { sign ++ "\n" } else { sign ++ " " ++ name ++ "\n" }
 
 /// `out` and then `ls`, with a `\n` after them where their last line has none.
-fn ended(out: List<String>, ls: List<String>) -> List<String> = {
+fn concat_with_newline(out: List<String>, ls: List<String>) -> List<String> = {
   let whole = out.concat(ls);
   match ls.at(ls.len() - 1) {
     Some(l) -> if l.ends_with("\n") { whole } else { whole.push("\n") },
@@ -883,25 +902,27 @@ pub type Difference = new { path: List<Step>, change: Change }
 /// key, and lists and arrays by `diff`, so an item put in or taken out is one difference and not
 /// one for every item after it. Values that differ any other way, or nested past 64 levels, are
 /// one `Replaced`.
-pub fn value_diff(was: Value, now: Value) -> List<Difference> = compared(was, now, [], 64)
+pub fn value_diff(was: Value, now: Value) -> List<Difference> = value_differences(was, now, [], 64)
 
-/// `room` is how many levels deeper the comparison may step.
-fn compared(was: Value, now: Value, path: List<Step>, room: Int) -> List<Difference> =
+/// `remaining` is how many levels deeper the comparison may step.
+fn value_differences(was: Value, now: Value, path: List<Step>, remaining: Int) -> List<Difference> =
   if was == now { [] } else {
-    let inside = if room <= 0 { [] } else {
+    let inside = if remaining <= 0 { [] } else {
       match ((was, now)) {
-        (VRecord(old), VRecord(new)) -> fields_compared(old, new, path, room - 1),
+        (VRecord(old), VRecord(new)) -> field_differences(old, new, path, remaining - 1),
         (VCtor(name, old), VCtor(other, new)) -> if name == other && old.len() == new.len() {
           range(0, old.len()).fold([], |out: List<Difference>, i: Int|
             match ((old.at(i), new.at(i))) {
               (Some(x), Some(y)) ->
-                out.concat(compared(x, y, path.push(AtArg(ctor_name(name), i)), room - 1)),
+                out.concat(
+                  value_differences(x, y, path.push(AtArg(ctor_name(name), i)), remaining - 1),
+                ),
               _ -> out,
             })
         } else { [] },
-        (VList(old), VList(new)) -> items_compared(old, new, path, room - 1),
-        (VArray(old), VArray(new)) -> items_compared(old, new, path, room - 1),
-        (VMap(old), VMap(new)) -> entries_compared(old, new, path, room - 1),
+        (VList(old), VList(new)) -> item_differences(old, new, path, remaining - 1),
+        (VArray(old), VArray(new)) -> item_differences(old, new, path, remaining - 1),
+        (VMap(old), VMap(new)) -> entry_differences(old, new, path, remaining - 1),
         _ -> [],
       }
     };
@@ -909,34 +930,34 @@ fn compared(was: Value, now: Value, path: List<Step>, room: Int) -> List<Differe
     if inside.len() == 0 { [{ path: path, change: Replaced(was, now) }] } else { inside }
   }
 
-fn found(path: List<Step>, step: Step, change: Change) -> Difference =
+fn difference_at(path: List<Step>, step: Step, change: Change) -> Difference =
   { path: path.push(step), change: change }
 
-fn fields_compared(
+fn field_differences(
   old: List<Field>,
   new: List<Field>,
   path: List<Step>,
-  room: Int,
+  remaining: Int,
 ) -> List<Difference> = {
   let both = old.fold([], |out: List<Difference>, f: Field|
     match field_named(new, f.name) {
-      Some(v) -> out.concat(compared(f.value, v, path.push(AtField(f.name)), room)),
-      None -> out.push(found(path, AtField(f.name), Removed(f.value))),
+      Some(v) -> out.concat(value_differences(f.value, v, path.push(AtField(f.name)), remaining)),
+      None -> out.push(difference_at(path, AtField(f.name), Removed(f.value))),
     });
   new.fold(both, |out: List<Difference>, f: Field|
     match field_named(old, f.name) {
       Some(_) -> out,
-      None -> out.push(found(path, AtField(f.name), Added(f.value))),
+      None -> out.push(difference_at(path, AtField(f.name), Added(f.value))),
     })
 }
 
 /// A list's items: each replaced stretch pairs its old items with its new ones in order, and the
 /// longer side's spare items are removed or added.
-fn items_compared(
+fn item_differences(
   old: List<Value>,
   new: List<Value>,
   path: List<Step>,
-  room: Int,
+  remaining: Int,
 ) -> List<Difference> = {
   let { shift: _, out } = swaps(diff(old, new), true).fold(
     { shift: 0, out: [] },
@@ -947,9 +968,10 @@ fn items_compared(
         shift: shift + w.come.len() - w.gone,
         out: range(0, most).fold(out, |acc: List<Difference>, k: Int|
           match ((if k < w.gone { old.at(w.at + k) } else { None }, w.come.at(k))) {
-            (Some(x), Some(y)) -> acc.concat(compared(x, y, path.push(AtItem(w.at + k)), room)),
-            (Some(x), None) -> acc.push(found(path, AtItem(w.at + k), Removed(x))),
-            (None, Some(y)) -> acc.push(found(path, AtItem(w.at + shift + k), Added(y))),
+            (Some(x), Some(y)) ->
+              acc.concat(value_differences(x, y, path.push(AtItem(w.at + k)), remaining)),
+            (Some(x), None) -> acc.push(difference_at(path, AtItem(w.at + k), Removed(x))),
+            (None, Some(y)) -> acc.push(difference_at(path, AtItem(w.at + shift + k), Added(y))),
             (None, None) -> acc,
           }),
       }
@@ -958,16 +980,18 @@ fn items_compared(
   out
 }
 
-fn gone(path: List<Step>, e: Entry) -> Difference = found(path, AtKey(e.key), Removed(e.value))
+fn removed_entry(path: List<Step>, e: Entry) -> Difference =
+  difference_at(path, AtKey(e.key), Removed(e.value))
 
-fn come(path: List<Step>, e: Entry) -> Difference = found(path, AtKey(e.key), Added(e.value))
+fn added_entry(path: List<Step>, e: Entry) -> Difference =
+  difference_at(path, AtKey(e.key), Added(e.value))
 
 /// A map's entries, each side in key order, walked together.
-fn entries_compared(
+fn entry_differences(
   old: List<Entry>,
   new: List<Entry>,
   path: List<Step>,
-  room: Int,
+  remaining: Int,
 ) -> List<Difference> = {
   let by_key = |p: Entry, q: Entry| order(p.key, q.key) != Greater;
   let was = old.sort_by(by_key);
@@ -978,17 +1002,19 @@ fn entries_compared(
       let { i, j, out } = s;
       match ((was.at(i), now.at(j))) {
         (Some(p), Some(q)) -> match order(p.key, q.key) {
-          Less -> { i: i + 1, j: j, out: out.push(gone(path, p)) },
-          Greater -> { i: i, j: j + 1, out: out.push(come(path, q)) },
+          Less -> { i: i + 1, j: j, out: out.push(removed_entry(path, p)) },
+          Greater -> { i: i, j: j + 1, out: out.push(added_entry(path, q)) },
           Equal ->
             {
               i: i + 1,
               j: j + 1,
-              out: out.concat(compared(p.value, q.value, path.push(AtKey(p.key)), room)),
+              out: out.concat(
+                value_differences(p.value, q.value, path.push(AtKey(p.key)), remaining),
+              ),
             },
         },
-        (Some(p), None) -> { i: i + 1, j: j, out: out.push(gone(path, p)) },
-        (None, Some(q)) -> { i: i, j: j + 1, out: out.push(come(path, q)) },
+        (Some(p), None) -> { i: i + 1, j: j, out: out.push(removed_entry(path, p)) },
+        (None, Some(q)) -> { i: i, j: j + 1, out: out.push(added_entry(path, q)) },
         (None, None) -> { i: i, j: j, out: out },
       }
     },
@@ -1024,23 +1050,23 @@ fn step_text(s: Step) -> String =
 // --- The search -------------------------------------------------------------
 
 /// A run of a script by its length alone.
-type Span = | Same(Int) | Gone(Int) | New(Int)
+type Span = | Same(Int) | Deleted(Int) | Inserted(Int)
 
 /// A stretch of both lists: `a0` up to `a1` of the first against `b0` up to `b1` of the second.
 type Box = { a0: Int, a1: Int, b0: Int, b1: Int }
 
 /// What is left to search, in order: stretches, and between them kept runs already found.
-type Pending = | Done | Stretch(Box, Pending) | Kept(Int, Pending)
+type Pending = | Done | Stretch(Box, Pending) | Matched(Int, Pending)
 
 /// One direction of a stretch's search. Its frontier is the cells of `v` around `base` and the
-/// other direction's those around `other`; `pa`, `pb` and `step` place its own coordinates in the
+/// other direction's those around `other`; `origin_a`, `origin_b` and `step` place its own coordinates in the
 /// lists; a path on its diagonal `k` meets the other direction's on `delta - k`, which is written
 /// for diagonals within `reach`.
 type Side = {
   base: Int,
   other: Int,
-  pa: Int,
-  pb: Int,
+  origin_a: Int,
+  origin_b: Int,
   step: Int,
   n: Int,
   m: Int,
@@ -1062,13 +1088,17 @@ fn spans<a>(a: List<a>, b: List<a>, limit: Int) -> List<Span>
   where derivable(eq, a)
 =
 
-  // Every index `searched` reads is inside its array, so the clause never answers.
-  handle { searched(a, b, limit) } with { abort.raise(_) -> [Gone(a.len()), New(b.len())] }
+  // Every index `search_spans` reads is inside its array, so the clause never answers.
+  handle {
+    search_spans(a, b, limit)
+  } with {
+    abort.raise(_) -> [Deleted(a.len()), Inserted(b.len())],
+  }
 
 /// `cap` is the last round a stretch is searched for, -1 for none, and no stretch needs a round
 /// past half the two lengths. Each direction's frontier is `width` cells of one array, a cell for
 /// each diagonal a round within `cap` reaches and one beyond at either end.
-fn searched<a>(a: List<a>, b: List<a>, limit: Int) -> List<Span> / {abort.raise}
+fn search_spans<a>(a: List<a>, b: List<a>, limit: Int) -> List<Span> / {abort.raise}
   where derivable(eq, a)
 = {
   let n = a.len();
@@ -1089,15 +1119,15 @@ fn searched<a>(a: List<a>, b: List<a>, limit: Int) -> List<Span> / {abort.raise}
 }
 
 /// The spans as runs of `a`'s and `b`'s elements.
-fn written<a>(a: List<a>, b: List<a>, spans: List<Span>) -> List<Edit<a>> = {
+fn edits_of_spans<a>(a: List<a>, b: List<a>, spans: List<Span>) -> List<Edit<a>> = {
   let { i: _, j: _, out } = spans.fold(
     { i: 0, j: 0, out: [] },
     |c: { i: Int, j: Int, out: List<Edit<a>> }, s: Span| {
       let { i, j, out } = c;
       match s {
         Same(n) -> { i: i + n, j: j + n, out: out.push(Keep(slice(a, i, n))) },
-        Gone(n) -> { i: i + n, j: j, out: out.push(Delete(slice(a, i, n))) },
-        New(n) -> { i: i, j: j + n, out: out.push(Insert(slice(b, j, n))) },
+        Deleted(n) -> { i: i + n, j: j, out: out.push(Delete(slice(a, i, n))) },
+        Inserted(n) -> { i: i, j: j + n, out: out.push(Insert(slice(b, j, n))) },
       }
     },
   );
@@ -1121,8 +1151,8 @@ reuse fn solve<a>(
 =
   match todo {
     Done -> out,
-    Kept(n, rest) -> solve(v, xs, ys, rest, out.push(Same(n)), cap, width, fuel),
-    Stretch(box, rest) -> if fuel <= 0 { drained(todo, out) } else {
+    Matched(n, rest) -> solve(v, xs, ys, rest, out.push(Same(n)), cap, width, fuel),
+    Stretch(box, rest) -> if fuel <= 0 { drain(todo, out) } else {
       let n = box.a1 - box.a0;
       let m = box.b1 - box.b0;
       let short = if n < m { n } else { m };
@@ -1133,11 +1163,20 @@ reuse fn solve<a>(
       let rm = m - head - tail;
       let led = out.push(Same(head));
       if rn == 0 || rm == 0 || cap < 0 {
-        solve(v, xs, ys, Kept(tail, rest), replaced(led, rn, rm), cap, width, fuel - 1)
+        solve(v, xs, ys, Matched(tail, rest), push_replacement(led, rn, rm), cap, width, fuel - 1)
       } else {
         let cut = search(v, xs, ys, inner, cap, width, 0);
         if (cut.x == 0 && cut.y == 0) || (cut.x == rn && cut.y == rm) {
-          solve(cut.v, xs, ys, Kept(tail, rest), replaced(led, rn, rm), cap, width, fuel - 1)
+          solve(
+            cut.v,
+            xs,
+            ys,
+            Matched(tail, rest),
+            push_replacement(led, rn, rm),
+            cap,
+            width,
+            fuel - 1,
+          )
         } else {
           let lo = { a0: inner.a0, a1: inner.a0 + cut.x, b0: inner.b0, b1: inner.b0 + cut.y };
           let hi = { a0: inner.a0 + cut.x, a1: inner.a1, b0: inner.b0 + cut.y, b1: inner.b1 };
@@ -1145,7 +1184,7 @@ reuse fn solve<a>(
             cut.v,
             xs,
             ys,
-            Stretch(lo, Stretch(hi, Kept(tail, rest))),
+            Stretch(lo, Stretch(hi, Matched(tail, rest))),
             led,
             cap,
             width,
@@ -1157,31 +1196,31 @@ reuse fn solve<a>(
   }
 
 /// What is pending with nothing searched: each stretch replaced whole.
-reuse fn drained(todo: Pending, out: List<Span>) -> List<Span> =
+reuse fn drain(todo: Pending, out: List<Span>) -> List<Span> =
   match todo {
     Done -> out,
-    Kept(n, rest) -> drained(rest, out.push(Same(n))),
-    Stretch(box, rest) -> drained(rest, replaced(out, box.a1 - box.a0, box.b1 - box.b0)),
+    Matched(n, rest) -> drain(rest, out.push(Same(n))),
+    Stretch(box, rest) -> drain(rest, push_replacement(out, box.a1 - box.a0, box.b1 - box.b0)),
   }
 
 /// The spans and then a stretch of `gone` elements replaced by `new` others.
-reuse fn replaced(out: List<Span>, gone: Int, new: Int) -> List<Span> =
-  out.push(Gone(gone)).push(New(new))
+reuse fn push_replacement(out: List<Span>, removed_entry: Int, new: Int) -> List<Span> =
+  out.push(Deleted(removed_entry)).push(Inserted(new))
 
-/// How many elements in a row are equal from `xs[i]` and `ys[j]`, stepping by `step`, up to `room`.
+/// How many elements in a row are equal from `xs[i]` and `ys[j]`, stepping by `step`, up to `remaining`.
 fn run<a>(
   xs: Array<a>,
   ys: Array<a>,
   i: Int,
   j: Int,
   step: Int,
-  room: Int,
+  remaining: Int,
   acc: Int,
 ) -> Int / {abort.raise}
   where derivable(eq, a)
 =
-  if room <= 0 { acc }
-  else if xs.get(i) == ys.get(j) { run(xs, ys, i + step, j + step, step, room - 1, acc + 1) }
+  if remaining <= 0 { acc }
+  else if xs.get(i) == ys.get(j) { run(xs, ys, i + step, j + step, step, remaining - 1, acc + 1) }
   else { acc }
 
 /// Where to split a stretch whose ends differ, as a point inside it.
@@ -1213,14 +1252,14 @@ reuse fn search<a>(
     else { { v: v, x: n - b.x, y: m - (b.reach - b.x) } }
   } else {
     let forward = sweep(
-      opened(v, fore, d),
+      prepare_round(v, fore, d),
       xs,
       ys,
       {
         base: fore,
         other: back,
-        pa: box.a0,
-        pb: box.b0,
+        origin_a: box.a0,
+        origin_b: box.b0,
         step: 1,
         n: n,
         m: m,
@@ -1232,14 +1271,14 @@ reuse fn search<a>(
     );
     if forward.x >= 0 { forward } else {
       let backward = sweep(
-        opened(forward.v, back, d),
+        prepare_round(forward.v, back, d),
         xs,
         ys,
         {
           base: back,
           other: fore,
-          pa: box.a1 - 1,
-          pb: box.b1 - 1,
+          origin_a: box.a1 - 1,
+          origin_b: box.b1 - 1,
           step: 0 - 1,
           n: n,
           m: m,
@@ -1257,7 +1296,7 @@ reuse fn search<a>(
 
 /// The frontier ready for round `d`: the cells just outside the round's diagonals hold no path,
 /// but for the one the first round starts from.
-reuse fn opened(v: Array<Int>, base: Int, d: Int) -> Array<Int> / {abort.raise} =
+reuse fn prepare_round(v: Array<Int>, base: Int, d: Int) -> Array<Int> / {abort.raise} =
   if d == 0 { v.set(base - 1, unreached()).set(base + 1, 0) }
   else { v.set(base - d - 1, unreached()).set(base + d + 1, unreached()) }
 
@@ -1283,8 +1322,9 @@ reuse fn sweep<a>(
     let from = if right > down { right } else { down };
     if from < 0 { sweep(v.set(s.base + k, unreached()), xs, ys, s, d, k + 2) } else {
       let y = from - k;
-      let room = if s.n - from < s.m - y { s.n - from } else { s.m - y };
-      let x = from + run(xs, ys, s.pa + s.step * from, s.pb + s.step * y, s.step, room, 0);
+      let remaining = if s.n - from < s.m - y { s.n - from } else { s.m - y };
+      let x = from
+        + run(xs, ys, s.origin_a + s.step * from, s.origin_b + s.step * y, s.step, remaining, 0);
       let across = s.delta - k;
       if across >= 0 - s.reach && across <= s.reach && x + v.get(s.other + across) >= s.n {
         { v: v, x: x, y: x - k }
@@ -1405,7 +1445,7 @@ test "a search reads no cell outside its arrays, whatever the lists and the limi
   let raised = range(0, 160).fold(0, |raised: Int, t: Int| {
     let a = noise(t * 7 + 1, t % 23);
     let b = noise(t * 11 + 5, t * 3 % 19);
-    match try[abort.raise] { searched(a, b, t % 8) } { Ok(_) -> raised, Err(_) -> raised + 1 }
+    match try[abort.raise] { search_spans(a, b, t % 8) } { Ok(_) -> raised, Err(_) -> raised + 1 }
   });
   assert_eq(raised, 0)
 }
@@ -1464,14 +1504,14 @@ test "apply puts each hunk where it says, and refuses one by its index and why" 
   assert_eq(both.len(), 2);
   assert_eq(apply(both, old), new);
   assert_eq(try_apply(both, old), Ok(new));
-  assert_eq(try_apply(both, [1, 2, 3, 4, 5, 6, 7, 0, 9]), Err({ hunk: 1, why: Differs(7) }));
-  assert_eq(try_apply(both, [1, 2, 3, 4]), Err({ hunk: 1, why: PastEnd }));
-  assert_eq(try_apply(both, new), Err({ hunk: 0, why: Differs(2) }));
+  assert_eq(try_apply(both, [1, 2, 3, 4, 5, 6, 7, 0, 9]), Err({ hunk: 1, reason: Differs(7) }));
+  assert_eq(try_apply(both, [1, 2, 3, 4]), Err({ hunk: 1, reason: PastEnd }));
+  assert_eq(try_apply(both, new), Err({ hunk: 0, reason: Differs(2) }));
   let swapped = both.drop(1).concat(both.take(1));
-  assert_eq(try_apply(swapped, old), Err({ hunk: 1, why: Overlaps }));
+  assert_eq(try_apply(swapped, old), Err({ hunk: 1, reason: Overlaps }));
   assert_eq(
     try_apply([{ old_at: 0 - 1, new_at: 0, edits: [Insert([0])] }], old),
-    Err({ hunk: 0, why: Overlaps }),
+    Err({ hunk: 0, reason: Overlaps }),
   );
   assert_eq(try_apply([], old), Ok(old))
 }
@@ -1481,7 +1521,7 @@ test "a hunk with nothing kept or deleted goes on where it says, the end include
   assert_eq(try_apply([{ old_at: 0, new_at: 0, edits: [Insert([9])] }], []), Ok([9]));
   assert_eq(
     try_apply([{ old_at: 3, new_at: 3, edits: [Insert([9])] }], [1, 2]),
-    Err({ hunk: 0, why: PastEnd }),
+    Err({ hunk: 0, reason: PastEnd }),
   )
 }
 
@@ -1489,8 +1529,8 @@ test "apply_near finds a hunk that moved, and says where each landed" {
   let old = [1, 2, 3, 4, 5, 6, 7, 8, 9];
   let both = hunks(diff(old, [1, 2, 30, 4, 5, 6, 7, 80, 9]), 1);
   let later = [0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-  assert_eq(try_apply(both, later), Err({ hunk: 0, why: Differs(1) }));
-  assert_eq(try { apply_near(both, later, 1) }, Err({ hunk: 0, why: Differs(1) }));
+  assert_eq(try_apply(both, later), Err({ hunk: 0, reason: Differs(1) }));
+  assert_eq(try { apply_near(both, later, 1) }, Err({ hunk: 0, reason: Differs(1) }));
   assert_eq(apply_near(both, later, 2), {
     result: [0, 0, 1, 2, 30, 4, 5, 6, 7, 80, 9],
     at: [3, 8],
@@ -1506,11 +1546,14 @@ test "apply_near takes the nearer place, and a later one before an earlier one a
   assert_eq(apply_near(one, [7, 0, 7, 0, 0, 0, 0], 3).at, [2]);
   assert_eq(apply_near(one, [7, 0, 0, 0, 0, 0, 7], 3).at, [6]);
   assert_eq(apply_near(one, [0, 7, 0, 0, 0, 0, 0], 3).at, [1]);
-  assert_eq(try { apply_near(one, [0, 7, 0, 0, 0, 0, 0], 1) }, Err({ hunk: 0, why: Differs(3) }));
+  assert_eq(
+    try { apply_near(one, [0, 7, 0, 0, 0, 0, 0], 1) },
+    Err({ hunk: 0, reason: Differs(3) }),
+  );
   let first: List<Hunk<Int>> = [{ old_at: 1, new_at: 1, edits: [Delete([7])] }];
   assert_eq(apply_near(first, [7, 0, 0, 7], 3), { result: [0, 0, 7], at: [0] });
   let start: List<Hunk<Int>> = [{ old_at: 0, new_at: 0, edits: [Delete([7])] }];
-  assert_eq(try_apply(start, [0, 7]), Err({ hunk: 0, why: Differs(0) }));
+  assert_eq(try_apply(start, [0, 7]), Err({ hunk: 0, reason: Differs(0) }));
   assert_eq(apply_near(start, [0, 7], 1), { result: [0], at: [1] })
 }
 
@@ -1527,24 +1570,26 @@ test "reversed hunks undo, and reversing them twice is the hunks" {
 
 test "a merge takes each side's change, and two that touch and differ are a conflict" {
   let base = [1, 2, 3, 4, 5, 6];
-  assert_eq(merge(base, [1, 20, 3, 4, 5, 6], [1, 2, 3, 4, 50, 6]), [Settled([1, 20, 3, 4, 50, 6])]);
-  assert_eq(merge(base, [1, 20, 3, 4, 5, 6], [1, 20, 3, 4, 5, 6]), [Settled([1, 20, 3, 4, 5, 6])]);
+  assert_eq(merge(base, [1, 20, 3, 4, 5, 6], [1, 2, 3, 4, 50, 6]), [
+    Resolved([1, 20, 3, 4, 50, 6]),
+  ]);
+  assert_eq(merge(base, [1, 20, 3, 4, 5, 6], [1, 20, 3, 4, 5, 6]), [Resolved([1, 20, 3, 4, 5, 6])]);
   assert_eq(merge(base, [1, 20, 3, 4, 5, 6], [1, 21, 3, 4, 5, 6]), [
-    Settled([1]),
+    Resolved([1]),
     Conflict({ base: [2], ours: [20], theirs: [21] }),
-    Settled([3, 4, 5, 6]),
+    Resolved([3, 4, 5, 6]),
   ]);
   assert_eq(merge(base, [1, 20, 3, 4, 5, 6], [1, 2, 30, 4, 5, 6]), [
-    Settled([1]),
+    Resolved([1]),
     Conflict({ base: [2, 3], ours: [20, 3], theirs: [2, 30] }),
-    Settled([4, 5, 6]),
+    Resolved([4, 5, 6]),
   ]);
   assert_eq(merge(base, [1, 2, 3, 7, 4, 5, 6], [1, 2, 3, 8, 4, 5, 6]), [
-    Settled([1, 2, 3]),
+    Resolved([1, 2, 3]),
     Conflict({ base: [], ours: [7], theirs: [8] }),
-    Settled([4, 5, 6]),
+    Resolved([4, 5, 6]),
   ]);
-  assert_eq(merge(base, base, base), [Settled(base)]);
+  assert_eq(merge(base, base, base), [Resolved(base)]);
   let none: List<Int> = [];
   assert_eq(merge(none, none, none), [])
 }
@@ -1596,9 +1641,10 @@ test "what diff -U wrote of {f.name} reads back as its hunks" for f: Fixture in 
 }
 
 test "what diff -U wrote of {f.name} patches the old file" for f: Fixture in fixtures() {
-  let read = parse(f.unified).fold([], |acc: List<Hunk<String>>, d: FileDiff| acc.concat(d.hunks));
-  assert_eq(patch(f.old, read), f.new);
-  assert_eq(patch(f.new, reverse(read)), f.old)
+  let parse_line = parse(f.unified).fold([], |acc: List<Hunk<String>>, d: FileDiff|
+    acc.concat(d.hunks));
+  assert_eq(patch(f.old, parse_line), f.new);
+  assert_eq(patch(f.new, reverse(parse_line)), f.old)
 }
 
 test "unified writes the labels it is given and nothing for no hunk" {
@@ -1689,126 +1735,131 @@ test "parse keeps a hunk's lines in order, an empty one as kept, and ends the la
   ])
 }
 
-type Refused = { name: String, text: String, at: Int, why: Fault }
+type ParseFailureCase = { name: String, text: String, at: Int, reason: Fault }
 
-fn refused() -> List<Refused> =
+fn parse_failures() -> List<ParseFailureCase> =
   [
     {
       name: "a rename",
       text: "diff --git a/x b/y\nsimilarity index 100%\nrename from x\nrename to y\n",
       at: 1,
-      why: Unsupported("rename"),
+      reason: Unsupported("rename"),
     },
     {
       name: "a copy",
       text: "diff --git a/x b/y\ncopy from x\ncopy to y\n",
       at: 1,
-      why: Unsupported("copy"),
+      reason: Unsupported("copy"),
     },
     {
       name: "a mode change",
       text: "diff --git a/x b/x\nold mode 100644\nnew mode 100755\n",
       at: 1,
-      why: Unsupported("mode"),
+      reason: Unsupported("mode"),
     },
     {
       name: "a binary patch",
       text: "diff --git a/x b/x\nindex 1..2 100644\nGIT binary patch\nliteral 3\n",
       at: 2,
-      why: Unsupported("binary"),
+      reason: Unsupported("binary"),
     },
     {
       name: "files said to differ in binary",
       text: "Binary files a/x and b/x differ\n",
       at: 0,
-      why: Unsupported("binary"),
+      reason: Unsupported("binary"),
     },
     {
       name: "a combined diff",
       text: "diff --cc x\nindex 1,2..3\n--- a/x\n+++ b/x\n@@@ -1,2 -1,2 +1,3 @@@\n",
       at: 4,
-      why: Unsupported("combined"),
+      reason: Unsupported("combined"),
     },
-    { name: "a line that is no diff", text: "hello\n", at: 0, why: Unexpected },
-    { name: "a hunk before any file", text: "@@ -1 +1 @@\n-a\n+b\n", at: 0, why: Unexpected },
-    { name: "an old name with no new one", text: "--- a\n@@ -1 +1 @@\n", at: 1, why: Unexpected },
-    { name: "an old name at the end", text: "--- a\n", at: 1, why: Unexpected },
-    { name: "a new name with no old one", text: "+++ b\n", at: 0, why: Unexpected },
+    { name: "a line that is no diff", text: "hello\n", at: 0, reason: Unexpected },
+    { name: "a hunk before any file", text: "@@ -1 +1 @@\n-a\n+b\n", at: 0, reason: Unexpected },
+    {
+      name: "an old name with no new one",
+      text: "--- a\n@@ -1 +1 @@\n",
+      at: 1,
+      reason: Unexpected,
+    },
+    { name: "an old name at the end", text: "--- a\n", at: 1, reason: Unexpected },
+    { name: "a new name with no old one", text: "+++ b\n", at: 0, reason: Unexpected },
     {
       name: "a line past a hunk's counts",
       text: "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b\n+c\n",
       at: 5,
-      why: Unexpected,
+      reason: Unexpected,
     },
     {
       name: "a range that is no number",
       text: "--- a\n+++ b\n@@ -x +1 @@\n",
       at: 2,
-      why: BadRange,
+      reason: BadRange,
     },
-    { name: "a negative range", text: "--- a\n+++ b\n@@ --1 +1 @@\n", at: 2, why: BadRange },
-    { name: "a negative count", text: "--- a\n+++ b\n@@ -1,-2 +1 @@\n", at: 2, why: BadRange },
+    { name: "a negative range", text: "--- a\n+++ b\n@@ --1 +1 @@\n", at: 2, reason: BadRange },
+    { name: "a negative count", text: "--- a\n+++ b\n@@ -1,-2 +1 @@\n", at: 2, reason: BadRange },
     {
       name: "lines counted from zero",
       text: "--- a\n+++ b\n@@ -0,2 +1 @@\n",
       at: 2,
-      why: BadRange,
+      reason: BadRange,
     },
-    { name: "a header left open", text: "--- a\n+++ b\n@@ -1 +1\n", at: 2, why: BadRange },
-    { name: "a header with one range", text: "--- a\n+++ b\n@@ -1 @@\n", at: 2, why: BadRange },
+    { name: "a header left open", text: "--- a\n+++ b\n@@ -1 +1\n", at: 2, reason: BadRange },
+    { name: "a header with one range", text: "--- a\n+++ b\n@@ -1 @@\n", at: 2, reason: BadRange },
     {
       name: "a hunk the text ends inside",
       text: "--- a\n+++ b\n@@ -1,2 +1,2 @@\n a\n",
       at: 4,
-      why: Miscounted,
+      reason: Miscounted,
     },
     {
       name: "a hunk another line cuts short",
       text: "--- a\n+++ b\n@@ -1,2 +1,2 @@\n a\n@@ -5 +5 @@\n",
       at: 4,
-      why: Miscounted,
+      reason: Miscounted,
     },
     {
       name: "a line on a side with none left",
       text: "--- a\n+++ b\n@@ -1,2 +1 @@\n-a\n+b\n+c\n",
       at: 5,
-      why: Miscounted,
+      reason: Miscounted,
     },
     {
       name: "a newline taken from no line",
       text: "--- a\n+++ b\n@@ -1 +1 @@\n\\ No newline at end of file\n",
       at: 3,
-      why: Unended,
+      reason: Unended,
     },
     {
       name: "a newline taken twice",
       text: "--- a\n+++ b\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n\\ No newline at end of file\n+b\n",
       at: 5,
-      why: Unended,
+      reason: Unended,
     },
   ]
 
-test "parse refuses {r.name}" for r: Refused in refused() {
-  assert_eq(try_parse(r.text), Err({ at: r.at, why: r.why }))
+test "parse refuses {r.name}" for r: ParseFailureCase in parse_failures() {
+  assert_eq(try_parse(r.text), Err({ at: r.at, reason: r.reason }))
 }
 
 test "a text is patched by its lines, and a line whose newline differs does not fit" {
   let made = hunks(diff_lines("a\nb\nc\n", "a\nB\nc\n"), 3);
   assert_eq(patch("a\nb\nc\n", made), "a\nB\nc\n");
-  assert_eq(try { patch("a\nb\nc", made) }, Err({ hunk: 0, why: Differs(2) }));
-  assert_eq(try { patch("a\nb\n", made) }, Err({ hunk: 0, why: PastEnd }))
+  assert_eq(try { patch("a\nb\nc", made) }, Err({ hunk: 0, reason: Differs(2) }));
+  assert_eq(try { patch("a\nb\n", made) }, Err({ hunk: 0, reason: PastEnd }))
 }
 
 test "a merge of texts writes a conflict between git's markers" {
   let apart = merge_lines("a\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n", "a\nb\nc\nd\nE\n");
   assert_eq(resolved(apart), Some(["a\n", "B\n", "c\n", "d\n", "E\n"]));
-  assert_eq(marked(apart, "ours", "theirs"), "a\nB\nc\nd\nE\n");
+  assert_eq(merge_text(apart, "ours", "theirs"), "a\nB\nc\nd\nE\n");
   let clash = merge_lines("a\nb\nc\n", "a\nB\nc\n", "a\nb2\nc\n");
   assert_eq(
-    marked(clash, "ours", "theirs"),
+    merge_text(clash, "ours", "theirs"),
     "a\n<<<<<<< ours\nB\n=======\nb2\n>>>>>>> theirs\nc\n",
   );
-  assert_eq(marked(merge_lines("a", "b", "c"), "", ""), "<<<<<<<\nb\n=======\nc\n>>>>>>>\n")
+  assert_eq(merge_text(merge_lines("a", "b", "c"), "", ""), "<<<<<<<\nb\n=======\nc\n>>>>>>>\n")
 }
 
 test "a value's differences are named by where they stand" {
@@ -1946,9 +1997,9 @@ test "a merge is resolved alike whichever side is ours" {
 }
 
 /// A text of one short line for each number, the last one ended or not.
-fn page(xs: List<Int>, ended: Bool) -> String = {
+fn page(xs: List<Int>, concat_with_newline: Bool) -> String = {
   let all = text_of(xs.map(|x: Int| Int::to_string(x % 3) ++ "\n"));
-  if ended || all == "" { all } else { all ++ "!" }
+  if concat_with_newline || all == "" { all } else { all ++ "!" }
 }
 
 type Pages = { a: List<Int>, b: List<Int>, a_ended: Bool, b_ended: Bool }

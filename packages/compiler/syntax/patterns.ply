@@ -1,18 +1,19 @@
-//! Patterns, and the `Lit` that expressions share with them.
+//! Patterns, and the `SourceLiteral` that expressions share with them.
 
-import compiler.syntax.parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, SoFar,
-                                ParseDiag, span_to, dummy_span, no_ident, no_qname, unexpected,
-                                error_at, push_diag, error_here, unclosed, token_kind,
-                                token_kind_at, current_span, span_at, previous_span, at_token,
-                                at_eof, starts_upper, advance, bump, eat, token_bytes, token_at,
-                                expect, expect_close, expect_ident, expect_field_name, fields_once,
-                                keyword_pun_refusal, too_deep, qname, comma_list, parsed_or, failed,
-                                token_lparen, token_rparen, token_lbrace, token_rbrace,
-                                token_lbracket, token_rbracket, token_comma, token_colon,
-                                token_dotdot, token_dotdoteq, token_minus, token_pipe,
-                                token_underscore, keyword_true, keyword_false, dump_node,
-                                dump_count, dump_presence, dump_payload, dump_word, dump_list,
-                                dump_opt, dump_ident, dump_qname, dump_diags, start, is_bare)
+import compiler.syntax.parsing (tuple_field_name, Span, Ident, QName, Input, Parser, ParseOutput,
+                                EatResult, PartialList, ParseDiag, span_to, dummy_span, no_ident,
+                                no_qname, unexpected, error_at, push_diag, error_here, unclosed,
+                                token_kind, token_kind_at, current_span, span_at, previous_span,
+                                at_token, at_eof, starts_upper, advance, bump, eat, token_bytes,
+                                token_at, expect, expect_close, expect_ident, expect_field_name,
+                                report_duplicate_fields, keyword_pun_error, too_deep, qname,
+                                comma_list, parsed_or, failed, token_lparen, token_rparen,
+                                token_lbrace, token_rbrace, token_lbracket, token_rbracket,
+                                token_comma, token_colon, token_dotdot, token_dotdoteq, token_minus,
+                                token_pipe, token_underscore, keyword_true, keyword_false,
+                                dump_node, dump_count, dump_presence, dump_payload, dump_word,
+                                dump_list, dump_opt, dump_ident, dump_qname, dump_diags, start,
+                                is_bare)
 import compiler.syntax.lexer (TokenKind, Token, Identifier, IntLiteral, FixedLiteral, WideLiteral,
                               FloatLiteral, DecimalLiteral, StringLiteral, BytesLiteral,
                               CharLiteral, Keyword, Punctuation, EndOfInput, Width, width_named,
@@ -24,140 +25,142 @@ import std.string
 
 // --- Literals ---------------------------------------------------------------
 
-/// `LFloat` and `LDec` carry the raw source over the literal node's own span, `-` included, never a parsed value.
-pub type Lit =
-  | LInt(Int)
+/// `LiteralFloat` and `LiteralDecimal` carry the raw source over the literal node's own span, `-` included, never a parsed value.
+pub type SourceLiteral =
+  | LiteralInt(Int)
   /// A width-suffixed literal: the width's name and the `Int` bit pattern the width reads.
-  | LFixed(Bytes, Int)
+  | LiteralFixed(Bytes, Int)
   /// A 128-bit literal: the width's name, then its high and low 64 bits as `Int` patterns.
-  | LWide(Bytes, Int, Int)
-  | LBool(Bool)
-  | LStr(Bytes)
-  | LBytes(Bytes)
+  | LiteralWide(Bytes, Int, Int)
+  | LiteralBool(Bool)
+  | LiteralString(Bytes)
+  | LiteralBytes(Bytes)
   /// An embedded file's bytes, known by their blake3 digest and their size: what an `embed` is
   /// written out as, the bytes themselves read only where a value is made.
-  | LEmbedded(Bytes, Int)
-  | LFloat(Bytes)
-  | LDec(Bytes)
+  | LiteralEmbedded(Bytes, Int)
+  | LiteralFloat(Bytes)
+  | LiteralDecimal(Bytes)
   /// A character's Unicode scalar value.
-  | LChar(Int)
-  | LUnit
-  | LBad
+  | LiteralChar(Int)
+  | LiteralUnit
+  | LiteralInvalid
 
-derive bin for Lit
+derive bin for SourceLiteral
 
-pub fn dump_lit(literal: Lit) -> Bytes / {abort.raise} =
+pub fn dump_lit(literal: SourceLiteral) -> Bytes / {abort.raise} =
   match literal {
-    LInt(v) -> dump_word(b"int").concat(dump_payload(ascii_of_int(v))),
-    LFixed(ty, v) ->
+    LiteralInt(v) -> dump_word(b"int").concat(dump_payload(ascii_of_int(v))),
+    LiteralFixed(ty, v) ->
       dump_word(b"fixed").concat(dump_payload(Bytes::concat_all([ty, b":", ascii_of_int(v)]))),
-    LWide(ty, high, low) ->
+    LiteralWide(ty, high, low) ->
       dump_word(b"wide").concat(
         dump_payload(Bytes::concat_all([ty, b":", ascii_of_int(high), b":", ascii_of_int(low)])),
       ),
-    LBool(b) -> dump_word(b"bool").concat(dump_payload(if b { b"1" } else { b"0" })),
-    LStr(s) -> dump_word(b"str").concat(dump_payload(s)),
-    LBytes(b) -> dump_word(b"bytes").concat(dump_payload(b)),
-    LEmbedded(digest, size) ->
+    LiteralBool(b) -> dump_word(b"bool").concat(dump_payload(if b { b"1" } else { b"0" })),
+    LiteralString(s) -> dump_word(b"str").concat(dump_payload(s)),
+    LiteralBytes(b) -> dump_word(b"bytes").concat(dump_payload(b)),
+    LiteralEmbedded(digest, size) ->
       dump_word(b"embedded").concat(
         dump_payload(Bytes::concat_all([digest, b":", ascii_of_int(size)])),
       ),
-    LFloat(r) -> dump_word(b"float").concat(dump_payload(r)),
-    LDec(r) -> dump_word(b"dec").concat(dump_payload(r)),
-    LChar(v) -> dump_word(b"char").concat(dump_payload(ascii_of_int(v))),
-    LUnit -> dump_word(b"unit"),
-    LBad -> dump_word(b"badlit"),
+    LiteralFloat(r) -> dump_word(b"float").concat(dump_payload(r)),
+    LiteralDecimal(r) -> dump_word(b"dec").concat(dump_payload(r)),
+    LiteralChar(v) -> dump_word(b"char").concat(dump_payload(ascii_of_int(v))),
+    LiteralUnit -> dump_word(b"unit"),
+    LiteralInvalid -> dump_word(b"badlit"),
   }
 
 // --- The AST ----------------------------------------------------------------
 
 /// Every variant carries its own span: a parenthesised pattern's span covers the parens, wider than its name's.
 pub type Pattern =
-  | PWild({ span: Span })
-  | PVar({ span: Span, name: Ident })
-  | PLit({ span: Span, lit: Lit })
+  | PatternWildcard({ span: Span })
+  | PatternVariable({ span: Span, name: Ident })
+  | PatternLiteral({ span: Span, lit: SourceLiteral })
   /// `lo..=hi`: every integer from `lo` through `hi`, both literals of one integer type.
-  | PRange({ span: Span, lo: Lit, hi: Lit })
-  | PCtor({ span: Span, name: QName, args: List<Pattern> })
-  | PRecord({ span: Span, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> })
-  | PList({ span: Span, rest: Option<Pattern>, items: List<Pattern> })
+  | PatternRange({ span: Span, lo: SourceLiteral, hi: SourceLiteral })
+  | PatternConstructor({ span: Span, name: QName, args: List<Pattern> })
+  | PatternRecord({ span: Span, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> })
+  | PatternList({ span: Span, rest: Option<Pattern>, items: List<Pattern> })
   /// `a | b`: two or more alternatives, each binding the same names at the same types.
-  | POr({ span: Span, alts: List<Pattern> })
+  | PatternOr({ span: Span, alternatives: List<Pattern> })
   /// The placeholder `parsed_or` asks for; no parse produces it.
-  | PBad({ span: Span })
+  | PatternInvalid({ span: Span })
 
 pub fn binder_names(p: Pattern) -> List<Ident> =
   match p {
-    PVar(v) -> [v.name],
-    PCtor(c) -> c.args.fold([], |acc: List<Ident>, x: Pattern| acc.concat(binder_names(x))),
-    PRecord(r) ->
+    PatternVariable(v) -> [v.name],
+    PatternConstructor(c) ->
+      c.args.fold([], |acc: List<Ident>, x: Pattern| acc.concat(binder_names(x))),
+    PatternRecord(r) ->
       r.fields.fold([], |acc: List<Ident>, f: { name: Ident, pat: Pattern }|
         acc.concat(binder_names(f.pat))),
-    PList(l) -> {
+    PatternList(l) -> {
       let items = l.items.fold([], |acc: List<Ident>, x: Pattern| acc.concat(binder_names(x)));
       match l.rest { Some(r) -> items.concat(binder_names(r)), None -> items }
     },
-    POr(o) -> match o.alts { [first, ..] -> binder_names(first), [] -> [] },
+    PatternOr(o) -> match o.alternatives { [first, ..] -> binder_names(first), [] -> [] },
     _ -> [],
   }
 
 pub fn pat_span(pattern: Pattern) -> Span =
   match pattern {
-    PWild(v) -> v.span,
-    PVar(v) -> v.span,
-    PLit(v) -> v.span,
-    PRange(v) -> v.span,
-    PCtor(v) -> v.span,
-    PRecord(v) -> v.span,
-    PList(v) -> v.span,
-    POr(v) -> v.span,
-    PBad(v) -> v.span,
+    PatternWildcard(v) -> v.span,
+    PatternVariable(v) -> v.span,
+    PatternLiteral(v) -> v.span,
+    PatternRange(v) -> v.span,
+    PatternConstructor(v) -> v.span,
+    PatternRecord(v) -> v.span,
+    PatternList(v) -> v.span,
+    PatternOr(v) -> v.span,
+    PatternInvalid(v) -> v.span,
   }
 
 fn set_pat_span(pattern: Pattern, span: Span) -> Pattern =
   match pattern {
-    PWild(v) -> PWild({ span: span }),
-    PVar(v) -> PVar({ span: span, name: v.name }),
-    PLit(v) -> PLit({ span: span, lit: v.lit }),
-    PRange(v) -> PRange({ ..v, span: span }),
-    PCtor(v) -> PCtor({ span: span, name: v.name, args: v.args }),
-    PRecord(v) -> PRecord({ span: span, rest: v.rest, fields: v.fields }),
-    PList(v) -> PList({ span: span, rest: v.rest, items: v.items }),
-    POr(v) -> POr({ span: span, alts: v.alts }),
-    PBad(v) -> PBad({ span: span }),
+    PatternWildcard(v) -> PatternWildcard({ span: span }),
+    PatternVariable(v) -> PatternVariable({ span: span, name: v.name }),
+    PatternLiteral(v) -> PatternLiteral({ span: span, lit: v.lit }),
+    PatternRange(v) -> PatternRange({ ..v, span: span }),
+    PatternConstructor(v) -> PatternConstructor({ span: span, name: v.name, args: v.args }),
+    PatternRecord(v) -> PatternRecord({ span: span, rest: v.rest, fields: v.fields }),
+    PatternList(v) -> PatternList({ span: span, rest: v.rest, items: v.items }),
+    PatternOr(v) -> PatternOr({ span: span, alternatives: v.alternatives }),
+    PatternInvalid(v) -> PatternInvalid({ span: span }),
   }
 
-pub fn no_pattern() -> Pattern = PBad({ span: dummy_span() })
+pub fn no_pattern() -> Pattern = PatternInvalid({ span: dummy_span() })
 
 pub fn has_or(x: Pattern) -> Bool =
   match x {
-    POr(_) -> true,
-    PCtor(v) -> v.args.fold(false, |b: Bool, a: Pattern| b || has_or(a)),
-    PRecord(v) ->
+    PatternOr(_) -> true,
+    PatternConstructor(v) -> v.args.fold(false, |b: Bool, a: Pattern| b || has_or(a)),
+    PatternRecord(v) ->
       v.fields.fold(false, |b: Bool, f: { name: Ident, pat: Pattern }| b || has_or(f.pat)),
-    PList(v) ->
+    PatternList(v) ->
       v.items.fold(false, |b: Bool, a: Pattern| b || has_or(a))
         || (match v.rest { Some(r) -> has_or(r), None -> false }),
-    PWild(_) -> false,
-    PVar(_) -> false,
-    PLit(_) -> false,
-    PRange(_) -> false,
-    PBad(_) -> false,
+    PatternWildcard(_) -> false,
+    PatternVariable(_) -> false,
+    PatternLiteral(_) -> false,
+    PatternRange(_) -> false,
+    PatternInvalid(_) -> false,
   }
 
 /// The patterns without a choice in them that `x` is, in the order a match tries them: a nested
 /// choice is distributed outwards, the leftmost alternative varying slowest.
 pub fn alternatives_of(x: Pattern) -> List<Pattern> =
   match x {
-    POr(v) ->
-      v.alts.fold([], |acc: List<Pattern>, a: Pattern| append_pats(acc, alternatives_of(a))),
-    PCtor(v) ->
+    PatternOr(v) ->
+      v.alternatives.fold([], |acc: List<Pattern>, a: Pattern|
+        append_pats(acc, alternatives_of(a))),
+    PatternConstructor(v) ->
       product(v.args.map(alternatives_of)).map(|args: List<Pattern>|
-        PCtor({ span: v.span, name: v.name, args: args })),
-    PRecord(v) ->
+        PatternConstructor({ span: v.span, name: v.name, args: args })),
+    PatternRecord(v) ->
       product(v.fields.map(|f: { name: Ident, pat: Pattern }| alternatives_of(f.pat))).map(
         |ps: List<Pattern>|
-          PRecord({
+          PatternRecord({
             span: v.span,
             rest: v.rest,
             fields: range(0, ps.len()).map(|i: Int| {
@@ -169,7 +172,7 @@ pub fn alternatives_of(x: Pattern) -> List<Pattern> =
             }),
           }),
       ),
-    PList(v) -> {
+    PatternList(v) -> {
       let rests = match v.rest {
         Some(r) -> alternatives_of(r).map(|q: Pattern| Some(q)),
         None -> [None],
@@ -177,7 +180,7 @@ pub fn alternatives_of(x: Pattern) -> List<Pattern> =
       product(v.items.map(alternatives_of)).fold([], |acc: List<Pattern>, items: List<Pattern>|
         append_pats(
           acc,
-          rests.map(|r: Option<Pattern>| PList({ span: v.span, rest: r, items: items })),
+          rests.map(|r: Option<Pattern>| PatternList({ span: v.span, rest: r, items: items })),
         ))
     },
     _ -> [x],
@@ -197,18 +200,24 @@ fn append_lists(a: List<List<Pattern>>, b: List<List<Pattern>>) -> List<List<Pat
 
 // --- Patterns ---------------------------------------------------------------
 
-pub fn pattern(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} =
+pub fn pattern(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} =
   if input.room <= 0 { Err(too_deep(input, parser)) }
   else { alternatives({ ..input, room: input.room - 1 }, parser) }
 
 /// `|` binds loosest, so every alternative is a pattern without one; parentheses nest another.
-fn alternatives(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+fn alternatives(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let first = pattern_body(input, parser)?;
   if !at_token(input, first.parser, token_pipe()) { Ok(first) } else {
     let more = iterate(
       { parser: first.parser, out: [first.node] },
       input.token_count - first.parser.pos + 1,
-      |s: SoFar<Pattern>|
+      |s: PartialList<Pattern>|
         if !at_token(input, s.parser, token_pipe()) { Stop(Ok(s)) } else {
           match pattern_body(input, advance(input, s.parser).parser) {
             Err(q) -> Stop(Err(q)),
@@ -222,17 +231,21 @@ fn alternatives(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser>
     };
     Ok({
       parser: more.parser,
-      node: POr({ span: span_to(pat_span(first.node), last), alts: more.out }),
+      node: PatternOr({ span: span_to(pat_span(first.node), last), alternatives: more.out }),
     })
   }
 }
 
-fn lit_pat(input: Input, parser: Parser, literal: Lit) -> Result<Parsed<Pattern>, Parser> = {
+fn lit_pat(
+  input: Input,
+  parser: Parser,
+  literal: SourceLiteral,
+) -> Result<ParseOutput<Pattern>, Parser> = {
   let a = advance(input, parser);
-  Ok({ parser: a.parser, node: PLit({ span: a.node, lit: literal }) })
+  Ok({ parser: a.parser, node: PatternLiteral({ span: a.node, lit: literal }) })
 }
 
-pub fn src_over(input: Input, span: Span) -> Bytes / {abort.raise} =
+pub fn source_text(input: Input, span: Span) -> Bytes / {abort.raise} =
   input.source.slice(span.start, span.end)
 
 fn is_num_tok(kind: TokenKind) -> Bool =
@@ -246,7 +259,10 @@ fn is_num_tok(kind: TokenKind) -> Bool =
   }
 
 /// A literal, `..=` and another are the range between the two.
-fn pattern_body(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+fn pattern_body(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let first = pattern_atom(input, parser)?;
   if !at_token(input, first.parser, token_dotdoteq()) { Ok(first) } else {
     let dots = advance(input, first.parser);
@@ -255,55 +271,58 @@ fn pattern_body(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser>
     // A bound in parentheses is refused: the range's source is its two literals and the dots.
     let bound = |p: Pattern|
       match p {
-        PLit(l) -> if input.source.at(l.span.start) == 40 { None } else { Some(l.lit) },
+        PatternLiteral(l) -> if input.source.at(l.span.start) == 40 { None } else { Some(l.lit) },
         _ -> None,
       };
     match ((bound(first.node), bound(last.node))) {
       (Some(lo), Some(hi)) ->
-        Ok({ parser: last.parser, node: PRange({ span: span, lo: lo, hi: hi }) }),
+        Ok({ parser: last.parser, node: PatternRange({ span: span, lo: lo, hi: hi }) }),
       _ ->
         Ok({
           parser: push_diag(
             last.parser,
             error_at(
-              range_bounds(),
+              non_literal_range_bound(),
               span,
               b"a range pattern's bounds are integer literals",
               b"one of these is not a literal",
               [b"a range is written `lo..=hi`, as in `0..=9` or `b'a'..=b'z'`, and binds nothing"],
             ),
           ),
-          node: PWild({ span: span }),
+          node: PatternWildcard({ span: span }),
         }),
     }
   }
 }
 
-pub fn range_bounds() -> Bytes = b"E0222"
+pub fn non_literal_range_bound() -> Bytes = b"E0222"
 
-fn pattern_atom(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+fn pattern_atom(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let st = current_span(input, parser);
   match token_kind(input, parser) {
-    IntLiteral(v) -> lit_pat(input, parser, LInt(v)),
-    FixedLiteral(ty, v) -> lit_pat(input, parser, LFixed(ty, v)),
-    WideLiteral(ty, high, low) -> lit_pat(input, parser, LWide(ty, high, low)),
+    IntLiteral(v) -> lit_pat(input, parser, LiteralInt(v)),
+    FixedLiteral(ty, v) -> lit_pat(input, parser, LiteralFixed(ty, v)),
+    WideLiteral(ty, high, low) -> lit_pat(input, parser, LiteralWide(ty, high, low)),
     // The lexer's payload is discarded: the tree holds the source, sliced.
-    FloatLiteral(f) -> lit_pat(input, parser, LFloat(src_over(input, st))),
-    DecimalLiteral(m, sc) -> lit_pat(input, parser, LDec(src_over(input, st))),
-    StringLiteral(s) -> lit_pat(input, parser, LStr(s)),
-    BytesLiteral(b) -> lit_pat(input, parser, LBytes(b)),
-    CharLiteral(v) -> lit_pat(input, parser, LChar(v)),
-    Keyword(k) -> if k == b"true" { lit_pat(input, parser, LBool(true)) }
-    else if k == b"false" { lit_pat(input, parser, LBool(false)) }
+    FloatLiteral(f) -> lit_pat(input, parser, LiteralFloat(source_text(input, st))),
+    DecimalLiteral(m, sc) -> lit_pat(input, parser, LiteralDecimal(source_text(input, st))),
+    StringLiteral(s) -> lit_pat(input, parser, LiteralString(s)),
+    BytesLiteral(b) -> lit_pat(input, parser, LiteralBytes(b)),
+    CharLiteral(v) -> lit_pat(input, parser, LiteralChar(v)),
+    Keyword(k) -> if k == b"true" { lit_pat(input, parser, LiteralBool(true)) }
+    else if k == b"false" { lit_pat(input, parser, LiteralBool(false)) }
     else { Err(error_here(input, parser, b"a pattern")) },
     Identifier(n) -> pattern_named(input, parser, st),
     Punctuation(s) -> if s == b"underscore" {
       let a = advance(input, parser);
-      Ok({ parser: a.parser, node: PWild({ span: a.node }) })
+      Ok({ parser: a.parser, node: PatternWildcard({ span: a.node }) })
     }
     // A negative literal is one pattern, decided by two tokens of lookahead.
     else if s == b"minus" && is_num_tok(token_kind_at(input, parser, 1)) {
-      neg_lit(input, parser, st)
+      negative_literal(input, parser, st)
     } else if s == b"lparen" { pattern_paren(input, parser) }
     else if s == b"lbracket" { list_pattern(input, parser) }
     else if s == b"lbrace" { record_pattern(input, parser) }
@@ -313,46 +332,62 @@ fn pattern_atom(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser>
 }
 
 /// `-v` wrapped to the width.
-fn neg_at_width(ty: Bytes, v: Int) -> Int / {abort.raise} =
+fn negate_at_width(ty: Bytes, v: Int) -> Int / {abort.raise} =
   match width_named(Bytes::of_string(String::of_bytes(ty).ascii_lower())) {
     Some(w) -> width_normalize(w, wrap_sub(0, v)),
     None -> 0 - v,
   }
 
 /// Two's complement across both halves: the borrow reaches the high half only when the low one is zero.
-fn neg_wide(ty: Bytes, high: Int, low: Int) -> Lit =
-  LWide(ty, if low == 0 { wrap_sub(0, high) } else { ~high }, wrap_sub(0, low))
+fn negate_wide(ty: Bytes, high: Int, low: Int) -> SourceLiteral =
+  LiteralWide(ty, if low == 0 { wrap_sub(0, high) } else { ~high }, wrap_sub(0, low))
 
-fn neg_lit(
+fn negative_literal(
   input: Input,
   parser: Parser,
   span: Span,
-) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let m = advance(input, parser);
   let a = advance(input, m.parser);
   let s = span_to(span, a.node);
   // `Float` and `Decimal` are not negated: their raw source over `s` already has the `-`.
   match token_kind(input, m.parser) {
-    IntLiteral(v) -> Ok({ parser: a.parser, node: PLit({ span: s, lit: LInt(0 - v) }) }),
+    IntLiteral(v) ->
+      Ok({ parser: a.parser, node: PatternLiteral({ span: s, lit: LiteralInt(0 - v) }) }),
     // Negated at the width, so each signed type's minimum (`-128i8`) is writable.
     FixedLiteral(ty, v) ->
-      Ok({ parser: a.parser, node: PLit({ span: s, lit: LFixed(ty, neg_at_width(ty, v)) }) }),
+      Ok({
+        parser: a.parser,
+        node: PatternLiteral({ span: s, lit: LiteralFixed(ty, negate_at_width(ty, v)) }),
+      }),
     WideLiteral(ty, high, low) ->
-      Ok({ parser: a.parser, node: PLit({ span: s, lit: neg_wide(ty, high, low) }) }),
+      Ok({ parser: a.parser, node: PatternLiteral({ span: s, lit: negate_wide(ty, high, low) }) }),
     FloatLiteral(f) ->
-      Ok({ parser: a.parser, node: PLit({ span: s, lit: LFloat(src_over(input, s)) }) }),
+      Ok({
+        parser: a.parser,
+        node: PatternLiteral({ span: s, lit: LiteralFloat(source_text(input, s)) }),
+      }),
     DecimalLiteral(mm, sc) ->
-      Ok({ parser: a.parser, node: PLit({ span: s, lit: LDec(src_over(input, s)) }) }),
+      Ok({
+        parser: a.parser,
+        node: PatternLiteral({ span: s, lit: LiteralDecimal(source_text(input, s)) }),
+      }),
     // Unreachable: `is_num_tok` admitted only a number.
-    _ -> Ok({ parser: a.parser, node: PLit({ span: s, lit: LBad }) }),
+    _ -> Ok({ parser: a.parser, node: PatternLiteral({ span: s, lit: LiteralInvalid }) }),
   }
 }
 
-fn pattern_paren(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+fn pattern_paren(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   if at_token(input, o.parser, token_rparen()) {
     let cl = advance(input, o.parser);
-    Ok({ parser: cl.parser, node: PLit({ span: span_to(o.node, cl.node), lit: LUnit }) })
+    Ok({
+      parser: cl.parser,
+      node: PatternLiteral({ span: span_to(o.node, cl.node), lit: LiteralUnit }),
+    })
   } else {
     let inner = pattern(input, o.parser)?;
     if at_token(input, inner.parser, token_comma()) {
@@ -365,13 +400,14 @@ fn pattern_paren(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser
       } else {
         Ok({
           parser: cl.parser,
-          node: PRecord({
+          node: PatternRecord({
             span: span_to(o.node, cl.node),
             rest: false,
             fields: range(0, items.len()).map(|i: Int| -> { name: Ident, pat: Pattern } {
               match items.at(i) {
-                Some(q) -> { name: positional(i, pat_span(q)), pat: q },
-                None -> { name: positional(i, o.node), pat: PWild({ span: o.node }) },
+                Some(q) -> { name: tuple_field_name(i, pat_span(q)), pat: q },
+                None ->
+                  { name: tuple_field_name(i, o.node), pat: PatternWildcard({ span: o.node }) },
               }
             }),
           }),
@@ -388,10 +424,10 @@ fn pattern_named(
   input: Input,
   parser: Parser,
   span: Span,
-) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let q = qname(input, parser, b"a pattern")?;
   if is_bare(q.node) && !starts_upper(q.node.name.name) {
-    Ok({ parser: q.parser, node: PVar({ span: span, name: q.node.name }) })
+    Ok({ parser: q.parser, node: PatternVariable({ span: span, name: q.node.name }) })
   } else if at_token(input, q.parser, token_lparen()) {
     let o = advance(input, q.parser);
     let args = comma_list(input, o.parser, token_rparen(), pattern)?;
@@ -404,12 +440,12 @@ fn pattern_named(
     )?;
     Ok({
       parser: cl.parser,
-      node: PCtor({ span: span_to(span, cl.node), name: q.node, args: args.node }),
+      node: PatternConstructor({ span: span_to(span, cl.node), name: q.node, args: args.node }),
     })
   } else {
     Ok({
       parser: q.parser,
-      node: PCtor({ span: span_to(span, q.node.span), name: q.node, args: [] }),
+      node: PatternConstructor({ span: span_to(span, q.node.span), name: q.node, args: [] }),
     })
   }
 }
@@ -421,7 +457,10 @@ type ListAcc = { parser: Parser, rest: Option<Pattern>, items: List<Pattern> }
 
 type ListOut = { rest: Option<Pattern>, items: List<Pattern> }
 
-fn list_pattern(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+fn list_pattern(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: b } = list_items(input, o.parser, o.node)?;
   let { parser, node: cl } = expect_close(
@@ -431,14 +470,17 @@ fn list_pattern(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser>
     o.node,
     b"`]` to close the list pattern",
   )?;
-  Ok({ parser: parser, node: PList({ span: span_to(o.node, cl), rest: b.rest, items: b.items }) })
+  Ok({
+    parser: parser,
+    node: PatternList({ span: span_to(o.node, cl), rest: b.rest, items: b.items }),
+  })
 }
 
 fn list_items(
   input: Input,
   parser: Parser,
   open: Span,
-) -> Result<Parsed<ListOut>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<ListOut>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, rest: None, items: [] },
     input.token_count - parser.pos + 1,
@@ -452,9 +494,10 @@ fn list_items(
         let bound = match token_kind(input, d.parser) {
           Identifier(n) -> match expect_ident(input, d.parser, b"a name after `..`") {
             Err(q) -> Err(q),
-            Ok(i) -> Ok({ parser: i.parser, node: PVar({ span: i.node.span, name: i.node }) }),
+            Ok(i) ->
+              Ok({ parser: i.parser, node: PatternVariable({ span: i.node.span, name: i.node }) }),
           },
-          _ -> Ok({ parser: d.parser, node: PWild({ span: d.node }) }),
+          _ -> Ok({ parser: d.parser, node: PatternWildcard({ span: d.node }) }),
         };
         match bound {
           Err(q) -> Stop(Err(q)),
@@ -483,11 +526,18 @@ fn list_items(
 
 // --- Record patterns --------------------------------------------------------
 
-type RecAcc = { parser: Parser, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> }
+type PartialRecordPattern = {
+  parser: Parser,
+  rest: Bool,
+  fields: List<{ name: Ident, pat: Pattern }>,
+}
 
-type RecOut = { rest: Bool, fields: List<{ name: Ident, pat: Pattern }> }
+type RecordPatternFields = { rest: Bool, fields: List<{ name: Ident, pat: Pattern }> }
 
-fn record_pattern(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parser> / {abort.raise} = {
+fn record_pattern(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Pattern>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: b } = record_fields(input, o.parser, o.node)?;
   let { parser, node: cl } = expect_close(
@@ -498,8 +548,11 @@ fn record_pattern(input: Input, parser: Parser) -> Result<Parsed<Pattern>, Parse
     b"`}` to close the record pattern",
   )?;
   Ok({
-    parser: fields_once(parser, b.fields.map(|f: { name: Ident, pat: Pattern }| f.name)),
-    node: PRecord({ span: span_to(o.node, cl), rest: b.rest, fields: b.fields }),
+    parser: report_duplicate_fields(
+      parser,
+      b.fields.map(|f: { name: Ident, pat: Pattern }| f.name),
+    ),
+    node: PatternRecord({ span: span_to(o.node, cl), rest: b.rest, fields: b.fields }),
   })
 }
 
@@ -507,11 +560,11 @@ fn record_fields(
   input: Input,
   parser: Parser,
   open: Span,
-) -> Result<Parsed<RecOut>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<RecordPatternFields>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, rest: false, fields: [] },
     input.token_count - parser.pos + 1,
-    |s: RecAcc|
+    |s: PartialRecordPattern|
       if at_token(input, s.parser, token_rbrace()) {
         Stop(Ok({ parser: s.parser, node: { rest: s.rest, fields: s.fields } }))
       } else if at_eof(input, s.parser) {
@@ -533,8 +586,12 @@ fn record_fields(
               let co = eat(input, n.parser, token_colon());
               // The shorthand `{x}` binds with the name's span; a keyword cannot be punned.
               let f = if co.ok { pattern(input, co.parser) }
-              else if fname.node.keyword { Err(keyword_pun_refusal(co.parser, n.node)) }
-              else { Ok({ parser: co.parser, node: PVar({ span: n.node.span, name: n.node }) }) };
+              else if fname.node.keyword { Err(keyword_pun_error(co.parser, n.node)) } else {
+                Ok({
+                  parser: co.parser,
+                  node: PatternVariable({ span: n.node.span, name: n.node }),
+                })
+              };
               match f {
                 Err(q) -> Stop(Err(q)),
                 Ok(fv) -> {
@@ -568,30 +625,31 @@ fn record_fields(
 
 pub fn dump_pattern(pattern: Pattern) -> Bytes / {abort.raise} =
   match pattern {
-    PWild(v) -> dump_node(v.span, b"pwld"),
-    PVar(v) -> dump_node(v.span, b"pvar").concat(dump_ident(v.name)),
-    PLit(v) -> dump_node(v.span, b"plit").concat(dump_lit(v.lit)),
-    PRange(v) -> Bytes::concat_all([dump_node(v.span, b"prng"), dump_lit(v.lo), dump_lit(v.hi)]),
-    PCtor(v) ->
+    PatternWildcard(v) -> dump_node(v.span, b"pwld"),
+    PatternVariable(v) -> dump_node(v.span, b"pvar").concat(dump_ident(v.name)),
+    PatternLiteral(v) -> dump_node(v.span, b"plit").concat(dump_lit(v.lit)),
+    PatternRange(v) ->
+      Bytes::concat_all([dump_node(v.span, b"prng"), dump_lit(v.lo), dump_lit(v.hi)]),
+    PatternConstructor(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"pctr"),
         dump_qname(v.name),
         dump_list(v.args, dump_pattern),
       ]),
-    PRecord(v) ->
+    PatternRecord(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"prec"),
         dump_presence(v.rest),
         dump_list(v.fields, dump_pat_field),
       ]),
-    PList(v) ->
+    PatternList(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"plst"),
         dump_list(v.items, dump_pattern),
         dump_opt(v.rest, dump_pattern),
       ]),
-    POr(v) -> dump_node(v.span, b"por").concat(dump_list(v.alts, dump_pattern)),
-    PBad(v) -> dump_node(v.span, b"pbad"),
+    PatternOr(v) -> dump_node(v.span, b"por").concat(dump_list(v.alternatives, dump_pattern)),
+    PatternInvalid(v) -> dump_node(v.span, b"pbad"),
   }
 
 fn dump_pat_field(f: { name: Ident, pat: Pattern }) -> Bytes / {abort.raise} =
@@ -721,21 +779,21 @@ test "a parenthesised alternative nests rather than flattening" {
 /// Names and structure only, for the expansion tests below.
 fn shape(pattern: Pattern) -> Bytes =
   match pattern {
-    PWild(_) -> b"_",
-    PVar(v) -> v.name.name,
-    PLit(_) -> b"#",
-    PRange(_) -> b"#..=#",
-    PCtor(v) -> if v.args.len() == 0 { v.name.name.name }
+    PatternWildcard(_) -> b"_",
+    PatternVariable(v) -> v.name.name,
+    PatternLiteral(_) -> b"#",
+    PatternRange(_) -> b"#..=#",
+    PatternConstructor(v) -> if v.args.len() == 0 { v.name.name.name }
     else { Bytes::concat_all([v.name.name.name, b"(", join_shapes(v.args), b")"]) },
-    PRecord(v) ->
+    PatternRecord(v) ->
       Bytes::concat_all([
         b"(",
         join_shapes(v.fields.map(|f: { name: Ident, pat: Pattern }| f.pat)),
         b")",
       ]),
-    PList(v) -> Bytes::concat_all([b"[", join_shapes(v.items), b"]"]),
-    POr(v) -> Bytes::concat_all([b"{", join_shapes(v.alts), b"}"]),
-    PBad(_) -> b"!",
+    PatternList(v) -> Bytes::concat_all([b"[", join_shapes(v.items), b"]"]),
+    PatternOr(v) -> Bytes::concat_all([b"{", join_shapes(v.alternatives), b"}"]),
+    PatternInvalid(_) -> b"!",
   }
 
 fn join_shapes(patterns: List<Pattern>) -> Bytes =

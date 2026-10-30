@@ -1,0 +1,952 @@
+//! The typed form a root's body is lowered to before any C is written. Every value is a variable
+//! holding the checker's type, held as a representation decided from that type; every join is a
+//! variable of its own type; every count is an instruction, which the ownership pass alone writes.
+//! Blocks nest only in `If`, `Case`, `Match`, `Loop` and `Handle`.
+
+import compiler.check.known (none_ctor, some_ctor)
+import compiler.check.types (Type, FunctionType, int_type, row_empty, string_type)
+import std.bytes (ascii_of_int)
+import compiler.syntax.parsing (Span, dummy_span)
+import compiler.syntax.patterns (SourceLiteral, LiteralUnit, LiteralString)
+import compiler.emit.c (Width)
+import compiler.emit.representations (RecordShape, kind_of)
+import compiler.emit.output (GenericCall, Need, ForwardedParameter)
+import compiler.emit.keys (RootKey, Callee, Generic, Named, TypeOp, Copy, Share, Keep)
+import compiler.emit.layout (SumLayout, SumCases, PlainWords, Pointer, RawRange, WordIs,
+                             WordOutside, Nullary, Inline, holds_count, words)
+import compiler.emit.typed_ir.handling (HandleOp, HandleSite, WordArray, Label, empty_instance)
+import compiler.emit.typed_ir.containers (ContainerOp)
+import compiler.emit.typed_ir.calling (CallingOp)
+import compiler.emit.typed_ir.statics (StaticDef)
+import compiler.emit.typed_ir.strings (StringOp, StringOperand, TakesBlock, OwnBlock,
+                                       string_operands, string_result)
+
+/// How a value is held. A function of the value's type (`lower.held`), but for `AsListView`, a view the
+/// lowering chooses for a list walked by its rest in a loop, which is made a list where it leaves,
+/// and `AsReuseToken`, which the ownership pass alone writes. `AsFlattened` is a record as its leaves;
+/// `AsReuseToken(n)` the cells of a block of `n` payload words whose fields a `Reset` let go of, or zero:
+/// freed where it is let go, never released as a value. `AsSum` is a sum in the words
+/// `layout` lays it in, its cases its constructors as the table names them, in declared order; it is
+/// one part of the form, never opened into its words, and counted through the case it holds. `AsUnit`
+/// is a value of no words; `AsAddress` an address into a block's payload, borrowed from the block;
+/// `AsImmediate` a word that is its own value and holds no count, as a `Char`'s is.
+pub type Representation =
+  | AsInt
+  | AsBool
+  | AsFixed(Width)
+  | AsFloat
+  | AsDecimal
+  | AsWideFixed(Width)
+  | AsWord
+  | AsFlattened(List<Leaf>)
+  | AsListView
+  | AsReuseToken(Int)
+  | AsSum({ layout: SumLayout, cases: List<Bytes> })
+  | AsUnit
+  | AsAddress
+  | AsImmediate
+
+/// A leaf of a flattened record or of a sum's case: never itself flat.
+pub type Leaf = { name: Bytes, representation: Representation }
+
+/// A local of a root's body: its number, the checker's type at the root's type arguments, and how
+/// a value of that type is held.
+pub type Var = { id: Int, ty: Type, representation: Representation }
+
+/// An operand: a variable, or a constant C names directly.
+pub type Arg =
+  | VarOperand(Var)
+  | IntOperand(Int)
+  | BoolOperand(Bool)
+  | FloatOperand(Int)
+  | FixedOperand({ width: Width, bits: Int })
+  | CharOperand(Int)
+  | ZeroOperand(Representation)
+
+/// A field an `Update` writes: the word of the box it starts at, its type, and its value, held as
+/// a layout lays the type in place.
+pub type FieldWrite = { at: Int, ty: Type, arg: Arg }
+
+/// Whether a callee consumes what a parameter is handed or only reads it while the call runs.
+pub type ParamOwnership = | OwnedParam | BorrowedParam
+
+/// A variable a loop carries from pass to pass, `init` on the first.
+pub type Carried = { var: Var, init: Arg }
+
+/// The variables `state` carries.
+pub fn carried_vars(state: List<Carried>) -> List<Var> = state.map(|c: Carried| c.var)
+
+/// What `state` starts from.
+pub fn carried_inits(state: List<Carried>) -> List<Arg> = state.map(|c: Carried| c.init)
+
+/// How a root hands back its answer: with a count of its own the caller takes (`OwnedResult`), or read
+/// out of the lent parameters it lists, by place, without one (`BorrowedResult`), valid while the caller
+/// holds what it lent them. `whole` is where the answer may be the argument itself rather than a
+/// word read out of it.
+pub type ResultOwnership = | OwnedResult | BorrowedResult(List<{ param: Int, whole: Bool }>)
+
+/// How a root takes its parameters and hands back its answer. A `destination_passing` root answers a record
+/// lying in place and takes one more C parameter, its destination: given a place's header address,
+/// an owned answer is written there, its counts the place's, and the root answers that address;
+/// given zero, it answers a box of its own. A borrowed answer is never given one.
+pub type Convention = {
+  params: List<ParamTaking>,
+  result: Representation,
+  destination_passing: Bool,
+  answered: ResultOwnership,
+}
+
+/// How a root takes one parameter: handed over or lent, and held as `representation`.
+pub type ParamTaking = { handed: ParamOwnership, representation: Representation }
+
+/// How each parameter of `c` is held.
+pub fn reps_of(c: Convention) -> List<Representation> =
+  c.params.map(|p: ParamTaking| p.representation)
+
+/// Whether each parameter of `c` is handed over or lent.
+pub fn handed_of(c: Convention) -> List<ParamOwnership> = c.params.map(|p: ParamTaking| p.handed)
+
+/// Parameters held as `reps`, each handed over.
+pub fn all_given(reps: List<Representation>) -> List<ParamTaking> =
+  reps.map(|r: Representation| { handed: OwnedParam, representation: r })
+
+/// How parameter `i` of `c` is held, where `c` has one.
+pub fn param_rep(c: Convention, i: Int) -> Option<Representation> =
+  match c.params.at(i) { Some(p) -> Some(p.representation), None -> None }
+
+/// Whether `c` is lent parameter `i`.
+pub fn param_lent(c: Convention, i: Int) -> Bool =
+  match c.params.at(i) { Some(p) -> p.handed == BorrowedParam, None -> false }
+
+/// `c` taking its first parameters as `handed` says, one for one, and the rest as it did.
+pub fn handed_at(c: Convention, by_convention: List<ParamOwnership>) -> Convention =
+  {
+    ..c,
+    params: c.params.fold([], |acc: List<ParamTaking>, p: ParamTaking|
+      acc.push(match by_convention.at(acc.len()) { Some(h) -> { ..p, handed: h }, None -> p })),
+  }
+
+/// Parameters held as `reps`, each lent where `lent` holds its place and handed over otherwise.
+pub fn lent_where(reps: List<Representation>, lent: List<Int>) -> List<ParamTaking> =
+  range(0, reps.len()).fold([], |acc: List<ParamTaking>, i: Int|
+    match reps.at(i) {
+      Some(r) ->
+        acc.push({
+          handed: if lent.contains(i) { BorrowedParam } else { OwnedParam },
+          representation: r,
+        }),
+      None -> acc,
+    })
+
+/// What an operation does with each operand (`takes`), whether it answers a count of its own,
+/// whether it can fail, and whether it can stop for a handler that may resume it later.
+pub type OperationSignature = { takes: List<Bool>, owned: Bool, fails: Bool, suspends: Bool }
+
+/// What a `Allocate` allocates. `ClosureAllocation` is a closure over body `nth` of the root's lambdas, holding
+/// `captures` words and taking `params` arguments. `CaseAllocation` is a sum's case `case` (its place among
+/// the sum's cases) boxed, `skip` words of tag holding `case` and then `words` of payload. `StackAllocation`
+/// is what it wraps laid in the C frame of the function that makes it, which it never outlives, with
+/// a count no code takes: it borrows what it holds (a closure its captures, a list its items), which
+/// live as long as it does, so its death lets go of nothing.
+pub type Allocation =
+  | ListAllocation(Int)
+  | ClosureAllocation({ nth: Int, captures: Int, params: Int })
+  | CaseAllocation({ case: Int, skip: Int, words: Int })
+  | StackAllocation(Allocation)
+  /// The box of a record wider than a call's registers, each field that holds a value made as
+  /// its `FieldInitializer` says, in field order.
+  | RecordAllocation(List<FieldInitializer>)
+
+/// How `RecordAllocation` makes one field that holds a value: `FromArgument`, from the next argument, a record
+/// lying in place read where that value lies, a place or a box, and copied in; `BuiltInPlace`, a record
+/// lying in place made right there, each of its own fields as these say, so no box of it is made.
+pub type FieldInitializer = | FromArgument | BuiltInPlace(List<FieldInitializer>)
+
+/// Where a `Get` reads: a field by its word offset, a case's argument, a closure's capture by the word past its
+/// descriptor it starts at, a flat value's leaf, or the word of a record a block holds in place at a
+/// word offset: the address of its header there.
+/// `CasePath` is the field of an `AsSum`'s case `case` whose first word is word `at` of the case's
+/// payload, wherever its layout puts it, read as the `Get`'s variable is held, which says how many
+/// words it reads; `PayloadPath` the address of the bytes a block holds, where its type lays them, held
+/// as an `AsAddress`.
+pub type Path =
+  | FieldPath({ name: Bytes, at: Int })
+  | ArgumentPath({ ctor: Bytes, at: Int })
+  | CapturePath(Int)
+  | LeafPath(Int)
+  | InlineRecordPath(Int)
+  | CasePath({ case: Int, at: Int })
+  | PayloadPath
+
+/// What a `Case` tests its subject against. An arm's `when` is an index into a `TagTest`'s
+/// constructors or a `IntTest`'s integers; a `RangeTest` holds one arm, `when` 0. Under `LengthTest` an arm's
+/// `when` k is a list of exactly k items, and of at least k where k is `at_least`.
+pub type Test =
+  | TagTest(List<Bytes>)
+  | IntTest(List<Int>)
+  | RangeTest({ lo: Int, hi: Int })
+  | LengthTest({ at_least: Int })
+
+/// An operation one family of the lowering writes and prints beyond the shared values. What it
+/// does with its operands is the `Op` value's `uses`, so nothing outside the family reads the
+/// payload.
+pub type Operation =
+  | OfHandling(HandleOp)
+  | OfContainers(ContainerOp)
+  | OfCalling(CallingOp)
+  | OfStrings(StringOp)
+
+pub type Rvalue =
+  /// An operator of C over operands held as `on`, which decides what it means.
+  | Primitive({ op: Bytes, on: Representation, args: List<Arg> })
+  /// A constant as written. `statics.folded` lays out each but `()` before counts are placed: as
+  /// static data, a decimal as its two words.
+  | Literal(SourceLiteral)
+  /// A constant laid out as static data, by the name its content gives it.
+  | Static(Bytes)
+  /// Made in the cells of the reuse token `reuse` names where it names one, else allocated.
+  | Allocate({ made: Allocation, args: List<Arg>, reuse: Option<Var> })
+  /// What `path` reads out of `of`, borrowed from it.
+  | Get({ of: Var, path: Path })
+  /// The field held as one word that `path` (a `FieldPath` or a `ArgumentPath`) reads out of the block `of`
+  /// is held as a word, with a count of its own: where the block is held only here its slot is
+  /// emptied and the count moves to the reader, and otherwise the reader takes one more. Only the
+  /// ownership pass writes one, at a field's last read; the block it leaves may no longer hold the
+  /// field.
+  | Take({ of: Var, path: Path })
+  /// The tag of constructor `name`, as the program's constructor table names it: an `Int` the unit
+  /// writes in.
+  | Tag(Bytes)
+  /// `arg` held as `to`: a scalar boxed or read out of its word, a record or a sum made its word
+  /// form or opened out of it.
+  | Convert({ arg: Arg, to: Representation })
+  /// A value held as more than one part, from its parts in order: an `AsFlattened`'s leaves, a part that
+  /// is itself an `AsFlattened` standing for its leaves; an `AsSum`'s case place and then the case's
+  /// arguments (its box, for a boxed case), which the printer lays into the sum's words.
+  | Aggregate({ parts: List<Arg> })
+  /// `of`, the box a record is held as, with each of `sets` written over the field at its word:
+  /// written in `of` itself where the box was held only here, else in a copy of it whose counted
+  /// words are each counted once more; the value each write replaces is let go. Takes `of` and each
+  /// field's value, and answers the box written.
+  | Update({ of: Var, sets: List<FieldWrite> })
+  | Call({ callee: Callee, args: List<Arg>, convention: Convention, suspends: Bool })
+  /// `closure` is the place among the root's closures of the lambda `f` is known to be a closure of,
+  /// whose entry by its type the call enters directly.
+  | Apply({ f: Arg, args: List<Arg>, convention: Convention, suspends: Bool, closure: Option<Int> })
+  /// A runtime function by its C name.
+  | Native({ name: Bytes, args: List<Arg>, uses: OperationSignature })
+  | Op({ op: Operation, args: List<Arg>, uses: OperationSignature })
+  /// Takes the variable's count: answers it where that count was its last, and 0 otherwise.
+  | IfUnique(Var)
+  /// What only a specialisation computes of its operands: an operation over a type or layout a type
+  /// variable leaves open, whose need settles the body by its callers, so no printer meets one. Each
+  /// operand is taken where the specialisation's operation takes it.
+  | Unspecialised(List<{ arg: Arg, takes: Bool }>)
+  /// `of` walked by its blocks as `op` says, `Copy`, `Share` or `Keep`: a copy, which takes `of`; for
+  /// `Share`, every block reached marked to cross threads, answering an `AsInt` that is nonzero where
+  /// each may; for `Keep`, a copy no count releases. `Share` and `Keep` borrow `of`.
+  | WalkLoop({ of: Var, op: TypeOp })
+
+pub type Block = List<Inst>
+
+pub type Inst =
+  /// `unwind` are the owned values live across `val` where it may fail, which the failure path
+  /// releases, and which a stop's frame record holds.
+  | Let({ var: Var, val: Rvalue, at: Span, unwind: List<Var> })
+  | Do({ val: Rvalue, at: Span, unwind: List<Var> })
+  /// A join's variable, which each path into the code after it sets once.
+  | Decl(Var)
+  | Assign({ var: Var, arg: Arg })
+  | If({ cond: Arg, then: Block, otherwise: Block })
+  | Case({ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block })
+  /// Arms tried in order, each leaving for the next by `Miss`, and `rest` where none is taken.
+  | Match({ arms: List<Block>, rest: Block })
+  /// The arm's tests failed: control goes to the next arm, which starts holding what the path held
+  /// at this miss; every miss of one arm holds the same.
+  | Miss
+  /// A loop over `state`, rebound by each `Next` in `body`, left with an answer by `Done`.
+  | Loop({ state: List<Carried>, body: Block, result: Var })
+  | Next(List<Arg>)
+  | Done(Arg)
+  | Return(Arg)
+  /// A self tail call: the root's parameters take the arguments and the body starts again.
+  | Restart(List<Arg>)
+  /// A tail call of member `member` of the root's group, its arguments held as that member's
+  /// convention says.
+  | Jump({ member: Int, args: List<Arg> })
+  /// The run fails as `reason` says, its site the text at `at`: on its way out it lets go of the
+  /// resources `letting` names, and then of the counts `unwind` holds, which the ownership pass
+  /// alone writes.
+  | Fail({ reason: MatchFailure, at: Span, letting: List<Unwinding>, unwind: List<Var> })
+  /// `body` run under the handlers `site` lays out over `args`, its answer or a clause's in `result`.
+  /// `unwind` are the owned values held across the body, which its landing releases where a failure
+  /// inside it is answered by no clause; a failing instruction inside releases only what the body
+  /// holds beyond them.
+  | Handle({ body: Block, args: List<Arg>, uses: OperationSignature, site: HandleSite, result: Var, unwind: List<Var> })
+  /// The failure sites of the instructions after it in its block, and of the blocks they hold, are
+  /// `Some` lender's: a lambda another root lent runs in place there. `None` ends the innermost such
+  /// run this block began. Writes no C, holds and reads nothing.
+  | SiteScope(Option<SiteOrigin>)
+  /// Where a raise, a clause that did not resume, or a cancel fails an instruction after it in its
+  /// block, or in a block they hold, the failure path first lets go of each of `Some` list's
+  /// resources, in order, before it releases what the instruction holds; `None` ends the innermost
+  /// such run this block began. A resource is let go by its type's `LetGo` root, and one whose
+  /// release fails replaces the failure going on. Writes no C where it stands, and holds nothing:
+  /// each value it names is live past the run, which the body lets go of on its own path.
+  | CleanupScope(Option<List<Unwinding>>)
+  // Written by the ownership pass alone.
+  | Inc({ var: Var, n: Int })
+  | Dec(Var)
+  /// `of`'s cells kept as `token` where `of` was the only holder, for a later `Allocate` to take.
+  | Reset({ token: Var, of: Var })
+  /// A reuse token no `Allocate` took, its block freed.
+  | Free({ of: Var, bytes: Arg })
+  /// A block known to be held only here consumed, and its counted words bound as owned.
+  | Destructure({ of: Var, words: List<Var> })
+
+/// A resource a failure lets go of: the value, the words handed past it for what its release
+/// performs, and the call of its type's `LetGo` root on them.
+pub type Unwinding = { arg: Arg, words: List<Arg>, callee: RootKey, convention: Convention }
+
+/// What a `Fail` fails with: no arm of a `match` matched, which fails the run, or a `let`'s pattern
+/// did not hold its value, which raises.
+pub type MatchFailure = | NoMatchingArm | LetMismatch
+
+/// The root that lent a lambda run in place: its key, which the lambda's failure sites name, and
+/// where its definition's text starts, which they count from.
+pub type SiteOrigin = { root: RootKey, base: Int }
+
+/// Whether a function is a root, which probes the stack and tests for failure: the program's own, an
+/// entry, or a type's lowering or lifting; or a plain one the emitter writes for a type (a drop,
+/// share, keep or copy root) or as the closure a name read as a value is, which does neither but
+/// still grows its stack.
+pub type FnKind = | Metered | Plain
+
+/// What a root tells the unit beyond its C: its calls of generic definitions, numbered as their
+/// `Generic(n)` callees are, what a specialisation would read of each type variable it took a slow
+/// path at, the parameters it calls as functions, and the parameters it hands on to calls.
+pub type Links = {
+  generics: List<GenericCall>,
+  needs: List<Need>,
+  called: List<Int>,
+  passes: List<ForwardedParameter>,
+  pending: Option<PendingRaise>,
+}
+
+pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [], pending: None }
+
+/// How a function raises, as it leaves on a failure, an `abort.raise` the runtime left pending: on
+/// `word`, the evidence object it holds for `abort`, whose operation `index` the raise is, its `op#`
+/// and the descriptor of `String` the static objects `op` and `string`.
+pub type PendingRaise = { word: Var, index: Int, op: Bytes, string: Bytes }
+
+/// One root's form. `params` are held as `conv` takes them, but a list a root of its own walks down
+/// by restarting on its rest, which it holds as a view of the list whose word `conv` takes; a
+/// `Restart` hands its arguments as `params` are held. `lambdas` are the bodies of the closures it
+/// makes (its lambdas, its handlers' clauses, a `simulate`'s body), each `ClosureAllocation`'s `nth` its place
+/// among them; `base` is where its definition's text starts, which its failure sites count from;
+/// `members` are a tail group's roots in case order, and empty for a root of its own. `statics` are
+/// the static objects its body names, each after those it names; a lambda's body holds its own.
+/// `result_type` is the type of what `conv.result` holds.
+///
+/// A tail group's `Fn` is keyed as its first member, takes one parameter, `which`, an `AsInt`, and
+/// answers a word, of the `result_type` every member answers. Its body is one `Case` on `which` testing
+/// `IntTest` of each member's place, arm `i` member `i`'s body, which reads `members[i].params` and
+/// answers a word by `Return`, and its rest a `Return` of a zero word. Inside arm `i` an `Jump` goes
+/// to a member's start with that member's arguments, and a `Restart` to member `i`'s.
+pub type Fn = {
+  key: RootKey,
+  kind: FnKind,
+  params: List<Var>,
+  convention: Convention,
+  result_type: Type,
+  body: Block,
+  lambdas: List<Lambda>,
+  base: Int,
+  members: List<Member>,
+  links: Links,
+  statics: List<StaticDef>,
+}
+
+/// A member of a tail group: its root, where its definition's text starts, its parameters at its own
+/// reps, and how its own entry and wrapper take them and answer.
+pub type Member = { key: RootKey, base: Int, params: List<Var>, convention: Convention }
+
+/// The body of a closure a root makes, numbered by its place among them, and the lambda's place in
+/// the root's text. The first `captures` of `body.params` are the words the closure captured, which
+/// its C function takes before its own parameters; `words` what its function takes after them.
+pub type Lambda = | Closure({ body: Fn, captures: Int, at: Span, words: ClosureEvidence })
+
+/// The evidence words a closure's function takes past its own parameters, as the lambda's own row
+/// says, which the closure's entry by its type reads off the words its caller hands: the name of
+/// the static descriptor of that row, how many words, and for each word of a label the row leaves
+/// to its caller, the place among the closure's captures of the label it was made with.
+pub type ClosureEvidence = { descriptor: Bytes, count: Int, left: List<Int> }
+
+/// What a closure of a row taking no word takes.
+pub fn no_closure_evidence() -> ClosureEvidence = { descriptor: b"", count: 0, left: [] }
+
+/// How a value held as `r` is held, as a fault names it.
+pub fn representation_text(r: Representation) -> Bytes =
+  match r {
+    AsInt -> b"Int",
+    AsBool -> b"Bool",
+    AsFixed(_) -> b"a number of a width",
+    AsFloat -> b"Float",
+    AsDecimal -> b"Decimal",
+    AsWideFixed(w) -> if w.signed { b"I128" } else { b"U128" },
+    AsWord -> b"a word",
+    AsFlattened(ls) -> Bytes::concat_all([b"flat, ", ascii_of_int(ls.len()), b" leaves"]),
+    AsListView -> b"a view",
+    AsReuseToken(n) -> Bytes::concat_all([b"a token of ", ascii_of_int(n), b" words"]),
+    AsSum(s) -> Bytes::concat_all([b"a sum's words, ", ascii_of_int(s.cases.len()), b" cases"]),
+    AsUnit -> b"no words",
+    AsAddress -> b"an address into a block",
+    AsImmediate -> b"a word holding no count",
+  }
+
+/// Variable `v` and how it is held, as a fault names it.
+pub fn var_text(v: Var) -> Bytes =
+  Bytes::concat_all([b"v", ascii_of_int(v.id), b" held as ", representation_text(v.representation)])
+
+/// What `m` makes, as a fault names it.
+pub fn allocation_text(m: Allocation) -> Bytes =
+  match m {
+    ListAllocation(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
+    ClosureAllocation(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
+    CaseAllocation(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
+    RecordAllocation(_) -> b"record",
+    StackAllocation(x) -> Bytes::concat_all([allocation_text(x), b" in the frame"]),
+  }
+
+/// What `m` lays out, wherever it lays it.
+pub fn base_allocation(m: Allocation) -> Allocation =
+  match m { StackAllocation(x) -> base_allocation(x), _ -> m }
+
+/// What a block laid in the frame borrows of `m`'s arguments `args`: a closure's captures, a list's
+/// items.
+pub fn stack_borrows(m: Allocation, args: List<Arg>) -> Option<List<Arg>> =
+  match m {
+    StackAllocation(ClosureAllocation(c)) -> Some(args.take(c.captures)),
+    StackAllocation(ListAllocation(_)) -> Some(args),
+    _ -> None,
+  }
+
+/// Whether a value held as `r` holds a count: a word, a view of a list, a reuse token, a flat value
+/// with a counted leaf, or a sum some case of which holds one.
+pub fn is_refcounted(r: Representation) -> Bool =
+  match r {
+    AsWord -> true,
+    AsListView -> true,
+    AsReuseToken(_) -> true,
+    AsFlattened(leaves) ->
+      leaves.fold(false, |any: Bool, l: Leaf| any || is_refcounted(l.representation)),
+    AsSum(s) -> holds_count(SumCases(s.layout)),
+    _ -> false,
+  }
+
+/// Whether a value held as `r` is a box of its words where it is held as a word: a flat value, or a
+/// sum of more than one word. Its word is made by laying those words in a box, and opened by taking
+/// the box apart.
+pub fn is_boxed(r: Representation) -> Bool =
+  match r { AsFlattened(_) -> true, AsSum(s) -> words(SumCases(s.layout)) > 1, _ -> false }
+
+/// Whether packing `arg` as `to` reads a word as the box of words it is (`is_boxed`): a view of the
+/// box's words, read out of the word as a field is, which takes nothing and holds no count of its
+/// own, so a specialisation reads a parameter's field as the generic body reads it off the word.
+pub fn is_unboxing(arg: Arg, to: Representation) -> Bool =
+  operand_representation(arg) == AsWord && is_boxed(to)
+
+/// The parts a value held as `r` is laid in, each as it is held: a flat value's leaves, a view's
+/// list and its offset, anything else itself (an `AsSum` among them, which only a printer lays out as
+/// its words).
+pub fn parts_of(r: Representation) -> List<Representation> =
+  match r {
+    AsFlattened(leaves) -> leaves.map(|l: Leaf| l.representation),
+    AsListView -> [AsWord, AsInt],
+    _ -> [r],
+  }
+
+/// How operand `a` is held: a variable as its own representation says, a constant as C names it.
+pub fn operand_representation(a: Arg) -> Representation =
+  match a {
+    VarOperand(v) -> v.representation,
+    IntOperand(_) -> AsInt,
+    BoolOperand(_) -> AsBool,
+    FloatOperand(_) -> AsFloat,
+    FixedOperand(n) -> AsFixed(n.width),
+    CharOperand(_) -> AsImmediate,
+    ZeroOperand(r) -> r,
+  }
+
+/// The variable an operand is, if it is one.
+pub fn operand_var(a: Arg) -> Option<Var> = match a { VarOperand(v) -> Some(v), _ -> None }
+
+/// Whether a call applies the function value `f` through its descriptor's typed entry, which takes
+/// the closure: a value of a function type. A continuation, which has none, is applied through its
+/// uniform entry, which borrows it.
+pub fn uses_typed_entry(f: Arg) -> Bool =
+  match f { VarOperand(v) -> match v.ty { FunctionType(_) -> true, _ -> false }, _ -> false }
+
+/// Each operand of `v` and whether `v` consumes it, by the fixed signature each operation has: a
+/// call takes what its convention gives and borrows what it lends, and takes the function it applies
+/// where it enters it typed (`uses_typed_entry`); an operator and a field read borrow, as do holding a
+/// value as one that holds no count and reading a word as the box of words it is (`is_unboxing`); what
+/// allocates or answers takes but a stacked closure, which reads its captures while its caller holds
+/// them; a runtime function or a family's operation does as its `uses` say; a test of a last holder
+/// takes what it tests; a walk takes what it copies and borrows what it shares or keeps.
+pub fn operands(v: Rvalue) -> List<{ arg: Arg, takes: Bool }> =
+  match v {
+    Primitive(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
+    Literal(_) -> [],
+    Static(_) -> [],
+    Allocate(m) -> if is_record_allocation(m.made) { read_records(m.args) } else {
+      let lent = match stack_borrows(m.made, m.args) { Some(cs) -> cs.len(), None -> 0 };
+      range(0, m.args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+        match m.args.at(i) {
+          Some(a) -> acc.push({ arg: a, takes: i >= lent }),
+          None -> acc,
+        }).concat(match m.reuse { Some(t) -> [{ arg: VarOperand(t), takes: true }], None -> [] })
+    },
+    Get(g) -> [{ arg: VarOperand(g.of), takes: false }],
+    Take(t) -> [{ arg: VarOperand(t.of), takes: false }],
+    Tag(_) -> [],
+    Convert(p) -> [{ arg: p.arg, takes: is_refcounted(p.to) && !is_unboxing(p.arg, p.to) }],
+    Aggregate(g) -> g.parts.map(|a: Arg| { arg: a, takes: true }),
+    Update(u) ->
+      [{ arg: VarOperand(u.of), takes: true }].concat(
+        read_records(u.sets.map(|s: FieldWrite| s.arg)),
+      ),
+    Call(c) -> by_convention(c.args, c.convention),
+    Apply(c) ->
+      [{ arg: c.f, takes: uses_typed_entry(c.f) }].concat(by_convention(c.args, c.convention)),
+    Native(n) -> by_signature(n.args, n.uses),
+    Op(o) -> by_signature(o.args, o.uses),
+    IfUnique(x) -> [{ arg: VarOperand(x), takes: true }],
+    WalkLoop(w) -> [{ arg: VarOperand(w.of), takes: w.op == Copy }],
+    Unspecialised(ops) -> ops,
+  }
+
+fn is_record_allocation(m: Allocation) -> Bool = match m { RecordAllocation(_) -> true, _ -> false }
+
+/// `args`, each only read.
+pub fn read_only(args: List<Arg>) -> List<{ arg: Arg, takes: Bool }> =
+  args.map(|a: Arg| { arg: a, takes: false })
+
+/// What an operation over `n` words does with them: reads them, answering what holds no count.
+pub fn reads(n: Int) -> OperationSignature =
+  { takes: range(0, n).map(|_: Int| false), owned: false, fails: false, suspends: false }
+
+/// `args`, values written into a record's fields: each taken, but a record held as a word, which a
+/// field lays in place and is copied in from where it lies, so it is only read.
+pub fn read_records(args: List<Arg>) -> List<{ arg: Arg, takes: Bool }> =
+  args.map(|a: Arg|
+    { arg: a, takes: match operand_var(a) { Some(v) -> !is_record_word(v), None -> true } })
+
+/// Whether `v` is a record held as a word: a box of its own, or a record lying in place in what it
+/// was read out of, which no count can be taken of.
+pub fn is_record_word(v: Var) -> Bool =
+  v.representation == AsWord && (match kind_of(v.ty).ty { RecordShape(_) -> true, _ -> false })
+
+fn by_convention(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) { Some(a) -> acc.push({ arg: a, takes: !param_lent(conv, i) }), None -> acc })
+
+/// The `uses` an operation over bytes is written with, as `strings.string_operands` and
+/// `string_result` say: it takes only the block it grows, answers a count of its own only where it
+/// answers a block, and neither fails nor stops.
+pub fn string_signature(op: StringOp) -> OperationSignature =
+  {
+    takes: string_operands(op).map(|a: StringOperand| a == TakesBlock),
+    owned: string_result(op) == OwnBlock,
+    fails: false,
+    suspends: false,
+  }
+
+/// Each of `args` and whether `uses` takes it: what a runtime function, a family's operation or a
+/// `Handle` does with its operands.
+pub fn by_signature(args: List<Arg>, uses: OperationSignature) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) {
+      Some(a) -> acc.push({ arg: a, takes: uses.takes.at(i) == Some(true) }),
+      None -> acc,
+    })
+
+/// How what `v` answers is held: a count of its own, read without one out of the operands it names,
+/// valid while each is held, or a constant no count is kept of.
+pub type Provenance = | Owns | BorrowSources(List<Var>) | Immortal
+
+pub fn provenance(v: Rvalue) -> Provenance =
+  match v {
+    Get(g) -> BorrowSources([g.of]),
+    Static(_) -> Immortal,
+    Tag(_) -> Immortal,
+    Native(n) -> signature_provenance(n.args, n.uses),
+    Op(o) -> signature_provenance(o.args, o.uses),
+    // A share answers a scalar.
+    WalkLoop(w) -> if w.op == Share { Immortal } else { Owns },
+    Convert(p) -> if !is_unboxing(p.arg, p.to) { Owns }
+    else { match p.arg { VarOperand(x) -> BorrowSources([x]), _ -> Immortal } },
+    Call(c) -> match c.convention.answered {
+      OwnedResult -> Owns,
+      BorrowedResult(from) ->
+        BorrowSources(
+          from.fold([], |xs: List<Var>, b: { param: Int, whole: Bool }|
+            match c.args.at(b.param) {
+              Some(VarOperand(x)) -> if is_refcounted(x.representation) && !xs.contains(x) {
+                xs.push(x)
+              } else { xs },
+              _ -> xs,
+            }),
+        ),
+    },
+    _ -> Owns,
+  }
+
+fn signature_provenance(args: List<Arg>, uses: OperationSignature) -> Provenance =
+  if uses.owned { Owns }
+  else { match args.at(0) { Some(VarOperand(x)) -> BorrowSources([x]), _ -> Immortal } }
+
+/// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
+/// call, a checked operator, and what its `uses` say of a runtime function or
+/// a family's operation. A value made or packed only allocates, which never fails: the heap aborts
+/// when it is exhausted. A constant is laid out before the program runs.
+pub fn fails(v: Rvalue) -> Bool =
+  match v {
+    Primitive(p) -> checked(p.op, p.on),
+    Literal(_) -> false,
+    Static(_) -> false,
+    Allocate(_) -> false,
+    Get(_) -> false,
+    Take(_) -> false,
+    Tag(_) -> false,
+    Convert(_) -> false,
+    Aggregate(_) -> false,
+    Update(_) -> false,
+    Call(_) -> true,
+    Apply(_) -> true,
+    Native(n) -> n.uses.fails,
+    Op(o) -> o.uses.fails,
+    IfUnique(_) -> false,
+    WalkLoop(_) -> false,
+    Unspecialised(_) -> false,
+  }
+
+/// Whether `val` may stop for a handler that resumes it later.
+pub fn may_suspend(val: Rvalue) -> Bool =
+  match val {
+    Call(c) -> c.suspends,
+    Apply(c) -> c.suspends,
+    Native(n) -> n.uses.suspends,
+    Op(o) -> o.uses.suspends,
+    _ -> false,
+  }
+
+/// Whether an instruction of `b`, or of a block it holds, is one `at` answers true for. A closure's
+/// body is its own function, so none is read.
+pub fn any_held(b: Block, at: (Inst) -> Bool) -> Bool =
+  b.any(|i: Inst|
+    at(i)
+      || (match i {
+        If(x) -> any_held(x.then, at) || any_held(x.otherwise, at),
+        Case(c) ->
+          any_held(c.rest, at) || c.arms.any(|a: { when: Int, body: Block }| any_held(a.body, at)),
+        Match(m) -> any_held(m.rest, at) || m.arms.any(|arm: Block| any_held(arm, at)),
+        Loop(l) -> any_held(l.body, at),
+        Handle(h) -> any_held(h.body, at),
+        _ -> false,
+      }))
+
+/// Whether the value an instruction binds or does is one `at` answers true for.
+fn valued(i: Inst, at: (Rvalue) -> Bool) -> Bool =
+  match i { Let(l) -> at(l.val), Do(d) -> at(d.val), _ -> false }
+
+/// Whether an instruction of `b`, or of a block it holds, may stop.
+pub fn suspends_in(b: Block) -> Bool = any_held(b, |i: Inst| valued(i, may_suspend))
+
+/// Whether an instruction of `b`, or of a block it holds, calls a function, by name or as a value.
+pub fn calls_in(b: Block) -> Bool =
+  any_held(b, |i: Inst|
+    valued(i, |v: Rvalue| match v { Call(_) -> true, Apply(_) -> true, _ -> false }))
+
+/// Whether anything may stop under a `handle` running `body` at `site`: a clause, its `return`
+/// clause, its body run detached, or a stop in its body. What it holds across its body is then held
+/// across a stop.
+pub fn handle_suspends(body: Block, site: HandleSite) -> Bool =
+  site.clauses.len() > 0 || site.ret != None || site.detached != None || suspends_in(body)
+
+/// Whether operator `op` over `on` is checked: an integer's arithmetic and shifts, which overflow
+/// or divide by zero, and a width's; an `Int` made a width it does not fit (`of_int`), and a `U64`
+/// or a 128-bit width made an `Int` (`to_int`); a decimal's arithmetic.
+pub fn checked(op: Bytes, on: Representation) -> Bool =
+  match on {
+    AsInt -> arithmetic(op) || shift(op) || op == b"neg" || op == b"of_int",
+    AsFixed(w) ->
+      arithmetic(op) || shift(op) || op == b"neg" || (op == b"to_int" && !w.signed && w.bits == 64),
+    AsFloat -> op == b"rem",
+    AsDecimal -> arithmetic(op),
+    AsWideFixed(_) -> arithmetic(op) || shift(op) || op == b"neg" || op == b"to_int",
+    _ -> false,
+  }
+
+pub fn arithmetic(op: Bytes) -> Bool =
+  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+pub fn shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
+
+pub fn comparison(op: Bytes) -> Bool =
+  op == b"eq" || op == b"ne" || op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+
+/// Whether control never passes `i` to what follows it in its block.
+pub fn is_terminator(i: Inst) -> Bool =
+  match i {
+    Return(_) -> true,
+    Restart(_) -> true,
+    Jump(_) -> true,
+    Next(_) -> true,
+    Done(_) -> true,
+    Fail(_) -> true,
+    Miss -> true,
+    _ -> false,
+  }
+
+/// Whether control can leave `b` at its end: its last instruction but a marker does not end.
+pub fn falls_through(b: Block) -> Bool =
+  b.fold(true, |falls: Bool, i: Inst|
+    match i { SiteScope(_) -> falls, CleanupScope(_) -> falls, _ -> !is_terminator(i) })
+
+test "a word, a view and a flat value with a counted leaf hold a count where a scalar holds none" {
+  assert_eq(
+    [AsInt, AsBool, AsFloat, AsDecimal, AsFixed({ bits: 8, signed: false })].map(is_refcounted),
+    [false, false, false, false, false],
+  );
+  assert_eq([AsWord, AsListView, AsReuseToken(2)].map(is_refcounted), [true, true, true]);
+  assert_eq(
+    [
+      AsFlattened([{ name: b"a", representation: AsInt }]),
+      AsFlattened([{ name: b"a", representation: AsInt }, { name: b"s", representation: AsWord }]),
+    ].map(
+      is_refcounted,
+    ),
+    [false, true],
+  )
+}
+
+test "each operation consumes or borrows each operand as its signature says" {
+  let s = { id: 1, ty: string_type(), representation: AsWord };
+  let conv = {
+    params: [
+      { handed: OwnedParam, representation: AsWord },
+      { handed: BorrowedParam, representation: AsWord },
+    ],
+    result: AsInt,
+    destination_passing: false,
+    answered: OwnedResult,
+  };
+  let call = Call({
+    callee: Generic(0),
+    args: [VarOperand(s), VarOperand(s)],
+    convention: conv,
+    suspends: false,
+  });
+  let takes = |v: Rvalue| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes);
+  assert_eq(takes(call), [true, false]);
+  // A call takes a function value it enters typed, and borrows a continuation.
+  let f = {
+    id: 2,
+    ty: FunctionType({
+      kept: [],
+      once: false,
+      params: [s.ty, s.ty],
+      ret: int_type(),
+      effects: row_empty(),
+    }),
+    representation: AsWord,
+  };
+  let apply = |f: Arg, args: List<Arg>|
+    Apply({ f: f, args: args, convention: conv, suspends: false, closure: None });
+  assert_eq(takes(apply(VarOperand(f), [VarOperand(s), VarOperand(s)])), [true, true, false]);
+  assert_eq(takes(apply(VarOperand(s), [VarOperand(s)])), [false, true]);
+  assert_eq(takes(Get({ of: s, path: LeafPath(0) })), [false]);
+  assert_eq(takes(Aggregate({ parts: [VarOperand(s), IntOperand(1)] })), [true, true]);
+  // A word read as a scalar is borrowed; a scalar boxed is taken.
+  assert_eq(takes(Convert({ arg: VarOperand(s), to: AsInt })), [false]);
+  assert_eq(takes(Convert({ arg: IntOperand(1), to: AsWord })), [true]);
+  // A word read as the box of words it is is a view of them, read out of the word.
+  let flat = AsFlattened([
+    { name: b"a", representation: AsWord },
+    { name: b"b", representation: AsInt },
+  ]);
+  assert_eq(takes(Convert({ arg: VarOperand(s), to: flat })), [false]);
+  assert_eq(provenance(Convert({ arg: VarOperand(s), to: flat })), BorrowSources([s]));
+  // A stacked closure reads its captures, which its caller holds while it is lent.
+  let closure = |framed: Bool|
+    Allocate({
+      made: if framed { StackAllocation(ClosureAllocation({ nth: 0, captures: 2, params: 1 })) }
+      else { ClosureAllocation({ nth: 0, captures: 2, params: 1 }) },
+      args: [VarOperand(s), VarOperand(s)],
+      reuse: None,
+    });
+  assert_eq(takes(closure(true)), [false, false]);
+  assert_eq(takes(closure(false)), [true, true]);
+  // A field taken leaves its block held, and answers a count of its own.
+  let taken = Take({ of: s, path: FieldPath({ name: b"buf", at: 1 }) });
+  assert_eq(takes(taken), [false]);
+  assert_eq(provenance(taken), Owns);
+  assert_eq(provenance(Tag(b"m.Box")), Immortal);
+  let lent = { takes: [false, true], owned: false, fails: true, suspends: false };
+  assert_eq(
+    takes(Op({ op: OfHandling(WordArray), args: [VarOperand(s), VarOperand(s)], uses: lent })),
+    [false, true],
+  );
+  assert_eq(provenance(Get({ of: s, path: LeafPath(0) })), BorrowSources([s]));
+  assert_eq(provenance(call), Owns);
+  // A call answering what it read out of what it was lent holds no count: it reads those arguments.
+  let borrowed = match call {
+    Call(c) ->
+      Call({
+        ..c,
+        convention: { ..c.convention, answered: BorrowedResult([{ param: 1, whole: true }]) },
+      }),
+    other -> other,
+  };
+  assert_eq(provenance(borrowed), BorrowSources([s]));
+  assert_eq(
+    provenance(Native({ name: b"rt_len_p", args: [VarOperand(s)], uses: lent })),
+    BorrowSources([s]),
+  );
+  assert_eq(provenance(Op({ op: OfHandling(Label(b"r")), args: [], uses: lent })), Immortal)
+}
+
+test "what can fail is what tests the runtime: a checked operator, a call, never an allocation or a constant" {
+  assert_eq(
+    fails(Primitive({ op: b"add", on: AsInt, args: [IntOperand(1), IntOperand(2)] })),
+    true,
+  );
+  assert_eq(
+    fails(Primitive({ op: b"lt", on: AsInt, args: [IntOperand(1), IntOperand(2)] })),
+    false,
+  );
+  assert_eq(
+    fails(Primitive({ op: b"add", on: AsFloat, args: [FloatOperand(0), FloatOperand(0)] })),
+    false,
+  );
+  assert_eq(
+    fails(
+      Primitive({
+        op: b"add",
+        on: AsDecimal,
+        args: [ZeroOperand(AsDecimal), ZeroOperand(AsDecimal)],
+      }),
+    ),
+    true,
+  );
+  assert_eq(fails(Primitive({ op: b"of_int", on: AsInt, args: [IntOperand(300)] })), true);
+  let w = { id: 2, ty: string_type(), representation: AsWord };
+  assert_eq(fails(Get({ of: w, path: LeafPath(0) })), false);
+  let flat = { ..w, representation: AsFlattened([{ name: b"x", representation: AsInt }]) };
+  assert_eq(fails(Convert({ arg: IntOperand(7), to: AsWord })), false);
+  assert_eq(fails(Convert({ arg: VarOperand(flat), to: AsWord })), false);
+  assert_eq(
+    fails(
+      Allocate({
+        made: CaseAllocation({ case: 0, skip: 0, words: 1 }),
+        args: [VarOperand(w)],
+        reuse: None,
+      }),
+    ),
+    false,
+  );
+  assert_eq(fails(Aggregate({ parts: [IntOperand(1)] })), false);
+  assert_eq(fails(Take({ of: w, path: FieldPath({ name: b"x", at: 0 }) })), false);
+  assert_eq(fails(Tag(b"m.Box")), false);
+  assert_eq([Literal(LiteralUnit), Literal(LiteralString(b"a")), Static(b"ply_k_0")].map(fails), [
+    false,
+    false,
+    false,
+  ]);
+  assert_eq(is_terminator(Miss), true);
+  assert_eq(falls_through([Do({ val: Literal(LiteralUnit), at: dummy_span(), unwind: [] })]), true)
+}
+
+test "a call stops where it says, a block where something it holds does, a handle where anything under it may" {
+  let call = |stops: Bool|
+    Call({
+      callee: Generic(0),
+      args: [],
+      convention: { params: [], result: AsWord, destination_passing: false, answered: OwnedResult },
+      suspends: stops,
+    });
+  let calling = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [] })];
+  assert_eq([may_suspend(call(true)), may_suspend(call(false))], [true, false]);
+  assert_eq([suspends_in(calling(true)), suspends_in(calling(false))], [true, false]);
+  // A stop in a branch of the block counts.
+  assert_eq(
+    suspends_in([If({ cond: BoolOperand(true), then: [], otherwise: calling(true) })]),
+    true,
+  );
+  let quiet = { clauses: [], ret: None, detached: None, instance: empty_instance(0) };
+  let clause = { effect: b"e", op: b"op", mode: 1, string: None, handler: 0 };
+  assert_eq(
+    [
+      handle_suspends(calling(false), quiet),
+      handle_suspends(calling(true), quiet),
+      handle_suspends([], { ..quiet, ret: Some(0) }),
+      handle_suspends([], { ..quiet, detached: Some({ body: 1, forwards: 2 }) }),
+      handle_suspends([], { ..quiet, clauses: [clause] }),
+    ],
+    [false, true, true, true, true],
+  )
+}
+
+test "a block ends where its last instruction but a site's change ends" {
+  let lent = SiteScope(Some({ root: Named(b"m.g"), base: 40 }));
+  let fail = Fail({ reason: NoMatchingArm, at: dummy_span(), letting: [], unwind: [] });
+  assert_eq(falls_through([lent, fail, SiteScope(None)]), false);
+  assert_eq(falls_through([fail, SiteScope(None), Return(IntOperand(0)), lent]), false);
+  assert_eq(falls_through([lent, SiteScope(None)]), true);
+  assert_eq(falls_through([]), true)
+}
+
+test "a sum is one part of the form, counted through its cases, and a last-holder test takes its operand" {
+  let none = { test: WordIs({ at: 0, value: 0 }), payload: Nullary };
+  let pointer = {
+    test: WordOutside({ at: 0, values: [0] }),
+    payload: Inline({ offset: 0, layout: PlainWords([Pointer]), stripped: None }),
+  };
+  let maybe = AsSum({
+    layout: { classes: [Pointer], cases: [none, pointer] },
+    cases: [none_ctor(), some_ctor()],
+  });
+  let flags = AsSum({
+    layout: {
+      classes: [RawRange({ lo: 0, hi: 1 })],
+      cases: [none, { test: WordIs({ at: 0, value: 1 }), payload: Nullary }],
+    },
+    cases: [b"Off", b"On"],
+  });
+  assert_eq([maybe, flags, AsUnit, AsAddress].map(is_refcounted), [true, false, false, false]);
+  // Opening a record yields its sum whole, never the sum's words.
+  assert_eq(
+    parts_of(
+      AsFlattened([{ name: b"o", representation: maybe }, { name: b"n", representation: AsInt }]),
+    ),
+    [maybe, AsInt],
+  );
+  let s = { id: 1, ty: string_type(), representation: AsWord };
+  assert_eq(operands(IfUnique(s)).map(|o: { arg: Arg, takes: Bool }| o.takes), [true]);
+  assert_eq(provenance(IfUnique(s)), Owns);
+  assert_eq(fails(IfUnique(s)), false)
+}
+
+test "a walk takes what it copies and borrows what it shares or keeps, and a share answers no count" {
+  let s = { id: 1, ty: string_type(), representation: AsWord };
+  let walked = [Copy, Share, Keep].map(|op: TypeOp| WalkLoop({ of: s, op: op }));
+  assert_eq(walked.map(|v: Rvalue| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes)), [
+    [true],
+    [false],
+    [false],
+  ]);
+  assert_eq(walked.map(provenance), [Owns, Immortal, Owns]);
+  assert_eq(walked.map(fails), [false, false, false])
+}

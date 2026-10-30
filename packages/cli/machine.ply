@@ -11,7 +11,7 @@ import compiler.check.resolve.tables (Diag, Label)
 import compiler.unit (entered_timeout_ms)
 import compiler.front.rows (Dump, EmitterRoot, ModuleSpan)
 import compiler.syntax.parsing (no_module)
-import diagnostic (Place, Raised, diag_of, noted, shown)
+import diagnostic (SourceText, RuntimeDiagnostic, diag_of, with_notes, shown)
 import entry (Main, Module)
 import std.bin
 import std.json (Json)
@@ -21,14 +21,14 @@ import std.value (Value, VList)
 import std.value
 import sim.plan
 import sim.plan (Seed)
-import sim.recording (Step, AAtom, AVar, AHold)
+import sim.recording (Step, AtomAccess, VariableAccess, HoldAccess)
 import std.string
 
 /// What a run binds, and how: every group of §14's flags as a value. The program parses and
 /// validates; the grants and runs it makes of them read typed fields. This is the one record every
 /// command that enters a program shares; each reads the subset its command takes.
 pub type TlsCredential = { name: String, cert: String, key: String }
-pub type Named = { name: String, path: String }
+pub type NamedPath = { name: String, path: String }
 
 pub type ConfigOptions = { set: List<String>, files: List<String>, schema: Option<String> }
 
@@ -36,14 +36,14 @@ pub type ConfigOptions = { set: List<String>, files: List<String>, schema: Optio
 /// anything is bound. With a schema, only a key it declares secret reads through `secret`; `schema`
 /// is the named function and its keys' names and shapes, which the binding's digest covers.
 /// `opened` is whether any source was read, which is when the run discloses its configuration.
-pub type Configured = {
+pub type RunConfiguration = {
   values: List<{ key: String, value: String, secret: Bool }>,
   schema: Option<{ function: String, keys: List<{ name: String, shape: String }> }>,
   opened: Bool,
 }
 
 /// What a run no source configured binds.
-pub fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
+pub fn empty_configuration() -> RunConfiguration = { values: [], schema: None, opened: false }
 
 /// The search a simulated test or law runs, as §9's flags say it: every field is in the key of what
 /// it proves. `roots` are the seeds searched, from `from` up to but not including `to`.
@@ -62,8 +62,8 @@ pub type Options = {
   trust: List<String>,
   /// The `--tls` credentials whose listeners require a client certificate.
   mtls: List<String>,
-  fs: List<Named>,
-  exec: List<Named>,
+  fs: List<NamedPath>,
+  exec: List<NamedPath>,
   /// The privileged families `--allow` granted the program this run drives, by name.
   allow: List<String>,
   config: ConfigOptions,
@@ -99,7 +99,7 @@ pub fn default_options() -> Options =
   }
 
 /// Every operation of the capability a command enters programs with.
-pub effect set Entering = {entering::machine.open, entering::machine.bind, entering::machine.hosting, entering::machine.enter, entering::machine.moved, entering::machine.unbind, entering::machine.close}
+pub effect set MachineAccess = {entering::machine.open, entering::machine.bind, entering::machine.hosting, entering::machine.enter, entering::machine.changed_read, entering::machine.unbind, entering::machine.close}
 
 // --- Grants and runs --------------------------------------------------------------
 
@@ -109,12 +109,12 @@ pub fn evaluation_run() -> entering::Run =
   { ..entering::unbounded(), timeout_ms: entered_timeout_ms() }
 
 /// A root or a program a run is lent, as `std.machine` names one.
-pub fn lent(n: Named) -> entering::Named = { name: n.name, path: n.path }
+pub fn granted_path(n: NamedPath) -> entering::NamedPath = { name: n.name, path: n.path }
 
-/// How a run meets `INT` and `TERM`. `Unheard` installs nothing, so the platform ends the
-/// process; `Ends` ends the run's children and exits with the code the signal would have given;
-/// `Drains` stops accepting and drains within `--drain-lead-ms` and `--drain-ms`.
-pub type Stop = | Unheard | Ends | Drains
+/// How a run meets `INT` and `TERM`. `PlatformDefault` installs nothing, so the platform ends the
+/// process; `ExitOnSignal` ends the run's children and exits with the code the signal would have given;
+/// `DrainOnSignal` stops accepting and drains within `--drain-lead-ms` and `--drain-ms`.
+pub type ShutdownMode = | PlatformDefault | ExitOnSignal | DrainOnSignal
 
 /// `--drain-lead-ms` and `--drain-ms`.
 pub type Drain = { lead_ms: Int, drain_ms: Int }
@@ -123,11 +123,16 @@ pub type Drain = { lead_ms: Int, drain_ms: Int }
 /// credentials, its configuration, its sink, the families `--allow` names, and its `stop`.
 /// `stderr` sends the program's own lines to stderr, as `--json` asks, since stdout is then the
 /// one document's.
-pub fn run_grants(o: Options, config: Configured, stop: Stop, stderr: Bool) -> entering::Grants =
+pub fn run_grants(
+  o: Options,
+  config: RunConfiguration,
+  stop: ShutdownMode,
+  stderr: Bool,
+) -> entering::Grants =
   {
     ..entering::no_grants(),
-    fs: o.fs.map(lent),
-    exec: o.exec.map(lent),
+    fs: o.fs.map(granted_path),
+    exec: o.exec.map(granted_path),
     allow: o.allow,
     argv: Some(o.argv),
     stderr: stderr,
@@ -135,9 +140,10 @@ pub fn run_grants(o: Options, config: Configured, stop: Stop, stderr: Bool) -> e
       name: "trace",
       fields: [o.trace.sink, o.trace.level],
     }).concat(match stop {
-      Unheard -> [],
-      Ends -> [{ name: "end", fields: [] }],
-      Drains -> [{ name: "drain", fields: [o.drain_lead_ms.to_string(), o.drain_ms.to_string()] }],
+      PlatformDefault -> [],
+      ExitOnSignal -> [{ name: "end", fields: [] }],
+      DrainOnSignal ->
+        [{ name: "drain", fields: [o.drain_lead_ms.to_string(), o.drain_ms.to_string()] }],
     }),
   }
 /// What the families still served in Rust read of a run: its credentials, the trust it adds to the
@@ -146,8 +152,8 @@ pub fn given_of(
   tls: List<TlsCredential>,
   trust: List<String>,
   mtls: List<String>,
-  config: Configured,
-) -> List<entering::Given> =
+  config: RunConfiguration,
+) -> List<entering::GrantEntry> =
   tls.map(|c: TlsCredential| { name: "tls", fields: [c.name, c.cert, c.key] }).concat(
     trust.map(|t: String| { name: "trust", fields: [t] }),
   ).concat(
@@ -203,11 +209,11 @@ pub fn is_abandoned(code: Bytes) -> Bool = code == b"W0612"
 /// `f` as a report renders it: each site placed in the module its root is written in, at an offset
 /// from where that root's definition starts. A raise with no place says what failed and not what
 /// was running, so it names `entry`, where there is one.
-pub fn placed(
+pub fn locate_failure(
   f: entering::Failure,
   roots: Map<Bytes, ModuleSpan>,
   entry: String,
-) -> Raised / {abort.raise} = {
+) -> RuntimeDiagnostic / {abort.raise} = {
   let labels = f.labels.map(|l: entering::Label| {
     let text = Bytes::of_string(l.text);
     match site_of(l.site, roots) {
@@ -216,14 +222,18 @@ pub fn placed(
       None -> { module: no_module(), start: 0, end: 0, primary: l.primary, text: text },
     }
   });
-  let said = entering::showing(f);
+  let said = entering::failure_details(f);
   let diag = diag_of(severity_word(f.severity), f.code, f.message, labels, said.notes);
   let unplaced = entry != "" && labels.all(|l: Label| l.module == no_module());
-  { diag: if unplaced { noted(diag, [unplaced_note(entry)]) } else { diag }, values: said.values }
+  {
+    diag: if unplaced { with_notes(diag, [unlocated_note(entry)]) } else { diag },
+    values: said.values,
+  }
 }
 
 /// `f`, which no program wrote, as a report renders it: a binding's refusal among them.
-pub fn unplaced(f: entering::Failure) -> Diag / {abort.raise} = shown(placed(f, Map::new(), ""))
+pub fn unplaced(f: entering::Failure) -> Diag / {abort.raise} =
+  shown(locate_failure(f, Map::new(), ""))
 
 /// Where a site lies in the modules: its root's place, and the site's offsets from it.
 pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, ModuleSpan>) -> Option<ModuleSpan> =
@@ -239,11 +249,11 @@ pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, ModuleSpan>) -> O
 fn severity_word(s: entering::Severity) -> String =
   match s { entering::Error -> "error", entering::Warning -> "warning", entering::Note -> "note" }
 
-fn unplaced_note(entry: String) -> String =
+fn unlocated_note(entry: String) -> String =
   "this raise has no place in the source: it happened while `" ++ entry
     ++ "` was running, in code the runtime runs on the program's behalf"
 
-/// A scheduling point as `sim` reads it, its site placed as `placed` places a label's.
+/// A scheduling point as `sim` reads it, its site placed as `locate_failure` places a label's.
 pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
   {
     region: s.region,
@@ -252,9 +262,9 @@ pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
     choice: s.choice,
     accesses: s.accesses.map(|a: entering::Access|
       match a {
-        entering::AAtom(x) -> AAtom(x),
-        entering::AVar(x) -> AVar(x),
-        entering::AHold(x) -> AHold(x),
+        entering::AtomAccess(x) -> AtomAccess(x),
+        entering::VariableAccess(x) -> VariableAccess(x),
+        entering::HoldAccess(x) -> HoldAccess(x),
       }),
     site: {
       definition: s.definition,
@@ -267,39 +277,39 @@ pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
   }
 
 /// One call's value, or what it raised, and what the entry ended with.
-pub type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
+pub type CallResult = { result: Result<Value, RuntimeDiagnostic>, warnings: List<Diag> }
 
 /// `name` of `unit` called with `args` under `run`: its answer or what it raised, and what the
 /// entry ended with.
-pub fn called(
+pub fn machine_call(
   unit: Int,
   roots: Map<Bytes, ModuleSpan>,
   name: String,
   args: List<Value>,
   run: entering::Run,
-) -> Called / {entering::machine.enter, abort.raise} = {
+) -> CallResult / {entering::machine.enter, abort.raise} = {
   let o = entering::machine.enter(unit, name, arguments_of(args), run);
-  { answer: answer_of(o, roots, name), warnings: warnings_of(o, roots) }
+  { result: result_of(o, roots, name), warnings: warnings_of(o, roots) }
 }
 
 /// What an entry's outcome says of its answer: the value it answered, or what it raised, Ply's
 /// defect where the runtime failed rather than the program. An entry that chose its exit code
 /// raised nothing, and answers `()`, as `process.exit` does.
-pub fn answer_of(
+pub fn result_of(
   o: entering::Outcome,
   roots: Map<Bytes, ModuleSpan>,
   name: String,
-) -> Result<Value, Raised> / {abort.raise} =
+) -> Result<Value, RuntimeDiagnostic> / {abort.raise} =
   if o.exit != None { Ok(value::VUnit) } else {
     match o.ended {
-      entering::Answered(bytes) -> match value::decode(bytes) {
+      entering::Returned(bytes) -> match value::decode(bytes) {
         Some(v) -> Ok(v),
         None -> Err(defect(name, "answered bytes that are no value")),
       },
-      entering::Failed(f) -> Err(placed(f, roots, name)),
+      entering::Failed(f) -> Err(locate_failure(f, roots, name)),
       entering::Panicked(message) -> Err(defect(name, "panicked: " ++ message)),
       entering::NoRoot -> Err(defect(name, "is no root of the unit it was entered on")),
-      entering::Unanswerable(why) -> Err(defect(name, "answered, and " ++ why)),
+      entering::UnencodableResult(why) -> Err(defect(name, "answered, and " ++ why)),
     }
   }
 
@@ -307,17 +317,18 @@ pub fn answer_of(
 pub fn warnings_of(
   o: entering::Outcome,
   roots: Map<Bytes, ModuleSpan>,
-) -> List<Diag> / {abort.raise} = o.warnings.map(|w: entering::Failure| shown(placed(w, roots, "")))
+) -> List<Diag> / {abort.raise} =
+  o.warnings.map(|w: entering::Failure| shown(locate_failure(w, roots, "")))
 
 /// A unit the runtime could not open, which says why: one compiled against another runtime, among
 /// others.
-pub fn unloaded(why: String) -> Diag =
+pub fn unit_load_error(why: String) -> Diag =
   diag_of("error", "E0450", "the unit could not be loaded: " ++ why, [], [
     "a unit is compiled against the runtime that opens it; this is Ply's fault",
   ])
 
 /// Ply failed entering `name`, rather than the program.
-pub fn defect(name: String, why: String) -> Raised =
+pub fn defect(name: String, why: String) -> RuntimeDiagnostic =
   {
     diag: diag_of("error", "E0505", "`" ++ name ++ "` " ++ why, [], [
       "this is Ply's fault, not the program's",
@@ -329,16 +340,16 @@ pub fn defect(name: String, why: String) -> Raised =
 
 test "work is dealt into lanes round-robin and comes back in its own order" {
   let xs = range(0, 7);
-  assert_eq(dealt(xs, None), xs.map(|x: Int| [x]));
-  assert_eq(dealt(xs, Some(3)), [[0, 3, 6], [1, 4], [2, 5]]);
-  assert_eq(dealt(xs, Some(1)), [xs]);
-  assert_eq(dealt(xs, Some(0)), [xs]);
-  assert_eq(dealt(range(0, 2), Some(8)), [[0], [1]]);
-  assert_eq(dealt([], Some(4)), []);
-  assert_eq(undealt(dealt(xs, Some(3))), xs);
-  assert_eq(undealt(dealt(xs, None)), xs);
+  assert_eq(split_into_lanes(xs, None), xs.map(|x: Int| [x]));
+  assert_eq(split_into_lanes(xs, Some(3)), [[0, 3, 6], [1, 4], [2, 5]]);
+  assert_eq(split_into_lanes(xs, Some(1)), [xs]);
+  assert_eq(split_into_lanes(xs, Some(0)), [xs]);
+  assert_eq(split_into_lanes(range(0, 2), Some(8)), [[0], [1]]);
+  assert_eq(split_into_lanes([], Some(4)), []);
+  assert_eq(merge_lanes(split_into_lanes(xs, Some(3))), xs);
+  assert_eq(merge_lanes(split_into_lanes(xs, None)), xs);
   assert_eq(
-    undealt(dealt(xs, Some(2)).map(|lane: List<Int>| lane.map(|x: Int| x * 10))),
+    merge_lanes(split_into_lanes(xs, Some(2)).map(|lane: List<Int>| lane.map(|x: Int| x * 10))),
     xs.map(|x: Int| x * 10),
   )
 }
@@ -363,13 +374,13 @@ test "the defaults are one record" {
 test "a run is lent what its flags name, and the stop it meets a signal with" {
   let quiet = run_grants(
     { ..default_options(), allow: ["shipped"], argv: ["a"] },
-    unconfigured(),
-    Unheard,
+    empty_configuration(),
+    PlatformDefault,
     false,
   );
   assert_eq(quiet.argv, Some(["a"]));
   assert_eq(quiet.allow, ["shipped"]);
-  assert_eq(quiet.given.map(|g: entering::Given| g.name), ["trace"]);
+  assert_eq(quiet.given.map(|g: entering::GrantEntry| g.name), ["trace"]);
   let serving = run_grants(
     {
       ..default_options(),
@@ -379,11 +390,11 @@ test "a run is lent what its flags name, and the stop it meets a signal with" {
       drain_lead_ms: 250,
     },
     { values: [{ key: "port", value: "80", secret: false }], schema: None, opened: true },
-    Drains,
+    DrainOnSignal,
     false,
   );
   assert_eq(serving.fs, [{ name: "cwd", path: "." }]);
-  assert_eq(serving.given.map(|g: entering::Given| g.name), [
+  assert_eq(serving.given.map(|g: entering::GrantEntry| g.name), [
     "tls",
     "config",
     "configured",
@@ -391,7 +402,7 @@ test "a run is lent what its flags name, and the stop it meets a signal with" {
     "drain",
   ]);
   assert_eq(serving.given.at(4), Some({ name: "drain", fields: ["250", "30000"] }));
-  let starting = run_grants(default_options(), unconfigured(), Ends, true);
+  let starting = run_grants(default_options(), empty_configuration(), ExitOnSignal, true);
   assert_eq(starting.given.at(1), Some({ name: "end", fields: [] }));
   assert(starting.stderr && !quiet.stderr)
 }
@@ -413,10 +424,10 @@ test "a failure's sites are placed at their roots, and an unplaced raise names i
     notes: [],
     values: [],
   };
-  let r = placed(failure, roots, "m.main");
+  let r = locate_failure(failure, roots, "m.main");
   assert_eq(r.diag.labels, [{ module: 0, start: 103, end: 107, primary: true, text: b"here" }]);
   assert_eq(r.diag.notes, 0);
-  let lost = placed(
+  let lost = locate_failure(
     { ..failure, labels: [{ site: None, primary: true, text: "here" }] },
     roots,
     "m.main",
@@ -429,7 +440,7 @@ test "a failure's sites are placed at their roots, and an unplaced raise names i
 
 pub type Refusal = {
   diags: List<Diag>,
-  places: List<Place>,
+  places: List<SourceText>,
   /// The file the refusal is about, when a `.plyx` was named and is not one. A program that does
   /// not compile is refused over its own sources instead, and names no file here.
   artifact: Option<String>,
@@ -439,11 +450,11 @@ pub type Refusal = {
 pub type Target = | Project(Program) | Deployed(Artifact)
 
 /// What a run read of the program it loaded.
-pub type Read = {
+pub type ProgramFiles = {
   /// The root the load was rooted at, as a report prints it.
   root: String,
   files: List<String>,
-  places: List<Place>,
+  places: List<SourceText>,
 }
 
 /// A loaded program and the entry points it offers, which the program reads off the front end's
@@ -451,12 +462,12 @@ pub type Read = {
 pub type Program = {
   root: String,
   files: List<String>,
-  places: List<Place>,
+  places: List<SourceText>,
   mains: List<Main>,
   modules: List<Module>,
 }
 
-pub fn program_of(read: Read, mains: List<Main>, modules: List<Module>) -> Target =
+pub fn program_of(read: ProgramFiles, mains: List<Main>, modules: List<Module>) -> Target =
   Project({
     root: read.root,
     files: read.files,
@@ -469,7 +480,7 @@ pub type Artifact = { path: String, digest: String, entry: String, definitions: 
 
 /// What the binding discloses before anything runs. A run that performs nothing of the host
 /// discloses nothing, because there is nothing it could reach.
-pub type Bound = {
+pub type BindingSummary = {
   operations: Int,
   digest: String,
   /// The banner the trace sink writes for itself.
@@ -486,26 +497,26 @@ pub type Signals = { names: List<String>, drain: Option<Drain> }
 pub type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal> }
 
 /// What was in flight when a signal asked the run to stop; `None` when nobody asked.
-pub type Stopping = { signal: Option<String>, listeners: Int, connections: Int, elapsed_ms: Int }
+pub type StopReport = { signal: Option<String>, listeners: Int, connections: Int, elapsed_ms: Int }
 
 /// What the run was given to stop in, and the spans its entries left open, which `W0609` named.
 pub type Teardown = { lead_ms: Int, drain_ms: Int, spans_left_open: Int }
 
 pub type Trace = { events: Int, spans: Int, abandoned: Int, flushed: Bool }
 
-derive bin for Stopping
+derive bin for StopReport
 derive bin for Trace
 
 /// What the entry did, once the binding is torn down.
-pub type Ended = {
+pub type RunOutcome = {
   /// The code `process.exit` asked for: the program chose it and returned no value.
   exit: Option<Int>,
   value: Option<Value>,
-  raised: Option<Raised>,
+  raised: Option<RuntimeDiagnostic>,
   counters: Counters,
   /// What the entry ended with, such as the spans it left open.
   warnings: List<Diag>,
-  stopping: Option<Stopping>,
+  stopping: Option<StopReport>,
   teardown: Teardown,
   trace: Option<Trace>,
   handshakes: List<String>,
@@ -531,7 +542,7 @@ pub fn sim_options_from(p: Parsed) -> SimulationOptions / {abort.raise} =
 
 /// What the flags ask a search to run, as `sim.plan` normalizes a plan.
 pub fn sim_plan_of(sim: SimulationOptions) -> plan::Plan / {abort.raise} =
-  plan::asked_plan({
+  plan::plan_from_flags({
     seed: match sim.seed { Some(text) -> plan::parse_seed(text), None -> None },
     mode: match plan::parse_mode(sim.mode) { Some(m) -> m, None -> plan::Dpor },
     roots: sim.roots,
@@ -541,7 +552,7 @@ pub fn sim_plan_of(sim: SimulationOptions) -> plan::Plan / {abort.raise} =
 
 /// Work dealt into lanes run at once: one lane per item, or `n` lanes dealt round-robin when `--jobs`
 /// names `n`, so lane `k` holds items `k`, `k + n`, ...
-pub fn dealt<a>(xs: List<a>, lanes: Option<Int>) -> List<List<a>> = {
+pub fn split_into_lanes<a>(xs: List<a>, lanes: Option<Int>) -> List<List<a>> = {
   let n = match lanes { Some(k) -> max(1, min(k, xs.len())), None -> xs.len() };
   // Each of a lane's items is stepped to, so dealing thousands into as many lanes is one pass.
   range(0, min(n, xs.len())).map(|k: Int|
@@ -549,8 +560,8 @@ pub fn dealt<a>(xs: List<a>, lanes: Option<Int>) -> List<List<a>> = {
       match xs.at(k + j * n) { Some(x) -> lane.push(x), None -> lane }))
 }
 
-/// What each lane answered, back in the order `dealt` took the items in.
-pub fn undealt<b>(lanes: List<List<b>>) -> List<b> / {abort.raise} = {
+/// What each lane answered, back in the order `split_into_lanes` took the items in.
+pub fn merge_lanes<b>(lanes: List<List<b>>) -> List<b> / {abort.raise} = {
   let n = lanes.len();
   let total = lanes.fold(0, |acc: Int, lane: List<b>| acc + lane.len());
   range(0, total).fold([], |out: List<b>, i: Int|
@@ -564,15 +575,15 @@ pub fn undealt<b>(lanes: List<List<b>>) -> List<b> / {abort.raise} = {
 pub fn no_sim_options() -> SimulationOptions =
   { seed: None, mode: "dpor", roots: None, budget: None, steps: None, measure_reduction: false }
 
-fn opt_text(parsed: Parsed, long: String) -> Option<String> = value(parsed, long)
+fn flag_value(parsed: Parsed, long: String) -> Option<String> = value(parsed, long)
 
 fn int_of(p: Parsed, long: String, default: Int) -> Int / {abort.raise} =
   match nat_value(p, long) { Some(n) -> n, None -> default }
 
 /// `--tls api=cert.pem,key.pem` as a credential record.
-fn creds(parsed: Parsed) -> List<TlsCredential> / {abort.raise} =
+fn tls_credentials(parsed: Parsed) -> List<TlsCredential> / {abort.raise} =
   values_of(parsed, "tls").map(|text: String|
-    match cut_pair(text) {
+    match split_pair(text) {
       Some(pair) -> match pair {
         (name, paths) -> match split_once(paths, ",") {
           Some(pp) -> match pp { (cert, key) -> { name: name, cert: cert, key: key } },
@@ -582,15 +593,15 @@ fn creds(parsed: Parsed) -> List<TlsCredential> / {abort.raise} =
       None -> { name: "", cert: "", key: "" },
     })
 
-fn named_paths(parsed: Parsed, long: String) -> List<Named> / {abort.raise} =
+fn named_paths(parsed: Parsed, long: String) -> List<NamedPath> / {abort.raise} =
   values_of(parsed, long).map(|text: String|
-    match cut_pair(text) {
+    match split_pair(text) {
       Some(pair) -> match pair { (name, path) -> { name: name, path: path } },
       None -> { name: "", path: "" },
     })
 
 /// `NAME=VALUE`: the pair on the first `=`.
-fn cut_pair(text: String) -> Option<(String, String)> / {abort.raise} =
+fn split_pair(text: String) -> Option<(String, String)> / {abort.raise} =
   match text.split_once("=") { Some(cut) -> Some((cut.head, cut.tail)), None -> None }
 
 fn split_once(text: String, sep: String) -> Option<(String, String)> / {abort.raise} =
@@ -605,7 +616,7 @@ pub fn config_of(p: Parsed) -> ConfigOptions =
 pub fn options_from(p: Parsed) -> Options / {abort.raise} =
   {
     ..default_options(),
-    tls: creds(p),
+    tls: tls_credentials(p),
     trust: values_of(p, "trust"),
     mtls: values_of(p, "mtls"),
     fs: named_paths(p, "fs"),
@@ -619,7 +630,7 @@ pub fn options_from(p: Parsed) -> Options / {abort.raise} =
     drain_ms: int_of(p, "drain-ms", default_options().drain_ms),
     drain_lead_ms: int_of(p, "drain-lead-ms", default_options().drain_lead_ms),
     timeout: int_of(p, "timeout", default_options().timeout),
-    seed: match opt_text(p, "seed") { Some(text) -> plan::parse_seed(text), None -> None },
+    seed: match flag_value(p, "seed") { Some(text) -> plan::parse_seed(text), None -> None },
     profile: surface::profile_of(p),
     argv: p.argv,
   }

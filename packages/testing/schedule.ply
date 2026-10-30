@@ -21,7 +21,7 @@ pub type Atom = { effect: String, resource: String, writes: Bool, nondet: Bool }
 /// Effects whose atoms name an input that no test can write: a seed, and a hold, which is only read.
 pub fn ambient_effects() -> List<String> = ["sim", "hold"]
 
-pub fn is_ambient(a: Atom) -> Bool = in_text(ambient_effects(), a.effect)
+pub fn is_ambient(a: Atom) -> Bool = contains_text(ambient_effects(), a.effect)
 
 /// Whether an atom can be contended over at all. An ambient input cannot: it is read, and only the
 /// run looking at it knows what it is. Nor can one a deterministic handler answers.
@@ -36,13 +36,13 @@ pub fn shared(f: List<Atom>) -> List<Atom> = f.filter(contends)
 // --- What a run's tests are, once the binding is taken into account ----------
 
 /// One test the run reports on: its footprint, and whether the run's binding reaches it.
-pub type Reported = { atoms: List<Atom>, host: Bool }
+pub type ReportedTest = { atoms: List<Atom>, host: Bool }
 
 /// Whether a test can interfere with any other test at all. A test the binding reaches acts on the
 /// world, which lives outside every region, so it is never isolated.
 pub type Isolation = | Region | Shared | Host
 
-pub fn isolation_of(t: Reported) -> Isolation =
+pub fn isolation_of(t: ReportedTest) -> Isolation =
   if t.host { Host } else if region_isolated(t.atoms) { Region } else { Shared }
 
 pub fn isolation_word(i: Isolation) -> String =
@@ -51,8 +51,8 @@ pub fn isolation_word(i: Isolation) -> String =
 /// How a run's tests split: each counts under exactly one of the three.
 pub type Counts = { total: Int, isolated: Int, shared: Int, host: Int }
 
-pub fn counts(tests: List<Reported>) -> Counts =
-  tests.fold({ total: 0, isolated: 0, shared: 0, host: 0 }, |c: Counts, t: Reported| {
+pub fn counts(tests: List<ReportedTest>) -> Counts =
+  tests.fold({ total: 0, isolated: 0, shared: 0, host: 0 }, |c: Counts, t: ReportedTest| {
     let one = { ..c, total: c.total + 1 };
     match isolation_of(t) {
       Region -> { ..one, isolated: c.isolated + 1 },
@@ -68,49 +68,55 @@ pub fn conflicts(a: Atom, b: Atom) -> Bool =
 
 /// Two tests conflict when any pair of their atoms does.
 pub fn footprints_conflict(xs: List<Atom>, ys: List<Atom>) -> Bool =
-  !xs.all(|a: Atom| !footprints_hold(ys, a))
+  !xs.all(|a: Atom| !any_conflicts(ys, a))
 
-fn footprints_hold(ys: List<Atom>, a: Atom) -> Bool = some(ys, |b: Atom| conflicts(a, b))
+fn any_conflicts(ys: List<Atom>, a: Atom) -> Bool = some(ys, |b: Atom| conflicts(a, b))
 
 /// One selected test, with the atoms another test could contend over.
-pub type Scheduled = { index: Int, contends: List<Atom> }
+pub type ScheduledTest = { index: Int, contended_atoms: List<Atom> }
 
 /// Greedy colouring of the conflict graph, largest footprint first, ties by index. Each class is
 /// returned with its indices ascending, and the classes come out in the order they were opened.
-pub fn group_by_conflict(tests: List<Scheduled>) -> List<List<Int>> / {abort.raise} =
-  in_order(tests).fold([], |classes: List<List<Scheduled>>, t: Scheduled| placed(classes, t)).map(
-    |class: List<Scheduled>| sorted_indices(class),
-  )
+pub fn group_by_conflict(tests: List<ScheduledTest>) -> List<List<Int>> / {abort.raise} =
+  in_order(tests).fold([], |classes: List<List<ScheduledTest>>, t: ScheduledTest|
+    assign_class(classes, t)).map(|class: List<ScheduledTest>| sorted_indices(class))
 
 /// The tests as a scheduler considers them: most contended first, so the classes are not shaped by
 /// an accident of the order the tree happens to declare them in.
-fn in_order(tests: List<Scheduled>) -> List<Scheduled> = tests.sort_by(ahead_of)
+fn in_order(tests: List<ScheduledTest>) -> List<ScheduledTest> = tests.sort_by(ahead_of)
 
 /// Most atoms first; ties by index, so the order is total and no insertion order leaks in.
-fn ahead_of(t: Scheduled, other: Scheduled) -> Bool =
-  if t.contends.len() == other.contends.len() { t.index < other.index }
-  else { t.contends.len() > other.contends.len() }
+fn ahead_of(t: ScheduledTest, other: ScheduledTest) -> Bool =
+  if t.contended_atoms.len() == other.contended_atoms.len() { t.index < other.index }
+  else { t.contended_atoms.len() > other.contended_atoms.len() }
 
-fn sorted_indices(class: List<Scheduled>) -> List<Int> =
-  class.map(|t: Scheduled| t.index).sort_by(|a: Int, b: Int| a < b)
+fn sorted_indices(class: List<ScheduledTest>) -> List<Int> =
+  class.map(|t: ScheduledTest| t.index).sort_by(|a: Int, b: Int| a < b)
 
 /// The first class this test clears every member of; a new class when it clears none.
-fn placed(classes: List<List<Scheduled>>, t: Scheduled) -> List<List<Scheduled>> / {abort.raise} = {
-  let slot = first_clear(classes, t.contends);
+fn assign_class(
+  classes: List<List<ScheduledTest>>,
+  t: ScheduledTest,
+) -> List<List<ScheduledTest>> / {abort.raise} = {
+  let slot = first_compatible_class(classes, t.contended_atoms);
   match slot { Some(k) -> classes.set(k, classes.get(k).push(t)), None -> classes.push([t]) }
 }
 
-fn first_clear(classes: List<List<Scheduled>>, atoms: List<Atom>) -> Option<Int> / {abort.raise} =
+fn first_compatible_class(
+  classes: List<List<ScheduledTest>>,
+  atoms: List<Atom>,
+) -> Option<Int> / {abort.raise} =
   range(0, classes.len()).fold(None, |found: Option<Int>, k: Int|
     match found {
       Some(_) -> found,
-      None -> if clears(classes.get(k), atoms) { Some(k) } else { None },
+      None -> if is_compatible(classes.get(k), atoms) { Some(k) } else { None },
     })
 
 /// Whether a test of `atoms` clears every member of `class`: one nothing could contend with
 /// clears every class without being held against its members.
-fn clears(class: List<Scheduled>, atoms: List<Atom>) -> Bool =
-  atoms.is_empty() || class.all(|other: Scheduled| !footprints_conflict(atoms, other.contends))
+fn is_compatible(class: List<ScheduledTest>, atoms: List<Atom>) -> Bool =
+  atoms.is_empty()
+    || class.all(|other: ScheduledTest| !footprints_conflict(atoms, other.contended_atoms))
 
 // --- How many of a run's tests are trivially parallel -----------------------
 
@@ -126,7 +132,7 @@ pub type Parallelism = {
 }
 
 /// Groups equal what the shared tests alone need: the property `--explain` publishes.
-pub fn holds(p: Parallelism) -> Bool = {
+pub fn groups_are_minimal(p: Parallelism) -> Bool = {
   let floor = if p.scheduled > 0 { 1 } else { 0 };
   p.groups == max(p.shared_groups, floor)
 }
@@ -135,12 +141,12 @@ pub fn holds(p: Parallelism) -> Bool = {
 /// `groups` is what `group_by_conflict` made of it.
 pub fn parallelism(
   universe: List<List<Atom>>,
-  scheduled: List<Scheduled>,
+  scheduled: List<ScheduledTest>,
   groups: List<List<Int>>,
 ) -> Parallelism / {abort.raise} = {
   let total = universe.len();
   let isolated = universe.filter(region_isolated).len();
-  let shared_only = scheduled.filter(|t: Scheduled| !region_isolated(t.contends));
+  let shared_only = scheduled.filter(|t: ScheduledTest| !region_isolated(t.contended_atoms));
   {
     total: total,
     isolated: isolated,
@@ -153,7 +159,7 @@ pub fn parallelism(
 
 // --- Helpers ----------------------------------------------------------------
 
-fn in_text(xs: List<String>, x: String) -> Bool = some(xs, |y: String| y == x)
+fn contains_text(xs: List<String>, x: String) -> Bool = some(xs, |y: String| y == x)
 
 fn some<a>(xs: List<a>, p: (a) -> Bool) -> Bool = xs.fold(false, |hit: Bool, x: a| hit || p(x))
 
@@ -174,9 +180,10 @@ fn fs(path: String) -> Atom = atom("fs", path, true)
 
 fn sim() -> Atom = atom("sim", "", false)
 
-fn scheduled(index: Int, atoms: List<Atom>) -> Scheduled = { index: index, contends: atoms }
+fn scheduled(index: Int, atoms: List<Atom>) -> ScheduledTest =
+  { index: index, contended_atoms: atoms }
 
-fn unreached(atoms: List<Atom>) -> Reported = { atoms: atoms, host: false }
+fn unreached(atoms: List<Atom>) -> ReportedTest = { atoms: atoms, host: false }
 
 test "a seed or a hold contends with nothing, and a write does" {
   let hold = atom("hold", "log", false);
@@ -293,16 +300,16 @@ test "the groups a run needs are what the shared tests alone need" {
   assert_eq(p.scheduled, 2);
   assert_eq(p.groups, 1);
   assert_eq(p.shared_groups, 1);
-  assert_eq(holds(p), true);
+  assert_eq(groups_are_minimal(p), true);
   // One selected test, and one nothing else could reach: `groups` is one while `shared_groups` is
   // zero, so the floor is what makes the property hold.
   let one = parallelism(universe, [scheduled(0, [sim()])], [[0]]);
   assert_eq(one.shared_groups, 0);
   assert_eq(one.groups, 1);
-  assert_eq(holds(one), true);
+  assert_eq(groups_are_minimal(one), true);
   // Nothing selected at all: no floor, and nothing to colour.
   let none = parallelism(universe, [], []);
-  assert_eq(holds(none), true)
+  assert_eq(groups_are_minimal(none), true)
 }
 
 fn db(resource: String, w: Bool) -> Atom = atom("db", resource, w)
@@ -320,10 +327,11 @@ test "what a deterministic handler answers contends with nothing, whatever it wr
   ])
 }
 
-fn contends_of(tests: List<Scheduled>, i: Int) -> List<Atom> =
-  tests.fold([], |found: List<Atom>, t: Scheduled| if t.index == i { t.contends } else { found })
+fn contends_of(tests: List<ScheduledTest>, i: Int) -> List<Atom> =
+  tests.fold([], |found: List<Atom>, t: ScheduledTest|
+    if t.index == i { t.contended_atoms } else { found })
 
-fn clear_pairs(tests: List<Scheduled>, class: List<Int>) -> Bool / {abort.raise} =
+fn clear_pairs(tests: List<ScheduledTest>, class: List<Int>) -> Bool / {abort.raise} =
   range(0, class.len()).all(|a: Int|
     range(a + 1, class.len()).all(|b: Int|
       !footprints_conflict(contends_of(tests, class.get(a)), contends_of(tests, class.get(b)))))
@@ -389,7 +397,7 @@ test "every test lands in exactly one class, and no class holds a conflicting pa
   let flat = classes.fold([], |acc: List<Int>, class: List<Int>|
     class.fold(acc, |xs: List<Int>, x: Int| xs.push(x)));
   assert_eq(flat.len(), tests.len());
-  assert(tests.all(|t: Scheduled| flat.count(|y: Int| y == t.index) == 1));
+  assert(tests.all(|t: ScheduledTest| flat.count(|y: Int| y == t.index) == 1));
   assert(classes.all(|class: List<Int>| clear_pairs(tests, class)))
 }
 
@@ -401,18 +409,18 @@ test "a test nothing can reach joins the first class, so adding such tests never
   ];
   let baseline = group_by_conflict(contended);
   assert_eq(baseline, [[0, 2], [1]]);
-  let wider = range(3, 40).fold(contended, |acc: List<Scheduled>, i: Int|
+  let wider = range(3, 40).fold(contended, |acc: List<ScheduledTest>, i: Int|
     acc.push(scheduled(i, shared([sim()]))));
   let classes = group_by_conflict(wider);
   assert_eq(classes.len(), baseline.len());
   assert(range(3, 40).all(|i: Int| classes.get(0).count(|y: Int| y == i) == 1));
   let universe = range(3, 40).fold(
-    contended.map(|t: Scheduled| t.contends),
+    contended.map(|t: ScheduledTest| t.contended_atoms),
     |acc: List<List<Atom>>, i: Int| acc.push([sim()]),
   );
   let p = parallelism(universe, wider, classes);
   assert_eq(p.isolated, 37);
   assert_eq(p.shared, 3);
   assert_eq(p.shared_groups, baseline.len());
-  assert_eq(holds(p), true)
+  assert_eq(groups_are_minimal(p), true)
 }

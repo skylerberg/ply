@@ -8,24 +8,24 @@ import std.time (time)
 import std.bytes
 import compiler.store.hash.forms (ModuleRecord, module_record_bin, record_digest, recorded_graph,
                                   recorded_hashes)
-import engine (Store, Found, Hit, Miss, Bad, Warning, Trouble, Corrupt, Unreadable, OtherVersion,
-               open, get, put, drop, keys, flush, compact, stats, warn, messages, pending, name_key,
-               held)
-import twin (on_twin)
+import engine (Store, Lookup, Hit, Miss, Bad, Warning, WarningKind, Corrupt, Unreadable,
+               OtherVersion, open, get, put, drop, keys, flush, compact, stats, warn, messages,
+               pending_count, name_key, contains_key)
+import fake (run_in_memory)
 import upstream (Upstream, read_entry, entry_keys, publish, mark_live)
 import std.hash (blake3)
 
 // --- Tables -----------------------------------------------------------------
 
-fn t_passed() -> Int = 5
-fn t_pass_records() -> Int = 6
-fn t_seen() -> Int = 7
-fn t_evidence() -> Int = 8
-fn t_reviews() -> Int = 9
-fn t_stamps() -> Int = 11
-fn t_code_passes() -> Int = 14
-fn t_eras() -> Int = 15
-fn t_modules() -> Int = 16
+fn passed_table() -> Int = 5
+fn pass_records_table() -> Int = 6
+fn seen_table() -> Int = 7
+fn evidence_table() -> Int = 8
+fn reviews_table() -> Int = 9
+fn stamps_table() -> Int = 11
+fn code_passes_table() -> Int = 14
+fn snapshots_table() -> Int = 15
+fn modules_table() -> Int = 16
 fn t_texts() -> Int = 17
 
 // --- Records ----------------------------------------------------------------
@@ -77,7 +77,7 @@ pub type Cache = {
 
 pub fn open_cache<[r]>(dir: String, stamps: Stamps) -> Cache / {fs.read[r], abort.raise} =
   {
-    store: stamped[r](open[r](dir, schema()), stamps),
+    store: check_stamps[r](open[r](dir, schema()), stamps),
     stamps: stamps,
     upstream: None,
     shared: Map::new(),
@@ -96,43 +96,43 @@ fn groups(was: Stamps, now: Stamps) -> List<Group> =
       what: "the test results and discharged obligations",
       was: was.runtime,
       now: now.runtime,
-      tables: [t_passed(), t_pass_records(), t_seen(), t_evidence()],
+      tables: [passed_table(), pass_records_table(), seen_table(), evidence_table()],
     },
     {
       what: "the passes filed under the code their tests ran",
       was: was.code,
       now: now.code,
-      tables: [t_code_passes()],
+      tables: [code_passes_table()],
     },
   ]
 
-fn emptied(s: Store, g: Group) -> Store / {abort.raise} =
+fn clear_group(s: Store, g: Group) -> Store / {abort.raise} =
   g.tables.fold(s, |s1: Store, t: Int| keys(s1, t).fold(s1, |s2: Store, k: Bytes| drop(s2, t, k)))
 
-fn restamped(store: Store, now: Stamps) -> Store / {abort.raise} =
-  put(store, t_stamps(), stamps_key(), bin::encode(now, stamps_bin()))
+fn write_stamps(store: Store, now: Stamps) -> Store / {abort.raise} =
+  put(store, stamps_table(), stamps_key(), bin::encode(now, stamps_bin()))
 
 fn short_stamp(stamp: String) -> String =
   if stamp.len() > 12 { "b3:" ++ stamp.slice(0, 12) } else { stamp }
 
-type Stamped = | Known(Stamps) | Unstamped | Garbled
+type StoredStamps = | Known(Stamps) | Unstamped | Garbled
 
 /// Groups filed under other stamps are dropped, each warned once; unreadable stamps drop them all.
-fn stamped<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} = {
-  let was = match get[r](s, t_stamps(), stamps_key()) {
+fn check_stamps<[r]>(s: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} = {
+  let was = match get[r](s, stamps_table(), stamps_key()) {
     Hit(bytes) -> match bin::decode(bytes, stamps_bin()) { Ok(st) -> Known(st), Err(_) -> Garbled },
     Miss -> Unstamped,
     Bad(_) -> Garbled,
   };
   let all = groups(now, now);
-  let dropped = |why: Trouble, message: String|
-    restamped(warn(all.fold(s, emptied), why, message), now);
+  let dropped = |why: WarningKind, message: String|
+    write_stamps(warn(all.fold(s, clear_group), why, message), now);
   match was {
     Known(st) -> if st == now { s } else {
-      restamped(
+      write_stamps(
         groups(st, now).filter(|g: Group| g.was != g.now).fold(s, |s1: Store, g: Group|
           warn(
-            emptied(s1, g),
+            clear_group(s1, g),
             OtherVersion,
             g.what ++ " were filed by another build (" ++ short_stamp(g.was) ++ "; this one is "
               ++ short_stamp(g.now)
@@ -158,23 +158,27 @@ pub fn with_upstream<[u]>(
 ) -> Cache / {fs.read[u], abort.raise} = {
   let under = |stamp: String|
     { root: root, schema: blake3(schema() ++ Bytes::of_string(stamp)), publish: publish };
-  let up = under(cache.stamps.runtime);
-  let code_up = under(cache.stamps.code);
+  let upstream_store = under(cache.stamps.runtime);
+  let code_upstream_store = under(cache.stamps.code);
   {
     ..cache,
-    upstream: Some(up),
-    shared: published_keys[u](up, t_passed()),
-    code_upstream: Some(code_up),
-    code_shared: published_keys[u](code_up, t_code_passes()),
+    upstream: Some(upstream_store),
+    shared: published_keys[u](upstream_store, passed_table()),
+    code_upstream: Some(code_upstream_store),
+    code_shared: published_keys[u](code_upstream_store, code_passes_table()),
   }
 }
 
-fn published_keys<[u]>(up: Upstream, table: Int) -> Map<Bytes, Bool> / {fs.read[u], abort.raise} =
-  entry_keys[u](up, table).fold(Map::new(), |m: Map<Bytes, Bool>, k: Bytes| m.insert(k, true))
+fn published_keys<[u]>(
+  upstream_store: Upstream,
+  table: Int,
+) -> Map<Bytes, Bool> / {fs.read[u], abort.raise} =
+  entry_keys[u](upstream_store, table).fold(Map::new(), |m: Map<Bytes, Bool>, k: Bytes|
+    m.insert(k, true))
 
 type Put = { table: Int, key: Bytes, payload: Bytes }
 
-fn published_failures(n: Int, root: String) -> String =
+fn publish_failure_message(n: Int, root: String) -> String =
   (if n == 1 { "1 entry" } else { n.to_string() ++ " entries" })
     ++ " could not be published to the upstream store `"
     ++ root
@@ -189,29 +193,29 @@ fn puts_in(store: Store, tables: List<Int>) -> List<Put> / {abort.raise} =
 pub fn flush_cache<[r]>(cache: Cache) -> Cache / {fs.read[r], fs.write[r], abort.raise} =
   {
     ..cache,
-    store: flush[r](if pending(cache.store) == 0 { cache.store }
-    else { current[r](cache.store, cache.stamps) }),
+    store: flush[r](if pending_count(cache.store) == 0 { cache.store }
+    else { with_current_stamps[r](cache.store, cache.stamps) }),
   }
 
 /// Whatever a flush writes goes under this build's stamps.
-fn current<[r]>(store: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} =
-  match get[r](store, t_stamps(), stamps_key()) {
-    Hit(b) -> if b == bin::encode(now, stamps_bin()) { store } else { restamped(store, now) },
-    _ -> restamped(store, now),
+fn with_current_stamps<[r]>(store: Store, now: Stamps) -> Store / {fs.read[r], abort.raise} =
+  match get[r](store, stamps_table(), stamps_key()) {
+    Hit(b) -> if b == bin::encode(now, stamps_bin()) { store } else { write_stamps(store, now) },
+    _ -> write_stamps(store, now),
   }
 
-type Published = { failed: Int, known: Map<Bytes, Bool> }
+type PublishResult = { failed: Int, known: Map<Bytes, Bool> }
 
 /// Each of `puts` published there; `known` is what it holds of `passes`.
-fn published_to<[u]>(
-  up: Upstream,
+fn publish_all<[u]>(
+  upstream_store: Upstream,
   puts: List<Put>,
   known: Map<Bytes, Bool>,
   passes: Int,
-) -> Published / {fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} =
+) -> PublishResult / {fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} =
   {
     failed: puts.fold(0, |n: Int, p: Put|
-      if publish[u](up, p.table, p.key, p.payload) { n } else { n + 1 }),
+      if publish[u](upstream_store, p.table, p.key, p.payload) { n } else { n + 1 }),
     known: puts.fold(known, |m: Map<Bytes, Bool>, p: Put|
       if p.table == passes { m.insert(p.key, true) } else { m }),
   }
@@ -220,20 +224,25 @@ fn published_to<[u]>(
 pub fn flush_shared<[r], [u]>(
   cache: Cache,
 ) -> Cache / {fs.read[r], fs.write[r], fs.read[u], fs.write[u], entropy.next, time.now_ms, abort.raise} = {
-  let shared = puts_in(cache.store, [t_passed(), t_evidence()]);
-  let coded = puts_in(cache.store, [t_code_passes()]);
+  let shared = puts_in(cache.store, [passed_table(), evidence_table()]);
+  let coded = puts_in(cache.store, [code_passes_table()]);
   let flushed = flush_cache[r](cache);
   match ((cache.upstream, cache.code_upstream)) {
-    (Some(up), Some(code_up)) -> if !up.publish { flushed } else {
-      let a = published_to[u](up, shared, flushed.shared, t_passed());
-      let b = published_to[u](code_up, coded, flushed.code_shared, t_code_passes());
+    (Some(upstream_store), Some(code_upstream_store)) -> if !upstream_store.publish { flushed }
+    else {
+      let a = publish_all[u](upstream_store, shared, flushed.shared, passed_table());
+      let b = publish_all[u](code_upstream_store, coded, flushed.code_shared, code_passes_table());
       // A merge keeps the schemas runs published under, so one this run read from stays too.
-      let _live = mark_live[u](up);
-      let _code_live = mark_live[u](code_up);
+      let _live = mark_live[u](upstream_store);
+      let _code_live = mark_live[u](code_upstream_store);
       let out = { ..flushed, shared: a.known, code_shared: b.known };
       let failed = a.failed + b.failed;
-      if failed == 0 { out }
-      else { { ..out, store: warn(out.store, Unreadable, published_failures(failed, up.root)) } }
+      if failed == 0 { out } else {
+        {
+          ..out,
+          store: warn(out.store, Unreadable, publish_failure_message(failed, upstream_store.root)),
+        }
+      }
     },
     _ -> flushed,
   }
@@ -241,12 +250,13 @@ pub fn flush_shared<[r], [u]>(
 
 pub fn warnings(cache: Cache) -> List<Warning> = cache.store.warnings
 
-fn noted(cache: Cache, why: String) -> Cache = { ..cache, store: warn(cache.store, Corrupt, why) }
+fn warn_corrupt(cache: Cache, why: String) -> Cache =
+  { ..cache, store: warn(cache.store, Corrupt, why) }
 
 fn named_key(name: Bytes) -> Bytes = blake3(name)
 
 /// A record read back: what it holds, or a warning that it did not decode and is treated as absent.
-pub type Read<a> = { value: Option<a>, cache: Cache }
+pub type ReadResult<a> = { value: Option<a>, cache: Cache }
 
 fn read<a, [r]>(
   cache: Cache,
@@ -254,17 +264,18 @@ fn read<a, [r]>(
   key: Bytes,
   codec: bin::BinCodec<a>,
   what: String,
-) -> Read<a> / {fs.read[r], abort.raise} =
+) -> ReadResult<a> / {fs.read[r], abort.raise} =
   match get[r](cache.store, table, key) {
     Miss -> { value: None, cache: cache },
-    Bad(why) -> { value: None, cache: noted(cache, damaged(what, why)) },
+    Bad(why) -> { value: None, cache: warn_corrupt(cache, damage_message(what, why)) },
     Hit(bytes) -> match bin::decode(bytes, codec) {
       Ok(v) -> { value: Some(v), cache: cache },
-      Err(e) -> { value: None, cache: noted(cache, damaged(what, bin::error_to_string(e))) },
+      Err(e) ->
+        { value: None, cache: warn_corrupt(cache, damage_message(what, bin::error_to_string(e))) },
     },
   }
 
-fn damaged(what: String, why: String) -> String =
+fn damage_message(what: String, why: String) -> String =
   "a stored " ++ what ++ " is damaged (" ++ why ++ "); it is treated as absent"
 
 fn write<a>(
@@ -277,7 +288,7 @@ fn write<a>(
   { ..cache, store: put(cache.store, table, key, bin::encode(value, codec)) }
 
 /// A write of what is already there is no write, so a run that changed nothing flushes nothing.
-fn renew<a, [r]>(
+fn write_if_changed<a, [r]>(
   cache: Cache,
   table: Int,
   key: Bytes,
@@ -295,75 +306,87 @@ fn renew<a, [r]>(
 // that era's module records, and each definition's text by its hash.
 
 /// The source text of the definition `hash` names, as it read when it was filed.
-pub fn text<[r]>(cache: Cache, hash: Bytes) -> Read<Bytes> / {fs.read[r], abort.raise} =
+pub fn text<[r]>(cache: Cache, hash: Bytes) -> ReadResult<Bytes> / {fs.read[r], abort.raise} =
   read[r](cache, t_texts(), hash, bin::bytes_bin(), "definition text")
 
 /// Files the text of the definition `hash` names, unless one is filed already. Two texts with one
 /// hash differ only in what a hash leaves out, such as comments, so the first one stays.
 pub fn put_text(cache: Cache, hash: Bytes, text: Bytes) -> Cache / {abort.raise} =
-  if held(cache.store, t_texts(), hash) { cache }
+  if contains_key(cache.store, t_texts(), hash) { cache }
   else { write(cache, t_texts(), hash, bin::bytes_bin(), text) }
 
 /// Whether a text is filed under `hash`, read from the index alone.
 pub fn holds_text(cache: Cache, hash: Bytes) -> Bool / {abort.raise} =
-  held(cache.store, t_texts(), hash)
+  contains_key(cache.store, t_texts(), hash)
 
-fn era_domain() -> Bytes = b"ply.era.1"
+fn snapshot_domain() -> Bytes = b"ply.era.1"
 
 /// What an era is filed under: a digest of its modules' record digests, in their order.
-pub fn era_digest(modules: List<Bytes>) -> Bytes =
-  blake3(era_domain().concat(Bytes::concat_all(modules)))
+pub fn snapshot_digest(modules: List<Bytes>) -> Bytes =
+  blake3(snapshot_domain().concat(Bytes::concat_all(modules)))
 
 /// The digests of the module records the era `digest` names; one that is not what its digest names
 /// is no era.
-pub fn era<[r]>(cache: Cache, digest: Bytes) -> Read<List<Bytes>> / {fs.read[r], abort.raise} = {
-  let got = read[r](cache, t_eras(), digest, bin::list_bin(bin::bytes_bin()), "era");
+pub fn snapshot<[r]>(
+  cache: Cache,
+  digest: Bytes,
+) -> ReadResult<List<Bytes>> / {fs.read[r], abort.raise} = {
+  let got = read[r](cache, snapshots_table(), digest, bin::list_bin(bin::bytes_bin()), "era");
   match got.value {
-    Some(modules) -> if era_digest(modules) == digest { got } else {
-      { value: None, cache: noted(got.cache, damaged("era", "it is not what its digest names")) }
+    Some(modules) -> if snapshot_digest(modules) == digest { got } else {
+      {
+        value: None,
+        cache: warn_corrupt(got.cache, damage_message("era", "it is not what its digest names")),
+      }
     },
     None -> got,
   }
 }
 
 /// The era of `modules`, filed under its digest unless the store holds it.
-pub fn put_era(cache: Cache, modules: List<Bytes>) -> Cache / {abort.raise} = {
-  let digest = era_digest(modules);
-  if held(cache.store, t_eras(), digest) { cache }
-  else { write(cache, t_eras(), digest, bin::list_bin(bin::bytes_bin()), modules) }
+pub fn put_snapshot(cache: Cache, modules: List<Bytes>) -> Cache / {abort.raise} = {
+  let digest = snapshot_digest(modules);
+  if contains_key(cache.store, snapshots_table(), digest) { cache }
+  else { write(cache, snapshots_table(), digest, bin::list_bin(bin::bytes_bin()), modules) }
 }
 
 /// The module record filed under `digest`; one that is not what its digest names is no record.
 pub fn module_record<[r]>(
   cache: Cache,
   digest: Bytes,
-) -> Read<ModuleRecord> / {fs.read[r], abort.raise} =
-  match get[r](cache.store, t_modules(), digest) {
+) -> ReadResult<ModuleRecord> / {fs.read[r], abort.raise} =
+  match get[r](cache.store, modules_table(), digest) {
     Miss -> { value: None, cache: cache },
-    Bad(why) -> { value: None, cache: noted(cache, damaged("module record", why)) },
+    Bad(why) -> { value: None, cache: warn_corrupt(cache, damage_message("module record", why)) },
     Hit(bytes) -> if record_digest(bytes) != digest {
       {
         value: None,
-        cache: noted(cache, damaged("module record", "it is not what its digest names")),
+        cache: warn_corrupt(
+          cache,
+          damage_message("module record", "it is not what its digest names"),
+        ),
       }
     } else {
       match bin::decode(bytes, module_record_bin()) {
         Ok(x) -> { value: Some(x), cache: cache },
         Err(e) ->
-          { value: None, cache: noted(cache, damaged("module record", bin::error_to_string(e))) },
+          {
+            value: None,
+            cache: warn_corrupt(cache, damage_message("module record", bin::error_to_string(e))),
+          },
       }
     },
   }
 
 /// Whether a module record is filed under `digest`, read from the index alone.
 pub fn holds_module_record(cache: Cache, digest: Bytes) -> Bool / {abort.raise} =
-  held(cache.store, t_modules(), digest)
+  contains_key(cache.store, modules_table(), digest)
 
 /// `record`, a module record's bytes, filed under its digest unless the store holds it.
 pub fn put_module_record(cache: Cache, record: Bytes) -> Cache / {abort.raise} = {
   let digest = record_digest(record);
-  if held(cache.store, t_modules(), digest) { cache }
-  else { { ..cache, store: put(cache.store, t_modules(), digest, record) } }
+  if contains_key(cache.store, modules_table(), digest) { cache }
+  else { { ..cache, store: put(cache.store, modules_table(), digest, record) } }
 }
 
 // --- Test results -----------------------------------------------------------
@@ -373,15 +396,19 @@ fn passed_in<[r]>(
   table: Int,
   shared: Map<Bytes, Bool>,
   key: Bytes,
-) -> Read<Bool> / {fs.read[r], abort.raise} =
+) -> ReadResult<Bool> / {fs.read[r], abort.raise} =
   match get[r](cache.store, table, key) {
     Hit(_) -> { value: Some(true), cache: cache },
     Miss -> { value: Some(shared.contains(key)), cache: cache },
-    Bad(why) -> { value: Some(shared.contains(key)), cache: noted(cache, damaged("result", why)) },
+    Bad(why) ->
+      {
+        value: Some(shared.contains(key)),
+        cache: warn_corrupt(cache, damage_message("result", why)),
+      },
   }
 
-pub fn passed<[r]>(cache: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
-  passed_in[r](cache, t_passed(), cache.shared, key)
+pub fn passed<[r]>(cache: Cache, key: Bytes) -> ReadResult<Bool> / {fs.read[r], abort.raise} =
+  passed_in[r](cache, passed_table(), cache.shared, key)
 
 /// The trace a pass filed under `key` here, or else in the upstream, stands on.
 fn trace_in<[r], [u]>(
@@ -390,17 +417,18 @@ fn trace_in<[r], [u]>(
   upstream: Option<Upstream>,
   shared: Map<Bytes, Bool>,
   key: Bytes,
-) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
+) -> ReadResult<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
   match get[r](cache.store, table, key) {
     Hit(trace) -> { value: Some(trace), cache: cache },
-    Bad(why) -> { value: None, cache: noted(cache, damaged("result", why)) },
+    Bad(why) -> { value: None, cache: warn_corrupt(cache, damage_message("result", why)) },
     Miss -> match upstream {
       None -> { value: None, cache: cache },
-      Some(up) -> if !shared.contains(key) { { value: None, cache: cache } } else {
-        match read_entry[u](up, table, key) {
+      Some(upstream_store) -> if !shared.contains(key) { { value: None, cache: cache } } else {
+        match read_entry[u](upstream_store, table, key) {
           Hit(trace) -> { value: Some(trace), cache: cache },
           Miss -> { value: None, cache: cache },
-          Bad(why) -> { value: None, cache: noted(cache, damaged("upstream result", why)) },
+          Bad(why) ->
+            { value: None, cache: warn_corrupt(cache, damage_message("upstream result", why)) },
         }
       },
     },
@@ -409,30 +437,33 @@ fn trace_in<[r], [u]>(
 pub fn pass_trace<[r], [u]>(
   cache: Cache,
   key: Bytes,
-) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
-  trace_in[r, u](cache, t_passed(), cache.upstream, cache.shared, key)
+) -> ReadResult<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
+  trace_in[r, u](cache, passed_table(), cache.upstream, cache.shared, key)
 
 /// A pass, with the trace of what its run read.
 pub fn put_passed(cache: Cache, key: Bytes, trace: Bytes) -> Cache / {abort.raise} =
-  { ..cache, store: put(cache.store, t_passed(), key, trace) }
+  { ..cache, store: put(cache.store, passed_table(), key, trace) }
 
 /// A pass filed under the code its test ran, here or in the upstream.
-pub fn passed_code<[r]>(cache: Cache, key: Bytes) -> Read<Bool> / {fs.read[r], abort.raise} =
-  passed_in[r](cache, t_code_passes(), cache.code_shared, key)
+pub fn passed_code<[r]>(cache: Cache, key: Bytes) -> ReadResult<Bool> / {fs.read[r], abort.raise} =
+  passed_in[r](cache, code_passes_table(), cache.code_shared, key)
 
 pub fn code_pass_trace<[r], [u]>(
   cache: Cache,
   key: Bytes,
-) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
-  trace_in[r, u](cache, t_code_passes(), cache.code_upstream, cache.code_shared, key)
+) -> ReadResult<Bytes> / {fs.read[r], fs.read[u], abort.raise} =
+  trace_in[r, u](cache, code_passes_table(), cache.code_upstream, cache.code_shared, key)
 
 pub fn put_passed_code(cache: Cache, key: Bytes, trace: Bytes) -> Cache / {abort.raise} =
-  { ..cache, store: put(cache.store, t_code_passes(), key, trace) }
+  { ..cache, store: put(cache.store, code_passes_table(), key, trace) }
 
-pub fn pass_record<[r]>(cache: Cache, key: Bytes) -> Read<PassRecord> / {fs.read[r], abort.raise} = {
+pub fn pass_record<[r]>(
+  cache: Cache,
+  key: Bytes,
+) -> ReadResult<PassRecord> / {fs.read[r], abort.raise} = {
   let got = read[r](
     cache,
-    t_pass_records(),
+    pass_records_table(),
     named_key(key),
     named_bin(pass_record_bin()),
     "pass record",
@@ -448,54 +479,61 @@ pub fn put_pass_record<[r]>(
   key: Bytes,
   record: PassRecord,
 ) -> Cache / {fs.read[r], abort.raise} =
-  renew[r](cache, t_pass_records(), named_key(key), named_bin(pass_record_bin()), {
+  write_if_changed[r](cache, pass_records_table(), named_key(key), named_bin(pass_record_bin()), {
     name: key,
     value: record,
   })
 
 /// Whether the store has seen the definition `hash` pass, read from the index alone.
 pub fn knows_definition(cache: Cache, hash: Bytes) -> Bool / {abort.raise} =
-  held(cache.store, t_seen(), hash)
+  contains_key(cache.store, seen_table(), hash)
 
 pub fn observe_definition(cache: Cache, hash: Bytes) -> Cache / {abort.raise} =
-  { ..cache, store: put(cache.store, t_seen(), hash, b"") }
+  { ..cache, store: put(cache.store, seen_table(), hash, b"") }
 
 // --- The prover -------------------------------------------------------------
 
-pub fn evidence<[r]>(cache: Cache, key: Bytes) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  read[r](cache, t_evidence(), key, bin::bytes_bin(), "evidence")
+pub fn evidence<[r]>(cache: Cache, key: Bytes) -> ReadResult<Bytes> / {fs.read[r], abort.raise} =
+  read[r](cache, evidence_table(), key, bin::bytes_bin(), "evidence")
 
 /// The local entry, or else the upstream's.
 pub fn evidence_shared<[r], [u]>(
   cache: Cache,
   key: Bytes,
-) -> Read<Bytes> / {fs.read[r], fs.read[u], abort.raise} = {
+) -> ReadResult<Bytes> / {fs.read[r], fs.read[u], abort.raise} = {
   let local = evidence[r](cache, key);
   match local.value {
     Some(_) -> local,
     None -> match cache.upstream {
       None -> local,
-      Some(up) -> match read_entry[u](up, t_evidence(), key) {
+      Some(upstream_store) -> match read_entry[u](upstream_store, evidence_table(), key) {
         Hit(payload) -> match bin::decode(payload, bin::bytes_bin()) {
           Ok(v) -> { value: Some(v), cache: local.cache },
           Err(e) ->
             {
               value: None,
-              cache: noted(local.cache, damaged("upstream evidence", bin::error_to_string(e))),
+              cache: warn_corrupt(
+                local.cache,
+                damage_message("upstream evidence", bin::error_to_string(e)),
+              ),
             },
         },
         Miss -> local,
-        Bad(why) -> { value: None, cache: noted(local.cache, damaged("upstream evidence", why)) },
+        Bad(why) ->
+          {
+            value: None,
+            cache: warn_corrupt(local.cache, damage_message("upstream evidence", why)),
+          },
       },
     },
   }
 }
 
 pub fn put_evidence(cache: Cache, key: Bytes, encoded: Bytes) -> Cache / {abort.raise} =
-  write(cache, t_evidence(), key, bin::bytes_bin(), encoded)
+  write(cache, evidence_table(), key, bin::bytes_bin(), encoded)
 
-pub fn review<[r]>(cache: Cache, def: Bytes) -> Read<Review> / {fs.read[r], abort.raise} = {
-  let got = read[r](cache, t_reviews(), named_key(def), named_bin(review_bin()), "review");
+pub fn review<[r]>(cache: Cache, def: Bytes) -> ReadResult<Review> / {fs.read[r], abort.raise} = {
+  let got = read[r](cache, reviews_table(), named_key(def), named_bin(review_bin()), "review");
   match got.value {
     Some(n) -> { value: if n.name == def { Some(n.value) } else { None }, cache: got.cache },
     None -> { value: None, cache: got.cache },
@@ -503,7 +541,7 @@ pub fn review<[r]>(cache: Cache, def: Bytes) -> Read<Review> / {fs.read[r], abor
 }
 
 pub fn put_review(cache: Cache, def: Bytes, r: Review) -> Cache / {abort.raise} =
-  write(cache, t_reviews(), named_key(def), named_bin(review_bin()), { name: def, value: r })
+  write(cache, reviews_table(), named_key(def), named_bin(review_bin()), { name: def, value: r })
 
 // --- Upkeep -----------------------------------------------------------------
 
@@ -521,21 +559,21 @@ pub type Counts = {
 pub fn counts(cache: Cache) -> Counts / {abort.raise} =
   {
     texts: keys(cache.store, t_texts()).len(),
-    passed: keys(cache.store, t_passed()).len(),
-    pass_records: keys(cache.store, t_pass_records()).len(),
-    eras: keys(cache.store, t_eras()).len(),
-    modules: keys(cache.store, t_modules()).len(),
-    seen: keys(cache.store, t_seen()).len(),
-    evidence: keys(cache.store, t_evidence()).len(),
-    reviews: keys(cache.store, t_reviews()).len(),
+    passed: keys(cache.store, passed_table()).len(),
+    pass_records: keys(cache.store, pass_records_table()).len(),
+    eras: keys(cache.store, snapshots_table()).len(),
+    modules: keys(cache.store, modules_table()).len(),
+    seen: keys(cache.store, seen_table()).len(),
+    evidence: keys(cache.store, evidence_table()).len(),
+    reviews: keys(cache.store, reviews_table()).len(),
   }
 
 /// How many definition texts, eras and module records a prune dropped.
-pub type Pruned = { texts: Int, eras: Int, modules: Int }
+pub type PruneCounts = { texts: Int, eras: Int, modules: Int }
 
 /// The tests whose pass record names each era, each by where a walk of it starts, and the hash
 /// each test passed at.
-type Passed = {
+type PassesBySnapshot = {
   eras: Map<Bytes, List<{ key: Bytes, case: Bool }>>,
   tests: Map<Bytes, Bool>,
   cache: Cache,
@@ -554,23 +592,25 @@ type Live = {
 /// that is neither of a test as it last passed nor of a definition it reached then: a failure reads
 /// only what its test last passed against. Each era is walked once, from all the tests that last
 /// passed in it.
-pub fn prune<[r]>(cache: Cache) -> { pruned: Pruned, cache: Cache } / {fs.read[r], abort.raise} = {
-  let passed = keys(cache.store, t_pass_records()).fold(
+pub fn prune<[r]>(
+  cache: Cache,
+) -> { pruned: PruneCounts, cache: Cache } / {fs.read[r], abort.raise} = {
+  let passed = keys(cache.store, pass_records_table()).fold(
     { eras: Map::new(), tests: Map::new(), cache: cache },
-    |acc: Passed, k: Bytes| {
+    |acc: PassesBySnapshot, k: Bytes| {
       let got = read[r](
         acc.cache,
-        t_pass_records(),
+        pass_records_table(),
         k,
         named_bin(pass_record_bin()),
         "pass record",
       );
       match got.value {
         Some(n) -> {
-          let era = n.value.era;
-          let tests = match acc.eras.get(era) { Some(ts) -> ts, None -> [] };
+          let snapshot = n.value.era;
+          let tests = match acc.eras.get(snapshot) { Some(ts) -> ts, None -> [] };
           {
-            eras: acc.eras.insert(era, tests.push({ key: n.value.of, case: n.value.case })),
+            eras: acc.eras.insert(snapshot, tests.push({ key: n.value.of, case: n.value.case })),
             tests: acc.tests.insert(n.value.test_hash, true),
             cache: got.cache,
           }
@@ -582,7 +622,7 @@ pub fn prune<[r]>(cache: Cache) -> { pruned: Pruned, cache: Cache } / {fs.read[r
   let live = passed.eras.fold(
     { modules: Map::new(), records: Map::new(), hashes: Map::new(), cache: passed.cache },
     |acc: Live, e: Bytes, tests: List<{ key: Bytes, case: Bool }>| {
-      let got = era[r](acc.cache, e);
+      let got = snapshot[r](acc.cache, e);
       match got.value {
         None -> { ..acc, cache: got.cache },
         Some(ms) -> {
@@ -616,8 +656,8 @@ pub fn prune<[r]>(cache: Cache) -> { pruned: Pruned, cache: Cache } / {fs.read[r
       gone: dead.len(),
     }
   };
-  let gone_eras = swept(live.cache, t_eras(), |k: Bytes| passed.eras.contains(k));
-  let gone_modules = swept(gone_eras.cache, t_modules(), |k: Bytes| live.modules.contains(k));
+  let gone_eras = swept(live.cache, snapshots_table(), |k: Bytes| passed.eras.contains(k));
+  let gone_modules = swept(gone_eras.cache, modules_table(), |k: Bytes| live.modules.contains(k));
   let texts = swept(gone_modules.cache, t_texts(), |k: Bytes|
     live.hashes.contains(k) || passed.tests.contains(k));
   {
@@ -643,11 +683,11 @@ pub fn compact_cache<[r]>(cache: Cache) -> Cache / {fs.read[r], fs.write[r], abo
 
 // --- Tests ------------------------------------------------------------------
 
-fn built() -> Stamps = { runtime: "runtime", code: "code" }
+fn test_stamps() -> Stamps = { runtime: "runtime", code: "code" }
 
 /// A module record holding one definition of each of `names`, each under the hash its name keys,
 /// and the test `m.t`, which references the first.
-fn holding(names: List<String>) -> Bytes / {abort.raise} =
+fn module_record_holding(names: List<String>) -> Bytes / {abort.raise} =
   bin::encode(
     {
       nodes: names.map(|n: String|
@@ -666,14 +706,14 @@ fn holding(names: List<String>) -> Bytes / {abort.raise} =
 
 /// The pass record of a test that passed in the era of `modules`.
 fn record_in(modules: List<Bytes>) -> PassRecord =
-  { test_hash: name_key("t"), era: era_digest(modules), of: b"m.t", case: false }
+  { test_hash: name_key("t"), era: snapshot_digest(modules), of: b"m.t", case: false }
 
 test "every table round-trips through a flush and a reopen" {
-  let m = holding(["m.f"]);
-  let run = on_twin(mem_empty(), || {
-    let c1 = open_cache[mem]("cache", built());
+  let m = module_record_holding(["m.f"]);
+  let run = run_in_memory(mem_empty(), || {
+    let c1 = open_cache[mem]("cache", test_stamps());
     let c2 = put_text(c1, name_key("m.f"), b"fn f() -> Int = 1\n");
-    let c3 = put_era(put_module_record(c2, m), [record_digest(m)]);
+    let c3 = put_snapshot(put_module_record(c2, m), [record_digest(m)]);
     let c4 = put_pass_record(
       observe_definition(put_passed(c3, name_key("result"), b""), name_key("m.f")),
       b"m.t",
@@ -684,7 +724,7 @@ test "every table round-trips through a flush and a reopen" {
       specs: [name_key("s")],
     });
     let c = flush_cache[mem](c5);
-    let r = open_cache[mem]("cache", built());
+    let r = open_cache[mem]("cache", test_stamps());
     assert_eq(text[mem](r, name_key("m.f")).value, Some(b"fn f() -> Int = 1\n"));
     assert_eq(text[mem](r, name_key("m.g")).value, None);
     assert(holds_text(r, name_key("m.f")) && !holds_text(r, name_key("m.g")));
@@ -692,7 +732,10 @@ test "every table round-trips through a flush and a reopen" {
     assert_eq(passed[mem](r, name_key("other")).value, Some(false));
     assert(knows_definition(r, name_key("m.f")) && !knows_definition(r, name_key("m.g")));
     assert_eq(pass_record[mem](r, b"m.t").value, Some(record_in([record_digest(m)])));
-    assert_eq(era[mem](r, era_digest([record_digest(m)])).value, Some([record_digest(m)]));
+    assert_eq(
+      snapshot[mem](r, snapshot_digest([record_digest(m)])).value,
+      Some([record_digest(m)]),
+    );
     assert_eq(
       module_record[mem](r, record_digest(m)).value,
       match bin::decode(m, module_record_bin()) { Ok(x) -> Some(x), Err(_) -> None },
@@ -707,14 +750,16 @@ test "every table round-trips through a flush and a reopen" {
 }
 
 test "an era or a module record not under its own digest is not filed or not read" {
-  let m = holding(["m.f"]);
-  let run = on_twin(mem_empty(), || {
-    let c = put_era(put_module_record(open_cache[mem]("cache", built()), m), [record_digest(m)]);
-    let refiled = put_era(put_module_record(c, m), [record_digest(m)]);
-    let elsewhere = { ..c, store: put(c.store, t_modules(), name_key("elsewhere"), m) };
+  let m = module_record_holding(["m.f"]);
+  let run = run_in_memory(mem_empty(), || {
+    let c = put_snapshot(put_module_record(open_cache[mem]("cache", test_stamps()), m), [
+      record_digest(m),
+    ]);
+    let refiled = put_snapshot(put_module_record(c, m), [record_digest(m)]);
+    let elsewhere = { ..c, store: put(c.store, modules_table(), name_key("elsewhere"), m) };
     {
       // Filing what is held puts nothing.
-      again: pending(refiled.store) == pending(c.store),
+      again: pending_count(refiled.store) == pending_count(c.store),
       read: module_record[mem](elsewhere, name_key("elsewhere")).value == None,
       warned: warnings(module_record[mem](elsewhere, name_key("elsewhere")).cache).len(),
     }
@@ -724,13 +769,13 @@ test "an era or a module record not under its own digest is not filed or not rea
 }
 
 test "prune keeps what each test reached in the era it last passed in, and drops the rest" {
-  let live = holding(["m.passed", "m.stale"]);
-  let dead = holding(["m.orphan"]);
-  let run = on_twin(mem_empty(), || {
-    let c0 = open_cache[mem]("cache", built());
+  let live = module_record_holding(["m.passed", "m.stale"]);
+  let dead = module_record_holding(["m.orphan"]);
+  let run = run_in_memory(mem_empty(), || {
+    let c0 = open_cache[mem]("cache", test_stamps());
     let c1 = put_pass_record(
-      put_era(
-        put_era(put_module_record(put_module_record(c0, live), dead), [record_digest(dead)]),
+      put_snapshot(
+        put_snapshot(put_module_record(put_module_record(c0, live), dead), [record_digest(dead)]),
         [record_digest(live)],
       ),
       b"m.t",
@@ -740,7 +785,7 @@ test "prune keeps what each test reached in the era it last passed in, and drops
       put_text(cache, name_key(n), b"v"));
     let p = prune[mem](flush_cache[mem](c2));
     let kept = flush_cache[mem](p.cache);
-    let r = open_cache[mem]("cache", built());
+    let r = open_cache[mem]("cache", test_stamps());
     {
       pruned: p.pruned,
       texts: ["m.passed", "m.stale", "m.orphan", "t"].map(|n: String| holds_text(r, name_key(n))),
@@ -760,34 +805,40 @@ test "the schema is a function of the stored shapes alone" {
 }
 
 test "two runs filing different entries both keep theirs" {
-  let run = on_twin(mem_empty(), || {
-    let a = put_text(open_cache[mem]("cache", built()), name_key("m.a"), b"A");
-    let b = put_text(open_cache[mem]("cache", built()), name_key("m.b"), b"B");
+  let run = run_in_memory(mem_empty(), || {
+    let a = put_text(open_cache[mem]("cache", test_stamps()), name_key("m.a"), b"A");
+    let b = put_text(open_cache[mem]("cache", test_stamps()), name_key("m.b"), b"B");
     let a1 = flush_cache[mem](a);
     let b1 = flush_cache[mem](b);
-    let r = open_cache[mem]("cache", built());
+    let r = open_cache[mem]("cache", test_stamps());
     [text[mem](r, name_key("m.a")).value, text[mem](r, name_key("m.b")).value]
   });
   assert_eq(run.value, [Some(b"A"), Some(b"B")])
 }
 
 test "a text filed under a hash already holding one writes nothing, and the first is kept" {
-  let run = on_twin(mem_empty(), || {
-    let _c1 = flush_cache[mem](put_text(open_cache[mem]("cache", built()), name_key("m.f"), b"F"));
-    let again = put_text(open_cache[mem]("cache", built()), name_key("m.f"), b"F // a comment");
-    { pending: pending(again.store), kept: text[mem](again, name_key("m.f")).value }
+  let run = run_in_memory(mem_empty(), || {
+    let _c1 = flush_cache[mem](
+      put_text(open_cache[mem]("cache", test_stamps()), name_key("m.f"), b"F"),
+    );
+    let again = put_text(
+      open_cache[mem]("cache", test_stamps()),
+      name_key("m.f"),
+      b"F // a comment",
+    );
+    { pending: pending_count(again.store), kept: text[mem](again, name_key("m.f")).value }
   });
   assert_eq(run.value, { pending: 0, kept: Some(b"F") })
 }
 
 test "an upstream's passes and evidence answer here, and what this run learns is published there" {
-  let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", true);
+  let run = run_in_memory(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", true);
     let a1 = flush_shared[mem, mem](
       put_evidence(put_passed(a, name_key("pass"), b""), name_key("claim"), b"evidence"),
     );
-    let b = with_upstream[mem](open_cache[mem]("two/cache", built()), "shared", true);
-    let lonely = open_cache[mem]("three/cache", built());
+    let b = with_upstream[mem](open_cache[mem]("two/cache", test_stamps()), "shared", true);
+    let lonely = open_cache[mem]("three/cache", test_stamps());
     [
       passed[mem](b, name_key("pass")).value == Some(true),
       evidence_shared[mem, mem](b, name_key("claim")).value == Some(b"evidence"),
@@ -800,13 +851,13 @@ test "an upstream's passes and evidence answer here, and what this run learns is
 }
 
 test "a pass is read back with its trace, here or from the upstream, and filed again on another" {
-  let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", true);
+  let run = run_in_memory(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", true);
     let _a1 = flush_shared[mem, mem](put_passed(a, name_key("pass"), b"read a"));
-    let b = with_upstream[mem](open_cache[mem]("two/cache", built()), "shared", true);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", test_stamps()), "shared", true);
     let first = pass_trace[mem, mem](b, name_key("pass")).value;
     let _b1 = flush_shared[mem, mem](put_passed(b, name_key("pass"), b"read b"));
-    let c = with_upstream[mem](open_cache[mem]("three/cache", built()), "shared", true);
+    let c = with_upstream[mem](open_cache[mem]("three/cache", test_stamps()), "shared", true);
     [
       first,
       pass_trace[mem, mem](c, name_key("pass")).value,
@@ -817,13 +868,17 @@ test "a pass is read back with its trace, here or from the upstream, and filed a
 }
 
 test "a pass filed under the code its test ran outlives another runtime stamp, and goes with its own" {
-  let run = on_twin(mem_empty(), || {
-    let a = open_cache[mem]("cache", built());
+  let run = run_in_memory(mem_empty(), || {
+    let a = open_cache[mem]("cache", test_stamps());
     let _filed = flush_cache[mem](
       put_passed_code(put_passed(a, name_key("result"), b""), name_key("code"), b""),
     );
-    let moved = open_cache[mem]("cache", { ..built(), runtime: "another" });
-    let recoded = open_cache[mem]("cache", { ..built(), runtime: "another", code: "another" });
+    let moved = open_cache[mem]("cache", { ..test_stamps(), runtime: "another" });
+    let recoded = open_cache[mem]("cache", {
+      ..test_stamps(),
+      runtime: "another",
+      code: "another",
+    });
     [
       passed[mem](moved, name_key("result")).value,
       passed_code[mem](moved, name_key("code")).value,
@@ -834,13 +889,13 @@ test "a pass filed under the code its test ran outlives another runtime stamp, a
 }
 
 test "a pass filed under its code is shared under a schema of its own, which another runtime reads" {
-  let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", true);
+  let run = run_in_memory(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", true);
     let _published = flush_shared[mem, mem](
       put_passed_code(put_passed(a, name_key("pass"), b""), name_key("code"), b""),
     );
     let b = with_upstream[mem](
-      open_cache[mem]("two/cache", { ..built(), runtime: "another" }),
+      open_cache[mem]("two/cache", { ..test_stamps(), runtime: "another" }),
       "shared",
       true,
     );
@@ -851,8 +906,8 @@ test "a pass filed under its code is shared under a schema of its own, which ano
 
 test "a publishing run marks every schema it used live, and a read-only one marks none" {
   let lives = |publish: Bool|
-    on_twin(mem_empty(), || {
-      let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", publish);
+    run_in_memory(mem_empty(), || {
+      let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", publish);
       let _flushed = flush_shared[mem, mem](a);
       match listed_names(fs.list_dir[mem]("shared/v2")) {
         Some(dirs) -> dirs.filter(|d: String| fs.exists[mem]("shared/v2/" ++ d ++ "/live")).len(),
@@ -864,25 +919,25 @@ test "a publishing run marks every schema it used live, and a read-only one mark
 }
 
 test "a read-only upstream answers and is not written" {
-  let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", false);
+  let run = run_in_memory(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", false);
     let a1 = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
-    let b = with_upstream[mem](open_cache[mem]("two/cache", built()), "shared", true);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", test_stamps()), "shared", true);
     passed[mem](b, name_key("pass")).value
   });
   assert_eq(run.value, Some(false))
 }
 
 test "two runs publishing one pass race harmlessly, and an unwritable upstream is a warning" {
-  let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", true);
-    let b = with_upstream[mem](open_cache[mem]("two/cache", built()), "shared", true);
+  let run = run_in_memory(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", true);
+    let b = with_upstream[mem](open_cache[mem]("two/cache", test_stamps()), "shared", true);
     let a1 = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
     let b1 = flush_shared[mem, mem](put_passed(b, name_key("pass"), b""));
     let blocked = fs.write_file[mem]("blocked", b"a file where the upstream should be");
-    let c = with_upstream[mem](open_cache[mem]("three/cache", built()), "blocked", true);
+    let c = with_upstream[mem](open_cache[mem]("three/cache", test_stamps()), "blocked", true);
     let c1 = flush_shared[mem, mem](put_passed(c, name_key("mine"), b""));
-    let again = open_cache[mem]("three/cache", built());
+    let again = open_cache[mem]("three/cache", test_stamps());
     {
       clean: warnings(a1) == [] && warnings(b1) == [],
       warned: messages(warnings(c1)),
@@ -897,15 +952,15 @@ test "two runs publishing one pass race harmlessly, and an unwritable upstream i
 }
 
 test "entries filed under another build's stamp are dropped group by group, and said once" {
-  let run = on_twin(mem_empty(), || {
+  let run = run_in_memory(mem_empty(), || {
     let c0 = put_passed_code(
-      put_passed(open_cache[mem]("cache", built()), name_key("t"), b""),
+      put_passed(open_cache[mem]("cache", test_stamps()), name_key("t"), b""),
       name_key("code"),
       b"",
     );
     let c1 = put_review(c0, b"m.f", { def: name_key("m.f"), specs: [] });
     let written = flush_cache[mem](c1);
-    let moved = { ..built(), runtime: "elsewhere" };
+    let moved = { ..test_stamps(), runtime: "elsewhere" };
     let r = open_cache[mem]("cache", moved);
     let warned = messages(r.store.warnings);
     let refiled = flush_cache[mem](open_cache[mem]("cache", moved));
@@ -927,14 +982,14 @@ test "entries filed under another build's stamp are dropped group by group, and 
 }
 
 test "a pass or a claim's evidence filed by another runtime is not believed" {
-  let run = on_twin(mem_empty(), || {
+  let run = run_in_memory(mem_empty(), || {
     let c0 = put_evidence(
-      put_passed(open_cache[mem]("cache", built()), name_key("t"), b""),
+      put_passed(open_cache[mem]("cache", test_stamps()), name_key("t"), b""),
       name_key("claim"),
       b"evidence",
     );
     let written = flush_cache[mem](c0);
-    let r = open_cache[mem]("cache", { ..built(), runtime: "another runtime" });
+    let r = open_cache[mem]("cache", { ..test_stamps(), runtime: "another runtime" });
     {
       warned: messages(r.store.warnings).len(),
       passed: passed[mem](r, name_key("t")).value,
@@ -947,12 +1002,12 @@ test "a pass or a claim's evidence filed by another runtime is not believed" {
 }
 
 test "an upstream answers only the runtime that published to it" {
-  let run = on_twin(mem_empty(), || {
-    let a = with_upstream[mem](open_cache[mem]("one/cache", built()), "shared", true);
+  let run = run_in_memory(mem_empty(), || {
+    let a = with_upstream[mem](open_cache[mem]("one/cache", test_stamps()), "shared", true);
     let published = flush_shared[mem, mem](put_passed(a, name_key("pass"), b""));
-    let same = with_upstream[mem](open_cache[mem]("two/cache", built()), "shared", true);
+    let same = with_upstream[mem](open_cache[mem]("two/cache", test_stamps()), "shared", true);
     let other = with_upstream[mem](
-      open_cache[mem]("three/cache", { ..built(), runtime: "another runtime" }),
+      open_cache[mem]("three/cache", { ..test_stamps(), runtime: "another runtime" }),
       "shared",
       true,
     );

@@ -38,7 +38,7 @@ import std.http
 import std.ip
 import std.list
 import std.net
-import std.net (Says, net)
+import std.net (Sends, net)
 import std.random (entropy, rand, with_rand)
 import std.show (show)
 import std.string
@@ -198,7 +198,7 @@ pub type Metrics = new { resource_metrics: List<ResourceMetrics> }
 
 /// What a collector answers a request with where it took only part of it: how many spans or
 /// data points it turned away, and why. All of it taken is zero and no message.
-pub type Receipt = new { rejected: Int, message: String }
+pub type ExportResponse = new { rejected: Int, message: String }
 
 /// A resource with no attributes.
 pub fn empty_resource() -> Resource = { attributes: [], dropped_attributes: 0u32 }
@@ -259,7 +259,7 @@ fn texts() -> Gen<String> =
       )),
   ])
 
-fn wide() -> Gen<U64> =
+fn u64s() -> Gen<U64> =
   gen::map2(gen::below(4294967296), gen::below(4294967296), |high: Int, low: Int|
     U64::of_int(high) << 32 | U64::of_int(low))
 
@@ -297,19 +297,19 @@ fn numbers() -> Gen<Number> =
 
 fn histogram_points() -> Gen<HistogramPoint> =
   gen::and_then(gen::list_of(key_values_at(1), 3), |attributes: List<KeyValue>|
-    gen::and_then(gen::list_of_length(wide(), 3), |times: List<U64>|
+    gen::and_then(gen::list_of_length(u64s(), 3), |times: List<U64>|
       gen::and_then(
         gen::list_of_length(gen::option_of(doubles()), 3),
         |stats: List<Option<Float>>|
           gen::map2(
-            gen::list_of(wide(), 5),
+            gen::list_of(u64s(), 5),
             gen::list_of(doubles(), 4),
             |counts: List<U64>, bounds: List<Float>| -> HistogramPoint {
               {
                 attributes: attributes,
-                start: wide_at(times, 0),
-                time: wide_at(times, 1),
-                count: wide_at(times, 2),
+                start: u64_at(times, 0),
+                time: u64_at(times, 1),
+                count: u64_at(times, 2),
                 sum: stat_at(stats, 0),
                 bucket_counts: counts,
                 explicit_bounds: bounds,
@@ -320,7 +320,7 @@ fn histogram_points() -> Gen<HistogramPoint> =
           ),
       )))
 
-fn wide_at(xs: List<U64>, i: Int) -> U64 = match xs.at(i) { Some(x) -> x, None -> 0u64 }
+fn u64_at(xs: List<U64>, i: Int) -> U64 = match xs.at(i) { Some(x) -> x, None -> 0u64 }
 
 fn stat_at(xs: List<Option<Float>>, i: Int) -> Option<Float> =
   match xs.at(i) { Some(x) -> x, None -> None }
@@ -328,9 +328,9 @@ fn stat_at(xs: List<Option<Float>>, i: Int) -> Option<Float> =
 // --- Refusals -----------------------------------------------------------------
 
 /// Why a reader refused a request.
-pub type Why =
+pub type ErrorKind =
   /// The bytes are not the protobuf of a request: `std.protobuf`'s own refusal.
-  | NotProtobuf(protobuf::Why)
+  | NotProtobuf(protobuf::ErrorKind)
   /// The text is not JSON; what the parser said.
   | NotJson(String)
   /// A JSON value that is not what its field takes; what the field takes.
@@ -354,8 +354,8 @@ pub type Why =
   | TooDeep
 
 /// A refusal: why, at which byte, and in which field.
-pub type Refusal = new {
-  why: Why,
+pub type Error = new {
+  reason: ErrorKind,
   /// For protobuf, the offset of the field refused. For JSON, the byte the parser stopped at,
   /// or -1 for a value refused once the text had parsed.
   at: Int,
@@ -367,7 +367,7 @@ pub type Refusal = new {
 /// What the readers of this module raise where they refuse.
 pub effect otlp {
   /// The bytes are not a request this module models.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// Sends everything the exporter around the caller holds, and answers what it has done.
   write flush() -> Stats
   /// What the exporter around the caller has done so far.
@@ -386,8 +386,8 @@ pub type Limits = new {
 /// request this module writes.
 pub fn default_limits() -> Limits = { length: 4194304, depth: 64 }
 
-fn refuse<a>(why: Why, at: Int, field: String) -> a / {otlp.refused} =
-  otlp.refused({ why: why, at: at, field: field })
+fn fail<a>(why: ErrorKind, at: Int, field: String) -> a / {otlp.fail} =
+  otlp.fail({ reason: why, at: at, field: field })
 
 // --- The two encodings ----------------------------------------------------------
 
@@ -414,42 +414,38 @@ pub fn encode_metrics(e: Encoding, m: Metrics) -> Bytes / {abort.raise} =
   match e { Protobuf -> metrics_body(m), Json -> json::to_bytes(metrics_json(m)) }
 
 /// A collector's answer; an empty receipt is the empty message.
-pub fn encode_receipt(e: Encoding, signal: Signal, r: Receipt) -> Bytes / {abort.raise} =
-  match e { Protobuf -> receipt_body(r), Json -> json::to_bytes(receipt_json(signal, r)) }
+pub fn encode_response(e: Encoding, signal: Signal, r: ExportResponse) -> Bytes / {abort.raise} =
+  match e { Protobuf -> response_body(r), Json -> json::to_bytes(response_json(signal, r)) }
 
-/// The traces a request holds, raising `otlp.refused` where `decode_traces` answers `Err`.
-pub fn read_traces(
-  e: Encoding,
-  data: Bytes,
-  limits: Limits,
-) -> Traces / {otlp.refused, abort.raise} =
+/// The traces a request holds, raising `otlp.fail` where `decode_traces` answers `Err`.
+pub fn read_traces(e: Encoding, data: Bytes, limits: Limits) -> Traces / {otlp.fail, abort.raise} =
   match e {
     Protobuf -> from_protobuf(data, limits, |m: Message| traces_of(m, limits.depth)),
     Json -> traces_of_json(parsed(data, limits), limits.depth),
   }
 
-/// The metrics a request holds, raising `otlp.refused` where `decode_metrics` answers `Err`.
+/// The metrics a request holds, raising `otlp.fail` where `decode_metrics` answers `Err`.
 pub fn read_metrics(
   e: Encoding,
   data: Bytes,
   limits: Limits,
-) -> Metrics / {otlp.refused, abort.raise} =
+) -> Metrics / {otlp.fail, abort.raise} =
   match e {
     Protobuf -> from_protobuf(data, limits, |m: Message| metrics_of(m, limits.depth)),
     Json -> metrics_of_json(parsed(data, limits), limits.depth),
   }
 
-/// The receipt a collector's answer holds, raising `otlp.refused` where `decode_receipt`
+/// The receipt a collector's answer holds, raising `otlp.fail` where `decode_response`
 /// answers `Err`.
-pub fn read_receipt(
+pub fn read_response(
   e: Encoding,
   signal: Signal,
   data: Bytes,
   limits: Limits,
-) -> Receipt / {otlp.refused, abort.raise} =
+) -> ExportResponse / {otlp.fail, abort.raise} =
   match e {
-    Protobuf -> from_protobuf(data, limits, receipt_of),
-    Json -> receipt_of_json(signal, parsed(data, limits)),
+    Protobuf -> from_protobuf(data, limits, response_of),
+    Json -> response_of_json(signal, parsed(data, limits)),
   }
 
 /// The traces a request holds, or why it is refused.
@@ -457,38 +453,38 @@ pub fn decode_traces(
   e: Encoding,
   data: Bytes,
   limits: Limits,
-) -> Result<Traces, Refusal> / {abort.raise} = try { read_traces(e, data, limits) }
+) -> Result<Traces, Error> / {abort.raise} = try { read_traces(e, data, limits) }
 
 /// The metrics a request holds, or why it is refused.
 pub fn decode_metrics(
   e: Encoding,
   data: Bytes,
   limits: Limits,
-) -> Result<Metrics, Refusal> / {abort.raise} = try { read_metrics(e, data, limits) }
+) -> Result<Metrics, Error> / {abort.raise} = try { read_metrics(e, data, limits) }
 
 /// The receipt a collector's answer holds, or why it is refused.
-pub fn decode_receipt(
+pub fn decode_response(
   e: Encoding,
   signal: Signal,
   data: Bytes,
   limits: Limits,
-) -> Result<Receipt, Refusal> / {abort.raise} = try { read_receipt(e, signal, data, limits) }
+) -> Result<ExportResponse, Error> / {abort.raise} = try { read_response(e, signal, data, limits) }
 
 // --- Protobuf: writing ----------------------------------------------------------
 
-fn text(field: Int, s: String) -> Bytes / {abort.raise} =
+fn string_if_set(field: Int, s: String) -> Bytes / {abort.raise} =
   if s == "" { b"" } else { protobuf::string_field(field, s) }
 
-fn narrow(field: Int, n: U32) -> Bytes / {abort.raise} =
+fn u32_if_set(field: Int, n: U32) -> Bytes / {abort.raise} =
   if n == 0u32 { b"" } else { protobuf::int_field(field, Int::of_u32(n)) }
 
-fn moment(field: Int, n: U64) -> Bytes / {abort.raise} =
+fn time_if_set(field: Int, n: U64) -> Bytes / {abort.raise} =
   if n == 0u64 { b"" } else { protobuf::fixed64_field(field, n) }
 
-fn number(field: Int, n: Int) -> Bytes / {abort.raise} =
+fn int_if_set(field: Int, n: Int) -> Bytes / {abort.raise} =
   if n == 0 { b"" } else { protobuf::int_field(field, n) }
 
-fn each(field: Int, bodies: List<Bytes>) -> Bytes / {abort.raise} =
+fn repeated_messages(field: Int, bodies: List<Bytes>) -> Bytes / {abort.raise} =
   Bytes::concat_all(bodies.map(|body: Bytes| protobuf::message_field(field, body)))
 
 fn value_body(v: AnyValue) -> Bytes / {abort.raise} =
@@ -497,30 +493,30 @@ fn value_body(v: AnyValue) -> Bytes / {abort.raise} =
     BoolValue(b) -> protobuf::bool_field(2, b),
     IntValue(n) -> protobuf::int_field(3, n),
     DoubleValue(f) -> protobuf::double_field(4, f),
-    ArrayValue(xs) -> protobuf::message_field(5, each(1, xs.map(value_body))),
-    KvlistValue(kvs) -> protobuf::message_field(6, each(1, kvs.map(key_value_body))),
+    ArrayValue(xs) -> protobuf::message_field(5, repeated_messages(1, xs.map(value_body))),
+    KvlistValue(kvs) -> protobuf::message_field(6, repeated_messages(1, kvs.map(key_value_body))),
     BytesValue(b) -> protobuf::bytes_field(7, b),
     NoValue -> b"",
   }
 
 fn key_value_body(kv: KeyValue) -> Bytes / {abort.raise} =
-  text(1, kv.key).concat(match kv.value {
+  string_if_set(1, kv.key).concat(match kv.value {
     NoValue -> b"",
     held -> protobuf::message_field(2, value_body(held)),
   })
 
 fn attributes_at(field: Int, kvs: List<KeyValue>) -> Bytes / {abort.raise} =
-  each(field, kvs.map(key_value_body))
+  repeated_messages(field, kvs.map(key_value_body))
 
 fn resource_body(r: Resource) -> Bytes / {abort.raise} =
-  attributes_at(1, r.attributes).concat(narrow(2, r.dropped_attributes))
+  attributes_at(1, r.attributes).concat(u32_if_set(2, r.dropped_attributes))
 
 fn scope_body(s: Scope) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    text(1, s.name),
-    text(2, s.version),
+    string_if_set(1, s.name),
+    string_if_set(2, s.version),
     attributes_at(3, s.attributes),
-    narrow(4, s.dropped_attributes),
+    u32_if_set(4, s.dropped_attributes),
   ])
 
 fn kind_number(k: SpanKind) -> Int =
@@ -538,27 +534,31 @@ fn code_number(c: StatusCode) -> Int = match c { StatusUnset -> 0, StatusOk -> 1
 fn temporality_number(t: Temporality) -> Int = match t { Delta -> 1, Cumulative -> 2 }
 
 fn status_at(field: Int, s: Status) -> Bytes / {abort.raise} =
-  if s == unset() { b"" }
-  else { protobuf::message_field(field, text(2, s.message).concat(number(3, code_number(s.code)))) }
+  if s == unset() { b"" } else {
+    protobuf::message_field(
+      field,
+      string_if_set(2, s.message).concat(int_if_set(3, code_number(s.code))),
+    )
+  }
 
 fn flags_at(field: Int, flags: U32) -> Bytes / {abort.raise} =
   if flags == 0u32 { b"" } else { protobuf::fixed32_field(field, flags) }
 
 fn event_body(e: Event) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    moment(1, e.time),
-    text(2, e.name),
+    time_if_set(1, e.time),
+    string_if_set(2, e.name),
     attributes_at(3, e.attributes),
-    narrow(4, e.dropped_attributes),
+    u32_if_set(4, e.dropped_attributes),
   ])
 
 fn link_body(l: Link) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     protobuf::bytes_field(1, traceparent::trace_id_bytes(l.trace_id)),
     protobuf::bytes_field(2, traceparent::span_id_bytes(l.span_id)),
-    text(3, l.trace_state),
+    string_if_set(3, l.trace_state),
     attributes_at(4, l.attributes),
-    narrow(5, l.dropped_attributes),
+    u32_if_set(5, l.dropped_attributes),
     flags_at(6, l.flags),
   ])
 
@@ -566,21 +566,21 @@ fn span_body(s: Span) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     protobuf::bytes_field(1, traceparent::trace_id_bytes(s.trace_id)),
     protobuf::bytes_field(2, traceparent::span_id_bytes(s.span_id)),
-    text(3, s.trace_state),
+    string_if_set(3, s.trace_state),
     match s.parent {
       Some(id) -> protobuf::bytes_field(4, traceparent::span_id_bytes(id)),
       None -> b"",
     },
-    text(5, s.name),
-    number(6, kind_number(s.kind)),
-    moment(7, s.start),
-    moment(8, s.end),
+    string_if_set(5, s.name),
+    int_if_set(6, kind_number(s.kind)),
+    time_if_set(7, s.start),
+    time_if_set(8, s.end),
     attributes_at(9, s.attributes),
-    narrow(10, s.dropped_attributes),
-    each(11, s.events.map(event_body)),
-    narrow(12, s.dropped_events),
-    each(13, s.links.map(link_body)),
-    narrow(14, s.dropped_links),
+    u32_if_set(10, s.dropped_attributes),
+    repeated_messages(11, s.events.map(event_body)),
+    u32_if_set(12, s.dropped_events),
+    repeated_messages(13, s.links.map(link_body)),
+    u32_if_set(14, s.dropped_links),
     status_at(15, s.status),
     flags_at(16, s.flags),
   ])
@@ -588,24 +588,24 @@ fn span_body(s: Span) -> Bytes / {abort.raise} =
 fn scope_spans_body(s: ScopeSpans) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     protobuf::message_field(1, scope_body(s.scope)),
-    each(2, s.spans.map(span_body)),
-    text(3, s.schema_url),
+    repeated_messages(2, s.spans.map(span_body)),
+    string_if_set(3, s.schema_url),
   ])
 
 fn resource_spans_body(r: ResourceSpans) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     protobuf::message_field(1, resource_body(r.resource)),
-    each(2, r.scope_spans.map(scope_spans_body)),
-    text(3, r.schema_url),
+    repeated_messages(2, r.scope_spans.map(scope_spans_body)),
+    string_if_set(3, r.schema_url),
   ])
 
 fn traces_body(t: Traces) -> Bytes / {abort.raise} =
-  each(1, t.resource_spans.map(resource_spans_body))
+  repeated_messages(1, t.resource_spans.map(resource_spans_body))
 
 fn number_point_body(p: NumberPoint) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    moment(2, p.start),
-    moment(3, p.time),
+    time_if_set(2, p.start),
+    time_if_set(3, p.time),
     match p.value { AsDouble(f) -> protobuf::double_field(4, f), AsInt(_) -> b"" },
     match p.value { AsInt(n) -> protobuf::sfixed64_field(6, n), AsDouble(_) -> b"" },
     attributes_at(7, p.attributes),
@@ -616,9 +616,9 @@ fn optional_double(field: Int, f: Option<Float>) -> Bytes / {abort.raise} =
 
 fn histogram_point_body(p: HistogramPoint) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    moment(2, p.start),
-    moment(3, p.time),
-    moment(4, p.count),
+    time_if_set(2, p.start),
+    time_if_set(3, p.time),
+    time_if_set(4, p.count),
     optional_double(5, p.sum),
     protobuf::packed_fixed64(6, p.bucket_counts),
     protobuf::packed_doubles(7, p.explicit_bounds),
@@ -629,12 +629,13 @@ fn histogram_point_body(p: HistogramPoint) -> Bytes / {abort.raise} =
 
 fn data_body(d: Data) -> Bytes / {abort.raise} =
   match d {
-    Gauge(points) -> protobuf::message_field(5, each(1, points.map(number_point_body))),
+    Gauge(points) ->
+      protobuf::message_field(5, repeated_messages(1, points.map(number_point_body))),
     Sum(points, temporality, monotonic) ->
       protobuf::message_field(
         7,
         Bytes::concat_all([
-          each(1, points.map(number_point_body)),
+          repeated_messages(1, points.map(number_point_body)),
           protobuf::int_field(2, temporality_number(temporality)),
           if monotonic { protobuf::bool_field(3, true) } else { b"" },
         ]),
@@ -642,35 +643,40 @@ fn data_body(d: Data) -> Bytes / {abort.raise} =
     Histogram(points, temporality) ->
       protobuf::message_field(
         9,
-        each(1, points.map(histogram_point_body)).concat(
+        repeated_messages(1, points.map(histogram_point_body)).concat(
           protobuf::int_field(2, temporality_number(temporality)),
         ),
       ),
   }
 
 fn metric_body(m: Metric) -> Bytes / {abort.raise} =
-  Bytes::concat_all([text(1, m.name), text(2, m.description), text(3, m.unit), data_body(m.data)])
+  Bytes::concat_all([
+    string_if_set(1, m.name),
+    string_if_set(2, m.description),
+    string_if_set(3, m.unit),
+    data_body(m.data),
+  ])
 
 fn scope_metrics_body(s: ScopeMetrics) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     protobuf::message_field(1, scope_body(s.scope)),
-    each(2, s.metrics.map(metric_body)),
-    text(3, s.schema_url),
+    repeated_messages(2, s.metrics.map(metric_body)),
+    string_if_set(3, s.schema_url),
   ])
 
 fn resource_metrics_body(r: ResourceMetrics) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     protobuf::message_field(1, resource_body(r.resource)),
-    each(2, r.scope_metrics.map(scope_metrics_body)),
-    text(3, r.schema_url),
+    repeated_messages(2, r.scope_metrics.map(scope_metrics_body)),
+    string_if_set(3, r.schema_url),
   ])
 
 fn metrics_body(m: Metrics) -> Bytes / {abort.raise} =
-  each(1, m.resource_metrics.map(resource_metrics_body))
+  repeated_messages(1, m.resource_metrics.map(resource_metrics_body))
 
-fn receipt_body(r: Receipt) -> Bytes / {abort.raise} =
+fn response_body(r: ExportResponse) -> Bytes / {abort.raise} =
   if r.rejected == 0 && r.message == "" { b"" }
-  else { protobuf::message_field(1, number(1, r.rejected).concat(text(2, r.message))) }
+  else { protobuf::message_field(1, int_if_set(1, r.rejected).concat(string_if_set(2, r.message))) }
 
 // --- Protobuf: reading ----------------------------------------------------------
 
@@ -679,70 +685,73 @@ fn receipt_body(r: Receipt) -> Bytes / {abort.raise} =
 fn from_protobuf<a>(
   data: Bytes,
   limits: Limits,
-  read: (Message) -> a / {otlp.refused, protobuf.refused, abort.raise},
-) -> a / {otlp.refused, abort.raise} =
-  match try[protobuf.refused] {
+  read: (Message) -> a / {otlp.fail, protobuf.fail, abort.raise},
+) -> a / {otlp.fail, abort.raise} =
+  match try[protobuf.fail] {
       read(protobuf::message(data, { depth: limits.depth, length: limits.length }))
     } {
     Ok(answer) -> answer,
-    Err(e) -> refuse(NotProtobuf(e.why), e.at, ""),
+    Err(e) -> fail(NotProtobuf(e.reason), e.at, ""),
   }
 
-effect set Reading = {otlp.refused, protobuf.refused, abort.raise}
+effect set Reading = {otlp.fail, protobuf.fail, abort.raise}
 
-fn value_of(m: Message, room: Int) -> AnyValue / {Reading} =
-  if room <= 0 { refuse(TooDeep, protobuf::offset(m), "value") } else {
+fn value_of(m: Message, depth_left: Int) -> AnyValue / {Reading} =
+  if depth_left <= 0 { fail(TooDeep, protobuf::offset(m), "value") } else {
     protobuf::fields(m).fold(NoValue, |held: AnyValue, f: Field|
       match f.number {
         1 -> StringValue(protobuf::string_of(f)),
         2 -> BoolValue(protobuf::bool_of(f)),
         3 -> IntValue(protobuf::int_of(f)),
         4 -> DoubleValue(protobuf::double_of(f)),
-        5 -> ArrayValue(values_in(protobuf::message_of(f), room - 1)),
-        6 -> KvlistValue(key_values_in(protobuf::message_of(f), 1, room - 1)),
+        5 -> ArrayValue(values_in(protobuf::message_of(f), depth_left - 1)),
+        6 -> KvlistValue(key_values_in(protobuf::message_of(f), 1, depth_left - 1)),
         7 -> BytesValue(protobuf::bytes_of(f)),
         _ -> held,
       })
   }
 
-fn values_in(m: Message, room: Int) -> List<AnyValue> / {Reading} =
+fn values_in(m: Message, depth_left: Int) -> List<AnyValue> / {Reading} =
   protobuf::fields(m).fold([], |acc: List<AnyValue>, f: Field|
-    match f.number { 1 -> acc.push(value_of(protobuf::message_of(f), room)), _ -> acc })
+    match f.number { 1 -> acc.push(value_of(protobuf::message_of(f), depth_left)), _ -> acc })
 
 /// Every `KeyValue` under the field `number` of `m`.
-fn key_values_in(m: Message, number: Int, room: Int) -> List<KeyValue> / {Reading} =
+fn key_values_in(m: Message, int_if_set: Int, depth_left: Int) -> List<KeyValue> / {Reading} =
   protobuf::fields(m).fold([], |acc: List<KeyValue>, f: Field|
-    if f.number == number { acc.push(key_value_of(protobuf::message_of(f), room)) } else { acc })
+    if f.number == int_if_set { acc.push(key_value_of(protobuf::message_of(f), depth_left)) }
+    else { acc })
 
-fn key_value_of(m: Message, room: Int) -> KeyValue / {Reading} = {
+fn key_value_of(m: Message, depth_left: Int) -> KeyValue / {Reading} = {
   let start: KeyValue = { key: "", value: NoValue };
   protobuf::fields(m).fold(start, |kv: KeyValue, f: Field|
     match f.number {
       1 -> { ..kv, key: protobuf::string_of(f) },
-      2 -> { ..kv, value: value_of(protobuf::message_of(f), room) },
+      2 -> { ..kv, value: value_of(protobuf::message_of(f), depth_left) },
       _ -> kv,
     })
 }
 
-fn resource_of(m: Message, room: Int) -> Resource / {Reading} =
+fn resource_of(m: Message, depth_left: Int) -> Resource / {Reading} =
   protobuf::fields(m).fold(empty_resource(), |r: Resource, f: Field|
     match f.number {
-      1 -> { ..r, attributes: r.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+      1 ->
+        { ..r, attributes: r.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
       2 -> { ..r, dropped_attributes: protobuf::uint32_of(f) },
       _ -> r,
     })
 
-fn scope_of(m: Message, room: Int) -> Scope / {Reading} =
+fn scope_of(m: Message, depth_left: Int) -> Scope / {Reading} =
   protobuf::fields(m).fold(scope(""), |s: Scope, f: Field|
     match f.number {
       1 -> { ..s, name: protobuf::string_of(f) },
       2 -> { ..s, version: protobuf::string_of(f) },
-      3 -> { ..s, attributes: s.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+      3 ->
+        { ..s, attributes: s.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
       4 -> { ..s, dropped_attributes: protobuf::uint32_of(f) },
       _ -> s,
     })
 
-fn kind_of(n: Int, at: Int) -> SpanKind / {otlp.refused} =
+fn kind_of(n: Int, at: Int) -> SpanKind / {otlp.fail} =
   match n {
     0 -> Unspecified,
     1 -> Internal,
@@ -750,18 +759,18 @@ fn kind_of(n: Int, at: Int) -> SpanKind / {otlp.refused} =
     3 -> Client,
     4 -> Producer,
     5 -> Consumer,
-    _ -> refuse(BadEnum(n), at, "kind"),
+    _ -> fail(BadEnum(n), at, "kind"),
   }
 
-fn code_of(n: Int, at: Int) -> StatusCode / {otlp.refused} =
-  match n { 0 -> StatusUnset, 1 -> StatusOk, 2 -> StatusError, _ -> refuse(BadEnum(n), at, "code") }
+fn code_of(n: Int, at: Int) -> StatusCode / {otlp.fail} =
+  match n { 0 -> StatusUnset, 1 -> StatusOk, 2 -> StatusError, _ -> fail(BadEnum(n), at, "code") }
 
-fn temporality_of(n: Int, at: Int) -> Temporality / {otlp.refused} =
+fn temporality_of(n: Int, at: Int) -> Temporality / {otlp.fail} =
   match n {
     1 -> Delta,
     2 -> Cumulative,
-    0 -> refuse(Missing("aggregationTemporality"), at, "aggregationTemporality"),
-    _ -> refuse(BadEnum(n), at, "aggregationTemporality"),
+    0 -> fail(Missing("aggregationTemporality"), at, "aggregationTemporality"),
+    _ -> fail(BadEnum(n), at, "aggregationTemporality"),
   }
 
 fn status_of(m: Message) -> Status / {Reading} =
@@ -772,13 +781,14 @@ fn status_of(m: Message) -> Status / {Reading} =
       _ -> s,
     })
 
-fn event_of(m: Message, room: Int) -> Event / {Reading} = {
+fn event_of(m: Message, depth_left: Int) -> Event / {Reading} = {
   let start: Event = { time: 0u64, name: "", attributes: [], dropped_attributes: 0u32 };
   protobuf::fields(m).fold(start, |e: Event, f: Field|
     match f.number {
       1 -> { ..e, time: protobuf::fixed64_of(f) },
       2 -> { ..e, name: protobuf::string_of(f) },
-      3 -> { ..e, attributes: e.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+      3 ->
+        { ..e, attributes: e.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
       4 -> { ..e, dropped_attributes: protobuf::uint32_of(f) },
       _ -> e,
     })
@@ -826,18 +836,18 @@ fn raw_at(at: Int) -> Raw =
     at: at,
   }
 
-fn trace_id_of(raw: Bytes, at: Int) -> TraceId / {otlp.refused, abort.raise} =
-  match traceparent::trace_id(raw) { Some(id) -> id, None -> refuse(BadId, at, "traceId") }
+fn trace_id_of(raw: Bytes, at: Int) -> TraceId / {otlp.fail, abort.raise} =
+  match traceparent::trace_id(raw) { Some(id) -> id, None -> fail(BadId, at, "traceId") }
 
-fn span_id_of(raw: Bytes, at: Int, field: String) -> SpanId / {otlp.refused, abort.raise} =
-  match traceparent::span_id(raw) { Some(id) -> id, None -> refuse(BadId, at, field) }
+fn span_id_of(raw: Bytes, at: Int, field: String) -> SpanId / {otlp.fail, abort.raise} =
+  match traceparent::span_id(raw) { Some(id) -> id, None -> fail(BadId, at, field) }
 
 /// A parent of no bytes, or of eight zeros as some writers send it, is none.
-fn parent_of(raw: Bytes, at: Int) -> Option<SpanId> / {otlp.refused, abort.raise} =
+fn parent_of(raw: Bytes, at: Int) -> Option<SpanId> / {otlp.fail, abort.raise} =
   if raw.len() == 0 || raw == b"\x00\x00\x00\x00\x00\x00\x00\x00" { None }
   else { Some(span_id_of(raw, at, "parentSpanId")) }
 
-fn span_from(r: Raw) -> Span / {otlp.refused, abort.raise} =
+fn span_from(r: Raw) -> Span / {otlp.fail, abort.raise} =
   {
     trace_id: trace_id_of(r.trace_id, r.at),
     span_id: span_id_of(r.span_id, r.at, "spanId"),
@@ -857,7 +867,7 @@ fn span_from(r: Raw) -> Span / {otlp.refused, abort.raise} =
     status: r.status,
   }
 
-fn link_from(r: Raw) -> Link / {otlp.refused, abort.raise} =
+fn link_from(r: Raw) -> Link / {otlp.fail, abort.raise} =
   {
     trace_id: trace_id_of(r.trace_id, r.at),
     span_id: span_id_of(r.span_id, r.at, "spanId"),
@@ -867,24 +877,25 @@ fn link_from(r: Raw) -> Link / {otlp.refused, abort.raise} =
     flags: r.flags,
   }
 
-fn link_of(m: Message, room: Int) -> Link / {Reading} =
+fn link_of(m: Message, depth_left: Int) -> Link / {Reading} =
   link_from(
     protobuf::fields(m).fold(raw_at(protobuf::offset(m)), |r: Raw, f: Field|
       match f.number {
         1 -> { ..r, trace_id: protobuf::bytes_of(f) },
         2 -> { ..r, span_id: protobuf::bytes_of(f) },
         3 -> { ..r, trace_state: protobuf::string_of(f) },
-        4 -> { ..r, attributes: r.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+        4 ->
+          { ..r, attributes: r.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
         5 -> { ..r, dropped_attributes: protobuf::uint32_of(f) },
         6 -> { ..r, flags: protobuf::fixed32_of(f) },
         _ -> r,
       }),
   )
 
-fn span_of(m: Message, room: Int) -> Span / {Reading} =
+fn span_of(m: Message, depth_left: Int) -> Span / {Reading} =
   span_from(
     protobuf::fields(m).fold(raw_at(protobuf::offset(m)), |r: Raw, f: Field|
-      if f.number <= 8 { span_head(r, f) } else { span_tail(r, f, room) }),
+      if f.number <= 8 { span_head(r, f) } else { span_tail(r, f, depth_left) }),
   )
 
 fn span_head(r: Raw, f: Field) -> Raw / {Reading} =
@@ -900,47 +911,55 @@ fn span_head(r: Raw, f: Field) -> Raw / {Reading} =
     _ -> r,
   }
 
-fn span_tail(r: Raw, f: Field, room: Int) -> Raw / {Reading} =
+fn span_tail(r: Raw, f: Field, depth_left: Int) -> Raw / {Reading} =
   match f.number {
-    9 -> { ..r, attributes: r.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+    9 -> { ..r, attributes: r.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
     10 -> { ..r, dropped_attributes: protobuf::uint32_of(f) },
-    11 -> { ..r, events: r.events.push(event_of(protobuf::message_of(f), room)) },
+    11 -> { ..r, events: r.events.push(event_of(protobuf::message_of(f), depth_left)) },
     12 -> { ..r, dropped_events: protobuf::uint32_of(f) },
-    13 -> { ..r, links: r.links.push(link_of(protobuf::message_of(f), room)) },
+    13 -> { ..r, links: r.links.push(link_of(protobuf::message_of(f), depth_left)) },
     14 -> { ..r, dropped_links: protobuf::uint32_of(f) },
     15 -> { ..r, status: status_of(protobuf::message_of(f)) },
     16 -> { ..r, flags: protobuf::fixed32_of(f) },
     _ -> r,
   }
 
-fn scope_spans_of(m: Message, room: Int) -> ScopeSpans / {Reading} = {
+fn scope_spans_of(m: Message, depth_left: Int) -> ScopeSpans / {Reading} = {
   let start: ScopeSpans = { scope: scope(""), spans: [], schema_url: "" };
   protobuf::fields(m).fold(start, |s: ScopeSpans, f: Field|
     match f.number {
-      1 -> { ..s, scope: scope_of(protobuf::message_of(f), room) },
-      2 -> { ..s, spans: s.spans.push(span_of(protobuf::message_of(f), room)) },
+      1 -> { ..s, scope: scope_of(protobuf::message_of(f), depth_left) },
+      2 -> { ..s, spans: s.spans.push(span_of(protobuf::message_of(f), depth_left)) },
       3 -> { ..s, schema_url: protobuf::string_of(f) },
       _ -> s,
     })
 }
 
-fn resource_spans_of(m: Message, room: Int) -> ResourceSpans / {Reading} = {
+fn resource_spans_of(m: Message, depth_left: Int) -> ResourceSpans / {Reading} = {
   let start: ResourceSpans = { resource: empty_resource(), scope_spans: [], schema_url: "" };
   protobuf::fields(m).fold(start, |r: ResourceSpans, f: Field|
     match f.number {
-      1 -> { ..r, resource: resource_of(protobuf::message_of(f), room) },
-      2 -> { ..r, scope_spans: r.scope_spans.push(scope_spans_of(protobuf::message_of(f), room)) },
+      1 -> { ..r, resource: resource_of(protobuf::message_of(f), depth_left) },
+      2 ->
+        {
+          ..r,
+          scope_spans: r.scope_spans.push(scope_spans_of(protobuf::message_of(f), depth_left)),
+        },
       3 -> { ..r, schema_url: protobuf::string_of(f) },
       _ -> r,
     })
 }
 
-fn traces_of(m: Message, room: Int) -> Traces / {Reading} = {
+fn traces_of(m: Message, depth_left: Int) -> Traces / {Reading} = {
   let start: Traces = { resource_spans: [] };
   protobuf::fields(m).fold(start, |t: Traces, f: Field|
     match f.number {
       1 ->
-        { resource_spans: t.resource_spans.push(resource_spans_of(protobuf::message_of(f), room)) },
+        {
+          resource_spans: t.resource_spans.push(
+            resource_spans_of(protobuf::message_of(f), depth_left),
+          ),
+        },
       _ -> t,
     })
 }
@@ -953,7 +972,7 @@ type RawPoint = {
   at: Int,
 }
 
-fn number_point_of(m: Message, room: Int) -> NumberPoint / {Reading} = {
+fn number_point_of(m: Message, depth_left: Int) -> NumberPoint / {Reading} = {
   let start: RawPoint = {
     attributes: [],
     start: 0u64,
@@ -967,12 +986,13 @@ fn number_point_of(m: Message, room: Int) -> NumberPoint / {Reading} = {
       3 -> { ..p, time: protobuf::fixed64_of(f) },
       4 -> { ..p, value: Some(AsDouble(protobuf::double_of(f))) },
       6 -> { ..p, value: Some(AsInt(protobuf::sfixed64_of(f))) },
-      7 -> { ..p, attributes: p.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+      7 ->
+        { ..p, attributes: p.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
       _ -> p,
     });
   match raw.value {
     Some(value) -> { attributes: raw.attributes, start: raw.start, time: raw.time, value: value },
-    None -> refuse(Missing("value"), raw.at, "asDouble"),
+    None -> fail(Missing("value"), raw.at, "asDouble"),
   }
 }
 
@@ -989,7 +1009,7 @@ fn empty_histogram_point() -> HistogramPoint =
     max: None,
   }
 
-fn histogram_point_of(m: Message, room: Int) -> HistogramPoint / {Reading} =
+fn histogram_point_of(m: Message, depth_left: Int) -> HistogramPoint / {Reading} =
   protobuf::fields(m).fold(empty_histogram_point(), |p: HistogramPoint, f: Field|
     match f.number {
       2 -> { ..p, start: protobuf::fixed64_of(f) },
@@ -1010,7 +1030,8 @@ fn histogram_point_of(m: Message, room: Int) -> HistogramPoint / {Reading} =
             |acc: List<Float>, x: Float| acc.push(x),
           ),
         },
-      9 -> { ..p, attributes: p.attributes.push(key_value_of(protobuf::message_of(f), room)) },
+      9 ->
+        { ..p, attributes: p.attributes.push(key_value_of(protobuf::message_of(f), depth_left)) },
       11 -> { ..p, min: Some(protobuf::double_of(f)) },
       12 -> { ..p, max: Some(protobuf::double_of(f)) },
       _ -> p,
@@ -1019,22 +1040,22 @@ fn histogram_point_of(m: Message, room: Int) -> HistogramPoint / {Reading} =
 /// The points, temporality and monotonicity a gauge, a sum or a histogram message holds.
 type RawData<p> = { points: List<p>, temporality: Int, monotonic: Bool }
 
-fn number_data_of(m: Message, room: Int) -> RawData<NumberPoint> / {Reading} = {
+fn number_data_of(m: Message, depth_left: Int) -> RawData<NumberPoint> / {Reading} = {
   let start: RawData<NumberPoint> = { points: [], temporality: 0, monotonic: false };
   protobuf::fields(m).fold(start, |d: RawData<NumberPoint>, f: Field|
     match f.number {
-      1 -> { ..d, points: d.points.push(number_point_of(protobuf::message_of(f), room)) },
+      1 -> { ..d, points: d.points.push(number_point_of(protobuf::message_of(f), depth_left)) },
       2 -> { ..d, temporality: protobuf::int_of(f) },
       3 -> { ..d, monotonic: protobuf::bool_of(f) },
       _ -> d,
     })
 }
 
-fn histogram_data_of(m: Message, room: Int) -> RawData<HistogramPoint> / {Reading} = {
+fn histogram_data_of(m: Message, depth_left: Int) -> RawData<HistogramPoint> / {Reading} = {
   let start: RawData<HistogramPoint> = { points: [], temporality: 0, monotonic: false };
   protobuf::fields(m).fold(start, |d: RawData<HistogramPoint>, f: Field|
     match f.number {
-      1 -> { ..d, points: d.points.push(histogram_point_of(protobuf::message_of(f), room)) },
+      1 -> { ..d, points: d.points.push(histogram_point_of(protobuf::message_of(f), depth_left)) },
       2 -> { ..d, temporality: protobuf::int_of(f) },
       _ -> d,
     })
@@ -1042,7 +1063,7 @@ fn histogram_data_of(m: Message, room: Int) -> RawData<HistogramPoint> / {Readin
 
 type RawMetric = { name: String, description: String, unit: String, data: Option<Data>, at: Int }
 
-fn metric_of(m: Message, room: Int) -> Metric / {Reading} = {
+fn metric_of(m: Message, depth_left: Int) -> Metric / {Reading} = {
   let start: RawMetric = {
     name: "",
     description: "",
@@ -1055,71 +1076,73 @@ fn metric_of(m: Message, room: Int) -> Metric / {Reading} = {
       1 -> { ..r, name: protobuf::string_of(f) },
       2 -> { ..r, description: protobuf::string_of(f) },
       3 -> { ..r, unit: protobuf::string_of(f) },
-      5 -> { ..r, data: Some(Gauge(number_data_of(protobuf::message_of(f), room).points)) },
+      5 -> { ..r, data: Some(Gauge(number_data_of(protobuf::message_of(f), depth_left).points)) },
       7 -> {
-        let d = number_data_of(protobuf::message_of(f), room);
+        let d = number_data_of(protobuf::message_of(f), depth_left);
         { ..r, data: Some(Sum(d.points, temporality_of(d.temporality, f.at), d.monotonic)) }
       },
       9 -> {
-        let d = histogram_data_of(protobuf::message_of(f), room);
+        let d = histogram_data_of(protobuf::message_of(f), depth_left);
         { ..r, data: Some(Histogram(d.points, temporality_of(d.temporality, f.at))) }
       },
-      10 -> refuse(Unsupported("exponential_histogram"), f.at, "exponentialHistogram"),
-      11 -> refuse(Unsupported("summary"), f.at, "summary"),
+      10 -> fail(Unsupported("exponential_histogram"), f.at, "exponentialHistogram"),
+      11 -> fail(Unsupported("summary"), f.at, "summary"),
       _ -> r,
     });
   match raw.data {
     Some(data) -> { name: raw.name, description: raw.description, unit: raw.unit, data: data },
-    None -> refuse(Missing("data"), raw.at, "data"),
+    None -> fail(Missing("data"), raw.at, "data"),
   }
 }
 
-fn scope_metrics_of(m: Message, room: Int) -> ScopeMetrics / {Reading} = {
+fn scope_metrics_of(m: Message, depth_left: Int) -> ScopeMetrics / {Reading} = {
   let start: ScopeMetrics = { scope: scope(""), metrics: [], schema_url: "" };
   protobuf::fields(m).fold(start, |s: ScopeMetrics, f: Field|
     match f.number {
-      1 -> { ..s, scope: scope_of(protobuf::message_of(f), room) },
-      2 -> { ..s, metrics: s.metrics.push(metric_of(protobuf::message_of(f), room)) },
+      1 -> { ..s, scope: scope_of(protobuf::message_of(f), depth_left) },
+      2 -> { ..s, metrics: s.metrics.push(metric_of(protobuf::message_of(f), depth_left)) },
       3 -> { ..s, schema_url: protobuf::string_of(f) },
       _ -> s,
     })
 }
 
-fn resource_metrics_of(m: Message, room: Int) -> ResourceMetrics / {Reading} = {
+fn resource_metrics_of(m: Message, depth_left: Int) -> ResourceMetrics / {Reading} = {
   let start: ResourceMetrics = { resource: empty_resource(), scope_metrics: [], schema_url: "" };
   protobuf::fields(m).fold(start, |r: ResourceMetrics, f: Field|
     match f.number {
-      1 -> { ..r, resource: resource_of(protobuf::message_of(f), room) },
+      1 -> { ..r, resource: resource_of(protobuf::message_of(f), depth_left) },
       2 ->
         {
           ..r,
-          scope_metrics: r.scope_metrics.push(scope_metrics_of(protobuf::message_of(f), room)),
+          scope_metrics: r.scope_metrics.push(
+            scope_metrics_of(protobuf::message_of(f), depth_left),
+          ),
         },
       3 -> { ..r, schema_url: protobuf::string_of(f) },
       _ -> r,
     })
 }
 
-fn metrics_of(m: Message, room: Int) -> Metrics / {Reading} = {
+fn metrics_of(m: Message, depth_left: Int) -> Metrics / {Reading} = {
   let start: Metrics = { resource_metrics: [] };
   protobuf::fields(m).fold(start, |held: Metrics, f: Field|
     match f.number {
       1 ->
         {
           resource_metrics: held.resource_metrics.push(
-            resource_metrics_of(protobuf::message_of(f), room),
+            resource_metrics_of(protobuf::message_of(f), depth_left),
           ),
         },
       _ -> held,
     })
 }
 
-fn receipt_of(m: Message) -> Receipt / {protobuf.refused, abort.raise} = {
-  let start: Receipt = { rejected: 0, message: "" };
-  protobuf::fields(m).fold(start, |r: Receipt, f: Field|
+fn response_of(m: Message) -> ExportResponse / {protobuf.fail, abort.raise} = {
+  let start: ExportResponse = { rejected: 0, message: "" };
+  protobuf::fields(m).fold(start, |r: ExportResponse, f: Field|
     match f.number {
       1 ->
-        protobuf::fields(protobuf::message_of(f)).fold(r, |inner: Receipt, g: Field|
+        protobuf::fields(protobuf::message_of(f)).fold(r, |inner: ExportResponse, g: Field|
           match g.number {
             1 -> { ..inner, rejected: protobuf::int_of(g) },
             2 -> { ..inner, message: protobuf::string_of(g) },
@@ -1142,21 +1165,21 @@ fn object(members: List<Member>) -> Json =
 
 /// `j` where a field says something, and `Null`, which `object` leaves out, where it holds
 /// what a reader takes a missing field for.
-fn said(says: Bool, j: Json) -> Json = if says { j } else { Null }
+fn json_if(present: Bool, j: Json) -> Json = if present { j } else { Null }
 
-fn text_json(s: String) -> Json = said(s != "", Str(s))
+fn text_json(s: String) -> Json = json_if(s != "", Str(s))
 
-fn narrow_json(n: U32) -> Json = said(n != 0u32, json::int(Int::of_u32(n)))
+fn u32_json(n: U32) -> Json = json_if(n != 0u32, json::int(Int::of_u32(n)))
 
-fn wide_text(n: U64) -> String / {abort.raise} =
+fn u64_text(n: U64) -> String / {abort.raise} =
   U128::to_string(
     U128::of_int(Int::of_u64(n >>> 32)) * 4294967296u128
       + U128::of_int(Int::of_u64(n & 0xFFFF_FFFFu64)),
   )
 
-fn moment_json(n: U64) -> Json / {abort.raise} = if n == 0u64 { Null } else { Str(wide_text(n)) }
+fn time_json(n: U64) -> Json / {abort.raise} = if n == 0u64 { Null } else { Str(u64_text(n)) }
 
-fn list_json(items: List<Json>) -> Json = said(items.len() > 0, json::Array(items))
+fn list_json(items: List<Json>) -> Json = json_if(items.len() > 0, json::Array(items))
 
 fn double_json(f: Float) -> Json =
   if f != f { Str("NaN") }
@@ -1200,7 +1223,7 @@ fn attributes_json(kvs: List<KeyValue>) -> Json / {abort.raise} = list_json(kvs.
 fn resource_json(r: Resource) -> Json / {abort.raise} =
   object([
     { key: "attributes", value: attributes_json(r.attributes) },
-    { key: "droppedAttributesCount", value: narrow_json(r.dropped_attributes) },
+    { key: "droppedAttributesCount", value: u32_json(r.dropped_attributes) },
   ])
 
 fn scope_json(s: Scope) -> Json / {abort.raise} =
@@ -1208,10 +1231,10 @@ fn scope_json(s: Scope) -> Json / {abort.raise} =
     { key: "name", value: text_json(s.name) },
     { key: "version", value: text_json(s.version) },
     { key: "attributes", value: attributes_json(s.attributes) },
-    { key: "droppedAttributesCount", value: narrow_json(s.dropped_attributes) },
+    { key: "droppedAttributesCount", value: u32_json(s.dropped_attributes) },
   ])
 
-fn enum_json(n: Int) -> Json = said(n != 0, json::int(n))
+fn enum_json(n: Int) -> Json = json_if(n != 0, json::int(n))
 
 fn status_json(s: Status) -> Json =
   if s == unset() { Null } else {
@@ -1223,10 +1246,10 @@ fn status_json(s: Status) -> Json =
 
 fn event_json(e: Event) -> Json / {abort.raise} =
   object([
-    { key: "timeUnixNano", value: moment_json(e.time) },
+    { key: "timeUnixNano", value: time_json(e.time) },
     { key: "name", value: text_json(e.name) },
     { key: "attributes", value: attributes_json(e.attributes) },
-    { key: "droppedAttributesCount", value: narrow_json(e.dropped_attributes) },
+    { key: "droppedAttributesCount", value: u32_json(e.dropped_attributes) },
   ])
 
 fn link_json(l: Link) -> Json / {abort.raise} =
@@ -1235,8 +1258,8 @@ fn link_json(l: Link) -> Json / {abort.raise} =
     { key: "spanId", value: Str(traceparent::span_id_hex(l.span_id)) },
     { key: "traceState", value: text_json(l.trace_state) },
     { key: "attributes", value: attributes_json(l.attributes) },
-    { key: "droppedAttributesCount", value: narrow_json(l.dropped_attributes) },
-    { key: "flags", value: narrow_json(l.flags) },
+    { key: "droppedAttributesCount", value: u32_json(l.dropped_attributes) },
+    { key: "flags", value: u32_json(l.flags) },
   ])
 
 fn span_json(s: Span) -> Json / {abort.raise} =
@@ -1248,17 +1271,17 @@ fn span_json(s: Span) -> Json / {abort.raise} =
       key: "parentSpanId",
       value: match s.parent { Some(id) -> Str(traceparent::span_id_hex(id)), None -> Null },
     },
-    { key: "flags", value: narrow_json(s.flags) },
+    { key: "flags", value: u32_json(s.flags) },
     { key: "name", value: text_json(s.name) },
     { key: "kind", value: enum_json(kind_number(s.kind)) },
-    { key: "startTimeUnixNano", value: moment_json(s.start) },
-    { key: "endTimeUnixNano", value: moment_json(s.end) },
+    { key: "startTimeUnixNano", value: time_json(s.start) },
+    { key: "endTimeUnixNano", value: time_json(s.end) },
     { key: "attributes", value: attributes_json(s.attributes) },
-    { key: "droppedAttributesCount", value: narrow_json(s.dropped_attributes) },
+    { key: "droppedAttributesCount", value: u32_json(s.dropped_attributes) },
     { key: "events", value: list_json(s.events.map(event_json)) },
-    { key: "droppedEventsCount", value: narrow_json(s.dropped_events) },
+    { key: "droppedEventsCount", value: u32_json(s.dropped_events) },
     { key: "links", value: list_json(s.links.map(link_json)) },
-    { key: "droppedLinksCount", value: narrow_json(s.dropped_links) },
+    { key: "droppedLinksCount", value: u32_json(s.dropped_links) },
     { key: "status", value: status_json(s.status) },
   ])
 
@@ -1282,8 +1305,8 @@ fn traces_json(t: Traces) -> Json / {abort.raise} =
 fn number_point_json(p: NumberPoint) -> Json / {abort.raise} =
   object([
     { key: "attributes", value: attributes_json(p.attributes) },
-    { key: "startTimeUnixNano", value: moment_json(p.start) },
-    { key: "timeUnixNano", value: moment_json(p.time) },
+    { key: "startTimeUnixNano", value: time_json(p.start) },
+    { key: "timeUnixNano", value: time_json(p.time) },
     match p.value {
       AsDouble(f) -> { key: "asDouble", value: double_json(f) },
       AsInt(n) -> { key: "asInt", value: Str(n.to_string()) },
@@ -1296,11 +1319,11 @@ fn optional_double_json(f: Option<Float>) -> Json =
 fn histogram_point_json(p: HistogramPoint) -> Json / {abort.raise} =
   object([
     { key: "attributes", value: attributes_json(p.attributes) },
-    { key: "startTimeUnixNano", value: moment_json(p.start) },
-    { key: "timeUnixNano", value: moment_json(p.time) },
-    { key: "count", value: moment_json(p.count) },
+    { key: "startTimeUnixNano", value: time_json(p.start) },
+    { key: "timeUnixNano", value: time_json(p.time) },
+    { key: "count", value: time_json(p.count) },
     { key: "sum", value: optional_double_json(p.sum) },
-    { key: "bucketCounts", value: list_json(p.bucket_counts.map(|n: U64| Str(wide_text(n)))) },
+    { key: "bucketCounts", value: list_json(p.bucket_counts.map(|n: U64| Str(u64_text(n)))) },
     { key: "explicitBounds", value: list_json(p.explicit_bounds.map(double_json)) },
     { key: "min", value: optional_double_json(p.min) },
     { key: "max", value: optional_double_json(p.max) },
@@ -1364,7 +1387,7 @@ fn metrics_json(m: Metrics) -> Json / {abort.raise} =
 fn rejected_name(signal: Signal) -> String =
   match signal { TraceSignal -> "rejectedSpans", MetricSignal -> "rejectedDataPoints" }
 
-fn receipt_json(signal: Signal, r: Receipt) -> Json =
+fn response_json(signal: Signal, r: ExportResponse) -> Json =
   if r.rejected == 0 && r.message == "" { json::object([]) } else {
     json::object([
       {
@@ -1384,38 +1407,38 @@ fn receipt_json(signal: Signal, r: Receipt) -> Json =
 
 type Members = Map<String, Json>
 
-fn parsed(data: Bytes, limits: Limits) -> Json / {otlp.refused, abort.raise} =
-  if data.len() > limits.length { refuse(TooLong, limits.length, "") } else {
+fn parsed(data: Bytes, limits: Limits) -> Json / {otlp.fail, abort.raise} =
+  if data.len() > limits.length { fail(TooLong, limits.length, "") } else {
     match json::parse(data) {
       Ok(j) -> j,
-      Err(e) -> refuse(NotJson(e.message), match e.offset { Some(at) -> at, None -> -1 }, ""),
+      Err(e) -> fail(NotJson(e.message), match e.offset { Some(at) -> at, None -> -1 }, ""),
     }
   }
 
-fn unfit<a>(why: Why, field: String) -> a / {otlp.refused} = refuse(why, -1, field)
+fn fail_field<a>(why: ErrorKind, field: String) -> a / {otlp.fail} = fail(why, -1, field)
 
 /// A member's value, with a `null` read as the member left out, as the mapping reads one.
 fn member(o: Members, name: String) -> Option<Json> =
   match o.get(name) { Some(Null) -> None, other -> other }
 
-fn members_of(j: Json, field: String) -> Members / {otlp.refused} =
-  match j { json::Object(m) -> m, _ -> unfit(WrongKind("an object"), field) }
+fn members_of(j: Json, field: String) -> Members / {otlp.fail} =
+  match j { json::Object(m) -> m, _ -> fail_field(WrongKind("an object"), field) }
 
 /// The object under `name`, or an empty one where it is left out.
-fn members_in(o: Members, name: String) -> Members / {otlp.refused} =
+fn members_in(o: Members, name: String) -> Members / {otlp.fail} =
   match member(o, name) { Some(j) -> members_of(j, name), None -> Map::new() }
 
-fn items_in(o: Members, name: String) -> List<Json> / {otlp.refused} =
+fn items_in(o: Members, name: String) -> List<Json> / {otlp.fail} =
   match member(o, name) {
     Some(json::Array(items)) -> items,
-    Some(_) -> unfit(WrongKind("an array"), name),
+    Some(_) -> fail_field(WrongKind("an array"), name),
     None -> [],
   }
 
-fn text_in(o: Members, name: String) -> String / {otlp.refused} =
+fn text_in(o: Members, name: String) -> String / {otlp.fail} =
   match member(o, name) {
     Some(Str(s)) -> s,
-    Some(_) -> unfit(WrongKind("a string"), name),
+    Some(_) -> fail_field(WrongKind("a string"), name),
     None -> "",
   }
 
@@ -1423,66 +1446,67 @@ fn all_digits(raw: Bytes) -> Bool =
   raw.len() > 0 && raw.scan(0, b"0123456789", raw.len()) >= raw.len()
 
 /// The whole number a 64-bit field holds: a decimal string, or a JSON number that is whole.
-fn whole_text(j: Json, field: String) -> String / {otlp.refused} =
+fn whole_text(j: Json, field: String) -> String / {otlp.fail} =
   match j {
     Str(s) -> s,
     Number(d) -> d.to_string(),
-    _ -> unfit(WrongKind("a whole number, as a string of digits or a number"), field),
+    _ -> fail_field(WrongKind("a whole number, as a string of digits or a number"), field),
   }
 
-fn wide_of(j: Json, field: String) -> U64 / {otlp.refused, abort.raise} = {
+fn u64_of_json(j: Json, field: String) -> U64 / {otlp.fail, abort.raise} = {
   let digits = whole_text(j, field);
-  if !all_digits(Bytes::of_string(digits)) || digits.len() > 20 { unfit(BadNumber, field) } else {
+  if !all_digits(Bytes::of_string(digits)) || digits.len() > 20 { fail_field(BadNumber, field) }
+  else {
     match U128::of_string(digits) {
-      Some(n) -> if n > 18446744073709551615u128 { unfit(BadNumber, field) } else {
+      Some(n) -> if n > 18446744073709551615u128 { fail_field(BadNumber, field) } else {
         U64::of_int(Int::of_u128(n / 4294967296u128)) << 32
           | U64::of_int(Int::of_u128(n % 4294967296u128))
       },
-      None -> unfit(BadNumber, field),
+      None -> fail_field(BadNumber, field),
     }
   }
 }
 
-fn wide_in(o: Members, name: String) -> U64 / {otlp.refused, abort.raise} =
-  match member(o, name) { Some(j) -> wide_of(j, name), None -> 0u64 }
+fn u64_in(o: Members, name: String) -> U64 / {otlp.fail, abort.raise} =
+  match member(o, name) { Some(j) -> u64_of_json(j, name), None -> 0u64 }
 
-fn int_of_json(j: Json, field: String) -> Int / {otlp.refused, abort.raise} = {
+fn int_of_json(j: Json, field: String) -> Int / {otlp.fail, abort.raise} = {
   let written = whole_text(j, field);
   let raw = Bytes::of_string(written);
   let negative = raw.starts_with(b"-");
   let digits = if negative { raw.slice(1, raw.len()) } else { raw };
-  if !all_digits(digits) || digits.len() > 19 { unfit(BadNumber, field) } else {
+  if !all_digits(digits) || digits.len() > 19 { fail_field(BadNumber, field) } else {
     match I128::of_string(written) {
       Some(n) -> if n > 9223372036854775807i128 || n < 0i128 - 9223372036854775808i128 {
-        unfit(BadNumber, field)
+        fail_field(BadNumber, field)
       } else { Int::of_i128(n) },
-      None -> unfit(BadNumber, field),
+      None -> fail_field(BadNumber, field),
     }
   }
 }
 
-fn int_in(o: Members, name: String) -> Int / {otlp.refused, abort.raise} =
+fn int_in(o: Members, name: String) -> Int / {otlp.fail, abort.raise} =
   match member(o, name) { Some(j) -> int_of_json(j, name), None -> 0 }
 
 /// A 32-bit field: a JSON number, whole and in range.
-fn narrow_in(o: Members, name: String) -> U32 / {otlp.refused, abort.raise} =
+fn u32_in(o: Members, name: String) -> U32 / {otlp.fail, abort.raise} =
   match member(o, name) {
     None -> 0u32,
     Some(j) -> {
       let n = int_of_json(j, name);
-      if n < 0 || n > 4294967295 { unfit(BadNumber, name) } else { U32::of_int(n) }
+      if n < 0 || n > 4294967295 { fail_field(BadNumber, name) } else { U32::of_int(n) }
     },
   }
 
 /// An enum's number: the mapping writes no names.
-fn enum_in(o: Members, name: String) -> Int / {otlp.refused, abort.raise} =
+fn enum_in(o: Members, name: String) -> Int / {otlp.fail, abort.raise} =
   match member(o, name) {
     None -> 0,
     Some(Number(d)) -> int_of_json(Number(d), name),
-    Some(_) -> unfit(WrongKind("an enum's number"), name),
+    Some(_) -> fail_field(WrongKind("an enum's number"), name),
   }
 
-fn double_of_json(j: Json, field: String) -> Float / {otlp.refused} =
+fn double_of_json(j: Json, field: String) -> Float / {otlp.fail} =
   match j {
     Number(d) -> Float::of_decimal(d),
     Str("NaN") -> Float::nan(),
@@ -1490,60 +1514,61 @@ fn double_of_json(j: Json, field: String) -> Float / {otlp.refused} =
     Str("-Infinity") -> Float::neg_infinity(),
     Str(s) -> match Float::of_string(s) {
       Some(f) -> f,
-      None -> unfit(WrongKind("a number"), field),
+      None -> fail_field(WrongKind("a number"), field),
     },
-    _ -> unfit(WrongKind("a number"), field),
+    _ -> fail_field(WrongKind("a number"), field),
   }
 
-fn optional_double_in(o: Members, name: String) -> Option<Float> / {otlp.refused} =
+fn optional_double_in(o: Members, name: String) -> Option<Float> / {otlp.fail} =
   match member(o, name) { Some(j) -> Some(double_of_json(j, name)), None -> None }
 
-fn bool_in(o: Members, name: String) -> Bool / {otlp.refused} =
+fn bool_in(o: Members, name: String) -> Bool / {otlp.fail} =
   match member(o, name) {
     Some(json::Bool(b)) -> b,
-    Some(_) -> unfit(WrongKind("true or false"), name),
+    Some(_) -> fail_field(WrongKind("true or false"), name),
     None -> false,
   }
 
 /// An id's bytes: hex in either case, as the mapping writes one.
-fn hex_in(o: Members, name: String) -> Bytes / {otlp.refused} = {
+fn hex_in(o: Members, name: String) -> Bytes / {otlp.fail} = {
   let written = text_in(o, name).ascii_lower();
   match try[abort.raise] { Bytes::of_hex(written) } {
     Ok(raw) -> raw,
-    Err(_) -> unfit(BadText, name),
+    Err(_) -> fail_field(BadText, name),
   }
 }
 
-fn value_of_json(j: Json, room: Int) -> AnyValue / {otlp.refused, abort.raise} =
-  if room <= 0 { unfit(TooDeep, "value") } else {
+fn value_of_json(j: Json, depth_left: Int) -> AnyValue / {otlp.fail, abort.raise} =
+  if depth_left <= 0 { fail_field(TooDeep, "value") } else {
     let o = members_of(j, "value");
     match ((member(o, "stringValue"), member(o, "boolValue"), member(o, "intValue"))) {
       (Some(Str(s)), _, _) -> StringValue(s),
-      (Some(_), _, _) -> unfit(WrongKind("a string"), "stringValue"),
+      (Some(_), _, _) -> fail_field(WrongKind("a string"), "stringValue"),
       (_, Some(json::Bool(b)), _) -> BoolValue(b),
-      (_, Some(_), _) -> unfit(WrongKind("true or false"), "boolValue"),
+      (_, Some(_), _) -> fail_field(WrongKind("true or false"), "boolValue"),
       (_, _, Some(n)) -> IntValue(int_of_json(n, "intValue")),
-      _ -> compound_of_json(o, room - 1),
+      _ -> compound_of_json(o, depth_left - 1),
     }
   }
 
-fn compound_of_json(o: Members, room: Int) -> AnyValue / {otlp.refused, abort.raise} =
+fn compound_of_json(o: Members, depth_left: Int) -> AnyValue / {otlp.fail, abort.raise} =
   match member(o, "doubleValue") {
     Some(f) -> DoubleValue(double_of_json(f, "doubleValue")),
     None -> match member(o, "arrayValue") {
       Some(held) ->
         ArrayValue(
-          items_in(members_of(held, "arrayValue"), "values").map(|x: Json| value_of_json(x, room)),
+          items_in(members_of(held, "arrayValue"), "values").map(|x: Json|
+            value_of_json(x, depth_left)),
         ),
       None -> match member(o, "kvlistValue") {
         Some(held) ->
-          KvlistValue(key_values_of_json(members_of(held, "kvlistValue"), "values", room)),
+          KvlistValue(key_values_of_json(members_of(held, "kvlistValue"), "values", depth_left)),
         None -> match member(o, "bytesValue") {
-          Some(Str(text)) -> match base64_decode(text) {
+          Some(Str(string_if_set)) -> match base64_decode(string_if_set) {
             Some(raw) -> BytesValue(raw),
-            None -> unfit(BadText, "bytesValue"),
+            None -> fail_field(BadText, "bytesValue"),
           },
-          Some(_) -> unfit(WrongKind("a string of base64"), "bytesValue"),
+          Some(_) -> fail_field(WrongKind("a string of base64"), "bytesValue"),
           None -> NoValue,
         },
       },
@@ -1553,88 +1578,88 @@ fn compound_of_json(o: Members, room: Int) -> AnyValue / {otlp.refused, abort.ra
 fn key_values_of_json(
   o: Members,
   name: String,
-  room: Int,
-) -> List<KeyValue> / {otlp.refused, abort.raise} =
+  depth_left: Int,
+) -> List<KeyValue> / {otlp.fail, abort.raise} =
   items_in(o, name).map(|j: Json| -> KeyValue {
     let kv = members_of(j, name);
     {
       key: text_in(kv, "key"),
-      value: match member(kv, "value") { Some(v) -> value_of_json(v, room), None -> NoValue },
+      value: match member(kv, "value") { Some(v) -> value_of_json(v, depth_left), None -> NoValue },
     }
   })
 
-fn resource_of_json(o: Members, room: Int) -> Resource / {otlp.refused, abort.raise} =
+fn resource_of_json(o: Members, depth_left: Int) -> Resource / {otlp.fail, abort.raise} =
   {
-    attributes: key_values_of_json(o, "attributes", room),
-    dropped_attributes: narrow_in(o, "droppedAttributesCount"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    dropped_attributes: u32_in(o, "droppedAttributesCount"),
   }
 
-fn scope_of_json(o: Members, room: Int) -> Scope / {otlp.refused, abort.raise} =
+fn scope_of_json(o: Members, depth_left: Int) -> Scope / {otlp.fail, abort.raise} =
   {
     name: text_in(o, "name"),
     version: text_in(o, "version"),
-    attributes: key_values_of_json(o, "attributes", room),
-    dropped_attributes: narrow_in(o, "droppedAttributesCount"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    dropped_attributes: u32_in(o, "droppedAttributesCount"),
   }
 
-fn status_of_json(o: Members) -> Status / {otlp.refused, abort.raise} =
+fn status_of_json(o: Members) -> Status / {otlp.fail, abort.raise} =
   { code: code_of(enum_in(o, "code"), -1), message: text_in(o, "message") }
 
-fn event_of_json(j: Json, room: Int) -> Event / {otlp.refused, abort.raise} = {
+fn event_of_json(j: Json, depth_left: Int) -> Event / {otlp.fail, abort.raise} = {
   let o = members_of(j, "events");
   {
-    time: wide_in(o, "timeUnixNano"),
+    time: u64_in(o, "timeUnixNano"),
     name: text_in(o, "name"),
-    attributes: key_values_of_json(o, "attributes", room),
-    dropped_attributes: narrow_in(o, "droppedAttributesCount"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    dropped_attributes: u32_in(o, "droppedAttributesCount"),
   }
 }
 
-fn link_of_json(j: Json, room: Int) -> Link / {otlp.refused, abort.raise} = {
+fn link_of_json(j: Json, depth_left: Int) -> Link / {otlp.fail, abort.raise} = {
   let o = members_of(j, "links");
   {
     trace_id: trace_id_of(hex_in(o, "traceId"), -1),
     span_id: span_id_of(hex_in(o, "spanId"), -1, "spanId"),
     trace_state: text_in(o, "traceState"),
-    attributes: key_values_of_json(o, "attributes", room),
-    dropped_attributes: narrow_in(o, "droppedAttributesCount"),
-    flags: narrow_in(o, "flags"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    dropped_attributes: u32_in(o, "droppedAttributesCount"),
+    flags: u32_in(o, "flags"),
   }
 }
 
-fn span_of_json(j: Json, room: Int) -> Span / {otlp.refused, abort.raise} = {
+fn span_of_json(j: Json, depth_left: Int) -> Span / {otlp.fail, abort.raise} = {
   let o = members_of(j, "spans");
   {
     trace_id: trace_id_of(hex_in(o, "traceId"), -1),
     span_id: span_id_of(hex_in(o, "spanId"), -1, "spanId"),
     trace_state: text_in(o, "traceState"),
     parent: parent_of(hex_in(o, "parentSpanId"), -1),
-    flags: narrow_in(o, "flags"),
+    flags: u32_in(o, "flags"),
     name: text_in(o, "name"),
     kind: kind_of(enum_in(o, "kind"), -1),
-    start: wide_in(o, "startTimeUnixNano"),
-    end: wide_in(o, "endTimeUnixNano"),
-    attributes: key_values_of_json(o, "attributes", room),
-    dropped_attributes: narrow_in(o, "droppedAttributesCount"),
-    events: items_in(o, "events").map(|e: Json| event_of_json(e, room)),
-    dropped_events: narrow_in(o, "droppedEventsCount"),
-    links: items_in(o, "links").map(|l: Json| link_of_json(l, room)),
-    dropped_links: narrow_in(o, "droppedLinksCount"),
+    start: u64_in(o, "startTimeUnixNano"),
+    end: u64_in(o, "endTimeUnixNano"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    dropped_attributes: u32_in(o, "droppedAttributesCount"),
+    events: items_in(o, "events").map(|e: Json| event_of_json(e, depth_left)),
+    dropped_events: u32_in(o, "droppedEventsCount"),
+    links: items_in(o, "links").map(|l: Json| link_of_json(l, depth_left)),
+    dropped_links: u32_in(o, "droppedLinksCount"),
     status: status_of_json(members_in(o, "status")),
   }
 }
 
-fn traces_of_json(j: Json, room: Int) -> Traces / {otlp.refused, abort.raise} =
+fn traces_of_json(j: Json, depth_left: Int) -> Traces / {otlp.fail, abort.raise} =
   {
     resource_spans: items_in(members_of(j, ""), "resourceSpans").map(|r: Json| -> ResourceSpans {
       let o = members_of(r, "resourceSpans");
       {
-        resource: resource_of_json(members_in(o, "resource"), room),
+        resource: resource_of_json(members_in(o, "resource"), depth_left),
         scope_spans: items_in(o, "scopeSpans").map(|s: Json| -> ScopeSpans {
           let held = members_of(s, "scopeSpans");
           {
-            scope: scope_of_json(members_in(held, "scope"), room),
-            spans: items_in(held, "spans").map(|x: Json| span_of_json(x, room)),
+            scope: scope_of_json(members_in(held, "scope"), depth_left),
+            spans: items_in(held, "spans").map(|x: Json| span_of_json(x, depth_left)),
             schema_url: text_in(held, "schemaUrl"),
           }
         }),
@@ -1643,29 +1668,29 @@ fn traces_of_json(j: Json, room: Int) -> Traces / {otlp.refused, abort.raise} =
     }),
   }
 
-fn number_point_of_json(j: Json, room: Int) -> NumberPoint / {otlp.refused, abort.raise} = {
+fn number_point_of_json(j: Json, depth_left: Int) -> NumberPoint / {otlp.fail, abort.raise} = {
   let o = members_of(j, "dataPoints");
   {
-    attributes: key_values_of_json(o, "attributes", room),
-    start: wide_in(o, "startTimeUnixNano"),
-    time: wide_in(o, "timeUnixNano"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    start: u64_in(o, "startTimeUnixNano"),
+    time: u64_in(o, "timeUnixNano"),
     value: match ((member(o, "asDouble"), member(o, "asInt"))) {
       (Some(f), _) -> AsDouble(double_of_json(f, "asDouble")),
       (_, Some(n)) -> AsInt(int_of_json(n, "asInt")),
-      _ -> unfit(Missing("value"), "asDouble"),
+      _ -> fail_field(Missing("value"), "asDouble"),
     },
   }
 }
 
-fn histogram_point_of_json(j: Json, room: Int) -> HistogramPoint / {otlp.refused, abort.raise} = {
+fn histogram_point_of_json(j: Json, depth_left: Int) -> HistogramPoint / {otlp.fail, abort.raise} = {
   let o = members_of(j, "dataPoints");
   {
-    attributes: key_values_of_json(o, "attributes", room),
-    start: wide_in(o, "startTimeUnixNano"),
-    time: wide_in(o, "timeUnixNano"),
-    count: wide_in(o, "count"),
+    attributes: key_values_of_json(o, "attributes", depth_left),
+    start: u64_in(o, "startTimeUnixNano"),
+    time: u64_in(o, "timeUnixNano"),
+    count: u64_in(o, "count"),
     sum: optional_double_in(o, "sum"),
-    bucket_counts: items_in(o, "bucketCounts").map(|n: Json| wide_of(n, "bucketCounts")),
+    bucket_counts: items_in(o, "bucketCounts").map(|n: Json| u64_of_json(n, "bucketCounts")),
     explicit_bounds: items_in(o, "explicitBounds").map(|x: Json|
       double_of_json(x, "explicitBounds")),
     min: optional_double_in(o, "min"),
@@ -1673,16 +1698,17 @@ fn histogram_point_of_json(j: Json, room: Int) -> HistogramPoint / {otlp.refused
   }
 }
 
-fn data_of_json(o: Members, room: Int) -> Data / {otlp.refused, abort.raise} =
+fn data_of_json(o: Members, depth_left: Int) -> Data / {otlp.fail, abort.raise} =
   match ((member(o, "gauge"), member(o, "sum"), member(o, "histogram"))) {
     (Some(g), _, _) ->
       Gauge(
-        items_in(members_of(g, "gauge"), "dataPoints").map(|p: Json| number_point_of_json(p, room)),
+        items_in(members_of(g, "gauge"), "dataPoints").map(|p: Json|
+          number_point_of_json(p, depth_left)),
       ),
     (_, Some(s), _) -> {
       let held = members_of(s, "sum");
       Sum(
-        items_in(held, "dataPoints").map(|p: Json| number_point_of_json(p, room)),
+        items_in(held, "dataPoints").map(|p: Json| number_point_of_json(p, depth_left)),
         temporality_of(enum_in(held, "aggregationTemporality"), -1),
         bool_in(held, "isMonotonic"),
       )
@@ -1690,34 +1716,34 @@ fn data_of_json(o: Members, room: Int) -> Data / {otlp.refused, abort.raise} =
     (_, _, Some(h)) -> {
       let held = members_of(h, "histogram");
       Histogram(
-        items_in(held, "dataPoints").map(|p: Json| histogram_point_of_json(p, room)),
+        items_in(held, "dataPoints").map(|p: Json| histogram_point_of_json(p, depth_left)),
         temporality_of(enum_in(held, "aggregationTemporality"), -1),
       )
     },
     _ -> if o.contains("exponentialHistogram") {
-      unfit(Unsupported("exponential_histogram"), "exponentialHistogram")
-    } else if o.contains("summary") { unfit(Unsupported("summary"), "summary") }
-    else { unfit(Missing("data"), "data") },
+      fail_field(Unsupported("exponential_histogram"), "exponentialHistogram")
+    } else if o.contains("summary") { fail_field(Unsupported("summary"), "summary") }
+    else { fail_field(Missing("data"), "data") },
   }
 
-fn metrics_of_json(j: Json, room: Int) -> Metrics / {otlp.refused, abort.raise} =
+fn metrics_of_json(j: Json, depth_left: Int) -> Metrics / {otlp.fail, abort.raise} =
   {
     resource_metrics: items_in(members_of(j, ""), "resourceMetrics").map(
       |r: Json| -> ResourceMetrics {
         let o = members_of(r, "resourceMetrics");
         {
-          resource: resource_of_json(members_in(o, "resource"), room),
+          resource: resource_of_json(members_in(o, "resource"), depth_left),
           scope_metrics: items_in(o, "scopeMetrics").map(|s: Json| -> ScopeMetrics {
             let held = members_of(s, "scopeMetrics");
             {
-              scope: scope_of_json(members_in(held, "scope"), room),
+              scope: scope_of_json(members_in(held, "scope"), depth_left),
               metrics: items_in(held, "metrics").map(|x: Json| -> Metric {
                 let m = members_of(x, "metrics");
                 {
                   name: text_in(m, "name"),
                   description: text_in(m, "description"),
                   unit: text_in(m, "unit"),
-                  data: data_of_json(m, room),
+                  data: data_of_json(m, depth_left),
                 }
               }),
               schema_url: text_in(held, "schemaUrl"),
@@ -1729,7 +1755,7 @@ fn metrics_of_json(j: Json, room: Int) -> Metrics / {otlp.refused, abort.raise} 
     ),
   }
 
-fn receipt_of_json(signal: Signal, j: Json) -> Receipt / {otlp.refused, abort.raise} = {
+fn response_of_json(signal: Signal, j: Json) -> ExportResponse / {otlp.fail, abort.raise} = {
   let partial = members_in(members_of(j, ""), "partialSuccess");
   { rejected: int_in(partial, rejected_name(signal)), message: text_in(partial, "errorMessage") }
 }
@@ -1755,7 +1781,7 @@ pub type Stats = new {
   /// Label sets turned away because their metric already had `max_series`.
   series_dropped: Int,
   /// `trace.exit` of a span that was not open.
-  misplaced: Int,
+  unmatched_exits: Int,
   /// Spans waiting to be sent, those of a request waiting to be sent again among them.
   queued: Int,
 }
@@ -1847,7 +1873,7 @@ pub fn config(service: String, host: String, port: Int) -> Config = {
 }
 
 /// A span that is open.
-type Open = {
+type OpenSpan = {
   id: Int,
   channel: String,
   name: String,
@@ -1857,27 +1883,27 @@ type Open = {
 }
 
 /// A span that ended, with the channel it was on.
-type Done = { channel: String, span: Span }
+type EndedSpan = { channel: String, span: Span }
 
 /// A request, encoded: what it holds, how many times it has been sent, and when it may be
 /// sent again.
 type Outbound = { signal: Signal, body: Bytes, items: Int, attempts: Int, not_before: Int }
 
 /// What one series of a metric has come to.
-type Tallied =
+type Tally =
   /// A counter's total, and whether every step so far added to it.
-  | Counted(Int, Bool)
+  | Count(Int, Bool)
   | Level(Float)
   /// A timing's count in each bucket, and its sum, least and greatest, in seconds.
-  | Timed(List<Int>, Float, Float, Float)
+  | Timing(List<Int>, Float, Float, Float)
 
-type Series = { channel: String, name: String, fields: Fields, value: Tallied }
+type Series = { channel: String, name: String, fields: Fields, value: Tally }
 
 type State = {
   /// Innermost first.
-  open: List<Open>,
+  open: List<OpenSpan>,
   next: Int,
-  queue: List<Done>,
+  queue: List<EndedSpan>,
   /// When the oldest span in the queue joined it.
   queued_at: Int,
   pending: Option<Outbound>,
@@ -1893,7 +1919,7 @@ type State = {
   stats: Stats,
 }
 
-fn fresh(started: U64, now_ms: Int) -> State =
+fn initial_state(started: U64, now_ms: Int) -> State =
   {
     open: [],
     next: 1,
@@ -1915,7 +1941,7 @@ fn fresh(started: U64, now_ms: Int) -> State =
       requests: 0,
       retries: 0,
       series_dropped: 0,
-      misplaced: 0,
+      unmatched_exits: 0,
       queued: 0,
     },
   }
@@ -1957,13 +1983,13 @@ fn opened(
 
 fn value_of_field(f: trace::Field) -> AnyValue / {abort.raise} =
   match f {
-    trace::FInt(n) -> IntValue(n),
-    trace::FBool(b) -> BoolValue(b),
-    trace::FText(s) -> StringValue(s),
-    trace::FFloat(x) -> DoubleValue(x),
-    trace::FDecimal(d) -> DoubleValue(Float::of_decimal(d)),
-    trace::FBytes(b) -> BytesValue(b),
-    trace::FJson(j) -> StringValue(json::to_string(j)),
+    trace::IntField(n) -> IntValue(n),
+    trace::BoolField(b) -> BoolValue(b),
+    trace::StringField(s) -> StringValue(s),
+    trace::FloatField(x) -> DoubleValue(x),
+    trace::DecimalField(d) -> DoubleValue(Float::of_decimal(d)),
+    trace::BytesField(b) -> BytesValue(b),
+    trace::JsonField(j) -> StringValue(json::to_string(j)),
   }
 
 /// Fields as attributes, in the order of their names.
@@ -1989,7 +2015,7 @@ fn status_for(outcome: trace::Outcome) -> Status =
     trace::Abandoned -> { code: StatusError, message: "abandoned" },
   }
 
-fn finished(o: Open, outcome: trace::Outcome, at: U64) -> Done / {abort.raise} = {
+fn finished(o: OpenSpan, outcome: trace::Outcome, at: U64) -> EndedSpan / {abort.raise} = {
   let context = o.who.context;
   {
     channel: o.channel,
@@ -2014,10 +2040,10 @@ fn finished(o: Open, outcome: trace::Outcome, at: U64) -> Done / {abort.raise} =
   }
 }
 
-fn is_sampled(o: Open) -> Bool = traceparent::sampled(o.who.context.parent)
+fn is_sampled(o: OpenSpan) -> Bool = traceparent::sampled(o.who.context.parent)
 
 /// `s` with `done` waiting to be sent, or counted as dropped where the queue is full.
-fn queued(s: State, cfg: Config, done: Done, now_ms: Int) -> State =
+fn queued(s: State, cfg: Config, done: EndedSpan, now_ms: Int) -> State =
   if s.queue.len() >= max(cfg.queue, 1) {
     { ..s, stats: { ..s.stats, dropped: s.stats.dropped + 1 } }
   } else {
@@ -2028,7 +2054,7 @@ fn queued(s: State, cfg: Config, done: Done, now_ms: Int) -> State =
     }
   }
 
-type Sweep = { closing: List<SpanId>, kept: List<Open>, state: State }
+type Sweep = { closing: List<SpanId>, kept: List<OpenSpan>, state: State }
 
 /// `s` with the span `span` closed as `outcome`, and every span opened under it that is still
 /// open closed as abandoned, which is what `trace.exit` says it does.
@@ -2040,11 +2066,11 @@ fn closed(
   at: U64,
   now_ms: Int,
 ) -> State / {abort.raise} =
-  match s.open.find(|o: Open| o.id == span.id && o.channel == span.channel) {
-    None -> { ..s, stats: { ..s.stats, misplaced: s.stats.misplaced + 1 } },
+  match s.open.find(|o: OpenSpan| o.id == span.id && o.channel == span.channel) {
+    None -> { ..s, stats: { ..s.stats, unmatched_exits: s.stats.unmatched_exits + 1 } },
     Some(target) -> {
       let start: Sweep = { closing: [target.who.context.parent.parent_id], kept: [], state: s };
-      let swept = s.open.reverse().fold(start, |acc: Sweep, o: Open| -> Sweep {
+      let swept = s.open.reverse().fold(start, |acc: Sweep, o: OpenSpan| -> Sweep {
         let under = match o.who.parent { Some(p) -> acc.closing.contains(p), None -> false };
         if o.id == target.id { { ..acc, state: ended(acc.state, cfg, o, outcome, at, now_ms) } }
         else if under {
@@ -2062,7 +2088,7 @@ fn closed(
 fn ended(
   s: State,
   cfg: Config,
-  o: Open,
+  o: OpenSpan,
   outcome: trace::Outcome,
   at: U64,
   now_ms: Int,
@@ -2073,21 +2099,21 @@ fn ended(
 fn annotated(s: State, span: SpanId, fields: Fields) -> State =
   {
     ..s,
-    open: s.open.map(|o: Open|
+    open: s.open.map(|o: OpenSpan|
       if o.who.context.parent.parent_id == span { { ..o, fields: o.fields.merge(fields) } }
       else { o }),
   }
 
 /// `s` with one metric's series under `fields` moved by `step`, which is handed what the
 /// series held; a label set past the metric's `max_series` is counted and not kept.
-fn tallied(
+fn update_series(
   s: State,
   cfg: Config,
   channel: String,
   kind: String,
   name: String,
   fields: Fields,
-  step: (Option<Tallied>) -> Tallied,
+  step: (Option<Tally>) -> Tally,
 ) -> State = {
   let metric = channel ++ "\u{0}" ++ kind ++ "\u{0}" ++ name;
   let key = metric ++ "\u{0}" ++ show(fields);
@@ -2115,32 +2141,32 @@ fn tallied(
   }
 }
 
-fn counted(held: Option<Tallied>, delta: Int) -> Tallied =
+fn add_count(held: Option<Tally>, delta: Int) -> Tally =
   match held {
-    Some(Counted(total, rising)) -> Counted(total + delta, rising && delta >= 0),
-    _ -> Counted(delta, delta >= 0),
+    Some(Count(total, rising)) -> Count(total + delta, rising && delta >= 0),
+    _ -> Count(delta, delta >= 0),
   }
 
-fn timed(held: Option<Tallied>, bounds: List<Float>, seconds: Float) -> Tallied =
+fn add_timing(held: Option<Tally>, bounds: List<Float>, seconds: Float) -> Tally =
   match held {
-    Some(Timed(counts, sum, least, greatest)) ->
-      Timed(
-        telemetry::counted(bounds, counts, seconds),
+    Some(Timing(counts, sum, least, greatest)) ->
+      Timing(
+        telemetry::add_to_buckets(bounds, counts, seconds),
         sum + seconds,
         if seconds < least { seconds } else { least },
         if seconds > greatest { seconds } else { greatest },
       ),
-    _ -> Timed(telemetry::counted(bounds, [], seconds), seconds, seconds, seconds),
+    _ -> Timing(telemetry::add_to_buckets(bounds, [], seconds), seconds, seconds, seconds),
   }
 
-fn wide_of_int(n: Int) -> U64 =
+fn u64_of_int(n: Int) -> U64 =
   match try[abort.raise] { U64::of_int(max(n, 0)) } { Ok(w) -> w, Err(_) -> 0u64 }
 
 /// One series as a metric holding its one point.
 fn metric_of_series(cfg: Config, held: Series, started: U64, at: U64) -> Metric / {abort.raise} = {
   let attributes = attributes_of(held.fields);
   match held.value {
-    Counted(total, rising) ->
+    Count(total, rising) ->
       {
         name: held.name,
         description: "",
@@ -2158,7 +2184,7 @@ fn metric_of_series(cfg: Config, held: Series, started: U64, at: U64) -> Metric 
         unit: "",
         data: Gauge([{ attributes: attributes, start: 0u64, time: at, value: AsDouble(level) }]),
       },
-    Timed(counts, sum, least, greatest) ->
+    Timing(counts, sum, least, greatest) ->
       {
         name: held.name,
         description: "",
@@ -2169,9 +2195,9 @@ fn metric_of_series(cfg: Config, held: Series, started: U64, at: U64) -> Metric 
               attributes: attributes,
               start: started,
               time: at,
-              count: wide_of_int(counts.fold(0, |n: Int, c: Int| n + c)),
+              count: u64_of_int(counts.fold(0, |n: Int, c: Int| n + c)),
               sum: Some(sum),
-              bucket_counts: counts.map(wide_of_int),
+              bucket_counts: counts.map(u64_of_int),
               explicit_bounds: cfg.bounds,
               min: Some(least),
               max: Some(greatest),
@@ -2224,24 +2250,29 @@ fn metrics_request(cfg: Config, s: State, at: U64) -> Metrics / {abort.raise} =
 
 /// Finished spans as a request: a scope for each channel, in the order the channels first
 /// appear.
-fn traces_request(cfg: Config, batch: List<Done>) -> Traces =
+fn traces_request(cfg: Config, batch: List<EndedSpan>) -> Traces =
   {
     resource_spans: [
       {
         resource: cfg.resource,
-        scope_spans: batch.fold([], |scopes: List<ScopeSpans>, done: Done| -> List<ScopeSpans> {
-          if scopes.any(|held: ScopeSpans| held.scope.name == done.channel) {
-            scopes.map(|held: ScopeSpans|
-              if held.scope.name == done.channel { { ..held, spans: held.spans.push(done.span) } }
-              else { held })
-          } else { scopes.push({ scope: scope(done.channel), spans: [done.span], schema_url: "" }) }
-        }),
+        scope_spans: batch.fold(
+          [],
+          |scopes: List<ScopeSpans>, done: EndedSpan| -> List<ScopeSpans> {
+            if scopes.any(|held: ScopeSpans| held.scope.name == done.channel) {
+              scopes.map(|held: ScopeSpans|
+                if held.scope.name == done.channel { { ..held, spans: held.spans.push(done.span) } }
+                else { held })
+            } else {
+              scopes.push({ scope: scope(done.channel), spans: [done.span], schema_url: "" })
+            }
+          },
+        ),
         schema_url: "",
       },
     ],
   }
 
-fn sealed(cfg: Config, body: Bytes) -> Bytes / {abort.raise} =
+fn compressed(cfg: Config, body: Bytes) -> Bytes / {abort.raise} =
   if cfg.gzip { gzip::gzip(body) } else { body }
 
 type Plan = { state: State, send: Option<Outbound>, wait_ms: Int }
@@ -2269,7 +2300,7 @@ fn planned(s: State, cfg: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {
             state: { ..s, queue: s.queue.drop(size), queued_at: now_ms, busy: true },
             send: Some({
               signal: TraceSignal,
-              body: sealed(cfg, encode_traces(cfg.encoding, traces_request(cfg, batch))),
+              body: compressed(cfg, encode_traces(cfg.encoding, traces_request(cfg, batch))),
               items: batch.len(),
               attempts: 0,
               not_before: now_ms,
@@ -2281,7 +2312,7 @@ fn planned(s: State, cfg: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {
             state: { ..s, dirty: false, metrics_at: now_ms, busy: true },
             send: Some({
               signal: MetricSignal,
-              body: sealed(cfg, encode_metrics(cfg.encoding, metrics_request(cfg, s, at))),
+              body: compressed(cfg, encode_metrics(cfg.encoding, metrics_request(cfg, s, at))),
               items: 0,
               attempts: 0,
               not_before: now_ms,
@@ -2294,14 +2325,14 @@ fn planned(s: State, cfg: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {
   }
 
 /// How a request ended.
-type Shipped =
+type SendOutcome =
   /// The collector took it, and says what of it it turned away.
-  | Taken(Receipt)
+  | Accepted(ExportResponse)
   /// It failed in a way that may pass: no answer, or a 429, 502, 503 or 504, with the
   /// milliseconds its `Retry-After` asked for.
-  | Later(Option<Int>)
+  | Retryable(Option<Int>)
   /// The collector refused it, and would refuse it again.
-  | Spurned
+  | Rejected
 
 /// How long to wait before attempt `attempt` (the first retry is 1): the backoff doubled for
 /// each retry before it, no more than the longest, and somewhere in its upper half by `draw`
@@ -2316,7 +2347,14 @@ pub fn retry_wait(cfg: Config, attempt: Int, retry_after_ms: Option<Int>, draw: 
   match retry_after_ms { Some(asked) -> max(asked, jittered), None -> jittered }
 }
 
-fn settled(s: State, cfg: Config, out: Outbound, how: Shipped, now_ms: Int, draw: Int) -> State = {
+fn record_outcome(
+  s: State,
+  cfg: Config,
+  out: Outbound,
+  how: SendOutcome,
+  now_ms: Int,
+  draw: Int,
+) -> State = {
   let free = { ..s, busy: false };
   let lost = |held: State| -> State {
     match out.signal {
@@ -2326,7 +2364,7 @@ fn settled(s: State, cfg: Config, out: Outbound, how: Shipped, now_ms: Int, draw
     }
   };
   match how {
-    Taken(receipt) ->
+    Accepted(receipt) ->
       {
         ..free,
         stats: {
@@ -2336,8 +2374,8 @@ fn settled(s: State, cfg: Config, out: Outbound, how: Shipped, now_ms: Int, draw
           rejected: free.stats.rejected + min(max(receipt.rejected, 0), out.items),
         },
       },
-    Spurned -> lost(free),
-    Later(retry_after) -> if out.attempts + 1 >= max(cfg.attempts, 1) { lost(free) } else {
+    Rejected -> lost(free),
+    Retryable(retry_after) -> if out.attempts + 1 >= max(cfg.attempts, 1) { lost(free) } else {
       {
         ..free,
         pending: Some({
@@ -2354,24 +2392,30 @@ fn settled(s: State, cfg: Config, out: Outbound, how: Shipped, now_ms: Int, draw
 /// The milliseconds a `Retry-After` of whole seconds asks for; a date is not read.
 fn retry_after(headers: http::Headers) -> Option<Int> =
   match http::header(headers, "retry-after") {
-    Some(text) -> match try[abort.raise] { Bytes::of_string(text.ascii_trim()).int_of_ascii() } {
+    Some(string_if_set) -> match try[abort.raise] {
+        Bytes::of_string(string_if_set.ascii_trim()).int_of_ascii()
+      } {
       Ok(Some(seconds)) -> if seconds > 86400 { Some(86400000) } else { Some(seconds * 1000) },
       _ -> None,
     },
     None -> None,
   }
 
-fn judged(cfg: Config, signal: Signal, res: http::Response<| {}>) -> Shipped / {abort.raise} =
+fn outcome_of(
+  cfg: Config,
+  signal: Signal,
+  res: http::Response<| {}>,
+) -> SendOutcome / {abort.raise} =
   if res.status >= 200 && res.status < 300 {
-    Taken(
-      match decode_receipt(cfg.encoding, signal, http::whole_bytes(res.body), default_limits()) {
+    Accepted(
+      match decode_response(cfg.encoding, signal, http::whole_bytes(res.body), default_limits()) {
         Ok(receipt) -> receipt,
         Err(_) -> { rejected: 0, message: "" },
       },
     )
   } else if res.status == 429 || res.status == 502 || res.status == 503 || res.status == 504 {
-    Later(retry_after(res.headers))
-  } else { Spurned }
+    Retryable(retry_after(res.headers))
+  } else { Rejected }
 
 /// The request `out` is, to the collector `cfg` names.
 fn request_of(cfg: Config, out: Outbound) -> http::Request / {abort.raise} = {
@@ -2394,24 +2438,24 @@ fn exchanged<[l]>(
       Err(e) -> Err(e),
       Ok(conn) ->
         bracket(|| conn, |c: http::Connection| http::close[l](c), |c: http::Connection|
-          http::ask_last[l](c, request_of(cfg, out), cfg.limits)),
+          http::round_trip_last[l](c, request_of(cfg, out), cfg.limits)),
     }
   } else { http::request[l](cfg.host, cfg.port, request_of(cfg, out), cfg.limits) }
 
 /// One request and how it ended. Nothing it does raises: a request that cannot be written, a
 /// header among `cfg.headers` that `std.http` will not send, is one the collector refused.
-fn shipped<[l]>(
+fn send_request<[l]>(
   cfg: Config,
   out: Outbound,
-) -> Shipped / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l]} =
+) -> SendOutcome / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l]} =
   match try[abort.raise] {
       match exchanged[l](cfg, out) {
-        Ok(res) -> judged(cfg, out.signal, res),
-        Err(_) -> Later(None),
+        Ok(res) -> outcome_of(cfg, out.signal, res),
+        Err(_) -> Retryable(None),
       }
     } {
     Ok(how) -> how,
-    Err(_) -> Spurned,
+    Err(_) -> Rejected,
   }
 
 /// What an exporter performs beside `net` on its collector's label: the host's clocks, and its
@@ -2448,7 +2492,7 @@ pub fn exporting<a, [l] | e>(
   handle {
     // `patience` is how long a flush may still wait; an event's own request waits for nothing.
     let pump = |force: Bool, patience: Int| {
-      let before = exported.held();
+      let before = exporter_state.get();
       let plan = planned(
         before,
         cfg,
@@ -2459,24 +2503,26 @@ pub fn exporting<a, [l] | e>(
       match plan.send {
         None -> false,
         Some(out) -> if plan.wait_ms > patience { false } else {
-          exported.hold(plan.state);
+          exporter_state.put(plan.state);
           if plan.wait_ms > 0 { time.sleep_ms(plan.wait_ms) } else { () };
-          let how = shipped[l](cfg, out);
+          let how = send_request[l](cfg, out);
           let draw = entropy.below(1000);
-          exported.hold(settled(exported.held(), cfg, out, how, time.elapsed_ms(), draw));
+          exporter_state.put(
+            record_outcome(exporter_state.get(), cfg, out, how, time.elapsed_ms(), draw),
+          );
           true
         },
       }
     };
     let flushed = || {
-      let held = exported.held();
+      let held = exporter_state.get();
       let began = time.elapsed_ms();
       let rounds = (held.queue.len() / max(cfg.batch, 1) + 3) * (max(cfg.attempts, 1) + 1);
       range(0, rounds).fold(true, |more: Bool, _: Int| {
         let left = cfg.flush_ms - (time.elapsed_ms() - began);
         if more && left > 0 { pump(true, left) } else { false }
       });
-      stats_of(exported.held())
+      stats_of(exporter_state.get())
     };
     bracket(
       || (),
@@ -2489,7 +2535,7 @@ pub fn exporting<a, [l] | e>(
           body()
         } with {
           trace.enter[*c](name, fields) -> {
-            let held = exported.held();
+            let held = exporter_state.get();
             let who = match telemetry::identity(fields) {
               Some(named) -> named,
               None -> {
@@ -2502,7 +2548,7 @@ pub fn exporting<a, [l] | e>(
                 made
               },
             };
-            exported.hold(
+            exporter_state.put(
               opened(
                 held,
                 c,
@@ -2515,9 +2561,9 @@ pub fn exporting<a, [l] | e>(
             { id: held.next, channel: c }
           },
           trace.exit[*c](span, outcome) -> {
-            exported.hold(
+            exporter_state.put(
               closed(
-                exported.held(),
+                exporter_state.get(),
                 cfg,
                 span,
                 outcome,
@@ -2529,31 +2575,46 @@ pub fn exporting<a, [l] | e>(
             ()
           },
           trace.count[*c](name, delta, fields) -> {
-            exported.hold(
-              tallied(exported.held(), cfg, c, "sum", name, fields, |held: Option<Tallied>|
-                counted(held, delta)),
+            exporter_state.put(
+              update_series(
+                exporter_state.get(),
+                cfg,
+                c,
+                "sum",
+                name,
+                fields,
+                |held: Option<Tally>| add_count(held, delta),
+              ),
             );
             pump(false, 0);
             ()
           },
           trace.gauge[*c](name, value, fields) -> {
-            exported.hold(
-              tallied(exported.held(), cfg, c, "gauge", name, fields, |_: Option<Tallied>|
-                Level(Float::of_decimal(value))),
+            exporter_state.put(
+              update_series(
+                exporter_state.get(),
+                cfg,
+                c,
+                "gauge",
+                name,
+                fields,
+                |_: Option<Tally>| Level(Float::of_decimal(value)),
+              ),
             );
             pump(false, 0);
             ()
           },
           trace.time[*c](name, micros, fields) -> {
-            exported.hold(
-              tallied(
-                exported.held(),
+            exporter_state.put(
+              update_series(
+                exporter_state.get(),
                 cfg,
                 c,
                 "histogram",
                 name,
                 fields,
-                |held: Option<Tallied>| timed(held, cfg.bounds, Float::of_int(micros) / 1000000.0),
+                |held: Option<Tally>|
+                  add_timing(held, cfg.bounds, Float::of_int(micros) / 1000000.0),
               ),
             );
             pump(false, 0);
@@ -2561,24 +2622,25 @@ pub fn exporting<a, [l] | e>(
           },
           tracing.current() -> None,
           tracing.sampler() -> cfg.sampler,
-          tracing.annotate(span, fields) -> exported.hold(annotated(exported.held(), span, fields)),
+          tracing.annotate(span, fields) ->
+            exporter_state.put(annotated(exporter_state.get(), span, fields)),
           otlp.flush() -> flushed(),
-          otlp.stats() -> stats_of(exported.held()),
+          otlp.stats() -> stats_of(exporter_state.get()),
         },
     )
   } with {
-    var st = fresh(nanos_now(wall_ms, mono_us, mono_us), time.elapsed_ms()),
-    exported.held() -> st,
-    exported.hold(next) -> {
+    var st = initial_state(nanos_now(wall_ms, mono_us, mono_us), time.elapsed_ms()),
+    exporter_state.get() -> st,
+    exporter_state.put(next) -> {
       st = next;
     },
   }
 }
 
 /// The state of the exporter `exporting` runs, which its events and its flushes share.
-effect exported {
-  read held() -> State
-  write hold(next: State) -> Unit
+effect exporter_state {
+  read get() -> State
+  write put(next: State) -> Unit
 }
 
 /// Sends everything the exporter around the caller holds, waiting out a backoff where a
@@ -2763,7 +2825,8 @@ fn sample_metrics_json() -> String =
   \\"sum":0.75,"bucketCounts":["1","2","0"],"explicitBounds":[0.1,1],"min":0.05,"max":0.5}],
   \\"aggregationTemporality":1}}]}]}]}
 
-fn joined(text: String) -> Bytes = Bytes::concat_all(Bytes::of_string(text).split(b"\n"))
+fn joined(string_if_set: String) -> Bytes =
+  Bytes::concat_all(Bytes::of_string(string_if_set).split(b"\n"))
 
 test "traces are written as OTLP's JSON mapping says: hex ids, 64-bit numbers as strings, enums as numbers" {
   assert_eq(
@@ -3019,18 +3082,18 @@ test "metrics read back from their JSON" {
 
 test "a receipt reads back from either encoding" {
   gen::check2(gen::any_int(), gen::text(), |rejected: Int, message: String| {
-    let receipt: Receipt = { rejected: rejected, message: message };
-    decode_receipt(
+    let receipt: ExportResponse = { rejected: rejected, message: message };
+    decode_response(
         Protobuf,
         TraceSignal,
-        encode_receipt(Protobuf, TraceSignal, receipt),
+        encode_response(Protobuf, TraceSignal, receipt),
         default_limits(),
       )
       == Ok(receipt)
-      && decode_receipt(
+      && decode_response(
         Json,
         MetricSignal,
-        encode_receipt(Json, MetricSignal, receipt),
+        encode_response(Json, MetricSignal, receipt),
         default_limits(),
       )
       == Ok(receipt)
@@ -3058,7 +3121,7 @@ test "a double JSON has no number for is written as a string a reader takes" {
   }
 }
 
-type Refused = { name: String, encoding: Encoding, body: Bytes, why: Why, field: String }
+type Refused = { name: String, encoding: Encoding, body: Bytes, reason: ErrorKind, field: String }
 
 fn span_json_with(members: String) -> Bytes =
   Bytes::of_string("{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{" ++ members ++ "}]}]}]}")
@@ -3078,7 +3141,7 @@ fn refused_traces() -> List<Refused> / {abort.raise} =
       name: "text that is not JSON",
       encoding: Json,
       body: b"{\"resourceSpans\":",
-      why: NotJson("the input ended where a value was expected"),
+      reason: NotJson("the input ended where a value was expected"),
       field: "",
     },
     {
@@ -3087,70 +3150,70 @@ fn refused_traces() -> List<Refused> / {abort.raise} =
       body: span_json_with(
         "\"traceId\":\"W47/95gDgQPSabYzgT/GDA==\",\"spanId\":\"eee19b7ec3c1b174\"",
       ),
-      why: BadText,
+      reason: BadText,
       field: "traceId",
     },
     {
       name: "a trace id of eight bytes",
       encoding: Json,
       body: span_json_with("\"traceId\":\"eee19b7ec3c1b174\",\"spanId\":\"eee19b7ec3c1b174\""),
-      why: BadId,
+      reason: BadId,
       field: "traceId",
     },
     {
       name: "a span with no span id",
       encoding: Json,
       body: span_json_with("\"traceId\":\"5b8efff798038103d269b633813fc60c\""),
-      why: BadId,
+      reason: BadId,
       field: "spanId",
     },
     {
       name: "an enum by its name",
       encoding: Json,
       body: span_json_with(good_ids() ++ ",\"kind\":\"SPAN_KIND_SERVER\""),
-      why: WrongKind("an enum's number"),
+      reason: WrongKind("an enum's number"),
       field: "kind",
     },
     {
       name: "an enum that names nothing",
       encoding: Json,
       body: span_json_with(good_ids() ++ ",\"kind\":9"),
-      why: BadEnum(9),
+      reason: BadEnum(9),
       field: "kind",
     },
     {
       name: "a time that is not whole",
       encoding: Json,
       body: span_json_with(good_ids() ++ ",\"startTimeUnixNano\":\"1.5\""),
-      why: BadNumber,
+      reason: BadNumber,
       field: "startTimeUnixNano",
     },
     {
       name: "a time past 64 bits",
       encoding: Json,
       body: span_json_with(good_ids() ++ ",\"startTimeUnixNano\":\"18446744073709551616\""),
-      why: BadNumber,
+      reason: BadNumber,
       field: "startTimeUnixNano",
     },
     {
       name: "a name that is a number",
       encoding: Json,
       body: span_json_with(good_ids() ++ ",\"name\":7"),
-      why: WrongKind("a string"),
+      reason: WrongKind("a string"),
       field: "name",
     },
     {
       name: "spans that are no array",
       encoding: Json,
       body: b"{\"resourceSpans\":{}}",
-      why: WrongKind("an array"),
+      reason: WrongKind("an array"),
       field: "resourceSpans",
     },
     {
       name: "bytes that are no message",
       encoding: Protobuf,
       body: b"\x0b",
-      why: NotProtobuf(protobuf::Group),
+      reason: NotProtobuf(protobuf::Group),
       field: "",
     },
     {
@@ -3163,7 +3226,7 @@ fn refused_traces() -> List<Refused> / {abort.raise} =
           protobuf::message_field(2, protobuf::bytes_field(1, b"\x01\x02")),
         ),
       ),
-      why: BadId,
+      reason: BadId,
       field: "traceId",
     },
   ]
@@ -3172,7 +3235,7 @@ test "traces are refused: {c.name}" for c: Refused in refused_traces() {
   match decode_traces(c.encoding, c.body, default_limits()) {
     Ok(_) -> panic("accepted"),
     Err(refusal) -> {
-      assert_eq(refusal.why, c.why);
+      assert_eq(refusal.reason, c.reason);
       assert_eq(refusal.field, c.field)
     },
   }
@@ -3184,35 +3247,35 @@ fn refused_metrics() -> List<Refused> / {abort.raise} =
       name: "a metric with no data",
       encoding: Json,
       body: metric_json_with(""),
-      why: Missing("data"),
+      reason: Missing("data"),
       field: "data",
     },
     {
       name: "an exponential histogram",
       encoding: Json,
       body: metric_json_with(",\"exponentialHistogram\":{}"),
-      why: Unsupported("exponential_histogram"),
+      reason: Unsupported("exponential_histogram"),
       field: "exponentialHistogram",
     },
     {
       name: "a summary",
       encoding: Json,
       body: metric_json_with(",\"summary\":{}"),
-      why: Unsupported("summary"),
+      reason: Unsupported("summary"),
       field: "summary",
     },
     {
       name: "a sum that does not say how it adds up",
       encoding: Json,
       body: metric_json_with(",\"sum\":{\"dataPoints\":[]}"),
-      why: Missing("aggregationTemporality"),
+      reason: Missing("aggregationTemporality"),
       field: "aggregationTemporality",
     },
     {
       name: "a point with no value",
       encoding: Json,
       body: metric_json_with(",\"gauge\":{\"dataPoints\":[{}]}"),
-      why: Missing("value"),
+      reason: Missing("value"),
       field: "asDouble",
     },
     {
@@ -3222,7 +3285,7 @@ fn refused_metrics() -> List<Refused> / {abort.raise} =
         1,
         protobuf::message_field(2, protobuf::message_field(2, protobuf::message_field(11, b""))),
       ),
-      why: Unsupported("summary"),
+      reason: Unsupported("summary"),
       field: "summary",
     },
     {
@@ -3232,7 +3295,7 @@ fn refused_metrics() -> List<Refused> / {abort.raise} =
         1,
         protobuf::message_field(2, protobuf::message_field(2, protobuf::string_field(1, "m"))),
       ),
-      why: Missing("data"),
+      reason: Missing("data"),
       field: "data",
     },
   ]
@@ -3241,7 +3304,7 @@ test "metrics are refused: {c.name}" for c: Refused in refused_metrics() {
   match decode_metrics(c.encoding, c.body, default_limits()) {
     Ok(_) -> panic("accepted"),
     Err(refusal) -> {
-      assert_eq(refusal.why, c.why);
+      assert_eq(refusal.reason, c.reason);
       assert_eq(refusal.field, c.field)
     },
   }
@@ -3276,35 +3339,35 @@ test "a field a reader does not know is passed over, in either encoding" {
 test "a request past its limits is refused" {
   let tight: Limits = { length: 16, depth: 64 };
   match decode_traces(Json, encode_traces(Json, sample_traces()), tight) {
-    Err(refusal) -> assert_eq(refusal.why, TooLong),
+    Err(refusal) -> assert_eq(refusal.reason, TooLong),
     Ok(_) -> panic("accepted"),
   };
   match decode_traces(Protobuf, encode_traces(Protobuf, sample_traces()), tight) {
-    Err(refusal) -> assert_eq(refusal.why, NotProtobuf(protobuf::TooLong)),
+    Err(refusal) -> assert_eq(refusal.reason, NotProtobuf(protobuf::TooLong)),
     Ok(_) -> panic("accepted"),
   };
   let shallow: Limits = { length: 4194304, depth: 5 };
   match decode_traces(Protobuf, encode_traces(Protobuf, sample_traces()), shallow) {
-    Err(refusal) -> assert_eq(refusal.why, NotProtobuf(protobuf::TooDeep)),
+    Err(refusal) -> assert_eq(refusal.reason, NotProtobuf(protobuf::TooDeep)),
     Ok(_) -> panic("accepted"),
   };
   match decode_traces(Json, encode_traces(Json, sample_traces()), { length: 4194304, depth: 1 }) {
-    Err(refusal) -> assert_eq(refusal.why, TooDeep),
+    Err(refusal) -> assert_eq(refusal.reason, TooDeep),
     Ok(_) -> panic("accepted"),
   }
 }
 
 test "an empty receipt is the empty message, and a partial one says what was turned away" {
-  let none: Receipt = { rejected: 0, message: "" };
-  assert_eq(encode_receipt(Protobuf, TraceSignal, none), b"");
-  assert_eq(encode_receipt(Json, TraceSignal, none), b"{}");
-  let some: Receipt = { rejected: 3, message: "too old" };
+  let none: ExportResponse = { rejected: 0, message: "" };
+  assert_eq(encode_response(Protobuf, TraceSignal, none), b"");
+  assert_eq(encode_response(Json, TraceSignal, none), b"{}");
+  let some: ExportResponse = { rejected: 3, message: "too old" };
   assert_eq(
-    String::of_bytes(encode_receipt(Json, TraceSignal, some)),
+    String::of_bytes(encode_response(Json, TraceSignal, some)),
     "{\"partialSuccess\":{\"errorMessage\":\"too old\",\"rejectedSpans\":\"3\"}}",
   );
   assert_eq(
-    String::of_bytes(encode_receipt(Json, MetricSignal, some)),
+    String::of_bytes(encode_response(Json, MetricSignal, some)),
     "{\"partialSuccess\":{\"errorMessage\":\"too old\",\"rejectedDataPoints\":\"3\"}}",
   )
 }
@@ -3333,7 +3396,7 @@ type Collector = {
 }
 
 /// One connection: what its client wrote, and what is left of the answer.
-type Conn = { written: Bytes, answer: Bytes, served: Bool }
+type Conn = { written: Bytes, result: Bytes, served: Bool }
 
 effect collector {
   /// Whether the next connection is refused, which takes a `Down` off the script.
@@ -3343,23 +3406,23 @@ effect collector {
   write took_metrics(m: Metrics) -> Unit
 }
 
-fn receipt_response<| r>(
+fn export_http_response<| r>(
   e: Encoding,
   signal: Signal,
   rejected: Int,
 ) -> http::Response<| r> / {abort.raise} = {
-  let receipt: Receipt = {
+  let receipt: ExportResponse = {
     rejected: rejected,
     message: if rejected == 0 { "" } else { "turned away" },
   };
   {
     status: 200,
     headers: http::set_header(http::empty_headers(), "content-type", content_type(e)),
-    body: http::Whole(encode_receipt(e, signal, receipt)),
+    body: http::Whole(encode_response(e, signal, receipt)),
   }
 }
 
-fn took<| r>(
+fn accept_export<| r>(
   e: Encoding,
   path: String,
   raw: Bytes,
@@ -3369,7 +3432,7 @@ fn took<| r>(
     match decode_traces(e, raw, default_limits()) {
       Ok(t) -> {
         collector.took_traces(t);
-        receipt_response(e, TraceSignal, rejected)
+        export_http_response(e, TraceSignal, rejected)
       },
       Err(_) -> http::text_response(400, "not traces"),
     }
@@ -3377,7 +3440,7 @@ fn took<| r>(
     match decode_metrics(e, raw, default_limits()) {
       Ok(m) -> {
         collector.took_metrics(m);
-        receipt_response(e, MetricSignal, rejected)
+        export_http_response(e, MetricSignal, rejected)
       },
       Err(_) -> http::text_response(400, "not metrics"),
     }
@@ -3396,8 +3459,8 @@ fn receive<| r>(
   else { None };
   match ((req.method, encoding, raw)) {
     (http::Post, Some(e), Ok(body)) -> match collector.next(kind, packed) {
-      Take | Down -> took(e, req.path, body, 0),
-      Partial(n) -> took(e, req.path, body, n),
+      Take | Down -> accept_export(e, req.path, body, 0),
+      Partial(n) -> accept_export(e, req.path, body, n),
       Busy(status, after) -> {
         let res = http::text_response(status, "later");
         match after {
@@ -3416,11 +3479,11 @@ fn receive<| r>(
 
 /// What `receive` under `std.http`'s serve loop writes back for the bytes one connection's client
 /// wrote.
-fn answered(
+fn serve_bytes(
   written: Bytes,
 ) -> Bytes / {collector.next, collector.took_traces, collector.took_metrics, abort.raise} = {
   let client = ip::socket_at(ip::loopback_v4(), 49152);
-  let ran = net::on_mem(net::mem_calling(net::mem_empty(), client, [Says(written)]), || {
+  let ran = net::on_mem(net::mem_calling(net::mem_empty(), client, [Sends(written)]), || {
     let conn = net.accept[listener](net.listen[listener](0));
     http::serve_connection[inner](conn, http::default_limits(), receive);
     conn
@@ -3428,7 +3491,7 @@ fn answered(
   net::mem_sent(ran.net, ran.value)
 }
 
-type Ran<a> = { value: a, seen: Collector }
+type CollectorRun<a> = { value: a, seen: Collector }
 
 fn collector_host() -> String = "collector.test"
 
@@ -3438,7 +3501,7 @@ fn collector_host() -> String = "collector.test"
 fn collected<a | e>(
   script: List<Reply>,
   body: () -> a / {net.connect[collector], net.connect_tls[collector], net.send[collector], net.recv[collector], net.close[collector] | e},
-) -> Ran<a> / {clock.now, abort.raise | e} = {
+) -> CollectorRun<a> / {clock.now, abort.raise | e} = {
   handle {
     handle {
       body()
@@ -3447,7 +3510,7 @@ fn collected<a | e>(
       var next = 1,
       net.connect[collector](host, port, t) -> if collector.refuses() || host != collector_host()
           || port != 4318 { None } else {
-        let conn: Conn = { written: b"", answer: b"", served: false };
+        let conn: Conn = { written: b"", result: b"", served: false };
         conns = conns.insert(next, conn);
         next = next + 1;
         Some(next - 1)
@@ -3464,15 +3527,15 @@ fn collected<a | e>(
         None -> Some(b""),
         Some(c) -> {
           let ready = if c.served { c } else {
-            let out: Conn = { written: c.written, answer: answered(c.written), served: true };
+            let out: Conn = { written: c.written, result: serve_bytes(c.written), served: true };
             out
           };
-          let n = min(most, ready.answer.len());
+          let n = min(most, ready.result.len());
           conns = conns.insert(conn, {
             ..ready,
-            answer: ready.answer.slice(n, ready.answer.len()),
+            result: ready.result.slice(n, ready.result.len()),
           });
-          Some(ready.answer.slice(0, n))
+          Some(ready.result.slice(0, n))
         },
       },
       net.close[collector](conn) -> {
@@ -3538,16 +3601,21 @@ fn test_config() -> Config = {
 /// A span opened through `std.telemetry`, a bare one inside it, an annotation, and one of each
 /// metric.
 fn checkout() -> Unit / {trace.enter[shop], trace.exit[shop], trace.count[shop], trace.gauge[shop], trace.time[shop], Tracing, entropy.next, time.sleep_ms, abort.raise} =
-  telemetry::in_span[shop]("checkout", telemetry::Server, #{"sku": trace::FText("BOLT-1")}, || {
-    time.sleep_ms(5);
-    let inner = trace.enter[shop]("reserve", #{"qty": trace::FInt(2)});
-    time.sleep_ms(2);
-    trace.exit[shop](inner, trace::Failed("out of stock"));
-    telemetry::annotate(#{"http.response.status_code": trace::FInt(409)});
-    trace.count[shop]("orders placed", 1, #{"sku": trace::FText("BOLT-1")});
-    trace.gauge[shop]("shelf", 41.75m, Map::new());
-    trace.time[shop]("checkout", 7000, Map::new())
-  })
+  telemetry::in_span[shop](
+    "checkout",
+    telemetry::Server,
+    #{"sku": trace::StringField("BOLT-1")},
+    || {
+      time.sleep_ms(5);
+      let inner = trace.enter[shop]("reserve", #{"qty": trace::IntField(2)});
+      time.sleep_ms(2);
+      trace.exit[shop](inner, trace::Failed("out of stock"));
+      telemetry::annotate(#{"http.response.status_code": trace::IntField(409)});
+      trace.count[shop]("orders placed", 1, #{"sku": trace::StringField("BOLT-1")});
+      trace.gauge[shop]("shelf", 41.75m, Map::new());
+      trace.time[shop]("checkout", 7000, Map::new())
+    },
+  )
 
 /// `exporting` to the label `collector`: the row names no other.
 fn shipping(
@@ -3896,11 +3964,12 @@ test "a trace that is not recorded is not sent, and a span takes the decision of
             step[shop]("unrecorded");
             telemetry::in_span[shop]("also unrecorded", telemetry::Internal, Map::new(), ||
               step[shop]("nor this"));
-            telemetry::served[web](remote(true), |r: http::Request| {
+            telemetry::host_handler[web](remote(true), |r: http::Request| {
               step[shop]("inside a recorded request");
               http::response(204, b"")
             });
-            telemetry::served[web](remote(false), |r: http::Request| http::response(204, b""));
+            telemetry::host_handler[web](remote(false), |r: http::Request|
+              http::response(204, b""));
             flush()
           })))
     }).value;
@@ -3954,7 +4023,7 @@ test "a ratio records the traces whose ids it keeps, and no others" {
     t.resource_spans.fold(all_kept, |a: Bool, r: ResourceSpans|
       r.scope_spans.fold(a, |b: Bool, s: ScopeSpans|
         s.spans.fold(b, |c: Bool, x: Span|
-          c && telemetry::records(telemetry::Ratio(1, 2), x.trace_id)))));
+          c && telemetry::should_sample(telemetry::Ratio(1, 2), x.trace_id)))));
   assert(kept)
 }
 
@@ -3969,7 +4038,7 @@ test "a collector that takes part of a request is believed, and a metric keeps n
             step[shop]("a");
             step[shop]("b");
             ["x", "y", "z", "x"].fold((), |_: Unit, sku: String|
-              trace.count[shop]("orders", 1, #{"sku": trace::FText(sku)}));
+              trace.count[shop]("orders", 1, #{"sku": trace::StringField(sku)}));
             flush()
           })))
     }).value;
@@ -3999,7 +4068,7 @@ test "closing a span closes the spans left open under it, and an exit of a span 
             flush()
           })))
     }).value;
-  assert_eq(ran.value.misplaced, 1);
+  assert_eq(ran.value.unmatched_exits, 1);
   match ran.seen.traces {
     [{ resource_spans: [{ scope_spans: [{ spans: [outer, inner], .. }], .. }] }] -> {
       assert_eq(inner.name, "inner");

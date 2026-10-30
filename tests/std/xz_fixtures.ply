@@ -11,7 +11,7 @@ import packed_samples (sample)
 import std.seq
 import std.seq (seq)
 import std.xz
-import std.xz (xz, Limits, Refusal)
+import std.xz (xz, Limits, Error)
 import std.value (reflect)
 
 type File = { name: String, bytes: Bytes }
@@ -25,37 +25,40 @@ fn file(name: String) -> Bytes / {abort.raise} =
   }
 
 /// The sample a packed file was made of, which its name opens with.
-fn plain_of(name: String) -> Bytes / {abort.raise} =
+fn uncompressed_of(name: String) -> Bytes / {abort.raise} =
   match name.split(".") { [stem, ..] -> sample(stem), [] -> panic("no name") }
 
-fn packed() -> List<File> = files().filter(|f: File| f.name.ends_with(".xz"))
+fn compressed_files() -> List<File> = files().filter(|f: File| f.name.ends_with(".xz"))
 
 /// Room for the 64 MiB dictionary the ninth preset asks for.
-fn roomy() -> Limits = { output: 1000000, window: 67108864 }
+fn large_limits() -> Limits = { output: 1000000, window: 67108864 }
 
-fn outcome(got: Result<Bytes, Refusal>, want: Bytes) -> String =
+fn outcome(got: Result<Bytes, Error>, want: Bytes) -> String =
   match got {
     Ok(b) -> if b == want { "same" } else { f"differs: {b.len()} bytes for {want.len()}" },
-    Err(r) -> f"refused at {r.at}: {reflect(r.why)}",
+    Err(r) -> f"refused at {r.at}: {reflect(r.reason)}",
   }
 
-test "{f.name} unpacks to its sample" for f: File in packed() {
-  assert_eq(outcome(xz::try_decompress(f.bytes, roomy()), plain_of(f.name)), "same")
+test "{f.name} unpacks to its sample" for f: File in compressed_files() {
+  assert_eq(outcome(xz::try_decompress(f.bytes, large_limits()), uncompressed_of(f.name)), "same")
 }
 
-/// What `packed` unpacks to, read `size` bytes at a time.
-fn streamed(
-  packed: Bytes,
+/// What `compressed_files` unpacks to, read `size` bytes at a time.
+fn decompress_in_chunks(
+  compressed_files: Bytes,
   size: Int,
   limits: Limits,
-) -> Bytes / {xz.refused, seq.spent, abort.raise} =
-  Bytes::concat_all(seq::to_list(xz::decoded(seq::slices(packed, size), limits), 10000000))
+) -> Bytes / {xz.fail, seq.spent, abort.raise} =
+  Bytes::concat_all(
+    seq::to_list(xz::decompress_stream(seq::slices(compressed_files, size), limits), 10000000),
+  )
 
-test "{f.name} unpacks the same a chunk at a time, whatever the chunk" for f: File in packed() {
-  let whole = plain_of(f.name);
-  assert(streamed(f.bytes, 100000, roomy()) == whole);
-  assert(streamed(f.bytes, 4099, roomy()) == whole);
-  assert(f.bytes.len() > 3000 || streamed(f.bytes, 1, roomy()) == whole)
+test "{f.name} unpacks the same a chunk at a time, whatever the chunk" for f: File in compressed_files(
+  ) {
+  let whole = uncompressed_of(f.name);
+  assert(decompress_in_chunks(f.bytes, 100000, large_limits()) == whole);
+  assert(decompress_in_chunks(f.bytes, 4099, large_limits()) == whole);
+  assert(f.bytes.len() > 3000 || decompress_in_chunks(f.bytes, 1, large_limits()) == whole)
 }
 
 test "streams one after another are one file, with zeros in fours between and after them" {
@@ -63,37 +66,39 @@ test "streams one after another are one file, with zeros in fours between and af
   let a = file("brief.l6.xz");
   let b = file("one.l6.xz");
   let n = a.len();
-  assert_eq(outcome(xz::try_decompress(a.concat(b), roomy()), both), "same");
+  assert_eq(outcome(xz::try_decompress(a.concat(b), large_limits()), both), "same");
   let padded = Bytes::concat_all([a, b"\x00\x00\x00\x00", b, b"\x00\x00\x00\x00\x00\x00\x00\x00"]);
-  assert_eq(outcome(xz::try_decompress(padded, roomy()), both), "same");
-  assert(streamed(padded, 3, roomy()) == both);
+  assert_eq(outcome(xz::try_decompress(padded, large_limits()), both), "same");
+  assert(decompress_in_chunks(padded, 3, large_limits()) == both);
   assert_eq(
-    xz::try_decompress(Bytes::concat_all([a, b"\x00\x00\x00", b]), roomy()),
-    Err({ at: n, why: xz::Trailing }),
+    xz::try_decompress(Bytes::concat_all([a, b"\x00\x00\x00", b]), large_limits()),
+    Err({ at: n, reason: xz::Trailing }),
   );
-  let first = xz::first(a.concat(b"more"), roomy());
+  let first = xz::decompress_first(a.concat(b"more"), large_limits());
   assert_eq(first.plain, sample("brief"));
   assert_eq(first.used, n)
 }
 
-test "{c.name} is refused by its filter's number" for c: { name: String, why: xz::Why } in [
-    { name: "records.x86.refused", why: xz::Filter(4) },
-    { name: "records.delta.refused", why: xz::Filter(3) },
-    { name: "records.arm64.refused", why: xz::Filter(10) },
-  ] { assert_eq(xz::try_decompress(file(c.name), roomy()), Err({ at: 12, why: c.why })) }
+test "{c.name} is refused by its filter's number" for c: { name: String, reason: xz::ErrorKind } in [
+    { name: "records.x86.refused", reason: xz::Filter(4) },
+    { name: "records.delta.refused", reason: xz::Filter(3) },
+    { name: "records.arm64.refused", reason: xz::Filter(10) },
+  ] {
+  assert_eq(xz::try_decompress(file(c.name), large_limits()), Err({ at: 12, reason: c.reason }))
+}
 
 test "a dictionary past the window is refused before a chunk is read, and an output past the limit where it would be passed" {
   let asks = file("prose.l9sha.xz");
   let narrow: Limits = { output: 1000000, window: 67108863 };
-  assert_eq(xz::try_decompress(asks, narrow), Err({ at: 12, why: xz::Window }));
+  assert_eq(xz::try_decompress(asks, narrow), Err({ at: 12, reason: xz::Window }));
   // The stream header and the first block's header alone, which the byte at 12 sizes, are refused
   // alike.
   assert_eq(
     xz::try_decompress(asks.slice(0, 12 + (asks.at(12) + 1) * 4), narrow),
-    Err({ at: 12, why: xz::Window }),
+    Err({ at: 12, reason: xz::Window }),
   );
   assert(match xz::try_decompress(file("long.blocks.xz"), { output: 149999, window: 67108864 }) {
-    Err(r) -> r.why == xz::OverLimit,
+    Err(r) -> r.reason == xz::OverLimit,
     Ok(_) -> false,
   })
 }

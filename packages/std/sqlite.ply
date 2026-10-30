@@ -20,23 +20,23 @@
 //! `functions()`.
 //!
 //! A statement is a `Bound`: text the reader has read, and its parameters. `bound(stmt(".."), ps)`
-//! makes one of text a program built, and the tag `sqlite"insert into t (a) values ({PInt(n)})"`
+//! makes one of text a program built, and the tag `sqlite"insert into t (a) values ({IntParameter(n)})"`
 //! one whose text is read when the program is checked and whose holes are its parameters, bound
 //! as `?1`, `?2`; nothing a hole holds is ever statement text. The parameters are `std.sql`'s
-//! `Param`: null, an integer, a float, text and bytes are what SQLite stores, and a `PBool` is
+//! `Param`: null, an integer, a float, text and bytes are what SQLite stores, and a `BoolParameter` is
 //! bound 1 or 0. A `Decimal`, a date, JSON and an array are the caller's to encode, as text or an
-//! integer, so `PNumeric`, `PJson` and `PArray` are refused. `query` answers rows, each a
+//! integer, so `NumericParameter`, `JsonParameter` and `ArrayParameter` are refused. `query` answers rows, each a
 //! `std.sql` `Row`, read a column at a time by `int`, `float`, `text` and `bytes`, and through
 //! `optional` where a column may be null; `execute` answers the rows a statement changed and the
 //! row id it last inserted; `returning` is a write that answers rows; `run` answers either as
-//! `std.sql`'s `Answer`. Every one takes its `Limits`, and there is no call without them.
+//! `std.sql`'s `QueryResult`. Every one takes its `Limits`, and there is no call without them.
 //!
 //! `transaction` runs its body between `BEGIN IMMEDIATE` and `COMMIT`, and rolls back if the body
 //! raises or its task is cancelled; inside another it is a savepoint. `snapshot` is the same over
 //! a transaction that only reads, which sees one state of the database throughout. `fold_rows`
 //! reads a large answer a page at a time. `backup` writes a compacted copy under the same root.
 //!
-//! What is refused is raised as `sql.refused` with a `Refusal`: `Busy` is another connection
+//! What is refused is raised as `sql.fail` with a `Error`: `Busy` is another connection
 //! holding the lock past the wait, and is the one to retry (`is_retryable`); `Constraint` names
 //! its kind and what the engine names, `table.column` for a unique, not-null or strict-type
 //! failure, the constraint's name for a check, and nothing for a foreign key. `try` makes a
@@ -60,12 +60,14 @@
 //! A schema's version is `pragma user_version`: a migration is a `transaction` that reads it,
 //! runs the statements past it and sets it.
 
-import std.sql (Stmt, stmt, Param, PNull, PInt, PBool, PText, PBytes, PFloat, PNumeric, PJson,
-                PArray, Datum, CNull, CInt, CFloat, CText, CBytes, Row, Answer, Rows, Count, Failed,
-                Sqlite, scan_statement, refusal_byte)
+import std.sql (Stmt, stmt, Param, NullParameter, IntParameter, BoolParameter, TextParameter,
+                BytesParameter, FloatParameter, NumericParameter, JsonParameter, ArrayParameter,
+                Datum, NullDatum, IntDatum, FloatDatum, TextDatum, BytesDatum, Row, QueryResult,
+                Rows, Count, Failed, Sqlite, scan_statement, refusal_byte)
 import std.bytes (i64_be)
 import std.fs
-import std.internal.native (native, wait, job_wait, observed, found, parts, in_parts, int_of)
+import std.internal.native (native, wait, job_wait, observed, found, parts, encode_parts,
+                            decode_int)
 import std.laws (agrees)
 import std.list
 import std.math (rem_euclid)
@@ -77,7 +79,7 @@ import std.gen
 /// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
 /// its arguments: the engine is the one every `ply` of this version carries, and a statement that
 /// would read a clock, entropy or another file is refused. `reads_only` refuses a statement that
-/// could write, and `strict` a table that is not `STRICT`. `ran_over` is how the twin runs one.
+/// could write, and `strict` a table that is not `STRICT`. `run_on_image` is how the twin runs one.
 extern fn sqlite_run(
   image: Bytes,
   sql: String,
@@ -160,7 +162,7 @@ pub nondet effect sqlite {
 /// operation, as the twin does, is deterministic though it may still be refused.
 pub effect sql {
   /// A database did not do what it was asked.
-  raise refused(why: Refusal)
+  raise fail(why: Error)
 }
 
 /// The constraint a write broke: a unique index or a primary key, a foreign key, `NOT NULL`, a
@@ -173,45 +175,45 @@ pub type Violation = | Unique | ForeignKey | NotNull | Check | Datatype | Other
 /// `Constraint`: a write broke one, with what the engine names of it. `Unopened`: the database
 /// did not open. `Refused`: the statement is one this module does not run, which the reader or
 /// the engine's authorizer said before it ran. `Malformed`: the engine could not read the
-/// statement, or it names what the database does not hold. `Over`: a limit its caller set, by its
+/// statement, or it names what the database does not hold. `RunResult`: a limit its caller set, by its
 /// field's name, or `value` for one text or blob past 64 MiB. `Mistyped`: a column does not hold
 /// what a reader asked it for. `Closed`: the connection is closed, or its transaction was rolled
 /// back under it. `Engine`: anything else, with the engine's code.
-pub type Refusal =
+pub type Error =
   | Busy
   | Constraint(Violation, String)
   | Unopened(String)
   | Refused(String)
   | Malformed(String)
-  | Over(String)
+  | RunResult(String)
   | Mistyped(String, String)
   | Closed(String)
   | Engine(String, String)
 
 /// Whether running the same thing again may succeed: only `Busy` says so.
-pub fn is_retryable(why: Refusal) -> Bool = match why { Busy -> true, _ -> false }
+pub fn is_retryable(why: Error) -> Bool = match why { Busy -> true, _ -> false }
 
-/// What a `Failure` is as a `Refusal`.
-pub fn refusal_of(f: Failure) -> Refusal =
+/// What a `Failure` is as a `Error`.
+pub fn refusal_of(f: Failure) -> Error =
   if f.kind == "busy" { Busy }
   else if f.kind == "unique" { Constraint(Unique, f.name) }
   else if f.kind == "foreign_key" { Constraint(ForeignKey, f.name) }
   else if f.kind == "not_null" { Constraint(NotNull, f.name) }
   else { refusal_of_rest(f) }
 
-fn refusal_of_rest(f: Failure) -> Refusal =
+fn refusal_of_rest(f: Failure) -> Error =
   if f.kind == "check" { Constraint(Check, f.name) }
   else if f.kind == "datatype" { Constraint(Datatype, f.name) }
   else if f.kind == "constraint" { Constraint(Other, f.name) }
   else if f.kind == "unopened" { Unopened(f.detail) }
   else { refusal_of_last(f) }
 
-fn refusal_of_last(f: Failure) -> Refusal =
+fn refusal_of_last(f: Failure) -> Error =
   if f.kind == "refused" || f.kind == "writes" || f.kind == "read_only" || f.kind == "exists" {
     Refused(f.detail)
   } else if f.kind == "statement" { Malformed(f.detail) }
-  else if f.kind == "too_large" { Over(f.name) }
-  else if f.kind == "steps" { Over("steps") }
+  else if f.kind == "too_large" { RunResult(f.name) }
+  else if f.kind == "steps" { RunResult("steps") }
   else if f.kind == "closed" || f.kind == "aborted" { Closed(f.detail) }
   else { Engine(if f.name == "" { f.kind } else { f.name }, f.detail) }
 
@@ -224,12 +226,12 @@ pub fn functions() -> List<String> / {abort.raise} =
 /// A statement the reader has read, with the values bound to its `?1`, `?2`.
 pub opaque type Bound = | Bound(String, List<Scalar>)
 
-/// `s` with `ps` bound to its placeholders, in order. Raises `Refused` for a statement the reader
+/// `bare_statement` with `ps` bound to its placeholders, in order. Raises `Refused` for a statement the reader
 /// refuses and for a parameter SQLite does not store.
-pub fn bound(s: Stmt, ps: List<Param>) -> Bound / {sql.refused, abort.raise} =
-  match scan_statement(Sqlite, s.sql) {
-    Err(e) -> sql.refused(Refused(e.detail)),
-    Ok(_) -> Bound(s.sql, scalars(ps)),
+pub fn bound(bare_statement: Stmt, ps: List<Param>) -> Bound / {sql.fail, abort.raise} =
+  match scan_statement(Sqlite, bare_statement.sql) {
+    Err(e) -> sql.fail(Refused(e.detail)),
+    Ok(_) -> Bound(bare_statement.sql, scalars(ps)),
   }
 
 /// The statement a `Bound` holds.
@@ -239,7 +241,7 @@ pub fn statement(b: Bound) -> Stmt = match b { Bound(sql, _) -> stmt(sql) }
 /// checked.
 pub fn literal(text: String) -> Result<Bound, { message: String, offset: Int }> / {abort.raise} =
   match compile([text]) {
-    Ok(s) -> Ok(Bound(s.sql, [])),
+    Ok(bare_statement) -> Ok(Bound(bare_statement.sql, [])),
     Err(e) -> Err({ message: e.message, offset: e.offset }),
   }
 
@@ -255,61 +257,62 @@ pub fn compile(
     });
   match scan_statement(Sqlite, sql) {
     Ok(_) -> Ok(stmt(sql)),
-    Err(e) -> Err(placed(texts, refusal_byte(e).unwrap_or(0), e.detail)),
+    Err(e) -> Err(error_in_part(texts, refusal_byte(e).unwrap_or(0), e.detail)),
   }
 }
 
 /// A tagged literal's statement with its holes bound, each a `Param`.
-pub fn fill(c: Stmt, holes: List<Param>) -> Bound / {sql.refused} = Bound(c.sql, scalars(holes))
+pub fn fill(c: Stmt, holes: List<Param>) -> Bound / {sql.fail} = Bound(c.sql, scalars(holes))
 
-type Placing = { begins: Int, part: Int, offset: Int, found: Bool }
+type PartSearch = { begins: Int, part: Int, offset: Int, found: Bool }
 
 /// Byte `at` of the statement the texts make, as the text it stands in and the characters before
 /// it there. A byte in a hole's `?n` stands at the end of the text before the hole.
-fn placed(
+fn error_in_part(
   texts: List<String>,
   at: Int,
   message: String,
 ) -> { message: String, offset: Int, part: Int } / {abort.raise} = {
   let last = range(0, texts.len()).fold(
     { begins: 0, part: 0, offset: 0, found: false },
-    |s: Placing, i: Int| {
+    |bare_statement: PartSearch, i: Int| {
       let text = Bytes::of_string(texts.at(i).unwrap_or(""));
-      let begins = s.begins + (if i == 0 { 0 } else { 1 + i.to_string().len() });
+      let begins = bare_statement.begins + (if i == 0 { 0 } else { 1 + i.to_string().len() });
       let ends = begins + text.len();
-      if s.found { s } else if at > ends {
-        { begins: ends, part: i, offset: characters(text, text.len()), found: false }
-      } else { { begins: ends, part: i, offset: characters(text, at - begins), found: true } }
+      if bare_statement.found { bare_statement } else if at > ends {
+        { begins: ends, part: i, offset: character_count(text, text.len()), found: false }
+      } else { { begins: ends, part: i, offset: character_count(text, at - begins), found: true } }
     },
   );
   { message: message, offset: last.offset, part: last.part }
 }
 
 /// How many characters the first `n` bytes of `text` hold.
-fn characters(text: Bytes, n: Int) -> Int / {abort.raise} =
+fn character_count(text: Bytes, n: Int) -> Int / {abort.raise} =
   if n <= 0 { 0 } else { String::of_bytes(text.slice(0, min(n, text.len()))).chars().len() }
 
-fn scalars(ps: List<Param>) -> List<Scalar> / {sql.refused} =
+fn scalars(ps: List<Param>) -> List<Scalar> / {sql.fail} =
   range(0, ps.len()).map(|i: Int|
     match ps.at(i) { Some(p) -> scalar_of(p, i + 1), None -> null_scalar() })
 
 fn null_scalar() -> Scalar = { kind: 0, int: 0, real: 0.0, bytes: b"" }
 
-fn scalar_of(p: Param, place: Int) -> Scalar / {sql.refused} =
+fn scalar_of(p: Param, place: Int) -> Scalar / {sql.fail} =
   match p {
-    PNull -> null_scalar(),
-    PInt(n) -> { kind: 1, int: n, real: 0.0, bytes: b"" },
-    PBool(b) -> { kind: 1, int: if b { 1 } else { 0 }, real: 0.0, bytes: b"" },
-    PFloat(x) -> { kind: 2, int: 0, real: x, bytes: b"" },
-    PText(s) -> { kind: 3, int: 0, real: 0.0, bytes: Bytes::of_string(s) },
-    PBytes(b) -> { kind: 4, int: 0, real: 0.0, bytes: b },
-    PNumeric(_) -> unbindable(place, "PNumeric", "a `Decimal`"),
-    PJson(_) -> unbindable(place, "PJson", "JSON"),
-    PArray(_) -> unbindable(place, "PArray", "an array"),
+    NullParameter -> null_scalar(),
+    IntParameter(n) -> { kind: 1, int: n, real: 0.0, bytes: b"" },
+    BoolParameter(b) -> { kind: 1, int: if b { 1 } else { 0 }, real: 0.0, bytes: b"" },
+    FloatParameter(x) -> { kind: 2, int: 0, real: x, bytes: b"" },
+    TextParameter(bare_statement) ->
+      { kind: 3, int: 0, real: 0.0, bytes: Bytes::of_string(bare_statement) },
+    BytesParameter(b) -> { kind: 4, int: 0, real: 0.0, bytes: b },
+    NumericParameter(_) -> unbindable(place, "PNumeric", "a `Decimal`"),
+    JsonParameter(_) -> unbindable(place, "PJson", "JSON"),
+    ArrayParameter(_) -> unbindable(place, "PArray", "an array"),
   }
 
-fn unbindable<a>(place: Int, name: String, what: String) -> a / {sql.refused} =
-  sql.refused(
+fn unbindable<a>(place: Int, name: String, what: String) -> a / {sql.fail} =
+  sql.fail(
     Refused(
       "parameter " ++ place.to_string() ++ " is a `" ++ name
         ++ "`, and SQLite stores null, integers, floats, text and bytes: encode "
@@ -319,22 +322,19 @@ fn unbindable<a>(place: Int, name: String, what: String) -> a / {sql.refused} =
   )
 
 /// A column's value as `std.sql` writes one.
-fn datum_of(s: Scalar) -> Datum / {abort.raise} =
-  if s.kind == 1 { CInt(s.int) }
-  else if s.kind == 2 { CFloat(s.real) }
-  else if s.kind == 3 { CText(String::of_bytes(s.bytes)) }
-  else if s.kind == 4 { CBytes(s.bytes) }
-  else { CNull }
+fn datum_of(bare_statement: Scalar) -> Datum / {abort.raise} =
+  if bare_statement.kind == 1 { IntDatum(bare_statement.int) }
+  else if bare_statement.kind == 2 { FloatDatum(bare_statement.real) }
+  else if bare_statement.kind == 3 { TextDatum(String::of_bytes(bare_statement.bytes)) }
+  else if bare_statement.kind == 4 { BytesDatum(bare_statement.bytes) }
+  else { NullDatum }
 
 /// The rows of a reply, each by column name. Two columns of one name would be one entry, so a
 /// statement that answers them is refused: name each with `as`.
-fn rows_of(
-  columns: List<String>,
-  rows: List<List<Scalar>>,
-) -> List<Row> / {sql.refused, abort.raise} = {
+fn rows_of(columns: List<String>, rows: List<List<Scalar>>) -> List<Row> / {sql.fail, abort.raise} = {
   let names = columns.fold(Map::new(), |seen: Map<String, Unit>, c: String| seen.insert(c, ()));
   if names.len() != columns.len() {
-    sql.refused(
+    sql.fail(
       Refused(
         "the statement answers two columns of one name, and a row is read by name: name each with `as`",
       ),
@@ -349,8 +349,8 @@ fn rows_of(
   }
 }
 
-fn settled(r: Reply) -> Reply / {sql.refused} =
-  match r.failure { None -> r, Some(f) -> sql.refused(refusal_of(f)) }
+fn raise_on_failure(r: Reply) -> Reply / {sql.fail} =
+  match r.failure { None -> r, Some(f) -> sql.fail(refusal_of(f)) }
 
 // --- A connection ------------------------------------------------------------------------
 
@@ -364,10 +364,10 @@ pub fn opening<[d]>(
   path: String,
   mode: Mode,
   options: Options,
-) -> Connection<[d]> / {sqlite.open[d], sql.refused} =
+) -> Connection<[d]> / {sqlite.open[d], sql.fail} =
   match sqlite.open[d](path, mode, options) {
     Ok(conn) -> Connection(conn),
-    Err(f) -> sql.refused(refusal_of(f)),
+    Err(f) -> sql.fail(refusal_of(f)),
   }
 
 /// Closes a connection, rolling back a transaction it left open: what a `with_hold` over one
@@ -380,34 +380,38 @@ pub fn close<[d]>(c: Connection<[d]>) -> Unit / {sqlite.close[d]} =
     },
   }
 
-fn number<[d]>(c: Connection<[d]>) -> Int = match c { Connection(conn) -> conn }
+fn connection_number<[d]>(c: Connection<[d]>) -> Int = match c { Connection(conn) -> conn }
 
 /// The rows a statement that only reads answers. Raises `Refused` for one that could write.
 pub fn query<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> List<Row> / {hold.read[r], sqlite.query[d], sql.refused, abort.raise} =
+) -> List<Row> / {hold.read[r], sqlite.query[d], sql.fail, abort.raise} =
   match q {
     Bound(sql, params) -> {
-      let reply = settled(sqlite.query[d](number(conn.get()), sql, params, limits));
+      let reply = raise_on_failure(
+        sqlite.query[d](connection_number(conn.get()), sql, params, limits),
+      );
       rows_of(reply.columns, reply.rows)
     },
   }
 
 /// What a write did: the rows the statement itself changed, a trigger's not among them, and the
 /// row id of the last row it inserted, or 0 where it inserted none.
-pub type Changed = { rows: Int, last_row_id: Int }
+pub type ExecuteResult = { rows: Int, last_row_id: Int }
 
 /// Runs a statement that writes, a schema statement among them.
 pub fn execute<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> Changed / {hold.read[r], sqlite.execute[d], sql.refused} =
+) -> ExecuteResult / {hold.read[r], sqlite.execute[d], sql.fail} =
   match q {
     Bound(sql, params) -> {
-      let reply = settled(sqlite.execute[d](number(conn.get()), sql, params, limits));
+      let reply = raise_on_failure(
+        sqlite.execute[d](connection_number(conn.get()), sql, params, limits),
+      );
       { rows: reply.changed, last_row_id: reply.last_row_id }
     },
   }
@@ -417,10 +421,12 @@ pub fn returning<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> List<Row> / {hold.read[r], sqlite.execute[d], sql.refused, abort.raise} =
+) -> List<Row> / {hold.read[r], sqlite.execute[d], sql.fail, abort.raise} =
   match q {
     Bound(sql, params) -> {
-      let reply = settled(sqlite.execute[d](number(conn.get()), sql, params, limits));
+      let reply = raise_on_failure(
+        sqlite.execute[d](connection_number(conn.get()), sql, params, limits),
+      );
       rows_of(reply.columns, reply.rows)
     },
   }
@@ -432,10 +438,10 @@ pub fn run<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> Answer / {hold.read[r], sqlite.execute[d], abort.raise} =
+) -> QueryResult / {hold.read[r], sqlite.execute[d], abort.raise} =
   match q {
     Bound(sql, params) -> {
-      let reply = sqlite.execute[d](number(conn.get()), sql, params, limits);
+      let reply = sqlite.execute[d](connection_number(conn.get()), sql, params, limits);
       match reply.failure {
         Some(f) -> Failed({ code: f.kind, constraint: f.name, detail: f.detail }),
         None -> if reply.columns.len() == 0 { Count(reply.changed) } else {
@@ -461,23 +467,23 @@ pub fn run<[d], [r]>(
 pub fn transaction<a, [d], [r] | e>(
   conn: Hold<Connection<[d]>, [r]>,
   body: () -> a / e,
-) -> a / {hold.read[r], sqlite.control[d], sql.refused | e} =
-  scoped[d](number(conn.get()), Begin, body)
+) -> a / {hold.read[r], sqlite.control[d], sql.fail | e} =
+  in_transaction[d](connection_number(conn.get()), Begin, body)
 
 /// `body` inside a transaction that only reads: every query in it sees the database as it stood
 /// at the first. A write in it raises `Busy` if another connection has written since.
 pub fn snapshot<a, [d], [r] | e>(
   conn: Hold<Connection<[d]>, [r]>,
   body: () -> a / e,
-) -> a / {hold.read[r], sqlite.control[d], sql.refused | e} =
-  scoped[d](number(conn.get()), BeginRead, body)
+) -> a / {hold.read[r], sqlite.control[d], sql.fail | e} =
+  in_transaction[d](connection_number(conn.get()), BeginRead, body)
 
-fn scoped<a, [d] | e>(
+fn in_transaction<a, [d] | e>(
   conn: Int,
   opens: Control,
   body: () -> a / e,
-) -> a / {sqlite.control[d], sql.refused | e} = {
-  settled(sqlite.control[d](conn, opens));
+) -> a / {sqlite.control[d], sql.fail | e} = {
+  raise_on_failure(sqlite.control[d](conn, opens));
   handle {
     bracket(
       || (),
@@ -490,7 +496,7 @@ fn scoped<a, [d] | e>(
         let value = body();
         // Whatever the commit answers, its scope is closed.
         scope_end.end();
-        settled(sqlite.control[d](conn, Commit));
+        raise_on_failure(sqlite.control[d](conn, Commit));
         value
       },
     )
@@ -511,7 +517,7 @@ effect scope_end {
 
 /// `f` over each row a statement that only reads answers, fetched `page` rows at a time, so a
 /// large answer is held a page at a time. `limits.rows` is the most rows it folds over, past
-/// which it raises `Over`, and `limits.bytes` bounds each page. Nothing else runs on the
+/// which it raises `RunResult`, and `limits.bytes` bounds each page. Nothing else runs on the
 /// connection while it folds: `f` reads another connection, or gathers what it will write.
 pub fn fold_rows<a, [d], [r] | e>(
   conn: Hold<Connection<[d]>, [r]>,
@@ -520,20 +526,20 @@ pub fn fold_rows<a, [d], [r] | e>(
   page: Int,
   init: a,
   f: (a, Row) -> a / e,
-) -> a / {hold.read[r], sqlite.cursor[d], sqlite.fetch[d], sqlite.finish[d], sql.refused, abort.raise | e} =
+) -> a / {hold.read[r], sqlite.cursor[d], sqlite.fetch[d], sqlite.finish[d], sql.fail, abort.raise | e} =
   match q {
     Bound(sql, params) -> {
-      let id = number(conn.get());
+      let id = connection_number(conn.get());
       if page < 1 { panic("a page is at least one row") } else {
         bracket(
-          || settled(sqlite.cursor[d](id, sql, params, limits)).columns,
+          || raise_on_failure(sqlite.cursor[d](id, sql, params, limits)).columns,
           |_c: List<String>| {
             sqlite.finish[d](id);
             ()
           },
           |columns: List<String>|
             iterate(init, max(limits.rows, 0) / page + 2, |acc: a| {
-              let got = settled(sqlite.fetch[d](id, page));
+              let got = raise_on_failure(sqlite.fetch[d](id, page));
               let next = rows_of(columns, got.rows).fold(acc, f);
               if got.rows.len() < page { Stop(next) } else { Continue(next) }
             }),
@@ -548,36 +554,42 @@ pub fn fold_rows<a, [d], [r] | e>(
 pub fn backup<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   path: String,
-) -> Unit / {hold.read[r], sqlite.backup[d], sql.refused} = {
-  settled(sqlite.backup[d](number(conn.get()), path));
+) -> Unit / {hold.read[r], sqlite.backup[d], sql.fail} = {
+  raise_on_failure(sqlite.backup[d](connection_number(conn.get()), path));
   ()
 }
 
 // --- Reading a row -----------------------------------------------------------------------
 
-fn held(row: Row, column: String) -> Datum / {sql.refused} =
+fn column_value(row: Row, column: String) -> Datum / {sql.fail} =
   match row.get(column) {
     Some(value) -> value,
-    None -> sql.refused(Mistyped(column, "a column of the answer")),
+    None -> sql.fail(Mistyped(column, "a column of the answer")),
   }
 
 /// The integer `column` holds. Raises `Mistyped` for anything else, null and no such column
 /// included.
-pub fn int(row: Row, column: String) -> Int / {sql.refused} =
-  match held(row, column) { CInt(n) -> n, _ -> sql.refused(Mistyped(column, "an integer")) }
+pub fn int(row: Row, column: String) -> Int / {sql.fail} =
+  match column_value(row, column) {
+    IntDatum(n) -> n,
+    _ -> sql.fail(Mistyped(column, "an integer")),
+  }
 
 /// The float `column` holds. An integer is not one: a `STRICT` table's `REAL` column answers
 /// floats, and an expression is cast.
-pub fn float(row: Row, column: String) -> Float / {sql.refused} =
-  match held(row, column) { CFloat(x) -> x, _ -> sql.refused(Mistyped(column, "a float")) }
+pub fn float(row: Row, column: String) -> Float / {sql.fail} =
+  match column_value(row, column) { FloatDatum(x) -> x, _ -> sql.fail(Mistyped(column, "a float")) }
 
 /// The text `column` holds.
-pub fn text(row: Row, column: String) -> String / {sql.refused} =
-  match held(row, column) { CText(s) -> s, _ -> sql.refused(Mistyped(column, "text")) }
+pub fn text(row: Row, column: String) -> String / {sql.fail} =
+  match column_value(row, column) {
+    TextDatum(bare_statement) -> bare_statement,
+    _ -> sql.fail(Mistyped(column, "text")),
+  }
 
 /// The bytes `column` holds.
-pub fn bytes(row: Row, column: String) -> Bytes / {sql.refused} =
-  match held(row, column) { CBytes(b) -> b, _ -> sql.refused(Mistyped(column, "bytes")) }
+pub fn bytes(row: Row, column: String) -> Bytes / {sql.fail} =
+  match column_value(row, column) { BytesDatum(b) -> b, _ -> sql.fail(Mistyped(column, "bytes")) }
 
 /// `None` where `column` holds null, and what `read` reads of it otherwise:
 /// `optional(row, "note", sqlite::text)`.
@@ -585,8 +597,8 @@ pub fn optional<a | e>(
   row: Row,
   column: String,
   read: (Row, String) -> a / e,
-) -> Option<a> / {sql.refused | e} =
-  match held(row, column) { CNull -> None, _ -> Some(read(row, column)) }
+) -> Option<a> / {sql.fail | e} =
+  match column_value(row, column) { NullDatum -> None, _ -> Some(read(row, column)) }
 
 // --- The real handler --------------------------------------------------------------------
 
@@ -601,7 +613,7 @@ fn served<a | e>(
     go()
   } with {
     sqlite.open[*label](path, mode, options) -> {
-      let asked = sqlite_open(
+      let takes_write_lock = sqlite_open(
         label,
         path,
         mode_number(mode),
@@ -609,31 +621,31 @@ fn served<a | e>(
         options.busy_ms,
         options.statements,
       );
-      let opened = opened_read(job_wait(asked));
-      match opened { Ok(_) -> recorded(label, path, mode), Err(_) -> () };
+      let opened = decode_open_reply(job_wait(takes_write_lock));
+      match opened { Ok(_) -> record_opened_files(label, path, mode), Err(_) -> () };
       opened
     },
     sqlite.close[*label](conn) -> job_wait(sqlite_close(label, conn)) == b"\x01",
     sqlite.query[*label](conn, sql, params, limits) ->
-      reply_read(
-        job_wait(sqlite_query(label, conn, sql, scalars_written(params), limits_written(limits))),
+      decode_reply(
+        job_wait(sqlite_query(label, conn, sql, encode_scalars(params), encode_limits(limits))),
       ),
     sqlite.execute[*label](conn, sql, params, limits) ->
-      reply_read(
-        job_wait(sqlite_execute(label, conn, sql, scalars_written(params), limits_written(limits))),
+      decode_reply(
+        job_wait(sqlite_execute(label, conn, sql, encode_scalars(params), encode_limits(limits))),
       ),
     sqlite.control[*label](conn, step) ->
-      reply_read(job_wait(sqlite_control(label, conn, step_number(step)))),
+      decode_reply(job_wait(sqlite_control(label, conn, step_number(step)))),
     sqlite.backup[*label](conn, path) -> {
-      let reply = reply_read(job_wait(sqlite_backup(label, conn, path)));
+      let reply = decode_reply(job_wait(sqlite_backup(label, conn, path)));
       match reply.failure { None -> observed(label, path, 4), Some(_) -> () };
       reply
     },
     sqlite.cursor[*label](conn, sql, params, limits) ->
-      reply_read(
-        job_wait(sqlite_cursor(label, conn, sql, scalars_written(params), limits_written(limits))),
+      decode_reply(
+        job_wait(sqlite_cursor(label, conn, sql, encode_scalars(params), encode_limits(limits))),
       ),
-    sqlite.fetch[*label](conn, rows) -> reply_read(job_wait(sqlite_fetch(label, conn, rows))),
+    sqlite.fetch[*label](conn, rows) -> decode_reply(job_wait(sqlite_fetch(label, conn, rows))),
     sqlite.finish[*label](conn) -> job_wait(sqlite_finish(label, conn)) == b"\x01",
   }
 
@@ -694,7 +706,7 @@ fn mode_number(mode: Mode) -> Int = match mode { ReadOnly -> 0, ReadWrite -> 1, 
 /// What opening the database at `path` read for an observed test's record: the file and the log
 /// beside it, where it only reads, and else what it may write, the files the engine keeps beside
 /// it among them.
-fn recorded(label: String, path: String, mode: Mode) -> Unit / {native.read} =
+fn record_opened_files(label: String, path: String, mode: Mode) -> Unit / {native.read} =
   match mode {
     ReadOnly -> {
       observed(label, path, 0);
@@ -710,32 +722,32 @@ fn step_number(step: Control) -> Int =
 
 /// A value as the natives read one: its kind's byte, then a number's eight bytes or what text or
 /// bytes hold.
-fn scalar_written(s: Scalar) -> Bytes =
-  match s.kind {
-    1 -> b"\x01".concat(i64_be(s.int)),
-    2 -> b"\x02".concat(i64_be(bits_of_float(s.real))),
-    3 -> b"\x03".concat(s.bytes),
-    4 -> b"\x04".concat(s.bytes),
+fn encode_scalar(bare_statement: Scalar) -> Bytes =
+  match bare_statement.kind {
+    1 -> b"\x01".concat(i64_be(bare_statement.int)),
+    2 -> b"\x02".concat(i64_be(bits_of_float(bare_statement.real))),
+    3 -> b"\x03".concat(bare_statement.bytes),
+    4 -> b"\x04".concat(bare_statement.bytes),
     _ -> b"\x00",
   }
 
-fn scalars_written(params: List<Scalar>) -> Bytes = in_parts(params.map(scalar_written))
+fn encode_scalars(params: List<Scalar>) -> Bytes = encode_parts(params.map(encode_scalar))
 
-fn limits_written(l: Limits) -> Bytes =
+fn encode_limits(l: Limits) -> Bytes =
   Bytes::concat_all([l.sql_bytes, l.params, l.rows, l.bytes, l.steps].map(i64_be))
 
-fn scalar_read(flat: Bytes) -> Scalar / {abort.raise} = {
+fn decode_scalar(flat: Bytes) -> Scalar / {abort.raise} = {
   let rest = flat.slice(1, flat.len());
   match flat.at(0) {
-    1 -> { kind: 1, int: int_of(rest), real: 0.0, bytes: b"" },
-    2 -> { kind: 2, int: 0, real: Float::of_bits(int_of(rest)), bytes: b"" },
+    1 -> { kind: 1, int: decode_int(rest), real: 0.0, bytes: b"" },
+    2 -> { kind: 2, int: 0, real: Float::of_bits(decode_int(rest)), bytes: b"" },
     3 -> { kind: 3, int: 0, real: 0.0, bytes: rest },
     4 -> { kind: 4, int: 0, real: 0.0, bytes: rest },
     _ -> null_scalar(),
   }
 }
 
-fn failure_read(flat: Bytes) -> Failure / {abort.raise} =
+fn decode_failure(flat: Bytes) -> Failure / {abort.raise} =
   match parts(flat) {
     [kind, name, detail] ->
       {
@@ -747,23 +759,23 @@ fn failure_read(flat: Bytes) -> Failure / {abort.raise} =
   }
 
 /// What opening a database answered: byte 1 and the connection's number, or byte 0 and why not.
-fn opened_read(said: Bytes) -> Result<Int, Failure> / {abort.raise} = {
-  let rest = said.slice(1, said.len());
-  if said.at(0) == 1 { Ok(int_of(rest)) } else { Err(failure_read(rest)) }
+fn decode_open_reply(encoded: Bytes) -> Result<Int, Failure> / {abort.raise} = {
+  let rest = encoded.slice(1, encoded.len());
+  if encoded.at(0) == 1 { Ok(decode_int(rest)) } else { Err(decode_failure(rest)) }
 }
 
 /// A reply as the natives write one: parts of the columns, the rows, whether it could have
 /// written, the rows it changed, the row id it last inserted and its failure found.
-fn reply_read(said: Bytes) -> Reply / {abort.raise} =
-  match parts(said) {
+fn decode_reply(encoded: Bytes) -> Reply / {abort.raise} =
+  match parts(encoded) {
     [columns, rows, wrote, changed, last_row_id, failure] ->
       {
         columns: parts(columns).map(|c: Bytes| String::of_bytes_lossy(c)),
-        rows: parts(rows).map(|row: Bytes| parts(row).map(scalar_read)),
+        rows: parts(rows).map(|row: Bytes| parts(row).map(decode_scalar)),
         wrote: wrote == b"\x01",
-        changed: int_of(changed),
-        last_row_id: int_of(last_row_id),
-        failure: match found(failure) { Some(f) -> Some(failure_read(f)), None -> None },
+        changed: decode_int(changed),
+        last_row_id: decode_int(last_row_id),
+        failure: match found(failure) { Some(f) -> Some(decode_failure(f)), None -> None },
       },
     _ -> panic("a database native wrote no reply"),
   }
@@ -772,12 +784,12 @@ fn reply_read(said: Bytes) -> Reply / {abort.raise} =
 
 /// A statement a fold has open: the rows it answered, how many were fetched, and each page's
 /// bound in bytes.
-type Folding = { rows: List<List<Scalar>>, at: Int, bytes: Int }
+type OpenCursor = { rows: List<List<Scalar>>, at: Int, bytes: Int }
 
 /// A twin's connection. `saved` holds the image each open transaction and savepoint rolls back
 /// to, outermost first, and `working` the image the transaction has made; `base` is the image it
 /// began from and `writes` whether it holds the write lock.
-type Open = {
+type FakeConnection = {
   path: String,
   mode: Mode,
   strict: Bool,
@@ -785,12 +797,17 @@ type Open = {
   working: Bytes,
   base: Bytes,
   writes: Bool,
-  folding: Option<Folding>,
+  folding: Option<OpenCursor>,
 }
 
-type Twin = { files: Map<String, Bytes>, open: Map<Int, Open>, writer: Map<String, Int>, next: Int }
+type Twin = {
+  files: Map<String, Bytes>,
+  open: Map<Int, FakeConnection>,
+  writer: Map<String, Int>,
+  next: Int,
+}
 
-type Stepped = { twin: Twin, reply: Reply }
+type FakeStep = { twin: Twin, reply: Reply }
 
 /// The databases of one root, in memory: each path's bytes as a file would hold them, and the
 /// connections open on them.
@@ -801,14 +818,15 @@ pub fn memory() -> Memory =
   Memory({ files: Map::new(), open: Map::new(), writer: Map::new(), next: 1 })
 
 /// The bytes of the database at `path`, as a file would hold them: what was last committed.
-pub fn stored(m: Memory, path: String) -> Option<Bytes> = match m { Memory(t) -> t.files.get(path) }
+pub fn database_bytes(m: Memory, path: String) -> Option<Bytes> =
+  match m { Memory(t) -> t.files.get(path) }
 
 /// `m` with the database at `path` holding `image`, a database file's bytes.
-pub fn storing(m: Memory, path: String, image: Bytes) -> Memory =
+pub fn with_database_bytes(m: Memory, path: String, image: Bytes) -> Memory =
   match m { Memory(t) -> Memory({ ..t, files: t.files.insert(path, image) }) }
 
 /// What `go` answered over a twin, and the twin it left.
-pub type Over<a> = { value: a, memory: Memory }
+pub type RunResult<a> = { value: a, memory: Memory }
 
 /// `go` run over `m` as the root its row names, every operation answered by the engine over an
 /// image in memory. It performs nothing, so a test or a law over it needs no root and is
@@ -816,7 +834,7 @@ pub type Over<a> = { value: a, memory: Memory }
 pub fn on_memory<a, [d] | e>(
   m: Memory,
   go: () -> a / {sqlite.read[d], sqlite.write[d] | e},
-) -> Over<a> / {abort.raise | e bounded} =
+) -> RunResult<a> / {abort.raise | e bounded} =
   handle {
     go()
   } with {
@@ -832,34 +850,34 @@ pub fn on_memory<a, [d] | e>(
       now.open.contains(conn)
     },
     sqlite.query[d](conn, sql, params, limits) -> {
-      let s = twin_run(t, conn, sql, params, limits, true);
-      t = s.twin;
-      s.reply
+      let bare_statement = twin_run(t, conn, sql, params, limits, true);
+      t = bare_statement.twin;
+      bare_statement.reply
     },
     sqlite.execute[d](conn, sql, params, limits) -> {
-      let s = twin_run(t, conn, sql, params, limits, false);
-      t = s.twin;
-      s.reply
+      let bare_statement = twin_run(t, conn, sql, params, limits, false);
+      t = bare_statement.twin;
+      bare_statement.reply
     },
     sqlite.control[d](conn, step) -> {
-      let s = twin_control(t, conn, step);
-      t = s.twin;
-      s.reply
+      let bare_statement = twin_control(t, conn, step);
+      t = bare_statement.twin;
+      bare_statement.reply
     },
     sqlite.backup[d](conn, path) -> {
-      let s = twin_backup(t, conn, path);
-      t = s.twin;
-      s.reply
+      let bare_statement = twin_backup(t, conn, path);
+      t = bare_statement.twin;
+      bare_statement.reply
     },
     sqlite.cursor[d](conn, sql, params, limits) -> {
-      let s = twin_cursor(t, conn, sql, params, limits);
-      t = s.twin;
-      s.reply
+      let bare_statement = twin_cursor(t, conn, sql, params, limits);
+      t = bare_statement.twin;
+      bare_statement.reply
     },
     sqlite.fetch[d](conn, rows) -> {
-      let s = twin_fetch(t, conn, rows);
-      t = s.twin;
-      s.reply
+      let bare_statement = twin_fetch(t, conn, rows);
+      t = bare_statement.twin;
+      bare_statement.reply
     },
     sqlite.finish[d](conn) -> {
       let now = t;
@@ -879,18 +897,19 @@ pub fn in_memory<a, [d] | e>(
   go: () -> a / {sqlite.read[d], sqlite.write[d] | e},
 ) -> a / {abort.raise | e bounded} = on_memory[d](memory(), go).value
 
-fn quiet() -> Reply =
+fn empty_reply() -> Reply =
   { columns: [], rows: [], wrote: false, changed: 0, last_row_id: 0, failure: None }
 
-fn failing(kind: String, name: String, detail: String) -> Reply =
-  { ..quiet(), failure: Some({ kind: kind, name: name, detail: detail }) }
+fn failure_reply(kind: String, name: String, detail: String) -> Reply =
+  { ..empty_reply(), failure: Some({ kind: kind, name: name, detail: detail }) }
 
-fn unconnected() -> Reply = failing("closed", "", "no connection is open under this number")
+fn no_connection_reply() -> Reply =
+  failure_reply("closed", "", "no connection is open under this number")
 
-fn locked() -> Reply = failing("busy", "", "database is locked")
+fn busy_reply() -> Reply = failure_reply("busy", "", "database is locked")
 
-fn folded() -> Reply =
-  failing(
+fn cursor_open_reply() -> Reply =
+  failure_reply(
     "refused",
     "",
     "a fold is reading this connection: nothing else runs on it until the fold ends",
@@ -902,7 +921,7 @@ fn confined(path: String) -> String / {abort.raise} =
 fn committed(t: Twin, path: String) -> Bytes = t.files.get(path).unwrap_or(b"")
 
 /// The image a connection's next statement runs over: its transaction's, or the last committed.
-fn image_of(t: Twin, o: Open) -> Bytes =
+fn image_of(t: Twin, o: FakeConnection) -> Bytes =
   if o.saved.len() > 0 { o.working } else { committed(t, o.path) }
 
 fn written_by_another(t: Twin, path: String, conn: Int) -> Bool =
@@ -943,26 +962,26 @@ fn twin_close(t: Twin, conn: Int) -> Twin =
   }
 
 /// `t` with the write lock on a connection's database let go, where the connection holds it.
-fn unlocked(t: Twin, o: Open, conn: Int) -> Twin =
+fn unlocked(t: Twin, o: FakeConnection, conn: Int) -> Twin =
   if t.writer.get(o.path) == Some(conn) { { ..t, writer: t.writer.remove(o.path) } } else { t }
 
 /// What one statement over an image answered, and the image it left: the one handed in where it
 /// failed or only read.
-type Ran = { image: Bytes, reply: Reply }
+type StatementResult = { image: Bytes, reply: Reply }
 
 /// `sql` over the database `image` holds, as `sqlite_run` runs it.
-fn ran_over(
+fn run_on_image(
   image: Bytes,
   sql: String,
   params: List<Scalar>,
   reads_only: Bool,
   strict: Bool,
   limits: Limits,
-) -> Ran / {abort.raise} =
+) -> StatementResult / {abort.raise} =
   match parts(
-      sqlite_run(image, sql, scalars_written(params), reads_only, strict, limits_written(limits)),
+      sqlite_run(image, sql, encode_scalars(params), reads_only, strict, encode_limits(limits)),
     ) {
-    [left, reply] -> { image: found(left).unwrap_or(image), reply: reply_read(reply) },
+    [left, reply] -> { image: found(left).unwrap_or(image), reply: decode_reply(reply) },
     _ -> panic("the twin's engine wrote no reply"),
   }
 
@@ -973,11 +992,11 @@ fn twin_run(
   params: List<Scalar>,
   limits: Limits,
   querying: Bool,
-) -> Stepped / {abort.raise} =
+) -> FakeStep / {abort.raise} =
   match t.open.get(conn) {
-    None -> { twin: t, reply: unconnected() },
-    Some(o) -> if o.folding != None { { twin: t, reply: folded() } } else {
-      let ran = ran_over(
+    None -> { twin: t, reply: no_connection_reply() },
+    Some(o) -> if o.folding != None { { twin: t, reply: cursor_open_reply() } } else {
+      let ran = run_on_image(
         image_of(t, o),
         sql,
         params,
@@ -989,14 +1008,14 @@ fn twin_run(
         Some(f) -> if f.kind == "writes" && !querying {
           {
             twin: t,
-            reply: failing(
+            reply: failure_reply(
               "read_only",
               "",
               "this statement writes, and the connection was opened to read",
             ),
           }
         } else { { twin: t, reply: ran.reply } },
-        None -> if ran.reply.wrote { twin_written(t, conn, o, ran.image, ran.reply) }
+        None -> if ran.reply.wrote { fake_apply_write(t, conn, o, ran.image, ran.reply) }
         else { { twin: t, reply: ran.reply } },
       }
     },
@@ -1004,11 +1023,11 @@ fn twin_run(
 
 /// A statement that wrote, kept: where another connection holds the write lock, or wrote since
 /// this one's transaction began to read, it is `busy` and nothing is kept.
-fn twin_written(t: Twin, conn: Int, o: Open, image: Bytes, reply: Reply) -> Stepped =
-  if written_by_another(t, o.path, conn) { { twin: t, reply: locked() } }
+fn fake_apply_write(t: Twin, conn: Int, o: FakeConnection, image: Bytes, reply: Reply) -> FakeStep =
+  if written_by_another(t, o.path, conn) { { twin: t, reply: busy_reply() } }
   else if o.saved.len() == 0 {
     { twin: { ..t, files: t.files.insert(o.path, image) }, reply: reply }
-  } else if !o.writes && committed(t, o.path) != o.base { { twin: t, reply: locked() } } else {
+  } else if !o.writes && committed(t, o.path) != o.base { { twin: t, reply: busy_reply() } } else {
     {
       twin: {
         ..t,
@@ -1019,10 +1038,10 @@ fn twin_written(t: Twin, conn: Int, o: Open, image: Bytes, reply: Reply) -> Step
     }
   }
 
-fn twin_control(t: Twin, conn: Int, step: Control) -> Stepped =
+fn twin_control(t: Twin, conn: Int, step: Control) -> FakeStep =
   match t.open.get(conn) {
-    None -> { twin: t, reply: unconnected() },
-    Some(o) -> if o.folding != None { { twin: t, reply: folded() } } else {
+    None -> { twin: t, reply: no_connection_reply() },
+    Some(o) -> if o.folding != None { { twin: t, reply: cursor_open_reply() } } else {
       match step {
         Begin -> twin_begin(t, conn, o, true),
         BeginRead -> twin_begin(t, conn, o, false),
@@ -1032,18 +1051,19 @@ fn twin_control(t: Twin, conn: Int, step: Control) -> Stepped =
     },
   }
 
-/// `asked` is whether the write lock was asked for, which a connection opened to read never
+/// `takes_write_lock` is whether the write lock was asked for, which a connection opened to read never
 /// takes: its transaction reads, as the engine's does.
-fn twin_begin(t: Twin, conn: Int, o: Open, asked: Bool) -> Stepped = {
-  let writes = asked && o.mode != ReadOnly;
+fn twin_begin(t: Twin, conn: Int, o: FakeConnection, takes_write_lock: Bool) -> FakeStep = {
+  let writes = takes_write_lock && o.mode != ReadOnly;
   if o.saved.len() >= 32 {
-    { twin: t, reply: failing("refused", "", "a connection nests 32 transactions at most") }
+    { twin: t, reply: failure_reply("refused", "", "a connection nests 32 transactions at most") }
   } else if o.saved.len() > 0 {
     {
       twin: { ..t, open: t.open.insert(conn, { ..o, saved: o.saved.push(o.working) }) },
-      reply: quiet(),
+      reply: empty_reply(),
     }
-  } else if writes && written_by_another(t, o.path, conn) { { twin: t, reply: locked() } } else {
+  } else if writes && written_by_another(t, o.path, conn) { { twin: t, reply: busy_reply() } }
+  else {
     let image = committed(t, o.path);
     {
       twin: {
@@ -1057,49 +1077,54 @@ fn twin_begin(t: Twin, conn: Int, o: Open, asked: Bool) -> Stepped = {
         }),
         writer: if writes { t.writer.insert(o.path, conn) } else { t.writer },
       },
-      reply: quiet(),
+      reply: empty_reply(),
     }
   }
 }
 
 /// The innermost scope closed: kept, or rolled back to the image it began from.
-fn twin_end(t: Twin, conn: Int, o: Open, kept: Bool) -> Stepped = {
+fn twin_end(t: Twin, conn: Int, o: FakeConnection, kept: Bool) -> FakeStep = {
   let depth = o.saved.len();
-  if depth == 0 { { twin: t, reply: failing("refused", "", "no transaction is open") } }
+  if depth == 0 { { twin: t, reply: failure_reply("refused", "", "no transaction is open") } }
   else if depth > 1 {
     let outer = o.saved.slice(0, depth - 1);
     let working = if kept { o.working } else { o.saved.at(depth - 1).unwrap_or(o.working) };
     {
       twin: { ..t, open: t.open.insert(conn, { ..o, saved: outer, working: working }) },
-      reply: quiet(),
+      reply: empty_reply(),
     }
   } else {
     let files = if kept && o.writes { t.files.insert(o.path, o.working) } else { t.files };
     let ended = { ..o, saved: [], working: b"", base: b"", writes: false };
     {
       twin: { ..unlocked(t, o, conn), files: files, open: t.open.insert(conn, ended) },
-      reply: quiet(),
+      reply: empty_reply(),
     }
   }
 }
 
-fn twin_backup(t: Twin, conn: Int, path: String) -> Stepped / {abort.raise} =
+fn twin_backup(t: Twin, conn: Int, path: String) -> FakeStep / {abort.raise} =
   match t.open.get(conn) {
-    None -> { twin: t, reply: unconnected() },
+    None -> { twin: t, reply: no_connection_reply() },
     Some(o) -> {
       let to = confined(path);
-      if o.folding != None { { twin: t, reply: folded() } } else if o.saved.len() > 0 {
-        { twin: t, reply: failing("statement", "", "cannot VACUUM from within a transaction") }
+      if o.folding != None { { twin: t, reply: cursor_open_reply() } } else if o.saved.len() > 0 {
+        {
+          twin: t,
+          reply: failure_reply("statement", "", "cannot VACUUM from within a transaction"),
+        }
       } else if t.files.contains(to) {
         {
           twin: t,
-          reply: failing(
+          reply: failure_reply(
             "exists",
             "",
             "`" ++ path ++ "` is there already, and a backup writes a new file",
           ),
         }
-      } else { { twin: { ..t, files: t.files.insert(to, committed(t, o.path)) }, reply: quiet() } }
+      } else {
+        { twin: { ..t, files: t.files.insert(to, committed(t, o.path)) }, reply: empty_reply() }
+      }
     },
   }
 
@@ -1109,12 +1134,12 @@ fn twin_cursor(
   sql: String,
   params: List<Scalar>,
   limits: Limits,
-) -> Stepped / {abort.raise} =
+) -> FakeStep / {abort.raise} =
   match t.open.get(conn) {
-    None -> { twin: t, reply: unconnected() },
-    Some(o) -> if o.folding != None { { twin: t, reply: folded() } } else {
+    None -> { twin: t, reply: no_connection_reply() },
+    Some(o) -> if o.folding != None { { twin: t, reply: cursor_open_reply() } } else {
       // Every row at once: a page's bound is held to as each is fetched.
-      let ran = ran_over(image_of(t, o), sql, params, true, o.strict, {
+      let ran = run_on_image(image_of(t, o), sql, params, true, o.strict, {
         ..limits,
         bytes: 9223372036854775807,
       });
@@ -1124,30 +1149,33 @@ fn twin_cursor(
           let folding = Some({ rows: ran.reply.rows, at: 0, bytes: limits.bytes });
           {
             twin: { ..t, open: t.open.insert(conn, { ..o, folding: folding }) },
-            reply: { ..quiet(), columns: ran.reply.columns },
+            reply: { ..empty_reply(), columns: ran.reply.columns },
           }
         },
       }
     },
   }
 
-fn twin_fetch(t: Twin, conn: Int, rows: Int) -> Stepped =
+fn twin_fetch(t: Twin, conn: Int, rows: Int) -> FakeStep =
   match t.open.get(conn) {
-    None -> { twin: t, reply: unconnected() },
+    None -> { twin: t, reply: no_connection_reply() },
     Some(o) -> match o.folding {
-      None -> { twin: t, reply: failing("closed", "", "no fold is open on this connection") },
+      None -> { twin: t, reply: failure_reply("closed", "", "no fold is open on this connection") },
       Some(f) -> {
         let page = f.rows.slice(f.at, min(f.at + max(rows, 0), f.rows.len()));
         let size = page.fold(0, |n: Int, row: List<Scalar>|
-          row.fold(n, |m: Int, s: Scalar|
-            m + (if s.kind == 0 { 0 } else if s.kind < 3 { 8 } else { s.bytes.len() })));
+          row.fold(n, |m: Int, bare_statement: Scalar|
+            m
+              + (if bare_statement.kind == 0 { 0 }
+              else if bare_statement.kind < 3 { 8 }
+              else { bare_statement.bytes.len() })));
         if size > f.bytes {
-          { twin: t, reply: failing("too_large", "bytes", "more than its caller allowed") }
+          { twin: t, reply: failure_reply("too_large", "bytes", "more than its caller allowed") }
         } else {
           let folding = Some({ ..f, at: f.at + page.len() });
           {
             twin: { ..t, open: t.open.insert(conn, { ..o, folding: folding }) },
-            reply: { ..quiet(), rows: page },
+            reply: { ..empty_reply(), rows: page },
           }
         }
       },
@@ -1156,19 +1184,23 @@ fn twin_fetch(t: Twin, conn: Int, rows: Int) -> Stepped =
 
 // --- Properties --------------------------------------------------------------------------
 
-fn roomy() -> Limits = { sql_bytes: 10000, params: 100, rows: 1000, bytes: 1000000, steps: 100000 }
+fn generous_limits() -> Limits =
+  { sql_bytes: 10000, params: 100, rows: 1000, bytes: 1000000, steps: 100000 }
 
-fn plain() -> Options = { strict: true, busy_ms: 0, statements: 16 }
+fn strict_options() -> Options = { strict: true, busy_ms: 0, statements: 16 }
 
 /// What a column of any type holds after `p` is written to it, read back through the engine.
 fn kept(p: Param) -> Datum / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_hold[kept_value](opening[scratch]("v.db", Create, plain()), |c| close(c)) { conn -> {
-        execute(conn, bound(stmt("create table v (x any) strict"), []), roomy());
-        execute(conn, bound(stmt("insert into v (x) values (?1)"), [p]), roomy());
-        held(
-          query(conn, bound(stmt("select x from v"), []), roomy()).at(0).unwrap_or(Map::new()),
+      with_hold[kept_value](opening[scratch]("v.db", Create, strict_options()), |c|
+        close(c)) { conn -> {
+        execute(conn, bound(stmt("create table v (x any) strict"), []), generous_limits());
+        execute(conn, bound(stmt("insert into v (x) values (?1)"), [p]), generous_limits());
+        column_value(
+          query(conn, bound(stmt("select x from v"), []), generous_limits()).at(0).unwrap_or(
+            Map::new(),
+          ),
           "x",
         )
       } })
@@ -1178,28 +1210,38 @@ fn kept(p: Param) -> Datum / {abort.raise} = {
 
 test "a float written is the float read, and a NaN is stored as null" {
   gen::check(gen::float(), |p: Float|
-    agrees(|x: Float| kept(PFloat(x)), |x: Float| if x != x { CNull } else { CFloat(x) }, p))
+    agrees(
+      |x: Float| kept(FloatParameter(x)),
+      |x: Float| if x != x { NullDatum } else { FloatDatum(x) },
+      p,
+    ))
 }
 
 /// The integers a table holds once `ns` are inserted in a transaction that then raises.
 fn after_a_failed_transaction(ns: List<Int>) -> List<Int> / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_hold[rolled_back](opening[scratch]("t.db", Create, plain()), |c| close(c)) { conn -> {
-        execute(conn, bound(stmt("create table t (n integer) strict"), []), roomy());
-        execute(conn, bound(stmt("insert into t (n) values (7)"), []), roomy());
-        let gave_up: Result<Unit, Refusal> = try {
+      with_hold[rolled_back](opening[scratch]("t.db", Create, strict_options()), |c|
+        close(c)) { conn -> {
+        execute(conn, bound(stmt("create table t (n integer) strict"), []), generous_limits());
+        execute(conn, bound(stmt("insert into t (n) values (7)"), []), generous_limits());
+        let gave_up: Result<Unit, Error> = try {
           transaction(conn, || {
             ns.map(|n: Int|
-              execute(conn, bound(stmt("insert into t (n) values (?1)"), [PInt(n)]), roomy()));
-            sql.refused(Closed("the body gave up"))
+              execute(
+                conn,
+                bound(stmt("insert into t (n) values (?1)"), [IntParameter(n)]),
+                generous_limits(),
+              ));
+            sql.fail(Closed("the body gave up"))
           })
         };
-        query(conn, bound(stmt("select n from t order by rowid"), []), roomy()).map(|row: Row|
-          int(row, "n"))
+        query(conn, bound(stmt("select n from t order by rowid"), []), generous_limits()).map(
+          |row: Row| int(row, "n"),
+        )
       } })
   };
-  match read { Ok(held) -> held, Err(_) -> panic("the table was not read") }
+  match read { Ok(column_value) -> column_value, Err(_) -> panic("the table was not read") }
 }
 
 test "a transaction whose body raises changes nothing" {
@@ -1209,22 +1251,23 @@ test "a transaction whose body raises changes nothing" {
 
 /// How many rows a query limited to `limit` answers of a table of `held`, or -1 where it is
 /// refused.
-fn answered(held: Int, limit: Int) -> Int / {abort.raise} = {
+fn rows_returned(column_value: Int, limit: Int) -> Int / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_hold[limited](opening[scratch]("t.db", Create, plain()), |c| close(c)) { conn -> {
-        execute(conn, bound(stmt("create table t (n integer) strict"), []), roomy());
+      with_hold[limited](opening[scratch]("t.db", Create, strict_options()), |c|
+        close(c)) { conn -> {
+        execute(conn, bound(stmt("create table t (n integer) strict"), []), generous_limits());
         execute(
           conn,
           bound(
             stmt(
               "with recursive c(i) as (select 1 union all select i + 1 from c where i < ?1) insert into t select i from c where ?1 > 0",
             ),
-            [PInt(held)],
+            [IntParameter(column_value)],
           ),
-          roomy(),
+          generous_limits(),
         );
-        query(conn, bound(stmt("select n from t"), []), { ..roomy(), rows: limit }).len()
+        query(conn, bound(stmt("select n from t"), []), { ..generous_limits(), rows: limit }).len()
       } })
   };
   match read { Ok(n) -> n, Err(_) -> -1 }
@@ -1233,10 +1276,12 @@ fn answered(held: Int, limit: Int) -> Int / {abort.raise} = {
 // Each binder is folded into 0 to 23, so a law over every integer reads small tables.
 test "a query answers every row within its limit, and is refused past it" {
   gen::check(
-    gen::map2(gen::any_int(), gen::any_int(), |held: Int, limit: Int| { held: held, limit: limit }),
+    gen::map2(gen::any_int(), gen::any_int(), |column_value: Int, limit: Int|
+      { held: column_value, limit: limit }),
     |x: { held: Int, limit: Int }|
       agrees(
-        |c: { held: Int, limit: Int }| answered(rem_euclid(c.held, 24), rem_euclid(c.limit, 24)),
+        |c: { held: Int, limit: Int }|
+          rows_returned(rem_euclid(c.held, 24), rem_euclid(c.limit, 24)),
         |c: { held: Int, limit: Int }|
           if rem_euclid(c.held, 24) <= rem_euclid(c.limit, 24) { rem_euclid(c.held, 24) }
           else { -1 },
@@ -1245,7 +1290,7 @@ test "a query answers every row within its limit, and is refused past it" {
   )
 }
 
-fn unread() -> List<String> =
+fn clock_and_random_statements() -> List<String> =
   [
     "select random()",
     "select randomblob(4)",
@@ -1259,13 +1304,20 @@ fn unread() -> List<String> =
   ]
 
 /// Whether `bound` refuses the statement, before any connection is asked.
-fn refused_unrun(sql: String) -> Bool / {abort.raise} =
+fn refused_before_running(sql: String) -> Bool / {abort.raise} =
   match try { bound(stmt(sql), []) } { Err(Refused(_)) -> true, _ -> false }
 
 test "a statement that reads the clock or draws a random number is refused before it runs" {
   gen::check(gen::any_int(), |x: Int|
     agrees(
-      |i: Int| refused_unrun(unread().at(rem_euclid(i, unread().len())).unwrap_or("")),
+      |i: Int|
+        refused_before_running(
+          clock_and_random_statements().at(
+            rem_euclid(i, clock_and_random_statements().len()),
+          ).unwrap_or(
+            "",
+          ),
+        ),
       |_: Int| true,
       x,
     ))
@@ -1273,79 +1325,88 @@ test "a statement that reads the clock or draws a random number is refused befor
 
 // --- Tests -------------------------------------------------------------------------------
 
-fn s(sql: String) -> Bound / {sql.refused, abort.raise} = bound(stmt(sql), [])
+fn bare_statement(sql: String) -> Bound / {sql.fail, abort.raise} = bound(stmt(sql), [])
 
-fn numbers(rows: List<Row>, column: String) -> List<Int> / {sql.refused} =
+fn numbers(rows: List<Row>, column: String) -> List<Int> / {sql.fail} =
   rows.map(|row: Row| int(row, column))
 
-fn refusal<a | e>(go: () -> a / {sql.refused | e}) -> Option<Refusal> / e =
-  match try[sql.refused] { go() } { Ok(_) -> None, Err(why) -> Some(why) }
+fn refusal<a | e>(go: () -> a / {sql.fail | e}) -> Option<Error> / e =
+  match try[sql.fail] { go() } { Ok(_) -> None, Err(why) -> Some(why) }
 
 test "a database written and closed is read back when it is opened again" {
   let wrote = over_twin(memory(), ||
-    with_hold[first](opening[app]("data/app.db", Create, plain()), |c| close(c)) { conn -> {
+    with_hold[first](opening[app]("data/app.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(
         conn,
-        s("create table person (id integer primary key, name text not null) strict"),
-        roomy(),
+        bare_statement("create table person (id integer primary key, name text not null) strict"),
+        generous_limits(),
       );
-      execute(conn, bound(stmt("insert into person (name) values (?1)"), [PText("Ada")]), roomy())
+      execute(
+        conn,
+        bound(stmt("insert into person (name) values (?1)"), [TextParameter("Ada")]),
+        generous_limits(),
+      )
     } });
   let left = match wrote { Ok(over) -> over, Err(_) -> panic("the database was not written") };
   assert_eq(left.value, { rows: 1, last_row_id: 1 });
   let names = in_twin(left.memory, ||
-    with_hold[second](opening[app]("data/app.db", ReadOnly, plain()), |c| close(c)) { conn ->
-      query(conn, s("select id, name from person"), roomy()).map(|row: Row| text(row, "name"))
+    with_hold[second](opening[app]("data/app.db", ReadOnly, strict_options()), |c|
+      close(c)) { conn ->
+      query(conn, bare_statement("select id, name from person"), generous_limits()).map(
+        |row: Row| text(row, "name"),
+      )
     });
   assert_eq(names, Ok(["Ada"]))
 }
 
 fn over_twin<a>(
   m: Memory,
-  go: () -> a / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise},
-) -> Result<Over<a>, Refusal> / {abort.raise} = try[sql.refused] { on_memory[app](m, go) }
+  go: () -> a / {sqlite.read[app], sqlite.write[app], sql.fail, abort.raise},
+) -> Result<RunResult<a>, Error> / {abort.raise} = try[sql.fail] { on_memory[app](m, go) }
 
 fn in_twin<a>(
   m: Memory,
-  go: () -> a / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise},
-) -> Result<a, Refusal> / {abort.raise} = try[sql.refused] { on_memory[app](m, go).value }
+  go: () -> a / {sqlite.read[app], sqlite.write[app], sql.fail, abort.raise},
+) -> Result<a, Error> / {abort.raise} = try[sql.fail] { on_memory[app](m, go).value }
 
 fn fresh<a>(
-  go: () -> a / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise},
-) -> Result<a, Refusal> / {abort.raise} = in_twin(memory(), go)
+  go: () -> a / {sqlite.read[app], sqlite.write[app], sql.fail, abort.raise},
+) -> Result<a, Error> / {abort.raise} = in_twin(memory(), go)
 
 test "a database that is not there opens only to be made" {
   assert_eq(
     fresh(||
-      with_hold[missing](opening[app]("no.db", ReadWrite, plain()), |c| close(c)) { conn -> 1 }),
+      with_hold[missing](opening[app]("no.db", ReadWrite, strict_options()), |c|
+        close(c)) { conn -> 1 }),
     Err(Unopened("unable to open database file")),
   );
   assert_eq(
-    fresh(|| with_hold[made](opening[app]("no.db", Create, plain()), |c| close(c)) { conn -> 1 }),
+    fresh(||
+      with_hold[made](opening[app]("no.db", Create, strict_options()), |c| close(c)) { conn -> 1 }),
     Ok(1),
   )
 }
 
 test "each kind of value is read by its reader, and null through optional" {
   let read = fresh(||
-    with_hold[typed](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
+    with_hold[typed](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(
         conn,
-        s("create table v (i integer, r real, t text, b blob, n text) strict"),
-        roomy(),
+        bare_statement("create table v (i integer, r real, t text, b blob, n text) strict"),
+        generous_limits(),
       );
       execute(
         conn,
         bound(stmt("insert into v values (?1, ?2, ?3, ?4, ?5)"), [
-          PInt(-9223372036854775807 - 1),
-          PFloat(1.5),
-          PText("a\0b \u{1F600}"),
-          PBytes(b"\x00\xff"),
-          PNull,
+          IntParameter(-9223372036854775807 - 1),
+          FloatParameter(1.5),
+          TextParameter("a\0b \u{1F600}"),
+          BytesParameter(b"\x00\xff"),
+          NullParameter,
         ]),
-        roomy(),
+        generous_limits(),
       );
-      let rows = query(conn, s("select i, r, t, b, n from v"), roomy());
+      let rows = query(conn, bare_statement("select i, r, t, b, n from v"), generous_limits());
       let row = rows.at(0).unwrap_or(Map::new());
       {
         i: int(row, "i"),
@@ -1375,43 +1436,50 @@ test "each kind of value is read by its reader, and null through optional" {
 
 test "a boolean is bound as 1 or 0, and what SQLite does not store is refused" {
   let read = fresh(||
-    with_hold[bools](opening[app]("t.db", Create, plain()), |c| close(c)) { conn ->
+    with_hold[bools](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
       numbers(
         query(
           conn,
-          bound(stmt("select ?1 as a union all select ?2"), [PBool(true), PBool(false)]),
-          roomy(),
+          bound(stmt("select ?1 as a union all select ?2"), [
+            BoolParameter(true),
+            BoolParameter(false),
+          ]),
+          generous_limits(),
         ),
         "a",
       )
     });
   assert_eq(read, Ok([1, 0]));
-  let unbound = refusal(|| bound(stmt("select ?1"), [PNumeric(1.50m)]));
+  let unbound = refusal(|| bound(stmt("select ?1"), [NumericParameter(1.50m)]));
   assert(match unbound { Some(Refused(_)) -> true, _ -> false })
 }
 
 test "a transaction commits when its body returns and rolls back when it raises" {
   let read = fresh(||
-    with_hold[txn](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
-      execute(conn, s("create table t (n integer) strict"), roomy());
-      transaction(conn, || execute(conn, s("insert into t values (1)"), roomy()));
+    with_hold[txn](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+      transaction(conn, ||
+        execute(conn, bare_statement("insert into t values (1)"), generous_limits()));
       let failed = refusal(||
         transaction(conn, || {
-          execute(conn, s("insert into t values (2)"), roomy());
-          execute(conn, s("insert into t values ('two')"), roomy())
+          execute(conn, bare_statement("insert into t values (2)"), generous_limits());
+          execute(conn, bare_statement("insert into t values ('two')"), generous_limits())
         }));
       let inner = transaction(conn, || {
-        execute(conn, s("insert into t values (3)"), roomy());
+        execute(conn, bare_statement("insert into t values (3)"), generous_limits());
         let gave_up = refusal(||
           transaction(conn, || {
-            execute(conn, s("insert into t values (4)"), roomy());
-            sql.refused(Closed("no"))
+            execute(conn, bare_statement("insert into t values (4)"), generous_limits());
+            sql.fail(Closed("no"))
           }));
-        execute(conn, s("insert into t values (5)"), roomy());
+        execute(conn, bare_statement("insert into t values (5)"), generous_limits());
         gave_up
       });
       {
-        held: numbers(query(conn, s("select n from t order by n"), roomy()), "n"),
+        held: numbers(
+          query(conn, bare_statement("select n from t order by n"), generous_limits()),
+          "n",
+        ),
         failed: failed,
         inner: inner,
       }
@@ -1424,22 +1492,29 @@ test "a transaction commits when its body returns and rolls back when it raises"
 
 test "a second writer is Busy, and a reader sees what was committed" {
   let read = fresh(||
-    with_hold[writer](opening[app]("t.db", Create, plain()), |c| close(c)) { one ->
-      with_hold[reader](opening[app]("t.db", ReadWrite, plain()), |c| close(c)) { two -> {
-        execute(one, s("create table t (n integer) strict"), roomy());
-        execute(one, s("insert into t values (1)"), roomy());
+    with_hold[writer](opening[app]("t.db", Create, strict_options()), |c| close(c)) { one ->
+      with_hold[reader](opening[app]("t.db", ReadWrite, strict_options()), |c| close(c)) { two -> {
+        execute(one, bare_statement("create table t (n integer) strict"), generous_limits());
+        execute(one, bare_statement("insert into t values (1)"), generous_limits());
         let during = transaction(one, || {
-          execute(one, s("insert into t values (2)"), roomy());
+          execute(one, bare_statement("insert into t values (2)"), generous_limits());
           {
-            seen: numbers(query(two, s("select n from t order by n"), roomy()), "n"),
-            written: refusal(|| execute(two, s("insert into t values (3)"), roomy())),
+            seen: numbers(
+              query(two, bare_statement("select n from t order by n"), generous_limits()),
+              "n",
+            ),
+            written: refusal(||
+              execute(two, bare_statement("insert into t values (3)"), generous_limits())),
             begun: refusal(|| transaction(two, || 0)),
           }
         });
         {
           during: during,
-          after: numbers(query(two, s("select n from t order by n"), roomy()), "n"),
-          then: execute(two, s("insert into t values (3)"), roomy()).rows,
+          after: numbers(
+            query(two, bare_statement("select n from t order by n"), generous_limits()),
+            "n",
+          ),
+          then: execute(two, bare_statement("insert into t values (3)"), generous_limits()).rows,
         }
       } }
     });
@@ -1453,16 +1528,17 @@ test "a second writer is Busy, and a reader sees what was committed" {
 
 test "a snapshot reads one state, and its write is Busy once another has written" {
   let read = fresh(||
-    with_hold[snap](opening[app]("t.db", Create, plain()), |c| close(c)) { one ->
-      with_hold[other](opening[app]("t.db", ReadWrite, plain()), |c| close(c)) { two -> {
-        execute(one, s("create table t (n integer) strict"), roomy());
+    with_hold[snap](opening[app]("t.db", Create, strict_options()), |c| close(c)) { one ->
+      with_hold[other](opening[app]("t.db", ReadWrite, strict_options()), |c| close(c)) { two -> {
+        execute(one, bare_statement("create table t (n integer) strict"), generous_limits());
         snapshot(one, || {
-          let before = query(one, s("select n from t"), roomy()).len();
-          execute(two, s("insert into t values (1)"), roomy());
+          let before = query(one, bare_statement("select n from t"), generous_limits()).len();
+          execute(two, bare_statement("insert into t values (1)"), generous_limits());
           {
             before: before,
-            still: query(one, s("select n from t"), roomy()).len(),
-            stale: refusal(|| execute(one, s("insert into t values (2)"), roomy())),
+            still: query(one, bare_statement("select n from t"), generous_limits()).len(),
+            stale: refusal(||
+              execute(one, bare_statement("insert into t values (2)"), generous_limits())),
           }
         })
       } }
@@ -1470,76 +1546,85 @@ test "a snapshot reads one state, and its write is Busy once another has written
   assert_eq(read, Ok({ before: 0, still: 0, stale: Some(Busy) }))
 }
 
-type Broken = { sql: String, why: Refusal }
+type ViolationCase = { sql: String, reason: Error }
 
-fn broken() -> List<Broken> =
+fn violation_cases() -> List<ViolationCase> =
   [
-    { sql: "insert into p values (2, 'a')", why: Constraint(Unique, "p.code") },
-    { sql: "insert into p values (1, 'b')", why: Constraint(Unique, "p.id") },
-    { sql: "insert into p (code) values (null)", why: Constraint(NotNull, "p.code") },
-    { sql: "insert into c (p, n) values (1, 0)", why: Constraint(Check, "positive") },
-    { sql: "insert into c (p, n) values (9, 1)", why: Constraint(ForeignKey, "") },
-    { sql: "insert into c (p, n) values (1, 'many')", why: Constraint(Datatype, "c.n") },
-    { sql: "delete from p", why: Constraint(ForeignKey, "") },
+    { sql: "insert into p values (2, 'a')", reason: Constraint(Unique, "p.code") },
+    { sql: "insert into p values (1, 'b')", reason: Constraint(Unique, "p.id") },
+    { sql: "insert into p (code) values (null)", reason: Constraint(NotNull, "p.code") },
+    { sql: "insert into c (p, n) values (1, 0)", reason: Constraint(Check, "positive") },
+    { sql: "insert into c (p, n) values (9, 1)", reason: Constraint(ForeignKey, "") },
+    { sql: "insert into c (p, n) values (1, 'many')", reason: Constraint(Datatype, "c.n") },
+    { sql: "delete from p", reason: Constraint(ForeignKey, "") },
   ]
 
-test "{c.sql} breaks the constraint it names" for c: Broken in broken() {
+test "{c.sql} breaks the constraint it names" for c: ViolationCase in violation_cases() {
   let read = fresh(||
-    with_hold[constrained](opening[app]("t.db", Create, plain()), |x| close(x)) { conn -> {
+    with_hold[constrained](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
       execute(
         conn,
-        s("create table p (id integer primary key, code text not null unique) strict"),
-        roomy(),
+        bare_statement("create table p (id integer primary key, code text not null unique) strict"),
+        generous_limits(),
       );
       execute(
         conn,
-        s(
+        bare_statement(
           "create table c (id integer primary key, p integer not null references p (id), n integer, constraint positive check (n > 0)) strict",
         ),
-        roomy(),
+        generous_limits(),
       );
-      execute(conn, s("insert into p values (1, 'a')"), roomy());
-      execute(conn, s("insert into c (p, n) values (1, 1)"), roomy());
-      refusal(|| execute(conn, s(c.sql), roomy()))
+      execute(conn, bare_statement("insert into p values (1, 'a')"), generous_limits());
+      execute(conn, bare_statement("insert into c (p, n) values (1, 1)"), generous_limits());
+      refusal(|| execute(conn, bare_statement(c.sql), generous_limits()))
     } });
-  assert_eq(read, Ok(Some(c.why)))
+  assert_eq(read, Ok(Some(c.reason)))
 }
 
 test "each limit refuses what passes it, by its name" {
   let read = fresh(||
-    with_hold[bounded](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
-      execute(conn, s("create table t (n integer) strict"), roomy());
-      execute(conn, s("insert into t values (1), (2), (3)"), roomy());
+    with_hold[bounded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+      execute(conn, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
       [
-        refusal(|| query(conn, s("select n from t"), { ..roomy(), rows: 2 })),
-        refusal(|| query(conn, s("select 'abcdef' as a"), { ..roomy(), bytes: 5 })),
-        refusal(|| query(conn, s("select 1 as a"), { ..roomy(), sql_bytes: 5 })),
         refusal(||
-          query(conn, bound(stmt("select ?1 as a, ?2 as b"), [PInt(1), PInt(2)]), {
-            ..roomy(),
-            params: 1,
-          })),
+          query(conn, bare_statement("select n from t"), { ..generous_limits(), rows: 2 })),
+        refusal(||
+          query(conn, bare_statement("select 'abcdef' as a"), { ..generous_limits(), bytes: 5 })),
+        refusal(||
+          query(conn, bare_statement("select 1 as a"), { ..generous_limits(), sql_bytes: 5 })),
         refusal(||
           query(
             conn,
-            s(
+            bound(stmt("select ?1 as a, ?2 as b"), [IntParameter(1), IntParameter(2)]),
+            { ..generous_limits(), params: 1 },
+          )),
+        refusal(||
+          query(
+            conn,
+            bare_statement(
               "with recursive c(i) as (select 1 union all select i + 1 from c where i < 1000000) select count(*) as n from c",
             ),
-            { ..roomy(), steps: 10 },
+            { ..generous_limits(), steps: 10 },
           )),
-        refusal(|| returning(conn, s("delete from t returning n"), { ..roomy(), rows: 1 })),
-        refusal(|| query(conn, s("select n from t"), { ..roomy(), rows: 3 })),
+        refusal(||
+          returning(conn, bare_statement("delete from t returning n"), {
+            ..generous_limits(),
+            rows: 1,
+          })),
+        refusal(||
+          query(conn, bare_statement("select n from t"), { ..generous_limits(), rows: 3 })),
       ]
     } });
   assert_eq(
     read,
     Ok([
-      Some(Over("rows")),
-      Some(Over("bytes")),
-      Some(Over("sql_bytes")),
-      Some(Over("params")),
-      Some(Over("steps")),
-      Some(Over("rows")),
+      Some(RunResult("rows")),
+      Some(RunResult("bytes")),
+      Some(RunResult("sql_bytes")),
+      Some(RunResult("params")),
+      Some(RunResult("steps")),
+      Some(RunResult("rows")),
       None,
     ]),
   )
@@ -1547,47 +1632,72 @@ test "each limit refuses what passes it, by its name" {
 
 test "a write refused for what it answered leaves nothing behind" {
   let read = fresh(||
-    with_hold[undone](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
-      execute(conn, s("create table t (n integer) strict"), roomy());
-      execute(conn, s("insert into t values (1), (2), (3)"), roomy());
+    with_hold[undone](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+      execute(conn, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
       let over = refusal(||
-        returning(conn, s("delete from t returning n"), { ..roomy(), rows: 1 }));
-      let gone = numbers(returning(conn, s("delete from t where n = 2 returning n"), roomy()), "n");
+        returning(conn, bare_statement("delete from t returning n"), {
+          ..generous_limits(),
+          rows: 1,
+        }));
+      let gone = numbers(
+        returning(conn, bare_statement("delete from t where n = 2 returning n"), generous_limits()),
+        "n",
+      );
       {
         over: over,
         gone: gone,
-        left: numbers(query(conn, s("select n from t order by n"), roomy()), "n"),
+        left: numbers(
+          query(conn, bare_statement("select n from t order by n"), generous_limits()),
+          "n",
+        ),
       }
     } });
-  assert_eq(read, Ok({ over: Some(Over("rows")), gone: [2], left: [1, 3] }))
+  assert_eq(read, Ok({ over: Some(RunResult("rows")), gone: [2], left: [1, 3] }))
 }
 
 test "fold_rows reads every row a page at a time and nothing else runs meanwhile" {
   let read = fresh(||
-    with_hold[folding](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
-      execute(conn, s("create table t (n integer) strict"), roomy());
+    with_hold[folding](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       execute(
         conn,
-        s(
+        bare_statement(
           "with recursive c(i) as (select 1 union all select i + 1 from c where i < 10) insert into t select i from c",
         ),
-        roomy(),
+        generous_limits(),
       );
-      let all = s("select n from t order by n");
+      let all = bare_statement("select n from t order by n");
       let counted = |acc: Int, _: Row| acc + 1;
       {
-        sum: fold_rows(conn, all, roomy(), 3, 0, |acc: Int, row: Row| acc + int(row, "n")),
-        whole: fold_rows(conn, all, roomy(), 10, 0, counted),
-        none: fold_rows(conn, s("select n from t where n > 99"), roomy(), 4, 0, counted),
-        over: refusal(|| fold_rows(conn, all, { ..roomy(), rows: 7 }, 3, 0, counted)),
+        sum: fold_rows(conn, all, generous_limits(), 3, 0, |acc: Int, row: Row|
+          acc + int(row, "n")),
+        whole: fold_rows(conn, all, generous_limits(), 10, 0, counted),
+        none: fold_rows(
+          conn,
+          bare_statement("select n from t where n > 99"),
+          generous_limits(),
+          4,
+          0,
+          counted,
+        ),
+        over: refusal(|| fold_rows(conn, all, { ..generous_limits(), rows: 7 }, 3, 0, counted)),
         meanwhile: is_refused(
-          fold_rows(conn, all, roomy(), 20, None, |_: Option<Refusal>, _: Row|
-            refusal(|| query(conn, s("select 1 as a"), roomy()))),
+          fold_rows(conn, all, generous_limits(), 20, None, |_: Option<Error>, _: Row|
+            refusal(|| query(conn, bare_statement("select 1 as a"), generous_limits()))),
         ),
         writes: is_refused(
-          refusal(|| fold_rows(conn, s("delete from t returning n"), roomy(), 3, 0, counted)),
+          refusal(||
+            fold_rows(
+              conn,
+              bare_statement("delete from t returning n"),
+              generous_limits(),
+              3,
+              0,
+              counted,
+            )),
         ),
-        after: query(conn, all, roomy()).len(),
+        after: query(conn, all, generous_limits()).len(),
       }
     } });
   assert_eq(
@@ -1596,7 +1706,7 @@ test "fold_rows reads every row a page at a time and nothing else runs meanwhile
       sum: 55,
       whole: 10,
       none: 0,
-      over: Some(Over("rows")),
+      over: Some(RunResult("rows")),
       meanwhile: true,
       writes: true,
       after: 10,
@@ -1604,15 +1714,15 @@ test "fold_rows reads every row a page at a time and nothing else runs meanwhile
   )
 }
 
-fn is_refused(why: Option<Refusal>) -> Bool = match why { Some(Refused(_)) -> true, _ -> false }
+fn is_refused(why: Option<Error>) -> Bool = match why { Some(Refused(_)) -> true, _ -> false }
 
 test "a backup is a database of its own, and writes over nothing" {
   let made = over_twin(memory(), ||
-    with_hold[source](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
-      execute(conn, s("create table t (n integer) strict"), roomy());
-      execute(conn, s("insert into t values (1)"), roomy());
+    with_hold[source](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+      execute(conn, bare_statement("insert into t values (1)"), generous_limits());
       backup(conn, "copies/t.db");
-      execute(conn, s("insert into t values (2)"), roomy());
+      execute(conn, bare_statement("insert into t values (2)"), generous_limits());
       {
         again: is_refused(refusal(|| backup(conn, "copies/t.db"))),
         inside: refusal(|| transaction(conn, || backup(conn, "copies/u.db"))),
@@ -1624,26 +1734,34 @@ test "a backup is a database of its own, and writes over nothing" {
     inside: Some(Malformed("cannot VACUUM from within a transaction")),
   });
   let copy = in_twin(left.memory, ||
-    with_hold[copied](opening[app]("copies/t.db", ReadOnly, plain()), |c| close(c)) { conn ->
-      numbers(query(conn, s("select n from t"), roomy()), "n")
+    with_hold[copied](opening[app]("copies/t.db", ReadOnly, strict_options()), |c|
+      close(c)) { conn ->
+      numbers(query(conn, bare_statement("select n from t"), generous_limits()), "n")
     });
   assert_eq(copy, Ok([1]));
-  assert(stored(left.memory, "copies/u.db") == None);
-  assert(stored(left.memory, "copies/t.db") != stored(left.memory, "t.db"))
+  assert(database_bytes(left.memory, "copies/u.db") == None);
+  assert(database_bytes(left.memory, "copies/t.db") != database_bytes(left.memory, "t.db"))
 }
 
 test "a connection opened to read writes nothing, and a query never writes" {
   let read = fresh(|| {
-    with_hold[seeded](opening[app]("t.db", Create, plain()), |c| close(c)) { conn ->
-      execute(conn, s("create table t (n integer) strict"), roomy())
+    with_hold[seeded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits())
     };
-    with_hold[reading](opening[app]("t.db", ReadOnly, plain()), |c| close(c)) { conn ->
+    with_hold[reading](opening[app]("t.db", ReadOnly, strict_options()), |c| close(c)) { conn ->
       [
-        refusal(|| execute(conn, s("insert into t values (1)"), roomy())),
-        refusal(|| query(conn, s("insert into t values (1) returning n"), roomy())),
-        refusal(|| transaction(conn, || execute(conn, s("insert into t values (1)"), roomy()))),
-        refusal(|| transaction(conn, || query(conn, s("select n from t"), roomy()).len())),
-        refusal(|| snapshot(conn, || query(conn, s("select n from t"), roomy()).len())),
+        refusal(|| execute(conn, bare_statement("insert into t values (1)"), generous_limits())),
+        refusal(||
+          query(conn, bare_statement("insert into t values (1) returning n"), generous_limits())),
+        refusal(||
+          transaction(conn, ||
+            execute(conn, bare_statement("insert into t values (1)"), generous_limits()))),
+        refusal(||
+          transaction(conn, ||
+            query(conn, bare_statement("select n from t"), generous_limits()).len())),
+        refusal(||
+          snapshot(conn, ||
+            query(conn, bare_statement("select n from t"), generous_limits()).len())),
       ]
     }
   });
@@ -1657,9 +1775,11 @@ test "a strict connection refuses a table that is not, and another takes it" {
   let made = |strict: Bool|
     fresh(||
       with_hold[strictness](
-        opening[app]("t.db", Create, { ..plain(), strict: strict }),
+        opening[app]("t.db", Create, { ..strict_options(), strict: strict }),
         |c| close(c),
-      ) { conn -> refusal(|| execute(conn, s("create table loose (a)"), roomy())) });
+      ) { conn ->
+        refusal(|| execute(conn, bare_statement("create table loose (a)"), generous_limits()))
+      });
   assert(match made(true) { Ok(Some(Refused(_))) -> true, _ -> false });
   assert_eq(made(false), Ok(None))
 }
@@ -1677,30 +1797,49 @@ fn engine_refuses() -> List<String> =
 
 test "the engine refuses {c}, which the reader cannot tell" for c: String in engine_refuses() {
   let read = fresh(||
-    with_hold[authorized](opening[app]("t.db", Create, plain()), |x| close(x)) { conn -> {
-      execute(conn, s("create table t (n integer) strict"), roomy());
-      let params = if c.contains("?1") { [PText("now")] } else { [] };
-      refusal(|| execute(conn, bound(stmt(c), params), roomy()))
+    with_hold[authorized](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
+      execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
+      let params = if c.contains("?1") { [TextParameter("now")] } else { [] };
+      refusal(|| execute(conn, bound(stmt(c), params), generous_limits()))
     } });
   assert(match read { Ok(Some(Refused(_))) -> true, _ -> false })
 }
 
 test "a view and a trigger are held to what a statement is" {
   let read = fresh(||
-    with_hold[smuggled](opening[app]("t.db", Create, plain()), |c| close(c)) { conn -> {
-      execute(conn, s("create table t (n integer, at text) strict"), roomy());
-      execute(conn, s("create view stamped as select datetime(at) as at from t"), roomy());
+    with_hold[smuggled](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(
         conn,
-        s(
+        bare_statement("create table t (n integer, at text) strict"),
+        generous_limits(),
+      );
+      execute(
+        conn,
+        bare_statement("create view stamped as select datetime(at) as at from t"),
+        generous_limits(),
+      );
+      execute(
+        conn,
+        bare_statement(
           "create trigger stamp after insert on t begin update t set at = datetime(new.at, '+1 day'); end",
         ),
-        roomy(),
+        generous_limits(),
       );
-      execute(conn, s("insert into t values (1, '2024-01-31 12:00:00')"), roomy());
-      let kept = query(conn, s("select at from stamped"), roomy()).map(|row: Row| text(row, "at"));
-      let now = refusal(|| execute(conn, s("insert into t values (2, 'now')"), roomy()));
-      { kept: kept, now: now, held: query(conn, s("select n from t"), roomy()).len() }
+      execute(
+        conn,
+        bare_statement("insert into t values (1, '2024-01-31 12:00:00')"),
+        generous_limits(),
+      );
+      let kept = query(conn, bare_statement("select at from stamped"), generous_limits()).map(
+        |row: Row| text(row, "at"),
+      );
+      let now = refusal(||
+        execute(conn, bare_statement("insert into t values (2, 'now')"), generous_limits()));
+      {
+        kept: kept,
+        now: now,
+        held: query(conn, bare_statement("select n from t"), generous_limits()).len(),
+      }
     } });
   assert(match read {
     Ok(r) ->
@@ -1715,7 +1854,7 @@ test "a tagged literal's holes are its parameters, and its text is placed where 
     compile(["select n from t where a = ", " and b = ", ""]),
     Ok(stmt("select n from t where a = ?1 and b = ?2")),
   );
-  let filled = fill(stmt("select ?1 as a, ?2 as b"), [PInt(1), PText("x")]);
+  let filled = fill(stmt("select ?1 as a, ?2 as b"), [IntParameter(1), TextParameter("x")]);
   assert_eq(statement(filled), stmt("select ?1 as a, ?2 as b"));
   let placed_at = |texts: List<String>|
     match compile(texts) { Err(e) -> Some({ part: e.part, offset: e.offset }), Ok(_) -> None };
@@ -1729,18 +1868,18 @@ test "a tagged literal's holes are its parameters, and its text is placed where 
 test "a path that leaves its root is refused in E0452's words" {
   let escaped = try[abort.raise] {
     fresh(||
-      with_hold[escaping](opening[app]("../t.db", Create, plain()), |c| close(c)) { conn -> 0 })
+      with_hold[escaping](opening[app]("../t.db", Create, strict_options()), |c|
+        close(c)) { conn -> 0 })
   };
   assert_eq(escaped, Err("`../t.db` leaves the root it was given"))
 }
 
 test "what was closed, and what was never opened, is Closed" {
   let read = fresh(|| {
-    let kept = with_hold[leaving](opening[app]("t.db", Create, plain()), |c| close(c)) { conn ->
-      conn.get()
-    };
+    let kept = with_hold[leaving](opening[app]("t.db", Create, strict_options()), |c|
+      close(c)) { conn -> conn.get() };
     with_hold[again](kept, |_: Connection<[app]>| ()) { conn ->
-      refusal(|| query(conn, s("select 1 as a"), roomy()))
+      refusal(|| query(conn, bare_statement("select 1 as a"), generous_limits()))
     }
   });
   assert(match read { Ok(Some(Closed(_))) -> true, _ -> false })

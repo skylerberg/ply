@@ -3,24 +3,25 @@
 
 import std.hash (blake3)
 import compiler.store.memo
-import compiler.store.memo (Query, Held, Run, memo, answer, started, key_of, ran_for, ran_total,
-                            nothing_held, over_held, packed_of, read_whole)
+import compiler.store.memo (Query, MemoryStore, Run, memo, query_output, start_run, key_of,
+                            executed_for, executed_count, empty_memory_store, with_memory_store,
+                            pack_memory_store, read_file)
 import compiler.store.packs
 
 /// The files a test's runs read, and the store they leave.
-type State = { files: Map<Bytes, Bytes>, held: Held }
+type State = { files: Map<Bytes, Bytes>, held: MemoryStore }
 
 fn state(files: List<{ at: Bytes, text: Bytes }>) -> State =
   {
     files: files.fold(Map::new(), |acc: Map<Bytes, Bytes>, f: { at: Bytes, text: Bytes }|
       acc.insert(f.at, f.text)),
-    held: nothing_held(),
+    held: empty_memory_store(),
   }
 
 fn edited(s: State, at: Bytes, text: Bytes) -> State = { ..s, files: s.files.insert(at, text) }
 
 /// `s`'s files over an empty store.
-fn emptied(s: State) -> State = { ..s, held: nothing_held() }
+fn emptied(s: State) -> State = { ..s, held: empty_memory_store() }
 
 fn files_of(s: State) -> Bytes =
   Bytes::concat_all(
@@ -28,8 +29,8 @@ fn files_of(s: State) -> Bytes =
       acc.push(at).push(b" ").push(blake3(text)).push(b"\n")),
   )
 
-fn pack_over(q: Map<Bytes, Query<| {}>>, s: State) -> packs::Written / {abort.raise} =
-  packed_of(s.held, q, files_of(s))
+fn pack_over(q: Map<Bytes, Query<| {}>>, s: State) -> packs::PackFiles / {abort.raise} =
+  pack_memory_store(s.held, q, files_of(s))
 
 type Answers = { outputs: List<Bytes>, run: Run, state: State }
 
@@ -37,20 +38,20 @@ type Answers = { outputs: List<Bytes>, run: Run, state: State }
 fn asked(
   q: Map<Bytes, Query<| {}>>,
   s: State,
-  packed: Option<packs::Written>,
+  packed: Option<packs::PackFiles>,
   names: List<Bytes>,
   input: Bytes,
 ) -> Answers / {abort.raise} = {
-  let done = over_held(
+  let done = with_memory_store(
     s.held,
     |path: String, offset: Int, len: Int| packs::frame_in(packed, path, offset, len),
     files_of(s),
     |_: Bytes, at: Bytes| s.files.get(at),
     ||
       names.fold(
-        { outputs: [], run: started(q) },
+        { outputs: [], run: start_run(q) },
         |acc: { outputs: List<Bytes>, run: Run }, name: Bytes| {
-          let a = answer(q, acc.run, name, input);
+          let a = query_output(q, acc.run, name, input);
           { outputs: acc.outputs.push(a.output), run: a.run }
         },
       ),
@@ -68,16 +69,16 @@ fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) ->
   { name: name, hash: hash, body: body, kept: true, summarized: false }
 
 fn length_of(input: Bytes) -> Bytes / {memo.read} =
-  Bytes::of_string(read_whole(input).len().to_string())
+  Bytes::of_string(read_file(input).len().to_string())
 
 fn doubled_length(input: Bytes) -> Bytes / {memo.read} =
-  Bytes::of_string(Int::to_string(2 * read_whole(input).len()))
+  Bytes::of_string(Int::to_string(2 * read_file(input).len()))
 
-fn longer(input: Bytes) -> Bytes / {memo.read} = b"long ".concat(memo.ask(b"length", input))
+fn longer(input: Bytes) -> Bytes / {memo.read} = b"long ".concat(memo.fetch(b"length", input))
 
-fn middled(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.ask(b"length", input))
+fn middled(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.fetch(b"length", input))
 
-fn topped(input: Bytes) -> Bytes / {memo.read} = memo.ask(b"middle", input).concat(b"!")
+fn topped(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"middle", input).concat(b"!")
 
 fn lengths(length_hash: Bytes) -> Map<Bytes, Query<| {}>> =
   Map::new().insert(b"length", query(b"length", length_hash, length_of)).insert(
@@ -97,54 +98,55 @@ fn summed() -> Map<Bytes, Query<| {}>> =
 /// A check of a module whole, as the checker's `whole` is: it reads the file `w`, and offers
 /// `verdict` whether `group`'s record would be reused.
 fn whole_of(input: Bytes) -> Bytes / {memo.read} = {
-  let _ = read_whole(b"w");
-  memo.offer(b"verdict", input, if memo.kept(b"group", input) { b"kept" } else { b"not kept" });
+  let _ = read_file(b"w");
+  memo.provide(b"verdict", input, if memo.is_cached(b"group", input) { b"kept" }
+  else { b"not kept" });
   b"done"
 }
 
 fn verdict_of(input: Bytes) -> Bytes / {memo.read} =
-  match memo.offered() { Some(v) -> v, None -> b"no verdict" }
+  match memo.provided() { Some(v) -> v, None -> b"no verdict" }
 
 fn entry_of(input: Bytes) -> Bytes / {memo.read} = {
-  let _ = memo.head(b"whole", input);
+  let _ = memo.output_digest(b"whole", input);
   b"entry"
 }
 
 fn group_by_entry(input: Bytes) -> Bytes / {memo.read} = {
-  let _ = memo.head(b"entry", input);
+  let _ = memo.output_digest(b"entry", input);
   b"group"
 }
 
 fn group_by_whole(input: Bytes) -> Bytes / {memo.read} = {
-  let _ = memo.head(b"whole", input);
+  let _ = memo.output_digest(b"whole", input);
   b"group"
 }
 
 fn group_by_both(input: Bytes) -> Bytes / {memo.read} = {
-  let _ = memo.head(b"offering", input);
-  let _ = memo.head(b"entry", input);
+  let _ = memo.output_digest(b"offering", input);
+  let _ = memo.output_digest(b"entry", input);
   b"group"
 }
 
 /// Offers `taker` what it answers of the file `of`.
 fn offering_of(input: Bytes) -> Bytes / {memo.read} = {
-  memo.offer(b"taker", input, b"t ".concat(read_whole(b"of")));
+  memo.provide(b"taker", input, b"t ".concat(read_file(b"of")));
   b"offered"
 }
 
 /// What `offering` offered, or else what `alone` works out, read over the file `of` either way.
 fn taker_of(input: Bytes) -> Bytes / {memo.read} = {
-  let _ = memo.head(b"offering", input);
-  match memo.offered() {
+  let _ = memo.output_digest(b"offering", input);
+  match memo.provided() {
     Some(v) -> {
-      let _ = read_whole(b"of");
+      let _ = read_file(b"of");
       v
     },
-    None -> memo.ask(b"alone", input),
+    None -> memo.fetch(b"alone", input),
   }
 }
 
-fn alone_of(input: Bytes) -> Bytes / {memo.read} = b"t ".concat(read_whole(b"of"))
+fn alone_of(input: Bytes) -> Bytes / {memo.read} = b"t ".concat(read_file(b"of"))
 
 fn judging_queries(group: Query<| {}>) -> Map<Bytes, Query<| {}>> =
   Map::new().insert(b"whole", query(b"whole", b"w1", whole_of)).insert(
@@ -178,7 +180,7 @@ test "a record is judged kept where nothing below it moved, though a record belo
     b"m",
   );
   // `group` stands: `entry` reads `whole`, which answers as it did.
-  assert_eq(ran_for(again.run, b"group"), []);
+  assert_eq(executed_for(again.run, b"group"), []);
   assert_eq(again.outputs, [b"done", b"kept", b"group"])
 }
 
@@ -215,7 +217,7 @@ test "what a body offers while a record is judged is taken, though the judgment 
   let cold = asked(x.q, emptied(x.now), None, [b"whole", b"taker"], b"m");
   assert_eq(warm.outputs, cold.outputs);
   // A fresh run's `taker` takes what `offering` offers, so `alone` does not run.
-  assert_eq(ran_for(warm.run, b"alone"), ran_for(cold.run, b"alone"))
+  assert_eq(executed_for(warm.run, b"alone"), executed_for(cold.run, b"alone"))
 }
 
 test "a body run while a record is judged is counted, though the judgment stops at the one judging" {
@@ -224,11 +226,11 @@ test "a body run while a record is judged is counted, though the judgment stops 
   let key = key_in(x.q, b"offering", b"m");
   // `offering`'s record is made anew over `of`, so its body ran.
   assert(warm.state.held.records.get(key) != x.first.held.records.get(key));
-  assert_eq(ran_for(warm.run, b"offering"), [b"m"])
+  assert_eq(executed_for(warm.run, b"offering"), [b"m"])
 }
 
 fn kept_longer(input: Bytes) -> Bytes / {memo.read} =
-  if memo.kept(b"longer", input) { b"kept" } else { b"not kept" }
+  if memo.is_cached(b"longer", input) { b"kept" } else { b"not kept" }
 
 test "a record an undone edit takes back is judged kept" {
   let q = lengths(b"h1").insert(b"probe", query(b"probe", b"p1", kept_longer));
@@ -236,17 +238,17 @@ test "a record an undone edit takes back is judged kept" {
   let moved = asked(q, edited(first.state, b"a", b"forty"), None, [b"longer"], b"a");
   let undone = asked(q, edited(moved.state, b"a", b"four"), None, [b"probe", b"longer"], b"a");
   // An ask takes `longer`'s earlier record back, with no body run.
-  assert_eq(ran_for(undone.run, b"longer"), []);
+  assert_eq(executed_for(undone.run, b"longer"), []);
   assert_eq(undone.outputs, [b"kept", b"long 4"])
 }
 
 fn kept_length(input: Bytes) -> Bytes / {memo.read} =
-  if memo.kept(b"length", input) { b"kept" } else { b"not kept" }
+  if memo.is_cached(b"length", input) { b"kept" } else { b"not kept" }
 
 test "a record whose long answer no store holds is judged not kept" {
   let text = b"word ".repeat(1000);
   let q = Map::new().insert(b"length", {
-    ..query(b"length", b"h1", read_whole),
+    ..query(b"length", b"h1", read_file),
     kept: false,
   }).insert(
     b"probe",
@@ -255,18 +257,20 @@ test "a record whose long answer no store holds is judged not kept" {
   let first = asked(q, state([{ at: b"a", text: text }]), None, [b"length"], b"a");
   let again = asked(q, first.state, None, [b"probe", b"length"], b"a");
   // The store kept the record and not its answer, so an ask runs the body.
-  assert_eq(ran_for(again.run, b"length"), [b"a"]);
+  assert_eq(executed_for(again.run, b"length"), [b"a"]);
   assert_eq(again.outputs.get(0), b"not kept")
 }
 
 fn moded(input: Bytes) -> Bytes / {memo.read} =
-  if memo.world(b"file", b"mode") == Some(b"old") { memo.ask(b"fragile", input) } else { b"new" }
+  if memo.external(b"file", b"mode") == Some(b"old") { memo.fetch(b"fragile", input) }
+  else { b"new" }
 
 fn fragile(input: Bytes) -> Bytes / {memo.read, abort.raise} =
-  if memo.world(b"file", b"ff") == Some(b"bad") { panic("the file `ff` is bad") } else { b"fine" }
+  if memo.external(b"file", b"ff") == Some(b"bad") { panic("the file `ff` is bad") }
+  else { b"fine" }
 
 fn kept_moded(input: Bytes) -> Bytes / {memo.read} =
-  if memo.kept(b"moded", input) { b"kept" } else { b"not kept" }
+  if memo.is_cached(b"moded", input) { b"kept" } else { b"not kept" }
 
 test "judging a record fails no run that a run over an empty store answers" {
   let q = Map::new().insert(b"moded", query(b"moded", b"d1", moded)).insert(b"fragile", {
@@ -307,7 +311,7 @@ test "a pack below a store made over other files runs no more bodies than the pa
   let warm = asked(q, now, Some(packed), [b"longer"], b"a");
   let cold = asked(q, emptied(now), Some(packed), [b"longer"], b"a");
   assert_eq(warm.outputs, cold.outputs);
-  assert_eq(ran_total(warm.run), ran_total(cold.run))
+  assert_eq(executed_count(warm.run), executed_count(cold.run))
 }
 
 // --- Summaries ------------------------------------------------------------------------------
@@ -325,10 +329,10 @@ test "runs alternating between two definitions below a summary run no body once 
     [b"mid 4!"],
     [b"mid 8!"],
   ]);
-  assert_eq([ran_total(third.run), ran_total(fourth.run)], [0, 0])
+  assert_eq([executed_count(third.run), executed_count(fourth.run)], [0, 0])
 }
 
-fn over_taker(input: Bytes) -> Bytes / {memo.read} = memo.ask(b"taker", input).concat(b"!")
+fn over_taker(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"taker", input).concat(b"!")
 
 test "a summary over an answer taken from an offer moves with what the offer was made from" {
   let q = judging_queries(query(b"group", b"g1", group_by_entry)).insert(b"offering", {

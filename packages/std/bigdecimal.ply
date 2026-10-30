@@ -44,19 +44,19 @@ show for BigDecimal by to_string
 numeric for BigDecimal by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
 
 /// Why a text names no decimal number.
-pub type Why =
+pub type ErrorKind =
   /// A character that is no part of a number, or the text ending where a digit is due.
-  | Stray
+  | UnexpectedCharacter
   /// An exponent past the bound the reader was given.
   | TooWide
 
 /// A refusal, and the character of the text it is about.
-pub type Refusal = new { at: Int, why: Why }
+pub type Error = new { at: Int, reason: ErrorKind }
 
 /// What this module raises where it refuses.
 pub effect bigdecimal {
   /// The text names no decimal number the reader's bound admits.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
 }
 
 // --- Making and reading one -------------------------------------------------
@@ -112,7 +112,7 @@ pub fn sign(value: BigDecimal) -> Int = bigint::sign(unscaled(value))
 /// `a + b`, exactly, at the larger of the two scales.
 pub fn add(a: BigDecimal, b: BigDecimal) -> BigDecimal = {
   let places = max(scale(a), scale(b));
-  BigDecimal(lifted(a, places) + lifted(b, places), places)
+  BigDecimal(unscaled_at(a, places) + unscaled_at(b, places), places)
 }
 
 /// `a - b`, exactly, at the larger of the two scales.
@@ -138,7 +138,7 @@ pub fn pow(value: BigDecimal, exponent: Int) -> Option<BigDecimal> =
 /// The order of the numbers, whatever their scales.
 pub fn compare(a: BigDecimal, b: BigDecimal) -> Ordering = {
   let places = max(scale(a), scale(b));
-  bigint::compare(lifted(a, places), lifted(b, places))
+  bigint::compare(unscaled_at(a, places), unscaled_at(b, places))
 }
 
 /// The same value at the least scale that holds it: `1.50` is `1.5`, and `2.00` and `0.000` are
@@ -158,7 +158,7 @@ pub fn round(value: BigDecimal, places: Int, mode: Rounding) -> BigDecimal =
 /// with zeros added where it has fewer. A negative `places` rounds to that many whole tens, held
 /// at scale zero.
 pub fn rescale(value: BigDecimal, places: Int, mode: Rounding) -> BigDecimal =
-  if places >= scale(value) { BigDecimal(lifted(value, places), places) }
+  if places >= scale(value) { BigDecimal(unscaled_at(value, places), places) }
   else { round(value, places, mode) }
 
 /// The value at the scale `like` has, rounded by `mode`: `rescale` by example.
@@ -309,16 +309,16 @@ pub fn to_scientific(value: BigDecimal) -> String = {
 
 /// The number a text names: digits with an optional sign before them, an optional point among
 /// them and an optional exponent after them, `e` or `E` and a whole number, as `Decimal::of_string`
-/// reads one. The scale is the digits written after the point less the exponent. Raises `refused`
+/// reads one. The scale is the digits written after the point less the exponent. Raises `fail`
 /// for any other text, at the character that is no part of a number, and for an exponent past
 /// `max_exponent` either way, since `1e1000000000` would be written out in full.
-pub fn read(text: String, max_exponent: Int) -> BigDecimal / {bigdecimal.refused, abort.raise} = {
+pub fn read(text: String, max_exponent: Int) -> BigDecimal / {bigdecimal.fail, abort.raise} = {
   let bytes = Bytes::of_string(text);
   let from = if is_sign(bytes.peek(0)) { 1 } else { 0 };
   let whole_end = bytes.skip(from, b"0123456789");
   let part_from = if bytes.peek(whole_end) == 46 { whole_end + 1 } else { whole_end };
   let part_end = bytes.skip(part_from, b"0123456789");
-  if whole_end - from + part_end - part_from == 0 { refuse(part_end, Stray) } else {
+  if whole_end - from + part_end - part_from == 0 { fail(part_end, UnexpectedCharacter) } else {
     let digits = bytes.slice(from, whole_end) ++ bytes.slice(part_from, part_end);
     let magnitude = match bigint::of_string(String::of_bytes(digits)) {
       Some(n) -> n,
@@ -326,8 +326,9 @@ pub fn read(text: String, max_exponent: Int) -> BigDecimal / {bigdecimal.refused
     };
     let coefficient = if bytes.peek(0) == 45 { bigint::neg(magnitude) } else { magnitude };
     if part_end == bytes.len() { of_parts(coefficient, part_end - part_from) }
-    else if bytes.peek(part_end) != 69 && bytes.peek(part_end) != 101 { refuse(part_end, Stray) }
-    else {
+    else if bytes.peek(part_end) != 69 && bytes.peek(part_end) != 101 {
+      fail(part_end, UnexpectedCharacter)
+    } else {
       let exponent = read_exponent(bytes, part_end + 1, max_exponent);
       of_parts(coefficient, part_end - part_from - exponent)
     }
@@ -335,7 +336,7 @@ pub fn read(text: String, max_exponent: Int) -> BigDecimal / {bigdecimal.refused
 }
 
 /// The number a text names, as `read` reads one under the same bound, or why it names none.
-pub fn parse(text: String, max_exponent: Int) -> Result<BigDecimal, Refusal> / {abort.raise} =
+pub fn parse(text: String, max_exponent: Int) -> Result<BigDecimal, Error> / {abort.raise} =
   try { read(text, max_exponent) }
 
 /// What a `bigdecimal"..."` literal is checked by: the number `read` reads with exponents up to
@@ -347,8 +348,9 @@ pub fn literal(
     Ok(value) -> Ok(value),
     Err(e) ->
       Err({
-        message: match e.why {
-          Stray -> "a decimal number is digits, with an optional sign, point and exponent",
+        message: match e.reason {
+          UnexpectedCharacter ->
+            "a decimal number is digits, with an optional sign, point and exponent",
           TooWide -> "an exponent is at most 6144 either way",
         },
         offset: e.at,
@@ -357,8 +359,8 @@ pub fn literal(
 
 // --- The parts --------------------------------------------------------------
 
-fn refuse<a>(at: Int, why: Why) -> a / {bigdecimal.refused} =
-  bigdecimal.refused({ at: at, why: why })
+fn fail<a>(at: Int, why: ErrorKind) -> a / {bigdecimal.fail} =
+  bigdecimal.fail({ at: at, reason: why })
 
 fn is_sign(byte: Int) -> Bool = byte == 43 || byte == 45
 
@@ -367,15 +369,15 @@ fn read_exponent(
   bytes: Bytes,
   from: Int,
   max_exponent: Int,
-) -> Int / {bigdecimal.refused, abort.raise} = {
+) -> Int / {bigdecimal.fail, abort.raise} = {
   let digits_from = if is_sign(bytes.peek(from)) { from + 1 } else { from };
   let end = bytes.skip(digits_from, b"0123456789");
-  if end == digits_from || end != bytes.len() { refuse(end, Stray) } else {
+  if end == digits_from || end != bytes.len() { fail(end, UnexpectedCharacter) } else {
     match bytes.slice(digits_from, end).int_of_ascii() {
-      Some(n) -> if n > max_exponent { refuse(from, TooWide) }
+      Some(n) -> if n > max_exponent { fail(from, TooWide) }
       else if bytes.peek(from) == 45 { 0 - n }
       else { n },
-      None -> refuse(from, TooWide),
+      None -> fail(from, TooWide),
     }
   }
 }
@@ -388,7 +390,7 @@ fn power(base: BigInt, exponent: Int) -> BigInt =
 fn ten_to(k: Int) -> BigInt = power(bigint::of_int(10), k)
 
 /// The value's digits as a whole number at `places` after the point, which is no fewer than it has.
-fn lifted(value: BigDecimal, places: Int) -> BigInt =
+fn unscaled_at(value: BigDecimal, places: Int) -> BigInt =
   unscaled(value) * ten_to(places - scale(value))
 
 /// The digits of the unscaled value, its sign aside.
@@ -508,7 +510,7 @@ fn order_key(value: BigDecimal) -> (Int, Int, List<Int>) = {
 // --- Tests ------------------------------------------------------------------
 
 /// The number a text names, for a test that writes one.
-fn dec(text: String) -> BigDecimal / {abort.raise} =
+fn big_decimal(text: String) -> BigDecimal / {abort.raise} =
   match parse(text, 400) { Ok(value) -> value, Err(_) -> panic("a decimal number") }
 
 fn text_of(value: Option<BigDecimal>) -> String =
@@ -522,24 +524,27 @@ test "a value keeps its scale, and a scale below zero is whole tens written out"
   assert_eq(to_string(of_int(0 - 42)), "-42");
   assert_eq(to_string(zero()), "0");
   assert_eq(to_string(of_parts(bigint::zero(), 2)), "0.00");
-  assert_eq(unscaled(dec("1.50")), bigint::of_int(150));
-  assert_eq(scale(dec("1.50")), 2);
-  assert_eq(["0", "0.00", "1.50", "-123.456", "100"].map(|t: String| precision(dec(t))), [
+  assert_eq(unscaled(big_decimal("1.50")), bigint::of_int(150));
+  assert_eq(scale(big_decimal("1.50")), 2);
+  assert_eq(["0", "0.00", "1.50", "-123.456", "100"].map(|t: String| precision(big_decimal(t))), [
     1,
     1,
     3,
     6,
     3,
   ]);
-  assert(is_zero(dec("0.000")) && is_negative(dec("-0.1")) && !is_negative(dec("0.0")));
-  assert_eq(["-0.1", "0.00", "7"].map(|t: String| sign(dec(t))), [0 - 1, 0, 1])
+  assert(
+    is_zero(big_decimal("0.000")) && is_negative(big_decimal("-0.1"))
+      && !is_negative(big_decimal("0.0")),
+  );
+  assert_eq(["-0.1", "0.00", "7"].map(|t: String| sign(big_decimal(t))), [0 - 1, 0, 1])
 }
 
 test "equality, order, digest and a Map read the number and never the scale; show keeps it" {
-  assert(dec("1.5") == dec("1.50") && dec("1.5") != dec("1.51"));
-  assert_eq(digest(dec("1.5")), digest(dec("1.500")));
-  assert_eq(digest(dec("0")), digest(dec("0.00")));
-  assert_eq(f"{dec("1.5")} and {dec("1.50")}", "1.5 and 1.50");
+  assert(big_decimal("1.5") == big_decimal("1.50") && big_decimal("1.5") != big_decimal("1.51"));
+  assert_eq(digest(big_decimal("1.5")), digest(big_decimal("1.500")));
+  assert_eq(digest(big_decimal("0")), digest(big_decimal("0.00")));
+  assert_eq(f"{big_decimal("1.5")} and {big_decimal("1.50")}", "1.5 and 1.50");
   let ordered = [
     "-100",
     "-12.5",
@@ -555,39 +560,43 @@ test "equality, order, digest and a Map read the number and never the scale; sho
     "10",
     "10.01",
   ].map(
-    dec,
+    big_decimal,
   );
   let keyed = ordered.fold(Map::new(), |m: Map<BigDecimal, Int>, v: BigDecimal| m.insert(v, 0));
   assert_eq(keyed.keys().map(to_string), ordered.map(to_string));
-  assert_eq(keyed.get(dec("-12.500")), Some(0));
-  assert_eq(keyed.insert(dec("10.0100"), 1).len(), ordered.len());
+  assert_eq(keyed.get(big_decimal("-12.500")), Some(0));
+  assert_eq(keyed.insert(big_decimal("10.0100"), 1).len(), ordered.len());
   assert(
     range(0, ordered.len() - 1).fold(true, |ok: Bool, i: Int|
       ok && ordered.at_or(i, zero()) < ordered.at_or(i + 1, zero())
         && compare(ordered.at_or(i, zero()), ordered.at_or(i + 1, zero())) == Less),
   );
-  assert_eq(compare(dec("1.50"), dec("1.5")), Equal);
-  assert_eq(to_string(max(dec("1.5"), dec("2.50"))), "2.50")
+  assert_eq(compare(big_decimal("1.50"), big_decimal("1.5")), Equal);
+  assert_eq(to_string(max(big_decimal("1.5"), big_decimal("2.50"))), "2.50")
 }
 
 test "sums, differences and products are exact: a sum at the larger scale, a product at their sum" {
-  assert_eq(to_string(dec("1.50") + dec("2")), "3.50");
-  assert_eq(to_string(dec("1.50") - dec("1.5")), "0.00");
-  assert_eq(to_string(dec("1.50") * dec("2.0")), "3.000");
-  assert_eq(to_string(-dec("1.50")), "-1.50");
-  assert_eq(to_string(abs(dec("-1.50"))), "1.50");
-  assert_eq(to_string(dec("0.1") + dec("0.2")), "0.3");
+  assert_eq(to_string(big_decimal("1.50") + big_decimal("2")), "3.50");
+  assert_eq(to_string(big_decimal("1.50") - big_decimal("1.5")), "0.00");
+  assert_eq(to_string(big_decimal("1.50") * big_decimal("2.0")), "3.000");
+  assert_eq(to_string(-big_decimal("1.50")), "-1.50");
+  assert_eq(to_string(abs(big_decimal("-1.50"))), "1.50");
+  assert_eq(to_string(big_decimal("0.1") + big_decimal("0.2")), "0.3");
   assert_eq(
     to_string(
-      dec("123456789012345678901234567890.123456789") * dec("-1000000000000000000000.000001"),
+      big_decimal("123456789012345678901234567890.123456789")
+        * big_decimal("-1000000000000000000000.000001"),
     ),
     "-123456789012345678901234568013580245801345678901234.567890123456789",
   );
-  assert_eq(to_string(List::sum([dec("0.1"), dec("0.20"), dec("0.300")])), "0.600");
-  assert_eq(text_of(pow(dec("-1.5"), 3)), "-3.375");
-  assert_eq(text_of(pow(dec("1.5"), 0)), "1");
-  assert_eq(text_of(pow(dec("2"), 100)), "1267650600228229401496703205376");
-  assert_eq(pow(dec("2"), 0 - 1), None)
+  assert_eq(
+    to_string(List::sum([big_decimal("0.1"), big_decimal("0.20"), big_decimal("0.300")])),
+    "0.600",
+  );
+  assert_eq(text_of(pow(big_decimal("-1.5"), 3)), "-3.375");
+  assert_eq(text_of(pow(big_decimal("1.5"), 0)), "1");
+  assert_eq(text_of(pow(big_decimal("2"), 100)), "1267650600228229401496703205376");
+  assert_eq(pow(big_decimal("2"), 0 - 1), None)
 }
 
 /// One case of an operation, and what Python's `decimal` answered for it, which is the General
@@ -989,98 +998,98 @@ fn quantizings() -> List<Vector> =
   ]
 
 test "{c.a} / {c.b} at {c.n} places, {c.mode}" for c: Vector in quotients_at_places() {
-  assert_eq(text_of(div(dec(c.a), dec(c.b), c.n, c.mode)), c.want)
+  assert_eq(text_of(div(big_decimal(c.a), big_decimal(c.b), c.n, c.mode)), c.want)
 }
 
 test "{c.a} / {c.b} to {c.n} digits, {c.mode}" for c: Vector in quotients_to_precision() {
-  assert_eq(text_of(div_to_precision(dec(c.a), dec(c.b), c.n, c.mode)), c.want)
+  assert_eq(text_of(div_to_precision(big_decimal(c.a), big_decimal(c.b), c.n, c.mode)), c.want)
 }
 
 test "the root of {c.a} to {c.n} digits" for c: Vector in roots_to_precision() {
-  assert_eq(text_of(sqrt_to_precision(dec(c.a), c.n, c.mode)), c.want)
+  assert_eq(text_of(sqrt_to_precision(big_decimal(c.a), c.n, c.mode)), c.want)
 }
 
 test "{c.a} to {c.n} digits, {c.mode}" for c: Vector in roundings_to_precision() {
-  assert_eq(to_string(round_to_precision(dec(c.a), c.n, c.mode)), c.want)
+  assert_eq(to_string(round_to_precision(big_decimal(c.a), c.n, c.mode)), c.want)
 }
 
 test "{c.a} at the scale of {c.b}, {c.mode}" for c: Vector in quantizings() {
-  assert_eq(to_string(quantize(dec(c.a), dec(c.b), c.mode)), c.want)
+  assert_eq(to_string(quantize(big_decimal(c.a), big_decimal(c.b), c.mode)), c.want)
 }
 
 test "a zero divisor and a root below zero have no answer, and an exact quotient need not exist" {
   assert_eq(div(one(), zero(), 5, HalfEven), None);
-  assert_eq(div(one(), dec("0.00"), 5, HalfEven), None);
+  assert_eq(div(one(), big_decimal("0.00"), 5, HalfEven), None);
   assert_eq(div_to_precision(one(), zero(), 5, HalfEven), None);
   assert_eq(div_exact(one(), zero()), None);
-  assert_eq(text_of(div_exact(dec("1"), dec("8"))), "0.125");
-  assert_eq(text_of(div_exact(dec("-7.5"), dec("0.25"))), "-30");
-  assert_eq(text_of(div_exact(dec("1"), dec("1024"))), "0.0009765625");
-  assert_eq(div_exact(dec("1"), dec("3")), None);
-  assert_eq(sqrt(dec("-0.01"), 5, HalfEven), None);
-  assert_eq(sqrt_to_precision(dec("-4"), 5, HalfEven), None);
-  assert_eq(text_of(sqrt(dec("2"), 10, Down)), "1.4142135623");
-  assert_eq(text_of(sqrt(dec("2"), 10, Up)), "1.4142135624");
-  assert_eq(text_of(sqrt(dec("4"), 3, Up)), "2.000");
-  assert_eq(text_of(sqrt(dec("152399025"), 0 - 2, HalfUp)), "12300")
+  assert_eq(text_of(div_exact(big_decimal("1"), big_decimal("8"))), "0.125");
+  assert_eq(text_of(div_exact(big_decimal("-7.5"), big_decimal("0.25"))), "-30");
+  assert_eq(text_of(div_exact(big_decimal("1"), big_decimal("1024"))), "0.0009765625");
+  assert_eq(div_exact(big_decimal("1"), big_decimal("3")), None);
+  assert_eq(sqrt(big_decimal("-0.01"), 5, HalfEven), None);
+  assert_eq(sqrt_to_precision(big_decimal("-4"), 5, HalfEven), None);
+  assert_eq(text_of(sqrt(big_decimal("2"), 10, Down)), "1.4142135623");
+  assert_eq(text_of(sqrt(big_decimal("2"), 10, Up)), "1.4142135624");
+  assert_eq(text_of(sqrt(big_decimal("4"), 3, Up)), "2.000");
+  assert_eq(text_of(sqrt(big_decimal("152399025"), 0 - 2, HalfUp)), "12300")
 }
 
 test "rounding to places leaves a shorter value alone, and rescaling writes its zeros" {
-  assert_eq(to_string(round(dec("1.5"), 3, Down)), "1.5");
-  assert_eq(to_string(rescale(dec("1.5"), 3, Down)), "1.500");
-  assert_eq(to_string(round(dec("1.2345"), 2, HalfEven)), "1.23");
-  assert_eq(to_string(round(dec("12345"), 0 - 2, HalfEven)), "12300");
-  assert_eq(to_string(rescale(dec("12355.5"), 0 - 1, HalfUp)), "12360");
-  assert_eq(to_string(strip_trailing_zeros(dec("1.500"))), "1.5");
-  assert_eq(to_string(strip_trailing_zeros(dec("200.00"))), "200");
-  assert_eq(to_string(strip_trailing_zeros(dec("0.000"))), "0");
-  assert_eq(to_string(strip_trailing_zeros(dec("-0.0120"))), "-0.012")
+  assert_eq(to_string(round(big_decimal("1.5"), 3, Down)), "1.5");
+  assert_eq(to_string(rescale(big_decimal("1.5"), 3, Down)), "1.500");
+  assert_eq(to_string(round(big_decimal("1.2345"), 2, HalfEven)), "1.23");
+  assert_eq(to_string(round(big_decimal("12345"), 0 - 2, HalfEven)), "12300");
+  assert_eq(to_string(rescale(big_decimal("12355.5"), 0 - 1, HalfUp)), "12360");
+  assert_eq(to_string(strip_trailing_zeros(big_decimal("1.500"))), "1.5");
+  assert_eq(to_string(strip_trailing_zeros(big_decimal("200.00"))), "200");
+  assert_eq(to_string(strip_trailing_zeros(big_decimal("0.000"))), "0");
+  assert_eq(to_string(strip_trailing_zeros(big_decimal("-0.0120"))), "-0.012")
 }
 
 test "a number is read plain or with an exponent, and written either way" {
-  assert_eq(to_string(dec("123.45")), "123.45");
-  assert_eq(to_string(dec("+.5")), "0.5");
-  assert_eq(to_string(dec("5.")), "5");
-  assert_eq(to_string(dec("-0.00")), "0.00");
-  assert_eq(to_string(dec("1.5E2")), "150");
-  assert_eq(to_string(dec("1.50e-3")), "0.00150");
-  assert_eq(to_string(dec("12e+3")), "12000");
-  assert_eq(to_string(dec("0e-5")), "0.00000");
+  assert_eq(to_string(big_decimal("123.45")), "123.45");
+  assert_eq(to_string(big_decimal("+.5")), "0.5");
+  assert_eq(to_string(big_decimal("5.")), "5");
+  assert_eq(to_string(big_decimal("-0.00")), "0.00");
+  assert_eq(to_string(big_decimal("1.5E2")), "150");
+  assert_eq(to_string(big_decimal("1.50e-3")), "0.00150");
+  assert_eq(to_string(big_decimal("12e+3")), "12000");
+  assert_eq(to_string(big_decimal("0e-5")), "0.00000");
   assert_eq(
     ["123.45", "1.50", "0.00", "0", "-0.0012", "12345678901234567890", "100"].map(|t: String|
-      to_scientific(dec(t))),
+      to_scientific(big_decimal(t))),
     ["1.2345E+2", "1.50E+0", "0E-2", "0E+0", "-1.2E-3", "1.2345678901234567890E+19", "1.00E+2"],
   );
   assert_eq(parse("1e400", 400), Ok(of_parts(bigint::one(), 0 - 400)));
-  assert_eq(scale(dec("1e-400")), 400)
+  assert_eq(scale(big_decimal("1e-400")), 400)
 }
 
-type Refused = { text: String, at: Int, why: Why }
+type ErrorCase = { text: String, at: Int, reason: ErrorKind }
 
-fn refusals() -> List<Refused> =
+fn error_cases() -> List<ErrorCase> =
   [
-    { text: "", at: 0, why: Stray },
-    { text: "-", at: 1, why: Stray },
-    { text: ".", at: 1, why: Stray },
-    { text: "x", at: 0, why: Stray },
-    { text: "1x", at: 1, why: Stray },
-    { text: "1.2.3", at: 3, why: Stray },
-    { text: "--1", at: 1, why: Stray },
-    { text: "1e", at: 2, why: Stray },
-    { text: "1e+", at: 3, why: Stray },
-    { text: "1e5x", at: 3, why: Stray },
-    { text: "1 000", at: 1, why: Stray },
-    { text: "1e401", at: 2, why: TooWide },
-    { text: "1e-401", at: 2, why: TooWide },
-    { text: "1e99999999999999999999", at: 2, why: TooWide },
+    { text: "", at: 0, reason: UnexpectedCharacter },
+    { text: "-", at: 1, reason: UnexpectedCharacter },
+    { text: ".", at: 1, reason: UnexpectedCharacter },
+    { text: "x", at: 0, reason: UnexpectedCharacter },
+    { text: "1x", at: 1, reason: UnexpectedCharacter },
+    { text: "1.2.3", at: 3, reason: UnexpectedCharacter },
+    { text: "--1", at: 1, reason: UnexpectedCharacter },
+    { text: "1e", at: 2, reason: UnexpectedCharacter },
+    { text: "1e+", at: 3, reason: UnexpectedCharacter },
+    { text: "1e5x", at: 3, reason: UnexpectedCharacter },
+    { text: "1 000", at: 1, reason: UnexpectedCharacter },
+    { text: "1e401", at: 2, reason: TooWide },
+    { text: "1e-401", at: 2, reason: TooWide },
+    { text: "1e99999999999999999999", at: 2, reason: TooWide },
   ]
 
-test "`{c.text}` names no decimal number" for c: Refused in refusals() {
-  assert_eq(parse(c.text, 400), Err({ at: c.at, why: c.why }))
+test "`{c.text}` names no decimal number" for c: ErrorCase in error_cases() {
+  assert_eq(parse(c.text, 400), Err({ at: c.at, reason: c.reason }))
 }
 
 test "a literal's check answers the number, or where the text stops being one" {
-  assert_eq(literal("-1.50").ok(), Some(dec("-1.50")));
+  assert_eq(literal("-1.50").ok(), Some(big_decimal("-1.50")));
   assert_eq(
     literal("1,5"),
     Err({
@@ -1097,22 +1106,22 @@ test "a literal's check answers the number, or where the text stops being one" {
 test "a Decimal keeps its scale both ways, and a value past one is refused" {
   assert_eq(to_string(of_decimal(1.50m)), "1.50");
   assert_eq(to_string(of_decimal(0m - 0.0070m)), "-0.0070");
-  assert_eq(to_decimal(dec("1.50")).map(Decimal::to_string), Some("1.50"));
+  assert_eq(to_decimal(big_decimal("1.50")).map(Decimal::to_string), Some("1.50"));
   assert_eq(
-    to_decimal(dec("-79228162514264337593543950335")).map(Decimal::to_string),
+    to_decimal(big_decimal("-79228162514264337593543950335")).map(Decimal::to_string),
     Some("-79228162514264337593543950335"),
   );
-  assert_eq(to_decimal(dec("79228162514264337593543950336")), None);
-  assert_eq(to_decimal(dec("0.00000000000000000000000000001")), None);
+  assert_eq(to_decimal(big_decimal("79228162514264337593543950336")), None);
+  assert_eq(to_decimal(big_decimal("0.00000000000000000000000000001")), None);
   // Thirty digits after the point that a Decimal need not hold.
   assert_eq(
-    to_decimal(dec("2.500000000000000000000000000000")).map(Decimal::to_string),
+    to_decimal(big_decimal("2.500000000000000000000000000000")).map(Decimal::to_string),
     Some("2.5"),
   )
 }
 
 test "a fraction and a Float are exact one way and rounded the other" {
-  assert_eq(to_rational(dec("0.75")), fraction("3/4"));
+  assert_eq(to_rational(big_decimal("0.75")), fraction("3/4"));
   assert_eq(text_of(of_rational_exact(fraction("-3/8"))), "-0.375");
   assert_eq(of_rational_exact(fraction("1/3")), None);
   assert_eq(to_string(of_rational(fraction("2/3"), 4, HalfEven)), "0.6667");
@@ -1120,9 +1129,9 @@ test "a fraction and a Float are exact one way and rounded the other" {
   assert_eq(text_of(of_float(0.1)), "0.1000000000000000055511151231257827021181583404541015625");
   assert_eq(text_of(of_float(0.0 - 2.5)), "-2.5");
   assert_eq(of_float(0.0 / 0.0), None);
-  assert_eq(to_float(dec("0.1")), 0.1);
-  assert_eq(to_float(dec("-1e-400")), 0.0);
-  assert_eq(to_float(dec("123456789012345678901234567890")), 1.2345678901234568e29)
+  assert_eq(to_float(big_decimal("0.1")), 0.1);
+  assert_eq(to_float(big_decimal("-1e-400")), 0.0);
+  assert_eq(to_float(big_decimal("123456789012345678901234567890")), 1.2345678901234568e29)
 }
 
 /// The fraction a text names, for a test that writes one.
@@ -1131,15 +1140,15 @@ fn fraction(text: String) -> Rational / {abort.raise} =
 
 /// Two `Decimal`s a test draws from `Int`s, with the places and the mode an operation is told, all
 /// small enough that a `Decimal` holds the sum, the product and the quotient at those places.
-type Drawn = { a: Int, b: Int, scales: Int, mode: Rounding }
+type Operands = { a: Int, b: Int, scales: Int, mode: Rounding }
 
-fn first(c: Drawn) -> Decimal / {abort.raise} =
+fn first(c: Operands) -> Decimal / {abort.raise} =
   match Decimal::of_parts(c.a >> 34, c.scales & 7) {
     Some(d) -> d,
     None -> panic("a scale in range"),
   }
 
-fn second(c: Drawn) -> Decimal / {abort.raise} =
+fn second(c: Operands) -> Decimal / {abort.raise} =
   match Decimal::of_parts(c.b >> 34, c.scales >> 3 & 7) {
     Some(d) -> d,
     None -> panic("a scale in range"),
@@ -1156,8 +1165,8 @@ fn decimal_sum(x: BigDecimal, y: BigDecimal) -> BigDecimal =
 fn decimal_product(x: BigDecimal, y: BigDecimal) -> BigDecimal =
   if is_zero(x) || is_zero(y) { zero() } else { x * y }
 
-/// A `Drawn` as a test draws one.
-fn drawns() -> gen::Gen<Drawn> =
+/// A `Operands` as a test draws one.
+fn arbitrary_operands() -> gen::Gen<Operands> =
   gen::map4(
     gen::any_int(),
     gen::any_int(),
@@ -1167,7 +1176,7 @@ fn drawns() -> gen::Gen<Drawn> =
   )
 
 test "a sum, a difference and a product are a Decimal's numbers, and its digits but for a zero operand's scale" {
-  gen::check(drawns(), |c: Drawn| {
+  gen::check(arbitrary_operands(), |c: Operands| {
     let x = of_decimal(first(c));
     let y = of_decimal(second(c));
     x + y == of_decimal(first(c) + second(c)) && x - y == of_decimal(first(c) - second(c))
@@ -1208,13 +1217,13 @@ test "a zero that carries a scale adds as the same number in both, and a Decimal
   // A value that is not zero is left as it stands by a `Decimal`'s zero, and lifted to the zero's
   // scale by a `BigDecimal`'s.
   assert_eq(Decimal::to_string(5m + 0.00m), "5");
-  assert_eq(to_string(dec("5") + dec("0.00")), "5.00");
+  assert_eq(to_string(big_decimal("5") + big_decimal("0.00")), "5.00");
   assert_eq(Decimal::to_string(0.00m * 5.0m), "0");
-  assert_eq(to_string(dec("0.00") * dec("5.0")), "0.000")
+  assert_eq(to_string(big_decimal("0.00") * big_decimal("5.0")), "0.000")
 }
 
 test "two values compare, and are equal, as their Decimals do" {
-  gen::check(drawns(), |c: Drawn| {
+  gen::check(arbitrary_operands(), |c: Operands| {
     compare(of_decimal(first(c)), of_decimal(second(c))) == compare_values(first(c), second(c))
       && compare_values(of_decimal(first(c)), of_decimal(second(c)))
       == compare_values(first(c), second(c))

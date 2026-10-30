@@ -44,7 +44,7 @@ import std.gen
 ///
 /// `==`, `compare`, `digest` and a `Map`'s keys take two values for one where they are one item:
 /// a map in another order of its fields, an integer spelled in more octets than it needs or as
-/// the bignum tag over a byte string, and `Simple(20)` to `Simple(23)` beside `Flag`, `Null` and
+/// the bignum tag over a byte string, and `Simple(20)` to `Simple(23)` beside `Boolean`, `Null` and
 /// `Undefined`. A float is its bits there, so a `NaN` equals itself and `0.0` is not `-0.0`.
 pub type Value =
   /// An integer an `Int` holds.
@@ -56,7 +56,7 @@ pub type Value =
   /// negative bignum carries it.
   | Negative(Bytes)
   /// A byte string.
-  | Bits(Bytes)
+  | ByteString(Bytes)
   | Text(String)
   /// An array.
   | Items(List<Value>)
@@ -64,7 +64,7 @@ pub type Value =
   | Fields(List<Field>)
   /// A tag's number and what it tags.
   | Tagged(Int, Value)
-  | Flag(Bool)
+  | Boolean(Bool)
   | Null
   | Undefined
   /// A simple value with no name of its own: 0 to 19, or 32 to 255.
@@ -96,14 +96,14 @@ type Same =
 fn sameness(v: Value) -> Same =
   match v {
     Int(n) -> SameInt(n),
-    Unsigned(octets) | Tagged(2, Bits(octets)) -> same_integer(false, octets),
-    Negative(octets) | Tagged(3, Bits(octets)) -> same_integer(true, octets),
-    Bits(b) -> SameBits(b),
+    Unsigned(octets) | Tagged(2, ByteString(octets)) -> same_integer(false, octets),
+    Negative(octets) | Tagged(3, ByteString(octets)) -> same_integer(true, octets),
+    ByteString(b) -> SameBits(b),
     Text(s) -> SameText(s),
     Items(held) -> SameItems(held.map(sameness)),
     Fields(held) -> SameFields(held.map(|f: Field| (sameness(f.key), sameness(f.value))).sort()),
     Tagged(number, inner) -> SameTagged(number, sameness(inner)),
-    Flag(b) -> SameSimple(if b { 21 } else { 20 }),
+    Boolean(b) -> SameSimple(if b { 21 } else { 20 }),
     Null -> SameSimple(22),
     Undefined -> SameSimple(23),
     Simple(n) -> SameSimple(n),
@@ -131,7 +131,7 @@ fn integer_of(negative: Bool, octets: Bytes) -> Value / {abort.raise} = {
 // --- Refusals -------------------------------------------------------------------
 
 /// Why a reader refused bytes, or a writer a value.
-pub type Why =
+pub type ErrorKind =
   /// The input ends before the item does.
   | Truncated
   /// Bytes follow the item.
@@ -148,7 +148,7 @@ pub type Why =
   /// 31 on an integer or a tag.
   | Reserved(Int)
   /// A break that ends nothing: outside an indefinite length, or where a map's value is due.
-  | StrayBreak
+  | UnexpectedBreak
   /// A piece of an indefinite-length string that is not a string of its type with a length.
   | BadChunk
   /// Text that is not UTF-8.
@@ -161,28 +161,28 @@ pub type Why =
   /// A negative tag number.
   | BadTag
   /// An integer, a length or a tag number not in its fewest bytes, under a deterministic form.
-  | LongArgument
+  | OverlongArgument
   /// A float a narrower width holds, under a deterministic form.
-  | LongFloat
+  | OverlongFloat
   /// A bignum with a leading zero octet or one 64 bits hold, under a deterministic form.
-  | LongBignum
+  | OverlongBignum
   /// An indefinite length, under a deterministic form.
   | IndefiniteLength
   /// A map's keys out of the form's order.
   | Unsorted
 
 /// A reader's refusal, and the offset in the input of what it refused.
-pub type Refusal = new { at: Int, why: Why }
+pub type Error = new { at: Int, reason: ErrorKind }
 
 /// What this module raises where it refuses.
 pub effect cbor {
   /// The bytes are not the CBOR asked for.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// The value has no encoding.
-  raise unwritable(why: Why)
+  raise unwritable(why: ErrorKind)
 }
 
-fn refuse<a>(at: Int, why: Why) -> a / {cbor.refused} = cbor.refused({ at: at, why: why })
+fn fail<a>(at: Int, why: ErrorKind) -> a / {cbor.fail} = cbor.fail({ at: at, reason: why })
 
 // --- Floats ---------------------------------------------------------------------
 
@@ -211,17 +211,17 @@ fn narrowed(bits: Int, exponent: Int, fraction: Int) -> Option<Int> = {
   let e = bits >>> 52 & 0x7FF;
   let f = bits & 0xF_FFFF_FFFF_FFFF;
   let power = e - 1023;
-  if e == 0x7FF { kept(sign | top << fraction, f, 52 - fraction) }
+  if e == 0x7FF { exact_shift(sign | top << fraction, f, 52 - fraction) }
   else if e == 0 { if f == 0 { Some(sign) } else { None } }
   else if power >= 1 - bias && power <= bias {
-    kept(sign | power + bias << fraction, f, 52 - fraction)
+    exact_shift(sign | power + bias << fraction, f, 52 - fraction)
   } else if power < 1 - bias && power >= 1 - bias - fraction {
-    kept(sign, f | 1 << 52, 52 - fraction + 1 - bias - power)
+    exact_shift(sign, f | 1 << 52, 52 - fraction + 1 - bias - power)
   } else { None }
 }
 
 /// `high` over `f` without its low `drop` bits, where none of them is set.
-fn kept(high: Int, f: Int, drop: Int) -> Option<Int> =
+fn exact_shift(high: Int, f: Int, drop: Int) -> Option<Int> =
   if f & (1 << drop) - 1 == 0 { Some(high | f >> drop) } else { None }
 
 fn float_bytes(f: Float) -> Bytes = {
@@ -260,16 +260,16 @@ fn integer_bytes(major: Int, octets: Bytes) -> Bytes / {abort.raise} = {
 pub fn write(v: Value) -> Bytes / {cbor.unwritable, abort.raise} =
   match v {
     Int(n) -> if n >= 0 { head_bytes(0, n) } else { head_bytes(1, -1 - n) },
-    Unsigned(octets) | Tagged(2, Bits(octets)) -> integer_bytes(0, octets),
-    Negative(octets) | Tagged(3, Bits(octets)) -> integer_bytes(1, octets),
-    Bits(b) -> head_bytes(2, b.len()) ++ b,
+    Unsigned(octets) | Tagged(2, ByteString(octets)) -> integer_bytes(0, octets),
+    Negative(octets) | Tagged(3, ByteString(octets)) -> integer_bytes(1, octets),
+    ByteString(b) -> head_bytes(2, b.len()) ++ b,
     Text(s) -> head_bytes(3, Bytes::of_string(s).len()) ++ Bytes::of_string(s),
     Items(held) -> head_bytes(4, held.len()) ++ Bytes::concat_all(held.map(write)),
     Fields(held) -> {
-      let sorted = held.fold(Map::new(), |written: Map<Bytes, Bytes>, f: Field| {
+      let sorted = held.fold(Map::new(), |written_hex: Map<Bytes, Bytes>, f: Field| {
         let key = write(f.key);
-        if written.contains(key) { cbor.unwritable(DuplicateKey) }
-        else { written.insert(key, write(f.value)) }
+        if written_hex.contains(key) { cbor.unwritable(DuplicateKey) }
+        else { written_hex.insert(key, write(f.value)) }
       });
       head_bytes(5, sorted.len())
         ++ Bytes::concat_all(
@@ -279,7 +279,7 @@ pub fn write(v: Value) -> Bytes / {cbor.unwritable, abort.raise} =
     },
     Tagged(number, inner) -> if number < 0 { cbor.unwritable(BadTag) }
     else { head_bytes(6, number) ++ write(inner) },
-    Flag(b) -> if b { b"\xf5" } else { b"\xf4" },
+    Boolean(b) -> if b { b"\xf5" } else { b"\xf4" },
     Null -> b"\xf6",
     Undefined -> b"\xf7",
     Simple(n) -> if n >= 0 && n < 24 { byte_of_int(0xE0 | n) }
@@ -289,7 +289,7 @@ pub fn write(v: Value) -> Bytes / {cbor.unwritable, abort.raise} =
   }
 
 /// The deterministic encoding of `v`, or why it has none.
-pub fn encode(v: Value) -> Result<Bytes, Why> / {abort.raise} = try { write(v) }
+pub fn encode(v: Value) -> Result<Bytes, ErrorKind> / {abort.raise} = try { write(v) }
 
 // --- Reading --------------------------------------------------------------------
 
@@ -308,16 +308,16 @@ pub type Form =
 pub type Limits = new { depth: Int, items: Int, string: Int }
 
 /// A value read, and the offset after it.
-pub type Read = { value: Value, at: Int }
+pub type ReadResult = { value: Value, at: Int }
 
 /// The one item `data` is, raising `cbor.refused` where `decode` answers `Err`.
-pub fn read(data: Bytes, form: Form, limits: Limits) -> Value / {cbor.refused, abort.raise} = {
+pub fn read(data: Bytes, form: Form, limits: Limits) -> Value / {cbor.fail, abort.raise} = {
   let first = read_at(data, 0, form, limits);
-  if first.at == data.len() { first.value } else { refuse(first.at, Trailing) }
+  if first.at == data.len() { first.value } else { fail(first.at, Trailing) }
 }
 
 /// The one item `data` is, or why it is not exactly one item of `form` within `limits`.
-pub fn decode(data: Bytes, form: Form, limits: Limits) -> Result<Value, Refusal> / {abort.raise} =
+pub fn decode(data: Bytes, form: Form, limits: Limits) -> Result<Value, Error> / {abort.raise} =
   try { read(data, form, limits) }
 
 /// The item that begins at `at`, and where the next begins: a sequence of items is read one at a
@@ -327,7 +327,7 @@ pub fn read_at(
   at: Int,
   form: Form,
   limits: Limits,
-) -> Read / {cbor.refused, abort.raise} = {
+) -> ReadResult / {cbor.fail, abort.raise} = {
   let got = item({ data: data, form: form, string: limits.string }, at, limits.depth, limits.items);
   { value: got.value, at: got.at }
 }
@@ -337,56 +337,55 @@ pub fn is_deterministic(data: Bytes, limits: Limits) -> Bool / {abort.raise} =
   decode(data, Deterministic, limits).is_ok()
 
 /// What a read is held to throughout.
-type Held = { data: Bytes, form: Form, string: Int }
+type Input = { data: Bytes, form: Form, string: Int }
 
 /// An item read, the offset after it, and how many more items the read may take.
-type Got = { value: Value, at: Int, left: Int }
+type ItemResult = { value: Value, at: Int, left: Int }
 
 /// An initial byte and its argument: the major type, the additional information, the argument's
 /// bits, whether eight bytes of it pass an `Int`, and the offset after it.
 type Head = { major: Int, info: Int, arg: Int, wide: Bool, at: Int }
 
-fn head(c: Held, at: Int) -> Head / {cbor.refused} =
-  if at < 0 || at >= c.data.len() { refuse(at, Truncated) } else {
+fn head(c: Input, at: Int) -> Head / {cbor.fail} =
+  if at < 0 || at >= c.data.len() { fail(at, Truncated) } else {
     let first = c.data.at(at);
     let info = first & 31;
     if info < 24 || info == 31 {
       { major: first >> 5, info: info, arg: info, wide: false, at: at + 1 }
-    } else if info > 27 { refuse(at, Reserved(first)) } else {
+    } else if info > 27 { fail(at, Reserved(first)) } else {
       let width = 1 << info - 24;
-      if width > c.data.len() - at - 1 { refuse(at, Truncated) } else {
+      if width > c.data.len() - at - 1 { fail(at, Truncated) } else {
         let arg = range(at + 1, at + 1 + width).fold(0, |acc: Int, i: Int| acc << 8 | c.data.at(i));
         { major: first >> 5, info: info, arg: arg, wide: arg < 0, at: at + 1 + width }
       }
     }
   }
 
-fn strict(c: Held) -> Bool = c.form != Any
+fn strict(c: Input) -> Bool = c.form != Any
 
 /// Whether fewer bytes would have held the argument.
-fn long(h: Head) -> Bool =
+fn is_overlong(h: Head) -> Bool =
   !h.wide
     && ((h.info == 24 && h.arg < 24) || (h.info == 25 && h.arg < 0x100)
     || (h.info == 26 && h.arg < 0x1_0000)
     || (h.info == 27 && h.arg < 0x1_0000_0000))
 
-/// The item at `at`. `room` is how many levels deeper it may nest, and `left` how many items the
+/// The item at `at`. `depth_left` is how many levels deeper it may nest, and `left` how many items the
 /// read may still take, this one among them.
-fn item(c: Held, at: Int, room: Int, left: Int) -> Got / {cbor.refused, abort.raise} =
-  if left <= 0 { refuse(at, TooMany) } else {
+fn item(c: Input, at: Int, depth_left: Int, left: Int) -> ItemResult / {cbor.fail, abort.raise} =
+  if left <= 0 { fail(at, TooMany) } else {
     let h = head(c, at);
     if h.major == 7 { { value: special(c, h, at), at: h.at, left: left - 1 } }
-    else if h.info == 31 && (h.major < 2 || h.major == 6) {
-      refuse(at, Reserved(h.major << 5 | 31))
-    } else if h.info == 31 && strict(c) { refuse(at, IndefiniteLength) }
-    else if strict(c) && long(h) { refuse(at, LongArgument) }
+    else if h.info == 31 && (h.major < 2 || h.major == 6) { fail(at, Reserved(h.major << 5 | 31)) }
+    else if h.info == 31 && strict(c) { fail(at, IndefiniteLength) }
+    else if strict(c) && is_overlong(h) { fail(at, OverlongArgument) }
     else if h.major < 2 { { value: integer(h), at: h.at, left: left - 1 } }
     else if h.major < 4 { string(c, h, at, left - 1) }
-    else if h.wide { refuse(at, TooWide) }
-    else if room <= 0 { refuse(at, TooDeep) }
-    else if h.major == 4 { items(c, h, room - 1, left - 1) }
-    else if h.major == 5 { fields(c, h, room - 1, left - 1) } else {
-      let inner = item(c, h.at, room - 1, left - 1);
+    else if h.wide { fail(at, TooWide) }
+    else if depth_left <= 0 { fail(at, TooDeep) }
+    else if h.major == 4 { items(c, h, depth_left - 1, left - 1) }
+    else if h.major == 5 { fields(c, h, depth_left - 1, left - 1) } else {
+      let inner = item(c, h.at, depth_left - 1, left - 1);
       { value: tagged(c, at, h.arg, inner.value), at: inner.at, left: inner.left }
     }
   }
@@ -396,44 +395,44 @@ fn integer(h: Head) -> Value =
   else if h.major == 0 { Int(h.arg) }
   else { Int(-1 - h.arg) }
 
-fn special(c: Held, h: Head, at: Int) -> Value / {cbor.refused} =
+fn special(c: Input, h: Head, at: Int) -> Value / {cbor.fail} =
   if h.info < 20 { Simple(h.info) }
-  else if h.info < 22 { Flag(h.info == 21) }
+  else if h.info < 22 { Boolean(h.info == 21) }
   else if h.info == 22 { Null }
   else if h.info == 23 { Undefined }
-  else if h.info == 24 { if h.arg < 32 { refuse(at, BadSimple) } else { Simple(h.arg) } }
-  else if h.info == 31 { refuse(at, StrayBreak) } else {
+  else if h.info == 24 { if h.arg < 32 { fail(at, BadSimple) } else { Simple(h.arg) } }
+  else if h.info == 31 { fail(at, UnexpectedBreak) } else {
     let double = if h.info == 25 { widened(h.arg, 5, 10) }
     else if h.info == 26 { widened(h.arg, 8, 23) }
     else { h.arg };
     let narrower = (h.info == 26 && narrowed(double, 5, 10) != None)
       || (h.info == 27 && narrowed(double, 8, 23) != None);
-    if strict(c) && narrower { refuse(at, LongFloat) } else { Float(Float::of_bits(double)) }
+    if strict(c) && narrower { fail(at, OverlongFloat) } else { Float(Float::of_bits(double)) }
   }
 
 /// The integer a tag 2 or 3 makes of a byte string; any other tagged item is itself.
-fn tagged(c: Held, at: Int, number: Int, inner: Value) -> Value / {cbor.refused, abort.raise} =
+fn tagged(c: Input, at: Int, number: Int, inner: Value) -> Value / {cbor.fail, abort.raise} =
   match inner {
-    Bits(octets) -> if number != 2 && number != 3 { Tagged(number, inner) }
-    else if strict(c) && (octets.len() <= 8 || octets.at(0) == 0) { refuse(at, LongBignum) }
+    ByteString(octets) -> if number != 2 && number != 3 { Tagged(number, inner) }
+    else if strict(c) && (octets.len() <= 8 || octets.at(0) == 0) { fail(at, OverlongBignum) }
     else { integer_of(number == 3, octets) },
     _ -> Tagged(number, inner),
   }
 
 /// The bytes of the string piece `h` heads, `held` being what the pieces before it hold.
-fn piece(c: Held, h: Head, at: Int, held: Int) -> Bytes / {cbor.refused, abort.raise} =
-  if h.wide { refuse(at, TooWide) }
-  else if h.arg > c.string - held { refuse(at, TooLong) }
-  else if h.arg > c.data.len() - h.at { refuse(h.at, Truncated) } else {
+fn piece(c: Input, h: Head, at: Int, held: Int) -> Bytes / {cbor.fail, abort.raise} =
+  if h.wide { fail(at, TooWide) }
+  else if h.arg > c.string - held { fail(at, TooLong) }
+  else if h.arg > c.data.len() - h.at { fail(h.at, Truncated) } else {
     let bytes = c.data.slice(h.at, h.at + h.arg);
-    if h.major == 3 && !bytes.is_utf8() { refuse(h.at, NotUtf8) } else { bytes }
+    if h.major == 3 && !bytes.is_utf8() { fail(h.at, NotUtf8) } else { bytes }
   }
 
-fn string(c: Held, h: Head, at: Int, left: Int) -> Got / {cbor.refused, abort.raise} = {
+fn string(c: Input, h: Head, at: Int, left: Int) -> ItemResult / {cbor.fail, abort.raise} = {
   let whole = if h.info == 31 { pieces(c, h.major, h.at, [], 0, c.data.len() - h.at) }
   else { { bytes: piece(c, h, at, 0), at: h.at + h.arg } };
   {
-    value: if h.major == 2 { Bits(whole.bytes) } else { Text(String::of_bytes(whole.bytes)) },
+    value: if h.major == 2 { ByteString(whole.bytes) } else { Text(String::of_bytes(whole.bytes)) },
     at: whole.at,
     left: left,
   }
@@ -442,102 +441,104 @@ fn string(c: Held, h: Head, at: Int, left: Int) -> Got / {cbor.refused, abort.ra
 /// The pieces of an indefinite-length string up to its break, joined. A piece is a byte at
 /// least, so `span`, the bytes there are, outlasts them.
 fn pieces(
-  c: Held,
+  c: Input,
   major: Int,
   at: Int,
   acc: List<Bytes>,
   held: Int,
   span: Int,
-) -> { bytes: Bytes, at: Int } / {cbor.refused, abort.raise} =
-  if span <= 0 { refuse(at, Truncated) } else {
+) -> { bytes: Bytes, at: Int } / {cbor.fail, abort.raise} =
+  if span <= 0 { fail(at, Truncated) } else {
     let h = head(c, at);
     if h.major == 7 && h.info == 31 { { bytes: Bytes::concat_all(acc), at: h.at } }
-    else if h.major != major || h.info == 31 { refuse(at, BadChunk) } else {
+    else if h.major != major || h.info == 31 { fail(at, BadChunk) } else {
       let bytes = piece(c, h, at, held);
       pieces(c, major, h.at + h.arg, acc.push(bytes), held + h.arg, span - 1)
     }
   }
 
-fn at_break(c: Held, at: Int) -> Bool = at >= 0 && at < c.data.len() && c.data.at(at) == 0xFF
+fn at_break(c: Input, at: Int) -> Bool = at >= 0 && at < c.data.len() && c.data.at(at) == 0xFF
 
 /// How many members the array or map `h` heads may hold: its count, or for an indefinite length
 /// the bytes there are, which outlast them. `each` is the fewest bytes a member takes.
-fn members(c: Held, h: Head, each: Int) -> Int / {cbor.refused, abort.raise} = {
-  let room = (c.data.len() - h.at) / each;
-  if h.info == 31 { room + 1 } else if h.arg > room { refuse(h.at, Truncated) } else { h.arg }
+fn members(c: Input, h: Head, each: Int) -> Int / {cbor.fail, abort.raise} = {
+  let depth_left = (c.data.len() - h.at) / each;
+  if h.info == 31 { depth_left + 1 }
+  else if h.arg > depth_left { fail(h.at, Truncated) }
+  else { h.arg }
 }
 
-fn items(c: Held, h: Head, room: Int, left: Int) -> Got / {cbor.refused, abort.raise} = {
-  let read = values(c, h.at, members(c, h, 1), h.info == 31, room, left, []);
+fn items(c: Input, h: Head, depth_left: Int, left: Int) -> ItemResult / {cbor.fail, abort.raise} = {
+  let read = values(c, h.at, members(c, h, 1), h.info == 31, depth_left, left, []);
   { value: Items(read.held), at: read.at, left: read.left }
 }
 
 fn values(
-  c: Held,
+  c: Input,
   at: Int,
   count: Int,
   open: Bool,
-  room: Int,
+  depth_left: Int,
   left: Int,
   acc: List<Value>,
-) -> { held: List<Value>, at: Int, left: Int } / {cbor.refused, abort.raise} =
-  if open && at_break(c, at) { { held: acc, at: at + 1, left: left } } else if count <= 0 {
-    if open { refuse(at, Truncated) } else { { held: acc, at: at, left: left } }
-  } else {
-    let got = item(c, at, room, left);
-    values(c, got.at, count - 1, open, room, got.left, acc.push(got.value))
+) -> { held: List<Value>, at: Int, left: Int } / {cbor.fail, abort.raise} =
+  if open && at_break(c, at) { { held: acc, at: at + 1, left: left } }
+  else if count <= 0 { if open { fail(at, Truncated) } else { { held: acc, at: at, left: left } } }
+  else {
+    let got = item(c, at, depth_left, left);
+    values(c, got.at, count - 1, open, depth_left, got.left, acc.push(got.value))
   }
 
-fn fields(c: Held, h: Head, room: Int, left: Int) -> Got / {cbor.refused, abort.raise} = {
-  let read = pairs(c, h.at, members(c, h, 2), h.info == 31, room, left, [], b"", Map::new());
+fn fields(c: Input, h: Head, depth_left: Int, left: Int) -> ItemResult / {cbor.fail, abort.raise} = {
+  let read = pairs(c, h.at, members(c, h, 2), h.info == 31, depth_left, left, [], b"", Map::new());
   { value: Fields(read.held), at: read.at, left: read.left }
 }
 
 /// `last` is the key before, as it was written, which a deterministic form orders the next
 /// after; `seen` is every key so far in its one encoding, which is how `Any` finds one twice.
 fn pairs(
-  c: Held,
+  c: Input,
   at: Int,
   count: Int,
   open: Bool,
-  room: Int,
+  depth_left: Int,
   left: Int,
   acc: List<Field>,
   last: Bytes,
   seen: Map<Bytes, Unit>,
-) -> { held: List<Field>, at: Int, left: Int } / {cbor.refused, abort.raise} =
-  if open && at_break(c, at) { { held: acc, at: at + 1, left: left } } else if count <= 0 {
-    if open { refuse(at, Truncated) } else { { held: acc, at: at, left: left } }
-  } else {
-    let key = item(c, at, room, left);
-    let written = c.data.slice(at, key.at);
+) -> { held: List<Field>, at: Int, left: Int } / {cbor.fail, abort.raise} =
+  if open && at_break(c, at) { { held: acc, at: at + 1, left: left } }
+  else if count <= 0 { if open { fail(at, Truncated) } else { { held: acc, at: at, left: left } } }
+  else {
+    let key = item(c, at, depth_left, left);
+    let written_hex = c.data.slice(at, key.at);
     let known = if strict(c) { seen } else {
-      let one = identity(key.value, written);
-      if seen.contains(one) { refuse(at, DuplicateKey) } else { seen.insert(one, ()) }
+      let one = key_encoding(key.value, written_hex);
+      if seen.contains(one) { fail(at, DuplicateKey) } else { seen.insert(one, ()) }
     };
     let order = if !strict(c) { Less }
-    else if c.form == LengthFirst { compare((last.len(), last), (written.len(), written)) }
-    else { compare(last, written) };
-    if order == Equal { refuse(at, DuplicateKey) }
-    else if order == Greater { refuse(at, Unsorted) } else {
-      let value = item(c, key.at, room, key.left);
+    else if c.form == LengthFirst { compare((last.len(), last), (written_hex.len(), written_hex)) }
+    else { compare(last, written_hex) };
+    if order == Equal { fail(at, DuplicateKey) }
+    else if order == Greater { fail(at, Unsorted) } else {
+      let value = item(c, key.at, depth_left, key.left);
       pairs(
         c,
         value.at,
         count - 1,
         open,
-        room,
+        depth_left,
         value.left,
         acc.push({ key: key.value, value: value.value }),
-        written,
+        written_hex,
         known,
       )
     }
   }
 
-/// The one encoding of a key that was read, which `written` is where it has no other.
-fn identity(key: Value, written: Bytes) -> Bytes / {abort.raise} =
-  match try[cbor.unwritable] { write(key) } { Ok(one) -> one, Err(_) -> written }
+/// The one encoding of a key that was read, which `written_hex` is where it has no other.
+fn key_encoding(key: Value, written_hex: Bytes) -> Bytes / {abort.raise} =
+  match try[cbor.unwritable] { write(key) } { Ok(one) -> one, Err(_) -> written_hex }
 
 // --- Tags -----------------------------------------------------------------------
 
@@ -545,8 +546,8 @@ fn identity(key: Value, written: Bytes) -> Bytes / {abort.raise} =
 pub fn to_big_int(v: Value) -> Option<BigInt> =
   match v {
     Int(n) -> Some(bigint::of_int(n)),
-    Unsigned(octets) | Tagged(2, Bits(octets)) -> Some(bigint::of_bytes(octets)),
-    Negative(octets) | Tagged(3, Bits(octets)) ->
+    Unsigned(octets) | Tagged(2, ByteString(octets)) -> Some(bigint::of_bytes(octets)),
+    Negative(octets) | Tagged(3, ByteString(octets)) ->
       Some(bigint::of_int(-1) - bigint::of_bytes(octets)),
     _ -> None,
   }
@@ -591,7 +592,7 @@ pub fn diagnostic(v: Value) -> String / {abort.raise} =
       Some(n) -> bigint::to_string(n),
       None -> "",
     },
-    Bits(b) -> "h'" ++ b.hex_of() ++ "'",
+    ByteString(b) -> "h'" ++ b.hex_of() ++ "'",
     Text(s) -> json::to_string(json::Str(s)),
     Items(held) -> "[" ++ String::join(held.map(diagnostic), ", ") ++ "]",
     Fields(held) ->
@@ -599,7 +600,7 @@ pub fn diagnostic(v: Value) -> String / {abort.raise} =
         ++ String::join(held.map(|f: Field| diagnostic(f.key) ++ ": " ++ diagnostic(f.value)), ", ")
         ++ "}",
     Tagged(number, inner) -> number.to_string() ++ "(" ++ diagnostic(inner) ++ ")",
-    Flag(b) -> if b { "true" } else { "false" },
+    Boolean(b) -> if b { "true" } else { "false" },
     Null -> "null",
     Undefined -> "undefined",
     Simple(n) -> "simple(" ++ n.to_string() ++ ")",
@@ -611,23 +612,23 @@ fn shown(v: Value) -> String =
 
 // --- Properties -----------------------------------------------------------------
 
-fn roomy() -> Limits = within(64, 1000000, 1000000)
+fn large_limits() -> Limits = limits_of(64, 1000000, 1000000)
 
-fn within(depth: Int, items: Int, string: Int) -> Limits =
+fn limits_of(depth: Int, items: Int, string: Int) -> Limits =
   { depth: depth, items: items, string: string }
 
 fn writable(v: Value) -> Bool / {abort.raise} = encode(v).is_ok()
 
 /// A `Value` as a test draws one.
-fn values_drawn_at(depth: Int) -> gen::Gen<Value> =
+fn arbitrary_values_at(depth: Int) -> gen::Gen<Value> =
   if depth <= 0 {
     gen::one_of([
       gen::map(gen::any_int(), |f0: Int| Int(f0)),
       gen::map(gen::bytes(), |f0: Bytes| Unsigned(f0)),
       gen::map(gen::bytes(), |f0: Bytes| Negative(f0)),
-      gen::map(gen::bytes(), |f0: Bytes| Bits(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| ByteString(f0)),
       gen::map(gen::text(), |f0: String| Text(f0)),
-      gen::map(gen::bool(), |f0: Bool| Flag(f0)),
+      gen::map(gen::bool(), |f0: Bool| Boolean(f0)),
       gen::constant(Null),
       gen::constant(Undefined),
       gen::map(gen::any_int(), |f0: Int| Simple(f0)),
@@ -638,22 +639,23 @@ fn values_drawn_at(depth: Int) -> gen::Gen<Value> =
       gen::map(gen::any_int(), |f0: Int| Int(f0)),
       gen::map(gen::bytes(), |f0: Bytes| Unsigned(f0)),
       gen::map(gen::bytes(), |f0: Bytes| Negative(f0)),
-      gen::map(gen::bytes(), |f0: Bytes| Bits(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| ByteString(f0)),
       gen::map(gen::text(), |f0: String| Text(f0)),
-      gen::map(gen::list_of(values_drawn_at(depth - 1), 3), |f0: List<Value>| Items(f0)),
+      gen::map(gen::list_of(arbitrary_values_at(depth - 1), 3), |f0: List<Value>| Items(f0)),
       gen::map(
         gen::list_of(
           gen::map2(
-            values_drawn_at(depth - 1),
-            values_drawn_at(depth - 1),
+            arbitrary_values_at(depth - 1),
+            arbitrary_values_at(depth - 1),
             |key: Value, value: Value| -> Field { { key: key, value: value } },
           ),
           3,
         ),
         |f0: List<Field>| Fields(f0),
       ),
-      gen::map2(gen::any_int(), values_drawn_at(depth - 1), |f0: Int, f1: Value| Tagged(f0, f1)),
-      gen::map(gen::bool(), |f0: Bool| Flag(f0)),
+      gen::map2(gen::any_int(), arbitrary_values_at(depth - 1), |f0: Int, f1: Value|
+        Tagged(f0, f1)),
+      gen::map(gen::bool(), |f0: Bool| Boolean(f0)),
       gen::constant(Null),
       gen::constant(Undefined),
       gen::map(gen::any_int(), |f0: Int| Simple(f0)),
@@ -661,20 +663,23 @@ fn values_drawn_at(depth: Int) -> gen::Gen<Value> =
     ])
   }
 
-fn values_drawn() -> gen::Gen<Value> =
-  gen::sized(|size: Int| values_drawn_at(min(max(size / 16, 0), 3)))
+fn arbitrary_values() -> gen::Gen<Value> =
+  gen::sized(|size: Int| arbitrary_values_at(min(max(size / 16, 0), 3)))
 
 test "a value that writes reads back as itself" {
-  gen::check(values_drawn(), |v: Value|
-    if writable(v) { decode(write(v), Any, roomy()) == Ok(v) } else { true })
+  gen::check(arbitrary_values(), |v: Value|
+    if writable(v) { decode(write(v), Any, large_limits()) == Ok(v) } else { true })
 }
 
 test "what is written, cut short anywhere, is truncated" {
-  gen::check2(values_drawn(), gen::any_int(), |v: Value, cut: Int|
+  gen::check2(arbitrary_values(), gen::any_int(), |v: Value, cut: Int|
     if writable(v) {
       let whole = write(v);
       let short = whole.slice(0, (cut & 0x7FFF_FFFF) % whole.len());
-      match decode(short, Any, roomy()) { Err(refusal) -> refusal.why == Truncated, Ok(_) -> false }
+      match decode(short, Any, large_limits()) {
+        Err(refusal) -> refusal.reason == Truncated,
+        Ok(_) -> false,
+      }
     } else { true })
 }
 
@@ -786,23 +791,23 @@ fn examples() -> List<Example> =
 
 test "RFC 8949 Appendix A: {c.hex} is {c.diagnostic}" for c: Example in examples() {
   let bytes = Bytes::of_hex(c.hex);
-  let v = read(bytes, Any, roomy());
+  let v = read(bytes, Any, large_limits());
   assert_eq(diagnostic(v), c.diagnostic);
-  assert_eq(is_deterministic(bytes, roomy()), c.deterministic);
-  let written = write(v);
-  assert_eq(written == bytes, c.deterministic);
-  assert_eq(decode(written, Deterministic, roomy()), Ok(v))
+  assert_eq(is_deterministic(bytes, large_limits()), c.deterministic);
+  let written_hex = write(v);
+  assert_eq(written_hex == bytes, c.deterministic);
+  assert_eq(decode(written_hex, Deterministic, large_limits()), Ok(v))
 }
 
-fn written(v: Value) -> String / {cbor.unwritable, abort.raise} = write(v).hex_of()
+fn written_hex(v: Value) -> String / {cbor.unwritable, abort.raise} = write(v).hex_of()
 
-fn refused(hex: String, form: Form, limits: Limits) -> Option<Refusal> / {abort.raise} =
+fn error_of(hex: String, form: Form, limits: Limits) -> Option<Error> / {abort.raise} =
   match decode(Bytes::of_hex(hex), form, limits) { Ok(_) -> None, Err(refusal) -> Some(refusal) }
 
 test "an integer is written in the fewest bytes, and past 64 bits as a bignum" {
   assert_eq(
     [0, 23, 24, 255, 256, 65535, 65536, 4294967295, 4294967296, 9223372036854775807].map(
-      |n: Int| written(Int(n)),
+      |n: Int| written_hex(Int(n)),
     ),
     [
       "00",
@@ -818,30 +823,35 @@ test "an integer is written in the fewest bytes, and past 64 bits as a bignum" {
     ],
   );
   assert_eq(
-    [-1, -24, -25, -256, -257, -65537, -9223372036854775807 - 1].map(|n: Int| written(Int(n))),
+    [-1, -24, -25, -256, -257, -65537, -9223372036854775807 - 1].map(|n: Int| written_hex(Int(n))),
     ["20", "37", "3818", "38ff", "390100", "3a00010000", "3b7fffffffffffffff"],
   );
-  assert_eq(written(Unsigned(Bytes::of_hex("8000000000000000"))), "1b8000000000000000");
-  assert_eq(written(Negative(Bytes::of_hex("8000000000000000"))), "3b8000000000000000");
-  assert_eq(written(Unsigned(Bytes::of_hex("010000000000000000"))), "c249010000000000000000");
-  assert_eq(written(Unsigned(Bytes::of_hex("0000ff"))), "18ff");
-  assert_eq(written(Unsigned(Bytes::of_hex("0100"))), "190100");
-  assert_eq(written(Unsigned(b"")), "00");
-  assert_eq(written(Negative(b"")), "20");
-  assert_eq(written(Tagged(3, Bits(Bytes::of_hex("ff")))), "38ff")
+  assert_eq(written_hex(Unsigned(Bytes::of_hex("8000000000000000"))), "1b8000000000000000");
+  assert_eq(written_hex(Negative(Bytes::of_hex("8000000000000000"))), "3b8000000000000000");
+  assert_eq(written_hex(Unsigned(Bytes::of_hex("010000000000000000"))), "c249010000000000000000");
+  assert_eq(written_hex(Unsigned(Bytes::of_hex("0000ff"))), "18ff");
+  assert_eq(written_hex(Unsigned(Bytes::of_hex("0100"))), "190100");
+  assert_eq(written_hex(Unsigned(b"")), "00");
+  assert_eq(written_hex(Negative(b"")), "20");
+  assert_eq(written_hex(Tagged(3, ByteString(Bytes::of_hex("ff")))), "38ff")
 }
 
 test "strings, arrays, tags and the simple values are written under their shortest heads" {
-  assert_eq(written(Bits(b"")), "40");
-  assert_eq(written(Bits(Bytes::of_hex("01020304"))), "4401020304");
-  assert_eq(written(Text("IETF")), "6449455446");
-  assert_eq(written(Text("\u{6c34}")), "63e6b0b4");
-  assert_eq(written(Bits(b"\x00".repeat(24))), "5818" ++ b"\x00".repeat(24).hex_of());
-  assert_eq(written(Items([Int(1), Items([Int(2), Int(3)]), Items([])])), "830182020380");
-  assert_eq(written(Tagged(1, Int(1363896240))), "c11a514b67b0");
-  assert_eq(written(Tagged(55799, Null)), "d9d9f7f6");
-  assert_eq([Flag(false), Flag(true), Null, Undefined].map(written), ["f4", "f5", "f6", "f7"]);
-  assert_eq([Simple(0), Simple(19), Simple(32), Simple(255)].map(written), [
+  assert_eq(written_hex(ByteString(b"")), "40");
+  assert_eq(written_hex(ByteString(Bytes::of_hex("01020304"))), "4401020304");
+  assert_eq(written_hex(Text("IETF")), "6449455446");
+  assert_eq(written_hex(Text("\u{6c34}")), "63e6b0b4");
+  assert_eq(written_hex(ByteString(b"\x00".repeat(24))), "5818" ++ b"\x00".repeat(24).hex_of());
+  assert_eq(written_hex(Items([Int(1), Items([Int(2), Int(3)]), Items([])])), "830182020380");
+  assert_eq(written_hex(Tagged(1, Int(1363896240))), "c11a514b67b0");
+  assert_eq(written_hex(Tagged(55799, Null)), "d9d9f7f6");
+  assert_eq([Boolean(false), Boolean(true), Null, Undefined].map(written_hex), [
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+  ]);
+  assert_eq([Simple(0), Simple(19), Simple(32), Simple(255)].map(written_hex), [
     "e0",
     "f3",
     "f820",
@@ -852,16 +862,16 @@ test "strings, arrays, tags and the simple values are written under their shorte
 test "a float is written in the narrowest width that holds its bits" {
   assert_eq(
     [0.0, -0.0, 1.5, 65504.0, 5.960464477539063e-8, 100000.0, 1.401298464324817e-45].map(
-      |f: Float| written(Float(f)),
+      |f: Float| written_hex(Float(f)),
     ),
     ["f90000", "f98000", "f93e00", "f97bff", "f90001", "fa47c35000", "fa00000001"],
   );
-  assert_eq(written(Float(1.1)), "fb3ff199999999999a");
+  assert_eq(written_hex(Float(1.1)), "fb3ff199999999999a");
   // A program sees one NaN, whatever bits made it, and it is written in a half.
-  assert_eq(written(Float(Float::of_bits(0x7FF8_0000_0000_0000))), "f97e00");
-  assert_eq(written(Float(Float::of_bits(0x7FF8_0000_2000_0000))), "f97e00");
-  assert_eq(written(Float(Float::of_bits(0xFFF8_0000_0000_0001))), "f97e00");
-  assert_eq(written(Float(Float::of_bits(1))), "fb0000000000000001")
+  assert_eq(written_hex(Float(Float::of_bits(0x7FF8_0000_0000_0000))), "f97e00");
+  assert_eq(written_hex(Float(Float::of_bits(0x7FF8_0000_2000_0000))), "f97e00");
+  assert_eq(written_hex(Float(Float::of_bits(0xFFF8_0000_0000_0001))), "f97e00");
+  assert_eq(written_hex(Float(Float::of_bits(1))), "fb0000000000000001")
 }
 
 test "a half and a single below their normal range read to the double they are" {
@@ -874,18 +884,18 @@ test "a half and a single below their normal range read to the double they are" 
   ];
   assert_eq(
     small.map(|c: { hex: String, float: Float }|
-      read(Bytes::of_hex(c.hex), Deterministic, roomy())),
+      read(Bytes::of_hex(c.hex), Deterministic, large_limits())),
     small.map(|c: { hex: String, float: Float }| Float(c.float)),
   );
   assert_eq(
-    small.map(|c: { hex: String, float: Float }| written(Float(c.float))),
+    small.map(|c: { hex: String, float: Float }| written_hex(Float(c.float))),
     small.map(|c: { hex: String, float: Float }| c.hex),
   )
 }
 
 test "a map is written in the order of its keys' encodings, however it was built" {
   let built = Fields([
-    field(Flag(false), Int(8)),
+    field(Boolean(false), Int(8)),
     field(Items([Int(-1)]), Int(7)),
     field(Items([Int(100)]), Int(6)),
     field(Text("aa"), Int(5)),
@@ -894,8 +904,8 @@ test "a map is written in the order of its keys' encodings, however it was built
     field(Int(100), Int(2)),
     field(Int(10), Int(1)),
   ]);
-  assert_eq(written(built), "a80a011864022003617a046261610581186406812007f408");
-  let back = read(write(built), Deterministic, roomy());
+  assert_eq(written_hex(built), "a80a011864022003617a046261610581186406812007f408");
+  let back = read(write(built), Deterministic, large_limits());
   assert_eq(back, built);
   assert_eq(
     diagnostic(back),
@@ -913,7 +923,7 @@ test "a value with no encoding says why" {
   assert_eq(encode(Tagged(-1, Null)), Err(BadTag));
   assert_eq(encode(Fields([field(Int(1), Null), field(Int(1), Null)])), Err(DuplicateKey));
   assert_eq(
-    encode(Items([Fields([field(Int(1), Null), field(Unsigned(b"\x01"), Flag(true))])])),
+    encode(Items([Fields([field(Int(1), Null), field(Unsigned(b"\x01"), Boolean(true))])])),
     Err(DuplicateKey),
   );
   assert_eq(encode(Simple(20)), Ok(b"\xf4"))
@@ -926,19 +936,19 @@ test "a value is the item it names, whatever spelling of it was built" {
   );
   assert_eq(Unsigned(b"\x00\x05"), Int(5));
   assert_eq(Negative(b""), Int(-1));
-  assert_eq(Tagged(2, Bits(b"\x05")), Int(5));
+  assert_eq(Tagged(2, ByteString(b"\x05")), Int(5));
   assert_eq(
-    Tagged(3, Bits(Bytes::of_hex("010000000000000000"))),
+    Tagged(3, ByteString(Bytes::of_hex("010000000000000000"))),
     Negative(Bytes::of_hex("010000000000000000")),
   );
-  assert_eq(Simple(21), Flag(true));
+  assert_eq(Simple(21), Boolean(true));
   assert_eq(
     Float(Float::of_bits(0x7FF8_0000_0000_0000)),
     Float(Float::of_bits(0x7FF8_0000_0000_0000)),
   );
   assert(Float(0.0) != Float(-0.0));
   assert(Float(1.0) != Int(1));
-  assert(Bits(b"a") != Text("a"));
+  assert(ByteString(b"a") != Text("a"));
   assert(Tagged(2, Int(5)) != Int(5));
   assert(
     Unsigned(Bytes::of_hex("8000000000000000")) != Negative(Bytes::of_hex("8000000000000000")),
@@ -947,85 +957,88 @@ test "a value is the item it names, whatever spelling of it was built" {
   assert_eq(named.get(Unsigned(b"\x01")), Some("one"));
   assert_eq(named.get(Fields([field(Simple(22), Null)])), Some("map"));
   assert_eq(named.get(Float(1.0)), None);
-  assert_eq(digest(Tagged(2, Bits(b"\x05"))), digest(Int(5)));
-  assert_eq(f"{Items([Int(1), Text("a"), Bits(b"\x01")])}", "[1, \"a\", h'01']")
+  assert_eq(digest(Tagged(2, ByteString(b"\x05"))), digest(Int(5)));
+  assert_eq(f"{Items([Int(1), Text("a"), ByteString(b"\x01")])}", "[1, \"a\", h'01']")
 }
 
 test "any form refuses what is no item, saying where" {
-  let lax = |hex: String| refused(hex, Any, roomy());
-  assert_eq(lax(""), Some({ at: 0, why: Truncated }));
-  assert_eq(lax("18"), Some({ at: 0, why: Truncated }));
-  assert_eq(lax("6261"), Some({ at: 1, why: Truncated }));
-  assert_eq(lax("9a00ffffff"), Some({ at: 5, why: Truncated }));
-  assert_eq(lax("a2010203"), Some({ at: 1, why: Truncated }));
-  assert_eq(lax("9f01"), Some({ at: 2, why: Truncated }));
-  assert_eq(lax("8118"), Some({ at: 1, why: Truncated }));
-  assert_eq(lax("821819"), Some({ at: 3, why: Truncated }));
+  let lax = |hex: String| error_of(hex, Any, large_limits());
+  assert_eq(lax(""), Some({ at: 0, reason: Truncated }));
+  assert_eq(lax("18"), Some({ at: 0, reason: Truncated }));
+  assert_eq(lax("6261"), Some({ at: 1, reason: Truncated }));
+  assert_eq(lax("9a00ffffff"), Some({ at: 5, reason: Truncated }));
+  assert_eq(lax("a2010203"), Some({ at: 1, reason: Truncated }));
+  assert_eq(lax("9f01"), Some({ at: 2, reason: Truncated }));
+  assert_eq(lax("8118"), Some({ at: 1, reason: Truncated }));
+  assert_eq(lax("821819"), Some({ at: 3, reason: Truncated }));
   assert_eq(lax("5f404040ff"), None);
-  assert_eq(lax("0001"), Some({ at: 1, why: Trailing }));
-  assert_eq(lax("1c"), Some({ at: 0, why: Reserved(0x1C) }));
-  assert_eq(lax("3f"), Some({ at: 0, why: Reserved(0x3F) }));
-  assert_eq(lax("df00"), Some({ at: 0, why: Reserved(0xDF) }));
-  assert_eq(lax("fc"), Some({ at: 0, why: Reserved(0xFC) }));
-  assert_eq(lax("ff"), Some({ at: 0, why: StrayBreak }));
-  assert_eq(lax("8101ff"), Some({ at: 2, why: Trailing }));
-  assert_eq(lax("bf01ff"), Some({ at: 2, why: StrayBreak }));
-  assert_eq(lax("5f6161ff"), Some({ at: 1, why: BadChunk }));
-  assert_eq(lax("5f5f4101ffff"), Some({ at: 1, why: BadChunk }));
-  assert_eq(lax("62c328"), Some({ at: 1, why: NotUtf8 }));
-  assert_eq(lax("7f61c361bcff"), Some({ at: 2, why: NotUtf8 }));
-  assert_eq(lax("f800"), Some({ at: 0, why: BadSimple }));
-  assert_eq(lax("f81f"), Some({ at: 0, why: BadSimple }));
+  assert_eq(lax("0001"), Some({ at: 1, reason: Trailing }));
+  assert_eq(lax("1c"), Some({ at: 0, reason: Reserved(0x1C) }));
+  assert_eq(lax("3f"), Some({ at: 0, reason: Reserved(0x3F) }));
+  assert_eq(lax("df00"), Some({ at: 0, reason: Reserved(0xDF) }));
+  assert_eq(lax("fc"), Some({ at: 0, reason: Reserved(0xFC) }));
+  assert_eq(lax("ff"), Some({ at: 0, reason: UnexpectedBreak }));
+  assert_eq(lax("8101ff"), Some({ at: 2, reason: Trailing }));
+  assert_eq(lax("bf01ff"), Some({ at: 2, reason: UnexpectedBreak }));
+  assert_eq(lax("5f6161ff"), Some({ at: 1, reason: BadChunk }));
+  assert_eq(lax("5f5f4101ffff"), Some({ at: 1, reason: BadChunk }));
+  assert_eq(lax("62c328"), Some({ at: 1, reason: NotUtf8 }));
+  assert_eq(lax("7f61c361bcff"), Some({ at: 2, reason: NotUtf8 }));
+  assert_eq(lax("f800"), Some({ at: 0, reason: BadSimple }));
+  assert_eq(lax("f81f"), Some({ at: 0, reason: BadSimple }));
   assert_eq(lax("f820"), None);
-  assert_eq(lax("5b8000000000000000"), Some({ at: 0, why: TooWide }));
-  assert_eq(lax("9b8000000000000000"), Some({ at: 0, why: TooWide }));
-  assert_eq(lax("db800000000000000000"), Some({ at: 0, why: TooWide }))
+  assert_eq(lax("5b8000000000000000"), Some({ at: 0, reason: TooWide }));
+  assert_eq(lax("9b8000000000000000"), Some({ at: 0, reason: TooWide }));
+  assert_eq(lax("db800000000000000000"), Some({ at: 0, reason: TooWide }))
 }
 
 test "a map with one key twice is refused, however the two were written" {
-  let lax = |hex: String| refused(hex, Any, roomy());
-  assert_eq(lax("a201020103"), Some({ at: 3, why: DuplicateKey }));
-  assert_eq(lax("a20102180103"), Some({ at: 3, why: DuplicateKey }));
-  assert_eq(lax("a2f93c0001fb3ff000000000000002"), Some({ at: 5, why: DuplicateKey }));
-  assert_eq(lax("a2c2410101c242000102"), Some({ at: 5, why: DuplicateKey }));
+  let lax = |hex: String| error_of(hex, Any, large_limits());
+  assert_eq(lax("a201020103"), Some({ at: 3, reason: DuplicateKey }));
+  assert_eq(lax("a20102180103"), Some({ at: 3, reason: DuplicateKey }));
+  assert_eq(lax("a2f93c0001fb3ff000000000000002"), Some({ at: 5, reason: DuplicateKey }));
+  assert_eq(lax("a2c2410101c242000102"), Some({ at: 5, reason: DuplicateKey }));
   assert_eq(lax("a2c2410101c242010002"), None)
 }
 
 test "a reader keeps to the depth, the items and the string length it was given" {
   let nested = |levels: Int| b"\x81".repeat(levels).hex_of() ++ "00";
-  assert_eq(refused(nested(64), Any, within(64, 65, 0)), None);
-  assert_eq(refused(nested(65), Any, within(64, 66, 0)), Some({ at: 64, why: TooDeep }));
-  assert_eq(refused("c1c1c100", Any, within(2, 4, 0)), Some({ at: 2, why: TooDeep }));
-  assert_eq(refused("a1a1000000", Any, within(1, 9, 0)), Some({ at: 1, why: TooDeep }));
-  assert_eq(refused("00", Any, within(0, 1, 0)), None);
-  assert_eq(refused("83010203", Any, within(1, 4, 0)), None);
-  assert_eq(refused("83010203", Any, within(1, 3, 0)), Some({ at: 3, why: TooMany }));
-  assert_eq(refused("a10102", Any, within(1, 2, 0)), Some({ at: 2, why: TooMany }));
-  assert_eq(refused("c100", Any, within(1, 1, 0)), Some({ at: 1, why: TooMany }));
-  assert_eq(refused("a10102", Any, within(1, 3, 0)), None);
-  assert_eq(refused("83f4f5f6", Any, within(1, 4, 0)), None);
-  assert_eq(refused("83f4f5f6", Any, within(1, 3, 0)), Some({ at: 3, why: TooMany }));
-  assert_eq(refused("83616161626163", Any, within(1, 4, 1)), None);
-  assert_eq(refused("83616161626163", Any, within(1, 3, 1)), Some({ at: 5, why: TooMany }));
-  assert_eq(refused("00", Any, within(0, 0, 0)), Some({ at: 0, why: TooMany }));
-  assert_eq(refused("4401020304", Any, within(0, 1, 4)), None);
-  assert_eq(refused("4401020304", Any, within(0, 1, 3)), Some({ at: 0, why: TooLong }));
-  assert_eq(refused("6449455446", Any, within(0, 1, 3)), Some({ at: 0, why: TooLong }));
-  assert_eq(refused("5f42010243030405ff", Any, within(0, 1, 5)), None);
-  assert_eq(refused("5f42010243030405ff", Any, within(0, 1, 4)), Some({ at: 4, why: TooLong }));
+  assert_eq(error_of(nested(64), Any, limits_of(64, 65, 0)), None);
+  assert_eq(error_of(nested(65), Any, limits_of(64, 66, 0)), Some({ at: 64, reason: TooDeep }));
+  assert_eq(error_of("c1c1c100", Any, limits_of(2, 4, 0)), Some({ at: 2, reason: TooDeep }));
+  assert_eq(error_of("a1a1000000", Any, limits_of(1, 9, 0)), Some({ at: 1, reason: TooDeep }));
+  assert_eq(error_of("00", Any, limits_of(0, 1, 0)), None);
+  assert_eq(error_of("83010203", Any, limits_of(1, 4, 0)), None);
+  assert_eq(error_of("83010203", Any, limits_of(1, 3, 0)), Some({ at: 3, reason: TooMany }));
+  assert_eq(error_of("a10102", Any, limits_of(1, 2, 0)), Some({ at: 2, reason: TooMany }));
+  assert_eq(error_of("c100", Any, limits_of(1, 1, 0)), Some({ at: 1, reason: TooMany }));
+  assert_eq(error_of("a10102", Any, limits_of(1, 3, 0)), None);
+  assert_eq(error_of("83f4f5f6", Any, limits_of(1, 4, 0)), None);
+  assert_eq(error_of("83f4f5f6", Any, limits_of(1, 3, 0)), Some({ at: 3, reason: TooMany }));
+  assert_eq(error_of("83616161626163", Any, limits_of(1, 4, 1)), None);
+  assert_eq(error_of("83616161626163", Any, limits_of(1, 3, 1)), Some({ at: 5, reason: TooMany }));
+  assert_eq(error_of("00", Any, limits_of(0, 0, 0)), Some({ at: 0, reason: TooMany }));
+  assert_eq(error_of("4401020304", Any, limits_of(0, 1, 4)), None);
+  assert_eq(error_of("4401020304", Any, limits_of(0, 1, 3)), Some({ at: 0, reason: TooLong }));
+  assert_eq(error_of("6449455446", Any, limits_of(0, 1, 3)), Some({ at: 0, reason: TooLong }));
+  assert_eq(error_of("5f42010243030405ff", Any, limits_of(0, 1, 5)), None);
+  assert_eq(
+    error_of("5f42010243030405ff", Any, limits_of(0, 1, 4)),
+    Some({ at: 4, reason: TooLong }),
+  );
   // A length that claims more than there is is truncation, whatever it claims.
-  assert_eq(refused("5a7fffffff", Any, roomy()), Some({ at: 0, why: TooLong }));
-  assert_eq(refused("5a000f0000", Any, roomy()), Some({ at: 5, why: Truncated }))
+  assert_eq(error_of("5a7fffffff", Any, large_limits()), Some({ at: 0, reason: TooLong }));
+  assert_eq(error_of("5a000f0000", Any, large_limits()), Some({ at: 5, reason: Truncated }))
 }
 
 test "a deterministic form reads what write emits and refuses every other spelling" {
-  let exact = |hex: String| refused(hex, Deterministic, roomy());
-  let any = |hex: String| decode(Bytes::of_hex(hex), Any, roomy()).ok();
+  let exact = |hex: String| error_of(hex, Deterministic, large_limits());
+  let any = |hex: String| decode(Bytes::of_hex(hex), Any, large_limits()).ok();
   assert_eq(["1817", "1900ff", "1a0000ffff", "1b00000000ffffffff"].map(exact), [
-    Some({ at: 0, why: LongArgument }),
-    Some({ at: 0, why: LongArgument }),
-    Some({ at: 0, why: LongArgument }),
-    Some({ at: 0, why: LongArgument }),
+    Some({ at: 0, reason: OverlongArgument }),
+    Some({ at: 0, reason: OverlongArgument }),
+    Some({ at: 0, reason: OverlongArgument }),
+    Some({ at: 0, reason: OverlongArgument }),
   ]);
   assert_eq(["1817", "1900ff", "1a0000ffff", "1b00000000ffffffff"].map(any), [
     Some(Int(23)),
@@ -1039,17 +1052,17 @@ test "a deterministic form reads what write emits and refuses every other spelli
     None,
     None,
   ]);
-  assert_eq(exact("3800"), Some({ at: 0, why: LongArgument }));
-  assert_eq(exact("5800"), Some({ at: 0, why: LongArgument }));
-  assert_eq(exact("980100"), Some({ at: 0, why: LongArgument }));
-  assert_eq(exact("d80100"), Some({ at: 0, why: LongArgument }));
-  assert_eq(exact("8200190001"), Some({ at: 2, why: LongArgument }));
-  assert_eq(exact("9fff"), Some({ at: 0, why: IndefiniteLength }));
-  assert_eq(exact("5f4101ff"), Some({ at: 0, why: IndefiniteLength }));
-  assert_eq(exact("bfff"), Some({ at: 0, why: IndefiniteLength }));
-  assert_eq(exact("fa3fc00000"), Some({ at: 0, why: LongFloat }));
-  assert_eq(exact("fb3ff8000000000000"), Some({ at: 0, why: LongFloat }));
-  assert_eq(exact("fb40f86a0000000000"), Some({ at: 0, why: LongFloat }));
+  assert_eq(exact("3800"), Some({ at: 0, reason: OverlongArgument }));
+  assert_eq(exact("5800"), Some({ at: 0, reason: OverlongArgument }));
+  assert_eq(exact("980100"), Some({ at: 0, reason: OverlongArgument }));
+  assert_eq(exact("d80100"), Some({ at: 0, reason: OverlongArgument }));
+  assert_eq(exact("8200190001"), Some({ at: 2, reason: OverlongArgument }));
+  assert_eq(exact("9fff"), Some({ at: 0, reason: IndefiniteLength }));
+  assert_eq(exact("5f4101ff"), Some({ at: 0, reason: IndefiniteLength }));
+  assert_eq(exact("bfff"), Some({ at: 0, reason: IndefiniteLength }));
+  assert_eq(exact("fa3fc00000"), Some({ at: 0, reason: OverlongFloat }));
+  assert_eq(exact("fb3ff8000000000000"), Some({ at: 0, reason: OverlongFloat }));
+  assert_eq(exact("fb40f86a0000000000"), Some({ at: 0, reason: OverlongFloat }));
   // Each of these is one bit of exponent or of fraction past what the narrower width holds.
   assert_eq(["fa47800000", "fa3f801000", "fb47f0000000000000", "fb3ff0000010000000"].map(exact), [
     None,
@@ -1059,50 +1072,56 @@ test "a deterministic form reads what write emits and refuses every other spelli
   ]);
   assert_eq(exact("fa47c35000"), None);
   assert_eq(any("fb3ff8000000000000"), Some(Float(1.5)));
-  assert_eq(exact("c24101"), Some({ at: 0, why: LongBignum }));
-  assert_eq(exact("c248ffffffffffffffff"), Some({ at: 0, why: LongBignum }));
-  assert_eq(exact("c24a00010000000000000000"), Some({ at: 0, why: LongBignum }));
+  assert_eq(exact("c24101"), Some({ at: 0, reason: OverlongBignum }));
+  assert_eq(exact("c248ffffffffffffffff"), Some({ at: 0, reason: OverlongBignum }));
+  assert_eq(exact("c24a00010000000000000000"), Some({ at: 0, reason: OverlongBignum }));
   assert_eq(exact("c249010000000000000000"), None);
   assert_eq(any("c24101"), Some(Int(1)));
   assert_eq(any("c340"), Some(Int(-1)));
   assert_eq(any("c248ffffffffffffffff"), Some(Unsigned(Bytes::of_hex("ffffffffffffffff"))));
   assert_eq(any("c24a00010000000000000000"), any("c249010000000000000000"));
   assert_eq(any("c2820102"), Some(Tagged(2, Items([Int(1), Int(2)]))));
-  assert_eq(exact("a202000100"), Some({ at: 3, why: Unsorted }));
-  assert_eq(exact("a201000100"), Some({ at: 3, why: DuplicateKey }));
+  assert_eq(exact("a202000100"), Some({ at: 3, reason: Unsorted }));
+  assert_eq(exact("a201000100"), Some({ at: 3, reason: DuplicateKey }));
   assert_eq(exact("a201000200"), None);
-  assert(is_deterministic(Bytes::of_hex("a201000200"), roomy()));
-  assert(!is_deterministic(Bytes::of_hex("a202000100"), roomy()))
+  assert(is_deterministic(Bytes::of_hex("a201000200"), large_limits()));
+  assert(!is_deterministic(Bytes::of_hex("a202000100"), large_limits()))
 }
 
 test "the two deterministic forms order a map's keys their own ways" {
   let bytewise = "a80a011864022003617a046261610581186406812007f408";
   let length_first = "a80a012003f408186402617a048120076261610581186406";
-  assert_eq(refused(bytewise, Deterministic, roomy()), None);
-  assert_eq(refused(bytewise, LengthFirst, roomy()), Some({ at: 6, why: Unsorted }));
-  assert_eq(refused(length_first, LengthFirst, roomy()), None);
-  assert_eq(refused(length_first, Deterministic, roomy()), Some({ at: 7, why: Unsorted }));
+  assert_eq(error_of(bytewise, Deterministic, large_limits()), None);
+  assert_eq(error_of(bytewise, LengthFirst, large_limits()), Some({ at: 6, reason: Unsorted }));
+  assert_eq(error_of(length_first, LengthFirst, large_limits()), None);
   assert_eq(
-    decode(Bytes::of_hex(length_first), LengthFirst, roomy()),
-    decode(Bytes::of_hex(bytewise), Deterministic, roomy()),
+    error_of(length_first, Deterministic, large_limits()),
+    Some({ at: 7, reason: Unsorted }),
   );
-  assert_eq(refused("a21801000200", LengthFirst, roomy()), Some({ at: 1, why: LongArgument }))
+  assert_eq(
+    decode(Bytes::of_hex(length_first), LengthFirst, large_limits()),
+    decode(Bytes::of_hex(bytewise), Deterministic, large_limits()),
+  );
+  assert_eq(
+    error_of("a21801000200", LengthFirst, large_limits()),
+    Some({ at: 1, reason: OverlongArgument }),
+  )
 }
 
 test "items one after another are read one at a time" {
   let data = Bytes::of_hex("0183010203616100ff");
-  let one = read_at(data, 0, Any, roomy());
-  let two = read_at(data, one.at, Any, roomy());
-  let three = read_at(data, two.at, Any, roomy());
+  let one = read_at(data, 0, Any, large_limits());
+  let two = read_at(data, one.at, Any, large_limits());
+  let three = read_at(data, two.at, Any, large_limits());
   assert_eq((one, two, three), (
     { value: Int(1), at: 1 },
     { value: Items([Int(1), Int(2), Int(3)]), at: 5 },
     { value: Text("a"), at: 7 },
   ));
   assert_eq(data.slice(three.at, data.len()), b"\x00\xff");
-  assert_eq(try { read_at(data, 8, Any, roomy()) }, Err({ at: 8, why: StrayBreak }));
-  assert_eq(try { read_at(data, 9, Any, roomy()) }, Err({ at: 9, why: Truncated }));
-  assert_eq(try { read(data, Any, roomy()) }, Err({ at: 1, why: Trailing }))
+  assert_eq(try { read_at(data, 8, Any, large_limits()) }, Err({ at: 8, reason: UnexpectedBreak }));
+  assert_eq(try { read_at(data, 9, Any, large_limits()) }, Err({ at: 9, reason: Truncated }));
+  assert_eq(try { read(data, Any, large_limits()) }, Err({ at: 1, reason: Trailing }))
 }
 
 test "an integer past an Int crosses to a BigInt and back" {
@@ -1117,15 +1136,15 @@ test "an integer past an Int crosses to a BigInt and back" {
   assert_eq(of_big_int(bigint"9223372036854775807"), Int(9223372036854775807));
   assert_eq(of_big_int(bigint"-9223372036854775808"), Int(-9223372036854775807 - 1));
   assert_eq(
-    to_big_int(read(Bytes::of_hex("1bffffffffffffffff"), Any, roomy())),
+    to_big_int(read(Bytes::of_hex("1bffffffffffffffff"), Any, large_limits())),
     Some(two_64 - bigint::one()),
   );
   assert_eq(
-    to_big_int(read(Bytes::of_hex("3bffffffffffffffff"), Any, roomy())),
+    to_big_int(read(Bytes::of_hex("3bffffffffffffffff"), Any, large_limits())),
     Some(bigint::neg(two_64)),
   );
   assert_eq(
-    to_big_int(read(Bytes::of_hex("c349010000000000000000"), Any, roomy())),
+    to_big_int(read(Bytes::of_hex("c349010000000000000000"), Any, large_limits())),
     Some(bigint::neg(two_64) - bigint::one()),
   );
   assert_eq(to_big_int(Int(-7)), Some(bigint::of_int(-7)));
@@ -1137,11 +1156,11 @@ test "a tag 1 time is an instant counted from the epoch" {
   assert_eq(of_instant(Instant(-1000000000)), Tagged(1, Int(-1)));
   assert_eq(of_instant(Instant(1500000000)), Tagged(1, Float(1.5)));
   assert_eq(
-    to_instant(read(Bytes::of_hex("c11a514b67b0"), Any, roomy())),
+    to_instant(read(Bytes::of_hex("c11a514b67b0"), Any, large_limits())),
     Some(Instant(1363896240000000000)),
   );
   assert_eq(
-    to_instant(read(Bytes::of_hex("c1fb41d452d9ec200000"), Any, roomy())),
+    to_instant(read(Bytes::of_hex("c1fb41d452d9ec200000"), Any, large_limits())),
     Some(Instant(1363896240500000000)),
   );
   assert_eq(to_instant(Tagged(1, Int(9223372036854775807))), None);

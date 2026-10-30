@@ -1,12 +1,13 @@
 //! The reference graph over every top-level definition: the index of what each module declares and exports.
 
 import compiler.syntax.parsing (Span, Ident, QName)
-import compiler.syntax.exprs (Tagged, tagged_parser, prelude_module)
-import compiler.syntax.items (Item, FnDef, TypeDef, EffectDef, TestDef, LawDef, is_pub, IInstance,
-                              InstanceDef, InstanceKind, NKey, NShow, NInvariant, NHost, NRelease,
-                              NumericDef, member_name, member_of)
+import compiler.syntax.exprs (TaggedLiteral, tagged_parser, prelude_module)
+import compiler.syntax.items (Item, FnDef, TypeDef, EffectDef, TestDef, LawDef, is_pub,
+                              InstanceItem, InstanceDef, InstanceKind, KeyInstance, ShowInstance,
+                              InvariantInstance, HostInstance, ReleaseInstance, NumericDef,
+                              member_name, member_of)
 import compiler.check.resolve.tables (ParsedModule, Diag, error_at_and)
-import compiler.check.resolve.scopes (of_module)
+import compiler.check.resolve.scopes (method_binder_module)
 import std.list
 import std.option
 import std.bytes
@@ -47,7 +48,7 @@ type ScopeIndex = {
   modules: Map<Bytes, Int>,
   /// The modules whose functions of types a call on a value here may call: itself, and each it
   /// imports, directly or through others.
-  sees: List<Int>,
+  visible_modules: List<Int>,
 }
 
 pub type Index = {
@@ -75,7 +76,7 @@ pub fn simple_of(qualified: Bytes, owner: Bytes) -> Bytes / {abort.raise} = {
   } else { qualified }
 }
 
-pub type Building = {
+pub type IndexBuilder = {
   nodes: List<Node>,
   tests: List<TestNode>,
   laws: List<LawNode>,
@@ -84,9 +85,9 @@ pub type Building = {
   diags: List<Diag>,
 }
 
-pub type Declaring = { map: Map<Bytes, Int>, spans: Map<Bytes, Span>, diags: List<Diag> }
+pub type Declarations = { map: Map<Bytes, Int>, spans: Map<Bytes, Span>, diags: List<Diag> }
 
-pub fn declare(d: Declaring, m: Int, name: Ident, id: Int, what: Bytes) -> Declaring =
+pub fn declare(d: Declarations, m: Int, name: Ident, id: Int, what: Bytes) -> Declarations =
   match d.spans.get(name.name) {
     Some(first) ->
       {
@@ -119,7 +120,7 @@ pub fn declare(d: Declaring, m: Int, name: Ident, id: Int, what: Bytes) -> Decla
       },
   }
 
-pub fn no_declaring(diags: List<Diag>) -> Declaring =
+pub fn no_declarations(diags: List<Diag>) -> Declarations =
   { map: Map::new(), spans: Map::new(), diags: diags }
 
 /// Each type's `key`, then its `show`, then its `invariant`, then its `release`, and an effect's
@@ -128,7 +129,7 @@ pub fn no_declaring(diags: List<Diag>) -> Declaring =
 pub fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
   items.fold(Map::new(), |acc: Map<Bytes, List<InstanceDef>>, item: Item|
     match item {
-      IInstance(d) -> {
+      InstanceItem(d) -> {
         let held = match acc.get(d.target.name) { Some(xs) -> xs, None -> [] };
         let rank = instance_rank(d.kind);
         acc.insert(
@@ -142,7 +143,13 @@ pub fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
     })
 
 fn instance_rank(kind: InstanceKind) -> Int =
-  match kind { NKey -> 0, NShow -> 1, NInvariant -> 2, NRelease -> 3, NHost -> 4 }
+  match kind {
+    KeyInstance -> 0,
+    ShowInstance -> 1,
+    InvariantInstance -> 2,
+    ReleaseInstance -> 3,
+    HostInstance -> 4,
+  }
 
 pub fn is_effect(index: Index, v: Int) -> Bool / {abort.raise} =
   match index.nodes.get(v).body { NodeEffect(_) -> true, _ -> false }
@@ -161,7 +168,7 @@ fn target(
       Some(owner) -> Some({ owner: owner, name: name }),
       // A function of a type is written through a binder of its module that no import wrote,
       // or through the type.
-      None -> match of_module(binder) {
+      None -> match method_binder_module(binder) {
         None -> match ((ns, scope.types.get(binder))) {
           (0, Some(of)) -> Some({ owner: of.owner, name: member_name(of.name, name) }),
           // A language type's are the prelude's where it writes one in Ply, as the checker binds
@@ -170,7 +177,7 @@ fn target(
             let home = b"std.".concat(Bytes::of_string(String::of_bytes(binder).ascii_lower()));
             let member = member_name(binder, name);
             let seen = |wanted: (Int) -> Bool / {abort.raise}|
-              scope.sees.fold(None, |found: Option<Target>, k: Int|
+              scope.visible_modules.fold(None, |found: Option<Target>, k: Int|
                 match found {
                   Some(_) -> found,
                   None -> if wanted(k) { Some({ owner: k, name: member }) } else { None },
@@ -209,9 +216,9 @@ fn exports(index: Index, qual: Option<Bytes>, node: Int) -> Bool / {abort.raise}
   match qual {
     None -> true,
     Some(_) -> match index.nodes.get(node).body {
-      NodeFn(d) -> is_pub(d.vis),
-      NodeType(d) -> is_pub(d.vis),
-      NodeEffect(d) -> is_pub(d.vis),
+      NodeFn(d) -> is_pub(d.visibility),
+      NodeType(d) -> is_pub(d.visibility),
+      NodeEffect(d) -> is_pub(d.visibility),
     },
   }
 
@@ -249,7 +256,7 @@ pub fn value_target(
   }
 
 /// The definition a tagged literal's check runs, by its program-wide name, as `module` names it.
-pub fn tagged_target(index: Index, module: Int, t: Tagged) -> Option<Bytes> / {abort.raise} =
+pub fn tagged_target(index: Index, module: Int, t: TaggedLiteral) -> Option<Bytes> / {abort.raise} =
   match value_target(index, module, tagged_parser(t)) {
     Some(FnTarget(node)) -> Some(index.nodes.get(node).name),
     _ -> None,
@@ -257,12 +264,12 @@ pub fn tagged_target(index: Index, module: Int, t: Tagged) -> Option<Bytes> / {a
 
 /// What a name `module` writes as a value denotes: a definition, by its program-wide name, or a
 /// constructor, by its own name and its type's program-wide one.
-pub type Denoted =
+pub type Denotation =
   | DenotesFn(Bytes)
   | DenotesCtor({ type_name: Bytes, name: Bytes })
   | DenotesNothing
 
-pub fn denoted(index: Index, module: Int, qname: QName) -> Denoted / {abort.raise} =
+pub fn denotation(index: Index, module: Int, qname: QName) -> Denotation / {abort.raise} =
   match value_target(index, module, qname) {
     Some(FnTarget(node)) -> DenotesFn(index.nodes.get(node).name),
     Some(CtorTarget(c)) -> DenotesCtor({ type_name: index.nodes.get(c.owner).name, name: c.name }),
@@ -270,14 +277,22 @@ pub fn denoted(index: Index, module: Int, qname: QName) -> Denoted / {abort.rais
   }
 
 /// The program-wide name of the effect `module` names `qname`.
-pub fn effect_called(index: Index, module: Int, qname: QName) -> Option<Bytes> / {abort.raise} =
+pub fn qualified_effect_name(
+  index: Index,
+  module: Int,
+  qname: QName,
+) -> Option<Bytes> / {abort.raise} =
   match effect_target(index, module, qname) {
     Some(v) -> Some(index.nodes.get(v).name),
     None -> None,
   }
 
 /// The program-wide name of the type `module` names `qname`.
-pub fn type_named(index: Index, module: Int, qname: QName) -> Option<Bytes> / {abort.raise} =
+pub fn qualified_type_name(
+  index: Index,
+  module: Int,
+  qname: QName,
+) -> Option<Bytes> / {abort.raise} =
   match type_target(index, module, qualifier(qname), qname.name.name) {
     Some(v) -> Some(index.nodes.get(v).name),
     None -> None,

@@ -1,22 +1,28 @@
 //! Parameter defaults: what one may be, qualified against the module that wrote it, and filled into every call.
 
 import compiler.syntax.parsing (Span, Ident, dummy_span, is_bare, starts_upper)
-import compiler.syntax.items (Item, IFn, ITest, ILaw, FnDef, SpecClause, Binder, parse, is_pub)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm, HandleClause,
-                              ReturnClause, HandlerVar, RecField, expr_span, ETagged, Hole,
-                              home_modules, sees_homes)
-import compiler.syntax.calls (slotted, slot_args, Slot, FromDefault, Unplaced, NoSuchParameter,
-                              FilledByPosition)
+import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDef, SpecClause, Binder,
+                              parse, is_pub)
+import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, BinaryExpression,
+                              UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                              MatchExpression, BlockExpression, RecordExpression,
+                              RecordUpdateExpression, PropagateExpression, FieldExpression,
+                              ListExpression, PerformExpression, HandleExpression,
+                              WithHoldExpression, SimulateExpression, ParallelExpression,
+                              InvalidExpression, HoleExpression, TryBlockExpression, Stmt,
+                              LetStatement, LetElseStatement, ExpressionStatement,
+                              AssignmentStatement, Param, NamedArg, MatchArm, HandleClause,
+                              ReturnClause, HandlerVar, RecordLiteralField, expr_span,
+                              TaggedLiteralExpression, Hole, home_modules, sees_homes)
+import compiler.syntax.calls (slotted, ordered_arguments, Slot, FromDefault, UnmatchedReason,
+                              NoSuchParameter, FilledByPosition)
 import std.list
 import compiler.check.known (none_ctor)
 import compiler.check.resolve.tables (ParsedModule, ValueSpace, ModuleBinding, Scope, Diag,
-                                      Resolved, lookup_declared, find_module_binding, qualify,
+                                      Resolution, lookup_declared, find_module_binding, qualify,
                                       error_at, list_names, ParamInfo, Parameters)
-import compiler.check.resolve.scopes (find, of_binder)
-import compiler.check.resolve.sets (reach, bytes_concat_diags)
+import compiler.check.resolve.scopes (find, method_binder)
+import compiler.check.resolve.sets (add_module_binding, concat_diagnostics)
 import compiler.check.resolve.bindings (item_binders)
 
 // --- Defaults: qualifying one against the module that wrote it -----------------------------
@@ -50,12 +56,16 @@ fn refused(qualifier: Qualifier, span: Span) -> Qualifier =
     ),
   }
 
-type Qualified = { q: Qualifier, e: Expr }
+type QualifyResult = { q: Qualifier, e: Expr }
 
-fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualified / {abort.raise} =
+fn qualify_expr(
+  resolved: Resolution,
+  qualifier: Qualifier,
+  expr: Expr,
+) -> QualifyResult / {abort.raise} =
   match expr {
-    EHole(_) -> { q: qualifier, e: expr },
-    EVar(v) -> if !is_bare(v.name) { { q: qualifier, e: expr } } else {
+    HoleExpression(_) -> { q: qualifier, e: expr },
+    NameExpression(v) -> if !is_bare(v.name) { { q: qualifier, e: expr } } else {
       match qualifier.binders.get(v.name.name.span.site) {
         Some(binder) -> if !qualifier.params.contains(binder) { { q: qualifier, e: expr } } else {
           {
@@ -107,7 +117,7 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
               e: expr,
             }
           } else {
-            let module = of_binder(resolved.scopes.get(b.owner).module);
+            let module = method_binder(resolved.scopes.get(b.owner).module);
             let imports = match find_module_binding(qualifier.imports, module) {
               Some(_) -> qualifier.imports,
               None ->
@@ -115,7 +125,7 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
             };
             {
               q: { ..qualifier, imports: imports },
-              e: EVar({
+              e: NameExpression({
                 span: v.span,
                 name: {
                   module: Some({ name: module, span: v.name.span }),
@@ -128,12 +138,12 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
         },
       }
     },
-    ELambda(l) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, l.body);
-      { q: o.q, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
+    LambdaExpression(l) -> {
+      let o: QualifyResult = qualify_expr(resolved, qualifier, l.body);
+      { q: o.q, e: LambdaExpression({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
     },
-    EApp(a) -> if a.named.len() > 0
-        || !(match a.func { EVar(v) -> starts_upper(v.name.name.name), _ -> false }) {
+    CallExpression(a) -> if a.named.len() > 0
+        || !(match a.func { NameExpression(v) -> starts_upper(v.name.name.name), _ -> false }) {
       { q: refused(qualifier, a.span), e: expr }
     } else {
       let f = qualify_expr(resolved, qualifier, a.func);
@@ -147,96 +157,105 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
       );
       {
         q: named.q,
-        e: EApp({ span: a.span, func: f.e, named: named.xs, args: args.xs, labels: a.labels }),
+        e: CallExpression({
+          span: a.span,
+          func: f.e,
+          named: named.xs,
+          args: args.xs,
+          labels: a.labels,
+        }),
       }
     },
-    EMatch(m) -> {
-      let s: Qualified = qualify_expr(resolved, qualifier, m.scrutinee);
+    MatchExpression(m) -> {
+      let s: QualifyResult = qualify_expr(resolved, qualifier, m.scrutinee);
       let arms = m.arms.fold(
         { q: s.q, xs: [] },
         |acc: { q: Qualifier, xs: List<MatchArm> }, arm: MatchArm| {
           let g: { q: Qualifier, e: Option<Expr> } = match arm.guard {
             None -> { q: acc.q, e: None },
             Some(x) -> {
-              let o: Qualified = qualify_expr(resolved, acc.q, x);
+              let o: QualifyResult = qualify_expr(resolved, acc.q, x);
               { q: o.q, e: Some(o.e) }
             },
           };
-          let body: Qualified = qualify_expr(resolved, g.q, arm.body);
+          let body: QualifyResult = qualify_expr(resolved, g.q, arm.body);
           { q: body.q, xs: acc.xs.push({ pat: arm.pat, guard: g.e, body: body.e, span: arm.span }) }
         },
       );
-      { q: arms.q, e: EMatch({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
+      { q: arms.q, e: MatchExpression({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
     },
-    EBlock(b) -> {
+    BlockExpression(b) -> {
       let stmts: { q: Qualifier, xs: List<Stmt> } = b.stmts.fold(
         { q: qualifier, xs: [] },
         |acc: { q: Qualifier, xs: List<Stmt> }, s: Stmt|
           match s {
-            SLet(l) -> {
-              let o: Qualified = qualify_expr(resolved, acc.q, l.value);
-              { q: o.q, xs: acc.xs.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })) }
+            LetStatement(l) -> {
+              let o: QualifyResult = qualify_expr(resolved, acc.q, l.value);
+              {
+                q: o.q,
+                xs: acc.xs.push(LetStatement({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
+              }
             },
-            SLetElse(l) -> {
-              let o: Qualified = qualify_expr(resolved, acc.q, l.value);
-              let fb: Qualified = qualify_expr(resolved, o.q, l.fallback);
-              { q: fb.q, xs: acc.xs.push(SLetElse({ ..l, value: o.e, fallback: fb.e })) }
+            LetElseStatement(l) -> {
+              let o: QualifyResult = qualify_expr(resolved, acc.q, l.value);
+              let fb: QualifyResult = qualify_expr(resolved, o.q, l.fallback);
+              { q: fb.q, xs: acc.xs.push(LetElseStatement({ ..l, value: o.e, fallback: fb.e })) }
             },
-            SExpr(x) -> {
-              let o: Qualified = qualify_expr(resolved, acc.q, x);
-              { q: o.q, xs: acc.xs.push(SExpr(o.e)) }
+            ExpressionStatement(x) -> {
+              let o: QualifyResult = qualify_expr(resolved, acc.q, x);
+              { q: o.q, xs: acc.xs.push(ExpressionStatement(o.e)) }
             },
-            SAssign(x) -> { q: refused(acc.q, x.span), xs: acc.xs.push(s) },
+            AssignmentStatement(x) -> { q: refused(acc.q, x.span), xs: acc.xs.push(s) },
           },
       );
       let tail: { q: Qualifier, e: Option<Expr> } = match b.tail {
         None -> { q: stmts.q, e: None },
         Some(t) -> {
-          let o: Qualified = qualify_expr(resolved, stmts.q, t);
+          let o: QualifyResult = qualify_expr(resolved, stmts.q, t);
           { q: o.q, e: Some(o.e) }
         },
       };
-      { q: tail.q, e: EBlock({ span: b.span, tail: tail.e, stmts: stmts.xs }) }
+      { q: tail.q, e: BlockExpression({ span: b.span, tail: tail.e, stmts: stmts.xs }) }
     },
-    EBinary(b) -> {
+    BinaryExpression(b) -> {
       let l = qualify_expr(resolved, qualifier, b.lhs);
       let rr = qualify_expr(resolved, l.q, b.rhs);
-      { q: rr.q, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
+      { q: rr.q, e: BinaryExpression({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
     },
-    EUnary(u) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, u.operand);
-      { q: o.q, e: EUnary({ span: u.span, op: u.op, operand: o.e }) }
+    UnaryExpression(u) -> {
+      let o: QualifyResult = qualify_expr(resolved, qualifier, u.operand);
+      { q: o.q, e: UnaryExpression({ span: u.span, op: u.op, operand: o.e }) }
     },
-    EIf(i) -> {
+    IfExpression(i) -> {
       let c = qualify_expr(resolved, qualifier, i.cond);
       let t = qualify_expr(resolved, c.q, i.then_branch);
       let el = qualify_expr(resolved, t.q, i.else_branch);
-      { q: el.q, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+      { q: el.q, e: IfExpression({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
     },
-    ERecord(rec) -> {
+    RecordExpression(rec) -> {
       let o = qualify_fields(resolved, qualifier, rec.fields);
-      { q: o.q, e: ERecord({ span: rec.span, fields: o.xs }) }
+      { q: o.q, e: RecordExpression({ span: rec.span, fields: o.xs }) }
     },
-    ERecordUpdate(rec) -> {
+    RecordUpdateExpression(rec) -> {
       let b = qualify_expr(resolved, qualifier, rec.base);
       let o = qualify_fields(resolved, b.q, rec.fields);
-      { q: o.q, e: ERecordUpdate({ span: rec.span, base: b.e, fields: o.xs }) }
+      { q: o.q, e: RecordUpdateExpression({ span: rec.span, base: b.e, fields: o.xs }) }
     },
-    EField(f) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, f.base);
-      { q: o.q, e: EField({ span: f.span, base: o.e, field: f.field }) }
+    FieldExpression(f) -> {
+      let o: QualifyResult = qualify_expr(resolved, qualifier, f.base);
+      { q: o.q, e: FieldExpression({ span: f.span, base: o.e, field: f.field }) }
     },
-    EList(l) -> {
+    ListExpression(l) -> {
       let o = qualify_exprs(resolved, qualifier, l.items);
-      { q: o.q, e: EList({ span: l.span, items: o.xs }) }
+      { q: o.q, e: ListExpression({ span: l.span, items: o.xs }) }
     },
-    ELit(_) -> { q: qualifier, e: expr },
-    EBad(_) -> { q: qualifier, e: expr },
+    LiteralExpression(_) -> { q: qualifier, e: expr },
+    InvalidExpression(_) -> { q: qualifier, e: expr },
     _ -> { q: refused(qualifier, expr_span(expr)), e: expr },
   }
 
 fn qualify_exprs(
-  resolved: Resolved,
+  resolved: Resolution,
   qualifier: Qualifier,
   exprs: List<Expr>,
 ) -> { q: Qualifier, xs: List<Expr> } / {abort.raise} =
@@ -246,19 +265,19 @@ fn qualify_exprs(
   })
 
 fn qualify_fields(
-  resolved: Resolved,
+  resolved: Resolution,
   qualifier: Qualifier,
-  fields: List<RecField>,
-) -> { q: Qualifier, xs: List<RecField> } / {abort.raise} =
+  fields: List<RecordLiteralField>,
+) -> { q: Qualifier, xs: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { q: qualifier, xs: [] },
-    |acc: { q: Qualifier, xs: List<RecField> }, field: RecField| {
+    |acc: { q: Qualifier, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
       let o = qualify_expr(resolved, acc.q, field.value);
       { q: o.q, xs: acc.xs.push({ name: field.name, value: o.e }) }
     },
   )
 
-fn decl_public(resolved: Resolved, owner: Int, name: Bytes) -> Bool / {abort.raise} =
+fn decl_public(resolved: Resolution, owner: Int, name: Bytes) -> Bool / {abort.raise} =
   match lookup_declared(resolved.declarations.get(owner), ValueSpace, name) {
     Some(d) -> d.public,
     None -> false,
@@ -266,31 +285,37 @@ fn decl_public(resolved: Resolved, owner: Int, name: Bytes) -> Bool / {abort.rai
 
 // --- Defaults: the signatures ---------------------------------------------------------------
 
-type Collected = {
+type SignatureCollection = {
   sigs: List<Parameters>,
   owner_imports: List<{ module: Int, binder: Bytes, target: Int }>,
   diags: List<Diag>,
 }
 
-fn collect(resolved: Resolved, mods: List<ParsedModule>) -> Collected / {abort.raise} =
-  range(0, mods.len()).fold({ sigs: [], owner_imports: [], diags: [] }, |acc: Collected, m: Int|
-    mods.get(m).module.items.fold(acc, |c: Collected, item: Item|
-      match item { IFn(f) -> collect_fn(resolved, mods, m, c, f), _ -> c }))
+fn collect_signatures(
+  resolved: Resolution,
+  mods: List<ParsedModule>,
+) -> SignatureCollection / {abort.raise} =
+  range(0, mods.len()).fold(
+    { sigs: [], owner_imports: [], diags: [] },
+    |acc: SignatureCollection, m: Int|
+      mods.get(m).module.items.fold(acc, |c: SignatureCollection, item: Item|
+        match item { FunctionItem(f) -> collect_signature(resolved, mods, m, c, f), _ -> c }),
+  )
 
-fn collect_fn(
-  resolved: Resolved,
+fn collect_signature(
+  resolved: Resolution,
   mods: List<ParsedModule>,
   m: Int,
-  c: Collected,
+  c: SignatureCollection,
   def: FnDef,
-) -> Collected / {abort.raise} = {
+) -> SignatureCollection / {abort.raise} = {
   let binders = if def.params.any(|param: Param| param.default != None) {
-    item_binders(resolved, m, IFn(def))
+    item_binders(resolved, m, FunctionItem(def))
   } else { Map::new() };
   let params = def.params.map(|param: Param| param.name.span.site);
-  let walked: { c: Collected, params: List<ParamInfo> } = def.params.fold(
+  let walked: { c: SignatureCollection, params: List<ParamInfo> } = def.params.fold(
     { c: c, params: [] },
-    |acc: { c: Collected, params: List<ParamInfo> }, param: Param|
+    |acc: { c: SignatureCollection, params: List<ParamInfo> }, param: Param|
       match param.default {
         None ->
           { ..acc, params: acc.params.push({ name: param.name.name, default: None, imports: [] }) },
@@ -299,7 +324,7 @@ fn collect_fn(
             resolved,
             {
               owner: m,
-              public: is_pub(def.vis),
+              public: is_pub(def.visibility),
               binders: binders,
               params: params,
               imports: [],
@@ -351,7 +376,7 @@ fn builtin_signature(name: Bytes) -> Option<Parameters> =
         {
           name: b"message",
           default: Some(
-            EVar({
+            NameExpression({
               span: dummy_span(),
               name: {
                 module: None,
@@ -375,49 +400,52 @@ type Filler = {
   diags: List<Diag>,
 }
 
-type Filled = { filler: Filler, expr: Expr }
+type FillResult = { filler: Filler, expr: Expr }
 
-type Filling = { r: Resolved, index: Map<Bytes, Parameters> }
+type FillContext = { r: Resolution, index: Map<Bytes, Parameters> }
 
-fn fill_expr(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.raise} = {
+fn fill_expr(f: FillContext, filler: Filler, expr: Expr) -> FillResult / {abort.raise} = {
   // Children first, so a nested call is filled before the outer one copies it.
   let o = fill_children(f, filler, expr);
-  match o.expr { EApp(a) -> fill(f, o.filler, a), _ -> o }
+  match o.expr { CallExpression(a) -> fill_call(f, o.filler, a), _ -> o }
 }
 
-fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.raise} =
+fn fill_children(f: FillContext, filler: Filler, expr: Expr) -> FillResult / {abort.raise} =
   match expr {
-    ELit(_) -> { filler: filler, expr: expr },
-    ETagged(t) -> {
+    LiteralExpression(_) -> { filler: filler, expr: expr },
+    TaggedLiteralExpression(t) -> {
       let filled = t.holes.fold(
         { filler: filler, holes: [] },
         |acc: { filler: Filler, holes: List<Hole> }, h: Hole| {
-          let o: Filled = fill_expr(f, acc.filler, h.value);
+          let o: FillResult = fill_expr(f, acc.filler, h.value);
           { filler: o.filler, holes: acc.holes.push({ ..h, value: o.expr }) }
         },
       );
-      { filler: filled.filler, expr: ETagged({ ..t, holes: filled.holes }) }
+      { filler: filled.filler, expr: TaggedLiteralExpression({ ..t, holes: filled.holes }) }
     },
-    EVar(_) -> { filler: filler, expr: expr },
-    EHole(_) -> { filler: filler, expr: expr },
-    EBad(_) -> { filler: filler, expr: expr },
-    EBinary(b) -> {
+    NameExpression(_) -> { filler: filler, expr: expr },
+    HoleExpression(_) -> { filler: filler, expr: expr },
+    InvalidExpression(_) -> { filler: filler, expr: expr },
+    BinaryExpression(b) -> {
       let l = fill_expr(f, filler, b.lhs);
       let rr = fill_expr(f, l.filler, b.rhs);
-      { filler: rr.filler, expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: rr.expr }) }
-    },
-    EUnary(u) -> {
-      let o: Filled = fill_expr(f, filler, u.operand);
-      { filler: o.filler, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
-    },
-    ELambda(l) -> {
-      let o: Filled = fill_expr(f, filler, l.body);
       {
-        filler: o.filler,
-        expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: l.ret }),
+        filler: rr.filler,
+        expr: BinaryExpression({ span: b.span, op: b.op, lhs: l.expr, rhs: rr.expr }),
       }
     },
-    EApp(a) -> {
+    UnaryExpression(u) -> {
+      let o: FillResult = fill_expr(f, filler, u.operand);
+      { filler: o.filler, expr: UnaryExpression({ span: u.span, op: u.op, operand: o.expr }) }
+    },
+    LambdaExpression(l) -> {
+      let o: FillResult = fill_expr(f, filler, l.body);
+      {
+        filler: o.filler,
+        expr: LambdaExpression({ span: l.span, body: o.expr, params: l.params, ret: l.ret }),
+      }
+    },
+    CallExpression(a) -> {
       let fn_ = fill_expr(f, filler, a.func);
       let args = fill_exprs(f, fn_.filler, a.args);
       let named = a.named.fold(
@@ -429,7 +457,7 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       );
       {
         filler: named.filler,
-        expr: EApp({
+        expr: CallExpression({
           span: a.span,
           func: fn_.expr,
           named: named.xs,
@@ -438,16 +466,21 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
         }),
       }
     },
-    EIf(i) -> {
+    IfExpression(i) -> {
       let c = fill_expr(f, filler, i.cond);
       let t = fill_expr(f, c.filler, i.then_branch);
       let el = fill_expr(f, t.filler, i.else_branch);
       {
         filler: el.filler,
-        expr: EIf({ span: i.span, cond: c.expr, then_branch: t.expr, else_branch: el.expr }),
+        expr: IfExpression({
+          span: i.span,
+          cond: c.expr,
+          then_branch: t.expr,
+          else_branch: el.expr,
+        }),
       }
     },
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let s = fill_expr(f, filler, m.scrutinee);
       let arms = m.arms.fold(
         { filler: s.filler, xs: [] },
@@ -455,104 +488,121 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
           let g: { filler: Filler, expr: Option<Expr> } = match arm.guard {
             None -> { filler: acc.filler, expr: None },
             Some(x) -> {
-              let o: Filled = fill_expr(f, acc.filler, x);
+              let o: FillResult = fill_expr(f, acc.filler, x);
               { filler: o.filler, expr: Some(o.expr) }
             },
           };
-          let body: Filled = fill_expr(f, g.filler, arm.body);
+          let body: FillResult = fill_expr(f, g.filler, arm.body);
           {
             filler: body.filler,
             xs: acc.xs.push({ pat: arm.pat, guard: g.expr, body: body.expr, span: arm.span }),
           }
         },
       );
-      { filler: arms.filler, expr: EMatch({ span: m.span, scrutinee: s.expr, arms: arms.xs }) }
+      {
+        filler: arms.filler,
+        expr: MatchExpression({ span: m.span, scrutinee: s.expr, arms: arms.xs }),
+      }
     },
-    EBlock(b) -> {
+    BlockExpression(b) -> {
       let stmts: { filler: Filler, xs: List<Stmt> } = b.stmts.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<Stmt> }, s: Stmt|
           match s {
-            SLet(l) -> {
-              let o: Filled = fill_expr(f, acc.filler, l.value);
+            LetStatement(l) -> {
+              let o: FillResult = fill_expr(f, acc.filler, l.value);
               {
                 filler: o.filler,
-                xs: acc.xs.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
+                xs: acc.xs.push(
+                  LetStatement({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr }),
+                ),
               }
             },
-            SLetElse(l) -> {
-              let o: Filled = fill_expr(f, acc.filler, l.value);
-              let fb: Filled = fill_expr(f, o.filler, l.fallback);
+            LetElseStatement(l) -> {
+              let o: FillResult = fill_expr(f, acc.filler, l.value);
+              let fb: FillResult = fill_expr(f, o.filler, l.fallback);
               {
                 filler: fb.filler,
-                xs: acc.xs.push(SLetElse({ ..l, value: o.expr, fallback: fb.expr })),
+                xs: acc.xs.push(LetElseStatement({ ..l, value: o.expr, fallback: fb.expr })),
               }
             },
-            SExpr(x) -> {
-              let o: Filled = fill_expr(f, acc.filler, x);
-              { filler: o.filler, xs: acc.xs.push(SExpr(o.expr)) }
+            ExpressionStatement(x) -> {
+              let o: FillResult = fill_expr(f, acc.filler, x);
+              { filler: o.filler, xs: acc.xs.push(ExpressionStatement(o.expr)) }
             },
-            SAssign(x) -> {
-              let o: Filled = fill_expr(f, acc.filler, x.value);
-              { filler: o.filler, xs: acc.xs.push(SAssign({ ..x, value: o.expr })) }
+            AssignmentStatement(x) -> {
+              let o: FillResult = fill_expr(f, acc.filler, x.value);
+              { filler: o.filler, xs: acc.xs.push(AssignmentStatement({ ..x, value: o.expr })) }
             },
           },
       );
       let tail: { filler: Filler, expr: Option<Expr> } = match b.tail {
         None -> { filler: stmts.filler, expr: None },
         Some(t) -> {
-          let o: Filled = fill_expr(f, stmts.filler, t);
+          let o: FillResult = fill_expr(f, stmts.filler, t);
           { filler: o.filler, expr: Some(o.expr) }
         },
       };
-      { filler: tail.filler, expr: EBlock({ span: b.span, tail: tail.expr, stmts: stmts.xs }) }
+      {
+        filler: tail.filler,
+        expr: BlockExpression({ span: b.span, tail: tail.expr, stmts: stmts.xs }),
+      }
     },
-    ERecord(rec) -> {
+    RecordExpression(rec) -> {
       let o = fill_fields(f, filler, rec.fields);
-      { filler: o.filler, expr: ERecord({ span: rec.span, fields: o.xs }) }
+      { filler: o.filler, expr: RecordExpression({ span: rec.span, fields: o.xs }) }
     },
-    ERecordUpdate(rec) -> {
+    RecordUpdateExpression(rec) -> {
       let b = fill_expr(f, filler, rec.base);
       let o = fill_fields(f, b.filler, rec.fields);
-      { filler: o.filler, expr: ERecordUpdate({ span: rec.span, base: b.expr, fields: o.xs }) }
+      {
+        filler: o.filler,
+        expr: RecordUpdateExpression({ span: rec.span, base: b.expr, fields: o.xs }),
+      }
     },
-    EField(fl) -> {
-      let o: Filled = fill_expr(f, filler, fl.base);
-      { filler: o.filler, expr: EField({ span: fl.span, base: o.expr, field: fl.field }) }
+    FieldExpression(fl) -> {
+      let o: FillResult = fill_expr(f, filler, fl.base);
+      { filler: o.filler, expr: FieldExpression({ span: fl.span, base: o.expr, field: fl.field }) }
     },
-    EList(l) -> {
+    ListExpression(l) -> {
       let o = fill_exprs(f, filler, l.items);
-      { filler: o.filler, expr: EList({ span: l.span, items: o.xs }) }
+      { filler: o.filler, expr: ListExpression({ span: l.span, items: o.xs }) }
     },
-    ETry(t) -> {
-      let o: Filled = fill_expr(f, filler, t.operand);
-      { filler: o.filler, expr: ETry({ span: t.span, operand: o.expr }) }
+    PropagateExpression(t) -> {
+      let o: FillResult = fill_expr(f, filler, t.operand);
+      { filler: o.filler, expr: PropagateExpression({ span: t.span, operand: o.expr }) }
     },
-    EPerform(p) -> {
+    PerformExpression(p) -> {
       let o = fill_exprs(f, filler, p.args);
       {
         filler: o.filler,
-        expr: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
+        expr: PerformExpression({
+          span: p.span,
+          effect_name: p.effect_name,
+          op: p.op,
+          resource: p.resource,
+          args: o.xs,
+        }),
       }
     },
-    EHandle(h) -> {
+    HandleExpression(h) -> {
       // The variables' first values are made before the body, where the `handle` stands.
       let vars: { filler: Filler, xs: List<HandlerVar> } = h.vars.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<HandlerVar> }, v: HandlerVar| {
-          let o: Filled = fill_expr(f, acc.filler, v.init);
+          let o: FillResult = fill_expr(f, acc.filler, v.init);
           { filler: o.filler, xs: acc.xs.push({ ..v, init: o.expr }) }
         },
       );
-      let body: Filled = fill_expr(f, vars.filler, h.body);
+      let body: FillResult = fill_expr(f, vars.filler, h.body);
       let clauses: { filler: Filler, xs: List<HandleClause> } = h.clauses.fold(
         { filler: body.filler, xs: [] },
         |acc: { filler: Filler, xs: List<HandleClause> }, c: HandleClause| {
-          let o: Filled = fill_expr(f, acc.filler, c.body);
+          let o: FillResult = fill_expr(f, acc.filler, c.body);
           {
             filler: o.filler,
             xs: acc.xs.push({
-              eff: c.eff,
+              effect_name: c.effect_name,
               op: c.op,
               resource: c.resource,
               every_label: c.every_label,
@@ -568,13 +618,13 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       let ret: { filler: Filler, expr: Option<ReturnClause> } = match h.ret {
         None -> { filler: clauses.filler, expr: None },
         Some(rc) -> {
-          let o: Filled = fill_expr(f, clauses.filler, rc.body);
+          let o: FillResult = fill_expr(f, clauses.filler, rc.body);
           { filler: o.filler, expr: Some({ binder: rc.binder, body: o.expr, span: rc.span }) }
         },
       };
       {
         filler: ret.filler,
-        expr: EHandle({
+        expr: HandleExpression({
           span: h.span,
           body: body.expr,
           ret: ret.expr,
@@ -583,31 +633,36 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
         }),
       }
     },
-    EWithHold(c) -> {
-      let acquire: Filled = fill_expr(f, filler, c.acquire);
-      let release: Filled = fill_expr(f, acquire.filler, c.release);
-      let o: Filled = fill_expr(f, release.filler, c.body);
+    WithHoldExpression(c) -> {
+      let acquire: FillResult = fill_expr(f, filler, c.acquire);
+      let release: FillResult = fill_expr(f, acquire.filler, c.release);
+      let o: FillResult = fill_expr(f, release.filler, c.body);
       {
         filler: o.filler,
-        expr: EWithHold({ ..c, acquire: acquire.expr, release: release.expr, body: o.expr }),
+        expr: WithHoldExpression({
+          ..c,
+          acquire: acquire.expr,
+          release: release.expr,
+          body: o.expr,
+        }),
       }
     },
-    ESimulate(s) -> {
-      let o: Filled = fill_expr(f, filler, s.body);
-      { filler: o.filler, expr: ESimulate({ span: s.span, body: o.expr }) }
+    SimulateExpression(s) -> {
+      let o: FillResult = fill_expr(f, filler, s.body);
+      { filler: o.filler, expr: SimulateExpression({ span: s.span, body: o.expr }) }
     },
-    ETryBlock(t) -> {
-      let o: Filled = fill_expr(f, filler, t.body);
-      { filler: o.filler, expr: ETryBlock({ ..t, body: o.expr }) }
+    TryBlockExpression(t) -> {
+      let o: FillResult = fill_expr(f, filler, t.body);
+      { filler: o.filler, expr: TryBlockExpression({ ..t, body: o.expr }) }
     },
-    EParallel(v) -> {
+    ParallelExpression(v) -> {
       let o = fill_exprs(f, filler, v.branches);
-      { filler: o.filler, expr: EParallel({ span: v.span, branches: o.xs }) }
+      { filler: o.filler, expr: ParallelExpression({ span: v.span, branches: o.xs }) }
     },
   }
 
 fn fill_exprs(
-  f: Filling,
+  f: FillContext,
   filler: Filler,
   exprs: List<Expr>,
 ) -> { filler: Filler, xs: List<Expr> } / {abort.raise} =
@@ -617,21 +672,21 @@ fn fill_exprs(
   })
 
 fn fill_fields(
-  f: Filling,
+  f: FillContext,
   filler: Filler,
-  fields: List<RecField>,
-) -> { filler: Filler, xs: List<RecField> } / {abort.raise} =
+  fields: List<RecordLiteralField>,
+) -> { filler: Filler, xs: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { filler: filler, xs: [] },
-    |acc: { filler: Filler, xs: List<RecField> }, field: RecField| {
+    |acc: { filler: Filler, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
       let o = fill_expr(f, acc.filler, field.value);
       { filler: o.filler, xs: acc.xs.push({ name: field.name, value: o.expr }) }
     },
   )
 
-fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Parameters> / {abort.raise} =
+fn signature_of(f: FillContext, filler: Filler, func: Expr) -> Option<Parameters> / {abort.raise} =
   match func {
-    EVar(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
+    NameExpression(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
       if is_bare(v.name) && starts_upper(v.name.name.name) { None }
       else if is_bare(v.name) && filler.binders.contains(v.name.name.span.site) { None } else {
         match find(f.r, filler.module, ValueSpace, v.name) {
@@ -646,9 +701,9 @@ type Call = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>, l
 
 /// The perform `call` is, where it is written on a bare name nothing binds and names an
 /// argument: an operation takes none by name, so each is refused and dropped.
-fn performed(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<Filled> =
+fn as_perform(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<FillResult> =
   match on {
-    EVar(v) -> if call.named.len() == 0
+    NameExpression(v) -> if call.named.len() == 0
         || (is_bare(v.name) && filler.binders.contains(v.name.name.span.site)) { None } else {
       let written = match v.name.module {
         Some(m) -> Bytes::concat_all([m.name, b"::", v.name.name.name]),
@@ -669,9 +724,9 @@ fn performed(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<Filled> 
               ),
             )),
         },
-        expr: EPerform({
+        expr: PerformExpression({
           span: call.span,
-          eff: v.name,
+          effect_name: v.name,
           op: op,
           resource: call.labels.at(0),
           args: call.args,
@@ -681,17 +736,17 @@ fn performed(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<Filled> 
     _ -> None,
   }
 
-fn fill(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} =
+fn fill_call(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.raise} =
   match call.func {
     // A call on a value: the checker finds its callee by the value's type, and fills it then.
-    EField(on) -> match performed(filler, call, on.base, on.field) {
+    FieldExpression(on) -> match as_perform(filler, call, on.base, on.field) {
       Some(p) -> p,
-      None -> { filler: filler, expr: EApp(call) },
+      None -> { filler: filler, expr: CallExpression(call) },
     },
-    _ -> fill_named(f, filler, call),
+    _ -> fill_by_signature(f, filler, call),
   }
 
-fn fill_named(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} =
+fn fill_by_signature(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.raise} =
   match signature_of(f, filler, call.func) {
     None -> {
       // No signature: a call through a value, a constructor or an unresolved name, so a named argument names no parameter.
@@ -708,11 +763,11 @@ fn fill_named(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} 
             ],
           ),
         ));
-      { filler: { ..filler, diags: diags }, expr: EApp({ ..call, named: [] }) }
+      { filler: { ..filler, diags: diags }, expr: CallExpression({ ..call, named: [] }) }
     },
     Some(sig) ->      // Over-application is `E0202`'s to report, with the callee's own type in hand.
       if call.args.len() > sig.params.len() {
-        { filler: filler, expr: EApp({ ..call, named: [] }) }
+        { filler: filler, expr: CallExpression({ ..call, named: [] }) }
       } else { fill_slots(filler, call, sig) },
   }
 
@@ -720,20 +775,20 @@ fn fill_named(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} 
 /// parameters are: the arguments in order, as written where one is left unfilled, and where each
 /// comes from, nothing where one is; what the call gets wrong; and the modules the defaults it
 /// copied name.
-pub type FilledArgs = {
+pub type PlacedArguments = {
   args: List<Expr>,
   slots: List<Slot>,
   diags: List<Diag>,
   imports: List<ModuleBinding>,
 }
 
-pub fn filled_args(
+pub fn place_arguments(
   module: Int,
   span: Span,
   signature: Parameters,
   args: List<Expr>,
   named: List<NamedArg>,
-) -> FilledArgs / {abort.raise} = {
+) -> PlacedArguments / {abort.raise} = {
   let s = slotted(
     signature.params.map(|p: ParamInfo| p.name),
     signature.params.map(|p: ParamInfo| p.default),
@@ -741,8 +796,8 @@ pub fn filled_args(
     named,
     span,
   );
-  let unplaced = s.unplaced.map(|u: { arg: NamedArg, why: Unplaced }|
-    match u.why {
+  let unplaced = s.unplaced.map(|u: { arg: NamedArg, reason: UnmatchedReason }|
+    match u.reason {
       NoSuchParameter ->
         error_at(
           b"E0123",
@@ -769,7 +824,7 @@ pub fn filled_args(
         ),
     });
   {
-    args: if s.missing.len() > 0 { args } else { slot_args(s.slots, args, named) },
+    args: if s.missing.len() > 0 { args } else { ordered_arguments(s.slots, args, named) },
     slots: if s.missing.len() > 0 { [] } else { s.slots },
     // A call with no names in it that leaves a hole is under-applied, which is `E0202`'s.
     diags: if s.missing.len() == 0 || named.len() == 0 { unplaced } else {
@@ -801,8 +856,8 @@ pub fn filled_args(
   }
 }
 
-fn fill_slots(filler: Filler, call: Call, signature: Parameters) -> Filled / {abort.raise} = {
-  let filled = filled_args(filler.module, call.span, signature, call.args, call.named);
+fn fill_slots(filler: Filler, call: Call, signature: Parameters) -> FillResult / {abort.raise} = {
+  let filled = place_arguments(filler.module, call.span, signature, call.args, call.named);
   {
     filler: {
       ..filler,
@@ -810,18 +865,18 @@ fn fill_slots(filler: Filler, call: Call, signature: Parameters) -> Filled / {ab
       implicit: filled.imports.fold(filler.implicit, |im: List<ModuleBinding>, b: ModuleBinding|
         match find_module_binding(im, b.binder) { Some(_) -> im, None -> im.push(b) }),
     },
-    expr: EApp({ ..call, args: filled.args, named: [] }),
+    expr: CallExpression({ ..call, args: filled.args, named: [] }),
   }
 }
 
 fn fill_item(
-  f: Filling,
+  f: FillContext,
   filler: Filler,
   item: Item,
 ) -> { filler: Filler, it: Item } / {abort.raise} =
   match item {
-    IFn(d) -> {
-      // A default is not walked here: it was qualified against this module in `collect`.
+    FunctionItem(d) -> {
+      // A default is not walked here: it was qualified against this module in `collect_signatures`.
       let spec: { filler: Filler, xs: List<SpecClause> } = d.spec.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<SpecClause> }, clause: SpecClause| {
@@ -836,11 +891,11 @@ fn fill_item(
           { filler: o.filler, expr: Some(o.expr) }
         },
       };
-      let body: Filled = fill_expr(f, measured.filler, d.body);
+      let body: FillResult = fill_expr(f, measured.filler, d.body);
       {
         filler: body.filler,
-        it: IFn({
-          vis: d.vis,
+        it: FunctionItem({
+          visibility: d.visibility,
           name: d.name,
           generics: d.generics,
           params: d.params,
@@ -859,18 +914,18 @@ fn fill_item(
         }),
       }
     },
-    ITest(d) -> match d.cases {
+    TestItem(d) -> match d.cases {
       None -> {
-        let o: Filled = fill_expr(f, filler, d.body);
-        { filler: o.filler, it: ITest({ ..d, body: o.expr }) }
+        let o: FillResult = fill_expr(f, filler, d.body);
+        { filler: o.filler, it: TestItem({ ..d, body: o.expr }) }
       },
       Some(c) -> {
-        let table: Filled = fill_expr(f, filler, c.table);
-        let label: Filled = fill_expr(f, table.filler, c.label);
-        let body: Filled = fill_expr(f, label.filler, d.body);
+        let table: FillResult = fill_expr(f, filler, c.table);
+        let label: FillResult = fill_expr(f, table.filler, c.label);
+        let body: FillResult = fill_expr(f, label.filler, d.body);
         {
           filler: body.filler,
-          it: ITest({
+          it: TestItem({
             ..d,
             cases: Some({ ..c, table: table.expr, label: label.expr }),
             body: body.expr,
@@ -878,33 +933,33 @@ fn fill_item(
         }
       },
     },
-    ILaw(d) -> {
+    LawItem(d) -> {
       let g = match d.guard {
         None -> { filler: filler, expr: None },
         Some(x) -> {
-          let o: Filled = fill_expr(f, filler, x);
+          let o: FillResult = fill_expr(f, filler, x);
           { filler: o.filler, expr: Some(o.expr) }
         },
       };
-      let body: Filled = fill_expr(f, g.filler, d.body);
-      { filler: body.filler, it: ILaw({ ..d, guard: g.expr, body: body.expr }) }
+      let body: FillResult = fill_expr(f, g.filler, d.body);
+      { filler: body.filler, it: LawItem({ ..d, guard: g.expr, body: body.expr }) }
     },
     _ -> { filler: filler, it: item },
   }
 
-pub type Expanded = { r: Resolved, mods: List<ParsedModule>, diags: List<Diag> }
+pub type ResolvedProgram = { r: Resolution, mods: List<ParsedModule>, diags: List<Diag> }
 
 /// The signatures, then every module's calls, then the modules a spliced default made each one reference.
-pub fn expand(
-  r: Resolved,
+pub fn fill_defaults(
+  r: Resolution,
   mods: List<ParsedModule>,
   diags: List<Diag>,
-) -> Expanded / {abort.raise} = {
-  let c = collect(r, mods);
+) -> ResolvedProgram / {abort.raise} = {
+  let c = collect_signatures(r, mods);
   let r2 = c.owner_imports.fold(
     r,
-    |acc: Resolved, oi: { module: Int, binder: Bytes, target: Int }|
-      reach(acc, oi.module, oi.binder, oi.target),
+    |acc: Resolution, oi: { module: Int, binder: Bytes, target: Int }|
+      add_module_binding(acc, oi.module, oi.binder, oi.target),
   );
   // Indexed once: a list lookup per call is quadratic in the program. First writer wins.
   let f = {
@@ -916,8 +971,8 @@ pub fn expand(
       }),
   };
   let walked = range(0, mods.len()).fold(
-    { r: r2, mods: [], diags: bytes_concat_diags(diags, c.diags) },
-    |acc: Expanded, m: Int| {
+    { r: r2, mods: [], diags: concat_diagnostics(diags, c.diags) },
+    |acc: ResolvedProgram, m: Int| {
       let mod: ParsedModule = mods.get(m);
       let items: { filler: Filler, xs: List<Item> } = mod.module.items.fold(
         { filler: { module: m, binders: Map::new(), implicit: [], diags: acc.diags }, xs: [] },
@@ -926,8 +981,8 @@ pub fn expand(
           { filler: o.filler, xs: ia.xs.push(o.it) }
         },
       );
-      let reached = items.filler.implicit.fold(acc.r, |rr: Resolved, binding: ModuleBinding|
-        reach(rr, m, binding.binder, binding.target));
+      let reached = items.filler.implicit.fold(acc.r, |rr: Resolution, binding: ModuleBinding|
+        add_module_binding(rr, m, binding.binder, binding.target));
       {
         r: reached,
         mods: acc.mods.push({
@@ -944,8 +999,8 @@ pub fn expand(
     r: {
       ..walked.r,
       signatures: f.index,
-      sees: range(0, mods.len()).map(|m: Int| {
-        let seen = seen_from(walked.r.imports, m);
+      visible_modules: range(0, mods.len()).map(|m: Int| {
+        let seen = transitive_imports(walked.r.imports, m);
         if !sees_homes(mods.get(m).name) { seen } else {
           range(0, mods.len()).fold(seen, |acc: List<Int>, k: Int|
             if !acc.contains(k) && home_modules().contains(mods.get(k).name) { acc.push(k) }
@@ -956,7 +1011,7 @@ pub fn expand(
   }
 }
 
-fn seen_from(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.raise} =
+fn transitive_imports(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.raise} =
   iterate({ seen: [m], work: [m] }, 1000000, |s: { seen: List<Int>, work: List<Int> }|
     match s.work {
       [] -> Stop(s.seen),
@@ -976,7 +1031,7 @@ fn seen_from(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.raise} =
 /// checked reads it, and each that stands in for another holds what was named of it, a transparent
 /// function's body among that, under imports cut to fewer than the body's calls were found
 /// through. So each sees them all.
-pub fn seeing_all(r: Resolved) -> Resolved =
-  { ..r, sees: r.scopes.map(|_: Scope| range(0, r.scopes.len())) }
+pub fn make_all_visible(r: Resolution) -> Resolution =
+  { ..r, visible_modules: r.scopes.map(|_: Scope| range(0, r.scopes.len())) }
 
 // --- Tests ------------------------------------------------------------------

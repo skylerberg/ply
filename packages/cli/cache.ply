@@ -8,20 +8,20 @@ import builder (builder)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
 import compiler.front
-import compiler.front.facts (View)
-import compiler.front.rows (Outlined, OType, KnownTestRow)
-import compiler.front.published (FiledBody, filed_bodies)
-import compiler.front.seam (bodies_read, def_known_row)
+import compiler.front.facts (CheckedProgram)
+import compiler.front.rows (OutlineItem, OutlinedType, KnownTestRow)
+import compiler.front.published (StoredBody, stored_bodies)
+import compiler.front.seam (all_body_facts, def_known_row)
 import compiler.check.infer.checker (CtorInfo, DefInfo, EffectInfo, OpInfo, TestInfo, Location)
 import compiler.store.memo_files
 import compiler.check.resolve.tables (Diag, qualify)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.check.types (Type, scheme_text, type_text)
-import diagnostic (spot_of)
-import loads
+import diagnostic (position_of)
+import project_store
 import paths
 import program (Program, load_program, program_view)
-import queried
+import module_queries
 import std.bin
 import std.bytes
 import std.fs (fs)
@@ -32,7 +32,7 @@ import store.tables
 import compiler.store.hash.forms (by_name)
 import compiler.store.hash.encoding (hex)
 import diagnostic (all_to_json, all_to_text)
-import report (Answer, indent, ok_code, compile_error, count_of, warning_lines)
+import report (CommandOutput, indent, ok_code, compile_error, count_of, warning_lines)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, strings_or_null)
 import std.list
@@ -76,20 +76,20 @@ pub type Stats = {
   memo: memo_files::Usage,
 }
 
-pub type Pruned = { texts: Int }
+pub type PruneCounts = { texts: Int }
 
-pub type Compacted = {
+pub type CompactResult = {
   directory: String,
   warnings: List<Diag>,
-  dropped: Pruned,
-  memo: memo_files::Compacted,
+  dropped: PruneCounts,
+  memo: memo_files::Compaction,
   bytes_before: Int,
   bytes_after: Int,
   /// The results compaction keeps.
   results: Int,
 }
 
-pub type Cleared = { directory: String, warnings: List<Diag>, cleared: Int }
+pub type ClearResult = { directory: String, warnings: List<Diag>, cleared: Int }
 
 pub type EntryKind = | FnEntry | TypeEntry | EffectEntry | TestEntry(Bool)
 
@@ -106,10 +106,10 @@ pub type Operation = {
 }
 
 pub type Interface =
-  | OfFn(String)
-  | OfType(Int, List<Variant>)
-  | OfEffect(Bool, List<Operation>)
-  | OfTest(Bool)
+  | FunctionInterface(String)
+  | TypeInterface(Int, List<Variant>)
+  | EffectInterface(Bool, List<Operation>)
+  | TestInterface(Bool)
 
 pub type Outcome = | Passed | Failed(String)
 
@@ -156,7 +156,7 @@ fn compact_suggested(stats: Stats) -> Bool =
 // --- The refusals -----------------------------------------------------------
 
 /// One shape for every cache command, so an agent can key off `action` and `exit_code`.
-fn stopped(style: Style, action: String, why: Refusal) -> Answer / {abort.raise} = {
+fn failure_output(style: Style, action: String, why: Refusal) -> CommandOutput / {abort.raise} = {
   let head: List<Member> = [
     { key: "command", value: Str("cache") },
     { key: "action", value: Str(action) },
@@ -181,7 +181,7 @@ fn stopped(style: Style, action: String, why: Refusal) -> Answer / {abort.raise}
   }
 }
 
-fn nothing_cached(query: String) -> Diag =
+fn no_match(query: String) -> Diag =
   {
     code: b"E0101",
     notes: 1,
@@ -211,9 +211,9 @@ fn store_json(stats: Stats) -> Json = {
 fn memo_json(u: memo_files::Usage) -> Json =
   object([
     { key: "records", value: int(u.records) },
-    { key: "answers", value: int(u.answers) },
-    { key: "answer_bytes", value: int(u.answer_bytes) },
-    { key: "unread_bytes", value: int(u.unread_bytes) },
+    { key: "answers", value: int(u.results) },
+    { key: "answer_bytes", value: int(u.output_bytes) },
+    { key: "unread_bytes", value: int(u.unreferenced_bytes) },
     { key: "foreign", value: int(u.foreign) },
     { key: "reclaimable_bytes", value: int(u.reclaimable_bytes) },
     { key: "segments", value: int(u.segments) },
@@ -274,11 +274,11 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
     indent() ++ "memo · " ++ bold(style, stats.memo.records.to_string()) ++ " "
       ++ plural(stats.memo.records, "record")
       ++ " · "
-      ++ count_of(stats.memo.answers, "longer answer"),
+      ++ count_of(stats.memo.results, "longer answer"),
     indent() ++ "  " ++ count_of(stats.memo.segments, "segment") ++ " "
       ++ dim(style, size_text(stats.memo.bytes))
       ++ " · answers "
-      ++ dim(style, size_text(stats.memo.answer_bytes))
+      ++ dim(style, size_text(stats.memo.output_bytes))
       ++ " · reclaimable "
       ++ dim(style, size_text(stats.memo.reclaimable_bytes))
       ++ (if stats.memo.foreign == 0 { "" }
@@ -299,10 +299,10 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
 
 // --- `ply cache compact` ----------------------------------------------------
 
-fn reclaimed(c: Compacted) -> Int =
+fn reclaimed(c: CompactResult) -> Int =
   if c.bytes_before > c.bytes_after { c.bytes_before - c.bytes_after } else { 0 }
 
-fn compact_json(c: Compacted) -> Json / {abort.raise} =
+fn compact_json(c: CompactResult) -> Json / {abort.raise} =
   object([
     { key: "command", value: Str("cache") },
     { key: "action", value: Str("compact") },
@@ -314,7 +314,7 @@ fn compact_json(c: Compacted) -> Json / {abort.raise} =
       value: object([
         { key: "texts", value: int(c.dropped.texts) },
         { key: "records", value: int(c.memo.records) },
-        { key: "answers", value: int(c.memo.answers) },
+        { key: "answers", value: int(c.memo.results) },
       ]),
     },
     { key: "bytes_before", value: int(c.bytes_before) },
@@ -324,17 +324,17 @@ fn compact_json(c: Compacted) -> Json / {abort.raise} =
     { key: "warnings", value: all_to_json(c.warnings, []) },
   ])
 
-fn compact_lines(style: Style, c: Compacted) -> List<String> / {abort.raise} = {
+fn compact_lines(style: Style, c: CompactResult) -> List<String> / {abort.raise} = {
   let d = c.dropped;
   let head = [indent() ++ green(style, "compacted") ++ " " ++ dim(style, c.directory)];
   // Only what was dropped; zeroes would read as though something happened.
   let pruned = if d.texts == 0 { head } else {
     head.push(indent() ++ "  dropped " ++ count_of(d.texts, "definition text") ++ " no pass ran")
   };
-  let swept = if c.memo.records + c.memo.answers == 0 { pruned } else {
+  let swept = if c.memo.records + c.memo.results == 0 { pruned } else {
     pruned.push(
       indent() ++ "  dropped " ++ count_of(c.memo.records, "record") ++ " · "
-        ++ count_of(c.memo.answers, "answer")
+        ++ count_of(c.memo.results, "answer")
         ++ " nothing reads",
     )
   };
@@ -354,7 +354,7 @@ fn compact_lines(style: Style, c: Compacted) -> List<String> / {abort.raise} = {
 
 // --- `ply cache clear` ------------------------------------------------------
 
-fn clear_json(c: Cleared) -> Json / {abort.raise} =
+fn clear_json(c: ClearResult) -> Json / {abort.raise} =
   object([
     { key: "command", value: Str("cache") },
     { key: "action", value: Str("clear") },
@@ -365,7 +365,7 @@ fn clear_json(c: Cleared) -> Json / {abort.raise} =
     { key: "warnings", value: all_to_json(c.warnings, []) },
   ])
 
-fn clear_lines(style: Style, c: Cleared) -> List<String> / {abort.raise} =
+fn clear_lines(style: Style, c: ClearResult) -> List<String> / {abort.raise} =
   [
     indent() ++ green(style, "cleared") ++ " " ++ c.cleared.to_string() ++ " cached "
       ++ plural(c.cleared, "result")
@@ -377,7 +377,7 @@ fn clear_lines(style: Style, c: Cleared) -> List<String> / {abort.raise} =
 
 /// A row's atoms, one per line of the footprint: a row is written `atom,atom`, and one headed by the
 /// labels its atoms bind is shown whole.
-fn atoms_listed(row: Bytes) -> List<String> =
+fn row_atoms(row: Bytes) -> List<String> =
   if row.len() == 0 { [] }
   else if row.starts_with(b"<") { [String::of_bytes_lossy(row)] }
   else { row.split(b",").map(String::of_bytes_lossy) }
@@ -388,7 +388,7 @@ fn effect_hashes_of(ws: List<{ name: Bytes, hash: Bytes }>) -> List<EffectHash> 
 
 type Field = { label: String, value: String }
 
-fn short(hash: String) -> String = if hash.len() < 12 { hash } else { hash.slice(0, 12) }
+fn short_hash(hash: String) -> String = if hash.len() < 12 { hash } else { hash.slice(0, 12) }
 
 fn kind_text(k: EntryKind) -> String =
   match k {
@@ -401,7 +401,8 @@ fn kind_text(k: EntryKind) -> String =
 fn title_of(entry: Entry) -> String =
   match entry.kind { TestEntry(_) -> quoted(entry.name), _ -> entry.name }
 
-fn where_of(entry: Entry) -> String = match entry.location { Some(l) -> l, None -> entry.file }
+fn entry_location(entry: Entry) -> String =
+  match entry.location { Some(l) -> l, None -> entry.file }
 
 fn variant_text(v: Variant) -> String =
   if v.fields.len() == 0 { v.name } else { v.name ++ "(" ++ String::join(v.fields, ", ") ++ ")" }
@@ -415,22 +416,22 @@ fn operation_text(o: Operation) -> String = {
 fn braced(atoms: List<String>) -> String = "{" ++ String::join(atoms, ", ") ++ "}"
 
 /// The label is blank on continuation lines, so a multi-variant type reads as one block.
-fn listed(label: String, values: List<String>) -> List<Field> =
+fn labeled_fields(label: String, values: List<String>) -> List<Field> =
   range(0, values.len()).map(|i: Int|
     { label: if i == 0 { label } else { "" }, value: values.at_or(i, "") })
 
 fn rows_of(entry: Entry) -> List<Field> = {
   let shape = match entry.interface {
-    OfFn(ty) -> [{ label: "type", value: ty }],
-    OfType(parameters, variants) ->
+    FunctionInterface(ty) -> [{ label: "type", value: ty }],
+    TypeInterface(parameters, variants) ->
       [{ label: "parameters", value: parameters.to_string() }].concat(
-        listed("variants", variants.map(variant_text)),
+        labeled_fields("variants", variants.map(variant_text)),
       ),
-    OfEffect(nd, ops) ->
+    EffectInterface(nd, ops) ->
       [{ label: "nondet", value: yes_no(nd) }].concat(
-        listed("operations", ops.map(operation_text)),
+        labeled_fields("operations", ops.map(operation_text)),
       ),
-    OfTest(nd) -> [{ label: "nondet", value: yes_no(nd) }],
+    TestInterface(nd) -> [{ label: "nondet", value: yes_no(nd) }],
   };
   match entry.footprint {
     Some(atoms) -> shape.push({ label: "footprint", value: braced(atoms) }),
@@ -440,7 +441,7 @@ fn rows_of(entry: Entry) -> List<Field> = {
 
 fn not_a_test(entry: Entry) -> String =
   match entry.interface {
-    OfTest(_) -> "— not proven at this hash, so it runs next time",
+    TestInterface(_) -> "— not proven at this hash, so it runs next time",
     _ -> "— not a test",
   }
 
@@ -453,7 +454,7 @@ fn result_line(entry: Entry) -> String =
 
 fn effect_hashes_line(e: Entry) -> String =
   if e.effect_hashes.len() == 0 { "— names no effect" } else {
-    String::join(e.effect_hashes.map(|w: EffectHash| w.name ++ " → " ++ short(w.hash)), ", ")
+    String::join(e.effect_hashes.map(|w: EffectHash| w.name ++ " → " ++ short_hash(w.hash)), ", ")
   }
 
 fn body_line(entry: Entry) -> String / {abort.raise} =
@@ -462,38 +463,38 @@ fn body_line(entry: Entry) -> String / {abort.raise} =
     None -> "— none: a declaration's is its form",
   }
 
-fn under(label: String, value: String) -> String =
+fn field_line(label: String, value: String) -> String =
   indent() ++ "  " ++ label.pad_right(10, " ") ++ " " ++ value
 
 fn entry_lines(style: Style, entry: Entry) -> List<String> / {abort.raise} = {
-  let head = indent() ++ bold(style, title_of(entry)) ++ "  " ++ dim(style, short(entry.hash))
+  let head = indent() ++ bold(style, title_of(entry)) ++ "  " ++ dim(style, short_hash(entry.hash))
     ++ "  "
     ++ kind_text(entry.kind)
     ++ "  "
-    ++ dim(style, where_of(entry));
+    ++ dim(style, entry_location(entry));
   let shape = rows_of(entry).fold([head], |acc: List<String>, f: Field|
-    acc.push(under(f.label, f.value)));
+    acc.push(field_line(f.label, f.value)));
   shape.concat([
-    under("effects", effect_hashes_line(entry)),
-    under("body", body_line(entry)),
-    under("result", result_line(entry)),
+    field_line("effects", effect_hashes_line(entry)),
+    field_line("body", body_line(entry)),
+    field_line("result", result_line(entry)),
   ])
 }
 
 fn interface_json(i: Interface) -> Json =
   match i {
-    OfFn(ty) -> object([{ key: "type", value: Str(ty) }]),
-    OfType(parameters, variants) ->
+    FunctionInterface(ty) -> object([{ key: "type", value: Str(ty) }]),
+    TypeInterface(parameters, variants) ->
       object([
         { key: "parameters", value: int(parameters) },
         { key: "variants", value: strings(variants.map(variant_text)) },
       ]),
-    OfEffect(nd, ops) ->
+    EffectInterface(nd, ops) ->
       object([
         { key: "nondet", value: Bool(nd) },
         { key: "operations", value: strings(ops.map(operation_text)) },
       ]),
-    OfTest(nd) -> object([{ key: "nondet", value: Bool(nd) }]),
+    TestInterface(nd) -> object([{ key: "nondet", value: Bool(nd) }]),
   }
 
 fn body_json(b: Option<Int>) -> Json =
@@ -502,7 +503,7 @@ fn body_json(b: Option<Int>) -> Json =
 fn entry_json(e: Entry) -> Json =
   object([
     { key: "name", value: Str(title_of(e)) },
-    { key: "hash", value: Str(short(e.hash)) },
+    { key: "hash", value: Str(short_hash(e.hash)) },
     { key: "kind", value: Str(kind_text(e.kind)) },
     { key: "file", value: Str(e.file) },
     { key: "location", value: string_or_null(e.location) },
@@ -531,7 +532,7 @@ fn before(a: Entry, b: Entry) -> Bool =
     },
   }
 
-fn ordered(entries: List<Entry>) -> List<Entry> =
+fn sorted_entries(entries: List<Entry>) -> List<Entry> =
   entries.fold([], |acc: List<Entry>, entry: Entry| {
     let n = acc.len();
     let i = range(0, n).fold(n, |p: Int, j: Int|
@@ -570,9 +571,9 @@ fn inspect_lines(
 
 // --- The command ------------------------------------------------------------
 
-fn stats_answer(style: Style, answer: Result<Stats, Refusal>) -> Answer / {abort.raise} =
+fn stats_answer(style: Style, answer: Result<Stats, Refusal>) -> CommandOutput / {abort.raise} =
   match answer {
-    Err(why) -> stopped(style, "stats", why),
+    Err(why) -> failure_output(style, "stats", why),
     Ok(st) ->
       {
         json: stats_json(st),
@@ -582,9 +583,12 @@ fn stats_answer(style: Style, answer: Result<Stats, Refusal>) -> Answer / {abort
       },
   }
 
-fn compact_answer(style: Style, answer: Result<Compacted, Refusal>) -> Answer / {abort.raise} =
+fn compact_answer(
+  style: Style,
+  answer: Result<CompactResult, Refusal>,
+) -> CommandOutput / {abort.raise} =
   match answer {
-    Err(why) -> stopped(style, "compact", why),
+    Err(why) -> failure_output(style, "compact", why),
     Ok(c) ->
       {
         json: compact_json(c),
@@ -594,9 +598,12 @@ fn compact_answer(style: Style, answer: Result<Compacted, Refusal>) -> Answer / 
       },
   }
 
-fn clear_answer(style: Style, answer: Result<Cleared, Refusal>) -> Answer / {abort.raise} =
+fn clear_answer(
+  style: Style,
+  answer: Result<ClearResult, Refusal>,
+) -> CommandOutput / {abort.raise} =
   match answer {
-    Err(why) -> stopped(style, "clear", why),
+    Err(why) -> failure_output(style, "clear", why),
     Ok(c) ->
       {
         json: clear_json(c),
@@ -606,12 +613,12 @@ fn clear_answer(style: Style, answer: Result<Cleared, Refusal>) -> Answer / {abo
       },
   }
 
-fn matched(style: Style, query: String, matches: Matches) -> Answer / {abort.raise} = {
-  let entries = ordered(matches.entries);
+fn inspect_output(style: Style, query: String, matches: Matches) -> CommandOutput / {abort.raise} = {
+  let entries = sorted_entries(matches.entries);
   if entries.len() == 0 {
-    stopped(style, "inspect", {
+    failure_output(style, "inspect", {
       directory: Some(matches.directory),
-      diags: [nothing_cached(query)],
+      diags: [no_match(query)],
       warnings: matches.warnings,
     })
   } else {
@@ -628,22 +635,25 @@ fn inspect_answer(
   s: Style,
   query: String,
   answer: Result<Matches, Refusal>,
-) -> Answer / {abort.raise} =
-  match answer { Err(why) -> stopped(s, "inspect", why), Ok(m) -> matched(s, query, m) }
+) -> CommandOutput / {abort.raise} =
+  match answer {
+    Err(why) -> failure_output(s, "inspect", why),
+    Ok(m) -> inspect_output(s, query, m),
+  }
 
 // --- Working the store ------------------------------------------------------
 
-fn shown(place: loads::Place, name: String) -> String =
+fn display_path(place: project_store::StoreLocation, name: String) -> String =
   paths::displayed({
     label: place.label,
     path: if name == "" { place.dir } else { place.dir ++ "/" ++ name },
   })
 
-fn memo_dir(place: loads::Place) -> String = place.dir ++ "/memo"
+fn memo_dir(place: project_store::StoreLocation) -> String = place.dir ++ "/memo"
 
 /// What the store at `place` holds, `current` naming the queries this `ply` answers under.
 fn stats_of<[r]>(
-  place: loads::Place,
+  place: project_store::StoreLocation,
   current: Map<Bytes, Bool>,
 ) -> Stats / {fs.read[r], time.elapsed_us, abort.raise} = {
   let started = time.elapsed_us();
@@ -651,9 +661,9 @@ fn stats_of<[r]>(
   let open_us = time.elapsed_us() - started;
   let u = tables::usage(c);
   {
-    directory: shown(place, ""),
-    warnings: loads::diags_of(tables::warnings(c)),
-    format: engine::format(),
+    directory: display_path(place, ""),
+    warnings: project_store::diags_of(tables::warnings(c)),
+    format: engine::format_version(),
     root: paths::displayed({
       label: place.label,
       path: if place.label == "cwd" { place.root } else { place.root.slice(1, place.root.len()) },
@@ -672,48 +682,50 @@ fn stats_of<[r]>(
 }
 
 /// Bytes the store and the memo store's segments take on disk.
-fn kept_bytes<[r]>(place: loads::Place) -> Int / {fs.read[r], abort.raise} =
-  engine::kept_bytes[r](place.dir) + memo_files::usage[r](memo_dir(place), []).bytes
+fn disk_bytes<[r]>(place: project_store::StoreLocation) -> Int / {fs.read[r], abort.raise} =
+  engine::disk_usage[r](place.dir) + memo_files::usage[r](memo_dir(place), []).bytes
 
-fn compacted_of<[r]>(
-  place: loads::Place,
+fn compact_store<[r]>(
+  place: project_store::StoreLocation,
   current: Map<Bytes, Bool>,
-) -> Compacted / {fs.read[r], fs.write[r], abort.raise} = {
-  let before = kept_bytes[r](place);
+) -> CompactResult / {fs.read[r], fs.write[r], abort.raise} = {
+  let before = disk_bytes[r](place);
   let c = tables::open_cache[r](place.dir, place.stamps);
   let pruned = tables::prune[r](c);
   let done = tables::compact_cache[r](pruned.cache);
-  let memo = memo_files::compacted[r](memo_dir(place), current.keys());
+  let memo = memo_files::compact[r](memo_dir(place), current.keys());
   {
-    directory: shown(place, ""),
-    warnings: loads::diags_of(tables::warnings(done)),
+    directory: display_path(place, ""),
+    warnings: project_store::diags_of(tables::warnings(done)),
     dropped: { texts: pruned.pruned.texts },
     memo: memo,
     bytes_before: before,
-    bytes_after: kept_bytes[r](place),
+    bytes_after: disk_bytes[r](place),
     results: tables::counts(done).passed,
   }
 }
 
-fn cleared_of<[r]>(
-  place: loads::Place,
-) -> Result<Cleared, Refusal> / {fs.read[r], fs.write[r], abort.raise} = {
+fn clear_store<[r]>(
+  place: project_store::StoreLocation,
+) -> Result<ClearResult, Refusal> / {fs.read[r], fs.write[r], abort.raise} = {
   let c = tables::open_cache[r](place.dir, place.stamps);
   let before = tables::counts(c).passed;
-  let stored = engine::cleared[r](place.dir);
+  let stored = engine::clear_dir[r](place.dir);
   let memo = memo_dir(place);
   let gone = (!fs.exists[r](memo) || fs.remove_tree[r](memo)) && stored;
-  let warnings = loads::diags_of(tables::warnings(c));
-  if gone { Ok({ directory: shown(place, ""), warnings: warnings, cleared: before }) } else {
+  let warnings = project_store::diags_of(tables::warnings(c));
+  if gone { Ok({ directory: display_path(place, ""), warnings: warnings, cleared: before }) } else {
     Err({
-      directory: Some(shown(place, "")),
+      directory: Some(display_path(place, "")),
       diags: [
         {
           code: b"E0502",
           notes: 1,
           labels: [],
           text: b"",
-          message: Bytes::of_string("could not clear the cache at `" ++ shown(place, "") ++ "`"),
+          message: Bytes::of_string(
+            "could not clear the cache at `" ++ display_path(place, "") ++ "`",
+          ),
           notes_text: [b"check the directory's permissions, or delete it by hand"],
           severity: b"error",
           fixes: [],
@@ -728,14 +740,14 @@ fn cleared_of<[r]>(
 
 /// Whether `query` names `name`, by its program-wide name or its last segment, or `hash` by a
 /// prefix of 4 or more hex digits.
-fn names(query: String, name: Bytes, hash: Bytes) -> Bool / {abort.raise} = {
+fn matches_query(query: String, name: Bytes, hash: Bytes) -> Bool / {abort.raise} = {
   let full = String::of_bytes_lossy(name);
   let segments = full.split(".");
   full == query || segments.at_or(segments.len() - 1, "") == query
     || (query.len() >= 4 && hash.hex_of().starts_with(query.ascii_lower()))
 }
 
-fn place_text(
+fn file_location(
   program: Program,
   at: Location,
 ) -> { file: String, location: Option<String> } / {abort.raise} =
@@ -744,8 +756,8 @@ fn place_text(
       {
         file: place.path,
         location: if at.span.start > place.text.len() { None } else {
-          let spot = spot_of(place.text, at.span.start);
-          Some(place.path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.col.to_string())
+          let spot = position_of(place.text, at.span.start);
+          Some(place.path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.column.to_string())
         },
       },
     None -> { file: "", location: None },
@@ -764,23 +776,23 @@ fn operation_of(o: OpInfo) -> Operation / {abort.raise} =
 /// answers: a test by whether a run proved it at its hash, which `proven` holds.
 fn matches_in(
   program: Program,
-  w: View,
+  w: CheckedProgram,
   query: String,
   proven: Map<Bytes, Bool>,
 ) -> List<Entry> / {abort.raise} = {
   let defs = by_name(w.frame.hashes.defs);
   let decls = by_name(w.frame.hashes.decls);
-  let read = bodies_read(w.checked);
-  let bodies = filed_bodies(w.frame.hashes).fold(
+  let read = all_body_facts(w.checked);
+  let bodies = stored_bodies(w.frame.hashes).fold(
     Map::new(),
-    |acc: Map<Bytes, Int>, b: FiledBody| acc.insert(b.hash, b.body.len()),
+    |acc: Map<Bytes, Int>, b: StoredBody| acc.insert(b.hash, b.body.len()),
   );
-  let held = |name: Bytes, m: Map<Bytes, Bytes>| match m.get(name) { Some(h) -> h, None -> b"" };
+  let hash_of = |name: Bytes, m: Map<Bytes, Bytes>| match m.get(name) { Some(h) -> h, None -> b"" };
   let body_of = |hash: Bytes| bodies.get(hash);
   let fns = w.checked.defs.fold([], |acc: List<Entry>, d: DefInfo| {
-    let hash = held(d.name, defs);
-    if !names(query, d.name, hash) { acc } else {
-      let at = place_text(program, d.at);
+    let hash = hash_of(d.name, defs);
+    if !matches_query(query, d.name, hash) { acc } else {
+      let at = file_location(program, d.at);
       let row = match defs.get(d.name) {
         Some(h) -> Some(def_known_row(decls, d, h, read)),
         None -> None,
@@ -791,11 +803,11 @@ fn matches_in(
         hash: hash.hex_of(),
         file: at.file,
         location: at.location,
-        interface: OfFn(match row {
+        interface: FunctionInterface(match row {
           Some(_) -> String::of_bytes_lossy(scheme_text(d.scheme)),
           None -> "",
         }),
-        footprint: match row { Some(r) -> Some(atoms_listed(r.footprint)), None -> None },
+        footprint: match row { Some(r) -> Some(row_atoms(r.footprint)), None -> None },
         effect_hashes: match row { Some(r) -> effect_hashes_of(r.effect_hashes), None -> [] },
         body: body_of(hash),
         outcome: None,
@@ -804,20 +816,20 @@ fn matches_in(
   });
   let types = range(0, w.frame.outlines.len()).fold(fns, |acc: List<Entry>, i: Int| {
     let o = w.frame.outlines.get(i);
-    o.items.fold(acc, |a: List<Entry>, item: Outlined|
+    o.items.fold(acc, |a: List<Entry>, item: OutlineItem|
       match item {
-        OType(t) -> {
+        OutlinedType(t) -> {
           let name = qualify(o.name, t.name);
-          let hash = held(name, decls);
-          if !names(query, name, hash) { a } else {
-            let at = place_text(program, { module: i, span: t.span });
+          let hash = hash_of(name, decls);
+          if !matches_query(query, name, hash) { a } else {
+            let at = file_location(program, { module: i, span: t.span });
             a.push({
               name: String::of_bytes_lossy(name),
               kind: TypeEntry,
               hash: hash.hex_of(),
               file: at.file,
               location: at.location,
-              interface: OfType(
+              interface: TypeInterface(
                 t.arity,
                 w.checked.ctors.filter(|c: CtorInfo| c.type_name == name).map(|c: CtorInfo|
                   {
@@ -836,16 +848,16 @@ fn matches_in(
       })
   });
   let effects = w.checked.effects.fold(types, |acc: List<Entry>, e: EffectInfo| {
-    let hash = held(e.name, decls);
-    if !names(query, e.name, hash) { acc } else {
-      let at = place_text(program, e.at);
+    let hash = hash_of(e.name, decls);
+    if !matches_query(query, e.name, hash) { acc } else {
+      let at = file_location(program, e.at);
       acc.push({
         name: String::of_bytes_lossy(e.name),
         kind: EffectEntry,
         hash: hash.hex_of(),
         file: at.file,
         location: at.location,
-        interface: OfEffect(e.nondet, e.ops.map(operation_of)),
+        interface: EffectInterface(e.nondet, e.operations.map(operation_of)),
         footprint: None,
         effect_hashes: [],
         body: None,
@@ -859,8 +871,8 @@ fn matches_in(
   );
   w.checked.tests.fold(effects, |acc: List<Entry>, t: TestInfo| {
     let hash = match w.frame.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" };
-    if !names(query, t.name, hash) && !names(query, t.key, hash) { acc } else {
-      let at = place_text(program, t.at);
+    if !matches_query(query, t.name, hash) && !matches_query(query, t.key, hash) { acc } else {
+      let at = file_location(program, t.at);
       let row = rows.get(t.key);
       acc.push({
         name: String::of_bytes_lossy(t.name),
@@ -868,8 +880,8 @@ fn matches_in(
         hash: hash.hex_of(),
         file: at.file,
         location: at.location,
-        interface: OfTest(t.nondet),
-        footprint: match row { Some(r) -> Some(atoms_listed(r.footprint)), None -> None },
+        interface: TestInterface(t.nondet),
+        footprint: match row { Some(r) -> Some(row_atoms(r.footprint)), None -> None },
         effect_hashes: match row { Some(r) -> effect_hashes_of(r.effect_hashes), None -> [] },
         body: None,
         outcome: if proven.contains(hash) { Some(Passed) } else { None },
@@ -878,13 +890,13 @@ fn matches_in(
   })
 }
 
-fn inspected<[r]>(
-  place: loads::Place,
+fn inspect_store<[r]>(
+  place: project_store::StoreLocation,
   program: Program,
   query: String,
 ) -> Result<Matches, Refusal> / {fs.read[r], abort.raise} =
   match program_view(program) {
-    None -> Err({ directory: Some(shown(place, "")), diags: program.diags, warnings: [] }),
+    None -> Err({ directory: Some(display_path(place, "")), diags: program.diags, warnings: [] }),
     Some(w) -> {
       let c = tables::open_cache[r](place.dir, place.stamps);
       let proven = w.frame.hashes.tests.values().fold(
@@ -893,8 +905,8 @@ fn inspected<[r]>(
           if tables::passed[r](c, h).value == Some(true) { acc.insert(h, true) } else { acc },
       );
       Ok({
-        directory: shown(place, ""),
-        warnings: loads::diags_of(tables::warnings(c)),
+        directory: display_path(place, ""),
+        warnings: project_store::diags_of(tables::warnings(c)),
         entries: matches_in(program, w, query, proven),
       })
     },
@@ -903,28 +915,28 @@ fn inspected<[r]>(
 /// The parser has already refused a word that is not one of the four, so the last arm is `inspect`.
 pub fn run(
   flags: Flags,
-) -> Answer / {semantics.cached, shipped.answer, toolchain.reused, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_reached} = {
   let s: Style = style_of(flags);
-  let place = loads::place_of(flags.paths, loads::shipped_stamps());
+  let place = project_store::store_location_of(flags.paths, project_store::shipped_stamps());
   let cwd = place.label == "cwd";
   if flags.action == "stats" {
-    let current = queried::current();
+    let current = module_queries::current_hashes();
     stats_answer(
       s,
       Ok(if cwd { stats_of[cwd](place, current) } else { stats_of[abs](place, current) }),
     )
   } else if flags.action == "compact" {
-    let current = queried::current();
+    let current = module_queries::current_hashes();
     compact_answer(
       s,
-      Ok(if cwd { compacted_of[cwd](place, current) } else { compacted_of[abs](place, current) }),
+      Ok(if cwd { compact_store[cwd](place, current) } else { compact_store[abs](place, current) }),
     )
   } else if flags.action == "clear" {
-    clear_answer(s, if cwd { cleared_of[cwd](place) } else { cleared_of[abs](place) })
+    clear_answer(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
   } else {
     let program = load_program(flags.paths, flags.verify_deps);
-    inspect_answer(s, flags.query, if cwd { inspected[cwd](place, program, flags.query) }
-    else { inspected[abs](place, program, flags.query) })
+    inspect_answer(s, flags.query, if cwd { inspect_store[cwd](place, program, flags.query) }
+    else { inspect_store[abs](place, program, flags.query) })
   }
 }
 
@@ -947,9 +959,9 @@ fn no_stats() -> Stats =
     garbage_bytes: 0,
     memo: {
       records: 0,
-      answers: 0,
-      answer_bytes: 0,
-      unread_bytes: 0,
+      results: 0,
+      output_bytes: 0,
+      unreferenced_bytes: 0,
       foreign: 0,
       reclaimable_bytes: 0,
       segments: 0,
@@ -964,7 +976,7 @@ fn an_entry() -> Entry =
     hash: "9f2c1a4e8b03c7d5e6f70819a2b3c4d5",
     file: "m.ply",
     location: Some("m.ply:4:1"),
-    interface: OfFn("(Int) -> List<Int>"),
+    interface: FunctionInterface("(Int) -> List<Int>"),
     footprint: None,
     effect_hashes: [],
     body: None,
@@ -986,9 +998,9 @@ test "a store half of whose bytes are unreachable is where compaction starts bei
   assert(!compact_suggested({ ..half, data_bytes: 0, garbage_bytes: 0 }));
   let answers = {
     records: 2,
-    answers: 2,
-    answer_bytes: 1000,
-    unread_bytes: 501,
+    results: 2,
+    output_bytes: 1000,
+    unreferenced_bytes: 501,
     foreign: 1,
     reclaimable_bytes: 601,
     segments: 1,
@@ -1012,9 +1024,9 @@ test "the statistics read as five lines and the sizes under them" {
     garbage_bytes: 250,
     memo: {
       records: 3,
-      answers: 5,
-      answer_bytes: 2048,
-      unread_bytes: 0,
+      results: 5,
+      output_bytes: 2048,
+      unreferenced_bytes: 0,
       foreign: 2,
       reclaimable_bytes: 1024,
       segments: 2,
@@ -1044,11 +1056,11 @@ test "an empty store has nothing to reclaim and no note about what an entry coun
 }
 
 test "compaction that dropped nothing and reclaimed nothing still says what it did" {
-  let c: Compacted = {
+  let c: CompactResult = {
     directory: "/p/.ply-cache",
     warnings: [],
     dropped: { texts: 0 },
-    memo: { records: 0, answers: 0, bytes: 0 },
+    memo: { records: 0, results: 0, bytes: 0 },
     bytes_before: 900,
     bytes_after: 900,
     results: 2,
@@ -1058,10 +1070,10 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
     "     900 B · nothing to reclaim",
     "     every result is kept, so no test re-runs",
   ]);
-  let swept: Compacted = {
+  let swept: CompactResult = {
     ..c,
     dropped: { texts: 2 },
-    memo: { records: 1, answers: 3, bytes: 300 },
+    memo: { records: 1, results: 3, bytes: 300 },
     bytes_after: 400,
   };
   assert_eq(compact_lines(plain(), swept), [
@@ -1103,7 +1115,7 @@ test "an effect declaration is one row per operation, and a type one per variant
     ..an_entry(),
     name: "m.wall",
     kind: EffectEntry,
-    interface: OfEffect(true, ops),
+    interface: EffectInterface(true, ops),
   };
   assert_eq(rows_of(e), [
     { label: "nondet", value: "yes" },
@@ -1114,7 +1126,10 @@ test "an effect declaration is one row per operation, and a type one per variant
     ..an_entry(),
     name: "m.Shape",
     kind: TypeEntry,
-    interface: OfType(1, [{ name: "Circle", fields: ["Int"] }, { name: "Empty", fields: [] }]),
+    interface: TypeInterface(1, [
+      { name: "Circle", fields: ["Int"] },
+      { name: "Empty", fields: [] },
+    ]),
   };
   assert_eq(rows_of(shape), [
     { label: "parameters", value: "1" },
@@ -1128,11 +1143,11 @@ test "a test's result line says whether this very hash is proven" {
     ..an_entry(),
     name: "one is one",
     kind: TestEntry(false),
-    interface: OfTest(false),
+    interface: TestInterface(false),
   };
   assert_eq(result_line(unproven), "— not proven at this hash, so it runs next time");
   assert_eq(
-    result_line({ ..unproven, kind: TestEntry(true), interface: OfTest(true) }),
+    result_line({ ..unproven, kind: TestEntry(true), interface: TestInterface(true) }),
     "— not proven at this hash, so it runs next time",
   );
   assert_eq(
@@ -1148,8 +1163,8 @@ test "a name declared twice is ordered by name, then hash, then file" {
   let alpha: Entry = { ..an_entry(), name: "alpha.shared", hash: "bb", file: "alpha.ply" };
   let beta: Entry = { ..an_entry(), name: "beta.shared", hash: "aa", file: "beta.ply" };
   let twin: Entry = { ..an_entry(), name: "alpha.shared", hash: "aa", file: "alpha.ply" };
-  assert_eq(ordered([beta, alpha, twin]).map(|entry: Entry| entry.hash), ["aa", "bb", "aa"]);
-  assert_eq(ordered([alpha, twin, beta]).map(|entry: Entry| entry.name), [
+  assert_eq(sorted_entries([beta, alpha, twin]).map(|entry: Entry| entry.hash), ["aa", "bb", "aa"]);
+  assert_eq(sorted_entries([alpha, twin, beta]).map(|entry: Entry| entry.name), [
     "alpha.shared",
     "alpha.shared",
     "beta.shared",
@@ -1166,13 +1181,13 @@ test "a second match is separated by a blank line and counted under both" {
 }
 
 /// The answer the subcommand the flags name gives, over what the store was found to hold.
-fn answered_over(
+fn run_with(
   flags: Flags,
   answer: Result<Stats, Refusal>,
   hits: Result<Matches, Refusal>,
-  swept: Result<Compacted, Refusal>,
-  emptied: Result<Cleared, Refusal>,
-) -> Answer / {abort.raise} = {
+  swept: Result<CompactResult, Refusal>,
+  emptied: Result<ClearResult, Refusal>,
+) -> CommandOutput / {abort.raise} = {
   let s: Style = style_of(flags);
   if flags.action == "stats" { stats_answer(s, answer) }
   else if flags.action == "compact" { compact_answer(s, swept) }
@@ -1180,13 +1195,13 @@ fn answered_over(
   else { inspect_answer(s, flags.query, hits) }
 }
 
-fn nowhere() -> Refusal = { directory: None, diags: [], warnings: [] }
+fn no_refusal() -> Refusal = { directory: None, diags: [], warnings: [] }
 
 fn flags_of(action: String, query: String, json: Bool) -> Flags =
   { ..no_flags(), action: action, query: query, json: json }
 
-fn only_stats(flags: Flags, stats: Stats) -> Answer / {abort.raise} =
-  answered_over(flags, Ok(stats), Err(nowhere()), Err(nowhere()), Err(nowhere()))
+fn only_stats(flags: Flags, stats: Stats) -> CommandOutput / {abort.raise} =
+  run_with(flags, Ok(stats), Err(no_refusal()), Err(no_refusal()), Err(no_refusal()))
 
 test "the action picks the subcommand, and its object keys off `command` and `action`" {
   let answer = only_stats(flags_of("stats", "", true), { ..no_stats(), results: 2, data_bytes: 8 });
@@ -1218,7 +1233,7 @@ test "a store that never opened is exit 2 and names no cache" {
     ],
     warnings: [],
   };
-  let answer = answered_over(flags_of("clear", "", false), Err(why), Err(why), Err(why), Err(why));
+  let answer = run_with(flags_of("clear", "", false), Err(why), Err(why), Err(why), Err(why));
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, ["Error[E0502]: could not open a cache under `/p`"]);
@@ -1253,13 +1268,7 @@ test "a refusal after the store opened names the cache and carries its warnings"
       },
     ],
   };
-  let answer = answered_over(
-    flags_of("compact", "", false),
-    Err(why),
-    Err(why),
-    Err(why),
-    Err(why),
-  );
+  let answer = run_with(flags_of("compact", "", false), Err(why), Err(why), Err(why), Err(why));
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, ["   warning: the store was discarded"]);
   let text = to_string(answer.json);
@@ -1270,12 +1279,12 @@ test "a refusal after the store opened names the cache and carries its warnings"
 
 test "inspecting a name the program does not define is E0101 and exits two" {
   let empty: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [] };
-  let answer = answered_over(
+  let answer = run_with(
     flags_of("inspect", "no_such_thing", false),
-    Err(nowhere()),
+    Err(no_refusal()),
     Ok(empty),
-    Err(nowhere()),
-    Err(nowhere()),
+    Err(no_refusal()),
+    Err(no_refusal()),
   );
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
@@ -1287,12 +1296,12 @@ test "inspecting a name the program does not define is E0101 and exits two" {
 
 test "a match is one object under `matches`, with the hash shortened and the type resolved" {
   let hits: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [an_entry()] };
-  let answer = answered_over(
+  let answer = run_with(
     flags_of("inspect", "active", true),
-    Err(nowhere()),
+    Err(no_refusal()),
     Ok(hits),
-    Err(nowhere()),
-    Err(nowhere()),
+    Err(no_refusal()),
+    Err(no_refusal()),
   );
   assert_eq(answer.code, 0);
   let text = to_string(answer.json);

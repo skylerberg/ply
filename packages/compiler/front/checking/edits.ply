@@ -5,20 +5,20 @@ import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo
-import compiler.store.memo (memo, Held, Run, Tally, answer, nothing_held, ran_total, ran_for,
-                            restored_for, started, tallies)
+import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, empty_memory_store,
+                            executed_count, executed_for, restored_for, start_run, query_stats)
 import compiler.store.packs
-import compiler.front.exports (entry_bin, placed_bin, group_source_from)
-import compiler.front.owned
-import compiler.front.seam (Analysed, Refused, view_of, view_dump, walked_facts_bin)
+import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
+import compiler.front.owner_checks
+import compiler.front.seam (Analysed, Refused, checked_program_of, view_dump, inferred_facts_bin)
 import compiler.front.rows (known_def_row_bin)
 import compiler.front.published (no_rows, analyse, dump_of)
 import compiler.front (published, staged_pulling_std_with, analyse_pulling_std_with, faceted,
                        checked_staged)
-import compiler.front.facts (ModuleShape, ModuleTables, answered_program, answered_load,
+import compiler.front.facts (ModuleShape, ModuleTables, assembled_program, assembled_load,
                              functions_of, tests_of)
 import compiler.syntax.items (derivation_bin)
-import compiler.expand.derive (Wrote, library_ask_bin, library_answer_bin)
+import compiler.expand.derive (Generated, deriver_request_bin, deriver_response_bin)
 import std.value
 import std.value (VList, VRecord, VStr)
 import compiler.front.diagnostics (parse_all, with_prelude_source)
@@ -26,26 +26,29 @@ import compiler.syntax.exprs (prelude_module)
 import compiler.expand.embed (EmbedFile, embed_file)
 import compiler.check.resolve.tables (Source, Diag)
 import compiler.check.infer.checker (TestInfo)
-import compiler.store.hash.forms (Fixed, Fixing, shapes_bin, fixed_bin, joined_fixing)
+import compiler.store.hash.forms (CachedNode, CachedHashes, hash_input_bin, cached_node_bin,
+                                  joined_cached_hashes)
 import compiler.store.hash (body_key, checked_body)
 import std.gen
-import compiler.front.checking.world (Placing, Named, EntryNamed, Embedding, ModuleAnswer,
-                                      placing_bin, named_bin, entry_named_bin, embedding_bin,
-                                      Answering, CheckQuery, decoded, module_query, entry_query,
-                                      setting_bin)
-import compiler.front.checking.groups (GroupNamed, owner_named_bin, group_named_bin,
-                                       owners_answer_bin, owners_query, cycles_query, group_query,
-                                       owner_entry_query, signatures_query, typed_query,
+import compiler.front.checking.world (PackageLocation, ModuleKey, InterfaceKey, Embedding,
+                                      ModuleResult, package_location_bin, module_key_bin,
+                                      interface_key_bin, embedding_bin, QueryEffects, CheckQuery,
+                                      decoded, module_query, owner_interfaces_query, setting_bin)
+import compiler.front.checking.groups (GroupKey, owner_key_bin, group_key_bin, owners_result_bin,
+                                       owners_query, cycles_query, group_query,
+                                       owner_interface_query, signatures_query, typed_query,
                                        group_hash_query, owner_facts, entire, imports_of,
                                        whole_query, GroupCheck, owners_check, current, current_unit,
-                                       group_of, group_hash_inputs, hashes_query, tables_answered,
+                                       group_of, group_hash_inputs, hashes_query, tables_of_result,
                                        sorted_bytes)
-import compiler.front.checking (world_of, looked, fresh_registry, Answered, facts_answered,
-                                view_answered, asked_all, hashed_all, cycles_among, root_warnings,
-                                refused_first, Publishing, Refusing, said, nothing_embedded,
-                                nothing_derived, over_decoding, answered_over, answered_under,
-                                prelude_frames, looked_alone, Alone, Raced, Turns, files_apart,
-                                Step, fixed_over, fixed_beside, layered, shipped_held, pack_of)
+import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
+                                facts_of_result, checked_program_from_results, query_load,
+                                hashed_all, cycles_among, root_warnings, refused_first,
+                                PublicationSummary, RefusalSummary, outcome_summary,
+                                nothing_embedded, nothing_derived, over_decoding, queried_over,
+                                queried_under, prelude_frames, lookup_input_alone, Alone, Raced,
+                                Turns, files_apart, Step, fixed_over, fixed_beside, layered,
+                                shipped_store, pack_of)
 
 // --- Through a session of edits -------------------------------------------------------------
 
@@ -54,16 +57,19 @@ import compiler.front.checking (world_of, looked, fresh_registry, Answered, fact
 /// for must run when what it reads changed since its record was made, and be reused otherwise.
 fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
   steps.fold(
-    { held: nothing_held(), checks: Map::new(), hashes: Map::new(), off: [] },
-    |s: { held: Held, checks: Map<Bytes, Bytes>, hashes: Map<Bytes, Bytes>, off: List<Bytes> }, step: Step| {
-      let warm = answered_over(s.held, step.sources);
-      let now = said(warm.outcome);
-      let whole = said(analyse(parse_all(step.sources)));
-      let fresh = answered_over(nothing_held(), step.sources);
-      let agrees = now == said(fresh.outcome) && warm.fixing == fresh.fixing
+    { held: empty_memory_store(), checks: Map::new(), hashes: Map::new(), off: [] },
+    |s: { held: MemoryStore, checks: Map<Bytes, Bytes>, hashes: Map<Bytes, Bytes>, off: List<Bytes> }, step: Step| {
+      let warm = queried_over(s.held, step.sources);
+      let now = outcome_summary(warm.outcome);
+      let whole = outcome_summary(analyse(parse_all(step.sources)));
+      let fresh = queried_over(empty_memory_store(), step.sources);
+      let agrees = now == outcome_summary(fresh.outcome) && warm.fixing == fresh.fixing
         && (match whole {
-          Publishing(_) -> now == whole,
-          Refusing(_) -> match now { Refusing(_) -> true, Publishing(_) -> false },
+          PublicationSummary(_) -> now == whole,
+          RefusalSummary(_) -> match now {
+            RefusalSummary(_) -> true,
+            PublicationSummary(_) -> false,
+          },
         });
       let checked = pulled(
         warm.run,
@@ -114,7 +120,7 @@ fn pulled(
         Some(x) -> x,
         None -> panic("the registry holds the query"),
       };
-      let ran = ran_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
+      let ran = executed_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
         acc.insert(k, true));
       // A record restored after an edit is undone is made again without running its body.
       let back = restored_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
@@ -151,16 +157,16 @@ fn pulled(
 fn groups_shown(groups: List<Bytes>) -> Bytes / {abort.raise} =
   Bytes::join(
     groups.map(|b: Bytes| {
-      let g = decoded(b, group_named_bin(), "a group's names");
+      let g = decoded(b, group_key_bin(), "a group's names");
       Bytes::concat_all([g.module, b"[", Bytes::join(g.owners, b" "), b"]"])
     }),
     b", ",
   )
 
 /// Where `warm`'s hashing and `fresh`'s part: each node either fixes otherwise, by name.
-fn fixing_apart(warm: Fixing, fresh: Fixing) -> Bytes = {
-  let by = |f: Fixing|
-    f.nodes.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: Fixed| acc.insert(x.name, x.hash));
+fn fixing_apart(warm: CachedHashes, fresh: CachedHashes) -> Bytes = {
+  let by = |f: CachedHashes|
+    f.nodes.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: CachedNode| acc.insert(x.name, x.hash));
   let w = by(warm);
   let c = by(fresh);
   let names = sorted_bytes(
@@ -173,7 +179,7 @@ fn fixing_apart(warm: Fixing, fresh: Fixing) -> Bytes = {
 
 /// What a check of the group `input` names reads, as one digest: what an edit must check it again
 /// where it moves, and nothing else. Nothing for a group its module no longer checks together.
-fn group_check_of(asked: GroupNamed, published: Bool) -> GroupCheck / {Answering, abort.raise} = {
+fn group_check_of(asked: GroupKey, published: Bool) -> GroupCheck / {QueryEffects, abort.raise} = {
   let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
   owners_check(
     named,
@@ -184,8 +190,8 @@ fn group_check_of(asked: GroupNamed, published: Bool) -> GroupCheck / {Answering
   )
 }
 
-fn group_inputs_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
-  let asked = decoded(input, group_named_bin(), "a group's names");
+fn group_inputs_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
+  let asked = decoded(input, group_key_bin(), "a group's names");
   if !current(asked) { b"" } else {
     let of = |c: GroupCheck| {
       let source = group_source_from(asked.module, c.reads, c.imported, c.needed);
@@ -194,12 +200,12 @@ fn group_inputs_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
         bin::encode(source.derived, bin::list_bin(derivation_bin())),
         bin::encode(
           source.deps,
-          bin::map_bin(bin::bytes_bin(), bin::map_bin(bin::bytes_bin(), entry_bin())),
+          bin::map_bin(bin::bytes_bin(), bin::map_bin(bin::bytes_bin(), owner_interface_bin())),
         ),
         bin::encode(source.rows, bin::list_bin(known_def_row_bin())),
-        bin::encode(source.fixed, bin::list_bin(fixed_bin())),
+        bin::encode(source.fixed, bin::list_bin(cached_node_bin())),
         bin::encode(c.setting, setting_bin()),
-        bin::encode(c.places, bin::map_bin(bin::bytes_bin(), placed_bin())),
+        bin::encode(c.places, bin::map_bin(bin::bytes_bin(), module_origin_bin())),
       ])
     };
     let refused = group_of(asked).refused.len() > 0;
@@ -212,14 +218,14 @@ fn group_inputs_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
 
 /// What hashing the group `input` names reads, as one digest. Nothing for a group its module no
 /// longer checks together.
-fn hash_inputs_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let asked = decoded(input, group_named_bin(), "a group's names");
+fn hash_inputs_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, group_key_bin(), "a group's names");
   if !current_unit(asked) { b"" } else {
     let h = group_hash_inputs(asked);
     blake3(
       Bytes::concat_all([
-        bin::encode(h.forms, shapes_bin()),
-        bin::encode(h.fixed, bin::list_bin(fixed_bin())),
+        bin::encode(h.forms, hash_input_bin()),
+        bin::encode(h.fixed, bin::list_bin(cached_node_bin())),
         bin::encode(h.fns, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
       ]),
     )
@@ -230,11 +236,11 @@ fn hash_inputs_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 /// `probe` digests it over `held`, which answered them all: none where modules import one another in
 /// a cycle.
 fn inputs_over(
-  held: Held,
+  held: MemoryStore,
   sources: List<Source>,
   probe: Bytes,
 ) -> Option<Map<Bytes, Bytes>> / {abort.raise} = {
-  let w = world_of(
+  let w = load_inputs_of(
     { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
@@ -242,41 +248,44 @@ fn inputs_over(
     held,
     prelude_frames,
     b"",
-    |kind: Bytes, at: Bytes| looked_alone(w, kind, at),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     || {
       let qs = fresh_registry().insert(b"group inputs", {
         name: b"group inputs",
         hash: b"group inputs",
-        body: group_inputs_answer,
+        body: group_inputs_result,
         kept: true,
         summarized: false,
       }).insert(b"hash inputs", {
         name: b"hash inputs",
         hash: b"hash inputs",
-        body: hash_inputs_answer,
+        body: hash_inputs_result,
         kept: true,
         summarized: false,
       });
-      let cycles = cycles_among(qs, started(qs), w.own);
+      let cycles = cycles_among(qs, start_run(qs), w.own);
       if cycles.refused.len() > 0 { None } else {
         Some(
           w.own.fold(
             { run: cycles.run, out: Map::new() },
             |acc: { run: Run, out: Map<Bytes, Bytes> }, m: Bytes| {
-              let named = bin::encode({ module: m, shipped: false, tested: false }, named_bin());
-              let o = answer(qs, acc.run, owners_query(), named);
-              decoded(o.output, owners_answer_bin(), "a module's owners").groups.fold(
+              let named = bin::encode(
+                { module: m, shipped: false, tested: false },
+                module_key_bin(),
+              );
+              let o = query_output(qs, acc.run, owners_query(), named);
+              decoded(o.output, owners_result_bin(), "a module's owners").groups.fold(
                 { run: o.run, out: acc.out },
                 |a: { run: Run, out: Map<Bytes, Bytes> }, g: List<Bytes>| {
                   let unit = bin::encode(
                     { module: m, shipped: false, tested: false, owners: g },
-                    group_named_bin(),
+                    group_key_bin(),
                   );
                   // A unit of several owners checks a group a cycle of its calls; it hashes whole.
                   let cut = if probe != b"group inputs" || g.len() < 2 {
                     { run: a.run, groups: [g] }
                   } else {
-                    let c = answer(qs, a.run, cycles_query(), unit);
+                    let c = query_output(qs, a.run, cycles_query(), unit);
                     {
                       run: c.run,
                       groups: decoded(
@@ -291,9 +300,9 @@ fn inputs_over(
                     |b: { run: Run, out: Map<Bytes, Bytes> }, owners: List<Bytes>| {
                       let key = bin::encode(
                         { module: m, shipped: false, tested: false, owners: owners },
-                        group_named_bin(),
+                        group_key_bin(),
                       );
-                      let i = answer(qs, b.run, probe, key);
+                      let i = query_output(qs, b.run, probe, key);
                       { run: i.run, out: b.out.insert(key, i.output) }
                     },
                   )
@@ -827,7 +836,7 @@ test "an opaque type's module edited and undone leaves an answer through the sto
   )
 }
 
-// `said` reads `say`, whose module refuses while its body panics, so its module is checked a group
+// `outcome_summary` reads `say`, whose module refuses while its body panics, so its module is checked a group
 // at a time when it comes back; its test is labelled as it is named, and hashes apart from it.
 test "a test labelled as the function it tests hashes apart from it, through a refusal and back" {
   let s0 = [
@@ -989,13 +998,13 @@ fn changes() -> gen::Gen<Change> =
     TwinAdded,
   ])
 
-/// A `Named` as a test draws one.
-fn nameds() -> gen::Gen<Named> =
+/// A `ModuleKey` as a test draws one.
+fn module_keys() -> gen::Gen<ModuleKey> =
   gen::map3(gen::bytes(), gen::bool(), gen::bool(), |module: Bytes, shipped: Bool, tested: Bool|
     { module: module, shipped: shipped, tested: tested })
 
-/// A `EntryNamed` as a test draws one.
-fn entry_nameds() -> gen::Gen<EntryNamed> =
+/// A `InterfaceKey` as a test draws one.
+fn interface_keys() -> gen::Gen<InterfaceKey> =
   gen::map4(
     gen::bytes(),
     gen::bool(),
@@ -1013,8 +1022,8 @@ fn embeddings() -> gen::Gen<Embedding> =
     |files: List<EmbedFile>, refused: Option<Bytes>| { files: files, refused: refused },
   )
 
-/// A `Placing` as a test draws one.
-fn placings() -> gen::Gen<Placing> =
+/// A `PackageLocation` as a test draws one.
+fn package_locations() -> gen::Gen<PackageLocation> =
   gen::map2(gen::any_int(), gen::bytes(), |package: Int, relative: Bytes|
     { package: package, relative: relative })
 
@@ -1096,7 +1105,7 @@ test "a row that moves under a caller leaves an answer through the store the fre
   ];
   let moved = with_module(stale, b"lib", chain_lib(b"b"));
   assert_eq(disagreements([step(b"cold", stale), step(b"the callee's row moved", moved)]), []);
-  let kept = answered_over(answered_over(nothing_held(), stale).held, moved);
+  let kept = queried_over(queried_over(empty_memory_store(), stale).held, moved);
   assert(match kept.outcome { Refused(_) -> true, Analysed(_) -> false })
 }
 
@@ -1114,7 +1123,7 @@ test "`keep` written on an imported function, or dropped, leaves an answer throu
     [],
   );
   // The caller lends what `keep` now holds, so it is refused where it was not.
-  let warm = answered_over(answered_over(nothing_held(), lent).held, kept);
+  let warm = queried_over(queried_over(empty_memory_store(), lent).held, kept);
   assert(match warm.outcome { Refused(_) -> true, Analysed(_) -> false })
 }
 
@@ -1128,7 +1137,7 @@ test "an unused selectively imported name deleted is refused through the store a
     disagreements([step(b"cold", s0), step(b"warm", s0), step(b"the name deleted", gone)]),
     [],
   );
-  match answered_over(answered_over(nothing_held(), s0).held, gone).outcome {
+  match queried_over(queried_over(empty_memory_store(), s0).held, gone).outcome {
     Analysed(_) -> panic("an import of a deleted name checked"),
     Refused(ds) -> assert(ds.fold(false, |acc: Bool, diag: Diag| acc || diag.code == b"E0101")),
   }
@@ -1241,14 +1250,14 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
 
 test "what a module query is asked reads back as it was asked" {
   gen::check4(
-    nameds(),
-    entry_nameds(),
+    module_keys(),
+    interface_keys(),
     embeddings(),
-    placings(),
-    |n: Named, e: EntryNamed, m: Embedding, p: Placing| {
-      bin::round_trips(n, named_bin()) && bin::round_trips(e, entry_named_bin())
+    package_locations(),
+    |n: ModuleKey, e: InterfaceKey, m: Embedding, p: PackageLocation| {
+      bin::round_trips(n, module_key_bin()) && bin::round_trips(e, interface_key_bin())
         && bin::round_trips(m, embedding_bin())
-        && bin::round_trips(p, placing_bin())
+        && bin::round_trips(p, package_location_bin())
     },
   )
 }
@@ -1256,24 +1265,26 @@ test "what a module query is asked reads back as it was asked" {
 // --- What an edit runs again ------------------------------------------------------------------
 
 /// How many times the run ran the body of the query `name`.
-fn ran_of(run: Run, name: Bytes) -> Int =
-  tallies(run).fold(0, |n: Int, t: Tally| if t.query == name { t.ran } else { n })
+fn run_count(run: Run, name: Bytes) -> Int =
+  query_stats(run).fold(0, |n: Int, t: QueryStats| if t.query == name { t.ran } else { n })
 
 /// Each group the run ran the body of the query `name` for, a group's check or its hashing.
-fn groups_ran(run: Run, name: Bytes) -> List<GroupNamed> / {abort.raise} =
-  ran_for(run, name).map(|b: Bytes| decoded(b, group_named_bin(), "a group's names"))
+fn groups_ran(run: Run, name: Bytes) -> List<GroupKey> / {abort.raise} =
+  executed_for(run, name).map(|b: Bytes| decoded(b, group_key_bin(), "a group's names"))
 
-fn group_in(module: Bytes, owners: List<Bytes>) -> GroupNamed =
+fn group_in(module: Bytes, owners: List<Bytes>) -> GroupKey =
   { module: module, shipped: false, tested: false, owners: owners }
 
 /// Each module the run ran the body of the query `name` for, a module's check or its hashing, in
 /// name order: by name, so a run over a module no test wrote fails saying which.
 fn modules_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
-  sorted_bytes(ran_for(run, name).map(|b: Bytes| decoded(b, named_bin(), "a module's name").module))
+  sorted_bytes(
+    executed_for(run, name).map(|b: Bytes| decoded(b, module_key_bin(), "a module's name").module),
+  )
 
 /// Whether `a` and `b` hold the same groups, in whatever order the run ran them.
-fn same_groups(a: List<GroupNamed>, b: List<GroupNamed>) -> Bool =
-  a.len() == b.len() && b.all(|g: GroupNamed| a.contains(g))
+fn same_groups(a: List<GroupKey>, b: List<GroupKey>) -> Bool =
+  a.len() == b.len() && b.all(|g: GroupKey| a.contains(g))
 
 /// Cycles, an effect, a specification, a law, a cost, a test over cases and an `opaque` type, across
 /// modules.
@@ -1291,7 +1302,7 @@ fn hashed_fixture() -> List<Source> =
 
 test "a program hashed from its modules' answers hashes as it does hashed whole, and warns alike" {
   [shop(), hashed_fixture()].fold((), |u: Unit, sources: List<Source>| {
-    let fixed = fixed_over(nothing_held(), sources, []);
+    let fixed = fixed_over(empty_memory_store(), sources, []);
     let whole = staged_pulling_std_with(sources, []);
     // A whole read's hashing leaves each call on a value to its check, as the answers did not.
     match ((
@@ -1302,7 +1313,10 @@ test "a program hashed from its modules' answers hashes as it does hashed whole,
       (Ok(read), Analysed(checked), Ok(taken)) -> {
         assert_eq(taken.hashes, checked.hashes);
         assert_eq(taken.unused, []);
-        assert_eq(owned::told(fixed.warnings), owned::told(read.unused))
+        assert_eq(
+          owner_checks::diag_summaries(fixed.warnings),
+          owner_checks::diag_summaries(read.unused),
+        )
       },
       _ -> panic("the fixture hashes"),
     }
@@ -1313,12 +1327,12 @@ test "a program's tables made from its modules' answers are the tables of its ch
   [shop(), hashed_fixture(), faceted(), faceted().reverse()].fold(
     (),
     |u: Unit, sources: List<Source>| {
-      let fixed = fixed_over(nothing_held(), sources, []);
+      let fixed = fixed_over(empty_memory_store(), sources, []);
       match analyse_pulling_std_with(sources, [], no_rows()).out {
         Refused(_) -> panic("the fixture checks"),
         Analysed(w) -> {
-          let answered = answered_program(
-            fixed.answers.map(|a: Answered| facts_answered(a.answer)),
+          let answered = assembled_program(
+            fixed.results.map(|a: CheckedModule| facts_of_result(a.result)),
             fixed.fixing,
             with_prelude_source([]).fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
               acc.insert(s.name, s.src)),
@@ -1332,8 +1346,8 @@ test "a program's tables made from its modules' answers are the tables of its ch
             w.embeds,
           );
           assert_eq(answered.view.checked.defs, w.checked.defs);
-          assert_eq(answered.view.frame.tagged, view_of(w).frame.tagged);
-          assert_eq(answered.view, view_of(w));
+          assert_eq(answered.view.frame.tagged, checked_program_of(w).frame.tagged);
+          assert_eq(answered.view, checked_program_of(w));
           let made = view_dump(answered.view, None);
           let whole = dump_of(Analysed(w));
           assert_eq(made.defs, whole.defs);
@@ -1345,7 +1359,7 @@ test "a program's tables made from its modules' answers are the tables of its ch
           assert_eq(made.emitter_roots, whole.emitter_roots);
           assert_eq(made.rows, whole.rows);
           let walked = |b: Bytes|
-            match bin::decode(b, walked_facts_bin()) {
+            match bin::decode(b, inferred_facts_bin()) {
               Ok(w) -> w,
               Err(_) -> panic("walked facts decode"),
             };
@@ -1353,7 +1367,7 @@ test "a program's tables made from its modules' answers are the tables of its ch
           let b = walked(whole.walked);
           assert_eq(a.pure, b.pure);
           assert_eq(a.orders, b.orders);
-          assert_eq(a.loose, b.loose);
+          assert_eq(a.law_facts, b.law_facts);
           assert_eq(made.walked, whole.walked);
           assert_eq(made, whole)
         },
@@ -1383,7 +1397,7 @@ fn pulling() -> { user: List<Source>, shipped: List<Source> } =
 
 test "a program assembled from its modules' answers, a shipped module's among them, is the program checked whole" {
   let f = pulling();
-  let w = world_of(
+  let w = load_inputs_of(
     { root: b"", manifest: None, files: f.user.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
@@ -1398,50 +1412,50 @@ test "a program assembled from its modules' answers, a shipped module's among th
     (),
     |u: Unit, mode: { tested: Bool, reached: Bool }| {
       let done = over_decoding(
-        nothing_held(),
+        empty_memory_store(),
         packs::no_pack,
         b"",
         |kind: Bytes, at: Bytes|
-          looked(w, held, held, || names, nothing_embedded, nothing_derived, kind, at),
+          lookup_input(w, held, held, || names, nothing_embedded, nothing_derived, kind, at),
         || {
           let qs = fresh_registry();
-          let all = asked_all(
+          let all = query_load(
             qs,
             w.own,
             if mode.tested { names } else { [] },
             mode.tested,
-            started(qs),
+            start_run(qs),
           );
           let fixed = hashed_all(qs, w.own, all.value.pulled, mode.tested, all.run);
           {
-            answers: all.value.answers,
+            results: all.value.results,
             pulled: all.value.pulled,
-            fixing: joined_fixing(fixed.value),
+            fixing: joined_cached_hashes(fixed.value),
           }
         },
       ).value;
-      let loaded = answered_load(
+      let loaded = assembled_load(
         f.user.map(|s: Source| s.name),
         { root: b"", manifest: None, supplied: [] },
-        done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
-          acc.insert(a.module, a.answer.shape)),
+        done.results.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
+          acc.insert(a.module, a.result.shape)),
         done.fixing,
         done.pulled,
         names,
         texts,
         true,
         mode.reached,
-        root_warnings(done.answers, f.user.len()),
+        root_warnings(done.results, f.user.len()),
       );
       match analyse_pulling_std_with(f.user, f.shipped, no_rows(), reached: mode.reached).out {
         Refused(_) -> panic("the fixture checks"),
         Analysed(whole) -> {
-          let view = view_of(whole);
-          let assembled = view_answered(
+          let view = checked_program_of(whole);
+          let assembled = checked_program_from_results(
             loaded.frame,
             loaded.reads,
-            done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
-              acc.insert(a.module, a.answer)),
+            done.results.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
+              acc.insert(a.module, a.result)),
           );
           assert_eq(loaded.pulled, [b"std.prelude", b"std.shapes"]);
           // `std.prelude`'s own tests are read with the rest of the library's.
@@ -1513,9 +1527,9 @@ test "a body that calls on a value stores what its check found, read whole or an
       ],
     },
   ].fold((), |u: Unit, fixture: { names: Bool, sources: List<Source> }| {
-    let answered = fixed_over(nothing_held(), fixture.sources, []).fixing.nodes.fold(
+    let answered = fixed_over(empty_memory_store(), fixture.sources, []).fixing.nodes.fold(
       b"",
-      |acc: Bytes, x: Fixed| if x.name == b"m.f" { x.body } else { acc },
+      |acc: Bytes, x: CachedNode| if x.name == b"m.f" { x.body } else { acc },
     );
     match analyse_pulling_std_with(fixture.sources, [], no_rows()).out {
       Refused(_) -> panic("the fixture checks"),
@@ -1538,9 +1552,9 @@ test "a body that calls on a value stores what its check found, read whole or an
 
 test "a run over an unchanged program runs no query again" {
   let sources = layered(b"pub fn step(n: Int) -> Int = n + 1\n");
-  let cold = answered_over(nothing_held(), sources);
+  let cold = queried_over(empty_memory_store(), sources);
   assert_eq(modules_ran(cold.run, module_query()), [b"app", b"aside", b"lib"]);
-  assert_eq(ran_total(answered_over(cold.held, sources).run), 0)
+  assert_eq(executed_count(queried_over(cold.held, sources).run), 0)
 }
 
 // A body's summary says what its answer is in terms of its arguments, which an importer's check
@@ -1548,10 +1562,10 @@ test "a run over an unchanged program runs no query again" {
 test "a body edit checks its own definition again and none that reads it" {
   let before = layered(b"pub fn step(n: Int) -> Int = n * 3\n");
   let after = layered(b"pub fn step(n: Int) -> Int = n * 4\n");
-  let warm = answered_over(answered_over(nothing_held(), before).held, after);
+  let warm = queried_over(queried_over(empty_memory_store(), before).held, after);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"step"])]);
   assert_eq(modules_ran(warm.run, module_query()), [b"lib"]);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(after))))
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))))
 }
 
 /// Two functions that call one another, so one unit, and a third that calls into it. `base` is
@@ -1576,7 +1590,7 @@ fn paired(base: Bytes, step: Bytes) -> List<Source> =
 
 /// Each owner the run ran the body of the query `name` for.
 fn owners_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
-  ran_for(run, name).map(|b: Bytes| decoded(b, owner_named_bin(), "an owner's name").owner)
+  executed_for(run, name).map(|b: Bytes| decoded(b, owner_key_bin(), "an owner's name").owner)
 
 test "a group that refused and is mended checks nothing again, each record taken back" {
   let source = |body: Bytes|
@@ -1591,11 +1605,14 @@ test "a group that refused and is mended checks nothing again, each record taken
         ]),
       },
     ];
-  let cold = answered_over(nothing_held(), source(b"n + 1"));
-  let broken = answered_over(cold.held, source(b"n + true"));
-  assert_eq(said(broken.outcome), said(analyse(parse_all(source(b"n + true")))));
-  let mended = answered_over(broken.held, source(b"n + 1"));
-  assert_eq(said(mended.outcome), said(cold.outcome));
+  let cold = queried_over(empty_memory_store(), source(b"n + 1"));
+  let broken = queried_over(cold.held, source(b"n + true"));
+  assert_eq(
+    outcome_summary(broken.outcome),
+    outcome_summary(analyse(parse_all(source(b"n + true")))),
+  );
+  let mended = queried_over(broken.held, source(b"n + 1"));
+  assert_eq(outcome_summary(mended.outcome), outcome_summary(cold.outcome));
   assert_eq(groups_ran(mended.run, group_query()), [])
 }
 
@@ -1639,22 +1656,25 @@ test "a unit whose group refuses is hashed without asking its own members' hashe
 
 test "a body edited in a unit of owners that call one another walks that owner alone, and the unit is settled again" {
   let before = paired(b"true", b"n");
-  let cold = answered_over(nothing_held(), before);
-  assert_eq(said(cold.outcome), said(analyse(parse_all(before))));
+  let cold = queried_over(empty_memory_store(), before);
+  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = paired(b"n == 0", b"n");
-  let warm = answered_over(cold.held, after);
+  let warm = queried_over(cold.held, after);
   assert_eq(owners_ran(warm.run, typed_query()), [b"even"]);
   assert(groups_ran(warm.run, group_query()).contains(group_in(b"lib", [b"even", b"odd"])));
-  assert_eq(said(warm.outcome), said(analyse(parse_all(after))));
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
   // A signature its sibling reads walks the sibling too.
   let renamed = paired(b"n == 0", b"left");
-  let again = answered_over(warm.held, renamed);
+  let again = queried_over(warm.held, renamed);
   let rewalked = owners_ran(again.run, typed_query());
   assert(rewalked.len() == 2 && rewalked.contains(b"even") && rewalked.contains(b"odd"));
-  assert_eq(said(again.outcome), said(analyse(parse_all(renamed))));
+  assert_eq(outcome_summary(again.outcome), outcome_summary(analyse(parse_all(renamed))));
   // And one walk that refuses refuses the unit with what a fresh check says of it.
   let broken = paired(b"n", b"left");
-  assert_eq(said(answered_over(again.held, broken).outcome), said(analyse(parse_all(broken))))
+  assert_eq(
+    outcome_summary(queried_over(again.held, broken).outcome),
+    outcome_summary(analyse(parse_all(broken))),
+  )
 }
 
 /// `paired`'s unit with a `Count` handed along, which holds a `Step`: `even` names neither type,
@@ -1685,13 +1705,13 @@ fn counted(more: Bytes) -> List<Source> =
 
 test "a walk taken from a check of its whole module is made again when what a sibling's signature reaches moves" {
   let before = counted(b"");
-  let cold = answered_over(nothing_held(), before);
-  assert_eq(said(cold.outcome), said(analyse(parse_all(before))));
+  let cold = queried_over(empty_memory_store(), before);
+  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   // Every signature `even` reads is as it was: only what they reach moved.
   let after = counted(b" | Rest");
-  let warm = answered_over(cold.held, after);
+  let warm = queried_over(cold.held, after);
   assert(owners_ran(warm.run, typed_query()).contains(b"even"));
-  assert_eq(said(warm.outcome), said(analyse(parse_all(after))))
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))))
 }
 
 /// Two sums that hold one another, each derived by `sizes`, and enough functions apart from them
@@ -1721,14 +1741,14 @@ fn coded(more: Bytes) -> List<Source> =
 /// What `sizes` writes for a derivation asked at `at`, where no deriver runs: `T::size()`, the
 /// length of the declaration it read, so its text moves whenever the declaration does.
 fn sized(at: Bytes) -> Option<Bytes> / {abort.raise} =
-  match bin::decode(at, library_ask_bin()) {
+  match bin::decode(at, deriver_request_bin()) {
     Err(_) -> None,
     Ok(ask) -> match value::decode(ask.declaration) {
       Some(VList([VRecord(fields)])) -> match value::field_named(fields, "target") {
         Some(VStr(target)) ->
           Some(
             bin::encode(
-              Wrote(
+              Generated(
                 Bytes::concat_all([
                   b"pub fn ",
                   Bytes::of_string(target),
@@ -1736,7 +1756,7 @@ fn sized(at: Bytes) -> Option<Bytes> / {abort.raise} =
                   Bytes::of_string(ask.declaration.len().to_string()),
                 ]),
               ),
-              library_answer_bin(),
+              deriver_response_bin(),
             ),
           ),
         _ -> None,
@@ -1747,12 +1767,12 @@ fn sized(at: Bytes) -> Option<Bytes> / {abort.raise} =
 
 // A derivation reads its module's every type: an edit to `Tree` moves `Grove`'s too.
 test "owners whose derivations' declaration moved walk what their deriver wrote anew" {
-  let cold = fixed_over(nothing_held(), coded(b""), [], derived: sized);
+  let cold = fixed_over(empty_memory_store(), coded(b""), [], derived: sized);
   let after = coded(b" | Twig(List<Grove>)");
   let warm = fixed_over(cold.held, after, [], derived: sized);
   assert(owners_ran(warm.run, typed_query()).contains(b"Tree"));
   assert(owners_ran(warm.run, typed_query()).contains(b"Grove"));
-  assert_eq(warm.answers, fixed_over(nothing_held(), after, [], derived: sized).answers)
+  assert_eq(warm.results, fixed_over(empty_memory_store(), after, [], derived: sized).results)
 }
 
 /// Two types whose `len` each call `len` on a value: one unit by what their texts mention, and
@@ -1775,46 +1795,46 @@ fn lengths(stack: Bytes, queue: Bytes) -> List<Source> =
 
 test "owners that only mention one another are a unit of groups: a body edited walks its owner, settles its group and signs nothing" {
   let before = lengths(b"xs.len()", b"f.len()");
-  let cold = answered_over(nothing_held(), before);
-  assert_eq(said(cold.outcome), said(analyse(parse_all(before))));
+  let cold = queried_over(empty_memory_store(), before);
+  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = lengths(b"xs.len() + 0", b"f.len()");
-  let warm = answered_over(cold.held, after);
+  let warm = queried_over(cold.held, after);
   assert_eq(owners_ran(warm.run, typed_query()), [b"Stack::len"]);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"Stack::len"])]);
-  assert_eq(ran_of(warm.run, signatures_query()), 0);
-  assert_eq(ran_of(warm.run, cycles_query()), 0);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(after))));
+  assert_eq(run_count(warm.run, signatures_query()), 0);
+  assert_eq(run_count(warm.run, cycles_query()), 0);
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
   // A call added from one group into the other cuts the unit again and walks the caller alone.
   let calling = lengths(b"xs.len() + 0", b"Stack(f).len()");
-  let called = answered_over(warm.held, calling);
+  let called = queried_over(warm.held, calling);
   assert_eq(owners_ran(called.run, typed_query()), [b"Queue::len"]);
-  assert_eq(groups_ran(called.run, cycles_query()).map(|g: GroupNamed| g.module), [b"lib"]);
-  assert_eq(said(called.outcome), said(analyse(parse_all(calling))));
+  assert_eq(groups_ran(called.run, cycles_query()).map(|g: GroupKey| g.module), [b"lib"]);
+  assert_eq(outcome_summary(called.outcome), outcome_summary(analyse(parse_all(calling))));
   // What the called group settles is its caller's to read: the caller is not walked again.
   let moved = lengths(b"0", b"Stack(f).len()");
-  let settled = answered_over(called.held, moved);
+  let settled = queried_over(called.held, moved);
   assert_eq(owners_ran(settled.run, typed_query()), [b"Stack::len"]);
-  assert_eq(said(settled.outcome), said(analyse(parse_all(moved))))
+  assert_eq(outcome_summary(settled.outcome), outcome_summary(analyse(parse_all(moved))))
 }
 
 test "a definition added above another checks itself and no other" {
-  let cold = answered_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let cold = queried_over(empty_memory_store(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
   let above = layered(b"pub fn first() -> Int = 1\n\npub fn step(n: Int) -> Int = n + 1\n");
-  let warm = answered_over(cold.held, above);
+  let warm = queried_over(cold.held, above);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"first"])]);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(above))))
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(above))))
 }
 
 test "a signature edit checks the definitions that read it again, and no other" {
-  let cold = answered_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let cold = queried_over(empty_memory_store(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
   let widened = b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n";
-  let warm = answered_over(cold.held, layered(widened));
+  let warm = queried_over(cold.held, layered(widened));
   assert_eq(groups_ran(warm.run, group_query()), [
     group_in(b"lib", [b"step"]),
     group_in(b"app", [b"go"]),
   ]);
   assert_eq(modules_ran(warm.run, module_query()), [b"app", b"lib"]);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(layered(widened)))))
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(layered(widened)))))
 }
 
 /// A type with a function of its own, a module that answers a value of it, and `app`, which
@@ -1836,8 +1856,8 @@ fn sized_src() -> Bytes =
   b"import made\npub fn size() -> Int = made::made().area()\n\npub fn two() -> Int = [made::made(), made::made()].len()\n"
 
 test "a function added to a type checks itself alone, and one re-signed the definitions that call it on a value" {
-  let cold = answered_over(nothing_held(), shaped(shapes_src(), sized_src()));
-  let added = answered_over(cold.held, shaped(shapes_src().concat(grown_src()), sized_src()));
+  let cold = queried_over(empty_memory_store(), shaped(shapes_src(), sized_src()));
+  let added = queried_over(cold.held, shaped(shapes_src().concat(grown_src()), sized_src()));
   assert_eq(groups_ran(added.run, group_query()), [group_in(b"shapes", [b"Shape::grown"])]);
   let resigned = edited(
     shaped(shapes_src().concat(grown_src()), sized_src()),
@@ -1845,12 +1865,12 @@ test "a function added to a type checks itself alone, and one re-signed the defi
     b"area(s: Shape) -> Int = match s",
     b"area(of: Shape) -> Int = match of",
   );
-  let warm = answered_over(added.held, resigned);
+  let warm = queried_over(added.held, resigned);
   assert_eq(groups_ran(warm.run, group_query()), [
     group_in(b"shapes", [b"Shape::area"]),
     group_in(b"app", [b"size"]),
   ]);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(resigned))));
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(resigned))));
   assert(match warm.outcome { Analysed(_) -> true, Refused(_) -> false })
 }
 
@@ -1889,8 +1909,10 @@ test "a call on a value leaves an answer through the store the fresh one as its 
 
 /// What a check through the store refuses of `user` over the shipped modules `shipped`.
 fn refused_over(user: List<Source>, shipped: List<Source>) -> List<Bytes> / {abort.raise} =
-  fixed_over(nothing_held(), user, shipped).answers.fold([], |acc: List<Bytes>, a: Answered|
-    acc.concat(a.answer.refused.map(|d: Diag| d.message)))
+  fixed_over(empty_memory_store(), user, shipped).results.fold(
+    [],
+    |acc: List<Bytes>, a: CheckedModule| acc.concat(a.result.refused.map(|d: Diag| d.message)),
+  )
 
 test "a module a language type's home module imports names the type's functions and reads no home module" {
   assert_eq(
@@ -2013,9 +2035,9 @@ test "a language type's function is found in a module that names a constructor a
 }
 
 fn tables_of(
-  answers: List<Answered>,
+  answers: List<CheckedModule>,
 ) -> List<{ module: Bytes, tables: ModuleTables }> / {abort.raise} =
-  answers.map(|a: Answered| { module: a.module, tables: tables_answered(a.answer) })
+  answers.map(|a: CheckedModule| { module: a.module, tables: tables_of_result(a.result) })
 
 fn spread(lib: Bytes) -> List<Source> =
   [
@@ -2027,9 +2049,9 @@ fn spread(lib: Bytes) -> List<Source> =
   ]
 
 test "the groups a signature edit moves in one module are checked again, and no other" {
-  let cold = answered_over(nothing_held(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let cold = queried_over(empty_memory_store(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
   let widened = spread(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
-  let warm = answered_over(cold.held, widened);
+  let warm = queried_over(cold.held, widened);
   let ran = groups_ran(warm.run, group_query());
   assert(
     same_groups(ran, [
@@ -2038,59 +2060,62 @@ test "the groups a signature edit moves in one module are checked again, and no 
       group_in(b"app", [b"again"]),
     ]),
   );
-  assert_eq(said(warm.outcome), said(analyse(parse_all(widened))));
-  assert_eq(tables_of(warm.answers), tables_of(answered_over(nothing_held(), widened).answers));
-  assert_eq(warm.answers, answered_over(nothing_held(), widened).answers)
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(widened))));
+  assert_eq(
+    tables_of(warm.results),
+    tables_of(queried_over(empty_memory_store(), widened).results),
+  );
+  assert_eq(warm.results, queried_over(empty_memory_store(), widened).results)
 }
 
 /// Whether the record `held` keeps of the group `g` took what a check of its whole module offered
 /// through `whole`: such a record reads the definition of the query that offered it.
-fn took_whole(held: Held, g: GroupNamed) -> Bool / {abort.raise} =
-  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
+fn took_whole(held: MemoryStore, g: GroupKey) -> Bool / {abort.raise} =
+  memo::current_records(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
-      || (r.query == group_query() && r.input == bin::encode(g, group_named_bin())
-      && r.reads.fold(false, |any: Bool, read: memo::Read|
+      || (r.query == group_query() && r.input == bin::encode(g, group_key_bin())
+      && r.reads.fold(false, |any: Bool, read: memo::Dependency|
         any
           || (match read {
-            memo::World(_, at, _) -> at == whole_query(),
-            memo::Asked(_, _, _) -> false,
+            memo::ExternalDependency(_, at, _) -> at == whole_query(),
+            memo::QueryDependency(_, _, _) -> false,
           }))))
 
 test "an edit that moves one group of a module checks it alone, and one that moves more checks the module once" {
   let app = b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 2\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n";
   let over = |lib: Bytes| [{ name: b"lib", src: lib }, { name: b"app", src: app }];
-  let cold = answered_over(nothing_held(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
-  let one = answered_over(cold.held, over(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let cold = queried_over(empty_memory_store(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let one = queried_over(cold.held, over(b"pub fn step(n: Int) -> Int = n + 1\n"));
   assert_eq(groups_ran(one.run, group_query()), [group_in(b"app", [b"go"])]);
   assert(!took_whole(one.held, group_in(b"app", [b"go"])));
   // The check of `app` that decided so read `step`'s entry, so it decides again when that moves.
   let widened = over(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
-  let more = answered_over(one.held, widened);
+  let more = queried_over(one.held, widened);
   // A record is its group's last run, so one that reads `whole`'s definition took its offer then.
   let ran = groups_ran(more.run, group_query());
   assert(!ran.contains(group_in(b"app", [b"other"])));
   assert(took_whole(more.held, group_in(b"app", [b"go"])));
   assert(took_whole(more.held, group_in(b"app", [b"again"])));
-  assert_eq(more.answers, answered_over(nothing_held(), widened).answers)
+  assert_eq(more.results, queried_over(empty_memory_store(), widened).results)
 }
 
 /// Whether the record `held` keeps of `module`'s answer under the query hash `hash` read an entry:
 /// only a check of the module whole, made while it was answered, reads one.
-fn checked_whole_in(held: Held, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
-  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
+fn checked_whole_in(held: MemoryStore, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
+  memo::current_records(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == hash
-      && r.input == bin::encode({ module: module, shipped: false, tested: false }, named_bin())
-      && r.reads.fold(false, |any: Bool, read: memo::Read|
+      && r.input == bin::encode({ module: module, shipped: false, tested: false }, module_key_bin())
+      && r.reads.fold(false, |any: Bool, read: memo::Dependency|
         any
           || (match read {
-            memo::Asked(name, _, _) -> name == entry_query(),
-            memo::World(_, _, _) -> false,
+            memo::QueryDependency(name, _, _) -> name == owner_interfaces_query(),
+            memo::ExternalDependency(_, _, _) -> false,
           }))))
 
 test "where only what puts a module together is defined anew, its groups stand and it is not checked again" {
   let sources = spread(b"pub fn step(n: Int) -> Int = n + 1\n");
-  let cold = answered_over(nothing_held(), sources);
+  let cold = queried_over(empty_memory_store(), sources);
   assert(checked_whole_in(cold.held, module_query(), b"app"));
   let anew = b"module, defined anew";
   let qs = fresh_registry().fold(
@@ -2099,12 +2124,12 @@ test "where only what puts a module together is defined anew, its groups stand a
       acc.insert(n, if n == module_query() { { ..q, hash: anew } } else { q }),
   );
   // Every query's hash names the run's stamp, so the store vouches for nothing to this one.
-  let warm = answered_under(qs, cold.held, sources);
+  let warm = queried_under(qs, cold.held, sources);
   assert(modules_ran(warm.run, module_query()).contains(b"app"));
   assert(modules_ran(warm.run, module_query()).contains(b"lib"));
   assert_eq(groups_ran(warm.run, group_query()), []);
   assert(!checked_whole_in(warm.held, anew, b"app"));
-  assert_eq(warm.answers, cold.answers)
+  assert_eq(warm.results, cold.results)
 }
 
 /// A module whose `go` and `again` read `lib::step` and `base`, an owner of their own module,
@@ -2120,34 +2145,34 @@ fn leaning(lib: Bytes) -> List<Source> =
 
 /// Whether `held` keeps a check of a module whole that asked for a group of that module or for an
 /// owner's entry there: a group asks for that check, so the check would wait on what waits on it.
-fn whole_asked_its_own(held: Held) -> Bool / {abort.raise} =
-  memo::current(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
+fn whole_asked_its_own(held: MemoryStore) -> Bool / {abort.raise} =
+  memo::current_records(held).fold(false, |found: Bool, _: Bytes, r: memo::Record|
     found
       || (r.query == whole_query()
       && {
-        let module = decoded(r.input, named_bin(), "a module's name").module;
-        r.reads.fold(false, |own: Bool, read: memo::Read|
+        let module = decoded(r.input, module_key_bin(), "a module's name").module;
+        r.reads.fold(false, |own: Bool, read: memo::Dependency|
           own
             || (match read {
-              memo::Asked(name, input, _) ->
-                (name == owner_entry_query()
-                  && decoded(input, owner_named_bin(), "an owner's name").module == module)
+              memo::QueryDependency(name, input, _) ->
+                (name == owner_interface_query()
+                  && decoded(input, owner_key_bin(), "an owner's name").module == module)
                   || (name == group_query()
-                  && decoded(input, group_named_bin(), "a group's names").module == module),
-              memo::World(_, _, _) -> false,
+                  && decoded(input, group_key_bin(), "a group's names").module == module),
+              memo::ExternalDependency(_, _, _) -> false,
             }))
       }))
 
 test "a check of a module whole that a group asks for reads nothing of the module's groups" {
-  let cold = answered_over(nothing_held(), leaning(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let cold = queried_over(empty_memory_store(), leaning(b"pub fn step(n: Int) -> Int = n + 1\n"));
   let widened = leaning(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
-  let warm = answered_over(cold.held, widened);
+  let warm = queried_over(cold.held, widened);
   let ran = groups_ran(warm.run, group_query());
   assert(ran.contains(group_in(b"app", [b"go"])));
   assert(ran.contains(group_in(b"app", [b"again"])));
   assert(!ran.contains(group_in(b"app", [b"aside"])));
   assert(!whole_asked_its_own(warm.held));
-  assert_eq(warm.answers, answered_over(nothing_held(), widened).answers)
+  assert_eq(warm.results, queried_over(empty_memory_store(), widened).results)
 }
 
 fn staled(inner: Bytes, first: Bytes, go: Bytes) -> List<Source> =
@@ -2181,9 +2206,9 @@ test "a group that goes stale while its module's others are checked is checked a
     b"pub fn first() -> Int = sprout() + 2",
     b"pub fn go(n: Int) -> Int = lib::step(1) + shown(n)",
   );
-  let warm = answered_over(answered_over(nothing_held(), before).held, after);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(after))));
-  assert_eq(warm.answers, answered_over(nothing_held(), after).answers)
+  let warm = queried_over(queried_over(empty_memory_store(), before).held, after);
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
+  assert_eq(warm.results, queried_over(empty_memory_store(), after).results)
 }
 
 test "a test edited beside a definition it calls answers what a fresh check answers" {
@@ -2199,30 +2224,30 @@ test "a test edited beside a definition it calls answers what a fresh check answ
       src: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = 1 + n\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 9) }\n",
     },
   ];
-  let warm = answered_over(answered_over(nothing_held(), before).held, after);
-  assert_eq(tables_of(warm.answers), tables_of(answered_over(nothing_held(), after).answers));
-  assert_eq(warm.answers, answered_over(nothing_held(), after).answers)
+  let warm = queried_over(queried_over(empty_memory_store(), before).held, after);
+  assert_eq(tables_of(warm.results), tables_of(queried_over(empty_memory_store(), after).results));
+  assert_eq(warm.results, queried_over(empty_memory_store(), after).results)
 }
 
 test "groups an edit breaks together each say why, as a fresh check says" {
-  let cold = answered_over(nothing_held(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let cold = queried_over(empty_memory_store(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
   let narrowed = spread(b"pub fn step(n: Int, by: Int) -> Int = n + by\n");
-  let warm = answered_over(cold.held, narrowed);
-  assert_eq(said(warm.outcome), said(analyse(parse_all(narrowed))))
+  let warm = queried_over(cold.held, narrowed);
+  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(narrowed))))
 }
 
 test "a definition added is checked and hashed alone" {
-  let cold = fixed_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"), []);
+  let cold = fixed_over(empty_memory_store(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"), []);
   let added = layered(b"pub fn step(n: Int) -> Int = n + 1\npub fn twice(n: Int) -> Int = n * 2\n");
   let warm = fixed_over(cold.held, added, []);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"twice"])]);
   assert_eq(groups_ran(warm.run, group_hash_query()), [group_in(b"lib", [b"twice"])]);
   assert_eq(modules_ran(warm.run, hashes_query()), [b"lib"]);
-  assert_eq(warm.fixing, fixed_over(nothing_held(), added, []).fixing)
+  assert_eq(warm.fixing, fixed_over(empty_memory_store(), added, []).fixing)
 }
 
 test "a body edit hashes the definitions that call it again, and no other" {
-  let cold = fixed_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n * 3\n"), []);
+  let cold = fixed_over(empty_memory_store(), layered(b"pub fn step(n: Int) -> Int = n * 3\n"), []);
   let edited = layered(b"pub fn step(n: Int) -> Int = n * 4\n");
   let warm = fixed_over(cold.held, edited, []);
   assert_eq(groups_ran(warm.run, group_query()), [group_in(b"lib", [b"step"])]);
@@ -2231,7 +2256,7 @@ test "a body edit hashes the definitions that call it again, and no other" {
     group_in(b"app", [b"go"]),
   ]);
   assert_eq(modules_ran(warm.run, hashes_query()), [b"app", b"lib"]);
-  assert_eq(warm.fixing, fixed_over(nothing_held(), edited, []).fixing)
+  assert_eq(warm.fixing, fixed_over(empty_memory_store(), edited, []).fixing)
 }
 
 test "a definition added to a shipped module checks and hashes no module that imports it again" {
@@ -2250,12 +2275,12 @@ test "a definition added to a shipped module checks and hashes no module that im
         ),
       },
     ];
-  let cold = fixed_over(nothing_held(), user, shapes(b""));
+  let cold = fixed_over(empty_memory_store(), user, shapes(b""));
   let added = shapes(b"pub fn spare() -> Int = 5\n");
   let warm = fixed_over(cold.held, user, added);
   assert_eq(modules_ran(warm.run, module_query()), [b"std.shapes"]);
   assert_eq(modules_ran(warm.run, hashes_query()), [b"std.shapes"]);
-  assert_eq(warm.fixing, fixed_over(nothing_held(), user, added).fixing)
+  assert_eq(warm.fixing, fixed_over(empty_memory_store(), user, added).fixing)
 }
 
 // A bootstrap's builder is loaded so: over a checkout whose shipped modules are not all the pack's.
@@ -2275,16 +2300,16 @@ test "a load over a pack it does not trust checks no shipped module the pack sti
       { name: b"std.b", src: b"pub fn one() -> Int = 1\n\npub fn none() -> Int = 0\n" },
       { name: b"std.aside", src: aside },
     ];
-  let packed = pack_of(shipped_held(shipped(b"pub fn spare() -> Int = 3\n")));
+  let packed = pack_of(shipped_store(shipped(b"pub fn spare() -> Int = 3\n")));
   let moved = shipped(b"pub fn spare() -> Int = 4\n");
-  let load = fixed_beside(nothing_held(), packed, user, moved);
+  let load = fixed_beside(empty_memory_store(), packed, user, moved);
   assert_eq(
-    ran_for(load.run, whole_query()).map(|b: Bytes|
-      decoded(b, named_bin(), "a module's name").module),
+    executed_for(load.run, whole_query()).map(|b: Bytes|
+      decoded(b, module_key_bin(), "a module's name").module),
     [b"main"],
   );
-  assert_eq(groups_ran(load.run, group_query()).map(|g: GroupNamed| g.module), [b"main", b"main"]);
-  assert_eq(load.answers, fixed_over(nothing_held(), user, moved).answers)
+  assert_eq(groups_ran(load.run, group_query()).map(|g: GroupKey| g.module), [b"main", b"main"]);
+  assert_eq(load.results, fixed_over(empty_memory_store(), user, moved).results)
 }
 
 test "modules that import one another in a cycle are refused through the store as they are fresh" {
@@ -2312,8 +2337,8 @@ test "a load that refuses checks no module that imports a refused one, and no gr
     { name: b"top", src: b"import app\npub fn main() -> Int = app::go()\n" },
     { name: b"aside", src: b"pub fn alone() -> Int = nothing()\n\npub fn other() -> Int = 2\n" },
   ];
-  let cold = answered_over(nothing_held(), sources);
-  assert_eq(sorted_bytes(refused_first(cold.answers).map(|a: Answered| a.module)), [
+  let cold = queried_over(empty_memory_store(), sources);
+  assert_eq(sorted_bytes(refused_first(cold.results).map(|a: CheckedModule| a.module)), [
     b"aside",
     b"lib",
   ]);
@@ -2324,7 +2349,10 @@ test "a load that refuses checks no module that imports a refused one, and no gr
     b"aside",
     b"pub fn alone() -> Int = 4\n\npub fn other() -> Int = 2\n",
   );
-  let warm = answered_over(cold.held, mended);
+  let warm = queried_over(cold.held, mended);
   assert_eq(modules_ran(warm.run, module_query()), [b"app", b"aside", b"lib", b"top"]);
-  assert_eq(said(warm.outcome), said(answered_over(nothing_held(), mended).outcome))
+  assert_eq(
+    outcome_summary(warm.outcome),
+    outcome_summary(queried_over(empty_memory_store(), mended).outcome),
+  )
 }

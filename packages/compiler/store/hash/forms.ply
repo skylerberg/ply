@@ -2,24 +2,36 @@
 
 import compiler.syntax.parsing (Span, Ident, QName, is_bare, bare, starts_upper, prelude_binder)
 import std.bin
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded,
-                                 LFloat, LDec, LChar, LUnit, LBad)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, Param, MatchArm, HandleClause, ReturnClause,
-                              HandlerVar, RecField, ETagged, Hole, tagged_parser, tagged_filler,
-                              NamedArg, prelude_module, scheduler_module)
-import compiler.syntax.items (Item, IFn, IType, IEffect, ITest, ILaw, FnDef, TypeDef, TDAlias,
-                              TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
-                              Constraint, SRequires, SEnsures, SCost, SSpace, SpecClause,
-                              ReturnsFresh, ReturnsParam, TDNominal, TDExtern, test_listing,
-                              test_run, case_params, InstanceDef, NKey, INumeric, NumericDef,
-                              numeric_ops, numeric_by, member_of, member_name)
-import compiler.check.resolve.tables (ParsedModule, Resolved, Binding, ModuleBinding, Diag, qualify)
+import compiler.syntax.type_syntax (TypeExpr, VariableTypeExpression, NamedTypeExpression,
+                                    FunctionTypeExpression, RecordTypeExpression,
+                                    UnitTypeExpression, InvalidTypeExpression, RowExpr, AtomExpr)
+import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
+                                 PatternRange, PatternConstructor, PatternRecord, PatternList,
+                                 PatternOr, PatternInvalid, SourceLiteral, LiteralInt, LiteralFixed,
+                                 LiteralWide, LiteralBool, LiteralString, LiteralBytes,
+                                 LiteralEmbedded, LiteralFloat, LiteralDecimal, LiteralChar,
+                                 LiteralUnit, LiteralInvalid)
+import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, BinaryExpression,
+                              UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                              MatchExpression, BlockExpression, RecordExpression,
+                              RecordUpdateExpression, PropagateExpression, FieldExpression,
+                              ListExpression, PerformExpression, HandleExpression,
+                              WithHoldExpression, SimulateExpression, ParallelExpression,
+                              InvalidExpression, HoleExpression, TryBlockExpression, Stmt,
+                              LetStatement, LetElseStatement, ExpressionStatement,
+                              AssignmentStatement, Param, MatchArm, HandleClause, ReturnClause,
+                              HandlerVar, RecordLiteralField, TaggedLiteralExpression, Hole,
+                              tagged_parser, tagged_filler, NamedArg, prelude_module,
+                              scheduler_module)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem, FnDef,
+                              TypeDef, AliasBody, SumBody, VariantDef, EffectDef, OpDef, TestDef,
+                              LawDef, Binder, Constraint, RequiresClause, EnsuresClause, CostClause,
+                              SpaceClause, SpecClause, ReturnsFresh, ReturnsParam, NominalBody,
+                              ExternBody, test_listing, test_run, case_params, InstanceDef,
+                              KeyInstance, NumericItem, NumericDef, numeric_ops, numeric_by,
+                              member_of, member_name)
+import compiler.check.resolve.tables (ParsedModule, Resolution, Binding, ModuleBinding, Diag,
+                                      qualify)
 import std.bytes (u32_le)
 import std.hash (blake3)
 import std.list
@@ -31,40 +43,41 @@ import compiler.check.infer.checker (MemberSite)
 import compiler.emit.keys (test_owner)
 import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, Node, TestNode, LawNode,
                                   DefEntry, IndexEntry, LawEntry, TestEntry, Target, CtorTarget,
-                                  FnTarget, Index, qualifier, simple_of, Building, Declaring,
-                                  declare, no_declaring, instances_in, is_effect, value_target,
+                                  FnTarget, Index, qualifier, simple_of, IndexBuilder, Declarations,
+                                  declare, no_declarations, instances_in, is_effect, value_target,
                                   ctor_target, type_target, effect_target, is_cyclic)
-import compiler.store.hash.encoding (Choice, CallSite, Found, Pick, Waiting, pick_bin, spec_tag)
+import compiler.store.hash.encoding (Choice, CallSite, Known, CallResolution, Pending,
+                                     call_resolution_bin, spec_tag)
 import compiler.store.hash.stored (Template, template_bin)
 import compiler.store.hash.template (node_template, test_template, law_template, spec_template,
-                                     expression_template, renumbered, written_code)
-import compiler.store.hash.fill (Filling, blank, Finished, finished, references,
+                                     expression_template, renumbered, emitted_code)
+import compiler.store.hash.fill (Filling, blank, FilledForm, fill, references,
                                  expression_references)
 
 // --- The reference graph over every top-level definition ------------------------------
 
 pub fn build_index(
   mods: List<ParsedModule>,
-  resolved: Resolved,
+  resolved: Resolution,
 ) -> { index: Index, diags: List<Diag> } / {abort.raise} = {
   let built = range(0, mods.len()).fold(
     { nodes: [], tests: [], laws: [], order: [], items: [], diags: [] },
-    |b: Building, m: Int| {
+    |b: IndexBuilder, m: Int| {
       let module = mods.get(m);
       let walked = module.module.items.fold(
         {
           b: b,
-          fns: no_declaring([]),
-          types: no_declaring([]),
-          effects: no_declaring([]),
-          ctors: no_declaring([]),
+          fns: no_declarations([]),
+          types: no_declarations([]),
+          effects: no_declarations([]),
+          ctors: no_declarations([]),
         },
-        |s: { b: Building, fns: Declaring, types: Declaring, effects: Declaring, ctors: Declaring }, item: Item| {
-          let bb: Building = s.b;
+        |s: { b: IndexBuilder, fns: Declarations, types: Declarations, effects: Declarations, ctors: Declarations }, item: Item| {
+          let bb: IndexBuilder = s.b;
           match item {
-            IFn(d) -> {
+            FunctionItem(d) -> {
               let id = bb.nodes.len();
-              let pushed: Building = {
+              let pushed: IndexBuilder = {
                 ..bb,
                 nodes: bb.nodes.push({
                   name: qualify(module.name, d.name.name),
@@ -74,16 +87,16 @@ pub fn build_index(
                 }),
                 order: bb.order.push(DefEntry(id)),
               };
-              let fns: Declaring = declare({ ..s.fns, diags: [] }, m, d.name, id, b"definition");
+              let fns: Declarations = declare({ ..s.fns, diags: [] }, m, d.name, id, b"definition");
               {
                 ..s,
                 b: { ..pushed, diags: pushed.diags.concat(fns.diags) },
                 fns: { ..fns, diags: [] },
               }
             },
-            IType(d) -> {
+            TypeItem(d) -> {
               let id = bb.nodes.len();
-              let pushed: Building = {
+              let pushed: IndexBuilder = {
                 ..bb,
                 nodes: bb.nodes.push({
                   name: qualify(module.name, d.name.name),
@@ -93,10 +106,10 @@ pub fn build_index(
                 }),
                 order: bb.order.push(DefEntry(id)),
               };
-              let types: Declaring = declare({ ..s.types, diags: [] }, m, d.name, id, b"type");
-              let ctors: Declaring = match d.body {
-                TDSum(variants) ->
-                  variants.fold({ ..s.ctors, diags: [] }, |c: Declaring, variant: VariantDef|
+              let types: Declarations = declare({ ..s.types, diags: [] }, m, d.name, id, b"type");
+              let ctors: Declarations = match d.body {
+                SumBody(variants) ->
+                  variants.fold({ ..s.ctors, diags: [] }, |c: Declarations, variant: VariantDef|
                     declare(c, m, variant.name, id, b"variant")),
                 _ -> { ..s.ctors, diags: [] },
               };
@@ -107,9 +120,9 @@ pub fn build_index(
                 ctors: { ..ctors, diags: [] },
               }
             },
-            IEffect(d) -> {
+            EffectItem(d) -> {
               let id = bb.nodes.len();
-              let pushed: Building = {
+              let pushed: IndexBuilder = {
                 ..bb,
                 nodes: bb.nodes.push({
                   name: qualify(module.name, d.name.name),
@@ -119,7 +132,7 @@ pub fn build_index(
                 }),
                 order: bb.order.push(DefEntry(id)),
               };
-              let effects: Declaring = declare(
+              let effects: Declarations = declare(
                 { ..s.effects, diags: [] },
                 m,
                 d.name,
@@ -132,7 +145,7 @@ pub fn build_index(
                 effects: { ..effects, diags: [] },
               }
             },
-            ITest(d) ->
+            TestItem(d) ->
               {
                 ..s,
                 b: {
@@ -141,7 +154,7 @@ pub fn build_index(
                   tests: bb.tests.push({ key: qualify(module.name, d.name), module: m, def: d }),
                 },
               },
-            ILaw(d) ->
+            LawItem(d) ->
               {
                 ..s,
                 b: {
@@ -154,7 +167,7 @@ pub fn build_index(
           }
         },
       );
-      let wb: Building = walked.b;
+      let wb: IndexBuilder = walked.b;
       {
         ..wb,
         items: wb.items.push({
@@ -178,7 +191,7 @@ pub fn build_index(
           numerics: module.module.items.fold(
             Map::new(),
             |acc: Map<Bytes, NumericDef>, item: Item|
-              match item { INumeric(d) -> acc.insert(d.target.name, d), _ -> acc },
+              match item { NumericItem(d) -> acc.insert(d.target.name, d), _ -> acc },
           ),
         }),
       }
@@ -198,7 +211,7 @@ pub fn build_index(
       effects: project(scope.bound.effects),
       modules: scope.modules.fold(Map::new(), |acc: Map<Bytes, Int>, mb: ModuleBinding|
         acc.insert(mb.binder, mb.target)),
-      sees: match resolved.sees.at(m) { Some(seen) -> seen, None -> [m] },
+      visible_modules: match resolved.visible_modules.at(m) { Some(seen) -> seen, None -> [m] },
     }
   });
   let prelude = range(0, mods.len()).filter(|m: Int| mods.get(m).name == prelude_module());
@@ -212,7 +225,7 @@ pub fn build_index(
     scopes: scopes,
     effect_sketches: Map::new(),
     written: prelude.fold(Map::new(), |acc: Map<Bytes, Int>, m: Int|
-      written_code().calls.concat(written_code().lifts).fold(
+      emitted_code().calls.concat(emitted_code().lifts).fold(
         acc,
         |a: Map<Bytes, Int>, n: Bytes|
           match built.items.get(m).fns.get(n) { Some(v) -> a.insert(n, v), None -> a },
@@ -228,7 +241,7 @@ fn sketch_effects(index: Index) -> Map<Int, Bytes> / {abort.raise} =
       NodeEffect(_) ->
         acc.insert(
           v,
-          finished(node_template(index, node.module, node.name, None, node.body), blank()).bytes,
+          fill(node_template(index, node.module, node.name, None, node.body), blank()).bytes,
         ),
       _ -> acc,
     }
@@ -284,7 +297,7 @@ pub fn spec_hash(owner: Bytes, kind: Int, index: Int, normalized: Bytes) -> Byte
 pub fn member_hash(component: Bytes, class: Int) -> Bytes = blake3(component.concat(u32_le(class)))
 
 /// Each member's choices, written as `envelope` reads them.
-pub fn framed_picks(picks: List<List<Choice>>) -> Bytes = {
+pub fn encoded_resolutions(picks: List<List<Choice>>) -> Bytes = {
   let inner = Bytes::concat_all(
     picks.map(|p: List<Choice>|
       u32_le(p.len()).concat(
@@ -296,8 +309,8 @@ pub fn framed_picks(picks: List<List<Choice>>) -> Bytes = {
   u32_le(inner.len()).concat(inner)
 }
 
-pub fn open_picks_bin() -> bin::BinCodec<List<List<Pick>>> =
-  bin::list_bin(bin::list_bin(pick_bin()))
+pub fn pending_resolutions_bin() -> bin::BinCodec<List<List<CallResolution>>> =
+  bin::list_bin(bin::list_bin(call_resolution_bin()))
 
 /// A body, alone in its component where `class` is `None`: a kind byte, the member's class, each
 /// member's choices, then the bytes its hash is taken over. A body with a call on a value its check
@@ -305,17 +318,18 @@ pub fn open_picks_bin() -> bin::BinCodec<List<List<Pick>>> =
 /// from it, so no store files it and no printer reads it until [`checked_body`] completes it.
 fn stored_body(
   class: Option<Int>,
-  picks: List<List<Pick>>,
+  picks: List<List<CallResolution>>,
   payload: Bytes,
 ) -> Bytes / {abort.raise} = {
   let head = |kind: Int|
     match class { None -> byte_of_int(kind), Some(c) -> byte_of_int(kind + 1).concat(u32_le(c)) };
-  let found = Option::traverse(picks, |member: List<Pick>|
-    Option::traverse(member, |p: Pick| match p { Found(c) -> Some(c), Waiting(_) -> None }));
+  let found = Option::traverse(picks, |member: List<CallResolution>|
+    Option::traverse(member, |p: CallResolution|
+      match p { Known(c) -> Some(c), Pending(_) -> None }));
   match found {
-    Some(choices) -> Bytes::concat_all([head(0), framed_picks(choices), payload]),
+    Some(choices) -> Bytes::concat_all([head(0), encoded_resolutions(choices), payload]),
     None -> {
-      let open = bin::encode(picks, open_picks_bin());
+      let open = bin::encode(picks, pending_resolutions_bin());
       Bytes::concat_all([head(2), u32_le(open.len()), open, payload])
     },
   }
@@ -388,18 +402,18 @@ pub fn of_key<a>(m: Map<Bytes, a>, key: Bytes) -> a / {abort.raise} =
   match m.get(key) { Some(x) -> x, None -> panic("a key the table does not hold") }
 
 /// Its calls' choices, then the normalized bytes `blake3` keys the body by.
-pub fn solo_body(f: Finished) -> Bytes / {abort.raise} = stored_body(None, [f.chosen], f.bytes)
+pub fn single_body(f: FilledForm) -> Bytes / {abort.raise} = stored_body(None, [f.chosen], f.bytes)
 
 /// Every member's choices, then the whole component's packed bytes, so any member rebuilds the
 /// cycle.
-pub fn member_body(refined: Refined, class: Int) -> Bytes / {abort.raise} =
+pub fn member_body(refined: Refinement, class: Int) -> Bytes / {abort.raise} =
   stored_body(Some(class), refined.picks, refined.packed)
 
 type Sccs = { component_of: List<Int>, orders: List<List<Int>> }
 
 /// The effects one component can see, in an order derived only from what it references.
 fn effect_order(
-  shapes: Shapes,
+  shapes: HashInput,
   refs: List<Int>,
   scc: Sccs,
   own: Option<Int>,
@@ -421,7 +435,7 @@ fn slots(order: List<Int>) -> Map<Int, Int> / {abort.raise} =
 /// A node as hashing reads it: its name, whether it is a declaration and whether an effect, the
 /// package its module is in, and its forms, which a node read as an earlier run fixed it has none
 /// of.
-pub type Shape = { name: Bytes, decl: Bool, effect: Bool, package: Int, form: Option<NodeForm> }
+pub type HashNode = { name: Bytes, decl: Bool, effect: Bool, package: Int, form: Option<NodeForm> }
 
 /// A node normalized and, for a function, what another package reads of it: its signature with the
 /// body left out, each clause of its specification, and whether its body is `transparent`.
@@ -439,35 +453,35 @@ pub type ClauseForm = { kind: Int, form: Template }
 /// and what one case runs.
 pub type ItemForm = { form: Template, listed: List<Int>, listing: List<Int> }
 
-pub type ItemShape = { key: Bytes, form: Option<ItemForm> }
+pub type HashItem = { key: Bytes, form: Option<ItemForm> }
 
 /// A program as hashing reads it: its nodes, those that are definitions in the order it lists
 /// them, and its tests and laws.
-pub type Shapes = {
-  nodes: List<Shape>,
+pub type HashInput = {
+  nodes: List<HashNode>,
   order: List<Int>,
-  tests: List<ItemShape>,
-  laws: List<ItemShape>,
+  tests: List<HashItem>,
+  laws: List<HashItem>,
 }
 
 derive bin for ClauseForm
 
 derive bin for NodeForm
 
-derive bin for Shape
+derive bin for HashNode
 
 derive bin for ItemForm
 
-derive bin for ItemShape
+derive bin for HashItem
 
-derive bin for Shapes
+derive bin for HashInput
 
-fn formless(shape: Shape) -> Bool = match shape.form { None -> true, Some(_) -> false }
+fn has_no_form(shape: HashNode) -> Bool = match shape.form { None -> true, Some(_) -> false }
 
 /// What filling reads throughout one hashing: the shapes, each node's name, and the graph over them.
-type Over = { shapes: Shapes, names: List<Bytes>, graph: Graph }
+type HashContext = { shapes: HashInput, names: List<Bytes>, graph: Graph }
 
-fn form_of(over: Over, v: Int) -> Template / {abort.raise} =
+fn form_of(over: HashContext, v: Int) -> Template / {abort.raise} =
   match over.shapes.nodes.get(v).form {
     Some(f) -> f.form,
     None -> panic("a node hashed again has no form"),
@@ -475,13 +489,13 @@ fn form_of(over: Over, v: Int) -> Template / {abort.raise} =
 
 /// `form` filled from `hashes`, its effects numbered as `effects` says.
 fn filled_under(
-  over: Over,
+  over: HashContext,
   form: Template,
   hashes: Map<Int, Bytes>,
   effects: Map<Int, Int>,
   by_name: Bool,
-) -> Finished / {abort.raise} =
-  finished(form, {
+) -> FilledForm / {abort.raise} =
+  fill(form, {
     hashes: hashes,
     component: Map::new(),
     effects: effects,
@@ -490,47 +504,47 @@ fn filled_under(
   })
 
 /// The effect enumeration an item is written under, fixed by what it references with nothing known.
-fn slots_of(over: Over, form: Template) -> Map<Int, Int> / {abort.raise} =
+fn slots_of(over: HashContext, form: Template) -> Map<Int, Int> / {abort.raise} =
   slots_under(over, references(form))
 
 /// The effect enumeration of an item that references `referenced`, in first-mention order.
-fn slots_under(over: Over, referenced: List<Int>) -> Map<Int, Int> / {abort.raise} =
+fn slots_under(over: HashContext, referenced: List<Int>) -> Map<Int, Int> / {abort.raise} =
   slots(effect_order(over.shapes, referenced, over.graph.scc, None, []))
 
 /// `form` filled from `hashes` under the enumeration its own references fix.
 fn filled_item(
-  over: Over,
+  over: HashContext,
   form: Template,
   hashes: Map<Int, Bytes>,
   by_name: Bool,
-) -> Finished / {abort.raise} = filled_under(over, form, hashes, slots_of(over, form), by_name)
+) -> FilledForm / {abort.raise} = filled_under(over, form, hashes, slots_of(over, form), by_name)
 
 fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (a == b && ia < ib)
 
-type Refined = {
+type Refinement = {
   members: List<{ node: Int, hash: Bytes }>,
   packed: Bytes,
-  picks: List<List<Pick>>,
+  picks: List<List<CallResolution>>,
   classes: Map<Int, Int>,
 }
 
 /// A cyclic component hashes as a unit; members are labelled by class refinement to a fixpoint, plus one settling round.
 fn hash_component(
-  over: Over,
+  over: HashContext,
   component: List<Int>,
   hashes: Map<Int, Bytes>,
   effects: Map<Int, Int>,
-) -> Refined / {abort.raise} = {
+) -> Refinement / {abort.raise} = {
   let encode = |classes: Map<Int, Int>, v: Int|
-    finished(form_of(over, v), {
+    fill(form_of(over, v), {
       hashes: hashes,
       component: classes,
       effects: effects,
       by_name: false,
       names: over.names,
     });
-  let relabel = |finished: List<Finished>| {
-    let encodings = finished.map(|f: Finished| f.bytes);
+  let relabel = |finished: List<FilledForm>| {
+    let encodings = finished.map(|f: FilledForm| f.bytes);
     let distinct = dedup_sorted(sort_bytes(encodings));
     range(0, component.len()).fold(Map::new(), |acc: Map<Int, Int>, i: Int|
       acc.insert(component.get(i), position_bytes(distinct, encodings.get(i))))
@@ -546,7 +560,7 @@ fn hash_component(
   let settled = iterate(
     { classes: start, encodings: component.map(|v: Int| encode(start, v)) },
     component.len() + 2,
-    |s: { classes: Map<Int, Int>, encodings: List<Finished> }| {
+    |s: { classes: Map<Int, Int>, encodings: List<FilledForm> }| {
       let next = relabel(s.encodings);
       let same = grouping(next) == grouping(s.classes);
       let re = { classes: next, encodings: component.map(|v: Int| encode(next, v)) };
@@ -558,14 +572,14 @@ fn hash_component(
     + 1;
   let by_class = range(0, component.len()).fold(
     range(0, width).map(|i: Int| { bytes: b"", chosen: [] }),
-    |acc: List<Finished>, i: Int|
+    |acc: List<FilledForm>, i: Int|
       acc.set(
         match settled.classes.get(component.get(i)) { Some(c) -> c, None -> 0 },
         settled.encodings.get(i),
       ),
   );
   let packed = u32_le(by_class.len()).concat(
-    Bytes::concat_all(by_class.map(|m: Finished| u32_le(m.bytes.len()).concat(m.bytes))),
+    Bytes::concat_all(by_class.map(|m: FilledForm| u32_le(m.bytes.len()).concat(m.bytes))),
   );
   let component_hash = blake3(packed);
   {
@@ -575,7 +589,7 @@ fn hash_component(
         hash: member_hash(component_hash, match settled.classes.get(v) { Some(c) -> c, None -> 0 }),
       }),
     packed: packed,
-    picks: by_class.map(|m: Finished| m.chosen),
+    picks: by_class.map(|m: FilledForm| m.chosen),
     classes: settled.classes,
   }
 }
@@ -609,14 +623,14 @@ fn sort_ints(xs: List<Int>) -> List<Int> / {abort.raise} =
 fn ints_lt(a: List<Int>, b: List<Int>) -> Bool =
   match compare_values(a, b) { Less -> true, _ -> false }
 
-type Stated = {
+type SpecHashes = {
   own: List<{ name: Bytes, hash: Bytes }>,
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
 }
 
-type Hashed = {
+type HashTables = {
   hashes: Map<Int, Bytes>,
   bodies: Map<Int, Bytes>,
   tests: List<Bytes>,
@@ -650,31 +664,31 @@ type TestHashes = {
 }
 
 /// `hashes` is the table references are written from; `fresh` is what each body hashed to under it.
-type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int, Bytes> }
+type ComponentKeys = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int, Bytes> }
 
 type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
 
 /// A node with nothing known: its sketch, which orders a cycle's members without source position,
 /// and what it references, in first-mention order.
-pub type First = { sketch: Bytes, references: List<Int> }
+pub type FirstPass = { sketch: Bytes, references: List<Int> }
 
 /// Every node with nothing known. A node `fixed` holds references what its run fixed, and has a
 /// sketch only where it has a form.
-fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<First> / {abort.raise} =
+fn first_pass_of(shapes: HashInput, fixed: Map<Int, List<Int>>) -> List<FirstPass> / {abort.raise} =
   range(0, shapes.nodes.len()).map(|v: Int| {
     let edges = fixed.get(v);
     match shapes.nodes.get(v).form {
       None -> { sketch: b"", references: match edges { Some(es) -> es, None -> [] } },
       Some(f) ->
         {
-          sketch: finished(f.form, blank()).bytes,
+          sketch: fill(f.form, blank()).bytes,
           references: match edges { Some(es) -> es, None -> references(f.form) },
         },
     }
   })
 
 /// The node at `v` of `index` normalized, and what another package reads of a function. `chose`
-/// is what [`Chosen`] says of its module's calls on values.
+/// is what [`ModuleSelection`] says of its module's calls on values.
 fn node_form(
   index: Index,
   v: Int,
@@ -692,7 +706,7 @@ fn node_form(
             node.module,
             node.name,
             None,
-            NodeFn({ ..d, body: ELit({ span: d.name.span, lit: LUnit }) }),
+            NodeFn({ ..d, body: LiteralExpression({ span: d.name.span, lit: LiteralUnit }) }),
           ),
         ),
         clauses: d.spec.map(|clause: SpecClause|
@@ -726,20 +740,20 @@ fn test_form(
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
   { form: law_template(index, l.module, l.def), listed: [], listing: [] }
 
-type Shaped = { shapes: Shapes, first: List<First> }
+type Shaped = { shapes: HashInput, first: List<FirstPass> }
 
 /// Each node of `index` as hashing reads it, its modules in `packages`; a node `fixed` holds the
 /// references of, and each test and law `fixing` holds, without forms. A fixed node that shares a
 /// cycle with one that is not has a form: its sketch orders that cycle's members.
-pub fn shapes_of(
+pub fn hash_input(
   index: Index,
   packages: List<Int>,
   fixed: Map<Int, List<Int>>,
-  fixing: Fixing,
+  fixing: CachedHashes,
 ) -> Shaped / {abort.raise} = {
-  let held_tests = fixing.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: FixedTest|
+  let held_tests = fixing.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: CachedTest|
     acc.insert(t.key, true));
-  let held_laws = fixing.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: FixedLaw|
+  let held_laws = fixing.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: CachedLaw|
     acc.insert(l.key, true));
   let shape = |v: Int, formed: Bool| {
     let node = index.nodes.get(v);
@@ -766,10 +780,10 @@ pub fn shapes_of(
         form: if held_laws.contains(l.key) { None } else { Some(law_form(index, l)) },
       }),
   };
-  let first = first_of(plain, fixed);
+  let first = first_pass_of(plain, fixed);
   // A cycle whose members are all fixed keeps the order it was fixed in, which no sketch decides.
   let cyclic = if fixed.len() == 0 { Map::new() } else {
-    graph::components({ out: first.map(|f: First| f.references) }).fold(
+    graph::components({ out: first.map(|f: FirstPass| f.references) }).fold(
       Map::new(),
       |acc: Map<Int, Bool>, c: List<Int>|
         if c.len() < 2 || c.fold(true, |all: Bool, v: Int| all && fixed.contains(v)) { acc } else {
@@ -784,29 +798,29 @@ pub fn shapes_of(
       nodes: range(0, index.nodes.len()).map(|v: Int|
         if cyclic.contains(v) { shape(v, true) } else { plain.nodes.get(v) }),
     };
-    { shapes: shapes, first: first_of(shapes, fixed) }
+    { shapes: shapes, first: first_pass_of(shapes, fixed) }
   }
 }
 
 /// Every node of `index` with its forms and the graph over them.
-pub fn over_of(index: Index) -> Over / {abort.raise} = {
-  let shaped = shapes_of(index, [], Map::new(), no_fixing());
+pub fn hash_context(index: Index) -> HashContext / {abort.raise} = {
+  let shaped = hash_input(index, [], Map::new(), no_cached_hashes());
   {
     shapes: shaped.shapes,
-    names: shaped.shapes.nodes.map(|s: Shape| s.name),
+    names: shaped.shapes.nodes.map(|s: HashNode| s.name),
     graph: graph_with(shaped.shapes, shaped.first, Map::new()),
   }
 }
 
 /// `carried` gives a fixed node the enumeration its component had where its body was hashed.
 fn graph_with(
-  shapes: Shapes,
-  first: List<First>,
+  shapes: HashInput,
+  first: List<FirstPass>,
   carried: Map<Int, List<Int>>,
 ) -> Graph / {abort.raise} = {
   let n = shapes.nodes.len();
-  let edges = first.map(|f: First| f.references);
-  let sketches = first.map(|f: First| f.sketch);
+  let edges = first.map(|f: FirstPass| f.references);
+  let sketches = first.map(|f: FirstPass| f.sketch);
   // A cycle's members last met first: the order the keys below are taken in.
   let components = graph::components({ out: edges }).map(|c: List<Int>| c.reverse());
   let component_of = range(0, components.len()).fold(
@@ -842,17 +856,17 @@ fn graph_with(
 
 /// A component of nodes held or never hashed keeps what `held` holds; any other is keyed.
 fn key_components(
-  over: Over,
+  over: HashContext,
   pinned: Map<Int, Bytes>,
-  held: Map<Int, Fixed>,
-) -> Keyed / {abort.raise} =
+  held: Map<Int, CachedNode>,
+) -> ComponentKeys / {abort.raise} =
   range(0, over.graph.components.len()).fold(
     { hashes: Map::new(), bodies: Map::new(), fresh: Map::new() },
-    |acc: Keyed, ci: Int| {
+    |acc: ComponentKeys, ci: Int| {
       let component = over.graph.components.get(ci);
       if component.fold(true, |all: Bool, v: Int|
-          all && (held.contains(v) || formless(over.shapes.nodes.get(v)))) {
-        component.fold(acc, |a: Keyed, v: Int|
+          all && (held.contains(v) || has_no_form(over.shapes.nodes.get(v)))) {
+        component.fold(acc, |a: ComponentKeys, v: Int|
           match held.get(v) {
             None -> a,
             Some(f) ->
@@ -867,16 +881,16 @@ fn key_components(
   )
 
 fn key_component(
-  over: Over,
+  over: HashContext,
   pinned: Map<Int, Bytes>,
-  acc: Keyed,
+  acc: ComponentKeys,
   ci: Int,
   component: List<Int>,
-) -> Keyed / {abort.raise} = {
+) -> ComponentKeys / {abort.raise} = {
   let effects = slots(over.graph.scc.orders.get(ci));
-  let own: Keyed = if is_cyclic(component, over.graph.edges) {
-    let refined: Refined = hash_component(over, component, acc.hashes, effects);
-    refined.members.fold(acc, |a: Keyed, m: { node: Int, hash: Bytes }| {
+  let own: ComponentKeys = if is_cyclic(component, over.graph.edges) {
+    let refined: Refinement = hash_component(over, component, acc.hashes, effects);
+    refined.members.fold(acc, |a: ComponentKeys, m: { node: Int, hash: Bytes }| {
       let class = match refined.classes.get(m.node) { Some(c) -> c, None -> 0 };
       {
         ..a,
@@ -890,7 +904,7 @@ fn key_component(
     {
       ..acc,
       fresh: acc.fresh.insert(v, blake3(encoding.bytes)),
-      bodies: acc.bodies.insert(v, solo_body(encoding)),
+      bodies: acc.bodies.insert(v, single_body(encoding)),
     }
   };
   {
@@ -907,7 +921,7 @@ pub type NodeRef = { name: Bytes, decl: Bool }
 
 /// What hashing derives from a node's body, which a module checked against its imports' entries
 /// does not hold; `own`, specs and `contract` are a function's, `contract` empty for a declaration.
-pub type Fixed = {
+pub type CachedNode = {
   name: Bytes,
   decl: Bool,
   hash: Bytes,
@@ -929,7 +943,7 @@ pub type Fixed = {
 
 /// What hashing derives from a test: its hash, stored body and own form, what it references and,
 /// over cases, what its roots run.
-pub type FixedTest = {
+pub type CachedTest = {
   key: Bytes,
   hash: Bytes,
   body: Bytes,
@@ -941,23 +955,23 @@ pub type FixedTest = {
 }
 
 /// What hashing derives from a law: its hash, its sentence's and what it references.
-pub type FixedLaw = { key: Bytes, hash: Bytes, text: Bytes, refs: List<NodeRef> }
+pub type CachedLaw = { key: Bytes, hash: Bytes, text: Bytes, refs: List<NodeRef> }
 
 /// The nodes, tests and laws a hashing reads as an earlier run fixed them rather than from their
 /// bodies.
-pub type Fixing = { nodes: List<Fixed>, tests: List<FixedTest>, laws: List<FixedLaw> }
+pub type CachedHashes = { nodes: List<CachedNode>, tests: List<CachedTest>, laws: List<CachedLaw> }
 
-pub fn no_fixing() -> Fixing = { nodes: [], tests: [], laws: [] }
+pub fn no_cached_hashes() -> CachedHashes = { nodes: [], tests: [], laws: [] }
 
 derive bin for NodeRef
 
-derive bin for Fixed
+derive bin for CachedNode
 
-derive bin for FixedTest
+derive bin for CachedTest
 
-derive bin for FixedLaw
+derive bin for CachedLaw
 
-derive bin for Fixing
+derive bin for CachedHashes
 
 /// What hashing fixed of one module as a graph by name, which a later run walks to find what a test
 /// reached when it passed: each definition and declaration with its hash and what it references,
@@ -975,23 +989,23 @@ derive bin for RecordedTest
 derive bin for ModuleRecord
 
 /// The record of `fixing`, one module's, as `module_record_bin` encodes it.
-pub fn module_record(fixing: Fixing) -> Bytes / {abort.raise} =
+pub fn module_record(fixing: CachedHashes) -> Bytes / {abort.raise} =
   bin::encode(
     {
-      nodes: fixing.nodes.map(|f: Fixed|
+      nodes: fixing.nodes.map(|f: CachedNode|
         { name: f.name, decl: f.decl, hash: f.hash, edges: f.edges }),
-      tests: fixing.tests.map(|t: FixedTest|
+      tests: fixing.tests.map(|t: CachedTest|
         { key: t.key, hash: t.hash, refs: t.refs, runs: t.runs }),
     },
     module_record_bin(),
   )
 
 /// What hashing fixed of one module, and the digest of its record.
-pub type ModuleHashed = { record: Bytes, fixing: Fixing }
+pub type ModuleHashes = { record: Bytes, fixing: CachedHashes }
 
 /// What hashing fixed of each of `modules`, one program's, as one.
-pub fn joined_fixing(modules: List<ModuleHashed>) -> Fixing =
-  modules.fold(no_fixing(), |acc: Fixing, m: ModuleHashed|
+pub fn joined_cached_hashes(modules: List<ModuleHashes>) -> CachedHashes =
+  modules.fold(no_cached_hashes(), |acc: CachedHashes, m: ModuleHashes|
     {
       nodes: acc.nodes.concat(m.fixing.nodes),
       tests: acc.tests.concat(m.fixing.tests),
@@ -1016,7 +1030,7 @@ pub type RecordedGraph = {
 pub fn recorded_graph(records: List<ModuleRecord>) -> RecordedGraph / {abort.raise} = {
   let nodes = records.flat_map(|r: ModuleRecord| r.nodes);
   let at = range(0, nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int|
-    acc.insert(pin_key(nodes.get(v).name, nodes.get(v).decl), v));
+    acc.insert(definition_key(nodes.get(v).name, nodes.get(v).decl), v));
   {
     nodes: nodes,
     edges: nodes.map(|n: RecordedNode| places_of(at, n.edges)),
@@ -1028,10 +1042,10 @@ pub fn recorded_graph(records: List<ModuleRecord>) -> RecordedGraph / {abort.rai
 
 fn places_of(at: Map<Bytes, Int>, refs: List<NodeRef>) -> List<Int> =
   refs.fold([], |acc: List<Int>, r: NodeRef|
-    match at.get(pin_key(r.name, r.decl)) { Some(v) -> acc.push(v), None -> acc })
+    match at.get(definition_key(r.name, r.decl)) { Some(v) -> acc.push(v), None -> acc })
 
 /// What a test reached, each function and each declaration by name with its hash.
-pub type Reached = { fns: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes> }
+pub type ReachableHashes = { fns: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes> }
 
 /// Where a walk from the test `key` of `g` starts: at what it references, or at what its cases run
 /// where `case` says. `None` where `g` holds no such test.
@@ -1043,14 +1057,18 @@ fn starts_of(g: RecordedGraph, key: Bytes, case: Bool) -> Option<List<Int>> =
 
 /// What the test `key` of `g` reached: from where `starts_of` says, through what each reached
 /// definition references. `None` where `g` holds no such test.
-pub fn recorded_reach(g: RecordedGraph, key: Bytes, case: Bool) -> Option<Reached> / {abort.raise} =
+pub fn recorded_reach(
+  g: RecordedGraph,
+  key: Bytes,
+  case: Bool,
+) -> Option<ReachableHashes> / {abort.raise} =
   match starts_of(g, key, case) {
     None -> None,
     Some(starts) ->
       Some(
         walk(g.edges, starts).fold(
           { fns: Map::new(), decls: Map::new() },
-          |acc: Reached, v: Int| {
+          |acc: ReachableHashes, v: Int| {
             let n = g.nodes.get(v);
             if n.decl { { ..acc, decls: acc.decls.insert(n.name, n.hash) } }
             else { { ..acc, fns: acc.fns.insert(n.name, n.hash) } }
@@ -1070,37 +1088,37 @@ pub fn recorded_hashes(
   walk(g.edges, starts).map(|v: Int| g.nodes.get(v).hash)
 }
 
-fn shape_keys(shapes: Shapes) -> Map<Bytes, Int> / {abort.raise} =
+fn hash_node_keys(shapes: HashInput) -> Map<Bytes, Int> / {abort.raise} =
   range(0, shapes.nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int| {
     let s = shapes.nodes.get(v);
-    acc.insert(pin_key(s.name, s.decl), v)
+    acc.insert(definition_key(s.name, s.decl), v)
   })
 
 /// What hashing `shapes` fixes, `first` what each node references with nothing known: each node
 /// `held` holds, and each test and law without a form, read as `fixing` says its earlier run fixed
 /// it.
-pub fn hashed_over(
-  shapes: Shapes,
-  first: List<First>,
-  held: Map<Int, Fixed>,
-  fixing: Fixing,
-) -> { graph: Graph, hashed: Hashed } / {abort.raise} = {
-  let keys = shape_keys(shapes);
-  let held_tests = fixing.tests.fold(Map::new(), |acc: Map<Bytes, FixedTest>, t: FixedTest|
+pub fn hash_all(
+  shapes: HashInput,
+  first: List<FirstPass>,
+  held: Map<Int, CachedNode>,
+  fixing: CachedHashes,
+) -> { graph: Graph, hashed: HashTables } / {abort.raise} = {
+  let keys = hash_node_keys(shapes);
+  let held_tests = fixing.tests.fold(Map::new(), |acc: Map<Bytes, CachedTest>, t: CachedTest|
     acc.insert(t.key, t));
-  let held_laws = fixing.laws.fold(Map::new(), |acc: Map<Bytes, FixedLaw>, l: FixedLaw|
+  let held_laws = fixing.laws.fold(Map::new(), |acc: Map<Bytes, CachedLaw>, l: CachedLaw|
     acc.insert(l.key, l));
   let present = |refs: List<NodeRef>|
     refs.fold([], |es: List<Int>, r: NodeRef|
-      match keys.get(pin_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es });
+      match keys.get(definition_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es });
   let g = graph_with(
     shapes,
     first,
-    held.fold(Map::new(), |acc: Map<Int, List<Int>>, v: Int, f: Fixed|
+    held.fold(Map::new(), |acc: Map<Int, List<Int>>, v: Int, f: CachedNode|
       acc.insert(v, present(f.effects))),
   );
-  let over = { shapes: shapes, names: shapes.nodes.map(|s: Shape| s.name), graph: g };
-  let pinned = held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
+  let over = { shapes: shapes, names: shapes.nodes.map(|s: HashNode| s.name), graph: g };
+  let pinned = held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: CachedNode|
     acc.insert(v, f.hash));
   let keyed = key_components(over, pinned, held);
   let hashes = keyed.hashes;
@@ -1117,7 +1135,7 @@ pub fn hashed_over(
     });
   let tests = shapes.tests.fold(
     { hashes: [], bodies: [], texts: [], refs: [], runs: [], listings: [] },
-    |acc: TestHashes, t: ItemShape|
+    |acc: TestHashes, t: HashItem|
       match t.form {
         None -> match held_tests.get(t.key) {
           Some(x) ->
@@ -1134,11 +1152,11 @@ pub fn hashed_over(
         Some(form) -> {
           let referenced = references(form.form);
           let effects = slots_under(over, referenced);
-          let f: Finished = filled_under(over, form.form, hashes, effects, false);
-          let text: Finished = filled_under(over, form.form, hashes, effects, true);
+          let f: FilledForm = filled_under(over, form.form, hashes, effects, false);
+          let text: FilledForm = filled_under(over, form.form, hashes, effects, true);
           {
             hashes: acc.hashes.push(blake3(f.bytes)),
-            bodies: acc.bodies.push(solo_body(f)),
+            bodies: acc.bodies.push(single_body(f)),
             texts: acc.texts.push(own_hash(text.bytes)),
             refs: acc.refs.push(
               form.listed.fold(referenced, |rs: List<Int>, r: Int| rs.push_unique(r)),
@@ -1151,7 +1169,7 @@ pub fn hashed_over(
   );
   let laws = shapes.laws.fold(
     { hashes: [], refs: [], texts: [] },
-    |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: ItemShape|
+    |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: HashItem|
       match l.form {
         None -> match held_laws.get(l.key) {
           Some(x) ->
@@ -1165,8 +1183,8 @@ pub fn hashed_over(
         Some(form) -> {
           let referenced = references(form.form);
           let effects = slots_under(over, referenced);
-          let f: Finished = filled_under(over, form.form, hashes, effects, false);
-          let text: Finished = filled_under(over, form.form, hashes, effects, true);
+          let f: FilledForm = filled_under(over, form.form, hashes, effects, false);
+          let text: FilledForm = filled_under(over, form.form, hashes, effects, true);
           {
             hashes: acc.hashes.push(blake3(f.bytes)),
             refs: acc.refs.push(referenced),
@@ -1177,11 +1195,11 @@ pub fn hashed_over(
   );
   let stated = shapes.order.fold(
     { own: [], specs: [], spec_texts: [], spec_checks: [] },
-    |acc: Stated, v: Int|
+    |acc: SpecHashes, v: Int|
       match held.get(v) {
-        Some(f) -> fixed_stated(acc, shapes.nodes.get(v).name, f),
+        Some(f) -> cached_spec_hashes(acc, shapes.nodes.get(v).name, f),
         None ->
-          unfixed_stated(
+          computed_spec_hashes(
             over,
             hashes,
             viewed_refs(over, held, hashes, check_keys, v).view,
@@ -1233,8 +1251,8 @@ fn contract_domain() -> Bytes = b"ply.contract.1"
 /// What another package reads of a definition: its signature and specifications, and its body only
 /// when it is `transparent`; of a node `held` holds and has no form of, what its run fixed.
 pub fn contract_of(
-  over: Over,
-  held: Map<Int, Fixed>,
+  over: HashContext,
+  held: Map<Int, CachedNode>,
   hashes: Map<Int, Bytes>,
   v: Int,
 ) -> Bytes / {abort.raise} = {
@@ -1266,8 +1284,8 @@ type Viewed = { check_keys: CheckKeys, view: Map<Int, Bytes> }
 /// The table a node's check key reads its references from: a definition in another package by its
 /// contract, and any other by its check key.
 fn viewed_refs(
-  over: Over,
-  held: Map<Int, Fixed>,
+  over: HashContext,
+  held: Map<Int, CachedNode>,
   hashes: Map<Int, Bytes>,
   check_keys: CheckKeys,
   v: Int,
@@ -1302,8 +1320,8 @@ fn viewed_refs(
 /// Dependency-first, as the hashes are: a component whose references all read as their hashes keeps
 /// them, and any other is keyed again under its view.
 fn check_key_components(
-  over: Over,
-  held: Map<Int, Fixed>,
+  over: HashContext,
+  held: Map<Int, CachedNode>,
   hashes: Map<Int, Bytes>,
 ) -> CheckKeys / {abort.raise} =
   range(0, over.graph.components.len()).fold(
@@ -1314,7 +1332,7 @@ fn check_key_components(
         component.fold(keys, |k: CheckKeys, v: Int|
           match hashes.get(v) { Some(h) -> { ..k, checks: k.checks.insert(v, h) }, None -> k });
       if component.fold(true, |all: Bool, v: Int|
-          all && (held.contains(v) || formless(over.shapes.nodes.get(v)))) {
+          all && (held.contains(v) || has_no_form(over.shapes.nodes.get(v)))) {
         component.fold(acc, |k: CheckKeys, v: Int|
           match held.get(v) { Some(f) -> { ..k, checks: k.checks.insert(v, f.check) }, None -> k })
       } else {
@@ -1331,7 +1349,7 @@ fn check_key_components(
         } else {
           let effects = slots(over.graph.scc.orders.get(ci));
           if is_cyclic(component, over.graph.edges) {
-            let refined: Refined = hash_component(over, component, gathered.view, effects);
+            let refined: Refinement = hash_component(over, component, gathered.view, effects);
             refined.members.fold(
               gathered.check_keys,
               |keys: CheckKeys, m: { node: Int, hash: Bytes }|
@@ -1356,8 +1374,8 @@ fn check_key_components(
     },
   )
 
-fn fixed_stated(acc: Stated, name: Bytes, fixed: Fixed) -> Stated = {
-  let owned: Stated = match fixed.own {
+fn cached_spec_hashes(acc: SpecHashes, name: Bytes, fixed: CachedNode) -> SpecHashes = {
+  let owned: SpecHashes = match fixed.own {
     Some(o) -> { ..acc, own: acc.own.push({ name: name, hash: o }) },
     None -> acc,
   };
@@ -1372,27 +1390,27 @@ fn fixed_stated(acc: Stated, name: Bytes, fixed: Fixed) -> Stated = {
 }
 
 /// `refs` are the node's references with nothing known, as the first pass found them.
-fn unfixed_stated(
-  over: Over,
+fn computed_spec_hashes(
+  over: HashContext,
   hashes: Map<Int, Bytes>,
   view: Map<Int, Bytes>,
   checks: Map<Int, Bytes>,
-  acc: Stated,
+  acc: SpecHashes,
   v: Int,
   refs: List<Int>,
-) -> Stated / {abort.raise} = {
+) -> SpecHashes / {abort.raise} = {
   let shape = over.shapes.nodes.get(v);
   match shape.form {
     None -> acc,
     Some(form) -> if shape.decl { acc } else {
-      let own: Finished = filled_under(
+      let own: FilledForm = filled_under(
         over,
         form.form,
         hashes,
         slots(effect_order(over.shapes, refs, over.graph.scc, None, [])),
         true,
       );
-      let owned: Stated = {
+      let owned: SpecHashes = {
         ..acc,
         own: acc.own.push({ name: shape.name, hash: own_hash(own.bytes) }),
       };
@@ -1427,29 +1445,32 @@ fn unfixed_stated(
 // --- A module's forms ------------------------------------------------------------------------
 
 /// Each node `form` names, after those of `seen`, in the order first named.
-fn form_nodes(form: Template, seen: Taken) -> Taken / {abort.raise} =
-  references(form).fold(seen, taken)
+fn form_nodes(form: Template, seen: NodeOrder) -> NodeOrder / {abort.raise} =
+  references(form).fold(seen, add_node)
 
-fn optional_form_nodes(form: Option<Template>, seen: Taken) -> Taken / {abort.raise} =
+fn optional_form_nodes(form: Option<Template>, seen: NodeOrder) -> NodeOrder / {abort.raise} =
   match form { Some(f) -> form_nodes(f, seen), None -> seen }
 
-type Taken = { order: List<Int>, at: Map<Int, Int> }
+type NodeOrder = { order: List<Int>, at: Map<Int, Int> }
 
-fn taken(t: Taken, v: Int) -> Taken =
+fn add_node(t: NodeOrder, v: Int) -> NodeOrder =
   if t.at.contains(v) { t } else { { order: t.order.push(v), at: t.at.insert(v, t.order.len()) } }
 
-fn moved(form: Template, ids: Map<Int, Int>) -> Template / {abort.raise} =
+fn renumber(form: Template, ids: Map<Int, Int>) -> Template / {abort.raise} =
   renumbered(form, |v: Int|
     match ids.get(v) { Some(k) -> k, None -> panic("a form names a node not taken") })
 
-fn optional_moved(form: Option<Template>, ids: Map<Int, Int>) -> Option<Template> / {abort.raise} =
-  match form { Some(f) -> Some(moved(f, ids)), None -> None }
+fn optional_renumber(
+  form: Option<Template>,
+  ids: Map<Int, Int>,
+) -> Option<Template> / {abort.raise} =
+  match form { Some(f) -> Some(renumber(f, ids)), None -> None }
 
 /// What hashing reads of the module at `module` of `index`, its modules in `packages`: each node
 /// of it, test and law with its forms, and each node of another module those reference, by what it
 /// is and the package it is in. Its own nodes come first, in the order the module lists them.
-pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> Shapes / {abort.raise} =
-  kept_forms(index, packages, module, {
+pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> HashInput / {abort.raise} =
+  filtered_forms(index, packages, module, {
     node: |_: Bytes| true,
     test: |_: Bytes| true,
     law: |_: Bytes| true,
@@ -1457,7 +1478,7 @@ pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> Shapes / 
 
 /// Which of a module's definitions, tests and laws a hashing of part of it keeps, each by its
 /// program-wide name: apart, since a test may be labelled as a definition is named.
-pub type Keeping = {
+pub type ItemFilter = {
   node: (Bytes) -> Bool / {abort.raise},
   test: (Bytes) -> Bool / {abort.raise},
   law: (Bytes) -> Bool / {abort.raise},
@@ -1465,14 +1486,14 @@ pub type Keeping = {
 
 /// [`module_forms`] of what `keeps` keeps of the module, each other node it references read as
 /// another module's is.
-pub fn kept_forms(
+pub fn filtered_forms(
   index: Index,
   packages: List<Int>,
   module: Int,
-  keeps: Keeping,
-) -> Shapes / {abort.raise} = {
-  let c = chosen_in(index, module);
-  chosen_forms(index, packages, {
+  keeps: ItemFilter,
+) -> HashInput / {abort.raise} = {
+  let c = module_selection(index, module);
+  selection_forms(index, packages, {
     own: c.own.filter(|v: Int| (keeps.node)(index.nodes.get(v).name)),
     tests: c.tests.filter(|t: TestNode| (keeps.test)(t.key)),
     laws: c.laws.filter(|l: LawNode| (keeps.law)(l.key)),
@@ -1483,7 +1504,7 @@ pub fn kept_forms(
 /// Nodes, tests and laws of one module of an index: its nodes in the order the index lists them.
 /// `called` is what its check found of each call on a value, by `CallSite`: nothing a hash reads,
 /// and `None` where no check is read, which leaves each call pending.
-pub type Chosen = {
+pub type ModuleSelection = {
   own: List<Int>,
   tests: List<TestNode>,
   laws: List<LawNode>,
@@ -1491,7 +1512,7 @@ pub type Chosen = {
 }
 
 /// Every node, test and law of the module at `module` of `index`, found in one walk of it.
-pub fn chosen_in(index: Index, module: Int) -> Chosen / {abort.raise} =
+pub fn module_selection(index: Index, module: Int) -> ModuleSelection / {abort.raise} =
   {
     own: index.order.fold([], |acc: List<Int>, e: IndexEntry|
       match e {
@@ -1504,23 +1525,30 @@ pub fn chosen_in(index: Index, module: Int) -> Chosen / {abort.raise} =
   }
 
 /// The forms hashing reads of `chosen`, nodes, tests and laws of one module, numbered among
-/// themselves as `kept_forms` numbers them.
-pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes / {abort.raise} = {
+/// themselves as `filtered_forms` numbers them.
+pub fn selection_forms(
+  index: Index,
+  packages: List<Int>,
+  chosen: ModuleSelection,
+) -> HashInput / {abort.raise} = {
   let own = chosen.own;
   let forms = own.map(|v: Int| node_form(index, v, chosen.called));
   let tests = chosen.tests;
   let laws = chosen.laws;
   let test_forms = tests.map(|t: TestNode| test_form(index, t, chosen.called));
   let law_forms = laws.map(|l: LawNode| law_form(index, l));
-  let item_nodes = |acc: Taken, x: ItemForm|
-    x.listed.concat(x.listing).fold(form_nodes(x.form, acc), |a: Taken, v: Int| taken(a, v));
+  let item_nodes = |acc: NodeOrder, x: ItemForm|
+    x.listed.concat(x.listing).fold(form_nodes(x.form, acc), |a: NodeOrder, v: Int| add_node(a, v));
   let table = law_forms.fold(
     test_forms.fold(
-      forms.fold(own.fold({ order: [], at: Map::new() }, taken), |acc: Taken, f: NodeForm|
-        f.clauses.fold(
-          optional_form_nodes(f.signature, form_nodes(f.form, acc)),
-          |a: Taken, c: ClauseForm| form_nodes(c.form, a),
-        )),
+      forms.fold(
+        own.fold({ order: [], at: Map::new() }, add_node),
+        |acc: NodeOrder, f: NodeForm|
+          f.clauses.fold(
+            optional_form_nodes(f.signature, form_nodes(f.form, acc)),
+            |a: NodeOrder, c: ClauseForm| form_nodes(c.form, a),
+          ),
+      ),
       item_nodes,
     ),
     item_nodes,
@@ -1528,7 +1556,7 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
   let ids = table.at;
   let item = |x: ItemForm|
     {
-      form: moved(x.form, ids),
+      form: renumber(x.form, ids),
       listed: x.listed.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
       listing: x.listing.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
     };
@@ -1544,9 +1572,9 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
         form: if k < own.len() {
           let f = forms.get(k);
           Some({
-            form: moved(f.form, ids),
-            signature: optional_moved(f.signature, ids),
-            clauses: f.clauses.map(|c: ClauseForm| { ..c, form: moved(c.form, ids) }),
+            form: renumber(f.form, ids),
+            signature: optional_renumber(f.signature, ids),
+            clauses: f.clauses.map(|c: ClauseForm| { ..c, form: renumber(c.form, ids) }),
             transparent: f.transparent,
           })
         } else { None },
@@ -1562,20 +1590,20 @@ pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes
 
 /// Where a node of forms put together comes from: the part that gives its form and its place
 /// there, or `part` -1 for one no part gives a form.
-type Joint = { part: Int, at: Int, shape: Shape }
+type JoinedNode = { part: Int, at: Int, shape: HashNode }
 
 /// The forms of `parts`, each what hashing reads of some of one module's definitions, tests and
 /// laws, as one reading of them all: each node a part gives a form, in the parts' order, then each
 /// no part gives one, in the order first met.
-pub fn joined_forms(parts: List<Shapes>) -> Shapes / {abort.raise} = {
-  let met = |formed: Bool|
-    |acc: { at: Map<Bytes, Int>, nodes: List<Joint> }, k: Int|
+pub fn joined_forms(parts: List<HashInput>) -> HashInput / {abort.raise} = {
+  let visit = |formed: Bool|
+    |acc: { at: Map<Bytes, Int>, nodes: List<JoinedNode> }, k: Int|
       range(0, parts.get(k).nodes.len()).fold(
         acc,
-        |a: { at: Map<Bytes, Int>, nodes: List<Joint> }, v: Int| {
+        |a: { at: Map<Bytes, Int>, nodes: List<JoinedNode> }, v: Int| {
           let shape = parts.get(k).nodes.get(v);
-          let key = pin_key(shape.name, shape.decl);
-          if formless(shape) == formed || a.at.contains(key) { a } else {
+          let key = definition_key(shape.name, shape.decl);
+          if has_no_form(shape) == formed || a.at.contains(key) { a } else {
             {
               at: a.at.insert(key, a.nodes.len()),
               nodes: a.nodes.push({ part: if formed { k } else { 0 - 1 }, at: v, shape: shape }),
@@ -1583,69 +1611,70 @@ pub fn joined_forms(parts: List<Shapes>) -> Shapes / {abort.raise} = {
           }
         },
       );
-  let formed = range(0, parts.len()).fold({ at: Map::new(), nodes: [] }, met(true));
-  let all = range(0, parts.len()).fold(formed, met(false));
-  let ids = parts.map(|part: Shapes|
+  let formed = range(0, parts.len()).fold({ at: Map::new(), nodes: [] }, visit(true));
+  let all = range(0, parts.len()).fold(formed, visit(false));
+  let ids = parts.map(|part: HashInput|
     range(0, part.nodes.len()).fold(Map::new(), |acc: Map<Int, Int>, v: Int| {
       let shape = part.nodes.get(v);
-      match all.at.get(pin_key(shape.name, shape.decl)) {
+      match all.at.get(definition_key(shape.name, shape.decl)) {
         Some(k) -> acc.insert(v, k),
         None -> panic("a node of a part is a node of the whole"),
       }
     }));
   let item = |k: Int|
-    |x: ItemShape|
+    |x: HashItem|
       {
         ..x,
         form: match x.form {
           None -> None,
           Some(f) ->
             Some({
-              form: moved(f.form, ids.get(k)),
+              form: renumber(f.form, ids.get(k)),
               listed: f.listed.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
               listing: f.listing.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
             }),
         },
       };
   {
-    nodes: all.nodes.map(|j: Joint|
+    nodes: all.nodes.map(|j: JoinedNode|
       match j.shape.form {
         None -> j.shape,
         Some(f) ->
           {
             ..j.shape,
             form: Some({
-              form: moved(f.form, ids.get(j.part)),
-              signature: optional_moved(f.signature, ids.get(j.part)),
-              clauses: f.clauses.map(|c: ClauseForm| { ..c, form: moved(c.form, ids.get(j.part)) }),
+              form: renumber(f.form, ids.get(j.part)),
+              signature: optional_renumber(f.signature, ids.get(j.part)),
+              clauses: f.clauses.map(|c: ClauseForm|
+                { ..c, form: renumber(c.form, ids.get(j.part)) }),
               transparent: f.transparent,
             }),
           },
       }),
     order: range(0, formed.nodes.len()),
-    tests: range(0, parts.len()).fold([], |acc: List<ItemShape>, k: Int|
+    tests: range(0, parts.len()).fold([], |acc: List<HashItem>, k: Int|
       acc.concat(parts.get(k).tests.map(item(k)))),
-    laws: range(0, parts.len()).fold([], |acc: List<ItemShape>, k: Int|
+    laws: range(0, parts.len()).fold([], |acc: List<HashItem>, k: Int|
       acc.concat(parts.get(k).laws.map(item(k)))),
   }
 }
 
 /// What hashing a module's `forms` fixes of its nodes, tests and laws, each node of another module
 /// they reference read as `fixed` holds it, which holds each of those.
-pub fn hashed_forms(forms: Shapes, fixed: List<Fixed>) -> Fixing / {abort.raise} = {
-  let named = shape_keys(forms);
-  let held = fixed.fold(Map::new(), |acc: Map<Int, Fixed>, f: Fixed|
-    match named.get(pin_key(f.name, f.decl)) {
-      Some(v) -> if formless(forms.nodes.get(v)) { acc.insert(v, f) } else { acc },
+pub fn hash_forms(forms: HashInput, fixed: List<CachedNode>) -> CachedHashes / {abort.raise} = {
+  let named = hash_node_keys(forms);
+  let held = fixed.fold(Map::new(), |acc: Map<Int, CachedNode>, f: CachedNode|
+    match named.get(definition_key(f.name, f.decl)) {
+      Some(v) -> if has_no_form(forms.nodes.get(v)) { acc.insert(v, f) } else { acc },
       None -> acc,
     });
   // An effect a fixed node's enumeration names is a node of the program though no form names it:
   // it is numbered, and never hashed.
   let extra = held.fold(
     { keys: named, nodes: [] },
-    |acc: { keys: Map<Bytes, Int>, nodes: List<Shape> }, _: Int, f: Fixed|
-      f.effects.fold(acc, |a: { keys: Map<Bytes, Int>, nodes: List<Shape> }, r: NodeRef| {
-        let key = pin_key(r.name, r.decl);
+    |acc: { keys: Map<Bytes, Int>, nodes: List<HashNode> }, _: Int, f: CachedNode|
+      f.effects.fold(acc, |a: { keys: Map<Bytes, Int>, nodes: List<HashNode> }, r: NodeRef| {
+        let key = definition_key(r.name, r.decl);
         if a.keys.contains(key) { a } else {
           {
             keys: a.keys.insert(key, forms.nodes.len() + a.nodes.len()),
@@ -1663,22 +1692,22 @@ pub fn hashed_forms(forms: Shapes, fixed: List<Fixed>) -> Fixing / {abort.raise}
   let shapes = { ..forms, nodes: forms.nodes.concat(extra.nodes) };
   let keys = extra.keys;
   let unfixed = range(0, forms.nodes.len()).filter(|v: Int|
-    formless(forms.nodes.get(v)) && !held.contains(v));
+    has_no_form(forms.nodes.get(v)) && !held.contains(v));
   if unfixed.len() > 0 {
     panic("no fixed hash of " ++ String::of_bytes_lossy(forms.nodes.get(unfixed.get(0)).name))
   };
   let present = |refs: List<NodeRef>|
     refs.fold([], |es: List<Int>, r: NodeRef|
-      match keys.get(pin_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es });
-  let out = hashed_over(
+      match keys.get(definition_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es });
+  let out = hash_all(
     shapes,
-    first_of(
+    first_pass_of(
       shapes,
-      held.fold(Map::new(), |acc: Map<Int, List<Int>>, v: Int, f: Fixed|
+      held.fold(Map::new(), |acc: Map<Int, List<Int>>, v: Int, f: CachedNode|
         acc.insert(v, present(f.edges))),
     ),
     held,
-    no_fixing(),
+    no_cached_hashes(),
   );
   let h = out.hashed;
   let refs = |rs: List<Int>|
@@ -1735,11 +1764,11 @@ pub fn hashed_forms(forms: Shapes, fixed: List<Fixed>) -> Fixing / {abort.raise}
 }
 
 /// The nodes of the modules `keep` names, paired by `index.order` as `assemble` pushed them.
-pub fn fixed_nodes(
+pub fn cached_nodes(
   index: Index,
   hashes: HashOutput,
   keep: Map<Bytes, Bool>,
-) -> List<Fixed> / {abort.raise} = {
+) -> List<CachedNode> / {abort.raise} = {
   let node_refs = |refs: List<Int>|
     refs.map(|r: Int| { name: index.nodes.get(r).name, decl: is_decl(index.nodes.get(r)) });
   let edges_of = |v: Int, node: Node|
@@ -1775,7 +1804,7 @@ pub fn fixed_nodes(
     match m.get(name) { Some(xs) -> xs, None -> [] };
   let walked = index.order.fold(
     { body: 0, def: 0, decl: 0, out: [] },
-    |acc: { body: Int, def: Int, decl: Int, out: List<Fixed> }, e: IndexEntry|
+    |acc: { body: Int, def: Int, decl: Int, out: List<CachedNode> }, e: IndexEntry|
       match e {
         DefEntry(v) -> {
           let node = index.nodes.get(v);
@@ -1821,17 +1850,17 @@ pub fn fixed_nodes(
 }
 
 /// The nodes, tests and laws of the modules `keep` names as `hashes` fixed them.
-pub fn fixing_of(
+pub fn cached_hashes_of(
   index: Index,
   hashes: HashOutput,
   keep: Map<Bytes, Bool>,
-) -> Fixing / {abort.raise} = {
+) -> CachedHashes / {abort.raise} = {
   let refs = |rs: List<Int>|
     rs.map(|r: Int| { name: index.nodes.get(r).name, decl: is_decl(index.nodes.get(r)) });
   let kept = |module: Int| keep.contains(index.mods.get(module).name);
   {
-    nodes: fixed_nodes(index, hashes, keep),
-    tests: range(0, index.tests.len()).fold([], |acc: List<FixedTest>, i: Int| {
+    nodes: cached_nodes(index, hashes, keep),
+    tests: range(0, index.tests.len()).fold([], |acc: List<CachedTest>, i: Int| {
       let t = index.tests.get(i);
       if !kept(t.module) { acc } else {
         acc.push({
@@ -1845,7 +1874,7 @@ pub fn fixing_of(
         })
       }
     }),
-    laws: range(0, index.laws.len()).fold([], |acc: List<FixedLaw>, i: Int| {
+    laws: range(0, index.laws.len()).fold([], |acc: List<CachedLaw>, i: Int| {
       let l = index.laws.get(i);
       if !kept(l.module) { acc } else {
         acc.push({
@@ -1862,23 +1891,23 @@ pub fn fixing_of(
 pub fn is_decl(node: Node) -> Bool = match node.body { NodeFn(_) -> false, _ -> true }
 
 /// What a definition or a declaration named `name` is filed under among both.
-pub fn pin_key(name: Bytes, decl: Bool) -> Bytes =
+pub fn definition_key(name: Bytes, decl: Bool) -> Bytes =
   Bytes::concat(if decl { b"decl " } else { b"def " }, name)
 
-fn started(m: Map<Bytes, List<Int>>, key: Bytes, vs: List<Int>) -> Map<Bytes, List<Int>> =
+fn append_at(m: Map<Bytes, List<Int>>, key: Bytes, vs: List<Int>) -> Map<Bytes, List<Int>> =
   m.insert(key, List::concat(match m.get(key) { Some(xs) -> xs, None -> [] }, vs))
 
 /// What a program's hash tables are laid out over: each node by its name and whether it is a
 /// declaration, its definitions, tests and laws in the order it lists them, each test by its key and
 /// whether it is over cases, and each law by its key.
-pub type Skeleton = {
+pub type HashLayout = {
   nodes: List<NodeRef>,
   order: List<IndexEntry>,
   tests: List<{ key: Bytes, cases: Bool }>,
   laws: List<Bytes>,
 }
 
-pub fn skeleton_of(index: Index) -> Skeleton =
+pub fn hash_layout(index: Index) -> HashLayout =
   {
     nodes: index.nodes.map(|node: Node| { name: node.name, decl: is_decl(node) }),
     order: index.order,
@@ -1891,19 +1920,23 @@ fn by_key<a>(keys: List<Bytes>, xs: List<a>) -> Map<Bytes, a> / {abort.raise} =
   range(0, keys.len()).fold(Map::new(), |acc: Map<Bytes, a>, i: Int|
     acc.insert(keys.get(i), xs.get(i)))
 
-pub fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput / {abort.raise} = {
+pub fn assemble(
+  sk: HashLayout,
+  edges: List<List<Int>>,
+  h: HashTables,
+) -> HashOutput / {abort.raise} = {
   let fns = range(0, sk.nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int| {
     let node = sk.nodes.get(v);
     if node.decl { acc } else { acc.insert(node.name, v) }
   });
   let declared = range(0, sk.nodes.len()).fold(Map::new(), |acc: Map<Bytes, List<Int>>, v: Int| {
     let node = sk.nodes.get(v);
-    if node.decl { started(acc, node.name, [v]) } else { acc }
+    if node.decl { append_at(acc, node.name, [v]) } else { acc }
   });
   let tested = range(0, sk.tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Int>>, i: Int|
-    started(acc, sk.tests.get(i).key, h.test_refs.get(i)));
+    append_at(acc, sk.tests.get(i).key, h.test_refs.get(i)));
   let items = range(0, sk.laws.len()).fold(tested, |acc: Map<Bytes, List<Int>>, i: Int|
-    started(acc, sk.laws.get(i), h.law_refs.get(i)));
+    append_at(acc, sk.laws.get(i), h.law_refs.get(i)));
   let names_at = |refs: List<Int>| refs.map(|r: Int| sk.nodes.get(r).name);
   let tests = sk.tests.map(|t: { key: Bytes, cases: Bool }| t.key);
   let empty: HashOutput = {
@@ -1925,12 +1958,12 @@ pub fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput /
       items: items,
       cases: range(0, sk.tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Int>>, i: Int| {
         let t = sk.tests.get(i);
-        if !t.cases { acc } else { started(acc, t.key, h.test_runs.get(i)) }
+        if !t.cases { acc } else { append_at(acc, t.key, h.test_runs.get(i)) }
       }),
       clauses: h.clauses,
       listings: range(0, sk.tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Int>>, i: Int| {
         let t = sk.tests.get(i);
-        if !t.cases { acc } else { started(acc, t.key, h.test_listings.get(i)) }
+        if !t.cases { acc } else { append_at(acc, t.key, h.test_listings.get(i)) }
       }),
     },
     bodies: [],
@@ -1981,19 +2014,19 @@ pub fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput /
 
 /// The hash tables of the program `sk` lays out, each node, test and law as `fixing` says hashing
 /// fixed it: what a load assembled from its modules' answers holds in place of hashing it.
-pub fn hashes_fixed(sk: Skeleton, fixing: Fixing) -> HashOutput / {abort.raise} = {
+pub fn hashes_from_cache(sk: HashLayout, fixing: CachedHashes) -> HashOutput / {abort.raise} = {
   let keys = range(0, sk.nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int| {
     let node = sk.nodes.get(v);
-    acc.insert(pin_key(node.name, node.decl), v)
+    acc.insert(definition_key(node.name, node.decl), v)
   });
   let ids = |refs: List<NodeRef>|
     refs.fold([], |es: List<Int>, r: NodeRef|
-      match keys.get(pin_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es });
-  let held = fixing.nodes.fold(Map::new(), |acc: Map<Int, Fixed>, f: Fixed|
-    match keys.get(pin_key(f.name, f.decl)) { Some(v) -> acc.insert(v, f), None -> acc });
-  let tests = fixing.tests.fold(Map::new(), |acc: Map<Bytes, FixedTest>, t: FixedTest|
+      match keys.get(definition_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es });
+  let held = fixing.nodes.fold(Map::new(), |acc: Map<Int, CachedNode>, f: CachedNode|
+    match keys.get(definition_key(f.name, f.decl)) { Some(v) -> acc.insert(v, f), None -> acc });
+  let tests = fixing.tests.fold(Map::new(), |acc: Map<Bytes, CachedTest>, t: CachedTest|
     acc.insert(t.key, t));
-  let laws = fixing.laws.fold(Map::new(), |acc: Map<Bytes, FixedLaw>, l: FixedLaw|
+  let laws = fixing.laws.fold(Map::new(), |acc: Map<Bytes, CachedLaw>, l: CachedLaw|
     acc.insert(l.key, l));
   let test_of = |key: Bytes|
     match tests.get(key) {
@@ -2005,14 +2038,14 @@ pub fn hashes_fixed(sk: Skeleton, fixing: Fixing) -> HashOutput / {abort.raise} 
       Some(l) -> l,
       None -> panic("no law is fixed under " ++ String::of_bytes_lossy(key)),
     };
-  let field = |pick: (Fixed) -> Bytes|
-    held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed| acc.insert(v, pick(f)));
+  let field = |pick: (CachedNode) -> Bytes|
+    held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: CachedNode| acc.insert(v, pick(f)));
   let stated = sk.order.fold(
     { own: [], specs: [], spec_texts: [], spec_checks: [] },
-    |acc: Stated, e: IndexEntry|
+    |acc: SpecHashes, e: IndexEntry|
       match e {
         DefEntry(v) -> match held.get(v) {
-          Some(f) -> if f.decl { acc } else { fixed_stated(acc, f.name, f) },
+          Some(f) -> if f.decl { acc } else { cached_spec_hashes(acc, f.name, f) },
           None -> acc,
         },
         _ -> acc,
@@ -2025,29 +2058,29 @@ pub fn hashes_fixed(sk: Skeleton, fixing: Fixing) -> HashOutput / {abort.raise} 
     range(0, sk.nodes.len()).map(|v: Int|
       match held.get(v) { Some(f) -> ids(f.edges), None -> [] }),
     {
-      hashes: field(|f: Fixed| f.hash),
-      bodies: field(|f: Fixed| f.body),
-      tests: tested.map(|t: FixedTest| t.hash),
-      test_bodies: tested.map(|t: FixedTest| t.body),
-      test_texts: tested.map(|t: FixedTest| t.text),
-      test_refs: tested.map(|t: FixedTest| ids(t.refs)),
-      test_runs: tested.map(|t: FixedTest| ids(t.runs)),
-      laws: lawful.map(|l: FixedLaw| l.hash),
-      law_refs: lawful.map(|l: FixedLaw| ids(l.refs)),
-      law_texts: lawful.map(|l: FixedLaw| l.text),
+      hashes: field(|f: CachedNode| f.hash),
+      bodies: field(|f: CachedNode| f.body),
+      tests: tested.map(|t: CachedTest| t.hash),
+      test_bodies: tested.map(|t: CachedTest| t.body),
+      test_texts: tested.map(|t: CachedTest| t.text),
+      test_refs: tested.map(|t: CachedTest| ids(t.refs)),
+      test_runs: tested.map(|t: CachedTest| ids(t.runs)),
+      laws: lawful.map(|l: CachedLaw| l.hash),
+      law_refs: lawful.map(|l: CachedLaw| ids(l.refs)),
+      law_texts: lawful.map(|l: CachedLaw| l.text),
       own: stated.own,
       specs: stated.specs,
       spec_texts: stated.spec_texts,
-      contracts: held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
+      contracts: held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: CachedNode|
         if f.decl || f.contract.len() == 0 { acc } else { acc.insert(v, f.contract) }),
-      checks: held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
+      checks: held.fold(Map::new(), |acc: Map<Int, Bytes>, v: Int, f: CachedNode|
         if f.decl || f.check.len() == 0 { acc } else { acc.insert(v, f.check) }),
       spec_checks: stated.spec_checks,
       enumerations: range(0, sk.nodes.len()).map(|v: Int|
         match held.get(v) { Some(f) -> ids(f.effects), None -> [] }),
       clauses: range(0, sk.nodes.len()).map(|v: Int|
         match held.get(v) { Some(f) -> ids(f.clauses), None -> [] }),
-      test_listings: tested.map(|t: FixedTest| ids(t.listing)),
+      test_listings: tested.map(|t: CachedTest| ids(t.listing)),
     },
   )
 }
@@ -2080,9 +2113,9 @@ fn record(a: Recording, name: Bytes, deps: List<Bytes>) -> Recording / {abort.ra
 
 // --- Closures ---------------------------------------------------------------------------------------
 
-type Walk = { seen: List<Bool>, frontier: List<Int>, all: List<Int> }
+type WalkState = { seen: List<Bool>, frontier: List<Int>, all: List<Int> }
 
-fn met(w: Walk, v: Int) -> Walk / {abort.raise} =
+fn visit(w: WalkState, v: Int) -> WalkState / {abort.raise} =
   if w.seen.get(v) { w }
   else { { seen: w.seen.set(v, true), frontier: w.frontier.push(v), all: w.all.push(v) } }
 
@@ -2094,46 +2127,48 @@ pub fn walked(
   from: List<Int>,
 ) -> { seen: List<Bool>, all: List<Int> } / {abort.raise} = {
   let n = edges.len();
-  let start = from.fold({ seen: range(0, n).map(|i: Int| false), frontier: [], all: [] }, met);
-  iterate(start, n + 2, |w: Walk|
+  let start = from.fold({ seen: range(0, n).map(|i: Int| false), frontier: [], all: [] }, visit);
+  iterate(start, n + 2, |w: WalkState|
     if w.frontier.len() == 0 { Stop({ seen: w.seen, all: w.all }) } else {
       Continue(
-        w.frontier.fold({ ..w, frontier: [] }, |acc: Walk, v: Int| edges.get(v).fold(acc, met)),
+        w.frontier.fold({ ..w, frontier: [] }, |acc: WalkState, v: Int|
+          edges.get(v).fold(acc, visit)),
       )
     })
 }
 
 /// What a walk starts from, and what a question is asked of: the function of a name, the type or
 /// effect of one, or the test or law of a key. A name alone says none of these.
-pub type Which = | TheFn(Bytes) | TheDecl(Bytes) | TheItem(Bytes)
+pub type Subject = | FunctionNamed(Bytes) | DeclarationNamed(Bytes) | ItemKeyed(Bytes)
 
 /// What a walk reached: each function, and each type or effect, by name, one apart from the other.
-pub type Reach = { fns: Map<Bytes, Bool>, decls: Map<Bytes, Bool> }
+pub type ReachableNames = { fns: Map<Bytes, Bool>, decls: Map<Bytes, Bool> }
 
 /// Where a walk from `which` starts: at a function or a declaration itself, and at what a test or
 /// a law references.
-fn nodes_of(r: Refs, which: Which) -> List<Int> =
+fn nodes_of(r: Refs, which: Subject) -> List<Int> =
   match which {
-    TheFn(name) -> match r.fns.get(name) { Some(v) -> [v], None -> [] },
-    TheDecl(name) -> match r.declared.get(name) { Some(vs) -> vs, None -> [] },
-    TheItem(key) -> match r.items.get(key) { Some(vs) -> vs, None -> [] },
+    FunctionNamed(name) -> match r.fns.get(name) { Some(v) -> [v], None -> [] },
+    DeclarationNamed(name) -> match r.declared.get(name) { Some(vs) -> vs, None -> [] },
+    ItemKeyed(key) -> match r.items.get(key) { Some(vs) -> vs, None -> [] },
   }
 
-fn starting(r: Refs, roots: List<Which>) -> List<Int> =
-  roots.fold([], |acc: List<Int>, which: Which| acc.concat(nodes_of(r, which)))
+fn start_nodes(r: Refs, roots: List<Subject>) -> List<Int> =
+  roots.fold([], |acc: List<Int>, which: Subject| acc.concat(nodes_of(r, which)))
 
 /// Everything `key` could stand for: the function and the declaration of that name, and the test
 /// or law of that key.
-fn spelt(key: Bytes) -> List<Which> = [TheItem(key), TheFn(key), TheDecl(key)]
+fn meanings(key: Bytes) -> List<Subject> =
+  [ItemKeyed(key), FunctionNamed(key), DeclarationNamed(key)]
 
-fn read_off(r: Refs, nodes: List<Int>) -> Reach / {abort.raise} =
-  nodes.fold({ fns: Map::new(), decls: Map::new() }, |acc: Reach, v: Int|
+fn reachable_names(r: Refs, nodes: List<Int>) -> ReachableNames / {abort.raise} =
+  nodes.fold({ fns: Map::new(), decls: Map::new() }, |acc: ReachableNames, v: Int|
     if r.decls.get(v) { { ..acc, decls: acc.decls.insert(r.names.get(v), true) } }
     else { { ..acc, fns: acc.fns.insert(r.names.get(v), true) } })
 
 /// What `roots` reach through what each references, those that are definitions included.
-pub fn reach(hashes: HashOutput, roots: List<Which>) -> Reach / {abort.raise} =
-  read_off(hashes.refs, walked(hashes.refs.edges, starting(hashes.refs, roots)).all)
+pub fn reach(hashes: HashOutput, roots: List<Subject>) -> ReachableNames / {abort.raise} =
+  reachable_names(hashes.refs, walked(hashes.refs.edges, start_nodes(hashes.refs, roots)).all)
 
 /// Every name some definition or declaration of which `keys` reach, and each of the keys the
 /// program knows, each key read as everything it could spell: a superset, by name, of what any one
@@ -2143,7 +2178,10 @@ pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {
   let r = hashes.refs;
   let known = keys.filter(|k: Bytes|
     r.items.contains(k) || r.fns.contains(k) || r.declared.contains(k));
-  let reached = reach(hashes, known.fold([], |acc: List<Which>, k: Bytes| acc.concat(spelt(k))));
+  let reached = reach(
+    hashes,
+    known.fold([], |acc: List<Subject>, k: Bytes| acc.concat(meanings(k))),
+  );
   known.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes| acc.insert(k, true)).merge(
     reached.fns,
   ).merge(
@@ -2156,10 +2194,10 @@ pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {
 /// another definition, and reaching one reaches nothing the function does.
 pub fn reached_functions(
   hashes: HashOutput,
-  roots: List<Which>,
+  roots: List<Subject>,
 ) -> Map<Bytes, Bool> / {abort.raise} = {
   let r = hashes.refs;
-  unit_reach(r, starting(r, roots))
+  unit_reach(r, start_nodes(r, roots))
 }
 
 /// What a unit offering the nodes `starts` holds of the functions `r` knows: what they reach, a
@@ -2171,7 +2209,7 @@ fn unit_reach(r: Refs, starts: List<Int>) -> Map<Bytes, Bool> / {abort.raise} = 
   let scheduled = scheduler_module().concat(b".");
   let written = range(0, r.names.len()).filter(|v: Int|
     !r.decls.get(v) && r.names.get(v).starts_with(scheduled));
-  read_off(r, walked(with_clauses(r), starts.concat(written)).all).fns
+  reachable_names(r, walked(with_clauses(r), starts.concat(written)).all).fns
 }
 
 /// Each node's references, with what its specification clauses reference.
@@ -2192,10 +2230,10 @@ pub fn listing_reach(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> 
 
 /// What `which` references itself, each a function or a declaration, in the order its text first
 /// names them.
-pub fn named_in(hashes: HashOutput, which: Which) -> List<NodeRef> / {abort.raise} = {
+pub fn references_in(hashes: HashOutput, which: Subject) -> List<NodeRef> / {abort.raise} = {
   let r = hashes.refs;
   let direct = match which {
-    TheItem(_) -> nodes_of(r, which),
+    ItemKeyed(_) -> nodes_of(r, which),
     _ -> nodes_of(r, which).fold([], |acc: List<Int>, v: Int| acc.concat(r.edges.get(v))),
   };
   direct.map(|v: Int| { name: r.names.get(v), decl: r.decls.get(v) })
@@ -2214,11 +2252,15 @@ fn back_edges(r: Refs) -> List<List<Int>> / {abort.raise} = {
 
 /// What names a definition or a declaration: each function and each type or effect by name, and
 /// each test and law by its key.
-pub type Naming = { fns: List<Bytes>, decls: List<Bytes>, items: List<Bytes> }
+pub type Referrers = { fns: List<Bytes>, decls: List<Bytes>, items: List<Bytes> }
 
 /// What names `target` in its own text, or, `through` any number of references, reaches it. A
 /// definition that names itself is among the first; none is among what reaches it.
-pub fn naming(hashes: HashOutput, target: Which, through: Bool) -> Naming / {abort.raise} = {
+pub fn find_referrers(
+  hashes: HashOutput,
+  target: Subject,
+  through: Bool,
+) -> Referrers / {abort.raise} = {
   let r = hashes.refs;
   let targets = nodes_of(r, target);
   let n = r.names.len();
@@ -2228,7 +2270,7 @@ pub fn naming(hashes: HashOutput, target: Which, through: Bool) -> Naming / {abo
   let holds = |vs: List<Int>| vs.fold(false, |b: Bool, v: Int| b || marked.get(v));
   let nodes = range(0, n).filter(|v: Int|
     if through { marked.get(v) && !targets.contains(v) } else { holds(r.edges.get(v)) });
-  let found = read_off(r, nodes);
+  let found = reachable_names(r, nodes);
   {
     fns: found.fns.keys(),
     decls: found.decls.keys(),
@@ -2239,7 +2281,10 @@ pub fn naming(hashes: HashOutput, target: Which, through: Bool) -> Naming / {abo
 
 /// Every name and key the program knows whose closure holds one of `names`, a name read as
 /// everything it could spell, as `closure_of` reads one: a superset, by name, for a key to take.
-pub fn reaching(hashes: HashOutput, names: Map<Bytes, Bool>) -> Map<Bytes, Bool> / {abort.raise} = {
+pub fn keys_reaching(
+  hashes: HashOutput,
+  names: Map<Bytes, Bool>,
+) -> Map<Bytes, Bool> / {abort.raise} = {
   let r = hashes.refs;
   let n = r.names.len();
   let seen = walked(
@@ -2256,18 +2301,19 @@ pub fn reaching(hashes: HashOutput, names: Map<Bytes, Bool>) -> Map<Bytes, Bool>
 
 /// One function or declaration a build holds: its name, which of the two it is, the hash it is
 /// filed under, and what it references, each by its place in the list that holds them all.
-pub type Closed = { name: Bytes, decl: Bool, hash: Bytes, refs: List<Int> }
+pub type ClosureEntry = { name: Bytes, decl: Bool, hash: Bytes, refs: List<Int> }
 
 /// Every function and declaration the functions `roots` reach through what each references, those
 /// included, in the order met. One with no hash is no part of a build.
-pub fn held_by(hashes: HashOutput, roots: List<Bytes>) -> List<Closed> / {abort.raise} = {
+pub fn build_closure(hashes: HashOutput, roots: List<Bytes>) -> List<ClosureEntry> / {abort.raise} = {
   let r = hashes.refs;
   let defs = by_name(hashes.defs);
   let decls = by_name(hashes.decls);
   let hash_of = |v: Int| Map::get(if r.decls.get(v) { decls } else { defs }, r.names.get(v));
-  let reached = walked(r.edges, starting(r, roots.map(|name: Bytes| TheFn(name)))).all.filter(
-    |v: Int| hash_of(v) != None,
-  );
+  let reached = walked(
+    r.edges,
+    start_nodes(r, roots.map(|name: Bytes| FunctionNamed(name))),
+  ).all.filter(|v: Int| hash_of(v) != None);
   let place = range(0, reached.len()).fold(Map::new(), |acc: Map<Int, Int>, i: Int|
     acc.insert(reached.get(i), i));
   reached.map(|v: Int|

@@ -1,10 +1,10 @@
 import std.fs (fs, Missing)
 import std.json (Json, Str, Bool, Number, Array, Null, object)
 import args (Flags)
-import paths (Rooted, Resolved, absolute, parent_of, displayed, kind, read_file, write_file,
-              create_dir, move_file, spelled, here)
+import paths (RootedPath, ResolvedPath, absolute, parent_of, displayed, kind, read_file, write_file,
+              create_dir, move_file, rooted_path, here)
 import std.env (env)
-import report (Answer, schema_version, ok_code, compile_error)
+import report (CommandOutput, schema_version, ok_code, compile_error)
 import walk (Failure)
 import builder (builder)
 import std.random (entropy)
@@ -12,7 +12,7 @@ import std.time (time)
 import compiler.cc (toolchain)
 import compiler.load (Derives)
 import compiler.unit (shipped)
-import compiler.check.resolve.tables (Source, Declared, Namespace, space, namespaces)
+import compiler.check.resolve.tables (Source, Declaration, Namespace, space, namespaces)
 import compiler.check.resolve.bindings (Reference, Member, Local, FieldName)
 import compiler.syntax.lexer (lex)
 import rename.lines (Moved, OperationLine, Renames, keyword_refusal, renamed, renames_of, shown)
@@ -22,7 +22,7 @@ import rename.edits (Edit, Edited, ModuleMove, applied, comment_edits, edited_of
                      own_part, renaming_of)
 import rename.verify (Renamed, verified)
 
-type Change = { at: Rooted, text: Bytes, changed: Bool, to: Option<Rooted> }
+type Change = { at: RootedPath, text: Bytes, changed: Bool, to: Option<RootedPath> }
 
 type Plan = { changes: List<Change>, mentions: List<Mention>, refusals: List<Failure> }
 
@@ -41,10 +41,10 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
         e.names.members.fold(into, |found: Map<Bytes, Bool>, m: Member|
           if m.kind == FieldName { found.insert(m.name, true) } else { found })),
   );
-  let missing = |path: String| { path: path, why: "is not among the files being renamed" };
+  let missing = |path: String| { path: path, reason: "is not among the files being renamed" };
   let declares = |x: { load: Loaded, read: Read }, name: Bytes|
     namespaces().any(|namespace: Namespace|
-        space(x.load.declarations.get(x.read.index), namespace).any(|d: Declared|
+        space(x.load.declarations.get(x.read.index), namespace).any(|d: Declaration|
           d.name == name || own_part(d.name) == name))
       || x.read.entries.any(|e: Entry|
         e.names.references.any(|r: Reference|
@@ -54,16 +54,17 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
       match by_path.get(file) {
         None -> found.push(missing(file)),
         Some(x) -> if declares(x, old) { found }
-        else { found.push({ path: file, why: "binds no " ++ shown(old) }) },
+        else { found.push({ path: file, reason: "binds no " ++ shown(old) }) },
       })).concat(
     renames.operations.fold([], |acc: List<Failure>, o: OperationLine|
       match by_path.get(o.file) {
         None -> acc.push(missing(o.file)),
-        Some(x) -> if x.read.effects.any(|e: { name: Bytes, ops: List<Bytes> }|
-            e.name == o.effect_name && e.ops.contains(o.op)) { acc } else {
+        Some(x) -> if x.read.effects.any(|e: { name: Bytes, operations: List<Bytes> }|
+            e.name == o.effect_name && e.operations.contains(o.op)) { acc } else {
           acc.push({
             path: o.file,
-            why: "declares no operation " ++ shown(Bytes::concat_all([o.effect_name, b".", o.op])),
+            reason: "declares no operation "
+              ++ shown(Bytes::concat_all([o.effect_name, b".", o.op])),
           })
         },
       }),
@@ -74,17 +75,17 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
       else { acc.push(missing(m.path)) }),
   ).concat(
     renames.fields.keys().filter(|old: Bytes| !fields_written.contains(old)).map(|old: Bytes|
-      { path: "", why: "no record in the files being renamed has a field " ++ shown(old) }),
+      { path: "", reason: "no record in the files being renamed has a field " ++ shown(old) }),
   )
 }
 
 fn planned(
-  store: Option<Resolved>,
+  store: Option<ResolvedPath>,
   pwd: String,
   renames: Renames,
   loads: List<Loaded>,
   libraries: List<Library>,
-) -> Plan / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+) -> Plan / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let rn = renaming_of(pwd, renames, loads, libraries);
   let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
     acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
@@ -127,14 +128,14 @@ fn planned(
     });
   let crowded = targets.fold([], |acc: List<Failure>, target: String, from: List<String>|
     if from.len() > 1 {
-      acc.push({ path: target, why: String::join(from, " and ") ++ " would both be moved here" })
+      acc.push({ path: target, reason: String::join(from, " and ") ++ " would both be moved here" })
     } else { acc });
   let taken = changes.fold([], |acc: List<Failure>, change: Change|
     match change.to {
       Some(to) -> if kind(to) != Missing {
         acc.push({
           path: displayed(to),
-          why: displayed(change.at) ++ " would be moved here, but this file already exists",
+          reason: displayed(change.at) ++ " would be moved here, but this file already exists",
         })
       } else { acc },
       None -> acc,
@@ -189,14 +190,14 @@ fn saved(
   change: Change,
 ) -> Option<Failure> / {fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs]} =
   if change.changed && !write_file(change.at, change.text) {
-    Some({ path: displayed(change.at), why: "could not write" })
+    Some({ path: displayed(change.at), reason: "could not write" })
   } else {
     match change.to {
       None -> None,
       Some(to) -> {
         let room = match parent_of(to) { Some(dir) -> create_dir(dir), None -> true };
         if room && move_file(change.at, to) { None }
-        else { Some({ path: displayed(change.at), why: "could not move to " ++ displayed(to) }) }
+        else { Some({ path: displayed(change.at), reason: "could not move to " ++ displayed(to) }) }
       },
     }
   }
@@ -235,12 +236,12 @@ fn json_report(plan: Plan, failures: List<Failure>, code: Int) -> Json =
       key: "errors",
       value: Array(
         failures.map(|f: Failure|
-          object([{ key: "path", value: Str(f.path) }, { key: "error", value: Str(f.why) }])),
+          object([{ key: "path", value: Str(f.path) }, { key: "error", value: Str(f.reason) }])),
       ),
     },
   ])
 
-fn answered(plan: Plan, failures: List<Failure>, check: Bool) -> Answer = {
+fn answered(plan: Plan, failures: List<Failure>, check: Bool) -> CommandOutput = {
   let code = if failures.len() > 0 { compile_error() }
   else if check && plan.changes.len() > 0 { 1 }
   else { ok_code() };
@@ -259,7 +260,7 @@ fn answered(plan: Plan, failures: List<Failure>, check: Bool) -> Answer = {
       }
     }),
     errs: failures.map(|f: Failure|
-      "error: " ++ (if f.path == "" { "" } else { f.path ++ ": " }) ++ f.why).concat(
+      "error: " ++ (if f.path == "" { "" } else { f.path ++ ": " }) ++ f.reason).concat(
       plan.mentions.map(|m: Mention|
         "warning: " ++ m.path ++ ":" ++ m.line.to_string()
           ++ ": a string contains the renamed name "
@@ -269,15 +270,15 @@ fn answered(plan: Plan, failures: List<Failure>, check: Bool) -> Answer = {
   }
 }
 
-fn refused_with(why: String) -> Answer =
-  answered({ changes: [], mentions: [], refusals: [] }, [{ path: "", why: why }], false)
+fn refused_with(why: String) -> CommandOutput =
+  answered({ changes: [], mentions: [], refusals: [] }, [{ path: "", reason: why }], false)
 
 pub fn run(
   flags: Flags,
-) -> Answer / {env.working_directory, shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+) -> CommandOutput / {env.working_directory, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
   match flags.map {
     None -> refused_with("list the renames in a file and pass it with `--map FILE`"),
-    Some(map) -> match read_file(spelled(map)) {
+    Some(map) -> match read_file(rooted_path(map)) {
       None -> refused_with(map ++ ": could not read"),
       Some(text) -> match renames_of(text, flags.words) {
         Err(why) -> refused_with(map ++ ": " ++ why),

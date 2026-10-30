@@ -105,7 +105,7 @@ pub const fn schema() -> sql::Schema =
           { name: "sku", ty: sql::TText, nullable: false, default: sql::DNone },
           { name: "name", ty: sql::TText, nullable: false, default: sql::DNone },
           { name: "price", ty: sql::TNumeric(12, 2), nullable: false, default: sql::DNone },
-          { name: "on_hand", ty: sql::TInt, nullable: false, default: sql::DNone },
+          { name: "on_hand", ty: sql::IntColumn, nullable: false, default: sql::DNone },
         ],
         primary_key: ["sku"],
         unique: [],
@@ -115,11 +115,16 @@ pub const fn schema() -> sql::Schema =
       {
         name: "orders",
         columns: [
-          { name: "id", ty: sql::TInt, nullable: false, default: sql::DSequence("orders_id_seq") },
+          {
+            name: "id",
+            ty: sql::IntColumn,
+            nullable: false,
+            default: sql::SequenceDefault("orders_id_seq"),
+          },
           { name: "customer", ty: sql::TText, nullable: false, default: sql::DNone },
-          { name: "lines", ty: sql::TJson, nullable: false, default: sql::DNone },
+          { name: "lines", ty: sql::JsonColumn, nullable: false, default: sql::DNone },
           { name: "total", ty: sql::TNumeric(12, 2), nullable: false, default: sql::DNone },
-          { name: "state", ty: sql::TJson, nullable: false, default: sql::DNone },
+          { name: "state", ty: sql::JsonColumn, nullable: false, default: sql::DNone },
         ],
         primary_key: ["id"],
         unique: [],
@@ -294,13 +299,14 @@ fn order_cancel() -> sql::Stmt = sql::stmt("update orders set state = $1 where i
 
 /// The rows a fetch read, or the problem a client is told of in their place.
 fn listed<a>(
-  read: Result<List<a>, sql::Unread>,
+  read: Result<List<a>, sql::FetchError>,
 ) -> Result<List<a>, http::Response<| {}>> / {abort.raise} =
   match read {
     Ok(xs) -> Ok(xs),
     Err(sql::Refused(e)) -> Err(unavailable(e)),
-    Err(sql::Counted(_)) -> Err(problem(500, "unreadable answer", "a query answered a count")),
-    Err(sql::Misread(e)) ->
+    Err(sql::UnexpectedCount(_)) ->
+      Err(problem(500, "unreadable answer", "a query answered a count")),
+    Err(sql::InvalidRow(e)) ->
       Err(
         problem(
           500,
@@ -325,7 +331,7 @@ fn book() -> Result<List<Order>, http::Response<| {}>> / {db.query[orders], abor
 fn order_row_of(
   id: Int,
 ) -> Result<Option<Order>, http::Response<| {}>> / {db.query[orders], abort.raise} = {
-  let os = listed(db::fetch[orders](order_by_id(), order_row(), [sql::PInt(id)]))?;
+  let os = listed(db::fetch[orders](order_by_id(), order_row(), [sql::IntParameter(id)]))?;
   Ok(head_of(os))
 }
 
@@ -333,12 +339,12 @@ fn order_row_of(
 /// this file already derived.
 fn lines_param(lines: List<Line>) -> sql::Param / {abort.raise} = {
   let c = json::list_json(line_json());
-  sql::PJson((c.encode)(lines))
+  sql::JsonParameter((c.encode)(lines))
 }
 
 fn state_param(s: State) -> sql::Param / {abort.raise} = {
   let c = state_json();
-  sql::PJson((c.encode)(s))
+  sql::JsonParameter((c.encode)(s))
 }
 
 // --- The business, which touches nothing ----------------------------------------
@@ -426,8 +432,10 @@ pub fn table() -> List<router::Route<Endpoint>> / {abort.raise} =
   ]
 
 /// Pure, and that is the first thing `ply check --types` prints about this service.
-pub fn route_of(method: http::Method, path: String) -> router::Matched<Endpoint> / {abort.raise} =
-  router::route(table(), method, path)
+pub fn route_of(
+  method: http::Method,
+  path: String,
+) -> router::RouteResult<Endpoint> / {abort.raise} = router::route(table(), method, path)
 
 // --- Responses ------------------------------------------------------------------
 
@@ -436,10 +444,10 @@ fn field(name: String, value: String) -> { key: String, value: List<String> } =
 
 /// One entry of a `Fields` map.
 fn text_field(name: String, value: String) -> { key: String, value: trace::Field } =
-  { key: name, value: trace::FText(value) }
+  { key: name, value: trace::StringField(value) }
 
 fn int_field(name: String, value: Int) -> { key: String, value: trace::Field } =
-  { key: name, value: trace::FInt(value) }
+  { key: name, value: trace::IntField(value) }
 
 fn json_headers() -> http::Headers = Map::of_entries([field("content-type", "application/json")])
 
@@ -509,7 +517,7 @@ pub fn list_items() -> http::Response<| {}> / {db.query[items], abort.raise} =
 
 /// Everything the shelf is short of.
 pub fn featured() -> http::Response<| {}> / {db.query[items], abort.raise} =
-  match listed(db::fetch[items](items_in_stock(), item_row(), [sql::PInt(0)])) {
+  match listed(db::fetch[items](items_in_stock(), item_row(), [sql::IntParameter(0)])) {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
@@ -519,7 +527,9 @@ pub fn get_item(
 ) -> http::Response<| {}> / {db.query[items], abort.raise} =
   match params.get("sku") {
     None -> problem(400, "bad request", "no sku was captured"),
-    Some(sku) -> match listed(db::fetch[items](item_by_sku(), item_row(), [sql::PText(sku)])) {
+    Some(sku) -> match listed(
+        db::fetch[items](item_by_sku(), item_row(), [sql::TextParameter(sku)]),
+      ) {
       Err(r) -> r,
       Ok(rows) -> match head_of(rows) {
         Some(i) -> json_body(200, i, item_json()),
@@ -595,9 +605,9 @@ fn recorded(
 ) -> http::Response<| {}> / {Service, abort.raise} =
   match listed(
       db::fetch_returning[orders](order_insert(), order_row(), [
-        sql::PText(p.customer),
+        sql::TextParameter(p.customer),
         lines_param(p.lines),
-        sql::PNumeric(total),
+        sql::NumericParameter(total),
         state_param(Open),
       ]),
     ) {
@@ -614,7 +624,7 @@ fn recorded(
           Map::of_entries([
             int_field("order", o.id),
             text_field("customer", p.customer),
-            { key: "total", value: trace::FDecimal(o.total) },
+            { key: "total", value: trace::DecimalField(o.total) },
             int_field("lines", p.lines.len()),
           ]),
         );
@@ -659,9 +669,9 @@ fn moving(
 /// Three answers, and each one is a different thing to have happened.
 fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
   match db.execute[items](item_reserve(), [
-      sql::PInt(to),
-      sql::PText(i.sku),
-      sql::PInt(i.on_hand),
+      sql::IntParameter(to),
+      sql::TextParameter(i.sku),
+      sql::IntParameter(i.on_hand),
     ]) {
     sql::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
     sql::Failed(_) -> db.rollback(i.sku),
@@ -705,7 +715,7 @@ fn cancelling(id: Int) -> http::Response<| {}> / {Service, abort.raise} =
 /// from under it; that answers 409 without a rollback — nothing had been written, so there is
 /// nothing to discard and committing an empty transaction is the honest end of it.
 fn cancelled_now(o: Order) -> http::Response<| {}> / {Service, abort.raise} =
-  match db.execute[orders](order_cancel(), [state_param(Cancelled), sql::PInt(o.id)]) {
+  match db.execute[orders](order_cancel(), [state_param(Cancelled), sql::IntParameter(o.id)]) {
     sql::Count(n) -> if n == 1 { restocked(o) }
     else { problem(409, "already cancelled", o.id.to_string()) },
     sql::Failed(e) -> unavailable(e),
@@ -723,7 +733,7 @@ fn restocked(o: Order) -> http::Response<| {}> / {Service, abort.raise} =
         Map::of_entries([
           int_field("order", o.id),
           text_field("customer", o.customer),
-          { key: "total", value: trace::FDecimal(o.total) },
+          { key: "total", value: trace::DecimalField(o.total) },
         ]),
       );
       json_body(200, cancelled(o), order_json())
@@ -868,7 +878,7 @@ fn guarded(
         "api key refused",
         Map::of_entries([
           text_field("path", req.path),
-          { key: "presented", value: trace::FBool(presented(req) != "") },
+          { key: "presented", value: trace::BoolField(presented(req) != "") },
         ]),
       );
       Buffered(problem(401, "unauthorized", "POST /orders needs a matching `x-api-key` header"))
@@ -1093,7 +1103,7 @@ fn heard<| e>(
     // Every framing refusal closes the connection: what a refusal did not establish is exactly
     // where the next message begins, so there is nothing to resynchronise to.
     http::Refused(why) ->
-      write_out(c, l, http::Get, http::Http11, false, http::refusal_response(why)),
+      write_out(c, l, http::Get, http::Http11, false, http::error_response(why)),
     http::Parsed(h) -> continued(c, l, h, buf, left, stopping),
   }
 
@@ -1143,8 +1153,8 @@ fn with_body<| e>(
       ),
     http::BodyClosed -> (),
     http::BodyRefused(why) ->
-      write_out(c, l, h.request.method, h.request.version, false, http::refusal_response(why)),
-    http::Body(got) -> answered(c, l, h, got, left, stopping),
+      write_out(c, l, h.request.method, h.request.version, false, http::error_response(why)),
+    http::BodyComplete(got) -> answered(c, l, h, got, left, stopping),
   }
 
 fn answered<| e>(
@@ -1276,9 +1286,14 @@ pub fn serve_pooled(
   l: http::Limits,
   count: Int,
   shedding: http::Shedding,
-) -> http::Pooled / {task.write, clock.read, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
-  http::pooled[listener, conn](listener, count, l, shedding, |c: Int, stop: Chan<Unit>|
-    serve_connection_until(c, l, stop))
+) -> http::PoolStats / {task.write, clock.read, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
+  http::serve_pooled_with[listener, conn](
+    listener,
+    count,
+    l,
+    shedding,
+    |c: Int, stop: Chan<Unit>| serve_connection_until(c, l, stop),
+  )
 
 fn joined(tasks: List<Task<Unit>>) -> Int / {task.write, abort.raise} =
   tasks.fold(0, |n: Int, t: Task<Unit>| {
@@ -1487,9 +1502,9 @@ pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb / {abort.rai
       stepped(d, item_insert(), item_row().params(i))),
     |d: db::MemDb, o: Order|
       stepped(d, order_insert(), [
-        sql::PText(o.customer),
+        sql::TextParameter(o.customer),
         lines_param(o.lines),
-        sql::PNumeric(o.total),
+        sql::NumericParameter(o.total),
         state_param(o.state),
       ]),
   )
@@ -1511,11 +1526,11 @@ pub fn shelf_of(d: db::MemDb) -> List<Item> / {abort.raise} = read_out(d, items_
 pub fn book_of(d: db::MemDb) -> List<Order> / {abort.raise} = read_out(d, orders_all(), order_row())
 
 fn read_out<a>(d: db::MemDb, s: sql::Stmt, c: sql::RowCodec<a>) -> List<a> / {abort.raise} =
-  match sql::decoded(db::step(d, s, []).out, c) {
+  match sql::decode_rows(db::step(d, s, []).out, c) {
     Ok(xs) -> xs,
-    Err(sql::Misread(e)) -> panic("a row would not decode: " ++ e.column),
+    Err(sql::InvalidRow(e)) -> panic("a row would not decode: " ++ e.column),
     Err(sql::Refused(e)) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
-    Err(sql::Counted(_)) -> panic("a query answered a count"),
+    Err(sql::UnexpectedCount(_)) -> panic("a query answered a count"),
   }
 
 // --- Tests: the business, which needs no handler at all ----------------------------
@@ -1653,7 +1668,7 @@ fn against<a | e>(
   let ran = handle {
     over_values(d, body)
   } with {
-    config.secret[credentials](key) -> config::secret_step(values, key),
+    config.secret[credentials](key) -> config::get_secret(values, key),
     // And **not** `signal`, which the caller handles.
   };
   {
@@ -1722,7 +1737,7 @@ fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Reque
 fn recorded_names(rs: List<trace::Record>) -> List<String> = rs.map(|r: trace::Record| r.name)
 
 fn outcomes_of(rs: List<trace::Record>) -> List<trace::Outcome> =
-  rs.filter(|r: trace::Record| r.kind == trace::KExit).map(|r: trace::Record| r.outcome)
+  rs.filter(|r: trace::Record| r.kind == trace::Exit).map(|r: trace::Record| r.outcome)
 
 fn body_string(r: http::Response<| {}>) -> String / {abort.raise} =
   String::of_bytes(http::whole_bytes(r.body))
@@ -2119,10 +2134,10 @@ fn rendered_fields(rs: List<trace::Record>) -> String =
 
 fn shown_field(f: Option<trace::Field>) -> String =
   match f {
-    Some(trace::FText(t)) -> t,
-    Some(trace::FInt(n)) -> n.to_string(),
-    Some(trace::FBool(b)) -> if b { "true" } else { "false" },
-    Some(trace::FDecimal(d)) -> d.to_string(),
+    Some(trace::StringField(t)) -> t,
+    Some(trace::IntField(n)) -> n.to_string(),
+    Some(trace::BoolField(b)) -> if b { "true" } else { "false" },
+    Some(trace::DecimalField(d)) -> d.to_string(),
     _ -> "",
   }
 
@@ -2304,12 +2319,15 @@ test "a signal drains the accept loop with no source change" {
 
 /// What `count` clients each asking for `path` once were answered by a pooled service of one worker
 /// and a queue of one, and how the pool counted them.
-fn pooled_run(count: Int, path: String) -> net::Over<http::Pooled> / {sim.read, abort.raise} = {
+fn pooled_run(
+  count: Int,
+  path: String,
+) -> net::RunResult<http::PoolStats> / {sim.read, abort.raise} = {
   let asked = Bytes::of_string(
     "GET " ++ path ++ " HTTP/1.1\r\nHost: service.example\r\nConnection: close\r\n\r\n",
   );
   let callers = range(0, count).fold(net::mem_empty(), |m: net::MemNet, i: Int|
-    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Says(asked)]));
+    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Sends(asked)]));
   twin(Some(Secret::of_string(twin_key())), ||
     net::on_mem(callers, ||
       simulate {
@@ -2338,7 +2356,7 @@ test "a kept-alive service connection under a stop is answered as its last, and 
   let ran = twin(Some(Secret::of_string(twin_key())), ||
     net::on_mem(
       net::mem_calling(net::mem_empty(), ip::socket_at(ip::loopback_v4(), 4000), [
-        net::Says(get_line("/health")),
+        net::Sends(get_line("/health")),
         net::Silent,
       ]),
       ||

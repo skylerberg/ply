@@ -6,21 +6,24 @@
 //! and an update gathers its record from the fields it keeps of its base and the ones it sets.
 
 import compiler.syntax.parsing (Span)
-import compiler.check.types (Type, TyCon, TyRecord, TyNominal, Field)
+import compiler.check.types (Type, NamedType, RecordType, NominalType, Field)
 import compiler.emit.typing (unknown_type)
-import compiler.emit.reps (Ctors, SumCtor, open_vars)
+import compiler.emit.representations (Ctors, SumCtor, open_vars)
 import compiler.emit.c (sorted_names)
-import compiler.emit.answer (Layout)
-import compiler.emit.layout (SumLaid, Boxed, words, tag_bits)
-import compiler.emit.tir (Rep, RWord, RFlat, RSum, RUnit, Leaf, Var, Arg, AVar, AInt, AZero, Make,
-                          MCase, MRecord, Supplied, Get, Gathered, Updated, FieldSet, PLeaf, PField,
-                          PPlace, rep_of_arg, read_only, read_records)
-import compiler.emit.lower.setting (ctor_sum)
-import compiler.emit.lower.held (held_as, leaf_spans, leaves_within, field_type, field_offsets,
-                                 case_index, leaf_type, laid_leaves, leaves_inside, record_parts,
-                                 record_fields, RecordPart, case_parts, lies_placed)
-import compiler.emit.lower.base (Context, Lowering, Lowered, unreachable, bound_as, handed, noted,
-                                 packed_from, unsettled)
+import compiler.emit.output (Layout)
+import compiler.emit.layout (SumLayout, Boxed, words, tag_bits)
+import compiler.emit.typed_ir (Representation, AsWord, AsFlattened, AsSum, AsUnit, Leaf, Var, Arg,
+                               VarOperand, IntOperand, ZeroOperand, Allocate, CaseAllocation,
+                               RecordAllocation, FromArgument, Get, Aggregate, Update, FieldWrite,
+                               LeafPath, FieldPath, InlineRecordPath, operand_representation,
+                               read_only, read_records)
+import compiler.emit.lower.module_context (ctor_sum)
+import compiler.emit.lower.representation (representation_of, leaf_spans, leaves_within, field_type,
+                                           field_offsets, case_index, leaf_type, layout_leaves,
+                                           leaves_inside, record_parts, record_fields, RecordPart,
+                                           case_parts, inline_with_header)
+import compiler.emit.lower.base (Context, Lowering, LoweredValue, unreachable, bound_as,
+                                 represented_as, noted, packed_from, deferred_to_specialisation)
 
 /// Constructor `name` applied to `args` by the call at `at`, making a value of type `ty`.
 pub fn constructed(
@@ -30,7 +33,7 @@ pub fn constructed(
   args: List<Arg>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = constructed_as(cx, st, name, args, ty, at)
+) -> LoweredValue / {abort.raise} = constructed_as(cx, st, name, args, ty, at)
 
 /// Constructor `name` applied to `args`, making a value of type `ty`: gathered into the sum's words
 /// where its type lays it out, no value where it lays it in none, and a placeholder where a type
@@ -43,19 +46,19 @@ pub fn constructed_as(
   args: List<Arg>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = {
+) -> LoweredValue / {abort.raise} = {
   let ctor = name;
   {
-    let r = held_as(cx.setting, ty);
+    let r = representation_of(cx.setting, ty);
     match r {
-      RSum(s) -> match case_index(r, ctor) {
+      AsSum(s) -> match case_index(r, ctor) {
         Some(i) -> case_gathered(cx, st, ty, s, i, args, at),
         None -> unreachable(b"a constructor its sum's cases do not hold: ".concat(ctor)),
       },
-      RUnit -> { st: st, arg: AZero(RUnit) },
+      AsUnit -> { st: st, arg: ZeroOperand(AsUnit) },
       _ -> if open_vars(cx.setting.ctors, ty) == [] {
         unreachable(b"a constructor at a type no declared sum or variable lays out: ".concat(ctor))
-      } else { open_made(cx, st, ty, ctor, args, at) },
+      } else { open_layout_constructed(cx, st, ty, ctor, args, at) },
     }
   }
 }
@@ -65,28 +68,36 @@ pub fn constructed_as(
 /// its callers settle lay out: a case every one of them lays in the sum's own words gathered from
 /// its place and its arguments, each as its word, as it is wherever it is laid out (a case of none
 /// a constant); any other case boxed with each argument as its word.
-fn open_made(
+fn open_layout_constructed(
   cx: Context,
   st: Lowering,
   ty: Type,
   ctor: Bytes,
   args: List<Arg>,
   at: Span,
-) -> Lowered = {
+) -> LoweredValue = {
   let sum = ctor_sum(cx.setting, ctor);
   let i = match sum { Some(x) -> x.index, None -> 0 };
-  let held = handed_all(open_needed(cx, st, ty), args.map(|a: Arg| { arg: a, to: RWord }), at);
+  let held = all_represented_as(
+    note_open_layouts(cx, st, ty),
+    args.map(|a: Arg| { arg: a, to: AsWord }),
+    at,
+  );
   let inline = args.len() == 0
     || (match ((sum, ty)) {
-      (Some(x), TyCon(c)) -> inline_everywhere(cx.setting.ctors, c.name, x.ctors, i),
+      (Some(x), NamedType(c)) -> inline_everywhere(cx.setting.ctors, c.name, x.ctors, i),
       _ -> false,
     });
   bound_as(
     held.st,
     ty,
-    RWord,
-    if inline { Gathered({ parts: [AInt(i)].concat(held.args) }) } else {
-      Make({ made: MCase({ case: i, skip: 0, words: args.len() }), args: held.args, reuse: None })
+    AsWord,
+    if inline { Aggregate({ parts: [IntOperand(i)].concat(held.args) }) } else {
+      Allocate({
+        made: CaseAllocation({ case: i, skip: 0, words: args.len() }),
+        args: held.args,
+        reuse: None,
+      })
     },
     at,
   )
@@ -101,7 +112,7 @@ fn inline_everywhere(ctors: Ctors, sum: Bytes, cs: List<SumCtor>, i: Int) -> Boo
 
 /// `st` noting the layout of each type variable a value of `ty` is laid out by, which a
 /// specialisation at known types lays out.
-pub fn open_needed(cx: Context, st: Lowering, ty: Type) -> Lowering =
+pub fn note_open_layouts(cx: Context, st: Lowering, ty: Type) -> Lowering =
   open_vars(cx.setting.ctors, ty).fold(st, |s: Lowering, v: Int|
     noted(s, { var: v, reads: Layout }))
 
@@ -111,42 +122,42 @@ fn case_gathered(
   cx: Context,
   st: Lowering,
   ty: Type,
-  s: { laid: SumLaid, cases: List<Bytes> },
+  s: { layout: SumLayout, cases: List<Bytes> },
   i: Int,
   args: List<Arg>,
   at: Span,
-) -> Lowered / {abort.raise} = {
+) -> LoweredValue / {abort.raise} = {
   let cps = case_parts(cx.setting.ctors, ty, i);
   if cps.len() != args.len() { unreachable(b"a constructor applied to other than its arguments") }
   else {
-    let held = handed_all(
+    let held = all_represented_as(
       st,
-      range(0, args.len()).fold([], |acc: List<{ arg: Arg, to: Rep }>, k: Int|
+      range(0, args.len()).fold([], |acc: List<{ arg: Arg, to: Representation }>, k: Int|
         match ((args.at(k), cps.at(k))) {
-          (Some(a), Some(cp)) -> acc.push({ arg: a, to: cp.rep }),
+          (Some(a), Some(cp)) -> acc.push({ arg: a, to: cp.representation }),
           _ -> acc,
         }),
       at,
     );
-    let r = RSum(s);
-    match s.laid.cases.at(i) {
+    let r = AsSum(s);
+    match s.layout.cases.at(i) {
       Some(c) -> match c.payload {
         // The box is the sum's alone until it is gathered into the sum's words.
         Boxed(b) -> {
           let boxed = bound_as(
             held.st,
             ty,
-            RWord,
-            Make({
-              made: MCase({ case: i, skip: b.skip, words: words(b.laid) }),
+            AsWord,
+            Allocate({
+              made: CaseAllocation({ case: i, skip: b.skip, words: words(b.layout) }),
               args: held.args,
               reuse: None,
             }),
             at,
           );
-          bound_as(boxed.st, ty, r, Gathered({ parts: [AInt(i), boxed.arg] }), at)
+          bound_as(boxed.st, ty, r, Aggregate({ parts: [IntOperand(i), boxed.arg] }), at)
         },
-        _ -> bound_as(held.st, ty, r, Gathered({ parts: [AInt(i)].concat(held.args) }), at),
+        _ -> bound_as(held.st, ty, r, Aggregate({ parts: [IntOperand(i)].concat(held.args) }), at),
       },
       None -> unreachable(b"a case its sum's layout does not hold"),
     }
@@ -154,15 +165,15 @@ fn case_gathered(
 }
 
 /// Each of `xs`' values held as its `to` says, in order.
-fn handed_all(
+fn all_represented_as(
   st: Lowering,
-  xs: List<{ arg: Arg, to: Rep }>,
+  xs: List<{ arg: Arg, to: Representation }>,
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } =
   xs.fold(
     { st: st, args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, x: { arg: Arg, to: Rep }| {
-      let h = handed({ st: acc.st, arg: x.arg }, x.to, at);
+    |acc: { st: Lowering, args: List<Arg> }, x: { arg: Arg, to: Representation }| {
+      let h = represented_as({ st: acc.st, arg: x.arg }, x.to, at);
       { st: h.st, args: acc.args.push(h.arg) }
     },
   )
@@ -170,39 +181,39 @@ fn handed_all(
 /// A record literal of `fields`, each lowered in written order, at the type the checker filed for
 /// it: gathered into its leaves where its type lays it out, no value where it lays it in none, and
 /// made by value where a type variable leaves the layout open.
-pub fn recorded(
+pub fn record_literal(
   cx: Context,
   st: Lowering,
   fields: List<{ name: Bytes, arg: Arg }>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = recorded_as(cx, st, fields, ty, at)
+) -> LoweredValue / {abort.raise} = record_literal_as(cx, st, fields, ty, at)
 
-/// A record of `fields` at type `ty`, as `recorded` makes one at the type the checker filed.
-pub fn recorded_as(
+/// A record of `fields` at type `ty`, as `record_literal` makes one at the type the checker filed.
+pub fn record_literal_as(
   cx: Context,
   st: Lowering,
   fields: List<{ name: Bytes, arg: Arg }>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = {
+) -> LoweredValue / {abort.raise} = {
   let value = |name: Bytes|
     fields.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
       if f.name == name { Some(f.arg) } else { acc });
-  let rep = held_as(cx.setting, ty);
-  if rep == RUnit { { st: st, arg: AZero(RUnit) } } else {
-    match laid_leaves(cx.setting.ctors, ty) {
+  let rep = representation_of(cx.setting, ty);
+  if rep == AsUnit { { st: st, arg: ZeroOperand(AsUnit) } } else {
+    match layout_leaves(cx.setting.ctors, ty) {
       Some(ls) -> {
         let given = record_parts(cx.setting.ctors, ty).fold(
           { xs: [], missing: false },
-          |acc: { xs: List<{ arg: Arg, to: Rep }>, missing: Bool }, p: RecordPart|
+          |acc: { xs: List<{ arg: Arg, to: Representation }>, missing: Bool }, p: RecordPart|
             match value(p.name) {
-              Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: p.rep }) },
+              Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: p.representation }) },
               None -> { ..acc, missing: true },
             },
         );
         if given.missing { unreachable(b"a record literal missing a field its type holds") } else {
-          let parts = handed_all(st, given.xs, at);
+          let parts = all_represented_as(st, given.xs, at);
           record_built(parts.st, ty, ls, rep, parts.args, at)
         }
       },
@@ -212,7 +223,15 @@ pub fn recorded_as(
           match value(n) { Some(a) -> acc.push(a), None -> acc });
         if given.len() != names.len() {
           unreachable(b"a record literal missing a field its type holds")
-        } else { unsettled(open_needed(cx, st, ty), ty, RWord, read_records(given), at) }
+        } else {
+          deferred_to_specialisation(
+            note_open_layouts(cx, st, ty),
+            ty,
+            AsWord,
+            read_records(given),
+            at,
+          )
+        }
       },
     }
   }
@@ -225,47 +244,61 @@ fn record_built(
   st: Lowering,
   ty: Type,
   ls: List<Leaf>,
-  rep: Rep,
+  rep: Representation,
   parts: List<Arg>,
   at: Span,
-) -> Lowered =
-  if rep == RWord {
+) -> LoweredValue =
+  if rep == AsWord {
     bound_as(
       st,
       ty,
-      RWord,
-      Make({ made: MRecord(parts.map(|_: Arg| Supplied)), args: parts, reuse: None }),
+      AsWord,
+      Allocate({
+        made: RecordAllocation(parts.map(|_: Arg| FromArgument)),
+        args: parts,
+        reuse: None,
+      }),
       at,
     )
-  } else { held_made(record_made(st, ty, ls, parts, at), rep, at) }
+  } else { record_represented_as(gathered_record(st, ty, ls, parts, at), rep, at) }
 
 /// `flat`, a record made as its leaves, held as `rep` its type holds it as: as it is, or boxed.
-fn held_made(flat: Lowered, rep: Rep, at: Span) -> Lowered =
-  if rep_of_arg(flat.arg) == rep { flat } else { handed(flat, rep, at) }
+fn record_represented_as(flat: LoweredValue, rep: Representation, at: Span) -> LoweredValue =
+  if operand_representation(flat.arg) == rep { flat } else { represented_as(flat, rep, at) }
 
 /// The record of type `ty` held as the leaves `ls`, gathered from `parts`, the values of its
 /// `record_parts` in order.
-fn record_made(st: Lowering, ty: Type, ls: List<Leaf>, parts: List<Arg>, at: Span) -> Lowered =
-  bound_as(st, ty, RFlat(ls), Gathered({ parts: parts }), at)
+fn gathered_record(
+  st: Lowering,
+  ty: Type,
+  ls: List<Leaf>,
+  parts: List<Arg>,
+  at: Span,
+) -> LoweredValue = bound_as(st, ty, AsFlattened(ls), Aggregate({ parts: parts }), at)
 
 /// The names of a record of type `ty` in the order it holds them, or `written` in that order where
 /// `ty` is no record.
 fn names_of(ty: Type, written: List<Bytes>) -> List<Bytes> =
   match ty {
-    TyRecord(fs) -> fs.map(|f: Field| f.name),
-    TyNominal(x) -> x.fields.map(|f: Field| f.name),
+    RecordType(fs) -> fs.map(|f: Field| f.name),
+    NominalType(x) -> x.fields.map(|f: Field| f.name),
     _ -> sorted_names(written),
   }
 
 /// Field `name` of `base`, held as its type says, borrowed: a flat record's leaves, or the words at
 /// its offset in the box a record's word is; no value for a field of no words; or, where a type
 /// variable leaves the layout open, read by name, a placeholder no printer sees.
-pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered / {abort.raise} = {
+pub fn field(
+  cx: Context,
+  base: LoweredValue,
+  name: Bytes,
+  at: Span,
+) -> LoweredValue / {abort.raise} = {
   // A record read out of the record around it and boxed for this read alone is read where it lies.
   let lies = match base.arg {
-    AVar(b) -> match ((b.rep, laid_leaves(cx.setting.ctors, b.ty))) {
-      (RWord, Some(ls)) -> match packed_from(base.st, b, RFlat(ls)) {
-        Some(s) -> { st: base.st, arg: AVar(s) },
+    VarOperand(b) -> match ((b.representation, layout_leaves(cx.setting.ctors, b.ty))) {
+      (AsWord, Some(ls)) -> match packed_from(base.st, b, AsFlattened(ls)) {
+        Some(s) -> { st: base.st, arg: VarOperand(s) },
         None -> base,
       },
       _ -> base,
@@ -273,14 +306,23 @@ pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered / {ab
     _ -> base,
   };
   match lies.arg {
-    AVar(b) -> {
+    VarOperand(b) -> {
       let fty = match field_type(b.ty, name) { Some(t) -> t, None -> unknown_type() };
-      match read_in(cx, lies.st, b, lay_of(cx, b), name, fty, held_as(cx.setting, fty), at) {
+      match read_field(
+          cx,
+          lies.st,
+          b,
+          field_layout(cx, b),
+          name,
+          fty,
+          representation_of(cx.setting, fty),
+          at,
+        ) {
         None -> unreachable(b"a field its record does not hold: ".concat(name)),
         Some(r) -> r,
       }
     },
-    AZero(RUnit) -> { st: lies.st, arg: AZero(RUnit) },
+    ZeroOperand(AsUnit) -> { st: lies.st, arg: ZeroOperand(AsUnit) },
     _ -> unreachable(b"a field of a value that is no record: ".concat(name)),
   }
 }
@@ -288,56 +330,67 @@ pub fn field(cx: Context, base: Lowered, name: Bytes, at: Span) -> Lowered / {ab
 /// Where the fields of a record lie, read once for every field read out of it: each field's span
 /// of a flat record's leaves; each field's first word in the box a record's word is; nothing for a
 /// record of no words; or nothing known, where a type variable leaves the layout open.
-type Lay =
+type FieldLayout =
   | Spans({ leaves: List<Leaf>, of: Map<Bytes, { at: Int, n: Int }> })
-  | Slots(Map<Bytes, Int>)
+  | Offsets(Map<Bytes, Int>)
   | Empty
   | Open
 
-fn lay_of(cx: Context, b: Var) -> Lay =
-  match b.rep {
-    RFlat(ls) -> Spans({ leaves: ls, of: leaf_spans(ls) }),
-    RUnit -> Empty,
-    _ -> match laid_leaves(cx.setting.ctors, b.ty) {
-      Some(_) -> Slots(field_offsets(cx.setting, b.ty)),
-      None -> if held_as(cx.setting, b.ty) == RUnit { Empty } else { Open },
+fn field_layout(cx: Context, b: Var) -> FieldLayout =
+  match b.representation {
+    AsFlattened(ls) -> Spans({ leaves: ls, of: leaf_spans(ls) }),
+    AsUnit -> Empty,
+    _ -> match layout_leaves(cx.setting.ctors, b.ty) {
+      Some(_) -> Offsets(field_offsets(cx.setting, b.ty)),
+      None -> if representation_of(cx.setting, b.ty) == AsUnit { Empty } else { Open },
     },
   }
 
 /// Field `name` of type `fty` of `b`, laid out as `lay` says, held as `want` and borrowed from `b`;
 /// nothing where `b`'s layout holds no such field.
-fn read_in(
+fn read_field(
   cx: Context,
   st: Lowering,
   b: Var,
-  lay: Lay,
+  lay: FieldLayout,
   name: Bytes,
   fty: Type,
-  want: Rep,
+  want: Representation,
   at: Span,
-) -> Option<Lowered> / {abort.raise} =
-  if want == RUnit { Some({ st: st, arg: AZero(RUnit) }) } else {
+) -> Option<LoweredValue> / {abort.raise} =
+  if want == AsUnit { Some({ st: st, arg: ZeroOperand(AsUnit) }) } else {
     // A record held as its leaves lies in place in the record around it: read as them.
     let nested = leaves_inside(cx.setting.ctors, fty);
-    let as_wanted = |l: Lowered| if rep_of_arg(l.arg) == want { l } else { handed(l, want, at) };
+    let as_wanted = |l: LoweredValue|
+      if operand_representation(l.arg) == want { l } else { represented_as(l, want, at) };
     match lay {
       Spans(s) -> match s.of.get(name) {
         None -> None,
         Some(sp) -> Some(as_wanted(leaves_read(st, b, s.leaves, sp, fty, nested != None, at))),
       },
-      Slots(offsets) -> match offsets.get(name) {
+      Offsets(offsets) -> match offsets.get(name) {
         None -> None,
         Some(o) -> {
-          let read = if lies_placed(cx.setting.ctors, fty) { Get({ of: b, path: PPlace(o) }) }
-          else { Get({ of: b, path: PField({ name: name, at: o }) }) };
+          let read = if inline_with_header(cx.setting.ctors, fty) {
+            Get({ of: b, path: InlineRecordPath(o) })
+          } else { Get({ of: b, path: FieldPath({ name: name, at: o }) }) };
           Some(match nested {
-            Some(ls) -> as_wanted(bound_as(st, fty, RFlat(ls), read, at)),
+            Some(ls) -> as_wanted(bound_as(st, fty, AsFlattened(ls), read, at)),
             None -> bound_as(st, fty, want, read, at),
           })
         },
       },
       Empty -> None,
-      Open -> Some(unsettled(open_needed(cx, st, b.ty), fty, want, read_only([AVar(b)]), at)),
+      Open ->
+        Some(
+          deferred_to_specialisation(
+            note_open_layouts(cx, st, b.ty),
+            fty,
+            want,
+            read_only([VarOperand(b)]),
+            at,
+          ),
+        ),
     }
   }
 
@@ -351,9 +404,9 @@ fn leaves_read(
   fty: Type,
   record: Bool,
   at: Span,
-) -> Lowered / {abort.raise} = {
+) -> LoweredValue / {abort.raise} = {
   let one = |s: Lowering, k: Int, ty: Type|
-    bound_as(s, ty, leaf_rep(ls, k), Get({ of: b, path: PLeaf(k) }), at);
+    bound_as(s, ty, leaf_representation(ls, k), Get({ of: b, path: LeafPath(k) }), at);
   if !record { one(st, sp.at, fty) } else {
     let inner = leaves_within(ls, sp);
     let read = range(0, inner.len()).fold(
@@ -367,17 +420,18 @@ fn leaves_read(
         { st: g.st, parts: acc.parts.push(g.arg) }
       },
     );
-    bound_as(read.st, fty, RFlat(inner), Gathered({ parts: read.parts }), at)
+    bound_as(read.st, fty, AsFlattened(inner), Aggregate({ parts: read.parts }), at)
   }
 }
 
-fn leaf_rep(ls: List<Leaf>, k: Int) -> Rep = match ls.at(k) { Some(l) -> l.rep, None -> RWord }
+fn leaf_representation(ls: List<Leaf>, k: Int) -> Representation =
+  match ls.at(k) { Some(l) -> l.representation, None -> AsWord }
 
 /// `{ ..base, sets }`, the fields `copies` read out of `base` as they stand, at the type the checker
 /// filed for it: gathered from what it keeps of `base` and what it sets where its type lays it out,
 /// no value where it lays it in none; where a type variable leaves the layout open, what only a
 /// specialisation computes.
-pub fn updated(
+pub fn record_update(
   cx: Context,
   st: Lowering,
   base: Arg,
@@ -385,36 +439,36 @@ pub fn updated(
   sets: List<{ name: Bytes, arg: Arg }>,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} =
+) -> LoweredValue / {abort.raise} =
   match base {
-    AVar(b) -> {
-      let rep = held_as(cx.setting, ty);
-      if rep == RUnit { { st: st, arg: AZero(RUnit) } } else {
-        match laid_leaves(cx.setting.ctors, ty) {
+    VarOperand(b) -> {
+      let rep = representation_of(cx.setting, ty);
+      if rep == AsUnit { { st: st, arg: ZeroOperand(AsUnit) } } else {
+        match layout_leaves(cx.setting.ctors, ty) {
           Some(ls) -> {
             // Each field is looked up once in maps read once, however wide the record is.
             let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
               m.insert(f.name, f.arg));
             let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
-            let lay = lay_of(cx, b);
+            let lay = field_layout(cx, b);
             // A record held as its box is written in its box, or a copy of it: only the fields set.
             // The base must hold the same fields, as a literal copying fields of a record of another
             // type alike in layout would let a field it replaces go as the other's.
             let parts_of_ty = record_parts(cx.setting.ctors, ty);
-            let in_place = rep == RWord && b.rep == RWord
+            let in_place = rep == AsWord && b.representation == AsWord
               && record_fields(b.ty) == record_fields(ty)
               && parts_of_ty.all(|p: RecordPart| given.contains(p.name) || kept.contains(p.name));
-            if in_place { written_over(cx, st, b, ty, sets, at) } else {
+            if in_place { box_fields_written(cx, st, b, ty, sets, at) } else {
               let parts = parts_of_ty.fold(
                 { st: st, parts: [], missing: false },
                 |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, p: RecordPart| {
                   match given.get(p.name) {
                     Some(a) -> {
-                      let h = handed({ st: acc.st, arg: a }, p.rep, at);
+                      let h = represented_as({ st: acc.st, arg: a }, p.representation, at);
                       { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
                     },
                     None -> if !kept.contains(p.name) { { ..acc, missing: true } } else {
-                      match read_in(cx, acc.st, b, lay, p.name, p.ty, p.rep, at) {
+                      match read_field(cx, acc.st, b, lay, p.name, p.ty, p.representation, at) {
                         None -> { ..acc, missing: true },
                         Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
                       }
@@ -428,11 +482,11 @@ pub fn updated(
             }
           },
           None ->
-            unsettled(
-              open_needed(cx, open_needed(cx, st, b.ty), ty),
+            deferred_to_specialisation(
+              note_open_layouts(cx, note_open_layouts(cx, st, b.ty), ty),
               ty,
-              RWord,
-              [{ arg: AVar(b), takes: true }].concat(
+              AsWord,
+              [{ arg: VarOperand(b), takes: true }].concat(
                 read_records(sets.map(|f: { name: Bytes, arg: Arg }| f.arg)),
               ),
               at,
@@ -445,28 +499,28 @@ pub fn updated(
 
 /// `{ ..b, sets }` of type `ty`, `b` the box a record of its layout is held as: the box, or a copy
 /// of it, with each field `sets` names written at its word, laid as the box lays it.
-fn written_over(
+fn box_fields_written(
   cx: Context,
   st: Lowering,
   b: Var,
   ty: Type,
   sets: List<{ name: Bytes, arg: Arg }>,
   at: Span,
-) -> Lowered = {
+) -> LoweredValue = {
   let offsets = field_offsets(cx.setting, ty);
   let written = sets.fold(
     { st: st, sets: [] },
-    |acc: { st: Lowering, sets: List<FieldSet> }, f: { name: Bytes, arg: Arg }| {
+    |acc: { st: Lowering, sets: List<FieldWrite> }, f: { name: Bytes, arg: Arg }| {
       let fty = match field_type(ty, f.name) { Some(t) -> t, None -> unknown_type() };
-      let laid = held_as(cx.setting, fty);
+      let laid = representation_of(cx.setting, fty);
       match offsets.get(f.name) {
-        Some(o) -> if laid == RUnit { acc } else {
-          let h = handed({ st: acc.st, arg: f.arg }, laid, at);
+        Some(o) -> if laid == AsUnit { acc } else {
+          let h = represented_as({ st: acc.st, arg: f.arg }, laid, at);
           { st: h.st, sets: acc.sets.push({ at: o, ty: fty, arg: h.arg }) }
         },
         None -> acc,
       }
     },
   );
-  bound_as(written.st, ty, RWord, Updated({ of: b, sets: written.sets }), at)
+  bound_as(written.st, ty, AsWord, Update({ of: b, sets: written.sets }), at)
 }

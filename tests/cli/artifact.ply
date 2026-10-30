@@ -3,10 +3,10 @@
 //! source runs. A tampered artifact is resealed, so what refuses it is the check under test and not
 //! the digest.
 
-import harness (Spawned, Source, program, project, write, on_disk, spawned, said, stdout, stderr,
-                json_of, at, path, nth, items, str, int, truth, shown, code_of, diagnostic, refused,
-                value_of)
-import compiler.store.plyx (Header, Section, Placed, decode, encode, digest_of, domain,
+import harness (PlyProcess, Source, write_program, write_project, write, on_disk, spawned,
+                all_output, stdout, stderr, json_of, at, path, nth, items, str, int, bool,
+                json_text, code_of, diagnostic, not_ok, value_of)
+import compiler.store.plyx (Header, Section, SectionLocation, decode, encode, digest_of, domain,
                             offset_digest, format)
 import std.bytes (u32_le)
 import std.fs (fs)
@@ -49,20 +49,21 @@ fn put(file: String, b: Bytes) -> Unit / {fs.write_file[cwd], abort.raise} =
   if !fs.write_file[cwd](file, b) { panic("could not write `" ++ file ++ "`") }
 
 /// What `ply build` wrote to `out` for the program in the working directory.
-fn built_to(out: String) -> Bytes / {Spawned, abort.raise} = {
+fn built_to(out: String) -> Bytes / {PlyProcess, abort.raise} = {
   let r = spawned(["build", ".", "-o", out]);
-  assert(r.code == 0, Some(said(r)));
+  assert(r.code == 0, Some(all_output(r)));
   bytes_of(out)
 }
 
-fn built() -> Bytes / {Spawned, abort.raise} = built_to("m.plyx")
+fn built() -> Bytes / {PlyProcess, abort.raise} = built_to("m.plyx")
 
-fn ran(file: String) -> Json / {Spawned, abort.raise} = json_of(spawned(["run", file, "--json"]))
+fn run_report(file: String) -> Json / {PlyProcess, abort.raise} =
+  json_of(spawned(["run", file, "--json"]))
 
 /// `b` written to `file` and run.
-fn ran_bytes(file: String, b: Bytes) -> Json / {Spawned, fs.write_file[cwd], abort.raise} = {
+fn write_and_run(file: String, b: Bytes) -> Json / {PlyProcess, fs.write_file[cwd], abort.raise} = {
   put(file, b);
-  ran(file)
+  run_report(file)
 }
 
 // --- The artifact as the container lays it out --------------------------------
@@ -76,13 +77,13 @@ fn parts_of(b: Bytes) -> Parts / {abort.raise} =
     Ok(o) ->
       {
         head: { frontend: o.frontend, runtime: o.runtime, entry: o.entry },
-        sections: o.sections.map(|p: Placed|
+        sections: o.sections.map(|p: SectionLocation|
           { name: p.name, count: p.count, payload: b.slice(p.at, p.at + p.len) }),
       },
   }
 
 /// Where the container placed each section of `b`.
-fn parts_placed(b: Bytes) -> List<Placed> / {abort.raise} =
+fn section_locations(b: Bytes) -> List<SectionLocation> / {abort.raise} =
   match decode(b) {
     Err(e) -> panic("the artifact does not open: " ++ String::of_bytes_lossy(e.message)),
     Ok(o) -> o.sections,
@@ -90,14 +91,14 @@ fn parts_placed(b: Bytes) -> List<Placed> / {abort.raise} =
 
 /// Laid out and sealed as `ply build` writes one, so a reader checks it as it would a build.
 fn sealed(parts: Parts) -> Bytes / {abort.raise} = {
-  let laid = encode(parts.head, parts.sections);
-  match digest_of(domain(), laid) {
+  let encoded = encode(parts.head, parts.sections);
+  match digest_of(domain(), encoded) {
     None -> panic("a container this short carries no digest"),
     Some(d) ->
       Bytes::concat_all([
-        laid.slice(0, offset_digest()),
+        encoded.slice(0, offset_digest()),
         d,
-        laid.slice(offset_digest() + 32, laid.len()),
+        encoded.slice(offset_digest() + 32, encoded.len()),
       ]),
   }
 }
@@ -108,7 +109,7 @@ fn section(parts: Parts, name: Bytes) -> Section / {abort.raise} =
     [] -> panic("the artifact carries no `" ++ String::of_bytes(name) ++ "` section"),
   }
 
-fn replaced(parts: Parts, s: Section) -> Parts =
+fn with_section(parts: Parts, s: Section) -> Parts =
   { ..parts, sections: parts.sections.map(|x: Section| if x.name == s.name { s } else { x }) }
 
 fn word(b: Bytes, i: Int) -> Int / {abort.raise} =
@@ -119,7 +120,7 @@ type Body = { hash: Bytes, body: Bytes }
 /// Each record is the hash, the body's length, and the body.
 fn bodies_of(parts: Parts) -> List<Body> / {abort.raise} = {
   let s = section(parts, b"bodies");
-  let walked = range(0, s.count).fold(
+  let decoded = range(0, s.count).fold(
     { at: 0, out: [] },
     |acc: { at: Int, out: List<Body> }, _i: Int| {
       let n = word(s.payload, acc.at + 32);
@@ -132,11 +133,11 @@ fn bodies_of(parts: Parts) -> List<Body> / {abort.raise} = {
       }
     },
   );
-  walked.out
+  decoded.out
 }
 
 fn with_bodies(parts: Parts, bodies: List<Body>) -> Parts / {abort.raise} =
-  replaced(parts, {
+  with_section(parts, {
     name: b"bodies",
     count: bodies.len(),
     payload: Bytes::concat_all(
@@ -144,10 +145,10 @@ fn with_bodies(parts: Parts, bodies: List<Body>) -> Parts / {abort.raise} =
     ),
   })
 
-type Named = { name: String, hash: Bytes }
+type NameRecord = { name: String, hash: Bytes }
 
 /// Each record is where its name lies in the string section, the name's length, and the hash.
-fn names_of(parts: Parts) -> List<Named> / {abort.raise} = {
+fn names_of(parts: Parts) -> List<NameRecord> / {abort.raise} = {
   let s = section(parts, b"names");
   let strings = section(parts, b"strings").payload;
   range(0, s.count).map(|i: Int| {
@@ -160,10 +161,10 @@ fn names_of(parts: Parts) -> List<Named> / {abort.raise} = {
 }
 
 /// Each name's text is written once, in record order, as the writer lays the string section out.
-fn with_names(parts: Parts, names: List<Named>) -> Parts / {abort.raise} = {
-  let laid = names.fold(
+fn with_names(parts: Parts, names: List<NameRecord>) -> Parts / {abort.raise} = {
+  let encoded = names.fold(
     { strings: b"", placed: Map::new(), records: [] },
-    |acc: { strings: Bytes, placed: Map<String, Int>, records: List<Bytes> }, named: Named| {
+    |acc: { strings: Bytes, placed: Map<String, Int>, records: List<Bytes> }, named: NameRecord| {
       let known = acc.placed.get(named.name);
       let offset = match known { Some(o) -> o, None -> acc.strings.len() };
       let text = Bytes::of_string(named.name);
@@ -176,20 +177,20 @@ fn with_names(parts: Parts, names: List<Named>) -> Parts / {abort.raise} = {
       }
     },
   );
-  replaced(
-    replaced(parts, {
+  with_section(
+    with_section(parts, {
       name: b"names",
       count: names.len(),
-      payload: Bytes::concat_all(laid.records),
+      payload: Bytes::concat_all(encoded.records),
     }),
-    { name: b"strings", count: laid.strings.len(), payload: laid.strings },
+    { name: b"strings", count: encoded.strings.len(), payload: encoded.strings },
   )
 }
 
 /// Each record is a module's path and its text, each after its length.
 fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
   let s = section(parts, b"closure");
-  let walked = range(0, s.count).fold(
+  let decoded = range(0, s.count).fold(
     { at: 0, out: [] },
     |acc: { at: Int, out: List<Source> }, _i: Int| {
       let path_len = word(s.payload, acc.at);
@@ -204,11 +205,11 @@ fn shipped_files(parts: Parts) -> List<Source> / {abort.raise} = {
       }
     },
   );
-  walked.out
+  decoded.out
 }
 
 fn with_files(parts: Parts, files: List<Source>) -> Parts / {abort.raise} =
-  replaced(parts, {
+  with_section(parts, {
     name: b"closure",
     count: files.len(),
     payload: Bytes::concat_all(
@@ -233,7 +234,7 @@ fn runnable_text(parts: Parts) -> String / {abort.raise} =
 
 // What the tamper tests below rest on: an artifact read back and written again is the artifact.
 test/nondet "an artifact read back section by section and written again is the same bytes" {
-  program(source());
+  write_program(source());
   let b = built();
   let p = parts_of(b);
   assert(sealed(p) == b, Some("resealing moved the bytes"));
@@ -242,14 +243,14 @@ test/nondet "an artifact read back section by section and written again is the s
     shipped_files(p),
   );
   assert(sealed(rewritten) == b, Some("a section read and written back moved the bytes"));
-  assert(truth(at(ran_bytes("again.plyx", sealed(rewritten)), "ok")), None)
+  assert(bool(at(write_and_run("again.plyx", sealed(rewritten)), "ok")), None)
 }
 
 // Where a program was built and what its cache held are not in what was built.
 test/nondet "two builds from two roots are byte-identical" {
-  project([{ path: "cold/m.ply", text: source() }, { path: "warm/m.ply", text: source() }]);
+  write_project([{ path: "cold/m.ply", text: source() }, { path: "warm/m.ply", text: source() }]);
   let warmed = spawned(["test", "warm"]);
-  assert(warmed.code == 0, Some(said(warmed)));
+  assert(warmed.code == 0, Some(all_output(warmed)));
   assert(fs.exists[cwd]("warm/.ply-cache"), Some("the second root's cache should be warm"));
   assert(spawned(["build", "cold", "-o", "cold.plyx"]).code == 0, None);
   assert(spawned(["build", "warm", "-o", "warm.plyx"]).code == 0, None);
@@ -262,18 +263,18 @@ test/nondet "two builds from two roots are byte-identical" {
 
 // Once in this process and once in a `ply` of its own, so neither decides the bytes.
 test/nondet "ply build twice writes the same bytes" {
-  program(source());
+  write_program(source());
   let one = built_to("one.plyx");
   let two = spawned(["build", ".", "-o", "two.plyx"], []);
-  assert(two.code == 0, Some(said(two)));
+  assert(two.code == 0, Some(all_output(two)));
   assert(one == bytes_of("two.plyx"), None)
 }
 
 test/nondet "an artifact carries no test, no law and nothing unreached" {
-  program(source());
+  write_program(source());
   let b = built();
   let p = parts_of(b);
-  let names = names_of(p).map(|n: Named| n.name);
+  let names = names_of(p).map(|n: NameRecord| n.name);
   let listed = String::join(names, ", ");
   assert(
     names.contains("m.main") && names.contains("m.shade") && names.contains("m.Colour"),
@@ -304,10 +305,10 @@ test/nondet "an artifact carries no test, no law and nothing unreached" {
 
 // `std.oid` embeds a table of names beside it, of which only that file spells this one.
 test/nondet "an artifact carries nothing of a data file a shipped module embeds and its program does not reach" {
-  program("import std.oid\n\nfn main() -> Int = oid::arcs(oid::common_name()).len()\n");
+  write_program("import std.oid\n\nfn main() -> Int = oid::arcs(oid::common_name()).len()\n");
   let b = built();
   let p = parts_of(b);
-  let names = names_of(p).map(|n: Named| n.name);
+  let names = names_of(p).map(|n: NameRecord| n.name);
   assert(names.contains("std.oid.arcs"), Some(String::join(names, ", ")));
   let shipped = [String::of_bytes_lossy(b), runnable_text(p)];
   shipped.fold((), |u: Unit, text: String|
@@ -316,12 +317,12 @@ test/nondet "an artifact carries nothing of a data file a shipped module embeds 
 
 // `std.brotli` embeds its dictionary beside it, which its readers reach and its writers do not.
 test/nondet "an artifact of a program that only writes brotli carries no reader and none of the dictionary" {
-  program(
+  write_program(
     "import std.brotli\n\nfn main() -> Int / {abort.raise} =\n  brotli::compress(b\"some bytes, some bytes\", brotli::Fast).len()\n",
   );
   let b = built();
   let p = parts_of(b);
-  let names = names_of(p).map(|n: Named| n.name);
+  let names = names_of(p).map(|n: NameRecord| n.name);
   let listed = String::join(names, ", ");
   assert(names.contains("std.brotli.compress"), Some(listed));
   assert(
@@ -334,13 +335,13 @@ test/nondet "an artifact of a program that only writes brotli carries no reader 
 }
 
 test/nondet "every body is filed under the hash the hash command prints" {
-  program(source());
+  write_program(source());
   let report = json_of(on_disk(["hash", ".", "--json"]));
   let p = parts_of(built());
   let names = names_of(p);
   let bodies = bodies_of(p).map(|b: Body| b.hash.hex_of());
   let checked = items(at(report, "definitions")).fold(0, |n: Int, e: Json|
-    match names.filter(|x: Named| x.name == str(at(e, "name"))) {
+    match names.filter(|x: NameRecord| x.name == str(at(e, "name"))) {
       [filed, ..] -> {
         assert(
           filed.hash.hex_of() == str(at(e, "hash")),
@@ -355,30 +356,30 @@ test/nondet "every body is filed under the hash the hash command prints" {
 }
 
 test/nondet "an artifact runs to the same value as its source" {
-  program(source());
+  write_program(source());
   assert_eq(value_of(spawned(["run", "--json", "m.ply"])), "42");
   let _ = built();
   assert_eq(value_of(spawned(["run", "--json", "m.plyx"])), "42")
 }
 
 test/nondet "a failure in an artifact carries no line number" {
-  program("fn main() -> Int / {abort.raise} = 1 / 0\n");
+  write_program("fn main() -> Int / {abort.raise} = 1 / 0\n");
   let _ = built();
-  let from_source = ran("m.ply");
+  let from_source = run_report("m.ply");
   let d = diagnostic(from_source);
-  assert(int(path(nth(at(d, "labels"), 0), ["start", "line"])) == 1, Some(shown(from_source)));
+  assert(int(path(nth(at(d, "labels"), 0), ["start", "line"])) == 1, Some(json_text(from_source)));
   assert(
     str(at(d, "message")) == "division by zero",
-    Some("the program's own failure, not the seam's: " ++ shown(from_source)),
+    Some("the program's own failure, not the seam's: " ++ json_text(from_source)),
   );
-  let failed = ran("m.plyx");
-  assert(refused(failed), Some(shown(failed)));
-  assert(code_of(failed) == code_of(from_source), Some(shown(failed)));
-  assert(path(nth(at(diagnostic(failed), "labels"), 0), ["start"]) == Null, Some(shown(failed)))
+  let failed = run_report("m.plyx");
+  assert(not_ok(failed), Some(json_text(failed)));
+  assert(code_of(failed) == code_of(from_source), Some(json_text(failed)));
+  assert(path(nth(at(diagnostic(failed), "labels"), 0), ["start"]) == Null, Some(json_text(failed)))
 }
 
 test/nondet "a closure that is not the closure is refused" {
-  program(source());
+  write_program(source());
   let p = parts_of(built());
   let files = shipped_files(p);
   let altered = files.map(|f: Source| { ..f, text: f.text.replace("Blue(20)", "Blue(19)") });
@@ -390,12 +391,12 @@ test/nondet "a closure that is not the closure is refused" {
   [{ what: "altered", files: altered }, { what: "garbled", files: garbled }].fold(
     (),
     |u: Unit, c: { what: String, files: List<Source> }| {
-      let report = ran_bytes("t.plyx", sealed(with_files(p, c.files)));
+      let report = write_and_run("t.plyx", sealed(with_files(p, c.files)));
       assert(
         code_of(report) == "E0443",
         Some(
           "a closure that is not the program must not be believed (" ++ c.what ++ "): "
-            ++ shown(report),
+            ++ json_text(report),
         ),
       )
     },
@@ -404,20 +405,20 @@ test/nondet "a closure that is not the closure is refused" {
 
 // A runnable is held to the artifact around it: one another build wrote is not this program.
 test/nondet "a runnable that is not the artifact's is refused" {
-  program(source());
+  write_program(source());
   let p = parts_of(built());
-  program("fn main() -> Int = 7\n");
+  write_program("fn main() -> Int = 7\n");
   let other = parts_of(built_to("other.plyx"));
-  let report = ran_bytes("t.plyx", sealed(replaced(p, section(other, b"runnable"))));
-  assert(code_of(report) == "E0443", Some(shown(report)))
+  let report = write_and_run("t.plyx", sealed(with_section(p, section(other, b"runnable"))));
+  assert(code_of(report) == "E0443", Some(json_text(report)))
 }
 
 test/nondet "a flipped bit in a body is E0443 naming the definition" {
-  program(source());
+  write_program(source());
   let b = built();
   // The first record is where the container placed the bodies; its payload, past the 32-byte key and
   // length prefix.
-  let record = match parts_placed(b).filter(|s: Placed| s.name == b"bodies") {
+  let record = match section_locations(b).filter(|s: SectionLocation| s.name == b"bodies") {
     [s, ..] -> s.at,
     [] -> panic("the artifact carries no bodies"),
   };
@@ -426,9 +427,9 @@ test/nondet "a flipped bit in a body is E0443 naming the definition" {
     byte_of_int(b.at(record + 36) ^ 0x40),
     b.slice(record + 37, b.len()),
   ]);
-  let report = ran_bytes("bad.plyx", flipped);
-  assert(refused(report), Some(shown(report)));
-  assert(code_of(report) == "E0443", Some(shown(report)));
+  let report = write_and_run("bad.plyx", flipped);
+  assert(not_ok(report), Some(json_text(report)));
+  assert(code_of(report) == "E0443", Some(json_text(report)));
   let message = str(at(diagnostic(report), "message"));
   assert(message.contains("offset " ++ record.to_string()), Some(message));
   let first = match bodies_of(parts_of(b)) {
@@ -439,68 +440,68 @@ test/nondet "a flipped bit in a body is E0443 naming the definition" {
 }
 
 test/nondet "no prefix of an artifact is believed" {
-  program(source());
+  write_program(source());
   let b = built();
   let n = b.len();
   [0, 1, 100, 187, 188, 200, n / 2, n - 1].fold((), |u: Unit, cut: Int| {
-    let report = ran_bytes("t.plyx", b.slice(0, cut));
-    assert(code_of(report) == "E0443", Some("at " ++ cut.to_string() ++ ": " ++ shown(report)))
+    let report = write_and_run("t.plyx", b.slice(0, cut));
+    assert(code_of(report) == "E0443", Some("at " ++ cut.to_string() ++ ": " ++ json_text(report)))
   });
-  assert(truth(at(ran_bytes("t.plyx", b), "ok")), None)
+  assert(bool(at(write_and_run("t.plyx", b), "ok")), None)
 }
 
 test/nondet "removing a body is E0443" {
-  program(source());
+  write_program(source());
   let p = parts_of(built());
-  let victim = match names_of(p).filter(|named: Named| named.name == "m.shade") {
+  let victim = match names_of(p).filter(|named: NameRecord| named.name == "m.shade") {
     [named, ..] -> named.hash,
     [] -> panic("`shade` is in the closure"),
   };
   let without = sealed(
     with_names(
       with_bodies(p, bodies_of(p).filter(|b: Body| b.hash != victim)),
-      names_of(p).filter(|named: Named| named.hash != victim),
+      names_of(p).filter(|named: NameRecord| named.hash != victim),
     ),
   );
   assert(
     match decode(without) { Ok(_) -> true, Err(_) -> false },
     Some("the container still verifies"),
   );
-  let report = ran_bytes("open.plyx", without);
-  assert(code_of(report) == "E0443", Some(shown(report)))
+  let report = write_and_run("open.plyx", without);
+  assert(code_of(report) == "E0443", Some(json_text(report)))
 }
 
 // Rebuild the artifact versus transfer it again: opposite responses, so two codes.
 test/nondet "another compiler or runtime is E0444 and not E0443" {
-  program(source());
+  write_program(source());
   let p = parts_of(built());
   [
     { what: "compiler", head: { ..p.head, frontend: byte_of_int(7).repeat(32) } },
     { what: "runtime", head: { ..p.head, runtime: byte_of_int(7).repeat(32) } },
   ].fold((), |u: Unit, c: { what: String, head: Header }| {
-    let report = ran_bytes("old.plyx", sealed({ ..p, head: c.head }));
-    assert(code_of(report) == "E0444", Some("another " ++ c.what ++ ": " ++ shown(report)))
+    let report = write_and_run("old.plyx", sealed({ ..p, head: c.head }));
+    assert(code_of(report) == "E0444", Some("another " ++ c.what ++ ": " ++ json_text(report)))
   })
 }
 
 test/nondet "a file that is not an artifact says so" {
-  program(source());
-  assert(code_of(ran_bytes("junk.plyx", b"not a program at all")) == "E0443", None)
+  write_program(source());
+  assert(code_of(write_and_run("junk.plyx", b"not a program at all")) == "E0443", None)
 }
 
 test/nondet "the digest is one line and agrees with the build" {
-  program(source());
+  write_program(source());
   let printed = spawned(["build", ".", "--digest"]).out;
   assert(printed.len() == 1, Some(String::join(printed, "\n")));
   let digest = String::join(printed, "").ascii_trim();
   assert(digest.starts_with("b3:") && digest.len() == 15, Some(digest));
   assert(!fs.exists[cwd]("m.plyx"), Some("`--digest` writes no file"));
   let report = json_of(spawned(["build", ".", "-o", "m.plyx", "--json"]));
-  assert(str(at(report, "digest")) == digest, Some(shown(report)))
+  assert(str(at(report, "digest")) == digest, Some(json_text(report)))
 }
 
 test/nondet "the digest moves with the closure and with nothing else" {
-  program(source());
+  write_program(source());
   let before = built();
   [
     {
@@ -524,7 +525,7 @@ test/nondet "the digest moves with the closure and with nothing else" {
 }
 
 test/nondet "diff reports added, changed, dropped and what a change is reached by" {
-  program(source());
+  write_program(source());
   let _ = built_to("old.plyx");
   write(
     "m.ply",
@@ -535,40 +536,40 @@ test/nondet "diff reports added, changed, dropped and what a change is reached b
   );
   let report = json_of(spawned(["build", ".", "--diff", "old.plyx", "--json"]));
   let changed = items(at(report, "changed")).map(str);
-  assert(changed.contains("m.shade"), Some(shown(report)));
+  assert(changed.contains("m.shade"), Some(json_text(report)));
   assert(
     changed.contains("m.main"),
-    Some("changing a callee changes its caller: " ++ shown(report)),
+    Some("changing a callee changes its caller: " ++ json_text(report)),
   );
-  assert(items(at(report, "added")) == [], Some(shown(report)));
-  assert(items(at(report, "dropped")) == [], Some(shown(report)));
+  assert(items(at(report, "added")) == [], Some(json_text(report)));
+  assert(items(at(report, "dropped")) == [], Some(json_text(report)));
   // The reverse closure: every definition that reaches a changed one, and a definition reaches itself.
   let reached = items(at(report, "reached")).map(str);
   changed.fold((), |u: Unit, name: String|
     assert(reached.contains(name), Some(name ++ " does not reach itself")));
-  assert(reached.contains("m.main"), Some(shown(report)));
+  assert(reached.contains("m.main"), Some(json_text(report)));
   assert(!reached.contains("m.Colour"), Some("a type reaches no function"));
-  assert(int(at(report, "artifact_bytes")) > 0, Some(shown(report)))
+  assert(int(at(report, "artifact_bytes")) > 0, Some(json_text(report)))
 }
 
 test/nondet "diff counts an addition and a removal" {
-  program("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
+  write_program("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
   let _ = built_to("old.plyx");
   write("m.ply", "fn other() -> Int = 2\nfn main() -> Int = other()\n");
   let report = json_of(spawned(["build", ".", "--diff", "old.plyx", "--json"]));
-  assert(at(report, "added") == Array([Str("m.other")]), Some(shown(report)));
-  assert(at(report, "dropped") == Array([Str("m.helper")]), Some(shown(report)));
-  assert(at(report, "changed") == Array([Str("m.main")]), Some(shown(report)))
+  assert(at(report, "added") == Array([Str("m.other")]), Some(json_text(report)));
+  assert(at(report, "dropped") == Array([Str("m.helper")]), Some(json_text(report)));
+  assert(at(report, "changed") == Array([Str("m.main")]), Some(json_text(report)))
 }
 
 test/nondet "a rename moves a name and no hash" {
-  program("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
+  write_program("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
   let before = parts_of(built_to("old.plyx"));
   write("m.ply", "fn assistant() -> Int = 1\nfn main() -> Int = assistant()\n");
   let report = json_of(spawned(["build", ".", "--diff", "old.plyx", "--json"]));
-  assert(at(report, "added") == Array([Str("m.assistant")]), Some(shown(report)));
-  assert(at(report, "dropped") == Array([Str("m.helper")]), Some(shown(report)));
-  assert(at(report, "changed") == Array([]), Some(shown(report)));
+  assert(at(report, "added") == Array([Str("m.assistant")]), Some(json_text(report)));
+  assert(at(report, "dropped") == Array([Str("m.helper")]), Some(json_text(report)));
+  assert(at(report, "changed") == Array([]), Some(json_text(report)));
   assert(
     bodies_of(before) == bodies_of(parts_of(built_to("new.plyx"))),
     Some("a rename may not move a body"),
@@ -576,17 +577,17 @@ test/nondet "a rename moves a name and no hash" {
 }
 
 /// The directory built and run, and the value its artifact ran to, which its source runs to too.
-fn runs_as_its_source() -> Json / {Spawned, abort.raise} = {
+fn runs_as_its_source() -> Json / {PlyProcess, abort.raise} = {
   let _ = built_to("app.plyx");
-  let from_source = ran(".");
-  let from_artifact = ran("app.plyx");
-  assert(truth(at(from_source, "ok")), Some(shown(from_source)));
-  assert(at(from_artifact, "value") == at(from_source, "value"), Some(shown(from_artifact)));
+  let from_source = run_report(".");
+  let from_artifact = run_report("app.plyx");
+  assert(bool(at(from_source, "ok")), Some(json_text(from_source)));
+  assert(at(from_artifact, "value") == at(from_source, "value"), Some(json_text(from_artifact)));
   at(from_artifact, "value")
 }
 
 test/nondet "modules sharing a last segment ship and run" {
-  project([
+  write_project([
     { path: "left/util.ply", text: "pub fn one() -> Int = 1\n" },
     { path: "right/util.ply", text: "pub fn two() -> Int = 20\n" },
     {
@@ -600,19 +601,22 @@ test/nondet "modules sharing a last segment ship and run" {
 }
 
 test/nondet "two names for one body ship and run" {
-  program("fn one() -> Int = 1\nfn uno() -> Int = 1\nfn main() -> Int = one() + uno() * 10\n");
+  write_program(
+    "fn one() -> Int = 1\nfn uno() -> Int = 1\nfn main() -> Int = one() + uno() * 10\n",
+  );
   assert(runs_as_its_source() == Str("11"), None);
   let names = names_of(parts_of(bytes_of("app.plyx")));
   let hash = |name: String|
-    names.filter(|named: Named| named.name == name).map(|named: Named| named.hash.hex_of());
-  assert(hash("m.one") != [], Some(String::join(names.map(|named: Named| named.name), ", ")));
+    names.filter(|named: NameRecord| named.name == name).map(|named: NameRecord|
+      named.hash.hex_of());
+  assert(hash("m.one") != [], Some(String::join(names.map(|named: NameRecord| named.name), ", ")));
   assert(hash("m.one") == hash("m.uno"), Some("one body, two names"))
 }
 
 // An effect and a function of one name are two definitions: holding the effect holds nothing the
 // function calls, and the program holds no function of that name.
 test/nondet "an artifact of a program that raises through an effect holds nothing the function of its name calls" {
-  project([
+  write_project([
     {
       path: "gz.ply",
       text:
@@ -642,7 +646,7 @@ test/nondet "an artifact of a program that raises through an effect holds nothin
   ]);
   assert(runs_as_its_source() == Str("2"), None);
   let p = parts_of(bytes_of("app.plyx"));
-  let names = names_of(p).map(|n: Named| n.name);
+  let names = names_of(p).map(|n: NameRecord| n.name);
   let listed = String::join(names, ", ");
   assert(names.contains("gz.read") && names.contains("gz.gz"), Some(listed));
   assert(!names.contains("gz.written"), Some("the function `gz` calls it: " ++ listed));
@@ -653,7 +657,7 @@ test/nondet "an artifact of a program that raises through an effect holds nothin
 
 // `std.gzip` declares `effect gzip` beside `fn gzip`, and its readers raise through the effect.
 test/nondet "an artifact of a program that reads with std.gzip and answers its refusal builds and runs" {
-  program(
+  write_program(
     \\import std.gzip
     \\import std.gzip (gzip)
     \\
@@ -664,7 +668,7 @@ test/nondet "an artifact of a program that reads with std.gzip and answers its r
     \\
   );
   assert(runs_as_its_source() == Str("0"), None);
-  let names = names_of(parts_of(bytes_of("app.plyx"))).map(|n: Named| n.name);
+  let names = names_of(parts_of(bytes_of("app.plyx"))).map(|n: NameRecord| n.name);
   assert(
     names.contains("std.gzip.inflate") && !names.contains("std.gzip.deflate"),
     Some(String::join(names, ", ")),
@@ -674,7 +678,7 @@ test/nondet "an artifact of a program that reads with std.gzip and answers its r
 // Two modules that declare a type alike file one body under two names; which one a definition
 // means is what it references, and a print that did not ask named the other.
 test/nondet "an artifact of a program that names one module's type and passes a literal as another's of the same shape builds and runs" {
-  project([
+  write_project([
     {
       path: "a.ply",
       text: "pub type Limits = new { output: Int, window: Int }\n\npub fn fa(l: Limits) -> Int = l.output + l.window\n",
@@ -700,16 +704,16 @@ test/nondet "an artifact of a program that names one module's type and passes a 
 
 // Run as a process: the binary a build measures is the one that runs it.
 test/nondet "the build prints the artifact's size beside the binary's" {
-  program(source());
+  write_program(source());
   let printed = stdout(spawned(["build", ".", "-o", "m.plyx"], []));
   assert(printed.contains("artifact"), Some(printed));
   assert(printed.contains("binary"), Some(printed));
   let report = json_of(spawned(["build", ".", "-o", "m.plyx", "--json"], []));
-  assert(int(at(report, "format")) == format(), Some(shown(report)));
-  assert(json::get(report, "sources") == None, Some(shown(report)));
+  assert(int(at(report, "format")) == format(), Some(json_text(report)));
+  assert(json::get(report, "sources") == None, Some(json_text(report)));
   let artifact_bytes = int(at(report, "artifact_bytes"));
   let binary_bytes = int(at(report, "binary_bytes"));
-  assert(artifact_bytes == bytes_of("m.plyx").len(), Some(shown(report)));
+  assert(artifact_bytes == bytes_of("m.plyx").len(), Some(json_text(report)));
   assert(
     binary_bytes > artifact_bytes,
     Some(
@@ -721,37 +725,37 @@ test/nondet "the build prints the artifact's size beside the binary's" {
 }
 
 test/nondet "entry names the closure and ambiguity is refused" {
-  project([
+  write_project([
     { path: "a.ply", text: "fn main() -> Int = 1\n" },
     { path: "b.ply", text: "fn main() -> Int = 2\n" },
   ]);
   assert(spawned(["build", "."]).code != 0, None);
   let r = spawned(["build", ".", "--entry", "a.main", "-o", "a.plyx"]);
-  assert(r.code == 0, Some(said(r)));
-  assert(str(at(ran("a.plyx"), "value")) == "1", None)
+  assert(r.code == 0, Some(all_output(r)));
+  assert(str(at(run_report("a.plyx"), "value")) == "1", None)
 }
 
 test/nondet "entry can name something other than main" {
-  program("fn serve() -> Int = 7\nfn main() -> Int = 1\n");
+  write_program("fn serve() -> Int = 7\nfn main() -> Int = 1\n");
   let report = json_of(spawned(["build", ".", "--entry", "serve", "-o", "s.plyx", "--json"]));
-  assert(str(at(report, "entry")) == "m.serve", Some(shown(report)));
-  assert(str(at(ran("s.plyx"), "value")) == "7", None)
+  assert(str(at(report, "entry")) == "m.serve", Some(json_text(report)));
+  assert(str(at(run_report("s.plyx"), "value")) == "7", None)
 }
 
 test/nondet "the default output is named after the module" {
-  program(source());
+  write_program(source());
   assert(spawned(["build", "."]).code == 0, None);
   assert(fs.exists[cwd]("m.plyx"), None)
 }
 
 test/nondet "a program that does not check produces no artifact" {
-  program("fn main() -> Int = true\n");
+  write_program("fn main() -> Int = true\n");
   assert(spawned(["build", ".", "-o", "m.plyx"]).code == 2, None);
   assert(!fs.exists[cwd]("m.plyx"), None)
 }
 
 test/nondet "the output directory is created" {
-  program(source());
+  write_program(source());
   assert(spawned(["build", ".", "-o", "dist/nested/m.plyx"]).code == 0, None);
   assert(fs.exists[cwd]("dist/nested/m.plyx"), None)
 }
@@ -766,36 +770,39 @@ fn service() -> String =
 
 // Each run a `ply` of its own: a run inside a test is bound to no host.
 test/nondet "an artifact keeps the names a host handler is registered against" {
-  program(service());
+  write_program(service());
   let _ = built_to("svc.plyx");
   let from_source = json_of(spawned(["run", "m.ply", "--json"], []));
   let from_artifact = json_of(spawned(["run", "svc.plyx", "--json"], []));
-  assert(truth(at(from_source, "ok")), Some(shown(from_source)));
+  assert(bool(at(from_source, "ok")), Some(json_text(from_source)));
   assert(
-    truth(at(from_artifact, "ok")),
-    Some("the artifact lost the name a handler is registered against: " ++ shown(from_artifact)),
+    bool(at(from_artifact, "ok")),
+    Some(
+      "the artifact lost the name a handler is registered against: " ++ json_text(from_artifact),
+    ),
   );
-  assert(at(from_artifact, "value") == at(from_source, "value"), Some(shown(from_artifact)))
+  assert(at(from_artifact, "value") == at(from_source, "value"), Some(json_text(from_artifact)))
 }
 
 test/nondet "the entry point keeps its program-wide name" {
-  program(source());
+  write_program(source());
   let report = json_of(spawned(["build", ".", "-o", "m.plyx", "--json"]));
-  assert(str(at(report, "entry")) == "m.main", Some(shown(report)));
+  assert(str(at(report, "entry")) == "m.main", Some(json_text(report)));
   let p = parts_of(bytes_of("m.plyx"));
   assert(
-    names_of(p).filter(|named: Named| named.hash == p.head.entry).map(|named: Named| named.name)
+    names_of(p).filter(|named: NameRecord| named.hash == p.head.entry).map(|named: NameRecord|
+        named.name)
       == ["m.main"],
     None,
   );
-  assert(str(at(ran("m.plyx"), "value")) == "42", None)
+  assert(str(at(run_report("m.plyx"), "value")) == "42", None)
 }
 
 test/nondet "an entry point that takes an argument is refused" {
-  program("fn serve(port: Int) -> Int = port\nfn main() -> Int = serve(1)\n");
+  write_program("fn serve(port: Int) -> Int = port\nfn main() -> Int = serve(1)\n");
   let report = json_of(spawned(["build", ".", "--entry", "serve", "--json"]));
-  assert(refused(report), Some(shown(report)));
-  assert(code_of(report) == "E0201", Some(shown(report)));
+  assert(not_ok(report), Some(json_text(report)));
+  assert(code_of(report) == "E0201", Some(json_text(report)));
   assert(!fs.exists[cwd]("m.plyx"), None)
 }
 
@@ -809,21 +816,21 @@ fn ready() -> String =
 
 // Spawned: a run whose root performs `signal` listens on the process it is in.
 test/nondet "an artifact run binds the signal handler a source run binds" {
-  program(ready());
+  write_program(ready());
   let _ = built();
   let source = json_of(spawned(["run", "m.ply", "--trace", "off", "--json"], []));
   let shipped = json_of(spawned(["run", "m.plyx", "--trace", "off", "--json"], []));
-  assert(truth(at(source, "ok")), Some(shown(source)));
-  assert(truth(at(shipped, "ok")), Some(shown(shipped)));
+  assert(bool(at(source, "ok")), Some(json_text(source)));
+  assert(bool(at(shipped, "ok")), Some(json_text(shipped)));
   assert(at(shipped, "value") == at(source, "value"), None);
-  assert(str(at(shipped, "value")) == "200", Some(shown(shipped)));
+  assert(str(at(shipped, "value")) == "200", Some(json_text(shipped)));
   // Reported the same way, so a deployment reads one `shutdown` shape whichever form it shipped.
-  assert(path(shipped, ["shutdown", "requested"]) == json::Bool(false), Some(shown(shipped)));
+  assert(path(shipped, ["shutdown", "requested"]) == json::Bool(false), Some(json_text(shipped)));
   assert(
     path(shipped, ["shutdown", "drain_ms"]) == path(source, ["shutdown", "drain_ms"]),
-    Some(shown(shipped)),
+    Some(json_text(shipped)),
   );
-  assert(int(path(shipped, ["shutdown", "spans_left_open"])) == 0, Some(shown(shipped)))
+  assert(int(path(shipped, ["shutdown", "spans_left_open"])) == 0, Some(json_text(shipped)))
 }
 
 /// A configuration schema, the entry point, and a definition only the schema reaches.
@@ -841,17 +848,17 @@ fn with_schema() -> String =
 
 // The runs are spawned: a configuration is read from the environment of the process it starts in.
 test/nondet "a config schema named at build time is in the artifact and still refuses" {
-  program(with_schema());
+  write_program(with_schema());
   // Without the flag the schema is outside the closure, so naming it at run is a refusal.
   assert(spawned(["build", "-o", "bare.plyx"]).code == 0, None);
   let bare_run = json_of(spawned(["run", "bare.plyx", "--config-schema", "m.spec", "--json"], []));
-  assert(refused(bare_run), Some(shown(bare_run)));
-  assert(code_of(bare_run) == "E0440", Some(shown(bare_run)));
+  assert(not_ok(bare_run), Some(json_text(bare_run)));
+  assert(code_of(bare_run) == "E0440", Some(json_text(bare_run)));
   assert(
     str(at(diagnostic(bare_run), "message")).contains("names no definition in this program"),
     Some(
       "the schema is absent from the artifact, rather than entered and declined: "
-        ++ shown(bare_run),
+        ++ json_text(bare_run),
     ),
   );
   // Named at build time, the schema ships, and the artifact refuses to start on the missing key as
@@ -859,8 +866,8 @@ test/nondet "a config schema named at build time is in the artifact and still re
   let build = stdout(spawned(["build", "--config-schema", "m.spec", "-o", "with.plyx"]));
   assert(build.contains("startup m.spec"), Some(build));
   let missing = json_of(spawned(["run", "with.plyx", "--config-schema", "m.spec", "--json"], []));
-  assert(refused(missing), Some(shown(missing)));
-  assert(code_of(missing) == "E0441", Some(shown(missing)));
+  assert(not_ok(missing), Some(json_text(missing)));
+  assert(code_of(missing) == "E0441", Some(json_text(missing)));
   // And starts once the key is supplied: the schema is applied, not merely present.
   let served = json_of(
     spawned(
@@ -878,31 +885,34 @@ test/nondet "a config schema named at build time is in the artifact and still re
       [],
     ),
   );
-  assert(truth(at(served, "ok")), Some(shown(served)));
+  assert(bool(at(served, "ok")), Some(json_text(served)));
   // The extra definitions are the schema's closure and nothing else.
   let bare = json_of(spawned(["build", "--json", "-o", "b2.plyx"]));
   let schemed = json_of(spawned(["build", "--json", "--config-schema", "m.spec", "-o", "w2.plyx"]));
-  assert(items(at(bare, "startup")) == [], Some(shown(bare)));
-  assert(str(nth(at(schemed, "startup"), 0)) == "m.spec", Some(shown(schemed)));
+  assert(items(at(bare, "startup")) == [], Some(json_text(bare)));
+  assert(str(nth(at(schemed, "startup"), 0)) == "m.spec", Some(json_text(schemed)));
   assert(
     int(at(schemed, "definitions")) > int(at(bare, "definitions")),
-    Some("the schema's closure is in the artifact: " ++ shown(bare) ++ " vs " ++ shown(schemed)),
+    Some(
+      "the schema's closure is in the artifact: " ++ json_text(bare) ++ " vs "
+        ++ json_text(schemed),
+    ),
   );
   assert(
     at(bare, "digest") != at(schemed, "digest"),
     Some("an artifact that carries a schema is a different artifact"),
   );
   // And it is still the closure of its roots: no test, no law, no fixture.
-  let names = names_of(parts_of(bytes_of("w2.plyx"))).map(|n: Named| n.name);
+  let names = names_of(parts_of(bytes_of("w2.plyx"))).map(|n: NameRecord| n.name);
   assert(names.filter(|n: String| n.contains("test")).len() == 0, Some(String::join(names, ", ")))
 }
 
 test/nondet "a build schema that names nothing is refused at build time" {
-  program(with_schema());
+  write_program(with_schema());
   let out = spawned(["build", "--config-schema", "m.absent", "-o", "x.plyx"]);
-  assert(out.code != 0, Some(said(out)));
-  assert(said(out).contains("E0440"), Some(said(out)));
-  assert(said(out).contains("this program has: m.spec"), Some(said(out)));
+  assert(out.code != 0, Some(all_output(out)));
+  assert(all_output(out).contains("E0440"), Some(all_output(out)));
+  assert(all_output(out).contains("this program has: m.spec"), Some(all_output(out)));
   assert(!fs.exists[cwd]("x.plyx"), None)
 }
 
@@ -916,7 +926,7 @@ fn asks_for_cc() -> String =
 
 // `ply run` over an artifact answers from its own `--exec`. Spawned, since the program exits.
 test/nondet "an artifact asks whether its caller bound the label it would start" {
-  program(asks_for_cc());
+  write_program(asks_for_cc());
   let _ = built();
   [{ exec: ["--exec", "cc=/bin/sh"], code: 7 }, { exec: [], code: 9 }].fold(
     (),
@@ -945,12 +955,12 @@ fn spawns_cc() -> String =
 
 // The label is the capability: an artifact starts what its caller bound to it, and nothing else.
 test/nondet "an artifact starts what its caller bound to the label, and refuses a label nothing bound" {
-  program(spawns_cc());
+  write_program(spawns_cc());
   let _ = built();
   let bound = spawned(["run", "m.plyx", "--exec", "cc=/bin/sh"], []);
-  assert(bound.code == 7, Some("the child's own code is what came back:\n" ++ said(bound)));
+  assert(bound.code == 7, Some("the child's own code is what came back:\n" ++ all_output(bound)));
   let unbound = spawned(["run", "m.plyx"], []);
-  assert(unbound.code != 0 && stderr(unbound).contains("E0456"), Some(said(unbound)))
+  assert(unbound.code != 0 && stderr(unbound).contains("E0456"), Some(all_output(unbound)))
 }
 
 /// Opens a span and answers without closing it.
@@ -965,23 +975,23 @@ fn leaves_a_span() -> String =
   \\
 
 test/nondet "an artifact hands back the span its entry left open beside its value" {
-  program(leaves_a_span());
+  write_program(leaves_a_span());
   let _ = built();
   let out = spawned(["run", "m.plyx", "--trace", "off", "--json"], []);
   assert_eq(value_of(out), "3");
-  let warned = shown(at(json_of(out), "diagnostics"));
+  let warned = json_text(at(json_of(out), "diagnostics"));
   assert(
     warned.contains("span was still open") && warned.contains("`order` on `orders`"),
-    Some(said(out)),
+    Some(all_output(out)),
   )
 }
 
 // --- Signing ---------------------------------------------------------------------
 
 test/nondet "a signed artifact runs under --require-signer, and an unsigned or wrongly signed one is E0460" {
-  program(source());
+  write_program(source());
   let made = on_disk(["keygen", "release.key", "--json"]);
-  assert(made.code == 0, Some(said(made)));
+  assert(made.code == 0, Some(all_output(made)));
   assert(on_disk(["keygen", "other.key"]).code == 0, None);
   assert(on_disk(["keygen", "release.key"]).code != 0, Some("a key was written over"));
   let _ = built();
@@ -994,32 +1004,32 @@ test/nondet "a signed artifact runs under --require-signer, and an unsigned or w
       ),
     );
   let unsigned = trusting(["release.key.pub"]);
-  assert(code_of(unsigned) == "E0460", Some(shown(unsigned)));
+  assert(code_of(unsigned) == "E0460", Some(json_text(unsigned)));
 
   let signed = spawned(["build", ".", "-o", "m.plyx", "--sign", "release.key", "--json"]);
-  assert(signed.code == 0, Some(said(signed)));
+  assert(signed.code == 0, Some(all_output(signed)));
   assert_eq(str(at(json_of(signed), "signed_by")), str(at(json_of(made), "key")));
   let ok = trusting(["release.key.pub"]);
-  assert(!refused(ok), Some(shown(ok)));
+  assert(!not_ok(ok), Some(json_text(ok)));
   let elsewhere = trusting(["other.key.pub"]);
-  assert(code_of(elsewhere) == "E0460", Some(shown(elsewhere)));
-  assert(!refused(trusting(["other.key.pub", "release.key.pub"])), None);
+  assert(code_of(elsewhere) == "E0460", Some(json_text(elsewhere)));
+  assert(!not_ok(trusting(["other.key.pub", "release.key.pub"])), None);
   // A secret key is not a public one.
   assert_eq(code_of(trusting(["release.key"])), "E0462");
 
   // The same bytes verify; a build of other sources leaves the signature vouching for bytes it no
   // longer sits beside.
   let verified = spawned(["build", ".", "-o", "m.plyx", "--verify", "--json"]);
-  assert(verified.code == 0, Some(said(verified)));
+  assert(verified.code == 0, Some(all_output(verified)));
   assert_eq(items(at(json_of(verified), "signers")).map(str), [str(at(json_of(made), "key"))]);
   write("m.ply", source().replace("Blue(21)", "Blue(22)"));
   let moved = json_of(spawned(["build", ".", "-o", "m.plyx", "--verify", "--json"]));
   assert(
-    code_of(moved) == "E0461" && shown(moved).contains("these sources build"),
-    Some(shown(moved)),
+    code_of(moved) == "E0461" && json_text(moved).contains("these sources build"),
+    Some(json_text(moved)),
   );
   let _ = built();
   let stale = trusting(["release.key.pub"]);
-  assert(code_of(stale) == "E0460", Some(shown(stale)));
-  assert(shown(stale).contains("vouch for"), Some(shown(stale)))
+  assert(code_of(stale) == "E0460", Some(json_text(stale)));
+  assert(json_text(stale).contains("vouch for"), Some(json_text(stale)))
 }

@@ -8,15 +8,16 @@
 //! writes the front end and their manifest.
 
 import compiler.cc
-import compiler.cc (compilers, memory, toolchain, Memory, Live)
-import compiler.load (Checked, LoadedAnalysis, SourceFile, answers_of, assembled, entry_hash_of,
-                      every_root, prepared)
-import compiler.front.published (entry_front)
-import compiler.store.hash.forms (HashOutput, TheFn, reach)
+import compiler.cc (compilers, memory, toolchain, Memory, LiveObjects)
+import compiler.load (CheckedProgram, LoadedAnalysis, SourceFile, check_results, checked_program,
+                      entry_hash_of, every_root, read_packages)
+import compiler.front.published (entry_header)
+import compiler.store.hash.forms (HashOutput, FunctionNamed, reach)
 import compiler.check.resolve.tables (Diag, Label)
-import compiler.unit (Emission, PlaceTally, shipped, shipped_runtime, answers_store, emitted,
-                      emitter_identity, held, program_key, programs_kept, file_kept, keep_file)
-import compiler.store.kept (Record, kept_records, with_kept)
+import compiler.unit (Emission, LevelTally, shipped, shipped_runtime, results_store, emitted,
+                      emitter_identity, held, program_key, programs_dir, read_cached_file,
+                      write_cached_file)
+import compiler.store.records (Record, record_store, with_record_store)
 import compiler.emit.keys (RootKey, Named, test_key)
 import std.bytes (u64_le)
 import std.fs (fs)
@@ -24,13 +25,13 @@ import std.list
 import std.process (process)
 import std.random (entropy)
 import std.time (time)
-import std.path (below_root)
+import std.path (strip_root)
 
 fn usage() -> String =
   "the builder takes ROOT ENTRY FRONT SOURCES MEMO KEPT PHASES: the program's package at the absolute path ROOT, the definition it enters, where its front end and the manifest of its C, which is kept in the toolchain's cache, are written, where what its modules answered is kept between builds (nothing kept: an empty MEMO), `kept` to keep the emitter's answers in the toolchain's cache (else `fresh`), and `phases` to say what each step took (else `quiet`)"
 
 /// The line and column of byte `at` of `text`, from one.
-fn line_col(text: Bytes, at: Int) -> String / {abort.raise} = {
+fn line_column(text: Bytes, at: Int) -> String / {abort.raise} = {
   let before = text.slice(0, if at > text.len() { text.len() } else { at });
   let lines = before.split(b"\n");
   lines.len().to_string() ++ ":"
@@ -38,22 +39,26 @@ fn line_col(text: Bytes, at: Int) -> String / {abort.raise} = {
 }
 
 /// Where a diagnostic points: its first primary label's file, line and column, when it has one.
-fn place(diag: Diag, files: List<SourceFile>) -> String / {abort.raise} =
+fn location(diag: Diag, files: List<SourceFile>) -> String / {abort.raise} =
   match diag.labels.filter(|label: Label| label.primary) {
     [label, ..] -> match files.at(label.module) {
-      Some(f) -> f.path ++ ":" ++ line_col(f.text, label.start) ++ ": ",
+      Some(f) -> f.path ++ ":" ++ line_column(f.text, label.start) ++ ": ",
       None -> "",
     },
     [] -> "",
   }
 
-fn told(diags: List<Diag>, files: List<SourceFile>) -> Unit / {process.err[proc], abort.raise} =
+fn report_diagnostics(
+  diags: List<Diag>,
+  files: List<SourceFile>,
+) -> Unit / {process.err[proc], abort.raise} =
   diags.fold((), |_: Unit, diag: Diag|
     process.err[proc](
       diag.notes_text.fold(
-        place(diag, files) ++ String::of_bytes_lossy(diag.code) ++ ": "
+        location(diag, files) ++ String::of_bytes_lossy(diag.code) ++ ": "
           ++ String::of_bytes_lossy(diag.message),
-        |told: String, note: Bytes| told ++ "\n  = " ++ String::of_bytes_lossy(note),
+        |report_diagnostics: String, note: Bytes|
+          report_diagnostics ++ "\n  = " ++ String::of_bytes_lossy(note),
       ),
     ))
 
@@ -64,18 +69,18 @@ fn ms(from: Int, to: Int) -> String = Int::to_string(to - from) ++ "ms"
 fn mb(bytes: Int) -> String = Int::to_string(bytes / 1000000) ++ "MB"
 
 /// What a build telling its phases says, after each place, of what its heap holds.
-fn memory_said(m: Memory) -> String = mb(m.live) ++ " live, " ++ mb(m.held) ++ " held"
+fn memory_report(m: Memory) -> String = mb(m.live) ++ " live, " ++ mb(m.held) ++ " held"
 
 /// What a build telling its phases says of the live objects of `entry`'s build once its unit is
 /// emitted and before its C is held: the twenty sorts that take the most bytes.
-fn census_said(entry: String, live: List<Live>) -> List<String> =
-  live.take(20).map(|l: Live|
+fn census_report(entry: String, live: List<LiveObjects>) -> List<String> =
+  live.take(20).map(|l: LiveObjects|
     "phases: " ++ entry ++ " live once emitted: " ++ l.what ++ ": " ++ Int::to_string(l.objects)
       ++ " objects, "
       ++ mb(l.bytes))
 
 /// What a build telling its phases says of place `r.place` of `entry`'s unit as it ends.
-pub fn place_said(entry: String, r: PlaceTally) -> String =
+pub fn level_report(entry: String, r: LevelTally) -> String =
   "phases: " ++ entry ++ " place " ++ Int::to_string(r.place) ++ ": " ++ Int::to_string(r.roots)
     ++ " roots, "
     ++ Int::to_string(r.kept)
@@ -88,19 +93,19 @@ pub fn place_said(entry: String, r: PlaceTally) -> String =
 
 /// What a build made: the front end the runtime reads and the manifest of the unit's C, whose parts
 /// the toolchain's cache keeps.
-type Made = { front: Bytes, sources: Bytes }
+type BuildOutput = { front: Bytes, sources: Bytes }
 
 /// `made` as one value kept between builds: the front end's length, the front end, the manifest.
-fn packed(made: Made) -> Bytes =
+fn encoded_output(made: BuildOutput) -> Bytes =
   Bytes::concat_all([u64_le(made.front.len()), made.front, made.sources])
 
-/// What `packed` kept, while the cache still holds every part of its C.
-fn unpacked(bytes: Bytes) -> Option<Made> / {toolchain.read, abort.raise} =
+/// What `encoded_output` kept, while the cache still holds every part of its C.
+fn decoded_output(bytes: Bytes) -> Option<BuildOutput> / {toolchain.read, abort.raise} =
   match bytes.u64_at(0) {
     Some(n) -> if 8 + n > bytes.len() { None } else {
       let made = { front: bytes.slice(8, 8 + n), sources: bytes.slice(8 + n, bytes.len()) };
-      match cc::manifested(made.sources) {
-        Some(sources) -> if cc::holds_sources(sources) { Some(made) } else { None },
+      match cc::parse_manifest(made.sources) {
+        Some(sources) -> if cc::sources_cached(sources) { Some(made) } else { None },
         None -> None,
       }
     },
@@ -109,18 +114,18 @@ fn unpacked(bytes: Bytes) -> Option<Made> / {toolchain.read, abort.raise} =
 
 /// What a build reaches: the program's sources and the stores below the filesystem's root, the
 /// runtime it runs on, which it emits for, the compilers and their cache, and its own streams.
-pub effect set Builds = {shipped.answer, shipped.names, shipped.module, shipped.digests, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.entered, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, memory.read, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
+pub effect set Builds = {shipped.read_pack, shipped.names, shipped.module, shipped.digests, shipped.report_reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.run_root, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, memory.read, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
 
 /// `made` written where its front end and its manifest go: 0 when both were, 2 when one could not be.
-fn written(
-  made: Made,
-  front: String,
+fn write_output(
+  made: BuildOutput,
+  definitions_path: String,
   sources: String,
 ) -> Int / {fs.write[abs], process.err[proc], abort.raise} =
-  if fs.write_file[abs](below_root(front), made.front)
-      && fs.write_file[abs](below_root(sources), made.sources) { 0 } else {
+  if fs.write_file[abs](strip_root(definitions_path), made.front)
+      && fs.write_file[abs](strip_root(sources), made.sources) { 0 } else {
     process.err[proc](
-      "what was built could not be written to `" ++ front ++ "` and `" ++ sources ++ "`",
+      "what was built could not be written to `" ++ definitions_path ++ "` and `" ++ sources ++ "`",
     );
     2
   }
@@ -128,26 +133,26 @@ fn written(
 /// The program at `root` built: 0 when its front end and its C's manifest were written, 1 when the program
 /// was refused, and 2 when what was built could not be written. `memo` is where what its modules
 /// answered is kept between builds (none where it is empty).
-pub fn built(
+pub fn build_program(
   root: String,
   entry: String,
-  front: String,
+  definitions_path: String,
   sources: String,
   memo: String,
-  kept: Bool,
+  cache_results: Bool,
   phases: Bool,
 ) -> Int / {Builds} = {
   let started = time.elapsed_ms();
   let definitions = shipped.definitions();
   let cache = toolchain.cache();
-  let programs = below_root(cache ++ "/" ++ programs_kept());
-  match prepared[abs](below_root(root)) {
+  let programs = strip_root(cache ++ "/" ++ programs_dir());
+  match read_packages[abs](strip_root(root)) {
     Err(u) -> {
-      told(u.diags, u.files);
+      report_diagnostics(u.diags, u.files);
       1
     },
     Ok(p) -> {
-      let store = if memo == "" { "" } else { below_root(memo) };
+      let store = if memo == "" { "" } else { strip_root(memo) };
       // A program is the definition it enters and all that reaches, so what was built under its
       // entry's hash is the program.
       let key = match entry_hash_of[abs, abs](p, store, Bytes::of_string(entry)) {
@@ -155,13 +160,16 @@ pub fn built(
         None -> None,
       };
       let reading = time.elapsed_ms();
-      let had = match key {
-        Some(k) -> match file_kept[abs](programs, k) { Some(b) -> unpacked(b), None -> None },
+      let cached = match key {
+        Some(k) -> match read_cached_file[abs](programs, k) {
+          Some(b) -> decoded_output(b),
+          None -> None,
+        },
         None -> None,
       };
-      match had {
+      match cached {
         Some(made) -> {
-          let wrote = written(made, front, sources);
+          let wrote = write_output(made, definitions_path, sources);
           if phases {
             process.err[proc](
               "phases: " ++ entry ++ " answered " ++ ms(started, reading)
@@ -170,12 +178,12 @@ pub fn built(
           };
           wrote
         },
-        None -> match assembled[abs](p, answers_of[abs, abs](p, store), false) {
+        None -> match checked_program[abs](p, check_results[abs, abs](p, store), false) {
           Err(u) -> {
-            told(u.diags, u.files);
+            report_diagnostics(u.diags, u.files);
             1
           },
-          Ok(checked) -> match entry_front(checked.front.dump, Bytes::of_string(entry)) {
+          Ok(checked) -> match entry_header(checked.front.dump, Bytes::of_string(entry)) {
             None -> {
               process.err[proc]("the program defines no `" ++ entry ++ "` to enter");
               1
@@ -183,33 +191,35 @@ pub fn built(
             Some(carried) -> {
               let f = checked.front;
               let checking = time.elapsed_ms();
-              let offered = built_roots(checked.front, checked.hashes, Bytes::of_string(entry));
+              let offered = build_roots(checked.front, checked.hashes, Bytes::of_string(entry));
               let places = if phases {
                 Some({
                   now: || time.elapsed_ms(),
-                  told: |r: PlaceTally|
-                    process.err[proc](place_said(entry, r) ++ ", " ++ memory_said(memory.heap())),
+                  told: |r: LevelTally|
+                    process.err[proc](
+                      level_report(entry, r) ++ ", " ++ memory_report(memory.heap()),
+                    ),
                 })
               } else { None };
-              let made_unit = if kept {
-                with_kept[abs, ans](
-                  answers_store(
-                    below_root(cache ++ "/bodies"),
+              let made_unit = if cache_results {
+                with_record_store[abs, ans](
+                  results_store(
+                    strip_root(cache ++ "/bodies"),
                     shipped_runtime(),
                     emitter_identity(definitions),
                   ),
                   ||
-                    unit_made(
+                    emit_unit(
                       checked,
                       Bytes::of_string(entry),
                       offered,
                       places,
-                      |k: Bytes| kept_records.get[ans](k),
-                      |rs: List<Record>| kept_records.put[ans](rs),
+                      |k: Bytes| record_store.get[ans](k),
+                      |rs: List<Record>| record_store.put[ans](rs),
                     ),
                 )
               } else {
-                unit_made(
+                emit_unit(
                   checked,
                   Bytes::of_string(entry),
                   offered,
@@ -220,18 +230,20 @@ pub fn built(
               };
               let emitting = time.elapsed_ms();
               if phases {
-                census_said(entry, memory.census()).fold((), |_: Unit, line: String|
+                census_report(entry, memory.census()).fold((), |_: Unit, line: String|
                   process.err[proc](line))
               };
               match held(f.dump, made_unit) {
-                Err(diags) -> stopped(Unheld(diags), f.files),
-                Ok(unit) -> match cc::kept(cc::split(unit)) {
-                  Err(why) -> stopped(Unbuilt(why), f.files),
+                Err(diags) -> report_failure(UnitRefused(diags), f.files),
+                Ok(unit) -> match cc::cache_sources(cc::split(unit)) {
+                  Err(why) -> report_failure(CompileFailed(why), f.files),
                   Ok(kept_sources) -> {
                     let made = { front: carried, sources: cc::manifest(kept_sources) };
-                    let wrote = written(made, front, sources);
+                    let wrote = write_output(made, definitions_path, sources);
                     match key {
-                      Some(k) -> if wrote == 0 { keep_file[abs](programs, k, packed(made)) },
+                      Some(k) -> if wrote == 0 {
+                        write_cached_file[abs](programs, k, encoded_output(made))
+                      },
                       None -> (),
                     };
                     if phases {
@@ -258,12 +270,12 @@ pub fn built(
 
 /// The roots a build of `entry` offers: each definition the definition it enters reaches. A built
 /// program never runs the rest: no test, law or clause, and no definition only those reach.
-pub fn built_roots(
-  front: LoadedAnalysis,
+pub fn build_roots(
+  definitions_path: LoadedAnalysis,
   hashes: HashOutput,
   entry: Bytes,
 ) -> List<RootKey> / {abort.raise} =
-  reached_roots(every_root(front), reach(hashes, [TheFn(entry)]).fns, entry)
+  reached_roots(every_root(definitions_path), reach(hashes, [FunctionNamed(entry)]).fns, entry)
 
 /// The definitions among `every` that `reached` holds or `entry` names.
 fn reached_roots(every: List<RootKey>, reached: Map<Bytes, Bool>, entry: Bytes) -> List<RootKey> =
@@ -278,17 +290,20 @@ test "a build offers what its entry reaches, never a test, law or clause" {
 }
 
 /// Why a build stopped before its C was written: the unit it held was refused, or its C did not build.
-type Stop = | Unheld(List<Diag>) | Unbuilt(String)
+type BuildFailure = | UnitRefused(List<Diag>) | CompileFailed(String)
 
 /// What a build stopped by `s` says, and the code it exits with: 1 for a refused unit, 2 for C that
 /// did not build.
-fn stopped(s: Stop, files: List<SourceFile>) -> Int / {process.err[proc], abort.raise} =
+fn report_failure(
+  s: BuildFailure,
+  files: List<SourceFile>,
+) -> Int / {process.err[proc], abort.raise} =
   match s {
-    Unheld(diags) -> {
-      told(diags, files);
+    UnitRefused(diags) -> {
+      report_diagnostics(diags, files);
       1
     },
-    Unbuilt(why) -> {
+    CompileFailed(why) -> {
       process.err[proc](why);
       2
     },
@@ -296,11 +311,11 @@ fn stopped(s: Stop, files: List<SourceFile>) -> Int / {process.err[proc], abort.
 
 /// The unit over `offered`, entered at `entry` alone, the emitter's answers read through `read` and
 /// kept through `keep`, each place it walks told to `places`.
-fn unit_made<| e>(
-  checked: Checked,
+fn emit_unit<| e>(
+  checked: CheckedProgram,
   entry: Bytes,
   offered: List<RootKey>,
-  places: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+  places: Option<{ now: () -> Int / e, told: (LevelTally) -> Unit / e }>,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
 ) -> Result<Emission, Bytes> / {shipped.runtime, abort.raise | e} = {
@@ -320,9 +335,17 @@ fn unit_made<| e>(
 
 pub fn main() -> Unit / {Builds, process.args[proc], process.exit[proc]} =
   match process.args[proc]() {
-    [root, entry, front, sources, memo, kept, phases] ->
+    [root, entry, definitions_path, sources, memo, cache_results, phases] ->
       process.exit[proc](
-        built(root, entry, front, sources, memo, kept == "kept", phases == "phases"),
+        build_program(
+          root,
+          entry,
+          definitions_path,
+          sources,
+          memo,
+          cache_results == "kept",
+          phases == "phases",
+        ),
       ),
     _ -> {
       process.err[proc](usage());

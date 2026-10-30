@@ -4,8 +4,9 @@
 import compiler.syntax.parsing (Span, span_bin, dummy_span)
 import std.bin
 import compiler.syntax.type_syntax (TypeExpr)
-import compiler.syntax.exprs (Expr, ELambda, Param, expr_span, prelude_module, expr_nodes_folded)
-import compiler.syntax.items (Module, SpecClause, Derived, parse, is_pub, schema_of)
+import compiler.syntax.exprs (Expr, LambdaExpression, Param, expr_span, prelude_module,
+                              expr_nodes_folded)
+import compiler.syntax.items (Module, SpecClause, DeriveOrigin, parse, is_pub, schema_of)
 import compiler.expand.rewrite (expand)
 import compiler.check.resolve.tables (Source, Diag, label_at, diag_bin)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules, dump_diags)
@@ -19,22 +20,24 @@ import std.string
 import compiler.check.infer.checker (MemberSite)
 import compiler.store.hash.graph (NodeEffect, NodeFn, NodeType, Node, TestNode, LawNode, Index,
                                   owner_type)
-import compiler.store.hash.encoding (hex, Choice, CallSite, Found, Pick, Waiting)
+import compiler.store.hash.encoding (hex, Choice, CallSite, Known, CallResolution, Pending)
 import compiler.store.hash.template (called_at, choice_at, test_template, law_template,
                                      spec_template, type_template, new_encoder)
 import compiler.store.hash.fill (references, type_references)
-import compiler.store.hash.forms (First, build_index, listed_refs, member_hash, framed_picks,
-                                  open_picks_bin, HashOutput, Refs, solo_body, member_body, Shapes,
-                                  shapes_of, over_of, NodeRef, Fixed, FixedTest, FixedLaw, Fixing,
-                                  no_fixing, hashed_over, contract_of, module_forms, kept_forms,
-                                  chosen_in, chosen_forms, joined_forms, hashed_forms, fixed_nodes,
-                                  fixing_of, is_decl, pin_key, skeleton_of, assemble, walked,
-                                  TheDecl, TheFn, TheItem, Reach, reach, closure_of,
-                                  reached_functions, listing_reach, named_in, naming, reaching,
-                                  Closed, held_by, by_name, of_key, module_record,
-                                  module_record_bin, record_digest, recorded_graph, recorded_reach,
-                                  recorded_hashes, Reached)
-import compiler.store.hash.printed (envelope, picks_of, Printed, Unprintable, print_bodies)
+import compiler.store.hash.forms (FirstPass, build_index, listed_refs, member_hash,
+                                  encoded_resolutions, pending_resolutions_bin, HashOutput, Refs,
+                                  single_body, member_body, HashInput, hash_input, hash_context,
+                                  NodeRef, CachedNode, CachedTest, CachedLaw, CachedHashes,
+                                  no_cached_hashes, hash_all, contract_of, module_forms,
+                                  filtered_forms, module_selection, selection_forms, joined_forms,
+                                  hash_forms, cached_nodes, cached_hashes_of, is_decl,
+                                  definition_key, hash_layout, assemble, walked, DeclarationNamed,
+                                  FunctionNamed, ItemKeyed, ReachableNames, reach, closure_of,
+                                  reached_functions, listing_reach, references_in, find_referrers,
+                                  keys_reaching, ClosureEntry, build_closure, by_name, of_key,
+                                  module_record, module_record_bin, record_digest, recorded_graph,
+                                  recorded_reach, recorded_hashes, ReachableHashes)
+import compiler.store.hash.printer (envelope, picks_of, Printed, Unprintable, print_bodies)
 
 // --- The hash table ----------------------------------------------------------------------
 
@@ -68,24 +71,25 @@ pub fn body_component(body: Bytes) -> Option<{ id: Bytes, members: List<Bytes> }
     },
   }
 
-/// `body` with each call on a value its hashing left pending written as `chose`, what its check
+/// `body` with each call on a value its hashing left pending written as `resolved_calls`, what its check
 /// found of each call by `CallSite`, says: the body hashing after the check stores. Any other body
 /// is itself.
-pub fn checked_body(body: Bytes, chose: Map<CallSite, Choice>) -> Bytes / {abort.raise} = {
+pub fn checked_body(body: Bytes, resolved_calls: Map<CallSite, Choice>) -> Bytes / {abort.raise} = {
   let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
   if kind != 2 && kind != 3 { body } else {
     let from = if kind == 2 { 1 } else { 5 };
     let n = match body.u32_at(from) { Some(x) -> x, None -> panic("a malformed body") };
-    let picks = match bin::decode(body.slice(from + 4, from + 4 + n), open_picks_bin()) {
+    let picks = match bin::decode(body.slice(from + 4, from + 4 + n), pending_resolutions_bin()) {
       Ok(p) -> p,
       Err(_) -> panic("a malformed body"),
     };
     Bytes::concat_all([
       byte_of_int(kind - 2),
       body.slice(1, from),
-      framed_picks(
-        picks.map(|member: List<Pick>|
-          member.map(|p: Pick| match p { Found(c) -> c, Waiting(site) -> choice_at(chose, site) })),
+      encoded_resolutions(
+        picks.map(|member: List<CallResolution>|
+          member.map(|p: CallResolution|
+            match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) })),
       ),
       body.slice(from + 4 + n, body.len()),
     ])
@@ -102,16 +106,16 @@ pub fn checked_hashes(
   unread: Map<Bytes, Bool>,
   unread_tests: Map<Bytes, Bool>,
 ) -> HashOutput / {abort.raise} = {
-  let chose = called_at(sites);
+  let resolved_calls = called_at(sites);
   {
     ..hashes,
     bodies: hashes.bodies.map(|b: { name: Bytes, body: Bytes }|
       if unread.contains(b.name) { b }
-      else { { name: b.name, body: checked_body(b.body, chose) } }),
+      else { { name: b.name, body: checked_body(b.body, resolved_calls) } }),
     test_bodies: hashes.test_bodies.fold(
       Map::new(),
       |acc: Map<Bytes, Bytes>, k: Bytes, b: Bytes|
-        acc.insert(k, if unread_tests.contains(k) { b } else { checked_body(b, chose) }),
+        acc.insert(k, if unread_tests.contains(k) { b } else { checked_body(b, resolved_calls) }),
     ),
   }
 }
@@ -196,45 +200,45 @@ fn digest_keyed(e: { key: Bytes, value: Bytes }) -> Bytes =
 // --- What hashing reads of a program ----------------------------------------------------------
 
 /// Every node of `index` with nothing known.
-fn first_pass(index: Index) -> List<First> / {abort.raise} =
-  shapes_of(index, [], Map::new(), no_fixing()).first
+fn first_pass(index: Index) -> List<FirstPass> / {abort.raise} =
+  hash_input(index, [], Map::new(), no_cached_hashes()).first
 
 /// `index` hashed with each node, test and law `fixing` holds read as its earlier run fixed it,
 /// its modules in `packages`; and what each node references with nothing known.
-fn hashed_whole(
+fn hash_whole_index(
   index: Index,
-  fixing: Fixing,
+  fixing: CachedHashes,
   packages: List<Int>,
-) -> { hashes: HashOutput, first: List<First> } / {abort.raise} = {
+) -> { hashes: HashOutput, first: List<FirstPass> } / {abort.raise} = {
   let keys = node_keys(index);
-  let held = fixing.nodes.fold(Map::new(), |acc: Map<Int, Fixed>, f: Fixed|
-    match keys.get(pin_key(f.name, f.decl)) { Some(v) -> acc.insert(v, f), None -> acc });
-  let shaped = shapes_of(index, packages, fixed_edges(index, fixing.nodes), fixing);
-  let out = hashed_over(shaped.shapes, shaped.first, held, fixing);
-  { hashes: assemble(skeleton_of(index), out.graph.edges, out.hashed), first: shaped.first }
+  let held = fixing.nodes.fold(Map::new(), |acc: Map<Int, CachedNode>, f: CachedNode|
+    match keys.get(definition_key(f.name, f.decl)) { Some(v) -> acc.insert(v, f), None -> acc });
+  let shaped = hash_input(index, packages, cached_edges(index, fixing.nodes), fixing);
+  let out = hash_all(shaped.shapes, shaped.first, held, fixing);
+  { hashes: assemble(hash_layout(index), out.graph.edges, out.hashed), first: shaped.first }
 }
 
 pub fn hash_index(index: Index) -> HashOutput / {abort.raise} =
-  hashed_whole(index, no_fixing(), []).hashes
+  hash_whole_index(index, no_cached_hashes(), []).hashes
 
 fn node_keys(index: Index) -> Map<Bytes, Int> / {abort.raise} =
   range(0, index.nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int| {
     let node = index.nodes.get(v);
-    acc.insert(pin_key(node.name, is_decl(node)), v)
+    acc.insert(definition_key(node.name, is_decl(node)), v)
   })
 
 /// What each fixed node references, by index, as its run fixed it: a node whose body is not read
 /// here references nothing of its own.
-fn fixed_edges(index: Index, fixed: List<Fixed>) -> Map<Int, List<Int>> / {abort.raise} = {
+fn cached_edges(index: Index, fixed: List<CachedNode>) -> Map<Int, List<Int>> / {abort.raise} = {
   let keys = node_keys(index);
-  fixed.fold(Map::new(), |acc: Map<Int, List<Int>>, f: Fixed|
-    match keys.get(pin_key(f.name, f.decl)) {
+  fixed.fold(Map::new(), |acc: Map<Int, List<Int>>, f: CachedNode|
+    match keys.get(definition_key(f.name, f.decl)) {
       None -> acc,
       Some(v) ->
         acc.insert(
           v,
           f.edges.fold([], |es: List<Int>, r: NodeRef|
-            match keys.get(pin_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es }),
+            match keys.get(definition_key(r.name, r.decl)) { Some(w) -> es.push(w), None -> es }),
         ),
     })
 }
@@ -244,17 +248,17 @@ fn fixed_edges(index: Index, fixed: List<Fixed>) -> Map<Int, List<Int>> / {abort
 /// reported unused.
 pub fn hashed_and_unused(
   index: Index,
-  fixed: Fixing,
+  fixed: CachedHashes,
   packages: List<Int>,
 ) -> { hashes: HashOutput, unused: List<Diag>, uses: List<UseNode> } / {abort.raise} = {
-  let whole = hashed_whole(index, fixed, packages);
-  let named = fixed.nodes.fold(Map::new(), |acc: Map<Bytes, Bool>, f: Fixed|
-    acc.insert(pin_key(f.name, f.decl), true));
+  let whole = hash_whole_index(index, fixed, packages);
+  let named = fixed.nodes.fold(Map::new(), |acc: Map<Bytes, Bool>, f: CachedNode|
+    acc.insert(definition_key(f.name, f.decl), true));
   if index.nodes.fold(true, |all: Bool, node: Node|
-      all && named.contains(pin_key(node.name, is_decl(node)))) {
-    let tested = fixed.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: FixedTest|
+      all && named.contains(definition_key(node.name, is_decl(node)))) {
+    let tested = fixed.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: CachedTest|
       acc.insert(t.key, true));
-    let lawed = fixed.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: FixedLaw|
+    let lawed = fixed.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: CachedLaw|
       acc.insert(l.key, true));
     let tests = index.tests.filter(|t: TestNode| !tested.contains(t.key));
     let laws = index.laws.filter(|l: LawNode| !lawed.contains(l.key));
@@ -276,7 +280,7 @@ pub fn hashed_and_unused(
     {
       hashes: whole.hashes,
       unused: unused_over(index, edges, fixed.nodes, tests.concat(laws)),
-      uses: use_nodes(index, edges, held_of(index, fixed.nodes), tests, laws),
+      uses: use_nodes(index, edges, cached_node_indexes(index, fixed.nodes), tests, laws),
     }
   }
 }
@@ -289,9 +293,9 @@ pub type Contract = { name: Bytes, decl: Bool, hash: Bytes }
 
 fn is_public(node: Node) -> Bool =
   match node.body {
-    NodeFn(d) -> is_pub(d.vis),
-    NodeType(d) -> is_pub(d.vis),
-    NodeEffect(d) -> is_pub(d.vis),
+    NodeFn(d) -> is_pub(d.visibility),
+    NodeType(d) -> is_pub(d.visibility),
+    NodeEffect(d) -> is_pub(d.visibility),
   }
 
 /// Every public definition and declaration of the modules `mine` names, as another package reads it.
@@ -303,9 +307,12 @@ pub fn public_contracts(
   let keys = node_keys(index);
   let named = |xs: List<{ name: Bytes, hash: Bytes }>, decl: Bool, into: Map<Int, Bytes>|
     xs.fold(into, |acc: Map<Int, Bytes>, x: { name: Bytes, hash: Bytes }|
-      match keys.get(pin_key(x.name, decl)) { Some(v) -> acc.insert(v, x.hash), None -> acc });
+      match keys.get(definition_key(x.name, decl)) {
+        Some(v) -> acc.insert(v, x.hash),
+        None -> acc,
+      });
   let hashes = named(h.decls, true, named(h.defs, false, Map::new()));
-  let over = over_of(index);
+  let over = hash_context(index);
   range(0, index.nodes.len()).fold([], |acc: List<Contract>, v: Int| {
     let node = index.nodes.get(v);
     if !is_public(node) || !mine(index.mods.get(node.module).name) { acc } else {
@@ -324,7 +331,7 @@ pub fn public_contracts(
 // A spec clause is reached with its owner.
 
 /// A fixed node is never reported: its own package's check answered for it.
-pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> / {abort.raise} =
+pub fn unused(index: Index, fixed: List<CachedNode> = []) -> List<Diag> / {abort.raise} =
   unused_over(
     index,
     node_edges_of(index, first_pass(index)),
@@ -335,24 +342,24 @@ pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> / {abort.rais
   )
 
 /// Each node of `index` `first` normalized, by what the walk for what nothing uses leads to from it.
-fn node_edges_of(index: Index, first: List<First>) -> List<List<Int>> / {abort.raise} =
+fn node_edges_of(index: Index, first: List<FirstPass>) -> List<List<Int>> / {abort.raise} =
   range(0, index.nodes.len()).map(|v: Int|
     node_edges(index, index.nodes.get(v), first.get(v).references))
 
 /// The nodes of `index` that `fixed` holds.
-fn held_of(index: Index, fixed: List<Fixed>) -> Map<Int, Bool> / {abort.raise} = {
+fn cached_node_indexes(index: Index, fixed: List<CachedNode>) -> Map<Int, Bool> / {abort.raise} = {
   let keys = node_keys(index);
-  fixed.fold(Map::new(), |acc: Map<Int, Bool>, f: Fixed|
-    match keys.get(pin_key(f.name, f.decl)) { Some(v) -> acc.insert(v, true), None -> acc })
+  fixed.fold(Map::new(), |acc: Map<Int, Bool>, f: CachedNode|
+    match keys.get(definition_key(f.name, f.decl)) { Some(v) -> acc.insert(v, true), None -> acc })
 }
 
 fn unused_over(
   index: Index,
   edges: List<List<Int>>,
-  fixed: List<Fixed>,
+  fixed: List<CachedNode>,
   item_roots: List<List<Int>>,
 ) -> List<Diag> / {abort.raise} = {
-  let held = held_of(index, fixed);
+  let held = cached_node_indexes(index, fixed);
   let n = index.nodes.len();
   let own = range(0, n).filter(|v: Int| is_root(index, index.nodes.get(v)));
   let roots = item_roots.fold(own, |acc: List<Int>, rs: List<Int>| acc.concat(rs));
@@ -363,7 +370,7 @@ fn unused_over(
 }
 
 /// A node, a test or a law as the walk for what nothing uses meets it: where it stands, whether the
-/// walk starts at it, the nodes it leads to, each as [`pin_key`] files it, and, for a node, the
+/// walk starts at it, the nodes it leads to, each as [`definition_key`] files it, and, for a node, the
 /// warning it is given where nothing reaches it.
 pub type UseNode = {
   key: Bytes,
@@ -388,7 +395,7 @@ fn use_nodes(
   tests: List<List<Int>>,
   laws: List<List<Int>>,
 ) -> List<UseNode> / {abort.raise} = {
-  let keys = index.nodes.map(|node: Node| pin_key(node.name, is_decl(node)));
+  let keys = index.nodes.map(|node: Node| definition_key(node.name, is_decl(node)));
   range(0, index.nodes.len()).fold([], |acc: List<UseNode>, v: Int|
     if held.contains(v) { acc } else {
       let node = index.nodes.get(v);
@@ -417,7 +424,7 @@ fn item_uses(
   let named = |vs: List<Int>|
     vs.map(|v: Int| {
       let node = index.nodes.get(v);
-      pin_key(node.name, is_decl(node))
+      definition_key(node.name, is_decl(node))
     });
   let item = |module: Int, span: Span, leads: List<Int>|
     { key: b"", module: module, span: span, root: true, leads: named(leads), unused: None };
@@ -518,22 +525,25 @@ fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> / {abort.
 /// `out` with the return type each lambda in `e` writes, in the order they are written.
 fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
   expr_nodes_folded(e, out, |acc: List<TypeExpr>, x: Expr|
-    match x { ELambda(l) -> match l.ret { Some(t) -> acc.push(t), None -> acc }, _ -> acc })
+    match x {
+      LambdaExpression(l) -> match l.ret { Some(t) -> acc.push(t), None -> acc },
+      _ -> acc,
+    })
 
 /// A schema's guard is a root, so a schema nothing instantiates is reported once, by its own name.
 fn is_root(index: Index, node: Node) -> Bool / {abort.raise} =
   node.simple.starts_with(b"_")
     || (match node.body {
       NodeFn(d) ->
-        is_pub(d.vis) || node.simple == b"main"
-          || index.mods.get(node.module).derived.fold(false, |b: Bool, x: Derived|
+        is_pub(d.visibility) || node.simple == b"main"
+          || index.mods.get(node.module).derived.fold(false, |b: Bool, x: DeriveOrigin|
             b || x.span == d.span)
           || (match schema_of(index.mods.get(node.module).module, d) {
             Some(schema) -> schema.name.name != node.simple,
             None -> false,
           }),
-      NodeType(d) -> is_pub(d.vis),
-      NodeEffect(d) -> is_pub(d.vis),
+      NodeType(d) -> is_pub(d.visibility),
+      NodeEffect(d) -> is_pub(d.visibility),
     })
 
 fn never_used(index: Index, node: Node) -> Diag / {abort.raise} = {
@@ -616,7 +626,7 @@ fn dump_hashes(out: HashOutput) -> Bytes / {abort.raise} =
     ),
   ])
 
-type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
+type Parsed = { name: Bytes, module: Module, derived: List<DeriveOrigin>, diags: List<Diag> }
 
 /// The driver's order: parse with the rewrites, expand every `derive`, resolve, hash.
 pub fn hash_dump(sources: List<Source>) -> String / {abort.raise} = {
@@ -670,11 +680,14 @@ fn itemized() -> List<Source> =
   ]
 
 test "hashing reads a fixed definition's contract and references as its run fixed them, and answers as reading them again" {
-  let index = indexed(itemized());
-  let fresh = hashed_and_unused(index, no_fixing(), []);
-  let fixed = fixed_nodes(index, fresh.hashes, Map::new().insert(b"base", true));
-  assert(fixed.filter(|f: Fixed| !f.decl).len() > 0, Some("the fixture's base defines functions"));
-  let held = hashed_and_unused(index, { ..no_fixing(), nodes: fixed }, []);
+  let index = index_sources(itemized());
+  let fresh = hashed_and_unused(index, no_cached_hashes(), []);
+  let fixed = cached_nodes(index, fresh.hashes, Map::new().insert(b"base", true));
+  assert(
+    fixed.filter(|f: CachedNode| !f.decl).len() > 0,
+    Some("the fixture's base defines functions"),
+  );
+  let held = hashed_and_unused(index, { ..no_cached_hashes(), nodes: fixed }, []);
   assert_eq([held.hashes.defs, held.hashes.decls, held.hashes.own, held.hashes.contracts], [
     fresh.hashes.defs,
     fresh.hashes.decls,
@@ -693,9 +706,10 @@ test "hashing reads a fixed definition's contract and references as its run fixe
     ),
   );
   // What is fixed is what is answered: a contract fixed as another answers that one, unencoded.
-  let marked = fixed.map(|f: Fixed|
+  let marked = fixed.map(|f: CachedNode|
     if f.decl { f } else { { ..f, contract: b"fixed:".concat(f.contract) } });
-  let taken = hashed_and_unused(index, { ..no_fixing(), nodes: marked }, []).hashes.contracts;
+  let taken = hashed_and_unused(index, { ..no_cached_hashes(), nodes: marked }, [
+  ]).hashes.contracts;
   let base = |c: { name: Bytes, hash: Bytes }| c.name.starts_with(b"base.");
   assert_eq(
     taken.filter(base),
@@ -711,17 +725,17 @@ test "a program read with every node, test and law fixed as a fresh run fixed it
       src: b"import base\npub effect tick { write beat() -> Unit }\npub fn even(n: Int) -> Bool / { tick.write } = if n == 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n == 0 { false } else { even(n - 1) }\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\ntest \"halves\" { assert_eq(half(base::one() + 3), 2) }\n",
     },
   ]);
-  let index = indexed(sources);
-  let fresh = hashed_and_unused(index, no_fixing(), []);
+  let index = index_sources(sources);
+  let fresh = hashed_and_unused(index, no_cached_hashes(), []);
   let all = sources.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source| acc.insert(s.name, true));
-  let held = hashed_and_unused(index, fixing_of(index, fresh.hashes, all), []);
+  let held = hashed_and_unused(index, cached_hashes_of(index, fresh.hashes, all), []);
   assert_eq(held.hashes, fresh.hashes);
   assert_eq(held.unused, [])
 }
 
 test "a type named only as the owner of a function something calls is used, and one of an uncalled function is not" {
   let src = b"type Tally = | Tally\nfn Tally::made() -> Int = 1\nfn Tally::idle() -> Int = 2\ntype Lone = | Lone\nfn Lone::made() -> Int = 3\npub fn f() -> Int = Tally::made()\n";
-  assert_eq(unused(indexed([{ name: b"m", src: src }])).map(|d: Diag| d.message), [
+  assert_eq(unused(index_sources([{ name: b"m", src: src }])).map(|d: Diag| d.message), [
     b"fn `m.Tally::idle` is never used",
     b"type `m.Lone` is never used",
     b"fn `m.Lone::made` is never used",
@@ -730,7 +744,10 @@ test "a type named only as the owner of a function something calls is used, and 
 
 test "a type named only as the owner of an extern function something calls is used" {
   let src = b"extern type Spelt\nextern fn Spelt::of(b: Bytes) -> String\npub fn f(b: Bytes) -> String = Spelt::of(b)\n";
-  assert_eq(unused(indexed([{ name: b"std.spelling", src: src }])).map(|d: Diag| d.message), [])
+  assert_eq(
+    unused(index_sources([{ name: b"std.spelling", src: src }])).map(|d: Diag| d.message),
+    [],
+  )
 }
 
 test "renaming a definition does not move its hash, and a change to a callee does" {
@@ -903,7 +920,7 @@ test "a mutually recursive pair hashes as one component with two members" {
 }
 
 /// The index of `sources` parsed, expanded and resolved alone, as a test hashes a fixture.
-pub fn indexed(sources: List<Source>) -> Index / {abort.raise} =
+pub fn index_sources(sources: List<Source>) -> Index / {abort.raise} =
   match resolve_modules(
       range(0, sources.len()).map(|i: Int| {
         let r = parse(sources.get(i).src);
@@ -926,7 +943,7 @@ fn one_set(names: List<Bytes>) -> Map<Bytes, Bool> =
 
 test "a closure is what a name reaches, the name included, and a test's what the test references" {
   let h = hash_index(
-    indexed([
+    index_sources([
       {
         name: b"m",
         src: b"pub fn leaf() -> Int = 1\npub fn mid() -> Int = leaf()\npub fn top() -> Int = mid()\npub fn other() -> Int = 2\ntest \"it\" { assert_eq(top(), 1) }",
@@ -937,12 +954,17 @@ test "a closure is what a name reaches, the name included, and a test's what the
   assert_eq(closure_of(h, [b"m.it"]).keys(), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
   assert_eq(closure_of(h, [b"m.mid", b"m.other"]).keys(), [b"m.leaf", b"m.mid", b"m.other"]);
   assert_eq(closure_of(h, [b"m.nothing"]), Map::new());
-  assert_eq(reaching(h, one_set([b"m.leaf"])).keys(), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
-  assert_eq(reaching(h, one_set([b"m.other"])).keys(), [b"m.other"])
+  assert_eq(keys_reaching(h, one_set([b"m.leaf"])).keys(), [
+    b"m.it",
+    b"m.leaf",
+    b"m.mid",
+    b"m.top",
+  ]);
+  assert_eq(keys_reaching(h, one_set([b"m.other"])).keys(), [b"m.other"])
 }
 
 test "the functions reached hold what a reached definition's clauses name, and what that reaches" {
-  let index = indexed([
+  let index = index_sources([
     {
       name: b"m",
       src: b"pub fn f(n: Int) -> Int\n  requires n > floor()\n  ensures result == model(n)\n= n\nfn model(n: Int) -> Int = n + under()\nfn under() -> Int = 0\nfn floor() -> Int = 0\npub fn other() -> Int = 2",
@@ -950,17 +972,17 @@ test "the functions reached hold what a reached definition's clauses name, and w
   ]);
   let h = hash_index(index);
   assert_eq(closure_of(h, [b"m.f"]).keys(), [b"m.f"]);
-  assert_eq(reached_functions(h, [TheFn(b"m.f")]).keys(), [
+  assert_eq(reached_functions(h, [FunctionNamed(b"m.f")]).keys(), [
     b"m.f",
     b"m.floor",
     b"m.model",
     b"m.under",
   ]);
-  assert_eq(reached_functions(h, [TheFn(b"m.other")]).keys(), [b"m.other"])
+  assert_eq(reached_functions(h, [FunctionNamed(b"m.other")]).keys(), [b"m.other"])
 }
 
 test "a listing reaches what its table and label do, and nothing only a case runs" {
-  let index = indexed([
+  let index = index_sources([
     {
       name: b"m",
       src: b"fn table() -> List<Int> = build(2)\nfn build(n: Int) -> List<Int> = [n]\nfn name_of(n: Int) -> Int = n\nfn heavy(n: Int) -> Int = deeper(n)\nfn deeper(n: Int) -> Int = n\ntest \"case {name_of(n)}\" for n: Int in table() {\n  assert_eq(heavy(n), n)\n}\n",
@@ -976,7 +998,7 @@ test "a listing reaches what its table and label do, and nothing only a case run
   assert(listed.contains(b"m.table") && listed.contains(b"m.build"), Some("the table is listed"));
   assert(!listed.contains(b"m.heavy") && !listed.contains(b"m.deeper"), Some("no case runs"));
   // The test itself reaches all of it.
-  let run = reached_functions(h, [TheItem(b"m.case {name_of(n)}")]).keys();
+  let run = reached_functions(h, [ItemKeyed(b"m.case {name_of(n)}")]).keys();
   assert(run.contains(b"m.heavy") && run.contains(b"m.table"), None)
 }
 
@@ -991,18 +1013,18 @@ test "a unit offering a test holds the scheduler's functions wherever the load h
   };
   let scheduled = [b"std.internal.schedule.nested", b"std.internal.schedule.simulated"];
   let held = |reached: Map<Bytes, Bool>| scheduled.filter(|n: Bytes| reached.contains(n));
-  let h = hash_index(indexed([program, scheduler]));
-  assert_eq(held(reached_functions(h, [TheItem(b"m.x")])), scheduled);
+  let h = hash_index(index_sources([program, scheduler]));
+  assert_eq(held(reached_functions(h, [ItemKeyed(b"m.x")])), scheduled);
   assert_eq(held(listing_reach(h, [b"m.x"])), scheduled);
-  assert(reached_functions(h, [TheItem(b"m.x")]).contains(b"m.three"), None);
+  assert(reached_functions(h, [ItemKeyed(b"m.x")]).contains(b"m.three"), None);
   // A load that holds no scheduler offers nothing of one.
-  assert_eq(reached_functions(hash_index(indexed([program])), [TheItem(b"m.x")]).keys(), [
+  assert_eq(reached_functions(hash_index(index_sources([program])), [ItemKeyed(b"m.x")]).keys(), [
     b"m.three",
   ])
 }
 
 test "a function is reached through itself, never through a type or an effect of its name" {
-  let index = indexed([
+  let index = index_sources([
     {
       name: b"m",
       src: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub type Box = | Box(Int)\neffect Box { read held() -> Box }\npub fn boxed() -> Box / {Box.read} = Box.held()\npub fn caller() -> Int = log()",
@@ -1010,22 +1032,22 @@ test "a function is reached through itself, never through a type or an effect of
   ]);
   let h = hash_index(index);
   // `user` performs the effect `log` and `boxed` names the type and the effect `Box`: no function.
-  assert_eq(reached_functions(h, [TheFn(b"m.user")]).keys(), [b"m.user"]);
-  assert_eq(reached_functions(h, [TheFn(b"m.boxed")]).keys(), [b"m.boxed"]);
-  assert_eq(reached_functions(h, [TheFn(b"m.caller")]).keys(), [
+  assert_eq(reached_functions(h, [FunctionNamed(b"m.user")]).keys(), [b"m.user"]);
+  assert_eq(reached_functions(h, [FunctionNamed(b"m.boxed")]).keys(), [b"m.boxed"]);
+  assert_eq(reached_functions(h, [FunctionNamed(b"m.caller")]).keys(), [
     b"m.caller",
     b"m.helper",
     b"m.log",
   ]);
-  assert_eq(reached_functions(h, [TheFn(b"m.log")]).keys(), [b"m.helper", b"m.log"]);
+  assert_eq(reached_functions(h, [FunctionNamed(b"m.log")]).keys(), [b"m.helper", b"m.log"]);
   // The effect `log`, and the type and the effect `Box`, are where a walk can start too.
-  assert_eq(reached_functions(h, [TheDecl(b"m.log")]).keys(), []);
-  assert_eq(reached_functions(h, [TheDecl(b"m.Box")]).keys(), [])
+  assert_eq(reached_functions(h, [DeclarationNamed(b"m.log")]).keys(), []);
+  assert_eq(reached_functions(h, [DeclarationNamed(b"m.Box")]).keys(), [])
 }
 
 fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput / {abort.raise} =
   hash_index(
-    indexed([
+    index_sources([
       { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
       {
         name: b"std.cases",
@@ -1071,7 +1093,7 @@ test "a test over cases hashes as what one case runs: its table and its label mo
 /// A function `log`, an effect `log` and a test keyed `m.log`: three things one name spells.
 fn three_of_a_name() -> HashOutput / {abort.raise} =
   hash_index(
-    indexed([
+    index_sources([
       {
         name: b"m",
         src: b"effect log { write emit(Bytes) -> Unit }\npub fn log() -> Int = helper()\nfn helper() -> Int = 1\npub fn user(b: Bytes) -> Unit / {log.write} = log.emit(b)\npub fn caller() -> Int = log()\ntest \"log\" { assert_eq(caller(), 1) }",
@@ -1081,29 +1103,45 @@ fn three_of_a_name() -> HashOutput / {abort.raise} =
 
 test "a walk goes by the node a reference names: a function apart from the effect of its name and from the test keyed like it" {
   let h = three_of_a_name();
-  let names = |r: Reach| { fns: r.fns.keys(), decls: r.decls.keys() };
-  assert_eq(names(reach(h, [TheFn(b"m.user")])), { fns: [b"m.user"], decls: [b"m.log"] });
-  assert_eq(names(reach(h, [TheDecl(b"m.log")])), { fns: [], decls: [b"m.log"] });
-  assert_eq(names(reach(h, [TheFn(b"m.log")])), { fns: [b"m.helper", b"m.log"], decls: [] });
-  assert_eq(names(reach(h, [TheItem(b"m.log")])), {
+  let names = |r: ReachableNames| { fns: r.fns.keys(), decls: r.decls.keys() };
+  assert_eq(names(reach(h, [FunctionNamed(b"m.user")])), { fns: [b"m.user"], decls: [b"m.log"] });
+  assert_eq(names(reach(h, [DeclarationNamed(b"m.log")])), { fns: [], decls: [b"m.log"] });
+  assert_eq(names(reach(h, [FunctionNamed(b"m.log")])), {
+    fns: [b"m.helper", b"m.log"],
+    decls: [],
+  });
+  assert_eq(names(reach(h, [ItemKeyed(b"m.log")])), {
     fns: [b"m.caller", b"m.helper", b"m.log"],
     decls: [],
   });
-  assert_eq(named_in(h, TheFn(b"m.user")), [{ name: b"m.log", decl: true }]);
-  assert_eq(named_in(h, TheItem(b"m.log")), [{ name: b"m.caller", decl: false }]);
+  assert_eq(references_in(h, FunctionNamed(b"m.user")), [{ name: b"m.log", decl: true }]);
+  assert_eq(references_in(h, ItemKeyed(b"m.log")), [{ name: b"m.caller", decl: false }]);
   // What a build holds of `user` is the effect, and nothing the function of its name calls.
   assert_eq(
-    held_by(h, [b"m.user"]).map(|x: Closed| { name: x.name, decl: x.decl, refs: x.refs }),
+    build_closure(h, [b"m.user"]).map(|x: ClosureEntry|
+      { name: x.name, decl: x.decl, refs: x.refs }),
     [{ name: b"m.user", decl: false, refs: [1] }, { name: b"m.log", decl: true, refs: [] }],
   )
 }
 
 test "what names a function is not what names the effect of its name" {
   let h = three_of_a_name();
-  assert_eq(naming(h, TheFn(b"m.log"), false), { fns: [b"m.caller"], decls: [], items: [] });
-  assert_eq(naming(h, TheDecl(b"m.log"), false), { fns: [b"m.user"], decls: [], items: [] });
-  assert_eq(naming(h, TheFn(b"m.caller"), false), { fns: [], decls: [], items: [b"m.log"] });
-  assert_eq(naming(h, TheFn(b"m.helper"), true), {
+  assert_eq(find_referrers(h, FunctionNamed(b"m.log"), false), {
+    fns: [b"m.caller"],
+    decls: [],
+    items: [],
+  });
+  assert_eq(find_referrers(h, DeclarationNamed(b"m.log"), false), {
+    fns: [b"m.user"],
+    decls: [],
+    items: [],
+  });
+  assert_eq(find_referrers(h, FunctionNamed(b"m.caller"), false), {
+    fns: [],
+    decls: [],
+    items: [b"m.log"],
+  });
+  assert_eq(find_referrers(h, FunctionNamed(b"m.helper"), true), {
     fns: [b"m.caller", b"m.log"],
     decls: [],
     items: [b"m.log"],
@@ -1114,7 +1152,7 @@ test "a key read by name alone reaches what anything it spells does" {
   let h = three_of_a_name();
   assert_eq(closure_of(h, [b"m.user"]).keys(), [b"m.log", b"m.user"]);
   assert_eq(closure_of(h, [b"m.log"]).keys(), [b"m.caller", b"m.helper", b"m.log"]);
-  assert_eq(reaching(h, one_set([b"m.helper"])).keys(), [b"m.caller", b"m.helper", b"m.log"])
+  assert_eq(keys_reaching(h, one_set([b"m.helper"])).keys(), [b"m.caller", b"m.helper", b"m.log"])
 }
 
 /// The fixtures below write `pub` throughout, so every name is one a reference may be printed under.
@@ -1297,7 +1335,7 @@ test "what a row promises `bounded` is in its hash" {
 
 test "printed bodies hash back to what they were stored under, under their own names" {
   let out = hash_index(
-    indexed([
+    index_sources([
       {
         name: b"left.util",
         src: b"pub type Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }",
@@ -1320,7 +1358,7 @@ test "printed bodies hash back to what they were stored under, under their own n
   ]);
   assert(ms.get(0).text.contains(b"import left.util as left_util\n"));
   let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   let shipped = printed_of(out, [b"left.util"]);
@@ -1329,7 +1367,7 @@ test "printed bodies hash back to what they were stored under, under their own n
 
 test "a body that compares, digests or names a function of a type references what crossing a container calls" {
   let out = hash_index(
-    indexed([
+    index_sources([
       {
         name: prelude_module(),
         src: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = xs\n",
@@ -1347,14 +1385,14 @@ test "a body that compares, digests or names a function of a type references wha
   // A text naming a container references what crossing it calls, as comparing one does.
   assert_eq(
     [b"app.same", b"app.hashed", b"app.named", b"app.both", b"app.plain"].map(|n: Bytes|
-      named_in(out, TheFn(n))),
+      references_in(out, FunctionNamed(n))),
     [written, written, written, written, []],
   )
 }
 
 test "a body that calls on a value prints back importing each module whose function it may call" {
   let hashed = hash_index(
-    indexed([
+    index_sources([
       { name: b"low", src: b"pub type A = | A\npub fn A::go(a: A) -> Int = 1" },
       { name: b"app", src: b"import low\npub fn gone(xs: List<Int>) -> Int = xs.go()" },
     ]),
@@ -1368,20 +1406,20 @@ test "a body that calls on a value prints back importing each module whose funct
   let ms = printed_of(out, []);
   assert(ms.get(0).text.contains(b"import low\n"));
   let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
 test "a call on a value prints as it was written, naming the parameter an argument fills" {
   let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)";
-  let index = indexed([{ name: b"m", src: src }]);
+  let index = index_sources([{ name: b"m", src: src }]);
   let body_of = |name: Bytes|
     index.nodes.fold(dummy_span(), |acc: Span, n: Node|
       match n.body { NodeFn(d) -> if n.name == name { expr_span(d.body) } else { acc }, _ -> acc });
-  let fixed = hashed_forms(
-    chosen_forms(index, [0], {
-      ..chosen_in(index, 0),
+  let fixed = hash_forms(
+    selection_forms(index, [0], {
+      ..module_selection(index, 0),
       called: Some(
         Map::of_entries([
           { key: { owner: b"m.total", site: body_of(b"m.total").site }, value: { named: [] } },
@@ -1393,8 +1431,8 @@ test "a call on a value prints as it was written, naming the parameter an argume
   ).nodes;
   let item = |name: Bytes|
     match print_bodies(
-        fixed.map(|f: Fixed| f.body),
-        fixed.map(|f: Fixed| { name: f.name, hash: f.hash, public: true }),
+        fixed.map(|f: CachedNode| f.body),
+        fixed.map(|f: CachedNode| { name: f.name, hash: f.hash, public: true }),
         [],
         [],
       ) {
@@ -1425,9 +1463,9 @@ test "a `with_hold`'s region is part of its hash" {
       None -> panic("the index names held"),
     }
   };
-  let out = hash_index(indexed([{ name: b"app", src: src(b"file") }]));
+  let out = hash_index(index_sources([{ name: b"app", src: src(b"file") }]));
   // The region is part of what a hold is typed as, so its name is hashed.
-  assert(hash_of(hash_index(indexed([{ name: b"app", src: src(b"other") }]))) != hash_of(out))
+  assert(hash_of(hash_index(index_sources([{ name: b"app", src: src(b"other") }]))) != hash_of(out))
 }
 
 test "a `try` that names its raise hashes apart from one that reads it off its body" {
@@ -1443,9 +1481,9 @@ test "a `try` that names its raise hashes apart from one that reads it off its b
       None -> panic("the index names f"),
     }
   };
-  let out = hash_index(indexed([{ name: b"m", src: src(b"try[p.bad] { g(n) }") }]));
+  let out = hash_index(index_sources([{ name: b"m", src: src(b"try[p.bad] { g(n) }") }]));
   // One that names no raise reads it off its body, which is all its hash holds.
-  let unnamed = hash_index(indexed([{ name: b"m", src: src(b"try { g(n) }") }]));
+  let unnamed = hash_index(index_sources([{ name: b"m", src: src(b"try { g(n) }") }]));
   assert(hash_of(unnamed) != hash_of(out))
 }
 
@@ -1453,7 +1491,7 @@ test "a tagged literal prints back under a binder whose module names its parser 
   // One body under two names: only a module that calls it `literal` can be the literal's tag.
   let parser = b"(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)";
   let out = hash_index(
-    indexed([
+    index_sources([
       { name: b"aaa", src: b"pub fn of_text".concat(parser) },
       { name: b"hex", src: b"pub fn literal".concat(parser) },
       { name: b"app", src: b"import hex as h\npub fn two() -> Int = h\"a\\\"b\" + h\"\"" },
@@ -1462,7 +1500,7 @@ test "a tagged literal prints back under a binder whose module names its parser 
   let ms = printed_of(out, []);
   assert(ms.get(1).text.contains(b"hex\"a\\\"b\" + hex\"\""));
   let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
@@ -1473,7 +1511,7 @@ test "a tagged literal with holes prints under a binder that names `compile` and
   let filler = b"(c: Int, holes: List<Int>) -> Int = c";
   let parser = b"(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)";
   let out = hash_index(
-    indexed([
+    index_sources([
       {
         name: b"aaa",
         src: Bytes::concat_all([b"pub fn compile", compiler, b"\npub fn stuffed", filler]),
@@ -1501,7 +1539,7 @@ test "a tagged literal with holes prints under a binder that names `compile` and
       found || m.text.contains(b"sh\"a")),
   );
   let again = hash_index(
-    indexed(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+    index_sources(ms.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
@@ -1510,7 +1548,7 @@ test "a reference is printed under a name the module holding it exports" {
   // One body under two names, in modules that ship rather than print: which name a reference is
   // printed under is a choice, and only one of them is a name another module may write.
   let out = hash_index(
-    indexed([
+    index_sources([
       { name: b"hidden", src: b"fn span() -> Int = 4\npub fn stride() -> Int = span() + 1" },
       { name: b"shelf", src: b"pub fn width() -> Int = 4" },
       { name: b"app", src: b"import shelf\npub fn wide() -> Int = shelf::width()" },
@@ -1535,7 +1573,7 @@ test "a reference is printed under a name the module holding it exports" {
 
 test "a record type's fields and an effect's operations hash alike in any order" {
   let hash_of = |src: Bytes, name: Bytes|
-    match by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }])))).get(name) {
+    match by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: src }])))).get(name) {
       Some(hash) -> hash,
       None -> panic("the index names the definition"),
     };
@@ -1567,8 +1605,8 @@ test "an operation atom hashes apart from its mode atom" {
       None -> panic("the index names f"),
     }
   };
-  let out = hash_index(indexed([{ name: b"m", src: src(b"send") }]));
-  assert(hash_of(out) != hash_of(hash_index(indexed([{ name: b"m", src: src(b"write") }]))))
+  let out = hash_index(index_sources([{ name: b"m", src: src(b"send") }]));
+  assert(hash_of(out) != hash_of(hash_index(index_sources([{ name: b"m", src: src(b"write") }]))))
 }
 
 test "renaming a label binder does not move a hash, and renaming a real resource does" {
@@ -1607,7 +1645,7 @@ test "renaming a label binder does not move a hash, and renaming a real resource
       b"](x)",
     ]);
   let hash_of = |src: Bytes, name: Bytes| {
-    let out = hash_index(indexed([{ name: b"m", src: src }]));
+    let out = hash_index(index_sources([{ name: b"m", src: src }]));
     match by_name(named_hashes(out)).get(name) {
       Some(h) -> h,
       None -> panic("the index names the definition"),
@@ -1631,8 +1669,8 @@ test "renaming an operation's type parameter does not move a hash" {
       v,
       b" }",
     ]);
-  let out = hash_index(indexed([{ name: b"m", src: boxed(b"a") }]));
-  let renamed = hash_index(indexed([{ name: b"m", src: boxed(b"b") }]));
+  let out = hash_index(index_sources([{ name: b"m", src: boxed(b"a") }]));
+  let renamed = hash_index(index_sources([{ name: b"m", src: boxed(b"b") }]));
   assert_eq(by_name(named_hashes(renamed)), by_name(named_hashes(out)))
 }
 
@@ -1658,7 +1696,7 @@ test "a type's label and row binders are levels, and what it is applied to is ha
       given,
       b"]}>) -> Int = 1",
     ]);
-  let hashed = |src: Bytes| hash_index(indexed([{ name: b"m", src: src }]));
+  let hashed = |src: Bytes| hash_index(index_sources([{ name: b"m", src: src }]));
   let out = hashed(held(b"e", b"l", b"conn"));
   let named = by_name(named_hashes(out));
   assert_eq(by_name(named_hashes(hashed(held(b"f", b"k", b"conn")))), named);
@@ -1669,7 +1707,7 @@ test "a type's label and row binders are levels, and what it is applied to is ha
 
 test "two effects that differ only in their names are two declarations" {
   let out = hash_index(
-    indexed([
+    index_sources([
       { name: b"a", src: b"pub effect one { read at() -> Int }" },
       { name: b"b", src: b"pub effect two { read at() -> Int }" },
     ]),
@@ -1684,7 +1722,7 @@ test "one effect declaration under two names is refused, since a body cannot say
   // One simple name in two modules: a module path is no part of an identity, so this is a single
   // declaration, and naming it twice leaves a body that performs it with no name to be printed under.
   let out = hash_index(
-    indexed([
+    index_sources([
       { name: b"a", src: b"pub effect one { read at() -> Int }" },
       { name: b"b", src: b"pub effect one { read at() -> Int }" },
     ]),
@@ -1708,7 +1746,7 @@ test "one effect declaration under two names is refused, since a body cannot say
 
 test "two sums that differ only in their names are two declarations, and one sum in two modules is one" {
   let apart = hash_index(
-    indexed([
+    index_sources([
       { name: b"a", src: b"pub type One = | Wrap(Int)" },
       { name: b"b", src: b"pub type Two = | Wrap(Int)" },
     ]),
@@ -1722,7 +1760,7 @@ test "two sums that differ only in their names are two declarations, and one sum
   let together = by_name(
     named_hashes(
       hash_index(
-        indexed([
+        index_sources([
           { name: b"a", src: b"pub type One = | Wrap(Int)" },
           { name: b"b", src: b"pub type One = | Wrap(Int)" },
         ]),
@@ -1734,7 +1772,7 @@ test "two sums that differ only in their names are two declarations, and one sum
 
 test "a type two modules declare alike is printed under the name a definition names, where the print is told" {
   let out = hash_index(
-    indexed([
+    index_sources([
       {
         name: b"a",
         src: b"pub type Limits = new { most: Int }\npub fn fa(l: Limits) -> Int = l.most + 1",
@@ -1749,15 +1787,15 @@ test "a type two modules declare alike is printed under the name a definition na
       },
     ]),
   );
-  let closure = held_by(out, [b"app.main"]);
+  let closure = build_closure(out, [b"app.main"]);
   let print = |told: Bool|
     match print_bodies(
         out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
-        closure.map(|x: Closed| { name: x.name, hash: x.hash, public: true }),
+        closure.map(|x: ClosureEntry| { name: x.name, hash: x.hash, public: true }),
         [],
         [],
         if told {
-          closure.map(|x: Closed|
+          closure.map(|x: ClosureEntry|
             { name: x.name, hash: x.hash, names: x.refs.map(|i: Int| closure.get(i).name) })
         } else { [] },
       ) {
@@ -1772,7 +1810,7 @@ test "a type two modules declare alike is printed under the name a definition na
 }
 
 test "a `new` record is its name and its fields, and no alias of those fields" {
-  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  let m = |src: Bytes| by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: src }]))));
   let date = m(b"pub type Date = new { day: Int }\npub fn mk() -> Date = { day: 1 }");
   let other = m(b"pub type Span = new { day: Int }\npub fn mk() -> Span = { day: 1 }");
   let alias = m(b"pub type Date = { day: Int }\npub fn mk() -> Date = { day: 1 }");
@@ -1785,7 +1823,7 @@ test "a `new` record is its name and its fields, and no alias of those fields" {
   let vendored = by_name(
     named_hashes(
       hash_index(
-        indexed([
+        index_sources([
           { name: b"a", src: b"pub type Date = new { day: Int }" },
           { name: b"b", src: b"pub type Date = new { day: Int }" },
         ]),
@@ -1796,7 +1834,7 @@ test "a `new` record is its name and its fields, and no alias of those fields" {
 }
 
 test "a type's hash says whether it is opaque, and what holds it moves with it" {
-  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  let m = |src: Bytes| by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: src }]))));
   let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
   let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
   assert(open.get(b"m.Date") != closed.get(b"m.Date"));
@@ -1811,7 +1849,7 @@ test "a type's hash says whether it is opaque, and what holds it moves with it" 
 }
 
 test "an alias is transparent, so its name is no part of it" {
-  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  let m = |src: Bytes| by_name(named_hashes(hash_index(index_sources([{ name: b"m", src: src }]))));
   // `conv_type` expands an alias in place, so these two declare one type and use it alike.
   let metres = m(b"pub type Metres = Int\npub fn go(x: Metres) -> Metres = x");
   let feet = m(b"pub type Feet = Int\npub fn go(x: Feet) -> Feet = x");
@@ -1825,7 +1863,7 @@ test "an alias is transparent, so its name is no part of it" {
 
 test "a definition's hash follows the name of the effect it performs" {
   let one = hash_index(
-    indexed([
+    index_sources([
       {
         name: b"m",
         src: b"pub effect log { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()",
@@ -1833,7 +1871,7 @@ test "a definition's hash follows the name of the effect it performs" {
     ]),
   );
   let other = hash_index(
-    indexed([
+    index_sources([
       {
         name: b"m",
         src: b"pub effect trace { write put() -> Unit }\npub fn say() -> Unit / {trace.write} = trace.put()",
@@ -1845,7 +1883,7 @@ test "a definition's hash follows the name of the effect it performs" {
 }
 
 test "the forms of a module's parts put together hash as the module's own, whichever order the parts come in" {
-  let index = indexed([
+  let index = index_sources([
     {
       name: b"m",
       src: b"pub type T = | Leaf | Node(List<T>)\npub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn count(t: T) -> Int = match t { Leaf -> 1, Node(ts) -> ts.fold(0, |n: Int, k: T| n + count(k)) }\ntest \"it\" { assert(even(2)) }\n",
@@ -1853,7 +1891,7 @@ test "the forms of a module's parts put together hash as the module's own, which
   ]);
   let whole = module_forms(index, [0], 0);
   let part = |names: List<Bytes>, tests: Bool|
-    kept_forms(index, [0], 0, {
+    filtered_forms(index, [0], 0, {
       node: |n: Bytes| names.contains(n),
       test: |_: Bytes| tests,
       law: |_: Bytes| false,
@@ -1861,20 +1899,20 @@ test "the forms of a module's parts put together hash as the module's own, which
   let counted = part([b"m.T", b"m.count"], false);
   let evens = part([b"m.even"], true);
   let odds = part([b"m.odd"], false);
-  let said = |forms: Shapes| {
-    let f = hashed_forms(forms, []);
+  let said = |forms: HashInput| {
+    let f = hash_forms(forms, []);
     {
-      nodes: f.nodes.fold(Map::new(), |acc: Map<Bytes, Fixed>, x: Fixed|
-        acc.insert(pin_key(x.name, x.decl), x)),
+      nodes: f.nodes.fold(Map::new(), |acc: Map<Bytes, CachedNode>, x: CachedNode|
+        acc.insert(definition_key(x.name, x.decl), x)),
       tests: f.tests,
     }
   };
   assert(
     [
-      pin_key(b"m.T", true),
-      pin_key(b"m.even", false),
-      pin_key(b"m.odd", false),
-      pin_key(b"m.count", false),
+      definition_key(b"m.T", true),
+      definition_key(b"m.even", false),
+      definition_key(b"m.odd", false),
+      definition_key(b"m.count", false),
     ].all(|k: Bytes| said(whole).nodes.contains(k)),
     None,
   );
@@ -1888,7 +1926,7 @@ test "a definition's hash follows each function a call on a value may be, of the
     by_name(
       named_hashes(
         hash_index(
-          indexed([
+          index_sources([
             {
               name: b"low",
               src: b"pub type A = | A\npub fn made() -> A = A\npub fn A::go(a: A) -> Int = ".concat(
@@ -1919,7 +1957,7 @@ test "a body that compares, digests or shows references what the code written fo
     src: b"pub fn List::at<a>(xs: List<a>, i: Int) -> Option<a> = None\npub fn List::push<a>(xs: List<a>, x: a) -> List<a> = if full(1) { xs } else { xs }\nfn full(n: Int) -> Bool = n == 32\n",
   };
   let hashes = hash_index(
-    indexed([
+    index_sources([
       prelude,
       { name: b"std.value", src: b"pub extern fn shown<a>(x: a) -> Bool\n" },
       {
@@ -1936,21 +1974,20 @@ test "a body that compares, digests or shows references what the code written fo
     { name: b"std.prelude.List::at", decl: false },
     { name: b"std.prelude.List::push", decl: false },
   ];
-  assert_eq([b"m.same", b"m.hashed", b"m.told"].map(|n: Bytes| named_in(hashes, TheFn(n))), [
-    written,
-    written,
-    written,
-  ]);
-  assert_eq(named_in(hashes, TheFn(b"m.less")), []);
+  assert_eq(
+    [b"m.same", b"m.hashed", b"m.told"].map(|n: Bytes| references_in(hashes, FunctionNamed(n))),
+    [written, written, written],
+  );
+  assert_eq(references_in(hashes, FunctionNamed(b"m.less")), []);
   // A definition of the builtin's name is what the name calls.
-  assert_eq(named_in(hashes, TheFn(b"n.own")), [{ name: b"n.digest", decl: false }]);
-  assert_eq(reached_functions(hashes, [TheFn(b"m.same")]).keys(), [
+  assert_eq(references_in(hashes, FunctionNamed(b"n.own")), [{ name: b"n.digest", decl: false }]);
+  assert_eq(reached_functions(hashes, [FunctionNamed(b"m.same")]).keys(), [
     b"m.same",
     b"std.prelude.List::at",
     b"std.prelude.List::push",
     b"std.prelude.full",
   ]);
-  assert_eq(named_in(hashes, TheFn(b"std.prelude.full")), written);
+  assert_eq(references_in(hashes, FunctionNamed(b"std.prelude.full")), written);
   assert_eq(
     hashes.defs.filter(|d: { name: Bytes, hash: Bytes }|
       (d.name == b"std.prelude.List::push" || d.name == b"std.prelude.full")
@@ -1983,8 +2020,8 @@ test "the published hashes digest to a pinned value" {
 
 test "a stored body is keyed by its own bytes, and bytes no envelope holds by nothing" {
   let picked = [{ named: [] }, { named: [2, 1] }];
-  let found = picked.map(|c: Choice| Found(c));
-  let solo = solo_body({ bytes: b"abc", chosen: found });
+  let found = picked.map(|c: Choice| Known(c));
+  let solo = single_body({ bytes: b"abc", chosen: found });
   assert_eq(body_key(solo), Some(blake3(b"abc")));
   match envelope(solo) { Some(e) -> assert_eq(picks_of(solo, e), [picked]), None -> assert(false) };
   let member = member_body(
@@ -2016,17 +2053,17 @@ test "a stored body is keyed by its own bytes, and bytes no envelope holds by no
   assert_eq(body_key(b"\x01\x00"), None);
   // A call its check is yet to say of keys its body under nothing, until the check completes it.
   let site = { owner: b"m.f", site: 1 };
-  let open = [Found(picked.get(0)), Waiting(site)];
-  let found_open = [Found(picked.get(0)), Found({ named: [2, 1] })];
+  let open = [Known(picked.get(0)), Pending(site)];
+  let found_open = [Known(picked.get(0)), Known({ named: [2, 1] })];
   let said = Map::new().insert(site, { named: [2, 1] });
-  let pending = solo_body({ bytes: b"abc", chosen: open });
+  let pending = single_body({ bytes: b"abc", chosen: open });
   let pending_member = member_body(
     { members: [], packed: b"xyz", picks: [[], open], classes: Map::new() },
     2,
   );
   assert_eq(body_key(pending), None);
   assert_eq(body_key(pending_member), None);
-  assert_eq(checked_body(pending, said), solo_body({ bytes: b"abc", chosen: found_open }));
+  assert_eq(checked_body(pending, said), single_body({ bytes: b"abc", chosen: found_open }));
   assert_eq(
     checked_body(pending_member, said),
     member_body({ members: [], packed: b"xyz", picks: [[], found_open], classes: Map::new() }, 2),
@@ -2064,7 +2101,7 @@ test "a parameter that names its space hashes apart from one that does not, what
 test "a type's hash covers the arithmetic it states" {
   let stating = |stated: Bytes, sum: Bytes|
     hash_index(
-      indexed([
+      index_sources([
         {
           name: b"m",
           src: Bytes::concat_all([
@@ -2097,7 +2134,7 @@ test "a type's hash covers the key and the show it states, and what hold it move
     by_name(
       named_hashes(
         hash_index(
-          indexed([
+          index_sources([
             {
               name: b"m",
               src: Bytes::concat_all([
@@ -2133,7 +2170,7 @@ test "a type's hash covers the key and the show it states, and what hold it move
 }
 
 test "a walk of a program's module records reaches what each test reached, by name and hash" {
-  let index = indexed([
+  let index = index_sources([
     { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
     {
       name: b"std.cases",
@@ -2150,7 +2187,7 @@ test "a walk of a program's module records reaches what each test reached, by na
   ]);
   let h = hash_index(index);
   let records = [b"std.show", b"std.cases", b"low", b"app"].map(|m: Bytes|
-    module_record(fixing_of(index, h, Map::new().insert(m, true))));
+    module_record(cached_hashes_of(index, h, Map::new().insert(m, true))));
   let g = recorded_graph(
     records.map(|r: Bytes|
       match bin::decode(r, module_record_bin()) {
@@ -2158,7 +2195,7 @@ test "a walk of a program's module records reaches what each test reached, by na
         Err(_) -> panic("a record reads back"),
       }),
   );
-  let hashed = |r: Reach|
+  let hashed = |r: ReachableNames|
     {
       fns: r.fns.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, _: Bool|
         match by_name(h.defs).get(n) { Some(x) -> acc.insert(n, x), None -> acc }),
@@ -2167,21 +2204,21 @@ test "a walk of a program's module records reaches what each test reached, by na
     };
   let plain = b"app.plain";
   let ranged = b"app.case {n}";
-  assert_eq(recorded_reach(g, plain, false), Some(hashed(reach(h, [TheItem(plain)]))));
+  assert_eq(recorded_reach(g, plain, false), Some(hashed(reach(h, [ItemKeyed(plain)]))));
   // A case runs its test's body, and never what lists its table.
   let runs = {
     ..h,
     refs: { ..h.refs, items: h.refs.items.insert(ranged, of_key(h.refs.cases, ranged)) },
   };
   let case = recorded_reach(g, ranged, true);
-  assert_eq(case, Some(hashed(reach(runs, [TheItem(ranged)]))));
+  assert_eq(case, Some(hashed(reach(runs, [ItemKeyed(ranged)]))));
   match case {
     Some(c) -> assert(c.fns.contains(b"low.odd") && !c.fns.contains(b"app.table")),
     None -> panic("the case's test is recorded"),
   };
   assert_eq(recorded_reach(g, b"app.gone", false), None);
   // One walk from several tests reaches the hashes each reached alone.
-  let alone = |r: Option<Reached>|
+  let alone = |r: Option<ReachableHashes>|
     match r { Some(x) -> x.fns.values().concat(x.decls.values()), None -> [] };
   assert_eq(
     recorded_hashes(g, [{ key: plain, case: false }, { key: ranged, case: true }]).sort(),

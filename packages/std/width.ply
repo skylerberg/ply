@@ -21,7 +21,7 @@
 //! A control character and a line break count for nothing: a text of several lines is measured
 //! line by line by whoever splits it. The table is `std.ucd`'s, of the Unicode version it names.
 
-import std.char (drawn_text)
+import std.char (sample_text)
 import std.laws (agrees)
 import std.segment
 import std.ucd
@@ -29,7 +29,7 @@ import std.ucd (Table)
 import std.gen
 
 /// How wide a character of ambiguous width counts.
-pub type Ambiguous =
+pub type AmbiguousWidth =
   /// One column, as terminals draw them unless set up for East Asian text.
   | Narrow
   /// Two columns, as a terminal with an East Asian legacy font draws them.
@@ -65,35 +65,35 @@ fn width_word(fields: List<Bytes>) -> Int / {abort.raise} = {
 const fn widths() -> Table = ucd::table(embed("ucd/width.txt"), 0, width_word)
 
 /// The columns a word says its character takes alone.
-fn columns_of(word: Int, ambiguous: Ambiguous) -> Int =
+fn columns_of(word: Int, ambiguous: AmbiguousWidth) -> Int =
   match word & 3 { 0 -> 1, 1 -> 0, 2 -> 2, _ -> if ambiguous == Wide { 2 } else { 1 } }
 
 /// The columns `c` takes standing alone: none, one or two. Adding these up over a text counts a
 /// joined emoji as its parts and a modifier beside its base; `columns` measures a text.
-pub fn char_columns(c: Char, ambiguous: Ambiguous = Narrow) -> Int =
+pub fn char_columns(c: Char, ambiguous: AmbiguousWidth = Narrow) -> Int =
   if c >= ' ' && c <= '~' { 1 }
   else { columns_of(ucd::lookup(widths(), Int::of_char(c)), ambiguous) }
 
 /// The columns counted so far, the word of the last character and the columns it was counted
 /// for, and whether it was the joiner `U+200D`.
-type Measuring = { total: Int, last: Int, counted: Int, joined: Bool }
+type ClusterState = { total: Int, last: Int, counted: Int, joined: Bool }
 
-fn opening() -> Measuring = { total: 0, last: 0, counted: 0, joined: false }
+fn empty_cluster() -> ClusterState = { total: 0, last: 0, counted: 0, joined: false }
 
 /// `so_far` and then the code point `cp` of the same cluster.
-fn measured(
-  held: Table,
-  so_far: Measuring,
+fn add_code_point(
+  width_table: Table,
+  so_far: ClusterState,
   cp: Int,
   first: Bool,
-  ambiguous: Ambiguous,
-) -> Measuring =
+  ambiguous: AmbiguousWidth,
+) -> ClusterState =
   if cp == 0xFE0F && so_far.last & is_emoji() != 0 && so_far.counted < 2 {
     { total: so_far.total + 2 - so_far.counted, last: so_far.last, counted: 2, joined: false }
   } else if cp == 0xFE0E && so_far.last & is_emoji_presentation() != 0 && so_far.counted == 2 {
     { total: so_far.total - 1, last: so_far.last, counted: 1, joined: false }
   } else {
-    let word = ucd::lookup(held, cp);
+    let word = ucd::lookup(width_table, cp);
     let own = if !first && (so_far.joined || word & is_modifier() != 0) { 0 }
     else { columns_of(word, ambiguous) };
     { total: so_far.total + own, last: word, counted: own, joined: cp == 0x200D }
@@ -102,12 +102,15 @@ fn measured(
 /// The columns `cluster` takes as one grapheme cluster, whatever it holds: its characters'
 /// together, but for those that add nothing where they stand and for what the two variation
 /// selectors change.
-pub fn cluster_columns(cluster: String, ambiguous: Ambiguous = Narrow) -> Int = {
-  let held = widths();
+pub fn cluster_columns(cluster: String, ambiguous: AmbiguousWidth = Narrow) -> Int = {
+  let width_table = widths();
   cluster.chars().fold(
-    { so_far: opening(), first: true },
-    |m: { so_far: Measuring, first: Bool }, c: Char|
-      { so_far: measured(held, m.so_far, Int::of_char(c), m.first, ambiguous), first: false },
+    { so_far: empty_cluster(), first: true },
+    |m: { so_far: ClusterState, first: Bool }, c: Char|
+      {
+        so_far: add_code_point(width_table, m.so_far, Int::of_char(c), m.first, ambiguous),
+        first: false,
+      },
   ).so_far.total
 }
 
@@ -118,22 +121,22 @@ fn is_plain(text: String) -> Bool =
 
 /// The columns counted, the measure of the cluster being read, the place of the next character
 /// and the boundaries still ahead.
-type Walking = { total: Int, cluster: Measuring, place: Int, ahead: List<Int> }
+type TextState = { total: Int, cluster: ClusterState, place: Int, ahead: List<Int> }
 
 /// `walk` after the character `c`, which opens a cluster where the next boundary is its place.
-fn walked(held: Table, walk: Walking, c: Char, ambiguous: Ambiguous) -> Walking =
+fn add_char(width_table: Table, walk: TextState, c: Char, ambiguous: AmbiguousWidth) -> TextState =
   match walk.ahead {
     [next, ..rest] -> if next == walk.place {
       {
         total: walk.total + walk.cluster.total,
-        cluster: measured(held, opening(), Int::of_char(c), true, ambiguous),
+        cluster: add_code_point(width_table, empty_cluster(), Int::of_char(c), true, ambiguous),
         place: walk.place + 1,
         ahead: rest,
       }
     } else {
       {
         total: walk.total,
-        cluster: measured(held, walk.cluster, Int::of_char(c), false, ambiguous),
+        cluster: add_code_point(width_table, walk.cluster, Int::of_char(c), false, ambiguous),
         place: walk.place + 1,
         ahead: walk.ahead,
       }
@@ -143,22 +146,22 @@ fn walked(held: Table, walk: Walking, c: Char, ambiguous: Ambiguous) -> Walking 
 
 /// The columns `text` takes on one line: the sum of its grapheme clusters', each measured as
 /// `cluster_columns` measures one.
-pub fn columns(text: String, ambiguous: Ambiguous = Narrow) -> Int =
+pub fn columns(text: String, ambiguous: AmbiguousWidth = Narrow) -> Int =
   if is_plain(text) { text.len() } else {
-    let held = widths();
+    let width_table = widths();
     let done = text.chars().fold(
-      { total: 0, cluster: opening(), place: 0, ahead: segment::grapheme_boundaries(text) },
-      |walk: Walking, c: Char| walked(held, walk, c, ambiguous),
+      { total: 0, cluster: empty_cluster(), place: 0, ahead: segment::grapheme_boundaries(text) },
+      |walk: TextState, c: Char| add_char(width_table, walk, c, ambiguous),
     );
     done.total + done.cluster.total
   }
 
-/// The longest opening of `text`, cut between grapheme clusters, that takes at most `room`
+/// The longest opening of `text`, cut between grapheme clusters, that takes at most `max_columns`
 /// columns: what fits a cell of that width without parting an emoji or a letter from its accent.
 /// Clusters of no width that follow what fits are kept with it.
-pub fn fitting(text: String, room: Int, ambiguous: Ambiguous = Narrow) -> String =
+pub fn truncate(text: String, max_columns: Int, ambiguous: AmbiguousWidth = Narrow) -> String =
   segment::graphemes(text).fold(
-    { kept: "", left: room, open: true },
+    { kept: "", left: max_columns, open: true },
     |so_far: { kept: String, left: Int, open: Bool }, cluster: String| {
       let wide = cluster_columns(cluster, ambiguous);
       if so_far.open && wide <= so_far.left {
@@ -172,28 +175,28 @@ pub fn fitting(text: String, room: Int, ambiguous: Ambiguous = Narrow) -> String
 test "a drawn text's columns are its clusters' together" {
   gen::check(gen::any_int(), |x: Int|
     agrees(
-      |seed: Int| columns(drawn_text(seed)),
+      |seed: Int| columns(sample_text(seed)),
       |seed: Int|
-        segment::graphemes(drawn_text(seed)).fold(0, |sum: Int, cluster: String|
+        segment::graphemes(sample_text(seed)).fold(0, |sum: Int, cluster: String|
           sum + cluster_columns(cluster)),
       x,
     ))
 }
 
 test "what fits a room opens the text and takes no more than the room" {
-  gen::check2(gen::any_int(), gen::any_int(), |seed: Int, room: Int| {
-    let text = drawn_text(seed);
-    let kept = fitting(text, room & 31);
-    text.starts_with(kept) && columns(kept) <= room & 31
-      && (kept != text || columns(text) <= room & 31)
+  gen::check2(gen::any_int(), gen::any_int(), |seed: Int, max_columns: Int| {
+    let text = sample_text(seed);
+    let prefix = truncate(text, max_columns & 31);
+    text.starts_with(prefix) && columns(prefix) <= max_columns & 31
+      && (prefix != text || columns(text) <= max_columns & 31)
   })
 }
 
 // --- Tests ------------------------------------------------------------------------
 
-type Measured = { text: String, columns: Int }
+type WidthCase = { text: String, columns: Int }
 
-fn measures() -> List<Measured> =
+fn measures() -> List<WidthCase> =
   [
     { text: "", columns: 0 },
     { text: "plain", columns: 5 },
@@ -226,7 +229,7 @@ fn measures() -> List<Measured> =
     { text: "a\u{4E2D}b\u{1F600}!", columns: 7 },
   ]
 
-test "the text of {c.text.chars().map(Int::of_char)} takes {c.columns} columns" for c: Measured in measures(
+test "the text of {c.text.chars().map(Int::of_char)} takes {c.columns} columns" for c: WidthCase in measures(
   ) { assert_eq(columns(c.text), c.columns) }
 
 test "an ambiguous character is one column or two as the caller says" {
@@ -260,22 +263,22 @@ test "a character alone takes none, one or two columns" {
 }
 
 test "what fits a room is whole clusters, and marks of no width stay with what they follow" {
-  assert_eq(fitting("a\u{4E2D}b", 3), "a\u{4E2D}");
-  assert_eq(fitting("a\u{4E2D}b", 2), "a");
-  assert_eq(fitting("\u{4E2D}", 1), "");
-  assert_eq(fitting("e\u{301}\u{301}x", 1), "e\u{301}\u{301}");
+  assert_eq(truncate("a\u{4E2D}b", 3), "a\u{4E2D}");
+  assert_eq(truncate("a\u{4E2D}b", 2), "a");
+  assert_eq(truncate("\u{4E2D}", 1), "");
+  assert_eq(truncate("e\u{301}\u{301}x", 1), "e\u{301}\u{301}");
   assert_eq(
-    fitting("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}ab", 3),
+    truncate("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}ab", 3),
     "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}a",
   );
-  assert_eq(fitting("ab\u{200B}c", 2), "ab\u{200B}");
-  assert_eq(fitting("abc", 0), "");
-  assert_eq(fitting("abc", -1), "");
-  assert_eq(fitting("abc", 10), "abc")
+  assert_eq(truncate("ab\u{200B}c", 2), "ab\u{200B}");
+  assert_eq(truncate("abc", 0), "");
+  assert_eq(truncate("abc", -1), "");
+  assert_eq(truncate("abc", 10), "abc")
 }
 
 test "a text's columns are its clusters' together" {
-  let texts = measures().map(|m: Measured| m.text);
+  let texts = measures().map(|m: WidthCase| m.text);
   assert_eq(
     texts.filter(|text: String|
       columns(text)

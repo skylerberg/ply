@@ -79,9 +79,10 @@ import std.json
 import std.laws (agrees, round_trip)
 import std.list
 import std.option
-import std.place (DecodeError, Index, Key, Place, Step, decode_error, decode_fields, decode_items)
-import std.place (error_to_string, in_field, in_index, path_to_string, place_at, unknown_key)
-import std.place (spliced, utf8_end)
+import std.location (DecodeError, Index, Key, Location, PathSegment, decode_error, decode_fields,
+                     decode_items)
+import std.location (error_to_string, in_field, in_index, path_to_string, location_at, unknown_key)
+import std.location (spliced, utf8_end)
 import std.result
 import std.string
 
@@ -107,7 +108,7 @@ pub type Entry = { key: Yaml, value: Yaml }
 // --- Refusals ---------------------------------------------------------------
 
 /// Why a reader refused.
-pub type Why =
+pub type ErrorKind =
   /// The stream is longer than the limit's `bytes`.
   | TooLong
   /// A node sits inside more sequences and mappings than the limit's `depth`.
@@ -131,7 +132,7 @@ pub type Why =
   /// scalar value.
   | Escape
   /// An integer past 64 bits, or a float past the largest double.
-  | TooWide
+  | OutOfRange
   /// A `%YAML` directive of another major version, as written.
   | Version(Int, Int)
   /// A tag written with a handle no `%TAG` directive of its document declares.
@@ -150,14 +151,14 @@ pub type Why =
   /// The path of an edit the document has no place for: it passes through a value that is no
   /// mapping or sequence, names an index its sequence lacks, or leads where the text cannot be
   /// changed to mean what the edit says.
-  | Closed(List<Step>)
+  | Uneditable(List<PathSegment>)
   /// This module failed, with what it said: its own defect, which no stream should meet,
   /// answered as a refusal so that a reader raises nothing else.
   | Defect(String)
 
 /// A refusal: the byte the reader stood at, its line and its column in characters, both from 1,
 /// and why.
-pub type Refusal = new { offset: Int, line: Int, column: Int, why: Why }
+pub type Error = new { offset: Int, line: Int, column: Int, reason: ErrorKind }
 
 /// What a reader holds a stream to: how many bytes it may be, how many sequences and mappings a
 /// node may sit inside, how many nodes its values may hold once every alias is counted as the
@@ -169,56 +170,56 @@ pub type Limits = new { bytes: Int, depth: Int, nodes: Int, scalar: Int, documen
 /// What a reader of this module raises where it refuses.
 pub effect yaml {
   /// The input is no YAML 1.2 stream the reader takes within its limits.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
 }
 
 /// Where the reader stands, and what it found there.
 effect fault {
-  raise at(offset: Int, why: Why)
+  raise at(offset: Int, why: ErrorKind)
 }
 
-fn stop<a>(offset: Int, why: Why) -> a / {fault.at} = fault.at(offset, why)
+fn fail<a>(offset: Int, why: ErrorKind) -> a / {fault.at} = fault.at(offset, why)
 
 // --- Tokens -----------------------------------------------------------------
 
 /// How a scalar is written.
 pub type Style = | Plain | SingleQuoted | DoubleQuoted | Literal | Folded
 
-type Tok =
+type TokenKind =
   /// A place a key's tokens take if a `:` follows it on its line.
-  | TNone
-  | TStreamEnd
-  | TVersion(Int, Int)
-  | TTagDirective(String, String)
-  | TReserved
-  | TDocumentStart
-  | TDocumentEnd
-  | TBlockSequenceStart
-  | TBlockMappingStart
-  | TBlockEnd
-  | TFlowSequenceStart
-  | TFlowSequenceEnd
-  | TFlowMappingStart
-  | TFlowMappingEnd
-  | TBlockEntry
-  | TFlowEntry
-  | TKey
-  | TValue
-  | TAlias(String)
-  | TAnchor(String)
+  | PlaceholderToken
+  | StreamEndToken
+  | VersionDirectiveToken(Int, Int)
+  | TagDirectiveToken(String, String)
+  | ReservedDirectiveToken
+  | DocumentStartToken
+  | DocumentEndToken
+  | BlockSequenceStartToken
+  | BlockMappingStartToken
+  | BlockEndToken
+  | FlowSequenceStartToken
+  | FlowSequenceEndToken
+  | FlowMappingStartToken
+  | FlowMappingEndToken
+  | BlockEntryToken
+  | FlowEntryToken
+  | KeyToken
+  | ValueToken
+  | AliasToken(String)
+  | AnchorToken(String)
   /// A handle and what follows it; a verbatim tag has no handle.
-  | TTag(String, String)
-  | TScalar(String, Style)
+  | TagToken(String, String)
+  | ScalarToken(String, Style)
 
-type Token = { tok: Tok, from: Int, to: Int }
+type Token = { tok: TokenKind, from: Int, to: Int }
 
 type Stack<a> = | Empty | Top(a, Stack<a>)
 
 /// A node that is a key if a `:` follows it on its line: where its tokens stand, and where it does.
-type Candidate = { slot: Int, pos: Int, line: Int, col: Int, tabbed: Bool }
+type SimpleKey = { slot: Int, pos: Int, line: Int, column: Int, tabbed: Bool }
 
 /// An open flow collection, and the candidate among its entries where it is a sequence.
-type Level = { map: Bool, key: Option<Candidate> }
+type FlowLevel = { map: Bool, key: Option<SimpleKey> }
 
 type Span = { from: Int, to: Int }
 
@@ -243,8 +244,8 @@ type Scanner = {
   indents: Stack<Int>,
   open: Int,
   flow_level: Int,
-  levels: Stack<Level>,
-  block_key: Option<Candidate>,
+  levels: Stack<FlowLevel>,
+  block_simple_key: Option<SimpleKey>,
   asked: Stack<Int>,
   allow_key: Bool,
   hold: Int,
@@ -298,9 +299,9 @@ fn unprintable(src: Bytes, i: Int, to: Int, left: Int) -> Int / {abort.raise} = 
 }
 
 /// Refuses a character YAML does not print between `from` and `to`.
-fn printable(src: Bytes, from: Int, to: Int) -> Unit / {fault.at, abort.raise} = {
+fn require_printable(src: Bytes, from: Int, to: Int) -> Unit / {fault.at, abort.raise} = {
   let bad = unprintable(src, from, to, to - from + 1);
-  if bad >= 0 { stop(bad, Control(control_at(src, bad))) } else { () }
+  if bad >= 0 { fail(bad, Control(control_at(src, bad))) } else { () }
 }
 
 /// The code of the unprintable character at `at`.
@@ -310,12 +311,12 @@ fn control_at(src: Bytes, at: Int) -> Int = {
 }
 
 /// A scanner at the start of `src`, past a byte order mark.
-fn opened(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
+fn scanner(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
   let n = src.len();
-  if n > limits.bytes { stop(max(limits.bytes, 0), TooLong) }
-  else if !src.is_utf8() { stop(utf8_end(src), NotUtf8) } else {
+  if n > limits.bytes { fail(max(limits.bytes, 0), TooLong) }
+  else if !src.is_utf8() { fail(utf8_end(src), NotUtf8) } else {
     let bad = src.skip_until(0, low_controls());
-    if bad < n { stop(bad, Control(control_at(src, bad))) } else {
+    if bad < n { fail(bad, Control(control_at(src, bad))) } else {
       let start = if src.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
       {
         src: src,
@@ -332,7 +333,7 @@ fn opened(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
         open: 0,
         flow_level: 0,
         levels: Empty,
-        block_key: None,
+        block_simple_key: None,
         asked: Empty,
         allow_key: true,
         hold: -1,
@@ -346,7 +347,7 @@ fn opened(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
   }
 }
 
-fn with_token(s: Scanner, tok: Tok, from: Int, to: Int) -> Scanner =
+fn with_token(s: Scanner, tok: TokenKind, from: Int, to: Int) -> Scanner =
   { ..s, tokens: s.tokens.push({ tok: tok, from: from, to: to }) }
 
 /// The scanner past a token that ends at `to`.
@@ -359,24 +360,25 @@ fn column(s: Scanner) -> Int = if s.lead && s.tabbed { s.line_indent } else { s.
 
 fn in_flow_map(s: Scanner) -> Bool = match s.levels { Top(level, _) -> level.map, Empty -> false }
 
-fn key_of(s: Scanner) -> Option<Candidate> =
-  match s.levels { Top(level, _) -> level.key, Empty -> s.block_key }
+fn simple_key(s: Scanner) -> Option<SimpleKey> =
+  match s.levels { Top(level, _) -> level.key, Empty -> s.block_simple_key }
 
-fn with_key(s: Scanner, key: Option<Candidate>) -> Scanner =
+fn with_simple_key(s: Scanner, key: Option<SimpleKey>) -> Scanner =
   match s.levels {
     Top(level, rest) -> { ..s, levels: Top({ map: level.map, key: key }, rest) },
-    Empty -> { ..s, block_key: key },
+    Empty -> { ..s, block_simple_key: key },
   }
 
-fn unheld(s: Scanner, key: Option<Candidate>) -> Int =
-  match key { Some(found) -> if found.slot == s.hold { -1 } else { s.hold }, None -> s.hold }
+fn blocked_without(s: Scanner, key: Option<SimpleKey>) -> Int =
+  match key { Some(locate) -> if locate.slot == s.hold { -1 } else { s.hold }, None -> s.hold }
 
-fn no_key<a>(at: Int) -> a / {fault.at} = stop(at, Expected("`:` after this key, on its line"))
+fn missing_colon<a>(at: Int) -> a / {fault.at} =
+  fail(at, Expected("`:` after this key, on its line"))
 
 /// The scanner on the line that starts at `start`, `lines` below. A candidate that must be a key
 /// has no `:` on its line by now.
 fn on_line(s: Scanner, start: Int, lines: Int) -> Scanner / {fault.at, abort.raise} =
-  if s.required >= 0 { no_key(s.required) } else {
+  if s.required >= 0 { missing_colon(s.required) } else {
     {
       ..s,
       pos: start,
@@ -401,14 +403,14 @@ fn skip(s: Scanner, left: Int) -> Scanner / {fault.at, abort.raise} = {
   else if is_break(c) { skip(on_line(s, p + break_len(src, p), 1), left - 1) }
   else if c == b'#' && (p == s.line_start || is_blank(src.peek(p - 1))) {
     let end = src.skip_until(p, b"\r\n");
-    printable(src, p, end);
+    require_printable(src, p, end);
     skip({ ..s, pos: end, comments: s.comments.push({ from: p, to: end }) }, left - 1)
   } else { { ..s, pos: p } }
 }
 
-type Unrolled = { indent: Int, indents: Stack<Int>, ends: Int }
+type UnrollResult = { indent: Int, indents: Stack<Int>, ends: Int }
 
-fn unrolled(indent: Int, indents: Stack<Int>, col: Int, ends: Int) -> Unrolled =
+fn unrolled(indent: Int, indents: Stack<Int>, col: Int, ends: Int) -> UnrollResult =
   if indent <= col { { indent: indent, indents: indents, ends: ends } } else {
     match indents {
       Empty -> { indent: -1, indents: Empty, ends: ends },
@@ -424,39 +426,42 @@ fn unroll(s: Scanner, col: Int) -> Scanner =
       ..s,
       indent: u.indent,
       indents: u.indents,
-      asked: within(s.asked, col),
+      asked: no_deeper_than(s.asked, col),
       open: s.open - u.ends,
       tokens: range(0, u.ends).fold(s.tokens, |tokens: List<Token>, _: Int|
-        tokens.push({ tok: TBlockEnd, from: s.pos, to: s.pos })),
+        tokens.push({ tok: BlockEndToken, from: s.pos, to: s.pos })),
     }
   }
 
 /// The columns no deeper than `col`.
-fn within(asked: Stack<Int>, col: Int) -> Stack<Int> =
-  match asked { Top(at, rest) -> if at > col { within(rest, col) } else { asked }, Empty -> Empty }
+fn no_deeper_than(asked: Stack<Int>, col: Int) -> Stack<Int> =
+  match asked {
+    Top(at, rest) -> if at > col { no_deeper_than(rest, col) } else { asked },
+    Empty -> Empty,
+  }
 
-fn is_asked(asked: Stack<Int>, col: Int) -> Bool =
+fn has_explicit_key(asked: Stack<Int>, col: Int) -> Bool =
   match asked { Top(at, _) -> at == col, Empty -> false }
 
 /// The columns without `col`, where it is the deepest.
-fn answered(asked: Stack<Int>, col: Int) -> Stack<Int> =
+fn without_explicit_key(asked: Stack<Int>, col: Int) -> Stack<Int> =
   match asked { Top(at, rest) -> if at == col { rest } else { asked }, Empty -> Empty }
 
 /// The scanner with a block collection open at `col`, which is written at `at`.
 fn roll(s: Scanner, col: Int, at: Int) -> Scanner / {fault.at} =
-  if s.open + s.flow_level >= s.depth { stop(at, TooDeep) }
+  if s.open + s.flow_level >= s.depth { fail(at, TooDeep) }
   else { { ..s, indents: Top(s.indent, s.indents), indent: col, open: s.open + 1 } }
 
-fn none_at(at: Int) -> Token = { tok: TNone, from: at, to: at }
+fn none_at(at: Int) -> Token = { tok: PlaceholderToken, from: at, to: at }
 
 /// The scanner with the token it stands at noted as a candidate, where a key may start.
-fn keyed(s: Scanner) -> Scanner =
+fn save_simple_key(s: Scanner) -> Scanner =
   if !s.allow_key || in_flow_map(s) { s } else {
     let col = column(s);
     let slot = s.tokens.len();
-    let noted = with_key(
+    let noted = with_simple_key(
       s,
-      Some({ slot: slot, pos: s.pos, line: s.line, col: col, tabbed: s.tabbed }),
+      Some({ slot: slot, pos: s.pos, line: s.line, column: col, tabbed: s.tabbed }),
     );
     {
       ..noted,
@@ -467,34 +472,34 @@ fn keyed(s: Scanner) -> Scanner =
   }
 
 /// The scanner with no candidate at its level. One that must be a key is one no more.
-fn unkeyed(s: Scanner) -> Scanner / {fault.at} =
-  if s.flow_level == 0 && s.required >= 0 { no_key(s.required) } else {
-    let key = key_of(s);
-    { ..with_key(s, None), hold: unheld(s, key) }
+fn remove_simple_key(s: Scanner) -> Scanner / {fault.at} =
+  if s.flow_level == 0 && s.required >= 0 { missing_colon(s.required) } else {
+    let key = simple_key(s);
+    { ..with_simple_key(s, None), hold: blocked_without(s, key) }
   }
 
 /// The scanner past one more token. Every call passes a byte or ends the stream.
 fn fetch(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
-  let found = skip(s, s.src.len() - s.pos + 2);
-  let c = found.src.peek(found.pos);
-  if c < 0 { finish(found) }
-  else if found.flow_level > 0 { in_flow(found, c) }
-  else { in_block(unroll(found, column(found)), c) }
+  let locate = skip(s, s.src.len() - s.pos + 2);
+  let c = locate.src.peek(locate.pos);
+  if c < 0 { finish(locate) }
+  else if locate.flow_level > 0 { in_flow(locate, c) }
+  else { in_block(unroll(locate, column(locate)), c) }
 }
 
 fn finish(s: Scanner) -> Scanner / {fault.at} =
-  if s.required >= 0 { no_key(s.required) } else {
+  if s.required >= 0 { missing_colon(s.required) } else {
     let ended = unroll(s, -1);
-    { ..with_token(ended, TStreamEnd, s.pos, s.pos), ended: true, hold: -1 }
+    { ..with_token(ended, StreamEndToken, s.pos, s.pos), ended: true, hold: -1 }
   }
 
 /// A token inside a flow collection: on a new line it is indented past the block around it, but
 /// for the bracket that closes the collection, which may stand at that block's own indentation.
 fn in_flow(s: Scanner, c: Int) -> Scanner / {fault.at, abort.raise} =
   if s.lead && (s.line_indent < s.indent || (s.line_indent == s.indent && c != b']' && c != b'}')) {
-    stop(s.pos, Expected("a line of a flow collection indented more than the block it is in"))
+    fail(s.pos, Expected("a line of a flow collection indented more than the block it is in"))
   } else if s.pos == s.line_start && at_marker(s.src, s.pos) {
-    stop(s.pos, Expected("the flow collection to close before a document marker"))
+    fail(s.pos, Expected("the flow collection to close before a document marker"))
   } else { token(s, c, s.src.peek(s.pos + 1)) }
 
 fn in_block(s: Scanner, c: Int) -> Scanner / {fault.at, abort.raise} =
@@ -524,8 +529,8 @@ fn token(s: Scanner, c: Int, next: Int) -> Scanner / {fault.at, abort.raise} =
     b'>' -> block_scalar(s, false),
     b'\'' -> quoted(s, false),
     34 -> quoted(s, true),
-    b'#' -> stop(s.pos, Expected("a blank before a comment")),
-    b'%' | b'@' | b'`' -> stop(s.pos, Expected("a node, which this character starts none of")),
+    b'#' -> fail(s.pos, Expected("a blank before a comment")),
+    b'%' | b'@' | b'`' -> fail(s.pos, Expected("a node, which this character starts none of")),
     b'-' -> if safe_after(s, next) { plain(s) } else { block_entry(s) },
     63 -> if safe_after(s, next) { plain(s) } else { key_indicator(s) },
     b':' -> if (s.after_json && s.flow_level > 0) || !safe_after(s, next) { value_indicator(s) }
@@ -535,51 +540,55 @@ fn token(s: Scanner, c: Int, next: Int) -> Scanner / {fault.at, abort.raise} =
 
 /// `---` or `...` at the start of a line: every block collection ends.
 fn marker(s: Scanner, start: Bool) -> Scanner / {fault.at, abort.raise} = {
-  let ended = unroll(unkeyed(s), -1);
+  let ended = unroll(remove_simple_key(s), -1);
   let to = s.pos + 3;
   let rest = s.src.skip(to, b" \t");
   let c = s.src.peek(rest);
   if !start && !(c < 0 || is_break(c) || c == b'#') {
-    stop(rest, Expected("nothing after `...` on its line but a comment"))
+    fail(rest, Expected("nothing after `...` on its line but a comment"))
   } else {
-    past(with_token(ended, if start { TDocumentStart } else { TDocumentEnd }, s.pos, to), to, false)
+    past(
+      with_token(ended, if start { DocumentStartToken } else { DocumentEndToken }, s.pos, to),
+      to,
+      false,
+    )
   }
 }
 
 // --- Directives -------------------------------------------------------------
 
-type Directed = { tok: Tok, to: Int }
+type ScannedDirective = { tok: TokenKind, to: Int }
 
 fn directive(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   let src = s.src;
-  let ended = unroll(unkeyed(s), -1);
+  let ended = unroll(remove_simple_key(s), -1);
   let name_end = src.skip_until(s.pos + 1, b" \t\r\n");
   let name = src.slice(s.pos + 1, name_end);
   let args = src.skip(name_end, b" \t");
   let read = if name == b"YAML" { version(src, args) }
   else if name == b"TAG" { handle_directive(src, args) }
-  else { { tok: TReserved, to: src.skip_until(args, b"\r\n") } };
+  else { { tok: ReservedDirectiveToken, to: src.skip_until(args, b"\r\n") } };
   let rest = src.skip(read.to, b" \t");
   let c = src.peek(rest);
   if !ends_word(src.peek(read.to)) || !(c < 0 || is_break(c) || c == b'#') {
-    stop(read.to, Expected("nothing after a directive on its line but a comment"))
+    fail(read.to, Expected("nothing after a directive on its line but a comment"))
   } else { past(with_token(ended, read.tok, s.pos, read.to), read.to, false) }
 }
 
 fn digits() -> Bytes = b"0123456789"
 
-fn version(src: Bytes, i: Int) -> Directed / {fault.at, abort.raise} = {
+fn version(src: Bytes, i: Int) -> ScannedDirective / {fault.at, abort.raise} = {
   let dot = src.skip(i, digits());
   let end = src.skip(dot + 1, digits());
   if dot == i || src.peek(dot) != b'.' || end == dot + 1 || end - i > 12 {
-    stop(i, Expected("a version after %YAML, as `1.2`"))
+    fail(i, Expected("a version after %YAML, as `1.2`"))
   } else {
     match src.slice(i, dot).int_of_ascii() {
       Some(major) -> match src.slice(dot + 1, end).int_of_ascii() {
-        Some(minor) -> { tok: TVersion(major, minor), to: end },
-        None -> stop(i, Expected("a version after %YAML, as `1.2`")),
+        Some(minor) -> { tok: VersionDirectiveToken(major, minor), to: end },
+        None -> fail(i, Expected("a version after %YAML, as `1.2`")),
       },
-      None -> stop(i, Expected("a version after %YAML, as `1.2`")),
+      None -> fail(i, Expected("a version after %YAML, as `1.2`")),
     }
   }
 }
@@ -594,34 +603,37 @@ fn tag_chars() -> Bytes =
 fn uri_chars() -> Bytes =
   b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-#;/?:@&=+$_.~*'()%!,[]"
 
-fn handle_directive(src: Bytes, i: Int) -> Directed / {fault.at, abort.raise} = {
+fn handle_directive(src: Bytes, i: Int) -> ScannedDirective / {fault.at, abort.raise} = {
   let word_end = src.skip(i + 1, word_chars());
   let handle_end = if src.peek(word_end) == b'!' { word_end + 1 } else { i + 1 };
   let prefix = src.skip(handle_end, b" \t");
   let end = src.skip(prefix, uri_chars());
   if src.peek(i) != b'!' || (handle_end == i + 1 && word_end > i + 1) {
-    stop(i, Expected("a tag handle after %TAG, as `!`, `!!` or `!name!`"))
+    fail(i, Expected("a tag handle after %TAG, as `!`, `!!` or `!name!`"))
   } else if prefix == handle_end || end == prefix {
-    stop(prefix, Expected("a prefix after the handle of %TAG"))
+    fail(prefix, Expected("a prefix after the handle of %TAG"))
   } else {
     {
-      tok: TTagDirective(String::of_bytes(src.slice(i, handle_end)), unescaped(src, prefix, end)),
+      tok: TagDirectiveToken(
+        String::of_bytes(src.slice(i, handle_end)),
+        percent_decoded(src, prefix, end),
+      ),
       to: end,
     }
   }
 }
 
 /// The text from `from` to `to` with each `%XX` as the byte it names.
-fn unescaped(src: Bytes, from: Int, to: Int) -> String / {fault.at, abort.raise} = {
+fn percent_decoded(src: Bytes, from: Int, to: Int) -> String / {fault.at, abort.raise} = {
   let raw = src.slice(from, to);
   if raw.skip_until(0, b"%") == raw.len() { String::of_bytes(raw) } else {
-    let decoded = Bytes::concat_all(percent(raw, 0, [], raw.len() + 1, from));
+    let decoded = Bytes::concat_all(percent_pieces(raw, 0, [], raw.len() + 1, from));
     if decoded.is_utf8() { String::of_bytes(decoded) }
-    else { stop(from, Expected("the escapes of a tag to spell UTF-8")) }
+    else { fail(from, Expected("the escapes of a tag to spell UTF-8")) }
   }
 }
 
-fn percent(
+fn percent_pieces(
   raw: Bytes,
   i: Int,
   acc: List<Bytes>,
@@ -635,16 +647,16 @@ fn percent(
     let high = hex_value(raw.peek(at + 1));
     let low = hex_value(raw.peek(at + 2));
     if high < 0 || low < 0 {
-      stop(base + at, Expected("two hexadecimal digits after `%` in a tag"))
-    } else { percent(raw, at + 3, run.push(byte_of_int(high * 16 + low)), left - 1, base) }
+      fail(base + at, Expected("two hexadecimal digits after `%` in a tag"))
+    } else { percent_pieces(raw, at + 3, run.push(byte_of_int(high * 16 + low)), left - 1, base) }
   }
 }
 
 // --- Indicators -------------------------------------------------------------
 
 fn flow_start(s: Scanner, map: Bool) -> Scanner / {fault.at} =
-  if s.open + s.flow_level >= s.depth { stop(s.pos, TooDeep) } else {
-    let noted = keyed(s);
+  if s.open + s.flow_level >= s.depth { fail(s.pos, TooDeep) } else {
+    let noted = save_simple_key(s);
     let inside = {
       ..noted,
       flow_level: s.flow_level + 1,
@@ -653,7 +665,7 @@ fn flow_start(s: Scanner, map: Bool) -> Scanner / {fault.at} =
     past(
       with_token(
         inside,
-        if map { TFlowMappingStart } else { TFlowSequenceStart },
+        if map { FlowMappingStartToken } else { FlowSequenceStartToken },
         s.pos,
         s.pos + 1,
       ),
@@ -664,55 +676,69 @@ fn flow_start(s: Scanner, map: Bool) -> Scanner / {fault.at} =
 
 fn flow_end(s: Scanner, map: Bool) -> Scanner / {fault.at} =
   match s.levels {
-    Empty -> stop(s.pos, Expected("a flow collection open, for this to close")),
+    Empty -> fail(s.pos, Expected("a flow collection open, for this to close")),
     Top(level, rest) -> {
-      let outside = { ..s, flow_level: s.flow_level - 1, levels: rest, hold: unheld(s, level.key) };
-      let closed = past(
-        with_token(outside, if map { TFlowMappingEnd } else { TFlowSequenceEnd }, s.pos, s.pos + 1),
+      let outside = {
+        ..s,
+        flow_level: s.flow_level - 1,
+        levels: rest,
+        hold: blocked_without(s, level.key),
+      };
+      let end_collection = past(
+        with_token(
+          outside,
+          if map { FlowMappingEndToken } else { FlowSequenceEndToken },
+          s.pos,
+          s.pos + 1,
+        ),
         s.pos + 1,
         false,
       );
-      { ..closed, after_json: closed.flow_level > 0 }
+      { ..end_collection, after_json: end_collection.flow_level > 0 }
     },
   }
 
 fn flow_entry(s: Scanner) -> Scanner / {fault.at} =
   if s.flow_level == 0 {
-    stop(s.pos, Expected("a flow collection open, for `,` to separate its entries"))
-  } else { past(with_token(unkeyed(s), TFlowEntry, s.pos, s.pos + 1), s.pos + 1, true) }
+    fail(s.pos, Expected("a flow collection open, for `,` to separate its entries"))
+  } else {
+    past(with_token(remove_simple_key(s), FlowEntryToken, s.pos, s.pos + 1), s.pos + 1, true)
+  }
 
 fn block_entry(s: Scanner) -> Scanner / {fault.at} =
-  if s.flow_level > 0 { stop(s.pos, Expected("no `-` entry inside a flow collection")) }
-  else if !s.allow_key { stop(s.pos, Expected("a block sequence to start on a line of its own")) }
-  else if s.tabbed { stop(s.pos, Tab) } else {
+  if s.flow_level > 0 { fail(s.pos, Expected("no `-` entry inside a flow collection")) }
+  else if !s.allow_key { fail(s.pos, Expected("a block sequence to start on a line of its own")) }
+  else if s.tabbed { fail(s.pos, Tab) } else {
     let col = column(s);
-    let cleared = unkeyed(s);
-    let begun = if cleared.indent < col {
-      with_token(roll(cleared, col, s.pos), TBlockSequenceStart, s.pos, s.pos)
+    let cleared = remove_simple_key(s);
+    let start_collection = if cleared.indent < col {
+      with_token(roll(cleared, col, s.pos), BlockSequenceStartToken, s.pos, s.pos)
     } else { cleared };
-    past(with_token(begun, TBlockEntry, s.pos, s.pos + 1), s.pos + 1, true)
+    past(with_token(start_collection, BlockEntryToken, s.pos, s.pos + 1), s.pos + 1, true)
   }
 
 fn key_indicator(s: Scanner) -> Scanner / {fault.at} =
-  if s.flow_level > 0 { past(with_token(unkeyed(s), TKey, s.pos, s.pos + 1), s.pos + 1, false) }
-  else if !s.allow_key { stop(s.pos, Expected("a block mapping to start on a line of its own")) }
-  else if s.tabbed { stop(s.pos, Tab) } else {
+  if s.flow_level > 0 {
+    past(with_token(remove_simple_key(s), KeyToken, s.pos, s.pos + 1), s.pos + 1, false)
+  } else if !s.allow_key { fail(s.pos, Expected("a block mapping to start on a line of its own")) }
+  else if s.tabbed { fail(s.pos, Tab) } else {
     let col = column(s);
-    let cleared = unkeyed(s);
-    let begun = if cleared.indent < col {
-      with_token(roll(cleared, col, s.pos), TBlockMappingStart, s.pos, s.pos)
+    let cleared = remove_simple_key(s);
+    let start_collection = if cleared.indent < col {
+      with_token(roll(cleared, col, s.pos), BlockMappingStartToken, s.pos, s.pos)
     } else { cleared };
     let asking = {
-      ..begun,
-      asked: if is_asked(begun.asked, col) { begun.asked } else { Top(col, begun.asked) },
+      ..start_collection,
+      asked: if has_explicit_key(start_collection.asked, col) { start_collection.asked }
+      else { Top(col, start_collection.asked) },
     };
-    past(with_token(asking, TKey, s.pos, s.pos + 1), s.pos + 1, true)
+    past(with_token(asking, KeyToken, s.pos, s.pos + 1), s.pos + 1, true)
   }
 
 /// The candidate of the scanner's level that a `:` here makes a key: one on this line, and near.
-fn live_key(s: Scanner) -> Option<Candidate> =
-  match key_of(s) {
-    Some(found) -> if found.line == s.line && s.pos - found.pos <= 1024 { Some(found) }
+fn usable_simple_key(s: Scanner) -> Option<SimpleKey> =
+  match simple_key(s) {
+    Some(locate) -> if locate.line == s.line && s.pos - locate.pos <= 1024 { Some(locate) }
     else { None },
     None -> None,
   }
@@ -721,21 +747,26 @@ fn live_key(s: Scanner) -> Option<Candidate> =
 /// and a collection may start on its line; with no `?` to answer it has an empty key, and its
 /// value is one node as any key's is.
 fn value_indicator(s: Scanner) -> Scanner / {fault.at, abort.raise} =
-  if in_flow_map(s) { past(with_token(s, TValue, s.pos, s.pos + 1), s.pos + 1, false) } else {
-    match live_key(s) {
-      Some(found) -> after_key(s, found),
+  if in_flow_map(s) { past(with_token(s, ValueToken, s.pos, s.pos + 1), s.pos + 1, false) } else {
+    match usable_simple_key(s) {
+      Some(locate) -> after_key(s, locate),
       None -> if s.flow_level > 0 {
-        past(with_token(with_key(s, None), TValue, s.pos, s.pos + 1), s.pos + 1, false)
-      } else if !s.allow_key { stop(s.pos, Expected("no `:` here: a mapping's value is one node")) }
-      else if s.tabbed { stop(s.pos, Tab) } else {
+        past(with_token(with_simple_key(s, None), ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
+      } else if !s.allow_key { fail(s.pos, Expected("no `:` here: a mapping's value is one node")) }
+      else if s.tabbed { fail(s.pos, Tab) } else {
         let col = column(s);
-        let cleared = unkeyed(s);
-        let begun = if cleared.indent < col {
-          with_token(roll(cleared, col, s.pos), TBlockMappingStart, s.pos, s.pos)
+        let cleared = remove_simple_key(s);
+        let start_collection = if cleared.indent < col {
+          with_token(roll(cleared, col, s.pos), BlockMappingStartToken, s.pos, s.pos)
         } else { cleared };
-        let answers = is_asked(begun.asked, col);
+        let answers = has_explicit_key(start_collection.asked, col);
         past(
-          with_token({ ..begun, asked: answered(begun.asked, col) }, TValue, s.pos, s.pos + 1),
+          with_token(
+            { ..start_collection, asked: without_explicit_key(start_collection.asked, col) },
+            ValueToken,
+            s.pos,
+            s.pos + 1,
+          ),
           s.pos + 1,
           answers,
         )
@@ -745,71 +776,85 @@ fn value_indicator(s: Scanner) -> Scanner / {fault.at, abort.raise} =
 
 /// A `:` after a candidate: the candidate's places take a key, and in a block the start of a
 /// mapping where its column opens one.
-fn after_key(s: Scanner, found: Candidate) -> Scanner / {fault.at, abort.raise} =
-  if s.flow_level == 0 && found.tabbed { stop(found.pos, Tab) } else {
-    let opens = s.flow_level == 0 && s.indent < found.col;
-    let begun = if opens { roll(s, found.col, found.pos) } else { s };
+fn after_key(s: Scanner, locate: SimpleKey) -> Scanner / {fault.at, abort.raise} =
+  if s.flow_level == 0 && locate.tabbed { fail(locate.pos, Tab) } else {
+    let opens = s.flow_level == 0 && s.indent < locate.column;
+    let start_collection = if opens { roll(s, locate.column, locate.pos) } else { s };
     let started = if opens {
-      begun.tokens.set(found.slot, { tok: TBlockMappingStart, from: found.pos, to: found.pos })
-    } else { begun.tokens };
-    let marked = started.set(found.slot + 1, { tok: TKey, from: found.pos, to: found.pos });
+      start_collection.tokens.set(locate.slot, {
+        tok: BlockMappingStartToken,
+        from: locate.pos,
+        to: locate.pos,
+      })
+    } else { start_collection.tokens };
+    let marked = started.set(locate.slot + 1, { tok: KeyToken, from: locate.pos, to: locate.pos });
     let cleared = {
-      ..with_key(begun, None),
+      ..with_simple_key(start_collection, None),
       tokens: marked,
-      hold: unheld(s, Some(found)),
+      hold: blocked_without(s, Some(locate)),
       required: if s.flow_level == 0 { -1 } else { s.required },
-      asked: if s.flow_level == 0 { answered(begun.asked, found.col) } else { begun.asked },
+      asked: if s.flow_level == 0 { without_explicit_key(start_collection.asked, locate.column) }
+      else { start_collection.asked },
     };
-    past(with_token(cleared, TValue, s.pos, s.pos + 1), s.pos + 1, false)
+    past(with_token(cleared, ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
   }
 
 fn anchor(s: Scanner, alias: Bool) -> Scanner / {fault.at, abort.raise} = {
   let end = s.src.skip_until(s.pos + 1, b" \t\r\n,[]{}");
-  if end == s.pos + 1 { stop(s.pos, Expected("a name after this indicator")) }
-  else if !ends_properties(s, s.src.peek(end)) { stop(end, Expected("a blank after an anchor")) }
+  if end == s.pos + 1 { fail(s.pos, Expected("a name after this indicator")) }
+  else if !ends_properties(s, s.src.peek(end)) { fail(end, Expected("a blank after an anchor")) }
   else {
     let name = String::of_bytes(s.src.slice(s.pos + 1, end));
-    printable(s.src, s.pos, end);
+    require_printable(s.src, s.pos, end);
     past(
-      with_token(keyed(s), if alias { TAlias(name) } else { TAnchor(name) }, s.pos, end),
+      with_token(
+        save_simple_key(s),
+        if alias { AliasToken(name) } else { AnchorToken(name) },
+        s.pos,
+        end,
+      ),
       end,
       false,
     )
   }
 }
 
-type TagRead = { handle: String, suffix: String, to: Int }
+type ScannedTag = { handle: String, suffix: String, to: Int }
 
 fn tag(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   let read = if s.src.peek(s.pos + 1) == b'<' { verbatim(s.src, s.pos) }
   else { shorthand(s.src, s.pos) };
-  if !ends_properties(s, s.src.peek(read.to)) { stop(read.to, Expected("a blank after a tag")) }
+  if !ends_properties(s, s.src.peek(read.to)) { fail(read.to, Expected("a blank after a tag")) }
   else {
-    past(with_token(keyed(s), TTag(read.handle, read.suffix), s.pos, read.to), read.to, false)
+    past(
+      with_token(save_simple_key(s), TagToken(read.handle, read.suffix), s.pos, read.to),
+      read.to,
+      false,
+    )
   }
 }
 
-fn verbatim(src: Bytes, from: Int) -> TagRead / {fault.at, abort.raise} = {
+fn verbatim(src: Bytes, from: Int) -> ScannedTag / {fault.at, abort.raise} = {
   let end = src.skip(from + 2, uri_chars());
   if src.peek(end) != b'>' || end == from + 2 {
-    stop(end, Expected("a verbatim tag, as `!<tag:yaml.org,2002:str>`"))
-  } else { { handle: "", suffix: unescaped(src, from + 2, end), to: end + 1 } }
+    fail(end, Expected("a verbatim tag, as `!<tag:yaml.org,2002:str>`"))
+  } else { { handle: "", suffix: percent_decoded(src, from + 2, end), to: end + 1 } }
 }
 
-fn shorthand(src: Bytes, from: Int) -> TagRead / {fault.at, abort.raise} = {
+fn shorthand(src: Bytes, from: Int) -> ScannedTag / {fault.at, abort.raise} = {
   let word_end = src.skip(from + 1, word_chars());
   if src.peek(word_end) == b'!' {
     let end = src.skip(word_end + 1, tag_chars());
-    if end == word_end + 1 { stop(end, Expected("a tag's name after its handle")) } else {
+    if end == word_end + 1 { fail(end, Expected("a tag's name after its handle")) } else {
       {
         handle: String::of_bytes(src.slice(from, word_end + 1)),
-        suffix: unescaped(src, word_end + 1, end),
+        suffix: percent_decoded(src, word_end + 1, end),
         to: end,
       }
     }
   } else {
     let end = src.skip(word_end, tag_chars());
-    { handle: "!", suffix: unescaped(src, from + 1, end), to: end }
+    { handle: "!", suffix: percent_decoded(src, from + 1, end), to: end }
   }
 }
 
@@ -832,21 +877,21 @@ fn gap(src: Bytes, p: Int, breaks: Int, start: Int, left: Int) -> Gap / {abort.r
 fn folded(breaks: Int) -> Bytes = if breaks == 1 { b" " } else { b"\n".repeat(breaks - 1) }
 
 /// A scalar's pieces so far, where its text ends, and the scanner on its last line.
-type Run = { chunks: List<Bytes>, to: Int, s: Scanner }
+type ScalarText = { chunks: List<Bytes>, to: Int, s: Scanner }
 
 fn scalar(
   s: Scanner,
-  run: Run,
+  run: ScalarText,
   style: Style,
   from: Int,
   allow_key: Bool,
 ) -> Scanner / {fault.at, abort.raise} = {
   let content = Bytes::concat_all(run.chunks);
   let quotes = style == SingleQuoted || style == DoubleQuoted;
-  if !quotes { printable(s.src, from, run.to) } else { () };
-  if content.len() > s.scalar { stop(from, ScalarTooLong) } else {
+  if !quotes { require_printable(s.src, from, run.to) } else { () };
+  if content.len() > s.scalar { fail(from, ScalarTooLong) } else {
     past(
-      with_token(run.s, TScalar(String::of_bytes(content), style), from, run.to),
+      with_token(run.s, ScalarToken(String::of_bytes(content), style), from, run.to),
       run.to,
       allow_key,
     )
@@ -854,7 +899,7 @@ fn scalar(
 }
 
 fn plain(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
-  let run = plain_lines(keyed(s), s.pos, [], s.src.len() - s.pos + 2);
+  let run = plain_lines(save_simple_key(s), s.pos, [], s.src.len() - s.pos + 2);
   scalar(s, run, Plain, s.pos, false)
 }
 
@@ -883,7 +928,7 @@ fn plain_end(src: Bytes, p: Int, flow: Bool, left: Int) -> Int / {abort.raise} =
 
 /// Whether a plain scalar goes on at the line the gap reaches: its text is indented past the
 /// block around it and starts with what a plain scalar may hold.
-fn goes_on(s: Scanner, g: Gap) -> Bool = {
+fn plain_continues(s: Scanner, g: Gap) -> Bool = {
   let c = s.src.peek(g.at);
   let flow = s.flow_level > 0;
   c >= 0 && c != b'#' && g.indent > s.indent && !(g.at == g.start && at_marker(s.src, g.at))
@@ -896,34 +941,34 @@ fn plain_lines(
   from: Int,
   chunks: List<Bytes>,
   left: Int,
-) -> Run / {fault.at, abort.raise} = {
+) -> ScalarText / {fault.at, abort.raise} = {
   let src = s.src;
   let end = plain_end(src, from, s.flow_level > 0, src.len() - from + 2);
   let text = chunks.push(src.slice(from, end));
   let g = gap(src, src.skip(end, b" \t"), 0, s.line_start, src.len() - end + 2);
-  if g.breaks == 0 || !goes_on(s, g) { { chunks: text, to: end, s: s } }
+  if g.breaks == 0 || !plain_continues(s, g) { { chunks: text, to: end, s: s } }
   else if left <= 0 { panic("more lines than bytes") }
   else { plain_lines(on_line(s, g.start, g.breaks), g.at, text.push(folded(g.breaks)), left - 1) }
 }
 
 fn quoted(s: Scanner, double: Bool) -> Scanner / {fault.at, abort.raise} = {
-  let run = quoted_run(keyed(s), s.pos + 1, [], double, s.src.len() - s.pos + 2);
+  let run = quoted_run(save_simple_key(s), s.pos + 1, [], double, s.src.len() - s.pos + 2);
   let read = scalar(s, run, if double { DoubleQuoted } else { SingleQuoted }, s.pos, false);
   { ..read, after_json: read.flow_level > 0 }
 }
 
 /// `to` moved back over the blanks before it, as far as `from`.
-fn back(src: Bytes, from: Int, to: Int) -> Int / {abort.raise} =
-  if to > from && is_blank(src.at(to - 1)) { back(src, from, to - 1) } else { to }
+fn before_blanks(src: Bytes, from: Int, to: Int) -> Int / {abort.raise} =
+  if to > from && is_blank(src.at(to - 1)) { before_blanks(src, from, to - 1) } else { to }
 
 /// The scanner on the line a gap inside a quoted scalar reaches, which is indented past the block
 /// around the scalar and holds no document marker.
 fn line_within(s: Scanner, g: Gap) -> Scanner / {fault.at, abort.raise} =
-  if s.src.peek(g.at) < 0 { stop(g.at, Expected("the quote that closes this scalar")) }
+  if s.src.peek(g.at) < 0 { fail(g.at, Expected("the quote that closes this scalar")) }
   else if g.at == g.start && at_marker(s.src, g.at) {
-    stop(g.at, Expected("the quote that closes this scalar before a document marker"))
+    fail(g.at, Expected("the quote that closes this scalar before a document marker"))
   } else if g.indent <= s.indent {
-    stop(g.at, Expected("a line of a quoted scalar indented more than the block it is in"))
+    fail(g.at, Expected("a line of a quoted scalar indented more than the block it is in"))
   } else { on_line(s, g.start, g.breaks) }
 
 /// A quoted scalar from `from`, which stands inside it. Each round passes a byte, so the bytes
@@ -934,14 +979,14 @@ fn quoted_run(
   chunks: List<Bytes>,
   double: Bool,
   left: Int,
-) -> Run / {fault.at, abort.raise} = {
+) -> ScalarText / {fault.at, abort.raise} = {
   let src = s.src;
   let q = src.skip_until(from, if double { b"\"\\\r\n" } else { b"'\r\n" });
   let c = src.peek(q);
-  if c < 0 { stop(q, Expected("the quote that closes this scalar")) }
+  if c < 0 { fail(q, Expected("the quote that closes this scalar")) }
   else if left <= 0 { panic("more pieces than bytes") } else if is_break(c) {
     let g = gap(src, q, 0, s.line_start, src.len() - q + 2);
-    let text = chunks.push(src.slice(from, back(src, from, q)));
+    let text = chunks.push(src.slice(from, before_blanks(src, from, q)));
     quoted_run(line_within(s, g), g.at, text.push(folded(g.breaks)), double, left - 1)
   } else if c == b'\'' {
     if src.peek(q + 1) == b'\'' {
@@ -952,25 +997,30 @@ fn quoted_run(
 }
 
 /// A double-quoted scalar from the backslash at `q`.
-fn escaped(s: Scanner, q: Int, chunks: List<Bytes>, left: Int) -> Run / {fault.at, abort.raise} = {
+fn escaped(
+  s: Scanner,
+  q: Int,
+  chunks: List<Bytes>,
+  left: Int,
+) -> ScalarText / {fault.at, abort.raise} = {
   let src = s.src;
   let c = src.peek(q + 1);
   if is_break(c) {
     let first = q + 1 + break_len(src, q + 1);
     let g = gap(src, src.skip(first, b" \t"), 0, first, src.len() - q + 2);
-    let within = line_within(s, {
+    let no_deeper_than = line_within(s, {
       breaks: g.breaks + 1,
       start: g.start,
       indent: g.indent,
       at: g.at,
     });
-    quoted_run(within, g.at, chunks.push(b"\n".repeat(g.breaks)), true, left)
-  } else if c == b'x' { coded(s, q, 2, chunks, left) }
-  else if c == b'u' { coded(s, q, 4, chunks, left) }
-  else if c == b'U' { coded(s, q, 8, chunks, left) } else {
-    let written = escape_of(c);
-    if written.len() == 0 { stop(q, Escape) }
-    else { quoted_run(s, q + 2, chunks.push(written), true, left) }
+    quoted_run(no_deeper_than, g.at, chunks.push(b"\n".repeat(g.breaks)), true, left)
+  } else if c == b'x' { hex_escape(s, q, 2, chunks, left) }
+  else if c == b'u' { hex_escape(s, q, 4, chunks, left) }
+  else if c == b'U' { hex_escape(s, q, 8, chunks, left) } else {
+    let edit_bytes = escape_of(c);
+    if edit_bytes.len() == 0 { fail(q, Escape) }
+    else { quoted_run(s, q + 2, chunks.push(edit_bytes), true, left) }
   }
 }
 
@@ -998,20 +1048,20 @@ fn escape_of(c: Int) -> Bytes =
   }
 
 /// A `\x`, `\u` or `\U` escape at `q`, of `width` hexadecimal digits.
-fn coded(
+fn hex_escape(
   s: Scanner,
   q: Int,
   width: Int,
   chunks: List<Bytes>,
   left: Int,
-) -> Run / {fault.at, abort.raise} = {
+) -> ScalarText / {fault.at, abort.raise} = {
   let code = range(q + 2, q + 2 + width).fold(0, |acc: Int, i: Int| {
     let d = hex_value(s.src.peek(i));
     if acc < 0 || d < 0 { -1 } else { acc * 16 + d }
   });
   match String::of_code_points([code]) {
     Some(text) -> quoted_run(s, q + 2 + width, chunks.push(Bytes::of_string(text)), true, left),
-    None -> stop(q, Escape),
+    None -> fail(q, Escape),
   }
 }
 
@@ -1035,7 +1085,7 @@ fn header(src: Bytes, i: Int, h: Header, left: Int) -> Header / {fault.at} = {
 
 /// The lines of a block scalar: where its first line starts, the indentation its content has, and
 /// whether line breaks fold.
-type Block = { src: Bytes, indent: Int, fold: Bool }
+type BlockScalar = { src: Bytes, indent: Int, fold: Bool }
 
 /// What a block scalar's lines have come to: its pieces, the empty lines since its last line of
 /// text, whether that line started with a blank, whether there was one, where the scalar ends,
@@ -1051,14 +1101,14 @@ type Lines = {
 }
 
 fn block_scalar(s: Scanner, literal: Bool) -> Scanner / {fault.at, abort.raise} =
-  if s.flow_level > 0 { stop(s.pos, Expected("no block scalar inside a flow collection")) } else {
+  if s.flow_level > 0 { fail(s.pos, Expected("no block scalar inside a flow collection")) } else {
     let src = s.src;
     let h = header(src, s.pos + 1, { chomp: 0, increment: 0, to: s.pos + 1 }, 2);
     let blanks = src.skip(h.to, b" \t");
     let comment = src.peek(blanks) == b'#' && blanks > h.to;
     let line_end = if comment { src.skip_until(blanks, b"\r\n") } else { blanks };
     if break_len(src, line_end) == 0 && src.peek(line_end) >= 0 {
-      stop(
+      fail(
         blanks,
         Expected("nothing after a block scalar's indicators on their line but a comment"),
       )
@@ -1066,7 +1116,7 @@ fn block_scalar(s: Scanner, literal: Bool) -> Scanner / {fault.at, abort.raise} 
       let first = line_end + break_len(src, line_end);
       let least = s.indent + 1;
       let indent = if h.increment > 0 { s.indent + h.increment }
-      else { detected(src, first, least, 0, src.len() - first + 2) };
+      else { detect_indent(src, first, least, 0, src.len() - first + 2) };
       let b = { src: src, indent: max(indent, 0), fold: !literal };
       let noted = if comment { { ..s, comments: s.comments.push({ from: blanks, to: line_end }) } }
       else { s };
@@ -1077,8 +1127,8 @@ fn block_scalar(s: Scanner, literal: Bool) -> Scanner / {fault.at, abort.raise} 
         src.len() - first + 2,
       );
       let content = chomped(read, h.chomp);
-      let ended = if src.peek(line_end) < 0 { past(unkeyed(noted), line_end, true) }
-      else { { ..on_line(unkeyed(noted), read.start, read.lines), allow_key: true } };
+      let ended = if src.peek(line_end) < 0 { past(remove_simple_key(noted), line_end, true) }
+      else { { ..on_line(remove_simple_key(noted), read.start, read.lines), allow_key: true } };
       let read_on = scalar(
         ended,
         { chunks: content, to: read.to, s: ended },
@@ -1092,7 +1142,7 @@ fn block_scalar(s: Scanner, literal: Bool) -> Scanner / {fault.at, abort.raise} 
 
 /// The indentation a block scalar with no indicator has: that of its first line that holds more
 /// than spaces, and no less than `least`. A line of spaces before it is no longer than it.
-fn detected(
+fn detect_indent(
   src: Bytes,
   p: Int,
   least: Int,
@@ -1102,16 +1152,16 @@ fn detected(
   let text = src.skip(p, b" ");
   let spaces = text - p;
   let b = break_len(src, text);
-  if b > 0 && left > 0 { detected(src, text + b, least, max(widest, spaces), left - 1) }
+  if b > 0 && left > 0 { detect_indent(src, text + b, least, max(widest, spaces), left - 1) }
   else if src.peek(text) < 0 { max(least, max(widest, spaces)) }
   else if spaces < least { max(least, widest) } else if widest > spaces {
-    stop(p, Expected("no line of spaces longer than the indentation of the block scalar under it"))
+    fail(p, Expected("no line of spaces longer than the indentation of the block scalar under it"))
   } else { spaces }
 }
 
 /// The block scalar's lines from the line that starts at `p`. Each round passes a line, so the
 /// bytes bound them: `left`.
-fn block_lines(b: Block, p: Int, got: Lines, left: Int) -> Lines / {fault.at, abort.raise} = {
+fn block_lines(b: BlockScalar, p: Int, got: Lines, left: Int) -> Lines / {fault.at, abort.raise} = {
   let src = b.src;
   let text = src.skip(p, b" ");
   let spaces = text - p;
@@ -1127,7 +1177,7 @@ fn block_lines(b: Block, p: Int, got: Lines, left: Int) -> Lines / {fault.at, ab
       left - 1,
     )
   } else if spaces < b.indent {
-    if c == b'\t' { stop(text, Tab) } else { { ..got, to: p, start: p } }
+    if c == b'\t' { fail(text, Tab) } else { { ..got, to: p, start: p } }
   } else if b.indent == 0 && at_marker(src, p) { { ..got, to: p, start: p } } else {
     let from = p + b.indent;
     let end = src.skip_until(from, b"\r\n");
@@ -1137,7 +1187,7 @@ fn block_lines(b: Block, p: Int, got: Lines, left: Int) -> Lines / {fault.at, ab
       got.chunks.push(if got.empty == 0 { b" " } else { b"\n".repeat(got.empty) })
     } else { got.chunks.push(b"\n".repeat(got.empty + 1)) };
     let after = end + break_len(src, end);
-    let held = {
+    let tagged_value = {
       chunks: joined.push(src.slice(from, end)),
       empty: 0,
       spaced: spaced,
@@ -1146,7 +1196,7 @@ fn block_lines(b: Block, p: Int, got: Lines, left: Int) -> Lines / {fault.at, ab
       lines: if after > end { got.lines + 1 } else { got.lines },
       start: if after > end { after } else { got.start },
     };
-    if after == end { held } else { block_lines(b, after, held, left - 1) }
+    if after == end { tagged_value } else { block_lines(b, after, tagged_value, left - 1) }
   }
 }
 
@@ -1245,28 +1295,31 @@ fn parser(scan: Scanner) -> Parser =
 
 /// The parser with a token to read at its head, the scanner asked for more where a key may yet
 /// stand before it. Each round passes a token or a byte, so the bytes bound them: `left`.
-fn ready(p: Parser, left: Int) -> Parser / {fault.at, abort.raise} = {
-  let settled = if p.scan.hold >= 0 { p.scan.hold } else { p.scan.tokens.len() };
-  if left <= 0 { panic("more tokens than bytes") } else if p.head < settled {
+fn fetch_more_tokens(p: Parser, left: Int) -> Parser / {fault.at, abort.raise} = {
+  let mapping_entries = if p.scan.hold >= 0 { p.scan.hold } else { p.scan.tokens.len() };
+  if left <= 0 { panic("more tokens than bytes") } else if p.head < mapping_entries {
     match p.scan.tokens.at(p.head) {
-      Some(t) -> match t.tok { TNone -> ready({ ..p, head: p.head + 1 }, left - 1), _ -> p },
+      Some(t) -> match t.tok {
+        PlaceholderToken -> fetch_more_tokens({ ..p, head: p.head + 1 }, left - 1),
+        _ -> p,
+      },
       None -> p,
     }
   } else if p.scan.ended { p }
-  else { ready({ ..p, scan: fetch(p.scan) }, left - 1) }
+  else { fetch_more_tokens({ ..p, scan: fetch(p.scan) }, left - 1) }
 }
 
-fn rounds(p: Parser) -> Int = 8 * p.scan.src.len() + 64
+fn step_limit(p: Parser) -> Int = 8 * p.scan.src.len() + 64
 
 fn current(p: Parser) -> Token =
   match p.scan.tokens.at(p.head) {
     Some(t) -> t,
-    None -> { tok: TStreamEnd, from: p.scan.src.len(), to: p.scan.src.len() },
+    None -> { tok: StreamEndToken, from: p.scan.src.len(), to: p.scan.src.len() },
   }
 
 /// The parser past the token at its head.
-fn taken(p: Parser) -> Parser / {fault.at, abort.raise} =
-  ready({ ..p, head: p.head + 1 }, rounds(p))
+fn consume(p: Parser) -> Parser / {fault.at, abort.raise} =
+  fetch_more_tokens({ ..p, head: p.head + 1 }, step_limit(p))
 
 fn said(p: Parser, kind: Kind, from: Int, to: Int) -> Parser =
   { ..p, events: p.events.push({ kind: kind, from: from, to: to }) }
@@ -1281,19 +1334,26 @@ fn popped(p: Parser) -> Parser =
 
 fn no_properties() -> Properties = { anchor: None, tag: None }
 
-fn empty(p: Parser, at: Int) -> Parser = said(p, Scalar(no_properties(), "", Plain), at, at)
+fn emit_empty_scalar(p: Parser, at: Int) -> Parser =
+  said(p, Scalar(no_properties(), "", Plain), at, at)
 
 /// The parser inside a collection it has just said the start of.
-fn begun(p: Parser, kind: Kind, state: State, from: Int, to: Int) -> Parser / {fault.at} =
-  if p.open >= p.scan.depth { stop(from, TooDeep) }
+fn start_collection(
+  p: Parser,
+  kind: Kind,
+  state: State,
+  from: Int,
+  to: Int,
+) -> Parser / {fault.at} =
+  if p.open >= p.scan.depth { fail(from, TooDeep) }
   else { said({ ..p, state: state, open: p.open + 1 }, kind, from, to) }
 
-fn closed(p: Parser, kind: Kind, from: Int, to: Int) -> Parser =
+fn end_collection(p: Parser, kind: Kind, from: Int, to: Int) -> Parser =
   said({ ..popped(p), open: p.open - 1 }, kind, from, to)
 
 /// The parser one step on: a token read, an event said, or both.
 fn step(before: Parser) -> Parser / {fault.at, abort.raise} = {
-  let p = ready(before, rounds(before));
+  let p = fetch_more_tokens(before, step_limit(before));
   let t = current(p);
   match p.state {
     AtStreamStart -> said({ ..p, state: AtDocumentStart }, StreamStart, 0, 0),
@@ -1321,21 +1381,24 @@ fn step(before: Parser) -> Parser / {fault.at, abort.raise} = {
   }
 }
 
-fn is_directive(tok: Tok) -> Bool =
-  match tok { TVersion(_, _) | TTagDirective(_, _) | TReserved -> true, _ -> false }
+fn is_directive(tok: TokenKind) -> Bool =
+  match tok {
+    VersionDirectiveToken(_, _) | TagDirectiveToken(_, _) | ReservedDirectiveToken -> true,
+    _ -> false,
+  }
 
 fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TDocumentEnd -> { ..taken(p), bare: true },
-    TStreamEnd -> said({ ..p, state: AtEnd, done: true }, StreamEnd, t.from, t.to),
-    TDocumentStart -> explicit_start(p, t),
+    DocumentEndToken -> { ..consume(p), bare: true },
+    StreamEndToken -> said({ ..p, state: AtEnd, done: true }, StreamEnd, t.from, t.to),
+    DocumentStartToken -> explicit_start(p, t),
     _ -> if !p.bare {
-      stop(
+      fail(
         t.from,
         Expected(if is_directive(t.tok) { "`...` to end the document before a directive" }
         else { "`---` to start another document" }),
       )
-    } else if is_directive(t.tok) { directed({ ..p, state: AfterDirectives }, t) } else {
+    } else if is_directive(t.tok) { apply_directive({ ..p, state: AfterDirectives }, t) } else {
       said(
         pushed({ ..p, state: AtDocumentContent, bare: false }, AtDocumentEnd),
         DocumentStart(false),
@@ -1347,7 +1410,7 @@ fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
 
 fn explicit_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   said(
-    pushed({ ..taken(p), state: AtDocumentContent, bare: false }, AtDocumentEnd),
+    pushed({ ..consume(p), state: AtDocumentContent, bare: false }, AtDocumentEnd),
     DocumentStart(true),
     t.from,
     t.to,
@@ -1355,38 +1418,38 @@ fn explicit_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
 
 fn after_directives(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TDocumentStart -> explicit_start(p, t),
-    _ -> if is_directive(t.tok) { directed(p, t) }
-    else { stop(t.from, Expected("`---` after the directives")) },
+    DocumentStartToken -> explicit_start(p, t),
+    _ -> if is_directive(t.tok) { apply_directive(p, t) }
+    else { fail(t.from, Expected("`---` after the directives")) },
   }
 
-fn directed(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
+fn apply_directive(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TVersion(major, minor) -> if p.versioned {
-      stop(t.from, Expected("one %YAML directive to a document"))
-    } else if major != 1 { stop(t.from, Version(major, minor)) }
-    else { taken({ ..p, versioned: true }) },
-    TTagDirective(named, prefix) -> if p.declared.contains(named) {
-      stop(t.from, Expected("one %TAG directive to a handle"))
+    VersionDirectiveToken(major, minor) -> if p.versioned {
+      fail(t.from, Expected("one %YAML directive to a document"))
+    } else if major != 1 { fail(t.from, Version(major, minor)) }
+    else { consume({ ..p, versioned: true }) },
+    TagDirectiveToken(named, prefix) -> if p.declared.contains(named) {
+      fail(t.from, Expected("one %TAG directive to a handle"))
     } else {
-      taken({
+      consume({
         ..p,
         handles: p.handles.insert(named, prefix),
         declared: p.declared.insert(named, ()),
       })
     },
-    _ -> taken(p),
+    _ -> consume(p),
   }
 
 fn document_content(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TDocumentStart | TDocumentEnd | TStreamEnd -> popped(empty(p, t.from)),
-    _ -> if is_directive(t.tok) { popped(empty(p, t.from)) } else { node(p, t, false) },
+    DocumentStartToken | DocumentEndToken | StreamEndToken -> popped(emit_empty_scalar(p, t.from)),
+    _ -> if is_directive(t.tok) { popped(emit_empty_scalar(p, t.from)) } else { node(p, t, false) },
   }
 
 fn document_end(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} = {
-  let explicit = match t.tok { TDocumentEnd -> true, _ -> false };
-  let after = if explicit { taken(p) } else { p };
+  let explicit = match t.tok { DocumentEndToken -> true, _ -> false };
+  let after = if explicit { consume(p) } else { p };
   said(
     {
       ..after,
@@ -1403,38 +1466,38 @@ fn document_end(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} = {
 }
 
 /// A tag in full: its handle as the document's directives declare it, and what follows.
-fn resolved(p: Parser, t: Token, named: String, suffix: String) -> String / {fault.at} =
+fn resolve_tag(p: Parser, t: Token, named: String, suffix: String) -> String / {fault.at} =
   if named == "" { suffix }
   else if named == "!" && suffix == "" { "!" } else {
     match p.handles.get(named) {
       Some(prefix) -> prefix ++ suffix,
-      None -> stop(t.from, UndeclaredHandle(named)),
+      None -> fail(t.from, UndeclaredHandle(named)),
     }
   }
 
 /// A node from the token `t` at the parser's head: its properties, then its content.
 fn node(p: Parser, t: Token, indentless: Bool) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TAlias(name) -> popped(said(taken(p), Alias(name), t.from, t.to)),
-    TAnchor(name) -> {
-      let q = taken(p);
+    AliasToken(name) -> popped(said(consume(p), Alias(name), t.from, t.to)),
+    AnchorToken(name) -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TTag(named, suffix) -> {
-          let r = taken(q);
-          let props = { anchor: Some(name), tag: Some(resolved(q, next, named, suffix)) };
+        TagToken(named, suffix) -> {
+          let r = consume(q);
+          let props = { anchor: Some(name), tag: Some(resolve_tag(q, next, named, suffix)) };
           content(r, current(r), props, indentless, t.from, next.to)
         },
         _ -> content(q, next, { anchor: Some(name), tag: None }, indentless, t.from, t.to),
       }
     },
-    TTag(named, suffix) -> {
-      let tagged = Some(resolved(p, t, named, suffix));
-      let q = taken(p);
+    TagToken(named, suffix) -> {
+      let tagged = Some(resolve_tag(p, t, named, suffix));
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TAnchor(name) -> {
-          let r = taken(q);
+        AnchorToken(name) -> {
+          let r = consume(q);
           content(r, current(r), { anchor: Some(name), tag: tagged }, indentless, t.from, next.to)
         },
         _ -> content(q, next, { anchor: None, tag: tagged }, indentless, t.from, t.to),
@@ -1454,161 +1517,173 @@ fn content(
   to: Int,
 ) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TScalar(text, style) -> popped(said(taken(p), Scalar(props, text, style), from, t.to)),
-    TFlowSequenceStart ->
-      begun(taken(p), SequenceStart(props, true), AtFlowSequenceEntry(true), from, t.to),
-    TFlowMappingStart ->
-      begun(taken(p), MappingStart(props, true), AtFlowMappingKey(true), from, t.to),
-    TBlockSequenceStart ->
-      begun(taken(p), SequenceStart(props, false), AtBlockSequenceEntry, from, t.to),
-    TBlockMappingStart ->
-      begun(taken(p), MappingStart(props, false), AtBlockMappingKey, from, t.to),
+    ScalarToken(text, style) -> popped(said(consume(p), Scalar(props, text, style), from, t.to)),
+    FlowSequenceStartToken ->
+      start_collection(
+        consume(p),
+        SequenceStart(props, true),
+        AtFlowSequenceEntry(true),
+        from,
+        t.to,
+      ),
+    FlowMappingStartToken ->
+      start_collection(consume(p), MappingStart(props, true), AtFlowMappingKey(true), from, t.to),
+    BlockSequenceStartToken ->
+      start_collection(consume(p), SequenceStart(props, false), AtBlockSequenceEntry, from, t.to),
+    BlockMappingStartToken ->
+      start_collection(consume(p), MappingStart(props, false), AtBlockMappingKey, from, t.to),
     _ -> {
-      let entry = match t.tok { TBlockEntry -> indentless, _ -> false };
-      if entry { begun(p, SequenceStart(props, false), AtIndentlessEntry, from, t.from) }
-      else if props.anchor == None && props.tag == None { stop(t.from, Expected("a node")) }
+      let entry = match t.tok { BlockEntryToken -> indentless, _ -> false };
+      if entry { start_collection(p, SequenceStart(props, false), AtIndentlessEntry, from, t.from) }
+      else if props.anchor == None && props.tag == None { fail(t.from, Expected("a node")) }
       else { popped(said(p, Scalar(props, "", Plain), from, to)) }
     },
   }
 
 fn block_sequence_entry(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TBlockEntry -> {
-      let q = taken(p);
+    BlockEntryToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TBlockEntry | TBlockEnd -> empty(q, t.to),
+        BlockEntryToken | BlockEndToken -> emit_empty_scalar(q, t.to),
         _ -> node(pushed(q, AtBlockSequenceEntry), next, false),
       }
     },
-    TBlockEnd -> closed(taken(p), SequenceEnd, t.from, t.to),
-    _ -> stop(t.from, Expected("`-` and another entry, or the sequence to end")),
+    BlockEndToken -> end_collection(consume(p), SequenceEnd, t.from, t.to),
+    _ -> fail(t.from, Expected("`-` and another entry, or the sequence to end")),
   }
 
 fn indentless_entry(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TBlockEntry -> {
-      let q = taken(p);
+    BlockEntryToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TBlockEntry | TKey | TValue | TBlockEnd -> empty(q, t.to),
+        BlockEntryToken | KeyToken | ValueToken | BlockEndToken -> emit_empty_scalar(q, t.to),
         _ -> node(pushed(q, AtIndentlessEntry), next, false),
       }
     },
-    _ -> closed(p, SequenceEnd, t.from, t.from),
+    _ -> end_collection(p, SequenceEnd, t.from, t.from),
   }
 
 fn block_mapping_key(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TKey -> {
-      let q = taken(p);
+    KeyToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TKey | TValue | TBlockEnd -> empty({ ..q, state: AtBlockMappingValue }, t.to),
+        KeyToken | ValueToken | BlockEndToken ->
+          emit_empty_scalar({ ..q, state: AtBlockMappingValue }, t.to),
         _ -> node(pushed(q, AtBlockMappingValue), next, true),
       }
     },
-    TValue -> empty({ ..p, state: AtBlockMappingValue }, t.from),
-    TBlockEnd -> closed(taken(p), MappingEnd, t.from, t.to),
-    _ -> stop(t.from, Expected("a key and its `:`, or the mapping to end")),
+    ValueToken -> emit_empty_scalar({ ..p, state: AtBlockMappingValue }, t.from),
+    BlockEndToken -> end_collection(consume(p), MappingEnd, t.from, t.to),
+    _ -> fail(t.from, Expected("a key and its `:`, or the mapping to end")),
   }
 
 fn block_mapping_value(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TValue -> {
-      let q = taken(p);
+    ValueToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TKey | TValue | TBlockEnd -> empty({ ..q, state: AtBlockMappingKey }, t.to),
+        KeyToken | ValueToken | BlockEndToken ->
+          emit_empty_scalar({ ..q, state: AtBlockMappingKey }, t.to),
         _ -> node(pushed(q, AtBlockMappingKey), next, true),
       }
     },
-    _ -> empty({ ..p, state: AtBlockMappingKey }, t.from),
+    _ -> emit_empty_scalar({ ..p, state: AtBlockMappingKey }, t.from),
   }
 
 fn flow_sequence_entry(p: Parser, t: Token, first: Bool) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TFlowSequenceEnd -> closed(taken(p), SequenceEnd, t.from, t.to),
-    TFlowEntry -> if first { flow_item(p, t) } else {
-      let q = taken(p);
+    FlowSequenceEndToken -> end_collection(consume(p), SequenceEnd, t.from, t.to),
+    FlowEntryToken -> if first { flow_item(p, t) } else {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TFlowSequenceEnd -> closed(taken(q), SequenceEnd, next.from, next.to),
+        FlowSequenceEndToken -> end_collection(consume(q), SequenceEnd, next.from, next.to),
         _ -> flow_item(q, next),
       }
     },
-    _ -> if first { flow_item(p, t) } else { stop(t.from, Expected("`,` or `]`")) },
+    _ -> if first { flow_item(p, t) } else { fail(t.from, Expected("`,` or `]`")) },
   }
 
 /// An entry of a flow sequence from the token `t`: a node, or one key and value with no braces.
 fn flow_item(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TKey | TValue -> begun(p, MappingStart(no_properties(), true), AtPairKey, t.from, t.from),
+    KeyToken | ValueToken ->
+      start_collection(p, MappingStart(no_properties(), true), AtPairKey, t.from, t.from),
     _ -> node(pushed(p, AtFlowSequenceEntry(false)), t, false),
   }
 
 fn pair_key(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} = {
-  let q = match t.tok { TKey -> taken(p), _ -> p };
+  let q = match t.tok { KeyToken -> consume(p), _ -> p };
   let next = current(q);
   match next.tok {
-    TValue | TFlowEntry | TFlowSequenceEnd -> empty({ ..q, state: AtPairValue }, next.from),
+    ValueToken | FlowEntryToken | FlowSequenceEndToken ->
+      emit_empty_scalar({ ..q, state: AtPairValue }, next.from),
     _ -> node(pushed(q, AtPairValue), next, false),
   }
 }
 
 fn pair_value(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TValue -> {
-      let q = taken(p);
+    ValueToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TFlowEntry | TFlowSequenceEnd -> empty({ ..q, state: AtPairEnd }, t.to),
+        FlowEntryToken | FlowSequenceEndToken -> emit_empty_scalar({ ..q, state: AtPairEnd }, t.to),
         _ -> node(pushed(q, AtPairEnd), next, false),
       }
     },
-    _ -> empty({ ..p, state: AtPairEnd }, t.from),
+    _ -> emit_empty_scalar({ ..p, state: AtPairEnd }, t.from),
   }
 
 fn flow_mapping_key(p: Parser, t: Token, first: Bool) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TFlowMappingEnd -> closed(taken(p), MappingEnd, t.from, t.to),
-    TFlowEntry -> if first { flow_key(p, t) } else {
-      let q = taken(p);
+    FlowMappingEndToken -> end_collection(consume(p), MappingEnd, t.from, t.to),
+    FlowEntryToken -> if first { flow_key(p, t) } else {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TFlowMappingEnd -> closed(taken(q), MappingEnd, next.from, next.to),
+        FlowMappingEndToken -> end_collection(consume(q), MappingEnd, next.from, next.to),
         _ -> flow_key(q, next),
       }
     },
-    _ -> if first { flow_key(p, t) } else { stop(t.from, Expected("`,` or `}`")) },
+    _ -> if first { flow_key(p, t) } else { fail(t.from, Expected("`,` or `}`")) },
   }
 
 /// A key of a flow mapping from the token `t`.
 fn flow_key(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TKey -> {
-      let q = taken(p);
+    KeyToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TValue | TFlowEntry | TFlowMappingEnd -> empty({ ..q, state: AtFlowMappingValue }, t.to),
+        ValueToken | FlowEntryToken | FlowMappingEndToken ->
+          emit_empty_scalar({ ..q, state: AtFlowMappingValue }, t.to),
         _ -> node(pushed(q, AtFlowMappingValue), next, false),
       }
     },
-    TValue -> empty({ ..p, state: AtFlowMappingValue }, t.from),
+    ValueToken -> emit_empty_scalar({ ..p, state: AtFlowMappingValue }, t.from),
     _ -> node(pushed(p, AtFlowMappingValue), t, false),
   }
 
 fn flow_mapping_value(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.tok {
-    TValue -> {
-      let q = taken(p);
+    ValueToken -> {
+      let q = consume(p);
       let next = current(q);
       match next.tok {
-        TFlowEntry | TFlowMappingEnd -> empty({ ..q, state: AtFlowMappingKey(false) }, t.to),
+        FlowEntryToken | FlowMappingEndToken ->
+          emit_empty_scalar({ ..q, state: AtFlowMappingKey(false) }, t.to),
         _ -> node(pushed(q, AtFlowMappingKey(false)), next, false),
       }
     },
-    _ -> empty({ ..p, state: AtFlowMappingKey(false) }, t.from),
+    _ -> emit_empty_scalar({ ..p, state: AtFlowMappingKey(false) }, t.from),
   }
 
 /// The parser at the end of its stream. Each step reads a token or says an event, so the bytes
@@ -1619,13 +1694,13 @@ fn run(p: Parser, left: Int) -> Parser / {fault.at, abort.raise} =
   else { run(step(p), left - 1) }
 
 fn parsed(src: Bytes, limits: Limits) -> Parser / {fault.at, abort.raise} =
-  run(parser(opened(src, limits)), 32 * src.len() + 64)
+  run(parser(scanner(src, limits)), 32 * src.len() + 64)
 
 /// The events with each comment before the first event written after it.
 fn with_comments(p: Parser) -> List<Event> / {abort.raise} = {
   let src = p.scan.src;
   let comments = p.scan.comments;
-  let merged = p.events.fold({ out: [], next: 0 }, |m: Merged, e: Event| {
+  let merged = p.events.fold({ out: [], next: 0 }, |m: CommentMerge, e: Event| {
     let upto = comments_before(comments, m.next, e.from);
     {
       out: range(m.next, upto).fold(m.out, |out: List<Event>, i: Int|
@@ -1646,7 +1721,7 @@ fn with_comments(p: Parser) -> List<Event> / {abort.raise} = {
   merged.out
 }
 
-type Merged = { out: List<Event>, next: Int }
+type CommentMerge = { out: List<Event>, next: Int }
 
 /// The first comment from `i` that does not start before `at`.
 fn comments_before(comments: List<Span>, i: Int, at: Int) -> Int =
@@ -1657,50 +1732,50 @@ fn comments_before(comments: List<Span>, i: Int, at: Int) -> Int =
 
 // --- Places -----------------------------------------------------------------
 
-fn placed_at(src: Bytes, offset: Int, why: Why) -> Refusal = {
-  let stood = place_at(src, offset);
-  { offset: offset, line: stood.line, column: stood.column, why: why }
+fn error_at(src: Bytes, offset: Int, why: ErrorKind) -> Error = {
+  let stood = location_at(src, offset);
+  { offset: offset, line: stood.line, column: stood.column, reason: why }
 }
 
-fn defect(said: String) -> Refusal = { offset: 0, line: 1, column: 1, why: Defect(said) }
+fn defect(said: String) -> Error = { offset: 0, line: 1, column: 1, reason: Defect(said) }
 
 /// Every event of a stream, comments among them, raising `yaml.refused` for a stream that is not
 /// YAML 1.2 within the limits.
-pub fn events(src: Bytes, limits: Limits) -> List<Event> / {yaml.refused} =
+pub fn events(src: Bytes, limits: Limits) -> List<Event> / {yaml.fail} =
   guarded(src, || with_comments(parsed(src, limits)))
 
 // --- Values -----------------------------------------------------------------
 
 /// A value with every mapping sorted and every float as its bits, which is what `==` compares.
-type Canon =
-  | CNull
-  | CBoolean(Bool)
-  | CInteger(Int)
-  | CFloat(Int)
-  | CString(String)
-  | CSequence(List<Canon>)
-  | CMapping(Map<Canon, Canon>)
-  | CTagged(String, Canon)
+type Canonical =
+  | CanonicalNull
+  | CanonicalBoolean(Bool)
+  | CanonicalInteger(Int)
+  | CanonicalFloat(Int)
+  | CanonicalString(String)
+  | CanonicalSequence(List<Canonical>)
+  | CanonicalMapping(Map<Canonical, Canonical>)
+  | CanonicalTagged(String, Canonical)
 
 key for Yaml by canonical
 
 show for Yaml by inline
 
-fn canonical(v: Yaml) -> Canon =
+fn canonical(v: Yaml) -> Canonical =
   match v {
-    Null -> CNull,
-    Boolean(b) -> CBoolean(b),
-    Integer(n) -> CInteger(n),
-    Float(f) -> CFloat(bits_of_float(if f.is_nan() { Float::nan() } else { f })),
-    String(s) -> CString(s),
-    Sequence(items) -> CSequence(items.map(canonical)),
+    Null -> CanonicalNull,
+    Boolean(b) -> CanonicalBoolean(b),
+    Integer(n) -> CanonicalInteger(n),
+    Float(f) -> CanonicalFloat(bits_of_float(if f.is_nan() { Float::nan() } else { f })),
+    String(s) -> CanonicalString(s),
+    Sequence(items) -> CanonicalSequence(items.map(canonical)),
     Mapping(entries) ->
-      CMapping(
+      CanonicalMapping(
         Map::of_entries(
           entries.map(|e: Entry| { key: canonical(e.key), value: canonical(e.value) }),
         ),
       ),
-    Tagged(tag, held) -> CTagged(tag, canonical(held)),
+    Tagged(tag, tagged_value) -> CanonicalTagged(tag, canonical(tagged_value)),
   }
 
 /// A mapping of these entries, a later entry for a key replacing an earlier one where that stood.
@@ -1709,13 +1784,13 @@ pub fn mapping(entries: List<Entry>) -> Yaml = Mapping(unique(entries))
 /// An entry of a mapping under a string key, which is what most mappings hold.
 pub fn entry(key: String, value: Yaml) -> Entry = { key: String(key), value: value }
 
-type Seen = { seen: Map<Canon, Unit>, kept: List<Entry> }
+type UniqueEntries = { seen: Map<Canonical, Unit>, kept: List<Entry> }
 
 /// The entries with one for each key: its last value, where the key first stood.
 fn unique(entries: List<Entry>) -> List<Entry> = {
   let last = Map::of_entries(entries.map(|e: Entry| { key: canonical(e.key), value: e.value }));
   if last.len() == entries.len() { entries } else {
-    entries.fold({ seen: Map::new(), kept: [] }, |s: Seen, e: Entry| {
+    entries.fold({ seen: Map::new(), kept: [] }, |s: UniqueEntries, e: Entry| {
       let k = canonical(e.key);
       if s.seen.contains(k) { s } else {
         {
@@ -1745,7 +1820,7 @@ fn says_nothing(tag: String) -> Bool =
 pub fn tagged(tag: String, value: Yaml) -> Yaml =
   if says_nothing(tag) { value } else {
     match value {
-      Tagged(_, held) -> tagged(tag, held),
+      Tagged(_, tagged_value) -> tagged(tag, tagged_value),
       Sequence(_) -> Tagged(tag, value),
       Mapping(_) -> Tagged(tag, value),
       String(_) -> Tagged(tag, value),
@@ -1754,15 +1829,16 @@ pub fn tagged(tag: String, value: Yaml) -> Yaml =
   }
 
 /// The value a tag is over, or the value itself.
-fn untagged(v: Yaml) -> Yaml = match v { Tagged(_, held) -> untagged(held), plain -> plain }
+fn untagged(v: Yaml) -> Yaml =
+  match v { Tagged(_, tagged_value) -> untagged(tagged_value), plain -> plain }
 
 /// The value of a mapping under `key`; `None` for an absent key and for a value that is no
 /// mapping. A tag over a mapping is looked through. Each call walks the mapping's entries.
 pub fn lookup(v: Yaml, key: Yaml) -> Option<Yaml> =
   match untagged(v) {
     Mapping(entries) ->
-      entries.fold(None, |found: Option<Yaml>, e: Entry|
-        if e.key == key { Some(e.value) } else { found }),
+      entries.fold(None, |locate: Option<Yaml>, e: Entry|
+        if e.key == key { Some(e.value) } else { locate }),
     _ -> None,
   }
 
@@ -1770,40 +1846,41 @@ pub fn lookup(v: Yaml, key: Yaml) -> Option<Yaml> =
 pub fn get(v: Yaml, name: String) -> Option<Yaml> = lookup(v, String(name))
 
 /// The value a path leads to from `v`, where every step of it is there.
-pub fn at(v: Yaml, path: List<Step>) -> Option<Yaml> =
+pub fn at(v: Yaml, path: List<PathSegment>) -> Option<Yaml> =
   match path {
     [] -> Some(v),
-    [Key(name), ..rest] -> match get(v, name) { Some(found) -> at(found, rest), None -> None },
+    [Key(name), ..rest] -> match get(v, name) { Some(locate) -> at(locate, rest), None -> None },
     [Index(i), ..rest] -> match untagged(v) {
-      Sequence(items) -> match items.at(i) { Some(found) -> at(found, rest), None -> None },
+      Sequence(items) -> match items.at(i) { Some(locate) -> at(locate, rest), None -> None },
       _ -> None,
     },
   }
 
-/// The value with `held` in place of what a tag over it holds, or `held` where there is no tag.
-fn retagged(v: Yaml, held: Yaml) -> Yaml =
-  match v { Tagged(tag, inner) -> Tagged(tag, retagged(inner, held)), _ -> held }
+/// The value with `tagged_value` in place of what a tag over it holds, or `tagged_value` where there is no tag.
+fn retagged(v: Yaml, tagged_value: Yaml) -> Yaml =
+  match v { Tagged(tag, inner) -> Tagged(tag, retagged(inner, tagged_value)), _ -> tagged_value }
 
 /// `v` with `new` where the path leads, in place of what stood there or as a new last key.
 ///
 /// A mapping the path names and `v` lacks is made. `None` where the path passes through a value
 /// that is no mapping, or names an index its sequence does not have.
-pub fn put(v: Yaml, path: List<Step>, new: Yaml) -> Option<Yaml> =
+pub fn put(v: Yaml, path: List<PathSegment>, new: Yaml) -> Option<Yaml> =
   match path {
     [] -> Some(new),
     [Key(name), ..rest] -> match untagged(v) {
       Mapping(entries) -> {
-        let held = unique(entries);
-        let child = match get(v, name) { Some(found) -> found, None -> Mapping([]) };
+        let tagged_value = unique(entries);
+        let child = match get(v, name) { Some(locate) -> locate, None -> Mapping([]) };
         match put(child, rest, new) {
           None -> None,
           Some(made) ->
             Some(
               retagged(
                 v,
-                Mapping(if held.any(|e: Entry| e.key == String(name)) {
-                  held.map(|e: Entry| if e.key == String(name) { entry(name, made) } else { e })
-                } else { held.push(entry(name, made)) }),
+                Mapping(if tagged_value.any(|e: Entry| e.key == String(name)) {
+                  tagged_value.map(|e: Entry|
+                    if e.key == String(name) { entry(name, made) } else { e })
+                } else { tagged_value.push(entry(name, made)) }),
               ),
             ),
         }
@@ -1824,7 +1901,7 @@ pub fn put(v: Yaml, path: List<Step>, new: Yaml) -> Option<Yaml> =
   }
 
 /// `v` without what the path leads to; `v` itself where it leads nowhere.
-pub fn without(v: Yaml, path: List<Step>) -> Yaml =
+pub fn without(v: Yaml, path: List<PathSegment>) -> Yaml =
   match path {
     [] -> v,
     [Key(name)] -> match untagged(v) {
@@ -1870,16 +1947,16 @@ fn shape(b: Bytes) -> Shape / {abort.raise} =
     else { AsString },
     b'f' | b'F' -> if b == b"false" || b == b"False" || b == b"FALSE" { AsBoolean(false) }
     else { AsString },
-    b'0' -> based(b),
+    b'0' -> shape_from_zero(b),
     b'1'..=b'9' -> decimal(b, 0),
-    b'+' | b'-' -> if b.peek(1) == b'.' { pointed(b, 1) }
+    b'+' | b'-' -> if b.peek(1) == b'.' { shape_from_point(b, 1) }
     else if bytes::is_digit(b.peek(1)) { decimal(b, 1) }
     else { AsString },
-    b'.' -> pointed(b, 0),
+    b'.' -> shape_from_point(b, 0),
     _ -> AsString,
   }
 
-fn based(b: Bytes) -> Shape / {abort.raise} = {
+fn shape_from_zero(b: Bytes) -> Shape / {abort.raise} = {
   let n = b.len();
   if b.starts_with(b"0o") { if n > 2 && b.skip(2, b"01234567") == n { AsOctal } else { AsString } }
   else if b.starts_with(b"0x") {
@@ -1905,7 +1982,7 @@ fn decimal(b: Bytes, i: Int) -> Shape / {abort.raise} = {
 }
 
 /// What starts with a point at `i`: an infinity, not a number, or a float with no whole part.
-fn pointed(b: Bytes, i: Int) -> Shape / {abort.raise} = {
+fn shape_from_point(b: Bytes, i: Int) -> Shape / {abort.raise} = {
   let rest = b.slice(i, b.len());
   if rest == b".inf" || rest == b".Inf" || rest == b".INF" { AsInfinity(b.peek(0) == b'-') }
   else if i == 0 && (rest == b".nan" || rest == b".NaN" || rest == b".NAN") { AsNan }
@@ -1913,17 +1990,17 @@ fn pointed(b: Bytes, i: Int) -> Shape / {abort.raise} = {
 }
 
 /// The value the core schema reads of a scalar written `b` with the shape `read`.
-fn shaped(b: Bytes, read: Shape, at: Int) -> Yaml / {fault.at, abort.raise} =
+fn value_of_shape(b: Bytes, read: Shape, at: Int) -> Yaml / {fault.at, abort.raise} =
   match read {
     AsNull -> Null,
     AsBoolean(flag) -> Boolean(flag),
     AsDecimal -> {
       let unsigned = if b.peek(0) == b'+' { b.slice(1, b.len()) } else { b };
-      match unsigned.int_of_ascii() { Some(n) -> Integer(n), None -> stop(at, TooWide) }
+      match unsigned.int_of_ascii() { Some(n) -> Integer(n), None -> fail(at, OutOfRange) }
     },
     AsOctal -> based_integer(b, 8, at),
     AsHex -> based_integer(b, 16, at),
-    AsFloat -> finite(b, at),
+    AsFloat -> float_value(b, at),
     AsInfinity(negative) -> Float(if negative { Float::neg_infinity() } else { Float::infinity() }),
     AsNan -> Float(Float::nan()),
     AsString -> String(String::of_bytes(b)),
@@ -1933,12 +2010,12 @@ fn shaped(b: Bytes, read: Shape, at: Int) -> Yaml / {fault.at, abort.raise} =
 fn based_integer(b: Bytes, base: Int, at: Int) -> Yaml / {fault.at, abort.raise} =
   match b.slice(2, b.len()).int_of_ascii_radix(base) {
     Some(n) -> Integer(n),
-    None -> stop(at, TooWide),
+    None -> fail(at, OutOfRange),
   }
 
 /// A float written `b`, which the core schema's table admits: a digit is put on each side of its
 /// point for the builtin that reads one.
-fn finite(b: Bytes, at: Int) -> Yaml / {fault.at, abort.raise} = {
+fn float_value(b: Bytes, at: Int) -> Yaml / {fault.at, abort.raise} = {
   let negative = b.peek(0) == b'-';
   let i = if negative || b.peek(0) == b'+' { 1 } else { 0 };
   let whole = b.skip(i, digits());
@@ -1952,8 +2029,8 @@ fn finite(b: Bytes, at: Int) -> Yaml / {fault.at, abort.raise} = {
     b.slice(fraction, b.len()),
   ]);
   match Float::of_string(String::of_bytes(text)) {
-    Some(f) -> if f.is_infinite() { stop(at, TooWide) } else { Float(f) },
-    None -> stop(at, TooWide),
+    Some(f) -> if f.is_infinite() { fail(at, OutOfRange) } else { Float(f) },
+    None -> fail(at, OutOfRange),
   }
 }
 
@@ -1974,20 +2051,20 @@ pub type Options = new { merge_keys: Bool, keep_tags: List<String> }
 type Node =
   | Leaf(Int, Int)
   /// Whether the sequence is in flow style.
-  | Elements(List<Node>, Int, Int, Bool)
+  | SequenceNode(List<Node>, Int, Int, Bool)
   /// Whether the mapping is in flow style, and where its first entry starts: past its
   /// properties, at a key or its `?`.
-  | Members(List<Member>, Int, Int, Bool, Int)
+  | MappingNode(List<Member>, Int, Int, Bool, Int)
 
 /// A key of a mapping as it is written, the value it reads as, and its value as written.
 type Member = { key: Yaml, at: Node, value: Node }
 
 /// An anchored value, and how many nodes it holds.
-type Held = { value: Yaml, nodes: Int }
+type AnchoredValue = { value: Yaml, nodes: Int }
 
 /// A collection being read: its properties, where it starts and where its content does, whether
 /// it is in flow style, and how many nodes are inside it so far.
-type Open = {
+type OpenCollection = {
   anchor: Option<String>,
   tag: Option<String>,
   from: Int,
@@ -2001,31 +2078,33 @@ type Item = | Own(Entry) | Merge(Yaml, Int)
 
 /// A mapping being read: its entries, the keys it writes itself, the key whose value comes next
 /// with where it stands and whether it is a merge key, and whether any was.
-type Pairs = {
+type MappingState = {
   items: List<Item>,
   members: List<Member>,
-  seen: Map<Canon, Unit>,
+  seen: Map<Canonical, Unit>,
   key: Option<Yaml>,
   key_node: Node,
   merging: Bool,
   merged: Bool,
 }
 
-type Frame = | InSequence(Open, List<Yaml>, List<Node>) | InMapping(Open, Pairs)
+type Frame =
+  | InSequence(OpenCollection, List<Yaml>, List<Node>)
+  | InMapping(OpenCollection, MappingState)
 
 /// A document's value, how it is written, and where the document starts.
-type Composed = { value: Yaml, node: Node, from: Int }
+type ComposedDocument = { value: Yaml, node: Node, from: Int }
 
 /// Where the composer stands: the options and limits, the collections open around it, the
 /// document's anchors, the documents read, and the nodes counted.
 type Composer = {
   merge_keys: Bool,
   keep: Map<String, Unit>,
-  most_nodes: Int,
-  most_documents: Int,
+  max_nodes: Int,
+  max_documents: Int,
   frames: Stack<Frame>,
-  anchors: Map<String, Held>,
-  documents: List<Composed>,
+  anchors: Map<String, AnchoredValue>,
+  documents: List<ComposedDocument>,
   document_from: Int,
   nodes: Int,
 }
@@ -2034,8 +2113,8 @@ fn composer(limits: Limits, options: Options) -> Composer =
   {
     merge_keys: options.merge_keys,
     keep: Map::of_entries(options.keep_tags.map(|tag: String| { key: tag, value: () })),
-    most_nodes: limits.nodes,
-    most_documents: limits.documents,
+    max_nodes: limits.nodes,
+    max_documents: limits.documents,
     frames: Empty,
     anchors: Map::new(),
     documents: [],
@@ -2045,7 +2124,7 @@ fn composer(limits: Limits, options: Options) -> Composer =
 
 /// A value read, with how many nodes it holds, how many of them are counted now, and how it is
 /// written, put where the composer stands: into the collection open around it, or as a document.
-fn placed(
+fn add_value(
   c: Composer,
   v: Yaml,
   node: Node,
@@ -2056,7 +2135,7 @@ fn placed(
 ) -> Composer / {fault.at} = {
   let total = c.nodes +| counted;
   let at = start_of(node);
-  if total > c.most_nodes { stop(at, TooManyNodes) } else {
+  if total > c.max_nodes { fail(at, TooManyNodes) } else {
     let next = {
       ..c,
       nodes: total,
@@ -2080,7 +2159,7 @@ fn placed(
         {
           ..next,
           frames: Top(
-            InMapping({ ..open, nodes: open.nodes +| size }, paired(pairs, v, node, merge)),
+            InMapping({ ..open, nodes: open.nodes +| size }, add_to_mapping(pairs, v, node, merge)),
             rest,
           ),
         },
@@ -2091,19 +2170,24 @@ fn placed(
 fn start_of(node: Node) -> Int =
   match node {
     Leaf(from, _) -> from,
-    Elements(_, from, _, _) -> from,
-    Members(_, from, _, _, _) -> from,
+    SequenceNode(_, from, _, _) -> from,
+    MappingNode(_, from, _, _, _) -> from,
   }
 
 /// A mapping being read with one more node: its next key, or the value of the key it holds.
-fn paired(pairs: Pairs, v: Yaml, node: Node, merge: Bool) -> Pairs / {fault.at} =
+fn add_to_mapping(
+  pairs: MappingState,
+  v: Yaml,
+  node: Node,
+  merge: Bool,
+) -> MappingState / {fault.at} =
   match pairs.key {
     None -> { ..pairs, key: Some(v), key_node: node, merging: merge },
     Some(k) -> if pairs.merging {
       { ..pairs, items: pairs.items.push(Merge(v, start_of(node))), key: None, merged: true }
     } else {
       let known = canonical(k);
-      if pairs.seen.contains(known) { stop(start_of(pairs.key_node), Duplicate(inline(k))) } else {
+      if pairs.seen.contains(known) { fail(start_of(pairs.key_node), Duplicate(inline(k))) } else {
         {
           ..pairs,
           items: pairs.items.push(Own({ key: k, value: v })),
@@ -2115,24 +2199,28 @@ fn paired(pairs: Pairs, v: Yaml, node: Node, merge: Bool) -> Pairs / {fault.at} 
     },
   }
 
-type Merging = { entries: List<Entry>, taken: Map<Canon, Unit> }
+type MergeState = { entries: List<Entry>, taken: Map<Canonical, Unit> }
 
 /// The entries of a mapping that was read: its own, and those its merge keys bring where it
 /// writes no such key itself.
-fn settled(pairs: Pairs) -> List<Entry> / {fault.at} =
+fn mapping_entries(pairs: MappingState) -> List<Entry> / {fault.at} =
   if !pairs.merged {
     pairs.items.fold([], |entries: List<Entry>, item: Item|
       match item { Own(e) -> entries.push(e), Merge(_, _) -> entries })
   } else {
-    pairs.items.fold({ entries: [], taken: pairs.seen }, |m: Merging, item: Item|
+    pairs.items.fold({ entries: [], taken: pairs.seen }, |m: MergeState, item: Item|
       match item {
         Own(e) -> { entries: m.entries.push(e), taken: m.taken },
         Merge(from, at) ->
-          merge_sources(from, at).fold(m, |into: Merging, source: List<Entry>|
-            source.fold(into, |held: Merging, e: Entry| {
+          merge_sources(from, at).fold(m, |into: MergeState, source: List<Entry>|
+            source.fold(into, |tagged_value: MergeState, e: Entry| {
               let known = canonical(e.key);
-              if held.taken.contains(known) { held }
-              else { { entries: held.entries.push(e), taken: held.taken.insert(known, ()) } }
+              if tagged_value.taken.contains(known) { tagged_value } else {
+                {
+                  entries: tagged_value.entries.push(e),
+                  taken: tagged_value.taken.insert(known, ()),
+                }
+              }
             })),
       }).entries
   }
@@ -2141,12 +2229,12 @@ fn merge_sources(from: Yaml, at: Int) -> List<List<Entry>> / {fault.at} =
   match from {
     Mapping(entries) -> [entries],
     Sequence(items) ->
-      items.map(|item: Yaml| match item { Mapping(entries) -> entries, _ -> not_merged(at) }),
-    _ -> not_merged(at),
+      items.map(|item: Yaml| match item { Mapping(entries) -> entries, _ -> bad_merge_value(at) }),
+    _ -> bad_merge_value(at),
   }
 
-fn not_merged<a>(at: Int) -> a / {fault.at} =
-  stop(at, Expected("a mapping, or a sequence of mappings, as the value of the merge key `<<`"))
+fn bad_merge_value<a>(at: Int) -> a / {fault.at} =
+  fail(at, Expected("a mapping, or a sequence of mappings, as the value of the merge key `<<`"))
 
 fn is_merge_key(c: Composer, tag: Option<String>, text: String, style: Style) -> Bool =
   c.merge_keys && style == Plain && text == "<<" && (tag == None || tag == Some(core_tag("merge")))
@@ -2160,13 +2248,14 @@ fn scalar_value(
   at: Int,
 ) -> Yaml / {fault.at, abort.raise} =
   match tag {
-    None -> if style == Plain { shaped(Bytes::of_string(text), shape(Bytes::of_string(text)), at) }
-    else { String(text) },
+    None -> if style == Plain {
+      value_of_shape(Bytes::of_string(text), shape(Bytes::of_string(text)), at)
+    } else { String(text) },
     Some(named) -> if named == "!" || named == core_tag("str") { String(text) }
-    else if named == core_tag("seq") || named == core_tag("map") { stop(at, Mistagged(named)) }
+    else if named == core_tag("seq") || named == core_tag("map") { fail(at, Mistagged(named)) }
     else if says_nothing(named) { as_tagged(named, Bytes::of_string(text), at) }
     else if c.keep.contains(named) { Tagged(named, String(text)) }
-    else { stop(at, UnknownTag(named)) },
+    else { fail(at, UnknownTag(named)) },
   }
 
 /// A scalar under `!!null`, `!!bool`, `!!int` or `!!float`: written as the core schema writes
@@ -2184,22 +2273,27 @@ fn as_tagged(tag: String, b: Bytes, at: Int) -> Yaml / {fault.at, abort.raise} =
     AsNan -> tag == core_tag("float"),
     AsString -> false,
   };
-  if !fits { stop(at, Mistagged(tag)) }
-  else if read == AsDecimal && tag == core_tag("float") { finite(b, at) }
-  else { shaped(b, read, at) }
+  if !fits { fail(at, Mistagged(tag)) }
+  else if read == AsDecimal && tag == core_tag("float") { float_value(b, at) }
+  else { value_of_shape(b, read, at) }
 }
 
 /// A collection under its tag: `kind` is the core schema's name for what it is.
-fn collected(c: Composer, open: Open, kind: String, v: Yaml) -> Yaml / {fault.at} =
+fn tagged_collection(
+  c: Composer,
+  open: OpenCollection,
+  kind: String,
+  v: Yaml,
+) -> Yaml / {fault.at} =
   match open.tag {
     None -> v,
     Some(named) -> if named == "!" || named == core_tag(kind) { v }
-    else if says_nothing(named) { stop(open.from, Mistagged(named)) }
+    else if says_nothing(named) { fail(open.from, Mistagged(named)) }
     else if c.keep.contains(named) { Tagged(named, v) }
-    else { stop(open.from, UnknownTag(named)) },
+    else { fail(open.from, UnknownTag(named)) },
   }
 
-fn no_pairs() -> Pairs =
+fn empty_mapping_state() -> MappingState =
   {
     items: [],
     members: [],
@@ -2211,18 +2305,27 @@ fn no_pairs() -> Pairs =
   }
 
 /// The composer with one more event read.
-fn composed(c: Composer, e: Event) -> Composer / {fault.at, abort.raise} =
+fn compose_event(c: Composer, e: Event) -> Composer / {fault.at, abort.raise} =
   match e.kind {
-    DocumentStart(_) -> if c.documents.len() >= c.most_documents { stop(e.from, TooManyDocuments) }
+    DocumentStart(_) -> if c.documents.len() >= c.max_documents { fail(e.from, TooManyDocuments) }
     else { { ..c, anchors: Map::new(), document_from: e.from } },
     Alias(name) -> match c.anchors.get(name) {
-      Some(held) -> placed(c, held.value, Leaf(e.from, e.to), held.nodes, held.nodes, None, false),
-      None -> stop(e.from, UnknownAlias(name)),
+      Some(tagged_value) ->
+        add_value(
+          c,
+          tagged_value.value,
+          Leaf(e.from, e.to),
+          tagged_value.nodes,
+          tagged_value.nodes,
+          None,
+          false,
+        ),
+      None -> fail(e.from, UnknownAlias(name)),
     },
     Scalar(props, text, style) -> {
       let merge = is_merge_key(c, props.tag, text, style);
       let v = if merge { String(text) } else { scalar_value(c, props.tag, text, style, e.from) };
-      placed(c, v, Leaf(e.from, e.to), 1, 1, props.anchor, merge)
+      add_value(c, v, Leaf(e.from, e.to), 1, 1, props.anchor, merge)
     },
     SequenceStart(props, flow) ->
       {
@@ -2256,17 +2359,17 @@ fn composed(c: Composer, e: Event) -> Composer / {fault.at, abort.raise} =
               flow: flow,
               nodes: 0,
             },
-            no_pairs(),
+            empty_mapping_state(),
           ),
           c.frames,
         ),
       },
     SequenceEnd -> match c.frames {
       Top(InSequence(open, items, nodes), rest) ->
-        placed(
+        add_value(
           { ..c, frames: rest },
-          collected(c, open, "seq", Sequence(items)),
-          Elements(nodes, open.from, e.to, open.flow),
+          tagged_collection(c, open, "seq", Sequence(items)),
+          SequenceNode(nodes, open.from, e.to, open.flow),
           open.nodes +| 1,
           1,
           open.anchor,
@@ -2276,10 +2379,10 @@ fn composed(c: Composer, e: Event) -> Composer / {fault.at, abort.raise} =
     },
     MappingEnd -> match c.frames {
       Top(InMapping(open, pairs), rest) ->
-        placed(
+        add_value(
           { ..c, frames: rest },
-          collected(c, open, "map", Mapping(settled(pairs))),
-          Members(pairs.members, open.from, e.to, open.flow, open.inner),
+          tagged_collection(c, open, "map", Mapping(mapping_entries(pairs))),
+          MappingNode(pairs.members, open.from, e.to, open.flow, open.inner),
           open.nodes +| 1,
           1,
           open.anchor,
@@ -2293,35 +2396,39 @@ fn composed(c: Composer, e: Event) -> Composer / {fault.at, abort.raise} =
 /// The composer at the end of the parser's stream, handed each event as the parser says it, so
 /// that what is refused first is what stands first in the text. `left` bounds the steps as it
 /// does for `run`.
-fn composing(p: Parser, c: Composer, left: Int) -> Composer / {fault.at, abort.raise} =
+fn compose_stream(p: Parser, c: Composer, left: Int) -> Composer / {fault.at, abort.raise} =
   if p.done { c }
   else if left <= 0 { panic("more steps than bytes") } else {
     let next = step(p);
-    let heard = match next.events.at(p.events.len()) { Some(e) -> composed(c, e), None -> c };
-    composing(next, heard, left - 1)
+    let heard = match next.events.at(p.events.len()) { Some(e) -> compose_event(c, e), None -> c };
+    compose_stream(next, heard, left - 1)
   }
 
 fn loaded(
   src: Bytes,
   limits: Limits,
   options: Options,
-) -> List<Composed> / {fault.at, abort.raise} =
-  composing(parser(opened(src, limits)), composer(limits, options), 32 * src.len() + 64).documents
+) -> List<ComposedDocument> / {fault.at, abort.raise} =
+  compose_stream(
+    parser(scanner(src, limits)),
+    composer(limits, options),
+    32 * src.len() + 64,
+  ).documents
 
 /// What a reader raises is a refusal placed in the text, whatever went wrong inside it.
-fn guarded<a>(src: Bytes, body: () -> a / {fault.at, abort.raise}) -> a / {yaml.refused} =
+fn guarded<a>(src: Bytes, body: () -> a / {fault.at, abort.raise}) -> a / {yaml.fail} =
   handle {
-    handle { body() } with { fault.at(offset, why) -> yaml.refused(placed_at(src, offset, why)) }
+    handle { body() } with { fault.at(offset, why) -> yaml.fail(error_at(src, offset, why)) }
   } with {
-    abort.raise(said) -> yaml.refused(defect(said)),
+    abort.raise(said) -> yaml.fail(defect(said)),
   }
 
 /// The one document of a stream.
-fn only(src: Bytes, documents: List<Composed>) -> Composed / {fault.at} =
+fn single_document(src: Bytes, documents: List<ComposedDocument>) -> ComposedDocument / {fault.at} =
   match documents {
     [] -> { value: Null, node: Leaf(src.len(), src.len()), from: src.len() },
     [one] -> one,
-    [_, second, ..] -> stop(second.from, NotOneDocument(documents.len())),
+    [_, second, ..] -> fail(second.from, NotOneDocument(documents.len())),
   }
 
 /// The value of a stream's one document, raising `yaml.refused` where `parse` answers `Err`. A
@@ -2330,21 +2437,21 @@ pub fn read(
   src: Bytes,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> Yaml / {yaml.refused} = guarded(src, || only(src, loaded(src, limits, options)).value)
+) -> Yaml / {yaml.fail} = guarded(src, || single_document(src, loaded(src, limits, options)).value)
 
 /// The value of a stream's one document, or why it is none within the limits.
 pub fn parse(
   src: Bytes,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> Result<Yaml, Refusal> = try { read(src, limits, options) }
+) -> Result<Yaml, Error> = try { read(src, limits, options) }
 
 /// `parse` over a string's bytes.
 pub fn parse_string(
   src: String,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> Result<Yaml, Refusal> = parse(Bytes::of_string(src), limits, options)
+) -> Result<Yaml, Error> = parse(Bytes::of_string(src), limits, options)
 
 /// The value of every document of a stream, in order, raising `yaml.refused` where `parse_all`
 /// answers `Err`.
@@ -2352,26 +2459,28 @@ pub fn read_all(
   src: Bytes,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> List<Yaml> / {yaml.refused} =
-  guarded(src, || loaded(src, limits, options).map(|d: Composed| d.value))
+) -> List<Yaml> / {yaml.fail} =
+  guarded(src, || loaded(src, limits, options).map(|d: ComposedDocument| d.value))
 
 /// The value of every document of a stream, or why it is none within the limits.
 pub fn parse_all(
   src: Bytes,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> Result<List<Yaml>, Refusal> = try { read_all(src, limits, options) }
+) -> Result<List<Yaml>, Error> = try { read_all(src, limits, options) }
 
 // --- Writing ----------------------------------------------------------------
 
 /// The value as a writer writes it: each mapping's keys held once, and each tag over what a
 /// reader that keeps it reads.
-fn normal(v: Yaml) -> Yaml =
+fn normalized(v: Yaml) -> Yaml =
   match v {
-    Sequence(items) -> Sequence(items.map(normal)),
+    Sequence(items) -> Sequence(items.map(normalized)),
     Mapping(entries) ->
-      Mapping(unique(entries.map(|e: Entry| { key: normal(e.key), value: normal(e.value) }))),
-    Tagged(tag, held) -> tagged(tag, normal(held)),
+      Mapping(
+        unique(entries.map(|e: Entry| { key: normalized(e.key), value: normalized(e.value) })),
+      ),
+    Tagged(tag, tagged_value) -> tagged(tag, normalized(tagged_value)),
     _ -> v,
   }
 
@@ -2379,7 +2488,7 @@ fn normal(v: Yaml) -> Yaml =
 /// their own, and what a reader reads back equal.
 pub fn to_bytes(v: Yaml) -> Bytes =
   handle {
-    Bytes::concat_all(put_value([], normal(v), 0, true, b""))
+    Bytes::concat_all(write_value([], normalized(v), 0, true, b""))
   } with {
     abort.raise(_) -> b"",
   }
@@ -2392,7 +2501,7 @@ pub fn stream_to_bytes(documents: List<Yaml>) -> Bytes =
   handle {
     Bytes::concat_all(
       documents.fold([], |out: List<Bytes>, v: Yaml|
-        put_value(out.push(b"---\n"), normal(v), 0, true, b"")),
+        write_value(out.push(b"---\n"), normalized(v), 0, true, b"")),
     )
   } with {
     abort.raise(_) -> b"",
@@ -2401,7 +2510,7 @@ pub fn stream_to_bytes(documents: List<Yaml>) -> Bytes =
 /// The value in flow style on one line, as it stands inside `[` and `]`.
 pub fn inline(v: Yaml) -> String =
   String::of_bytes_lossy(handle {
-    Bytes::concat_all(put_flow([], normal(v)))
+    Bytes::concat_all(write_flow([], normalized(v)))
   } with {
     abort.raise(_) -> b"",
   })
@@ -2411,7 +2520,7 @@ fn margin(n: Int) -> Bytes = b" ".repeat(n)
 /// A value after what introduces it: nothing at the root, a key's `:`, an entry's `-` or a tag.
 /// `inner` is the indentation of its own lines, `compact` whether a block collection may start
 /// on the line it is introduced on, and `sep` what parts it from its introducer there.
-fn put_value(
+fn write_value(
   out: List<Bytes>,
   v: Yaml,
   inner: Int,
@@ -2419,50 +2528,51 @@ fn put_value(
   sep: Bytes,
 ) -> List<Bytes> / {abort.raise} =
   match v {
-    Tagged(tag, held) -> put_value(out.push(sep).push(tag_bytes(tag)), held, inner, false, b" "),
+    Tagged(tag, tagged_value) ->
+      write_value(out.push(sep).push(tag_bytes(tag)), tagged_value, inner, false, b" "),
     Sequence(items) -> if items.len() == 0 { out.push(sep).push(b"[]\n") }
-    else if compact { put_items(out.push(sep), items, inner, true) }
-    else { put_items(out.push(b"\n"), items, inner, false) },
+    else if compact { write_items(out.push(sep), items, inner, true) }
+    else { write_items(out.push(b"\n"), items, inner, false) },
     Mapping(entries) -> if entries.len() == 0 { out.push(sep).push(b"{}\n") }
-    else if compact { put_entries(out.push(sep), entries, inner, true) }
-    else { put_entries(out.push(b"\n"), entries, inner, false) },
-    String(s) -> put_string(out.push(sep), Bytes::of_string(s), inner),
+    else if compact { write_entries(out.push(sep), entries, inner, true) }
+    else { write_entries(out.push(b"\n"), entries, inner, false) },
+    String(s) -> write_string(out.push(sep), Bytes::of_string(s), inner),
     atom -> out.push(sep).push(atom_bytes(atom)).push(b"\n"),
   }
 
 /// What is written so far, and whether the next line's indentation is.
-type Putting = { out: List<Bytes>, first: Bool }
+type BlockOutput = { out: List<Bytes>, first: Bool }
 
-fn put_items(
+fn write_items(
   out: List<Bytes>,
   items: List<Yaml>,
   inner: Int,
   on_line: Bool,
 ) -> List<Bytes> / {abort.raise} =
-  items.fold({ out: out, first: on_line }, |w: Putting, item: Yaml| {
+  items.fold({ out: out, first: on_line }, |w: BlockOutput, item: Yaml| {
     let lead = if w.first { w.out } else { w.out.push(margin(inner)) };
-    { out: put_value(lead.push(b"-"), item, inner + 2, true, b" "), first: false }
+    { out: write_value(lead.push(b"-"), item, inner + 2, true, b" "), first: false }
   }).out
 
 /// A mapping's entries. A key that does not fit on its line before a `:` is written after `?`.
-fn put_entries(
+fn write_entries(
   out: List<Bytes>,
   entries: List<Entry>,
   inner: Int,
   on_line: Bool,
 ) -> List<Bytes> / {abort.raise} =
-  entries.fold({ out: out, first: on_line }, |w: Putting, e: Entry| {
+  entries.fold({ out: out, first: on_line }, |w: BlockOutput, e: Entry| {
     let lead = if w.first { w.out } else { w.out.push(margin(inner)) };
     match key_bytes(e.key) {
       Some(key) ->
         {
-          out: put_value(lead.push(key).push(b":"), e.value, inner + 2, false, b" "),
+          out: write_value(lead.push(key).push(b":"), e.value, inner + 2, false, b" "),
           first: false,
         },
       None -> {
-        let asked = put_value(lead.push(b"?"), e.key, inner + 2, true, b" ");
+        let asked = write_value(lead.push(b"?"), e.key, inner + 2, true, b" ");
         {
-          out: put_value(asked.push(margin(inner)).push(b":"), e.value, inner + 2, true, b" "),
+          out: write_value(asked.push(margin(inner)).push(b":"), e.value, inner + 2, true, b" "),
           first: false,
         }
       },
@@ -2473,8 +2583,8 @@ fn put_entries(
 fn key_bytes(k: Yaml) -> Option<Bytes> / {abort.raise} =
   match k {
     String(s) -> {
-      let written = string_bytes(Bytes::of_string(s), false);
-      if written.len() <= 512 { Some(written) } else { None }
+      let edit_bytes = string_bytes(Bytes::of_string(s), false);
+      if edit_bytes.len() <= 512 { Some(edit_bytes) } else { None }
     },
     Sequence(items) -> if items.len() == 0 { Some(b"[]") } else { None },
     Mapping(entries) -> if entries.len() == 0 { Some(b"{}") } else { None },
@@ -2497,10 +2607,10 @@ fn atom_bytes(v: Yaml) -> Bytes =
 
 /// A string that ends its line: as a literal block scalar where it holds a line break and
 /// nothing a literal cannot, and otherwise as `string_bytes` writes it.
-fn put_string(out: List<Bytes>, raw: Bytes, inner: Int) -> List<Bytes> / {abort.raise} =
+fn write_string(out: List<Bytes>, raw: Bytes, inner: Int) -> List<Bytes> / {abort.raise} =
   if !literal_fits(raw, inner == 0) { out.push(string_bytes(raw, false)).push(b"\n") } else {
     let n = raw.len();
-    let body_end = back_over(raw, n);
+    let body_end = before_line_feeds(raw, n);
     let trailing = n - body_end;
     let lines = raw.slice(0, body_end).split(b"\n");
     let pad = margin(max(inner, 2));
@@ -2516,8 +2626,8 @@ fn put_string(out: List<Bytes>, raw: Bytes, inner: Int) -> List<Bytes> / {abort.
   }
 
 /// `to` moved back over the line feeds before it.
-fn back_over(raw: Bytes, to: Int) -> Int / {abort.raise} =
-  if to > 0 && raw.at(to - 1) == b'\n' { back_over(raw, to - 1) } else { to }
+fn before_line_feeds(raw: Bytes, to: Int) -> Int / {abort.raise} =
+  if to > 0 && raw.at(to - 1) == b'\n' { before_line_feeds(raw, to - 1) } else { to }
 
 /// Whether a line of the text starts with a space, which a block scalar's indentation indicator
 /// is written for.
@@ -2533,7 +2643,8 @@ fn byte_at(raw: Bytes, i: Int) -> Int = handle { raw.at(i) } with { abort.raise(
 /// columns there.
 fn literal_fits(raw: Bytes, root: Bool) -> Bool / {abort.raise} = {
   let n = raw.len();
-  raw.skip_until(0, b"\n") < n && raw.skip(0, b"\n") < n && special(raw, 0, b"\n\t", n + 1) < 0
+  raw.skip_until(0, b"\n") < n && raw.skip(0, b"\n") < n
+    && first_to_escape(raw, 0, b"\n\t", n + 1) < 0
     && !(root && is_indented(raw))
 }
 
@@ -2544,8 +2655,8 @@ fn string_bytes(raw: Bytes, flow: Bool) -> Bytes / {abort.raise} = {
   let n = raw.len();
   if plain_fits(raw, flow) { raw }
   else if raw.skip_until(0, b"\"\\") < n && raw.skip_until(0, b"'") == n
-      && special(raw, 0, b"", n + 1) < 0 { Bytes::concat_all([b"'", raw, b"'"]) }
-  else { Bytes::concat_all(put_escaped([b"\""], raw, 0, n + 1).push(b"\"")) }
+      && first_to_escape(raw, 0, b"", n + 1) < 0 { Bytes::concat_all([b"'", raw, b"'"]) }
+  else { Bytes::concat_all(write_escaped([b"\""], raw, 0, n + 1).push(b"\"")) }
 }
 
 /// Whether a plain scalar written `raw` reads back as the string it is: it is no null, boolean or
@@ -2555,18 +2666,18 @@ fn string_bytes(raw: Bytes, flow: Bool) -> Bytes / {abort.raise} = {
 fn plain_fits(raw: Bytes, flow: Bool) -> Bool / {abort.raise} = {
   let n = raw.len();
   n > 0 && shape(raw) == AsString && !is_blank(raw.peek(0)) && !is_blank(raw.peek(n - 1))
-    && !starts_indicator(raw)
+    && !starts_with_indicator(raw)
     && raw.peek(n - 1) != b':'
-    && special(raw, 0, b"", n + 1) < 0
+    && first_to_escape(raw, 0, b"", n + 1) < 0
     && !raw.contains(b": ")
     && !raw.contains(b" #")
     && !(flow && raw.skip_until(0, b",[]{}") < n)
-    && !is_foreign(raw)
+    && !is_yaml11_non_string(raw)
 }
 
 /// Whether the text starts as something other than a plain scalar does: with an indicator, or
 /// with what marks a document.
-fn starts_indicator(raw: Bytes) -> Bool / {abort.raise} = {
+fn starts_with_indicator(raw: Bytes) -> Bool / {abort.raise} = {
   let c = raw.peek(0);
   if c == b'-' || c == b':' || c == 63 {
     ends_word(raw.peek(1)) || is_flow_indicator(raw.peek(1)) || raw.starts_with(b"---")
@@ -2575,7 +2686,7 @@ fn starts_indicator(raw: Bytes) -> Bool / {abort.raise} = {
 
 /// Whether a YAML 1.1 reader takes a plain scalar written `raw` for something other than a
 /// string: one of its booleans, a merge key, a number with `_`, `:` or a base prefix, or a date.
-fn is_foreign(raw: Bytes) -> Bool / {abort.raise} = {
+fn is_yaml11_non_string(raw: Bytes) -> Bool / {abort.raise} = {
   let n = raw.len();
   let word = if n <= 5 { String::of_bytes(raw).ascii_lower() } else { "" };
   let from = if raw.peek(0) == b'+' || raw.peek(0) == b'-' { 1 } else { 0 };
@@ -2590,25 +2701,25 @@ fn is_foreign(raw: Bytes) -> Bool / {abort.raise} = {
 /// The bytes that may start what a double-quoted scalar writes as an escape, the quote and the
 /// backslash aside: every C0 control, the delete character, and the lead bytes of the C1
 /// controls, the line and paragraph separators, the byte order mark, U+FFFE and U+FFFF.
-fn specials() -> Bytes =
+fn escape_lead_bytes() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f\xc2\xe2\xef"
 
 /// Where the first character stands, from `i`, that a double-quoted scalar writes as an escape
 /// and `allowed` does not hold, or -1. Each round passes a byte, so the bytes bound them: `left`.
-fn special(raw: Bytes, i: Int, allowed: Bytes, left: Int) -> Int / {abort.raise} = {
-  let at = raw.skip_until(i, specials());
+fn first_to_escape(raw: Bytes, i: Int, allowed: Bytes, left: Int) -> Int / {abort.raise} = {
+  let at = raw.skip_until(i, escape_lead_bytes());
   if at >= raw.len() || left <= 0 { -1 }
   else if escape_at(raw, at).text.len() == 0 || raw.skip(at, allowed) > at {
-    special(raw, at + 1, allowed, left - 1)
+    first_to_escape(raw, at + 1, allowed, left - 1)
   } else { at }
 }
 
 /// An escape and how many bytes of the text it stands for.
-type Escaped = { text: Bytes, width: Int }
+type EscapeSequence = { text: Bytes, width: Int }
 
 /// What a double-quoted scalar writes for the character at `at`; no text where it writes the
 /// character itself.
-fn escape_at(raw: Bytes, at: Int) -> Escaped / {abort.raise} = {
+fn escape_at(raw: Bytes, at: Int) -> EscapeSequence / {abort.raise} = {
   let c = raw.peek(at);
   let next = raw.peek(at + 1);
   let third = raw.peek(at + 2);
@@ -2649,18 +2760,18 @@ fn short_escape(c: Int) -> Bytes / {abort.raise} =
 
 /// `raw` from `i` between double quotes: each quote, backslash and unprintable character as its
 /// escape. Each round passes a byte, so the bytes bound them: `left`.
-fn put_escaped(out: List<Bytes>, raw: Bytes, i: Int, left: Int) -> List<Bytes> / {abort.raise} = {
+fn write_escaped(out: List<Bytes>, raw: Bytes, i: Int, left: Int) -> List<Bytes> / {abort.raise} = {
   let at = raw.skip_until(i, escape_stops());
   let run = out.push(raw.slice(i, at));
   if at >= raw.len() { run }
   else if left <= 0 { panic("more escapes than bytes") } else {
     let e = escape_at(raw, at);
-    if e.text.len() == 0 { put_escaped(run.push(raw.slice(at, at + 1)), raw, at + 1, left - 1) }
-    else { put_escaped(run.push(e.text), raw, at + e.width, left - 1) }
+    if e.text.len() == 0 { write_escaped(run.push(raw.slice(at, at + 1)), raw, at + 1, left - 1) }
+    else { write_escaped(run.push(e.text), raw, at + e.width, left - 1) }
   }
 }
 
-fn escape_stops() -> Bytes = b"\"\\".concat(specials())
+fn escape_stops() -> Bytes = b"\"\\".concat(escape_lead_bytes())
 
 /// A tag as a node carries it: `!!name` for one of `tag:yaml.org,2002:`, `!name` for a local one,
 /// and otherwise in full between `!<` and `>`, each byte a tag cannot hold as a `%` escape.
@@ -2672,38 +2783,43 @@ fn tag_bytes(tag: String) -> Bytes / {abort.raise} = {
   if raw.starts_with(core) && n > k && raw.skip(k, shorthand_chars()) == n {
     b"!!".concat(raw.slice(k, n))
   } else if raw.peek(0) == b'!' && n > 1 && raw.skip(1, shorthand_chars()) == n { raw }
-  else { Bytes::concat_all(put_percent([b"!<"], raw, 0, n + 1).push(b">")) }
+  else { Bytes::concat_all(write_percent_escaped([b"!<"], raw, 0, n + 1).push(b">")) }
 }
 
 /// What a shorthand tag is written of with no escape.
 fn shorthand_chars() -> Bytes =
   b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-#;/?:@&=+$_.~*'()"
 
-fn put_percent(out: List<Bytes>, raw: Bytes, i: Int, left: Int) -> List<Bytes> / {abort.raise} = {
+fn write_percent_escaped(
+  out: List<Bytes>,
+  raw: Bytes,
+  i: Int,
+  left: Int,
+) -> List<Bytes> / {abort.raise} = {
   let at = raw.skip(i, shorthand_chars());
   let run = out.push(raw.slice(i, at));
   if at >= raw.len() { run }
   else if left <= 0 { panic("more escapes than bytes") }
-  else { put_percent(run.push(b"%").push(hex_pair(raw.at(at))), raw, at + 1, left - 1) }
+  else { write_percent_escaped(run.push(b"%").push(hex_pair(raw.at(at))), raw, at + 1, left - 1) }
 }
 
 /// A value in flow style.
-fn put_flow(out: List<Bytes>, v: Yaml) -> List<Bytes> / {abort.raise} =
+fn write_flow(out: List<Bytes>, v: Yaml) -> List<Bytes> / {abort.raise} =
   match v {
-    Tagged(tag, held) -> put_flow(out.push(tag_bytes(tag)).push(b" "), held),
+    Tagged(tag, tagged_value) -> write_flow(out.push(tag_bytes(tag)).push(b" "), tagged_value),
     Sequence(items) -> match items {
       [] -> out.push(b"[]"),
       [first, ..rest] ->
-        rest.fold(put_flow(out.push(b"["), first), |o: List<Bytes>, item: Yaml|
-          put_flow(o.push(b", "), item)).push(
+        rest.fold(write_flow(out.push(b"["), first), |o: List<Bytes>, item: Yaml|
+          write_flow(o.push(b", "), item)).push(
           b"]",
         ),
     },
     Mapping(entries) -> match entries {
       [] -> out.push(b"{}"),
       [first, ..rest] ->
-        rest.fold(put_pair(out.push(b"{"), first), |o: List<Bytes>, e: Entry|
-          put_pair(o.push(b", "), e)).push(
+        rest.fold(write_pair(out.push(b"{"), first), |o: List<Bytes>, e: Entry|
+          write_pair(o.push(b", "), e)).push(
           b"}",
         ),
     },
@@ -2713,7 +2829,7 @@ fn put_flow(out: List<Bytes>, v: Yaml) -> List<Bytes> / {abort.raise} =
 
 /// A key and its value inside a flow mapping, the key after `?` where it is a collection, has a
 /// tag or is long.
-fn put_pair(out: List<Bytes>, e: Entry) -> List<Bytes> / {abort.raise} = {
+fn write_pair(out: List<Bytes>, e: Entry) -> List<Bytes> / {abort.raise} = {
   let simple = match e.key {
     String(s) -> s.len() <= 256,
     Sequence(_) -> false,
@@ -2721,15 +2837,15 @@ fn put_pair(out: List<Bytes>, e: Entry) -> List<Bytes> / {abort.raise} = {
     Tagged(_, _) -> false,
     _ -> true,
   };
-  if simple { put_flow(put_flow(out, e.key).push(b": "), e.value) }
-  else { put_flow(put_flow(out.push(b"? "), e.key).push(b" : "), e.value) }
+  if simple { write_flow(write_flow(out, e.key).push(b": "), e.value) }
+  else { write_flow(write_flow(out.push(b"? "), e.key).push(b" : "), e.value) }
 }
 
 // --- Codecs -----------------------------------------------------------------
 
-/// An error saying `what` was expected and naming the kind of value `found` is instead.
-pub fn expected(what: String, found: Yaml) -> DecodeError =
-  decode_error("expected " ++ what ++ ", found " ++ kind_of(found))
+/// An error saying `what` was expected and naming the kind of value `locate` is instead.
+pub fn expected(what: String, locate: Yaml) -> DecodeError =
+  decode_error("expected " ++ what ++ ", found " ++ kind_of(locate))
 
 /// What a value is, as an error names it: `an integer`, `a mapping`.
 pub fn kind_of(v: Yaml) -> String =
@@ -2758,7 +2874,7 @@ pub fn field<a>(
 ) -> Result<a, DecodeError> / {abort.raise} =
   match untagged(v) {
     Mapping(_) -> match get(v, name) {
-      Some(found) -> Result::map_err((codec.decode)(found), |e: DecodeError| in_field(name, e)),
+      Some(locate) -> Result::map_err((codec.decode)(locate), |e: DecodeError| in_field(name, e)),
       None -> Err(in_field(name, decode_error("this key is missing"))),
     },
     _ -> Err(expected("a mapping", v)),
@@ -2774,8 +2890,8 @@ pub fn optional_field<a>(
     Mapping(_) -> match get(v, name) {
       None -> Ok(None),
       Some(Null) -> Ok(None),
-      Some(found) ->
-        Result::map_err((codec.decode)(found), |e: DecodeError| in_field(name, e)).map(|x: a|
+      Some(locate) ->
+        Result::map_err((codec.decode)(locate), |e: DecodeError| in_field(name, e)).map(|x: a|
           Some(x)),
     },
     _ -> Err(expected("a mapping", v)),
@@ -2928,18 +3044,21 @@ fn string_keyed(entries: List<Entry>) -> Result<List<{ key: String, value: Yaml 
   )
 
 /// The node a path leads to in a document as it is written, as far as the path is written there.
-fn node_at(node: Node, path: List<Step>) -> Node =
+fn node_at(node: Node, path: List<PathSegment>) -> Node =
   match path {
     [] -> node,
     [Key(name), ..rest] -> match node {
-      Members(members, _, _, _, _) -> match members.find(|m: Member| m.key == String(name)) {
+      MappingNode(members, _, _, _, _) -> match members.find(|m: Member| m.key == String(name)) {
         Some(m) -> node_at(m.value, rest),
         None -> node,
       },
       _ -> node,
     },
     [Index(i), ..rest] -> match node {
-      Elements(nodes, _, _, _) -> match nodes.at(i) { Some(n) -> node_at(n, rest), None -> node },
+      SequenceNode(nodes, _, _, _) -> match nodes.at(i) {
+        Some(n) -> node_at(n, rest),
+        None -> node,
+      },
       _ -> node,
     },
   }
@@ -2953,18 +3072,18 @@ pub fn decode_bytes<a>(
   codec: YamlCodec<a>,
   options: Options = { merge_keys: false, keep_tags: [] },
 ) -> Result<a, DecodeError> / {abort.raise} =
-  match try { guarded(src, || only(src, loaded(src, limits, options))) } {
+  match try { guarded(src, || single_document(src, loaded(src, limits, options))) } {
     Err(r) ->
       Err({
         path: [],
         place: Some({ line: r.line, column: r.column }),
-        message: why_to_string(r.why),
+        message: error_kind_message(r.reason),
       }),
     Ok(read) ->
       Result::map_err((codec.decode)(read.value), |e: DecodeError|
         {
           path: e.path,
-          place: Some(place_at(src, start_of(node_at(read.node, e.path)))),
+          place: Some(location_at(src, start_of(node_at(read.node, e.path)))),
           message: e.message,
         }),
   }
@@ -2989,11 +3108,11 @@ pub fn encode_string<a>(x: a, codec: YamlCodec<a>) -> String / {abort.raise} =
 // --- Refusals as text -------------------------------------------------------
 
 /// A refusal as a sentence: `line 3, column 8: expected a node`.
-pub fn refusal_to_string(r: Refusal) -> String =
+pub fn error_message(r: Error) -> String =
   "line " ++ r.line.to_string() ++ ", column " ++ r.column.to_string() ++ ": "
-    ++ why_to_string(r.why)
+    ++ error_kind_message(r.reason)
 
-fn why_to_string(why: Why) -> String =
+fn error_kind_message(why: ErrorKind) -> String =
   match why {
     TooLong -> "the stream is longer than its limit",
     TooDeep -> "this is nested deeper than the limit",
@@ -3007,7 +3126,7 @@ fn why_to_string(why: Why) -> String =
     Expected(what) -> "expected " ++ what,
     Tab -> "a tab may not indent a block: use spaces",
     Escape -> "this is no escape of a double-quoted scalar, or names no Unicode scalar value",
-    TooWide -> "this number is past what an `Int` or a `Float` holds",
+    OutOfRange -> "this number is past what an `Int` or a `Float` holds",
     Version(major, minor) ->
       "this stream is YAML " ++ major.to_string() ++ "." ++ minor.to_string()
         ++ ", and this reader reads YAML 1",
@@ -3020,10 +3139,11 @@ fn why_to_string(why: Why) -> String =
       "no node before this alias has the anchor " ++ name
         ++ ", or the alias stands inside the node that does",
     Duplicate(key) -> "the key " ++ key ++ " is written twice in this mapping",
-    NotOneDocument(found) ->
-      "the stream holds " ++ found.to_string() ++ " documents, and one was asked for",
-    Closed(path) -> if path.len() == 0 { "the document has no place for this edit of all it holds" }
-    else { "the document has no place for an edit at `" ++ path_to_string(path) ++ "`" },
+    NotOneDocument(locate) ->
+      "the stream holds " ++ locate.to_string() ++ " documents, and one was asked for",
+    Uneditable(path) -> if path.len() == 0 {
+      "the document has no place for this edit of all it holds"
+    } else { "the document has no place for an edit at `" ++ path_to_string(path) ++ "`" },
     Defect(said) -> "std.yaml failed, which is its defect and no fault of the text: " ++ said,
   }
 
@@ -3055,9 +3175,9 @@ pub fn document(
   src: Bytes,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> Document / {yaml.refused} =
+) -> Document / {yaml.fail} =
   guarded(src, || {
-    let read = only(src, loaded(src, limits, options));
+    let read = single_document(src, loaded(src, limits, options));
     { source: src, value: read.value, node: read.node, limits: limits, options: options }
   })
 
@@ -3066,7 +3186,7 @@ pub fn parse_document(
   src: Bytes,
   limits: Limits,
   options: Options = { merge_keys: false, keep_tags: [] },
-) -> Result<Document, Refusal> = try { document(src, limits, options) }
+) -> Result<Document, Error> = try { document(src, limits, options) }
 
 /// The document's bytes: what it was read from, changed only where an edit changed them.
 pub fn source(d: Document) -> Bytes = d.source
@@ -3075,21 +3195,22 @@ pub fn source(d: Document) -> Bytes = d.source
 pub fn value(d: Document) -> Yaml = d.value
 
 /// A node a path leads to, and whether it stands inside a flow collection.
-type Found = { node: Node, flow: Bool }
+type LocatedNode = { node: Node, flow: Bool }
 
-fn found(node: Node, path: List<Step>, flow: Bool) -> Option<Found> =
+fn locate(node: Node, path: List<PathSegment>, flow: Bool) -> Option<LocatedNode> =
   match path {
     [] -> Some({ node: node, flow: flow }),
     [Key(name), ..rest] -> match node {
-      Members(members, _, _, style, _) -> match members.find(|m: Member| m.key == String(name)) {
-        Some(m) -> found(m.value, rest, flow || style),
+      MappingNode(members, _, _, style, _) -> match members.find(|m: Member|
+          m.key == String(name)) {
+        Some(m) -> locate(m.value, rest, flow || style),
         None -> None,
       },
       _ -> None,
     },
     [Index(i), ..rest] -> match node {
-      Elements(nodes, _, _, style) -> match nodes.at(i) {
-        Some(n) -> found(n, rest, flow || style),
+      SequenceNode(nodes, _, _, style) -> match nodes.at(i) {
+        Some(n) -> locate(n, rest, flow || style),
         None -> None,
       },
       _ -> None,
@@ -3098,9 +3219,9 @@ fn found(node: Node, path: List<Step>, flow: Bool) -> Option<Found> =
 
 /// Where the value a path leads to is written: `None` for a path the document does not write,
 /// as one into what an alias or a merge key brings.
-pub fn place(d: Document, path: List<Step>) -> Option<Place> =
-  match found(d.node, path, false) {
-    Some(f) -> Some(place_at(d.source, start_of(f.node))),
+pub fn place(d: Document, path: List<PathSegment>) -> Option<Location> =
+  match locate(d.node, path, false) {
+    Some(f) -> Some(location_at(d.source, start_of(f.node))),
     None -> None,
   }
 
@@ -3109,16 +3230,16 @@ pub fn place(d: Document, path: List<Step>) -> Option<Place> =
 fn content_end(node: Node) -> Int =
   match node {
     Leaf(_, to) -> to,
-    Elements(nodes, from, to, flow) -> if flow { to }
+    SequenceNode(nodes, from, to, flow) -> if flow { to }
     else { match nodes.at(nodes.len() - 1) { Some(last) -> content_end(last), None -> from } },
-    Members(members, from, to, flow, _) -> if flow { to } else {
+    MappingNode(members, from, to, flow, _) -> if flow { to } else {
       match members.at(members.len() - 1) { Some(last) -> content_end(last.value), None -> from }
     },
   }
 
 /// `to` moved back over the blanks and line breaks before it.
-fn back_space(src: Bytes, to: Int) -> Int / {abort.raise} =
-  if to > 0 && ends_word(src.at(to - 1)) { back_space(src, to - 1) } else { to }
+fn before_whitespace(src: Bytes, to: Int) -> Int / {abort.raise} =
+  if to > 0 && ends_word(src.at(to - 1)) { before_whitespace(src, to - 1) } else { to }
 
 /// Where the line holding `p` starts.
 fn line_start(src: Bytes, p: Int) -> Int / {abort.raise} =
@@ -3130,21 +3251,21 @@ fn line_after(src: Bytes, p: Int) -> Int / {abort.raise} =
 
 /// A value as an edit writes it, on one line: a string by the rules of where it stands, and a
 /// collection in flow style.
-fn written(v: Yaml, flow: Bool) -> Bytes / {abort.raise} =
+fn edit_bytes(v: Yaml, flow: Bool) -> Bytes / {abort.raise} =
   match v {
     String(s) -> string_bytes(Bytes::of_string(s), flow),
-    _ -> Bytes::concat_all(put_flow([], v)),
+    _ -> Bytes::concat_all(write_flow([], v)),
   }
 
 /// The first of the texts that reads, under the document's limits and options, as `wanted`.
 fn first_fit(
   d: Document,
-  path: List<Step>,
+  path: List<PathSegment>,
   texts: List<Bytes>,
   wanted: Yaml,
-) -> Document / {yaml.refused} =
+) -> Document / {yaml.fail} =
   match texts {
-    [] -> shut(d, path),
+    [] -> fail_edit(d, path),
     [text, ..rest] -> match parse_document(text, d.limits, d.options) {
       Ok(made) -> if made.value == wanted { made } else { first_fit(d, path, rest, wanted) },
       Err(_) -> first_fit(d, path, rest, wanted),
@@ -3152,8 +3273,8 @@ fn first_fit(
   }
 
 /// Refuses an edit, at the deepest part of its path that is written.
-fn shut<a>(d: Document, path: List<Step>) -> a / {yaml.refused} =
-  yaml.refused(placed_at(d.source, start_of(node_at(d.node, path)), Closed(path)))
+fn fail_edit<a>(d: Document, path: List<PathSegment>) -> a / {yaml.fail} =
+  yaml.fail(error_at(d.source, start_of(node_at(d.node, path)), Uneditable(path)))
 
 /// The document with `v` at the path, and every byte that does not write that value as it was.
 ///
@@ -3164,37 +3285,37 @@ fn shut<a>(d: Document, path: List<Step>) -> a / {yaml.refused} =
 /// `yaml.refused` unless it means `put(value(d), path, v)`: for a path through a value that is no
 /// mapping, an index its sequence does not have, a place the text has no room for, such as inside
 /// what an alias stands for, or a text past the limits.
-pub fn set(d: Document, path: List<Step>, v: Yaml) -> Document / {yaml.refused} =
+pub fn set(d: Document, path: List<PathSegment>, v: Yaml) -> Document / {yaml.fail} =
   match put(d.value, path, v) {
-    None -> shut(d, path),
+    None -> fail_edit(d, path),
     Some(wanted) ->
       first_fit(
         d,
         path,
         handle {
-          set_texts(d, path, normal(v))
+          set_texts(d, path, normalized(v))
         } with {
-          abort.raise(said) -> yaml.refused(defect(said)),
+          abort.raise(said) -> yaml.fail(defect(said)),
         },
         wanted,
       ),
   }
 
-fn set_texts(d: Document, path: List<Step>, v: Yaml) -> List<Bytes> / {abort.raise} =
-  match found(d.node, path, false) {
+fn set_texts(d: Document, path: List<PathSegment>, v: Yaml) -> List<Bytes> / {abort.raise} =
+  match locate(d.node, path, false) {
     Some(f) -> replaced(d.source, f, v),
     None -> added(d, path, v, path.len() - 1),
   }
 
 /// The texts with `v` in place of a node: pulled up to the line of what introduces it where the
 /// node starts on a line below, and where it stands.
-fn replaced(src: Bytes, f: Found, v: Yaml) -> List<Bytes> / {abort.raise} = {
+fn replaced(src: Bytes, f: LocatedNode, v: Yaml) -> List<Bytes> / {abort.raise} = {
   let from = start_of(f.node);
   let to = max(content_end(f.node), from);
-  let text = written(v, f.flow);
+  let text = edit_bytes(v, f.flow);
   let tail = if to > from && src.peek(to - 1) == b'\n' { b"\n" } else { b"" };
   let lead = if from == to && !ends_word(src.peek(from - 1)) { b" " } else { b"" };
-  let above = back_space(src, from);
+  let above = before_whitespace(src, from);
   let here = spliced(src, from, to, Bytes::concat_all([lead, text, tail]));
   if above > 0 && src.skip_until(above, b"\n") < from {
     [spliced(src, above, to, Bytes::concat_all([b" ", text, tail])), here]
@@ -3202,9 +3323,9 @@ fn replaced(src: Bytes, f: Found, v: Yaml) -> List<Bytes> / {abort.raise} = {
 }
 
 /// The value under the keys of `path` from its step `n` on; `None` where one is an index.
-fn wrapped(path: List<Step>, n: Int, v: Yaml) -> Option<Yaml> =
-  path.drop(n).reverse().fold(Some(v), |held: Option<Yaml>, step: Step|
-    match held {
+fn wrapped(path: List<PathSegment>, n: Int, v: Yaml) -> Option<Yaml> =
+  path.drop(n).reverse().fold(Some(v), |tagged_value: Option<Yaml>, step: PathSegment|
+    match tagged_value {
       None -> None,
       Some(inner) -> match step {
         Key(name) -> Some(Mapping([entry(name, inner)])),
@@ -3214,13 +3335,13 @@ fn wrapped(path: List<Step>, n: Int, v: Yaml) -> Option<Yaml> =
 
 /// The texts with a key added for `v`: to the deepest mapping the path reaches, which is the one
 /// `n` steps along it.
-fn added(d: Document, path: List<Step>, v: Yaml, n: Int) -> List<Bytes> / {abort.raise} =
+fn added(d: Document, path: List<PathSegment>, v: Yaml, n: Int) -> List<Bytes> / {abort.raise} =
   if n < 0 { [] } else {
-    match found(d.node, path.take(n), false) {
+    match locate(d.node, path.take(n), false) {
       None -> added(d, path, v, n - 1),
       Some(f) -> match path.at(n) {
         Some(Key(name)) -> match wrapped(path, n + 1, v) {
-          Some(held) -> entered(d.source, f, name, held),
+          Some(tagged_value) -> entry_texts(d.source, f, name, tagged_value),
           None -> [],
         },
         _ -> [],
@@ -3229,9 +3350,9 @@ fn added(d: Document, path: List<Step>, v: Yaml, n: Int) -> List<Bytes> / {abort
   }
 
 /// The texts with `name: v` as a new last entry of the mapping `f` is.
-fn entered(src: Bytes, f: Found, name: String, v: Yaml) -> List<Bytes> / {abort.raise} =
+fn entry_texts(src: Bytes, f: LocatedNode, name: String, v: Yaml) -> List<Bytes> / {abort.raise} =
   match f.node {
-    Members(members, _, _, flow, inner) -> match members.at(members.len() - 1) {
+    MappingNode(members, _, _, flow, inner) -> match members.at(members.len() - 1) {
       None -> if flow { [spliced(src, inner, inner, flow_pair(b"", name, v))] } else { [] },
       Some(last) -> {
         let end = content_end(last.value);
@@ -3243,7 +3364,7 @@ fn entered(src: Bytes, f: Found, name: String, v: Yaml) -> List<Bytes> / {abort.
   }
 
 fn flow_pair(lead: Bytes, name: String, v: Yaml) -> Bytes / {abort.raise} =
-  Bytes::concat_all([lead, string_bytes(Bytes::of_string(name), true), b": ", written(v, true)])
+  Bytes::concat_all([lead, string_bytes(Bytes::of_string(name), true), b": ", edit_bytes(v, true)])
 
 /// The texts with `name: v` on a line of its own after the line `end` stands on, indented as
 /// the entry at `inner` is.
@@ -3261,7 +3382,7 @@ fn line_added(
         margin(inner - line_start(src, inner)),
         key,
         b": ",
-        written(v, false),
+        edit_bytes(v, false),
       ]);
       let next = line_after(src, end);
       if next > 0 && src.peek(next - 1) == b'\n' { [spliced(src, next, next, line.concat(b"\n"))] }
@@ -3276,24 +3397,24 @@ fn line_added(
 /// not hold changes nothing. The edited text is read back, and the edit raises `yaml.refused`
 /// unless it means `without(value(d), path)`: for the empty path, and for a path the text has no
 /// lines of its own for.
-pub fn remove(d: Document, path: List<Step>) -> Document / {yaml.refused} =
+pub fn remove(d: Document, path: List<PathSegment>) -> Document / {yaml.fail} =
   match at(d.value, path) {
     None -> d,
     Some(_) ->
       first_fit(
         d,
         path,
-        handle { removed(d, path) } with { abort.raise(said) -> yaml.refused(defect(said)) },
+        handle { removed(d, path) } with { abort.raise(said) -> yaml.fail(defect(said)) },
         without(d.value, path),
       ),
   }
 
-fn removed(d: Document, path: List<Step>) -> List<Bytes> / {abort.raise} = {
+fn removed(d: Document, path: List<PathSegment>) -> List<Bytes> / {abort.raise} = {
   let src = d.source;
-  match found(d.node, path.take(path.len() - 1), false) {
+  match locate(d.node, path.take(path.len() - 1), false) {
     None -> [],
     Some(f) -> match f.node {
-      Members(members, _, _, flow, _) -> match path.at(path.len() - 1) {
+      MappingNode(members, _, _, flow, _) -> match path.at(path.len() - 1) {
         Some(Key(name)) -> match members.find_index(|m: Member| m.key == String(name)) {
           None -> [],
           Some(i) -> if members.len() == 1 { replaced(src, f, Mapping([])) } else {
@@ -3307,7 +3428,7 @@ fn removed(d: Document, path: List<Step>) -> List<Bytes> / {abort.raise} = {
         },
         _ -> [],
       },
-      Elements(nodes, _, _, flow) -> match path.at(path.len() - 1) {
+      SequenceNode(nodes, _, _, flow) -> match path.at(path.len() - 1) {
         Some(Index(i)) -> if i < 0 || i >= nodes.len() { [] }
         else if nodes.len() == 1 { replaced(src, f, Sequence([])) } else {
           cut_entry(
@@ -3327,7 +3448,7 @@ fn removed(d: Document, path: List<Step>) -> List<Bytes> / {abort.raise} = {
 /// Where an entry of a sequence starts: in a block, at its `-`.
 fn entry_start(src: Bytes, node: Node, flow: Bool) -> Int / {abort.raise} = {
   let from = start_of(node);
-  let dash = back(src, 0, from) - 1;
+  let dash = before_blanks(src, 0, from) - 1;
   if !flow && src.peek(dash) == b'-' { dash } else { from }
 }
 
@@ -3365,7 +3486,7 @@ pub fn decode_document<a>(
   Result::map_err((codec.decode)(d.value), |e: DecodeError|
     {
       path: e.path,
-      place: Some(place_at(d.source, start_of(node_at(d.node, e.path)))),
+      place: Some(location_at(d.source, start_of(node_at(d.node, e.path)))),
       message: e.message,
     })
 
@@ -3471,54 +3592,55 @@ fn drawn_tags() -> List<String> =
   ]
 
 /// More than a value a test draws reaches, with every tag one is drawn under kept.
-fn wide() -> Limits =
+fn large_limits() -> Limits =
   { bytes: 1073741824, depth: 512, nodes: 1073741824, scalar: 1073741824, documents: 1073741824 }
 
-fn keeping() -> Options = { merge_keys: false, keep_tags: drawn_tags() }
+fn keep_drawn_tags() -> Options = { merge_keys: false, keep_tags: drawn_tags() }
 
 /// An `Entry` as a test draws one.
 fn entries() -> gen::Gen<Entry> =
   gen::map2(yamls(), yamls(), |key: Yaml, value: Yaml| { key: key, value: value })
 
-/// A `Jseed` as a test draws one.
-fn jseeds_at(depth: Int) -> gen::Gen<Jseed> =
+/// A `JsonSample` as a test draws one.
+fn json_samples_at(depth: Int) -> gen::Gen<JsonSample> =
   if depth <= 0 {
     gen::one_of([
-      gen::constant(JNull),
-      gen::map(gen::bool(), |f0: Bool| JBoolean(f0)),
-      gen::map(gen::any_int(), |f0: Int| JInteger(f0)),
-      gen::map(gen::text(), |f0: String| JString(f0)),
+      gen::constant(JsonNull),
+      gen::map(gen::bool(), |f0: Bool| JsonBoolean(f0)),
+      gen::map(gen::any_int(), |f0: Int| JsonInteger(f0)),
+      gen::map(gen::text(), |f0: String| JsonString(f0)),
     ])
   } else {
     gen::one_of([
-      gen::constant(JNull),
-      gen::map(gen::bool(), |f0: Bool| JBoolean(f0)),
-      gen::map(gen::any_int(), |f0: Int| JInteger(f0)),
-      gen::map(gen::text(), |f0: String| JString(f0)),
-      gen::map(gen::list_of(jseeds_at(depth - 1), 3), |f0: List<Jseed>| JArray(f0)),
+      gen::constant(JsonNull),
+      gen::map(gen::bool(), |f0: Bool| JsonBoolean(f0)),
+      gen::map(gen::any_int(), |f0: Int| JsonInteger(f0)),
+      gen::map(gen::text(), |f0: String| JsonString(f0)),
+      gen::map(gen::list_of(json_samples_at(depth - 1), 3), |f0: List<JsonSample>| JsonArray(f0)),
       gen::map(
         gen::list_of(
-          gen::map2(gen::text(), jseeds_at(depth - 1), |key: String, value: Jseed|
+          gen::map2(gen::text(), json_samples_at(depth - 1), |key: String, value: JsonSample|
             { key: key, value: value }),
           3,
         ),
-        |f0: List<Jsown>| JObject(f0),
+        |f0: List<JsonMember>| JsonObject(f0),
       ),
     ])
   }
 
-fn jseeds() -> gen::Gen<Jseed> = gen::sized(|size: Int| jseeds_at(min(max(size / 16, 0), 3)))
+fn json_samples() -> gen::Gen<JsonSample> =
+  gen::sized(|size: Int| json_samples_at(min(max(size / 16, 0), 3)))
 
 test "a value reads back from the document written of it" {
   gen::check(yamls(), |x: Yaml|
-    round_trip(to_bytes, |text: Bytes| parse(text, wide(), keeping()).ok(), x))
+    round_trip(to_bytes, |text: Bytes| parse(text, large_limits(), keep_drawn_tags()).ok(), x))
 }
 
 test "a document keeps the bytes it was read from, and means what a reader reads of them" {
   gen::check(yamls(), |v: Yaml| {
     let text = to_bytes(v);
-    match parse_document(text, wide(), keeping()) {
-      Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide(), keeping()),
+    match parse_document(text, large_limits(), keep_drawn_tags()) {
+      Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, large_limits(), keep_drawn_tags()),
       Err(_) -> false,
     }
   })
@@ -3532,13 +3654,13 @@ test "a key set in a document is set in its value, and removed from both" {
     |entries: List<Entry>, name: String, v: Yaml| {
       let before = mapping(entries);
       let path = [Key(name)];
-      match parse_document(to_bytes(before), wide(), keeping()) {
+      match parse_document(to_bytes(before), large_limits(), keep_drawn_tags()) {
         Err(_) -> false,
         Ok(d) -> match try { set(d, path, v) } {
           Err(_) -> false,
           Ok(changed) -> {
-            let taken = try { value(remove(changed, path)) };
-            Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
+            let consume = try { value(remove(changed, path)) };
+            Some(value(changed)) == put(before, path, v) && consume == Ok(without(before, path))
           },
         },
       }
@@ -3547,55 +3669,61 @@ test "a key set in a document is set in its value, and removed from both" {
 }
 
 /// What a test draws a JSON document from, numbers as the integers both formats write alike.
-type Jseed =
-  | JNull
-  | JBoolean(Bool)
-  | JInteger(Int)
-  | JString(String)
-  | JArray(List<Jseed>)
-  | JObject(List<Jsown>)
+type JsonSample =
+  | JsonNull
+  | JsonBoolean(Bool)
+  | JsonInteger(Int)
+  | JsonString(String)
+  | JsonArray(List<JsonSample>)
+  | JsonObject(List<JsonMember>)
 
-type Jsown = { key: String, value: Jseed }
+type JsonMember = { key: String, value: JsonSample }
 
-fn as_json(s: Jseed) -> json::Json =
+fn as_json(s: JsonSample) -> json::Json =
   match s {
-    JNull -> json::Null,
-    JBoolean(b) -> json::Bool(b),
-    JInteger(n) -> json::Number(Decimal::of_int(n)),
-    JString(text) -> json::Str(text),
-    JArray(items) -> json::Array(items.map(as_json)),
-    JObject(fields) ->
-      json::Object(Map::of_entries(fields.map(|f: Jsown| { key: f.key, value: as_json(f.value) }))),
+    JsonNull -> json::Null,
+    JsonBoolean(b) -> json::Bool(b),
+    JsonInteger(n) -> json::Number(Decimal::of_int(n)),
+    JsonString(text) -> json::Str(text),
+    JsonArray(items) -> json::Array(items.map(as_json)),
+    JsonObject(fields) ->
+      json::Object(
+        Map::of_entries(fields.map(|f: JsonMember| { key: f.key, value: as_json(f.value) })),
+      ),
   }
 
-fn as_yaml(s: Jseed) -> Yaml =
+fn as_yaml(s: JsonSample) -> Yaml =
   match s {
-    JNull -> Null,
-    JBoolean(b) -> Boolean(b),
-    JInteger(n) -> Integer(n),
-    JString(text) -> String(text),
-    JArray(items) -> Sequence(items.map(as_yaml)),
-    JObject(fields) -> mapping(fields.map(|f: Jsown| entry(f.key, as_yaml(f.value)))),
+    JsonNull -> Null,
+    JsonBoolean(b) -> Boolean(b),
+    JsonInteger(n) -> Integer(n),
+    JsonString(text) -> String(text),
+    JsonArray(items) -> Sequence(items.map(as_yaml)),
+    JsonObject(fields) -> mapping(fields.map(|f: JsonMember| entry(f.key, as_yaml(f.value)))),
   }
 
 test "a JSON document reads as the value JSON says it is" {
-  gen::check(jseeds(), |x: Jseed|
-    agrees(|s: Jseed| parse(json::to_bytes(as_json(s)), wide()), |s: Jseed| Ok(as_yaml(s)), x))
+  gen::check(json_samples(), |x: JsonSample|
+    agrees(
+      |s: JsonSample| parse(json::to_bytes(as_json(s)), large_limits()),
+      |s: JsonSample| Ok(as_yaml(s)),
+      x,
+    ))
 }
 
 // --- Tests: values ----------------------------------------------------------
 
 fn limited() -> Limits = { bytes: 65536, depth: 16, nodes: 10000, scalar: 4096, documents: 8 }
 
-fn the(text: String) -> Yaml / {abort.raise} =
-  match parse_string(text, limited()) { Ok(v) -> v, Err(e) -> panic(refusal_to_string(e)) }
+fn must_parse(text: String) -> Yaml / {abort.raise} =
+  match parse_string(text, limited()) { Ok(v) -> v, Err(e) -> panic(error_message(e)) }
 
 /// What a scalar written after `v: ` reads as.
-fn valued(text: String) -> Option<Yaml> =
+fn parsed_value(text: String) -> Option<Yaml> =
   match parse_string("v: " ++ text, limited()) { Ok(v) -> get(v, "v"), Err(_) -> None }
 
-fn why_not(text: String) -> Option<Why> =
-  match parse_string(text, limited()) { Ok(_) -> None, Err(e) -> Some(e.why) }
+fn error_kind_of(text: String) -> Option<ErrorKind> =
+  match parse_string(text, limited()) { Ok(_) -> None, Err(e) -> Some(e.reason) }
 
 fn strings(xs: List<String>) -> Yaml = Sequence(xs.map(|x: String| String(x)))
 
@@ -3617,11 +3745,11 @@ test "a float is the float its bits are, and no integer" {
   assert(Float(1.0) != Integer(1));
   assert(String("1") != Integer(1));
   assert(Null != String(""));
-  assert_eq(the("a: .nan"), Mapping([entry("a", Float(Float::nan()))]))
+  assert_eq(must_parse("a: .nan"), Mapping([entry("a", Float(Float::nan()))]))
 }
 
 test "a key is any value, and a string key has a short hand" {
-  let v = the("? [a, b]\n: pair\n1: one\ntrue: yes\nname: text\n~: nothing\n");
+  let v = must_parse("? [a, b]\n: pair\n1: one\ntrue: yes\nname: text\n~: nothing\n");
   assert_eq(lookup(v, strings(["a", "b"])), Some(String("pair")));
   assert_eq(lookup(v, Integer(1)), Some(String("one")));
   assert_eq(lookup(v, Boolean(true)), Some(String("yes")));
@@ -3632,13 +3760,13 @@ test "a key is any value, and a string key has a short hand" {
 }
 
 test "a value shows as it is written in flow style" {
-  let shown = the("a: [1, 'two', {b: ~}]\nc: |\n  line\n");
+  let shown = must_parse("a: [1, 'two', {b: ~}]\nc: |\n  line\n");
   assert_eq(f"{shown}", "{a: [1, two, {b: null}], c: \"line\\n\"}");
   assert_eq(inline(Mapping([{ key: strings(["a"]), value: Null }])), "{? [a] : null}")
 }
 
 test "a path leads to a value, puts one and takes one away" {
-  let v = the("servers:\n  alpha:\n    ports: [80, 443]\n");
+  let v = must_parse("servers:\n  alpha:\n    ports: [80, 443]\n");
   let ports = [Key("servers"), Key("alpha"), Key("ports")];
   assert_eq(at(v, ports.push(Index(1))), Some(Integer(443)));
   assert_eq(at(v, ports.push(Index(2))), None);
@@ -3646,16 +3774,16 @@ test "a path leads to a value, puts one and takes one away" {
   assert_eq(at(v, []), Some(v));
   assert_eq(
     put(v, ports.push(Index(0)), Integer(8080)),
-    Some(the("servers: {alpha: {ports: [8080, 443]}}")),
+    Some(must_parse("servers: {alpha: {ports: [8080, 443]}}")),
   );
   assert_eq(
     put(v, [Key("servers"), Key("beta"), Key("port")], Integer(1)),
-    Some(the("servers: {alpha: {ports: [80, 443]}, beta: {port: 1}}")),
+    Some(must_parse("servers: {alpha: {ports: [80, 443]}, beta: {port: 1}}")),
   );
   assert_eq(put(v, ports.push(Index(2)), Integer(1)), None);
   assert_eq(put(v, ports.push(Key("a")), Integer(1)), None);
-  assert_eq(without(v, ports.push(Index(0))), the("servers: {alpha: {ports: [443]}}"));
-  assert_eq(without(v, [Key("servers"), Key("alpha")]), the("servers: {}"));
+  assert_eq(without(v, ports.push(Index(0))), must_parse("servers: {alpha: {ports: [443]}}"));
+  assert_eq(without(v, [Key("servers"), Key("alpha")]), must_parse("servers: {}"));
   assert_eq(without(v, [Key("absent"), Key("x")]), v);
   assert_eq(
     path_to_string(ports.push(Index(2)).push(Key("a b"))),
@@ -3672,7 +3800,7 @@ type Reading = | ReadNull | ReadBoolean(Bool) | ReadInteger(Int) | ReadFloat(Str
 type Row = { text: String, reads: Reading }
 
 fn read_as(text: String) -> Option<Reading> =
-  match valued(text) {
+  match parsed_value(text) {
     Some(Null) -> Some(ReadNull),
     Some(Boolean(b)) -> Some(ReadBoolean(b)),
     Some(Integer(n)) -> Some(ReadInteger(n)),
@@ -3792,28 +3920,28 @@ test "the plain scalar `{c.text}` reads by the core schema's table" for c: Row i
 
 test "a scalar between quotes or in a block is a string whatever it spells" {
   assert_eq(
-    the("['12', \"true\", '~', \"\", 'null', \"1e3\"]"),
+    must_parse("['12', \"true\", '~', \"\", 'null', \"1e3\"]"),
     strings(["12", "true", "~", "", "null", "1e3"]),
   );
-  assert_eq(the("- |\n  12\n- >-\n  true\n"), strings(["12\n", "true"]))
+  assert_eq(must_parse("- |\n  12\n- >-\n  true\n"), strings(["12\n", "true"]))
 }
 
 test "a number past what its type holds is refused, not rounded into it" {
-  assert_eq(why_not("9223372036854775808"), Some(TooWide));
-  assert_eq(why_not("-9223372036854775809"), Some(TooWide));
-  assert_eq(why_not("0x8000000000000000"), Some(TooWide));
-  assert_eq(why_not("0o1000000000000000000000"), Some(TooWide));
-  assert_eq(why_not("1e999"), Some(TooWide));
-  assert_eq(why_not("-1e999"), Some(TooWide));
-  assert_eq(valued("\"9223372036854775808\""), Some(String("9223372036854775808")))
+  assert_eq(error_kind_of("9223372036854775808"), Some(OutOfRange));
+  assert_eq(error_kind_of("-9223372036854775809"), Some(OutOfRange));
+  assert_eq(error_kind_of("0x8000000000000000"), Some(OutOfRange));
+  assert_eq(error_kind_of("0o1000000000000000000000"), Some(OutOfRange));
+  assert_eq(error_kind_of("1e999"), Some(OutOfRange));
+  assert_eq(error_kind_of("-1e999"), Some(OutOfRange));
+  assert_eq(parsed_value("\"9223372036854775808\""), Some(String("9223372036854775808")))
 }
 
 // --- Tests: tags ------------------------------------------------------------
 
 /// A tagged node, and the value it reads as in flow style.
-type Tagging = { text: String, reads: String }
+type TagCase = { text: String, reads: String }
 
-fn core_tags() -> List<Tagging> =
+fn core_tags() -> List<TagCase> =
   [
     { text: "!!str 12", reads: "\"12\"" },
     { text: "!!str true", reads: "\"true\"" },
@@ -3832,48 +3960,48 @@ fn core_tags() -> List<Tagging> =
     { text: "!!seq\n- a\n", reads: "[a]" },
   ]
 
-test "`{c.text}` is what its core schema tag says" for c: Tagging in core_tags() {
+test "`{c.text}` is what its core schema tag says" for c: TagCase in core_tags() {
   assert_eq(parse_string(c.text, limited()).map(inline), Ok(c.reads))
 }
 
 test "a float's tag reads an integer as a float" {
   assert_eq(
-    the("[!!float 1, !!float 1.5, !!float .inf, !!float '-0']"),
+    must_parse("[!!float 1, !!float 1.5, !!float .inf, !!float '-0']"),
     Sequence([Float(1.0), Float(1.5), Float(Float::infinity()), Float(-0.0)]),
   )
 }
 
-type Refused = { text: String, why: Why }
+type TagErrorCase = { text: String, reason: ErrorKind }
 
-fn mistagged() -> List<Refused> =
+fn tag_error_cases() -> List<TagErrorCase> =
   [
-    { text: "!!int 1.5", why: Mistagged("tag:yaml.org,2002:int") },
-    { text: "!!int twelve", why: Mistagged("tag:yaml.org,2002:int") },
-    { text: "!!float 0x10", why: Mistagged("tag:yaml.org,2002:float") },
-    { text: "!!bool yes", why: Mistagged("tag:yaml.org,2002:bool") },
-    { text: "!!null nothing", why: Mistagged("tag:yaml.org,2002:null") },
-    { text: "!!seq text", why: Mistagged("tag:yaml.org,2002:seq") },
-    { text: "!!map text", why: Mistagged("tag:yaml.org,2002:map") },
-    { text: "!!seq {a: 1}", why: Mistagged("tag:yaml.org,2002:seq") },
-    { text: "!!map [a]", why: Mistagged("tag:yaml.org,2002:map") },
-    { text: "!!str [a]", why: Mistagged("tag:yaml.org,2002:str") },
-    { text: "!!int\n- 1\n", why: Mistagged("tag:yaml.org,2002:int") },
-    { text: "!local text", why: UnknownTag("!local") },
-    { text: "!!binary aGk=", why: UnknownTag("tag:yaml.org,2002:binary") },
-    { text: "!!timestamp 2001-12-14", why: UnknownTag("tag:yaml.org,2002:timestamp") },
-    { text: "!!set {a}", why: UnknownTag("tag:yaml.org,2002:set") },
+    { text: "!!int 1.5", reason: Mistagged("tag:yaml.org,2002:int") },
+    { text: "!!int twelve", reason: Mistagged("tag:yaml.org,2002:int") },
+    { text: "!!float 0x10", reason: Mistagged("tag:yaml.org,2002:float") },
+    { text: "!!bool yes", reason: Mistagged("tag:yaml.org,2002:bool") },
+    { text: "!!null nothing", reason: Mistagged("tag:yaml.org,2002:null") },
+    { text: "!!seq text", reason: Mistagged("tag:yaml.org,2002:seq") },
+    { text: "!!map text", reason: Mistagged("tag:yaml.org,2002:map") },
+    { text: "!!seq {a: 1}", reason: Mistagged("tag:yaml.org,2002:seq") },
+    { text: "!!map [a]", reason: Mistagged("tag:yaml.org,2002:map") },
+    { text: "!!str [a]", reason: Mistagged("tag:yaml.org,2002:str") },
+    { text: "!!int\n- 1\n", reason: Mistagged("tag:yaml.org,2002:int") },
+    { text: "!local text", reason: UnknownTag("!local") },
+    { text: "!!binary aGk=", reason: UnknownTag("tag:yaml.org,2002:binary") },
+    { text: "!!timestamp 2001-12-14", reason: UnknownTag("tag:yaml.org,2002:timestamp") },
+    { text: "!!set {a}", reason: UnknownTag("tag:yaml.org,2002:set") },
     {
       text: "!!python/object/apply:os.system [ls]",
-      why: UnknownTag("tag:yaml.org,2002:python/object/apply:os.system"),
+      reason: UnknownTag("tag:yaml.org,2002:python/object/apply:os.system"),
     },
-    { text: "!<tag:example.com,2000:x> [a]", why: UnknownTag("tag:example.com,2000:x") },
-    { text: "!e!x 1", why: UndeclaredHandle("!e!") },
-    { text: "--- !e!x 1\n", why: UndeclaredHandle("!e!") },
-    { text: "%YAML 2.0\n--- a\n", why: Version(2, 0) },
+    { text: "!<tag:example.com,2000:x> [a]", reason: UnknownTag("tag:example.com,2000:x") },
+    { text: "!e!x 1", reason: UndeclaredHandle("!e!") },
+    { text: "--- !e!x 1\n", reason: UndeclaredHandle("!e!") },
+    { text: "%YAML 2.0\n--- a\n", reason: Version(2, 0) },
   ]
 
-test "`{c.text}` is refused for its tag" for c: Refused in mistagged() {
-  assert_eq(why_not(c.text), Some(c.why))
+test "`{c.text}` is refused for its tag" for c: TagErrorCase in tag_error_cases() {
+  assert_eq(error_kind_of(c.text), Some(c.reason))
 }
 
 test "a tag outside the core schema is kept where the reader is asked to keep it" {
@@ -3902,10 +4030,10 @@ test "a tag outside the core schema is kept where the reader is asked to keep it
     Ok(Tagged("tag:example.com,2000:app/tag!", String("x"))),
   );
   assert_eq(
-    kept("[!Ref a, !Other b]", ["!Ref"]).map_err(|e: Refusal| (e.column, e.why)),
+    kept("[!Ref a, !Other b]", ["!Ref"]).map_err(|e: Error| (e.column, e.reason)),
     Err((10, UnknownTag("!Other"))),
   );
-  assert_eq(get(Tagged("!t", the("a: 1")), "a"), Some(Integer(1)))
+  assert_eq(get(Tagged("!t", must_parse("a: 1")), "a"), Some(Integer(1)))
 }
 
 test "the maker of a tagged value holds what a reader reads under the tag" {
@@ -3923,20 +4051,20 @@ test "the maker of a tagged value holds what a reader reads under the tag" {
 
 test "an alias is the value its anchor is on, and an anchor lasts its document" {
   assert_eq(
-    the("base: &b {x: 1, y: [&i 2]}\nagain: *b\nitem: *i\n"),
-    the("base: {x: 1, y: [2]}\nagain: {x: 1, y: [2]}\nitem: 2\n"),
+    must_parse("base: &b {x: 1, y: [&i 2]}\nagain: *b\nitem: *i\n"),
+    must_parse("base: {x: 1, y: [2]}\nagain: {x: 1, y: [2]}\nitem: 2\n"),
   );
-  assert_eq(the("- &a one\n- &a two\n- *a\n"), strings(["one", "two", "two"]));
-  assert_eq(the("&a key: *a\n"), Mapping([entry("key", String("key"))]));
-  assert_eq(why_not("- *missing\n"), Some(UnknownAlias("missing")));
-  assert_eq(why_not("&a [*a]\n"), Some(UnknownAlias("a")));
+  assert_eq(must_parse("- &a one\n- &a two\n- *a\n"), strings(["one", "two", "two"]));
+  assert_eq(must_parse("&a key: *a\n"), Mapping([entry("key", String("key"))]));
+  assert_eq(error_kind_of("- *missing\n"), Some(UnknownAlias("missing")));
+  assert_eq(error_kind_of("&a [*a]\n"), Some(UnknownAlias("a")));
   assert_eq(
-    parse_all(b"--- &a 1\n--- *a\n", limited()).map_err(|e: Refusal| (e.line, e.why)),
+    parse_all(b"--- &a 1\n--- *a\n", limited()).map_err(|e: Error| (e.line, e.reason)),
     Err((2, UnknownAlias("a"))),
   )
 }
 
-fn laughs(levels: Int) -> Bytes =
+fn billion_laughs(levels: Int) -> Bytes =
   Bytes::concat_all(
     range(0, levels).map(|i: Int|
       Bytes::of_string(
@@ -3949,9 +4077,9 @@ fn laughs(levels: Int) -> Bytes =
   )
 
 test "aliases that expand past the node limit are refused" {
-  let bomb = b"l0: &l0 [lol, lol, lol, lol, lol, lol, lol, lol, lol]\n".concat(laughs(9));
+  let bomb = b"l0: &l0 [lol, lol, lol, lol, lol, lol, lol, lol, lol]\n".concat(billion_laughs(9));
   let read = parse(bomb, { bytes: 65536, depth: 16, nodes: 100000, scalar: 4096, documents: 8 });
-  assert_eq(read.map_err(|e: Refusal| (e.line, e.why)), Err((6, TooManyNodes)));
+  assert_eq(read.map_err(|e: Error| (e.line, e.reason)), Err((6, TooManyNodes)));
   let shallow = |nodes: Int|
     parse(b"a: &a [1, 2, 3]\nb: [*a, *a]\n", {
       bytes: 100,
@@ -3959,7 +4087,7 @@ test "aliases that expand past the node limit are refused" {
       nodes: nodes,
       scalar: 10,
       documents: 1,
-    }).map_err(|e: Refusal| (e.line, e.column, e.why));
+    }).map_err(|e: Error| (e.line, e.column, e.reason));
   assert(match shallow(16) { Ok(_) -> true, Err(_) -> false });
   assert_eq(shallow(15), Err((1, 1, TooManyNodes)));
   assert_eq(shallow(14), Err((2, 4, TooManyNodes)));
@@ -3973,10 +4101,10 @@ test "a merge key is the string it is in YAML 1.2, and merges where the reader i
   let merging: Options = { merge_keys: true, keep_tags: [] };
   assert_eq(
     parse_string(text, limited()).ok().and_then(|v: Yaml| get(v, "own")),
-    Some(the("{b: 0, '<<': [{a: 1, b: 2}, {b: 3, c: 4}], d: 5}")),
+    Some(must_parse("{b: 0, '<<': [{a: 1, b: 2}, {b: 3, c: 4}], d: 5}")),
   );
   let merged = parse_string(text, limited(), merging).ok().and_then(|v: Yaml| get(v, "own"));
-  assert_eq(merged, Some(the("{b: 0, a: 1, c: 4, d: 5}")));
+  assert_eq(merged, Some(must_parse("{b: 0, a: 1, c: 4, d: 5}")));
   assert_eq(match merged { Some(Mapping(entries)) -> entries.map(|e: Entry| e.key), _ -> [] }, [
     String("b"),
     String("a"),
@@ -3985,62 +4113,65 @@ test "a merge key is the string it is in YAML 1.2, and merges where the reader i
   ]);
   assert_eq(
     parse_string("a: &a {x: 1}\nb: {<<: *a, x: 2, <<: {y: 3}}\n", limited(), merging),
-    Ok(the("a: {x: 1}\nb: {x: 2, y: 3}\n")),
+    Ok(must_parse("a: {x: 1}\nb: {x: 2, y: 3}\n")),
   );
   assert_eq(
     parse_string("{'<<': 1, \"<<\": 2}", limited(), merging),
-    Err({ offset: 10, line: 1, column: 11, why: Duplicate("\"<<\"") }),
+    Err({ offset: 10, line: 1, column: 11, reason: Duplicate("\"<<\"") }),
   );
   assert_eq(
-    parse_string("a: {<<: [1]}", limited(), merging).map_err(|e: Refusal| e.why),
+    parse_string("a: {<<: [1]}", limited(), merging).map_err(|e: Error| e.reason),
     Err(Expected("a mapping, or a sequence of mappings, as the value of the merge key `<<`")),
   );
-  assert_eq(parse_string("<<: text", limited(), merging).map_err(|e: Refusal| e.column), Err(5))
+  assert_eq(parse_string("<<: text", limited(), merging).map_err(|e: Error| e.column), Err(5))
 }
 
 test "a key written twice in a mapping is refused, as the values the keys read as" {
-  assert_eq(why_not("a: 1\nb: 2\na: 3\n"), Some(Duplicate("a")));
+  assert_eq(error_kind_of("a: 1\nb: 2\na: 3\n"), Some(Duplicate("a")));
   assert_eq(
     parse_string("a: 1\nb: 2\na: 3\n", limited()),
-    Err({ offset: 10, line: 3, column: 1, why: Duplicate("a") }),
+    Err({ offset: 10, line: 3, column: 1, reason: Duplicate("a") }),
   );
-  assert_eq(why_not("{a: 1, 'a': 2}"), Some(Duplicate("a")));
-  assert_eq(why_not("{1: a, 0x1: b}"), Some(Duplicate("1")));
-  assert_eq(why_not("{[a, b]: 1, [a, b]: 2}"), Some(Duplicate("[a, b]")));
-  assert_eq(why_not("{~: 1, null: 2}"), Some(Duplicate("null")));
-  assert_eq(why_not("? {b: 1, a: 2}\n: x\n? {a: 2, b: 1}\n: y\n"), Some(Duplicate("{a: 2, b: 1}")));
-  assert_eq(why_not("{1: a, '1': b, 1.0: c, true: d, 'true': e}"), None)
+  assert_eq(error_kind_of("{a: 1, 'a': 2}"), Some(Duplicate("a")));
+  assert_eq(error_kind_of("{1: a, 0x1: b}"), Some(Duplicate("1")));
+  assert_eq(error_kind_of("{[a, b]: 1, [a, b]: 2}"), Some(Duplicate("[a, b]")));
+  assert_eq(error_kind_of("{~: 1, null: 2}"), Some(Duplicate("null")));
+  assert_eq(
+    error_kind_of("? {b: 1, a: 2}\n: x\n? {a: 2, b: 1}\n: y\n"),
+    Some(Duplicate("{a: 2, b: 1}")),
+  );
+  assert_eq(error_kind_of("{1: a, '1': b, 1.0: c, true: d, 'true': e}"), None)
 }
 
 // --- Tests: limits and refusals ---------------------------------------------
 
 test "a stream is held to each limit its reader is given" {
   let small: Limits = { bytes: 12, depth: 2, nodes: 5, scalar: 5, documents: 2 };
-  let held = |text: String|
-    parse_all(Bytes::of_string(text), small).map_err(|e: Refusal| (e.offset, e.why));
-  assert_eq(held("a: [1, 2]"), Ok([the("a: [1, 2]")]));
-  assert_eq(held("123456789012"), Err((0, ScalarTooLong)));
-  assert_eq(held("- 1\n- 2\n- 30\n"), Err((12, TooLong)));
-  assert_eq(held("a: [[1]]"), Err((4, TooDeep)));
-  assert_eq(held("a:\n b:\n  c:"), Err((9, TooDeep)));
-  assert_eq(held("- - - 1"), Err((4, TooDeep)));
-  assert_eq(held("[1, 2, 3, 4]"), Ok([the("[1, 2, 3, 4]")]));
-  assert_eq(held("[1,2,3,4,5]"), Err((0, TooManyNodes)));
-  assert_eq(held("[1,2,3,4,5,6"), Err((11, TooManyNodes)));
-  assert_eq(held("abcdef"), Err((0, ScalarTooLong)));
-  assert_eq(held("- 'abcdef'"), Err((2, ScalarTooLong)));
-  assert_eq(held("|\n abcde"), Err((0, ScalarTooLong)));
-  assert_eq(held("|-\n abcde"), Ok([String("abcde")]));
-  assert_eq(held("1\n--- 2\n"), Ok([Integer(1), Integer(2)]));
-  assert_eq(held("1\n--- 2\n---"), Err((8, TooManyDocuments)));
+  let tagged_value = |text: String|
+    parse_all(Bytes::of_string(text), small).map_err(|e: Error| (e.offset, e.reason));
+  assert_eq(tagged_value("a: [1, 2]"), Ok([must_parse("a: [1, 2]")]));
+  assert_eq(tagged_value("123456789012"), Err((0, ScalarTooLong)));
+  assert_eq(tagged_value("- 1\n- 2\n- 30\n"), Err((12, TooLong)));
+  assert_eq(tagged_value("a: [[1]]"), Err((4, TooDeep)));
+  assert_eq(tagged_value("a:\n b:\n  c:"), Err((9, TooDeep)));
+  assert_eq(tagged_value("- - - 1"), Err((4, TooDeep)));
+  assert_eq(tagged_value("[1, 2, 3, 4]"), Ok([must_parse("[1, 2, 3, 4]")]));
+  assert_eq(tagged_value("[1,2,3,4,5]"), Err((0, TooManyNodes)));
+  assert_eq(tagged_value("[1,2,3,4,5,6"), Err((11, TooManyNodes)));
+  assert_eq(tagged_value("abcdef"), Err((0, ScalarTooLong)));
+  assert_eq(tagged_value("- 'abcdef'"), Err((2, ScalarTooLong)));
+  assert_eq(tagged_value("|\n abcde"), Err((0, ScalarTooLong)));
+  assert_eq(tagged_value("|-\n abcde"), Ok([String("abcde")]));
+  assert_eq(tagged_value("1\n--- 2\n"), Ok([Integer(1), Integer(2)]));
+  assert_eq(tagged_value("1\n--- 2\n---"), Err((8, TooManyDocuments)));
   let nested = |levels: Int| Bytes::concat_all([b"[".repeat(levels), b"]".repeat(levels)]);
   assert(match parse(nested(16), limited()) { Ok(_) -> true, Err(_) -> false });
   assert_eq(
-    parse(nested(17), limited()).map_err(|e: Refusal| (e.offset, e.why)),
+    parse(nested(17), limited()).map_err(|e: Error| (e.offset, e.reason)),
     Err((16, TooDeep)),
   );
-  assert_eq(parse(b"[".repeat(60000), limited()).map_err(|e: Refusal| e.why), Err(TooDeep));
-  assert_eq(parse(b"- ".repeat(30000), limited()).map_err(|e: Refusal| e.why), Err(TooDeep))
+  assert_eq(parse(b"[".repeat(60000), limited()).map_err(|e: Error| e.reason), Err(TooDeep));
+  assert_eq(parse(b"- ".repeat(30000), limited()).map_err(|e: Error| e.reason), Err(TooDeep))
 }
 
 test "a refusal says the byte, the line and the column in characters" {
@@ -4050,29 +4181,29 @@ test "a refusal says the byte, the line and the column in characters" {
       offset: 13,
       line: 2,
       column: 8,
-      why: Expected("a key and its `:`, or the mapping to end"),
+      reason: Expected("a key and its `:`, or the mapping to end"),
     }),
   );
   assert_eq(
     parse_string("a: 1\r\n\r\nb: [", limited()),
-    Err({ offset: 12, line: 3, column: 5, why: Expected("a node") }),
+    Err({ offset: 12, line: 3, column: 5, reason: Expected("a node") }),
   );
   assert_eq(
-    parse_string("a: 1\nb: \"é\" x\n", limited()).map_err(refusal_to_string),
+    parse_string("a: 1\nb: \"é\" x\n", limited()).map_err(error_message),
     Err("line 2, column 8: expected a key and its `:`, or the mapping to end"),
   );
   assert_eq(
-    parse_string("a:\n\tb: 1\n", limited()).map_err(refusal_to_string),
+    parse_string("a:\n\tb: 1\n", limited()).map_err(error_message),
     Err("line 2, column 2: a tab may not indent a block: use spaces"),
   );
   assert_eq(
-    parse_string("a: \"\\q\"", limited()).map_err(refusal_to_string),
+    parse_string("a: \"\\q\"", limited()).map_err(error_message),
     Err(
       "line 1, column 5: this is no escape of a double-quoted scalar, or names no Unicode scalar value",
     ),
   );
   assert_eq(
-    parse(b"a: b\x01", limited()).map_err(refusal_to_string),
+    parse(b"a: b\x01", limited()).map_err(error_message),
     Err("line 1, column 5: the character U+0001 may not be written here outside an escape"),
   )
 }
@@ -4080,35 +4211,35 @@ test "a refusal says the byte, the line and the column in characters" {
 test "bytes that are not UTF-8 are refused where they stop being it" {
   assert_eq(
     parse(b"a: 1\nb: \"\xc3\xa9\xff\"", limited()),
-    Err({ offset: 11, line: 2, column: 6, why: NotUtf8 }),
+    Err({ offset: 11, line: 2, column: 6, reason: NotUtf8 }),
   );
   assert_eq(
     parse(b"# \xed\xa0\x80", limited()),
-    Err({ offset: 2, line: 1, column: 3, why: NotUtf8 }),
+    Err({ offset: 2, line: 1, column: 3, reason: NotUtf8 }),
   );
-  assert_eq(parse(b"\xef\xbb\xbfa: 1", limited()), Ok(the("a: 1")))
+  assert_eq(parse(b"\xef\xbb\xbfa: 1", limited()), Ok(must_parse("a: 1")))
 }
 
 test "a character YAML does not print is refused outside a quoted scalar, which holds what JSON does" {
-  assert_eq(why_not("a: b\u{7f}"), Some(Control(127)));
-  assert_eq(why_not("a: b # c\u{9f}"), Some(Control(159)));
-  assert_eq(why_not("a: |\n  b\u{ffff}\n"), Some(Control(65535)));
-  assert_eq(why_not("&a\u{80} b"), Some(Control(128)));
+  assert_eq(error_kind_of("a: b\u{7f}"), Some(Control(127)));
+  assert_eq(error_kind_of("a: b # c\u{9f}"), Some(Control(159)));
+  assert_eq(error_kind_of("a: |\n  b\u{ffff}\n"), Some(Control(65535)));
+  assert_eq(error_kind_of("&a\u{80} b"), Some(Control(128)));
   assert_eq(
-    the("[\"b\u{7f}\u{9f}\u{ffff}\", 'c\u{7f}']"),
+    must_parse("[\"b\u{7f}\u{9f}\u{ffff}\", 'c\u{7f}']"),
     strings(["b\u{7f}\u{9f}\u{ffff}", "c\u{7f}"]),
   );
   assert_eq(
-    the("a: b\u{85}c\u{a0}\u{2028}"),
+    must_parse("a: b\u{85}c\u{a0}\u{2028}"),
     Mapping([entry("a", String("b\u{85}c\u{a0}\u{2028}"))]),
   );
-  assert_eq(why_not("a: \"b\u{1}\""), Some(Control(1)))
+  assert_eq(error_kind_of("a: \"b\u{1}\""), Some(Control(1)))
 }
 
 test "a stream of several documents is read whole, and one document is asked for by name" {
   assert_eq(
     parse_all(b"a: 1\n---\n- 2\n...\n--- three\n", limited()),
-    Ok([the("a: 1"), Sequence([Integer(2)]), String("three")]),
+    Ok([must_parse("a: 1"), Sequence([Integer(2)]), String("three")]),
   );
   assert_eq(parse_all(b"", limited()), Ok([]));
   assert_eq(parse_all(b"# only a comment\n", limited()), Ok([]));
@@ -4117,28 +4248,28 @@ test "a stream of several documents is read whole, and one document is asked for
   assert_eq(parse(b"---\n", limited()), Ok(Null));
   assert_eq(
     parse(b"a: 1\n--- 2\n--- 3\n", limited()),
-    Err({ offset: 5, line: 2, column: 1, why: NotOneDocument(3) }),
+    Err({ offset: 5, line: 2, column: 1, reason: NotOneDocument(3) }),
   )
 }
 
 test "the raising reader raises what the other answers, and a task may perform it" {
   assert_eq(
     try { read(b"a: [", limited()) },
-    Err({ offset: 4, line: 1, column: 5, why: Expected("a node") }),
+    Err({ offset: 4, line: 1, column: 5, reason: Expected("a node") }),
   );
-  assert_eq(try { read_all(b"a: 1\n--- 2\n", limited()) }, Ok([the("a: 1"), Integer(2)]));
+  assert_eq(try { read_all(b"a: 1\n--- 2\n", limited()) }, Ok([must_parse("a: 1"), Integer(2)]));
   let read_in_task = simulate {
     let t = task.spawn(|| try { read(b"a: 1\na: 2", limited()) });
     task.join(t)
   };
-  assert_eq(read_in_task, Err({ offset: 5, line: 2, column: 1, why: Duplicate("a") }))
+  assert_eq(read_in_task, Err({ offset: 5, line: 2, column: 1, reason: Duplicate("a") }))
 }
 
 // --- Tests: reading ---------------------------------------------------------
 
 test "block and flow collections nest in each other" {
   assert_eq(
-    the(
+    must_parse(
       "name: example\nports:\n- 80\n- 443\nowner: {name: Tom, tags: [a, b]}\nrows:\n  - id: 1\n    at: [x, y]\n  - - nested\n    - {k: v}\n",
     ),
     Mapping([
@@ -4155,7 +4286,7 @@ test "block and flow collections nest in each other" {
     ]),
   );
   assert_eq(
-    the("[a, b: c, {d: e}, [f]]"),
+    must_parse("[a, b: c, {d: e}, [f]]"),
     Sequence([
       String("a"),
       Mapping([entry("b", String("c"))]),
@@ -4164,148 +4295,164 @@ test "block and flow collections nest in each other" {
     ]),
   );
   assert_eq(
-    the("{a, b: , c: d}"),
+    must_parse("{a, b: , c: d}"),
     Mapping([entry("a", Null), entry("b", Null), entry("c", String("d"))]),
   );
   assert_eq(
-    the("? a\n: b\n? - c\n: - d\n"),
+    must_parse("? a\n: b\n? - c\n: - d\n"),
     Mapping([entry("a", String("b")), { key: strings(["c"]), value: strings(["d"]) }]),
   )
 }
 
 test "a plain scalar goes on over lines, and a quoted one folds as it does" {
-  assert_eq(valued("one\n  two\n\n  three # said\n"), Some(String("one two\nthree")));
-  assert_eq(valued("'it''s\n  folded'\n"), Some(String("it's folded")));
-  assert_eq(valued("\"a \\\n   b\\tc\\u00e9\\x41 \\\n\n  d\"\n"), Some(String("a b\tcéA \nd")));
+  assert_eq(parsed_value("one\n  two\n\n  three # said\n"), Some(String("one two\nthree")));
+  assert_eq(parsed_value("'it''s\n  folded'\n"), Some(String("it's folded")));
   assert_eq(
-    valued("\"\\0\\a\\b\\e\\f\\n\\r\\t\\v\\ \\\"\\/\\\\\\N\\_\\L\\P\\U0001F600\"\n"),
+    parsed_value("\"a \\\n   b\\tc\\u00e9\\x41 \\\n\n  d\"\n"),
+    Some(String("a b\tcéA \nd")),
+  );
+  assert_eq(
+    parsed_value("\"\\0\\a\\b\\e\\f\\n\\r\\t\\v\\ \\\"\\/\\\\\\N\\_\\L\\P\\U0001F600\"\n"),
     Some(String("\0\u{7}\u{8}\u{1b}\u{c}\n\r\t\u{b} \"/\\\u{85}\u{a0}\u{2028}\u{2029}\u{1F600}")),
   );
-  assert_eq(valued("a:b c#d\n"), Some(String("a:b c#d")));
-  assert_eq(the("- -a\n- ?b\n- :c\n"), strings(["-a", "?b", ":c"]))
+  assert_eq(parsed_value("a:b c#d\n"), Some(String("a:b c#d")));
+  assert_eq(must_parse("- -a\n- ?b\n- :c\n"), strings(["-a", "?b", ":c"]))
 }
 
 test "a block scalar keeps its lines or folds them, chomped as its header says" {
-  assert_eq(valued("|\n  one\n   two\n\n  three\n\n"), Some(String("one\n two\n\nthree\n")));
-  assert_eq(valued("|-\n  one\n\n"), Some(String("one")));
-  assert_eq(valued("|+\n  one\n\n"), Some(String("one\n\n")));
+  assert_eq(parsed_value("|\n  one\n   two\n\n  three\n\n"), Some(String("one\n two\n\nthree\n")));
+  assert_eq(parsed_value("|-\n  one\n\n"), Some(String("one")));
+  assert_eq(parsed_value("|+\n  one\n\n"), Some(String("one\n\n")));
   assert_eq(
-    valued(">\n  one\n  two\n\n  three\n   more\n  four\n"),
+    parsed_value(">\n  one\n  two\n\n  three\n   more\n  four\n"),
     Some(String("one two\nthree\n more\nfour\n")),
   );
-  assert_eq(valued("|2\n   indented\n"), Some(String(" indented\n")));
-  assert_eq(valued("|1-  # said\n  text\n"), Some(String(" text")));
-  assert_eq(valued("|\n"), Some(String("")));
-  assert_eq(the("--- |\ntext at the margin\n...\n"), String("text at the margin\n"))
+  assert_eq(parsed_value("|2\n   indented\n"), Some(String(" indented\n")));
+  assert_eq(parsed_value("|1-  # said\n  text\n"), Some(String(" text")));
+  assert_eq(parsed_value("|\n"), Some(String("")));
+  assert_eq(must_parse("--- |\ntext at the margin\n...\n"), String("text at the margin\n"))
 }
 
 test "a key before its `:` stands on one line and within 1024 bytes, but in a flow mapping" {
   let long = |n: Int| "k".repeat(n);
-  assert_eq(the(long(1024) ++ ": v"), Mapping([entry(long(1024), String("v"))]));
+  assert_eq(must_parse(long(1024) ++ ": v"), Mapping([entry(long(1024), String("v"))]));
   assert_eq(
-    why_not(long(1025) ++ ": v"),
+    error_kind_of(long(1025) ++ ": v"),
     Some(Expected("no `:` here: a mapping's value is one node")),
   );
-  assert_eq(why_not("[" ++ long(1025) ++ ": v]"), Some(Expected("`,` or `]`")));
-  assert_eq(the("{" ++ long(1025) ++ ": v}"), Mapping([entry(long(1025), String("v"))]));
+  assert_eq(error_kind_of("[" ++ long(1025) ++ ": v]"), Some(Expected("`,` or `]`")));
+  assert_eq(must_parse("{" ++ long(1025) ++ ": v}"), Mapping([entry(long(1025), String("v"))]));
   assert_eq(
-    the("{a\n  b: c, \"d\"\n  : e}"),
+    must_parse("{a\n  b: c, \"d\"\n  : e}"),
     Mapping([entry("a b", String("c")), entry("d", String("e"))]),
   );
-  assert_eq(why_not("[a\n  b: c]"), Some(Expected("`,` or `]`")));
-  assert_eq(why_not("a\n  b: c"), Some(Expected("no `:` here: a mapping's value is one node")))
+  assert_eq(error_kind_of("[a\n  b: c]"), Some(Expected("`,` or `]`")));
+  assert_eq(
+    error_kind_of("a\n  b: c"),
+    Some(Expected("no `:` here: a mapping's value is one node")),
+  )
 }
 
 test "the reader departs from the specification where its doc says, and no further" {
-  assert_eq(the("a: [\n  1,\n  2\n]\nb: {\n  c: 3\n}\n"), the("{a: [1, 2], b: {c: 3}}"));
   assert_eq(
-    why_not("a:\n  b: [\n  1\n  ]\n"),
+    must_parse("a: [\n  1,\n  2\n]\nb: {\n  c: 3\n}\n"),
+    must_parse("{a: [1, 2], b: {c: 3}}"),
+  );
+  assert_eq(
+    error_kind_of("a:\n  b: [\n  1\n  ]\n"),
     Some(Expected("a line of a flow collection indented more than the block it is in")),
   );
   assert_eq(
-    why_not("a:\n  b: [\n    1\n]\n"),
+    error_kind_of("a:\n  b: [\n    1\n]\n"),
     Some(Expected("a line of a flow collection indented more than the block it is in")),
   );
-  assert_eq(the("a: |\n  x\n   "), Mapping([entry("a", String("x\n \n"))]));
-  assert_eq(the("a: |\n  x"), Mapping([entry("a", String("x\n"))]));
-  assert_eq(the("- |+\n   "), Sequence([String("\n")]));
-  assert_eq(the("\u{feff}a: 1"), the("a: 1"));
-  assert_eq(the("%YAML 1.1\n---\nno: 0777\n"), Mapping([entry("no", Integer(777))]));
-  assert_eq(the("%YAML 1.3\n--- a\n"), String("a"));
-  assert_eq(the("%FOO bar\n--- a\n"), String("a"))
+  assert_eq(must_parse("a: |\n  x\n   "), Mapping([entry("a", String("x\n \n"))]));
+  assert_eq(must_parse("a: |\n  x"), Mapping([entry("a", String("x\n"))]));
+  assert_eq(must_parse("- |+\n   "), Sequence([String("\n")]));
+  assert_eq(must_parse("\u{feff}a: 1"), must_parse("a: 1"));
+  assert_eq(must_parse("%YAML 1.1\n---\nno: 0777\n"), Mapping([entry("no", Integer(777))]));
+  assert_eq(must_parse("%YAML 1.3\n--- a\n"), String("a"));
+  assert_eq(must_parse("%FOO bar\n--- a\n"), String("a"))
 }
 
-type Unread = { text: String, why: Why }
+type SyntaxErrorCase = { text: String, reason: ErrorKind }
 
-fn unread() -> List<Unread> =
+fn syntax_error_cases() -> List<SyntaxErrorCase> =
   [
-    { text: "a: b: c", why: Expected("no `:` here: a mapping's value is one node") },
-    { text: "a: - b", why: Expected("a block sequence to start on a line of its own") },
-    { text: "a:\n  b\nc", why: Expected("`:` after this key, on its line") },
-    { text: "\"a\nb\": c", why: Expected("no `:` here: a mapping's value is one node") },
-    { text: "a: \"b", why: Expected("the quote that closes this scalar") },
-    { text: "a: 'b", why: Expected("the quote that closes this scalar") },
-    { text: "a: [b, c", why: Expected("`,` or `]`") },
-    { text: "a: {b: c", why: Expected("`,` or `}`") },
-    { text: "a: [b c]]", why: Expected("a flow collection open, for this to close") },
-    { text: "a: [b,, c]", why: Expected("a node") },
-    { text: "a: ]", why: Expected("a flow collection open, for this to close") },
-    { text: "- , a", why: Expected("a flow collection open, for `,` to separate its entries") },
-    { text: "[a, - b]", why: Expected("no `-` entry inside a flow collection") },
+    { text: "a: b: c", reason: Expected("no `:` here: a mapping's value is one node") },
+    { text: "a: - b", reason: Expected("a block sequence to start on a line of its own") },
+    { text: "a:\n  b\nc", reason: Expected("`:` after this key, on its line") },
+    { text: "\"a\nb\": c", reason: Expected("no `:` here: a mapping's value is one node") },
+    { text: "a: \"b", reason: Expected("the quote that closes this scalar") },
+    { text: "a: 'b", reason: Expected("the quote that closes this scalar") },
+    { text: "a: [b, c", reason: Expected("`,` or `]`") },
+    { text: "a: {b: c", reason: Expected("`,` or `}`") },
+    { text: "a: [b c]]", reason: Expected("a flow collection open, for this to close") },
+    { text: "a: [b,, c]", reason: Expected("a node") },
+    { text: "a: ]", reason: Expected("a flow collection open, for this to close") },
+    { text: "- , a", reason: Expected("a flow collection open, for `,` to separate its entries") },
+    { text: "[a, - b]", reason: Expected("no `-` entry inside a flow collection") },
     {
       text: "a: [\nb]",
-      why: Expected("a line of a flow collection indented more than the block it is in"),
+      reason: Expected("a line of a flow collection indented more than the block it is in"),
     },
     {
       text: "a: \"b\nc\"",
-      why: Expected("a line of a quoted scalar indented more than the block it is in"),
+      reason: Expected("a line of a quoted scalar indented more than the block it is in"),
     },
-    { text: "a: \"b\"#c", why: Expected("a blank before a comment") },
+    { text: "a: \"b\"#c", reason: Expected("a blank before a comment") },
     {
       text: "a: |x\n  b",
-      why: Expected("nothing after a block scalar's indicators on their line but a comment"),
+      reason: Expected("nothing after a block scalar's indicators on their line but a comment"),
     },
     {
       text: "a: |\n    \n  b",
-      why: Expected("no line of spaces longer than the indentation of the block scalar under it"),
+      reason: Expected(
+        "no line of spaces longer than the indentation of the block scalar under it",
+      ),
     },
-    { text: "a: @b", why: Expected("a node, which this character starts none of") },
-    { text: "a: &", why: Expected("a name after this indicator") },
-    { text: "a: !<> b", why: Expected("a verbatim tag, as `!<tag:yaml.org,2002:str>`") },
-    { text: "a: !!", why: Expected("a tag's name after its handle") },
-    { text: "a: !b,c", why: Expected("a blank after a tag") },
-    { text: "a: !a%zz b", why: Expected("two hexadecimal digits after `%` in a tag") },
-    { text: "a: 1\n... b", why: Expected("nothing after `...` on its line but a comment") },
-    { text: "a: 1\n--- b: 2", why: Expected("no `:` here: a mapping's value is one node") },
-    { text: "[a]\nb", why: Expected("`---` to start another document") },
+    { text: "a: @b", reason: Expected("a node, which this character starts none of") },
+    { text: "a: &", reason: Expected("a name after this indicator") },
+    { text: "a: !<> b", reason: Expected("a verbatim tag, as `!<tag:yaml.org,2002:str>`") },
+    { text: "a: !!", reason: Expected("a tag's name after its handle") },
+    { text: "a: !b,c", reason: Expected("a blank after a tag") },
+    { text: "a: !a%zz b", reason: Expected("two hexadecimal digits after `%` in a tag") },
+    { text: "a: 1\n... b", reason: Expected("nothing after `...` on its line but a comment") },
+    { text: "a: 1\n--- b: 2", reason: Expected("no `:` here: a mapping's value is one node") },
+    { text: "[a]\nb", reason: Expected("`---` to start another document") },
     {
       text: "a: 1\n%YAML 1.2\n---\n",
-      why: Expected("`...` to end the document before a directive"),
+      reason: Expected("`...` to end the document before a directive"),
     },
-    { text: "%YAML 1.2\na: 1", why: Expected("`---` after the directives") },
-    { text: "%YAML 1.2\n%YAML 1.2\n---\n", why: Expected("one %YAML directive to a document") },
-    { text: "%YAML one\n---\n", why: Expected("a version after %YAML, as `1.2`") },
+    { text: "%YAML 1.2\na: 1", reason: Expected("`---` after the directives") },
+    { text: "%YAML 1.2\n%YAML 1.2\n---\n", reason: Expected("one %YAML directive to a document") },
+    { text: "%YAML one\n---\n", reason: Expected("a version after %YAML, as `1.2`") },
     {
       text: "%YAML 1.2 3\n---\n",
-      why: Expected("nothing after a directive on its line but a comment"),
+      reason: Expected("nothing after a directive on its line but a comment"),
     },
-    { text: "%TAG !a! x\n%TAG !a! y\n---\n", why: Expected("one %TAG directive to a handle") },
-    { text: "%TAG a x\n---\n", why: Expected("a tag handle after %TAG, as `!`, `!!` or `!name!`") },
-    { text: "%TAG !a!\n---\n", why: Expected("a prefix after the handle of %TAG") },
-    { text: "- a\n\t- b", why: Tab },
-    { text: "a:\n\tb: 1", why: Tab },
-    { text: "-\t- a", why: Tab },
-    { text: "a: \"\\q\"", why: Escape },
-    { text: "a: \"\\xZZ\"", why: Escape },
-    { text: "a: \"\\uD800\"", why: Escape },
-    { text: "a: \"\\U00110000\"", why: Escape },
+    { text: "%TAG !a! x\n%TAG !a! y\n---\n", reason: Expected("one %TAG directive to a handle") },
+    {
+      text: "%TAG a x\n---\n",
+      reason: Expected("a tag handle after %TAG, as `!`, `!!` or `!name!`"),
+    },
+    { text: "%TAG !a!\n---\n", reason: Expected("a prefix after the handle of %TAG") },
+    { text: "- a\n\t- b", reason: Tab },
+    { text: "a:\n\tb: 1", reason: Tab },
+    { text: "-\t- a", reason: Tab },
+    { text: "a: \"\\q\"", reason: Escape },
+    { text: "a: \"\\xZZ\"", reason: Escape },
+    { text: "a: \"\\uD800\"", reason: Escape },
+    { text: "a: \"\\U00110000\"", reason: Escape },
   ]
 
-test "`{c.text}` is refused" for c: Unread in unread() { assert_eq(why_not(c.text), Some(c.why)) }
+test "`{c.text}` is refused" for c: SyntaxErrorCase in syntax_error_cases() {
+  assert_eq(error_kind_of(c.text), Some(c.reason))
+}
 
 test "a tab parts tokens and never indents" {
   assert_eq(
-    the("a:\tb\nc:\t[d,\te]\t# said\nf: \"g\th\"\n\t\ng:\n  -\th\n"),
+    must_parse("a:\tb\nc:\t[d,\te]\t# said\nf: \"g\th\"\n\t\ng:\n  -\th\n"),
     Mapping([
       entry("a", String("b")),
       entry("c", strings(["d", "e"])),
@@ -4313,8 +4460,8 @@ test "a tab parts tokens and never indents" {
       entry("g", strings(["h"])),
     ]),
   );
-  assert_eq(why_not("-\ti: j"), Some(Tab));
-  assert_eq(why_not("a: |\n  b\n\tc"), Some(Tab))
+  assert_eq(error_kind_of("-\ti: j"), Some(Tab));
+  assert_eq(error_kind_of("a: |\n  b\n\tc"), Some(Tab))
 }
 
 // --- Tests: writing ---------------------------------------------------------
@@ -4378,9 +4525,9 @@ test "a value is written in block style, an empty collection in flow, and reads 
 }
 
 /// A string, and how it is written where it ends its line.
-type Spelt = { text: String, written: String }
+type SpellingCase = { text: String, written: String }
 
-fn spellings() -> List<Spelt> =
+fn spellings() -> List<SpellingCase> =
   [
     { text: "plain words", written: "plain words" },
     { text: "", written: "\"\"" },
@@ -4467,7 +4614,8 @@ fn spellings() -> List<Spelt> =
     { text: " indented\nline\n", written: "\" indented\\nline\\n\"" },
   ]
 
-test "`{c.written}` is how its string is written, and reads back" for c: Spelt in spellings() {
+test "`{c.written}` is how its string is written, and reads back" for c: SpellingCase in spellings(
+  ) {
   assert_eq(to_string(String(c.text)), c.written ++ "\n");
   assert_eq(parse_string(c.written ++ "\n", limited()), Ok(String(c.text)))
 }
@@ -4478,7 +4626,9 @@ test "a string inside a flow collection is quoted where one of its indicators wo
     "[\"a, b\", \"[a]\", \"a]b\", \"a{b\", \"a: b\", plain, \"two\\nlines\\n\", \"yes\", -a]",
   );
   assert_eq(
-    the("[\"a, b\", \"[a]\", \"a]b\", \"a{b\", \"a: b\", plain, \"two\\nlines\\n\", \"yes\", -a]"),
+    must_parse(
+      "[\"a, b\", \"[a]\", \"a]b\", \"a{b\", \"a: b\", plain, \"two\\nlines\\n\", \"yes\", -a]",
+    ),
     strings(["a, b", "[a]", "a]b", "a{b", "a: b", "plain", "two\nlines\n", "yes", "-a"]),
   )
 }
@@ -4545,9 +4695,9 @@ test "the documents of a stream are written each after its marker" {
   let documents = [
     Null,
     String("a"),
-    the("[1, 2]"),
-    the("a: 1"),
-    Tagged("!t", the("a: 1")),
+    must_parse("[1, 2]"),
+    must_parse("a: 1"),
+    Tagged("!t", must_parse("a: 1")),
     String("x\ny\n"),
   ];
   assert_eq(
@@ -4589,7 +4739,7 @@ test "the events of a stream stand where they are written, comments among them" 
       { kind: StreamEnd, from: 46, to: 46 },
     ]),
   );
-  assert_eq(place_at(b"# top\na: [1, &x two] # tail\n", 13), { line: 2, column: 8 })
+  assert_eq(location_at(b"# top\na: [1, &x two] # tail\n", 13), { line: 2, column: 8 })
 }
 
 test "events say what a value does not: styles, markers, an alias, a tag no reader keeps, a key twice" {
@@ -4625,7 +4775,7 @@ test "events say what a value does not: styles, markers, an alias, a tag no read
       StreamEnd,
     ]),
   );
-  assert_eq(kinds("a: [\n").map_err(|e: Refusal| e.why), Err(Expected("a node")))
+  assert_eq(kinds("a: [\n").map_err(|e: Error| e.reason), Err(Expected("a node")))
 }
 
 // --- Tests: codecs ----------------------------------------------------------
@@ -4709,7 +4859,7 @@ test "a decode error says the path of keys and the line and column it is written
 
 test "a codec over a value alone gives the path and no place" {
   assert_eq(
-    list_yaml(server_yaml()).decode(the("- {name: web, port: 80, tags: [a, 2]}")),
+    list_yaml(server_yaml()).decode(must_parse("- {name: web, port: 80, tags: [a, 2]}")),
     Err({
       path: [Index(0), Key("tags"), Index(1)],
       place: None,
@@ -4753,7 +4903,7 @@ test "the leaf codecs read their own kind and say what they found of another" {
 
 test "a timestamp is a string to the reader and a date or an instant to its codec" {
   let text = "day: 2001-12-14\nat: 2001-12-14T21:59:43Z\nlocal: 2001-12-14T21:59:43\nclock: 21:59:43\n";
-  let v = the(text);
+  let v = must_parse(text);
   assert_eq(get(v, "day"), Some(String("2001-12-14")));
   assert_eq(field(v, "day", date_yaml()), Ok(date::of(2001, 12, 14).expect("a date")));
   assert_eq(field(v, "at", offset_date_time_yaml()).map(date::rfc3339), Ok("2001-12-14T21:59:43Z"));
@@ -4772,14 +4922,14 @@ test "a timestamp is a string to the reader and a date or an instant to its code
 
 test "a string-keyed map is a mapping, and a key that is no string is refused" {
   let codec = string_map_yaml(int_yaml());
-  assert_eq((codec.encode)(#{"b": 2, "a": 1}), the("{a: 1, b: 2}"));
-  assert_eq((codec.decode)(the("{b: 2, a: 1}")), Ok(#{"a": 1, "b": 2}));
+  assert_eq((codec.encode)(#{"b": 2, "a": 1}), must_parse("{a: 1, b: 2}"));
+  assert_eq((codec.decode)(must_parse("{b: 2, a: 1}")), Ok(#{"a": 1, "b": 2}));
   assert_eq(
-    Result::map_err((codec.decode)(the("{a: 1, b: x}")), error_to_string),
+    Result::map_err((codec.decode)(must_parse("{a: 1, b: x}")), error_to_string),
     Err("b: expected an integer, found a string"),
   );
   assert_eq(
-    Result::map_err((codec.decode)(the("{1: 1}")), error_to_string),
+    Result::map_err((codec.decode)(must_parse("{1: 1}")), error_to_string),
     Err("expected a string for a key, found an integer"),
   )
 }
@@ -4811,20 +4961,20 @@ fn manifest() -> String =
 
 fn edited(
   text: String,
-  edit: (Document) -> Document / {yaml.refused, abort.raise},
+  edit: (Document) -> Document / {yaml.fail, abort.raise},
 ) -> String / {abort.raise} =
   match parse_document(Bytes::of_string(text), limited()) {
-    Err(e) -> "unread: " ++ refusal_to_string(e),
+    Err(e) -> "unread: " ++ error_message(e),
     Ok(d) -> match try { edit(d) } {
       Ok(made) -> String::of_bytes_lossy(source(made)),
-      Err(e) -> "refused: " ++ refusal_to_string(e),
+      Err(e) -> "refused: " ++ error_message(e),
     },
   }
 
 test "a document is its bytes and its value, and says where a path is written" {
   let text = Bytes::of_string(manifest());
   match parse_document(text, limited()) {
-    Err(e) -> panic(refusal_to_string(e)),
+    Err(e) -> panic(error_message(e)),
     Ok(d) -> {
       assert_eq(source(d), text);
       assert_eq(Ok(value(d)), parse(text, limited()));
@@ -4843,13 +4993,16 @@ test "a document is its bytes and its value, and says where a path is written" {
       assert_eq(place(d, [Key("kind"), Index(0)]), None)
     },
   };
-  assert_eq(parse_document(b"a: [", limited()).map_err(|e: Refusal| e.why), Err(Expected("a node")))
+  assert_eq(
+    parse_document(b"a: [", limited()).map_err(|e: Error| e.reason),
+    Err(Expected("a node")),
+  )
 }
 
 /// The lines of the manifest an edit changed: those it took, each after `-`, then those it put,
 /// each after `+`.
 fn changed(
-  edit: (Document) -> Document / {yaml.refused, abort.raise},
+  edit: (Document) -> Document / {yaml.fail, abort.raise},
 ) -> List<String> / {abort.raise} = {
   let before = manifest().lines();
   let after = edited(manifest(), edit).lines();
@@ -4858,7 +5011,8 @@ fn changed(
   )
 }
 
-fn first_container() -> List<Step> = [Key("spec"), Key("template"), Key("containers"), Index(0)]
+fn first_container() -> List<PathSegment> =
+  [Key("spec"), Key("template"), Key("containers"), Index(0)]
 
 test "setting a value that is written changes those bytes and no others" {
   assert_eq(changed(|d: Document| set(d, [Key("spec"), Key("replicas")], Integer(5))), [
@@ -4883,7 +5037,7 @@ test "setting a value that is written changes those bytes and no others" {
     ["-        args: [--port, \"80\"]", "+        args: [--port, 8080]"],
   );
   assert_eq(
-    changed(|d: Document| set(d, [Key("spec"), Key("strategy")], the("{type: Rolling}"))),
+    changed(|d: Document| set(d, [Key("spec"), Key("strategy")], must_parse("{type: Rolling}"))),
     ["-  strategy:", "+  strategy: {type: Rolling}"],
   );
   assert_eq(
@@ -4907,7 +5061,7 @@ test "a value over several lines is replaced by one on the line of its key" {
     "a:\n  # why\n  [x]\nc: 2\n",
   );
   assert_eq(edited("a: 1\n", |d: Document| set(d, [], strings(["x"]))), "[x]\n");
-  assert_eq(edited("", |d: Document| set(d, [], the("{a: 1}"))), "{a: 1}")
+  assert_eq(edited("", |d: Document| set(d, [], must_parse("{a: 1}"))), "{a: 1}")
 }
 
 test "a new key goes after its mapping's last entry, as that mapping's keys are indented" {
@@ -4920,7 +5074,7 @@ test "a new key goes after its mapping's last entry, as that mapping's keys are 
     ["-  labels: {app: web, tier: front}", "+  labels: {app: web, tier: front, env: prod}"],
   );
   assert_eq(
-    changed(|d: Document| set(d, first_container().push(Key("ports")), the("[80, 443]"))),
+    changed(|d: Document| set(d, first_container().push(Key("ports")), must_parse("[80, 443]"))),
     ["+        ports: [80, 443]"],
   );
   assert_eq(changed(|d: Document| set(d, [Key("status"), Key("ready")], Boolean(true))), [
@@ -4971,27 +5125,30 @@ test "removing a path takes its lines and leaves the rest, comments among it" {
 }
 
 test "an edit the document has no place for is refused where the path stops" {
-  let refused = |text: String, edit: (Document) -> Document / {yaml.refused, abort.raise}|
+  let refused = |text: String, edit: (Document) -> Document / {yaml.fail, abort.raise}|
     match parse_document(Bytes::of_string(text), limited()) {
-      Err(e) -> Some((e.line, e.column, e.why)),
-      Ok(d) -> match try { edit(d) } { Ok(_) -> None, Err(e) -> Some((e.line, e.column, e.why)) },
+      Err(e) -> Some((e.line, e.column, e.reason)),
+      Ok(d) -> match try { edit(d) } {
+        Ok(_) -> None,
+        Err(e) -> Some((e.line, e.column, e.reason)),
+      },
     };
   assert_eq(
     refused("a: 1\nb: x\n", |d: Document| set(d, [Key("b"), Key("c")], Null)),
-    Some((2, 4, Closed([Key("b"), Key("c")]))),
+    Some((2, 4, Uneditable([Key("b"), Key("c")]))),
   );
   assert_eq(
     refused("a: [1]\n", |d: Document| set(d, [Key("a"), Index(1)], Null)),
-    Some((1, 4, Closed([Key("a"), Index(1)]))),
+    Some((1, 4, Uneditable([Key("a"), Index(1)]))),
   );
-  assert_eq(refused("a: 1\n", |d: Document| remove(d, [])), Some((1, 1, Closed([]))));
+  assert_eq(refused("a: 1\n", |d: Document| remove(d, [])), Some((1, 1, Uneditable([]))));
   assert_eq(
     refused("a: &x 1\nb: *x\n", |d: Document| set(d, [Key("a")], Integer(2))),
-    Some((1, 4, Closed([Key("a")]))),
+    Some((1, 4, Uneditable([Key("a")]))),
   );
   assert_eq(
     refused("a: &x {k: 1}\nb: *x\n", |d: Document| set(d, [Key("b"), Key("k")], Integer(2))),
-    Some((2, 4, Closed([Key("b"), Key("k")]))),
+    Some((2, 4, Uneditable([Key("b"), Key("k")]))),
   );
   assert_eq(
     edited("a: &x 1\nb: *x\n", |d: Document| set(d, [Key("b")], Integer(2))),
@@ -5006,12 +5163,12 @@ test "an edit the document has no place for is refused where the path stops" {
           Err(_) -> b"",
         }
       },
-      |e: Refusal| e.why,
+      |e: Error| e.reason,
     ),
-    Err(Closed([Key("c")])),
+    Err(Uneditable([Key("c")])),
   );
   assert_eq(
-    refusal_to_string({ offset: 0, line: 1, column: 1, why: Closed([Key("a"), Index(1)]) }),
+    error_message({ offset: 0, line: 1, column: 1, reason: Uneditable([Key("a"), Index(1)]) }),
     "line 1, column 1: the document has no place for an edit at `a[1]`",
   )
 }
@@ -5019,7 +5176,7 @@ test "an edit the document has no place for is refused where the path stops" {
 test "a document decodes as it stands, and again after an edit" {
   let text = "- name: web\n  port: 80\n  tags: [a]\n- name: db\n  port: 5432\n  tags: []\n";
   match parse_document(Bytes::of_string(text), limited()) {
-    Err(e) -> panic(refusal_to_string(e)),
+    Err(e) -> panic(error_message(e)),
     Ok(d) -> {
       assert_eq(
         decode_document(d, list_yaml(server_yaml())).map(|servers: List<Server>|
@@ -5030,7 +5187,7 @@ test "a document decodes as it stands, and again after an edit" {
       assert_eq(
         match moved {
           Ok(after) -> decode_document(after, list_yaml(server_yaml())).map_err(error_to_string),
-          Err(e) -> panic(refusal_to_string(e)),
+          Err(e) -> panic(error_message(e)),
         },
         Err("line 5, column 9: [1].port: expected an integer, found a string"),
       )

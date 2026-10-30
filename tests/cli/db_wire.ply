@@ -1,8 +1,8 @@
 //! `std.db`'s TLS, notifications and copies, against a real server.
 
-import harness (Here, Wire, ended, serving, working, write)
+import harness (WorkingDirectory, Network, wait_for_exit, start_server, working_directory, write)
 import postgres
-import postgres (Cluster, Postgres, over)
+import postgres (Cluster, Postgres, call_with_url)
 import std.certgen (certgen)
 import std.process (process)
 import std.string
@@ -180,27 +180,28 @@ fn trusting(trusted: List<String>) -> List<String> =
   trusted.fold([], |flags: List<String>, pem: String| flags.concat(["--trust", pem]))
 
 /// A cluster speaking TLS under a certificate for `localhost`, and where that certificate is.
-fn secured() -> { cluster: Cluster, pem: String } / {Here, Wire, Postgres, certgen.issue, abort.raise, diverges} = {
+fn tls_cluster() -> { cluster: Cluster, pem: String } / {WorkingDirectory, Network, Postgres, certgen.issue, abort.raise, diverges} = {
   let issued = certgen.issue();
-  let c = postgres::secured("ply", "pencil", issued.certificate, issued.key);
+  let c = postgres::scram_with_tls("ply", "pencil", issued.certificate, issued.key);
   write("server.pem", issued.certificate);
   { cluster: c, pem: working_pem() }
 }
 
-fn working_pem() -> String / {Here, abort.raise} = working() ++ "/server.pem"
+fn working_pem() -> String / {WorkingDirectory, abort.raise} = working_directory() ++ "/server.pem"
 
 fn refused_08001(r: Result<String, String>, what: String) -> Bool =
   match r { Err(why) -> why.starts_with("08001: ") && why.contains(what), Ok(_) -> false }
 
 test/nondet "a secured connection is encrypted and verified for its host" {
   if postgres::available() {
-    let s = secured();
+    let s = tls_cluster();
     write("inner.ply", wired());
     let l = trusting([s.pem]);
     let modes = ["sslmode=verify-full", "sslmode=require", "sslmode=verify-ca"].map(
-      |mode: String| over("encrypted", postgres::url(s.cluster, "localhost", "ply", mode), l),
+      |mode: String|
+        call_with_url("encrypted", postgres::url(s.cluster, "localhost", "ply", mode), l),
     );
-    let plain = over(
+    let plain = call_with_url(
       "encrypted",
       postgres::url(s.cluster, "localhost", "ply", "sslmode=disable"),
       l,
@@ -214,16 +215,16 @@ test/nondet "a secured connection is encrypted and verified for its host" {
 
 test/nondet "a certificate not trusted, or not for the host, is refused" {
   if postgres::available() {
-    let s = secured();
+    let s = tls_cluster();
     write("inner.ply", wired());
     let trusting_none = trusting([]);
-    let untrusted = over(
+    let untrusted = call_with_url(
       "encrypted",
       postgres::url(s.cluster, "localhost", "ply", "sslmode=require"),
       trusting_none,
     );
     let l = trusting([s.pem]);
-    let elsewhere = over(
+    let elsewhere = call_with_url(
       "encrypted",
       postgres::url(s.cluster, "127.0.0.1", "ply", "sslmode=verify-full"),
       l,
@@ -239,18 +240,21 @@ test/nondet "a server that will not speak TLS is not spoken to in plaintext" {
     let c = postgres::scram("ply", "pencil");
     write("inner.ply", wired());
     let l = trusting([]);
-    let r = over("encrypted", postgres::url(c, "127.0.0.1", "ply", "sslmode=require"), l);
+    let r = call_with_url("encrypted", postgres::url(c, "127.0.0.1", "ply", "sslmode=require"), l);
     postgres::stop(c);
     assert(refused_08001(r, "does not speak TLS"), None)
   }
 }
 
 /// The major version of the postgres the run bound.
-fn major() -> Int / {Postgres, abort.raise} = {
-  let said = String::of_bytes_lossy(process.spawn[postgres](["--version"], "", []).out);
-  said.split(" ").fold(0, |found: Int, word: String|
+fn postgres_major_version() -> Int / {Postgres, abort.raise} = {
+  let version_text = String::of_bytes_lossy(process.spawn[postgres](["--version"], "", []).out);
+  version_text.split(" ").fold(0, |found: Int, word: String|
     if found > 0 { found } else {
-      match String::int_of_string(match word.split(".") { [major, ..] -> major, [] -> "" }) {
+      match String::int_of_string(match word.split(".") {
+          [postgres_major_version, ..] -> postgres_major_version,
+          [] -> "",
+        }) {
         Some(n) -> n,
         None -> 0,
       }
@@ -261,16 +265,17 @@ fn major() -> Int / {Postgres, abort.raise} = {
 // understand and hangs up, which is refused rather than retried in plaintext.
 test/nondet "direct negotiation secures the connection without asking first" {
   if postgres::available() {
-    let s = secured();
+    let s = tls_cluster();
     write("inner.ply", wired());
     let l = trusting([s.pem]);
-    let r = over(
+    let r = call_with_url(
       "encrypted",
       postgres::url(s.cluster, "localhost", "ply", "sslmode=verify-full&sslnegotiation=direct"),
       l,
     );
     postgres::stop(s.cluster);
-    if major() >= 17 { assert_eq(r, Ok("1")) } else { assert(refused_08001(r, ""), None) }
+    if postgres_major_version() >= 17 { assert_eq(r, Ok("1")) }
+    else { assert(refused_08001(r, ""), None) }
   }
 }
 
@@ -279,14 +284,18 @@ test/nondet "a notification is heard when its transaction commits and never when
     let c = postgres::scram("ply", "pencil");
     write("inner.ply", wired());
     let l = trusting([]);
-    let heard = over("notices", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"), l);
+    let heard = call_with_url(
+      "notices",
+      postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"),
+      l,
+    );
     postgres::stop(c);
     assert_eq(heard, Ok("quiet jobs:one quiet undone quiet jobs:three quiet"))
   }
 }
 
 /// Until `ready` answers, asking every tenth of a second for at most `tries` of them.
-fn until<| e>(
+fn wait_until<| e>(
   what: String,
   tries: Int,
   ready: () -> Bool / e,
@@ -294,7 +303,7 @@ fn until<| e>(
   if ready() { () }
   else if tries <= 0 { panic("waited for " ++ what) } else {
     time.sleep_ms(100);
-    until(what, tries - 1, ready)
+    wait_until(what, tries - 1, ready)
   }
 
 test/nondet "a listener whose connection is ended listens again and says so" {
@@ -302,7 +311,7 @@ test/nondet "a listener whose connection is ended listens again and says so" {
     let c = postgres::scram("ply", "pencil");
     let _ = postgres::psql(c, "ply", "create table heard (what text)");
     write("inner.ply", wired());
-    let server = serving(
+    let server = start_server(
       ["run", "--", "reconnects", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable")],
       [],
       0,
@@ -311,17 +320,17 @@ test/nondet "a listener whose connection is ended listens again and says so" {
     let heard = |what: String|
       postgres::psql(c, "ply", "select count(*) from heard where what = '" ++ what ++ "'") == "1";
     // The program is compiled first, which under a loaded run takes a while.
-    until("the listener to listen", 6000, || postgres::psql(c, "ply", listening) == "1");
+    wait_until("the listener to listen", 6000, || postgres::psql(c, "ply", listening) == "1");
     let _ = postgres::psql(c, "ply", "select pg_notify('jobs', 'first')");
-    until("the first to be heard", 600, || heard("jobs:first"));
+    wait_until("the first to be heard", 600, || heard("jobs:first"));
     let _ = postgres::psql(
       c,
       "ply",
       "select pg_terminate_backend(pid) from pg_stat_activity where query = 'listen \"jobs\"'",
     );
-    until("the listener to reconnect", 600, || heard("reconnected"));
+    wait_until("the listener to reconnect", 600, || heard("reconnected"));
     let _ = postgres::psql(c, "ply", "select pg_notify('jobs', 'second')");
-    let f = ended(server, 120000, "the listener did not end");
+    let f = wait_for_exit(server, 120000, "the listener did not end");
     postgres::stop(c);
     assert(
       String::of_bytes_lossy(f.out).contains("heard jobs:first,reconnected,jobs:second"),
@@ -340,7 +349,11 @@ test/nondet "rows are copied in and out whole or not at all" {
     );
     write("inner.ply", wired());
     let l = trusting([]);
-    let copied = over("copies", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"), l);
+    let copied = call_with_url(
+      "copies",
+      postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"),
+      l,
+    );
     let left = postgres::psql(
       c,
       "ply",

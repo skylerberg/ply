@@ -8,10 +8,11 @@ import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import program (Program, load_program, published, place_of, resolve_def, unknown_def, program_view)
-import report (Answer, schema_version, ok_code, refused, reported)
-import compiler.front.facts (View)
-import compiler.front.rows (Outlined, OType)
+import program (Program, load_program, definitions_in_order, place_of, resolve_def, unknown_def,
+                program_view)
+import report (CommandOutput, schema_version, ok_code, refused, reported)
+import compiler.front.facts (CheckedProgram)
+import compiler.front.rows (OutlineItem, OutlinedType)
 import compiler.syntax.fmt (item_range)
 import compiler.check.infer.checker (Location)
 import compiler.check.resolve.tables (Diag, error_at, qualify)
@@ -21,10 +22,10 @@ import std.string
 import compiler.syntax.parsing (no_module, dummy_span, span_between)
 
 /// A `fn` or a `type` the query named, and where the tree declares it.
-pub type Named = { name: String, simple: String, at: Location }
+pub type NamedDefinition = { name: String, simple: String, at: Location }
 
 /// One definition and the range of its file that holds it.
-pub type Shown = {
+pub type DefinitionSource = {
   name: String,
   simple: String,
   at: Location,
@@ -34,22 +35,22 @@ pub type Shown = {
   end: Int,
 }
 
-pub fn source_of(shown: Shown) -> String / {abort.raise} =
+pub fn source_of(shown: DefinitionSource) -> String / {abort.raise} =
   String::of_bytes_lossy(shown.text.slice(shown.start, shown.end))
 
 // --- Naming a `type` ------------------------------------------------------------
 // No table of the checker's holds a `type` declaration, so it is read from the tree.
 
-type Lookup = | NoType | OneType(Named) | ManyTypes(List<String>)
+type Lookup = | NoType | OneType(NamedDefinition) | ManyTypes(List<String>)
 
-fn declared_types(view: View) -> List<Named> =
-  range(0, view.frame.outlines.len()).fold([], |acc: List<Named>, i: Int|
+fn declared_types(view: CheckedProgram) -> List<NamedDefinition> =
+  range(0, view.frame.outlines.len()).fold([], |acc: List<NamedDefinition>, i: Int|
     match view.frame.outlines.at(i) {
       None -> acc,
       Some(o) ->
-        o.items.fold(acc, |a: List<Named>, it: Outlined|
+        o.items.fold(acc, |a: List<NamedDefinition>, it: OutlineItem|
           match it {
-            OType(t) ->
+            OutlinedType(t) ->
               a.push({
                 name: String::of_bytes_lossy(qualify(o.name, t.name)),
                 simple: String::of_bytes_lossy(t.name),
@@ -59,18 +60,18 @@ fn declared_types(view: View) -> List<Named> =
           }),
     })
 
-fn type_named(analysis: View, query: String) -> Lookup = {
+fn type_named(analysis: CheckedProgram, query: String) -> Lookup = {
   let all = declared_types(analysis);
-  let exact = all.fold(None, |acc: Option<Named>, t: Named|
+  let exact = all.fold(None, |acc: Option<NamedDefinition>, t: NamedDefinition|
     match acc { Some(_) -> acc, None -> if t.name == query { Some(t) } else { None } });
   match exact {
     Some(t) -> OneType(t),
     None -> {
-      let matching = all.filter(|t: Named| t.simple == query);
+      let matching = all.filter(|t: NamedDefinition| t.simple == query);
       match matching.at(0) {
         None -> NoType,
         Some(t) -> if matching.len() == 1 { OneType(t) }
-        else { ManyTypes(matching.map(|x: Named| x.name)) },
+        else { ManyTypes(matching.map(|x: NamedDefinition| x.name)) },
       }
     },
   }
@@ -98,7 +99,7 @@ fn no_text(name: String, location: Location) -> Diag =
     [],
   )
 
-fn unplaced(name: String, why: String, location: Location) -> Diag =
+fn unlocatable(name: String, why: String, location: Location) -> Diag =
   error_at(
     b"E0101",
     location.module,
@@ -108,11 +109,14 @@ fn unplaced(name: String, why: String, location: Location) -> Diag =
     [],
   )
 
-fn placed(program: Program, found: Named) -> Result<Shown, Diag> / {abort.raise} =
+fn located_source(
+  program: Program,
+  found: NamedDefinition,
+) -> Result<DefinitionSource, Diag> / {abort.raise} =
   match place_of(program, found.at) {
     None -> Err(no_text(found.name, found.at)),
     Some(place) -> match item_range(place.text, Bytes::of_string(found.simple)) {
-      Err(why) -> Err(unplaced(found.name, String::of_bytes_lossy(why), found.at)),
+      Err(why) -> Err(unlocatable(found.name, String::of_bytes_lossy(why), found.at)),
       Ok(r) ->
         Ok({
           name: found.name,
@@ -130,18 +134,18 @@ fn placed(program: Program, found: Named) -> Result<Shown, Diag> / {abort.raise}
 /// program, and where its file holds it.
 pub fn locate(
   program: Program,
-  analysis: View,
+  analysis: CheckedProgram,
   query: String,
-) -> Result<Shown, Diag> / {abort.raise} =
-  match resolve_def(published(analysis), query) {
+) -> Result<DefinitionSource, Diag> / {abort.raise} =
+  match resolve_def(definitions_in_order(analysis), query) {
     Ok(d) ->
-      placed(program, {
+      located_source(program, {
         name: String::of_bytes_lossy(d.name),
         simple: String::of_bytes_lossy(d.simple_name),
         at: d.at,
       }),
     Err(names) -> match type_named(analysis, query) {
-      OneType(t) -> placed(program, t),
+      OneType(t) -> located_source(program, t),
       ManyTypes(ns) -> Err(many_types(query, ns)),
       NoType -> Err(unknown_def(query, names)),
     },
@@ -159,7 +163,7 @@ pub fn source_lines(text: String) -> List<String> = {
   } else { parts }
 }
 
-pub fn answered(shown: Shown) -> Answer / {abort.raise} = {
+pub fn show_output(shown: DefinitionSource) -> CommandOutput / {abort.raise} = {
   let source = source_of(shown);
   {
     json: object([
@@ -181,14 +185,14 @@ pub fn answered(shown: Shown) -> Answer / {abort.raise} = {
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_reached} = {
   let loaded: Program = load_program(flags.paths, flags.verify_deps);
   let s = style_of(flags);
   match program_view(loaded) {
     None -> refused(s, "show", loaded.diags, loaded.places),
     Some(w) -> match locate(loaded, w, flags.query) {
       Err(d) -> reported(s, "show", [d], loaded.places),
-      Ok(shown) -> answered(shown),
+      Ok(shown) -> show_output(shown),
     },
   }
 }
@@ -198,7 +202,7 @@ pub fn run(
 fn a_file() -> Bytes =
   b"// The base.\nfn one() -> Int = 1\n\n// Doubles the base.\npub fn two() -> Int = one() + one()  // twice\n"
 
-fn shown_of(start: Int, end: Int) -> Shown =
+fn shown_of(start: Int, end: Int) -> DefinitionSource =
   {
     name: "m.two",
     simple: "two",
@@ -228,7 +232,7 @@ test "the text is written back as the lines it is made of, the last newline endi
 }
 
 test "the answer carries the byte range and the text, and exits 0" {
-  let answer = answered(shown_of(0, 13));
+  let answer = show_output(shown_of(0, 13));
   assert_eq(answer.code, 0);
   assert_eq(answer.errs, []);
   assert_eq(answer.lines, ["// The base."])

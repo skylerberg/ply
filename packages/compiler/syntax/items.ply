@@ -1,48 +1,51 @@
 //! The item parser, and all of the parser's error recovery.
 
-import compiler.syntax.parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Label,
-                                Eaten, ParseStart, span_to, dummy_span, no_ident, no_qname, bare,
-                                made_at, role_case_at_param, role_case_identity_param,
-                                role_case_at_type, role_case_identity_type, qualified, unexpected,
-                                unknown_deriver, error_at, error_at_and, push_diag, error_here,
-                                unclosed, token_kind, token_kind_at, current_span, span_at,
-                                previous_span, at_token, at_eof, at_ident_text, is_ident, is_str,
-                                starts_upper, advance, bump, eat, expect, expect_close,
-                                expect_ident, expect_gt, with_no_brace, fresh_item, start, qname,
-                                comma_list, parsed_or, failed, token_lparen, token_rparen,
-                                token_lbrace, token_rbrace, token_lbracket, token_rbracket,
-                                token_comma, token_colon, token_coloncolon, token_dot, token_eq,
-                                token_lt, token_gt, token_underscore, token_ge, token_pipe,
-                                token_slash, token_arrow, token_hashbracket, at_pos, keyword_pub,
-                                keyword_fn, keyword_type, keyword_effect, keyword_nondet,
-                                keyword_test, keyword_import, dump_node, erase_spans, dump_count,
-                                dump_presence, dump_payload, dump_word, dump_bool, dump_list,
-                                dump_opt, dump_ident, dump_qname, dump_diags, Doc, doc_at,
-                                module_doc, token_between, dump_doc, primary_span_of, span_bin,
-                                ident_bin, span_between, prelude_binder)
+import compiler.syntax.parsing (Span, Ident, QName, Input, Parser, ParseOutput, PartialList,
+                                ParseDiag, Label, EatResult, ParseStart, span_to, dummy_span,
+                                no_ident, no_qname, bare, synthetic_span_at, role_case_at_param,
+                                role_case_identity_param, role_case_at_type,
+                                role_case_identity_type, qualified, unexpected, unknown_deriver,
+                                error_at, error_at_and, push_diag, error_here, unclosed, token_kind,
+                                token_kind_at, current_span, span_at, previous_span, at_token,
+                                at_eof, at_ident_text, is_ident, is_str, starts_upper, advance,
+                                bump, eat, expect, expect_close, expect_ident, expect_gt,
+                                with_no_brace, fresh_item, start, qname, comma_list, parsed_or,
+                                failed, token_lparen, token_rparen, token_lbrace, token_rbrace,
+                                token_lbracket, token_rbracket, token_comma, token_colon,
+                                token_coloncolon, token_dot, token_eq, token_lt, token_gt,
+                                token_underscore, token_ge, token_pipe, token_slash, token_arrow,
+                                token_hashbracket, at_pos, keyword_pub, keyword_fn, keyword_type,
+                                keyword_effect, keyword_nondet, keyword_test, keyword_import,
+                                dump_node, erase_spans, dump_count, dump_presence, dump_payload,
+                                dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname,
+                                dump_diags, Doc, doc_at, module_doc, token_between, dump_doc,
+                                primary_span_of, span_bin, ident_bin, span_between, prelude_binder)
 import std.bin
 import std.list
 import compiler.syntax.lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead,
                               InterpolatedTail, Keyword, Punctuation, EndOfInput, Comment, DocMark,
                               ItemDoc, ModuleDoc, doc_mark, follows_name, is_ident_continue)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TRecord, TUnit, TCon, TFn, TBad, RowExpr,
-                                    AtomExpr, Mode, Generics, RowMember, MWrite, MRaise, RMAtom,
-                                    RMSet, ty, ty_span, mode, generics, row, row_member,
-                                    no_generics, dump_ty, dump_row, dump_atom, dump_generics,
-                                    dump_mode, starts_type)
+import compiler.syntax.type_syntax (TypeExpr, VariableTypeExpression, RecordTypeExpression,
+                                    UnitTypeExpression, NamedTypeExpression, FunctionTypeExpression,
+                                    InvalidTypeExpression, RowExpr, AtomExpr, Mode, Generics,
+                                    RowMember, WriteMode, RaiseMode, AtomMember, EffectSetMember,
+                                    ty, ty_span, mode, generics, row, row_member, no_generics,
+                                    dump_ty, dump_row, dump_atom, dump_generics, dump_mode,
+                                    starts_type)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
-import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span,
-                              no_expr, fn_param, param, declared_param, dump_expr, dump_param,
-                              shown_binder, cases_binder, set_binder, hidden_binder, free_names,
-                              free_binder, case_at, case_identity, case_body, listing, home_modules,
-                              sees_homes, prelude_module, scheduler_module, beneath_scheduler,
-                              task_operations)
-import compiler.syntax.patterns (LStr)
+import compiler.syntax.exprs (Expr, LiteralExpression, CallExpression, NameExpression, Param, expr,
+                              scrutinee, block_expr, expr_span, no_expr, fn_param, lambda_parameter,
+                              declared_param, dump_expr, dump_param, show_binder, cases_binder,
+                              set_binder, is_hidden_binder, implicitly_imported_names,
+                              implicit_import_binder, case_index_binder, case_identity, case_body,
+                              listing, home_modules, sees_homes, prelude_module, scheduler_module,
+                              scheduler_dependencies, task_operations)
+import compiler.syntax.patterns (LiteralString)
 import std.prelude_source
 
 // --- The tree ---------------------------------------------------------------
 
-pub type Vis = | VPub | VPriv
+pub type Visibility = | Public | Private
 
 /// `m`, the module `name`, importing `std.prelude` as every module but the prelude itself does:
 /// under a binder no source can write, past the imports its text writes.
@@ -52,13 +55,13 @@ pub fn with_prelude(name: Bytes, m: Module) -> Module =
       ..m,
       imports: m.imports.push({
         path: prelude_module().split(b".").map(|s: Bytes| { name: s, span: dummy_span() }),
-        kind: IAlias({ name: prelude_binder(), span: dummy_span() }),
+        kind: ModuleAlias({ name: prelude_binder(), span: dummy_span() }),
         span: dummy_span(),
       }),
     }
   }
 
-pub type ImportKind = | IModule | IAlias(Ident) | INames(List<Ident>)
+pub type ImportKind = | WholeModule | ModuleAlias(Ident) | SelectedNames(List<Ident>)
 
 pub type ImportDecl = { path: List<Ident>, kind: ImportKind, span: Span }
 
@@ -66,41 +69,48 @@ pub type ImportDecl = { path: List<Ident>, kind: ImportKind, span: Span }
 derive bin for ImportKind
 derive bin for ImportDecl
 
-/// What `derivable(D, a)` and the predicates hold a type to: `DEq`, `DOrd`, `DShow` and `DHash`
-/// are what `==`, `compare`, `show` and `digest` read of a value, `DNumeric` and `DInteger` the
-/// predicates `numeric(a)` and `integer(a)`, and `DKept` what a process keeps of a `const`'s
+/// What `derivable(D, a)` and the predicates hold a type to: `EqDeriver`, `OrdDeriver`, `ShowDeriver` and `HashDeriver`
+/// are what `==`, `compare`, `show` and `digest` read of a value, `NumericDeriver` and `IntegerDeriver` the
+/// predicates `numeric(a)` and `integer(a)`, and `ConstantDeriver` what a process keeps of a `const`'s
 /// value, which no constraint names.
-pub type Deriver = | DEq | DOrd | DShow | DHash | DNumeric | DInteger | DKept
+pub type Deriver =
+  | EqDeriver
+  | OrdDeriver
+  | ShowDeriver
+  | HashDeriver
+  | NumericDeriver
+  | IntegerDeriver
+  | ConstantDeriver
 
 derive bin for Deriver
 
 /// What `derivable(D, a)` can name.
-pub fn derivable_kinds() -> List<Deriver> = [DEq, DOrd, DShow, DHash]
+pub fn derivable_kinds() -> List<Deriver> = [EqDeriver, OrdDeriver, ShowDeriver, HashDeriver]
 
 pub fn is_predicate(deriver: Deriver) -> Bool =
-  match deriver { DNumeric -> true, DInteger -> true, _ -> false }
+  match deriver { NumericDeriver -> true, IntegerDeriver -> true, _ -> false }
 
 pub fn deriver_text(deriver: Deriver) -> Bytes =
   match deriver {
-    DEq -> b"eq",
-    DOrd -> b"ord",
-    DShow -> b"show",
-    DHash -> b"hash",
-    DNumeric -> b"numeric",
-    DInteger -> b"integer",
-    DKept -> b"kept",
+    EqDeriver -> b"eq",
+    OrdDeriver -> b"ord",
+    ShowDeriver -> b"show",
+    HashDeriver -> b"hash",
+    NumericDeriver -> b"numeric",
+    IntegerDeriver -> b"integer",
+    ConstantDeriver -> b"kept",
   }
 
 /// A definition's hash carries this, so a deriver keeps its number.
 pub fn deriver_tag(deriver: Deriver) -> Int =
   match deriver {
-    DEq -> 1,
-    DOrd -> 2,
-    DShow -> 4,
-    DHash -> 5,
-    DNumeric -> 6,
-    DInteger -> 7,
-    DKept -> 10,
+    EqDeriver -> 1,
+    OrdDeriver -> 2,
+    ShowDeriver -> 4,
+    HashDeriver -> 5,
+    NumericDeriver -> 6,
+    IntegerDeriver -> 7,
+    ConstantDeriver -> 10,
   }
 
 /// A constraint as it is written.
@@ -112,7 +122,7 @@ pub type Constraint = { deriver: Deriver, deriver_span: Span, param: Ident, span
 
 /// `cost` bounds the steps a call takes by an `Int` over the parameters, up to a constant factor, and
 /// `space` the memory it holds beyond its arguments alike.
-pub type SpecKind = | SRequires | SEnsures | SCost | SSpace
+pub type SpecKind = | RequiresClause | EnsuresClause | CostClause | SpaceClause
 
 derive bin for SpecKind
 
@@ -125,7 +135,7 @@ pub fn result_name() -> Bytes = b"result"
 pub type Returns = | ReturnsFresh(Span) | ReturnsParam(Ident)
 
 pub type FnDef = {
-  vis: Vis,
+  visibility: Visibility,
   name: Ident,
   generics: Generics,
   params: List<Param>,
@@ -157,14 +167,14 @@ pub type LawDef = {
   binders: List<Binder>,
   identities: List<Ident>,
   guard: Option<Expr>,
-  of: Option<OfSchema>,
+  of: Option<SchemaInstance>,
   body: Expr,
   span: Span,
 }
 
 /// `law "l" = round_trip(f, g)`. The resolver fills `home`, the schema's module, `shown`, the
 /// names the schema gives its binders, and `identities`, the type parameters its `where` constrains.
-pub type OfSchema = {
+pub type SchemaInstance = {
   schema: QName,
   home: Option<Bytes>,
   shown: List<Bytes>,
@@ -179,7 +189,7 @@ pub type SchemaIdentity = { name: Bytes, position: Int }
 /// `law schema round_trip<a>(f: (a) -> String) forall (x: a) { .. }`: a law over what it is given.
 /// `identities` are the type parameters its `where identity(a)` names, as a law's are.
 pub type SchemaDef = {
-  vis: Vis,
+  visibility: Visibility,
   name: Ident,
   /// Type parameters, and at most one row parameter: what the definitions it is given may raise.
   generics: Generics,
@@ -194,13 +204,13 @@ pub type SchemaDef = {
 
 pub type VariantDef = { name: Ident, fields: List<TypeExpr>, doc: Option<Doc>, span: Span }
 
-/// `TDNominal` holds the record type written after `new`. `TDExtern` is an `extern type`: one the
+/// `NominalBody` holds the record type written after `new`. `ExternBody` is an `extern type`: one the
 /// toolchain lays out, with no constructor or field a program can name.
 pub type TypeDefBody =
-  | TDAlias(TypeExpr)
-  | TDSum(List<VariantDef>)
-  | TDNominal(TypeExpr)
-  | TDExtern
+  | AliasBody(TypeExpr)
+  | SumBody(List<VariantDef>)
+  | NominalBody(TypeExpr)
+  | ExternBody
 
 /// A field of the record a `type` declares, with the doc above it.
 pub type FieldDoc = { name: Bytes, doc: Doc }
@@ -208,12 +218,12 @@ pub type FieldDoc = { name: Bytes, doc: Doc }
 /// An `opaque` before `type`, where it is written, with all another module has of the type: the
 /// module's `pub fn`s that answer one, and those that only take one. They are named here because a
 /// load reads a shipped module without the functions the program does not reach.
-pub type Opaque = { span: Span, answer: List<Bytes>, take: List<Bytes> }
+pub type Opaque = { span: Span, result: List<Bytes>, take: List<Bytes> }
 
 /// `field_docs` holds a doc for each field of a declared record that has one. Only the module
 /// declaring an `opaque` type builds a value of it, or names a constructor of one.
 pub type TypeDef = {
-  vis: Vis,
+  visibility: Visibility,
   opaque: Option<Opaque>,
   name: Ident,
   generics: Generics,
@@ -242,10 +252,10 @@ pub type OpDef = {
 
 /// `is_nondet` because `nondet` is a keyword and cannot be a field name.
 pub type EffectDef = {
-  vis: Vis,
+  visibility: Visibility,
   name: Ident,
   is_nondet: Bool,
-  ops: List<OpDef>,
+  operations: List<OpDef>,
   doc: Option<Doc>,
   span: Span,
 }
@@ -280,7 +290,7 @@ pub type DeriveDef = { deriver: Bytes, deriver_span: Span, target: Ident, span: 
 
 /// Which `derive` generated a definition, and what its deriver wrote; kept beside the module rather
 /// than on the `FnDef`.
-pub type Derived = { deriver: Bytes, target: Bytes, span: Span, written: List<Bytes> }
+pub type DeriveOrigin = { deriver: Bytes, target: Bytes, span: Span, written: List<Bytes> }
 
 /// What a `derive` wrote of its module's type `target`, wherever the item stands: each function's
 /// text. The rest of its module decides it (the cycle a codec is on, the types it declares), so a
@@ -297,7 +307,12 @@ derive bin for Derivation
 /// `host for os by served` is what an effect's own module says its performs go through where no
 /// handler of the program answers them: the real handler every root whose row names the effect
 /// runs under. Its `target` names the effect.
-pub type InstanceKind = | NKey | NShow | NInvariant | NRelease | NHost
+pub type InstanceKind =
+  | KeyInstance
+  | ShowInstance
+  | InvariantInstance
+  | ReleaseInstance
+  | HostInstance
 
 derive bin for InstanceKind
 
@@ -305,11 +320,11 @@ pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Spa
 
 pub fn instance_text(kind: InstanceKind) -> Bytes =
   match kind {
-    NKey -> b"key",
-    NShow -> b"show",
-    NInvariant -> b"invariant",
-    NRelease -> b"release",
-    NHost -> b"host",
+    KeyInstance -> b"key",
+    ShowInstance -> b"show",
+    InvariantInstance -> b"invariant",
+    ReleaseInstance -> b"release",
+    HostInstance -> b"host",
   }
 
 /// One function a `numeric` names, and the operation it names it for.
@@ -317,7 +332,7 @@ pub type NumericOp = { op: Ident, by: Ident }
 
 /// The arithmetic a nominal type's own module states the operators mean at it:
 /// `numeric for BigInt by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }`.
-pub type NumericDef = { target: Ident, ops: List<NumericOp>, span: Span }
+pub type NumericDef = { target: Ident, operations: List<NumericOp>, span: Span }
 
 /// The operations a `numeric` names a function for, each once, in the order a unit lists them:
 /// `+`, binary `-`, `*`, unary `-`, and what `numeric_of_int` calls.
@@ -325,13 +340,13 @@ pub fn numeric_ops() -> List<Bytes> = [b"add", b"sub", b"mul", b"neg", b"of_int"
 
 /// The function `d` names for `op`.
 pub fn numeric_by(d: NumericDef, op: Bytes) -> Option<Ident> =
-  d.ops.fold(None, |acc: Option<Ident>, x: NumericOp|
+  d.operations.fold(None, |acc: Option<Ident>, x: NumericOp|
     match acc { Some(_) -> acc, None -> if x.op.name == op { Some(x.by) } else { None } })
 
 /// `expansion` is every atom the set stands for, as its own module writes them; the resolver fills it.
 pub type EffectSetDef = {
   name: Ident,
-  vis: Vis,
+  visibility: Visibility,
   atoms: List<AtomExpr>,
   includes: List<QName>,
   expansion: List<AtomExpr>,
@@ -342,7 +357,7 @@ pub type EffectSetDef = {
 /// `extern fn`: a function the runtime implements, with no body to check. The prelude declares
 /// every one; a module that writes one is refused.
 pub type ExternDef = {
-  vis: Vis,
+  visibility: Visibility,
   name: Ident,
   generics: Generics,
   params: List<Param>,
@@ -358,17 +373,17 @@ pub type ExternDef = {
 }
 
 pub type Item =
-  | IFn(FnDef)
-  | IType(TypeDef)
-  | IEffect(EffectDef)
-  | ITest(TestDef)
-  | ILaw(LawDef)
-  | ISchema(SchemaDef)
-  | IDerive(DeriveDef)
-  | IEffectSet(EffectSetDef)
-  | IExtern(ExternDef)
-  | IInstance(InstanceDef)
-  | INumeric(NumericDef)
+  | FunctionItem(FnDef)
+  | TypeItem(TypeDef)
+  | EffectItem(EffectDef)
+  | TestItem(TestDef)
+  | LawItem(LawDef)
+  | SchemaItem(SchemaDef)
+  | DeriveItem(DeriveDef)
+  | EffectSetItem(EffectSetDef)
+  | ExternItem(ExternDef)
+  | InstanceItem(InstanceDef)
+  | NumericItem(NumericDef)
 
 pub type Module = { doc: Option<Doc>, imports: List<ImportDecl>, items: List<Item> }
 
@@ -376,7 +391,7 @@ pub type Module = { doc: Option<Doc>, imports: List<ImportDecl>, items: List<Ite
 
 pub fn no_fn() -> FnDef =
   {
-    vis: VPriv,
+    visibility: Private,
     name: no_ident(),
     generics: no_generics(),
     params: [],
@@ -394,38 +409,38 @@ pub fn no_fn() -> FnDef =
     span: dummy_span(),
   }
 
-pub fn no_item() -> Item = IFn(no_fn())
+pub fn no_item() -> Item = FunctionItem(no_fn())
 
 pub fn item_doc(item: Item) -> Option<Doc> =
   match item {
-    IFn(d) -> d.doc,
-    IType(d) -> d.doc,
-    IEffect(d) -> d.doc,
-    IEffectSet(d) -> d.doc,
-    IExtern(d) -> d.doc,
-    ISchema(d) -> d.doc,
-    ITest(_) -> None,
-    ILaw(_) -> None,
-    IDerive(_) -> None,
-    IInstance(_) -> None,
-    INumeric(_) -> None,
+    FunctionItem(d) -> d.doc,
+    TypeItem(d) -> d.doc,
+    EffectItem(d) -> d.doc,
+    EffectSetItem(d) -> d.doc,
+    ExternItem(d) -> d.doc,
+    SchemaItem(d) -> d.doc,
+    TestItem(_) -> None,
+    LawItem(_) -> None,
+    DeriveItem(_) -> None,
+    InstanceItem(_) -> None,
+    NumericItem(_) -> None,
   }
 
 /// The type an item states functions of, which whatever keeps the type's declaration keeps with
 /// it: a comparison, a `show` or an operator reaches them from a value, and from no body.
-pub fn stated_type(item: Item) -> Option<Ident> =
+pub fn target_type(item: Item) -> Option<Ident> =
   match item {
-    IInstance(d) -> Some(d.target),
-    INumeric(d) -> Some(d.target),
-    IFn(_) -> None,
-    IType(_) -> None,
-    IEffect(_) -> None,
-    ITest(_) -> None,
-    ILaw(_) -> None,
-    ISchema(_) -> None,
-    IDerive(_) -> None,
-    IEffectSet(_) -> None,
-    IExtern(_) -> None,
+    InstanceItem(d) -> Some(d.target),
+    NumericItem(d) -> Some(d.target),
+    FunctionItem(_) -> None,
+    TypeItem(_) -> None,
+    EffectItem(_) -> None,
+    TestItem(_) -> None,
+    LawItem(_) -> None,
+    SchemaItem(_) -> None,
+    DeriveItem(_) -> None,
+    EffectSetItem(_) -> None,
+    ExternItem(_) -> None,
   }
 
 /// The function `module` names the real handler of its effect `name` (`host for name by f`), by
@@ -435,7 +450,7 @@ pub fn real_handler_of(module: Module, name: Bytes) -> Option<Bytes> =
     match found {
       Some(_) -> found,
       None -> match item {
-        IInstance(d) -> if d.kind == NHost && d.target.name == name { Some(d.by.name) }
+        InstanceItem(d) -> if d.kind == HostInstance && d.target.name == name { Some(d.by.name) }
         else { None },
         _ -> None,
       },
@@ -443,42 +458,42 @@ pub fn real_handler_of(module: Module, name: Bytes) -> Option<Bytes> =
 
 pub fn item_span(item: Item) -> Span =
   match item {
-    IFn(d) -> d.span,
-    IType(d) -> d.span,
-    IEffect(d) -> d.span,
-    ITest(d) -> d.span,
-    ILaw(d) -> d.span,
-    ISchema(d) -> d.span,
-    IDerive(d) -> d.span,
-    IEffectSet(d) -> d.span,
-    IExtern(d) -> d.span,
-    IInstance(d) -> d.span,
-    INumeric(d) -> d.span,
+    FunctionItem(d) -> d.span,
+    TypeItem(d) -> d.span,
+    EffectItem(d) -> d.span,
+    TestItem(d) -> d.span,
+    LawItem(d) -> d.span,
+    SchemaItem(d) -> d.span,
+    DeriveItem(d) -> d.span,
+    EffectSetItem(d) -> d.span,
+    ExternItem(d) -> d.span,
+    InstanceItem(d) -> d.span,
+    NumericItem(d) -> d.span,
   }
 
 /// The item that owns what `item` declares or states: a `derive`, an instance or a `numeric` is its
 /// type's, since only the type's own module may state one.
 pub fn owner_of(item: Item) -> Option<Bytes> =
   match item {
-    IFn(d) -> Some(d.name.name),
-    IType(d) -> Some(d.name.name),
-    IEffect(d) -> Some(d.name.name),
-    ISchema(d) -> Some(d.name.name),
-    IEffectSet(d) -> Some(d.name.name),
-    IExtern(d) -> Some(d.name.name),
-    IDerive(d) -> Some(d.target.name),
-    IInstance(d) -> Some(d.target.name),
-    INumeric(d) -> Some(d.target.name),
-    ITest(_) -> None,
-    ILaw(_) -> None,
+    FunctionItem(d) -> Some(d.name.name),
+    TypeItem(d) -> Some(d.name.name),
+    EffectItem(d) -> Some(d.name.name),
+    SchemaItem(d) -> Some(d.name.name),
+    EffectSetItem(d) -> Some(d.name.name),
+    ExternItem(d) -> Some(d.name.name),
+    DeriveItem(d) -> Some(d.target.name),
+    InstanceItem(d) -> Some(d.target.name),
+    NumericItem(d) -> Some(d.target.name),
+    TestItem(_) -> None,
+    LawItem(_) -> None,
   }
 
 /// What a check files `item` under: the owner of what it declares or states, or a test or a law under
 /// its own name, which no declaration's name can be.
 pub fn item_owner(item: Item) -> Bytes =
   match item {
-    ITest(d) -> test_owned_as(d.name),
-    ILaw(d) -> b"law ".concat(d.name),
+    TestItem(d) -> test_owned_as(d.name),
+    LawItem(d) -> b"law ".concat(d.name),
     _ -> match owner_of(item) { Some(o) -> o, None -> b"" },
   }
 
@@ -498,7 +513,7 @@ pub fn schema_named(module: Module, name: Bytes) -> Option<SchemaDef> =
     match found {
       Some(_) -> found,
       None -> match item {
-        ISchema(d) -> if d.name.name == name { Some(d) } else { None },
+        SchemaItem(d) -> if d.name.name == name { Some(d) } else { None },
         _ -> None,
       },
     })
@@ -511,7 +526,7 @@ pub fn schema_of(module: Module, def: FnDef) -> Option<SchemaDef> =
       match found {
         Some(_) -> found,
         None -> match item {
-          ISchema(d) -> if d.span == def.span { Some(d) } else { None },
+          SchemaItem(d) -> if d.span == def.span { Some(d) } else { None },
           _ -> None,
         },
       })
@@ -548,11 +563,11 @@ pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
 
 fn instance_kind_at(input: Input, parser: Parser) -> Option<InstanceKind> =
-  if at_ident_text(input, parser, b"key") { Some(NKey) }
-  else if at_ident_text(input, parser, b"show") { Some(NShow) }
-  else if at_ident_text(input, parser, b"invariant") { Some(NInvariant) }
-  else if at_ident_text(input, parser, b"release") { Some(NRelease) }
-  else if at_ident_text(input, parser, b"host") { Some(NHost) }
+  if at_ident_text(input, parser, b"key") { Some(KeyInstance) }
+  else if at_ident_text(input, parser, b"show") { Some(ShowInstance) }
+  else if at_ident_text(input, parser, b"invariant") { Some(InvariantInstance) }
+  else if at_ident_text(input, parser, b"release") { Some(ReleaseInstance) }
+  else if at_ident_text(input, parser, b"host") { Some(HostInstance) }
   else { None }
 
 /// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
@@ -608,12 +623,12 @@ pub fn at_effect_set_start(input: Input, parser: Parser) -> Bool =
 
 // --- Recovery ---------------------------------------------------------------
 
-pub type Rec = { parser: Parser, depth: Int }
+pub type RecoveryState = { parser: Parser, depth: Int }
 
-pub fn is_open(kind: TokenKind) -> Bool =
+pub fn is_open_bracket(kind: TokenKind) -> Bool =
   kind == token_lparen() || kind == token_lbrace() || kind == token_lbracket()
 
-pub fn is_close(kind: TokenKind) -> Bool =
+pub fn is_close_bracket(kind: TokenKind) -> Bool =
   kind == token_rparen() || kind == token_rbrace() || kind == token_rbracket()
 
 /// Skips to the next item start at bracket depth zero. It bumps every round, so the budget cannot fire.
@@ -621,12 +636,12 @@ pub fn recover_to_item(input: Input, parser: Parser) -> Parser / {abort.raise} =
   // Callers consume a keyword before failing, so an item start here already belongs to the next item.
   let p0 = if !at_eof(input, parser) && !at_item_start(input, parser) { bump(input, parser) }
   else { parser };
-  iterate({ parser: p0, depth: 0 }, input.token_count - p0.pos + 2, |s: Rec|
+  iterate({ parser: p0, depth: 0 }, input.token_count - p0.pos + 2, |s: RecoveryState|
     if at_eof(input, s.parser) { Stop(s.parser) }
     else if s.depth == 0 && at_item_start(input, s.parser) { Stop(s.parser) } else {
       let k = token_kind(input, s.parser);
-      let d = if is_open(k) { s.depth + 1 }
-      else if is_close(k) { if s.depth <= 0 { 0 } else { s.depth - 1 } }
+      let d = if is_open_bracket(k) { s.depth + 1 }
+      else if is_close_bracket(k) { if s.depth <= 0 { 0 } else { s.depth - 1 } }
       else { s.depth };
       Continue({ parser: bump(input, s.parser), depth: d })
     })
@@ -634,33 +649,40 @@ pub fn recover_to_item(input: Input, parser: Parser) -> Parser / {abort.raise} =
 
 // --- Imports ----------------------------------------------------------------
 
-pub fn import_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> / {abort.raise} =
+pub fn import_name(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Ident>, Parser> / {abort.raise} =
   expect_ident(input, parser, b"a name to import from the module")
 
 pub fn import_path(
   input: Input,
   parser: Parser,
   first: Ident,
-) -> Result<Parsed<List<Ident>>, Parser> / {abort.raise} =
-  iterate({ parser: parser, out: [first] }, input.token_count - parser.pos + 1, |s: SoFar<Ident>| {
-    let d = eat(input, s.parser, token_dot());
-    if !d.ok { Stop(Ok({ parser: d.parser, node: s.out })) } else {
-      match expect_ident(input, d.parser, b"another module path segment after `.`") {
-        Err(q) -> Stop(Err(q)),
-        Ok(n) -> Continue({ parser: n.parser, out: s.out.push(n.node) }),
+) -> Result<ParseOutput<List<Ident>>, Parser> / {abort.raise} =
+  iterate(
+    { parser: parser, out: [first] },
+    input.token_count - parser.pos + 1,
+    |s: PartialList<Ident>| {
+      let d = eat(input, s.parser, token_dot());
+      if !d.ok { Stop(Ok({ parser: d.parser, node: s.out })) } else {
+        match expect_ident(input, d.parser, b"another module path segment after `.`") {
+          Err(q) -> Stop(Err(q)),
+          Ok(n) -> Continue({ parser: n.parser, out: s.out.push(n.node) }),
+        }
       }
-    }
-  })
+    },
+  )
 
 /// `as` is contextual: it stays usable as an ordinary identifier.
 pub fn import_kind(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<ImportKind>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<ImportKind>, Parser> / {abort.raise} =
   if at_ident_text(input, parser, b"as") {
     let a = advance(input, parser);
     let n = expect_ident(input, a.parser, b"a name to bind the module as, after `as`")?;
-    Ok({ parser: n.parser, node: IAlias(n.node) })
+    Ok({ parser: n.parser, node: ModuleAlias(n.node) })
   } else if at_token(input, parser, token_lparen()) {
     let o = advance(input, parser);
     let names = comma_list(input, o.parser, token_rparen(), import_name)?;
@@ -686,21 +708,21 @@ pub fn import_kind(
           ),
         ),
       )
-    } else { Ok({ parser: cl.parser, node: INames(names.node) }) }
-  } else { Ok({ parser: parser, node: IModule }) }
+    } else { Ok({ parser: cl.parser, node: SelectedNames(names.node) }) }
+  } else { Ok({ parser: parser, node: WholeModule }) }
 
 /// `import m as x (a, b)` both renames and selects, which is refused.
 pub fn imports_both(input: Input, parser: Parser, kind: ImportKind) -> Bool =
   match kind {
-    IAlias(a) -> at_token(input, parser, token_lparen()),
-    INames(ns) -> at_ident_text(input, parser, b"as"),
-    IModule -> false,
+    ModuleAlias(a) -> at_token(input, parser, token_lparen()),
+    SelectedNames(ns) -> at_ident_text(input, parser, b"as"),
+    WholeModule -> false,
   }
 
 pub fn import_decl(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<ImportDecl>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<ImportDecl>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: first } = expect_ident(input, st.parser, b"a module path after `import`")?;
   let { parser, node: path } = import_path(input, parser, first)?;
@@ -729,15 +751,19 @@ pub fn import_decl(
 }
 
 /// Every `import` precedes every item, so the import table is complete before any body is parsed.
-pub fn imports(input: Input, parser: Parser) -> Parsed<List<ImportDecl>> / {abort.raise} =
-  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: SoFar<ImportDecl>|
-    if !at_token(input, s.parser, keyword_import()) { Stop({ parser: s.parser, node: s.out }) }
-    else {
-      match import_decl(input, s.parser) {
-        Err(q) -> Continue({ parser: recover_to_item(input, q), out: s.out }),
-        Ok(d) -> Continue({ parser: d.parser, out: s.out.push(d.node) }),
-      }
-    })
+pub fn imports(input: Input, parser: Parser) -> ParseOutput<List<ImportDecl>> / {abort.raise} =
+  iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.pos + 1,
+    |s: PartialList<ImportDecl>|
+      if !at_token(input, s.parser, keyword_import()) { Stop({ parser: s.parser, node: s.out }) }
+      else {
+        match import_decl(input, s.parser) {
+          Err(q) -> Continue({ parser: recover_to_item(input, q), out: s.out }),
+          Ok(d) -> Continue({ parser: d.parser, out: s.out.push(d.node) }),
+        }
+      },
+  )
 
 pub fn import_out_of_order(input: Input, parser: Parser, first_item: Option<Item>) -> Parser = {
   let message = b"`import` must appear before every definition";
@@ -768,7 +794,7 @@ pub fn import_out_of_order(input: Input, parser: Parser, first_item: Option<Item
 // --- `where` and its constraints -------------------------------------------
 
 /// What `derivable(D, a)` names as `D`.
-fn derivable_kind(parser: Parser, name: Ident) -> Result<Parsed<Deriver>, Parser> =
+fn derivable_kind(parser: Parser, name: Ident) -> Result<ParseOutput<Deriver>, Parser> =
   match derivable_kinds().find(|d: Deriver| deriver_text(d) == name.name) {
     Some(d) -> Ok({ parser: parser, node: d }),
     None ->
@@ -800,10 +826,10 @@ fn derivable_kind(parser: Parser, name: Ident) -> Result<Parsed<Deriver>, Parser
 pub fn constraint(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<Constraint>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Constraint>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
-  if at_ident_text(input, parser, b"numeric") { predicate(input, parser, DNumeric) }
-  else if at_ident_text(input, parser, b"integer") { predicate(input, parser, DInteger) }
+  if at_ident_text(input, parser, b"numeric") { predicate(input, parser, NumericDeriver) }
+  else if at_ident_text(input, parser, b"integer") { predicate(input, parser, IntegerDeriver) }
   else if !at_ident_text(input, parser, b"derivable") {
     Err(
       error_here(
@@ -842,7 +868,7 @@ fn predicate(
   input: Input,
   parser: Parser,
   deriver: Deriver,
-) -> Result<Parsed<Constraint>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Constraint>, Parser> / {abort.raise} = {
   let n = current_span(input, parser);
   let a = advance(input, parser);
   let { parser, node: o } = expect(input, a.parser, token_lparen(), b"`(` and the type parameter")?;
@@ -868,13 +894,13 @@ fn predicate(
 pub fn where_clause(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<Constraint>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<List<Constraint>>, Parser> / {abort.raise} =
   if !at_ident_text(input, parser, b"where") { Ok({ parser: parser, node: [] }) } else {
     let a = advance(input, parser);
     iterate(
       { parser: a.parser, out: [] },
       input.token_count - a.parser.pos + 1,
-      |s: SoFar<Constraint>|
+      |s: PartialList<Constraint>|
         match constraint(input, s.parser) {
           Err(q) -> Stop(Err(q)),
           Ok(cn) -> {
@@ -891,10 +917,10 @@ pub fn where_clause(
 /// `requires`, `ensures`, `cost` and `space` are contextual: only `=` could otherwise follow a `fn`
 /// header.
 pub fn spec_kind_at(input: Input, parser: Parser) -> Option<SpecKind> =
-  if at_ident_text(input, parser, b"requires") { Some(SRequires) }
-  else if at_ident_text(input, parser, b"ensures") { Some(SEnsures) }
-  else if at_ident_text(input, parser, b"cost") { Some(SCost) }
-  else if at_ident_text(input, parser, b"space") { Some(SSpace) }
+  if at_ident_text(input, parser, b"requires") { Some(RequiresClause) }
+  else if at_ident_text(input, parser, b"ensures") { Some(EnsuresClause) }
+  else if at_ident_text(input, parser, b"cost") { Some(CostClause) }
+  else if at_ident_text(input, parser, b"space") { Some(SpaceClause) }
   else { None }
 
 /// `returns` is contextual: it opens the clause only before a name.
@@ -906,7 +932,7 @@ fn opt_returns(
   input: Input,
   parser: Parser,
   params: List<Param>,
-) -> Result<Parsed<Option<Returns>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Option<Returns>>, Parser> / {abort.raise} =
   if !at_returns(input, parser) { Ok({ parser: parser, node: None }) } else {
     let a = advance(input, parser);
     let { parser, node: name } = expect_ident(
@@ -938,27 +964,35 @@ fn opt_returns(
 pub fn spec_clauses(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<SpecClause>>, Parser> / {abort.raise} =
-  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: SoFar<SpecClause>|
-    match spec_kind_at(input, s.parser) {
-      None -> Stop(Ok({ parser: s.parser, node: s.out })),
-      Some(k) -> {
-        let a = advance(input, s.parser);
-        match expr(input, a.parser) {
-          Err(q) -> Stop(Err(q)),
-          Ok(e) ->
-            Continue({
-              parser: e.parser,
-              out: s.out.push({ kind: k, expr: e.node, span: span_to(a.node, expr_span(e.node)) }),
-            }),
-        }
+) -> Result<ParseOutput<List<SpecClause>>, Parser> / {abort.raise} =
+  iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.pos + 1,
+    |s: PartialList<SpecClause>|
+      match spec_kind_at(input, s.parser) {
+        None -> Stop(Ok({ parser: s.parser, node: s.out })),
+        Some(k) -> {
+          let a = advance(input, s.parser);
+          match expr(input, a.parser) {
+            Err(q) -> Stop(Err(q)),
+            Ok(e) ->
+              Continue({
+                parser: e.parser,
+                out: s.out.push({
+                  kind: k,
+                  expr: e.node,
+                  span: span_to(a.node, expr_span(e.node)),
+                }),
+              }),
+          }
+        },
       },
-    })
+  )
 
 fn opt_decreases(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<Option<Expr>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Option<Expr>>, Parser> / {abort.raise} =
   if !at_ident_text(input, parser, b"decreases") { Ok({ parser: parser, node: None }) } else {
     let a = advance(input, parser);
     let { parser, node: e } = expr(input, a.parser)?;
@@ -966,14 +1000,17 @@ fn opt_decreases(
   }
 
 /// Each its own function so its `?` sits in return position rather than inside a `let`'s `if` (`E0119`).
-fn opt_generics(input: Input, parser: Parser) -> Result<Parsed<Generics>, Parser> / {abort.raise} =
+fn opt_generics(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Generics>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lt()) { Ok({ parser: parser, node: no_generics() }) }
   else { generics(input, parser) }
 
 fn opt_ret(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<Option<TypeExpr>>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Option<TypeExpr>>, Parser> / {abort.raise} = {
   let ar = eat(input, parser, token_arrow());
   if !ar.ok { Ok({ parser: ar.parser, node: None }) } else {
     let { parser, node: t } = ty(input, ar.parser)?;
@@ -984,7 +1021,7 @@ fn opt_ret(
 fn opt_row(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<Option<RowExpr>>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Option<RowExpr>>, Parser> / {abort.raise} = {
   let sl = eat(input, parser, token_slash());
   if !sl.ok { Ok({ parser: sl.parser, node: None }) } else {
     let { parser, node: r } = row(input, sl.parser)?;
@@ -998,7 +1035,7 @@ fn fn_name(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<Parsed<Ident>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Ident>, Parser> / {abort.raise} = {
   let { parser, node: first } = expect_ident(input, parser, what)?;
   if !at_token(input, parser, token_coloncolon()) { Ok({ parser: parser, node: first }) } else {
     let { parser, node: member } = expect_ident(
@@ -1031,18 +1068,18 @@ pub fn is_builtin(name: Bytes, module: Module, def: ExternDef) -> Bool =
   name == prelude_module()
     && !module.items.any(|item: Item|
       match item {
-        IType(t) -> def.name.name.starts_with(member_name(t.name.name, b"")),
+        TypeItem(t) -> def.name.name.starts_with(member_name(t.name.name, b"")),
         _ -> false,
       })
 
 pub fn fn_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
+  vis: Visibility,
   reuse: Option<Span>,
   transparent: Option<Span>,
   constant: Option<Span> = None,
-) -> Result<Parsed<FnDef>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<FnDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = fn_name(input, st.parser, b"a function name after `fn`")?;
   let { parser, node: g } = opt_generics(input, parser)?;
@@ -1071,7 +1108,7 @@ pub fn fn_def(
   Ok({
     parser: parser,
     node: {
-      vis: vis,
+      visibility: vis,
       name: name,
       generics: g,
       params: ps,
@@ -1094,7 +1131,10 @@ pub fn fn_def(
 // --- `extern fn` ------------------------------------------------------------
 
 /// A declaration is all there is of one, so every parameter's type and the answer's are written.
-fn extern_param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> / {abort.raise} = {
+fn extern_param(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Param>, Parser> / {abort.raise} = {
   let { parser, node: p } = declared_param(input, parser)?;
   match p.ty {
     Some(_) -> Ok({ parser: parser, node: p }),
@@ -1121,8 +1161,8 @@ fn extern_param(input: Input, parser: Parser) -> Result<Parsed<Param>, Parser> /
 pub fn extern_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<ExternDef>, Parser> / {abort.raise} = {
+  vis: Visibility,
+) -> Result<ParseOutput<ExternDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, .. } = expect(input, st.parser, keyword_fn(), b"`fn` after `extern`")?;
   let { parser, node: name } = fn_name(input, parser, b"a function name after `extern fn`")?;
@@ -1154,7 +1194,7 @@ pub fn extern_def(
   Ok({
     parser: parser,
     node: {
-      vis: vis,
+      visibility: vis,
       name: name,
       generics: g,
       params: ps,
@@ -1172,7 +1212,7 @@ pub fn extern_def(
 // --- `law` ------------------------------------------------------------------
 
 /// A binder's type is mandatory: inferring it would make a law's meaning depend on how its body was written.
-pub fn binder(input: Input, parser: Parser) -> Result<Parsed<Binder>, Parser> / {abort.raise} =
+pub fn binder(input: Input, parser: Parser) -> Result<ParseOutput<Binder>, Parser> / {abort.raise} =
   annotated(
     input,
     parser,
@@ -1180,7 +1220,10 @@ pub fn binder(input: Input, parser: Parser) -> Result<Parsed<Binder>, Parser> / 
     b"`:` and a type \xe2\x80\x94 a `forall` binder must be annotated",
   )
 
-fn schema_param(input: Input, parser: Parser) -> Result<Parsed<Binder>, Parser> / {abort.raise} =
+fn schema_param(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Binder>, Parser> / {abort.raise} =
   annotated(
     input,
     parser,
@@ -1193,7 +1236,7 @@ fn annotated(
   parser: Parser,
   named: Bytes,
   typed: Bytes,
-) -> Result<Parsed<Binder>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Binder>, Parser> / {abort.raise} = {
   let { parser, node: name } = expect_ident(input, parser, named)?;
   let { parser, .. } = expect(input, parser, token_colon(), typed)?;
   let { parser, node: t } = ty(input, parser)?;
@@ -1203,7 +1246,7 @@ fn annotated(
 pub fn law_binders(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<Binder>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<List<Binder>>, Parser> / {abort.raise} =
   if !at_ident_text(input, parser, b"forall") { Ok({ parser: parser, node: [] }) } else {
     let a = advance(input, parser);
     let { parser, node: o } = expect(
@@ -1232,13 +1275,13 @@ pub fn law_binders(
     } else { Ok({ parser: parser, node: bs }) }
   }
 
-pub type ParsedName = { parser: Parser, name: Bytes, span: Span }
+pub type QuotedLabel = { parser: Parser, name: Bytes, span: Span }
 
-pub fn quoted(
+pub fn quoted_label(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<ParsedName, Parser> / {abort.raise} =
+) -> Result<QuotedLabel, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     StringLiteral(s) ->
       Ok({ parser: bump(input, parser), name: s, span: current_span(input, parser) }),
@@ -1249,27 +1292,28 @@ pub fn quoted(
 type LawWhere = { identities: List<Ident>, guard: Option<Expr> }
 
 /// `open` while a constraint or the guard must still follow.
-type WhereSoFar = { parser: Parser, identities: List<Ident>, open: Bool }
+type PartialWhere = { parser: Parser, identities: List<Ident>, open: Bool }
 
 /// The type variables `binders`' types write, each once, in the order they are first written: what
 /// a law's `identity(a)` may name.
 pub fn law_type_variables(binders: List<Binder>) -> List<Bytes> =
-  binders.fold([], |acc: List<Bytes>, b: Binder| written_variables(b.ty, acc))
+  binders.fold([], |acc: List<Bytes>, b: Binder| collect_type_variables(b.ty, acc))
 
-fn written_variables(ty: TypeExpr, found: List<Bytes>) -> List<Bytes> =
+fn collect_type_variables(ty: TypeExpr, found: List<Bytes>) -> List<Bytes> =
   match ty {
-    TVar(i) -> if found.contains(i.name) { found } else { found.push(i.name) },
-    TCon(c) -> c.args.fold(found, |acc: List<Bytes>, a: TypeExpr| written_variables(a, acc)),
-    TFn(f) ->
-      written_variables(
+    VariableTypeExpression(i) -> if found.contains(i.name) { found } else { found.push(i.name) },
+    NamedTypeExpression(c) ->
+      c.args.fold(found, |acc: List<Bytes>, a: TypeExpr| collect_type_variables(a, acc)),
+    FunctionTypeExpression(f) ->
+      collect_type_variables(
         f.ret,
-        f.params.fold(found, |acc: List<Bytes>, p: TypeExpr| written_variables(p, acc)),
+        f.params.fold(found, |acc: List<Bytes>, p: TypeExpr| collect_type_variables(p, acc)),
       ),
-    TRecord(r) ->
+    RecordTypeExpression(r) ->
       r.fields.fold(found, |acc: List<Bytes>, f: { name: Ident, ty: TypeExpr }|
-        written_variables(f.ty, acc)),
-    TUnit(_) -> found,
-    TBad(_) -> found,
+        collect_type_variables(f.ty, acc)),
+    UnitTypeExpression(_) -> found,
+    InvalidTypeExpression(_) -> found,
   }
 
 /// `identity(a)` at the parser's position, where `a` is one of `variables`.
@@ -1290,7 +1334,7 @@ fn law_where(
   input: Input,
   parser: Parser,
   variables: List<Bytes>,
-) -> Result<Parsed<LawWhere>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<LawWhere>, Parser> / {abort.raise} =
   if !at_ident_text(input, parser, b"where") {
     Ok({ parser: parser, node: { identities: [], guard: None } })
   } else {
@@ -1298,7 +1342,7 @@ fn law_where(
     let named = iterate(
       { parser: a.parser, identities: [], open: true },
       input.token_count - a.parser.pos + 1,
-      |s: WhereSoFar|
+      |s: PartialWhere|
         match identity_at(input, s.parser, variables) {
           None -> Stop(s),
           Some(name) -> {
@@ -1317,18 +1361,21 @@ fn law_where(
     }
   }
 
-pub fn law_def(input: Input, parser: Parser) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
+pub fn law_def(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<LawDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
-  let nm = quoted(input, st.parser, b"a quoted law label")?;
+  let nm = quoted_label(input, st.parser, b"a quoted law label")?;
   if at_token(input, nm.parser, token_eq()) { instantiation(input, st.node, nm) }
-  else { written_law(input, st.node, nm) }
+  else { law_with_body(input, st.node, nm) }
 }
 
-fn written_law(
+fn law_with_body(
   input: Input,
   start: Span,
-  nm: ParsedName,
-) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
+  nm: QuotedLabel,
+) -> Result<ParseOutput<LawDef>, Parser> / {abort.raise} = {
   let { parser, node: bs } = law_binders(input, nm.parser)?;
   let { parser, node: w } = law_where(input, parser, law_type_variables(bs))?;
   let { parser, node: body } = block_expr(input, parser)?;
@@ -1351,8 +1398,8 @@ fn written_law(
 fn instantiation(
   input: Input,
   start: Span,
-  nm: ParsedName,
-) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
+  nm: QuotedLabel,
+) -> Result<ParseOutput<LawDef>, Parser> / {abort.raise} = {
   let eq = advance(input, nm.parser);
   let { parser, node: q } = qname(input, eq.parser, b"the law schema to instantiate")?;
   let { parser, node: o } = expect(
@@ -1379,9 +1426,9 @@ fn instantiation(
       identities: [],
       guard: None,
       of: Some({ schema: q, home: None, shown: [], identities: [], span: span }),
-      body: EApp({
+      body: CallExpression({
         span: span,
-        func: EVar({ span: q.span, name: q }),
+        func: NameExpression({ span: q.span, name: q }),
         named: [],
         args: args,
         labels: [],
@@ -1398,7 +1445,7 @@ fn instantiation(
 fn schema_generics(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<Generics>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Generics>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lt()) { Ok({ parser: parser, node: no_generics() }) } else {
     let { parser, node: g } = generics(input, parser)?;
     let labelled = match g.labels.at(0) {
@@ -1436,8 +1483,8 @@ fn take_one(idents: List<Ident>) -> List<Ident> =
 pub fn schema_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<SchemaDef>, Parser> / {abort.raise} = {
+  vis: Visibility,
+) -> Result<ParseOutput<SchemaDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let kw = advance(input, st.parser);
   let { parser, node: name } = expect_ident(input, kw.parser, b"a name after `law schema`")?;
@@ -1462,7 +1509,7 @@ pub fn schema_def(
   Ok({
     parser: parser,
     node: {
-      vis: vis,
+      visibility: vis,
       name: name,
       generics: g,
       params: ps,
@@ -1492,7 +1539,7 @@ pub fn looks_like_variants(input: Input, parser: Parser) -> Bool =
 fn variant_fields(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<TypeExpr>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<List<TypeExpr>>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lparen()) { Ok({ parser: parser, node: [] }) } else {
     let o = advance(input, parser);
     let { parser, node: l } = comma_list(input, o.parser, token_rparen(), ty)?;
@@ -1518,12 +1565,12 @@ fn variant_doc(input: Input, parser: Parser) -> Option<Doc> / {abort.raise} =
 pub fn variants(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<VariantDef>>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<List<VariantDef>>, Parser> / {abort.raise} = {
   let lead = eat(input, parser, token_pipe());
   iterate(
     { parser: lead.parser, out: [] },
     input.token_count - lead.parser.pos + 1,
-    |s: SoFar<VariantDef>|
+    |s: PartialList<VariantDef>|
       match expect_ident(input, s.parser, b"a variant name") {
         Err(q) -> Stop(Err(q)),
         Ok(name) -> match variant_fields(input, name.parser) {
@@ -1548,13 +1595,13 @@ pub fn variants(
 pub fn type_params(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<Ident>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<List<Ident>>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lt()) { Ok({ parser: parser, node: [] }) } else {
     let o = advance(input, parser);
     let { parser, node: ns } = iterate(
       { parser: o.parser, out: [] },
       input.token_count - o.parser.pos + 1,
-      |s: SoFar<Ident>|
+      |s: PartialList<Ident>|
         if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge()) {
           Stop(Ok({ parser: s.parser, node: s.out }))
         } else if at_eof(input, s.parser) {
@@ -1578,7 +1625,7 @@ pub fn type_params(
 fn nominal_body(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<TypeDefBody>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<TypeDefBody>, Parser> / {abort.raise} = {
   let opened = advance(input, parser).parser;
   if !at_token(input, opened, token_lbrace()) {
     Err(error_here(input, opened, b"`{` to open a nominal record's fields after `new`"))
@@ -1592,24 +1639,32 @@ fn nominal_body(
     )
   } else {
     let t = ty(input, opened)?;
-    Ok({ parser: t.parser, node: TDNominal(t.node) })
+    Ok({ parser: t.parser, node: NominalBody(t.node) })
   }
 }
 
-fn type_body(input: Input, parser: Parser) -> Result<Parsed<TypeDefBody>, Parser> / {abort.raise} =
+fn type_body(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<TypeDefBody>, Parser> / {abort.raise} =
   if at_ident_text(input, parser, b"new") { nominal_body(input, parser) }
   else if looks_like_variants(input, parser) {
     let v = variants(input, parser)?;
-    Ok({ parser: v.parser, node: TDSum(v.node) })
+    Ok({ parser: v.parser, node: SumBody(v.node) })
   } else {
     let t = ty(input, parser)?;
-    Ok({ parser: t.parser, node: TDAlias(t.node) })
+    Ok({ parser: t.parser, node: AliasBody(t.node) })
   }
 
 /// An alias is the type it names, so there is nothing of its own for `opaque` to close.
-fn opaque_alias(parser: Parser, opaque: Option<Span>, body: TypeDefBody, name: Ident) -> Parser =
+fn reject_opaque_alias(
+  parser: Parser,
+  opaque: Option<Span>,
+  body: TypeDefBody,
+  name: Ident,
+) -> Parser =
   match ((opaque, body)) {
-    (Some(span), TDAlias(_)) ->
+    (Some(span), AliasBody(_)) ->
       push_diag(
         parser,
         error_at(
@@ -1629,8 +1684,8 @@ fn opaque_alias(parser: Parser, opaque: Option<Span>, body: TypeDefBody, name: I
 fn extern_type_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<TypeDef>, Parser> / {abort.raise} = {
+  vis: Visibility,
+) -> Result<ParseOutput<TypeDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, .. } = expect(input, st.parser, keyword_type(), b"`type` after `extern`")?;
   let { parser, node: name } = expect_ident(input, parser, b"a type name after `extern type`")?;
@@ -1639,12 +1694,12 @@ fn extern_type_def(
   Ok({
     parser: parser,
     node: {
-      vis: vis,
+      visibility: vis,
       opaque: None,
       name: name,
       generics: g,
       constraints: cs,
-      body: TDExtern,
+      body: ExternBody,
       doc: None,
       field_docs: [],
       span: span_to(st.node, previous_span(input, parser)),
@@ -1656,8 +1711,8 @@ fn extern_type_def(
 pub fn type_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<TypeDef>, Parser> / {abort.raise} = {
+  vis: Visibility,
+) -> Result<ParseOutput<TypeDef>, Parser> / {abort.raise} = {
   let opaque = if at_opaque_start(input, parser) { Some(current_span(input, parser)) }
   else { None };
   let st = advance(input, match opaque { Some(_) -> bump(input, parser), None -> parser });
@@ -1667,12 +1722,12 @@ pub fn type_def(
   let { parser, .. } = expect(input, parser, token_eq(), b"`=` after the type name")?;
   let { parser, node: body } = type_body(input, parser)?;
   Ok({
-    parser: opaque_alias(parser, opaque, body, name),
+    parser: reject_opaque_alias(parser, opaque, body, name),
     node: {
-      vis: vis,
+      visibility: vis,
       opaque: match ((opaque, body)) {
-        (_, TDAlias(_)) -> None,
-        (Some(span), _) -> Some({ span: span, answer: [], take: [] }),
+        (_, AliasBody(_)) -> None,
+        (Some(span), _) -> Some({ span: span, result: [], take: [] }),
         (None, _) -> None,
       },
       name: name,
@@ -1689,15 +1744,15 @@ pub fn type_def(
 /// The docs above the fields of a record written in braces; a tuple's fields are positions.
 fn field_docs(input: Input, body: TypeDefBody) -> List<FieldDoc> / {abort.raise} =
   match body {
-    TDAlias(t) -> record_docs(input, t),
-    TDNominal(t) -> record_docs(input, t),
-    TDSum(_) -> [],
-    TDExtern -> [],
+    AliasBody(t) -> record_docs(input, t),
+    NominalBody(t) -> record_docs(input, t),
+    SumBody(_) -> [],
+    ExternBody -> [],
   }
 
 fn record_docs(input: Input, t: TypeExpr) -> List<FieldDoc> / {abort.raise} =
   match t {
-    TRecord(r) -> if input.source.at(r.span.start) != 123 { [] } else {
+    RecordTypeExpression(r) -> if input.source.at(r.span.start) != 123 { [] } else {
       r.fields.fold([], |acc: List<FieldDoc>, f: { name: Ident, ty: TypeExpr }|
         match doc_at(input, f.name.span.start) {
           Some(d) -> acc.push({ name: f.name.name, doc: d }),
@@ -1713,7 +1768,7 @@ type OpParam = { name: Option<Ident>, keep: Bool, ty: TypeExpr }
 
 /// An operation's parameter: its type, the name it may be written with for documentation, and
 /// whether it is written `keep`: the handler takes what it is handed.
-fn op_param(input: Input, parser: Parser) -> Result<Parsed<OpParam>, Parser> / {abort.raise} = {
+fn op_param(input: Input, parser: Parser) -> Result<ParseOutput<OpParam>, Parser> / {abort.raise} = {
   let named = (is_ident(input, parser) || at_token(input, parser, token_underscore()))
     && token_kind_at(input, parser, 1) == token_colon();
   let name = match token_kind(input, parser) {
@@ -1729,14 +1784,17 @@ fn op_param(input: Input, parser: Parser) -> Result<Parsed<OpParam>, Parser> / {
 }
 
 /// The places among `params` of those written `keep`.
-fn kept_places(params: List<OpParam>) -> List<Int> =
+fn keep_indices(params: List<OpParam>) -> List<Int> =
   range(0, params.len()).filter(|i: Int| match params.at(i) { Some(p) -> p.keep, None -> false })
 
 fn param_names(params: List<OpParam>) -> List<Ident> =
   params.fold([], |acc: List<Ident>, p: OpParam|
     match p.name { Some(n) -> acc.push(n), None -> acc })
 
-fn op_resource_param(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} =
+fn op_resource_param(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Bool>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lbracket()) { Ok({ parser: parser, node: false }) } else {
     let o = advance(input, parser);
     let { parser, .. } = expect_ident(input, o.parser, b"a resource parameter name inside `[..]`")?;
@@ -1744,7 +1802,7 @@ fn op_resource_param(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parse
     Ok({ parser: parser, node: true })
   }
 
-fn raise_refuses(input: Input, parser: Parser, label: Bytes, note: Bytes) -> Parser =
+fn raise_operation_error(input: Input, parser: Parser, label: Bytes, note: Bytes) -> Parser =
   push_diag(
     parser,
     error_at(
@@ -1757,12 +1815,12 @@ fn raise_refuses(input: Input, parser: Parser, label: Bytes, note: Bytes) -> Par
   )
 
 /// A raise answers nothing, so it writes no result: `ret` is `Unit` there, and nothing reads it.
-fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
+fn raise_op(input: Input, parser: Parser) -> Result<ParseOutput<OpDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = expect_ident(input, st.parser, b"an operation name")?;
   if at_token(input, parser, token_lbracket()) {
     Err(
-      raise_refuses(
+      raise_operation_error(
         input,
         parser,
         b"a raise takes no resource",
@@ -1771,7 +1829,7 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
     )
   } else if at_token(input, parser, token_lt()) {
     Err(
-      raise_refuses(
+      raise_operation_error(
         input,
         parser,
         b"a raise takes no type parameters",
@@ -1795,7 +1853,7 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
     )?;
     if at_token(input, parser, token_arrow()) {
       Err(
-        raise_refuses(
+        raise_operation_error(
           input,
           parser,
           b"a raise writes no result",
@@ -1807,13 +1865,13 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
         parser: parser,
         node: {
           name: name,
-          mode: MRaise,
+          mode: RaiseMode,
           resource_param: false,
           ty_params: [],
           params: written.map(|p: OpParam| p.ty),
           param_names: param_names(written),
           kept: [],
-          ret: TUnit({ span: cl }),
+          ret: UnitTypeExpression({ span: cl }),
           doc: doc_at(input, st.node.start),
           span: span_to(st.node, cl),
         },
@@ -1823,11 +1881,11 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
 }
 
 /// One operation of an effect. `raise` is contextual, as `read` and `write` are.
-pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} =
+pub fn op_def(input: Input, parser: Parser) -> Result<ParseOutput<OpDef>, Parser> / {abort.raise} =
   if at_ident_text(input, parser, b"raise") { raise_op(input, parser) }
   else { moded_op(input, parser) }
 
-fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
+fn moded_op(input: Input, parser: Parser) -> Result<ParseOutput<OpDef>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
   let { parser, node: m } = mode(input, parser)?;
   let { parser, node: name } = expect_ident(input, parser, b"an operation name")?;
@@ -1858,7 +1916,7 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
       ty_params: tps,
       params: written.map(|p: OpParam| p.ty),
       param_names: param_names(written),
-      kept: kept_places(written),
+      kept: keep_indices(written),
       ret: ret,
       doc: doc_at(input, start.start),
       span: span_to(start, ty_span(ret)),
@@ -1870,22 +1928,26 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
 pub fn op_defs(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<OpDef>>, Parser> / {abort.raise} =
-  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: SoFar<OpDef>|
-    if at_token(input, s.parser, token_rbrace()) || at_eof(input, s.parser) {
-      Stop(Ok({ parser: s.parser, node: s.out }))
-    } else {
-      match op_def(input, s.parser) {
-        Err(q) -> Stop(Err(q)),
-        Ok(o) -> Continue({ parser: o.parser, out: s.out.push(o.node) }),
-      }
-    })
+) -> Result<ParseOutput<List<OpDef>>, Parser> / {abort.raise} =
+  iterate(
+    { parser: parser, out: [] },
+    input.token_count - parser.pos + 1,
+    |s: PartialList<OpDef>|
+      if at_token(input, s.parser, token_rbrace()) || at_eof(input, s.parser) {
+        Stop(Ok({ parser: s.parser, node: s.out }))
+      } else {
+        match op_def(input, s.parser) {
+          Err(q) -> Stop(Err(q)),
+          Ok(o) -> Continue({ parser: o.parser, out: s.out.push(o.node) }),
+        }
+      },
+  )
 
 pub fn effect_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<EffectDef>, Parser> / {abort.raise} = {
+  vis: Visibility,
+) -> Result<ParseOutput<EffectDef>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
   let nd = eat(input, parser, keyword_nondet());
   let { parser, .. } = expect(input, nd.parser, keyword_effect(), b"`effect` after `nondet`")?;
@@ -1906,24 +1968,31 @@ pub fn effect_def(
   )?;
   Ok({
     parser: parser,
-    node: { vis: vis, name: name, is_nondet: nd.ok, ops: ops, doc: None, span: span_to(start, cl) },
+    node: {
+      visibility: vis,
+      name: name,
+      is_nondet: nd.ok,
+      operations: ops,
+      doc: None,
+      span: span_to(start, cl),
+    },
   })
 }
 
 // --- `effect set` -----------------------------------------------------------
 
 /// `atoms` is last because only the last growing field of a literal is pushed in place, and it is the common case.
-pub type ParsedSetMembers = { parser: Parser, includes: List<QName>, atoms: List<AtomExpr> }
+pub type EffectSetMembers = { parser: Parser, includes: List<QName>, atoms: List<AtomExpr> }
 
 pub fn set_members(
   input: Input,
   parser: Parser,
   open: Span,
-) -> Result<ParsedSetMembers, Parser> / {abort.raise} =
+) -> Result<EffectSetMembers, Parser> / {abort.raise} =
   iterate(
     { parser: parser, includes: [], atoms: [] },
     input.token_count - parser.pos + 1,
-    |s: ParsedSetMembers|
+    |s: EffectSetMembers|
       if at_token(input, s.parser, token_rbrace()) || at_token(input, s.parser, token_pipe()) {
         Stop(Ok({ parser: s.parser, includes: s.includes, atoms: s.atoms }))
       } else if at_eof(input, s.parser) {
@@ -1933,8 +2002,9 @@ pub fn set_members(
           Err(q) -> Stop(Err(q)),
           Ok(m) -> {
             let next = match m.node {
-              RMAtom(a) -> { parser: m.parser, includes: s.includes, atoms: s.atoms.push(a) },
-              RMSet(q) -> { parser: m.parser, atoms: s.atoms, includes: s.includes.push(q) },
+              AtomMember(a) -> { parser: m.parser, includes: s.includes, atoms: s.atoms.push(a) },
+              EffectSetMember(q) ->
+                { parser: m.parser, atoms: s.atoms, includes: s.includes.push(q) },
             };
             let cm = eat(input, next.parser, token_comma());
             if !cm.ok {
@@ -1949,8 +2019,8 @@ pub fn set_members(
 pub fn effect_set_def(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<EffectSetDef>, Parser> / {abort.raise} = {
+  vis: Visibility,
+) -> Result<ParseOutput<EffectSetDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let sk = advance(input, st.parser);
   let { parser, node: name } = expect_ident(
@@ -2007,7 +2077,7 @@ pub fn effect_set_def(
       parser: promised,
       node: {
         name: name,
-        vis: vis,
+        visibility: vis,
         atoms: ms.atoms,
         includes: ms.includes,
         expansion: [],
@@ -2024,7 +2094,7 @@ pub fn effect_set_def(
 pub fn derive_def(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<DeriveDef>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<DeriveDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = expect_ident(input, st.parser, b"a deriver name after `derive`")?;
   if !at_ident_text(input, parser, b"for") {
@@ -2055,21 +2125,21 @@ pub fn derive_def(
 pub fn instance_def(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<InstanceDef>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<InstanceDef>, Parser> / {abort.raise} = {
   let kind = match instance_kind_at(input, parser) {
     Some(k) -> k,
     None -> panic("an instance is read where its kind opens it"),
   };
   let st = advance(input, parser);
   let f = advance(input, st.parser);
-  let { parser, node: target } = expect_ident(input, f.parser, if kind == NHost {
+  let { parser, node: target } = expect_ident(input, f.parser, if kind == HostInstance {
     b"the effect, after `for`"
   } else { b"the type, after `for`" })?;
   if !at_ident_text(input, parser, b"by") {
     Err(
       error_here(input, parser, match kind {
-        NInvariant -> b"`by` and the function every value of the type satisfies",
-        NHost -> b"`by` and the function that is the effect's real handler",
+        InvariantInstance -> b"`by` and the function every value of the type satisfies",
+        HostInstance -> b"`by` and the function that is the effect's real handler",
         _ -> b"`by` and the function the type's values go through",
       }),
     )
@@ -2088,7 +2158,10 @@ pub fn instance_def(
   }
 }
 
-fn numeric_op(input: Input, parser: Parser) -> Result<Parsed<NumericOp>, Parser> / {abort.raise} = {
+fn numeric_op(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<NumericOp>, Parser> / {abort.raise} = {
   let { parser, node: op } = expect_ident(
     input,
     parser,
@@ -2108,7 +2181,7 @@ fn numeric_op(input: Input, parser: Parser) -> Result<Parsed<NumericOp>, Parser>
 pub fn numeric_def(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<NumericDef>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<NumericDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let f = advance(input, st.parser);
   let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
@@ -2126,14 +2199,18 @@ pub fn numeric_def(
     let { parser, .. } = expect(input, parser, token_rbrace(), b"`}` to close the operations")?;
     Ok({
       parser: parser,
-      node: { target: target, ops: ops, span: span_to(st.node, previous_span(input, parser)) },
+      node: {
+        target: target,
+        operations: ops,
+        span: span_to(st.node, previous_span(input, parser)),
+      },
     })
   }
 }
 
 // --- `test` -----------------------------------------------------------------
 
-fn test_nondet(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} = {
+fn test_nondet(input: Input, parser: Parser) -> Result<ParseOutput<Bool>, Parser> / {abort.raise} = {
   let sl = eat(input, parser, token_slash());
   if !sl.ok { Ok({ parser: sl.parser, node: false }) } else {
     let { parser, .. } = expect(input, sl.parser, keyword_nondet(), b"`nondet` after `test/`")?;
@@ -2141,11 +2218,11 @@ fn test_nondet(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {
   }
 }
 
-type Labelled = { parser: Parser, text: Bytes, span: Span, label: Expr }
+type TestLabel = { parser: Parser, text: Bytes, span: Span, label: Expr }
 
 /// A label is text, or before `for` a template: the lexer reads that one as an interpolated string,
 /// and its text is the template as written.
-fn test_label(input: Input, parser: Parser) -> Result<Labelled, Parser> / {abort.raise} =
+fn test_label(input: Input, parser: Parser) -> Result<TestLabel, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     StringLiteral(s) -> {
       let sp = current_span(input, parser);
@@ -2153,7 +2230,7 @@ fn test_label(input: Input, parser: Parser) -> Result<Labelled, Parser> / {abort
         parser: bump(input, parser),
         text: s,
         span: sp,
-        label: ELit({ span: sp, lit: LStr(s) }),
+        label: LiteralExpression({ span: sp, lit: LiteralString(s) }),
       })
     },
     InterpolatedHead(_) -> if input.source.at(current_span(input, parser).start) != 34 {
@@ -2176,7 +2253,7 @@ fn test_cases(
   input: Input,
   parser: Parser,
   label: Expr,
-) -> Result<Parsed<Option<Cases>>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Option<Cases>>, Parser> / {abort.raise} =
   if !at_ident_text(input, parser, b"for") { Ok({ parser: parser, node: None }) } else {
     let opened = advance(input, parser);
     let binder = expect_ident(input, opened.parser, b"a name for the case after `for`")?;
@@ -2206,7 +2283,10 @@ fn test_cases(
     }
   }
 
-pub fn test_def(input: Input, parser: Parser) -> Result<Parsed<TestDef>, Parser> / {abort.raise} = {
+pub fn test_def(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<TestDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: nd } = test_nondet(input, st.parser)?;
   let nm = test_label(input, parser)?;
@@ -2235,13 +2315,23 @@ pub fn test_listing(c: Cases) -> Expr = listing(c.binder, c.ty, c.table, c.label
 
 /// The parameters a test over cases is entered with, in the order its root takes them.
 pub fn case_params(c: Cases) -> List<{ name: Ident, ty: TypeExpr }> = {
-  let made = |name: Bytes, role: Int| { name: name, span: made_at(c.in_span, c.in_span, role) };
+  let made = |name: Bytes, role: Int|
+    { name: name, span: synthetic_span_at(c.in_span, c.in_span, role) };
   let named = |name: Bytes, role: Int| {
-    let at = made_at(c.in_span, c.in_span, role);
-    TCon({ span: at, name: bare({ name: name, span: at }), args: [], labels: [], rows: [] })
+    let at = synthetic_span_at(c.in_span, c.in_span, role);
+    NamedTypeExpression({
+      span: at,
+      name: bare({ name: name, span: at }),
+      args: [],
+      labels: [],
+      rows: [],
+    })
   };
   [
-    { name: made(case_at(), role_case_at_param()), ty: named(b"Int", role_case_at_type()) },
+    {
+      name: made(case_index_binder(), role_case_at_param()),
+      ty: named(b"Int", role_case_at_type()),
+    },
     {
       name: made(case_identity(), role_case_identity_param()),
       ty: named(b"Bytes", role_case_identity_type()),
@@ -2252,7 +2342,7 @@ pub fn case_params(c: Cases) -> List<{ name: Ident, ty: TypeExpr }> = {
 // --- `item` -----------------------------------------------------------------
 
 /// A `pub` on an item that cannot be public is reported, and the item is still parsed.
-pub fn no_pub(
+pub fn reject_pub(
   parser: Parser,
   code: Bytes,
   span: Option<Span>,
@@ -2273,8 +2363,8 @@ fn at_fn_start(input: Input, parser: Parser) -> Bool =
 fn written_fn(
   input: Input,
   parser: Parser,
-  vis: Vis,
-) -> Result<Parsed<FnDef>, Parser> / {abort.raise} =
+  vis: Visibility,
+) -> Result<ParseOutput<FnDef>, Parser> / {abort.raise} =
   if at_transparent_start(input, parser) {
     let t = advance(input, parser);
     if at_reuse_start(input, t.parser) {
@@ -2292,60 +2382,60 @@ fn written_fn(
 pub fn item_at(
   input: Input,
   parser: Parser,
-  vis: Vis,
+  vis: Visibility,
   pub_span: Option<Span>,
-) -> Result<Parsed<Item>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Item>, Parser> / {abort.raise} =
   if at_fn_start(input, parser) {
     let d = written_fn(input, parser, vis)?;
-    Ok({ parser: d.parser, node: IFn(d.node) })
+    Ok({ parser: d.parser, node: FunctionItem(d.node) })
   } else if at_opaque_start(input, parser) || at_token(input, parser, keyword_type()) {
     let d = type_def(input, parser, vis)?;
-    Ok({ parser: d.parser, node: IType(d.node) })
+    Ok({ parser: d.parser, node: TypeItem(d.node) })
   } else if at_effect_set_start(input, parser) {
     let d = effect_set_def(input, parser, vis)?;
-    Ok({ parser: d.parser, node: IEffectSet(d.node) })
+    Ok({ parser: d.parser, node: EffectSetItem(d.node) })
   } else if at_token(input, parser, keyword_effect()) || at_token(input, parser, keyword_nondet()) {
     let d = effect_def(input, parser, vis)?;
-    Ok({ parser: d.parser, node: IEffect(d.node) })
+    Ok({ parser: d.parser, node: EffectItem(d.node) })
   } else if at_token(input, parser, keyword_test()) {
     let d = test_def(
       input,
-      no_pub(parser, unexpected(), pub_span, b"a `test` cannot be `pub`", [
+      reject_pub(parser, unexpected(), pub_span, b"a `test` cannot be `pub`", [
         b"a test has no name another module could reference",
       ]),
     )?;
-    Ok({ parser: d.parser, node: ITest(d.node) })
+    Ok({ parser: d.parser, node: TestItem(d.node) })
   } else if at_schema_start(input, parser) {
     let d = schema_def(input, parser, vis)?;
-    Ok({ parser: d.parser, node: ISchema(d.node) })
+    Ok({ parser: d.parser, node: SchemaItem(d.node) })
   } else if at_law_start(input, parser) {
     let d = law_def(
       input,
-      no_pub(parser, unexpected(), pub_span, b"a `law` cannot be `pub`", [
+      reject_pub(parser, unexpected(), pub_span, b"a `law` cannot be `pub`", [
         b"a law has no name another module could reference",
       ]),
     )?;
-    Ok({ parser: d.parser, node: ILaw(d.node) })
+    Ok({ parser: d.parser, node: LawItem(d.node) })
   } else if at_derive_start(input, parser) {
     let d = derive_def(
       input,
-      no_pub(parser, unexpected(), pub_span, b"a `derive` cannot be `pub`", [
+      reject_pub(parser, unexpected(), pub_span, b"a `derive` cannot be `pub`", [
         b"a generated definition takes the visibility of the type it is derived for, so a type you can name is a type you can encode",
       ]),
     )?;
-    Ok({ parser: d.parser, node: IDerive(d.node) })
+    Ok({ parser: d.parser, node: DeriveItem(d.node) })
   } else if at_extern_start(input, parser) {
     if token_kind_at(input, parser, 1) == keyword_type() {
       let d = extern_type_def(input, parser, vis)?;
-      Ok({ parser: d.parser, node: IType(d.node) })
+      Ok({ parser: d.parser, node: TypeItem(d.node) })
     } else {
       let d = extern_def(input, parser, vis)?;
-      Ok({ parser: d.parser, node: IExtern(d.node) })
+      Ok({ parser: d.parser, node: ExternItem(d.node) })
     }
   } else if at_instance_start(input, parser) {
     let d = instance_def(
       input,
-      no_pub(
+      reject_pub(
         parser,
         unexpected(),
         pub_span,
@@ -2353,15 +2443,15 @@ pub fn item_at(
         [b"it is part of what its type or effect is, and reaches wherever that does"],
       ),
     )?;
-    Ok({ parser: d.parser, node: IInstance(d.node) })
+    Ok({ parser: d.parser, node: InstanceItem(d.node) })
   } else if at_numeric_start(input, parser) {
     let d = numeric_def(
       input,
-      no_pub(parser, unexpected(), pub_span, b"a `numeric` cannot be `pub`", [
+      reject_pub(parser, unexpected(), pub_span, b"a `numeric` cannot be `pub`", [
         b"it is part of what its type is, and reaches wherever the type does",
       ]),
     )?;
-    Ok({ parser: d.parser, node: INumeric(d.node) })
+    Ok({ parser: d.parser, node: NumericItem(d.node) })
   } else {
     Err(
       error_here(
@@ -2372,12 +2462,12 @@ pub fn item_at(
     )
   }
 
-pub fn item(input: Input, parser: Parser) -> Result<Parsed<Item>, Parser> / {abort.raise} = {
+pub fn item(input: Input, parser: Parser) -> Result<ParseOutput<Item>, Parser> / {abort.raise} = {
   let doc = doc_at(input, current_span(input, parser).start);
   let it = if at_token(input, parser, keyword_pub()) {
     let a = advance(input, parser);
-    item_at(input, a.parser, VPub, Some(a.node))
-  } else { item_at(input, parser, VPriv, None) };
+    item_at(input, a.parser, Public, Some(a.node))
+  } else { item_at(input, parser, Private, None) };
   let { parser, node: found } = it?;
   Ok({ parser: parser, node: documented(found, doc) })
 }
@@ -2386,31 +2476,31 @@ pub fn item(input: Input, parser: Parser) -> Result<Parsed<Item>, Parser> / {abo
 /// an `invariant`, a `release` or a `numeric` is its functions'; none takes a doc.
 fn documented(item: Item, doc: Option<Doc>) -> Item =
   match item {
-    IFn(d) -> IFn({ ..d, doc: doc }),
-    IType(d) -> IType({ ..d, doc: doc }),
-    IEffect(d) -> IEffect({ ..d, doc: doc }),
-    IEffectSet(d) -> IEffectSet({ ..d, doc: doc }),
-    IExtern(d) -> IExtern({ ..d, doc: doc }),
-    ISchema(d) -> ISchema({ ..d, doc: doc }),
-    ITest(_) -> item,
-    ILaw(_) -> item,
-    IDerive(_) -> item,
-    IInstance(_) -> item,
-    INumeric(_) -> item,
+    FunctionItem(d) -> FunctionItem({ ..d, doc: doc }),
+    TypeItem(d) -> TypeItem({ ..d, doc: doc }),
+    EffectItem(d) -> EffectItem({ ..d, doc: doc }),
+    EffectSetItem(d) -> EffectSetItem({ ..d, doc: doc }),
+    ExternItem(d) -> ExternItem({ ..d, doc: doc }),
+    SchemaItem(d) -> SchemaItem({ ..d, doc: doc }),
+    TestItem(_) -> item,
+    LawItem(_) -> item,
+    DeriveItem(_) -> item,
+    InstanceItem(_) -> item,
+    NumericItem(_) -> item,
   }
 
-// --- `run` ------------------------------------------------------------------
+// --- `parse_module` ------------------------------------------------------------------
 
 /// `items` is last because only the last growing field of a literal is pushed in place.
-pub type ModuleSoFar = { parser: Parser, imports: List<ImportDecl>, items: List<Item> }
+pub type PartialModule = { parser: Parser, imports: List<ImportDecl>, items: List<Item> }
 
 /// Every round consumes at least one token, so the budget cannot fire.
-pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
+pub fn parse_module(input: Input, parser: Parser) -> ParseOutput<Module> / {abort.raise} = {
   let leading = imports(input, parser);
   let done = iterate(
     { parser: leading.parser, imports: leading.node, items: [] },
     input.token_count - leading.parser.pos + 2,
-    |s: ModuleSoFar|
+    |s: PartialModule|
       if at_eof(input, s.parser) { Stop(s) } else {
         let p0 = fresh_item(s.parser);
         if at_token(input, p0, keyword_import()) {
@@ -2431,15 +2521,15 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
         }
       },
   );
-  let shown = match first_shown(input) {
+  let shown = match first_interpolation(input) {
     None -> done.imports,
-    Some(sp) -> done.imports.push(hidden_import(b"show", shown_binder(), sp)),
+    Some(sp) -> done.imports.push(hidden_import(b"show", show_binder(), sp)),
   };
   let ranged = match first_cases(done.items) {
     None -> shown,
     Some(sp) -> shown.push(hidden_import(b"cases", cases_binder(), sp)),
   };
-  let gathered = match first_set(input) {
+  let gathered = match first_set_literal(input) {
     None -> ranged,
     Some(sp) -> ranged.push(hidden_import(b"set", set_binder(), sp)),
   };
@@ -2447,30 +2537,30 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
     parser: done.parser,
     node: {
       doc: module_doc(input),
-      imports: gathered.concat(free_imports(input, gathered)),
-      items: published(named_tests(done.items)),
+      imports: gathered.concat(implicit_imports(input, gathered)),
+      items: with_opaque_interfaces(named_tests(done.items)),
     },
   }
 }
 
-/// A hidden import of each module of [`free_names`] whose names the text reads where it declares
-/// and selects none of them, under its [`free_binder`]: a name after `.` or `::` is another's, and
+/// A hidden import of each module of [`implicitly_imported_names`] whose names the text reads where it declares
+/// and selects none of them, under its [`implicit_import_binder`]: a name after `.` or `::` is another's, and
 /// one after `fn`, `type` or `effect set` is the module's own. A parse and a header read alike.
-fn free_imports(input: Input, imports: List<ImportDecl>) -> List<ImportDecl> = {
+fn implicit_imports(input: Input, imports: List<ImportDecl>) -> List<ImportDecl> = {
   let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
   let selected = imports.fold(Map::new(), |acc: Map<Bytes, Bool>, d: ImportDecl|
     match d.kind {
-      INames(ns) -> ns.fold(acc, |a: Map<Bytes, Bool>, n: Ident| a.insert(n.name, true)),
+      SelectedNames(ns) -> ns.fold(acc, |a: Map<Bytes, Bool>, n: Ident| a.insert(n.name, true)),
       _ -> acc,
     });
-  let free = free_names().fold(
+  let free = implicitly_imported_names().fold(
     Map::new(),
     |acc: Map<Bytes, Bool>, f: { module: Bytes, names: List<Bytes> }|
       f.names.fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)),
   );
   let read = range(0, input.token_count).fold(
     { on: false, declared: Map::new(), first: Map::new() },
-    |s: FreeRead, i: Int| {
+    |s: ImplicitImportScan, i: Int| {
       let k = kind(i);
       let before = kind(i - 1);
       let on = import_step(s.on, k, before);
@@ -2495,35 +2585,38 @@ fn free_imports(input: Input, imports: List<ImportDecl>) -> List<ImportDecl> = {
       }
     },
   );
-  free_names().fold([], |acc: List<ImportDecl>, f: { module: Bytes, names: List<Bytes> }| {
-    let used = f.names.fold(None, |found: Option<Span>, n: Bytes|
-      if read.declared.contains(n) || selected.contains(n) { found } else {
-        match read.first.get(n) {
-          None -> found,
-          Some(sp) -> match found {
-            Some(at) -> if at.start < sp.start { found } else { Some(sp) },
-            None -> Some(sp),
-          },
-        }
-      });
-    match used {
-      Some(sp) -> acc.push(hidden_import(f.module, free_binder(f.module), sp)),
-      None -> acc,
-    }
-  })
+  implicitly_imported_names().fold(
+    [],
+    |acc: List<ImportDecl>, f: { module: Bytes, names: List<Bytes> }| {
+      let used = f.names.fold(None, |found: Option<Span>, n: Bytes|
+        if read.declared.contains(n) || selected.contains(n) { found } else {
+          match read.first.get(n) {
+            None -> found,
+            Some(sp) -> match found {
+              Some(at) -> if at.start < sp.start { found } else { Some(sp) },
+              None -> Some(sp),
+            },
+          }
+        });
+      match used {
+        Some(sp) -> acc.push(hidden_import(f.module, implicit_import_binder(f.module), sp)),
+        None -> acc,
+      }
+    },
+  )
 }
 
-/// Where [`free_imports`]' walk over a text stands: inside an `import` or not, the names of
-/// [`free_names`] it declares, and where it first reads each other one as no other module's.
-type FreeRead = { on: Bool, declared: Map<Bytes, Bool>, first: Map<Bytes, Span> }
+/// Where [`implicit_imports`]' walk over a text stands: inside an `import` or not, the names of
+/// [`implicitly_imported_names`] it declares, and where it first reads each other one as no other module's.
+type ImplicitImportScan = { on: Bool, declared: Map<Bytes, Bool>, first: Map<Bytes, Span> }
 
 /// The names the text lexed as `input` calls on a value, `x.name(..)`, or names a function through
 /// a type under, `T::name`: what a home module of the language's types may answer. A call on a bare
 /// name the text never binds is a perform, and an import calls nothing.
 pub fn called_names(input: Input) -> Map<Bytes, Bool> = {
   let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
-  let imported = importing(input);
-  let bound = standing(input, imported);
+  let imported = tokens_in_imports(input);
+  let bound = bindable_names(input, imported);
   let performed = |at: Int|
     match kind(at) {
       Identifier(e) -> !bound.contains(e) && kind(at - 1) != token_dot(),
@@ -2580,14 +2673,14 @@ pub fn read_without_import<| e>(
     )
   }
 
-/// The scheduler, where the module `name`, lexed as `input`, lies outside [`beneath_scheduler`] and
+/// The scheduler, where the module `name`, lexed as `input`, lies outside [`scheduler_dependencies`] and
 /// writes `simulate { .. }` or performs `task` or `clock`: names `task.write` or one of
 /// [`task_operations`], or `clock.read`, `clock.write`, `clock.now` or `clock.sleep`, as a row's
 /// atom or as a perform. A region and a crossing call the scheduler, and an entry that performs
 /// `task` runs under its region, and one that performs `clock` under its clock. A name after `.` or
 /// `::` is another's.
 pub fn scheduler_read(name: Bytes, input: Input) -> List<Bytes> =
-  if beneath_scheduler().contains(name) { [] } else {
+  if scheduler_dependencies().contains(name) { [] } else {
     let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
     let named = |i: Int, ops: List<Bytes>|
       kind(i + 1) == token_dot() && kind(i - 1) != token_dot() && kind(i - 1) != token_coloncolon()
@@ -2620,7 +2713,7 @@ pub fn homes_declaring<| e>(
 
 /// Whether each token of `input` is part of an `import`: its keyword, its path and its selection,
 /// which end at a name that follows a name.
-fn importing(input: Input) -> Array<Bool> =
+fn tokens_in_imports(input: Input) -> Array<Bool> =
   Array::of_list(
     range(0, input.tokens.len()).fold(
       { flags: [], on: false },
@@ -2642,7 +2735,7 @@ fn import_step(on: Bool, k: TokenKind, before: TokenKind) -> Bool =
   }
 
 /// Where the module first writes a set literal, which calls `std.set`.
-fn first_set(input: Input) -> Option<Span> =
+fn first_set_literal(input: Input) -> Option<Span> =
   input.tokens.fold(None, |acc: Option<Span>, token: Token|
     match acc {
       Some(_) -> acc,
@@ -2653,25 +2746,25 @@ fn first_set(input: Input) -> Option<Span> =
 /// Whether a written type names `name` as the module that declares it does, at any depth.
 fn names_type(t: TypeExpr, name: Bytes) -> Bool =
   match t {
-    TCon(c) ->
+    NamedTypeExpression(c) ->
       (c.name.module == None && c.name.name.name == name)
         || c.args.fold(false, |found: Bool, a: TypeExpr| found || names_type(a, name)),
-    TFn(f) ->
+    FunctionTypeExpression(f) ->
       names_type(f.ret, name)
         || f.params.fold(false, |found: Bool, p: TypeExpr| found || names_type(p, name)),
-    TRecord(r) ->
+    RecordTypeExpression(r) ->
       r.fields.fold(false, |found: Bool, f: { name: Ident, ty: TypeExpr }|
         found || names_type(f.ty, name)),
     _ -> false,
   }
 
 /// What the module's `pub fn`s say of the type `name`: which answer one, and which only take one.
-fn publishing(items: List<Item>, name: Bytes, span: Span) -> Opaque =
-  items.fold({ span: span, answer: [], take: [] }, |acc: Opaque, item: Item|
+fn opaque_interface(items: List<Item>, name: Bytes, span: Span) -> Opaque =
+  items.fold({ span: span, result: [], take: [] }, |acc: Opaque, item: Item|
     match item {
-      IFn(d) -> if !is_pub(d.vis) { acc }
+      FunctionItem(d) -> if !is_pub(d.visibility) { acc }
       else if match d.ret { Some(t) -> names_type(t, name), None -> false } {
-        { ..acc, answer: acc.answer.push(d.name.name) }
+        { ..acc, result: acc.result.push(d.name.name) }
       } else if d.params.fold(false, |found: Bool, p: Param|
           found || (match p.ty { Some(t) -> names_type(t, name), None -> false })) {
         { ..acc, take: acc.take.push(d.name.name) }
@@ -2680,13 +2773,13 @@ fn publishing(items: List<Item>, name: Bytes, span: Span) -> Opaque =
     })
 
 /// Each `opaque` type with what its module publishes for it.
-fn published(items: List<Item>) -> List<Item> =
+fn with_opaque_interfaces(items: List<Item>) -> List<Item> =
   if !items.fold(false, |any: Bool, item: Item|
-      any || (match item { IType(d) -> d.opaque != None, _ -> false })) { items } else {
+      any || (match item { TypeItem(d) -> d.opaque != None, _ -> false })) { items } else {
     items.map(|item: Item|
       match item {
-        IType(d) -> match d.opaque {
-          Some(o) -> IType({ ..d, opaque: Some(publishing(items, d.name.name, o.span)) }),
+        TypeItem(d) -> match d.opaque {
+          Some(o) -> TypeItem({ ..d, opaque: Some(opaque_interface(items, d.name.name, o.span)) }),
           None -> item,
         },
         _ -> item,
@@ -2698,12 +2791,12 @@ fn published(items: List<Item>) -> List<Item> =
 /// tests of a module share a name, whichever labels the checker lets them share.
 fn named_tests(items: List<Item>) -> List<Item> / {abort.raise} = {
   let written = items.fold(Map::new(), |acc: Map<Bytes, Bool>, item: Item|
-    match item { ITest(d) -> acc.insert(d.label, true), _ -> acc });
+    match item { TestItem(d) -> acc.insert(d.label, true), _ -> acc });
   let walked = items.fold(
     { named: Map::new(), items: [] },
     |acc: { named: Map<Bytes, Bool>, items: List<Item> }, item: Item|
       match item {
-        ITest(d) -> {
+        TestItem(d) -> {
           let name = if !acc.named.contains(d.label) { d.label } else {
             iterate(2, written.len() + acc.named.len() + 1, |n: Int| {
               let counted = Bytes::concat_all([
@@ -2716,7 +2809,10 @@ fn named_tests(items: List<Item>) -> List<Item> / {abort.raise} = {
               else { Stop(counted) }
             })
           };
-          { named: acc.named.insert(name, true), items: acc.items.push(ITest({ ..d, name: name })) }
+          {
+            named: acc.named.insert(name, true),
+            items: acc.items.push(TestItem({ ..d, name: name })),
+          }
         },
         _ -> { ..acc, items: acc.items.push(item) },
       },
@@ -2729,7 +2825,7 @@ fn named_tests(items: List<Item>) -> List<Item> / {abort.raise} = {
 /// written, so the label cannot be shared.
 pub fn cases_form(c: Cases) -> Option<Bytes> / {abort.raise} =
   match c.label {
-    ELit(_) -> None,
+    LiteralExpression(_) -> None,
     _ -> Some(erase_spans(dump_ty(c.ty).concat(dump_expr(c.table)))),
   }
 
@@ -2739,13 +2835,13 @@ fn first_cases(items: List<Item>) -> Option<Span> =
     match acc {
       Some(_) -> acc,
       None -> match item {
-        ITest(d) -> match d.cases { Some(c) -> Some(c.for_span), None -> None },
+        TestItem(d) -> match d.cases { Some(c) -> Some(c.for_span), None -> None },
         _ -> None,
       },
     })
 
 /// Where the module first interpolates, which calls into `std.show`.
-fn first_shown(input: Input) -> Option<Span> / {abort.raise} =
+fn first_interpolation(input: Input) -> Option<Span> / {abort.raise} =
   input.tokens.fold(None, |acc: Option<Span>, token: Token|
     match acc {
       Some(_) -> acc,
@@ -2761,14 +2857,17 @@ fn first_shown(input: Input) -> Option<Span> / {abort.raise} =
 fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDecl =
   {
     path: [{ name: b"std", span: span }, { name: module, span: span }],
-    kind: IAlias({ name: binder, span: span }),
+    kind: ModuleAlias({ name: binder, span: span }),
     span: span,
   }
 
 /// Whether the module's text writes `decl`: neither an import a parse adds for what the text calls
 /// into nor the prelude's, which every module imports.
 pub fn is_written(decl: ImportDecl) -> Bool =
-  match decl.kind { IAlias(a) -> !hidden_binder(a.name) && a.name != prelude_binder(), _ -> true }
+  match decl.kind {
+    ModuleAlias(a) -> !is_hidden_binder(a.name) && a.name != prelude_binder(),
+    _ -> true,
+  }
 
 /// Where `header`'s walk over a module's tokens stands, and the first of each hidden import it found.
 type HeaderScan = { at: Int, whole: Bool, shown: Option<Span>, cased: Option<Span> }
@@ -2801,7 +2900,7 @@ pub fn header_of(input: Input, parser: Parser) -> Option<Module> / {abort.raise}
         _ -> Continue({ at: p.at + 1, depth: p.depth }),
       }).at;
   // One walk over the tokens, which stops where only a whole parse can say what the module imports.
-  let scanned = iterate(
+  let scan_items = iterate(
     { at: 0, whole: false, shown: None, cased: None },
     n + 1,
     |h: HeaderScan|
@@ -2836,22 +2935,22 @@ pub fn header_of(input: Input, parser: Parser) -> Option<Module> / {abort.raise}
         })
       },
   );
-  if scanned.whole { None } else {
-    let with_shown = match scanned.shown {
+  if scan_items.whole { None } else {
+    let with_shown = match scan_items.shown {
       None -> leading.node,
-      Some(sp) -> leading.node.push(hidden_import(b"show", shown_binder(), sp)),
+      Some(sp) -> leading.node.push(hidden_import(b"show", show_binder(), sp)),
     };
-    let with_cased = match scanned.cased {
+    let with_cased = match scan_items.cased {
       None -> with_shown,
       Some(sp) -> with_shown.push(hidden_import(b"cases", cases_binder(), sp)),
     };
-    let with_set = match first_set(input) {
+    let with_set = match first_set_literal(input) {
       None -> with_cased,
       Some(sp) -> with_cased.push(hidden_import(b"set", set_binder(), sp)),
     };
     Some({
       doc: module_doc(input),
-      imports: with_set.concat(free_imports(input, with_set)),
+      imports: with_set.concat(implicit_imports(input, with_set)),
       items: [],
     })
   }
@@ -2861,7 +2960,7 @@ test "a name read with no import pulls its module, and one the module declares o
   let freed = |src: Bytes|
     parse(src).node.imports.fold([], |acc: List<Bytes>, d: ImportDecl|
       match d.kind {
-        IAlias(a) -> if a.name.starts_with(b"?free.") { acc.push(a.name) } else { acc },
+        ModuleAlias(a) -> if a.name.starts_with(b"?free.") { acc.push(a.name) } else { acc },
         _ -> acc,
       });
   assert_eq(freed(b"fn main() -> Unit / {Console} = print(\"hi\")\n"), [b"?free.console"]);
@@ -2893,16 +2992,16 @@ type Scan = {
   base: TokenKind,
   behind: TokenKind,
   starts: List<Int>,
-  spelt: List<Spelt>,
-  sighted: List<Int>,
+  name_uses: List<NameUse>,
+  method_call_items: List<Int>,
 }
 
-type Spelt = { piece: Int, name: Bytes }
+type NameUse = { piece: Int, name: Bytes }
 
-/// `Exercised` is a `test` or a `law`; `Private` a function or a type no `pub` opens, with the names
-/// it declares; `Imported` an `import`, with the names it binds; `Held` anything else, which an
+/// `TestOrLaw` is a `test` or a `law`; `PrivateItem` a function or a type no `pub` opens, with the names
+/// it declares; `ImportItem` an `import`, with the names it binds; `ExportedItem` anything else, which an
 /// importer reads, a `derive` among them, since what it makes is called by names no source spells.
-type PieceKind = | Exercised | Private(List<Bytes>) | Imported(List<Bytes>) | Held
+type ItemKind = | TestOrLaw | PrivateItem(List<Bytes>) | ImportItem(List<Bytes>) | ExportedItem
 
 /// The spans of `src` that a module importing it reads nothing of: each `test` and `law`; each
 /// private function and type that nothing an importer reads spells, directly or through others; and
@@ -2911,10 +3010,10 @@ type PieceKind = | Exercised | Private(List<Bytes>) | Imported(List<Bytes>) | He
 /// item, so the item's own comments go with it, to the end of the item's last token. The items are
 /// found from the tokens alone, without a parse, and any identifier left that spells a name keeps
 /// what declares it.
-pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
+pub fn unread_by_importers(src: Bytes) -> List<Span> / {abort.raise} = {
   let s = start(src);
   let input = s.input;
-  let scan = scanned(input, s.parser, standing(input, importing(input)));
+  let scan = scan_items(input, s.parser, bindable_names(input, tokens_in_imports(input)));
   let count = scan.starts.len();
   let firsts = Array::of_list(scan.starts);
   let end = ending(input);
@@ -2922,21 +3021,21 @@ pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
   let kinds = Array::of_list(
     range(0, count).map(|j: Int| piece_kind(input, at_pos(s.parser, firsts.get(j)), lasts.get(j))),
   );
-  let kept = reached(kinds, reaches(kinds, scan.spelt));
+  let kept = reachable_items(kinds, reference_edges(kinds, scan.name_uses));
   let bound = range(0, count).fold(Map::new(), |acc: Map<Bytes, Bool>, j: Int|
     match kinds.get(j) {
-      Imported(names) -> names.fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)),
+      ImportItem(names) -> names.fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)),
       _ -> acc,
     });
-  let used = scan.spelt.fold(Map::new(), |acc: Map<Bytes, Bool>, sp: Spelt|
+  let used = scan.name_uses.fold(Map::new(), |acc: Map<Bytes, Bool>, sp: NameUse|
     if kept.get(sp.piece) && bound.contains(sp.name) { acc.insert(sp.name, true) } else { acc });
-  let sighted = scan.sighted.fold(false, |any: Bool, piece: Int| any || kept.get(piece));
+  let sighted = scan.method_call_items.fold(false, |any: Bool, piece: Int| any || kept.get(piece));
   range(0, count).fold([], |acc: List<Span>, j: Int| {
     let cut = match kinds.get(j) {
-      Exercised -> true,
-      Private(_) -> !kept.get(j),
-      Imported(names) -> names.len() > 0 && !sighted && !names.any(|n: Bytes| used.contains(n)),
-      Held -> false,
+      TestOrLaw -> true,
+      PrivateItem(_) -> !kept.get(j),
+      ImportItem(names) -> names.len() > 0 && !sighted && !names.any(|n: Bytes| used.contains(n)),
+      ExportedItem -> false,
     };
     if cut {
       acc.push(span_between(before_piece(input, firsts.get(j)), token_at(input, lasts.get(j)).end))
@@ -2947,7 +3046,7 @@ pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
 /// Each name `input` writes where a local binding of it can stand: not after a dot or a `::`, not
 /// before a dot, not in an `import` (what `imported` flags), and not as the effect an `effect`
 /// declares. A name written nowhere so is an effect's or a module's, and a call on it a perform.
-fn standing(input: Input, imported: Array<Bool>) -> Map<Bytes, Bool> =
+fn bindable_names(input: Input, imported: Array<Bool>) -> Map<Bytes, Bool> =
   range(0, input.tokens.len()).fold(Map::new(), |names: Map<Bytes, Bool>, i: Int|
     match token_at(input, i).kind {
       Identifier(n) -> {
@@ -2960,7 +3059,7 @@ fn standing(input: Input, imported: Array<Bool>) -> Map<Bytes, Bool> =
       _ -> names,
     })
 
-fn scanned(input: Input, parser: Parser, bound: Map<Bytes, Bool>) -> Scan =
+fn scan_items(input: Input, parser: Parser, bound: Map<Bytes, Bool>) -> Scan =
   input.tokens.fold(
     {
       at: 0,
@@ -2970,18 +3069,18 @@ fn scanned(input: Input, parser: Parser, bound: Map<Bytes, Bool>) -> Scan =
       base: EndOfInput,
       behind: EndOfInput,
       starts: [],
-      spelt: [],
-      sighted: [],
+      name_uses: [],
+      method_call_items: [],
     },
     |s: Scan, t: Token| {
       let k = t.kind;
-      let starts = if s.depth == 0 && may_start(k) && !modifies(s.prev)
+      let starts = if s.depth == 0 && may_start(k) && !is_item_modifier(s.prev)
           && at_item_start(input, at_pos(parser, s.at)) { s.starts.push(s.at) }
       else { s.starts };
       let spelt = match k {
-        Identifier(n) -> if starts.len() == 0 { s.spelt }
-        else { s.spelt.push({ piece: starts.len() - 1, name: n }) },
-        _ -> s.spelt,
+        Identifier(n) -> if starts.len() == 0 { s.name_uses }
+        else { s.name_uses.push({ piece: starts.len() - 1, name: n }) },
+        _ -> s.name_uses,
       };
       // `value.name(` and `value.name[`, where the value is no bare name the text never binds,
       // and `Type::name`.
@@ -3004,9 +3103,10 @@ fn scanned(input: Input, parser: Parser, bound: Map<Bytes, Bool>) -> Scan =
         base: s.before,
         behind: s.base,
         starts: starts,
-        spelt: spelt,
-        sighted: if reads && starts.len() > 0 { s.sighted.push(starts.len() - 1) }
-        else { s.sighted },
+        name_uses: spelt,
+        method_call_items: if reads && starts.len() > 0 {
+          s.method_call_items.push(starts.len() - 1)
+        } else { s.method_call_items },
       }
     },
   )
@@ -3030,7 +3130,7 @@ fn may_start(k: TokenKind) -> Bool =
 
 /// Whether a token makes the next part of an item already begun (`pub fn`, `reuse fn`, `opaque type`,
 /// `nondet effect`, `test/nondet`).
-fn modifies(k: TokenKind) -> Bool =
+fn is_item_modifier(k: TokenKind) -> Bool =
   match k {
     Identifier(n) ->
       n == b"reuse" || n == b"transparent" || n == b"const" || n == b"opaque" || n == b"extern",
@@ -3038,37 +3138,41 @@ fn modifies(k: TokenKind) -> Bool =
   }
 
 /// For each item, the private items it spells a name of.
-fn reaches(kinds: Array<PieceKind>, spelt: List<Spelt>) -> Array<List<Int>> / {abort.raise} = {
+fn reference_edges(
+  kinds: Array<ItemKind>,
+  spelt: List<NameUse>,
+) -> Array<List<Int>> / {abort.raise} = {
   let count = kinds.len();
   let declares = range(0, count).fold(Map::new(), |acc: Map<Bytes, List<Int>>, j: Int|
     match kinds.get(j) {
-      Private(names) ->
+      PrivateItem(names) ->
         names.fold(acc, |a: Map<Bytes, List<Int>>, n: Bytes|
           a.insert(n, List::push(match a.get(n) { Some(js) -> js, None -> [] }, j))),
       _ -> acc,
     });
-  spelt.fold(Array::new(count, []), |acc: Array<List<Int>>, sp: Spelt|
+  spelt.fold(Array::new(count, []), |acc: Array<List<Int>>, sp: NameUse|
     match declares.get(sp.name) {
       Some(js) -> acc.set(sp.piece, acc.get(sp.piece).concat(js)),
       None -> acc,
     })
 }
 
-/// Which items an importer reads: every `Held` one, and each private one an item it reads spells.
-fn reached(kinds: Array<PieceKind>, edges: Array<List<Int>>) -> Array<Bool> / {abort.raise} = {
+/// Which items an importer reads: every `ExportedItem` one, and each private one an item it reads spells.
+fn reachable_items(kinds: Array<ItemKind>, edges: Array<List<Int>>) -> Array<Bool> / {abort.raise} = {
   let count = kinds.len();
-  let roots = range(0, count).filter(|j: Int| match kinds.get(j) { Held -> true, _ -> false });
+  let roots = range(0, count).filter(|j: Int|
+    match kinds.get(j) { ExportedItem -> true, _ -> false });
   iterate(
     {
       kept: roots.fold(Array::new(count, false), |k: Array<Bool>, j: Int| k.set(j, true)),
       frontier: roots,
     },
     count + 2,
-    |st: Reach|
+    |st: ReachState|
       if st.frontier.len() == 0 { Stop(st.kept) } else {
         Continue(
-          st.frontier.fold({ kept: st.kept, frontier: [] }, |acc: Reach, j: Int|
-            edges.get(j).fold(acc, |a: Reach, q: Int|
+          st.frontier.fold({ kept: st.kept, frontier: [] }, |acc: ReachState, j: Int|
+            edges.get(j).fold(acc, |a: ReachState, q: Int|
               if a.kept.get(q) { a }
               else { { kept: a.kept.set(q, true), frontier: a.frontier.push(q) } })),
         )
@@ -3077,7 +3181,7 @@ fn reached(kinds: Array<PieceKind>, edges: Array<List<Int>>) -> Array<Bool> / {a
 }
 
 /// The items found to be read so far, and those just found, whose names are yet to be followed.
-type Reach = { kept: Array<Bool>, frontier: List<Int> }
+type ReachState = { kept: Array<Bool>, frontier: List<Int> }
 
 fn token_at(input: Input, i: Int) -> Token =
   match input.tokens.at(i) { Some(t) -> t, None -> { start: 0, end: 0, kind: EndOfInput } }
@@ -3107,25 +3211,28 @@ fn depth_after(depth: Int, k: TokenKind) -> Int =
     _ -> depth,
   }
 
-fn piece_kind(input: Input, here: Parser, last: Int) -> PieceKind / {abort.raise} = {
+fn piece_kind(input: Input, here: Parser, last: Int) -> ItemKind / {abort.raise} = {
   let k = token_kind(input, here);
-  if k == keyword_test() || at_law_start(input, here) { Exercised } else if k == keyword_import() {
-    match import_decl(input, here) { Ok(d) -> Imported(bound_by(d.node)), Err(_) -> Held }
+  if k == keyword_test() || at_law_start(input, here) { TestOrLaw } else if k == keyword_import() {
+    match import_decl(input, here) { Ok(d) -> ImportItem(bound_by(d.node)), Err(_) -> ExportedItem }
   } else if k == keyword_type() || at_opaque_start(input, here) {
-    Private(type_names(input, here.pos, last))
+    PrivateItem(type_names(input, here.pos, last))
   } else if k == keyword_fn() || at_reuse_start(input, here) || at_transparent_start(input, here)
       || at_const_start(input, here) {
-    match ident_after(input, here.pos, last, keyword_fn()) { Some(n) -> Private([n]), None -> Held }
-  } else { Held }
+    match ident_after(input, here.pos, last, keyword_fn()) {
+      Some(n) -> PrivateItem([n]),
+      None -> ExportedItem,
+    }
+  } else { ExportedItem }
 }
 
 /// The names an `import` binds: the module's last segment, the name it binds it as, or each name
 /// it selects.
 fn bound_by(d: ImportDecl) -> List<Bytes> =
   match d.kind {
-    IModule -> match d.path.at(d.path.len() - 1) { Some(seg) -> [seg.name], None -> [] },
-    IAlias(a) -> [a.name],
-    INames(ns) -> ns.map(|n: Ident| n.name),
+    WholeModule -> match d.path.at(d.path.len() - 1) { Some(seg) -> [seg.name], None -> [] },
+    ModuleAlias(a) -> [a.name],
+    SelectedNames(ns) -> ns.map(|n: Ident| n.name),
   }
 
 /// The identifier right after the first token of kind `k` among `first` to `last`.
@@ -3155,14 +3262,15 @@ fn type_names(input: Input, first: Int, last: Int) -> List<Bytes> = {
 
 /// What `src` parses to. The text of `std.prelude` as the toolchain ships it, which every program
 /// reads, is parsed once a process.
-pub fn parse(src: Bytes) -> Parsed<Module> / {abort.raise} =
+pub fn parse(src: Bytes) -> ParseOutput<Module> / {abort.raise} =
   if src == prelude_source::text() { prelude_parse() } else { parse_started(start(src)) }
 
-fn prelude_parse() -> Parsed<Module> / {abort.raise} = parse_started(start(prelude_source::text()))
+fn prelude_parse() -> ParseOutput<Module> / {abort.raise} =
+  parse_started(start(prelude_source::text()))
 
 /// [`parse`] of the text `s` began.
-pub fn parse_started(s: ParseStart) -> Parsed<Module> / {abort.raise} = {
-  let r = run(s.input, s.parser);
+pub fn parse_started(s: ParseStart) -> ParseOutput<Module> / {abort.raise} = {
+  let r = parse_module(s.input, s.parser);
   if r.parser.diags.len() > 0 { r }
   else { { parser: stray_docs(s.input, r.parser, r.node), node: r.node } }
 }
@@ -3174,27 +3282,27 @@ fn opt_doc(doc: Option<Doc>) -> List<Doc> = match doc { Some(d) -> [d], None -> 
 /// In source order: a declaration's own doc, then those of its variants, fields or operations.
 fn item_docs(item: Item) -> List<Doc> = {
   let inner = match item {
-    IType(d) -> match d.body {
-      TDSum(vs) ->
+    TypeItem(d) -> match d.body {
+      SumBody(vs) ->
         vs.fold([], |acc: List<Doc>, v: VariantDef|
           match v.doc { Some(x) -> acc.push(x), None -> acc }),
-      TDAlias(_) -> d.field_docs.map(|f: FieldDoc| f.doc),
-      TDNominal(_) -> d.field_docs.map(|f: FieldDoc| f.doc),
-      TDExtern -> [],
+      AliasBody(_) -> d.field_docs.map(|f: FieldDoc| f.doc),
+      NominalBody(_) -> d.field_docs.map(|f: FieldDoc| f.doc),
+      ExternBody -> [],
     },
-    IEffect(d) ->
-      d.ops.fold([], |acc: List<Doc>, o: OpDef|
+    EffectItem(d) ->
+      d.operations.fold([], |acc: List<Doc>, o: OpDef|
         match o.doc { Some(x) -> acc.push(x), None -> acc }),
     _ -> [],
   };
   inner.fold(opt_doc(item_doc(item)), |acc: List<Doc>, x: Doc| acc.push(x))
 }
 
-fn holds(doc: Doc, c: Comment) -> Bool = doc.span.start <= c.start && c.end <= doc.span.end
+fn doc_contains(doc: Doc, c: Comment) -> Bool = doc.span.start <= c.start && c.end <= doc.span.end
 
 /// `next` indexes the first held doc not wholly before the comment; `last` ends the stray line
 /// before, which a stray line in the same gap continues rather than reports again.
-type StrayWalk = { next: Int, last: Int, parser: Parser }
+type StrayDocScan = { next: Int, last: Int, parser: Parser }
 
 fn stray_doc(mark: DocMark, c: Comment) -> ParseDiag =
   match mark {
@@ -3225,7 +3333,7 @@ fn stray_docs(input: Input, parser: Parser, module: Module) -> Parser / {abort.r
     item_docs(it).fold(acc, |a: List<Doc>, x: Doc| a.push(x)));
   let walked = input.comments.fold(
     { next: 0, last: -1, parser: parser },
-    |s: StrayWalk, c: Comment|
+    |s: StrayDocScan, c: Comment|
       match doc_mark(input.source, c) {
         None -> s,
         Some(mark) -> {
@@ -3235,8 +3343,8 @@ fn stray_docs(input: Input, parser: Parser, module: Module) -> Parser / {abort.r
               None -> Stop(i),
             });
           let inside = match mark {
-            ItemDoc -> match held.at(k) { Some(d) -> holds(d, c), None -> false },
-            ModuleDoc -> match module.doc { Some(d) -> holds(d, c), None -> false },
+            ItemDoc -> match held.at(k) { Some(d) -> doc_contains(d, c), None -> false },
+            ModuleDoc -> match module.doc { Some(d) -> doc_contains(d, c), None -> false },
           };
           if inside { { next: k, last: -1, parser: s.parser } }
           else if s.last >= 0 && !token_between(input, s.last, c.start) {
@@ -3250,24 +3358,24 @@ fn stray_docs(input: Input, parser: Parser, module: Module) -> Parser / {abort.r
 
 // --- The dump ---------------------------------------------------------------
 
-pub fn dump_vis(v: Vis) -> Bytes =
-  match v { VPub -> dump_word(b"pub"), VPriv -> dump_word(b"priv") }
+pub fn dump_visibility(v: Visibility) -> Bytes =
+  match v { Public -> dump_word(b"pub"), Private -> dump_word(b"priv") }
 
 pub fn dump_deriver(deriver: Deriver) -> Bytes = dump_word(deriver_text(deriver))
 
 pub fn dump_spec_kind(k: SpecKind) -> Bytes =
   match k {
-    SRequires -> dump_word(b"requires"),
-    SEnsures -> dump_word(b"ensures"),
-    SCost -> dump_word(b"cost"),
-    SSpace -> dump_word(b"space"),
+    RequiresClause -> dump_word(b"requires"),
+    EnsuresClause -> dump_word(b"ensures"),
+    CostClause -> dump_word(b"cost"),
+    SpaceClause -> dump_word(b"space"),
   }
 
 pub fn dump_import_kind(kind: ImportKind) -> Bytes / {abort.raise} =
   match kind {
-    IModule -> dump_word(b"mod"),
-    IAlias(a) -> dump_word(b"alias").concat(dump_ident(a)),
-    INames(ns) -> dump_word(b"names").concat(dump_list(ns, dump_ident)),
+    WholeModule -> dump_word(b"mod"),
+    ModuleAlias(a) -> dump_word(b"alias").concat(dump_ident(a)),
+    SelectedNames(ns) -> dump_word(b"names").concat(dump_list(ns, dump_ident)),
   }
 
 pub fn dump_import(decl: ImportDecl) -> Bytes / {abort.raise} =
@@ -3305,7 +3413,7 @@ pub fn dump_returns(r: Returns) -> Bytes / {abort.raise} =
 pub fn dump_fn(def: FnDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(def.span, b"fn"),
-    dump_vis(def.vis),
+    dump_visibility(def.visibility),
     dump_opt(def.reuse, dump_reuse),
     dump_opt(def.transparent, dump_transparent),
     dump_opt(def.returns, dump_returns),
@@ -3348,7 +3456,7 @@ pub fn dump_law(law_def: LawDef) -> Bytes / {abort.raise} =
 pub fn dump_schema(d: SchemaDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(d.span, b"sch"),
-    dump_vis(d.vis),
+    dump_visibility(d.visibility),
     dump_ident(d.name),
     dump_generics(d.generics),
     dump_list(d.params, dump_binder),
@@ -3369,10 +3477,10 @@ pub fn dump_variant(variant: VariantDef) -> Bytes / {abort.raise} =
 
 pub fn dump_type_body(b: TypeDefBody) -> Bytes / {abort.raise} =
   match b {
-    TDAlias(t) -> dump_word(b"alias").concat(dump_ty(t)),
-    TDSum(vs) -> dump_word(b"sum").concat(dump_list(vs, dump_variant)),
-    TDNominal(t) -> dump_word(b"new").concat(dump_ty(t)),
-    TDExtern -> dump_word(b"extern"),
+    AliasBody(t) -> dump_word(b"alias").concat(dump_ty(t)),
+    SumBody(vs) -> dump_word(b"sum").concat(dump_list(vs, dump_variant)),
+    NominalBody(t) -> dump_word(b"new").concat(dump_ty(t)),
+    ExternBody -> dump_word(b"extern"),
   }
 
 /// Dumped only where it is written, so a declaration without it dumps as it always has.
@@ -3381,7 +3489,7 @@ pub fn dump_opaque(span: Span) -> Bytes = dump_node(span, b"opq")
 pub fn dump_type(type_def: TypeDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(type_def.span, b"ty"),
-    dump_vis(type_def.vis),
+    dump_visibility(type_def.visibility),
     match type_def.opaque { Some(o) -> dump_opaque(o.span), None -> b"" },
     dump_ident(type_def.name),
     dump_generics(type_def.generics),
@@ -3412,10 +3520,10 @@ pub fn dump_op(op: OpDef) -> Bytes / {abort.raise} =
 pub fn dump_effect(effect_def: EffectDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(effect_def.span, b"eff"),
-    dump_vis(effect_def.vis),
+    dump_visibility(effect_def.visibility),
     dump_ident(effect_def.name),
     dump_bool(effect_def.is_nondet),
-    dump_list(effect_def.ops, dump_op),
+    dump_list(effect_def.operations, dump_op),
     dump_doc_if(effect_def.doc),
   ])
 
@@ -3450,7 +3558,7 @@ pub fn dump_derive(d: DeriveDef) -> Bytes / {abort.raise} =
 pub fn dump_effect_set(d: EffectSetDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(d.span, b"set"),
-    dump_vis(d.vis),
+    dump_visibility(d.visibility),
     dump_ident(d.name),
     dump_list(d.atoms, dump_atom),
     dump_list(d.includes, dump_qname),
@@ -3461,7 +3569,7 @@ pub fn dump_effect_set(d: EffectSetDef) -> Bytes / {abort.raise} =
 pub fn dump_extern(d: ExternDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(d.span, b"ext"),
-    dump_vis(d.vis),
+    dump_visibility(d.visibility),
     dump_ident(d.name),
     dump_generics(d.generics),
     dump_list(d.params, dump_param),
@@ -3484,22 +3592,22 @@ pub fn dump_numeric(d: NumericDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(d.span, b"num"),
     dump_ident(d.target),
-    dump_list(d.ops, |x: NumericOp| dump_ident(x.op).concat(dump_ident(x.by))),
+    dump_list(d.operations, |x: NumericOp| dump_ident(x.op).concat(dump_ident(x.by))),
   ])
 
 pub fn dump_item(item: Item) -> Bytes / {abort.raise} =
   match item {
-    IFn(d) -> dump_fn(d),
-    IType(d) -> dump_type(d),
-    IEffect(d) -> dump_effect(d),
-    ITest(d) -> dump_test(d),
-    ILaw(d) -> dump_law(d),
-    ISchema(d) -> dump_schema(d),
-    IDerive(d) -> dump_derive(d),
-    IEffectSet(d) -> dump_effect_set(d),
-    IExtern(d) -> dump_extern(d),
-    IInstance(d) -> dump_instance(d),
-    INumeric(d) -> dump_numeric(d),
+    FunctionItem(d) -> dump_fn(d),
+    TypeItem(d) -> dump_type(d),
+    EffectItem(d) -> dump_effect(d),
+    TestItem(d) -> dump_test(d),
+    LawItem(d) -> dump_law(d),
+    SchemaItem(d) -> dump_schema(d),
+    DeriveItem(d) -> dump_derive(d),
+    EffectSetItem(d) -> dump_effect_set(d),
+    ExternItem(d) -> dump_extern(d),
+    InstanceItem(d) -> dump_instance(d),
+    NumericItem(d) -> dump_numeric(d),
   }
 
 pub fn dump_module(module: Module) -> Bytes / {abort.raise} =
@@ -3519,7 +3627,7 @@ pub fn dump(src: Bytes) -> String / {abort.raise} = {
   String::of_bytes(dump_module(r.node).concat(dump_diags(r.parser.diags)))
 }
 
-pub fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
+pub fn is_pub(v: Visibility) -> Bool = match v { Public -> true, Private -> false }
 
 /// Whether `name` is a module of the standard library.
 pub fn is_std(name: Bytes) -> Bool = name == b"std" || name.starts_with(b"std.")
@@ -3532,7 +3640,12 @@ pub fn is_compiler(name: Bytes) -> Bool = name == b"compiler" || name.starts_wit
 pub fn is_shipped(name: Bytes) -> Bool = is_std(name) || is_compiler(name)
 
 pub fn spec_kind_text(k: SpecKind) -> Bytes =
-  match k { SRequires -> b"requires", SEnsures -> b"ensures", SCost -> b"cost", SSpace -> b"space" }
+  match k {
+    RequiresClause -> b"requires",
+    EnsuresClause -> b"ensures",
+    CostClause -> b"cost",
+    SpaceClause -> b"space",
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -3549,7 +3662,7 @@ test "a type carries a where clause" {
   );
   assert_eq(r.parser.diags.len(), 0);
   let tys = r.node.items.fold([], |acc: List<TypeDef>, it: Item|
-    match it { IType(d) -> acc.push(d), _ -> acc });
+    match it { TypeItem(d) -> acc.push(d), _ -> acc });
   assert_eq(tys.len(), 3);
   assert_eq(tys.get(0).constraints.len(), 2);
   assert_eq(tys.get(0).constraints.get(0).param.name, b"a");
@@ -3669,12 +3782,12 @@ test "`opaque` before `type` closes a sum or a `new` record, never an alias, and
   assert_eq(refused(b"pub opaque type T = Int\n"), [b"E0221"]);
   assert_eq(refused(b"opaque type T = { a: Int }\n"), [b"E0221"]);
   assert_eq(refused(b"fn opaque(opaque: Int) -> Int = opaque\n"), []);
-  let published = parse(
+  let with_opaque_interfaces = parse(
     b"pub opaque type T = | T(Int)\npub fn make() -> Option<T> = None\nfn kept(t: T) -> T = t\npub fn read(t: T) -> Int = 1\npub fn other() -> Int = 1\n",
   );
-  match item_at_index(published.node, 0) {
-    IType(d) ->
-      assert_eq(d.opaque, Some({ span: span_between(4, 10), answer: [b"make"], take: [b"read"] })),
+  match item_at_index(with_opaque_interfaces.node, 0) {
+    TypeItem(d) ->
+      assert_eq(d.opaque, Some({ span: span_between(4, 10), result: [b"make"], take: [b"read"] })),
     _ -> panic("the first item is `T`"),
   }
 }
@@ -3807,7 +3920,7 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
   let r = parse(b"test/nondet \"n {c.n}\" for c: Row in rows() { assert(c.ok) }\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [ITest(d)] -> {
+    [TestItem(d)] -> {
       assert_eq(d.label, b"n {c.n}");
       assert_eq(d.name, b"n {c.n}");
       assert_eq(d.label_span, span_between(12, 21));
@@ -3835,7 +3948,7 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
 test "a test whose label an earlier test has is named by the label and a count, and keeps its label" {
   let tests = |src: Bytes|
     parse(src).node.items.fold([], |acc: List<Bytes>, item: Item|
-      match item { ITest(d) -> acc.push(d.label.concat(b" -> ").concat(d.name)), _ -> acc });
+      match item { TestItem(d) -> acc.push(d.label.concat(b" -> ").concat(d.name)), _ -> acc });
   let over = |label: Bytes|
     Bytes::concat_all([b"test \"", label, b"\" for n: Int in [1] { () }\n"]);
   let plain = |label: Bytes| Bytes::concat_all([b"test \"", label, b"\" { () }\n"]);
@@ -3855,7 +3968,7 @@ test "a test whose label an earlier test has is named by the label and a count, 
 test "two tests over cases may share a label only where its holes run over different tables" {
   let form = |src: Bytes|
     match parse(src).node.items {
-      [ITest(d)] -> match d.cases { Some(c) -> cases_form(c), None -> None },
+      [TestItem(d)] -> match d.cases { Some(c) -> cases_form(c), None -> None },
       _ -> panic("one test"),
     };
   assert_eq(form(b"test \"a\" for n: Int in [1] { () }\n"), None);
@@ -3902,13 +4015,13 @@ test "an `extern type` is a type with parameters and no body, `pub` where it is 
   let r = parse(b"pub extern type Node<a>\nextern type Hidden\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IType(d), IType(h)] -> {
-      assert(match d.body { TDExtern -> true, _ -> false });
-      assert_eq(d.vis, VPub);
+    [TypeItem(d), TypeItem(h)] -> {
+      assert(match d.body { ExternBody -> true, _ -> false });
+      assert_eq(d.visibility, Public);
       assert_eq(d.name.name, b"Node");
       assert_eq(d.generics.types.map(|i: Ident| i.name), [b"a"]);
       assert_eq(d.span, span_between(4, 23));
-      assert_eq(h.vis, VPriv)
+      assert_eq(h.visibility, Private)
     },
     _ -> panic("two `extern type`s"),
   };
@@ -3921,7 +4034,7 @@ test "an `extern fn` is a declaration: generics, parameters, an answer, a row an
   );
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IExtern(d), IFn(g)] -> {
+    [ExternItem(d), FunctionItem(g)] -> {
       assert_eq(d.name.name, b"List::map");
       assert_eq(d.generics.types.map(|i: Ident| i.name), [b"a", b"b"]);
       assert_eq(d.generics.effects.map(|i: Ident| i.name), [b"e"]);
@@ -3940,8 +4053,8 @@ test "an `extern fn` states where a call cannot raise and what it answers" {
   );
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IExtern(d), IExtern(g)] -> {
-      assert_eq(d.spec.map(|c: SpecClause| c.kind), [SRequires, SEnsures]);
+    [ExternItem(d), ExternItem(g)] -> {
+      assert_eq(d.spec.map(|c: SpecClause| c.kind), [RequiresClause, EnsuresClause]);
       assert_eq(d.span, span_between(0, 121));
       assert_eq(g.spec.len(), 0)
     },
@@ -3953,7 +4066,7 @@ test "an `extern fn`'s parameter may be written `keep`" {
   let r = parse(b"extern fn hold<a>(f: keep (a) -> a, g: (a) -> a) -> Unit\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IExtern(d)] -> assert_eq(d.params.map(|p: Param| p.keep), [true, false]),
+    [ExternItem(d)] -> assert_eq(d.params.map(|p: Param| p.keep), [true, false]),
     _ -> panic("one `extern fn`"),
   };
   // The checker judges what `keep` stands before.
@@ -3970,8 +4083,8 @@ test "an `extern fn` writes every type, may be `pub`, and keeps its text from `e
   let r = parse(b"pub extern fn f(x: Int) -> Int\n  requires x > 0\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IExtern(d)] -> {
-      assert_eq(d.vis, VPub);
+    [ExternItem(d)] -> {
+      assert_eq(d.visibility, Public);
       assert_eq(d.written, b"extern fn f(x: Int) -> Int\n  requires x > 0");
       assert_eq(d.span, span_between(4, 47))
     },
@@ -4020,8 +4133,8 @@ fn written_where(
       errors: r.parser.diags.len(),
     };
   match r.node.items.at(0) {
-    Some(ILaw(d)) -> named({ identities: d.identities, guard: d.guard }),
-    Some(ISchema(d)) -> named({ identities: d.identities, guard: d.guard }),
+    Some(LawItem(d)) -> named({ identities: d.identities, guard: d.guard }),
+    Some(SchemaItem(d)) -> named({ identities: d.identities, guard: d.guard }),
     _ -> { identities: [], guarded: false, errors: r.parser.diags.len() },
   }
 }
@@ -4095,14 +4208,14 @@ test "a `///` block documents the declaration below it and `//!` lines the modul
   let m = r.node;
   assert_eq(doc_lines(m.doc), [b"The module.", b"Second line."]);
   match item_at_index(m, 0) {
-    IFn(d) -> assert_eq(doc_lines(d.doc), [b"One fn.", b"", b"More."]),
+    FunctionItem(d) -> assert_eq(doc_lines(d.doc), [b"One fn.", b"", b"More."]),
     _ -> panic("the first item is `f`"),
   };
   match item_at_index(m, 1) {
-    IType(d) -> {
+    TypeItem(d) -> {
       assert_eq(doc_lines(d.doc), [b"A type."]);
       match d.body {
-        TDSum(vs) ->
+        SumBody(vs) ->
           assert_eq(vs.map(|v: VariantDef| doc_lines(v.doc)), [[b"The first."], [b"The second."]]),
         _ -> panic("`T` is a sum"),
       }
@@ -4110,7 +4223,7 @@ test "a `///` block documents the declaration below it and `//!` lines the modul
     _ -> panic("the second item is `T`"),
   };
   match item_at_index(m, 2) {
-    IType(d) -> {
+    TypeItem(d) -> {
       assert_eq(doc_lines(d.doc), [b"A record."]);
       assert_eq(d.field_docs.map(|f: FieldDoc| { name: f.name, lines: f.doc.lines }), [
         { name: b"size", lines: [b"Its size."] },
@@ -4119,18 +4232,18 @@ test "a `///` block documents the declaration below it and `//!` lines the modul
     _ -> panic("the third item is `R`"),
   };
   match item_at_index(m, 3) {
-    IEffect(d) -> {
+    EffectItem(d) -> {
       assert_eq(doc_lines(d.doc), [b"An effect."]);
-      assert_eq(d.ops.map(|o: OpDef| doc_lines(o.doc)), [[b"Writes a line."], []])
+      assert_eq(d.operations.map(|o: OpDef| doc_lines(o.doc)), [[b"Writes a line."], []])
     },
     _ -> panic("the fourth item is `log`"),
   };
   match item_at_index(m, 4) {
-    IEffectSet(d) -> assert_eq(doc_lines(d.doc), [b"A set."]),
+    EffectSetItem(d) -> assert_eq(doc_lines(d.doc), [b"A set."]),
     _ -> panic("the fifth item is `Logs`"),
   };
   match item_at_index(m, 5) {
-    IFn(d) -> assert_eq(doc_lines(d.doc), [b"Spread", b"over a gap."]),
+    FunctionItem(d) -> assert_eq(doc_lines(d.doc), [b"Spread", b"over a gap."]),
     _ -> panic("the sixth item is `g`"),
   }
 }
@@ -4176,7 +4289,7 @@ test "a test over cases takes no doc either, above it or between its label and i
   // A plain comment there is trivia, and the label is still a template.
   let commented = parse(b"// over cases\ntest \"t {n}\" // then\nfor n: Int in [1] { () }\n");
   assert_eq(commented.parser.diags.len(), 0);
-  match commented.node.items { [ITest(d)] -> assert(d.cases != None), _ -> panic("one test") }
+  match commented.node.items { [TestItem(d)] -> assert(d.cases != None), _ -> panic("one test") }
 }
 
 test "a `///` block documents a `law schema`, and above an instantiation it documents nothing" {
@@ -4185,7 +4298,7 @@ test "a `///` block documents a `law schema`, and above an instantiation it docu
   );
   assert_eq(r.parser.diags.len(), 0);
   match item_at_index(r.node, 0) {
-    ISchema(d) -> assert_eq(doc_lines(d.doc), [b"What a codec is held to."]),
+    SchemaItem(d) -> assert_eq(doc_lines(d.doc), [b"What a codec is held to."]),
     _ -> assert(false),
   };
   assert_eq(
@@ -4202,9 +4315,9 @@ test "`numeric for T by { .. }` is an item, and `numeric` is still a constraint'
   );
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IType(_), INumeric(d), IFn(_)] -> {
+    [TypeItem(_), NumericItem(d), FunctionItem(_)] -> {
       assert_eq(d.target.name, b"T");
-      assert_eq(d.ops.map(|x: NumericOp| (x.op.name, x.by.name)), [
+      assert_eq(d.operations.map(|x: NumericOp| (x.op.name, x.by.name)), [
         (b"add", b"f"),
         (b"of_int", b"g"),
       ]);
@@ -4235,7 +4348,7 @@ test "`key for T by f` and `show for T by f` are items, and neither word is rese
   let r = parse(b"type T = | T(Int)\nkey for T by f\nshow for T by g\nfn f(t: T) -> Int = 0\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IType(_), IInstance(k), IInstance(s), IFn(_)] -> {
+    [TypeItem(_), InstanceItem(k), InstanceItem(s), FunctionItem(_)] -> {
       assert_eq(instance_text(k.kind), b"key");
       assert_eq(k.target.name, b"T");
       assert_eq(k.by.name, b"f");
@@ -4264,8 +4377,8 @@ test "`invariant for T by f` is an item, and `invariant` is not reserved" {
   let r = parse(b"pub opaque type T = | T(Int)\ninvariant for T by valid\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IType(_), IInstance(i)] -> {
-      assert_eq(i.kind, NInvariant);
+    [TypeItem(_), InstanceItem(i)] -> {
+      assert_eq(i.kind, InvariantInstance);
       assert_eq(instance_text(i.kind), b"invariant");
       assert_eq((i.target.name, i.by.name), (b"T", b"valid"))
     },
@@ -4293,8 +4406,8 @@ test "`host for e by f` is an item naming an effect, and `host` is not reserved"
   let r = parse(b"effect e {\n  read get() -> Int\n}\nhost for e by served\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
-    [IEffect(_), IInstance(h)] -> {
-      assert_eq(h.kind, NHost);
+    [EffectItem(_), InstanceItem(h)] -> {
+      assert_eq(h.kind, HostInstance);
       assert_eq(instance_text(h.kind), b"host");
       assert_eq((h.target.name, h.by.name), (b"e", b"served"))
     },
@@ -4318,8 +4431,8 @@ test "`host for e by f` is an item naming an effect, and `host` is not reserved"
 
 test "`release for T by f` is an item, and `release` is not reserved" {
   match parse(b"pub opaque type T = | T(Int)\nrelease for T by close\n").node.items {
-    [IType(_), IInstance(i)] ->
-      assert_eq((i.kind, i.target.name, i.by.name), (NRelease, b"T", b"close")),
+    [TypeItem(_), InstanceItem(i)] ->
+      assert_eq((i.kind, i.target.name, i.by.name), (ReleaseInstance, b"T", b"close")),
     _ -> panic("a type and a release"),
   };
   assert_eq(parse(b"fn release(release: Int) -> Int = release\n").parser.diags.len(), 0)
@@ -4406,7 +4519,7 @@ test "a module reads the scheduler where it writes `simulate` or performs `task`
 
 test "an importer reads no test or law, nor a private item or an import only they reach" {
   let src = b"//! A module.\n\nimport std.laws (agrees)\nimport std.bytes\n\n/// More.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + bytes::one()\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = thrice(x)\n\nfn thrice(x: Int) -> Int = x * 3\n\ntype Pair = { a: Int, b: Int }\n\n// --- Tests\n\ntest \"more\" {\n  assert_eq(more(twice(1)), 4)\n}\n\ntest/nondet \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n\nlaw \"pairs\" = agrees(|p: Pair| p.a, |p: Pair| p.a)\n";
-  assert_eq(unimported(src).map(|s: Span| src.slice(s.start, s.end)), [
+  assert_eq(unread_by_importers(src).map(|s: Span| src.slice(s.start, s.end)), [
     b"\n\nimport std.laws (agrees)",
     b"\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = thrice(x)",
     b"\n\nfn thrice(x: Int) -> Int = x * 3",
@@ -4417,18 +4530,18 @@ test "an importer reads no test or law, nor a private item or an import only the
   ]);
   // An item left that calls on a value, or through a type, reads every module the imports reach.
   let performs = b"import std.list\nimport std.process (process)\n\npub fn stop(text: String) -> Int / {abort.raise, process.out[proc]} = { process.out[proc](text); abort.raise(1) }\n";
-  assert_eq(unimported(performs).len(), 1);
+  assert_eq(unread_by_importers(performs).len(), 1);
   let through = b"import std.list\nimport std.laws (agrees)\n\npub fn second(xs: List<Int>) -> Option<Int> = xs.second()\n";
-  assert_eq(unimported(through), []);
+  assert_eq(unread_by_importers(through), []);
   let named = b"import std.list\n\npub fn second(xs: List<Int>) -> Option<Int> = List::second(xs)\n";
-  assert_eq(unimported(named), []);
+  assert_eq(unread_by_importers(named), []);
   let tested = b"import std.list\n\npub fn one() -> Int = 1\n\ntest \"second\" { assert_eq([1, 2].second(), Some(2)) }\n";
-  assert_eq(unimported(tested).len(), 2);
+  assert_eq(unread_by_importers(tested).len(), 2);
   // Whatever a `pub` item or a `derive` spells stays, and so does what that spells in turn.
   let held = b"import std.bin\n\ntype Kept = { a: Int }\n\nderive bin for Kept\n\nfn helper() -> Int = 1\n\npub fn shown() -> Int = helper()\n";
-  assert_eq(unimported(held), []);
+  assert_eq(unread_by_importers(held), []);
   let stated = b"pub opaque type Balance = | Balance(Int)\n\nfn valid(b: Balance) -> Bool = true\n\ntest \"valid\" { assert(valid(Balance(1))) }\n\ninvariant for Balance by valid\n";
-  assert_eq(unimported(stated).map(|s: Span| stated.slice(s.start, s.end)), [
+  assert_eq(unread_by_importers(stated).map(|s: Span| stated.slice(s.start, s.end)), [
     b"\n\ntest \"valid\" { assert(valid(Balance(1))) }",
   ])
 }

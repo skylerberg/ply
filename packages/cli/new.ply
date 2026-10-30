@@ -4,14 +4,14 @@
 
 import args (Flags, no_flags, style_of)
 import std.cli (Parsed, has, value)
-import diagnostic (Place)
-import paths (Rooted, child, create_dir, displayed, here, kind, rooted, write_file)
-import report (Answer, indent, ok_code, compile_error, schema_version, reported)
+import diagnostic (SourceText)
+import paths (RootedPath, child, create_dir, displayed, here, kind, rooted, write_file)
+import report (CommandOutput, indent, ok_code, compile_error, schema_version, reported)
 import std.term (Style)
 import surface
 import compiler.front.pkg (is_dotted_path)
 import compiler.check.resolve.tables (error_at)
-import std.fs (fs, Missing, MemFs, Written, mem_create_dir, mem_empty, mem_kind, mem_read,
+import std.fs (fs, Missing, MemFs, WriteResult, mem_create_dir, mem_empty, mem_kind, mem_read,
                mem_write)
 import std.json (Json, Array, Bool, Number, Str, object)
 import std.path (file_name)
@@ -28,15 +28,15 @@ pub fn options_from(p: Parsed) -> Options = { name: value(p, "name"), lib: has(p
 
 // --- Refusals -----------------------------------------------------------------
 
-fn at(path: String) -> Place = { path: path, text: b"" }
+fn at(path: String) -> SourceText = { path: path, text: b"" }
 
-fn refuse(
+fn failure_output(
   style: Style,
   command: String,
   path: String,
   why: String,
   note: String,
-) -> Answer / {abort.raise} =
+) -> CommandOutput / {abort.raise} =
   reported(
     style,
     command,
@@ -55,13 +55,13 @@ fn refuse(
 
 /// A package's name is the prefix its importers reach it through, so it takes the shape a module
 /// path takes: lower-case identifier segments joined by dots.
-fn bad_name(name: String) -> Bool / {abort.raise} = !is_dotted_path(name)
+fn is_bad_name(name: String) -> Bool / {abort.raise} = !is_dotted_path(name)
 
-fn name_of(dir: Rooted, opts: Options) -> String =
+fn name_of(dir: RootedPath, opts: Options) -> String =
   match opts.name { Some(named) -> named, None -> file_name(dir.path) }
 
 /// The version a new package declares as its toolchain: the one this binary is.
-fn toolchain() -> Version / {shipped.version} = {
+fn toolchain_version() -> Version / {shipped.version} = {
   let parts = shipped.version().split(".");
   let at_part = |i: Int|
     match parts.at(i) {
@@ -134,7 +134,7 @@ fn json_of(name: String, dir: String, lib: Bool, code: Int) -> Json =
     { key: "files", value: Array(files_of(lib).map(|f: String| Str(f))) },
   ])
 
-fn made(style: Style, name: String, dir: String, lib: Bool) -> Answer = {
+fn created_output(style: Style, name: String, dir: String, lib: Bool) -> CommandOutput = {
   let step = if lib { "ply test" } else { "ply run ." };
   {
     json: json_of(name, dir, lib, ok_code()),
@@ -150,15 +150,15 @@ fn made(style: Style, name: String, dir: String, lib: Bool) -> Answer = {
 pub fn run(
   flags: Flags,
   opts: Options,
-) -> Answer / {fs.kind[cwd], fs.kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], shipped.version, abort.raise} = {
+) -> CommandOutput / {fs.kind[cwd], fs.kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], shipped.version, abort.raise} = {
   let s = style_of(flags);
   let dir = rooted(match flags.paths.at(0) { Some(r) -> r, None -> here() });
   let shown_dir = displayed(dir);
   let name = name_of(dir, opts);
   let manifest = child(dir, "ply.pkg");
   let module = child(dir, module_file(opts.lib));
-  if bad_name(name) {
-    refuse(
+  if is_bad_name(name) {
+    failure_output(
       s,
       "new",
       shown_dir,
@@ -166,7 +166,7 @@ pub fn run(
       "a name is lower-case letters, digits and `_`, joined by dots: the prefix importers reach it through",
     )
   } else if kind(dir) != Missing {
-    refuse(
+    failure_output(
       s,
       "new",
       shown_dir,
@@ -174,15 +174,15 @@ pub fn run(
       "`ply new` makes a package, and never writes into one that exists",
     )
   } else if !create_dir(dir) {
-    refuse(
+    failure_output(
       s,
       "new",
       shown_dir,
       "could not make `" ++ shown_dir ++ "`",
       "the directory was not written",
     )
-  } else if !write_file(manifest, Bytes::of_string(manifest_text(name, toolchain()))) {
-    refuse(
+  } else if !write_file(manifest, Bytes::of_string(manifest_text(name, toolchain_version()))) {
+    failure_output(
       s,
       "new",
       shown_dir,
@@ -190,14 +190,14 @@ pub fn run(
       "nothing else was written",
     )
   } else if !write_file(module, Bytes::of_string(module_text(name, opts.lib))) {
-    refuse(
+    failure_output(
       s,
       "new",
       shown_dir,
       "could not write `" ++ displayed(module) ++ "`",
       "the package's other file was written",
     )
-  } else { made(s, name, shown_dir, opts.lib) }
+  } else { created_output(s, name, shown_dir, opts.lib) }
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -225,13 +225,13 @@ test "a program's first module prints and carries one test, a library's doubles"
 }
 
 test "a name takes the shape a module path takes, and nothing else" {
-  assert(!bad_name("demo"));
-  assert(!bad_name("store.orders"));
-  assert(!bad_name("a1.b_2"));
-  assert(bad_name("Demo"));
-  assert(bad_name("my-app"));
-  assert(bad_name(""));
-  assert(bad_name("a..b"))
+  assert(!is_bad_name("demo"));
+  assert(!is_bad_name("store.orders"));
+  assert(!is_bad_name("a1.b_2"));
+  assert(is_bad_name("Demo"));
+  assert(is_bad_name("my-app"));
+  assert(is_bad_name(""));
+  assert(is_bad_name("a..b"))
 }
 
 test "the line's flags are what the run reads" {
@@ -245,9 +245,9 @@ test "the line's flags are what the run reads" {
 
 /// A run whose filesystem root is `tree`, with nothing under the working directory, and the tree it
 /// left behind.
-type Scaffolded = { tree: MemFs, answer: Answer }
+type ScaffoldRun = { tree: MemFs, result: CommandOutput }
 
-fn scaffolded(tree: MemFs, flags: Flags, opts: Options) -> Scaffolded / {abort.raise} =
+fn scaffold_in(tree: MemFs, flags: Flags, opts: Options) -> ScaffoldRun / {abort.raise} =
   handle {
     run(flags, opts)
   } with {
@@ -257,17 +257,17 @@ fn scaffolded(tree: MemFs, flags: Flags, opts: Options) -> Scaffolded / {abort.r
     fs.kind[abs](p) -> mem_kind(a, p),
     fs.create_dir[cwd](p) -> panic("a path under `abs` is made under `abs`"),
     fs.create_dir[abs](p) -> {
-      let w: Written = mem_create_dir(a, p);
+      let w: WriteResult = mem_create_dir(a, p);
       a = w.fs;
       w.ok
     },
     fs.write_file[cwd](p, body) -> panic("a path under `abs` is written under `abs`"),
     fs.write_file[abs](p, body) -> {
-      let w: Written = mem_write(a, p, body);
+      let w: WriteResult = mem_write(a, p, body);
       a = w.fs;
       w.ok
     },
-    return answer -> { tree: a, answer: answer },
+    return answer -> { tree: a, result: answer },
   }
 
 test "a package outside the working directory is made, and refused, under the root it resolved to" {
@@ -277,7 +277,7 @@ test "a package outside the working directory is made, and refused, under the ro
     paths: [
       {
         label: "abs",
-        spelling: "srv",
+        root_path: "srv",
         display: "/srv",
         inside: "demo",
         absolute: "/srv",
@@ -286,9 +286,9 @@ test "a package outside the working directory is made, and refused, under the ro
       },
     ],
   };
-  let first = scaffolded(mem_empty(), flags, { name: None, lib: true });
-  assert_eq(first.answer.code, 0);
-  assert_eq(first.answer.lines, [
+  let first = scaffold_in(mem_empty(), flags, { name: None, lib: true });
+  assert_eq(first.result.code, 0);
+  assert_eq(first.result.lines, [
     "   created /srv/demo · ply.pkg, lib.ply",
     "   next: cd /srv/demo && ply test",
   ]);
@@ -297,8 +297,8 @@ test "a package outside the working directory is made, and refused, under the ro
     Some(Bytes::of_string(module_text("demo", true))),
   );
   assert(mem_read(first.tree, "srv/demo/ply.pkg") != None);
-  let program = scaffolded(mem_empty(), flags, { name: None, lib: false });
-  assert_eq(program.answer.lines, [
+  let program = scaffold_in(mem_empty(), flags, { name: None, lib: false });
+  assert_eq(program.result.lines, [
     "   created /srv/demo · ply.pkg, main.ply",
     "   next: cd /srv/demo && ply run .",
   ]);
@@ -306,8 +306,8 @@ test "a package outside the working directory is made, and refused, under the ro
     mem_read(program.tree, "srv/demo/main.ply"),
     Some(Bytes::of_string(module_text("demo", false))),
   );
-  let again = scaffolded(first.tree, flags, { name: None, lib: false });
-  assert_eq(again.answer.code, 2);
-  assert_eq(again.answer.errs, ["Error[E0502]: `/srv/demo` is already there"]);
+  let again = scaffold_in(first.tree, flags, { name: None, lib: false });
+  assert_eq(again.result.code, 2);
+  assert_eq(again.result.errs, ["Error[E0502]: `/srv/demo` is already there"]);
   assert_eq(mem_read(again.tree, "srv/demo/main.ply"), None)
 }

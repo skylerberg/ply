@@ -4,12 +4,12 @@ import compiler.load (Derives, LoadedAnalysis)
 import args (Flags, kept, style_of)
 import units
 import units (emit)
-import appends (broken_promises, priced)
-import literals (literal, unsettled)
+import update_costs (broken_promises, cost_checker)
+import literals (evaluation, evaluation_errors)
 import builder (builder)
 import compiler.cc (toolchain)
 import std.env (env)
-import loads (shipped_stamps)
+import project_store (shipped_stamps)
 import results
 import std.random (entropy)
 import std.hash (blake3)
@@ -18,34 +18,34 @@ import std.time (time)
 import config_schema
 import configuration
 import machine
-import compiler.front.facts (View, pulled_at)
-import compiler.front.seam (Within)
+import compiler.front.facts (CheckedProgram, pulled_at)
+import compiler.front.seam (TestRunScope)
 import compiler.unit (shipped)
 import compiler.check.infer.checker (DefInfo, EffectInfo, TestInfo, prelude_effects)
 import compiler.check.resolve.tables (Diag)
 import compiler.check.types
 import compiler.syntax.type_syntax
-import compiler.syntax.type_syntax (MWrite)
-import diagnostic (Place, shown)
+import compiler.syntax.type_syntax (WriteMode)
+import diagnostic (SourceText, shown)
 import mutants (targets)
 import paths
-import program (Timed, front_of, modules_of, own_diags, timed_over, timed_uncached_over, unmoved,
-                program_view, asked_line, command_kept)
-import report (Answer, ok_code, printed, refused, reuse_members, with_front_end)
+import program (TimedLoad, loaded_analysis, modules_of, own_diags, timed_over, timed_uncached_over,
+                unchanged, program_view, encoded_command_line, cached_command)
+import report (CommandOutput, ok_code, printed, refused, reuse_members, with_front_end)
 import sources (Embed, File, Project, imported_reader, load_resolved, shipped_imported)
 import std.process (process)
 import std.json (Object, Str, Bool, object, int, parse_string)
 import std.term (Style)
 import tester
-import tester (ledger, Listed, Options, Testing, TestUnit, Unlisted)
-import machine (Entering)
+import tester (result_cache, ListedCase, Options, TestRun, TestUnit, ListingFailure)
+import machine (MachineAccess)
 import std.machine as entering
 import std.value (Value)
 import walk
 import views
-import listings
-import queried
-import queried (command_key)
+import case_listings
+import module_queries
+import module_queries (command_key)
 import std.bin
 import testing.select (Row, Stands, by_code, code_keys, decide, to_run)
 import std.bytes
@@ -53,42 +53,43 @@ import std.string
 import signature (atom_texts)
 import proof.goal (set_of)
 import std.option
-import tests.report (Entry, Case, group_of_class, classes_of, decided_of, Program, Spent, no_spent,
-                     primary_of, placed_cases, phases_json, unbound, test_at, canonical,
-                     footprint_text)
-import tests.concluded (hash_at, test_hash_at, seeded_of, entry_of, cases_of, traces_of, standing)
-import tests.cases (Keeping, kept_bin, all_cached, Scope, scope_of, over_cases, listed,
-                    listing_within, run_within, run_unit, Ranged, ranged, codes_of, passed_by_code,
-                    concluded_run, search_of, sim_json)
+import tests.report (Entry, Case, group_of_class, classes_of, run_decision_of, Program, TimeSpent,
+                     no_time_spent, primary_of, placed_cases, phases_json, unbound, test_at,
+                     canonical, footprint_text)
+import tests.concluded (hash_at, test_hash_at, seeded_of, entry_of, cases_of, traces_of,
+                        pass_status)
+import tests.cases (CacheTarget, cached_output_bin, all_cached, Scope, scope_of, over_cases,
+                    list_cases, listing_within, run_within, run_unit, ExpandedTests, expand_cases,
+                    codes_of, passed_by_code, concluded_run, search_of, sim_json)
 import semantics (semantics)
 
 // --- The load ---------------------------------------------------------------
 
 /// One report, the load a watching run's next report may reuse, and what that load embedded, which
 /// a watching run reads again whether or not the load held.
-pub type Iteration = { answer: Answer, held: Option<Timed>, embeds: List<Embed> }
+pub type Iteration = { result: CommandOutput, held: Option<TimedLoad>, embeds: List<Embed> }
 
 pub fn run(
   flags: Flags,
   options: Options,
   argv: Option<List<String>>,
-) -> Answer / {semantics.cached, shipped.answer, process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, Entering, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached, toolchain.reused} =
-  iterated(flags, options, None, argv).answer
+) -> CommandOutput / {semantics.cached, shipped.read_pack, process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} =
+  run_once(flags, options, None, argv).result
 
 /// A save that changed no file's text is the last report's load again, with nothing re-derived.
-fn loaded(
+fn load_or_reuse(
   flags: Flags,
   options: Options,
-  held: Option<Timed>,
+  held: Option<TimedLoad>,
   project: Project,
   started: Int,
-) -> Timed / {shipped.answer, toolchain.reused, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.reached} = {
+) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_reached} = {
   let reused = match held {
-    Some(t) -> if unmoved(project, t.program) { Some(t) } else { None },
+    Some(t) -> if unchanged(project, t.program) { Some(t) } else { None },
     None -> None,
   };
   match reused {
-    Some(t) -> { ..t, read_ms: 0, front_ms: 0, file_ms: 0 },
+    Some(t) -> { ..t, read_ms: 0, front_end_ms: 0, store_ms: 0 },
     None -> if flags.no_cache {
       timed_uncached_over(flags.paths, project, started, flags.verify_deps)
     } else { timed_over(flags.paths, project, started, flags.verify_deps) },
@@ -97,27 +98,30 @@ fn loaded(
 
 /// One report over the tree as it is now; `held` is the load the last one ran against. `argv`, where
 /// it is given, is the command line a run that ran nothing keeps its answer under for the next.
-pub fn iterated(
+pub fn run_once(
   flags: Flags,
   options: Options,
-  held: Option<Timed>,
+  held: Option<TimedLoad>,
   argv: Option<List<String>>,
-) -> Iteration / {semantics.cached, shipped.answer, process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, Entering, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached, toolchain.reused} = {
+) -> Iteration / {semantics.cached, shipped.read_pack, process.out[proc], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} = {
   let s: Style = style_of(flags);
   let begun = time.elapsed_us();
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   let key = match argv {
-    Some(line) -> if held == None && keeps_answer(flags, options) {
-      Some(command_key(queried::program(), asked_line(line, flags.paths)))
+    Some(line) -> if held == None && caches_output(flags, options) {
+      Some(command_key(module_queries::program_digest(), encoded_command_line(line, flags.paths)))
     } else { None },
     None -> None,
   };
-  let taken = match key { Some(k) -> replayed(flags, options, k, project, begun), None -> None };
+  let taken = match key {
+    Some(k) -> cached_output(flags, options, k, project, begun),
+    None -> None,
+  };
   match taken {
-    Some(answer) -> { answer: answer, held: None, embeds: [] },
+    Some(answer) -> { result: answer, held: None, embeds: [] },
     None -> {
-      let t: Timed = loaded(flags, options, held, project, started);
+      let t: TimedLoad = load_or_reuse(flags, options, held, project, started);
       over_load(flags, options, s, t, begun, match key {
         Some(k) -> Some({ key: k, project: project, passes: [], after: false }),
         None -> None,
@@ -128,40 +132,40 @@ pub fn iterated(
 
 /// A run whose answer the next may take: one that consults the store, answers once and as a plain
 /// run does, and reads no configuration file the key does not cover.
-fn keeps_answer(flags: Flags, options: Options) -> Bool =
+fn caches_output(flags: Flags, options: Options) -> Bool =
   !flags.no_cache && !flags.watch && !flags.explain && !options.coverage && options.mutate == None
     && options.machine.config.files.len() == 0
     && options.machine.config.schema == None
 
 /// The keys of the passes that answer each test in scope.
-fn answered_by(answering: List<List<Bytes>>, scope: Scope) -> List<Bytes> =
+fn pass_keys_in_scope(answering: List<List<Bytes>>, scope: Scope) -> List<Bytes> =
   scope.visible.fold([], |acc: List<Bytes>, i: Int|
     acc.concat(match answering.at(i) { Some(ks) -> ks, None -> [] }))
 
 /// The answer a run kept under `key`, where it answers this one: every place its load looked at
 /// holds what it held, and every pass it took still stands. It prints what that run printed before
 /// its answer.
-fn replayed(
+fn cached_output(
   flags: Flags,
   options: Options,
   key: Bytes,
   project: Project,
   begun: Int,
-) -> Option<Answer> / {semantics.cached, shipped.answer, toolchain.reused, time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], entering::machine.moved, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.variables, env.working_directory, Derives, abort.raise} = {
+) -> Option<CommandOutput> / {semantics.cached, shipped.read_pack, toolchain.reuse_dir, time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], entering::machine.changed_read, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.variables, env.working_directory, Derives, abort.raise} = {
   let supplied = configuration::supplied(options.machine.config);
-  match match command_kept(flags.paths, project, key) {
-      Some(b) -> match bin::decode(b, kept_bin()) { Ok(k) -> Some(k), Err(_) -> None },
+  match match cached_command(flags.paths, project, key) {
+      Some(b) -> match bin::decode(b, cached_output_bin()) { Ok(k) -> Some(k), Err(_) -> None },
       None -> None,
     } {
     None -> None,
     Some(k) -> {
       let importing = imported_reader();
-      let stands = results::with_ledger(results::store_for(flags.paths, false), || {
-        let held = ledger.passes(k.passes);
-        let now = views::now_for(views::viewed_in(traces_of(held)), |m: Bytes|
+      let stands = results::with_result_cache(results::store_for(flags.paths, false), || {
+        let held = result_cache.passes(k.passes);
+        let now = views::shipped_state_of(views::views_in(traces_of(held)), |m: Bytes|
           shipped_imported(importing, m));
         held.fold(true, |all: Bool, h: Option<Bytes>|
-          all && h != None && standing(now, h, options, supplied) == Some(Stands))
+          all && h != None && pass_status(now, h, options, supplied) == Some(Stands))
       });
       match if stands { Some(parse_string(k.json)) } else { None } {
         None -> None,
@@ -180,7 +184,7 @@ fn replayed(
                         key: "phases",
                         value: phases_json({
                           read_us: time.elapsed_us() - begun,
-                          front_us: 0,
+                          front_end_us: 0,
                           write_back_us: 0,
                         }),
                       },
@@ -205,32 +209,32 @@ fn over_load(
   flags: Flags,
   options: Options,
   s: Style,
-  t: Timed,
+  t: TimedLoad,
   begun: Int,
-  keeping: Option<Keeping>,
-) -> Iteration / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, Entering, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, priced.report, shipped.answer, Derives, abort.raise, shipped.reached, literal.verdicts, literal.statements} =
+  keeping: Option<CacheTarget>,
+) -> Iteration / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, shipped.read_pack, Derives, abort.raise, shipped.report_reached, evaluation.verdicts, evaluation.statements} =
   match program_view(t.program) {
     // Every diagnostic, as `check` refuses: an error is the whole answer, so the shipped-module
     // filter a successful load applies to warnings is not applied here.
     None ->
       {
-        answer: with_front_end(
+        result: with_front_end(
           refused(s, "test", t.program.diags, t.program.places),
           reuse_members(t.program.tallies, t.program.lost),
         ),
         held: None,
         embeds: t.program.embeds,
       },
-    Some(w) -> match config_schema::refusal(w, options.machine.config.schema) {
+    Some(w) -> match config_schema::schema_error(w, options.machine.config.schema) {
       Some(d) ->
         {
-          answer: unbound(s, { diags: [d], places: t.program.places }),
+          result: unbound(s, { diags: [d], places: t.program.places }),
           held: None,
           embeds: t.program.embeds,
         },
       None ->
         {
-          answer: tests_over(flags, s, options, t, w, begun, keeping),
+          result: tests_over(flags, s, options, t, w, begun, keeping),
           held: Some(t),
           embeds: t.program.embeds,
         },
@@ -240,13 +244,13 @@ fn over_load(
 /// How the tree stamps now, one line per `.ply` file a load of the paths reads, or `None` when the
 /// walk could not read what it was given: a walk that failed has seen nothing, and a watcher told
 /// the tree is empty stops noticing saves to it.
-pub fn stamped(
-  rs: List<paths::Resolved>,
+pub fn file_stamps(
+  rs: List<paths::ResolvedPath>,
 ) -> Option<List<String>> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], abort.raise, diverges} = {
-  let found = walk::loads(rs);
+  let found = walk::walk_paths_for_load(rs);
   if found.errors.len() > 0 { None } else {
     Some(
-      found.files.fold([], |acc: List<String>, shown: String, rooted: paths::Rooted|
+      found.files.fold([], |acc: List<String>, shown: String, rooted: paths::RootedPath|
         acc.push(
           shown ++ " " ++ stamp_part(paths::modified_ms(rooted)) ++ " "
             ++ stamp_part(paths::file_size(rooted)),
@@ -258,13 +262,13 @@ pub fn stamped(
 fn stamp_part(n: Option<Int>) -> String = match n { Some(x) -> x.to_string(), None -> "-" }
 
 /// The root a report names.
-fn root_of(rs: List<paths::Resolved>) -> String =
+fn root_of(rs: List<paths::ResolvedPath>) -> String =
   match rs.at(0) { None -> ".", Some(r) -> r.machine }
 
 // --- What the loaded tree tells a selector ------------------------------------
 
 /// Each test of the run, as the selector keys it: one the tree declares, or one case of it.
-pub fn rows_of(analysis: View) -> List<Row> / {abort.raise} =
+pub fn rows_of(analysis: CheckedProgram) -> List<Row> / {abort.raise} =
   range(0, analysis.checked.tests.len()).fold([], |acc: List<Row>, i: Int|
     match test_at(analysis, i) {
       None -> acc,
@@ -280,18 +284,18 @@ pub fn rows_of(analysis: View) -> List<Row> / {abort.raise} =
         }),
     })
 
-fn mode_writes(m: type_syntax::Mode) -> Bool = match m { MWrite -> true, _ -> false }
+fn mode_writes(m: type_syntax::Mode) -> Bool = match m { WriteMode -> true, _ -> false }
 
 /// Every effect the program or the prelude declares, by its program-wide name, with whether it is
 /// `nondet`.
-pub fn declared_effects(analysis: View) -> Map<Bytes, Bool> =
+pub fn declared_effects(analysis: CheckedProgram) -> Map<Bytes, Bool> =
   prelude_effects().concat(analysis.checked.effects).fold(
     Map::new(),
     |acc: Map<Bytes, Bool>, e: EffectInfo| acc.insert(e.name, e.nondet),
   )
 
 pub fn case_view(
-  analysis: View,
+  analysis: CheckedProgram,
   declared: Map<Bytes, Bool>,
   i: Int,
   test_info: TestInfo,
@@ -328,13 +332,12 @@ pub fn case_view(
 
 /// The modules a line narrows a run to: those of `files` it names or that are under a directory it
 /// names. `None` where it names each root whole.
-fn named_modules(paths: List<paths::Resolved>, files: List<File>) -> Option<List<String>> =
-  if paths.all(|r: paths::Resolved| r.inside == ".") { None } else {
+fn named_modules(paths: List<paths::ResolvedPath>, files: List<File>) -> Option<List<String>> =
+  if paths.all(|r: paths::ResolvedPath| r.inside == ".") { None } else {
     Some(
       files.filter(|f: File|
-        paths.fold(false, |hit: Bool, r: paths::Resolved| hit || paths::names(r, f.path))).map(
-        |f: File| f.module,
-      ),
+        paths.fold(false, |hit: Bool, r: paths::ResolvedPath|
+          hit || paths::includes(r, f.path))).map(|f: File| f.module),
     )
   }
 
@@ -342,8 +345,8 @@ fn named_modules(paths: List<paths::Resolved>, files: List<File>) -> Option<List
 /// they run in.
 fn program_of(
   options: Options,
-  timed: Timed,
-  analysis: View,
+  timed: TimedLoad,
+  analysis: CheckedProgram,
   entries: List<Entry>,
   root: String,
   scope: Scope,
@@ -362,9 +365,9 @@ fn program_of(
     });
   {
     root: root,
-    filed_under: filed_under,
+    stored_under: filed_under,
     unit: unit,
-    files: timed.program.places.map(|place: Place| place.path),
+    files: timed.program.places.map(|place: SourceText| place.path),
     places: timed.program.places,
     modules: modules_of(timed.program, analysis.frame).map(|m: { name: String, path: String }|
       { name: m.name, file: m.path }),
@@ -372,8 +375,8 @@ fn program_of(
     reuse: reuse_members(timed.program.tallies, timed.program.lost),
     phases: {
       read_us: timed.read_ms * 1000,
-      front_us: timed.front_ms * 1000,
-      write_back_us: timed.file_ms * 1000,
+      front_end_us: timed.front_end_ms * 1000,
+      write_back_us: timed.store_ms * 1000,
     },
     declared: scope.visible.len() + scope.filtered_out,
     cases: cases,
@@ -392,11 +395,11 @@ fn tests_over(
   flags: Flags,
   style: Style,
   options: Options,
-  timed: Timed,
-  analysis: View,
+  timed: TimedLoad,
+  analysis: CheckedProgram,
   begun: Int,
-  keeping: Option<Keeping>,
-) -> Answer / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, Entering, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, priced.report, literal.verdicts, literal.statements, shipped.answer, Derives, abort.raise, shipped.reached} = {
+  keeping: Option<CacheTarget>,
+) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, Derives, abort.raise, shipped.report_reached} = {
   let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
     Some(query) -> match targets(analysis, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
     None -> Ok(None),
@@ -406,9 +409,9 @@ fn tests_over(
     Ok(targeted) -> {
       let loaded_at = time.elapsed_us();
       let unkept = broken_promises(timed.program, analysis.frame);
-      let broken = if unkept.len() > 0 { unkept } else { unsettled(timed, analysis.frame) };
+      let broken = if unkept.len() > 0 { unkept } else { evaluation_errors(timed, analysis.frame) };
       let promised_at = time.elapsed_us();
-      let spent = { ..no_spent(), before_us: begun, promises_us: promised_at - loaded_at };
+      let spent = { ..no_time_spent(), before_us: begun, promises_us: promised_at - loaded_at };
       if broken.len() > 0 { refused(style, "test", broken, timed.program.places) }
       else { selected(flags, style, options, timed, analysis, targeted, spent, keeping) }
     },
@@ -419,16 +422,16 @@ fn selected(
   flags: Flags,
   style: Style,
   options: Options,
-  timed: Timed,
-  analysis: View,
+  timed: TimedLoad,
+  analysis: CheckedProgram,
   targeted: Option<List<DefInfo>>,
-  spent: Spent,
-  keeping: Option<Keeping>,
-) -> Answer / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, Entering, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, shipped.answer, Derives, abort.raise, shipped.reached} = {
+  spent: TimeSpent,
+  keeping: Option<CacheTarget>,
+) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, Derives, abort.raise, shipped.report_reached} = {
   let configuring = time.elapsed_us();
-  let testing = tester::begun(options);
-  results::with_ledger(results::store_for(flags.paths, flags.no_cache), || {
-    let opened = if flags.no_cache { [] } else { ledger.opened() };
+  let testing = tester::start_run(options);
+  results::with_result_cache(results::store_for(flags.paths, flags.no_cache), || {
+    let opened = if flags.no_cache { [] } else { result_cache.open_warnings() };
     // Which tests there are is the tables' to say, so each test over cases lists its own first,
     // unless a run kept what it listed while all its table reaches stands.
     let hashed = hashed_by_kind(analysis);
@@ -440,31 +443,31 @@ fn selected(
     let place = listings_at(flags.paths);
     let stamp = Bytes::of_string(shipped_stamps().runtime);
     let kept = if flags.no_cache { Map::new() }
-    else if place.label == "cwd" { listings::kept[cwd](place.dir, stamp, asked) }
-    else { listings::kept[abs](place.dir, stamp, asked) };
-    let unkept = asked.filter(|a: listings::Asked| !kept.contains(a.test));
-    let to_list = unkept.map(|a: listings::Asked| a.test);
+    else if place.label == "cwd" { case_listings::cached_listings[cwd](place.dir, stamp, asked) }
+    else { case_listings::cached_listings[abs](place.dir, stamp, asked) };
+    let unkept = asked.filter(|a: case_listings::ListingRequest| !kept.contains(a.test));
+    let to_list = unkept.map(|a: case_listings::ListingRequest| a.test);
     let handing = time.elapsed_us();
     // Each unit is emitted over a dump of what it enters, but a schema with constants to enter runs
     // the whole program's.
-    let whole = if options.machine.config.schema != None { Some(front_of(timed, analysis)) }
+    let whole = if options.machine.config.schema != None { Some(loaded_analysis(timed, analysis)) }
     else { None };
-    let hand = |within: Within|
-      match whole { Some(front) -> front, None -> front_of(timed, analysis, Some(within)) };
+    let analysis_for = |within: TestRunScope|
+      match whole { Some(front) -> front, None -> loaded_analysis(timed, analysis, Some(within)) };
     let lister = if to_list.len() == 0 { None } else {
       let within = listing_within(analysis, to_list);
-      Some({ front: hand(within), reach: within.owners })
+      Some({ front: analysis_for(within), reach: within.owners })
     };
     let listing = time.elapsed_us();
-    match listed(testing, lister, to_list) {
+    match list_cases(testing, lister, to_list) {
       Err(diags) -> unbound(style, { diags: diags, places: timed.program.places }),
       Ok(found) -> {
-        if flags.no_cache { () }
-        else if place.label == "cwd" { listings::keep[cwd](place.dir, stamp, unkept, found) }
-        else { listings::keep[abs](place.dir, stamp, unkept, found) };
+        if flags.no_cache { () } else if place.label == "cwd" {
+          case_listings::cache_listings[cwd](place.dir, stamp, unkept, found)
+        } else { case_listings::cache_listings[abs](place.dir, stamp, unkept, found) };
         let cases = kept.fold(
           found,
-          |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int, listed: List<Listed>|
+          |acc: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int, listed: List<ListedCase>|
             acc.insert(i, Ok(listed)),
         );
         decided_run(
@@ -472,8 +475,8 @@ fn selected(
           style,
           testing,
           timed,
-          ranged(analysis, cases),
-          hand,
+          expand_cases(analysis, cases),
+          analysis_for,
           opened,
           targeted,
           { ..spent, store_us: handing - configuring, handoff_us: listing - handing },
@@ -487,7 +490,7 @@ fn selected(
 
 /// Each definition's hash and each declaration's, by kind and name: a function and a type may share
 /// a name.
-fn hashed_by_kind(analysis: View) -> Map<Bytes, Bytes> =
+fn hashed_by_kind(analysis: CheckedProgram) -> Map<Bytes, Bytes> =
   analysis.frame.hashes.decls.fold(
     analysis.frame.hashes.defs.fold(
       Map::new(),
@@ -502,8 +505,8 @@ fn hashed_by_kind(analysis: View) -> Map<Bytes, Bytes> =
 /// each definition it references, by its hash. The test's own hash leaves its table and its label
 /// out, so that a case added moves no other case's key.
 fn listing_hash(
-  analysis: View,
-  places: List<Place>,
+  analysis: CheckedProgram,
+  places: List<SourceText>,
   hashed: Map<Bytes, Bytes>,
   i: Int,
 ) -> Bytes / {abort.raise} =
@@ -536,27 +539,27 @@ fn listing_hash(
   }
 
 /// Where a project keeps what its tests over cases listed.
-fn listings_at(paths: List<paths::Resolved>) -> { label: String, dir: String } =
+fn listings_at(paths: List<paths::ResolvedPath>) -> { label: String, dir: String } =
   match paths.at(0) {
     Some(r) -> { label: r.label, dir: paths::in_root(r, ".ply-cache/listings").path },
     None -> { label: "cwd", dir: ".ply-cache/listings" },
   }
 
-/// The run over the tests as listing left them. `hand` answers the dump a unit is emitted over,
+/// The run over the tests as listing left them. `analysis_for` answers the dump a unit is emitted over,
 /// given what the unit enters. `listing` is when listing began.
 fn decided_run(
   flags: Flags,
   style: Style,
-  testing: Testing,
-  timed: Timed,
-  over: Ranged,
-  hand: (Within) -> LoadedAnalysis / {abort.raise},
+  testing: TestRun,
+  timed: TimedLoad,
+  over: ExpandedTests,
+  analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
   opened: List<Diag>,
   targeted: Option<List<DefInfo>>,
-  spent: Spent,
+  spent: TimeSpent,
   listing: Int,
-  keeping: Option<Keeping>,
-) -> Answer / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.working_directory, env.variables, Entering, ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.texts, ledger.unfiled, ledger.history, ledger.filed, emit.unit, emit.compiled, shipped.answer, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], Derives, abort.raise, shipped.reached} = {
+  keeping: Option<CacheTarget>,
+) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.working_directory, env.variables, MachineAccess, result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing, emit.unit, emit.compiled, shipped.read_pack, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], Derives, abort.raise, shipped.report_reached} = {
   let options = testing.options;
   let analysis = over.analysis;
   let selecting = time.elapsed_us();
@@ -582,9 +585,9 @@ fn decided_run(
   // pass is filed under: the runtime answers what the store holds and does what it is told.
   let searching = machine::sim_plan_of(options.sim);
   let search = search_of(searching);
-  let loaded = views::held_texts(timed.program.shipping, timed.program.reached);
+  let load_or_reuse = views::loaded_texts(timed.program.shipping, timed.program.reached);
   let supplied = configuration::supplied(options.machine.config);
-  let asked = cases_of(rows_of(analysis), search, flags.no_cache, options, supplied, loaded);
+  let asked = cases_of(rows_of(analysis), search, flags.no_cache, options, supplied, load_or_reuse);
   let first = decide(asked.cases);
   let building = time.elapsed_us();
   // What a test runs is the unit's to say, so a run that would execute anything emits it before
@@ -593,7 +596,7 @@ fn decided_run(
   let visible = set_of(scope.visible);
   let running = to_run(first).filter(|i: Int| visible.contains(i));
   let within = run_within(over, running);
-  let handed = hand(within);
+  let handed = analysis_for(within);
   let unit_at = time.elapsed_us();
   let emitted = run_unit(
     handed,
@@ -612,13 +615,13 @@ fn decided_run(
       };
       let answered = by_code(
         first,
-        passed_by_code(first, keyed, loaded, options, supplied),
+        passed_by_code(first, keyed, load_or_reuse, options, supplied),
         search,
       );
       let decisions = answered.decisions;
       // Which tests may share a worker is the program's to say, from the atoms each row carries.
       let classes = classes_of(p, to_run(decisions).filter(|i: Int| visible.contains(i)));
-      let decided = decided_of(
+      let decided = run_decision_of(
         p,
         decisions,
         search,
@@ -639,16 +642,16 @@ fn decided_run(
         Ok(made_unit) -> {
           let binding = time.elapsed_us();
           let refused = |diags: List<Diag>| {
-            tester::closed(made_unit);
+            tester::close_unit(made_unit);
             unbound(style, { diags: diags, places: p.places })
           };
-          match configuration::opened_by(options.machine.config, |name: String|
+          match configuration::resolve_configuration(options.machine.config, |name: String|
               schema_of(made_unit, name)) {
             Err(diags) -> refused(diags),
             Ok(r) -> match tester::bound(
                 testing,
                 handed.dump,
-                configuration::configured(r.configuration),
+                configuration::run_configuration(r.configuration),
               ) {
               Err(diags) -> refused(diags),
               Ok(bound_testing) -> {
@@ -670,7 +673,8 @@ fn decided_run(
                     // A `--json` answer is kept from selecting again, below.
                     kept: if flags.json { None } else {
                       match keeping {
-                        Some(k) -> Some({ ..k, passes: answered_by(asked.answering, scope) }),
+                        Some(k) ->
+                          Some({ ..k, passes: pass_keys_in_scope(asked.answering, scope) }),
                         None -> None,
                       }
                     },
@@ -697,7 +701,7 @@ fn decided_run(
                       false,
                       options,
                       supplied,
-                      loaded,
+                      load_or_reuse,
                     );
                     let settled = decide(again.cases);
                     if all_cached(settled, scope) {
@@ -723,13 +727,20 @@ fn decided_run(
                         over.judged,
                         scope,
                         settled,
-                        decided_of(next, settled, search, sim_json(searching, options.sim), [], []),
+                        run_decision_of(
+                          next,
+                          settled,
+                          search,
+                          sim_json(searching, options.sim),
+                          [],
+                          [],
+                        ),
                         Map::new(),
                         {
                           refiled: [],
                           kept: Some({
                             ..k,
-                            passes: answered_by(again.answering, scope),
+                            passes: pass_keys_in_scope(again.answering, scope),
                             after: true,
                           }),
                         },
@@ -743,7 +754,7 @@ fn decided_run(
                   },
                   None -> (),
                 };
-                tester::closed(made_unit);
+                tester::close_unit(made_unit);
                 answer
               },
             },
@@ -761,7 +772,7 @@ fn schema_of(
   name: String,
 ) -> Result<Value, List<Diag>> / {entering::machine.enter, abort.raise} =
   match unit.opened {
-    Some(o) -> configuration::schema_in(o.unit, unit.roots, name),
+    Some(o) -> configuration::evaluate_schema_on_unit(o.unit, unit.roots, name),
     None -> Err([shown(machine::defect(name, "was asked of a run that built no unit"))]),
   }
 
@@ -773,9 +784,9 @@ test "a tree stamps one line per `.ply` file, and a walk that fails stamps nothi
     { path: "notes.txt", body: b"x" },
     { path: "sub/deep.ply", body: b"fn d() -> Int = 2" },
   ]);
-  let walked = |rs: List<paths::Resolved>|
+  let walked = |rs: List<paths::ResolvedPath>|
     handle {
-      stamped(rs)
+      file_stamps(rs)
     } with {
       fs.kind[cwd](p) -> mem_kind(tree, p),
       fs.kind[abs](p) -> panic("nothing here leaves the working directory"),

@@ -12,25 +12,25 @@ import std.bytes
 import std.fs (fs)
 import std.list
 import std.snapshot
-import std.snapshot (Change, Same, Stored)
+import std.snapshot (Change, Same, Snapshots)
 import ucd_files
 import ucd_files (Row, rows_under, unicode_data)
 
 /// A property of every code point as the runs it is constant over: each run's first code point
 /// under the value a table writes for the run.
-type Layer = Map<Int, Bytes>
+type PropertyRuns = Map<Int, Bytes>
 
 /// The runs so far, and the first code point no row has covered.
-type Laying = { runs: List<{ key: Int, value: Bytes }>, next: Int }
+type RunsState = { runs: List<{ key: Int, value: Bytes }>, next: Int }
 
 /// The layer of `rows`, which rise and do not meet: what `value` writes of each, and `missing`
 /// for the code points between them.
-fn layer<| e>(
+fn property_runs<| e>(
   rows: List<Row>,
   missing: Bytes,
   value: (Row) -> Bytes / e,
-) -> Layer / {abort.raise | e} = {
-  let laid = rows.fold({ runs: [], next: 0 }, |so_far: Laying, row: Row|
+) -> PropertyRuns / {abort.raise | e} = {
+  let laid = rows.fold({ runs: [], next: 0 }, |so_far: RunsState, row: Row|
     if row.first < so_far.next { panic("rows that do not rise") } else {
       let before = if row.first > so_far.next {
         so_far.runs.push({ key: so_far.next, value: missing })
@@ -43,14 +43,18 @@ fn layer<| e>(
 
 /// The layer that writes `letter` for the code points `file` lists under `under`, a binary
 /// property's name or a property's and one of its values, and nothing for the rest.
-fn flag(file: Bytes, under: List<String>, letter: Bytes) -> Layer / {abort.raise} =
-  layer(rows_under(file, under).sort_by(|a: Row, b: Row| a.first < b.first), b"", |_: Row| letter)
+fn flag(file: Bytes, under: List<String>, letter: Bytes) -> PropertyRuns / {abort.raise} =
+  property_runs(
+    rows_under(file, under).sort_by(|a: Row, b: Row| a.first < b.first),
+    b"",
+    |_: Row| letter,
+  )
 
-fn value_at(of: Layer, cp: Int) -> Bytes =
+fn value_at(of: PropertyRuns, cp: Int) -> Bytes =
   match of.floor(cp) { Some(run) -> run.value, None -> b"" }
 
 /// `line`, which is `count` fields, without the `;` after each field at its end that is empty.
-fn unpadded(line: Bytes, count: Int) -> Bytes / {abort.raise} =
+fn trim_empty_fields(line: Bytes, count: Int) -> Bytes / {abort.raise} =
   range(0, count).fold(line, |kept: Bytes, _: Int|
     if kept.ends_with(b";") { kept.slice(0, kept.len() - 1) } else { kept })
 
@@ -59,13 +63,15 @@ type Run = { first: Int, value: Bytes }
 
 /// The runs of a table whose fields are each the values of some layers written one after
 /// another, with `;` between the fields and none after the last that is not empty.
-fn runs(fields: List<List<Layer>>) -> List<Run> / {abort.raise} = {
-  let starts = fields.flatten().fold(Map::new(), |all: Layer, one: Layer| all.merge(one)).keys();
+fn runs(fields: List<List<PropertyRuns>>) -> List<Run> / {abort.raise} = {
+  let starts = fields.flatten().fold(Map::new(), |all: PropertyRuns, one: PropertyRuns|
+    all.merge(one)).keys(
+  );
   starts.fold([], |found: List<Run>, start: Int| {
-    let value = unpadded(
+    let value = trim_empty_fields(
       Bytes::join(
-        fields.map(|layers: List<Layer>|
-          Bytes::concat_all(layers.map(|of: Layer| value_at(of, start)))),
+        fields.map(|layers: List<PropertyRuns>|
+          Bytes::concat_all(layers.map(|of: PropertyRuns| value_at(of, start)))),
         b";",
       ),
       fields.len(),
@@ -79,7 +85,7 @@ fn runs(fields: List<List<Layer>>) -> List<Run> / {abort.raise} = {
 }
 
 /// `cp` as a table writes a code point: hexadecimal in capitals, four digits or more.
-fn written(cp: Int) -> Bytes =
+fn code_point_hex(cp: Int) -> Bytes =
   Bytes::concat_all(
     [20, 16, 12, 8, 4, 0].filter(|shift: Int| shift <= 12 || cp >> shift != 0).map(|shift: Int|
       b"0123456789ABCDEF".slice(cp >> shift & 15, (cp >> shift & 15) + 1)),
@@ -90,7 +96,7 @@ fn written(cp: Int) -> Bytes =
 fn table(
   published: Bytes,
   about: List<String>,
-  fields: List<List<Layer>>,
+  fields: List<List<PropertyRuns>>,
   missing: Bytes,
 ) -> String / {abort.raise} = {
   let found = runs(fields);
@@ -108,8 +114,8 @@ fn table(
     if run.value == missing { text } else {
       text.push(
         Bytes::concat_all([
-          written(run.first),
-          if last == run.first { b"" } else { b"..".concat(written(last)) },
+          code_point_hex(run.first),
+          if last == run.first { b"" } else { b"..".concat(code_point_hex(last)) },
           b";",
           run.value,
           b"\n",
@@ -125,8 +131,8 @@ fn table(
 }
 
 /// The value a field of `UnicodeData.txt` gives every code point it lists.
-fn unicode_data_field(index: Int, missing: Bytes) -> Layer / {abort.raise} =
-  layer(unicode_data(), missing, |row: Row| row.fields.get(index))
+fn unicode_data_field(index: Int, missing: Bytes) -> PropertyRuns / {abort.raise} =
+  property_runs(unicode_data(), missing, |row: Row| row.fields.get(index))
 
 /// `ucd/classes.txt`.
 fn classes() -> String / {abort.raise} = {
@@ -159,8 +165,8 @@ fn classes() -> String / {abort.raise} = {
 
 /// How far the mapping a field of `UnicodeData.txt` names lies from each code point: `0` where
 /// the field is empty, as it is for every code point of a range.
-fn distance(index: Int) -> Layer / {abort.raise} =
-  layer(unicode_data(), b"0", |row: Row| {
+fn mapping_offsets(index: Int) -> PropertyRuns / {abort.raise} =
+  property_runs(unicode_data(), b"0", |row: Row| {
     let mapped = row.fields.get(index);
     if mapped.len() == 0 { b"0" }
     else { Bytes::of_string(Int::to_string(ucd_files::hex(mapped) - row.first)) }
@@ -176,7 +182,7 @@ fn simple_case() -> String / {abort.raise} =
       "each how far its uppercase, lowercase and titlecase mapping lies from a code point of the run,",
       "`0` for one that maps to itself. A code point in no line maps to itself all three ways.",
     ],
-    [[distance(12)], [distance(13)], [distance(14)]],
+    [[mapping_offsets(12)], [mapping_offsets(13)], [mapping_offsets(14)]],
     b"0;0;0",
   )
 
@@ -206,10 +212,10 @@ fn normalization() -> String / {abort.raise} = {
     ],
     [
       [
-        layer(unicode_data(), b"", |row: Row|
+        property_runs(unicode_data(), b"", |row: Row|
           if row.fields.get(3) == b"0" { b"" } else { row.fields.get(3) }),
       ],
-      [layer(unicode_data(), b"", |row: Row| decomposition(row.fields.get(5)))],
+      [property_runs(unicode_data(), b"", |row: Row| decomposition(row.fields.get(5)))],
       [
         flag(quick, ["NFC_QC", "N"], b"C"),
         flag(quick, ["NFC_QC", "M"], b"c"),
@@ -222,26 +228,29 @@ fn normalization() -> String / {abort.raise} = {
 }
 
 /// The layer of `rows`, in whatever order a file lists them.
-fn layer_of<| e>(
+fn property_runs_from_unsorted<| e>(
   rows: List<Row>,
   missing: Bytes,
   value: (Row) -> Bytes / e,
-) -> Layer / {abort.raise | e} =
-  layer(rows.sort_by(|a: Row, b: Row| a.first < b.first), missing, value)
+) -> PropertyRuns / {abort.raise | e} =
+  property_runs(rows.sort_by(|a: Row, b: Row| a.first < b.first), missing, value)
 
 /// The full mapping `SpecialCasing.txt` gives in its column `column`, in the rows that hold under
 /// no condition, left out where it is the simple mapping field `simple` of `UnicodeData.txt`
 /// gives, or the code point itself where that gives none.
-fn special(column: Int, simple: Int) -> Layer / {abort.raise} = {
+fn full_case_mapping(column: Int, simple: Int) -> PropertyRuns / {abort.raise} = {
   let singly = unicode_data().fold(Map::new(), |known: Map<Int, Bytes>, row: Row|
     if row.fields.get(simple).len() == 0 { known }
     else { known.insert(row.first, row.fields.get(simple)) });
-  layer_of(
+  property_runs_from_unsorted(
     ucd_files::rows(ucd_files::special_casing()).filter(|row: Row| row.fields.len() == 4),
     b"",
     |row: Row| {
       let full = row.fields.get(column);
-      let one = match singly.get(row.first) { Some(mapped) -> mapped, None -> written(row.first) };
+      let one = match singly.get(row.first) {
+        Some(mapped) -> mapped,
+        None -> code_point_hex(row.first),
+      };
       if full == one { b"" } else { full }
     },
   )
@@ -268,18 +277,18 @@ fn casing() -> String / {abort.raise} = {
     ],
     [
       [
-        layer_of(statused([b"C", b"S"]), b"", |row: Row|
+        property_runs_from_unsorted(statused([b"C", b"S"]), b"", |row: Row|
           Bytes::of_string(Int::to_string(ucd_files::hex(row.fields.get(1)) - row.first))),
       ],
-      [layer_of(statused([b"F"]), b"", |row: Row| row.fields.get(1))],
-      [special(0, 13)],
-      [special(1, 14)],
-      [special(2, 12)],
+      [property_runs_from_unsorted(statused([b"F"]), b"", |row: Row| row.fields.get(1))],
+      [full_case_mapping(0, 13)],
+      [full_case_mapping(1, 14)],
+      [full_case_mapping(2, 12)],
       [
         flag(ucd_files::derived_core_properties(), ["Cased"], b"c"),
         flag(ucd_files::derived_core_properties(), ["Case_Ignorable"], b"i"),
         flag(ucd_files::prop_list(), ["Soft_Dotted"], b"s"),
-        layer(unicode_data(), b"", |row: Row|
+        property_runs(unicode_data(), b"", |row: Row|
           if row.fields.get(3) == b"230" { b"a" }
           else if row.fields.get(3) == b"0" { b"" }
           else { b"b" }),
@@ -290,8 +299,8 @@ fn casing() -> String / {abort.raise} = {
 }
 
 /// The value of the property `file` lists, for every code point it lists under one.
-fn property(file: Bytes) -> Layer / {abort.raise} =
-  layer_of(ucd_files::rows(file), b"", |row: Row| row.fields.get(0))
+fn property(file: Bytes) -> PropertyRuns / {abort.raise} =
+  property_runs_from_unsorted(ucd_files::rows(file), b"", |row: Row| row.fields.get(0))
 
 /// `ucd/breaks.txt`.
 fn breaks() -> String / {abort.raise} = {
@@ -322,16 +331,17 @@ fn breaks() -> String / {abort.raise} = {
 }
 
 /// The layer that holds, for every code point, what `mix` makes of `layers`' values for it.
-fn mixed<| e>(layers: List<Layer>, mix: (List<Bytes>) -> Bytes / e) -> Layer / e =
+fn combined<| e>(layers: List<PropertyRuns>, mix: (List<Bytes>) -> Bytes / e) -> PropertyRuns / e =
   Map::of_entries(
-    layers.fold(Map::new(), |all: Layer, one: Layer| all.merge(one)).keys().map(|start: Int|
-      { key: start, value: mix(layers.map(|of: Layer| value_at(of, start))) }),
+    layers.fold(Map::new(), |all: PropertyRuns, one: PropertyRuns| all.merge(one)).keys().map(
+      |start: Int| { key: start, value: mix(layers.map(|of: PropertyRuns| value_at(of, start))) },
+    ),
   )
 
 /// The layer that writes `value` for the code points whose General_Category is one of
 /// `categories`.
-fn categorized(categories: List<Bytes>, value: Bytes) -> Layer / {abort.raise} =
-  layer(unicode_data(), b"", |row: Row|
+fn categorized(categories: List<Bytes>, value: Bytes) -> PropertyRuns / {abort.raise} =
+  property_runs(unicode_data(), b"", |row: Row|
     if categories.contains(row.fields.get(2)) { value } else { b"" })
 
 /// `ucd/width.txt`.
@@ -342,7 +352,7 @@ fn width() -> String / {abort.raise} = {
   let emoji = ucd_files::emoji_data();
   // Format characters by category that a terminal still gives a cell.
   let drawn = [
-    layer(
+    property_runs(
       [{ first: 0xAD, last: 0xAD, fields: [] }, { first: 0x115F, last: 0x115F, fields: [] }],
       b"",
       |_: Row| b"1",
@@ -371,7 +381,7 @@ fn width() -> String / {abort.raise} = {
     ],
     [
       [
-        mixed([drawn, unseen, wide].flatten(), |values: List<Bytes>| {
+        combined([drawn, unseen, wide].flatten(), |values: List<Bytes>| {
           let said = |some: List<Bytes>| Bytes::concat_all(some);
           if said(values.take(drawn.len())) == b""
               && said(values.slice(drawn.len(), drawn.len() + unseen.len())) != b"" { b"0" }
@@ -390,8 +400,8 @@ fn width() -> String / {abort.raise} = {
 
 /// `of`, kept for the code points `statuses` calls valid or a deviation, which are the ones a
 /// label may hold.
-fn in_labels(statuses: Layer, of: Layer) -> Layer =
-  mixed([statuses, of], |values: List<Bytes>|
+fn in_labels(statuses: PropertyRuns, of: PropertyRuns) -> PropertyRuns =
+  combined([statuses, of], |values: List<Bytes>|
     match values {
       [status, value] -> if status == b"v" || status == b"d" { value } else { b"" },
       _ -> b"",
@@ -401,7 +411,7 @@ fn in_labels(statuses: Layer, of: Layer) -> Layer =
 fn idna() -> String / {abort.raise} = {
   let mapping = ucd_files::idna_mapping_table();
   let rows = ucd_files::rows(mapping);
-  let statuses = layer(rows, b"", |row: Row|
+  let statuses = property_runs(rows, b"", |row: Row|
     match row.fields.get(0) {
       b"valid" -> b"v",
       b"deviation" -> b"d",
@@ -426,9 +436,9 @@ fn idna() -> String / {abort.raise} = {
     [
       [statuses],
       [
-        layer(rows, b"", |row: Row|
+        property_runs(rows, b"", |row: Row|
           if row.fields.get(0) != b"mapped" { b"" } else {
-            match ucd_files::hexes(row.fields.get(1)) {
+            match ucd_files::code_points_of(row.fields.get(1)) {
               [one] -> if row.first != row.last { row.fields.get(1) } else {
                 let far = one - row.first;
                 Bytes::of_string((if far >= 0 { "+" } else { "" }) ++ far.to_string())
@@ -445,7 +455,8 @@ fn idna() -> String / {abort.raise} = {
         in_labels(statuses, flag(joining, ["T"], b"T")),
         in_labels(
           statuses,
-          layer(unicode_data(), b"", |row: Row| if row.fields.get(3) == b"9" { b"v" } else { b"" }),
+          property_runs(unicode_data(), b"", |row: Row|
+            if row.fields.get(3) == b"9" { b"v" } else { b"" }),
         ),
       ],
     ],
@@ -490,7 +501,7 @@ fn case_orbits() -> String / {abort.raise} = {
     ],
     [
       [
-        layer(members.sort_by(|a: Row, b: Row| a.first < b.first), b"", |row: Row|
+        property_runs(members.sort_by(|a: Row, b: Row| a.first < b.first), b"", |row: Row|
           row.fields.get(0)),
       ],
     ],
@@ -510,7 +521,7 @@ fn scripts() -> String / {abort.raise} = {
     ],
     [
       [
-        layer(
+        property_runs(
           ucd_files::rows(published).sort_by(|a: Row, b: Row| a.first < b.first),
           b"",
           |row: Row| row.fields.get(0),
@@ -537,7 +548,7 @@ fn names() -> List<String> =
   ]
 
 /// What the published files make of the shipped file `name`.
-fn derived(name: String) -> String / {abort.raise} =
+fn derive(name: String) -> String / {abort.raise} =
   match name {
     "LICENSE" -> String::of_bytes(ucd_files::license()),
     "breaks.txt" -> breaks(),
@@ -553,12 +564,12 @@ fn derived(name: String) -> String / {abort.raise} =
   }
 
 /// The files the standard library ships beside `std.ucd`, as the tree holds them.
-fn shipped() -> Stored =
+fn shipped() -> Snapshots =
   { dir: "../../packages/std/ucd", files: embed_dir("../../packages/std/ucd") }
 
 test "the shipped {name} is, byte for byte, what the published files derive" for name: String in names(
   ) {
-  let now = snapshot::compare(shipped(), name, derived(name));
+  let now = snapshot::compare(shipped(), name, derive(name));
   let patch = match now {
     snapshot::Absent(diff) -> diff,
     snapshot::Changed(diff) -> diff,
@@ -567,13 +578,13 @@ test "the shipped {name} is, byte for byte, what the published files derive" for
   assert(
     now == Same,
     Some(
-      f"`packages/std/ucd/{name}` is not what the published files in `tests/std/ucd/` derive; `{writing()}` writes what they do, as this diff does:\n{patch}",
+      f"`packages/std/ucd/{name}` is not what the published files in `tests/std/ucd/` derive; `{update_command()}` writes what they do, as this diff does:\n{patch}",
     ),
   )
 }
 
 /// The run that writes every derived file where the standard library ships it.
-fn writing() -> String = "ply run tests/std --fs ucd=packages/std/ucd"
+fn update_command() -> String = "ply run tests/std --fs ucd=packages/std/ucd"
 
 test "the standard library ships no file under ucd/ that nothing here derives" {
   assert_eq(snapshot::unused(shipped(), names()), [])
@@ -581,5 +592,5 @@ test "the standard library ships no file under ucd/ that nothing here derives" {
 
 /// Writes every derived file into the directory the run lends as `ucd`, and answers what each
 /// took.
-fn main() -> List<{ name: String, change: Change }> / {fs.read_file[ucd], fs.create_dir[ucd], fs.write_file[ucd], snapshot::snapshot.unwritten, abort.raise} =
-  names().map(|name: String| { name: name, change: snapshot::accept[ucd]("", name, derived(name)) })
+fn main() -> List<{ name: String, change: Change }> / {fs.read_file[ucd], fs.create_dir[ucd], fs.write_file[ucd], snapshot::snapshot.write_failed, abort.raise} =
+  names().map(|name: String| { name: name, change: snapshot::accept[ucd]("", name, derive(name)) })

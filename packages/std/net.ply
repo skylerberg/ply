@@ -8,7 +8,7 @@
 //!
 //! An address is `std.ip`'s: `connect_to` and `listen_on` take a `SocketAddress`, and
 //! `peer_address` and `local_address` answer one, so what a filter checked is what is connected to.
-//! The operations added with them answer a `Result` whose `Err` is a `Refusal` saying why; the
+//! The operations added with them answer a `Result` whose `Err` is a `Error` saying why; the
 //! functions here that open something (`dial`, `dial_address`, `listening`, `secure`) raise it as
 //! `socket.refused` instead, and `try` makes it a `Result` again. `socket` is an effect of its own
 //! because `net` is `nondet` and a raise is not.
@@ -48,7 +48,7 @@ import std.bytes
 import std.bytes (i64_be, u16_be)
 import std.dns
 import std.dns (dns)
-import std.internal.native (native, wait, job_wait, found, parts, in_parts, int_of)
+import std.internal.native (native, wait, job_wait, found, parts, encode_parts, decode_int)
 import std.io
 import std.io (Sink, Source)
 import std.ip
@@ -59,7 +59,7 @@ import std.task
 import std.time (after, as_millis, as_nanos, between, millis, nanos, seconds)
 
 /// Why a socket operation did not do what it was asked.
-pub type Refusal =
+pub type Error =
   /// Nothing is listening where the connection was sent.
   | Refused
   /// No route leads to the address.
@@ -85,7 +85,7 @@ pub type Refusal =
 
 /// What an upgrade to TLS settled: the application protocol the two ends agreed on, where one was
 /// offered and taken.
-pub type Secured = { protocol: Option<String> }
+pub type UpgradeResult = { protocol: Option<String> }
 
 /// When an idle connection is probed, and where the platform lets a program say, how often and how
 /// many unanswered probes end it.
@@ -135,10 +135,10 @@ pub nondet effect net {
   write listen_tls[s](port: Int, credential: String) -> Int
   /// A listener at exactly `at`, which is a loopback address, with `options` set before it binds.
   /// Any other address is `PermissionDenied`.
-  write listen_on[s](at: SocketAddress, options: List<SocketOption>) -> Result<Int, Refusal>
+  write listen_on[s](at: SocketAddress, options: List<SocketOption>) -> Result<Int, Error>
   /// A listener on the Unix socket at `path` under the root `--fs` binds as `root`. A path
   /// something is already at is `AddressInUse`; `close` removes the one this made.
-  write listen_unix[s](root: String, path: String) -> Result<Int, Refusal>
+  write listen_unix[s](root: String, path: String) -> Result<Int, Error>
   /// A connection to `host`, trying each address it resolves to until the deadline. `None` is a
   /// host not reached, for any reason.
   write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
@@ -148,9 +148,9 @@ pub nondet effect net {
   /// writes `0` bytes.
   write connect_tls[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   /// A connection to exactly `to`, no name looked up, with `options` set before it connects.
-  write connect_to[s](to: SocketAddress, options: List<SocketOption>, timeout_ms: Int) -> Result<Int, Refusal>
+  write connect_to[s](to: SocketAddress, options: List<SocketOption>, timeout_ms: Int) -> Result<Int, Error>
   /// A connection to the Unix socket at `path` under the root `--fs` binds as `root`.
-  write connect_unix[s](root: String, path: String, timeout_ms: Int) -> Result<Int, Refusal>
+  write connect_unix[s](root: String, path: String, timeout_ms: Int) -> Result<Int, Error>
   /// The TLS handshake, completed now rather than when a request needs it, answering what it took in
   /// microseconds. `None` for a connection with no handshake to complete: a plaintext one, or one
   /// whose handshake failed, which ends it. A session that already handshook answers what took it.
@@ -160,11 +160,11 @@ pub nondet effect net {
   /// secured connection afterwards. `alpn` is the application protocols to offer, none when empty.
   /// `unread` is the plaintext the caller read and has not consumed: it must be empty, and it or
   /// anything the socket still holds is `Injected`. An `Err` ends the connection.
-  write start_tls[s](conn: Int, name: String, alpn: List<String>, unread: Bytes, timeout_ms: Int) -> Result<Secured, Refusal>
+  write start_tls[s](conn: Int, name: String, alpn: List<String>, unread: Bytes, timeout_ms: Int) -> Result<UpgradeResult, Error>
   /// The server's half of `start_tls`, with the credential `--tls` names `credential`; one the run
   /// lacks is `E0429`. `alpn` is the protocols to accept; empty agrees on none and refuses no
   /// client. `unread` is what the caller read past the request to upgrade, and must be empty.
-  write serve_tls[s](conn: Int, credential: String, alpn: List<String>, unread: Bytes, timeout_ms: Int) -> Result<Secured, Refusal>
+  write serve_tls[s](conn: Int, credential: String, alpn: List<String>, unread: Bytes, timeout_ms: Int) -> Result<UpgradeResult, Error>
   /// The next connection a listener takes, waiting for one; `0` once the run has stopped accepting.
   write accept[s](listener: Int) -> Int
   /// At most `max` bytes, as soon as any arrive; a shorter answer is not the end of what the peer
@@ -179,7 +179,7 @@ pub nondet effect net {
   /// Closes a listener or a connection.
   write close[s](socket: Int) -> Unit
   /// Sets one option of a listener or a connection.
-  write set_option[s](socket: Int, option: SocketOption) -> Result<Unit, Refusal>
+  write set_option[s](socket: Int, option: SocketOption) -> Result<Unit, Error>
   /// The port this end of a socket is bound to: for a listener asked for port 0, the one it was
   /// given. `None` for a listener the drain has closed.
   read local_port[s](socket: Int) -> Option<Int>
@@ -216,11 +216,11 @@ pub nondet effect net {
 /// What a socket refuses.
 pub effect socket {
   /// A connection did not open, or an upgrade did not complete.
-  raise refused(why: Refusal)
+  raise fail(why: Error)
 }
 
 /// A refusal as a sentence.
-pub fn refusal_message(why: Refusal) -> String =
+pub fn error_message(why: Error) -> String =
   match why {
     Refused -> "nothing is listening there",
     Unreachable -> "no route leads there",
@@ -275,8 +275,8 @@ pub fn dial_address<[l]>(
   to: SocketAddress,
   options: List<SocketOption>,
   timeout_ms: Int,
-) -> Int / {net.connect_to[l], socket.refused} =
-  match net.connect_to[l](to, options, timeout_ms) { Ok(c) -> c, Err(why) -> socket.refused(why) }
+) -> Int / {net.connect_to[l], socket.fail} =
+  match net.connect_to[l](to, options, timeout_ms) { Ok(c) -> c, Err(why) -> socket.fail(why) }
 
 /// A connection to `name` at `port`: its addresses looked up through `dns`, ordered by
 /// `dns::interleave`, and tried one at a time until one connects. `timeout_ms` is one deadline on
@@ -290,7 +290,7 @@ pub fn dial<[l]>(
   port: Int,
   options: List<SocketOption>,
   timeout_ms: Int,
-) -> Int / {dns.lookup, net.connect_to[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+) -> Int / {dns.lookup, net.connect_to[l], socket.fail, task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
   dialled[l](name, port, options, ending("dial", timeout_ms))
 
 /// The instant `timeout_ms` from now, or the deadline around this call where that is earlier.
@@ -321,12 +321,12 @@ fn dialled<[l]>(
   port: Int,
   options: List<SocketOption>,
   end: Instant,
-) -> Int / {dns.lookup, net.connect_to[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at} =
+) -> Int / {dns.lookup, net.connect_to[l], socket.fail, task.write, clock.read, clock.write, task::deadline.at} =
   match dns::resolve(name, between(clock.now(), end)) {
     Ok(found) -> reached[l](dns::interleave(dns::addresses(found)), port, options, end),
-    Err(dns::TimedOut) -> socket.refused(TimedOut),
-    Err(dns::Other(code, text)) -> socket.refused(Other(code, text)),
-    Err(_) -> socket.refused(NameNotFound),
+    Err(dns::TimedOut) -> socket.fail(TimedOut),
+    Err(dns::Other(code, text)) -> socket.fail(Other(code, text)),
+    Err(_) -> socket.fail(NameNotFound),
   }
 
 fn reached<[l]>(
@@ -334,16 +334,16 @@ fn reached<[l]>(
   port: Int,
   options: List<SocketOption>,
   end: Instant,
-) -> Int / {net.connect_to[l], socket.refused, clock.read} =
+) -> Int / {net.connect_to[l], socket.fail, clock.read} =
   match addresses {
-    [] -> socket.refused(NameNotFound),
+    [] -> socket.fail(NameNotFound),
     [address, ..rest] -> match ip::socket_address(address, port) {
-      None -> socket.refused(Other(0, "a port is 0 to 65535")),
+      None -> socket.fail(Other(0, "a port is 0 to 65535")),
       Some(to) -> match ms_left(end) {
-        None -> socket.refused(TimedOut),
+        None -> socket.fail(TimedOut),
         Some(left) -> match net.connect_to[l](to, options, max(left / addresses.len(), 1)) {
           Ok(c) -> c,
-          Err(why) -> if rest.len() == 0 { socket.refused(why) }
+          Err(why) -> if rest.len() == 0 { socket.fail(why) }
           else { reached[l](rest, port, options, end) },
         },
       },
@@ -357,10 +357,10 @@ pub fn secure<[l]>(
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
-) -> Secured / {net.start_tls[l], socket.refused} =
+) -> UpgradeResult / {net.start_tls[l], socket.fail} =
   match net.start_tls[l](conn, name, alpn, unread, timeout_ms) {
     Ok(secured) -> secured,
-    Err(why) -> socket.refused(why),
+    Err(why) -> socket.fail(why),
   }
 
 /// `conn` secured as its server, raising why it is not: `net.serve_tls`, with its rules.
@@ -370,10 +370,10 @@ pub fn secure_accepted<[l]>(
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
-) -> Secured / {net.serve_tls[l], socket.refused} =
+) -> UpgradeResult / {net.serve_tls[l], socket.fail} =
   match net.serve_tls[l](conn, credential, alpn, unread, timeout_ms) {
     Ok(secured) -> secured,
-    Err(why) -> socket.refused(why),
+    Err(why) -> socket.fail(why),
   }
 
 /// A TLS connection to `name` at `port`, dialled as `dial` dials and then secured as `name`,
@@ -385,7 +385,7 @@ pub fn dial_tls<[l]>(
   alpn: List<String>,
   options: List<SocketOption>,
   timeout_ms: Int,
-) -> Int / {dns.lookup, net.connect_to[l], net.start_tls[l], net.close[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
+) -> Int / {dns.lookup, net.connect_to[l], net.start_tls[l], net.close[l], socket.fail, task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
   let end = ending("dial_tls", timeout_ms);
   let c = dialled[l](name, port, options, end);
   let secured = match ms_left(end) {
@@ -396,7 +396,7 @@ pub fn dial_tls<[l]>(
     Ok(_) -> c,
     Err(why) -> {
       net.close[l](c);
-      socket.refused(why)
+      socket.fail(why)
     },
   }
 }
@@ -405,23 +405,20 @@ pub fn dial_tls<[l]>(
 pub fn listening<[l]>(
   at: SocketAddress,
   options: List<SocketOption>,
-) -> Int / {net.listen_on[l], socket.refused} =
-  match net.listen_on[l](at, options) { Ok(s) -> s, Err(why) -> socket.refused(why) }
+) -> Int / {net.listen_on[l], socket.fail} =
+  match net.listen_on[l](at, options) { Ok(s) -> s, Err(why) -> socket.fail(why) }
 
 /// A listener on the Unix socket at `path` under `root`, raising why there is none.
-pub fn listening_unix<[l]>(
-  root: String,
-  path: String,
-) -> Int / {net.listen_unix[l], socket.refused} =
-  match net.listen_unix[l](root, path) { Ok(s) -> s, Err(why) -> socket.refused(why) }
+pub fn listening_unix<[l]>(root: String, path: String) -> Int / {net.listen_unix[l], socket.fail} =
+  match net.listen_unix[l](root, path) { Ok(s) -> s, Err(why) -> socket.fail(why) }
 
 /// A connection to the Unix socket at `path` under `root`, raising why there is none.
 pub fn dial_unix<[l]>(
   root: String,
   path: String,
   timeout_ms: Int,
-) -> Int / {net.connect_unix[l], socket.refused} =
-  match net.connect_unix[l](root, path, timeout_ms) { Ok(c) -> c, Err(why) -> socket.refused(why) }
+) -> Int / {net.connect_unix[l], socket.fail} =
+  match net.connect_unix[l](root, path, timeout_ms) { Ok(c) -> c, Err(why) -> socket.fail(why) }
 
 /// A connection as a source: each pull is one `recv` within `timeout_ms`, the end is the peer done
 /// sending, and a deadline raises `TimedOut`. Its `close` closes the connection, so the hold of
@@ -429,12 +426,12 @@ pub fn dial_unix<[l]>(
 pub fn reading<[l]>(
   conn: Int,
   timeout_ms: Int,
-) -> Source<| {net.recv[l], net.close[l], socket.refused}> =
+) -> Source<| {net.recv[l], net.close[l], socket.fail}> =
   {
     pull: |size: Int|
       match net.recv[l](conn, size, timeout_ms) {
         Some(bytes) -> bytes,
-        None -> socket.refused(TimedOut),
+        None -> socket.fail(TimedOut),
       },
     close: || net.close[l](conn),
   }
@@ -456,21 +453,21 @@ pub fn writing<[l]>(
 /// What the far end of a scripted connection does next.
 pub type Step =
   /// It sends these bytes.
-  | Says(Bytes)
+  | Sends(Bytes)
   /// It waits until it has heard exactly these bytes, in order, after what it heard before. A
   /// program that sends anything else fails where it sends it.
-  | Hears(Bytes)
+  | Expects(Bytes)
   /// It waits until this end has ended its sending.
-  | HearsEnd
+  | ExpectsEnd
   /// It waits until it has heard exactly these bytes, written whole by one `send_secret`: a
   /// credential in its frame, as `sent_secret` makes it, which the far end knows as a server
   /// knows a password. A program that sends anything else here, or these bytes any other way,
   /// fails where it sends it, and nothing says how what it sent differs.
-  | HearsSecret(Bytes)
+  | ExpectsSecret(Bytes)
   /// It does its half of a TLS handshake here, and what follows is read only once secured.
   | Upgrades
   /// It fails a TLS handshake here with this refusal.
-  | Refuses(Refusal)
+  | Refuses(Error)
   /// It sends nothing before one deadline passes.
   | Stalls
   /// It sends nothing more and stays: every read from here on is a deadline.
@@ -484,7 +481,7 @@ pub type Step =
 
 /// What a connection to an address the twin was told of finds: a peer that answers each
 /// connection with the next of its scripts, or a refusal.
-pub type Reach = | Serving(List<List<Step>>) | Failing(Refusal)
+pub type Endpoint = | Serving(List<List<Step>>) | Failing(Error)
 
 /// A client the twin's `accept` hands out: where it calls from, what it does, for a Unix socket who
 /// it is, and the certificate (DER) it presents once its connection is secured.
@@ -509,7 +506,7 @@ pub type MemListener = {
 /// A connection a twin holds. `script` is what the far end does next; `fed` says the far end may
 /// send more than the script holds, which is so while it is the program's own and open; `gone`
 /// says it will take nothing more. `sent` is everything this end sent but credentials, which
-/// `sealed` holds as `send_secret` framed them; `unheard` is what no `Hears` has matched yet,
+/// `sealed` holds as `send_secret` framed them; `unheard` is what no `Expects` has matched yet,
 /// and `deadlines` the deadline each read was given, in order.
 pub type MemConn = {
   label: Option<String>,
@@ -526,7 +523,7 @@ pub type MemConn = {
   deadlines: List<Int>,
   secured: Option<String>,
   /// The application protocol the connection's handshake agreed, where it agreed one.
-  agreed: Option<String>,
+  negotiated: Option<String>,
   options: List<SocketOption>,
   credentials: Option<PeerCredentials>,
   /// `accept` handed the connection out, and the certificate its client presents, where it does.
@@ -541,7 +538,7 @@ pub type MemNet = {
   port: Int,
   listeners: Map<Int, MemListener>,
   conns: Map<Int, MemConn>,
-  reaches: Map<String, Reach>,
+  reaches: Map<String, Endpoint>,
   callers: List<Caller>,
   names: dns::Table,
   credentials: List<String>,
@@ -552,7 +549,7 @@ pub type MemNet = {
 }
 
 /// An operation's two answers: the network it left, and what the host would have answered.
-pub type Stepped<a> = { net: MemNet, answer: a }
+pub type StepResult<a> = { net: MemNet, result: a }
 
 /// A network nothing listens on, that knows no name.
 pub fn mem_empty() -> MemNet =
@@ -572,7 +569,7 @@ pub fn mem_empty() -> MemNet =
 
 /// The network with a far end secured as `name` presenting the certificate `der`, and with a
 /// connection `Presenting(name)` presenting it to the program's own listener.
-pub fn mem_presenting(n: MemNet, name: String, der: Bytes) -> MemNet =
+pub fn mem_server_certificate(n: MemNet, name: String, der: Bytes) -> MemNet =
   { ..n, leaves: n.leaves.insert(name, der) }
 
 /// The network with a peer at `at` that answers each connection with the next of `scripts`, and
@@ -581,7 +578,7 @@ pub fn mem_serving(n: MemNet, at: SocketAddress, scripts: List<List<Step>>) -> M
   { ..n, reaches: n.reaches.insert(ip::render_socket(at), Serving(scripts)) }
 
 /// The network with every connection to `at` refused with `why`.
-pub fn mem_failing(n: MemNet, at: SocketAddress, why: Refusal) -> MemNet =
+pub fn mem_failing(n: MemNet, at: SocketAddress, why: Error) -> MemNet =
   { ..n, reaches: n.reaches.insert(ip::render_socket(at), Failing(why)) }
 
 /// The network with a peer on the Unix socket at `path` under `root`.
@@ -607,7 +604,7 @@ pub fn mem_calling(n: MemNet, from: SocketAddress, script: List<Step>) -> MemNet
 
 /// `mem_calling`, for a client that presents the certificate `der` once its connection is
 /// secured: what a server's `net.peer_certificate` then answers.
-pub fn mem_calling_presenting(
+pub fn mem_calling_with_certificate(
   n: MemNet,
   from: SocketAddress,
   der: Bytes,
@@ -645,7 +642,7 @@ pub fn mem_credential(n: MemNet, name: String) -> MemNet =
 
 /// The network moving at most `most` bytes in each `recv` and `send` from here on, and as many
 /// as it is asked when `most` is zero: the short reads and partial writes a socket gives.
-pub fn mem_short(n: MemNet, most: Int) -> MemNet = { ..n, short: most }
+pub fn mem_chunk_limit(n: MemNet, most: Int) -> MemNet = { ..n, short: most }
 
 /// Everything the program sent on `conn` but credentials, whether or not it is still open.
 pub fn mem_sent(n: MemNet, conn: Int) -> Bytes =
@@ -681,11 +678,11 @@ fn deadline(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
 
 /// `max`, refused where a read asks for no bytes: an empty answer is the peer done sending, so a
 /// read of none would answer as the end of the stream does.
-fn asked_for(max: Int) -> Int / {abort.raise} =
+fn checked_read_size(max: Int) -> Int / {abort.raise} =
   if max <= 0 { panic("`net.recv` was asked for " ++ max.to_string() ++ " bytes") } else { max }
 
 /// Refuses a write of nothing, which would answer as a peer gone does.
-fn something_to(operation: String, empty: Bool) -> Unit / {abort.raise} =
+fn check_nonempty_write(operation: String, empty: Bool) -> Unit / {abort.raise} =
   if empty { panic("`net." ++ operation ++ "` was given an empty payload") } else { () }
 
 /// Whether a run may listen at `at`: a listener the rest of a network can reach is not a run's to
@@ -759,14 +756,15 @@ fn listener_of(n: MemNet, label: String, id: Int) -> MemListener / {abort.raise}
 fn with_conn(n: MemNet, id: Int, c: MemConn) -> MemNet = { ..n, conns: n.conns.insert(id, c) }
 
 /// The connection with every step at the head of its script that has been met taken off: a
-/// `Hears` the program has sent all of, a `HearsEnd` after it ended its sending, a `Says` of
-/// nothing, and a `Leaves`, which ends the script. A `Hears` the program has sent something else
-/// for fails here, and so does a `HearsSecret` it has sent plain bytes for.
-fn listened(c: MemConn) -> MemConn / {abort.raise} =
+/// `Expects` the program has sent all of, a `ExpectsEnd` after it ended its sending, a `Sends` of
+/// nothing, and a `Leaves`, which ends the script. A `Expects` the program has sent something else
+/// for fails here, and so does a `ExpectsSecret` it has sent plain bytes for.
+fn advance_script(c: MemConn) -> MemConn / {abort.raise} =
   match c.script {
-    [Says(bytes), ..rest] -> if bytes.len() == 0 { listened({ ..c, script: rest }) } else { c },
-    [HearsEnd, ..rest] -> if c.ended { listened({ ..c, script: rest }) } else { c },
-    [HearsSecret(_), ..] -> if c.unheard.len() == 0 { c } else {
+    [Sends(bytes), ..rest] -> if bytes.len() == 0 { advance_script({ ..c, script: rest }) }
+    else { c },
+    [ExpectsEnd, ..rest] -> if c.ended { advance_script({ ..c, script: rest }) } else { c },
+    [ExpectsSecret(_), ..] -> if c.unheard.len() == 0 { c } else {
       panic(
         "the peer was to hear a credential and the program sent \""
           ++ String::of_bytes_lossy(c.unheard)
@@ -774,10 +772,10 @@ fn listened(c: MemConn) -> MemConn / {abort.raise} =
       )
     },
     [Leaves, ..] -> { ..c, script: [], fed: false, gone: true },
-    [Hears(expected), ..rest] -> {
+    [Expects(expected), ..rest] -> {
       let wanted = expected.len();
       if c.unheard.starts_with(expected) {
-        listened({ ..c, script: rest, unheard: c.unheard.slice(wanted, c.unheard.len()) })
+        advance_script({ ..c, script: rest, unheard: c.unheard.slice(wanted, c.unheard.len()) })
       } else if expected.starts_with(c.unheard) { c } else {
         panic(
           "the peer was to hear \"" ++ String::of_bytes_lossy(expected)
@@ -809,7 +807,7 @@ fn new_conn(
     unheard: b"",
     deadlines: [],
     secured: None,
-    agreed: None,
+    negotiated: None,
     options: [NoDelay(true)],
     credentials: None,
     accepted: false,
@@ -829,11 +827,11 @@ fn bind(
   port: Int,
   tls: Option<String>,
   options: List<SocketOption>,
-) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+) -> StepResult<Result<Int, Error>> / {abort.raise} = {
   let assigned = if port == 0 { n.port } else { port };
   let at = ip::socket_at(address, assigned);
   let key = ip::render_socket(at);
-  if bound_at(n, key) != None || n.reaches.contains(key) { { net: n, answer: Err(AddressInUse) } }
+  if bound_at(n, key) != None || n.reaches.contains(key) { { net: n, result: Err(AddressInUse) } }
   else {
     let l: MemListener = {
       label: label,
@@ -850,7 +848,7 @@ fn bind(
         port: if port == 0 { n.port + 1 } else { n.port },
         listeners: n.listeners.insert(n.next, l),
       },
-      answer: Ok(n.next),
+      result: Ok(n.next),
     }
   }
 }
@@ -865,10 +863,10 @@ fn port_checked(operation: String, port: Int) -> Int / {abort.raise} =
 
 /// What `net.listen` answers over the network. A port already bound fails as the host's bind
 /// does.
-pub fn mem_listen(n: MemNet, label: String, port: Int) -> Stepped<Int> / {abort.raise} = {
+pub fn mem_listen(n: MemNet, label: String, port: Int) -> StepResult<Int> / {abort.raise} = {
   let bound = bind(n, label, ip::loopback_v4(), port_checked("listen", port), None, []);
-  match bound.answer {
-    Ok(id) -> { net: bound.net, answer: id },
+  match bound.result {
+    Ok(id) -> { net: bound.net, result: id },
     Err(_) ->
       panic("`net.listen` could not bind 127.0.0.1:" ++ port.to_string() ++ ": address in use"),
   }
@@ -881,11 +879,11 @@ pub fn mem_listen_tls(
   label: String,
   port: Int,
   credential: String,
-) -> Stepped<Int> / {abort.raise} = {
+) -> StepResult<Int> / {abort.raise} = {
   let held = credentialed(n, credential);
   let bound = bind(n, label, ip::loopback_v4(), port_checked("listen_tls", port), Some(held), []);
-  match bound.answer {
-    Ok(id) -> { net: bound.net, answer: id },
+  match bound.result {
+    Ok(id) -> { net: bound.net, result: id },
     Err(_) ->
       panic("`net.listen_tls` could not bind 127.0.0.1:" ++ port.to_string() ++ ": address in use"),
   }
@@ -901,8 +899,8 @@ pub fn mem_listen_on(
   label: String,
   at: SocketAddress,
   options: List<SocketOption>,
-) -> Stepped<Result<Int, Refusal>> / {abort.raise} =
-  if !listenable(at) { { net: n, answer: Err(PermissionDenied) } }
+) -> StepResult<Result<Int, Error>> / {abort.raise} =
+  if !listenable(at) { { net: n, result: Err(PermissionDenied) } }
   else { bind(n, label, ip::socket_ip(at), ip::socket_port(at), None, options.map(option_checked)) }
 
 /// What `net.listen_unix` answers over the network, which keeps the path bound until the
@@ -912,12 +910,12 @@ pub fn mem_listen_unix(
   label: String,
   root: String,
   path: String,
-) -> Stepped<Result<Int, Refusal>> = {
+) -> StepResult<Result<Int, Error>> = {
   let key = unix_key(root, path);
-  if bound_at(n, key) != None || n.reaches.contains(key) { { net: n, answer: Err(AddressInUse) } }
+  if bound_at(n, key) != None || n.reaches.contains(key) { { net: n, result: Err(AddressInUse) } }
   else {
     let l: MemListener = { label: label, at: None, key: key, tls: None, waiting: [], options: [] };
-    { net: { ..n, next: n.next + 1, listeners: n.listeners.insert(n.next, l) }, answer: Ok(n.next) }
+    { net: { ..n, next: n.next + 1, listeners: n.listeners.insert(n.next, l) }, result: Ok(n.next) }
   }
 }
 
@@ -929,7 +927,7 @@ fn opened(
   to: Option<SocketAddress>,
   key: String,
   options: List<SocketOption>,
-) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+) -> StepResult<Result<Int, Error>> / {abort.raise} = {
   let local = match to {
     Some(at) -> Some(ip::socket_at(ip::loopback_like(ip::socket_ip(at)), n.port)),
     None -> None,
@@ -959,7 +957,7 @@ fn opened(
           ),
           listeners: n.listeners.insert(listener, { ..l, waiting: l.waiting.push(n.next + 1) }),
         },
-        answer: Ok(n.next),
+        result: Ok(n.next),
       }
     },
     None -> match n.reaches.get(key) {
@@ -971,10 +969,10 @@ fn opened(
             conns: n.conns.insert(n.next, { ..mine, script: script }),
             reaches: n.reaches.insert(key, Serving(rest)),
           },
-          answer: Ok(n.next),
+          result: Ok(n.next),
         },
-      Some(Failing(why)) -> { net: n, answer: Err(why) },
-      _ -> { net: n, answer: Err(Refused) },
+      Some(Failing(why)) -> { net: n, result: Err(why) },
+      _ -> { net: n, result: Err(Refused) },
     },
   }
 }
@@ -991,7 +989,7 @@ pub fn mem_connect_to(
   to: SocketAddress,
   options: List<SocketOption>,
   timeout_ms: Int,
-) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+) -> StepResult<Result<Int, Error>> / {abort.raise} = {
   deadline("connect_to", timeout_ms);
   opened(n, label, Some(to), ip::render_socket(to), options.map(option_checked))
 }
@@ -1003,7 +1001,7 @@ pub fn mem_connect_unix(
   root: String,
   path: String,
   timeout_ms: Int,
-) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+) -> StepResult<Result<Int, Error>> / {abort.raise} = {
   deadline("connect_unix", timeout_ms);
   opened(n, label, None, unix_key(root, path), [])
 }
@@ -1016,7 +1014,7 @@ pub fn mem_connect(
   host: String,
   port: Int,
   timeout_ms: Int,
-) -> Stepped<Option<Int>> / {abort.raise} = {
+) -> StepResult<Option<Int>> / {abort.raise} = {
   deadline("connect", timeout_ms);
   let found = match dns::table_lookup(n.names, host) {
     Ok(found) -> dns::addresses(found),
@@ -1030,14 +1028,14 @@ fn first_reached(
   label: String,
   addresses: List<Ip>,
   port: Int,
-) -> Stepped<Option<Int>> / {abort.raise} =
+) -> StepResult<Option<Int>> / {abort.raise} =
   match addresses {
-    [] -> { net: n, answer: None },
+    [] -> { net: n, result: None },
     [address, ..rest] -> {
       let to = ip::socket_at(address, port);
       let tried = opened(n, label, Some(to), ip::render_socket(to), []);
-      match tried.answer {
-        Ok(id) -> { net: tried.net, answer: Some(id) },
+      match tried.result {
+        Ok(id) -> { net: tried.net, result: Some(id) },
         Err(_) -> first_reached(n, label, rest, port),
       }
     },
@@ -1051,14 +1049,18 @@ pub fn mem_connect_tls(
   host: String,
   port: Int,
   timeout_ms: Int,
-) -> Stepped<Option<Int>> / {abort.raise} = {
+) -> StepResult<Option<Int>> / {abort.raise} = {
   let reached = mem_connect(n, label, host, port, timeout_ms);
-  match reached.answer {
+  match reached.result {
     Some(id) -> match reached.net.conns.get(id) {
       Some(c) ->
         {
-          net: with_conn(reached.net, id, { ..c, secured: Some(host), agreed: Some("http/1.1") }),
-          answer: Some(id),
+          net: with_conn(reached.net, id, {
+            ..c,
+            secured: Some(host),
+            negotiated: Some("http/1.1"),
+          }),
+          result: Some(id),
         },
       None -> reached,
     },
@@ -1069,13 +1071,13 @@ pub fn mem_connect_tls(
 /// What `net.accept` answers over the network: the program's own connection waiting on the
 /// listener, else the next client the network was told of, else `0`, as a host that has stopped
 /// accepting answers.
-pub fn mem_accept(n: MemNet, label: String, listener: Int) -> Stepped<Int> / {abort.raise} = {
+pub fn mem_accept(n: MemNet, label: String, listener: Int) -> StepResult<Int> / {abort.raise} = {
   let l = listener_of(n, label, listener);
   match l.waiting {
     [id, ..rest] ->
-      { net: { ..n, listeners: n.listeners.insert(listener, { ..l, waiting: rest }) }, answer: id },
+      { net: { ..n, listeners: n.listeners.insert(listener, { ..l, waiting: rest }) }, result: id },
     [] -> match n.callers {
-      [] -> { net: n, answer: 0 },
+      [] -> { net: n, result: 0 },
       [caller, ..rest] -> {
         let fresh = new_conn(l.at, caller.from, caller.script);
         let c = {
@@ -1087,7 +1089,7 @@ pub fn mem_accept(n: MemNet, label: String, listener: Int) -> Stepped<Int> / {ab
         };
         {
           net: { ..n, next: n.next + 1, callers: rest, conns: n.conns.insert(n.next, c) },
-          answer: n.next,
+          result: n.next,
         }
       },
     },
@@ -1102,25 +1104,25 @@ pub fn mem_recv(
   conn: Int,
   max: Int,
   timeout_ms: Int,
-) -> Stepped<Option<Bytes>> / {abort.raise} = {
+) -> StepResult<Option<Bytes>> / {abort.raise} = {
   deadline("recv", timeout_ms);
-  let wanted = asked_for(max);
-  let asked = listened(conn_of(n, label, conn));
+  let wanted = checked_read_size(max);
+  let asked = advance_script(conn_of(n, label, conn));
   let c = { ..asked, deadlines: asked.deadlines.push(timeout_ms) };
   let most = if n.short > 0 { min(wanted, n.short) } else { wanted };
   match c.script {
-    [] -> { net: with_conn(n, conn, c), answer: if c.fed { None } else { Some(b"") } },
-    [Says(bytes), ..rest] -> if bytes.len() > most {
+    [] -> { net: with_conn(n, conn, c), result: if c.fed { None } else { Some(b"") } },
+    [Sends(bytes), ..rest] -> if bytes.len() > most {
       let left = bytes.slice(most, bytes.len());
       {
-        net: with_conn(n, conn, { ..c, script: [Says(left)].concat(rest) }),
-        answer: Some(bytes.slice(0, most)),
+        net: with_conn(n, conn, { ..c, script: [Sends(left)].concat(rest) }),
+        result: Some(bytes.slice(0, most)),
       }
-    } else { { net: with_conn(n, conn, { ..c, script: rest }), answer: Some(bytes) } },
+    } else { { net: with_conn(n, conn, { ..c, script: rest }), result: Some(bytes) } },
     [Repeats(bytes), ..] ->
-      { net: with_conn(n, conn, c), answer: Some(bytes.slice(0, min(most, bytes.len()))) },
-    [Stalls, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: None },
-    _ -> { net: with_conn(n, conn, c), answer: None },
+      { net: with_conn(n, conn, c), result: Some(bytes.slice(0, min(most, bytes.len()))) },
+    [Stalls, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: None },
+    _ -> { net: with_conn(n, conn, c), result: None },
   }
 }
 
@@ -1132,18 +1134,22 @@ pub fn mem_send(
   conn: Int,
   payload: Bytes,
   timeout_ms: Int,
-) -> Stepped<Option<Int>> / {abort.raise} = {
+) -> StepResult<Option<Int>> / {abort.raise} = {
   deadline("send", timeout_ms);
-  something_to("send", payload.len() == 0);
-  let c = listened(conn_of(n, label, conn));
-  if c.ended || c.gone { { net: with_conn(n, conn, c), answer: Some(0) } } else {
+  check_nonempty_write("send", payload.len() == 0);
+  let c = advance_script(conn_of(n, label, conn));
+  if c.ended || c.gone { { net: with_conn(n, conn, c), result: Some(0) } } else {
     match c.script {
-      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: None },
+      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: None },
       _ -> {
         let size = if n.short > 0 { min(payload.len(), n.short) } else { payload.len() };
         let part = payload.slice(0, size);
-        let mine = listened({ ..c, sent: c.sent.concat(part), unheard: c.unheard.concat(part) });
-        { net: passed_on(with_conn(n, conn, mine), c.joined, part), answer: Some(size) }
+        let mine = advance_script({
+          ..c,
+          sent: c.sent.concat(part),
+          unheard: c.unheard.concat(part),
+        });
+        { net: passed_on(with_conn(n, conn, mine), c.joined, part), result: Some(size) }
       },
     }
   }
@@ -1168,7 +1174,7 @@ pub fn sent_secret(
 }
 
 /// What `net.send_secret` answers over the network: every byte or none, all of it sealed. The far
-/// end hears the credential in its frame, whole, as a `HearsSecret` waits for it, and
+/// end hears the credential in its frame, whole, as a `ExpectsSecret` waits for it, and
 /// `mem_sent_secrets` keeps it; nothing of it is in `mem_sent`. A credential is not handed to
 /// the program's own end, which would read it as plain bytes: a joined connection fails here,
 /// where a socket would deliver it.
@@ -1181,12 +1187,12 @@ pub fn mem_send_secret(
   encoding: String,
   after: Bytes,
   timeout_ms: Int,
-) -> Stepped<Bool> / {abort.raise} = {
+) -> StepResult<Bool> / {abort.raise} = {
   deadline("send_secret", timeout_ms);
   let framed = sent_secret(before, secret, encoding, after);
-  something_to("send_secret", framed.is_empty());
-  let c = listened(conn_of(n, label, conn));
-  if c.ended || c.gone { { net: with_conn(n, conn, c), answer: false } } else if c.joined != None {
+  check_nonempty_write("send_secret", framed.is_empty());
+  let c = advance_script(conn_of(n, label, conn));
+  if c.ended || c.gone { { net: with_conn(n, conn, c), result: false } } else if c.joined != None {
     panic(
       "the twin cannot hand a credential to the program's own end of socket " ++ conn.to_string()
         ++ ": nothing in Ply opens it",
@@ -1194,16 +1200,16 @@ pub fn mem_send_secret(
   } else {
     let kept = { ..c, sealed: c.sealed.push(framed) };
     match c.script {
-      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: false },
-      [Hears(expected), ..] ->
+      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: false },
+      [Expects(expected), ..] ->
         panic(
           "the peer was to hear \"" ++ String::of_bytes_lossy(expected)
             ++ "\" and the program sent a credential",
         ),
-      [HearsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
-        { net: with_conn(n, conn, listened({ ..kept, script: rest })), answer: true }
+      [ExpectsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
+        { net: with_conn(n, conn, advance_script({ ..kept, script: rest })), result: true }
       } else { panic("the peer was to hear one credential and the program sent another") },
-      _ -> { net: with_conn(n, conn, kept), answer: true },
+      _ -> { net: with_conn(n, conn, kept), result: true },
     }
   }
 }
@@ -1213,7 +1219,7 @@ fn passed_on(n: MemNet, other: Option<Int>, bytes: Bytes) -> MemNet =
   match other {
     None -> n,
     Some(id) -> match n.conns.get(id) {
-      Some(c) -> with_conn(n, id, { ..c, script: c.script.push(Says(bytes)) }),
+      Some(c) -> with_conn(n, id, { ..c, script: c.script.push(Sends(bytes)) }),
       None -> n,
     },
   }
@@ -1236,25 +1242,28 @@ fn parted(n: MemNet, other: Option<Int>, closed: Bool) -> MemNet =
   }
 
 /// What `net.close_write` does over the network.
-pub fn mem_close_write(n: MemNet, label: String, conn: Int) -> Stepped<Unit> / {abort.raise} = {
+pub fn mem_close_write(n: MemNet, label: String, conn: Int) -> StepResult<Unit> / {abort.raise} = {
   let c = conn_of(n, label, conn);
-  { net: parted(with_conn(n, conn, listened({ ..c, ended: true })), c.joined, false), answer: () }
+  {
+    net: parted(with_conn(n, conn, advance_script({ ..c, ended: true })), c.joined, false),
+    result: (),
+  }
 }
 
 /// What `net.close` does over the network: the handle names nothing afterwards, a Unix listener's
 /// path is free again, and what a connection sent stays readable by `mem_sent`.
-pub fn mem_close(n: MemNet, label: String, socket: Int) -> Stepped<Unit> / {abort.raise} =
+pub fn mem_close(n: MemNet, label: String, socket: Int) -> StepResult<Unit> / {abort.raise} =
   match n.conns.get(socket) {
     Some(_) -> {
       let c = conn_of(n, label, socket);
       let kept = with_conn(n, socket, { ..c, gone: true, ended: true, joined: None });
-      { net: { ..parted(kept, c.joined, true), closed: n.closed.push(socket) }, answer: () }
+      { net: { ..parted(kept, c.joined, true), closed: n.closed.push(socket) }, result: () }
     },
     None -> {
       let _l = listener_of(n, label, socket);
       {
         net: { ..n, listeners: n.listeners.remove(socket), closed: n.closed.push(socket) },
-        answer: (),
+        result: (),
       }
     },
   }
@@ -1271,23 +1280,23 @@ fn upgraded(
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
-) -> Stepped<Result<Secured, Refusal>> / {abort.raise} = {
+) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} = {
   deadline(operation, timeout_ms);
-  let c = listened(conn_of(n, label, conn));
+  let c = advance_script(conn_of(n, label, conn));
   let secured = |rest: List<Step>| {
     {
-      net: with_conn(n, conn, { ..c, script: rest, secured: Some(who), agreed: alpn.at(0) }),
-      answer: Ok({ protocol: alpn.at(0) }),
+      net: with_conn(n, conn, { ..c, script: rest, secured: Some(who), negotiated: alpn.at(0) }),
+      result: Ok({ protocol: alpn.at(0) }),
     }
   };
-  let over = |why: Refusal| {
+  let over = |why: Error| {
     {
       net: parted(
         with_conn(n, conn, { ..c, script: [], fed: false, gone: true, ended: true, joined: None }),
         c.joined,
         true,
       ),
-      answer: Err(why),
+      result: Err(why),
     }
   };
   if c.secured != None {
@@ -1303,7 +1312,7 @@ fn upgraded(
   } else if unread.len() > 0 { over(Injected) } else {
     match c.script {
       [Upgrades, ..rest] -> secured(rest),
-      [Says(_), ..] -> over(Injected),
+      [Sends(_), ..] -> over(Injected),
       [Repeats(_), ..] -> over(Injected),
       [Refuses(why), ..] -> over(why),
       [] -> if c.joined != None { secured([]) } else { over(Reset) },
@@ -1321,7 +1330,7 @@ pub fn mem_start_tls(
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
-) -> Stepped<Result<Secured, Refusal>> / {abort.raise} =
+) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} =
   upgraded(n, "start_tls", label, conn, name, alpn, unread, timeout_ms)
 
 /// What `net.serve_tls` answers over the network, which holds the credentials `mem_credential`
@@ -1334,14 +1343,18 @@ pub fn mem_serve_tls(
   alpn: List<String>,
   unread: Bytes,
   timeout_ms: Int,
-) -> Stepped<Result<Secured, Refusal>> / {abort.raise} =
+) -> StepResult<Result<UpgradeResult, Error>> / {abort.raise} =
   upgraded(n, "serve_tls", label, conn, credentialed(n, credential), alpn, unread, timeout_ms)
 
 /// What `net.handshake` answers over the network: a secured connection has none left to
 /// complete, and a plaintext one has none at all.
-pub fn mem_handshake(n: MemNet, label: String, conn: Int) -> Stepped<Option<Int>> / {abort.raise} = {
+pub fn mem_handshake(
+  n: MemNet,
+  label: String,
+  conn: Int,
+) -> StepResult<Option<Int>> / {abort.raise} = {
   let c = conn_of(n, label, conn);
-  { net: with_conn(n, conn, c), answer: if c.secured == None { None } else { Some(0) } }
+  { net: with_conn(n, conn, c), result: if c.secured == None { None } else { Some(0) } }
 }
 
 /// Which setting an option is, whatever it sets it to.
@@ -1375,7 +1388,7 @@ pub fn mem_set_option(
   label: String,
   socket: Int,
   asked: SocketOption,
-) -> Stepped<Result<Unit, Refusal>> / {abort.raise} = {
+) -> StepResult<Result<Unit, Error>> / {abort.raise} = {
   let option = option_checked(asked);
   match n.conns.get(socket) {
     Some(_) -> {
@@ -1388,7 +1401,7 @@ pub fn mem_set_option(
         },
         _ -> set,
       };
-      { net: match option { Presenting(_) -> presenting, _ -> set }, answer: Ok(()) }
+      { net: match option { Presenting(_) -> presenting, _ -> set }, result: Ok(()) }
     },
     None -> {
       let l = listener_of(n, label, socket);
@@ -1397,7 +1410,7 @@ pub fn mem_set_option(
           ..n,
           listeners: n.listeners.insert(socket, { ..l, options: with_option(l.options, option) }),
         },
-        answer: Ok(()),
+        result: Ok(()),
       }
     },
   }
@@ -1440,8 +1453,8 @@ pub fn mem_peer_address(
   }
 
 /// What `net.peer_certificate` answers over the network, once a connection is secured: to a server,
-/// the certificate its client was handed out presenting (`mem_calling_presenting`), or the program's
-/// own client presents (`Presenting`); to a client, the one `mem_presenting` gave the name it
+/// the certificate its client was handed out presenting (`mem_calling_with_certificate`), or the program's
+/// own client presents (`Presenting`); to a client, the one `mem_server_certificate` gave the name it
 /// secured the connection as.
 pub fn mem_peer_certificate(n: MemNet, label: String, conn: Int) -> Option<Bytes> / {abort.raise} =
   match n.conns.get(conn) {
@@ -1462,7 +1475,7 @@ pub fn mem_peer_certificate(n: MemNet, label: String, conn: Int) -> Option<Bytes
 /// what the twin's far end agrees to, and `http/1.1` for a connection `connect_tls` opened.
 pub fn mem_protocol(n: MemNet, label: String, conn: Int) -> Option<String> / {abort.raise} =
   match n.conns.get(conn) {
-    Some(_) -> conn_of(n, label, conn).agreed,
+    Some(_) -> conn_of(n, label, conn).negotiated,
     None -> {
       let _l = listener_of(n, label, conn);
       None
@@ -1484,7 +1497,7 @@ pub fn mem_peer_credentials(
   }
 
 /// What `go` answered over a twin, and the network it left.
-pub type Over<a> = { value: a, net: MemNet }
+pub type RunResult<a> = { value: a, net: MemNet }
 
 /// `go` run over `start`, every `net` operation under every label answered by the twin and every
 /// `dns` operation by the table the twin holds: what a test hands code that opens, serves or
@@ -1493,7 +1506,7 @@ pub type Over<a> = { value: a, net: MemNet }
 pub fn on_mem<a | e>(
   start: MemNet,
   go: () -> a / {net.read[*], net.write[*], dns.lookup, dns.reverse, dns.servers | e},
-) -> Over<a> / {abort.raise | e bounded} =
+) -> RunResult<a> / {abort.raise | e bounded} =
   handle {
     go()
   } with {
@@ -1501,77 +1514,77 @@ pub fn on_mem<a | e>(
     net.listen[*label](port) -> {
       let s = mem_listen(t, label, port);
       t = s.net;
-      s.answer
+      s.result
     },
     net.listen_tls[*label](port, credential) -> {
       let s = mem_listen_tls(t, label, port, credential);
       t = s.net;
-      s.answer
+      s.result
     },
     net.listen_on[*label](at, options) -> {
       let s = mem_listen_on(t, label, at, options);
       t = s.net;
-      s.answer
+      s.result
     },
     net.listen_unix[*label](root, path) -> {
       let s = mem_listen_unix(t, label, root, path);
       t = s.net;
-      s.answer
+      s.result
     },
     net.connect[*label](host, port, timeout_ms) -> {
       let s = mem_connect(t, label, host, port, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.connect_tls[*label](host, port, timeout_ms) -> {
       let s = mem_connect_tls(t, label, host, port, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.connect_to[*label](to, options, timeout_ms) -> {
       let s = mem_connect_to(t, label, to, options, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.connect_unix[*label](root, path, timeout_ms) -> {
       let s = mem_connect_unix(t, label, root, path, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.handshake[*label](conn) -> {
       let s = mem_handshake(t, label, conn);
       t = s.net;
-      s.answer
+      s.result
     },
     net.start_tls[*label](conn, name, alpn, unread, timeout_ms) -> {
       let s = mem_start_tls(t, label, conn, name, alpn, unread, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.serve_tls[*label](conn, credential, alpn, unread, timeout_ms) -> {
       let s = mem_serve_tls(t, label, conn, credential, alpn, unread, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.accept[*label](listener) -> {
       let s = mem_accept(t, label, listener);
       t = s.net;
-      s.answer
+      s.result
     },
     net.recv[*label](conn, max, timeout_ms) -> {
       let s = mem_recv(t, label, conn, max, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.send[*label](conn, payload, timeout_ms) -> {
       let s = mem_send(t, label, conn, payload, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.send_secret[*label](conn, before, secret, encoding, after, timeout_ms) -> {
       let s = mem_send_secret(t, label, conn, before, secret, encoding, after, timeout_ms);
       t = s.net;
-      s.answer
+      s.result
     },
     net.close_write[*label](conn) -> {
       t = mem_close_write(t, label, conn).net;
@@ -1582,7 +1595,7 @@ pub fn on_mem<a | e>(
     net.set_option[*label](socket, option) -> {
       let s = mem_set_option(t, label, socket, option);
       t = s.net;
-      s.answer
+      s.result
     },
     net.local_port[*label](socket) -> mem_local_port(t, label, socket),
     net.local_address[*label](socket) -> mem_local_address(t, label, socket),
@@ -1599,12 +1612,12 @@ pub fn on_mem<a | e>(
 
 // --- The real handler -------------------------------------------------------
 
-host for net by served
+host for net by host_handler
 
 /// `go` with every socket operation done on the machine, each socket under the label its clause
 /// binds, and every operation that waits waiting in the asking task. Each clause answers with its
 /// value and the handler holds nothing, so a `parallel` branch is answered on its own thread.
-fn served<a | e>(
+fn host_handler<a | e>(
   go: () -> a / {net.read[*], net.write[*] | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
   handle {
@@ -1614,9 +1627,10 @@ fn served<a | e>(
     net.listen_tls[*label](port, credential) ->
       net_listen_tls(label, port_checked("listen_tls", port), credential),
     net.listen_on[*label](at, options) -> if !listenable(at) { Err(PermissionDenied) } else {
-      refused_or(net_listen_on(label, address_written(at), options_written(options)), int_of)
+      decode_result(net_listen_on(label, encode_address(at), encode_options(options)), decode_int)
     },
-    net.listen_unix[*label](root, path) -> refused_or(net_listen_unix(label, root, path), int_of),
+    net.listen_unix[*label](root, path) ->
+      decode_result(net_listen_unix(label, root, path), decode_int),
     net.connect[*label](host, port, timeout_ms) -> {
       deadline("connect", timeout_ms);
       int_found(job_wait(net_connect(label, host, port_checked("connect", port), timeout_ms)))
@@ -1629,18 +1643,18 @@ fn served<a | e>(
     },
     net.connect_to[*label](to, options, timeout_ms) -> {
       deadline("connect_to", timeout_ms);
-      let asked = net_connect_to(label, address_written(to), options_written(options), timeout_ms);
-      refused_or(job_wait(asked), int_of)
+      let asked = net_connect_to(label, encode_address(to), encode_options(options), timeout_ms);
+      decode_result(job_wait(asked), decode_int)
     },
     net.connect_unix[*label](root, path, timeout_ms) -> {
       deadline("connect_unix", timeout_ms);
-      refused_or(job_wait(net_connect_unix(label, root, path, timeout_ms)), int_of)
+      decode_result(job_wait(net_connect_unix(label, root, path, timeout_ms)), decode_int)
     },
     net.handshake[*label](conn) -> int_found(job_wait(net_handshake(label, conn))),
     net.start_tls[*label](conn, name, alpn, unread, timeout_ms) -> {
       deadline("start_tls", timeout_ms);
-      let asked = net_start_tls(label, conn, name, texts_written(alpn), unread.len(), timeout_ms);
-      refused_or(job_wait(asked), secured_read)
+      let asked = net_start_tls(label, conn, name, encode_texts(alpn), unread.len(), timeout_ms);
+      decode_result(job_wait(asked), decode_upgrade_result)
     },
     net.serve_tls[*label](conn, credential, alpn, unread, timeout_ms) -> {
       deadline("serve_tls", timeout_ms);
@@ -1648,32 +1662,32 @@ fn served<a | e>(
         label,
         conn,
         credential,
-        texts_written(alpn),
+        encode_texts(alpn),
         unread.len(),
         timeout_ms,
       );
-      refused_or(job_wait(asked), secured_read)
+      decode_result(job_wait(asked), decode_upgrade_result)
     },
-    net.accept[*label](listener) -> int_of(job_wait(net_accept(label, listener))),
+    net.accept[*label](listener) -> decode_int(job_wait(net_accept(label, listener))),
     net.recv[*label](conn, max, timeout_ms) -> {
       deadline("recv", timeout_ms);
-      found(job_wait(net_recv(label, conn, asked_for(max), timeout_ms)))
+      found(job_wait(net_recv(label, conn, checked_read_size(max), timeout_ms)))
     },
     net.send[*label](conn, payload, timeout_ms) -> {
       deadline("send", timeout_ms);
-      something_to("send", payload.len() == 0);
+      check_nonempty_write("send", payload.len() == 0);
       int_found(job_wait(net_send(label, conn, payload, timeout_ms)))
     },
     net.send_secret[*label](conn, before, secret, encoding, after, timeout_ms) -> {
       deadline("send_secret", timeout_ms);
       let framed = sent_secret(before, secret, encoding, after);
-      something_to("send_secret", framed.is_empty());
+      check_nonempty_write("send_secret", framed.is_empty());
       job_wait(net_send_secret(label, conn, framed, timeout_ms)) == b"\x01"
     },
     net.close_write[*label](conn) -> net_close_write(label, conn),
     net.close[*label](socket) -> net_close(label, socket),
     net.set_option[*label](socket, option) ->
-      refused_or(net_set_option(label, socket, option_written(option)), |_: Bytes| ()),
+      decode_result(net_set_option(label, socket, encode_option(option)), |_: Bytes| ()),
     net.local_port[*label](socket) -> {
       let at = net_local_port(label, socket);
       if at < 0 { None } else { Some(at) }
@@ -1681,12 +1695,12 @@ fn served<a | e>(
     net.local_address[*label](socket) -> address_found(net_local_address(label, socket)),
     net.peer_address[*label](conn) -> address_found(net_peer_address(label, conn)),
     net.peer_credentials[*label](conn) -> match found(net_peer_credentials(label, conn)) {
-      Some(flat) -> Some(credentials_read(flat)),
+      Some(flat) -> Some(decode_credentials(flat)),
       None -> None,
     },
     net.peer_certificate[*label](conn) -> found(net_peer_certificate(label, conn)),
     net.protocol[*label](conn) -> text_found(net_protocol(label, conn)),
-    net.options[*label](socket) -> options_read(net_options(label, socket)),
+    net.options[*label](socket) -> decode_options(net_options(label, socket)),
   }
 
 /// A listener on `port` of the loopback address, as its handle.
@@ -1806,42 +1820,42 @@ extern fn net_options(label: String, socket: Int) -> Bytes / {native.read}
 // --- What the host's socket natives read and write ----------------------------
 
 /// The integer a native found.
-fn int_found(said: Bytes) -> Option<Int> / {abort.raise} =
-  match found(said) { Some(flat) -> Some(int_of(flat)), None -> None }
+fn int_found(encoded: Bytes) -> Option<Int> / {abort.raise} =
+  match found(encoded) { Some(flat) -> Some(decode_int(flat)), None -> None }
 
 /// The text a native found.
-fn text_found(said: Bytes) -> Option<String> =
-  match found(said) { Some(flat) -> Some(String::of_bytes_lossy(flat)), None -> None }
+fn text_found(encoded: Bytes) -> Option<String> =
+  match found(encoded) { Some(flat) -> Some(String::of_bytes_lossy(flat)), None -> None }
 
 /// The socket address a native found.
-fn address_found(said: Bytes) -> Option<SocketAddress> / {abort.raise} =
-  match found(said) { Some(flat) -> Some(address_read(flat)), None -> None }
+fn address_found(encoded: Bytes) -> Option<SocketAddress> / {abort.raise} =
+  match found(encoded) { Some(flat) -> Some(decode_address(flat)), None -> None }
 
-fn texts_written(texts: List<String>) -> Bytes =
-  in_parts(texts.map(|t: String| Bytes::of_string(t)))
+fn encode_texts(texts: List<String>) -> Bytes =
+  encode_parts(texts.map(|t: String| Bytes::of_string(t)))
 
 /// What an upgrade settled: the protocol the two ends agreed, found.
-fn secured_read(said: Bytes) -> Secured = { protocol: text_found(said) }
+fn decode_upgrade_result(encoded: Bytes) -> UpgradeResult = { protocol: text_found(encoded) }
 
 /// Parts: the user, the group, and the process, empty where the platform does not say.
-fn credentials_read(flat: Bytes) -> PeerCredentials / {abort.raise} =
+fn decode_credentials(flat: Bytes) -> PeerCredentials / {abort.raise} =
   match parts(flat) {
     [user, group, process] ->
-      { user: int_of(user), group: int_of(group), process: process.i64_be_at(0) },
+      { user: decode_int(user), group: decode_int(group), process: process.i64_be_at(0) },
     _ -> panic("a socket native wrote no credentials"),
   }
 
 /// A socket address as the host's socket natives read and write one: parts of its address's bytes,
 /// its port in two bytes, and its zone, empty for none.
-pub fn address_written(at: SocketAddress) -> Bytes =
-  in_parts([
+pub fn encode_address(at: SocketAddress) -> Bytes =
+  encode_parts([
     ip::to_bytes(ip::socket_ip(at)),
     u16_be(ip::socket_port(at)),
     match ip::socket_zone(at) { Some(zone) -> Bytes::of_string(zone), None -> b"" },
   ])
 
-/// The socket address `address_written` writes.
-pub fn address_read(flat: Bytes) -> SocketAddress / {abort.raise} =
+/// The socket address `encode_address` writes.
+pub fn decode_address(flat: Bytes) -> SocketAddress / {abort.raise} =
   match parts(flat) {
     [address, port, zone] -> match ip::of_bytes(address) {
       Some(a) -> {
@@ -1858,75 +1872,75 @@ pub fn address_read(flat: Bytes) -> SocketAddress / {abort.raise} =
 /// A socket option as the host's socket natives read and write one: its setting's byte, as
 /// `with_option` numbers settings, and then what it sets: a flag's byte, a size's eight bytes, or
 /// for an option that may set nothing, byte 0, or byte 1 and what it sets.
-pub fn option_written(asked: SocketOption) -> Bytes / {abort.raise} = {
+pub fn encode_option(asked: SocketOption) -> Bytes / {abort.raise} = {
   let option = option_checked(asked);
   byte_of_int(setting(option)).concat(match option {
-    NoDelay(on) -> flag_written(on),
+    NoDelay(on) -> encode_flag(on),
     KeepAlive(None) -> b"\x00",
     KeepAlive(Some(p)) ->
       b"\x01".concat(
-        in_parts([
+        encode_parts([
           i64_be(as_nanos(p.idle)),
           match p.interval { Some(d) -> i64_be(as_nanos(d)), None -> b"" },
           match p.count { Some(n) -> i64_be(n), None -> b"" },
         ]),
       ),
-    ReuseAddress(on) -> flag_written(on),
-    ReusePort(on) -> flag_written(on),
+    ReuseAddress(on) -> encode_flag(on),
+    ReusePort(on) -> encode_flag(on),
     SendBuffer(bytes) -> i64_be(bytes),
     ReceiveBuffer(bytes) -> i64_be(bytes),
     Linger(None) -> b"\x00",
     Linger(Some(d)) -> b"\x01".concat(i64_be(as_nanos(d))),
-    Broadcast(on) -> flag_written(on),
-    MulticastLoop(on) -> flag_written(on),
-    JoinGroup(group, interface) -> group_written(group, interface),
-    LeaveGroup(group, interface) -> group_written(group, interface),
+    Broadcast(on) -> encode_flag(on),
+    MulticastLoop(on) -> encode_flag(on),
+    JoinGroup(group, interface) -> encode_group(group, interface),
+    LeaveGroup(group, interface) -> encode_group(group, interface),
     Presenting(name) -> Bytes::of_string(name),
   })
 }
 
-fn flag_written(on: Bool) -> Bytes = if on { b"\x01" } else { b"\x00" }
+fn encode_flag(on: Bool) -> Bytes = if on { b"\x01" } else { b"\x00" }
 
 /// Parts: the group's address bytes and the interface, empty for the one the host picks.
-fn group_written(group: Ip, interface: Option<String>) -> Bytes =
-  in_parts([
+fn encode_group(group: Ip, interface: Option<String>) -> Bytes =
+  encode_parts([
     ip::to_bytes(group),
     match interface { Some(name) -> Bytes::of_string(name), None -> b"" },
   ])
 
-/// The option `option_written` writes.
-fn option_read(flat: Bytes) -> SocketOption / {abort.raise} = {
+/// The option `encode_option` writes.
+fn decode_option(flat: Bytes) -> SocketOption / {abort.raise} = {
   let rest = flat.slice(1, flat.len());
   let on = rest.len() > 0 && rest.at(0) == 1;
   let after = if rest.len() > 0 { rest.slice(1, rest.len()) } else { b"" };
   match flat.at(0) {
     0 -> NoDelay(on),
-    1 -> KeepAlive(if on { Some(probing_read(after)) } else { None }),
+    1 -> KeepAlive(if on { Some(decode_probing(after)) } else { None }),
     2 -> ReuseAddress(on),
     3 -> ReusePort(on),
-    4 -> SendBuffer(int_of(rest)),
-    5 -> ReceiveBuffer(int_of(rest)),
-    6 -> Linger(if on { Some(nanos(int_of(after))) } else { None }),
+    4 -> SendBuffer(decode_int(rest)),
+    5 -> ReceiveBuffer(decode_int(rest)),
+    6 -> Linger(if on { Some(nanos(decode_int(after))) } else { None }),
     7 -> Broadcast(on),
     8 -> MulticastLoop(on),
-    9 -> match group_read(rest) { (group, interface) -> JoinGroup(group, interface) },
-    10 -> match group_read(rest) { (group, interface) -> LeaveGroup(group, interface) },
+    9 -> match decode_group(rest) { (group, interface) -> JoinGroup(group, interface) },
+    10 -> match decode_group(rest) { (group, interface) -> LeaveGroup(group, interface) },
     _ -> Presenting(String::of_bytes_lossy(rest)),
   }
 }
 
-fn probing_read(flat: Bytes) -> Probing / {abort.raise} =
+fn decode_probing(flat: Bytes) -> Probing / {abort.raise} =
   match parts(flat) {
     [idle, interval, count] ->
       {
-        idle: nanos(int_of(idle)),
+        idle: nanos(decode_int(idle)),
         interval: match interval.i64_be_at(0) { Some(n) -> Some(nanos(n)), None -> None },
         count: count.i64_be_at(0),
       },
     _ -> panic("a socket native wrote no probing"),
   }
 
-fn group_read(flat: Bytes) -> (Ip, Option<String>) / {abort.raise} =
+fn decode_group(flat: Bytes) -> (Ip, Option<String>) / {abort.raise} =
   match parts(flat) {
     [address, interface] -> match ip::of_bytes(address) {
       Some(group) ->
@@ -1937,16 +1951,16 @@ fn group_read(flat: Bytes) -> (Ip, Option<String>) / {abort.raise} =
   }
 
 /// `options` as the host's socket natives read them: each written, as parts.
-pub fn options_written(options: List<SocketOption>) -> Bytes / {abort.raise} =
-  in_parts(options.map(option_written))
+pub fn encode_options(options: List<SocketOption>) -> Bytes / {abort.raise} =
+  encode_parts(options.map(encode_option))
 
-/// The options `options_written` writes.
-pub fn options_read(flat: Bytes) -> List<SocketOption> / {abort.raise} =
-  parts(flat).map(option_read)
+/// The options `encode_options` writes.
+pub fn decode_options(flat: Bytes) -> List<SocketOption> / {abort.raise} =
+  parts(flat).map(decode_option)
 
 /// The refusal a socket native wrote: its kind's byte, `Refused` 1 to `Other` 11 in declaration
 /// order, then `Handshake`'s reason, or `Other`'s code and words as parts.
-fn refusal_read(flat: Bytes) -> Refusal / {abort.raise} = {
+fn decode_socket_error(flat: Bytes) -> Error / {abort.raise} = {
   let rest = flat.slice(1, flat.len());
   match flat.at(0) {
     1 -> Refused,
@@ -1960,7 +1974,7 @@ fn refusal_read(flat: Bytes) -> Refusal / {abort.raise} = {
     9 -> Untrusted,
     10 -> Handshake(String::of_bytes_lossy(rest)),
     _ -> match parts(rest) {
-      [code, words] -> Other(int_of(code), String::of_bytes_lossy(words)),
+      [code, words] -> Other(decode_int(code), String::of_bytes_lossy(words)),
       _ -> Other(0, String::of_bytes_lossy(rest)),
     },
   }
@@ -1968,12 +1982,12 @@ fn refusal_read(flat: Bytes) -> Refusal / {abort.raise} = {
 
 /// What a socket native answered where the operation may be refused: byte 1 and what `ok` reads of
 /// the rest, or byte 0 and the refusal.
-pub fn refused_or<a | e>(
-  said: Bytes,
+pub fn decode_result<a | e>(
+  encoded: Bytes,
   ok: (Bytes) -> a / e,
-) -> Result<a, Refusal> / {abort.raise | e} = {
-  let rest = said.slice(1, said.len());
-  if said.at(0) == 1 { Ok(ok(rest)) } else { Err(refusal_read(rest)) }
+) -> Result<a, Error> / {abort.raise | e} = {
+  let rest = encoded.slice(1, encoded.len());
+  if encoded.at(0) == 1 { Ok(ok(rest)) } else { Err(decode_socket_error(rest)) }
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -1984,7 +1998,7 @@ test "an address, an option and a refusal read back as the host's natives write 
     ip::read_socket("[2001:db8::1]:443"),
     ip::read_socket("[fe80::1%en0]:8080"),
   ];
-  assert_eq(addresses.map(|at: SocketAddress| address_read(address_written(at))), addresses);
+  assert_eq(addresses.map(|at: SocketAddress| decode_address(encode_address(at))), addresses);
   let probing: Probing = { idle: seconds(60), interval: Some(seconds(5)), count: Some(3) };
   let options = [
     NoDelay(true),
@@ -2003,17 +2017,17 @@ test "an address, an option and a refusal read back as the host's natives write 
     LeaveGroup(ip::read("ff02::1"), None),
     Presenting("client"),
   ];
-  assert_eq(options_read(options_written(options)), options);
-  assert_eq(options_read(options_written([])), []);
-  let refused = |kind: Bytes| refused_or(b"\x00".concat(kind), |_: Bytes| ());
+  assert_eq(decode_options(encode_options(options)), options);
+  assert_eq(decode_options(encode_options([])), []);
+  let refused = |kind: Bytes| decode_result(b"\x00".concat(kind), |_: Bytes| ());
   assert_eq(refused(b"\x01"), Err(Refused));
   assert_eq(refused(b"\x09"), Err(Untrusted));
   assert_eq(refused(b"\x0Ano shared cipher"), Err(Handshake("no shared cipher")));
   assert_eq(
-    refused(b"\x0B".concat(in_parts([i64_be(61), b"refused by the system"]))),
+    refused(b"\x0B".concat(encode_parts([i64_be(61), b"refused by the system"]))),
     Err(Other(61, "refused by the system")),
   );
-  assert_eq(refused_or(b"\x01".concat(i64_be(7)), int_of), Ok(7))
+  assert_eq(decode_result(b"\x01".concat(i64_be(7)), decode_int), Ok(7))
 }
 
 fn head(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -> b"" }
@@ -2096,18 +2110,18 @@ test "a credential goes on a connection whole and sealed, framed by what is said
 }
 
 /// A network with one peer at `192.0.2.25:25` that answers one connection with `script`.
-fn relayed(script: List<Step>) -> MemNet / {ip.refused, abort.raise} =
+fn relayed(script: List<Step>) -> MemNet / {ip.fail, abort.raise} =
   mem_serving(mem_empty(), ip::read_socket("192.0.2.25:25"), [script])
 
 /// A connection to that peer.
-fn to_relay() -> Int / {net.connect_to[relay], ip.refused, abort.raise} =
+fn to_relay() -> Int / {net.connect_to[relay], ip.fail, abort.raise} =
   match net.connect_to[relay](ip::read_socket("192.0.2.25:25"), [], 1000) {
     Ok(c) -> c,
     Err(_) -> panic("the relay refused"),
   }
 
 test "a scripted peer says its lines in order, waits to hear the program's, and ends" {
-  let script = [Says(b"220 ready\r\n"), Hears(b"EHLO x\r\n"), Says(b"250 ok\r\n")];
+  let script = [Sends(b"220 ready\r\n"), Expects(b"EHLO x\r\n"), Sends(b"250 ok\r\n")];
   let ran = on_mem(relayed(script), || {
     let c = to_relay();
     let greeting = net.recv[relay](c, 512, 1000);
@@ -2130,7 +2144,7 @@ test "a scripted peer says its lines in order, waits to hear the program's, and 
 
 test "a program that sends what its peer was not to hear fails where it sends it" {
   let failed: Result<Option<Int>, String> = try[abort.raise] {
-    on_mem(relayed([Hears(b"EHLO x\r\n")]), ||
+    on_mem(relayed([Expects(b"EHLO x\r\n")]), ||
       net.send[relay](to_relay(), b"HELO x\r\n", 1000)).value
   };
   assert_eq(failed, Err("the peer was to hear \"EHLO x\r\n\" and the program sent \"HELO x\r\n\""))
@@ -2141,11 +2155,11 @@ fn plain_auth() -> Bytes = b"AUTH PLAIN AGFkYQBodW50ZXIy\r\n"
 test "a credential reaches the far end whole in its frame, and nothing that shows the connection holds it" {
   let password = Secret::of_bytes(b"\x00ada\x00hunter2");
   let script = [
-    Says(b"220 ready\r\n"),
-    Hears(b"EHLO x\r\n"),
-    Says(b"250 AUTH PLAIN\r\n"),
-    HearsSecret(plain_auth()),
-    Says(b"235 ok\r\n"),
+    Sends(b"220 ready\r\n"),
+    Expects(b"EHLO x\r\n"),
+    Sends(b"250 AUTH PLAIN\r\n"),
+    ExpectsSecret(plain_auth()),
+    Sends(b"235 ok\r\n"),
   ];
   let ran = on_mem(relayed(script), || {
     let c = to_relay();
@@ -2185,20 +2199,20 @@ test "a credential the peer was not to hear fails where it is sent, and says not
     };
     failed
   };
-  assert_eq(sent([HearsSecret(plain_auth())], "base64"), Ok(true));
+  assert_eq(sent([ExpectsSecret(plain_auth())], "base64"), Ok(true));
   assert_eq(
-    sent([HearsSecret(plain_auth())], "raw"),
+    sent([ExpectsSecret(plain_auth())], "raw"),
     Err("the peer was to hear one credential and the program sent another"),
   );
   assert_eq(
-    sent([Hears(b"AUTH PLAIN\r\n")], "base64"),
+    sent([Expects(b"AUTH PLAIN\r\n")], "base64"),
     Err("the peer was to hear \"AUTH PLAIN\r\n\" and the program sent a credential"),
   );
-  assert_eq(sent([Says(b"220 ready\r\n")], "base64"), Ok(true));
+  assert_eq(sent([Sends(b"220 ready\r\n")], "base64"), Ok(true));
   assert_eq(sent([Blocks], "base64"), Ok(false));
   assert_eq(sent([], "rot13"), Err("`net.send_secret` knows no encoding `rot13`"));
   let pending: Result<Bool, String> = try[abort.raise] {
-    on_mem(relayed([HearsSecret(plain_auth())]), || {
+    on_mem(relayed([ExpectsSecret(plain_auth())]), || {
       let c = to_relay();
       let _half = net.send[relay](c, b"AUTH", 1000);
       net.send_secret[relay](c, b"", Secret::of_bytes(plain_auth()), "raw", b"", 1000)
@@ -2208,7 +2222,7 @@ test "a credential the peer was not to hear fails where it is sent, and says not
 }
 
 test "a read and a write move no more than a short network lets them" {
-  let ran = on_mem(mem_short(relayed([Says(b"abcdefg"), Hears(b"hello")]), 3), || {
+  let ran = on_mem(mem_chunk_limit(relayed([Sends(b"abcdefg"), Expects(b"hello")]), 3), || {
     let c = to_relay();
     let read = [
       net.recv[relay](c, 512, 1000),
@@ -2226,10 +2240,10 @@ test "a read and a write move no more than a short network lets them" {
 
 test "an upgrade secures the connection where the peer upgrades, and what follows is read after it" {
   let script = [
-    Says(b"220 go ahead\r\n"),
+    Sends(b"220 go ahead\r\n"),
     Upgrades,
-    Hears(b"EHLO x\r\n"),
-    Says(b"250 secured\r\n"),
+    Expects(b"EHLO x\r\n"),
+    Sends(b"250 secured\r\n"),
   ];
   let ran = on_mem(relayed(script), || {
     let c = to_relay();
@@ -2264,7 +2278,7 @@ test "an upgrade secures the connection where the peer upgrades, and what follow
 test "plaintext sent behind the go-ahead is refused, whether the socket holds it or the caller does" {
   // The peer's second line is in the socket when the handshake is to begin.
   let waiting = on_mem(
-    relayed([Says(b"220 go ahead\r\n"), Says(b"250 injected\r\n"), Upgrades]),
+    relayed([Sends(b"220 go ahead\r\n"), Sends(b"250 injected\r\n"), Upgrades]),
     || {
       let c = to_relay();
       let _go_ahead = net.recv[relay](c, 512, 1000);
@@ -2283,7 +2297,7 @@ test "plaintext sent behind the go-ahead is refused, whether the socket holds it
   assert_eq(waiting.value.wrote, Some(0));
   assert_eq(mem_secured(waiting.net, waiting.value.c), None);
   // Both lines came in one read, so the second is in the caller's own buffer.
-  let buffered = on_mem(relayed([Says(b"220 go ahead\r\n250 injected\r\n"), Upgrades]), || {
+  let buffered = on_mem(relayed([Sends(b"220 go ahead\r\n250 injected\r\n"), Upgrades]), || {
     let c = to_relay();
     let read = match net.recv[relay](c, 512, 1000) { Some(bytes) -> bytes, None -> b"" };
     let unread = read.slice(b"220 go ahead\r\n".len(), read.len());
@@ -2292,63 +2306,65 @@ test "plaintext sent behind the go-ahead is refused, whether the socket holds it
   assert_eq(buffered.value, Err(Injected))
 }
 
-test "an upgrade whose peer {c.told} answers {c.shown}" for c: { told: String, script: List<Step>, alpn: List<String>, shown: String, answer: Result<Secured, Refusal> } in [
+test "an upgrade whose peer {c.told} answers {c.shown}" for c: { told: String, script: List<Step>, alpn: List<String>, shown: String, result: Result<UpgradeResult, Error> } in [
     {
       told: "upgrades with a protocol offered",
       script: [Upgrades],
       alpn: ["postgresql", "h2"],
       shown: "the first offered",
-      answer: Ok({ protocol: Some("postgresql") }),
+      result: Ok({ protocol: Some("postgresql") }),
     },
     {
       told: "shows a certificate not trusted",
       script: [Refuses(Untrusted)],
       alpn: [],
       shown: "Untrusted",
-      answer: Err(Untrusted),
+      result: Err(Untrusted),
     },
     {
       told: "fails the handshake",
       script: [Refuses(Handshake("no cipher suite in common"))],
       alpn: [],
       shown: "why",
-      answer: Err(Handshake("no cipher suite in common")),
+      result: Err(Handshake("no cipher suite in common")),
     },
     {
       told: "stalls",
       script: [Stalls, Upgrades],
       alpn: [],
       shown: "TimedOut",
-      answer: Err(TimedOut),
+      result: Err(TimedOut),
     },
     {
       told: "still waits to hear something",
-      script: [Hears(b"STARTTLS\r\n"), Upgrades],
+      script: [Expects(b"STARTTLS\r\n"), Upgrades],
       alpn: [],
       shown: "TimedOut",
-      answer: Err(TimedOut),
+      result: Err(TimedOut),
     },
-    { told: "is gone", script: [], alpn: [], shown: "Reset", answer: Err(Reset) },
+    { told: "is gone", script: [], alpn: [], shown: "Reset", result: Err(Reset) },
   ] {
   let ran = on_mem(relayed(c.script), || {
     let conn = to_relay();
     {
-      answer: net.start_tls[relay](conn, "db.example", c.alpn, b"", 1000),
+      result: net.start_tls[relay](conn, "db.example", c.alpn, b"", 1000),
       after: net.send[relay](conn, b"x", 1000),
     }
   });
-  assert_eq(ran.value.answer, c.answer);
-  assert_eq(ran.value.after, match c.answer { Ok(_) -> Some(1), Err(_) -> Some(0) })
+  assert_eq(ran.value.result, c.result);
+  assert_eq(ran.value.after, match c.result { Ok(_) -> Some(1), Err(_) -> Some(0) })
 }
 
 test "a refused connection or upgrade is raised by the functions that open one" {
   let ran = on_mem(relayed([Refuses(Untrusted)]), || {
     let c = to_relay();
-    let upgrade: Result<Secured, Refusal> = try { secure[relay](c, "mail.example", [], b"", 1000) };
-    let nobody: Result<Int, Refusal> = try[socket.refused] {
+    let upgrade: Result<UpgradeResult, Error> = try {
+      secure[relay](c, "mail.example", [], b"", 1000)
+    };
+    let nobody: Result<Int, Error> = try[socket.fail] {
       dial_address[relay](ip::read_socket("192.0.2.26:25"), [], 1000)
     };
-    let beyond: Result<Int, Refusal> = try[socket.refused] {
+    let beyond: Result<Int, Error> = try[socket.fail] {
       listening[listener](ip::read_socket("192.0.2.1:80"), [])
     };
     { upgrade: upgrade, nobody: nobody, beyond: beyond }
@@ -2360,7 +2376,7 @@ test "a refused connection or upgrade is raised by the functions that open one" 
 
 test "a listener hands out the clients waiting, each from its address, then says it has stopped" {
   let callers = mem_calling(
-    mem_calling(mem_empty(), ip::read_socket("203.0.113.9:4431"), [Says(b"hi"), Hears(b"yo")]),
+    mem_calling(mem_empty(), ip::read_socket("203.0.113.9:4431"), [Sends(b"hi"), Expects(b"yo")]),
     ip::read_socket("[2001:db8::9]:4432"),
     [],
   );
@@ -2370,7 +2386,7 @@ test "a listener hands out the clients waiting, each from its address, then says
     let second = net.accept[listener](l);
     let third = net.accept[listener](l);
     let heard = net.recv[conn](first, 64, 1000);
-    let said = net.send[conn](first, b"yo", 1000);
+    let encoded = net.send[conn](first, b"yo", 1000);
     {
       first: first,
       third: third,
@@ -2382,7 +2398,7 @@ test "a listener hands out the clients waiting, each from its address, then says
         net.peer_address[listener](l),
       ],
       heard: heard,
-      said: said,
+      said: encoded,
       ended: net.recv[conn](first, 64, 1000),
     }
   });
@@ -2401,9 +2417,14 @@ test "a listener hands out the clients waiting, each from its address, then says
 }
 
 test "a server secures a client that asks, with a credential the run holds, and refuses what it read past the request" {
-  let asking = [Says(b"STARTTLS\r\n"), Hears(b"220 go ahead\r\n"), Upgrades, Says(b"EHLO x\r\n")];
+  let asking = [
+    Sends(b"STARTTLS\r\n"),
+    Expects(b"220 go ahead\r\n"),
+    Upgrades,
+    Sends(b"EHLO x\r\n"),
+  ];
   let client = ip::read_socket("203.0.113.9:4431");
-  let served = |script: List<Step>, unread: Bytes| {
+  let host_handler = |script: List<Step>, unread: Bytes| {
     on_mem(mem_credential(mem_calling(mem_empty(), client, script), "mail"), || {
       let l = net.listen[listener](2525);
       let c = net.accept[listener](l);
@@ -2413,15 +2434,15 @@ test "a server secures a client that asks, with a credential the run holds, and 
       { c: c, secured: secured, next: net.recv[conn](c, 512, 1000) }
     })
   };
-  let ran = served(asking, b"");
+  let ran = host_handler(asking, b"");
   assert_eq(ran.value.secured, Ok({ protocol: None }));
   assert_eq(ran.value.next, Some(b"EHLO x\r\n"));
   assert_eq(mem_secured(ran.net, ran.value.c), Some("mail"));
   // A client that sent a command behind its request, to be run as if it had come secured.
-  let injected = served(asking, b"MAIL FROM:<mallory@example>\r\n");
+  let injected = host_handler(asking, b"MAIL FROM:<mallory@example>\r\n");
   assert_eq(injected.value.secured, Err(Injected));
   assert_eq(injected.value.next, Some(b""));
-  let unheld: Result<Result<Secured, Refusal>, String> = try[abort.raise] {
+  let unheld: Result<Result<UpgradeResult, Error>, String> = try[abort.raise] {
     on_mem(mem_calling(mem_empty(), client, asking), || {
       let c = net.accept[listener](net.listen[listener](2525));
       net.serve_tls[conn](c, "mail", [], b"", 1000)
@@ -2477,9 +2498,9 @@ test "a name connects where the network's table says, each address tried in the 
   ]);
   let world = mem_failing(
     mem_serving(mem_resolving(mem_empty(), names), ip::read_socket("192.0.2.5:5432"), [
-      [Says(b"R")],
-      [Says(b"R")],
-      [Says(b"R")],
+      [Sends(b"R")],
+      [Sends(b"R")],
+      [Sends(b"R")],
     ]),
     ip::read_socket("[2001:db8::5]:5432"),
     Unreachable,
@@ -2491,9 +2512,9 @@ test "a name connects where the network's table says, each address tried in the 
         let tls = net.connect_tls[db]("db.example", 5432, 1000);
         let dialled = dial[db]("DB.example.", 5432, [], 1000);
         let nowhere = net.connect[db]("other.example", 5432, 1000);
-        let unknown: Result<Int, Refusal> = try { dial[db]("other.example", 5432, [], 1000) };
-        let foreign: Result<Int, Refusal> = try { dial[db]("b\u{fc}cher.example", 5432, [], 1000) };
-        let spent: Result<Int, Refusal> = try { dial[db]("db.example", 5432, [], 1000) };
+        let unknown: Result<Int, Error> = try { dial[db]("other.example", 5432, [], 1000) };
+        let foreign: Result<Int, Error> = try { dial[db]("b\u{fc}cher.example", 5432, [], 1000) };
+        let spent: Result<Int, Error> = try { dial[db]("db.example", 5432, [], 1000) };
         {
           by_host: by_host,
           tls: tls,
@@ -2548,7 +2569,7 @@ test "a dial is one deadline: an address that does not answer costs its share of
         assert_eq(unanswered(at(1), || dial[db]("db.example", 5432, [], 900)), 7);
         assert_eq(since(), 300);
         // Half of what the first left, then all of what the second left: the deadline and no more.
-        let none: Result<Int, Refusal> = try {
+        let none: Result<Int, Error> = try {
           unanswered(at(3), || dial[db]("db.example", 5432, [], 1000))
         };
         assert_eq((none, since()), (Err(TimedOut), 1300));
@@ -2563,14 +2584,14 @@ test "a dial is one deadline: an address that does not answer costs its share of
 test "a TLS connection by name is dialled, secured, and closed when it does not secure" {
   let names = dns::with_name(dns::table(), "api.example", [ip::read("192.0.2.7")]);
   let world = mem_serving(mem_resolving(mem_empty(), names), ip::read_socket("192.0.2.7:443"), [
-    [Upgrades, Says(b"ok")],
+    [Upgrades, Sends(b"ok")],
     [Refuses(Untrusted)],
   ]);
   let ran = on_mem(world, ||
     simulate {
       task::unbounded(|| {
         let c = dial_tls[api]("api.example", 443, ["h2"], [], 1000);
-        let refused: Result<Int, Refusal> = try { dial_tls[api]("api.example", 443, [], [], 1000) };
+        let refused: Result<Int, Error> = try { dial_tls[api]("api.example", 443, [], [], 1000) };
         { c: c, read: net.recv[api](c, 16, 1000), refused: refused }
       })
     });
@@ -2582,7 +2603,11 @@ test "a TLS connection by name is dialled, secured, and closed when it does not 
 
 test "a secured connection's far end presents the certificate its name was given, and none before" {
   let at = ip::read_socket("192.0.2.9:5432");
-  let world = mem_presenting(mem_serving(mem_empty(), at, [[Upgrades]]), "db.example", b"leaf");
+  let world = mem_server_certificate(
+    mem_serving(mem_empty(), at, [[Upgrades]]),
+    "db.example",
+    b"leaf",
+  );
   let ran = on_mem(world, || {
     let c = dial_address[db](at, [], 1000);
     let before = net.peer_certificate[db](c);
@@ -2594,7 +2619,7 @@ test "a secured connection's far end presents the certificate its name was given
 
 test "a server's connection answers the certificate its client presented, and none for one that presented none" {
   let world = mem_calling(
-    mem_calling_presenting(
+    mem_calling_with_certificate(
       mem_credential(mem_empty(), "api"),
       ip::read_socket("198.51.100.4:5000"),
       b"client leaf",
@@ -2613,7 +2638,7 @@ test "a server's connection answers the certificate its client presented, and no
 }
 
 test "the program's own listener sees the certificate its client presents, and none from one presenting none" {
-  let world = mem_presenting(mem_credential(mem_empty(), "api"), "caller", b"caller leaf");
+  let world = mem_server_certificate(mem_credential(mem_empty(), "api"), "caller", b"caller leaf");
   let ran = on_mem(world, || {
     let here = ip::read_socket("127.0.0.1:8443");
     let l = listening[listener](here, []);
@@ -2621,12 +2646,12 @@ test "the program's own listener sees the certificate its client presents, and n
     let later = dial_address[client](here, [], 1000);
     let anonymous = dial_address[client](here, [], 1000);
     let set = net.set_option[client](later, Presenting("caller"));
-    let served = [presenting, later, anonymous].map(|_c: Int| {
+    let host_handler = [presenting, later, anonymous].map(|_c: Int| {
       let c = net.accept[listener](l);
       let _secured = net.serve_tls[listener](c, "api", [], b"", 1000);
       net.peer_certificate[listener](c)
     });
-    { set: set, served: served, options: net.options[client](presenting) }
+    { set: set, served: host_handler, options: net.options[client](presenting) }
   });
   assert_eq(ran.value.set, Ok(()));
   assert_eq(ran.value.served, [Some(b"caller leaf"), Some(b"caller leaf"), None]);
@@ -2673,10 +2698,10 @@ test "a socket keeps the options it was opened with and the ones set on it since
 test "a Unix socket is a path one listener holds until it closes, and its far end has an owner" {
   let who = { user: 501, group: 20, process: Some(4242) };
   let world = mem_serving_unix(
-    mem_calling_unix(mem_empty(), who, [Says(b"hello")]),
+    mem_calling_unix(mem_empty(), who, [Sends(b"hello")]),
     "run",
     "docker.sock",
-    [[Says(b"{}")]],
+    [[Sends(b"{}")]],
   );
   let ran = on_mem(world, || {
     let l = listening_unix[listener]("run", "app.sock");
@@ -2708,14 +2733,17 @@ test "a Unix socket is a path one listener holds until it closes, and its far en
 }
 
 test "a connection is read and written as streams, and its hold closes it" {
-  let script = [Hears(b"PING\n"), HearsEnd, Says(b"one\ntw"), Says(b"o\nthree")];
+  let script = [Expects(b"PING\n"), ExpectsEnd, Sends(b"one\ntw"), Sends(b"o\nthree")];
   let ran = on_mem(relayed(script), || {
     let c = to_relay();
     with_hold[conn](
       reading[relay](c, 1000),
-      io::shut,
+      io::close_source,
     ) { source -> {
-      with_hold[out](writing[relay](c, 1000), io::shut_sink) { sink -> io::write(sink, b"PING\n") };
+      with_hold[out](
+        writing[relay](c, 1000),
+        io::close_sink,
+      ) { sink -> io::write(sink, b"PING\n") };
       io::fold_lines(source, 4, 1024, [], |lines: List<Bytes>, line: Bytes| lines.push(line))
     } }
   });
@@ -2725,12 +2753,12 @@ test "a connection is read and written as streams, and its hold closes it" {
 }
 
 test "a stream's deadline is raised, and its connection is still closed" {
-  let ran = on_mem(relayed([Says(b"partial"), Stalls]), || {
+  let ran = on_mem(relayed([Sends(b"partial"), Stalls]), || {
     let c = to_relay();
-    let read: Result<Bytes, Refusal> = try[socket.refused] {
+    let read: Result<Bytes, Error> = try[socket.fail] {
       with_hold[conn](
         reading[relay](c, 1000),
-        io::shut,
+        io::close_source,
       ) { source -> io::read_all(source, 64, 1024) }
     };
     read

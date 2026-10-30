@@ -7,42 +7,44 @@
 
 import std.value (Value, VBool, VInt)
 import candidates (candidates)
-import decide (Static, Certified, Unwitnessed, GuardRefuted, Undecided, Settlement, Stopped)
-import domain (Domain, Con, Fn, finite, point_at)
-import lower (Blocker, Lambda, Unbounded, blocker_parts)
+import decide (StaticResult, Certified, Unwitnessed, GuardRefuted, Undecided, StaticProof,
+               FailedAttempt)
+import domain (Domain, NamedSort, FunctionSort, finite, point_at)
+import lower (Blocker, Lambda, BoundUnshown, blocker_parts)
 import obligation (Outcome, Proved, Refuted, Vacuous, Unproved, Defect, Gap, Open, UnhandledEffect,
-                   Raised, NoWitness, Endless, Unsearched, Certificate, Binding, Judged, JHeld,
-                   JFailed, JRejected, JRaised, JFaulted, Cost, Law, Pure, is_proved)
+                   Raised, NoWitness, DomainTooLarge, Unsearched, Certificate, Binding, Judgement,
+                   PointHeld, PointFailed, PointRejected, PointRaised, PointFaulted, Cost, Law,
+                   Pure, is_proved)
 import rules (Rule, GroundEvaluation, ExhaustiveEnumeration, ExhaustiveInterleaving)
-import world (Obligation, World, no_world, Binder, Strategy, Interleave, Static, Bounded, Unhandled,
-              Run, Every, Unwalked, Points)
+import prover_input (Obligation, ProverInput, empty_prover_input, Binder, Strategy, Interleave,
+                     Static, Bounded, Unhandled, Run, Every, NotEnumerable, Points)
 import sim.plan
 import sim.plan (Seed, Dpor, seed_text)
-import sim.recording (Interleaving, Step, Passed, Failed, AVar)
-import sim.search (Exact, Cause, RunFailed, Unscheduled, Diverged, explore_keeping)
+import sim.recording (Interleaving, Step, Passed, Failed, VariableAccess)
+import sim.search (Exact, Cause, RunFailed, InvalidRecording, Diverged, explore_with_state)
 import std.list
 
 /// One claim a run discharges: its place in the collection, the claim, and what the static prover
 /// settled for it.
-pub type Asked = { claim: Int, obligation: Obligation, settled: Static }
+pub type ClaimToDischarge = { claim: Int, obligation: Obligation, settled: StaticResult }
 
 /// Points the runtime judges for one claim, in order, and how.
-pub type Batch = { claim: Int, points: List<List<Value>>, mode: Mode }
+pub type Batch = { claim: Int, points: List<List<Value>>, mode: JudgeMode }
 
 /// The whole claim until a point settles it; the guard alone until it admits a point; or the guard
 /// alone at every point until it raises.
-pub type Mode = | MWhole | MWitness | MDomain
+pub type JudgeMode = | WholeClaim | WitnessSearch | GuardFilter
 
 /// What a discharge asks the runtime, and what it answers: one conversation, because a function's
 /// row is one row and a discharge needs both answers. A law over interleavings is run at one of its
 /// points under one seed, within so many scheduling steps.
-pub type Ask = | AskJudged(List<Batch>) | AskInterleaved(Int, List<Value>, Seed, Int)
+pub type RuntimeRequest = | JudgePoints(List<Batch>) | RunInterleaving(Int, List<Value>, Seed, Int)
 
-pub type Reply = | Judgements(List<List<Judged>>) | Interleaved(LawRun)
+pub type RuntimeReply = | Judgements(List<List<Judgement>>) | Interleaved(LawRun)
 
 /// One run of a law: `observed` when it entered a `simulate` region, without which there was no
 /// schedule to vary.
-pub type LawRun = { interleaving: Interleaving<Judged>, observed: Bool }
+pub type LawRun = { interleaving: Interleaving<Judgement>, observed: Bool }
 
 // --- Discharging ---------------------------------------------------------------
 
@@ -51,42 +53,49 @@ pub type LawRun = { interleaving: Interleaving<Judged>, observed: Bool }
 /// each claim's outcome as soon as it is known, by the claim's place in the collection: one that
 /// needs no run before the runtime is asked anything.
 pub fn discharged<| e>(
-  asked: List<Asked>,
-  world: World,
+  asked: List<ClaimToDischarge>,
+  world: ProverInput,
   sim: plan::Plan,
-  ask: (Ask) -> Reply / e,
+  ask: (RuntimeRequest) -> RuntimeReply / e,
   told: (Int, Outcome) -> Unit / e,
 ) -> List<Outcome> / {abort.raise | e} = {
-  let works = asked.map(|a: Asked| planned(a, world));
+  let works = asked.map(|a: ClaimToDischarge| plan_claim(a, world));
   range(0, works.len()).fold((), |_: Unit, i: Int|
-    match ((works.at(i), asked.at(i))) { (Some(WDone(o)), Some(a)) -> told(a.claim, o), _ -> () });
+    match ((works.at(i), asked.at(i))) {
+      (Some(Finished(o)), Some(a)) -> told(a.claim, o),
+      _ -> (),
+    });
   let batches = range(0, works.len()).fold([], |acc: List<Batch>, i: Int|
     match ((works.at(i), asked.at(i))) {
-      (Some(WPoints(p)), Some(a)) ->
+      (Some(NeedsPoints(p)), Some(a)) ->
         acc.push({
           claim: a.claim,
           points: p.points,
-          mode: match p.kind { KLaw -> MDomain, KWitness(_) -> MWitness, _ -> MWhole },
+          mode: match p.kind {
+            LawPoints -> GuardFilter,
+            WitnessPoints(_) -> WitnessSearch,
+            _ -> WholeClaim,
+          },
         }),
       _ -> acc,
     });
   let answers = if batches.len() == 0 { [] }
-  else { match ask(AskJudged(batches)) { Judgements(js) -> js, _ -> [] } };
+  else { match ask(JudgePoints(batches)) { Judgements(js) -> js, _ -> [] } };
   range(0, works.len()).fold(
     { outcomes: [], next: 0 },
     |acc: { outcomes: List<Outcome>, next: Int }, i: Int|
       match ((works.at(i), asked.at(i))) {
-        (Some(WDone(o)), _) -> { ..acc, outcomes: acc.outcomes.push(o) },
-        (Some(WPoints(p)), Some(a)) -> {
+        (Some(Finished(o)), _) -> { ..acc, outcomes: acc.outcomes.push(o) },
+        (Some(NeedsPoints(p)), Some(a)) -> {
           let js = match answers.at(acc.next) { Some(x) -> x, None -> [] };
           let outcome = match p.kind {
-            KLaw -> match kept(a.obligation, p, js) {
+            LawPoints -> match admitted_points(a.obligation, p, js) {
               Err(o) -> o,
-              Ok(points) -> searched(a, p, points, sim, ask),
+              Ok(points) -> search_law(a, p, points, sim, ask),
             },
-            KWitness(c) -> witnessed(a.obligation, p, js, c),
-            KEnum(witness) -> walked(a.obligation, p, js, witness),
-            KSearch(stopped) -> tried(a.obligation, p, js, stopped),
+            WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
+            EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
+            CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
           };
           told(a.claim, outcome);
           { outcomes: acc.outcomes.push(outcome), next: acc.next + 1 }
@@ -100,25 +109,29 @@ pub fn discharged<| e>(
 /// guard admits would stand; a law's, whose guard keeps the ones to search; a few, for one its
 /// guard admits, which the certificate then stands on; or a few, for one the claim fails at, the
 /// static prover having stopped where it says.
-type Kind = | KEnum(Option<Certificate>) | KLaw | KWitness(Certificate) | KSearch(Stopped)
+type PointPurpose =
+  | EveryPoint(Option<Certificate>)
+  | LawPoints
+  | WitnessPoints(Certificate)
+  | CounterexampleSearch(FailedAttempt)
 
 /// One claim's points, and the domain a walk of every point covers.
-type Pointed = {
-  kind: Kind,
+type PointPlan = {
+  kind: PointPurpose,
   points: List<List<Value>>,
   domain: Option<{ name: String, points: Int }>,
 }
 
-type Work = | WDone(Outcome) | WPoints(Pointed)
+type ClaimWork = | Finished(Outcome) | NeedsPoints(PointPlan)
 
-fn certificate_of(s: Settlement, ran: Bool) -> Certificate =
+fn certificate_of(s: StaticProof, ran: Bool) -> Certificate =
   { rules: s.rules, steps: s.steps, guard_satisfiable: true, sorts: s.sorts, ran: ran }
 
 fn guard_span(obligation: Obligation) -> { module: Int, start: Int, end: Int } =
   match obligation.guards.at(0) { Some(g) -> g, None -> obligation.at }
 
 /// Where the static prover stopped, as a gap says it.
-fn open(s: Stopped) -> Gap =
+fn open_gap(s: FailedAttempt) -> Gap =
   Open({
     spent: s.spent,
     stuck: s.blockers.map(|b: Blocker| {
@@ -135,33 +148,37 @@ fn every_point(domain: Domain) -> Option<List<List<Value>>> / {abort.raise} =
       Some(points) -> match point_at(domain, i) { Some(vs) -> Some(points.push(vs)), None -> None },
     })
 
-fn planned(asked: Asked, world: World) -> Work / {abort.raise} = {
+fn plan_claim(asked: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort.raise} = {
   let o = asked.obligation;
   match o.strategy {
     Interleave(points) -> match points {
-      Unwalked -> WDone(Unproved(Endless)),
+      NotEnumerable -> Finished(Unproved(DomainTooLarge)),
       Every(domain, name) -> match every_point(domain) {
-        None -> WDone(Unproved(Endless)),
+        None -> Finished(Unproved(DomainTooLarge)),
         Some(ps) ->
-          WPoints({ kind: KLaw, points: ps, domain: Some({ name: name, points: domain.points }) }),
+          NeedsPoints({
+            kind: LawPoints,
+            points: ps,
+            domain: Some({ name: name, points: domain.points }),
+          }),
       },
     },
     Bounded -> match asked.settled {
-      Certified(s) -> WDone(Proved(certificate_of(s, false))),
-      Unwitnessed(s) -> WDone(Proved(certificate_of(s, false))),
-      GuardRefuted -> WDone(Vacuous({ guard: guard_span(o) })),
-      Undecided(stopped) -> WDone(Unproved(open(stopped))),
+      Certified(s) -> Finished(Proved(certificate_of(s, false))),
+      Unwitnessed(s) -> Finished(Proved(certificate_of(s, false))),
+      GuardRefuted -> Finished(Vacuous({ guard: guard_span(o) })),
+      Undecided(stopped) -> Finished(Unproved(open_gap(stopped))),
     },
     Static(after) -> match asked.settled {
-      Certified(s) -> WDone(Proved(certificate_of(s, false))),
-      GuardRefuted -> WDone(Vacuous({ guard: guard_span(o) })),
+      Certified(s) -> Finished(Proved(certificate_of(s, false))),
+      GuardRefuted -> Finished(Vacuous({ guard: guard_span(o) })),
       _ -> match after {
-        Unhandled(row) -> WDone(Unproved(UnhandledEffect(Some(row)))),
+        Unhandled(row) -> Finished(Unproved(UnhandledEffect(Some(row)))),
         Run(Every(domain, name)) -> match every_point(domain) {
-          None -> searching(asked, world),
+          None -> plan_search(asked, world),
           Some(ps) ->
-            WPoints({
-              kind: KEnum(match asked.settled {
+            NeedsPoints({
+              kind: EveryPoint(match asked.settled {
                 Unwitnessed(s) -> Some(certificate_of(s, true)),
                 _ -> None,
               }),
@@ -169,24 +186,25 @@ fn planned(asked: Asked, world: World) -> Work / {abort.raise} = {
               domain: Some({ name: name, points: domain.points }),
             }),
         },
-        Run(Unwalked) -> searching(asked, world),
+        Run(NotEnumerable) -> plan_search(asked, world),
       },
     },
   }
 }
 
 /// A claim over a domain no run walks whole, tried at the few points its binders offer.
-fn searching(asked: Asked, world: World) -> Work / {abort.raise} = {
+fn plan_search(asked: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort.raise} = {
   let o = asked.obligation;
   let points = if o.binders.fold(false, |any: Bool, b: Binder| any || !b.made) { [] }
   else { candidates(o.binders.map(|b: Binder| b.ty), world.decls, o.literals) };
   match asked.settled {
-    Unwitnessed(s) -> if points.len() == 0 { WDone(Unproved(NoWitness)) }
-    else { WPoints({ kind: KWitness(certificate_of(s, true)), points: points, domain: None }) },
-    Undecided(stopped) -> if points.len() == 0 { WDone(Unproved(open(stopped))) }
-    else { WPoints({ kind: KSearch(stopped), points: points, domain: None }) },
-    Certified(s) -> WDone(Proved(certificate_of(s, false))),
-    GuardRefuted -> WDone(Vacuous({ guard: guard_span(o) })),
+    Unwitnessed(s) -> if points.len() == 0 { Finished(Unproved(NoWitness)) } else {
+      NeedsPoints({ kind: WitnessPoints(certificate_of(s, true)), points: points, domain: None })
+    },
+    Undecided(stopped) -> if points.len() == 0 { Finished(Unproved(open_gap(stopped))) }
+    else { NeedsPoints({ kind: CounterexampleSearch(stopped), points: points, domain: None }) },
+    Certified(s) -> Finished(Proved(certificate_of(s, false))),
+    GuardRefuted -> Finished(Vacuous({ guard: guard_span(o) })),
   }
 }
 
@@ -207,10 +225,10 @@ fn faulted(
 
 /// The judgements of a whole claim in order: how many points its guard admitted and it held at, and
 /// what the first point that settled it came to.
-fn settled_at(
+fn first_decisive(
   obligation: Obligation,
-  p: Pointed,
-  js: List<Judged>,
+  p: PointPlan,
+  js: List<Judgement>,
 ) -> { held: Int, stop: Option<Outcome> } =
   range(0, js.len()).fold(
     { held: 0, stop: None },
@@ -218,10 +236,10 @@ fn settled_at(
       match acc.stop {
         Some(_) -> acc,
         None -> match ((js.at(i), p.points.at(i))) {
-          (Some(JHeld), _) -> { ..acc, held: acc.held + 1 },
-          (Some(JFailed), Some(values)) ->
+          (Some(PointHeld), _) -> { ..acc, held: acc.held + 1 },
+          (Some(PointFailed), Some(values)) ->
             { ..acc, stop: Some(Refuted({ bindings: bindings(obligation, values), seed: None })) },
-          (Some(JRaised(r)), Some(values)) ->
+          (Some(PointRaised(r)), Some(values)) ->
             {
               ..acc,
               stop: Some(
@@ -234,7 +252,7 @@ fn settled_at(
                 ),
               ),
             },
-          (Some(JFaulted(f)), Some(values)) ->
+          (Some(PointFaulted(f)), Some(values)) ->
             { ..acc, stop: Some(faulted(f, bindings(obligation, values))) },
           _ -> acc,
         },
@@ -243,13 +261,13 @@ fn settled_at(
 
 /// Every point of a finite domain, judged: the claim is proved where it held at each its guard
 /// admitted, and vacuous where the guard admitted none.
-fn walked(
+fn enumeration_outcome(
   obligation: Obligation,
-  p: Pointed,
-  js: List<Judged>,
+  p: PointPlan,
+  js: List<Judgement>,
   witness: Option<Certificate>,
 ) -> Outcome = {
-  let w = settled_at(obligation, p, js);
+  let w = first_decisive(obligation, p, js);
   match w.stop {
     Some(o) -> o,
     None -> if w.held == 0 { Vacuous({ guard: guard_span(obligation) }) } else {
@@ -275,12 +293,17 @@ fn walked(
 
 /// A few points judged for one the guard admits: the first stands the proof made of the claim under
 /// its guard.
-fn witnessed(obligation: Obligation, p: Pointed, js: List<Judged>, c: Certificate) -> Outcome =
+fn witness_outcome(
+  obligation: Obligation,
+  p: PointPlan,
+  js: List<Judgement>,
+  c: Certificate,
+) -> Outcome =
   range(0, js.len()).fold(Unproved(NoWitness), |found: Outcome, i: Int|
     match found {
       Unproved(_) -> match ((js.at(i), p.points.at(i))) {
-        (Some(JHeld), _) -> Proved(c),
-        (Some(JFaulted(f)), Some(values)) -> faulted(f, bindings(obligation, values)),
+        (Some(PointHeld), _) -> Proved(c),
+        (Some(PointFaulted(f)), Some(values)) -> faulted(f, bindings(obligation, values)),
         _ -> found,
       },
       _ -> found,
@@ -288,21 +311,26 @@ fn witnessed(obligation: Obligation, p: Pointed, js: List<Judged>, c: Certificat
 
 /// A few points judged for one the claim fails at: none found leaves it as open as the static
 /// prover left it, however many it held at.
-fn tried(obligation: Obligation, p: Pointed, js: List<Judged>, stopped: Stopped) -> Outcome =
-  match settled_at(obligation, p, js).stop { Some(o) -> o, None -> Unproved(open(stopped)) }
+fn search_outcome(
+  obligation: Obligation,
+  p: PointPlan,
+  js: List<Judgement>,
+  stopped: FailedAttempt,
+) -> Outcome =
+  match first_decisive(obligation, p, js).stop { Some(o) -> o, None -> Unproved(open_gap(stopped)) }
 
 /// The points a law's guard admitted, judged one at a time: a raise is the law's own gap.
-fn kept(
+fn admitted_points(
   obligation: Obligation,
-  p: Pointed,
-  js: List<Judged>,
+  p: PointPlan,
+  js: List<Judgement>,
 ) -> Result<List<List<Value>>, Outcome> =
   range(0, js.len()).fold(Ok([]), |acc: Result<List<List<Value>>, Outcome>, i: Int|
     match acc {
       Err(_) -> acc,
       Ok(points) -> match ((js.at(i), p.points.at(i))) {
-        (Some(JHeld), Some(values)) -> Ok(points.push(values)),
-        (Some(JRaised(r)), Some(values)) ->
+        (Some(PointHeld), Some(values)) -> Ok(points.push(values)),
+        (Some(PointRaised(r)), Some(values)) ->
           Err(
             Unproved(
               Raised({
@@ -312,7 +340,7 @@ fn kept(
               }),
             ),
           ),
-        (Some(JFaulted(f)), Some(values)) -> Err(faulted(f, bindings(obligation, values))),
+        (Some(PointFaulted(f)), Some(values)) -> Err(faulted(f, bindings(obligation, values))),
         _ -> acc,
       },
     })
@@ -329,17 +357,17 @@ type Totals = {
 }
 
 /// What one point's search keeps across its runs: how many entered a region, and whether all did.
-type Watch = { entered: Int, observed: Bool }
+type RegionCount = { entered: Int, observed: Bool }
 
 /// Each kept point searched in turn; the first failure is the law's.
-fn searched<| e>(
-  asked: Asked,
-  p: Pointed,
+fn search_law<| e>(
+  asked: ClaimToDischarge,
+  p: PointPlan,
   points: List<List<Value>>,
-  searching: plan::Plan,
-  ask: (Ask) -> Reply / e,
+  plan_search: plan::Plan,
+  ask: (RuntimeRequest) -> RuntimeReply / e,
 ) -> Outcome / {abort.raise | e} = {
-  let sim = plan::normalized(searching);
+  let sim = plan::normalized(plan_search);
   let start = {
     totals: {
       interleavings: 0,
@@ -356,12 +384,12 @@ fn searched<| e>(
       match acc.ended {
         Some(_) -> acc,
         None -> {
-          let kept = explore_keeping(
+          let admitted_points = explore_with_state(
             sim,
             Exact,
             { entered: 0, observed: true },
-            |w: Watch, seed: Seed|
-              match ask(AskInterleaved(asked.claim, values, seed, sim.steps)) {
+            |w: RegionCount, seed: Seed|
+              match ask(RunInterleaving(asked.claim, values, seed, sim.steps)) {
                 Interleaved(r) ->
                   {
                     run: r.interleaving,
@@ -370,18 +398,18 @@ fn searched<| e>(
                       observed: w.observed && r.observed,
                     },
                   },
-                Judgements(_) -> { run: unanswered(), state: w },
+                Judgements(_) -> { run: mismatched_reply(), state: w },
               },
           );
-          let e = kept.explored.exploration;
+          let e = admitted_points.explored.exploration;
           let totals = {
-            interleavings: acc.totals.interleavings + kept.state.entered,
+            interleavings: acc.totals.interleavings + admitted_points.state.entered,
             evaluations: acc.totals.evaluations + e.explored,
             exhaustive: acc.totals.exhaustive && e.exhaustive,
             exhausted: acc.totals.exhausted || e.exhausted,
-            observed: acc.totals.observed && kept.state.observed,
+            observed: acc.totals.observed && admitted_points.state.observed,
           };
-          match ((e.failure, kept.explored.failure)) {
+          match ((e.failure, admitted_points.explored.failure)) {
             (Some(seed), Some(fl)) ->
               {
                 totals: totals,
@@ -398,11 +426,11 @@ fn searched<| e>(
   }
 }
 
-fn unanswered() -> Interleaving<Judged> =
+fn mismatched_reply() -> Interleaving<Judgement> =
   {
     steps: [],
     verdict: Failed(
-      JFaulted({
+      PointFaulted({
         code: "E0505",
         message: "the runtime answered an interleaving with judgements",
         notes: [],
@@ -418,17 +446,17 @@ fn law_failed(
   obligation: Obligation,
   values: List<Value>,
   seed: Seed,
-  why: Cause<Judged>,
+  why: Cause<Judgement>,
   notes: List<String>,
 ) -> Outcome / {abort.raise} = {
   let bs = bindings(obligation, values);
   let again = "reproduce with `--sim once --seed " ++ seed_text(seed)
     ++ "`, and report it with the test's source";
   match why {
-    RunFailed(JFailed) -> Refuted({ bindings: bs, seed: Some(seed_text(seed)) }),
-    RunFailed(JRaised(r)) ->
+    RunFailed(PointFailed) -> Refuted({ bindings: bs, seed: Some(seed_text(seed)) }),
+    RunFailed(PointRaised(r)) ->
       Unproved(Raised({ message: r.message, values: r.values, bindings: bs })),
-    RunFailed(JFaulted(f)) -> faulted({ ..f, notes: f.notes.concat(notes) }, bs),
+    RunFailed(PointFaulted(f)) -> faulted({ ..f, notes: f.notes.concat(notes) }, bs),
     RunFailed(_) ->
       Defect({
         code: "E0505",
@@ -437,7 +465,7 @@ fn law_failed(
         values: [],
         bindings: bs,
       }),
-    Unscheduled(u) ->
+    InvalidRecording(u) ->
       Defect({
         code: "E0505",
         message: "the scheduler recorded a step that does not describe a schedule",
@@ -464,8 +492,14 @@ fn law_failed(
 
 /// No point kept is a vacuity, and every interleaving at every point is a proof. A search that
 /// stopped short of all of them proves nothing, however many it ran.
-fn law_held(obligation: Obligation, p: Pointed, kept: Int, sim: plan::Plan, t: Totals) -> Outcome =
-  if kept == 0 { Vacuous({ guard: guard_span(obligation) }) }
+fn law_held(
+  obligation: Obligation,
+  p: PointPlan,
+  admitted_points: Int,
+  sim: plan::Plan,
+  t: Totals,
+) -> Outcome =
+  if admitted_points == 0 { Vacuous({ guard: guard_span(obligation) }) }
   else if !proves(sim, t) { Unproved(Unsearched(t.evaluations)) } else {
     let d = match p.domain { Some(x) -> x, None -> { name: "", points: 0 } };
     Proved({
@@ -506,44 +540,47 @@ fn claim_of(binders: List<Binder>, strategy: Strategy) -> Obligation =
     identities: [],
   }
 
-fn int_binder(name: String) -> Binder = { name: name, ty: Con("Int", []), text: "Int", made: true }
+fn int_binder(name: String) -> Binder =
+  { name: name, ty: NamedSort("Int", []), text: "Int", made: true }
 
 fn bool_binder(name: String) -> Binder =
-  { name: name, ty: Con("Bool", []), text: "Bool", made: true }
+  { name: name, ty: NamedSort("Bool", []), text: "Bool", made: true }
 
-fn open_claim(binders: List<Binder>) -> Obligation = claim_of(binders, Static(Run(Unwalked)))
+fn open_claim(binders: List<Binder>) -> Obligation = claim_of(binders, Static(Run(NotEnumerable)))
 
 fn bool_claim() -> Obligation / {abort.raise} =
-  match finite([Con("Bool", [])], []) {
+  match finite([NamedSort("Bool", [])], []) {
     Some(d) -> claim_of([bool_binder("b")], Static(Run(Every(d, "Bool")))),
     None -> panic("finite"),
   }
 
 /// A runtime that judges each point by `rule`, given how it is asked, and searches nothing.
-fn judging<| e>(rule: keep (Mode, List<Value>) -> Judged / e) -> (Ask) -> Reply / e =
-  |ask: Ask|
+fn judging<| e>(
+  rule: keep (JudgeMode, List<Value>) -> Judgement / e,
+) -> (RuntimeRequest) -> RuntimeReply / e =
+  |ask: RuntimeRequest|
     match ask {
-      AskJudged(bs) ->
+      JudgePoints(bs) ->
         Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| rule(b.mode, p)))),
-      AskInterleaved(_, _, _, _) ->
+      RunInterleaving(_, _, _, _) ->
         Interleaved({
           interleaving: { steps: [], verdict: Passed, virtual_time: 0 },
           observed: false,
         }),
     }
 
-fn never_asked() -> (Ask) -> Reply / {abort.raise} =
-  |ask: Ask| panic("a settled claim asks the runtime nothing")
+fn never_asked() -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
+  |ask: RuntimeRequest| panic("a settled claim asks the runtime nothing")
 
 fn run_one<| e>(
   obligation: Obligation,
-  settled: Static,
+  settled: StaticResult,
   sim: plan::Plan,
-  ask: (Ask) -> Reply / e,
+  ask: (RuntimeRequest) -> RuntimeReply / e,
 ) -> Outcome / {abort.raise | e} =
   match discharged(
       [{ claim: 0, obligation: obligation, settled: settled }],
-      no_world(),
+      empty_prover_input(),
       sim,
       ask,
       |_claim: Int, _outcome: Outcome| (),
@@ -559,12 +596,12 @@ fn int_of(vs: List<Value>) -> Int / {abort.raise} =
 
 fn binding_values(bs: List<Binding>) -> List<Value> = bs.map(|b: Binding| b.value)
 
-fn settlement() -> Settlement = { rules: [GroundEvaluation], steps: 3, sorts: [] }
+fn settlement() -> StaticProof = { rules: [GroundEvaluation], steps: 3, sorts: [] }
 
 fn certificate(ran: Bool) -> Certificate =
   { rules: [GroundEvaluation], steps: 3, guard_satisfiable: true, sorts: [], ran: ran }
 
-fn undecided() -> Static = Undecided({ spent: false, blockers: [Lambda] })
+fn undecided() -> StaticResult = Undecided({ spent: false, blockers: [Lambda] })
 
 fn left_open() -> Outcome =
   Unproved(Open({ spent: false, stuck: [{ kind: "lambda", about: None }] }))
@@ -582,7 +619,7 @@ test "a proof the static prover made stands, and the runtime is asked nothing" {
 }
 
 test "a claim no proof closed stays open, however many points it holds at" {
-  let held = judging(|mode: Mode, p: List<Value>| JHeld);
+  let held = judging(|mode: JudgeMode, p: List<Value>| PointHeld);
   assert_eq(
     run_one(open_claim([int_binder("x")]), undecided(), plan::default_plan(), held),
     left_open(),
@@ -601,7 +638,8 @@ test "a claim no proof closed stays open, however many points it holds at" {
 
 test "a point the claim fails at refutes it, and a raise at one is its gap" {
   let o = open_claim([int_binder("x")]);
-  let failing = judging(|mode: Mode, p: List<Value>| if int_of(p) < 0 { JFailed } else { JHeld });
+  let failing = judging(|mode: JudgeMode, p: List<Value>|
+    if int_of(p) < 0 { PointFailed } else { PointHeld });
   match run_one(o, undecided(), plan::default_plan(), failing) {
     Refuted(cx) -> {
       assert_eq(binding_values(cx.bindings), [VInt(0 - 1)]);
@@ -609,8 +647,9 @@ test "a point the claim fails at refutes it, and a raise at one is its gap" {
     },
     _ -> panic("not refuted"),
   };
-  let raising = judging(|mode: Mode, p: List<Value>|
-    if int_of(p) == 1 { JRaised({ message: "division by zero", values: [] }) } else { JHeld });
+  let raising = judging(|mode: JudgeMode, p: List<Value>|
+    if int_of(p) == 1 { PointRaised({ message: "division by zero", values: [] }) }
+    else { PointHeld });
   match run_one(o, undecided(), plan::default_plan(), raising) {
     Unproved(Raised(r)) -> {
       assert_eq(r.message, "division by zero");
@@ -618,8 +657,8 @@ test "a point the claim fails at refutes it, and a raise at one is its gap" {
     },
     _ -> panic("not a raise"),
   };
-  let faulting = judging(|mode: Mode, p: List<Value>|
-    JFaulted({ code: "E0505", message: "Ply failed making the judge", notes: [], values: [] }));
+  let faulting = judging(|mode: JudgeMode, p: List<Value>|
+    PointFaulted({ code: "E0505", message: "Ply failed making the judge", notes: [], values: [] }));
   match run_one(o, undecided(), plan::default_plan(), faulting) {
     Defect(f) -> assert_eq((f.code, binding_values(f.bindings)), ("E0505", [VInt(0)])),
     _ -> panic("not a defect"),
@@ -628,15 +667,15 @@ test "a point the claim fails at refutes it, and a raise at one is its gap" {
 
 test "a proof made under a guard stands on the first point the guard admits, and waits for one" {
   let o = open_claim([int_binder("x")]);
-  let admitting = judging(|mode: Mode, p: List<Value>| {
-    assert_eq(mode, MWitness);
-    if int_of(p) == 1 { JHeld } else { JRejected }
+  let admitting = judging(|mode: JudgeMode, p: List<Value>| {
+    assert_eq(mode, WitnessSearch);
+    if int_of(p) == 1 { PointHeld } else { PointRejected }
   });
   assert_eq(
     run_one(o, Unwitnessed(settlement()), plan::default_plan(), admitting),
     Proved(certificate(true)),
   );
-  let rejecting = judging(|mode: Mode, p: List<Value>| JRejected);
+  let rejecting = judging(|mode: JudgeMode, p: List<Value>| PointRejected);
   assert_eq(
     run_one(o, Unwitnessed(settlement()), plan::default_plan(), rejecting),
     Unproved(NoWitness),
@@ -651,15 +690,20 @@ test "a claim over a value no run makes is tried at no point" {
     Unproved(NoWitness),
   );
   let f = open_claim([
-    { name: "f", ty: Fn([Con("Int", [])], Con("Int", []), true), text: "(Int) -> Int", made: true },
+    {
+      name: "f",
+      ty: FunctionSort([NamedSort("Int", [])], NamedSort("Int", []), true),
+      text: "(Int) -> Int",
+      made: true,
+    },
   ]);
   assert_eq(run_one(f, undecided(), plan::default_plan(), never_asked()), left_open())
 }
 
 test "a finite domain walked whole is a proof that names it, and one point is evaluating" {
-  let held = judging(|mode: Mode, p: List<Value>| {
-    assert_eq(mode, MWhole);
-    JHeld
+  let held = judging(|mode: JudgeMode, p: List<Value>| {
+    assert_eq(mode, WholeClaim);
+    PointHeld
   });
   assert_eq(
     run_one(bool_claim(), undecided(), plan::default_plan(), held),
@@ -687,18 +731,19 @@ test "a finite domain walked whole is a proof that names it, and one point is ev
 }
 
 test "a walk ends at the point the claim fails at, and one the guard emptied is vacuous" {
-  let failing = judging(|mode: Mode, p: List<Value>|
-    if p == [VBool(true)] { JFailed } else { JHeld });
+  let failing = judging(|mode: JudgeMode, p: List<Value>|
+    if p == [VBool(true)] { PointFailed } else { PointHeld });
   match run_one(bool_claim(), undecided(), plan::default_plan(), failing) {
     Refuted(cx) -> assert_eq(binding_values(cx.bindings), [VBool(true)]),
     _ -> panic("not refuted"),
   };
-  let rejecting = judging(|mode: Mode, p: List<Value>| JRejected);
+  let rejecting = judging(|mode: JudgeMode, p: List<Value>| PointRejected);
   assert_eq(
     run_one(bool_claim(), undecided(), plan::default_plan(), rejecting),
     Vacuous({ guard: { module: 0, start: 3, end: 4 } }),
   );
-  let raising = judging(|mode: Mode, p: List<Value>| JRaised({ message: "no", values: [] }));
+  let raising = judging(|mode: JudgeMode, p: List<Value>|
+    PointRaised({ message: "no", values: [] }));
   assert(match run_one(bool_claim(), undecided(), plan::default_plan(), raising) {
     Unproved(Raised(_)) -> true,
     _ -> false,
@@ -727,7 +772,7 @@ test "a cost bound is proved off its owner's body or stays open with why, and is
   assert_eq(
     run_one(
       o,
-      Undecided({ spent: false, blockers: [Unbounded("its steps outgrow the bound")] }),
+      Undecided({ spent: false, blockers: [BoundUnshown("its steps outgrow the bound")] }),
       plan::default_plan(),
       never_asked(),
     ),
@@ -741,17 +786,17 @@ test "a cost bound is proved off its owner's body or stays open with why, and is
 }
 
 test "a run judges every claim's points in one batch, each as its kind asks" {
-  let ask = |a: Ask|
+  let ask = |a: RuntimeRequest|
     match a {
-      AskJudged(bs) -> {
+      JudgePoints(bs) -> {
         assert_eq(bs.map(|batch: Batch| (batch.claim, batch.points.len(), batch.mode)), [
-          (4, 3, MWhole),
-          (7, 2, MWhole),
-          (9, 3, MWitness),
+          (4, 3, WholeClaim),
+          (7, 2, WholeClaim),
+          (9, 3, WitnessSearch),
         ]);
-        Judgements(bs.map(|batch: Batch| batch.points.map(|p: List<Value>| JHeld)))
+        Judgements(bs.map(|batch: Batch| batch.points.map(|p: List<Value>| PointHeld)))
       },
-      AskInterleaved(_, _, _, _) -> panic("nothing to search"),
+      RunInterleaving(_, _, _, _) -> panic("nothing to search"),
     };
   let outcomes = discharged(
     [
@@ -760,7 +805,7 @@ test "a run judges every claim's points in one batch, each as its kind asks" {
       { claim: 7, obligation: bool_claim(), settled: undecided() },
       { claim: 9, obligation: open_claim([int_binder("x")]), settled: Unwitnessed(settlement()) },
     ],
-    no_world(),
+    empty_prover_input(),
     plan::default_plan(),
     ask,
     |_claim: Int, _outcome: Outcome| (),
@@ -780,11 +825,11 @@ test "each claim is told once as it is decided, a settled one before the runtime
         { claim: 4, obligation: open_claim([int_binder("x")]), settled: undecided() },
         { claim: 5, obligation: open_claim([int_binder("x")]), settled: Certified(settlement()) },
       ],
-      no_world(),
+      empty_prover_input(),
       plan::default_plan(),
-      |a: Ask| {
+      |a: RuntimeRequest| {
         heard.heard("asked");
-        judging(|_mode: Mode, _point: List<Value>| JHeld)(a)
+        judging(|_mode: JudgeMode, _point: List<Value>| PointHeld)(a)
       },
       |claim: Int, _outcome: Outcome| heard.heard(claim.to_string()),
     )
@@ -804,9 +849,9 @@ fn counter_run(
   tasks: Int,
   holds: (Int) -> Bool,
   seed: Seed,
-) -> Interleaving<Judged> / {abort.raise} = {
+) -> Interleaving<Judgement> / {abort.raise} = {
   let start = {
-    pc: range(0, tasks).map(|_t: Int| 0),
+    program_counter: range(0, tasks).map(|_t: Int| 0),
     reg: range(0, tasks).map(|_t: Int| 0),
     counter: 0,
     steps: [],
@@ -814,22 +859,22 @@ fn counter_run(
   let end = iterate(
     start,
     4 * tasks + 2,
-    |st: { pc: List<Int>, reg: List<Int>, counter: Int, steps: List<Step> }| {
+    |st: { program_counter: List<Int>, reg: List<Int>, counter: Int, steps: List<Step> }| {
       let enabled = range(0, tasks).filter(|t: Int|
-        match st.pc.at(t) { Some(p) -> p < 2, None -> false });
+        match st.program_counter.at(t) { Some(p) -> p < 2, None -> false });
       if enabled.len() == 0 { Stop(st) } else {
         let choice = match seed.path.at(st.steps.len()) {
           Some(c) -> min(c, enabled.len() - 1),
           None -> 0,
         };
         let t = match enabled.at(choice) { Some(x) -> x, None -> 0 };
-        let pc = match st.pc.at(t) { Some(p) -> p, None -> 0 };
+        let pc = match st.program_counter.at(t) { Some(p) -> p, None -> 0 };
         let reading = pc == 0;
         let reg = if reading { st.reg.set(t, st.counter) } else { st.reg };
         let counter = if reading { st.counter }
         else { match st.reg.at(t) { Some(r) -> r + 1, None -> 0 } };
         Continue({
-          pc: st.pc.set(t, pc + 1),
+          program_counter: st.program_counter.set(t, pc + 1),
           reg: reg,
           counter: counter,
           steps: st.steps.push({
@@ -837,7 +882,7 @@ fn counter_run(
             task: t,
             enabled: enabled,
             choice: choice,
-            accesses: [AVar({ handler: 0, index: 0, write: !reading })],
+            accesses: [VariableAccess({ handler: 0, index: 0, write: !reading })],
             site: { definition: Some("transfer"), span: { module: 0, start: 0, end: 0 } },
             stamp: [],
           }),
@@ -847,20 +892,21 @@ fn counter_run(
   );
   {
     steps: end.steps,
-    verdict: if holds(end.counter) { Passed } else { Failed(JFailed) },
+    verdict: if holds(end.counter) { Passed } else { Failed(PointFailed) },
     virtual_time: 0,
   }
 }
 
 /// A runtime whose guard keeps every point and whose law body is `run` at each seed.
 fn law_runtime<| e>(
-  run: keep (Seed) -> Interleaving<Judged> / e,
+  run: keep (Seed) -> Interleaving<Judgement> / e,
   observed: Bool,
-) -> (Ask) -> Reply / e =
-  |ask: Ask|
+) -> (RuntimeRequest) -> RuntimeReply / e =
+  |ask: RuntimeRequest|
     match ask {
-      AskJudged(bs) -> Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| JHeld))),
-      AskInterleaved(_, _, seed, _) -> Interleaved({ interleaving: run(seed), observed: observed }),
+      JudgePoints(bs) -> Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| PointHeld))),
+      RunInterleaving(_, _, seed, _) ->
+        Interleaved({ interleaving: run(seed), observed: observed }),
     }
 
 fn ground_law() -> Obligation / {abort.raise} =
@@ -870,7 +916,7 @@ fn ground_law() -> Obligation / {abort.raise} =
   }
 
 fn bool_law() -> Obligation / {abort.raise} =
-  match finite([Con("Bool", [])], []) {
+  match finite([NamedSort("Bool", [])], []) {
     Some(d) -> claim_of([bool_binder("b")], Interleave(Every(d, "Bool"))),
     None -> panic("finite"),
   }
@@ -957,12 +1003,12 @@ test "a search that stops short of every interleaving proves nothing, and says h
 test "a law over a domain no run walks whole is searched at no point" {
   assert_eq(
     run_one(
-      claim_of([int_binder("n")], Interleave(Unwalked)),
+      claim_of([int_binder("n")], Interleave(NotEnumerable)),
       undecided(),
       dpor_plan(64),
       never_asked(),
     ),
-    Unproved(Endless),
+    Unproved(DomainTooLarge),
   )
 }
 
@@ -971,7 +1017,7 @@ test "a law's body that raises is its gap, and one Ply failed to run is Ply's de
     |seed: Seed|
       {
         steps: [],
-        verdict: Failed(JRaised({ message: "divided by zero", values: [] })),
+        verdict: Failed(PointRaised({ message: "divided by zero", values: [] })),
         virtual_time: 0,
       },
     false,
@@ -984,7 +1030,9 @@ test "a law's body that raises is its gap, and one Ply failed to run is Ply's de
     |seed: Seed|
       {
         steps: [],
-        verdict: Failed(JFaulted({ code: "E0415", message: "diverged", notes: [], values: [] })),
+        verdict: Failed(
+          PointFaulted({ code: "E0415", message: "diverged", notes: [], values: [] }),
+        ),
         virtual_time: 0,
       },
     false,
@@ -996,13 +1044,13 @@ test "a law's body that raises is its gap, and one Ply failed to run is Ply's de
 }
 
 test "a law whose guard admits no point of its domain is vacuous" {
-  let rejecting = |ask: Ask|
+  let rejecting = |ask: RuntimeRequest|
     match ask {
-      AskJudged(bs) -> {
-        assert_eq(bs.map(|b: Batch| b.mode), [MDomain]);
-        Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| JRejected)))
+      JudgePoints(bs) -> {
+        assert_eq(bs.map(|b: Batch| b.mode), [GuardFilter]);
+        Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| PointRejected)))
       },
-      AskInterleaved(_, _, _, _) -> panic("nothing kept, so nothing to search"),
+      RunInterleaving(_, _, _, _) -> panic("nothing kept, so nothing to search"),
     };
   assert_eq(
     run_one(bool_law(), undecided(), dpor_plan(64), rejecting),

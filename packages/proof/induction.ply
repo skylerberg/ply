@@ -1,0 +1,104 @@
+//! `induct` — the search for an induction over an `Int` or `List` binder, for a claim about
+//! self-recursive definitions: each binder in turn, taken apart one step at a time, unrolling every
+//! recursive definition the claim reaches. The kernel judges each proposal from the claim alone.
+
+import context (Context, self_recursive, terminates)
+import goal (Goal, Limits, Proof)
+import kernel (check_induction, add_induction_blocker)
+import lower (Blocker, RecursiveCall)
+import rules (Descent, Spine)
+import sort (is_named_sort, list_elem)
+
+type InductionAttempt = { proof: Option<Proof>, blockers: List<Blocker> }
+
+pub fn attempt(
+  context: Context,
+  g: Goal,
+  limits: Limits,
+  budget: Int,
+  spent: Int,
+  blockers: List<Blocker>,
+) -> InductionAttempt / {abort.raise} = {
+  let named = blockers.fold(Map::new(), |m: Map<String, Bool>, b: Blocker|
+    match b { RecursiveCall(n) -> m.insert(n, true), _ -> m });
+  let recursive = named.keys();
+  if recursive.len() == 0 { { proof: None, blockers: blockers } } else {
+    let unrollable = recursive.fold(
+      { ok: true, blockers: blockers },
+      |st: { ok: Bool, blockers: List<Blocker> }, name: String|
+        if !st.ok { st } else {
+          match self_recursive(context, name) {
+            None ->
+              {
+                ok: false,
+                blockers: add_induction_blocker(
+                  st.blockers,
+                  "`" ++ name ++ "` is not a pure definition calling only itself",
+                ),
+              },
+            Some(_) -> if terminates(context, name) { st } else {
+              {
+                ok: false,
+                blockers: add_induction_blocker(
+                  st.blockers,
+                  "the checker does not see every call `" ++ name ++ "` makes of itself descend",
+                ),
+              }
+            },
+          }
+        },
+    );
+    if !unrollable.ok { { proof: None, blockers: unrollable.blockers } } else {
+      let result_slot = match g.result { Some(_) -> g.binders.len() - 1, None -> 0 - 1 };
+      let walked = range(0, g.binders.len()).fold(
+        { done: false, proof: None, budget: budget, spent: spent, blockers: unrollable.blockers },
+        |st: { done: Bool, proof: Option<Proof>, budget: Int, spent: Int, blockers: List<Blocker> }, slot: Int|
+          if st.done { st } else {
+            match g.binders.at(slot) {
+              None -> st,
+              Some(binder) -> {
+                let over_list = list_elem(binder.ty) != None;
+                if !(is_named_sort(binder.ty, "Int") || over_list) || slot == result_slot { st }
+                else {
+                  let r = check_induction(
+                    context,
+                    g,
+                    {
+                      binder: binder.name,
+                      slot: slot,
+                      scheme: if over_list { Spine(1) } else { Descent(1) },
+                      defs: recursive,
+                    },
+                    limits,
+                    st.budget,
+                    st.blockers,
+                  );
+                  let spent = st.spent + r.used;
+                  let left = st.budget - r.used;
+                  match r.proof {
+                    Some(p) ->
+                      {
+                        done: true,
+                        proof: Some({ ..p, steps: spent }),
+                        budget: left,
+                        spent: spent,
+                        blockers: r.blockers,
+                      },
+                    None ->
+                      {
+                        done: left == 0,
+                        proof: None,
+                        budget: left,
+                        spent: spent,
+                        blockers: r.blockers,
+                      },
+                  }
+                }
+              },
+            }
+          },
+      );
+      { proof: walked.proof, blockers: walked.blockers }
+    }
+  }
+}
