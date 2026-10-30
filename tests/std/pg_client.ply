@@ -1,0 +1,58 @@
+//! `std.pg`'s client against a real server, whose TCP connections demand a password: SCRAM against
+//! postgres rather than against a script, and a clear-text password sent sealed. `postgres` says
+//! what the run binds.
+
+import postgres
+import postgres (Wire)
+import std.pg (connect, simple_query, finish, default_timeouts, QueryResult, client_error_text,
+               NoTls)
+
+fn first_text(answer: QueryResult) -> String / {abort.raise} =
+  match answer.rows { [[Some(text), ..], ..] -> String::of_bytes(text), _ -> "no value" }
+
+/// What `select 1` answered over the cluster at `port` with `password`, as `Ok`'s text or `Err`'s.
+fn ask_with_password(
+  port: Int,
+  password: String,
+) -> Result<String, String> / {Wire, abort.raise, diverges} =
+  match connect[link](
+      "127.0.0.1",
+      port,
+      NoTls,
+      "ply",
+      "ply",
+      [],
+      Some(Secret::of_string(password).bytes()),
+      "a-cluster-test-nonce",
+      default_timeouts(),
+    ) {
+    Err(e) -> Err(client_error_text(e)),
+    Ok(session) -> match simple_query[link](session, "select 1", default_timeouts()) {
+      Err(e) -> Err(client_error_text(e)),
+      Ok(reply) -> {
+        finish[link](reply.session, default_timeouts());
+        Ok(first_text(reply.result))
+      },
+    },
+  }
+
+test/nondet "the client speaks SCRAM to a real server" {
+  if postgres::available() {
+    let c = postgres::scram("pencil");
+    let r = ask_with_password(c.port, "pencil");
+    postgres::stop(c);
+    assert_eq(r, Ok("1"))
+  }
+}
+
+// The password goes out sealed, by `net.send_secret`; a wrong one is the server's refusal.
+test/nondet "the client sends a clear-text password to a real server, and a wrong one is refused" {
+  if postgres::available() {
+    let c = postgres::clear_text("pencil");
+    let right = ask_with_password(c.port, "pencil");
+    let wrong = ask_with_password(c.port, "crayon");
+    postgres::stop(c);
+    assert_eq(right, Ok("1"));
+    assert(match wrong { Err(why) -> why.contains("28P01"), Ok(_) -> false }, None)
+  }
+}

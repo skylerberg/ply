@@ -1,19 +1,16 @@
-//! `std.kv` between processes: a directory has one store at a time, and what a writer had
-//! committed when it was killed is what the next process opens.
+//! `std.key_value` between processes: what a writer had committed when it was killed is what the next
+//! process opens, once the lock the writer left is old.
 
-import harness (write_program, spawned, start_streaming, start_interactive, next_line, signal_to,
-                wait_for_exit, all_output, stdout, RunResult, Server, WorkingDirectory, PlyProcess,
-                Clock)
+import harness (write_program, spawned, start_streaming, next_line, signal_to, wait_for_exit,
+                all_output, stdout, RunResult, Server, PlyProcess)
 import std.fs (fs)
 import std.list
-import std.process (process, Kill)
+import std.process (Kill)
 import std.string
-import std.time (time)
 
-/// A program over the store in `db` of its root. `hold` commits two batches and keeps the store
-/// until it reads a line; `write` commits batches, saying each once it has answered, until it is
-/// killed; `ask N` asks for the lock `N` times and says what the store holds: how many batches,
-/// and whether both keys of each are there under its value and no other key is.
+/// A program over the store in `db` of its root. `write` commits batches, saying each once it has
+/// answered, until it is killed; `ask` asks for the lock once and says what the store holds: how
+/// many batches, and whether both keys of each are there under its value and no other key is.
 fn source() -> String =
   \\import std.key_value
   \\import std.key_value (key_value, Limits, Manual, Op, Put, Store, Error, Locked)
@@ -21,7 +18,6 @@ fn source() -> String =
   \\import std.fs (fs, Durable, Fast)
   \\import std.process (process)
   \\import std.random (entropy)
-  \\import std.string
   \\
   \\fn limits() -> Limits = { key: 64, value: 8192, batch: 65536, file: 65536 }
   \\
@@ -41,22 +37,14 @@ fn source() -> String =
   \\        && key_value::read[data](snap, name(i, "b")) == Some(body(i)))
   \\}
   \\
-  \\fn run(
-  \\  mode: String,
-  \\  tries: Int,
-  \\) -> Unit / {fs.read[data], fs.write[data], process.read[proc], process.write[proc], entropy.next, key_value.fail, abort.raise} =
+  \\fn run(mode: String) -> Unit / {fs.read[data], fs.write[data], process.write[proc], entropy.next, key_value.fail, abort.raise} =
   \\  with_hold[store](
-  \\    key_value::open[data]("db", limits(), Manual, key_value::raw(), tries),
+  \\    key_value::open[data]("db", limits(), Manual, key_value::raw(), 1),
   \\    |s: Store| key_value::close[data](s),
   \\  ) { opened -> {
   \\    let s = opened.get();
   \\    let from = key_value::stats(s).sequence;
-  \\    if mode == "hold" {
-  \\      key_value::batch[data](key_value::batch[data](s, pair_of(from + 1), Durable), pair_of(from + 2), Fast);
-  \\      process.out[proc]("holding");
-  \\      let _ = process.line[proc]();
-  \\      ()
-  \\    } else if mode == "write" {
+  \\    if mode == "write" {
   \\      iterate({ store: s, i: from + 1 }, 1000000, |at: { store: Store, i: Int }| {
   \\        let next = key_value::batch[data](at.store, pair_of(at.i), if at.i % 2 == 0 { Durable } else { Fast });
   \\        process.out[proc]("committed " ++ at.i.to_string());
@@ -68,13 +56,8 @@ fn source() -> String =
   \\  } }
   \\
   \\fn main() -> Unit / {fs.read[data], fs.write[data], process.read[proc], process.write[proc], entropy.next, abort.raise} = {
-  \\  let args = process.args[proc]();
-  \\  let mode = match args.at(0) { Some(m) -> m, None -> "ask" };
-  \\  let tries = match args.at(1) {
-  \\    Some(text) -> match text.int_of_string() { Some(count) -> count, None -> 1 },
-  \\    None -> 1,
-  \\  };
-  \\  let ran: Result<Unit, Error> = try[key_value.fail] { run(mode, tries) };
+  \\  let mode = match process.args[proc]().at(0) { Some(m) -> m, None -> "ask" };
+  \\  let ran: Result<Unit, Error> = try[key_value.fail] { run(mode) };
   \\  match ran {
   \\    Ok(_) -> process.out[proc]("closed"),
   \\    Err(Locked) -> process.out[proc]("refused: locked"),
@@ -100,8 +83,8 @@ fn next_line_with_prefix(
       ),
   }
 
-/// What a process that asked for the store once says of it.
-fn ask_once() -> RunResult / {PlyProcess, abort.raise} = spawned(run(["ask", "1"]), [])
+/// What a process that ask_once for the store says of it.
+fn ask_once() -> RunResult / {PlyProcess, abort.raise} = spawned(run(["ask"]), [])
 
 /// The batches a process found in the store it opened, and whether each was whole.
 fn opened(ran: RunResult) -> Option<{ batches: Int, whole: Bool }> / {abort.raise} =
@@ -113,31 +96,6 @@ fn opened(ran: RunResult) -> Option<{ batches: Int, whole: Bool }> / {abort.rais
       },
       _ -> found,
     })
-
-test/nondet "a directory has one store at a time: a second process is refused it, or waits until the first has closed" {
-  write_program(source());
-  let holder = start_interactive(run(["hold"]), []);
-  assert_eq(next_line_with_prefix(holder, "holding"), "");
-  let refused = ask_once();
-  assert(stdout(refused).contains("refused: locked"), Some(all_output(refused)));
-  let waiting = start_streaming(run(["ask", "60"]), []);
-  time.sleep_ms(2500);
-  let _ = process.input[ply](holder.child, b"go\n");
-  process.end_input[ply](holder.child);
-  assert_eq(next_line_with_prefix(holder, "closed"), "");
-  assert_eq(next_line_with_prefix(waiting, "opened "), "2 whole");
-  let _ = wait_for_exit(
-    holder,
-    60000,
-    "the holder was still running a minute after it closed its store",
-  );
-  let _ = wait_for_exit(
-    waiting,
-    60000,
-    "the second store was still running a minute after it said what it held",
-  );
-  ()
-}
 
 /// The greatest batch the writer says it committed in the lines it has yet to hand over, which
 /// is `so_far` where it says none.

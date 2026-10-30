@@ -1,5 +1,6 @@
-//! `std.sqlite` over files: a program's databases under a root the host binds, held to that root by
-//! the host's confinement and by the engine's own authorizer.
+//! `std.sqlite` under a root a run binds: a path that leaves the root, as it is spelled or through a
+//! link, ends the run; a connection the run leaves open is closed when it ends; and a test's pass
+//! over a database is kept until the database moves.
 
 import harness (WorkingDirectory, RunResult, PlyProcess, write_project, spawned, stderr,
                 working_directory, write, json_of, path, int, json_text)
@@ -47,31 +48,6 @@ fn sqlite_program() -> String =
   \\  with_hold[second](sqlite::opening[app]("data.db", ReadOnly, plain()), |c| sqlite::close(c)) { conn -> names(conn) }
   \\}
   \\
-  \\/// What the engine itself answers a statement the reader would have refused first.
-  \\fn raw(text: String) -> String / {sqlite.read[app], sqlite.write[app]} =
-  \\  match sqlite.open[app]("escape.db", Create, plain()) {
-  \\    Err(f) -> f.kind,
-  \\    Ok(conn) -> {
-  \\      let said = match sqlite.execute[app](conn, text, [], roomy()).failure {
-  \\        Some(f) -> f.kind,
-  \\        None -> "ran",
-  \\      };
-  \\      sqlite.close[app](conn);
-  \\      said
-  \\    },
-  \\  }
-  \\
-  \\pub fn escapes(outside: String) -> List<String> / {sqlite.read[app], sqlite.write[app]} =
-  \\  [
-  \\    raw("attach database '" ++ outside ++ "/attached.db' as other"),
-  \\    raw("attach database 'file:" ++ outside ++ "/uri.db?mode=rwc' as other"),
-  \\    raw("vacuum into '" ++ outside ++ "/vacuumed.db'"),
-  \\    raw("select readfile('" ++ outside ++ "/secret.txt')"),
-  \\    raw("select writefile('" ++ outside ++ "/written.txt', 'x')"),
-  \\    raw("pragma temp_store_directory = '" ++ outside ++ "'"),
-  \\    raw("select load_extension('" ++ outside ++ "/evil')"),
-  \\  ]
-  \\
   \\pub fn opens(path: String) -> String / {sqlite.read[app], sqlite.write[app], abort.raise} =
   \\  refusal(|| with_hold[opened_at](sqlite::opening[app](path, Create, plain()), |c| sqlite::close(c)) { conn ->
   \\    sqlite::execute(conn, s("create table if not exists t (n integer) strict"), roomy()) })
@@ -95,7 +71,6 @@ fn sqlite_program() -> String =
   \\fn asked(scenario: List<String>) -> String / {sqlite.read[app], sqlite.write[app], sqlite.read[nowhere], sqlite.write[nowhere], sql.fail, abort.raise} =
   \\  match scenario {
   \\    ["round_trip"] -> String::join(round_trip(), ","),
-  \\    ["escapes", outside] -> String::join(escapes(outside), ","),
   \\    ["opens", path] -> opens(path),
   \\    ["backs_up", path] -> backs_up(path),
   \\    ["unbound"] -> unbound(),
@@ -167,7 +142,7 @@ fn failure_code(
   }
 }
 
-/// Every file below `dir`, by its path from it, a link to a directory among them.
+/// Every file below `dir`, by its path from it.
 fn files(dir: String) -> List<String> / {WorkingDirectory, abort.raise} =
   match fs.walk[cwd](dir) {
     None -> [],
@@ -179,32 +154,14 @@ fn files(dir: String) -> List<String> / {WorkingDirectory, abort.raise} =
         }).sort_by(|a: String, b: String| compare(a, b) == Less),
   }
 
-fn first_bytes(path: String, n: Int) -> Bytes / {WorkingDirectory, abort.raise} =
-  match fs.read_file[cwd](path) { Some(b) -> b.slice(0, n), None -> b"" }
-
 fn absolute_path(path: String) -> String / {WorkingDirectory, abort.raise} =
   working_directory() ++ "/" ++ path
 
-/// `path`, below the working directory, as a link in `root` names it: from the link's own directory.
-fn from_root(path: String) -> String / {abort.raise} =
-  if path.starts_with("root/") { path.slice(5, path.len()) } else { "../" ++ path }
+/// A link absolute_path `link` in `root` to `target` in `outside`.
+fn linked_out(link: String, target: String) -> Unit / {WorkingDirectory, abort.raise} =
+  assert(fs.symlink[cwd]("root/" ++ link, "../outside/" ++ target), Some("a link is made"))
 
-fn make_link(link: String, to: String) -> Unit / {WorkingDirectory, abort.raise} =
-  assert(fs.symlink[cwd](link, from_root(to)), Some("a link is made"))
-
-test/nondet "the engine itself refuses every way out of the root" {
-  rooted();
-  let _ = fs.write_file[cwd]("outside/secret.txt", b"secret");
-  // Attach, attach by URI, vacuum into, readfile, writefile, a pragma, load_extension.
-  assert_eq(
-    answer(["escapes", absolute_path("outside")]),
-    "refused,refused,refused,statement,statement,refused,statement",
-  );
-  assert_eq(files("outside"), ["secret.txt"]);
-  assert_eq(files("root"), ["escape.db"])
-}
-
-test/nondet "a path that leaves the root is refused before anything opens" {
+test/nondet "a path that leaves the root, as it is spelled or through a link, is refused before anything opens" {
   rooted();
   let outside = absolute_path("outside/abs.db");
   ["../outside/up.db", outside, "a/../../outside/up.db"].fold((), |u: Unit, path: String|
@@ -213,60 +170,17 @@ test/nondet "a path that leaves the root is refused before anything opens" {
   ["../outside/copy.db", outside].fold((), |u: Unit, path: String|
     assert_eq(failure_code(["backs_up", path]), Some("E0452")));
   assert_eq(failure_code(["unbound"]), Some("E0451"));
-  assert_eq(files("outside"), [])
-}
-
-test/nondet "a database is never opened through a symbolic link" {
-  rooted();
-  let _ = fs.create_dir[cwd]("root/dir");
+  assert_eq(files("outside"), []);
+  // A link out of the root leaves it whether or not anything is where it leads.
   let _ = fs.write_file[cwd]("outside/out.db", b"");
-  // A link to a database inside the root, a directory that is a link, links out of the root to a
-  // file and to nothing, and the journal, the write-ahead log and its index the engine would open
-  // beside a database, each a link to a file outside the root.
-  make_link("root/link.db", "root/real.db");
-  make_link("root/linked", "root/dir");
-  make_link("root/out.db", "outside/out.db");
-  make_link("root/gone.db", "outside/gone.db");
-  let sides = [("_wal", "-wal"), ("_journal", "-journal"), ("_shm", "-shm")];
-  sides.fold((), |u: Unit, s: (String, String)|
-    match s {
-      (stem, suffix) ->
-        make_link("root/side" ++ stem ++ ".db" ++ suffix, "outside/target" ++ suffix),
-    });
-  assert_eq(
-    answers(
-      [["opens", "real.db"], ["opens", "link.db"], ["opens", "linked/new.db"]].concat(
-        sides.map(|s: (String, String)|
-          match s { (stem, _) -> ["opens", "side" ++ stem ++ ".db"] }),
-      ),
-    ),
-    ["ran", "unopened", "unopened", "unopened", "unopened", "unopened"],
-  );
+  linked_out("out.db", "out.db");
+  linked_out("gone.db", "gone.db");
+  linked_out("away.db", "copied.db");
   ["out.db", "gone.db"].fold((), |u: Unit, leaving: String|
     assert_eq(failure_code(["opens", leaving]), Some("E0452")));
-  sides.fold((), |u: Unit, s: (String, String)|
-    match s {
-      (stem, suffix) -> {
-        let target = "outside/target" ++ suffix;
-        assert(!fs.exists[cwd](target), Some(target ++ " was written through the link"));
-        assert(
-          !fs.exists[cwd]("root/side" ++ stem ++ ".db"),
-          Some("side" ++ stem ++ ".db was made"),
-        )
-      },
-    });
-  assert_eq(fs.read_file[cwd]("outside/out.db"), Some(b""));
-  assert_eq(files("outside"), ["out.db"]);
-  // A backup is written to a new file, never through a link already there, and a link to where
-  // nothing is outside the root leaves it whether or not anything is there.
-  make_link("root/copy.db", "root/missing.db");
-  make_link("root/away.db", "outside/copied.db");
-  assert_eq(answers([["round_trip"], ["backs_up", "copy.db"]]), ["Ada,Grace", "refused"]);
-  assert(!fs.exists[cwd]("root/missing.db"), Some("the backup went through the link"));
   assert_eq(failure_code(["backs_up", "away.db"]), Some("E0452"));
-  assert_eq(answer(["backs_up", "kept.db"]), "ran");
-  assert_eq(files("outside"), ["out.db"]);
-  assert_eq(first_bytes("root/kept.db", 16), b"SQLite format 3\x00")
+  assert_eq(fs.read_file[cwd]("outside/out.db"), Some(b""));
+  assert_eq(files("outside"), ["out.db"])
 }
 
 test/nondet "a connection a run leaves open is closed when the run ends" {

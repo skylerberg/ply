@@ -9,6 +9,7 @@ import library
 import library (ShippedFile)
 import compiler.cc
 import compiler.cc (Profile, Toolchain, compilers, toolchain)
+import compiler.front (ShippedData)
 import compiler.front.published (entry_header)
 import compiler.front.interface (length_prefixed)
 import compiler.build (build_roots)
@@ -17,7 +18,7 @@ import compiler.native
 import compiler.native (PackFile)
 import compiler.store.packs
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.check.resolve.tables (Diagnostic, error_at)
+import compiler.check.resolve.tables (Diagnostic, Source, error_at)
 import compiler.unit (shipped, results_store, emitted, emitter_identity, held, identity_of,
                       shipped_runtime)
 import compiler.emit.abi (Runtime, runtime_of)
@@ -230,19 +231,58 @@ fn chunked_read(path: String, step: Int) -> Option<Bytes> / {fs.read[abs], abort
 
 fn builder_roots() -> List<Bytes> = [b"bootstrap.build_builder"]
 
-fn builder_cache_key(shipped: Bytes, linking: Bytes, building: Bytes) -> String / {abort.raise} = {
+fn builder_reads_kept(linking: Bytes, building: Bytes) -> String / {abort.raise} = {
   let key = blake3(
     Bytes::concat_all([
-      b"ply builder 1\0",
+      b"ply builder reads 1\0",
       length_prefixed(builder_source()),
       length_prefixed(Bytes::of_string(builder_entry())),
-      shipped,
       linking,
       length_prefixed(building),
     ]),
   );
+  key.hex_of() ++ ".reads"
+}
+
+fn builder_cache_key(
+  reads_at: String,
+  files: List<ShippedFile>,
+  reads: List<String>,
+) -> String / {abort.raise} = {
+  let read = reads.fold(Map::new(), |acc: Map<String, Bool>, name: String| acc.insert(name, true));
+  let key = blake3(
+    Bytes::concat_all(
+      files.fold(Map::new(), |acc: Map<String, Bytes>, f: ShippedFile|
+        acc.insert(
+          f.name,
+          length_prefixed(Bytes::of_string(f.path)).concat(if read.contains(f.name) {
+            blake3(f.bytes)
+          } else { b"" }),
+        )).fold(
+        [b"ply builder 2\0", length_prefixed(Bytes::of_string(reads_at))],
+        |acc: List<Bytes>, name: String, held: Bytes|
+          acc.push(length_prefixed(Bytes::of_string(name))).push(length_prefixed(held)),
+      ),
+    ),
+  );
   key.hex_of() ++ ".builder"
 }
+
+fn builder_reads(
+  files: List<ShippedFile>,
+  modules: List<Bytes>,
+  embedded: List<Bytes>,
+) -> List<String> = {
+  let module = modules.fold(Map::new(), |acc: Map<String, Bool>, name: Bytes|
+    acc.insert(String::of_bytes_lossy(name) ++ ".ply", true));
+  let digest = embedded.fold(Map::new(), |acc: Map<Bytes, Bool>, d: Bytes| acc.insert(d, true));
+  files.fold([], |acc: List<String>, f: ShippedFile|
+    if module.contains(f.name) || digest.contains(blake3(f.bytes)) { acc.push(f.name) }
+    else { acc })
+}
+
+fn held_used(path: String) -> Option<Bytes> / {toolchain.read, abort.raise} =
+  if toolchain.exists(path) { toolchain.read_file(path) } else { None }
 
 fn shipped_results_roots() -> List<Bytes> = [b"bootstrap.build_shipped_results"]
 
@@ -311,57 +351,102 @@ fn build_builder(
   t: Toolchain,
   runtime: Runtime,
   files: List<ShippedFile>,
-  kept: String,
+  linking: Bytes,
   work: String,
   phases: Bool,
 ) -> Result<Builder, List<Diagnostic>> / {Bootstraps, process.err[proc], shipped.definitions, toolchain.bodies_dir, shipped.read_pack, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.report_reached, Derives, abort.raise} = {
-  let path = toolchain.cache() ++ "/" ++ kept;
-  if toolchain.exists(kept) { Ok({ path: path, taken: true }) } else {
-    let started = time.elapsed_ms();
-    let t_load: TimedLoad = library::with_shipped_files(files, ||
-      timed_uncached_over([], builder_project(), started, false));
-    match program_view(t_load.program) {
-      None -> Err(t_load.program.diagnostics),
-      Some(w) -> {
-        let front = loaded_analysis(t_load, w);
-        let entry = Bytes::of_string(builder_entry());
-        let offered = build_roots(front, w.frame.hashes, entry);
-        let store = results_store(
-          strip_root(toolchain.bodies_dir()),
-          runtime,
-          emitter_identity(shipped.definitions()),
-        );
-        let emission = with_record_store[abs, ans](store, ||
-          emitted(
-            runtime,
-            front.dump,
-            front.files.map(|f: { path: String, name: String, text: Bytes }| f.text),
-            front.inputs,
-            offered,
-            |k: Bytes| record_store.get[ans](k),
-            |rs: List<Record>| record_store.put[ans](rs),
-            entered: Some([Named(entry)]),
-          ));
-        match ((held(front.dump, emission), entry_header(front.dump, entry))) {
-          (Err(diagnostics), _) -> Err(diagnostics),
-          (_, None) -> failed("the builder defines no `" ++ builder_entry() ++ "` to enter"),
-          (Ok(c), Some(carried)) -> {
-            let compiling = time.elapsed_ms();
-            let objects = cc::objects[cc](t, cc::split(c), native::native_flags(), work);
-            compiled_timed(phases, "the builder's", objects, compiling);
-            match link_executable(t, objects, options.library, work) {
-              Err(diagnostics) -> Err(diagnostics),
-              Ok(exe) -> match append_pack(exe, build_pack(files, carried, [])) {
-                Err(diagnostics) -> Err(diagnostics),
-                Ok(whole) -> if toolchain.rename(cache_relative(whole), kept) {
-                  Ok({ path: path, taken: false })
-                } else { failed("the builder could not be kept in the toolchain's cache") },
-              },
-            }
-          },
+  let reads_at = builder_reads_kept(linking, identity_of(shipped.definitions(), builder_roots()));
+  let kept = match held_used(reads_at) {
+    None -> None,
+    Some(names) -> {
+      let at = builder_cache_key(
+        reads_at,
+        files,
+        names.split(b"\n").fold([], |acc: List<String>, name: Bytes|
+          if name.len() == 0 { acc } else { acc.push(String::of_bytes_lossy(name)) }),
+      );
+      match ((toolchain.exists(at), held_used(at ++ ".front"))) {
+        (true, Some(carried)) -> Some({ at: at, carried: carried }),
+        _ -> None,
+      }
+    },
+  };
+  match kept {
+    Some(k) -> {
+      let copy = toolchain.cache() ++ "/" ++ work ++ "/builder";
+      if fs.create_dir[abs](strip_root(parent(copy)))
+          && fs.copy[abs](strip_root(toolchain.cache() ++ "/" ++ k.at), strip_root(copy)) {
+        match append_pack(copy, build_pack(files, k.carried, [])) {
+          Err(diagnostics) -> Err(diagnostics),
+          Ok(whole) -> Ok({ path: whole, taken: true }),
         }
-      },
-    }
+      } else { failed("the kept builder could not be copied to run") }
+    },
+    None -> {
+      let started = time.elapsed_ms();
+      let t_load: TimedLoad = library::with_shipped_files(files, ||
+        timed_uncached_over([], builder_project(), started, false));
+      match program_view(t_load.program) {
+        None -> Err(t_load.program.diagnostics),
+        Some(w) -> {
+          let front = loaded_analysis(t_load, w);
+          let entry = Bytes::of_string(builder_entry());
+          let offered = build_roots(front, w.frame.hashes, entry);
+          let store = results_store(
+            strip_root(toolchain.bodies_dir()),
+            runtime,
+            emitter_identity(shipped.definitions()),
+          );
+          let emission = with_record_store[abs, ans](store, ||
+            emitted(
+              runtime,
+              front.dump,
+              front.files.map(|f: { path: String, name: String, text: Bytes }| f.text),
+              front.inputs,
+              offered,
+              |k: Bytes| record_store.get[ans](k),
+              |rs: List<Record>| record_store.put[ans](rs),
+              entered: Some([Named(entry)]),
+            ));
+          match ((held(front.dump, emission), entry_header(front.dump, entry))) {
+            (Err(diagnostics), _) -> Err(diagnostics),
+            (_, None) -> failed("the builder defines no `" ++ builder_entry() ++ "` to enter"),
+            (Ok(c), Some(carried)) -> {
+              let compiling = time.elapsed_ms();
+              let objects = cc::objects[cc](t, cc::split(c), native::native_flags(), work);
+              compiled_timed(phases, "the builder's", objects, compiling);
+              match link_executable(t, objects, options.library, work) {
+                Err(diagnostics) -> Err(diagnostics),
+                Ok(exe) -> {
+                  let shipping = t_load.program.shipping;
+                  let reads = builder_reads(
+                    files,
+                    shipping.read.map(|s: Source| s.name),
+                    t_load.program.inputs.fold(
+                      shipping.data.map(|d: ShippedData| blake3(d.bytes)),
+                      |acc: List<Bytes>, digest: Bytes, _: Bytes| acc.push(digest),
+                    ),
+                  );
+                  let at = builder_cache_key(reads_at, files, reads);
+                  if toolchain.write_file(at ++ ".front", carried)
+                      && fs.copy[abs](strip_root(exe), strip_root(exe ++ ".kept"))
+                      && toolchain.rename(cache_relative(exe ++ ".kept"), at)
+                      && toolchain.write_file(
+                        reads_at,
+                        Bytes::join(reads.map(|name: String| Bytes::of_string(name)), b"\n"),
+                      ) {
+                    match append_pack(exe, build_pack(files, carried, [])) {
+                      Err(diagnostics) -> Err(diagnostics),
+                      Ok(whole) -> Ok({ path: whole, taken: false }),
+                    }
+                  } else { failed("the builder could not be kept in the toolchain's cache") }
+                },
+              }
+            },
+          }
+        },
+      }
+    },
   }
 }
 
@@ -375,10 +460,6 @@ fn build_ply(
   let front = cache ++ "/" ++ work ++ "/ply.front";
   let manifest = cache ++ "/" ++ work ++ "/ply.sources";
   let memo = module_queries::shipped_store_dir(toolchain.reuse_dir());
-  if fs.create_dir[abs](strip_root(memo)) {
-    fs.write_file[abs](strip_root(memo) ++ "/.used", b"");
-    ()
-  };
   let ran = toolchain.run(cache_relative(builder), [
     options.root ++ "/" ++ options.toolchain.cli,
     options.toolchain.entry,
@@ -448,11 +529,9 @@ fn shipped_results(
         };
         let had = match kept {
           None -> None,
-          Some(at) -> if !toolchain.exists(at) { None } else {
-            match toolchain.read_file(at) {
-              Some(bytes) -> decode_shipped_results(bytes),
-              None -> None,
-            }
+          Some(at) -> match held_used(at) {
+            Some(bytes) -> decode_shipped_results(bytes),
+            None -> None,
           },
         };
         match had {
@@ -524,19 +603,7 @@ fn bootstrap_ply(
         };
         timed(phases, "described the runtime", started);
         let at = time.elapsed_ms();
-        match build_builder(
-            options,
-            t,
-            runtime,
-            files,
-            builder_cache_key(
-              keys.shipped,
-              keys.linking,
-              identity_of(shipped.definitions(), builder_roots()),
-            ),
-            work,
-            phases,
-          ) {
+        match build_builder(options, t, runtime, files, keys.linking, work, phases) {
           Err(diagnostics) -> Err(diagnostics),
           Ok(builder) -> {
             timed(
@@ -756,13 +823,48 @@ test "a file's digest is of its ranges' digests, however many reads it takes" {
   assert_eq(over("lib/absent", 4), None)
 }
 
-test "a builder is kept under its shipped modules, its link and the definitions that build it" {
-  let kept = builder_cache_key(b"shipped", b"linking", b"building");
+fn three_files() -> List<ShippedFile> =
+  [
+    { name: "std.a.ply", path: "std/a.ply", bytes: b"a" },
+    { name: "std.b.ply", path: "std/b.ply", bytes: b"b" },
+    { name: "std/a/data.txt", path: "std/a/data.txt", bytes: b"data" },
+  ]
+
+fn edited(files: List<ShippedFile>, name: String) -> List<ShippedFile> =
+  files.map(|f: ShippedFile| if f.name == name { { ..f, bytes: f.bytes.concat(b"!") } } else { f })
+
+test "a builder's reads are kept under its link and the definitions that build it" {
+  let kept = builder_reads_kept(b"linking", b"building");
+  assert(kept.ends_with(".reads"));
+  assert_eq(builder_reads_kept(b"linking", b"building"), kept);
+  assert(builder_reads_kept(b"moved", b"building") != kept);
+  assert(builder_reads_kept(b"linking", b"moved") != kept)
+}
+
+test "a builder is kept under the bytes of the shipped files it read and the name of every one" {
+  let files = three_files();
+  let reads = ["std.a.ply", "std/a/data.txt"];
+  let kept = builder_cache_key("r.reads", files, reads);
   assert(kept.ends_with(".builder"));
-  assert_eq(builder_cache_key(b"shipped", b"linking", b"building"), kept);
-  assert(builder_cache_key(b"moved", b"linking", b"building") != kept);
-  assert(builder_cache_key(b"shipped", b"moved", b"building") != kept);
-  assert(builder_cache_key(b"shipped", b"linking", b"moved") != kept)
+  assert_eq(builder_cache_key("r.reads", edited(files, "std.b.ply"), reads), kept);
+  assert(builder_cache_key("r.reads", edited(files, "std.a.ply"), reads) != kept);
+  assert(builder_cache_key("r.reads", edited(files, "std/a/data.txt"), reads) != kept);
+  assert(
+    builder_cache_key(
+        "r.reads",
+        files.push({ name: "std.c.ply", path: "std/c.ply", bytes: b"" }),
+        reads,
+      )
+      != kept,
+  );
+  assert(builder_cache_key("r.reads", files, reads.push("std.b.ply")) != kept);
+  assert(builder_cache_key("moved.reads", files, reads) != kept)
+}
+
+test "a builder read each module its load read and each file it embeds, and nothing else" {
+  let files = three_files();
+  assert_eq(builder_reads(files, [b"std.a"], [blake3(b"data")]), ["std.a.ply", "std/a/data.txt"]);
+  assert_eq(builder_reads(files, [b"std.b"], []), ["std.b.ply"])
 }
 
 test "what a ply answered is kept under how it answers, and under nothing of its own front end" {

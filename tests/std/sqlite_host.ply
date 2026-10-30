@@ -1,7 +1,9 @@
 //! `std.sqlite`'s real handler over files under the root `scratch`, which CI's runs of the library's
 //! suites grant (`.github/ci-ply.sh`): what a connection writes, what a second connection sees and
-//! is refused while the first holds a transaction, and a fold read a page at a time.
+//! is refused while the first holds a transaction, a fold read a page at a time, the statements the
+//! engine refuses because they reach another file, and the links it never opens or writes through.
 
+import scratch
 import std.fs (fs, listed_names)
 import std.list
 import std.sql (stmt, IntParameter, TextParameter, Row)
@@ -26,22 +28,13 @@ fn refusal<a | e>(go: () -> a / {sql.fail | e}) -> String / e =
     Err(_) -> "other",
   }
 
-/// `file` with nothing an earlier run left of it under the root: the database, its write-ahead log,
-/// the log's index and a rollback journal.
-fn fresh(file: String) -> String / {fs.remove[scratch]} = {
-  ["", "-wal", "-shm", "-journal"].fold((), |u: Unit, suffix: String| {
-    let _ = fs.remove[scratch](file ++ suffix);
-    ()
-  });
-  file
-}
+/// The names in `dir` under the root, in order.
+fn listed(dir: String) -> List<String> / {fs.list_dir[scratch]} =
+  match listed_names(fs.list_dir[scratch](dir)) { Some(names) -> names.sort(), None -> [] }
 
 /// The files under the root whose names start with `file`, in order.
 fn beside(file: String) -> List<String> / {fs.list_dir[scratch]} =
-  match listed_names(fs.list_dir[scratch](".")) {
-    Some(names) -> names.filter(|n: String| n.starts_with(file)).sort(),
-    None -> [],
-  }
+  listed(".").filter(|n: String| n.starts_with(file))
 
 fn names<[d], [r]>(
   conn: Hold<sqlite::Connection<[d]>, [r]>,
@@ -129,7 +122,8 @@ fn folded(
   } }
 
 test/nondet "a database written and closed is read back from its file" {
-  let file = fresh("round_trip.db");
+  scratch::fresh();
+  let file = "round_trip.db";
   assert_eq(round_trip(file), ["Ada", "Grace"]);
   let bytes = match fs.read_file[scratch](file) { Some(b) -> b, None -> b"" };
   assert_eq(bytes.slice(0, 16), b"SQLite format 3\x00");
@@ -140,12 +134,111 @@ test/nondet "a database written and closed is read back from its file" {
 }
 
 test/nondet "a reader sees what was committed and a second writer is busy" {
-  let file = fresh("together.db");
+  scratch::fresh();
+  let file = "together.db";
   assert_eq(round_trip(file), ["Ada", "Grace"]);
   assert_eq(together(file), ["2", "busy", "busy", "3", "3", "ran"])
 }
 
 test/nondet "a fold reads a statement the connection keeps open between pages" {
-  let file = fresh("folded.db");
-  assert_eq([1000, 64, 1].map(|rows: Int| folded(file, rows)), [500500, 2080, 1])
+  scratch::fresh();
+  assert_eq([1000, 64, 1].map(|rows: Int| folded("folded.db", rows)), [500500, 2080, 1])
+}
+
+/// What the engine itself says of `text` on a connection to `escape.db`, with no reader before it
+/// to refuse the statement first: the kind of its failure, or `ran`.
+fn engine_said(text: String) -> String / {sqlite.read[scratch], sqlite.write[scratch]} =
+  match sqlite.open[scratch]("escape.db", Create, plain()) {
+    Err(f) -> f.kind,
+    Ok(conn) -> {
+      let said = match sqlite.execute[scratch](conn, text, [], roomy()).failure {
+        Some(f) -> f.kind,
+        None -> "ran",
+      };
+      sqlite.close[scratch](conn);
+      said
+    },
+  }
+
+test/nondet "the engine refuses every statement that reaches a file other than its database" {
+  scratch::fresh();
+  assert(fs.create_dir[scratch]("other"));
+  assert(fs.write_file[scratch]("other/secret.txt", b"secret"));
+  let other = match fs.canonical[scratch]("other") {
+    Some(path) -> path,
+    None -> panic("a directory under the root has a path"),
+  };
+  assert_eq(
+    [
+      "attach database '" ++ other ++ "/attached.db' as other",
+      "attach database 'file:" ++ other ++ "/uri.db?mode=rwc' as other",
+      "vacuum into '" ++ other ++ "/vacuumed.db'",
+      "select readfile('" ++ other ++ "/secret.txt')",
+      "select writefile('" ++ other ++ "/written.txt', 'x')",
+      "pragma temp_store_directory = '" ++ other ++ "'",
+      "select load_extension('" ++ other ++ "/evil')",
+    ].map(|text: String| engine_said(text)),
+    ["refused", "refused", "refused", "statement", "statement", "refused", "statement"],
+  );
+  assert_eq(listed("other"), ["secret.txt"]);
+  assert_eq(listed("."), [scratch::marker(), "escape.db", "other"].sort())
+}
+
+/// What opening `path`, making it where nothing is, and making a table in it answers.
+fn opens(path: String) -> String / {sqlite.read[scratch], sqlite.write[scratch], abort.raise} =
+  refusal(||
+    with_hold[opened_at](sqlite::opening[scratch](path, Create, plain()), |c|
+      sqlite::close(c)) { conn ->
+      sqlite::execute(conn, s("create table if not exists t (n integer) strict"), roomy())
+    })
+
+/// What backing `file` up into `path` answers.
+fn backs_up(
+  file: String,
+  path: String,
+) -> String / {sqlite.read[scratch], sqlite.write[scratch], abort.raise} =
+  refusal(||
+    with_hold[source](sqlite::opening[scratch](file, ReadWrite, plain()), |c|
+      sqlite::close(c)) { conn -> sqlite::backup(conn, path) })
+
+/// A link at `link` to `target`, which is read from the root.
+fn linked(link: String, target: String) -> Unit / {fs.symlink[scratch], abort.raise} =
+  assert(fs.symlink[scratch](link, target), Some("a link is made"))
+
+test/nondet "a database is never opened through a symbolic link, and a backup never writes through one" {
+  scratch::fresh();
+  assert(fs.create_dir[scratch]("dir"));
+  assert(fs.create_dir[scratch]("other"));
+  // A link to a database, a directory that is a link, and the journal, the write-ahead log and its
+  // index the engine would open beside a database, each a link to a file elsewhere.
+  linked("link.db", "real.db");
+  linked("linked", "dir");
+  let sides = [("_wal", "-wal"), ("_journal", "-journal"), ("_shm", "-shm")];
+  sides.fold((), |u: Unit, side: (String, String)|
+    match side {
+      (stem, suffix) -> linked("side" ++ stem ++ ".db" ++ suffix, "other/target" ++ suffix),
+    });
+  assert_eq(
+    ["real.db", "link.db", "linked/new.db"].concat(
+      sides.map(|side: (String, String)| match side { (stem, _) -> "side" ++ stem ++ ".db" }),
+    ).map(|path: String| opens(path)),
+    ["ran", "unopened", "unopened", "unopened", "unopened", "unopened"],
+  );
+  sides.fold((), |u: Unit, side: (String, String)|
+    match side {
+      (stem, suffix) -> {
+        let target = "other/target" ++ suffix;
+        assert(!fs.exists[scratch](target), Some(target ++ " was written through the link"));
+        assert(!fs.exists[scratch]("side" ++ stem ++ ".db"), Some("side" ++ stem ++ ".db was made"))
+      },
+    });
+  assert_eq((listed("dir"), listed("other")), ([], []));
+  // A backup is written to a new file, never through a link already there.
+  linked("copy.db", "missing.db");
+  assert_eq(round_trip("data.db"), ["Ada", "Grace"]);
+  assert_eq(backs_up("data.db", "copy.db"), "refused");
+  assert(!fs.exists[scratch]("missing.db"), Some("the backup went through the link"));
+  assert_eq(backs_up("data.db", "kept.db"), "ran");
+  let kept = match fs.read_file[scratch]("kept.db") { Some(b) -> b, None -> b"" };
+  assert_eq(kept.slice(0, 16), b"SQLite format 3\x00")
 }

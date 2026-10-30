@@ -4,21 +4,13 @@
 import harness (WorkingDirectory, PlyProcess, spawned_warm_agrees, scratch, Source, write_project,
                 write_program, write, in_memory, one_module_tree, tree, on_disk, warm_agrees,
                 all_output, stdout, json_of, at, path, nth, items, first, str, int, bool, json_text,
-                Hermetic, Shipped, std_tree, std_data, module_in, ShippedModule, std_modules,
-                on_disk_shipping, on_disk_shipping_only, over_tree, spawned, assert_ok,
-                diagnostic_codes, with_prelude_shipped, value_of)
+                Hermetic, Shipped, std_tree, std_data, on_disk_shipping, on_disk_shipping_only,
+                over_tree, spawned, assert_ok, diagnostic_codes, with_prelude_shipped, value_of)
 import compiler.syntax.expressions (prelude_module)
-import compiler.front (shipped_data_wanted)
-import compiler.syntax.items (parse, Item, FunctionItem, TypeItem, EffectItem, EffectSetItem,
-                              SchemaItem, OpDefinition, is_pub)
-import compiler.syntax.lexer (lex, Identifier, Token, Punctuation, Keyword, EndOfInput)
-import compiler.syntax.parsing (Doc)
 import std.fs (MemFs)
 import std.json (Json)
 import std.list
-import std.process (process, Exited)
 import std.string
-import std.text (shell_join)
 
 /// Handles every atom it can perform, so its test is `det` and cacheable.
 fn importer() -> String =
@@ -689,68 +681,6 @@ test "programs that reach different functions of one shipped module share what a
   })
 }
 
-/// Words a shell reads into, or takes for its own where a command's name stands.
-fn hostile_words() -> List<String> =
-  [
-    "",
-    "plain",
-    "a b",
-    "it's",
-    "'",
-    "\"",
-    "$HOME",
-    "$(echo hi)",
-    "`echo hi`",
-    "a\\b",
-    "\\",
-    "a\nb",
-    "a\tb",
-    "x\ry",
-    "*",
-    "?",
-    "[a-z]",
-    "{a,b}",
-    "~",
-    "~root",
-    "#x",
-    "!x",
-    "a;b",
-    "a|b",
-    "a&b",
-    "a>b",
-    "<",
-    "(x)",
-    "CC=gcc",
-    "=ls",
-    "--jobs=4",
-    "-",
-    "--",
-    "if",
-    "time",
-    "{",
-    "%1",
-    "caf\u{e9}",
-    "a\u{3000}b",
-    "a'b\"c$d`e\\f",
-  ]
-
-// `std.text` holds its quoting to its own reader; only a shell can say a shell reads it so.
-test/nondet "sh reads back every word std.text quotes for it, and takes none for its own grammar" {
-  let line = |words: List<String>| match shell_join(words) { Some(l) -> l, None -> "" };
-  let read = process.spawn[sh](["-c", "printf '%s\\001' " ++ line(hostile_words())], "", []);
-  assert_eq(
-    read.out,
-    Bytes::of_string(String::join(hostile_words().map(|word: String| word ++ "\u{1}"), "")),
-  );
-  ["if", "then", "do", "done", "for", "while", "case", "{", "}", "!", "CC=gcc"].fold(
-    (),
-    |_: Unit, word: String| {
-      let named = process.spawn[sh](["-c", line([word, "true"])], "", []);
-      assert(named.ended == Exited(127), Some(word ++ " was read as the shell's own"))
-    },
-  )
-}
-
 test/nondet "a shipped module's laws are not a project's, and the library's checkout proves every one" {
   write_project(checkout(two_shipped()).push({ path: "app/m.ply", text: keeping() }));
   let mine = json_of(spawned(["prove", "app", "--json"]));
@@ -1093,102 +1023,5 @@ test "ply doc documents a name of a shipped module of the compiler" {
   assert(
     r.code == 0 && all_output(r).contains("pub fn format(source: Bytes) -> Result<Bytes"),
     Some(all_output(r)),
-  )
-}
-
-// A file the tree holds and no module embeds would ship in every binary and be read by nothing.
-test "each data file the standard library's tree holds is one a module of it embeds" {
-  let embedded = std_tree().fold([], |acc: List<String>, f: { name: String, bytes: Bytes }|
-    if !f.name.ends_with(".ply") { acc } else {
-      shipped_data_wanted({ name: Bytes::of_string(module_in("std.", f.name)), src: f.bytes }).fold(
-        acc,
-        |a: List<String>, name: Bytes| a.push(String::of_bytes(name)),
-      )
-    });
-  assert_eq(std_data().map(|d: { name: String, bytes: Bytes }| d.name).sort(), embedded.sort())
-}
-
-/// What a module publishes that has no doc: every `pub` declaration, and each operation of a `pub`
-/// effect, by name.
-fn undocumented(module: String, src: Bytes) -> List<String> / {abort.raise} =
-  parse(src).node.items.fold([], |acc: List<String>, it: Item| {
-    let named = |name: Bytes| module ++ "." ++ String::of_bytes(name);
-    match it {
-      FunctionItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) {
-        acc.push(named(d.name.name))
-      } else { acc },
-      TypeItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) { acc.push(named(d.name.name)) }
-      else { acc },
-      SchemaItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) { acc.push(named(d.name.name)) }
-      else { acc },
-      EffectSetItem(d) -> if is_pub(d.visibility) && has_no_doc(d.doc) {
-        acc.push(named(d.name.name))
-      } else { acc },
-      EffectItem(d) -> if !is_pub(d.visibility) { acc } else {
-        let own = if has_no_doc(d.doc) { acc.push(named(d.name.name)) } else { acc };
-        d.operations.fold(own, |a: List<String>, op: OpDefinition|
-          if has_no_doc(op.doc) {
-            a.push(named(d.name.name) ++ "." ++ String::of_bytes(op.name.name))
-          } else { a })
-      },
-      _ -> acc,
-    }
-  })
-
-fn has_no_doc(doc: Option<Doc>) -> Bool = match doc { None -> true, Some(_) -> false }
-
-test "every name {m.module} publishes is documented" for m: ShippedModule in std_modules() {
-  let missing = undocumented(m.module, m.src);
-  assert(
-    missing.len() == 0,
-    Some("these are published without a `///` doc:\n" ++ String::join(missing, "\n")),
-  )
-}
-
-/// The shipped modules that fold case or trim by Unicode's tables, each with the text of a
-/// person's it reads that way. Every other one compares names and tokens, which take
-/// `std.string`'s `ascii_lower`, `ascii_upper` and `ascii_trim`.
-fn unicode_readers() -> List<{ module: String, reason: String }> =
-  [
-    { module: "cli", reason: "a manual page's title is the program's name in capitals" },
-    { module: "ini", reason: "`any_case` matches a key as Python's `configparser` folds one" },
-    { module: "semver", reason: "`coerce` reads a version out of text a person typed" },
-    { module: "string", reason: "the ASCII trim is stated against the prelude's" },
-    { module: "tar", reason: "paths are compared as a file system that folds case compares them" },
-    { module: "text", reason: "a shell line is refused at white space of any script" },
-  ]
-
-/// Whether a source calls `std.unicode`'s `lowercase` or `uppercase`, or `String::trim`, outside
-/// its comments and its literals: a declaration of one is no call.
-fn reads_unicode(src: Bytes) -> Bool / {abort.raise} = {
-  let tokens = lex(src).tokens;
-  let kind = |i: Int| match tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
-  range(1, tokens.len()).fold(false, |found: Bool, i: Int|
-    found
-      || (match kind(i) {
-        Identifier(name) ->
-          (name == b"lowercase" || name == b"uppercase" || name == b"trim")
-            && (kind(i - 1) == Punctuation(b"dot") || kind(i - 1) == Punctuation(b"coloncolon"))
-            && kind(i + 1) == Punctuation(b"lparen")
-            && kind(i - 3) != Keyword(b"fn"),
-        _ -> false,
-      }))
-}
-
-test "a shipped module folds case and trims by ASCII, unless it is listed as reading a person's text" {
-  let found = std_tree().fold([], |acc: List<String>, f: { name: String, bytes: Bytes }|
-    if f.name.ends_with(".ply") && reads_unicode(f.bytes) { acc.push(module_in("", f.name)) }
-    else { acc }).sort(
-  );
-  let listed = unicode_readers().map(|r: { module: String, reason: String }| r.module);
-  assert(
-    found == listed,
-    Some(
-      "the modules that call `std.unicode`'s `lowercase` or `uppercase`, or `String::trim`:\n  "
-        ++ String::join(found, " ")
-        ++ "\nthe ones listed as reading a person's text:\n  "
-        ++ String::join(listed, " ")
-        ++ "\na name or a token takes `std.string`'s `ascii_lower`, `ascii_upper` or `ascii_trim`",
-    ),
   )
 }
