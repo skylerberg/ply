@@ -8,12 +8,12 @@ import compiler.syntax.expressions (Expression, prelude_module, try_spans, expre
                                     sees_homes)
 import compiler.expand.rewrite.shared (expressions_matching)
 import std.list (zip)
-import compiler.check.types (Atom, Row, ResourceVariable, SingletonResource, AnyResource,
+import compiler.check.types (Effect, Effects, ResourceVariable, SingletonResource, AnyResource,
                              NamedResource, Type, VariableType, NamedType, FunctionType,
-                             canonical_beside, RecordType, record_fields, Field, atoms_sorted,
-                             resolve_atom, row_empty, row_open, row_singleton, without_raises,
+                             canonical_beside, RecordType, record_fields, Field, effects_sorted,
+                             resolve_effect, no_effects, open_effects, single_effect, without_raises,
                              int_type, bool_type, bytes_type, list_type, iter_type, fn_type,
-                             shallow_resolve, written_label, label_of, atoms_text, scheme_text,
+                             shallow_resolve, written_label, label_of, effect_list_text, scheme_text,
                              type_text, NominalType, TypeTable, insert_type, subtable,
                              tables_joined, type_table_bin, variables_in, unit_type, type_at)
 import compiler.check.termination (Terminates, TerminatesByDecreases, Diverges, Site)
@@ -50,7 +50,7 @@ import compiler.check.infer.checker (OpInfo, EffectInfo, ConstructorInfo, Defini
                                      LawInfo, MemberSite, WitnessOrder, LabelApplication,
                                      CachedDefinition, CachedTest, CachedFacts, CheckCache,
                                      empty_cache, Checker, CheckedBody, report, report_error_at,
-                                     resolve, resolve_row_in, abort_atom, definition_of, Builtin,
+                                     resolve, resolve_effects_in, abort_effect, definition_of, Builtin,
                                      builtin_of_extern, builtins, builtin_named, member_site_bin,
                                      witness_order_bin, ReleaseSite)
 import compiler.check.infer.names (simple_name_of)
@@ -171,8 +171,8 @@ pub fn types_named(all: TypeTable, bodies: List<TypedBody<Bytes>>) -> TypeTable 
 fn keys_in(b: TypedBody<Bytes>) -> List<Bytes> / {abort.raise} =
   body_retyped(b, [], {
     ty: |k: Bytes, seen: List<Bytes>| { ty: k, state: seen.push(k) },
-    row: |r: Row| r,
-    atom: |a: Atom| a,
+    row: |r: Effects| r,
+    entry: |a: Effect| a,
     span: |sp: Span| sp,
   }).state
 
@@ -283,13 +283,13 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
       Some(d) -> by_place(d.scheme.type_variables),
       None -> match sorts.get(b.owner) { Some(s) -> s, None -> Map::new() },
     };
-    let rows: RowNumbering = match owner {
+    let rows: VariableNumbering = match owner {
       Some(d) ->
-        { rows: by_place(d.scheme.row_variables), labels: by_place(d.scheme.label_variables) },
+        { rows: by_place(d.scheme.effect_variables), labels: by_place(d.scheme.label_variables) },
       None -> { rows: Map::new(), labels: Map::new() },
     };
     let ty = |t: Type| numbered(resolve(checker, t), types, checker.keep_variables);
-    let row = |r: Row| row_numbered(resolve_row_in(checker, r), rows);
+    let effects = |r: Effects| effects_numbered(resolve_effects_in(checker, r), rows);
     let labelled_diagnostics = |sp: Span| moved_by(sp, 0 - b.base);
     let here = match released.get(b.owner) { Some(at) -> at, None -> Map::new() };
     let witnesses = match owner {
@@ -312,8 +312,8 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
           },
           _ -> None,
         },
-      row: row,
-      atom: |a: Atom| atom_numbered(resolve_atom(checker.substitution, a), rows.labels),
+      row: effects,
+      entry: |a: Effect| effect_numbered(resolve_effect(checker.substitution, a), rows.labels),
       read: |read: WalkedReading|
         match read {
           WalkedLocal(l) -> Some(ReadLocal(l.name)),
@@ -325,7 +325,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
                 ReadBuiltin({
                   name: f.name,
                   args: f.args.map(ty),
-                  rows: f.rows.map(row),
+                  rows: f.rows.map(effects),
                   witnesses: ws,
                 }),
               ),
@@ -340,10 +340,10 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
             else { match scheme { Some(sc) -> sc.type_variables.map(VariableType), None -> [] } };
             let filled = match scheme {
               Some(sc) ->
-                sc.row_variables.map(|v: Int|
+                sc.effect_variables.map(|v: Int|
                   zip(x.quantified, x.rows).fold(
-                    row_open(v),
-                    |w: Row, p: { first: Int, second: Row }|
+                    open_effects(v),
+                    |w: Effects, p: { first: Int, second: Effects }|
                       if p.first == v { p.second } else { w },
                   )),
               None -> x.rows,
@@ -357,7 +357,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
                   ReadDefinition({
                     full: x.full,
                     args: args.map(ty),
-                    rows: filled.map(row),
+                    rows: filled.map(effects),
                     labels: ls,
                     witnesses: ws,
                   }),
@@ -445,8 +445,8 @@ fn keyed_bodies(
       let h = intern_type(s.table, s.keyed, t);
       { ty: h.key, state: { table: h.table, keyed: h.keyed } }
     },
-    row: |r: Row| r,
-    atom: |a: Atom| a,
+    row: |r: Effects| r,
+    entry: |a: Effect| a,
     span: |sp: Span| sp,
   };
   let out = bodies.fold(
@@ -459,20 +459,20 @@ fn keyed_bodies(
   { bodies: out.bodies, types: out.state.table }
 }
 
-type RowNumbering = { rows: Map<Int, Int>, labels: Map<Int, Int> }
+type VariableNumbering = { rows: Map<Int, Int>, labels: Map<Int, Int> }
 
-fn row_numbered(row: Row, numbering: RowNumbering) -> Row / {abort.raise} =
+fn effects_numbered(effects: Effects, numbering: VariableNumbering) -> Effects / {abort.raise} =
   {
-    atoms: if !row.atoms.fold(false, |found: Bool, a: Atom|
-        found || (match a.resource { ResourceVariable(_) -> true, _ -> false })) { row.atoms }
-    else { atoms_sorted(row.atoms.map(|a: Atom| atom_numbered(a, numbering.labels))) },
-    tail: match row.tail { None -> None, Some(v) -> numbering.rows.get(v) },
+    listed: if !effects.listed.fold(false, |found: Bool, a: Effect|
+        found || (match a.resource { ResourceVariable(_) -> true, _ -> false })) { effects.listed }
+    else { effects_sorted(effects.listed.map(|a: Effect| effect_numbered(a, numbering.labels))) },
+    tail: match effects.tail { None -> None, Some(v) -> numbering.rows.get(v) },
   }
 
-fn atom_numbered(atom: Atom, labels: Map<Int, Int>) -> Atom =
-  match atom.resource {
-    ResourceVariable(v) -> { ..atom, resource: ResourceVariable(place_among(labels, v)) },
-    _ -> atom,
+fn effect_numbered(entry: Effect, labels: Map<Int, Int>) -> Effect =
+  match entry.resource {
+    ResourceVariable(v) -> { ..entry, resource: ResourceVariable(place_among(labels, v)) },
+    _ -> entry,
   }
 
 fn place_among(numbering: Map<Int, Int>, v: Int) -> Int =
@@ -516,7 +516,7 @@ fn numbered(ty: Type, numbering: Map<Int, Int>, kept: List<Int>) -> Type =
           once: false,
           params: f.params.map(again),
           ret: again(f.ret),
-          effects: row_empty(),
+          effects: no_effects(),
         }),
       RecordType(fs) -> RecordType(fs.map(|f: Field| { ..f, ty: again(f.ty) })),
       NominalType(x) ->
@@ -533,7 +533,7 @@ fn renumbers(ty: Type) -> Bool =
     VariableType(_) -> true,
     NamedType(c) -> c.args.fold(false, |found: Bool, a: Type| found || renumbers(a)),
     FunctionType(f) ->
-      f.effects.atoms.len() > 0 || f.effects.tail != None
+      f.effects.listed.len() > 0 || f.effects.tail != None
         || f.params.fold(false, |found: Bool, p: Type| found || renumbers(p))
         || renumbers(f.ret),
     RecordType(fs) -> fs.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
@@ -594,8 +594,8 @@ pub fn bodies_read(
           let t = type_at(types, k, seen);
           { ty: t.ty, state: t.read }
         },
-        row: |r: Row| r,
-        atom: |a: Atom| a,
+        row: |r: Effects| r,
+        entry: |a: Effect| a,
         span: |sp: Span| sp,
       });
       { out: acc.out.push(o.out), read: o.state }
@@ -732,7 +732,7 @@ pub fn check_program_with(
   { checker: holed, ok: !has_error(holed.diagnostics) }
 }
 
-fn effects_text(atoms: List<Atom>) -> Bytes / {abort.raise} = atoms_text(atoms, b",")
+fn effects_text(effects: List<Effect>) -> Bytes / {abort.raise} = effect_list_text(effects, b",")
 
 pub fn dump_flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
 
@@ -997,8 +997,8 @@ fn settled_m(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
     let base = match bases.get(key(b.owner, b.part)) { Some(x) -> x, None -> 0 };
     body_retyped(b, (), {
       ty: |t: Type, s: Unit| { ty: t, state: s },
-      row: |r: Row| r,
-      atom: |a: Atom| a,
+      row: |r: Effects| r,
+      entry: |a: Effect| a,
       span: |sp: Span| moved_by(sp, base),
     }).out
   })
@@ -1041,9 +1041,9 @@ fn placed_in(src: Bytes, from: Bytes, to: Bytes) -> Span / {abort.raise} =
     },
   }
 
-fn row_text(row: Row) -> Bytes / {abort.raise} = {
-  let listed = Bytes::join(row.atoms.map(atom_placed_text), b", ");
-  let tail = match row.tail {
+fn effects_text(effects: Effects) -> Bytes / {abort.raise} = {
+  let listed = Bytes::join(effects.listed.map(effect_placed_text), b", ");
+  let tail = match effects.tail {
     None -> b"",
     Some(v) ->
       Bytes::concat_all([if listed.len() == 0 { b"" } else { b" " }, b"| ", place_text(b"e", v)]),
@@ -1051,17 +1051,17 @@ fn row_text(row: Row) -> Bytes / {abort.raise} = {
   Bytes::concat_all([b"{", listed, tail, b"}"])
 }
 
-fn atom_placed_text(atom: Atom) -> Bytes / {abort.raise} = {
-  let resource = match atom.resource {
+fn effect_placed_text(entry: Effect) -> Bytes / {abort.raise} = {
+  let resource = match entry.resource {
     SingletonResource -> b"",
     AnyResource -> b"[*]",
     NamedResource(n) -> Bytes::concat_all([b"[", n, b"]"]),
     ResourceVariable(v) -> Bytes::concat_all([b"[", place_text(b"l", v), b"]"]),
   };
   Bytes::concat_all([
-    atom.effect,
+    entry.effect,
     b".",
-    match atom.op { Some(op) -> op, None -> mode_text(atom.mode) },
+    match entry.op { Some(op) -> op, None -> mode_text(entry.mode) },
     resource,
   ])
 }
@@ -1069,59 +1069,59 @@ fn atom_placed_text(atom: Atom) -> Bytes / {abort.raise} = {
 fn place_text(letter: Bytes, place: Int) -> Bytes / {abort.raise} =
   if place < 0 { b"?" } else { letter.concat(ascii_of_int(place)) }
 
-fn rows_of_node(e: TypedExpression<Type>) -> List<Bytes> / {abort.raise} = {
-  let filled = |rows: List<Row>|
+fn effects_of_node(e: TypedExpression<Type>) -> List<Bytes> / {abort.raise} = {
+  let filled = |rows: List<Effects>|
     if rows.len() == 0 { [] }
-    else { [Bytes::concat_all([b"[", Bytes::join(rows.map(row_text), b", "), b"]"])] };
+    else { [Bytes::concat_all([b"[", Bytes::join(rows.map(effects_text), b", "), b"]"])] };
   match e.node {
     TypedRead(ReadDefinition(d)) -> filled(d.rows),
     TypedRead(ReadBuiltin(f)) -> filled(f.rows),
-    TypedLambda(l) -> [row_text(l.row)],
-    TypedSimulate(t) -> [row_text(t.row)],
-    TypedHandle(h) -> [row_text(h.row)],
-    TypedPerform(p) -> [atom_placed_text(p.atom)],
+    TypedLambda(l) -> [effects_text(l.row)],
+    TypedSimulate(t) -> [effects_text(t.row)],
+    TypedHandle(h) -> [effects_text(h.row)],
+    TypedPerform(p) -> [effect_placed_text(p.entry)],
     TypedCall(c) -> match c.callee.node {
       TypedRead(ReadDefinition(_)) -> [],
       TypedRead(ReadConstructor(_)) -> [],
       TypedRead(ReadBuiltin(_)) -> [],
-      _ -> [row_text(c.row)],
+      _ -> [effects_text(c.row)],
     },
     _ -> [],
   }
 }
 
-fn rows_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} =
+fn effects_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} =
   settled_m(checker).flat_map(|b: TypedBody<Type>| typed_expression_nodes(b.body)).flat_map(
     |e: TypedExpression<Type>| {
-      let own = if picked(e.span) { rows_of_node(e) } else { [] };
+      let own = if picked(e.span) { effects_of_node(e) } else { [] };
       match e.node {
         TypedHandle(h) ->
           own.concat(
             h.clauses.filter(|c: TypedClause<Type>| picked(c.span)).map(|c: TypedClause<Type>|
-              row_text(c.row)),
+              effects_text(c.row)),
           ).concat(match h.ret {
-            Some(r) -> if picked(r.span) { [row_text(r.row)] } else { [] },
+            Some(r) -> if picked(r.span) { [effects_text(r.row)] } else { [] },
             None -> [],
           }),
         TypedParallel(ts) ->
           own.concat(
             ts.filter(|t: TypedThunk<Type>| picked(t.body.span)).map(|t: TypedThunk<Type>|
-              row_text(t.row)),
+              effects_text(t.row)),
           ),
         _ -> own,
       }
     },
   )
 
-fn rows_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
-  rows_where(checker, |s: Span| s == at)
+fn effects_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  effects_where(checker, |s: Span| s == at)
 
-fn rows_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
-  rows_where(checker, |s: Span| written_over(s, at))
+fn effects_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  effects_where(checker, |s: Span| written_over(s, at))
 
 fn rowed_m(src: Bytes) -> Checker / {abort.raise} = {
   let checker = checker_m(src);
-  assert_eq(rows_where(checker, |s: Span| true).filter(|t: Bytes| t.index_of(b"?") != None), []);
+  assert_eq(effects_where(checker, |s: Span| true).filter(|t: Bytes| t.index_of(b"?") != None), []);
   checker
 }
 
@@ -1134,7 +1134,7 @@ test "a clause binding its continuation holds what resuming it performs" {
   let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>|
     typed_expression_nodes(b.body)).flat_map(|e: TypedExpression<Type>|
     match e.node {
-      TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| row_text(c.resumed)),
+      TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| effects_text(c.resumed)),
       _ -> [],
     });
   assert_eq(resumed, [b"{m.trace.step}"])
@@ -1159,12 +1159,12 @@ test "a read of a definition generic over rows holds what it fills each of them 
     ]),
   );
   let checker = rowed_m(src);
-  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  let at = |from: Bytes, to: Bytes| effects_written_at(checker, placed_in(src, from, to));
   assert_eq(at(b"apply(|| {", b"(|| {"), [b"[{m.log.note}]"]);
   assert_eq(at(b"apply(|| link", b"(|| link"), [b"[{m.link.send[l0]}]"]);
   assert_eq(at(b"apply(f)", b"(f)"), [b"[{| e0}]"]);
   let member = placed_in(src, b"map(|x", b"(|x");
-  assert_eq(rows_where(checker, |s: Span| s.start == member.start && s.end == member.end), [
+  assert_eq(effects_where(checker, |s: Span| s.start == member.start && s.end == member.end), [
     b"[{m.log.note}]",
   ]);
   assert_eq(at(b"logged() +", b"() +"), [])
@@ -1178,7 +1178,7 @@ test "a row variable nothing settles ends the row it is read in" {
     ]),
   );
   let checker = rowed_m(src);
-  assert_eq(rows_written_at(checker, placed_in(src, b"run(1)", b"(1)")), [b"[{}]"])
+  assert_eq(effects_written_at(checker, placed_in(src, b"run(1)", b"(1)")), [b"[{}]"])
 }
 
 test "a lambda holds its own row, however wide the place it is passed to" {
@@ -1190,7 +1190,7 @@ test "a lambda holds its own row, however wide the place it is passed to" {
     ]),
   );
   let checker = rowed_m(src);
-  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  let at = |from: Bytes, to: Bytes| effects_written_at(checker, placed_in(src, from, to));
   assert_eq(at(b"|| 3", b")\n"), [b"{}"]);
   assert_eq(at(b"into(|| 3", b"(|| 3"), [b"[{}]"]);
   assert_eq(at(b"|| { log.note(4)", b")\n"), [b"{m.log.note}"]);
@@ -1207,7 +1207,7 @@ test "a call through a function value holds the row of the type it calls through
     ]),
   );
   let checker = rowed_m(src);
-  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  let at = |from: Bytes, to: Bytes| effects_written_at(checker, placed_in(src, from, to));
   assert_eq(at(b"f()", b"\n"), [b"{| e0}"]);
   assert_eq(at(b"g()", b"\n"), [b"{m.log.note | e0}"]);
   assert_eq(at(b"j.run()", b"\n"), [b"{m.log.write}"]);
@@ -1223,7 +1223,7 @@ test "a handle holds its body's row as its clauses open it, and each clause's an
     ]),
   );
   let checker = rowed_m(src);
-  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  let at = |from: Bytes, to: Bytes| effects_written_at(checker, placed_in(src, from, to));
   assert_eq(at(b"handle { log.note(1)", b"\nfn guarded"), [b"{m.link.send[conn], m.log.note}"]);
   assert_eq(at(b"log.note(n) -> {", b", return"), [b"{m.link.send[conn]}"]);
   assert_eq(at(b"return v", b" }\n"), [b"{}"]);
@@ -1243,9 +1243,9 @@ test "a try holds its body's row, and the clauses it is written out with perform
   let checker = rowed_m(src);
   let one = expression_span(written_node(checker, placed_in(src, b"try { digit", b"\n")));
   let at = try_spans(one);
-  assert_eq(rows_at(checker, one), [b"{m.log.write, m.parse.bad}"]);
-  assert_eq(rows_at(checker, at.ret), [b"{}"]);
-  assert_eq(rows_at(checker, at.clause), [b"{}"])
+  assert_eq(effects_at(checker, one), [b"{m.log.write, m.parse.bad}"]);
+  assert_eq(effects_at(checker, at.ret), [b"{}"]);
+  assert_eq(effects_at(checker, at.clause), [b"{}"])
 }
 
 test "each branch of a `parallel` holds what it performs" {
@@ -1256,7 +1256,7 @@ test "each branch of a `parallel` holds what it performs" {
   let checker = rowed_m(src);
   let branch = |text: Bytes| {
     let s = placed_in(src, text, text).start;
-    rows_at(checker, expression_span(written_node(checker, span_between(s, s + text.len()))))
+    effects_at(checker, expression_span(written_node(checker, span_between(s, s + text.len()))))
   };
   assert_eq(branch(b"n + 1"), [b"{}"]);
   assert_eq(branch(b"{ log.note(n); n }"), [b"{m.log.note}"])
@@ -1272,7 +1272,7 @@ test "a perform holds its atom, on a label parameter as its definition's own" {
     ]),
   );
   let checker = rowed_m(src);
-  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  let at = |from: Bytes, to: Bytes| effects_written_at(checker, placed_in(src, from, to));
   assert_eq(at(b"link.send[l](x)", b"\n"), [b"m.link.send[l0]"]);
   assert_eq(at(b"link.send[conn](x)", b"\n"), [b"m.link.send[conn]"]);
   assert_eq(at(b"link.send[l](link", b"\n"), [b"m.link.send[l0]"]);
@@ -1483,11 +1483,11 @@ test "two label parameters stay apart, and each names its own atom" {
 }
 
 test "a call inside a recursive group fills its callee's labels as any call does" {
-  let alone = |call: Bytes, row: Bytes|
+  let alone = |call: Bytes, effects: Bytes|
     Bytes::concat_all([
       b"effect net { write send[r](Bytes) -> Unit }\n",
       b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {",
-      row,
+      effects,
       b"} = if n <= 0 { net.send[l](b) } else { ",
       call,
       b" }",
@@ -1520,11 +1520,11 @@ test "a call inside a recursive group fills its callee's labels as any call does
 }
 
 test "a call inside a recursive group fills its callee's row as any call does" {
-  let alone = |row: Bytes, handed: Bytes|
+  let alone = |effects: Bytes, handed: Bytes|
     Bytes::concat_all([
       b"effect tick { write now() -> Unit }\n",
       b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / ",
-      row,
+      effects,
       b" = if n <= 0 { f() } else { each(n - 1, ",
       handed,
       b") }",
@@ -4914,10 +4914,10 @@ test "a builtin is what the prelude declares: its scheme, its parameters' names 
   };
   assert_eq(slice.scheme, {
     type_variables: [],
-    row_variables: [],
+    effect_variables: [],
     keep_variables: [],
     label_variables: [],
-    ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
+    ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), single_effect(abort_effect())),
   });
   assert_eq(declared_as(b"List::len").doc, [b"The number of items in the list."])
 }
@@ -4925,13 +4925,13 @@ test "a builtin is what the prelude declares: its scheme, its parameters' names 
 test "a declaration's generic list is its scheme's variables, numbered from zero" {
   assert_eq(declared_as(b"List::map").scheme, {
     type_variables: [0, 1],
-    row_variables: [0],
+    effect_variables: [0],
     keep_variables: [],
     label_variables: [],
     ty: fn_type(
-      [list_type(VariableType(0)), fn_type([VariableType(0)], VariableType(1), row_open(0))],
+      [list_type(VariableType(0)), fn_type([VariableType(0)], VariableType(1), open_effects(0))],
       list_type(VariableType(1)),
-      row_open(0),
+      open_effects(0),
     ),
   });
   assert_eq(
@@ -4940,10 +4940,10 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
       [
         VariableType(0),
         int_type(),
-        fn_type([VariableType(0)], iter_type(VariableType(0), VariableType(1)), row_open(0)),
+        fn_type([VariableType(0)], iter_type(VariableType(0), VariableType(1)), open_effects(0)),
       ],
       VariableType(1),
-      { atoms: [abort_atom()], tail: Some(0) },
+      { listed: [abort_effect()], tail: Some(0) },
     ),
   )
 }

@@ -6,7 +6,7 @@ import compiler.emit.output (Output, RootOutput, Tables, DefinitionSymbol, Proto
                              ExpectedPrototype, CallAt, SharedFn, GenericAt, callee_name,
                              word_prototype, no_generics, output_bin, tables_bin, root_output_bin,
                              no_tables, GenericCall, Generics, Need, ForwardedParameter, NeedKind,
-                             Scalar, Layout, Exact, RowGeneric, needs_specialisation,
+                             Scalar, Layout, Exact, EffectsGeneric, needs_specialisation,
                              PublishedSignature, Keyed, KeyedTag, KeyedField, KeyedEntry,
                              shared_fn_bin)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticFile, StaticWords, StaticWord,
@@ -711,7 +711,7 @@ fn static_fields(d: StaticDefinition) -> List<Bytes> =
   words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
     match w { FieldWord(n) -> acc.push(n), _ -> acc })
 
-fn holds_field(d: StaticDefinition) -> Bool = static_fields(d).len() > 0
+fn has_fields(d: StaticDefinition) -> Bool = static_fields(d).len() > 0
 
 fn addressed(d: StaticDefinition) -> List<Bytes> =
   words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
@@ -933,7 +933,7 @@ fn fields_part(
   statics: List<StaticDefinition>,
   constant_c: (StaticDefinition) -> Bytes / {abort.raise},
 ) -> Bytes / {abort.raise} = {
-  let held = statics.filter(holds_field);
+  let held = statics.filter(has_fields);
   let own = held.fold(Map::new(), |acc: Map<Bytes, Bool>, d: StaticDefinition|
     acc.insert(d.name, true));
   if held.len() == 0 { b"" } else {
@@ -1005,7 +1005,7 @@ fn constants_defined(
       m.body.tables.statics.fold(
         acc,
         |a: { constants: List<StaticDefinition>, defined: Map<Bytes, Bool> }, d: StaticDefinition|
-          if holds_field(d) || a.defined.contains(d.name) { a }
+          if has_fields(d) || a.defined.contains(d.name) { a }
           else { { constants: a.constants.push(d), defined: a.defined.insert(d.name, true) } },
       ),
   )
@@ -1345,7 +1345,7 @@ pub fn produce<| e>(
   }
 }
 
-pub fn kept_sources(
+pub fn cache_parts(
   parts: List<WrittenPart>,
 ) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} =
   cc::cache_sources(unit_header(), parts)
@@ -1738,11 +1738,11 @@ type Body = { text: Bytes, shared: List<SharedFn> }
 
 derive bin for Body
 
-fn answer_body(a: Output) -> Body = { text: a.text, shared: a.tables.shared }
+fn output_body(a: Output) -> Body = { text: a.text, shared: a.tables.shared }
 
 fn summarised(a: Output) -> Output = { text: b"", tables: { ..a.tables, shared: [] } }
 
-fn body_digest(a: Output) -> Bytes / {abort.raise} = blake3(bin::encode(answer_body(a), body_bin()))
+fn body_digest(a: Output) -> Bytes / {abort.raise} = blake3(bin::encode(output_body(a), body_bin()))
 
 type Stored = { material: Bytes, body: Bytes, size: Int }
 
@@ -1783,7 +1783,7 @@ fn restored_result(
     if callees_unchanged(keys, a, k.callees) { Some(a) } else { None }
   }
 
-type KeptAnswers = {
+type CachedResults = {
   results: Map<RootName, Output>,
   stored: Map<RootName, Stored>,
   known: Map<Bytes, Bool>,
@@ -1793,7 +1793,7 @@ fn cached_results<| e>(
   keys: Map<RootName, Bytes>,
   materials: Map<RootName, Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
-) -> KeptAnswers / {abort.raise | e} = {
+) -> CachedResults / {abort.raise | e} = {
   let found = materials.fold(
     Map::new(),
     |acc: Map<RootName, CachedResult>, n: RootName, m: Bytes|
@@ -1829,7 +1829,7 @@ fn cached_results<| e>(
   }
 }
 
-fn kept_among(kept: KeptAnswers, materials: Map<RootName, Bytes>) -> KeptAnswers =
+fn cached_among(kept: CachedResults, materials: Map<RootName, Bytes>) -> CachedResults =
   {
     results: materials.fold(Map::new(), |acc: Map<RootName, Output>, n: RootName, _: Bytes|
       match kept.results.get(n) { Some(a) -> acc.insert(n, a), None -> acc }),
@@ -1869,7 +1869,7 @@ fn results_to_cache<| e>(
             records: called.records.push({
               key: result_record_key(m),
               bytes: bin::encode(cached_result_of(keys, a), cached_result_bin()),
-            }).push({ key: body_key(m), bytes: bin::encode(answer_body(a), body_bin()) }),
+            }).push({ key: body_key(m), bytes: bin::encode(output_body(a), body_bin()) }),
           }
         },
         None -> acc,
@@ -2308,7 +2308,7 @@ fn walk_level<s | e>(
   program: Constructors,
   w: EmissionProgress<s>,
   roots: List<RootKey>,
-  kept: KeptAnswers,
+  kept: CachedResults,
   read: (Bytes) -> Option<Bytes> / e,
   keep: (List<Record>) -> Unit / e,
   ask: (s, List<RootKey>, Map<RootName, OwnershipSignature>, KnownResults) -> EmitterReply<s> / {abort.raise | e},
@@ -2320,7 +2320,7 @@ fn walk_level<s | e>(
         types,
         w,
         roots,
-        |ms: Map<RootName, Bytes>| kept_among(kept, ms),
+        |ms: Map<RootName, Bytes>| cached_among(kept, ms),
         read,
         ask,
       ),
@@ -2404,7 +2404,7 @@ fn with_results<s | e>(
   types: Bytes,
   w: EmissionProgress<s>,
   roots: List<RootKey>,
-  look: (Map<RootName, Bytes>) -> KeptAnswers / {abort.raise | e},
+  look: (Map<RootName, Bytes>) -> CachedResults / {abort.raise | e},
   read: (Bytes) -> Option<Bytes> / e,
   ask: (s, List<RootKey>, Map<RootName, OwnershipSignature>, KnownResults) -> EmitterReply<s> / {abort.raise | e},
 ) -> EmissionProgress<s> / {abort.raise | e} = {
@@ -2835,7 +2835,7 @@ fn with_callee_needs(
           Exact -> type_variables(arg),
           Layout -> layout_variables(arg),
           Scalar -> match arg { VariableType(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
-          RowGeneric -> [],
+          EffectsGeneric -> [],
         };
         vars.fold(a, |m: Map<RootName, List<Need>>, v: Int| {
           let had = match m.get(n) { Some(ns) -> ns, None -> [] };
@@ -2871,7 +2871,7 @@ fn call_specialisation(
   match definition_of(call.callee) {
     Some(definition) -> if functions.len() == 0 && args.all(|a: KeyArg| a == open)
         && call.rows.len() == 0 { call.callee }
-    else { keys::specialisation_key_with_rows(definition, args, functions, call.rows) },
+    else { keys::specialisation_key_with_effects(definition, args, functions, call.rows) },
     None -> call.callee,
   }
 }
@@ -2945,9 +2945,9 @@ fn settled_text<| e>(
   named: Map<RootName, List<RootName>>,
   read: (Bytes) -> Option<Bytes> / e,
 ) -> Output / {abort.raise | e} = {
-  let body = if a.text.len() > 0 { answer_body(a) } else {
+  let body = if a.text.len() > 0 { output_body(a) } else {
     match stored.get(n) {
-      None -> answer_body(a),
+      None -> output_body(a),
       Some(s) -> match read(body_key(s.material)) {
         None -> panic("a kept answer's body is kept beside it"),
         Some(b) -> match bin::decode(b, body_bin()) {

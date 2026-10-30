@@ -1,6 +1,6 @@
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (SourceLiteral)
-import compiler.check.types (Type, Row, Atom)
+import compiler.check.types (Type, Effects, Effect)
 import compiler.check.typed (BodyPart, TypedPattern, TypedParam, TypedFieldPattern, TypedWild,
                              TypedBinder, TypedLiteralPattern, TypedRange, TypedCase,
                              TypedRecordPattern, TypedListPattern, TypedOr, TypedExpression,
@@ -22,7 +22,7 @@ pub type WalkedNode =
   | WalkedRead(WalkedReading)
   | WalkedUnary({ op: Bytes, operand: Walked })
   | WalkedBinary({ op: Bytes, lhs: Walked, rhs: Walked })
-  | WalkedCall({ callee: Walked, args: List<Walked>, row: Row })
+  | WalkedCall({ callee: Walked, args: List<Walked>, row: Effects })
   | WalkedIf({ cond: Walked, then_branch: Walked, else_branch: Walked })
   | WalkedMatch({ scrutinee: Walked, arms: List<WalkedArm> })
   | WalkedBlock({ statements: List<WalkedStatement>, tail: Option<Walked> })
@@ -30,20 +30,20 @@ pub type WalkedNode =
   | WalkedRecord(List<WalkedField>)
   | WalkedUpdate({ base: Walked, sets: List<WalkedField> })
   | WalkedFieldRead({ base: Walked, field: Bytes })
-  | WalkedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<Walked> })
-  | WalkedLambda({ params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row })
+  | WalkedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, entry: Effect, args: List<Walked> })
+  | WalkedLambda({ params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Effects })
   | WalkedSimulate(WalkedThunk)
   | WalkedParallel(List<WalkedThunk>)
-  | WalkedHandle({ body: Walked, row: Row, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> })
+  | WalkedHandle({ body: Walked, row: Effects, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> })
   | WalkedDefault(Int)
 
 pub type WalkedReading =
   | WalkedLocal({ name: Bytes, binder: Int })
-  | WalkedDefinition({ full: Bytes, key: Bytes, args: List<Type>, rows: List<Row>, quantified: List<Int>, labels: List<Type> })
+  | WalkedDefinition({ full: Bytes, key: Bytes, args: List<Type>, rows: List<Effects>, quantified: List<Int>, labels: List<Type> })
   | WalkedConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<Type> })
-  | WalkedBuiltin({ name: Bytes, args: List<Type>, rows: List<Row> })
+  | WalkedBuiltin({ name: Bytes, args: List<Type>, rows: List<Effects> })
 
-pub type WalkedThunk = { body: Walked, row: Row }
+pub type WalkedThunk = { body: Walked, row: Effects }
 
 pub type WalkedField = { name: Bytes, value: Walked }
 
@@ -69,12 +69,12 @@ pub type WalkedClause = {
   label: Option<TypedParam<Type>>,
   resume: Option<TypedParam<Type>>,
   body: Walked,
-  row: Row,
-  resumed: Row,
+  row: Effects,
+  resumed: Effects,
   span: Span,
 }
 
-pub type WalkedReturn = { binder: TypedParam<Type>, body: Walked, row: Row, span: Span }
+pub type WalkedReturn = { binder: TypedParam<Type>, body: Walked, row: Effects, span: Span }
 
 pub type WalkedHandlerVar = { name: Bytes, ty: Type, init: Walked, span: Span }
 
@@ -96,9 +96,9 @@ pub fn binary_of(op: Bytes, lhs: Option<Walked>, rhs: Option<Walked>) -> Option<
     _ -> None,
   }
 
-pub fn call_of(callee: Option<Walked>, args: List<Option<Walked>>, row: Row) -> Option<WalkedNode> =
+pub fn call_of(callee: Option<Walked>, args: List<Option<Walked>>, effects: Effects) -> Option<WalkedNode> =
   match ((callee, Option::all(args))) {
-    (Some(f), Some(xs)) -> Some(WalkedCall({ callee: f, args: xs, row: row })),
+    (Some(f), Some(xs)) -> Some(WalkedCall({ callee: f, args: xs, row: effects })),
     _ -> None,
   }
 
@@ -220,24 +220,24 @@ pub fn perform_of(
   effect_name: Bytes,
   op: Bytes,
   resource: Option<Bytes>,
-  atom: Atom,
+  entry: Effect,
   args: List<Option<Walked>>,
 ) -> Option<WalkedNode> =
   match Option::all(args) {
     Some(xs) ->
       Some(
-        WalkedPerform({ effect: effect_name, op: op, resource: resource, atom: atom, args: xs }),
+        WalkedPerform({ effect: effect_name, op: op, resource: resource, entry: entry, args: xs }),
       ),
     None -> None,
   }
 
-pub fn simulate_of(body: Option<Walked>, row: Row) -> Option<WalkedNode> =
-  match body { Some(b) -> Some(WalkedSimulate({ body: b, row: row })), None -> None }
+pub fn simulate_of(body: Option<Walked>, effects: Effects) -> Option<WalkedNode> =
+  match body { Some(b) -> Some(WalkedSimulate({ body: b, row: effects })), None -> None }
 
-pub fn parallel_of(branches: List<{ body: Option<Walked>, row: Row }>) -> Option<WalkedNode> =
+pub fn parallel_of(branches: List<{ body: Option<Walked>, row: Effects }>) -> Option<WalkedNode> =
   match branches.fold(
       Some([]),
-      |acc: Option<List<WalkedThunk>>, b: { body: Option<Walked>, row: Row }|
+      |acc: Option<List<WalkedThunk>>, b: { body: Option<Walked>, row: Effects }|
         match ((acc, b.body)) {
           (Some(ts), Some(x)) -> Some(ts.push({ body: x, row: b.row })),
           _ -> None,
@@ -266,8 +266,8 @@ pub fn clause_of(
   label: Option<TypedParam<Type>>,
   resume: Option<TypedParam<Type>>,
   body: Option<Walked>,
-  row: Row,
-  resumed: Row,
+  effects: Effects,
+  resumed: Effects,
   span: Span,
 ) -> Option<WalkedClause> =
   match ((params, body)) {
@@ -281,7 +281,7 @@ pub fn clause_of(
         label: label,
         resume: resume,
         body: b,
-        row: row,
+        row: effects,
         resumed: resumed,
         span: span,
       }),
@@ -291,10 +291,10 @@ pub fn clause_of(
 pub fn return_of(
   binder: TypedParam<Type>,
   body: Option<Walked>,
-  row: Row,
+  effects: Effects,
   span: Span,
 ) -> Option<WalkedReturn> =
-  match body { Some(b) -> Some({ binder: binder, body: b, row: row, span: span }), None -> None }
+  match body { Some(b) -> Some({ binder: binder, body: b, row: effects, span: span }), None -> None }
 
 pub fn handler_var_of(
   name: Bytes,
@@ -306,16 +306,16 @@ pub fn handler_var_of(
 
 pub fn handle_of(
   body: Option<Walked>,
-  row: Row,
+  effects: Effects,
   clauses: List<Option<WalkedClause>>,
   ret: Option<Option<WalkedReturn>>,
   vars: List<Option<WalkedHandlerVar>>,
 ) -> Option<WalkedNode> =
   match ((body, Option::all(clauses), ret, Option::all(vars))) {
     (Some(b), Some(cs), None, Some(vs)) ->
-      Some(WalkedHandle({ body: b, row: row, clauses: cs, ret: None, vars: vs })),
+      Some(WalkedHandle({ body: b, row: effects, clauses: cs, ret: None, vars: vs })),
     (Some(b), Some(cs), Some(Some(r)), Some(vs)) ->
-      Some(WalkedHandle({ body: b, row: row, clauses: cs, ret: Some(r), vars: vs })),
+      Some(WalkedHandle({ body: b, row: effects, clauses: cs, ret: Some(r), vars: vs })),
     _ -> None,
   }
 
@@ -335,10 +335,10 @@ pub fn lambda_of(
   params: List<TypedParam<Type>>,
   kept: List<Int>,
   body: Option<Walked>,
-  row: Row,
+  effects: Effects,
 ) -> Option<WalkedNode> =
   match body {
-    Some(b) -> Some(WalkedLambda({ params: params, kept: kept, body: b, row: row })),
+    Some(b) -> Some(WalkedLambda({ params: params, kept: kept, body: b, row: effects })),
     None -> None,
   }
 
@@ -426,8 +426,8 @@ pub fn defaults_filled(e: Walked, copies: List<Option<Walked>>) -> Option<Walked
 pub type Settling = {
   ty: (Type) -> Type / {abort.raise},
   witness: (Type) -> Option<Bytes> / {abort.raise},
-  row: (Row) -> Row / {abort.raise},
-  atom: (Atom) -> Atom / {abort.raise},
+  row: (Effects) -> Effects / {abort.raise},
+  entry: (Effect) -> Effect / {abort.raise},
   read: (WalkedReading) -> Option<Reading<Type>> / {abort.raise},
   copies: (Type, List<Bytes>) -> Option<List<Bytes>> / {abort.raise},
   span: (Span) -> Span,
@@ -661,7 +661,7 @@ fn settled_node(node: WalkedNode, s: Settling) -> Option<TypedNode<Type>> / {abo
             effect: p.effect,
             op: p.op,
             resource: p.resource,
-            atom: (s.atom)(p.atom),
+            entry: (s.entry)(p.entry),
             args: xs,
           }),
         ),

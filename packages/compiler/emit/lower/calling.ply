@@ -6,9 +6,9 @@ import compiler.emit.code (Code, CodeVar, NDefinition, NConstructor, NBuiltin, C
                            CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm, CodeClause,
                            CodeListPattern, CodeBindingPattern, KnownRead, labels_among,
                            code_children)
-import compiler.check.types (Type, FunctionType, VariableType, NamedType, Scheme, Row, Atom,
+import compiler.check.types (Type, FunctionType, VariableType, NamedType, Scheme, Effects, Effect,
                              ResourceVariable, int_type, bool_type, option_type, run_needs,
-                             row_empty)
+                             no_effects)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span, dummy_span, prelude_binder)
 import compiler.syntax.expressions (prelude_module)
@@ -27,7 +27,7 @@ import compiler.check.known (list_item, map_parts, map_node_type, iter_parts, so
                              continue_constructor, stop_constructor)
 import compiler.emit.keys (RootKey, InlinedLambda, Named, Specialisation, Test, KeyType, KeyLayout,
                            Callee, Root, Generic, Evidence, root_name, root_text, definition_of,
-                           key_types, key_rows, unspecialised, specialisation_key)
+                           key_types, key_effects, unspecialised, specialisation_key)
 import compiler.emit.typed_ir
 import compiler.emit.typed_ir (reps_of, all_given, Representation, AsInt, AsBool, AsWord,
                                AsListView, AsSum, AsUnit, AsImmediate, Var, Arg, VarOperand,
@@ -66,13 +66,13 @@ import compiler.emit.lower.evidence (EvidenceArguments, evidence_parameters,
                                      with_evidence_parameters, evidence_arguments,
                                      evidence_arguments_filled, function_value_evidence,
                                      wanted_handing, label_values_at, caller_filled_labels,
-                                     labels_read, label_value, words_read, row_descriptor,
-                                     passed_evidence_arguments, label_codes, rows_static,
+                                     labels_read, label_value, words_read, effects_descriptor,
+                                     passed_evidence_arguments, label_codes, effects_static,
                                      root_body_start, evidence_parameter_types, evidence_for,
-                                     builtin_row)
-import compiler.emit.evidence (RowEvidence, evidence_type, instance_block_type,
+                                     builtin_effects)
+import compiler.emit.evidence (EffectsEvidence, evidence_type, instance_block_type,
                                evidence_param_count, max_evidence_params, evidence_array_type,
-                               row_evidence, in_scheme)
+                               effects_evidence, in_scheme)
 
 pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abort.raise} = {
   let h = evidence_parameters(setting, r.key);
@@ -83,7 +83,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
     base: r.base,
     params: r.params,
     types: r.types,
-    param_rows: param_rows_of(setting, r),
+    param_effects: param_effects_of(setting, r),
     result: signature_convention(
       setting,
       call_signature(setting, r.key, r.types, r.result_type),
@@ -108,7 +108,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
     allows_lambda_inlining: false,
     written: [],
     words: [],
-    rows: key_rows(r.key),
+    rows: key_effects(r.key),
     labels: h.labels,
     label_names: labels_among(r.params, h.labels).map(|p: EmitParam| p.name),
     label_values: [],
@@ -120,7 +120,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
   { ..context, tails: Restarts(restart_parameter_representations(context)) }
 }
 
-fn param_rows_of(setting: ModuleContext, r: Root) -> List<Option<Row>> =
+fn param_effects_of(setting: ModuleContext, r: Root) -> List<Option<Effects>> =
   match match definition_of(r.key) {
       Some(full_name) -> definition_full(setting.module, setting.here, setting.imports, full_name),
       None -> None,
@@ -539,7 +539,7 @@ pub fn continuation_closure(
           resumes: None,
           body: { node: CodeVar({ name: b"resume", slot: n }), span: at, ty: t },
           ty: f,
-          words: row_evidence(f.effects, context.rows, context.labels),
+          words: effects_evidence(f.effects, context.rows, context.labels),
           held: no_captured_evidence(),
         };
         let o = lambda_body_start(context, st, frame, at);
@@ -551,7 +551,7 @@ pub fn continuation_closure(
               k,
               range(0, n).fold([], |acc: List<Arg>, j: Int|
                 match o.st.env.get(j) { Some(a) -> acc.push(a), None -> acc }),
-              row_empty(),
+              no_effects(),
               false,
               at,
             ),
@@ -613,11 +613,11 @@ pub fn applied(
   st: Lowering,
   f: Arg,
   args: List<Arg>,
-  row: Row,
+  effects: Effects,
   tail: Bool,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  applied_wanting(context, st, f, args, row_evidence(row, context.rows, context.labels), tail, at)
+  applied_wanting(context, st, f, args, effects_evidence(effects, context.rows, context.labels), tail, at)
 
 pub fn known_applied(
   context: Context,
@@ -625,14 +625,14 @@ pub fn known_applied(
   k: KnownRead,
   f: Arg,
   args: List<Arg>,
-  row: Row,
+  effects: Effects,
   tail: Bool,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let wanted = match ((frame_of(context, k.owner, k.nth), f)) {
-    (Some(None), _) -> row_evidence(k.lambda.row, context.rows, context.labels),
+    (Some(None), _) -> effects_evidence(k.lambda.row, context.rows, context.labels),
     (Some(Some(_)), VarOperand(v)) -> param_wanted(context, v),
-    _ -> row_evidence(row, context.rows, context.labels),
+    _ -> effects_evidence(effects, context.rows, context.labels),
   };
   applied_wanting(context, st, f, args, wanted, tail, at)
 }
@@ -642,7 +642,7 @@ fn applied_wanting(
   st: Lowering,
   f: Arg,
   args: List<Arg>,
-  wanted: List<RowEvidence>,
+  wanted: List<EffectsEvidence>,
   tail: Bool,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
@@ -1172,10 +1172,10 @@ fn parameter_function_words(context: Context, closure: Var) -> List<EvidenceWord
     })
 }
 
-fn param_wanted(context: Context, closure: Var) -> List<RowEvidence> =
+fn param_wanted(context: Context, closure: Var) -> List<EffectsEvidence> =
   match context.parameter_positions.get(closure.id) {
-    Some(p) -> match context.param_rows.at(p) {
-      Some(Some(r)) -> row_evidence(r, context.rows, context.labels),
+    Some(p) -> match context.param_effects.at(p) {
+      Some(Some(r)) -> effects_evidence(r, context.rows, context.labels),
       _ -> [],
     },
     None -> [],
@@ -1603,7 +1603,7 @@ pub fn iterated(
   context: Context,
   st: Lowering,
   args: List<Arg>,
-  row: Row,
+  effects: Effects,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match args {
@@ -1615,7 +1615,7 @@ pub fn iterated(
       Some(t) -> {
         let v = step_variables(context, st, t.state, t.result);
         let begun = pass_begun(enter_block(v.st), v.left, budget, at);
-        let r = applied(context, begun.st, step, [VarOperand(v.state)], row, false, at);
+        let r = applied(context, begun.st, step, [VarOperand(v.state)], effects, false, at);
         let exit_inlined = begun.spent;
         let pass = iter_tested(context, r.st.insts, r.arg, {
           state: v.state,
@@ -1653,8 +1653,8 @@ pub fn called_builtin(
   function: Code,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let row = builtin_row(function);
-  if name == b"iterate" { iterated(context, st, args, row, at) } else if name == b"panic" {
+  let effects = builtin_effects(function);
+  if name == b"iterate" { iterated(context, st, args, effects, at) } else if name == b"panic" {
     match function_parts(function.ty, args.len()) {
       Some(f) ->
         performed(
@@ -2041,7 +2041,7 @@ pub fn closure(
   };
   let after = raising.st;
   let own = if frame.words.len() == 0 { { st: after, name: b"" } }
-  else { static_added(after, row_descriptor(frame.words.map(|o: RowEvidence| o.evidence))) };
+  else { static_added(after, effects_descriptor(frame.words.map(|o: EffectsEvidence| o.evidence))) };
   let placed = {
     ..own.st,
     lambdas: own.st.lambdas.set(
@@ -2053,7 +2053,7 @@ pub fn closure(
         words: {
           descriptor: own.name,
           count: frame.words.len(),
-          left: frame.words.fold([], |acc: List<Int>, o: RowEvidence|
+          left: frame.words.fold([], |acc: List<Int>, o: EffectsEvidence|
             match o.evidence.resource {
               ResourceVariable(p) -> match zip(exit_inlined, s.labels).find(
                   |l: { first: Int, second: Var }| l.first == p,
@@ -2332,7 +2332,7 @@ fn numbered(
     next: first + specs.len(),
   }
 
-fn continuation_type(t: Type, resumes: Option<Row>) -> Type =
+fn continuation_type(t: Type, resumes: Option<Effects>) -> Type =
   match ((t, resumes)) { (FunctionType(f), Some(r)) -> FunctionType({ ..f, effects: r }), _ -> t }
 
 fn closure_layout(context: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> ClosureLayout = {
@@ -2517,7 +2517,7 @@ fn slot_read(c: Code, slot: Int) -> Option<Code> = {
 
 fn generic(d: Definition) -> Bool =
   match d.scheme {
-    Some(sc) -> sc.type_variables.len() > 0 || sc.row_variables.len() > 0,
+    Some(sc) -> sc.type_variables.len() > 0 || sc.effect_variables.len() > 0,
     None -> false,
   }
 
@@ -2692,7 +2692,7 @@ pub fn called_at_types(
   st: Lowering,
   name: Bytes,
   types: List<Type>,
-  rows: List<Row>,
+  rows: List<Effects>,
   codes: List<Code>,
   args: List<Arg>,
   at: Span,
@@ -2707,7 +2707,7 @@ fn defined_called(
   st: Lowering,
   d: NamedDefinition,
   types: List<Type>,
-  rows: List<Row>,
+  rows: List<Effects>,
   codes: List<Code>,
   args: List<Arg>,
   at: Span,
@@ -2728,7 +2728,7 @@ pub fn simulate_called(
   context: Context,
   st: Lowering,
   body: Arg,
-  row: Row,
+  effects: Effects,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let name = scheduler_module().concat(b"::simulated");
@@ -2736,7 +2736,7 @@ pub fn simulate_called(
     Some(d) -> match d.definition.scheme {
       Some(sc) -> match sc.ty {
         FunctionType(f) -> match f.params.last() {
-          Some(FunctionType(b)) -> b.effects.atoms.map(|a: Atom| a.effect),
+          Some(FunctionType(b)) -> b.effects.listed.map(|a: Effect| a.effect),
           _ -> [],
         },
         _ -> [],
@@ -2767,7 +2767,7 @@ pub fn simulate_called(
     sites.st,
     name,
     [match type_of(body) { FunctionType(f) -> f.ret, _ -> unknown_type() }],
-    [{ ..row, atoms: row.atoms.filter(|a: Atom| !answered.contains(a.effect)) }],
+    [{ ..effects, listed: effects.listed.filter(|a: Effect| !answered.contains(a.effect)) }],
     [],
     sites.args.push(body),
     at,
@@ -2842,7 +2842,7 @@ fn return_type_at(d: Definition, given: List<Type>) -> Option<Type> =
     None -> None,
   }
 
-fn may_suspend(row: Row) -> Bool = row.tail != None || run_needs(row.atoms).len() > 0
+fn may_suspend(effects: Effects) -> Bool = effects.tail != None || run_needs(effects.listed).len() > 0
 
 fn all_represented_as(
   st: Lowering,
@@ -3084,7 +3084,7 @@ fn labelled_param(d: Definition, j: Int) -> Bool =
     Some(sc) -> match sc.ty {
       FunctionType(f) -> match f.params.at(j) {
         Some(FunctionType(p)) ->
-          p.effects.atoms.any(|a: Atom|
+          p.effects.listed.any(|a: Effect|
             match a.resource { ResourceVariable(_) -> true, _ -> false }),
         _ -> false,
       },
@@ -3094,7 +3094,7 @@ fn labelled_param(d: Definition, j: Int) -> Bool =
   }
 
 fn inlinable(context: Context, l: Lambda) -> Bool / {abort.raise} =
-  !has_handle(l.body) && rows_static({ node: CodeLambda(l), span: l.at, ty: FunctionType(l.ty) })
+  !has_handle(l.body) && effects_static({ node: CodeLambda(l), span: l.at, ty: FunctionType(l.ty) })
 
 fn owner_named(context: Context, name: Bytes) -> RootKey / {abort.raise} =
   match context.owners.get(name) {
@@ -3153,7 +3153,7 @@ fn named_arity(
 fn named_lambda(c: Code, n: Int) -> Lambda = {
   let f = match c.ty {
     FunctionType(t) -> t,
-    _ -> { params: [], kept: [], once: false, ret: unknown_type(), effects: row_empty() },
+    _ -> { params: [], kept: [], once: false, ret: unknown_type(), effects: no_effects() },
   };
   {
     params: n,
@@ -3171,7 +3171,7 @@ fn named_lambda(c: Code, n: Int) -> Lambda = {
             span: c.span,
             ty: match f.params.at(i) { Some(t) -> t, None -> unknown_type() },
           }),
-        row: row_empty(),
+        row: no_effects(),
       }),
       span: c.span,
       ty: f.ret,
@@ -3190,7 +3190,7 @@ pub fn known_run(
   context: Context,
   st: Lowering,
   k: KnownRead,
-  row: Row,
+  effects: Effects,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let f = known_lambda_read(context, st, { ..k, slot: k.lambda.params }, at);
@@ -3203,7 +3203,7 @@ pub fn known_run(
         None -> acc,
       },
   );
-  known_applied(context, read.st, k, f.arg, read.args, row, false, at)
+  known_applied(context, read.st, k, f.arg, read.args, effects, false, at)
 }
 
 pub fn named_in(

@@ -27,9 +27,9 @@ import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
 import compiler.check.resolve.tables (Diagnostic, ParsedModule, error_at, qualify)
 import compiler.syntax.parsing (Span, no_module)
-import compiler.check.types (Atom, Field, Printer, Type, NamedType, FunctionType, RecordType,
-                             VariableType, print_resource, print_row, print_type, printer_naming,
-                             printer_new, reserve_atoms, row_is_pure, row_is_pure_but_raise,
+import compiler.check.types (Effect, Field, Printer, Type, NamedType, FunctionType, RecordType,
+                             VariableType, print_resource, print_effects, print_type, printer_naming,
+                             printer_new, reserve_effects, is_pure, is_pure_but_raise,
                              run_needs, tuple_arity, type_letter, type_args, without_raises,
                              NominalType, is_diverges)
 import compiler.syntax.type_syntax (WriteMode)
@@ -41,14 +41,14 @@ import std.list
 
 /// A definition as a callee: its signature, and whether its published row is empty. The static
 /// prover unfolds a call and shares one term between equal calls only when that row is. `pure`: its
-/// body performs nothing but may raise. `row_pure`: its type's row is nothing but raises too, so
+/// body performs nothing but may raise. `effects_pure`: its type's row is nothing but raises too, so
 /// equal calls answer alike. A function type's own flag says more: that a value of it performs
 /// nothing and never raises.
 pub type Signature = {
   name: String,
   ty: Sort,
   pure: Bool,
-  row_pure: Bool,
+  effects_pure: Bool,
   /// Whether its row names a raise or `diverges`: a call may end with no answer.
   raises: Bool,
   /// Where its row is a variable beside nothing but raises, the parameters whose functions are
@@ -445,7 +445,7 @@ fn type_of(t: Type, vars: List<Int>) -> Sort / {abort.raise} =
       FunctionSort(
         f.params.map(|p: Type| type_of(p, vars)),
         type_of(f.ret, vars),
-        row_is_pure(f.effects),
+        is_pure(f.effects),
       ),
     RecordType(fs) -> record_of(fs, vars),
     // A value of a `new` record is the record it is written as, which is what a run is handed.
@@ -499,9 +499,9 @@ fn signature_of(d: DefinitionInfo) -> Signature / {abort.raise} =
     name: String::of_bytes_lossy(d.name),
     ty: type_of(d.scheme.ty, met(d.scheme.ty, [])),
     pure: without_raises(d.effects).len() == 0,
-    row_pure: pure_but_raise(d.scheme.ty),
+    effects_pure: pure_but_raise(d.scheme.ty),
     raises: d.effects.len() > without_raises(d.effects).len()
-      || d.effects.any(|atom: Atom| is_diverges(atom)),
+      || d.effects.any(|entry: Effect| is_diverges(entry)),
     through: effect_parameters_of(d.scheme.ty),
   }
 
@@ -510,18 +510,18 @@ fn signature_of(d: DefinitionInfo) -> Signature / {abort.raise} =
 fn effect_parameters_of(t: Type) -> List<Int> =
   match t {
     FunctionType(f) -> match f.effects.tail {
-      Some(v) -> if without_raises(f.effects.atoms).len() > 0 || mentions_row(f.ret, v) { [] }
+      Some(v) -> if without_raises(f.effects.listed).len() > 0 || mentions_effect_variable(f.ret, v) { [] }
       else {
         let direct = range(0, f.params.len()).filter(|i: Int|
           match f.params.at(i) {
             Some(FunctionType(g)) ->
-              g.effects.tail == Some(v) && !g.params.any(|p: Type| mentions_row(p, v))
-                && !mentions_row(g.ret, v),
+              g.effects.tail == Some(v) && !g.params.any(|p: Type| mentions_effect_variable(p, v))
+                && !mentions_effect_variable(g.ret, v),
             _ -> false,
           });
         let elsewhere = range(0, f.params.len()).any(|i: Int|
           !direct.contains(i)
-            && (match f.params.at(i) { Some(p) -> mentions_row(p, v), None -> false }));
+            && (match f.params.at(i) { Some(p) -> mentions_effect_variable(p, v), None -> false }));
         if elsewhere || direct.len() == 0 { [] } else { direct }
       },
       None -> [],
@@ -529,17 +529,17 @@ fn effect_parameters_of(t: Type) -> List<Int> =
     _ -> [],
   }
 
-fn mentions_row(t: Type, v: Int) -> Bool =
+fn mentions_effect_variable(t: Type, v: Int) -> Bool =
   match t {
     VariableType(_) -> false,
-    NamedType(c) -> type_args(c.args).any(|a: Type| mentions_row(a, v)),
+    NamedType(c) -> type_args(c.args).any(|a: Type| mentions_effect_variable(a, v)),
     FunctionType(f) ->
-      f.effects.tail == Some(v) || f.params.any(|p: Type| mentions_row(p, v))
-        || mentions_row(f.ret, v),
-    RecordType(fs) -> fs.any(|x: Field| mentions_row(x.ty, v)),
+      f.effects.tail == Some(v) || f.params.any(|p: Type| mentions_effect_variable(p, v))
+        || mentions_effect_variable(f.ret, v),
+    RecordType(fs) -> fs.any(|x: Field| mentions_effect_variable(x.ty, v)),
     NominalType(n) ->
-      n.fields.any(|x: Field| mentions_row(x.ty, v))
-        || type_args(n.args).any(|a: Type| mentions_row(a, v)),
+      n.fields.any(|x: Field| mentions_effect_variable(x.ty, v))
+        || type_args(n.args).any(|a: Type| mentions_effect_variable(a, v)),
   }
 
 // --- Declared types ------------------------------------------------------------------
@@ -646,12 +646,12 @@ fn law_guards(modules: List<ParsedModule>) -> Map<Bytes, LawGuardSummary> / {abo
 
 /// What an `ensures` leaves alone is everything outside the resources its owner's row writes; one
 /// printer names them, so two label variables read apart.
-fn frame_of(footprint: List<Atom>) -> Frame / {abort.raise} = {
-  let writes = footprint.filter(|a: Atom| match a.mode { WriteMode -> true, _ -> false });
+fn frame_of(footprint: List<Effect>) -> Frame / {abort.raise} = {
+  let writes = footprint.filter(|a: Effect| match a.mode { WriteMode -> true, _ -> false });
   if writes.len() == 0 { Pure } else {
     let named = writes.fold(
-      { p: reserve_atoms(printer_new(), writes), texts: [] },
-      |acc: { p: Printer, texts: List<String> }, a: Atom| {
+      { p: reserve_effects(printer_new(), writes), texts: [] },
+      |acc: { p: Printer, texts: List<String> }, a: Effect| {
         let r = print_resource(acc.p, a.resource);
         let written = String::of_bytes_lossy(a.effect.concat(r.text));
         {
@@ -667,11 +667,11 @@ fn frame_of(footprint: List<Atom>) -> Frame / {abort.raise} = {
 }
 
 /// A row as a report prints it, its labels named apart from the resources it names.
-fn effects_text(atoms: List<Atom>) -> Option<String> / {abort.raise} =
-  if atoms.len() == 0 { None } else {
+fn effects_text(effects: List<Effect>) -> Option<String> / {abort.raise} =
+  if effects.len() == 0 { None } else {
     Some(
       String::of_bytes_lossy(
-        print_row(reserve_atoms(printer_new(), atoms), { atoms: atoms, tail: None }).text,
+        print_effects(reserve_effects(printer_new(), effects), { listed: effects, tail: None }).text,
       ),
     )
   }
@@ -1060,7 +1060,7 @@ fn builtin_signatures() -> List<BuiltinSignature> / {abort.raise} =
 
 /// Whether a function of type `t` performs nothing but may raise.
 fn pure_but_raise(t: Type) -> Bool =
-  match t { FunctionType(f) -> row_is_pure_but_raise(f.effects), _ -> true }
+  match t { FunctionType(f) -> is_pure_but_raise(f.effects), _ -> true }
 
 /// The measures the definitions of the modules `owned` answers for state, in the checker's order.
 pub fn measures_in(analysis: Analysis, owned: (Bytes) -> Bool) -> List<Measure> / {abort.raise} = {
@@ -1167,7 +1167,7 @@ test "a signature numbers its variables by first appearance, and says whether it
       true,
     ),
     pure: true,
-    row_pure: true,
+    effects_pure: true,
     raises: false,
     through: [],
   });

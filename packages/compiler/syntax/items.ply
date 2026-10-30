@@ -26,10 +26,10 @@ import compiler.syntax.lexer (TokenKind, Token, Identifier, StringLiteral, Inter
                               ItemDoc, ModuleDoc, doc_mark, follows_name, is_identifier_continue)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, RecordTypeExpression,
                                     UnitTypeExpression, NamedTypeExpression, FunctionTypeExpression,
-                                    InvalidTypeExpression, RowExpression, AtomExpression, Mode,
-                                    Generics, RowMember, WriteMode, RaiseMode, AtomMember,
-                                    EffectSetMember, ty, type_span, mode, generics, row, row_member,
-                                    no_generics, dump_type, dump_row, dump_atom, dump_generics,
+                                    InvalidTypeExpression, EffectsExpression, EffectExpression, Mode,
+                                    Generics, EffectsMember, WriteMode, RaiseMode, EffectMember,
+                                    EffectSetMember, ty, type_span, mode, generics, effects, effects_member,
+                                    no_generics, dump_type, dump_effects_expression, dump_effect_expression, dump_generics,
                                     dump_mode, starts_type)
 import compiler.syntax.expressions (Expression, LiteralExpression, CallExpression, NameExpression,
                                     Param, expression, scrutinee, block_expression, expression_span,
@@ -123,7 +123,7 @@ pub type FnDefinition = {
   generics: Generics,
   params: List<Param>,
   ret: Option<TypeExpression>,
-  effects: Option<RowExpression>,
+  effects: Option<EffectsExpression>,
   constraints: List<Constraint>,
   spec: List<SpecClause>,
   returns: Option<Returns>,
@@ -283,9 +283,9 @@ pub fn numeric_by(d: NumericDefinition, op: Bytes) -> Option<Identifier> =
 pub type EffectSetDefinition = {
   name: Identifier,
   visibility: Visibility,
-  atoms: List<AtomExpression>,
+  listed: List<EffectExpression>,
   includes: List<QName>,
-  expansion: List<AtomExpression>,
+  expansion: List<EffectExpression>,
   doc: Option<Doc>,
   span: Span,
 }
@@ -296,7 +296,7 @@ pub type ExternDefinition = {
   generics: Generics,
   params: List<Param>,
   ret: TypeExpression,
-  effects: Option<RowExpression>,
+  effects: Option<EffectsExpression>,
   constraints: List<Constraint>,
   spec: List<SpecClause>,
   doc: Option<Doc>,
@@ -911,13 +911,13 @@ fn opt_return(
   }
 }
 
-fn opt_row(
+fn optional_effects(
   input: Input,
   parser: Parser,
-) -> Result<ParseOutput<Option<RowExpression>>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<Option<EffectsExpression>>, Parser> / {abort.raise} = {
   let sl = eat(input, parser, token_slash());
   if !sl.ok { Ok({ parser: sl.parser, node: None }) } else {
-    let { parser, node: r } = row(input, sl.parser)?;
+    let { parser, node: r } = effects(input, sl.parser)?;
     Ok({ parser: parser, node: Some(r) })
   }
 }
@@ -983,7 +983,7 @@ pub fn fn_definition(
     b"`)` to close the parameter list",
   )?;
   let { parser, node: ret } = opt_return(input, parser)?;
-  let { parser, node: eff } = opt_row(input, parser)?;
+  let { parser, node: eff } = optional_effects(input, parser)?;
   let { parser, node: cs } = where_clause(input, parser)?;
   let { parser, node: rt } = opt_returns(input, parser, ps)?;
   let { parser, node: sp } = spec_clauses(input, parser)?;
@@ -1070,7 +1070,7 @@ pub fn extern_definition(
     b"`->` and the type an `extern fn` answers",
   )?;
   let { parser, node: ret } = ty(input, parser)?;
-  let { parser, node: eff } = opt_row(input, parser)?;
+  let { parser, node: eff } = optional_effects(input, parser)?;
   let { parser, node: cs } = where_clause(input, parser)?;
   let { parser, node: sp } = spec_clauses(input, parser)?;
   Ok({
@@ -1846,7 +1846,7 @@ pub fn effect_definition(
   })
 }
 
-pub type EffectSetMembers = { parser: Parser, includes: List<QName>, atoms: List<AtomExpression> }
+pub type EffectSetMembers = { parser: Parser, includes: List<QName>, listed: List<EffectExpression> }
 
 pub fn set_members(
   input: Input,
@@ -1854,26 +1854,26 @@ pub fn set_members(
   open: Span,
 ) -> Result<EffectSetMembers, Parser> / {abort.raise} =
   iterate(
-    { parser: parser, includes: [], atoms: [] },
+    { parser: parser, includes: [], listed: [] },
     input.token_count - parser.pos + 1,
     |s: EffectSetMembers|
       if at_token(input, s.parser, token_rbrace()) || at_token(input, s.parser, token_pipe()) {
-        Stop(Ok({ parser: s.parser, includes: s.includes, atoms: s.atoms }))
+        Stop(Ok({ parser: s.parser, includes: s.includes, listed: s.listed }))
       } else if at_eof(input, s.parser) {
         Stop(Err(unclosed(input, s.parser, open, b"`}` to close the effect set")))
       } else {
-        match row_member(input, s.parser) {
+        match effects_member(input, s.parser) {
           Err(q) -> Stop(Err(q)),
           Ok(m) -> {
             let next = match m.node {
-              AtomMember(a) -> { parser: m.parser, includes: s.includes, atoms: s.atoms.push(a) },
+              EffectMember(a) -> { parser: m.parser, includes: s.includes, listed: s.listed.push(a) },
               EffectSetMember(q) ->
-                { parser: m.parser, atoms: s.atoms, includes: s.includes.push(q) },
+                { parser: m.parser, listed: s.listed, includes: s.includes.push(q) },
             };
             let cm = eat(input, next.parser, token_comma());
             if !cm.ok {
-              Stop(Ok({ parser: cm.parser, includes: next.includes, atoms: next.atoms }))
-            } else { Continue({ parser: cm.parser, includes: next.includes, atoms: next.atoms }) }
+              Stop(Ok({ parser: cm.parser, includes: next.includes, listed: next.listed }))
+            } else { Continue({ parser: cm.parser, includes: next.includes, listed: next.listed }) }
           },
         }
       },
@@ -1922,13 +1922,13 @@ pub fn effect_set_definition(
       o,
       b"`}` to close the effect set",
     )?;
-    let promised = ms.atoms.fold(parser, |q: Parser, atom: AtomExpression|
-      if !atom.bounded { q } else {
+    let promised = ms.listed.fold(parser, |q: Parser, entry: EffectExpression|
+      if !entry.bounded { q } else {
         push_diagnostic(
           q,
           error_at(
             b"E0466",
-            atom.span,
+            entry.span,
             b"`bounded` is a promise a definition makes of its own effects",
             b"this effect belongs to an effect set",
             [b"write the effect with `bounded` in the effects of the definition that promises it"],
@@ -1940,7 +1940,7 @@ pub fn effect_set_definition(
       node: {
         name: name,
         visibility: vis,
-        atoms: ms.atoms,
+        listed: ms.listed,
         includes: ms.includes,
         expansion: [],
         doc: None,
@@ -3174,7 +3174,7 @@ pub fn dump_fn(definition: FnDefinition) -> Bytes / {abort.raise} =
     dump_generics(definition.generics),
     dump_list(definition.params, dump_param),
     dump_opt(definition.ret, dump_type),
-    dump_opt(definition.effects, dump_row),
+    dump_opt(definition.effects, dump_effects_expression),
     dump_list(definition.constraints, dump_constraint),
     dump_list(definition.spec, dump_spec),
     match definition.decreases {
@@ -3317,9 +3317,9 @@ pub fn dump_effect_set(d: EffectSetDefinition) -> Bytes / {abort.raise} =
     dump_node(d.span, b"set"),
     dump_visibility(d.visibility),
     dump_identifier(d.name),
-    dump_list(d.atoms, dump_atom),
+    dump_list(d.listed, dump_effect_expression),
     dump_list(d.includes, dump_qualified_name),
-    dump_list(d.expansion, dump_atom),
+    dump_list(d.expansion, dump_effect_expression),
     dump_doc_if(d.doc),
   ])
 
@@ -3331,7 +3331,7 @@ pub fn dump_extern(d: ExternDefinition) -> Bytes / {abort.raise} =
     dump_generics(d.generics),
     dump_list(d.params, dump_param),
     dump_type(d.ret),
-    dump_opt(d.effects, dump_row),
+    dump_opt(d.effects, dump_effects_expression),
     dump_list(d.constraints, dump_constraint),
     dump_list(d.spec, dump_spec),
     dump_doc_if(d.doc),
