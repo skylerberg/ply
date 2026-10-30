@@ -1,11 +1,3 @@
-//! Ownership. A resource is a value of a type that states a `release`, a value holding one, or a
-//! function its call consumes. It is never copied: a binding of one the body owns is consumed at
-//! most once on each path, and one lent to the body never. The walk judges a body by the tree the
-//! check's walk built of it, each node with its type, and how what it calls takes its arguments, and
-//! answers where each owned binding a path leaves live is let go: where its block, its body or its
-//! branch ends, or where a way out of its block leaves early. The emitter writes its type's release
-//! there.
-
 import compiler.syntax.parsing (Span)
 import compiler.check.types (Type, FunctionType, Row, Field, record_fields, unit_type)
 import compiler.check.typed (TypedParam, pattern_binders, TypedPattern, TypedWild, TypedBinder,
@@ -27,63 +19,34 @@ import compiler.check.infer.names (simple_name_of)
 import std.list
 import std.option
 
-/// What the walk asks of the check.
 pub type Facts = {
-  /// The module the body is in, which every diagnostic names.
   module: Int,
-  /// Whether a value of the resolved type is a resource.
   resource: (Type) -> Bool / {abort.raise},
-  /// A type of the tree as the check resolved it.
   resolved: (Type) -> Type / {abort.raise},
-  /// How the definition or builtin the check holds under a name takes its arguments, where it holds
-  /// one.
   taking: (Bytes) -> Option<ArgumentModes> / {abort.raise},
-  /// The places of the parameters of an operation its handler takes, by the effect's name across
-  /// the program and the operation's.
   op_keep_parameters: (Bytes, Bytes) -> List<Int> / {abort.raise},
-  /// Whether a value of the resolved type states a `release` itself, so that taking it apart, which
-  /// only its own module may, consumes it whole and runs no release.
   opened: (Type) -> Bool / {abort.raise},
 }
 
-/// How a definition takes its arguments: the places of those written `keep`; `all` for a
-/// constructor, which takes every value it is handed.
 pub type ArgumentModes = { kept: List<Int>, all: Bool }
 
 fn keeps_argument(t: ArgumentModes, i: Int) -> Bool = t.all || t.kept.contains(i)
 
-/// A parameter of the body judged: its name, where it is written, its type, and whether it is
-/// written `keep`, which makes it the body's to let go.
 pub type Param = { name: Bytes, span: Span, ty: Type, keep: Bool }
 
-/// Where an owned value is let go, by the node at `at`, as `place` says: after a block, a branch's
-/// body, a lambda's, a clause's or the definition's; before the last expression of its scope where
-/// that does not name it; or where a failure unwinds through the node. `held` is its binder, or the
-/// node that made a value no binder holds: the scrutinee of a `match`, or an argument a call takes
-/// before a later one may fail.
 pub type Release = {
   held: Holder,
   ty: Type,
   at: Span,
   place: ReleasePlace,
-  /// What the lambda the release runs in performs, none in the definition's body, and the
-  /// operations the `handle`s around it there answer.
   row: Option<Row>,
   answered: List<Bytes>,
 }
 
-/// Where a release runs: what the lambda it runs in performs, and what the `handle`s around it there
-/// answer.
 type ReleaseContext = { row: Option<Row>, answered: List<Bytes> }
 
-/// What the walk of a body found: what it refuses, where each binding it owns is let go, and the type
-/// of each value it owns, any of which it may let go, so that its row performs their releases.
 pub type OwnershipResult = { diags: List<Diag>, releases: List<Release>, held: List<OwnedValue> }
 
-/// A value a body owns, which a release may let go: bound at `at` as `name`, of type `ty`; `row`
-/// what the lambda it is let go in performs, none in the definition's body; and `answered` the
-/// operations the `handle`s around it there answer, which its release may perform without that row
-/// naming them.
 pub type OwnedValue = {
   held: Holder,
   row: Option<Row>,
@@ -93,27 +56,10 @@ pub type OwnedValue = {
   answered: List<Bytes>,
 }
 
-/// How an expression's value is used where it stands.
-type Usage =
-  /// Moved into what holds it, the text saying what that is.
-  | Moved(Bytes)
-  /// Lent to the call it is handed to, which never keeps it.
-  | Borrowed
-  /// Read as a value is copied: an operand, a condition.
-  | Read
-  /// A statement's value, let go where it stands.
-  | Dropped
-  /// The function a binding holds, called: a call consumes one that owns what it holds.
-  | Called
+type Usage = | Moved(Bytes) | Borrowed | Read | Dropped | Called
 
-/// A function the walk is inside of, which judges its capture of a binding from outside it: `held`
-/// where it may outlive what it borrows, and `local` where a `let` binds it, whose binding then
-/// says what it captured.
 type EnclosingFunction = { span: Span, held: Bool, local: Bool }
 
-/// A binding the walk follows, by `key`, its holder's (`holder_key`).
-/// `depth` is how many functions in it is bound, so a use deeper than that captures it, and `frame`
-/// the body that runs it: the definition's, a lambda's or a clause's.
 type Binding = {
   key: Int,
   owning_package: Holder,
@@ -125,35 +71,19 @@ type Binding = {
   depth: Int,
   frame: Int,
   gone: Option<Consumption>,
-  /// Resource fields a read moved out of it.
   taken: List<Bytes>,
-  /// For a function a `let` binds: the owned bindings it borrows, by the site each is bound at.
   borrows: List<Int>,
-  /// For a function a `let` binds that consumed what it captured: those bindings, which letting the
-  /// function go uncalled lets go.
   holds: List<Int>,
-  /// Where it is let go: what the lambda it is bound in performs, and the operations the `handle`s
-  /// around it there answer.
   row: Option<Row>,
   answered: List<Bytes>,
 }
 
-/// Where and how a path consumed a binding.
 type Consumption = { at: Span, how: Bytes }
 
-/// What a binding holds: a value its type's release lets go; a function that took a resource, whose
-/// call consumes what it took and whose letting go lets that go; or a clause's continuation, which a
-/// clause that never calls it abandons.
 type Kind = | Value | OwningFunction | Continuation
 
-/// A `handle` the walk is inside the body of: the operations its clauses answer, and the body it
-/// runs in.
 type EnclosingHandle = { operations: List<Bytes>, body: Int }
 
-/// What the walk has seen: each binding by the site it is bound at, what it refuses, and what each
-/// function a `let` binds captured, by the function's site.
-/// `in_flight` are the arguments the calls being walked took from earlier places, which are theirs only
-/// once they are called, so a failure in a later argument lets them go.
 type OwnershipState = {
   module: Int,
   bindings: Map<Int, Binding>,
@@ -163,33 +93,22 @@ type OwnershipState = {
   in_flight: List<ReleaseTarget>,
 }
 
-/// An owned value a failure lets go: what holds it, and its type.
 type ReleaseTarget = { owning_package: Holder, ty: Type }
 
-/// What a function's body captured from outside it: the bindings it consumed and the owned bindings
-/// it borrows, each by the site it is bound at.
 type Captures = { consumed: List<Int>, borrows: List<Int> }
 
-/// The functions the walk is inside of, innermost last; the sites bound in the block, body
-/// or arm being walked, which its end lets go; and the body running here, whose failures let go
-/// only what it binds.
 type Scope = {
   fns: List<EnclosingFunction>,
   block: List<Int>,
   handles: List<EnclosingHandle>,
   frame: Int,
-  /// The innermost lambda's site, or 0 in the definition's body: where what runs here runs.
   body: Int,
-  /// What the innermost lambda performs, none in the definition's body.
   row: Option<Row>,
-  /// How the innermost block's value is used, which an `else` answering it answers as.
   result: Usage,
 }
 
 type ScopedState = { s: Scope, st: OwnershipState }
 
-/// Where a body, a definition's or a test's, would copy a resource, use one after consuming it, or
-/// consume one it was lent; and what it owns. `params` are the definition's.
 pub fn check_ownership(
   f: Facts,
   params: List<Param>,
@@ -231,7 +150,6 @@ pub fn check_ownership(
   {
     diags: walked.diags,
     releases: walked.releases,
-    // What may be let go is what a release is placed for, in the body it runs in.
     held: walked.releases.fold([], |acc: List<OwnedValue>, r: Release| {
       let bind = walked.bindings.get(holder_key(r.held));
       let x = {
@@ -247,8 +165,6 @@ pub fn check_ownership(
   }
 }
 
-/// Whether `e` reads a resource or answers an operation, which only a body that does has to be
-/// judged for.
 pub fn judged(f: Facts, e: Walked) -> Bool / {abort.raise} =
   walked_nodes_folded(e, false, |found: Bool, x: Walked|
     found || resource_at(f, x) || (match x.node { WalkedHandle(_) -> true, _ -> false }))
@@ -257,9 +173,6 @@ fn type_of(f: Facts, e: Walked) -> Type / {abort.raise} = f.resolved(e.ty)
 
 fn resource_at(f: Facts, e: Walked) -> Bool / {abort.raise} = f.resource(type_of(f, e))
 
-/// `st` with each owned binding of `sites` a path leaves live let go where its scope, the node at
-/// `at`, ends, the last bound first, and gone past it: before `last`, the scope's last expression,
-/// where that does not name it, and after the scope otherwise.
 fn release_scope(
   f: Facts,
   state: OwnershipState,
@@ -283,8 +196,6 @@ fn release_scope(
       None -> acc,
     })
 
-/// What the node `at` answers, where a release placed as `place` runs after it, it is a resource
-/// and `usage` takes it: a failing release lets it go too. One only lent is its owner's to let go.
 fn owned_result(
   f: Facts,
   at: Walked,
@@ -296,9 +207,6 @@ fn owned_result(
     if f.resource(t) { [{ owning_package: HeldByNode(at.span.site), ty: t }] } else { [] }
   }
 
-/// `st` with `b` let go at `at` as `place` says, and, where its release fails, what is still owned
-/// there let go on that way out: the rest of what `b` holds, `value`, what the node at `at` answered,
-/// and what the body owns live and what calls around hold in flight.
 fn release_binding(
   state: OwnershipState,
   b: Binding,
@@ -313,8 +221,6 @@ fn release_binding(
     if x.frame == b.frame && key != b.key && !holders.contains(x.owning_package) && live(x) {
       acc.concat(released_values(state, x))
     } else { acc });
-  // The latest first: what calls hold in flight, the latest taken first, then the bindings, whose
-  // keys fall as their binders stand later.
   let around = value.concat(state.in_flight.reverse().concat(check_ownership));
   held.fold(
     { st: add_releases(state, held, at, place, w), later: held },
@@ -328,7 +234,6 @@ fn release_binding(
   ).st
 }
 
-/// Whether a release placed as `p` runs on a way out a failure takes.
 fn on_failure(p: ReleasePlace) -> Bool =
   match p {
     ReleaseUnwinding -> true,
@@ -337,9 +242,6 @@ fn on_failure(p: ReleasePlace) -> Bool =
     _ -> false,
   }
 
-/// `st` with each owned binding of `sites` refused that `last`, the scope's last expression, hands on
-/// as a resource it only lends or reads: its scope's end lets it go while what it is handed to still
-/// reads it.
 fn check_borrowed_result(
   f: Facts,
   state: OwnershipState,
@@ -369,8 +271,6 @@ fn check_borrowed_bindings(
       })
   }
 
-/// Whether `e` may answer what the binding `key` holds, or a field of it, rather than a value it
-/// makes: a call answers what it owns, and a value built of the binding takes it.
 fn may_return_binding(e: Walked, key: Int) -> Bool =
   match e.node {
     WalkedRead(WalkedLocal(l)) -> binding_key(l.binder) == key,
@@ -382,8 +282,6 @@ fn may_return_binding(e: Walked, key: Int) -> Bool =
     _ -> false,
   }
 
-/// `st` with each owned binding of `sites` live here let go after the node at `at`, the last bound
-/// first.
 fn release_after(state: OwnershipState, sites: List<Int>, at: Span) -> OwnershipState =
   sites.reverse().fold(state, |acc: OwnershipState, key: Int|
     match acc.bindings.get(key) {
@@ -394,7 +292,6 @@ fn release_after(state: OwnershipState, sites: List<Int>, at: Span) -> Ownership
       None -> acc,
     })
 
-/// `st` with each binding of `keys` held by the body `frame` names.
 fn move_to_frame(state: OwnershipState, keys: List<Int>, frame: Int) -> OwnershipState =
   keys.fold(state, |acc: OwnershipState, key: Int|
     match acc.bindings.get(key) {
@@ -402,7 +299,6 @@ fn move_to_frame(state: OwnershipState, keys: List<Int>, frame: Int) -> Ownershi
       None -> acc,
     })
 
-/// Whether binary operator `op` never raises: a comparison, a logical, bitwise or concatenating one.
 fn never_raises(op: Bytes) -> Bool =
   [
     b"or",
@@ -421,14 +317,10 @@ fn never_raises(op: Bytes) -> Bool =
     op,
   )
 
-/// A block's statements walked so far, and how many.
 type Walk = { s: Scope, st: OwnershipState, at: Int }
 
-/// Whether `b` owns what it holds here.
 fn live(b: Binding) -> Bool = b.owned && b.gone == None && b.taken.len() == 0
 
-/// What letting go of the live binding `b` lets go: its value, what a function it holds consumed,
-/// or, for a continuation, nothing, which the clause that never calls it abandons.
 fn released_values(state: OwnershipState, b: Binding) -> List<ReleaseTarget> =
   match b.kind {
     Value -> [{ owning_package: b.owning_package, ty: b.ty }],
@@ -441,9 +333,6 @@ fn released_values(state: OwnershipState, b: Binding) -> List<ReleaseTarget> =
     Continuation -> [],
   }
 
-/// The values each binding of `keys` holds: itself, or for a function that consumed what it
-/// captured, what that function holds, which is values alone, so a function holding another holds
-/// what the other does.
 fn values_held(state: OwnershipState, keys: List<Int>) -> List<Int> =
   keys.fold([], |acc: List<Int>, key: Int|
     match state.bindings.get(key) {
@@ -453,7 +342,6 @@ fn values_held(state: OwnershipState, keys: List<Int>) -> List<Int> =
       None -> acc,
     })
 
-/// `st` with each of `held` let go at `at` as `place` says, running where `w` says.
 fn add_releases(
   state: OwnershipState,
   held: List<ReleaseTarget>,
@@ -474,8 +362,6 @@ fn add_releases(
       })),
   }
 
-/// Where `b` is let go at the end of its scope, whose last expression is `last`: before it where it
-/// does not name the binding, so a tail call there stays a loop, and after it otherwise.
 fn release_point(
   state: OwnershipState,
   b: Binding,
@@ -486,7 +372,6 @@ fn release_point(
     place: if mentions_binding(state, last, b) { ReleaseAfter } else { ReleaseBefore },
   }
 
-/// Whether `e` reads `b`, or a function a `let` binds that borrows or holds it.
 fn mentions_binding(state: OwnershipState, e: Walked, b: Binding) -> Bool = {
   let keys = state.bindings.fold([b.key], |acc: List<Int>, key: Int, x: Binding|
     if x.borrows.contains(b.key) || x.holds.contains(b.key) { acc.push(key) } else { acc });
@@ -498,8 +383,6 @@ fn mentions_binding(state: OwnershipState, e: Walked, b: Binding) -> Bool = {
       }))
 }
 
-/// `st` with each owned binding of `sites` that `last`, its scope's last expression, does not name
-/// let go before `last` runs, the last bound first, so `last` runs without it.
 fn release_before_last(state: OwnershipState, s: Scope, last: Walked) -> OwnershipState =
   s.block.reverse().fold(state, |acc: OwnershipState, key: Int|
     match acc.bindings.get(key) {
@@ -515,8 +398,6 @@ fn release_before_last(state: OwnershipState, s: Scope, last: Walked) -> Ownersh
       None -> acc,
     })
 
-/// `st` with each owned binding of `sites` live here let go after the node `at`, on a way out of its
-/// scope that the path on does not take, and still live on the path that goes on.
 fn release_on_exit(
   f: Facts,
   state: OwnershipState,
@@ -541,12 +422,9 @@ fn release_on_exit(
   { ..state, releases: leaving.releases }
 }
 
-/// What a failure at the call or perform at `at` lets go, the latest first: the arguments calls
-/// around it took from earlier places, and what the running body owns live there.
 fn release_on_failure(s: Scope, state: OwnershipState, at: Span) -> OwnershipState =
   failing(s, state, at, ReleaseUnwinding)
 
-/// What a failure at the node at `at` lets go, the latest first, placed as `place` says.
 fn failing(s: Scope, state: OwnershipState, at: Span, place: ReleasePlace) -> OwnershipState = {
   let check_ownership = state.bindings.fold(
     [],
@@ -562,10 +440,6 @@ fn failing(s: Scope, state: OwnershipState, at: Span, place: ReleasePlace) -> Ow
   )
 }
 
-// --- Bindings ----------------------------------------------------------------------------------
-
-/// `name`, bound at `at`, to a value of type `ty`, owned where `owned` holds and lent otherwise, and
-/// followed where `followed` holds: a resource, or a function that borrows one.
 fn bind(
   b: ScopedState,
   name: Bytes,
@@ -609,8 +483,6 @@ fn bind_as(
     }
   }
 
-/// Where a release at this point of `s` runs: what the lambda around it performs, and what the
-/// `handle`s around this point in that lambda answer, those around a lambda being where it is called.
 fn release_context(s: Scope) -> ReleaseContext =
   {
     row: s.row,
@@ -618,11 +490,9 @@ fn release_context(s: Scope) -> ReleaseContext =
       if h.body == s.body { acc.concat(h.operations) } else { acc }),
   }
 
-/// The binding the local read `l` names, where the walk follows it.
 fn binding_of(state: OwnershipState, l: { name: Bytes, binder: Int }) -> Option<Binding> =
   state.bindings.get(binding_key(l.binder))
 
-/// The binding `e` reads, where it is a read of a followed local.
 fn binding_read(s: Scope, state: OwnershipState, e: Walked) -> Option<Binding> =
   match e.node { WalkedRead(WalkedLocal(l)) -> binding_of(state, l), _ -> None }
 
@@ -635,9 +505,6 @@ fn report(state: OwnershipState, d: Diag) -> OwnershipState =
 fn consume(state: OwnershipState, b: Binding, span: Span, how: Bytes) -> OwnershipState =
   store_binding(state, { ..b, gone: Some({ at: span, how: how }) })
 
-// --- Uses ----------------------------------------------------------------------------------------
-
-/// A read of the binding `b` at `span`, its value used as `usage` says.
 fn check_use(
   f: Facts,
   s: Scope,
@@ -648,7 +515,6 @@ fn check_use(
 ) -> OwnershipState / {abort.raise} = {
   let crossed = s.fns.drop(b.depth);
   let called = match usage { Called -> true, _ -> false };
-  // A call consumes a function that owns what it holds, or one whose type says it is called once.
   let once = match b.ty { FunctionType(t) -> t.once, _ -> false };
   let use = if !called { usage } else if b.owned || once { Moved(b"called") } else { Borrowed };
   match b.gone {
@@ -682,8 +548,6 @@ fn check_use(
   }
 }
 
-/// `st` with what each function of `crossed` a `let` binds captured: the binding `b`, consumed or
-/// borrowed. Borrowing a function that borrows borrows what it does.
 fn record_capture(
   state: OwnershipState,
   crossed: List<EnclosingFunction>,
@@ -696,14 +560,12 @@ fn record_capture(
         Some(c) -> c,
         None -> { consumed: [], borrows: [] },
       };
-      // What a function borrows, any that takes or borrows it borrows too.
       let borrowed = b.borrows.fold(was.borrows, |xs: List<Int>, k: Int| xs.push_unique(k));
       let now = if consumed { { consumed: was.consumed.push_unique(b.key), borrows: borrowed } }
       else { { ..was, borrows: borrowed.push_unique(b.key) } };
       { ..acc, captured: acc.captured.insert(fun.span.site, now) }
     })
 
-/// A binding the function `b` borrows that a path has since consumed, whole or in part.
 fn consumed_lender(state: OwnershipState, b: Binding) -> Option<Binding> =
   b.borrows.fold(None, |acc: Option<Binding>, k: Int|
     match acc {
@@ -713,8 +575,6 @@ fn consumed_lender(state: OwnershipState, b: Binding) -> Option<Binding> =
         None -> None,
       },
     })
-
-// --- Expressions ---------------------------------------------------------------------------------
 
 fn walk(
   f: Facts,
@@ -731,7 +591,6 @@ fn walk(
       None -> state,
     },
     WalkedRead(_) -> state,
-    // Arithmetic may raise, which unwinds past what the body holds.
     WalkedBinary(b) -> {
       let sides = [b.lhs, b.rhs].fold(
         { st: state, left: state },
@@ -774,7 +633,6 @@ fn walk(
     },
     WalkedMatch(m) -> walk_match(f, s, state, e, m.scrutinee, m.arms, usage),
     WalkedBlock(b) -> {
-      // A block with no tail ends in its last statement where that is an expression.
       let last = b.stmts.len() - 1;
       let ends_in_statement = (match b.tail { Some(_) -> false, None -> true })
         && (match b.stmts.at(last) { Some(WalkedDo(_)) -> true, _ -> false });
@@ -823,7 +681,6 @@ fn walk(
     },
     WalkedUpdate(u) -> {
       let how = if resource_at(f, u.base) { Moved(b"updated into a new record") } else { Read };
-      // A binding is judged after `check_overwritten_fields`, which may make it whole again.
       let base = match binding_read(s, state, u.base) {
         Some(_) -> {
           let checked = check_overwritten_fields(f, s, state, u.base, u.sets);
@@ -841,7 +698,6 @@ fn walk(
       );
       check_new_value(f, { ..held, in_flight: state.in_flight }, e, usage)
     },
-    // The record a field is read out of is walked here unless it is a name, which `field` judges.
     WalkedFieldRead(x) ->
       walk_field(
         f,
@@ -885,7 +741,6 @@ fn walk(
       check_new_value(f, arguments_taken(s, state, args, e.span), e, usage)
     },
     WalkedHandle(h) -> walk_handle(f, s, state, e, h, usage),
-    // A region answers what its world simulates, as a `handle` would.
     WalkedSimulate(t) ->
       release_on_failure(
         s,
@@ -912,15 +767,9 @@ fn walk(
     },
   }
 
-/// `s` for a body that runs as a function of its own, called where it stands, once or not at all: a
-/// `simulate` region's, a `parallel` branch's or a hold's region's. It may borrow what is bound
-/// outside it but not consume it, and its failures let go only what it binds.
 fn isolated_scope(s: Scope, at: Span) -> Scope =
   { ..s, fns: s.fns.push({ span: at, held: false, local: false }), frame: 0 - at.site - 1 }
 
-/// `after`, the walk from `before` of a body a handler around it may answer a failure in: what the
-/// body owns from outside it and does not take is let go where a failure leaves that handler, at
-/// `at`, rather than where the body failed, since a failure the handler answers goes on with it.
 fn release_after_handler(
   before: OwnershipState,
   after: OwnershipState,
@@ -955,9 +804,6 @@ fn release_after_handler(
 
 fn in_record() -> Usage = Moved(b"held in a record")
 
-/// `st` with each resource field of `base` that an update writes over refused where the record still
-/// holds it, as writing over it would drop it unreleased; a binding whose moved-out fields the update
-/// each writes again is whole once more, for the update to take.
 fn check_overwritten_fields(
   f: Facts,
   s: Scope,
@@ -982,8 +828,6 @@ fn check_overwritten_fields(
   }
 }
 
-/// `walked`, `x` walked from `st` as `usage` says: a resource it hands to what takes it is in flight
-/// until that runs, so a failure in a later argument lets it go.
 fn put_in_flight(
   f: Facts,
   s: Scope,
@@ -1010,8 +854,6 @@ fn put_in_flight(
   }
 }
 
-/// `after`, the walk of a call or a perform at `at` past its arguments, which are now the callee's:
-/// a failure there lets go what the body owns live.
 fn arguments_taken(
   s: Scope,
   before: OwnershipState,
@@ -1019,8 +861,6 @@ fn arguments_taken(
   at: Span,
 ) -> OwnershipState = release_on_failure(s, { ..after, in_flight: before.in_flight }, at)
 
-/// A value `e` makes where it stands: one that is a resource has to be held by what it is handed
-/// to, or nothing would let it go.
 fn check_new_value(
   f: Facts,
   state: OwnershipState,
@@ -1032,16 +872,12 @@ fn check_new_value(
     _ -> if resource_at(f, e) { report(state, new_resource_dropped(f, e, usage)) } else { state },
   }
 
-/// The function a lambda used as `usage` says is made as.
 fn enclosing_function_at(span: Span, usage: Usage) -> EnclosingFunction =
   match usage {
     Borrowed -> { span: span, held: false, local: false },
     _ -> { span: span, held: true, local: false },
   }
 
-// --- Calls ---------------------------------------------------------------------------------------
-
-/// A call of `func` on `args`, each passed as the callee takes it.
 fn walk_call(
   f: Facts,
   s: Scope,
@@ -1051,10 +887,8 @@ fn walk_call(
 ) -> OwnershipState / {abort.raise} =
   match func.node {
     WalkedRead(WalkedLocal(l)) -> match binding_of(state, l) {
-      // A function that is a resource is consumed by its call; one that borrows is only called.
       Some(b) -> {
         let called = check_use(f, s, state, b, func.span, Called);
-        // What the function holds is the call's once its arguments are in hand.
         let flying = if b.owned && live(b) && b.frame == s.frame {
           { ..called, in_flight: called.in_flight.concat(released_values(state, b)) }
         } else { called };
@@ -1066,10 +900,8 @@ fn walk_call(
     },
     WalkedRead(WalkedDefinition(d)) -> walk_arguments(f, s, state, named(f, func, d.key), args),
     WalkedRead(WalkedBuiltin(b)) -> walk_arguments(f, s, state, named(f, func, b.name), args),
-    // A constructor takes each value it holds.
     WalkedRead(WalkedConstructor(_)) ->
       walk_arguments(f, s, state, { taking: all_taken(), params: [] }, args),
-    // A function a field holds is read out of its record as the record is lent.
     WalkedFieldRead(x) ->
       walk_arguments(f, s, walk(f, s, state, x.base, Borrowed), value_call_modes(f, func), args),
     _ -> walk_arguments(f, s, walk(f, s, state, func, Read), value_call_modes(f, func), args),
@@ -1077,13 +909,8 @@ fn walk_call(
 
 fn all_taken() -> ArgumentModes = { kept: [], all: true }
 
-/// How a call takes its arguments: as `taking` says, and `params` its parameters' types where they
-/// are known, which say how it holds a lambda.
 type CallModes = { taking: ArgumentModes, params: List<Type> }
 
-/// How a call of what the check holds under `key`, read as `func`, takes its arguments: as its
-/// declaration says, at the types the read fills, or as its type does where the check holds no
-/// declaration of it.
 fn named(f: Facts, func: Walked, key: Bytes) -> CallModes / {abort.raise} =
   match f.taking(key) {
     Some(t) ->
@@ -1091,14 +918,12 @@ fn named(f: Facts, func: Walked, key: Bytes) -> CallModes / {abort.raise} =
     None -> value_call_modes(f, func),
   }
 
-/// How a call of the function value `func` takes its arguments, as its type says.
 fn value_call_modes(f: Facts, func: Walked) -> CallModes / {abort.raise} =
   match type_of(f, func) {
     FunctionType(t) -> { taking: { kept: t.kept, all: false }, params: t.params },
     _ -> { taking: { kept: [], all: false }, params: [] },
   }
 
-/// `args` passed to a call as `c` says.
 fn walk_arguments(
   f: Facts,
   s: Scope,
@@ -1112,8 +937,6 @@ fn walk_arguments(
       at: acc.at + 1,
     }).st
 
-/// An argument handed to a parameter that takes it where `keep` holds, of type `ty` where that is
-/// known: a lambda there is judged by how the parameter holds it.
 fn walk_argument(
   f: Facts,
   s: Scope,
@@ -1133,8 +956,6 @@ fn walk_argument(
   }
 }
 
-/// A field read `e`, of the field `name` of `base`: a resource field read out of an owned binding
-/// moves the field out. `based` is the walk past the record where it is not a name.
 fn walk_field(
   f: Facts,
   s: Scope,
@@ -1147,7 +968,6 @@ fn walk_field(
 ) -> OwnershipState / {abort.raise} =
   match binding_read(s, state, base) {
     Some(b) -> if !resource_at(f, e) {
-      // A field that is no resource is read whatever became of the record's other fields.
       if b.gone != None && b.taken.len() == 0 { check_use(f, s, state, b, base.span, Borrowed) }
       else { state }
     } else {
@@ -1180,7 +1000,6 @@ fn walk_field(
     },
   }
 
-/// The binding a path of field reads, `r.a.b`, starts from.
 fn path_root(s: Scope, state: OwnershipState, e: Walked) -> Option<Binding> =
   match e.node {
     WalkedRead(WalkedLocal(l)) -> binding_of(state, l),
@@ -1188,18 +1007,12 @@ fn path_root(s: Scope, state: OwnershipState, e: Walked) -> Option<Binding> =
     _ -> None,
   }
 
-/// Whether the record `base` holds a resource beside its field `name`, which moving that field out
-/// would leave behind.
 fn others_held(f: Facts, base: Walked, name: Bytes) -> Bool / {abort.raise} =
   match record_fields(type_of(f, base)) {
     Some(fs) -> fs.any(|x: Field| x.name != name && f.resource(x.ty)),
     None -> true,
   }
 
-// --- Functions -----------------------------------------------------------------------------------
-
-/// The lambda `e`, `l`, its body walked as `fun` says it is held, its parameters owned where they
-/// are written `keep` or `given` holds their places.
 fn walk_lambda(
   f: Facts,
   s: Scope,
@@ -1209,7 +1022,6 @@ fn walk_lambda(
   fun: EnclosingFunction,
   given: List<Int>,
 ) -> { st: OwnershipState, captured: Captures } / {abort.raise} = {
-  // Its body runs when it is called, so nothing a call around it holds in flight is the body's.
   let inner: ScopedState = {
     s: {
       ..s,
@@ -1243,13 +1055,10 @@ fn walk_lambda(
   }
 }
 
-// --- Statements and branches ---------------------------------------------------------------------
-
 fn walk_statement(f: Facts, b: ScopedState, x: WalkedStmt) -> ScopedState / {abort.raise} =
   match x {
     WalkedLet(l) -> match ((l.value.node, l.pat)) {
       (WalkedLambda(lam), TypedBinder(v)) -> bind_lambda(f, b, v.name, v.span, l.value, lam),
-      // Any other value is bound, or taken apart, and a pattern that misses fails the `let`.
       _ -> {
         let valued = walk(f, b.s, b.st, l.value, let_usage(f, b, l.pat, l.value));
         bind_pattern(
@@ -1260,10 +1069,7 @@ fn walk_statement(f: Facts, b: ScopedState, x: WalkedStmt) -> ScopedState / {abo
         )
       },
     },
-    // The `else` leaves the block, so what it consumes is gone only on its own path, and what the
-    // block holds live is let go where it ends.
     WalkedLetElse(l) -> {
-      // The value runs first; where the pattern misses, the `else` answers the block instead.
       let valued = walk(f, b.s, b.st, l.value, let_usage(f, b, l.pat, l.value));
       let missed = add_releases(
         valued,
@@ -1299,9 +1105,6 @@ fn walk_statement(f: Facts, b: ScopedState, x: WalkedStmt) -> ScopedState / {abo
       { ..b, st: walk(f, b.s, b.st, a.value, Moved(b"assigned to a handler's variable")) },
   }
 
-/// A function a `let` binds as `name` at `at`, the lambda `e`, followed by what it captures: one
-/// that consumed a resource is a resource itself, and one that borrows a resource is usable while the
-/// resource is.
 fn bind_lambda(
   f: Facts,
   b: ScopedState,
@@ -1312,8 +1115,6 @@ fn bind_lambda(
 ) -> ScopedState / {abort.raise} = {
   let local: EnclosingFunction = { span: e.span, held: false, local: true };
   let first = walk_lambda(f, b.s, b.st, e, l, local, []);
-  // What the function consumes it holds from its start, so a failure in it before it consumes one
-  // lets that go: walked again with those held by its body.
   let o = if first.captured.consumed.len() == 0 { first } else {
     walk_lambda(f, b.s, move_to_frame(b.st, first.captured.consumed, e.span.site), e, l, local, [])
   };
@@ -1335,8 +1136,6 @@ fn bind_lambda(
   }
 }
 
-/// How `let pat = value` uses the value: a lent binding read whole lends its parts; a value the
-/// pattern takes apart, or a resource, is taken; anything else is read.
 fn let_usage(
   f: Facts,
   b: ScopedState,
@@ -1348,7 +1147,6 @@ fn let_usage(
     Moved(b"bound by a `let`")
   } else { Read }
 
-/// `b`, its value already walked, with what `pat` binds of the value bound.
 fn bind_pattern(
   f: Facts,
   b: ScopedState,
@@ -1364,8 +1162,6 @@ fn bind_pattern(
   )
 }
 
-/// What a `let ... else` whose pattern missed its value lets go before the `else` runs: the value,
-/// which nothing took apart, where the `let` took it.
 fn missed_value_releases(
   f: Facts,
   b: ScopedState,
@@ -1381,8 +1177,6 @@ fn missed_value_releases(
     }
   }
 
-/// `st` past the value of a `let` whose pattern `pat` may miss it: a miss fails at the value,
-/// letting go of what the body owns live there and of the value, which nothing took apart.
 fn release_on_miss(
   f: Facts,
   s: Scope,
@@ -1401,7 +1195,6 @@ fn release_on_miss(
     }
   }
 
-/// Whether `pat` may not match a value of its type: anything but a name, `_` or a record of those.
 fn refutable(pat: TypedPattern<Type>) -> Bool =
   match pat {
     TypedBinder(_) -> false,
@@ -1410,8 +1203,6 @@ fn refutable(pat: TypedPattern<Type>) -> Bool =
     _ -> true,
   }
 
-/// Whether `value` is a lent binding, or a path of field reads from one, whose parts a pattern then
-/// borrows.
 fn is_borrowed_value(s: Scope, state: OwnershipState, value: Walked) -> Bool =
   match value.node {
     WalkedRead(WalkedLocal(l)) -> match binding_of(state, l) { Some(b) -> !b.owned, None -> false },
@@ -1419,19 +1210,15 @@ fn is_borrowed_value(s: Scope, state: OwnershipState, value: Walked) -> Bool =
     _ -> false,
   }
 
-/// Each name `pat` binds, where, at the type the check gave it, resolved.
 fn binders(
   f: Facts,
   pat: TypedPattern<Type>,
 ) -> List<{ name: Bytes, span: Span, ty: Type }> / {abort.raise} =
   pattern_binders(pat).map(|p: TypedParam<Type>| { ..p, ty: f.resolved(p.ty) })
 
-/// Whether `pat` binds a resource by name, which takes the value it matches apart.
 fn binds_resource(f: Facts, pat: TypedPattern<Type>) -> Bool / {abort.raise} =
   binders(f, pat).any(|p: { name: Bytes, span: Span, ty: Type }| f.resource(p.ty))
 
-/// `st` with each `_` of `pat` that stands for a resource refused, and each `..` that leaves one
-/// out: what it matches would be let go of without its release.
 fn check_wildcard_resources(
   f: Facts,
   state: OwnershipState,
@@ -1476,9 +1263,6 @@ fn check_wildcard_resources(
     _ -> state,
   }
 
-/// Paths that each started from `before` and ended in `ends`, each the evaluation of the node at
-/// the same place of `branches`, joined: what any path refused, and a binding any path consumed
-/// consumed past the join, the paths that did not consume it letting it go where they end.
 fn join_paths(
   f: Facts,
   before: OwnershipState,
@@ -1487,8 +1271,6 @@ fn join_paths(
   branches: List<Walked>,
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
-  // What each path lets go of, as no path that consumed it can: before it runs, from where it
-  // starts, and after it, from where it ends, each let go before the next.
   let ending = range(0, ends.len()).map(|i: Int| {
     let branch = branches.get(i);
     let unconsumed = before.bindings.fold([], |acc: List<Binding>, key: Int, b: Binding|
@@ -1519,14 +1301,12 @@ fn join_paths(
           None -> x,
         });
     let first = letting({ ..starts.get(i), releases: [] }, early, ReleaseBefore, []);
-    // Where the path ends, what it let go before it ran is gone.
     let ended = early.fold({ ..ends.get(i), releases: [] }, |x: OwnershipState, b: Binding|
       match x.bindings.get(b.key) {
         Some(z) -> consume(x, z, at, b"let go before its branch"),
         None -> x,
       });
     let last = letting(ended, late, ReleaseAfter, owned_result(f, branch, ReleaseAfter, usage));
-    // A branch whose value is lent on may not answer what is let go after it.
     let lent = match usage { Borrowed -> true, Read -> true, _ -> false };
     let refused = if !lent || !resource_at(f, branch) { [] } else {
       late.filter(|b: Binding| may_return_binding(branch, b.key)).map(|b: Binding|
@@ -1539,7 +1319,6 @@ fn join_paths(
     |w: { st: OwnershipState, at: Int }, x: OwnershipState| {
       let acc = w.st;
       let mine = ending.get(w.at);
-      // A value let go before its path runs is no longer held where that path fails.
       let first = mine.first.filter(|r: Release| r.place == ReleaseBefore).map(|r: Release| r.held);
       let fails = |r: Release| on_failure(r.place) && first.contains(r.held);
       {
@@ -1553,7 +1332,6 @@ fn join_paths(
               None -> m.insert(key, b),
             }),
           diags: acc.diags.concat(x.diags.drop(before.diags.len())).concat(mine.refused),
-          // Let go before the path, then what the path let go itself, then after it.
           releases: acc.releases.concat(mine.first).concat(
             x.releases.drop(before.releases.len()).filter(|r: Release| !fails(r)),
           ).concat(
@@ -1575,7 +1353,6 @@ fn join_paths(
       }
     },
   ).st;
-  // A field moved out on one path but not another leaves no one value to let go after the join.
   before.bindings.fold(merged, |acc: OwnershipState, key: Int, b: Binding| {
     let after = ends.map(|x: OwnershipState| x.bindings.get(key));
     let moved = after.any(|y: Option<Binding>|
@@ -1585,9 +1362,6 @@ fn join_paths(
   })
 }
 
-/// The `match` `e` of `scrutinee`: an arm that binds a resource part of an owned value by name takes
-/// the value apart, and an arm that binds none leaves it whole; the arms of a lent value borrow its
-/// parts.
 fn walk_match(
   f: Facts,
   s: Scope,
@@ -1601,7 +1375,6 @@ fn walk_match(
   let held = binding_read(s, state, scrutinee);
   let ty = type_of(f, scrutinee);
   let opened = f.opened(ty);
-  // A field read through a lent record lends the field, as one no arm takes apart leaves it whole.
   let through = match scrutinee.node {
     WalkedFieldRead(_) ->
       is_borrowed_value(s, state, scrutinee)
@@ -1611,10 +1384,8 @@ fn walk_match(
   let local = match scrutinee.node { WalkedRead(WalkedLocal(_)) -> true, _ -> false };
   let made = held == None && !local && !through && f.resource(ty);
   let start: OwnershipState = match held {
-    // Read lent here: what each arm does decides whether it takes the value.
     Some(b) -> check_use(f, s, state, b, at, Borrowed),
     None -> if made {
-      // A resource the scrutinee makes is the match's, as if a binding held it.
       store_binding(walk(f, s, state, scrutinee, Moved(b"matched")), {
         key: at.site,
         owning_package: HeldByNode(at.site),
@@ -1639,8 +1410,6 @@ fn walk_match(
     None -> if made { Some(at.site) } else { None },
   };
   let check_ownership = match held { Some(b) -> b.owned, None -> made };
-  // A value of a type that states a `release` is taken apart by every arm (`opened`): its parts are
-  // no longer it, so nothing lets it go.
   let ends = arms.map(|a: WalkedArm| {
     let binds = opened || binds_resource(f, a.pat);
     let taken: OwnershipState = match key {
@@ -1699,7 +1468,6 @@ fn walk_match(
     arms.map(|a: WalkedArm| a.body),
     usage,
   );
-  // A value the scrutinee made that no arm took apart is let go where the `match` ends.
   match if made { out.bindings.get(at.site) } else { None } {
     Some(b) -> if b.gone != None { out } else {
       consume(
@@ -1713,8 +1481,6 @@ fn walk_match(
   }
 }
 
-/// `out` with each binding `after`, an `else` at `at` walked from `before`, consumed refused, but
-/// those of `block`, the one it answers: the block goes on past the `else` owning the rest.
 fn check_outer_consumed(
   f: Facts,
   before: OwnershipState,
@@ -1731,8 +1497,6 @@ fn check_outer_consumed(
       None -> acc,
     })
 
-/// `after`, a guard at `at` walked from `before`, with each binding it consumed refused and still
-/// held: a guard that fails hands the value on to the next arm, and one may run more than once.
 fn check_guard_consumed(
   f: Facts,
   before: OwnershipState,
@@ -1748,11 +1512,6 @@ fn check_guard_consumed(
       None -> acc,
     })
 
-// --- Handlers ------------------------------------------------------------------------------------
-
-/// The `handle` `e`, `h`: the body runs where the `handle` stands, and each clause's parameters are
-/// lent, but for those the operation's handler takes. A clause, and the `return` clause, run as
-/// functions of their own, any number of times or none, so neither consumes what is bound outside it.
 fn walk_handle(
   f: Facts,
   s: Scope,
@@ -1762,7 +1521,6 @@ fn walk_handle(
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
   let ops = h.clauses.map(|c: WalkedClause| Bytes::concat_all([c.effect, b".", c.op]));
-  // Each variable starts from its initializer, which reads those above it, and its clauses read it.
   let vars = h.vars.fold({ s: s, st: state }, |acc: ScopedState, v: WalkedHandlerVar| {
     let held = resource_at(f, v.init);
     let walked = walk(f, acc.s, acc.st, v.init, if held { Moved(b"held by a handler's variable") }
@@ -1791,7 +1549,6 @@ fn walk_handle(
         bind(x, p.name, p.span, t, f.resource(t), kept.contains(i))
       },
     );
-    // A continuation is consumed by its one call.
     let resumed = match c.resume {
       Some(k) -> bind_as(given, k.name, k.span, unit_type(), true, true, Continuation),
       None -> given,
@@ -1814,7 +1571,6 @@ fn walk_handle(
   });
   match h.ret {
     None -> clauses,
-    // The body's answer is the `return` clause's to hold.
     Some(r) -> {
       let inner: ScopedState = {
         s: { ..isolated_scope(vars.s, r.span), block: [] },
@@ -1840,8 +1596,6 @@ fn walk_handle(
     },
   }
 }
-
-// --- Diagnostics ---------------------------------------------------------------------------------
 
 fn quoted(name: Bytes) -> Bytes = Bytes::concat_all([b"`", name, b"`"])
 

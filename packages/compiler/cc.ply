@@ -1,98 +1,46 @@
-//! Compiling a unit's C with the host's C compiler, and linking what it compiles: a library a program
-//! loads, or an executable a native program is. A unit's C is cut at the marks its emitter writes,
-//! and each part compiles to an object kept under the toolchain's cache by what decides it: the
-//! compiler, the flags and the part's C. So an edit recompiles the parts it reached, and a unit
-//! compiled once links from the cache.
-
 import std.bytes
 import std.hash (blake3)
 import std.internal.native (native, wait, job_wait, found, parts, encode_parts, decode_int)
 import std.list
 import std.string
 
-/// The C compilers by their labels: what each is, and each run of one. What a compiler makes is a
-/// function of what it is given, so the effect is a deterministic one.
 pub effect compilers {
-  /// The compiler the label names, or `None` where it is not installed.
   read find[c]() -> Option<Compiler>
-  /// Starts the compiler with `args` in the environment this run has: a job, or why it could not
-  /// start.
   write start[c](args: List<String>) -> Result<Int, String>
-  /// How a job ended: `None` where the compiler succeeded, else what it said on standard error.
   write wait[c](job: Int) -> Option<Bytes>
 }
 
-/// The toolchain's cache, which compiled objects and libraries are kept in between runs, and how
-/// many compilers run at once. A path here is below the cache. What the cache holds decides what
-/// is compiled again and never what a library is, so the effect is a deterministic one.
 pub effect toolchain {
-  /// The cache's directory.
   read cache() -> String
-  /// The directory `ply run` and `ply check` file what they reuse in, which the toolchain sweeps.
   read reuse_dir() -> String
-  /// The directory the emitter's answers are kept in between runs, which the toolchain sweeps.
   read bodies_dir() -> String
-  /// How many compilers run at once.
   read jobs() -> Int
-  /// Whether the cache holds `path`, which records a use of it.
   read exists(path: String) -> Bool
-  /// What `path` holds, or `None` where the cache has no such file.
   read read_file(path: String) -> Option<Bytes>
-  /// `bytes` at `path`, written whole.
   write write_file(path: String, bytes: Bytes) -> Bool
-  /// `from` moved to `to`, whole.
   write rename(from: String, to: String) -> Bool
-  /// `bytes` added after what `path` holds, which keeps what it may be run as.
   write append(path: String, bytes: Bytes) -> Bool
-  /// A new directory of the asker's own, or `None` where none could be made.
   write temp_dir() -> Option<String>
-  /// `dir` and everything below it, removed.
   write remove_tree(dir: String) -> Unit
-  /// What the runtime's library needs linked after it on this platform.
   read libraries() -> List<String>
-  /// The program at `path`, one linked below the cache, run to its end with `args` and the
-  /// environment this run has. What it writes to standard error is this run's, as it writes it.
   write run(path: String, args: List<String>) -> RunResult
 }
 
-/// The asking program's own heap, which no two runs need read alike.
 pub nondet effect memory {
-  /// What the heap holds now, read without a walk of its objects.
   read heap() -> Memory
-  /// The live objects now, the most bytes first: a walk of every object.
   read census() -> List<LiveObjects>
 }
 
-/// How a program ran: its exit code, `-1` where a signal ended it or it did not start, and what it
-/// wrote to standard output.
 pub type RunResult = { code: Int, out: Bytes }
 
-/// What a heap holds, in bytes: `live` is the blocks its live objects take, each its size class's
-/// whole block, and `held` the pages and larger blocks holding them, whatever is live in them.
 pub type Memory = { live: Int, held: Int }
 
-/// A heap's live objects of one sort, how many there are and their bytes past their headers. A
-/// record is told by its fields, a constructor by its name, and a block emitted code laid out, whose
-/// header names no type, by its bytes past the header; any other object by its kind.
 pub type LiveObjects = { what: String, objects: Int, bytes: Int }
 
-/// A compiler: its path, what identifies it, which every key it makes holds, and what every
-/// invocation of it needs that others do not, as tcc's `-B` names where its support library is.
 pub type Compiler = { path: String, identity: Bytes, support_flags: List<String> }
 
-/// The compiler a build runs, and what decides what it makes.
-pub type Toolchain = {
-  /// The compiler's identity: an upgrade in place keys every object anew.
-  identity: Bytes,
-  /// What every invocation of this compiler needs that others do not: tcc's `-B`.
-  support_flags: List<String>,
-  /// The optimisation flag.
-  level: String,
-  /// Whether emitted code checks what it assumes (`PLY_CHECKED`), as a development build's does.
-  checked: Bool,
-}
+pub type Toolchain = { identity: Bytes, support_flags: List<String>, level: String, checked: Bool }
 
-/// A unit's C cut at its marks: the head every part compiles after, then each part by its label.
 pub type Parts = { head: Bytes, parts: List<{ label: String, text: Bytes }> }
 
 fn mark_opener() -> Bytes = b"/* --- "
@@ -101,22 +49,16 @@ fn part_opener() -> Bytes = b"/* --- part "
 
 fn mark_closer() -> Bytes = b" --- */"
 
-/// The line that opens the part of a unit labelled `label`. `label` holds no newline, as a mark is
-/// one line, and no space, as a manifest parts a label from its digest at a space.
 pub fn part_mark(label: String) -> Bytes =
   Bytes::concat_all([part_opener(), Bytes::of_string(label), mark_closer()])
 
-/// The line that opens a unit's runtime part, labelled `runtime`, which defines the pointers the
-/// head declares and binds them at load.
 pub fn tail_mark() -> Bytes = b"/* --- the runtime, bound at load --- */"
 
-/// Where `mark` begins a line of `text` at or after `from`.
 fn line_start(text: Bytes, mark: Bytes, from: Int) -> Option<Int> / {abort.raise} =
   if from == 0 && text.starts_with(mark) { Some(0) } else {
     match text.index_of_from(b"\n".concat(mark), from) { Some(at) -> Some(at + 1), None -> None }
   }
 
-/// The label of the part `line` opens, or `None` where it is no mark.
 fn label_of(line: Bytes) -> Option<String> / {abort.raise} =
   if line == tail_mark() { Some("runtime") }
   else if line.len() >= part_opener().len() + mark_closer().len() && line.starts_with(part_opener())
@@ -124,7 +66,6 @@ fn label_of(line: Bytes) -> Option<String> / {abort.raise} =
     Some(String::of_bytes(line.slice(part_opener().len(), line.len() - mark_closer().len())))
   } else { None }
 
-/// Each mark of `text` in order: where its line starts, and the label of the part it opens.
 fn marks(text: Bytes) -> List<{ at: Int, label: String }> / {abort.raise} =
   iterate(
     { from: 0, found: [] },
@@ -145,11 +86,6 @@ fn marks(text: Bytes) -> List<{ at: Int, label: String }> / {abort.raise} =
       },
   )
 
-/// `text` cut into its head, the text before its first mark, and its parts, the largest first. A
-/// mark is a line [`part_mark`] or [`tail_mark`] wrote, and each part runs from its mark to the next.
-/// A compile starts the parts in this order and waits for the oldest it started, so the long ones
-/// run beside one another and hold no short one's place. A text with no marks is all head and an
-/// empty runtime part. Panics where two parts share a label, which only an emitter's bug makes.
 pub fn split(text: Bytes) -> Parts / {abort.raise} = {
   let found = marks(text);
   let labels = found.map(|m: { at: Int, label: String }| m.label).sort();
@@ -183,16 +119,11 @@ fn cache_key(t: Toolchain, flags: List<String>, pieces: List<Bytes>) -> String /
   ).hex_of(
   )
 
-/// What every compile passes after its level, whatever the level asks for: each `Float` operation
-/// rounded once, as written, so none is fused with another or reordered.
 fn float_flags() -> List<String> = ["-ffp-contract=off", "-fno-fast-math"]
 
-/// What `t` passes every compile before the flags its asker adds: its level, `PLY_CHECKED` defined
-/// where it is checked, and [`float_flags`].
 pub fn compile_flags(t: Toolchain) -> List<String> =
   [t.level].concat(if t.checked { ["-DPLY_CHECKED"] } else { [] }).concat(float_flags())
 
-/// What `compiler` compiles with at `level`, checked or not.
 pub fn toolchain_of(compiler: Compiler, level: String, checked: Bool) -> Toolchain =
   {
     identity: compiler.identity,
@@ -201,11 +132,6 @@ pub fn toolchain_of(compiler: Compiler, level: String, checked: Bool) -> Toolcha
     checked: checked,
   }
 
-/// A build profile. `name` is what `--profile` calls it, and `runtime_dir` is where cargo builds the
-/// runtime that a native program of the profile links, below a checkout's `target/`. `unit` is the
-/// optimisation level for a unit, the library a program loads, and `native` the level for a native
-/// program. `checked` turns on the generated code's reference-count checks (`PLY_CHECKED`), and
-/// `tcc` lets a unit be compiled with tcc.
 pub type Profile = {
   name: String,
   runtime_dir: String,
@@ -215,9 +141,6 @@ pub type Profile = {
   tcc: Bool,
 }
 
-/// The default profile: units compile fast and check their reference counts. Native programs are
-/// still optimised, because a native program is the compiler. At `-O0` it checks code several times
-/// slower, and `-O1` compiles almost as slowly as `-O2`.
 pub fn development() -> Profile =
   {
     name: "development",
@@ -228,7 +151,6 @@ pub fn development() -> Profile =
     tcc: true,
   }
 
-/// The profile for code that should run fast.
 pub fn release() -> Profile =
   {
     name: "release",
@@ -239,13 +161,8 @@ pub fn release() -> Profile =
     tcc: false,
   }
 
-/// Every profile, the default first.
 pub fn profiles() -> List<Profile> = [development(), release()]
 
-/// Each of `runs` run to its end, `toolchain.jobs()` at a time and each waited for in the order it
-/// started: nothing, or what every refusal said, each after the run it refused, in that order, so
-/// one build reports every part that does not compile. A compiler that cannot be started stops any
-/// more from starting; every job started is waited for, so none outlives the refusal.
 fn run_all<[c]>(
   runs: List<List<String>>,
 ) -> Result<Unit, String> / {compilers.write[c], toolchain.read, abort.raise} = {
@@ -302,20 +219,14 @@ fn run_all<[c]>(
   }
 }
 
-/// One part of a unit as a compiler is given it: its label, and the digest of its C with the head
-/// before it, which decides the object it compiles to.
 pub type Source = { label: String, digest: String }
 
-/// Each of `parts`' sources, in order.
 pub fn sources_of(parts: Parts) -> List<Source> / {abort.raise} =
   parts.parts.map(|p: { label: String, text: Bytes }|
     { label: p.label, digest: blake3(parts.head.concat(p.text)).hex_of() })
 
-/// Where the cache keeps a source's C.
 fn source_path(s: Source) -> String = "src/" ++ s.digest ++ ".c"
 
-/// `parts`' sources, each one's C written below the cache where it is not there already: what
-/// `objects_from_sources` compiles from, in another process or a later run.
 pub fn cache_sources(
   parts: Parts,
 ) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
@@ -329,12 +240,9 @@ pub fn cache_sources(
   if landed { Ok(sources) } else { Err("a unit's C could not be kept in the toolchain's cache") }
 }
 
-/// `sources` as a line each, its label and its digest: what a builder hands the linker of a unit it
-/// kept.
 pub fn manifest(sources: List<Source>) -> Bytes =
   Bytes::concat_all(sources.map(|s: Source| Bytes::of_string(s.label ++ " " ++ s.digest ++ "\n")))
 
-/// The sources `manifest` wrote, or `None` for anything else.
 pub fn parse_manifest(text: Bytes) -> Option<List<Source>> =
   text.split(b"\n").fold(Some([]), |acc: Option<List<Source>>, line: Bytes|
     match acc {
@@ -354,18 +262,14 @@ pub fn parse_manifest(text: Bytes) -> Option<List<Source>> =
       },
     })
 
-/// Whether the cache still holds each of `sources`' C, which records a use of each.
 pub fn sources_cached(sources: List<Source>) -> Bool / {toolchain.read} =
   sources.fold(true, |ok: Bool, s: Source| ok && toolchain.exists(source_path(s)))
 
 fn object_path(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
   "obj/" ++ cache_key(t, flags, [Bytes::of_string(s.digest)]) ++ ".o"
 
-/// The objects of a unit's parts by their paths, in the parts' order, and how many of them this
-/// build compiled: the cache held the rest.
 pub type Objects = { paths: List<String>, compiled: Int }
 
-/// The objects `targets` names, those of `missing` compiled from `inputs`, one each, into place.
 fn compile_missing<[c]>(
   t: Toolchain,
   flags: List<String>,
@@ -386,8 +290,6 @@ fn compile_missing<[c]>(
   match run_all[c](runs) {
     Err(why) -> Err(why),
     Ok(_) -> {
-      // Into place by a rename, so a reader never sees half an object, and two builds that made the
-      // same one leave one.
       let placed = range(0, missing.len()).fold(true, |ok: Bool, k: Int|
         ok && toolchain.rename(object(k), targets.get(missing.get(k))));
       if placed {
@@ -397,9 +299,6 @@ fn compile_missing<[c]>(
   }
 }
 
-/// Each part's object, in order: held by the cache where this compiler already made one of the same
-/// C with the same flags, and compiled now where it did not. `work` is a directory of this build's own
-/// in the cache.
 pub fn objects<[c]>(
   t: Toolchain,
   parts: Parts,
@@ -425,8 +324,6 @@ pub fn objects<[c]>(
   }
 }
 
-/// [`objects`] of sources `cache_sources` wrote: a part whose object the cache does not hold compiles from its
-/// kept C, and one whose C the cache no longer holds either is refused.
 pub fn objects_from_sources<[c]>(
   t: Toolchain,
   sources: List<Source>,
@@ -453,8 +350,6 @@ pub fn objects_from_sources<[c]>(
   }
 }
 
-/// The library `objects` link into, kept in the cache by what decides it, so a unit linked once opens
-/// from the cache: its path, or why it was not linked.
 fn link_shared<[c]>(
   t: Toolchain,
   objects: List<String>,
@@ -478,25 +373,18 @@ fn link_shared<[c]>(
   }
 }
 
-/// Where the cache keeps the library `objects`, by their paths in it, link into.
 fn library_path(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
   cache_key(t, ["-shared", "stack-marked"], objects.map(Bytes::of_string)) ++ ".so"
 
-/// The integer `count` bytes of `b` from `from` hold, least significant first.
 fn read_little_endian(b: Bytes, from: Int, count: Int) -> Int / {abort.raise} =
   range(0, count).fold(0, |n: Int, k: Int| n * 256 + b.at(from + count - 1 - k))
 
-/// `n` as `count` bytes, least significant first.
 fn little_endian_bytes(n: Int, count: Int) -> Bytes / {abort.raise} =
   range(0, count).fold({ rest: n, out: b"" }, |s: { rest: Int, out: Bytes }, _k: Int|
     { rest: s.rest / 256, out: s.out.concat(byte_of_int(s.rest % 256)) }).out
 
 fn pt_gnu_stack() -> Int = 0x6474E551
 
-/// `library` saying its code needs no executable stack: a 64-bit little-endian ELF file with no
-/// `PT_GNU_STACK` program header gains one, and anything else comes back as it is. A loader takes a
-/// library without the header to need an executable stack, which glibc refuses to give one it opens,
-/// and tcc links none. tcc leaves no room after the headers, so they move to the end of the file.
 pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
   let size = library.len();
   if size < 64 || !library.starts_with(b"\x7FELF\x02\x01") { library } else {
@@ -521,7 +409,6 @@ pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
         b"\x00".repeat(pad),
         library.slice(at, at + count * each),
         little_endian_bytes(pt_gnu_stack(), 4),
-        // Readable and writable, not executable.
         little_endian_bytes(6, 4),
         b"\x00".repeat(40),
         little_endian_bytes(16, 8),
@@ -530,14 +417,10 @@ pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
   }
 }
 
-/// The flags every object of a library a program loads compiles with.
 fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
 
-/// Where the cache keeps the probe [`targets_x86_64_linux`] preprocesses.
 fn probe_path() -> String = "probe/x86_64_linux.c"
 
-/// Whether the compiler labelled `c` compiles for x86-64 Linux: whether it preprocesses a probe that
-/// stops for any other target. `false` where it is not installed.
 pub fn targets_x86_64_linux<[c]>() -> Bool / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache_sources = toolchain.exists(probe_path())
     || toolchain.write_file(
@@ -552,9 +435,6 @@ pub fn targets_x86_64_linux<[c]>() -> Bool / {compilers.write[c], toolchain.read
   }
 }
 
-/// Compiles `text`, a unit's C, with the compiler labelled `c` as profile `p` compiles units, and
-/// links it into a library stored in the cache. Returns the library's path, or why it could not be
-/// built.
 pub fn library<[c]>(
   p: Profile,
   text: Bytes,
@@ -570,7 +450,6 @@ pub fn library<[c]>(
         t,
         sources_of(parts).map(|s: Source| cache ++ "/" ++ object_path(t, flags, s)),
       );
-      // A unit built before is a library the cache holds, which needs no room to build in.
       if toolchain.exists(made) { Ok(cache ++ "/" ++ made) } else {
         match toolchain.temp_dir() {
           None -> Err("the toolchain's cache has no room to compile in"),
@@ -587,9 +466,6 @@ pub fn library<[c]>(
     },
   }
 
-/// The executable `main`, a C translation unit, makes when compiled and linked after `objects` and
-/// before `libraries`, which name archives and the system libraries they need: its path below
-/// `work`, from which the asker moves it where it goes.
 pub fn executable<[c]>(
   t: Toolchain,
   main: Bytes,
@@ -616,15 +492,8 @@ pub fn executable<[c]>(
   }
 }
 
-// --- The real handlers -----------------------------------------------------------
-//
-// The family `toolchain`, which a run is lent with `--allow toolchain`: each native refuses a run
-// not lent it.
-
 host for compilers by compilers_handler
 
-/// `go` with each C compiler the host has, by its label, each run a job of the run's that the
-/// asking task waits for.
 fn compilers_handler<a | e>(
   go: () -> a / {compilers.read[*], compilers.write[*] | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
@@ -651,18 +520,12 @@ fn compilers_handler<a | e>(
     compilers.wait[*label](job) -> found(job_wait(job)),
   }
 
-/// The compiler the label names, found: its path, what identifies it, and its support flags as
-/// parts, as parts.
 extern fn compilers_found(label: String) -> Bytes / {native.read}
 
-/// The compiler the label names started with `args`, as parts: byte 1 and the ticket of its end,
-/// which answers what `compilers.wait` reads; or byte 0 and why it could not start.
 extern fn compilers_started(label: String, args: Bytes) -> Bytes / {native.read}
 
 host for toolchain by toolchain_handler
 
-/// `go` with the toolchain's cache read and written below it on the host, and each program linked
-/// there run as a job of the run's that the asking task waits for.
 fn toolchain_handler<a | e>(
   go: () -> a / {toolchain.read, toolchain.write | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
@@ -694,49 +557,34 @@ fn toolchain_handler<a | e>(
     },
   }
 
-/// The cache's directory.
 extern fn toolchain_cache() -> Bytes / {native.read}
 
-/// The directory what `ply run` and `ply check` reuse is filed in.
 extern fn toolchain_reused() -> Bytes / {native.read}
 
-/// The directory the emitter's answers are kept in.
 extern fn toolchain_bodies() -> Bytes / {native.read}
 
-/// How many compilers run at once.
 extern fn toolchain_jobs() -> Int / {native.read}
 
-/// Whether the cache holds `path`, which records a use of it.
 extern fn toolchain_holds(path: String) -> Bool / {native.read}
 
-/// What the cache holds at `path`, found.
 extern fn toolchain_held(path: String) -> Bytes / {native.read}
 
-/// Whether `bytes` were written whole at `path`.
 extern fn toolchain_written(path: String, bytes: Bytes) -> Bool / {native.read}
 
-/// Whether `from` was moved whole to `to`.
 extern fn toolchain_moved(from: String, to: String) -> Bool / {native.read}
 
-/// Whether `bytes` were added after what `path` holds.
 extern fn toolchain_appended(path: String, bytes: Bytes) -> Bool / {native.read}
 
-/// A new directory of the asker's own below the cache, found.
 extern fn toolchain_scratch() -> Bytes / {native.read}
 
-/// `dir` below the cache removed with everything under it.
 extern fn toolchain_cleared(dir: String) -> Unit / {native.read}
 
-/// What the runtime's library needs linked after it, as parts.
 extern fn toolchain_libraries() -> Bytes / {native.read}
 
-/// The ticket of the program at `path` below the cache run to its end with `args`, as parts: what
-/// it ended with and what it wrote to standard output, as parts.
 extern fn toolchain_ran(path: String, args: Bytes) -> Int / {native.read}
 
 host for memory by memory_handler
 
-/// `go` with the asking program's own heap read.
 fn memory_handler<a | e>(go: () -> a / {memory.read | e}) -> a / {native.read, abort.raise | e} =
   handle {
     go()
@@ -758,21 +606,13 @@ fn memory_handler<a | e>(go: () -> a / {memory.read | e}) -> a / {native.read, a
         }),
   }
 
-/// What the heap holds, its live bytes and those held for them, as parts.
 extern fn memory_heap() -> Bytes / {native.read}
 
-/// The live objects, the most bytes first, each a sort's words, its count and its bytes, as parts
-/// of parts.
 extern fn memory_census() -> Bytes / {native.read}
 
-// --- Tests -----------------------------------------------------------------------
-
-/// The runtime part of [`unit_text`], which holds a comment that is no mark.
 fn runtime_text() -> Bytes =
   tail_mark().concat(b"\nint r;\n/* --- what the loader reads --- */\nint s;\n")
 
-/// A unit's C with parts before and after its runtime part, whose labels in order are
-/// [`unit_labels`].
 fn unit_text() -> Bytes =
   Bytes::concat_all([
     b"#include <x>\n",
@@ -799,7 +639,6 @@ test "a unit cuts at every mark, each label read whole, into a head and parts th
       None -> b"",
     };
   assert_eq(Bytes::concat_all([p.head].concat(unit_labels().map(text_of))), unit_text());
-  // A mark after the tail mark starts a part of its own.
   assert_eq(text_of("runtime"), runtime_text())
 }
 
@@ -877,8 +716,6 @@ test "both profiles optimise native programs the same" {
   assert_eq(release().native, development().native)
 }
 
-/// What `ran` answers over `runs` where the compiler says `said` of each run, its argument the
-/// run's last, `None` where it compiles; and how many runs were started.
 fn run_all_with(
   runs: List<List<String>>,
   said: (String) -> Option<Bytes>,
@@ -907,7 +744,6 @@ test "a compile runs every part, and fails once with what the compiler said of e
   let said = |file: String|
     if file == "b.c" { None } else { Some(Bytes::of_string(file ++ ":1: error: no")) };
   let r = run_all_with(runs, said);
-  // One part refused does not keep the others from compiling.
   assert_eq(r.started, 3);
   match r.result {
     Ok(_) -> assert(false, Some("a compile two parts refused succeeded")),
@@ -921,11 +757,9 @@ test "a compile runs every part, and fails once with what the compiler said of e
           && at(b"b.c") < 0,
         Some(why),
       );
-      // In the order the parts were started.
       assert(at(b"a.c:1") < at(b"c.c:1"), Some(why))
     },
   };
-  // One refusal is said alone, and none is a success.
   assert_eq(
     run_all_with(runs, |file: String|
       if file == "c.c" { Some(Bytes::of_string("bad")) } else { None }).result,
@@ -934,8 +768,6 @@ test "a compile runs every part, and fails once with what the compiler said of e
   assert_eq(run_all_with(runs, |_: String| None).result, Ok(()))
 }
 
-/// What `targets_x86_64_linux` answers where the probe is kept as `cache_sources` says, the compiler starts as
-/// `start` says and says `said` of its run; and each run it was started with.
 fn probe_with(
   cache_sources: Bool,
   start: Result<Int, String>,
@@ -977,8 +809,6 @@ test "a compiler compiles for x86-64 Linux where it preprocesses the probe, and 
   assert_eq(unkept.runs, [])
 }
 
-/// What `build` returns where the cache holds just `held` and every compile, write and move
-/// succeeds; and each path it wrote to.
 fn built_over(
   held: List<String>,
   build: () -> Result<Objects, String> / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise},
@@ -1010,7 +840,6 @@ fn built_over(
 
 test "a build compiles the parts whose objects the cache does not hold, each from C of its own" {
   let t = toolchain_of({ path: "cc", identity: b"cc 1", support_flags: [] }, "-O2", false);
-  // Two parts share a label, so only a file named by something else keeps their C apart.
   let parts = {
     head: b"#include <x>\n",
     parts: [

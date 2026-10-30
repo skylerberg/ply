@@ -1,6 +1,3 @@
-//! Expressions: the tree, the grammar and the dump. Record updates, `?`, `try` blocks, tagged literals
-//! and named arguments are kept as parsed; later passes expand them.
-
 import std.derive.children
 import compiler.syntax.parsing (tuple_field_name, Span, Ident, QName, Input, Parser, ParseOutput,
                                 PartialList, ParseDiag, span_to, dummy_span, no_ident, bare,
@@ -41,17 +38,12 @@ import compiler.syntax.patterns (Pattern, PatternVariable, SourceLiteral, Litera
                                  LiteralFloat, LiteralDecimal, LiteralChar, LiteralUnit, pattern,
                                  pat_span, dump_pattern, dump_lit, source_text)
 
-// --- The tree ---------------------------------------------------------------
-
-/// An expression as it is written. Each case's parts are declared in the order they are written,
-/// which is the order its derived walks meet them in.
 pub type Expr =
   | LiteralExpression({ span: Span, lit: SourceLiteral })
   | NameExpression({ span: Span, name: QName })
   | BinaryExpression({ span: Span, op: Bytes, lhs: Expr, rhs: Expr })
   | UnaryExpression({ span: Span, op: Bytes, operand: Expr })
   | LambdaExpression({ span: Span, params: List<Param>, ret: Option<TypeExpr>, body: Expr })
-  /// `labels` are the resource labels written at the call: `relay[conn](c)`.
   | CallExpression({ span: Span, func: Expr, labels: List<Ident>, args: List<Expr>, named: List<NamedArg> })
   | IfExpression({ span: Span, cond: Expr, then_branch: Expr, else_branch: Expr })
   | MatchExpression({ span: Span, scrutinee: Expr, arms: List<MatchArm> })
@@ -63,36 +55,20 @@ pub type Expr =
   | ListExpression({ span: Span, items: List<Expr> })
   | PerformExpression({ span: Span, effect_name: QName, op: Ident, resource: Option<Ident>, args: List<Expr> })
   | HandleExpression({ span: Span, vars: List<HandlerVar>, body: Expr, clauses: List<HandleClause>, ret: Option<ReturnClause> })
-  /// `with_hold[r](acquire, release) { h -> body }`: `body` with `h` a hold on what `acquire`
-  /// answered, and `release` run on it however `body` ends.
   | WithHoldExpression({ span: Span, resource: Ident, acquire: Expr, release: Expr, binder: Ident, body: Expr })
   | SimulateExpression({ span: Span, body: Expr })
-  /// `parallel { a, b }`: the branches' answers as a tuple, which means evaluating them left to right.
   | ParallelExpression({ span: Span, branches: List<Expr> })
-  /// `tag"text"`: the call `tag::literal("text")` a check ran, read as the value it answered. With
-  /// holes, the call of `tag::fill` on what `tag::compile` answered a check for the texts, and on
-  /// the holes.
   | TaggedLiteralExpression(TaggedLiteral)
-  /// `???`, or `..` where a definition's body is not written yet: an unfilled hole, which checks
-  /// as any type, reports what it must be, and raises `abort.raise` if a run reaches it. `text`
-  /// is the spelling written.
   | HoleExpression({ span: Span, text: Bytes })
   | InvalidExpression({ span: Span })
-  /// `try { body }`: `Ok` of what the body answers, or `Err` of what one raise in it carried. With
-  /// no `raise` written, the checker reads which one off the body's row.
   | TryBlockExpression({ span: Span, raise: Option<RaiseName>, body: Expr })
 
 derive children for Expr
 
 pub type RaiseName = { effect_name: QName, op: Ident }
 
-/// A tagged literal as it is written: `text` is what its string reads as up to its first hole, and
-/// `quoted` that much of the string, from its opening quote through the `{` or the `"` that ends
-/// the text, which `span` outgrows inside parentheses.
 pub type TaggedLiteral = { span: Span, tag: Ident, text: Bytes, quoted: Span, holes: List<Hole> }
 
-/// A hole of a tagged literal and the text after it: `quoted` runs from the `}` that closes the
-/// hole through the `{` or the `"` that ends the text.
 pub type Hole = { value: Expr, text: Bytes, quoted: Span }
 
 pub type RecordLiteralField = { name: Ident, value: Expr }
@@ -101,13 +77,8 @@ pub type NamedArg = { name: Ident, value: Expr, span: Span }
 
 type Arg = | ArgumentByPosition(Expr) | ArgumentByName(NamedArg)
 
-/// A parameter; only a `fn` parameter may carry a `default`, or name with `cost` the steps a call of
-/// it takes and with `space` the memory a call of it holds, which only that definition's `cost` and
-/// `space` clauses read.
 pub type Param = {
   name: Ident,
-  /// Written `keep`: the callee takes what it is handed, holding a function past the call or
-  /// consuming a resource, where a parameter of either is otherwise lent to the call.
   keep: Bool,
   ty: Option<TypeExpr>,
   cost: Option<Ident>,
@@ -118,11 +89,8 @@ pub type Param = {
 
 pub type Stmt =
   | LetStatement({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr })
-  /// `let p = v else { .. };`: where `parser` does not match, the `else` block is the enclosing block's
-  /// value and the statements after this one do not run.
   | LetElseStatement({ span: Span, pat: Pattern, ty: Option<TypeExpr>, value: Expr, fallback: Expr })
   | ExpressionStatement(Expr)
-  /// `name = value;`: a clause giving its handler's variable a new value.
   | AssignmentStatement({ span: Span, name: Ident, value: Expr })
 
 pub type MatchArm = { pat: Pattern, guard: Option<Expr>, body: Expr, span: Span }
@@ -131,11 +99,7 @@ pub type HandleClause = {
   effect_name: QName,
   op: Ident,
   resource: Option<Ident>,
-  /// `[*]`: the clause answers the operation on every label, so there is no label to name and
-  /// `resource` stays `None`. This is what distinguishes it from a clause on a singleton.
   every_label: Bool,
-  /// `[*t]`: the same coverage, with the label the call site named bound to `t` in the body. A
-  /// clause that answers every label can otherwise answer one it should have refused.
   label_binder: Option<Ident>,
   resume: Option<Ident>,
   body: Expr,
@@ -145,11 +109,8 @@ pub type HandleClause = {
 
 pub type ReturnClause = { binder: Ident, body: Expr, span: Span }
 
-/// `var name: T = init` in a `with` block: a variable the handler holds, made when its `handle`
-/// starts, which its clauses assign and its `return` reads.
 pub type HandlerVar = { name: Ident, ty: Option<TypeExpr>, init: Expr, span: Span }
 
-/// A variant of its own rather than `()`, so a placeholder that reaches the dump is visible.
 pub fn no_expr() -> Expr = InvalidExpression({ span: dummy_span() })
 
 pub fn expr_span(expr: Expr) -> Span =
@@ -179,28 +140,17 @@ pub fn expr_span(expr: Expr) -> Span =
     TryBlockExpression(v) -> v.span,
   }
 
-/// The place of the closure a `simulate` written at `at` runs its body in.
 pub fn simulate_closure_span(at: Span) -> Span = synthetic_span(at, role_simulated())
 
-/// The place of the closure a `handle` written at `at` runs its body in, where the body runs
-/// detached.
 pub fn detached_closure_span(at: Span) -> Span = synthetic_span(at, role_detached())
 
-/// The effect the `?`s of the `n`th function or typed lambda of the item written at `at` raise to
-/// leave the `handle`s they stand in, which the `handle` around the outermost of those answers. No
-/// source can name it.
 pub fn exit_effect(at: Int, n: Int) -> Bytes =
   Bytes::concat_all([b"exit?", ascii_of_int(at), b"?", ascii_of_int(n)])
 
-/// Whether `name` is an effect `exit_effect` names.
 pub fn is_exit_effect(name: Bytes) -> Bool = name.starts_with(b"exit?")
 
-/// The one operation of an exit effect, a raise of what the `?` exits with.
 pub fn exit_op() -> Bytes = b"leave"
 
-/// Where the parts of the `handle` a `try` written at `at` stands for are, which its check types:
-/// the return clause, the raise's clause, the `Ok` and the `Err` it calls, and the record of the
-/// raise's arguments the `Err` holds where it takes several.
 pub type TrySpans = { ret: Span, clause: Span, ok: Span, err: Span, carried: Span }
 
 pub fn try_spans(at: Span) -> TrySpans =
@@ -217,28 +167,21 @@ fn tag_fn(t: TaggedLiteral, name: Bytes, role: Int) -> QName = {
   { module: Some(t.tag), name: { name: name, span: at }, span: at }
 }
 
-/// The function a tagged literal's check runs, as the literal's module names it: `literal` over
-/// the text of one with no hole, and `compile` over the texts around the holes of one with any. Its
-/// span is the callee's its call is written with.
 pub fn tagged_parser(t: TaggedLiteral) -> QName =
   tag_fn(t, if t.holes.len() == 0 { b"literal" } else { b"compile" }, role_tag_parser())
 
-/// The function a tagged literal's holes are handed to, with what its check answered.
 pub fn tagged_filler(t: TaggedLiteral) -> QName = tag_fn(t, b"fill", role_tag_filler())
 
-/// A text of a tagged literal and where it is written.
 pub type TaggedPart = { text: Bytes, quoted: Span }
 
 derive bin for TaggedPart
 
-/// A tagged literal's texts in order: one more than it has holes.
 pub fn tagged_parts(t: TaggedLiteral) -> List<TaggedPart> =
   t.holes.fold([{ text: t.text, quoted: t.quoted }], |parts: List<TaggedPart>, h: Hole|
     parts.push({ text: h.text, quoted: h.quoted }))
 
 pub fn hole_values(t: TaggedLiteral) -> List<Expr> = t.holes.map(|h: Hole| h.value)
 
-/// The literal with `values` in its holes, in order.
 pub fn with_hole_values(t: TaggedLiteral, values: List<Expr>) -> TaggedLiteral / {abort.raise} =
   { ..t, holes: range(0, t.holes.len()).map(|i: Int| { ..t.holes.get(i), value: values.get(i) }) }
 
@@ -251,7 +194,6 @@ fn tag_call(t: TaggedLiteral, role: Int, callee: QName, args: List<Expr>) -> Exp
     labels: [],
   })
 
-/// The call a tagged literal's check runs.
 pub fn tagged_call(t: TaggedLiteral) -> Expr = {
   let texts = tagged_parts(t).map(|part: TaggedPart|
     LiteralExpression({ span: part.quoted, lit: LiteralString(part.text) }));
@@ -259,7 +201,6 @@ pub fn tagged_call(t: TaggedLiteral) -> Expr = {
   else { [ListExpression({ span: synthetic_span(t.span, role_tag_texts()), items: texts })] })
 }
 
-/// The call that hands a tagged literal's holes to its tag, with what the check's call answered.
 pub fn tagged_fill(t: TaggedLiteral, compiled: Expr) -> Expr =
   tag_call(t, role_tag_fill(), tagged_filler(t), [
     compiled,
@@ -309,7 +250,6 @@ fn set_span(expr: Expr, span: Span) -> Expr =
     TryBlockExpression(v) -> TryBlockExpression({ ..v, span: span }),
   }
 
-/// Ends in `}`, so it may stand as a statement without `;` and as a match arm without `,`.
 pub fn is_block_like(expr: Expr) -> Bool =
   match expr {
     BlockExpression(v) -> true,
@@ -323,9 +263,6 @@ pub fn is_block_like(expr: Expr) -> Bool =
     _ -> false,
   }
 
-// --- The precedence table ---------------------------------------------------
-
-/// `width` is how many tokens the operator spans: a shift is touching `<`s or `>`s, as `>>` is not lexed.
 type BinaryOperator = { op: Bytes, binding_power: Int, width: Int }
 
 fn binary_operator(kind: TokenKind) -> Option<BinaryOperator> =
@@ -354,11 +291,8 @@ fn binary_operator(kind: TokenKind) -> Option<BinaryOperator> =
     _ -> None,
   }
 
-/// An operator that is the call of a builtin: the builtin's name, the operator's token and text,
-/// and the binding power of the arithmetic operator it is beside.
 pub type CallOperator = { name: Bytes, token: Bytes, text: Bytes, binding_power: Int }
 
-/// `+%`, `-%` and `*%` wrap at the operand type's width; `+|`, `-|` and `*|` saturate at it.
 pub fn call_operators() -> List<CallOperator> =
   [
     { name: b"wrap_add", token: b"pluspercent", text: b"+%", binding_power: 9 },
@@ -373,8 +307,6 @@ pub fn call_operator(name: Bytes) -> Option<CallOperator> =
   call_operators().fold(None, |acc: Option<CallOperator>, o: CallOperator|
     if o.name == name { Some(o) } else { acc })
 
-/// The operator a call was written as, when the parser wrote the call for one: its callee stands
-/// after its first operand, where a call spelled out has it before.
 pub fn written_operator(func: Expr, args: List<Expr>) -> Option<CallOperator> =
   match ((func, args)) {
     (NameExpression(v), [first, _]) -> if v.name.module != None
@@ -383,8 +315,6 @@ pub fn written_operator(func: Expr, args: List<Expr>) -> Option<CallOperator> =
     _ -> None,
   }
 
-/// `a +% b` is `wrap_add(a, b)`, built at the parse so the operator and the call are one definition
-/// and one hash; `ply fmt` reads which spelling it was back from where the callee stands.
 fn binary_node(o: BinaryOperator, at: Span, lhs: Expr, rhs: Expr) -> Expr = {
   let span = span_to(expr_span(lhs), expr_span(rhs));
   match call_operator(o.op) {
@@ -408,7 +338,6 @@ fn joined(input: Input, parser: Parser, n: Int) -> Bool =
   if n == 1 { touching(input, parser, 1) }
   else { touching(input, parser, 1) && touching(input, parser, 2) }
 
-/// `>>>` must be tried before `>>`.
 fn peek_binary_operator(input: Input, parser: Parser) -> Option<BinaryOperator> =
   if parser.no_pipe && at_token(input, parser, token_pipe()) { None }
   else if at_token(input, parser, token_gt()) && joined(input, parser, 2) {
@@ -419,13 +348,9 @@ fn peek_binary_operator(input: Input, parser: Parser) -> Option<BinaryOperator> 
     Some({ op: b"shl", binding_power: 7, width: 2 })
   } else { binary_operator(token_kind(input, parser)) }
 
-// --- The grammar ------------------------------------------------------------
-
 pub fn expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parser> / {abort.raise} =
   binary_expression(input, parser, 1, binding_powers())
 
-/// In a scrutinee a `{` opens the arm block, never a record or a block expression — except at the
-/// very start, where nothing else can stand and the arms are the `{` after it.
 pub fn scrutinee(
   input: Input,
   parser: Parser,
@@ -437,11 +362,8 @@ pub fn scrutinee(
   }
 }
 
-/// How many binding powers there are, so how many times a right operand can recurse at a higher one.
 fn binding_powers() -> Int = 10
 
-/// The left spine is one `iterate`; the right operand recurses at `binding_power + 1`, spending one of `powers`,
-/// so depth is bounded by the number of binding powers rather than by the input's length.
 fn binary_expression(
   input: Input,
   parser: Parser,
@@ -516,7 +438,6 @@ fn postfix_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parse
     } else if at_token(input, s.parser, token_dot()) {
       match postfix_dot(input, s) { Err(q) -> Stop(Err(q)), Ok(r) -> Continue(r) }
     } else if at_token(input, s.parser, token_question()) {
-      // `?` binds tightest, with calls and fields: `f(x)?.g` is `(f(x)?).g` and `-x?` is `-(x?)`.
       let q = advance(input, s.parser);
       Continue({
         parser: q.parser,
@@ -525,8 +446,6 @@ fn postfix_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parse
     } else { Stop(Ok(s)) })
 }
 
-/// `g`, a name after `m::`, or where it is a type's and `::` follows, the function of the type named
-/// after it: `value.m::T::f(..)` calls a function of a type the module `m` declares.
 fn typed_name(
   input: Input,
   parser: Parser,
@@ -546,8 +465,6 @@ fn typed_name(
     })
   }
 
-/// What a dot is followed by: a field's name, or `m::f` and a call's arguments, the call of `m::f`
-/// with the value first, which is kept as a field of that name.
 fn dotted_name(input: Input, parser: Parser) -> Result<ParseOutput<Ident>, Parser> / {abort.raise} = {
   let { parser, node: f } = expect_field_name(input, parser, b"a field name after `.`")?;
   if f.keyword || !at_token(input, parser, token_coloncolon()) {
@@ -570,9 +487,6 @@ fn dotted_name(input: Input, parser: Parser) -> Result<ParseOutput<Ident>, Parse
   }
 }
 
-/// A name, `.`, a name, then `[` or `(` is a perform, or a call on the value a binding of that name
-/// holds; anything else is a field read. An operation takes no named argument, so a call that
-/// writes one is kept as the call on a value.
 fn postfix_dot(
   input: Input,
   s: ParseOutput<Expr>,
@@ -622,8 +536,6 @@ fn postfix_dot(
 
 fn opens_arguments(kind: TokenKind) -> Bool = kind == token_lbracket() || kind == token_lparen()
 
-/// `relay[conn](c)`: a `[` after a name, holding names, then `(`, fills the callee's label
-/// parameters; after a field's name, those of the function called on the value.
 fn at_label_args(input: Input, s: ParseOutput<Expr>) -> Bool / {abort.raise} =
   match s.node {
     NameExpression(v) ->
@@ -677,9 +589,6 @@ fn opt_resource(
     Ok({ parser: parser, node: Some(r) })
   }
 
-/// A clause's resource: `[name]`, `[*]` for every label, `[*t]` for every label with the one the
-/// call site named bound to `t`, or nothing when the operation takes none. A perform names a label,
-/// so only a clause gets the `*` forms.
 type ClauseResource = { every: Bool, name: Option<Ident>, binder: Option<Ident> }
 
 fn clause_resource(
@@ -692,7 +601,6 @@ fn clause_resource(
     let o = advance(input, parser);
     if at_token(input, o.parser, token_star()) {
       let st = advance(input, o.parser);
-      // `[*t]` binds the label: the clause answers every label, and reads the one it answered.
       let binder = match token_kind(input, st.parser) {
         Identifier(n) -> {
           let b = advance(input, st.parser);
@@ -782,7 +690,6 @@ fn named_arg(
   })
 }
 
-/// The parser's only rule about names is ordering; `first` is the first named argument's span, for the label.
 type Split = { parser: Parser, first: Option<Span>, named: List<NamedArg>, args: List<Expr> }
 
 fn split_args(parser: Parser, parsed: List<Arg>) -> Split =
@@ -830,7 +737,6 @@ fn lit_expr(
   Ok({ parser: a.parser, node: LiteralExpression({ span: a.node, lit: literal }) })
 }
 
-/// `???` or `..`: an unfilled hole the checker reports and a run raises on.
 fn hole_expr(input: Input, parser: Parser, text: Bytes) -> Result<ParseOutput<Expr>, Parser> = {
   let a = advance(input, parser);
   Ok({ parser: a.parser, node: HoleExpression({ span: a.node, text: text }) })
@@ -842,7 +748,6 @@ fn primary_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parse
     IntLiteral(v) -> lit_expr(input, parser, LiteralInt(v)),
     FixedLiteral(ty, v) -> lit_expr(input, parser, LiteralFixed(ty, v)),
     WideLiteral(ty, high, low) -> lit_expr(input, parser, LiteralWide(ty, high, low)),
-    // Float and decimal literals keep their source text.
     FloatLiteral(f) -> lit_expr(input, parser, LiteralFloat(source_text(input, st))),
     DecimalLiteral(m, sc) -> lit_expr(input, parser, LiteralDecimal(source_text(input, st))),
     StringLiteral(s) -> lit_expr(input, parser, LiteralString(s)),
@@ -872,8 +777,6 @@ fn primary_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parse
   }
 }
 
-/// Contextual, not reserved. `simulate` and `parallel` defer to `no_brace`, so `if simulate { .. }`
-/// is a name and a block.
 fn primary_ident(
   input: Input,
   parser: Parser,
@@ -895,11 +798,8 @@ fn primary_ident(
     }
   }
 
-/// How the string of a tagged literal opens: its text up to its first hole, if it has one.
 type TaggedHead = { text: Bytes, has_holes: Bool }
 
-/// The string that touches the name the parser is at, which makes the two a tagged literal:
-/// `uuid"..."` is one, and `uuid "..."` a name and then a string.
 fn tagged_text(input: Input, parser: Parser) -> Option<TaggedHead> =
   if token_at(input, parser, 1).start != token_at(input, parser, 0).end { None } else {
     match token_kind_at(input, parser, 1) {
@@ -958,7 +858,6 @@ fn primary_paren_inner(
   } else {
     let inner = expr(input, o.parser)?;
     if at_token(input, inner.parser, token_comma()) {
-      // A comma makes a tuple: the record `{_0: a, _1: b}`.
       let rest = comma_list(input, advance(input, inner.parser).parser, token_rparen(), expr)?;
       let cl = expect_close(input, rest.parser, token_rparen(), o.node, b"`)` to close the tuple")?;
       let items = prepend(inner.node, rest.node);
@@ -1015,9 +914,6 @@ fn primary_list_inner(
   Ok({ parser: parser, node: ListExpression({ span: span_to(o.node, cl), items: items }) })
 }
 
-/// `#{k: v, ..}` is `Map::of_entries([{key: k, value: v}, ..])`, named as a call names it, and
-/// `#[a, ..]` is `std.set`'s `Set::of_list([a, ..])`, built at the parse so the literal and the call
-/// are one definition and one hash. `ply fmt` reads which spelling a map was back from the source.
 fn map_literal(
   input: Input,
   parser: Parser,
@@ -1068,23 +964,15 @@ fn map_literal_inner(
   })
 }
 
-/// The binder under which a module that writes a set literal imports `std.set`; no source can
-/// spell it.
 pub fn set_binder() -> Bytes = b"?set"
 
-/// What a set literal calls in `std.set`.
 pub fn set_literal_callee() -> Bytes = b"Set::of_list"
 
-/// The call a map literal is, spelt as a call names it.
 pub fn map_literal_call() -> { binder: Bytes, name: Bytes } =
   { binder: b"Map", name: b"of_entries" }
 
-// --- Interpolated strings ---------------------------------------------------
-
-/// The binder under which a module that interpolates imports `std.show`; no source can spell it.
 pub fn show_binder() -> Bytes = b"?show"
 
-/// `f"a {x} b"` is `"a " ++ display(x) ++ " b"`, `display` being `std.show`'s.
 fn interpolated_string(
   input: Input,
   parser: Parser,
@@ -1103,8 +991,6 @@ fn interpolated_string(
   Ok({ parser: parser, node: concatenated(span_to(first, last), parts) })
 }
 
-/// At an `InterpolatedHead`: every hole of its string and the text after each, a brace inside a
-/// hole read as an expression's.
 fn holes(input: Input, parser: Parser) -> Result<ParseOutput<List<Hole>>, Parser> / {abort.raise} = {
   let saved = parser.no_brace;
   match holes_on(input, with_no_brace(parser, false)) {
@@ -1113,8 +999,6 @@ fn holes(input: Input, parser: Parser) -> Result<ParseOutput<List<Hole>>, Parser
   }
 }
 
-/// At an `InterpolatedHead` or an `InterpolatedMiddle`: the hole after it and the text that closes
-/// the hole, a round each, every round passing at least the token that opens its hole.
 fn holes_on(
   input: Input,
   parser: Parser,
@@ -1159,20 +1043,14 @@ fn display_call(expr: Expr) -> Expr = {
   })
 }
 
-// --- A test over cases -------------------------------------------------------
-
-/// The binder under which a module with a test over cases imports `std.cases`; no source can spell it.
 pub fn cases_binder() -> Bytes = b"?cases"
 
-/// Whether an import under `name` is the parser's, never the source's.
 pub fn is_hidden_binder(name: Bytes) -> Bool =
   name == show_binder() || name == cases_binder() || name == set_binder()
     || name.starts_with(implicit_import_prefix())
 
 fn implicit_import_prefix() -> Bytes = b"?free."
 
-/// The names a module reads with no import where it declares and imports none of them, each under
-/// the module of the library that declares it, `std.` left off.
 pub fn implicitly_imported_names() -> List<{ module: Bytes, names: List<Bytes> }> =
   [
     { module: b"console", names: [b"print", b"eprint", b"read_line", b"Console"] },
@@ -1180,8 +1058,6 @@ pub fn implicitly_imported_names() -> List<{ module: Bytes, names: List<Bytes> }
     { module: b"math", names: [b"abs"] },
   ]
 
-/// The modules that declare what Ply writes of the language's own types, each type's functions a
-/// module calls with no import where [`sees_homes`] says it does.
 pub fn home_modules() -> List<Bytes> =
   [
     b"std.list",
@@ -1194,28 +1070,19 @@ pub fn home_modules() -> List<Bytes> =
     b"std.float",
   ]
 
-/// The module of the language's own functions, which every other module imports under
-/// `prelude_binder` past the imports its text writes, and which imports nothing.
 pub fn prelude_module() -> Bytes = b"std.prelude"
 
-/// The name the prelude's own definition `full` has in the prelude; none for another module's.
 pub fn prelude_own(full: Bytes) -> Option<Bytes> = {
   let prefix = prelude_module().concat(b".");
   if full.starts_with(prefix) { full.slice_at(prefix.len(), full.len() - prefix.len()) }
   else { None }
 }
 
-/// The module of the toolchain's scheduler, whose functions a `simulate` and a perform of one of
-/// `crossing_operations` are calls of.
 pub fn scheduler_module() -> Bytes = b"std.internal.schedule"
 
-/// Whether `definition` is one of the scheduler's `crossing_<op>`, which a perform of a prelude
-/// operation at types not all `Kept` calls in its place: it stands at that perform.
 pub fn crossing_perform(definition: Bytes) -> Bool =
   definition.starts_with(scheduler_module().concat(b".crossing_"))
 
-/// The scheduler and every module it imports, directly or through others: none of them reads the
-/// scheduler with no import, so that what a module sees stays acyclic.
 pub fn scheduler_dependencies() -> List<Bytes> =
   [
     scheduler_module(),
@@ -1237,25 +1104,17 @@ pub fn scheduler_dependencies() -> List<Bytes> =
     b"std.value",
   ]
 
-/// The real handler of each of the prelude's effects that has one, which the prelude has no module
-/// to declare with `host for`: the effect, the handler's module and its name there. `task`'s is the
-/// run's region, and `clock`'s the run's clock, whose sleeps wait in that region.
 pub fn prelude_hosts() -> List<{ effect: Bytes, module: Bytes, by: Bytes }> =
   [
     { effect: b"clock", module: scheduler_module(), by: b"clocked" },
     { effect: b"task", module: scheduler_module(), by: b"scheduled" },
   ]
 
-/// The operations of the prelude's `task` effect.
 pub fn task_operations() -> List<Bytes> = crossing_operations().push(b"yield")
 
-/// The operations of the prelude's `task` effect generic in their own types, each of which crosses
-/// through the scheduler.
 pub fn crossing_operations() -> List<Bytes> =
   [b"spawn", b"join", b"cancel", b"await", b"channel", b"send", b"recv", b"close", b"select"]
 
-/// The prelude, the home modules and every module they import, directly or through others, hidden
-/// imports and those of tests among them.
 pub fn home_module_dependencies() -> List<Bytes> =
   home_modules().concat([
     prelude_module(),
@@ -1269,17 +1128,10 @@ pub fn home_module_dependencies() -> List<Bytes> =
     b"std.value",
   ])
 
-/// Whether the module `name` sees the home modules with no import: every module but those
-/// [`home_module_dependencies`], which see what they import, so that what a module sees stays acyclic. Where
-/// a module lies is no part of it: a copy of one of the library's elsewhere sees what it did.
 pub fn sees_homes(name: Bytes) -> Bool = !home_module_dependencies().contains(name)
 
-/// The binder under which a module imports one of [`implicitly_imported_names`]'s modules for the names it reads
-/// of it; no source can spell it.
 pub fn implicit_import_binder(module: Bytes) -> Bytes = implicit_import_prefix().concat(module)
 
-/// The names [`implicitly_imported_names`] gives the module a hidden import under `binder` reads, none where the
-/// binder is another.
 pub fn implicitly_imported_by(binder: Bytes) -> List<Bytes> =
   implicitly_imported_names().fold(
     [],
@@ -1287,10 +1139,8 @@ pub fn implicitly_imported_by(binder: Bytes) -> List<Bytes> =
       if implicit_import_binder(f.module) == binder { f.names } else { acc },
   )
 
-/// The name a case's test is entered with its place in the table under; no source can spell it.
 pub fn case_index_binder() -> Bytes = b"?at"
 
-/// The name a case's test is entered with its identity under; no source can spell it.
 pub fn case_identity() -> Bytes = b"?identity"
 
 fn cases_name(name: Bytes, module_at: Span, name_at: Span) -> QName =
@@ -1300,8 +1150,6 @@ fn cases_name(name: Bytes, module_at: Span, name_at: Span) -> QName =
     span: name_at,
   }
 
-/// A call into `std.cases`, made for the case's word at `from`. Both calls' callees stand at the
-/// case's type, where what they require of it is reported once.
 fn cases_call(span: Span, from: Span, ty: TypeExpr, name: Bytes, args: List<Expr>) -> Expr = {
   let callee = synthetic_span_at(ty_span(ty), from, role_case_callee());
   CallExpression({
@@ -1325,8 +1173,6 @@ fn local(name: Bytes, at: Span) -> Expr =
 
 fn table_binder() -> Bytes = b"?table"
 
-/// `let ?table: std.cases.Table<T> = table;`: the table held to the case's type where it is
-/// written, made for the case's word at `from`.
 fn table_let(ty: TypeExpr, table: Expr, from: Span) -> Stmt = {
   let at = expr_span(table);
   let typed = { ..at, site: 0 };
@@ -1344,9 +1190,6 @@ fn table_let(ty: TypeExpr, table: Expr, from: Span) -> Stmt = {
   })
 }
 
-/// `{ let ?table = ..; std.cases.listed(?table, |c: T| label) }`: each case's label and
-/// identity. What it adds is made for the `for` written at `for_span`; the table and the label keep
-/// their sites, which a case's run shares.
 pub fn listing(binder: Ident, ty: TypeExpr, table: Expr, label: Expr, for_span: Span) -> Expr =
   BlockExpression({
     span: synthetic_span_at(span_to(for_span, expr_span(table)), for_span, role_case_block()),
@@ -1384,8 +1227,6 @@ pub fn listing(binder: Ident, ty: TypeExpr, table: Expr, label: Expr, for_span: 
     stmts: [table_let(ty, table, for_span)],
   })
 
-/// `{ let ?table = ..; let c: T = std.cases.chosen(?table, ?at, ?identity); body }`: the body
-/// over the case it is entered for. What it adds is made for the `in` written at `in_span`.
 pub fn case_body(binder: Ident, ty: TypeExpr, table: Expr, in_span: Span, body: Expr) -> Expr =
   BlockExpression({
     span: synthetic_span_at(span_to(binder.span, expr_span(body)), in_span, role_case_block()),
@@ -1428,7 +1269,6 @@ pub fn case_body(binder: Ident, ty: TypeExpr, table: Expr, in_span: Span, body: 
     ],
   })
 
-/// The pieces concatenated, empty text dropped; the outermost node spans the whole literal.
 fn concatenated(span: Span, parts: List<Expr>) -> Expr = {
   let kept = parts.filter(|expr: Expr|
     match expr { LiteralExpression(l) -> l.lit != LiteralString(b""), _ -> true });
@@ -1469,7 +1309,6 @@ fn entry_record(key: Expr, value: Expr) -> Expr = {
   })
 }
 
-/// `{x: e}`, `{x, y}` and `{..b}` are records; `{x}` is a block whose value is `x`.
 fn at_record_literal(input: Input, parser: Parser) -> Bool =
   if token_kind_at(input, parser, 1) == token_dotdot() { true } else {
     match token_kind_at(input, parser, 1) {
@@ -1532,8 +1371,6 @@ fn record_base(
     }
   }
 
-/// A path, or one call of it: the expansion writes `base.f` once per field it copies, and binds a
-/// call first so it runs once.
 fn record_update_base(
   input: Input,
   parser: Parser,
@@ -1583,7 +1420,6 @@ fn record_update_base(
     };
     let opens = at_token(input, path.parser, token_lparen());
     match op_of {
-      // `name.op(..)` performs here as it does anywhere else.
       Some(p) -> if !opens && !at_token(input, path.parser, token_lbracket()) { Ok(path) } else {
         let { parser, node: res } = opt_resource(input, path.parser)?;
         let a = call_args(input, parser)?;
@@ -1742,7 +1578,6 @@ fn block_step(
     },
   }
 
-/// Its own function so `?` sits in return position: `?` in an `if` branch bound by `let` is `E0119`.
 fn let_ty(
   input: Input,
   parser: Parser,
@@ -1807,7 +1642,6 @@ fn let_else(
   })
 }
 
-/// `name = value;`, whose `;` may be left off before the block's `}`.
 fn assign_stmt(input: Input, parser: Parser) -> Result<ParseOutput<Stmt>, Parser> / {abort.raise} = {
   let { parser, node: name } = expect_ident(input, parser, b"the name of the variable to assign")?;
   let eq = advance(input, parser);
@@ -1827,7 +1661,6 @@ fn assign_stmt(input: Input, parser: Parser) -> Result<ParseOutput<Stmt>, Parser
   }
 }
 
-/// The block nests in the statement.
 fn else_block(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lbrace()) {
     Err(error_here(input, parser, b"`{` to open the `else` block of a `let ... else`"))
@@ -1839,13 +1672,11 @@ pub fn fn_param(
   parser: Parser,
 ) -> Result<ParseOutput<Param>, Parser> / {abort.raise} = param_inner(input, parser, true)
 
-/// A lambda parameter, which may not carry a default.
 pub fn lambda_parameter(
   input: Input,
   parser: Parser,
 ) -> Result<ParseOutput<Param>, Parser> / {abort.raise} = param_inner(input, parser, false)
 
-/// An `extern fn`'s parameter, which carries no default.
 pub fn declared_param(
   input: Input,
   parser: Parser,
@@ -1876,7 +1707,6 @@ fn param_inner(
     b"memory a call of it holds",
   )?;
   let { parser, node: d } = param_default(input, parser, allow_default)?;
-  // A refused default is `None`, so the span stops before the `= 1` that was read.
   let end = match d {
     Some(e) -> expr_span(e),
     None -> match ((s, c)) {
@@ -1899,8 +1729,6 @@ fn param_inner(
   })
 }
 
-/// `cost k` or `space s` after a `fn` parameter's function type, the `word` naming what one call of
-/// the function takes.
 fn cost_or_space_name(
   input: Input,
   parser: Parser,
@@ -1930,8 +1758,6 @@ fn cost_or_space_name(
     }
   }
 
-/// A parameter's type, and whether it is written `keep`: the callee takes what it is handed. The
-/// checker decides which types may be.
 fn param_ty(
   input: Input,
   parser: Parser,
@@ -1945,7 +1771,6 @@ fn param_ty(
   }
 }
 
-/// Parsed either way, so a default on a lambda is refused with the reason rather than a syntax error.
 fn param_default(
   input: Input,
   parser: Parser,
@@ -1984,7 +1809,6 @@ pub fn no_param() -> Param =
     span: dummy_span(),
   }
 
-/// `||` is one token: the empty parameter list.
 fn lambda_params(
   input: Input,
   parser: Parser,
@@ -1992,7 +1816,6 @@ fn lambda_params(
   let empty = eat(input, parser, token_pipepipe());
   if empty.ok { Ok({ parser: empty.parser, node: [] }) } else {
     let bar = advance(input, empty.parser);
-    // Inside the list a `|` closes it and is never bit-or; restored on both paths.
     let saved = bar.parser.no_pipe;
     let { parser, node: ps } = (match comma_list(
         input,
@@ -2013,7 +1836,6 @@ fn lambda_params(
   }
 }
 
-/// A written return type requires a block body.
 fn lambda_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parser> / {abort.raise} = {
   let st = current_span(input, parser);
   let { parser, node: params } = lambda_params(input, parser)?;
@@ -2048,7 +1870,6 @@ fn lambda_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parser
   }
 }
 
-/// The body reads `|` as bit-or again whatever list encloses the lambda; restored on both paths.
 fn lambda_body(
   input: Input,
   parser: Parser,
@@ -2069,7 +1890,6 @@ fn else_branch(
 ) -> Result<ParseOutput<Expr>, Parser> / {abort.raise} = {
   let els = eat(input, parser, keyword_else());
   if !els.ok {
-    // No `else`: a `()` over the empty span at the end of the `then` block.
     let end = expr_span(then_branch).end;
     Ok({
       parser: els.parser,
@@ -2080,8 +1900,6 @@ fn else_branch(
 
 type IfArm = { start: Span, cond: Expr, then_branch: Expr }
 
-/// An `else if` chain is read as one loop, an arm a round, and nested from its end: a chain nests no
-/// deeper for being long.
 fn if_expr(input: Input, parser: Parser) -> Result<ParseOutput<Expr>, Parser> / {abort.raise} = {
   let chain = iterate(
     { parser: parser, out: [] },
@@ -2190,7 +2008,6 @@ fn match_arm_step(
               body: body.node,
               span: span_to(pat_span(pat.node), expr_span(body.node)),
             };
-            // The comma is eaten before the `}` test, whichever way the test goes.
             let comma = eat(input, body.parser, token_comma());
             if comma.ok || at_token(input, comma.parser, token_rbrace()) {
               Continue({ parser: comma.parser, out: s.out.push(arm) })
@@ -2274,7 +2091,6 @@ fn handle_rest(
   })
 }
 
-/// `return` and `var` are contextual here too: each starts an item only when a name follows it.
 fn handle_step(
   input: Input,
   s: HandlerClauses,
@@ -2285,7 +2101,6 @@ fn handle_step(
       Ok(rc) -> {
         let next = match s.ret {
           None -> { ..s, parser: rc.parser, ret: Some(rc.node) },
-          // A duplicate `return` is reported and dropped; the parse carries on.
           Some(prev) ->
             {
               ..s,
@@ -2311,7 +2126,6 @@ fn handle_step(
     match handler_var(input, s.parser) {
       Err(q) -> Stop(Err(q)),
       Ok(v) -> {
-        // A variable written after a clause is reported and kept; the parse carries on.
         let first = s.clauses.len() == 0 && (match s.ret { None -> true, Some(_) -> false });
         let placed = if first { v.parser } else {
           push_diag(
@@ -2339,7 +2153,6 @@ fn handle_step(
     }
   }
 
-/// `var name: T = init`, the type optional.
 fn handler_var(
   input: Input,
   parser: Parser,
@@ -2358,7 +2171,6 @@ fn handler_var(
 fn is_ident_at(input: Input, parser: Parser, n: Int) -> Bool =
   match token_kind_at(input, parser, n) { Identifier(x) -> true, _ -> false }
 
-/// `resume` is a keyword only between a clause's `)` and its `->`.
 fn clause_resume(
   input: Input,
   parser: Parser,
@@ -2514,8 +2326,6 @@ fn simulate_expr(
   })
 }
 
-/// `try` is the block's wherever a `{` follows it, a scrutinee included, so `match try { .. } { .. }`
-/// reads; before `[` it is one only when the bracket names an operation, which no label does.
 fn opens_try(input: Input, parser: Parser) -> Bool =
   token_kind_at(input, parser, 1) == token_lbrace()
     || (token_kind_at(input, parser, 1) == token_lbracket()
@@ -2571,7 +2381,6 @@ fn parallel_expr(
     b"`{` to start the branches",
   )?;
   let { parser, node: branches } = comma_list(input, parser, token_rbrace(), expr)?;
-  // One branch would be a tuple of one, which Ply has none of.
   if branches.len() < 2 { Err(error_here(input, parser, b"`,` and a second branch")) } else {
     let { parser, node: cl } = expect_close(
       input,
@@ -2586,8 +2395,6 @@ fn parallel_expr(
     })
   }
 }
-
-// --- The dump ---------------------------------------------------------------
 
 pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
   match expr {
@@ -2661,7 +2468,6 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
         dump_expr(v.body),
         dump_list(v.clauses, dump_clause),
         dump_opt(v.ret, dump_return),
-        // Written only where there are any, so a handle without variables dumps as it always has.
         if v.vars.len() == 0 { b"" }
         else { dump_word(b"vars").concat(dump_list(v.vars, dump_var)) },
       ]),
@@ -2699,8 +2505,6 @@ fn dump_field(field: RecordLiteralField) -> Bytes / {abort.raise} =
 fn dump_named(arg: NamedArg) -> Bytes / {abort.raise} =
   Bytes::concat_all([dump_node(arg.span, b"narg"), dump_ident(arg.name), dump_expr(arg.value)])
 
-/// A cost or space name is written only where one is, so a parameter without one dumps as it always
-/// has.
 pub fn dump_param(lambda_parameter: Param) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(lambda_parameter.span, b"prm"),
@@ -2775,9 +2579,6 @@ pub fn dump_return(clause: ReturnClause) -> Bytes / {abort.raise} =
     dump_expr(clause.body),
   ])
 
-// --- The area's own entry point ---------------------------------------------
-
-/// One expression, then end of input; on failure the dump is the diagnostics alone.
 pub fn dump_expr_of(src: Bytes) -> String / {abort.raise} = {
   let s = start(src);
   let r = expr(s.input, s.parser);
@@ -2801,7 +2602,6 @@ pub fn dump_fn_param_of(src: Bytes) -> String / {abort.raise} = {
   String::of_bytes(dump_param(r.node).concat(dump_diags(r.parser.diags)))
 }
 
-/// Total on purpose: a probe uses it to touch the whole tree.
 pub fn node_count(expr: Expr) -> Int =
   match expr {
     LiteralExpression(v) -> 1,
@@ -2870,8 +2670,6 @@ pub fn is_arithmetic(op: Bytes) -> Bool =
 pub fn is_order_comparison(op: Bytes) -> Bool =
   op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
 
-// --- Tests ------------------------------------------------------------------
-
 test "the bit operators sit between the comparisons and the concatenation, loosest first" {
   assert_eq(
     dump_expr_of(b"a | b ^ c & d"),
@@ -2899,7 +2697,6 @@ test "`~` is a unary operator, tighter than any binary" {
 }
 
 test "inside a lambda's parameter list a `|` closes the list; in its body it is bit-or again" {
-  // `x = 1` is a default, refused as `E0120`.
   assert_eq(
     dump_expr_of(b"|x = 1| x | 2"),
     "0:13:elam;#1;1:2:prm;1:2:ident;@78;?0;?0;?0;8:13:ebin;%bitor;8:9:evar;8:"
@@ -2917,7 +2714,6 @@ test "a keyword names a field in a literal and after `.`" {
 
 test "the try operator is a node of its own and takes the `?` into its span" {
   assert_eq(dump_expr_of(b"x?"), "0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;#0;");
-  // `x??` nests left.
   assert_eq(dump_expr_of(b"x??"), "0:3:etry;0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;#0;");
 }
 
@@ -2928,9 +2724,7 @@ test "a hole is an expression, `???` or `..`, and three question marks are one, 
     dump_expr_of(b"f(???)"),
     "0:6:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:5:ehole;%str;@3f3f3f;#0;#0;#0;",
   );
-  // Maximal munch: `x???` is `x` then a hole, not `(x?)?` then `?`.
   assert_eq(dump_expr_of(b"x???"), "#1;!E0001:1:4:1:0;=1:4:1;");
-  // `..` after `{` still opens a record update.
   assert_eq(
     dump_expr_of(b"{ ..r, x: 1 }"),
     "0:13:erup;4:5:evar;4:5:qname;?0;4:5:ident;@72;#1;7:8:ident;@78;10:11:elit;%int;@31;#0;",
@@ -2938,9 +2732,7 @@ test "a hole is an expression, `???` or `..`, and three question marks are one, 
 }
 
 test "the try operator binds tighter than a unary and than any binary" {
-  // `-x?` is `-(x?)`: the `eun` is outside.
   assert_eq(dump_expr_of(b"-x?"), "0:3:eun;%neg;1:3:etry;1:2:evar;1:2:qname;?0;1:2:ident;@78;#0;");
-  // `x? + y` is `(x?) + y`.
   assert_eq(
     dump_expr_of(b"x? + y"),
     "0:6:ebin;%add;0:2:etry;0:1:evar;0:1:qname;?0;0:1:ident;@78;"
@@ -2962,19 +2754,15 @@ test "the base of a record update is a path and not an expression" {
     "0:13:erup;3:6:efld;3:4:evar;3:4:qname;?0;3:4:ident;@73;5:6:ident;@69;"
       ++ "#1;8:9:ident;@78;11:12:elit;%int;@31;#0;",
   );
-  // `...b` is one dot too many.
   assert_eq(dump_expr_of(b"{...b}"), "#1;!E0001:1:4:1:1;=1:4:1;");
-  // A second `..` has no defined order of fields.
   assert_eq(dump_expr_of(b"{..a, ..b}"), "#1;!E0001:6:8:1:1;=6:8:1;")
 }
 
-// The printer qualifies an imported name, so a base it writes as `m::f(x)` must read back.
 test "the base of a record update may be a qualified name, or a call of one" {
   assert(dump_expr_of(b"{..m::b, x: 1}").starts_with("0:14:erup;3:7:evar;3:7:qname;?1;"));
   let call = dump_expr_of(b"{..m::f(x)}");
   assert(call.starts_with("0:11:erup;3:10:eapp;"));
   assert(call.contains("3:7:qname;?1;"));
-  // An operation is performed there as anywhere else, on a label too.
   assert(dump_expr_of(b"{..store.held(), x: 1}").starts_with("0:22:erup;3:15:eprf;"));
   assert(dump_expr_of(b"{..store.held[db]()}").starts_with("0:20:erup;3:19:eprf;"))
 }
@@ -2985,7 +2773,6 @@ test "a named argument is a node with its own span, its name and its value" {
     "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;"
       ++ "#1;5:9:narg;5:6:ident;@62;8:9:elit;%int;@32;#0;#0;",
   );
-  // The two-token lookahead: `f(x)` is positional and `f(x: 1)` is not.
   assert_eq(
     dump_expr_of(b"f(x)"),
     "0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:evar;2:3:qname;?0;"
@@ -2993,9 +2780,7 @@ test "a named argument is a node with its own span, its name and its value" {
   )
 }
 
-// Neither `E0124` nor `E0123` fails the parse, so the call is still built and dumped.
 test "a positional argument after a named one is refused, once each" {
-  // Each offending positional points back at the first named argument.
   assert_eq(
     dump_expr_of(b"f(a: 1, 2)"),
     "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;8:9:elit;%int;@32;"
@@ -3030,7 +2815,6 @@ test "a fn parameter may carry a default and a lambda parameter may not" {
       ++ "?1;9:10:elit;%int;@31;#0;",
   );
   assert_eq(dump_fn_param_of(b"x = 1"), "0:5:prm;0:1:ident;@78;?0;?1;4:5:elit;%int;@31;#0;");
-  // Refused, so `default` is `None` and the span ends at the type.
   assert_eq(
     dump_param_of(b"x: Int = 1"),
     "0:6:prm;0:1:ident;@78;?1;3:6:tcon;3:6:qname;?0;3:6:ident;@496e74;#0;"
@@ -3043,7 +2827,6 @@ test "a fn parameter of a function type may name its cost, and no other paramete
   assert(named.contains("%cost;"), Some(named));
   assert(named.ends_with(";@6b;?0;#0;"), Some(named));
   assert(dump_fn_param_of(b"n: Int cost k").contains("!E0001"));
-  // A lambda's parameter is called where it is written, so it names no cost.
   assert(!dump_param_of(b"g: (Int) -> Int cost k").contains("%cost;"))
 }
 
@@ -3054,7 +2837,6 @@ test "a fn parameter of a function type may name its space after its cost, and n
   let both = dump_fn_param_of(b"g: (Int) -> Int cost k space s");
   assert(both.contains("%cost;") && both.ends_with(";@73;?0;#0;"), Some(both));
   assert(dump_fn_param_of(b"n: Int space s").contains("!E0001"));
-  // Written after the space name, `cost` is no name of the parameter's.
   assert(!dump_fn_param_of(b"g: (Int) -> Int space s cost k").contains("%cost;"));
   assert(!dump_param_of(b"g: (Int) -> Int space s").contains("%space;"))
 }
@@ -3063,7 +2845,6 @@ test "a parameter may be written `keep` before its type, and `keep` alone is a t
   let kept = dump_fn_param_of(b"g: keep (Int) -> Int");
   assert(kept.contains("%keep;"), Some(kept));
   assert(!dump_fn_param_of(b"g: (Int) -> Int").contains("%keep;"));
-  // The checker judges what `keep` stands before.
   let resource = dump_fn_param_of(b"c: keep Conn");
   assert(resource.contains("%keep;") && !resource.contains("!E0001"), Some(resource));
   let named = dump_fn_param_of(b"n: keep");
@@ -3095,7 +2876,6 @@ test "a name touching a string is a tagged literal, and a postfix follows it as 
     dump_expr_of(b"hex\"\".n"),
     "0:7:efld;0:5:etag;0:3:ident;@686578;%str;@;#0;6:7:ident;@6e;#0;",
   );
-  // A space apart they are a name and then a string, which is no one expression.
   assert_eq(dump_expr_of(b"hex \"a\""), "#1;!E0001:4:7:1:0;=4:7:1;")
 }
 
@@ -3108,7 +2888,6 @@ test "a tagged literal's holes are expressions between its texts, braces of thei
     dump_expr_of(b"sh\"{ {n: 1}.n }{sh\"{y}\"}\""),
     "0:25:etag;0:2:ident;@7368;%str;@;#2;5:13:efld;5:11:erec;#1;6:7:ident;@6e;9:10:elit;%int;@31;12:13:ident;@6e;%str;@;16:23:etag;16:18:ident;@7368;%str;@;#1;20:21:evar;20:21:qname;?0;20:21:ident;@79;%str;@;%str;@;#0;",
   );
-  // A hole that does not close is the interpolated string's diagnostic.
   assert(dump_expr_of(b"sh\"{x y}\"").starts_with("#1;!E0001"))
 }
 
@@ -3144,7 +2923,6 @@ test "an `else if` chain nests no deeper for being long, and every binding power
   let read = expr(chained.input, chained.parser);
   assert(!failed(read));
   assert_eq(parsed_or(read, no_expr()).parser.diags.len(), 0);
-  // Each operator binds tighter than the one before it, so each right operand is read a power up.
   let climbing = start(b"a || b && c == d | e ^ f & g << h ++ i + j * k");
   let climbed = expr(climbing.input, climbing.parser);
   assert(!failed(climbed));
@@ -3158,7 +2936,6 @@ test "each level of nesting spends one of the input's room, and one past it is r
       b"1",
       Bytes::concat_all(range(0, n).map(|i: Int| b")")),
     ]);
-  // The expression itself is one level, and each pair of parentheses another.
   let deepest = start(nested(max_depth() - 1));
   let fits = expr(deepest.input, deepest.parser);
   assert(!failed(fits));
@@ -3213,11 +2990,9 @@ test "a call may name the labels it fills" {
     "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;8:9:evar;8:9:qname;?0;"
       ++ "8:9:ident;@78;#0;#2;2:3:ident;@61;5:6:ident;@62;#0;",
   );
-  // With no call after it the bracket is not a label list, and the expression ends at the name.
   assert(dump_expr_of(b"f[a]").contains("!E0001:1:2:"))
 }
 
-// `simulate` stays a name in a scrutinee, which the test below this one holds.
 test "a block-like expression may be a scrutinee or a condition" {
   let handled = dump_expr_of(b"match handle { g() } with { e.op(x) resume k -> 0 } { y -> y }");
   assert(!handled.contains("!E"));
@@ -3277,7 +3052,6 @@ test "`let ... else` is its own statement, its `else` block after the initialize
     dump_expr_of(b"{ let Some(x) = o else { 0 }; x }"),
     "0:33:eblk;#1;2:29:slete;6:13:pctr;6:10:qname;?0;6:10:ident;@536f6d65;#1;11:12:pvar;11:12:ident;@78;?0;16:17:evar;16:17:qname;?0;16:17:ident;@6f;23:28:eblk;#0;?1;25:26:elit;%int;@30;?1;30:31:evar;30:31:qname;?0;30:31:ident;@78;#0;",
   );
-  // The initializer's own `else` is taken first, so this one is the statement's.
   assert_eq(
     dump_expr_of(b"{ let 1 = if a { 1 } else { 2 } else { 3 }; 4 }"),
     "0:47:eblk;#1;2:43:slete;6:7:plit;%int;@31;?0;10:31:eif;13:14:evar;13:14:qname;?0;13:14:ident;@61;15:20:eblk;#0;?1;17:18:elit;%int;@31;26:31:eblk;#0;?1;28:29:elit;%int;@32;37:42:eblk;#0;?1;39:40:elit;%int;@33;?1;44:45:elit;%int;@34;#0;",
@@ -3325,7 +3099,6 @@ test "a handler takes clauses, a resume binder and at most one `return`" {
     dump_expr_of(b"handle f() with { e.op(a) resume k -> k(a), return v -> v }"),
     "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;#0;#0;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;",
   );
-  // `[*t]` is `[*]` with the label bound: the clause still names no resource, and it reads one.
   assert_eq(
     dump_expr_of(b"handle f() with { e.op[*t](a) -> t }"),
     "0:36:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:34:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;?1;24:25:ident;@74;#1;27:28:ident;@61;?0;33:34:evar;33:34:qname;?0;33:34:ident;@74;?0;#0;",
@@ -3345,7 +3118,6 @@ test "a handler's `var`s come before its clauses" {
 
 test "`simulate` is contextual" {
   assert_eq(dump_expr_of(b"simulate { 1 }"), "0:14:esim;9:14:eblk;#0;?1;11:12:elit;%int;@31;#0;");
-  // It is an ordinary name wherever the shape does not hold.
   assert_eq(dump_expr_of(b"simulate"), "0:8:evar;0:8:qname;?0;0:8:ident;@73696d756c617465;#0;")
 }
 
@@ -3439,9 +3211,7 @@ test "`parallel` is contextual, takes two or more branches, and nests" {
 test "`try` opens a block wherever a `{` follows it, and names a raise in brackets" {
   assert(dump_expr_of(b"try { 1 }").contains("0:9:etrb;?0;"));
   assert(dump_expr_of(b"try[m::p.bad] { 1 }").contains("0:19:etrb;?1;"));
-  // A scrutinee may be one: no name is followed by a block there.
   assert(dump_expr_of(b"match try { 1 } { _ -> 2 }").contains("6:15:etrb;?0;"));
-  // A name wherever neither shape holds: alone, and before a label.
   assert_eq(dump_expr_of(b"try"), "0:3:evar;0:3:qname;?0;0:3:ident;@747279;#0;");
   assert(dump_expr_of(b"try[conn](1)").contains("0:3:evar;"));
   assert(dump_expr_of(b"try[p.bad] 1").contains("!E0001:"))

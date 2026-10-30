@@ -1,67 +1,37 @@
-//! Immutable segments named by one manifest: where a program that runs briefly keeps keyed bytes
-//! between runs and reads a little of them. A segment is written once, by one run, in order: a
-//! header, frames, then tables of fixed-width rows sorted by their keys. The manifest names the
-//! segments a store is, oldest first, and where each table lies, and is replaced whole under a
-//! lock, so what a run wrote is there for every later run or for none. A reader holds the manifest,
-//! searches a table in place and reads a frame by its offset: opening a store costs one small
-//! file, and a store is a handful of files however much it holds.
-//!
-//! A run makes a directory of its own in the store before it reads the manifest and removes it when
-//! it ends. A sweep removes a segment no manifest names only while no other run's directory is
-//! there, so a run reads every segment of the manifest it read to its end.
-
 import std.fs
 import std.fs (fs)
 import std.hash (checksum)
 import std.bytes (u32_le, u64_le)
 import std.list
 
-// --- Layout -----------------------------------------------------------------
-
-/// Moves whenever the bytes on disk change meaning: a manifest of another format reads as none.
 fn format() -> Int = 3
 
 fn segment_magic() -> Bytes = b"PLYSEGM1"
 
 fn manifest_magic() -> Bytes = b"PLYSEGS1"
 
-/// A frame's payload length and its checksum.
 fn frame_header_len() -> Int = 12
 
-/// Magic, format, token and shapes.
 pub fn header_len() -> Int = 52
 
-/// The most one read asks for: a table or an answer longer than this is read in parts.
 fn max_read_size() -> Int = 33554432
 
-/// How many bytes of frames wait before they are appended.
 fn flush_threshold() -> Int = 8388608
 
-/// How long a run's directory stands for a run still going, in milliseconds: one older is left by
-/// a run that died.
 fn stale_run_ms() -> Int = 3600000
 
-/// How long a manifest of other shapes stands for a store still used, in milliseconds.
 fn stale_manifest_ms() -> Int = 172800000
 
-/// The four bytes of `b` at `at` as a number, least significant first: zero past either end.
 pub fn read_u32(b: Bytes, at: Int) -> Int = match b.u32_at(at) { Some(n) -> n, None -> 0 }
 
-/// The eight bytes of `b` at `at` as a number, least significant first: zero past either end.
 pub fn read_u64(b: Bytes, at: Int) -> Int = match b.u64_at(at) { Some(n) -> n, None -> 0 }
 
-/// One table of a segment: its number, how wide a row is, how many rows it holds, where they start
-/// and their checksum.
 pub type TableEntry = { table: Int, width: Int, count: Int, offset: Int, sum: Bytes }
 
-/// A segment as the manifest names it: its token, the generation that named it, its length and its
-/// tables.
 pub type Segment = { token: Bytes, at: Int, size: Int, parts: List<TableEntry> }
 
-/// The segments a store is, oldest first, and the generation of its last commit.
 pub type Manifest = { generation: Int, segments: List<Segment> }
 
-/// A store that holds nothing.
 pub fn empty_manifest() -> Manifest = { generation: 0, segments: [] }
 
 fn manifest_name(schema: Bytes) -> String / {abort.raise} =
@@ -69,13 +39,10 @@ fn manifest_name(schema: Bytes) -> String / {abort.raise} =
 
 fn segment_name(token: Bytes) -> String / {abort.raise} = "seg-" ++ token.hex_of()
 
-/// The file of the segment `token` names.
 pub fn segment_path(dir: String, token: Bytes) -> String / {abort.raise} =
   dir ++ "/" ++ segment_name(token)
 
 fn lock_path(dir: String) -> String = dir ++ "/lock"
-
-// --- The manifest -----------------------------------------------------------
 
 fn table_entry_bytes(p: TableEntry) -> Bytes =
   Bytes::concat_all([u32_le(p.table), u32_le(p.width), u64_le(p.count), u64_le(p.offset), p.sum])
@@ -144,7 +111,6 @@ fn segments_from(
     )
   }
 
-/// The manifest `b` holds: none for bytes of another format, or that do not match their checksum.
 fn manifest_from(b: Bytes) -> Option<Manifest> / {abort.raise} = {
   let n = b.len();
   if n < 32 || b.slice(0, 8) != manifest_magic() || read_u32(b, 8) != format() { None }
@@ -153,24 +119,18 @@ fn manifest_from(b: Bytes) -> Option<Manifest> / {abort.raise} = {
   }
 }
 
-/// The manifest the store in `dir` holds for `schema`: nothing where there is none, or where what is
-/// there does not read as one. Its name carries the shapes, so a program that keeps other shapes in
-/// the directory reads and replaces a manifest of its own.
 pub fn manifest<[r]>(dir: String, schema: Bytes) -> Manifest / {fs.read[r], abort.raise} =
   match fs.read_file[r](dir ++ "/" ++ manifest_name(schema)) {
     None -> empty_manifest(),
     Some(b) -> match manifest_from(b) { Some(m) -> m, None -> empty_manifest() },
   }
 
-/// Whether the store in `dir` holds a manifest for `schema` that does not read as one.
 pub fn unreadable<[r]>(dir: String, schema: Bytes) -> Bool / {fs.read[r], abort.raise} =
   match fs.read_file[r](dir ++ "/" ++ manifest_name(schema)) {
     None -> false,
     Some(b) -> manifest_from(b) == None,
   }
 
-/// Whether the store in `dir` holds a manifest of other shapes than `schema`: what another program
-/// keeps there, which this one does not read.
 pub fn has_other_manifests<[r]>(dir: String, schema: Bytes) -> Bool / {fs.read[r], abort.raise} = {
   let own = manifest_name(schema);
   List::fold(
@@ -181,16 +141,11 @@ pub fn has_other_manifests<[r]>(dir: String, schema: Bytes) -> Bool / {fs.read[r
   )
 }
 
-// --- A run's hold on a store -------------------------------------------------
-
-/// A run's directory in the store in `dir`, made before the run reads the manifest: none where the
-/// store takes no write.
 pub fn start_run<[r]>(dir: String) -> Option<String> / {fs.write[r]} = {
   fs.create_dir[r](dir);
   fs.temp_dir[r](dir, "run")
 }
 
-/// A run's directory removed, as the run ends.
 pub fn end_run<[r]>(run: Option<String>) -> Unit / {fs.write[r]} =
   match run {
     Some(path) -> {
@@ -200,12 +155,9 @@ pub fn end_run<[r]>(run: Option<String>) -> Unit / {fs.write[r]} =
     None -> (),
   }
 
-/// When the run whose directory is `run` began, in milliseconds since the epoch.
 pub fn run_start_ms<[r]>(run: Option<String>) -> Int / {fs.read[r]} =
   match run { Some(path) -> match fs.modified_ms[r](path) { Some(ms) -> ms, None -> 0 }, None -> 0 }
 
-/// What names the `nth` segment a run writes: `run` is its directory and `generation` that of the
-/// manifest it read, so no two runs of a store write one name.
 pub fn segment_token(run: Option<String>, generation: Int, nth: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     Bytes::of_string(match run { Some(path) -> path, None -> "" }),
@@ -217,10 +169,6 @@ pub fn segment_token(run: Option<String>, generation: Int, nth: Int) -> Bytes / 
     8,
   )
 
-// --- Reading ----------------------------------------------------------------
-
-/// `len` bytes from `offset` of the file at `path`, read in parts where one read would be too long:
-/// none where the file is shorter.
 pub fn read_range<[r]>(
   path: String,
   offset: Int,
@@ -252,8 +200,6 @@ fn find_table(parts: List<TableEntry>, table: Int) -> Option<TableEntry> =
   parts.fold(None, |acc: Option<TableEntry>, p: TableEntry|
     match acc { Some(_) -> acc, None -> if p.table == table { Some(p) } else { None } })
 
-/// The rows of `table` in `seg`, empty where it holds none: none where they cannot be read whole or
-/// do not match their checksum, which is a damaged segment.
 pub fn table_rows<[r]>(
   dir: String,
   seg: Segment,
@@ -269,15 +215,11 @@ pub fn table_rows<[r]>(
     },
   }
 
-/// A key's first four bytes as a number, high byte first: rows whose keys differ there order as
-/// those numbers do, so a search slices a key only where two of them tie.
 fn key_prefix(b: Bytes, at: Int) -> Int = {
   let le = read_u32(b, at);
   (le & 255) << 24 | (le >> 8 & 255) << 16 | (le >> 16 & 255) << 8 | le >> 24 & 255
 }
 
-/// How many of `rows`, each `width` bytes and sorted by its leading bytes, lie below `key`: the
-/// place of the first row that leads with `key` or lies past it. `key` is four bytes or longer.
 pub fn lower_bound(table_rows: Bytes, width: Int, key: Bytes) -> Int / {abort.raise} = {
   let n = key.len();
   let head = key_prefix(key, 0);
@@ -292,7 +234,6 @@ pub fn lower_bound(table_rows: Bytes, width: Int, key: Bytes) -> Int / {abort.ra
     })
 }
 
-/// The row of `rows` that leads with `key`, where there is one.
 pub fn row_of(table_rows: Bytes, width: Int, key: Bytes) -> Option<Bytes> / {abort.raise} = {
   let at = lower_bound(table_rows, width, key) * width;
   if at + width <= table_rows.len() && table_rows.slice(at, at + key.len()) == key {
@@ -300,7 +241,6 @@ pub fn row_of(table_rows: Bytes, width: Int, key: Bytes) -> Option<Bytes> / {abo
   } else { None }
 }
 
-/// Every row of `rows` that leads with `key`, in their order.
 pub fn rows_of(table_rows: Bytes, width: Int, key: Bytes) -> List<Bytes> / {abort.raise} = {
   let n = key.len();
   iterate(
@@ -315,18 +255,13 @@ pub fn rows_of(table_rows: Bytes, width: Int, key: Bytes) -> List<Bytes> / {abor
   )
 }
 
-// --- Frames -----------------------------------------------------------------
-
-/// `payload` as a segment holds it: its length and a checksum before it.
 pub fn framed(payload: Bytes) -> Bytes / {abort.raise} = {
   let head = u32_le(payload.len());
   Bytes::concat_all([head, checksum(head.concat(payload)), payload])
 }
 
-/// How many bytes the frame of a payload of `len` bytes takes.
 pub fn framed_len(len: Int) -> Int = frame_header_len() + len
 
-/// The payload of exactly one frame: none for bytes that are not one or do not match their checksum.
 pub fn unframed(b: Bytes) -> Option<Bytes> / {abort.raise} =
   if b.len() < frame_header_len() || read_u32(b, 0) != b.len() - frame_header_len() { None } else {
     let payload = b.slice(frame_header_len(), b.len());
@@ -334,7 +269,6 @@ pub fn unframed(b: Bytes) -> Option<Bytes> / {abort.raise} =
     else { Some(payload) }
   }
 
-/// The payload of `len` bytes framed at `offset` of the segment `token` names.
 pub fn payload<[r]>(
   dir: String,
   token: Bytes,
@@ -346,11 +280,6 @@ pub fn payload<[r]>(
     None -> None,
   }
 
-// --- Writing ----------------------------------------------------------------
-
-/// A segment as far as it is written: where its next byte lies, the bytes yet to be appended and
-/// how many they are, the payloads framed among them by where each frame lies, and whether the file
-/// system refused a write, after which nothing more is written.
 pub type SegmentWriter = {
   end: Int,
   waiting: List<Bytes>,
@@ -359,14 +288,11 @@ pub type SegmentWriter = {
   dead: Bool,
 }
 
-/// A segment of which nothing is written.
 pub fn new_writer() -> SegmentWriter =
   { end: header_len(), waiting: [], unwritten: Map::new(), buffered: 0, dead: false }
 
-/// A segment nothing can be written of.
 pub fn failed_writer() -> SegmentWriter = { ..new_writer(), dead: true }
 
-/// `w` with `payload` framed after what it holds, and where the frame lies.
 pub fn append_payload(
   w: SegmentWriter,
   payload: Bytes,
@@ -384,8 +310,6 @@ pub fn append_payload(
   }
 }
 
-/// `w` with `frames`, whole frames read from another segment, after what it holds, and where they
-/// lie.
 pub fn append_frames(w: SegmentWriter, frames: Bytes) -> { writing: SegmentWriter, at: Int } =
   {
     writing: {
@@ -397,14 +321,11 @@ pub fn append_frames(w: SegmentWriter, frames: Bytes) -> { writing: SegmentWrite
     at: w.end,
   }
 
-/// The payload `w` framed at `at` and has yet to append.
 pub fn pending_payload(w: SegmentWriter, at: Int) -> Option<Bytes> = w.unwritten.get(at)
 
 fn header(schema: Bytes, token: Bytes) -> Bytes =
   Bytes::concat_all([segment_magic(), u32_le(format()), token, schema])
 
-/// `w` with what waits and then `more` written to the segment `token` names, which its first write
-/// starts under its header.
 fn flush<[r]>(
   dir: String,
   schema: Bytes,
@@ -423,7 +344,6 @@ fn flush<[r]>(
     } else { { ..w, dead: true } }
   }
 
-/// `w` with what waits appended to the segment `token` names, once enough waits.
 pub fn flush_when_full<[r]>(
   dir: String,
   schema: Bytes,
@@ -432,12 +352,8 @@ pub fn flush_when_full<[r]>(
 ) -> SegmentWriter / {fs.write[r], abort.raise} =
   if w.buffered > flush_threshold() { flush[r](dir, schema, token, w, b"") } else { w }
 
-/// One table of a segment being finished: its number, how wide a row is, and its rows. A table is
-/// made of a map's entries in their order and no other way, so a search of one misses no row.
 pub opaque type Table = new { table: Int, width: Int, rows: Bytes }
 
-/// The table numbered `table` of what `row` makes of each entry of `rows`: the entry's key, then
-/// what `row` answers of it, and no row where it answers none. Every row is as wide as the first.
 pub fn table<v>(
   table: Int,
   table_rows: Map<Bytes, v>,
@@ -458,9 +374,6 @@ pub fn table<v>(
   { table: table, width: built.width, rows: Bytes::concat_all(built.rows) }
 }
 
-/// The segment `token` names finished: what waits of `w` appended, then each of `tables` that holds
-/// a row, in order. What a manifest names it as: none where the file system refused a write. The
-/// file is no part of the store until a manifest names it.
 pub fn finish<[r]>(
   dir: String,
   schema: Bytes,
@@ -489,14 +402,8 @@ pub fn finish<[r]>(
   if done.dead { None } else { Some({ token: token, at: 0, size: done.end, parts: built.parts }) }
 }
 
-/// What a commit came to: the manifest it wrote; `LockHeld`, where another run would not let the lock
-/// go; `StoreChanged`, where the store was no longer the one the commit was made for; or `WriteFailed`,
-/// where the file system refused.
 pub type CommitResult = | Committed(Manifest) | LockHeld | StoreChanged | WriteFailed
 
-/// The manifest of the store in `dir` replaced by `m`, which names the segment of `token` last:
-/// where `durable`, that segment, the manifest and the directory are each synced, so what the
-/// manifest names outlives a loss of power.
 fn replace_manifest<[r]>(
   dir: String,
   schema: Bytes,
@@ -512,10 +419,6 @@ fn replace_manifest<[r]>(
     && (!durable || fs.sync[r](dir))
 }
 
-/// `seg` named as the newest segment of the store in `dir`: the manifest is read again under the
-/// store's lock, `seg` takes the next generation, and the manifest is replaced whole. `without`
-/// names segments the run found damaged, which are named no longer. A `durable` commit is synced to
-/// the disk before it answers.
 pub fn commit<[r]>(
   dir: String,
   schema: Bytes,
@@ -538,9 +441,6 @@ pub fn commit<[r]>(
     if done { Committed(next) } else { WriteFailed }
   }
 
-/// The segments of `m` from the one at `from` on replaced by `seg`, which holds what they held,
-/// where the store's manifest is still `m`: how a merge lands, and `StoreChanged` where a run committed
-/// while it worked.
 pub fn replace_merged<[r]>(
   dir: String,
   schema: Bytes,
@@ -561,10 +461,6 @@ pub fn replace_merged<[r]>(
     else { WriteFailed }
   }
 
-/// Where the newest segments of `m` that are due to be written again as one start, by their place
-/// among its segments: each of them is at most twice what the newer ones come to together. So a
-/// store is a handful of segments, and a byte is written again only as often as what follows it
-/// doubles. One less than the count of segments where the newest stands alone.
 pub fn merge_start(m: Manifest) -> Int / {abort.raise} = {
   let n = m.segments.len();
   if n < 2 { n - 1 } else {
@@ -577,9 +473,6 @@ pub fn merge_start(m: Manifest) -> Int / {abort.raise} = {
   }
 }
 
-// --- Sweeping ---------------------------------------------------------------
-
-/// Whether the file `name` in `dir` is a segment of `schema`.
 fn is_own_segment<[r]>(
   dir: String,
   name: String,
@@ -592,13 +485,6 @@ fn is_own_segment<[r]>(
     None -> false,
   }
 
-/// The store in `dir` rid of what no run reads any more, by the run whose directory is `run`, which
-/// dates the sweep. Each of `retired`, the directories of a layout no program reads, goes whole. A
-/// run's directory older than an hour was left by a run that died, and goes. A manifest of other
-/// shapes that has not changed for two days goes. And while no other run's directory is there, so
-/// no run still reads a manifest older than the one read here: every segment of `schema` the
-/// store's manifest does not name, every manifest that was never renamed into place, and, once no
-/// manifest of other shapes is left, every segment no manifest names.
 pub fn sweep<[r]>(
   dir: String,
   schema: Bytes,
@@ -641,12 +527,8 @@ pub fn sweep<[r]>(
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
 fn test_shapes() -> Bytes = b"shapes".blake3()
 
-/// A segment of the store in `dir` keeping `schema`, holding `pairs`, each a frame and a row of its
-/// key and where the frame lies, in a table numbered one: what the manifest would name it as.
 fn write_test_segment<[r]>(
   dir: String,
   schema: Bytes,
@@ -678,7 +560,6 @@ fn write_segment<[r]>(
   pairs: List<{ key: Bytes, value: Bytes }>,
 ) -> Segment / {fs.write[r], abort.raise} = write_test_segment[r](dir, test_shapes(), token, pairs)
 
-/// What the store in `dir` holds under `key`, the newest segment first.
 fn lookup<[r]>(dir: String, key: Bytes) -> Option<Bytes> / {fs.read[r], abort.raise} = {
   let m = manifest[r](dir, test_shapes());
   range(0, m.segments.len()).fold(None, |acc: Option<Bytes>, i: Int|
@@ -723,7 +604,6 @@ test "what a segment holds is read back through the manifest, the newest segment
   assert_eq(run.value.a, Some(b"anew"));
   assert_eq(run.value.b, Some(b"two"));
   assert_eq(run.value.c, None);
-  // A store is its segments, its manifest and nothing else once the lock is let go.
   assert_eq(names_in(run.tree, "s").len(), 3)
 }
 
@@ -803,12 +683,10 @@ fn sized(size: Int) -> Segment = { token: b"", at: 0, size: size, parts: [] }
 
 test "the newest segments are due as one while each is at most twice what follows it" {
   let due = |sizes: List<Int>| merge_start({ generation: 0, segments: sizes.map(sized) });
-  // Nothing to merge: no segment, one, or a newest far smaller than the one before it.
   assert_eq(due([]), 0 - 1);
   assert_eq(due([400]), 0);
   assert_eq(due([400, 1]), 1);
   assert_eq(due([400, 3, 1]), 2);
-  // The two newest, then the three, and the whole store once what follows the oldest is half of it.
   assert_eq(due([400, 1, 1]), 1);
   assert_eq(due([400, 3, 1, 1]), 1);
   assert_eq(due([400, 150, 80]), 0)
@@ -827,7 +705,6 @@ test "a sweep removes what no manifest names, and nothing while another run is t
   });
   let other = match made.value { Some(path) -> path, None -> "" };
   let seg = |token: Bytes| segment_name(token);
-  // Another run is there: only the retired layout goes.
   let held_back = fs::on_mem[abs](made.tree, || {
     let run = start_run[abs]("s");
     sweep[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, ["records"]);
@@ -836,7 +713,6 @@ test "a sweep removes what no manifest names, and nothing while another run is t
   let kept = names_in(held_back.tree, "s");
   assert(!kept.contains("records"));
   assert(kept.contains(seg(b"token--b")) && kept.contains(seg(b"token--o")));
-  // It ended: the segments no manifest names go, and the manifest never renamed into place.
   let alone = fs::on_mem[abs](held_back.tree, || {
     fs.remove[abs](other);
     let run = start_run[abs]("s");
@@ -863,7 +739,6 @@ test "a sweep leaves the segments of a store of other shapes while its manifest 
   let kept = names_in(made.tree, "s");
   assert(kept.contains(segment_name(b"token--o")) && kept.contains(manifest_name(other)));
   assert(!kept.contains(segment_name(b"token--b")));
-  // Two days on, the other store's manifest has not changed: it goes, and its segments with it.
   let later = fs::on_mem[abs](made.tree, || {
     let run = start_run[abs]("s");
     let path = match run { Some(p) -> p, None -> "" };

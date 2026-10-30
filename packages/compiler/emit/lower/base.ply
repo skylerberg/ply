@@ -1,7 +1,3 @@
-//! The state a root's body is lowered in, and what every part of the lowering shares: binding a
-//! value, a block of its own, a join, a frame of its own for a body lowered as a function, a
-//! broken invariant. Nothing here calls the lowering's recursion, which `emit.lower` alone holds.
-
 import compiler.emit.code
 import compiler.emit.code (Code, CodeArm, Capture, NDef, NBuiltin, NCtor)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
@@ -29,25 +25,6 @@ import compiler.emit.lower.representation (representation_of)
 import compiler.emit.typed_ir.statics (StaticDef, StaticLayout, StaticWords, AddressWord, BytesWord,
                                        named_by_content)
 
-/// What a root's body is lowered under: the module's setting, the root's key and full name, where
-/// its definition's text starts, its parameters as the emitter holds them and their types, how its
-/// answer is handed back and its type, the body itself, where a call in tail position goes, each
-/// parameter's place among them by its variable's id (`i` for `i` in a root of its own; a tail
-/// group's member's variables are numbered apart from the other members'), and, in a lambda another
-/// root lent this one, run in place, that root and every lambda it lends by their places, by which
-/// what the lambda hands on is numbered. An `observing` lowering writes where each slot is read and
-/// each frame entered (`note_slot_read`, `note_frame_entry`), for `emit.moves` to read the form's moves
-/// off; nothing else lowers so. `frame` is the place of the lambda whose slots the body being
-/// lowered reads, or nowhere in the root's own, and `captured` the slots of that frame that hold
-/// what the frame around it handed in. `allows_lambda_inlining` is whether the root lends its own lambdas,
-/// as read under this setting, and `written` what it lends then: the lambdas its body writes and
-/// the definitions it hands as values, read once for the whole body. `words` are the evidence words
-/// the body holds, innermost first; `rows` and `labels` what the root's key fills its definition's
-/// row variables with and how many label parameters the definition has, which the rows its nodes
-/// hold are read at; `label_names` those parameters' names in
-/// their order, which a label a call fills is read by; `label_values` the value each label of the
-/// root's numbering has in the function being lowered, where it holds one; and `handed` the root's
-/// parameters past its definition's, which a restart hands back as they are.
 pub type Context = {
   setting: ModuleContext,
   key: RootKey,
@@ -55,8 +32,6 @@ pub type Context = {
   base: Int,
   params: List<EmitParam>,
   types: List<Type>,
-  /// What each parameter that is a function performs, as the root's definition writes it and in
-  /// the root's numbering: a type the check settled holds no row.
   param_rows: List<Option<Row>>,
   result: Representation,
   result_type: Type,
@@ -64,9 +39,6 @@ pub type Context = {
   tails: TailCalls,
   parameter_positions: Map<Int, Int>,
   inlined_from: Option<{ owner: RootKey, written: List<code::Lambda> }>,
-  /// Each root whose lambda a slot of this body, or of a closure it makes, may be known to hold, by
-  /// the name its code calls it: the root itself, each root a parameter was handed a lambda of, and
-  /// each lender whose lambda runs here.
   owners: Map<Bytes, RootKey>,
   observing: Bool,
   frame: Span,
@@ -80,37 +52,25 @@ pub type Context = {
   label_values: List<Option<Arg>>,
   handed: List<Arg>,
   instance: Option<HandlerInstance>,
-  /// The counted blocks of the heap instances the body's words live in, which a closure holding
-  /// those words holds too.
   kept: List<Arg>,
-  /// What an entry's body performs, which the runtime answers where nothing of the program does.
   performs: Row,
 }
 
-/// The instance of the `handle` whose clauses or body a function is, which holds that handle's
-/// variables from word `vars`.
 pub type HandlerInstance = { word: Arg, vars: Int }
 
-/// What a function of its own takes from where it is made rather than from its caller: the words
-/// its row needs, each with what it answers, the instance of the `handle` it is a clause of, and
-/// the counted blocks of the heap instances those words live in.
 pub type CapturedEvidence = {
   words: List<EvidenceWord>,
   instance: Option<HandlerInstance>,
   kept: List<Arg>,
 }
 
-/// Nothing held: a function that takes its words from its caller.
 pub fn no_captured_evidence() -> CapturedEvidence = { words: [], instance: None, kept: [] }
 
-/// One value for each part of a `CapturedEvidence`.
 pub type Holding<a> = { words: List<a>, instance: Option<a>, kept: List<a> }
 
-/// `h`'s values in the order a closure lays them: the words, the instance, then the counted blocks.
 pub fn holding_laid<a>(h: Holding<a>) -> List<a> =
   h.words.concat(match h.instance { Some(i) -> [i], None -> [] }).concat(h.kept)
 
-/// What a function holding `h` captures for it where it is made.
 pub fn held_values(h: CapturedEvidence) -> Holding<Arg> =
   {
     words: h.words.map(|w: EvidenceWord| w.word),
@@ -118,7 +78,6 @@ pub fn held_values(h: CapturedEvidence) -> Holding<Arg> =
     kept: h.kept,
   }
 
-/// What a function holding `h` holds inside, read off `vars`, its captures of it.
 pub fn held_inside(h: CapturedEvidence, vars: Holding<Var>) -> CapturedEvidence =
   {
     words: zip(h.words, vars.words).map(|p: { first: EvidenceWord, second: Var }|
@@ -130,19 +89,10 @@ pub fn held_inside(h: CapturedEvidence, vars: Holding<Var>) -> CapturedEvidence 
     kept: vars.kept.map(VarOperand),
   }
 
-/// An evidence word a body holds: what it answers, the word, whether it came through a row variable
-/// of the frame it was handed to, which no `handle` answers, and whether a `handle` of the body
-/// made it.
 pub type EvidenceWord = { evidence: Evidence, word: Arg, through: Bool, handled: Bool }
 
-/// Where a call in tail position goes without a call of its own: to the root's start where it calls
-/// the root's own definition, its parameters held there as `Restarts` says, to a member of the
-/// root's tail group (its members' keys in case order), or nowhere, in a closure's body.
 pub type TailCalls = | Restarts(List<Representation>) | Enters(List<RootKey>) | Calls
 
-/// A body lowered so far: the next variable's number, what each slot holds, the block being
-/// written, the closures' bodies made so far, the static objects the root and its closures name so
-/// far, each after those it names, and what the root tells the unit.
 pub type Lowering = {
   next: Int,
   env: Map<Int, Arg>,
@@ -150,19 +100,12 @@ pub type Lowering = {
   lambdas: List<Lambda>,
   statics: List<StaticDef>,
   links: Links,
-  /// What a failure here lets go of, as the markers around it in this function name it: a body
-  /// lowered in place of a call fails through its caller's.
   unwinding: List<Unwinding>,
-  /// The variables of this function known to hold a closure of one of the root's lambdas, each by
-  /// that lambda's place among the root's closures.
   closures: Map<Int, Int>,
 }
 
-/// A node lowered: the state after it and the operand holding its value.
 pub type LoweredValue = { st: Lowering, arg: Arg }
 
-/// What a call calls: a constructor, a builtin, a definition by its full name, a function value, or
-/// a body run in place of the call.
 pub type Target =
   | ToCtor(Bytes)
   | ToBuiltin(Bytes)
@@ -170,33 +113,16 @@ pub type Target =
   | ToValue
   | ToInlinedBody(InlinedBody)
 
-/// A body run in place of a call: a known lambda's; the step `iterate` runs each pass of its loop;
-/// or the function a walk over a list's items runs on each item, a pass of the walk's loop.
 pub type InlinedBody = | KnownLambda | IterateStep | WalkFunction(Walk)
 
-/// A walk of the list or map its call's first argument holds by the function at argument `at`:
-/// `over` is the type of each item, or of each key and value; `held` what the walk holds across its
-/// passes and answers, a fold's accumulator or the list a map or a filter builds. A `ranged` walk's
-/// first argument is a call of `range`, whose ends it counts between, making no list; they follow
-/// the call's arguments among those lowered.
 pub type Walk = { by: WalkKind, at: Int, over: List<Type>, held: Type, ranged: Bool }
 
-/// What a walk does with each item: folds it into the accumulator, pushes what the function answers
-/// for it, or pushes it where the function holds of it; or folds each entry of a map.
 pub type WalkKind = | Folding | Mapping | Filtering | EntryFolding
 
-/// A body lowered as a function of its own: how many parameters lead its slots, its frame's size,
-/// what it copies in from the frame around it, whether its last parameter is the continuation a
-/// handler's clause binds, a word of no type the runtime calls, the body, whose reads of what it
-/// copies in say the types its closure holds them at, its function type where no node of the
-/// source files one, as the checker files a lambda's, the evidence words it is handed, in the
-/// root's numbering, as its own row says, and what it holds from where it is made instead, which a
-/// function the runtime or a `handle` calls holds.
 pub type Frame = {
   params: Int,
   size: Int,
   captures: List<Capture>,
-  /// What resuming the continuation the frame's last parameter is performs, where it is one.
   resumes: Option<Row>,
   body: Code,
   ty: FunctionSignature,
@@ -204,16 +130,12 @@ pub type Frame = {
   held: CapturedEvidence,
 }
 
-/// A body to lower under a context of its own, from its first state.
 pub type Opened = { cx: Context, st: Lowering }
 
-/// A `match` arm lowered: the arm as written, its guard's value where it has one, and its body.
 pub type LoweredArm = { arm: CodeArm, guard: Option<LoweredValue>, body: LoweredValue }
 
-/// A member of a tail group: its context and its body.
 pub type GroupMember = { cx: Context, body: Code }
 
-/// The first state of a body whose leading slots hold `params`.
 pub fn initial_lowering(params: List<Var>) -> Lowering =
   {
     next: params.fold(0, |n: Int, p: Var| if p.id >= n { p.id + 1 } else { n }),
@@ -227,20 +149,15 @@ pub fn initial_lowering(params: List<Var>) -> Lowering =
     closures: Map::new(),
   }
 
-/// Panics: the lowering met `why`, which the checker or `emit.code` rules out of every program they
-/// hand it, so reaching it is a defect in Ply.
 pub fn unreachable<a>(why: Bytes) -> a / {abort.raise} =
   panic(String::of_bytes_lossy(b"the lowering met what no checked program holds: ".concat(why)))
 
-/// A new variable of type `ty` held as `rep`.
 pub fn fresh(st: Lowering, ty: Type, rep: Representation) -> { st: Lowering, var: Var } =
   { st: { ..st, next: st.next + 1 }, var: { id: st.next, ty: ty, representation: rep } }
 
-/// `val` bound to a new variable of type `ty`, held as a value of that type is in a body.
 pub fn bound(cx: Context, st: Lowering, ty: Type, val: Rvalue, at: Span) -> LoweredValue =
   bound_as(st, ty, representation_of(cx.setting, ty), val, at)
 
-/// `val` bound to a new variable of type `ty` held as `rep`.
 pub fn bound_as(
   st: Lowering,
   ty: Type,
@@ -252,9 +169,6 @@ pub fn bound_as(
   { st: emitted(v.st, Let({ var: v.var, val: val, at: at, unwind: [] })), arg: VarOperand(v.var) }
 }
 
-/// What only a specialisation computes of `ops`, a value of type `ty` held as `rep`, each operand
-/// taken where the specialisation takes it: `st` has noted the need that settles the body by its
-/// callers, so no printer meets it.
 pub fn deferred_to_specialisation(
   st: Lowering,
   ty: Type,
@@ -263,29 +177,21 @@ pub fn deferred_to_specialisation(
   at: Span,
 ) -> LoweredValue = bound_as(st, ty, rep, Unspecialised(ops), at)
 
-/// `val` done for what it does, its answer let go.
 pub fn run_for_effect(st: Lowering, val: Rvalue, at: Span) -> Lowering =
   emitted(st, Do({ val: val, at: at, unwind: [] }))
 
 pub fn emitted(st: Lowering, i: Inst) -> Lowering = { ..st, insts: st.insts.push(i) }
 
-/// The name an observing lowering's note of a slot read stands under, of a slot a closure captures
-/// where it is made, and of a frame whose slots are bound anew.
 pub fn read_note() -> Bytes = b"#read"
 
 pub fn capture_note() -> Bytes = b"#capture"
 
 pub fn enter_note() -> Bytes = b"#enter"
 
-/// `st`, where `cx` observes, noting that `slot` of `cx`'s frame is read at `at`: an operation over
-/// the slot's number and the frame's site that reads no variable and does nothing, so the
-/// ownership pass places every count as it would without it.
 pub fn note_slot_read(cx: Context, st: Lowering, note: Bytes, slot: Int, at: Span) -> Lowering =
   if !cx.observing { st }
   else { with_note(st, note, [IntOperand(slot), IntOperand(cx.frame.site)], at) }
 
-/// `st`, where `cx` observes, noting that `cx`'s frame is entered at `at` with every slot bound
-/// anew: a known lambda's body run in place, or a step's pass.
 pub fn note_frame_entry(cx: Context, st: Lowering, at: Span) -> Lowering =
   if !cx.observing { st } else { with_note(st, enter_note(), [IntOperand(cx.frame.site)], at) }
 
@@ -300,16 +206,11 @@ fn with_note(st: Lowering, note: Bytes, args: List<Arg>, at: Span) -> Lowering =
     at,
   )
 
-/// A block of its own after `st`: its environment, no instructions yet.
 pub fn enter_block(st: Lowering) -> Lowering = { ..st, insts: [] }
 
-/// `outer`, whose block and environment go on, after a block of its own lowered to `inner`: the
-/// variables, closures, statics and links `inner` added.
 pub fn exit_block(outer: Lowering, inner: Lowering) -> Lowering =
   { ..outer, next: inner.next, lambdas: inner.lambdas, statics: inner.statics, links: inner.links }
 
-/// The first state of a body lowered as a function of its own inside `st`'s: its variables numbered
-/// from its parameters, `env` its slots, the root's closures, statics and links carried on.
 pub fn enter_function(st: Lowering, params: List<Var>, env: Map<Int, Arg>) -> Lowering =
   {
     ..initial_lowering(params),
@@ -319,15 +220,9 @@ pub fn enter_function(st: Lowering, params: List<Var>, env: Map<Int, Arg>) -> Lo
     links: st.links,
   }
 
-/// `outer` after a function of its own lowered to `inner`: `outer`'s variables, block and
-/// environment, and the closures, statics and links `inner` added.
 pub fn exit_function(outer: Lowering, inner: Lowering) -> Lowering =
   { ..outer, lambdas: inner.lambdas, statics: inner.statics, links: inner.links }
 
-/// `st` holding the static object laid as `laid`, named by its content as `emit.tir.statics.named`
-/// names it, once however often it is added; and that name, which `Rvalue.Static` reads the object by.
-/// A static whose words address others is added after them, so the root lists each after those it
-/// names.
 pub fn static_added(
   st: Lowering,
   laid: StaticLayout,
@@ -340,28 +235,19 @@ pub fn static_added(
   }
 }
 
-/// `l` added as the body of the next closure the root makes, and its place among them.
 pub fn with_lambda(st: Lowering, l: Lambda) -> { st: Lowering, nth: Int } =
   { st: { ..st, lambdas: st.lambdas.push(l) }, nth: st.lambdas.len() }
 
-/// `st` noting that a specialisation would read `need` of a type variable.
 pub fn noted(st: Lowering, need: Need) -> Lowering =
   if st.links.needs.contains(need) { st }
   else { { ..st, links: { ..st.links, needs: st.links.needs.push(need) } } }
 
-/// What a read of a definition, a constructor or a builtin, `c`, holds: its type and the type
-/// arguments it fills.
 pub fn read_typed(c: Code) -> SiteType =
   {
     ty: c.ty,
     args: match c.node { NDef(d) -> d.args, NBuiltin(b) -> b.args, NCtor(k) -> k.args, _ -> [] },
   }
 
-/// `l`, the value of slot `slot`, bound as `name`, read at `at` as a value of type `ty`: where the
-/// slot is one the frame was handed or holds a word, taken at that type, since a body another root
-/// lends the lambda to holds a capture as a word of no type, and a specialisation is handed a
-/// parameter of its full type as the call crosses it, a word where a variable the call does not
-/// carry stands; any other slot holds the type its binder gave it.
 pub fn typed_slot_read(
   cx: Context,
   l: LoweredValue,
@@ -373,7 +259,6 @@ pub fn typed_slot_read(
   if !cx.captured.contains(slot) && operand_representation(l.arg) != AsWord { l }
   else { retyped(cx, l, ty, at) }
 
-/// The type an operand holds.
 pub fn type_of(a: Arg) -> Type =
   match a {
     VarOperand(v) -> v.ty,
@@ -385,8 +270,6 @@ pub fn type_of(a: Arg) -> Type =
     ZeroOperand(r) -> zero_type(r),
   }
 
-/// The type a zero held as `r` is of where `r` says it: a scalar's own, and `Unit` for a value of no
-/// words, whose word is 0; unknown for any other representation.
 fn zero_type(r: Representation) -> Type =
   match r {
     AsUnit -> unit_type(),
@@ -402,18 +285,6 @@ fn zero_type(r: Representation) -> Type =
 fn width_type(w: { bits: Int, signed: Bool }) -> Type =
   match width_named(w) { Some(n) -> named_type(n), None -> unknown_type() }
 
-/// `l`'s value held as `to`: an integer constant written as the width it is handed as, a zero of a
-/// representation holding no count as `to`'s where `to` holds none either (the zero of each is the
-/// number zero), a value made by holding one held as `to` otherwise that nothing has read since and
-/// no slot names as that one, and anything else packed, a sum's zero among them (an `Option`'s is
-/// `None`). A value no slot names, which nothing reads after the operation it is handed to, packed
-/// into one holding a count but holding no more than it did is packed right after the block last
-/// names it: the operands an operation is handed are each made what it takes as soon as they are
-/// made, so what a failure among them holds only grows and the failure paths share their releases,
-/// rather than each releasing every operand still unpacked and every one packed. A list's word
-/// handed as a view is a view of it from its first item.
-/// The two words of `a`, a `Decimal` or a 128-bit width held as `two`, read from the registers that
-/// hold it.
 pub fn pair_words(
   st: Lowering,
   a: Arg,
@@ -450,20 +321,14 @@ pub fn represented_as(l: LoweredValue, to: Representation, at: Span) -> LoweredV
     }
   }
 
-/// `l` as what reads a slot holding it anywhere but in the walk down a list it views: the list, where
-/// it is a view of one.
 pub fn list_of_view(l: LoweredValue, at: Span) -> LoweredValue =
   if operand_representation(l.arg) == AsListView { represented_as(l, AsWord, at) } else { l }
 
-/// How many of the values a value held as `r` is laid in hold a count.
 fn counts_in(r: Representation) -> Int = parts_of(r).filter(is_refcounted).len()
 
 fn slot_named(st: Lowering, v: Var) -> Bool =
   st.env.fold(false, |named: Bool, _: Int, a: Arg| named || a == VarOperand(v))
 
-/// `v` packed as `to` into a new variable, the `Let` that does it placed right after the last
-/// instruction of `st`'s block that names `v`, but after any change of whose sites follow; at the
-/// block's end where nothing in it names `v`, which a block around holds.
 fn packed_after(st: Lowering, v: Var, to: Representation, at: Span) -> LoweredValue = {
   let w = fresh(st, v.ty, to);
   let named = after_last_reference(st.insts, v.id);
@@ -481,19 +346,14 @@ fn packed_after(st: Lowering, v: Var, to: Representation, at: Span) -> LoweredVa
   }
 }
 
-/// The place in `b` right after the last instruction that names variable `id` or changes whose
-/// sites follow; 0 where none does.
 fn after_last_reference(b: Block, id: Int) -> Int =
   b.fold_right({ at: b.len(), found: false }, |i: Inst, s: { at: Int, found: Bool }|
     if s.found { s } else if references(i, id) || (match i { SiteScope(_) -> true, _ -> false }) {
       { ..s, found: true }
     } else { { at: s.at - 1, found: false } }).at
 
-/// Whether instruction `i`, or a block it holds, names variable `id`.
 fn references(i: Inst, id: Int) -> Bool = references_variable(i, id, true)
 
-/// Whether instruction `i`, or a block it holds, names variable `id`, a `Let` binding it among them
-/// where `binding`.
 fn references_variable(i: Inst, id: Int, binding: Bool) -> Bool = {
   let within = |b: Block| b.any(|x: Inst| references_variable(x, id, binding));
   match i {
@@ -533,9 +393,6 @@ fn references_variable(i: Inst, id: Int, binding: Bool) -> Bool = {
   }
 }
 
-/// `v` held as `to` where `st`'s block holds it so already: the variable `v` was packed from, where
-/// the block makes `v` by packing one it does not declare to be set again, or one the block packed
-/// `v` into, so a value handed as a word twice is boxed once. `v` is left to any other reader.
 pub fn packed_from(st: Lowering, v: Var, to: Representation) -> Option<Var> = {
   let declared = |s: Var| st.insts.any(|i: Inst| i == Decl(s));
   st.insts.fold(None, |found: Option<Var>, i: Inst|
@@ -554,8 +411,6 @@ pub fn packed_from(st: Lowering, v: Var, to: Representation) -> Option<Var> = {
     })
 }
 
-/// Body `b` without each `Convert` nothing in it reads: a value made for a reader that read what it was
-/// made from instead.
 pub fn unread_packs_dropped(b: Block) -> Block =
   unread_dropped_in(b, |id: Int| b.any(|i: Inst| references_variable(i, id, false)))
 
@@ -598,13 +453,6 @@ fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
 fn argument_references(a: Arg, id: Int) -> Bool =
   match a { VarOperand(v) -> v.id == id, _ -> false }
 
-/// `l`'s value at what `t`, the type the checker gave it, says of each part `l`'s variable's type
-/// leaves unsaid: a lambda another root lent, run in place where its arguments and captures arrive
-/// as a type variable's words or a specialisation's erased ones, reads them at the types it was
-/// written for, as far as those say. The variable itself where that type is held as it is;
-/// otherwise its word, the value itself where it is one, held as that type is: an erased `Option<_>`
-/// is its payload's word where an `Option` of a record is its cases, and a capture, a word of its
-/// full type, is held as that type. `l` as it is for anything else, a view among them.
 pub fn retyped(cx: Context, l: LoweredValue, t: Type, at: Span) -> LoweredValue =
   match l.arg {
     VarOperand(v) -> {
@@ -624,9 +472,6 @@ pub fn retyped(cx: Context, l: LoweredValue, t: Type, at: Span) -> LoweredValue 
     _ -> l,
   }
 
-/// `s` with each part it leaves unsaid told by `t`'s part at the same place, where `t` says
-/// something there: a type variable of `t`'s, which is another root's, read as a word it says
-/// nothing more of. A part `s` says is kept, and so is all of `s` where `t` is shaped otherwise.
 fn refined_type(s: Type, t: Type) -> Type =
   if is_unknown_type(s) { if is_unknown_type(t) { s } else { type_variables_erased(t) } } else {
     match s {
@@ -670,10 +515,8 @@ fn refined_fields(fs: List<Field>, gs: List<Field>) -> List<Field> =
       None -> f,
     })
 
-/// Whether `t` says nothing of a value: a type variable, or a word erased to `_`.
 fn is_unknown_type(t: Type) -> Bool = match t { VariableType(_) -> true, _ -> t == word_type() }
 
-/// `t` with each type variable, which is another root's, read as a word, `_`.
 fn type_variables_erased(t: Type) -> Type =
   match t {
     VariableType(_) -> word_type(),
@@ -694,8 +537,6 @@ fn type_variables_erased(t: Type) -> Type =
       }),
   }
 
-/// Whether `t` leaves part of a value's type unsaid: a type variable, or a word a specialisation
-/// erased to `_`, which says nothing more of it.
 pub fn has_unknown_part(t: Type) -> Bool =
   match t {
     VariableType(_) -> true,
@@ -705,15 +546,12 @@ pub fn has_unknown_part(t: Type) -> Bool =
     NominalType(x) -> x.fields.any(|f: Field| has_unknown_part(f.ty)),
   }
 
-/// `args` each handed over as a word.
 pub fn as_words(st: Lowering, args: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
   args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
     let h = represented_as({ st: acc.st, arg: a }, AsWord, at);
     { st: h.st, args: acc.args.push(h.arg) }
   })
 
-/// The type a join of `arms` holds: the first arm's that falls through holding a variable, then the
-/// first's that falls through, then the root's answer's.
 pub fn join_type(cx: Context, arms: List<LoweredValue>) -> Type = {
   let live = arms.filter(|a: LoweredValue| falls_through(a.st.insts));
   match live.fold(None, |acc: Option<Type>, a: LoweredValue|
@@ -726,8 +564,6 @@ pub fn join_type(cx: Context, arms: List<LoweredValue>) -> Type = {
   }
 }
 
-/// An arm's block ending in its value set into join `j`, held as `j` is; an arm that leaves sets
-/// nothing. `st` numbers what it adds.
 pub fn set_join(
   st: Lowering,
   arm: LoweredValue,
@@ -743,13 +579,9 @@ pub fn set_join(
     { st: { ..h.st, insts: st.insts }, block: h.st.insts.push(Assign({ var: j, arg: h.arg })) }
   }
 
-/// How a join of type `ty` holds its value: in tail position as the body answers, which is a word
-/// for a clause that resumes, whose continuation hands back what the runtime resumes with and no
-/// value of `ty`; elsewhere as its type holds it.
 pub fn join_representation(cx: Context, ty: Type, tail: Bool) -> Representation =
   if tail { cx.result } else { representation_of(cx.setting, ty) }
 
-/// An `if` whose arms join in a variable of the type they answer.
 pub fn joined(
   cx: Context,
   cond: LoweredValue,
@@ -773,7 +605,6 @@ pub fn joined(
   }
 }
 
-/// `l && r` or `l || r`: a `Bool` joined from the right operand where the left one does not decide.
 pub fn short_circuit(
   cx: Context,
   l: LoweredValue,
@@ -806,8 +637,6 @@ test "a zero is handed as another representation's zero only where neither holds
     represented_as({ st: st, arg: ZeroOperand(AsInt) }, byte, dummy_span()).arg,
     ZeroOperand(byte),
   );
-  // A value of no words handed as a word is its word 0, which is packed, of `Unit`'s type, which its
-  // release reads.
   assert_eq(
     match represented_as({ st: st, arg: ZeroOperand(AsUnit) }, AsWord, dummy_span()).st.insts {
       [Let(x)] -> Some({ val: x.val, ty: x.var.ty }),
@@ -815,7 +644,6 @@ test "a zero is handed as another representation's zero only where neither holds
     },
     Some({ val: Convert({ arg: ZeroOperand(AsUnit), to: AsWord }), ty: unit_type() }),
   );
-  // A word's zero may stand for a count, so it is read as an `Int`, not taken for one's zero.
   assert(
     represented_as({ st: st, arg: ZeroOperand(AsWord) }, AsInt, dummy_span()).st.insts != [],
     None,
@@ -834,7 +662,6 @@ test "a word just opened to its type and handed straight back as a word is the w
   );
   let back = represented_as(enter_block, AsWord, dummy_span());
   assert_eq(back.arg, VarOperand(w));
-  // The opening stays for any other reader, and goes where nothing reads it.
   assert_eq(back.st.insts, enter_block.st.insts);
   assert_eq(unread_packs_dropped(back.st.insts), []);
   let named = {
@@ -842,7 +669,6 @@ test "a word just opened to its type and handed straight back as a word is the w
     st: { ..enter_block.st, env: enter_block.st.env.insert(1, enter_block.arg) },
   };
   assert_eq(represented_as(named, AsWord, dummy_span()).arg, VarOperand(w));
-  // Held back as another representation than the word it came from, it is packed.
   let byte = AsFixed({ bits: 8, signed: false });
   assert(represented_as(enter_block, byte, dummy_span()).arg != VarOperand(w), None)
 }
@@ -854,7 +680,6 @@ test "a static is held once however often it is added, after the static it addre
   let again = static_added(parent.st, spelling);
   assert_eq(again.name, child.name);
   assert_eq(again.st.statics.map(|d: StaticDef| d.name), [child.name, parent.name]);
-  // One added while a lambda's body is lowered is the root's when the root goes on.
   let inner = static_added(
     enter_function(child.st, [], Map::new()),
     StaticWords([BytesWord(b"m.U")]),

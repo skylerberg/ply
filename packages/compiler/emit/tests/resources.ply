@@ -1,6 +1,3 @@
-//! Resources once lowered: each let go by its type's `ReleaseResource` root where the check lets it go, and
-//! named for the failure paths a failure unwinding past it takes.
-
 import compiler.check.types (NamedType)
 import compiler.emit.emit_harness (Program, program_of, checked, printed_text)
 import compiler.emit.keys
@@ -18,7 +15,6 @@ fn connection_module() -> Bytes =
     b"pub fn send(c: Conn, n: Int) -> Int = n\n",
   ])
 
-/// `src` after `connection_module` as module `m` of a program.
 fn program(src: Bytes) -> Program / {abort.raise} =
   match program_of(connection_module().concat(src)) {
     Ok(p) -> p,
@@ -28,14 +24,12 @@ fn program(src: Bytes) -> Program / {abort.raise} =
 fn let_go_of_conn() -> RootKey =
   keys::generated_key(ReleaseResource, NamedType({ name: b"m.Conn", args: [] }), b"m")
 
-/// What `m.<name>` of `p` is once its counts are placed and checked.
 fn body_of(p: Program, name: Bytes) -> Block / {abort.raise} =
   match checked(p, name) {
     Ok(f) -> f.body,
     Err(why) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", why]))),
   }
 
-/// Each instruction of `b`, those of the blocks it holds after the one holding them.
 fn flat(b: Block) -> List<Inst> =
   b.fold([], |acc: List<Inst>, i: Inst|
     match i {
@@ -53,7 +47,6 @@ fn flat(b: Block) -> List<Inst> =
       _ -> acc.push(i),
     })
 
-/// The roots `b` calls, in order.
 fn calls_in(b: Block) -> List<RootKey> =
   flat(b).fold([], |acc: List<RootKey>, i: Inst|
     match i { Let(l) -> push_callee(acc, l.val), Do(d) -> push_callee(acc, d.val), _ -> acc })
@@ -61,7 +54,6 @@ fn calls_in(b: Block) -> List<RootKey> =
 fn push_callee(acc: List<RootKey>, v: Rvalue) -> List<RootKey> =
   match v { Call(c) -> match c.callee { Root(k) -> acc.push(k), _ -> acc }, _ -> acc }
 
-/// The roots each run of `b`'s failure paths lets go of resources by, in order.
 fn unwound_in(b: Block) -> List<List<RootKey>> =
   flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
     match i { CleanupScope(Some(xs)) -> acc.push(xs.map(|x: Unwinding| x.callee)), _ -> acc })
@@ -69,7 +61,6 @@ fn unwound_in(b: Block) -> List<List<RootKey>> =
 test "a resource is let go where its block ends, by its type's `LetGo` root" {
   let p = program(b"fn f() -> Int = { let c = open(1); let n = send(c, 1); n }\n");
   assert_eq(calls_in(body_of(p, b"f")), [Named(b"m.open"), Named(b"m.send"), let_go_of_conn()]);
-  // Taken by the call that consumes it, it is let go nowhere else.
   let q = program(b"fn g() -> Unit = { let c = open(1); close(c) }\n");
   assert_eq(calls_in(body_of(q, b"g")), [Named(b"m.open"), Named(b"m.close")])
 }
@@ -103,7 +94,6 @@ test "a block that ends in a statement lets go after it, and each alternative of
 }
 
 test "a release that fails lets go of what is still owned, through the runtime" {
-  // A failure in `open(2)` lets go of `a`; so does one in `b`'s release, which runs first.
   let p = program(b"fn f() -> Unit = { let a = open(1); let b = open(2); () }\n");
   assert_eq(unwound_in(body_of(p, b"f")), [[let_go_of_conn()], [let_go_of_conn()]]);
   let q = program(b"fn f() -> Unit = { let a = open(1); () }\n");
@@ -116,7 +106,6 @@ test "a `let` whose pattern misses lets go of what its block owns before it fail
   );
   let b = body_of(p, b"f");
   assert(unwound_in(b).all(|xs: List<RootKey>| xs == [let_go_of_conn()]), None);
-  // The miss fails letting go of `c`, which the block lets go of where it ends otherwise.
   let missed = flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
     match i { Fail(x) -> acc.push(x.letting.map(|u: Unwinding| u.callee)), _ -> acc });
   assert_eq(missed, [[let_go_of_conn()]]);
@@ -128,13 +117,11 @@ test "a miss lets go of each value whole, lent to its release, past what a `hand
     b"type Pair = | Pair(Conn, Option<Int>)\ntype Held = | Held(Conn, Int)\nfn mk() -> Pair = Pair(open(1), None)\nfn f() -> Held / {abort.raise} = { let Pair(c, Some(n)) = mk(); Held(c, n) }\n",
   );
   let b = body_of(p, b"f");
-  // The value a miss lets go of is read whole, so no field of it is taken out of it first.
   assert(
     !flat(b).any(|i: Inst|
       match i { Let(l) -> match l.val { Take(_) -> true, _ -> false }, _ -> false }),
     None,
   );
-  // A miss hands what it lets go of to its release as a failure past a call does.
   let r = program(
     b"fn might() -> Int / {abort.raise} = 1\nfn maybe() -> Option<Int> = None\nfn g() -> Int / {abort.raise} = { let c = open(1); let n = send(c, might()); let Some(m) = maybe(); n + m }\n",
   );
@@ -145,7 +132,6 @@ test "a miss lets go of each value whole, lent to its release, past what a `hand
       _ -> acc,
     });
   assert(handings.len() >= 2 && handings.all(|h: List<ParamOwnership>| h == handings.get(0)), None);
-  // Checked and counted inside a `handle`, whose landing holds what the body consumes.
   let q = program(
     b"fn f(o: Option<Int>) -> Int / {abort.raise} = { let c = open(1); handle { let Some(x) = o; close(c); x } with { abort.raise(m) -> 0 } }\n",
   );
@@ -175,7 +161,6 @@ test "an update whose written field fails lets go of the record it updates" {
   let p = program(
     b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {abort.raise} = { let h = { conn: open(1), n: 1 }; let r = { ..h, n: might() }; send(r.conn, r.n) }\n",
   );
-  // A run around `might()`, where the update's base is still the body's, and one around `send`.
   assert_eq(unwound_in(body_of(p, b"f")).len(), 2)
 }
 
@@ -195,7 +180,6 @@ test "a clause of a `handle` in an argument lowers past what the call holds" {
   assert(calls_in(body_of(p, b"f")).any(|k: RootKey| k == Named(b"m.kept")), None)
 }
 
-/// A resource whose release notes it as it lets it go.
 fn logging_release_corpus() -> Bytes =
   Bytes::concat_all([
     b"effect log { write note(n: Int) -> Unit }\n",
@@ -204,7 +188,6 @@ fn logging_release_corpus() -> Bytes =
     b"pub fn noted(c: keep Noted) -> Unit / {log.write} = match c { Noted(n) -> log.note(n) }\n",
   ])
 
-/// How many arguments each call of root `k` in `b` hands it, in order.
 fn argument_counts(b: Block, k: RootKey) -> List<Int> =
   flat(b).fold([], |acc: List<Int>, i: Inst| {
     let v = match i { Let(l) -> Some(l.val), Do(d) -> Some(d.val), _ -> None };
@@ -221,7 +204,6 @@ test "a release that performs is handed the word the body holds for it, where it
     ),
   );
   let b = body_of(p, b"f");
-  // The value, then the word for `log`, which `abort` stays out of.
   assert_eq(
     argument_counts(
       b,
@@ -235,7 +217,6 @@ test "a release that performs is handed the word the body holds for it, where it
       _ -> acc,
     });
   assert(words.len() > 0 && words.all(|n: Int| n == 1), None);
-  // A release that performs nothing is handed the value alone.
   let q = program(b"fn g() -> Int / {abort.raise} = { let c = open(1); let n = send(c, 1); n }\n");
   assert_eq(argument_counts(body_of(q, b"g"), let_go_of_conn()), [1])
 }

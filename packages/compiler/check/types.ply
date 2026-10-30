@@ -1,5 +1,3 @@
-//! The type language, unification, the type environment and the type printer `infer.ply` checks with.
-
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise,
                                     mode_text, angled, mode_bin)
 import compiler.syntax.lexer (is_ident_continue)
@@ -9,19 +7,14 @@ import std.list
 import std.bytes (ascii_of_int)
 import std.option
 
-// --- Atoms and rows ---------------------------------------------------------------
-
-/// `ResourceVariable` is a label a definition is generic over: the id is a type variable, bound to `label_type`.
 pub type Resource = | NamedResource(Bytes) | SingletonResource | ResourceVariable(Int) | AnyResource
 
-/// `op: None` is the mode atom `effect.mode[resource]`; `Some` names one operation of that effect.
 pub type Atom = { effect: Bytes, resource: Resource, mode: Mode, op: Option<Bytes> }
 
 derive bin for Resource
 
 derive bin for Atom
 
-/// `atoms` stays sorted by `atom_lt` and duplicate-free.
 pub type Row = { atoms: List<Atom>, tail: Option<Int> }
 
 fn resource_lt(a: Resource, b: Resource) -> Bool =
@@ -42,8 +35,6 @@ fn resource_lt(a: Resource, b: Resource) -> Bool =
     AnyResource -> false,
   }
 
-/// Whether `a` stands for every ground label `b` can be: `AnyResource` is what a handler clause written
-/// `[*]` discharges, and it is never equal to a label, only broader than one.
 pub fn resource_covers(a: Resource, b: Resource) -> Bool =
   match a {
     AnyResource -> true,
@@ -69,24 +60,14 @@ pub fn atom_lt(a: Atom, b: Atom) -> Bool =
     && (mode_rank(a.mode) < mode_rank(b.mode)
     || (mode_rank(a.mode) == mode_rank(b.mode) && op_lt(a.op, b.op))))))
 
-/// The mode atom of an effect and resource covers every operation atom of the same mode, on a
-/// resource it covers.
 pub fn atom_covers(a: Atom, b: Atom) -> Bool =
   a.effect == b.effect && resource_covers(a.resource, b.resource)
     && (a == b
-    || (match a.op {
-      // A mode atom covers every operation of its mode; an operation covers the same operation,
-      // which is what lets a row written `op[*]` cover `op[any label]`.
-      None -> mode_rank(a.mode) == mode_rank(b.mode),
-      Some(_) -> a.op == b.op,
-    }))
+    || (match a.op { None -> mode_rank(a.mode) == mode_rank(b.mode), Some(_) -> a.op == b.op }))
 
 pub fn atoms_covered(atoms: List<Atom>, x: Atom) -> Bool =
   atoms.fold(false, |acc: Bool, y: Atom| acc || atom_covers(y, x))
 
-/// An atom that permits rather than names: `op[*]` permits its operation on every label, and a
-/// mode atom permits every operation of its mode. A row written with one is a licence, so a
-/// narrower row satisfies it.
 fn is_permissive(atom: Atom) -> Bool =
   match atom.resource { AnyResource -> true, _ -> match atom.op { None -> true, Some(_) -> false } }
 
@@ -97,7 +78,6 @@ pub fn atom_conflicts(a: Atom, b: Atom) -> Bool =
   a.effect == b.effect && a.resource == b.resource
     && (mode_rank(a.mode) == 1 || mode_rank(b.mode) == 1)
 
-/// Keeps the list sorted and duplicate-free.
 pub fn atoms_insert(atoms: List<Atom>, atom: Atom) -> List<Atom> / {abort.raise} = {
   let n = atoms.len();
   let i = range(0, n).fold(n, |acc: Int, j: Int|
@@ -110,8 +90,6 @@ pub fn atoms_insert(atoms: List<Atom>, atom: Atom) -> List<Atom> / {abort.raise}
 pub fn atoms_union(a: List<Atom>, b: List<Atom>) -> List<Atom> / {abort.raise} =
   b.fold(a, |acc: List<Atom>, atom: Atom| atoms_insert(acc, atom))
 
-/// Ordered by `atom_lt` and each atom once, as inserting them one at a time leaves them, by merging
-/// neighbouring runs until one is left; each round halves the runs, so `n` rounds are plenty.
 pub fn atoms_sorted(atoms: List<Atom>) -> List<Atom> / {abort.raise} =
   iterate(atoms.map(|a: Atom| [a]), atoms.len() + 1, |runs: List<List<Atom>>|
     match runs {
@@ -153,19 +131,14 @@ pub fn row_singleton(atom: Atom) -> Row = { atoms: [atom], tail: None }
 pub fn row_is_pure(row: Row) -> Bool =
   row.atoms.len() == 0 && (match row.tail { None -> true, Some(_) -> false })
 
-/// A raise changes no state and answers alike for equal calls, so what asks only that, such as a
-/// spec, a memoized constant or a generated function, ignores it.
 pub fn without_raises(atoms: List<Atom>) -> List<Atom> =
   atoms.filter(|atom: Atom| !is_raise(atom.mode))
 
-/// Divergence: a definition whose recursion no measure is seen to descend. It names no operation, so
-/// it is written, and printed, as the bare `diverges`.
 pub fn diverges_atom() -> Atom =
   { effect: b"diverges", resource: SingletonResource, mode: ReadMode, op: None }
 
 pub fn is_diverges(atom: Atom) -> Bool = atom.effect == b"diverges"
 
-/// What a run must be given: the runner answers a raise as a failure and bounds a loop by its steps.
 pub fn run_needs(atoms: List<Atom>) -> List<Atom> =
   atoms.filter(|atom: Atom| !is_raise(atom.mode) && !is_diverges(atom))
 
@@ -181,24 +154,15 @@ pub fn row_without(row: Row, removed: List<Atom>) -> Row =
 pub fn row_without_covered(row: Row, removed: List<Atom>) -> Row =
   { atoms: row.atoms.filter(|atom: Atom| !atoms_covered(removed, atom)), tail: row.tail }
 
-// --- Types -------------------------------------------------------------------------
-
 pub type Field = { name: Bytes, ty: Type }
 
 pub type Type =
   | VariableType(Int)
   | NamedType({ name: Bytes, args: List<Type> })
-  /// `kept` are the places of the parameters the function takes rather than borrows, and `once` a
-  /// function its call consumes.
   | FunctionType(FunctionSignature)
-  /// Sorted by field name.
   | RecordType(List<Field>)
-  /// A record a `type T = new { .. }` declares: `name` and `args` are all that tell two apart, and
-  /// `fields` is what they stand for, sorted by field name and written over `args`.
   | NominalType({ name: Bytes, args: List<Type>, fields: List<Field> })
 
-/// A function's parameters and answer, the places of the parameters it takes rather than borrows,
-/// whether its call consumes it, and what it performs.
 pub type FunctionSignature = {
   params: List<Type>,
   kept: List<Int>,
@@ -207,7 +171,6 @@ pub type FunctionSignature = {
   effects: Row,
 }
 
-/// `keep_variables` are the type variables of `ty_vars` written `keep`, which a resource may fill.
 pub type Scheme = {
   ty_vars: List<Int>,
   row_vars: List<Int>,
@@ -243,7 +206,6 @@ pub fn secret_type(ty: Type) -> Type = applied_type(b"Secret", ty)
 pub fn fn_type(params: List<Type>, ret: Type, effects: Row) -> Type =
   FunctionType({ params: params, kept: [], once: false, ret: ret, effects: effects })
 
-/// `fn_type` whose parameters at `kept` are taken, and which a call consumes where `once` holds.
 pub fn owning_fn_type(
   params: List<Type>,
   kept: List<Int>,
@@ -257,7 +219,6 @@ pub fn monomorphic(ty: Type) -> Scheme =
 pub fn fields_sorted(fields: List<Field>) -> List<Field> / {abort.raise} =
   fields.fold([], |acc: List<Field>, field: Field| field_insert(acc, field))
 
-/// A later field of the same name replaces the earlier one.
 fn field_insert(sorted: List<Field>, field: Field) -> List<Field> / {abort.raise} = {
   let n = sorted.len();
   let i = range(0, n).fold(n, |acc: Int, j: Int|
@@ -272,11 +233,9 @@ pub fn field_get(fields: List<Field>, name: Bytes) -> Option<Type> =
   fields.fold(None, |acc: Option<Type>, field: Field|
     match acc { Some(_) -> acc, None -> if field.name == name { Some(field.ty) } else { None } })
 
-/// The fields a value of this type is read by, whether or not the type is declared.
 pub fn record_fields(ty: Type) -> Option<List<Field>> =
   match ty { RecordType(fs) -> Some(fs), NominalType(n) -> Some(n.fields), _ -> None }
 
-/// Two or more fields named exactly `_0`, `_1`, ... with none missing.
 pub fn tuple_arity(fields: List<Field>) -> Option<Int> = {
   let n = fields.len();
   if n < 2 { None } else {
@@ -290,8 +249,6 @@ pub fn tuple_arity(fields: List<Field>) -> Option<Int> = {
   }
 }
 
-// --- Small list helpers ---------------------------------------------------------------
-
 pub fn ints_insert(xs: List<Int>, v: Int) -> List<Int> / {abort.raise} = {
   let n = xs.len();
   let i = range(0, n).fold(n, |acc: Int, j: Int|
@@ -303,8 +260,6 @@ pub fn ints_union(a: List<Int>, b: List<Int>) -> List<Int> / {abort.raise} =
   b.fold(a, |acc: List<Int>, v: Int| ints_insert(acc, v))
 
 pub fn ints_difference(a: List<Int>, b: List<Int>) -> List<Int> = a.filter(|v: Int| !b.contains(v))
-
-// --- Fresh variables and the substitution -----------------------------------------------
 
 pub type Fresh = { next_ty: Int, next_row: Int }
 
@@ -350,7 +305,6 @@ pub fn mark_rigid_row(subst: Subst, v: Int) -> Subst =
 pub fn is_rigid_ty(subst: Subst, v: Int) -> Bool = subst.rigid_ty.contains(v)
 pub fn is_rigid_row(subst: Subst, v: Int) -> Bool = subst.rigid_row.contains(v)
 
-/// The budget cannot run out: bindings never form a cycle, so a chain is at most `s.ty.len()` long.
 pub fn shallow_resolve(subst: Subst, ty: Type) -> Type / {abort.raise} =
   iterate(ty, subst.ty.len() + 2, |cur: Type|
     match cur {
@@ -358,13 +312,9 @@ pub fn shallow_resolve(subst: Subst, ty: Type) -> Type / {abort.raise} =
       _ -> Stop(cur),
     })
 
-/// `t` with each variable `subst` binds replaced by what it is bound to, through every binding. A
-/// part of `t` that holds no bound variable is `t`'s own, not a copy.
 pub fn resolve_type(subst: Subst, t: Type) -> Type / {abort.raise} =
   if has_bound_variable(subst, t) { rebuild_resolved(subst, t, subst.ty.len()) } else { t }
 
-/// Whether `t` holds a variable `subst` binds: asked before a part is built again, so a part with
-/// nothing bound in it is kept as it is.
 fn has_bound_variable(subst: Subst, t: Type) -> Bool =
   match t {
     VariableType(v) -> subst.ty.contains(v),
@@ -376,14 +326,10 @@ fn has_bound_variable(subst: Subst, t: Type) -> Bool =
         || row_may_change(subst, f.effects),
     RecordType(fs) ->
       fs.fold(false, |found: Bool, f: Field| found || has_bound_variable(subst, f.ty)),
-    // Its fields hold no variable its arguments do not.
     NominalType(n) ->
       n.args.fold(false, |found: Bool, a: Type| found || has_bound_variable(subst, a)),
   }
 
-/// `t`, which holds a bound variable, with its bindings: each part with nothing bound in it kept as
-/// it is. `budget` is how many more bindings a path through `t` may pass: bindings never form a
-/// cycle, so a path passes each at most once.
 fn rebuild_resolved(subst: Subst, t: Type, budget: Int) -> Type / {abort.raise} =
   match t {
     VariableType(v) -> match subst.ty.get(v) {
@@ -427,8 +373,6 @@ fn rebuild_resolved(subst: Subst, t: Type, budget: Int) -> Type / {abort.raise} 
       }),
   }
 
-/// Whether `subst` may make something else of `row`: its tail is bound, or an atom names a variable
-/// resource.
 fn row_may_change(subst: Subst, row: Row) -> Bool =
   (match row.tail { Some(v) -> subst.row.contains(v), None -> false })
     || row.atoms.fold(false, |found: Bool, atom: Atom|
@@ -448,8 +392,6 @@ pub fn resolved_tail(subst: Subst, row: Row) -> Option<Int> / {abort.raise} = {
     })
 }
 
-/// A label variable bound since the atom was built may now name the same resource as another atom,
-/// so the atoms are rebuilt through `atoms_insert` rather than kept.
 pub fn resolve_row(subst: Subst, row: Row) -> Row / {abort.raise} = {
   let bound = subst.row.len();
   let walked = iterate(
@@ -481,7 +423,6 @@ pub fn resolve_row(subst: Subst, row: Row) -> Row / {abort.raise} = {
   }
 }
 
-/// The label prefix marks the nullary constructor a bound label variable stands for, as regions do.
 pub fn label_prefix() -> Bytes = b"#label:"
 
 pub fn label_type(name: Bytes) -> Type = named_type(label_prefix().concat(name))
@@ -494,18 +435,13 @@ pub fn label_of(ty: Type) -> Option<Bytes> / {abort.raise} =
     _ -> None,
   }
 
-/// A declared type's label and row arguments ride after its type arguments, so whatever walks a
-/// type's arguments meets them: a label under `#label`, a row as the row of a function answering
-/// `#row`. No source can spell either name.
 fn label_arg(label: Type) -> Type = applied_type(b"#label", label)
 
 fn row_arg(row: Row) -> Type = fn_type([], named_type(b"#row"), row)
 
-/// The label an argument of a declared type is, when it is one.
 pub fn arg_label(ty: Type) -> Option<Type> =
   match ty { NamedType(c) -> if c.name == b"#label" { c.args.at(0) } else { None }, _ -> None }
 
-/// The row an argument of a declared type is, when it is one.
 pub fn arg_row(ty: Type) -> Option<Row> =
   match ty {
     FunctionType(f) -> match f.ret {
@@ -519,7 +455,6 @@ pub fn applied_args(tys: List<Type>, labels: List<Type>, rows: List<Row>) -> Lis
   if labels.len() == 0 && rows.len() == 0 { tys }
   else { tys.concat(labels.map(label_arg)).concat(rows.map(row_arg)) }
 
-/// Whether an argument is a label or a row rather than a type.
 pub fn is_label_or_row(ty: Type) -> Bool =
   match ty {
     NamedType(c) -> c.name == b"#label",
@@ -527,7 +462,6 @@ pub fn is_label_or_row(ty: Type) -> Bool =
     _ -> false,
   }
 
-/// The arguments that are types: what a value's shape turns on.
 pub fn type_args(args: List<Type>) -> List<Type> = args.filter(|a: Type| !is_label_or_row(a))
 
 pub fn resolve_atom(subst: Subst, atom: Atom) -> Atom / {abort.raise} =
@@ -614,8 +548,6 @@ pub fn solve_continuation_row(subst: Subst, v: Int, row: Row) -> Subst / {abort.
     }
   }
 
-/// The type variables `tys` name, in the order they first appear: how a root whose types name
-/// variables no scheme quantifies, a law's, numbers them.
 pub fn vars_in(tys: List<Type>) -> List<Int> = tys.fold([], vars_of)
 
 fn vars_of(seen: List<Int>, ty: Type) -> List<Int> =
@@ -632,7 +564,6 @@ pub type FreeVariables = { tys: List<Int>, rows: List<Int> }
 pub fn free_vars(subst: Subst, ty: Type, acc: FreeVariables) -> FreeVariables / {abort.raise} =
   free_vars_within(subst, ty, acc, subst.ty.len())
 
-/// `budget` as in `rebuild_resolved`.
 fn free_vars_within(
   subst: Subst,
   ty: Type,
@@ -665,8 +596,6 @@ fn free_vars_within(
       n.args.fold(acc, |a: FreeVariables, x: Type| free_vars_within(subst, x, a, budget)),
   }
 
-/// Immutable containers, which may hold a narrower function than their type says. A hold is read
-/// and never written, so it is one.
 pub fn is_covariant_container(name: Bytes) -> Bool =
   name == b"List" || name == b"Array" || name == b"Columns" || name == b"Option"
     || name == b"Result"
@@ -681,11 +610,6 @@ pub fn unify(
   found: Type,
 ) -> UnifyResult / {abort.raise} = unify_at(subst, fresh, expected, found, false, unify_budget(), 1)
 
-/// `exact`: inside a parameter or another constructor, a row must not stand for a wider one.
-/// `budget` is how many levels deeper the unification may go. Each level goes to a part of the types
-/// as they are unified, and a binding never reaches its own variable, so no path meets a part twice:
-/// the parts of the two types resolved are room enough. Counting them costs a walk, so it waits
-/// until a room that suffices for any type a person writes runs out; `tries` is that one recount.
 fn unify_at(
   subst: Subst,
   fresh: Fresh,
@@ -752,7 +676,6 @@ fn unify_structural(
           budget,
           tries,
         );
-        // Two labels that differ are told as the label arguments they are.
         match u.error {
           None -> u,
           Some(_) -> if !is_label_or_row(a) { u }
@@ -764,11 +687,7 @@ fn unify_structural(
     FunctionType(f1) -> match b {
       FunctionType(f2) -> if f1.params.len() != f2.params.len() {
         unify_failed(subst, fresh, Arity({ expected: f1.params.len(), found: f2.params.len() }))
-      }
-      // A function that may be called again stands where a `once` one is expected, but a `once`
-      // one, a resource, never stands for one that may be copied; where the place is read both
-      // ways, as a parameter is, the two agree. `kept` is the ownership check's to judge.
-      else if (f2.once && !f1.once) || (exact && f1.once != f2.once) {
+      } else if (f2.once && !f1.once) || (exact && f1.once != f2.once) {
         unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
       } else {
         let ps = unify_all(subst, fresh, f1.params, f2.params, true, budget, tries);
@@ -802,7 +721,6 @@ fn unify_structural(
       },
       _ -> unify_failed(subst, fresh, Mismatch({ expected: a, found: b })),
     },
-    // By name, as a sum is: the fields follow from the arguments.
     NominalType(n1) -> match b {
       NominalType(n2) -> if n1.name != n2.name || n1.args.len() != n2.args.len() {
         unify_failed(subst, fresh, Mismatch({ expected: a, found: b }))
@@ -828,8 +746,6 @@ fn unify_all(
       None -> unify_at(acc.subst, acc.fresh, xs.get(i), ys.get(i), exact, budget, tries),
     })
 
-/// A free label variable takes the resource the other row names for the same operation, so a
-/// caller's concrete label reaches a callee's generic one through an argument's row.
 fn bind_labels(subst: Subst, xs: List<Atom>, ys: List<Atom>) -> Subst / {abort.raise} =
   xs.fold(subst, |acc: Subst, atom: Atom| {
     let a = resolve_atom(acc, atom);
@@ -934,10 +850,6 @@ fn unify_row_at(
   }
 }
 
-// --- The environment ----------------------------------------------------------------------
-
-/// A scope's locals, each by the site of the name that binds it; the local each name it binds
-/// stands for in it; and in `open` those whose schemes may still reach a free variable.
 pub type Scope = { locals: Map<Int, Scheme>, names: Map<Bytes, Int>, open: List<Int> }
 
 pub type TypeEnv = { globals: Map<Bytes, Scheme>, open: List<Bytes>, scopes: List<Scope> }
@@ -975,7 +887,6 @@ pub fn env_remove_global(env: TypeEnv, name: Bytes) -> TypeEnv / {abort.raise} =
 
 pub fn env_lookup(env: TypeEnv, name: Bytes) -> Option<Scheme> = env.globals.get(name)
 
-/// The local the name at `binder` binds, with its depth.
 pub fn env_local(
   env: TypeEnv,
   binder: Int,
@@ -986,7 +897,6 @@ pub fn env_local(
       None -> acc,
     })
 
-/// The local each name in scope stands for, outermost scope first.
 pub fn env_locals(env: TypeEnv) -> List<InScope> / {abort.raise} = {
   let n = env.scopes.len();
   range(0, n).fold([], |acc: List<InScope>, i: Int| {
@@ -1009,7 +919,6 @@ fn scheme_free(subst: Subst, scheme: Scheme) -> FreeVariables / {abort.raise} = 
   }
 }
 
-/// Also closes every binding that reaches no free variable.
 pub fn env_free_vars(
   subst: Subst,
   env: TypeEnv,
@@ -1085,9 +994,6 @@ fn rename_atom(atom: Atom, tys: Map<Int, Type>) -> Atom / {abort.raise} =
     _ -> atom,
   }
 
-/// As `rename`, with a row in place of a row variable: the row's atoms join the ones written
-/// beside the variable, and its tail takes the variable's place. One pass, so what a variable gives
-/// way to may name that variable.
 fn substituted(t: Type, tys: Map<Int, Type>, rows: Map<Int, Row>) -> Type / {abort.raise} =
   match t {
     VariableType(v) -> match tys.get(v) { Some(x) -> x, None -> t },
@@ -1118,8 +1024,6 @@ fn substituted(t: Type, tys: Map<Int, Type>, rows: Map<Int, Row>) -> Type / {abo
     },
   }
 
-/// A declaration's type as one use of it holds it: the declaration's variables give way to the
-/// use's arguments, which ride in the order it binds them, types and labels, then rows.
 pub fn apply_arguments(
   ty: Type,
   ty_vars: List<Int>,
@@ -1139,8 +1043,6 @@ pub fn apply_arguments(
   substituted(ty, tys, rows)
 }
 
-/// `labels` are the fresh variables the scheme's label parameters became, in declaration order, and
-/// `rows` the fresh row variables its row variables became, in its order.
 pub type SchemeInstance = {
   fresh: Fresh,
   ty: Type,
@@ -1223,11 +1125,6 @@ pub fn generalize(
   }
 }
 
-// --- A table of types --------------------------------------------------------------------------
-// A type kept beside many others is kept as nodes, each part by the key of its node: a record type
-// every function of a module mentions is held once, and so is each type inside it.
-
-/// One node of a type: what it is, each part by the key of its node. A function's row is no part.
 pub type TypeNode =
   | NodeVariable(Int)
   | NodeNamed({ name: Bytes, args: List<Bytes> })
@@ -1241,7 +1138,6 @@ derive bin for NodeField
 
 derive bin for TypeNode
 
-/// Nodes by their keys.
 pub type TypeTable = Map<Bytes, TypeNode>
 
 derive bin for TypeTable
@@ -1264,7 +1160,6 @@ fn insert_fields(table: TypeTable, fs: List<Field>) -> InsertedFields / {abort.r
     { table: h.table, fields: acc.fields.push({ name: f.name, ty: h.key }) }
   })
 
-/// `ty` held in `table`: the key of its node, beside the table holding it and each part of it.
 pub fn insert_type(table: TypeTable, ty: Type) -> { table: TypeTable, key: Bytes } / {abort.raise} = {
   let made = match ty {
     VariableType(v) -> { table: table, node: NodeVariable(v) },
@@ -1297,7 +1192,6 @@ pub fn insert_type(table: TypeTable, ty: Type) -> { table: TypeTable, key: Bytes
   }
 }
 
-/// The parts of a node, by key.
 fn node_parts(node: TypeNode) -> List<Bytes> =
   match node {
     NodeVariable(_) -> [],
@@ -1307,12 +1201,9 @@ fn node_parts(node: TypeNode) -> List<Bytes> =
     NodeNominal(x) -> x.args.concat(x.fields.map(|f: NodeField| f.ty)),
   }
 
-/// The nodes of `table` the types `keys` name are made of.
 pub fn subtable(table: TypeTable, keys: List<Bytes>) -> TypeTable =
   keys.fold(Map::new(), |acc: TypeTable, k: Bytes| reached_nodes(table, k, acc, table.len()))
 
-/// `budget` is how many more nodes a path may pass: keys are digests of what they name, so no path
-/// meets a node twice.
 fn reached_nodes(table: TypeTable, key: Bytes, acc: TypeTable, budget: Int) -> TypeTable =
   if budget <= 0 || acc.contains(key) { acc } else {
     match table.get(key) {
@@ -1323,14 +1214,11 @@ fn reached_nodes(table: TypeTable, key: Bytes, acc: TypeTable, budget: Int) -> T
     }
   }
 
-/// Both tables as one.
 pub fn tables_joined(a: TypeTable, b: TypeTable) -> TypeTable =
   b.fold(a, |acc: TypeTable, k: Bytes, node: TypeNode| acc.insert(k, node))
 
 type ReadTypes = { tys: List<Type>, read: Map<Bytes, Type> }
 
-/// The type `key` names in `table`, beside every type read on the way by its key, so a part many
-/// types share is read once. A key the table does not hold is a variable no one numbered, `-1`.
 pub fn type_at(
   table: TypeTable,
   key: Bytes,
@@ -1410,12 +1298,6 @@ fn type_of_node(
     },
   }
 
-// --- Types held once ---------------------------------------------------------------------------
-// An answer that keeps a type for each of many definitions keeps each distinct type once: a record
-// most functions of a module take is written out in every one of their types otherwise.
-
-/// One type as a list of types held once holds it: what it is, each part by its place among those
-/// before it.
 pub type InternedType =
   | InternedVariable(Int)
   | InternedNamed({ name: Bytes, args: List<Int> })
@@ -1429,15 +1311,12 @@ derive bin for InternedField
 
 derive bin for InternedType
 
-/// Types held once so far: each node, its place by its encoding, and each nominal type's place by
-/// the digest of the whole of it.
 pub type TypeInterner = {
   held: List<InternedType>,
   places: Map<Bytes, Int>,
   whole: Map<Bytes, Int>,
 }
 
-/// No type held yet.
 pub fn empty_interner() -> TypeInterner = { held: [], places: Map::new(), whole: Map::new() }
 
 type InternedPositions = { h: TypeInterner, at: List<Int> }
@@ -1457,8 +1336,6 @@ fn intern_fields(
     { h: p.h, fields: acc.fields.push({ name: f.name, ty: p.at }) }
   })
 
-/// `ty`'s place in `h`, which holds it and each part of it it did not hold. A nominal type held
-/// already is found whole, so the fields written out at each mention of it are walked once.
 fn intern_type(h: TypeInterner, ty: Type) -> { h: TypeInterner, at: Int } / {abort.raise} =
   match ty {
     VariableType(v) -> intern_node(h, InternedVariable(v)),
@@ -1512,14 +1389,11 @@ fn intern_node(
   }
 }
 
-/// `tys` held in `h` beside what it held: where each stands in it. Types held together walk a part
-/// they share once between them.
 pub fn intern_more_types(
   h: TypeInterner,
   tys: List<Type>,
 ) -> { h: TypeInterner, at: List<Int> } / {abort.raise} = intern_parts(h, tys)
 
-/// `tys` held once: each distinct type and part of one, and where each of `tys` stands among them.
 pub fn intern_types(
   tys: List<Type>,
 ) -> { held: List<InternedType>, at: List<Int> } / {abort.raise} = {
@@ -1536,7 +1410,6 @@ fn interned_parts_of(node: InternedType) -> List<Int> =
     InternedNominal(x) -> x.fields.fold(x.args, |acc: List<Int>, f: InternedField| acc.push(f.ty)),
   }
 
-/// `node` with each part at the place `to` gives it.
 fn renumbered(node: InternedType, to: Map<Int, Int>) -> InternedType / {abort.raise} = {
   let part = |i: Int|
     match to.get(i) { Some(n) -> n, None -> panic("a type's part is laid out before it") };
@@ -1554,8 +1427,6 @@ fn renumbered(node: InternedType, to: Map<Int, Int>) -> InternedType / {abort.ra
 
 type Numbering = { numbered: Map<Int, Int>, out: List<InternedType> }
 
-/// `budget` is how many more nodes a path may pass: a part stands before what holds it, so no path
-/// meets a node twice.
 fn numbered_from(
   held: List<InternedType>,
   s: Numbering,
@@ -1572,9 +1443,6 @@ fn numbered_from(
     }
   }
 
-/// The part of `h` the types at `places` are made of, as a list of its own: laid out as
-/// [`intern_types`] lays those types out alone, so what keeps them writes the same bytes whichever
-/// way they were held.
 pub fn interned_subset(
   h: TypeInterner,
   places: List<Int>,
@@ -1588,7 +1456,6 @@ pub fn interned_subset(
   }
 }
 
-/// Each type `held` holds, in its place: a part two of them share is one value in both.
 pub fn types_of(held: List<InternedType>) -> List<Type> / {abort.raise} =
   held.fold([], |built: List<Type>, node: InternedType| {
     let part = |i: Int| built.get(i);
@@ -1605,16 +1472,10 @@ pub fn types_of(held: List<InternedType>) -> List<Type> / {abort.raise} =
     })
   })
 
-// --- One numbering per text ------------------------------------------------------------------
-// The checker numbers variables as it meets them, so two answers about one program may number
-// them apart. Renamed in the order their text names them, a scheme's head first, the two are one
-// value.
-
 type Naming = { tys: Map<Int, Int>, rows: Map<Int, Int> }
 
 fn no_naming() -> Naming = { tys: Map::new(), rows: Map::new() }
 
-/// A label variable is a type variable's id, so the two share one numbering.
 fn name_ty(naming: Naming, v: Int) -> Naming =
   if naming.tys.contains(v) { naming }
   else { { ..naming, tys: naming.tys.insert(v, naming.tys.len()) } }
@@ -1657,8 +1518,6 @@ pub fn canonical_atoms(atoms: List<Atom>) -> List<Atom> / {abort.raise} = {
 pub fn canonical_scheme(scheme: Scheme) -> Scheme / {abort.raise} =
   canonical_beside(scheme, []).scheme
 
-/// `scheme` named as [`canonical_scheme`] names it, beside `rows`, atoms read with it, renamed alike
-/// and each sorted: a label variable the scheme does not name is numbered after those it does.
 pub fn canonical_beside(
   scheme: Scheme,
   rows: List<List<Atom>>,
@@ -1682,9 +1541,6 @@ pub fn canonical_beside(
   }
 }
 
-// --- The printer --------------------------------------------------------------------------
-
-/// `taken` holds the concrete resource names the text names: a label variable may take none of them.
 pub type Printer = {
   ty_names: Map<Int, Bytes>,
   row_names: Map<Int, Bytes>,
@@ -1695,7 +1551,6 @@ pub type Printer = {
 pub fn printer_new() -> Printer =
   { ty_names: Map::new(), row_names: Map::new(), label_names: Map::new(), taken: Map::new() }
 
-/// A variable printed under the name a signature wrote for it, rather than the next free letter.
 pub fn printer_naming(printer: Printer, v: Int, name: Bytes) -> Printer =
   { ..printer, ty_names: printer.ty_names.insert(v, name) }
 
@@ -1709,7 +1564,6 @@ fn letter_name(letters: Bytes, i: Int) -> Bytes / {abort.raise} = {
   if i < n { letter } else { letter.concat(Bytes::of_string(Int::to_string(i / n))) }
 }
 
-/// The name the `i`th type variable a fresh printer meets is printed under.
 pub fn ty_letter(i: Int) -> Bytes / {abort.raise} = letter_name(ty_letters(), i)
 
 fn ty_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } / {abort.raise} =
@@ -1739,9 +1593,6 @@ fn label_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } / {
     },
   }
 
-/// The first label letter, then round, that no resource in this text and no other label holds, so
-/// `[l]` in a printed row or footprint means one thing. Each try is a distinct name, so one more try
-/// than there are names held finds a free one.
 fn free_label(printer: Printer) -> Bytes / {abort.raise} =
   iterate(0, printer.taken.len() + printer.label_names.len() + 1, |i: Int| {
     let name = letter_name(label_letters(), i);
@@ -1752,14 +1603,12 @@ fn free_label(printer: Printer) -> Bytes / {abort.raise} =
 fn label_in_use(names: Map<Int, Bytes>, name: Bytes) -> Bool =
   names.fold(false, |acc: Bool, v: Int, held: Bytes| acc || held == name)
 
-/// Every concrete resource a text names, gathered before a label variable in it is given a name.
 fn reserve_resource(printer: Printer, resource: Resource) -> Printer =
   match resource {
     NamedResource(n) -> { ..printer, taken: printer.taken.insert(n, true) },
     _ -> printer,
   }
 
-/// What a caller that lays a row out itself must hand the printer before it names anything.
 pub fn reserve_atoms(printer: Printer, atoms: List<Atom>) -> Printer =
   atoms.fold(printer, |acc: Printer, atom: Atom| reserve_resource(acc, atom.resource))
 
@@ -1782,11 +1631,8 @@ fn reserve_ty(printer: Printer, t: Type) -> Printer / {abort.raise} =
     NominalType(n) -> n.args.fold(printer, |acc: Printer, a: Type| reserve_ty(acc, a)),
   }
 
-/// What parts a region's written name from the definition that opens it, in the label its hold and
-/// atoms carry. No name holds it, so no source writes such a label.
 pub fn region_mark() -> Bytes = b"@"
 
-/// A label as a source writes it: a region's without the definition that opens it.
 pub fn written_label(label: Bytes) -> Bytes / {abort.raise} =
   match label.index_of(region_mark()) { Some(i) -> label.slice(0, i), None -> label }
 
@@ -1825,13 +1671,9 @@ fn type_with_written_labels(ty: Type, closed: (Bytes) -> Bool) -> Type / {abort.
       }),
   }
 
-/// `row` as it stands outside the definition that performs it: an atom a region did not answer
-/// names the region as it was written, which is what a signature can write.
 pub fn row_outside_definition(row: Row) -> Row / {abort.raise} =
   row_with_written_labels(row, |_: Bytes| true)
 
-/// `ty` as it stands past the close of the region whose label is `label`: what still names that
-/// region names it as it was written, and a region still open keeps its own label.
 pub fn type_after_region(ty: Type, label: Bytes) -> Type / {abort.raise} =
   type_with_written_labels(ty, |l: Bytes| l == label)
 
@@ -1867,7 +1709,6 @@ pub fn print_atom(
     }
   }
 
-/// A fresh printer, so a lone atom names its label from the start of the alphabet.
 pub fn atom_text(atom: Atom) -> Bytes / {abort.raise} = print_atom(printer_new(), atom).text
 
 pub fn resource_text(resource: Resource) -> Bytes / {abort.raise} =
@@ -1876,7 +1717,6 @@ pub fn resource_text(resource: Resource) -> Bytes / {abort.raise} =
 pub fn print_ty(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {abort.raise} =
   printed(reserve_ty(printer, ty), ty)
 
-/// A label argument: the resource it names, or the name its variable prints under.
 fn label_text(printer: Printer, label: Type) -> { printer: Printer, text: Bytes } / {abort.raise} =
   match label_of(label) {
     Some(n) -> { printer: printer, text: written_label(n) },
@@ -1889,7 +1729,6 @@ fn label_text(printer: Printer, label: Type) -> { printer: Printer, text: Bytes 
     },
   }
 
-/// Its resources already reserved, all of them at once, so no part of the type walks them again.
 fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {abort.raise} =
   match ty {
     VariableType(v) -> {
@@ -1974,7 +1813,6 @@ fn print_applied(
     }
   }
 
-/// A declared type with the labels and rows it is given, each kind where a use writes it.
 fn print_with_labels_and_rows(
   printer: Printer,
   name: Bytes,
@@ -2018,8 +1856,6 @@ fn print_tys(
     },
   )
 
-/// One printer for the whole list, so two label variables in it are told apart. Each atom on its
-/// own, for a caller that places them itself.
 pub fn print_atom_list(
   printer: Printer,
   atoms: List<Atom>,
@@ -2043,8 +1879,6 @@ pub fn print_atoms(
   { printer: out.printer, text: Bytes::join(out.texts, sep) }
 }
 
-/// The labels the atoms name are bound in a head, as a scheme's head binds its own: without them a
-/// label a caller fills reads back as a resource of that name.
 pub fn atoms_text(atoms: List<Atom>, sep: Bytes) -> Bytes / {abort.raise} = {
   let out = print_atoms(printer_new(), atoms, sep);
   let vars = atoms.fold([], |acc: List<Int>, atom: Atom|
@@ -2063,8 +1897,6 @@ pub fn atoms_text(atoms: List<Atom>, sep: Bytes) -> Bytes / {abort.raise} = {
     Bytes::concat_all([b"<", Bytes::join(head.texts, sep), b">", out.text])
   }
 }
-
-// --- Reading atoms back -------------------------------------------------------------------
 
 pub fn last_dot(b: Bytes) -> Int =
   range(0, b.len()).fold(0 - 1, |acc: Int, i: Int| if b.at(i) == 46 { i } else { acc })
@@ -2090,33 +1922,22 @@ fn read_atom(text: Bytes) -> Option<Atom> / {abort.raise} =
             Some({ effect: eff, resource: s.resource, mode: ReadMode, op: None })
           } else if access == b"write" {
             Some({ effect: eff, resource: s.resource, mode: WriteMode, op: None })
-          }
-          // An operation's mode is its declaration's, which this text does not carry; the caller settles it.
-          else { Some({ effect: eff, resource: s.resource, mode: WriteMode, op: Some(access) }) }
+          } else { Some({ effect: eff, resource: s.resource, mode: WriteMode, op: Some(access) }) }
         }
       },
     }
   }
 
-/// The inverse of `atoms_text(_, b",")`. A text that binds label variables names them from the start
-/// of the alphabet, so nothing in it says which parameter each one was: that text reads as nothing.
 pub fn read_atoms(text: Bytes) -> Option<List<Atom>> / {abort.raise} =
   if text.len() == 0 { Some([]) }
   else if text.at(0) == 60 { None }
   else { Option::traverse(text.split(b","), read_atom) }
 
-/// How a filed row names the label parameter at `i`; no resource can be spelled so.
 fn label_position_name(i: Int) -> Bytes = b"#".concat(ascii_of_int(i))
 
-/// `atoms` as a definition's rows are filed: each label variable named by its place among `labels`,
-/// the definition's label parameters in the order it writes them, so the text reads back for any
-/// later check of it (`atoms_with_label_variables`). A variable that is no parameter leaves the text one that
-/// reads as nothing.
 pub fn positional_atoms_text(atoms: List<Atom>, labels: List<Int>) -> Bytes / {abort.raise} =
   atoms_text(positional_atoms(atoms, labels), b",")
 
-/// `atoms` with each label variable named by its place among `labels`, as [`positional_atoms_text`]
-/// writes them and [`atoms_with_label_variables`] reads them back.
 pub fn positional_atoms(atoms: List<Atom>, labels: List<Int>) -> List<Atom> =
   atoms.map(|atom: Atom|
     match atom.resource {
@@ -2127,9 +1948,6 @@ pub fn positional_atoms(atoms: List<Atom>, labels: List<Int>) -> List<Atom> =
       _ -> atom,
     })
 
-/// Filed atoms with each label parameter named by its place as the variable at that place of
-/// `labels`, the definition's label parameters as a check of it binds them now. None where a place
-/// is past them.
 pub fn atoms_with_label_variables(
   atoms: List<Atom>,
   labels: List<Int>,
@@ -2162,8 +1980,6 @@ pub fn print_scheme(
   printer: Printer,
   scheme: Scheme,
 ) -> { printer: Printer, text: Bytes } / {abort.raise} = {
-  // Named in the order a call fills them, against every resource the body names, so the head and
-  // the body read the same there.
   let p = reserve_ty(printer, scheme.ty);
   let body = printed(
     scheme.label_vars.fold(p, |acc: Printer, v: Int| label_name(acc, v).printer),
@@ -2210,13 +2026,10 @@ pub fn print_scheme(
   }
 }
 
-/// A fresh printer per scheme, so each one names its variables from the start of the alphabet.
 pub fn scheme_text(scheme: Scheme) -> Bytes / {abort.raise} =
   print_scheme(printer_new(), scheme).text
 pub fn type_text(ty: Type) -> Bytes / {abort.raise} = print_ty(printer_new(), ty).text
 pub fn row_text(row: Row) -> Bytes / {abort.raise} = print_row(printer_new(), row).text
-
-// --- Tests ------------------------------------------------------------------
 
 test "unification binds a variable once and refuses the occurs case" {
   let f0 = fresh_new();
@@ -2312,7 +2125,6 @@ test "atoms read back as the atoms they were printed from" {
   assert_eq(read_atoms(atoms_text([rd], b",")), Some([rd]));
   assert_eq(read_atoms(atoms_text([rd, wr], b",")), Some([rd, wr]));
   assert_eq(read_atoms(atoms_text([send], b",")), Some([send]));
-  // A label variable's name is the printer's, not the parameter's, so a text that binds one is refused.
   assert_eq(
     read_atoms(
       atoms_text(
@@ -2346,7 +2158,6 @@ test "a filed row names a label parameter by its place, read back as that parame
       assert_eq(atoms_with_label_variables(atoms, [12]), None)
     },
   };
-  // A variable that is no parameter cannot be named, so its row is not filed readably.
   assert_eq(read_atoms(positional_atoms_text([send(ResourceVariable(9))], [4])), None)
 }
 
@@ -2404,10 +2215,8 @@ test "two schemes alike but for how their variables are numbered are one scheme 
       tail: Some(0),
     }),
   });
-  // Renaming is invisible to the printer.
   assert_eq(scheme_text(canonical_scheme(one)), scheme_text(one));
   assert_eq(canonical_type(list_type(VariableType(8))), list_type(VariableType(0)));
-  // A footprint's labels are numbered as its sorted atoms name them, and stay sorted.
   let recv = { ..send(30), op: Some(b"recv") };
   assert_eq(canonical_atoms([send(12), recv]), [send(0), { ..send(1), op: Some(b"recv") }])
 }
@@ -2427,7 +2236,6 @@ test "a label variable sorts between a name and the singleton, and resolves to w
     row_text(row_closed([single, var_, named])),
     b"{net.send[conn], net.send[l], net.send}",
   );
-  // Bound to the label `conn`, the variable atom is the named one and the row holds it once.
   let s = {
     ty: Map::new().insert(4, label_type(b"conn")),
     row: Map::new(),
@@ -2438,7 +2246,6 @@ test "a label variable sorts between a name and the singleton, and resolves to w
   assert_eq(row_text(resolve_row(s, row_closed([var_, named]))), b"{net.send[conn]}")
 }
 
-// Without the head, a reader has nothing to tell `[l]` the parameter from `[l]` the resource by.
 test "a footprint's text binds the labels its atoms name" {
   let named = {
     effect: b"net",
@@ -2462,14 +2269,11 @@ test "a footprint's text binds the labels its atoms name" {
   assert_eq(atoms_text([named, second], b","), b"<[l]>net.send[conn],net.send[l]")
 }
 
-// The shape `crates/ply-core-tests` pins for the Rust printer: the two must answer it alike, or a
-// text one of them wrote reads back as something else in the other.
 test "a label variable steps past a resource of its name" {
   let named = { effect: b"net", resource: NamedResource(b"l"), mode: WriteMode, op: Some(b"send") };
   let var_ = { effect: b"net", resource: ResourceVariable(4), mode: WriteMode, op: Some(b"recv") };
   assert_eq(atoms_text([named, var_], b","), b"<[m]>net.send[l],net.recv[m]");
   assert_eq(row_text(row_closed([named, var_])), b"{net.send[l], net.recv[m]}");
-  // One operation under a resource and under the variable: two atoms, and two names.
   let same_op = {
     effect: b"net",
     resource: ResourceVariable(4),
@@ -2485,10 +2289,8 @@ test "a label variable steps past a resource of its name" {
     ty: fn_type([], unit_type(), row_closed([named, var_])),
   };
   assert_eq(scheme_text(sc), b"<[m]>() -> Unit / {net.send[l], net.recv[m]}");
-  // A second name in the way takes the next letter again.
   let held = { effect: b"net", resource: NamedResource(b"m"), mode: WriteMode, op: Some(b"close") };
   assert_eq(atoms_text([named, held, var_], b","), b"<[n]>net.send[l],net.close[m],net.recv[n]");
-  // Every letter held, so the variable takes the round.
   let last = {
     effect: b"net",
     resource: NamedResource(b"n"),
@@ -2513,7 +2315,6 @@ test "a free label variable takes the resource the other row names for its opera
   let u = unify_row(subst_new(), v.fresh, generic, concrete);
   assert(match u.error { None -> true, Some(_) -> false });
   assert_eq(row_text(resolve_row(u.subst, generic)), b"{net.send[conn]}");
-  // A rigid one is the definition's own label and unifies with nothing else.
   let bad = unify_row(mark_rigid_ty(subst_new(), v.var), v.fresh, generic, concrete);
   assert(match bad.error { Some(RowMismatch(_)) -> true, _ -> false })
 }
@@ -2528,7 +2329,6 @@ test "a scheme prints its label parameters bracketed, among the type parameters"
     ty: fn_type([VariableType(1)], unit_type(), { atoms: [atom], tail: Some(2) }),
   };
   assert_eq(scheme_text(sc), b"<a, [l] | e>(a) -> Unit / {net.send[l] | e}");
-  // Renaming the label variable leaves the printed scheme alone.
   let other = {
     ty_vars: [1],
     row_vars: [2],
@@ -2582,7 +2382,6 @@ test "a declared type's labels and rows print in their places, unify as argument
   let u = unify(subst_new(), fresh, open, conn);
   assert(u.error == None);
   assert_eq(type_text(resolve_type(u.subst, open)), type_text(conn));
-  // A sum holds what it is given exactly: a narrower row is another type, and so is another label.
   let narrower = unify(subst_new(), fresh, conn, held(label_type(b"conn"), row_empty()));
   assert(match narrower.error { Some(RowMismatch(_)) -> true, _ -> false });
   let elsewhere = unify(subst_new(), fresh, conn, held(label_type(b"peer"), row_open(2)));
@@ -2590,8 +2389,6 @@ test "a declared type's labels and rows print in their places, unify as argument
     Some(Mismatch(m)) -> type_text(m.expected) == b"[conn]" && type_text(m.found) == b"[peer]",
     _ -> false,
   });
-  // A field written over the declaration's variables, as one use holds it. An argument may name a
-  // variable it replaces.
   let field = fn_type([VariableType(0)], open, {
     atoms: [send(ResourceVariable(1))],
     tail: Some(2),
@@ -2622,7 +2419,6 @@ test "a `new` record's labels and rows print, unify and fill its fields as a sum
   let open = held(VariableType(1), { atoms: [send(ResourceVariable(1))], tail: Some(2) });
   let conn = held(label_type(b"conn"), row_singleton(send(NamedResource(b"conn"))));
   assert_eq(type_text(open), b"m.Feed<Int, [l] | {net.send[l] | e}>");
-  // The declaration at one use's arguments: its fields are written over what it was given.
   let used = apply_arguments(
     held(VariableType(1), row_open(2)),
     [1],
@@ -2635,7 +2431,6 @@ test "a `new` record's labels and rows print, unify and fill its fields as a sum
   ]);
   let fresh = { next_ty: 3, next_row: 3 };
   assert(unify(subst_new(), fresh, used, conn).error == None);
-  // What it is given is exact: a narrower row is another type, and so is another label.
   let narrower = unify(subst_new(), fresh, conn, held(label_type(b"conn"), row_empty()));
   assert(match narrower.error { Some(RowMismatch(_)) -> true, _ -> false });
   let elsewhere = unify(subst_new(), fresh, conn, held(label_type(b"peer"), row_open(2)));
@@ -2666,8 +2461,6 @@ test "types held once read back as they were, each part they share held once" {
   let h = intern_types(tys);
   let back = types_of(h.held);
   assert_eq(h.at.map(|i: Int| back.get(i)), tys);
-  // `Int`, the span, the list of it, the function, `Bytes`, the record, the variable, the point,
-  // the list of it, and the point written with no field.
   assert_eq(h.held.len(), 10)
 }
 
@@ -2683,12 +2476,9 @@ test "a type table reads back each type held in it, and holds a type met again o
     },
   );
   assert_eq(held.keys.map(|k: Bytes| type_at(held.table, k, Map::new()).ty), tys);
-  // A key is a digest of the type, so a table filled afresh gives the same one.
   let again = insert_type(held.table, point);
   assert_eq(again.key, insert_type(Map::new(), point).key);
   assert_eq(again.table, held.table);
-  // A node held under no other's key: the variable, `Int`, the span, the point, its list, the
-  // function.
   assert_eq(held.table.len(), 6)
 }
 
@@ -2699,14 +2489,10 @@ test "a part of what many types hold together is those types held alone" {
   let second = [fn_type([span, point], int_type(), row_empty()), point, list_type(point)];
   let a = intern_more_types(empty_interner(), first);
   let b = intern_more_types(a.h, second);
-  // The second met the point's parts in the first's order, and is laid out in its own.
   assert_eq(interned_subset(b.h, b.at), intern_types(second));
   assert_eq(interned_subset(b.h, a.at), intern_types(first))
 }
 
-/// `ty` as `specialised` spells it: `_`, a type's name and arguments, a record's fields, a `new`
-/// record's name and arguments then its fields, a variable of the spelling body as `'0`, and a
-/// position left unknown as `?`. A function's type is a word's.
 pub fn encode_type(ty: Type) -> Bytes =
   match ty {
     VariableType(v) -> if v < 0 { b"?" } else { b"'".concat(ascii_of_int(v)) },
@@ -2726,8 +2512,6 @@ fn encode_named_type(name: Bytes, args: List<Type>) -> Bytes = {
   else { Bytes::concat_all([n, b"<", Bytes::join(args.map(encode_type), b","), b">"]) }
 }
 
-/// A byte a type's name is spelled with as it is: a name holding any other, a label's, is spelled
-/// between quotes.
 fn type_name_byte(c: Int) -> Bool = is_ident_continue(c) || c == 46
 
 fn encode_fields(fs: List<Field>) -> Bytes =
@@ -2737,15 +2521,12 @@ fn encode_fields(fs: List<Field>) -> Bytes =
     b"}",
   ])
 
-/// The one type `s` spells, as `encode_type` spells it.
 pub fn decode_type(s: Bytes) -> Option<Type> / {abort.raise} =
   match read_type(s, 0, 2 * s.len() + 2) {
     Some(r) -> if r.at == s.len() { Some(r.ty) } else { None },
     None -> None,
   }
 
-/// The type spelled at `at`, and where its spelling ends; `budget` is how many more reads a spelling
-/// of `s`'s length can nest.
 fn read_type(s: Bytes, at: Int, budget: Int) -> Option<{ ty: Type, at: Int }> / {abort.raise} =
   if budget <= 0 || at >= s.len() { None }
   else if s.at(at) == 63 { Some({ ty: VariableType(0 - 1), at: at + 1 }) } else if s.at(at) == 39 {
@@ -2767,7 +2548,6 @@ fn read_type(s: Bytes, at: Int, budget: Int) -> Option<{ ty: Type, at: Int }> / 
       match if end < s.len() && s.at(end) == 60 { read_args(s, end + 1, [], budget - 1) }
         else { Some({ args: [], at: end }) } {
         None -> None,
-        // A `new` record's fields follow its name and arguments.
         Some(r) -> if r.at < s.len() && s.at(r.at) == 123 {
           match read_fields(s, r.at + 1, [], budget - 1) {
             Some(f) ->
@@ -2779,11 +2559,9 @@ fn read_type(s: Bytes, at: Int, budget: Int) -> Option<{ ty: Type, at: Int }> / 
     }
   }
 
-/// Where the type's name that starts at `at` ends: a program-wide name holds its modules' dots.
 fn type_name_end(s: Bytes, at: Int) -> Int / {abort.raise} =
   if at < s.len() && type_name_byte(s.at(at)) { type_name_end(s, at + 1) } else { at }
 
-/// The arguments spelled from `at` to the `>` that closes them, and where it ends.
 fn read_args(
   s: Bytes,
   at: Int,
@@ -2800,7 +2578,6 @@ fn read_args(
     }
   }
 
-/// The fields spelled from `at` to the `}` that closes them, and where it ends.
 fn read_fields(
   s: Bytes,
   at: Int,
@@ -2825,14 +2602,11 @@ fn read_fields(
     }
   }
 
-/// Where the decimal digits that start at `at` end.
 fn digits_end(s: Bytes, at: Int) -> Int / {abort.raise} =
   if at < s.len() && s.at(at) >= 48 && s.at(at) <= 57 { digits_end(s, at + 1) } else { at }
 
-/// Where the name that starts at `at` ends.
 fn name_end(s: Bytes, at: Int) -> Int / {abort.raise} =
   if at < s.len() && is_ident_continue(s.at(at)) { name_end(s, at + 1) } else { at }
 
-/// The number decimal digits `b` spell.
 pub fn digits(b: Bytes) -> Int =
   range(0, b.len()).fold(0, |acc: Int, i: Int| acc * 10 + b.at(i) - 48)

@@ -1,17 +1,3 @@
-//! `ply.lock` — the closure a build resolved: each package by what it is (its name, its version and
-//! the BLAKE3 digest of the modules it contributed) and never by where it was found, so moving a
-//! dependency keeps its pin and editing one breaks it.
-//!
-//! A path dependency inside the checkout the project is in carries no digest, as Cargo's lock
-//! records one: the commit that holds the project holds its sources too, so an edit to it leaves
-//! the dependent's lock as it was, and two changes to it never meet in a lock. `committed_packages` says
-//! which those are. A dependency fetched from git or a registry, or a path one outside the
-//! checkout, keeps its digest, which is all that pins its sources.
-//!
-//! The digest is the front end's: `pins_of` in `compiler.front.pkg` reads it off the package judgments
-//! that decide what a package *is*, so there is one answer to "what did this build use" and the
-//! lockfile only records it. This module reads, checks and writes that record.
-
 import diagnostic (SourceText)
 import std.env (env)
 import paths
@@ -26,11 +12,8 @@ import std.path (join)
 import std.list
 import compiler.syntax.parsing (no_module, dummy_span)
 
-/// One package as the front end pins it, as text, because the file is JSON.
 pub type Pin = { name: String, version: String, digest: String }
 
-/// The front end's answer carries bytes, so the boundary converts once, here, rather than at every
-/// caller.
 pub fn from_front(ps: List<pkg::LockedPackage>) -> List<Pin> =
   ps.map(|pin: pkg::LockedPackage|
     {
@@ -39,14 +22,8 @@ pub fn from_front(ps: List<pkg::LockedPackage>) -> List<Pin> =
       digest: String::of_bytes_lossy(pin.digest),
     })
 
-/// One package as the file records it: its name and version; the digest of its sources, `None` for
-/// a path dependency the checkout holds; and, for a registry package, the digest of the archive it
-/// was fetched as, which the next fetch of that version must match.
 pub type Entry = { name: String, version: String, digest: Option<String>, archive: Option<String> }
 
-/// A registry package's archive, as `ply resolve` fetched and checked it.
-/// `interface`: the registry published an interface for it under these semantics; `attestation`:
-/// what the registry's attester signed of it, as served.
 pub type FetchedArchive = {
   name: String,
   version: String,
@@ -57,8 +34,6 @@ pub type FetchedArchive = {
 
 pub type Lock = { version: Int, packages: List<Entry> }
 
-/// A field is written only when the entry holds it: a path package the checkout holds is its name
-/// and version, and only a registry package has an archive.
 fn entry_json() -> JsonCodec<Entry> =
   {
     encode: |e: Entry| {
@@ -105,13 +80,9 @@ fn lock_json() -> JsonCodec<Lock> =
       },
   }
 
-/// The format this file writes. A lock from another version is refused rather than half-read.
 pub fn format() -> Int = 2
 
-/// Beside the package's `ply.pkg`, whichever file in its directory the path named.
 pub fn path_of(resolved: ResolvedPath) -> RootedPath = in_root(resolved, "ply.lock")
-
-// --- Reading -------------------------------------------------------------------
 
 fn parse_lock(text: String) -> Result<Lock, String> / {abort.raise} =
   match parse(Bytes::of_string(text)) {
@@ -122,8 +93,6 @@ fn parse_lock(text: String) -> Result<Lock, String> / {abort.raise} =
     },
   }
 
-/// The lock at the root, or `None` when the project has none. `Err` is a lock that cannot be read:
-/// a file the run must not ignore, since what it pins is what it would otherwise trust.
 pub fn read(
   resolved: ResolvedPath,
 ) -> Result<Option<Lock>, String> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
@@ -140,18 +109,10 @@ pub fn read(
     },
   }
 
-/// What the lock says about one package, when it says anything.
 pub fn entry_of(lock: Lock, name: String) -> Option<Entry> =
   lock.packages.fold(None, |found: Option<Entry>, entry: Entry|
     match found { Some(_) -> found, None -> if entry.name == name { Some(entry) } else { None } })
 
-// --- What the checkout pins -------------------------------------------------------
-
-/// The closure's path dependencies that the checkout holding the project holds too, by name: a
-/// commit of the checkout pins their sources, so the lock records them without a digest. One is a
-/// path dependency whose directory `in_checkout` places in the checkout `checkout_of` finds at the
-/// project's root. A project in no checkout has none, and a dependency fetched from git or a
-/// registry is never one, wherever its tree is kept.
 pub fn committed_packages(pkgs: pkg::PackageSources) -> List<String> / {fs.kind[abs], abort.raise} =
   match checkout_of(String::of_bytes_lossy(pkgs.root)) {
     None -> [],
@@ -168,15 +129,9 @@ pub fn committed_packages(pkgs: pkg::PackageSources) -> List<String> / {fs.kind[
         }),
   }
 
-/// A key the walk fetched a tree for rather than reading the directory it names: a git key, or a
-/// registry slot in the project's cache.
 fn fetched(root: Bytes, key: Bytes) -> Bool / {abort.raise} =
   key.starts_with(b"git+") || key.starts_with(pkg::registry_dir(root).concat(b"/"))
 
-// --- The judgment ----------------------------------------------------------------
-
-/// What is wrong with the lock, as a diagnostic over the project's root: a pinned package the run
-/// found different bytes for, or a lock nothing can read.
 pub fn unreadable_lock(resolved: ResolvedPath, why: String) -> Diag =
   error_at(
     b"E0139",
@@ -206,9 +161,6 @@ pub fn mismatch(resolved: ResolvedPath, version: String, digest: String, found: 
     ],
   )
 
-/// Verifies a build's closure against the lock: every package the lock pins a digest for must be
-/// the one this run found, unless the checkout holds it now (`committed_packages`). A package the lock does
-/// not mention is not an error — a write records it.
 pub fn verify(
   resolved: ResolvedPath,
   lock: Lock,
@@ -222,7 +174,6 @@ pub fn verify(
         match entry_of(lock, found.name) {
           None -> Ok(()),
           Some(pinned) -> match pinned.digest {
-            // Recorded as the checkout's and outside it now: nothing pinned these sources.
             None -> Ok(()),
             Some(digest) -> if digest == found.digest { Ok(()) }
             else { Err(mismatch(resolved, pinned.version, digest, found)) },
@@ -231,13 +182,6 @@ pub fn verify(
       },
     })
 
-// --- Writing -----------------------------------------------------------------------
-
-/// The lock a run's closure pins, with every package the closure holds and no stale entries: what
-/// `ply build` writes, so a lock can only ever describe a build that happened. A package
-/// `committed_packages` names is recorded without a digest. Any other the lock already records under the
-/// same digest keeps its entry, archive and all; one `archives` names is recorded with the archive
-/// `ply resolve` fetched it as.
 pub fn updated_lock(
   lock: Option<Lock>,
   pins: List<Pin>,
@@ -249,7 +193,6 @@ pub fn updated_lock(
     packages: sorted(pins.map(|pin: Pin| entry_for(lock, archives, committed_packages, pin))),
   }
 
-/// `updated_lock`, as the file holds it.
 pub fn text(
   lock: Option<Lock>,
   pins: List<Pin>,
@@ -287,8 +230,6 @@ fn entry_for(
 fn new_entry(pin: Pin) -> Entry =
   { name: pin.name, version: pin.version, digest: Some(pin.digest), archive: None }
 
-/// By name, so two runs that pinned the same closure write the same file and a diff is a change in
-/// the closure rather than in a walk order.
 fn sorted(entries: List<Entry>) -> List<Entry> / {abort.raise} =
   entries.fold([], |acc: List<Entry>, entry: Entry| {
     let n = acc.len();
@@ -305,8 +246,6 @@ fn insert_at(entries: List<Entry>, i: Int, p: Entry) -> List<Entry> / {abort.rai
   after.fold(before.push(p), |acc: List<Entry>, x: Entry| acc.push(x))
 }
 
-// --- Tests ------------------------------------------------------------------
-
 pub fn a_pin(name: String, version: String, digest: String) -> Pin =
   { name: name, version: version, digest: digest }
 
@@ -317,7 +256,6 @@ test "a lock is written sorted by name, so a walk order cannot change it" {
   let pins = [a_pin("zebra", "1.0.0", "b3:z"), a_pin("alpha", "0.2.0", "b3:a")];
   let text = text(None, pins, [], []);
   assert(text.contains("\"name\":\"alpha\""));
-  // `String::find` raises when the needle is absent, which is itself the failure this test means.
   assert(text.find("\"alpha\"") < text.find("\"zebra\""))
 }
 
@@ -368,7 +306,6 @@ test "an edit to a package the checkout holds leaves the lock as it was, byte fo
         Ok(_) -> (),
         Err(_) -> panic("an edit to a package the checkout holds was refused"),
       };
-      // Outside the checkout the same edit is refused: only its digest pinned it there.
       let pinned = text(None, [a_pin("prove", "0.1.0", "b3:old")], [], []);
       match parse_lock(pinned) {
         Err(why) -> panic(why),
@@ -392,7 +329,6 @@ test "a pinned package whose sources moved is refused, and one the lock does not
     Ok(_) -> (),
     Err(_) -> panic("the same dependency was refused"),
   };
-  // A package the lock does not mention is recorded, not refused.
   match verify(r, lock, [a_pin("other", "0.1.0", "b3:x")], []) {
     Ok(_) -> (),
     Err(_) -> panic("an unpinned package was refused"),
@@ -478,7 +414,6 @@ test "writing a lock keeps what the closure still holds and drops what it left" 
 
 test "an archive is kept only for the sources it was fetched as" {
   let before: Lock = { version: 2, packages: [an_entry("orders", "0.2.0", "b3:o", Some("b3:77"))] };
-  // The sources moved or the version did: the old archive no longer describes what is pinned.
   let moved = text(Some(before), [a_pin("orders", "0.2.0", "b3:other")], [], []);
   assert(!moved.contains("b3:77"));
   let raised = text(
@@ -497,8 +432,6 @@ fn a_manifest(name: String) -> Bytes =
       ++ "\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 16, patch: 0}, dependencies: [], entry: None}",
   )
 
-/// What `committed_packages` makes of a project at `root` over `checkouts`, whose dependencies are at
-/// `keys`, each a package named for its key's last segment.
 fn committed_at(root: String, keys: List<String>) -> List<String> / {abort.raise} =
   handle {
     committed_packages({
@@ -527,13 +460,10 @@ test "a checkout holds the path dependencies below it, not a fetched one, a link
       "/repo/nested/b",
       "/repo/sub/c",
       "/repo/link",
-      // A registry slot, inside the checkout's directory and still fetched.
       "/repo/app/.ply-cache/registry/r",
     ]),
     ["a", "repo"],
   );
-  // A project in no checkout pins every dependency by its digest.
   assert_eq(committed_at("/other/e", ["/repo/libs/a"]), []);
-  // A linked worktree is a checkout like any other.
   assert_eq(committed_at("/wt", ["/wt/lib", "/repo/libs/a"]), ["lib"])
 }

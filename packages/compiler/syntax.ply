@@ -1,39 +1,3 @@
-//! Ply source as values: a module parsed into a tree, read through accessors, and printed as
-//! `ply fmt` prints it.
-//!
-//! `parse` reads one module's source and answers its tree with the diagnostics the parser made,
-//! each a value: a code, a message, labels with a line, a column and byte offsets, and notes. The
-//! parser is the compiler's own, so it reads what `ply check` reads and recovers as it does: an
-//! item that does not parse is reported once and left out, and the items around it are read, so a
-//! tree answered beside diagnostics holds the rest of the module. Nothing inside a broken item is
-//! kept, and a source that is not UTF-8 is read up to where it stops being.
-//!
-//! A tree is made of nodes, and a `Node` is opaque: what it holds is the compiler's, which changes
-//! with the language. A node is read by `kind`, `span`, `text`, `name`, `children` and the few
-//! accessors beside them, which keep their meaning. `Kind` is the vocabulary, and it grows: a
-//! release that adds syntax adds a kind and moves `version`, so a `match` over kinds ends in a
-//! wildcard arm. A kind is never renamed or given another meaning without `version` moving.
-//!
-//! The tree is what was written. An interpolated string, a map or set literal, a tuple and an
-//! operator are each one node of their own kind though the compiler reads them as calls, and the
-//! names the parser writes for itself are no node. Comments are not nodes: `comments` answers the
-//! ones inside a node's span, a doc comment is its item's `doc`, and `format` and `apply_edits` keep
-//! every one.
-//!
-//! `format` is the formatter `ply fmt` runs. It keeps every comment, the spelling of every literal
-//! and the order of everything, and its answer parses to the same tree (`shape`) and formats to
-//! itself.
-//!
-//! Code is made as text and checked as syntax. `expression`, `pattern`, `type_expression`, `item`
-//! and `identifier` each read one fragment whole or refuse it, and a `syntax"…"` literal is a
-//! module's items checked where it is written, each hole a node: an expression, a pattern, a type
-//! or a name, by where the hole stands. A node in a hole is written as one node, in parentheses
-//! unless it is a name, so nothing it holds is read as part of the text around it. `apply_edits` makes
-//! replacements in a source by span and keeps every other byte.
-//!
-//! `compiler.checker` answers what these sources mean: diagnostics from the whole front end, and
-//! each definition's type, row, hash and references.
-
 import compiler.syntax.exprs
 import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, BinaryExpression,
                               UnaryExpression, LambdaExpression, CallExpression, IfExpression,
@@ -73,31 +37,16 @@ import std.gen (Gen)
 import std.list
 import std.location (Location, location_at)
 
-// --- Diagnostics ------------------------------------------------------------
-
-/// A stretch of a source, in bytes: from `start` up to `end`.
 pub type Span = { start: Int, end: Int }
 
-/// One place a diagnostic points at, and what it says of it.
-///
-/// `path` names the source: `""` for the one source `parse` was given, and for a diagnostic of
-/// `compiler.checker` the path its source was given under, or nothing where it is about no source.
-/// `place` is where `span` starts.
 pub type Label = new { path: String, span: Span, place: Location, primary: Bool, text: String }
 
-/// One replacement in the source at `path`: `text` in place of `span`. An empty span inserts and
-/// an empty text deletes.
 pub type Edit = new { path: String, span: Span, text: Bytes }
 
-/// A change that applies as it is and leaves a program the diagnostic no longer holds for.
 pub type Fix = new { title: String, edits: List<Edit> }
 
-/// Whether a diagnostic refuses the program or only remarks on it.
 pub type Severity = | Error | Warning
 
-/// What the front end says of a source: a code `ply explain` reads (`E0001`), a sentence, the
-/// places it is about with the primary one among them, the notes under it, and the fixes it
-/// offers.
 pub type Diagnostic = new {
   code: String,
   severity: Severity,
@@ -107,7 +56,6 @@ pub type Diagnostic = new {
   fixes: List<Fix>,
 }
 
-/// The label a diagnostic is placed at: its first primary one, else its first.
 pub fn primary(diagnostic: Diagnostic) -> Option<Label> =
   match diagnostic.labels.fold(None, |found: Option<Label>, label: Label|
       match found { Some(_) -> found, None -> if label.primary { Some(label) } else { None } }) {
@@ -115,10 +63,7 @@ pub fn primary(diagnostic: Diagnostic) -> Option<Label> =
     None -> diagnostic.labels.at(0),
   }
 
-/// What this module raises where it refuses.
 pub effect syntax {
-  /// A node does not go where a `syntax"…"` literal's hole stands, or the text it makes does not
-  /// parse.
   raise fail(why: Diagnostic)
 }
 
@@ -139,7 +84,6 @@ fn diagnostic_of(source: Bytes, diag: ParseDiag) -> Diagnostic =
     fixes: [],
   }
 
-/// A refusal of this module's own, placed like the parser's.
 fn unexpected(source: Bytes, span: Span, message: String, label: String) -> Diagnostic =
   diagnostic_of(
     source,
@@ -152,17 +96,12 @@ fn unexpected(source: Bytes, span: Span, message: String, label: String) -> Diag
     ),
   )
 
-// --- Nodes ------------------------------------------------------------------
-
-/// The source a node was parsed from, that source's comments, and the names each item of it binds,
-/// by where the item lies: a call written on one of those is a call on a value.
 type Origin = {
   source: Bytes,
   comments: List<lexer::Comment>,
   binding: List<{ start: Int, end: Int, names: Map<Bytes, Bool> }>,
 }
 
-/// What a node is, as the compiler holds it.
 type NodeSyntax =
   | ModuleSyntax(Module)
   | ImportSyntax(ImportDecl)
@@ -187,195 +126,90 @@ type NodeSyntax =
   | PatternSyntax(Pattern)
   | TypeSyntax(TypeExpr)
 
-/// One node of a tree: a module, an item, an expression, a pattern, a type, or a part of one.
-///
-/// Two nodes are `==` when they are the same node of the same source; `shape` compares trees
-/// whatever their layout.
 pub opaque type Node = | Node(Origin, NodeSyntax)
 
-/// What a node is. The list grows with the language: end a `match` over it with a wildcard arm.
-///
-/// Each kind says what `children` answers for it, in the order the source writes them, and what
-/// `name` answers where it names anything.
 pub type Kind =
-  /// A whole source: its imports, then its items.
   | Module
-  /// `import a.b`: named by the module's path; an `ImportedName` for each name in a list, or an
-  /// `ImportAlias`.
   | Import
-  /// One name of `import a.b (f, g)`.
   | ImportedName
-  /// The binder of `import a.b as c`.
   | ImportAlias
-  /// `fn`: its parameters, its result type and its `Row` where written, its `Requires`, `Ensures`,
-  /// `Cost` and `Space` clauses, its `Decreases`, then its body.
   | Function
-  /// `type`: the type it names, or each `Variant` of a sum.
   | TypeDeclaration
-  /// `effect`: each `Operation`.
   | EffectDeclaration
-  /// `test`, named by its label: over cases, the values in its label's holes, the case's
-  /// `Parameter` and the table; then its body.
   | Test
-  /// `law`, named by its label: its binders as `Parameter`s, each type variable its
-  /// `where identity(a)` constrains as a `TypeVariable`, its guard where written, then its body,
-  /// which for an instantiation is the `Call` of the schema.
   | Law
-  /// `law schema`: its parameters, its binders, each type variable its `where identity(a)`
-  /// constrains as a `TypeVariable`, its guard where written, then its body.
   | LawSchema
-  /// `derive json for T`, named by the type.
   | Derive
-  /// `effect set`, named by the set.
   | EffectSet
-  /// `extern fn`: its parameters, its result type, its `Row` and its clauses.
   | ExternFunction
-  /// `key for T by f`, `show for T by f` or `invariant for T by f`, named by the type.
   | Instance
-  /// `numeric for T by { .. }`, named by the type.
   | Numeric
-  /// A constructor of a sum type: the types of its fields.
   | Variant
-  /// An operation of an effect: the types of its parameters, then of its result unless it is a
-  /// `raise`.
   | Operation
-  /// A parameter of a function, a lambda, a law or a handler, or the binder of a `with_hold` or a
-  /// test over cases: its type and its default where written.
   | Parameter
-  /// `requires e`: the condition.
   | Requires
-  /// `ensures e`: the condition.
   | Ensures
-  /// `cost e`: the bound.
   | Cost
-  /// `space e`: the bound.
   | Space
-  /// `decreases e`: the measure.
   | Decreases
-  /// An effect row, `{fs.read[r], abort.raise | e}`: read it with `text`.
   | Row
-  /// A literal: a number, a string, a line string, bytes, a character, `true`, `false` or `()`.
   | Literal
-  /// A name used as a value, `f` or `m::f`: `name` is `f` and `qualifier` is `m`.
   | Name
-  /// A binary operator: its two operands. `operator` is its spelling.
   | Binary
-  /// `-x`, `!x` or `~x`: the operand. `operator` is its spelling.
   | Unary
-  /// `|x: T| body`: its parameters, its result type where written, then its body.
   | Lambda
-  /// A call: the callee, then each argument, a named one as a `Field`.
   | Call
-  /// `if`: the condition, the block, and the `else` branch where one is written.
   | If
-  /// `match`: the scrutinee, then each `Arm`.
   | Match
-  /// `{ .. }`: each statement, a `Let`, a `LetElse` or an expression, then the tail.
   | Block
-  /// `{ a: 1, b }`: each `Field`.
   | RecordLiteral
-  /// `(a, b)`: each element.
   | Tuple
-  /// `{ ..base, a: 1 }`: the base, then each `Field`.
   | RecordUpdate
-  /// `x?`: the operand.
   | Propagate
-  /// `a.b`: the value; `name` is the field.
   | Access
-  /// `[a, b]`: each element.
   | ListLiteral
-  /// `#{k: v}`: each key and its value, in turn.
   | MapLiteral
-  /// `#[a, b]`: each element.
   | SetLiteral
-  /// `f"a {x} b"`: the value in each hole.
   | Interpolation
-  /// `tag"text {x}"`: the value in each hole; `name` is the tag.
   | TaggedLiteral
-  /// `effect_name.op[r](args)`: each argument; `name` is the operation and `qualifier` the effect. A
-  /// call written so on a name its item binds is a call on that value, a `Call` of an `Access`, as
-  /// `f(x).len()` is.
   | Perform
-  /// `handle { .. } with { .. }`: the body, then each `HandlerVariable`, each `Handler` and the
-  /// `ReturnHandler`.
   | Handle
-  /// `with_hold[r](acquire, release) { h -> body }`: the two, the binder, the body.
   | WithHold
-  /// `simulate { .. }`: the body.
   | Simulate
-  /// `parallel { a, b }`: each branch.
   | Parallel
-  /// `try { .. }`: the body.
   | TryBlock
-  /// `let p: T = v;`: the pattern, the type where written, the value.
   | Let
-  /// `let p = v else { .. };`: as a `Let`, then the block.
   | LetElse
-  /// `x = v;` in a handler's clause: the value; `name` is the variable.
   | Assignment
-  /// An arm of a `match`: the pattern, the guard where written, the body.
   | Arm
-  /// A clause of a `handle`: its parameters, then its body; `name` is the operation and
-  /// `qualifier` the effect.
   | Handler
-  /// `return x -> ..` in a `handle`: the binder, then the body.
   | ReturnHandler
-  /// `var x: T = v` in a `handle`: the type where written, then the first value; `name` is the
-  /// variable.
   | HandlerVariable
-  /// A named part: a record's field, a named argument, a record pattern's field or a record
-  /// type's: the value, pattern or type. A field written by its name alone holds the node of that
-  /// name, at the same span.
   | Field
-  /// `_`.
   | Wildcard
-  /// A pattern that binds a name.
   | Binding
-  /// A literal as a pattern.
   | LiteralPattern
-  /// `lo..=hi`.
   | RangePattern
-  /// `Some(p)`: each argument; `name` is the constructor and `qualifier` its module.
   | ConstructorPattern
-  /// `{ a, b: p, .. }`: each `Field`.
   | RecordPattern
-  /// `(p, q)`: each element.
   | TuplePattern
-  /// `[p, q, ..rest]`: each element, then the rest.
   | ListPattern
-  /// `p | q`: each alternative.
   | Alternatives
-  /// A type variable, `a`.
   | TypeVariable
-  /// `List<Int>` or `m::T`: each type argument; `name` is the type and `qualifier` its module.
   | TypeName
-  /// `(A, B) -> C / {..}`: each parameter type, the result type, and the `Row` where written.
   | FunctionType
-  /// `{ a: Int }`: each `Field`.
   | RecordType
-  /// `(A, B)`: each element.
   | TupleType
-  /// `()` as a type.
   | UnitType
-  /// `???` or `..`: an unfilled hole.
   | Hole
-  /// What stands where the parser could read nothing.
   | Unparsed
 
-/// A name as the source writes it, and where.
 pub type Ident = new { text: String, span: Span }
 
-/// A comment as written, its `//`, `///` or `//!` included, without the blanks that end its line.
 pub type Comment = new { span: Span, text: String }
 
-/// The version of this module's vocabulary: it moves when a `Kind` is added, and with what is said
-/// of the release when an accessor comes to answer otherwise for a tree it already read. At 2 a
-/// call on a value written on a bare name is no longer a `Perform`; at 3 a handler has its
-/// `HandlerVariable`s and a clause its `Assignment`s; at 4 a law's or a schema's `identity(a)` is the
-/// `TypeVariable` `a`, no longer a guard's `Call`, and an `Instance` may be an `invariant`.
 pub fn version() -> Int = 4
 
-/// A place the compiler read, as the span of the source it lies at.
 fn to_span(place: parsing::Span) -> Span = { start: place.start, end: place.end }
 
 fn to_identifier(ident: parsing::Ident) -> Ident =
@@ -420,7 +254,6 @@ fn all_of(parts: List<List<NodeSyntax>>) -> List<NodeSyntax> =
 
 fn span_of(source: Bytes, at: NodeSyntax) -> Span = to_span(parsed_span(source, at))
 
-/// Where the compiler read `at`.
 fn parsed_span(source: Bytes, at: NodeSyntax) -> parsing::Span =
   match at {
     ModuleSyntax(_) -> parsing::span_between(0, source.len()),
@@ -527,15 +360,12 @@ fn item_parts(item: Item) -> List<NodeSyntax> =
 fn statement(stmt: Stmt) -> NodeSyntax =
   match stmt { ExpressionStatement(e) -> ExpressionSyntax(e), _ -> StatementSyntax(stmt) }
 
-/// A call the parser wrote for an operator, `a +% b`.
 fn is_operator(e: Expr) -> Bool =
   match e {
     CallExpression(v) -> match written_operator(v.func, v.args) { Some(_) -> true, None -> false },
     _ -> false,
   }
 
-/// A call the parser wrote around the value in an interpolated string's hole: its callee is
-/// reached through a binder no source can spell.
 fn is_display(e: Expr) -> Bool =
   match e {
     CallExpression(v) -> match v.func {
@@ -899,19 +729,13 @@ fn qualifier_of(at: NodeSyntax) -> Option<parsing::Ident> =
 fn named(found: Option<parsing::Ident>) -> Option<Ident> =
   match found { Some(ident) -> Some(to_identifier(ident)), None -> None }
 
-/// What a node is.
 pub fn kind(node: Node) -> Kind / {abort.raise} =
   match node { Node(origin, at) -> kind_of(origin.source, at) }
 
-/// Where a node is written in its source. An item's span starts at its keyword: a `pub` before
-/// it and the doc above it lie outside, and a parenthesised expression's or pattern's takes in its
-/// parentheses.
 pub fn span(node: Node) -> Span = match node { Node(origin, at) -> span_of(origin.source, at) }
 
-/// The whole source a node was parsed from.
 pub fn source(node: Node) -> Bytes = match node { Node(origin, _) -> origin.source }
 
-/// A node as written: the bytes of its span.
 pub fn text(node: Node) -> Bytes / {abort.raise} =
   match node {
     Node(origin, at) -> {
@@ -920,11 +744,9 @@ pub fn text(node: Node) -> Bytes / {abort.raise} =
     },
   }
 
-/// The line and column a node starts at in its source.
 pub fn place(node: Node) -> Location =
   match node { Node(origin, at) -> location_at(origin.source, span_of(origin.source, at).start) }
 
-/// The nodes directly inside a node, in the order the source writes them: what its `Kind` says.
 pub fn children(node: Node) -> List<Node> / {abort.raise} =
   match node {
     Node(origin, at) ->
@@ -932,8 +754,6 @@ pub fn children(node: Node) -> List<Node> / {abort.raise} =
         Node(origin, resolve_method_call(origin, part))),
   }
 
-/// `at` as the checker reads it where the parser cannot tell: `x.f(..)` on a name its item binds
-/// is the call of the value's function, and on any other name a perform.
 fn resolve_method_call(origin: Origin, at: NodeSyntax) -> NodeSyntax =
   match at {
     ExpressionSyntax(e) -> match e {
@@ -959,21 +779,15 @@ fn resolve_method_call(origin: Origin, at: NodeSyntax) -> NodeSyntax =
     _ -> at,
   }
 
-/// Whether the item of `origin` written over `at` binds `name`.
 fn bound_at(origin: Origin, at: Int, name: Bytes) -> Bool =
   origin.binding.fold(false, |found: Bool, b: { start: Int, end: Int, names: Map<Bytes, Bool> }|
     found || (at >= b.start && at < b.end && b.names.contains(name)))
 
-/// The name a node declares, binds or refers to, and where it is written: what its `Kind` says.
-/// A test's and a law's is its label.
 pub fn name(node: Node) -> Option<Ident> = match node { Node(_, at) -> named(name_of(at)) }
 
-/// What a name is reached through: the module binder of `m::f`, of a qualified constructor
-/// pattern or type, and the effect of a `Perform` or a `Handler`.
 pub fn qualifier(node: Node) -> Option<Ident> =
   match node { Node(_, at) -> named(qualifier_of(at)) }
 
-/// A `Binary` or a `Unary` node's operator as it is written: `+`, `&&`, `+%`, `!`.
 pub fn operator(node: Node) -> Option<String> =
   match node {
     Node(_, ExpressionSyntax(e)) -> match e {
@@ -988,7 +802,6 @@ pub fn operator(node: Node) -> Option<String> =
     _ -> None,
   }
 
-/// What a string literal reads as, its escapes read; `None` for any other node.
 pub fn string_value(node: Node) -> Option<String> =
   match node {
     Node(_, ExpressionSyntax(LiteralExpression(v))) -> match v.lit {
@@ -998,7 +811,6 @@ pub fn string_value(node: Node) -> Option<String> =
     _ -> None,
   }
 
-/// What an `Int` literal reads as; `None` for any other node.
 pub fn int_value(node: Node) -> Option<Int> =
   match node {
     Node(_, ExpressionSyntax(LiteralExpression(v))) -> match v.lit {
@@ -1008,7 +820,6 @@ pub fn int_value(node: Node) -> Option<Int> =
     _ -> None,
   }
 
-/// Whether an item is written `pub`.
 pub fn is_public(node: Node) -> Bool =
   match node {
     Node(_, ItemSyntax(item)) -> match item {
@@ -1022,8 +833,6 @@ pub fn is_public(node: Node) -> Bool =
     _ -> false,
   }
 
-/// The doc comment of a module, an item, a variant or an operation, a line each without its
-/// marker; empty where it has none.
 pub fn doc(node: Node) -> List<String> = {
   let held = match node {
     Node(_, ModuleSyntax(m)) -> m.doc,
@@ -1035,8 +844,6 @@ pub fn doc(node: Node) -> List<String> = {
   match held { Some(d) -> d.lines.map(|line: Bytes| String::of_bytes_lossy(line)), None -> [] }
 }
 
-/// The comments written inside a node's span, in order: every comment of the source for its
-/// `Module`. A doc comment above an item lies outside the item's span and inside the module's.
 pub fn comments(node: Node) -> List<Comment> / {abort.raise} =
   match node {
     Node(origin, at) -> {
@@ -1057,16 +864,12 @@ fn walk_into(node: Node, room: Int, found: List<Node>) -> List<Node> / {abort.ra
       walk_into(child, room - 1, so_far))
   }
 
-/// A node and every node inside it, each before what it holds, in the order the source writes
-/// them.
 pub fn walk(node: Node) -> List<Node> / {abort.raise} =
   walk_into(node, 4 * source(node).len() + 64, [])
 
 fn contains_offset(node: Node, offset: Int) -> Bool =
   span(node).start <= offset && offset < span(node).end
 
-/// The nodes whose spans hold the byte at `offset`, outermost first, from `node` down: empty
-/// where `node` does not hold it.
 pub fn enclosing(node: Node, offset: Int) -> List<Node> / {abort.raise} =
   if !contains_offset(node, offset) { [] } else {
     iterate(
@@ -1080,14 +883,9 @@ pub fn enclosing(node: Node, offset: Int) -> List<Node> / {abort.raise} =
     )
   }
 
-/// A node's tree with every position, comment and layout left out: two nodes have one shape
-/// exactly when they are the same tree, however each is written. A literal counts by its value,
-/// so `1_000` and `1000` are one shape.
 pub fn shape(node: Node) -> Bytes / {abort.raise} =
   match node { Node(origin, at) -> shape_of(origin.source, at, 8) }
 
-/// A part the compiler dumps is its dump; any other is its kind, its name and its parts' shapes,
-/// each led by its length. Such a part holds dumped ones within two levels, which `room` covers.
 fn shape_of(source: Bytes, at: NodeSyntax, room: Int) -> Bytes / {abort.raise} =
   match at {
     ModuleSyntax(m) -> parsing::erase_spans(items::dump_module(m)),
@@ -1134,12 +932,8 @@ fn part_tag(at: NodeSyntax) -> Bytes =
     _ -> b"",
   }
 
-// --- Parsing ----------------------------------------------------------------
-
-/// A source's tree, and what the parser said of it: no diagnostic for a source that parses.
 pub type ParseResult = new { tree: Node, diagnostics: List<Diagnostic> }
 
-/// `source`'s origin, `spans` the places of its items, each of which binds names apart.
 fn origin_of(source: Bytes, spans: List<parsing::Span>) -> Origin / {abort.raise} =
   {
     source: source,
@@ -1152,15 +946,9 @@ fn origin_of(source: Bytes, spans: List<parsing::Span>) -> Origin / {abort.raise
       }),
   }
 
-/// `text`'s origin, read as one item.
 fn origin_whole(text: Bytes) -> Origin / {abort.raise} =
   origin_of(text, [parsing::span_between(0, text.len())])
 
-/// One module's source as a tree, a `Module` node, with the parser's diagnostics.
-///
-/// The parse takes time in proportion to the source and nests at most 128 deep, refusing what
-/// nests deeper. An item that does not parse is a diagnostic and no node, and the items around it
-/// are read.
 pub fn parse(source: Bytes) -> ParseResult / {abort.raise} = {
   let read = items::parse(source);
   {
@@ -1169,10 +957,6 @@ pub fn parse(source: Bytes) -> ParseResult / {abort.raise} = {
   }
 }
 
-/// What `ply fmt` writes for a module's source: the same function, so the same bytes. A source
-/// that does not parse is refused with the parser's first diagnostic, as the command refuses it.
-/// The formatter holds its own answer to parsing as its source does, and refuses a source it
-/// would print otherwise: that is a defect of `ply`, answered as `E0505`.
 pub fn format(source: Bytes) -> Result<Bytes, Diagnostic> / {abort.raise} =
   match fmt::fmt_source(source) {
     Ok(out) -> Ok(out),
@@ -1188,14 +972,11 @@ pub fn format(source: Bytes) -> Result<Bytes, Diagnostic> / {abort.raise} =
     },
   }
 
-/// A source as `format` writes it, or as it is where `format` refuses it.
 pub fn formatted(source: Bytes) -> Bytes / {abort.raise} =
   match format(source) { Ok(out) -> out, Err(_) -> source }
 
 fn starts_before(a: Edit, b: Edit) -> Bool = a.span.start < b.span.start
 
-/// `source` with every one of `edits` made, each by its span in `source` as it stands, and every
-/// byte outside them kept. `None` where two edits overlap or one reaches outside the source.
 pub fn apply_edits(source: Bytes, edits: List<Edit>) -> Option<Bytes> = {
   let ordered = edits.sort_by(starts_before);
   let wrap = ordered.fold(
@@ -1221,9 +1002,6 @@ pub fn apply_edits(source: Bytes, edits: List<Edit>) -> Option<Bytes> = {
   }
 }
 
-// --- Fragments --------------------------------------------------------------
-
-/// The first diagnostic of a parse that made any, or one for what follows the fragment.
 fn fragment_diagnostic(
   source: Bytes,
   input: Input,
@@ -1250,7 +1028,6 @@ fn parse_failure(parser: Parser, source: Bytes) -> Diagnostic =
     None -> unexpected(source, { start: 0, end: 0 }, "this does not parse", "here"),
   }
 
-/// One expression, whole: an `Err` where `text` is none, or holds more than one.
 pub fn expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   let s = parsing::start(text);
   match exprs::expr(s.input, s.parser) {
@@ -1265,7 +1042,6 @@ pub fn expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   }
 }
 
-/// One pattern, whole.
 pub fn pattern(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   let s = parsing::start(text);
   match patterns::pattern(s.input, s.parser) {
@@ -1277,7 +1053,6 @@ pub fn pattern(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   }
 }
 
-/// One type, whole.
 pub fn type_expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   let s = parsing::start(text);
   match type_syntax::ty(s.input, s.parser) {
@@ -1289,8 +1064,6 @@ pub fn type_expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} 
   }
 }
 
-/// One item, whole, with its doc: an `Err` where `text` does not parse, imports, or holds none or
-/// more than one.
 pub fn item(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   let read = items::parse(text);
   match read.parser.diags.at(0) {
@@ -1310,8 +1083,6 @@ pub fn item(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
   }
 }
 
-/// A name as an expression, a `Name` node: an `Err` where `text` is not one identifier, a keyword
-/// among them.
 pub fn identifier(text: String) -> Result<Node, Diagnostic> / {abort.raise} = {
   let given = Bytes::of_string(text);
   let lexed = lexer::lex(given);
@@ -1337,23 +1108,16 @@ pub fn identifier(text: String) -> Result<Node, Diagnostic> / {abort.raise} = {
 fn not_a_name(given: Bytes) -> Diagnostic =
   unexpected(given, { start: 0, end: given.len() }, "expected one name", "not a name")
 
-// --- The `syntax"…"` literal ------------------------------------------------
-
-/// What may stand in a hole, by what the text around it makes of a name written there.
 type HoleKind = | AsName | AsExpression | AsPattern | AsType
 
-/// The texts of a `syntax"…"` literal with holes, and what each hole stands as.
 pub opaque type Template = | Template(List<Bytes>, List<HoleKind>)
 
-/// Why a literal's text is refused, as a tagged literal's parser answers it.
 pub type Malformed = { message: String, offset: Int }
 
-/// Why a literal's texts are refused: `part` is the text, counted from 0.
 pub type MalformedPart = { message: String, offset: Int, part: Int }
 
 fn hole_name(i: Int) -> Bytes = b"hole__".concat(Bytes::of_string(i.to_string()))
 
-/// How many characters `text` holds before the byte at `upto`.
 fn character_count(text: Bytes, upto: Int) -> Int =
   String::of_bytes_lossy(match try[abort.raise] { text.slice(0, upto) } {
     Ok(before) -> before,
@@ -1361,7 +1125,6 @@ fn character_count(text: Bytes, upto: Int) -> Int =
   }).len(
   )
 
-/// The texts with a name where each hole stands, and where each text starts in the whole.
 fn assemble_parts(texts: List<Bytes>) -> { whole: Bytes, starts: List<Int> } =
   range(0, texts.len()).fold(
     { whole: b"", starts: [] },
@@ -1371,8 +1134,6 @@ fn assemble_parts(texts: List<Bytes>) -> { whole: Bytes, starts: List<Int> } =
     },
   )
 
-/// The text an offset of the whole falls in, and how far into it: a hole's name counts as the end
-/// of the text before it.
 fn locate_part(texts: List<Bytes>, starts: List<Int>, offset: Int) -> { part: Int, offset: Int } =
   range(0, texts.len()).fold({ part: 0, offset: 0 }, |found: { part: Int, offset: Int }, i: Int| {
     let from = starts.at_or(i, 0);
@@ -1390,7 +1151,6 @@ fn hole_kind_of(node: Node) -> HoleKind / {abort.raise} =
     _ -> AsName,
   }
 
-/// What the hole named `hole` stands as in `tree`, where a node is named by it.
 fn hole_kind_in(tree: Node, hole: Bytes) -> Option<HoleKind> / {abort.raise} = {
   let to_identifier = String::of_bytes_lossy(hole);
   walk(tree).fold(None, |found: Option<HoleKind>, node: Node|
@@ -1405,9 +1165,6 @@ fn hole_kind_in(tree: Node, hole: Bytes) -> Option<HoleKind> / {abort.raise} = {
     })
 }
 
-/// What a `syntax"…"` literal with holes is checked by: the texts as one module, a name where
-/// each hole stands. A hole stands where the name would be an expression, a pattern, a type, or
-/// the name of a definition, a parameter or a field.
 pub fn compile(parts: List<String>) -> Result<Template, MalformedPart> / {abort.raise} = {
   let texts = parts.map(Bytes::of_string);
   let wrap = assemble_parts(texts);
@@ -1437,7 +1194,6 @@ pub fn compile(parts: List<String>) -> Result<Template, MalformedPart> / {abort.
   }
 }
 
-/// The message and place of the first diagnostic, as a literal's refusal carries them.
 fn primary_of(diagnostics: List<Diagnostic>) -> Option<{ text: String, span: Span }> =
   match diagnostics.at(0) {
     None -> None,
@@ -1447,7 +1203,6 @@ fn primary_of(diagnostics: List<Diagnostic>) -> Option<{ text: String, span: Spa
     },
   }
 
-/// What a `syntax"…"` literal with no hole is checked by, and is: the text as one module.
 pub fn literal(text: String) -> Result<Node, Malformed> / {abort.raise} = {
   let given = Bytes::of_string(text);
   let read = parse(given);
@@ -1472,15 +1227,12 @@ fn is_bare_name(node: Node) -> Bool / {abort.raise} =
   qualifier(node) == None
     && (match kind(node) { Name -> true, Binding -> true, TypeVariable -> true, _ -> false })
 
-/// A node's text in parentheses. A line string runs to the end of its line, so one that ends the
-/// text has the closing parenthesis on the next.
 fn parenthesized(node: Node) -> Bytes / {abort.raise} = {
   let to_span = text(node);
   let ends_lines = match to_span.index_of(b"\\\\") { Some(_) -> b"\n", None -> b"" };
   Bytes::concat_all([b"(", to_span, ends_lines, b")"])
 }
 
-/// A node as the text a hole of its stand takes.
 fn hole_text(stand: HoleKind, node: Node) -> Bytes / {syntax.fail, abort.raise} =
   match ((stand, node)) {
     (AsName, _) -> if is_bare_name(node) { text(node) } else { misplaced(node, "a name") },
@@ -1495,9 +1247,6 @@ fn hole_text(stand: HoleKind, node: Node) -> Bytes / {syntax.fail, abort.raise} 
     (AsType, _) -> if is_bare_name(node) { text(node) } else { misplaced(node, "a type") },
   }
 
-/// The module a `syntax"…"` literal is with `holes` where its holes stand: each node written
-/// whole where it stands, in parentheses unless it is a name. Refused where a node is not what its
-/// hole takes, or the text made does not parse.
 pub fn fill(template: Template, holes: List<Node>) -> Node / {syntax.fail, abort.raise} =
   match template {
     Template(texts, stands) -> {
@@ -1515,23 +1264,13 @@ pub fn fill(template: Template, holes: List<Node>) -> Node / {syntax.fail, abort
     },
   }
 
-// --- Sampling ---------------------------------------------------------------
-
-/// A small module that parses and checks, written with uneven layout and comments, for a test
-/// about source to draw: `samples()` draws programs where a `Bytes` draws noise no parser reads.
-/// Its definitions are `f0`, `f1` and so on, each of one `Int` named `x` to an `Int`, and a `let`
-/// in one binds `y`.
 pub type Sample = | Sample(Bytes)
 
-/// The source a `Sample` holds.
 pub fn sample_source(s: Sample) -> Bytes = match s { Sample(source) -> source }
 
-/// The smallest bodies of a sample: each an `Int` over `x`, with no import behind it.
 fn sample_atoms() -> List<Bytes> =
   [b"x", b"1", b"2_000", b"0xFF", b"( x )", b"[x,x].len()", b"#{ 1:x }.len()"]
 
-/// What a body is also written with where only its spelling is read: the forms the parser makes
-/// calls of, and the literals whose spelling the formatter keeps.
 fn spelling_atoms() -> List<Bytes> =
   sample_atoms().concat([
     b"f\"n {x}\"",
@@ -1572,7 +1311,6 @@ fn sample_bodies(depth: Int, atoms: List<Bytes>) -> Gen<Bytes> =
     ])
   }
 
-/// A module of up to three definitions, each body made of `atoms`.
 fn sample_modules(atoms: List<Bytes>) -> Gen<Bytes> =
   gen::map(
     gen::list_of(
@@ -1599,12 +1337,9 @@ fn sample_modules(atoms: List<Bytes>) -> Gen<Bytes> =
       ),
   )
 
-/// A `Sample` as a test draws one.
 pub fn samples() -> Gen<Sample> =
   gen::map(sample_modules(sample_atoms()), |source: Bytes| Sample(source))
 
-/// A module that parses and need not check: a sample's layouts over every form the formatter reads
-/// back from the source.
 type Spelling = | Spelling(Bytes)
 
 fn spelling_text(s: Spelling) -> Bytes = match s { Spelling(source) -> source }
@@ -1612,8 +1347,6 @@ fn spelling_text(s: Spelling) -> Bytes = match s { Spelling(source) -> source }
 fn spellings() -> Gen<Spelling> =
   gen::map(sample_modules(spelling_atoms()), |source: Bytes| Spelling(source))
 
-/// A text made of what Ply source is written in, most of it no module: openers of every literal,
-/// escapes, brackets, operators and characters cut short, which a `Bytes` rarely draws side by side.
 type Noise = | Noise(Bytes)
 
 fn noise_text(n: Noise) -> Bytes = match n { Noise(text) -> text }
@@ -1689,8 +1422,6 @@ fn noise_parts() -> List<Bytes> =
     b"\xff",
     b"\x00",
   ]
-
-// --- Tests ------------------------------------------------------------------
 
 fn tree_of(source: Bytes) -> Node / {abort.raise} = parse(source).tree
 
@@ -1794,7 +1525,6 @@ test "a call written on a name its item binds is a call on that value, and on an
     },
     None -> panic("two calls"),
   };
-  // A fragment binds as one item.
   match expression(b"|ys: List<Int>| ys.len()") {
     Ok(lambda) -> assert(walk_into(lambda, 8, []).any(|n: Node| kind(n) == Access)),
     Err(_) -> panic("the fragment parses"),

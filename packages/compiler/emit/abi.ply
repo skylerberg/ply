@@ -1,51 +1,24 @@
-//! What emitted code and the runtime it runs on both rely on, declared once: the structs both lay
-//! out, the constants both read, and each function emitted C calls through a pointer its unit binds
-//! (the runtime's helpers, and the natives the compiler calls directly) with its signature at the
-//! machine. The runtime describes what it implements and lays out as a text (`runtime_of` reads
-//! it), and `runtime_mismatches` says where that disagrees with what is declared here.
-
 import std.bytes (ascii_of_int)
 import compiler.emit.layout (MachineStruct, MachineField, head_structs, header_bytes, frame_count,
                              pointer_floor)
 
-// --- Signatures -------------------------------------------------------------------
-
-/// What a parameter or the answer of a function compiled code calls is at the machine, as the
-/// runtime's description names it. Each is passed in one machine word.
 pub type Machine =
-  /// A uniform word, which holds a value of any type.
   | Word
-  /// The address of uniform words.
   | Words
-  /// A 64-bit integer, raw.
   | I64
-  /// A `Float`'s bits.
   | F64
-  /// The address of bytes, their count passed beside it.
   | Addr
-  /// The address of words the function writes.
   | Out
-  /// A runtime object the runtime lays out: a bridge, a hold or what a native made.
   | Handle
-  /// A value's word form, which the runtime moves and never reads.
   | Handed
-  /// A block emitted code lays out, of which the runtime reads the count.
   | Block
-  /// A type's descriptor: `type#T`, or `kept#T`, which names `type#T` beside its comparisons.
   | Type
-  /// An operation's descriptor.
   | Op
-  /// A drop root's address.
   | DropRoot
-  /// A keep root's address.
   | KeepRoot
-  /// How many bytes a native left as the context's taken bytes, which emitted code copies out.
   | Taken
-  /// A `Secret`'s handle: lent to a native that takes one, owned by the code a native answers one
-  /// to.
   | Secret
 
-/// Every kind, in the order the runtime's `Machine` lists them.
 fn kinds() -> List<Machine> =
   [
     Word,
@@ -65,7 +38,6 @@ fn kinds() -> List<Machine> =
     Secret,
   ]
 
-/// The name the runtime's description gives `m`.
 pub fn machine_name(m: Machine) -> Bytes =
   match m {
     Word -> b"Word",
@@ -88,16 +60,10 @@ pub fn machine_name(m: Machine) -> Bytes =
 fn machine_named(name: Bytes) -> Option<Machine> =
   kinds().find(|m: Machine| machine_name(m) == name)
 
-/// A function compiled code calls with its context and machine words, by the name it is known by:
-/// what it takes past the context, what it answers (`None` for nothing), and whether a failure of
-/// it raises rather than ending the run. A native's signature is what the runtime reads off the
-/// Rust type of the function it binds.
 pub type Native = { name: Bytes, params: List<Machine>, result: Option<Machine>, raises: Bool }
 
 fn uniform(n: Int) -> List<Machine> = range(0, n).map(|_: Int| Word)
 
-/// The native `name` taking `words` uniform words, answering one where `answers`, as one called
-/// over a value's encoding does.
 pub fn uniform_native(name: Bytes, words: Int, answers: Bool, raises: Bool) -> Native =
   {
     name: name,
@@ -109,8 +75,6 @@ pub fn uniform_native(name: Bytes, words: Int, answers: Bool, raises: Bool) -> N
 fn called(name: Bytes, params: List<Machine>, answer: Option<Machine>) -> Native =
   { name: name, params: params, result: answer, raises: false }
 
-/// Each of the runtime's own helpers the emitted C calls, by its C name: what the C does to values,
-/// frames and handlers. A helper is added here and in the runtime's table beside its function.
 pub fn helpers() -> List<Native> =
   [
     called(b"rt_box_decimal", uniform(2), Some(Word)),
@@ -159,22 +123,6 @@ pub fn helpers() -> List<Native> =
 
 fn raising(n: Native) -> Native = { ..n, raises: true }
 
-/// Each native the emitted C calls directly over machine words, by the name the compiler declares
-/// it under, `?` first. A crossing is written a part at a time into the innermost lowering
-/// (`?out_*`) and read a part at a time from the innermost lifting (`?in_*`); `?in_decimal` and
-/// `?in_fixed` answer a value's low word and keep its high word for `?in_high`; a native that
-/// answers bytes leaves them as the crossing's taken bytes and answers their count, and `?taken`
-/// copies them out. `?shown_open` begins a lowering of a value a diagnostic shows, which keeps
-/// nothing beside its bytes and `?lower_close` ends. `?hold_made` makes a hold of a value it takes,
-/// `?hold_read` answers what a hold holds lent from it, and `?hold_taken` takes it out, the hold
-/// letting go. `?refused` and `?refused_text` refuse an operation written in place over the numbers
-/// or the text it names, and `?assert_failed` an `assert_eq` over what a diagnostic shows of its
-/// actual value and then its expected one. `?keep` keeps a value a perform hands a program's clause
-/// beside its `PlyKept`, `?open` answers what a kept value holds where it is of the type it names,
-/// and `?kept_equal` and `?kept_order` compare two kept values. The `?secret_*` natives make, read
-/// and compute over a `Secret`, its handle lent, and answer another's handle, a count, or bytes
-/// left taken and their count, below 0 where they have none.
-/// The rest read a string's bytes, lent as an address and a count, or a `Float`'s bits.
 pub fn natives() -> List<Native> =
   [
     called(b"?out_tag", [I64], None),
@@ -258,13 +206,8 @@ pub fn natives() -> List<Native> =
       called(name, [F64, F64], Some(F64))),
   )
 
-/// The native of `natives` named `name`.
 pub fn native_named(name: Bytes) -> Option<Native> = natives().find(|n: Native| n.name == name)
 
-// --- What both lay out ------------------------------------------------------------
-
-/// `PlyObj`, a block's header: its count, in the low half of the word before the block's payload,
-/// and whether the scheduler's own work made the block.
 pub fn object_struct() -> MachineStruct =
   {
     name: b"PlyObj",
@@ -275,20 +218,10 @@ pub fn object_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyCtx`, the context every function is handed, as far as emitted code reads and writes it:
-/// the fields the runtime lays out first. Its bytes are those fields' extent; the rest of the
-/// context is the runtime's alone. `task` is the task running, which each stack keeps as its own:
-/// 0 outside any region, a region's body runs as the task that opened the region, every other task
-/// as a number no task of any region in the process shares, and a detached body as the task that
-/// began it, whichever resumes it. A `handle`'s instance records it as it opens, and only that task
-/// may leave it. `alloc` is what emitted code takes a small block from the heap by and gives one
-/// back to without calling the runtime (`alloc_struct`).
 pub fn ctx_struct() -> MachineStruct =
   {
     name: b"PlyCtx",
     bytes: 184,
-    // A released `ply`'s bootstrap compares the first eleven as listed, so a new field goes last.
-    // The word at 8 and the two at 48 are the runtime's own.
     fields: [
       { name: b"failed", decl: b"int64_t failed", at: 0, bytes: 8 },
       { name: b"stack_floor", decl: b"volatile uintptr_t stack_floor", at: 16, bytes: 8 },
@@ -313,11 +246,6 @@ pub fn ctx_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyPage`, a page of a heap's blocks of one size: its dead blocks, each naming the next at
-/// `alloc_laid().link_at`; where those never handed out begin and where its blocks end; the heap
-/// that owns it; the bytes of a block; how many are live; and whether its class lists it. Emitted
-/// code takes a block from the page its class fills and gives one back to a page in place, as the
-/// runtime would.
 pub fn page_struct() -> MachineStruct =
   {
     name: b"PlyPage",
@@ -338,9 +266,6 @@ pub fn page_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyFilling`, a heap's blocks as emitted code takes them: by class, the page being filled; the
-/// heap's name, which each page it owns holds as its owner; and how many blocks handed out had held
-/// an object before.
 pub fn filling_struct() -> MachineStruct =
   {
     name: b"PlyFilling",
@@ -357,8 +282,6 @@ pub fn filling_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyAlloc`, a heap as emitted code takes its small blocks: its blocks; how many blocks the
-/// program allocated; and, while not 0, that every block goes through the runtime.
 pub fn alloc_struct() -> MachineStruct =
   {
     name: b"PlyAlloc",
@@ -370,18 +293,11 @@ pub fn alloc_struct() -> MachineStruct =
     ],
   }
 
-/// How many classes a heap sorts its blocks into.
 fn alloc_classes() -> Int = 65
 
-/// Where a heap's pages lie: in segments of `segment` bytes, each aligned to its size, holding its
-/// pages' headers from byte `pages_at` and its pages `page` bytes apart, so a block's address names
-/// its page; a block of at most `word_classes` words is of the class its words number; and a dead
-/// block names the next at byte `link_at`.
 pub fn alloc_laid() -> { segment: Int, page: Int, pages_at: Int, word_classes: Int, link_at: Int } =
   { segment: 4194304, page: 65536, pages_at: 8, word_classes: 16, link_at: 8 }
 
-/// `PlyFrame`: a frame that may stop links one into the context's `frames` around the call, its
-/// slots after it, and `each` lets go of every slot; the runtime passes its `d` as -1.
 pub fn frame_struct() -> MachineStruct =
   {
     name: b"PlyFrame",
@@ -392,9 +308,6 @@ pub fn frame_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyType`, a type's descriptor (`type#T`): its identity (the low 64 bits of the digest of its
-/// spelling), its spelling, and the entries the runtime counts and crosses a value of it through,
-/// each taking the value's word form.
 pub fn type_struct() -> MachineStruct =
   {
     name: b"PlyType",
@@ -410,10 +323,6 @@ pub fn type_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyOp`, an operation at its perform's type arguments (`op#effect.op@T..`): the effect's and
-/// the operation's field-table entries, the answer's type, which parameters are the operation's own
-/// type parameter (bit `i` for parameter `i`), each parameter's type and the operation's own type
-/// parameters'.
 pub fn op_struct() -> MachineStruct =
   {
     name: b"PlyOp",
@@ -430,12 +339,6 @@ pub fn op_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyFnDesc`, a lambda's descriptor, which the payload word `closure_descriptor` of its closure's
-/// block names: the uniform entry (the block and each argument as its word form, answering one);
-/// the entry at the function type's own convention, cast to it where emitted code calls it; that
-/// convention's identity, which a checked build compares; and the entries that release the block
-/// (its captures, then its memory), share it with another thread (answering 0 where a capture
-/// cannot cross) and keep it for good.
 pub fn fn_desc_struct() -> MachineStruct =
   {
     name: b"PlyFnDesc",
@@ -450,11 +353,6 @@ pub fn fn_desc_struct() -> MachineStruct =
     ],
   }
 
-/// `PlyKept` (`kept#T`), what a value a perform hands a program's clause is kept beside: its type's
-/// descriptor, and the entries comparing two of its values, each taking their word forms lent: for
-/// equality, answering 1 where they are equal, and for order, answering the sign of their order;
-/// each 0 where `==` or `compare` is not built at the type. Apart from `PlyType`, which a released
-/// `ply`'s bootstrap lays out as it declares it.
 pub fn kept_struct() -> MachineStruct =
   {
     name: b"PlyKept",
@@ -466,8 +364,6 @@ pub fn kept_struct() -> MachineStruct =
     ],
   }
 
-/// Every struct emitted code lays out and the runtime reads, each declared before a struct that
-/// points at it.
 pub fn machine_structs() -> List<MachineStruct> =
   [
     page_struct(),
@@ -480,54 +376,30 @@ pub fn machine_structs() -> List<MachineStruct> =
     fn_desc_struct(),
   ]
 
-/// The count of a block nothing counts or frees, as a unit's static data and the memo hold, which
-/// the C spells `UINT32_MAX`.
 pub fn immortal_count() -> Int = 4294967295
 
-/// The bit of a block's count set while another thread may hold it, which the C spells
-/// `UINT32_C(0x80000000)`.
 pub fn shared_count() -> Int = 2147483648
 
-/// The payload word of a function value's block that names its `PlyFnDesc`, and of a hold that says
-/// it is one.
 pub fn closure_descriptor() -> Int = 0
 
-/// How deeply drop roots nest before one puts its release off until the outermost returns.
 pub fn release_depth() -> Int = 32
 
-/// A hold's object: the value it holds at word `held`, 0 once it has let go.
 pub type HoldLayout = { held: Int }
 
-/// Where the runtime's holds keep what they hold.
 pub fn hold_layout() -> HoldLayout = { held: 1 }
 
-/// A heap instance's block as emitted code lays it out and the runtime reads it, past its header,
-/// in words: how many its head holds before the instance, where in the head the detached body it is
-/// the `handle` of is, which the runtime writes, and where the place of its first variable is, their
-/// count after it. The head's first words hold the block's descriptor, the instance's size and the
-/// place and count of its records.
 pub type HeapInstanceLayout = { words: Int, detached: Int, vars: Int }
 
-/// Where a heap instance's block holds what, as `HeapInstanceLayout` says.
 pub fn heap_instance_layout() -> HeapInstanceLayout = { words: 7, detached: 4, vars: 5 }
 
-/// A clause's record in its `handle`'s instance, as emitted code lays it out and the runtime reads
-/// it: the words holding its closure, the instance, and the descriptor of `String` where the clause
-/// is handed one; its place, counted from 1, lies between the last two.
 pub type ClauseRecordLayout = { closure: Int, instance: Int, string: Int }
 
-/// Where a clause's record holds what, as `ClauseRecordLayout` says.
 pub fn clause_record_layout() -> ClauseRecordLayout = { closure: 0, instance: 1, string: 3 }
 
-/// `failed` while a clause unwinds to the `handle` instance the context's `target` names.
 pub fn failed_target() -> Int = 9
 
-/// `failed` while an `abort.raise` no frame answered waits for the word that answers it, which
-/// `rt_pending_raised` hands the message to raise through.
 pub fn failed_pending() -> Int = 10
 
-/// The words emitted code sets aside in its frame for `rt_unwind_hold` to keep a failure in while a
-/// resource's release runs.
 pub fn unwinding_words() -> Int = 16
 
 fn dotted(parts: List<Bytes>) -> Bytes = Bytes::join(parts, b".")
@@ -539,10 +411,6 @@ fn fields_stated(into: Map<Bytes, Int>, s: MachineStruct) -> Map<Bytes, Int> =
       f.bytes,
     ))
 
-/// What the runtime must lay out and read as this compiler does, each a named integer as the
-/// runtime's description states it: each shared struct's size (`PlyType.bytes`) but the context's,
-/// which is the runtime's own, each field's offset and size (`PlyCtx.failed.at`, `PlyCtx.failed.bytes`),
-/// and the constants both read.
 pub fn facts() -> Map<Bytes, Int> =
   [object_struct()].concat(machine_structs()).fold(
     fields_stated(Map::new(), ctx_struct()),
@@ -613,12 +481,6 @@ pub fn facts() -> Map<Bytes, Int> =
     alloc_laid().link_at,
   )
 
-// --- The runtime's description ------------------------------------------------------
-
-/// The runtime a unit is compiled against, as it describes itself: what all a unit emitted against
-/// it is a function of on its side, each native it implements by the name the compiler declares,
-/// each helper of its own by its C name, what it lays out, as `facts` names it, and each
-/// diagnostic code it raises.
 pub type Runtime = {
   identity: Bytes,
   natives: List<Native>,
@@ -627,7 +489,6 @@ pub type Runtime = {
   codes: List<Bytes>,
 }
 
-/// The line a runtime's description opens with, which names its form.
 fn description_header() -> Bytes = b"ply runtime 1"
 
 fn function_line(kind: Bytes, n: Native) -> Bytes =
@@ -646,8 +507,6 @@ fn function_line(kind: Bytes, n: Native) -> Bytes =
     b"\n",
   ])
 
-/// `r` as its runtime's library describes it: a line naming the form, then a line each for its
-/// identity, each native, each helper, each fact and each code, its words apart by one space.
 pub fn description(r: Runtime) -> Bytes =
   Bytes::concat_all([
     description_header(),
@@ -664,12 +523,10 @@ pub fn description(r: Runtime) -> Bytes =
     Bytes::concat_all(r.codes.map(|code: Bytes| Bytes::concat_all([b"code ", code, b"\n"]))),
   ])
 
-/// The kinds `names` spell; `None` where one spells none.
 fn kinds_named(names: List<Bytes>) -> Option<List<Machine>> =
   names.fold(Some([]), |acc: Option<List<Machine>>, name: Bytes|
     match ((acc, machine_named(name))) { (Some(ms), Some(m)) -> Some(ms.push(m)), _ -> None })
 
-/// The function a `native` or `helper` line's words describe after its kind.
 fn function_of(words: List<Bytes>) -> Option<Native> =
   match ((words.at(1), words.at(2), words.at(3), kinds_named(words.drop(4)))) {
     (Some(name), Some(raises), Some(answer), Some(params)) -> if raises != b"0" && raises != b"1" {
@@ -685,7 +542,6 @@ fn function_of(words: List<Bytes>) -> Option<Native> =
     _ -> None,
   }
 
-/// `r` with what `line` says of it: a line of a kind no compiler of this form reads says nothing.
 fn read_line(r: Runtime, line: Bytes) -> Result<Runtime, Bytes> / {abort.raise} = {
   let words = line.split(b" ");
   let kind = match words.at(0) { Some(k) -> k, None -> b"" };
@@ -714,7 +570,6 @@ fn read_line(r: Runtime, line: Bytes) -> Result<Runtime, Bytes> / {abort.raise} 
   } else { Ok(r) }
 }
 
-/// The runtime `text` describes, as `description` writes one; or why it reads as none.
 pub fn runtime_of(text: Bytes) -> Result<Runtime, Bytes> / {abort.raise} = {
   let lines = text.split(b"\n").filter(|l: Bytes| l.len() > 0);
   match lines.at(0) {
@@ -739,23 +594,14 @@ pub fn runtime_of(text: Bytes) -> Result<Runtime, Bytes> / {abort.raise} = {
   }
 }
 
-/// A runtime of `identity` implementing `natives` that serves the code this compiler emits: its
-/// helpers and what it lays out as declared here. It raises no code.
 pub fn serving_runtime(identity: Bytes, natives: List<Native>) -> Runtime =
   { identity: identity, natives: natives, helpers: helpers(), facts: facts(), codes: [] }
 
-// --- Where a runtime disagrees ------------------------------------------------------
-
-/// Where a runtime does not serve the code this compiler emits: a helper the emitted C calls that it
-/// has none of, or has under another signature; or a fact it lays out otherwise, or states nothing
-/// of.
 pub type RuntimeMismatch =
   | MissingHelper(Native)
   | HelperMismatch({ declared: Native, found: Native })
   | FactMismatch({ name: Bytes, declared: Int, found: Option<Int> })
 
-/// Each place `r` does not serve what is declared here, helpers first, then facts by name. What `r`
-/// says beyond them is not read.
 pub fn runtime_mismatches(r: Runtime) -> List<RuntimeMismatch> = {
   let found = r.helpers.fold(Map::new(), |acc: Map<Bytes, Native>, n: Native|
     acc.insert(n.name, n));
@@ -784,7 +630,6 @@ fn signature_text(n: Native) -> Bytes =
     if n.raises { b", raising" } else { b"" },
   ])
 
-/// Why `u` does not serve, as a line of the diagnostic that lists it.
 pub fn mismatch_line(u: RuntimeMismatch) -> Bytes / {abort.raise} =
   match u {
     MissingHelper(d) ->
@@ -818,8 +663,6 @@ pub fn mismatch_line(u: RuntimeMismatch) -> Bytes / {abort.raise} =
     },
   }
 
-// --- Tests -------------------------------------------------------------------------
-
 test "each struct emitted code lays out has its fields in order, each at a multiple of its size, within the struct" {
   [object_struct(), ctx_struct()].concat(machine_structs()).concat(head_structs()).fold(
     (),
@@ -849,8 +692,6 @@ test "a description reads back as it was written" {
     codes: [b"E0424", b"W0608"],
   };
   assert_eq(runtime_of(description(r)), Ok(r));
-  // A line of a kind this form does not know says nothing; a line of a known kind that does not read
-  // refuses the description.
   assert_eq(runtime_of(description(r).concat(b"later something\n")), Ok(r));
   assert(runtime_of(description(r).concat(b"fact count.frame\n")) != Ok(r), None);
   assert(runtime_of(description(r).concat(b"helper rt_x 0 Ward\n")) != Ok(r), None);
@@ -897,7 +738,6 @@ test "a runtime that lacks or retypes a helper, or lays out a field, a size or a
   assert_eq(said({ ..r, facts: r.facts.remove(b"hold.held") }), [
     b"the runtime states nothing of `hold.held`, which this compiler declares 1",
   ]);
-  // The context's size is the runtime's own; each field's place is not.
   assert_eq(facts().get(b"PlyCtx.bytes"), None);
   assert_eq(facts().get(b"PlyCtx.frames.at"), Some(64))
 }

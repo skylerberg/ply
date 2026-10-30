@@ -1,20 +1,3 @@
-//! Query results that stay valid while everything they read is unchanged. A query is a function a
-//! run calls by name. Its record lists each read it made, in order, with a digest of what the read
-//! returned: a read of the world (a file, a shipped module, an embedded file) or a call of another
-//! query. A query reads only through `memo`, so nothing it reads goes unrecorded.
-//!
-//! A record is checked the first time a run asks for it. Its reads are repeated in order, a call of
-//! another query by checking that query's record the same way, and the record is reused when every
-//! read returns what it returned before. Only a record with a changed read runs its body again, and
-//! a body that returns the same result as before stops the change there. No record is trusted
-//! without this check, so a store or a pack written by another `ply`, or over other files, gives the
-//! same results as the run's own.
-//!
-//! A summarized query's record also stores a summary: every place read below it, every summarized
-//! query called below it, and the definition of every other query below it, down to the summarized
-//! records. A record whose summary is unchanged is reused without reading the records below it, so a
-//! run reads what a change touched and the summaries around it, not everything a record reaches.
-
 import std.bin
 import std.bytes (u64_le)
 import std.list
@@ -23,47 +6,22 @@ import std.gen
 import compiler.store.packs
 
 pub effect memo {
-  /// What the world holds at `at`, as `kind` reads it, or nothing there.
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
-  /// What the query named `query` answers for `input`.
   read fetch(query: Bytes, input: Bytes) -> Bytes
-  /// The digest of what the query named `query` answers for `input`: the read an `fetch` makes,
-  /// without the answer, which `held` hands over and no store is read for. A body that keeps what
-  /// it decoded of an answer by its digest asks so, and decodes each answer once.
   read output_digest(query: Bytes, input: Bytes) -> Bytes
-  /// The answer under `digest`, which a `head` or an `fetch` of this run answered: none where no
-  /// store holds it any more, which an `fetch` then makes again.
   read stored_output(digest: Bytes) -> Option<Bytes>
-  /// Whether the store holds a valid result of `query` for `input`, one an ask would reuse without
-  /// running the body. No body of `query` runs to find out, for any input; calls of other queries
-  /// are settled as an ask settles them, and a record being computed is judged by its stored result.
-  /// It reads nothing a result depends on.
   read is_cached(query: Bytes, input: Bytes) -> Bool
-  /// Offers `output` as what `query` answers for `input`, which a body running for it in this run
-  /// takes in place of working it out: what a body that works out several answers at once hands on.
-  /// The output must be what the body would work out from what it reads.
   read provide(query: Bytes, input: Bytes, output: Bytes) -> Unit
-  /// [`memo.provide`] under the definition of the query `by` in place of the offering body's own:
-  /// what a body offers of work another query's definition wholly reaches, so an answer made from
-  /// the offer moves with that work and not with the rest of the body that happened to do it.
   read provide_as(by: Bytes, query: Bytes, input: Bytes, output: Bytes) -> Unit
-  /// What was offered as the answer the running body works out, if anything was. Taking it reads
-  /// the definition of the query that offered it, so an answer made from an offer moves with the
-  /// code that made it.
   read provided() -> Option<Bytes>
 }
 
-/// A read a record keeps: of the world by what it answered, or of a query by what it answered.
 pub type Dependency =
   | ExternalDependency(Bytes, Bytes, Bytes)
   | QueryDependency(Bytes, Bytes, Bytes)
 
-/// What a body being executed has read so far, beside the run it reads under.
 type Execution = { run: Run, reads: List<Dependency>, external_reads: Map<Bytes, Bool> }
 
-/// A query's result for one input: the hash of the query, the input, every read it made in order,
-/// the digest of its result, which the result is stored under, and its summary, empty for a record
-/// that has none.
 pub type Record = {
   query: Bytes,
   input: Bytes,
@@ -75,11 +33,6 @@ pub type Record = {
 derive bin for Dependency
 derive bin for Record
 
-/// A query: its name, the hash of its definition, which is part of every key its records are stored
-/// under, its body, whether a store keeps its long results or only their digests, and whether its
-/// records store a summary. A query whose results no later run reads, or that are cheaper to compute
-/// than to read, stores only its records and the results short enough to sit inside them; a later run
-/// that needs a longer one runs the body again.
 pub type Query<| e> = {
   name: Bytes,
   hash: Bytes,
@@ -88,21 +41,6 @@ pub type Query<| e> = {
   summarized: Bool,
 }
 
-/// The state of a run:
-/// - `settled`: the result digest of each key the run has settled;
-/// - `asked`: what its driver asked, in order;
-/// - `open` and `trail`: the keys being computed now, with their queries, outermost first; asking
-///   one of them again is a cycle;
-/// - `took` and `ran`: per query, how many records it reused and how many bodies it ran;
-/// - `provided`: results a body offered for other keys, with the offering query, the key that body
-///   was computing and which of its runs made the offer;
-/// - `runs`: how many times the run ran the body under each key;
-/// - `lost`: per query, how many results it computed again because a valid record named a result
-///   that no store held;
-/// - `judged`: each record [`would_reuse`] judged, by its key;
-/// - `judging`: whether the run is judging a record for [`memo.kept`];
-/// - `provisional`: for each key being computed, the stored result a judgment used before the
-///   computation finished.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Dependency>,
@@ -111,7 +49,6 @@ pub type Run = {
   took: Map<Bytes, Int>,
   ran: Map<Bytes, Int>,
   inputs: List<{ query: Bytes, input: Bytes }>,
-  /// Each record the run took back from before an edit it found undone, with no body run.
   restored: List<{ query: Bytes, input: Bytes }>,
   provided: Map<Bytes, ProvidedOutput>,
   runs: Map<Bytes, Int>,
@@ -141,8 +78,6 @@ fn new_run() -> Run =
     provisional: Map::new(),
   }
 
-/// What the run's driver asked, each read by the digest of what it answered: what an answer made
-/// over them is a function of.
 pub fn driver_dependencies(run: Run) -> List<Dependency> = run.asked
 
 fn dependency_keys<| e>(
@@ -159,9 +94,6 @@ fn dependency_keys<| e>(
       ExternalDependency(_, _, _) -> acc,
     })
 
-/// The key of each record of a query whose hash `wanted` holds among those the answers `run`'s
-/// driver asked read, at any depth, those answers' own among them: what a store of those answers
-/// and nothing else keeps.
 pub fn reachable_keys<| e>(
   queries: Map<Bytes, Query<| e>>,
   wanted: Map<Bytes, Bool>,
@@ -188,12 +120,8 @@ pub fn reachable_keys<| e>(
       },
   )
 
-/// How many answers the run made again because a record that stood named one no store held: none
-/// over a store that is whole.
 pub fn missing_count(run: Run) -> Int = run.lost.fold(0, |n: Int, _: Bytes, k: Int| n + k)
 
-/// What a run did of one query: answers taken as kept, bodies run, and of those the answers made again
-/// because no store held them though the query keeps its answers.
 pub type QueryStats = { query: Bytes, took: Int, ran: Int, lost: Int }
 
 derive bin for QueryStats
@@ -203,7 +131,6 @@ fn count_of(m: Map<Bytes, Int>, name: Bytes) -> Int = match m.get(name) { Some(n
 fn incremented(m: Map<Bytes, Int>, name: Bytes) -> Map<Bytes, Int> =
   m.insert(name, count_of(m, name) + 1)
 
-/// Each query the run asked, by name.
 pub fn query_stats(run: Run) -> List<QueryStats> =
   run.ran.fold(run.took, |acc: Map<Bytes, Int>, k: Bytes, _: Int|
     if acc.contains(k) { acc } else { acc.insert(k, 0) }).keys(
@@ -215,7 +142,6 @@ pub fn query_stats(run: Run) -> List<QueryStats> =
       lost: count_of(run.lost, name),
     })
 
-/// `a`'s tallies and `b`'s together, a query's counts summed where both ran it.
 pub fn merged_query_stats(a: List<QueryStats>, b: List<QueryStats>) -> List<QueryStats> =
   b.fold(
     a.fold(Map::new(), |acc: Map<Bytes, QueryStats>, t: QueryStats| acc.insert(t.query, t)),
@@ -228,52 +154,39 @@ pub fn merged_query_stats(a: List<QueryStats>, b: List<QueryStats>) -> List<Quer
   ).values(
   )
 
-/// Each input of the query `name` the run took a record back for.
 pub fn restored_for(run: Run, name: Bytes) -> List<Bytes> =
   run.restored.filter(|r: { query: Bytes, input: Bytes }| r.query == name).map(
     |r: { query: Bytes, input: Bytes }| r.input,
   )
 
-/// Each input the run ran the body of the query `name` for, in the order it ran them.
 pub fn executed_for(run: Run, name: Bytes) -> List<Bytes> =
   run.inputs.filter(|r: { query: Bytes, input: Bytes }| r.query == name).map(
     |r: { query: Bytes, input: Bytes }| r.input,
   )
 
-/// How many bodies the run ran, over every query.
 pub fn executed_count(run: Run) -> Int = run.ran.fold(0, |n: Int, _: Bytes, k: Int| n + k)
 
-/// The digest a read is kept by: nothing there is a value of its own.
 pub fn digest_of(query_output: Option<Bytes>) -> Bytes =
   match query_output { Some(b) -> b"=".concat(blake3(b)), None -> b"-" }
 
-/// What a query's answer for `input` is kept under: its definition's hash and the input's digest.
 pub fn key_of<| e>(q: Query<| e>, input: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.key\x00", q.hash, b"\x00", blake3(input)]))
 
 fn length_prefixed(b: Bytes) -> Bytes = u64_le(b.len()).concat(b)
 
-/// The id of the place `at`, read as `kind`, among the places a run looked at.
 pub fn location_id(kind: Bytes, at: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.place\x00", length_prefixed(kind), at]))
 
-/// The place that holds a query's hash, under the query's name. A record made from an offer reads
-/// it for the query that offered it, and a summary reads it for each unsummarized query below it.
 fn query_kind() -> Bytes = b"query"
 
-/// The place that identifies the pack below a store together with the shipped files a run reads. A
-/// command's summary reads it, since the run may have reused the pack's records unchecked.
 pub fn pack_kind() -> Bytes = b"pack"
 
-/// The value of the [`pack_kind`] place for the pack `index` describes and the shipped files
-/// `world` lists: nothing where there is no pack.
 pub fn pack_place(index: Option<packs::Index>, world: Bytes) -> Option<Bytes> =
   match index {
     Some(i) -> Some(blake3(Bytes::concat_all([length_prefixed(i.id), world]))),
     None -> None,
   }
 
-/// The id of a set of queries. A pack records the id of the queries that made it.
 pub fn queries_id<| e>(queries: Map<Bytes, Query<| e>>) -> Bytes =
   blake3(
     Bytes::concat_all(
@@ -282,11 +195,8 @@ pub fn queries_id<| e>(queries: Map<Bytes, Query<| e>>) -> Bytes =
     ),
   )
 
-/// The key the previous record under `key` is stored under once a new one replaces it: a key of
-/// the same width that no query makes.
 pub fn previous_key(key: Bytes) -> Bytes = blake3(b"earlier\x00".concat(key))
 
-/// The records `held` keeps as what their keys answer, the earlier ones left out.
 pub fn current_records(held: MemoryStore) -> Map<Bytes, Record> = {
   let earlier = held.records.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes, _: Record|
     acc.insert(previous_key(k), true));
@@ -294,8 +204,6 @@ pub fn current_records(held: MemoryStore) -> Map<Bytes, Record> = {
     if earlier.contains(k) { acc } else { acc.insert(k, r) })
 }
 
-/// Keeps the record under `key` as the earlier one, where `next` is another: what an edit that is
-/// undone answers again.
 fn keep_previous(key: Bytes, next: Record) -> Unit / {memo_store.read, memo_store.write} =
   match memo_store.record(key) {
     Some(old) -> if old.output != next.output || old.reads != next.reads {
@@ -306,15 +214,11 @@ fn keep_previous(key: Bytes, next: Record) -> Unit / {memo_store.read, memo_stor
 
 fn record_format() -> Bytes = b"\x06"
 
-/// The longest answer a store keeps inside the record that names it.
 pub fn max_inline_size() -> Int = 2048
 
-/// `output` where a store keeps it inside its record.
 pub fn inline_output(output: Bytes) -> Option<Bytes> =
   if output.len() <= max_inline_size() { Some(output) } else { None }
 
-/// `r` as a store writes it: its result's digest first, then `inline`, the result itself where the
-/// record holds it, so a run that reuses it reads no further.
 pub fn record_bytes(r: Record, inline: Option<Bytes>) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     record_format(),
@@ -333,20 +237,15 @@ fn length_prefixed_at(b: Bytes, at: Int) -> Option<{ value: Bytes, next: Int }> 
     else { Some({ value: b.slice(at + 8, at + 8 + n), next: at + 8 + n }) },
   }
 
-/// Whether `b` starts like a record's bytes.
 fn of_record(b: Bytes) -> Bool = b.len() >= 9 && b.slice(0, 1) == record_format()
 
-/// The digest of the answer a record's bytes, or their first bytes, name.
 pub fn output_digest_of(b: Bytes) -> Option<Bytes> / {abort.raise} =
   if !of_record(b) { None }
   else { match length_prefixed_at(b, 1) { Some(o) -> Some(o.value), None -> None } }
 
-/// What a run names its queries by to a store: the hash of each.
 fn hashes_of<| e>(queries: Map<Bytes, Query<| e>>) -> List<Bytes> =
   queries.fold([], |acc: List<Bytes>, _: Bytes, q: Query<| e>| acc.push(q.hash))
 
-/// The answer a record's bytes, or their first bytes, hold beside its digest: none for a record
-/// that keeps its answer apart.
 pub fn inline_output_of(b: Bytes) -> Option<Bytes> / {abort.raise} =
   if !of_record(b) { None } else {
     match length_prefixed_at(b, 1) {
@@ -356,17 +255,14 @@ pub fn inline_output_of(b: Bytes) -> Option<Bytes> / {abort.raise} =
     }
   }
 
-/// Where in a record's bytes what follows its answer starts.
 fn after_inline(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
   if at >= b.len() { None }
   else if b.at(at) == 0 { Some(at + 1) }
   else if b.at(at) != 1 { None }
   else { match length_prefixed_at(b, at + 1) { Some(i) -> Some(i.next), None -> None } }
 
-/// How many of a record's first bytes name its answer, and hold it where the record does.
 pub fn record_head_size() -> Int = 4096
 
-/// The record `b` holds, or nothing where they do not read as one.
 pub fn record_from(b: Bytes) -> Option<Record> / {abort.raise} =
   if !of_record(b) { None } else {
     match length_prefixed_at(b, 1) {
@@ -400,37 +296,17 @@ pub fn record_from(b: Bytes) -> Option<Record> / {abort.raise} =
     }
   }
 
-/// Where a run reads and stores records and their results, and reads the world: the handler a
-/// command runs its queries under.
 pub effect memo_store {
-  /// The digest of the answer the record under `key` names.
   read output_digest(key: Bytes) -> Option<Bytes>
-  /// The record kept under `key` in the run's store, or else in the pack below it.
   read record(key: Bytes) -> Option<Record>
-  /// The answer kept under its digest, in the store or the pack below it.
   read output(digest: Bytes) -> Option<Bytes>
-  /// Keeps `r` under `key`, and `output` under `r.output`: in the store where `lasting` or where it is
-  /// short enough to sit inside its record, else for the rest of the run only.
   write put(key: Bytes, r: Record, output: Bytes, lasting: Bool) -> Unit
-  /// Keeps `r`, a record the store or its pack holds already, under `key`; its answer stays where it
-  /// is kept.
   write adopt(key: Bytes, r: Record) -> Unit
-  /// What the world holds at `at`, as `kind` reads it. A place is looked at once a run, so a run
-  /// reads one world however long it runs: what moved under it is found by the next run.
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
-  /// The digest of what [`memo_store.external`] answers for the place, worked out once a run.
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
-  /// Each place the run has looked at so far, as a read with the digest it found.
   read looked() -> List<Dependency>
-  /// Whether the record under `key` can be reused unchecked: it is in a pack made by the run's own
-  /// queries over exactly the shipped files the run reads.
   read standing(key: Bytes) -> Bool
-  /// The pack's record under `key` where the store holds a record of its own under it: none where
-  /// it holds none, or the pack has none.
   read below(key: Bytes) -> Option<Record>
-  /// Tells the store which queries the run uses, before the run asks it anything: `id` names the set,
-  /// and `queries` lists each query's hash, since a store eventually drops the records of queries no
-  /// run uses.
   write running(id: Bytes, queries: List<Bytes>) -> Unit
 }
 
@@ -444,7 +320,6 @@ fn query_of<| e>(queries: Map<Bytes, Query<| e>>, name: Bytes) -> Query<| e> / {
 
 fn too_deep() -> Bytes = b"queries ask one another deeper than any program's queries go"
 
-/// What the world holds at `at` as `kind` reads it, a query's hash at its name among them.
 fn external_at<| e>(
   queries: Map<Bytes, Query<| e>>,
   kind: Bytes,
@@ -453,7 +328,6 @@ fn external_at<| e>(
   if kind == query_kind() { match queries.get(at) { Some(q) -> Some(q.hash), None -> None } }
   else { memo_store.external(kind, at) }
 
-/// The digest of what [`external_at`] answers.
 fn external_digest_at<| e>(
   queries: Map<Bytes, Query<| e>>,
   kind: Bytes,
@@ -462,15 +336,11 @@ fn external_digest_at<| e>(
   if kind == query_kind() { digest_of(external_at(queries, kind, at)) }
   else { memo_store.external_digest(kind, at) }
 
-/// A new run over the store, with its queries named to the store first. Nothing is checked until
-/// it is asked for.
 pub fn start_run<| e>(queries: Map<Bytes, Query<| e>>) -> Run / {memo_store.write} = {
   memo_store.running(queries_id(queries), hashes_of(queries));
   new_run()
 }
 
-/// What the query `name` answers for `input`: its record's answer where nothing it read moved, else
-/// its body's, which is kept. The run notes the read as one its driver asked.
 pub fn query_output<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -485,9 +355,6 @@ pub fn query_output<| e>(
   }
 }
 
-/// [`answer`], for a query's body: what `q` answers for `input`, kept under `key`, beside the digest
-/// it is kept by. `left` is how much deeper the asking may go: deeper than every query a program
-/// has, which only a run asking its way around a loop reaches.
 fn fetch_output<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -500,8 +367,6 @@ fn fetch_output<| e>(
     let s = verify_key(queries, run, q, key, input, left - 1);
     match memo_store.output(s.head) {
       Some(o) -> { run: s.run, output: o, head: s.head },
-      // A result no store holds is computed again, and counted as lost where its query keeps its
-      // results. It must match its record's digest, or the body reads something it does not record.
       None -> if s.run.open.contains(key) { abort.raise(judgment_stopped()) } else {
         let e = execute(queries, s.run, q, key, input, left - 1);
         if e.head != s.head {
@@ -525,8 +390,6 @@ fn fetch_output<| e>(
 fn reuse(run: Run, name: Bytes, output: Bytes) -> { run: Run, head: Bytes } =
   { run: { ..run, took: incremented(run.took, name) }, head: output }
 
-/// The digest of what `q` returns for `input`, stored under `key`: the run's own value where it
-/// settled the key already, else what [`checked`] finds. Each key is settled once a run.
 fn verify_key<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -540,9 +403,6 @@ fn verify_key<| e>(
       Some(h) -> { run: run, head: h },
       None -> {
         let step = { query: q.name, input: input };
-        // Reads are checked in order and stop at the first that changed, so reaching a record being
-        // computed is a cycle a fresh run would also hit. A judgment for `memo.kept` asks for
-        // records no body asked for, so it takes the stored result instead.
         if run.open.contains(key) {
           if !run.judging { report_cycle(run, step) } else {
             match memo_store.output_digest(key) {
@@ -553,8 +413,6 @@ fn verify_key<| e>(
         } else {
           let opened = { ..run, open: run.open.insert(key, true), trail: run.trail.push(step) };
           let done = checked(queries, opened, q, key, input, left - 1);
-          // What was settled from a result handed out before this one was done stands only where
-          // the result came out the same.
           let early = match done.run.provisional.get(key) {
             Some(h) -> h != done.head,
             None -> false,
@@ -575,9 +433,6 @@ fn verify_key<| e>(
     }
   }
 
-/// What `q` returns for `input`, stored under `key`. The record is reused when the pack below is
-/// valid as it is, when its summary is unchanged, or when its reads are; the record it replaced is
-/// reused when that one's reads are unchanged; otherwise the body runs.
 fn checked<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -606,9 +461,6 @@ fn checked<| e>(
     },
   }
 
-/// An undone edit returns what it returned before: the record the one under `key` replaced, or the
-/// pack's own record where the store holds another, is reused when its reads are unchanged and its
-/// result is still stored. Otherwise `q`'s body runs.
 fn undone_or_run<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -639,7 +491,6 @@ fn undone_or_run<| e>(
   }
 }
 
-/// `record` where its reads are unchanged and its result is still stored; else none.
 fn taken_back<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -657,10 +508,8 @@ fn taken_back<| e>(
     },
   }
 
-/// The message that ends a judgment for [`memo.kept`] that reached a record being computed.
 fn judgment_stopped() -> String = "a judgment reached a record being computed"
 
-/// Refuses a query asked for its own answer, naming the queries asked on the way to it.
 fn report_cycle(
   run: Run,
   step: { query: Bytes, input: Bytes },
@@ -672,8 +521,6 @@ fn report_cycle(
           ++ String::of_bytes_lossy(s.input.slice(0, min(s.input.len(), 120)))),
   )
 
-/// Whether each of `reads` returns now what it returned when recorded, checked in order up to the
-/// first that differs. A call of a query is settled as the run settles that query.
 fn dependencies_unchanged<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -697,13 +544,9 @@ fn dependencies_unchanged<| e>(
       })
   }
 
-/// The id of a call of the query `name` for `input`, the same whatever the query's hash is: what a
-/// summary lists the call under.
 fn query_dependency_id(name: Bytes, input: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.asked\x00", length_prefixed(name), input]))
 
-/// A summary being built: the reads still to visit, the ids already listed, the summary so far,
-/// and whether every record below was found.
 type Summing = {
   work: List<Dependency>,
   seen: Map<Bytes, Bool>,
@@ -711,14 +554,10 @@ type Summing = {
   whole: Bool,
 }
 
-/// `x` continued with `rest`, with `r` added to the summary unless `id` is listed already.
 fn noting(x: Summing, rest: List<Dependency>, id: Bytes, r: Dependency) -> Summing =
   if x.seen.contains(id) { { ..x, work: rest } }
   else { { ..x, work: rest, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
 
-/// The summary of `reads`: every place they and the records below them read, every summarized query
-/// they call and the definition of every unsummarized query below them, down to the summarized
-/// records, each once. None where a record below is missing from every store.
 fn summary_of<| e>(
   queries: Map<Bytes, Query<| e>>,
   reads: List<Dependency>,
@@ -757,8 +596,6 @@ fn summary_of<| e>(
   if made.whole { Some(made.summary) } else { None }
 }
 
-/// The record `r` stored again under `key` with the summary of its reads now: for a record whose
-/// summary changed while its reads did not.
 fn resummarized<| e>(
   queries: Map<Bytes, Query<| e>>,
   key: Bytes,
@@ -769,11 +606,6 @@ fn resummarized<| e>(
     None -> (),
   }
 
-/// Whether the record of the query `q` under `key` would be reused without its body running: the
-/// run settled it already, the pack below is valid as it is, its summary or else its reads are
-/// unchanged, or an undone edit would bring back the record it replaced or the pack's own; each
-/// read judged by [`judged_reads`]. A result of a query that does not keep long results must still
-/// be stored. The run remembers each judgment.
 fn would_reuse<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -815,8 +647,6 @@ fn would_reuse<| e>(
     }
   }
 
-/// Whether `record` would be taken back as [`taken_back`] takes one, judged as [`judged_reads`]
-/// judges, with no body of the query `judged` run.
 fn judged_back<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -832,11 +662,6 @@ fn judged_back<| e>(
     },
   }
 
-/// Whether each of `reads` returns what it returned before, without running any body of the query
-/// `judged`. A call is judged by the result the run settled, by the stored result of a record being
-/// computed now, by an offer made this run, by judging the record the same way where it is another
-/// of `judged`, and otherwise by settling it, so a body that runs again and returns the same result
-/// counts as unchanged.
 fn judged_reads<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -880,12 +705,8 @@ fn judged_reads<| e>(
       }
     })
 
-/// Whether `o` is still a valid result for its key: it came from the latest run of the offering body
-/// in this run. A body offers what it computed from its reads, and a run reads each place once.
 fn provided_valid(run: Run, o: ProvidedOutput) -> Bool = run.runs.get(o.from) == Some(o.nth)
 
-/// `q`'s body run for `input`, its record stored under `key`, with a summary of its reads where `q`
-/// is summarized.
 fn execute<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -908,7 +729,6 @@ fn execute<| e>(
     let world = |s: Execution, kind: Bytes, at: Bytes| {
       let found = external_at(queries, kind, at);
       let d = external_digest_at(queries, kind, at);
-      // A place read again to the same answer is one read.
       let seen = location_id(kind, at).concat(d);
       {
         st: if s.external_reads.contains(seen) { s } else {
@@ -921,8 +741,6 @@ fn execute<| e>(
         found: found,
       }
     };
-    // What the query `name` answers for `asked`, noted as a read of the body: with `whole`, the
-    // answer beside its digest.
     let asking = |s: Execution, name: Bytes, asked: Bytes, whole: Bool| {
       let aq = query_of(queries, name);
       let akey = key_of(aq, asked);
@@ -935,7 +753,6 @@ fn execute<| e>(
         asked: a,
       }
     };
-    // `output` offered as what `name` answers for `asked`, read as the definition of `by`.
     let offering = |s: Execution, by: Bytes, name: Bytes, asked: Bytes, output: Bytes|
       {
         ..s,
@@ -973,15 +790,12 @@ fn execute<| e>(
         let jq = query_of(queries, name);
         let k = key_of(jq, asked);
         let was = st.run;
-        // A judgment runs bodies no ask may run: one that fails, or reaches a record being computed
-        // with no stored result, judges the record not kept.
         let judged = handle {
           Some(would_reuse(queries, { ..was, judging: true }, jq, k, left - 1))
         } with {
           abort.raise(_) -> None,
         };
         match judged {
-          // A judgment that reached a record being computed keeps nothing it settled.
           None -> match was.provided.get(k) { Some(o) -> provided_valid(was, o), None -> false },
           Some(w) -> {
             st = { ..st, run: { ..w.run, judging: was.judging } };
@@ -1017,19 +831,11 @@ fn execute<| e>(
     let summary = if !q.summarized { [] }
     else { match summary_of(queries, s.reads) { Some(made) -> made, None -> [] } };
     let rec = { query: q.hash, input: input, reads: s.reads, output: d, summary: summary };
-    // Only an answer kept is worth restoring when an edit is undone.
     if q.kept { keep_previous(key, rec) };
     memo_store.put(key, rec, ran.output, q.kept);
     { run: s.run, head: d }
   }
 
-// --- Results computed over what a driver asked ------------------------------------------------
-// A command's result depends on what its run asked and on the places it read, so it is stored as a
-// record whose summary is every place the run looked at and every query's definition, and reused
-// while that summary is unchanged.
-
-/// The command result stored under `key`, where every place its run looked at is unchanged and every
-/// query is defined as it was; otherwise none. No record below it is read.
 pub fn cached_output<| e>(
   queries: Map<Bytes, Query<| e>>,
   key: Bytes,
@@ -1046,9 +852,6 @@ pub fn cached_output<| e>(
     else { None },
   }
 
-/// `output` stored under `key` as a command's result over `reads`, made by what `hash` names. Its
-/// summary is `looked`, the places the run that computed it looked at, and the definition of each of
-/// `queries`.
 pub fn record_output<| e>(
   queries: Map<Bytes, Query<| e>>,
   key: Bytes,
@@ -1057,8 +860,6 @@ pub fn record_output<| e>(
   looked: List<Dependency>,
   output: Bytes,
 ) -> Unit / {memo_store.read, memo_store.write, abort.raise} = {
-  // The store keeps the records of the queries a run names, so a run that only stores a command's
-  // result names its queries too.
   memo_store.running(queries_id(queries), hashes_of(queries));
   let defined = queries.fold(looked, |acc: List<Dependency>, name: Bytes, q: Query<| e>|
     acc.push(ExternalDependency(query_kind(), name, digest_of(Some(q.hash)))));
@@ -1073,13 +874,8 @@ pub fn record_output<| e>(
   memo_store.put(key, rec, output, true)
 }
 
-// --- A store held in memory ------------------------------------------------------------------
-
-/// A place a run looked at, and what it found there.
 pub type Look = { kind: Bytes, at: Bytes, value: Option<Bytes>, digest: Bytes }
 
-/// The state of a run over a store in memory: what it found at each place it looked at, the pack
-/// below the store, whether the pack's records can be reused unchecked, and each pack record read.
 type MemoryRunState = {
   looked: Map<Bytes, Look>,
   pack: packs::PackReader,
@@ -1087,16 +883,10 @@ type MemoryRunState = {
   packed: Map<Bytes, Option<Record>>,
 }
 
-/// A store in memory: what a store in a directory holds in files.
 pub type MemoryStore = { records: Map<Bytes, Record>, outputs: Map<Bytes, Bytes> }
 
 pub fn empty_memory_store() -> MemoryStore = { records: Map::new(), outputs: Map::new() }
 
-/// `work` run over `held`, with `look` reading the world: its value, and the store with what it
-/// stored. A record or result `held` lacks is read from the pack below it through `read`, which
-/// returns a frame of the pack's file. `world` lists the shipped files the run reads: the pack's
-/// records are reused unchecked where the pack was made by the run's queries over exactly those
-/// files, and checked by their reads otherwise (`packs`).
 pub fn with_memory_store<a | e>(
   held: MemoryStore,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
@@ -1104,8 +894,6 @@ pub fn with_memory_store<a | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> { held: MemoryStore, value: a } / {abort.raise | e} = {
-  // A packed record, read once a run, beside the answer it holds, which a later ask of the answer
-  // reads.
   let packed_at = |r: MemoryRunState, inl: Map<Bytes, Bytes>, key: Bytes|
     match r.packed.get(key) {
       Some(rec) -> { running: r, inlined: inl, rec: rec },
@@ -1132,7 +920,6 @@ pub fn with_memory_store<a | e>(
         }
       },
     };
-  // A pack that is valid as it is wins; otherwise the store's own record comes first.
   let held_or_packed = |h: MemoryStore, r: MemoryRunState, inl: Map<Bytes, Bytes>, key: Bytes|
     if r.trusted {
       let p = packed_at(r, inl, key);
@@ -1207,7 +994,6 @@ pub fn with_memory_store<a | e>(
       };
     },
     memo_store.adopt(key, rec) -> {
-      // An answer its record holds is held beside the record kept again.
       store = {
         records: store.records.insert(key, rec),
         outputs: match inlined.get(rec.output) {
@@ -1248,7 +1034,6 @@ pub fn with_memory_store<a | e>(
           None -> false,
         },
       };
-      // A command's result over the pack depends on which pack it is.
       if running.pack.index != None {
         let l = looked(running, pack_kind(), b"");
         running = l.running;
@@ -1258,8 +1043,6 @@ pub fn with_memory_store<a | e>(
   }
 }
 
-/// `work` run with no store of its own, over the pack `read` reads as [`with_memory_store`] does: each record
-/// it keeps lives only as long as the run.
 pub fn with_temporary_store<a | e>(
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
@@ -1267,8 +1050,6 @@ pub fn with_temporary_store<a | e>(
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> a / {abort.raise | e} = with_memory_store(empty_memory_store(), read, world, look, work).value
 
-/// A pack of what `held` holds, written uncompressed, made by `queries` over the files `files`
-/// lists.
 pub fn pack_memory_store<| e>(
   held: MemoryStore,
   queries: Map<Bytes, Query<| e>>,
@@ -1309,8 +1090,6 @@ pub fn pack_memory_store<| e>(
   )
 }
 
-// --- Tests ----------------------------------------------------------------------------------
-
 type ExternalDependency = { files: Map<Bytes, Bytes>, held: MemoryStore, read: Int }
 
 fn test_world(files: List<{ at: Bytes, text: Bytes }>) -> ExternalDependency =
@@ -1321,7 +1100,6 @@ fn test_world(files: List<{ at: Bytes, text: Bytes }>) -> ExternalDependency =
     read: 0,
   }
 
-/// A query of a test, its longer answers kept and no summary.
 fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> Query<| {}> =
   { name: name, hash: hash, body: body, kept: true, summarized: false }
 
@@ -1342,8 +1120,6 @@ fn test_queries(length_hash: Bytes) -> Map<Bytes, Query<| {}>> =
     query(b"longer", b"l1", longer),
   )
 
-/// `name` asked of `input` over `w` from a run of its own: what it answered, how many bodies ran,
-/// how many times it read the world, and the world it left.
 fn asked_over(
   queries: Map<Bytes, Query<| {}>>,
   w: ExternalDependency,
@@ -1352,8 +1128,6 @@ fn asked_over(
 ) -> { output: Bytes, executed: Int, lost: Int, read: Int, world: ExternalDependency } / {abort.raise} =
   asked_with(queries, w, None, None, name, input)
 
-/// [`asked_over`], with `packed` below the run's store, made over files `w`'s are listed against,
-/// and the world holding `after` from its second read on, where that is given.
 fn asked_with(
   queries: Map<Bytes, Query<| {}>>,
   w: ExternalDependency,
@@ -1396,7 +1170,6 @@ fn asked_with(
       },
   }
 
-/// How many times a test's run read the world before this one.
 effect world_reads {
   write counted() -> Int
 }
@@ -1404,7 +1177,6 @@ effect world_reads {
 fn edited(w: ExternalDependency, at: Bytes, text: Bytes) -> ExternalDependency =
   { ..w, files: w.files.insert(at, text) }
 
-/// `w` with only the record under `key` left of what its store holds.
 fn only_record(w: ExternalDependency, key: Bytes) -> ExternalDependency / {abort.raise} =
   match w.held.records.get(key) {
     Some(r) -> { ..w, held: { ..w.held, records: Map::new().insert(key, r) } },
@@ -1429,7 +1201,6 @@ test "an answer that comes out the same stops what an edit moves" {
   let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
   assert_eq(first.output, b"long 4");
   assert_eq(first.executed, 2);
-  // Another text of the same length: `length` runs again and answers the same, so `longer` stands.
   let same = asked_over(q, edited(first.world, b"a", b"FOUR"), b"longer", b"a");
   assert_eq(same.output, b"long 4");
   assert_eq(same.executed, 1);
@@ -1480,8 +1251,6 @@ test "records whose reads now lead round to what asked them answer as a cold run
   ];
   let first = asked_over(q, test_world(files), b"paired", b"s");
   assert_eq(first.output, b"alone|loop");
-  // `switched` now asks `relayed`, whose record answers `loop`, which would lead round to `switched`
-  // again; checked in order, `leveled` below it answers `fine` first.
   let moved = edited(edited(first.world, b"switch", b"ask"), b"f", b"fine");
   let cold = edited(
     edited({ ..first.world, held: empty_memory_store() }, b"switch", b"ask"),
@@ -1523,7 +1292,6 @@ test "records kept in other worlds that ask one another answer as a cold run, an
   let second = asked_over(q, edited(edited(first.world, b"hd", b"off"), b"yd", b"on"), b"y", b"x");
   assert_eq(second.output, b"h");
   assert_eq(asked_over(q, edited(second.world, b"yd", b"off"), b"g", b"x").output, b"h");
-  // With both on, a cold run asks `g` round to itself too.
   let both = edited(second.world, b"hd", b"on");
   assert_eq(try_answer(|| asked_over(q, both, b"g", b"x").output), None);
   assert_eq(
@@ -1541,7 +1309,6 @@ test "an edit undone answers as before with no body run, from the records it rep
   let undone = asked_over(q, edited(moved.world, b"a", b"four"), b"longer", b"a");
   assert_eq(undone.output, b"long 4");
   assert_eq(undone.executed, 0);
-  // And done again: the record undoing replaced is the earlier one now.
   let redone = asked_over(q, edited(undone.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(redone.output, b"long 5");
   assert_eq(redone.executed, 0)
@@ -1588,7 +1355,6 @@ test "an answer asked for by its digest is the read an ask makes, and is handed 
   );
   assert_eq(headed.output, b"long 4!");
   assert_eq(headed.world.held.records, asked.world.held.records);
-  // The read stands as an ask's does: an edit that moves the answer below runs the body again.
   let moved = asked_over(
     by(loudest_by_digest),
     edited(headed.world, b"a", b"forty"),
@@ -1638,10 +1404,8 @@ test "what stood through a definition that moved under it answers anew where tha
     b"longer",
     b"a",
   );
-  // `length` is defined anew and answers alike, so `longer` stands on it.
   let stood = asked_over(test_queries(b"h2"), first.world, b"longer", b"a");
   assert_eq(stood.executed, 1);
-  // Its answer moves now: `longer`, which asked it under its earlier definition, answers anew.
   let moved = asked_over(test_queries(b"h2"), edited(stood.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(moved.output, b"long 5");
   assert_eq(moved.executed, 2)
@@ -1685,13 +1449,10 @@ test "a run reads each place once, whatever the place holds later in it" {
   assert_eq(next.executed, 1)
 }
 
-// --- Summaries ------------------------------------------------------------------------------
-
 fn topped(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"middle", input).concat(b"!")
 
 fn middled(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.fetch(b"length", input))
 
-/// `top`, which keeps a summary, over `middle` and `length`, which keep none.
 fn summed() -> Map<Bytes, Query<| {}>> =
   test_queries(b"h1").insert(b"top", { ..query(b"top", b"t1", topped), summarized: true }).insert(
     b"middle",
@@ -1703,7 +1464,6 @@ test "a record whose summary answers as it did stands with no record below it re
   let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   assert_eq(first.output, b"mid 4!");
   let top = key_of(query_of(q, b"top"), b"a");
-  // No record below `top` is held: it stands on its summary alone.
   let again = asked_over(q, only_record(first.world, top), b"top", b"a");
   assert_eq(again.output, b"mid 4!");
   assert_eq(again.executed, 0)
@@ -1720,7 +1480,6 @@ test "a summary holds each place and definition below, down to records that keep
   let middle = summary_of_key(b"middle");
   assert(middle.contains(ExternalDependency(b"file", b"a", digest_of(Some(b"four")))));
   assert(middle.contains(ExternalDependency(query_kind(), b"length", digest_of(Some(b"h1")))));
-  // `top`'s ends at `middle`, which keeps a summary of its own.
   assert_eq(summary_of_key(b"top"), [QueryDependency(b"middle", b"a", digest_of(Some(b"mid 4")))])
 }
 
@@ -1728,8 +1487,6 @@ test "a summary that moved under an answer that came out the same is made anew" 
   let q = summed();
   let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   let top = key_of(query_of(q, b"top"), b"a");
-  // Another text of the same length: the summary fails, the reads below stand once `length` answers
-  // alike, and `top` keeps the summary they make now.
   let same = asked_over(q, edited(first.world, b"a", b"FOUR"), b"top", b"a");
   assert_eq(same.output, b"mid 4!");
   assert_eq(same.executed, 1);
@@ -1744,23 +1501,17 @@ test "a summary moves with the definition of a query below it" {
   let first = asked_over(summed(), test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   let top = key_of(query_of(summed(), b"top"), b"a");
   let redefined = summed().insert(b"length", query(b"length", b"h2", length_of));
-  // Only `top`'s record is held: with `length` defined anew, its summary fails and what it reads
-  // below is made again.
   let moved = asked_over(redefined, only_record(first.world, top), b"top", b"a");
   assert_eq(moved.output, b"mid 4!");
   assert_eq(moved.executed, 2)
 }
 
-// --- Packs ----------------------------------------------------------------------------------
-
-/// What `w`'s files are, as a run lists the files a pack below it was made over.
 fn files_of(w: ExternalDependency) -> Bytes =
   Bytes::concat_all(
     w.files.fold([], |acc: List<Bytes>, at: Bytes, text: Bytes|
       acc.push(at).push(b" ").push(blake3(text)).push(b"\n")),
   )
 
-/// The pack cut from `held` over the world `w`'s files, for the queries `q`.
 fn pack_over(
   q: Map<Bytes, Query<| {}>>,
   w: ExternalDependency,
@@ -1777,7 +1528,6 @@ test "a packed answer stands as it is over the very files it was made over, and 
     b"longer",
     b"a",
   );
-  // Only `longer` runs: `length` stands as packed.
   assert_eq(first.output, b"long 4");
   assert_eq(first.executed, 1);
   assert_eq(current_records(first.world.held).keys(), [key_of(query_of(q, b"longer"), b"a")])
@@ -1787,7 +1537,6 @@ test "a packed answer over other files is held to its reads, and answered again 
   let q = test_queries(b"h1");
   let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let packed = pack_over(q, four.world);
-  // Another file beside it: the pack does not stand as it is, but what `length` read is as it was.
   let beside = asked_with(
     q,
     test_world([{ at: b"a", text: b"four" }, { at: b"z", text: b"more" }]),
@@ -1853,7 +1602,6 @@ test "what asked a packed answer is answered again where the files below the pac
     b"longer",
     b"a",
   );
-  // The pack stands no longer, and `length` is held to what it read.
   let moved = asked_with(
     q,
     edited(first.world, b"a", b"forty"),
@@ -1891,10 +1639,6 @@ test "a run takes what the pack below its store holds for what moved" {
   assert_eq(next.executed, 0)
 }
 
-// --- Commands -------------------------------------------------------------------------------
-
-/// A command over `w`, with `packed` below its store, that answers what `name` answers for `a` and
-/// keeps it under `key`: whether it was taken back, what it answered and how many bodies ran.
 fn commanded_over(
   q: Map<Bytes, Query<| {}>>,
   w: ExternalDependency,
@@ -1936,8 +1680,6 @@ test "an answer kept over what a run asked stands while every place the run look
   let again = commanded_over(q, first.world, None, b"longer", b"k");
   assert(again.took);
   assert_eq(again.output, b"said long 4");
-  // Another text of the same length moves a place the run looked at: the answer is made again, and
-  // only the body that read the place runs.
   let same = commanded_over(q, edited(again.world, b"a", b"FOUR"), None, b"longer", b"k");
   assert(!same.took);
   assert_eq([same.output, Bytes::of_string(same.executed.to_string())], [b"said long 4", b"1"]);
@@ -1989,7 +1731,6 @@ test "a record whose answer is no longer kept is answered again" {
 test "an answer made again that comes out otherwise than its record is refused" {
   let q = test_queries(b"h1");
   let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  // The body now answers otherwise from the same reads: it reads what it does not record.
   let unrecorded = Map::new().insert(
     b"length",
     query(b"length", b"h1", |input: Bytes| {
@@ -2001,8 +1742,6 @@ test "an answer made again that comes out otherwise than its record is refused" 
   assert_eq(try_answer(|| asked_over(unrecorded, lost, b"length", b"a").output), None)
 }
 
-/// The text the world holds of the file `input` names, empty where it holds none: a query body the
-/// tests of a memo store read files through.
 pub fn read_file(input: Bytes) -> Bytes / {memo.read} =
   match memo.external(b"file", input) { Some(t) -> t, None -> b"" }
 
@@ -2056,7 +1795,6 @@ test "an answer taken from an offer is made again when the query that offered it
   assert_eq(first.output, b"v a");
   let again = asked_over(offer_queries(b"o1"), first.world, b"both", b"a");
   assert_eq(again.executed, 0);
-  // The offering query runs under its new definition, and the answer taken from its offer with it.
   let moved = asked_over(offer_queries(b"o2"), again.world, b"both", b"a");
   assert_eq(moved.output, b"v a");
   assert_eq(moved.executed, 2)
@@ -2070,7 +1808,6 @@ fn judging(input: Bytes) -> Bytes / {memo.read} = {
 test "a record is judged kept by an answer offered in the run, with no body run for it" {
   let q = offer_queries(b"o1").insert(b"judging", query(b"judging", b"j1", judging));
   let first = asked_over(q, test_world([]), b"both", b"a");
-  // `taken`'s record stands on the offer `offering` makes when it runs again under a new definition.
   let moved = q.insert(b"offering", query(b"offering", b"o2", offering));
   let judged = asked_over(moved, first.world, b"judging", b"a");
   assert_eq(judged.output, b"kept");
@@ -2085,7 +1822,6 @@ test "a query asking for its own answer is refused" {
   assert_eq(try_answer(|| asked_over(looping, test_world([]), b"self", b"x").output), None)
 }
 
-/// A `Record` as a test draws one.
 fn records() -> gen::Gen<Record> =
   gen::and_then(gen::bytes(), |query: Bytes|
     gen::map4(
@@ -2097,7 +1833,6 @@ fn records() -> gen::Gen<Record> =
         { query: query, input: input, reads: reads, output: output, summary: summary },
     ))
 
-/// A `Dependency` as a test draws one.
 fn reads() -> gen::Gen<Dependency> =
   gen::one_of([
     gen::map3(gen::bytes(), gen::bytes(), gen::bytes(), |f0: Bytes, f1: Bytes, f2: Bytes|

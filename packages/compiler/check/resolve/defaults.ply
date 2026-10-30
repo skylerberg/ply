@@ -1,5 +1,3 @@
-//! Parameter defaults: what one may be, qualified against the module that wrote it, and filled into every call.
-
 import compiler.syntax.parsing (Span, Ident, dummy_span, is_bare, starts_upper)
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDef, SpecClause, Binder,
                               parse, is_pub)
@@ -24,8 +22,6 @@ import compiler.check.resolve.tables (ParsedModule, ValueSpace, ModuleBinding, S
 import compiler.check.resolve.scopes (find, method_binder)
 import compiler.check.resolve.sets (add_module_binding, concat_diagnostics)
 import compiler.check.resolve.bindings (item_binders)
-
-// --- Defaults: qualifying one against the module that wrote it -----------------------------
 
 type Qualifier = {
   owner: Int,
@@ -283,8 +279,6 @@ fn decl_public(resolved: Resolution, owner: Int, name: Bytes) -> Bool / {abort.r
     None -> false,
   }
 
-// --- Defaults: the signatures ---------------------------------------------------------------
-
 type SignatureCollection = {
   sigs: List<Parameters>,
   owner_imports: List<{ module: Int, binder: Bytes, target: Int }>,
@@ -339,7 +333,6 @@ fn collect_signature(
               params: acc.params.push({ name: param.name.name, default: None, imports: [] }),
             }
           } else {
-            // The writing module needs the binder as much as any caller does.
             let owner_imports = o.q.imports.fold(
               acc.c.owner_imports,
               |oi: List<{ module: Int, binder: Bytes, target: Int }>, binding: ModuleBinding|
@@ -366,7 +359,6 @@ fn collect_signature(
   }
 }
 
-/// The builtins that carry a default: `assert(cond, message: None)`.
 fn builtin_signature(name: Bytes) -> Option<Parameters> =
   if name == b"assert" {
     Some({
@@ -391,8 +383,6 @@ fn builtin_signature(name: Bytes) -> Option<Parameters> =
     })
   } else { None }
 
-// --- Defaults: filling every call --------------------------------------------------------
-
 type Filler = {
   module: Int,
   binders: Map<Int, Int>,
@@ -405,7 +395,6 @@ type FillResult = { filler: Filler, expr: Expr }
 type FillContext = { r: Resolution, index: Map<Bytes, Parameters> }
 
 fn fill_expr(f: FillContext, filler: Filler, expr: Expr) -> FillResult / {abort.raise} = {
-  // Children first, so a nested call is filled before the outer one copies it.
   let o = fill_children(f, filler, expr);
   match o.expr { CallExpression(a) -> fill_call(f, o.filler, a), _ -> o }
 }
@@ -586,7 +575,6 @@ fn fill_children(f: FillContext, filler: Filler, expr: Expr) -> FillResult / {ab
       }
     },
     HandleExpression(h) -> {
-      // The variables' first values are made before the body, where the `handle` stands.
       let vars: { filler: Filler, xs: List<HandlerVar> } = h.vars.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<HandlerVar> }, v: HandlerVar| {
@@ -686,21 +674,18 @@ fn fill_fields(
 
 fn signature_of(f: FillContext, filler: Filler, func: Expr) -> Option<Parameters> / {abort.raise} =
   match func {
-    NameExpression(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
-      if is_bare(v.name) && starts_upper(v.name.name.name) { None }
-      else if is_bare(v.name) && filler.binders.contains(v.name.name.span.site) { None } else {
-        match find(f.r, filler.module, ValueSpace, v.name) {
-          Some(b) -> f.index.get(b.qualified),
-          None -> if is_bare(v.name) { builtin_signature(v.name.name.name) } else { None },
-        }
-      },
+    NameExpression(v) -> if is_bare(v.name) && starts_upper(v.name.name.name) { None }
+    else if is_bare(v.name) && filler.binders.contains(v.name.name.span.site) { None } else {
+      match find(f.r, filler.module, ValueSpace, v.name) {
+        Some(b) -> f.index.get(b.qualified),
+        None -> if is_bare(v.name) { builtin_signature(v.name.name.name) } else { None },
+      }
+    },
     _ -> None,
   }
 
 type Call = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>, labels: List<Ident> }
 
-/// The perform `call` is, where it is written on a bare name nothing binds and names an
-/// argument: an operation takes none by name, so each is refused and dropped.
 fn as_perform(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<FillResult> =
   match on {
     NameExpression(v) -> if call.named.len() == 0
@@ -738,7 +723,6 @@ fn as_perform(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<FillRes
 
 fn fill_call(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.raise} =
   match call.func {
-    // A call on a value: the checker finds its callee by the value's type, and fills it then.
     FieldExpression(on) -> match as_perform(filler, call, on.base, on.field) {
       Some(p) -> p,
       None -> { filler: filler, expr: CallExpression(call) },
@@ -749,7 +733,6 @@ fn fill_call(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.
 fn fill_by_signature(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.raise} =
   match signature_of(f, filler, call.func) {
     None -> {
-      // No signature: a call through a value, a constructor or an unresolved name, so a named argument names no parameter.
       let diags = call.named.fold(filler.diags, |ds: List<Diag>, arg: NamedArg|
         ds.push(
           error_at(
@@ -765,16 +748,11 @@ fn fill_by_signature(f: FillContext, filler: Filler, call: Call) -> FillResult /
         ));
       { filler: { ..filler, diags: diags }, expr: CallExpression({ ..call, named: [] }) }
     },
-    Some(sig) ->      // Over-application is `E0202`'s to report, with the callee's own type in hand.
-      if call.args.len() > sig.params.len() {
-        { filler: filler, expr: CallExpression({ ..call, named: [] }) }
-      } else { fill_slots(filler, call, sig) },
+    Some(sig) -> if call.args.len() > sig.params.len() {
+      { filler: filler, expr: CallExpression({ ..call, named: [] }) }
+    } else { fill_slots(filler, call, sig) },
   }
 
-/// What a call of `signature` at `span` in `module` passes, `args` and then `named` put where its
-/// parameters are: the arguments in order, as written where one is left unfilled, and where each
-/// comes from, nothing where one is; what the call gets wrong; and the modules the defaults it
-/// copied name.
 pub type PlacedArguments = {
   args: List<Expr>,
   slots: List<Slot>,
@@ -826,7 +804,6 @@ pub fn place_arguments(
   {
     args: if s.missing.len() > 0 { args } else { ordered_arguments(s.slots, args, named) },
     slots: if s.missing.len() > 0 { [] } else { s.slots },
-    // A call with no names in it that leaves a hole is under-applied, which is `E0202`'s.
     diags: if s.missing.len() == 0 || named.len() == 0 { unplaced } else {
       unplaced.push(
         error_at(
@@ -839,7 +816,6 @@ pub fn place_arguments(
         ),
       )
     },
-    // The default may name something in its own module, which this one may never have imported.
     imports: range(0, s.slots.len()).fold([], |im: List<ModuleBinding>, i: Int|
       match s.slots.get(i) {
         FromDefault(_) ->
@@ -876,7 +852,6 @@ fn fill_item(
 ) -> { filler: Filler, it: Item } / {abort.raise} =
   match item {
     FunctionItem(d) -> {
-      // A default is not walked here: it was qualified against this module in `collect_signatures`.
       let spec: { filler: Filler, xs: List<SpecClause> } = d.spec.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<SpecClause> }, clause: SpecClause| {
@@ -949,7 +924,6 @@ fn fill_item(
 
 pub type ResolvedProgram = { r: Resolution, mods: List<ParsedModule>, diags: List<Diag> }
 
-/// The signatures, then every module's calls, then the modules a spliced default made each one reference.
 pub fn fill_defaults(
   r: Resolution,
   mods: List<ParsedModule>,
@@ -961,7 +935,6 @@ pub fn fill_defaults(
     |acc: Resolution, oi: { module: Int, binder: Bytes, target: Int }|
       add_module_binding(acc, oi.module, oi.binder, oi.target),
   );
-  // Indexed once: a list lookup per call is quadratic in the program. First writer wins.
   let f = {
     r: r2,
     index: c.sigs.fold(Map::new(), |acc: Map<Bytes, Parameters>, signature: Parameters|
@@ -1027,11 +1000,5 @@ fn transitive_imports(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.ra
         ),
     })
 
-/// `r` as a check against entries reads it. Every module of one is there because the module
-/// checked reads it, and each that stands in for another holds what was named of it, a transparent
-/// function's body among that, under imports cut to fewer than the body's calls were found
-/// through. So each sees them all.
 pub fn make_all_visible(r: Resolution) -> Resolution =
   { ..r, visible_modules: r.scopes.map(|_: Scope| range(0, r.scopes.len())) }
-
-// --- Tests ------------------------------------------------------------------
