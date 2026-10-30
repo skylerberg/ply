@@ -5,15 +5,16 @@ import compiler.check.typed (TypedParam, pattern_binders, TypedPattern, TypedWil
                              TypedFieldPattern, Holder, HeldByBinder, HeldByNode, ReleasePlace,
                              ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseMissing,
                              ReleaseFailing, binding_key, holder_key)
-import compiler.check.infer.walked (Walked, WalkedLit, WalkedRead, WalkedLocal, WalkedDefinition,
-                                    WalkedConstructor, WalkedBuiltin, WalkedUnary, WalkedBinary,
-                                    WalkedCall, WalkedIf, WalkedMatch, WalkedBlock, WalkedList,
-                                    WalkedRecord, WalkedUpdate, WalkedFieldRead, WalkedPerform,
-                                    WalkedLambda, WalkedSimulate, WalkedParallel, WalkedHandle,
-                                    WalkedDefault, WalkedArm, WalkedStmt, WalkedLet, WalkedLetElse,
-                                    WalkedDo, WalkedAssign, WalkedField, WalkedThunk, WalkedClause,
-                                    WalkedReturn, WalkedHandlerVar, walked_nodes_folded)
-import compiler.check.resolve.tables (Diag, error_at, error_at_and)
+import compiler.check.infer.walked (Walked, WalkedLiteral, WalkedRead, WalkedLocal,
+                                    WalkedDefinition, WalkedConstructor, WalkedBuiltin, WalkedUnary,
+                                    WalkedBinary, WalkedCall, WalkedIf, WalkedMatch, WalkedBlock,
+                                    WalkedList, WalkedRecord, WalkedUpdate, WalkedFieldRead,
+                                    WalkedPerform, WalkedLambda, WalkedSimulate, WalkedParallel,
+                                    WalkedHandle, WalkedDefault, WalkedArm, WalkedStatement,
+                                    WalkedLet, WalkedLetElse, WalkedDo, WalkedAssign, WalkedField,
+                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVar,
+                                    walked_nodes_folded)
+import compiler.check.resolve.tables (Diagnostic, error_at, error_at_and)
 import compiler.check.infer.checker (simulated_ops)
 import compiler.check.infer.names (simple_name_of)
 import std.list
@@ -45,7 +46,11 @@ pub type Release = {
 
 type ReleaseContext = { row: Option<Row>, answered: List<Bytes> }
 
-pub type OwnershipResult = { diags: List<Diag>, releases: List<Release>, held: List<OwnedValue> }
+pub type OwnershipResult = {
+  diagnostics: List<Diagnostic>,
+  releases: List<Release>,
+  held: List<OwnedValue>,
+}
 
 pub type OwnedValue = {
   held: Holder,
@@ -87,7 +92,7 @@ type EnclosingHandle = { operations: List<Bytes>, body: Int }
 type OwnershipState = {
   module: Int,
   bindings: Map<Int, Binding>,
-  diags: List<Diag>,
+  diagnostics: List<Diagnostic>,
   releases: List<Release>,
   captured: Map<Int, Captures>,
   in_flight: List<ReleaseTarget>,
@@ -98,7 +103,7 @@ type ReleaseTarget = { owning_package: Holder, ty: Type }
 type Captures = { consumed: List<Int>, borrows: List<Int> }
 
 type Scope = {
-  fns: List<EnclosingFunction>,
+  functions: List<EnclosingFunction>,
   block: List<Int>,
   handles: List<EnclosingHandle>,
   frame: Int,
@@ -117,7 +122,7 @@ pub fn check_ownership(
   let start: ScopedState = params.fold(
     {
       s: {
-        fns: [],
+        functions: [],
         block: [],
         handles: [],
         frame: 0,
@@ -128,7 +133,7 @@ pub fn check_ownership(
       st: {
         module: f.module,
         bindings: Map::new(),
-        diags: [],
+        diagnostics: [],
         releases: [],
         captured: Map::new(),
         in_flight: [],
@@ -148,7 +153,7 @@ pub fn check_ownership(
     Moved(b"answered"),
   );
   {
-    diags: walked.diags,
+    diagnostics: walked.diagnostics,
     releases: walked.releases,
     held: walked.releases.fold([], |acc: List<OwnedValue>, r: Release| {
       let bind = walked.bindings.get(holder_key(r.held));
@@ -471,7 +476,7 @@ fn bind_as(
         ty: ty,
         kind: kind,
         owned: check_ownership,
-        depth: b.s.fns.len(),
+        depth: b.s.functions.len(),
         frame: b.s.frame,
         gone: None,
         taken: [],
@@ -499,8 +504,8 @@ fn binding_read(s: Scope, state: OwnershipState, e: Walked) -> Option<Binding> =
 fn store_binding(state: OwnershipState, b: Binding) -> OwnershipState =
   { ..state, bindings: state.bindings.insert(b.key, b) }
 
-fn report(state: OwnershipState, d: Diag) -> OwnershipState =
-  { ..state, diags: state.diags.push(d) }
+fn report(state: OwnershipState, d: Diagnostic) -> OwnershipState =
+  { ..state, diagnostics: state.diagnostics.push(d) }
 
 fn consume(state: OwnershipState, b: Binding, span: Span, how: Bytes) -> OwnershipState =
   store_binding(state, { ..b, gone: Some({ at: span, how: how }) })
@@ -513,7 +518,7 @@ fn check_use(
   span: Span,
   usage: Usage,
 ) -> OwnershipState / {abort.raise} = {
-  let crossed = s.fns.drop(b.depth);
+  let crossed = s.functions.drop(b.depth);
   let called = match usage { Called -> true, _ -> false };
   let once = match b.ty { FunctionType(t) -> t.once, _ -> false };
   let use = if !called { usage } else if b.owned || once { Moved(b"called") } else { Borrowed };
@@ -584,7 +589,7 @@ fn walk(
   usage: Usage,
 ) -> OwnershipState / {abort.raise} =
   match e.node {
-    WalkedLit(_) -> state,
+    WalkedLiteral(_) -> state,
     WalkedDefault(_) -> state,
     WalkedRead(WalkedLocal(l)) -> match binding_of(state, l) {
       Some(b) -> check_use(f, s, state, b, e.span, usage),
@@ -633,12 +638,12 @@ fn walk(
     },
     WalkedMatch(m) -> walk_match(f, s, state, e, m.scrutinee, m.arms, usage),
     WalkedBlock(b) -> {
-      let last = b.stmts.len() - 1;
+      let last = b.statements.len() - 1;
       let ends_in_statement = (match b.tail { Some(_) -> false, None -> true })
-        && (match b.stmts.at(last) { Some(WalkedDo(_)) -> true, _ -> false });
-      let walked = b.stmts.fold(
+        && (match b.statements.at(last) { Some(WalkedDo(_)) -> true, _ -> false });
+      let walked = b.statements.fold(
         { s: { ..s, block: [], result: usage }, st: state, at: 0 },
-        |acc: Walk, x: WalkedStmt|
+        |acc: Walk, x: WalkedStatement|
           if ends_in_statement && acc.at == last { acc } else {
             let o = walk_statement(f, { s: acc.s, st: acc.st }, x);
             { s: o.s, st: o.st, at: acc.at + 1 }
@@ -660,7 +665,7 @@ fn walk(
             e.span,
             usage,
           ),
-        None -> match b.stmts.at(last) {
+        None -> match b.statements.at(last) {
           Some(WalkedDo(x)) ->
             release_scope(
               f,
@@ -768,7 +773,11 @@ fn walk(
   }
 
 fn isolated_scope(s: Scope, at: Span) -> Scope =
-  { ..s, fns: s.fns.push({ span: at, held: false, local: false }), frame: 0 - at.site - 1 }
+  {
+    ..s,
+    functions: s.functions.push({ span: at, held: false, local: false }),
+    frame: 0 - at.site - 1,
+  }
 
 fn release_after_handler(
   before: OwnershipState,
@@ -882,44 +891,54 @@ fn walk_call(
   f: Facts,
   s: Scope,
   state: OwnershipState,
-  func: Walked,
+  function: Walked,
   args: List<Walked>,
 ) -> OwnershipState / {abort.raise} =
-  match func.node {
+  match function.node {
     WalkedRead(WalkedLocal(l)) -> match binding_of(state, l) {
       Some(b) -> {
-        let called = check_use(f, s, state, b, func.span, Called);
+        let called = check_use(f, s, state, b, function.span, Called);
         let flying = if b.owned && live(b) && b.frame == s.frame {
           { ..called, in_flight: called.in_flight.concat(released_values(state, b)) }
         } else { called };
         let calling = if b.kind == Continuation { { taking: all_taken(), params: [] } }
-        else { value_call_modes(f, func) };
+        else { value_call_modes(f, function) };
         walk_arguments(f, s, flying, calling, args)
       },
-      None -> walk_arguments(f, s, state, value_call_modes(f, func), args),
+      None -> walk_arguments(f, s, state, value_call_modes(f, function), args),
     },
-    WalkedRead(WalkedDefinition(d)) -> walk_arguments(f, s, state, named(f, func, d.key), args),
-    WalkedRead(WalkedBuiltin(b)) -> walk_arguments(f, s, state, named(f, func, b.name), args),
+    WalkedRead(WalkedDefinition(d)) -> walk_arguments(f, s, state, named(f, function, d.key), args),
+    WalkedRead(WalkedBuiltin(b)) -> walk_arguments(f, s, state, named(f, function, b.name), args),
     WalkedRead(WalkedConstructor(_)) ->
       walk_arguments(f, s, state, { taking: all_taken(), params: [] }, args),
     WalkedFieldRead(x) ->
-      walk_arguments(f, s, walk(f, s, state, x.base, Borrowed), value_call_modes(f, func), args),
-    _ -> walk_arguments(f, s, walk(f, s, state, func, Read), value_call_modes(f, func), args),
+      walk_arguments(
+        f,
+        s,
+        walk(f, s, state, x.base, Borrowed),
+        value_call_modes(f, function),
+        args,
+      ),
+    _ ->
+      walk_arguments(f, s, walk(f, s, state, function, Read), value_call_modes(f, function), args),
   }
 
 fn all_taken() -> ArgumentModes = { kept: [], all: true }
 
 type CallModes = { taking: ArgumentModes, params: List<Type> }
 
-fn named(f: Facts, func: Walked, key: Bytes) -> CallModes / {abort.raise} =
+fn named(f: Facts, function: Walked, key: Bytes) -> CallModes / {abort.raise} =
   match f.taking(key) {
     Some(t) ->
-      { taking: t, params: match type_of(f, func) { FunctionType(fnt) -> fnt.params, _ -> [] } },
-    None -> value_call_modes(f, func),
+      {
+        taking: t,
+        params: match type_of(f, function) { FunctionType(fnt) -> fnt.params, _ -> [] },
+      },
+    None -> value_call_modes(f, function),
   }
 
-fn value_call_modes(f: Facts, func: Walked) -> CallModes / {abort.raise} =
-  match type_of(f, func) {
+fn value_call_modes(f: Facts, function: Walked) -> CallModes / {abort.raise} =
+  match type_of(f, function) {
     FunctionType(t) -> { taking: { kept: t.kept, all: false }, params: t.params },
     _ -> { taking: { kept: [], all: false }, params: [] },
   }
@@ -977,7 +996,7 @@ fn walk_field(
           check_use(f, s, state, b, base.span, Moved(how))
         } else if others_held(f, base, name) { report(state, field_beside(f, b, name, e.span)) }
         else {
-          match s.fns.drop(b.depth).at(0) {
+          match s.functions.drop(b.depth).at(0) {
             Some(fun) -> report(state, consumed_in_lambda(f, b, e.span, fun)),
             None -> store_binding(state, { ..b, taken: b.taken.push(name) }),
           }
@@ -1025,7 +1044,7 @@ fn walk_lambda(
   let inner: ScopedState = {
     s: {
       ..s,
-      fns: s.fns.push(fun),
+      functions: s.functions.push(fun),
       block: [],
       frame: e.span.site,
       body: e.span.site,
@@ -1055,22 +1074,22 @@ fn walk_lambda(
   }
 }
 
-fn walk_statement(f: Facts, b: ScopedState, x: WalkedStmt) -> ScopedState / {abort.raise} =
+fn walk_statement(f: Facts, b: ScopedState, x: WalkedStatement) -> ScopedState / {abort.raise} =
   match x {
-    WalkedLet(l) -> match ((l.value.node, l.pat)) {
+    WalkedLet(l) -> match ((l.value.node, l.pattern)) {
       (WalkedLambda(lam), TypedBinder(v)) -> bind_lambda(f, b, v.name, v.span, l.value, lam),
       _ -> {
-        let valued = walk(f, b.s, b.st, l.value, let_usage(f, b, l.pat, l.value));
+        let valued = walk(f, b.s, b.st, l.value, let_usage(f, b, l.pattern, l.value));
         bind_pattern(
           f,
-          { ..b, st: release_on_miss(f, b.s, valued, l.pat, l.value) },
-          l.pat,
+          { ..b, st: release_on_miss(f, b.s, valued, l.pattern, l.value) },
+          l.pattern,
           l.value,
         )
       },
     },
     WalkedLetElse(l) -> {
-      let valued = walk(f, b.s, b.st, l.value, let_usage(f, b, l.pat, l.value));
+      let valued = walk(f, b.s, b.st, l.value, let_usage(f, b, l.pattern, l.value));
       let missed = add_releases(
         valued,
         missed_value_releases(f, b, l.value),
@@ -1095,8 +1114,8 @@ fn walk_statement(f: Facts, b: ScopedState, x: WalkedStmt) -> ScopedState / {abo
       );
       bind_pattern(
         f,
-        { ..b, st: { ..valued, diags: fallback.diags, releases: fallback.releases } },
-        l.pat,
+        { ..b, st: { ..valued, diagnostics: fallback.diagnostics, releases: fallback.releases } },
+        l.pattern,
         l.value,
       )
     },
@@ -1139,23 +1158,23 @@ fn bind_lambda(
 fn let_usage(
   f: Facts,
   b: ScopedState,
-  pat: TypedPattern<Type>,
+  pattern: TypedPattern<Type>,
   value: Walked,
 ) -> Usage / {abort.raise} =
   if is_borrowed_value(b.s, b.st, value) { Borrowed }
-  else if binds_resource(f, pat) || resource_at(f, value) || f.opened(type_of(f, value)) {
+  else if binds_resource(f, pattern) || resource_at(f, value) || f.opened(type_of(f, value)) {
     Moved(b"bound by a `let`")
   } else { Read }
 
 fn bind_pattern(
   f: Facts,
   b: ScopedState,
-  pat: TypedPattern<Type>,
+  pattern: TypedPattern<Type>,
   value: Walked,
 ) -> ScopedState / {abort.raise} = {
   let check_ownership = !is_borrowed_value(b.s, b.st, value);
-  let checked = if check_ownership { check_wildcard_resources(f, b.st, pat) } else { b.st };
-  binders(f, pat).fold(
+  let checked = if check_ownership { check_wildcard_resources(f, b.st, pattern) } else { b.st };
+  binders(f, pattern).fold(
     { s: b.s, st: checked },
     |acc: ScopedState, p: { name: Bytes, span: Span, ty: Type }|
       bind(acc, p.name, p.span, p.ty, f.resource(p.ty), check_ownership),
@@ -1181,10 +1200,10 @@ fn release_on_miss(
   f: Facts,
   s: Scope,
   state: OwnershipState,
-  pat: TypedPattern<Type>,
+  pattern: TypedPattern<Type>,
   value: Walked,
 ) -> OwnershipState / {abort.raise} =
-  if !refutable(pat) { state } else {
+  if !refutable(pattern) { state } else {
     let t = type_of(f, value);
     let whole = if f.resource(t) && !is_borrowed_value(s, state, value) {
       [{ owning_package: HeldByNode(value.span.site), ty: t }]
@@ -1195,11 +1214,11 @@ fn release_on_miss(
     }
   }
 
-fn refutable(pat: TypedPattern<Type>) -> Bool =
-  match pat {
+fn refutable(pattern: TypedPattern<Type>) -> Bool =
+  match pattern {
     TypedBinder(_) -> false,
     TypedWild(_) -> false,
-    TypedRecordPattern(r) -> r.fields.any(|x: TypedFieldPattern<Type>| refutable(x.pat)),
+    TypedRecordPattern(r) -> r.fields.any(|x: TypedFieldPattern<Type>| refutable(x.pattern)),
     _ -> true,
   }
 
@@ -1212,19 +1231,19 @@ fn is_borrowed_value(s: Scope, state: OwnershipState, value: Walked) -> Bool =
 
 fn binders(
   f: Facts,
-  pat: TypedPattern<Type>,
+  pattern: TypedPattern<Type>,
 ) -> List<{ name: Bytes, span: Span, ty: Type }> / {abort.raise} =
-  pattern_binders(pat).map(|p: TypedParam<Type>| { ..p, ty: f.resolved(p.ty) })
+  pattern_binders(pattern).map(|p: TypedParam<Type>| { ..p, ty: f.resolved(p.ty) })
 
-fn binds_resource(f: Facts, pat: TypedPattern<Type>) -> Bool / {abort.raise} =
-  binders(f, pat).any(|p: { name: Bytes, span: Span, ty: Type }| f.resource(p.ty))
+fn binds_resource(f: Facts, pattern: TypedPattern<Type>) -> Bool / {abort.raise} =
+  binders(f, pattern).any(|p: { name: Bytes, span: Span, ty: Type }| f.resource(p.ty))
 
 fn check_wildcard_resources(
   f: Facts,
   state: OwnershipState,
-  pat: TypedPattern<Type>,
+  pattern: TypedPattern<Type>,
 ) -> OwnershipState / {abort.raise} =
-  match pat {
+  match pattern {
     TypedWild(w) -> if f.resource(f.resolved(w.ty)) { report(state, wildcard_resource(f, w.span)) }
     else { state },
     TypedCase(c) ->
@@ -1232,7 +1251,7 @@ fn check_wildcard_resources(
         check_wildcard_resources(f, acc, a)),
     TypedRecordPattern(r) -> {
       let named = r.fields.fold(state, |acc: OwnershipState, x: TypedFieldPattern<Type>|
-        check_wildcard_resources(f, acc, x.pat));
+        check_wildcard_resources(f, acc, x.pattern));
       match r.rest {
         None -> named,
         Some(at) -> {
@@ -1331,7 +1350,9 @@ fn join_paths(
               else { m },
               None -> m.insert(key, b),
             }),
-          diags: acc.diags.concat(x.diags.drop(before.diags.len())).concat(mine.refused),
+          diagnostics: acc.diagnostics.concat(x.diagnostics.drop(before.diagnostics.len())).concat(
+            mine.refused,
+          ),
           releases: acc.releases.concat(mine.first).concat(
             x.releases.drop(before.releases.len()).filter(|r: Release| !fails(r)),
           ).concat(
@@ -1378,7 +1399,7 @@ fn walk_match(
   let through = match scrutinee.node {
     WalkedFieldRead(_) ->
       is_borrowed_value(s, state, scrutinee)
-        || (!opened && !arms.any(|a: WalkedArm| binds_resource(f, a.pat))),
+        || (!opened && !arms.any(|a: WalkedArm| binds_resource(f, a.pattern))),
     _ -> false,
   };
   let local = match scrutinee.node { WalkedRead(WalkedLocal(_)) -> true, _ -> false };
@@ -1394,7 +1415,7 @@ fn walk_match(
         ty: ty,
         kind: Value,
         owned: true,
-        depth: s.fns.len(),
+        depth: s.functions.len(),
         frame: s.frame,
         gone: None,
         taken: [],
@@ -1411,22 +1432,22 @@ fn walk_match(
   };
   let check_ownership = match held { Some(b) -> b.owned, None -> made };
   let ends = arms.map(|a: WalkedArm| {
-    let binds = opened || binds_resource(f, a.pat);
+    let binds = opened || binds_resource(f, a.pattern);
     let taken: OwnershipState = match key {
       Some(k) -> if binds {
         match start.bindings.get(k) {
           Some(b) ->
             check_wildcard_resources(
               f,
-              consume(start, b, a.pat_span, b"taken apart by a `match` arm"),
-              a.pat,
+              consume(start, b, a.pattern_span, b"taken apart by a `match` arm"),
+              a.pattern,
             ),
           None -> start,
         }
       } else { start },
       None -> start,
     };
-    let inner = binders(f, a.pat).fold(
+    let inner = binders(f, a.pattern).fold(
       { s: { ..s, block: [] }, st: taken },
       |acc: ScopedState, p: { name: Bytes, span: Span, ty: Type }|
         bind(acc, p.name, p.span, p.ty, f.resource(p.ty), check_ownership),
@@ -1599,7 +1620,7 @@ fn walk_handle(
 
 fn quoted(name: Bytes) -> Bytes = Bytes::concat_all([b"`", name, b"`"])
 
-fn used_after_consumed(f: Facts, b: Binding, span: Span, g: Consumption) -> Diag =
+fn used_after_consumed(f: Facts, b: Binding, span: Span, g: Consumption) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1615,7 +1636,7 @@ fn used_after_consumed(f: Facts, b: Binding, span: Span, g: Consumption) -> Diag
     ],
   )
 
-fn borrow_after_consumed(f: Facts, b: Binding, span: Span, lender: Binding) -> Diag =
+fn borrow_after_consumed(f: Facts, b: Binding, span: Span, lender: Binding) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1628,7 +1649,7 @@ fn borrow_after_consumed(f: Facts, b: Binding, span: Span, lender: Binding) -> D
     [b"a function that borrows a resource is usable only while the resource is"],
   )
 
-fn partly_moved(f: Facts, b: Binding, span: Span) -> Diag / {abort.raise} =
+fn partly_moved(f: Facts, b: Binding, span: Span) -> Diagnostic / {abort.raise} =
   error_at(
     b"E0316",
     f.module,
@@ -1643,7 +1664,7 @@ fn partly_moved(f: Facts, b: Binding, span: Span) -> Diag / {abort.raise} =
     [b"its other fields may still be read, but not the record whole"],
   )
 
-fn field_twice(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
+fn field_twice(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic =
   error_at(
     b"E0316",
     f.module,
@@ -1653,7 +1674,7 @@ fn field_twice(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
     [b"a resource field is moved out of its record once"],
   )
 
-fn field_beside(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
+fn field_beside(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic =
   error_at(
     b"E0316",
     f.module,
@@ -1677,7 +1698,7 @@ fn field_beside(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
     ],
   )
 
-fn consumed_borrowed(f: Facts, b: Binding, span: Span, how: Bytes) -> Diag =
+fn consumed_borrowed(f: Facts, b: Binding, span: Span, how: Bytes) -> Diagnostic =
   error_at_and(
     b"E0318",
     f.module,
@@ -1693,7 +1714,7 @@ fn consumed_borrowed(f: Facts, b: Binding, span: Span, how: Bytes) -> Diag =
     ],
   )
 
-fn consumed_in_lambda(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) -> Diag =
+fn consumed_in_lambda(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1708,7 +1729,7 @@ fn consumed_in_lambda(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) 
     ],
   )
 
-fn owning_function_passed(f: Facts, b: Binding, span: Span) -> Diag =
+fn owning_function_passed(f: Facts, b: Binding, span: Span) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1723,7 +1744,7 @@ fn owning_function_passed(f: Facts, b: Binding, span: Span) -> Diag =
     ],
   )
 
-fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diag =
+fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,
@@ -1733,7 +1754,7 @@ fn handler_variable_resource(f: Facts, v: WalkedHandlerVar) -> Diag =
     [b"bind the resource with `let` around the `handle`, and lend it to the clauses that use it"],
   )
 
-fn moved_through(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
+fn moved_through(f: Facts, b: Binding, name: Bytes, span: Span) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1748,7 +1769,7 @@ fn moved_through(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
     ],
   )
 
-fn written_over(f: Facts, name: Bytes, at: Span) -> Diag =
+fn written_over(f: Facts, name: Bytes, at: Span) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,
@@ -1764,7 +1785,7 @@ fn written_over(f: Facts, name: Bytes, at: Span) -> Diag =
     ],
   )
 
-fn fallback_consumed(f: Facts, b: Binding, at: Span) -> Diag =
+fn fallback_consumed(f: Facts, b: Binding, at: Span) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1779,7 +1800,7 @@ fn fallback_consumed(f: Facts, b: Binding, at: Span) -> Diag =
     ],
   )
 
-fn guard_consumed(f: Facts, b: Binding, at: Span, what: Bytes) -> Diag =
+fn guard_consumed(f: Facts, b: Binding, at: Span, what: Bytes) -> Diagnostic =
   error_at_and(
     b"E0316",
     f.module,
@@ -1794,7 +1815,7 @@ fn guard_consumed(f: Facts, b: Binding, at: Span, what: Bytes) -> Diag =
     ],
   )
 
-fn borrowing_function_kept(f: Facts, b: Binding, span: Span) -> Diag =
+fn borrowing_function_kept(f: Facts, b: Binding, span: Span) -> Diagnostic =
   error_at_and(
     b"E0318",
     f.module,
@@ -1809,7 +1830,7 @@ fn borrowing_function_kept(f: Facts, b: Binding, span: Span) -> Diag =
     ],
   )
 
-fn borrowed_past(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) -> Diag =
+fn borrowed_past(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) -> Diagnostic =
   error_at_and(
     b"E0318",
     f.module,
@@ -1824,7 +1845,7 @@ fn borrowed_past(f: Facts, b: Binding, span: Span, fun: EnclosingFunction) -> Di
     ],
   )
 
-fn copied(f: Facts, b: Binding, span: Span) -> Diag =
+fn copied(f: Facts, b: Binding, span: Span) -> Diagnostic =
   error_at(
     b"E0317",
     f.module,
@@ -1836,7 +1857,7 @@ fn copied(f: Facts, b: Binding, span: Span) -> Diag =
     ],
   )
 
-fn dropped_binding(f: Facts, b: Binding, span: Span) -> Diag =
+fn dropped_binding(f: Facts, b: Binding, span: Span) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,
@@ -1846,7 +1867,7 @@ fn dropped_binding(f: Facts, b: Binding, span: Span) -> Diag =
     [b"pass it to what consumes it, or leave it bound: it is let go where its block ends"],
   )
 
-fn new_resource_dropped(f: Facts, e: Walked, usage: Usage) -> Diag =
+fn new_resource_dropped(f: Facts, e: Walked, usage: Usage) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,
@@ -1860,7 +1881,7 @@ fn new_resource_dropped(f: Facts, e: Walked, usage: Usage) -> Diag =
     [b"bind it with `let`, so it is let go where its block ends, or hand it to what takes it"],
   )
 
-fn moved_on_one_path(module: Int, b: Binding) -> Diag =
+fn moved_on_one_path(module: Int, b: Binding) -> Diagnostic =
   error_at(
     b"E0316",
     module,
@@ -1874,7 +1895,7 @@ fn moved_on_one_path(module: Int, b: Binding) -> Diag =
     [b"move the field out on every path past the branch, or on none"],
   )
 
-fn rest_dropped(f: Facts, span: Span) -> Diag =
+fn rest_dropped(f: Facts, span: Span) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,
@@ -1884,7 +1905,7 @@ fn rest_dropped(f: Facts, span: Span) -> Diag =
     [b"name what holds it, so it is let go where its block ends, or consume it"],
   )
 
-fn wildcard_resource(f: Facts, span: Span) -> Diag =
+fn wildcard_resource(f: Facts, span: Span) -> Diagnostic =
   error_at(
     b"E0322",
     f.module,

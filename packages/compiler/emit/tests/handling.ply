@@ -1,11 +1,12 @@
 import std.list
 import std.bytes (ascii_of_int)
 import compiler.emit.representations
-import compiler.emit.representations (Ctors, Def, no_ctors, parallel_results_type)
-import compiler.emit.code (Code, NBuiltin, CodeHandle, CodeBlock, CodeApply, CodeLambda, NDef,
-                           CodeLiteral, CodeIf, CodeMatch, CodeRecord, CodeFieldRead, CodeBinary,
-                           Lambda, Capture, CodeHandler, CodeClause, CodeArm, CodeStmt, CodeLet,
-                           CodeDo, CodeField, read_name, code_children)
+import compiler.emit.representations (Constructors, Definition, no_constructors,
+                                      parallel_results_type)
+import compiler.emit.code (Code, NBuiltin, CodeHandle, CodeBlock, CodeApply, CodeLambda,
+                           NDefinition, CodeLiteral, CodeIf, CodeMatch, CodeRecord, CodeFieldRead,
+                           CodeBinary, Lambda, Capture, CodeHandler, CodeClause, CodeArm,
+                           CodeStatement, CodeLet, CodeDo, CodeField, read_name, code_children)
 import compiler.syntax.parsing (Span, span_between)
 import compiler.syntax.patterns (LiteralBytes)
 import compiler.check.resolve.tables (qualify)
@@ -26,8 +27,8 @@ import compiler.emit.typed_ir (handed_of, all_given, Representation, AsInt, AsWo
                                ZeroOperand, Primitive, Convert, Allocate, ClosureAllocation, Op,
                                OfHandling, OfContainers, OperationSignature, Inst, Let, Do, Assign,
                                Return, Handle, Fn, Metered, OwnedParam, OwnedResult, AsFlattened,
-                               Leaf, Get, Path, LeafPath, FieldPath, PayloadPath, Closure, Decl,
-                               Native, Call, Rvalue, ParamOwnership, no_links,
+                               Leaf, Get, Path, LeafPath, FieldPath, PayloadPath, Closure,
+                               Declaration, Native, Call, Rvalue, ParamOwnership, no_links,
                                operand_representation)
 import compiler.emit.typed_ir
 import compiler.emit.typed_ir.containers (CopyOut, Length)
@@ -39,10 +40,11 @@ import compiler.emit.typed_ir.handling (HandleOp, HandleSite, Clause, Perform, L
                                         VarInit, VarRead, VarWrite, raise_offset, task_offset)
 import compiler.emit.typing (SiteType, unknown_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo, Builtin, builtins)
-import compiler.check.infer.expr (crossing_vars)
-import compiler.syntax.exprs (crossing_operations, task_operations, scheduler_module, prelude_own)
+import compiler.check.infer.expression (crossing_variables)
+import compiler.syntax.expressions (crossing_operations, task_operations, scheduler_module,
+                                    prelude_own)
 import compiler.emit.output (Need, Exact, GenericCall)
-import compiler.emit.lower.module_context (Root, prelude_ctor)
+import compiler.emit.lower.module_context (Root, prelude_constructor)
 import compiler.emit.lower.representation (representation_of)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, initial_lowering, emitted,
                                  enter_block, no_captured_evidence, read_typed)
@@ -53,11 +55,11 @@ import compiler.emit.lower.marshalling (marshalling_builtin_call, marshalling_bu
                                         type_descriptor, shown_described, word_form_entry,
                                         operation_descriptor)
 import compiler.emit.lower.containers (builtin)
-import compiler.emit.typed_ir.statics (StaticDef, StaticStruct, AddressWord, RawWord, FieldWord,
-                                       PreludeWord, EntryWord, entries_of)
+import compiler.emit.typed_ir.statics (StaticDefinition, StaticStruct, AddressWord, RawWord,
+                                       FieldWord, PreludeWord, EntryWord, entries_of)
 import compiler.emit.lower.scalars (comparison_built)
 import compiler.emit.print.count_functions (never_lifted_fn, never_shown_fn)
-import compiler.emit.generated (GeneratedRoot, marshal_root, container_code, container_defs,
+import compiler.emit.generated (GeneratedRoot, marshal_root, container_code, container_definitions,
                                 runtime_entry_code, container_op_generated, container_op_reads,
                                 marshalled_sums, marshals, is_marshal_op)
 import compiler.emit.marks (marked_type, marks_of, mark_type_params)
@@ -82,19 +84,28 @@ fn empty_span() -> Span = span_between(0, 0)
 fn bare_read(name: Bytes) -> Code =
   { node: NBuiltin({ name: name, args: [], rows: [] }), span: empty_span(), ty: unknown_type() }
 
-fn root_context(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> / {abort.raise} =
-  p.roots.fold(None, |acc: Option<{ cx: Context, code: Code }>, r: Root|
+fn root_context(
+  p: Program,
+  name: Bytes,
+) -> Option<{ context: Context, code: Code }> / {abort.raise} =
+  p.roots.fold(None, |acc: Option<{ context: Context, code: Code }>, r: Root|
     if r.key != Named(qualify(b"m", name)) { acc } else {
       {
         let code = r.code;
-        Some({ cx: context_of(p.setting, r, code), code: code })
+        Some({ context: context_of(p.setting, r, code), code: code })
       }
     })
 
-fn handle_at(p: Program, name: Bytes) -> Option<{ cx: Context, h: CodeHandler }> / {abort.raise} =
+fn handle_at(
+  p: Program,
+  name: Bytes,
+) -> Option<{ context: Context, h: CodeHandler }> / {abort.raise} =
   match root_context(p, name) {
     None -> None,
-    Some(r) -> match handle_of(r.code) { Some(h) -> Some({ cx: r.cx, h: h }), None -> None },
+    Some(r) -> match handle_of(r.code) {
+      Some(h) -> Some({ context: r.context, h: h }),
+      None -> None,
+    },
   }
 
 fn handle_of(c: Code) -> Option<CodeHandler> =
@@ -114,7 +125,7 @@ fn ops_in(
     [],
     |acc: List<{ var: Var, op: HandleOp, args: List<Arg>, uses: OperationSignature }>, i: Inst|
       match i {
-        Let(l) -> match l.val {
+        Let(l) -> match l.value {
           Op(o) -> match o.op {
             OfHandling(h) -> acc.push({ var: l.var, op: h, args: o.args, uses: o.uses }),
             _ -> acc,
@@ -136,7 +147,7 @@ fn handles_in(
 
 fn unpacks(body: List<Inst>, v: Var, rep: Representation) -> Bool =
   body.any(|i: Inst|
-    match i { Let(l) -> l.val == Convert({ arg: VarOperand(v), to: rep }), _ -> false })
+    match i { Let(l) -> l.value == Convert({ arg: VarOperand(v), to: rep }), _ -> false })
 
 fn without_descriptor(op: HandleOp) -> HandleOp =
   match op { Perform(x) -> Perform({ ..x, descriptor: b"" }), other -> other }
@@ -188,7 +199,7 @@ test "a perform hands its operation's entry in the object it holds its arguments
                 match i {
                   Let(l) ->
                     o.args.drop(1) == [VarOperand(l.var)] && l.var.representation == AsWord
-                      && l.val == Convert({ arg: VarOperand(local(0, int, AsInt)), to: AsWord }),
+                      && l.value == Convert({ arg: VarOperand(local(0, int, AsInt)), to: AsWord }),
                   _ -> false,
                 }),
               None,
@@ -202,20 +213,20 @@ test "a perform hands its operation's entry in the object it holds its arguments
             match o.op { Perform(x) -> x.descriptor, _ -> b"" },
         );
         assert_eq(
-          f.statics.filter(|d: StaticDef|
+          f.statics.filter(|d: StaticDefinition|
             match d.layout { StaticStruct(s) -> s.of == b"PlyOp", _ -> false }).map(
-            |d: StaticDef| d.name,
+            |d: StaticDefinition| d.name,
           ),
           described,
         );
-        assert_eq(f.statics.last().map(|d: StaticDef| d.name), described.at(0))
+        assert_eq(f.statics.last().map(|d: StaticDefinition| d.name), described.at(0))
       };
       {
         let f = lowered_root(p, b"asked");
         match f.body {
           [Let(o), Let(k), ..] -> {
             assert_eq((o.var.ty, o.var.representation), (int, AsWord));
-            assert_eq((k.val, k.var.representation), (
+            assert_eq((k.value, k.var.representation), (
               Convert({ arg: VarOperand(o.var), to: AsInt }),
               AsInt,
             ))
@@ -297,12 +308,12 @@ test "a label argument is the resource's field-table entry, an Int no count is k
       None -> assert(false),
       Some(r) -> {
         let entry = local(0, int_type(), AsInt);
-        let o = label(r.cx, initial_lowering([]), b"conn", sample_span());
+        let o = label(r.context, initial_lowering([]), b"conn", sample_span());
         assert_eq(o.arg, VarOperand(entry));
         assert_eq(o.st.insts, [
           Let({
             var: entry,
-            val: Op({
+            value: Op({
               op: OfHandling(Label(b"conn")),
               args: [],
               uses: { takes: [], owned: false, fails: false, suspends: false },
@@ -345,7 +356,7 @@ test "a continuation read as a value is the closure of a lambda that resumes it,
         c.body.kind == typed_ir::Plain
           && c.body.body.any(|i: Inst|
             match i {
-              Let(x) -> match x.val {
+              Let(x) -> match x.value {
                 typed_ir::Apply(a) -> match a.f {
                   VarOperand(v) -> representations::resumed(v.ty) != None,
                   _ -> false,
@@ -372,7 +383,7 @@ test "a clause binding the call site's label hands the runtime the descriptor of
             Some(i) -> {
               assert_eq(h.args.at(i).map(operand_representation), Some(AsInt));
               assert(
-                f.statics.any(|d: StaticDef|
+                f.statics.any(|d: StaticDefinition|
                   match d.layout {
                     StaticStruct(s) -> s.of == b"PlyType" && s.fields.at(2) == Some(RawWord(6)),
                     _ -> false,
@@ -417,7 +428,7 @@ test "a clause resuming in its tail joins its arms as the word it hands back, ne
         match f.lambdas.at(0) {
           Some(Closure(c)) ->
             c.body.body.fold([], |a: List<Representation>, i: Inst|
-              match i { Decl(v) -> a.push(v.representation), _ -> a }),
+              match i { Declaration(v) -> a.push(v.representation), _ -> a }),
           None -> [],
         },
         [AsWord],
@@ -437,7 +448,7 @@ test "a handle runs its body in place over its instance, which holds its clauses
         let clause = closure_var(1, int);
         let made = Let({
           var: clause,
-          val: Allocate({
+          value: Allocate({
             made: ClosureAllocation({ nth: 0, captures: 0, params: 0 }),
             args: [],
             reuse: None,
@@ -446,7 +457,7 @@ test "a handle runs its body in place over its instance, which holds its clauses
           unwind: [],
         });
         let plan = handle_plan(
-          g.cx,
+          g.context,
           emitted({ ..initial_lowering([n]), next: 2 }, made),
           g.h,
           sample_span(),
@@ -456,13 +467,13 @@ test "a handle runs its body in place over its instance, which holds its clauses
         let sum = local(3, int, AsInt);
         let add = Let({
           var: sum,
-          val: Primitive({ op: b"add", on: AsInt, args: [VarOperand(n), IntOperand(1)] }),
+          value: Primitive({ op: b"add", on: AsInt, args: [VarOperand(n), IntOperand(1)] }),
           at: sample_span(),
           unwind: [],
         });
         let body = { st: { ..emitted(enter_block(outer), add), next: 4 }, arg: VarOperand(sum) };
         let o = handle_assembled(
-          g.cx,
+          g.context,
           outer,
           body,
           [VarOperand(clause)],
@@ -504,7 +515,16 @@ test "a handle runs its body in place over its instance, which holds its clauses
         };
         let left = { st: emitted(body.st, Return(VarOperand(sum))), arg: VarOperand(sum) };
         let message = handle {
-          handle_assembled(g.cx, outer, left, [VarOperand(clause)], None, g.h, plan, sample_span());
+          handle_assembled(
+            g.context,
+            outer,
+            left,
+            [VarOperand(clause)],
+            None,
+            g.h,
+            plan,
+            sample_span(),
+          );
           b""
         } with {
           abort.raise(m) -> Bytes::of_string(m),
@@ -521,7 +541,7 @@ test "a handle of an effect whose operations the lowering does not know is never
     Ok(p) -> match handle_at(p, b"guarded") {
       None -> assert(false, Some("`guarded` is a handle")),
       Some(g) -> {
-        let blind = { ..g.cx, setting: { ..g.cx.setting, effects: [] } };
+        let blind = { ..g.context, setting: { ..g.context.setting, effects: [] } };
         let message = handle {
           handle_plan(blind, initial_lowering([]), g.h, sample_span());
           b""
@@ -541,12 +561,12 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
   match program_of(handle_corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      let planned = |g: { cx: Context, h: CodeHandler }|
-        handle_plan(g.cx, initial_lowering([]), g.h, sample_span());
+      let planned = |g: { context: Context, h: CodeHandler }|
+        handle_plan(g.context, initial_lowering([]), g.h, sample_span());
       let frame_of = |name: Bytes|
         match handle_at(p, name) {
           Some(g) -> if detaches(g.h.clauses) {
-            Some(body_frame(g.cx, g.h, planned(g), [], int_type()))
+            Some(body_frame(g.context, g.h, planned(g), [], int_type()))
           } else { None },
           None -> None,
         };
@@ -555,7 +575,7 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
       match frame_of(b"off_tail_held") {
         None -> assert(false),
         Some(f) -> {
-          assert_eq((f.params, f.captures), (0, [{ src: 0, dst: 0 }]));
+          assert_eq((f.params, f.captures), (0, [{ src: 0, destination: 0 }]));
           assert(f.size >= 2)
         },
       };
@@ -566,7 +586,7 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
             g.h.clauses.map(|cl: CodeClause| clause_frame(cl, no_captured_evidence()).params),
             [3],
           );
-          assert_eq(body_frame(g.cx, g.h, planned(g), [], int_type()).captures.len(), 0)
+          assert_eq(body_frame(g.context, g.h, planned(g), [], int_type()).captures.len(), 0)
         },
       };
       match handle_at(p, b"off_tail") {
@@ -575,9 +595,14 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
           let int = int_type();
           let clause = closure_var(0, int);
           let inner = closure_var(1, int);
-          let plan = handle_plan(g.cx, { ..initial_lowering([]), next: 2 }, g.h, sample_span());
+          let plan = handle_plan(
+            g.context,
+            { ..initial_lowering([]), next: 2 },
+            g.h,
+            sample_span(),
+          );
           let o = handle_assembled(
-            g.cx,
+            g.context,
             plan.st,
             { st: plan.st, arg: VarOperand(inner) },
             [VarOperand(clause)],
@@ -634,8 +659,8 @@ test "a body run detached captures each variable's first value at the variable's
 
 fn variable_operations(body: List<Inst>) -> List<Bytes> =
   body.fold([], |acc: List<Bytes>, i: Inst| {
-    let val = match i { Let(l) -> Some(l.val), Do(d) -> Some(d.val), _ -> None };
-    match val {
+    let value = match i { Let(l) -> Some(l.value), Do(d) -> Some(d.value), _ -> None };
+    match value {
       None -> match i { Handle(h) -> acc.concat(variable_operations(h.body)), _ -> acc },
       Some(Op(o)) -> match o.op {
         OfHandling(VarInit(_)) -> acc.push(b"init"),
@@ -665,7 +690,7 @@ test "a place an operation's own type parameter stands at crosses carried, which
       let marked = |op: keys::TypeOp, t: Type, marks: List<Int>|
         keys::marked(keys::generated_key(op, t, b"m"), marks);
       let names = |k: RootKey|
-        named_calls(written_at(p.setting.ctors, k).code).map(
+        named_calls(written_at(p.setting.constructors, k).code).map(
           |c: { name: Bytes, filed: Option<SiteType> }|
             { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } },
         );
@@ -688,7 +713,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
     Ok(p) -> match root_context(p, b"held") {
       None -> assert(false),
       Some(r) -> {
-        let start = params_of(r.cx);
+        let start = params_of(r.context);
         let int = int_type();
         let send = {
           name: b"send",
@@ -698,7 +723,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
           own: [0],
         };
         let d = operation_descriptor(
-          r.cx,
+          r.context,
           start.st,
           b"task",
           send,
@@ -708,7 +733,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
         match d.name {
           None -> assert(false),
           Some(name) -> {
-            assert_eq(d.st.statics.last().map(|s: StaticDef| s.name), Some(name));
+            assert_eq(d.st.statics.last().map(|s: StaticDefinition| s.name), Some(name));
             match d.st.statics.last() {
               Some(s) -> match s.layout {
                 StaticStruct(x) -> {
@@ -737,7 +762,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
           ret: option_type(VariableType(0)),
         };
         let got = operation_descriptor(
-          r.cx,
+          r.context,
           start.st,
           b"task",
           recv,
@@ -749,13 +774,16 @@ test "an operation's descriptor names its types at the perform, the parameters i
             Generated(w, _) -> w.op == OnWordForm(Lower) || w.op == OnWordForm(Lift),
             _ -> false,
           };
-        assert(!got.st.statics.any(|s: StaticDef| entries_of(s).any(crossing)), None);
+        assert(!got.st.statics.any(|s: StaticDefinition| entries_of(s).any(crossing)), None);
         let take = { ..recv, name: b"take", params: [], ret: VariableType(0) };
-        let text = operation_descriptor(r.cx, start.st, b"task", take, [], string_type());
+        let text = operation_descriptor(r.context, start.st, b"task", take, [], string_type());
         let carried_crossing = |k: RootKey|
           match k { Generated(w, _) -> crossing(k) && w.marks.len() > 0, _ -> false };
         assert(text.name != None, None);
-        assert(!text.st.statics.any(|s: StaticDef| entries_of(s).any(carried_crossing)), None);
+        assert(
+          !text.st.statics.any(|s: StaticDefinition| entries_of(s).any(carried_crossing)),
+          None,
+        );
         let fail = {
           name: b"fail",
           mode: RaiseMode,
@@ -764,7 +792,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
           own: [0, 1],
         };
         let raised = operation_descriptor(
-          r.cx,
+          r.context,
           start.st,
           b"oops",
           fail,
@@ -772,7 +800,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
           unit_type(),
         );
         assert(
-          raised.st.statics.any(|s: StaticDef|
+          raised.st.statics.any(|s: StaticDefinition|
             entries_of(s).contains(
               keys::marked(keys::generated_key(OnWordForm(Lower), option_type(int), b"m"), [1]),
             )),
@@ -780,7 +808,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
         );
         assert_eq(
           operation_descriptor(
-            r.cx,
+            r.context,
             start.st,
             b"task",
             send,
@@ -804,14 +832,14 @@ fn kept_marshalling_corpus() -> Bytes =
 fn natives_in(body: List<Inst>) -> List<Bytes> =
   body.fold([], |acc: List<Bytes>, i: Inst|
     match i {
-      Let(l) -> match l.val { Native(n) -> acc.push(n.name), _ -> acc },
-      Do(d) -> match d.val { Native(n) -> acc.push(n.name), _ -> acc },
+      Let(l) -> match l.value { Native(n) -> acc.push(n.name), _ -> acc },
+      Do(d) -> match d.value { Native(n) -> acc.push(n.name), _ -> acc },
       Handle(h) -> acc.concat(natives_in(h.body)),
       _ -> acc,
     })
 
-fn kept_entries(statics: List<StaticDef>) -> List<List<Option<RootKey>>> =
-  statics.fold([], |acc: List<List<Option<RootKey>>>, d: StaticDef|
+fn kept_entries(statics: List<StaticDefinition>) -> List<List<Option<RootKey>>> =
+  statics.fold([], |acc: List<List<Option<RootKey>>>, d: StaticDefinition|
     match d.layout {
       StaticStruct(s) -> if s.of != b"PlyKept" { acc } else {
         acc.push(
@@ -861,14 +889,14 @@ test "a clause compares the kept values it is handed through their type's equali
         assert_eq(kept_entries(f.statics), [comparison_entries(ints)]);
         {
           let e = word_form_entry(
-            p.setting.ctors,
+            p.setting.constructors,
             keys::generated_key(OnWordForm(keys::Equal), ints, b"m"),
           );
           assert_eq(e.params.map(|v: Var| v.representation), [AsWord, AsWord]);
           assert(
             e.body.any(|i: Inst|
               match i {
-                Let(l) -> match l.val {
+                Let(l) -> match l.value {
                   Call(x) -> x.callee == Root(keys::generated_key(keys::Equal, ints, b"m")),
                   _ -> false,
                 },
@@ -887,7 +915,7 @@ test "a clause compares the kept values it is handed through their type's equali
         RecordType(fields_sorted([{ name: b"t", ty: task }])),
         VariableType(0),
       ];
-      assert_eq(types.map(|t: Type| comparison_built(p.setting.ctors, t, false)), [
+      assert_eq(types.map(|t: Type| comparison_built(p.setting.constructors, t, false)), [
         true,
         true,
         true,
@@ -895,7 +923,7 @@ test "a clause compares the kept values it is handed through their type's equali
         false,
         false,
       ]);
-      assert_eq(types.map(|t: Type| comparison_built(p.setting.ctors, t, true)), [
+      assert_eq(types.map(|t: Type| comparison_built(p.setting.constructors, t, true)), [
         true,
         true,
         false,
@@ -923,7 +951,7 @@ test "a value nested in what a program's generic operation is handed crosses kep
       let int = int_type();
       let rooted_call = |acc: List<RootKey>, i: Inst|
         match i {
-          Let(l) -> match l.val {
+          Let(l) -> match l.value {
             Call(c) -> match c.callee { Root(k) -> acc.push(k), _ -> acc },
             _ -> acc,
           },
@@ -979,7 +1007,7 @@ test "a parallel block hands the runtime its branches and the descriptor of each
           None -> [],
           Some(r) ->
             parallel_block(
-              r.cx,
+              r.context,
               { ..initial_lowering([]), next: 2 },
               branches,
               row_empty(),
@@ -988,7 +1016,7 @@ test "a parallel block hands the runtime its branches and the descriptor of each
         };
       assert_eq(
         lowered(b"reads").fold([], |acc: List<Path>, i: Inst|
-          match i { Let(x) -> match x.val { Get(g) -> acc.push(g.path), _ -> acc }, _ -> acc }),
+          match i { Let(x) -> match x.value { Get(g) -> acc.push(g.path), _ -> acc }, _ -> acc }),
         [FieldPath({ name: b"_0", at: 0 }), FieldPath({ name: b"_1", at: 1 })],
       );
       match ops_in(lowered(b"reads")) {
@@ -1033,7 +1061,7 @@ fn fn_of(name: Bytes, params: List<Var>, body: List<Inst>) -> Fn =
 fn op_let(v: Var, op: HandleOp, args: List<Arg>) -> Inst =
   Let({
     var: v,
-    val: Op({
+    value: Op({
       op: OfHandling(op),
       args: args,
       uses: { takes: args.map(|_: Arg| true), owned: true, fails: true, suspends: true },
@@ -1049,7 +1077,7 @@ test "a perform calls its operation's entry in the object it is handed, its word
     fn_of(b"sends", [entry, word(1), object], [
       Let({
         var: word(2),
-        val: Op({
+        value: Op({
           op: OfHandling(
             Perform({
               effect: b"m.net",
@@ -1095,7 +1123,7 @@ test "a perform calls its operation's entry in the object it is handed, its word
       ),
       Let({
         var: local(5, int_type(), AsInt),
-        val: Op({
+        value: Op({
           op: OfHandling(Label(b"conn")),
           args: [],
           uses: { takes: [], owned: false, fails: false, suspends: false },
@@ -1105,7 +1133,7 @@ test "a perform calls its operation's entry in the object it is handed, its word
       }),
       Return(VarOperand(word(4))),
     ]),
-    no_ctors(),
+    no_constructors(),
   );
   let text = pieces_text(printed.pieces);
   let named_type = |x: Bytes|
@@ -1136,7 +1164,7 @@ test "a parallel block's answers are moved into a box in the branches' order, an
       op_let(word(22), Parallel, branches.concat(described).map(|v: Var| VarOperand(v))),
       Return(VarOperand(word(22))),
     ]),
-    no_ctors(),
+    no_constructors(),
   );
   let text = pieces_text(printed.pieces);
   let message = Some(String::of_bytes_lossy(text));
@@ -1164,7 +1192,7 @@ test "where an instruction is written is its root, then its offsets from the roo
         op_let(local(2, int, AsInt), CurrentSite(2), []),
         Return(VarOperand(local(2, int, AsInt))),
       ]),
-      no_ctors(),
+      no_constructors(),
     ).pieces,
   );
   let message = Some(String::of_bytes_lossy(printed));
@@ -1258,7 +1286,7 @@ test "the task operations a load reads the scheduler for are the prelude's, and 
   };
   assert_eq(ops.map(|o: OpInfo| o.name).sort(), task_operations().sort());
   assert_eq(
-    ops.filter(|o: OpInfo| crossing_vars(o).len() > 0).map(|o: OpInfo| o.name),
+    ops.filter(|o: OpInfo| crossing_variables(o).len() > 0).map(|o: OpInfo| o.name),
     crossing_operations(),
   )
 }
@@ -1340,7 +1368,7 @@ test "a crossing stands at the perform it is called for: each of its sites is th
   let src = b"fn made() -> Chan<Int> / {task.channel, abort.raise} = task.channel(1)\n";
   {
     let f = shipped_lowered(src, [scheduler], scheduler_module(), b"crossing_probe");
-    let text = pieces_text(printed_fn(f, no_ctors()).pieces);
+    let text = pieces_text(printed_fn(f, no_constructors()).pieces);
     let shown = Some(String::of_bytes_lossy(text));
     assert(
       text.index_of(
@@ -1500,7 +1528,7 @@ test "a detached body's block is the heap's, forwarding what is around its handl
   assert_eq(
     f.f.body.fold([], |acc: List<Int>, i: Inst|
       match i {
-        Do(d) -> match d.val {
+        Do(d) -> match d.value {
           Op(o) -> match o.op { OfHandling(SetForwarding(at)) -> acc.push(at), _ -> acc },
           _ -> acc,
         },
@@ -1515,7 +1543,7 @@ test "a detached body's block is the heap's, forwarding what is around its handl
         Closure(c) ->
           c.body.body.any(|i: Inst|
             match i {
-              Do(d) -> match d.val {
+              Do(d) -> match d.value {
                 Op(o) ->
                   o.op == OfHandling(Entering) && o.args.at(1) != Some(ZeroOperand(AsImmediate)),
                 _ -> false,
@@ -1634,7 +1662,7 @@ test "a landing enters each clause by its type and sets the answer as its type h
             assert(
               h.body.any(|i: Inst|
                 match i {
-                  Do(d) -> match d.val { Op(o) -> o.op == OfHandling(Returning), _ -> false },
+                  Do(d) -> match d.value { Op(o) -> o.op == OfHandling(Returning), _ -> false },
                   _ -> false,
                 }),
               None,
@@ -1775,7 +1803,7 @@ fn record_corpus() -> Bytes =
 fn reads_of(body: List<Inst>, of: Var) -> List<Path> =
   body.fold([], |acc: List<Path>, i: Inst|
     match i {
-      Let(l) -> match l.val {
+      Let(l) -> match l.value {
         Get(g) -> if g.of.id == of.id { acc.push(g.path) } else { acc },
         _ -> acc,
       },
@@ -1848,15 +1876,15 @@ test "a step iterate runs in place copies into a detached handle's body only slo
           None -> assert(false),
           Some(h) -> {
             let f = body_frame(
-              r.cx,
+              r.context,
               h,
-              handle_plan(r.cx, initial_lowering([]), h, sample_span()),
+              handle_plan(r.context, initial_lowering([]), h, sample_span()),
               [],
               int_type(),
             );
-            let own = range(0, l.params).concat(l.captures.map(|c: Capture| c.dst));
+            let own = range(0, l.params).concat(l.captures.map(|c: Capture| c.destination));
             assert_eq(f.captures.len(), 2);
-            assert(f.captures.all(|c: Capture| own.contains(c.src) && c.dst == c.src))
+            assert(f.captures.all(|c: Capture| own.contains(c.src) && c.destination == c.src))
           },
         },
       },
@@ -1875,7 +1903,11 @@ fn marshalling_corpus() -> Bytes =
 
 fn crossed_parts(body: List<Inst>) -> List<Bytes> / {abort.raise} =
   body.fold([], |acc: List<Bytes>, i: Inst|
-    match i { Let(l) -> acc.concat(part_of(l.val)), Do(d) -> acc.concat(part_of(d.val)), _ -> acc })
+    match i {
+      Let(l) -> acc.concat(part_of(l.value)),
+      Do(d) -> acc.concat(part_of(d.value)),
+      _ -> acc,
+    })
 
 fn part_of(v: Rvalue) -> List<Bytes> / {abort.raise} =
   match v {
@@ -1892,9 +1924,13 @@ fn part_of(v: Rvalue) -> List<Bytes> / {abort.raise} =
     _ -> [],
   }
 
-fn params_of(cx: Context) -> { vars: List<Var>, st: Lowering } / {abort.raise} = {
-  let vars = range(0, cx.types.len()).map(|i: Int|
-    { id: i, ty: cx.types.get(i), representation: representation_of(cx.setting, cx.types.get(i)) });
+fn params_of(context: Context) -> { vars: List<Var>, st: Lowering } / {abort.raise} = {
+  let vars = range(0, context.types.len()).map(|i: Int|
+    {
+      id: i,
+      ty: context.types.get(i),
+      representation: representation_of(context.setting, context.types.get(i)),
+    });
   { vars: vars, st: initial_lowering(vars) }
 }
 
@@ -1917,7 +1953,7 @@ fn calls_in(
           },
           _ -> acc,
         };
-      match i { Let(l) -> called(l.val), Do(d) -> called(d.val), _ -> acc }
+      match i { Let(l) -> called(l.value), Do(d) -> called(d.value), _ -> acc }
     },
   )
 
@@ -1927,18 +1963,18 @@ test "a crossing native is handed machine words: a string as its bytes' address 
     Ok(p) -> match root_context(p, b"held") {
       None -> assert(false),
       Some(r) -> {
-        let start = params_of(r.cx);
+        let start = params_of(r.context);
         let natives = |body: List<Inst>|
           body.fold(
             [],
             |acc: List<{ name: Bytes, representations: List<Representation> }>, i: Inst|
               match i {
-                Do(d) -> match d.val {
+                Do(d) -> match d.value {
                   Native(n) ->
                     acc.push({ name: n.name, representations: n.args.map(operand_representation) }),
                   _ -> acc,
                 },
-                Let(x) -> match x.val {
+                Let(x) -> match x.value {
                   Native(n) ->
                     acc.push({ name: n.name, representations: n.args.map(operand_representation) }),
                   _ -> acc,
@@ -1947,7 +1983,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
               },
           );
         let text = marshalling_builtin_call(
-          r.cx,
+          r.context,
           start.st,
           b"?out_str",
           [VarOperand(start.vars.get(0))],
@@ -1963,7 +1999,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
           { name: b"builtin_elaborated_out_str_p", representations: [AsAddress, AsInt] },
         ]);
         let float = marshalling_builtin_call(
-          r.cx,
+          r.context,
           start.st,
           b"?out_float",
           [VarOperand(start.vars.get(1))],
@@ -1978,7 +2014,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
           { name: b"builtin_elaborated_out_float_p", representations: [AsInt] },
         ]);
         let int = marshalling_builtin_call(
-          r.cx,
+          r.context,
           start.st,
           b"?out_int",
           [VarOperand(start.vars.get(2))],
@@ -2000,13 +2036,13 @@ test "an `assert_eq` at a type left open is the specialisations' to settle" {
       None -> assert(false),
       Some(r) -> match r.code.node {
         CodeApply(a) -> {
-          let start = params_of(r.cx);
+          let start = params_of(r.context);
           let l = builtin(
-            r.cx,
+            r.context,
             start.st,
             b"assert_eq",
             start.vars.map(VarOperand),
-            a.func,
+            a.function,
             sample_span(),
           );
           assert_eq(crossed_parts(l.st.insts), [b"unsettled assert_eq"]);
@@ -2034,18 +2070,21 @@ fn named_calls(c: Code) -> List<{ name: Bytes, filed: Option<SiteType> }> =
     CodeApply(a) -> {
       let inner = a.args.fold([], |acc: List<{ name: Bytes, filed: Option<SiteType> }>, x: Code|
         acc.concat(named_calls(x)));
-      match read_name(a.func) {
-        Some(n) -> [{ name: n, filed: Some(read_typed(a.func)) }].concat(inner),
+      match read_name(a.function) {
+        Some(n) -> [{ name: n, filed: Some(read_typed(a.function)) }].concat(inner),
         None -> inner,
       }
     },
     CodeBlock(b) ->
-      b.stmts.fold([], |acc: List<{ name: Bytes, filed: Option<SiteType> }>, s: CodeStmt|
-        acc.concat(match s {
-          CodeLet(l) -> named_calls(l.value),
-          CodeDo(d) -> named_calls(d.code),
-          _ -> [],
-        })).concat(match b.tail { Some(t) -> named_calls(t), None -> [] }),
+      b.statements.fold(
+        [],
+        |acc: List<{ name: Bytes, filed: Option<SiteType> }>, s: CodeStatement|
+          acc.concat(match s {
+            CodeLet(l) -> named_calls(l.value),
+            CodeDo(d) -> named_calls(d.code),
+            _ -> [],
+          }),
+      ).concat(match b.tail { Some(t) -> named_calls(t), None -> [] }),
     CodeIf(x) ->
       named_calls(x.cond).concat(named_calls(x.then_branch)).concat(named_calls(x.else_branch)),
     CodeMatch(m) ->
@@ -2075,14 +2114,14 @@ fn lambdas_in(c: Code) -> List<Lambda> =
     |acc: List<Lambda>, x: Code| acc.concat(lambdas_in(x)),
   )
 
-fn rows_filled(c: Code) -> List<Row> = match c.node { NDef(d) -> d.rows, _ -> [] }
+fn rows_filled(c: Code) -> List<Row> = match c.node { NDefinition(d) -> d.rows, _ -> [] }
 
 fn literal_bytes(c: Code) -> List<Bytes> =
   match c.node {
     CodeLiteral(l) -> match l { LiteralBytes(b) -> [b], _ -> [] },
     CodeApply(a) -> a.args.fold([], |acc: List<Bytes>, x: Code| acc.concat(literal_bytes(x))),
     CodeBlock(b) ->
-      b.stmts.fold([], |acc: List<Bytes>, s: CodeStmt|
+      b.statements.fold([], |acc: List<Bytes>, s: CodeStatement|
         acc.concat(match s {
           CodeLet(l) -> literal_bytes(l.value),
           CodeDo(d) -> literal_bytes(d.code),
@@ -2101,11 +2140,11 @@ fn literal_bytes(c: Code) -> List<Bytes> =
     _ -> [],
   }
 
-fn written_at(ctors: Ctors, key: RootKey) -> GeneratedRoot / {abort.raise} =
+fn written_at(constructors: Constructors, key: RootKey) -> GeneratedRoot / {abort.raise} =
   match key {
-    Generated(w, _) -> if is_marshal_op(w.op) { marshal_root(b"m", ctors, key) }
-    else { container_code(b"m", ctors, op_name(w.op), w.ty) },
-    _ -> marshal_root(b"m", ctors, key),
+    Generated(w, _) -> if is_marshal_op(w.op) { marshal_root(b"m", constructors, key) }
+    else { container_code(b"m", constructors, op_name(w.op), w.ty) },
+    _ -> marshal_root(b"m", constructors, key),
   }
 
 fn is_marshalling_root(k: RootKey) -> Bool =
@@ -2120,7 +2159,7 @@ fn is_marshalling_root(k: RootKey) -> Bool =
   }
 
 fn is_constructor_name(name: Bytes) -> Bool / {abort.raise} = {
-  let through = prelude_ctor(b"");
+  let through = prelude_constructor(b"");
   let bare = if name.starts_with(through) { name.slice(through.len(), name.len()) } else { name };
   bare.index_of(b"::") == None
     && (match bare.split(b".").last() {
@@ -2157,7 +2196,7 @@ test "an entry reads its arguments from the runtime's lifting, ends it, and writ
       ],
     );
     assert_eq(e.params, []);
-    assert(e.here.any(|d: Def| d.name == b"held" && d.root == Named(b"m.held")))
+    assert(e.here.any(|d: Definition| d.name == b"held" && d.root == Named(b"m.held")))
   }
 }
 
@@ -2181,7 +2220,7 @@ test "a generic definition's entry calls it as any caller does, at an Int for ea
           && (match c.filed { Some(t) -> t.args == [int_type()], None -> false })),
       None,
     );
-    assert(!e.here.any(|d: Def| d.name == b"first"), None)
+    assert(!e.here.any(|d: Definition| d.name == b"first"), None)
   }
 }
 
@@ -2207,7 +2246,7 @@ test "an entry of a definition generic over a row calls it as any caller does, a
       [row_empty()],
     ]);
     assert_eq(e.performs, row_empty());
-    assert(!e.here.any(|d: Def| d.name == b"none"), None)
+    assert(!e.here.any(|d: Definition| d.name == b"none"), None)
   }
 }
 
@@ -2324,7 +2363,7 @@ test "a written root calls only crossing builtins, what it files a type for, and
       let asked = types.fold([], |acc: List<RootKey>, t: Type|
         acc.concat([Lower, Lift].map(|op: keys::TypeOp| keys::generated_key(op, t, b"m")))).concat(
         [list_type(int_type()), array, map].fold([], |acc: List<RootKey>, t: Type|
-          acc.concat(container_defs(b"m", t).map(|d: Def| d.root))),
+          acc.concat(container_definitions(b"m", t).map(|d: Definition| d.root))),
       ).concat(
         [
           { ty: list_type(int_type()), at: 1 },
@@ -2336,13 +2375,13 @@ test "a written root calls only crossing builtins, what it files a type for, and
           )),
       );
       let roots = asked.fold([], |acc: List<{ key: RootKey, root: GeneratedRoot }>, k: RootKey| {
-        let r = written_at(p.setting.ctors, k);
+        let r = written_at(p.setting.constructors, k);
         r.here.fold(
           acc.push({ key: k, root: r }),
-          |a: List<{ key: RootKey, root: GeneratedRoot }>, d: Def|
+          |a: List<{ key: RootKey, root: GeneratedRoot }>, d: Definition|
             if d.root == k || a.any(|x: { key: RootKey, root: GeneratedRoot }| x.key == d.root) {
               a
-            } else { a.push({ key: d.root, root: written_at(p.setting.ctors, d.root) }) },
+            } else { a.push({ key: d.root, root: written_at(p.setting.constructors, d.root) }) },
         )
       });
       let externs = prelude_externs().map(|e: Extern| e.name);
@@ -2351,7 +2390,7 @@ test "a written root calls only crossing builtins, what it files a type for, and
         named_calls(code).fold(
           acc,
           |a: List<Bytes>, call: { name: Bytes, filed: Option<SiteType> }| {
-            let local = r.root.here.any(|d: Def| qualify(b"m", d.name) == call.name);
+            let local = r.root.here.any(|d: Definition| qualify(b"m", d.name) == call.name);
             let bare = match prelude_own(call.name) { Some(n) -> n, None -> call.name };
             let generated = call.name.starts_with(b"?")
               && (!is_marshalling_root(r.key) || marshalling_builtin(call.name))
@@ -2379,19 +2418,19 @@ test "a written root calls only crossing builtins, what it files a type for, and
           container_op_reads(c, 0)),
         [true, true, false, false],
       );
-      let written_names = |k: RootKey| literal_bytes(written_at(p.setting.ctors, k).code);
+      let written_names = |k: RootKey| literal_bytes(written_at(p.setting.constructors, k).code);
       assert_eq(written_names(keys::generated_key(Lower, record, b"m")), [b"h", b"w"]);
       assert_eq(written_names(keys::generated_key(Lift, shape, b"m")), [b"m.Dot", b"m.Line"])
     },
   }
 }
 
-fn written_whole(ctors: Ctors, key: RootKey) -> Bool / {abort.raise} =
+fn written_whole(constructors: Constructors, key: RootKey) -> Bool / {abort.raise} =
   iterate({ todo: [key], seen: [] }, 512, |s: { todo: List<RootKey>, seen: List<RootKey> }|
     match s.todo.at(0) {
       None -> Stop(true),
       Some(k) -> if s.seen.contains(k) { Continue({ todo: s.todo.drop(1), seen: s.seen }) } else {
-        match handle { Some(written_at(ctors, k)) } with { abort.raise(_) -> None } {
+        match handle { Some(written_at(constructors, k)) } with { abort.raise(_) -> None } {
           None -> Stop(false),
           Some(r) -> {
             let parts = named_calls(r.code).fold(
@@ -2410,7 +2449,7 @@ fn written_whole(ctors: Ctors, key: RootKey) -> Bool / {abort.raise} =
                 },
             );
             Continue({
-              todo: s.todo.drop(1).concat(parts).concat(r.here.map(|d: Def| d.root)),
+              todo: s.todo.drop(1).concat(parts).concat(r.here.map(|d: Definition| d.root)),
               seen: s.seen.push(k),
             })
           },
@@ -2422,8 +2461,8 @@ test "a type crosses where its roots and those of every type it crosses at are w
   match program_of(marshalling_corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      let ctors = p.setting.ctors;
-      let held = marshalled_sums(ctors.sums, |_: Bytes| true);
+      let constructors = p.setting.constructors;
+      let held = marshalled_sums(constructors.sums, |_: Bytes| true);
       let shape = NamedType({ name: b"m.Shape", args: [] });
       let hook = NamedType({ name: b"m.Hook", args: [] });
       let callback = fn_type([int_type()], int_type(), row_empty());
@@ -2446,7 +2485,7 @@ test "a type crosses where its roots and those of every type it crosses at are w
       ];
       let message = |back: Bool| types.map(|t: Type| marshals(held, t, back));
       let written = |op: keys::TypeOp|
-        types.map(|t: Type| written_whole(ctors, keys::generated_key(op, t, b"m")));
+        types.map(|t: Type| written_whole(constructors, keys::generated_key(op, t, b"m")));
       assert_eq(message(false), written(Lower));
       assert_eq(message(true), written(Lift));
       assert_eq(message(false), [
@@ -2481,7 +2520,8 @@ test "a type crosses where its roots and those of every type it crosses at are w
         false,
         false,
       ]);
-      let inserting = marshalled_sums(ctors.sums, |n: Bytes| !emitted_code().lifts.contains(n));
+      let inserting = marshalled_sums(constructors.sums, |n: Bytes|
+        !emitted_code().lifts.contains(n));
       assert_eq(
         [
           marshals(inserting, map, false),
@@ -2490,7 +2530,7 @@ test "a type crosses where its roots and those of every type it crosses at are w
         ],
         [true, false, true],
       );
-      let bare = marshalled_sums(ctors.sums, |_: Bytes| false);
+      let bare = marshalled_sums(constructors.sums, |_: Bytes| false);
       assert_eq(
         [
           marshals(bare, list_type(int_type()), false),
@@ -2513,18 +2553,18 @@ test "a type's descriptor is laid once, its identity and spelling before the ent
     Ok(p) -> match root_context(p, b"held") {
       None -> assert(false),
       Some(r) -> {
-        let start = params_of(r.cx);
+        let start = params_of(r.context);
         let shape = NamedType({ name: b"m.Shape", args: [] });
-        let once = type_descriptor(r.cx, start.st, shape, sample_span());
-        let twice = type_descriptor(r.cx, once.st, shape, sample_span());
+        let once = type_descriptor(r.context, start.st, shape, sample_span());
+        let twice = type_descriptor(r.context, once.st, shape, sample_span());
         assert_eq(twice.st.statics, once.st.statics);
         assert_eq(once.st.statics.len(), 2);
         let key = |op: keys::TypeOp, t: Type| keys::generated_key(op, t, b"m");
         let laid = |d: LoweredValue|
           match d.st.statics.at(1) { Some(s) -> s, None -> panic("a descriptor laid no static") };
-        let lowering = |s: StaticDef|
+        let lowering = |s: StaticDefinition|
           match s.layout { StaticStruct(x) -> x.fields.at(5), _ -> None };
-        let lifting = |s: StaticDef|
+        let lifting = |s: StaticDefinition|
           match s.layout { StaticStruct(x) -> x.fields.at(6), _ -> None };
         let d = laid(once);
         assert_eq(entries_of(d), [key(Dup, shape), key(keys::Release, shape)]);
@@ -2543,16 +2583,16 @@ test "a type's descriptor is laid once, its identity and spelling before the ent
           _ -> assert(false),
         };
         assert_eq(operand_representation(once.arg), AsInt);
-        let shown = laid(shown_described(r.cx, start.st, shape, sample_span()));
+        let shown = laid(shown_described(r.context, start.st, shape, sample_span()));
         assert_eq(entries_of(shown), [
           key(Dup, shape),
           key(keys::Release, shape),
           key(OnWordForm(Lower), shape),
         ]);
-        let string = laid(type_descriptor(r.cx, start.st, string_type(), sample_span()));
+        let string = laid(type_descriptor(r.context, start.st, string_type(), sample_span()));
         assert_eq(lifting(string), Some(EntryWord(key(OnWordForm(Lift), string_type()))));
         assert_eq(lowering(string), Some(PreludeWord(never_shown_fn())));
-        let open = type_descriptor(r.cx, start.st, list_type(VariableType(0)), sample_span());
+        let open = type_descriptor(r.context, start.st, list_type(VariableType(0)), sample_span());
         assert_eq(open.st.statics, []);
         assert(open.st.links.needs.any(|n: Need| n.reads == Exact));
         assert_eq(crossed_parts(open.st.insts), [b"unsettled type#List<'0>"])
@@ -2565,7 +2605,7 @@ test "a type's word-form entries open the word for its lowering and box what its
   match program_of(marshalling_corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      let ctors = p.setting.ctors;
+      let constructors = p.setting.constructors;
       let types = [
         int_type(),
         float_type(),
@@ -2578,7 +2618,7 @@ test "a type's word-form entries open the word for its lowering and box what its
       ];
       let entries = types.fold([], |acc: List<Fn>, t: Type|
         [OnWordForm(Lower), OnWordForm(Lift)].fold(acc, |a: List<Fn>, op: keys::TypeOp| {
-          let f = word_form_entry(ctors, keys::generated_key(op, t, b"m"));
+          let f = word_form_entry(constructors, keys::generated_key(op, t, b"m"));
           a.push(f)
         }));
       let refused = entries.fold([], |acc: List<Bytes>, f: Fn|
@@ -2606,7 +2646,7 @@ test "a type's word-form entries open the word for its lowering and box what its
         entries.take(2).map(|f: Fn|
           f.body.fold([], |acc: List<Representation>, i: Inst|
             match i {
-              Let(l) -> match l.val { Convert(x) -> acc.push(x.to), _ -> acc },
+              Let(l) -> match l.value { Convert(x) -> acc.push(x.to), _ -> acc },
               _ -> acc,
             })),
         [[AsInt], [AsWord]],

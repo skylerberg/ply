@@ -1,74 +1,79 @@
-import compiler.syntax.parsing (Span, ParseDiag, error_at, dummy_span, starts_upper, parse_diag_bin)
-import compiler.syntax.items (Module, FunctionItem, FnDef, item_span, parse)
-import compiler.syntax.exprs (Expr, LiteralExpression, NameExpression, CallExpression,
-                              RecordExpression, ListExpression, RecordLiteralField, expr_span)
+import compiler.syntax.parsing (Span, ParseDiagnostic, error_at, dummy_span, starts_upper,
+                                parse_diagnostic_bin)
+import compiler.syntax.items (Module, FunctionItem, FnDefinition, item_span, parse)
+import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, CallExpression,
+                                    RecordExpression, ListExpression, RecordLiteralField,
+                                    expression_span)
 import compiler.syntax.patterns (LiteralInt, LiteralBool, LiteralString, LiteralUnit)
-import compiler.syntax.type_syntax (NamedTypeExpression, ty_span)
+import compiler.syntax.type_syntax (NamedTypeExpression, type_span)
 import compiler.store.hash.encoding (hex)
 import compiler.store.hash.forms (sort_bytes)
 import compiler.check.resolve.tables (Source, source_bin)
-import compiler.check.known (some_ctor, none_ctor)
+import compiler.check.known (some_constructor, none_constructor)
 import compiler.expand.embed (ModuleEmbed, EmbedFile)
 import std.json (Json, Null, Bool, Number, Str, Member, JsonCodec, object, array, variant,
                  error_to_string)
 import std.hash (blake3)
 import std.bin
-import std.pkg (Manifest, Version, Dep, Path, Git, Registry, Workspace, Suite, manifest_json,
+import std.pkg (Manifest, Version, Dependency, Path, Git, Registry, Workspace, Suite, manifest_json,
                 workspace_json, prefix_of, manifest_bin)
 import std.list
 import std.graph
 import std.string
 import std.bytes
 
-type FileKind = { noun: Bytes, file: Bytes, def: Bytes, ty: Bytes }
+type FileKind = { noun: Bytes, file: Bytes, definition: Bytes, ty: Bytes }
 
 fn manifest_file_kind() -> FileKind =
-  { noun: b"manifest", file: b"ply.pkg", def: b"package", ty: b"Manifest" }
+  { noun: b"manifest", file: b"ply.pkg", definition: b"package", ty: b"Manifest" }
 
 fn workspace_file_kind() -> FileKind =
-  { noun: b"workspace", file: b"ply.work", def: b"workspace", ty: b"Workspace" }
+  { noun: b"workspace", file: b"ply.work", definition: b"workspace", ty: b"Workspace" }
 
-pub type CheckedManifest = { manifest: Option<Manifest>, diags: List<ParseDiag> }
+pub type CheckedManifest = { manifest: Option<Manifest>, diagnostics: List<ParseDiagnostic> }
 
 pub fn check_manifest(src: Bytes) -> CheckedManifest / {abort.raise} =
   match literal_of(src, manifest_file_kind()) {
-    Err(diags) -> { manifest: None, diags: diags },
+    Err(diagnostics) -> { manifest: None, diagnostics: diagnostics },
     Ok(l) -> match decoded(l, manifest_file_kind(), manifest_json()) {
-      Err(diags) -> { manifest: None, diags: diags },
+      Err(diagnostics) -> { manifest: None, diagnostics: diagnostics },
       Ok(m) -> validate(m, l.at),
     },
   }
 
-pub type CheckedWorkspace = { workspace: Option<Workspace>, diags: List<ParseDiag> }
+pub type CheckedWorkspace = { workspace: Option<Workspace>, diagnostics: List<ParseDiagnostic> }
 
 pub fn check_workspace(src: Bytes) -> CheckedWorkspace / {abort.raise} =
   match literal_of(src, workspace_file_kind()) {
-    Err(diags) -> { workspace: None, diags: diags },
+    Err(diagnostics) -> { workspace: None, diagnostics: diagnostics },
     Ok(l) -> match decoded(l, workspace_file_kind(), workspace_json()) {
-      Err(diags) -> { workspace: None, diags: diags },
+      Err(diagnostics) -> { workspace: None, diagnostics: diagnostics },
       Ok(w) -> {
-        let diags = workspace_diags(w, field_diag(l.at, workspace_file_kind()));
-        { workspace: if diags.len() == 0 { Some(w) } else { None }, diags: diags }
+        let diagnostics = workspace_diagnostics(w, field_diagnostic(l.at, workspace_file_kind()));
+        { workspace: if diagnostics.len() == 0 { Some(w) } else { None }, diagnostics: diagnostics }
       },
     },
   }
 
 type Literal = { json: Json, at: Span }
 
-fn literal_of(src: Bytes, s: FileKind) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
+fn literal_of(src: Bytes, s: FileKind) -> Result<Literal, List<ParseDiagnostic>> / {abort.raise} = {
   let r = parse(src);
-  if r.parser.diags.len() > 0 { Err(r.parser.diags) } else { literal_in(r.node, s) }
+  if r.parser.diagnostics.len() > 0 { Err(r.parser.diagnostics) } else { literal_in(r.node, s) }
 }
 
-fn literal_in(module: Module, s: FileKind) -> Result<Literal, List<ParseDiag>> / {abort.raise} =
+fn literal_in(
+  module: Module,
+  s: FileKind,
+) -> Result<Literal, List<ParseDiagnostic>> / {abort.raise} =
   match module.items {
     [one] -> match one {
-      FunctionItem(d) -> if d.name.name == s.def { literal_fn(d, s) } else {
+      FunctionItem(d) -> if d.name.name == s.definition { literal_fn(d, s) } else {
         Err([
           shape_error(
             d.name.span,
             s,
-            message_text([b"a ", s.noun, b"'s one definition is named `", s.def, b"`"]),
+            message_text([b"a ", s.noun, b"'s one definition is named `", s.definition, b"`"]),
           ),
         ])
       },
@@ -77,7 +82,7 @@ fn literal_in(module: Module, s: FileKind) -> Result<Literal, List<ParseDiag>> /
           shape_error(
             item_span(one),
             s,
-            message_text([b"a ", s.noun, b" holds a `fn ", s.def, b"`, nothing else"]),
+            message_text([b"a ", s.noun, b" holds a `fn ", s.definition, b"`, nothing else"]),
           ),
         ]),
     },
@@ -86,7 +91,13 @@ fn literal_in(module: Module, s: FileKind) -> Result<Literal, List<ParseDiag>> /
         shape_error(
           dummy_span(),
           s,
-          message_text([b"a ", s.noun, b" defines `", s.def, b"`; this file defines nothing"]),
+          message_text([
+            b"a ",
+            s.noun,
+            b" defines `",
+            s.definition,
+            b"`; this file defines nothing",
+          ]),
         ),
       ]),
     [_, two, ..rest] ->
@@ -94,20 +105,20 @@ fn literal_in(module: Module, s: FileKind) -> Result<Literal, List<ParseDiag>> /
         shape_error(
           item_span(two),
           s,
-          message_text([b"a ", s.noun, b" defines `", s.def, b"` and nothing else"]),
+          message_text([b"a ", s.noun, b" defines `", s.definition, b"` and nothing else"]),
         ),
       ]),
   }
 
 fn message_text(parts: List<Bytes>) -> Bytes = Bytes::concat_all(parts)
 
-fn shape_error(here: Span, s: FileKind, message: Bytes) -> ParseDiag =
+fn shape_error(here: Span, s: FileKind, message: Bytes) -> ParseDiagnostic =
   error_at(b"E0129", here, message, message_text([b"not the shape a ", s.noun, b" takes"]), [
     message_text([
       b"a `",
       s.file,
       b"` file is exactly `fn ",
-      s.def,
+      s.definition,
       b"() -> ",
       s.ty,
       b" = ...`, with std.pkg's ",
@@ -115,39 +126,51 @@ fn shape_error(here: Span, s: FileKind, message: Bytes) -> ParseDiag =
     ]),
   ])
 
-fn concat_diags(xs: List<ParseDiag>, ys: List<ParseDiag>) -> List<ParseDiag> =
-  ys.fold(xs, |acc: List<ParseDiag>, diag: ParseDiag| acc.push(diag))
+fn concat_diagnostics(
+  xs: List<ParseDiagnostic>,
+  ys: List<ParseDiagnostic>,
+) -> List<ParseDiagnostic> =
+  ys.fold(xs, |acc: List<ParseDiagnostic>, diagnostic: ParseDiagnostic| acc.push(diagnostic))
 
-fn literal_fn(def: FnDef, s: FileKind) -> Result<Literal, List<ParseDiag>> / {abort.raise} = {
-  let returns = message_text([b"`", s.def, b"` returns std.pkg's `", s.ty, b"`"]);
+fn literal_fn(
+  definition: FnDefinition,
+  s: FileKind,
+) -> Result<Literal, List<ParseDiagnostic>> / {abort.raise} = {
+  let returns = message_text([b"`", s.definition, b"` returns std.pkg's `", s.ty, b"`"]);
   let not_it = message_text([b"not the ", s.noun, b" type"]);
-  let ret_diags = match def.ret {
+  let return_diagnostics = match definition.ret {
     None ->
       [
         labelled_shape_error(
-          def.name.span,
-          message_text([b"`", s.def, b"` declares its return type, std.pkg's `", s.ty, b"`"]),
+          definition.name.span,
+          message_text([
+            b"`",
+            s.definition,
+            b"` declares its return type, std.pkg's `",
+            s.ty,
+            b"`",
+          ]),
           b"no return type written",
         ),
       ],
     Some(t) -> match t {
       NamedTypeExpression(c) -> if c.name.name.name == s.ty { [] }
-      else { [labelled_shape_error(ty_span(t), returns, not_it)] },
-      _ -> [labelled_shape_error(ty_span(t), returns, not_it)],
+      else { [labelled_shape_error(type_span(t), returns, not_it)] },
+      _ -> [labelled_shape_error(type_span(t), returns, not_it)],
     },
   };
-  let param_diags = if def.params.len() == 0 { [] } else {
+  let param_diagnostics = if definition.params.len() == 0 { [] } else {
     [
       labelled_shape_error(
-        def.name.span,
-        message_text([b"`", s.def, b"` takes no parameters"]),
+        definition.name.span,
+        message_text([b"`", s.definition, b"` takes no parameters"]),
         message_text([b"a ", s.noun, b" is data; nothing is passed in"]),
       ),
     ]
   };
-  let diags = concat_diags(ret_diags, param_diags);
-  if diags.len() > 0 { Err(diags) } else {
-    match literal_json(def.body) {
+  let diagnostics = concat_diagnostics(return_diagnostics, param_diagnostics);
+  if diagnostics.len() > 0 { Err(diagnostics) } else {
+    match literal_json(definition.body) {
       Err(at) ->
         Err([
           error_at(
@@ -158,19 +181,19 @@ fn literal_fn(def: FnDef, s: FileKind) -> Result<Literal, List<ParseDiag>> / {ab
             [b"a literal, a constructor applied to literals, a record or a list is fine"],
           ),
         ]),
-      Ok(j) -> Ok({ json: j, at: expr_span(def.body) }),
+      Ok(j) -> Ok({ json: j, at: expression_span(definition.body) }),
     }
   }
 }
 
-fn labelled_shape_error(here: Span, message: Bytes, label: Bytes) -> ParseDiag =
+fn labelled_shape_error(here: Span, message: Bytes, label: Bytes) -> ParseDiagnostic =
   error_at(b"E0129", here, message, label, [])
 
 fn decoded<a>(
   l: Literal,
   s: FileKind,
   codec: JsonCodec<a>,
-) -> Result<a, List<ParseDiag>> / {abort.raise} =
+) -> Result<a, List<ParseDiagnostic>> / {abort.raise} =
   match (codec.decode)(l.json) {
     Err(e) ->
       Err([
@@ -185,9 +208,9 @@ fn decoded<a>(
     Ok(v) -> Ok(v),
   }
 
-fn literal_json(expr: Expr) -> Result<Json, Span> / {abort.raise} =
-  match expr {
-    LiteralExpression(v) -> match v.lit {
+fn literal_json(expression: Expression) -> Result<Json, Span> / {abort.raise} =
+  match expression {
+    LiteralExpression(v) -> match v.literal {
       LiteralInt(n) -> Ok(Number(Decimal::of_int(n))),
       LiteralBool(b) -> Ok(Bool(b)),
       LiteralString(s) -> Ok(Str(String::of_bytes(s))),
@@ -199,28 +222,35 @@ fn literal_json(expr: Expr) -> Result<Json, Span> / {abort.raise} =
       Err(s) -> Err(s),
       Ok(items) -> Ok(array(items)),
     },
-    CallExpression(a) -> match a.func {
+    CallExpression(a) -> match a.function {
       NameExpression(f) -> if a.named.len() == 0 && a.labels.len() == 0
-          && starts_upper(f.name.name.name) { ctor_json(a.span, f.name.name.name, a.args) }
+          && starts_upper(f.name.name.name) { constructor_json(a.span, f.name.name.name, a.args) }
       else { Err(a.span) },
       _ -> Err(a.span),
     },
-    NameExpression(v) -> if v.name.name.name == none_ctor() { Ok(Null) }
+    NameExpression(v) -> if v.name.name.name == none_constructor() { Ok(Null) }
     else if starts_upper(v.name.name.name) { Ok(variant(String::of_bytes(v.name.name.name), [])) }
     else { Err(v.span) },
-    _ -> Err(expr_span(expr)),
+    _ -> Err(expression_span(expression)),
   }
 
-fn ctor_json(here: Span, tag: Bytes, args: List<Expr>) -> Result<Json, Span> / {abort.raise} =
-  if tag == some_ctor() { match args { [x] -> literal_json(x), _ -> Err(here) } } else {
+fn constructor_json(
+  here: Span,
+  tag: Bytes,
+  args: List<Expression>,
+) -> Result<Json, Span> / {abort.raise} =
+  if tag == some_constructor() { match args { [x] -> literal_json(x), _ -> Err(here) } } else {
     match items_json(args, []) {
       Err(s) -> Err(s),
       Ok(values) -> Ok(variant(String::of_bytes(tag), values)),
     }
   }
 
-fn items_json(exprs: List<Expr>, acc: List<Json>) -> Result<List<Json>, Span> / {abort.raise} =
-  match exprs {
+fn items_json(
+  expressions: List<Expression>,
+  acc: List<Json>,
+) -> Result<List<Json>, Span> / {abort.raise} =
+  match expressions {
     [] -> Ok(acc),
     [x, ..rest] -> match literal_json(x) {
       Err(s) -> Err(s),
@@ -241,27 +271,30 @@ fn fields_json(
   }
 
 fn validate(manifest: Manifest, here: Span) -> CheckedManifest / {abort.raise} = {
-  let bad = field_diag(here, manifest_file_kind());
-  let name_diags = if Bytes::of_string(manifest.name).len() == 0 {
+  let bad = field_diagnostic(here, manifest_file_kind());
+  let name_diagnostics = if Bytes::of_string(manifest.name).len() == 0 {
     [bad(b"a manifest's `name` must not be empty")]
   } else if !is_dotted_path(manifest.name) {
     [bad(b"a manifest's `name` is lower-case identifier segments joined by dots")]
   } else { [] };
-  let prefix_diags = match manifest.prefix {
+  let prefix_diagnostics = match manifest.prefix {
     None -> [],
     Some(p) -> if is_dotted_path(p) { [] }
     else { [bad(b"a manifest's `prefix` is lower-case identifier segments joined by dots")] },
   };
-  let version_diags = if version_ok(manifest.version) { [] }
+  let version_diagnostics = if version_ok(manifest.version) { [] }
   else { [bad(b"a manifest's `version` counts up from zero, never below")] };
-  let base = concat_diags(name_diags, concat_diags(prefix_diags, version_diags));
+  let base = concat_diagnostics(
+    name_diagnostics,
+    concat_diagnostics(prefix_diagnostics, version_diagnostics),
+  );
   {
     manifest: if base.len() == 0 { Some(manifest) } else { None },
-    diags: deps_ok(manifest.dependencies, [], base, bad),
+    diagnostics: dependencies_ok(manifest.dependencies, [], base, bad),
   }
 }
 
-fn field_diag(here: Span, s: FileKind) -> (Bytes) -> ParseDiag =
+fn field_diagnostic(here: Span, s: FileKind) -> (Bytes) -> ParseDiagnostic =
   |message: Bytes|
     error_at(b"E0131", here, message, message_text([b"not a field a ", s.noun, b" accepts"]), [])
 
@@ -285,9 +318,12 @@ fn cargo_name(name: String) -> Bool / {abort.raise} = {
     })
 }
 
-fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> / {abort.raise} = {
+fn workspace_diagnostics(
+  w: Workspace,
+  bad: (Bytes) -> ParseDiagnostic,
+) -> List<ParseDiagnostic> / {abort.raise} = {
   let dirs = directories(w);
-  let placed = dirs.fold([], |acc: List<ParseDiag>, dir: String|
+  let placed = dirs.fold([], |acc: List<ParseDiagnostic>, dir: String|
     if below(dir) { acc } else {
       acc.push(
         bad(
@@ -299,7 +335,7 @@ fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> /
         ),
       )
     });
-  let once = range(0, dirs.len()).fold(placed, |acc: List<ParseDiag>, i: Int|
+  let once = range(0, dirs.len()).fold(placed, |acc: List<ParseDiagnostic>, i: Int|
     if !dirs.take(i).contains(dirs.get(i)) { acc } else {
       acc.push(
         bad(message_text([b"the directory `", Bytes::of_string(dirs.get(i)), b"` is named twice"])),
@@ -336,19 +372,19 @@ fn workspace_diags(w: Workspace, bad: (Bytes) -> ParseDiag) -> List<ParseDiag> /
 
 fn version_ok(v: Version) -> Bool = v.major >= 0 && v.minor >= 0 && v.patch >= 0
 
-fn deps_ok(
-  deps: List<Dep>,
+fn dependencies_ok(
+  dependencies: List<Dependency>,
   seen: List<Bytes>,
-  diags: List<ParseDiag>,
-  bad: (Bytes) -> ParseDiag,
-) -> List<ParseDiag> / {abort.raise} =
-  match deps {
-    [] -> diags,
+  diagnostics: List<ParseDiagnostic>,
+  bad: (Bytes) -> ParseDiagnostic,
+) -> List<ParseDiagnostic> / {abort.raise} =
+  match dependencies {
+    [] -> diagnostics,
     [d, ..rest] -> {
       let here = if Bytes::of_string(d.name).len() == 0 {
-        diags.push(bad(b"a dependency's `name` must not be empty"))
+        diagnostics.push(bad(b"a dependency's `name` must not be empty"))
       } else if seen.contains(Bytes::of_string(d.name)) {
-        diags.push(
+        diagnostics.push(
           bad(
             Bytes::concat_all([
               b"the dependency `",
@@ -358,7 +394,7 @@ fn deps_ok(
           ),
         )
       } else if !version_ok(d.min) {
-        diags.push(
+        diagnostics.push(
           bad(
             Bytes::concat_all([
               b"the dependency `",
@@ -368,7 +404,7 @@ fn deps_ok(
           ),
         )
       } else if is_registry(d) && !is_dotted_path(d.name) {
-        diags.push(
+        diagnostics.push(
           bad(
             Bytes::concat_all([
               b"the registry dependency `",
@@ -377,8 +413,8 @@ fn deps_ok(
             ]),
           ),
         )
-      } else { diags };
-      deps_ok(rest, seen.push(Bytes::of_string(d.name)), here, bad)
+      } else { diagnostics };
+      dependencies_ok(rest, seen.push(Bytes::of_string(d.name)), here, bad)
     },
   }
 
@@ -400,7 +436,7 @@ test "a well-formed manifest checks and decodes" {
   let got = check_manifest(
     b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"tool\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [{name: \"cli\", prefix: None, min: {major: 1, minor: 2, patch: 3}, source: Path(\"../cli\")}, {name: \"gitlib\", prefix: Some(\"gl\"), min: {major: 0, minor: 0, patch: 1}, source: Git(\"https://example.com/gitlib\", \"deadbee\")}, {name: \"reglib\", prefix: None, min: {major: 2, minor: 0, patch: 0}, source: Registry}], entry: Some(\"app.serve\")}",
   );
-  assert_eq(got.diags, []);
+  assert_eq(got.diagnostics, []);
   match got.manifest {
     None -> assert(false),
     Some(m) -> {
@@ -415,13 +451,13 @@ test "a well-formed manifest checks and decodes" {
 }
 
 test "a manifest with anything but one fn named package is refused" {
-  assert_eq(check_manifest(b"type X = {a: Int}").diags.get(0).code, b"E0129");
-  assert_eq(check_manifest(b"fn other() -> Int = 1").diags.get(0).code, b"E0129");
-  assert_eq(check_manifest(b"fn package() -> Int = 1").diags.get(0).code, b"E0129");
+  assert_eq(check_manifest(b"type X = {a: Int}").diagnostics.get(0).code, b"E0129");
+  assert_eq(check_manifest(b"fn other() -> Int = 1").diagnostics.get(0).code, b"E0129");
+  assert_eq(check_manifest(b"fn package() -> Int = 1").diagnostics.get(0).code, b"E0129");
   assert_eq(
     check_manifest(
       b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}\nfn extra() -> Int = 1",
-    ).diags.get(
+    ).diagnostics.get(
       0,
     ).code,
     b"E0129",
@@ -434,7 +470,7 @@ test "a manifest body that runs is not a value" {
     check_manifest(
       head
         ++ b"{name: greet(\"x\"), version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
-    ).diags.get(
+    ).diagnostics.get(
       0,
     ).code,
     b"E0130",
@@ -443,7 +479,7 @@ test "a manifest body that runs is not a value" {
     check_manifest(
       head
         ++ b"{name: \"a\", version: {major: 0, minor: 0, patch: 1 + 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
-    ).diags.get(
+    ).diagnostics.get(
       0,
     ).code,
     b"E0130",
@@ -452,40 +488,43 @@ test "a manifest body that runs is not a value" {
     check_manifest(
       head
         ++ b"{ let x = 1; {name: \"a\", version: {major: 0, minor: 0, patch: x}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None} }",
-    ).diags.get(
+    ).diagnostics.get(
       0,
     ).code,
     b"E0130",
   )
 }
 
-fn a_manifest(name: String, deps: List<String>) -> Bytes =
+fn a_manifest(name: String, dependencies: List<String>) -> Bytes =
   Bytes::of_string(
     "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
       ++ "\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
-      ++ String::join(deps, ", ")
+      ++ String::join(dependencies, ", ")
       ++ "], entry: None}",
   )
 
-fn a_dep(name: String, floor: Int, path: String) -> String =
+fn a_dependency(name: String, floor: Int, path: String) -> String =
   "{name: \"" ++ name ++ "\", prefix: None, min: {major: 0, minor: " ++ floor.to_string()
     ++ ", patch: 0}, source: Path(\""
     ++ path
     ++ "\")}"
 
-fn supplied_at(root: String, name: String, deps: List<String>) -> SuppliedPackage =
-  { root: Bytes::of_string(root), manifest: Some(a_manifest(name, deps)), modules: [] }
+fn supplied_at(root: String, name: String, dependencies: List<String>) -> SuppliedPackage =
+  { root: Bytes::of_string(root), manifest: Some(a_manifest(name, dependencies)), modules: [] }
 
-fn a_registry_dep(name: String, floor: Int) -> String =
+fn a_registry_dependency(name: String, floor: Int) -> String =
   "{name: \"" ++ name ++ "\", prefix: None, min: {major: 0, minor: " ++ floor.to_string()
     ++ ", patch: 0}, source: Registry}"
 
 fn codes_of(clo: Closure) -> List<Bytes> =
-  clo.diags.map(|d: { slot: Int, diag: ParseDiag }| d.diag.code)
+  clo.diagnostics.map(|d: { slot: Int, diagnostic: ParseDiagnostic }| d.diagnostic.code)
 
 test "a registry dependency is wanted at the root's cache, whichever package declares it" {
-  let app = supplied_at("/x/app", "app", [a_registry_dep("orders", 1), a_dep("lib", 0, "../lib")]);
-  let lib = supplied_at("/x/lib", "lib", [a_registry_dep("money", 0)]);
+  let app = supplied_at("/x/app", "app", [
+    a_registry_dependency("orders", 1),
+    a_dependency("lib", 0, "../lib"),
+  ]);
+  let lib = supplied_at("/x/lib", "lib", [a_registry_dependency("money", 0)]);
   assert_eq(roots_wanted([b"/x/app"], [app]), [b"/x/app/.ply-cache/registry/orders", b"/x/lib"]);
   assert_eq(
     roots_wanted([b"/x/app", b"/x/app/.ply-cache/registry/orders", b"/x/lib"], [app, lib]),
@@ -495,116 +534,120 @@ test "a registry dependency is wanted at the root's cache, whichever package dec
 }
 
 test "a registry dependency at or above its floor is the package its slot holds" {
-  let pkgs: PackageSources = {
+  let packages: PackageSources = {
     root: b"/x/app",
-    manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
+    manifest: Some(a_manifest("app", [a_registry_dependency("orders", 1)])),
     supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "orders", [])],
   };
-  let clo = closure(pkgs, []);
-  assert_eq(clo.diags, []);
+  let clo = closure(packages, []);
+  assert_eq(clo.diagnostics, []);
   assert_eq(clo.packages.map(|package: Package| package.prefix), [b"app", b"orders"]);
-  assert_eq(clo.packages.get(0).deps, [b"orders"])
+  assert_eq(clo.packages.get(0).dependencies, [b"orders"])
 }
 
 test "a registry slot never fetched, fetched below the floor, or holding another package says so" {
   let unfetched = closure(
     {
       root: b"/x/app",
-      manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
+      manifest: Some(a_manifest("app", [a_registry_dependency("orders", 1)])),
       supplied: [{ root: b"/x/app/.ply-cache/registry/orders", manifest: None, modules: [] }],
     },
     [],
   );
   assert_eq(codes_of(unfetched), [b"E0135"]);
-  let message_text = unfetched.diags.get(0).diag;
+  let message_text = unfetched.diagnostics.get(0).diagnostic;
   assert(String::of_bytes_lossy(message_text.message).contains("`orders` has not been fetched"));
   assert(String::of_bytes_lossy(message_text.notes_text.get(0)).contains("`ply resolve`"));
   let below = closure(
     {
       root: b"/x/app",
-      manifest: Some(a_manifest("app", [a_registry_dep("orders", 2)])),
+      manifest: Some(a_manifest("app", [a_registry_dependency("orders", 2)])),
       supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "orders", [])],
     },
     [],
   );
   assert_eq(codes_of(below), [b"E0136"]);
-  assert_eq(below.diags.get(0).diag.notes, 1);
+  assert_eq(below.diagnostics.get(0).diagnostic.notes, 1);
   let other = closure(
     {
       root: b"/x/app",
-      manifest: Some(a_manifest("app", [a_registry_dep("orders", 1)])),
+      manifest: Some(a_manifest("app", [a_registry_dependency("orders", 1)])),
       supplied: [supplied_at("/x/app/.ply-cache/registry/orders", "billing", [])],
     },
     [],
   );
   assert_eq(codes_of(other), [b"E0135"]);
   assert(
-    String::of_bytes_lossy(other.diags.get(0).diag.message).contains("holds the package `billing`"),
+    String::of_bytes_lossy(other.diagnostics.get(0).diagnostic.message).contains(
+      "holds the package `billing`",
+    ),
   )
 }
 
 test "a cycle is named from the package it comes back to, without the one that only leads there" {
-  let pkgs: PackageSources = {
+  let packages: PackageSources = {
     root: b"/x/app",
-    manifest: Some(a_manifest("app", [a_dep("mid", 1, "../mid")])),
+    manifest: Some(a_manifest("app", [a_dependency("mid", 1, "../mid")])),
     supplied: [
-      supplied_at("/x/mid", "mid", [a_dep("lib", 1, "../lib")]),
-      supplied_at("/x/lib", "lib", [a_dep("mid", 1, "../mid")]),
+      supplied_at("/x/mid", "mid", [a_dependency("lib", 1, "../lib")]),
+      supplied_at("/x/lib", "lib", [a_dependency("mid", 1, "../mid")]),
     ],
   };
-  let clo = closure(pkgs, []);
+  let clo = closure(packages, []);
   assert_eq(codes_of(clo), [b"E0134"]);
   assert(
-    String::of_bytes_lossy(clo.diags.get(0).diag.message).contains(
+    String::of_bytes_lossy(clo.diagnostics.get(0).diagnostic.message).contains(
       "in a cycle: /x/mid -> /x/lib -> /x/mid",
     ),
   )
 }
 
 test "a diamond of one version is what a closure pins: both requesters, one package" {
-  let pkgs: PackageSources = {
+  let packages: PackageSources = {
     root: b"/x/app",
-    manifest: Some(a_manifest("app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")])),
+    manifest: Some(a_manifest("app", [a_dependency("b", 1, "../b"), a_dependency("c", 1, "../c")])),
     supplied: [
-      supplied_at("/x/b", "b", [a_dep("d", 0, "../d")]),
-      supplied_at("/x/c", "c", [a_dep("d", 1, "../d")]),
+      supplied_at("/x/b", "b", [a_dependency("d", 0, "../d")]),
+      supplied_at("/x/c", "c", [a_dependency("d", 1, "../d")]),
       supplied_at("/x/d", "d", []),
     ],
   };
-  let clo = closure(pkgs, []);
-  assert_eq(clo.diags, []);
+  let clo = closure(packages, []);
+  assert_eq(clo.diagnostics, []);
   assert_eq(clo.packages.map(|package: Package| package.prefix), [b"app", b"b", b"c", b"d"])
 }
 
 test "a package of one version at two places has no version to pick" {
-  let pkgs: PackageSources = {
+  let packages: PackageSources = {
     root: b"/x/app",
-    manifest: Some(a_manifest("app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")])),
+    manifest: Some(a_manifest("app", [a_dependency("b", 1, "../b"), a_dependency("c", 1, "../c")])),
     supplied: [
-      supplied_at("/x/b", "b", [a_dep("d", 1, "../d1")]),
-      supplied_at("/x/c", "c", [a_dep("d", 1, "../d2")]),
+      supplied_at("/x/b", "b", [a_dependency("d", 1, "../d1")]),
+      supplied_at("/x/c", "c", [a_dependency("d", 1, "../d2")]),
       supplied_at("/x/d1", "d", []),
       supplied_at("/x/d2", "d", []),
     ],
   };
-  let clo = closure(pkgs, []);
-  let codes = clo.diags.map(|d: { slot: Int, diag: ParseDiag }| d.diag.code);
+  let clo = closure(packages, []);
+  let codes = clo.diagnostics.map(|d: { slot: Int, diagnostic: ParseDiagnostic }|
+    d.diagnostic.code);
   assert_eq(codes, [b"E0137"]);
-  let text = String::of_bytes_lossy(clo.diags.get(0).diag.message);
+  let text = String::of_bytes_lossy(clo.diagnostics.get(0).diagnostic.message);
   assert(text.contains("`b` wants `/x/d1`"));
   assert(text.contains("`c` wants `/x/d2`"))
 }
 
 test "a dependency below the floor its importer asks for is named with both versions" {
-  let pkgs: PackageSources = {
+  let packages: PackageSources = {
     root: b"/x/app",
-    manifest: Some(a_manifest("app", [a_dep("b", 9, "../b")])),
+    manifest: Some(a_manifest("app", [a_dependency("b", 9, "../b")])),
     supplied: [supplied_at("/x/b", "b", [])],
   };
-  let clo = closure(pkgs, []);
-  let codes = clo.diags.map(|d: { slot: Int, diag: ParseDiag }| d.diag.code);
+  let clo = closure(packages, []);
+  let codes = clo.diagnostics.map(|d: { slot: Int, diagnostic: ParseDiagnostic }|
+    d.diagnostic.code);
   assert_eq(codes, [b"E0136"]);
-  let text = String::of_bytes_lossy(clo.diags.get(0).diag.message);
+  let text = String::of_bytes_lossy(clo.diagnostics.get(0).diagnostic.message);
   assert(text.contains("is version 0.1.0"));
   assert(text.contains("at least 0.9.0"))
 }
@@ -612,13 +655,16 @@ test "a dependency below the floor its importer asks for is named with both vers
 test "fields that fail validation are named" {
   let head = b"import std.pkg (Manifest)\nfn package() -> Manifest = ";
   let tail = b", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}";
-  assert_eq(check_manifest(head ++ b"{name: \"\"" ++ tail).diags.get(0).code, b"E0131");
-  assert_eq(check_manifest(head ++ b"{name: \"Not A Path\"" ++ tail).diags.get(0).code, b"E0131");
-  assert_eq(check_manifest(head ++ b"{name: 3" ++ tail).diags.get(0).code, b"E0131");
+  assert_eq(check_manifest(head ++ b"{name: \"\"" ++ tail).diagnostics.get(0).code, b"E0131");
+  assert_eq(
+    check_manifest(head ++ b"{name: \"Not A Path\"" ++ tail).diagnostics.get(0).code,
+    b"E0131",
+  );
+  assert_eq(check_manifest(head ++ b"{name: 3" ++ tail).diagnostics.get(0).code, b"E0131");
   let dup = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}, {name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 2}, source: Registry}], entry: None}";
-  assert_eq(check_manifest(dup).diags.get(0).code, b"E0131");
+  assert_eq(check_manifest(dup).diagnostics.get(0).code, b"E0131");
   let escaping = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"../up\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}], entry: None}";
-  let refused = check_manifest(escaping).diags.get(0);
+  let refused = check_manifest(escaping).diagnostics.get(0);
   assert_eq(refused.code, b"E0131");
   assert(String::of_bytes_lossy(refused.message).contains("is not a package name"))
 }
@@ -637,11 +683,11 @@ fn a_toolchain(entry: String, std: String) -> String =
     ++ "\", cli_tests: \"tests/cli\", runtime: \"ply-runtime\"})"
 
 fn workspace_codes(src: Bytes) -> List<Bytes> / {abort.raise} =
-  check_workspace(src).diags.map(|d: ParseDiag| d.code)
+  check_workspace(src).diagnostics.map(|d: ParseDiagnostic| d.code)
 
 test "a well-formed workspace checks and decodes, with or without a toolchain" {
   let got = check_workspace(a_workspace(a_toolchain("ply.main", "lib/std")));
-  assert_eq(got.diags, []);
+  assert_eq(got.diagnostics, []);
   match got.workspace {
     None -> panic("the workspace checks"),
     Some(w) -> {
@@ -657,12 +703,14 @@ test "a well-formed workspace checks and decodes, with or without a toolchain" {
       }
     },
   };
-  assert_eq(check_workspace(a_workspace("None")).diags, [])
+  assert_eq(check_workspace(a_workspace("None")).diagnostics, [])
 }
 
 test "a workspace is refused as a manifest is, in its own words" {
-  let shaped = check_workspace(b"import std.pkg (Workspace)\nfn package() -> Workspace = 1").diags;
-  assert_eq(shaped.map(|d: ParseDiag| d.code), [b"E0129"]);
+  let shaped = check_workspace(
+    b"import std.pkg (Workspace)\nfn package() -> Workspace = 1",
+  ).diagnostics;
+  assert_eq(shaped.map(|d: ParseDiagnostic| d.code), [b"E0129"]);
   assert_eq(shaped.get(0).message, b"a workspace's one definition is named `workspace`");
   assert_eq(
     workspace_codes(
@@ -677,8 +725,8 @@ test "a workspace is refused as a manifest is, in its own words" {
 }
 
 test "a workspace names each directory once, below its own, and an entry that is a definition" {
-  let twice = check_workspace(a_workspace(a_toolchain("ply.main", "lib/store"))).diags;
-  assert_eq(twice.map(|d: ParseDiag| d.code), [b"E0131"]);
+  let twice = check_workspace(a_workspace(a_toolchain("ply.main", "lib/store"))).diagnostics;
+  assert_eq(twice.map(|d: ParseDiagnostic| d.code), [b"E0131"]);
   assert(String::of_bytes_lossy(twice.get(0).message).contains("`lib/store` is named twice"));
   ["/abs/std", "../std", "lib/./std", "lib//std", ""].fold((), |u: Unit, dir: String|
     assert_eq(workspace_codes(a_workspace(a_toolchain("ply.main", dir))), [b"E0131"]));
@@ -692,7 +740,7 @@ test "a workspace names each directory once, below its own, and an entry that is
 }
 
 test "a manifest is still refused in its own words" {
-  let d = check_manifest(b"fn other() -> Int = 1").diags.get(0);
+  let d = check_manifest(b"fn other() -> Int = 1").diagnostics.get(0);
   assert_eq(d.message, b"a manifest's one definition is named `package`");
   assert_eq(d.notes_text, [
     b"a `ply.pkg` file is exactly `fn package() -> Manifest = ...`, with std.pkg's Manifest",
@@ -701,8 +749,8 @@ test "a manifest is still refused in its own words" {
 
 test "a manifest with a syntax error reports the parse, not the shape" {
   let got = check_manifest(b"fn package() -> Manifest = {name: \"a\"");
-  assert_eq(got.diags.len(), 1);
-  assert(got.diags.get(0).code != b"E0129")
+  assert_eq(got.diagnostics.len(), 1);
+  assert(got.diagnostics.get(0).code != b"E0129")
 }
 
 test "a module path scans segments, not just characters" {
@@ -721,12 +769,17 @@ pub type SuppliedPackage = { root: Bytes, manifest: Option<Bytes>, modules: List
 
 pub type PackageSources = { root: Bytes, manifest: Option<Bytes>, supplied: List<SuppliedPackage> }
 
-pub type Package = { root: Bytes, prefix: Bytes, deps: List<Bytes>, manifest: Option<Manifest> }
+pub type Package = {
+  root: Bytes,
+  prefix: Bytes,
+  dependencies: List<Bytes>,
+  manifest: Option<Manifest>,
+}
 
 pub type Closure = {
   packages: List<Package>,
   modules: List<{ pkg: Int, src: Source }>,
-  diags: List<{ slot: Int, diag: ParseDiag }>,
+  diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }>,
 }
 
 fn join_normalized(base: Bytes, rel: Bytes) -> Bytes / {abort.raise} =
@@ -753,13 +806,18 @@ pub fn roots_wanted(
       Some(src) -> match check_manifest(src).manifest {
         None -> acc,
         Some(m) ->
-          m.dependencies.fold(acc, |acc2: List<Bytes>, d: Dep|
+          m.dependencies.fold(acc, |accumulator2: List<Bytes>, d: Dependency|
             match d.source {
-              Path(p) -> add_wanted_root(known, acc2, join_normalized(s.root, Bytes::of_string(p))),
+              Path(p) ->
+                add_wanted_root(known, accumulator2, join_normalized(s.root, Bytes::of_string(p))),
               Git(url, rev) ->
-                add_wanted_root(known, acc2, git_key(Bytes::of_string(url), Bytes::of_string(rev))),
+                add_wanted_root(
+                  known,
+                  accumulator2,
+                  git_key(Bytes::of_string(url), Bytes::of_string(rev)),
+                ),
               Registry ->
-                add_wanted_root(known, acc2, registry_key(root, Bytes::of_string(d.name))),
+                add_wanted_root(known, accumulator2, registry_key(root, Bytes::of_string(d.name))),
             }),
       },
     })
@@ -769,7 +827,10 @@ fn add_wanted_root(known: List<Bytes>, acc: List<Bytes>, root: Bytes) -> List<By
   if known.contains(root) || acc.contains(root) { acc } else { acc.push(root) }
 
 test "a walk's next reads are the roots its manifests ask for that it has not read" {
-  let app = supplied_at("/x/app", "app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")]);
+  let app = supplied_at("/x/app", "app", [
+    a_dependency("b", 1, "../b"),
+    a_dependency("c", 1, "../c"),
+  ]);
   assert_eq(roots_wanted([b"/x/app"], [app]), [b"/x/b", b"/x/c"]);
   assert_eq(roots_wanted([b"/x/app", b"/x/b"], [app]), [b"/x/c"]);
   assert_eq(roots_wanted([b"/x/app"], [{ root: b"/x/app", manifest: None, modules: [] }]), [])
@@ -805,10 +866,10 @@ fn slot_of(manifests: List<Option<Bytes>>, i: Int) -> Int = {
 
 fn checked_manifests(
   texts: List<Option<Bytes>>,
-) -> { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: ParseDiag }> } / {abort.raise} =
+) -> { manifests: List<Option<Manifest>>, diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }> } / {abort.raise} =
   range(0, texts.len()).fold(
-    { manifests: [], diags: [] },
-    |acc: { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: ParseDiag }> }, i: Int|
+    { manifests: [], diagnostics: [] },
+    |acc: { manifests: List<Option<Manifest>>, diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }> }, i: Int|
       match texts.get(i) {
         None -> { ..acc, manifests: acc.manifests.push(None) },
         Some(src) -> {
@@ -816,31 +877,45 @@ fn checked_manifests(
           let slot = slot_of(texts, i);
           {
             manifests: acc.manifests.push(c.manifest),
-            diags: c.diags.fold(
-              acc.diags,
-              |ds: List<{ slot: Int, diag: ParseDiag }>, diag: ParseDiag|
-                ds.push({ slot: slot, diag: diag }),
+            diagnostics: c.diagnostics.fold(
+              acc.diagnostics,
+              |ds: List<{ slot: Int, diagnostic: ParseDiagnostic }>, diagnostic: ParseDiagnostic|
+                ds.push({ slot: slot, diagnostic: diagnostic }),
             ),
           }
         },
       },
   )
 
-fn manifest_diag(slot: Int, code: Bytes, message: Bytes) -> { slot: Int, diag: ParseDiag } =
-  { slot: slot, diag: error_at(code, dummy_span(), message, b"in this package's manifest", []) }
+fn manifest_diagnostic(
+  slot: Int,
+  code: Bytes,
+  message: Bytes,
+) -> { slot: Int, diagnostic: ParseDiagnostic } =
+  {
+    slot: slot,
+    diagnostic: error_at(code, dummy_span(), message, b"in this package's manifest", []),
+  }
 
 pub fn anonymous_package() -> PackageSources = { root: b"", manifest: None, supplied: [] }
 
-pub fn closure(pkgs: PackageSources, root_modules: List<Bytes>) -> Closure / {abort.raise} =
-  closure_of_judged(judged(pkgs, root_modules), pkgs.supplied)
+pub fn closure(packages: PackageSources, root_modules: List<Bytes>) -> Closure / {abort.raise} =
+  closure_of_judged(judged(packages, root_modules), packages.supplied)
 
-pub type JudgedPackages = { packages: List<Package>, diags: List<{ slot: Int, diag: ParseDiag }> }
+pub type JudgedPackages = {
+  packages: List<Package>,
+  diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }>,
+}
 
 pub fn closure_of_judged(
   j: JudgedPackages,
   supplied: List<SuppliedPackage>,
 ) -> Closure / {abort.raise} =
-  { packages: j.packages, modules: name_modules(j.packages, supplied, 1, []), diags: j.diags }
+  {
+    packages: j.packages,
+    modules: name_modules(j.packages, supplied, 1, []),
+    diagnostics: j.diagnostics,
+  }
 
 pub fn without_locations(j: JudgedPackages) -> JudgedPackages / {abort.raise} =
   {
@@ -855,7 +930,7 @@ pub fn without_locations(j: JudgedPackages) -> JudgedPackages / {abort.raise} =
           Some(m) ->
             Some({
               ..m,
-              dependencies: m.dependencies.map(|d: Dep|
+              dependencies: m.dependencies.map(|d: Dependency|
                 match d.source { Path(_) -> { ..d, source: Path("") }, _ -> d }),
             }),
         },
@@ -865,13 +940,16 @@ pub fn without_locations(j: JudgedPackages) -> JudgedPackages / {abort.raise} =
 
 pub fn location_placeholder(i: Int) -> Bytes = Bytes::of_string("package " ++ i.to_string())
 
-pub fn judged(pkgs: PackageSources, root_modules: List<Bytes>) -> JudgedPackages / {abort.raise} = {
-  let texts: List<Option<Bytes>> = pkgs.supplied.fold(
-    [pkgs.manifest],
+pub fn judged(
+  packages: PackageSources,
+  root_modules: List<Bytes>,
+) -> JudgedPackages / {abort.raise} = {
+  let texts: List<Option<Bytes>> = packages.supplied.fold(
+    [packages.manifest],
     |acc: List<Option<Bytes>>, supplied: SuppliedPackage| acc.push(supplied.manifest),
   );
-  let roots: List<Bytes> = pkgs.supplied.fold(
-    [pkgs.root],
+  let roots: List<Bytes> = packages.supplied.fold(
+    [packages.root],
     |acc: List<Bytes>, supplied: SuppliedPackage| acc.push(supplied.root),
   );
   let checked = checked_manifests(texts);
@@ -880,11 +958,11 @@ pub fn judged(pkgs: PackageSources, root_modules: List<Bytes>) -> JudgedPackages
     {
       root: roots.get(i),
       prefix: match m { None -> b"", Some(x) -> Bytes::of_string(prefix_of(x)) },
-      deps: [],
+      dependencies: [],
       manifest: m,
     }
   });
-  judge(texts, roots, checked.manifests, packages, root_modules, checked.diags)
+  judge(texts, roots, checked.manifests, packages, root_modules, checked.diagnostics)
 }
 
 derive bin for SuppliedPackage
@@ -971,7 +1049,7 @@ fn embed_part(embed: ModuleEmbed) -> Bytes / {abort.raise} =
 
 type Pending = {
   packages: List<Package>,
-  diags: List<{ slot: Int, diag: ParseDiag }>,
+  diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }>,
   edges: List<{ from: Int, target: Int }>,
 }
 
@@ -986,26 +1064,26 @@ fn judge(
   manifests: List<Option<Manifest>>,
   packages: List<Package>,
   root_modules: List<Bytes>,
-  diags: List<{ slot: Int, diag: ParseDiag }>,
+  diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }>,
 ) -> JudgedPackages / {abort.raise} = {
   let built = range(0, packages.len()).fold(
-    { packages: packages, diags: diags, edges: [] },
+    { packages: packages, diagnostics: diagnostics, edges: [] },
     |acc: Pending, i: Int|
       match manifests.get(i) {
         None -> acc,
         Some(m) ->
-          m.dependencies.fold(acc, |a: Pending, d: Dep|
+          m.dependencies.fold(acc, |a: Pending, d: Dependency|
             judge_dependency(texts, roots, manifests, i, a, d)),
       },
   );
-  let versioned = version_judgments(texts, roots, built.packages, built.edges, built.diags);
+  let versioned = version_judgments(texts, roots, built.packages, built.edges, built.diagnostics);
   let collided = prefix_judgments(texts, roots, built.packages, root_modules, versioned);
   let cycled = match graph::cycle(graph::of_edges(roots.len(), built.edges)) {
     None -> collided,
     Some(c) ->
       collided.push({
         slot: slot_of(texts, c.get(0)),
-        diag: error_at(
+        diagnostic: error_at(
           b"E0134",
           dummy_span(),
           Bytes::concat_all([b"packages depend on one another in a cycle: ", cycle_text(roots, c)]),
@@ -1014,7 +1092,7 @@ fn judge(
         ),
       }),
   };
-  { packages: built.packages, diags: cycled }
+  { packages: built.packages, diagnostics: cycled }
 }
 
 fn version_text(v: Version) -> Bytes =
@@ -1025,50 +1103,53 @@ fn version_judgments(
   roots: List<Bytes>,
   packages: List<Package>,
   edges: List<{ from: Int, target: Int }>,
-  diags: List<{ slot: Int, diag: ParseDiag }>,
-) -> List<{ slot: Int, diag: ParseDiag }> / {abort.raise} = {
+  diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }>,
+) -> List<{ slot: Int, diagnostic: ParseDiagnostic }> / {abort.raise} = {
   let named = |p: Package| match p.manifest { None -> "", Some(m) -> m.name };
-  range(0, packages.len()).fold(diags, |acc: List<{ slot: Int, diag: ParseDiag }>, i: Int| {
-    let p = packages.get(i);
-    if p.manifest == None { acc } else {
-      let earlier = range(0, i).fold(None, |found: Option<Int>, j: Int|
-        match found {
-          Some(_) -> found,
-          None -> if named(packages.get(j)) == named(p) && packages.get(j).manifest != None {
-            Some(j)
-          } else { None },
-        });
-      match earlier {
-        None -> acc,
-        Some(j) ->
-          acc.push({
-            slot: slot_of(texts, requester_of(edges, i)),
-            diag: error_at(
-              b"E0137",
-              dummy_span(),
-              Bytes::concat_all([
-                b"`",
-                Bytes::of_string(named(p)),
-                b"` is reached at two places: `",
-                Bytes::of_string(package_name(packages.get(requester_of(edges, j)))),
-                b"` wants `",
-                roots.get(j),
-                b"`, and `",
-                Bytes::of_string(package_name(packages.get(requester_of(edges, i)))),
-                b"` wants `",
-                roots.get(i),
-                b"`",
-              ]),
-              b"in this package's manifest",
-              [
-                b"a closure pins one version of a package, and only one of these can be it",
-                b"depend on one of them, or make them the same package",
-              ],
-            ),
-          }),
+  range(0, packages.len()).fold(
+    diagnostics,
+    |acc: List<{ slot: Int, diagnostic: ParseDiagnostic }>, i: Int| {
+      let p = packages.get(i);
+      if p.manifest == None { acc } else {
+        let earlier = range(0, i).fold(None, |found: Option<Int>, j: Int|
+          match found {
+            Some(_) -> found,
+            None -> if named(packages.get(j)) == named(p) && packages.get(j).manifest != None {
+              Some(j)
+            } else { None },
+          });
+        match earlier {
+          None -> acc,
+          Some(j) ->
+            acc.push({
+              slot: slot_of(texts, requester_of(edges, i)),
+              diagnostic: error_at(
+                b"E0137",
+                dummy_span(),
+                Bytes::concat_all([
+                  b"`",
+                  Bytes::of_string(named(p)),
+                  b"` is reached at two places: `",
+                  Bytes::of_string(package_name(packages.get(requester_of(edges, j)))),
+                  b"` wants `",
+                  roots.get(j),
+                  b"`, and `",
+                  Bytes::of_string(package_name(packages.get(requester_of(edges, i)))),
+                  b"` wants `",
+                  roots.get(i),
+                  b"`",
+                ]),
+                b"in this package's manifest",
+                [
+                  b"a closure pins one version of a package, and only one of these can be it",
+                  b"depend on one of them, or make them the same package",
+                ],
+              ),
+            }),
+        }
       }
-    }
-  })
+    },
+  )
 }
 
 fn requester_of(edges: List<{ from: Int, target: Int }>, target: Int) -> Int =
@@ -1089,7 +1170,7 @@ fn judge_dependency(
   manifests: List<Option<Manifest>>,
   i: Int,
   acc: Pending,
-  d: Dep,
+  d: Dependency,
 ) -> Pending / {abort.raise} = {
   let name = Bytes::of_string(d.name);
   match d.source {
@@ -1139,7 +1220,7 @@ fn judge_dependency(
 fn resolve_note() -> Bytes =
   b"`ply resolve` fetches the version this closure selects into the project's `.ply-cache/registry`"
 
-fn is_registry(d: Dep) -> Bool = match d.source { Registry -> true, _ -> false }
+fn is_registry(d: Dependency) -> Bool = match d.source { Registry -> true, _ -> false }
 
 fn judge_reached_dependency(
   texts: List<Option<Bytes>>,
@@ -1147,7 +1228,7 @@ fn judge_reached_dependency(
   manifests: List<Option<Manifest>>,
   i: Int,
   acc: Pending,
-  d: Dep,
+  d: Dependency,
   key: Bytes,
   absent: Bytes,
   notes: List<Bytes>,
@@ -1155,10 +1236,10 @@ fn judge_reached_dependency(
   let slot = slot_of(texts, i);
   let name = Bytes::of_string(d.name);
   match root_index(roots, key, 0) {
-    None -> push_diag_notes(acc, slot, b"E0135", absent, notes),
+    None -> push_diagnostic_notes(acc, slot, b"E0135", absent, notes),
     Some(j) -> match texts.get(j) {
-      None -> if is_registry(d) { push_diag_notes(acc, slot, b"E0135", absent, notes) } else {
-        push_diag_text(
+      None -> if is_registry(d) { push_diagnostic_notes(acc, slot, b"E0135", absent, notes) } else {
+        push_diagnostic_text(
           acc,
           slot,
           b"E0135",
@@ -1177,7 +1258,7 @@ fn judge_reached_dependency(
           let granted = Bytes::of_string(prefix_of(tm));
           let aliased = match d.prefix { None -> granted, Some(a) -> Bytes::of_string(a) };
           if is_registry(d) && tm.name != d.name {
-            push_diag_notes(
+            push_diagnostic_notes(
               acc,
               slot,
               b"E0135",
@@ -1193,7 +1274,7 @@ fn judge_reached_dependency(
               notes,
             )
           } else if compare(tm.version, d.min) == Less {
-            push_diag_notes(
+            push_diagnostic_notes(
               acc,
               slot,
               b"E0136",
@@ -1210,7 +1291,7 @@ fn judge_reached_dependency(
               notes,
             )
           } else if aliased != granted {
-            push_diag_text(
+            push_diagnostic_text(
               acc,
               slot,
               b"E0133",
@@ -1228,9 +1309,9 @@ fn judge_reached_dependency(
             {
               packages: acc.packages.set(i, {
                 ..acc.packages.get(i),
-                deps: acc.packages.get(i).deps.push(granted),
+                dependencies: acc.packages.get(i).dependencies.push(granted),
               }),
-              diags: acc.diags,
+              diagnostics: acc.diagnostics,
               edges: acc.edges.push({ from: i, target: j }),
             }
           }
@@ -1240,7 +1321,7 @@ fn judge_reached_dependency(
   }
 }
 
-fn push_diag_notes(
+fn push_diagnostic_notes(
   acc: Pending,
   slot: Int,
   code: Bytes,
@@ -1249,31 +1330,31 @@ fn push_diag_notes(
 ) -> Pending =
   {
     ..acc,
-    diags: acc.diags.push({
+    diagnostics: acc.diagnostics.push({
       slot: slot,
-      diag: error_at(code, dummy_span(), message, b"in this package's manifest", notes),
+      diagnostic: error_at(code, dummy_span(), message, b"in this package's manifest", notes),
     }),
   }
 
-fn push_diag_text(acc: Pending, slot: Int, code: Bytes, message: Bytes) -> Pending =
-  { ..acc, diags: acc.diags.push(manifest_diag(slot, code, message)) }
+fn push_diagnostic_text(acc: Pending, slot: Int, code: Bytes, message: Bytes) -> Pending =
+  { ..acc, diagnostics: acc.diagnostics.push(manifest_diagnostic(slot, code, message)) }
 
 fn prefix_judgments(
   texts: List<Option<Bytes>>,
   roots: List<Bytes>,
   packages: List<Package>,
   root_modules: List<Bytes>,
-  diags: List<{ slot: Int, diag: ParseDiag }>,
-) -> List<{ slot: Int, diag: ParseDiag }> / {abort.raise} = {
+  diagnostics: List<{ slot: Int, diagnostic: ParseDiagnostic }>,
+) -> List<{ slot: Int, diagnostic: ParseDiagnostic }> / {abort.raise} = {
   let reserved = range(0, packages.len()).fold(
-    diags,
-    |acc: List<{ slot: Int, diag: ParseDiag }>, i: Int| {
+    diagnostics,
+    |acc: List<{ slot: Int, diagnostic: ParseDiagnostic }>, i: Int| {
       let p = packages.get(i);
       if p.manifest == None || p.prefix.len() == 0 { acc } else {
         let with_reserved = if p.prefix == b"std" || p.prefix == b"compiler" {
           acc.push({
             slot: slot_of(texts, i),
-            diag: error_at(
+            diagnostic: error_at(
               b"E0133",
               dummy_span(),
               Bytes::concat_all([
@@ -1290,13 +1371,13 @@ fn prefix_judgments(
         } else { acc };
         range(i + 1, packages.len()).fold(
           with_reserved,
-          |acc2: List<{ slot: Int, diag: ParseDiag }>, j: Int| {
+          |accumulator2: List<{ slot: Int, diagnostic: ParseDiagnostic }>, j: Int| {
             let q = packages.get(j);
-            if q.manifest == None || p.prefix != q.prefix { acc2 }
-            else if package_name(p) == package_name(q) { acc2 } else {
-              acc2.push({
+            if q.manifest == None || p.prefix != q.prefix { accumulator2 }
+            else if package_name(p) == package_name(q) { accumulator2 } else {
+              accumulator2.push({
                 slot: slot_of(texts, j),
-                diag: error_at(
+                diagnostic: error_at(
                   b"E0133",
                   dummy_span(),
                   Bytes::concat_all([
@@ -1318,14 +1399,14 @@ fn prefix_judgments(
       }
     },
   );
-  root_modules.fold(reserved, |acc: List<{ slot: Int, diag: ParseDiag }>, m: Bytes| {
+  root_modules.fold(reserved, |acc: List<{ slot: Int, diagnostic: ParseDiagnostic }>, m: Bytes| {
     let seg = first_segment(m);
     match find_prefix(packages, seg, 1) {
       None -> acc,
       Some(j) ->
         acc.push({
           slot: slot_of(texts, j),
-          diag: error_at(
+          diagnostic: error_at(
             b"E0133",
             dummy_span(),
             Bytes::concat_all([

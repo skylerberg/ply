@@ -6,7 +6,8 @@ import compiler.check.types (Type, NamedType, VariableType, named_type, int_type
 import compiler.check.known (width_type)
 import compiler.emit.c (Width, width_named)
 import compiler.emit.keys (Named)
-import compiler.emit.representations (Ctors, layout_of, known_layout, has_vars, no_ctors)
+import compiler.emit.representations (Constructors, layout_of, known_layout, has_variables,
+                                      no_constructors)
 import compiler.emit.layout (SumCases, SumLayout, WordIs, LowBits, Nullary, Inline, Boxed, words,
                              container_layouts, head_words, map_head, InlineRecord, RecordFields,
                              FieldLayout, frame_count)
@@ -19,8 +20,8 @@ import compiler.emit.typed_ir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, 
                                Lambda, Closure, no_links, operand_representation, is_boxed,
                                no_closure_evidence)
 import compiler.emit.lower.representation (c_values_of, word_count, record_parts)
-import compiler.emit.typed_ir.statics (StaticDef, StaticLayout, StaticBlock, StaticFile, RawWord,
-                                       named_by_content, text_block)
+import compiler.emit.typed_ir.statics (StaticDefinition, StaticLayout, StaticBlock, StaticFile,
+                                       RawWord, named_by_content, text_block)
 import compiler.emit.typed_ir.statics (StaticWords, BytesWord, AddressWord, StaticWord)
 
 pub type Datum = | StringDatum(Bytes) | BytesDatum(Bytes) | EmbeddedDatum(Bytes)
@@ -32,9 +33,10 @@ pub fn datum_layout(s: Datum) -> StaticLayout =
     EmbeddedDatum(digest) -> StaticFile(digest),
   }
 
-pub fn statics_of(s: Datum) -> List<StaticDef> / {abort.raise} = [named_by_content(datum_layout(s))]
+pub fn statics_of(s: Datum) -> List<StaticDefinition> / {abort.raise} =
+  [named_by_content(datum_layout(s))]
 
-pub fn empty_map_static() -> StaticDef / {abort.raise} =
+pub fn empty_map_static() -> StaticDefinition / {abort.raise} =
   named_by_content(
     StaticBlock({
       head: Some({
@@ -46,36 +48,36 @@ pub fn empty_map_static() -> StaticDef / {abort.raise} =
     }),
   )
 
-pub fn folded(ctors: Ctors, f: Fn) -> Fn / {abort.raise} = {
+pub fn folded(constructors: Constructors, f: Fn) -> Fn / {abort.raise} = {
   let b = folded_block(f.body, {
-    defs: f.statics,
+    definitions: f.statics,
     seen: names_of(f.statics),
     known: Map::new(),
-    ctors: ctors,
+    constructors: constructors,
   });
   {
     ..f,
     body: b.block,
     lambdas: f.lambdas.map(|l: Lambda|
-      match l { Closure(c) -> Closure({ ..c, body: folded(ctors, c.body) }) }),
-    statics: b.held.defs,
+      match l { Closure(c) -> Closure({ ..c, body: folded(constructors, c.body) }) }),
+    statics: b.held.definitions,
   }
 }
 
 type FoldState = {
-  defs: List<StaticDef>,
+  definitions: List<StaticDefinition>,
   seen: Map<Bytes, Bool>,
   known: Map<Int, List<StaticWord>>,
-  ctors: Ctors,
+  constructors: Constructors,
 }
 
-fn names_of(defs: List<StaticDef>) -> Map<Bytes, Bool> =
-  defs.fold(Map::new(), |m: Map<Bytes, Bool>, d: StaticDef| m.insert(d.name, true))
+fn names_of(definitions: List<StaticDefinition>) -> Map<Bytes, Bool> =
+  definitions.fold(Map::new(), |m: Map<Bytes, Bool>, d: StaticDefinition| m.insert(d.name, true))
 
-fn with_statics(h: FoldState, defs: List<StaticDef>) -> FoldState =
-  defs.fold(h, |acc: FoldState, d: StaticDef|
+fn with_statics(h: FoldState, definitions: List<StaticDefinition>) -> FoldState =
+  definitions.fold(h, |acc: FoldState, d: StaticDefinition|
     if acc.seen.contains(d.name) { acc }
-    else { { ..acc, defs: acc.defs.push(d), seen: acc.seen.insert(d.name, true) } })
+    else { { ..acc, definitions: acc.definitions.push(d), seen: acc.seen.insert(d.name, true) } })
 
 fn with_known(h: FoldState, v: Var, words: List<StaticWord>) -> FoldState =
   { ..h, known: h.known.insert(v.id, words) }
@@ -84,12 +86,12 @@ fn folded_block(b: Block, held: FoldState) -> { block: Block, held: FoldState } 
   b.fold({ block: [], held: held }, |acc: { block: Block, held: FoldState }, i: Inst| {
     let x = match i {
       Let(l) -> {
-        let v = folded_val(Some(l.var), l.val, acc.held);
-        { inst: Let({ ..l, val: v.val }), held: v.held }
+        let v = folded_value(Some(l.var), l.value, acc.held);
+        { inst: Let({ ..l, value: v.value }), held: v.held }
       },
       Do(d) -> {
-        let v = folded_val(None, d.val, acc.held);
-        { inst: Do({ ..d, val: v.val }), held: v.held }
+        let v = folded_value(None, d.value, acc.held);
+        { inst: Do({ ..d, value: v.value }), held: v.held }
       },
       If(x) -> {
         let t = folded_block(x.then, acc.held);
@@ -131,22 +133,25 @@ fn folded_block(b: Block, held: FoldState) -> { block: Block, held: FoldState } 
     { block: acc.block.push(x.inst), held: x.held }
   })
 
-fn folded_val(
+fn folded_value(
   into: Option<Var>,
   v: Rvalue,
   held: FoldState,
-) -> { val: Rvalue, held: FoldState } / {abort.raise} = {
+) -> { value: Rvalue, held: FoldState } / {abort.raise} = {
   let laid = match v {
-    Literal(l) -> match static_of_lit(l) {
+    Literal(l) -> match static_of_literal(l) {
       Some(s) -> {
-        let defs = statics_of(s);
-        { val: Static(defs.get(defs.len() - 1).name), held: with_statics(held, defs) }
+        let definitions = statics_of(s);
+        {
+          value: Static(definitions.get(definitions.len() - 1).name),
+          held: with_statics(held, definitions),
+        }
       },
       None -> match l {
         LiteralDecimal(text) -> {
           let w = decimal_words(text);
           {
-            val: Primitive({
+            value: Primitive({
               op: b"decimal",
               on: AsInt,
               args: [IntOperand(w.lo), IntOperand(w.hi)],
@@ -156,13 +161,13 @@ fn folded_val(
         },
         LiteralWide(_, high, low) ->
           {
-            val: Primitive({ op: b"wide", on: AsInt, args: [IntOperand(low), IntOperand(high)] }),
+            value: Primitive({ op: b"wide", on: AsInt, args: [IntOperand(low), IntOperand(high)] }),
             held: held,
           },
         LiteralFixed(name, bits) -> match width_named(name) {
-          Some(w) -> if w.bits < 128 { { val: v, held: held } } else {
+          Some(w) -> if w.bits < 128 { { value: v, held: held } } else {
             {
-              val: Primitive({
+              value: Primitive({
                 op: b"wide",
                 on: AsInt,
                 args: [IntOperand(bits), IntOperand(if bits < 0 { 0 - 1 } else { 0 })],
@@ -170,15 +175,15 @@ fn folded_val(
               held: held,
             }
           },
-          None -> { val: v, held: held },
+          None -> { value: v, held: held },
         },
-        _ -> { val: v, held: held },
+        _ -> { value: v, held: held },
       },
     },
-    _ -> { val: v, held: held },
+    _ -> { value: v, held: held },
   };
   match into {
-    Some(y) -> if has_vars(y.ty) { laid } else { known_bound(y, laid.val, laid.held) },
+    Some(y) -> if has_variables(y.ty) { laid } else { known_bound(y, laid.value, laid.held) },
     None -> laid,
   }
 }
@@ -187,13 +192,13 @@ fn known_bound(
   y: Var,
   v: Rvalue,
   held: FoldState,
-) -> { val: Rvalue, held: FoldState } / {abort.raise} = {
-  let same = { val: v, held: held };
+) -> { value: Rvalue, held: FoldState } / {abort.raise} = {
+  let same = { value: v, held: held };
   match v {
-    Static(name) -> { val: v, held: with_known(held, y, [AddressWord({ name: name, tag: 0 })]) },
+    Static(name) -> { value: v, held: with_known(held, y, [AddressWord({ name: name, tag: 0 })]) },
     Primitive(p) -> match p.args {
       [IntOperand(lo), IntOperand(hi)] -> if p.op == b"decimal" || p.op == b"wide" {
-        { val: v, held: with_known(held, y, [RawWord(lo), RawWord(hi)]) }
+        { value: v, held: with_known(held, y, [RawWord(lo), RawWord(hi)]) }
       } else { same },
       _ -> same,
     },
@@ -202,10 +207,10 @@ fn known_bound(
       Some(parts) -> match y.representation {
         AsSum(s) -> match g.parts.at(0) {
           Some(IntOperand(i)) ->
-            { val: v, held: with_known(held, y, sum_words(s.layout, i, parts.drop(1))) },
+            { value: v, held: with_known(held, y, sum_words(s.layout, i, parts.drop(1))) },
           _ -> same,
         },
-        _ -> { val: v, held: with_known(held, y, joined_words(parts)) },
+        _ -> { value: v, held: with_known(held, y, joined_words(parts)) },
       },
     },
     Allocate(m) -> match m.made {
@@ -239,7 +244,7 @@ fn known_bound(
     } else {
       match p.arg {
         IntOperand(n) -> if n >= 0 - (1 << 62) && n < 1 << 62 {
-          { val: v, held: with_known(held, y, [RawWord(n * 2 + 1)]) }
+          { value: v, held: with_known(held, y, [RawWord(n * 2 + 1)]) }
         } else { same },
         _ -> same,
       }
@@ -253,17 +258,17 @@ fn boxed_static(
   ws: List<StaticWord>,
   n: Int,
   held: FoldState,
-) -> { val: Rvalue, held: FoldState } / {abort.raise} =
+) -> { value: Rvalue, held: FoldState } / {abort.raise} =
   if ws.len() != n { panic("a box whose known words are not as many as it holds") } else {
     let d = named_by_content(StaticBlock({ head: None, words: ws }));
     {
-      val: Static(d.name),
+      value: Static(d.name),
       held: with_known(with_statics(held, [d]), y, [AddressWord({ name: d.name, tag: 0 })]),
     }
   }
 
 fn record_placed(held: FoldState, ty: Type, ws: List<StaticWord>) -> Option<List<StaticWord>> =
-  match known_layout(held.ctors, ty) {
+  match known_layout(held.constructors, ty) {
     Some(RecordFields(fs)) -> if !fs.any(|f: FieldLayout|
         match f.layout { InlineRecord(_) -> true, _ -> false }) { Some(ws) } else {
       fs.fold(
@@ -295,9 +300,9 @@ fn shaped_words(
   parts: List<List<StaticWord>>,
   from: Int,
 ) -> Option<{ words: List<StaticWord>, next: Int }> / {abort.raise} =
-  match known_layout(held.ctors, ty) {
+  match known_layout(held.constructors, ty) {
     Some(RecordFields(fs)) -> {
-      let fields = record_parts(held.ctors, ty);
+      let fields = record_parts(held.constructors, ty);
       range(0, fields.len()).fold(
         Some({ words: [], next: from }),
         |acc: Option<{ words: List<StaticWord>, next: Int }>, k: Int|
@@ -339,7 +344,7 @@ fn shaped_words(
 fn inline_record_words(held: FoldState, ws: List<StaticWord>) -> Option<List<StaticWord>> =
   match ws {
     [AddressWord(x)] -> if x.tag != 0 { None } else {
-      match held.defs.filter(|d: StaticDef| d.name == x.name).at(0) {
+      match held.definitions.filter(|d: StaticDefinition| d.name == x.name).at(0) {
         Some(d) -> match d.layout {
           StaticBlock(b) -> if b.head == None { Some([RawWord(frame_count())].concat(b.words)) }
           else { None },
@@ -422,7 +427,7 @@ fn with_tag(w: StaticWord, bits: Int) -> StaticWord / {abort.raise} =
     }
   }
 
-fn static_of_lit(l: SourceLiteral) -> Option<Datum> =
+fn static_of_literal(l: SourceLiteral) -> Option<Datum> =
   match l {
     LiteralString(s) -> Some(StringDatum(s)),
     LiteralBytes(b) -> Some(BytesDatum(b)),
@@ -464,7 +469,7 @@ fn signed(w: U128) -> Int / {abort.raise} =
 
 fn local(id: Int, ty: Type, rep: Representation) -> Var = { id: id, ty: ty, representation: rep }
 
-fn bind(v: Var, val: Rvalue) -> Inst = Let({ var: v, val: val, at: dummy_span(), unwind: [] })
+fn bind(v: Var, value: Rvalue) -> Inst = Let({ var: v, value: value, at: dummy_span(), unwind: [] })
 
 fn root(body: Block, lambdas: List<Lambda>) -> Fn =
   {
@@ -484,7 +489,7 @@ fn root(body: Block, lambdas: List<Lambda>) -> Fn =
 fn bound_values(b: Block) -> List<Rvalue> =
   b.fold([], |acc: List<Rvalue>, i: Inst|
     match i {
-      Let(l) -> acc.push(l.val),
+      Let(l) -> acc.push(l.value),
       If(x) -> acc.concat(bound_values(x.then)).concat(bound_values(x.otherwise)),
       _ -> acc,
     })
@@ -495,7 +500,7 @@ test "each constant a body binds is the static its content names, listed once, a
   let s = |id: Int| local(id, string_type(), AsWord);
   let inner = root([bind(s(0), Literal(LiteralString(b"b"))), Return(VarOperand(s(0)))], []);
   let f = folded(
-    no_ctors(),
+    no_constructors(),
     root(
       [
         bind(s(1), Literal(LiteralString(b"a"))),
@@ -518,26 +523,26 @@ test "each constant a body binds is the static its content names, listed once, a
     Static(a),
     Static(name_of(EmbeddedDatum(b"digest"))),
   ]);
-  assert_eq(f.statics.map(|d: StaticDef| d.name), [a, name_of(EmbeddedDatum(b"digest"))]);
+  assert_eq(f.statics.map(|d: StaticDefinition| d.name), [a, name_of(EmbeddedDatum(b"digest"))]);
   assert_eq(f.statics.get(1).layout, StaticFile(b"digest"));
   match f.lambdas.get(0) {
     Closure(c) -> {
       assert_eq(bound_values(c.body.body), [Static(name_of(StringDatum(b"b")))]);
-      assert_eq(c.body.statics.map(|d: StaticDef| d.name), [name_of(StringDatum(b"b"))])
+      assert_eq(c.body.statics.map(|d: StaticDefinition| d.name), [name_of(StringDatum(b"b"))])
     },
   };
-  assert_eq(folded(no_ctors(), f), f)
+  assert_eq(folded(no_constructors(), f), f)
 }
 
 test "the statics a lowering attached stay first, and a literal's join them after, each once" {
   let child = named_by_content(StaticWords([BytesWord(b"m.T")]));
   let parent = named_by_content(StaticWords([AddressWord({ name: child.name, tag: 0 })]));
   let a = statics_of(StringDatum(b"a")).get(0);
-  let f = folded(no_ctors(), {
+  let f = folded(no_constructors(), {
     ..root([bind(local(0, string_type(), AsWord), Literal(LiteralString(b"a"))), bind(local(1, string_type(), AsWord), Literal(LiteralString(b"b")))], []),
     statics: [child, parent, a],
   });
-  assert_eq(f.statics.map(|d: StaticDef| d.name), [
+  assert_eq(f.statics.map(|d: StaticDefinition| d.name), [
     child.name,
     parent.name,
     a.name,
@@ -555,7 +560,7 @@ test "a decimal literal is its two words, its scale as written and a zero never 
     hi: 0 - 1,
   });
   let d = folded(
-    no_ctors(),
+    no_constructors(),
     root([bind(local(0, decimal_type(), AsDecimal), Literal(LiteralDecimal(b"1_000.5m")))], []),
   );
   assert_eq(bound_values(d.body), [
@@ -571,7 +576,7 @@ test "a decimal literal is its two words, its scale as written and a zero never 
 test "a 128-bit width is its two words in its registers, its low word first, and a box of them as a word" {
   let wide = { bits: 128, signed: true };
   let f = folded(
-    no_ctors(),
+    no_constructors(),
     root(
       [bind(local(0, width_type(wide), AsWideFixed(wide)), Literal(LiteralFixed(b"I128", 0 - 5)))],
       [],
@@ -582,7 +587,7 @@ test "a 128-bit width is its two words in its registers, its low word first, and
   ]);
   assert_eq(f.statics, []);
   let big = folded(
-    no_ctors(),
+    no_constructors(),
     root(
       [
         bind(
@@ -600,7 +605,10 @@ test "a 128-bit width is its two words in its registers, its low word first, and
   assert_eq(bound_values(big.body), [
     Primitive({ op: b"wide", on: AsInt, args: [IntOperand(7), IntOperand(1)] }),
   ]);
-  let u = folded(no_ctors(), root([bind(local(0, unit_type(), AsWord), Literal(LiteralUnit))], []));
+  let u = folded(
+    no_constructors(),
+    root([bind(local(0, unit_type(), AsWord), Literal(LiteralUnit))], []),
+  );
   assert_eq(bound_values(u.body), [Literal(LiteralUnit)])
 }
 
@@ -611,7 +619,7 @@ test "a box made of what the build knows whole is a static box, its case's place
   let word = local(3, int_type(), AsWord);
   let made = |m: Allocation, args: List<Arg>| Allocate({ made: m, args: args, reuse: None });
   let f = folded(
-    no_ctors(),
+    no_constructors(),
     root(
       [
         bind(text, Literal(LiteralString(b"a"))),
@@ -654,9 +662,9 @@ test "a box made of what the build knows whole is a static box, its case's place
     Static(second.name),
     Convert({ arg: IntOperand(9), to: AsWord }),
   ]);
-  assert_eq(f.statics.map(|d: StaticDef| d.name), [a, first.name, second.name]);
+  assert_eq(f.statics.map(|d: StaticDefinition| d.name), [a, first.name, second.name]);
   assert_eq(f.statics.get(2), second);
-  assert_eq(folded(no_ctors(), f), f)
+  assert_eq(folded(no_constructors(), f), f)
 }
 
 test "a box of what the build does not know, or at a type a variable leaves open, is made as it is" {
@@ -671,7 +679,7 @@ test "a box of what the build does not know, or at a type a variable leaves open
     ),
     bind(open, made(CaseAllocation({ case: 1, skip: 0, words: 1 }), [IntOperand(5)])),
   ];
-  let f = folded(no_ctors(), { ..root(body, []), params: [param] });
+  let f = folded(no_constructors(), { ..root(body, []), params: [param] });
   assert_eq(f.body, body);
   assert_eq(f.statics, [])
 }

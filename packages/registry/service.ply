@@ -39,7 +39,7 @@ import std.router (Found, Literal, MethodNotAllowed, NotFound, Param, Route, par
 import std.list
 import store (Absent, Busy, Exists, Pending, StoreError, Unreadable, WriteFailed, archive_path,
               save_attestation, attestation_path, digest_path, read_index, index_path,
-              interface_path, save_interface, mark_pending, pending, save_release, host_handler,
+              interface_path, save_interface, mark_pending, pending, save_release, served_file,
               unmark_pending, yank)
 import fake
 import upload (authorize, is_semantics, validate_archive, validate_attestation, validate_interface)
@@ -96,9 +96,9 @@ fn routes() -> List<Route<Endpoint>> =
 /// One request, answered from the store and the run's configuration and from nothing else. A
 /// write's body is read whole, and refused past the bound `limits` sets.
 pub fn handle_request<| e>(
-  req: Request,
+  request: Request,
 ) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], http::Reading} =
-  match router::route(routes(), req.method, req.path) {
+  match router::route(routes(), request.method, request.path) {
     NotFound -> text_response(404, "no such resource\n"),
     MethodNotAllowed(ms) -> method_not_allowed(ms),
     Found(hit) -> {
@@ -114,12 +114,12 @@ pub fn handle_request<| e>(
         text_response(404, "`" ++ semantics ++ "` is not a semantics version\n")
       } else {
         match hit.endpoint {
-          GetIndex -> file_response(host_handler(index_path(name)), "application/json"),
+          GetIndex -> file_response(served_file(index_path(name)), "application/json"),
           GetArchive -> match version {
             None -> not_a_version(),
             Some(v) ->
               file_response(
-                host_handler(archive_path(name, render_version(v))),
+                served_file(archive_path(name, render_version(v))),
                 "application/octet-stream",
               ),
           },
@@ -127,7 +127,7 @@ pub fn handle_request<| e>(
             None -> not_a_version(),
             Some(v) ->
               file_response(
-                host_handler(digest_path(name, render_version(v))),
+                served_file(digest_path(name, render_version(v))),
                 "text/plain; charset=utf-8",
               ),
           },
@@ -135,7 +135,7 @@ pub fn handle_request<| e>(
             None -> not_a_version(),
             Some(v) ->
               file_response(
-                host_handler(interface_path(name, render_version(v), semantics)),
+                served_file(interface_path(name, render_version(v), semantics)),
                 "application/octet-stream",
               ),
           },
@@ -143,20 +143,26 @@ pub fn handle_request<| e>(
             None -> not_a_version(),
             Some(v) ->
               file_response(
-                host_handler(attestation_path(name, render_version(v), semantics)),
+                served_file(attestation_path(name, render_version(v), semantics)),
                 "application/octet-stream",
               ),
           },
           PutAttestation -> match version {
             None -> not_a_version(),
-            Some(v) -> put_attestation(req, name, v, semantics),
+            Some(v) -> put_attestation(request, name, v, semantics),
           },
-          Publish -> match version { None -> not_a_version(), Some(v) -> publish(req, name, v) },
+          Publish -> match version {
+            None -> not_a_version(),
+            Some(v) -> publish(request, name, v),
+          },
           PutInterface -> match version {
             None -> not_a_version(),
-            Some(v) -> put_interface(req, name, v, semantics),
+            Some(v) -> put_interface(request, name, v, semantics),
           },
-          Yank -> match version { None -> not_a_version(), Some(v) -> yank_version(req, name, v) },
+          Yank -> match version {
+            None -> not_a_version(),
+            Some(v) -> yank_version(request, name, v),
+          },
         }
       }
     },
@@ -198,15 +204,15 @@ fn store_error_response<| e>(t: StoreError, name: String, version: Version) -> R
   }
 
 fn publish<| e>(
-  req: Request,
+  request: Request,
   name: String,
   version: Version,
 ) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], http::Reading} =
-  match authorize(name, req.headers) {
+  match authorize(name, request.headers) {
     Err(r) -> upload_error_response(r),
     Ok(_) -> {
-      let body = http::request_body(req, limits().max_body);
-      match validate_archive(name, version, http::header(req.headers, "x-ply-digest"), body) {
+      let body = http::request_body(request, limits().max_body);
+      match validate_archive(name, version, http::header(request.headers, "x-ply-digest"), body) {
         Err(r) -> upload_error_response(r),
         Ok(release) -> match save_release(name, release, body) {
           Err(t) -> store_error_response(t, name, version),
@@ -232,12 +238,12 @@ fn publish<| e>(
   }
 
 fn put_interface<| e>(
-  req: Request,
+  request: Request,
   name: String,
   version: Version,
   semantics: String,
 ) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], http::Reading} =
-  match authorize(name, req.headers) {
+  match authorize(name, request.headers) {
     Err(r) -> upload_error_response(r),
     Ok(_) -> match read_index(name) {
       Err(why) -> text_response(500, why ++ "\n"),
@@ -245,7 +251,7 @@ fn put_interface<| e>(
       Ok(Some(x)) -> match release_at(x, version) {
         None -> store_error_response(Absent, name, version),
         Some(r) -> {
-          let body = http::request_body(req, limits().max_body);
+          let body = http::request_body(request, limits().max_body);
           match validate_interface(semantics, r.digest, body) {
             Err(e) -> upload_error_response(e),
             Ok(_) -> match save_interface(name, version, semantics, body) {
@@ -274,7 +280,7 @@ fn put_interface<| e>(
   }
 
 fn put_attestation<| e>(
-  req: Request,
+  request: Request,
   name: String,
   version: Version,
   semantics: String,
@@ -287,7 +293,7 @@ fn put_attestation<| e>(
       Ok(Some(x)) -> match release_at(x, version) {
         None -> store_error_response(Absent, name, version),
         Some(r) -> {
-          let body = http::request_body(req, limits().max_body);
+          let body = http::request_body(request, limits().max_body);
           match validate_attestation(name, version, semantics, r.digest, Bytes::of_hex(hex), body) {
             Err(e) -> upload_error_response(e),
             Ok(_) -> match save_attestation(name, version, semantics, body) {
@@ -307,11 +313,11 @@ fn put_attestation<| e>(
   }
 
 fn yank_version<| e>(
-  req: Request,
+  request: Request,
   name: String,
   version: Version,
 ) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} =
-  match authorize(name, req.headers) {
+  match authorize(name, request.headers) {
     Err(r) -> upload_error_response(r),
     Ok(_) -> match yank(name, version) {
       Err(t) -> store_error_response(t, name, version),
@@ -413,20 +419,23 @@ fn write_request(
   digest: String,
   body: Bytes,
 ) -> Request / {abort.raise} = {
-  let req = request_to(method, "registry.test", target, body);
-  let authed = if token == "" { req.headers }
-  else { set_header(req.headers, "authorization", "Bearer " ++ token) };
-  { ..req, headers: if digest == "" { authed } else { set_header(authed, "x-ply-digest", digest) } }
+  let request = request_to(method, "registry.test", target, body);
+  let authed = if token == "" { request.headers }
+  else { set_header(request.headers, "authorization", "Bearer " ++ token) };
+  {
+    ..request,
+    headers: if digest == "" { authed } else { set_header(authed, "x-ply-digest", digest) },
+  }
 }
 
 /// An answer with its body read whole.
 type WholeResponse = { status: Int, headers: http::Headers, body: Bytes }
 
-/// What `handle_request` answers `req` with, called as a server calls it on a request whose body is whole.
+/// What `handle_request` answers `request` with, called as a server calls it on a request whose body is whole.
 fn whole_response(
-  req: Request,
+  request: Request,
 ) -> WholeResponse / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], abort.raise} =
-  match http::read_whole(http::empty_headers(), || handle_request(req)) {
+  match http::read_whole(http::empty_headers(), || handle_request(request)) {
     Ok(r) -> { status: r.status, headers: r.headers, body: http::whole_bytes(r.body) },
     Err(e) ->
       { status: e.status, headers: http::empty_headers(), body: Bytes::of_string(e.reason) },

@@ -11,8 +11,8 @@ import compiler.front.facts (Analysis, ShippedView, CheckedProgram, Frame, Table
 import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, pins_of_load,
                        resolved_pulling_std_with)
 import compiler.check.resolve.defaults (ResolvedProgram)
-import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FnOutline, KnownDefRow,
-                            KnownTestRow, ModuleDerivations)
+import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FnOutline,
+                            KnownDefinitionRow, KnownTestRow, ModuleDerivations)
 import compiler.front.published (dump_of, no_rows)
 import compiler.front.pkg (PackageSources, LockedPackage, SuppliedPackage, closure)
 import interfaces
@@ -22,16 +22,17 @@ import compiler.store.hash.forms (HashOutput, NodeRef, FunctionNamed, Subject, C
 import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
 import compiler.syntax.items (Item, FunctionItem, parse)
-import compiler.check.infer.checker (DefInfo, TestInfo, LawInfo, Location)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, Location)
 import compiler.check.termination (Terminates, unknown_summary)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, Label, error_at, qualify)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label, error_at, qualify)
 import compiler.check.types (NamedType, FunctionType, tables_joined)
 import diagnostic (SourceText, position_of)
 import paths
 import proof.static_prover (UnprovedMeasure, unproved_measures)
 import proof.prover_input (measures_in)
-import sources (File, Project, DepPackage, Embed, load_resolved, shipping_cached, shipping_of,
-                shipped_at, all_shipped_names, no_ply_files, embeds_changed, embeds_parsed)
+import sources (File, Project, DependencyPackage, Embed, load_resolved, shipping_cached,
+                shipping_of, shipped_at, all_shipped_names, no_ply_files, embeds_changed,
+                embeds_parsed)
 import builder (builder)
 import module_queries
 import module_queries (QueryResults)
@@ -51,14 +52,14 @@ pub type Program = {
   files: List<File>,
   read_at: List<paths::RootedPath>,
   places: List<SourceText>,
-  diags: List<Diag>,
+  diagnostics: List<Diagnostic>,
   frame: Option<Frame>,
   answered: Map<Bytes, ModuleResult>,
   reads: TableReads,
   whole: Option<Analysis>,
   sources: List<Source>,
   modules: List<ModuleHashes>,
-  pkgs: PackageSources,
+  packages: PackageSources,
   embeds: List<Embed>,
   inputs: Map<Bytes, Bytes>,
   shipping: ShippedInputs,
@@ -107,20 +108,20 @@ fn failed_program(
   project: Project,
   shipping: ShippedInputs,
   places: List<SourceText>,
-  diags: List<Diag>,
+  diagnostics: List<Diagnostic>,
 ) -> Program =
   {
     files: project.files,
     read_at: read_at(project),
     places: places,
-    diags: diags,
+    diagnostics: diagnostics,
     frame: None,
     answered: Map::new(),
     reads: no_reads(),
     whole: None,
     sources: project.sources,
     modules: [],
-    pkgs: pkgs_of(project),
+    packages: packages_of(project),
     embeds: [],
     inputs: Map::new(),
     shipping: shipping,
@@ -137,14 +138,14 @@ pub fn no_program() -> Program =
     files: [],
     read_at: [],
     places: [],
-    diags: [],
+    diagnostics: [],
     frame: None,
     answered: Map::new(),
     reads: no_reads(),
     whole: None,
     sources: [],
     modules: [],
-    pkgs: { root: b"", manifest: None, supplied: [] },
+    packages: { root: b"", manifest: None, supplied: [] },
     embeds: [],
     inputs: Map::new(),
     shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
@@ -156,7 +157,7 @@ pub fn no_program() -> Program =
     looked: [],
   }
 
-pub fn pkgs_of(project: Project) -> PackageSources =
+pub fn packages_of(project: Project) -> PackageSources =
   {
     root: Bytes::of_string(project.root_key),
     manifest: match project.manifest { None -> None, Some(f) -> Some(f.text) },
@@ -167,7 +168,7 @@ fn own_places(project: Project) -> List<SourceText> =
   project.files.map(|file: File| { path: file.path, text: file.text })
 
 fn supplied(project: Project) -> List<SuppliedPackage> =
-  project.packages.map(|package: DepPackage|
+  project.packages.map(|package: DependencyPackage|
     {
       root: Bytes::of_string(package.root),
       manifest: package.manifest,
@@ -177,26 +178,29 @@ fn supplied(project: Project) -> List<SuppliedPackage> =
 
 fn read_at(project: Project) -> List<paths::RootedPath> =
   project.files.map(|file: File| file.at).concat(
-    project.packages.fold([], |acc: List<paths::RootedPath>, package: DepPackage|
+    project.packages.fold([], |acc: List<paths::RootedPath>, package: DependencyPackage|
       acc.concat(package.files.map(|file: File| file.at))),
   )
 
-fn dep_places(project: Project) -> List<SourceText> =
-  project.packages.fold([], |acc: List<SourceText>, package: DepPackage|
+fn dependency_places(project: Project) -> List<SourceText> =
+  project.packages.fold([], |acc: List<SourceText>, package: DependencyPackage|
     package.files.fold(acc, |places: List<SourceText>, file: File|
       places.push({ path: file.path, text: file.text })))
 
 fn manifest_places(project: Project) -> List<SourceText> = {
-  let deps = project.packages.fold([], |acc: List<SourceText>, package: DepPackage|
-    match package.manifest {
-      None -> acc,
-      Some(text) -> acc.push({ path: package.root ++ "/ply.pkg", text: text }),
-    });
+  let dependencies = project.packages.fold(
+    [],
+    |acc: List<SourceText>, package: DependencyPackage|
+      match package.manifest {
+        None -> acc,
+        Some(text) -> acc.push({ path: package.root ++ "/ply.pkg", text: text }),
+      },
+  );
   match project.manifest {
-    None -> deps,
+    None -> dependencies,
     Some(f) -> {
       let root: List<SourceText> = [{ path: f.path, text: f.text }];
-      deps.fold(root, |acc: List<SourceText>, place: SourceText| acc.push(place))
+      dependencies.fold(root, |acc: List<SourceText>, place: SourceText| acc.push(place))
     },
   }
 }
@@ -204,13 +208,16 @@ fn manifest_places(project: Project) -> List<SourceText> = {
 pub type ProjectSources = { modules: List<SourceText>, manifests: List<SourceText> }
 
 pub fn project_sources(project: Project) -> ProjectSources =
-  { modules: own_places(project).concat(dep_places(project)), manifests: manifest_places(project) }
+  {
+    modules: own_places(project).concat(dependency_places(project)),
+    manifests: manifest_places(project),
+  }
 
 pub fn front_end(
   sources: List<Source>,
   shipping: ShippedInputs,
   rows: Rows,
-  pkgs: PackageSources,
+  packages: PackageSources,
   embeds: List<Embed>,
   reached: Bool,
   fixed: CachedHashes,
@@ -220,7 +227,7 @@ pub fn front_end(
     sources,
     shipping.read,
     rows,
-    pkgs,
+    packages,
     embeds: embeds.map(|embed: Embed| embed.embedded),
     unread: shipping.unread,
     reached: reached,
@@ -235,7 +242,7 @@ pub fn reanalysed(
   program: Program,
   frame: Frame,
   sources: List<Source>,
-  pkgs: PackageSources,
+  packages: PackageSources,
   moved: List<Bytes>,
 ) -> PulledAnalysis / {abort.raise} = {
   let rows = published_rows(program);
@@ -247,11 +254,12 @@ pub fn reanalysed(
     sources,
     program.shipping,
     {
-      defs: rows.defs.filter(|r: KnownDefRow| !stale.contains(r.name) && !moved.contains(r.name)),
+      definitions: rows.definitions.filter(|r: KnownDefinitionRow|
+        !stale.contains(r.name) && !moved.contains(r.name)),
       tests: [],
       types: rows.types,
     },
-    pkgs,
+    packages,
     program.embeds,
     program.reached,
     no_cached_hashes(),
@@ -271,11 +279,11 @@ fn analysed(
 ) -> Program / {abort.raise} = {
   let texts = shipping.read.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
     acc.insert(String::of_bytes_lossy(source.name), source.src));
-  let pkgs: PackageSources = pkgs_of(project);
+  let packages: PackageSources = packages_of(project);
   let warnings = root_warnings(answers, project.sources.len());
   let loaded = assembled_load(
     project.sources.map(|s: Source| s.name),
-    pkgs,
+    packages,
     answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
       acc.insert(a.module, a.result.shape)),
     joined_cached_hashes(modules),
@@ -296,7 +304,7 @@ fn analysed(
     ).concat(
       own.manifests,
     ),
-    diags: warnings,
+    diagnostics: warnings,
     frame: Some(loaded.frame),
     answered: answers.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
       acc.insert(a.module, a.result)),
@@ -304,7 +312,7 @@ fn analysed(
     whole: None,
     sources: project.sources,
     modules: modules,
-    pkgs: pkgs,
+    packages: packages,
     embeds: embeds,
     inputs: inputs,
     shipping: shipping,
@@ -326,7 +334,7 @@ fn analysed(
           m || (match item { OutlinedFunction(f) -> pick(f), _ -> false })));
   let measured = held(|f: FnOutline| f.measured);
   if !measured && !held(|f: FnOutline| f.reuse || f.returns) { program } else {
-    let refused = |ds: List<Diag>| { ..program, diags: ds, frame: None };
+    let refused = |ds: List<Diagnostic>| { ..program, diagnostics: ds, frame: None };
     match whole_of(program) {
       Err(ds) -> refused(ds),
       Ok(w) -> match if measured { unproved_measures(w, mine) } else { [] } {
@@ -357,15 +365,15 @@ fn published_rows(program: Program) -> Rows / {abort.raise} =
   program.answered.fold(no_rows(), |acc: Rows, _: Bytes, a: ModuleResult| {
     let rows = rows_of_result(a);
     {
-      defs: acc.defs.concat(rows.defs),
+      definitions: acc.definitions.concat(rows.definitions),
       tests: acc.tests.concat(rows.tests),
       types: tables_joined(acc.types, rows.types),
     }
   })
 
-pub fn own_diags(diags: List<Diag>, frame: Frame) -> List<Diag> =
-  diags.filter(|diag: Diag|
-    !diag.labels.any(|l: Label|
+pub fn own_diagnostics(diagnostics: List<Diagnostic>, frame: Frame) -> List<Diagnostic> =
+  diagnostics.filter(|diagnostic: Diagnostic|
+    !diagnostic.labels.any(|l: Label|
       l.primary && pulled_at(frame.packages, frame.module_packages, l.module)))
 
 pub fn program_view(program: Program) -> Option<CheckedProgram> / {abort.raise} =
@@ -374,15 +382,15 @@ pub fn program_view(program: Program) -> Option<CheckedProgram> / {abort.raise} 
     Some(f) -> Some(checked_program_from_results(f, program.reads, program.answered)),
   }
 
-pub fn whole_of(program: Program) -> Result<Analysis, List<Diag>> / {abort.raise} =
+pub fn whole_of(program: Program) -> Result<Analysis, List<Diagnostic>> / {abort.raise} =
   match ((program.frame, program.whole)) {
-    (None, _) -> Err(program.diags),
+    (None, _) -> Err(program.diagnostics),
     (Some(_), Some(w)) -> Ok(w),
     (Some(f), None) -> match front_end(
         program.sources,
         program.shipping,
         published_rows(program),
-        program.pkgs,
+        program.packages,
         program.embeds,
         program.reached,
         joined_cached_hashes(program.modules),
@@ -395,7 +403,7 @@ pub fn whole_of(program: Program) -> Result<Analysis, List<Diag>> / {abort.raise
 
 pub type Parses = Map<Bytes, ParsedSource>
 
-pub type Unresolved = { diags: List<Diag>, modules: List<Source> }
+pub type Unresolved = { diagnostics: List<Diagnostic>, modules: List<Source> }
 
 fn parsed_into<| e>(
   parses: Parses,
@@ -411,14 +419,14 @@ fn parsed_into<| e>(
 fn resolved_from(
   sources: List<Source>,
   shipping: ShippedInputs,
-  pkgs: PackageSources,
+  packages: PackageSources,
   embeds: List<Embed>,
   parses: Parses,
 ) -> Result<ResolvedProgram, Unresolved> / {abort.raise} =
   resolved_pulling_std_with(
     sources,
     shipping.read,
-    pkgs,
+    packages,
     embeds.map(|embed: Embed| embed.embedded),
     shipping.unread,
     shipping.data,
@@ -427,20 +435,24 @@ fn resolved_from(
     parses.values(),
   )
 
-fn supplied_sources(sources: List<Source>, pkgs: PackageSources) -> List<Source> / {abort.raise} =
-  closure(pkgs, sources.map(|s: Source| s.name)).modules.map(|m: { pkg: Int, src: Source }| m.src)
+fn supplied_sources(
+  sources: List<Source>,
+  packages: PackageSources,
+) -> List<Source> / {abort.raise} =
+  closure(packages, sources.map(|s: Source| s.name)).modules.map(|m: { pkg: Int, src: Source }|
+    m.src)
 
 pub fn resolution_of(
   program: Program,
   parses: Parses,
-) -> { resolved: Result<ResolvedProgram, List<Diag>>, parses: Parses } / {abort.raise} =
+) -> { resolved: Result<ResolvedProgram, List<Diagnostic>>, parses: Parses } / {abort.raise} =
   match program.frame {
-    None -> { resolved: Err(program.diags), parses: parses },
+    None -> { resolved: Err(program.diagnostics), parses: parses },
     Some(_) -> {
       let derived = module_derivations(program);
       let now = parsed_into(
         parses,
-        program.sources.concat(supplied_sources(program.sources, program.pkgs)).concat(
+        program.sources.concat(supplied_sources(program.sources, program.packages)).concat(
           program.shipping.read,
         ),
         |s: Source|
@@ -458,12 +470,12 @@ pub fn resolution_of(
         resolved: match resolved_from(
             program.sources,
             program.shipping,
-            program.pkgs,
+            program.packages,
             program.embeds,
             now,
           ) {
           Ok(p) -> Ok(p),
-          Err(u) -> Err(u.diags),
+          Err(u) -> Err(u.diagnostics),
         },
         parses: now,
       }
@@ -476,11 +488,11 @@ pub fn renamed_resolution(
   parses: Parses,
 ) -> { resolved: Result<ResolvedProgram, Unresolved>, parses: Parses } / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
-  if project.diags.len() > 0 {
-    { resolved: Err({ diags: project.diags, modules: [] }), parses: parses }
+  if project.diagnostics.len() > 0 {
+    { resolved: Err({ diagnostics: project.diagnostics, modules: [] }), parses: parses }
   } else {
-    let pkgs = pkgs_of(project);
-    let own = project.sources.concat(supplied_sources(project.sources, pkgs));
+    let packages = packages_of(project);
+    let own = project.sources.concat(supplied_sources(project.sources, packages));
     let names = own.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source| acc.insert(s.name, true));
     let texts = project.sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
       acc.insert(s.name, s.src));
@@ -499,13 +511,13 @@ pub fn renamed_resolution(
         library: Some(|ask: DeriverRequest| derivation_result(ask, texts)),
       ));
     {
-      resolved: resolved_from(project.sources, shipped, pkgs, embeds_parsed(project), now),
+      resolved: resolved_from(project.sources, shipped, packages, embeds_parsed(project), now),
       parses: now,
     }
   }
 }
 
-fn unproved_measure(u: UnprovedMeasure) -> Diag =
+fn unproved_measure(u: UnprovedMeasure) -> Diagnostic =
   error_at(
     b"E0467",
     u.measure.at.module,
@@ -522,7 +534,8 @@ fn unproved_measure(u: UnprovedMeasure) -> Diag =
     }),
   )
 
-pub fn usable(project: Project) -> Bool = project.diags.len() == 0 && project.sources.len() > 0
+pub fn usable(project: Project) -> Bool =
+  project.diagnostics.len() == 0 && project.sources.len() > 0
 
 fn assembled(
   project: Project,
@@ -546,8 +559,8 @@ fn assembled_from(
   reached: Bool,
 ) -> Program / {abort.raise} = {
   let answers = q.results;
-  if project.diags.len() > 0 {
-    failed_program(project, shipping, own_places(project), project.diags)
+  if project.diagnostics.len() > 0 {
+    failed_program(project, shipping, own_places(project), project.diagnostics)
   } else if project.sources.len() == 0 {
     failed_program(project, shipping, [], [
       no_ply_files(match paths.at(0) { Some(r) -> r.display, None -> "." }),
@@ -559,7 +572,7 @@ fn assembled_from(
     );
     let own = project_sources(project);
     let packaged = packages_refused(
-      pkgs_of(project),
+      packages_of(project),
       project.sources.map(|s: Source| s.name),
       own.modules.len(),
       shipping.read.map(|s: Source| s.name).concat(shipping.unread),
@@ -571,16 +584,21 @@ fn assembled_from(
         acc.insert(String::of_bytes_lossy(source.name), source.src));
       let pulled = answers.drop(own.modules.len()).map(|a: CheckedModule|
         shipped_place(texts, String::of_bytes_lossy(a.module)));
-      let diags = range(0, answers.len()).fold([], |acc: List<Diag>, i: Int| {
+      let diagnostics = range(0, answers.len()).fold([], |acc: List<Diagnostic>, i: Int| {
         let a = answers.get(i);
         if !first.contains(a.module) { acc } else {
           acc.concat(
-            a.result.refused.map(|d: Diag|
+            a.result.refused.map(|d: Diagnostic|
               { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
           )
         }
       });
-      failed_program(project, shipping, own.modules.concat(pulled).concat(own.manifests), diags)
+      failed_program(
+        project,
+        shipping,
+        own.modules.concat(pulled).concat(own.manifests),
+        diagnostics,
+      )
     } else {
       match q.inputs {
         Err(moved) -> failed_program(project, shipping, own.modules.concat(own.manifests), moved),
@@ -592,7 +610,10 @@ fn assembled_from(
 }
 
 fn slots_of(project: Project) -> List<String> / {abort.raise} =
-  interfaces::slots(project.root_key, project.packages.map(|package: DepPackage| package.root))
+  interfaces::slots(
+    project.root_key,
+    project.packages.map(|package: DependencyPackage| package.root),
+  )
 
 fn verified(
   project: Project,
@@ -602,17 +623,17 @@ fn verified(
 ) -> Program / {fs.read_file[abs], abort.raise} =
   if !verify || program.frame == None { program } else {
     match whole_of(program) {
-      Err(ds) -> { ..program, diags: ds, frame: None },
+      Err(ds) -> { ..program, diagnostics: ds, frame: None },
       Ok(w) -> match interfaces::rederive_mismatches(
           slots_of(project),
           interfaces::dependency_sources(
-            pkgs_of(project),
+            packages_of(project),
             project.sources.map(|source: Source| source.name),
           ),
           w,
         ) {
         [] -> program,
-        refused -> { ..program, diags: program.diags.concat(refused), frame: None },
+        refused -> { ..program, diagnostics: program.diagnostics.concat(refused), frame: None },
       },
     }
   }
@@ -748,15 +769,21 @@ pub fn load_program(
 
 pub fn pins_for(
   paths: List<paths::ResolvedPath>,
-) -> Result<{ pins: List<LockedPackage>, pkgs: PackageSources }, { diags: List<Diag>, places: List<SourceText> }> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+) -> Result<{ pins: List<LockedPackage>, packages: PackageSources }, { diagnostics: List<Diagnostic>, places: List<SourceText> }> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
-  if project.diags.len() > 0 { Err({ diags: project.diags, places: own_places(project) }) } else {
-    let pkgs = pkgs_of(project);
-    match pins_of_load(project.sources, pkgs, embeds_parsed(project).map(|e: Embed| e.embedded)) {
-      Ok(pins) -> Ok({ pins: pins, pkgs: pkgs }),
-      Err(diags) -> {
+  if project.diagnostics.len() > 0 {
+    Err({ diagnostics: project.diagnostics, places: own_places(project) })
+  } else {
+    let packages = packages_of(project);
+    match pins_of_load(
+        project.sources,
+        packages,
+        embeds_parsed(project).map(|e: Embed| e.embedded),
+      ) {
+      Ok(pins) -> Ok({ pins: pins, packages: packages }),
+      Err(diagnostics) -> {
         let own = project_sources(project);
-        Err({ diags: diags, places: own.modules.concat(own.manifests) })
+        Err({ diagnostics: diagnostics, places: own.modules.concat(own.manifests) })
       },
     }
   }
@@ -768,7 +795,10 @@ pub fn loaded_analysis(
   within: Option<TestRunScope> = None,
 ) -> LoadedAnalysis / {abort.raise} = {
   {
-    dump: view_dump({ ..view, frame: { ..view.frame, warnings: timed.program.diags } }, within),
+    dump: view_dump(
+      { ..view, frame: { ..view.frame, warnings: timed.program.diagnostics } },
+      within,
+    ),
     files: source_files(timed.program, view.frame),
     inputs: timed.program.inputs,
     read_ms: timed.read_ms,
@@ -859,7 +889,8 @@ pub fn unchanged(
   project: Project,
   program: Program,
 ) -> Bool / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  project.diags.len() == 0 && project.files == program.files && pkgs_of(project) == program.pkgs
+  project.diagnostics.len() == 0 && project.files == program.files
+    && packages_of(project) == program.packages
     && !embeds_changed(program.embeds)
 
 pub fn modules_of(program: Program, frame: Frame) -> List<ModuleView> / {abort.raise} =
@@ -931,9 +962,9 @@ pub fn location_of(program: Program, location: Location) -> Option<String> / {ab
     },
   }
 
-type Picking = { seen: Map<Bytes, Bool>, out: List<DefInfo> }
+type Picking = { seen: Map<Bytes, Bool>, out: List<DefinitionInfo> }
 
-fn pick(acc: Picking, by_name: Map<Bytes, DefInfo>, name: Bytes) -> Picking =
+fn pick(acc: Picking, by_name: Map<Bytes, DefinitionInfo>, name: Bytes) -> Picking =
   match acc.seen.get(name) {
     Some(_) -> acc,
     None -> match by_name.get(name) {
@@ -942,25 +973,33 @@ fn pick(acc: Picking, by_name: Map<Bytes, DefInfo>, name: Bytes) -> Picking =
     },
   }
 
-fn module_fns(acc: List<Bytes>, o: Outline) -> List<Bytes> =
+fn module_functions(acc: List<Bytes>, o: Outline) -> List<Bytes> =
   o.items.fold(acc, |a: List<Bytes>, it: OutlineItem|
     match it { OutlinedFunction(f) -> a.push(qualify(o.name, f.name)), _ -> a })
 
-pub fn definitions_in_order(view: CheckedProgram) -> List<DefInfo> = {
-  let by_name = view.checked.defs.fold(Map::new(), |acc: Map<Bytes, DefInfo>, def_info: DefInfo|
-    acc.insert(def_info.name, def_info));
-  let a_definition = view.frame.outlines.fold([], module_fns);
+pub fn definitions_in_order(view: CheckedProgram) -> List<DefinitionInfo> = {
+  let by_name = view.checked.definitions.fold(
+    Map::new(),
+    |acc: Map<Bytes, DefinitionInfo>, definition_info: DefinitionInfo|
+      acc.insert(definition_info.name, definition_info),
+  );
+  let a_definition = view.frame.outlines.fold([], module_functions);
   let first: Picking = a_definition.fold(
     { seen: Map::new(), out: [] },
     |acc: Picking, name: Bytes| pick(acc, by_name, name),
   );
-  let all: Picking = view.checked.defs.fold(first, |acc: Picking, def_info: DefInfo|
-    pick(acc, by_name, def_info.name));
+  let all: Picking = view.checked.definitions.fold(
+    first,
+    |acc: Picking, definition_info: DefinitionInfo| pick(acc, by_name, definition_info.name),
+  );
   all.out
 }
 
-pub fn resolve_def(defs: List<DefInfo>, query: String) -> Result<DefInfo, List<String>> = {
-  let exact = defs.fold(None, |acc: Option<DefInfo>, d: DefInfo|
+pub fn resolve_definition(
+  definitions: List<DefinitionInfo>,
+  query: String,
+) -> Result<DefinitionInfo, List<String>> = {
+  let exact = definitions.fold(None, |acc: Option<DefinitionInfo>, d: DefinitionInfo|
     match acc {
       Some(_) -> acc,
       None -> if String::of_bytes_lossy(d.name) == query { Some(d) } else { None },
@@ -968,17 +1007,18 @@ pub fn resolve_def(defs: List<DefInfo>, query: String) -> Result<DefInfo, List<S
   match exact {
     Some(d) -> Ok(d),
     None -> {
-      let matching = defs.filter(|d: DefInfo| String::of_bytes_lossy(d.simple_name) == query);
+      let matching = definitions.filter(|d: DefinitionInfo|
+        String::of_bytes_lossy(d.simple_name) == query);
       match matching.at(0) {
         None -> Err([]),
         Some(d) -> if matching.len() == 1 { Ok(d) }
-        else { Err(matching.map(|x: DefInfo| String::of_bytes_lossy(x.name))) },
+        else { Err(matching.map(|x: DefinitionInfo| String::of_bytes_lossy(x.name))) },
       }
     },
   }
 }
 
-pub fn unknown_def(query: String, names: List<String>) -> Diag =
+pub fn unknown_definition(query: String, names: List<String>) -> Diagnostic =
   if names.len() == 0 {
     error_at(
       b"E0101",
@@ -1001,11 +1041,11 @@ pub fn unknown_def(query: String, names: List<String>) -> Diag =
     )
   }
 
-pub fn with_note(diag: Diag, note: Bytes) -> Diag =
-  { ..diag, notes: diag.notes + 1, notes_text: diag.notes_text.push(note) }
+pub fn with_note(diagnostic: Diagnostic, note: Bytes) -> Diagnostic =
+  { ..diagnostic, notes: diagnostic.notes + 1, notes_text: diagnostic.notes_text.push(note) }
 
 pub type Tables = {
-  defs: Map<Bytes, Bytes>,
+  definitions: Map<Bytes, Bytes>,
   own: Map<Bytes, Bytes>,
   specs: Map<Bytes, Int>,
   hashes: HashOutput,
@@ -1013,8 +1053,10 @@ pub type Tables = {
 
 pub fn tables_of(h: HashOutput) -> Tables =
   {
-    defs: h.defs.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-      acc.insert(x.name, x.hash)),
+    definitions: h.definitions.fold(
+      Map::new(),
+      |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| acc.insert(x.name, x.hash),
+    ),
     own: h.own.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
       acc.insert(x.name, x.hash)),
     specs: h.specs.fold(
@@ -1026,28 +1068,31 @@ pub fn tables_of(h: HashOutput) -> Tables =
   }
 
 pub fn hash_of(tables: Tables, name: Bytes) -> Option<String> / {abort.raise} =
-  match tables.defs.get(name) { Some(h) -> Some(String::of_bytes_lossy(hex(h))), None -> None }
+  match tables.definitions.get(name) {
+    Some(h) -> Some(String::of_bytes_lossy(hex(h))),
+    None -> None,
+  }
 
 pub fn own_hash_of(tables: Tables, name: Bytes) -> Option<String> / {abort.raise} =
   match tables.own.get(name) { Some(h) -> Some(String::of_bytes_lossy(hex(h))), None -> None }
 
-pub fn deps_of(tables: Tables, which: Subject) -> List<String> / {abort.raise} =
+pub fn dependencies_of(tables: Tables, which: Subject) -> List<String> / {abort.raise} =
   forms::references_in(tables.hashes, which).fold([], |acc: List<Bytes>, r: NodeRef|
     acc.push_unique(r.name)).map(|n: Bytes| String::of_bytes_lossy(n))
 
 pub fn closure_of(tables: Tables, which: Subject) -> List<String> / {abort.raise} = {
   let reached = forms::reach(tables.hashes, [which]);
-  reached.fns.merge(reached.decls).keys().map(|n: Bytes| String::of_bytes_lossy(n))
+  reached.functions.merge(reached.declarations).keys().map(|n: Bytes| String::of_bytes_lossy(n))
 }
 
 pub fn transitive_callers(tables: Tables, name: Bytes) -> List<Bytes> / {abort.raise} = {
   let n = forms::find_referrers(tables.hashes, FunctionNamed(name), true);
-  n.fns.concat(n.items)
+  n.functions.concat(n.items)
 }
 
 pub fn direct_callers(tables: Tables, name: Bytes) -> List<Bytes> / {abort.raise} = {
   let n = forms::find_referrers(tables.hashes, FunctionNamed(name), false);
-  n.fns.concat(n.items)
+  n.functions.concat(n.items)
 }
 
 pub fn specs_of(tables: Tables, name: Bytes) -> Int =
@@ -1083,16 +1128,16 @@ test "a proof answers for the root package's claims and never a shipped module's
   assert(owned(b"m") && !owned(b"std.y") && !owned(b"compiler.x"))
 }
 
-fn a_definition(name: Bytes, simple: Bytes) -> DefInfo =
+fn a_definition(name: Bytes, simple: Bytes) -> DefinitionInfo =
   {
     name: name,
     module: b"m",
     simple_name: simple,
     scheme: {
-      ty_vars: [],
-      row_vars: [],
+      type_variables: [],
+      row_variables: [],
       keep_variables: [],
-      label_vars: [],
+      label_variables: [],
       ty: FunctionType({
         kept: [],
         once: false,
@@ -1117,24 +1162,33 @@ fn a_definition(name: Bytes, simple: Bytes) -> DefInfo =
   }
 
 test "a query is a program-wide name, or a simple name that names exactly one definition" {
-  let defs = [
+  let definitions = [
     a_definition(b"a.total", b"total"),
     a_definition(b"b.total", b"total"),
     a_definition(b"a.one", b"one"),
   ];
-  assert_eq(match resolve_def(defs, "a.total") { Ok(d) -> d.name, Err(_) -> b"" }, b"a.total");
-  assert_eq(match resolve_def(defs, "one") { Ok(d) -> d.name, Err(_) -> b"" }, b"a.one");
-  assert_eq(match resolve_def(defs, "total") { Ok(_) -> [], Err(ns) -> ns }, [
+  assert_eq(
+    match resolve_definition(definitions, "a.total") { Ok(d) -> d.name, Err(_) -> b"" },
+    b"a.total",
+  );
+  assert_eq(
+    match resolve_definition(definitions, "one") { Ok(d) -> d.name, Err(_) -> b"" },
+    b"a.one",
+  );
+  assert_eq(match resolve_definition(definitions, "total") { Ok(_) -> [], Err(ns) -> ns }, [
     "a.total",
     "b.total",
   ]);
-  assert_eq(match resolve_def(defs, "absent") { Ok(_) -> ["found"], Err(ns) -> ns }, [])
+  assert_eq(
+    match resolve_definition(definitions, "absent") { Ok(_) -> ["found"], Err(ns) -> ns },
+    [],
+  )
 }
 
 test "a name nothing declares is `E0101`, and an ambiguous one says which" {
-  assert_eq(unknown_def("absent", []).code, b"E0101");
-  assert_eq(unknown_def("absent", []).message, b"no definition is named `absent`");
-  let many = unknown_def("total", ["a.total", "b.total"]);
+  assert_eq(unknown_definition("absent", []).code, b"E0101");
+  assert_eq(unknown_definition("absent", []).message, b"no definition is named `absent`");
+  let many = unknown_definition("total", ["a.total", "b.total"]);
   assert_eq(many.message, b"`total` names 2 definitions");
   assert_eq(many.notes_text, [b"one of: a.total, b.total"]);
   assert_eq(with_note(many, b"and one more").notes, 2)

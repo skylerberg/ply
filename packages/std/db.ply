@@ -70,27 +70,27 @@ import std.bytes
 import std.option
 import std.result
 import std.sql
-import std.sql (Stmt, Param, QueryResult, DbError, Row, Failed, db_error, stmt, Count, Schema,
+import std.sql (Statement, Param, QueryResult, DbError, Row, Failed, db_error, stmt, Count, Schema,
                 Table, Column, SequenceDefault, DNone, LiteralDefault, Unique, ForeignKey, Check,
                 ColumnType, IntColumn, BoolColumn, TText, BytesColumn, FloatColumn, TNumeric,
                 JsonColumn, TArray, NullParameter, IntParameter, BoolParameter, TextParameter,
                 NumericParameter, FloatParameter, BytesParameter, JsonParameter, ArrayParameter,
                 column, Datum, TextDatum, NullDatum, BoolDatum, NumericDatum, IntDatum, BytesDatum,
                 FloatDatum, JsonDatum, ArrayDatum, Rows, column_default, Postgres, tokenize,
-                SqlTokAt, SqlPlaceholder, sql_is_semicolon, datum_type, Operation, Reads, Writes,
+                SqlTokenAt, SqlPlaceholder, sql_is_semicolon, datum_type, Operation, Reads, Writes,
                 WritesRows)
 
 /// The database, one table per label.
 pub nondet effect db {
   /// Runs a statement that only reads, its `$n` placeholders bound to `ps`.
-  read query[t](s: Stmt, ps: List<Param>) -> QueryResult
+  read query[t](s: Statement, ps: List<Param>) -> QueryResult
   /// Runs the statement once for each parameter list. Each result is what its own `query` would
   /// have returned.
-  read batch[t](s: Stmt, each: List<List<Param>>) -> List<QueryResult>
+  read batch[t](s: Statement, each: List<List<Param>>) -> List<QueryResult>
   /// Runs a statement that writes, returning the number of rows it touched as `Count`.
-  write execute[t](s: Stmt, ps: List<Param>) -> QueryResult
+  write execute[t](s: Statement, ps: List<Param>) -> QueryResult
   /// Runs a statement that writes and returns rows, as one with `returning` does.
-  write returning[t](s: Stmt, ps: List<Param>) -> QueryResult
+  write returning[t](s: Statement, ps: List<Param>) -> QueryResult
   /// Transaction control takes no resource, so its atom is the singleton `db.write`.
   write begin(level: Isolation, access: Access) -> QueryResult
   /// Commits the innermost open transaction or savepoint.
@@ -125,7 +125,7 @@ pub nondet effect db {
   write copy_end[t](copy: Int, failure: Option<String>) -> Result<Int, DbError>
   /// Starts copying the rows the statement `s` returns out of the server with `COPY`, returning the
   /// copy's number. It holds a connection as `copy_in` does.
-  read copy_out[t](s: Stmt) -> Result<Int, DbError>
+  read copy_out[t](s: Statement) -> Result<Int, DbError>
   /// At most `rows` more rows of a copy out, as `query` would have returned them. None once the
   /// server has sent every row or the copy failed, which `copy_end` then reports.
   read copy_take[t](copy: Int, rows: Int) -> Result<List<Row>, DbError>
@@ -228,7 +228,7 @@ pub fn is_retryable(e: DbError) -> Bool = e.code == "40001" || e.code == "40P01"
 /// The rows `s` returns, each read by `codec`. When the check can compute the statement and the
 /// codec is derived, it checks the columns the statement returns against the codec's fields.
 pub fn fetch<a, [t]>(
-  s: Stmt,
+  s: Statement,
   codec: sql::RowCodec<a>,
   ps: List<Param>,
 ) -> Result<List<a>, sql::FetchError> / {db.query[t], abort.raise} =
@@ -236,7 +236,7 @@ pub fn fetch<a, [t]>(
 
 /// `fetch` over a statement that writes and returns the rows its `returning` names.
 pub fn fetch_returning<a, [t]>(
-  s: Stmt,
+  s: Statement,
   codec: sql::RowCodec<a>,
   ps: List<Param>,
 ) -> Result<List<a>, sql::FetchError> / {db.returning[t], abort.raise} =
@@ -313,7 +313,7 @@ fn send_chunks<[t] | e>(
 /// rows it did not pull are read and dropped. The result is `body`'s, or what failed the copy,
 /// which ends the sequence early.
 pub fn copy_from<a, [t] | e>(
-  s: Stmt,
+  s: Statement,
   page: Int,
   body: (Seq<Row | {db.copy_take[t]}>) -> a / e,
 ) -> Result<a, DbError> / {db.copy_out[t], db.copy_end[t] | e} =
@@ -359,10 +359,12 @@ fn page_rows<[t]>(id: Int, page: Int, held: List<Row>, fuel: Int) -> Seq<Row | {
 // --- Batching ----------------------------------------------------------------------
 
 /// A lookup run up to the query it waits on, and what it does with the result.
-type Pending<b> = | Completed(b) | Querying(Stmt, List<Param>, once (QueryResult) -> Pending<b>)
+type Pending<b> =
+  | Completed(b)
+  | Querying(Statement, List<Param>, once (QueryResult) -> Pending<b>)
 
 /// What a round knows of one lookup: its result, or the query it waits on.
-type Step<b> = | Finished(b) | Asked({ s: Stmt, ps: List<Param> })
+type Step<b> = | Finished(b) | Asked({ s: Statement, ps: List<Param> })
 
 /// The continuations of a round's waiting lookups, one per `Asked` step.
 type Waiting<b> = | NoneWaiting | Waits(once (QueryResult) -> Pending<b>, Waiting<b>)
@@ -458,7 +460,7 @@ fn run_round_queries<b, [t]>(
   steps: List<Step<b>>,
   asking: List<Int>,
 ) -> Map<Int, QueryResult> / {db.query[t], db.batch[t]} = {
-  let groups = asking.fold([], |acc: List<{ s: Stmt, at: List<Int> }>, i: Int|
+  let groups = asking.fold([], |acc: List<{ s: Statement, at: List<Int> }>, i: Int|
     match steps.at(i) {
       Some(Asked(a)) -> match range(0, acc.len()).fold(None, |found: Option<Int>, g: Int|
           match found {
@@ -477,7 +479,7 @@ fn run_round_queries<b, [t]>(
       _ -> acc,
     });
   let params = |i: Int| match steps.at(i) { Some(Asked(a)) -> a.ps, _ -> [] };
-  groups.fold(Map::new(), |acc: Map<Int, QueryResult>, g: { s: Stmt, at: List<Int> }|
+  groups.fold(Map::new(), |acc: Map<Int, QueryResult>, g: { s: Statement, at: List<Int> }|
     match g.at {
       [only] -> acc.insert(only, db.query[t](g.s, params(only))),
       _ -> {
@@ -851,21 +853,21 @@ pub fn max_savepoints() -> Int = 16
 // --- The DDL a schema renders to ------------------------------------------------
 
 /// The statements that create a schema's sequences and then its tables, in order.
-pub fn create_schema(s: Schema) -> List<Stmt> =
-  s.tables.fold(sequence_statements(s), |acc: List<Stmt>, t: Table|
+pub fn create_schema(s: Schema) -> List<Statement> =
+  s.tables.fold(sequence_statements(s), |acc: List<Statement>, t: Table|
     acc.push(stmt(create_table_sql(t))))
 
 /// The statements that drop a schema's tables, last created first, and then its sequences.
-pub fn drop_schema(s: Schema) -> List<Stmt> = {
-  let drops = reverse_list(s.tables).fold([], |acc: List<Stmt>, t: Table|
-    acc.push(stmt("drop table if exists " ++ quote_ident(t.name) ++ " cascade")));
-  sequence_names(s).fold(drops, |acc: List<Stmt>, n: String|
-    acc.push(stmt("drop sequence if exists " ++ quote_ident(n))))
+pub fn drop_schema(s: Schema) -> List<Statement> = {
+  let drops = reverse_list(s.tables).fold([], |acc: List<Statement>, t: Table|
+    acc.push(stmt("drop table if exists " ++ quote_identifier(t.name) ++ " cascade")));
+  sequence_names(s).fold(drops, |acc: List<Statement>, n: String|
+    acc.push(stmt("drop sequence if exists " ++ quote_identifier(n))))
 }
 
-fn sequence_statements(s: Schema) -> List<Stmt> =
-  sequence_names(s).fold([], |acc: List<Stmt>, n: String|
-    acc.push(stmt("create sequence " ++ quote_ident(n))))
+fn sequence_statements(s: Schema) -> List<Statement> =
+  sequence_names(s).fold([], |acc: List<Statement>, n: String|
+    acc.push(stmt("create sequence " ++ quote_identifier(n))))
 
 fn sequence_names(s: Schema) -> List<String> =
   s.tables.fold([], |acc: List<String>, t: Table|
@@ -879,28 +881,28 @@ fn sequence_names(s: Schema) -> List<String> =
 fn create_table_sql(t: Table) -> String = {
   let cols = t.columns.map(|c: Column| column_sql(c));
   let pk = if t.primary_key.len() == 0 { [] }
-  else { ["primary key (" ++ comma(t.primary_key.map(|n: String| quote_ident(n))) ++ ")"] };
+  else { ["primary key (" ++ comma(t.primary_key.map(|n: String| quote_identifier(n))) ++ ")"] };
   let uq = t.unique.map(|u: Unique|
-    "constraint " ++ quote_ident(u.name) ++ " unique ("
-      ++ comma(u.columns.map(|n: String| quote_ident(n)))
+    "constraint " ++ quote_identifier(u.name) ++ " unique ("
+      ++ comma(u.columns.map(|n: String| quote_identifier(n)))
       ++ ")");
   let fks = t.foreign_keys.map(|f: ForeignKey|
-    "constraint " ++ quote_ident(f.name) ++ " foreign key ("
-      ++ comma(f.columns.map(|n: String| quote_ident(n)))
+    "constraint " ++ quote_identifier(f.name) ++ " foreign key ("
+      ++ comma(f.columns.map(|n: String| quote_identifier(n)))
       ++ ") references "
-      ++ quote_ident(f.references)
+      ++ quote_identifier(f.references)
       ++ " ("
-      ++ comma(f.refers_to.map(|n: String| quote_ident(n)))
+      ++ comma(f.refers_to.map(|n: String| quote_identifier(n)))
       ++ ")");
   let cks = t.checks.map(|c: Check|
-    "constraint " ++ quote_ident(c.name) ++ " check (" ++ c.expr ++ ")");
-  "create table " ++ quote_ident(t.name) ++ " ("
+    "constraint " ++ quote_identifier(c.name) ++ " check (" ++ c.expression ++ ")");
+  "create table " ++ quote_identifier(t.name) ++ " ("
     ++ comma(cols.concat(pk).concat(uq).concat(fks).concat(cks))
     ++ ")"
 }
 
 fn column_sql(c: Column) -> String =
-  quote_ident(c.name) ++ " " ++ type_sql(c.ty) ++ (if c.nullable { "" } else { " not null" })
+  quote_identifier(c.name) ++ " " ++ type_sql(c.ty) ++ (if c.nullable { "" } else { " not null" })
     ++ (match c.default {
       DNone -> "",
       SequenceDefault(n) -> " default nextval('" ++ n ++ "')",
@@ -933,7 +935,7 @@ fn literal_sql(p: Param) -> String =
     ArrayParameter(_) -> "null",
   }
 
-fn quote_ident(s: String) -> String = "\"" ++ String::join(s.split("\""), "\"\"") ++ "\""
+fn quote_identifier(s: String) -> String = "\"" ++ String::join(s.split("\""), "\"\"") ++ "\""
 
 fn comma(pieces: List<String>) -> String = String::join(pieces, ", ")
 
@@ -946,7 +948,7 @@ fn last<a>(xs: List<a>) -> Option<a> = match xs { [] -> None, [h] -> Some(h), [_
 // --- The in-memory fake ---------------------------------------------------------
 
 /// A table of the fake and the rows it contains.
-pub type MemTable = { def: Table, rows: List<Row> }
+pub type MemTable = { definition: Table, rows: List<Row> }
 
 /// One entry per open scope: what the scope began with, which a rollback to it restores.
 pub type Frame = {
@@ -979,7 +981,7 @@ pub type Outcome = { db: MemDb, out: QueryResult }
 /// An empty fake of a schema, every sequence at zero, nothing listened to.
 pub fn open(s: Schema) -> MemDb =
   {
-    tables: s.tables.map(|t: Table| { def: t, rows: [] }),
+    tables: s.tables.map(|t: Table| { definition: t, rows: [] }),
     sequences: sequence_names(s).fold(Map::new(), |acc: Map<String, Int>, n: String|
       acc.insert(n, 0)),
     stack: [],
@@ -1035,8 +1037,8 @@ type Token =
 
 fn sql_ws() -> Bytes = b" \t\r\n"
 fn sql_digits() -> Bytes = b"0123456789"
-fn ident_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789$"
-fn ident_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+fn identifier_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789$"
+fn identifier_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
 /// `-1` is the end of the input, which is in no set.
 fn in_set(set: Bytes, c: Int) -> Bool / {abort.raise} =
@@ -1068,8 +1070,8 @@ reuse fn lex(
         None -> Err(unsupported("a block comment that is never closed")),
         Some(end) -> lex(src, end, acc, left - 1),
       }
-    } else if in_set(ident_start(), c) {
-      let end = src.skip(j, ident_rest());
+    } else if in_set(identifier_start(), c) {
+      let end = src.skip(j, identifier_rest());
       lex(
         src,
         end,
@@ -1105,7 +1107,7 @@ reuse fn lex_number(
     let end = if src.peek(whole) == 46 { src.skip(whole + 1, sql_digits()) } else { whole };
     let after = src.peek(end);
     if after == 101 || after == 69 { Err(unsupported("a number in exponent notation")) }
-    else if in_set(ident_start(), after) { Err(unsupported("a number followed by a letter")) }
+    else if in_set(identifier_start(), after) { Err(unsupported("a number followed by a letter")) }
     else { lex(src, end, acc.push(NumberToken(String::of_bytes(src.slice(i, end)))), left - 1) }
   }
 
@@ -1196,48 +1198,48 @@ type Projection = | StarProjection | ColumnProjection(List<Target>) | CountProje
 
 type Comparison = | EqualTo | NotEqualTo | LessThan | LessOrEqual | GreaterThan | GreaterOrEqual
 
-type Expr =
+type Expression =
   | ColumnName(String)
   | Placeholder(Int)
   | LiteralValue(Datum)
   | DefaultKeyword
-  | Not(Expr)
-  | And(Expr, Expr)
-  | Or(Expr, Expr)
-  | Compare(Comparison, Expr, Expr)
-  | IsNull(Expr, Bool)
-  | InList(Expr, List<Expr>, Bool)
-  | Between(Expr, Expr, Expr, Bool)
-  | Like(Expr, Expr, Bool)
+  | Not(Expression)
+  | And(Expression, Expression)
+  | Or(Expression, Expression)
+  | Compare(Comparison, Expression, Expression)
+  | IsNull(Expression, Bool)
+  | InList(Expression, List<Expression>, Bool)
+  | Between(Expression, Expression, Expression, Bool)
+  | Like(Expression, Expression, Bool)
 
 type OrderKey = { column: String, desc: Bool, nulls_first: Bool }
 
 type SelectQuery = {
   source: String,
   proj: Projection,
-  filter: Option<Expr>,
+  filter: Option<Expression>,
   order: List<OrderKey>,
-  limit: Option<Expr>,
-  offset: Option<Expr>,
+  limit: Option<Expression>,
+  offset: Option<Expression>,
 }
 
 type InsertQuery = {
   source: String,
   columns: List<String>,
-  tuples: List<List<Expr>>,
+  tuples: List<List<Expression>>,
   returning: Option<Projection>,
 }
 
-type Assignment = { column: String, value: Expr }
+type Assignment = { column: String, value: Expression }
 
 type UpdateQuery = {
   source: String,
   sets: List<Assignment>,
-  filter: Option<Expr>,
+  filter: Option<Expression>,
   returning: Option<Projection>,
 }
 
-type DeleteQuery = { source: String, filter: Option<Expr>, returning: Option<Projection> }
+type DeleteQuery = { source: String, filter: Option<Expression>, returning: Option<Projection> }
 
 type Query = | Select(SelectQuery) | Insert(InsertQuery) | Update(UpdateQuery) | Delete(DeleteQuery)
 
@@ -1252,9 +1254,9 @@ fn token_symbol(ts: List<Token>) -> String = match ts { [SymbolToken(s), ..] -> 
 fn rest_of(ts: List<Token>) -> List<Token> = match ts { [] -> [], [_, ..t] -> t }
 
 fn expected(what: String, ts: List<Token>) -> DbError =
-  unsupported("expected " ++ what ++ ", found " ++ show_tok(ts))
+  unsupported("expected " ++ what ++ ", found " ++ show_token(ts))
 
-fn show_tok(ts: List<Token>) -> String =
+fn show_token(ts: List<Token>) -> String =
   match ts {
     [] -> "the end of the statement",
     [WordToken(w), ..] -> "`" ++ w ++ "`",
@@ -1288,19 +1290,22 @@ fn parse_colref(ts: List<Token>) -> Result<Parsed<String>, DbError> = {
 
 /// Every cycle through the expression parser takes a token, so a path reaches each of its eleven
 /// functions at most once per token. This is the step budget each starts with.
-fn expr_room(ts: List<Token>) -> Int = (ts.len() + 1) * 11
+fn expression_room(ts: List<Token>) -> Int = (ts.len() + 1) * 11
 
-fn parse_expr_text(s: String) -> Result<Expr, DbError> / {abort.raise} = {
+fn parse_expression_text(s: String) -> Result<Expression, DbError> / {abort.raise} = {
   let ts = lex_all(s)?;
-  let c = parse_or(ts, expr_room(ts))?;
+  let c = parse_or(ts, expression_room(ts))?;
   if c.rest.len() == 0 { Ok(c.value) } else { Err(expected("the end of the expression", c.rest)) }
 }
 
-fn parse_or(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_or(ts: List<Token>, left: Int) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") }
   else { parse_or_more(parse_and(ts, left - 1)?, left - 1) }
 
-fn parse_or_more(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_or_more(
+  c: Parsed<Expression>,
+  left: Int,
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     if token_word(c.rest) == "or" {
       let r = parse_and(rest_of(c.rest), left - 1)?;
@@ -1308,11 +1313,14 @@ fn parse_or_more(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / 
     } else { Ok(c) }
   }
 
-fn parse_and(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_and(ts: List<Token>, left: Int) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") }
   else { parse_and_more(parse_not(ts, left - 1)?, left - 1) }
 
-fn parse_and_more(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_and_more(
+  c: Parsed<Expression>,
+  left: Int,
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     if token_word(c.rest) == "and" {
       let r = parse_not(rest_of(c.rest), left - 1)?;
@@ -1320,7 +1328,7 @@ fn parse_and_more(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> /
     } else { Ok(c) }
   }
 
-fn parse_not(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_not(ts: List<Token>, left: Int) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     if token_word(ts) == "not" {
       let c = parse_not(rest_of(ts), left - 1)?;
@@ -1328,7 +1336,10 @@ fn parse_not(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abo
     } else { parse_pred_tail(parse_primary(ts, left - 1)?, left - 1) }
   }
 
-fn parse_pred_tail(c: Parsed<Expr>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_pred_tail(
+  c: Parsed<Expression>,
+  left: Int,
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     let w = token_word(c.rest);
     let s = token_symbol(c.rest);
@@ -1356,44 +1367,45 @@ fn comparison_of(s: String) -> Comparison =
   else if s == ">" { GreaterThan }
   else { GreaterOrEqual }
 
-fn parse_is(c: Parsed<Expr>, ts: List<Token>) -> Result<Parsed<Expr>, DbError> =
+fn parse_is(c: Parsed<Expression>, ts: List<Token>) -> Result<Parsed<Expression>, DbError> =
   if token_word(ts) == "null" { Ok(parsed(IsNull(c.value, true), rest_of(ts))) }
   else if token_word(ts) == "not" && token_word(rest_of(ts)) == "null" {
     Ok(parsed(IsNull(c.value, false), rest_of(rest_of(ts))))
   } else { Err(expected("`null` or `not null` after `is`", ts)) }
 
 fn parse_in(
-  c: Parsed<Expr>,
+  c: Parsed<Expression>,
   negated: Bool,
   ts: List<Token>,
   left: Int,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     let after = expect_symbol(ts, "(")?;
-    let items = parse_expr_list(after, [], left - 1)?;
+    let items = parse_expression_list(after, [], left - 1)?;
     Ok(parsed(InList(c.value, items.value, negated), items.rest))
   }
 
-fn parse_expr_list(
+fn parse_expression_list(
   ts: List<Token>,
-  acc: List<Expr>,
+  acc: List<Expression>,
   left: Int,
-) -> Result<Parsed<List<Expr>>, DbError> / {abort.raise} =
+) -> Result<Parsed<List<Expression>>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     let c = parse_or(ts, left - 1)?;
     let items = acc.push(c.value);
-    if token_symbol(c.rest) == "," { parse_expr_list(rest_of(c.rest), items, left - 1) } else {
+    if token_symbol(c.rest) == "," { parse_expression_list(rest_of(c.rest), items, left - 1) }
+    else {
       let after = expect_symbol(c.rest, ")")?;
       Ok(parsed(items, after))
     }
   }
 
 fn parse_between(
-  c: Parsed<Expr>,
+  c: Parsed<Expression>,
   negated: Bool,
   ts: List<Token>,
   left: Int,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     let lo = parse_primary(ts, left - 1)?;
     let after = expect_word(lo.rest, "and")?;
@@ -1402,24 +1414,27 @@ fn parse_between(
   }
 
 fn parse_like(
-  c: Parsed<Expr>,
+  c: Parsed<Expression>,
   negated: Bool,
   ts: List<Token>,
   left: Int,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     let p = parse_primary(ts, left - 1)?;
     if token_word(p.rest) == "escape" { Err(unsupported("`like ... escape`")) }
     else { Ok(parsed(Like(c.value, p.value, negated), p.rest)) }
   }
 
-fn parse_primary(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / {abort.raise} =
+fn parse_primary(
+  ts: List<Token>,
+  left: Int,
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} =
   if left <= 0 { panic("more calls than tokens allow") } else {
     match ts {
       [] -> Err(unsupported("the statement ended where a value was expected")),
       [ParameterToken(n), ..t] -> Ok(parsed(Placeholder(n), t)),
       [StringToken(s), ..t] -> Ok(parsed(LiteralValue(TextDatum(s)), t)),
-      [NumberToken(s), ..t] -> num_literal(s, false, t),
+      [NumberToken(s), ..t] -> number_literal(s, false, t),
       [QuotedToken(w), ..t] -> parse_column_tail(w, t),
       [SymbolToken(s), ..t] -> if s == "(" {
         let c = parse_or(t, left - 1)?;
@@ -1427,7 +1442,7 @@ fn parse_primary(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / 
         Ok(parsed(c.value, after))
       } else if s == "-" {
         match t {
-          [NumberToken(n), ..t2] -> num_literal(n, true, t2),
+          [NumberToken(n), ..t2] -> number_literal(n, true, t2),
           _ -> Err(expected("a number after `-`", t)),
         }
       } else { Err(expected("a value", ts)) },
@@ -1443,7 +1458,7 @@ fn parse_primary(ts: List<Token>, left: Int) -> Result<Parsed<Expr>, DbError> / 
     }
   }
 
-fn parse_column_tail(name: String, ts: List<Token>) -> Result<Parsed<Expr>, DbError> =
+fn parse_column_tail(name: String, ts: List<Token>) -> Result<Parsed<Expression>, DbError> =
   if token_symbol(ts) == "." {
     let c = parse_name(rest_of(ts))?;
     Ok(parsed(ColumnName(c.value), c.rest))
@@ -1451,11 +1466,11 @@ fn parse_column_tail(name: String, ts: List<Token>) -> Result<Parsed<Expr>, DbEr
   else { Ok(parsed(ColumnName(name), ts)) }
 
 /// A literal with a `.` is `numeric` and one without is `integer`, as in postgres.
-fn num_literal(
+fn number_literal(
   s: String,
   negative: Bool,
   ts: List<Token>,
-) -> Result<Parsed<Expr>, DbError> / {abort.raise} = {
+) -> Result<Parsed<Expression>, DbError> / {abort.raise} = {
   let text = if negative { "-" ++ s } else { s };
   if s.contains(".") {
     match Decimal::of_string(text) {
@@ -1553,9 +1568,9 @@ fn parse_alias(ts: List<Token>, dflt: String) -> Result<Parsed<String>, DbError>
     Ok(parsed(n.value, n.rest))
   } else { Ok(parsed(dflt, ts)) }
 
-fn parse_where(ts: List<Token>) -> Result<Parsed<Option<Expr>>, DbError> / {abort.raise} =
+fn parse_where(ts: List<Token>) -> Result<Parsed<Option<Expression>>, DbError> / {abort.raise} =
   if token_word(ts) == "where" {
-    let c = parse_or(rest_of(ts), expr_room(ts))?;
+    let c = parse_or(rest_of(ts), expression_room(ts))?;
     Ok(parsed(Some(c.value), c.rest))
   } else { Ok(parsed(None, ts)) }
 
@@ -1593,7 +1608,7 @@ fn parse_nulls(ts: List<Token>, desc: Bool) -> Result<Parsed<Bool>, DbError> =
     else { Err(expected("`first` or `last` after `nulls`", rest_of(ts))) }
   } else { Ok(parsed(desc, ts)) }
 
-type Slice = { limit: Option<Expr>, offset: Option<Expr> }
+type Slice = { limit: Option<Expression>, offset: Option<Expression> }
 
 fn parse_limit_offset(ts: List<Token>) -> Result<Parsed<Slice>, DbError> / {abort.raise} = {
   let l = parse_one_bound(ts, "limit")?;
@@ -1604,9 +1619,9 @@ fn parse_limit_offset(ts: List<Token>) -> Result<Parsed<Slice>, DbError> / {abor
 fn parse_one_bound(
   ts: List<Token>,
   word: String,
-) -> Result<Parsed<Option<Expr>>, DbError> / {abort.raise} =
+) -> Result<Parsed<Option<Expression>>, DbError> / {abort.raise} =
   if token_word(ts) == word {
-    let c = parse_primary(rest_of(ts), expr_room(ts))?;
+    let c = parse_primary(rest_of(ts), expression_room(ts))?;
     Ok(parsed(Some(c.value), c.rest))
   } else { Ok(parsed(None, ts)) }
 
@@ -1656,12 +1671,12 @@ fn parse_name_list(
 /// `left` limits the number of items, since each but the last takes a comma.
 fn parse_tuples(
   ts: List<Token>,
-  acc: List<List<Expr>>,
+  acc: List<List<Expression>>,
   left: Int,
-) -> Result<Parsed<List<List<Expr>>>, DbError> / {abort.raise} =
+) -> Result<Parsed<List<List<Expression>>>, DbError> / {abort.raise} =
   if left <= 0 { panic("more items than tokens") } else {
     let a = expect_symbol(ts, "(")?;
-    let c = parse_expr_list(a, [], expr_room(a))?;
+    let c = parse_expression_list(a, [], expression_room(a))?;
     let tuples = acc.push(c.value);
     if token_symbol(c.rest) == "," { parse_tuples(rest_of(c.rest), tuples, left - 1) }
     else { Ok(parsed(tuples, c.rest)) }
@@ -1702,7 +1717,7 @@ fn parse_assignments(
   if left <= 0 { panic("more items than tokens") } else {
     let n = parse_name(ts)?;
     let a = expect_symbol(n.rest, "=")?;
-    let v = parse_primary(a, expr_room(a))?;
+    let v = parse_primary(a, expression_room(a))?;
     let sets = acc.push({ column: n.value, value: v.value });
     if token_symbol(v.rest) == "," { parse_assignments(rest_of(v.rest), sets, left - 1) }
     else { Ok(parsed(sets, v.rest)) }
@@ -1757,7 +1772,7 @@ pub fn param_datum(p: Param) -> Datum =
     ArrayParameter(xs) -> ArrayDatum(xs.map(|x: Param| param_datum(x))),
   }
 
-fn eval_value(row: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
+fn eval_value(row: Row, ps: List<Param>, e: Expression) -> Result<Datum, DbError> / {abort.raise} =
   match e {
     Not(_) -> eval_bool_value(row, ps, e),
     And(_, _) -> eval_bool_value(row, ps, e),
@@ -1771,7 +1786,7 @@ fn eval_value(row: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {a
   }
 
 /// What a literal, a column or a parameter is; the rest are predicates.
-fn leaf_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} =
+fn leaf_value(r: Row, ps: List<Param>, e: Expression) -> Result<Datum, DbError> / {abort.raise} =
   match e {
     LiteralValue(v) -> Ok(v),
     ColumnName(n) -> match r.get(n) { None -> Err(undefined_column(n)), Some(v) -> Ok(v) },
@@ -1783,12 +1798,16 @@ fn leaf_value(r: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abo
     _ -> panic("a predicate is no leaf"),
   }
 
-fn eval_bool_value(row: Row, ps: List<Param>, e: Expr) -> Result<Datum, DbError> / {abort.raise} = {
+fn eval_bool_value(
+  row: Row,
+  ps: List<Param>,
+  e: Expression,
+) -> Result<Datum, DbError> / {abort.raise} = {
   let t = eval_pred(row, ps, e)?;
   Ok(match t { SqlTrue -> BoolDatum(true), SqlFalse -> BoolDatum(false), SqlUnknown -> NullDatum })
 }
 
-fn eval_pred(row: Row, ps: List<Param>, e: Expr) -> Result<SqlBool, DbError> / {abort.raise} =
+fn eval_pred(row: Row, ps: List<Param>, e: Expression) -> Result<SqlBool, DbError> / {abort.raise} =
   match e {
     Not(x) -> {
       let t = eval_pred(row, ps, x)?;
@@ -1821,7 +1840,7 @@ fn eval_pred(row: Row, ps: List<Param>, e: Expr) -> Result<SqlBool, DbError> / {
 fn eval_pred_of_value(
   row: Row,
   ps: List<Param>,
-  e: Expr,
+  e: Expression,
 ) -> Result<SqlBool, DbError> / {abort.raise} = {
   let v = leaf_value(row, ps, e)?;
   match v {
@@ -1836,8 +1855,8 @@ fn eval_compare(
   row: Row,
   ps: List<Param>,
   op: Comparison,
-  a: Expr,
-  b: Expr,
+  a: Expression,
+  b: Expression,
 ) -> Result<SqlBool, DbError> / {abort.raise} = {
   let av = eval_value(row, ps, a)?;
   let bv = eval_value(row, ps, b)?;
@@ -1861,8 +1880,8 @@ fn eval_compare(
 fn eval_in(
   row: Row,
   ps: List<Param>,
-  x: Expr,
-  items: List<Expr>,
+  x: Expression,
+  items: List<Expression>,
   negated: Bool,
 ) -> Result<SqlBool, DbError> / {abort.raise} = {
   let v = eval_value(row, ps, x)?;
@@ -1874,7 +1893,7 @@ fn in_scan(
   row: Row,
   ps: List<Param>,
   v: Datum,
-  items: List<Expr>,
+  items: List<Expression>,
   so_far: SqlBool,
 ) -> Result<SqlBool, DbError> / {abort.raise} =
   match items {
@@ -1892,9 +1911,9 @@ fn in_scan(
 fn eval_between(
   row: Row,
   ps: List<Param>,
-  x: Expr,
-  lo: Expr,
-  hi: Expr,
+  x: Expression,
+  lo: Expression,
+  hi: Expression,
   negated: Bool,
 ) -> Result<SqlBool, DbError> / {abort.raise} = {
   let a = eval_compare(row, ps, GreaterOrEqual, x, lo)?;
@@ -1905,8 +1924,8 @@ fn eval_between(
 fn eval_like(
   row: Row,
   ps: List<Param>,
-  x: Expr,
-  p: Expr,
+  x: Expression,
+  p: Expression,
   negated: Bool,
 ) -> Result<SqlBool, DbError> / {abort.raise} = {
   let xv = eval_value(row, ps, x)?;
@@ -2221,11 +2240,11 @@ fn coerce_elements(
 fn find_table(ts: List<MemTable>, name: String) -> Option<MemTable> =
   match ts {
     [] -> None,
-    [h, ..t] -> if h.def.name == name { Some(h) } else { find_table(t, name) },
+    [h, ..t] -> if h.definition.name == name { Some(h) } else { find_table(t, name) },
   }
 
 fn put_table(ts: List<MemTable>, mt: MemTable) -> List<MemTable> =
-  ts.map(|x: MemTable| if x.def.name == mt.def.name { mt } else { x })
+  ts.map(|x: MemTable| if x.definition.name == mt.definition.name { mt } else { x })
 
 fn find_column(cs: List<Column>, n: String) -> Option<Column> =
   match cs { [] -> None, [h, ..t] -> if h.name == n { Some(h) } else { find_column(t, n) } }
@@ -2238,44 +2257,45 @@ fn index_from(xs: List<String>, s: String, i: Int) -> Option<Int> =
 fn cell_of(r: Row, n: String) -> Datum = match r.get(n) { None -> NullDatum, Some(v) -> v }
 
 /// A primary key column is not-null whether or not the schema says so.
-fn not_null_here(def: Table, c: Column) -> Bool = !c.nullable || def.primary_key.contains(c.name)
+fn not_null_here(definition: Table, c: Column) -> Bool =
+  !c.nullable || definition.primary_key.contains(c.name)
 
 /// Postgres's order: not-null, check, unique; referential integrity runs after the statement.
 fn validate_row(
-  def: Table,
+  definition: Table,
   rows: List<Row>,
   row: Row,
   skip: Int,
 ) -> Option<DbError> / {abort.raise} =
-  match check_not_null(def, def.columns, row) {
+  match check_not_null(definition, definition.columns, row) {
     Some(e) -> Some(e),
-    None -> match check_checks(def, def.checks, row) {
+    None -> match check_checks(definition, definition.checks, row) {
       Some(e) -> Some(e),
-      None -> check_unique(def, rows, row, skip),
+      None -> check_unique(definition, rows, row, skip),
     },
   }
 
-fn check_not_null(def: Table, cs: List<Column>, row: Row) -> Option<DbError> =
+fn check_not_null(definition: Table, cs: List<Column>, row: Row) -> Option<DbError> =
   match cs {
     [] -> None,
-    [c, ..t] -> if not_null_here(def, c) && is_null(cell_of(row, c.name)) {
+    [c, ..t] -> if not_null_here(definition, c) && is_null(cell_of(row, c.name)) {
       // Postgres names a column here and no constraint.
       Some(
         db_error(
           "23502",
           "",
-          "null value in column \"" ++ c.name ++ "\" of relation \"" ++ def.name
+          "null value in column \"" ++ c.name ++ "\" of relation \"" ++ definition.name
             ++ "\" violates not-null constraint",
         ),
       )
-    } else { check_not_null(def, t, row) },
+    } else { check_not_null(definition, t, row) },
   }
 
 /// A `CHECK` fails only when false and passes when unknown, the opposite of a `WHERE`.
-fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> / {abort.raise} =
+fn check_checks(definition: Table, cs: List<Check>, row: Row) -> Option<DbError> / {abort.raise} =
   match cs {
     [] -> None,
-    [c, ..t] -> match parse_expr_text(c.expr) {
+    [c, ..t] -> match parse_expression_text(c.expression) {
       Err(e) -> Some(e),
       Ok(x) -> match eval_pred(row, [], x) {
         Err(e) -> Some(e),
@@ -2284,23 +2304,31 @@ fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> / {abo
             db_error(
               "23514",
               c.name,
-              "new row for relation \"" ++ def.name ++ "\" violates check constraint \"" ++ c.name
+              "new row for relation \"" ++ definition.name ++ "\" violates check constraint \""
+                ++ c.name
                 ++ "\"",
             ),
           ),
-        Ok(_) -> check_checks(def, t, row),
+        Ok(_) -> check_checks(definition, t, row),
       },
     },
   }
 
-fn check_unique(def: Table, rows: List<Row>, row: Row, skip: Int) -> Option<DbError> =
-  match unique_violation(def, rows, row, skip, def.primary_key, def.name ++ "_pkey") {
+fn check_unique(definition: Table, rows: List<Row>, row: Row, skip: Int) -> Option<DbError> =
+  match unique_violation(
+      definition,
+      rows,
+      row,
+      skip,
+      definition.primary_key,
+      definition.name ++ "_pkey",
+    ) {
     Some(e) -> Some(e),
-    None -> check_unique_list(def, def.unique, rows, row, skip),
+    None -> check_unique_list(definition, definition.unique, rows, row, skip),
   }
 
 fn check_unique_list(
-  def: Table,
+  definition: Table,
   us: List<Unique>,
   rows: List<Row>,
   row: Row,
@@ -2308,15 +2336,15 @@ fn check_unique_list(
 ) -> Option<DbError> =
   match us {
     [] -> None,
-    [u, ..t] -> match unique_violation(def, rows, row, skip, u.columns, u.name) {
+    [u, ..t] -> match unique_violation(definition, rows, row, skip, u.columns, u.name) {
       Some(e) -> Some(e),
-      None -> check_unique_list(def, t, rows, row, skip),
+      None -> check_unique_list(definition, t, rows, row, skip),
     },
   }
 
 /// Two NULLs are distinct in a unique index, so a key with any NULL in it never collides.
 fn unique_violation(
-  def: Table,
+  definition: Table,
   rows: List<Row>,
   row: Row,
   skip: Int,
@@ -2349,7 +2377,7 @@ fn check_referential(ts: List<MemTable>) -> Option<DbError> = check_ref_from(ts,
 fn check_ref_from(all: List<MemTable>, ts: List<MemTable>) -> Option<DbError> =
   match ts {
     [] -> None,
-    [h, ..t] -> match check_table_fks(all, h, h.def.foreign_keys) {
+    [h, ..t] -> match check_table_fks(all, h, h.definition.foreign_keys) {
       Some(e) -> Some(e),
       None -> check_ref_from(all, t),
     },
@@ -2404,7 +2432,7 @@ fn fk_pairs(parent: Row, child: Row, cs: List<String>, rs: List<String>) -> Bool
 // --- Executing a statement -------------------------------------------------------
 
 /// The result's shape follows the statement: a `RETURNING` returns `Rows` and a bare write `Count`.
-pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> Outcome / {abort.raise} =
+pub fn step(d: MemDb, s: Statement, ps: List<Param>) -> Outcome / {abort.raise} =
   if d.failed { fail(d, in_failed_txn()) }
   else { match parse_statement(s.sql) { Err(e) -> fail(d, e), Ok(q) -> exec(d, q, ps) } }
 
@@ -2428,20 +2456,20 @@ fn read_only(db: MemDb) -> Bool =
 
 // --- The plan --------------------------------------------------------------------
 
-type Operands = { left: Expr, right: Expr }
+type Operands = { left: Expression, right: Expression }
 
-fn plan_filter(def: Table, f: Option<Expr>) -> Result<Option<Expr>, DbError> =
+fn plan_filter(definition: Table, f: Option<Expression>) -> Result<Option<Expression>, DbError> =
   match f {
     None -> Ok(None),
     Some(e) -> {
-      let x = plan_expr(def, e)?;
+      let x = plan_expression(definition, e)?;
       Ok(Some(x))
     },
   }
 
-fn plan_expr(def: Table, e: Expr) -> Result<Expr, DbError> =
+fn plan_expression(definition: Table, e: Expression) -> Result<Expression, DbError> =
   match e {
-    ColumnName(n) -> match find_column(def.columns, n) {
+    ColumnName(n) -> match find_column(definition.columns, n) {
       None -> Err(undefined_column(n)),
       Some(_) -> Ok(e),
     },
@@ -2449,59 +2477,59 @@ fn plan_expr(def: Table, e: Expr) -> Result<Expr, DbError> =
     LiteralValue(_) -> Ok(e),
     DefaultKeyword -> Ok(e),
     Not(x) -> {
-      let a = plan_expr(def, x)?;
+      let a = plan_expression(definition, x)?;
       Ok(Not(a))
     },
     And(a, b) -> {
-      let pa = plan_expr(def, a)?;
-      let pb = plan_expr(def, b)?;
+      let pa = plan_expression(definition, a)?;
+      let pb = plan_expression(definition, b)?;
       Ok(And(pa, pb))
     },
     Or(a, b) -> {
-      let pa = plan_expr(def, a)?;
-      let pb = plan_expr(def, b)?;
+      let pa = plan_expression(definition, a)?;
+      let pb = plan_expression(definition, b)?;
       Ok(Or(pa, pb))
     },
     Compare(op, a, b) -> {
-      let p = plan_operands(def, a, b)?;
+      let p = plan_operands(definition, a, b)?;
       Ok(Compare(op, p.left, p.right))
     },
     IsNull(x, want) -> {
-      let a = plan_expr(def, x)?;
+      let a = plan_expression(definition, x)?;
       Ok(IsNull(a, want))
     },
     InList(x, items, negated) -> {
-      let px = plan_expr(def, x)?;
-      let pis = plan_items(def, column_type_of(def, px), items, [])?;
+      let px = plan_expression(definition, x)?;
+      let pis = plan_items(definition, column_type_of(definition, px), items, [])?;
       Ok(InList(px, pis, negated))
     },
     Between(x, lo, hi, negated) -> {
-      let a = plan_operands(def, x, lo)?;
-      let ph = plan_expr(def, hi)?;
-      let b = paired(def, a.left, ph)?;
+      let a = plan_operands(definition, x, lo)?;
+      let ph = plan_expression(definition, hi)?;
+      let b = paired(definition, a.left, ph)?;
       Ok(Between(b.left, a.right, b.right, negated))
     },
     Like(x, p, negated) -> {
-      let px = plan_expr(def, x)?;
-      let pp = plan_expr(def, p)?;
+      let px = plan_expression(definition, x)?;
+      let pp = plan_expression(definition, p)?;
       Ok(Like(px, pp, negated))
     },
   }
 
-fn plan_operands(def: Table, a: Expr, b: Expr) -> Result<Operands, DbError> = {
-  let pa = plan_expr(def, a)?;
-  let pb = plan_expr(def, b)?;
-  paired(def, pa, pb)
+fn plan_operands(definition: Table, a: Expression, b: Expression) -> Result<Operands, DbError> = {
+  let pa = plan_expression(definition, a)?;
+  let pb = plan_expression(definition, b)?;
+  paired(definition, pa, pb)
 }
 
 /// Two planned operands, where an `unknown` literal takes its type from the column on the other side.
-fn paired(def: Table, pa: Expr, pb: Expr) -> Result<Operands, DbError> =
-  match column_type_of(def, pa) {
+fn paired(definition: Table, pa: Expression, pb: Expression) -> Result<Operands, DbError> =
+  match column_type_of(definition, pa) {
     Some(ty) -> {
       let nb = retype(ty, pb)?;
       Ok({ left: pa, right: nb })
     },
-    None -> match column_type_of(def, pb) {
+    None -> match column_type_of(definition, pb) {
       Some(ty) -> {
         let na = retype(ty, pa)?;
         Ok({ left: na, right: pb })
@@ -2511,36 +2539,36 @@ fn paired(def: Table, pa: Expr, pb: Expr) -> Result<Operands, DbError> =
   }
 
 fn plan_items(
-  def: Table,
+  definition: Table,
   ty: Option<ColumnType>,
-  items: List<Expr>,
-  acc: List<Expr>,
-) -> Result<List<Expr>, DbError> =
+  items: List<Expression>,
+  acc: List<Expression>,
+) -> Result<List<Expression>, DbError> =
   match items {
     [] -> Ok(acc),
     [h, ..t] -> {
-      let ph = plan_expr(def, h)?;
+      let ph = plan_expression(definition, h)?;
       match ty {
-        None -> plan_items(def, ty, t, acc.push(ph)),
+        None -> plan_items(definition, ty, t, acc.push(ph)),
         Some(want) -> {
           let rh = retype(want, ph)?;
-          plan_items(def, ty, t, acc.push(rh))
+          plan_items(definition, ty, t, acc.push(rh))
         },
       }
     },
   }
 
-fn column_type_of(def: Table, e: Expr) -> Option<ColumnType> =
+fn column_type_of(definition: Table, e: Expression) -> Option<ColumnType> =
   match e {
     ColumnName(n) -> {
-      let c = find_column(def.columns, n)?;
+      let c = find_column(definition.columns, n)?;
       Some(c.ty)
     },
     _ -> None,
   }
 
 /// Only a string literal is `unknown`; a parameter and any other literal carry their own type.
-fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
+fn retype(ty: ColumnType, e: Expression) -> Result<Expression, DbError> =
   match e {
     LiteralValue(v) -> match v {
       TextDatum(s) -> match ty {
@@ -2556,27 +2584,31 @@ fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
   }
 
 /// Duplicate output names and unknown columns are the statement's shape, so they are rejected here.
-fn check_projection(def: Table, proj: Projection) -> Option<DbError> =
+fn check_projection(definition: Table, proj: Projection) -> Option<DbError> =
   match proj {
     StarProjection -> None,
     CountProjection(_) -> None,
-    ColumnProjection(ns) -> check_result_columns(def, ns, []),
+    ColumnProjection(ns) -> check_result_columns(definition, ns, []),
   }
 
-fn check_result_columns(def: Table, ns: List<Target>, seen: List<String>) -> Option<DbError> =
+fn check_result_columns(
+  definition: Table,
+  ns: List<Target>,
+  seen: List<String>,
+) -> Option<DbError> =
   match ns {
     [] -> None,
-    [h, ..t] -> match find_column(def.columns, h.column) {
+    [h, ..t] -> match find_column(definition.columns, h.column) {
       None -> Some(undefined_column(h.column)),
       Some(_) -> if seen.contains(h.name) {
         Some(unsupported("a result set with two columns named `" ++ h.name ++ "`"))
-      } else { check_result_columns(def, t, seen.push(h.name)) },
+      } else { check_result_columns(definition, t, seen.push(h.name)) },
     },
   }
 
-fn check_returning(def: Table, r: Option<Projection>) -> Option<DbError> = {
+fn check_returning(definition: Table, r: Option<Projection>) -> Option<DbError> = {
   let p = r?;
-  check_projection(def, p)
+  check_projection(definition, p)
 }
 
 // --- select ----------------------------------------------------------------------
@@ -2584,7 +2616,7 @@ fn check_returning(def: Table, r: Option<Projection>) -> Option<DbError> = {
 fn exec_select(db: MemDb, q: SelectQuery, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(db.tables, q.source) {
     None -> fail(db, undefined_table(q.source)),
-    Some(mt) -> match plan_select(mt.def, q) {
+    Some(mt) -> match plan_select(mt.definition, q) {
       Err(e) -> fail(db, e),
       Ok(planned) -> match select_rows(mt.rows, ps, planned.filter, []) {
         Err(e) -> fail(db, e),
@@ -2593,13 +2625,13 @@ fn exec_select(db: MemDb, q: SelectQuery, ps: List<Param>) -> Outcome / {abort.r
     },
   }
 
-fn plan_select(def: Table, q: SelectQuery) -> Result<SelectQuery, DbError> =
-  match check_projection(def, q.proj) {
+fn plan_select(definition: Table, q: SelectQuery) -> Result<SelectQuery, DbError> =
+  match check_projection(definition, q.proj) {
     Some(e) -> Err(e),
-    None -> match check_order_columns(def, q.order) {
+    None -> match check_order_columns(definition, q.order) {
       Some(e) -> Err(e),
       None -> {
-        let f = plan_filter(def, q.filter)?;
+        let f = plan_filter(definition, q.filter)?;
         Ok({
           source: q.source,
           proj: q.proj,
@@ -2615,7 +2647,7 @@ fn plan_select(def: Table, q: SelectQuery) -> Result<SelectQuery, DbError> =
 fn select_rows(
   rows: List<Row>,
   ps: List<Param>,
-  filter: Option<Expr>,
+  filter: Option<Expression>,
   acc: List<Row>,
 ) -> Result<List<Row>, DbError> / {abort.raise} =
   match rows {
@@ -2626,7 +2658,11 @@ fn select_rows(
     },
   }
 
-fn keeps(row: Row, ps: List<Param>, filter: Option<Expr>) -> Result<Bool, DbError> / {abort.raise} =
+fn keeps(
+  row: Row,
+  ps: List<Param>,
+  filter: Option<Expression>,
+) -> Result<Bool, DbError> / {abort.raise} =
   match filter {
     None -> Ok(true),
     Some(e) -> {
@@ -2650,7 +2686,7 @@ fn finish_select(
     ColumnProjection(ns) -> ordered_slice(db, mt, q, ps, rows, ColumnProjection(ns)),
   }
 
-fn is_bound(e: Option<Expr>) -> Bool = match e { None -> false, Some(_) -> true }
+fn is_bound(e: Option<Expression>) -> Bool = match e { None -> false, Some(_) -> true }
 
 fn ordered_slice(
   db: MemDb,
@@ -2660,7 +2696,7 @@ fn ordered_slice(
   rows: List<Row>,
   proj: Projection,
 ) -> Outcome / {abort.raise} =
-  match check_order_columns(mt.def, q.order) {
+  match check_order_columns(mt.definition, q.order) {
     Some(e) -> fail(db, e),
     None -> match sort_rows(rows, q.order, []) {
       Err(e) -> fail(db, e),
@@ -2668,12 +2704,12 @@ fn ordered_slice(
     },
   }
 
-fn check_order_columns(def: Table, keys: List<OrderKey>) -> Option<DbError> =
+fn check_order_columns(definition: Table, keys: List<OrderKey>) -> Option<DbError> =
   match keys {
     [] -> None,
-    [k, ..t] -> match find_column(def.columns, k.column) {
+    [k, ..t] -> match find_column(definition.columns, k.column) {
       None -> Some(undefined_column(k.column)),
-      Some(_) -> check_order_columns(def, t),
+      Some(_) -> check_order_columns(definition, t),
     },
   }
 
@@ -2701,7 +2737,7 @@ fn slice_and_project(
 
 fn eval_bound(
   ps: List<Param>,
-  e: Option<Expr>,
+  e: Option<Expression>,
   dflt: Int,
   code: String,
   what: String,
@@ -2801,7 +2837,7 @@ fn project_cols(row: Row, ns: List<Target>, acc: Row) -> Result<Row, DbError> =
 
 // --- insert ----------------------------------------------------------------------
 
-type RowAcc = { sequences: Map<String, Int>, row: Row, err: Option<DbError> }
+type RowAccumulator = { sequences: Map<String, Int>, row: Row, err: Option<DbError> }
 
 type Build = { sequences: Map<String, Int>, rows: List<Row>, err: Option<DbError> }
 
@@ -2809,11 +2845,11 @@ fn exec_insert(db: MemDb, q: InsertQuery, ps: List<Param>) -> Outcome / {abort.r
   match find_table(db.tables, q.source) {
     None -> fail(db, undefined_table(q.source)),
     Some(mt) -> {
-      let cols = if q.columns.len() == 0 { mt.def.columns.map(|c: Column| c.name) }
+      let cols = if q.columns.len() == 0 { mt.definition.columns.map(|c: Column| c.name) }
       else { q.columns };
-      match check_column_list(mt.def, cols, []) {
+      match check_column_list(mt.definition, cols, []) {
         Some(e) -> fail(db, e),
-        None -> match check_returning(mt.def, q.returning) {
+        None -> match check_returning(mt.definition, q.returning) {
           Some(e) -> fail(db, e),
           None -> insert_build(db, mt, cols, q, ps),
         },
@@ -2821,14 +2857,14 @@ fn exec_insert(db: MemDb, q: InsertQuery, ps: List<Param>) -> Outcome / {abort.r
     },
   }
 
-fn check_column_list(def: Table, cols: List<String>, seen: List<String>) -> Option<DbError> =
+fn check_column_list(definition: Table, cols: List<String>, seen: List<String>) -> Option<DbError> =
   match cols {
     [] -> None,
-    [h, ..t] -> match find_column(def.columns, h) {
+    [h, ..t] -> match find_column(definition.columns, h) {
       None -> Some(undefined_column(h)),
       Some(_) -> if seen.contains(h) {
         Some(db_error("42701", "", "column \"" ++ h ++ "\" specified more than once"))
-      } else { check_column_list(def, t, seen.push(h)) },
+      } else { check_column_list(definition, t, seen.push(h)) },
     },
   }
 
@@ -2843,22 +2879,23 @@ fn insert_build(
 ) -> Outcome / {abort.raise} = {
   let b = q.tuples.fold(
     { sequences: db.sequences, rows: [], err: None },
-    |acc: Build, exprs: List<Expr>| build_tuple(mt.def, cols, exprs, ps, acc),
+    |acc: Build, expressions: List<Expression>|
+      build_tuple(mt.definition, cols, expressions, ps, acc),
   );
   let advanced = memdb(db, db.tables, b.sequences, db.stack, db.failed);
   match b.err { Some(e) -> fail(advanced, e), None -> insert_rows(advanced, mt, b.rows, q) }
 }
 
 fn build_tuple(
-  def: Table,
+  definition: Table,
   cols: List<String>,
-  exprs: List<Expr>,
+  expressions: List<Expression>,
   ps: List<Param>,
   acc: Build,
 ) -> Build / {abort.raise} =
   match acc.err {
     Some(_) -> acc,
-    None -> if exprs.len() != cols.len() {
+    None -> if expressions.len() != cols.len() {
       {
         sequences: acc.sequences,
         rows: acc.rows,
@@ -2866,14 +2903,14 @@ fn build_tuple(
           db_error(
             "42601",
             "",
-            "INSERT has " ++ (if exprs.len() > cols.len() { "more" } else { "fewer" })
+            "INSERT has " ++ (if expressions.len() > cols.len() { "more" } else { "fewer" })
               ++ " expressions than target columns",
           ),
         ),
       }
     } else {
       collect_tuple(
-        build_columns(def, def.columns, cols, exprs, ps, {
+        build_columns(definition, definition.columns, cols, expressions, ps, {
           sequences: acc.sequences,
           row: Map::new(),
           err: None,
@@ -2883,38 +2920,46 @@ fn build_tuple(
     },
   }
 
-fn collect_tuple(built: RowAcc, acc: Build) -> Build =
+fn collect_tuple(built: RowAccumulator, acc: Build) -> Build =
   match built.err {
     Some(e) -> { sequences: built.sequences, rows: acc.rows, err: Some(e) },
     None -> { sequences: built.sequences, rows: acc.rows.push(built.row), err: None },
   }
 
 fn build_columns(
-  def: Table,
+  definition: Table,
   cs: List<Column>,
   cols: List<String>,
-  exprs: List<Expr>,
+  expressions: List<Expression>,
   ps: List<Param>,
-  acc: RowAcc,
-) -> RowAcc / {abort.raise} =
+  acc: RowAccumulator,
+) -> RowAccumulator / {abort.raise} =
   match cs {
     [] -> acc,
     [c, ..rest] -> match acc.err {
       Some(_) -> acc,
-      None -> build_columns(def, rest, cols, exprs, ps, build_column(c, cols, exprs, ps, acc)),
+      None ->
+        build_columns(
+          definition,
+          rest,
+          cols,
+          expressions,
+          ps,
+          build_column(c, cols, expressions, ps, acc),
+        ),
     },
   }
 
 fn build_column(
   c: Column,
   cols: List<String>,
-  exprs: List<Expr>,
+  expressions: List<Expression>,
   ps: List<Param>,
-  acc: RowAcc,
-) -> RowAcc / {abort.raise} =
+  acc: RowAccumulator,
+) -> RowAccumulator / {abort.raise} =
   match index_of(cols, c.name) {
     None -> default_into(c, acc),
-    Some(i) -> match exprs.at(i) {
+    Some(i) -> match expressions.at(i) {
       None -> default_into(c, acc),
       Some(e) -> match e {
         DefaultKeyword -> default_into(c, acc),
@@ -2923,14 +2968,14 @@ fn build_column(
     },
   }
 
-fn is_param(e: Expr) -> Bool = match e { Placeholder(_) -> true, _ -> false }
+fn is_param(e: Expression) -> Bool = match e { Placeholder(_) -> true, _ -> false }
 
 fn store_value(
   c: Column,
   r: Result<Datum, DbError>,
   from_param: Bool,
-  acc: RowAcc,
-) -> RowAcc / {abort.raise} =
+  acc: RowAccumulator,
+) -> RowAccumulator / {abort.raise} =
   match r {
     Err(e) -> { sequences: acc.sequences, row: acc.row, err: Some(e) },
     Ok(v) -> match coerce(c, c.ty, v, from_param) {
@@ -2939,7 +2984,7 @@ fn store_value(
     },
   }
 
-fn default_into(c: Column, acc: RowAcc) -> RowAcc / {abort.raise} =
+fn default_into(c: Column, acc: RowAccumulator) -> RowAccumulator / {abort.raise} =
   match c.default {
     DNone -> { sequences: acc.sequences, row: acc.row.insert(c.name, NullDatum), err: None },
     LiteralDefault(p) -> store_value(c, Ok(param_datum(p)), false, acc),
@@ -2979,9 +3024,9 @@ fn insert_rows(
 fn append_rows(mt: MemTable, rows: List<Row>) -> Result<MemTable, DbError> / {abort.raise} =
   match rows {
     [] -> Ok(mt),
-    [h, ..t] -> match validate_row(mt.def, mt.rows, h, -1) {
+    [h, ..t] -> match validate_row(mt.definition, mt.rows, h, -1) {
       Some(e) -> Err(e),
-      None -> append_rows({ def: mt.def, rows: mt.rows.push(h) }, t),
+      None -> append_rows({ definition: mt.definition, rows: mt.rows.push(h) }, t),
     },
   }
 
@@ -2998,15 +3043,15 @@ fn finish_write(db: MemDb, rows: List<Row>, returning: Option<Projection>, count
 
 type ChangedRow = { at: Int, row: Row }
 
-type UpAcc = { rows: List<Row>, changed: List<ChangedRow>, at: Int, err: Option<DbError> }
+type UpAccumulator = { rows: List<Row>, changed: List<ChangedRow>, at: Int, err: Option<DbError> }
 
 fn exec_update(db: MemDb, q: UpdateQuery, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(db.tables, q.source) {
     None -> fail(db, undefined_table(q.source)),
-    Some(mt) -> match plan_update(mt.def, q, ps) {
+    Some(mt) -> match plan_update(mt.definition, q, ps) {
       Err(e) -> fail(db, e),
       Ok(planned) -> {
-        let acc = update_rows(mt.def, mt.rows, planned, ps, {
+        let acc = update_rows(mt.definition, mt.rows, planned, ps, {
           rows: [],
           changed: [],
           at: 0,
@@ -3018,16 +3063,16 @@ fn exec_update(db: MemDb, q: UpdateQuery, ps: List<Param>) -> Outcome / {abort.r
   }
 
 fn plan_update(
-  def: Table,
+  definition: Table,
   q: UpdateQuery,
   ps: List<Param>,
 ) -> Result<UpdateQuery, DbError> / {abort.raise} =
-  match check_returning(def, q.returning) {
+  match check_returning(definition, q.returning) {
     Some(e) -> Err(e),
-    None -> match constant_sets(def, q.sets, ps) {
+    None -> match constant_sets(definition, q.sets, ps) {
       Some(e) -> Err(e),
       None -> {
-        let f = plan_filter(def, q.filter)?;
+        let f = plan_filter(definition, q.filter)?;
         Ok({ source: q.source, sets: q.sets, filter: f, returning: q.returning })
       },
     },
@@ -3035,25 +3080,25 @@ fn plan_update(
 
 /// A constant `set` is coerced at plan time, so one that cannot fit fails even when no row matches.
 fn constant_sets(
-  def: Table,
+  definition: Table,
   sets: List<Assignment>,
   ps: List<Param>,
 ) -> Option<DbError> / {abort.raise} =
   match sets {
     [] -> None,
-    [s, ..t] -> match find_column(def.columns, s.column) {
+    [s, ..t] -> match find_column(definition.columns, s.column) {
       None -> Some(undefined_column(s.column)),
       Some(c) -> match constant_of(s.value, ps) {
-        None -> constant_sets(def, t, ps),
+        None -> constant_sets(definition, t, ps),
         Some(v) -> match coerce(c, c.ty, v, is_param(s.value)) {
           Err(e) -> Some(e),
-          Ok(_) -> constant_sets(def, t, ps),
+          Ok(_) -> constant_sets(definition, t, ps),
         },
       },
     },
   }
 
-fn constant_of(e: Expr, ps: List<Param>) -> Option<Datum> =
+fn constant_of(e: Expression, ps: List<Param>) -> Option<Datum> =
   match e {
     LiteralValue(v) -> Some(v),
     Placeholder(n) -> {
@@ -3064,41 +3109,41 @@ fn constant_of(e: Expr, ps: List<Param>) -> Option<Datum> =
   }
 
 fn update_rows(
-  def: Table,
+  definition: Table,
   rows: List<Row>,
   q: UpdateQuery,
   ps: List<Param>,
-  acc: UpAcc,
-) -> UpAcc / {abort.raise} =
+  acc: UpAccumulator,
+) -> UpAccumulator / {abort.raise} =
   match rows {
     [] -> acc,
     [h, ..t] -> match acc.err {
       Some(_) -> acc,
-      None -> update_rows(def, t, q, ps, update_one(def, h, q, ps, acc)),
+      None -> update_rows(definition, t, q, ps, update_one(definition, h, q, ps, acc)),
     },
   }
 
 fn update_one(
-  def: Table,
+  definition: Table,
   row: Row,
   q: UpdateQuery,
   ps: List<Param>,
-  acc: UpAcc,
-) -> UpAcc / {abort.raise} =
+  acc: UpAccumulator,
+) -> UpAccumulator / {abort.raise} =
   match keeps(row, ps, q.filter) {
     Err(e) -> { rows: acc.rows, changed: acc.changed, at: acc.at, err: Some(e) },
-    Ok(hit) -> if hit { update_matching_row(def, row, q, ps, acc) }
+    Ok(hit) -> if hit { update_matching_row(definition, row, q, ps, acc) }
     else { { rows: acc.rows.push(row), changed: acc.changed, at: acc.at + 1, err: None } },
   }
 
 fn update_matching_row(
-  def: Table,
+  definition: Table,
   row: Row,
   q: UpdateQuery,
   ps: List<Param>,
-  acc: UpAcc,
-) -> UpAcc / {abort.raise} =
-  match apply_sets(def, row, q.sets, ps) {
+  acc: UpAccumulator,
+) -> UpAccumulator / {abort.raise} =
+  match apply_sets(definition, row, q.sets, ps) {
     Err(e) -> { rows: acc.rows, changed: acc.changed, at: acc.at, err: Some(e) },
     Ok(nr) ->
       {
@@ -3110,18 +3155,18 @@ fn update_matching_row(
   }
 
 fn apply_sets(
-  def: Table,
+  definition: Table,
   row: Row,
   sets: List<Assignment>,
   ps: List<Param>,
 ) -> Result<Row, DbError> / {abort.raise} =
   match sets {
     [] -> Ok(row),
-    [s, ..t] -> match find_column(def.columns, s.column) {
+    [s, ..t] -> match find_column(definition.columns, s.column) {
       None -> Err(undefined_column(s.column)),
       Some(c) -> {
         let nr = set_value(c, row, s.value, ps)?;
-        apply_sets(def, nr, t, ps)
+        apply_sets(definition, nr, t, ps)
       },
     },
   }
@@ -3130,7 +3175,7 @@ fn apply_sets(
 fn set_value(
   c: Column,
   row: Row,
-  e: Expr,
+  e: Expression,
   ps: List<Param>,
 ) -> Result<Row, DbError> / {abort.raise} =
   match e {
@@ -3149,11 +3194,16 @@ fn set_value(
     },
   }
 
-fn finish_update(db: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQuery) -> Outcome / {abort.raise} =
-  match validate_changed(mt.def, acc.rows, acc.changed) {
+fn finish_update(
+  db: MemDb,
+  mt: MemTable,
+  acc: UpAccumulator,
+  q: UpdateQuery,
+) -> Outcome / {abort.raise} =
+  match validate_changed(mt.definition, acc.rows, acc.changed) {
     Some(e) -> fail(db, e),
     None -> {
-      let tables = put_table(db.tables, { def: mt.def, rows: acc.rows });
+      let tables = put_table(db.tables, { definition: mt.definition, rows: acc.rows });
       match check_referential(tables) {
         Some(e) -> fail(db, e),
         None ->
@@ -3168,33 +3218,33 @@ fn finish_update(db: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQuery) -> Outcome
   }
 
 fn validate_changed(
-  def: Table,
+  definition: Table,
   rows: List<Row>,
   cs: List<ChangedRow>,
 ) -> Option<DbError> / {abort.raise} =
   match cs {
     [] -> None,
-    [h, ..t] -> match validate_row(def, rows, h.row, h.at) {
+    [h, ..t] -> match validate_row(definition, rows, h.row, h.at) {
       Some(e) -> Some(e),
-      None -> validate_changed(def, rows, t),
+      None -> validate_changed(definition, rows, t),
     },
   }
 
 // --- delete ----------------------------------------------------------------------
 
-type DelAcc = { rows: List<Row>, gone: List<Row>, err: Option<DbError> }
+type DelAccumulator = { rows: List<Row>, gone: List<Row>, err: Option<DbError> }
 
 fn exec_delete(db: MemDb, q: DeleteQuery, ps: List<Param>) -> Outcome / {abort.raise} =
   match find_table(db.tables, q.source) {
     None -> fail(db, undefined_table(q.source)),
-    Some(mt) -> match plan_delete(mt.def, q) {
+    Some(mt) -> match plan_delete(mt.definition, q) {
       Err(e) -> fail(db, e),
       Ok(q) -> {
         let acc = delete_rows(mt.rows, q, ps, { rows: [], gone: [], err: None });
         match acc.err {
           Some(e) -> fail(db, e),
           None -> {
-            let tables = put_table(db.tables, { def: mt.def, rows: acc.rows });
+            let tables = put_table(db.tables, { definition: mt.definition, rows: acc.rows });
             match check_referential(tables) {
               Some(e) -> fail(db, e),
               None ->
@@ -3211,11 +3261,11 @@ fn exec_delete(db: MemDb, q: DeleteQuery, ps: List<Param>) -> Outcome / {abort.r
     },
   }
 
-fn plan_delete(def: Table, q: DeleteQuery) -> Result<DeleteQuery, DbError> =
-  match check_returning(def, q.returning) {
+fn plan_delete(definition: Table, q: DeleteQuery) -> Result<DeleteQuery, DbError> =
+  match check_returning(definition, q.returning) {
     Some(e) -> Err(e),
     None -> {
-      let f = plan_filter(def, q.filter)?;
+      let f = plan_filter(definition, q.filter)?;
       Ok({ source: q.source, filter: f, returning: q.returning })
     },
   }
@@ -3224,8 +3274,8 @@ fn delete_rows(
   rows: List<Row>,
   q: DeleteQuery,
   ps: List<Param>,
-  acc: DelAcc,
-) -> DelAcc / {abort.raise} =
+  acc: DelAccumulator,
+) -> DelAccumulator / {abort.raise} =
   match rows {
     [] -> acc,
     [h, ..t] -> match acc.err {
@@ -3471,7 +3521,7 @@ fn test_part() -> Table =
     primary_key: ["sku"],
     unique: [{ name: "part_tag_key", columns: ["tag"] }],
     foreign_keys: [],
-    checks: [{ name: "part_price_check", expr: "price >= 0" }],
+    checks: [{ name: "part_price_check", expression: "price >= 0" }],
   }
 
 fn test_bin() -> Table =
@@ -3487,7 +3537,7 @@ fn test_bin() -> Table =
     foreign_keys: [
       { name: "bin_sku_fkey", columns: ["sku"], references: "part", refers_to: ["sku"] },
     ],
-    checks: [{ name: "bin_qty_check", expr: "qty >= 0" }],
+    checks: [{ name: "bin_qty_check", expression: "qty >= 0" }],
   }
 
 fn test_run(db: MemDb, sql: String, ps: List<Param>) -> Outcome / {abort.raise} =
@@ -3537,7 +3587,7 @@ fn test_count(a: QueryResult) -> Int =
   }
 
 test "create_schema renders one statement per table and one per sequence" {
-  let sqls = create_schema(test_schema()).map(|s: Stmt| s.sql);
+  let sqls = create_schema(test_schema()).map(|s: Statement| s.sql);
   assert_eq(sqls.len(), 3);
   assert_eq(sqls.at(0), Some("create sequence \"bin_id_seq\""));
   assert_eq(
@@ -4521,7 +4571,7 @@ type StatementResult = { session: pg::Session, result: QueryResult }
 /// text rather than on the call's label, so a join reaches tables the label never named. The
 /// scheduler records the label's atom, so the label must be one of the statement's tables.
 fn check_statement(
-  s: Stmt,
+  s: Statement,
   operation: Operation,
   label: String,
   what: String,
@@ -4537,16 +4587,16 @@ fn check_statement(
 
 fn run_checked(
   session: pg::Session,
-  s: Stmt,
+  s: Statement,
   ps: List<Param>,
   rows: Bool,
-  cfg: Server,
+  config: Server,
 ) -> Result<StatementResult, pg::ClientError> / {net.send[link], net.recv[link], abort.raise, diverges} =
   match pg::extended_query[link](
       session,
       s.sql,
       ps.map(|param: Param| param_text(param)),
-      cfg.client,
+      config.client,
     ) {
     Err(e) -> Err(e),
     Ok(reply) ->
@@ -4561,35 +4611,35 @@ fn run_checked(
 fn control(
   session: pg::Session,
   sql: String,
-  cfg: Server,
+  config: Server,
 ) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link], abort.raise, diverges} =
-  pg::simple_query[link](session, sql, cfg.client)
+  pg::simple_query[link](session, sql, config.client)
 
-/// How a connection to `cfg` is secured: verified as the host it was asked to reach.
-fn tls_of(cfg: Server) -> pg::Tls =
-  match cfg.ssl {
+/// How a connection to `config` is secured: verified as the host it was asked to reach.
+fn tls_of(config: Server) -> pg::Tls =
+  match config.ssl {
     Disabled -> pg::NoTls,
-    Negotiated -> pg::Requested(cfg.host),
-    Immediate -> pg::Direct(cfg.host),
+    Negotiated -> pg::Requested(config.host),
+    Immediate -> pg::Direct(config.host),
   }
 
 fn open_connection(
-  cfg: Server,
+  config: Server,
   nonce: String,
   c: Claim,
 ) -> Result<PooledConnection, DbError> / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match c {
     Idle(l) -> Ok(l),
     Fresh(n) -> match pg::connect[link](
-        cfg.host,
-        cfg.port,
-        tls_of(cfg),
-        cfg.user,
-        cfg.database,
-        startup_parameters(cfg),
-        cfg.password,
+        config.host,
+        config.port,
+        tls_of(config),
+        config.user,
+        config.database,
+        startup_parameters(config),
+        config.password,
         nonce ++ "-" ++ n.to_string(),
-        cfg.client,
+        config.client,
       ) {
       Err(e) -> Err(client_error(e)),
       Ok(session) -> Ok({ n: n, session: session }),
@@ -4601,7 +4651,7 @@ fn open_connection(
 fn release_after_failure(
   l: PooledConnection,
   e: pg::ClientError,
-  cfg: Server,
+  config: Server,
 ) -> OperationResult / {net.send[link], net.close[link], abort.raise} =
   match e {
     pg::Rejected(session, server) ->
@@ -4612,7 +4662,7 @@ fn release_after_failure(
         freed: Some(Reuse({ ..l, session: session })),
       },
     _ -> {
-      pg::finish[link](l.session, cfg.client);
+      pg::finish[link](l.session, config.client);
       { result: Failed(client_error(e)), n: l.n, scope: None, freed: Some(Lost) }
     },
   }
@@ -4627,7 +4677,7 @@ fn failed_within(
   scope: Scope,
   session: pg::Session,
   e: pg::ClientError,
-  cfg: Server,
+  config: Server,
   deeper: Int,
 ) -> OperationResult / {net.send[link], net.close[link], abort.raise} =
   match e {
@@ -4639,7 +4689,7 @@ fn failed_within(
         freed: None,
       },
     _ -> {
-      pg::finish[link](session, cfg.client);
+      pg::finish[link](session, config.client);
       {
         result: Failed(client_error(e)),
         n: scope.n,
@@ -4650,16 +4700,16 @@ fn failed_within(
   }
 
 fn statement_outside(
-  cfg: Server,
+  config: Server,
   nonce: String,
   c: Claim,
-  s: Stmt,
+  s: Statement,
   ps: List<Param>,
   rows: Bool,
 ) -> OperationResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match open_connection(cfg, nonce, c) {
+  match open_connection(config, nonce, c) {
     Err(e) -> { result: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
-    Ok(l) -> match run_checked(l.session, s, ps, rows, cfg) {
+    Ok(l) -> match run_checked(l.session, s, ps, rows, config) {
       Ok(ran) ->
         {
           result: ran.result,
@@ -4667,19 +4717,19 @@ fn statement_outside(
           scope: None,
           freed: Some(Reuse({ ..l, session: ran.session })),
         },
-      Err(e) -> release_after_failure(l, e, cfg),
+      Err(e) -> release_after_failure(l, e, config),
     },
   }
 
 fn statement_within(
-  cfg: Server,
+  config: Server,
   scope: Scope,
   session: pg::Session,
-  s: Stmt,
+  s: Statement,
   ps: List<Param>,
   rows: Bool,
 ) -> OperationResult / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match run_checked(session, s, ps, rows, cfg) {
+  match run_checked(session, s, ps, rows, config) {
     Ok(ran) ->
       {
         result: ran.result,
@@ -4687,22 +4737,22 @@ fn statement_within(
         scope: Some(updated_scope(scope, ran.session, 0)),
         freed: None,
       },
-    Err(e) -> failed_within(scope, session, e, cfg, 0),
+    Err(e) -> failed_within(scope, session, e, config, 0),
   }
 
 fn open_transaction(
-  cfg: Server,
+  config: Server,
   nonce: String,
   c: Claim,
   level: Isolation,
   access: Access,
 ) -> OperationResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match open_connection(cfg, nonce, c) {
+  match open_connection(config, nonce, c) {
     Err(e) -> { result: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match control(
         l.session,
         "begin isolation level " ++ isolation_sql(level) ++ " " ++ access_sql(access),
-        cfg,
+        config,
       ) {
       Ok(reply) ->
         {
@@ -4719,16 +4769,16 @@ fn open_transaction(
           }),
           freed: None,
         },
-      Err(e) -> release_after_failure(l, e, cfg),
+      Err(e) -> release_after_failure(l, e, config),
     },
   }
 
 fn open_savepoint(
-  cfg: Server,
+  config: Server,
   scope: Scope,
   session: pg::Session,
 ) -> OperationResult / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match control(session, "savepoint " ++ savepoint_name(scope.depth + 1), cfg) {
+  match control(session, "savepoint " ++ savepoint_name(scope.depth + 1), config) {
     Ok(reply) ->
       {
         result: Count(0),
@@ -4736,7 +4786,7 @@ fn open_savepoint(
         scope: Some(updated_scope(scope, reply.session, 1)),
         freed: None,
       },
-    Err(e) -> failed_within(scope, session, e, cfg, 0),
+    Err(e) -> failed_within(scope, session, e, config, 0),
   }
 
 /// A transaction that has ended, its connection back in the pool.
@@ -4746,12 +4796,12 @@ fn end_transaction(scope: Scope, session: pg::Session, answer: QueryResult) -> O
 /// A `commit` closes its scope whatever the server replies: a savepoint's leaves the scope around
 /// it, and a transaction's gives its connection back.
 fn commit_scope(
-  cfg: Server,
+  config: Server,
   scope: Scope,
   session: pg::Session,
 ) -> OperationResult / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   if scope.depth > 1 {
-    match control(session, "release savepoint " ++ savepoint_name(scope.depth), cfg) {
+    match control(session, "release savepoint " ++ savepoint_name(scope.depth), config) {
       Ok(reply) ->
         {
           result: Count(0),
@@ -4759,15 +4809,15 @@ fn commit_scope(
           scope: Some(updated_scope(scope, reply.session, -1)),
           freed: None,
         },
-      Err(e) -> failed_within(scope, session, e, cfg, -1),
+      Err(e) -> failed_within(scope, session, e, config, -1),
     }
   } else {
-    match control(session, "commit", cfg) {
+    match control(session, "commit", config) {
       Ok(reply) -> end_transaction(scope, reply.session, commit_result(reply.result.tag)),
       Err(pg::Rejected(after, server)) ->
         end_transaction(scope, after, Failed(server_error(server))),
       Err(e) -> {
-        pg::finish[link](session, cfg.client);
+        pg::finish[link](session, config.client);
         { result: Failed(unresolved(e)), n: scope.n, scope: None, freed: Some(Lost) }
       },
     }
@@ -4778,7 +4828,7 @@ fn commit_result(tag: String) -> QueryResult =
   if tag == "ROLLBACK" { Failed(in_failed_txn()) } else { Count(0) }
 
 fn abort_scope(
-  cfg: Server,
+  config: Server,
   scope: Scope,
   session: pg::Session,
 ) -> OperationResult / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
@@ -4788,7 +4838,7 @@ fn abort_scope(
     match control(
         session,
         "rollback to savepoint " ++ name ++ "; release savepoint " ++ name,
-        cfg,
+        config,
       ) {
       Ok(reply) ->
         {
@@ -4797,12 +4847,12 @@ fn abort_scope(
           scope: Some(updated_scope(scope, reply.session, -1)),
           freed: None,
         },
-      Err(e) -> failed_within(scope, session, e, cfg, -1),
+      Err(e) -> failed_within(scope, session, e, config, -1),
     }
   } else {
-    match control(session, "rollback", cfg) {
+    match control(session, "rollback", config) {
       Ok(reply) -> end_transaction(scope, reply.session, Count(0)),
-      Err(e) -> release_after_failure({ n: scope.n, session: session }, e, cfg),
+      Err(e) -> release_after_failure({ n: scope.n, session: session }, e, config),
     }
   }
 
@@ -4853,7 +4903,7 @@ type CopyStart = {
 /// `sql` sent on the connection `claim` names; `out` is the statement a copy out reads, whose
 /// columns are described first.
 fn begin_copy(
-  cfg: Server,
+  config: Server,
   nonce: String,
   claim: CopyClaim,
   sql: String,
@@ -4861,15 +4911,15 @@ fn begin_copy(
 ) -> CopyStart / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match claim {
     CopyRefused(e) -> { n: 0 - 1, within: false, session: None, columns: [], failed: Some(e) },
-    CopyOutside(c) -> match open_connection(cfg, nonce, c) {
+    CopyOutside(c) -> match open_connection(config, nonce, c) {
       Err(e) -> { n: claim_n(c), within: false, session: None, columns: [], failed: Some(e) },
-      Ok(l) -> copy_on(cfg, l.n, false, l.session, sql, out),
+      Ok(l) -> copy_on(config, l.n, false, l.session, sql, out),
     },
-    CopyWithin(scope, session) -> copy_on(cfg, scope.n, true, session, sql, out),
+    CopyWithin(scope, session) -> copy_on(config, scope.n, true, session, sql, out),
   }
 
 fn copy_on(
-  cfg: Server,
+  config: Server,
   n: Int,
   within: Bool,
   session: pg::Session,
@@ -4877,13 +4927,13 @@ fn copy_on(
   out: Option<String>,
 ) -> CopyStart / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match out {
-    None -> match pg::copy_in_begin[link](session, sql, cfg.client) {
+    None -> match pg::copy_in_begin[link](session, sql, config.client) {
       Ok(c) -> { n: n, within: within, session: Some(c.session), columns: [], failed: None },
-      Err(e) -> copy_refused(cfg, n, within, session, e),
+      Err(e) -> copy_refused(config, n, within, session, e),
     },
-    Some(query) -> match pg::describe_statement[link](session, query, cfg.client) {
-      Err(e) -> copy_refused(cfg, n, within, session, e),
-      Ok(r) -> match pg::copy_out_begin[link](r.session, sql, cfg.client) {
+    Some(query) -> match pg::describe_statement[link](session, query, config.client) {
+      Err(e) -> copy_refused(config, n, within, session, e),
+      Ok(r) -> match pg::copy_out_begin[link](r.session, sql, config.client) {
         Ok(c) ->
           {
             n: n,
@@ -4892,7 +4942,7 @@ fn copy_on(
             columns: r.result.columns,
             failed: None,
           },
-        Err(e) -> copy_refused(cfg, n, within, r.session, e),
+        Err(e) -> copy_refused(config, n, within, r.session, e),
       },
     },
   }
@@ -4900,7 +4950,7 @@ fn copy_on(
 /// A copy that did not start. An error from the server leaves the connection usable, and anything
 /// else ends it.
 fn copy_refused(
-  cfg: Server,
+  config: Server,
   n: Int,
   within: Bool,
   session: pg::Session,
@@ -4916,7 +4966,7 @@ fn copy_refused(
         failed: Some(server_error(server)),
       },
     _ -> {
-      pg::finish[link](session, cfg.client);
+      pg::finish[link](session, config.client);
       { n: n, within: within, session: None, columns: [], failed: Some(client_error(e)) }
     },
   }
@@ -5031,7 +5081,7 @@ type TakeResult = {
 
 /// At most `rows` rows, read from what has arrived and then from the server, a piece at a time.
 fn take_rows(
-  cfg: Server,
+  config: Server,
   c: Copy,
   session: Option<pg::Session>,
   rows: Int,
@@ -5051,10 +5101,10 @@ fn take_rows(
     None -> answered(c, None, ready),
     Some(s) -> if ready.lines.len() >= rows { answered({ ..c, session: Some(s) }, None, ready) }
     else {
-      match pg::copy_out_take[link](s, cfg.client) {
+      match pg::copy_out_take[link](s, config.client) {
         Ok(piece) -> match piece.data {
           Some(data) ->
-            take_rows(cfg, { ..c, pending: c.pending.concat(data) }, Some(piece.session), rows),
+            take_rows(config, { ..c, pending: c.pending.concat(data) }, Some(piece.session), rows),
           None ->
             answered(
               { ..c, session: None, done: true },
@@ -5071,7 +5121,7 @@ fn take_rows(
           }
         },
         Err(e) -> {
-          pg::finish[link](s, cfg.client);
+          pg::finish[link](s, config.client);
           let failed = client_error(e);
           {
             copy: { ..c, session: None, done: true, failed: Some(failed) },
@@ -5086,14 +5136,14 @@ fn take_rows(
 
 /// Reads and drops what remains of a copy out, so its connection is ready for the next statement.
 fn drain_copy_out(
-  cfg: Server,
+  config: Server,
   s: pg::Session,
 ) -> Result<pg::Session, pg::ClientError> / {net.recv[link], abort.raise, diverges} =
-  match pg::copy_out_take[link](s, cfg.client) {
+  match pg::copy_out_take[link](s, config.client) {
     Err(e) -> Err(e),
     Ok(piece) -> match piece.data {
       None -> Ok(piece.session),
-      Some(_) -> drain_copy_out(cfg, piece.session),
+      Some(_) -> drain_copy_out(config, piece.session),
     },
   }
 
@@ -5101,66 +5151,66 @@ fn drain_copy_out(
 type CopyEnd = { session: Option<pg::Session>, result: Result<Int, DbError> }
 
 fn end_copy_in(
-  cfg: Server,
+  config: Server,
   session: pg::Session,
   failure: Option<String>,
 ) -> CopyEnd / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match pg::copy_in_end[link]({ session: session, columns: 0 }, failure, cfg.client) {
+  match pg::copy_in_end[link]({ session: session, columns: 0 }, failure, config.client) {
     Ok(r) -> { session: Some(r.session), result: Ok(count_of(r.result.tag)) },
     Err(pg::Rejected(after, server)) -> { session: Some(after), result: Err(server_error(server)) },
     Err(e) -> {
-      pg::finish[link](session, cfg.client);
+      pg::finish[link](session, config.client);
       { session: None, result: Err(client_error(e)) }
     },
   }
 
 fn end_copy_out(
-  cfg: Server,
+  config: Server,
   c: Copy,
   session: pg::Session,
 ) -> CopyEnd / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match drain_copy_out(cfg, session) {
+  match drain_copy_out(config, session) {
     Ok(s) -> { session: Some(s), result: Ok(c.taken) },
     Err(pg::Rejected(after, server)) -> { session: Some(after), result: Err(server_error(server)) },
     Err(e) -> {
-      pg::finish[link](session, cfg.client);
+      pg::finish[link](session, config.client);
       { session: None, result: Err(client_error(e)) }
     },
   }
 
 /// `COPY` of the `columns` of table `t` from the client, every name quoted.
 fn copy_in_sql(t: String, columns: List<String>) -> String =
-  "copy " ++ quote_ident(t) ++ " (" ++ comma(columns.map(quote_ident)) ++ ") from stdin"
+  "copy " ++ quote_identifier(t) ++ " (" ++ comma(columns.map(quote_identifier)) ++ ") from stdin"
 
 // --- The listening connection --------------------------------------------------------
 
 /// A connection of its own that listens on every one of `channels`.
 fn listening(
-  cfg: Server,
+  config: Server,
   nonce: String,
   made: Int,
   channels: List<String>,
 ) -> Result<pg::Session, DbError> / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match pg::connect[link](
-      cfg.host,
-      cfg.port,
-      tls_of(cfg),
-      cfg.user,
-      cfg.database,
-      startup_parameters(cfg),
-      cfg.password,
+      config.host,
+      config.port,
+      tls_of(config),
+      config.user,
+      config.database,
+      startup_parameters(config),
+      config.password,
       nonce ++ "-listener-" ++ made.to_string(),
-      cfg.client,
+      config.client,
     ) {
     Err(e) -> Err(client_error(e)),
     Ok(s) ->
       channels.fold(Ok(s), |acc: Result<pg::Session, DbError>, channel: String|
         match acc {
           Err(e) -> Err(e),
-          Ok(talking) -> match control(talking, "listen " ++ quote_ident(channel), cfg) {
+          Ok(talking) -> match control(talking, "listen " ++ quote_identifier(channel), config) {
             Ok(r) -> Ok(r.session),
             Err(e) -> {
-              pg::finish[link](talking, cfg.client);
+              pg::finish[link](talking, config.client);
               Err(client_error(e))
             },
           },
@@ -5173,13 +5223,13 @@ type WaitResult = { listener: Listener, notification: Notice }
 type ListenResult = { listener: Listener, result: QueryResult }
 
 fn listen_on(
-  cfg: Server,
+  config: Server,
   nonce: String,
   l: Listener,
   channel: String,
 ) -> ListenResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match l.session {
-    None -> match listening(cfg, nonce, l.made, l.channels.push(channel)) {
+    None -> match listening(config, nonce, l.made, l.channels.push(channel)) {
       Err(e) -> { listener: { ..l, made: l.made + 1 }, result: Failed(e) },
       Ok(s) ->
         {
@@ -5187,7 +5237,7 @@ fn listen_on(
           result: Count(0),
         },
     },
-    Some(s) -> match control(s, "listen " ++ quote_ident(channel), cfg) {
+    Some(s) -> match control(s, "listen " ++ quote_identifier(channel), config) {
       Ok(r) ->
         {
           listener: { ..l, session: Some(r.session), channels: l.channels.push(channel) },
@@ -5196,26 +5246,26 @@ fn listen_on(
       Err(pg::Rejected(after, server)) ->
         { listener: { ..l, session: Some(after) }, result: Failed(server_error(server)) },
       Err(e) -> {
-        pg::finish[link](s, cfg.client);
+        pg::finish[link](s, config.client);
         { listener: { ..l, session: None, lost: true }, result: Failed(client_error(e)) }
       },
     },
   }
 
 fn unlisten_on(
-  cfg: Server,
+  config: Server,
   l: Listener,
   channel: String,
 ) -> ListenResult / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} = {
   let rest = l.channels.filter(|c: String| c != channel);
   match l.session {
     None -> { listener: { ..l, channels: rest }, result: Count(0) },
-    Some(s) -> match control(s, "unlisten " ++ quote_ident(channel), cfg) {
+    Some(s) -> match control(s, "unlisten " ++ quote_identifier(channel), config) {
       Ok(r) -> { listener: { ..l, session: Some(r.session), channels: rest }, result: Count(0) },
       Err(pg::Rejected(after, server)) ->
         { listener: { ..l, session: Some(after) }, result: Failed(server_error(server)) },
       Err(e) -> {
-        pg::finish[link](s, cfg.client);
+        pg::finish[link](s, config.client);
         { listener: { ..l, session: None, channels: rest, lost: true }, result: Count(0) }
       },
     },
@@ -5224,13 +5274,13 @@ fn unlisten_on(
 
 /// A wait on the listener, which opens a new connection first when the last one was lost.
 fn wait_for_notification(
-  cfg: Server,
+  config: Server,
   nonce: String,
   l: Listener,
   timeout_ms: Int,
 ) -> WaitResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match l.session {
-    None -> reopen_listener(cfg, nonce, l),
+    None -> reopen_listener(config, nonce, l),
     Some(s) -> match pg::await_notification[link](s, timeout_ms) {
       Ok(w) ->
         {
@@ -5238,18 +5288,18 @@ fn wait_for_notification(
           notification: match w.notification { Some(n) -> Notified(n), None -> Quiet },
         },
       Err(_) -> {
-        pg::finish[link](s, cfg.client);
-        reopen_listener(cfg, nonce, { ..l, session: None, lost: true })
+        pg::finish[link](s, config.client);
+        reopen_listener(config, nonce, { ..l, session: None, lost: true })
       },
     },
   }
 
 fn reopen_listener(
-  cfg: Server,
+  config: Server,
   nonce: String,
   l: Listener,
 ) -> WaitResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match listening(cfg, nonce, l.made, l.channels) {
+  match listening(config, nonce, l.made, l.channels) {
     Ok(s) ->
       {
         listener: { ..l, session: Some(s), lost: false, made: l.made + 1 },
@@ -5264,7 +5314,7 @@ fn listener_busy() -> String =
 /// The `db` effect handled by a live server. `nonce` is the caller's, so a run's seed decides it
 /// and a test can fix it; each connection's nonce is that text and its own number.
 pub fn serve<a | e>(
-  cfg: Server,
+  config: Server,
   size: Int,
   nonce: String,
   body: () -> a / {db.read[*], db.write[*] | e},
@@ -5278,19 +5328,19 @@ pub fn serve<a | e>(
       pool_state.replace(apply_result(pool_state.current(), left));
       left.result
     };
-    let statement = |s: Stmt, ps: List<Param>, rows: Bool, what: String|
+    let statement = |s: Statement, ps: List<Param>, rows: Bool, what: String|
       match taken(for_statement(pool_state.current(), size, what)) {
         Answered(a) -> a,
-        Outside(c) -> settled(statement_outside(cfg, nonce, c, s, ps, rows)),
-        Within(scope, session) -> settled(statement_within(cfg, scope, session, s, ps, rows)),
+        Outside(c) -> settled(statement_outside(config, nonce, c, s, ps, rows)),
+        Within(scope, session) -> settled(statement_within(config, scope, session, s, ps, rows)),
       };
     let closing = |d: ToClose| {
       pool_state.replace(d.pool);
       d.closing
     };
-    let alone = |s: Stmt, each: List<List<Param>>|
+    let alone = |s: Statement, each: List<List<Param>>|
       each.map(|ps: List<Param>| statement(s, ps, true, "`db.batch`"));
-    let shared = |s: Stmt, each: List<List<Param>>|
+    let shared = |s: Statement, each: List<List<Param>>|
       match coalesce(s, each) {
         None -> None,
         Some(c) -> match statement(c.s, c.ps, true, "`db.batch`") {
@@ -5303,21 +5353,21 @@ pub fn serve<a | e>(
       match closing(for_close(pool_state.current(), "`db.batch`", Count(0))) {
         Settled(_) -> (),
         Closes(scope, session) -> {
-          settled(if updated_scope { commit_scope(cfg, scope, session) }
-          else { abort_scope(cfg, scope, session) });
+          settled(if updated_scope { commit_scope(config, scope, session) }
+          else { abort_scope(config, scope, session) });
           ()
         },
       };
     // A batch's queries as one statement. Inside a transaction it runs under a savepoint, so that
     // an error leaves the transaction as running each query alone would have. A statement the
     // queries cannot share, or one the server rejects, runs once for each.
-    let batch = |s: Stmt, each: List<List<Param>>|
+    let batch = |s: Statement, each: List<List<Param>>|
       if each.len() < 2 { alone(s, each) } else {
         match route(pool_state.current().open) {
           Own(scope) -> match taken(
               for_begin(pool_state.current(), size, scope.level, scope.access),
             ) {
-            Within(inner, session) -> match settled(open_savepoint(cfg, inner, session)) {
+            Within(inner, session) -> match settled(open_savepoint(config, inner, session)) {
               Failed(_) -> alone(s, each),
               _ -> match shared(s, each) {
                 Some(answers) -> {
@@ -5342,7 +5392,7 @@ pub fn serve<a | e>(
       match claimed.claim {
         CopyRefused(e) -> Err(e),
         claim -> {
-          let b = begin_copy(cfg, nonce, claim, sql, out);
+          let b = begin_copy(config, nonce, claim, sql, out);
           match b.failed {
             Some(e) -> {
               pool_state.replace(let_copy_go(pool_state.current(), b.n, b.within, b.session));
@@ -5390,14 +5440,14 @@ pub fn serve<a | e>(
             Err(e) -> Err(e),
             Ok(t) -> {
               pool_state.replace(t.pool);
-              copy_closed(c, if c.out { end_copy_out(cfg, c, t.session) }
-              else { end_copy_in(cfg, t.session, failure) })
+              copy_closed(c, if c.out { end_copy_out(config, c, t.session) }
+              else { end_copy_in(config, t.session, failure) })
             },
           }
         },
       };
     let taken_from = |c: Copy, session: Option<pg::Session>, rows: Int| {
-      let t = take_rows(cfg, c, session, rows);
+      let t = take_rows(config, c, session, rows);
       let updated_scope = with_copy(pool_state.current(), t.copy);
       pool_state.replace(match t.release {
         None -> updated_scope,
@@ -5452,18 +5502,18 @@ pub fn serve<a | e>(
       },
       db.begin(level, access) -> match taken(for_begin(pool_state.current(), size, level, access)) {
         Answered(a) -> a,
-        Outside(c) -> settled(open_transaction(cfg, nonce, c, level, access)),
-        Within(scope, session) -> settled(open_savepoint(cfg, scope, session)),
+        Outside(c) -> settled(open_transaction(config, nonce, c, level, access)),
+        Within(scope, session) -> settled(open_savepoint(config, scope, session)),
       },
       db.commit() -> match closing(
           for_close(pool_state.current(), "`db.commit`", Failed(connection_lost())),
         ) {
         Settled(a) -> a,
-        Closes(scope, session) -> settled(commit_scope(cfg, scope, session)),
+        Closes(scope, session) -> settled(commit_scope(config, scope, session)),
       },
       db.abort() -> match closing(for_close(pool_state.current(), "`db.abort`", Count(0))) {
         Settled(a) -> a,
-        Closes(scope, session) -> settled(abort_scope(cfg, scope, session)),
+        Closes(scope, session) -> settled(abort_scope(config, scope, session)),
       },
       db.notify[*c](payload) ->
         statement(
@@ -5478,20 +5528,20 @@ pub fn serve<a | e>(
           listener_back(l);
           Count(0)
         } else {
-          let s = listen_on(cfg, nonce, l, c);
+          let s = listen_on(config, nonce, l, c);
           listener_back(s.listener);
           s.result
         }
       },
       db.unlisten[*c]() -> {
-        let s = unlisten_on(cfg, listener_taken(), c);
+        let s = unlisten_on(config, listener_taken(), c);
         listener_back(s.listener);
         s.result
       },
       db.next_notification(timeout_ms) -> {
         if pool_state.current().listener.channels.len() == 0 { panic(nothing_listened()) }
         else { () };
-        let w = wait_for_notification(cfg, nonce, listener_taken(), timeout_ms);
+        let w = wait_for_notification(config, nonce, listener_taken(), timeout_ms);
         listener_back(w.listener);
         w.notification
       },
@@ -5503,7 +5553,7 @@ pub fn serve<a | e>(
           match pg::copy_send[link](
               { session: took_rows.session, columns: 0 },
               copy_text(rows),
-              cfg.client,
+              config.client,
             ) {
             Ok(c) -> {
               pool_state.replace(
@@ -5512,7 +5562,7 @@ pub fn serve<a | e>(
               Ok(())
             },
             Err(e) -> {
-              pg::finish[link](took_rows.session, cfg.client);
+              pg::finish[link](took_rows.session, config.client);
               copy_closed(took_rows.copy, { session: None, result: Err(client_error(e)) });
               Err(client_error(e))
             },
@@ -5527,7 +5577,7 @@ pub fn serve<a | e>(
       },
       db.copy_take[*t](id, rows) -> copy_take(id, rows),
     };
-    close_pool(pool_state.current(), cfg);
+    close_pool(pool_state.current(), config);
     answer
   } with {
     var pool: Pool = {
@@ -5553,7 +5603,7 @@ effect pool_state {
 
 /// What `db.notify` sends: the channel and the payload as parameters, so neither is ever read as
 /// SQL.
-fn notify_statement() -> Stmt = stmt("select pg_notify($1, $2)")
+fn notify_statement() -> Statement = stmt("select pg_notify($1, $2)")
 
 /// A statement's text short of a closing `;`, which a statement inside a `COPY` may not have.
 fn statement_text(sql: String) -> String / {abort.raise} =
@@ -5570,16 +5620,17 @@ fn statement_text(sql: String) -> String / {abort.raise} =
 /// queries cannot share one statement: text the parser cannot take apart, a query whose parameters
 /// do not match the placeholders, or more parameters than one statement may carry.
 fn coalesce(
-  s: Stmt,
+  s: Statement,
   each: List<List<Param>>,
-) -> Option<{ s: Stmt, ps: List<Param> }> / {abort.raise} =
+) -> Option<{ s: Statement, ps: List<Param> }> / {abort.raise} =
   match tokenize(Postgres, s.sql) {
     Err(_) -> None,
     Ok(ts) -> match statement_body(s.sql, ts) {
       None -> None,
       Some(body) -> {
-        let places = ts.filter(|t: SqlTokAt| match t.tok { SqlPlaceholder -> true, _ -> false });
-        let width = places.fold(0, |m: Int, t: SqlTokAt| max(m, placeholder_number(t.text)));
+        let places = ts.filter(|t: SqlTokenAt|
+          match t.token { SqlPlaceholder -> true, _ -> false });
+        let width = places.fold(0, |m: Int, t: SqlTokenAt| max(m, placeholder_number(t.text)));
         let fits = each.fold(true, |ok: Bool, ps: List<Param>| ok && ps.len() == width);
         if !fits || width * each.len() > 65535 { None } else {
           let arms = range(0, each.len()).map(|i: Int|
@@ -5600,9 +5651,9 @@ fn coalesce(
   }
 
 /// The statement's text short of a closing `;`; `None` when a `;` comes before its end.
-fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> / {abort.raise} = {
+fn statement_body(sql: String, ts: List<SqlTokenAt>) -> Option<String> / {abort.raise} = {
   let semis = range(0, ts.len()).filter(|i: Int|
-    match ts.at(i) { Some(t) -> sql_is_semicolon(t.tok), None -> false });
+    match ts.at(i) { Some(t) -> sql_is_semicolon(t.token), None -> false });
   match semis {
     [] -> Some(sql),
     [i] -> if i == ts.len() - 1 {
@@ -5618,9 +5669,13 @@ fn statement_body(sql: String, ts: List<SqlTokAt>) -> Option<String> / {abort.ra
 fn placeholder_number(text: String) -> Int / {abort.raise} = int_or_zero(text.slice(1, text.len()))
 
 /// Each placeholder `$k` of `body` written `$(k + by)`.
-fn renumber_placeholders(body: String, places: List<SqlTokAt>, by: Int) -> String / {abort.raise} = {
+fn renumber_placeholders(
+  body: String,
+  places: List<SqlTokenAt>,
+  by: Int,
+) -> String / {abort.raise} = {
   let b = Bytes::of_string(body);
-  let walked = places.fold({ at: 0, out: b"" }, |acc: { at: Int, out: Bytes }, t: SqlTokAt|
+  let walked = places.fold({ at: 0, out: b"" }, |acc: { at: Int, out: Bytes }, t: SqlTokenAt|
     if t.at < acc.at || t.at >= b.len() { acc } else {
       {
         at: t.at + Bytes::of_string(t.text).len(),
@@ -5655,10 +5710,10 @@ fn split_asks(rows: List<Row>, asks: Int) -> List<QueryResult> = {
 /// Tells every connection the pool still holds after its body has returned that it is done, and
 /// closes it: the idle ones; one a body returned from inside its transaction, which the server
 /// rolls back; one a copy left open, of which the server stores nothing; and the listener's.
-fn close_pool(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
+fn close_pool(p: Pool, config: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
   let close = |s: Option<pg::Session>|
-    match s { Some(session) -> pg::finish[link](session, cfg.client), None -> () };
-  p.idle.fold((), |done: Unit, l: PooledConnection| pg::finish[link](l.session, cfg.client));
+    match s { Some(session) -> pg::finish[link](session, config.client), None -> () };
+  p.idle.fold((), |done: Unit, l: PooledConnection| pg::finish[link](l.session, config.client));
   p.open.fold((), |done: Unit, scope: Scope| close(scope.session));
   p.copies.filter(|c: Copy| !c.within).fold((), |done: Unit, c: Copy| close(c.session));
   close(p.listener.session)
@@ -5897,9 +5952,9 @@ fn with_query(query: String, s: Server) -> Result<Server, String> / {abort.raise
           Err(why) -> Err(why),
           Ok(so_far) -> match split_at(pair, "=") {
             None -> Err("`" ++ pair ++ "` is not a `key=value` parameter"),
-            Some(kv) -> match unpercent(kv.tail) {
+            Some(key_value) -> match unpercent(key_value.tail) {
               Err(why) -> Err(why),
-              Ok(value) -> with_parameter(so_far, kv.head, value),
+              Ok(value) -> with_parameter(so_far, key_value.head, value),
             },
           },
         },
@@ -6026,7 +6081,7 @@ pub fn with_server<a | e>(
     Err(why) -> Err(why),
     Ok(read) -> match with_password(read, password) {
       Err(why) -> Err(why),
-      Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)),
+      Ok(config) -> Ok(serve(config, size, nonce(), body)),
     },
   }
 
@@ -6499,7 +6554,7 @@ fn test_talking(f: FakeServer, c: Int) -> Bool =
 fn test_said(wires: List<FakeConnection>) -> List<List<String>> =
   wires.map(|w: FakeConnection| w.said)
 
-fn test_insert(sku: String) -> Stmt = stmt("insert into part (sku) values ('" ++ sku ++ "')")
+fn test_insert(sku: String) -> Statement = stmt("insert into part (sku) values ('" ++ sku ++ "')")
 
 fn test_begin(level: String) -> String = "begin isolation level " ++ level ++ " read write"
 

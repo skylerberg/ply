@@ -1,4 +1,4 @@
-//! A multi-route HTTP service that sells parts, over postgres or an in-memory twin of it, whose types
+//! A multi-route HTTP service that sells parts, over postgres or an in-memory fake of it, whose types
 //! are its documentation — and which can be started, watched, and stopped without losing a request.
 //! How it runs is configuration (`config` below):
 //!
@@ -110,7 +110,7 @@ pub const fn schema() -> sql::Schema =
         primary_key: ["sku"],
         unique: [],
         foreign_keys: [],
-        checks: [{ name: "items_on_hand_is_not_negative", expr: "on_hand >= 0" }],
+        checks: [{ name: "items_on_hand_is_not_negative", expression: "on_hand >= 0" }],
       },
       {
         name: "orders",
@@ -142,11 +142,11 @@ pub fn connections_key() -> String = "SERVICE_CONNECTIONS"
 
 pub fn api_key() -> String = "SERVICE_API_KEY"
 
-/// Where the service's database is. Optional because the twin has no database: a service over postgres
+/// Where the service's database is. Optional because the fake has no database: a service over postgres
 /// refuses to start without it, which is what `configured_url` below is for.
 pub fn database_key() -> String = "SERVICE_DATABASE"
 
-/// Which store answers the routes: `postgres`, or `memory` for the twin.
+/// Which store answers the routes: `postgres`, or `memory` for the fake.
 pub fn store_key() -> String = "SERVICE_STORE"
 
 /// The credential to listen with, as `--tls NAME=CERT,KEY` named it; plaintext when unset.
@@ -259,41 +259,42 @@ fn accept_of(configured: Option<String>) -> Result<Accept, String> =
 
 // --- The statements ---------------------------------------------------------------
 
-fn items_all() -> sql::Stmt = sql::stmt("select sku, name, price, on_hand from items order by sku")
+fn items_all() -> sql::Statement =
+  sql::stmt("select sku, name, price, on_hand from items order by sku")
 
 /// The readiness probe, and the cheapest statement in the file: one aggregate over one table, no
 /// rows on the wire, no parameters to bind.
-fn store_reachable() -> sql::Stmt = sql::stmt("select count(*) from items")
+fn store_reachable() -> sql::Statement = sql::stmt("select count(*) from items")
 
-fn items_in_stock() -> sql::Stmt =
+fn items_in_stock() -> sql::Statement =
   sql::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
 
-fn item_by_sku() -> sql::Stmt =
+fn item_by_sku() -> sql::Statement =
   sql::stmt("select sku, name, price, on_hand from items where sku = $1")
 
-fn item_insert() -> sql::Stmt =
+fn item_insert() -> sql::Statement =
   sql::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
 
 /// The reservation, and the only interesting statement in the file.
-fn item_reserve() -> sql::Stmt =
+fn item_reserve() -> sql::Statement =
   sql::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
 
-fn orders_all() -> sql::Stmt =
+fn orders_all() -> sql::Statement =
   sql::stmt("select id, customer, lines, total, state from orders order by id")
 
-fn order_by_id() -> sql::Stmt =
+fn order_by_id() -> sql::Statement =
   sql::stmt("select id, customer, lines, total, state from orders where id = $1")
 
 /// The id is the database's.
-fn order_insert() -> sql::Stmt =
+fn order_insert() -> sql::Statement =
   sql::stmt(
     "insert into orders (customer, lines, total, state) values ($1, $2, $3, $4)"
       ++ " returning id, customer, lines, total, state",
   )
 
 /// No compare-and-set on `state`, and the reason is worth writing down because it is a design
-/// decision the twin forced rather than a shortcut.
-fn order_cancel() -> sql::Stmt = sql::stmt("update orders set state = $1 where id = $2")
+/// decision the fake forced rather than a shortcut.
+fn order_cancel() -> sql::Statement = sql::stmt("update orders set state = $1 where id = $2")
 
 // --- Reading a result set ----------------------------------------------------------
 
@@ -1257,7 +1258,7 @@ fn one_at_a_time(
   }
 
 /// The same budget with a task for each connection, so a slow client holds up only itself. Every
-/// task is joined before the loop answers: the twin's store lives no longer than the call that
+/// task is joined before the loop answers: the fake's store lives no longer than the call that
 /// opened it.
 pub fn serve_each(
   listener: Int,
@@ -1336,20 +1337,20 @@ pub fn listening(
 
 // --- The service, stocked and running ----------------------------------------------------
 
-/// The twin on a plain listener, one connection at a time.
+/// The fake on a plain listener, one connection at a time.
 pub fn run_memory(
   port: Int,
   api: Option<Secret<String>>,
   count: Int,
 ) -> Int / {net.listen[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
-  twin(api, || listen_and_serve(port, count))
+  fake(api, || listen_and_serve(port, count))
 
-/// The API key the *tests* drive the twin with.
-pub fn twin_key() -> String = "twin-key-not-a-credential"
+/// The API key the *tests* drive the fake with.
+pub fn fake_key() -> String = "fake-key-not-a-credential"
 
 /// The service over a database that is a value and a sink that is a value: every operation
 /// `Serving` names is answered here, and the credential from `api`.
-pub fn twin<a | e>(
+pub fn fake<a | e>(
   api: Option<Secret<String>>,
   body: () -> a / {Serving | e},
 ) -> a / {abort.raise | e} =
@@ -1412,7 +1413,7 @@ fn over_values<a | e>(
     trace.exit[*](span, outcome) -> {
       let o = trace::exit_step(sink, span, outcome);
       sink = o.sink;
-      // `exit_step` answers `ok: false` where the bound driver raises `E0445`, because a twin is a
+      // `exit_step` answers `ok: false` where the bound driver raises `E0445`, because a fake is a
       // value and a value does not raise.
       if o.ok { () } else { panic("trace.exit named a span that is not open") }
     },
@@ -1439,7 +1440,7 @@ fn main() -> Int / {Running, abort.raise, diverges} = {
     ),
   );
   match s.store {
-    Memory -> twin(key, || listening(s)),
+    Memory -> fake(key, || listening(s)),
     Postgres -> postgres(config.get[server](database_key()), s, key),
   }
 }
@@ -1510,7 +1511,7 @@ pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb / {abort.rai
   )
 
 /// A step whose answer must be a success.
-fn stepped(d: db::MemDb, s: sql::Stmt, ps: List<sql::Param>) -> db::MemDb / {abort.raise} = {
+fn stepped(d: db::MemDb, s: sql::Statement, ps: List<sql::Param>) -> db::MemDb / {abort.raise} = {
   let out = db::step(d, s, ps);
   match out.out {
     sql::Failed(e) -> panic("the fixture would not load: " ++ e.code ++ " " ++ e.detail),
@@ -1518,18 +1519,18 @@ fn stepped(d: db::MemDb, s: sql::Stmt, ps: List<sql::Param>) -> db::MemDb / {abo
   }
 }
 
-/// What the twin holds, read back through the same statements an endpoint uses, so an assertion
-/// about the store is an assertion about what a request would see rather than about the twin's
+/// What the fake holds, read back through the same statements an endpoint uses, so an assertion
+/// about the store is an assertion about what a request would see rather than about the fake's
 /// internals.
 pub fn shelf_of(d: db::MemDb) -> List<Item> / {abort.raise} = read_out(d, items_all(), item_row())
 
 pub fn book_of(d: db::MemDb) -> List<Order> / {abort.raise} = read_out(d, orders_all(), order_row())
 
-fn read_out<a>(d: db::MemDb, s: sql::Stmt, c: sql::RowCodec<a>) -> List<a> / {abort.raise} =
+fn read_out<a>(d: db::MemDb, s: sql::Statement, c: sql::RowCodec<a>) -> List<a> / {abort.raise} =
   match sql::decode_rows(db::step(d, s, []).out, c) {
     Ok(xs) -> xs,
     Err(sql::InvalidRow(e)) -> panic("a row would not decode: " ++ e.column),
-    Err(sql::Refused(e)) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
+    Err(sql::Refused(e)) -> panic("a read of the fake failed: " ++ e.code ++ " " ++ e.detail),
     Err(sql::UnexpectedCount(_)) -> panic("a query answered a count"),
   }
 
@@ -1684,7 +1685,7 @@ fn against<a | e>(
 /// The service as `examples/service.sql` seeds it, with a key configured and nobody asking it to stop.
 fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.raise | e} =
   handle {
-    against(d, config::one_secret(api_key(), twin_key()), body)
+    against(d, config::one_secret(api_key(), fake_key()), body)
   } with {
     signal.stopping() -> false,
   }
@@ -1717,7 +1718,7 @@ fn request(m: http::Method, path: String, body: Bytes) -> http::Request =
     client_certificate: None,
   }
 
-/// A request carrying the key the twin is configured with.
+/// A request carrying the key the fake is configured with.
 fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Request =
   {
     method: m,
@@ -1726,7 +1727,7 @@ fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Reque
     query: "",
     authority: "localhost",
     version: http::Http11,
-    headers: Map::of_entries([field("x-api-key", twin_key())]),
+    headers: Map::of_entries([field("x-api-key", fake_key())]),
     trailers: Map::new(),
     body: http::Whole(body),
     peer: None,
@@ -2120,7 +2121,7 @@ test "a service with no credential configured refuses POST /orders rather than a
 test "the configured credential appears in no response, no field and no record" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":1}]}");
   assert_eq(r.out.status, 201);
-  let key = Bytes::of_string(twin_key());
+  let key = Bytes::of_string(fake_key());
   assert_eq(http::whole_bytes(r.out.body).index_of(key), None);
   assert_eq(Bytes::of_string(join(recorded_names(r.records))).index_of(key), None);
   assert_eq(Bytes::of_string(rendered_fields(r.records)).index_of(key), None)
@@ -2152,7 +2153,7 @@ test "the schema declares the keys the service cannot start without, and default
     Some({ name: "SERVICE_API_KEY", shape: config::SSecret, required: true, default: None }),
   );
   // Where to reach the database is optional in the schema and required by a service over postgres:
-  // the twin has no database, so a run of it supplies no URL.
+  // the fake has no database, so a run of it supplies no URL.
   assert_eq(
     key_named(keys, database_key()),
     Some({ name: "SERVICE_DATABASE", shape: config::SText, required: false, default: None }),
@@ -2328,7 +2329,7 @@ fn pooled_run(
   );
   let callers = range(0, count).fold(net::mem_empty(), |m: net::MemNet, i: Int|
     net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Sends(asked)]));
-  twin(Some(Secret::of_string(twin_key())), ||
+  fake(Some(Secret::of_string(fake_key())), ||
     net::on_mem(callers, ||
       simulate {
         let listener = net.listen[listener](0);
@@ -2353,7 +2354,7 @@ test "a pooled service sheds what its queue cannot hold, and answers every conne
 }
 
 test "a kept-alive service connection under a stop is answered as its last, and not waited on" {
-  let ran = twin(Some(Secret::of_string(twin_key())), ||
+  let ran = fake(Some(Secret::of_string(fake_key())), ||
     net::on_mem(
       net::mem_calling(net::mem_empty(), ip::socket_at(ip::loopback_v4(), 4000), [
         net::Sends(get_line("/health")),
@@ -2379,7 +2380,7 @@ test "a kept-alive service connection under a stop is answered as its last, and 
 // answering everything else.
 test "during the drain lead a service is unready and still serving" {
   let r = handle {
-    against(stock(), config::one_secret(api_key(), twin_key()), || {
+    against(stock(), config::one_secret(api_key(), fake_key()), || {
       let ready = app(request(http::Get, "/ready", b""));
       let items = app(request(http::Get, "/items", b""));
       { ready: ready.status, items: items.status }
@@ -2538,7 +2539,7 @@ test "a posted order travels the whole connection and moves the store" {
     Bytes::of_string(
       "POST /orders HTTP/1.1\r\nHost: service.example\r\nContent-Type: application/json\r\n"
         ++ "x-api-key: "
-        ++ twin_key()
+        ++ fake_key()
         ++ "\r\n"
         ++ "Content-Length: "
         ++ Bytes::of_string(body).len().to_string()
@@ -2695,10 +2696,10 @@ test "a task per connection writes the bytes one connection at a time writes" {
   assert_eq(spawned.sent, 2)
 }
 
-// The twin as `main` runs it when the settings name it: nothing granted but sockets and stdout.
-test "the twin serves the service over TLS with a task per connection" {
+// The fake as `main` runs it when the settings name it: nothing granted but sockets and stdout.
+test "the fake serves the service over TLS with a task per connection" {
   let sent = handle {
-    twin(Some(Secret::of_string(twin_key())), ||
+    fake(Some(Secret::of_string(fake_key())), ||
       simulate { assert_eq(listening(one_connection(Some("service"), TaskPerConnection)), 1) })
   } with {
     var queue = [get_line("/items")],
@@ -2725,10 +2726,10 @@ test "the twin serves the service over TLS with a task per connection" {
   assert(Bytes::concat_all(sent).index_of(b"\"sku\":\"gasket\"") != None)
 }
 
-// The twin entry point, driven end to end with nothing granted but sockets.
+// The fake entry point, driven end to end with nothing granted but sockets.
 test "run_memory serves the service with no database bound and no host at all" {
   let sent = handle {
-    assert_eq(run_memory(8137, Some(Secret::of_string(twin_key())), 1), 1)
+    assert_eq(run_memory(8137, Some(Secret::of_string(fake_key())), 1), 1)
   } with {
     var queue = [get_line("/items").concat(get_line("/orders"))],
     var sent = [],
@@ -2858,7 +2859,7 @@ test "a chunk size that is empty, not hex, or unterminated is refused" {
 test "trailers arrive in their own field and are never merged into the headers" {
   let e = served(
     Bytes::of_string(
-      "POST /orders HTTP/1.1\r\nHost: d\r\nx-api-key: " ++ twin_key()
+      "POST /orders HTTP/1.1\r\nHost: d\r\nx-api-key: " ++ fake_key()
         ++ "\r\nTransfer-Encoding: chunked\r\n\r\n",
     ).concat(
       b"2\r\n{}\r\n0\r\nContent-Length: 0\r\nAuthorization: root\r\n\r\n",

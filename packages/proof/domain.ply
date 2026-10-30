@@ -31,7 +31,7 @@ pub type Variant = { name: String, fields: List<Sort> }
 /// fields are written in terms of those parameters, `SortVariable(i)` being the `i`th, so `NamedSort(name, args)`
 /// means the fields with `args` substituted for them by position — a `Pair<Bool>` is four values, and
 /// the same declaration under `Pair<Int>` is not finite at all.
-pub type Decl = { name: String, params: Int, variants: List<Variant> }
+pub type Declaration = { name: String, params: Int, variants: List<Variant> }
 
 /// What a finite type came to, as the runtime builds its values from an index: a builtin by name,
 /// the `Int`s from a least one on, a declared type's cases in declaration order, or a record's
@@ -159,31 +159,31 @@ pub fn sizes_of(domain: Domain) -> List<Int> = domain.shapes.map(shape_size)
 pub fn max_enumerated_points() -> Int = 4096
 
 /// What a type came to, or `None` when it is infinite, unknown, or past [`max_enumerated_points`].
-pub fn shape_of(ty: Sort, decls: List<Decl>) -> Option<Shape> =
-  expand_shape(ty, decls, [], [], 2 * decls.len() + 2)
+pub fn shape_of(ty: Sort, declarations: List<Declaration>) -> Option<Shape> =
+  expand_shape(ty, declarations, [], [], 2 * declarations.len() + 2)
 
 /// How many values inhabit a type, or `None` when it is infinite, unknown, or past [`max_enumerated_points`].
-pub fn size(ty: Sort, decls: List<Decl>) -> Option<Int> =
-  match shape_of(ty, decls) { Some(s) -> Some(shape_size(s)), None -> None }
+pub fn size(ty: Sort, declarations: List<Declaration>) -> Option<Int> =
+  match shape_of(ty, declarations) { Some(s) -> Some(shape_size(s)), None -> None }
 
 /// The `Int`s a claim's guards admit a binder at, both ends included.
 pub type Interval = { low: Int, high: Int }
 
 /// The binders' domain, when every one of them is finite and the product is within [`max_enumerated_points`].
-pub fn finite(binders: List<Sort>, decls: List<Decl>) -> Option<Domain> =
-  finite_within(binders.map(|ty: Sort| { ty: ty, within: None }), decls)
+pub fn finite(binders: List<Sort>, declarations: List<Declaration>) -> Option<Domain> =
+  finite_within(binders.map(|ty: Sort| { ty: ty, within: None }), declarations)
 
 /// [`finite`], an `Int` binder being finite between the ends its claim's guards hold it to.
 pub fn finite_within(
   binders: List<{ ty: Sort, within: Option<Interval> }>,
-  decls: List<Decl>,
+  declarations: List<Declaration>,
 ) -> Option<Domain> =
   binders.fold(
     Some({ shapes: [], points: 1 }),
     |acc: Option<Domain>, b: { ty: Sort, within: Option<Interval> }|
       match acc {
         None -> None,
-        Some(seen) -> match shape_within(b.ty, b.within, decls) {
+        Some(seen) -> match shape_within(b.ty, b.within, declarations) {
           None -> None,
           Some(shape) -> {
             let n = shape_size(shape);
@@ -196,15 +196,19 @@ pub fn finite_within(
       },
   )
 
-fn shape_within(ty: Sort, within: Option<Interval>, decls: List<Decl>) -> Option<Shape> =
+fn shape_within(
+  ty: Sort,
+  within: Option<Interval>,
+  declarations: List<Declaration>,
+) -> Option<Shape> =
   match within {
-    None -> shape_of(ty, decls),
+    None -> shape_of(ty, declarations),
     Some(ends) -> match ty {
-      NamedSort(name, _) -> if name != "Int" { shape_of(ty, decls) }
+      NamedSort(name, _) -> if name != "Int" { shape_of(ty, declarations) }
       // Past the bound before it is measured, so the count never overflows.
       else if ends.high < ends.low || ends.high - ends.low >= max_enumerated_points() { None }
       else { Some(Ints(ends.low, ends.high - ends.low + 1)) },
-      _ -> shape_of(ty, decls),
+      _ -> shape_of(ty, declarations),
     },
   }
 
@@ -236,21 +240,27 @@ fn tuple_at(sizes: List<Int>, at: Int, rest: Int) -> List<Int> / {abort.raise} =
 /// which a path does once for each, and reading an argument, which a path does once between two.
 fn expand_shape(
   ty: Sort,
-  decls: List<Decl>,
+  declarations: List<Declaration>,
   expanding: List<String>,
-  subst: List<Sort>,
+  substitution: List<Sort>,
   depth_left: Int,
 ) -> Option<Shape> =
   if depth_left <= 0 { None } else {
     match ty {
       // Arguments arrive already substituted into the scope that wrote them, so one read settles a
-      // parameter; reading it against `subst` again would let `SortVariable(0)` name itself forever.
-      SortVariable(index) -> match subst.at(index) {
-        Some(argument) -> expand_shape(argument, decls, expanding, [], depth_left - 1),
+      // parameter; reading it against `substitution` again would let `SortVariable(0)` name itself forever.
+      SortVariable(index) -> match substitution.at(index) {
+        Some(argument) -> expand_shape(argument, declarations, expanding, [], depth_left - 1),
         None -> None,
       },
       FunctionSort(_, _, _) -> None,
-      RecordSort(fields) -> match fields_of(fields, decls, expanding, subst, depth_left) {
+      RecordSort(fields) -> match fields_of(
+          fields,
+          declarations,
+          expanding,
+          substitution,
+          depth_left,
+        ) {
         None -> None,
         Some(fs) -> Some(Fields(fs.size, fs.fields)),
       },
@@ -262,14 +272,14 @@ fn expand_shape(
         else if is_unbounded(name) { None }
         else if width_of(name) != 0 { Some(Scalar(name, pow(2, width_of(name)))) }
         else if expanding.contains(name) { None } else {
-          match find_decl(decls, name) {
+          match find_declaration(declarations, name) {
             None -> None,
-            Some(decl) ->
+            Some(declaration) ->
               cases_of(
-                decl,
-                decls,
+                declaration,
+                declarations,
                 expanding.push(name),
-                args.map(|a: Sort| substituted(a, subst)),
+                args.map(|a: Sort| substituted(a, substitution)),
                 depth_left - 1,
               ),
           }
@@ -298,18 +308,24 @@ fn width_of(name: String) -> Int =
 
 /// Every case of one declared type, summed: a type with no variants has no values at all.
 fn cases_of(
-  decl: Decl,
-  decls: List<Decl>,
+  declaration: Declaration,
+  declarations: List<Declaration>,
   expanding: List<String>,
   args: List<Sort>,
   depth_left: Int,
 ) -> Option<Shape> =
-  match decl.variants.fold(
+  match declaration.variants.fold(
       Some({ total: 0, cases: [] }),
       |acc: Option<{ total: Int, cases: List<{ name: String, size: Int, fields: List<Shape> }> }>, variant: Variant|
         match acc {
           None -> None,
-          Some(seen) -> match product_of(variant.fields, decls, expanding, args, depth_left) {
+          Some(seen) -> match product_of(
+              variant.fields,
+              declarations,
+              expanding,
+              args,
+              depth_left,
+            ) {
             None -> None,
             Some(p) -> {
               let total = seen.total + p.size;
@@ -330,9 +346,9 @@ fn cases_of(
 /// A tuple's shapes and the product of their sizes, refused as soon as it is past the bound.
 fn product_of(
   types: List<Sort>,
-  decls: List<Decl>,
+  declarations: List<Declaration>,
   expanding: List<String>,
-  subst: List<Sort>,
+  substitution: List<Sort>,
   depth_left: Int,
 ) -> Option<{ size: Int, shapes: List<Shape> }> =
   types.fold(
@@ -340,7 +356,7 @@ fn product_of(
     |acc: Option<{ size: Int, shapes: List<Shape> }>, ty: Sort|
       match acc {
         None -> None,
-        Some(seen) -> match expand_shape(ty, decls, expanding, subst, depth_left) {
+        Some(seen) -> match expand_shape(ty, declarations, expanding, substitution, depth_left) {
           None -> None,
           Some(shape) -> {
             let next = seen.size * shape_size(shape);
@@ -354,16 +370,16 @@ fn product_of(
 /// A record's fields in the order the type lists them, with the product of their sizes.
 fn fields_of(
   fields: List<{ name: String, ty: Sort }>,
-  decls: List<Decl>,
+  declarations: List<Declaration>,
   expanding: List<String>,
-  subst: List<Sort>,
+  substitution: List<Sort>,
   depth_left: Int,
 ) -> Option<{ size: Int, fields: List<{ name: String, shape: Shape }> }> =
   match product_of(
       fields.map(|f: { name: String, ty: Sort }| f.ty),
-      decls,
+      declarations,
       expanding,
-      subst,
+      substitution,
       depth_left,
     ) {
     None -> None,
@@ -380,26 +396,34 @@ fn fields_of(
 
 /// A type written inside a declaration, with the arguments it was applied to in place of its
 /// parameters. An argument is put in as it is, so a variable in it is never read as a parameter.
-pub fn substituted(ty: Sort, subst: List<Sort>) -> Sort =
+pub fn substituted(ty: Sort, substitution: List<Sort>) -> Sort =
   match ty {
-    SortVariable(index) -> match subst.at(index) { Some(argument) -> argument, None -> ty },
+    SortVariable(index) -> match substitution.at(index) { Some(argument) -> argument, None -> ty },
     FunctionSort(params, ret, pure) ->
-      FunctionSort(params.map(|p: Sort| substituted(p, subst)), substituted(ret, subst), pure),
+      FunctionSort(
+        params.map(|p: Sort| substituted(p, substitution)),
+        substituted(ret, substitution),
+        pure,
+      ),
     RecordSort(fields) ->
       RecordSort(
-        fields.map(|f: { name: String, ty: Sort }| { name: f.name, ty: substituted(f.ty, subst) }),
+        fields.map(|f: { name: String, ty: Sort }|
+          { name: f.name, ty: substituted(f.ty, substitution) }),
       ),
-    NamedSort(name, args) -> NamedSort(name, args.map(|a: Sort| substituted(a, subst))),
+    NamedSort(name, args) -> NamedSort(name, args.map(|a: Sort| substituted(a, substitution))),
   }
 
 /// The declaration of the type `name`, when it is a declared one.
-pub fn find_decl(decls: List<Decl>, name: String) -> Option<Decl> =
-  decls.fold(None, |found: Option<Decl>, decl: Decl|
-    match found { Some(_) -> found, None -> if decl.name == name { Some(decl) } else { None } })
+pub fn find_declaration(declarations: List<Declaration>, name: String) -> Option<Declaration> =
+  declarations.fold(None, |found: Option<Declaration>, declaration: Declaration|
+    match found {
+      Some(_) -> found,
+      None -> if declaration.name == name { Some(declaration) } else { None },
+    })
 
 // --- Tests ------------------------------------------------------------------
 
-fn kinds() -> List<Decl> =
+fn kinds() -> List<Declaration> =
   [
     {
       name: "Kind",
@@ -412,7 +436,7 @@ fn kinds() -> List<Decl> =
     },
   ]
 
-fn nat() -> List<Decl> =
+fn nat() -> List<Declaration> =
   [
     {
       name: "Nat",
@@ -424,19 +448,19 @@ fn nat() -> List<Decl> =
 pub fn named_sort(name: String) -> Sort = NamedSort(name, [])
 
 test "a nullary enum and Bool are finite and everything unbounded is not" {
-  let decls = kinds();
-  assert_eq(size(named_sort("Bool"), decls), Some(2));
-  assert_eq(size(named_sort("Unit"), decls), Some(1));
-  assert_eq(size(named_sort("Kind"), decls), Some(3));
-  assert_eq(size(named_sort("Int"), decls), None);
-  assert_eq(size(named_sort("String"), decls), None);
-  assert_eq(size(named_sort("Bytes"), decls), None);
-  assert_eq(size(named_sort("Float"), decls), None);
-  assert_eq(size(named_sort("List"), decls), None);
+  let declarations = kinds();
+  assert_eq(size(named_sort("Bool"), declarations), Some(2));
+  assert_eq(size(named_sort("Unit"), declarations), Some(1));
+  assert_eq(size(named_sort("Kind"), declarations), Some(3));
+  assert_eq(size(named_sort("Int"), declarations), None);
+  assert_eq(size(named_sort("String"), declarations), None);
+  assert_eq(size(named_sort("Bytes"), declarations), None);
+  assert_eq(size(named_sort("Float"), declarations), None);
+  assert_eq(size(named_sort("List"), declarations), None);
   // A 64-bit width does not fit the arithmetic here, but a narrower one is a count like any other.
-  assert_eq(size(named_sort("U64"), decls), None);
-  assert_eq(size(named_sort("U8"), decls), Some(256));
-  assert_eq(size(named_sort("I32"), decls), Some(4294967296))
+  assert_eq(size(named_sort("U64"), declarations), None);
+  assert_eq(size(named_sort("U8"), declarations), Some(256));
+  assert_eq(size(named_sort("I32"), declarations), Some(4294967296))
 }
 
 test "a type variable and a function are never finite" {
@@ -449,18 +473,18 @@ test "a recursive type is infinite even with a nullary base case" {
 }
 
 test "a record's size is the product of its fields'" {
-  let decls = kinds();
+  let declarations = kinds();
   assert_eq(
     size(
       RecordSort([{ name: "k", ty: named_sort("Kind") }, { name: "b", ty: named_sort("Bool") }]),
-      decls,
+      declarations,
     ),
     Some(6),
   );
   assert_eq(
     size(
       RecordSort([{ name: "k", ty: named_sort("Kind") }, { name: "n", ty: named_sort("Int") }]),
-      decls,
+      declarations,
     ),
     None,
   )
@@ -583,9 +607,9 @@ test "an Int is finite between the ends its guards hold it to, and walked from t
 }
 
 test "a product beyond the bound is refused rather than walked" {
-  let decls = kinds();
-  assert_eq(finite(range(0, 16).map(|_i: Int| named_sort("Kind")), decls), None);
-  match finite(range(0, 4).map(|_i: Int| named_sort("Kind")), decls) {
+  let declarations = kinds();
+  assert_eq(finite(range(0, 16).map(|_i: Int| named_sort("Kind")), declarations), None);
+  match finite(range(0, 4).map(|_i: Int| named_sort("Kind")), declarations) {
     None -> assert_eq(false, true),
     Some(domain) -> assert_eq(domain.points, 81),
   }
@@ -613,8 +637,8 @@ test "a ground claim has exactly one point" {
 }
 
 test "enumeration covers the domain once each in a fixed order" {
-  let decls = kinds();
-  match finite([named_sort("Bool"), named_sort("Kind")], decls) {
+  let declarations = kinds();
+  match finite([named_sort("Bool"), named_sort("Kind")], declarations) {
     None -> assert_eq(false, true),
     Some(domain) -> {
       assert_eq(domain.points, 6);
@@ -704,14 +728,14 @@ test "a point is every binder's value, the last varying fastest" {
 }
 
 test "a case takes its share of its type, a width starts at its least value, and a ground claim has one point" {
-  let decls = [
+  let declarations = [
     {
       name: "m.Kind",
       params: 0,
       variants: [{ name: "m.Off", fields: [] }, { name: "m.On", fields: [NamedSort("Bool", [])] }],
     },
   ];
-  match finite([NamedSort("m.Kind", [])], decls) {
+  match finite([NamedSort("m.Kind", [])], declarations) {
     None -> panic("a finite domain"),
     Some(d) ->
       assert_eq(range(0, d.points).map(|i: Int| point_at(d, i)), [

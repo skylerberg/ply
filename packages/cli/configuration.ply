@@ -1,8 +1,8 @@
 import compiler.cc
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import compiler.front.rows (ModuleSpan)
 import compiler.load (LoadedAnalysis)
-import diagnostic (diag_of, shown)
+import diagnostic (diagnostic_of, shown)
 import std.env (env)
 import machine
 import machine (ConfigOptions, RunConfiguration)
@@ -47,7 +47,7 @@ pub type Configuration = {
   environment: Int,
 }
 
-pub type Resolution = { configuration: Configuration, warnings: List<Diag> }
+pub type Resolution = { configuration: Configuration, warnings: List<Diagnostic> }
 
 pub fn closed_configuration() -> Configuration =
   { values: Map::new(), schema: None, sets: 0, files: [], environment: 0 }
@@ -82,7 +82,7 @@ fn is_secret(shape: Option<Shape>) -> Bool = shape == Some(SSecret)
 
 pub fn redacted() -> String = "****"
 
-fn error(code: Bytes, message: String, label: String, notes: List<String>) -> Diag =
+fn error(code: Bytes, message: String, label: String, notes: List<String>) -> Diagnostic =
   error_at(
     code,
     no_module(),
@@ -92,7 +92,7 @@ fn error(code: Bytes, message: String, label: String, notes: List<String>) -> Di
     notes.map(Bytes::of_string),
   )
 
-fn configuration_error(message: String, label: String, notes: List<String>) -> Diag =
+fn configuration_error(message: String, label: String, notes: List<String>) -> Diagnostic =
   error(b"E0440", message, label, notes)
 
 fn char_of(c: Int) -> String / {abort.raise} =
@@ -154,7 +154,7 @@ fn pair_error(why: ini::ErrorKind) -> String =
     _ -> "it has no `=`",
   }
 
-fn unreadable(path: String, why: Option<String>) -> Diag =
+fn unreadable(path: String, why: Option<String>) -> Diagnostic =
   configuration_error(
     "`--config " ++ path ++ "` could not be read"
       ++ (match why { Some(w) -> ": " ++ w, None -> "" }),
@@ -165,7 +165,7 @@ fn unreadable(path: String, why: Option<String>) -> Diag =
     ],
   )
 
-fn bad_line(path: String, number: Int, line: String, why: String) -> Diag / {abort.raise} =
+fn bad_line(path: String, number: Int, line: String, why: String) -> Diagnostic / {abort.raise} =
   configuration_error(
     "`" ++ path ++ "` line " ++ number.to_string() ++ " is not `KEY=VALUE`: " ++ why,
     "this line is the run's configuration",
@@ -176,7 +176,7 @@ fn bad_line(path: String, number: Int, line: String, why: String) -> Diag / {abo
     ],
   )
 
-fn bad_set(argument: String, why: String) -> Diag =
+fn bad_set(argument: String, why: String) -> Diagnostic =
   configuration_error(
     "`--set " ++ argument ++ "` is not `KEY=VALUE`: " ++ why,
     "this argument is the run's configuration",
@@ -185,25 +185,32 @@ fn bad_set(argument: String, why: String) -> Diag =
 
 pub type ConfigFile = { path: String, text: Option<Bytes> }
 
-type SuppliedValues = { supplied: Map<String, SuppliedValue>, diags: List<Diag> }
+type SuppliedValues = { supplied: Map<String, SuppliedValue>, diagnostics: List<Diagnostic> }
 
 fn add_file_values(gathered: SuppliedValues, f: ConfigFile) -> SuppliedValues / {abort.raise} =
   match f.text {
-    None -> { ..gathered, diags: gathered.diags.push(unreadable(f.path, None)) },
+    None -> { ..gathered, diagnostics: gathered.diagnostics.push(unreadable(f.path, None)) },
     Some(b) -> if !b.is_utf8() {
-      { ..gathered, diags: gathered.diags.push(unreadable(f.path, Some("it is not UTF-8"))) }
+      {
+        ..gathered,
+        diagnostics: gathered.diagnostics.push(unreadable(f.path, Some("it is not UTF-8"))),
+      }
     } else {
       let ls = String::of_bytes(b).lines();
       range(0, ls.len()).fold(gathered, |acc: SuppliedValues, i: Int| {
         let line = match ls.at(i) { Some(l) -> l, None -> "" };
         match parse_line(line) {
           Ok(None) -> acc,
-          Ok(Some(kv)) ->
+          Ok(Some(key_value)) ->
             {
               ..acc,
-              supplied: acc.supplied.insert(kv.key, { value: kv.value, source: ByFile(f.path) }),
+              supplied: acc.supplied.insert(key_value.key, {
+                value: key_value.value,
+                source: ByFile(f.path),
+              }),
             },
-          Err(why) -> { ..acc, diags: acc.diags.push(bad_line(f.path, i + 1, line, why)) },
+          Err(why) ->
+            { ..acc, diagnostics: acc.diagnostics.push(bad_line(f.path, i + 1, line, why)) },
         }
       })
     },
@@ -213,22 +220,26 @@ pub fn sources_of(
   sets: List<String>,
   files: List<ConfigFile>,
   environment: List<{ name: String, value: String }>,
-) -> Result<Sources, List<Diag>> / {abort.raise} = {
+) -> Result<Sources, List<Diagnostic>> / {abort.raise} = {
   let from_env = environment.fold(
     Map::new(),
     |m: Map<String, SuppliedValue>, v: { name: String, value: String }|
       if key_error(v.name) == None { m.insert(v.name, { value: v.value, source: ByEnvironment }) }
       else { m },
   );
-  let from_files = files.fold({ supplied: from_env, diags: [] }, add_file_values);
+  let from_files = files.fold({ supplied: from_env, diagnostics: [] }, add_file_values);
   let all = sets.fold(from_files, |acc: SuppliedValues, argument: String|
     match parse_line(argument) {
-      Ok(Some(kv)) ->
-        { ..acc, supplied: acc.supplied.insert(kv.key, { value: kv.value, source: BySet }) },
-      Ok(None) -> { ..acc, diags: acc.diags.push(bad_set(argument, "it supplies no key")) },
-      Err(why) -> { ..acc, diags: acc.diags.push(bad_set(argument, why)) },
+      Ok(Some(key_value)) ->
+        {
+          ..acc,
+          supplied: acc.supplied.insert(key_value.key, { value: key_value.value, source: BySet }),
+        },
+      Ok(None) ->
+        { ..acc, diagnostics: acc.diagnostics.push(bad_set(argument, "it supplies no key")) },
+      Err(why) -> { ..acc, diagnostics: acc.diagnostics.push(bad_set(argument, why)) },
     });
-  if all.diags.len() > 0 { Err(all.diags) } else {
+  if all.diagnostics.len() > 0 { Err(all.diagnostics) } else {
     Ok({
       supplied: all.supplied,
       sets: sets.len(),
@@ -238,7 +249,7 @@ pub fn sources_of(
   }
 }
 
-fn malformed(function: String, why: String) -> Diag =
+fn malformed(function: String, why: String) -> Diagnostic =
   configuration_error(
     "`--config-schema " ++ function ++ "` returned something that is not a `ConfigSpec`: " ++ why,
     "this value decides what the run requires of its configuration",
@@ -259,7 +270,7 @@ fn shape_of(ctor: String) -> Option<Shape> =
   else if ctor == "std.config.SSecret" { Some(SSecret) }
   else { None }
 
-fn key_of(value: Value, function: String) -> Result<Key, Diag> =
+fn key_of(value: Value, function: String) -> Result<Key, Diagnostic> =
   match value {
     VRecord(fields) -> match field(fields, "name") {
       Some(VStr(name)) -> match field(fields, "shape") {
@@ -292,7 +303,7 @@ fn key_of(value: Value, function: String) -> Result<Key, Diag> =
     _ -> Err(malformed(function, "a key in `keys` is not a record")),
   }
 
-fn duplicate_key_error(name: String) -> Diag =
+fn duplicate_key_error(name: String) -> Diagnostic =
   configuration_error(
     "the configuration schema declares `" ++ name ++ "` twice",
     "a key is declared once or the run cannot resolve it",
@@ -302,7 +313,7 @@ fn duplicate_key_error(name: String) -> Diag =
     ],
   )
 
-fn check_unique_keys(keys: List<Key>) -> Option<Diag> = {
+fn check_unique_keys(keys: List<Key>) -> Option<Diagnostic> = {
   let walked = keys.fold(
     { seen: Map::new(), dup: None },
     |acc: { seen: Map<String, Bool>, dup: Option<String> }, k: Key|
@@ -315,7 +326,7 @@ fn check_unique_keys(keys: List<Key>) -> Option<Diag> = {
   match walked.dup { Some(name) -> Some(duplicate_key_error(name)), None -> None }
 }
 
-pub fn schema_of(value: Value, function: String) -> Result<Schema, Diag> =
+pub fn schema_of(value: Value, function: String) -> Result<Schema, Diagnostic> =
   match value {
     VRecord(fields) -> match field(fields, "keys") {
       Some(VList(items)) -> match Result::traverse(items, |item: Value| key_of(item, function)) {
@@ -340,7 +351,7 @@ fn shape_error(shape: Shape, value: String) -> Option<String> / {abort.raise} =
     else { None },
   }
 
-fn missing(k: Key, sources: Sources) -> Diag / {abort.raise} = {
+fn missing(k: Key, sources: Sources) -> Diagnostic / {abort.raise} = {
   let files = if sources.files.len() == 0 { "no `--config` file" } else {
     "the `--config` " ++ plural(sources.files.len(), "file") ++ " "
       ++ String::join(sources.files.map(|f: String| "`" ++ f ++ "`"), ", ")
@@ -366,7 +377,7 @@ fn missing(k: Key, sources: Sources) -> Diag / {abort.raise} = {
   )
 }
 
-fn invalid(k: Key, r: ResolvedValue, why: String) -> Diag =
+fn invalid(k: Key, r: ResolvedValue, why: String) -> Diagnostic =
   error(
     b"E0442",
     "`" ++ k.name ++ "` is declared `" ++ shape_word(k.shape) ++ "` and " ++ source_text(r.source)
@@ -382,7 +393,7 @@ fn invalid(k: Key, r: ResolvedValue, why: String) -> Diag =
     ],
   )
 
-fn undeclared(key: String, source: Source, schema: Schema) -> Diag = {
+fn undeclared(key: String, source: Source, schema: Schema) -> Diagnostic = {
   let names = schema.keys.map(|k: Key| k.name).sort();
   let declared = if names.len() == 0 { "the schema declares no keys at all" }
   else { "the schema declares: " ++ String::join(names, ", ") };
@@ -399,7 +410,7 @@ fn undeclared(key: String, source: Source, schema: Schema) -> Diag = {
   { ..d, severity: b"warning" }
 }
 
-type ResolveState = { values: Map<String, ResolvedValue>, diags: List<Diag> }
+type ResolveState = { values: Map<String, ResolvedValue>, diagnostics: List<Diagnostic> }
 
 fn resolve_key(acc: ResolveState, sources: Sources, k: Key) -> ResolveState / {abort.raise} = {
   let found: Option<ResolvedValue> = match sources.supplied.get(k.name) {
@@ -410,9 +421,10 @@ fn resolve_key(acc: ResolveState, sources: Sources, k: Key) -> ResolveState / {a
     },
   };
   match found {
-    None -> if k.required { { ..acc, diags: acc.diags.push(missing(k, sources)) } } else { acc },
+    None -> if k.required { { ..acc, diagnostics: acc.diagnostics.push(missing(k, sources)) } }
+    else { acc },
     Some(r) -> match shape_error(k.shape, r.value) {
-      Some(why) -> { ..acc, diags: acc.diags.push(invalid(k, r, why)) },
+      Some(why) -> { ..acc, diagnostics: acc.diagnostics.push(invalid(k, r, why)) },
       None -> { ..acc, values: acc.values.insert(k.name, r) },
     },
   }
@@ -421,16 +433,16 @@ fn resolve_key(acc: ResolveState, sources: Sources, k: Key) -> ResolveState / {a
 pub fn resolved(
   sources: Sources,
   schema: Option<Schema>,
-) -> Result<Resolution, List<Diag>> / {abort.raise} = {
+) -> Result<Resolution, List<Diagnostic>> / {abort.raise} = {
   let supplied = sources.supplied.fold(
     Map::new(),
     |m: Map<String, ResolvedValue>, key: String, sup: SuppliedValue|
       m.insert(key, { value: sup.value, source: sup.source, shape: None }),
   );
   let walked = match schema {
-    None -> { values: supplied, diags: [] },
+    None -> { values: supplied, diagnostics: [] },
     Some(sc) ->
-      sc.keys.fold({ values: supplied, diags: [] }, |acc: ResolveState, k: Key|
+      sc.keys.fold({ values: supplied, diagnostics: [] }, |acc: ResolveState, k: Key|
         resolve_key(acc, sources, k)),
   };
   let warnings = match schema {
@@ -438,13 +450,13 @@ pub fn resolved(
     Some(sc) -> {
       let declared = sc.keys.fold(Map::new(), |m: Map<String, Bool>, k: Key|
         m.insert(k.name, true));
-      sources.supplied.fold([], |diags: List<Diag>, key: String, sup: SuppliedValue|
+      sources.supplied.fold([], |diagnostics: List<Diagnostic>, key: String, sup: SuppliedValue|
         if is_explicit(sup.source) && !declared.contains(key) {
-          diags.push(undeclared(key, sup.source, sc))
-        } else { diags })
+          diagnostics.push(undeclared(key, sup.source, sc))
+        } else { diagnostics })
     },
   };
-  if walked.diags.len() > 0 { Err(walked.diags) } else {
+  if walked.diagnostics.len() > 0 { Err(walked.diagnostics) } else {
     Ok({
       configuration: {
         values: walked.values,
@@ -468,16 +480,16 @@ pub fn supplied(
 
 pub fn resolve_configuration<| e>(
   flags: ConfigOptions,
-  evaluated: (String) -> Result<Value, List<Diag>> / e,
-) -> Result<Resolution, List<Diag>> / {abort.raise, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs] | e} = {
+  evaluated: (String) -> Result<Value, List<Diagnostic>> / e,
+) -> Result<Resolution, List<Diagnostic>> / {abort.raise, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs] | e} = {
   let files = flags.files.map(|path: String|
     { path: path, text: paths::read_file(paths::rooted(paths::resolve(path))) });
   match sources_of(flags.set, files, env.variables()) {
-    Err(diags) -> Err(diags),
+    Err(diagnostics) -> Err(diagnostics),
     Ok(sources) -> match flags.schema {
       None -> resolved(sources, None),
       Some(function) -> match evaluated(function) {
-        Err(diags) -> Err(diags),
+        Err(diagnostics) -> Err(diagnostics),
         Ok(v) -> match schema_of(v, function) {
           Err(d) -> Err([d]),
           Ok(schema) -> resolved(sources, Some(schema)),
@@ -491,11 +503,11 @@ pub fn evaluate_schema(
   front: LoadedAnalysis,
   profile: cc::Profile,
   name: String,
-) -> Result<Value, List<Diag>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
+) -> Result<Value, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
   match units::whole_text(front) {
-    Err(diags) -> Err(diags),
+    Err(diagnostics) -> Err(diagnostics),
     Ok(text) -> match units::library(text, profile) {
-      Err(diags) -> Err(diags),
+      Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(why) -> Err([machine::unit_load_error(why)]),
         Ok(opened) -> {
@@ -511,12 +523,12 @@ pub fn evaluate_schema_on_unit(
   unit: Int,
   roots: Map<Bytes, ModuleSpan>,
   name: String,
-) -> Result<Value, List<Diag>> / {entering::machine.enter, abort.raise} = {
+) -> Result<Value, List<Diagnostic>> / {entering::machine.enter, abort.raise} = {
   let o = entering::machine.enter(unit, name, machine::arguments_of([]), machine::evaluation_run());
   match o.ended {
     entering::NoRoot ->
       Err([
-        diag_of(
+        diagnostic_of(
           "error",
           "E0440",
           "`--config-schema " ++ name ++ "` names no definition in this program",
@@ -528,7 +540,7 @@ pub fn evaluate_schema_on_unit(
       Ok(v) -> Ok(v),
       Err(raised) ->
         Err([
-          diag_of(
+          diagnostic_of(
             "error",
             "E0440",
             "`--config-schema " ++ name ++ "` could not be evaluated: "
@@ -700,7 +712,7 @@ fn read_err(
   sets: List<String>,
   files: List<ConfigFile>,
   environment: List<{ name: String, value: String }>,
-) -> List<Diag> / {abort.raise} =
+) -> List<Diagnostic> / {abort.raise} =
   match sources_of(sets, files, environment) {
     Ok(_) -> panic("a source was refused"),
     Err(ds) -> ds,
@@ -711,7 +723,7 @@ fn spec_of(keys: List<Key>) -> Option<Schema> = Some({ function: "m.spec", keys:
 fn resolved_ok(s: Sources, schema: Option<Schema>) -> Resolution / {abort.raise} =
   match resolved(s, schema) { Ok(r) -> r, Err(_) -> panic("the configuration resolves") }
 
-fn resolved_err(s: Sources, schema: Option<Schema>) -> List<Diag> / {abort.raise} =
+fn resolved_err(s: Sources, schema: Option<Schema>) -> List<Diagnostic> / {abort.raise} =
   match resolved(s, schema) { Ok(_) -> panic("the configuration was refused"), Err(ds) -> ds }
 
 fn value_of(resolution: Resolution, key: String) -> Option<String> =
@@ -720,15 +732,16 @@ fn value_of(resolution: Resolution, key: String) -> Option<String> =
 fn source_of(resolution: Resolution, key: String) -> Option<Source> =
   match resolution.configuration.values.get(key) { Some(v) -> Some(v.source), None -> None }
 
-fn codes(diags: List<Diag>) -> List<Bytes> = diags.map(|diag: Diag| diag.code)
+fn codes(diagnostics: List<Diagnostic>) -> List<Bytes> =
+  diagnostics.map(|diagnostic: Diagnostic| diagnostic.code)
 
-fn rendered(diag: Diag) -> String =
-  String::of_bytes_lossy(diag.message) ++ " "
-    ++ String::join(diag.notes_text.map(|n: Bytes| String::of_bytes_lossy(n)), " ")
+fn rendered(diagnostic: Diagnostic) -> String =
+  String::of_bytes_lossy(diagnostic.message) ++ " "
+    ++ String::join(diagnostic.notes_text.map(|n: Bytes| String::of_bytes_lossy(n)), " ")
 
-fn says(diag: Diag, text: String) -> Bool = rendered(diag).contains(text)
+fn says(diagnostic: Diagnostic, text: String) -> Bool = rendered(diagnostic).contains(text)
 
-fn first(ds: List<Diag>) -> Diag / {abort.raise} =
+fn first(ds: List<Diagnostic>) -> Diagnostic / {abort.raise} =
   match ds.at(0) { Some(d) -> d, None -> panic("a diagnostic was raised") }
 
 fn required_key(name: String, shape: Shape) -> Key = { ..optional(name, shape), required: true }
@@ -926,14 +939,14 @@ test "an undeclared explicit key is W0607 listing the declared ones, an environm
     spec_of([optional("SERVICE_REGION", SText)]),
   );
   assert_eq(codes(r.warnings), [b"W0607", b"W0607"]);
-  assert_eq(r.warnings.map(|diag: Diag| diag.severity), [b"warning", b"warning"]);
+  assert_eq(r.warnings.map(|diagnostic: Diagnostic| diagnostic.severity), [b"warning", b"warning"]);
   assert(
-    r.warnings.fold(false, |hit: Bool, diag: Diag|
-      hit || says(diag, "--set supplies `SERVICE_PROT`")),
+    r.warnings.fold(false, |hit: Bool, diagnostic: Diagnostic|
+      hit || says(diagnostic, "--set supplies `SERVICE_PROT`")),
   );
   assert(
-    r.warnings.fold(false, |hit: Bool, diag: Diag|
-      hit || says(diag, "--config deploy.env supplies `SERVICE_RGION`")),
+    r.warnings.fold(false, |hit: Bool, diagnostic: Diagnostic|
+      hit || says(diagnostic, "--config deploy.env supplies `SERVICE_RGION`")),
   );
   assert(says(first(r.warnings), "the schema declares: SERVICE_REGION"));
   assert_eq(resolved_ok(read_ok(["ANYTHING=1"], [], []), None).warnings, [])

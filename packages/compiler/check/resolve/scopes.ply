@@ -1,44 +1,45 @@
-import compiler.syntax.parsing (Span, Ident, QName, dummy_span)
-import compiler.syntax.items (Module, Item, is_shipped, TypeItem, SumBody, VariantDef, ImportDecl,
-                              ModuleAlias, SelectedNames, member_name, Opaque)
-import compiler.syntax.exprs (implicitly_imported_by)
+import compiler.syntax.parsing (Span, Identifier, QName, dummy_span)
+import compiler.syntax.items (Module, Item, is_shipped, TypeItem, SumBody, VariantDefinition,
+                              ImportDeclaration, ModuleAlias, SelectedNames, member_name, Opaque)
+import compiler.syntax.expressions (implicitly_imported_by)
 import std.list
-import compiler.check.resolve.tables (ParsedModule, Namespace, TypeSpace, ValueSpace, Decls,
-                                      Binding, Bindings, Scope, Diag, Edge, ModuleEntry, Resolution,
-                                      namespaces, push_declared, lookup_declared, push_binding,
-                                      lookup, find_module_binding, position, default_binder,
-                                      qualify, import_module_name, path_span, import_binder,
-                                      binder_span, error_at, error_at_and, backticked, list_names,
-                                      describe_namespace, namespace_keyword, exported_names)
+import compiler.check.resolve.tables (ParsedModule, Namespace, TypeSpace, ValueSpace, Declarations,
+                                      Binding, Bindings, Scope, Diagnostic, Edge, ModuleEntry,
+                                      Resolution, namespaces, push_declared, lookup_declared,
+                                      push_binding, lookup, find_module_binding, position,
+                                      default_binder, qualify, import_module_name, path_span,
+                                      import_binder, binder_span, error_at, error_at_and,
+                                      backticked, list_names, describe_namespace, namespace_keyword,
+                                      exported_names)
 
 pub type ScopeBuilder = {
   scope: Scope,
-  local: Decls,
-  imported: Decls,
+  local: Declarations,
+  imported: Declarations,
   edges: List<Edge>,
-  diags: List<Diag>,
+  diagnostics: List<Diagnostic>,
 }
 
 pub type ResolutionContext = {
-  mods: List<ParsedModule>,
+  modules: List<ParsedModule>,
   names: List<ModuleEntry>,
-  declarations: List<Decls>,
+  declarations: List<Declarations>,
   declared: List<Bindings>,
-  pkgs: List<PackageDeps>,
+  packages: List<PackageDependencies>,
   module_packages: List<Int>,
   std: Int,
   compiler: Int,
   shipped: Int,
 }
 
-pub type PackageDeps = { prefix: Bytes, deps: List<Bytes> }
+pub type PackageDependencies = { prefix: Bytes, dependencies: List<Bytes> }
 
 pub fn no_packages(
-  mods: List<ParsedModule>,
-) -> { pkgs: List<PackageDeps>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int } =
+  modules: List<ParsedModule>,
+) -> { packages: List<PackageDependencies>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int } =
   {
-    pkgs: [{ prefix: b"", deps: [] }],
-    module_packages: mods.map(|parsed: ParsedModule| 0),
+    packages: [{ prefix: b"", dependencies: [] }],
+    module_packages: modules.map(|parsed: ParsedModule| 0),
     std: 1,
     compiler: 2,
     shipped: 3,
@@ -52,35 +53,36 @@ pub fn bind_import(
   w: ResolutionContext,
   i: Int,
   builder: ScopeBuilder,
-  decl: ImportDecl,
+  declaration: ImportDeclaration,
 ) -> ScopeBuilder / {abort.raise} =
-  match import_target(w, i, builder, decl) {
+  match import_target(w, i, builder, declaration) {
     Found(t) -> {
       let b2: ScopeBuilder = {
         ..builder,
-        edges: builder.edges.push({ from: i, target: t, span: path_span(decl) }),
+        edges: builder.edges.push({ from: i, target: t, span: path_span(declaration) }),
       };
-      match decl.kind {
+      match declaration.kind {
         SelectedNames(names) -> {
-          let key = default_binder(import_module_name(decl));
+          let key = default_binder(import_module_name(declaration));
           let sel = match find_module_binding(b2.scope.selective, key) {
             Some(_) -> b2.scope.selective,
-            None -> b2.scope.selective.push({ binder: key, target: t, span: path_span(decl) }),
+            None ->
+              b2.scope.selective.push({ binder: key, target: t, span: path_span(declaration) }),
           };
           let b3: ScopeBuilder = { ..b2, scope: { ..b2.scope, selective: sel } };
-          names.fold(b3, |acc: ScopeBuilder, ident: Ident| bind_name(w, i, acc, t, ident))
+          names.fold(b3, |acc: ScopeBuilder, ident: Identifier| bind_name(w, i, acc, t, ident))
         },
         ModuleAlias(a) ->
           implicitly_imported_by(a.name).fold(
-            bind_module(w, i, b2, decl, t),
+            bind_module(w, i, b2, declaration, t),
             |acc: ScopeBuilder, n: Bytes|
               if namespaces().any(|namespace: Namespace|
                     lookup(acc.scope.bound, namespace, n) != None)
                   || !namespaces().any(|namespace: Namespace|
                     lookup_declared(w.declarations.get(t), namespace, n) != None) { acc }
-              else { bind_name(w, i, acc, t, { name: n, span: path_span(decl) }) },
+              else { bind_name(w, i, acc, t, { name: n, span: path_span(declaration) }) },
           ),
-        _ -> bind_module(w, i, b2, decl, t),
+        _ -> bind_module(w, i, b2, declaration, t),
       }
     },
     _ -> builder,
@@ -92,18 +94,19 @@ fn import_target(
   w: ResolutionContext,
   i: Int,
   builder: ScopeBuilder,
-  decl: ImportDecl,
+  declaration: ImportDeclaration,
 ) -> ImportTarget / {abort.raise} = {
-  let name = import_module_name(decl);
+  let name = import_module_name(declaration);
   if name.len() == 0 { Missing } else {
     let p = w.module_packages.get(i);
-    if 0 < p && p < w.shipped && p < w.pkgs.len() && name.index_of(b".") == None {
+    if 0 < p && p < w.shipped && p < w.packages.len() && name.index_of(b".") == None {
       sibling(w, i, name)
     } else {
       match sibling(w, i, name) {
         Found(t) -> Found(t),
         _ -> match index_of(w.names, name) {
-          Some(t) -> if w.mods.get(t).name.len() == 0 { Missing } else { allowed_target(w, i, t) },
+          Some(t) -> if w.modules.get(t).name.len() == 0 { Missing }
+          else { allowed_target(w, i, t) },
           None -> Missing,
         },
       }
@@ -113,11 +116,11 @@ fn import_target(
 
 fn sibling(w: ResolutionContext, i: Int, name: Bytes) -> ImportTarget / {abort.raise} = {
   let p = w.module_packages.get(i);
-  if p == 0 || p >= w.shipped || p >= w.pkgs.len() { Missing } else {
-    let prefix = w.pkgs.get(p).prefix;
+  if p == 0 || p >= w.shipped || p >= w.packages.len() { Missing } else {
+    let prefix = w.packages.get(p).prefix;
     if name.starts_with(prefix.concat(b".")) { Missing } else {
       match index_of(w.names, Bytes::concat_all([prefix, b".", name])) {
-        Some(t) -> if w.mods.get(t).name.len() == 0 { Missing } else { Found(t) },
+        Some(t) -> if w.modules.get(t).name.len() == 0 { Missing } else { Found(t) },
         None -> Missing,
       }
     }
@@ -128,36 +131,37 @@ fn allowed_target(w: ResolutionContext, i: Int, t: Int) -> ImportTarget / {abort
   let p = w.module_packages.get(i);
   let q = w.module_packages.get(t);
   if q == p || q == w.std || q == w.compiler || q >= w.shipped || p >= w.shipped { Found(t) } else {
-    let prefix = w.pkgs.get(q).prefix;
-    if w.pkgs.get(p).deps.contains(prefix) { Found(t) }
+    let prefix = w.packages.get(q).prefix;
+    if w.packages.get(p).dependencies.contains(prefix) { Found(t) }
     else { Undeclared({ importer: p, owning_package: q }) }
   }
 }
 
 fn internal_import(w: ResolutionContext, i: Int, t: Int) -> Bool / {abort.raise} = {
-  let held = w.mods.get(t).name;
-  (held == b"std.internal" || held.starts_with(b"std.internal.")) && !is_shipped(w.mods.get(i).name)
+  let held = w.modules.get(t).name;
+  (held == b"std.internal" || held.starts_with(b"std.internal."))
+    && !is_shipped(w.modules.get(i).name)
 }
 
 pub fn target_or_report(
   w: ResolutionContext,
   i: Int,
   builder: ScopeBuilder,
-  decl: ImportDecl,
+  declaration: ImportDeclaration,
 ) -> { b: ScopeBuilder, t: Option<Int> } / {abort.raise} =
-  match import_target(w, i, builder, decl) {
+  match import_target(w, i, builder, declaration) {
     Found(t) -> if internal_import(w, i, t) {
       {
         b: {
           ..builder,
-          diags: builder.diags.push(
+          diagnostics: builder.diagnostics.push(
             error_at(
               b"E0159",
               i,
-              path_span(decl),
+              path_span(declaration),
               Bytes::concat_all([
                 b"`",
-                w.mods.get(t).name,
+                w.modules.get(t).name,
                 b"` is the toolchain's own, which only its shipped modules import",
               ]),
               b"not importable here",
@@ -171,7 +175,7 @@ pub fn target_or_report(
       }
     } else { { b: builder, t: Some(t) } },
     Undeclared(u) -> {
-      let name = import_module_name(decl);
+      let name = import_module_name(declaration);
       let message = if u.owning_package == 0 {
         Bytes::concat_all([
           b"`",
@@ -183,17 +187,17 @@ pub fn target_or_report(
           b"`",
           name,
           b"` belongs to the package `",
-          w.pkgs.get(u.owning_package).prefix,
+          w.packages.get(u.owning_package).prefix,
           b"`, which `",
-          w.pkgs.get(u.importer).prefix,
+          w.packages.get(u.importer).prefix,
           b"` does not declare as a dependency",
         ])
       };
       {
         b: {
           ..builder,
-          diags: builder.diags.push(
-            error_at(b"E0132", i, path_span(decl), message, b"not a declared dependency", [
+          diagnostics: builder.diagnostics.push(
+            error_at(b"E0132", i, path_span(declaration), message, b"not a declared dependency", [
               b"add it to that package's ply.pkg dependencies to import it",
             ]),
           ),
@@ -202,7 +206,7 @@ pub fn target_or_report(
       }
     },
     Missing -> {
-      let name = import_module_name(decl);
+      let name = import_module_name(declaration);
       let near = w.names.fold([], |acc: List<Bytes>, e: ModuleEntry|
         if e.name.len() > 0 && e.name.ends_with(default_binder(name)) { acc.push(e.name) }
         else { acc });
@@ -212,11 +216,11 @@ pub fn target_or_report(
       {
         b: {
           ..builder,
-          diags: builder.diags.push(
+          diagnostics: builder.diagnostics.push(
             error_at(
               b"E0106",
               i,
-              path_span(decl),
+              path_span(declaration),
               Bytes::concat_all([b"no module named `", name, b"` in this program"]),
               b"not found",
               [note],
@@ -232,19 +236,19 @@ fn bind_module(
   w: ResolutionContext,
   i: Int,
   builder: ScopeBuilder,
-  decl: ImportDecl,
+  declaration: ImportDeclaration,
   t: Int,
 ) -> ScopeBuilder / {abort.raise} =
-  match import_binder(decl) {
+  match import_binder(declaration) {
     None -> builder,
     Some(binder) -> {
-      let s = binder_span(decl);
+      let s = binder_span(declaration);
       match find_module_binding(builder.scope.modules, binder) {
         Some(first) -> {
-          let name = import_module_name(decl);
+          let name = import_module_name(declaration);
           {
             ..builder,
-            diags: builder.diags.push(
+            diagnostics: builder.diagnostics.push(
               error_at_and(
                 b"E0110",
                 i,
@@ -255,7 +259,7 @@ fn bind_module(
                 first.span,
                 Bytes::concat_all([
                   b"`",
-                  w.mods.get(first.target).name,
+                  w.modules.get(first.target).name,
                   b"` is already bound as `",
                   binder,
                   b"`",
@@ -282,20 +286,20 @@ fn bind_name(
   i: Int,
   builder: ScopeBuilder,
   t: Int,
-  name: Ident,
+  name: Identifier,
 ) -> ScopeBuilder / {abort.raise} = {
-  let decls = w.declarations.get(t);
-  let module = w.mods.get(t).name;
+  let declarations = w.declarations.get(t);
+  let module = w.modules.get(t).name;
   let found = namespaces().filter(|namespace: Namespace|
-    match lookup_declared(decls, namespace, name.name) { Some(_) -> true, None -> false });
+    match lookup_declared(declarations, namespace, name.name) { Some(_) -> true, None -> false });
   if found.len() == 0 {
-    let exported = exported_names(decls);
+    let exported = exported_names(declarations);
     let note = if exported.len() == 0 {
       Bytes::concat_all([b"`", module, b"` exports nothing; mark an item `pub` to export it"])
     } else { Bytes::concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")]) };
     {
       ..builder,
-      diags: builder.diags.push(
+      diagnostics: builder.diagnostics.push(
         error_at(
           b"E0101",
           i,
@@ -308,16 +312,19 @@ fn bind_name(
     }
   } else {
     let public = found.filter(|namespace: Namespace|
-      match lookup_declared(decls, namespace, name.name) { Some(x) -> x.public, None -> false });
+      match lookup_declared(declarations, namespace, name.name) {
+        Some(x) -> x.public,
+        None -> false,
+      });
     if public.len() == 0 {
-      let allowed_target = match lookup_declared(decls, found.get(0), name.name) {
+      let allowed_target = match lookup_declared(declarations, found.get(0), name.name) {
         Some(x) -> x,
         None -> panic("just found"),
       };
       {
         ..builder,
-        diags: builder.diags.push(
-          match opaque_constructor_error(w.mods, i, name.span, t, name.name) {
+        diagnostics: builder.diagnostics.push(
+          match opaque_constructor_error(w.modules, i, name.span, t, name.name) {
             Some(closed) -> closed,
             None ->
               private_name_error(
@@ -347,7 +354,7 @@ pub fn private_name_error(
   namespace: Namespace,
   name: Bytes,
   module: Bytes,
-) -> Diag =
+) -> Diagnostic =
   error_at_and(
     b"E0107",
     m,
@@ -389,7 +396,7 @@ fn opaque_sum(module: Module, name: Bytes) -> Option<{ name: Bytes, opaque: Opaq
       Some(_) -> found,
       None -> match item {
         TypeItem(d) -> match ((d.opaque, d.body)) {
-          (Some(o), SumBody(vs)) -> if vs.fold(false, |held: Bool, v: VariantDef|
+          (Some(o), SumBody(vs)) -> if vs.fold(false, |held: Bool, v: VariantDefinition|
               held || v.name.name == name) { Some({ name: d.name.name, opaque: o }) }
           else { None },
           _ -> None,
@@ -399,13 +406,13 @@ fn opaque_sum(module: Module, name: Bytes) -> Option<{ name: Bytes, opaque: Opaq
     })
 
 pub fn opaque_constructor_error(
-  mods: List<ParsedModule>,
+  modules: List<ParsedModule>,
   m: Int,
   span: Span,
   owner: Int,
   name: Bytes,
-) -> Option<Diag> / {abort.raise} = {
-  let parsed = mods.get(owner);
+) -> Option<Diagnostic> / {abort.raise} = {
+  let parsed = modules.get(owner);
   match opaque_sum(parsed.module, name) {
     None -> None,
     Some(closed) ->
@@ -436,19 +443,19 @@ fn bind_one(
   i: Int,
   builder: ScopeBuilder,
   t: Int,
-  name: Ident,
+  name: Identifier,
   namespace: Namespace,
 ) -> ScopeBuilder / {abort.raise} = {
   let binding = match lookup(w.declared.get(t), namespace, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
-  let module = w.mods.get(t).name;
+  let module = w.modules.get(t).name;
   match lookup_declared(builder.local, namespace, name.name) {
     Some(prev) ->
       {
         ..builder,
-        diags: builder.diags.push(
+        diagnostics: builder.diagnostics.push(
           error_at_and(
             b"E0108",
             i,
@@ -485,7 +492,7 @@ fn bind_one(
       Some(prev) ->
         {
           ..builder,
-          diags: builder.diags.push(
+          diagnostics: builder.diagnostics.push(
             error_at_and(
               b"E0110",
               i,
@@ -616,8 +623,8 @@ fn canonical(nodes: List<Int>) -> List<Int> / {abort.raise} =
     range(0, nodes.len()).map(|i: Int| nodes.get((least + i) % nodes.len()))
   }
 
-pub fn cycle_diag(mods: List<ParsedModule>, cycle: Cycle) -> Diag / {abort.raise} = {
-  let names = cycle.nodes.map(|i: Int| mods.get(i).name);
+pub fn cycle_diagnostic(modules: List<ParsedModule>, cycle: Cycle) -> Diagnostic / {abort.raise} = {
+  let names = cycle.nodes.map(|i: Int| modules.get(i).name);
   let first = if names.len() == 0 { b"" } else { names.get(0) };
   if cycle.nodes.len() == 1 {
     error_at(

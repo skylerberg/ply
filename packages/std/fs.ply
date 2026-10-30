@@ -36,7 +36,7 @@
 //! changed under a directory by looking at it again. They ask the operating system for nothing
 //! beyond what `scan` reads, so a change is detected on the look after it happens, each look reads
 //! every entry, and this works wherever a file system is mounted from. A function here that cannot
-//! do what was requested raises `files.refused` with the path and the reason.
+//! do what was requested raises `files.fail` with the path and the reason.
 //!
 //! The fake is `MemFs`, an in-memory file system with a `mem_` function for every operation, and
 //! `on_mem` runs code written against any root over one. It follows symlinks and rejects paths
@@ -254,7 +254,7 @@ pub nondet effect fs {
 /// What the functions of this module raise.
 pub effect files {
   /// The file system could not do what a function requested: the path where it stopped, and why.
-  raise refused(path: String, why: FileError)
+  raise fail(path: String, why: FileError)
 }
 
 /// The mode as the nine letters `ls -l` writes, such as `rwxr-xr-x`.
@@ -921,10 +921,14 @@ pub fn mem_append(tree: MemFs, path: String, body: Bytes) -> AppendResult / {abo
 pub fn mem_copy(tree: MemFs, from: String, to: String) -> WriteResult / {abort.raise} =
   match key_of(tree, from, true) {
     Some(src) -> match key_of(tree, to, true) {
-      Some(dst) -> match tree.files.get(src) {
-        Some(body) -> if src == dst || one_file(tree, src, dst) { { fs: tree, ok: true } }
-        else if readable(tree, src) && can_write_file(tree, dst) {
-          { fs: with_mode(stored(tree, dst, body), dst, mode_at(tree, src)), ok: true }
+      Some(destination) -> match tree.files.get(src) {
+        Some(body) -> if src == destination || one_file(tree, src, destination) {
+          { fs: tree, ok: true }
+        } else if readable(tree, src) && can_write_file(tree, destination) {
+          {
+            fs: with_mode(stored(tree, destination, body), destination, mode_at(tree, src)),
+            ok: true,
+          }
         } else { { fs: tree, ok: false } },
         None -> { fs: tree, ok: false },
       },
@@ -1096,9 +1100,9 @@ pub fn mem_remove_tree(f: MemFs, path: String) -> WriteResult / {abort.raise} =
 pub fn mem_rename(tree: MemFs, from: String, to: String) -> WriteResult / {abort.raise} =
   match key_of(tree, from, false) {
     Some(src) -> match key_of(tree, to, false) {
-      Some(dst) -> if kind_at(tree, src) != Missing && (src == dst || one_file(tree, src, dst)) {
-        { fs: tree, ok: true }
-      } else if movable(tree, src, dst) { { fs: moved(tree, src, dst), ok: true } }
+      Some(destination) -> if kind_at(tree, src) != Missing
+          && (src == destination || one_file(tree, src, destination)) { { fs: tree, ok: true } }
+      else if movable(tree, src, destination) { { fs: moved(tree, src, destination), ok: true } }
       else { { fs: tree, ok: false } },
       None -> { fs: tree, ok: false },
     },
@@ -1110,26 +1114,26 @@ fn one_file(tree: MemFs, a: String, b: String) -> Bool =
   tree.files.contains(a) && tree.files.contains(b) && tree.ids.get(a) != None
     && tree.ids.get(a) == tree.ids.get(b)
 
-fn movable(tree: MemFs, src: String, dst: String) -> Bool = {
+fn movable(tree: MemFs, src: String, destination: String) -> Bool = {
   let from = kind_at(tree, src);
-  let to = kind_at(tree, dst);
-  src != "" && dst != "" && from != Missing && kind_at(tree, parent_of(dst)) == Dir
+  let to = kind_at(tree, destination);
+  src != "" && destination != "" && from != Missing && kind_at(tree, parent_of(destination)) == Dir
     && writable(tree, parent_of(src))
-    && writable(tree, parent_of(dst))
-    && !String::starts_with(dst ++ "/", src ++ "/")
+    && writable(tree, parent_of(destination))
+    && !String::starts_with(destination ++ "/", src ++ "/")
     && (to == Missing || (from != Dir && to != Dir))
 }
 
-/// `src` and everything under it, moved to `dst`. A directory takes with it the files a power loss
+/// `src` and everything under it, moved to `destination`. A directory takes with it the files a power loss
 /// keeps in it; a file's own move survives a power loss only once its directory is synced.
-fn moved(f: MemFs, src: String, dst: String) -> MemFs / {abort.raise} = {
-  let cleared = if kind_at(f, dst) == Missing { f } else { dropped(f, dst) };
-  let under_dst = |k: String| dst ++ k.slice(src.len(), k.len());
+fn moved(f: MemFs, src: String, destination: String) -> MemFs / {abort.raise} = {
+  let cleared = if kind_at(f, destination) == Missing { f } else { dropped(f, destination) };
+  let under_destination = |k: String| destination ++ k.slice(src.len(), k.len());
   let keyed = all_keys(cleared).fold(cleared, |t: MemFs, k: String|
-    if k == src || k.starts_with(src ++ "/") { rekeyed(t, k, under_dst(k)) } else { t });
+    if k == src || k.starts_with(src ++ "/") { rekeyed(t, k, under_destination(k)) } else { t });
   let durable = if kind_at(f, src) != Dir { keyed.durable } else {
     keyed.durable.keys().fold(keyed.durable, |m: Map<String, Int>, k: String|
-      if k.starts_with(src ++ "/") { moved_key(m, k, under_dst(k)) } else { m })
+      if k.starts_with(src ++ "/") { moved_key(m, k, under_destination(k)) } else { m })
   };
   { ..keyed, durable: durable, clock: keyed.clock + 1 }
 }
@@ -1196,29 +1200,37 @@ pub fn mem_link(tree: MemFs, path: String, to: String) -> LinkResult / {abort.ra
     None -> { fs: tree, done: Err(NotFound) },
     Some(src) -> match key_of(tree, path, false) {
       None -> { fs: tree, done: Err(NotFound) },
-      Some(dst) -> match link_error(tree, src, dst) {
+      Some(destination) -> match link_error(tree, src, destination) {
         Some(why) -> { fs: tree, done: Err(why) },
-        None -> { fs: with_hard_link(with_id(tree, src), src, dst), done: Ok(()) },
+        None -> { fs: with_hard_link(with_id(tree, src), src, destination), done: Ok(()) },
       },
     },
   }
 
-/// Why `dst` cannot be made a name of the file at `src`, if it cannot.
-fn link_error(tree: MemFs, src: String, dst: String) -> Option<FileError> =
+/// Why `destination` cannot be made a name of the file at `src`, if it cannot.
+fn link_error(tree: MemFs, src: String, destination: String) -> Option<FileError> =
   match kind_at(tree, src) {
     Missing -> Some(NotFound),
-    File -> if kind_at(tree, dst) != Missing { Some(Exists) } else { create_error(tree, dst) },
+    File -> if kind_at(tree, destination) != Missing { Some(Exists) }
+    else { create_error(tree, destination) },
     _ -> Some(NotAFile),
   }
 
-/// The tree with `dst` as one more name of the file at `src`, which has an id.
-fn with_hard_link(tree: MemFs, src: String, dst: String) -> MemFs = {
-  let carried = |m: Map<String, Int>| match m.get(src) { Some(x) -> m.insert(dst, x), None -> m };
+/// The tree with `destination` as one more name of the file at `src`, which has an id.
+fn with_hard_link(tree: MemFs, src: String, destination: String) -> MemFs = {
+  let carried = |m: Map<String, Int>|
+    match m.get(src) { Some(x) -> m.insert(destination, x), None -> m };
   let id = match tree.ids.get(src) { Some(n) -> n, None -> 0 };
   {
     ..tree,
-    files: match tree.files.get(src) { Some(b) -> tree.files.insert(dst, b), None -> tree.files },
-    modes: match tree.modes.get(src) { Some(m) -> tree.modes.insert(dst, m), None -> tree.modes },
+    files: match tree.files.get(src) {
+      Some(b) -> tree.files.insert(destination, b),
+      None -> tree.files,
+    },
+    modes: match tree.modes.get(src) {
+      Some(m) -> tree.modes.insert(destination, m),
+      None -> tree.modes,
+    },
     modified: carried(tree.modified),
     ids: carried(tree.ids),
     shared: tree.shared.insert(id, match tree.shared.get(id) { Some(n) -> n + 1, None -> 2 }),
@@ -1731,13 +1743,13 @@ pub type Pending = { path: String, temp: String, file: Int }
 /// `write_atomic` and `std.io`'s `replacing` pair the two.
 pub fn begin_atomic<[l]>(
   path: String,
-) -> Pending / {fs.open[l], files.refused, entropy.next, abort.raise} =
+) -> Pending / {fs.open[l], files.fail, entropy.next, abort.raise} =
   iterate(0, 8, |tries: Int| {
     let temp = under(parent_of(path), ".tmp-" ++ token_hex(12));
     match fs.open[l](temp, ToCreate) {
       Ok(file) -> Stop({ path: path, temp: temp, file: file }),
       Err(why) -> if why == Exists && tries < 7 { Continue(tries + 1) }
-      else { files.refused(temp, why) },
+      else { files.fail(temp, why) },
     }
   })
 
@@ -1745,13 +1757,13 @@ pub fn begin_atomic<[l]>(
 /// closed and given `mode`, or the mode of the file at the path, or `rw-r--r--` if there is none.
 /// It is renamed over the path, replacing a file or a link there and writing through neither.
 /// Under `Durable` the directory is then synced. A step the file system fails raises
-/// `files.refused` and is not retried: before the rename, the path keeps its old contents, and
+/// `files.fail` and is not retried: before the rename, the path keeps its old contents, and
 /// after it, the path has the new file, whose rename a power loss may still undo.
 pub fn commit_atomic<[l]>(
   p: Pending,
   mode: Option<Mode>,
   durability: Durability,
-) -> Unit / {fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], files.refused} = {
+) -> Unit / {fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], files.fail} = {
   let dir = parent_of(p.path);
   let wanted = match mode {
     Some(given) -> given,
@@ -1760,15 +1772,13 @@ pub fn commit_atomic<[l]>(
       None -> default_mode(File),
     },
   };
-  if durability == Durable && !fs.sync[l](p.temp) {
-    files.refused(p.temp, operation_failed("sync"))
-  } else { () };
+  if durability == Durable && !fs.sync[l](p.temp) { files.fail(p.temp, operation_failed("sync")) }
+  else { () };
   fs.close[l](p.file);
-  if !fs.set_mode[l](p.temp, wanted) { files.refused(p.temp, operation_failed("set_mode")) }
+  if !fs.set_mode[l](p.temp, wanted) { files.fail(p.temp, operation_failed("set_mode")) }
   else { () };
-  if !fs.rename[l](p.temp, p.path) { files.refused(p.path, operation_failed("rename")) }
-  else { () };
-  if durability == Durable && !fs.sync[l](dir) { files.refused(dir, operation_failed("sync")) }
+  if !fs.rename[l](p.temp, p.path) { files.fail(p.path, operation_failed("rename")) } else { () };
+  if durability == Durable && !fs.sync[l](dir) { files.fail(dir, operation_failed("sync")) }
   else { () }
 }
 
@@ -1802,11 +1812,11 @@ pub fn write_atomic<[l]>(
   body: Bytes,
   durability: Durability,
   mode: Option<Mode> = None,
-) -> Unit / {fs.open[l], fs.write_chunk[l], fs.space[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.refused, entropy.next, abort.raise} =
+) -> Unit / {fs.open[l], fs.write_chunk[l], fs.space[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.fail, entropy.next, abort.raise} =
   with_hold[atomic](begin_atomic[l](path), |p: Pending| abandon_atomic[l](p)) { held -> {
     let p = held.get();
     if fs.write_chunk[l](p.file, body) { commit_atomic[l](p, mode, durability) }
-    else { files.refused(p.temp, write_error[l](p.temp, body.len())) }
+    else { files.fail(p.temp, write_error[l](p.temp, body.len())) }
   } }
 
 /// Why a write of `n` bytes at `path` failed, as far as its file system's free space can tell.
@@ -1882,7 +1892,7 @@ type PreparedEntry<a> = { copy: CopyState<a>, from: String, to: String, bytes: B
 ///
 /// `step` is called with each entry once it is copied, and returns `Continue` to go on or `Stop` to
 /// end the copy there, keeping what was copied. A directory's mode and time are set after
-/// everything beneath it. A file system failure raises `files.refused` with the path, and leaves
+/// everything beneath it. A file system failure raises `files.fail` with the path, and leaves
 /// what was copied so far. By then `Replace` has removed the destination's old contents, and the
 /// root is never replaced.
 pub fn copy_tree<a, [l] | e>(
@@ -1891,7 +1901,7 @@ pub fn copy_tree<a, [l] | e>(
   how: CopyOptions,
   init: a,
   step: (a, Progress) -> Iter<a, a> / e,
-) -> CopyResult<a> / {fs.stat[l], fs.scan[l], fs.read_link[l], fs.create_dir[l], fs.remove[l], fs.remove_tree[l], fs.symlink[l], fs.link[l], fs.set_mode[l], fs.set_modified[l], fs.copy[l], files.refused, abort.raise | e} = {
+) -> CopyResult<a> / {fs.stat[l], fs.scan[l], fs.read_link[l], fs.create_dir[l], fs.remove[l], fs.remove_tree[l], fs.symlink[l], fs.link[l], fs.set_mode[l], fs.set_modified[l], fs.copy[l], files.fail, abort.raise | e} = {
   let found = plan_copy[l, l](from, to, how);
   let copied = found.entries.fold(empty_copy(init), |c: CopyState<a>, entry: ScanEntry|
     if c.done.stopped { c } else {
@@ -1919,7 +1929,7 @@ pub fn copy_tree_across<a, [s], [d] | e>(
   how: CopyOptions,
   init: a,
   step: (a, Progress) -> Iter<a, a> / e,
-) -> CopyResult<a> / {fs.stat[s], fs.scan[s], fs.read_link[s], fs.open[s], fs.read_chunk[s], fs.close[s], fs.stat[d], fs.scan[d], fs.create_dir[d], fs.remove[d], fs.remove_tree[d], fs.symlink[d], fs.link[d], fs.set_mode[d], fs.set_modified[d], fs.open[d], fs.write_chunk[d], fs.close[d], files.refused, abort.raise | e} = {
+) -> CopyResult<a> / {fs.stat[s], fs.scan[s], fs.read_link[s], fs.open[s], fs.read_chunk[s], fs.close[s], fs.stat[d], fs.scan[d], fs.create_dir[d], fs.remove[d], fs.remove_tree[d], fs.symlink[d], fs.link[d], fs.set_mode[d], fs.set_modified[d], fs.open[d], fs.write_chunk[d], fs.close[d], files.fail, abort.raise | e} = {
   let found = plan_copy[s, d](from, to, how);
   let copied = found.entries.fold(empty_copy(init), |c: CopyState<a>, entry: ScanEntry|
     if c.done.stopped { c } else {
@@ -2012,33 +2022,30 @@ fn plan_copy<[s], [d]>(
   from: String,
   to: String,
   how: CopyOptions,
-) -> CopyPlan / {fs.stat[s], fs.scan[s], fs.stat[d], fs.scan[d], fs.remove_tree[d], files.refused, abort.raise} = {
+) -> CopyPlan / {fs.stat[s], fs.scan[s], fs.stat[d], fs.scan[d], fs.remove_tree[d], files.fail, abort.raise} = {
   let source = normalize(from);
   let dest = normalize(to);
   let beneath = |top: String, seen: List<ScanEntry>|
     seen.map(|entry: ScanEntry|
       { ..entry, path: entry.path.slice(under(top, "").len(), entry.path.len()) });
-  let top = match fs.stat[s](source) {
-    Some(found) -> found,
-    None -> files.refused(from, NotFound),
-  };
+  let top = match fs.stat[s](source) { Some(found) -> found, None -> files.fail(from, NotFound) };
   let rest = if top.kind != Dir { [] } else {
     match fs.scan[s](source, true) {
       Some(seen) -> beneath(source, seen),
-      None -> files.refused(from, NotADirectory),
+      None -> files.fail(from, NotADirectory),
     }
   };
   let entries = [{ path: "", stat: top }].concat(rest);
   let sized = entries.fold(0, |total: Int, entry: ScanEntry| total +| entry.stat.size);
-  if entries.len() > how.entries || sized > how.bytes { files.refused(from, LimitExceeded) }
+  if entries.len() > how.entries || sized > how.bytes { files.fail(from, LimitExceeded) }
   else { () };
   let nothing: Map<String, Kind> = Map::new();
   let held = match fs.stat[d](dest) {
     None -> nothing,
     Some(found) -> match how.existing {
-      Refuse -> files.refused(to, Exists),
+      Refuse -> files.fail(to, Exists),
       Replace -> if fs.remove_tree[d](dest) { nothing }
-      else { files.refused(to, operation_failed("remove_tree")) },
+      else { files.fail(to, operation_failed("remove_tree")) },
       Merge -> if found.kind != Dir { nothing.insert("", found.kind) } else {
         match fs.scan[d](dest, true) {
           Some(seen) ->
@@ -2046,7 +2053,7 @@ fn plan_copy<[s], [d]>(
               nothing.insert("", Dir),
               |m: Map<String, Kind>, entry: ScanEntry| m.insert(entry.path, entry.stat.kind),
             ),
-          None -> files.refused(to, NotADirectory),
+          None -> files.fail(to, NotADirectory),
         }
       },
     },
@@ -2062,40 +2069,45 @@ fn placed<a, [s], [d]>(
   how: CopyOptions,
   c: CopyState<a>,
   entry: ScanEntry,
-) -> PreparedEntry<a> / {fs.read_link[s], fs.remove[d], fs.create_dir[d], fs.symlink[d], fs.link[d], files.refused} = {
+) -> PreparedEntry<a> / {fs.read_link[s], fs.remove[d], fs.create_dir[d], fs.symlink[d], fs.link[d], files.fail} = {
   let src = below(found.source, entry.path);
-  let dst = below(found.dest, entry.path);
+  let destination = below(found.dest, entry.path);
   let before = found.held.get(entry.path);
-  let done = |copy: CopyState<a>| { copy: copy, from: src, to: dst, bytes: false, skipped: false };
+  let done = |copy: CopyState<a>|
+    { copy: copy, from: src, to: destination, bytes: false, skipped: false };
   match before {
     None -> (),
     Some(kind) -> if kind != Dir {
-      if fs.remove[d](dst) { () } else { files.refused(dst, operation_failed("remove")) }
-    } else if entry.stat.kind != Dir { files.refused(dst, NotAFile) }
+      if fs.remove[d](destination) { () }
+      else { files.fail(destination, operation_failed("remove")) }
+    } else if entry.stat.kind != Dir { files.fail(destination, NotAFile) }
     else { () },
   };
   match entry.stat.kind {
-    Dir -> if before == Some(Dir) || fs.create_dir[d](dst) {
-      done({ ..c, dirs: c.dirs.push({ path: dst, stat: entry.stat }) })
-    } else { files.refused(dst, operation_failed("create_dir")) },
+    Dir -> if before == Some(Dir) || fs.create_dir[d](destination) {
+      done({ ..c, dirs: c.dirs.push({ path: destination, stat: entry.stat }) })
+    } else { files.fail(destination, operation_failed("create_dir")) },
     Symlink -> match fs.read_link[s](src) {
-      None -> files.refused(src, NotFound),
-      Some(target) -> if resolve_target(segments(parent_of(dst)), target) == None {
+      None -> files.fail(src, NotFound),
+      Some(target) -> if resolve_target(segments(parent_of(destination)), target) == None {
         match how.outside {
-          RefuseLink -> files.refused(dst, CrossesRoot),
+          RefuseLink -> files.fail(destination, CrossesRoot),
           SkipLink ->
             {
-              ..done({ ..c, done: { ..c.done, skipped: c.done.skipped.push(dst) } }),
+              ..done({ ..c, done: { ..c.done, skipped: c.done.skipped.push(destination) } }),
               skipped: true,
             },
         }
-      } else if fs.symlink[d](dst, target) { done(c) }
-      else { files.refused(dst, operation_failed("symlink")) },
+      } else if fs.symlink[d](destination, target) { done(c) }
+      else { files.fail(destination, operation_failed("symlink")) },
     },
     _ -> match c.firsts.get(entry.stat.id) {
       None -> { ..done(c), bytes: true },
       Some(first) -> if first.device != entry.stat.device { { ..done(c), bytes: true } } else {
-        match fs.link[d](dst, first.path) { Ok(_) -> done(c), Err(why) -> files.refused(dst, why) }
+        match fs.link[d](destination, first.path) {
+          Ok(_) -> done(c),
+          Err(why) -> files.fail(destination, why),
+        }
       },
     },
   }
@@ -2105,26 +2117,32 @@ fn placed<a, [s], [d]>(
 /// source's, and if the source has other names, its path is recorded for them.
 fn finish_file_copy<a, [d]>(
   c: CopyState<a>,
-  dst: String,
+  destination: String,
   found: Stat,
   written: Bool,
-) -> CopyState<a> / {fs.set_modified[d], files.refused} =
-  if !written { files.refused(dst, operation_failed("copy")) }
-  else if !fs.set_modified[d](dst, stamp_ms(found)) {
-    files.refused(dst, operation_failed("set_modified"))
+) -> CopyState<a> / {fs.set_modified[d], files.fail} =
+  if !written { files.fail(destination, operation_failed("copy")) }
+  else if !fs.set_modified[d](destination, stamp_ms(found)) {
+    files.fail(destination, operation_failed("set_modified"))
   } else if found.links < 2 { c }
-  else { { ..c, firsts: c.firsts.insert(found.id, { device: found.device, path: dst }) } }
+  else { { ..c, firsts: c.firsts.insert(found.id, { device: found.device, path: destination }) } }
 
-/// The copy after its fold is called with the entry at `dst`.
+/// The copy after its fold is called with the entry at `destination`.
 fn told<a | e>(
   c: CopyState<a>,
-  dst: String,
+  destination: String,
   found: Stat,
   step: (a, Progress) -> Iter<a, a> / e,
 ) -> CopyState<a> / e = {
   let entries = c.done.entries + 1;
   let bytes = c.done.bytes + found.size;
-  let now = { path: dst, kind: found.kind, size: found.size, entries: entries, bytes: bytes };
+  let now = {
+    path: destination,
+    kind: found.kind,
+    size: found.size,
+    entries: entries,
+    bytes: bytes,
+  };
   match step(c.done.value, now) {
     Continue(value) -> { ..c, done: { ..c.done, value: value, entries: entries, bytes: bytes } },
     Stop(value) ->
@@ -2136,12 +2154,12 @@ fn told<a | e>(
 /// mode, deepest first.
 fn finished<a, [d]>(
   c: CopyState<a>,
-) -> CopyResult<a> / {fs.set_modified[d], fs.set_mode[d], files.refused} = {
+) -> CopyResult<a> / {fs.set_modified[d], fs.set_mode[d], files.fail} = {
   c.dirs.reverse().fold((), |_: Unit, dir: ScanEntry|
     if !fs.set_modified[d](dir.path, stamp_ms(dir.stat)) {
-      files.refused(dir.path, operation_failed("set_modified"))
+      files.fail(dir.path, operation_failed("set_modified"))
     } else if !fs.set_mode[d](dir.path, dir.stat.mode) {
-      files.refused(dir.path, operation_failed("set_mode"))
+      files.fail(dir.path, operation_failed("set_mode"))
     } else { () });
   c.done
 }
@@ -3389,7 +3407,7 @@ fn replaced(
 ) -> Over<Result<Unit, (String, FileError)>> / {abort.raise} =
   on_mem_failing[d](tree, writes, ||
     counted(|| {
-      let wrote: Result<Unit, (String, FileError)> = try[files.refused] {
+      let wrote: Result<Unit, (String, FileError)> = try[files.fail] {
         write_atomic[d]("d/cfg", body, durability)
       };
       wrote
@@ -3438,7 +3456,7 @@ test "an atomic write replaces a link and another name of a file, and writes thr
 /// An atomic write of `path` over a disk that accepts nothing written through a descriptor.
 fn unwritable<[l]>(
   path: String,
-) -> Unit / {fs.open[l], fs.space[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.refused, entropy.next, abort.raise} =
+) -> Unit / {fs.open[l], fs.space[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.fail, entropy.next, abort.raise} =
   handle { write_atomic[l](path, b"new", Durable) } with { fs.write_chunk[l](file, body) -> false }
 
 test "an atomic write that cannot be made reports where it stopped and why, and leaves the path unchanged" {
@@ -3446,7 +3464,7 @@ test "an atomic write that cannot be made reports where it stopped and why, and 
   let tried = |tree: MemFs, path: String|
     on_mem[d](tree, ||
       counted(|| {
-        let wrote: Result<Unit, (String, FileError)> = try[files.refused] {
+        let wrote: Result<Unit, (String, FileError)> = try[files.fail] {
           write_atomic[d](path, b"new", Durable)
         };
         match wrote { Ok(_) -> None, Err((_, why)) -> Some(why) }
@@ -3461,9 +3479,7 @@ test "an atomic write that cannot be made reports where it stopped and why, and 
   let full = |room: Int|
     on_mem[d](mem_with_space(base, { ..roomy, available: room }), ||
       counted(|| {
-        let wrote: Result<Unit, (String, FileError)> = try[files.refused] {
-          unwritable[d]("d/cfg")
-        };
+        let wrote: Result<Unit, (String, FileError)> = try[files.fail] { unwritable[d]("d/cfg") };
         match wrote { Ok(_) -> None, Err((_, why)) -> Some(why) }
       }));
   assert_eq(full(2).value, Some(NoSpace));
@@ -3540,7 +3556,7 @@ fn copy_tried(
   how: CopyOptions,
 ) -> Over<Result<CopyResult<Int>, (String, FileError)>> / {abort.raise} =
   on_mem[d](tree, || {
-    let copied: Result<CopyResult<Int>, (String, FileError)> = try[files.refused] {
+    let copied: Result<CopyResult<Int>, (String, FileError)> = try[files.fail] {
       copy_tree[d](from, to, how, 0, counting)
     };
     copied

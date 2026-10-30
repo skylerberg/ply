@@ -7,10 +7,11 @@ import compiler.front
 import compiler.front.facts (CheckedProgram)
 import compiler.front.rows (OutlineItem, OutlinedType, KnownTestRow)
 import compiler.front.published (StoredBody, stored_bodies)
-import compiler.front.seam (all_body_facts, def_known_row)
-import compiler.check.infer.checker (CtorInfo, DefInfo, EffectInfo, OpInfo, TestInfo, Location)
+import compiler.front.seam (all_body_facts, definition_known_row)
+import compiler.check.infer.checker (ConstructorInfo, DefinitionInfo, EffectInfo, OpInfo, TestInfo,
+                                     Location)
 import compiler.store.memo_files
-import compiler.check.resolve.tables (Diag, qualify)
+import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.check.types (Type, scheme_text, type_text)
 import diagnostic (position_of)
@@ -41,11 +42,15 @@ import proof.obligation (plural)
 import compiler.front.seam
 import semantics (semantics)
 
-pub type Refusal = { directory: Option<String>, diags: List<Diag>, warnings: List<Diag> }
+pub type Refusal = {
+  directory: Option<String>,
+  diagnostics: List<Diagnostic>,
+  warnings: List<Diagnostic>,
+}
 
 pub type Stats = {
   directory: String,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   format: Int,
   root: String,
   open_us: Int,
@@ -64,7 +69,7 @@ pub type PruneCounts = { texts: Int }
 
 pub type CompactResult = {
   directory: String,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   dropped: PruneCounts,
   memo: memo_files::Compaction,
   bytes_before: Int,
@@ -72,7 +77,7 @@ pub type CompactResult = {
   results: Int,
 }
 
-pub type ClearResult = { directory: String, warnings: List<Diag>, cleared: Int }
+pub type ClearResult = { directory: String, warnings: List<Diagnostic>, cleared: Int }
 
 pub type EntryKind = | FnEntry | TypeEntry | EffectEntry | TestEntry(Bool)
 
@@ -109,7 +114,7 @@ pub type Entry = {
   outcome: Option<Outcome>,
 }
 
-pub type Matches = { directory: String, warnings: List<Diag>, entries: List<Entry> }
+pub type Matches = { directory: String, warnings: List<Diagnostic>, entries: List<Entry> }
 
 fn decimal(text: String) -> Json =
   match Decimal::of_string(text) { Some(d) -> Number(d), None -> int(0) }
@@ -129,7 +134,7 @@ fn failure_output(style: Style, action: String, why: Refusal) -> CommandOutput /
     { key: "action", value: Str(action) },
     { key: "ok", value: Bool(false) },
     { key: "exit_code", value: int(compile_error()) },
-    { key: "diagnostics", value: all_to_json(why.diags, []) },
+    { key: "diagnostics", value: all_to_json(why.diagnostics, []) },
   ];
   let body = match why.directory {
     None -> head,
@@ -142,12 +147,12 @@ fn failure_output(style: Style, action: String, why: Refusal) -> CommandOutput /
   {
     json: object(body),
     lines: warning_lines(style, why.warnings),
-    errs: all_to_text(style, why.diags, []),
+    errs: all_to_text(style, why.diagnostics, []),
     code: compile_error(),
   }
 }
 
-fn no_match(query: String) -> Diag =
+fn no_match(query: String) -> Diagnostic =
   {
     code: b"E0101",
     notes: 1,
@@ -569,7 +574,7 @@ fn inspect_output(style: Style, query: String, matches: Matches) -> CommandOutpu
   if entries.len() == 0 {
     failure_output(style, "inspect", {
       directory: Some(matches.directory),
-      diags: [no_match(query)],
+      diagnostics: [no_match(query)],
       warnings: matches.warnings,
     })
   } else {
@@ -610,7 +615,7 @@ fn stats_of<[r]>(
   let u = tables::usage(c);
   {
     directory: display_path(place, ""),
-    warnings: project_store::diags_of(tables::warnings(c)),
+    warnings: project_store::diagnostics_of(tables::warnings(c)),
     format: engine::format_version(),
     root: paths::displayed({
       label: place.label,
@@ -643,7 +648,7 @@ fn compact_store<[r]>(
   let memo = memo_files::compact[r](memo_dir(place), current.keys());
   {
     directory: display_path(place, ""),
-    warnings: project_store::diags_of(tables::warnings(done)),
+    warnings: project_store::diagnostics_of(tables::warnings(done)),
     dropped: { texts: pruned.pruned.texts },
     memo: memo,
     bytes_before: before,
@@ -660,11 +665,11 @@ fn clear_store<[r]>(
   let stored = engine::clear_dir[r](place.dir);
   let memo = memo_dir(place);
   let gone = (!fs.exists[r](memo) || fs.remove_tree[r](memo)) && stored;
-  let warnings = project_store::diags_of(tables::warnings(c));
+  let warnings = project_store::diagnostics_of(tables::warnings(c));
   if gone { Ok({ directory: display_path(place, ""), warnings: warnings, cleared: before }) } else {
     Err({
       directory: Some(display_path(place, "")),
-      diags: [
+      diagnostics: [
         {
           code: b"E0502",
           notes: 1,
@@ -721,8 +726,8 @@ fn matches_in(
   query: String,
   proven: Map<Bytes, Bool>,
 ) -> List<Entry> / {abort.raise} = {
-  let defs = by_name(w.frame.hashes.defs);
-  let decls = by_name(w.frame.hashes.decls);
+  let definitions = by_name(w.frame.hashes.definitions);
+  let declarations = by_name(w.frame.hashes.declarations);
   let read = all_body_facts(w.checked);
   let bodies = stored_bodies(w.frame.hashes).fold(
     Map::new(),
@@ -730,12 +735,12 @@ fn matches_in(
   );
   let hash_of = |name: Bytes, m: Map<Bytes, Bytes>| match m.get(name) { Some(h) -> h, None -> b"" };
   let body_of = |hash: Bytes| bodies.get(hash);
-  let fns = w.checked.defs.fold([], |acc: List<Entry>, d: DefInfo| {
-    let hash = hash_of(d.name, defs);
+  let functions = w.checked.definitions.fold([], |acc: List<Entry>, d: DefinitionInfo| {
+    let hash = hash_of(d.name, definitions);
     if !matches_query(query, d.name, hash) { acc } else {
       let at = file_location(program, d.at);
-      let row = match defs.get(d.name) {
-        Some(h) -> Some(def_known_row(decls, d, h, read)),
+      let row = match definitions.get(d.name) {
+        Some(h) -> Some(definition_known_row(declarations, d, h, read)),
         None -> None,
       };
       acc.push({
@@ -755,13 +760,13 @@ fn matches_in(
       })
     }
   });
-  let types = range(0, w.frame.outlines.len()).fold(fns, |acc: List<Entry>, i: Int| {
+  let types = range(0, w.frame.outlines.len()).fold(functions, |acc: List<Entry>, i: Int| {
     let o = w.frame.outlines.get(i);
     o.items.fold(acc, |a: List<Entry>, item: OutlineItem|
       match item {
         OutlinedType(t) -> {
           let name = qualify(o.name, t.name);
-          let hash = hash_of(name, decls);
+          let hash = hash_of(name, declarations);
           if !matches_query(query, name, hash) { a } else {
             let at = file_location(program, { module: i, span: t.span });
             a.push({
@@ -772,11 +777,13 @@ fn matches_in(
               location: at.location,
               interface: TypeInterface(
                 t.arity,
-                w.checked.ctors.filter(|c: CtorInfo| c.type_name == name).map(|c: CtorInfo|
-                  {
-                    name: String::of_bytes_lossy(c.simple_name),
-                    fields: c.fields.map(|f: Type| String::of_bytes_lossy(type_text(f))),
-                  }),
+                w.checked.constructors.filter(|c: ConstructorInfo| c.type_name == name).map(
+                  |c: ConstructorInfo|
+                    {
+                      name: String::of_bytes_lossy(c.simple_name),
+                      fields: c.fields.map(|f: Type| String::of_bytes_lossy(type_text(f))),
+                    },
+                ),
               ),
               footprint: None,
               effect_hashes: [],
@@ -789,7 +796,7 @@ fn matches_in(
       })
   });
   let effects = w.checked.effects.fold(types, |acc: List<Entry>, e: EffectInfo| {
-    let hash = hash_of(e.name, decls);
+    let hash = hash_of(e.name, declarations);
     if !matches_query(query, e.name, hash) { acc } else {
       let at = file_location(program, e.at);
       acc.push({
@@ -837,7 +844,12 @@ fn inspect_store<[r]>(
   query: String,
 ) -> Result<Matches, Refusal> / {fs.read[r], abort.raise} =
   match program_view(program) {
-    None -> Err({ directory: Some(display_path(place, "")), diags: program.diags, warnings: [] }),
+    None ->
+      Err({
+        directory: Some(display_path(place, "")),
+        diagnostics: program.diagnostics,
+        warnings: [],
+      }),
     Some(w) -> {
       let c = tables::open_cache[r](place.dir, place.stamps);
       let proven = w.frame.hashes.tests.values().fold(
@@ -847,7 +859,7 @@ fn inspect_store<[r]>(
       );
       Ok({
         directory: display_path(place, ""),
-        warnings: project_store::diags_of(tables::warnings(c)),
+        warnings: project_store::diagnostics_of(tables::warnings(c)),
         entries: matches_in(program, w, query, proven),
       })
     },
@@ -874,7 +886,7 @@ pub fn run(
   } else if flags.action == "clear" {
     clear_answer(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
   } else {
-    let program = load_program(flags.paths, flags.verify_deps);
+    let program = load_program(flags.paths, flags.verify_dependencies);
     inspect_answer(s, flags.query, if cwd { inspect_store[cwd](place, program, flags.query) }
     else { inspect_store[abs](place, program, flags.query) })
   }
@@ -1132,7 +1144,7 @@ fn run_with(
   else { inspect_answer(s, flags.query, hits) }
 }
 
-fn no_refusal() -> Refusal = { directory: None, diags: [], warnings: [] }
+fn no_refusal() -> Refusal = { directory: None, diagnostics: [], warnings: [] }
 
 fn flags_of(action: String, query: String, json: Bool) -> Flags =
   { ..no_flags(), action: action, query: query, json: json }
@@ -1156,7 +1168,7 @@ test "the action picks the subcommand, and its object keys off `command` and `ac
 test "a store that never opened is exit 2 and names no cache" {
   let why: Refusal = {
     directory: None,
-    diags: [
+    diagnostics: [
       {
         code: b"E0502",
         notes: 0,
@@ -1180,7 +1192,7 @@ test "a store that never opened is exit 2 and names no cache" {
 test "a refusal after the store opened names the cache and carries its warnings" {
   let why: Refusal = {
     directory: Some("/p/.ply-cache"),
-    diags: [
+    diagnostics: [
       {
         code: b"E0502",
         notes: 0,

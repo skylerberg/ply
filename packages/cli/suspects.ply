@@ -3,13 +3,13 @@ import compiler.front.seam (Analysed, Refused, checked_program_of)
 import compiler.front.facts (CheckedProgram)
 import compiler.front.rows (ModuleSpan, OutlinedType, OutlineItem, location_span)
 import compiler.store.hash.forms (ItemKeyed, no_cached_hashes, reach)
-import compiler.check.infer.checker (DefInfo, EffectInfo, Location, TestInfo)
+import compiler.check.infer.checker (DefinitionInfo, EffectInfo, Location, TestInfo)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.syntax.fmt (line_end, line_start)
 import program (Program, front_end, sources_of)
 import std.diff
-import testing.delta (Added, Change, ChangeKind, Decl, Delta, DefKey, Derived, Edited, Removed,
-                      Value, classify, kind_word)
+import testing.delta (Added, Change, ChangeKind, Declaration, Delta, DefinitionKey, Derived, Edited,
+                      Removed, Value, classify, kind_word)
 import testing.facts (Baseline, CurrentProgram, facts, moved_from)
 import tester (result_cache, LastPass)
 import std.bytes
@@ -20,8 +20,8 @@ pub type Tree = {
   whole: CheckedProgram,
   sources: List<Source>,
   places: Places,
-  defs: Map<String, String>,
-  decls: Map<String, String>,
+  definitions: Map<String, String>,
+  declarations: Map<String, String>,
 }
 
 fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> / {abort.raise} =
@@ -36,15 +36,18 @@ pub fn tree_of(sources: List<Source>, analysis: CheckedProgram) -> Tree / {abort
     whole: analysis,
     sources: sources,
     places: places_of(analysis),
-    defs: by_name(analysis.frame.hashes.defs),
-    decls: by_name(analysis.frame.hashes.decls),
+    definitions: by_name(analysis.frame.hashes.definitions),
+    declarations: by_name(analysis.frame.hashes.declarations),
   }
 
-fn closed(t: Tree, key: String) -> { fns: List<String>, decls: List<String> } / {abort.raise} = {
+fn closed(
+  t: Tree,
+  key: String,
+) -> { functions: List<String>, declarations: List<String> } / {abort.raise} = {
   let reached = reach(t.whole.frame.hashes, [ItemKeyed(Bytes::of_string(key))]);
   {
-    fns: reached.fns.keys().map(String::of_bytes_lossy),
-    decls: reached.decls.keys().map(String::of_bytes_lossy),
+    functions: reached.functions.keys().map(String::of_bytes_lossy),
+    declarations: reached.declarations.keys().map(String::of_bytes_lossy),
   }
 }
 
@@ -64,10 +67,15 @@ pub fn compared(
     key: key,
     baseline: {
       test: baseline.test.hex_of(),
-      closure: keyed(baseline.reached.fns),
-      decls: keyed(baseline.reached.decls),
+      closure: keyed(baseline.reached.functions),
+      declarations: keyed(baseline.reached.declarations),
     },
-    now: { test: test_hash, closure: closed(pr, key), defs: pr.defs, decls: pr.decls },
+    now: {
+      test: test_hash,
+      closure: closed(pr, key),
+      definitions: pr.definitions,
+      declarations: pr.declarations,
+    },
   }
 
 pub fn texts_then(cs: List<Compared>) -> Map<String, Bytes> / {result_cache.texts, abort.raise} = {
@@ -88,7 +96,7 @@ pub fn delta_of(pr: Tree, c: Compared, then: Map<String, Bytes>) -> Delta / {abo
       c.key,
       c.baseline,
       c.now,
-      |k: DefKey, was: String| same(then.get(was), defined_at(pr.places, k)),
+      |k: DefinitionKey, was: String| same(then.get(was), defined_at(pr.places, k)),
       same(then.get(c.baseline.test), pr.places.tests.get(Bytes::of_string(c.key))),
     ),
   )
@@ -96,7 +104,7 @@ pub fn delta_of(pr: Tree, c: Compared, then: Map<String, Bytes>) -> Delta / {abo
 
 pub type Places = {
   values: Map<Bytes, Location>,
-  decls: Map<Bytes, Location>,
+  declarations: Map<Bytes, Location>,
   tests: Map<Bytes, Location>,
 }
 
@@ -106,9 +114,11 @@ fn places_of(analysis: CheckedProgram) -> Places / {abort.raise} = {
     |acc: Map<Bytes, Location>, e: EffectInfo| acc.insert(e.name, e.at),
   );
   {
-    values: analysis.checked.defs.fold(Map::new(), |acc: Map<Bytes, Location>, d: DefInfo|
-      acc.insert(d.name, d.at)),
-    decls: range(0, analysis.frame.outlines.len()).fold(
+    values: analysis.checked.definitions.fold(
+      Map::new(),
+      |acc: Map<Bytes, Location>, d: DefinitionInfo| acc.insert(d.name, d.at),
+    ),
+    declarations: range(0, analysis.frame.outlines.len()).fold(
       effects,
       |acc: Map<Bytes, Location>, i: Int| {
         let o = analysis.frame.outlines.get(i);
@@ -134,9 +144,9 @@ fn lines_at(sources: List<Source>, at: Location) -> Option<Bytes> / {abort.raise
     }
   }
 
-fn defined_at(p: Places, k: DefKey) -> Option<Location> / {abort.raise} = {
+fn defined_at(p: Places, k: DefinitionKey) -> Option<Location> / {abort.raise} = {
   let name = Bytes::of_string(k.name);
-  match k.ns { Value -> p.values.get(name), Decl -> p.decls.get(name) }
+  match k.ns { Value -> p.values.get(name), Declaration -> p.declarations.get(name) }
 }
 
 fn text_at(pr: Tree, at: Option<Location>) -> Option<Bytes> / {abort.raise} =
@@ -152,7 +162,7 @@ pub fn texts_of(
   let h = analysis.frame.hashes;
   let placed = |at: Map<Bytes, Location>, xs: List<{ name: Bytes, hash: Bytes }>|
     xs.map(|x: { name: Bytes, hash: Bytes }| { hash: x.hash, at: at.get(x.name) });
-  placed(p.values, h.defs).concat(placed(p.decls, h.decls)).concat(
+  placed(p.values, h.definitions).concat(placed(p.declarations, h.declarations)).concat(
     h.tests.fold([], |acc: List<{ hash: Bytes, at: Option<Location> }>, key: Bytes, hash: Bytes|
       acc.push({ hash: hash, at: p.tests.get(key) })),
   ).fold(
@@ -266,7 +276,10 @@ fn passed_in(t: Tree, key: String) -> LastPass / {abort.raise} = {
   };
   {
     test: match h.tests.get(Bytes::of_string(key)) { Some(x) -> x, None -> b"" },
-    reached: { fns: hashed(reached.fns, h.defs), decls: hashed(reached.decls, h.decls) },
+    reached: {
+      functions: hashed(reached.functions, h.definitions),
+      declarations: hashed(reached.declarations, h.declarations),
+    },
   }
 }
 
@@ -277,7 +290,9 @@ fn over(
   filed: (Bytes) -> Bool,
 ) -> { delta: Delta, diffs: List<SuspectDiff> } / {abort.raise} = {
   let hashes = before.whole.frame.hashes;
-  let all = hashes.defs.concat(hashes.decls).map(|x: { name: Bytes, hash: Bytes }| x.hash).concat(
+  let all = hashes.definitions.concat(hashes.declarations).map(
+    |x: { name: Bytes, hash: Bytes }| x.hash,
+  ).concat(
     hashes.tests.values(),
   );
   let texts = texts_of(before.whole, before.sources, all.filter(filed));
@@ -368,12 +383,16 @@ test "editing an effect declaration makes the declaration the edit and its users
     "  read peek[users](key: Int) -> Int\n}\nfn lookup",
   );
   let o = over(tree_of_source(handled()), tree_of_source(after), "handled", every);
-  assert_eq(o.delta.changes.map(|c: Change| { name: c.name, decl: c.ns == Decl, kind: c.kind }), [
-    { name: "db", decl: true, kind: Edited },
-    { name: "lookup", decl: false, kind: Derived },
-    { name: "seeded", decl: false, kind: Derived },
-    { name: "twice", decl: false, kind: Derived },
-  ])
+  assert_eq(
+    o.delta.changes.map(|c: Change|
+      { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
+    [
+      { name: "db", declaration: true, kind: Edited },
+      { name: "lookup", declaration: false, kind: Derived },
+      { name: "seeded", declaration: false, kind: Derived },
+      { name: "twice", declaration: false, kind: Derived },
+    ],
+  )
 }
 
 test "a rename beside an edit shows the old name removed and the new one added" {
@@ -390,10 +409,14 @@ test "a name shared by a function and a type still names the one that moved" {
   let collide = "type Amount = Cents(Int) | Dollars(Int)\nfn Amount(n: Int) -> Int = n + 1\nfn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }\ntest \"t\" { assert_eq(use_it(Cents(5)), 5) }\n";
   let swapped = collide.replace("Cents(Int) | Dollars(Int)", "Dollars(Int) | Cents(Int)");
   let o = over(tree_of_source(collide), tree_of_source(swapped), "t", every);
-  assert_eq(o.delta.changes.map(|c: Change| { name: c.name, decl: c.ns == Decl, kind: c.kind }), [
-    { name: "Amount", decl: true, kind: Edited },
-    { name: "use_it", decl: false, kind: Derived },
-  ])
+  assert_eq(
+    o.delta.changes.map(|c: Change|
+      { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
+    [
+      { name: "Amount", declaration: true, kind: Edited },
+      { name: "use_it", declaration: false, kind: Derived },
+    ],
+  )
 }
 
 fn signed(d: SuspectDiff, sign: String) -> Bool =
@@ -440,10 +463,9 @@ test "a filed text is the whole lines of a definition, a type, an effect and a t
   let src = "effect db {\n  read get(key: Int) -> Int\n}\ntype Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s { Dot -> 1, Line(n) -> n }\ntest \"sized\" { assert_eq(size(Dot), 1) }\n";
   let t = tree_of_source(src);
   let hashes = t.whole.frame.hashes;
-  let wanted = hashes.defs.concat(hashes.decls).filter(|x: { name: Bytes, hash: Bytes }|
-    x.name == b"size" || x.name == b"Shape" || x.name == b"db").map(
-    |x: { name: Bytes, hash: Bytes }| x.hash,
-  ).concat(
+  let wanted = hashes.definitions.concat(hashes.declarations).filter(
+    |x: { name: Bytes, hash: Bytes }| x.name == b"size" || x.name == b"Shape" || x.name == b"db",
+  ).map(|x: { name: Bytes, hash: Bytes }| x.hash).concat(
     hashes.tests.values(),
   );
   let texts = texts_of(t.whole, t.sources, wanted).map(|x: { hash: Bytes, text: Bytes }|

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# `examples/service.ply`'s endpoints run unchanged against its in-memory twin and against postgres,
+# `examples/service.ply`'s endpoints run unchanged against its in-memory fake and against postgres,
 # checked the two ways that can be checked:
 #
-#   1. `ply test examples/service.ply --no-cache`: the whole suite against the twin, hermetic, and
+#   1. `ply test examples/service.ply --no-cache`: the whole suite against the fake, hermetic, and
 #      every test evaluated rather than served from a cache.
 #   2. The one service started twice, `SERVICE_STORE=memory` and `SERVICE_STORE=postgres`, the same requests
 #      sent to both, and the answers compared byte for byte.
@@ -56,7 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== 1. the whole suite against the twin, hermetically =="
+echo "== 1. the whole suite against the fake, hermetically =="
 "$ply" --color never test "$here/service.ply" --no-cache | tee "$work/step1.out"
 # `ply test` exits 0 over a run that evaluated nothing, so the counts are read, not the status.
 counts="$(grep -E '^[[:space:]]*[0-9]+ failed, [0-9]+ passed, [0-9]+ cached' "$work/step1.out" | tail -n 1 || true)"
@@ -127,7 +127,7 @@ wait_for() {
 
 mem_pid="$(serve memory "$mem_port" "$work/memory.log")"
 pg_pid="$(serve postgres "$pg_port" "$work/postgres.log")"
-wait_for "$mem_port" || { echo "the twin never answered:"; cat "$work/memory.log"; exit 1; }
+wait_for "$mem_port" || { echo "the fake never answered:"; cat "$work/memory.log"; exit 1; }
 wait_for "$pg_port" || { echo "postgres never answered:"; cat "$work/postgres.log"; exit 1; }
 
 # One request to both services. The writes move both stores in step, so the reads after them compare
@@ -210,7 +210,7 @@ echo "   rolled back  409, orders still $before"
 echo
 
 if [ "$divergences" -ne 0 ]; then
-  echo "$divergences of $compared requests diverged between the twin and postgres"
+  echo "$divergences of $compared requests diverged between the fake and postgres"
   exit 1
 fi
-echo "$compared requests answered byte for byte alike by the twin and postgres."
+echo "$compared requests answered byte for byte alike by the fake and postgres."

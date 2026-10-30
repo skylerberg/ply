@@ -2,7 +2,7 @@ import compiler.front.facts (Analysis)
 import compiler.front.seam (Analysed, Refused)
 import compiler.front.rows (module_of)
 import compiler.store.hash.encoding (hex)
-import compiler.check.infer.checker (DefInfo)
+import compiler.check.infer.checker (DefinitionInfo)
 import compiler.syntax
 import compiler.syntax (Diagnostic, Edit, Error, Sample, Span, Warning, sample_source)
 import compiler.syntax.items (Item, EffectItem, TypeItem)
@@ -10,7 +10,7 @@ import compiler.load
 import compiler.load (SourceFile)
 import compiler.syntax.parsing
 import compiler.check.resolve
-import compiler.check.resolve.tables (Diag, ParsedModule, qualify)
+import compiler.check.resolve.tables (ParsedModule, qualify)
 import compiler.check.types (row_text, scheme_text)
 import compiler.unit (shipped)
 import std.bytes
@@ -70,12 +70,12 @@ fn validate_sources(
 fn file_at(files: List<SourceFile>, module: Int) -> SourceFile =
   files.at_or(module, { path: "", name: "", text: b"" })
 
-fn diagnostic_of(files: List<SourceFile>, diag: Diag) -> Diagnostic =
+fn diagnostic_of(files: List<SourceFile>, diagnostic: tables::Diagnostic) -> Diagnostic =
   {
-    code: String::of_bytes_lossy(diag.code),
-    severity: if diag.severity == b"warning" { Warning } else { Error },
-    message: String::of_bytes_lossy(diag.message),
-    labels: diag.labels.map(|label: tables::Label| {
+    code: String::of_bytes_lossy(diagnostic.code),
+    severity: if diagnostic.severity == b"warning" { Warning } else { Error },
+    message: String::of_bytes_lossy(diagnostic.message),
+    labels: diagnostic.labels.map(|label: tables::Label| {
       let file = file_at(files, label.module);
       {
         path: file.path,
@@ -85,8 +85,8 @@ fn diagnostic_of(files: List<SourceFile>, diag: Diag) -> Diagnostic =
         text: String::of_bytes_lossy(label.text),
       }
     }),
-    notes: diag.notes_text.map(|note: Bytes| String::of_bytes_lossy(note)),
-    fixes: diag.fixes.map(|fix: tables::Fix|
+    notes: diagnostic.notes_text.map(|note: Bytes| String::of_bytes_lossy(note)),
+    fixes: diagnostic.fixes.map(|fix: tables::Fix|
       {
         title: String::of_bytes_lossy(fix.title),
         edits: fix.edits.map(|edit: tables::Edit|
@@ -102,14 +102,14 @@ type Tables = { hashes: Map<Bytes, Bytes>, references: Map<Bytes, List<Bytes>> }
 
 fn tables_of(analysis: Analysis) -> Tables =
   {
-    hashes: analysis.hashes.decls.fold(
-      analysis.hashes.defs.fold(
+    hashes: analysis.hashes.declarations.fold(
+      analysis.hashes.definitions.fold(
         Map::new(),
         |held: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }| held.insert(d.name, d.hash),
       ),
       |held: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }| held.insert(d.name, d.hash),
     ),
-    references: analysis.hashes.deps.fold(
+    references: analysis.hashes.dependencies.fold(
       Map::new(),
       |held: Map<Bytes, List<Bytes>>, d: { name: Bytes, names: List<Bytes> }|
         held.insert(d.name, d.names),
@@ -125,18 +125,22 @@ fn references_in(tables: Tables, name: Bytes) -> List<String> =
     None -> [],
   }
 
-fn function(files: List<SourceFile>, tables: Tables, def: DefInfo) -> Definition / {abort.raise} =
+fn function(
+  files: List<SourceFile>,
+  tables: Tables,
+  definition: DefinitionInfo,
+) -> Definition / {abort.raise} =
   {
-    name: String::of_bytes_lossy(def.name),
-    module: String::of_bytes_lossy(def.module),
-    simple_name: String::of_bytes_lossy(def.simple_name),
+    name: String::of_bytes_lossy(definition.name),
+    module: String::of_bytes_lossy(definition.module),
+    simple_name: String::of_bytes_lossy(definition.simple_name),
     kind: Function,
-    path: file_at(files, def.at.module).path,
-    span: { start: def.at.span.start, end: def.at.span.end },
-    signature: String::of_bytes_lossy(scheme_text(def.scheme)),
-    row: String::of_bytes_lossy(row_text({ atoms: def.footprint, tail: None })),
-    hash: hash_in(tables, def.name),
-    references: references_in(tables, def.name),
+    path: file_at(files, definition.at.module).path,
+    span: { start: definition.at.span.start, end: definition.at.span.end },
+    signature: String::of_bytes_lossy(scheme_text(definition.scheme)),
+    row: String::of_bytes_lossy(row_text({ atoms: definition.footprint, tail: None })),
+    hash: hash_in(tables, definition.name),
+    references: references_in(tables, definition.name),
   }
 
 fn declaration(
@@ -144,7 +148,7 @@ fn declaration(
   path: String,
   module: Bytes,
   kind: DefinitionKind,
-  declared: parsing::Ident,
+  declared: parsing::Identifier,
 ) -> Definition / {abort.raise} = {
   let name = qualify(module, declared.name);
   {
@@ -180,10 +184,11 @@ fn definitions_of(
   analysis: Analysis,
 ) -> List<Definition> / {abort.raise} = {
   let tables = tables_of(analysis);
-  let all = range(0, analysis.mods.len()).fold(
-    analysis.checked.defs.map(|def: DefInfo| function(files, tables, def)),
+  let all = range(0, analysis.modules.len()).fold(
+    analysis.checked.definitions.map(|definition: DefinitionInfo|
+      function(files, tables, definition)),
     |found: List<Definition>, i: Int|
-      match analysis.mods.at(i) {
+      match analysis.modules.at(i) {
         Some(parsed) -> declared(tables, file_at(files, i).path, parsed, found),
         None -> found,
       },
@@ -218,16 +223,18 @@ pub fn checked(
   let own = validate_sources(sources, limits);
   let answered = load::analyse_in_memory(own, Map::new());
   match answered.out {
-    Refused(diags) ->
+    Refused(diagnostics) ->
       {
         ok: false,
-        diagnostics: diags.map(|diag: Diag| diagnostic_of(answered.files, diag)),
+        diagnostics: diagnostics.map(|diagnostic: tables::Diagnostic|
+          diagnostic_of(answered.files, diagnostic)),
         definitions: [],
       },
     Analysed(analysis) ->
       {
         ok: true,
-        diagnostics: analysis.warnings.map(|diag: Diag| diagnostic_of(answered.files, diag)),
+        diagnostics: analysis.warnings.map(|diagnostic: tables::Diagnostic|
+          diagnostic_of(answered.files, diagnostic)),
         definitions: definitions_of(answered.files, own.map(|f: SourceFile| f.name), analysis),
       },
   }

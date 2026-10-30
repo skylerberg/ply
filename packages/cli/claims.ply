@@ -20,9 +20,9 @@ import compiler.front.rows (LawRow, ModuleSpan)
 import compiler.emit.keys as root_keys
 import compiler.emit.keys (Clause, ClauseKind, LawBody, LawGuard, LawPart, Named, Requires, law_key,
                            root_name, root_text)
-import compiler.check.infer.checker (DefInfo)
+import compiler.check.infer.checker (DefinitionInfo)
 import compiler.cc
-import compiler.check.resolve.tables (Diag, error_with_labels, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_with_labels, error_at)
 import signature (provenance)
 import std.bytes
 import proof.keys (claim_key, run_key)
@@ -32,8 +32,8 @@ import std.json (Json, Null, Str, Bool, Number, Array, Object, Member, object, i
                  to_string)
 import std.term (Style, plain, dim, red, green, yellow)
 import proof.obligation (Binding, Builds, CacheRefused, Certificate, Change, Changed, ClaimRow,
-                         Cost, Counterexample, Coverage, Def, Defect, Ensures, Fault, Frame, Fresh,
-                         FromProof, Gap, Judgement, PointFailed, PointFaulted, PointHeld,
+                         Cost, Counterexample, Coverage, Definition, Defect, Ensures, Fault, Frame,
+                         Fresh, FromProof, Gap, Judgement, PointFailed, PointFaulted, PointHeld,
                          PointRaised, PointRejected, Kind, Law, Laws, ChangeState, Never, NoWitness,
                          Open, Outcome, Proved, Pure, Raised, CacheStatus, ClaimSnapshot, Refuted,
                          Space, Stuck, Uncached, Unchanged, UnhandledEffect, Unproved, Vacuous,
@@ -63,7 +63,7 @@ pub type ProveOptions = { budget: Option<Int>, timeout: Option<Int> }
 
 pub effect proof_store {
   read cached(keys: List<String>) -> List<Option<Bytes>>
-  write record(entries: List<{ key: String, evidence: Bytes }>) -> List<Diag>
+  write record(entries: List<{ key: String, evidence: Bytes }>) -> List<Diagnostic>
   read baselines(names: List<String>) -> List<{ name: String, record: ClaimSnapshot }>
   write accepted(records: List<{ name: String, record: ClaimSnapshot }>) -> AcceptResult
 }
@@ -76,7 +76,7 @@ pub fn options_from(p: Parsed) -> Options / {abort.raise} =
     sim: machine::sim_options_from(p),
   }
 
-pub type Refused = { diags: List<Diag>, places: List<SourceText> }
+pub type Refused = { diagnostics: List<Diagnostic>, places: List<SourceText> }
 
 pub type Refusal = | NotCompiled(Refused) | CacheUnavailable(Refused)
 
@@ -94,22 +94,22 @@ pub type Claim = {
 
 pub type Plan = { prove_budget: Int, timeout_ms: Int, sim: plan::Plan }
 
-pub type LoadResult = { places: List<SourceText>, warnings: List<Diag> }
+pub type LoadResult = { places: List<SourceText>, warnings: List<Diagnostic> }
 
 pub type OwnClaims = {
   claims: List<Claim>,
-  defs: List<Def>,
+  definitions: List<Definition>,
   laws: List<WrittenLaw>,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   world: ProverInput,
   modules: List<Bytes>,
 }
 
 pub type Collection = {
   places: List<SourceText>,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   claims: List<Claim>,
-  defs: List<Def>,
+  definitions: List<Definition>,
   laws: List<WrittenLaw>,
   plan: Plan,
   world: ProverInput,
@@ -135,7 +135,7 @@ pub fn collection_of(
     places: got.places,
     warnings: got.warnings.concat(mine.warnings),
     claims: mine.claims,
-    defs: mine.defs,
+    definitions: mine.definitions,
     laws: mine.laws,
     plan: plan_of(options),
     world: mine.world,
@@ -144,9 +144,12 @@ pub fn collection_of(
   }
 
 pub fn own_claims(analysis: Analysis, built: ProverInputResult) -> OwnClaims / {abort.raise} = {
-  let defs = analysis.checked.defs.fold(Map::new(), |acc: Map<String, DefInfo>, d: DefInfo|
-    acc.insert(String::of_bytes_lossy(d.name), d));
-  let schemas = schemas_instantiated(analysis.mods);
+  let definitions = analysis.checked.definitions.fold(
+    Map::new(),
+    |acc: Map<String, DefinitionInfo>, d: DefinitionInfo|
+      acc.insert(String::of_bytes_lossy(d.name), d),
+  );
+  let schemas = schemas_instantiated(analysis.modules);
   {
     claims: built.world.obligations.map(|o: Obligation|
       {
@@ -158,7 +161,7 @@ pub fn own_claims(analysis: Analysis, built: ProverInputResult) -> OwnClaims / {
         frame: o.frame,
         at: o.at,
         unperformed: match o.kind {
-          Ensures(_) -> match defs.get(o.owner) {
+          Ensures(_) -> match definitions.get(o.owner) {
             Some(d) -> provenance(d).unperformed,
             None -> [],
           },
@@ -169,15 +172,19 @@ pub fn own_claims(analysis: Analysis, built: ProverInputResult) -> OwnClaims / {
           None -> None,
         },
       }),
-    defs: built.defs,
+    definitions: built.definitions,
     laws: built.laws,
     warnings: built.warnings,
     world: built.world,
-    modules: range(0, analysis.mods.len()).map(|i: Int| analysis.mods.get(i).name),
+    modules: range(0, analysis.modules.len()).map(|i: Int| analysis.modules.get(i).name),
   }
 }
 
-pub type DischargeResult = { outcomes: List<Outcome>, duration_ms: Decimal, warnings: List<Diag> }
+pub type DischargeResult = {
+  outcomes: List<Outcome>,
+  duration_ms: Decimal,
+  warnings: List<Diagnostic>,
+}
 
 pub type Reach = {
   decision: String,
@@ -275,20 +282,20 @@ pub type Verdicts = {
   cached: Int,
   specified: Int,
   duration_ms: Decimal,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
 }
 
-pub type AcceptResult = { definitions: Int, stored: Bool, warnings: List<Diag> }
+pub type AcceptResult = { definitions: Int, stored: Bool, warnings: List<Diagnostic> }
 
 pub type Row = { claim: Claim, outcome: Outcome, reason: CacheStatus, reach: Option<Reach> }
 
 pub fn seconds(ms: Decimal) -> String / {abort.raise} = ms.div(1000m, 2, HalfUp).to_string()
 
-pub fn once_each(diags: List<Diag>) -> List<Diag> =
-  diags.fold([], |acc: List<Diag>, d: Diag|
-    if acc.fold(false, |seen: Bool, k: Diag| seen || (k.code == d.code && k.message == d.message)) {
-      acc
-    } else { acc.push(d) })
+pub fn once_each(diagnostics: List<Diagnostic>) -> List<Diagnostic> =
+  diagnostics.fold([], |acc: List<Diagnostic>, d: Diagnostic|
+    if acc.fold(false, |seen: Bool, k: Diagnostic|
+        seen || (k.code == d.code && k.message == d.message)) { acc }
+    else { acc.push(d) })
 
 pub fn location_text(places: List<SourceText>, at: ModuleSpan) -> Option<String> / {abort.raise} =
   if at.module == no_module() { None } else {
@@ -411,10 +418,10 @@ pub fn rows_of(claims: List<Claim>, wanted: List<Int>, verdicts: Verdicts) -> Li
     })
 
 pub fn laws_in(collection: Collection) -> Laws =
-  laws_of(collection.defs.map(|def: Def| def.name), collection.laws)
+  laws_of(collection.definitions.map(|definition: Definition| definition.name), collection.laws)
 
-fn refusal_warning(text: String) -> Diag = {
-  let d: Diag = error_with_labels(b"W0602", Bytes::of_string(text), [], [
+fn refusal_warning(text: String) -> Diagnostic = {
+  let d: Diagnostic = error_with_labels(b"W0602", Bytes::of_string(text), [], [
     b"the obligation was discharged again, so no claim rests on it",
     b"run `ply cache clear` if it happens again",
   ]);
@@ -442,7 +449,7 @@ pub fn claim_rows(
 
 pub fn carried_by(collection: Collection) -> Int =
   specified(
-    collection.defs.map(|def: Def| def.name),
+    collection.definitions.map(|definition: Definition| definition.name),
     laws_in(collection),
     collection.claims.map(|claim: Claim| { owner: claim.owner, kind: claim.kind }),
   )
@@ -535,7 +542,7 @@ pub fn decide_claims<| e>(
         reaches: static_answers.reaches,
         reasons: selection.reasons,
         coverage: coverage(
-          collection.defs.map(|def: Def| def.name),
+          collection.definitions.map(|definition: Definition| definition.name),
           laws_in(collection),
           claim_rows(collection, wanted, all),
         ),
@@ -605,11 +612,12 @@ pub fn discharge_on_unit(
   settled: List<StaticResult>,
 ) -> Result<DischargeResult, Refusal> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.compiled, discharging.decided, abort.raise} =
   if runs.len() == 0 { Ok({ outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] }) } else {
-    let broken = |diags: List<Diag>| Err(NotCompiled({ diags: diags, places: collection.places }));
+    let broken = |diagnostics: List<Diagnostic>|
+      Err(NotCompiled({ diagnostics: diagnostics, places: collection.places }));
     match units::whole_text(front) {
-      Err(diags) -> broken(diags),
+      Err(diagnostics) -> broken(diagnostics),
       Ok(text) -> match units::library(text, cc::development()) {
-        Err(diags) -> broken(diags),
+        Err(diagnostics) -> broken(diagnostics),
         Ok(library) -> match entering::machine.open(library) {
           Err(why) -> broken([machine::unit_load_error(why)]),
           Ok(o) -> {
@@ -659,7 +667,7 @@ pub fn discharge_runs(
       |claim: Int, outcome: Outcome| discharging.decided(claim, outcome),
     )
   } with {
-    var warnings: List<Diag> = [],
+    var warnings: List<Diagnostic> = [],
     entry_warnings.ended(ws) -> {
       warnings = warnings.concat(ws);
     },
@@ -673,22 +681,22 @@ pub fn discharge_runs(
 }
 
 effect entry_warnings {
-  write ended(warnings: List<Diag>) -> Unit
+  write ended(warnings: List<Diagnostic>) -> Unit
 }
 
 fn judge_in_lanes(
   p: ProofContext,
   batches: List<Batch>,
   lanes: Option<Int>,
-) -> { each: List<List<Judgement>>, warnings: List<Diag> } / {entering::machine.enter, abort.raise} = {
+) -> { each: List<List<Judgement>>, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} = {
   let dealt = machine::split_into_lanes(batches, lanes);
   let judge_batch = judge_lanes(p, dealt, 0, dealt.len(), 64);
   {
     each: machine::merge_lanes(
       judge_batch.map(|lane: List<BatchResult>| lane.map(|j: BatchResult| j.each)),
     ),
-    warnings: judge_batch.fold([], |acc: List<Diag>, lane: List<BatchResult>|
-      lane.fold(acc, |into: List<Diag>, j: BatchResult| into.concat(j.warnings))),
+    warnings: judge_batch.fold([], |acc: List<Diagnostic>, lane: List<BatchResult>|
+      lane.fold(acc, |into: List<Diagnostic>, j: BatchResult| into.concat(j.warnings))),
   }
 }
 
@@ -735,11 +743,11 @@ pub fn proof_context_of(unit: Int, front: LoadedAnalysis, collection: Collection
     timeout_ms: collection.plan.timeout_ms,
   }
 
-pub type BatchResult = { each: List<Judgement>, warnings: List<Diag> }
+pub type BatchResult = { each: List<Judgement>, warnings: List<Diagnostic> }
 
 type ClaimRoots = { guards: List<String>, body: String, call: Option<String> }
 
-type EntryResult = { result: Result<Value, Judgement>, warnings: List<Diag> }
+type EntryResult = { result: Result<Value, Judgement>, warnings: List<Diagnostic> }
 
 pub fn judge_batch(
   p: ProofContext,
@@ -750,7 +758,7 @@ pub fn judge_batch(
     Ok(r) -> {
       let done = batch.points.fold(
         { each: [], warnings: [], over: false },
-        |acc: { each: List<Judgement>, warnings: List<Diag>, over: Bool }, point: List<Value>|
+        |acc: { each: List<Judgement>, warnings: List<Diagnostic>, over: Bool }, point: List<Value>|
           if acc.over { acc } else {
             let one = match batch.mode {
               WholeClaim -> judge_point(p, r, point),
@@ -791,7 +799,7 @@ fn judge_point(
   p: ProofContext,
   r: ClaimRoots,
   point: List<Value>,
-) -> { result: Judgement, warnings: List<Diag> } / {entering::machine.enter, abort.raise} = {
+) -> { result: Judgement, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} = {
   let g = guard(p, r, point);
   match g.result {
     Err(j) -> { result: j, warnings: g.warnings },
@@ -810,10 +818,10 @@ fn guard(
   p: ProofContext,
   r: ClaimRoots,
   point: List<Value>,
-) -> { result: Result<Bool, Judgement>, warnings: List<Diag> } / {entering::machine.enter, abort.raise} =
+) -> { result: Result<Bool, Judgement>, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} =
   r.guards.fold(
     { result: Ok(true), warnings: [] },
-    |acc: { result: Result<Bool, Judgement>, warnings: List<Diag> }, root: String|
+    |acc: { result: Result<Bool, Judgement>, warnings: List<Diagnostic> }, root: String|
       match acc.result {
         Ok(true) -> {
           let e = enter_root(p, root, point);
@@ -827,7 +835,7 @@ fn proposition_holds(
   p: ProofContext,
   r: ClaimRoots,
   point: List<Value>,
-) -> { result: Result<Bool, Judgement>, warnings: List<Diag> } / {entering::machine.enter, abort.raise} =
+) -> { result: Result<Bool, Judgement>, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} =
   match r.call {
     None -> {
       let e = enter_root(p, r.body, point);
@@ -920,7 +928,7 @@ fn roots_of(p: ProofContext, claim: Int) -> Result<ClaimRoots, Judgement> / {abo
       let owner = Bytes::of_string(o.owner);
       let clause = |kind: ClauseKind, n: Int|
         String::of_bytes_lossy(
-          root_text(root_name(Clause({ def: Named(owner), kind: kind, n: n }))),
+          root_text(root_name(Clause({ definition: Named(owner), kind: kind, n: n }))),
         );
       let law = |at: { module: Bytes, label: Bytes }, part: LawPart|
         String::of_bytes_lossy(root_text(root_name(law_key(at.module, at.label, part))));
@@ -961,7 +969,7 @@ pub fn run_interleaving(
   point: List<Value>,
   seed: Seed,
   steps: Int,
-) -> { run: LawRun, warnings: List<Diag> } / {entering::machine.enter, abort.raise} =
+) -> { run: LawRun, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} =
   match roots_of(p, claim) {
     Err(fault) ->
       {
@@ -1086,10 +1094,10 @@ fn certificate_json(c: Certificate) -> Json / {abort.raise} =
     { key: "summary", value: Str(certificate_summary(c)) },
   ])
 
-fn counterexample_json(cx: Counterexample) -> Json =
+fn counterexample_json(context: Counterexample) -> Json =
   object([
-    { key: "bindings", value: bindings_json(cx.bindings) },
-    { key: "seed", value: match cx.seed { Some(text) -> Str(text), None -> Null } },
+    { key: "bindings", value: bindings_json(context.bindings) },
+    { key: "seed", value: match context.seed { Some(text) -> Str(text), None -> Null } },
   ])
 
 fn stuck_json(stuck: List<Stuck>) -> Json =
@@ -1104,7 +1112,7 @@ fn stuck_json(stuck: List<Stuck>) -> Json =
 fn outcome_members(outcome: Outcome) -> List<Member> / {abort.raise} =
   match outcome {
     Proved(c) -> [{ key: "certificate", value: certificate_json(c) }],
-    Refuted(cx) -> [{ key: "counterexample", value: counterexample_json(cx) }],
+    Refuted(context) -> [{ key: "counterexample", value: counterexample_json(context) }],
     Vacuous(_) -> [{ key: "vacuity", value: Str(vacuity_summary()) }],
     Unproved(gap) ->
       [
@@ -1206,22 +1214,22 @@ pub fn plan_json(p: Plan) -> Json / {abort.raise} =
 
 fn span_of(at: ModuleSpan) -> Span = span_between(at.start, at.end)
 
-fn refutation(row: Row, cx: Counterexample) -> Diag = {
-  let notes = [Bytes::of_string(quantifier(row.claim, cx.bindings))];
+fn refutation(row: Row, context: Counterexample) -> Diagnostic = {
+  let notes = [Bytes::of_string(quantifier(row.claim, context.bindings))];
   error_at(
     b"E0419",
     row.claim.at.module,
     span_of(row.claim.at),
-    Bytes::of_string(label_of(row.claim) ++ " is false at " ++ bindings_text(cx.bindings)),
+    Bytes::of_string(label_of(row.claim) ++ " is false at " ++ bindings_text(context.bindings)),
     b"this claim does not hold",
-    match cx.seed {
+    match context.seed {
       Some(seed) -> notes.push(Bytes::of_string("replay with `--seed " ++ seed ++ "`")),
       None -> notes,
     },
   )
 }
 
-fn vacuity(row: Row, guard: ModuleSpan) -> Diag =
+fn vacuity(row: Row, guard: ModuleSpan) -> Diagnostic =
   error_at(
     b"E0420",
     guard.module,
@@ -1234,7 +1242,7 @@ fn vacuity(row: Row, guard: ModuleSpan) -> Diag =
     ],
   )
 
-fn unproved(row: Row, gap: Gap) -> Diag / {abort.raise} =
+fn unproved(row: Row, gap: Gap) -> Diagnostic / {abort.raise} =
   error_at(
     b"E0474",
     row.claim.at.module,
@@ -1254,7 +1262,7 @@ fn unproved(row: Row, gap: Gap) -> Diag / {abort.raise} =
     ),
   )
 
-fn defect(row: Row, fault: Fault) -> Diag / {abort.raise} = {
+fn defect(row: Row, fault: Fault) -> Diagnostic / {abort.raise} = {
   let at = if fault.bindings.len() == 0 { [] }
   else { [Bytes::of_string("at " ++ bindings_text(fault.bindings))] };
   error_at(
@@ -1267,11 +1275,11 @@ fn defect(row: Row, fault: Fault) -> Diag / {abort.raise} = {
   )
 }
 
-pub fn diagnostics_of(rows: List<Row>) -> List<Diag> / {abort.raise} =
-  rows.fold([], |acc: List<Diag>, row: Row|
+pub fn diagnostics_of(rows: List<Row>) -> List<Diagnostic> / {abort.raise} =
+  rows.fold([], |acc: List<Diagnostic>, row: Row|
     match row.outcome {
       Proved(_) -> acc,
-      Refuted(cx) -> acc.push(refutation(row, cx)),
+      Refuted(context) -> acc.push(refutation(row, context)),
       Vacuous(v) -> acc.push(vacuity(row, v.guard)),
       Unproved(gap) -> acc.push(unproved(row, gap)),
       Defect(f) -> acc.push(defect(row, f)),
@@ -1283,8 +1291,8 @@ pub fn failure_output(
   why: Refusal,
 ) -> CommandOutput / {abort.raise} =
   match why {
-    NotCompiled(r) -> refused(style, command, r.diags, r.places),
-    CacheUnavailable(r) -> reported(style, command, r.diags, r.places),
+    NotCompiled(r) -> refused(style, command, r.diagnostics, r.places),
+    CacheUnavailable(r) -> reported(style, command, r.diagnostics, r.places),
   }
 
 pub fn a_span() -> ModuleSpan = { module: 0, start: 3, end: 7 }
@@ -1337,7 +1345,7 @@ test "a certificate names each rule once, counts the unfoldings, and ends in its
     Propositional,
     LinearArithmetic,
     Propositional,
-    Unfold({ def: "m.double", depth: 1 }),
+    Unfold({ definition: "m.double", depth: 1 }),
   ];
   assert_eq(
     certificate_summary({
@@ -1413,7 +1421,7 @@ test "a refuted claim is E0419 over the claim, and one nothing proved is E0474 o
   };
   let ds = diagnostics_of([refuted]);
   assert_eq(ds.len(), 1);
-  let d: Diag = match ds.at(0) { Some(x) -> x, None -> panic("one diagnostic") };
+  let d: Diagnostic = match ds.at(0) { Some(x) -> x, None -> panic("one diagnostic") };
   assert_eq(d.code, b"E0419");
   assert_eq(d.severity, b"error");
   assert_eq(d.message, b"law \"a batch is small\" is false at xs = [0, 0]");
@@ -1431,7 +1439,7 @@ test "a refuted claim is E0419 over the claim, and one nothing proved is E0474 o
     reason: Fresh,
     reach: None,
   };
-  let e: Diag = match diagnostics_of([gap]) { [x] -> x, _ -> panic("one diagnostic") };
+  let e: Diagnostic = match diagnostics_of([gap]) { [x] -> x, _ -> panic("one diagnostic") };
   assert_eq(e.code, b"E0474");
   assert_eq(e.severity, b"error");
   assert_eq(e.message, b"m.stored ensures #0 is not proved: performs {db.read[rows]}: no handler");
@@ -1454,7 +1462,7 @@ test "an unproved claim says where the prover stopped, and a cost bound is named
     reason: Fresh,
     reach: None,
   };
-  let d: Diag = match diagnostics_of([open]) { [x] -> x, _ -> panic("one diagnostic") };
+  let d: Diagnostic = match diagnostics_of([open]) { [x] -> x, _ -> panic("one diagnostic") };
   assert_eq(d.code, b"E0474");
   assert_eq(d.message, b"m.total cost #0 is not proved: no proof");
   assert_eq(d.notes_text, [
@@ -1486,7 +1494,7 @@ test "Ply's failure is its own error over the claim, never the program's gap" {
     reason: Fresh,
     reach: None,
   };
-  let d: Diag = match diagnostics_of([r]) { [x] -> x, _ -> panic("one diagnostic") };
+  let d: Diagnostic = match diagnostics_of([r]) { [x] -> x, _ -> panic("one diagnostic") };
   assert_eq(d.code, b"E0505");
   assert_eq(d.severity, b"error");
   assert_eq(
@@ -1528,7 +1536,7 @@ fn a_collection_of(claims: List<Claim>) -> Collection =
     places: [a_place()],
     warnings: [],
     claims: claims,
-    defs: [],
+    definitions: [],
     laws: [],
     plan: a_plan(),
     world: empty_prover_input(),
@@ -1592,7 +1600,7 @@ pub fn collected_part(collection: Collection) -> LoadResult =
 pub fn claimed_part(collection: Collection) -> OwnClaims =
   {
     claims: collection.claims,
-    defs: collection.defs,
+    definitions: collection.definitions,
     laws: collection.laws,
     warnings: [],
     world: collection.world,

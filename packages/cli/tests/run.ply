@@ -19,16 +19,16 @@ import machine
 import compiler.front.facts (CheckedProgram, pulled_at)
 import compiler.front.seam (TestRunScope)
 import compiler.unit (shipped)
-import compiler.check.infer.checker (DefInfo, EffectInfo, TestInfo, prelude_effects)
-import compiler.check.resolve.tables (Diag)
+import compiler.check.infer.checker (DefinitionInfo, EffectInfo, TestInfo, prelude_effects)
+import compiler.check.resolve.tables (Diagnostic)
 import compiler.check.types
 import compiler.syntax.type_syntax
 import compiler.syntax.type_syntax (WriteMode)
 import diagnostic (SourceText, shown)
 import mutants (targets)
 import paths
-import program (TimedLoad, loaded_analysis, modules_of, own_diags, timed_over, timed_uncached_over,
-                unchanged, program_view, encoded_command_line, cached_command)
+import program (TimedLoad, loaded_analysis, modules_of, own_diagnostics, timed_over,
+                timed_uncached_over, unchanged, program_view, encoded_command_line, cached_command)
 import report (CommandOutput, ok_code, printed, refused, reuse_members, with_front_end)
 import sources (Embed, File, Project, imported_reader, load_resolved, shipped_imported)
 import std.process (process)
@@ -84,8 +84,8 @@ fn load_or_reuse(
   match reused {
     Some(t) -> { ..t, read_ms: 0, front_end_ms: 0, store_ms: 0 },
     None -> if flags.no_cache {
-      timed_uncached_over(flags.paths, project, started, flags.verify_deps)
-    } else { timed_over(flags.paths, project, started, flags.verify_deps) },
+      timed_uncached_over(flags.paths, project, started, flags.verify_dependencies)
+    } else { timed_over(flags.paths, project, started, flags.verify_dependencies) },
   }
 }
 
@@ -202,7 +202,7 @@ fn over_load(
     None ->
       {
         result: with_front_end(
-          refused(s, "test", t.program.diags, t.program.places),
+          refused(s, "test", t.program.diagnostics, t.program.places),
           reuse_members(t.program.tallies, t.program.lost),
         ),
         held: None,
@@ -211,7 +211,7 @@ fn over_load(
     Some(w) -> match config_schema::schema_error(w, options.machine.config.schema) {
       Some(d) ->
         {
-          result: unbound(s, { diags: [d], places: t.program.places }),
+          result: unbound(s, { diagnostics: [d], places: t.program.places }),
           held: None,
           embeds: t.program.embeds,
         },
@@ -319,7 +319,7 @@ fn program_of(
   entries: List<Entry>,
   root: String,
   scope: Scope,
-  opened: List<Diag>,
+  opened: List<Diagnostic>,
   filed_under: Option<String>,
   unit: TestUnit,
 ) -> Program / {abort.raise} = {
@@ -351,7 +351,7 @@ fn program_of(
     cases: cases,
     positions: placed_cases(cases),
     filtered_out: scope.filtered_out,
-    warnings: opened.concat(own_diags(timed.program.diags, analysis.frame)),
+    warnings: opened.concat(own_diagnostics(timed.program.diagnostics, analysis.frame)),
     options: object([]),
   }
 }
@@ -365,8 +365,11 @@ fn tests_over(
   begun: Int,
   keeping: Option<CacheTarget>,
 ) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, Derives, abort.raise, shipped.report_reached} = {
-  let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
-    Some(query) -> match targets(analysis, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
+  let aimed: Result<Option<List<DefinitionInfo>>, Diagnostic> = match options.mutate {
+    Some(query) -> match targets(analysis, query) {
+      Ok(definitions) -> Ok(Some(definitions)),
+      Err(d) -> Err(d),
+    },
     None -> Ok(None),
   };
   match aimed {
@@ -389,7 +392,7 @@ fn selected(
   options: Options,
   timed: TimedLoad,
   analysis: CheckedProgram,
-  targeted: Option<List<DefInfo>>,
+  targeted: Option<List<DefinitionInfo>>,
   spent: TimeSpent,
   keeping: Option<CacheTarget>,
 ) -> CommandOutput / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, shipped.read_pack, Derives, abort.raise, shipped.report_reached} = {
@@ -421,7 +424,8 @@ fn selected(
     };
     let listing = time.elapsed_us();
     match list_cases(testing, lister, to_list) {
-      Err(diags) -> unbound(style, { diags: diags, places: timed.program.places }),
+      Err(diagnostics) ->
+        unbound(style, { diagnostics: diagnostics, places: timed.program.places }),
       Ok(found) -> {
         if flags.no_cache { () } else if place.label == "cwd" {
           case_listings::cache_listings[cwd](place.dir, stamp, unkept, found)
@@ -450,8 +454,8 @@ fn selected(
 }
 
 fn hashed_by_kind(analysis: CheckedProgram) -> Map<Bytes, Bytes> =
-  analysis.frame.hashes.decls.fold(
-    analysis.frame.hashes.defs.fold(
+  analysis.frame.hashes.declarations.fold(
+    analysis.frame.hashes.definitions.fold(
       Map::new(),
       |acc: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
         acc.insert(b"fn ".concat(d.name), d.hash),
@@ -483,7 +487,7 @@ fn listing_hash(
             [text],
             |acc: List<Bytes>, v: Int| {
               let key = Bytes::concat(
-                if r.decls.get(v) { b"decl " } else { b"fn " },
+                if r.declarations.get(v) { b"decl " } else { b"fn " },
                 r.names.get(v),
               );
               acc.push(key).push(match hashed.get(key) { Some(h) -> h, None -> b"" })
@@ -507,8 +511,8 @@ fn decided_run(
   timed: TimedLoad,
   over: ExpandedTests,
   analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
-  opened: List<Diag>,
-  targeted: Option<List<DefInfo>>,
+  opened: List<Diagnostic>,
+  targeted: Option<List<DefinitionInfo>>,
   spent: TimeSpent,
   listing: Int,
   keeping: Option<CacheTarget>,
@@ -554,7 +558,7 @@ fn decided_run(
     options.machine.config.schema != None,
   );
   match emitted {
-    Err(diags) -> unbound(style, { diags: diags, places: p.places }),
+    Err(diagnostics) -> unbound(style, { diagnostics: diagnostics, places: p.places }),
     Ok(unit) -> {
       let keyed = match unit {
         Some(e) -> if flags.no_cache { Map::new() }
@@ -579,26 +583,26 @@ fn decided_run(
       let build = decided.runs.len() > 0 || options.machine.config.schema != None;
       let text = match unit { Some(e) -> if build { Some(e.text) } else { None }, None -> None };
       let made = match units::library_of(text, options.machine.profile) {
-        Err(diags) -> Err(diags),
+        Err(diagnostics) -> Err(diagnostics),
         Ok(library) -> tester::unit_of(testing, handed, library, true),
       };
       match made {
-        Err(diags) -> unbound(style, { diags: diags, places: p.places }),
+        Err(diagnostics) -> unbound(style, { diagnostics: diagnostics, places: p.places }),
         Ok(made_unit) -> {
           let binding = time.elapsed_us();
-          let refused = |diags: List<Diag>| {
+          let refused = |diagnostics: List<Diagnostic>| {
             tester::close_unit(made_unit);
-            unbound(style, { diags: diags, places: p.places })
+            unbound(style, { diagnostics: diagnostics, places: p.places })
           };
           match configuration::resolve_configuration(options.machine.config, |name: String|
               schema_of(made_unit, name)) {
-            Err(diags) -> refused(diags),
+            Err(diagnostics) -> refused(diagnostics),
             Ok(r) -> match tester::bound(
                 testing,
                 handed.dump,
                 configuration::run_configuration(r.configuration),
               ) {
-              Err(diags) -> refused(diags),
+              Err(diagnostics) -> refused(diagnostics),
               Ok(bound_testing) -> {
                 let bound = time.elapsed_us();
                 let answer = concluded_run(
@@ -708,7 +712,7 @@ fn decided_run(
 fn schema_of(
   unit: TestUnit,
   name: String,
-) -> Result<Value, List<Diag>> / {entering::machine.enter, abort.raise} =
+) -> Result<Value, List<Diagnostic>> / {entering::machine.enter, abort.raise} =
   match unit.opened {
     Some(o) -> configuration::evaluate_schema_on_unit(o.unit, unit.roots, name),
     None -> Err([shown(machine::defect(name, "was asked of a run that built no unit"))]),

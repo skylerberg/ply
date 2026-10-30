@@ -9,7 +9,7 @@ import compiler.front.interface (length_prefixed)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.emit.keys (RootKey, Named)
 import compiler.cc
-import compiler.check.resolve.tables (Diag, error_at, error_with_labels, label_at)
+import compiler.check.resolve.tables (Diagnostic, error_at, error_with_labels, label_at)
 import machine
 import machine (CallResult)
 import std.machine as entering
@@ -21,7 +21,7 @@ import std.sql
 import std.sql (Dialect, Postgres, Sqlite, Operation, Reads, Writes, WritesRows, Either, Finding,
                 FindingKind, Unreadable, Undeclared, LabelMismatch, OperationMismatch, SelectStar,
                 Unsupported, RowMismatch, ValueMismatch)
-import std.value (Value, VBool, VCtor, VInt, VList, VRecord, VStr, field_named, ctor_name)
+import std.value (Value, VBool, VCtor, VInt, VList, VRecord, VStr, field_named, constructor_name)
 import units
 import units (emit)
 import compiler.syntax.parsing (span_between)
@@ -317,7 +317,8 @@ fn computed_value(
         let texts = t.parts.map(|p: Bytes| VStr(String::of_bytes_lossy(p)));
         let handed = match texts { [one] -> one, _ -> VList(texts) };
         match computed_of(call(String::of_bytes_lossy(t.callee), [handed])) {
-          Known(VCtor(name, [v])) -> if ctor_name(name) == "Ok" { Known(v) } else { Unknown },
+          Known(VCtor(name, [v])) -> if constructor_name(name) == "Ok" { Known(v) }
+          else { Unknown },
           Stopped -> Stopped,
           _ -> Unknown,
         }
@@ -343,14 +344,14 @@ fn all_computed(
 fn computed_of(called: CallResult) -> Computed =
   match called.result {
     Ok(v) -> Known(v),
-    Err(raised) -> if machine::is_abandoned(raised.diag.code) { Stopped } else { Unknown },
+    Err(raised) -> if machine::is_abandoned(raised.diagnostic.code) { Stopped } else { Unknown },
   }
 
 pub fn check_statements(
   analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
   frame: Frame,
   asked: List<StatementCheck>,
-) -> Result<List<Option<CheckResult>>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
+) -> Result<List<Option<CheckResult>>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
   let schemas = asked.fold([], |acc: List<Bytes>, a: StatementCheck|
     match a.schema {
       Some(s) -> if acc.contains(s.name) { acc } else { acc.push(s.name) },
@@ -361,7 +362,7 @@ pub fn check_statements(
   if named.len() == 0 {
     Ok(asked.map(|a: StatementCheck| Some(check_result_of(None, a, computed_text(a.statement)))))
   } else {
-    let reached = reach(frame.hashes, named.map(|n: Bytes| FunctionNamed(n))).fns;
+    let reached = reach(frame.hashes, named.map(|n: Bytes| FunctionNamed(n))).functions;
     let front = analysis_for({ owners: reached, tests: Map::new() });
     match units::library_over(
         emit.unit(
@@ -371,7 +372,7 @@ pub fn check_statements(
         ),
         cc::development(),
       ) {
-      Err(diags) -> Err(diags),
+      Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(why) -> Err([machine::unit_load_error(why)]),
         Ok(opened) -> {
@@ -508,7 +509,7 @@ fn column_of(v: Value) -> Option<sql::Column> =
 fn column_type_of(v: Value, left: Int) -> Option<sql::ColumnType> =
   match v {
     VCtor(name, args) -> {
-      let n = ctor_name(name);
+      let n = constructor_name(name);
       if n == "TInt" { Some(sql::IntColumn) }
       else if n == "TBool" { Some(sql::BoolColumn) }
       else if n == "TText" { Some(sql::TText) }
@@ -532,7 +533,7 @@ fn column_type_of(v: Value, left: Int) -> Option<sql::ColumnType> =
 fn statement_of(v: Value) -> Option<String> =
   match v {
     VStr(s) -> Some(s),
-    VCtor(name, args) -> if ctor_name(name) != "Bound" { None }
+    VCtor(name, args) -> if constructor_name(name) != "Bound" { None }
     else { match args { [VStr(s), ..] -> Some(s), _ -> None } },
     VRecord(fields) -> text_in(field_named(fields, "sql")),
     _ -> None,
@@ -552,7 +553,7 @@ fn excerpt(text: String, at: Int) -> Bytes / {abort.raise} = {
   b.slice(from, min(b.len(), from + 24))
 }
 
-pub fn misfits(a: CheckSite, j: CheckResult) -> List<Diag> / {abort.raise} =
+pub fn misfits(a: CheckSite, j: CheckResult) -> List<Diagnostic> / {abort.raise} =
   match j {
     Unchecked -> [],
     Checked(check_statements) ->
@@ -611,16 +612,16 @@ pub fn misfits(a: CheckSite, j: CheckResult) -> List<Diag> / {abort.raise} =
       }),
   }
 
-pub fn schemas_refused(asks: List<CheckSite>) -> List<Diag> =
+pub fn schemas_refused(asks: List<CheckSite>) -> List<Diagnostic> =
   asks.fold(
-    { modules: [], diags: [] },
-    |acc: { modules: List<Int>, diags: List<Diag> }, a: CheckSite|
+    { modules: [], diagnostics: [] },
+    |acc: { modules: List<Int>, diagnostics: List<Diagnostic> }, a: CheckSite|
       if acc.modules.contains(a.site.module) { acc } else {
         match a.schemas {
           [first, second, ..] ->
             {
               modules: acc.modules.push(a.site.module),
-              diags: acc.diags.push(
+              diagnostics: acc.diagnostics.push(
                 error_with_labels(
                   b"E0471",
                   Bytes::concat_all([
@@ -644,7 +645,7 @@ pub fn schemas_refused(asks: List<CheckSite>) -> List<Diag> =
           _ -> acc,
         }
       },
-  ).diags
+  ).diagnostics
 
 fn a_site(callee: Bytes, args: List<Argument>) -> StatementSite =
   { module: 0, span: span_between(3, 9), callee: callee, label: b"items", args: args }
@@ -792,12 +793,12 @@ test "what the check found is reported at the call, naming the statement and the
     at: 12,
     message: "names the column `nmae`, which `items` does not have",
   };
-  let diags = misfits(a, Checked({ text: "select sku, nmae from items", found: [found] }));
-  assert_eq(diags.map(|d: Diag| d.code), [b"E0433"]);
-  assert_eq(diags.map(|d: Diag| d.message), [
+  let diagnostics = misfits(a, Checked({ text: "select sku, nmae from items", found: [found] }));
+  assert_eq(diagnostics.map(|d: Diagnostic| d.code), [b"E0433"]);
+  assert_eq(diagnostics.map(|d: Diagnostic| d.message), [
     b"this statement names the column `nmae`, which `items` does not have in the schema `m.schema`",
   ]);
-  assert_eq(diags.map(|d: Diag| d.notes_text), [
+  assert_eq(diagnostics.map(|d: Diagnostic| d.notes_text), [
     [
       b"the statement, from `m.items_all()`: select sku, nmae from items",
       b"at byte 12 of the statement: `nmae from items`",
@@ -806,7 +807,7 @@ test "what the check found is reported at the call, naming the statement and the
   ]);
   assert_eq(misfits(a, Unchecked), []);
   let twice = { ..a, schemas: [declared, { ..declared, name: b"n.schema" }] };
-  assert_eq(schemas_refused([twice, twice]).map(|d: Diag| d.code), [b"E0471"]);
+  assert_eq(schemas_refused([twice, twice]).map(|d: Diagnostic| d.code), [b"E0471"]);
   assert_eq(schemas_refused([a]), []);
   assert_eq(code_of(sql::Unsupported), b"E0470")
 }

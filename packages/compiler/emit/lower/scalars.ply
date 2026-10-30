@@ -9,15 +9,15 @@ import compiler.check.types (Type, VariableType, NamedType, FunctionType, Record
 import compiler.check.known (is_int, is_bool, is_float, is_decimal, is_char, is_string, is_bytes,
                              is_unit, hold_name, secret_name, secret_item, option_item, list_item,
                              array_element, map_parts, columns_row, result_parts, ordering_type,
-                             width_type, fixed_widths, some_ctor, none_ctor)
+                             width_type, fixed_widths, some_constructor, none_constructor)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, folded_constant, is_bitwise)
 import std.bytes (ascii_of_int)
-import compiler.emit.representations (Ctors, SumCtor, has_vars, type_vars, compared_by_root,
-                                      keyed_sum, numeric_sum, nullary_sum, generic_sum, written_sum,
-                                      at_args, release_row)
-import compiler.check.infer.expr (kept_type)
+import compiler.emit.representations (Constructors, SumConstructor, has_variables, type_variables,
+                                      compared_by_root, keyed_sum, numeric_sum, nullary_sum,
+                                      generic_sum, written_sum, at_args, release_row)
+import compiler.check.infer.expression (kept_type)
 import compiler.emit.output (Exact, Scalar, float_literal_bits)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, TypeOp, Root, Order, NumericFunction, Reflect, Show, Digest,
@@ -25,7 +25,7 @@ import compiler.emit.keys (RootKey, TypeOp, Root, Order, NumericFunction, Reflec
 import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFixed, AsFloat, AsDecimal,
                                AsWideFixed, AsWord, AsSum, AsUnit, AsImmediate, Arg, VarOperand,
                                IntOperand, ZeroOperand, BoolOperand, FloatOperand, FixedOperand,
-                               CharOperand, Primitive, Literal, Tag, Call, Native, Let, Decl,
+                               CharOperand, Primitive, Literal, Tag, Call, Native, Let, Declaration,
                                Assign, If, operand_representation, comparison, arithmetic, shift,
                                Unwinding, read_only)
 import compiler.emit.lower.module_context (declared_call_types)
@@ -43,7 +43,7 @@ import compiler.emit.roots (builtin_helper)
 import compiler.expand.rewrite (FloatFunction, float_function, float_exact, numeric_operators)
 
 pub fn literal(
-  cx: Context,
+  context: Context,
   st: Lowering,
   l: SourceLiteral,
   at: Span,
@@ -53,18 +53,18 @@ pub fn literal(
     LiteralBool(b) -> { st: st, arg: BoolOperand(b) },
     LiteralFloat(x) -> { st: st, arg: FloatOperand(float_literal_bits(x)) },
     LiteralChar(v) -> { st: st, arg: CharOperand(v) },
-    LiteralFixed(name, bits) -> width_literal(cx, st, l, name, bits, at),
-    LiteralWide(name, _, low) -> width_literal(cx, st, l, name, low, at),
-    LiteralString(_) -> bound(cx, st, string_type(), Literal(l), at),
-    LiteralBytes(_) -> bound(cx, st, bytes_type(), Literal(l), at),
-    LiteralEmbedded(_, _) -> bound(cx, st, bytes_type(), Literal(l), at),
-    LiteralDecimal(_) -> bound(cx, st, decimal_type(), Literal(l), at),
+    LiteralFixed(name, bits) -> width_literal(context, st, l, name, bits, at),
+    LiteralWide(name, _, low) -> width_literal(context, st, l, name, low, at),
+    LiteralString(_) -> bound(context, st, string_type(), Literal(l), at),
+    LiteralBytes(_) -> bound(context, st, bytes_type(), Literal(l), at),
+    LiteralEmbedded(_, _) -> bound(context, st, bytes_type(), Literal(l), at),
+    LiteralDecimal(_) -> bound(context, st, decimal_type(), Literal(l), at),
     LiteralUnit -> { st: st, arg: ZeroOperand(AsUnit) },
     LiteralInvalid -> unreachable(b"a literal that does not read"),
   }
 
 fn width_literal(
-  cx: Context,
+  context: Context,
   st: Lowering,
   l: SourceLiteral,
   name: Bytes,
@@ -73,42 +73,47 @@ fn width_literal(
 ) -> LoweredValue / {abort.raise} =
   match width_named(name) {
     Some(w) -> if w.bits <= 64 { { st: st, arg: FixedOperand({ width: w, bits: bits }) } }
-    else { bound(cx, st, named_type(name), Literal(l), at) },
+    else { bound(context, st, named_type(name), Literal(l), at) },
     None -> unreachable(b"a literal of no known width"),
   }
 
-pub fn constant(cx: Context, c: Code) -> Option<Arg> =
+pub fn constant(context: Context, c: Code) -> Option<Arg> =
   match folded_constant(c) { Some(n) -> Some(IntOperand(n)), None -> None }
 
-pub fn operand(cx: Context, op: Bytes, rhs: Code) -> Option<Arg> =
+pub fn operand(context: Context, op: Bytes, rhs: Code) -> Option<Arg> =
   match divisor(op, rhs) { Some(d) -> Some(IntOperand(d)), None -> None }
 
-pub fn unary(cx: Context, o: LoweredValue, op: Bytes, at: Span) -> LoweredValue / {abort.raise} =
+pub fn unary(
+  context: Context,
+  o: LoweredValue,
+  op: Bytes,
+  at: Span,
+) -> LoweredValue / {abort.raise} =
   if op == b"not" {
     let b = represented_as(o, AsBool, at);
-    bound(cx, b.st, named_type(b"Bool"), Primitive({ op: op, on: AsBool, args: [b.arg] }), at)
+    bound(context, b.st, named_type(b"Bool"), Primitive({ op: op, on: AsBool, args: [b.arg] }), at)
   } else if op != b"neg" && op != b"bitnot" { unreachable(b"an operator: ".concat(op)) } else {
     let ty = type_of(o.arg);
     if ty == unknown_type() {
       unreachable(b"an operator over an operand of no known type: ".concat(op))
     } else {
-      match class_of(cx.setting.ctors, ty) {
-        IntOperands -> unary_primitive(cx, o, op, AsInt, ty, at),
-        WidthOperands(w) -> unary_primitive(cx, o, op, width_representation(w), ty, at),
-        FloatOperands -> if op == b"neg" { unary_primitive(cx, o, op, AsFloat, ty, at) }
+      match class_of(context.setting.constructors, ty) {
+        IntOperands -> unary_primitive(context, o, op, AsInt, ty, at),
+        WidthOperands(w) -> unary_primitive(context, o, op, width_representation(w), ty, at),
+        FloatOperands -> if op == b"neg" { unary_primitive(context, o, op, AsFloat, ty, at) }
         else { fail_missing_operator(o.st, op) },
-        DecimalOperands -> if op == b"neg" { unary_primitive(cx, o, op, AsDecimal, ty, at) }
+        DecimalOperands -> if op == b"neg" { unary_primitive(context, o, op, AsDecimal, ty, at) }
         else { fail_missing_operator(o.st, op) },
         WordOperands(t) ->
           deferred_to_specialisation(
             note_exact_types(o.st, t),
             ty,
-            representation_of(cx.setting, ty),
+            representation_of(context.setting, ty),
             read_only([o.arg]),
             at,
           ),
-        SumOperands(t) -> if op == b"neg" && numeric_sum(cx.setting.ctors, t) {
-          stated(cx, o.st, op, [o.arg], [t], t, at)
+        SumOperands(t) -> if op == b"neg" && numeric_sum(context.setting.constructors, t) {
+          stated(context, o.st, op, [o.arg], [t], t, at)
         } else { fail_missing_operator(o.st, op) },
         _ -> fail_missing_operator(o.st, op),
       }
@@ -116,36 +121,37 @@ pub fn unary(cx: Context, o: LoweredValue, op: Bytes, at: Span) -> LoweredValue 
   }
 
 pub fn binary(
-  cx: Context,
+  context: Context,
   l: LoweredValue,
   r: LoweredValue,
   op: Bytes,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let ty = match l.arg { IntOperand(_) -> type_of(r.arg), _ -> type_of(l.arg) };
-  if op == b"concat" { concatenated(cx, r.st, l.arg, r.arg, ty, at) }
+  if op == b"concat" { concatenated(context, r.st, l.arg, r.arg, ty, at) }
   else if !comparison(op) && !arithmetic(op) && !shift(op) && !is_bitwise(op) {
     unreachable(b"an operator: ".concat(op))
   } else if ty == unknown_type() {
     unreachable(b"an operator over operands of no known type: ".concat(op))
-  } else if (op == b"eq" || op == b"ne") && representation_of(cx.setting, ty) == AsUnit {
+  } else if (op == b"eq" || op == b"ne") && representation_of(context.setting, ty) == AsUnit {
     { st: r.st, arg: BoolOperand(op == b"eq") }
   } else {
     let eq = op == b"eq" || op == b"ne";
-    let equal = match class_of(cx.setting.ctors, ty) {
-      RecordOperands(fs) -> if eq { Some(fields_equal(cx, r.st, fs, l.arg, r.arg, at)) }
+    let equal = match class_of(context.setting.constructors, ty) {
+      RecordOperands(fs) -> if eq { Some(fields_equal(context, r.st, fs, l.arg, r.arg, at)) }
       else { None },
       _ -> None,
     };
     match equal {
-      Some(e) -> if op == b"ne" { negation(cx, e, at) } else { e },
-      None -> binary_by_class(cx, l, r, op, ty, class_of(cx.setting.ctors, ty), at),
+      Some(e) -> if op == b"ne" { negation(context, e, at) } else { e },
+      None ->
+        binary_by_class(context, l, r, op, ty, class_of(context.setting.constructors, ty), at),
     }
   }
 }
 
 fn binary_by_class(
-  cx: Context,
+  context: Context,
   l: LoweredValue,
   r: LoweredValue,
   op: Bytes,
@@ -158,21 +164,22 @@ fn binary_by_class(
   let answer = if comparison(op) { truth } else { ty };
   {
     match c {
-      IntOperands -> binary_primitive(cx, l, r, op, AsInt, answer, at),
-      WidthOperands(w) -> binary_primitive(cx, l, r, op, width_representation(w), answer, at),
-      BoolOperands -> if eq { binary_primitive(cx, l, r, op, AsBool, truth, at) }
+      IntOperands -> binary_primitive(context, l, r, op, AsInt, answer, at),
+      WidthOperands(w) -> binary_primitive(context, l, r, op, width_representation(w), answer, at),
+      BoolOperands -> if eq { binary_primitive(context, l, r, op, AsBool, truth, at) }
       else { fail_missing_operator(r.st, op) },
       FloatOperands -> if comparison(op) || arithmetic(op) {
-        binary_primitive(cx, l, r, op, AsFloat, answer, at)
+        binary_primitive(context, l, r, op, AsFloat, answer, at)
       } else { fail_missing_operator(r.st, op) },
       DecimalOperands -> if comparison(op) || arithmetic(op) {
-        binary_primitive(cx, l, r, op, AsDecimal, answer, at)
+        binary_primitive(context, l, r, op, AsDecimal, answer, at)
       } else { fail_missing_operator(r.st, op) },
-      CharOperands -> if comparison(op) { binary_primitive(cx, l, r, op, AsImmediate, truth, at) }
-      else { fail_missing_operator(r.st, op) },
+      CharOperands -> if comparison(op) {
+        binary_primitive(context, l, r, op, AsImmediate, truth, at)
+      } else { fail_missing_operator(r.st, op) },
       TextOperands -> if eq {
         binary_primitive(
-          cx,
+          context,
           l,
           r,
           if op == b"eq" { b"bytes_eq" } else { b"bytes_ne" },
@@ -182,40 +189,40 @@ fn binary_by_class(
         )
       } else { fail_missing_operator(r.st, op) },
       NullaryOperands(_) -> if eq {
-        match representation_of(cx.setting, ty) {
-          AsSum(k) -> binary_primitive(cx, l, r, op, AsSum(k), truth, at),
+        match representation_of(context.setting, ty) {
+          AsSum(k) -> binary_primitive(context, l, r, op, AsSum(k), truth, at),
           _ -> fail_missing_operator(r.st, op),
         }
-      } else { compared_by_order(cx, l, r, op, ty, at) },
-      SumOperands(t) -> if !eq && numeric_sum(cx.setting.ctors, t) && arithmetic(op) {
-        stated(cx, r.st, op, [l.arg, r.arg], [t, t], t, at)
+      } else { compared_by_order(context, l, r, op, ty, at) },
+      SumOperands(t) -> if !eq && numeric_sum(context.setting.constructors, t) && arithmetic(op) {
+        stated(context, r.st, op, [l.arg, r.arg], [t, t], t, at)
       } else if eq {
         equal_by(
-          cx,
+          context,
           r.st,
           op,
-          keys::generated_key(keys::Equal, t, cx.setting.module),
+          keys::generated_key(keys::Equal, t, context.setting.module),
           t,
           [l.arg, r.arg],
           at,
         )
-      } else { compared_by_order(cx, l, r, op, ty, at) },
+      } else { compared_by_order(context, l, r, op, ty, at) },
       WalkedOperands(t) -> if eq {
         equal_by(
-          cx,
+          context,
           r.st,
           op,
-          keys::generated_key(ContainerWalk(b"equal"), t, cx.setting.module),
+          keys::generated_key(ContainerWalk(b"equal"), t, context.setting.module),
           t,
           [l.arg, r.arg],
           at,
         )
-      } else { compared_by_order(cx, l, r, op, ty, at) },
+      } else { compared_by_order(context, l, r, op, ty, at) },
       WordOperands(t) -> if eq && is_secret(t) {
         handles_equal(l, r, op, b"builtin_elaborated_secret_equal_p", at)
       } else if eq && t == kept_type() {
         handles_equal(l, r, op, b"builtin_elaborated_kept_equal_p", at)
-      } else { compared_by_order(cx, l, r, op, t, at) },
+      } else { compared_by_order(context, l, r, op, t, at) },
       RecordOperands(_) -> fail_missing_operator(r.st, op),
     }
   }
@@ -280,67 +287,84 @@ fn handles_equal(
 }
 
 fn fields_equal(
-  cx: Context,
+  context: Context,
   st: Lowering,
   fs: List<Field>,
   a: Arg,
   b: Arg,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  fields_with_values(cx, fs).fold(
+  fields_with_values(context, fs).fold(
     { out: { st: st, arg: BoolOperand(true) }, first: true },
     |acc: { out: LoweredValue, first: Bool }, f: Field| {
       let x = field(
-        cx,
+        context,
         { st: if acc.first { acc.out.st } else { enter_block(acc.out.st) }, arg: a },
         f.name,
         at,
       );
-      let y = field(cx, { st: x.st, arg: b }, f.name, at);
+      let y = field(context, { st: x.st, arg: b }, f.name, at);
       let xs = { st: y.st, arg: x.arg };
       let e = match f.ty {
-        RecordType(gs) -> fields_equal(cx, y.st, gs, x.arg, y.arg, at),
-        NominalType(n) -> fields_equal(cx, y.st, n.fields, x.arg, y.arg, at),
-        _ -> binary_by_class(cx, xs, y, b"eq", f.ty, class_of(cx.setting.ctors, f.ty), at),
+        RecordType(gs) -> fields_equal(context, y.st, gs, x.arg, y.arg, at),
+        NominalType(n) -> fields_equal(context, y.st, n.fields, x.arg, y.arg, at),
+        _ ->
+          binary_by_class(
+            context,
+            xs,
+            y,
+            b"eq",
+            f.ty,
+            class_of(context.setting.constructors, f.ty),
+            at,
+          ),
       };
-      { out: if acc.first { e } else { short_circuit(cx, acc.out, e, true, at) }, first: false }
+      {
+        out: if acc.first { e } else { short_circuit(context, acc.out, e, true, at) },
+        first: false,
+      }
     },
   ).out
 
 fn fields_order(
-  cx: Context,
+  context: Context,
   st: Lowering,
   fs: List<Field>,
   a: Arg,
   b: Arg,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  fields_with_values(cx, fs).fold(
+  fields_with_values(context, fs).fold(
     { out: { st: st, arg: IntOperand(0) }, first: true },
     |acc: { out: LoweredValue, first: Bool }, f: Field| {
       let x = field(
-        cx,
+        context,
         { st: if acc.first { acc.out.st } else { enter_block(acc.out.st) }, arg: a },
         f.name,
         at,
       );
-      let y = field(cx, { st: x.st, arg: b }, f.name, at);
+      let y = field(context, { st: x.st, arg: b }, f.name, at);
       let s = match f.ty {
-        RecordType(gs) -> fields_order(cx, y.st, gs, x.arg, y.arg, at),
-        NominalType(n) -> fields_order(cx, y.st, n.fields, x.arg, y.arg, at),
-        _ -> order_sign(cx, { st: y.st, arg: x.arg }, y, f.ty, at),
+        RecordType(gs) -> fields_order(context, y.st, gs, x.arg, y.arg, at),
+        NominalType(n) -> fields_order(context, y.st, n.fields, x.arg, y.arg, at),
+        _ -> order_sign(context, { st: y.st, arg: x.arg }, y, f.ty, at),
       };
-      { out: if acc.first { s } else { first_nonzero_sign(cx, acc.out, s, at) }, first: false }
+      { out: if acc.first { s } else { first_nonzero_sign(context, acc.out, s, at) }, first: false }
     },
   ).out
 
-fn fields_with_values(cx: Context, fs: List<Field>) -> List<Field> =
-  fs.filter(|f: Field| representation_of(cx.setting, f.ty) != AsUnit)
+fn fields_with_values(context: Context, fs: List<Field>) -> List<Field> =
+  fs.filter(|f: Field| representation_of(context.setting, f.ty) != AsUnit)
 
-fn first_nonzero_sign(cx: Context, l: LoweredValue, r: LoweredValue, at: Span) -> LoweredValue = {
+fn first_nonzero_sign(
+  context: Context,
+  l: LoweredValue,
+  r: LoweredValue,
+  at: Span,
+) -> LoweredValue = {
   let j = fresh(exit_block(l.st, r.st), int_type(), AsInt);
   let c = bound(
-    cx,
+    context,
     j.st,
     bool_type(),
     Primitive({ op: b"ne", on: AsInt, args: [l.arg, IntOperand(0)] }),
@@ -350,7 +374,7 @@ fn first_nonzero_sign(cx: Context, l: LoweredValue, r: LoweredValue, at: Span) -
   {
     st: {
       ..right.st,
-      insts: right.st.insts.push(Decl(j.var)).push(
+      insts: right.st.insts.push(Declaration(j.var)).push(
         If({ cond: c.arg, then: [Assign({ var: j.var, arg: l.arg })], otherwise: right.block }),
       ),
     },
@@ -359,7 +383,7 @@ fn first_nonzero_sign(cx: Context, l: LoweredValue, r: LoweredValue, at: Span) -
 }
 
 pub fn scalar_builtin_call(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
@@ -371,18 +395,27 @@ pub fn scalar_builtin_call(
       let b = match args.at(1) { Some(x) -> x, None -> IntOperand(0) };
       if args.len() != arity(name) {
         unreachable(b"a builtin called with other than its arguments: ".concat(name))
-      } else if name == b"compare" || name == b"compare_values" { ordered(cx, st, name, a, b, at) }
-      else if name == b"min" || name == b"max" { min_or_max(cx, st, name == b"max", a, b, at) }
-      else if name == b"reflect" || name == b"shown" { reflected(cx, st, name, a, at) }
-      else if name == b"?encoded" || name == b"digest" { encoded(cx, st, name == b"digest", a, at) }
-      else if name == b"?same" {
+      } else if name == b"compare" || name == b"compare_values" {
+        ordered(context, st, name, a, b, at)
+      } else if name == b"min" || name == b"max" {
+        min_or_max(context, st, name == b"max", a, b, at)
+      } else if name == b"reflect" || name == b"shown" { reflected(context, st, name, a, at) }
+      else if name == b"?encoded" || name == b"digest" {
+        encoded(context, st, name == b"digest", a, at)
+      } else if name == b"?same" {
         let x = represented_as({ st: st, arg: a }, AsWord, at);
         let y = represented_as({ st: x.st, arg: b }, AsWord, at);
-        bound(cx, y.st, bool_type(), Primitive({ op: b"eq", on: AsWord, args: [x.arg, y.arg] }), at)
+        bound(
+          context,
+          y.st,
+          bool_type(),
+          Primitive({ op: b"eq", on: AsWord, args: [x.arg, y.arg] }),
+          at,
+        )
       } else if name == b"Float::of_int" || name == b"Float::of_bits" {
         let x = represented_as({ st: st, arg: a }, AsInt, at);
         bound(
-          cx,
+          context,
           x.st,
           float_type(),
           Primitive({
@@ -394,21 +427,21 @@ pub fn scalar_builtin_call(
         )
       } else if name == b"bits_of_float" {
         let x = represented_as({ st: st, arg: a }, AsFloat, at);
-        bound(cx, x.st, int_type(), Primitive({ op: b"bits", on: AsFloat, args: [x.arg] }), at)
+        bound(context, x.st, int_type(), Primitive({ op: b"bits", on: AsFloat, args: [x.arg] }), at)
       } else if float_function(name) != None { float_called(st, name, args, at) }
-      else if float_exact(name) != None { float_computed(cx, st, name, a, at) }
-      else if decimal_conversion(name) { decimal_converted(cx, st, name, a, at) }
+      else if float_exact(name) != None { float_computed(context, st, name, a, at) }
+      else if decimal_conversion(name) { decimal_converted(context, st, name, a, at) }
       else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
-        width_arithmetic(cx, st, name, args, at)
-      } else if name == b"to_int" { to_int_call(cx, st, args, at) }
+        width_arithmetic(context, st, name, args, at)
+      } else if name == b"to_int" { to_int_call(context, st, args, at) }
       else if name == b"?numeric_binary" || name == b"?numeric_unary" {
-        witnessed_operator(cx, st, name, args, at)
-      } else if name == b"?stated_witness" { witness_value(cx, st, a, at) } else {
+        witnessed_operator(context, st, name, args, at)
+      } else if name == b"?stated_witness" { witness_value(context, st, a, at) } else {
         match of_int_width(name) {
           Some(w) -> {
             let x = represented_as({ st: st, arg: a }, AsInt, at);
             bound(
-              cx,
+              context,
               x.st,
               width_type(w),
               Primitive({ op: b"of_int", on: AsInt, args: [x.arg] }),
@@ -419,7 +452,7 @@ pub fn scalar_builtin_call(
             Some(w) -> {
               let x = represented_as({ st: st, arg: a }, width_representation(w), at);
               bound(
-                cx,
+                context,
                 x.st,
                 int_type(),
                 Primitive({ op: b"to_int", on: width_representation(w), args: [x.arg] }),
@@ -437,7 +470,7 @@ pub fn decimal_conversion(name: Bytes) -> Bool =
   name == b"Decimal::of_int" || name == b"Decimal::scale"
 
 fn decimal_converted(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
@@ -445,23 +478,35 @@ fn decimal_converted(
 ) -> LoweredValue / {abort.raise} =
   if name == b"Decimal::of_int" {
     let x = represented_as({ st: st, arg: a }, AsInt, at);
-    bound(cx, x.st, decimal_type(), Primitive({ op: b"to_decimal", on: AsInt, args: [x.arg] }), at)
+    bound(
+      context,
+      x.st,
+      decimal_type(),
+      Primitive({ op: b"to_decimal", on: AsInt, args: [x.arg] }),
+      at,
+    )
   } else {
     let d = represented_as({ st: st, arg: a }, AsDecimal, at);
-    bound(cx, d.st, int_type(), Primitive({ op: b"scale", on: AsDecimal, args: [d.arg] }), at)
+    bound(context, d.st, int_type(), Primitive({ op: b"scale", on: AsDecimal, args: [d.arg] }), at)
   }
 
-fn builtin_return_type(cx: Context, name: Bytes, ty: Type, known: Type) -> Type =
-  match declared_call_types(cx.setting, name, [ty]) { Some(t) -> t.ret, None -> known }
+fn builtin_return_type(context: Context, name: Bytes, ty: Type, known: Type) -> Type =
+  match declared_call_types(context.setting, name, [ty]) { Some(t) -> t.ret, None -> known }
 
-fn witness_value(cx: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} =
+fn witness_value(context: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} =
   match read_literal(st, a) {
     None -> unreachable(b"a stated witness named by no literal"),
-    Some(s) -> if !cx.setting.ctors.named.contains(s.name) {
+    Some(s) -> if !context.setting.constructors.named.contains(s.name) {
       unreachable(b"a stated witness of a type no constructor names")
     } else {
-      let tag = bound(cx, s.st, int_type(), Tag(s.name), at);
-      bound(cx, tag.st, int_type(), Primitive({ op: b"witness", on: AsInt, args: [tag.arg] }), at)
+      let tag = bound(context, s.st, int_type(), Tag(s.name), at);
+      bound(
+        context,
+        tag.st,
+        int_type(),
+        Primitive({ op: b"witness", on: AsInt, args: [tag.arg] }),
+        at,
+      )
     },
   }
 
@@ -469,7 +514,7 @@ fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
   match a {
     VarOperand(v) -> match st.insts.at(st.insts.len() - 1) {
       Some(Let(l)) -> if l.var.id != v.id { None } else {
-        match l.val {
+        match l.value {
           Literal(LiteralString(n)) ->
             Some({ st: { ..st, insts: st.insts.take(st.insts.len() - 1) }, name: n }),
           _ -> None,
@@ -480,8 +525,8 @@ fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
     _ -> None,
   }
 
-pub fn numeric_in_place(ctors: Ctors, ty: Type) -> Bool =
-  match class_of(ctors, ty) {
+pub fn numeric_in_place(constructors: Constructors, ty: Type) -> Bool =
+  match class_of(constructors, ty) {
     IntOperands -> true,
     FloatOperands -> true,
     DecimalOperands -> true,
@@ -490,7 +535,7 @@ pub fn numeric_in_place(ctors: Ctors, ty: Type) -> Bool =
   }
 
 pub fn numeric_converted(
-  cx: Context,
+  context: Context,
   st: Lowering,
   n: Arg,
   ty: Type,
@@ -498,8 +543,8 @@ pub fn numeric_converted(
 ) -> LoweredValue / {abort.raise} = {
   let x = represented_as({ st: st, arg: n }, AsInt, at);
   let converted = |op: Bytes|
-    bound(cx, x.st, ty, Primitive({ op: op, on: AsInt, args: [x.arg] }), at);
-  match class_of(cx.setting.ctors, ty) {
+    bound(context, x.st, ty, Primitive({ op: op, on: AsInt, args: [x.arg] }), at);
+  match class_of(context.setting.constructors, ty) {
     FloatOperands -> converted(b"to_float"),
     DecimalOperands -> converted(b"to_decimal"),
     WidthOperands(_) -> converted(b"of_int"),
@@ -521,23 +566,23 @@ type OperatorClass =
   | RecordOperands(List<Field>)
   | WordOperands(Type)
 
-pub fn comparison_built(ctors: Ctors, t: Type, order: Bool) -> Bool / {abort.raise} =
+pub fn comparison_built(constructors: Constructors, t: Type, order: Bool) -> Bool / {abort.raise} =
   iterate({ todo: [t], seen: [] }, 1 << 24, |s: { todo: List<Type>, seen: List<Bytes> }|
     match s.todo {
       [] -> Stop(true),
       [x, ..rest] -> match x {
         FunctionType(_) -> if order { Stop(false) } else { Continue({ ..s, todo: rest }) },
-        _ -> match class_of(ctors, x) {
+        _ -> match class_of(constructors, x) {
           RecordOperands(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
           WalkedOperands(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
           SumOperands(w) -> match w {
-            NamedType(c) -> if s.seen.contains(c.name) || keyed_sum(ctors, c.name) {
+            NamedType(c) -> if s.seen.contains(c.name) || keyed_sum(constructors, c.name) {
               Continue({ ..s, todo: rest })
             } else {
-              let cs = match ctors.sums.get(c.name) { Some(found) -> found, None -> [] };
+              let cs = match constructors.sums.get(c.name) { Some(found) -> found, None -> [] };
               Continue({
                 todo: rest.concat(
-                  cs.fold([], |acc: List<Type>, k: SumCtor|
+                  cs.fold([], |acc: List<Type>, k: SumConstructor|
                     acc.concat(k.fields.map(|f: Type| at_args(f, k.params, c.args)))),
                 ),
                 seen: s.seen.push(c.name),
@@ -555,33 +600,34 @@ pub fn comparison_built(ctors: Ctors, t: Type, order: Bool) -> Bool / {abort.rai
 
 fn type_args(t: Type) -> List<Type> = match t { NamedType(c) -> c.args, _ -> [] }
 
-fn class_of(ctors: Ctors, ty: Type) -> OperatorClass =
+fn class_of(constructors: Constructors, ty: Type) -> OperatorClass =
   match ty {
-    RecordType(fs) -> if fs.len() > 0 && !has_vars(ty) { RecordOperands(fs) }
+    RecordType(fs) -> if fs.len() > 0 && !has_variables(ty) { RecordOperands(fs) }
     else { WordOperands(ty) },
-    NominalType(x) -> if x.fields.len() > 0 && !has_vars(ty) { RecordOperands(x.fields) }
+    NominalType(x) -> if x.fields.len() > 0 && !has_variables(ty) { RecordOperands(x.fields) }
     else { WordOperands(ty) },
     NamedType(c) -> if c.args.len() > 0 {
       if is_walked_container(ty) || is_walked_columns(ty) || is_result(ty)
-          || (is_option(ty) && !has_vars(ty)) { WalkedOperands(ty) }
-      else if generic_sum(ctors, ty) { SumOperands(ty) }
+          || (is_option(ty) && !has_variables(ty)) { WalkedOperands(ty) }
+      else if generic_sum(constructors, ty) { SumOperands(ty) }
       else { WordOperands(ty) }
     } else if is_int(ty) { IntOperands }
     else if is_bool(ty) { BoolOperands }
     else if is_float(ty) { FloatOperands }
     else if is_decimal(ty) { DecimalOperands }
     else if is_char(ty) { CharOperands }
-    else if is_string(ty) || is_bytes(ty) { TextOperands } else if compared_by_root(ctors, c.name) {
-      if nullary_sum(match ctors.sums.get(c.name) { Some(cs) -> cs, None -> [] })
-          && !keyed_sum(ctors, c.name)
-          && !numeric_sum(ctors, ty) { NullaryOperands(ty) }
+    else if is_string(ty) || is_bytes(ty) { TextOperands }
+    else if compared_by_root(constructors, c.name) {
+      if nullary_sum(match constructors.sums.get(c.name) { Some(cs) -> cs, None -> [] })
+          && !keyed_sum(constructors, c.name)
+          && !numeric_sum(constructors, ty) { NullaryOperands(ty) }
       else { SumOperands(ty) }
     } else { match width_named(c.name) { Some(w) -> WidthOperands(w), None -> WordOperands(ty) } },
     _ -> WordOperands(ty),
   }
 
 fn unary_primitive(
-  cx: Context,
+  context: Context,
   o: LoweredValue,
   op: Bytes,
   on: Representation,
@@ -589,11 +635,11 @@ fn unary_primitive(
   at: Span,
 ) -> LoweredValue = {
   let a = represented_as(o, on, at);
-  bound(cx, a.st, ty, Primitive({ op: op, on: on, args: [a.arg] }), at)
+  bound(context, a.st, ty, Primitive({ op: op, on: on, args: [a.arg] }), at)
 }
 
 fn binary_primitive(
-  cx: Context,
+  context: Context,
   l: LoweredValue,
   r: LoweredValue,
   op: Bytes,
@@ -604,11 +650,11 @@ fn binary_primitive(
   let a = represented_as({ st: r.st, arg: l.arg }, on, at);
   let b = if has_count_operand(op) { { st: a.st, arg: r.arg } }
   else { represented_as({ st: a.st, arg: r.arg }, on, at) };
-  bound(cx, b.st, answer, Primitive({ op: op, on: on, args: [a.arg, b.arg] }), at)
+  bound(context, b.st, answer, Primitive({ op: op, on: on, args: [a.arg, b.arg] }), at)
 }
 
 fn equal_by(
-  cx: Context,
+  context: Context,
   st: Lowering,
   op: Bytes,
   key: RootKey,
@@ -616,12 +662,12 @@ fn equal_by(
   args: List<Arg>,
   at: Span,
 ) -> LoweredValue = {
-  let e = root_call(cx, st, key, args, [ty, ty], bool_type(), at);
-  if op == b"ne" { negation(cx, e, at) } else { e }
+  let e = root_call(context, st, key, args, [ty, ty], bool_type(), at);
+  if op == b"ne" { negation(context, e, at) } else { e }
 }
 
 pub fn stated(
-  cx: Context,
+  context: Context,
   st: Lowering,
   op: Bytes,
   args: List<Arg>,
@@ -630,9 +676,9 @@ pub fn stated(
   at: Span,
 ) -> LoweredValue =
   root_call(
-    cx,
+    context,
     st,
-    keys::generated_key(NumericFunction(op), ty, cx.setting.module),
+    keys::generated_key(NumericFunction(op), ty, context.setting.module),
     args,
     types,
     ty,
@@ -640,35 +686,35 @@ pub fn stated(
   )
 
 fn compared_by_order(
-  cx: Context,
+  context: Context,
   l: LoweredValue,
   r: LoweredValue,
   op: Bytes,
   ty: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  match if comparison(op) { root_order(cx, r.st, ty, l.arg, r.arg, at) } else { None } {
+  match if comparison(op) { root_order(context, r.st, ty, l.arg, r.arg, at) } else { None } {
     None -> if op != b"eq" && op != b"ne" { fail_missing_operator(r.st, op) }
     else if is_function(ty) { functions_compared(r.st, at) } else {
       let truth = bool_type();
       deferred_to_specialisation(
         note_exact_types(r.st, ty),
         truth,
-        representation_of(cx.setting, truth),
+        representation_of(context.setting, truth),
         read_only([l.arg, r.arg]),
         at,
       )
     },
     Some(o) -> {
       let s = bound(
-        cx,
+        context,
         o.st,
         int_type(),
         Primitive({ op: b"sign", on: operand_representation(o.arg), args: [o.arg] }),
         at,
       );
       bound(
-        cx,
+        context,
         s.st,
         bool_type(),
         Primitive({ op: op, on: AsInt, args: [s.arg, IntOperand(0)] }),
@@ -678,17 +724,17 @@ fn compared_by_order(
   }
 
 fn root_call(
-  cx: Context,
+  context: Context,
   st: Lowering,
   key: RootKey,
   args: List<Arg>,
   types: List<Type>,
   answer: Type,
   at: Span,
-) -> LoweredValue = root_call_with_words(cx, st, key, args, types, answer, at, false)
+) -> LoweredValue = root_call_with_words(context, st, key, args, types, answer, at, false)
 
 fn root_call_with_words(
-  cx: Context,
+  context: Context,
   st: Lowering,
   key: RootKey,
   args: List<Arg>,
@@ -699,7 +745,7 @@ fn root_call_with_words(
   words: { count: Int, args: List<Arg> } = { count: 0, args: [] },
 ) -> LoweredValue = {
   let conv = with_evidence_parameters(
-    typed_convention(cx.setting.ctors, types, answer),
+    typed_convention(context.setting.constructors, types, answer),
     0,
     words.count,
   );
@@ -708,7 +754,7 @@ fn root_call_with_words(
     |acc: { st: Lowering, args: List<Arg> }, i: Int|
       match ((args.at(i), types.at(i))) {
         (Some(x), Some(t)) -> {
-          let h = represented_as({ st: acc.st, arg: x }, representation_of(cx.setting, t), at);
+          let h = represented_as({ st: acc.st, arg: x }, representation_of(context.setting, t), at);
           { st: h.st, args: acc.args.push(h.arg) }
         },
         _ -> acc,
@@ -728,11 +774,11 @@ fn root_call_with_words(
   )
 }
 
-fn negation(cx: Context, b: LoweredValue, at: Span) -> LoweredValue =
-  bound(cx, b.st, bool_type(), Primitive({ op: b"not", on: AsBool, args: [b.arg] }), at)
+fn negation(context: Context, b: LoweredValue, at: Span) -> LoweredValue =
+  bound(context, b.st, bool_type(), Primitive({ op: b"not", on: AsBool, args: [b.arg] }), at)
 
 fn ordered(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
@@ -740,22 +786,22 @@ fn ordered(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let ty = match a { IntOperand(_) -> type_of(b), _ -> type_of(a) };
-  let order = builtin_return_type(cx, name, ty, ordering_type());
+  let order = builtin_return_type(context, name, ty, ordering_type());
   let made = |s: LoweredValue|
-    bound(cx, s.st, order, Primitive({ op: b"ordering", on: AsInt, args: [s.arg] }), at);
-  if has_unknown_part(ty) { open_at(cx, st, ty, [a, b], order, at) } else {
-    match root_order(cx, st, ty, a, b, at) {
+    bound(context, s.st, order, Primitive({ op: b"ordering", on: AsInt, args: [s.arg] }), at);
+  if has_unknown_part(ty) { open_at(context, st, ty, [a, b], order, at) } else {
+    match root_order(context, st, ty, a, b, at) {
       Some(o) -> o,
-      None -> match class_of(cx.setting.ctors, ty) {
-        RecordOperands(fs) -> made(fields_order(cx, st, fs, a, b, at)),
-        _ -> made(order_sign(cx, { st: st, arg: a }, { st: st, arg: b }, ty, at)),
+      None -> match class_of(context.setting.constructors, ty) {
+        RecordOperands(fs) -> made(fields_order(context, st, fs, a, b, at)),
+        _ -> made(order_sign(context, { st: st, arg: a }, { st: st, arg: b }, ty, at)),
       },
     }
   }
 }
 
 fn open_at(
-  cx: Context,
+  context: Context,
   st: Lowering,
   ty: Type,
   args: List<Arg>,
@@ -765,7 +811,7 @@ fn open_at(
   deferred_to_specialisation(
     note_exact_types(st, ty),
     answer,
-    representation_of(cx.setting, answer),
+    representation_of(context.setting, answer),
     read_only(args),
     at,
   )
@@ -787,7 +833,7 @@ fn kept_sign(st: Lowering, a: Arg, b: Arg, at: Span) -> LoweredValue = {
 }
 
 fn min_or_max(
-  cx: Context,
+  context: Context,
   st: Lowering,
   most: Bool,
   a: Arg,
@@ -795,19 +841,19 @@ fn min_or_max(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let ty = match a { IntOperand(_) -> type_of(b), _ -> type_of(a) };
-  let s = match class_of(cx.setting.ctors, ty) {
-    RecordOperands(fs) -> fields_order(cx, st, fs, b, a, at),
-    _ -> order_sign(cx, { st: st, arg: b }, { st: st, arg: a }, ty, at),
+  let s = match class_of(context.setting.constructors, ty) {
+    RecordOperands(fs) -> fields_order(context, st, fs, b, a, at),
+    _ -> order_sign(context, { st: st, arg: b }, { st: st, arg: a }, ty, at),
   };
   let past = bound(
-    cx,
+    context,
     s.st,
     bool_type(),
     Primitive({ op: if most { b"gt" } else { b"lt" }, on: AsInt, args: [s.arg, IntOperand(0)] }),
     at,
   );
   joined(
-    cx,
+    context,
     past,
     { st: enter_block(past.st), arg: b },
     { st: enter_block(past.st), arg: a },
@@ -817,7 +863,7 @@ fn min_or_max(
 }
 
 fn root_order(
-  cx: Context,
+  context: Context,
   st: Lowering,
   ty: Type,
   a: Arg,
@@ -827,20 +873,29 @@ fn root_order(
   let order = ordering_type();
   let at_root = |op: TypeOp, t: Type|
     Some(
-      root_call(cx, st, keys::generated_key(op, t, cx.setting.module), [a, b], [t, t], order, at),
+      root_call(
+        context,
+        st,
+        keys::generated_key(op, t, context.setting.module),
+        [a, b],
+        [t, t],
+        order,
+        at,
+      ),
     );
-  match class_of(cx.setting.ctors, ty) {
+  match class_of(context.setting.constructors, ty) {
     NullaryOperands(t) -> at_root(Order, t),
     SumOperands(t) -> at_root(Order, t),
     WalkedOperands(t) -> at_root(ContainerWalk(b"ordered"), t),
-    WordOperands(t) -> if is_option(t) && !has_vars(t) { at_root(ContainerWalk(b"ordered"), t) }
-    else { None },
+    WordOperands(t) -> if is_option(t) && !has_variables(t) {
+      at_root(ContainerWalk(b"ordered"), t)
+    } else { None },
     _ -> None,
   }
 }
 
 fn order_sign(
-  cx: Context,
+  context: Context,
   l: LoweredValue,
   r: LoweredValue,
   ty: Type,
@@ -849,59 +904,74 @@ fn order_sign(
   let int = int_type();
   let signed = |o: LoweredValue|
     bound(
-      cx,
+      context,
       o.st,
       int,
       Primitive({ op: b"sign", on: operand_representation(o.arg), args: [o.arg] }),
       at,
     );
-  if has_unknown_part(ty) { signed(open_at(cx, r.st, ty, [l.arg, r.arg], ordering_type(), at)) }
-  else {
-    match root_order(cx, r.st, ty, l.arg, r.arg, at) {
+  if has_unknown_part(ty) {
+    signed(open_at(context, r.st, ty, [l.arg, r.arg], ordering_type(), at))
+  } else {
+    match root_order(context, r.st, ty, l.arg, r.arg, at) {
       Some(o) -> signed(o),
-      None -> match class_of(cx.setting.ctors, ty) {
-        IntOperands -> binary_primitive(cx, l, r, b"order", AsInt, int, at),
-        BoolOperands -> binary_primitive(cx, l, r, b"order", AsBool, int, at),
-        CharOperands -> binary_primitive(cx, l, r, b"order", AsImmediate, int, at),
-        WidthOperands(w) -> binary_primitive(cx, l, r, b"order", width_representation(w), int, at),
-        DecimalOperands -> binary_primitive(cx, l, r, b"order", AsDecimal, int, at),
-        TextOperands -> binary_primitive(cx, l, r, b"bytes_order", AsWord, int, at),
+      None -> match class_of(context.setting.constructors, ty) {
+        IntOperands -> binary_primitive(context, l, r, b"order", AsInt, int, at),
+        BoolOperands -> binary_primitive(context, l, r, b"order", AsBool, int, at),
+        CharOperands -> binary_primitive(context, l, r, b"order", AsImmediate, int, at),
+        WidthOperands(w) ->
+          binary_primitive(context, l, r, b"order", width_representation(w), int, at),
+        DecimalOperands -> binary_primitive(context, l, r, b"order", AsDecimal, int, at),
+        TextOperands -> binary_primitive(context, l, r, b"bytes_order", AsWord, int, at),
         FloatOperands -> {
-          let x = total_key(cx, { st: r.st, arg: l.arg }, at);
-          let y = total_key(cx, { st: x.st, arg: r.arg }, at);
-          bound(cx, y.st, int, Primitive({ op: b"order", on: AsInt, args: [x.arg, y.arg] }), at)
+          let x = total_key(context, { st: r.st, arg: l.arg }, at);
+          let y = total_key(context, { st: x.st, arg: r.arg }, at);
+          bound(
+            context,
+            y.st,
+            int,
+            Primitive({ op: b"order", on: AsInt, args: [x.arg, y.arg] }),
+            at,
+          )
         },
-        _ -> if representation_of(cx.setting, ty) == AsUnit { { st: r.st, arg: IntOperand(0) } }
-        else if ty == kept_type() { kept_sign(r.st, l.arg, r.arg, at) }
+        _ -> if representation_of(context.setting, ty) == AsUnit {
+          { st: r.st, arg: IntOperand(0) }
+        } else if ty == kept_type() { kept_sign(r.st, l.arg, r.arg, at) }
         else { unreachable(b"an order of a type none is derived for: ".concat(encode_type(ty))) },
       },
     }
   }
 }
 
-fn total_key(cx: Context, f: LoweredValue, at: Span) -> LoweredValue = {
+fn total_key(context: Context, f: LoweredValue, at: Span) -> LoweredValue = {
   let int = int_type();
   let x = represented_as(f, AsFloat, at);
-  let bits = bound(cx, x.st, int, Primitive({ op: b"bits", on: AsFloat, args: [x.arg] }), at);
+  let bits = bound(context, x.st, int, Primitive({ op: b"bits", on: AsFloat, args: [x.arg] }), at);
   let sign = bound(
-    cx,
+    context,
     bits.st,
     int,
     Primitive({ op: b"shr", on: AsInt, args: [bits.arg, IntOperand(63)] }),
     at,
   );
   let flips = bound(
-    cx,
+    context,
     sign.st,
     int,
     Primitive({ op: b"ushr", on: AsInt, args: [sign.arg, IntOperand(1)] }),
     at,
   );
-  bound(cx, flips.st, int, Primitive({ op: b"bitxor", on: AsInt, args: [bits.arg, flips.arg] }), at)
+  bound(
+    context,
+    flips.st,
+    int,
+    Primitive({ op: b"bitxor", on: AsInt, args: [bits.arg, flips.arg] }),
+    at,
+  )
 }
 
 fn reflected(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
@@ -910,30 +980,30 @@ fn reflected(
   let ty = type_of(a);
   let value_type = named_type(b"std.value.Value");
   let op = if name == b"shown" { Show } else { Reflect };
-  let value = |ctor: Bytes| constructed_as(cx, st, ctor, [a], value_type, at);
-  let unary_primitive = |ctor: Bytes| constructed_as(cx, st, ctor, [], value_type, at);
+  let value = |ctor: Bytes| constructed_as(context, st, ctor, [a], value_type, at);
+  let unary_primitive = |ctor: Bytes| constructed_as(context, st, ctor, [], value_type, at);
   let none = || unreachable(b"a reflection of a value none describes: ".concat(encode_type(ty)));
-  if !cx.setting.ctors.named.contains(b"std.value.VUnit") {
+  if !context.setting.constructors.named.contains(b"std.value.VUnit") {
     unreachable(b"a reflection in a program that holds no `std.value`")
   } else {
     match ty {
       FunctionType(_) -> {
         let f = constructed_as(
-          cx,
+          context,
           st,
           b"std.value.FAnonymous",
           [],
           named_type(b"std.value.Fun"),
           at,
         );
-        constructed_as(cx, f.st, b"std.value.VFn", [f.arg], value_type, at)
+        constructed_as(context, f.st, b"std.value.VFn", [f.arg], value_type, at)
       },
       NamedType(c) -> if c.name == hold_name() { unary_primitive(b"std.value.VHold") }
       else if c.name == secret_name() { unary_primitive(b"std.value.VSecret") }
-      else if has_unknown_part(ty) { open_at(cx, st, ty, [a], value_type, at) }
-      else if written_sum(cx.setting.ctors, c) || is_walked_container(ty) || is_walked_columns(ty) {
-        type_operation_call(cx, st, op, ty, a, at)
-      } else if c.args.len() > 0 { none() }
+      else if has_unknown_part(ty) { open_at(context, st, ty, [a], value_type, at) }
+      else if written_sum(context.setting.constructors, c) || is_walked_container(ty)
+          || is_walked_columns(ty) { type_operation_call(context, st, op, ty, a, at) }
+      else if c.args.len() > 0 { none() }
       else if is_int(ty) { value(b"std.value.VInt") }
       else if is_bool(ty) { value(b"std.value.VBool") }
       else if is_float(ty) { value(b"std.value.VFloat") }
@@ -943,18 +1013,18 @@ fn reflected(
       else if is_bytes(ty) { value(b"std.value.VBytes") }
       else if is_unit(ty) { unary_primitive(b"std.value.VUnit") } else {
         match width_named(c.name) {
-          Some(w) -> width_reflected(cx, st, c.name, w, a, value_type, at),
+          Some(w) -> width_reflected(context, st, c.name, w, a, value_type, at),
           None -> none(),
         }
       },
-      _ -> if has_unknown_part(ty) { open_at(cx, st, ty, [a], value_type, at) }
-      else { type_operation_call(cx, st, op, ty, a, at) },
+      _ -> if has_unknown_part(ty) { open_at(context, st, ty, [a], value_type, at) }
+      else { type_operation_call(context, st, op, ty, a, at) },
     }
   }
 }
 
 fn width_reflected(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   w: Width,
@@ -965,18 +1035,18 @@ fn width_reflected(
   let int = int_type();
   let u128 = width_type({ bits: 128, signed: false });
   let made = |s: Lowering, lo: Arg, hi: Arg|
-    bound(cx, s, u128, Primitive({ op: b"wide", on: AsInt, args: [lo, hi] }), at);
+    bound(context, s, u128, Primitive({ op: b"wide", on: AsInt, args: [lo, hi] }), at);
   let wide = if w.bits > 64 {
     let p = pair_words(st, a, AsWideFixed(w), at);
     made(p.st, p.lo, p.hi)
   } else if w.bits == 64 {
-    let x = unary_primitive(cx, { st: st, arg: a }, b"narrow", AsFixed(w), int, at);
+    let x = unary_primitive(context, { st: st, arg: a }, b"narrow", AsFixed(w), int, at);
     made(x.st, x.arg, IntOperand(0))
   } else {
-    let x = unary_primitive(cx, { st: st, arg: a }, b"to_int", AsFixed(w), int, at);
+    let x = unary_primitive(context, { st: st, arg: a }, b"to_int", AsFixed(w), int, at);
     let bits = if !w.signed { x } else {
       bound(
-        cx,
+        context,
         x.st,
         int,
         Primitive({ op: b"bitand", on: AsInt, args: [x.arg, IntOperand((1 << w.bits) - 1)] }),
@@ -985,12 +1055,12 @@ fn width_reflected(
     };
     made(bits.st, bits.arg, IntOperand(0))
   };
-  let spelled = literal(cx, wide.st, LiteralString(name), at);
-  constructed_as(cx, spelled.st, b"std.value.VFixed", [spelled.arg, wide.arg], value_type, at)
+  let spelled = literal(context, wide.st, LiteralString(name), at);
+  constructed_as(context, spelled.st, b"std.value.VFixed", [spelled.arg, wide.arg], value_type, at)
 }
 
 fn encoded(
-  cx: Context,
+  context: Context,
   st: Lowering,
   hashed: Bool,
   a: Arg,
@@ -998,21 +1068,22 @@ fn encoded(
 ) -> LoweredValue / {abort.raise} = {
   let ty = type_of(a);
   let bytes = builtin_return_type(
-    cx,
+    context,
     if hashed { b"digest" } else { b"?encoded" },
     ty,
     bytes_type(),
   );
   let rooted_by = match ty {
     NamedType(c) ->
-      written_sum(cx.setting.ctors, c) || is_walked_container(ty) || is_walked_columns(ty),
+      written_sum(context.setting.constructors, c) || is_walked_container(ty)
+        || is_walked_columns(ty),
     RecordType(_) -> true,
     NominalType(_) -> true,
     _ -> false,
   };
-  if has_unknown_part(ty) { open_at(cx, st, ty, [a], bytes, at) } else {
-    match if rooted_by { Some(type_operation_call(cx, st, Digest, ty, a, at)) }
-      else { scalar_encoding(cx, st, a, ty, at) } {
+  if has_unknown_part(ty) { open_at(context, st, ty, [a], bytes, at) } else {
+    match if rooted_by { Some(type_operation_call(context, st, Digest, ty, a, at)) }
+      else { scalar_encoding(context, st, a, ty, at) } {
       Some(e) -> if hashed { blake3_of(e.st, e.arg, at) } else { e },
       None -> unreachable(b"a digest of a type none is derived for: ".concat(encode_type(ty))),
     }
@@ -1020,7 +1091,7 @@ fn encoded(
 }
 
 fn type_operation_call(
-  cx: Context,
+  context: Context,
   st: Lowering,
   op: TypeOp,
   ty: Type,
@@ -1028,50 +1099,60 @@ fn type_operation_call(
   at: Span,
 ) -> LoweredValue =
   root_call(
-    cx,
+    context,
     st,
-    keys::generated_key(op, ty, cx.setting.module),
+    keys::generated_key(op, ty, context.setting.module),
     [a],
     [ty],
     match op { Digest -> bytes_type(), _ -> named_type(b"std.value.Value") },
     at,
   )
 
-pub fn let_go(cx: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} = {
+pub fn let_go(context: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} = {
   let ty = type_of(a);
-  if has_vars(ty) {
+  if has_variables(ty) {
     deferred_to_specialisation(
       note_exact_types(st, ty),
       unit_type(),
-      representation_of(cx.setting, unit_type()),
+      representation_of(context.setting, unit_type()),
       read_only([a]),
       at,
     )
   } else {
-    let h = let_go_evidence(cx, ty);
+    let h = let_go_evidence(context, ty);
     let w = passed_evidence_arguments(st, h, at);
     let words = { count: h.words.len(), args: w.args };
-    root_call_with_words(cx, w.st, let_go_root(cx, ty), [a], [ty], unit_type(), at, true, words)
+    root_call_with_words(
+      context,
+      w.st,
+      let_go_root(context, ty),
+      [a],
+      [ty],
+      unit_type(),
+      at,
+      true,
+      words,
+    )
   }
 }
 
 pub fn unwound(
-  cx: Context,
+  context: Context,
   st: Lowering,
   a: Arg,
   at: Span,
 ) -> { st: Lowering, unwound: Unwinding } / {abort.raise} = {
   let ty = type_of(a);
-  let h = let_go_evidence(cx, ty);
+  let h = let_go_evidence(context, ty);
   let w = passed_evidence_arguments(note_exact_types(st, ty), h, at);
   {
     st: w.st,
     unwound: {
       arg: a,
       words: w.args,
-      callee: let_go_root(cx, ty),
+      callee: let_go_root(context, ty),
       convention: with_evidence_parameters(
-        typed_convention(cx.setting.ctors, [ty], unit_type()),
+        typed_convention(context.setting.constructors, [ty], unit_type()),
         0,
         h.words.len(),
       ),
@@ -1079,19 +1160,19 @@ pub fn unwound(
   }
 }
 
-fn let_go_root(cx: Context, ty: Type) -> RootKey =
-  keys::generated_key(ReleaseResource, ty, cx.setting.module)
+fn let_go_root(context: Context, ty: Type) -> RootKey =
+  keys::generated_key(ReleaseResource, ty, context.setting.module)
 
-fn let_go_evidence(cx: Context, ty: Type) -> EvidenceArguments / {abort.raise} =
+fn let_go_evidence(context: Context, ty: Type) -> EvidenceArguments / {abort.raise} =
   scheme_evidence_arguments(
-    cx,
-    Some(monomorphic(fn_type([ty], unit_type(), release_row(cx.setting.ctors, ty)))),
+    context,
+    Some(monomorphic(fn_type([ty], unit_type(), release_row(context.setting.constructors, ty)))),
     [],
     [],
   )
 
 fn width_arithmetic(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
@@ -1101,12 +1182,12 @@ fn width_arithmetic(
   let b = match args.at(1) { Some(x) -> x, None -> IntOperand(0) };
   let ty = match a { IntOperand(_) -> type_of(b), _ -> type_of(a) };
   let checked = name.starts_with(b"checked_");
-  let answer = builtin_return_type(cx, name, ty, if checked { option_type(ty) } else { ty });
-  match class_of(cx.setting.ctors, ty) {
+  let answer = builtin_return_type(context, name, ty, if checked { option_type(ty) } else { ty });
+  match class_of(context.setting.constructors, ty) {
     WidthOperands(w) -> if w.bits > 64 {
       if checked {
         checked_in_place(
-          cx,
+          context,
           st,
           name,
           a,
@@ -1116,20 +1197,38 @@ fn width_arithmetic(
           at,
         )
       } else {
-        binary_primitive(cx, { st: st, arg: a }, { st: st, arg: b }, name, AsWideFixed(w), ty, at)
+        binary_primitive(
+          context,
+          { st: st, arg: a },
+          { st: st, arg: b },
+          name,
+          AsWideFixed(w),
+          ty,
+          at,
+        )
       }
     } else if wrapping(name) || (saturating(name) && w.bits == 64) {
-      binary_primitive(cx, { st: st, arg: a }, { st: st, arg: b }, name, AsFixed(w), ty, at)
+      binary_primitive(context, { st: st, arg: a }, { st: st, arg: b }, name, AsFixed(w), ty, at)
     } else if w.bits == 64 {
-      checked_in_place(cx, st, name, a, b, { ty: ty, held: AsFixed(w), on: AsFixed(w) }, answer, at)
-    } else if checked { checked_width(cx, st, name, a, b, w, answer, at) }
-    else { binary_primitive(cx, { st: st, arg: a }, { st: st, arg: b }, name, AsFixed(w), ty, at) },
+      checked_in_place(
+        context,
+        st,
+        name,
+        a,
+        b,
+        { ty: ty, held: AsFixed(w), on: AsFixed(w) },
+        answer,
+        at,
+      )
+    } else if checked { checked_width(context, st, name, a, b, w, answer, at) } else {
+      binary_primitive(context, { st: st, arg: a }, { st: st, arg: b }, name, AsFixed(w), ty, at)
+    },
     IntOperands -> if wrapping(name) || saturating(name) {
       let x = represented_as({ st: st, arg: a }, AsInt, at);
       let y = if has_count_operand(name) { { st: x.st, arg: b } }
       else { represented_as({ st: x.st, arg: b }, AsInt, at) };
       bound(
-        cx,
+        context,
         y.st,
         ty,
         Primitive({ op: name, on: AsFixed({ bits: 64, signed: true }), args: [x.arg, y.arg] }),
@@ -1137,14 +1236,14 @@ fn width_arithmetic(
       )
     } else {
       let word = AsFixed({ bits: 64, signed: true });
-      checked_in_place(cx, st, name, a, b, { ty: ty, held: AsInt, on: word }, answer, at)
+      checked_in_place(context, st, name, a, b, { ty: ty, held: AsInt, on: word }, answer, at)
     },
     _ -> unreachable(b"an integer's builtin at a type that is no integer: ".concat(name)),
   }
 }
 
 fn to_int_call(
-  cx: Context,
+  context: Context,
   st: Lowering,
   args: List<Arg>,
   at: Span,
@@ -1153,16 +1252,17 @@ fn to_int_call(
     [_, x] -> {
       let ty = type_of(x);
       let int = int_type();
-      let option = builtin_return_type(cx, b"to_int", ty, option_type(int));
-      let some = |l: LoweredValue| constructed_as(cx, l.st, some_ctor(), [l.arg], option, at);
-      match class_of(cx.setting.ctors, ty) {
+      let option = builtin_return_type(context, b"to_int", ty, option_type(int));
+      let some = |l: LoweredValue|
+        constructed_as(context, l.st, some_constructor(), [l.arg], option, at);
+      match class_of(context.setting.constructors, ty) {
         IntOperands -> some(represented_as({ st: st, arg: x }, AsInt, at)),
         WidthOperands(w) -> if w.bits < 64 || (w.bits == 64 && w.signed) {
-          some(unary_primitive(cx, { st: st, arg: x }, b"to_int", AsFixed(w), int, at))
+          some(unary_primitive(context, { st: st, arg: x }, b"to_int", AsFixed(w), int, at))
         } else {
           let h = represented_as({ st: st, arg: x }, width_representation(w), at);
           let fits = bound(
-            cx,
+            context,
             h.st,
             bool_type(),
             if w.bits == 64 {
@@ -1175,7 +1275,7 @@ fn to_int_call(
             at,
           );
           let value = bound(
-            cx,
+            context,
             enter_block(fits.st),
             int,
             Primitive({
@@ -1185,10 +1285,17 @@ fn to_int_call(
             }),
             at,
           );
-          some_if(cx, fits, value, option, at)
+          some_if(context, fits, value, option, at)
         },
-        _ -> if has_vars(ty) {
-          left_to_callers(cx, st, b"to_int", args, { params: args.map(type_of), ret: option }, at)
+        _ -> if has_variables(ty) {
+          left_to_callers(
+            context,
+            st,
+            b"to_int",
+            args,
+            { params: args.map(type_of), ret: option },
+            at,
+          )
         } else { unreachable(b"`to_int` at a type that is no integer") },
       }
     },
@@ -1196,7 +1303,7 @@ fn to_int_call(
   }
 
 fn witnessed_operator(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
@@ -1209,9 +1316,10 @@ fn witnessed_operator(
       None -> unreachable(b"an operator over a witness numbered as none is"),
       Some(op) -> {
         let ty = match x { IntOperand(_) -> type_of(y), _ -> type_of(x) };
-        if !has_vars(ty) { binary(cx, { st: st, arg: x }, { st: st, arg: y }, op, at) } else {
+        if !has_variables(ty) { binary(context, { st: st, arg: x }, { st: st, arg: y }, op, at) }
+        else {
           left_to_callers(
-            cx,
+            context,
             scalar(ty),
             name,
             args,
@@ -1221,11 +1329,11 @@ fn witnessed_operator(
         }
       },
     },
-    [IntOperand(k), _, x] -> if !has_vars(type_of(x)) {
-      unary(cx, { st: st, arg: x }, if k == 1 { b"bitnot" } else { b"neg" }, at)
+    [IntOperand(k), _, x] -> if !has_variables(type_of(x)) {
+      unary(context, { st: st, arg: x }, if k == 1 { b"bitnot" } else { b"neg" }, at)
     } else {
       left_to_callers(
-        cx,
+        context,
         scalar(type_of(x)),
         name,
         args,
@@ -1238,7 +1346,7 @@ fn witnessed_operator(
 }
 
 fn checked_width(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
@@ -1254,7 +1362,7 @@ fn checked_width(
   let x = represented_as({ st: st, arg: a }, AsFixed(w), at);
   let y = if neg { x } else { represented_as({ st: x.st, arg: b }, AsFixed(w), at) };
   let exact = bound(
-    cx,
+    context,
     y.st,
     if unsigned { width_type(word) } else { int_type() },
     Primitive({
@@ -1268,7 +1376,7 @@ fn checked_width(
     at,
   );
   let fits = bound(
-    cx,
+    context,
     exact.st,
     bool_type(),
     if unsigned {
@@ -1287,17 +1395,17 @@ fn checked_width(
     at,
   );
   let narrowed = bound(
-    cx,
+    context,
     enter_block(fits.st),
     ty,
     Primitive({ op: b"narrow", on: operand_representation(exact.arg), args: [exact.arg] }),
     at,
   );
-  some_if(cx, fits, narrowed, option, at)
+  some_if(context, fits, narrowed, option, at)
 }
 
 fn checked_in_place(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
@@ -1310,14 +1418,14 @@ fn checked_in_place(
   let x = represented_as({ st: st, arg: a }, k.held, at);
   let y = if neg { x } else { represented_as({ st: x.st, arg: b }, k.held, at) };
   let fits = bound(
-    cx,
+    context,
     y.st,
     bool_type(),
     Primitive({ op: name, on: k.on, args: if neg { [x.arg] } else { [x.arg, y.arg] } }),
     at,
   );
   let wrapped = bound(
-    cx,
+    context,
     enter_block(fits.st),
     k.ty,
     Primitive({
@@ -1329,32 +1437,32 @@ fn checked_in_place(
     }),
     at,
   );
-  some_if(cx, fits, wrapped, option, at)
+  some_if(context, fits, wrapped, option, at)
 }
 
 fn some_if(
-  cx: Context,
+  context: Context,
   fits: LoweredValue,
   value: LoweredValue,
   option: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let some = constructed_as(cx, value.st, some_ctor(), [value.arg], option, at);
+  let some = constructed_as(context, value.st, some_constructor(), [value.arg], option, at);
   let none = constructed_as(
-    cx,
+    context,
     exit_block(enter_block(fits.st), some.st),
-    none_ctor(),
+    none_constructor(),
     [],
     option,
     at,
   );
-  let j = fresh(exit_block(fits.st, none.st), option, representation_of(cx.setting, option));
+  let j = fresh(exit_block(fits.st, none.st), option, representation_of(context.setting, option));
   let t = set_join(j.st, some, j.var, at);
   let e = set_join(t.st, none, j.var, at);
   {
     st: {
       ..e.st,
-      insts: fits.st.insts.push(Decl(j.var)).push(
+      insts: fits.st.insts.push(Declaration(j.var)).push(
         If({ cond: fits.arg, then: t.block, otherwise: e.block }),
       ),
     },
@@ -1372,7 +1480,7 @@ fn fail_missing_operator(st: Lowering, op: Bytes) -> LoweredValue / {abort.raise
 fn note_exact_types(st: Lowering, ty: Type) -> Lowering =
   match ty {
     VariableType(v) -> if v < 0 { st } else { noted(st, { var: v, reads: Exact }) },
-    _ -> type_vars(ty).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
+    _ -> type_variables(ty).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
   }
 
 fn has_count_operand(op: Bytes) -> Bool = shift(op) || op == b"rotl" || op == b"rotr"
@@ -1396,7 +1504,7 @@ fn arity(name: Bytes) -> Int =
   else { match float_function(name) { Some(f) -> f.operands, None -> 1 } }
 
 fn float_computed(
-  cx: Context,
+  context: Context,
   st: Lowering,
   name: Bytes,
   a: Arg,
@@ -1406,7 +1514,7 @@ fn float_computed(
     None -> unreachable(b"no exact Float function: ".concat(name)),
     Some(op) -> {
       let x = represented_as({ st: st, arg: a }, AsFloat, at);
-      bound(cx, x.st, float_type(), Primitive({ op: op, on: AsFloat, args: [x.arg] }), at)
+      bound(context, x.st, float_type(), Primitive({ op: op, on: AsFloat, args: [x.arg] }), at)
     },
   }
 
@@ -1491,8 +1599,8 @@ fn int_of_width(name: Bytes) -> Option<Width> =
 fn is_option(t: Type) -> Bool = option_item(t) != None
 
 pub fn is_walked_container(t: Type) -> Bool =
-  !has_vars(t) && (list_item(t) != None || array_element(t) != None || map_parts(t) != None)
+  !has_variables(t) && (list_item(t) != None || array_element(t) != None || map_parts(t) != None)
 
-pub fn is_walked_columns(t: Type) -> Bool = !has_vars(t) && columns_row(t) != None
+pub fn is_walked_columns(t: Type) -> Bool = !has_variables(t) && columns_row(t) != None
 
-fn is_result(t: Type) -> Bool = !has_vars(t) && result_parts(t) != None
+fn is_result(t: Type) -> Bool = !has_variables(t) && result_parts(t) != None

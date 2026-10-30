@@ -1162,7 +1162,7 @@ of one precedence count as one level, however long.
 ### 5.1 Blocks and `let`
 
 A block `{ statements... tail }` has the value of its last expression (its *tail*), or `Unit` if
-it has none. `let <pattern> [: Type] = <expr>;` binds a name once; the `;` is required, and a later
+it has none. `let <pattern> [: Type] = <expression>;` binds a name once; the `;` is required, and a later
 `let` may shadow an earlier one. An expression statement needs `;` unless it is the tail or is
 block-like (`if`, `match`, `handle`, a block, `with_hold`, `simulate`).
 
@@ -1177,7 +1177,7 @@ fn sum_two(input: Bytes) -> Int = {
 ```
 
 A record pattern names every field or ends with `..` (`E0201`). A `let` whose pattern does not
-match raises (§6.8). `let <pattern> = <expr> else { .. };` states what happens instead: when the
+match raises (§6.8). `let <pattern> = <expression> else { .. };` states what happens instead: when the
 pattern does not match, the `else` block becomes the value of the enclosing block, and the
 statements after it do not run. The `else` block has the enclosing block's type and cannot see the
 pattern's names. A `?` inside it exits as it would from the block's tail.
@@ -1210,7 +1210,7 @@ case).
 | pattern | matches |
 | --- | --- |
 | `_` / `name` | anything; `name` binds it |
-| `Ctor`, `Ctor(p, q)`, `mod::Ctor(p)` | a constructor |
+| `Constructor`, `Constructor(p, q)`, `mod::Constructor(p)` | a constructor |
 | `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `b'{'`, `true`, `()` | a literal |
 | `0..=9`, `b'a'..=b'z'`, `1u8..=9u8` | an integer from the first bound to the second, inclusive |
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix |
@@ -2222,7 +2222,7 @@ scope ends. The scope is called a *region*, and the value is accessed through a 
 
 ```ply
 fn first_byte(path: String) -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.close[repo], io.refused, io.closed} =
-  with_hold[file](io::reading[repo](path), io::shut) { source -> io::read(source, 1) }
+  with_hold[file](io::reading[repo](path), io::close_source) { source -> io::read(source, 1) }
 ```
 
 `with_hold[r](acquire, release) { h -> body }` runs `body` with `h` bound to a hold on what
@@ -2339,7 +2339,7 @@ test "resolves {c.reference}" for c: Resolution in resolutions() {
   builds it, often from `embed_dir` (§3.4). A function with no parameters is computed once however
   many cases read it. A record literal in it is a `new` record when the case type is one (§4.2).
 - The name is bound in the body and in the label. The label is read like an interpolated string
-  (§2.3): each `{expr}` is a hole, and `{{` and `}}` are literal braces.
+  (§2.3): each `{expression}` is a hole, and `{{` and `}}` are literal braces.
 - Each case is identified as `<module>.<label>`, using the label its holes produce, so every case
   and test in a module needs its own label. If a case has the same label as another case in its
   table, another test's name or a case of another test, its test fails as a whole with `E0105`,
@@ -2363,9 +2363,9 @@ test "resolves {c.reference}" for c: Resolution in resolutions() {
 
 ```ply
 import std.snapshot
-import std.snapshot (Stored)
+import std.snapshot (Snapshots)
 
-fn stored() -> Stored = { dir: "snapshots", files: embed_dir("snapshots") }
+fn stored() -> Snapshots = { dir: "snapshots", files: embed_dir("snapshots") }
 
 test "an order renders as stored" {
   snapshot::check(stored(), "order.txt", snapshot::render(order()))
@@ -2515,7 +2515,7 @@ Ply, reported as `E0505` when the program is built.
 
 | variable | effect |
 | --- | --- |
-| `PLY_CC=cmd` | the C compiler to run in place of `cc`; while it is set, `tcc` is not used |
+| `PLY_CC=command` | the C compiler to run in place of `cc`; while it is set, `tcc` is not used |
 | `PLY_C_CACHE=DIR` | where compiled code and other build results are cached, keyed by content (default `ply/cache` under the user's cache directory: `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere) |
 | `PLY_C_CACHE_MAX=BYTES` | a size limit for the cache, enforced by deleting the least recently used entries first, but never one used in the last hour; `0` is no limit |
 
@@ -3324,7 +3324,7 @@ threads; and it may receive a `Secret` when an argument's type contains one.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | a TLS credential (PEM, leaf first; key in PKCS#8, PKCS#1 or SEC1); repeatable. Used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`, which `std.http`'s `serve_pooled_tls` uses to offer `h2` and `http/1.1`. A name given several times has several certificates, and each handshake uses the one matching the name the client requests (SNI), or the first. Changed certificate files are reloaded within a second without a restart, keeping the old one if the new one fails to load. Sessions resume from tickets whose key rotates. `E0430` if it does not load, `E0429` if a program names one not given. |
-| `--trust CERT.pem` | an extra trusted certificate; repeatable. `net.connect_tls` and `net.start_tls` accept servers it signs, in addition to the built-in roots. With any `--trust`, every TLS listener requests a certificate from clients, still serving a client without one unless `--mtls` names the credential. `net.peer_certificate` returns the certificate presented (on a client, the server's, for channel binding); `std.http` puts it on each request as `client_certificate`, and `std.x509` reads it. A client presents one when its connection was opened or set with `net::Presenting("NAME")` (a `--tls` credential), as `std.http`'s `fetch` does for `Fetching.credential`. `net.listen_tls` and `net.connect_tls` offer only `http/1.1`; to offer other protocols (`h2`), use `net.serve_tls` or `net.start_tls`, and `net.protocol` returns what the handshake agreed. `E0430` if it does not parse. The `ply` command's own connections use `PLY_TRUST` instead (§16). |
+| `--trust CERT.pem` | an extra trusted certificate; repeatable. `net.connect_tls` and `net.start_tls` accept servers it signs, in addition to the built-in roots. With any `--trust`, every TLS listener requests a certificate from clients, still serving a client without one unless `--mtls` names the credential. `net.peer_certificate` returns the certificate presented (on a client, the server's, for channel binding); `std.http` puts it on each request as `client_certificate`, and `std.x509` reads it. A client presents one when its connection was opened or set with `net::Presenting("NAME")` (a `--tls` credential), as `std.http`'s `fetch` does for `FetchOptions.credential`. `net.listen_tls` and `net.connect_tls` offer only `http/1.1`; to offer other protocols (`h2`), use `net.serve_tls` or `net.start_tls`, and `net.protocol` returns what the handshake agreed. `E0430` if it does not parse. The `ply` command's own connections use `PLY_TRUST` instead (§16). |
 | `--mtls NAME` | a `--tls` credential whose listeners require a client certificate; repeatable. A client without one that `--trust` verifies is rejected at the handshake. `E0429` if no `--tls` names it, `E0430` without a `--trust`. |
 | `--fs NAME=PATH` | a file system root; repeatable. `std.fs` files and `std.sqlite` databases under that label live below it, as does a Unix socket `net.listen_unix` or `net.connect_unix` names. `E0454` if it is not a directory. |
 | `--exec NAME=PATH` | a program that a `process.spawn` or `process.start` with that label may start; repeatable (`ply run`, `ply test`). `E0457` if it cannot be executed. |
@@ -3856,7 +3856,7 @@ In `examples/`:
 - `relay.ply`: one forwarder that is generic over the label it writes under.
 - `shout.ply`: a command line declared with `std.cli` and read into the program's own type.
 - `store.ply`: a handler used to grant a capability.
-- `agreement.ply` and `twin_divergence_audit.ply`: `std.db`'s in-memory fake checked against
+- `agreement.ply` and `fake_divergence_audit.ply`: `std.db`'s in-memory fake checked against
   recorded PostgreSQL results.
 - `service.ply`: a service over PostgreSQL or its in-memory fake, whose store, TLS and accept loop
   are configuration, with tracing and graceful shutdown.

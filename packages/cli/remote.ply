@@ -3,7 +3,7 @@ import compiler.front.pkg (SuppliedPackage, check_manifest, registry_dir, regist
 import compiler.store.plyx (digest_of, digest_text, encode_named, library_domain, library_magic,
                             offset_digest, archive_digest)
 import builder (builder)
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import std.env (env)
 import lock (FetchedArchive, Lock, entry_of)
 import plyz
@@ -12,13 +12,14 @@ import registry (BaseUrl, archive_target, attestation_target, base_of, exchange,
                  interface_target, response_message, registry_unreachable, unset, url_variable)
 import interfaces (slot_attestation, slot_interface)
 import semantics
-import sources (DepPackage, File, Project, VendoredPackage, from_vendor, vendored, unlocated_error)
+import sources (DependencyPackage, File, Project, VendoredPackage, from_vendor, vendored,
+                unlocated_error)
 import std.fs (fs, Listed, Dir)
 import std.http
 import std.json (decode_bytes, error_to_string)
 import std.net (net)
 import std.path (join, parent, strip_root)
-import std.pkg (Dep, Index, Manifest, Registry, Release, Version, index_json, parse_version,
+import std.pkg (Dependency, Index, Manifest, Registry, Release, Version, index_json, parse_version,
                 render_version, release_at)
 import std.list
 import std.option
@@ -40,7 +41,7 @@ fn interface_path(root: String, name: String, version: String) -> String / {abor
 pub fn requirements(project: Project) -> List<Requirement> / {abort.raise} = {
   let cached_archive = cache_dir(project.root_key) ++ "/";
   let own = match project.manifest { Some(f) -> [f.text], None -> [] };
-  let texts = project.packages.fold(own, |acc: List<Bytes>, package: DepPackage|
+  let texts = project.packages.fold(own, |acc: List<Bytes>, package: DependencyPackage|
     if package.root.starts_with(cached_archive) { acc }
     else { match package.manifest { Some(t) -> acc.push(t), None -> acc } });
   texts.fold([], |acc: List<Requirement>, t: Bytes|
@@ -49,11 +50,11 @@ pub fn requirements(project: Project) -> List<Requirement> / {abort.raise} = {
 
 fn manifest_of(text: Bytes) -> Option<Manifest> / {abort.raise} = {
   let c = check_manifest(text);
-  if c.diags.len() > 0 { None } else { c.manifest }
+  if c.diagnostics.len() > 0 { None } else { c.manifest }
 }
 
 fn registry_requirements(manifest: Manifest) -> List<Requirement> =
-  manifest.dependencies.fold([], |acc: List<Requirement>, d: Dep|
+  manifest.dependencies.fold([], |acc: List<Requirement>, d: Dependency|
     match d.source { Registry -> acc.push({ name: d.name, floor: d.min }), _ -> acc })
 
 pub fn select(index: Index, floor: Version, pinned: Option<Version>) -> Option<Release> = {
@@ -93,7 +94,7 @@ pub type Node = {
   name: String,
   release: Release,
   archive: ArchiveContents,
-  deps: List<Requirement>,
+  dependencies: List<Requirement>,
   interface: Option<Bytes>,
   attestation: Option<Bytes>,
 }
@@ -103,9 +104,9 @@ type Walk = { indexes: Map<String, Index>, nodes: Map<String, Node>, queue: List
 pub fn walk<| e>(
   lock: Option<Lock>,
   reqs: List<Requirement>,
-  index_of: (String) -> Result<Index, Diag> / e,
-  node_at: (String, Release) -> Result<Node, Diag> / e,
-) -> Result<List<Node>, Diag> / {diverges, abort.raise | e} =
+  index_of: (String) -> Result<Index, Diagnostic> / e,
+  node_at: (String, Release) -> Result<Node, Diagnostic> / e,
+) -> Result<List<Node>, Diagnostic> / {diverges, abort.raise | e} =
   match walked(lock, index_of, node_at, { indexes: Map::new(), nodes: Map::new(), queue: reqs }) {
     Err(d) -> Err(d),
     Ok(w) -> Ok(w.nodes.values()),
@@ -113,13 +114,13 @@ pub fn walk<| e>(
 
 fn walked<| e>(
   lock: Option<Lock>,
-  index_of: (String) -> Result<Index, Diag> / e,
-  node_at: (String, Release) -> Result<Node, Diag> / e,
+  index_of: (String) -> Result<Index, Diagnostic> / e,
+  node_at: (String, Release) -> Result<Node, Diagnostic> / e,
   w: Walk,
-) -> Result<Walk, Diag> / {abort.raise, diverges | e} =
+) -> Result<Walk, Diagnostic> / {abort.raise, diverges | e} =
   match w.queue {
     [] -> Ok(w),
-    [req, ..rest] -> match visited(lock, index_of, node_at, { ..w, queue: rest }, req) {
+    [request, ..rest] -> match visited(lock, index_of, node_at, { ..w, queue: rest }, request) {
       Err(d) -> Err(d),
       Ok(next) -> walked(lock, index_of, node_at, next),
     },
@@ -127,28 +128,32 @@ fn walked<| e>(
 
 fn visited<| e>(
   lock: Option<Lock>,
-  index_of: (String) -> Result<Index, Diag> / e,
-  node_at: (String, Release) -> Result<Node, Diag> / e,
+  index_of: (String) -> Result<Index, Diagnostic> / e,
+  node_at: (String, Release) -> Result<Node, Diagnostic> / e,
   w: Walk,
-  req: Requirement,
-) -> Result<Walk, Diag> / {abort.raise | e} = {
-  let registry_requirements = match w.indexes.get(req.name) {
+  request: Requirement,
+) -> Result<Walk, Diagnostic> / {abort.raise | e} = {
+  let registry_requirements = match w.indexes.get(request.name) {
     Some(x) -> Ok(x),
-    None -> index_of(req.name),
+    None -> index_of(request.name),
   };
   match registry_requirements {
     Err(d) -> Err(d),
     Ok(index) -> {
-      let w1 = { ..w, indexes: w.indexes.insert(req.name, index) };
-      match select(index, req.floor, pinned_version(lock, req.name)) {
-        None -> Err(unsatisfied(req, index)),
+      let w1 = { ..w, indexes: w.indexes.insert(request.name, index) };
+      match select(index, request.floor, pinned_version(lock, request.name)) {
+        None -> Err(unsatisfied(request, index)),
         Some(r) -> {
-          let key = req.name ++ "@" ++ render_version(r.version);
+          let key = request.name ++ "@" ++ render_version(r.version);
           if w1.nodes.contains(key) { Ok(w1) } else {
-            match node_at(req.name, r) {
+            match node_at(request.name, r) {
               Err(d) -> Err(d),
               Ok(node) ->
-                Ok({ ..w1, nodes: w1.nodes.insert(key, node), queue: w1.queue.concat(node.deps) }),
+                Ok({
+                  ..w1,
+                  nodes: w1.nodes.insert(key, node),
+                  queue: w1.queue.concat(node.dependencies),
+                }),
             }
           }
         },
@@ -162,7 +167,7 @@ type RegistryContext = { base: BaseUrl, root: String, lock: Option<Lock> }
 fn fetch_index(
   base: BaseUrl,
   name: String,
-) -> Result<Index, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} = {
+) -> Result<Index, Diagnostic> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} = {
   let target = index_target(base, name);
   match exchange(base, get(base, target)) {
     Err(d) -> Err(d),
@@ -196,7 +201,7 @@ fn fetch_node(
   ctx: RegistryContext,
   name: String,
   release: Release,
-) -> Result<Node, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+) -> Result<Node, Diagnostic> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
   let version = render_version(release.version);
   let pinned = pinned_archive(ctx.lock, name, version);
   let path = archive_path(ctx.root, name, version);
@@ -251,7 +256,7 @@ pub fn verified_archive(
   bytes: Bytes,
   listed: String,
   pinned: Option<String>,
-) -> Result<ArchiveContents, Diag> / {abort.raise} =
+) -> Result<ArchiveContents, Diagnostic> / {abort.raise} =
   match unpack(bytes) {
     Err(why) ->
       Err(
@@ -276,7 +281,7 @@ fn listed_as(
   listed: String,
   d: String,
   u: ArchiveContents,
-) -> Result<ArchiveContents, Diag> =
+) -> Result<ArchiveContents, Diagnostic> =
   if listed == d { Ok(u) } else {
     Err(
       wrong_response(
@@ -300,7 +305,7 @@ fn node_of(
   name: String,
   release: Release,
   u: ArchiveContents,
-) -> Result<Node, Diag> / {abort.raise} = {
+) -> Result<Node, Diagnostic> / {abort.raise} = {
   let version = render_version(release.version);
   match manifest_of(u.manifest) {
     None ->
@@ -324,7 +329,7 @@ fn node_of(
         name: name,
         release: release,
         archive: u,
-        deps: registry_requirements(m),
+        dependencies: registry_requirements(m),
         interface: None,
         attestation: None,
       })
@@ -409,7 +414,7 @@ fn install(
   root: String,
   items: List<VendoredPackage>,
   node: Node,
-) -> Result<Unit, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+) -> Result<Unit, Diagnostic> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
   let slot = slot_of(root, node.name);
   match replace_package(slot, node, true) {
     Err(d) -> Err(d),
@@ -424,7 +429,7 @@ fn replace_package(
   dir: String,
   node: Node,
   published: Bool,
-) -> Result<Unit, Diag> / {fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
+) -> Result<Unit, Diagnostic> / {fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} = {
   let staging = dir ++ "@" ++ render_version(node.release.version);
   remove_tree(staging, 0);
   let beside = |at: String, held: Option<Bytes>|
@@ -474,7 +479,7 @@ fn remove_tree(dir: String, depth: Int) -> Bool / {fs.list_dir[abs], fs.remove[a
 pub fn resolved(
   project: Project,
   lock: Option<Lock>,
-) -> Result<List<FetchedArchive>, Diag> / {env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[abs], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> Result<List<FetchedArchive>, Diagnostic> / {env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[abs], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match requirements(project) {
     [] -> Ok([]),
     reqs -> match env.variable(url_variable()) {
@@ -509,7 +514,7 @@ fn install_all(
   items: List<VendoredPackage>,
   nodes: List<Node>,
   out: List<FetchedArchive>,
-) -> Result<List<FetchedArchive>, Diag> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
+) -> Result<List<FetchedArchive>, Diagnostic> / {fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise} =
   match nodes {
     [] -> Ok(out),
     [n, ..rest] -> match install(root, items, n) {
@@ -530,7 +535,11 @@ fn install_all(
     },
   }
 
-pub type FetchedClosure = { manifest: Manifest, own: SuppliedPackage, deps: List<SuppliedPackage> }
+pub type FetchedClosure = {
+  manifest: Manifest,
+  own: SuppliedPackage,
+  dependencies: List<SuppliedPackage>,
+}
 
 fn supplied_of(root: String, node: Node) -> SuppliedPackage / {abort.raise} =
   {
@@ -543,7 +552,7 @@ fn supplied_of(root: String, node: Node) -> SuppliedPackage / {abort.raise} =
 pub fn index_of(
   base: BaseUrl,
   name: String,
-) -> Result<Index, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} =
+) -> Result<Index, Diagnostic> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} =
   fetch_index(base, name)
 
 pub fn fetch_closure(
@@ -551,7 +560,7 @@ pub fn fetch_closure(
   root: String,
   name: String,
   r: Release,
-) -> Result<FetchedClosure, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
+) -> Result<FetchedClosure, Diagnostic> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
   let ctx: RegistryContext = { base: base, root: root, lock: None };
   match fetch_node(ctx, name, r) {
     Err(d) -> Err(d),
@@ -567,7 +576,7 @@ pub fn fetch_closure(
         ),
       Some(m) -> match walk(
           None,
-          n.deps,
+          n.dependencies,
           |x: String| fetch_index(base, x),
           |x: String, at: Release| fetch_node(ctx, x, at),
         ) {
@@ -576,7 +585,7 @@ pub fn fetch_closure(
           Ok({
             manifest: m,
             own: supplied_of(root, n),
-            deps: highest_versions(nodes).map(|x: Node| supplied_of(root, x)),
+            dependencies: highest_versions(nodes).map(|x: Node| supplied_of(root, x)),
           }),
       },
     },
@@ -588,14 +597,14 @@ pub fn staged(
   dir: String,
   name: String,
   r: Release,
-) -> Result<String, Diag> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
+) -> Result<String, Diagnostic> / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[abs], fs.list_dir[abs], fs.remove[abs], fs.rename[abs], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
   let ctx: RegistryContext = { base: base, root: dir, lock: None };
   let package = join(dir, "package");
   match fetch_node(ctx, name, r) {
     Err(d) -> Err(d),
     Ok(n) -> match walk(
         None,
-        n.deps,
+        n.dependencies,
         |x: String| fetch_index(base, x),
         |x: String, at: Release| fetch_node(ctx, x, at),
       ) {
@@ -611,10 +620,10 @@ pub fn staged(
   }
 }
 
-fn wrong_response(message: String, notes: List<Bytes>) -> Diag =
+fn wrong_response(message: String, notes: List<Bytes>) -> Diagnostic =
   unlocated_error(b"E0142", message, b"the registry's answer is not what it names", notes)
 
-fn pin_mismatch(name: String, version: String, pinned: String, served: String) -> Diag =
+fn pin_mismatch(name: String, version: String, pinned: String, served: String) -> Diagnostic =
   wrong_response(
     "the registry served `" ++ name ++ "` " ++ version ++ " as " ++ served
       ++ ", and `ply.lock` pins it as "
@@ -628,14 +637,14 @@ fn pin_mismatch(name: String, version: String, pinned: String, served: String) -
     ],
   )
 
-fn unexpected_status(base: BaseUrl, target: String, status: Int, why: String) -> Diag =
+fn unexpected_status(base: BaseUrl, target: String, status: Int, why: String) -> Diagnostic =
   registry_unreachable(
     base.url ++ target ++ " answered " ++ status.to_string()
       ++ (if why == "" { "" } else { ": " ++ why }),
     [],
   )
 
-fn no_package(base: BaseUrl, name: String) -> Diag =
+fn no_package(base: BaseUrl, name: String) -> Diagnostic =
   unlocated_error(
     b"E0143",
     "the registry at " ++ base.url ++ " has no package named `" ++ name ++ "`",
@@ -643,20 +652,21 @@ fn no_package(base: BaseUrl, name: String) -> Diag =
     [b"check the name in `ply.pkg`, and that `PLY_REGISTRY` names the registry it is published to"],
   )
 
-fn unsatisfied(req: Requirement, index: Index) -> Diag = {
-  let above = index.versions.filter(|release: Release| compare(release.version, req.floor) != Less);
-  let floor = render_version(req.floor);
+fn unsatisfied(request: Requirement, index: Index) -> Diagnostic = {
+  let above = index.versions.filter(|release: Release|
+    compare(release.version, request.floor) != Less);
+  let floor = render_version(request.floor);
   if above.len() == 0 {
     unlocated_error(
       b"E0143",
-      "no published version of `" ++ req.name ++ "` is at or above " ++ floor,
+      "no published version of `" ++ request.name ++ "` is at or above " ++ floor,
       b"no published version satisfies this dependency",
       [Bytes::of_string("published: " ++ versions_text(index.versions))],
     )
   } else {
     unlocated_error(
       b"E0143",
-      "every version of `" ++ req.name ++ "` at or above " ++ floor ++ " is yanked: "
+      "every version of `" ++ request.name ++ "` at or above " ++ floor ++ " is yanked: "
         ++ versions_text(above),
       b"no published version satisfies this dependency",
       [b"a yanked version is served only to a lock that already pins it"],
@@ -672,7 +682,7 @@ fn versions_text(rs: List<Release>) -> String =
     })
   }
 
-fn unwritable(path: String) -> Diag =
+fn unwritable(path: String) -> Diagnostic =
   unlocated_error(
     b"E0502",
     "could not write `" ++ path ++ "`",
@@ -794,7 +804,7 @@ fn a_node(name: String, version: String) -> Node / {abort.raise} =
     name: name,
     release: a_release(version, false),
     archive: { digest: b"", manifest: b"", modules: [] },
-    deps: [],
+    dependencies: [],
     interface: None,
     attestation: None,
   }
@@ -827,7 +837,7 @@ fn a_registry() -> Map<String, Index> / {abort.raise} =
     { key: "billing", value: { name: "billing", versions: [a_release("0.1.0", false)] } },
   ])
 
-fn deps_of(name: String, version: String) -> List<Requirement> / {abort.raise} =
+fn dependencies_of(name: String, version: String) -> List<Requirement> / {abort.raise} =
   if name == "orders" && version == "0.1.0" {
     [{ name: "money", floor: parse_version("1.0.0").expect("a fixture's version") }]
   } else if name == "orders" && version == "0.2.0" {
@@ -839,7 +849,7 @@ fn deps_of(name: String, version: String) -> List<Requirement> / {abort.raise} =
 fn walk_table(
   reqs: List<Requirement>,
   lock: Option<Lock>,
-) -> Result<List<String>, Diag> / {abort.raise, diverges} = {
+) -> Result<List<String>, Diagnostic> / {abort.raise, diverges} = {
   let table = a_registry();
   match walk(
       lock,
@@ -865,7 +875,7 @@ fn walk_table(
       |name: String, release: Release|
         Ok({
           ..a_node(name, render_version(release.version)),
-          deps: deps_of(name, render_version(release.version)),
+          dependencies: dependencies_of(name, render_version(release.version)),
         }),
     ) {
     Err(d) -> Err(d),

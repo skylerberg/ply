@@ -4,7 +4,7 @@ import entries (Runnable, runnable_bin)
 import std.bin
 import units
 import units (emit)
-import compiler.front.rows (Dump, HashTableRow, DefinitionHashRow, HashRow, BodyRow, DefRow,
+import compiler.front.rows (Dump, HashTableRow, DefinitionHashRow, HashRow, BodyRow, DefinitionRow,
                             TypeRow, EffectRow)
 import compiler.store.hash.forms (ClosureEntry, HashOutput, by_name, build_closure, walk)
 import compiler.store.hash.printer (Printed, Unprintable, print_bodies)
@@ -14,7 +14,7 @@ import compiler.load (SourceFile, check_in_memory, LoadedAnalysis)
 import compiler.store.plyx (Header, SectionLocation, Section, decode, digest_of, digest_text,
                             domain)
 import compiler.store.segments (read_u32)
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import compiler.unit (compiler_roots, identity_of, shipped)
 import compiler.emit.abi (Native)
 import compiler.emit.print.unit_header (bound_functions)
@@ -93,9 +93,9 @@ fn short(hash: Bytes) -> String / {abort.raise} = hash.hex_of().slice(0, 12)
 
 fn short_digest(d: Bytes) -> String / {abort.raise} = digest_text(d).slice(0, 15)
 
-fn refusal(diags: List<Diag>) -> Refusal = { diags: diags, places: [] }
+fn refusal(diagnostics: List<Diagnostic>) -> Refusal = { diagnostics: diagnostics, places: [] }
 
-fn internal_error(message: String, notes: List<Bytes>) -> Diag =
+fn internal_error(message: String, notes: List<Bytes>) -> Diagnostic =
   error_at(
     b"E0505",
     no_module(),
@@ -105,7 +105,7 @@ fn internal_error(message: String, notes: List<Bytes>) -> Diag =
     notes.push(b"nothing was built"),
   )
 
-fn invalid_artifact(path: String, message: String, notes: List<Bytes>) -> Diag =
+fn invalid_artifact(path: String, message: String, notes: List<Bytes>) -> Diagnostic =
   error_at(
     b"E0443",
     no_module(),
@@ -115,7 +115,7 @@ fn invalid_artifact(path: String, message: String, notes: List<Bytes>) -> Diag =
     notes.push(b"rebuild it with `ply build`, or transfer the file again"),
   )
 
-fn version_mismatch(path: String, message: String) -> Diag =
+fn version_mismatch(path: String, message: String) -> Diagnostic =
   error_at(
     b"E0444",
     no_module(),
@@ -151,7 +151,7 @@ fn hash_rows(d: Dump) -> Map<Bytes, HashRow> =
 fn hex_bytes(h: Bytes) -> Bytes / {abort.raise} = Bytes::of_hex(String::of_bytes(h))
 
 fn hashes_of(r: HashRow) -> List<Bytes> / {abort.raise} =
-  [r.def, r.decl].fold([], |acc: List<Bytes>, h: Option<Bytes>|
+  [r.definition, r.declaration].fold([], |acc: List<Bytes>, h: Option<Bytes>|
     match h { Some(x) -> acc.push(hex_bytes(x)), None -> acc })
 
 fn bodies_by_name(d: Dump) -> Map<Bytes, List<Bytes>> / {abort.raise} =
@@ -198,7 +198,7 @@ fn joined_names(names: List<Bytes>) -> Bytes =
       None -> acc,
     })
 
-fn no_body(absent: List<Bytes>) -> Diag =
+fn no_body(absent: List<Bytes>) -> Diagnostic =
   error_at(
     b"E0443",
     no_module(),
@@ -210,7 +210,7 @@ fn no_body(absent: List<Bytes>) -> Diag =
     [b"missing: ".concat(joined_names(absent.take(8)))],
   )
 
-fn unhashed(name: Bytes) -> Diag =
+fn unhashed(name: Bytes) -> Diagnostic =
   error_at(
     b"E0443",
     no_module(),
@@ -220,20 +220,21 @@ fn unhashed(name: Bytes) -> Diag =
     [],
   )
 
-type Exports = { fns: Map<Bytes, Bool>, decls: Map<Bytes, Bool> }
+type Exports = { functions: Map<Bytes, Bool>, declarations: Map<Bytes, Bool> }
 
 fn exports_of(d: Dump) -> Exports = {
   let typed = d.types.fold(Map::new(), |acc: Map<Bytes, Bool>, r: TypeRow|
     acc.insert(r.name, r.public));
   {
-    fns: d.defs.fold(Map::new(), |acc: Map<Bytes, Bool>, r: DefRow| acc.insert(r.name, r.public)),
-    decls: d.effects.fold(typed, |acc: Map<Bytes, Bool>, r: EffectRow|
+    functions: d.definitions.fold(Map::new(), |acc: Map<Bytes, Bool>, r: DefinitionRow|
+      acc.insert(r.name, r.public)),
+    declarations: d.effects.fold(typed, |acc: Map<Bytes, Bool>, r: EffectRow|
       acc.insert(r.name, r.public)),
   }
 }
 
 fn exported(e: Exports, x: ClosureEntry) -> Bool =
-  match Map::get(if x.decl { e.decls } else { e.fns }, x.name) {
+  match Map::get(if x.declaration { e.declarations } else { e.functions }, x.name) {
     Some(public) -> public,
     None -> true,
   }
@@ -250,7 +251,7 @@ fn printed_files(
   d: Dump,
   held: List<ClosureEntry>,
   bodies: Map<Bytes, Bytes>,
-) -> Result<List<SourceFile>, Diag> / {shipped.names, abort.raise} = {
+) -> Result<List<SourceFile>, Diagnostic> / {shipped.names, abort.raise} = {
   let shipped_names = shipped.names().fold(Map::new(), |acc: Map<Bytes, Bool>, n: String|
     acc.insert(Bytes::of_string(n), true));
   let shipped_modules = held.fold(Map::new(), |acc: Map<Bytes, Bool>, x: ClosureEntry| {
@@ -348,14 +349,17 @@ fn reaches_of(held: List<ClosureEntry>) -> List<Reach> / {abort.raise} = {
     match held.at(i) {
       None -> acc,
       Some(x) ->
-        acc.insert(Bytes::concat_all([x.name, b"\x00", if x.decl { b"0" } else { b"1" }]), {
-          name: String::of_bytes(x.name),
-          reaches: walk(edges, [i]).fold(Map::new(), |seen: Map<Bytes, Bool>, j: Int|
-            seen.insert(name_at(j), true)).keys(
-          ).map(
-            String::of_bytes,
-          ),
-        }),
+        acc.insert(
+          Bytes::concat_all([x.name, b"\x00", if x.declaration { b"0" } else { b"1" }]),
+          {
+            name: String::of_bytes(x.name),
+            reaches: walk(edges, [i]).fold(Map::new(), |seen: Map<Bytes, Bool>, j: Int|
+              seen.insert(name_at(j), true)).keys(
+            ).map(
+              String::of_bytes,
+            ),
+          },
+        ),
     }).values(
   )
 }
@@ -410,9 +414,9 @@ pub fn build_artifact(
   startup: List<String>,
   reaches: Bool,
 ) -> Result<BuiltArtifact, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.report_reached, shipped.definitions, shipped.runtime, abort.raise} = {
-  let defs = by_name(hashes.defs);
+  let definitions = by_name(hashes.definitions);
   let roots = startup.push(entry).map(Bytes::of_string);
-  match roots.filter(|r: Bytes| !defs.contains(r)) {
+  match roots.filter(|r: Bytes| !definitions.contains(r)) {
     [missing, ..] -> Err(refusal([unhashed(missing)])),
     [] -> {
       let closure = build_closure(hashes, roots);
@@ -427,7 +431,7 @@ pub fn build_artifact(
           ),
         [] -> {
           let names = closure.fold(Map::new(), |acc: Map<Bytes, Bool>, x: ClosureEntry|
-            if x.decl { acc } else { acc.insert(x.name, true) }).keys(
+            if x.declaration { acc } else { acc.insert(x.name, true) }).keys(
           );
           match printed_files(front.dump, closure, bodies) {
             Err(d) -> Err(refusal([d])),
@@ -437,7 +441,8 @@ pub fn build_artifact(
                   refusal([
                     internal_error(
                       "the closure printed back to source does not open as the program it was printed from",
-                      u.diags.take(1).map(|d: Diag| Bytes::concat_all([d.code, b": ", d.message])),
+                      u.diagnostics.take(1).map(|d: Diagnostic|
+                        Bytes::concat_all([d.code, b": ", d.message])),
                     ),
                   ]),
                 ),
@@ -454,9 +459,9 @@ pub fn build_artifact(
                     ]),
                   ),
                 None -> {
-                  let defined = again.dump.defs.fold(
+                  let defined = again.dump.definitions.fold(
                     Map::new(),
-                    |acc: Map<Bytes, Bool>, r: DefRow| acc.insert(r.name, true),
+                    |acc: Map<Bytes, Bool>, r: DefinitionRow| acc.insert(r.name, true),
                   );
                   match units::text_of(
                       emit.unit(
@@ -464,9 +469,9 @@ pub fn build_artifact(
                         names.filter(|n: Bytes| defined.contains(n)).map(|n: Bytes| keys::Named(n)),
                       ),
                     ) {
-                    Err(diags) -> Err(refusal(diags)),
+                    Err(diagnostics) -> Err(refusal(diagnostics)),
                     Ok(unit) -> {
-                      let entry_hash = match defs.get(Bytes::of_string(entry)) {
+                      let entry_hash = match definitions.get(Bytes::of_string(entry)) {
                         Some(h) -> h,
                         None -> b"",
                       };
@@ -523,7 +528,7 @@ pub fn library_unit(
   names: List<String>,
 ) -> Result<LibraryUnit, Refusal> / {emit.unit, shipped.definitions, shipped.runtime, abort.raise} =
   match units::text_of(emit.unit(front, names.map(|n: String| keys::Named(Bytes::of_string(n))))) {
-    Err(diags) -> Err(refusal(diags)),
+    Err(diagnostics) -> Err(refusal(diagnostics)),
     Ok(unit) -> Ok({ head: header_of(b""), count: 1, payload: gzip::gzip(unit) }),
   }
 
@@ -544,11 +549,11 @@ fn read_bodies(
   path: String,
   b: Bytes,
   p: SectionLocation,
-) -> Result<Map<Bytes, Bytes>, Diag> / {abort.raise} = {
+) -> Result<Map<Bytes, Bytes>, Diagnostic> / {abort.raise} = {
   let end = p.at + p.len;
   let walked = range(0, p.count).fold(
     Ok({ at: p.at, by_hash: Map::new() }),
-    |acc: Result<BodiesCursor, Diag>, _i: Int|
+    |acc: Result<BodiesCursor, Diagnostic>, _i: Int|
       match acc {
         Err(_) -> acc,
         Ok(s) -> if s.at + 36 > end { Err(overrun_error(path, "definition", s.at)) } else {
@@ -589,7 +594,7 @@ fn read_bodies(
   }
 }
 
-fn overrun_error(path: String, what: String, at: Int) -> Diag =
+fn overrun_error(path: String, what: String, at: Int) -> Diagnostic =
   invalid_artifact(
     path,
     "a " ++ what ++ " record at offset " ++ at.to_string() ++ " runs past its section",
@@ -603,14 +608,14 @@ fn read_names(
   b: Bytes,
   names: Option<SectionLocation>,
   strings: Option<SectionLocation>,
-) -> Result<List<Name>, Diag> =
+) -> Result<List<Name>, Diagnostic> =
   match names {
     None -> Ok([]),
     Some(p) -> if p.len != p.count * 40 {
       Err(invalid_artifact(path, "the namespace section is the wrong size", []))
     } else {
       let text = match strings { Some(s) -> payload(b, s), None -> b"" };
-      range(0, p.count).fold(Ok([]), |acc: Result<List<Name>, Diag>, i: Int|
+      range(0, p.count).fold(Ok([]), |acc: Result<List<Name>, Diagnostic>, i: Int|
         match acc {
           Err(_) -> acc,
           Ok(done) -> {
@@ -641,14 +646,14 @@ fn read_closure(
   path: String,
   b: Bytes,
   closure: Option<SectionLocation>,
-) -> Result<List<File>, Diag> =
+) -> Result<List<File>, Diagnostic> =
   match closure {
     None -> Ok([]),
     Some(p) -> {
       let end = p.at + p.len;
       let walked = range(0, p.count).fold(
         Ok({ at: p.at, out: [] }),
-        |acc: Result<FilesCursor, Diag>, _i: Int|
+        |acc: Result<FilesCursor, Diagnostic>, _i: Int|
           match acc {
             Err(_) -> acc,
             Ok(s) -> {
@@ -694,14 +699,15 @@ fn read_closure(
     },
   }
 
-fn with_note(diag: Diag, note: Bytes) -> Diag =
-  if note.len() == 0 { diag }
-  else { { ..diag, notes_text: diag.notes_text.push(note), notes: diag.notes + 1 } }
+fn with_note(diagnostic: Diagnostic, note: Bytes) -> Diagnostic =
+  if note.len() == 0 { diagnostic } else {
+    { ..diagnostic, notes_text: diagnostic.notes_text.push(note), notes: diagnostic.notes + 1 }
+  }
 
 pub fn open_artifact(
   path: String,
   b: Bytes,
-) -> Result<OpenedArtifact, Diag> / {shipped.definitions, shipped.runtime, abort.raise} =
+) -> Result<OpenedArtifact, Diagnostic> / {shipped.definitions, shipped.runtime, abort.raise} =
   match decode(b) {
     Err(r) -> {
       let base = if r.stale { version_mismatch(path, String::of_bytes_lossy(r.message)) }
@@ -827,7 +833,7 @@ fn read_runnable(
   bytes: Bytes,
   entry: String,
   held: Bytes,
-) -> Result<Runnable, Diag> / {abort.raise} =
+) -> Result<Runnable, Diagnostic> / {abort.raise} =
   match bin::decode(bytes, runnable_section_bin()) {
     Err(why) ->
       Err(invalid_artifact(path, "the artifact's runnable does not read: " ++ why.message, [])),
@@ -851,7 +857,7 @@ fn read_runnable(
     } else { Ok(c.runnable) },
   }
 
-pub fn unreadable(path: String) -> Diag =
+pub fn unreadable(path: String) -> Diagnostic =
   invalid_artifact(path, "could not read `" ++ path ++ "`", [
     b"name the `.plyx` file `ply build` wrote",
   ])
@@ -873,8 +879,8 @@ pub fn previous(
     },
   }
 
-fn closure_entry(name: Bytes, decl: Bool, hash: Bytes, refs: List<Int>) -> ClosureEntry =
-  { name: name, decl: decl, hash: hash, refs: refs }
+fn closure_entry(name: Bytes, declaration: Bool, hash: Bytes, refs: List<Int>) -> ClosureEntry =
+  { name: name, declaration: declaration, hash: hash, refs: refs }
 
 test "a name held as a function and as a declaration is filed under both hashes, by name and then by hash" {
   let held = [
@@ -905,7 +911,10 @@ test "what a held definition reaches of its closure is read through what each re
 }
 
 test "a function and an effect of one name each say whether their module exports them" {
-  let exports = { fns: Map::new().insert(b"m.gz", false), decls: Map::new().insert(b"m.gz", true) };
+  let exports = {
+    functions: Map::new().insert(b"m.gz", false),
+    declarations: Map::new().insert(b"m.gz", true),
+  };
   assert(exported(exports, closure_entry(b"m.gz", true, b"\x02", [])));
   assert(!exported(exports, closure_entry(b"m.gz", false, b"\x03", [])));
   assert(exported(exports, closure_entry(b"abort", true, b"\x07", [])))

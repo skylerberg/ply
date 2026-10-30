@@ -17,10 +17,10 @@ import compiler.load (analyse_in_memory, fresh_check_results, deriving_nothing, 
 import results
 import store.tables
 import store.fake (run_in_memory)
-import compiler.check.infer.checker (DefInfo)
-import compiler.check.resolve.tables (Diag, Label, Source)
+import compiler.check.infer.checker (DefinitionInfo)
+import compiler.check.resolve.tables (Diagnostic, Label, Source)
 import compiler.check.types
-import diagnostic (RuntimeDiagnostic, diag_of, with_notes)
+import diagnostic (RuntimeDiagnostic, diagnostic_of, with_notes)
 import mutants (MutantVerdict, Queue, mutant_unit, coverage, mutants, mutation_queue)
 import program (TimedLoad)
 import std.json (Bool)
@@ -220,11 +220,11 @@ fn spanned(span: { module: Int, start: Int, end: Int }, said: String) -> Label =
 
 fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abort.raise} =
   match search::run_failure(fl) {
-    Some(fell) -> { ..fell.failure, diag: with_notes(fell.failure.diag, fl.notes) },
+    Some(fell) -> { ..fell.failure, diagnostic: with_notes(fell.failure.diagnostic, fl.notes) },
     None -> {
       let d = match fl.cause {
         Diverged(x) ->
-          diag_of(
+          diagnostic_of(
             "error",
             "E0415",
             "replaying seed " ++ plan::seed_text(x.seed)
@@ -237,27 +237,28 @@ fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abor
             ],
           ),
         InvalidRecording(x) ->
-          diag_of(
+          diagnostic_of(
             "error",
             "E0505",
             "the scheduler recorded a step that does not describe a schedule",
             [spanned(x.span, "this step")],
             [x.what, reproduce(x.seed)],
           ),
-        _ -> diag_of("error", "E0505", "a search stopped at a failure it does not hold", [], []),
+        _ ->
+          diagnostic_of("error", "E0505", "a search stopped at a failure it does not hold", [], []),
       };
-      { diag: with_notes(d, fl.notes), values: [] }
+      { diagnostic: with_notes(d, fl.notes), values: [] }
     },
   }
 
 pub fn hashes_of(analysis: CheckedProgram, era: Bytes) -> Hashes / {abort.raise} =
   {
-    defs: by_name(analysis.frame.hashes.defs),
-    decls: by_name(analysis.frame.hashes.decls),
+    definitions: by_name(analysis.frame.hashes.definitions),
+    declarations: by_name(analysis.frame.hashes.declarations),
     era: era,
     closure: |keys: List<Bytes>| {
       let reached = reach(analysis.frame.hashes, keys.map(|k: Bytes| ItemKeyed(k)));
-      { fns: reached.fns.keys(), decls: reached.decls.keys() }
+      { functions: reached.functions.keys(), declarations: reached.declarations.keys() }
     },
   }
 
@@ -282,7 +283,7 @@ pub fn conclude_tests(
     })
 
 pub fn seen_of(h: Hashes) -> Map<Bytes, Bool> / {result_cache.known} = {
-  let hashes = h.defs.values();
+  let hashes = h.definitions.values();
   let answers = result_cache.known(hashes);
   range(0, hashes.len()).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
     match ((hashes.at(i), answers.at(i))) {
@@ -416,9 +417,9 @@ fn failed_of(
     suspects: failed.suspects.map(|name: Bytes|
       {
         name: String::of_bytes_lossy(name),
-        hash: match h.defs.get(name) {
+        hash: match h.definitions.get(name) {
           Some(x) -> Some(x.hex_of()),
-          None -> match h.decls.get(name) { Some(x) -> Some(x.hex_of()), None -> None },
+          None -> match h.declarations.get(name) { Some(x) -> Some(x.hex_of()), None -> None },
         },
       }),
     unchanged: failed.suspects.len() == 0,
@@ -445,7 +446,7 @@ fn escapes_of(
   analysis: CheckedProgram,
   c: Conclusion<RuntimeDiagnostic>,
   done: Map<Int, JobResult>,
-) -> List<Diag> = {
+) -> List<Diagnostic> = {
   let unbound = |index: Int|
     match result_at(done, index) {
       Some(d) ->
@@ -456,11 +457,11 @@ fn escapes_of(
           }),
       None -> false,
     };
-  c.outcomes.fold([], |acc: List<Diag>, outcome: conclude::Outcome<RuntimeDiagnostic>| {
+  c.outcomes.fold([], |acc: List<Diagnostic>, outcome: conclude::Outcome<RuntimeDiagnostic>| {
     let wrote = match outcome.recorded { Some(rec) -> is_written(rec), None -> false };
     if !wrote || !unbound(outcome.index) { acc } else {
       acc.push(
-        diag_of(
+        diagnostic_of(
           "error",
           "E0505",
           "`"
@@ -481,10 +482,10 @@ fn escapes_of(
   })
 }
 
-fn notice_of(n: conclude::Notice) -> Diag =
+fn notice_of(n: conclude::Notice) -> Diagnostic =
   match n {
     StaleIndex(x) ->
-      diag_of(
+      diagnostic_of(
         "warning",
         "E0505",
         "a run named test " ++ x.index.to_string() ++ ", but the module defines "
@@ -493,7 +494,7 @@ fn notice_of(n: conclude::Notice) -> Diag =
         ["the choice was made against another program; the stale index was skipped"],
       ),
     UnobservedSearch(key) ->
-      diag_of(
+      diagnostic_of(
         "warning",
         "E0505",
         "`" ++ String::of_bytes_lossy(key)
@@ -516,14 +517,15 @@ pub fn run_report_of(
   c: Conclusion<RuntimeDiagnostic>,
   done: Map<Int, JobResult>,
   elapsed: Int,
-  said: List<Diag>,
+  said: List<Diagnostic>,
 ) -> RunReport / {abort.raise} = {
   let ordered = c.outcomes.fold(
     [],
     |acc: List<JobResult>, outcome: conclude::Outcome<RuntimeDiagnostic>|
       match result_at(done, outcome.index) { Some(d) -> acc.push(d), None -> acc },
   );
-  let teardown = ordered.fold([], |acc: List<Diag>, d: JobResult| acc.concat(d.usage.teardown));
+  let teardown = ordered.fold([], |acc: List<Diagnostic>, d: JobResult|
+    acc.concat(d.usage.teardown));
   let b = hosted.backend;
   {
     operations: hosted.operations,
@@ -569,12 +571,12 @@ pub fn mutated(
   report: RunReport,
   options: Options,
   search_options: SearchOptions,
-  targeted: Option<List<DefInfo>>,
+  targeted: Option<List<DefinitionInfo>>,
 ) -> RunReport / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.report_reached} =
   match targeted {
     None -> report,
-    Some(defs) -> if !green_run(report) { report } else {
-      let queue = mutation_queue(timed.program.places, analysis, defs);
+    Some(definitions) -> if !green_run(report) { report } else {
+      let queue = mutation_queue(timed.program.places, analysis, definitions);
       let every = all_classes(program, options);
       let judged = range(0, min(options.mutate_budget, queue.mutants.len())).map(|id: Int|
         mutant_verdict(timed, analysis, program, queue, id, every, search_options));
@@ -797,7 +799,7 @@ pub fn store_history(
 ) -> Unit / {result_cache.unstored, result_cache.history, abort.raise} =
   if filing.records.len() == 0 { () } else {
     let unfiled = result_cache.unstored(
-      filing.reached.fns.concat(filing.reached.decls).concat(
+      filing.reached.functions.concat(filing.reached.declarations).concat(
         filing.records.map(|e: { key: Bytes, record: conclude::PassRecord }| e.record.test),
       ),
     );
@@ -946,7 +948,10 @@ fn store_passing(
 
 test "a test's outcome as its group finishes carries what it raised" {
   let view = loaded_from([{ path: "p/m.ply", body: b"test \"red\" { assert_eq(1, 2) }\n" }]).whole;
-  let raised = { diag: diag_of("error", "E0501", "assertion failed", [], []), values: [] };
+  let raised = {
+    diagnostic: diagnostic_of("error", "E0501", "assertion failed", [], []),
+    values: [],
+  };
   let failed = {
     test: 0,
     status: "failed",

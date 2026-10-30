@@ -1,4 +1,4 @@
-import compiler.syntax.exprs (TaggedPart)
+import compiler.syntax.expressions (TaggedPart)
 import compiler.front.facts (CheckedProgram, Frame, TaggedSite)
 import compiler.front.seam (TestRunScope)
 import compiler.store.hash.forms (FunctionNamed, reach)
@@ -8,10 +8,10 @@ import compiler.syntax.lexer (utf8_len)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.emit.keys (RootKey, Named)
 import compiler.syntax.parsing (Span, span_between)
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import compiler.unit (shipped, shipped_runtime, compiler_roots, entered_timeout_ms, identity_of)
 import compiler.store.records (Record, record_store, with_record_store)
-import diagnostic (SourceText, diag_of, shown)
+import diagnostic (SourceText, diagnostic_of, shown)
 import compiler.cc
 import compiler.cc (toolchain)
 import machine
@@ -44,8 +44,8 @@ derive bin for Verdict
 pub type EvaluationRequest = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 
 pub effect evaluation {
-  read verdicts(timed: TimedLoad, frame: Frame, asked: List<EvaluationRequest>) -> Result<List<Verdict>, List<Diag>>
-  read statements(timed: TimedLoad, frame: Frame, asked: List<statements::StatementCheck>) -> Result<List<CheckResult>, List<Diag>>
+  read verdicts(timed: TimedLoad, frame: Frame, asked: List<EvaluationRequest>) -> Result<List<Verdict>, List<Diagnostic>>
+  read statements(timed: TimedLoad, frame: Frame, asked: List<statements::StatementCheck>) -> Result<List<CheckResult>, List<Diagnostic>>
 }
 
 fn request_of(site: TaggedSite) -> EvaluationRequest =
@@ -147,7 +147,7 @@ fn literal_error(
   places: List<SourceText>,
   site: TaggedSite,
   verdict: Verdict,
-) -> Option<Diag> / {abort.raise} =
+) -> Option<Diagnostic> / {abort.raise} =
   match verdict {
     Accepted -> None,
     Rejected(why) -> {
@@ -202,21 +202,21 @@ fn time_given(whose: Bytes) -> Bytes =
 pub fn evaluation_errors(
   timed: TimedLoad,
   frame: Frame,
-) -> List<Diag> / {evaluation.verdicts, evaluation.statements, abort.raise} =
+) -> List<Diagnostic> / {evaluation.verdicts, evaluation.statements, abort.raise} =
   literal_errors(timed, frame).concat(statement_errors(timed, frame))
 
 fn statement_errors(
   timed: TimedLoad,
   frame: Frame,
-) -> List<Diag> / {evaluation.statements, abort.raise} =
+) -> List<Diagnostic> / {evaluation.statements, abort.raise} =
   if !runs_statements(timed.program, frame) { [] } else {
     let asks = check_sites(frame).filter(|a: CheckSite| a.site.module < timed.program.files.len());
     let refused = schemas_refused(asks);
     if asks.len() == 0 { refused } else {
       match evaluation.statements(timed, frame, asks.map(|a: CheckSite| a.asked)) {
-        Err(diags) -> refused.concat(diags),
+        Err(diagnostics) -> refused.concat(diagnostics),
         Ok(judgements) ->
-          range(0, asks.len()).fold(refused, |acc: List<Diag>, i: Int|
+          range(0, asks.len()).fold(refused, |acc: List<Diagnostic>, i: Int|
             match judgements.at(i) { Some(j) -> acc.concat(misfits(asks.get(i), j)), None -> acc }),
       }
     }
@@ -225,18 +225,18 @@ fn statement_errors(
 fn literal_errors(
   timed: TimedLoad,
   frame: Frame,
-) -> List<Diag> / {evaluation.verdicts, abort.raise} = {
+) -> List<Diagnostic> / {evaluation.verdicts, abort.raise} = {
   let sites = frame.tagged.filter(|site: TaggedSite| site.module < timed.program.files.len());
   if sites.len() == 0 { [] } else {
     let parsers = distinct_requests(sites);
     match evaluation.verdicts(timed, frame, parsers) {
-      Err(diags) -> diags,
+      Err(diagnostics) -> diagnostics,
       Ok(verdicts) ->
-        sites.fold([], |acc: List<Diag>, site: TaggedSite|
+        sites.fold([], |acc: List<Diagnostic>, site: TaggedSite|
           match verdict_for(parsers, verdicts, site) {
             None -> acc,
             Some(verdict) -> match literal_error(timed.program.places, site, verdict) {
-              Some(diag) -> acc.push(diag),
+              Some(diagnostic) -> acc.push(diagnostic),
               None -> acc,
             },
           }),
@@ -247,9 +247,9 @@ fn literal_errors(
 fn verdict_of(called: CallResult) -> Verdict / {abort.raise} =
   match called.result {
     Err(raised) -> {
-      let diag = shown(raised);
-      if machine::is_abandoned(diag.code) { Abandoned }
-      else { Raised(String::of_bytes_lossy(diag.message)) }
+      let diagnostic = shown(raised);
+      if machine::is_abandoned(diagnostic.code) { Abandoned }
+      else { Raised(String::of_bytes_lossy(diagnostic.message)) }
     },
     Ok(value) -> match value {
       VCtor(name, args) -> if name == "Ok" { Accepted } else {
@@ -279,7 +279,10 @@ fn argument_of(a: EvaluationRequest) -> Value = {
 }
 
 fn entering(frame: Frame, names: List<Bytes>) -> TestRunScope / {abort.raise} =
-  { owners: reach(frame.hashes, names.map(|n: Bytes| FunctionNamed(n))).fns, tests: Map::new() }
+  {
+    owners: reach(frame.hashes, names.map(|n: Bytes| FunctionNamed(n))).functions,
+    tests: Map::new(),
+  }
 
 fn callees(asked: List<EvaluationRequest>) -> List<Bytes> =
   asked.fold([], |acc: List<Bytes>, a: EvaluationRequest|
@@ -289,14 +292,14 @@ fn evaluate(
   front: LoadedAnalysis,
   frame: Frame,
   asked: List<EvaluationRequest>,
-) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
+) -> Result<List<Verdict>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
   if asked.len() == 0 { Ok([]) } else {
     let names = callees(asked);
-    let reached = reach(frame.hashes, names.map(|n: Bytes| FunctionNamed(n))).fns;
+    let reached = reach(frame.hashes, names.map(|n: Bytes| FunctionNamed(n))).functions;
     let offered = every_root(front).filter(|k: RootKey|
       match k { Named(d) -> reached.contains(d), _ -> false });
     match units::library_over(emit.unit(front, offered), cc::development()) {
-      Err(diags) -> Err(diags),
+      Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(why) -> Err([machine::unit_load_error(why)]),
         Ok(opened) -> {
@@ -389,7 +392,7 @@ pub fn with_evaluation_cache<a | e>(
         let open = sought.filter(|s: KeyedRequest| s.kept == None);
         if open.len() == 0 { Ok(merge_verdicts(sought, [])) } else {
           match program_view(timed.program) {
-            None -> Err(timed.program.diags),
+            None -> Err(timed.program.diagnostics),
             Some(view) -> evaluate_and_cache(timed, view, sought, open),
           }
         }
@@ -405,11 +408,11 @@ fn evaluate_and_cache(
   view: CheckedProgram,
   sought: List<KeyedRequest>,
   open: List<KeyedRequest>,
-) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.put[lit], abort.raise} = {
+) -> Result<List<Verdict>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.put[lit], abort.raise} = {
   let asked = open.map(|s: KeyedRequest| s.asked);
   let front = loaded_analysis(timed, view, Some(entering(view.frame, callees(asked))));
   match evaluate(front, view.frame, asked) {
-    Err(diags) -> Err(diags),
+    Err(diagnostics) -> Err(diagnostics),
     Ok(found) -> {
       record_store.put[lit](
         range(0, open.len()).fold([], |acc: List<Record>, i: Int|
@@ -434,7 +437,7 @@ fn judgements(
   timed: TimedLoad,
   frame: Frame,
   asked: List<statements::StatementCheck>,
-) -> Result<List<CheckResult>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.get[lit], record_store.put[lit], abort.raise} = {
+) -> Result<List<CheckResult>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.get[lit], record_store.put[lit], abort.raise} = {
   let keyed = asked.map(|a: statements::StatementCheck| {
     let key = check_result_key(toolchain, a);
     {
@@ -454,7 +457,7 @@ fn judgements(
     Ok(keyed.map(|k: KeyedStatement| match k.kept { Some(j) -> j, None -> Unchecked }))
   } else {
     match match program_view(timed.program) {
-        None -> Err(timed.program.diags),
+        None -> Err(timed.program.diagnostics),
         Some(view) ->
           check_statements(
             |within: TestRunScope| loaded_analysis(timed, view, Some(within)),
@@ -462,7 +465,7 @@ fn judgements(
             open.map(|k: KeyedStatement| k.asked),
           ),
       } {
-      Err(diags) -> Err(diags),
+      Err(diagnostics) -> Err(diagnostics),
       Ok(found) -> {
         record_store.put[lit](
           range(0, open.len()).fold([], |acc: List<Record>, i: Int|
@@ -537,7 +540,7 @@ test "a parser's answer is read as its verdict, and the clock stopping it is tol
   let answered = |v: Value| verdict_of({ result: Ok(v), warnings: [] });
   let failed = |code: String|
     verdict_of({
-      result: Err({ diag: diag_of("error", code, "m", [], []), values: [] }),
+      result: Err({ diagnostic: diagnostic_of("error", code, "m", [], []), values: [] }),
       warnings: [],
     });
   assert_eq(failed("W0612"), Abandoned);

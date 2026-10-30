@@ -15,7 +15,7 @@ import std.bin
 import std.random (entropy)
 import std.time (time)
 import compiler.expand.embed (EmbedResult, EmbedBytesResult, EmbedRequest, with_digests)
-import compiler.check.resolve.tables (Source, Diag, Label, error_at)
+import compiler.check.resolve.tables (Source, Diagnostic, Label, error_at)
 import builder (builder)
 import compiler.cc (toolchain)
 import compiler.load (embedded_below, is_ply)
@@ -28,28 +28,37 @@ import compiler.syntax.parsing (no_module, Span, dummy_span, span_between)
 
 pub type File = { path: String, module: String, text: Bytes, at: RootedPath }
 
-pub type DepPackage = { root: String, dir: String, manifest: Option<Bytes>, files: List<File> }
+pub type DependencyPackage = {
+  root: String,
+  dir: String,
+  manifest: Option<Bytes>,
+  files: List<File>,
+}
 
 pub type VendoredPackage = { want: String, dir: String }
 
 pub type Project = {
   files: List<File>,
   sources: List<Source>,
-  diags: List<Diag>,
+  diagnostics: List<Diagnostic>,
   manifest: Option<File>,
-  packages: List<DepPackage>,
+  packages: List<DependencyPackage>,
   root_key: String,
 }
 
 pub type Embed = { embedded: EmbedRecord, file: RootedPath }
 
-pub fn unlocated_error(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
-  error_at(code, no_module(), dummy_span(), Bytes::of_string(message), label, notes)
+pub fn unlocated_error(
+  code: Bytes,
+  message: String,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Diagnostic = error_at(code, no_module(), dummy_span(), Bytes::of_string(message), label, notes)
 
-fn at_file(code: Bytes, m: Int, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
+fn at_file(code: Bytes, m: Int, message: String, label: Bytes, notes: List<Bytes>) -> Diagnostic =
   error_at(code, m, dummy_span(), Bytes::of_string(message), label, notes)
 
-fn unaddressable(m: Int, path: String, why: String) -> Diag =
+fn unaddressable(m: Int, path: String, why: String) -> Diagnostic =
   at_file(
     b"E0111",
     m,
@@ -58,18 +67,18 @@ fn unaddressable(m: Int, path: String, why: String) -> Diag =
     [b"rename it so every directory and the file stem is a plain identifier"],
   )
 
-fn unreadable(path: String) -> Diag =
+fn unreadable(path: String) -> Diagnostic =
   unlocated_error(b"E0502", "could not read `" ++ path ++ "`", b"this path could not be loaded", [
     b"pass a `.ply` file or a directory containing one",
   ])
 
-pub fn no_ply_files(path: String) -> Diag =
+pub fn no_ply_files(path: String) -> Diagnostic =
   unlocated_error(b"E0502", "no `.ply` files under `" ++ path ++ "`", b"nothing to compile", [
     b"name a `.ply` file, or a directory that contains one",
     b"directories whose name starts with `.` are not searched",
   ])
 
-pub fn no_package(pwd: String) -> Diag =
+pub fn no_package(pwd: String) -> Diagnostic =
   unlocated_error(
     b"E0502",
     "no `ply.pkg` in `" ++ pwd ++ "` or any directory above it",
@@ -80,8 +89,8 @@ pub fn no_package(pwd: String) -> Diag =
     ],
   )
 
-fn refused_file(project: Project, file: File, diag: Diag) -> Project =
-  { ..project, files: project.files.push(file), diags: project.diags.push(diag) }
+fn refused_file(project: Project, file: File, diagnostic: Diagnostic) -> Project =
+  { ..project, files: project.files.push(file), diagnostics: project.diagnostics.push(diagnostic) }
 
 fn with_module(
   project: Project,
@@ -116,7 +125,7 @@ fn one_file(
   rooted: RootedPath,
 ) -> Project / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match read_file(rooted) {
-    None -> { ..project, diags: project.diags.push(unreadable(displayed(rooted))) },
+    None -> { ..project, diagnostics: project.diagnostics.push(unreadable(displayed(rooted))) },
     Some(text) -> {
       let display = match paths::strip_prefix(rooted.path, strip) {
         Some(rest) -> if rest == "" { rooted.path } else { rest },
@@ -127,7 +136,7 @@ fn one_file(
   }
 
 fn empty() -> Project =
-  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "" }
+  { files: [], sources: [], diagnostics: [], manifest: None, packages: [], root_key: "" }
 
 fn read(
   found: WalkResult,
@@ -137,10 +146,12 @@ fn read(
   let filed: Project = found.files.values().fold(empty(), |acc: Project, rooted: RootedPath|
     one_file(strip, part, acc, rooted));
   found.errors.fold(filed, |acc: Project, e: Failure|
-    { ..acc, diags: acc.diags.push(unreadable(e.path)) })
+    { ..acc, diagnostics: acc.diagnostics.push(unreadable(e.path)) })
 }
 
-fn named_path_errors(resolved: paths::ResolvedPath) -> List<Diag> / {fs.kind[cwd], fs.kind[abs]} = {
+fn named_path_errors(
+  resolved: paths::ResolvedPath,
+) -> List<Diagnostic> / {fs.kind[cwd], fs.kind[abs]} = {
   let at = paths::rooted(resolved);
   match paths::kind(at) {
     fs::Missing -> [unreadable(displayed(at))],
@@ -155,9 +166,13 @@ fn load_path(
   let own = read(walk_for_load(nothing(), resolved), paths::root_prefix(resolved), resolved.part);
   match with_manifest(resolved, empty()).manifest {
     None -> if resolved.part == "" { own }
-    else { { ..own, diags: own.diags.concat(named_path_errors(resolved)) } },
+    else { { ..own, diagnostics: own.diagnostics.concat(named_path_errors(resolved)) } },
     Some(manifest) ->
-      { ..own, manifest: Some(manifest), diags: own.diags.concat(named_path_errors(resolved)) },
+      {
+        ..own,
+        manifest: Some(manifest),
+        diagnostics: own.diagnostics.concat(named_path_errors(resolved)),
+      },
   }
 }
 
@@ -172,7 +187,10 @@ pub fn load_resolved(
       if acc.packages.contains(root) {
         {
           ..acc,
-          project: { ..acc.project, diags: acc.project.diags.concat(named_path_errors(resolved)) },
+          project: {
+            ..acc.project,
+            diagnostics: acc.project.diagnostics.concat(named_path_errors(resolved)),
+          },
         }
       } else {
         let one = load_path(resolved);
@@ -240,7 +258,7 @@ pub fn embeds_parsed(
 ) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   project.packages.fold(
     read_embeds(Bytes::of_string(project.root_key), project.files),
-    |acc: List<Embed>, package: DepPackage|
+    |acc: List<Embed>, package: DependencyPackage|
       acc.concat(read_embeds(Bytes::of_string(package.root), package.files)),
   )
 
@@ -313,7 +331,7 @@ fn read_dir(
   }
 }
 
-fn read_dep_modules(
+fn read_dependency_modules(
   root: String,
 ) -> List<File> / {fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let swept = at_abs(root);
@@ -333,14 +351,15 @@ fn read_dep_modules(
 
 fn at_abs(path: String) -> RootedPath / {abort.raise} = { label: "abs", path: strip_root(path) }
 
-fn read_dep(
+fn read_dependency(
   root: Bytes,
   dir: String,
-) -> DepPackage / {fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+) -> DependencyPackage / {fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let here = String::of_bytes_lossy(root);
   match read_file(at_abs(join(dir, "ply.pkg"))) {
     None -> { root: here, dir: dir, manifest: None, files: [] },
-    Some(text) -> { root: here, dir: dir, manifest: Some(text), files: read_dep_modules(dir) },
+    Some(text) ->
+      { root: here, dir: dir, manifest: Some(text), files: read_dependency_modules(dir) },
   }
 }
 
@@ -374,18 +393,18 @@ fn walk_round(
   vendored: List<VendoredPackage>,
   known: List<Bytes>,
   manifests: List<SuppliedPackage>,
-  supplied: List<DepPackage>,
-) -> List<DepPackage> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} =
+  supplied: List<DependencyPackage>,
+) -> List<DependencyPackage> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} =
   match roots_wanted(known, manifests) {
     [] -> supplied,
     wanted -> {
       let next = wanted.fold(
         { known: known, manifests: manifests, supplied: supplied },
-        |acc: { known: List<Bytes>, manifests: List<SuppliedPackage>, supplied: List<DepPackage> }, want: Bytes| {
+        |acc: { known: List<Bytes>, manifests: List<SuppliedPackage>, supplied: List<DependencyPackage> }, want: Bytes| {
           match dependency_dir(root, vendored, want) {
             None -> { ..acc, known: acc.known.push(want) },
             Some(tree) -> {
-              let package = read_dep(want, tree);
+              let package = read_dependency(want, tree);
               {
                 known: acc.known.push(want),
                 manifests: acc.manifests.push({
@@ -406,7 +425,7 @@ fn walk_round(
 fn walk_packages(
   root: String,
   manifest: Option<File>,
-) -> List<DepPackage> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+) -> List<DependencyPackage> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
   let root_key = Bytes::of_string(root);
   walk_round(
     root,
@@ -459,20 +478,25 @@ fn merge(a: Project, b: Project) -> Project = {
   {
     files: files,
     sources: sources,
-    diags: b.diags.fold(a.diags, |acc: List<Diag>, diag: Diag| acc.push(diag)),
+    diagnostics: b.diagnostics.fold(
+      a.diagnostics,
+      |acc: List<Diagnostic>, diagnostic: Diagnostic| acc.push(diagnostic),
+    ),
     manifest: match a.manifest { Some(_) -> a.manifest, None -> b.manifest },
-    packages: b.packages.fold(a.packages, |acc: List<DepPackage>, package: DepPackage|
-      acc.push(package)),
+    packages: b.packages.fold(
+      a.packages,
+      |acc: List<DependencyPackage>, package: DependencyPackage| acc.push(package),
+    ),
     root_key: if a.root_key == "" { b.root_key } else { a.root_key },
   }
 }
 
 pub fn stem(name: String) -> String / {abort.raise} = name.slice(0, name.len() - 4)
 
-pub fn shipped_digest_of(srcs: List<Source>, data: List<ShippedData>) -> String / {abort.raise} = {
+pub fn shipped_digest_of(sources: List<Source>, data: List<ShippedData>) -> String / {abort.raise} = {
   let part = |name: Bytes, bytes: Bytes|
     Bytes::concat_all([u64_le(String::of_bytes_lossy(name).len()), name, blake3(bytes)]);
-  let parts = srcs.filter(|src: Source| is_std(src.name)).map(|src: Source|
+  let parts = sources.filter(|src: Source| is_std(src.name)).map(|src: Source|
     part(src.name, src.src)).concat(
     data.map(|d: ShippedData| part(d.name, d.bytes)),
   );
@@ -493,12 +517,12 @@ pub fn shipped_text(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
 
 pub fn shipping_for(
   user: List<Source>,
-  pkgs: PackageSources,
+  packages: PackageSources,
 ) -> ShippedInputs / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let listed = shipped_names();
   shipped_inputs_of(
     user,
-    pkgs,
+    packages,
     listed,
     |name: Bytes| match shipped_text(name) { Some(text) -> Some(imported(text)), None -> None },
     |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
@@ -660,11 +684,11 @@ test "a file that cannot be a module is refused and does not reach the front end
     fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
   assert_eq(p.sources.len(), 1);
-  assert_eq(p.diags.len(), 1);
-  assert_eq(match p.diags.at(0) { Some(d) -> d.code, None -> b"" }, b"E0111");
+  assert_eq(p.diagnostics.len(), 1);
+  assert_eq(match p.diagnostics.at(0) { Some(d) -> d.code, None -> b"" }, b"E0111");
   assert_eq(p.files.map(|file: File| file.path), ["m.ply", "my-file.ply"]);
   assert_eq(
-    match p.diags.at(0) { Some(d) -> d.labels.map(|label: Label| label.module), None -> [] },
+    match p.diagnostics.at(0) { Some(d) -> d.labels.map(|label: Label| label.module), None -> [] },
     [1],
   )
 }
@@ -676,7 +700,7 @@ test "a project file under the compiler root walks on to the front end's collisi
     fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
     fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
-  assert_eq(p.diags.len(), 0);
+  assert_eq(p.diagnostics.len(), 0);
   assert_eq(match p.sources.at(0) { Some(s) -> s.name, None -> b"" }, b"compiler.fmt")
 }
 
@@ -687,7 +711,7 @@ test "a project file under std walks on to the front end's collision" {
     fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
     fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
-  assert_eq(p.diags.len(), 0);
+  assert_eq(p.diagnostics.len(), 0);
   assert_eq(match p.sources.at(0) { Some(s) -> s.name, None -> b"" }, b"std.json")
 }
 
@@ -698,7 +722,7 @@ test "a part of the toolchain's library names its files under its prefix, as the
     fs.read_file[cwd](path) -> Some(b"pub fn f() -> Int = 1\n"),
     fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
   };
-  assert_eq(p.diags.len(), 0);
+  assert_eq(p.diagnostics.len(), 0);
   assert_eq(p.sources.map(|s: Source| s.name).sort(), [b"std.hash.legacy", b"std.json"]);
   assert_eq(p.files.map(|file: File| file.path).sort(), ["hash/legacy.ply", "json.ply"])
 }
@@ -719,7 +743,7 @@ test "a file found outside the working directory is read there, named below its 
       Some(b"fn f() -> Int = 1\n")
     } else { None },
   };
-  assert_eq(p.diags.len(), 0);
+  assert_eq(p.diagnostics.len(), 0);
   assert_eq(p.files.map(|file: File| file.path), ["store/orders.ply"]);
   assert_eq(p.files.map(|file: File| file.at), [
     { label: "abs", path: "srv/app/store/orders.ply" },
@@ -859,7 +883,7 @@ test "a project's load reads no shipped test or law, nor what only they reach" {
   assert(says(b"fn bump(x: Int) -> Int = x + 1"));
   assert(!says(b"std.laws") && !says(b"twice") && !says(b"test") && !says(b"law"));
   let parsed = parse(load.text);
-  assert_eq(parsed.parser.diags.len(), 0);
+  assert_eq(parsed.parser.diagnostics.len(), 0);
   assert_eq(parsed.node.items.len(), 2)
 }
 
@@ -892,14 +916,14 @@ test "a load reads the data file a shipped module it pulls embeds, under its nam
 }
 
 test "the digest of the shipped modules covers the data files they embed" {
-  let srcs = [{ name: b"std.words", src: embedding_words() }];
+  let sources = [{ name: b"std.words", src: embedding_words() }];
   let over = |bytes: Bytes|
-    shipped_digest_of(srcs, [{ name: b"std/words/list.txt", bytes: bytes }]);
+    shipped_digest_of(sources, [{ name: b"std/words/list.txt", bytes: bytes }]);
   assert_eq(over(b"one\n"), over(b"one\n"));
   assert(over(b"one\n") != over(b"two\n"));
-  assert(over(b"one\n") != shipped_digest_of(srcs, []));
+  assert(over(b"one\n") != shipped_digest_of(sources, []));
   let held = handle {
-    shipped_data(srcs.concat(srcs))
+    shipped_data(sources.concat(sources))
   } with {
     fs.read_file[shipped](p) -> if p == "std/words/list.txt" { Some(b"one\n") } else { None },
   };

@@ -500,8 +500,8 @@ fn value_body(v: AnyValue) -> Bytes / {abort.raise} =
     NoValue -> b"",
   }
 
-fn key_value_body(kv: KeyValue) -> Bytes / {abort.raise} =
-  string_if_set(1, kv.key).concat(match kv.value {
+fn key_value_body(key_value: KeyValue) -> Bytes / {abort.raise} =
+  string_if_set(1, key_value.key).concat(match key_value.value {
     NoValue -> b"",
     held -> protobuf::message_field(2, value_body(held)),
   })
@@ -723,11 +723,11 @@ fn key_values_in(m: Message, int_if_set: Int, depth_left: Int) -> List<KeyValue>
 
 fn key_value_of(m: Message, depth_left: Int) -> KeyValue / {Reading} = {
   let start: KeyValue = { key: "", value: NoValue };
-  protobuf::fields(m).fold(start, |kv: KeyValue, f: Field|
+  protobuf::fields(m).fold(start, |key_value: KeyValue, f: Field|
     match f.number {
-      1 -> { ..kv, key: protobuf::string_of(f) },
-      2 -> { ..kv, value: value_of(protobuf::message_of(f), depth_left) },
-      _ -> kv,
+      1 -> { ..key_value, key: protobuf::string_of(f) },
+      2 -> { ..key_value, value: value_of(protobuf::message_of(f), depth_left) },
+      _ -> key_value,
     })
 }
 
@@ -1212,10 +1212,10 @@ fn value_json(v: AnyValue) -> Json / {abort.raise} =
     NoValue -> json::object([]),
   }
 
-fn key_value_json(kv: KeyValue) -> Json / {abort.raise} =
+fn key_value_json(key_value: KeyValue) -> Json / {abort.raise} =
   object([
-    { key: "key", value: text_json(kv.key) },
-    { key: "value", value: match kv.value { NoValue -> Null, held -> value_json(held) } },
+    { key: "key", value: text_json(key_value.key) },
+    { key: "value", value: match key_value.value { NoValue -> Null, held -> value_json(held) } },
   ])
 
 fn attributes_json(kvs: List<KeyValue>) -> Json / {abort.raise} = list_json(kvs.map(key_value_json))
@@ -1581,10 +1581,13 @@ fn key_values_of_json(
   depth_left: Int,
 ) -> List<KeyValue> / {otlp.fail, abort.raise} =
   items_in(o, name).map(|j: Json| -> KeyValue {
-    let kv = members_of(j, name);
+    let key_value = members_of(j, name);
     {
-      key: text_in(kv, "key"),
-      value: match member(kv, "value") { Some(v) -> value_of_json(v, depth_left), None -> NoValue },
+      key: text_in(key_value, "key"),
+      value: match member(key_value, "value") {
+        Some(v) -> value_of_json(v, depth_left),
+        None -> NoValue,
+      },
     }
   })
 
@@ -2044,8 +2047,8 @@ fn finished(o: OpenSpan, outcome: trace::Outcome, at: U64) -> EndedSpan / {abort
 fn is_sampled(o: OpenSpan) -> Bool = traceparent::sampled(o.who.context.parent)
 
 /// `s` with `done` waiting to be sent, or counted as dropped when the queue is full.
-fn queued(s: State, cfg: Config, done: EndedSpan, now_ms: Int) -> State =
-  if s.queue.len() >= max(cfg.queue, 1) {
+fn queued(s: State, config: Config, done: EndedSpan, now_ms: Int) -> State =
+  if s.queue.len() >= max(config.queue, 1) {
     { ..s, stats: { ..s.stats, dropped: s.stats.dropped + 1 } }
   } else {
     {
@@ -2061,7 +2064,7 @@ type Sweep = { closing: List<SpanId>, kept: List<OpenSpan>, state: State }
 /// open closed as abandoned, as `trace.exit` documents.
 fn closed(
   s: State,
-  cfg: Config,
+  config: Config,
   span: trace::Span,
   outcome: trace::Outcome,
   at: U64,
@@ -2073,12 +2076,12 @@ fn closed(
       let start: Sweep = { closing: [target.who.context.parent.parent_id], kept: [], state: s };
       let swept = s.open.reverse().fold(start, |acc: Sweep, o: OpenSpan| -> Sweep {
         let under = match o.who.parent { Some(p) -> acc.closing.contains(p), None -> false };
-        if o.id == target.id { { ..acc, state: ended(acc.state, cfg, o, outcome, at, now_ms) } }
+        if o.id == target.id { { ..acc, state: ended(acc.state, config, o, outcome, at, now_ms) } }
         else if under {
           {
             closing: acc.closing.push(o.who.context.parent.parent_id),
             kept: acc.kept,
-            state: ended(acc.state, cfg, o, trace::Abandoned, at, now_ms),
+            state: ended(acc.state, config, o, trace::Abandoned, at, now_ms),
           }
         } else { { ..acc, kept: acc.kept.push(o) } }
       });
@@ -2088,13 +2091,13 @@ fn closed(
 
 fn ended(
   s: State,
-  cfg: Config,
+  config: Config,
   o: OpenSpan,
   outcome: trace::Outcome,
   at: U64,
   now_ms: Int,
 ) -> State / {abort.raise} =
-  if is_sampled(o) { queued(s, cfg, finished(o, outcome, at), now_ms) }
+  if is_sampled(o) { queued(s, config, finished(o, outcome, at), now_ms) }
   else { { ..s, stats: { ..s.stats, unsampled: s.stats.unsampled + 1 } } }
 
 fn annotated(s: State, span: SpanId, fields: Fields) -> State =
@@ -2109,7 +2112,7 @@ fn annotated(s: State, span: SpanId, fields: Fields) -> State =
 /// current value. A label set past the metric's `max_series` is counted and not stored.
 fn update_series(
   s: State,
-  cfg: Config,
+  config: Config,
   channel: String,
   kind: String,
   name: String,
@@ -2123,7 +2126,7 @@ fn update_series(
       { ..s, dirty: true, series: s.series.insert(key, { ..held, value: step(Some(held.value)) }) },
     None -> {
       let width = match s.widths.get(metric) { Some(n) -> n, None -> 0 };
-      if width >= max(cfg.max_series, 1) {
+      if width >= max(config.max_series, 1) {
         { ..s, stats: { ..s.stats, series_dropped: s.stats.series_dropped + 1 } }
       } else {
         {
@@ -2164,7 +2167,7 @@ fn u64_of_int(n: Int) -> U64 =
   match try[abort.raise] { U64::of_int(max(n, 0)) } { Ok(w) -> w, Err(_) -> 0u64 }
 
 /// One series as a metric containing its single point.
-fn metric_of_series(cfg: Config, held: Series, started: U64, at: U64) -> Metric / {abort.raise} = {
+fn metric_of_series(config: Config, held: Series, started: U64, at: U64) -> Metric / {abort.raise} = {
   let attributes = attributes_of(held.fields);
   match held.value {
     Count(total, rising) ->
@@ -2199,7 +2202,7 @@ fn metric_of_series(cfg: Config, held: Series, started: U64, at: U64) -> Metric 
               count: u64_of_int(counts.fold(0, |n: Int, c: Int| n + c)),
               sum: Some(sum),
               bucket_counts: counts.map(u64_of_int),
-              explicit_bounds: cfg.bounds,
+              explicit_bounds: config.bounds,
               min: Some(least),
               max: Some(greatest),
             },
@@ -2237,13 +2240,13 @@ fn with_scoped(scopes: List<ScopeMetrics>, channel: String, m: Metric) -> List<S
   }
 
 /// Every series as a request: a scope for each channel, a metric for each name and kind.
-fn metrics_request(cfg: Config, s: State, at: U64) -> Metrics / {abort.raise} =
+fn metrics_request(config: Config, s: State, at: U64) -> Metrics / {abort.raise} =
   {
     resource_metrics: [
       {
-        resource: cfg.resource,
+        resource: config.resource,
         scope_metrics: s.series.values().fold([], |scopes: List<ScopeMetrics>, held: Series|
-          with_scoped(scopes, held.channel, metric_of_series(cfg, held, s.started, at))),
+          with_scoped(scopes, held.channel, metric_of_series(config, held, s.started, at))),
         schema_url: "",
       },
     ],
@@ -2251,11 +2254,11 @@ fn metrics_request(cfg: Config, s: State, at: U64) -> Metrics / {abort.raise} =
 
 /// Finished spans as a request: a scope for each channel, in the order the channels first
 /// appear.
-fn traces_request(cfg: Config, batch: List<EndedSpan>) -> Traces =
+fn traces_request(config: Config, batch: List<EndedSpan>) -> Traces =
   {
     resource_spans: [
       {
-        resource: cfg.resource,
+        resource: config.resource,
         scope_spans: batch.fold(
           [],
           |scopes: List<ScopeSpans>, done: EndedSpan| -> List<ScopeSpans> {
@@ -2273,8 +2276,8 @@ fn traces_request(cfg: Config, batch: List<EndedSpan>) -> Traces =
     ],
   }
 
-fn compressed(cfg: Config, body: Bytes) -> Bytes / {abort.raise} =
-  if cfg.gzip { gzip::gzip(body) } else { body }
+fn compressed(config: Config, body: Bytes) -> Bytes / {abort.raise} =
+  if config.gzip { gzip::gzip(body) } else { body }
 
 type Plan = { state: State, send: Option<Outbound>, wait_ms: Int }
 
@@ -2282,7 +2285,7 @@ type Plan = { state: State, send: Option<Outbound>, wait_ms: Int }
 /// has passed. Otherwise, a batch of spans, if enough are waiting or the oldest has waited long
 /// enough. Otherwise, the metrics, if one changed and their interval has passed. `force` means a
 /// flush: everything waiting is due, and a request waiting on its backoff is sent after it.
-fn planned(s: State, cfg: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {abort.raise} =
+fn planned(s: State, config: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {abort.raise} =
   if s.busy { { state: s, send: None, wait_ms: 0 } } else {
     match s.pending {
       Some(waiting) -> if force || now_ms >= waiting.not_before {
@@ -2293,27 +2296,34 @@ fn planned(s: State, cfg: Config, now_ms: Int, at: U64, force: Bool) -> Plan / {
         }
       } else { { state: s, send: None, wait_ms: 0 } },
       None -> {
-        let size = max(cfg.batch, 1);
+        let size = max(config.batch, 1);
         let waiting = s.queue.len();
-        if waiting >= size || (waiting > 0 && (force || now_ms - s.queued_at >= cfg.max_age_ms)) {
+        if waiting >= size
+            || (waiting > 0 && (force || now_ms - s.queued_at >= config.max_age_ms)) {
           let batch = s.queue.take(size);
           {
             state: { ..s, queue: s.queue.drop(size), queued_at: now_ms, busy: true },
             send: Some({
               signal: TraceSignal,
-              body: compressed(cfg, encode_traces(cfg.encoding, traces_request(cfg, batch))),
+              body: compressed(
+                config,
+                encode_traces(config.encoding, traces_request(config, batch)),
+              ),
               items: batch.len(),
               attempts: 0,
               not_before: now_ms,
             }),
             wait_ms: 0,
           }
-        } else if s.dirty && (force || now_ms - s.metrics_at >= cfg.metrics_every_ms) {
+        } else if s.dirty && (force || now_ms - s.metrics_at >= config.metrics_every_ms) {
           {
             state: { ..s, dirty: false, metrics_at: now_ms, busy: true },
             send: Some({
               signal: MetricSignal,
-              body: compressed(cfg, encode_metrics(cfg.encoding, metrics_request(cfg, s, at))),
+              body: compressed(
+                config,
+                encode_metrics(config.encoding, metrics_request(config, s, at)),
+              ),
               items: 0,
               attempts: 0,
               not_before: now_ms,
@@ -2338,19 +2348,19 @@ type SendOutcome =
 /// How long to wait before attempt `attempt` (the first retry is 1): the backoff doubled for each
 /// earlier retry, capped at the longest, and placed in its upper half by `draw` out of a thousand.
 /// If `Retry-After` requested a longer wait, that wait instead.
-pub fn retry_wait(cfg: Config, attempt: Int, retry_after_ms: Option<Int>, draw: Int) -> Int = {
+pub fn retry_wait(config: Config, attempt: Int, retry_after_ms: Option<Int>, draw: Int) -> Int = {
   let doubled = range(1, min(max(attempt, 1), 32)).fold(
-    max(cfg.backoff_ms, 0),
-    |wait: Int, _: Int| min(wait * 2, max(cfg.max_backoff_ms, 0)),
+    max(config.backoff_ms, 0),
+    |wait: Int, _: Int| min(wait * 2, max(config.max_backoff_ms, 0)),
   );
-  let capped = min(doubled, max(cfg.max_backoff_ms, 0));
+  let capped = min(doubled, max(config.max_backoff_ms, 0));
   let jittered = capped / 2 + capped / 2 * min(max(draw, 0), 999) / 1000;
   match retry_after_ms { Some(asked) -> max(asked, jittered), None -> jittered }
 }
 
 fn record_outcome(
   s: State,
-  cfg: Config,
+  config: Config,
   out: Outbound,
   how: SendOutcome,
   now_ms: Int,
@@ -2376,13 +2386,13 @@ fn record_outcome(
         },
       },
     Rejected -> lost(free),
-    Retryable(retry_after) -> if out.attempts + 1 >= max(cfg.attempts, 1) { lost(free) } else {
+    Retryable(retry_after) -> if out.attempts + 1 >= max(config.attempts, 1) { lost(free) } else {
       {
         ..free,
         pending: Some({
           ..out,
           attempts: out.attempts + 1,
-          not_before: now_ms + retry_wait(cfg, out.attempts + 1, retry_after, draw),
+          not_before: now_ms + retry_wait(config, out.attempts + 1, retry_after, draw),
         }),
         stats: { ..free.stats, retries: free.stats.retries + 1 },
       }
@@ -2403,13 +2413,18 @@ fn retry_after(headers: http::Headers) -> Option<Int> =
   }
 
 fn outcome_of(
-  cfg: Config,
+  config: Config,
   signal: Signal,
   res: http::Response<| {}>,
 ) -> SendOutcome / {abort.raise} =
   if res.status >= 200 && res.status < 300 {
     Accepted(
-      match decode_response(cfg.encoding, signal, http::whole_bytes(res.body), default_limits()) {
+      match decode_response(
+          config.encoding,
+          signal,
+          http::whole_bytes(res.body),
+          default_limits(),
+        ) {
         Ok(receipt) -> receipt,
         Err(_) -> { rejected: 0, message: "" },
       },
@@ -2418,41 +2433,46 @@ fn outcome_of(
     Retryable(retry_after(res.headers))
   } else { Rejected }
 
-/// The HTTP request for `out`, to the collector `cfg` names.
-fn request_of(cfg: Config, out: Outbound) -> http::Request / {abort.raise} = {
-  let path = cfg.prefix
+/// The HTTP request for `out`, to the collector `config` names.
+fn request_of(config: Config, out: Outbound) -> http::Request / {abort.raise} = {
+  let path = config.prefix
     ++ (match out.signal { TraceSignal -> traces_path(), MetricSignal -> metrics_path() });
-  let req = http::request_to(http::Post, cfg.host ++ ":" ++ cfg.port.to_string(), path, out.body);
-  let typed = http::set_header(cfg.headers, "content-type", content_type(cfg.encoding));
+  let request = http::request_to(
+    http::Post,
+    config.host ++ ":" ++ config.port.to_string(),
+    path,
+    out.body,
+  );
+  let typed = http::set_header(config.headers, "content-type", content_type(config.encoding));
   {
-    ..req,
-    headers: if cfg.gzip { http::set_header(typed, "content-encoding", "gzip") } else { typed },
+    ..request,
+    headers: if config.gzip { http::set_header(typed, "content-encoding", "gzip") } else { typed },
   }
 }
 
 fn exchanged<[l]>(
-  cfg: Config,
+  config: Config,
   out: Outbound,
 ) -> Result<http::Response<| {}>, http::ClientError> / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l], abort.raise} =
-  if cfg.tls {
-    match http::dial_tls[l](cfg.host, cfg.port, cfg.limits) {
+  if config.tls {
+    match http::dial_tls[l](config.host, config.port, config.limits) {
       Err(e) -> Err(e),
       Ok(conn) ->
         bracket(|| conn, |c: http::Connection| http::close[l](c), |c: http::Connection|
-          http::round_trip_last[l](c, request_of(cfg, out), cfg.limits)),
+          http::round_trip_last[l](c, request_of(config, out), config.limits)),
     }
-  } else { http::request[l](cfg.host, cfg.port, request_of(cfg, out), cfg.limits) }
+  } else { http::request[l](config.host, config.port, request_of(config, out), config.limits) }
 
 /// Sends one request and returns how it ended. Nothing it does raises: a request that cannot be
-/// written, such as one with a header among `cfg.headers` that `std.http` will not send, counts as
+/// written, such as one with a header among `config.headers` that `std.http` will not send, counts as
 /// rejected by the collector.
 fn send_request<[l]>(
-  cfg: Config,
+  config: Config,
   out: Outbound,
 ) -> SendOutcome / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l]} =
   match try[abort.raise] {
-      match exchanged[l](cfg, out) {
-        Ok(res) -> outcome_of(cfg, out.signal, res),
+      match exchanged[l](config, out) {
+        Ok(res) -> outcome_of(config, out.signal, res),
         Err(_) -> Retryable(None),
       }
     } {
@@ -2464,8 +2484,8 @@ fn send_request<[l]>(
 /// entropy for ids and jitter.
 pub effect set Exporting = {time.now_ms, time.elapsed_ms, time.elapsed_us, time.sleep_ms, entropy.next, entropy.below}
 
-/// Runs `body`, sending its spans, counters, gauges and timings to the collector `cfg` names, over
-/// connections under the label the call gives. `exporting[collector](cfg, ..)` performs `net` on
+/// Runs `body`, sending its spans, counters, gauges and timings to the collector `config` names, over
+/// connections under the label the call gives. `exporting[collector](config, ..)` performs `net` on
 /// `collector` and on nothing else, so telemetry goes wherever a run binds that label.
 ///
 /// It handles every `trace.enter`, `trace.exit`, `trace.count`, `trace.gauge` and `trace.time`
@@ -2475,17 +2495,17 @@ pub effect set Exporting = {time.now_ms, time.elapsed_ms, time.elapsed_us, time.
 /// recently saw opened and not yet closed. That is one stack for the whole program, not one per
 /// task, so a program whose tasks open spans concurrently should open them with `in_span`.
 ///
-/// An event never waits on the collector. A span that ends while `cfg.queue` spans are waiting is
+/// An event never waits on the collector. A span that ends while `config.queue` spans are waiting is
 /// dropped and counted. The task whose event makes a request due, by count or by age, sends that
-/// request itself, within the deadlines of `cfg.limits`. Meanwhile every other event is queued or
+/// request itself, within the deadlines of `config.limits`. Meanwhile every other event is queued or
 /// counted. A request that fails in a way that may be temporary (no reply, or a 429, 502, 503 or
-/// 504) is retained and sent again by a later event once its backoff has passed, `cfg.attempts`
+/// 504) is retained and sent again by a later event once its backoff has passed, `config.attempts`
 /// times in all. Nothing here raises because of a collector. There is no timer: age and backoff
 /// are checked when the program next traces something. A `Retry-After` is honoured as a number of
 /// seconds; a date is not parsed. `flush` sends everything waiting, sleeping through a backoff
-/// when it must, for at most `cfg.flush_ms`. `exporting` itself does the same however `body` ends.
+/// when it must, for at most `config.flush_ms`. `exporting` itself does the same however `body` ends.
 pub fn exporting<a, [l] | e>(
-  cfg: Config,
+  config: Config,
   body: () -> a / {trace.enter[*], trace.exit[*], trace.count[*], trace.gauge[*], trace.time[*], Tracing, otlp.flush, otlp.stats | e},
 ) -> a / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l], Exporting, abort.raise | e} = {
   let wall_ms = time.now_ms();
@@ -2496,7 +2516,7 @@ pub fn exporting<a, [l] | e>(
       let before = exporter_state.get();
       let plan = planned(
         before,
-        cfg,
+        config,
         time.elapsed_ms(),
         nanos_now(wall_ms, mono_us, time.elapsed_us()),
         force,
@@ -2506,10 +2526,10 @@ pub fn exporting<a, [l] | e>(
         Some(out) -> if plan.wait_ms > patience { false } else {
           exporter_state.put(plan.state);
           if plan.wait_ms > 0 { time.sleep_ms(plan.wait_ms) } else { () };
-          let how = send_request[l](cfg, out);
+          let how = send_request[l](config, out);
           let draw = entropy.below(1000);
           exporter_state.put(
-            record_outcome(exporter_state.get(), cfg, out, how, time.elapsed_ms(), draw),
+            record_outcome(exporter_state.get(), config, out, how, time.elapsed_ms(), draw),
           );
           true
         },
@@ -2518,9 +2538,9 @@ pub fn exporting<a, [l] | e>(
     let flushed = || {
       let held = exporter_state.get();
       let began = time.elapsed_ms();
-      let rounds = (held.queue.len() / max(cfg.batch, 1) + 3) * (max(cfg.attempts, 1) + 1);
+      let rounds = (held.queue.len() / max(config.batch, 1) + 3) * (max(config.attempts, 1) + 1);
       range(0, rounds).fold(true, |more: Bool, _: Int| {
-        let left = cfg.flush_ms - (time.elapsed_ms() - began);
+        let left = config.flush_ms - (time.elapsed_ms() - began);
         if more && left > 0 { pump(true, left) } else { false }
       });
       stats_of(exporter_state.get())
@@ -2542,7 +2562,7 @@ pub fn exporting<a, [l] | e>(
               None -> {
                 let above = match held.open { [inner, ..] -> Some(inner.who.context), [] -> None };
                 let made: telemetry::Identity = {
-                  context: telemetry::begin(above, cfg.sampler),
+                  context: telemetry::begin(above, config.sampler),
                   parent: match above { Some(up) -> Some(up.parent.parent_id), None -> None },
                   kind: telemetry::Internal,
                 };
@@ -2565,7 +2585,7 @@ pub fn exporting<a, [l] | e>(
             exporter_state.put(
               closed(
                 exporter_state.get(),
-                cfg,
+                config,
                 span,
                 outcome,
                 nanos_now(wall_ms, mono_us, time.elapsed_us()),
@@ -2579,7 +2599,7 @@ pub fn exporting<a, [l] | e>(
             exporter_state.put(
               update_series(
                 exporter_state.get(),
-                cfg,
+                config,
                 c,
                 "sum",
                 name,
@@ -2594,7 +2614,7 @@ pub fn exporting<a, [l] | e>(
             exporter_state.put(
               update_series(
                 exporter_state.get(),
-                cfg,
+                config,
                 c,
                 "gauge",
                 name,
@@ -2609,20 +2629,20 @@ pub fn exporting<a, [l] | e>(
             exporter_state.put(
               update_series(
                 exporter_state.get(),
-                cfg,
+                config,
                 c,
                 "histogram",
                 name,
                 fields,
                 |held: Option<Tally>|
-                  add_timing(held, cfg.bounds, Float::of_int(micros) / 1000000.0),
+                  add_timing(held, config.bounds, Float::of_int(micros) / 1000000.0),
               ),
             );
             pump(false, 0);
             ()
           },
           tracing.current() -> None,
-          tracing.sampler() -> cfg.sampler,
+          tracing.sampler() -> config.sampler,
           tracing.annotate(span, fields) ->
             exporter_state.put(annotated(exporter_state.get(), span, fields)),
           otlp.flush() -> flushed(),
@@ -3448,19 +3468,19 @@ fn accept_export<| r>(
 
 /// An OTLP receiver over `std.http`: both paths, both encodings, gzipped or not.
 fn receive<| r>(
-  req: http::Request,
+  request: http::Request,
 ) -> http::Response<| r> / {collector.next, collector.took_traces, collector.took_metrics, http::Reading} = {
-  let kind = match http::header(req.headers, "content-type") { Some(k) -> k, None -> "" };
-  let packed = http::header(req.headers, "content-encoding") == Some("gzip");
-  let sent = http::request_body(req, 4194304);
+  let kind = match http::header(request.headers, "content-type") { Some(k) -> k, None -> "" };
+  let packed = http::header(request.headers, "content-encoding") == Some("gzip");
+  let sent = http::request_body(request, 4194304);
   let raw = if packed { gzip::try_gunzip(sent, 4194304) } else { Ok(sent) };
   let encoding = if kind == content_type(Json) { Some(Json) }
   else if kind == content_type(Protobuf) { Some(Protobuf) }
   else { None };
-  match ((req.method, encoding, raw)) {
+  match ((request.method, encoding, raw)) {
     (http::Post, Some(e), Ok(body)) -> match collector.next(kind, packed) {
-      Take | Down -> accept_export(e, req.path, body, 0),
-      Partial(n) -> accept_export(e, req.path, body, n),
+      Take | Down -> accept_export(e, request.path, body, 0),
+      Partial(n) -> accept_export(e, request.path, body, n),
       Busy(status, after) -> {
         let res = http::text_response(status, "later");
         match after {
@@ -3619,9 +3639,9 @@ fn checkout() -> Unit / {trace.enter[shop], trace.exit[shop], trace.count[shop],
 
 /// `exporting` to the label `collector`: the row names no other.
 fn shipping(
-  cfg: Config,
+  config: Config,
 ) -> Stats / {net.connect[collector], net.connect_tls[collector], net.send[collector], net.recv[collector], net.close[collector], Exporting, abort.raise} =
-  exporting[collector](cfg, || {
+  exporting[collector](config, || {
     checkout();
     flush()
   })
@@ -3629,7 +3649,7 @@ fn shipping(
 fn nanos_at(ms: Int) -> U64 / {abort.raise} = U64::of_int((epoch_ms() + ms) * 1000000)
 
 /// What `checkout` traces, with the ids that a stream seeded with `seed` generates.
-fn expected_traces(cfg: Config, seed: Int) -> Traces / {abort.raise} = {
+fn expected_traces(config: Config, seed: Int) -> Traces / {abort.raise} = {
   let trace_drawn = traceparent::rand_trace_id(rand(seed));
   let root = traceparent::rand_span_id(trace_drawn.rand);
   let child = traceparent::rand_span_id(root.rand);
@@ -3667,7 +3687,7 @@ fn expected_traces(cfg: Config, seed: Int) -> Traces / {abort.raise} = {
   {
     resource_spans: [
       {
-        resource: cfg.resource,
+        resource: config.resource,
         scope_spans: [{ scope: scope("shop"), spans: [reserve, whole], schema_url: "" }],
         schema_url: "",
       },
@@ -3675,12 +3695,12 @@ fn expected_traces(cfg: Config, seed: Int) -> Traces / {abort.raise} = {
   }
 }
 
-fn expected_metrics(cfg: Config) -> Metrics / {abort.raise} = {
+fn expected_metrics(config: Config) -> Metrics / {abort.raise} = {
   let seconds = Float::of_int(7000) / 1000000.0;
   {
     resource_metrics: [
       {
-        resource: cfg.resource,
+        resource: config.resource,
         scope_metrics: [
           {
             scope: scope("shop"),
@@ -3769,10 +3789,11 @@ fn shipments() -> List<Shipment> =
 
 test "a collector decodes what was traced, sent as {c.name}" for c: Shipment in shipments() {
   let base: Config = test_config();
-  let cfg: Config = { ..base, encoding: c.encoding, gzip: c.gzip };
-  let ran = with_rand(rand(41), || simulate { on_clock(|| collected([], || shipping(cfg))) }).value;
-  assert_eq(ran.seen.traces, [expected_traces(cfg, 41)]);
-  assert_eq(ran.seen.metrics, [expected_metrics(cfg)]);
+  let config: Config = { ..base, encoding: c.encoding, gzip: c.gzip };
+  let ran = with_rand(rand(41), ||
+    simulate { on_clock(|| collected([], || shipping(config))) }).value;
+  assert_eq(ran.seen.traces, [expected_traces(config, 41)]);
+  assert_eq(ran.seen.metrics, [expected_metrics(config)]);
   assert_eq(ran.seen.types, [content_type(c.encoding), content_type(c.encoding)]);
   assert_eq(ran.seen.gzipped, if c.gzip { 2 } else { 0 });
   assert_eq(ran.value.exported, 2);
@@ -3791,12 +3812,12 @@ fn span_names(t: Traces) -> List<String> =
       s.spans.fold(inner, |names: List<String>, x: Span| names.push(x.name))))
 
 test "a request the collector cannot accept yet is sent again after Retry-After and the backoff" {
-  let cfg: Config = test_config();
+  let config: Config = test_config();
   let ran = with_rand(rand(7), ||
     simulate {
       on_clock(||
         collected([Busy(503, Some(2)), Busy(429, None), Take], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("only");
             flush()
           })))
@@ -3819,12 +3840,12 @@ test "a request the collector cannot accept yet is sent again after Retry-After 
 
 test "a failed request waits for an event after its backoff, and the events before it queue" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, batch: 1 };
+  let config: Config = { ..base, batch: 1 };
   let ran = with_rand(rand(8), ||
     simulate {
       on_clock(||
         collected([Busy(503, None), Take], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("a");
             step[shop]("b");
             let waiting = stats();
@@ -3848,12 +3869,12 @@ test "a failed request waits for an event after its backoff, and the events befo
 
 test "a full queue drops and counts, and what was queued is sent once the collector is back" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, queue: 3, batch: 2, attempts: 3 };
+  let config: Config = { ..base, queue: 3, batch: 2, attempts: 3 };
   let ran = with_rand(rand(9), ||
     simulate {
       on_clock(||
         collected([Down, Down], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             ["s1", "s2", "s3", "s4", "s5", "s6", "s7"].fold((), |_: Unit, name: String|
               step[shop](name));
             let full = stats();
@@ -3872,12 +3893,12 @@ test "a full queue drops and counts, and what was queued is sent once the collec
 
 test "a request is abandoned when the collector rejects it or it fails every attempt" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, attempts: 2 };
+  let config: Config = { ..base, attempts: 2 };
   let spurned = with_rand(rand(10), ||
     simulate {
       on_clock(||
         collected([Bad], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("a");
             flush()
           })))
@@ -3889,7 +3910,7 @@ test "a request is abandoned when the collector rejects it or it fails every att
     simulate {
       on_clock(||
         collected([Busy(502, None), Busy(504, None), Take], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("a");
             flush()
           })))
@@ -3903,12 +3924,12 @@ test "a request is abandoned when the collector rejects it or it fails every att
 
 test "spans are sent when enough wait or the oldest has waited long enough, and metrics on their interval" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, batch: 3, max_age_ms: 5000, metrics_every_ms: 60000 };
+  let config: Config = { ..base, batch: 3, max_age_ms: 5000, metrics_every_ms: 60000 };
   let ran = with_rand(rand(11), ||
     simulate {
       on_clock(||
         collected([], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("a");
             step[shop]("b");
             let two = stats();
@@ -3942,11 +3963,11 @@ test "spans are sent when enough wait or the oldest has waited long enough, and 
 }
 
 fn remote(sampled: Bool) -> http::Request / {abort.raise} = {
-  let req = http::request_to(http::Get, "shop.example", "/orders", b"");
+  let request = http::request_to(http::Get, "shop.example", "/orders", b"");
   {
-    ..req,
+    ..request,
     headers: http::set_header(
-      req.headers,
+      request.headers,
       "traceparent",
       "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0" ++ (if sampled { "1" } else { "0" }),
     ),
@@ -3955,20 +3976,20 @@ fn remote(sampled: Bool) -> http::Request / {abort.raise} = {
 
 test "a trace that is not recorded is not sent, and a span takes the decision of its caller" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, sampler: telemetry::AlwaysOff };
+  let config: Config = { ..base, sampler: telemetry::AlwaysOff };
   let ran = with_rand(rand(12), ||
     simulate {
       on_clock(||
         collected([], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("unrecorded");
             telemetry::in_span[shop]("also unrecorded", telemetry::Internal, Map::new(), ||
               step[shop]("nor this"));
-            telemetry::host_handler[web](remote(true), |r: http::Request| {
+            telemetry::serve_traced[web](remote(true), |r: http::Request| {
               step[shop]("inside a recorded request");
               http::response(204, b"")
             });
-            telemetry::host_handler[web](remote(false), |r: http::Request|
+            telemetry::serve_traced[web](remote(false), |r: http::Request|
               http::response(204, b""));
             flush()
           })))
@@ -4007,12 +4028,12 @@ test "a trace that is not recorded is not sent, and a span takes the decision of
 
 test "a ratio sampler records the traces whose ids it selects, and no others" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, sampler: telemetry::Ratio(1, 2) };
+  let config: Config = { ..base, sampler: telemetry::Ratio(1, 2) };
   let ran = with_rand(rand(13), ||
     simulate {
       on_clock(||
         collected([], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             range(0, 24).fold((), |_: Unit, i: Int| step[shop]("s" ++ i.to_string()));
             flush()
           })))
@@ -4029,12 +4050,12 @@ test "a ratio sampler records the traces whose ids it selects, and no others" {
 
 test "a partial accept is believed, and a metric tracks no more series than its bound" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, max_series: 2 };
+  let config: Config = { ..base, max_series: 2 };
   let ran = with_rand(rand(14), ||
     simulate {
       on_clock(||
         collected([Partial(1)], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("a");
             step[shop]("b");
             ["x", "y", "z", "x"].fold((), |_: Unit, sku: String|
@@ -4055,12 +4076,12 @@ test "a partial accept is believed, and a metric tracks no more series than its 
 }
 
 test "closing a span closes the spans left open under it, and an exit of a span not open is counted" {
-  let cfg: Config = test_config();
+  let config: Config = test_config();
   let ran = with_rand(rand(15), ||
     simulate {
       on_clock(||
         collected([], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             let outer = trace.enter[shop]("outer", Map::new());
             let inner = trace.enter[shop]("inner", Map::new());
             trace.exit[shop](outer, trace::Ok);
@@ -4082,12 +4103,12 @@ test "closing a span closes the spans left open under it, and an exit of a span 
 
 test "a flush waits no longer than it is given, and what it could not send stays queued" {
   let base: Config = test_config();
-  let cfg: Config = { ..base, flush_ms: 3000 };
+  let config: Config = { ..base, flush_ms: 3000 };
   let ran = with_rand(rand(16), ||
     simulate {
       on_clock(||
         collected([Busy(503, Some(60)), Take], ||
-          exporting[collector](cfg, || {
+          exporting[collector](config, || {
             step[shop]("a");
             let first = flush();
             time.sleep_ms(60000);
@@ -4103,13 +4124,13 @@ test "a flush waits no longer than it is given, and what it could not send stays
 }
 
 test "a retry's wait doubles to its bound, lies in its upper half, and is never under Retry-After" {
-  let cfg: Config = test_config();
-  assert_eq(retry_wait(cfg, 1, None, 0), 50);
-  assert_eq(retry_wait(cfg, 1, None, 999), 99);
-  assert_eq(retry_wait(cfg, 2, None, 0), 100);
-  assert_eq(retry_wait(cfg, 4, None, 500), 600);
-  assert_eq(retry_wait(cfg, 5, None, 0), 500);
-  assert_eq(retry_wait(cfg, 30, None, 0), 500);
-  assert_eq(retry_wait(cfg, 1, Some(3000), 999), 3000);
-  assert_eq(retry_wait(cfg, 5, Some(10), 0), 500)
+  let config: Config = test_config();
+  assert_eq(retry_wait(config, 1, None, 0), 50);
+  assert_eq(retry_wait(config, 1, None, 999), 99);
+  assert_eq(retry_wait(config, 2, None, 0), 100);
+  assert_eq(retry_wait(config, 4, None, 500), 600);
+  assert_eq(retry_wait(config, 5, None, 0), 500);
+  assert_eq(retry_wait(config, 30, None, 0), 500);
+  assert_eq(retry_wait(config, 1, Some(3000), 999), 3000);
+  assert_eq(retry_wait(config, 5, Some(10), 0), 500)
 }

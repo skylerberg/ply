@@ -9,7 +9,7 @@
 //! by default: a program installs an exporter (`std.otlp`'s `exporting`), or `traced` when it only
 //! wants its spans identified in what `std.trace` already writes.
 //!
-//! A span is still a `std.trace` span. `in_span`, `host_handler` and `in_client_span` perform
+//! A span is still a `std.trace` span. `in_span`, `serve_traced` and `in_client_span` perform
 //! `trace.enter` and `trace.exit` on the channel they are given. They write the span's ids into its
 //! fields under the names that `trace_id_field` and the functions beside it return. So any `trace`
 //! handler can tell spans apart, and an exporter reads the ids back with `identity`.
@@ -333,12 +333,12 @@ effect span_end {
 
 // --- Across std.http ------------------------------------------------------------
 
-/// The context `req` arrived with, or `None` when it starts a trace: `traceparent::incoming`
+/// The context `request` arrived with, or `None` when it starts a trace: `traceparent::incoming`
 /// applied to its `traceparent` and `tracestate` fields.
-pub fn extract(req: Request) -> Option<Context> =
+pub fn extract(request: Request) -> Option<Context> =
   traceparent::incoming(
-    http::header_lines(req.headers, "traceparent"),
-    http::header_lines(req.headers, "tracestate"),
+    http::header_lines(request.headers, "traceparent"),
+    http::header_lines(request.headers, "tracestate"),
   )
 
 /// `headers` with `context` added for whoever receives them: `traceparent`, and `tracestate` when
@@ -349,49 +349,49 @@ pub fn with_context(headers: Headers, context: Context) -> Headers = {
   else { http::set_header(named, "tracestate", traceparent::render_state(context.state)) }
 }
 
-/// `req` with the span around the caller named as its parent. Unchanged outside any span.
-pub fn inject(req: Request) -> Request / {tracing.current} =
+/// `request` with the span around the caller named as its parent. Unchanged outside any span.
+pub fn inject(request: Request) -> Request / {tracing.current} =
   match tracing.current() {
-    Some(context) -> { ..req, headers: with_context(req.headers, context) },
-    None -> req,
+    Some(context) -> { ..request, headers: with_context(request.headers, context) },
+    None -> request,
   }
 
-/// Runs `app` on `req` in a server span named for the request's method, and returns its response.
+/// Runs `app` on `request` in a server span named for the request's method, and returns its response.
 /// The span is a child of the span the request's `traceparent` names, whatever span is around the
 /// call. When the request names none, it is a child of the span around the call. The span records
 /// the request's method, path, query, host and protocol version under OpenTelemetry's names, and
 /// the response's status once there is one. It is `Failed` for a status of 500 or above.
-pub fn host_handler<[c] | e, s>(
-  req: Request,
+pub fn serve_traced<[c] | e, s>(
+  request: Request,
   app: (Request) -> Response<| s> / {Tracing | e},
 ) -> Response<| s> / {trace.enter[c], trace.exit[c], Tracing, entropy.next, abort.raise | e} =
   run_in_span[c](
-    http::method_name(req.method),
+    http::method_name(request.method),
     Server,
-    request_fields(req),
-    extract(req),
+    request_fields(request),
+    extract(request),
     |_: Context| {
-      let res = app(req);
+      let res = app(request);
       annotate(status_fields(res.status, 500));
       res
     },
     |res: Response<| s>| status_outcome(res.status, 500),
   )
 
-/// Runs `send` on `req` in a client span named for its method, and returns its result. `send`
+/// Runs `send` on `request` in a client span named for its method, and returns its result. `send`
 /// receives the request with that span named as its parent in `traceparent`, and `tracestate`
 /// alongside. The span is `Failed` for a status of 400 or above, and when `send` returns an error.
 pub fn in_client_span<[c] | e>(
-  req: Request,
+  request: Request,
   send: (Request) -> Result<Response<| {}>, ClientError> / {Tracing | e},
 ) -> Result<Response<| {}>, ClientError> / {trace.enter[c], trace.exit[c], Tracing, entropy.next, abort.raise | e} =
   run_in_span[c](
-    http::method_name(req.method),
+    http::method_name(request.method),
     Client,
-    request_fields(req),
+    request_fields(request),
     None,
     |context: Context| {
-      let answer = send({ ..req, headers: with_context(req.headers, context) });
+      let answer = send({ ..request, headers: with_context(request.headers, context) });
       match answer {
         Ok(res) -> annotate(status_fields(res.status, 400)),
         Err(error) -> annotate(#{error_type(): StringField(client_error_name(error))}),
@@ -424,26 +424,26 @@ pub fn client_error_name(error: ClientError) -> String =
     http::Malformed(_) -> "malformed",
   }
 
-fn request_fields(req: Request) -> Fields = {
-  let at = authority_of(req.authority);
+fn request_fields(request: Request) -> Fields = {
+  let at = authority_of(request.authority);
   let base: Fields = #{
-    http_request_method(): StringField(http::method_name(req.method)),
-    url_path(): StringField(req.path),
-    network_protocol_version(): StringField(match req.version {
+    http_request_method(): StringField(http::method_name(request.method)),
+    url_path(): StringField(request.path),
+    network_protocol_version(): StringField(match request.version {
       http::Http10 -> "1.0",
       http::Http11 -> "1.1",
       http::Http2 -> "2",
     }),
   };
-  let queried = if req.query == "" { base }
-  else { base.insert(url_query(), StringField(req.query)) };
+  let queried = if request.query == "" { base }
+  else { base.insert(url_query(), StringField(request.query)) };
   let hosted = if at.host == "" { queried }
   else { queried.insert(server_address(), StringField(at.host)) };
   let ported = match at.port {
     Some(port) -> hosted.insert(server_port(), IntField(port)),
     None -> hosted,
   };
-  match http::header(req.headers, "user-agent") {
+  match http::header(request.headers, "user-agent") {
     Some(agent) -> ported.insert(user_agent_original(), StringField(agent)),
     None -> ported,
   }
@@ -713,18 +713,18 @@ test "a span's identity reads back from its fields" {
 }
 
 test "a served request continues the trace it arrived with, and records what the request was" {
-  let req = get("/orders/7?full=1");
+  let request = get("/orders/7?full=1");
   let arriving = {
-    ..req,
+    ..request,
     headers: http::set_header(
-      http::set_header(req.headers, "traceparent", remote_parent()),
+      http::set_header(request.headers, "traceparent", remote_parent()),
       "tracestate",
       "rojo=1",
     ),
   };
   let ran = collect_records(4, ||
     traced(AlwaysOff, ||
-      host_handler[web](arriving, |r: Request| {
+      serve_traced[web](arriving, |r: Request| {
         let here = tracing.current();
         http::text_response(503, match here { Some(c) -> trace_hex(c), None -> "" })
       })));
@@ -827,7 +827,7 @@ fn look(who: String) -> Unit / {tracing.current, sightings.record} =
 /// yields again and records the span once more.
 fn relayed<| e>(
   who: String,
-  req: Request,
+  request: Request,
 ) -> Response<| e> / {Tracing, sightings.record, trace.enter[upstream], trace.exit[upstream], entropy.next, task.yield, abort.raise} = {
   look(who);
   task.yield();
@@ -843,8 +843,8 @@ fn relayed<| e>(
 }
 
 fn arriving(parent: String) -> Request / {abort.raise} = {
-  let req = get("/orders");
-  { ..req, headers: http::set_header(req.headers, "traceparent", parent) }
+  let request = get("/orders");
+  { ..request, headers: http::set_header(request.headers, "traceparent", parent) }
 }
 
 type Sighting = { request: String, trace: String }
@@ -855,8 +855,8 @@ test "two requests served at once each see their own span, whatever order they r
   let sights = handle {
     traced(AlwaysOn, ||
       simulate {
-        let a = task.spawn(|| host_handler[web](arriving(first), |r: Request| relayed("a", r)));
-        let b = task.spawn(|| host_handler[web](arriving(second), |r: Request| relayed("b", r)));
+        let a = task.spawn(|| serve_traced[web](arriving(first), |r: Request| relayed("a", r)));
+        let b = task.spawn(|| serve_traced[web](arriving(second), |r: Request| relayed("b", r)));
         assert_eq(task.join(a).status, 204);
         assert_eq(task.join(b).status, 204)
       })

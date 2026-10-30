@@ -1,31 +1,32 @@
 import std.bin
 import std.list
-import compiler.syntax.parsing (Span, Ident, QName, ParseDiag, span_to, bare, dump_diags,
-                                starts_upper, synthetic_span, synthetic_span_at,
+import compiler.syntax.parsing (Span, Identifier, QName, ParseDiagnostic, span_to, bare,
+                                dump_diagnostics, starts_upper, synthetic_span, synthetic_span_at,
                                 role_member_receiver, role_member_field, role_member_callee,
                                 role_spawn_let, role_spawn_binder, role_spawn_perform,
                                 role_spawn_lambda, role_spawn_call, role_spawn_read)
 import compiler.syntax.type_syntax (FunctionTypeExpression, WriteMode, nullary)
-import compiler.syntax.items (Module, Item, FunctionItem, LawItem, SchemaItem, FnDef, Binder,
-                              SchemaDef, schema_guard_name, parse, dump_module)
+import compiler.syntax.items (Module, Item, FunctionItem, LawItem, SchemaItem, FnDefinition, Binder,
+                              SchemaDefinition, schema_guard_name, parse, dump_module)
 import compiler.syntax.calls (slotted, ordered_arguments)
-import compiler.syntax.exprs (Expr, NameExpression, CallExpression, BlockExpression,
-                              MatchExpression, MatchArm, LambdaExpression, PropagateExpression,
-                              FieldExpression, PerformExpression, HandleExpression, LetStatement,
-                              NamedArg, TaggedLiteral, HandleClause, is_exit_effect, exit_op)
+import compiler.syntax.expressions (Expression, NameExpression, CallExpression, BlockExpression,
+                                    MatchExpression, MatchArm, LambdaExpression,
+                                    PropagateExpression, FieldExpression, PerformExpression,
+                                    HandleExpression, LetStatement, NamedArg, TaggedLiteral,
+                                    HandleClause, is_exit_effect, exit_op)
 import compiler.syntax.patterns (Pattern, PatternConstructor, PatternVariable)
 import compiler.emit.abi
 import compiler.emit.abi (Native, native_named)
 import compiler.check.known (int_name, bool_name, float_name, decimal_name, fixed_widths)
-import compiler.expand.rewrite.shared (map_item, tagged_in, report_rebound_constructors, any_expr,
-                                       variable_at, binder_at)
+import compiler.expand.rewrite.shared (map_item, tagged_in, report_rebound_constructors,
+                                       any_expression, variable_at, binder_at)
 import compiler.expand.rewrite.try_operator (expand_try)
 
 pub type Written = {
   qualifier: Bytes,
   name: Bytes,
   names: List<Bytes>,
-  defaults: List<Option<Expr>>,
+  defaults: List<Option<Expression>>,
 }
 
 pub type MemberCallee = | WrittenOut(Written) | InField
@@ -33,10 +34,10 @@ pub type MemberCallee = | WrittenOut(Written) | InField
 fn member_arguments(
   m: Written,
   at: Span,
-  on: Expr,
-  args: List<Expr>,
+  on: Expression,
+  args: List<Expression>,
   named: List<NamedArg>,
-) -> List<Expr> = {
+) -> List<Expression> = {
   let written = [on].concat(args);
   if written.len() > m.names.len() { written } else {
     let s = slotted(m.names, m.defaults, written, named, at);
@@ -44,7 +45,7 @@ fn member_arguments(
   }
 }
 
-fn member_var(m: Written, at: Span) -> Expr = {
+fn member_var(m: Written, at: Span) -> Expression = {
   let named = { ..at, site: 0 };
   NameExpression({
     span: at,
@@ -56,27 +57,30 @@ fn member_var(m: Written, at: Span) -> Expr = {
   })
 }
 
-fn expand_member_call(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
-  match expr {
+fn expand_member_call(sites: Map<Int, MemberCallee>, expression: Expression) -> Expression =
+  match expression {
     NameExpression(v) -> match v.name.module {
-      None -> expr,
-      Some(of) -> if !starts_upper(of.name) { expr } else {
-        match sites.get(v.span.site) { Some(WrittenOut(m)) -> member_var(m, v.span), _ -> expr }
+      None -> expression,
+      Some(of) -> if !starts_upper(of.name) { expression } else {
+        match sites.get(v.span.site) {
+          Some(WrittenOut(m)) -> member_var(m, v.span),
+          _ -> expression,
+        }
       },
     },
-    CallExpression(a) -> match a.func {
+    CallExpression(a) -> match a.function {
       FieldExpression(f) -> match sites.get(a.span.site) {
         Some(WrittenOut(m)) ->
           CallExpression({
             span: a.span,
-            func: member_var(m, f.span),
+            function: member_var(m, f.span),
             named: [],
             args: member_arguments(m, a.span, f.base, a.args, a.named),
             labels: a.labels,
           }),
-        _ -> expr,
+        _ -> expression,
       },
-      _ -> expr,
+      _ -> expression,
     },
     PerformExpression(p) -> {
       let on = NameExpression({
@@ -88,7 +92,7 @@ fn expand_member_call(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
         Some(InField) ->
           CallExpression({
             span: p.span,
-            func: FieldExpression({
+            function: FieldExpression({
               span: synthetic_span_at(
                 span_to(p.effect_name.span, p.op.span),
                 p.span,
@@ -104,22 +108,26 @@ fn expand_member_call(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
         Some(WrittenOut(m)) ->
           CallExpression({
             span: p.span,
-            func: member_var(m, synthetic_span_at(p.op.span, p.span, role_member_callee())),
+            function: member_var(m, synthetic_span_at(p.op.span, p.span, role_member_callee())),
             named: [],
             args: member_arguments(m, p.span, on, p.args, []),
             labels: labels,
           }),
-        None -> expr,
+        None -> expression,
       }
     },
-    _ -> expr,
+    _ -> expression,
   }
 
-pub fn expand_function_member_calls(def: FnDef, sites: Map<Int, MemberCallee>) -> FnDef =
-  if sites.len() == 0 { def } else {
-    match map_item(FunctionItem(def), |expr: Expr| expand_member_call(sites, expr)) {
+pub fn expand_function_member_calls(
+  definition: FnDefinition,
+  sites: Map<Int, MemberCallee>,
+) -> FnDefinition =
+  if sites.len() == 0 { definition } else {
+    match map_item(FunctionItem(definition), |expression: Expression|
+        expand_member_call(sites, expression)) {
       FunctionItem(d) -> d,
-      _ -> def,
+      _ -> definition,
     }
   }
 
@@ -215,36 +223,40 @@ fn emitter_natives() -> List<CompilerNative> =
   [{ name: b"?encoded", words: 1, results: true, raises: false }]
 
 fn has_try(m: Module) -> Bool =
-  any_expr(m, |expr: Expr| match expr { PropagateExpression(_) -> true, _ -> false })
+  any_expression(m, |expression: Expression|
+    match expression { PropagateExpression(_) -> true, _ -> false })
 
 pub fn expand(
   module: Module,
-  diags: List<ParseDiag>,
-) -> { module: Module, diags: List<ParseDiag> } / {abort.raise} = {
-  let tried = if has_try(module) { expand_try(module, diags) }
-  else { { module: module, diags: diags } };
-  let function_item = with_schema_fns(wrap_spawned_values(tried.module));
-  { module: function_item, diags: report_rebound_constructors(function_item, tried.diags) }
+  diagnostics: List<ParseDiagnostic>,
+) -> { module: Module, diagnostics: List<ParseDiagnostic> } / {abort.raise} = {
+  let tried = if has_try(module) { expand_try(module, diagnostics) }
+  else { { module: module, diagnostics: diagnostics } };
+  let function_item = with_schema_functions(wrap_spawned_values(tried.module));
+  {
+    module: function_item,
+    diagnostics: report_rebound_constructors(function_item, tried.diagnostics),
+  }
 }
 
 fn spawns_value(
-  p: { span: Span, effect_name: QName, op: Ident, resource: Option<Ident>, args: List<Expr> },
+  p: { span: Span, effect_name: QName, op: Identifier, resource: Option<Identifier>, args: List<Expression> },
 ) -> Bool =
   p.effect_name.module == None && p.effect_name.name.name == b"task" && p.op.name == b"spawn"
     && (match p.args { [LambdaExpression(_)] -> false, [_] -> true, _ -> false })
 
-fn wrap_spawned_value(expr: Expr) -> Expr =
-  match expr {
-    PerformExpression(p) -> if !spawns_value(p) { expr } else {
+fn wrap_spawned_value(expression: Expression) -> Expression =
+  match expression {
+    PerformExpression(p) -> if !spawns_value(p) { expression } else {
       let at = |role: Int| synthetic_span(p.span, role);
       match p.args {
         [value] ->
           BlockExpression({
             span: p.span,
-            stmts: [
+            statements: [
               LetStatement({
                 span: at(role_spawn_let()),
-                pat: binder_at(b"?spawned", at(role_spawn_binder())),
+                pattern: binder_at(b"?spawned", at(role_spawn_binder())),
                 ty: None,
                 value: value,
               }),
@@ -260,7 +272,7 @@ fn wrap_spawned_value(expr: Expr) -> Expr =
                     ret: None,
                     body: CallExpression({
                       span: at(role_spawn_call()),
-                      func: variable_at(b"?spawned", at(role_spawn_read())),
+                      function: variable_at(b"?spawned", at(role_spawn_read())),
                       named: [],
                       args: [],
                       labels: [],
@@ -270,18 +282,18 @@ fn wrap_spawned_value(expr: Expr) -> Expr =
               }),
             ),
           }),
-        _ -> expr,
+        _ -> expression,
       }
     },
-    _ -> expr,
+    _ -> expression,
   }
 
 fn wrap_spawned_values(module: Module) -> Module =
-  if !any_expr(module, |e: Expr| match e { PerformExpression(p) -> spawns_value(p), _ -> false }) {
-    module
-  } else { { ..module, items: module.items.map(|item: Item| map_item(item, wrap_spawned_value)) } }
+  if !any_expression(module, |e: Expression|
+      match e { PerformExpression(p) -> spawns_value(p), _ -> false }) { module }
+  else { { ..module, items: module.items.map(|item: Item| map_item(item, wrap_spawned_value)) } }
 
-fn schema_fns(d: SchemaDef) -> List<Item> = {
+fn schema_functions(d: SchemaDefinition) -> List<Item> = {
   let at = { ..d.name.span, site: 0 };
   let ident = |t: Bytes| { name: t, span: at };
   let params = d.params.concat(d.binders).map(|b: Binder|
@@ -311,7 +323,7 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
     tail_bounded: false,
     span: at,
   };
-  let function_item = |name: Ident, body: Expr|
+  let function_item = |name: Identifier, body: Expression|
     FunctionItem({
       visibility: d.visibility,
       name: name,
@@ -337,36 +349,40 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
   }
 }
 
-fn with_schema_fns(module: Module) -> Module =
+fn with_schema_functions(module: Module) -> Module =
   if !module.items.fold(false, |found: Bool, item: Item|
       found || (match item { SchemaItem(_) -> true, _ -> false })) { module } else {
     {
       ..module,
       items: module.items.fold([], |acc: List<Item>, item: Item|
-        match item { SchemaItem(d) -> acc.push(item).concat(schema_fns(d)), _ -> acc.push(item) }),
+        match item {
+          SchemaItem(d) -> acc.push(item).concat(schema_functions(d)),
+          _ -> acc.push(item),
+        }),
     }
   }
 
 pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
   let r = parse(src);
-  let x = expand(r.node, r.parser.diags);
-  String::of_bytes(dump_module(x.module).concat(dump_diags(x.diags)))
+  let x = expand(r.node, r.parser.diagnostics);
+  String::of_bytes(dump_module(x.module).concat(dump_diagnostics(x.diagnostics)))
 }
 
-fn expanded_fn(src: Bytes) -> { body: Expr, codes: List<Bytes> } / {abort.raise} = {
+fn expanded_fn(src: Bytes) -> { body: Expression, codes: List<Bytes> } / {abort.raise} = {
   let r = parse(src);
-  let x = expand(r.node, r.parser.diags);
+  let x = expand(r.node, r.parser.diagnostics);
   match x.module.items.at(0) {
-    Some(FunctionItem(d)) -> { body: d.body, codes: x.diags.map(|d: ParseDiag| d.code) },
+    Some(FunctionItem(d)) ->
+      { body: d.body, codes: x.diagnostics.map(|d: ParseDiagnostic| d.code) },
     _ -> panic("the source's first item is a function"),
   }
 }
 
-fn arms_of(e: Expr) -> List<{ ctor: Bytes, binds: List<Bytes>, body: Expr }> =
+fn arms_of(e: Expression) -> List<{ ctor: Bytes, binds: List<Bytes>, body: Expression }> =
   match e {
     MatchExpression(m) ->
       m.arms.map(|a: MatchArm|
-        match a.pat {
+        match a.pattern {
           PatternConstructor(c) ->
             {
               ctor: c.name.name.name,
@@ -379,9 +395,9 @@ fn arms_of(e: Expr) -> List<{ ctor: Bytes, binds: List<Bytes>, body: Expr }> =
     _ -> [],
   }
 
-fn called(e: Expr) -> Bytes =
+fn called(e: Expression) -> Bytes =
   match e {
-    CallExpression(a) -> match a.func { NameExpression(v) -> v.name.name.name, _ -> b"" },
+    CallExpression(a) -> match a.function { NameExpression(v) -> v.name.name.name, _ -> b"" },
     _ -> b"",
   }
 
@@ -389,14 +405,14 @@ test "a `?` on a `let` splits the block at that statement, failure arm first" {
   let x = expanded_fn(b"fn f(n: Int) -> Result<Int, Bytes> = { let x = g(n)?; Ok(x + 1) }");
   assert_eq(x.codes, []);
   let tested = match x.body {
-    BlockExpression(b) -> if b.stmts.len() == 0 { b.tail } else { None },
+    BlockExpression(b) -> if b.statements.len() == 0 { b.tail } else { None },
     _ -> None,
   };
   match tested {
     Some(m) -> {
       assert_eq(match m { MatchExpression(n) -> called(n.scrutinee), _ -> b"" }, b"g");
       let arms = arms_of(m);
-      assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+      assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expression }| a.ctor), [
         b"Err",
         b"Ok",
       ]);
@@ -416,7 +432,7 @@ test "a `?` inside a return-position expression lifts to its head, and an `Optio
   let x = expanded_fn(b"fn f(n: Int) -> Option<Int> = Some(g(n)? + 1)");
   assert_eq(x.codes, []);
   let arms = arms_of(x.body);
-  assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+  assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expression }| a.ctor), [
     b"None",
     b"Some",
   ]);
@@ -430,7 +446,7 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
   assert_eq(called(x.body), b"g")
 }
 
-fn exit_value(e: Expr) -> Option<Expr> =
+fn exit_value(e: Expression) -> Option<Expression> =
   match e {
     PerformExpression(p) -> if is_exit_effect(p.effect_name.name.name) && p.op.name == exit_op() {
       p.args.at(0)
@@ -463,7 +479,7 @@ test "a `?` inside a `handle` raises its function's exit, which a `handle` aroun
       match inner {
         Some(m) -> {
           let arms = arms_of(m);
-          assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+          assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expression }| a.ctor), [
             b"Err",
             b"Ok",
           ]);
@@ -566,7 +582,7 @@ test "a spawn of a value other than a lambda spawns a lambda calling it, the val
   assert_eq(x.codes, []);
   match x.body {
     BlockExpression(b) -> {
-      assert_eq(b.stmts.len(), 1);
+      assert_eq(b.statements.len(), 1);
       match b.tail {
         Some(PerformExpression(p)) -> match p.args {
           [LambdaExpression(l)] -> {

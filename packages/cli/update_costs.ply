@@ -7,8 +7,8 @@ import compiler.front (analyse_pulling_std_with, module_form_digest)
 import compiler.front.published (no_rows)
 import compiler.front.seam (Analysed, Refused)
 import compiler.store.hash.encoding (hex)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, error_at, error_at_and)
-import compiler.check.resolve.scopes (PackageDeps)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, error_at, error_at_and)
+import compiler.check.resolve.scopes (PackageDependencies)
 import compiler.syntax.parsing (Span, no_module, dummy_span, span_between)
 import compiler.unit (identity_of, shipped)
 import compiler.store.records (Record, record_store, with_record_store)
@@ -38,26 +38,29 @@ pub fn costs_of(
   program: Program,
   analysis: Analysis,
 ) -> Costing / {cost_checker.report, abort.raise} = {
-  let srcs = range(0, analysis.mods.len()).map(|i: Int|
+  let sources = range(0, analysis.modules.len()).map(|i: Int|
     match program.places.at(i) { Some(place) -> place.text, None -> b"" });
-  let c = cost_checker.report(cost_input_of(analysis, srcs));
+  let c = cost_checker.report(cost_input_of(analysis, sources));
   {
     ..c,
-    report: { ..c.report, defs: c.report.defs.filter(|d: Costed| d.module < program.files.len()) },
+    report: {
+      ..c.report,
+      definitions: c.report.definitions.filter(|d: Costed| d.module < program.files.len()),
+    },
   }
 }
 
 pub fn broken_promises(
   program: Program,
   frame: Frame,
-) -> List<Diag> / {cost_checker.report, abort.raise} =
+) -> List<Diagnostic> / {cost_checker.report, abort.raise} =
   if !has_promises(program, frame) { [] } else {
     match whole_of(program) {
       Err(ds) -> ds,
       Ok(w) -> {
         let r = costs_of(program, w).report;
         if !r.ok { [unresolved()] } else {
-          r.unkept.fold(promises(r), |acc: List<Diag>, u: Unkept|
+          r.unkept.fold(promises(r), |acc: List<Diagnostic>, u: Unkept|
             acc.push(broken_returns_clause(u)))
         }
       },
@@ -74,8 +77,8 @@ fn checker_roots() -> List<Bytes> =
 fn costs_key(
   identity: Bytes,
   names: List<Bytes>,
-  srcs: List<Bytes>,
-  pkgs: List<PackageDeps>,
+  sources: List<Bytes>,
+  packages: List<PackageDependencies>,
   module_packages: List<Int>,
   shipped: Int,
   embeds: List<ModuleEmbed>,
@@ -100,16 +103,16 @@ fn costs_key(
             Bytes::concat_all([
               match names.at(i) { Some(x) -> x, None -> b"" },
               b"\x00",
-              match srcs.at(i) { Some(x) -> blake3(x), None -> b"" },
+              match sources.at(i) { Some(x) -> blake3(x), None -> b"" },
             ])),
         ),
         b"\x00",
         Bytes::concat_all(
-          pkgs.map(|p: PackageDeps|
+          packages.map(|p: PackageDependencies|
             Bytes::concat_all([
               p.prefix,
               b"(",
-              Bytes::concat_all(p.deps.map(|d: Bytes| d.concat(b","))),
+              Bytes::concat_all(p.dependencies.map(|d: Bytes| d.concat(b","))),
               b")",
             ])),
         ),
@@ -127,13 +130,13 @@ fn costs_key(
   )
 }
 
-fn keyed_sources(a: Analysis, srcs: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+fn keyed_sources(a: Analysis, sources: List<Bytes>) -> List<Bytes> / {abort.raise} = {
   let owner = |name: Bytes| {
     let dot = range(0, name.len()).fold(0 - 1, |acc: Int, i: Int|
       if name.at(i) == 46 { i } else { acc });
     if dot < 0 { b"" } else { name.slice(0, dot) }
   };
-  let held = a.hashes.defs.concat(a.hashes.decls).fold(
+  let held = a.hashes.definitions.concat(a.hashes.declarations).fold(
     Map::new(),
     |acc: Map<Bytes, List<Bytes>>, d: { name: Bytes, hash: Bytes }| {
       let m = owner(d.name);
@@ -146,9 +149,9 @@ fn keyed_sources(a: Analysis, srcs: List<Bytes>) -> List<Bytes> / {abort.raise} 
       )
     },
   );
-  range(0, a.mods.len()).map(|i: Int| {
-    let m = a.mods.get(i);
-    let src = match srcs.at(i) { Some(x) -> x, None -> b"" };
+  range(0, a.modules.len()).map(|i: Int| {
+    let m = a.modules.get(i);
+    let src = match sources.at(i) { Some(x) -> x, None -> b"" };
     if !pulled_at(a.packages, a.module_packages, i) { src } else {
       Bytes::concat_all(
         [b"shipped\x00", module_form_digest(m.module, src), b"\x00"].concat(
@@ -173,8 +176,8 @@ pub fn with_cost_cache<a | e>(
         let a = p.analysis;
         let key = costs_key(
           identity,
-          a.mods.map(|m: ParsedModule| m.name),
-          keyed_sources(a, p.srcs),
+          a.modules.map(|m: ParsedModule| m.name),
+          keyed_sources(a, p.sources),
           a.packages,
           a.module_packages,
           a.packages.len(),
@@ -215,7 +218,7 @@ pub fn has_promises(program: Program, frame: Frame) -> Bool =
       || o.items.fold(false, |a: Bool, it: OutlineItem|
         a || (match it { OutlinedFunction(f) -> f.reuse || f.returns, _ -> false })))
 
-fn broken_returns_clause(u: Unkept) -> Diag =
+fn broken_returns_clause(u: Unkept) -> Diagnostic =
   error_at(
     b"E0148",
     u.module,
@@ -296,7 +299,7 @@ fn site_lines(
   }
 }
 
-fn def_lines(
+fn definition_lines(
   style: Style,
   places: List<SourceText>,
   lines: List<String>,
@@ -310,7 +313,7 @@ fn def_lines(
 }
 
 fn total(report: Report, verdict: Bytes) -> Int =
-  report.defs.fold(0, |acc: Int, d: Costed| acc + count_verdict(d, verdict))
+  report.definitions.fold(0, |acc: Int, d: Costed| acc + count_verdict(d, verdict))
 
 fn summary(report: Report) -> String / {abort.raise} = {
   let reuses = total(report, b"reuses");
@@ -331,15 +334,17 @@ pub fn report_lines(
   places: List<SourceText>,
   report: Report,
 ) -> List<String> / {abort.raise} =
-  if report.defs.len() == 0 { ["", indent() ++ dim(style, "no updates: nothing to cost")] } else {
-    report.defs.fold([""], |acc: List<String>, d: Costed| def_lines(style, places, acc, d)).push(
+  if report.definitions.len() == 0 { ["", indent() ++ dim(style, "no updates: nothing to cost")] }
+  else {
+    report.definitions.fold([""], |acc: List<String>, d: Costed|
+      definition_lines(style, places, acc, d)).push(
       "",
     ).push(
       "  " ++ dim(style, summary(report)),
     )
   }
 
-pub fn unresolved() -> Diag =
+pub fn unresolved() -> Diagnostic =
   error_at(
     b"E0505",
     no_module(),
@@ -349,7 +354,7 @@ pub fn unresolved() -> Diag =
     [b"this is Ply's fault: the compiler's own `costs.ply` is what failed here"],
   )
 
-fn unkept(d: Costed, promise: Span, site: Site) -> Diag = {
+fn unkept(d: Costed, promise: Span, site: Site) -> Diagnostic = {
   let held = if site.op == b"Array::set" { b"array" } else { b"list" };
   let what = if site.verdict == b"copies" { b"copies its ".concat(held) }
   else { b"cannot be shown to reuse its ".concat(held) };
@@ -378,28 +383,31 @@ fn unkept(d: Costed, promise: Span, site: Site) -> Diag = {
   )
 }
 
-pub fn promises(report: Report) -> List<Diag> =
-  report.defs.fold([], |acc: List<Diag>, d: Costed|
+pub fn promises(report: Report) -> List<Diagnostic> =
+  report.definitions.fold([], |acc: List<Diagnostic>, d: Costed|
     match d.reuse {
       None -> acc,
       Some(promise) ->
-        d.sites.fold(acc, |diags: List<Diag>, site: Site|
-          if site.verdict == b"reuses" || site.param >= 0 { diags }
-          else { diags.push(unkept(d, promise, site)) }),
+        d.sites.fold(acc, |diagnostics: List<Diagnostic>, site: Site|
+          if site.verdict == b"reuses" || site.param >= 0 { diagnostics }
+          else { diagnostics.push(unkept(d, promise, site)) }),
     })
 
 test "a cost report's key moves with the checker, a module's text, the packages and an embed" {
-  let srcs = [b"fn f() -> Int = 1", b"fn g() -> Int = 2"];
+  let sources = [b"fn f() -> Int = 1", b"fn g() -> Int = 2"];
   let embedded = |bytes: Bytes|
     [{ module: b"m", key: b"file:x", read: Ok([embed_file(b"", bytes)]) }];
   let key = |identity: Bytes, texts: List<Bytes>, module_packages: List<Int>, embeds: List<ModuleEmbed>|
     costs_key(identity, [b"m", b"n"], texts, [], module_packages, 1, embeds);
-  let base = key(b"c", srcs, [0, 0], []);
-  assert_eq(key(b"c", srcs, [0, 0], []), base);
-  assert(key(b"d", srcs, [0, 0], []) != base, None);
+  let base = key(b"c", sources, [0, 0], []);
+  assert_eq(key(b"c", sources, [0, 0], []), base);
+  assert(key(b"d", sources, [0, 0], []) != base, None);
   assert(key(b"c", [b"fn f() -> Int = 1", b"fn g() -> Int = 3"], [0, 0], []) != base, None);
-  assert(key(b"c", srcs, [0, 1], []) != base, None);
-  assert(key(b"c", srcs, [0, 0], embedded(b"1")) != key(b"c", srcs, [0, 0], embedded(b"2")), None)
+  assert(key(b"c", sources, [0, 1], []) != base, None);
+  assert(
+    key(b"c", sources, [0, 0], embedded(b"1")) != key(b"c", sources, [0, 0], embedded(b"2")),
+    None,
+  )
 }
 
 test "a cost report stands over a shipped module that gained what the program does not reach" {
@@ -409,7 +417,7 @@ test "a cost report stands over a shipped module that gained what the program do
       Analysed(a) ->
         keyed_sources(
           a,
-          a.mods.map(|m: ParsedModule| if m.name == b"std.x" { x } else { user.src }),
+          a.modules.map(|m: ParsedModule| if m.name == b"std.x" { x } else { user.src }),
         ),
       Refused(_) -> panic("the program checks"),
     };
@@ -463,7 +471,7 @@ test "a definition's tally names only the verdicts it has, in one order" {
 }
 
 test "a program that updates nothing is told so on one line" {
-  assert_eq(report_lines(plain(), place(), { ok: true, rounds: 1, defs: [], unkept: [] }), [
+  assert_eq(report_lines(plain(), place(), { ok: true, rounds: 1, definitions: [], unkept: [] }), [
     "",
     "   no updates: nothing to cost",
   ])
@@ -473,7 +481,7 @@ test "a site is placed by its file's base name and the verdict column does not m
   let r: Report = {
     ok: true,
     rounds: 2,
-    defs: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)],
+    definitions: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)],
     unkept: [],
   };
   assert_eq(report_lines(plain(), place(), r), [
@@ -492,21 +500,23 @@ test "a `reuse fn` is refused for a copy its own body causes and for nothing els
   let kept: Report = {
     ok: true,
     rounds: 1,
-    defs: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)],
+    definitions: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)],
     unkept: [],
   };
   assert_eq(promises(kept), []);
   let caller: Report = {
     ok: true,
     rounds: 1,
-    defs: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)],
+    definitions: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)],
     unkept: [],
   };
   assert_eq(promises(caller), []);
   let broken: Report = {
     ok: true,
     rounds: 1,
-    defs: [costed(b"fn", [site(b"copies", b"read again", b"`Map::update`", 0 - 1)], promise)],
+    definitions: [
+      costed(b"fn", [site(b"copies", b"read again", b"`Map::update`", 0 - 1)], promise),
+    ],
     unkept: [],
   };
   let raised = promises(broken);
@@ -522,21 +532,21 @@ test "a `reuse fn` is refused for a copy its own body causes and for nothing els
   let hopeless: Report = {
     ok: true,
     rounds: 1,
-    defs: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)],
+    definitions: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)],
     unkept: [],
   };
-  assert_eq(promises(hopeless).map(|x: Diag| x.message), [
+  assert_eq(promises(hopeless).map(|x: Diagnostic| x.message), [
     b"`grow` is a `reuse fn`, and this `List::push` cannot be shown to reuse its list: a call",
   ]);
   let array: Report = {
     ok: true,
     rounds: 1,
-    defs: [
+    definitions: [
       costed(b"fn", [{ ..site(b"copies", b"read again", b"", 0 - 1), op: b"Array::set" }], promise),
     ],
     unkept: [],
   };
-  assert_eq(promises(array).map(|x: Diag| x.message), [
+  assert_eq(promises(array).map(|x: Diagnostic| x.message), [
     b"`grow` is a `reuse fn`, and this `Array::set` copies its array: read again",
   ])
 }
@@ -545,7 +555,7 @@ test "a definition with no promise is costed and never refused" {
   let r: Report = {
     ok: true,
     rounds: 1,
-    defs: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)],
+    definitions: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)],
     unkept: [],
   };
   assert_eq(promises(r), [])

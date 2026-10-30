@@ -14,7 +14,7 @@ import compiler.front.facts (Analysis)
 import compiler.front (EmbedRecord, ShippedInputs, analyse_pulling_std_with)
 import compiler.store.hash (Contract, public_contracts)
 import compiler.front.pkg (PackageSources, SuppliedPackage, is_dotted_path)
-import compiler.check.resolve.tables (Diag, Source, error_at)
+import compiler.check.resolve.tables (Diagnostic, Source, error_at)
 import std.fs (fs)
 import std.json (Json, Array, Bool, Number, Str, object)
 import std.net (net)
@@ -47,7 +47,7 @@ fn consumer_manifest(manifest: Manifest) -> Bytes =
   )
 
 pub type Consumer = {
-  pkgs: PackageSources,
+  packages: PackageSources,
   whole: Analysis,
   modules: List<Bytes>,
   shipping: ShippedInputs,
@@ -57,20 +57,21 @@ pub fn analyse_as_consumer(
   root: Bytes,
   manifest: Manifest,
   own: SuppliedPackage,
-  deps: List<SuppliedPackage>,
+  dependencies: List<SuppliedPackage>,
   embeds: List<EmbedRecord>,
-) -> Result<Consumer, List<Diag>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let pkgs: PackageSources = {
+) -> Result<Consumer, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let packages: PackageSources = {
     root: root,
     manifest: Some(consumer_manifest(manifest)),
-    supplied: deps.fold([own], |acc: List<SuppliedPackage>, s: SuppliedPackage| acc.push(s)),
+    supplied: dependencies.fold([own], |acc: List<SuppliedPackage>, s: SuppliedPackage|
+      acc.push(s)),
   };
-  let shipping = shipping_for([], pkgs);
+  let shipping = shipping_for([], packages);
   match analyse_pulling_std_with(
       [],
       shipping.read,
       no_rows(),
-      pkgs,
+      packages,
       embeds,
       unread: shipping.unread,
       data: shipping.data,
@@ -79,7 +80,7 @@ pub fn analyse_as_consumer(
     Analysed(w) -> {
       let prefix = Bytes::of_string(prefix_of(manifest));
       Ok({
-        pkgs: pkgs,
+        packages: packages,
         whole: w,
         modules: own.modules.map(|s: Source| Bytes::concat_all([prefix, b".", s.name])),
         shipping: shipping,
@@ -97,7 +98,7 @@ pub type ContractChanges = { added: List<String>, changed: List<String>, removed
 
 fn by_key(cs: List<Contract>) -> Map<Bytes, Contract> =
   cs.fold(Map::new(), |acc: Map<Bytes, Contract>, c: Contract|
-    acc.insert(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name), c))
+    acc.insert(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name), c))
 
 fn shown_name(c: Contract) -> String = String::of_bytes_lossy(c.name)
 
@@ -106,18 +107,18 @@ pub fn contract_changes(was: List<Contract>, now: List<Contract>) -> ContractCha
   let after = by_key(now);
   {
     added: now.filter(|c: Contract|
-      !before.contains(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name))).map(
+      !before.contains(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name))).map(
       shown_name,
     ),
     changed: now.filter(|c: Contract|
-      match before.get(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name)) {
+      match before.get(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name)) {
         Some(b) -> b.hash != c.hash,
         None -> false,
       }).map(
       shown_name,
     ),
     removed: was.filter(|c: Contract|
-      !after.contains(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name))).map(
+      !after.contains(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name))).map(
       shown_name,
     ),
   }
@@ -169,7 +170,12 @@ fn change_summary(m: ContractChanges, b: Bump) -> String =
     }
   }
 
-pub fn bump_error(name: String, was: Version, now: Version, m: ContractChanges) -> Option<Diag> = {
+pub fn bump_error(
+  name: String,
+  was: Version,
+  now: Version,
+  m: ContractChanges,
+) -> Option<Diagnostic> = {
   let need = required_bump(m);
   let actual_bump = bump_between(was, now);
   if rank(actual_bump) >= rank(need) { None } else {
@@ -205,14 +211,14 @@ pub fn options_from(parsed: Parsed) -> Options =
     to: parsed.positionals.at_or(2, ""),
   }
 
-fn version_of(text: String) -> Result<Version, Diag> / {abort.raise} =
+fn version_of(text: String) -> Result<Version, Diagnostic> / {abort.raise} =
   match parse_version(text) {
     Some(v) -> Ok(v),
     None ->
       Err(rejected_package("`" ++ text ++ "` is not a version", [b"a version reads like `0.2.0`"])),
   }
 
-pub fn unpublished(name: String, version: Version) -> Diag =
+pub fn unpublished(name: String, version: Version) -> Diagnostic =
   error_at(
     b"E0143",
     no_module(),
@@ -228,12 +234,18 @@ pub fn published_contracts(
   name: String,
   index: Index,
   version: Version,
-) -> Result<List<Contract>, List<Diag>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> Result<List<Contract>, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match release_at(index, version) {
     None -> Err([unpublished(name, version)]),
     Some(r) -> match fetch_closure(base, root, name, r) {
       Err(d) -> Err([d]),
-      Ok(c) -> match analyse_as_consumer(Bytes::of_string(root), c.manifest, c.own, c.deps, []) {
+      Ok(c) -> match analyse_as_consumer(
+          Bytes::of_string(root),
+          c.manifest,
+          c.own,
+          c.dependencies,
+          [],
+        ) {
         Err(ds) -> Err(ds),
         Ok(x) -> Ok(promised(x)),
       },
@@ -327,13 +339,13 @@ fn contracts_output(
 }
 
 fn contract_of(name: String, hash: Bytes) -> Contract =
-  { name: Bytes::of_string(name), decl: false, hash: hash }
+  { name: Bytes::of_string(name), declaration: false, hash: hash }
 
 test "what moved is each definition added, changed or removed, by name and namespace" {
   let was = [
     contract_of("m.a", b"1"),
     contract_of("m.b", b"2"),
-    { ..contract_of("m.T", b"3"), decl: true },
+    { ..contract_of("m.T", b"3"), declaration: true },
   ];
   let now = [
     contract_of("m.a", b"1"),
