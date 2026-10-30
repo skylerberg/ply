@@ -47,7 +47,7 @@ import compiler.check.infer.definitions (Extern, declared_natives, program_nativ
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.print.head (unit_head, unit_tail, bound, pointer_declared)
 import compiler.cc
-import compiler.cc (part_mark, source_digest, Source, WrittenPart, toolchain)
+import compiler.cc (part_mark, written_part, Source, WrittenPart, toolchain)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Runtime, Unserved, unserved, unserved_line, runtime_of,
                           uniform_native, serving, Machine, machine_name)
@@ -65,10 +65,8 @@ import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
-import compiler.syntax.parsing
 import compiler.syntax.parsing (no_module)
-import compiler.syntax.items (read_without_import, homes_declaring, SRequires, SEnsures,
-                              spec_kind_text)
+import compiler.syntax.items (SRequires, SEnsures, spec_kind_text)
 import compiler.syntax.exprs (prelude_module)
 import compiler.emit.print.counting (same_word_fn)
 
@@ -1425,9 +1423,10 @@ fn part_written<| e>(
         natives,
         constant_c,
       );
-      let made = { digest: source_digest(unit_head(), text), size: text.len() };
+      let part = written_part(unit_head(), p.label, text);
+      let made = { digest: part.digest, size: part.size };
       {
-        part: { label: p.label, digest: made.digest, size: made.size, text: Some(text) },
+        part: part,
         records: if recorded == Some(made) { [] }
         else { [{ key: part_record(key), bytes: bin::encode(made, part_kept_bin()) }] },
       }
@@ -1567,13 +1566,7 @@ pub fn produce<| e>(
     { label: "taken", text: taken_part(by_name.values()) },
     { label: "tables", text: tables_part(plans, pools.lambdas, exports, by_name.len()) },
   ].filter(|s: { label: String, text: Bytes }| s.text.len() > 0).map(
-    |s: { label: String, text: Bytes }|
-      {
-        label: s.label,
-        digest: source_digest(unit_head(), s.text),
-        size: s.text.len(),
-        text: Some(s.text),
-      },
+    |s: { label: String, text: Bytes }| written_part(unit_head(), s.label, s.text),
   );
   {
     parts: written.parts.concat(tail),
@@ -1583,25 +1576,17 @@ pub fn produce<| e>(
   }
 }
 
-/// The C of a unit whole, from its `parts`, every one written anew: what a caller that takes no part
-/// from the cache reads.
-pub fn unit_text(parts: List<WrittenPart>) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    [unit_head()].concat(
-      parts.map(|w: WrittenPart|
-        match w.text {
-          Some(t) -> t,
-          None -> panic("a unit whose text is read takes no part from the cache"),
-        }),
-    ),
-  )
-
 /// The sources of a unit's `parts`, each new one's C kept below the cache after the head its digest
 /// covers: what a C compiler is handed.
 pub fn kept_sources(
   parts: List<WrittenPart>,
 ) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} =
   cc::kept(unit_head(), parts)
+
+/// The C of a unit whole, read back from the `sources` [`kept_sources`] kept: what an artifact
+/// carries. Refuses a source the cache no longer holds.
+pub fn read_back(sources: List<Source>) -> Result<Bytes, String> / {toolchain.read, abort.raise} =
+  cc::read_back(unit_head(), sources)
 
 // --- What a root runs ----------------------------------------------------------
 
@@ -1703,7 +1688,7 @@ fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program
     acc.insert(m.name, m));
   // The program's own prelude, which every module imports; a scope left without one takes the
   // shipped prelude's text.
-  let read = modules_read(by_name, sources, modules_lowered(roots).keys().push(prelude_module()));
+  let read = modules_read(by_name, modules_lowered(roots).keys().push(prelude_module()));
   let reads = dump.embeds.fold(Map::new(), |acc: Map<Int, List<Bytes>>, e: EmbedAt|
     match by_name.get(e.module) {
       None -> acc,
@@ -1766,24 +1751,13 @@ fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program
 
 /// Each module the roots written in `starts` read, by its name, with the modules it depends on: what
 /// it imports and what it reads with no import (a type's home, the scheduler), closed over those.
-/// `by_name` holds the program's modules, whose texts `sources` holds by index; a module is lexed
-/// only once the closure reaches it.
+/// `by_name` holds the program's modules.
 fn modules_read(
   by_name: Map<Bytes, ModuleRow>,
-  sources: List<Bytes>,
   starts: List<Bytes>,
 ) -> Map<Bytes, List<Bytes>> / {abort.raise} = {
-  let text = |m: Bytes| match by_name.get(m) { Some(row) -> sources.at(row.index), None -> None };
-  let declared = homes_declaring(text);
-  let deps = |m: Bytes| {
-    let homes = match text(m) {
-      Some(t) -> read_without_import(m, parsing::start(t).input, || declared),
-      None -> [],
-    };
-    (match by_name.get(m) { Some(row) -> row.imports, None -> [] }).concat(homes).filter(
-      |d: Bytes| d != m && by_name.contains(d),
-    )
-  };
+  let deps = |m: Bytes|
+    match by_name.get(m) { Some(row) -> row.imports.concat(row.unimported), None -> [] };
   // Each round reads a module no earlier one did.
   iterate(
     { read: Map::new(), next: starts.filter(|m: Bytes| by_name.contains(m)) },
@@ -3632,6 +3606,18 @@ pub fn held(
 
 // --- Tests ------------------------------------------------------------------
 
+/// The C of a unit whole, from its `parts`, every one written anew.
+pub fn unit_text(parts: List<WrittenPart>) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    [unit_head()].concat(
+      parts.map(|w: WrittenPart|
+        match w.text {
+          Some(t) -> t,
+          None -> panic("a unit whose text is read takes no part from the cache"),
+        }),
+    ),
+  )
+
 /// A unit `produce` made with no part kept, and its C whole.
 type Fresh = { text: Bytes, parts: List<WrittenPart>, taken: List<RootName>, made: Made }
 
@@ -4293,7 +4279,8 @@ type Cut = { label: String, text: Bytes }
 
 /// The parts `cc.split` cuts unit `text` into, in the order the unit holds them.
 fn parts_in(text: Bytes) -> List<Cut> / {abort.raise} =
-  cc::split(text).parts.sort_by(|a: Cut, b: Cut| found_at(text, a.text) < found_at(text, b.text))
+  cc::split(text).parts.map(|w: WrittenPart|
+    { label: w.label, text: match w.text { Some(t) -> t, None -> b"" } })
 
 /// The parts of unit `text` that hold its bodies: each before the runtime's.
 fn body_parts(text: Bytes) -> List<Cut> / {abort.raise} =
@@ -6351,6 +6338,30 @@ test "a function of a type a module calls with no import is read from its home, 
     ),
     [b"m.first"],
   )
+}
+
+test "a module's row names the home and the scheduler it reads with no import, which a unit reads with it" {
+  let user = [
+    {
+      name: b"m",
+      src: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
+    },
+    { name: b"n", src: b"import m\npub fn one() -> Int = 1\n" },
+  ];
+  let shipped = [
+    {
+      name: b"std.list",
+      src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+    },
+    { name: b"std.internal.schedule", src: b"pub fn idle() -> Int = 0\n" },
+  ];
+  let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
+  let unimported = |module: Bytes|
+    dump.modules.filter(|row: ModuleRow| row.name == module).map(|row: ModuleRow| row.unimported);
+  assert_eq(unimported(b"m"), [[b"std.list", b"std.internal.schedule"]]);
+  assert_eq(unimported(b"n"), [[]]);
+  let p = program_of(dump, sources_placed(dump, user.concat(shipped)), [Named(b"m.first")]);
+  assert_eq(p.read.keys(), [b"m", b"std.internal.schedule", b"std.list", prelude_module()])
 }
 
 test "a law's body over a sort it leaves uninterpreted is lowered as a generic body as it stands" {
