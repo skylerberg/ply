@@ -3,15 +3,14 @@ import compiler.syntax.expressions (crossing_perform, scheduler_module)
 import compiler.check.types (Type, NamedType, int_type, string_type, bool_type)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (int_literal)
-import compiler.emit.roots (symbol_of, root_id)
+import compiler.emit.roots (root_id, builtin_pointed)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Named, Root, Generated, root_name, root_text, has_entry,
-                           definition_of)
+import compiler.emit.keys (RootKey, Named, Root, Generated, has_entry, definition_of)
 import compiler.emit.evidence (declared_arity)
 import compiler.emit.representations (Constructors, no_constructors, known_layout)
 import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, ConstructorTag, FailureSiteRoot, InGroup,
-                             LambdaOwner, FromCaller, merged, pieces_text)
+                             LambdaOwner, FromCaller, merged, pieces_text, own_symbol)
 import compiler.emit.release (drop_of)
 import compiler.emit.typed_ir.handling (empty_instance)
 import compiler.emit.typed_ir (carried_variables, reps_of, all_given, param_rep,
@@ -32,7 +31,7 @@ import compiler.emit.typed_ir (carried_variables, reps_of, all_given, param_rep,
 import compiler.emit.print.text (BodyContext, InstructionContext, Printing, PrintOutput,
                                  empty_printing, function_body, line, text, pieces, pad, named,
                                  name_of, arg_text, assigned, label, check, failing_return, site,
-                                 slot, part_names, part_name, unsupported)
+                                 slot, part_names, part_name, unsupported, native_noted)
 import compiler.emit.print.ownership (block_opened, block_closed, count_printed, walked_value,
                                       last_of, updated, failure_exit_through)
 import compiler.emit.print.value_printing (c_type, as_word, word_as, word_to_parts, value_printing,
@@ -61,7 +60,7 @@ import compiler.emit.print.frames (site_linked, handle_linked, unlinked, record_
 import compiler.emit.print.count_functions (dup_fn, release_fn, call_text)
 
 pub fn printed_fn(f: Fn, constructors: Constructors) -> PrintOutput / {abort.raise} = {
-  let name = symbol_of(root_text(root_name(f.key)));
+  let name = own_symbol(None);
   let own = if f.members.len() == 0 { root_printed(name, f, constructors) }
   else { group_printed(name, f, constructors) };
   let closures = range(0, f.lambdas.len()).fold(
@@ -69,7 +68,7 @@ pub fn printed_fn(f: Fn, constructors: Constructors) -> PrintOutput / {abort.rai
     |acc: { printing: Printing, out: List<Piece> }, k: Int|
       match f.lambdas.at(k) {
         Some(l) -> {
-          let t = lambda_text(f, k, l, closure_printed(name, k, l, acc.printing));
+          let t = lambda_text(name, k, l, closure_printed(name, k, l, acc.printing));
           { printing: t.printing, out: acc.out.concat(t.out) }
         },
         None -> acc,
@@ -92,6 +91,7 @@ pub fn printed_fn(f: Fn, constructors: Constructors) -> PrintOutput / {abort.rai
     handles: tables.handles,
     expects: tables.expects,
     shared: tables.shared,
+    natives: tables.natives,
   }
 }
 
@@ -248,7 +248,7 @@ fn group_printed(
   let wrappers = range(0, f.members.len()).fold(
     { printing: switched, out: [] },
     |acc: { printing: Printing, out: List<Piece> }, i: Int| {
-      let w = group_wrapper(f, i, acc.printing);
+      let w = group_wrapper(name, f, i, acc.printing);
       { printing: w.printing, out: acc.out.concat(w.out) }
     },
   );
@@ -872,14 +872,15 @@ fn native(
   pr: Printing,
   into: Option<Var>,
   n: { name: Bytes, args: List<Arg>, uses: OperationSignature },
-) -> Printing = {
+) -> Printing / {abort.raise} = {
   let call = Bytes::concat_all([
     n.name,
     b"(ctx",
     Bytes::concat_all(n.args.map(|a: Arg| b", ".concat(arg_text(pr, a)))),
     b")",
   ]);
-  let sited = if n.uses.fails { site(p, pr) } else { pr };
+  let noted = match builtin_pointed(n.name) { Some(h) -> native_noted(pr, h), None -> pr };
+  let sited = if n.uses.fails { site(p, noted) } else { noted };
   let written = match into {
     Some(v) -> assigned(sited, p.depth, v, c_type(v.representation), call),
     None -> line(sited, p.depth, call.concat(b";")),
@@ -1121,7 +1122,7 @@ test "a tail group is one function switching on its member's place, each arm ope
       no_constructors(),
     ).pieces,
   );
-  let g = symbol_of(b"m.even").concat(b"_group");
+  let g = own_symbol(None).concat(b"_group");
   let said = Some(String::of_bytes_lossy(text));
   let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
   assert(at(g.concat(b"(PlyCtx *ctx, int which")) >= 0 && at(b"switch (which)") >= 0, said);
@@ -1171,14 +1172,14 @@ test "a closure's function follows its root's, and its body numbers its temporar
     words: no_closure_evidence(),
   });
   let f = { ..body, lambdas: [l] };
-  let name = symbol_of(b"m.outer");
+  let name = own_symbol(None);
   let inner = closure_printed(name, 0, l, { ..empty_printing(Map::new()), temps: 7, labels: 3 });
   let body = pieces_text(inner.out);
   assert(body.index_of(b" t1;") != None && body.index_of(b"t8") == None, None);
   let printed = printed_fn(f, no_constructors());
   assert(
     pieces_text(printed.pieces).ends_with(
-      b"}\n".concat(pieces_text(lambda_text(f, 0, l, inner).out)),
+      b"}\n".concat(pieces_text(lambda_text(name, 0, l, inner).out)),
     ),
   );
   assert_eq(printed.lambdas, [])
@@ -1215,7 +1216,7 @@ test "a plain root never probes the stack; a drop root nests through the release
   let text_of = |op: keys::TypeOp| {
     let f = plain(op);
     let all = pieces_text(printed_fn(f, no_constructors()).pieces);
-    let own = Bytes::concat_all([c_declaration(symbol_of(root_text(root_name(f.key))), f), b" {"]);
+    let own = Bytes::concat_all([c_declaration(own_symbol(None), f), b" {"]);
     match all.index_of(own) {
       Some(i) -> match all.index_of_from(b"\n}\n", i) { Some(j) -> all.slice(i, j), None -> b"" },
       None -> b"",
