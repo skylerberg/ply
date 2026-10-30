@@ -4,8 +4,8 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               SelectedNames, dump_item, target_type, item_span, ModuleAlias,
                               WholeModule, DeriveItem, InstanceItem, NumericItem)
 import compiler.syntax.type_syntax (WriteMode)
-import compiler.syntax.expressions (sees_homes, is_hidden_binder, prelude_module, scheduler_module,
-                                    Expression, PerformExpression, expression_span)
+import compiler.syntax.expressions (sees_homes, is_hidden_binder, prelude_module, Expression,
+                                    PerformExpression, expression_span)
 import compiler.syntax.node_ids (numbered_module)
 import compiler.expand.rewrite.shared (expressions_matching)
 import compiler.emit.code (Code, dump)
@@ -42,9 +42,8 @@ import compiler.expand.embed (ModuleEmbed, EmbedResult, EmbedFile, EmbedBytes, E
                               EmbedRequest, ItemEmbeds, embed_request_bin, embed_result_bin,
                               item_embeds_bin, embed_key, inline_embeds, embed_requests,
                               requests_by_item, requests_in, request_of_key, embed_file)
-import compiler.syntax.items (parse, import_declaration_bin, read_without_import, scheduler_read,
-                              homes_declaring, homes_for, called_names, is_std, is_shipped,
-                              HomeNames)
+import compiler.syntax.items (parse, import_declaration_bin, scheduler_read, homes_declaring,
+                              homes_for, called_names, is_std, is_shipped, HomeNames)
 import compiler.syntax.lexer (is_identifier_continue)
 import compiler.front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterConstructor,
                             FunctionWidths, ListWidths, MapWidths, NoWidths, RecordWidths,
@@ -64,7 +63,7 @@ import compiler.front.published (no_rows, encode_rows, decode_rows, rows_of, inf
                                  analyse_with, HashedProgram, hashed_closure, resolved_closure,
                                  checked_closure, runtime_dump, entry_header, dump_of, Claim,
                                  ClaimDefinition, ClaimLaw, ClaimSum, ClaimClause, claims,
-                                 claims_in, rechecked, untested)
+                                 claims_in, rechecked, untested, unimported_read)
 
 fn import_at(imports: List<ImportDeclaration>, name: Bytes) -> Span / {abort.raise} = {
   let found = imports.fold(None, |acc: Option<Span>, declaration: ImportDeclaration|
@@ -335,9 +334,6 @@ fn with_home_imports<| e>(
     }
   }
 
-fn implicit_imports_covered(declared: List<HomeNames>, required: List<Bytes>) -> Bool =
-  declared.len() == 0 && required.contains(scheduler_module())
-
 fn read_needed<| e>(
   users: Int,
   listed: List<Bytes>,
@@ -525,7 +521,11 @@ type PullState = {
   embeds: List<ModuleEmbed>,
   diagnostics: List<Diagnostic>,
   cuts: List<StubCuts>,
+  unimported: Map<Bytes, List<Bytes>>,
 }
+
+fn asked_with(asked: List<Bytes>, unimported: Map<Bytes, List<Bytes>>) -> List<Bytes> =
+  unimported.fold(asked, |acc: List<Bytes>, _: Bytes, read: List<Bytes>| acc.concat(read))
 
 fn with_hidden_imports(p: ParsedSource, dependencies: Option<Dependencies>) -> ParsedSource =
   match dependencies {
@@ -575,6 +575,29 @@ fn pull_rounds(
     if r.diagnostics.len() > 0 { { ..x, diagnostics: r.diagnostics } }
     else if r.wanted.len() == 0 { x }
     else if rounds_left <= 0 { panic("a shipped module pulled twice") } else {
+      let read = unimported_read(
+        r.wanted.fold([], |acc: List<Source>, name: Bytes, src: Bytes|
+          acc.push({ name: name, src: src })),
+        declared,
+      );
+      let round = r.wanted.fold(x, |acc: PullState, name: Bytes, src: Bytes| {
+        let at = acc.parsed.len();
+        let o = shipped_embedded(
+          whole,
+          dependencies,
+          data,
+          at,
+          parsed_at(given, derived, at, { name: name, src: src }),
+        );
+        {
+          ..acc,
+          parsed: acc.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
+          cuts: if tested { acc.cuts }
+          else { acc.cuts.push({ name: o.parsed.name, cuts: cuts_of(o.parsed.module) }) },
+          pulled: acc.pulled.push(name),
+          embeds: acc.embeds.concat(o.embeds),
+        }
+      });
       pull_rounds(
         users,
         shipped,
@@ -583,29 +606,15 @@ fn pull_rounds(
         data,
         listed,
         tested,
-        r.wanted.fold(x, |acc: PullState, name: Bytes, src: Bytes| {
-          let at = acc.parsed.len();
-          let o = shipped_embedded(
-            whole,
-            dependencies,
-            data,
-            at,
-            parsed_at(given, derived, at, { name: name, src: src }),
-          );
-          {
-            ..acc,
-            parsed: acc.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
-            cuts: if tested { acc.cuts }
-            else { acc.cuts.push({ name: o.parsed.name, cuts: cuts_of(o.parsed.module) }) },
-            pulled: acc.pulled.push(name),
-            embeds: acc.embeds.concat(o.embeds),
-          }
-        }),
-        rounds_left - 1,
-        if implicit_imports_covered(declared, required) { required } else {
-          r.wanted.fold(required, |acc: List<Bytes>, name: Bytes, src: Bytes|
-            acc.concat(read_without_import(name, start(src).input, || declared)))
+        {
+          ..round,
+          unimported: read.fold(
+            round.unimported,
+            |acc: Map<Bytes, List<Bytes>>, name: Bytes, reads: List<Bytes>| acc.insert(name, reads),
+          ),
         },
+        rounds_left - 1,
+        asked_with(required, read),
         declared,
         given,
         derived,
@@ -829,11 +838,8 @@ fn pulled_load(
   let texts = lookup_or_empty.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
   let sources = user.concat(package_closure.modules.map(|m: { pkg: Int, src: Source }| m.src));
-  let declared = homes_declaring(|h: Bytes| if required.contains(h) { None } else { texts.get(h) });
-  let read_requests = if implicit_imports_covered(declared, required) { required } else {
-    sources.fold(required, |acc: List<Bytes>, s: Source|
-      acc.concat(read_without_import(s.name, start(s.src).input, || declared)))
-  };
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  let unimported = unimported_read(sources, declared);
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
     |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
@@ -873,9 +879,16 @@ fn pulled_load(
     data_by_name(data),
     listed,
     tested,
-    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diagnostics: [] },
+    {
+      parsed: assembled,
+      pulled: [],
+      embeds: [],
+      cuts: read.cuts,
+      diagnostics: [],
+      unimported: unimported,
+    },
     texts.len(),
-    read_requests,
+    asked_with(required, unimported),
     declared,
     given,
     derived,
@@ -923,6 +936,7 @@ pub fn staged_pulling_std_with(
         load.package_closure,
         user.len(),
         load.tree,
+        x.unimported,
         fixed,
         load.embeds_at.concat(x.embeds),
         x.cuts,
@@ -1858,6 +1872,7 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       index: 0,
       items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
       imports: [prelude_module()],
+      unimported: [],
       sets: [],
       cuts: [
         { start: 115, end: 126, braced: true, name: b"m.say", test: false },

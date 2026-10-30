@@ -2,7 +2,7 @@ import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, dummy_span, m
                                 parse_diagnostic, parse_label, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, TestItem, LawItem, SumBody,
                               SpecKind, FnDefinition, LawDefinition, SchemaInstance)
-import compiler.syntax.expressions (expression_span, prelude_module, prelude_own)
+import compiler.syntax.expressions (expression_span, prelude_module, prelude_own, scheduler_module)
 import compiler.emit.code (Code, CodeLiteral, CodeVar, NDefinition, NConstructor, NBuiltin,
                            CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda, CodeSimulate,
@@ -51,7 +51,7 @@ import std.bin
 import std.hash (blake3)
 import std.list
 import compiler.expand.embed (ModuleEmbed, ItemEmbeds)
-import compiler.syntax.items (parse)
+import compiler.syntax.items (parse, read_without_import, homes_declaring, unimported_of, HomeNames)
 import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefinitionRow, KnownTestRow,
                             Rows, known_definition_row_bin, rows_bin, ModuleSpan, DefinitionRow,
                             TestRow, DefinitionHashRow, HashTableRow, Dump, normalized_diagnostic)
@@ -377,7 +377,41 @@ pub fn analyse_with(
       untested({ ..parse_at(closed.len(), { name: prelude_module(), src: src }), src: src }),
     )
   };
-  analyse_closure(all, clo, rows, parsed.len(), tree_named(parsed.map(|p: ParsedSource| p.name)))
+  let texts = all.fold(Map::new(), |acc: Map<Bytes, Bytes>, p: ParsedSource|
+    acc.insert(p.name, p.src));
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  let unimported = if declared.len() == 0 && !texts.contains(scheduler_module()) { Map::new() }
+  else { unimported_read(all.map(|p: ParsedSource| { name: p.name, src: p.src }), declared) };
+  analyse_closure(
+    all,
+    clo,
+    rows,
+    parsed.len(),
+    tree_named(parsed.map(|p: ParsedSource| p.name)),
+    unimported,
+  )
+}
+
+pub fn unimported_read(
+  sources: List<Source>,
+  declared: List<HomeNames>,
+) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+  sources.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, s: Source|
+    acc.insert(s.name, read_without_import(s.name, start(s.src).input, || declared)))
+
+fn unimported_in(
+  modules: List<ParsedModule>,
+  r: Resolution,
+  read: Map<Bytes, List<Bytes>>,
+) -> List<List<Bytes>> / {abort.raise} = {
+  let held = modules.fold(Map::new(), |acc: Map<Bytes, Bool>, m: ParsedModule|
+    acc.insert(m.name, true));
+  range(0, modules.len()).map(|i: Int|
+    unimported_of(
+      match read.get(modules.get(i).name) { Some(xs) -> xs, None -> [] },
+      |m: Bytes| held.contains(m),
+      r.imports.get(i).map(|t: Int| modules.get(t).name),
+    ))
 }
 
 fn with_prelude_module(
@@ -433,6 +467,7 @@ fn std_squats(
 pub type HashedProgram = {
   modules: List<ParsedModule>,
   r: Resolution,
+  unimported: List<List<Bytes>>,
   index: Index,
   hashes: HashOutput,
   unused: List<Diagnostic>,
@@ -452,6 +487,7 @@ pub fn hashed_closure(
   clo: Closure,
   root_count: Int,
   tree: ToolchainTree,
+  unimported: Map<Bytes, List<Bytes>>,
   fixed: CachedHashes = { nodes: [], tests: [], laws: [] },
   embeds: List<ModuleEmbed> = [],
   cuts: List<StubCuts> = [],
@@ -465,6 +501,7 @@ pub fn hashed_closure(
       Ok({
         modules: x.modules,
         r: x.r,
+        unimported: unimported_in(x.modules, x.r, unimported),
         index: resolved.index,
         hashes: hashed.hashes,
         unused: hashed.unused.filter(|diagnostic: Diagnostic|
@@ -546,6 +583,7 @@ pub fn checked_closure(
     Analysed({
       modules: h.modules,
       r: h.r,
+      unimported: h.unimported,
       checked: checked,
       index: h.index,
       hashes: {
@@ -623,14 +661,15 @@ fn analyse_closure(
   rows: Rows,
   root_count: Int,
   tree: ToolchainTree,
+  unimported: Map<Bytes, List<Bytes>>,
 ) -> AnalysisOutcome / {abort.raise} =
-  match hashed_closure(parsed, clo, root_count, tree) {
+  match hashed_closure(parsed, clo, root_count, tree, unimported) {
     Err(diagnostics) -> Refused(diagnostics),
     Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module()) {
         None
       } else { prelude_cut(parsed, h) } {
       None -> checked_closure(h, rows, CheckEvery),
-      Some(cut) -> match hashed_closure(cut, clo, root_count, tree) {
+      Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
         Err(diagnostics) -> Refused(diagnostics),
         Ok(kept) -> checked_closure(kept, rows, CheckEvery),
       },
