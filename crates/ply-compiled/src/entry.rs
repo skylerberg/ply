@@ -855,7 +855,6 @@ pub fn write_failure(w: &mut Writer, d: &Diagnostic, opened: Option<&Opened>) {
         .tag(match d.severity {
             Severity::Error => 0,
             Severity::Warning => 1,
-            Severity::Note => 2,
         })
         .str(&d.message);
     w.list(d.labels.iter(), |w, l| {

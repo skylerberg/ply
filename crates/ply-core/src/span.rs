@@ -159,7 +159,6 @@ impl SourceMap {
 pub enum Severity {
     Error,
     Warning,
-    Note,
 }
 
 #[derive(Clone, Debug)]
@@ -406,7 +405,6 @@ impl fmt::Display for Diagnostic {
         let titled = match self.severity {
             Severity::Error => "Error",
             Severity::Warning => "Warning",
-            Severity::Note => "Note",
         };
         write!(
             f,

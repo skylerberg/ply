@@ -1,7 +1,7 @@
 //! What this runtime says of itself to a compiler that emits code for it, in the form
 //! `compiler.emit.abi.runtime_of` reads: what a unit emitted against it is a function of, each
-//! native and helper it binds with what its function's type takes and answers, and where it lays
-//! out what emitted code reads in place, each as a named integer.
+//! native and helper it binds with what its function's type takes and answers, where it lays out
+//! what emitted code reads in place, each as a named integer, and the diagnostic codes it raises.
 
 use super::prelude::{machine_natives, own_helpers};
 use crate::blocks::{self, Filling, Page, Segment};
@@ -92,7 +92,8 @@ fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
 }
 
 /// This runtime, described: a line naming the form, then its identity, each native, each helper
-/// of its own and each fact, a line each, its words apart by one space.
+/// of its own, each fact and each diagnostic code it raises, a line each, its words apart by one
+/// space.
 pub fn described() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
@@ -106,6 +107,9 @@ pub fn described() -> &'static str {
         }
         for (name, value) in facts() {
             let _ = writeln!(out, "fact {name} {value}");
+        }
+        for code in ply_core::codes::ALL {
+            let _ = writeln!(out, "code {code}");
         }
         out
     })

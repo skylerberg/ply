@@ -11,10 +11,11 @@
 #                         Nothing found, or a download that failed, leaves the run to build.
 # ci-warm.sh handed NAME  likewise the artifact NAME of this run, which `build-ply` packed for the
 #                         run's other jobs
-# ci-warm.sh foreign      the C cache and stages another toolchain's run left, less the stages: each
-#                         file of the C cache is named by what decides it, so it serves any toolchain
-#                         that names it, but a stage's records do not say which compiler wrote them
-#                         (every builder writes `memo-std`)
+# ci-warm.sh foreign      the C cache and stages another toolchain's run left, less the stages but
+#                         `memo-std`: each file of the C cache is named by what decides it, and each
+#                         of std's records is kept under its query's code and held to its reads, so
+#                         either serves any toolchain that names it, but a stage holds what one
+#                         toolchain's binary built and filed for itself
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
 stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
@@ -55,10 +56,11 @@ case "${1:-}" in
     [ -f "$mark" ] || { echo "nothing is marked at $mark" >&2; exit 2; }
     before=$(megabytes "$cache" "$stage")
     # A store goes whole, kept where a run since the mark used it: its segments were written by
-    # earlier runs, and only its `.used` says this one read them.
+    # earlier runs, so its use is its `.used` or its own time, which the directory each run makes
+    # there moves, as `sweep`'s `last_use` reads it.
     for dir in "$stores"/*/; do
       [ -d "$dir" ] || continue
-      [ "$dir.used" -nt "$mark" ] || rm -rf "$dir"
+      [ "$dir.used" -nt "$mark" ] || [ "$dir" -nt "$mark" ] || rm -rf "$dir"
     done
     [ -d "$cache" ] && find "$cache" -path "$stores/*" -type d -prune -o -type f ! -newer "$mark" -print0 |
       xargs -0 rm -f --
@@ -69,8 +71,9 @@ case "${1:-}" in
           # Files swept one by one, as `sweep`'s `BY_FILE` takes them: each a runnable or an
           # answer of its own.
           answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
-          # A stage, and the memo stores, go whole: its `.used` stamp is what a load writes.
-          *) [ -n "$(find "$dir" -type f -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
+          # A stage, and a memo store, go whole, kept where it or anything in it is newer than the
+          # mark: a stage's `.used`, or a store's own time, which each run's directory there moves.
+          *) [ -n "$(find "$dir" -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
         esac
       done
     fi
@@ -106,8 +109,8 @@ case "${1:-}" in
     fi
     ;;
   foreign)
-    rm -rf "$stage"
-    echo "kept $(megabytes "$cache") MB of another toolchain's C cache, and none of its stages"
+    [ -d "$stage" ] && find "$stage" -mindepth 1 -maxdepth 1 ! -name memo-std -exec rm -rf {} +
+    echo "kept $(megabytes "$cache") MB of another toolchain's C cache and $(megabytes "$stage") MB of its std records, and none of its stages"
     ;;
   *)
     echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | handed NAME | foreign" >&2
