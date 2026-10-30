@@ -16,7 +16,7 @@
 #   ci-shards.sh toolchain-inputs [core]
 #                                each path a bootstrap reads Ply from, one a line,
 #                                which the toolchain key hashes; with `core`, of
-#                                the standard library only its prelude (`PRELUDE`)
+#                                the standard library only what the rest embeds
 #   ci-shards.sh work ROLE       each path `ply.work` gives ROLE (`ply work`), one a
 #                                line
 #   ci-shards.sh store-paths     where the runs keep their stores, one pattern a
@@ -40,7 +40,8 @@
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
 #                                sources job holds to `ply fmt --check`
-#   ci-shards.sh nightly-modules the modules of the CLI's suite no pull request runs, on one line,
+#   ci-shards.sh nightly-modules ROLE
+#                                the modules of the suite ROLE no pull request runs, on one line,
 #                                which the nightly job hands `ci-ply.sh nightly`
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF nothing restores again:
@@ -72,10 +73,10 @@ CLI_PARTS=4
 # A package's own tests and proofs share one job, `packages`, in turn: each loads little. These take
 # a job of their own instead: the compiler's own tests take every core.
 RUNS_ALONE=(package-compiler)
-# Modules of the CLI's suite no pull request runs, which the `nightly` job does: minutes each, the
-# reach audit checking packages cold and the copies audit listing every one, or against a postgres
-# they start.
-CLI_NIGHTLY=(reached copies db_in_ply db_wire pg_client)
+# Modules no pull request runs, which the `nightly` job does, as `role:module` with the role
+# `ply.work` gives their suite: minutes each, the reach audit checking packages cold and the copies
+# audit listing every one, or against a postgres they start.
+NIGHTLY=(cli-tests:reached cli-tests:copies std-tests:db_driver std-tests:pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
@@ -116,10 +117,6 @@ ACTIONS=(
 # The file that says where a bootstrap reads a checkout's parts (`toolchain_inputs`).
 TOOLCHAIN_WORKSPACE=ply.work
 
-# The prelude, the module of the language's own definitions, and the copy of its text the checker
-# reads builtins from, as paths under the library's tree: the one part of the library a `ply` takes
-# as given rather than reading a checkout's (`toolchain_inputs core`).
-PRELUDE=(prelude.ply prelude_source.ply)
 
 # What `ply work` prints of this checkout's `ply.work`, a role and a path a line, read once by the
 # commands that place a package, and the tables made of it.
@@ -293,10 +290,22 @@ cmd_job_runs() {
 
 # `<module>.` per module of the CLI's suite a pull request runs, on one line: the qualified names of
 # a module's tests begin so.
-cli_filters() {
-  local module
-  for module in $(modules_of "$CLI_SUITE"); do
-    named_in "$module" "${CLI_NIGHTLY[@]}" || printf '%s. ' "$module"
+# The modules of the suite `ply.work` gives ROLE that NIGHTLY leaves to the nightly job, one a line.
+nightly_of() {
+  local entry
+  for entry in "${NIGHTLY[@]}"; do
+    if [[ ${entry%%:*} == "$1" ]]; then printf '%s\n' "${entry#*:}"; fi
+  done
+}
+
+# What a pull request's run of the suite at PATH, which `ply.work` gives ROLE, filters its tests by:
+# every module but those NIGHTLY leaves to the nightly job, or nothing where it leaves none.
+suite_filters() {
+  local role=$1 path=$2 module nightly
+  nightly=$(nightly_of "$role")
+  [[ -n $nightly ]] || return 0
+  for module in $(modules_of "$path"); do
+    grep -qxF -- "$module" <<< "$nightly" || printf '%s. ' "$module"
   done
 }
 
@@ -304,14 +313,14 @@ cmd_run_line() {
   local id=$1 path part
   case "$id" in
     stdlib | proofs) printf '%s\t\t\n' "$STD_LIBRARY" ;;
-    std-tests) printf '%s\t\t\n' "$STD_TESTS" ;;
+    std-tests) printf '%s\t%s\t\n' "$STD_TESTS" "$(suite_filters std-tests "$STD_TESTS")" ;;
     cli-part-*)
       part=${id#cli-part-}
       if ! [[ $part =~ ^[1-9][0-9]*$ ]] || ((part > CLI_PARTS)); then
         echo "the CLI's suite runs in $CLI_PARTS parts, and '$id' is none of them" >&2
         return 1
       fi
-      printf '%s\t%s\t%d/%d\n' "$CLI_SUITE" "$(cli_filters)" "$part" "$CLI_PARTS"
+      printf '%s\t%s\t%d/%d\n' "$CLI_SUITE" "$(suite_filters cli-tests "$CLI_SUITE")" "$part" "$CLI_PARTS"
       ;;
     package-*)
       path=$(package_path "${id#package-}") || { echo "no package suite named '${id#package-}'" >&2; return 1; }
@@ -600,23 +609,14 @@ lexical() {
 
 # Each path of the repository a bootstrap reads Ply from, one a line: `ply.work`, the standard
 # library's, the compiler's and the program's trees it places, and every package the manifest of one
-# of those names by path, and theirs. With `core`, of the library only its prelude (`PRELUDE`), and a
-# prelude the tree does not hold fails, since a key that hashed nothing for it would match any.
+# of those names by path, and theirs. With `core`, all of these but the library's tree, and with them
+# each file they embed from outside themselves, as the compiler embeds the prelude whose text the
+# checker reads builtins from.
 toolchain_inputs() {
-  local scope=${1:-all} all prev dir rel file
+  local scope=${1:-all} all prev dir rel file target
   all=$({
     printf '%s\n' "$TOOLCHAIN_WORKSPACE"
-    if [[ $scope == core ]]; then
-      for file in "${PRELUDE[@]}"; do
-        if [[ ! -f $root/$(role std)/$file ]]; then
-          echo "the library holds no $(role std)/$file, which PRELUDE names" >&2
-          exit 1
-        fi
-        printf '%s/%s\n' "$(role std)" "$file"
-      done
-    else
-      role std
-    fi
+    [[ $scope == core ]] || role std
     role compiler
     role cli
   } | LC_ALL=C sort -u)
@@ -631,10 +631,48 @@ toolchain_inputs() {
           sed -n 's/.*source: *Path("\([^"]*\)").*/\1/p' "$root/$dir/ply.pkg" |
             while IFS= read -r rel; do lexical "$dir/$rel"; done
         done <<< "$prev"
+        if [[ $scope == core ]]; then
+          embeds_from <<< "$prev" | while IFS=: read -r file target; do
+            covered "$target" "$prev" || printf '%s\n' "$target"
+          done
+        fi
       } | grep . | LC_ALL=C sort -u
     )
   done
   printf '%s\n' "$all"
+}
+
+# `file:target` for each `embed` below the paths read on standard input that can leave its path,
+# each a path from the repository's root: within a tree only one that climbs out of its module's
+# directory, from a single file any. A line of a `\\` text is a program a test writes, and no embed.
+embeds_from() {
+  local path pattern file rel
+  while IFS= read -r path; do
+    if [ -d "$root/$path" ]; then
+      pattern='embed(_dir)?\("[^"]*\.\.[^"]*"'
+    elif [ -f "$root/$path" ]; then
+      pattern='embed(_dir)?\("[^"]*"'
+    else
+      continue
+    fi
+    { grep -rHE --include='*.ply' "$pattern" "$root/$path" || true; } |
+      { grep -vE '^[^:]*:[[:space:]]*\\\\' || true; } |
+      sed -E 's/^([^:]*):.*embed(_dir)?\("([^"]*)".*/\1:\3/' |
+      while IFS=: read -r file rel; do
+        [[ -n $rel ]] || continue
+        file=${file#"$root"/}
+        printf '%s:%s\n' "$file" "$(lexical "$(dirname "$file")/$rel")"
+      done
+  done
+}
+
+# Whether PATH lies in one of the paths INPUTS lists, a line each.
+covered() {
+  local target=$1 path
+  while IFS= read -r path; do
+    [[ -n $path && ($target == "$path" || $target == "$path"/*) ]] && return 0
+  done <<< "$2"
+  return 1
 }
 
 # The paths the toolchain key hashes (`toolchain_inputs`), and those its core hashes, held to what a
@@ -647,41 +685,24 @@ cmd_toolchain_embeds() {
   return $((bad > 0))
 }
 
-# `cmd_toolchain_embeds` of the paths `toolchain_inputs SCOPE` lists. Within a tree only an `embed`
-# that climbs out of its module's directory can leave it; a file of the core leaves itself with any.
+# `cmd_toolchain_embeds` of the paths `toolchain_inputs SCOPE` lists.
 toolchain_embeds() {
-  local scope=$1 inputs trees path file rel target covered pattern bad=0
+  local scope=$1 inputs trees file target bad=0
   inputs=$(toolchain_inputs "$scope")
   trees=$(grep -vxF -- "$TOOLCHAIN_WORKSPACE" <<< "$inputs" || true)
   if [[ -z $trees ]]; then
     echo "FAIL: $TOOLCHAIN_WORKSPACE places no part of the toolchain, so the toolchain key is held to nothing" >&2
     return 1
   fi
-  while IFS=: read -r file rel; do
-    [[ -n $rel ]] || continue
-    target=$(lexical "$(dirname "${file#"$root"/}")/$rel")
-    covered=no
-    while IFS= read -r path; do
-      [[ $target == "$path" || $target == "$path"/* ]] && covered=yes
-    done <<< "$inputs"
-    if [ "$covered" = no ]; then
-      echo "FAIL: ${file#"$root"/} embeds $target, outside every path the $scope toolchain key hashes" >&2
+  while IFS=: read -r file target; do
+    if ! covered "$target" "$inputs"; then
+      echo "FAIL: $file embeds $target, outside every path the $scope toolchain key hashes" >&2
+      bad=$((bad + 1))
+    elif [ ! -e "$root/$target" ]; then
+      echo "FAIL: $file embeds $target, which the tree does not hold" >&2
       bad=$((bad + 1))
     fi
-  done < <(while IFS= read -r path; do
-    if [ -d "$root/$path" ]; then
-      pattern='embed(_dir)?\("[^"]*\.\.[^"]*"'
-    elif [ -f "$root/$path" ]; then
-      pattern='embed(_dir)?\("[^"]*"'
-    else
-      continue
-    fi
-    # `file:path` per embed that can leave its path; a line of a `\\` text is a program a test
-    # writes, not part of the tree.
-    { grep -rHE --include='*.ply' "$pattern" "$root/$path" || true; } |
-      { grep -vE '^[^:]*:[[:space:]]*\\\\' || true; } |
-      sed -E 's/^([^:]*):.*embed(_dir)?\("([^"]*)".*/\1:\3/'
-  done <<< "$inputs")
+  done < <(embeds_from <<< "$inputs")
   if [ "$bad" -eq 0 ]; then
     printf 'toolchain key (%s): the %d paths a bootstrap reads Ply from hold every file they embed\n' "$scope" "$(grep -c . <<< "$inputs")"
   fi
@@ -1086,9 +1107,10 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  for module in "${CLI_NIGHTLY[@]}"; do
-    if [[ -z $(test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true) ]]; then
-      echo "FAIL: $CLI_SUITE/$module.ply declares no test, and CLI_NIGHTLY leaves it to the nightly job" >&2
+  for entry in "${NIGHTLY[@]}"; do
+    module="$(role "${entry%%:*}")/${entry#*:}"
+    if [[ -z $(test_names "$root/$module.ply" 2>/dev/null || true) ]]; then
+      echo "FAIL: $module.ply declares no test, and NIGHTLY leaves it to the nightly job" >&2
       failures=$((failures + 1))
     fi
   done
@@ -1180,7 +1202,7 @@ case "${1:-}" in
   formatted-sources) printf '%s\n' "${FORMATTED_SOURCES[@]}" ;;
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
-  nightly-modules) echo "${CLI_NIGHTLY[*]}" ;;
+  nightly-modules) nightly_of "${2:?a role}" | paste -sd ' ' - ;;
   *)
     echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2

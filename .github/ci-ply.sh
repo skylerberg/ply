@@ -17,10 +17,10 @@
 #       none starts after it: the job then fails naming the run it stopped and the ones it never
 #       started, and the steps after it still keep what the runs wrote, so a re-run starts from
 #       there rather than cold.
-#   ci-ply.sh nightly [MODULE...] [ARG...]
-#       the modules of the CLI's suite no pull request runs (`ci-shards.sh`'s CLI_NIGHTLY), every
-#       MODULE in one `ply test` with the suite's grants and ARGs such as `--shard K/N` or a case's
-#       `--filter` added
+#   ci-ply.sh nightly ROLE [MODULE...] [ARG...]
+#       the modules of the suite `ply.work` gives ROLE that no pull request runs (`ci-shards.sh`'s
+#       NIGHTLY), every MODULE in one `ply test` with the suite's grants and ARGs such as
+#       `--shard K/N` or a case's `--filter` added
 #   ci-ply.sh mark                  the moment `keep` gathers from
 #   ci-ply.sh keep DIR              each store of kept records `ply` used since `mark`, the emitter's
 #                                   answers among them, whole into DIR for a later run: an answer is
@@ -59,7 +59,7 @@ mark=$caches/ply-c-runs.mark
 # each test cost.
 durations=$caches/ply-test-durations.tsv
 
-# The directory holding postgres and its tools, for the CLI suite's tests that start a cluster: the
+# The directory holding postgres and its tools, for the library's tests that start a cluster: the
 # first on PATH, else the newest of Debian's per-version directories, which are off PATH.
 postgres_bin() {
   local found
@@ -70,11 +70,10 @@ postgres_bin() {
 pg=$(postgres_bin)
 
 # What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
-# it, a postgres where there is one, its scratch directory and the filesystem, the repository, and
-# every family a command enters a program with, since its tests run the commands in this process.
+# it, its scratch directory and the filesystem, the repository, and every family a command enters a
+# program with, since its tests run the commands in this process.
 cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
-  ${pg:+--exec "initdb=$pg/initdb" --exec "postgres=$pg/postgres" --exec "psql=$pg/psql"}
   --fs cwd=. --fs abs=/ --fs "repo=$root"
   --allow machine --allow shipped --allow toolchain)
 
@@ -120,9 +119,11 @@ unreported() {
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
 # directory of its own, which its harness empties before each test and refuses without the marker;
-# the standard library's suites granted an emptied directory as the root `scratch`, which the tests
-# of its real handlers write under; and any other package as `ply test` runs it, granted nothing.
-# The scratch root's path is the same every run, since a pass is kept for the binding it ran under.
+# the standard library's suites granted an emptied directory as the root `scratch`, marked as the
+# CLI's is, which the tests of its real handlers write under (`tests/std/scratch.ply`), and `sh`,
+# which reads back what `std.text` quotes for it; and any other package as `ply test` runs it,
+# granted nothing. The scratch root's path is the same every run, since a pass is kept for the
+# binding it ran under.
 tested() {
   local path=$1 status=0 dir
   shift
@@ -133,8 +134,10 @@ tested() {
     rm -rf "$dir"
   elif [[ $path == "$(work std)" || $path == "$(work std-tests)" ]]; then
     dir=$caches/ply-std-scratch
-    rm -rf "$dir" && mkdir -p "$dir"
-    bounded "$ply" test "$path" --json "$@" --fs "scratch=$dir" || status=$?
+    rm -rf "$dir" && mkdir -p "$dir" && touch "$dir/.ply-scratch"
+    bounded "$ply" test "$path" --json "$@" --fs "scratch=$dir" --exec sh=/bin/sh \
+      ${pg:+--exec "initdb=$pg/initdb" --exec "postgres=$pg/postgres" --exec "psql=$pg/psql"} ||
+      status=$?
     rm -rf "$dir"
   else
     bounded "$ply" test "$path" --json "$@" || status=$?
@@ -363,18 +366,28 @@ case "${1:-}" in
     exit "$failed"
     ;;
   nightly)
+    role=${2:?usage: ci-ply.sh nightly ROLE [MODULE...] [ARG...]}
     : > "$durations"
     out=$(mktemp)
     status=0
     # The modules, each a filter, up to the first of what `ply test` is also given.
     args=()
     given=0
-    for arg in "${@:2}"; do
+    for arg in "${@:3}"; do
       [[ $arg == -* ]] && given=1
       if ((given)); then args+=("$arg"); else args+=(--filter "$arg."); fi
     done
-    [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-ply.sh nightly [MODULE...] [ARG...]" >&2; exit 2; }
-    tested "$(work cli-tests)" "${args[@]}" > "$out" || status=$?
+    [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-ply.sh nightly ROLE [MODULE...] [ARG...]" >&2; exit 2; }
+    # The library's TLS tests trust a certificate for `localhost` alone, made before the run, since
+    # `ply` reads what `--trust` names as it starts.
+    if [[ $role == std-tests ]]; then
+      certificate=$(mktemp -d)
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost \
+        -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE \
+        -keyout "$certificate/localhost.key" -out "$certificate/localhost.pem" 2>/dev/null || exit 1
+      args+=(--fs "certificate=$certificate" --trust "$certificate/localhost.pem")
+    fi
+    tested "$(work "$role")" "${args[@]}" > "$out" || status=$?
     if ! reported "$out"; then
       unreported nightly "$status"
       rm -f "$out"
@@ -458,7 +471,7 @@ case "${1:-}" in
     rm -rf "$dir"
     ;;
   *)
-    echo "usage: ci-ply.sh run ID [ARG...] | nightly [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME" >&2
+    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME" >&2
     exit 2
     ;;
 esac
