@@ -34,7 +34,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// The levels as the real handler numbers them: `Debug` 0, `Info` 1, `Warn` 2 and `Error` 3.
+/// The levels as the host handler numbers them: `Debug` 0, `Info` 1, `Warn` 2 and `Error` 3.
 fn level_of(n: I64) -> Option<Level> {
     match n.0 {
         0 => Some(Level::Debug),
@@ -52,7 +52,7 @@ fn traced(c: &mut Ctx) -> Option<(Arc<Trace>, Owner)> {
     Some((trace, (c.id, crate::tasks::production_task(c))))
 }
 
-/// The fields at `at`, as the real handler writes them.
+/// The fields at `at`, as the host handler writes them.
 fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Field)>> {
     handed(
         c,

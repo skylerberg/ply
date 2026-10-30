@@ -30,7 +30,8 @@ import compiler.check.types (Resource, SingletonResource, ResourceVariable, Atom
                              env_bind_global, apply_arguments, NominalType, atom_bin, row_bin,
                              type_bin, scheme_bin, TypeTable, owning_fn_type)
 import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
-                             duration_type, task_type, chan_type, hold_name, hold_type, map_parts)
+                             duration_type, task_type, chan_type, scoped_name, scoped_type,
+                             map_parts)
 import compiler.check.termination (Callee, Termination, Summary, summary_bin, termination_bin,
                                    callee_bin)
 import compiler.check.resolve.tables (ParsedModule, Resolution, Scope, Diagnostic, diagnostic_bin,
@@ -120,14 +121,14 @@ pub type InstanceInfo = {
 
 pub type NumericInfo = { type_name: Bytes, ctor: Bytes, functions: List<Bytes>, at: Location }
 
-pub type SpecInfo = { kind: SpecKind, index: Int, footprint: List<Atom>, span: Span }
+pub type SpecInfo = { kind: SpecKind, index: Int, effects: List<Atom>, span: Span }
 
 pub type DefinitionInfo = {
   name: Bytes,
   module: Bytes,
   simple_name: Bytes,
   scheme: Scheme,
-  footprint: List<Atom>,
+  effects: List<Atom>,
   performed: List<Atom>,
   scaling: List<Atom>,
   repeats: List<Int>,
@@ -166,7 +167,7 @@ pub type TestInfo = {
   index: Int,
   nondet: Bool,
   cases: Bool,
-  footprint: List<Atom>,
+  effects: List<Atom>,
   at: Location,
 }
 
@@ -180,7 +181,7 @@ pub type LawInfo = {
   binders: List<LawBinder>,
   identities: List<Int>,
   has_guard: Bool,
-  footprint: List<Atom>,
+  effects: List<Atom>,
   at: Location,
 }
 
@@ -323,7 +324,7 @@ pub type SpawnSite = { span: Span, ty: Type, around: List<ClauseSite> }
 
 pub type HandoffSite = { span: Span, ty: Type, op: Bytes }
 
-pub type OpenRegion = {
+pub type OpenScope = {
   name: Bytes,
   label: Bytes,
   span: Span,
@@ -332,7 +333,7 @@ pub type OpenRegion = {
   handoffs: List<HandoffSite>,
 }
 
-pub type RegionSite = {
+pub type ScopeSite = {
   module: Int,
   name: Bytes,
   label: Bytes,
@@ -400,7 +401,7 @@ pub type SpecEnv = {
 pub type GroupDefinition = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
 
 pub type CachedDefinition = {
-  footprint: List<Atom>,
+  effects: List<Atom>,
   performed: List<Atom>,
   scaling: List<Atom>,
   repeats: List<Int>,
@@ -410,7 +411,7 @@ pub type CachedDefinition = {
   facts: Bytes,
 }
 
-pub type CachedTest = { footprint: List<Atom>, facts: Bytes }
+pub type CachedTest = { effects: List<Atom>, facts: Bytes }
 
 pub type CachedFacts = { name: Bytes, facts: Bytes }
 
@@ -517,8 +518,8 @@ pub type Checker = {
   simulate_depth: Int,
   simulation_scope: Int,
   crossings: List<CapturedLocal>,
-  open_regions: List<OpenRegion>,
-  regions: List<RegionSite>,
+  open_scopes: List<OpenScope>,
+  scopes: List<ScopeSite>,
   simulations: List<Simulation>,
   parallels: List<ParallelSite>,
   map_keys: List<MapKeySite>,
@@ -729,12 +730,12 @@ pub type Count = {
 
 pub type Generalization = { env: TypeEnv, scheme: Scheme }
 
-pub fn hold() -> Bytes = b"hold"
+pub fn scoped_effect() -> Bytes = b"scoped"
 
-pub fn hold_atom(resource: Resource) -> Atom =
-  { effect: hold(), resource: resource, mode: ReadMode, op: None }
+pub fn scoped_read(resource: Resource) -> Atom =
+  { effect: scoped_effect(), resource: resource, mode: ReadMode, op: None }
 
-pub fn is_region_effect(name: Bytes) -> Bool = name == hold()
+pub fn is_scoped_effect(name: Bytes) -> Bool = name == scoped_effect()
 
 pub fn compare_values_name() -> Bytes = b"compare_values"
 
@@ -1149,13 +1150,13 @@ fn declared_type(
                 panic(
                   misdeclared(b"names a type that is not the language's own at that arity", name),
                 )
-              } else if name == hold_name() {
+              } else if name == scoped_name() {
                 match c.labels {
                   [l] -> match args.d.labels.get(l.name) {
-                    Some(label) -> { d: args.d, ty: hold_type(label, args.types.get(0)) },
+                    Some(label) -> { d: args.d, ty: scoped_type(label, args.types.get(0)) },
                     None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
                   },
-                  _ -> panic(misdeclared(b"names a hold without its region's label", name)),
+                  _ -> panic(misdeclared(b"names a scoped value without its scope's label", name)),
                 }
               } else { { d: args.d, ty: NamedType({ name: name, args: args.types }) } }
             },
@@ -1174,15 +1175,23 @@ fn declared_row(d: DeclarationScope, row: Option<RowExpression>) -> Row / {abort
           if is_bare(a.effect_name) && a.effect_name.name.name == b"abort"
               && (match a.op { Some(op) -> op.name == b"raise", None -> false }) {
             atoms_insert(acc, abort_atom())
-          } else if is_bare(a.effect_name) && a.effect_name.name.name == hold()
+          } else if is_bare(a.effect_name) && a.effect_name.name.name == scoped_effect()
               && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, ReadMode) }) {
             match a.resource {
               Some(l) -> match d.labels.get(l.name) {
-                Some(VariableType(v)) -> atoms_insert(acc, hold_atom(ResourceVariable(v))),
+                Some(VariableType(v)) -> atoms_insert(acc, scoped_read(ResourceVariable(v))),
                 _ ->
-                  panic(misdeclared(b"reads a hold under a label no generic list binds", l.name)),
+                  panic(
+                    misdeclared(
+                      b"reads a scoped value under a label no generic list binds",
+                      l.name,
+                    ),
+                  ),
               },
-              None -> panic(misdeclared(b"reads a hold without its region's label", hold())),
+              None ->
+                panic(
+                  misdeclared(b"reads a scoped value without its scope's label", scoped_effect()),
+                ),
             }
           } else {
             match if is_bare(a.effect_name) && a.op == None && a.resource == None {
@@ -1198,7 +1207,7 @@ fn declared_row(d: DeclarationScope, row: Option<RowExpression>) -> Row / {abort
               None ->
                 panic(
                   misdeclared(
-                    b"performs more than `abort.raise`, `hold.read` and a mode of an effect it names",
+                    b"performs more than `abort.raise`, `scoped.read` and a mode of an effect it names",
                     a.effect_name.name.name,
                   ),
                 ),
@@ -1208,7 +1217,7 @@ fn declared_row(d: DeclarationScope, row: Option<RowExpression>) -> Row / {abort
           None -> None,
           Some(v) -> match d.rows.get(v.name) {
             Some(var) -> Some(var),
-            None -> panic(misdeclared(b"names a row variable no generic list binds", v.name)),
+            None -> panic(misdeclared(b"names an effect variable no generic list binds", v.name)),
           },
         },
       },

@@ -36,7 +36,7 @@ import compiler.check.known (is_int, is_bool, is_char, is_float, is_string, is_b
                              secret_item, task_answer, chan_item, task_type, is_integer_name,
                              float_name, char_name, decimal_name, bool_name, string_name,
                              bytes_name, unit_name, list_name, array_name, columns_name, map_name,
-                             hold_name, task_name, chan_name, secret_name)
+                             scoped_name, task_name, chan_name, secret_name)
 import compiler.check.termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee,
                                    DefinedCallee, OtherCallee, Termination, Terminates, Diverges,
                                    Summary, Verdict, verdict, unknown_summary)
@@ -86,7 +86,8 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      effect_of, definition_of, set_definition, Builtin,
                                      prelude_imports, builtin_of_extern, builtins, refuse_externs,
                                      mode_eq, is_direct, bind_builtin, insert_constraint,
-                                     dedup_constraints, Shapes, derivable, variables_of_type, hold)
+                                     dedup_constraints, Shapes, derivable, variables_of_type,
+                                     scoped_effect)
 import compiler.check.infer.names (Found, look_up_language_type, declared_value, written_binder,
                                    local_at, simple_name_of, home_module)
 import compiler.check.infer.declarations (convert_type, convert_atom, op_named, duplicate,
@@ -211,7 +212,8 @@ fn bind_externs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.rais
 
 fn checked_native_modes(c: Checker, b: Builtin) -> Builtin / {abort.raise} = {
   let modes = match b.scheme.ty {
-    FunctionType(f) -> f.effects.atoms.filter(|a: Atom| a.op == None && a.effect != hold()),
+    FunctionType(f) ->
+      f.effects.atoms.filter(|a: Atom| a.op == None && a.effect != scoped_effect()),
     _ -> [],
   };
   match modes.find(|a: Atom|
@@ -886,7 +888,7 @@ fn bind_signature(
       module: parsed.name,
       simple_name: definition.name.name,
       scheme: scheme,
-      footprint: resolve_row_in(bound, s.sig.published_row).atoms,
+      effects: resolve_row_in(bound, s.sig.published_row).atoms,
       performed: [],
       scaling: [],
       repeats: [],
@@ -1002,7 +1004,7 @@ fn checked_or_cached(
   let taken: Option<{ checker: Checker, row: Row, count: Count }> = match handed {
     None -> None,
     Some(rows) -> match ((
-        atoms_with_label_variables(rows.footprint, member.labels),
+        atoms_with_label_variables(rows.effects, member.labels),
         atoms_with_label_variables(rows.performed, member.labels),
         atoms_with_label_variables(rows.scaling, member.labels),
       )) {
@@ -1378,12 +1380,12 @@ fn check_release_row(
                 type_text(t),
                 b"`, whose release performs `",
                 atom_text(a),
-                b"`, which its row does not name",
+                b"`, which its effects do not name",
               ]),
               b"a value it owns is let go here or where its block ends",
               [
-                b"a value of a type that states a `release` is let go by it wherever nothing consumed it, a raise or a cancel included, so a row that holds one performs what the release does",
-                Bytes::concat_all([b"add `", atom_text(a), b"` to the row"]),
+                b"a value of a type that states a `release` is let go by it wherever nothing consumed it, a raise or a cancel included, so effects that hold one include what the release does",
+                Bytes::concat_all([b"add `", atom_text(a), b"` to the effects"]),
               ],
             )
           })
@@ -1429,7 +1431,7 @@ fn check_lambda_release_rows(
               Bytes::concat_all([
                 b"`",
                 x.name,
-                b"` is let go in a function whose row does not name `",
+                b"` is let go in a function whose effects do not name `",
                 atom_text(a),
                 b"`, which its release performs",
               ]),
@@ -1474,7 +1476,7 @@ fn record_function(
         module: parsed.name,
         simple_name: definition.name.name,
         scheme: sc,
-        footprint: footprint.atoms,
+        effects: footprint.atoms,
         performed: body_row.atoms,
         scaling: [],
         repeats: [],
@@ -1645,7 +1647,7 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
         let count = counts.get(slot);
         let counted = if c.module >= c.known.root { bodies.get(slot).written } else {
           {
-            scaling: info.footprint.fold([], |acc: List<Atom>, w: Atom|
+            scaling: info.effects.fold([], |acc: List<Atom>, w: Atom|
               if count.scaling.fold(false, |b: Bool, a: Atom| b || atoms_covered([w], a)) {
                 acc.push(w)
               } else { acc }),
@@ -1865,7 +1867,7 @@ fn check_fn_body(
       let u = unify_row(shaped.substitution, shaped.fresh, signature.published_row, left);
       let c = with_unified(shaped, u);
       match u.error {
-        Some(e) -> report_unify(c, e, expression_span(definition.body), b"inferred effect row"),
+        Some(e) -> report_unify(c, e, expression_span(definition.body), b"inferred effects"),
         None -> c,
       }
     },
@@ -1962,7 +1964,7 @@ fn raise_reason(checker: Checker, name: Bytes) -> RaiseReason / {abort.raise} =
     match checker.contracts.get(name) {
       Some(c) -> if c.raises { UnguardedBuiltin(name) } else { RaisingFunctionValue },
       None -> match definition_of(checker, name) {
-        Some(d) -> if d.footprint.fold(false, |any: Bool, a: Atom| any || is_abort(a)) {
+        Some(d) -> if d.effects.fold(false, |any: Bool, a: Atom| any || is_abort(a)) {
           RaisingCall(name)
         } else { RaisingFunctionValue },
         None -> RaisingCall(name),
@@ -2096,7 +2098,7 @@ fn check_bounded_promises(
           atoms,
           match body.tail_name {
             Some(n) -> backticked_text(n).concat(b"'s operations"),
-            None -> b"the row variable",
+            None -> b"the effect variable",
           },
           {
             atom: no_atom(),
@@ -2202,7 +2204,7 @@ fn site_label(dec: List<Atom>, site: PerformSite) -> Bytes / {abort.raise} = {
         a,
         b"` through ",
         through,
-        b", which may perform any of its operations; this row names only ",
+        b", which may perform any of its operations; these effects name only ",
         backticked(named_for(dec, site.atom).map(atom_text), b", "),
       ])
     } else { Bytes::concat_all([b"reaches `", a, b"` through ", through]) },
@@ -2382,7 +2384,7 @@ fn check_const_shape(
         definition,
         at,
         b"binds a parameter of its own",
-        label_at(checker.module, b.span, true, b"a `const fn` binds no type, label or row"),
+        label_at(checker.module, b.span, true, b"a `const fn` binds no type, label or effects"),
         handed,
       ),
   };
@@ -2405,7 +2407,7 @@ fn check_const_shape(
         taken,
         definition,
         at,
-        b"writes a row",
+        b"writes effects",
         label_at(taken.module, r.span, true, b"a `const fn` writes none"),
         [b"a `const fn` performs nothing: a raise that leaves its body ends the run"],
       ),
@@ -2437,7 +2439,7 @@ fn check_const_shape(
             ]),
           ),
           [
-            b"a process keeps a `const fn`'s value for good, as data, which a function, a `Hold`, a `Task`, a `Chan` and a `Secret` are not",
+            b"a process keeps a `const fn`'s value for good, as data, which a function, a `Scoped`, a `Task`, a `Chan` and a `Secret` are not",
           ],
         ),
     },
@@ -2541,7 +2543,7 @@ fn check_unwritten(
           checker.module,
           expression_span(definition.body),
           true,
-          b"body has row ".concat(row_text(closed_row)),
+          b"body has effects ".concat(row_text(closed_row)),
         ),
       ]
     } else { sites };
@@ -2550,11 +2552,16 @@ fn check_unwritten(
       Bytes::concat_all([
         b"`",
         definition.name.name,
-        b"` writes no `/`, so its row is empty, and its body ",
-        if forwarded && atoms.len() == 0 { b"forwards a row" } else { b"performs effects" },
+        b"` writes no `/`, so its effects are empty, and its body ",
+        if forwarded && atoms.len() == 0 { b"forwards effects" } else { b"performs effects" },
       ]),
       primaries.push(
-        label_at(checker.module, definition.name.span, false, b"no `/` written: the row is empty"),
+        label_at(
+          checker.module,
+          definition.name.span,
+          false,
+          b"no `/` written: the effects are empty",
+        ),
       ),
       [
         if closed_row.atoms.len() > 0 && closed_row.tail == None
@@ -2582,7 +2589,7 @@ fn check_unwritten(
     let fixable = nameable && (!forwarded || tail != None);
     let fixed: Diagnostic = match definition.ret {
       Some(t) -> if fixable {
-        with_fix(d, Bytes::concat_all([b"write the row `/ ", row, b"`"]), [
+        with_fix(d, Bytes::concat_all([b"write the effects `/ ", row, b"`"]), [
           insertion(checker.module, type_span(t).end, b" / ".concat(row)),
         ])
       } else { d },
@@ -2613,7 +2620,7 @@ fn check_bounded_row(
             Bytes::concat_all([
               b"`",
               definition.name.name,
-              b"` bounds its steps, and its row says it may not return",
+              b"` bounds its steps, and its effects say it may not return",
             ]),
             [
               label_at(c.module, clause.span, true, b"this bound says every call ends"),
@@ -2636,7 +2643,7 @@ fn check_bounded_row(
             ]),
             [
               label_at(c.module, clause.span, true, b"this bound is proved from the body alone"),
-              label_at(c.module, written, false, b"its row is written here"),
+              label_at(c.module, written, false, b"its effects are written here"),
             ],
             [
               Bytes::concat_all([
@@ -2686,7 +2693,7 @@ fn unwritten_divergence(
           Bytes::concat_all([
             b"`",
             definition.name.name,
-            b"` may not return, and its row does not say so",
+            b"` may not return, and its effects do not say so",
           ]),
           [
             label_at(
@@ -2709,7 +2716,7 @@ fn unwritten_divergence(
           [
             b"a call back into the group descends when it hands on a part of an argument, or an `Int` moved toward a bound a guard on the way holds it beyond",
             b"a loop with no such measure can spend a budget, with `iterate`, or state a `decreases` a proof shows falls",
-            b"write `diverges` in the row only of a loop that waits on something outside, such as a stream or a peer",
+            b"write `diverges` in the effects only of a loop that waits on something outside, such as a stream or a peer",
           ],
         ),
       )
@@ -2749,7 +2756,7 @@ fn check_written(
         Bytes::concat_all([
           b"a call that may not return makes `",
           definition.name.name,
-          b"` one too: add `diverges` to its row, or call only what ends",
+          b"` one too: add `diverges` to its effects, or call only what ends",
         ]),
       ]
     } else {
@@ -2777,11 +2784,11 @@ fn check_written(
         names,
       ]),
       primaries.push(
-        label_at(checker.module, ann_span, false, b"declared row is ".concat(row_text(dec))),
+        label_at(checker.module, ann_span, false, b"declared effects are ".concat(row_text(dec))),
       ),
       if narrowed {
         notes.push(
-          b"a row that names operations permits a call only when the callee's row names them too: widen this row to the mode atom, or narrow the callee's row",
+          b"effects that name operations permit a call only when the callee's effects name them too: widen these effects to the whole mode, or narrow the callee's",
         )
       } else { notes },
     );
@@ -2790,7 +2797,7 @@ fn check_written(
         extra.fold(d, |acc: Diagnostic, o: Offence|
           if written_as(checker, o.atom.effect) == None { acc } else {
             let text = written_atom_text(checker, o.atom);
-            with_fix(acc, Bytes::concat_all([b"add `", text, b"` to the row"]), [
+            with_fix(acc, Bytes::concat_all([b"add `", text, b"` to the effects"]), [
               row_edit(checker, r, text),
             ])
           }),
@@ -2818,9 +2825,9 @@ fn check_written(
                 c2.module,
                 expression_span(definition.body),
                 true,
-                b"body has row ".concat(row_text(inf)),
+                b"body has effects ".concat(row_text(inf)),
               ),
-              label_at(c2.module, ann_span, false, b"declared row cannot absorb it"),
+              label_at(c2.module, ann_span, false, b"declared effects cannot include it"),
             ],
             [b"add the missing effect variable to the generic list, or widen the annotation"],
           ),
@@ -2986,7 +2993,7 @@ fn require_written_signature(
   definition: FnDefinition,
   signature: Signature,
 ) -> Checker / {abort.raise} = {
-  let why = b"a signature is a claim about what a definition means, so it is written rather than inferred; the effect row is the exception and stays inferred";
+  let why = b"a signature is a claim about what a definition means, so it is written rather than inferred; the effects are the exception and stays inferred";
   let params = range(0, definition.params.len()).fold(checker, |c: Checker, i: Int| {
     let p = definition.params.get(i);
     match p.ty {
@@ -3118,7 +3125,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                   cached_tests: c.cached_tests.push(qualify(parsed.name, definition.name)),
                   kept: c.kept.push({ name: owner, facts: cached.facts }),
                 },
-                atoms: row_of_cached_atoms(c, cached.footprint).atoms,
+                atoms: row_of_cached_atoms(c, cached.effects).atoms,
               },
             None -> {
               let c1: Checker = {
@@ -3200,7 +3207,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                 index: checked.tests.len(),
                 nondet: definition.is_nondet,
                 cases: definition.cases != None,
-                footprint: footprint.atoms,
+                effects: footprint.atoms,
                 at: location_of(checked, definition.span),
               }),
               walking: b"",
@@ -3578,7 +3585,7 @@ fn check_law(
       binders: binders,
       identities: identified.vars,
       has_guard: match definition.guard { Some(_) -> true, None -> false },
-      footprint: run_needs(row.atoms),
+      effects: run_needs(row.atoms),
       at: location_of(last, definition.span),
     }),
   }
@@ -3821,7 +3828,7 @@ fn law_row_reason(row: RowExpression) -> Option<Bytes> =
   match row.tail {
     Some(_) ->
       Some(
-        b"an effect variable has no binder here, and a law quantifies over values rather than over rows",
+        b"an effect variable has no binder here, and a law quantifies over values rather than over effects",
       ),
     None -> match row.atoms.filter(|a: AtomExpression| !raises(a)).at(0) {
       Some(a) ->
@@ -3871,12 +3878,12 @@ fn ungeneratable_within(
 ) -> Option<Bytes> / {abort.raise} =
   match ty {
     VariableType(_) -> None,
-    NamedType(c) -> if c.name == hold_name() {
-      Some(b"a `Hold` is created by `with_hold` and exists only inside its region")
+    NamedType(c) -> if c.name == scoped_name() {
+      Some(b"a `Scoped` is created by `with_scope` and exists only inside its scope")
     } else if c.name == task_name() {
-      Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it")
+      Some(b"a `Task` is a key into the scheduler of the simulation that spawned it")
     } else if c.name == chan_name() {
-      Some(b"a `Chan` is a key into the scheduler of the `simulate` region that made it")
+      Some(b"a `Chan` is a key into the scheduler of the simulation that made it")
     } else if c.name == secret_name() {
       Some(
         b"a `Secret` is a credential: quantifying over one would have the prover mint credentials and print them in counterexamples",
@@ -3899,12 +3906,12 @@ fn ungeneratable_within(
     },
     FunctionType(f) -> if f.effects.tail != None {
       Some(
-        b"a function a declared type holds under its row parameter is not generated, whatever row the type is given",
+        b"a function a declared type holds under its effect variable is not generated, whatever effects the type is given",
       )
     } else if !row_is_pure_but_raise(f.effects) {
       Some(
         Bytes::concat_all([
-          b"a function with row ",
+          b"a function with effects ",
           row_display(f.effects),
           b" cannot be applied inside a pure body",
         ]),
@@ -4001,7 +4008,7 @@ fn not_identity_within(
             )
           },
           None ->
-            refused(if c.name == hold_name() || is_scheduler_handle(c.name) {
+            refused(if c.name == scoped_name() || is_scheduler_handle(c.name) {
               Bytes::concat_all([b"a `", c.name, b"` names a location rather than a value"])
             } else if c.name == secret_name() {
               b"a `Secret` holds a credential nothing written in Ply reads"
@@ -4071,7 +4078,7 @@ fn check_spec_purity(
           Bytes::concat_all([
             b"a law body may carry `",
             atom_text(a),
-            b"` \xe2\x80\x94 the seed a `simulate` region reads \xe2\x80\x94 and nothing else",
+            b"` \xe2\x80\x94 the seed a simulation reads \xe2\x80\x94 and nothing else",
           ]),
         ));
       let hosted = if law_body {
@@ -4117,11 +4124,15 @@ fn check_spec_purity(
         c1,
         b"E0417",
         body_span,
-        Bytes::concat_all([b"the row of this ", site_short(site), b" is not known to be empty"]),
-        b"has row ".concat(row_text(row)),
+        Bytes::concat_all([
+          b"the effects of this ",
+          site_short(site),
+          b" is not known to be empty",
+        ]),
+        b"has effects ".concat(row_text(row)),
         [
           b"an effect variable is pure for some instantiations and not for others, and a claim has to hold for every one",
-          b"call something whose row is closed and empty here",
+          b"call something whose effects are closed and empty here",
         ],
       ),
     None -> c1,
@@ -4179,7 +4190,7 @@ pub fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                   specs: acc.specs.push({
                     kind: clause.kind,
                     index: i,
-                    footprint: o.atoms,
+                    effects: o.atoms,
                     span: clause.span,
                   }),
                 }

@@ -29,13 +29,19 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - Write plainly. Use short sentences, one idea each, in common words. Use the standard term for a
   standard idea: "returns", not "answers"; "borrows", not a new verb. Define a term the first time
   you use it.
+- Be brief. Prose costs tokens, time and maintenance: cut every sentence the reader does not need.
+- Make each comment, message and paragraph readable on its own. Name the thing you mean, and write
+  "it" only when what it refers to is unmistakable. Give the main point first, then the exceptions.
 - Prose is `README.md`, `docs/GUIDE.md` and this file. A document says what its reader needs and
   nothing more, and is deleted when it stops being true. No status files, reports, logs or dated
-  notes: git history and PR descriptions hold history.
+  notes: git history and PR descriptions keep history.
 - State a direction as the direction. No hedging and no time estimates.
 - Correct in place. Never write "previously", "corrected" or "a draft of this said".
 - Measurements belong in the description of the PR they decide, not in the tree.
 - PR descriptions and commit messages: a few lines on what changed and why.
+- Cards on the board follow these rules too. A card's title is one imperative deliverable. Its
+  description gives the problem, the direction and when it is done, in words a reader new to the
+  code can follow. No card codes, dates or links to scratch files.
 
 ## Comments
 
@@ -45,7 +51,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - No history ("used to", "since #123"), no references to PRs or documents, no figures.
 - Doc comments (`///` above a declaration, `//!` at the head of a module) are for callers. Open
   with a one-sentence summary, then say what the signature cannot: what the result means, when it
-  raises, units, edge cases. Never restate the type. No examples: the tests that name a definition
+  raises, units, edge cases. Never restate the type. No examples: the tests that use a definition
   are its examples, and `ply callers` lists them.
 
 ## Naming
@@ -56,7 +62,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - Don't invent terms. Use the established name for an established idea. Where Ply has a genuinely
   new idea, give it a plain name and define it in the guide.
 - No version or age markers (`v2`, `new_`, `old_`) and no task, PR or card numbers in names.
-- Where a keyword takes the plain word, name the role instead (`original`, `annotation`).
+- When the plain word is a keyword, name the role instead (`original`, `annotation`).
 
 ## Work
 
@@ -78,7 +84,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - A rule lives in one place. When two places restate one rule, route both through one function in
   the module that owns it and delete the copy.
 - No backwards compatibility: delete retired flags, APIs and modes outright.
-- New code is Ply. Port Rust to Ply when work reaches it.
+- New code is Ply. Port Rust to Ply when you work on it.
 
 ## Tests
 
@@ -88,6 +94,9 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   reference, `live == 0`.
 - A test that touches a real resource uses a handler instead. A few `test/nondet` tests check the
   real handlers.
+- A program a CLI test runs is a file under `tests/programs/<test module>/` that the test reads with
+  `embed`, so `ply check`, `ply fmt` and `ply rename` cover it. Use a raw string only for text that
+  must fail to check, that the test builds, or that is not Ply.
 - Rust tests test only the Rust: none compiles Ply or reads the standard library. Ply tests cover
   what Ply programs do, including the runtime's internals.
 
@@ -105,7 +114,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - CI is `.github/workflows/ci.yml`. `.github/ci-shards.sh` lists CI's Ply test runs (each is `ply
   test` of one package) and which job runs each.
 - A pull request bootstraps only when it changes the runtime's Rust, `ply.work`, the compiler, the
-  CLI, a package their manifests name, or a file one of those embeds from outside itself, such as
+  CLI, a package their manifests list, or a file one of those embeds from outside itself, such as
   `std.prelude`, whose text the checker reads builtins from (`compiler.prelude_source`). Otherwise
   its suites run with the newest `ply` main bootstrapped of those, which reads the rest of the
   checkout's standard library from its sources. Main bootstraps whenever any of the library changed,
@@ -125,7 +134,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - A file under `packages/std` that is not `.ply` is data a standard library module embeds by its
   path (`embed("oid/names.txt")` in `oid.ply`). It ships inside every `ply` binary, so test
   fixtures go in `tests/std`, not here.
-- `packages/` holds the Ply packages and `crates/` the cargo packages. `ply.work` says which
+- `packages/` contains the Ply packages and `crates/` the cargo packages. `ply.work` says which
   package plays which part of `ply`; CI and the scripts read it with `ply work`. CI publishes each
   build of `main` to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
 - A `ply.lock` records a path dependency inside this checkout (proof, sim, store, testing) by name

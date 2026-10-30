@@ -199,7 +199,7 @@ fn ran(job: ply_host::jobs::Refusing) -> Result<Vec<u8>, Diagnostic> {
     })
 }
 
-/// The operation as the real handler asks it, under `label`.
+/// The operation as the host handler asks it, under `label`.
 fn asked(
     fs: &FsHost,
     op: Op,

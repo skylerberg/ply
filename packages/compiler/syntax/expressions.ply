@@ -57,7 +57,7 @@ pub type Expression =
   | ListExpression({ span: Span, items: List<Expression> })
   | PerformExpression({ span: Span, effect_name: QName, op: Identifier, resource: Option<Identifier>, args: List<Expression> })
   | HandleExpression({ span: Span, vars: List<HandlerVar>, body: Expression, clauses: List<HandleClause>, ret: Option<ReturnClause> })
-  | WithHoldExpression({ span: Span, resource: Identifier, acquire: Expression, release: Expression, binder: Identifier, body: Expression })
+  | WithScopeExpression({ span: Span, resource: Identifier, acquire: Expression, release: Expression, binder: Identifier, body: Expression })
   | SimulateExpression({ span: Span, body: Expression })
   | ParallelExpression({ span: Span, branches: List<Expression> })
   | TaggedLiteralExpression(TaggedLiteral)
@@ -139,7 +139,7 @@ pub fn expression_span(expression: Expression) -> Span =
     ListExpression(v) -> v.span,
     PerformExpression(v) -> v.span,
     HandleExpression(v) -> v.span,
-    WithHoldExpression(v) -> v.span,
+    WithScopeExpression(v) -> v.span,
     SimulateExpression(v) -> v.span,
     ParallelExpression(v) -> v.span,
     TaggedLiteralExpression(v) -> v.span,
@@ -258,7 +258,7 @@ fn set_span(expression: Expression, span: Span) -> Expression =
         args: v.args,
       }),
     HandleExpression(v) -> HandleExpression({ ..v, span: span }),
-    WithHoldExpression(v) -> WithHoldExpression({ ..v, span: span }),
+    WithScopeExpression(v) -> WithScopeExpression({ ..v, span: span }),
     SimulateExpression(v) -> SimulateExpression({ span: span, body: v.body }),
     ParallelExpression(v) -> ParallelExpression({ span: span, branches: v.branches }),
     TaggedLiteralExpression(v) -> TaggedLiteralExpression({ ..v, span: span }),
@@ -273,7 +273,7 @@ pub fn is_block_like(expression: Expression) -> Bool =
     IfExpression(v) -> true,
     MatchExpression(v) -> true,
     HandleExpression(v) -> true,
-    WithHoldExpression(v) -> true,
+    WithScopeExpression(v) -> true,
     SimulateExpression(v) -> true,
     ParallelExpression(v) -> true,
     TryBlockExpression(v) -> true,
@@ -833,8 +833,8 @@ fn primary_identifier(
   parser: Parser,
   name: Bytes,
 ) -> Result<ParseOutput<Expression>, Parser> / {abort.raise} =
-  if name == b"with_hold" && token_kind_at(input, parser, 1) == token_lbracket() {
-    with_hold_expression(input, parser)
+  if name == b"with_scope" && token_kind_at(input, parser, 1) == token_lbracket() {
+    with_scope_expression(input, parser)
   } else if name == b"simulate" && !parser.no_brace
       && token_kind_at(input, parser, 1) == token_lbrace() { simulate_expression(input, parser) }
   else if name == b"parallel" && !parser.no_brace
@@ -2377,26 +2377,22 @@ fn return_clause(
   })
 }
 
-fn with_hold_expression(
+fn with_scope_expression(
   input: Input,
   parser: Parser,
 ) -> Result<ParseOutput<Expression>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
-  let { parser, node: br } = expect(input, st.parser, token_lbracket(), b"`[` and a region name")?;
-  let { parser, node: resource } = expect_identifier(
-    input,
-    parser,
-    b"a region name inside `[..]`",
-  )?;
+  let { parser, node: br } = expect(input, st.parser, token_lbracket(), b"`[` and a scope name")?;
+  let { parser, node: resource } = expect_identifier(input, parser, b"a scope name inside `[..]`")?;
   let { parser, .. } = expect_close(input, parser, token_rbracket(), br, b"`]`")?;
   let saved = parser.no_brace;
-  match with_hold_rest(input, with_no_brace(parser, false), st.node, resource) {
+  match with_scope_rest(input, with_no_brace(parser, false), st.node, resource) {
     Err(q) -> Err(with_no_brace(q, saved)),
     Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
   }
 }
 
-fn with_hold_rest(
+fn with_scope_rest(
   input: Input,
   parser: Parser,
   span: Span,
@@ -2406,7 +2402,7 @@ fn with_hold_rest(
     input,
     parser,
     token_lparen(),
-    b"`(` and what the hold acquires",
+    b"`(` and what the scope acquires",
   )?;
   let { parser, node: acquire } = expression(input, parser)?;
   let { parser, .. } = expect(
@@ -2424,25 +2420,24 @@ fn with_hold_rest(
     paren,
     b"`)` after the release function",
   )?;
-  let { parser, node: brace } = expect(
+  let { parser, node: brace } = expect(input, parser, token_lbrace(), b"`{` to start the scope")?;
+  let { parser, node: binder } = expect_identifier(
     input,
     parser,
-    token_lbrace(),
-    b"`{` to start the hold's region",
+    b"a name to bind the scoped value to",
   )?;
-  let { parser, node: binder } = expect_identifier(input, parser, b"a name to bind the hold to")?;
-  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the region body")?;
+  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the scope's body")?;
   let { parser, node: body } = expression(input, parser)?;
   let { parser, node: cl } = expect_close(
     input,
     parser,
     token_rbrace(),
     brace,
-    b"`}` to close the hold's region",
+    b"`}` to close the scope",
   )?;
   Ok({
     parser: parser,
-    node: WithHoldExpression({
+    node: WithScopeExpression({
       span: span_to(span, cl),
       resource: resource,
       acquire: acquire,
@@ -2621,7 +2616,7 @@ pub fn dump_expression(expression: Expression) -> Bytes / {abort.raise} =
         if v.vars.len() == 0 { b"" }
         else { dump_word(b"vars").concat(dump_list(v.vars, dump_var)) },
       ]),
-    WithHoldExpression(v) ->
+    WithScopeExpression(v) ->
       Bytes::concat_all([
         dump_node(v.span, b"ehld"),
         dump_identifier(v.resource),
@@ -2797,7 +2792,8 @@ pub fn node_count(expression: Expression) -> Int =
           n + 1 + clause.params.len() + node_count(clause.body))
         + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) })
         + v.vars.fold(0, |n: Int, hv: HandlerVar| n + 1 + node_count(hv.init)),
-    WithHoldExpression(v) -> 1 + node_count(v.acquire) + node_count(v.release) + node_count(v.body),
+    WithScopeExpression(v) ->
+      1 + node_count(v.acquire) + node_count(v.release) + node_count(v.body),
     SimulateExpression(v) -> 1 + node_count(v.body),
     ParallelExpression(v) -> 1 + count_all(v.branches),
     TaggedLiteralExpression(v) -> 1 + v.holes.fold(0, |n: Int, h: Hole| n + node_count(h.value)),
@@ -3301,18 +3297,18 @@ test "`simulate` is contextual" {
   )
 }
 
-test "`with_hold` is contextual: a region, what it acquires, what releases that, and a body" {
-  let dump = dump_expression_of(b"with_hold[f](a, r) { h -> h }");
-  assert(dump.starts_with("0:29:ehld;10:11:ident;@66;13:14:evar;"));
+test "`with_scope` is contextual: a scope, what it acquires, what releases that, and a body" {
+  let dump = dump_expression_of(b"with_scope[f](a, r) { h -> h }");
+  assert(dump.starts_with("0:30:ehld;11:12:ident;@66;14:15:evar;"));
   assert_eq(
-    dump_expression_of(b"with_hold[f](a, r,) { h -> h }"),
-    dump_expression_of(b"with_hold[f](a, r ) { h -> h }"),
+    dump_expression_of(b"with_scope[f](a, r,) { h -> h }"),
+    dump_expression_of(b"with_scope[f](a, r ) { h -> h }"),
   );
   assert_eq(
-    dump_expression_of(b"with_hold"),
-    "0:9:evar;0:9:qname;?0;0:9:ident;@776974685f686f6c64;#0;",
+    dump_expression_of(b"with_scope"),
+    "0:10:evar;0:10:qname;?0;0:10:ident;@776974685f73636f7065;#0;",
   );
-  assert(dump_expression_of(b"with_hold[f](a) { h -> h }").contains("!E0001:"))
+  assert(dump_expression_of(b"with_scope[f](a) { h -> h }").contains("!E0001:"))
 }
 
 test "in a scrutinee a `{` is the arm block, so `simulate` is a name there" {

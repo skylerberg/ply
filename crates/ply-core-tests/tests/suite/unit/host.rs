@@ -1,6 +1,6 @@
 use ply_core::host::*;
 
-/// A run's binding keeps what the run is lent, which the natives of the real handlers read.
+/// A run's binding keeps what the run is lent, which the natives of the host handlers read.
 #[test]
 fn a_granted_binding_keeps_what_its_run_is_lent() {
     let binding = HostBinding::granted(Grants::default().with("allow", &["toolchain"]));

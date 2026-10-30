@@ -325,7 +325,7 @@ fn a_ply_it_started_reports_its_views() {
     );
 }
 
-/// The record is the run's: what a real handler of it reads goes there, a run made on the test's
+/// The record is the run's: what a host handler of it reads goes there, a run made on the test's
 /// behalf shares it, and a run with none of its own records nothing.
 #[test]
 fn a_run_records_into_the_record_it_was_handed_and_one_handed_none_records_nothing() {

@@ -1,4 +1,4 @@
-//! What `std.fs`'s real handler asks the host through its natives: the files under the roots the
+//! What `std.fs`'s host handler asks the host through its natives: the files under the roots the
 //! run names, each operation's path confined to its root by a walk that follows its links here.
 //! Each operation is a job that answers flat: a byte 1 or 0 for whether it did what it was asked,
 //! a kind as [`Kind::number`] numbers it, a refusal as [`Refusal::flat`] writes it, and anything

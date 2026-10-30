@@ -118,7 +118,7 @@ machine! {
 }
 
 /// The natives over machine data: the crossings' and the rest of this table's, then strings' and
-/// byte strings' (`crate::machine`), then those the standard library's real handlers call
+/// byte strings' (`crate::machine`), then those the standard library's host handlers call
 /// (`crate::hosted`), then what `std.machine` declares (`crate::entry`) and what
 /// `std.internal.schedule` does (`crate::tasks`).
 pub fn machine_natives() -> &'static [MachineNative] {

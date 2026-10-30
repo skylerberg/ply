@@ -63,7 +63,7 @@ impl Driver {
             .enter((who.machine, who.task), channel, name, &[])
     }
 
-    /// `E0445`, as the real handler's native fails the run, where `id` names no span `who` holds.
+    /// `E0445`, as the host handler's native fails the run, where `id` names no span `who` holds.
     fn exit(&self, who: EntryPoint, channel: &str, id: i64) -> Result<(), Diagnostic> {
         self.trace
             .exit((who.machine, who.task), channel, id, Outcome::Ok)
@@ -223,7 +223,7 @@ fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work(
     let d = driver();
     let alone = d.enter(entry_point(), "orders", "place_order");
 
-    // Beside a footprint-disjoint entry point that opened two spans on another channel first.
+    // Beside an entry point with disjoint effects that opened two spans on another channel first.
     let d = driver();
     let other = entry_point();
     let _ = d.enter(other, "items", "list_items");

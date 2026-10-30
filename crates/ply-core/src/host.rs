@@ -55,7 +55,7 @@ pub trait HostRuntime {
     /// Waits until at least one ticket the run watches is answered.
     fn park(&self) -> Result<(), Diagnostic>;
 
-    /// What the natives of the real handlers reach the machine through: the run's sockets, its
+    /// What the natives of the host handlers reach the machine through: the run's sockets, its
     /// configuration and the rest the host made, which only the crate that made them names. `None`
     /// for a runtime that holds none.
     fn facilities(&self) -> Option<&dyn std::any::Any> {
@@ -120,7 +120,7 @@ pub struct HostBinding {
     grants: Grants,
 }
 
-/// What a run is lent, as named entries, each a list of fields: the natives of the real handlers
+/// What a run is lent, as named entries, each a list of fields: the natives of the host handlers
 /// read the ones they serve (`fs NAME PATH`, `exec NAME PATH`, `allow FAMILY`, `argv ARG..`, ...).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
@@ -265,7 +265,7 @@ fn err_no_clock(what: &str) -> Diagnostic {
     .note("`clock.now` reads the clock a run's `HostRuntime` keeps, and a production region's sleeps are deadlines on it, so a runtime that keeps none answers neither")
 }
 
-/// An operation of an effect that no handler of the program, no real handler and no host family
+/// An operation of an effect that no handler of the program, no host handler and no host family
 /// answers, refused at the entry that performed it.
 #[cold]
 #[inline(never)]

@@ -1,7 +1,7 @@
-//! A region's scheduler as data: what its tasks wait on, how each request a task makes changes
-//! them, and which task runs next. `simulate` takes its schedule from a seed and records each
-//! step. A production region runs ready tasks first in, first out, and waits on the run's tickets
-//! and clock when none is ready. Nothing here switches a stack or reads the host: a region's loop
+//! A scheduler as data: what its tasks wait on, how each request a task makes changes them, and
+//! which task runs next. `simulate` takes its schedule from a seed and records each step. A
+//! production scheduler runs ready tasks first in, first out, and waits on the run's tickets and
+//! clock when none is ready. Nothing here switches a stack or reads the host: a scheduler's loop
 //! passes in each request with what the runtime knows about it, and runs the task each turn names.
 //!
 //! Values one task passes to another (`v`) are stored without being inspected. A task's result is
@@ -17,7 +17,7 @@ import std.string
 
 // --- Inputs and outputs ---------------------------------------------------------
 
-/// How a region picks what runs next: by the entry's seed, as `simulate` does (`Seeded`), or in
+/// How a scheduler picks what runs next: by the entry's seed, as `simulate` does (`Seeded`), or in
 /// the order its tasks became ready, handling the host's operations as they come (`Production`).
 pub type Policy = | Seeded | Production
 
@@ -29,17 +29,17 @@ pub type Shields = { acquiring: Int, releasing: Int, stopping: Bool }
 /// Inside no bracket.
 pub fn unshielded() -> Shields = { acquiring: 0, releasing: 0, stopping: false }
 
-/// A task's handle as its owner reads it: the region and the task it refers to, and how the task
+/// A task's handle as its owner reads it: the scheduler and the task it refers to, and how the task
 /// ended if the handle has recorded that.
-pub type TaskRef = { region: Int, id: Int, ended: TaskStatus }
+pub type TaskRef = { scheduler: Int, id: Int, ended: TaskStatus }
 
 /// How a task ended, as its handle records it: not yet, with a result, or cancelled.
 pub type TaskStatus = | Live | Returned | Cancelled
 
-/// A channel's handle: its region and its id there.
-pub type ChanRef = { region: Int, id: Int }
+/// A channel's handle: its scheduler and its id there.
+pub type ChanRef = { scheduler: Int, id: Int }
 
-/// What a task requests from its region when it gives up control.
+/// What a task requests from its scheduler when it gives up control.
 pub type Request<v> =
   | Spawn
   | Join(TaskRef)
@@ -67,7 +67,7 @@ pub type Request<v> =
   | Finished
   /// The task finished unwinding after a cancel.
   | Unwound
-  /// A raise that nothing in the task handled leaves it for the handlers around the region.
+  /// A raise that nothing in the task handled leaves it for the handlers around the scheduler.
   /// Carries the brackets each other task is inside, by task, if any.
   | Raised(Map<Int, Shields>)
   /// The task failed at run time; the runtime stores the failure.
@@ -75,7 +75,7 @@ pub type Request<v> =
 
 /// What the runtime knows about a request: where it was performed, the brackets the task is inside
 /// if a cancel waits for it to leave them (otherwise none), and the run's clock, which a production
-/// region reads.
+/// scheduler reads.
 pub type RequestContext = { site: Site, shields: Shields, now: Int }
 
 /// What a task receives when it runs again.
@@ -103,37 +103,37 @@ pub type Turn<v> =
   | Run(Int, Resumption<v>)
   /// Every task ended, and the body returned.
   | Complete
-  /// Every task ended after this task's raise left it, and the raise now lands at the region's
+  /// Every task ended after this task's raise left it, and the raise now lands at the scheduler's
   /// site.
   | Reraise(Int)
   | Ends(Ending)
-  /// A production region with nothing to run until a ticket is completed, the deadline passes if
+  /// A production scheduler with nothing to run until a ticket is completed, the deadline passes if
   /// there is one, or the run is stopped.
   | Idle(Option<Int>)
 
-/// How a region ends without its body's result.
+/// How a scheduler ends without its body's result.
 pub type Ending =
-  /// The region's own failure.
-  | RegionFailed(Failure)
+  /// The scheduler's own failure.
+  | SchedulerFailed(Failure)
   /// The task failed at run time: the runtime's failure is reported, with this note.
   | TaskFailed(Int, Option<String>)
   /// A drain after a stop ran out of time, which failed the run.
   | Drained
 
-/// An action the region's loop takes for the scheduler, which only the runtime can perform.
+/// An action the scheduler's loop takes for the scheduler, which only the runtime can perform.
 pub type Command =
   /// A cancel waits until the task leaves the brackets it is inside.
-  | HoldBack(Int)
+  | DelayCancel(Int)
   /// The task's cancel no longer waits.
   | LetThrough(Int)
   /// The task never started: free its body and stack.
   | Discard(Int)
   /// The task ended by cancellation, which its handle records.
   | MarkCancelled(Int)
-  /// The task's raise is dropped: another task's raise is already leaving the region.
+  /// The task's raise is dropped: another task's raise is already leaving the scheduler.
   | DropRaise(Int)
 
-/// A failure the region reports: a code, a message, labels at sites, and notes.
+/// A failure the scheduler reports: a code, a message, labels at sites, and notes.
 pub type Failure = { code: String, message: String, labels: List<Label>, notes: List<String> }
 
 /// A failure's message at a site, with `primary` set for the site the failure is about.
@@ -145,10 +145,10 @@ derive bin for Failure
 /// `f` encoded as the runtime reads the failure it fails a run with.
 pub fn failure_bytes(f: Failure) -> Bytes / {abort.raise} = bin::encode(f, failure_bin())
 
-/// What the region's host reports to a production turn.
+/// What the scheduler's host reports to a production turn.
 pub type HostState = { now: Int, stopping: Bool }
 
-// --- A region's state -------------------------------------------------------------
+// --- A scheduler's state -------------------------------------------------------------
 
 type Wait<v> =
   | Joining(Int)
@@ -175,7 +175,7 @@ type State<v> =
   /// search has a step of the task to order against the cancel.
   | Dropped
 
-/// One of the region's tasks.
+/// One of the scheduler's tasks.
 type Member<v> = {
   id: Int,
   state: State<v>,
@@ -196,59 +196,59 @@ type Channel<v> = {
   closed: Bool,
 }
 
-/// One region's scheduler. Tasks and channels are numbered from 0 in the region and never reused.
+/// One scheduler. Tasks and channels are numbered from 0 in the scheduler and never reused.
 /// Its loop has the only reference to it, so a request updates it in place.
-pub type Region<v> = {
+pub type Scheduler<v> = {
   policy: Policy,
   id: Int,
   site: Site,
   tasks: Map<Int, Member<v>>,
   /// In `simulate`, each task's vector clock: how many steps of each task it has observed. A
-  /// production region keeps none.
+  /// production scheduler keeps none.
   stamps: List<List<Int>>,
   /// The tasks that may run. In `simulate` they are ascending, the order a choice indexes, with
   /// the running task among them until it stops being ready. In production they are in the order
   /// they became ready.
   ready: List<Int>,
   timers: Map<(Int, Int), Unit>,
-  /// A production region's tasks waiting on tickets, by token.
+  /// A production scheduler's tasks waiting on tickets, by token.
   tickets: Map<Int, Int>,
   channels: Map<Int, Channel<v>>,
   /// In `simulate`, what an operation on each channel writes, by the channel's id. A production
-  /// region keeps none.
+  /// scheduler keeps none.
   chan_accesses: List<Access>,
   unfinished: Int,
   next_id: Int,
   next_chan: Int,
   current: Option<Int>,
-  /// `simulate`'s virtual time, in nanoseconds since the region opened.
+  /// `simulate`'s virtual time, in nanoseconds since the scheduler opened.
   now: Int,
   trail: Trail,
-  /// The steps this region took before its last.
+  /// The steps this scheduler took before its last.
   steps: List<Step>,
-  /// The last step this region took, which the running task is taking; none before the first.
+  /// The last step this scheduler took, which the running task is taking; none before the first.
   step: Option<Step>,
   ending: Option<Ending>,
-  /// The task whose raise leaves the region once every other task has ended.
+  /// The task whose raise leaves the scheduler once every other task has ended.
   raising: Option<Int>,
   orders: List<Command>,
   /// What the last `next_turn` decided runs next. Before the first call, its value means nothing.
   turn: Turn<v>,
-  /// Used by `simulate`'s loop: each footprint the runtime wrote, decoded, and cached because a
-  /// program repeats its steps' footprints.
-  footprints: Map<Bytes, List<trail::Touch>>,
-  /// Used by a production region's loop: how many waits on the run in a row woke nothing.
+  /// Used by `simulate`'s loop: each set of effects the runtime wrote, decoded, and cached because
+  /// a program repeats its steps' effects.
+  touches: Map<Bytes, List<trail::Touch>>,
+  /// Used by a production scheduler's loop: how many waits on the run in a row woke nothing.
   spurious_wakeups: Int,
 }
 
-/// A `simulate` region `id` at `site`, its body to run as task 0, choosing from `t`.
-pub fn seeded<v>(id: Int, site: Site, t: Trail) -> Region<v> = new_region(Seeded, id, site, t)
+/// A simulation `id` at `site`, its body to run as task 0, choosing from `t`.
+pub fn seeded<v>(id: Int, site: Site, t: Trail) -> Scheduler<v> = new_scheduler(Seeded, id, site, t)
 
-/// The run's production region, its root to run as task 0.
-pub fn production<v>(id: Int, site: Site) -> Region<v> =
-  new_region(Production, id, site, trail::trail({ root: 0u64, path: [] }, 1))
+/// The run's production scheduler, its root to run as task 0.
+pub fn production<v>(id: Int, site: Site) -> Scheduler<v> =
+  new_scheduler(Production, id, site, trail::trail({ root: 0u64, path: [] }, 1))
 
-fn new_region<v>(policy: Policy, id: Int, site: Site, t: Trail) -> Region<v> =
+fn new_scheduler<v>(policy: Policy, id: Int, site: Site, t: Trail) -> Scheduler<v> =
   {
     policy: policy,
     id: id,
@@ -278,32 +278,32 @@ fn new_region<v>(policy: Policy, id: Int, site: Site, t: Trail) -> Region<v> =
     raising: None,
     orders: [],
     turn: Idle(None),
-    footprints: Map::new(),
+    touches: Map::new(),
     spurious_wakeups: 0,
   }
 
 /// The accesses of a step that accessed nothing.
 fn no_accesses() -> List<Access> = []
 
-/// Every step the region took, in order.
-pub fn steps_taken<v>(r: Region<v>) -> List<Step> = steps_with(r.steps, r.step)
+/// Every step the scheduler took, in order.
+pub fn steps_taken<v>(r: Scheduler<v>) -> List<Step> = steps_with(r.steps, r.step)
 
-/// The trail as the region leaves it, including the virtual time it used.
-pub fn final_trail<v>(r: Region<v>) -> Trail = { ..r.trail, virtual_time: r.now }
+/// The trail as the scheduler leaves it, including the virtual time it used.
+pub fn final_trail<v>(r: Scheduler<v>) -> Trail = { ..r.trail, virtual_time: r.now }
 
-/// The commands the region issued since they were last taken, oldest first, and the region without
-/// them.
-pub fn take_commands<v>(r: Region<v>) -> { orders: List<Command>, region: Region<v> } =
-  { orders: r.orders, region: { ..r, orders: [] } }
+/// The commands the scheduler issued since they were last taken, oldest first, and the scheduler
+/// without them.
+pub fn take_commands<v>(r: Scheduler<v>) -> { orders: List<Command>, scheduler: Scheduler<v> } =
+  { orders: r.orders, scheduler: { ..r, orders: [] } }
 
-/// How many tasks the region has: in `simulate` every one it spawned, in production those not yet
-/// ended.
-pub fn task_count<v>(r: Region<v>) -> Int = r.tasks.len()
+/// How many tasks the scheduler has: in `simulate` every one it spawned, in production those not
+/// yet ended.
+pub fn task_count<v>(r: Scheduler<v>) -> Int = r.tasks.len()
 
 // --- Turns -------------------------------------------------------------------------
 
-/// The region once it has decided what runs next, which it stores as its turn.
-pub fn next_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise} =
+/// The scheduler once it has decided what runs next, which it stores as its turn.
+pub fn next_turn<v>(r: Scheduler<v>, host: HostState) -> Scheduler<v> / {abort.raise} =
   match r.ending {
     Some(e) -> { ..r, turn: Ends(e) },
     None -> match r.current {
@@ -319,27 +319,27 @@ pub fn next_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise} 
     },
   }
 
-fn fail_turn<v>(r: Region<v>, f: Failure) -> Region<v> = {
-  let s = fail_region(r, f);
-  let turn = match s.ending { Some(e) -> Ends(e), None -> Ends(RegionFailed(f)) };
+fn fail_turn<v>(r: Scheduler<v>, f: Failure) -> Scheduler<v> = {
+  let s = fail_scheduler(r, f);
+  let turn = match s.ending { Some(e) -> Ends(e), None -> Ends(SchedulerFailed(f)) };
   { ..s, turn: turn }
 }
 
 /// `r` failed with `f`, unless it already ended another way.
-fn fail_region<v>(r: Region<v>, f: Failure) -> Region<v> =
-  match r.ending { Some(_) -> r, None -> { ..r, ending: Some(RegionFailed(f)) } }
+fn fail_scheduler<v>(r: Scheduler<v>, f: Failure) -> Scheduler<v> =
+  match r.ending { Some(_) -> r, None -> { ..r, ending: Some(SchedulerFailed(f)) } }
 
 /// The final turn: completion or a re-raise when every task has ended, or a deadlock failure when
 /// some still wait on something that can never happen.
-fn final_turn<v>(r: Region<v>) -> Region<v> / {abort.raise} =
+fn final_turn<v>(r: Scheduler<v>) -> Scheduler<v> / {abort.raise} =
   if r.unfinished > 0 {
     fail_turn(r, match r.policy { Seeded -> deadlock(r), Production -> host_deadlock(r) })
   } else {
     match r.raising { Some(task) -> { ..r, turn: Reraise(task) }, None -> { ..r, turn: Complete } }
   }
 
-fn seeded_turn<v>(r: Region<v>) -> Region<v> / {abort.raise} =
-  iterate(r, r.tasks.len() + r.timers.len() + 2, |s: Region<v>|
+fn seeded_turn<v>(r: Scheduler<v>) -> Scheduler<v> / {abort.raise} =
+  iterate(r, r.tasks.len() + r.timers.len() + 2, |s: Scheduler<v>|
     match s.ending {
       Some(e) -> Stop({ ..s, turn: Ends(e) }),
       None -> {
@@ -362,21 +362,21 @@ fn seeded_turn<v>(r: Region<v>) -> Region<v> / {abort.raise} =
 /// Records the scheduling point that chooses the enabled task at `choice`, with the choices stream
 /// at `choices` after it.
 fn choose_task<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   choice: Int,
   choices: Int,
-) -> Iter<Region<v>, Region<v>> / {abort.raise} =
+) -> Iter<Scheduler<v>, Scheduler<v>> / {abort.raise} =
   match s.ready.at(choice) {
     None ->
       Stop(fail_turn(s, internal_error(s, "a scheduling point had no enabled task to choose"))),
     Some(id) -> match s.tasks.get(id) {
       None ->
-        Stop(fail_turn(s, internal_error(s, task_name(id) ++ " is not a task of this region"))),
+        Stop(fail_turn(s, internal_error(s, task_name(id) ++ " is not a task of this scheduler"))),
       Some(task) -> {
         let dropped = match task.state { Dropped -> true, _ -> false };
         let read = if task.cancelled { [trail::liveness(id, Read)] } else { no_accesses() };
         let step = {
-          region: s.id,
+          scheduler: s.id,
           task: id,
           enabled: s.ready,
           choice: choice,
@@ -403,7 +403,7 @@ fn choose_task<v>(
 
 /// `s` after the scheduling point that took `step`, with the choices stream's counter at
 /// `choices`.
-fn record_step<v>(s: Region<v>, step: Step, choices: Int) -> Region<v> / {abort.raise} =
+fn record_step<v>(s: Scheduler<v>, step: Step, choices: Int) -> Scheduler<v> / {abort.raise} =
   {
     ..s,
     trail: { ..s.trail, points: s.trail.points + 1, choices: choices },
@@ -427,14 +427,14 @@ fn widened(xs: List<Int>, n: Int) -> List<Int> =
 fn at_or_zero(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(n) -> n, None -> 0 }
 
 /// Moves virtual time to `deadline`, and readies each task sleeping until then, in task order.
-fn advance_time<v>(s: Region<v>, deadline: Int) -> Region<v> / {abort.raise} = {
+fn advance_time<v>(s: Scheduler<v>, deadline: Int) -> Scheduler<v> / {abort.raise} = {
   let woken = s.timers.keys().filter(|k: (Int, Int)| k._0 == deadline);
-  woken.fold(timers_cut(s, woken, deadline), |acc: Region<v>, k: (Int, Int)|
+  woken.fold(timers_cut(s, woken, deadline), |acc: Scheduler<v>, k: (Int, Int)|
     wake_sleeper(acc, k._1))
 }
 
 /// `s` at virtual time `deadline`, without the timers `woken`.
-fn timers_cut<v>(s: Region<v>, woken: List<(Int, Int)>, deadline: Int) -> Region<v> =
+fn timers_cut<v>(s: Scheduler<v>, woken: List<(Int, Int)>, deadline: Int) -> Scheduler<v> =
   {
     ..s,
     timers: woken.fold(s.timers, |m: Map<(Int, Int), Unit>, k: (Int, Int)| m.remove(k)),
@@ -442,27 +442,28 @@ fn timers_cut<v>(s: Region<v>, woken: List<(Int, Int)>, deadline: Int) -> Region
   }
 
 /// `s` without the timer `key`.
-fn timer_cut<v>(s: Region<v>, key: (Int, Int)) -> Region<v> = { ..s, timers: s.timers.remove(key) }
+fn timer_cut<v>(s: Scheduler<v>, key: (Int, Int)) -> Scheduler<v> =
+  { ..s, timers: s.timers.remove(key) }
 
 /// `s` with the timer `key`.
-fn timer_set<v>(s: Region<v>, key: (Int, Int)) -> Region<v> =
+fn timer_set<v>(s: Scheduler<v>, key: (Int, Int)) -> Scheduler<v> =
   { ..s, timers: s.timers.insert(key, ()) }
 
 /// Readies each sleeper whose deadline is `now` or earlier, earliest first and then in task order.
-fn wake_due_sleepers<v>(r: Region<v>, now: Int) -> Region<v> / {abort.raise} =
-  iterate(r, r.timers.len() + 1, |s: Region<v>|
+fn wake_due_sleepers<v>(r: Scheduler<v>, now: Int) -> Scheduler<v> / {abort.raise} =
+  iterate(r, r.timers.len() + 1, |s: Scheduler<v>|
     match s.timers.first() {
       Some(t) -> if t.key._0 > now { Stop(s) }
       else { Continue(wake_sleeper(timer_cut(s, t.key), t.key._1)) },
       None -> Stop(s),
     })
 
-fn wake_sleeper<v>(s: Region<v>, id: Int) -> Region<v> =
+fn wake_sleeper<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> =
   match s.tasks.get(id) {
     Some(t) -> match t.state {
       Blocked(Sleeping(_), _) -> make_ready(s, id, Resume(Nothing)),
       _ ->
-        fail_region(
+        fail_scheduler(
           s,
           internal_error(
             s,
@@ -471,13 +472,13 @@ fn wake_sleeper<v>(s: Region<v>, id: Int) -> Region<v> =
         ),
     },
     None ->
-      fail_region(
+      fail_scheduler(
         s,
         internal_error(s, "a timer fired for " ++ task_name(id) ++ ", which is not a task"),
       ),
   }
 
-fn production_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise} = {
+fn production_turn<v>(r: Scheduler<v>, host: HostState) -> Scheduler<v> / {abort.raise} = {
   let s = if r.timers.len() == 0 { r } else { wake_due_sleepers(r, host.now) };
   match s.ending {
     Some(e) -> { ..s, turn: Ends(e) },
@@ -487,7 +488,8 @@ fn production_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise
           Ready(res) -> { ..s, ready: rest, current: Some(id), turn: Run(id, res) },
           _ -> fail_turn(s, internal_error(s, task_name(id) ++ " was chosen but is not enabled")),
         },
-        None -> fail_turn(s, internal_error(s, task_name(id) ++ " is not a task of this region")),
+        None ->
+          fail_turn(s, internal_error(s, task_name(id) ++ " is not a task of this scheduler")),
       },
       [] -> if s.unfinished == 0 { final_turn(s) } else {
         match s.timers.first() {
@@ -501,8 +503,8 @@ fn production_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise
 }
 
 /// Readies, in task order, each task waiting on one of `tokens`, whose tickets the run completed.
-/// A token that no task here waits on belongs to another region of the run that has ended.
-pub fn wake_ticket_waiters<v>(r: Region<v>, tokens: List<Int>) -> Region<v> / {abort.raise} = {
+/// A token that no task here waits on belongs to another scheduler of the run that has ended.
+pub fn wake_ticket_waiters<v>(r: Scheduler<v>, tokens: List<Int>) -> Scheduler<v> / {abort.raise} = {
   let found = tokens.fold(
     { tickets: r.tickets, tasks: [] },
     |acc: { tickets: Map<Int, Int>, tasks: List<Int> }, token: Int|
@@ -511,12 +513,12 @@ pub fn wake_ticket_waiters<v>(r: Region<v>, tokens: List<Int>) -> Region<v> / {a
         None -> acc,
       },
   );
-  found.tasks.sort().fold({ ..r, tickets: found.tickets }, |acc: Region<v>, id: Int|
+  found.tasks.sort().fold({ ..r, tickets: found.tickets }, |acc: Scheduler<v>, id: Int|
     match acc.tasks.get(id) {
       Some(t) -> match t.state {
         Blocked(AwaitingTicket(_), _) -> make_ready(acc, id, Resume(Nothing)),
         _ ->
-          fail_region(
+          fail_scheduler(
             acc,
             internal_error(acc, task_name(id) ++ " was answered a ticket while not waiting on one"),
           ),
@@ -527,17 +529,17 @@ pub fn wake_ticket_waiters<v>(r: Region<v>, tokens: List<Int>) -> Region<v> / {a
 
 // --- Requests ---------------------------------------------------------------------
 
-/// Applies the running `task`'s request to the region.
+/// Applies the running `task`'s request to the scheduler.
 pub fn handle_request<v>(
-  r: Region<v>,
+  r: Scheduler<v>,
   task: Int,
   request: Request<v>,
   context: RequestContext,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match r.ending {
     Some(_) -> r,
     None -> if r.current != Some(task) {
-      fail_region(
+      fail_scheduler(
         r,
         internal_error(
           r,
@@ -554,11 +556,11 @@ pub fn handle_request<v>(
   }
 
 fn apply_request<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   request: Request<v>,
   context: RequestContext,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match request {
     Spawn -> apply_spawn(s, task, context.site),
     Join(t) -> apply_join(s, task, t, context.site, false),
@@ -575,16 +577,16 @@ fn apply_request<v>(
       )
     },
     Send(c, value) -> match channel_error(s, c, context.site) {
-      Some(f) -> fail_region(s, f),
+      Some(f) -> fail_scheduler(s, f),
       None ->
         record_channel_access(apply_send(s, task, c.id, value, context.site), c.id, context.site),
     },
     Recv(c) -> match channel_error(s, c, context.site) {
-      Some(f) -> fail_region(s, f),
+      Some(f) -> fail_scheduler(s, f),
       None -> record_channel_access(apply_receive(s, task, c.id, context.site), c.id, context.site),
     },
     Close(c) -> match channel_error(s, c, context.site) {
-      Some(f) -> fail_region(s, f),
+      Some(f) -> fail_scheduler(s, f),
       None -> record_channel_access(apply_close(s, task, c.id), c.id, context.site),
     },
     Select(arms, wait) -> apply_select(s, task, arms, wait, context.site),
@@ -603,9 +605,9 @@ fn apply_request<v>(
         reply({ ..s, trail: { ..s.trail, draws: s.trail.draws + 1 } }, task, Number(value))
       },
       Production ->
-        fail_region(
+        fail_scheduler(
           s,
-          internal_error(s, "`random.next` reached a production region, which draws nothing"),
+          internal_error(s, "`random.next` reached the run's own scheduler, which draws nothing"),
         ),
     },
     Below(n) -> match s.policy {
@@ -614,9 +616,9 @@ fn apply_request<v>(
         reply({ ..s, trail: { ..s.trail, draws: d.counter } }, task, Number(d.value))
       },
       Production ->
-        fail_region(
+        fail_scheduler(
           s,
-          internal_error(s, "`random.below` reached a production region, which draws nothing"),
+          internal_error(s, "`random.below` reached the run's own scheduler, which draws nothing"),
         ),
     },
     Seed -> {
@@ -636,7 +638,7 @@ fn apply_request<v>(
   }
 
 /// `s` with one more channel, of `capacity`.
-fn add_channel<v>(s: Region<v>, capacity: Int) -> Region<v> =
+fn add_channel<v>(s: Scheduler<v>, capacity: Int) -> Scheduler<v> =
   {
     ..s,
     next_chan: s.next_chan + 1,
@@ -654,41 +656,41 @@ fn add_channel<v>(s: Region<v>, capacity: Int) -> Region<v> =
   }
 
 /// `s` with channel `id` replaced by `f` of it.
-fn chan_set<v>(s: Region<v>, id: Int, f: (Channel<v>) -> Channel<v>) -> Region<v> =
+fn chan_set<v>(s: Scheduler<v>, id: Int, f: (Channel<v>) -> Channel<v>) -> Scheduler<v> =
   { ..s, channels: s.channels.update(id, f) }
 
 /// `s` with task `id` replaced by `f` of it.
-fn task_set<v>(s: Region<v>, id: Int, f: (Member<v>) -> Member<v>) -> Region<v> =
+fn task_set<v>(s: Scheduler<v>, id: Int, f: (Member<v>) -> Member<v>) -> Scheduler<v> =
   { ..s, tasks: s.tasks.update(id, f) }
 
 /// `s` without task `id`.
-fn task_removed<v>(s: Region<v>, id: Int) -> Region<v> = { ..s, tasks: s.tasks.remove(id) }
+fn task_removed<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> = { ..s, tasks: s.tasks.remove(id) }
 
 /// Readies the running task with `incoming`, and gives control back to the loop.
-fn reply<v>(s: Region<v>, task: Int, incoming: Reply<v>) -> Region<v> =
+fn reply<v>(s: Scheduler<v>, task: Int, incoming: Reply<v>) -> Scheduler<v> =
   { ..running_readied(s, task, Resume(incoming)), current: None }
 
 /// Readies the task to raise `f` where it made its request, and gives control back to the loop.
-fn raise_in_task<v>(s: Region<v>, task: Int, f: Failure) -> Region<v> =
+fn raise_in_task<v>(s: Scheduler<v>, task: Int, f: Failure) -> Scheduler<v> =
   { ..running_readied(s, task, Raise(f)), current: None }
 
 /// Readies the running task `id` to run again as `res`. In `simulate` it is already among the
 /// ready tasks.
-fn running_readied<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
+fn running_readied<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
   match s.policy { Seeded -> set_state(s, id, Ready(res)), Production -> ready_queued(s, id, res) }
 
-/// Readies task `id`, which the region has, to run again as `res`.
-fn make_ready<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
+/// Readies task `id`, which the scheduler has, to run again as `res`.
+fn make_ready<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
   match s.policy { Seeded -> ready_in_order(s, id, res), Production -> ready_queued(s, id, res) }
 
-fn ready_in_order<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
+fn ready_in_order<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
   {
     ..s,
     tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: Ready(res) }),
     ready: ascending_with(s.ready, id),
   }
 
-fn ready_queued<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
+fn ready_queued<v>(s: Scheduler<v>, id: Int, res: Resumption<v>) -> Scheduler<v> =
   {
     ..s,
     tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: Ready(res) }),
@@ -709,27 +711,28 @@ fn first_not_below(xs: List<Int>, id: Int, i: Int, final_trail: Int) -> Int =
 
 fn at_or_minus(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(n) -> n, None -> 0 - 1 }
 
-fn set_state<v>(s: Region<v>, id: Int, state: State<v>) -> Region<v> =
+fn set_state<v>(s: Scheduler<v>, id: Int, state: State<v>) -> Scheduler<v> =
   { ..s, tasks: s.tasks.update(id, |t: Member<v>| { ..t, state: state }) }
 
-fn block_task<v>(s: Region<v>, id: Int, wait: Wait<v>, site: Site) -> Region<v> =
+fn block_task<v>(s: Scheduler<v>, id: Int, wait: Wait<v>, site: Site) -> Scheduler<v> =
   stopped_running(s, id, Blocked(wait, site))
 
 /// Puts the running task `id` in `state`, in which it cannot run, and gives control back to the
 /// loop.
-fn stopped_running<v>(s: Region<v>, id: Int, state: State<v>) -> Region<v> = {
+fn stopped_running<v>(s: Scheduler<v>, id: Int, state: State<v>) -> Scheduler<v> = {
   let final_trail = match s.policy { Seeded -> unready(s, id), Production -> s };
   { ..set_state(final_trail, id, state), current: None }
 }
 
-fn add_command<v>(s: Region<v>, order: Command) -> Region<v> = { ..s, orders: s.orders.push(order) }
+fn add_command<v>(s: Scheduler<v>, order: Command) -> Scheduler<v> =
+  { ..s, orders: s.orders.push(order) }
 
 /// Places the running task's step at `site`, if it accessed nothing before.
-fn set_step_site<v>(s: Region<v>, site: Site) -> Region<v> =
+fn set_step_site<v>(s: Scheduler<v>, site: Site) -> Scheduler<v> =
   match s.policy { Production -> s, Seeded -> set_last_step_site(s, site) }
 
 /// `s` with its last step placed at `site`, if it was not placed yet.
-fn set_last_step_site<v>(s: Region<v>, site: Site) -> Region<v> =
+fn set_last_step_site<v>(s: Scheduler<v>, site: Site) -> Scheduler<v> =
   { ..s, step: with_site(s.step, site) }
 
 /// `step` placed at `site`, if it was not placed yet.
@@ -748,16 +751,16 @@ fn touching(step: Step, access: Access) -> Step =
   { ..step, accesses: trail::with_access(step.accesses, access) }
 
 /// Adds `access`, made at `site`, to what the step that made this request accessed.
-fn record_access<v>(s: Region<v>, access: Access, site: Site) -> Region<v> =
+fn record_access<v>(s: Scheduler<v>, access: Access, site: Site) -> Scheduler<v> =
   match s.policy { Production -> s, Seeded -> touched_step(s, access, site) }
 
 /// `s` with `access` added to its last step, and the step placed at `site` if it was not placed
 /// yet.
-fn touched_step<v>(s: Region<v>, access: Access, site: Site) -> Region<v> =
+fn touched_step<v>(s: Scheduler<v>, access: Access, site: Site) -> Scheduler<v> =
   { ..s, step: step_touched(with_site(s.step, site), access) }
 
 /// Adds an operation on channel `chan`, made at `site`, to what the step that made it accessed.
-fn record_channel_access<v>(s: Region<v>, chan: Int, site: Site) -> Region<v> =
+fn record_channel_access<v>(s: Scheduler<v>, chan: Int, site: Site) -> Scheduler<v> =
   match s.policy {
     Production -> s,
     Seeded -> match s.chan_accesses.at(chan) {
@@ -767,13 +770,20 @@ fn record_channel_access<v>(s: Region<v>, chan: Int, site: Site) -> Region<v> =
   }
 
 /// Adds what the running task's step performed, each where it was made, to the step's accesses.
-pub fn record_accesses<v>(r: Region<v>, accesses: List<{ access: Access, at: Site }>) -> Region<v> =
-  accesses.fold(r, |acc: Region<v>, a: { access: Access, at: Site }|
+pub fn record_accesses<v>(
+  r: Scheduler<v>,
+  accesses: List<{ access: Access, at: Site }>,
+) -> Scheduler<v> =
+  accesses.fold(r, |acc: Scheduler<v>, a: { access: Access, at: Site }|
     record_access(acc, a.access, a.at))
 
 /// Adds `access` to what task `id`'s last step accessed. A cancel is known only once it happens,
 /// and that step could have come after it instead.
-fn record_last_step_access<v>(s: Region<v>, id: Int, access: Access) -> Region<v> / {abort.raise} =
+fn record_last_step_access<v>(
+  s: Scheduler<v>,
+  id: Int,
+  access: Access,
+) -> Scheduler<v> / {abort.raise} =
   match s.policy {
     Production -> s,
     Seeded -> if match s.step { Some(st) -> st.task == id, None -> false } {
@@ -793,7 +803,7 @@ fn record_last_step_access<v>(s: Region<v>, id: Int, access: Access) -> Region<v
     },
   }
 
-fn apply_spawn<v>(s: Region<v>, task: Int, site: Site) -> Region<v> = {
+fn apply_spawn<v>(s: Scheduler<v>, task: Int, site: Site) -> Scheduler<v> = {
   let id = s.next_id;
   let stamp = match s.policy { Seeded -> stamp_of(s, task), Production -> [] };
   reply(make_ready(task_born(s, site, stamp), id, Start), task, Spawned(id))
@@ -801,7 +811,7 @@ fn apply_spawn<v>(s: Region<v>, task: Int, site: Site) -> Region<v> = {
 
 /// `s` with one more task, created at `site` with the clock `stamp` in `simulate`, and not yet
 /// ready.
-fn task_born<v>(s: Region<v>, site: Site, stamp: List<Int>) -> Region<v> =
+fn task_born<v>(s: Scheduler<v>, site: Site, stamp: List<Int>) -> Scheduler<v> =
   {
     ..s,
     next_id: s.next_id + 1,
@@ -818,13 +828,13 @@ fn task_born<v>(s: Region<v>, site: Site, stamp: List<Int>) -> Region<v> =
 
 /// A join, or an await, of `t`.
 fn apply_join<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   t: TaskRef,
   site: Site,
   awaiting: Bool,
-) -> Region<v> / {abort.raise} =
-  if t.region != s.id { fail_region(s, foreign_task(site, t.id)) } else {
+) -> Scheduler<v> / {abort.raise} =
+  if t.scheduler != s.id { fail_scheduler(s, foreign_task(site, t.id)) } else {
     let settled = match s.tasks.get(t.id) {
       Some(target) -> match target.state { Done -> Returned, Stopped -> Cancelled, _ -> Live },
       None -> t.ended,
@@ -837,7 +847,7 @@ fn apply_join<v>(
         if awaiting { reply(a, task, Awaited(false)) }
         else { raise_in_task(a, task, joined_cancelled(site, t.id)) }
       },
-      Live -> if !s.tasks.contains(t.id) { fail_region(s, unknown_task(site, t.id)) } else {
+      Live -> if !s.tasks.contains(t.id) { fail_scheduler(s, unknown_task(site, t.id)) } else {
         let wait_description = task_set(s, t.id, |x: Member<v>|
           { ..x, joiners: x.joiners.push(task) });
         block_task(
@@ -852,14 +862,14 @@ fn apply_join<v>(
 
 /// Stops `t` wherever it is, as `task.cancel` does, and replies whether it stopped anything.
 fn apply_cancel<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   t: TaskRef,
   shields: Shields,
   site: Site,
-) -> Region<v> / {abort.raise} =
-  if t.region != s.id { fail_region(s, foreign_task(site, t.id)) }
-  else if t.id == task || t.id == 0 { fail_region(s, invalid_cancel(site, t.id, task)) } else {
+) -> Scheduler<v> / {abort.raise} =
+  if t.scheduler != s.id { fail_scheduler(s, foreign_task(site, t.id)) }
+  else if t.id == task || t.id == 0 { fail_scheduler(s, invalid_cancel(site, t.id, task)) } else {
     let standing = match s.tasks.get(t.id) {
       None -> None,
       Some(target) ->
@@ -876,7 +886,7 @@ fn apply_cancel<v>(
     };
     match standing {
       None -> match t.ended {
-        Live -> fail_region(s, unknown_task(site, t.id)),
+        Live -> fail_scheduler(s, unknown_task(site, t.id)),
         _ -> reply(record_access(s, trail::end_access(t.id), site), task, Flag(false)),
       },
       Some(st) -> if st.ended {
@@ -897,12 +907,12 @@ fn apply_cancel<v>(
 /// only unwinds when it next runs. A task in a bracket's `acquire` keeps a reply it was given, a
 /// task in a `release` also keeps its wait, and the cancel takes effect when it leaves them.
 fn stop_task<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   by: Int,
   id: Int,
   shields: Shields,
   site: Site,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match s.tasks.get(id) {
     None -> s,
     Some(target) -> {
@@ -910,24 +920,30 @@ fn stop_task<v>(
       let s1 = task_set(s, id, |x: Member<v>| { ..x, cancelled: true });
       let shielded = shields.acquiring > 0 || shields.releasing > 0;
       match state {
-        // A production region keeps no ended task, so its handle records the end before it goes.
+        // A production scheduler keeps no ended task, so its handle records the end before it goes.
         Ready(Start) -> match s1.policy {
           Seeded -> set_state(add_command(s1, Discard(id)), id, Dropped),
           Production ->
             add_command(finish_cancel(set_state(unready(s1, id), id, Stopped), id), Discard(id)),
         },
-        Ready(_) -> if shielded { add_command(s1, HoldBack(id)) }
+        Ready(_) -> if shielded { add_command(s1, DelayCancel(id)) }
         else { set_state(s1, id, Ready(Unwind)) },
-        Blocked(wait, _) -> if shields.releasing > 0 { add_command(s1, HoldBack(id)) }
+        Blocked(wait, _) -> if shields.releasing > 0 { add_command(s1, DelayCancel(id)) }
         else { absorbed(make_ready(release_wait(s1, id, wait, site), id, Unwind), id, by) },
-        _ -> fail_region(s1, internal_error(s1, task_name(id) ++ " was cancelled while running")),
+        _ ->
+          fail_scheduler(s1, internal_error(s1, task_name(id) ++ " was cancelled while running")),
       }
     },
   }
 
 /// Removes task `id` from what `wait` held it on, recording an access so a step on that is ordered
 /// against this.
-fn release_wait<v>(s: Region<v>, id: Int, wait: Wait<v>, site: Site) -> Region<v> / {abort.raise} =
+fn release_wait<v>(
+  s: Scheduler<v>,
+  id: Int,
+  wait: Wait<v>,
+  site: Site,
+) -> Scheduler<v> / {abort.raise} =
   match wait {
     Sleeping(until) -> { ..s, timers: s.timers.remove((until, id)) },
     Joining(on) -> record_access(remove_joiner(s, on, id), trail::end_access(on), site),
@@ -938,15 +954,16 @@ fn release_wait<v>(s: Region<v>, id: Int, wait: Wait<v>, site: Site) -> Region<v
     Selecting(arms) -> {
       let chans = arms.map(|a: Arm<v>| a.chan).sort().fold([], |acc: List<Int>, c: Int|
         if acc.contains(c) { acc } else { acc.push(c) });
-      chans.fold(remove_waiter(s, id, chans), |acc: Region<v>, c: Int|
+      chans.fold(remove_waiter(s, id, chans), |acc: Scheduler<v>, c: Int|
         record_channel_access(acc, c, site))
     },
   }
 
 /// `s` without task `id` among the tasks that may run.
-fn unready<v>(s: Region<v>, id: Int) -> Region<v> = { ..s, ready: s.ready.filter(|q: Int| q != id) }
+fn unready<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> =
+  { ..s, ready: s.ready.filter(|q: Int| q != id) }
 
-fn remove_joiner<v>(s: Region<v>, on: Int, joiner: Int) -> Region<v> =
+fn remove_joiner<v>(s: Scheduler<v>, on: Int, joiner: Int) -> Scheduler<v> =
   {
     ..s,
     tasks: s.tasks.update(on, |t: Member<v>|
@@ -954,8 +971,8 @@ fn remove_joiner<v>(s: Region<v>, on: Int, joiner: Int) -> Region<v> =
   }
 
 /// Removes task `id` from each of `chans`' waiting lists.
-fn remove_waiter<v>(s: Region<v>, id: Int, chans: List<Int>) -> Region<v> =
-  chans.fold(s, |acc: Region<v>, c: Int|
+fn remove_waiter<v>(s: Scheduler<v>, id: Int, chans: List<Int>) -> Scheduler<v> =
+  chans.fold(s, |acc: Scheduler<v>, c: Int|
     {
       ..acc,
       channels: acc.channels.update(c, |ch: Channel<v>|
@@ -970,10 +987,10 @@ fn remove_waiter<v>(s: Region<v>, id: Int, chans: List<Int>) -> Region<v> =
 /// first. In that case an operation that replied keeps its reply, and one that waits does not
 /// start.
 fn unwind_if_cancelled<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   context: RequestContext,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   if !context.shields.stopping || context.shields.releasing > 0 { s } else {
     let wait = match s.tasks.get(task) {
       Some(t) -> match t.state { Blocked(w, _) -> Some(w), _ -> None },
@@ -992,14 +1009,14 @@ fn unwind_if_cancelled<v>(
 
 /// Marks a cancelled task, whether running or never started, as ended. An await of it returns that
 /// it was cancelled, and a join raises.
-fn finish_cancel<v>(s: Region<v>, id: Int) -> Region<v> / {abort.raise} = {
+fn finish_cancel<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> / {abort.raise} = {
   let joiners = match s.tasks.get(id) { Some(t) -> Some(t.joiners), None -> None };
   match joiners {
     None -> s,
     Some(js) -> {
       let woken = js.fold(
         add_command({ ..s, unfinished: s.unfinished - 1 }, MarkCancelled(id)),
-        |acc: Region<v>, joiner: Int| {
+        |acc: Scheduler<v>, joiner: Int| {
           let waited = match acc.tasks.get(joiner) {
             Some(j) -> match j.state {
               Blocked(Awaiting(_), _) -> Some(Some(Resume(Awaited(false)))),
@@ -1012,7 +1029,7 @@ fn finish_cancel<v>(s: Region<v>, id: Int) -> Region<v> / {abort.raise} = {
             None -> acc,
             Some(Some(res)) -> absorbed(make_ready(acc, joiner, res), joiner, id),
             Some(None) ->
-              fail_region(
+              fail_scheduler(
                 acc,
                 internal_error(
                   acc,
@@ -1032,35 +1049,38 @@ fn finish_cancel<v>(s: Region<v>, id: Int) -> Region<v> / {abort.raise} = {
 
 /// The running task returned, and its handle stores the result. Each task waiting on it is
 /// notified.
-fn finish_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
+fn finish_task<v>(s: Scheduler<v>, task: Int) -> Scheduler<v> / {abort.raise} = {
   let joiners = match s.tasks.get(task) { Some(t) -> Some(t.joiners), None -> None };
   match joiners {
     None ->
-      fail_region(
+      fail_scheduler(
         s,
-        internal_error(s, task_name(task) ++ " finished without being a task of this region"),
+        internal_error(s, task_name(task) ++ " finished without being a task of this scheduler"),
       ),
     Some(js) -> {
       let s1 = record_access(s, trail::end_access(task), nowhere());
-      let woken = js.fold({ ..s1, unfinished: s1.unfinished - 1 }, |acc: Region<v>, joiner: Int| {
-        let incoming = match acc.tasks.get(joiner) {
-          Some(j) -> match j.state {
-            Blocked(Awaiting(_), _) -> Some(Some(Awaited(true))),
-            Blocked(_, _) -> Some(Some(Joined)),
-            _ -> Some(None),
-          },
-          None -> None,
-        };
-        match incoming {
-          Some(Some(h)) -> absorbed(make_ready(acc, joiner, Resume(h)), joiner, task),
-          Some(None) ->
-            fail_region(
-              acc,
-              internal_error(acc, task_name(joiner) ++ " was woken but was not blocked"),
-            ),
-          None -> acc,
-        }
-      });
+      let woken = js.fold(
+        { ..s1, unfinished: s1.unfinished - 1 },
+        |acc: Scheduler<v>, joiner: Int| {
+          let incoming = match acc.tasks.get(joiner) {
+            Some(j) -> match j.state {
+              Blocked(Awaiting(_), _) -> Some(Some(Awaited(true))),
+              Blocked(_, _) -> Some(Some(Joined)),
+              _ -> Some(None),
+            },
+            None -> None,
+          };
+          match incoming {
+            Some(Some(h)) -> absorbed(make_ready(acc, joiner, Resume(h)), joiner, task),
+            Some(None) ->
+              fail_scheduler(
+                acc,
+                internal_error(acc, task_name(joiner) ++ " was woken but was not blocked"),
+              ),
+            None -> acc,
+          }
+        },
+      );
       let done = stopped_running(woken, task, Done);
       match done.policy {
         Seeded -> task_set(done, task, |x: Member<v>| { ..x, joiners: [] }),
@@ -1070,15 +1090,15 @@ fn finish_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
   }
 }
 
-/// The running task's raise leaves it for the handlers around the region. Every other task still
+/// The running task's raise leaves it for the handlers around the scheduler. Every other task still
 /// running is cancelled, so each releases the brackets it is inside, and the raise lands once they
 /// have ended. A second raise while one is leaving is dropped.
 fn raise_from_task<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   shields: Map<Int, Shields>,
   site: Site,
-) -> Region<v> / {abort.raise} = {
+) -> Scheduler<v> / {abort.raise} = {
   let leaving = s.raising;
   let unfinished = s.unfinished - 1;
   let out = record_access(
@@ -1089,7 +1109,7 @@ fn raise_from_task<v>(
   match leaving {
     Some(_) -> add_command(out, DropRaise(task)),
     None ->
-      out.tasks.keys().fold({ ..out, raising: Some(task) }, |acc: Region<v>, id: Int| {
+      out.tasks.keys().fold({ ..out, raising: Some(task) }, |acc: Scheduler<v>, id: Int| {
         let live = match acc.tasks.get(id) {
           Some(t) ->
             !t.cancelled
@@ -1118,19 +1138,18 @@ fn raise_from_task<v>(
   }
 }
 
-/// The running task failed at run time: the region ends, and the failure is noted with where it
+/// The running task failed at run time: the scheduler ends, and the failure is noted with where it
 /// happened.
-fn fail_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
+fn fail_task<v>(s: Scheduler<v>, task: Int) -> Scheduler<v> / {abort.raise} = {
   let live = max(s.unfinished - 1, 0);
   let note = if s.next_id <= 1 { None } else {
     Some(match s.policy {
       Seeded ->
-        "failed in task " ++ task_name(task) ++ " of a simulated region, with " ++ live.to_string()
+        "failed in task " ++ task_name(task) ++ " of a simulation, with " ++ live.to_string()
           ++ " other task(s) unfinished; replay with seed "
           ++ trail::seed_text(s.trail.seed),
       Production ->
-        "failed in task " ++ task_name(task) ++ " of a host-scheduled region, with "
-          ++ live.to_string()
+        "failed in task " ++ task_name(task) ++ " of the run's scheduler, with " ++ live.to_string()
           ++ " other task(s) unfinished; a host-backed run is not replayable from a seed",
     })
   };
@@ -1139,15 +1158,15 @@ fn fail_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
 }
 
 fn apply_sleep<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   nanos: Int,
   context: RequestContext,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   if nanos <= 0 { reply(s, task, Nothing) } else {
     match s.policy {
       Seeded -> match checked_add(s.now, nanos) {
-        None -> fail_region(s, time_overflow(context.site, s.now, nanos)),
+        None -> fail_scheduler(s, time_overflow(context.site, s.now, nanos)),
         Some(deadline) ->
           block_task(timer_set(s, (deadline, task)), task, Sleeping(deadline), context.site),
       },
@@ -1158,19 +1177,19 @@ fn apply_sleep<v>(
     }
   }
 
-fn apply_ticket<v>(s: Region<v>, task: Int, token: Int, site: Site) -> Region<v> =
+fn apply_ticket<v>(s: Scheduler<v>, task: Int, token: Int, site: Site) -> Scheduler<v> =
   match s.policy {
     Seeded ->
-      fail_region(
+      fail_scheduler(
         s,
         internal_error(
           s,
-          "a seeded region was asked to wait on a ticket, which only a production region does",
+          "a simulation was asked to wait on a ticket, which only the run's own scheduler does",
         ),
       ),
     Production -> match s.tickets.get(token) {
       Some(other) ->
-        fail_region(
+        fail_scheduler(
           s,
           internal_error(
             s,
@@ -1184,25 +1203,25 @@ fn apply_ticket<v>(s: Region<v>, task: Int, token: Int, site: Site) -> Region<v>
   }
 
 /// `s` with task `task` waiting on the ticket of `token`.
-fn ticket_set<v>(s: Region<v>, token: Int, task: Int) -> Region<v> =
+fn ticket_set<v>(s: Scheduler<v>, token: Int, task: Int) -> Scheduler<v> =
   { ..s, tickets: s.tickets.insert(token, task) }
 
 // --- Channels --------------------------------------------------------------------
 
-/// Why `c` does not refer to a channel of this region, if it does not: it belongs to another
-/// region, or its id was never created here.
-fn channel_error<v>(s: Region<v>, c: ChanRef, site: Site) -> Option<Failure> =
-  if c.region != s.id { Some(foreign_channel(site, c.id)) }
+/// Why `c` does not refer to a channel of this scheduler, if it does not: it belongs to another
+/// scheduler, or its id was never created here.
+fn channel_error<v>(s: Scheduler<v>, c: ChanRef, site: Site) -> Option<Failure> =
+  if c.scheduler != s.id { Some(foreign_channel(site, c.id)) }
   else if c.id >= s.next_chan || c.id < 0 {
-    Some(internal_error(s, chan_name(c.id) ++ " is not a channel of this region"))
+    Some(internal_error(s, chan_name(c.id) ++ " is not a channel of this scheduler"))
   } else { None }
 
-/// Where a send goes without waiting: nowhere, rejected by a closed channel or one the region no
+/// Where a send goes without waiting: nowhere, rejected by a closed channel or one the scheduler no
 /// longer has; to the receiver that has waited longest; into the queue while it has room; or not
 /// yet.
 type SendRoute = | Closed | ToReceiver(Int) | Queued | SenderWaits
 
-fn send_route<v>(s: Region<v>, id: Int) -> SendRoute =
+fn send_route<v>(s: Scheduler<v>, id: Int) -> SendRoute =
   match s.channels.get(id) {
     None -> Closed,
     Some(ch) -> if ch.closed { Closed } else {
@@ -1215,12 +1234,12 @@ fn send_route<v>(s: Region<v>, id: Int) -> SendRoute =
 
 /// `s` after `task`'s send of `value` on channel `id`, which goes where `goes` says, is complete.
 fn complete_send<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   id: Int,
   value: v,
   goes: SendRoute,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match goes {
     ToReceiver(receiver) ->
       deliver(
@@ -1238,12 +1257,12 @@ fn complete_send<v>(
   }
 
 fn apply_send<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   id: Int,
   value: v,
   site: Site,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match send_route(s, id) {
     Closed -> reply(s, task, Flag(false)),
     SenderWaits ->
@@ -1258,12 +1277,12 @@ fn apply_send<v>(
 
 /// Readies `receiver`, waiting to receive on `chan`, with `value`, or with the close.
 fn deliver<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   receiver: Int,
   chan: Int,
   value: Option<v>,
   by: Int,
-) -> Region<v> / {abort.raise} = {
+) -> Scheduler<v> / {abort.raise} = {
   let wait = match s.tasks.get(receiver) {
     Some(t) -> match t.state { Blocked(w, _) -> Some(Some(w)), _ -> Some(None) },
     None -> None,
@@ -1285,7 +1304,7 @@ fn deliver<v>(
           by,
         ),
       None ->
-        fail_region(
+        fail_scheduler(
           s,
           internal_error(
             s,
@@ -1295,16 +1314,16 @@ fn deliver<v>(
         ),
     },
     _ ->
-      fail_region(
+      fail_scheduler(
         s,
         internal_error(s, task_name(receiver) ++ " was taken as a receiver but was not receiving"),
       ),
   }
 }
 
-/// What task `id` waits on: `None` if the region has no such task, `Some(None)` if it waits on
+/// What task `id` waits on: `None` if the scheduler has no such task, `Some(None)` if it waits on
 /// nothing.
-fn wait_of<v>(s: Region<v>, id: Int) -> Option<Option<Wait<v>>> =
+fn wait_of<v>(s: Scheduler<v>, id: Int) -> Option<Option<Wait<v>>> =
   match s.tasks.get(id) {
     Some(t) -> match t.state { Blocked(w, _) -> Some(Some(w)), _ -> Some(None) },
     None -> None,
@@ -1323,13 +1342,13 @@ fn sent_value<v>(wait: Option<Option<Wait<v>>>, chan: Int) -> Option<v> =
 
 /// Readies `sender`, waiting as `wait` to send on `chan`, with whether its value was sent.
 fn release_sender<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   sender: Int,
   wait: Option<Option<Wait<v>>>,
   chan: Int,
   went: Bool,
   by: Int,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match wait {
     None -> s,
     Some(Some(Sending(_, _))) -> absorbed(make_ready(s, sender, Resume(Flag(went))), sender, by),
@@ -1348,7 +1367,7 @@ fn release_sender<v>(
         )
       },
       None ->
-        fail_region(
+        fail_scheduler(
           s,
           internal_error(
             s,
@@ -1358,7 +1377,7 @@ fn release_sender<v>(
         ),
     },
     _ ->
-      fail_region(
+      fail_scheduler(
         s,
         internal_error(s, task_name(sender) ++ " was taken as a sender but was not sending"),
       ),
@@ -1375,14 +1394,14 @@ fn index_where<a>(xs: List<a>, ok: (a) -> Bool) -> Option<Int> =
 
 /// Where a receive takes from without waiting: the oldest queued value; the sender that has waited
 /// longest, if nothing is queued; nothing, from a channel that is closed and empty or one the
-/// region no longer has; or nowhere yet.
+/// scheduler no longer has; or nowhere yet.
 type ReceiveRoute<v> =
   | FromQueue
   | FromSender(Int, Option<Option<Wait<v>>>)
   | Spent
   | ReceiverWaits
 
-fn receive_route<v>(s: Region<v>, id: Int) -> ReceiveRoute<v> =
+fn receive_route<v>(s: Scheduler<v>, id: Int) -> ReceiveRoute<v> =
   match s.channels.get(id) {
     None -> Spent,
     Some(ch) -> if ch.queue.len() > 0 { FromQueue } else {
@@ -1394,7 +1413,7 @@ fn receive_route<v>(s: Region<v>, id: Int) -> ReceiveRoute<v> =
   }
 
 /// The value a receive on channel `id` takes, from where `goes` says.
-fn received_value<v>(s: Region<v>, id: Int, goes: ReceiveRoute<v>) -> Option<v> =
+fn received_value<v>(s: Scheduler<v>, id: Int, goes: ReceiveRoute<v>) -> Option<v> =
   match goes {
     FromQueue -> match s.channels.get(id) {
       Some(ch) -> match ch.queue.at(0) { Some(q) -> Some(q.value), None -> None },
@@ -1406,11 +1425,11 @@ fn received_value<v>(s: Region<v>, id: Int, goes: ReceiveRoute<v>) -> Option<v> 
 
 /// `s` after `task`'s receive on channel `id`, from where `goes` says, is complete.
 fn complete_receive<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   id: Int,
   goes: ReceiveRoute<v>,
-) -> Region<v> / {abort.raise} =
+) -> Scheduler<v> / {abort.raise} =
   match goes {
     FromQueue -> {
       let stamp = match s.channels.get(id) {
@@ -1442,7 +1461,7 @@ fn complete_receive<v>(
 
 /// `s` with the room that `by`'s receive made on channel `id` filled by the value of the sender
 /// that has waited longest, which is then released.
-fn refilled<v>(s: Region<v>, id: Int, by: Int) -> Region<v> / {abort.raise} = {
+fn refilled<v>(s: Scheduler<v>, id: Int, by: Int) -> Scheduler<v> / {abort.raise} = {
   let sender = match s.channels.get(id) { Some(ch) -> ch.senders.at(0), None -> None };
   match sender {
     None -> s,
@@ -1468,7 +1487,12 @@ fn refilled<v>(s: Region<v>, id: Int, by: Int) -> Region<v> / {abort.raise} = {
   }
 }
 
-fn apply_receive<v>(s: Region<v>, task: Int, id: Int, site: Site) -> Region<v> / {abort.raise} =
+fn apply_receive<v>(
+  s: Scheduler<v>,
+  task: Int,
+  id: Int,
+  site: Site,
+) -> Scheduler<v> / {abort.raise} =
   match receive_route(s, id) {
     ReceiverWaits ->
       block_task(
@@ -1485,14 +1509,14 @@ fn apply_receive<v>(s: Region<v>, task: Int, id: Int, site: Site) -> Region<v> /
 
 /// Closes the channel to sending. Each waiting receiver gets `None` and each waiting sender
 /// `false`, while queued values remain to be received.
-fn apply_close<v>(s: Region<v>, task: Int, id: Int) -> Region<v> / {abort.raise} = {
+fn apply_close<v>(s: Scheduler<v>, task: Int, id: Int) -> Scheduler<v> / {abort.raise} = {
   let shut = chan_set(s, id, |c: Channel<v>| { ..c, closed: true });
   let wait_description = match shut.channels.get(id) {
     Some(ch) -> ch.receivers.len() + ch.senders.len(),
     None -> 0,
   };
   // One waiter at a time off the live queues, since a select may wait on both sides of a channel.
-  let drained = iterate(shut, wait_description + 1, |acc: Region<v>| {
+  let drained = iterate(shut, wait_description + 1, |acc: Scheduler<v>| {
     let next = match acc.channels.get(id) {
       None -> None,
       Some(ch) -> match ch.receivers {
@@ -1537,47 +1561,47 @@ fn apply_close<v>(s: Region<v>, task: Int, id: Int) -> Region<v> / {abort.raise}
 /// Completes the first arm, in the order given, that can go without waiting. If none can and
 /// `wait` is true, waits on every arm for the first one another task makes ready.
 fn apply_select<v>(
-  s: Region<v>,
+  s: Scheduler<v>,
   task: Int,
   arms: List<{ chan: ChanRef, send: Option<v> }>,
   wait: Bool,
   site: Site,
-) -> Region<v> / {abort.raise} = {
+) -> Scheduler<v> / {abort.raise} = {
   let refused = arms.fold(None, |bad: Option<Failure>, a: { chan: ChanRef, send: Option<v> }|
     match bad { Some(_) -> bad, None -> channel_error(s, a.chan, site) });
   match refused {
-    Some(f) -> fail_region(s, f),
+    Some(f) -> fail_scheduler(s, f),
     None -> {
       let wait_description = arms.map(|a: { chan: ChanRef, send: Option<v> }|
         { chan: a.chan.id, send: a.send });
-      let touched = wait_description.fold(s, |acc: Region<v>, a: Arm<v>|
+      let touched = wait_description.fold(s, |acc: Scheduler<v>, a: Arm<v>|
         record_channel_access(acc, a.chan, site));
       let tried = range(0, wait_description.len()).fold(
-        { region: touched, arms: wait_description, went: None },
-        |acc: { region: Region<v>, arms: List<Arm<v>>, went: Option<{ at: Int, got: Option<v> }> }, i: Int|
+        { scheduler: touched, arms: wait_description, went: None },
+        |acc: { scheduler: Scheduler<v>, arms: List<Arm<v>>, went: Option<{ at: Int, got: Option<v> }> }, i: Int|
           match acc.went {
             Some(_) -> acc,
             None -> match acc.arms.at(i) {
               None -> acc,
               Some(arm) -> match arm.send {
-                None -> match receive_route(acc.region, arm.chan) {
+                None -> match receive_route(acc.scheduler, arm.chan) {
                   ReceiverWaits -> acc,
                   goes -> {
-                    let got = received_value(acc.region, arm.chan, goes);
+                    let got = received_value(acc.scheduler, arm.chan, goes);
                     {
                       ..acc,
-                      region: complete_receive(acc.region, task, arm.chan, goes),
+                      scheduler: complete_receive(acc.scheduler, task, arm.chan, goes),
                       went: Some({ at: i, got: got }),
                     }
                   },
                 },
-                Some(value) -> match send_route(acc.region, arm.chan) {
+                Some(value) -> match send_route(acc.scheduler, arm.chan) {
                   SenderWaits -> acc,
                   Closed -> { ..acc, went: Some({ at: i, got: None }) },
                   goes ->
                     {
                       ..acc,
-                      region: complete_send(acc.region, task, arm.chan, value, goes),
+                      scheduler: complete_send(acc.scheduler, task, arm.chan, value, goes),
                       went: Some({ at: i, got: Some(value) }),
                     },
                 },
@@ -1586,9 +1610,9 @@ fn apply_select<v>(
           },
       );
       match tried.went {
-        Some(went) -> reply(tried.region, task, Selected(Some(went))),
-        None -> if !wait { reply(tried.region, task, Selected(None)) } else {
-          let queued = tried.arms.fold(tried.region, |acc: Region<v>, a: Arm<v>|
+        Some(went) -> reply(tried.scheduler, task, Selected(Some(went))),
+        None -> if !wait { reply(tried.scheduler, task, Selected(None)) } else {
+          let queued = tried.arms.fold(tried.scheduler, |acc: Scheduler<v>, a: Arm<v>|
             chan_set(acc, a.chan, |c: Channel<v>|
               match a.send {
                 Some(_) -> if c.senders.contains(task) { c }
@@ -1605,7 +1629,7 @@ fn apply_select<v>(
 
 /// Removes a closed channel with nothing queued and nobody waiting. Operations on it then behave
 /// as on an exhausted channel, which it is.
-fn remove_if_spent<v>(s: Region<v>, id: Int) -> Region<v> = {
+fn remove_if_spent<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> = {
   let spent = match s.channels.get(id) {
     Some(ch) ->
       ch.closed && ch.queue.len() == 0 && ch.senders.len() == 0 && ch.receivers.len() == 0,
@@ -1615,25 +1639,29 @@ fn remove_if_spent<v>(s: Region<v>, id: Int) -> Region<v> = {
 }
 
 /// `s` without channel `id`.
-fn channel_removed<v>(s: Region<v>, id: Int) -> Region<v> = { ..s, channels: s.channels.remove(id) }
+fn channel_removed<v>(s: Scheduler<v>, id: Int) -> Scheduler<v> =
+  { ..s, channels: s.channels.remove(id) }
 
 // --- Vector clocks ------------------------------------------------------------------
 
-fn stamp_of<v>(s: Region<v>, id: Int) -> List<Int> =
+fn stamp_of<v>(s: Scheduler<v>, id: Int) -> List<Int> =
   match s.stamps.at(id) { Some(stamp) -> stamp, None -> [] }
 
 /// In `simulate`, records that `into` has observed everything `from` had.
-fn absorbed<v>(s: Region<v>, into: Int, from: Int) -> Region<v> / {abort.raise} =
+fn absorbed<v>(s: Scheduler<v>, into: Int, from: Int) -> Scheduler<v> / {abort.raise} =
   match s.policy { Production -> s, Seeded -> stamp_absorbed(s, into, stamp_of(s, from)) }
 
-fn stamp_absorbed<v>(s: Region<v>, into: Int, stamp: List<Int>) -> Region<v> / {abort.raise} =
+fn stamp_absorbed<v>(s: Scheduler<v>, into: Int, stamp: List<Int>) -> Scheduler<v> / {abort.raise} =
   match s.policy {
     Production -> s,
     Seeded -> if stamp.len() == 0 { s } else { stamps_absorbed(s, into, stamp) },
   }
 
-fn stamps_absorbed<v>(s: Region<v>, into: Int, stamp: List<Int>) -> Region<v> / {abort.raise} =
-  { ..s, stamps: stamps_joined(s.stamps, into, stamp) }
+fn stamps_absorbed<v>(
+  s: Scheduler<v>,
+  into: Int,
+  stamp: List<Int>,
+) -> Scheduler<v> / {abort.raise} = { ..s, stamps: stamps_joined(s.stamps, into, stamp) }
 
 /// `stamps` with task `into`'s clock joined with `stamp`.
 fn stamps_joined(
@@ -1681,7 +1709,7 @@ fn primary(context: Site, text: String) -> Label = { at: context, primary: true,
 
 fn secondary(context: Site, text: String) -> Label = { at: context, primary: false, text: text }
 
-fn internal_error<v>(r: Region<v>, message: String) -> Failure =
+fn internal_error<v>(r: Scheduler<v>, message: String) -> Failure =
   {
     code: "E0505",
     message: message,
@@ -1695,7 +1723,7 @@ fn internal_error<v>(r: Region<v>, message: String) -> Failure =
   }
 
 /// Each blocked task, ascending, with where it waits and on what.
-fn blocked_labels<v>(r: Region<v>, now: Option<Int>) -> List<Label> =
+fn blocked_labels<v>(r: Scheduler<v>, now: Option<Int>) -> List<Label> =
   r.tasks.fold([], |acc: List<Label>, id: Int, t: Member<v>|
     match t.state {
       Blocked(wait, site) ->
@@ -1736,98 +1764,101 @@ fn wait_description<v>(id: Int, wait: Wait<v>, now: Option<Int>) -> String =
     },
   }
 
-fn blocked_count<v>(r: Region<v>) -> Int =
+fn blocked_count<v>(r: Scheduler<v>) -> Int =
   r.tasks.fold(0, |n: Int, _id: Int, t: Member<v>| match t.state { Blocked(_, _) -> n + 1, _ -> n })
 
-fn deadlock<v>(r: Region<v>) -> Failure / {abort.raise} =
+fn deadlock<v>(r: Scheduler<v>) -> Failure / {abort.raise} =
   {
     code: "E0414",
-    message: "this simulated region deadlocked: "
-      ++ plural(blocked_count(r), "task is", "tasks are")
+    message: "this simulation deadlocked: " ++ plural(blocked_count(r), "task is", "tasks are")
       ++ " blocked and none runnable",
-    labels: [primary(r.site, "no task in this region can make progress")].concat(
+    labels: [primary(r.site, "no task in this scheduler can make progress")].concat(
       blocked_labels(r, Some(r.now)),
     ),
     notes: [
-      "a `simulate` region ends when its last task ends, so a task that never finishes stops the region rather than being abandoned",
+      "a simulation ends when its last task ends, so a task that never finishes stops the simulation rather than being dropped",
       "break the wait cycle, or make the task being waited on finish",
       "replay with seed " ++ trail::seed_text(r.trail.seed),
     ],
   }
 
-fn host_deadlock<v>(r: Region<v>) -> Failure / {abort.raise} =
+fn host_deadlock<v>(r: Scheduler<v>) -> Failure / {abort.raise} =
   {
     code: "E0414",
-    message: "this host-scheduled region deadlocked: "
-      ++ plural(blocked_count(r), "task is", "tasks are")
+    message: "this run's scheduler deadlocked: " ++ plural(blocked_count(r), "task is", "tasks are")
       ++ " blocked, none runnable and none waiting on the host",
-    labels: [primary(r.site, "no task in this region can make progress")].concat(
+    labels: [primary(r.site, "no task in this scheduler can make progress")].concat(
       blocked_labels(r, None),
     ),
     notes: [
-      "a region ends when its last task ends, so a task that never finishes stops the region rather than being abandoned",
+      "a scheduler ends when its last task ends, so a task that never finishes stops it rather than being dropped",
       "break the wait cycle, or make the task being waited on finish",
     ],
   }
 
-fn step_budget_exceeded<v>(r: Region<v>) -> Failure / {abort.raise} =
+fn step_budget_exceeded<v>(r: Scheduler<v>) -> Failure / {abort.raise} =
   {
     code: "E0414",
-    message: "this simulated region took " ++ r.trail.budget.to_string()
+    message: "this simulation took " ++ r.trail.budget.to_string()
       ++ " scheduling steps without finishing",
-    labels: [primary(r.site, "no task in this region ever stopped running")],
+    labels: [primary(r.site, "no task in this simulation ever stopped running")],
     notes: [
-      "this is the per-interleaving step budget; a region that legitimately needs more steps raises the simulation plan's `steps`",
+      "this is the per-interleaving step budget; a simulation that needs more steps raises the simulation plan's `steps`",
       "more often it is a task that loops without ever finishing, which a real scheduler would spin on forever",
       "replay with seed " ++ trail::seed_text(r.trail.seed),
     ],
   }
 
-fn divergence<v>(r: Region<v>, point: Int, choice: Int, enabled: Int) -> Failure / {abort.raise} =
+fn divergence<v>(
+  r: Scheduler<v>,
+  point: Int,
+  choice: Int,
+  enabled: Int,
+) -> Failure / {abort.raise} =
   {
     code: "E0415",
     message: "replaying this seed did not reproduce the schedule it recorded",
-    labels: [primary(r.site, "this region scheduled differently on replay")],
+    labels: [primary(r.site, "this simulation scheduled differently on replay")],
     notes: [
       "at scheduling point " ++ point.to_string() ++ " the seed names enabled task "
         ++ choice.to_string()
         ++ ", and "
         ++ plural(enabled, "task was", "tasks were")
         ++ " enabled",
-      "this is a defect in Ply's simulation rather than in the program under test: a run must be a function of its definitions and its seed",
+      "this is an internal error in Ply's simulation rather than in the program under test: a run must be a function of its definitions and its seed",
       "the seed replayed was " ++ trail::seed_text(r.trail.seed),
     ],
   }
 
-/// How many times in a row a production region's park may wake with no ticket completed and no
+/// How many times in a row a production scheduler's park may wake with no ticket completed and no
 /// stop before it counts as a bug in the host.
 pub fn max_spurious_wakeups() -> Int = 1024
 
 /// The failure for a host whose park kept waking for no reason.
-pub fn too_many_spurious_wakeups<v>(r: Region<v>) -> Failure =
+pub fn too_many_spurious_wakeups<v>(r: Scheduler<v>) -> Failure =
   {
     code: "E0505",
     message: "the host runtime returned from `park` " ++ max_spurious_wakeups().to_string()
       ++ " times without resolving a token",
-    labels: [primary(r.site, "every task in this region is waiting on the host")],
+    labels: [primary(r.site, "every task in this scheduler is waiting on the host")],
     notes: [
       "a park must block until at least one outstanding ticket is answered",
       "this is a defect in the host runtime rather than in the program: spinning here would burn a core and report nothing",
     ],
   }
 
-/// A second `simulate` region entered while `outer` runs.
+/// A second simulation entered while `outer` runs.
 pub fn nested(site: Site, outer: Site) -> Failure =
   {
     code: "E0416",
-    message: "a `simulate` region may not run inside another one",
+    message: "a simulation may not run inside another one",
     labels: [
-      primary(site, "this region is entered while one is already running"),
-      secondary(outer, "the region already running"),
+      primary(site, "this simulation starts while one is already running"),
+      secondary(outer, "the simulation already running"),
     ],
     notes: [
       "two schedulers mean two notions of `runnable` and a state space that is a product of both",
-      "hoist the inner region out, or handle its effects with an ordinary `handle`",
+      "move the inner simulation out, or handle its effects with an ordinary `handle`",
     ],
   }
 
@@ -1838,39 +1869,39 @@ fn time_overflow(site: Site, now: Int, nanos: Int) -> Failure =
       ++ nanos.to_string()
       ++ "ns overflows",
     labels: [primary(site, "this deadline cannot be represented")],
-    notes: ["virtual time is nanoseconds since the region was entered, and it is an `Int`"],
+    notes: ["virtual time is nanoseconds since the simulation started, and it is an `Int`"],
   }
 
 fn foreign_channel(site: Site, chan: Int) -> Failure =
   {
     code: "E0413",
-    message: "`" ++ chan_name(chan) ++ "` is a channel of another region",
-    labels: [primary(site, "this handle was made by another region's scheduler")],
+    message: "`" ++ chan_name(chan) ++ "` is a channel of another scheduler",
+    labels: [primary(site, "this handle was made by another scheduler")],
     notes: [
-      "every region numbers its own channels, so here the handle's id names another channel, or none",
-      "use a channel inside the region that made it",
+      "every scheduler numbers its own channels, so here the handle's id names another channel, or none",
+      "use a channel inside the simulation that made it",
     ],
   }
 
 fn foreign_task(site: Site, task: Int) -> Failure =
   {
     code: "E0413",
-    message: "`" ++ task_name(task) ++ "` is a task of another region",
-    labels: [primary(site, "this handle was spawned by another region's scheduler")],
+    message: "`" ++ task_name(task) ++ "` is a task of another scheduler",
+    labels: [primary(site, "this handle was spawned by another scheduler")],
     notes: [
-      "every region numbers its own tasks, so here the handle's id names another task, or none",
-      "join the task inside the region that spawned it",
+      "every scheduler numbers its own tasks, so here the handle's id names another task, or none",
+      "join the task inside the simulation that spawned it",
     ],
   }
 
 fn unknown_task(site: Site, task: Int) -> Failure =
   {
     code: "E0413",
-    message: "`" ++ task_name(task) ++ "` names no task in this simulated region",
-    labels: [primary(site, "this handle outlived the region that created it")],
+    message: "`" ++ task_name(task) ++ "` names no task in this simulation",
+    labels: [primary(site, "this handle outlived the simulation that created it")],
     notes: [
-      "a `Task` is a key into its region's scheduler, and the scheduler ends with the region",
-      "join the task inside the `simulate` region that spawned it",
+      "a `Task` is a key into its simulation's scheduler, and the scheduler ends with the simulation",
+      "join the task inside the simulation that spawned it",
     ],
   }
 
@@ -1912,7 +1943,7 @@ fn invalid_cancel(site: Site, target: Int, task: Int) -> Failure =
     message: task_name(target) ++ " cannot be cancelled from " ++ task_name(task),
     labels: [primary(site, "cancelled here")],
     notes: [
-      "a task cancels another one: the region's own body, and a task itself, are not cancelled",
+      "a task cancels another one: the simulation's own body, and a task itself, are not cancelled",
     ],
   }
 
@@ -1928,21 +1959,21 @@ extern fn keep<a>(x: a) -> Kept
 /// The value of type `a` that `k` wraps. The run fails if `k` wraps a value of another type.
 extern fn open<a>(k: Kept) -> a
 
-/// The stacks of one region's tasks, the switch between each task and the region's loop, and each
-/// task's last request and reply. Each stack is freed when its last owner releases it.
+/// The stacks of one scheduler's tasks, the switch between each task and the scheduler's loop, and
+/// each task's last request and reply. Each stack is freed when its last owner releases it.
 pub extern type Stacks
 
-/// A task's body and the words its row takes, as its creator had them, until a region starts it.
+/// A task's body and the words its row takes, as its creator had them, until a scheduler starts it.
 pub extern type TaskBody
 
-/// Stacks for a region opened here, `seeded` for `simulate`, for the region written at the site
-/// that `root`, `start` and `end` give.
+/// Stacks for a scheduler opened here, `seeded` for `simulate`, for the scheduler written at the
+/// site that `root`, `start` and `end` give.
 extern fn stacks_opened(seeded: Bool, root: Int, start: Int, end: Int) -> Stacks / {native.write}
 
-/// The id of `s`'s region among the entry's regions.
+/// The id of `s`'s scheduler among the entry's schedulers.
 extern fn stacks_region(s: Stacks) -> Int / {native.read}
 
-/// Where the region opened on the context before `s`'s was written, a seeded one's or else a
+/// Where the scheduler opened on the context before `s`'s was written, a seeded one's or else a
 /// production one's: the site's root, start or end by `which`, with a root of -1 if there is none.
 extern fn stacks_outer(s: Stacks, which: Int) -> Int / {native.read}
 
@@ -1964,7 +1995,7 @@ extern fn task_as<a, b>(t: Task<a>) -> Task<b>
 /// A channel's handle at the type its perform or its clause uses: the same handle.
 extern fn chan_as<a, b>(c: Chan<a>) -> Chan<b>
 
-/// The trail the entry's last seeded region left (`trail::encode_saved_trail`), empty before its
+/// The trail the entry's last simulation left (`trail::encode_saved_trail`), empty before its
 /// first.
 extern fn trail_entered() -> Bytes / {native.read}
 
@@ -1974,10 +2005,10 @@ extern fn seed_root(which: Int) -> Int / {native.read}
 /// The seed's path, each choice in two bytes, the least significant first.
 extern fn seed_path() -> Bytes / {native.read}
 
-/// The scheduling points the entry's seeded regions may take.
+/// The scheduling points the entry's simulations may take.
 extern fn seeded_steps() -> Int / {native.read}
 
-/// Stores `final_trail` for the entry's next region, and `interleaving` as its outcome's
+/// Stores `final_trail` for the entry's next scheduler, and `interleaving` as its outcome's
 /// interleaving.
 extern fn trail_left(final_trail: Bytes, interleaving: Bytes) -> Unit / {native.write}
 
@@ -2045,7 +2076,7 @@ extern fn heard_number(s: Stacks) -> Int / {native.read}
 /// Takes the value the loop resumed the running task with.
 extern fn heard_kept(s: Stacks) -> Kept / {native.write}
 
-/// Frees task `id`: its stack, a body it never ran, and the region's reference to its handle.
+/// Frees task `id`: its stack, a body it never ran, and the scheduler's reference to its handle.
 extern fn task_freed(s: Stacks, id: Int) -> Unit / {native.write}
 
 /// Restores the context that task `id`'s body left without returning, adding `note` if it is not
@@ -2062,23 +2093,23 @@ extern fn task_held_back(s: Stacks, id: Int, stop_task: Bool) -> Unit / {native.
 /// Records on task `id`'s handle that it was cancelled.
 extern fn task_settled(s: Stacks, id: Int) -> Unit / {native.write}
 
-/// A handle for a task of region `region`, numbered when the region starts it.
+/// A handle for a task of scheduler `scheduler`, numbered when the scheduler starts it.
 extern fn task_made(region: Int) -> Task<Kept>
 
-/// A field of `t`, by `which`: its region, its id, or how it ended (0 not yet, 1 returned, 2
+/// A field of `t`, by `which`: its scheduler, its id, or how it ended (0 not yet, 1 returned, 2
 /// cancelled).
 extern fn task_said(t: Task<Kept>, which: Int) -> Int / {native.read}
 
 /// The result of the task `t` refers to. The run fails if it has not returned.
 extern fn task_answer(t: Task<Kept>) -> Kept / {native.read}
 
-/// A handle of channel `id` of region `region`.
+/// A handle of channel `id` of scheduler `scheduler`.
 extern fn chan_made(region: Int, id: Int) -> Chan<Kept>
 
-/// A field of `c`, by `which`: its region or its id.
+/// A field of `c`, by `which`: its scheduler or its id.
 extern fn chan_said(c: Chan<Kept>, which: Int) -> Int
 
-/// Fails the run with the region's failure that `failure_bytes` encoded.
+/// Fails the run with the scheduler's failure that `failure_bytes` encoded.
 extern fn region_failed(failure: Bytes) -> Unit / {native.write}
 
 /// Makes `tickets_answered` report the ticket for `token` once it is completed. Returns 1, or 0
@@ -2097,8 +2128,8 @@ extern fn tickets_park(deadline: Int) -> Int / {native.read}
 /// The run's clock: nanoseconds since it began.
 extern fn host_now() -> Int / {native.read}
 
-/// Records what the run still has when its root's body returns, before the region whose stacks are
-/// `s` drains its other tasks: `scheduled` tasks still present, and the stacks it keeps.
+/// Records what the run still has when its root's body returns, before the scheduler whose stacks
+/// are `s` drains its other tasks: `scheduled` tasks still present, and the stacks it keeps.
 extern fn root_returned(s: Stacks, scheduled: Int) -> Unit / {native.write}
 
 /// 1 if the run has been told to stop, else 0.
@@ -2203,8 +2234,8 @@ fn received_reply_code() -> Int = 4
 fn closed_reply_code() -> Int = 5
 fn selected_reply_code() -> Int = 6
 
-/// The running task sends its loop request `code` about the task `t`: its id, then its region and
-/// how its handle records it ended, packed in one number.
+/// The running task sends its loop request `code` about the task `t`: its id, then its scheduler
+/// and how its handle records it ended, packed in one number.
 fn request_on_task(s: Stacks, code: Int, t: Task<Kept>) -> Int / {native.read, native.write} =
   task_yielded(s, code, task_said(t, 1), task_said(t, 0) * 4 + task_said(t, 2))
 
@@ -2226,7 +2257,7 @@ fn waited_shields(s: Stacks, id: Int) -> Shields / {native.read} =
 fn requested_task(s: Stacks) -> TaskRef / {native.read} = {
   let b = asked_number(s, 1);
   {
-    region: b / 4,
+    scheduler: b / 4,
     id: asked_number(s, 0),
     ended: match b % 4 { 1 -> Returned, 2 -> Cancelled, _ -> Live },
   }
@@ -2234,12 +2265,12 @@ fn requested_task(s: Stacks) -> TaskRef / {native.read} = {
 
 /// The channel a request refers to, from the numbers it was sent with.
 fn requested_channel(s: Stacks) -> ChanRef / {native.read} =
-  { region: asked_number(s, 1), id: asked_number(s, 0) }
+  { scheduler: asked_number(s, 1), id: asked_number(s, 0) }
 
 /// The request the loop just received from task `id`, with code `code`.
 fn request_of(
   s: Stacks,
-  r: Region<Kept>,
+  r: Scheduler<Kept>,
   id: Int,
   code: Int,
 ) -> Request<Kept> / {abort.raise, native.read, native.write} = {
@@ -2270,8 +2301,8 @@ fn request_of(
   } else { Failed }
 }
 
-// How a region's clause handles each `task` operation: the running task of the region whose stacks
-// are `s` sends a request to its loop.
+// How a scheduler's clause handles each `task` operation: the running task of the scheduler whose
+// stacks are `s` sends a request to its loop.
 
 fn request_join(s: Stacks, t: Task<Kept>) -> Kept / {native.read, native.write} = {
   request_on_task(s, join_code(), t);
@@ -2323,7 +2354,7 @@ fn request_select(
   wait: Bool,
 ) -> Option<(Int, Option<Kept>)> / {native.write} = {
   let handle_request = arms.map(|arm: (Chan<Kept>, Option<Kept>)|
-    { chan: { region: chan_said(arm._0, 0), id: chan_said(arm._0, 1) }, send: arm._1 });
+    { chan: { scheduler: chan_said(arm._0, 0), id: chan_said(arm._0, 1) }, send: arm._1 });
   task_yielded_kept(s, select_code(), if wait { 1 } else { 0 }, 0, keep(handle_request));
   let went: Option<{ at: Int, got: Option<Kept> }> = open(heard_kept(s));
   match went { Some(w) -> Some((w.at, w.got)), None -> None }
@@ -2349,12 +2380,12 @@ fn resume_task(s: Stacks, id: Int, res: Resumption<Kept>) -> Int / {abort.raise,
     },
   }
 
-// --- `simulate`'s region ---------------------------------------------------------------------
+// --- `simulate`'s scheduler ---------------------------------------------------------------------
 
-/// `simulate`'s region, written at the site that `root`, `start` and `end` give. `body` runs as its
-/// task 0, and every task's `task`, `clock`, `random` and `sim` operations are handled here, in the
-/// order the entry's seed picks. A raise that leaves a task lands where the region is written, once
-/// every other task has ended. A region that ends any other way fails the run.
+/// `simulate`'s scheduler, written at the site that `root`, `start` and `end` give. `body` runs as
+/// its task 0, and every task's `task`, `clock`, `random` and `sim` operations are handled here, in
+/// the order the entry's seed picks. A raise that leaves a task lands where the scheduler is
+/// written, once every other task has ended. A scheduler that ends any other way fails the run.
 pub fn simulated<a | e>(
   root: Int,
   start: Int,
@@ -2416,7 +2447,7 @@ pub fn simulated<a | e>(
   }
 }
 
-/// The trail the entry's regions left, or the seed's own before the first.
+/// The trail the entry's schedulers left, or the seed's own before the first.
 fn load_trail() -> trail::SavedTrail / {abort.raise, native.read} =
   match trail::decode_saved_trail(trail_entered()) {
     Some(l) -> l,
@@ -2435,9 +2466,10 @@ fn load_trail() -> trail::SavedTrail / {abort.raise, native.read} =
     },
   }
 
-/// `simulate`'s loop over the stacks `s` of region `id` written at `site`. It runs the task each
-/// turn names and applies its requests until the region ends. Then it stores the trail and
-/// returns, fails the run, or lands the raise that left a task, depending on how the region ended.
+/// `simulate`'s loop over the stacks `s` of scheduler `id` written at `site`. It runs the task each
+/// turn names and applies its requests until the scheduler ends. Then it stores the trail and
+/// returns, fails the run, or lands the raise that left a task, depending on how the scheduler
+/// ended.
 fn run_simulation(
   s: Stacks,
   id: Int,
@@ -2447,7 +2479,7 @@ fn run_simulation(
   let r = iterate(
     seeded(id, site, entered.trail),
     entered.trail.budget + 2,
-    |region: Region<Kept>| {
+    |region: Scheduler<Kept>| {
       let chosen = next_turn(region, { now: 0, stopping: false });
       match chosen.turn {
         Run(task, res) -> {
@@ -2459,7 +2491,7 @@ fn run_simulation(
             now: 0,
           };
           let touched = if footprint_held() == 0 { chosen }
-          else { add_footprint(chosen, footprint_taken()) };
+          else { add_touches(chosen, footprint_taken()) };
           let request = request_of(s, touched, task, code);
           let next = handle_request(touched, task, request, context);
           if next.next_id > child && code == spawn_code() {
@@ -2487,58 +2519,58 @@ fn run_simulation(
       task_restored(s, task, raised_note(r, task));
       ()
     },
-    Ends(RegionFailed(f)) -> region_failed(failure_bytes(f)),
+    Ends(SchedulerFailed(f)) -> region_failed(failure_bytes(f)),
     Ends(TaskFailed(task, note)) -> {
       task_restored(s, task, match note { Some(n) -> n, None -> "" });
       ()
     },
-    _ -> region_failed(failure_bytes(internal_error(r, "a seeded region waited on the host"))),
+    _ -> region_failed(failure_bytes(internal_error(r, "a simulation waited on the host"))),
   }
 }
 
-/// `r` with what the running task's step performed, which the runtime wrote as `footprint`, added
+/// `r` with what the running task's step performed, which the runtime wrote as `effects`, added
 /// to the step's accesses.
-fn add_footprint(r: Region<Kept>, footprint: Bytes) -> Region<Kept> / {abort.raise} =
-  match r.footprints.get(footprint) {
+fn add_touches(r: Scheduler<Kept>, footprint: Bytes) -> Scheduler<Kept> / {abort.raise} =
+  match r.touches.get(footprint) {
     Some(touches) -> record_accesses(r, touches),
     None -> {
       let touches = trail::touches_of(footprint);
-      record_accesses({ ..r, footprints: r.footprints.insert(footprint, touches) }, touches)
+      record_accesses({ ..r, touches: r.touches.insert(footprint, touches) }, touches)
     },
   }
 
-/// The note a region adds when it re-raises a raise that left task `task`, if the region spawned
-/// any task: the task, and the seed that replays the run.
-fn raised_note(r: Region<Kept>, task: Int) -> String / {abort.raise} =
+/// The note a scheduler adds when it re-raises a raise that left task `task`, if the scheduler
+/// spawned any task: the task, and the seed that replays the run.
+fn raised_note(r: Scheduler<Kept>, task: Int) -> String / {abort.raise} =
   if r.next_id <= 1 { "" } else {
-    "raised in task " ++ task_name(task) ++ " of a simulated region; replay with seed "
+    "raised in task " ++ task_name(task) ++ " of a simulation; replay with seed "
       ++ trail::seed_text(r.trail.seed)
   }
 
-/// The region after the loop has carried out each command it issued since they were last taken.
-fn run_commands(s: Stacks, r: Region<Kept>) -> Region<Kept> / {native.write} =
+/// The scheduler after the loop has carried out each command it issued since they were last taken.
+fn run_commands(s: Stacks, r: Scheduler<Kept>) -> Scheduler<Kept> / {native.write} =
   if r.orders.len() == 0 { r } else {
     let given = take_commands(r);
     given.orders.fold((), |_u: Unit, o: Command| run_command(s, o));
-    given.region
+    given.scheduler
   }
 
 /// Carries out a command the scheduler issued.
 fn run_command(s: Stacks, o: Command) -> Unit / {native.write} =
   match o {
-    HoldBack(id) -> task_held_back(s, id, true),
+    DelayCancel(id) -> task_held_back(s, id, true),
     LetThrough(id) -> task_held_back(s, id, false),
     Discard(id) -> task_freed(s, id),
     MarkCancelled(id) -> task_settled(s, id),
     DropRaise(id) -> task_freed(s, id),
   }
 
-// --- The run's region ------------------------------------------------------------------------
+// --- The run's scheduler ------------------------------------------------------------------------
 
-/// The run's region, under which an entry runs a root that performs `task`. `body` runs as its task
-/// 0, and every task's `task` operations are handled here, ready tasks first in, first out. A task
-/// that waits on the host or sleeps waits here while the others run. It returns once every task has
-/// ended. A raise that leaves a task lands at the entry once every other task has ended.
+/// The run's scheduler, under which an entry runs a root that performs `task`. `body` runs as its
+/// task 0, and every task's `task` operations are handled here, ready tasks first in, first out. A
+/// task that waits on the host or sleeps waits here while the others run. It returns once every
+/// task has ended. A raise that leaves a task lands at the entry once every other task has ended.
 pub fn scheduled<a | e>(
   body: keep () -> a / {task.write | e},
 ) -> a / {abort.raise, native.read, native.write, diverges | e} = {
@@ -2547,7 +2579,7 @@ pub fn scheduled<a | e>(
   let root_task = task_made(id);
   handle {
     task_started(stacks, 0, task_body(root_task, || task_ran(body)));
-    run_region(stacks, id);
+    run_scheduler(stacks, id);
     open(task_answer(root_task))
   } with {
     task.spawn(f) -> {
@@ -2567,10 +2599,11 @@ pub fn scheduled<a | e>(
   }
 }
 
-/// The run's loop over the stacks `s` of region `id`. It runs the task each turn names and applies
-/// its requests, waiting on the run when none is ready, until the region ends. Then it returns,
-/// fails the run, or lands the raise that left a task, depending on how the region ended.
-fn run_region(s: Stacks, id: Int) -> Unit / {abort.raise, native.read, native.write, diverges} = {
+/// The run's loop over the stacks `s` of scheduler `id`. It runs the task each turn names and
+/// applies its requests, waiting on the run when none is ready, until the scheduler ends. Then it
+/// returns, fails the run, or lands the raise that left a task, depending on how the scheduler
+/// ended.
+fn run_scheduler(s: Stacks, id: Int) -> Unit / {abort.raise, native.read, native.write, diverges} = {
   let r = serve_loop(s, production(id, nowhere()));
   match r.turn {
     Complete -> (),
@@ -2578,30 +2611,30 @@ fn run_region(s: Stacks, id: Int) -> Unit / {abort.raise, native.read, native.wr
       task_restored(s, task, "");
       ()
     },
-    Ends(RegionFailed(f)) -> region_failed(failure_bytes(f)),
+    Ends(SchedulerFailed(f)) -> region_failed(failure_bytes(f)),
     Ends(TaskFailed(task, note)) -> {
       task_restored(s, task, match note { Some(n) -> n, None -> "" });
       ()
     },
     Ends(Drained) -> (),
-    _ -> region_failed(failure_bytes(internal_error(r, "the run's region stopped waiting"))),
+    _ -> region_failed(failure_bytes(internal_error(r, "the run's scheduler stopped waiting"))),
   }
 }
 
-/// The run's loop from `r`, up to a turn that runs nothing, which is stored in the region it
+/// The run's loop from `r`, up to a turn that runs nothing, which is stored in the scheduler it
 /// returns. A drain after a stop that has run out of time has failed the run, which ends the loop.
 fn serve_loop(
   s: Stacks,
-  r: Region<Kept>,
-) -> Region<Kept> / {abort.raise, native.read, native.write, diverges} =
+  r: Scheduler<Kept>,
+) -> Scheduler<Kept> / {abort.raise, native.read, native.write, diverges} =
   if run_drained() != 0 { { ..r, turn: Ends(Drained) } }
   else { serve_turn(s, next_turn(r, { now: host_now(), stopping: run_stopping() != 0 })) }
 
 /// The run's loop after the turn stored in `r`.
 fn serve_turn(
   s: Stacks,
-  r: Region<Kept>,
-) -> Region<Kept> / {abort.raise, native.read, native.write, diverges} =
+  r: Scheduler<Kept>,
+) -> Scheduler<Kept> / {abort.raise, native.read, native.write, diverges} =
   match r.turn {
     Run(task, res) -> {
       let code = resume_task(s, task, res);
@@ -2631,21 +2664,21 @@ fn serve_turn(
     _ -> r,
   }
 
-/// The region after a wait on the run ended with `tokens` completed. Each task waiting on one of
-/// them is readied. The region fails if waits that could only end by a completion woke nothing too
-/// many times in a row. A wait that a stop ended is how an idle service receives a signal, and one
-/// bounded by `deadline` ends when it passes, so neither counts as a wasted wakeup.
+/// The scheduler after a wait on the run ended with `tokens` completed. Each task waiting on one of
+/// them is readied. The scheduler fails if waits that could only end by a completion woke nothing
+/// too many times in a row. A wait that a stop ended is how an idle service receives a signal, and
+/// one bounded by `deadline` ends when it passes, so neither counts as a wasted wakeup.
 fn after_park(
-  r: Region<Kept>,
+  r: Scheduler<Kept>,
   deadline: Option<Int>,
   tokens: List<Int>,
   stop_task: Bool,
-) -> Region<Kept> / {abort.raise} = {
+) -> Scheduler<Kept> / {abort.raise} = {
   let parks = if tokens.len() == 0 && deadline == None && !stop_task { r.spurious_wakeups + 1 }
   else { 0 };
   let woken = wake_ticket_waiters(r, tokens);
   if parks > max_spurious_wakeups() {
-    { ..fail_region(woken, too_many_spurious_wakeups(woken)), spurious_wakeups: parks }
+    { ..fail_scheduler(woken, too_many_spurious_wakeups(woken)), spurious_wakeups: parks }
   } else { { ..woken, spurious_wakeups: parks } }
 }
 
@@ -2657,8 +2690,8 @@ fn tokens_of(bytes: Bytes) -> List<Int> / {abort.raise} =
 // --- The run's clock -------------------------------------------------------------------------
 
 /// The language's `clock` where no `simulate` handles it, under which an entry runs a root that
-/// performs it. It is the run's monotonic clock. A sleep by a task of the run's region waits in
-/// that region while its other tasks run; anywhere else it blocks the thread.
+/// performs it. It is the run's monotonic clock. A sleep by a task of the run's scheduler waits in
+/// that scheduler while its other tasks run; anywhere else it blocks the thread.
 pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / {native.read | e} =
   handle {
     go()
@@ -2670,37 +2703,39 @@ pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / {nativ
 /// Nanoseconds on the run's monotonic clock.
 extern fn clock_now() -> Int / {native.read}
 
-/// Waits `nanos` nanoseconds, or not at all for a span at or below zero. A task of the run's region
-/// waits in the region; anywhere else the thread waits.
+/// Waits `nanos` nanoseconds, or not at all for a span at or below zero. A task of the run's
+/// scheduler waits in the scheduler; anywhere else the thread waits.
 extern fn clock_sleep(nanos: Int) -> Unit / {native.read}
 
 // --- Tests --------------------------------------------------------------------------
 
 fn here() -> RequestContext = { site: nowhere(), shields: unshielded(), now: 0 }
 
-fn region_site() -> Site = { root: 1, start: 0, end: 10 }
+fn scheduler_site() -> Site = { root: 1, start: 0, end: 10 }
 
-/// A `simulate` region whose seed follows `path`, then picks the lowest enabled task.
-fn seeded_by(path: List<Int>, budget: Int) -> Region<Int> =
+/// A simulation whose seed follows `path`, then picks the lowest enabled task.
+fn seeded_by(path: List<Int>, budget: Int) -> Scheduler<Int> =
   seeded(
     0,
-    region_site(),
+    scheduler_site(),
     trail::trail({ root: 0u64, path: path.concat(range(0, 200).map(|_i: Int| 0)) }, budget),
   )
 
-fn lowest() -> Region<Int> = seeded_by([], 1000)
+fn lowest() -> Scheduler<Int> = seeded_by([], 1000)
 
-fn next(r: Region<Int>) -> Region<Int> / {abort.raise} = next_turn(r, { now: 0, stopping: false })
+fn next(r: Scheduler<Int>) -> Scheduler<Int> / {abort.raise} =
+  next_turn(r, { now: 0, stopping: false })
 
 /// The turn after the running `task` makes `request`.
-fn then(t: Region<Int>, task: Int, request: Request<Int>) -> Region<Int> / {abort.raise} =
+fn then(t: Scheduler<Int>, task: Int, request: Request<Int>) -> Scheduler<Int> / {abort.raise} =
   next(handle_request(t, task, request, here()))
 
-fn live(id: Int) -> TaskRef = { region: 0, id: id, ended: Live }
+fn live(id: Int) -> TaskRef = { scheduler: 0, id: id, ended: Live }
 
-fn chan(id: Int) -> ChanRef = { region: 0, id: id }
+fn chan(id: Int) -> ChanRef = { scheduler: 0, id: id }
 
-fn code_of(t: Region<Int>) -> String = match t.turn { Ends(RegionFailed(f)) -> f.code, _ -> "" }
+fn code_of(t: Scheduler<Int>) -> String =
+  match t.turn { Ends(SchedulerFailed(f)) -> f.code, _ -> "" }
 
 test "the body runs first, and the region completes once every task has ended" {
   let t = next(lowest());
@@ -2765,7 +2800,7 @@ test "virtual time moves only when every task sleeps, waking one deadline's slee
 
 /// The body spawns task 1 and sleeps. Task 1 receives on a channel nothing sends to, and the body
 /// wakes after it.
-fn receiver_waiting() -> Region<Int> / {abort.raise} = {
+fn receiver_waiting() -> Scheduler<Int> / {abort.raise} = {
   let apply_spawn = then(then(next(lowest()), 0, Channel(0)), 0, Spawn);
   let receiving = then(then(apply_spawn, 0, Sleep(10)), 1, Recv(chan(0)));
   assert_eq(receiving.turn, Run(0, Resume(Nothing)));
@@ -2789,7 +2824,7 @@ test "a task cancelled inside a release keeps its wait, and the cancel waits for
   let releasing = { acquiring: 0, releasing: 1, stopping: false };
   let stopped = then(receiver_waiting(), 0, Cancel(live(1), releasing));
   assert_eq(stopped.turn, Run(0, Resume(Flag(true))));
-  assert(stopped.orders.contains(HoldBack(1)));
+  assert(stopped.orders.contains(DelayCancel(1)));
   // Still receiving, so a send reaches it.
   assert_eq(then(stopped, 0, Send(chan(0), 3)).turn, Run(0, Resume(Flag(true))))
 }
@@ -2813,7 +2848,7 @@ test "a sibling in a bracket's acquire keeps its reply, and the raise waits for 
   assert_eq(apply_spawn.turn, Run(1, Start));
   let acquiring = Map::new().insert(0, { acquiring: 1, releasing: 0, stopping: false });
   let final_trail = then(apply_spawn, 1, Raised(acquiring));
-  assert(final_trail.orders.contains(HoldBack(0)));
+  assert(final_trail.orders.contains(DelayCancel(0)));
   assert_eq(final_trail.turn, Run(0, Resume(Spawned(1))));
   // Its acquire returns, the cancel lands there, and its release runs as it unwinds.
   assert_eq(then(final_trail, 0, Unwound).turn, Reraise(1))
@@ -2836,8 +2871,8 @@ test "each step records what the scheduler orders it against" {
 test "a step is placed where it first accessed what another task could, else where it gave up control" {
   let context = |n: Int| { root: 1, start: n, end: n + 1 };
   let touched = record_accesses(next(lowest()), [
-    { access: trail::Hold(1, Write), at: context(2) },
-    { access: trail::Hold(2, Read), at: context(3) },
+    { access: trail::ScopedValue(1, Write), at: context(2) },
+    { access: trail::ScopedValue(2, Read), at: context(3) },
   ]);
   let first = next_turn(handle_request(touched, 0, Yield, { ..here(), site: context(4) }), {
     now: 0,
@@ -2846,7 +2881,7 @@ test "a step is placed where it first accessed what another task could, else whe
   let second = handle_request(first, 0, Yield, { ..here(), site: context(5) });
   assert_eq(steps_taken(second).map(|s: Step| s.site), [Some(context(2)), Some(context(5))]);
   assert_eq(steps_taken(second).map(|s: Step| s.accesses), [
-    [trail::Hold(1, Write), trail::Hold(2, Read)],
+    [trail::ScopedValue(1, Write), trail::ScopedValue(2, Read)],
     [],
   ])
 }
@@ -2854,11 +2889,11 @@ test "a step is placed where it first accessed what another task could, else whe
 test "a deadlock names each blocked task where it waits" {
   let stuck = then(then(next(lowest()), 0, Channel(0)), 0, Recv(chan(0)));
   match stuck.turn {
-    Ends(RegionFailed(f)) -> {
+    Ends(SchedulerFailed(f)) -> {
       assert_eq(f.code, "E0414");
-      assert_eq(f.message, "this simulated region deadlocked: 1 task is blocked and none runnable");
+      assert_eq(f.message, "this simulation deadlocked: 1 task is blocked and none runnable");
       assert_eq(f.labels.map(|l: Label| l.text), [
-        "no task in this region can make progress",
+        "no task in this scheduler can make progress",
         "@0 waits here to receive from channel #0, which is empty",
       ]);
       assert_eq(
@@ -2882,9 +2917,9 @@ test "a failure is written as the runtime reads it" {
 }
 
 test "a handle another region made is rejected" {
-  let r = then(next(lowest()), 0, Join({ region: 5, id: 1, ended: Live }));
+  let r = then(next(lowest()), 0, Join({ scheduler: 5, id: 1, ended: Live }));
   assert_eq(code_of(r), "E0413");
-  assert_eq(code_of(then(next(lowest()), 0, Send({ region: 5, id: 0 }, 1))), "E0413")
+  assert_eq(code_of(then(next(lowest()), 0, Send({ scheduler: 5, id: 0 }, 1))), "E0413")
 }
 
 test "the step budget ends a region that never finishes, and a replay off its schedule diverges" {
@@ -2893,14 +2928,14 @@ test "the step budget ends a region that never finishes, and a replay off its sc
   assert_eq(code_of(then(next(seeded_by([0, 5], 10)), 0, Spawn)), "E0415")
 }
 
-fn produced() -> Region<Int> / {abort.raise} = next(production(0, region_site()))
+fn produced() -> Scheduler<Int> / {abort.raise} = next(production(0, scheduler_site()))
 
 fn at_time(
-  t: Region<Int>,
+  t: Scheduler<Int>,
   task: Int,
   request: Request<Int>,
   now: Int,
-) -> Region<Int> / {abort.raise} =
+) -> Scheduler<Int> / {abort.raise} =
   next_turn(handle_request(t, task, request, { ..here(), now: now }), { now: now, stopping: false })
 
 test "a production region runs ready tasks first in, first out" {
@@ -2950,13 +2985,13 @@ test "a production task cancelled before it starts has its handle marked before 
   assert_eq(then(incoming, 1, Yield).turn, Run(0, Resume(Awaited(false))))
 }
 
-/// A new run's region, after `parks` waits in a row that woke nothing.
-fn serving_at(parks: Int) -> Region<Kept> =
-  { ..production(0, region_site()), spurious_wakeups: parks }
+/// A new run's scheduler, after `parks` waits in a row that woke nothing.
+fn serving_at(parks: Int) -> Scheduler<Kept> =
+  { ..production(0, scheduler_site()), spurious_wakeups: parks }
 
-/// The code of the failure the region ended with, if it failed.
-fn failure_code(r: Region<Kept>) -> String =
-  match r.ending { Some(RegionFailed(f)) -> f.code, _ -> "" }
+/// The code of the failure the scheduler ended with, if it failed.
+fn failure_code(r: Scheduler<Kept>) -> String =
+  match r.ending { Some(SchedulerFailed(f)) -> f.code, _ -> "" }
 
 test "waits on the run that wake nothing fail the region past the bound, and a wait a deadline or stop ended does not count" {
   assert_eq(failure_code(after_park(serving_at(max_spurious_wakeups()), None, [], false)), "E0505");
@@ -2966,7 +3001,7 @@ test "waits on the run that wake nothing fail the region past the bound, and a w
       after_park(serving_at(max_spurious_wakeups()), Some(5), [], false),
       after_park(serving_at(max_spurious_wakeups()), None, [], true),
       after_park(serving_at(3), None, [7], false),
-    ].map(|r: Region<Kept>| r.spurious_wakeups),
+    ].map(|r: Scheduler<Kept>| r.spurious_wakeups),
     [0, 0, 0],
   )
 }

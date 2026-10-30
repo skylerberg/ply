@@ -7,8 +7,8 @@
 //! write `[app]` conflict and two that query it do not. The engine is SQLite 3.53.2, compiled into
 //! `ply` and the same on every machine.
 //!
-//! A connection is opened under a `with_hold`, which closes it however its body ends:
-//! `with_hold[db](sqlite::opening[app]("app.db", sqlite::Create, options), |c| sqlite::close(c))
+//! A connection is opened under a `with_scope`, which closes it however its body ends:
+//! `with_scope[db](sqlite::opening[app]("app.db", sqlite::Create, options), |c| sqlite::close(c))
 //! { conn -> .. }`. It is opened once with settings no statement can change: write-ahead
 //! logging, foreign keys enforced, the wait `Options.busy_ms` on another connection's lock,
 //! defensive mode, an untrusted schema, no extension loading, no attached database, no temporary
@@ -364,11 +364,11 @@ fn raise_on_failure(r: Reply) -> Reply / {sql.fail} =
 
 // --- A connection ------------------------------------------------------------------------
 
-/// An open database under the root `d`. It is useless once its `with_hold` has closed it: any
+/// An open database under the root `d`. It is useless once its `with_scope` has closed it: any
 /// operation on it then raises `Closed`.
 pub opaque type Connection<[d]> = | Connection(Int)
 
-/// Opens the database at `path` under the root `d` with `mode` and `options`. A `with_hold`
+/// Opens the database at `path` under the root `d` with `mode` and `options`. A `with_scope`
 /// acquires a connection with this. Raises `Unopened` when the database does not open.
 pub fn opening<[d]>(
   path: String,
@@ -380,7 +380,7 @@ pub fn opening<[d]>(
     Err(f) -> sql.fail(refusal_of(f)),
   }
 
-/// Closes a connection, rolling back any transaction it left open. A `with_hold` over a connection
+/// Closes a connection, rolling back any transaction it left open. A `with_scope` over a connection
 /// releases it with this, written `|c| sqlite::close(c)`.
 pub fn close<[d]>(c: Connection<[d]>) -> Unit / {sqlite.close[d]} =
   match c {
@@ -394,10 +394,10 @@ fn connection_number<[d]>(c: Connection<[d]>) -> Int = match c { Connection(conn
 
 /// The rows a read-only statement returns. Raises `Refused` for a statement that could write.
 pub fn query<[d], [r]>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> List<Row> / {hold.read[r], sqlite.query[d], sql.fail, abort.raise} =
+) -> List<Row> / {scoped.read[r], sqlite.query[d], sql.fail, abort.raise} =
   match q {
     Bound(sql, params) -> {
       let reply = raise_on_failure(
@@ -413,10 +413,10 @@ pub type ExecuteResult = { rows: Int, last_row_id: Int }
 
 /// Runs a statement that writes, including a schema statement.
 pub fn execute<[d], [r]>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> ExecuteResult / {hold.read[r], sqlite.execute[d], sql.fail} =
+) -> ExecuteResult / {scoped.read[r], sqlite.execute[d], sql.fail} =
   match q {
     Bound(sql, params) -> {
       let reply = raise_on_failure(
@@ -428,10 +428,10 @@ pub fn execute<[d], [r]>(
 
 /// Runs a statement that writes and returns rows, as one with `returning` does.
 pub fn returning<[d], [r]>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> List<Row> / {hold.read[r], sqlite.execute[d], sql.fail, abort.raise} =
+) -> List<Row> / {scoped.read[r], sqlite.execute[d], sql.fail, abort.raise} =
   match q {
     Bound(sql, params) -> {
       let reply = raise_on_failure(
@@ -445,10 +445,10 @@ pub fn returning<[d], [r]>(
 /// the rows it changed, and `Failed` in place of a raise, with a `Failure`'s `kind` as its `code`
 /// and the `name` as its `constraint`.
 pub fn run<[d], [r]>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
-) -> QueryResult / {hold.read[r], sqlite.execute[d], abort.raise} =
+) -> QueryResult / {scoped.read[r], sqlite.execute[d], abort.raise} =
   match q {
     Bound(sql, params) -> {
       let reply = sqlite.execute[d](connection_number(conn.get()), sql, params, limits);
@@ -476,17 +476,17 @@ pub fn run<[d], [r]>(
 /// connection holds the lock past the wait. On a connection opened to read, it takes no lock and
 /// is a `snapshot`.
 pub fn transaction<a, [d], [r] | e>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   body: () -> a / e,
-) -> a / {hold.read[r], sqlite.control[d], sql.fail | e} =
+) -> a / {scoped.read[r], sqlite.control[d], sql.fail | e} =
   in_transaction[d](connection_number(conn.get()), Begin, body)
 
 /// Runs `body` inside a transaction that only reads: every query in it sees the database as it was
 /// at the first query. A write in it raises `Busy` if another connection has written since.
 pub fn snapshot<a, [d], [r] | e>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   body: () -> a / e,
-) -> a / {hold.read[r], sqlite.control[d], sql.fail | e} =
+) -> a / {scoped.read[r], sqlite.control[d], sql.fail | e} =
   in_transaction[d](connection_number(conn.get()), BeginRead, body)
 
 fn in_transaction<a, [d] | e>(
@@ -532,13 +532,13 @@ effect scope_end {
 /// connection during the fold: `f` reads from another connection, or collects what it will write
 /// later.
 pub fn fold_rows<a, [d], [r] | e>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   q: Bound,
   limits: Limits,
   page: Int,
   init: a,
   f: (a, Row) -> a / e,
-) -> a / {hold.read[r], sqlite.cursor[d], sqlite.fetch[d], sqlite.finish[d], sql.fail, abort.raise | e} =
+) -> a / {scoped.read[r], sqlite.cursor[d], sqlite.fetch[d], sqlite.finish[d], sql.fail, abort.raise | e} =
   match q {
     Bound(sql, params) -> {
       let id = connection_number(conn.get());
@@ -564,9 +564,9 @@ pub fn fold_rows<a, [d], [r] | e>(
 /// yet: `VACUUM INTO`. The copy is a separate database, consistent even if others write meanwhile.
 /// Raises `Malformed` inside a transaction, where the engine cannot copy.
 pub fn backup<[d], [r]>(
-  conn: Hold<Connection<[d]>, [r]>,
+  conn: Scoped<Connection<[d]>, [r]>,
   path: String,
-) -> Unit / {hold.read[r], sqlite.backup[d], sql.fail} = {
+) -> Unit / {scoped.read[r], sqlite.backup[d], sql.fail} = {
   raise_on_failure(sqlite.backup[d](connection_number(conn.get()), path));
   ()
 }
@@ -612,7 +612,7 @@ pub fn optional<a | e>(
 ) -> Option<a> / {sql.fail | e} =
   match column_value(row, column) { NullDatum -> None, _ -> Some(read(row, column)) }
 
-// --- The real handler --------------------------------------------------------------------
+// --- The host handler --------------------------------------------------------------------
 
 host for sqlite by served
 
@@ -1209,7 +1209,7 @@ fn strict_options() -> Options = { strict: true, busy_ms: 0, statements: 16 }
 fn kept(p: Param) -> Datum / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_hold[kept_value](opening[scratch]("v.db", Create, strict_options()), |c|
+      with_scope[kept_value](opening[scratch]("v.db", Create, strict_options()), |c|
         close(c)) { conn -> {
         execute(conn, bound(stmt("create table v (x any) strict"), []), generous_limits());
         execute(conn, bound(stmt("insert into v (x) values (?1)"), [p]), generous_limits());
@@ -1237,7 +1237,7 @@ test "a float written is the float read, and a NaN is stored as null" {
 fn after_a_failed_transaction(ns: List<Int>) -> List<Int> / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_hold[rolled_back](opening[scratch]("t.db", Create, strict_options()), |c|
+      with_scope[rolled_back](opening[scratch]("t.db", Create, strict_options()), |c|
         close(c)) { conn -> {
         execute(conn, bound(stmt("create table t (n integer) strict"), []), generous_limits());
         execute(conn, bound(stmt("insert into t (n) values (7)"), []), generous_limits());
@@ -1270,7 +1270,7 @@ test "a transaction whose body raises changes nothing" {
 fn rows_returned(column_value: Int, limit: Int) -> Int / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
-      with_hold[limited](opening[scratch]("t.db", Create, strict_options()), |c|
+      with_scope[limited](opening[scratch]("t.db", Create, strict_options()), |c|
         close(c)) { conn -> {
         execute(conn, bound(stmt("create table t (n integer) strict"), []), generous_limits());
         execute(
@@ -1351,7 +1351,8 @@ fn refusal<a | e>(go: () -> a / {sql.fail | e}) -> Option<Error> / e =
 
 test "a database written and closed is read back when it is opened again" {
   let wrote = over_twin(memory(), ||
-    with_hold[first](opening[app]("data/app.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[first](opening[app]("data/app.db", Create, strict_options()), |c|
+      close(c)) { conn -> {
       execute(
         conn,
         bare_statement("create table person (id integer primary key, name text not null) strict"),
@@ -1366,7 +1367,7 @@ test "a database written and closed is read back when it is opened again" {
   let left = match wrote { Ok(over) -> over, Err(_) -> panic("the database was not written") };
   assert_eq(left.value, { rows: 1, last_row_id: 1 });
   let names = in_twin(left.memory, ||
-    with_hold[second](opening[app]("data/app.db", ReadOnly, strict_options()), |c|
+    with_scope[second](opening[app]("data/app.db", ReadOnly, strict_options()), |c|
       close(c)) { conn ->
       query(conn, bare_statement("select id, name from person"), generous_limits()).map(
         |row: Row| text(row, "name"),
@@ -1392,20 +1393,20 @@ fn fresh<a>(
 test "a database that does not exist opens only in Create mode" {
   assert_eq(
     fresh(||
-      with_hold[missing](opening[app]("no.db", ReadWrite, strict_options()), |c|
+      with_scope[missing](opening[app]("no.db", ReadWrite, strict_options()), |c|
         close(c)) { conn -> 1 }),
     Err(Unopened("unable to open database file")),
   );
   assert_eq(
     fresh(||
-      with_hold[made](opening[app]("no.db", Create, strict_options()), |c| close(c)) { conn -> 1 }),
+      with_scope[made](opening[app]("no.db", Create, strict_options()), |c| close(c)) { conn -> 1 }),
     Ok(1),
   )
 }
 
 test "each kind of value is read by its reader, and null through optional" {
   let read = fresh(||
-    with_hold[typed](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[typed](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(
         conn,
         bare_statement("create table v (i integer, r real, t text, b blob, n text) strict"),
@@ -1452,7 +1453,7 @@ test "each kind of value is read by its reader, and null through optional" {
 
 test "a boolean is bound as 1 or 0, and what SQLite does not store is rejected" {
   let read = fresh(||
-    with_hold[bools](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
+    with_scope[bools](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
       numbers(
         query(
           conn,
@@ -1472,7 +1473,7 @@ test "a boolean is bound as 1 or 0, and what SQLite does not store is rejected" 
 
 test "a transaction commits when its body returns and rolls back when it raises" {
   let read = fresh(||
-    with_hold[txn](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[txn](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       transaction(conn, ||
         execute(conn, bare_statement("insert into t values (1)"), generous_limits()));
@@ -1508,8 +1509,8 @@ test "a transaction commits when its body returns and rolls back when it raises"
 
 test "a second writer is Busy, and a reader sees what was committed" {
   let read = fresh(||
-    with_hold[writer](opening[app]("t.db", Create, strict_options()), |c| close(c)) { one ->
-      with_hold[reader](opening[app]("t.db", ReadWrite, strict_options()), |c| close(c)) { two -> {
+    with_scope[writer](opening[app]("t.db", Create, strict_options()), |c| close(c)) { one ->
+      with_scope[reader](opening[app]("t.db", ReadWrite, strict_options()), |c| close(c)) { two -> {
         execute(one, bare_statement("create table t (n integer) strict"), generous_limits());
         execute(one, bare_statement("insert into t values (1)"), generous_limits());
         let during = transaction(one, || {
@@ -1544,8 +1545,8 @@ test "a second writer is Busy, and a reader sees what was committed" {
 
 test "a snapshot reads one state, and its write is Busy once another has written" {
   let read = fresh(||
-    with_hold[snap](opening[app]("t.db", Create, strict_options()), |c| close(c)) { one ->
-      with_hold[other](opening[app]("t.db", ReadWrite, strict_options()), |c| close(c)) { two -> {
+    with_scope[snap](opening[app]("t.db", Create, strict_options()), |c| close(c)) { one ->
+      with_scope[other](opening[app]("t.db", ReadWrite, strict_options()), |c| close(c)) { two -> {
         execute(one, bare_statement("create table t (n integer) strict"), generous_limits());
         snapshot(one, || {
           let before = query(one, bare_statement("select n from t"), generous_limits()).len();
@@ -1577,7 +1578,7 @@ fn violation_cases() -> List<ViolationCase> =
 
 test "{c.sql} breaks the constraint it names" for c: ViolationCase in violation_cases() {
   let read = fresh(||
-    with_hold[constrained](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
+    with_scope[constrained](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
       execute(
         conn,
         bare_statement("create table p (id integer primary key, code text not null unique) strict"),
@@ -1599,7 +1600,7 @@ test "{c.sql} breaks the constraint it names" for c: ViolationCase in violation_
 
 test "each limit rejects what exceeds it, reporting its name" {
   let read = fresh(||
-    with_hold[bounded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[bounded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       execute(conn, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
       [
@@ -1648,7 +1649,7 @@ test "each limit rejects what exceeds it, reporting its name" {
 
 test "a write rejected for what it returned leaves nothing behind" {
   let read = fresh(||
-    with_hold[undone](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[undone](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       execute(conn, bare_statement("insert into t values (1), (2), (3)"), generous_limits());
       let over = refusal(||
@@ -1674,7 +1675,7 @@ test "a write rejected for what it returned leaves nothing behind" {
 
 test "fold_rows reads every row a page at a time and nothing else runs meanwhile" {
   let read = fresh(||
-    with_hold[folding](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[folding](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       execute(
         conn,
@@ -1734,7 +1735,7 @@ fn is_refused(why: Option<Error>) -> Bool = match why { Some(Refused(_)) -> true
 
 test "a backup is a separate database, and never overwrites a file" {
   let made = over_twin(memory(), ||
-    with_hold[source](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[source](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       execute(conn, bare_statement("insert into t values (1)"), generous_limits());
       backup(conn, "copies/t.db");
@@ -1750,7 +1751,7 @@ test "a backup is a separate database, and never overwrites a file" {
     inside: Some(Malformed("cannot VACUUM from within a transaction")),
   });
   let copy = in_twin(left.memory, ||
-    with_hold[copied](opening[app]("copies/t.db", ReadOnly, strict_options()), |c|
+    with_scope[copied](opening[app]("copies/t.db", ReadOnly, strict_options()), |c|
       close(c)) { conn ->
       numbers(query(conn, bare_statement("select n from t"), generous_limits()), "n")
     });
@@ -1761,10 +1762,10 @@ test "a backup is a separate database, and never overwrites a file" {
 
 test "a connection opened to read writes nothing, and a query never writes" {
   let read = fresh(|| {
-    with_hold[seeded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
+    with_scope[seeded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits())
     };
-    with_hold[reading](opening[app]("t.db", ReadOnly, strict_options()), |c| close(c)) { conn ->
+    with_scope[reading](opening[app]("t.db", ReadOnly, strict_options()), |c| close(c)) { conn ->
       [
         refusal(|| execute(conn, bare_statement("insert into t values (1)"), generous_limits())),
         refusal(||
@@ -1790,7 +1791,7 @@ test "a connection opened to read writes nothing, and a query never writes" {
 test "a strict connection rejects a table that is not strict, and another connection accepts it" {
   let made = |strict: Bool|
     fresh(||
-      with_hold[strictness](
+      with_scope[strictness](
         opening[app]("t.db", Create, { ..strict_options(), strict: strict }),
         |c| close(c),
       ) { conn ->
@@ -1813,7 +1814,7 @@ fn engine_refuses() -> List<String> =
 
 test "the engine rejects {c}, which the parser cannot detect" for c: String in engine_refuses() {
   let read = fresh(||
-    with_hold[authorized](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
+    with_scope[authorized](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
       let params = if c.contains("?1") { [TextParameter("now")] } else { [] };
       refusal(|| execute(conn, bound(stmt(c), params), generous_limits()))
@@ -1823,7 +1824,7 @@ test "the engine rejects {c}, which the parser cannot detect" for c: String in e
 
 test "a view and a trigger are bound by the same rules as a statement" {
   let read = fresh(||
-    with_hold[smuggled](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
+    with_scope[smuggled](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(
         conn,
         bare_statement("create table t (n integer, at text) strict"),
@@ -1884,7 +1885,7 @@ test "a tagged literal's holes are its parameters, and an error points where its
 test "a path that leaves its root is rejected with E0452's message" {
   let escaped = try[abort.raise] {
     fresh(||
-      with_hold[escaping](opening[app]("../t.db", Create, strict_options()), |c|
+      with_scope[escaping](opening[app]("../t.db", Create, strict_options()), |c|
         close(c)) { conn -> 0 })
   };
   assert_eq(escaped, Err("`../t.db` leaves the root it was given"))
@@ -1892,9 +1893,9 @@ test "a path that leaves its root is rejected with E0452's message" {
 
 test "what was closed, and what was never opened, is Closed" {
   let read = fresh(|| {
-    let kept = with_hold[leaving](opening[app]("t.db", Create, strict_options()), |c|
+    let kept = with_scope[leaving](opening[app]("t.db", Create, strict_options()), |c|
       close(c)) { conn -> conn.get() };
-    with_hold[again](kept, |_: Connection<[app]>| ()) { conn ->
+    with_scope[again](kept, |_: Connection<[app]>| ()) { conn ->
       refusal(|| query(conn, bare_statement("select 1 as a"), generous_limits()))
     }
   });

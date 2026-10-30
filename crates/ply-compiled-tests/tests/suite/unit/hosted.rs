@@ -111,7 +111,7 @@ fn a_run_that_listens_for_no_stop_installs_no_signal_handler() {
     );
 }
 
-/// What a real handler read goes into its run's record under the root its label names, once the run
+/// What a host handler read goes into its run's record under the root its label names, once the run
 /// is observed; a label no root is bound to, and a run nobody observes, record nothing.
 #[test]
 fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
@@ -163,7 +163,7 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
     assert_eq!(read, ["file\tapp\ta.db\t"], "{trace}");
 }
 
-/// What a real handler read of the binary goes into its run's record without a root: a shipped
+/// What a host handler read of the binary goes into its run's record without a root: a shipped
 /// module by its name and the program the launcher entered, each digested by the binary.
 #[test]
 fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {

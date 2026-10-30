@@ -1,4 +1,4 @@
-//! SQLite databases under the roots `--fs` binds, which `std.sqlite`'s real handler opens and asks
+//! SQLite databases under the roots `--fs` binds, which `std.sqlite`'s host handler opens and asks
 //! through its natives, each operation a job for the process's waiting pool.
 //!
 //! A connection is a thread that owns its engine and takes one operation at a time, so a

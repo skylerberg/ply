@@ -124,7 +124,7 @@ fn rooted(c: &mut Ctx, label: &[u8], what: &'static str) -> Option<(Arc<SqliteHo
     }
 }
 
-/// A statement's text, values and limits, as the real handler hands them.
+/// A statement's text, values and limits, as the host handler hands them.
 fn statement(
     c: &mut Ctx,
     native: &str,
