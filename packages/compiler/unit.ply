@@ -11,7 +11,7 @@ import compiler.emit.answer (Answer, RootAnswer, Tables, Defined, Head, Expect, 
                              GenericAt, expected_callee, word_head, no_generics, answer_bin,
                              tables_bin, root_answer_bin, no_tables, GenericCall, Generics, Need,
                              Pass, Reads, Scalar, Layout, Exact, Rowed, settled_by_callers,
-                             Published, Keyed, KeyedTag, KeyedField, KeyedEntry)
+                             Published, Keyed, KeyedTag, KeyedField, KeyedEntry, shared_fn_bin)
 import compiler.emit.tir.statics (StaticDef, SFile, SPlain, StaticWord, WField, WAddress, named,
                                   words_of)
 import compiler.emit.print.statics (static_c, static_extern, escaped, c_string)
@@ -1860,6 +1860,9 @@ fn answer_key(m: Bytes) -> Bytes = b"answer\x00".concat(m)
 /// whose body calls it.
 fn key_key(d: Bytes) -> Bytes = b"key\x00".concat(d)
 
+/// What the body of the kept answer of a root whose material is `m` is filed under.
+fn body_key(m: Bytes) -> Bytes = b"body\x00".concat(m)
+
 /// The digest a kept answer names the root `k` by.
 fn key_digest(k: RootKey) -> Bytes / {abort.raise} = blake3(key_bytes(k))
 
@@ -1875,24 +1878,45 @@ fn standing(looked: Map<RootName, Answer>, offered: Map<RootName, Bool>) -> Map<
           })) { acc.insert(n, a) }
     else { acc })
 
-/// A kept body: its answer, which names none of the roots its body calls; the digest of each of
-/// those, in the order its body names them, each root kept once beside it (`key_key`); and the key
-/// each root it calls had, in the order `callees_of` names them. A key reads its callees by hash and
-/// the C calls them by name, so two callees that hash alike under two names share a key and not a
-/// body.
-type Kept = { answer: Answer, calls: List<Bytes>, callees: List<Option<Bytes>> }
+/// A kept root's summary: its answer without its C, which names none of the roots its body calls;
+/// the digest of each of those, in the order its body names them, each root kept once beside it
+/// (`key_key`); the key each root it calls had, in the order `callees_of` names them; and the digest
+/// of its `Body`, kept beside it (`body_key`). A key reads its callees by hash and the C calls them by
+/// name, so two callees that hash alike under two names share a key and not a body.
+type Kept = { answer: Answer, calls: List<Bytes>, callees: List<Option<Bytes>>, body: Bytes }
 
 derive bin for Kept
+
+/// The C of an answer: its text and the functions its closures share. The steps over the whole
+/// program read none of it, so a kept root's is read only where its part is written.
+type Body = { text: Bytes, shared: List<SharedFn> }
+
+derive bin for Body
+
+fn answer_body(a: Answer) -> Body = { text: a.text, shared: a.tables.shared }
+
+/// `a` without its C, as its summary keeps it.
+fn summarised(a: Answer) -> Answer = { text: b"", tables: { ..a.tables, shared: [] } }
+
+/// The digest of `a`'s C.
+fn body_digest(a: Answer) -> Bytes / {abort.raise} = blake3(bin::encode(answer_body(a), body_bin()))
+
+/// Where a kept root's body is: the material its records are kept under, and the body's digest. Its
+/// body is kept in the batch its summary is, so a store that loses one loses both.
+type Stored = { material: Bytes, body: Bytes }
 
 /// The roots `a` calls, by name, ascending, each once.
 fn callees_of(a: Answer) -> List<RootName> = names_ordered(a.tables.calls.map(root_name))
 
-fn kept_of(keys: Map<RootName, Bytes>, a: Answer) -> Kept / {abort.raise} =
+fn kept_of(keys: Map<RootName, Bytes>, a: Answer) -> Kept / {abort.raise} = {
+  let s = summarised(a);
   {
-    answer: { ..a, tables: { ..a.tables, calls: [] } },
+    answer: { ..s, tables: { ..s.tables, calls: [] } },
     calls: a.tables.calls.map(key_digest),
     callees: callees_of(a).map(|c: RootName| keys.get(c)),
+    body: body_digest(a),
   }
+}
 
 /// Whether each root `a`'s body calls still has the key `callees` says it had.
 fn holds(keys: Map<RootName, Bytes>, a: Answer, callees: List<Option<Bytes>>) -> Bool = {
@@ -1921,12 +1945,16 @@ fn standing_kept(
     if holds(keys, a, k.callees) { Some(a) } else { None }
   }
 
-/// The kept answers of some roots, each by its root's name, and the digests of the keys the store
-/// holds of the roots they call.
-type KeptAnswers = { answers: Map<RootName, Answer>, known: Map<Bytes, Bool> }
+/// The kept answers of some roots without their C, each by its root's name, where each one's body is,
+/// and the digests of the keys the store holds of the roots they call.
+type KeptAnswers = {
+  answers: Map<RootName, Answer>,
+  stored: Map<RootName, Stored>,
+  known: Map<Bytes, Bool>,
+}
 
-/// The answers `materials` names a kept one of, each root by its material: each read back with the
-/// roots it calls, a key read once however many answers call it.
+/// The answers `materials` names a kept one of, each root by its material: each summary read back
+/// with the roots it calls, a key read once however many answers call it, and no body.
 fn kept_answers<| e>(
   keys: Map<RootName, Bytes>,
   materials: Map<RootName, Bytes>,
@@ -1944,20 +1972,28 @@ fn kept_answers<| e>(
       Some(b) -> match bin::decode(b, root_key_bin()) { Ok(r) -> acc.insert(d, r), Err(_) -> acc },
       None -> acc,
     });
+  let answers = found.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, k: Kept|
+    match standing_kept(keys, resolved, k) { Some(a) -> acc.insert(n, a), None -> acc });
   {
-    answers: found.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, k: Kept|
-      match standing_kept(keys, resolved, k) { Some(a) -> acc.insert(n, a), None -> acc }),
+    answers: answers,
+    stored: answers.fold(Map::new(), |acc: Map<RootName, Stored>, n: RootName, _: Answer|
+      match ((materials.get(n), found.get(n))) {
+        (Some(m), Some(k)) -> acc.insert(n, { material: m, body: k.body }),
+        _ -> acc,
+      }),
     known: resolved.fold(Map::new(), |acc: Map<Bytes, Bool>, d: Bytes, _: RootKey|
       acc.insert(d, true)),
   }
 }
 
-/// The answers of `kept` of the roots `materials` names, and none of its digests, which a walk
-/// knows from its start.
+/// The answers of `kept` of the roots `materials` names, where their bodies are, and none of its
+/// digests, which a walk knows from its start.
 fn kept_among(kept: KeptAnswers, materials: Map<RootName, Bytes>) -> KeptAnswers =
   {
     answers: materials.fold(Map::new(), |acc: Map<RootName, Answer>, n: RootName, _: Bytes|
       match kept.answers.get(n) { Some(a) -> acc.insert(n, a), None -> acc }),
+    stored: materials.fold(Map::new(), |acc: Map<RootName, Stored>, n: RootName, _: Bytes|
+      match kept.stored.get(n) { Some(s) -> acc.insert(n, s), None -> acc }),
     known: Map::new(),
   }
 
@@ -1994,7 +2030,7 @@ fn answers_kept<| e>(
             records: called.records.push({
               key: answer_key(m),
               bytes: bin::encode(kept_of(keys, a), kept_bin()),
-            }),
+            }).push({ key: body_key(m), bytes: bin::encode(answer_body(a), body_bin()) }),
           }
         },
         None -> acc,
@@ -2357,6 +2393,8 @@ type Asked<s> = { held: s, answers: List<RootAnswer>, found: List<RootKey> }
 /// has not settled; what the emitter holds; and the roots its caller offered or holds otherwise.
 type Walk<s> = {
   answers: Map<RootName, Answer>,
+  /// Where the body of each answer read back without its C is.
+  stored: Map<RootName, Stored>,
   keys: Map<RootName, RootKey>,
   held: Map<RootName, Published>,
   handed: Map<RootName, Handing>,
@@ -2423,6 +2461,7 @@ fn walked<s | e>(
   range(0, last + 1).fold(
     {
       answers: Map::new(),
+      stored: Map::new(),
       keys: Map::new(),
       held: Map::new(),
       handed: Map::new(),
@@ -2703,6 +2742,8 @@ fn answered_now<s | e>(
     ..w,
     answers: all.fold(w.answers, |acc: Map<RootName, Answer>, n: RootName, a: Answer|
       acc.insert(n, a)),
+    stored: settled.kept.fold(w.stored, |acc: Map<RootName, Stored>, n: RootName, _: Answer|
+      match looked.stored.get(n) { Some(s) -> acc.insert(n, s), None -> acc }),
     keys: reached.fold(
       keys.fold(w.keys, |acc: Map<RootName, RootKey>, n: RootName, k: RootKey| acc.insert(n, k)),
       |acc: Map<RootName, RootKey>, n: RootName, k: RootKey| acc.insert(n, k),
@@ -2849,10 +2890,15 @@ pub fn emitted<| e>(
         scoped_asked(dump, p, ctors, offered, held, roots, handed, done),
     );
     {
-      let c = compiled(all.answers, all.keys);
+      let c = compiled(all.answers, all.keys, all.stored);
       let settled = generics_settled(c.answers, c.keys, all.needs, all.called, program);
       let unemitted = settled.unemitted;
-      let held = settled_bodies(settled.answers, c.keys, unemitted);
+      // The steps above read no body; each is read here, as its part is written.
+      let held = settled_bodies(settled.answers, c.keys, unemitted).fold(
+        Map::new(),
+        |m: Map<RootName, Answer>, n: RootName, a: Answer|
+          m.insert(n, settled_text(n, a, c.stored, settled.named, read)),
+      );
       let roots = every.concat(all.added).filter(|k: RootKey|
         !unemitted.contains(root_name(k))).concat(
         entries,
@@ -3126,22 +3172,33 @@ fn settled_root(
 
 /// `answers` with every generic call settled over the program's constructors `ctors`, by the needs
 /// and the parameters called as functions the walk closed (`settling`), so each call settles on the
-/// root the walk answered for it: each placeholder of a body's C, and of the entries its closures
-/// name, written as the root its call settles on, a specialisation by its own name, and that root
-/// among the body's calls. Answers those answers, and `unemitted`: the
-/// generic bodies the unit never emits, whose calls are settled on their specialisations instead
-/// (`settled_only`).
+/// root the walk answered for it: the entries its closures name written as the root each call
+/// settles on, a specialisation by its own name, and that root among the body's calls. Answers those
+/// answers; `named`, the roots each body's calls settle on, by their placeholders' numbers, which its
+/// C is written with only once its body is read (`settled_text`); and `unemitted`: the generic bodies
+/// the unit never emits, whose calls are settled on their specialisations instead (`settled_only`).
 fn generics_settled(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
   ctors: Ctors,
-) -> { answers: Map<RootName, Answer>, unemitted: Map<RootName, Bool> } / {abort.raise} = {
+) -> { answers: Map<RootName, Answer>, named: Map<RootName, List<RootName>>, unemitted: Map<RootName, Bool> } / {abort.raise} = {
   let unemitted = settled_only(answers, keys, needs);
   // A root keyed by a layout is the one the unit asked for under its name, whatever type this call
   // settles it at.
   let asked = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
+  let named = answers.fold(
+    Map::new(),
+    |acc: Map<RootName, List<RootName>>, n: RootName, a: Answer|
+      if a.tables.generics.calls.len() == 0 { acc } else {
+        acc.insert(
+          n,
+          a.tables.generics.calls.map(|g: GenericCall|
+            root_name(asked(settled_root(g, needs, called, ctors)))),
+        )
+      },
+  );
   let settled_answers = answers.fold(
     Map::new(),
     |acc: Map<RootName, Answer>, n: RootName, a: Answer|
@@ -3162,7 +3219,7 @@ fn generics_settled(
               },
             });
         {
-          text: placeholders_named(a.text, roots),
+          text: a.text,
           tables: {
             ..a.tables,
             generics: {
@@ -3182,16 +3239,48 @@ fn generics_settled(
         }
       }),
   );
-  { answers: settled_answers, unemitted: unemitted }
+  { answers: settled_answers, named: named, unemitted: unemitted }
 }
 
-/// The answers as a unit compiles them, `keys` with each code's key, and `coded` each code's key with
-/// its home. A code two or more specialisations share is one body under the code's name (`Coded`),
-/// and each of them a stub that calls it.
+/// The C of root `n`'s answer `a` as its part writes it: its own where it holds it, else its body as
+/// `stored` says it was kept, read through `read`; and each placeholder of its generic calls written
+/// as the root `named` says that call settles on.
+fn settled_text<| e>(
+  n: RootName,
+  a: Answer,
+  stored: Map<RootName, Stored>,
+  named: Map<RootName, List<RootName>>,
+  read: (Bytes) -> Option<Bytes> / e,
+) -> Answer / {abort.raise | e} = {
+  let body = if a.text.len() > 0 { answer_body(a) } else {
+    match stored.get(n) {
+      None -> answer_body(a),
+      Some(s) -> match read(body_key(s.material)) {
+        None -> panic("a kept answer's body is kept beside it"),
+        Some(b) -> match bin::decode(b, body_bin()) {
+          Ok(x) -> x,
+          Err(_) -> panic("a kept answer's body reads back as it was kept"),
+        },
+      },
+    }
+  };
+  {
+    text: match named.get(n) {
+      Some(roots) -> placeholders_named(body.text, roots),
+      None -> body.text,
+    },
+    tables: { ..a.tables, shared: body.shared },
+  }
+}
+
+/// The answers as a unit compiles them, `keys` with each code's key, `coded` each code's key with its
+/// home, and `stored` with where each code's body is. A code two or more specialisations share is one
+/// body under the code's name (`Coded`), and each of them a stub that calls it.
 type Compiled = {
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
   coded: List<{ key: RootKey, home: Bytes }>,
+  stored: Map<RootName, Stored>,
 }
 
 /// `answers`, each a root's by its key in `keys`, as the unit compiles them (`Compiled`). A
@@ -3202,6 +3291,7 @@ type Compiled = {
 fn compiled(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
+  stored: Map<RootName, Stored>,
 ) -> Compiled / {abort.raise} = {
   let sharing = answers.fold(
     Map::new(),
@@ -3209,7 +3299,7 @@ fn compiled(
       match keys.get(n) {
         Some(At(spec, _)) -> if a.tables.members.len() > 0
             || a.tables.defined.any(|d: Defined| d.entered) { acc } else {
-          let k = code_of(spec.def, n, a);
+          let k = code_of(spec.def, n, a, digest_in(stored, n, a));
           let c = root_name(k);
           acc.insert(c, {
             key: k,
@@ -3220,7 +3310,7 @@ fn compiled(
       },
   );
   sharing.fold(
-    { answers: answers, keys: keys, coded: [] },
+    { answers: answers, keys: keys, coded: [], stored: stored },
     |acc: Compiled, c: RootName, s: { key: RootKey, shared: List<RootName> }|
       match if s.shared.len() < 2 { None } else { answers.get(s.shared.get(0)) } {
         None -> acc,
@@ -3242,10 +3332,24 @@ fn compiled(
                 0,
               ),
             }),
+            // A stub is written whole, and the code's body is the first's.
+            stored: s.shared.fold(
+              match stored.get(s.shared.get(0)) {
+                Some(x) -> acc.stored.insert(c, x),
+                None -> acc.stored,
+              },
+              |m: Map<RootName, Stored>, n: RootName| m.remove(n),
+            ),
           },
       },
   )
 }
+
+/// The digest of the C of `a`, the answer of root `n`: its own where it holds its C, else the one
+/// its summary kept.
+fn digest_in(stored: Map<RootName, Stored>, n: RootName, a: Answer) -> Bytes / {abort.raise} =
+  if a.text.len() > 0 { body_digest(a) }
+  else { match stored.get(n) { Some(s) -> s.body, None -> body_digest(a) } }
 
 /// Specialisation `a` as a stub that calls `code`, the body it shares: its C passes its parameters
 /// through and answers what that answers.
@@ -3287,11 +3391,13 @@ fn stub(a: Answer, code: RootKey) -> Answer / {abort.raise} =
 /// The code body `a` of specialisation `n` of `def` compiles as: the digest of the body with its
 /// calls of itself made calls of no name, which a specialisation whose body is alike but for its name
 /// shares.
-fn code_of(def: Bytes, n: RootName, a: Answer) -> RootKey / {abort.raise} = {
-  let unnamed = renamed(a, n, Coded({ def: def, code: b"" }));
+fn code_of(def: Bytes, n: RootName, a: Answer, body: Bytes) -> RootKey / {abort.raise} = {
+  let unnamed = renamed(summarised(a), n, Coded({ def: def, code: b"" }));
   Coded({
     def: def,
-    code: Bytes::of_string(blake3(bin::encode(unnamed, answer_bin())).slice(0, 16).hex_of()),
+    code: Bytes::of_string(
+      blake3(bin::encode(unnamed, answer_bin()).concat(body)).slice(0, 16).hex_of(),
+    ),
   })
 }
 
@@ -3685,16 +3791,18 @@ fn program_calling_f_at(
       at.map(calling),
     ),
   );
-  let c = compiled(had.answers, had.keys);
+  let c = compiled(had.answers, had.keys, Map::new());
+  let s = generics_settled(
+    c.answers,
+    c.keys,
+    closed_needs(had.answers, had.keys),
+    closed_called(had.answers, had.keys),
+    no_ctors(),
+  );
   {
     coded: c.coded.map(|x: { key: RootKey, home: Bytes }| x.key),
-    bodies: generics_settled(
-      c.answers,
-      c.keys,
-      closed_needs(had.answers, had.keys),
-      closed_called(had.answers, had.keys),
-      no_ctors(),
-    ).answers,
+    bodies: s.answers.fold(Map::new(), |m: Map<RootName, Answer>, n: RootName, a: Answer|
+      m.insert(n, settled_text(n, a, Map::new(), s.named, |_: Bytes| None))),
   }
 }
 
@@ -4424,7 +4532,9 @@ test "a kept body stands only where each callee it names still has the key it wa
   };
   assert_eq(filed.callees, [Some(b"kb")]);
   assert(filed.calls.len() == 1 && filed.calls.all(|d: Bytes| d.len() == 32), None);
-  assert_eq(standing_kept(keys, resolved, filed), Some(body));
+  // It stands without its C, which is kept apart, and its digest names that C.
+  assert_eq(standing_kept(keys, resolved, filed), Some(summarised(body)));
+  assert_eq(filed.body, body_digest(body));
   // Another tree's callee that hashes alike under another name: the C would call a name not here.
   assert_eq(standing_kept(by_def([{ key: b"m.c", value: b"kb" }]), resolved, filed), None);
   assert_eq(standing_kept(by_def([{ key: b"m.b", value: b"another" }]), resolved, filed), None);
@@ -6073,9 +6183,10 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
         Err(why) -> panic(String::of_bytes_lossy(why)),
       };
     assert_eq(unit(lending).kept, 0);
-    // What the next run starts from: the body of `scaled`, and of no root it names, beside the keys
-    // of the roots it calls.
-    let answer = |k: Bytes| !k.starts_with(key_key(b""));
+    // What the next run starts from: the answer of `scaled` and its body, and of no root it names,
+    // beside the keys of the roots it calls.
+    let answer = |k: Bytes| k.starts_with(answer_key(b""));
+    let body = |k: Bytes| k.starts_with(body_key(b""));
     // An answer is filed under its material, which opens with its definition's name; the entry of
     // `scaled` is filed so too, and calls it.
     let scaled = |k: Bytes, v: Bytes|
@@ -6084,9 +6195,14 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
           Ok(filed) -> !filed.calls.contains(key_digest(Named(b"m.scaled"))),
           Err(_) -> false,
         });
+    let all = body_store.all();
+    let kept = all.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
+      if answer(k) && scaled(k, v) { acc.insert(k, v) } else { acc });
+    let bodies = kept.keys().map(|k: Bytes| body_key(k.slice(answer_key(b"").len(), k.len())));
     body_store.replace(
-      body_store.all().fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-        if !answer(k) || scaled(k, v) { acc.insert(k, v) } else { acc }),
+      all.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
+        if (!answer(k) && !body(k)) || kept.contains(k) || bodies.contains(k) { acc.insert(k, v) }
+        else { acc }),
     );
     assert_eq(body_store.all().keys().filter(answer).len(), 1);
     let moved = unit(
@@ -6606,7 +6722,11 @@ test "a walk grows its scope once, over what is left, where a kept body's call s
     assert(held.covered.contains(b"k"), None);
     assert_eq(warm.walk.emitter.built, 2);
     let cold = kept_bodies(|| walk_in_store(edited)).walk;
-    assert(warm.walk.answers == cold.answers, None)
+    // A kept answer is read without its C, which the next test holds equal where it is written.
+    let summaries = |answers: Map<RootName, Answer>|
+      answers.fold(Map::new(), |m: Map<RootName, Answer>, n: RootName, a: Answer|
+        m.insert(n, summarised(a)));
+    assert(summaries(warm.walk.answers) == summaries(cold.answers), None)
   })
 }
 
