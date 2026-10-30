@@ -221,23 +221,37 @@ fn run_all<[c]>(
 
 pub type Source = { label: String, digest: String }
 
+pub fn source_digest(head: Bytes, part: Bytes) -> String / {abort.raise} =
+  blake3(head.concat(part)).hex_of()
+
 pub fn sources_of(parts: Parts) -> List<Source> / {abort.raise} =
   parts.parts.map(|p: { label: String, text: Bytes }|
-    { label: p.label, digest: blake3(parts.head.concat(p.text)).hex_of() })
+    { label: p.label, digest: source_digest(parts.head, p.text) })
 
-fn source_path(s: Source) -> String = "src/" ++ s.digest ++ ".c"
+fn source_path(digest: String) -> String = "src/" ++ digest ++ ".c"
+
+pub type WrittenPart = { label: String, digest: String, size: Int, text: Option<Bytes> }
+
+pub fn holds_source(digest: String) -> Bool / {toolchain.read} =
+  toolchain.exists(source_path(digest))
 
 pub fn cache_sources(
-  parts: Parts,
+  head: Bytes,
+  written: List<WrittenPart>,
 ) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
-  let sources = sources_of(parts);
-  let landed = range(0, sources.len()).fold(true, |ok: Bool, i: Int| {
-    let path = source_path(sources.get(i));
+  let landed = written.fold(true, |ok: Bool, w: WrittenPart|
     ok
-      && (toolchain.exists(path)
-      || toolchain.write_file(path, parts.head.concat(parts.parts.get(i).text)))
-  });
-  if landed { Ok(sources) } else { Err("a unit's C could not be kept in the toolchain's cache") }
+      && (holds_source(w.digest)
+      || (match w.text {
+        None -> false,
+        Some(t) -> toolchain.write_file(source_path(w.digest), head.concat(t)),
+      })));
+  if !landed { Err("a unit's C could not be kept in the toolchain's cache") } else {
+    Ok(
+      written.sort_by(|a: WrittenPart, b: WrittenPart| a.size > b.size).map(|w: WrittenPart|
+        { label: w.label, digest: w.digest }),
+    )
+  }
 }
 
 pub fn manifest(sources: List<Source>) -> Bytes =
@@ -263,7 +277,7 @@ pub fn parse_manifest(text: Bytes) -> Option<List<Source>> =
     })
 
 pub fn sources_cached(sources: List<Source>) -> Bool / {toolchain.read} =
-  sources.fold(true, |ok: Bool, s: Source| ok && toolchain.exists(source_path(s)))
+  sources.fold(true, |ok: Bool, s: Source| ok && holds_source(s.digest))
 
 fn object_path(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
   "obj/" ++ cache_key(t, flags, [Bytes::of_string(s.digest)]) ++ ".o"
@@ -333,7 +347,7 @@ pub fn objects_from_sources<[c]>(
   let cache = toolchain.cache();
   let targets = sources.map(|s: Source| object_path(t, flags, s));
   let missing = range(0, targets.len()).filter(|i: Int| !toolchain.exists(targets.get(i)));
-  match missing.find(|i: Int| !toolchain.exists(source_path(sources.get(i)))) {
+  match missing.find(|i: Int| !holds_source(sources.get(i).digest)) {
     Some(i) ->
       Err(
         "the C of part `" ++ sources.get(i).label ++ "` is no longer kept in the toolchain's cache",
@@ -344,7 +358,7 @@ pub fn objects_from_sources<[c]>(
         flags,
         targets,
         missing,
-        missing.map(|i: Int| cache ++ "/" ++ source_path(sources.get(i))),
+        missing.map(|i: Int| cache ++ "/" ++ source_path(sources.get(i).digest)),
         work,
       ),
   }
@@ -809,10 +823,10 @@ test "a compiler compiles for x86-64 Linux where it preprocesses the probe, and 
   assert_eq(unkept.runs, [])
 }
 
-fn built_over(
+fn built_over<a>(
   held: List<String>,
-  build: () -> Result<Objects, String> / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise},
-) -> { made: Result<Objects, String>, written: List<String> } / {abort.raise} =
+  build: () -> a / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise},
+) -> { made: a, written: List<String> } / {abort.raise} =
   handle {
     build()
   } with {
@@ -859,9 +873,21 @@ test "a build compiles the parts whose objects the cache does not hold, each fro
     made: Ok({ paths: paths, compiled: 0 }),
     written: [],
   });
-  let cache_sources = built_over([targets.get(0)].concat(sources.map(source_path)), ||
-    objects_from_sources[cc](t, sources, [], "work"));
+  let cache_sources = built_over(
+    [targets.get(0)].concat(sources.map(|s: Source| source_path(s.digest))),
+    || objects_from_sources[cc](t, sources, [], "work"),
+  );
   assert_eq(cache_sources.made, Ok({ paths: paths, compiled: 2 }))
+}
+
+test "keeping a unit's parts writes each new one's C, takes each the cache holds, and refuses one it lost" {
+  let fresh = { label: "a", digest: "aa", size: 2, text: Some(b"a\n") };
+  let taken = { label: "b", digest: "bb", size: 9, text: None };
+  assert_eq(built_over(["src/bb.c"], || cache_sources(b"h\n", [fresh, taken])), {
+    made: Ok([{ label: "b", digest: "bb" }, { label: "a", digest: "aa" }]),
+    written: ["src/aa.c"],
+  });
+  assert(built_over([], || cache_sources(b"h\n", [fresh, taken])).made.is_err(), None)
 }
 
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
