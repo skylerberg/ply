@@ -13,6 +13,8 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 mkdir -p "$(dirname "$dest")"
-gh release download main-latest --repo skylerberg/ply --pattern "$asset" --output "$dest" --clobber
-chmod +x "$dest"
+# Written beside DEST and renamed over it: macOS kills a binary rewritten in place once it has run.
+gh release download main-latest --repo skylerberg/ply --pattern "$asset" --output "$dest.download" --clobber
+chmod +x "$dest.download"
+mv -f "$dest.download" "$dest"
 echo "$dest"
