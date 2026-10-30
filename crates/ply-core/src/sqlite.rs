@@ -28,7 +28,7 @@ pub const MAX_DEPTH: u32 = 32;
 const STEP_GRAIN: i32 = 1000;
 
 /// What opens a refusal a guarded function raises, so it is told from the engine's own errors.
-const REFUSED: &str = "refused: ";
+const REJECTED: &str = "refused: ";
 
 /// The scalar, aggregate and window functions a statement may call. The list is closed: the
 /// authorizer refuses any other name wherever it is written, a view or a trigger included.
@@ -240,7 +240,7 @@ impl Failure {
         }
     }
 
-    fn refused(detail: impl Into<String>) -> Failure {
+    fn rejected(detail: impl Into<String>) -> Failure {
         Failure::new("refused", "", detail)
     }
 
@@ -316,7 +316,7 @@ struct Guard {
     /// Set while the engine runs a statement of its own, which the authorizer lets through.
     internal: AtomicBool,
     /// Why the authorizer last refused, for the failure the refused statement answers with.
-    refused: Mutex<Option<String>>,
+    rejected: Mutex<Option<String>>,
     /// The steps the running statement has left.
     steps: AtomicI64,
     /// Whether the progress handler stopped the running statement.
@@ -327,13 +327,13 @@ struct Guard {
 }
 
 impl Guard {
-    fn refuse(&self, why: String) -> Authorization {
-        *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    fn refuse(&self, reason: String) -> Authorization {
+        *self.rejected.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
         Authorization::Deny
     }
 
-    fn take_refusal(&self) -> Option<String> {
-        self.refused
+    fn take_rejection(&self) -> Option<String> {
+        self.rejected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -450,7 +450,7 @@ impl Engine {
             pager(Reply::failed(failure));
             return;
         }
-        self.guard.take_refusal();
+        self.guard.take_rejection();
         let mut stmt = match self.conn.prepare_cached(sql) {
             Ok(stmt) => stmt,
             Err(e) => {
@@ -475,7 +475,7 @@ impl Engine {
                 ));
             }
             if stmt.parameter_count() != params.len() {
-                return Err(Failure::refused(format!(
+                return Err(Failure::rejected(format!(
                     "the statement has {} placeholder(s) and was given {} parameter(s)",
                     stmt.parameter_count(),
                     params.len()
@@ -537,7 +537,7 @@ impl Engine {
                         ended = Some(Err(Failure::too_large("rows", limits.rows)));
                     }
                     Ok(Some(row)) => match read_row(row, width) {
-                        Err(refusal) => ended = Some(Err(refusal)),
+                        Err(rejection) => ended = Some(Err(rejection)),
                         Ok(values) => {
                             seen += 1;
                             bytes += values.iter().map(Scalar::bytes).sum::<i64>();
@@ -617,7 +617,7 @@ impl Engine {
         }
         let sql = match (step, self.depth) {
             (Control::Begin | Control::BeginRead, depth) if depth >= MAX_DEPTH => {
-                return Reply::failed(Failure::refused(format!(
+                return Reply::failed(Failure::rejected(format!(
                     "a connection nests {MAX_DEPTH} transactions at most"
                 )));
             }
@@ -625,7 +625,7 @@ impl Engine {
             (Control::BeginRead, 0) => "BEGIN".to_string(),
             (Control::Begin | Control::BeginRead, depth) => format!("SAVEPOINT ply_{depth}"),
             (Control::Commit | Control::Rollback, 0) => {
-                return Reply::failed(Failure::refused("no transaction is open"));
+                return Reply::failed(Failure::rejected("no transaction is open"));
             }
             (Control::Commit, 1) => "COMMIT".to_string(),
             (Control::Commit, depth) => format!("RELEASE ply_{}", depth - 1),
@@ -660,7 +660,7 @@ impl Engine {
     /// which holds nothing yet.
     pub fn backup(&mut self, to: &Path) -> Reply {
         let Some(to) = to.to_str() else {
-            return Reply::failed(Failure::refused("the path is not UTF-8"));
+            return Reply::failed(Failure::rejected("the path is not UTF-8"));
         };
         let done = self.internal(|conn| {
             // `VACUUM INTO` attaches the file it writes, and a connection attaches none otherwise.
@@ -687,7 +687,7 @@ impl Engine {
         }
         // The one statement that writes another file and asks the authorizer nothing first.
         if first_word_is(sql, "vacuum") {
-            return Err(Failure::refused(
+            return Err(Failure::rejected(
                 "a connection reaches its own database and no other file: `VACUUM` is refused, and a backup is how a copy is made",
             ));
         }
@@ -698,7 +698,7 @@ impl Engine {
     /// connection requires it, or a row at the largest row id.
     fn left_behind(&self, sql: &str) -> Option<Failure> {
         if self.guard.last_row_id_taken.load(Ordering::Relaxed) {
-            return Some(Failure::refused(format!(
+            return Some(Failure::rejected(format!(
                 "a row id of {} is refused: past it the engine draws row ids at random",
                 i64::MAX
             )));
@@ -719,7 +719,7 @@ impl Engine {
         });
         match loose {
             Ok(None) => None,
-            Ok(Some(table)) => Some(Failure::refused(format!(
+            Ok(Some(table)) => Some(Failure::rejected(format!(
                 "the table `{table}` is not `STRICT`, and this connection requires every table to be"
             ))),
             Err(e) => Some(self.failure_of(e)),
@@ -760,16 +760,16 @@ impl Engine {
     }
 
     fn failure_of(&self, e: rusqlite::Error) -> Failure {
-        if let Some(why) = self.guard.take_refusal() {
-            return Failure::refused(why);
+        if let Some(reason) = self.guard.take_rejection() {
+            return Failure::rejected(reason);
         }
         let spent = self.guard.spent.swap(false, Ordering::Relaxed);
         match e {
             rusqlite::Error::MultipleStatement => {
-                Failure::refused("one statement at a time: this text holds another after its `;`")
+                Failure::rejected("one statement at a time: this text holds another after its `;`")
             }
             rusqlite::Error::NulError(_) => {
-                Failure::refused("the statement's text holds a NUL byte")
+                Failure::rejected("the statement's text holds a NUL byte")
             }
             rusqlite::Error::SqlInputError {
                 error, msg, offset, ..
@@ -831,11 +831,11 @@ fn by_code(error: ffi::Error, msg: String, spent: bool) -> Failure {
             "",
             "the statement ran past the steps its caller allowed",
         ),
-        ffi::SQLITE_AUTH => Failure::refused(msg),
+        ffi::SQLITE_AUTH => Failure::rejected(msg),
         ffi::SQLITE_READONLY => Failure::new("read_only", "", msg),
         ffi::SQLITE_TOOBIG => Failure::new("too_large", "value", msg),
-        ffi::SQLITE_ERROR => match msg.strip_prefix(REFUSED) {
-            Some(why) => Failure::refused(why),
+        ffi::SQLITE_ERROR => match msg.strip_prefix(REJECTED) {
+            Some(reason) => Failure::rejected(reason),
             None => Failure::new("statement", "", msg),
         },
         ffi::SQLITE_RANGE | ffi::SQLITE_MISMATCH => Failure::new("statement", "", msg),
@@ -953,8 +953,8 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
         if authorizing.internal.load(Ordering::Relaxed) {
             return Authorization::Allow;
         }
-        match refusal(ctx.action) {
-            Some(why) => authorizing.refuse(why),
+        match rejection(ctx.action) {
+            Some(reason) => authorizing.refuse(reason),
             None => Authorization::Allow,
         }
     }))?;
@@ -984,7 +984,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
 }
 
 /// Why the authorizer refuses `action`, or `None` for one a statement may take.
-fn refusal(action: AuthAction<'_>) -> Option<String> {
+fn rejection(action: AuthAction<'_>) -> Option<String> {
     match action {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Some(
             "a connection reaches its own database and no other file: `ATTACH`, `DETACH` and `VACUUM` are refused"
@@ -1054,10 +1054,10 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
         "timediff" => 0..2,
         _ => 0..1,
     };
-    let refuse = |why: String| Err(rusqlite::Error::UserFunctionError(why.into()));
+    let refuse = |reason: String| Err(rusqlite::Error::UserFunctionError(reason.into()));
     if ctx.len() < times.end {
         return refuse(format!(
-            "{REFUSED}`{name}` with no time reads the clock: bind the time as a parameter"
+            "{REJECTED}`{name}` with no time reads the clock: bind the time as a parameter"
         ));
     }
     let args: Vec<Scalar> = (0..ctx.len())
@@ -1074,19 +1074,19 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
             let word = text.trim().to_ascii_lowercase();
             if word == "now" {
                 return refuse(format!(
-                    "{REFUSED}`{name}` of `now` reads the clock: bind the time as a parameter"
+                    "{REJECTED}`{name}` of `now` reads the clock: bind the time as a parameter"
                 ));
             }
             if word == "localtime" || word == "utc" {
                 return refuse(format!(
-                    "{REFUSED}`{name}` with `{word}` reads the machine's time zone: convert with `std.tz` and bind the result"
+                    "{REJECTED}`{name}` with `{word}` reads the machine's time zone: convert with `std.tz` and bind the result"
                 ));
             }
         }
     }
     UNGUARDED.with(|unguarded| {
         let Some(conn) = unguarded else {
-            return refuse(format!("{REFUSED}`{name}` could not be answered"));
+            return refuse(format!("{REJECTED}`{name}` could not be answered"));
         };
         let holes: Vec<String> = (1..=args.len()).map(|i| format!("?{i}")).collect();
         let mut stmt = conn.prepare_cached(&format!("SELECT {name}({})", holes.join(", ")))?;

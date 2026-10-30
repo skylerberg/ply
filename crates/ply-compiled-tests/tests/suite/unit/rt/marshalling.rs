@@ -7,7 +7,7 @@ use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyType};
 use ply_compiled::heap::{Word, imm, word_at};
-use ply_compiled::native::Answered;
+use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
 use ply_core::codec::{Writer, fun, shown, tag};
 use ply_core::float::bits;
@@ -262,17 +262,17 @@ fn the_natives_read_what_the_codec_writes() {
 /// which.
 #[test]
 fn a_descriptors_refusal_fails_the_entry() {
-    for (refusal, said) in [
+    for (rejection, said) in [
         ("rt_never_lifted", "lifts only a `String`"),
         ("rt_never_shown", "does not lower it"),
     ] {
         let mut ctx = context();
         ctx.begin();
-        let refused: unsafe extern "C" fn(*mut Ctx) = helper(refusal);
-        unsafe { refused(&mut ctx) };
-        assert_ne!(ctx.failed, 0, "{refusal} refused nothing");
-        let why = format!("{:?}", ctx.take_failure());
-        assert!(why.contains(said), "{why}");
+        let rejected: unsafe extern "C" fn(*mut Ctx) = helper(rejection);
+        unsafe { rejected(&mut ctx) };
+        assert_ne!(ctx.failed, 0, "{rejection} refused nothing");
+        let reason = format!("{:?}", ctx.take_failure());
+        assert!(reason.contains(said), "{reason}");
         ctx.end();
     }
 }
@@ -280,8 +280,8 @@ fn a_descriptors_refusal_fails_the_entry() {
 /// Asserts the context did not fail, saying why where it did.
 pub fn unfailed(ctx: &mut Ctx) {
     let failed = ctx.failed;
-    let why = ctx.take_failure();
-    assert_eq!(failed, 0, "{why:?}");
+    let reason = ctx.take_failure();
+    assert_eq!(failed, 0, "{reason:?}");
 }
 
 fn lift_and(bytes: &[u8], read: impl FnOnce(*mut Ctx)) -> String {
@@ -499,7 +499,7 @@ fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
     let mut w = Writer::new();
     w.count(tag::LIST, 3);
     w.handle(shown::SEALED);
-    w.handle(shown::HOLD);
+    w.handle(shown::SCOPED);
     w.count(tag::RECORD, 2);
     w.name(b"first");
     w.int(40);
@@ -571,7 +571,7 @@ fn taken_bytes_are_copied_out_at_their_count_alone() {
 #[test]
 fn handed_words_are_the_words_compiled_code_passes() {
     assert_eq!(
-        unsafe { std::mem::transmute::<Handed, Word>(<Handed as Answered>::of(5)) },
+        unsafe { std::mem::transmute::<Handed, Word>(<Handed as Returned>::of(5)) },
         5
     );
 }

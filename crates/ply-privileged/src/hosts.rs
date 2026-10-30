@@ -125,7 +125,7 @@ impl Hosts {
         if !handshakes.is_empty() {
             report("handshakes", &|w| {
                 w.count(handshakes.completed)
-                    .count(handshakes.refused)
+                    .count(handshakes.rejected)
                     .list(handshakes.reasons.iter(), |w, (reason, n)| {
                         w.str(reason).count(*n);
                     });

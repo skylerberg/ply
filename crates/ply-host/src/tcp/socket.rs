@@ -1,6 +1,6 @@
 //! The socket table over TCP and Unix sockets, plaintext or TLS, and datagram sockets.
 
-use super::wire::{self, Credentials, Endpoint, Probing, Refusal, SocketOption};
+use super::wire::{self, Credentials, Endpoint, Probing, NetError, SocketOption};
 use super::{
     Handles, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener, not_a_stream,
     not_upgradable, unknown_handle,
@@ -407,7 +407,7 @@ impl TcpHost {
 
     /// A listener at exactly `to`, with `options` set before the bind: its handle, or why not.
     pub fn listen_on(&self, label: &str, to: &Endpoint, options: &[SocketOption]) -> Vec<u8> {
-        wire::answer(bound(to, options).map(|listener| {
+        wire::result(bound(to, options).map(|listener| {
             let handle = self.sockets.insert(
                 Some(label),
                 Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
@@ -427,7 +427,7 @@ impl TcpHost {
         span: Span,
     ) -> Result<Vec<u8>, Diagnostic> {
         let path = self.unix_path("`net.listen_unix`", root, path, span)?;
-        Ok(wire::answer(match UnixListener::bind(&path) {
+        Ok(wire::result(match UnixListener::bind(&path) {
             Ok(listener) => {
                 let handle = self.sockets.insert(
                     Some(label),
@@ -435,7 +435,7 @@ impl TcpHost {
                 );
                 Ok(int(handle).to_vec())
             }
-            Err(e) => Err(Refusal::of(&e)),
+            Err(e) => Err(NetError::of(&e)),
         }))
     }
 
@@ -447,7 +447,7 @@ impl TcpHost {
         _path: &str,
         _span: Span,
     ) -> Result<Vec<u8>, Diagnostic> {
-        Ok(wire::answer(Err(no_unix_sockets())))
+        Ok(wire::result(Err(no_unix_sockets())))
     }
 
     /// A connection to `host`, its resolution and each address it resolves to tried in turn on the
@@ -494,7 +494,7 @@ impl TcpHost {
         let presenting = Arc::clone(&self.presenting);
         let label = label.to_string();
         Box::new(move || {
-            Ok(wire::answer(reach_to(&to, &options, timeout).map(
+            Ok(wire::result(reach_to(&to, &options, timeout).map(
                 |stream| {
                     let handle =
                         sockets.insert(Some(&label), Socket::Stream(Plain::Tcp(Arc::new(stream))));
@@ -522,7 +522,7 @@ impl TcpHost {
         let sockets = Arc::clone(&self.sockets);
         let label = label.to_string();
         Ok(Box::new(move || {
-            Ok(wire::answer(reach_unix(&path, timeout).map(|stream| {
+            Ok(wire::result(reach_unix(&path, timeout).map(|stream| {
                 let handle =
                     sockets.insert(Some(&label), Socket::Stream(Plain::Unix(Arc::new(stream))));
                 int(handle).to_vec()
@@ -539,7 +539,7 @@ impl TcpHost {
         _timeout: Duration,
         _span: Span,
     ) -> Result<Job, Diagnostic> {
-        Ok(Box::new(|| Ok(wire::answer(Err(no_unix_sockets())))))
+        Ok(Box::new(|| Ok(wire::result(Err(no_unix_sockets())))))
     }
 
     /// The TLS handshake, completed now rather than when a request needs it: the microseconds it
@@ -575,11 +575,11 @@ impl TcpHost {
     ) -> Result<Job, Diagnostic> {
         let server = ServerName::try_from(name.to_string());
         let early = if upgrade.unread > 0 {
-            Some((tls::REASON_INJECTED, Refusal::Injected))
+            Some((tls::REASON_INJECTED, NetError::Injected))
         } else if server.is_err() {
             Some((
                 tls::REASON_NAME,
-                Refusal::Handshake(tls::REASON_NAME.to_string()),
+                NetError::Handshake(tls::REASON_NAME.to_string()),
             ))
         } else {
             None
@@ -599,22 +599,22 @@ impl TcpHost {
                         (None, Ok(server)) => {
                             tls::Session::connect(config, server, stream, handshakes)
                         }
-                        (reason, _) => tls::Session::refused(
+                        (reason, _) => tls::Session::rejected(
                             stream,
                             handshakes,
                             reason.unwrap_or(tls::REASON_NAME),
                         ),
                     })
                 })?;
-        if let Some((_, refusal)) = early {
-            return Ok(Box::new(move || Ok(wire::answer(Err(refusal)))));
+        if let Some((_, rejection)) = early {
+            return Ok(Box::new(move || Ok(wire::result(Err(rejection)))));
         }
         Ok(Box::new(move || {
             if tls::plaintext_waiting(&stream) {
                 session.refuse(tls::REASON_INJECTED);
-                return Ok(wire::answer(Err(Refusal::Injected)));
+                return Ok(wire::result(Err(NetError::Injected)));
             }
-            Ok(settled(&session, upgrade.timeout))
+            Ok(finished(&session, upgrade.timeout))
         }))
     }
 
@@ -637,15 +637,15 @@ impl TcpHost {
             self.sockets
                 .upgraded("`net.serve_tls`", conn, label, span, move |stream| {
                     Arc::new(if injected {
-                        tls::Session::refused(stream, handshakes, tls::REASON_INJECTED)
+                        tls::Session::rejected(stream, handshakes, tls::REASON_INJECTED)
                     } else {
                         tls::Session::new(config, stream, handshakes)
                     })
                 })?;
         if injected {
-            return Ok(Box::new(|| Ok(wire::answer(Err(Refusal::Injected)))));
+            return Ok(Box::new(|| Ok(wire::result(Err(NetError::Injected)))));
         }
-        Ok(Box::new(move || Ok(settled(&session, upgrade.timeout))))
+        Ok(Box::new(move || Ok(finished(&session, upgrade.timeout))))
     }
 
     /// The next connection a listener takes, as its handle; `0` once the run has stopped
@@ -803,13 +803,13 @@ impl TcpHost {
         span: Span,
     ) -> Result<Vec<u8>, Diagnostic> {
         let set = self.described(socket, label, span, |sock| match raw_of(sock) {
-            Some(raw) => apply(&raw, &option).map_err(|e| Refusal::of(&e)),
-            None => Err(Refusal::Reset),
+            Some(raw) => apply(&raw, &option).map_err(|e| NetError::of(&e)),
+            None => Err(NetError::Reset),
         })?;
         if let (Ok(()), SocketOption::Presenting(name)) = (&set, &option) {
             lock(&self.presenting).insert(socket, name.clone());
         }
-        Ok(wire::answer(set.map(|()| Vec::new())))
+        Ok(wire::result(set.map(|()| Vec::new())))
     }
 
     /// The port this end of a socket is bound to; `None` for a listener the drain has closed.
@@ -903,14 +903,14 @@ fn presented(options: &[SocketOption]) -> Option<String> {
 
 /// The handshake of an upgrade, completed within its deadline: the protocol agreed found, or why
 /// not.
-fn settled(session: &tls::Session, timeout: Duration) -> Vec<u8> {
-    let outcome = session.settle_within(timeout).map_err(|why| match why {
-        tls::Unsettled::Expired => Refusal::TimedOut,
-        tls::Unsettled::Refused(tls::REASON_CERTIFICATE) => Refusal::Untrusted,
-        tls::Unsettled::Refused(tls::REASON_GONE) => Refusal::Reset,
-        tls::Unsettled::Refused(reason) => Refusal::Handshake(reason.to_string()),
+fn finished(session: &tls::Session, timeout: Duration) -> Vec<u8> {
+    let outcome = session.finish_within(timeout).map_err(|reason| match reason {
+        tls::Unfinished::Expired => NetError::TimedOut,
+        tls::Unfinished::Rejected(tls::REASON_CERTIFICATE) => NetError::Untrusted,
+        tls::Unfinished::Rejected(tls::REASON_GONE) => NetError::Reset,
+        tls::Unfinished::Rejected(reason) => NetError::Handshake(reason.to_string()),
     });
-    wire::answer(outcome.map(found))
+    wire::result(outcome.map(found))
 }
 
 /// The next connection a listener takes, as its handle; `0` once the run has stopped accepting or
@@ -1047,66 +1047,66 @@ fn reach_to(
     to: &Endpoint,
     options: &[SocketOption],
     timeout: Duration,
-) -> Result<TcpStream, Refusal> {
+) -> Result<TcpStream, NetError> {
     let address = to.socket_addr()?;
-    let refusal = |e: io::Error| Refusal::of(&e);
+    let rejection = |e: io::Error| NetError::of(&e);
     let socket = RawSocket::new(
         Domain::for_address(address),
         Type::STREAM,
         Some(Protocol::TCP),
     )
-    .map_err(refusal)?;
-    socket.set_tcp_nodelay(true).map_err(refusal)?;
+    .map_err(rejection)?;
+    socket.set_tcp_nodelay(true).map_err(rejection)?;
     for option in options {
-        apply(&socket, option).map_err(refusal)?;
+        apply(&socket, option).map_err(rejection)?;
     }
     socket
         .connect_timeout(&SockAddr::from(address), timeout)
-        .map_err(refusal)?;
+        .map_err(rejection)?;
     Ok(socket.into())
 }
 
 #[cfg(unix)]
-fn reach_unix(path: &Path, timeout: Duration) -> Result<UnixStream, Refusal> {
-    let refusal = |e: io::Error| Refusal::of(&e);
-    let address = SockAddr::unix(path).map_err(refusal)?;
-    let socket = RawSocket::new(Domain::UNIX, Type::STREAM, None).map_err(refusal)?;
+fn reach_unix(path: &Path, timeout: Duration) -> Result<UnixStream, NetError> {
+    let rejection = |e: io::Error| NetError::of(&e);
+    let address = SockAddr::unix(path).map_err(rejection)?;
+    let socket = RawSocket::new(Domain::UNIX, Type::STREAM, None).map_err(rejection)?;
     // Linux polls a non-blocking connect to a full queue as ready; a blocking one waits this out.
-    socket.set_write_timeout(Some(timeout)).map_err(refusal)?;
+    socket.set_write_timeout(Some(timeout)).map_err(rejection)?;
     socket.connect(&address).map_err(|e| {
         // Nothing at the path is nothing listening there.
         if e.kind() == io::ErrorKind::NotFound {
-            Refusal::Refused
+            NetError::Rejected
         } else {
-            Refusal::of(&e)
+            NetError::of(&e)
         }
     })?;
     Ok(socket.into())
 }
 
 #[cfg(not(unix))]
-fn no_unix_sockets() -> Refusal {
-    Refusal::Other(0, "this platform has no Unix sockets".to_string())
+fn no_unix_sockets() -> NetError {
+    NetError::Other(0, "this platform has no Unix sockets".to_string())
 }
 
 /// A listener at `to` with `options` set before the bind, which is when the reuse options count.
 /// An address is reused as `std`'s own listener reuses it unless an option says otherwise.
-fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, Refusal> {
+fn bound(to: &Endpoint, options: &[SocketOption]) -> Result<TcpListener, NetError> {
     let address = to.socket_addr()?;
-    let refusal = |e: io::Error| Refusal::of(&e);
+    let rejection = |e: io::Error| NetError::of(&e);
     let socket = RawSocket::new(
         Domain::for_address(address),
         Type::STREAM,
         Some(Protocol::TCP),
     )
-    .map_err(refusal)?;
+    .map_err(rejection)?;
     #[cfg(unix)]
-    socket.set_reuse_address(true).map_err(refusal)?;
+    socket.set_reuse_address(true).map_err(rejection)?;
     for option in options {
-        apply(&socket, option).map_err(refusal)?;
+        apply(&socket, option).map_err(rejection)?;
     }
-    socket.bind(&SockAddr::from(address)).map_err(refusal)?;
-    socket.listen(BACKLOG).map_err(refusal)?;
+    socket.bind(&SockAddr::from(address)).map_err(rejection)?;
+    socket.listen(BACKLOG).map_err(rejection)?;
     Ok(socket.into())
 }
 

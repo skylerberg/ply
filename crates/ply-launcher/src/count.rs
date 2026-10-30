@@ -231,7 +231,7 @@ pub fn window_sampled<R>(
     SAMPLE.store(every, Ordering::Relaxed);
     ATTRIBUTE.store(every >= 1, Ordering::Relaxed);
     ON.store(true, Ordering::Relaxed);
-    let answer = f();
+    let result = f();
     ON.store(false, Ordering::Relaxed);
     ATTRIBUTE.store(false, Ordering::Relaxed);
     // Every attribution that was counted has announced itself, so waiting them out makes the rows
@@ -244,7 +244,7 @@ pub fn window_sampled<R>(
         bytes: BYTES.load(Ordering::Relaxed),
     };
     let sites = SITES.lock().map(|sites| sites.clone()).unwrap_or_default();
-    (answer, counted, sites)
+    (result, counted, sites)
 }
 
 /// What a run asked to be told about its allocations, taken out of the line before the program

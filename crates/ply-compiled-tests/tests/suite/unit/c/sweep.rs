@@ -1,5 +1,5 @@
 use ply_compiled::c::sweep::{
-    ANSWERED, BEGUN, REUSED, STAMP, STORES, USED, claim, due, finished, sweep, sweep_stages, used,
+    RETURNED, BEGUN, REUSED, STAMP, STORES, USED, claim, due, finished, sweep, sweep_stages, used,
 };
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -242,7 +242,7 @@ fn stage(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
 
 /// A cached front of `size` bytes under the stage-directory entry `under`, last used `ago` before
 /// `now`.
-fn filed(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago: Duration) {
+fn cache_file(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago: Duration) {
     let dir = root.join(under);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(name), vec![b'x'; size]).unwrap();
@@ -251,7 +251,7 @@ fn filed(root: &Path, under: &str, name: &str, size: usize, now: SystemTime, ago
 
 /// An opened artifact's cached front.
 fn front(root: &Path, name: &str, size: usize, now: SystemTime, ago: Duration) {
-    filed(root, ANSWERED, name, size, now, ago);
+    cache_file(root, RETURNED, name, size, now, ago);
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -264,7 +264,7 @@ fn a_stage_directory_inside_its_budget_is_left_alone() {
     front(root.path(), "front.a", 100, now, 5 * HOUR);
     assert_eq!(sweep_stages(root.path(), 1_000, now), 0);
     assert!(root.path().join("stage-a").exists());
-    assert!(root.path().join(ANSWERED).join("front.a").exists());
+    assert!(root.path().join(RETURNED).join("front.a").exists());
 }
 
 /// A stage goes whole and a front goes on its own, least recently used first, and whatever a run
@@ -284,8 +284,8 @@ fn stages_and_fronts_go_least_recently_used_first() {
         .map(|n| root.path().join(n).exists())
         .collect();
     assert_eq!(left, vec![false, false, true]);
-    assert!(!root.path().join(ANSWERED).join("front.oldest").exists());
-    assert!(root.path().join(ANSWERED).join("front.fresh").exists());
+    assert!(!root.path().join(RETURNED).join("front.oldest").exists());
+    assert!(root.path().join(RETURNED).join("front.fresh").exists());
 }
 
 /// A stage is written once and used by every run after, so its use, not its writing, is its age.
@@ -352,7 +352,7 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
     std::fs::write(root.path().join(STAMP), vec![b'x'; 100]).unwrap();
     set(&root.path().join(STAMP), now - 5 * HOUR);
     sweep_stages(root.path(), 0, now);
-    assert!(root.path().join(ANSWERED).join("front.1234.tmp").exists());
+    assert!(root.path().join(RETURNED).join("front.1234.tmp").exists());
     assert!(root.path().join(STAMP).exists());
 }
 
@@ -362,17 +362,17 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
 fn a_reused_answer_goes_on_its_own_least_recently_used_first() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
-    filed(root.path(), REUSED, "old", 100, now, 6 * HOUR);
+    cache_file(root.path(), REUSED, "old", 100, now, 6 * HOUR);
     front(root.path(), "front.mid", 100, now, 4 * HOUR);
     stage(root.path(), "stage-a", 100, now, 2 * HOUR);
-    filed(root.path(), REUSED, "fresh", 100, now, HOUR / 4);
+    cache_file(root.path(), REUSED, "fresh", 100, now, HOUR / 4);
     assert_eq!(sweep_stages(root.path(), 250, now), 200);
     let reused = root.path().join(REUSED);
     assert!(
         !reused.join("old").exists(),
         "the answer used longest ago goes first"
     );
-    assert!(!root.path().join(ANSWERED).join("front.mid").exists());
+    assert!(!root.path().join(RETURNED).join("front.mid").exists());
     assert!(
         root.path().join("stage-a").exists(),
         "the rest fits once two have gone"
@@ -389,8 +389,8 @@ fn a_reused_answer_goes_on_its_own_least_recently_used_first() {
 fn a_reused_answer_being_written_is_never_swept() {
     let root = tempfile::tempdir().unwrap();
     let now = SystemTime::now();
-    filed(root.path(), REUSED, "k.1234.0.tmp", 100, now, 5 * HOUR);
-    filed(root.path(), REUSED, "k", 100, now, 5 * HOUR);
+    cache_file(root.path(), REUSED, "k.1234.0.tmp", 100, now, 5 * HOUR);
+    cache_file(root.path(), REUSED, "k", 100, now, 5 * HOUR);
     assert_eq!(sweep_stages(root.path(), 0, now), 100);
     let reused = root.path().join(REUSED);
     assert!(reused.join("k.1234.0.tmp").exists());

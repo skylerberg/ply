@@ -99,7 +99,7 @@ fn op(params: &'static Params) -> PlyOp {
     PlyOp {
         effect: 0,
         op: 1,
-        answer: &raw const TEXT_T,
+        result: &raw const TEXT_T,
         own: 0,
         params_len: 1,
         params: params.0.as_ptr(),
@@ -111,8 +111,8 @@ fn op(params: &'static Params) -> PlyOp {
 /// A perform through the bridge, as emitted code performs through it where nothing between answers.
 fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
     let entry = BRIDGE.slot.entry;
-    let answer = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
-    unsafe { std::mem::transmute::<Handed, Word>(answer) }
+    let result = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
+    unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
 
 #[test]
@@ -272,8 +272,8 @@ fn a_bracket_of_emitted_closures_cleans_up_what_it_acquired_and_lets_every_closu
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
-    let answer = bracket(&mut ctx, &ACQUIRE);
-    assert_eq!((answer, ctx.failed), (7, 0));
+    let result = bracket(&mut ctx, &ACQUIRE);
+    assert_eq!((result, ctx.failed), (7, 0));
     assert_eq!(CLEANED.with(Cell::get), 5);
     assert_eq!(ctx.heap.live(), 0);
     ctx.end();
@@ -289,8 +289,8 @@ fn a_bracket_cleans_up_after_a_body_that_unwinds() {
     let mut ctx = context();
     ctx.begin();
     CLEANED.with(|c| c.set(0));
-    let answer = bracket(&mut ctx, &ACQUIRE_SIX);
-    assert_eq!((answer, ctx.failed), (0, FAILED_TARGET));
+    let result = bracket(&mut ctx, &ACQUIRE_SIX);
+    assert_eq!((result, ctx.failed), (0, FAILED_TARGET));
     assert_eq!(CLEANED.with(Cell::get), 6);
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
@@ -334,7 +334,7 @@ fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
     ctx.begin();
     LIFTED.with(|l| l.borrow_mut().clear());
     let label = unsafe { helper::<LabelString>("rt_label_string")(&mut ctx, 3, &STRING_T) };
-    super::crossing::unfailed(&mut ctx);
+    super::marshalling::unfailed(&mut ctx);
     assert_eq!(LIFTED.with(|l| l.borrow().clone()), "files");
     unsafe { box_dec(&mut ctx, label) };
     assert_eq!(ctx.heap.live(), 0, "the label was not let go");

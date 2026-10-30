@@ -140,16 +140,16 @@ fn a_malformed_pem_a_certificate_free_file_and_a_key_free_file_are_each_refused(
     let material = material();
 
     let garbage = material.write("garbage.pem", "-----BEGIN CERTIFICATE-----\nnot base64!\n");
-    let refused = one(load(CredentialSpec {
+    let rejected = one(load(CredentialSpec {
         name: "api".to_string(),
         certificate: garbage.clone(),
         key: material.key.clone(),
     }));
-    assert_eq!(refused.code, codes::TLS_CREDENTIAL_INVALID);
+    assert_eq!(rejected.code, codes::TLS_CREDENTIAL_INVALID);
     assert!(
-        refused.message.contains("garbage.pem"),
+        rejected.message.contains("garbage.pem"),
         "{}",
-        refused.message
+        rejected.message
     );
 
     // Valid PEM, wrong contents: the key file offered where a chain was wanted.
@@ -270,7 +270,7 @@ fn shaken(
 }
 
 /// The error a handshake between the two ends with, whichever end refused.
-fn refusal(server: &Arc<ServerConfig>, client: &Arc<ClientConfig>, name: &str) -> TlsError {
+fn rejection(server: &Arc<ServerConfig>, client: &Arc<ClientConfig>, name: &str) -> TlsError {
     let (mut s, mut c) = ends(server, client, name);
     for _ in 0..8 {
         if let Err(e) = passed(&mut c, &mut s).and_then(|()| passed(&mut s, &mut c)) {
@@ -427,12 +427,12 @@ fn a_listener_that_requires_a_client_certificate_refuses_a_client_without_one() 
             .and_then(|chain| chain.first().cloned()),
         Some(der_of(&caller))
     );
-    let refused = refusal(
+    let rejected = rejection(
         credential.config(),
         &client_trusting(&[&served], None),
         "localhost",
     );
-    assert_eq!(refused, TlsError::NoCertificatesPresented);
+    assert_eq!(rejected, TlsError::NoCertificatesPresented);
 }
 
 #[test]
@@ -683,9 +683,9 @@ fn speak(
         let mut stream = StreamOwned::new(connection, socket);
         stream.write_all(REQUEST)?;
         stream.flush()?;
-        let mut answer = vec![0u8; read_back];
-        stream.read_exact(&mut answer)?;
-        Ok(answer)
+        let mut result = vec![0u8; read_back];
+        stream.read_exact(&mut result)?;
+        Ok(result)
     })
 }
 
@@ -720,7 +720,7 @@ fn a_request_over_tls_reads_and_writes_the_same_bytes_the_plaintext_path_would()
 
     let counts = peer.handshakes.snapshot();
     assert_eq!(counts.completed, 1);
-    assert_eq!(counts.refused, 0);
+    assert_eq!(counts.rejected, 0);
     assert!(counts.reasons.is_empty());
 
     session.close();
@@ -733,7 +733,7 @@ fn a_request_over_tls_reads_and_writes_the_same_bytes_the_plaintext_path_would()
 fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
     let material = material();
     let peer = peer(&material);
-    let refused = speak(peer.port(), material.der.clone(), vec!["h2".to_string()], 0);
+    let rejected = speak(peer.port(), material.der.clone(), vec!["h2".to_string()], 0);
 
     let session = peer.accept();
     assert_eq!(
@@ -741,10 +741,10 @@ fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
         Some(Vec::new()),
         "a refused handshake reads as end of stream"
     );
-    assert!(refused.join().expect("the client finished").is_err());
+    assert!(rejected.join().expect("the client finished").is_err());
 
     let counts = peer.handshakes.snapshot();
-    assert_eq!(counts.refused, 1);
+    assert_eq!(counts.rejected, 1);
     assert_eq!(counts.completed, 0);
     assert_eq!(counts.reasons, [(REASON_ALPN, 1)]);
 
@@ -793,7 +793,7 @@ fn a_peer_that_does_not_speak_tls_closes_that_connection_and_nothing_else() {
     plaintext.join().expect("the peer finished");
 
     let counts = peer.handshakes.snapshot();
-    assert_eq!(counts.refused, 1);
+    assert_eq!(counts.rejected, 1);
     assert_eq!(counts.reasons, [(REASON_NOT_TLS, 1)]);
 }
 
@@ -812,7 +812,7 @@ fn a_client_that_disconnects_mid_handshake_is_counted_as_the_peer_going_away() {
     gone.join().expect("the peer finished");
 
     let counts = peer.handshakes.snapshot();
-    assert_eq!(counts.refused, 1);
+    assert_eq!(counts.rejected, 1);
     assert_eq!(counts.reasons, [(REASON_GONE, 1)]);
 }
 
@@ -834,9 +834,9 @@ fn a_read_deadline_answers_none_and_leaves_the_session_open() {
         std::thread::sleep(std::time::Duration::from_millis(300));
         stream.write_all(REQUEST).expect("the request is written");
         stream.flush().expect("the request is flushed");
-        let mut answer = vec![0u8; RESPONSE.len()];
-        stream.read_exact(&mut answer).expect("a response");
-        answer
+        let mut result = vec![0u8; RESPONSE.len()];
+        stream.read_exact(&mut result).expect("a response");
+        result
     });
 
     let session = peer.accept();
@@ -855,7 +855,7 @@ fn a_read_deadline_answers_none_and_leaves_the_session_open() {
     assert_eq!(request, REQUEST);
     assert_eq!(session.write(RESPONSE), RESPONSE.len());
     assert_eq!(client.join().expect("the client finished"), RESPONSE);
-    assert_eq!(peer.handshakes.snapshot().refused, 0);
+    assert_eq!(peer.handshakes.snapshot().rejected, 0);
 }
 
 /// A security property: they key a run-long map, and rustls's error text embeds peer-chosen values.
@@ -910,11 +910,11 @@ fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
 fn the_reasons_are_reported_most_frequent_first_and_then_alphabetically() {
     let handshakes = Handshakes::default();
     for reason in [REASON_NOT_TLS, REASON_ALPN, REASON_NOT_TLS, REASON_GONE] {
-        handshakes.refused(reason);
+        handshakes.rejected(reason);
     }
     handshakes.completed();
     let counts = handshakes.snapshot();
-    assert_eq!(counts.refused, 4);
+    assert_eq!(counts.rejected, 4);
     assert_eq!(counts.completed, 1);
     assert_eq!(
         counts.reasons,

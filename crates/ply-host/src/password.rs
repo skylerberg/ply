@@ -408,10 +408,10 @@ fn narrow(n: i64) -> Result<u32, String> {
 
 /// The refusal of `what` (`kdf.argon2`, ..) asked for `why`, which ends the run where it was asked.
 #[cold]
-pub fn refused(what: &str, why: &str, span: Span) -> Diagnostic {
+pub fn rejected(what: &str, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{what} was asked for {why}"),
+        format!("{what} was asked for {reason}"),
     )
     .primary(span, "performed here")
     .note("the host bounds what one hash may cost before it starts one")

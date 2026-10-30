@@ -81,8 +81,8 @@ pub fn user_name(id: i64) -> Option<String> {
     unsafe {
         let mut entry: libc::passwd = std::mem::zeroed();
         let mut found: *mut libc::passwd = std::ptr::null_mut();
-        let answered = libc::getpwuid_r(id, &mut entry, text.as_mut_ptr(), text.len(), &mut found);
-        (answered == 0 && !found.is_null() && !entry.pw_name.is_null()).then(|| {
+        let returned = libc::getpwuid_r(id, &mut entry, text.as_mut_ptr(), text.len(), &mut found);
+        (returned == 0 && !found.is_null() && !entry.pw_name.is_null()).then(|| {
             std::ffi::CStr::from_ptr(entry.pw_name)
                 .to_string_lossy()
                 .into_owned()

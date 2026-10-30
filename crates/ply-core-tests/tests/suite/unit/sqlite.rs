@@ -24,7 +24,7 @@ fn done(engine: &mut Engine, sql: &str) -> Reply {
     reply
 }
 
-fn refused(engine: &mut Engine, sql: &str) -> Failure {
+fn rejected(engine: &mut Engine, sql: &str) -> Failure {
     let reply = run(engine, sql);
     reply
         .failure
@@ -32,7 +32,7 @@ fn refused(engine: &mut Engine, sql: &str) -> Failure {
 }
 
 fn kind(engine: &mut Engine, sql: &str) -> &'static str {
-    refused(engine, sql).kind
+    rejected(engine, sql).kind
 }
 
 fn text(s: &str) -> Scalar {
@@ -136,7 +136,7 @@ fn a_statement_cannot_reach_another_file() {
         "SELECT readfile('/etc/passwd')",
         "SELECT writefile('/tmp/ply-sqlite-escape', 'x')",
     ] {
-        let failure = refused(&mut engine, sql);
+        let failure = rejected(&mut engine, sql);
         assert!(
             failure.kind == "refused" || failure.kind == "statement",
             "{sql}: {failure:?}"
@@ -384,7 +384,7 @@ fn a_constraint_failure_says_its_kind_and_what_it_names() {
         ("INSERT INTO c (p, n) VALUES (9, 1)", "foreign_key", ""),
         ("INSERT INTO c (p, n) VALUES (1, 'many')", "datatype", "c.n"),
     ] {
-        let failure = refused(&mut engine, sql);
+        let failure = rejected(&mut engine, sql);
         assert_eq!(
             (failure.kind, failure.name.as_str()),
             (kind, name),

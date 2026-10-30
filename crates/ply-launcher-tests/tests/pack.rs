@@ -111,18 +111,18 @@ fn an_answer_is_the_frame_a_range_of_the_answers_file_holds() {
     .expect("the pack reads")
     .expect("the binary carries one");
     assert_eq!(
-        pack.answer("store", 0, one.len()),
+        pack.result("store", 0, one.len()),
         Some(b"one record".to_vec())
     );
     assert_eq!(
-        pack.answer("store", one.len(), two.len()),
+        pack.result("store", one.len(), two.len()),
         Some(b"another".to_vec())
     );
-    assert_eq!(pack.answer("index", 0, 0), Some(b"index".to_vec()));
+    assert_eq!(pack.result("index", 0, 0), Some(b"index".to_vec()));
     // Not where a frame starts, past the file, or no file at all.
-    assert_eq!(pack.answer("store", 1, one.len()), None);
-    assert_eq!(pack.answer("store", one.len(), two.len() + 1), None);
-    assert_eq!(pack.answer("records", 0, 0), None);
+    assert_eq!(pack.result("store", 1, one.len()), None);
+    assert_eq!(pack.result("store", one.len(), two.len() + 1), None);
+    assert_eq!(pack.result("records", 0, 0), None);
 }
 
 #[test]
@@ -234,6 +234,6 @@ fn a_table_out_of_order_is_refused() {
     data.extend_from_slice(&pack_len.to_le_bytes());
     data.extend_from_slice(&table_len.to_le_bytes());
     data.extend_from_slice(b"PLYPACK1");
-    let refused = read(&data).err().expect("an unsorted table is refused");
-    assert!(refused.contains("ascending"), "{refused}");
+    let rejected = read(&data).err().expect("an unsorted table is refused");
+    assert!(rejected.contains("ascending"), "{rejected}");
 }

@@ -4,11 +4,11 @@
 # suite as `ply test` runs it, the standard library's among them; the proof runs, the standard
 # library's (`proofs`) and each package's (`laws-<id>`), are a `ply prove` each. Each prints every
 # result to the log as it finishes, on standard error, and the report `--json` writes when it ends
-# is read for the rest. A run fails when a test fails or a claim does not hold, when the run refuses
+# is read for the rest. A run fails when a test fails or a claim does not hold, when it is rejected
 # or ends without a report, and when it selects no test or proves no claim, so a renamed test never
 # stops being run quietly; a part of the CLI's suite takes the tests whose keys hash to it, which may
-# be none. It fails too when its load ran a body again because a store had lost the answer its
-# record names, which is a run made cold by a defect and not by an edit.
+# be none. It fails too when its load ran a body again because a store had lost the result its
+# record names, which is a run made cold by a bug in Ply and not by an edit.
 #
 #   ci-ply.sh run ID [ARG...]
 #       the runs the job ID takes (`ci-shards.sh job-runs ID`), in turn, or one run, or one module
@@ -23,12 +23,12 @@
 #       `--shard K/N` or a case's `--filter` added
 #   ci-ply.sh mark                  the moment `keep` gathers from
 #   ci-ply.sh keep DIR              each store of kept records `ply` used since `mark`, the emitter's
-#                                   answers among them, whole into DIR for a later run: an answer is
+#                                   results among them, whole into DIR for a later run: a result is
 #                                   keyed by its definition, the emitter and the runtime's sources,
 #                                   so another tree reuses what still applies. Objects stay out: one
 #                                   compiles from its bodies in seconds. The stages are build-ply's
 #                                   to ship, and the packages' stores are carried apart.
-#   ci-ply.sh restore DIR           a kept DIR laid under what `ply` reads: each store in it
+#   ci-ply.sh restore DIR           a DIR from `keep` laid under what `ply` reads: each store in it
 #                                   replaces the one in place, and any other file is kept where one
 #                                   is there
 #   ci-ply.sh compact               each package's store a run since `mark` opened compacted, and
@@ -41,7 +41,7 @@
 #                                   artifact
 #   ci-ply.sh handed NAME           the artifact NAME, which a run of this toolchain packed with
 #                                   `hand`, as this job's stores: unpacked aside and laid only when
-#                                   whole, since a load fails over a store that lost an answer. Sets
+#                                   whole, since a load fails over a store that lost a result. Sets
 #                                   the step's `found`. Nothing found, or a download that failed,
 #                                   leaves the job to what a cache holds
 set -uo pipefail
@@ -100,7 +100,7 @@ bounded() {
 
 # What the run ID says once the deadline ended it, the milliseconds since STARTED into it.
 stopped_run() {
-  echo "::error::the run $2 was stopped at the job's deadline after $((($(now_ms) - $1) / 1000))s: what it finished is kept, and a re-run of this job starts from it"
+  echo "::error::the run $2 was stopped at the job's deadline after $((($(now_ms) - $1) / 1000))s: what it finished is cached, and a re-run of this job starts from it"
 }
 
 # Whether the run left a report at $1: a `ply` that crashed or was killed wrote none.
@@ -118,11 +118,11 @@ unreported() {
 }
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
-# directory of its own, which its harness empties before each test and refuses without the marker;
+# directory of its own, which its harness empties before each test and rejects without the marker;
 # the standard library's suites granted an emptied directory as the root `scratch`, marked as the
 # CLI's is, which the tests of its real handlers write under (`tests/std/scratch.ply`), and `sh`,
 # which reads back what `std.text` quotes for it; and any other package as `ply test` runs it,
-# granted nothing. The scratch root's path is the same every run, since a pass is kept for the
+# granted nothing. The scratch root's path is the same every run, since a pass is cached for the
 # binding it ran under.
 tested() {
   local path=$1 status=0 dir
@@ -145,8 +145,8 @@ tested() {
   return "$status"
 }
 
-# What a red run said: each failure's test and diagnostic, and a refused run's diagnostics, each with
-# its notes, which name what refused. The report itself is one line too long for a log to show.
+# What a red run said: each failed test and diagnostic, and a rejected run's diagnostics, each with
+# its notes, which name what was rejected. The report itself is one line too long for a log to show.
 red() {
   jq -r '
     (.failures[]? | ("FAILED \(.key // .name): \(.diagnostic.code // "") \(.diagnostic.message // "")",
@@ -176,12 +176,12 @@ summed() {
   jq -r '.summary // {} | "summary: \(.passed // 0) passed, \(.failed // 0) failed, \(.abandoned // 0) abandoned, \(.cached // 0) cached"' "$1" 2>/dev/null
 }
 
-# What a report's load took of the stores as kept, what it ran anew, and how many of those it ran
-# although their records stood, the answers they name being in no store. Nothing for a report no load
-# made: a kept answer's.
+# What a report's load took from the stores, what it ran anew, and how many of those it ran
+# although their records stood, the results they name being in no store. Nothing for a report no load
+# made: a cached result's.
 answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) answers taken, \([.front_end.queries[].run] | add // 0) run and \(.front_end.lost // 0) lost" else "" end)'
 
-# Whether a report's load lost an answer: none is lost over stores that are whole, whatever moved.
+# Whether a report's load lost a result: none is lost over stores that are whole, whatever moved.
 lost() {
   jq -s -e 'any(.[]; (.front_end.lost // 0) > 0)' "$1" > /dev/null 2>&1
 }
@@ -241,7 +241,7 @@ tests_of() {
     status=1
   fi
   if lost "$out"; then
-    echo "the run $id ran bodies again whose answers a store had kept and lost" >&2
+    echo "the run $id ran bodies again whose results a store had cached and lost" >&2
     status=1
   fi
   if [ "$status" -ne 0 ]; then
@@ -282,7 +282,7 @@ proofs_of() {
     status=1
   fi
   if lost "$out"; then
-    echo "the run $id ran bodies again whose answers a store had kept and lost" >&2
+    echo "the run $id ran bodies again whose results a store had cached and lost" >&2
     status=1
   fi
   if [ "$status" -ne 0 ]; then
@@ -293,7 +293,7 @@ proofs_of() {
   rm -f "$out"
 }
 
-# What a red proof run said: each claim nothing proved, how and where, and a refused run's
+# What a red proof run said: each claim nothing proved, how and where, and a rejected run's
 # diagnostics.
 disproved() {
   jq -r '
@@ -318,7 +318,7 @@ store_dirs() {
   done | LC_ALL=C sort -u
 }
 
-# The stores of kept records, the emitter's answers among them, each a directory `sweep` takes whole
+# Stores of cached records, the emitter's results among them, each a directory `sweep` takes whole
 # (its `STORES`).
 # shellcheck disable=SC2100 # `ci-shards.sh verify` reads this line as written.
 stores=ply-c-cache/bodies
@@ -416,7 +416,7 @@ case "${1:-}" in
   restore)
     dir=${2:?a directory}
     [ -d "$dir" ] || exit 0
-    # A kept store replaces the one in place whole: it grew from it, and the segments of two
+    # A saved store replaces the one in place whole: it grew from it, and the segments of two
     # manifests do not mix file by file.
     for store in "$dir/$stores"/*/; do
       [ -d "$store" ] && rm -rf "${caches:?}/$stores/$(basename "$store")"
@@ -431,7 +431,7 @@ case "${1:-}" in
       # than the mark in was opened by no run of this job.
       if [ -z "$(find "$dir/.ply-cache" -newer "$mark" -print -quit)" ]; then
         rm -rf "$dir/.ply-cache"
-        echo "=== ${dir#"$root"/}: opened by no run of this job, and not kept"
+        echo "=== ${dir#"$root"/}: opened by no run of this job, and removed"
         continue
       fi
       echo "=== ${dir#"$root"/}"
@@ -444,7 +444,7 @@ case "${1:-}" in
     for dir in $(store_dirs); do
       [ -d "$dir/.ply-cache" ] && kept+=("${dir#"$root"/}/.ply-cache")
     done
-    [ "${#kept[@]}" -gt 0 ] || { echo "this job keeps no store"; exit 0; }
+    [ "${#kept[@]}" -gt 0 ] || { echo "this job has no store"; exit 0; }
     tar -cf - -C "$root" "${kept[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
     echo "packed ${#kept[@]} stores, $(du -sh "$file" | cut -f1): ${kept[*]}"
     ;;

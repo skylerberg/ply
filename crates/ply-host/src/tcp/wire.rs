@@ -14,8 +14,8 @@ use std::time::Duration;
 
 /// A `std.net.Refusal`.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Refusal {
-    Refused,
+pub enum NetError {
+    Rejected,
     Unreachable,
     TimedOut,
     Reset,
@@ -28,21 +28,21 @@ pub enum Refusal {
     Other(i64, String),
 }
 
-impl Refusal {
-    pub fn of(error: &io::Error) -> Refusal {
+impl NetError {
+    pub fn of(error: &io::Error) -> NetError {
         use io::ErrorKind as Kind;
         match error.kind() {
-            Kind::ConnectionRefused => Refusal::Refused,
-            Kind::HostUnreachable | Kind::NetworkUnreachable => Refusal::Unreachable,
-            Kind::TimedOut | Kind::WouldBlock => Refusal::TimedOut,
+            Kind::ConnectionRefused => NetError::Rejected,
+            Kind::HostUnreachable | Kind::NetworkUnreachable => NetError::Unreachable,
+            Kind::TimedOut | Kind::WouldBlock => NetError::TimedOut,
             Kind::ConnectionReset
             | Kind::ConnectionAborted
             | Kind::BrokenPipe
             | Kind::NotConnected
-            | Kind::UnexpectedEof => Refusal::Reset,
-            Kind::AddrInUse => Refusal::AddressInUse,
-            Kind::PermissionDenied => Refusal::PermissionDenied,
-            _ => Refusal::Other(
+            | Kind::UnexpectedEof => NetError::Reset,
+            Kind::AddrInUse => NetError::AddressInUse,
+            Kind::PermissionDenied => NetError::PermissionDenied,
+            _ => NetError::Other(
                 i64::from(error.raw_os_error().unwrap_or(0)),
                 error.to_string(),
             ),
@@ -51,17 +51,17 @@ impl Refusal {
 
     pub fn written(&self) -> Vec<u8> {
         match self {
-            Refusal::Refused => vec![1],
-            Refusal::Unreachable => vec![2],
-            Refusal::TimedOut => vec![3],
-            Refusal::Reset => vec![4],
-            Refusal::NameNotFound => vec![5],
-            Refusal::AddressInUse => vec![6],
-            Refusal::PermissionDenied => vec![7],
-            Refusal::Injected => vec![8],
-            Refusal::Untrusted => vec![9],
-            Refusal::Handshake(why) => [&[10u8][..], why.as_bytes()].concat(),
-            Refusal::Other(code, text) => {
+            NetError::Rejected => vec![1],
+            NetError::Unreachable => vec![2],
+            NetError::TimedOut => vec![3],
+            NetError::Reset => vec![4],
+            NetError::NameNotFound => vec![5],
+            NetError::AddressInUse => vec![6],
+            NetError::PermissionDenied => vec![7],
+            NetError::Injected => vec![8],
+            NetError::Untrusted => vec![9],
+            NetError::Handshake(reason) => [&[10u8][..], reason.as_bytes()].concat(),
+            NetError::Other(code, text) => {
                 [&[11u8][..], &parts(&[&int(*code), text.as_bytes()])].concat()
             }
         }
@@ -69,10 +69,10 @@ impl Refusal {
 }
 
 /// `outcome` as an answer that may be refused.
-pub fn answer(outcome: Result<Vec<u8>, Refusal>) -> Vec<u8> {
+pub fn result(outcome: Result<Vec<u8>, NetError>) -> Vec<u8> {
     match outcome {
-        Ok(answered) => [&[1u8][..], &answered].concat(),
-        Err(refusal) => [&[0u8][..], &refusal.written()].concat(),
+        Ok(returned) => [&[1u8][..], &returned].concat(),
+        Err(rejection) => [&[0u8][..], &rejection.written()].concat(),
     }
 }
 
@@ -102,13 +102,13 @@ impl Endpoint {
 
     /// The address a socket call takes; a zone that names no interface of this machine is one
     /// nothing can be reached through.
-    pub fn socket_addr(&self) -> Result<SocketAddr, Refusal> {
+    pub fn socket_addr(&self) -> Result<SocketAddr, NetError> {
         match (self.ip, &self.zone) {
             (IpAddr::V4(ip), _) => Ok(SocketAddr::V4(SocketAddrV4::new(ip, self.port))),
             (IpAddr::V6(ip), None) => Ok(SocketAddr::V6(SocketAddrV6::new(ip, self.port, 0, 0))),
             (IpAddr::V6(ip), Some(zone)) => match zone_index(zone) {
                 Some(scope) => Ok(SocketAddr::V6(SocketAddrV6::new(ip, self.port, 0, scope))),
-                None => Err(Refusal::Other(
+                None => Err(NetError::Other(
                     0,
                     format!("`{zone}` names no interface of this machine"),
                 )),

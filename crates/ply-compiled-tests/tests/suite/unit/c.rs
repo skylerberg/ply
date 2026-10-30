@@ -24,9 +24,9 @@ fn a_natives_signature_is_its_functions_type() {
     use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
     use ply_compiled::native::{Native, Raises, Signature};
     use ply_compiled::rt::Ctx;
-    let of = |params: &'static [Machine], answer, raises| Signature {
+    let of = |params: &'static [Machine], result, raises| Signature {
         params,
-        answer,
+        result,
         raises,
     };
     assert_eq!(
@@ -91,7 +91,7 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
         .find(|n| n.name == "?out_str")
         .expect("`?out_str`");
     assert_eq!(out_str.signature.params, [Machine::Addr, Machine::I64]);
-    assert_eq!(out_str.signature.answer, None);
+    assert_eq!(out_str.signature.result, None);
 }
 
 /// What the runtime says of itself to a compiler is read off its own functions and structs: each
@@ -189,35 +189,35 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_n
     retired.helpers.push(HelperShape {
         name: "rt_retired".to_string(),
         args: 1,
-        answers: true,
+        results: true,
     });
-    let refused = retired
+    let rejected = retired
         .bound()
         .expect_err("a helper the runtime lacks is refused");
-    assert!(refused.to_string().contains("`rt_retired`"), "{refused}");
+    assert!(rejected.to_string().contains("`rt_retired`"), "{rejected}");
     let mut reshaped = units::exports_of(&[]);
     reshaped.helpers[0].args += 1;
-    let refused = reshaped
+    let rejected = reshaped
         .bound()
         .expect_err("a helper taking other words is not the one the unit was emitted against");
     assert!(
-        refused.to_string().contains(&reshaped.helpers[0].name),
-        "{refused}"
+        rejected.to_string().contains(&reshaped.helpers[0].name),
+        "{rejected}"
     );
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(loaded) = units::opened(dir.path(), &[], |e| {
         e.helpers.push(HelperShape {
             name: "rt_retired".to_string(),
             args: 1,
-            answers: true,
+            results: true,
         })
     }) else {
         return;
     };
-    let refused = loaded
+    let rejected = loaded
         .err()
         .expect("a unit that does not serve is not loaded");
-    assert!(refused.contains("`rt_retired`"), "{refused}");
+    assert!(rejected.contains("`rt_retired`"), "{rejected}");
 }
 
 #[test]
@@ -234,8 +234,8 @@ fn a_unit_compiles_loads_binds_and_answers() {
     let native = loaded.expect("the unit loads");
     assert_eq!(native.names(), ["m.probe"]);
     assert_eq!(native.arity("m.probe"), Some(2));
-    let answer = units::entered(&native, "m.probe", &[imm(20), imm(22)]).expect("it answers");
-    assert_eq!(imm_value(answer), 42);
+    let result = units::entered(&native, "m.probe", &[imm(20), imm(22)]).expect("it answers");
+    assert_eq!(imm_value(result), 42);
 }
 
 /// The prologue a body opens with: room asked for on the stack it runs on where its frame lies below
@@ -268,14 +268,14 @@ struct Unknown {
     ctx: *mut ply_compiled::rt::Ctx,
     entry: ply_compiled::rt::Entry,
     args: [ply_compiled::heap::Word; 1],
-    answer: ply_compiled::heap::Word,
+    result: ply_compiled::heap::Word,
     main: usize,
 }
 
 extern "C" fn enter_from_an_unknown_stack(arg: usize) {
     let u = arg as *mut Unknown;
     unsafe {
-        (*u).answer = ply_compiled::rt::on_known_stack((*u).ctx, || {
+        (*u).result = ply_compiled::rt::on_known_stack((*u).ctx, || {
             ((*u).entry)((*u).ctx, (*u).args.as_ptr())
         });
         let mut spent = 0;
@@ -296,20 +296,20 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
         ctx: &raw mut ctx,
         entry: native.entry("m.ladder").expect("`m.ladder` is taken"),
         args: [imm(DEEP)],
-        answer: 0,
+        result: 0,
         main: 0,
     };
     let u = &raw mut u;
     let unknown = ply_compiled::stack::Stack::take().expect("the system maps a stack");
     let sp = unknown.prepare(enter_from_an_unknown_stack, u as usize);
-    let answer = unsafe {
+    let result = unsafe {
         ply_compiled::stack::switch(&mut (*u).main, sp);
-        (*u).answer
+        (*u).result
     };
     let (failed, grown) = (ctx.failed, ctx.grown);
     let raised = ctx.take_failure().map(|d| d.message);
     ctx.end();
-    Some((imm_value(answer), grown, failed, raised))
+    Some((imm_value(result), grown, failed, raised))
 }
 
 /// A recursion past a stack's first chunk makes the stack writable further down and answers on
@@ -317,11 +317,11 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
 /// runtime knows no stack is given one of its own.
 #[test]
 fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_answers() {
-    let Some((answer, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
+    let Some((result, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
         return;
     };
     assert_eq!(failed, 0, "`m.ladder({DEEP})` raised: {raised:?}");
-    assert_eq!(answer, DEEP);
+    assert_eq!(result, DEEP);
     assert!(
         grown >= 2,
         "the call never crossed the floor twice: {grown}"

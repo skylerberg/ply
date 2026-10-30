@@ -14,7 +14,7 @@ use ply_core::codec::{self, Reader, Writer, fun, tag};
 use ply_core::{Escapee, escape};
 
 /// One crossing under way.
-pub(crate) enum Crossing {
+pub(crate) enum Marshalling {
     Lowering(Lowering),
     Lifting(Lifting),
 }
@@ -34,7 +34,7 @@ pub(crate) struct Lowering {
     resumes: bool,
     /// Whether this is an entry's answer, and the first handle of its run written into it, which
     /// the boundary refuses.
-    answers_entry: bool,
+    results_entry: bool,
     escaping: Option<escape::Handle>,
     /// Whether this is a value a diagnostic shows, which keeps nothing beside its bytes: a runtime
     /// object written as a handle at the position [`codec::shown`] gives what it is, and a carried
@@ -61,7 +61,7 @@ impl Lowering {
             shareables: 0,
             functions: false,
             resumes: false,
-            answers_entry: false,
+            results_entry: false,
             escaping: None,
             shown: false,
         }
@@ -113,10 +113,10 @@ impl Lifting {
 /// called a native outside the crossing it belongs to.
 #[cold]
 #[inline(never)]
-pub(crate) fn err_crossing(why: &str) -> Diagnostic {
+pub(crate) fn err_marshalling(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a value crossing between compiled code and the runtime: {why}"),
+        format!("a value crossing between compiled code and the runtime: {reason}"),
     )
     .primary(Span::DUMMY, "in compiled code")
     .note("this is Ply's fault, not the program's")
@@ -124,26 +124,26 @@ pub(crate) fn err_crossing(why: &str) -> Diagnostic {
 
 impl Ctx {
     fn lowering(&mut self) -> Result<&mut Lowering, i64> {
-        if !matches!(self.crossings.last(), Some(Crossing::Lowering(_))) {
-            return Err(self.fail(err_crossing("a value written with no lowering open")));
+        if !matches!(self.marshallings.last(), Some(Marshalling::Lowering(_))) {
+            return Err(self.fail(err_marshalling("a value written with no lowering open")));
         }
-        match self.crossings.last_mut() {
-            Some(Crossing::Lowering(l)) => Ok(l),
+        match self.marshallings.last_mut() {
+            Some(Marshalling::Lowering(l)) => Ok(l),
             _ => unreachable!("the innermost crossing is a lowering"),
         }
     }
 
     /// Whether the innermost crossing is a lowering of a value a diagnostic shows.
     fn showing(&self) -> bool {
-        matches!(self.crossings.last(), Some(Crossing::Lowering(l)) if l.shown)
+        matches!(self.marshallings.last(), Some(Marshalling::Lowering(l)) if l.shown)
     }
 
     fn lifting(&mut self) -> Result<&mut Lifting, i64> {
-        if !matches!(self.crossings.last(), Some(Crossing::Lifting(_))) {
-            return Err(self.fail(err_crossing("a value read with no lifting open")));
+        if !matches!(self.marshallings.last(), Some(Marshalling::Lifting(_))) {
+            return Err(self.fail(err_marshalling("a value read with no lifting open")));
         }
-        match self.crossings.last_mut() {
-            Some(Crossing::Lifting(l)) => Ok(l),
+        match self.marshallings.last_mut() {
+            Some(Marshalling::Lifting(l)) => Ok(l),
             _ => unreachable!("the innermost crossing is a lifting"),
         }
     }
@@ -154,8 +154,8 @@ impl Ctx {
             Ok(l) => read(l),
             Err(_) => return T::default(),
         };
-        r.unwrap_or_else(|why| {
-            self.fail(err_crossing(&why));
+        r.unwrap_or_else(|reason| {
+            self.fail(err_marshalling(&reason));
             T::default()
         })
     }
@@ -182,7 +182,7 @@ impl Ctx {
 ///
 /// # Safety
 /// `p` holds `n` bytes, or `n` is 0.
-pub(crate) unsafe fn lent<'a>(p: Addr, n: I64) -> &'a [u8] {
+pub(crate) unsafe fn borrowed<'a>(p: Addr, n: I64) -> &'a [u8] {
     if n.0 <= 0 {
         return &[];
     }
@@ -195,7 +195,7 @@ pub unsafe extern "C" fn rt_out_tag(ctx: *mut Ctx, t: I64) {
     match u8::try_from(t.0) {
         Ok(t @ (tag::UNIT | tag::FALSE | tag::TRUE)) => c.write(|l| l.w.tag(t)),
         _ => {
-            c.fail(err_crossing(&format!("tag {} is not a value alone", t.0)));
+            c.fail(err_marshalling(&format!("tag {} is not a value alone", t.0)));
         }
     }
 }
@@ -226,7 +226,7 @@ pub unsafe extern "C" fn rt_out_fixed(ctx: *mut Ctx, width: I64, lo: I64, hi: I6
         .ok()
         .and_then(|w| ply_core::INT_TYPES.get(w))
     else {
-        c.fail(err_crossing(&format!("width {} is no width", width.0)));
+        c.fail(err_marshalling(&format!("width {} is no width", width.0)));
         return;
     };
     let high = if ty.bits() == 128 { hi.0 as u64 } else { 0 };
@@ -240,14 +240,14 @@ pub unsafe extern "C" fn rt_out_char(ctx: *mut Ctx, c: I64) {
     match u32::try_from(c.0).ok().and_then(char::from_u32) {
         Some(ch) => cx.write(|l| l.w.char(u32::from(ch))),
         None => {
-            cx.fail(err_crossing(&format!("{} is no character", c.0)));
+            cx.fail(err_marshalling(&format!("{} is no character", c.0)));
         }
     }
 }
 
 /// A string, the `n` bytes of UTF-8 at `p`.
 pub unsafe extern "C" fn rt_out_str(ctx: *mut Ctx, p: Addr, n: I64) {
-    let s = unsafe { lent(p, n) };
+    let s = unsafe { borrowed(p, n) };
     unsafe { &mut *ctx }.write(|l| {
         l.opens_shareable();
         l.w.str(s);
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn rt_out_str(ctx: *mut Ctx, p: Addr, n: I64) {
 
 /// A bytes value, the `n` bytes at `p`.
 pub unsafe extern "C" fn rt_out_bytes(ctx: *mut Ctx, p: Addr, n: I64) {
-    let b = unsafe { lent(p, n) };
+    let b = unsafe { borrowed(p, n) };
     unsafe { &mut *ctx }.write(|l| {
         l.opens_shareable();
         l.w.bytes(b);
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn rt_out_count(ctx: *mut Ctx, t: I64, n: I64) {
     let (Ok(t @ (tag::LIST | tag::ARRAY | tag::MAP | tag::RECORD)), Ok(n)) =
         (u8::try_from(t.0), u64::try_from(n.0))
     else {
-        c.fail(err_crossing(&format!("tag {} counting {}", t.0, n.0)));
+        c.fail(err_marshalling(&format!("tag {} counting {}", t.0, n.0)));
         return;
     };
     c.write(|l| {
@@ -285,13 +285,13 @@ pub unsafe extern "C" fn rt_out_count(ctx: *mut Ctx, t: I64, n: I64) {
 /// The head of the constructor named by the `len` bytes at `name`, given `n` arguments, which
 /// follow.
 pub unsafe extern "C" fn rt_out_ctor(ctx: *mut Ctx, name: Addr, len: I64, n: I64) {
-    let name = unsafe { lent(name, len) };
+    let name = unsafe { borrowed(name, len) };
     unsafe { &mut *ctx }.write(|l| l.w.ctor(name, n.0.max(0) as u64));
 }
 
 /// A record field's name, the `n` bytes at `p`, before its value.
 pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
-    let name = unsafe { lent(p, n) };
+    let name = unsafe { borrowed(p, n) };
     unsafe { &mut *ctx }.write(|l| l.w.name(name));
 }
 
@@ -301,8 +301,8 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     let c = unsafe { &mut *ctx };
     let w = h.word();
     if c.showing() {
-        let kind = if hold_id(w).is_some() {
-            codec::shown::HOLD
+        let kind = if scoped_id(w).is_some() {
+            codec::shown::SCOPED
         } else {
             codec::shown::SEALED
         };
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     if heap::is_native(w)
         && let Some(escaping) = unsafe { heap::native_escapes(w) }
         && let Ok(l) = c.lowering()
-        && l.answers_entry
+        && l.results_entry
     {
         l.escaping.get_or_insert(escaping);
     }
@@ -334,7 +334,7 @@ pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const Ply
 /// `name`, or anonymous where `len` is 0; or, an anonymous one holding what may not leave its
 /// thread, as a continuation's closure does, one no run but its own can resume.
 pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I64) {
-    let name = unsafe { lent(name, len) };
+    let name = unsafe { borrowed(name, len) };
     let leaves = !name.is_empty() || unsafe { Block::of(f.word()).share(ctx) };
     unsafe { &mut *ctx }.write(|l| {
         if !leaves {
@@ -489,7 +489,7 @@ pub unsafe extern "C" fn rt_in_count(ctx: *mut Ctx, t: I64) -> I64 {
 
 /// A record field's name, which must be the `n` bytes at `p`.
 pub unsafe extern "C" fn rt_in_field(ctx: *mut Ctx, p: Addr, n: I64) {
-    let want = unsafe { lent(p, n) };
+    let want = unsafe { borrowed(p, n) };
     unsafe { &mut *ctx }.read(|l| {
         let name = l.r.symbol()?;
         if name.as_bytes() != want {
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn rt_in_field(ctx: *mut Ctx, p: Addr, n: I64) {
 
 /// 1 where the constructor read last is named by the `n` bytes at `p`, else 0.
 pub unsafe extern "C" fn rt_in_name_is(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let want = unsafe { lent(p, n) };
+    let want = unsafe { borrowed(p, n) };
     I64(unsafe { &mut *ctx }.read(|l| match &l.name {
         Some(name) => Ok(i64::from(name.as_bytes() == want)),
         None => Err("a constructor's name asked before one was read".into()),
@@ -514,14 +514,14 @@ pub unsafe extern "C" fn rt_in_name_is(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
 /// What a descriptor lifts by for every type but `String`, the one type the runtime lifts: it fails
 /// the entry.
 pub unsafe extern "C" fn rt_never_lifted(ctx: *mut Ctx) {
-    unsafe { &mut *ctx }.fail(err_crossing(
+    unsafe { &mut *ctx }.fail(err_marshalling(
         "a value lifted through a descriptor that lifts none: the runtime lifts only a `String`",
     ));
 }
 
 /// What a descriptor lowers by where no diagnostic shows a value of its type: it fails the entry.
 pub unsafe extern "C" fn rt_never_shown(ctx: *mut Ctx) {
-    unsafe { &mut *ctx }.fail(err_crossing(
+    unsafe { &mut *ctx }.fail(err_marshalling(
         "a value shown through a descriptor that does not lower it",
     ));
 }
@@ -530,8 +530,8 @@ pub unsafe extern "C" fn rt_never_shown(ctx: *mut Ctx) {
 /// [`rt_lower_close`] ends: nothing is held beside its bytes.
 pub unsafe extern "C" fn rt_shown_open(ctx: *mut Ctx) {
     unsafe { &mut *ctx }
-        .crossings
-        .push(Crossing::Lowering(Lowering::shown()));
+        .marshallings
+        .push(Marshalling::Lowering(Lowering::shown()));
 }
 
 /// Ends the innermost lowering, which holds no handle: its bytes' count, the bytes left as the
@@ -541,11 +541,11 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
     if c.lowering().is_err() {
         return I64(0);
     }
-    let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
+    let Some(Marshalling::Lowering(l)) = c.marshallings.pop() else {
         unreachable!("the innermost crossing is a lowering");
     };
     if l.handles > 0 {
-        c.fail(err_crossing("a value the bytes hold only a handle of"));
+        c.fail(err_marshalling("a value the bytes hold only a handle of"));
         return I64(0);
     }
     c.give(l.w.finish())
@@ -557,8 +557,8 @@ pub unsafe extern "C" fn rt_lift_close(ctx: *mut Ctx) {
     if c.lifting().is_err() {
         return;
     }
-    if let Err(why) = c.close_lifting() {
-        c.fail(err_crossing(&why));
+    if let Err(reason) = c.close_lifting() {
+        c.fail(err_marshalling(&reason));
     }
 }
 
@@ -566,7 +566,7 @@ pub unsafe extern "C" fn rt_lift_close(ctx: *mut Ctx) {
 pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
     let c = unsafe { &mut *ctx };
     if usize::try_from(n.0).ok() != Some(c.taken.len()) {
-        c.fail(err_crossing(&format!(
+        c.fail(err_marshalling(&format!(
             "{} bytes taken, of {} given",
             n.0,
             c.taken.len()
@@ -583,12 +583,12 @@ impl Ctx {
     pub fn lift_from(&mut self, bytes: Vec<u8>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
-            Err(why) => {
-                self.fail(err_crossing(&why));
+            Err(reason) => {
+                self.fail(err_marshalling(&reason));
                 Reader::new(codec::FORMAT.to_vec()).expect("the format alone opens")
             }
         };
-        self.crossings.push(Crossing::Lifting(Lifting {
+        self.marshallings.push(Marshalling::Lifting(Lifting {
             r,
             name: None,
             high: None,
@@ -597,7 +597,7 @@ impl Ctx {
 
     /// Ends the innermost lifting; an error where bytes are left.
     fn close_lifting(&mut self) -> Result<(), String> {
-        let Some(Crossing::Lifting(l)) = self.crossings.pop() else {
+        let Some(Marshalling::Lifting(l)) = self.marshallings.pop() else {
             unreachable!("the innermost crossing is a lifting");
         };
         l.r.end()
@@ -618,17 +618,17 @@ fn lowering(
     opened: Lowering,
     write: impl FnOnce(*mut Ctx),
 ) -> Result<Lowering, String> {
-    let depth = unsafe { &*ctx }.crossings.len();
+    let depth = unsafe { &*ctx }.marshallings.len();
     unsafe { &mut *ctx }
-        .crossings
-        .push(Crossing::Lowering(opened));
+        .marshallings
+        .push(Marshalling::Lowering(opened));
     write(ctx);
     let c = unsafe { &mut *ctx };
-    if c.crossings.len() != depth + 1 {
-        c.crossings.truncate(depth + 1);
+    if c.marshallings.len() != depth + 1 {
+        c.marshallings.truncate(depth + 1);
         return Err("a lowering left a crossing of its own open".into());
     }
-    let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
+    let Some(Marshalling::Lowering(l)) = c.marshallings.pop() else {
         return Err("a lowering ended a crossing it did not begin".into());
     };
     Ok(l)
@@ -645,26 +645,26 @@ pub(crate) fn string_lifted(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<
 /// `bytes` lifted through `ty`; `None` with the context failed where they do not cross.
 fn lifted_from(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
     let c = unsafe { &mut *ctx };
-    let depth = c.crossings.len();
+    let depth = c.marshallings.len();
     c.lift_from(bytes);
     let w = unsafe { (ty.lift)(ctx) };
     let c = unsafe { &mut *ctx };
-    if c.crossings.len() != depth + 1 {
-        c.crossings.truncate(depth + 1);
-        c.fail(err_crossing("a lifting left a crossing of its own open"));
+    if c.marshallings.len() != depth + 1 {
+        c.marshallings.truncate(depth + 1);
+        c.fail(err_marshalling("a lifting left a crossing of its own open"));
     }
-    if let Err(why) = c.close_lifting() {
-        c.fail(err_crossing(&why));
+    if let Err(reason) = c.close_lifting() {
+        c.fail(err_marshalling(&reason));
     }
-    (c.failed == 0).then(|| <Handed as crate::native::Answered>::of(w))
+    (c.failed == 0).then(|| <Handed as crate::native::Returned>::of(w))
 }
 
 impl Ctx {
     /// Opens what an entry through `R#entered` runs between: a lowering for its answer, and over it
     /// a lifting of `bytes`, the arguments' list.
     pub(crate) fn open_entry(&mut self, bytes: Vec<u8>) {
-        self.crossings.push(Crossing::Lowering(Lowering {
-            answers_entry: true,
+        self.marshallings.push(Marshalling::Lowering(Lowering {
+            results_entry: true,
             ..Lowering::new(false)
         }));
         self.lift_from(bytes);
@@ -820,9 +820,9 @@ fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String
 /// lowering or left another crossing open.
 fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
     let c = unsafe { &mut *ctx };
-    let open = c.crossings.len();
+    let open = c.marshallings.len();
     if open != 1 {
-        c.crossings.clear();
+        c.marshallings.clear();
         return Err(match open {
             0 => "the entry ended the lowering its answer was to be written into".into(),
             _ => format!(
@@ -831,8 +831,8 @@ fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
             ),
         });
     }
-    match c.crossings.pop() {
-        Some(Crossing::Lowering(l)) => Ok(l),
+    match c.marshallings.pop() {
+        Some(Marshalling::Lowering(l)) => Ok(l),
         _ => Err("the entry ended the lowering its answer was to be written into".into()),
     }
 }

@@ -4,7 +4,7 @@
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Carried, Handed, PlyType};
 use ply_compiled::heap::{HEADER, Obj, Word};
-use ply_compiled::native::Answered;
+use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;

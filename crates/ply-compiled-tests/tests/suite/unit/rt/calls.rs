@@ -184,11 +184,11 @@ fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept()
                 let c: *mut Ctx = &mut mine;
                 barrier.wait();
                 let w = read(c, keep_box);
-                let answered = held(w);
+                let returned = held(w);
                 let_go(c, w);
                 assert_eq!(mine.heap.live(), 0);
                 mine.end();
-                answered
+                returned
             })
         })
         .collect();
@@ -265,9 +265,9 @@ fn a_constant_is_evaluated_once_and_every_later_read_answers_the_copy() {
 
 /// `Bytes::at` refused, left pending as a raise of `abort.raise`.
 unsafe extern "C" fn refusing(ctx: *mut Ctx, _args: *const Word) -> Word {
-    let refused: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
+    let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
         helper(&builtin_helper_name("?refused"));
-    unsafe { refused(ctx, 8, 5, 2, 0) };
+    unsafe { rejected(ctx, 8, 5, 2, 0) };
     0
 }
 

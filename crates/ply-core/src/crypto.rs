@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 
 /// The runtime error of the operation `what` handed what it takes no part of, `why` saying what.
 #[cold]
-pub fn misuse(span: Span, what: &str, why: String) -> Diagnostic {
-    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what}: {why}"))
+pub fn misuse(span: Span, what: &str, reason: String) -> Diagnostic {
+    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what}: {reason}"))
         .primary(span, "called here")
         .note("`std.crypto` and `std.hash` name what the runtime takes; they are the callers these builtins are for")
 }

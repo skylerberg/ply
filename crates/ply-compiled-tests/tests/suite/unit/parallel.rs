@@ -244,10 +244,10 @@ fn a_branch_that_answered_past_one_that_failed_is_left_for_emitted_code() {
     }
     let mut ctx = context();
     ctx.begin();
-    let [failed, answered] = branches(&mut ctx, [&FAILS, &SECOND]);
+    let [failed, returned] = branches(&mut ctx, [&FAILS, &SECOND]);
     assert_eq!((ctx.failed, failed), (1, 0));
-    assert_eq!(held(answered), 2);
-    free(&mut ctx, answered);
+    assert_eq!(held(returned), 2);
+    free(&mut ctx, returned);
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
     ctx.end();

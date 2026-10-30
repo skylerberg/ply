@@ -103,9 +103,9 @@ pub struct Ctx {
     pub(crate) entered_sims: u32,
     /// The regions `std.internal.schedule` opened on this context, innermost last, which a bracket
     /// shields its running task in and a seeded step records what it touched for.
-    pub(crate) regions: Vec<(*mut crate::tasks::Region, [i64; 3])>,
+    pub(crate) schedulers: Vec<(*mut crate::tasks::Scheduler, [i64; 3])>,
     /// What the running seeded step touched, each beside where it was made.
-    pub footprint: Vec<(crate::tasks::Touched, [i64; 3])>,
+    pub effects: Vec<(crate::tasks::Touched, [i64; 3])>,
     /// The trail the entry's last seeded region left, and the interleaving its regions took, each as
     /// the scheduler wrote it.
     pub(crate) trail_kept: Option<Vec<u8>>,
@@ -120,7 +120,7 @@ pub struct Ctx {
     /// Whether whoever runs this context's entries reads what they performed.
     pub(crate) traced: bool,
     /// How many holds this entry has made, which numbers the next.
-    pub(super) holds_made: u64,
+    pub(super) scoped_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
     pub(super) outer: (*mut Heap, *const i64),
     /// Releases a drop root at [`RELEASE_DEPTH`] put off: each word with the root that releases it.
@@ -129,7 +129,7 @@ pub struct Ctx {
     /// drop: never inside the release that let it go.
     pub(crate) continuations_died: Vec<(usize, usize)>,
     /// The crossings under way, the innermost last.
-    pub(crate) crossings: Vec<Crossing>,
+    pub(crate) marshallings: Vec<Marshalling>,
     /// The bytes a native answered, until compiled code copies them out with [`rt_taken`].
     pub(crate) taken: Vec<u8>,
     /// The context running on this thread when this one's entry began, put back when it ends.
@@ -241,19 +241,19 @@ impl Ctx {
             seed: ply_core::Seed::default(),
             sim_steps: ply_core::sim::DEFAULT_STEPS,
             entered_sims: 0,
-            regions: Vec::new(),
-            footprint: Vec::new(),
+            schedulers: Vec::new(),
+            effects: Vec::new(),
             trail_kept: None,
             held_at_root: None,
             interleaving: None,
             pending: None,
             pending_words: Vec::new(),
             traced: false,
-            holds_made: 0,
+            scoped_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             release_later: Vec::new(),
             continuations_died: Vec::new(),
-            crossings: Vec::new(),
+            marshallings: Vec::new(),
             taken: Vec::new(),
             outer_running: std::ptr::null_mut(),
         }
@@ -298,7 +298,7 @@ impl Ctx {
     /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now: whoever runs
     /// its entries, or a seeded region's steps. A production region reads none.
     pub(crate) fn rearm_recording(&mut self) {
-        let seeded = (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
+        let seeded = (self.schedulers.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
         self.recording = i64::from(self.traced || seeded);
     }
 
@@ -323,7 +323,7 @@ impl Ctx {
     /// records their steps. A branch performs no `task` operation, and one that waits waits on its
     /// own thread, so the run's region keeps no block in turn.
     pub(crate) fn runs_branches_at_once(&self) -> bool {
-        !(self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() })
+        !(self.schedulers.iter()).any(|(r, _)| unsafe { (**r).is_seeded() })
     }
 
     /// Fails this entry as one of its `parallel` branches failed.
@@ -366,12 +366,12 @@ impl Ctx {
         self.performed.clear();
         self.starting_detached = None;
         self.entered_sims = 0;
-        self.regions.clear();
-        self.footprint.clear();
+        self.schedulers.clear();
+        self.effects.clear();
         self.trail_kept = None;
         self.held_at_root = None;
         self.interleaving = None;
-        self.holds_made = 0;
+        self.scoped_made = 0;
         if let Some(p) = self.pending.take() {
             p.release();
         }
@@ -382,7 +382,7 @@ impl Ctx {
         self.entering_words = 0;
         self.rearm_recording();
         self.release_later.clear();
-        self.crossings.clear();
+        self.marshallings.clear();
         self.taken.clear();
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
@@ -654,9 +654,9 @@ impl Ctx {
         {
             return;
         }
-        let stepping = (self.regions.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
+        let stepping = (self.schedulers.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
         if stepping {
-            self.footprint
+            self.effects
                 .push((touched, [self.site_root, self.site_start, self.site_end]));
         }
     }

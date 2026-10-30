@@ -2,7 +2,7 @@ mod codec;
 mod crypto;
 mod escape;
 mod float;
-mod footprint;
+mod effects;
 mod host;
 mod rc;
 mod sim;

@@ -8,7 +8,7 @@ pub mod wire;
 
 pub use socket::TcpHost;
 pub(crate) use socket::apply;
-pub use wire::{Credentials, Endpoint, Probing, Refusal, SocketOption};
+pub use wire::{Credentials, Endpoint, Probing, NetError, SocketOption};
 
 use ply_core::{Diagnostic, Span, codes};
 use std::collections::BTreeMap;
@@ -133,10 +133,10 @@ fn not_a_stream(handle: i64, span: Span) -> Diagnostic {
 
 /// An upgrade of something that is not a plaintext TCP connection at rest.
 #[cold]
-fn not_upgradable(what: &str, handle: i64, why: &str, span: Span) -> Diagnostic {
+fn not_upgradable(what: &str, handle: i64, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{what} cannot secure socket {handle}: {why}"),
+        format!("{what} cannot secure socket {handle}: {reason}"),
     )
     .primary(span, "an upgrade takes a plaintext connection nothing else is waiting on")
     .note("the handle is the secured connection afterwards, so a read or a write still in flight on the plaintext would be one the upgrade could not account for")

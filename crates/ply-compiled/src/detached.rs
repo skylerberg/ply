@@ -22,7 +22,7 @@ pub struct Detached {
     resumer_sp: usize,
     resumer_current: usize,
     request: Option<Stopped>,
-    answer: Word,
+    result: Word,
     /// Owned here, not by the entry frame, which never returns where the body is abandoned.
     body: Word,
     /// The block whose objects the body and clauses hold for what their rows take around the
@@ -192,7 +192,7 @@ pub(crate) unsafe fn open_over(
         resumer_sp: 0,
         resumer_current: 0,
         request: None,
-        answer: 0,
+        result: 0,
         body,
         forwards,
         starting: Some(body),
@@ -330,7 +330,7 @@ pub(crate) unsafe fn resume(
     ctx: *mut Ctx,
     id: usize,
     capture: Option<usize>,
-    answer: Option<Word>,
+    result: Option<Word>,
 ) -> Word {
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
@@ -365,8 +365,8 @@ pub(crate) unsafe fn resume(
     }
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
-    if let Some(a) = answer {
-        d.answer = a;
+    if let Some(a) = result {
+        d.result = a;
     }
     d.resumer_current = c.current;
     d.state = State::Running;
@@ -488,7 +488,7 @@ unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>) -> W
     let from = &mut d.sp as *mut usize;
     unsafe { switch_keeping(ctx, from, to) };
     let c = unsafe { &mut *ctx };
-    std::mem::take(&mut c.detached[id].answer)
+    std::mem::take(&mut c.detached[id].result)
 }
 
 extern "C" fn entry(arg: usize) {

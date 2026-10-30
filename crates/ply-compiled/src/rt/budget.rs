@@ -71,13 +71,13 @@ pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
         ctx,
         stack: &stack,
         call: Some(call),
-        answer: 0,
+        result: 0,
         back: 0,
     };
     let handover = &raw mut hop;
     let sp = stack.prepare(hopped::<F>, handover as usize);
     unsafe { switch_keeping(ctx, &raw mut (*handover).back, sp) };
-    unsafe { (*handover).answer }
+    unsafe { (*handover).result }
 }
 
 /// What [`on_known_stack`] hands the stack it hops onto, from its own frame, which outlives the hop.
@@ -85,7 +85,7 @@ struct Hop<'a, F> {
     ctx: *mut Ctx,
     stack: &'a Stack,
     call: Option<F>,
-    answer: Word,
+    result: Word,
     back: usize,
 }
 
@@ -98,9 +98,9 @@ extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
         (*(*hop).ctx).frames = std::ptr::null_mut();
         (*hop).call.take().expect("a hop runs its call once")
     };
-    let answer = call();
+    let result = call();
     let to = unsafe {
-        (*hop).answer = answer;
+        (*hop).result = result;
         (*hop).back
     };
     let mut spent = 0;

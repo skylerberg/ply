@@ -46,10 +46,10 @@ fn a_run_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
     });
     let run = run_of(&*rt).expect("a host made the runtime");
     run.watch(&ticket).expect("the run submitted it");
-    while run.answered().is_empty() {
+    while run.returned().is_empty() {
         rt.park().expect("the run watches its own job");
     }
-    assert_eq!(run.answered(), vec![ticket.token]);
+    assert_eq!(run.returned(), vec![ticket.token]);
     assert_eq!(
         run.taken(&ticket).expect("its own ticket"),
         Some(b"hashed".to_vec())
@@ -60,7 +60,7 @@ fn a_run_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
 /// pool does, rather than leaving it waiting for ever.
 #[test]
 fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
-    let (answered, heard) = mpsc::channel();
+    let (returned, heard) = mpsc::channel();
     std::thread::spawn(move || {
         let runtime = unbound()();
         let ticket = submitted(
@@ -70,7 +70,7 @@ fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
             || -> Result<Vec<u8>, String> { panic!("the job broke") },
         );
         let outcome = job_bytes(&*runtime, &ticket);
-        let _ = answered.send(outcome.map(|_| ()).map_err(|d| d.message));
+        let _ = returned.send(outcome.map(|_| ()).map_err(|d| d.message));
     });
     match heard.recv_timeout(Duration::from_secs(10)) {
         Ok(Err(message)) => assert!(message.contains("`a waiting job`"), "{message}"),

@@ -21,18 +21,18 @@ fn said(n: i64) -> JobOutput {
     Ok(written(n))
 }
 
-fn submitted(pool: &Pool, run: &Arc<Run>, answer: i64) -> Pending {
+fn submitted(pool: &Pool, run: &Arc<Run>, result: i64) -> Pending {
     pool.submit(
         run,
         Span::DUMMY,
         "test",
         "a test job",
-        Box::new(move || said(answer)),
+        Box::new(move || said(result)),
     )
     .expect("the pool takes the job")
 }
 
-fn answered(run: &Run, pending: Pending) -> Vec<u8> {
+fn returned(run: &Run, pending: Pending) -> Vec<u8> {
     run.block_on(&pending, None)
         .unwrap_or_else(|d| panic!("{d:?}"))
         .expect("an unbounded wait ends answered")
@@ -45,14 +45,14 @@ fn collected(run: &Run) -> Vec<(u64, Result<Vec<u8>, Diagnostic>)> {
         run.park(Some(Duration::from_secs(10)), &|| false),
         "the run watches something"
     );
-    (run.answered().into_iter())
+    (run.returned().into_iter())
         .map(|token| {
             let pending = Pending {
                 token,
                 label: "a test job",
             };
-            let answer = run.taken(&pending).map(|v| v.expect("answered"));
-            (token, answer)
+            let result = run.taken(&pending).map(|v| v.expect("answered"));
+            (token, result)
         })
         .collect()
 }
@@ -70,17 +70,17 @@ fn a_run_collects_its_own_operations_and_none_of_anothers() {
     );
     mine.watch(&a).expect("its own");
     theirs.watch(&b).expect("its own");
-    let mine_answered = collected(&mine);
-    assert_eq!(mine_answered.len(), 1);
-    assert_eq!(mine_answered[0].0, a.token);
+    let mine_returned = collected(&mine);
+    assert_eq!(mine_returned.len(), 1);
+    assert_eq!(mine_returned[0].0, a.token);
     assert_eq!(
         collected(&theirs)
             .into_iter()
-            .map(|(token, answer)| (token, answer.expect("answered")))
+            .map(|(token, result)| (token, result.expect("answered")))
             .collect::<Vec<_>>(),
         [(b.token, written(2))]
     );
-    assert!(mine.answered().is_empty(), "an answer is handed back once");
+    assert!(mine.returned().is_empty(), "an answer is handed back once");
 }
 
 /// A job that finishes after its run has ended answers no one, and keeps no thread.
@@ -138,7 +138,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             }
         }
     };
-    assert_eq!(answered(&after, pending), written(9));
+    assert_eq!(returned(&after, pending), written(9));
 }
 
 /// A pool that gives each operation a thread refuses the one past its bound; a queued one has no
@@ -151,7 +151,7 @@ fn a_queued_pool_answers_more_operations_than_a_thread_each_would_be_given() {
         .map(|i| (i, submitted(&pool, &asking, i)))
         .collect();
     for (i, token) in asked {
-        assert_eq!(answered(&asking, token), written(i));
+        assert_eq!(returned(&asking, token), written(i));
     }
 }
 
@@ -180,7 +180,7 @@ fn a_queued_pool_runs_no_more_at_once_than_it_has_threads() {
         })
         .collect();
     for token in tokens {
-        answered(&asking, token);
+        returned(&asking, token);
     }
     let most = most.load(Ordering::SeqCst);
     assert!(
@@ -209,7 +209,7 @@ fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
             .block_on(&broken, None)
             .expect_err("a panic is the operation's failure");
         assert_eq!(failed.code, codes::RUNTIME_ERROR);
-        assert_eq!(answered(&asking, after), written(7));
+        assert_eq!(returned(&asking, after), written(7));
     }
 }
 
@@ -237,7 +237,7 @@ fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
     for pending in minted.into_iter().flatten() {
         assert_ne!(pending.token, 0);
         assert!(tokens.insert(pending.token), "`{pending}` was minted twice");
-        answered(&asking, pending);
+        returned(&asking, pending);
     }
 }
 

@@ -97,11 +97,11 @@ fn a_block_freed_at_another_size_than_it_was_allocated_at_is_refused() {
     let mut ctx = context();
     let w = alloc(&mut ctx, 40);
     let heap = &raw mut ctx.heap;
-    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         std::mem::transmute::<Word, Block>(w).free(heap, sized(20))
     }))
     .expect_err("a block of 40 bytes was freed as larger");
-    let said = refused.downcast_ref::<String>().expect("a message");
+    let said = rejected.downcast_ref::<String>().expect("a message");
     assert!(
         said.contains(&format!(
             "was freed as {} bytes, and its block was taken as 40",
@@ -170,7 +170,7 @@ fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     let held = alloc(&mut ctx, sized(1));
     let made: Counted = helper(&builtin_helper_name("?hold_made"));
     let h = unsafe { made(&mut ctx, held) };
-    let at = ply_compiled::rt::HOLD_HELD;
+    let at = ply_compiled::rt::SCOPED_VALUE;
     assert_eq!(unsafe { word_at(obj(h), at) }, held);
     unsafe { *(h as *mut Word).byte_add(HEADER).add(at) = 0 };
     free(&mut ctx, held, sized(1));

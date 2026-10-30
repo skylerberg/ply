@@ -47,12 +47,12 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
     // Rust's own `main` does this before any user code, so a write to a closed pipe is an error the
     // program answers rather than a signal that ends it; entered from C, the runtime does it here.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    if let Err(why) = unsafe { ply_compiled::c::linked::install(unit) } {
-        eprintln!("ply: {why}");
+    if let Err(reason) = unsafe { ply_compiled::c::linked::install(unit) } {
+        eprintln!("ply: {reason}");
         return 2;
     }
-    if let Err(why) = ply_launcher::install_own_pack() {
-        eprintln!("ply: {why}");
+    if let Err(reason) = ply_launcher::install_own_pack() {
+        eprintln!("ply: {reason}");
         return 2;
     }
     let program = match ply_launcher::linked_program() {
@@ -66,8 +66,8 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
     // The launcher's own flags, taken out before the program parses the line.
     let count = match ply_launcher::count::flag(&mut argv) {
         Ok(count) => count,
-        Err(why) => {
-            eprintln!("ply: {why}");
+        Err(reason) => {
+            eprintln!("ply: {reason}");
             return 2;
         }
     };

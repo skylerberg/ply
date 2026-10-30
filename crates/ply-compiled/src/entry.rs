@@ -12,7 +12,7 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, lent};
+use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, borrowed};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
@@ -162,7 +162,7 @@ impl Run {
 /// How an entry ended.
 pub enum Ended {
     /// The root answered: its answer's PLV1.
-    Answered(Vec<u8>),
+    Returned(Vec<u8>),
     /// A raise nothing answered, a runtime error, the clock run out, or an answer the boundary
     /// refuses.
     Failed(Diagnostic),
@@ -391,9 +391,9 @@ fn entered(
     let ended = if ctx.failed != 0 {
         failure(ctx)
     } else {
-        answered(ctx, root)
+        ended_with_result(ctx, root)
     };
-    if run.tested && matches!(ended, Ended::Answered(_)) {
+    if run.tested && matches!(ended, Ended::Returned(_)) {
         last.live = ctx.left_live() as u64;
     }
     ctx.end();
@@ -423,18 +423,18 @@ fn returned(ctx: &mut Ctx) -> Last {
 }
 
 /// How an entry whose root returned ended: its answer's bytes, or why the boundary keeps it.
-fn answered(ctx: &mut Ctx, root: &str) -> Ended {
+fn ended_with_result(ctx: &mut Ctx, root: &str) -> Ended {
     match crate::rt::close_entry(ctx) {
-        Ok(EntryBytes::Bytes(bytes)) => Ended::Answered(bytes),
+        Ok(EntryBytes::Bytes(bytes)) => Ended::Returned(bytes),
         Ok(EntryBytes::Function) => {
             Ended::Unanswerable("its answer holds a function the program wrote")
         }
         Ok(EntryBytes::Escaping(escapee)) => {
-            let boundary = ply_core::Boundary::EntryAnswer { name: root };
-            Ended::Failed(ply_core::escape::refused(&boundary, &escapee, Span::DUMMY))
+            let boundary = ply_core::Boundary::EntryResult { name: root };
+            Ended::Failed(ply_core::escape::rejected(&boundary, &escapee, Span::DUMMY))
         }
         Ok(EntryBytes::Holding) => Ended::Unanswerable("its answer holds a handle of its run"),
-        Err(why) => Ended::Failed(crate::rt::err_crossing(&why)),
+        Err(reason) => Ended::Failed(crate::rt::err_marshalling(&reason)),
     }
 }
 
@@ -554,7 +554,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// `open`: `result(opened, string)`, `opened := int unit, int roots, int nanos, int threads`.
 unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    let library = unsafe { lent(p, n) };
+    let library = unsafe { borrowed(p, n) };
     let mut w = Writer::new();
     match std::str::from_utf8(library)
         .map_err(|_| "the library's path is not UTF-8".to_string())
@@ -570,8 +570,8 @@ unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
                 .count(nanos)
                 .count(threads as u64);
         }
-        Err(why) => {
-            w.tag(1).str(&why);
+        Err(reason) => {
+            w.tag(1).str(&reason);
         }
     }
     unsafe { &mut *ctx }.given(w.finish())
@@ -586,7 +586,7 @@ unsafe extern "C" fn rt_unit_close(_ctx: *mut Ctx, unit: I64) {
 /// caller is lent `machine`.
 unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
+    let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
     if !allowed(c, "machine.bind") {
@@ -602,9 +602,9 @@ unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes 
             let binding = bindings().keep(bound);
             w.tag(0).int(binding);
         }
-        Err(refused) => {
+        Err(rejected) => {
             w.tag(1)
-                .list(refused.iter(), |w, d| write_failure(w, d, None));
+                .list(rejected.iter(), |w, d| write_failure(w, d, None));
         }
     }
     c.given(w.finish())
@@ -624,7 +624,7 @@ unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> TakenBytes {
 /// `hosting`: the disclosures' facts under the grants.
 unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
+    let Some(grants) = read_or_fail(c, unsafe { borrowed(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
     let Some(binder) = BINDER.get() else {
@@ -644,7 +644,7 @@ unsafe extern "C" fn rt_unit_moved(
     tn: I64,
 ) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { lent(gp, gn) }, read_grants) else {
+    let Some(grants) = read_or_fail(c, unsafe { borrowed(gp, gn) }, read_grants) else {
         return TakenBytes(0);
     };
     if !allowed(c, "machine.moved") {
@@ -653,7 +653,7 @@ unsafe extern "C" fn rt_unit_moved(
     let Some(binder) = BINDER.get() else {
         return TakenBytes(c.fail(err_no_binder()));
     };
-    let trace = String::from_utf8_lossy(unsafe { lent(tp, tn) }).into_owned();
+    let trace = String::from_utf8_lossy(unsafe { borrowed(tp, tn) }).into_owned();
     let caller = ply_host::observe::of(&*c.host_runtime());
     let moved = binder.moved(&grants, &trace, caller.as_deref());
     let mut w = Writer::new();
@@ -676,14 +676,14 @@ unsafe extern "C" fn rt_unit_enter(
     run_n: I64,
 ) -> TakenBytes {
     let c = unsafe { &mut *ctx };
-    let Some(asked) = read_or_fail(c, unsafe { lent(run_p, run_n) }, read_run) else {
+    let Some(asked) = read_or_fail(c, unsafe { borrowed(run_p, run_n) }, read_run) else {
         return TakenBytes(0);
     };
     if (asked.run.timeout_ms > 0 || asked.run.measure) && !allowed(c, "machine.enter") {
         return TakenBytes(0);
     }
-    let root = String::from_utf8_lossy(unsafe { lent(root_p, root_n) }).into_owned();
-    let arguments = unsafe { lent(arguments_p, arguments_n) }.to_vec();
+    let root = String::from_utf8_lossy(unsafe { borrowed(root_p, root_n) }).into_owned();
+    let arguments = unsafe { borrowed(arguments_p, arguments_n) }.to_vec();
     let Some(opened) = units().get(unit.0) else {
         return TakenBytes(c.fail(err_unheld("unit", unit.0)));
     };
@@ -738,8 +738,8 @@ fn read_or_fail<T>(
     let mut r = Reader::new(bytes);
     match read(&mut r).and_then(|t| r.end().map(|()| t)) {
         Ok(t) => Some(t),
-        Err(why) => {
-            c.fail(err_unread(&why));
+        Err(reason) => {
+            c.fail(err_unread(&reason));
             None
         }
     }
@@ -805,7 +805,7 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
 /// int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place, int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
-        Ended::Answered(bytes) => {
+        Ended::Returned(bytes) => {
             w.tag(0).bytes(bytes);
         }
         Ended::Failed(d) => {
@@ -818,8 +818,8 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         Ended::NoRoot => {
             w.tag(3);
         }
-        Ended::Unanswerable(why) => {
-            w.tag(4).str(why);
+        Ended::Unanswerable(reason) => {
+            w.tag(4).str(reason);
         }
     }
     w.option(exit, |w, code| {
@@ -882,10 +882,10 @@ fn write_site(w: &mut Writer, opened: Option<&Opened>, span: Span) {
 }
 
 #[cold]
-fn err_unread(why: &str) -> Diagnostic {
+fn err_unread(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("`std.machine` handed the runtime bytes it does not read: {why}"),
+        format!("`std.machine` handed the runtime bytes it does not read: {reason}"),
     )
     .note("the module writes the format the runtime reads; this is Ply's fault")
 }

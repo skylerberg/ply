@@ -162,7 +162,7 @@ impl Spans {
     ) -> Result<Vec<Closing>, Unbalanced> {
         let stack: &[OpenSpan] = self.open.get(&owner).map_or(&[], Vec::as_slice);
         let Some(at) = stack.iter().position(|open| open.id == id) else {
-            return Err(self.why(owner, id));
+            return Err(self.reason(owner, id));
         };
         if stack[at].channel != *channel {
             return Err(Unbalanced::OtherChannel(stack[at].channel.clone()));
@@ -251,7 +251,7 @@ impl Spans {
         self.open.len()
     }
 
-    fn why(&self, owner: Owner, id: i64) -> Unbalanced {
+    fn reason(&self, owner: Owner, id: i64) -> Unbalanced {
         let next = self.next.get(&owner.0).copied().unwrap_or(1);
         if id < 1 || id >= next {
             return Unbalanced::NeverOpened;
@@ -267,13 +267,13 @@ impl Spans {
 
 #[cold]
 #[inline(never)]
-pub fn err_unbalanced(span: Span, operation: &str, id: i64, why: &Unbalanced) -> Diagnostic {
+pub fn err_unbalanced(span: Span, operation: &str, id: i64, reason: &Unbalanced) -> Diagnostic {
     let diagnostic = Diagnostic::error(
         codes::SPAN_UNBALANCED,
         format!("{operation} names span {id}, which is not open on this task"),
     )
     .primary(span, "this span is not open here");
-    let diagnostic = match why {
+    let diagnostic = match reason {
         Unbalanced::NeverOpened => diagnostic
             .note("no `trace.enter` in this entry point has answered that id")
             .note("a `Span` is an ordinary record, so one can be built rather than entered; pass the value `trace.enter` answered"),

@@ -21,7 +21,7 @@ impl Handle {
         }
     }
 
-    fn why(self) -> &'static str {
+    fn reason(self) -> &'static str {
         match self {
             Handle::Continuation => {
                 "a continuation resumes a body that lives only as long as the entry that captured \
@@ -81,26 +81,26 @@ impl Escapee {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary<'a> {
-    EntryAnswer { name: &'a str },
+    EntryResult { name: &'a str },
 }
 
 impl Boundary<'_> {
     fn headline(&self, handle: Handle, reached: &str) -> String {
         let what = handle.noun();
         match self {
-            Boundary::EntryAnswer { name } => format!("`{name}` answered {what}{reached}"),
+            Boundary::EntryResult { name } => format!("`{name}` answered {what}{reached}"),
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
-            Boundary::EntryAnswer { .. } => "answered here",
+            Boundary::EntryResult { .. } => "answered here",
         }
     }
 
     fn outlives(&self) -> &'static str {
         match self {
-            Boundary::EntryAnswer { .. } => {
+            Boundary::EntryResult { .. } => {
                 "an entry point's answer goes to its caller, which keeps it after the entry has \
                  ended and closed every region it opened"
             }
@@ -109,7 +109,7 @@ impl Boundary<'_> {
 
     fn remedy(&self, handle: Handle) -> &'static str {
         match self {
-            Boundary::EntryAnswer { .. } => handle.instead(),
+            Boundary::EntryResult { .. } => handle.instead(),
         }
     }
 }
@@ -117,13 +117,13 @@ impl Boundary<'_> {
 /// `escapee` refused at `boundary`.
 #[cold]
 #[inline(never)]
-pub fn refused(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {
+pub fn rejected(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::REGION_ESCAPE_AT_BOUNDARY,
         boundary.headline(escapee.handle, &escapee.reached()),
     )
     .primary(span, boundary.label())
-    .note(escapee.handle.why())
+    .note(escapee.handle.reason())
     .note(boundary.outlives())
     .note(escapee.handle.unseen())
     .note(boundary.remedy(escapee.handle))

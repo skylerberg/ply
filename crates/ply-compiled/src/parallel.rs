@@ -133,7 +133,7 @@ unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
         let closure = branches[i];
         let c = unsafe { &mut *ctx };
         (c.entering_desc, c.entering_words) = words;
-        let answer = call(ctx, closure);
+        let result = call(ctx, closure);
         let_go(ctx, closure);
         if unsafe { (*ctx).failed } != 0 {
             branches[i] = 0;
@@ -143,7 +143,7 @@ unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
             }
             return;
         }
-        branches[i] = answer;
+        branches[i] = result;
     }
 }
 
@@ -151,7 +151,7 @@ unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
 struct Branch {
     ctx: Box<Ctx>,
     closure: Word,
-    answer: Word,
+    result: Word,
 }
 
 /// Takes a branch's context off the watchdog's list as its run ends, however it ends.
@@ -184,7 +184,7 @@ impl Handed {
         let heap_was = heap::swap_current(&mut c.heap);
         let site_was = heap::poison::swap(&raw const c.site_root);
         let running_was = crate::rt::swap_running(ctx);
-        branch.answer = call(ctx, branch.closure);
+        branch.result = call(ctx, branch.closure);
         if c.failed == crate::rt::FAILED_OUT_OF_STACK {
             crate::rt::let_go_below_here();
         }
@@ -217,7 +217,7 @@ unsafe fn in_parallel(
             Branch {
                 ctx,
                 closure,
-                answer: 0,
+                result: 0,
             }
         })
         .collect();
@@ -230,15 +230,15 @@ unsafe fn in_parallel(
     // Left to right: the first branch that failed is how evaluating them in turn would have ended.
     let mut ended = false;
     for (slot, run) in branches.iter_mut().zip(runs) {
-        let Branch { ctx, answer, .. } = run;
+        let Branch { ctx, result, .. } = run;
         let mut ctx = *ctx;
         if ended {
-            *slot = if ctx.failed == 0 { answer } else { 0 };
+            *slot = if ctx.failed == 0 { result } else { 0 };
             parent.absorb(ctx);
             continue;
         }
         let failure = ctx.take_branch_failure();
-        *slot = if failure.is_some() { 0 } else { answer };
+        *slot = if failure.is_some() { 0 } else { result };
         parent.absorb(ctx);
         if let Some(f) = failure {
             parent.fail_from_branch(f);

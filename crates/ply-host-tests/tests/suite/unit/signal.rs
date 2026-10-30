@@ -20,12 +20,12 @@ fn accepting(host: &TcpHost, listener: i64) -> mpsc::Receiver<i64> {
     let job = host
         .accept(LISTENER, listener, Span::DUMMY)
         .expect("the accept is taken");
-    let (answered, answer) = mpsc::channel();
+    let (returned, result) = mpsc::channel();
     std::thread::spawn(move || {
         let handle = ply_host::native::int_of(&job().expect("the accept ran")).expect("a handle");
-        let _ = answered.send(handle);
+        let _ = returned.send(handle);
     });
-    answer
+    result
 }
 
 fn accepted(host: &TcpHost, listener: i64) -> i64 {
@@ -171,14 +171,14 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     let listener = listen(&host, 0);
 
     // Parked, with nothing connecting: exactly an idle service.
-    let answer = accepting(&host, listener);
+    let result = accepting(&host, listener);
     assert_eq!(
         host.accepts_in_flight(),
         1,
         "the accept is counted as parked"
     );
     assert!(
-        answer.recv_timeout(Duration::from_millis(100)).is_err(),
+        result.recv_timeout(Duration::from_millis(100)).is_err(),
         "nothing is connecting, so it is still waiting"
     );
 
@@ -187,11 +187,11 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     shutdown.request(ShutdownSignal::Terminate);
     until_stopped_accepting(&shutdown);
 
-    let answered = answer
+    let returned = result
         .recv_timeout(Duration::from_secs(10))
         .expect("the parked accept returned, so an idle service observes a stop");
     assert_eq!(
-        answered, 0,
+        returned, 0,
         "the connection the drain dialled is closed rather than served"
     );
     let until = Instant::now() + Duration::from_secs(2);
@@ -211,7 +211,7 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     let listener = listen(&host, 0);
     let address = host.local_addr(listener).expect("a bound address");
 
-    let answer = accepting(&host, listener);
+    let result = accepting(&host, listener);
 
     let shutdown = Shutdown::new(bounds(0, 5_000));
     shutdown.attach_net(Arc::clone(&host) as Arc<dyn Accepting>);
@@ -221,7 +221,7 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     let mut client = TcpStream::connect_timeout(&address, Duration::from_millis(500))
         .or_else(|_| TcpStream::connect(address));
     assert_eq!(
-        answer
+        result
             .recv_timeout(Duration::from_secs(10))
             .expect("the accept returned"),
         0

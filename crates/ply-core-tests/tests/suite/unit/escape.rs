@@ -5,12 +5,12 @@ use ply_core::{Span, codes};
 /// the way to the handle, and what to answer instead.
 #[test]
 fn an_entry_points_answer_refuses_a_continuation_by_the_way_to_it() {
-    let boundary = Boundary::EntryAnswer { name: "m.parked" };
+    let boundary = Boundary::EntryResult { name: "m.parked" };
     let escapee = Escapee {
         handle: Handle::Continuation,
         route: vec!["item 1".into(), "`m.Just`'s argument 1".into()],
     };
-    let d = refused(&boundary, &escapee, Span::DUMMY);
+    let d = rejected(&boundary, &escapee, Span::DUMMY);
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
     assert_eq!(
         d.message,
@@ -36,8 +36,8 @@ fn a_handle_reached_directly_names_no_way() {
         route: Vec::new(),
     };
     assert_eq!(escapee.reached(), "");
-    let d = refused(
-        &Boundary::EntryAnswer { name: "m.spawned" },
+    let d = rejected(
+        &Boundary::EntryResult { name: "m.spawned" },
         &escapee,
         Span::DUMMY,
     );

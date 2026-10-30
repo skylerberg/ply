@@ -8,7 +8,7 @@ use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEAD, INSTANCE_VARS};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
 use ply_compiled::frames::{PlyFrame, held_across};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
-use ply_compiled::native::{Answered, I64};
+use ply_compiled::native::{Returned, I64};
 use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_perform};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ unsafe fn holding_a_box(ctx: *mut Ctx, marker: Word, call: impl FnOnce() -> Word
 static FLIP_OP: PlyOp = PlyOp {
     effect: AMB,
     op: FLIP,
-    answer: std::ptr::null(),
+    result: std::ptr::null(),
     own: 0,
     params_len: 0,
     params: std::ptr::null(),
@@ -279,10 +279,10 @@ unsafe fn handled(ctx: *mut Ctx, clause: &'static PlyFnDesc) -> Word {
     let body = closure(ctx, &BODY);
     let (instance, record) = instance(ctx, closure(ctx, clause));
     STOP.set(record);
-    let answer =
+    let result =
         unsafe { rt_detached_open(ctx, Block::of(body), Block::of(0), Block::of(instance)) };
     unsafe { Block::of(instance).let_go_function(ctx) };
-    unsafe { std::mem::transmute::<Handed, Word>(answer) }
+    unsafe { std::mem::transmute::<Handed, Word>(result) }
 }
 
 fn failure(ctx: *mut Ctx) -> String {
@@ -301,9 +301,9 @@ fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
     let ctx = &raw mut owned;
     unsafe {
         (*ctx).begin();
-        let answer = handled(ctx, &ONCE);
+        let result = handled(ctx, &ONCE);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-        assert_eq!(imm_value(answer), 10);
+        assert_eq!(imm_value(result), 10);
         assert_eq!(taken(&SEEN), [1; 5]);
         assert_eq!(taken(&CLAUSES_UNRECORDED), [true]);
         assert_eq!(taken(&TOKENS), [TOKEN]);
@@ -340,9 +340,9 @@ fn a_body_whose_continuation_dies_unresumed_gives_back_what_it_held_once() {
     let ctx = &raw mut owned;
     unsafe {
         (*ctx).begin();
-        let answer = handled(ctx, &NEVER);
+        let result = handled(ctx, &NEVER);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-        assert_eq!(imm_value(answer), 42);
+        assert_eq!(imm_value(result), 42);
         assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
         assert_eq!(taken(&TOKENS), [TOKEN]);
         assert_eq!(freed(), HELD);

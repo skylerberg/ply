@@ -54,7 +54,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
     laid!(out, PlyKept as "PlyKept": ty, equal, order);
-    laid!(out, PlyOp as "PlyOp": effect, op, answer, own, params_len, params, vars_len, vars);
+    laid!(out, PlyOp as "PlyOp": effect, op, result, own, params_len, params, vars_len, vars);
     laid!(out, PlyFnDesc as "PlyFnDesc": uniform, typed, convention, release, share, keep);
     out.extend([
         ("alloc.segment", blocks::SEGMENT),
@@ -67,7 +67,7 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("count.shared", heap::SHARED as usize),
         ("pointer_floor", heap::POINTER_FLOOR as usize),
         ("release_depth", crate::rt::RELEASE_DEPTH as usize),
-        ("hold.held", crate::rt::HOLD_HELD),
+        ("hold.held", crate::rt::SCOPED_VALUE),
         ("closure.descriptor", heap::CLOSURE_CODE),
         ("failed.target", crate::rt::FAILED_TARGET as usize),
         ("failed.pending", crate::rt::FAILED_PENDING as usize),
@@ -83,8 +83,8 @@ fn facts() -> Vec<(&'static str, usize)> {
 }
 
 fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
-    let answer = s.answer.map_or("-", Machine::name);
-    let _ = write!(out, "{kind} {name} {} {answer}", u8::from(s.raises));
+    let result = s.result.map_or("-", Machine::name);
+    let _ = write!(out, "{kind} {name} {} {result}", u8::from(s.raises));
     for p in s.params {
         let _ = write!(out, " {}", p.name());
     }

@@ -6,7 +6,7 @@ use super::{Nondeterministic, asked, done, from_host, given, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use crate::secret;
 use ply_core::Diagnostic;
 use ply_host::native::parts_of;
@@ -198,7 +198,7 @@ pub unsafe extern "C" fn rt_net_listen(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let Some(at) = handed(c, "net_listen", "a port", port(at)) else {
@@ -231,13 +231,13 @@ pub unsafe extern "C" fn rt_net_listen_tls(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let Some(at) = handed(c, "net_listen_tls", "a port", port(at)) else {
                 return I64(0);
             };
-            let Some(credential) = c.text(unsafe { lent(credential_at, credential_n) }) else {
+            let Some(credential) = c.text(unsafe { borrowed(credential_at, credential_n) }) else {
                 return I64(0);
             };
             match net.listen_tls(label, at, credential, c.site()) {
@@ -268,11 +268,11 @@ pub unsafe extern "C" fn rt_net_listen_on(
         Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-            let options = SocketOption::list(unsafe { lent(options_at, options_n) });
+            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
                 handed(c, "net_listen_on", "an address", to),
                 handed(c, "net_listen_on", "socket options", options),
@@ -301,17 +301,17 @@ pub unsafe extern "C" fn rt_net_listen_unix(
         Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
             let (Some(root), Some(path)) = (
-                c.text(unsafe { lent(root_at, root_n) }),
-                c.text(unsafe { lent(path_at, path_n) }),
+                c.text(unsafe { borrowed(root_at, root_n) }),
+                c.text(unsafe { borrowed(path_at, path_n) }),
             ) else {
                 return TakenBytes(0);
             };
-            let answer = net.listen_unix(label, root, path, c.site());
-            given(c, answer)
+            let result = net.listen_unix(label, root, path, c.site());
+            given(c, result)
         },
     )
 }
@@ -332,10 +332,10 @@ pub unsafe extern "C" fn rt_net_connect(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(host) = c.text(unsafe { lent(host_at, host_n) }) else {
+            let Some(host) = c.text(unsafe { borrowed(host_at, host_n) }) else {
                 return I64(0);
             };
             let (Some(at), Some(timeout)) = (
@@ -367,10 +367,10 @@ pub unsafe extern "C" fn rt_net_connect_tls(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(host) = c.text(unsafe { lent(host_at, host_n) }) else {
+            let Some(host) = c.text(unsafe { borrowed(host_at, host_n) }) else {
                 return I64(0);
             };
             let (Some(at), Some(timeout)) = (
@@ -403,11 +403,11 @@ pub unsafe extern "C" fn rt_net_connect_to(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-            let options = SocketOption::list(unsafe { lent(options_at, options_n) });
+            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options), Some(timeout)) = (
                 handed(c, "net_connect_to", "an address", to),
                 handed(c, "net_connect_to", "socket options", options),
@@ -440,12 +440,12 @@ pub unsafe extern "C" fn rt_net_connect_unix(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let (Some(root), Some(path)) = (
-                c.text(unsafe { lent(root_at, root_n) }),
-                c.text(unsafe { lent(path_at, path_n) }),
+                c.text(unsafe { borrowed(root_at, root_n) }),
+                c.text(unsafe { borrowed(path_at, path_n) }),
             ) else {
                 return I64(0);
             };
@@ -472,7 +472,7 @@ pub unsafe extern "C" fn rt_net_handshake(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let job = net.handshake(label, conn.0, c.site());
@@ -502,10 +502,10 @@ pub unsafe extern "C" fn rt_net_start_tls(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(name) = c.text(unsafe { lent(name_at, name_n) }) else {
+            let Some(name) = c.text(unsafe { borrowed(name_at, name_n) }) else {
                 return I64(0);
             };
             let Some(upgrade) = upgrade(c, "net_start_tls", alpn_at, alpn_n, unread, timeout_ms)
@@ -539,10 +539,10 @@ pub unsafe extern "C" fn rt_net_serve_tls(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let Some(credential) = c.text(unsafe { lent(credential_at, credential_n) }) else {
+            let Some(credential) = c.text(unsafe { borrowed(credential_at, credential_n) }) else {
                 return I64(0);
             };
             let Some(upgrade) = upgrade(c, "net_serve_tls", alpn_at, alpn_n, unread, timeout_ms)
@@ -569,7 +569,7 @@ fn upgrade(
         c,
         native,
         "application protocols",
-        texts(unsafe { lent(alpn_at, alpn_n) }),
+        texts(unsafe { borrowed(alpn_at, alpn_n) }),
     )?;
     let unread = handed(
         c,
@@ -599,7 +599,7 @@ pub unsafe extern "C" fn rt_net_accept(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let job = net.accept(label, listener.0, c.site());
@@ -618,7 +618,7 @@ pub unsafe extern "C" fn rt_net_recv(
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "net_recv", Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return I64(0);
         };
         let (Some(max), Some(timeout)) = (
@@ -644,13 +644,13 @@ pub unsafe extern "C" fn rt_net_send(
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return I64(0);
         };
         let Some(timeout) = handed(c, "net_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let payload = unsafe { lent(payload_at, payload_n) }.to_vec();
+        let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
         let job = net.send(label, conn.0, payload, timeout, c.site());
         waited(c, "net_send", "`net.send`", job)
     })
@@ -671,7 +671,7 @@ pub unsafe extern "C" fn rt_net_send_secret(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let Some(framed) = secret::held(c, &framed) else {
@@ -700,7 +700,7 @@ pub unsafe extern "C" fn rt_net_close_write(
         Nondeterministic,
         (),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return;
             };
             let closed = net.close_write(label, conn.0, c.site());
@@ -712,7 +712,7 @@ pub unsafe extern "C" fn rt_net_close_write(
 /// Closes a socket of any kind.
 pub unsafe extern "C" fn rt_net_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
     asked(ctx, "net_close", Nondeterministic, (), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return;
         };
         let closed = net.close(label, socket.0, c.site());
@@ -761,17 +761,17 @@ fn set_option(
     option_n: I64,
     datagram: bool,
 ) -> TakenBytes {
-    let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+    let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
         return TakenBytes(0);
     };
-    let option = SocketOption::read(unsafe { lent(option_at, option_n) });
+    let option = SocketOption::read(unsafe { borrowed(option_at, option_n) });
     let Some(option) = handed(c, native, "a socket option", option) else {
         return TakenBytes(0);
     };
     let span = c.site();
-    let answer = held_datagram(&net, label, socket, datagram, span)
+    let result = held_datagram(&net, label, socket, datagram, span)
         .and_then(|()| net.set_option(label, socket.0, option, span));
-    given(c, answer)
+    given(c, result)
 }
 
 /// Holds `socket` to a datagram socket where `datagram` says it must be one.
@@ -801,7 +801,7 @@ pub unsafe extern "C" fn rt_net_local_port(
         Nondeterministic,
         I64(-1),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(-1);
             };
             match net.local_port(label, socket.0, c.site()) {
@@ -835,13 +835,13 @@ fn described(
         Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
             let span = c.site();
-            let answer = held_datagram(&net, label, socket, datagram, span)
+            let result = held_datagram(&net, label, socket, datagram, span)
                 .and_then(|()| read(&net, label, socket.0, span));
-            given(c, answer)
+            given(c, result)
         },
     )
 }
@@ -970,11 +970,11 @@ pub unsafe extern "C" fn rt_udp_bind(
         Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-            let options = SocketOption::list(unsafe { lent(options_at, options_n) });
+            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
                 handed(c, "udp_bind", "an address", to),
                 handed(c, "udp_bind", "socket options", options),
@@ -1001,15 +1001,15 @@ pub unsafe extern "C" fn rt_udp_connect(
         Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
             let Some(to) = handed(c, "udp_connect", "an address", to) else {
                 return TakenBytes(0);
             };
-            let answer = ply_host::udp::connect(&net, label, socket.0, &to, c.site());
-            given(c, answer)
+            let result = ply_host::udp::connect(&net, label, socket.0, &to, c.site());
+            given(c, result)
         },
     )
 }
@@ -1034,17 +1034,17 @@ pub unsafe extern "C" fn rt_udp_send_to(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
             let (Some(to), Some(timeout)) = (
                 handed(c, "udp_send_to", "an address", to),
                 handed(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
-            let payload = unsafe { lent(payload_at, payload_n) }.to_vec();
+            let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
             let job = ply_host::udp::send_to(&net, label, socket.0, to, payload, timeout, c.site());
             waited(c, "udp_send_to", "`udp.send_to`", job)
         },
@@ -1063,13 +1063,13 @@ pub unsafe extern "C" fn rt_udp_send(
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return I64(0);
         };
         let Some(timeout) = handed(c, "udp_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let payload = unsafe { lent(payload_at, payload_n) }.to_vec();
+        let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
         let job = ply_host::udp::send(&net, label, socket.0, payload, timeout, c.site());
         waited(c, "udp_send", "`udp.send`", job)
     })
@@ -1090,7 +1090,7 @@ pub unsafe extern "C" fn rt_udp_recv_from(
         Nondeterministic,
         I64(0),
         |c: &mut Ctx| {
-            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+            let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
             let (Some(max), Some(timeout)) = (
@@ -1137,7 +1137,7 @@ pub unsafe extern "C" fn rt_udp_set_option(
 /// Closes a datagram socket.
 pub unsafe extern "C" fn rt_udp_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
     asked(ctx, "udp_close", Nondeterministic, (), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+        let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return;
         };
         let span = c.site();

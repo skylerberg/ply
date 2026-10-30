@@ -1,10 +1,10 @@
 use crate::bare::context;
 use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
-use ply_compiled::native::{Addr, Answered, I64};
+use ply_compiled::native::{Addr, Returned, I64};
 use ply_compiled::rt::{Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, rt_taken};
 use ply_compiled::tasks::{
-    self, ANSWERED, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, Region, Shield,
+    self, RETURNED, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, Scheduler, Shield,
     Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
     rt_tickets_park, ticket_taken,
 };
@@ -31,10 +31,10 @@ fn asking(code: i64, n: i64) -> Message {
 }
 
 /// Asks its loop twice, the second time one more than it heard, then keeps what it heard last.
-unsafe fn asks_twice(_ctx: *mut Ctx, region: usize) {
-    let region = region as *mut Region;
-    let first = unsafe { tasks::to_loop(region, asking(1, 10)) };
-    let second = unsafe { tasks::to_loop(region, asking(2, first.numbers[0] + 1)) };
+unsafe fn asks_twice(_ctx: *mut Ctx, scheduler: usize) {
+    let scheduler = scheduler as *mut Scheduler;
+    let first = unsafe { tasks::to_loop(scheduler, asking(1, 10)) };
+    let second = unsafe { tasks::to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
     HEARD.with(|h| h.borrow_mut().push(second.numbers[0]));
 }
 
@@ -42,20 +42,20 @@ unsafe fn released(_ctx: *mut Ctx, _arg: usize) {
     RELEASED.with(|r| r.set(r.get() + 1));
 }
 
-fn body(run: unsafe fn(*mut Ctx, usize), region: *mut Region) -> Body {
+fn body(run: unsafe fn(*mut Ctx, usize), scheduler: *mut Scheduler) -> Body {
     Body {
         run,
         release: released,
-        arg: region as usize,
+        arg: scheduler as usize,
     }
 }
 
 #[test]
 fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, true);
-    let r: *mut Region = &mut *region;
-    region.start(1, body(asks_twice, r));
+    let mut scheduler = Scheduler::open(&mut ctx, true);
+    let r: *mut Scheduler = &mut *scheduler;
+    scheduler.start(1, body(asks_twice, r));
     let first = unsafe { tasks::resume(r, 1, Message::default()) };
     assert_eq!((first.code, first.numbers[0]), (1, 10));
     let second = unsafe { tasks::resume(r, 1, asking(0, 41)) };
@@ -63,22 +63,22 @@ fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
     let end = unsafe { tasks::resume(r, 1, asking(0, 7)) };
     assert_eq!(end.code, FINISHED);
     assert_eq!(heard(), [7]);
-    region.free(1);
+    scheduler.free(1);
     assert_eq!(
         RELEASED.with(Cell::get),
         0,
         "a body that ran is not released again"
     );
-    drop(region);
+    drop(scheduler);
 }
 
 #[test]
 fn tasks_interleave_through_their_loop_each_where_it_stopped() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, false);
-    let r: *mut Region = &mut *region;
-    region.start(1, body(asks_twice, r));
-    region.start(2, body(asks_twice, r));
+    let mut scheduler = Scheduler::open(&mut ctx, false);
+    let r: *mut Scheduler = &mut *scheduler;
+    scheduler.start(1, body(asks_twice, r));
+    scheduler.start(2, body(asks_twice, r));
     unsafe {
         assert_eq!(tasks::resume(r, 1, Message::default()).code, 1);
         assert_eq!(tasks::resume(r, 2, Message::default()).code, 1);
@@ -88,7 +88,7 @@ fn tasks_interleave_through_their_loop_each_where_it_stopped() {
         assert_eq!(tasks::resume(r, 2, asking(0, 2)).code, FINISHED);
     }
     assert_eq!(heard(), [1, 2]);
-    drop(region);
+    drop(scheduler);
 }
 
 unsafe fn unwinds(ctx: *mut Ctx, _: usize) {
@@ -109,11 +109,11 @@ unsafe fn breaks(ctx: *mut Ctx, _: usize) {
 fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
-    let mut region = Region::open(c, true);
-    let r: *mut Region = &mut *region;
-    region.start(1, body(unwinds, r));
-    region.start(2, body(raises, r));
-    region.start(3, body(breaks, r));
+    let mut scheduler = Scheduler::open(c, true);
+    let r: *mut Scheduler = &mut *scheduler;
+    scheduler.start(1, body(unwinds, r));
+    scheduler.start(2, body(raises, r));
+    scheduler.start(3, body(breaks, r));
     let ended = |id| unsafe { tasks::resume(r, id, Message::default()).code };
     assert_eq!(ended(1), UNWOUND);
     assert_eq!(unsafe { (*c).failed }, 0);
@@ -121,104 +121,104 @@ fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     assert_eq!(unsafe { (*c).failed }, 0);
     assert_eq!(ended(3), FAILED);
     assert_eq!(unsafe { (*c).failed }, 0);
-    assert!(!region.restore(1, None), "an unwound task leaves nothing");
-    assert!(region.restore(2, None));
+    assert!(!scheduler.restore(1, None), "an unwound task leaves nothing");
+    assert!(scheduler.restore(2, None));
     assert_eq!(unsafe { (*c).failed }, FAILED_TARGET);
     unsafe { (*c).failed = 0 };
-    assert!(region.restore(3, Some("noted".to_string())));
+    assert!(scheduler.restore(3, Some("noted".to_string())));
     assert_eq!(unsafe { (*c).failed }, 1);
     unsafe { (*c).failed = 0 };
-    drop(region);
+    drop(scheduler);
 }
 
 /// Asks its loop once, then ends.
-unsafe fn asks_once(_ctx: *mut Ctx, region: usize) {
-    unsafe { tasks::to_loop(region as *mut Region, asking(1, 0)) };
+unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
+    unsafe { tasks::to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
 }
 
 #[test]
 fn a_region_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, false);
-    let r: *mut Region = &mut *region;
+    let mut scheduler = Scheduler::open(&mut ctx, false);
+    let r: *mut Scheduler = &mut *scheduler;
     for id in 1..=3 {
-        region.start(id, body(asks_once, r));
+        scheduler.start(id, body(asks_once, r));
         unsafe { tasks::resume(r, id, Message::default()) };
     }
-    assert_eq!(region.stacks(), 3);
+    assert_eq!(scheduler.stacks(), 3);
     for id in 1..=3 {
         assert_eq!(
             unsafe { tasks::resume(r, id, Message::default()) }.code,
             FINISHED
         );
-        region.free(id);
+        scheduler.free(id);
     }
     assert_eq!(
-        region.stacks(),
+        scheduler.stacks(),
         3,
         "the stacks wait for the region's next tasks"
     );
     for id in 4..=5 {
-        region.start(id, body(asks_once, r));
+        scheduler.start(id, body(asks_once, r));
         unsafe { tasks::resume(r, id, Message::default()) };
     }
     assert_eq!(
-        region.stacks(),
+        scheduler.stacks(),
         3,
         "the next tasks ran on stacks given back"
     );
     for id in 4..=5 {
         unsafe { tasks::resume(r, id, Message::default()) };
-        region.free(id);
+        scheduler.free(id);
     }
-    drop(region);
+    drop(scheduler);
 }
 
 #[test]
 fn a_task_the_region_never_ran_lets_go_of_its_body() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, true);
-    let r: *mut Region = &mut *region;
+    let mut scheduler = Scheduler::open(&mut ctx, true);
+    let r: *mut Scheduler = &mut *scheduler;
     let before = RELEASED.with(Cell::get);
-    region.start(1, body(asks_once, r));
-    region.start(2, body(asks_once, r));
-    region.free(1);
+    scheduler.start(1, body(asks_once, r));
+    scheduler.start(2, body(asks_once, r));
+    scheduler.free(1);
     assert_eq!(RELEASED.with(Cell::get), before + 1);
-    drop(region);
+    drop(scheduler);
     assert_eq!(RELEASED.with(Cell::get), before + 2);
 }
 
 /// Stands in an `acquire`, asks its loop, and leaves it, keeping whether a cancel landed there.
-unsafe fn acquires(_ctx: *mut Ctx, region: usize) {
-    let region = region as *mut Region;
-    let id = unsafe { (*region).shield(Shield::Acquire) }.expect("a task runs");
-    unsafe { tasks::to_loop(region, asking(1, 0)) };
-    let lands = unsafe { (*region).unshield(id, Shield::Acquire) };
+unsafe fn acquires(_ctx: *mut Ctx, scheduler: usize) {
+    let scheduler = scheduler as *mut Scheduler;
+    let id = unsafe { (*scheduler).shield(Shield::Acquire) }.expect("a task runs");
+    unsafe { tasks::to_loop(scheduler, asking(1, 0)) };
+    let lands = unsafe { (*scheduler).unshield(id, Shield::Acquire) };
     HEARD.with(|h| h.borrow_mut().push(i64::from(lands)));
 }
 
 #[test]
 fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, true);
-    let r: *mut Region = &mut *region;
-    region.start(1, body(acquires, r));
+    let mut scheduler = Scheduler::open(&mut ctx, true);
+    let r: *mut Scheduler = &mut *scheduler;
+    scheduler.start(1, body(acquires, r));
     unsafe { tasks::resume(r, 1, Message::default()) };
     let inside = Shields {
         acquiring: 1,
         releasing: 0,
         stopping: false,
     };
-    assert_eq!(region.shields(1), inside);
-    assert_eq!(region.shielded(), [(1, inside)]);
-    region.hold_back(1, true);
+    assert_eq!(scheduler.shields(1), inside);
+    assert_eq!(scheduler.shielded(), [(1, inside)]);
+    scheduler.hold_back(1, true);
     assert_eq!(
         unsafe { tasks::resume(r, 1, Message::default()) }.code,
         FINISHED
     );
     assert_eq!(heard(), [1]);
-    assert_eq!(region.shields(1), Shields::default());
-    drop(region);
+    assert_eq!(scheduler.shields(1), Shields::default());
+    drop(scheduler);
 }
 
 #[test]
@@ -255,14 +255,14 @@ fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
         Some(runtime),
         None,
     );
-    let submit = |answer: &'static [u8]| {
+    let submit = |result: &'static [u8]| {
         jobs::submit(
             Work::Computing,
             &run,
             Span::DUMMY,
             "test",
             "a test job",
-            move || Ok(answer.to_vec()),
+            move || Ok(result.to_vec()),
         )
         .expect("a thread is had")
         .token
@@ -336,11 +336,11 @@ fn word_of<T>(x: T) -> Word {
 }
 
 fn handle(w: Word) -> Handle {
-    <Handle as Answered>::of(w)
+    <Handle as Returned>::of(w)
 }
 
 fn handed(w: Word) -> Handed {
-    <Handed as Answered>::of(w)
+    <Handed as Returned>::of(w)
 }
 
 fn let_go(ctx: &mut Ctx, w: Word) {
@@ -351,7 +351,7 @@ fn let_go(ctx: &mut Ctx, w: Word) {
 #[test]
 fn a_steps_footprint_is_written_as_the_trail_reads_it_and_taken_once() {
     let mut ctx = context();
-    ctx.footprint.push((
+    ctx.effects.push((
         tasks::Touched::Atom {
             effect: ply_core::Symbol::new("log"),
             resource: Some(ply_core::Symbol::new("x")),
@@ -359,7 +359,7 @@ fn a_steps_footprint_is_written_as_the_trail_reads_it_and_taken_once() {
         },
         [3, 1, 2],
     ));
-    ctx.footprint.push((
+    ctx.effects.push((
         tasks::Touched::Hold {
             id: 9,
             write: false,
@@ -425,7 +425,7 @@ const fn function(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> 
 }
 
 /// Keeps the descriptor and the first word it was entered with, and answers 5 kept.
-unsafe extern "C" fn answers_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let c = unsafe { &mut *ctx };
     let first = if c.entering_words == 0 {
         0
@@ -445,9 +445,9 @@ unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> 
     0
 }
 
-static FIVE: PlyFnDesc = function(answers_five);
+static FIVE: PlyFnDesc = function(results_five);
 static THREE: PlyFnDesc = function(asks_three);
-static ANSWERS_FIVE: Immortal = Immortal {
+static RESULTS_FIVE: Immortal = Immortal {
     rc: IMMORTAL,
     desc: &FIVE,
 };
@@ -457,7 +457,7 @@ static ASKS_THREE: Immortal = Immortal {
 };
 
 fn block(f: &'static Immortal) -> Block {
-    <Block as Answered>::of(f as *const Immortal as Word)
+    <Block as Returned>::of(f as *const Immortal as Word)
 }
 
 /// Stacks for a region, a task handle in it, and `f` made a body of task 1 answering into it, the
@@ -465,8 +465,8 @@ fn block(f: &'static Immortal) -> Block {
 fn started(ctx: &mut Ctx, f: &'static Immortal, row: &[Word], words: &mut [Word]) -> (Word, Word) {
     let c: *mut Ctx = ctx;
     let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1), I64(-1), I64(0), I64(0)) });
-    let region = unsafe { tasks::rt_stacks_region(c, handle(s)) };
-    let t = word_of(unsafe { tasks::rt_task_made(c, region) });
+    let scheduler = unsafe { tasks::rt_stacks_region(c, handle(s)) };
+    let t = word_of(unsafe { tasks::rt_task_made(c, scheduler) });
     let b = word_of(unsafe {
         tasks::rt_task_body(c, handle(t), block(f), row.as_ptr(), words.as_ptr())
     });
@@ -483,21 +483,21 @@ fn a_task_runs_its_body_with_the_words_its_maker_held_and_answers_into_its_handl
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let row = [1, 0, -1];
-    let (s, t) = started(&mut ctx, &ANSWERS_FIVE, &row, &mut [77]);
+    let (s, t) = started(&mut ctx, &RESULTS_FIVE, &row, &mut [77]);
     assert_eq!(unsafe { tasks::rt_task_said(c, handle(t), I64(1)) }.0, 1);
     let ended = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     assert_eq!(ended.0, FINISHED);
     assert_eq!(ENTERED.with(|e| e.take()), [row.as_ptr() as Word, 77]);
     assert_eq!(
         unsafe { tasks::rt_task_said(c, handle(t), I64(2)) }.0,
-        ANSWERED
+        RETURNED
     );
-    let answer = word_of(unsafe { tasks::rt_task_answer(c, handle(t)) });
+    let result = word_of(unsafe { tasks::rt_task_answer(c, handle(t)) });
     assert_eq!(
-        word_of(unsafe { tasks::rt_open(c, handle(answer), &INTS) }),
+        word_of(unsafe { tasks::rt_open(c, handle(result), &INTS) }),
         5
     );
-    let_go(&mut ctx, answer);
+    let_go(&mut ctx, result);
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);

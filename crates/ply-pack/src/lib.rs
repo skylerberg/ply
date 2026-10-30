@@ -89,7 +89,7 @@ impl Pack {
     /// What the zstd frame `len` bytes long at `offset` of the answers' file `path` holds; a `len`
     /// of 0 reads to the file's end. `None` where there is no such file, the range runs past it, or
     /// its bytes are not whole frames.
-    pub fn answer(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
+    pub fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
         let file = self.bytes(&format!("{ANSWERS}/{path}"))?;
         let end = if len == 0 {
             file.len()

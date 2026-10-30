@@ -37,7 +37,7 @@ fn argon2_answers_rfc_9106s_vectors() {
     ];
     for (variant, tag) in vectors {
         let made = password::argon2(variant, &[1; 32], &[2; 16], &[3; 8], &[4; 12], 32, 3, 4, 32)
-            .unwrap_or_else(|why| panic!("{variant} was refused: {why}"));
+            .unwrap_or_else(|reason| panic!("{variant} was refused: {reason}"));
         assert_eq!(made, hex(tag), "{variant}");
     }
 }
@@ -98,7 +98,7 @@ fn scrypt_answers_rfc_7914s_vectors() {
     ];
     for (secret, salt, log_n, r, p, tag) in vectors {
         let made = password::scrypt(secret.as_bytes(), salt.as_bytes(), log_n, r, p, 64)
-            .unwrap_or_else(|why| panic!("N = 2^{log_n} was refused: {why}"));
+            .unwrap_or_else(|reason| panic!("N = 2^{log_n} was refused: {reason}"));
         assert_eq!(made, hex(tag), "N = 2^{log_n}, r = {r}, p = {p}");
     }
 }
@@ -130,7 +130,7 @@ fn bcrypt_answers_jbcrypts_vectors() {
     ];
     for (secret, cost, salt, tag) in vectors {
         let made = password::bcrypt(secret.as_bytes(), &hex(salt), cost)
-            .unwrap_or_else(|why| panic!("cost {cost} was refused: {why}"));
+            .unwrap_or_else(|reason| panic!("cost {cost} was refused: {reason}"));
         assert_eq!(made, hex(tag), "`{secret}` at cost {cost}");
     }
 }
@@ -172,18 +172,18 @@ fn pbkdf2_answers_the_rfcs_vectors() {
 const PASSWORD: &[u8] = b"correct horse battery staple";
 
 /// What was asked, refused, with no `Work` made of it and so nothing computed.
-fn refused(asked: Result<Work, String>, names: &str) {
-    let why = match asked {
+fn rejected(asked: Result<Work, String>, names: &str) {
+    let reason = match asked {
         Ok(_) => panic!("nothing refused what should say `{names}`"),
-        Err(why) => why,
+        Err(reason) => reason,
     };
     assert!(
-        why.contains(names),
-        "the refusal does not say `{names}`: {why}"
+        reason.contains(names),
+        "the refusal does not say `{names}`: {reason}"
     );
     assert!(
-        !why.contains("correct") && !why.contains("staple"),
-        "the refusal holds the password: {why}"
+        !reason.contains("correct") && !reason.contains("staple"),
+        "the refusal holds the password: {reason}"
     );
 }
 
@@ -201,28 +201,28 @@ fn argon2_is_checked_against_its_bounds_before_anything_is_computed() {
     assert!(argon2id(8 * MAX_LANES, 1, MAX_LANES, MAX_LENGTH).is_ok());
     assert_eq!(MAX_ARGON2_WORK, 2 * MAX_MEMORY_KIB);
 
-    refused(argon2id(MAX_MEMORY_KIB + 1, 1, 1, 32), "KiB of memory");
-    refused(argon2id(4 << 20, 1, 1, 32), "4194304 KiB of memory");
-    refused(argon2id(MAX_MEMORY_KIB, 3, 1, 32), "3 passes");
-    refused(argon2id(1 << 20, 5, 1, 32), "5 passes");
-    refused(argon2id(i64::MAX, i64::MAX, 1, 32), "KiB of memory");
-    refused(argon2id(64, i64::MAX, 1, 32), "passes");
-    refused(argon2id(64, 0, 1, 32), "0 passes");
-    refused(argon2id(64, 1, 0, 32), "0 lanes");
-    refused(argon2id(8 * (MAX_LANES + 1), 1, MAX_LANES + 1, 32), "lanes");
-    refused(argon2id(31, 1, 4, 32), "31 KiB of memory");
-    refused(argon2id(64, 1, 1, 3), "a hash of 3 bytes");
-    refused(argon2id(64, 1, 1, MAX_LENGTH + 1), "a hash of 65 bytes");
-    refused(argon2id(64, 1, 1, -1), "a hash of -1 bytes");
-    refused(
+    rejected(argon2id(MAX_MEMORY_KIB + 1, 1, 1, 32), "KiB of memory");
+    rejected(argon2id(4 << 20, 1, 1, 32), "4194304 KiB of memory");
+    rejected(argon2id(MAX_MEMORY_KIB, 3, 1, 32), "3 passes");
+    rejected(argon2id(1 << 20, 5, 1, 32), "5 passes");
+    rejected(argon2id(i64::MAX, i64::MAX, 1, 32), "KiB of memory");
+    rejected(argon2id(64, i64::MAX, 1, 32), "passes");
+    rejected(argon2id(64, 0, 1, 32), "0 passes");
+    rejected(argon2id(64, 1, 0, 32), "0 lanes");
+    rejected(argon2id(8 * (MAX_LANES + 1), 1, MAX_LANES + 1, 32), "lanes");
+    rejected(argon2id(31, 1, 4, 32), "31 KiB of memory");
+    rejected(argon2id(64, 1, 1, 3), "a hash of 3 bytes");
+    rejected(argon2id(64, 1, 1, MAX_LENGTH + 1), "a hash of 65 bytes");
+    rejected(argon2id(64, 1, 1, -1), "a hash of -1 bytes");
+    rejected(
         Work::argon2("argon2id", PASSWORD, &[2; 7], b"", b"", 64, 1, 1, 32),
         "a salt of 7 bytes",
     );
-    refused(
+    rejected(
         Work::argon2("argon2id", PASSWORD, &[2; 16], b"", &[4; 33], 64, 1, 1, 32),
         "33 bytes of associated data",
     );
-    refused(
+    rejected(
         Work::argon2("argon2", PASSWORD, &[2; 16], b"", b"", 64, 1, 1, 32),
         "a variant",
     );
@@ -236,20 +236,20 @@ fn scrypt_is_checked_against_its_bounds_before_anything_is_computed() {
     assert!(asked(17, 8, 8).is_ok());
     assert!(asked(1, 1, 1 << 22).is_ok());
 
-    refused(asked(21, 8, 1), "N = 2^21, r = 8 and p = 1");
-    refused(asked(20, 8, 2), "their product");
-    refused(asked(20, 9, 1), "their product");
-    refused(asked(62, i64::MAX, i64::MAX), "their product");
-    refused(asked(63, 1, 1), "N = 2^63");
-    refused(asked(0, 8, 1), "N = 2^0");
-    refused(asked(14, 0, 1), "r = 0");
-    refused(asked(14, 8, 0), "p = 0");
-    refused(asked(14, 8, -1), "p = -1");
-    refused(
+    rejected(asked(21, 8, 1), "N = 2^21, r = 8 and p = 1");
+    rejected(asked(20, 8, 2), "their product");
+    rejected(asked(20, 9, 1), "their product");
+    rejected(asked(62, i64::MAX, i64::MAX), "their product");
+    rejected(asked(63, 1, 1), "N = 2^63");
+    rejected(asked(0, 8, 1), "N = 2^0");
+    rejected(asked(14, 0, 1), "r = 0");
+    rejected(asked(14, 8, 0), "p = 0");
+    rejected(asked(14, 8, -1), "p = -1");
+    rejected(
         Work::scrypt(PASSWORD, b"salt", 14, 8, 1, 0),
         "a hash of 0 bytes",
     );
-    refused(
+    rejected(
         Work::scrypt(PASSWORD, b"salt", 14, 8, 1, MAX_LENGTH + 1),
         "a hash of 65 bytes",
     );
@@ -259,36 +259,36 @@ fn scrypt_is_checked_against_its_bounds_before_anything_is_computed() {
 fn bcrypt_and_pbkdf2_are_checked_against_their_bounds_before_anything_is_computed() {
     let salt = [7u8; 16];
     assert!(Work::bcrypt(PASSWORD, &salt, MAX_BCRYPT_COST).is_ok());
-    refused(
+    rejected(
         Work::bcrypt(PASSWORD, &salt, MAX_BCRYPT_COST + 1),
         "a cost of 17",
     );
-    refused(Work::bcrypt(PASSWORD, &salt, 31), "a cost of 31");
-    refused(Work::bcrypt(PASSWORD, &salt, 3), "a cost of 3");
-    refused(
+    rejected(Work::bcrypt(PASSWORD, &salt, 31), "a cost of 31");
+    rejected(Work::bcrypt(PASSWORD, &salt, 3), "a cost of 3");
+    rejected(
         Work::bcrypt(PASSWORD, &salt[..15], 10),
         "a salt of 15 bytes",
     );
 
     assert!(Work::pbkdf2("SHA-256", PASSWORD, b"salt", MAX_PBKDF2_ITERATIONS, 32).is_ok());
     assert!(Work::pbkdf2("SHA-512", PASSWORD, b"", 1, MAX_LENGTH).is_ok());
-    refused(
+    rejected(
         Work::pbkdf2("SHA-256", PASSWORD, b"salt", MAX_PBKDF2_ITERATIONS + 1, 32),
         "10000001 iterations",
     );
-    refused(
+    rejected(
         Work::pbkdf2("SHA-256", PASSWORD, b"salt", 0, 32),
         "0 iterations",
     );
-    refused(
+    rejected(
         Work::pbkdf2("SHA-256", PASSWORD, b"salt", i64::MAX, 32),
         "iterations",
     );
-    refused(
+    rejected(
         Work::pbkdf2("SHA-256", PASSWORD, b"salt", 1, 0),
         "a hash of 0 bytes",
     );
-    refused(
+    rejected(
         Work::pbkdf2("SHA3-256", PASSWORD, b"salt", 1, 32),
         "a hash that is none of",
     );

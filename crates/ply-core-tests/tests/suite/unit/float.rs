@@ -208,7 +208,7 @@ impl Rng {
 }
 
 /// What the runtime's function for builtin `b` answers over `x`, and `y` where it takes two.
-fn answered(b: Function, x: f64, y: f64) -> f64 {
+fn returned(b: Function, x: f64, y: f64) -> f64 {
     match b {
         Function::Sqrt => x.sqrt(),
         Function::Exp => float::exp(x),
@@ -255,7 +255,7 @@ fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
                 continue;
             };
             judged += 1;
-            let got = answered(b, x, y);
+            let got = returned(b, x, y);
             assert_eq!(
                 bits(got),
                 bits(want),

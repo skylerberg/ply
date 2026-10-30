@@ -9,7 +9,7 @@
 
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, F64, I64, Raises};
-use crate::rt::{Ctx, Refused, lent, refuse, refused_numbered, refused_unknown};
+use crate::rt::{Ctx, Rejected, borrowed, refuse, rejected_numbered, rejected_unknown};
 use ply_core::builtins::{assert_failure, not_found};
 use ply_core::{Decimal, Diagnostic, Span, codes};
 
@@ -72,10 +72,10 @@ float_functions! {
 
 #[cold]
 #[inline(never)]
-fn err_machine(why: &str) -> Diagnostic {
+fn err_machine(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a string's bytes handed to the runtime: {why}"),
+        format!("a string's bytes handed to the runtime: {reason}"),
     )
     .primary(Span::DUMMY, "in compiled code")
     .note("this is Ply's fault, not the program's")
@@ -137,7 +137,7 @@ pub unsafe extern "C" fn rt_scalar_encoded(
 /// the `n` bytes at `p`, left as taken bytes, answering their count.
 pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I64) -> I64 {
     let c = unsafe { &mut *ctx };
-    let bytes = unsafe { lent(p, n) };
+    let bytes = unsafe { borrowed(p, n) };
     if text.0 != 0 && c.text(bytes).is_none() {
         return I64(0);
     }
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I
 
 /// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let digest = blake3::hash(unsafe { lent(p, n) });
+    let digest = blake3::hash(unsafe { borrowed(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
 }
 
@@ -180,48 +180,48 @@ pub unsafe extern "C" fn rt_refused_text(
 ) -> Raises {
     let c = unsafe { &mut *ctx };
     let site = c.site();
-    let Some(r) = refused_numbered(what) else {
-        refused_unknown(c, what);
+    let Some(r) = rejected_numbered(what) else {
+        rejected_unknown(c, what);
         return Raises(());
     };
-    let refused = match r {
-        Refused::StringFind => {
+    let rejected = match r {
+        Rejected::StringFind => {
             let (Some(s), Some(needle)) =
-                (c.text(unsafe { lent(p, n) }), c.text(unsafe { lent(q, m) }))
+                (c.text(unsafe { borrowed(p, n) }), c.text(unsafe { borrowed(q, m) }))
             else {
                 return Raises(());
             };
             not_found(site, s, needle)
         }
-        Refused::Assert => {
+        Rejected::Assert => {
             let message = if n.0 < 0 {
                 None
             } else {
-                match c.text(unsafe { lent(p, n) }) {
+                match c.text(unsafe { borrowed(p, n) }) {
                     Some(s) => Some(s),
                     None => return Raises(()),
                 }
             };
             assert_failure(message, site)
         }
-        Refused::SecretDecode | Refused::SecretEncode => {
-            let Some(encoding) = c.text(unsafe { lent(p, n) }) else {
+        Rejected::SecretDecode | Rejected::SecretEncode => {
+            let Some(encoding) = c.text(unsafe { borrowed(p, n) }) else {
                 return Raises(());
             };
-            let (what, does) = if r == Refused::SecretDecode {
+            let (what, does) = if r == Rejected::SecretDecode {
                 ("`Secret::decode`", "reads")
             } else {
                 ("`Secret::encode`", "writes")
             };
-            let why = format!("`{encoding}` is no encoding it {does}");
-            ply_core::crypto::misuse(site, what, why)
+            let reason = format!("`{encoding}` is no encoding it {does}");
+            ply_core::crypto::misuse(site, what, reason)
         }
         _ => {
-            refused_unknown(c, what);
+            rejected_unknown(c, what);
             return Raises(());
         }
     };
-    refuse(c, r, refused);
+    refuse(c, r, rejected);
     Raises(())
 }
 

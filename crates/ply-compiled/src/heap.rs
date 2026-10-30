@@ -128,7 +128,7 @@ pub mod poison {
         if !is_object(w) {
             return;
         }
-        let why = if w == word() {
+        let reason = if w == word() {
             "a payload word poisoned when its block died"
         } else if unsafe { (*(w as *const Obj)).rc } == 0 {
             "a block that has died"
@@ -142,7 +142,7 @@ pub mod poison {
             let (root, start, end) = unsafe { (*site, *site.add(1), *site.add(2)) };
             format!("root {root} bytes {start}..{end} from its start")
         };
-        panic!("a stale read: {why}, at {at}");
+        panic!("a stale read: {reason}, at {at}");
     }
 }
 
@@ -398,8 +398,8 @@ pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap, ctx: *mut crate::
             held.release(ctx);
             drop(held);
             (NATIVE_BYTES, true)
-        } else if crate::rt::hold_id(w).is_some() {
-            (crate::rt::HOLD_BYTES, false)
+        } else if crate::rt::scoped_id(w).is_some() {
+            (crate::rt::SCOPED_BYTES, false)
         } else {
             panic!("`rt_handle_free` was handed a block that is no handle")
         };

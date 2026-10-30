@@ -71,9 +71,9 @@ fn head() -> String {
     }
     out.push_str("} PlyCtx;\n");
     for h in helpers() {
-        let (answer, params) = signature(h.args(), h.answers());
+        let (result, params) = signature(h.args(), h.results());
         out.push_str(&format!(
-            "extern {answer} (*{})({params});\n",
+            "extern {result} (*{})({params});\n",
             pointer(h.name)
         ));
     }
@@ -84,24 +84,24 @@ fn head() -> String {
 fn bound() -> String {
     let mut out = String::new();
     for h in helpers() {
-        let (answer, params) = signature(h.args(), h.answers());
-        out.push_str(&format!("{answer} (*{})({params});\n", pointer(h.name)));
+        let (result, params) = signature(h.args(), h.results());
+        out.push_str(&format!("{result} (*{})({params});\n", pointer(h.name)));
     }
     out.push_str("void ply_bind(void **fns) {\n");
     for (i, h) in helpers().iter().enumerate() {
-        let (answer, params) = signature(h.args(), h.answers());
+        let (result, params) = signature(h.args(), h.results());
         let p = pointer(h.name);
-        out.push_str(&format!("  {p} = ({answer} (*)({params}))fns[{i}];\n"));
+        out.push_str(&format!("  {p} = ({result} (*)({params}))fns[{i}];\n"));
     }
     out.push_str("}\n");
     out
 }
 
 /// A helper's C return type and parameters: the context, then `args` words.
-fn signature(args: usize, answers: bool) -> (&'static str, String) {
+fn signature(args: usize, results: bool) -> (&'static str, String) {
     let params = std::iter::once("PlyCtx*").chain(std::iter::repeat_n("Word", args));
     (
-        if answers { "Word" } else { "void" },
+        if results { "Word" } else { "void" },
         params.collect::<Vec<_>>().join(", "),
     )
 }
@@ -175,7 +175,7 @@ pub fn exports_of(defs: &[Def]) -> Laid {
                 .map(|h| HelperShape {
                     name: h.name.to_string(),
                     args: h.args(),
-                    answers: h.answers(),
+                    results: h.results(),
                 })
                 .collect(),
             constants: Vec::new(),
@@ -317,12 +317,12 @@ pub fn entered(
         .unwrap_or_else(|| panic!("the unit does not take `{name}`"));
     let mut ctx = native.context();
     ctx.begin();
-    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let result = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
     let raised = ctx.take_failure().map(|d| d.message);
     ctx.end();
     if failed == 0 {
-        Ok(answer)
+        Ok(result)
     } else {
         Err(raised.unwrap_or_default())
     }

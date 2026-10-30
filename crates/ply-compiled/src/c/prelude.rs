@@ -33,8 +33,8 @@ impl Helper {
         self.signature.words()
     }
 
-    pub fn answers(&self) -> bool {
-        self.signature.answers()
+    pub fn results(&self) -> bool {
+        self.signature.results()
     }
 }
 
@@ -210,7 +210,7 @@ helpers! {
         body: Block,
         cleanup: Block,
         held: *const PlyType,
-        answer: *const PlyType
+        result: *const PlyType
     ) -> Handed;
     rt_unwind_hold(held) -> Word;
     rt_unwind_resume(held);

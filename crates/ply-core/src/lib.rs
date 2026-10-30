@@ -10,7 +10,7 @@ pub mod escape;
 pub mod expr;
 pub mod files;
 pub mod float;
-mod footprint;
+mod effects;
 pub mod handler;
 pub mod host;
 pub mod intty;
@@ -26,7 +26,7 @@ pub mod sqlite;
 pub use builtins::assert_failure;
 pub use crypto::constant_time_eq;
 pub use escape::{Boundary, Escapee, Handle};
-pub use footprint::{EffectAtom, Mode, Resource, label_var_name};
+pub use effects::{EffectAtom, Mode, Resource, label_var_name};
 pub use host::{
     Determinism, HostBinding, HostRuntime, HostUse, Pending, RuntimeFactory, ShutdownReport,
 };

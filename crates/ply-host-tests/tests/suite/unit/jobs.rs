@@ -6,7 +6,7 @@ use ply_host::registry::{facilities_of, job_bytes, run_of, unbound};
 use ply_host::signal::{Bounds, Shutdown, ShutdownSignal};
 use std::time::{Duration, Instant};
 
-fn answered(runtime: &dyn HostRuntime, ticket: &Pending) -> Vec<u8> {
+fn returned(runtime: &dyn HostRuntime, ticket: &Pending) -> Vec<u8> {
     job_bytes(runtime, ticket).unwrap_or_else(|d| panic!("the job was not answered: {}", d.message))
 }
 
@@ -27,11 +27,11 @@ fn a_jobs_ticket_is_answered_through_an_unbound_runtime_and_a_hosts() {
     let unbound = unbound()();
     for work in [Work::Computing, Work::Waiting] {
         let ticket = submitted(&*unbound, work, "a test job", || Ok(b"answered".to_vec()));
-        assert_eq!(answered(&*unbound, &ticket), b"answered");
+        assert_eq!(returned(&*unbound, &ticket), b"answered");
     }
     let host = ply_host::Host::new().runtime();
     let ticket = submitted(&*host, Work::Computing, "a test job", || Ok(vec![1, 2, 3]));
-    assert_eq!(answered(&*host, &ticket), [1, 2, 3]);
+    assert_eq!(returned(&*host, &ticket), [1, 2, 3]);
 }
 
 /// The run's region waits on a ticket it watches and takes its answer once it is answered.
@@ -43,10 +43,10 @@ fn a_watched_ticket_is_answered_to_the_run_that_watched_it() {
     });
     let run = run_of(&*runtime).expect("a host made the runtime");
     run.watch(&ticket).expect("the run submitted it");
-    while run.answered().is_empty() {
+    while run.returned().is_empty() {
         runtime.park().expect("one ticket is outstanding");
     }
-    assert_eq!(run.answered(), [ticket.token]);
+    assert_eq!(run.returned(), [ticket.token]);
     assert_eq!(
         run.taken(&ticket).expect("its own ticket"),
         Some(b"late".to_vec())
@@ -81,7 +81,7 @@ fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
         .runtime();
     let quick = || Ok(b"read".to_vec());
     let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
-    assert_eq!(answered(&*runtime, &ticket), b"read");
+    assert_eq!(returned(&*runtime, &ticket), b"read");
 
     assert!(shutdown.request(ShutdownSignal::Terminate));
     let until = Instant::now() + Duration::from_secs(5);
@@ -107,16 +107,16 @@ fn a_jobs_own_refusal_fails_the_run_with_its_code() {
         "test",
         "a test job",
         || {
-            Err(jobs::Failure::Refused(ply_core::Diagnostic::error(
+            Err(jobs::Failure::Rejected(ply_core::Diagnostic::error(
                 codes::PROCESS_OUTPUT_TOO_LARGE,
                 "too much",
             )))
         },
     )
     .expect("a thread is had");
-    let refused = job_bytes(&*runtime, &ticket).expect_err("the job refused");
-    assert_eq!(refused.code, codes::PROCESS_OUTPUT_TOO_LARGE);
-    assert_eq!(refused.message, "too much");
+    let rejected = job_bytes(&*runtime, &ticket).expect_err("the job refused");
+    assert_eq!(rejected.code, codes::PROCESS_OUTPUT_TOO_LARGE);
+    assert_eq!(rejected.message, "too much");
 }
 
 /// Every runtime one unbound factory makes, as each `parallel` branch makes its own, is over the

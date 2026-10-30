@@ -11,7 +11,7 @@ pub use children::{Ended, Finished, Heard, Io, Output, Signal};
 use crate::jobs::{Failure, Job, Refusing};
 use crate::native::found;
 use crate::stdio;
-use children::{Child, Launch, Refusal, Unusable};
+use children::{Child, Launch, ProcessError, Unusable};
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -134,8 +134,8 @@ impl ExecSpec {
     }
 }
 
-fn malformed(text: &str, why: &str) -> String {
-    format!("`{text}` is not an executable: {why}; write `--exec NAME=PATH`")
+fn malformed(text: &str, reason: &str) -> String {
+    format!("`{text}` is not an executable: {reason}; write `--exec NAME=PATH`")
 }
 
 /// What `--exec NAME=PATH` bound, resolved once: the only programs this run can start.
@@ -459,14 +459,14 @@ impl ProcessHost {
             let (_, child) = started.map_err(Failure::Said)?;
             match child.wait(None) {
                 Ok(Some(exit)) => Ok(exit.flat()),
-                Err(Refusal::TooMuch { out, err }) => Err(Failure::Refused(too_much(
+                Err(ProcessError::TooMuch { out, err }) => Err(Failure::Rejected(too_much(
                     "spawn", &program, out, err, span,
                 ))),
-                Err(Refusal::Unreaped(why)) => Err(Failure::Said(format!(
-                    "`{}`'s ending could not be read: {why}",
+                Err(ProcessError::Unreaped(reason)) => Err(Failure::Said(format!(
+                    "`{}`'s ending could not be read: {reason}",
                     program.display()
                 ))),
-                Ok(None) | Err(Refusal::Spent) => Err(Failure::Said(format!(
+                Ok(None) | Err(ProcessError::Spent) => Err(Failure::Said(format!(
                     "`{}` was waited on by something other than its spawn",
                     program.display()
                 ))),
@@ -516,7 +516,7 @@ impl ProcessHost {
         let at = Resource::Named(Symbol::new(label));
         self.children
             .get(handle, &at)
-            .map_err(|why| unusable(op, handle, &at, why, span))
+            .map_err(|reason| unusable(op, handle, &at, reason, span))
     }
 
     /// The job of how the child ended and what its streams hold, found once it has: none while it
@@ -535,7 +535,7 @@ impl ProcessHost {
         let deadline = deadline(timeout_ms);
         Ok(Box::new(move || match child.wait(deadline) {
             Ok(exit) => Ok(found(exit.map(Finished::flat))),
-            Err(refusal) => Err(refused("wait", handle, &child, refusal, span)),
+            Err(rejection) => Err(rejected("wait", handle, &child, rejection, span)),
         }))
     }
 
@@ -596,7 +596,7 @@ impl ProcessHost {
         let deadline = deadline(timeout_ms);
         Ok(Box::new(move || match child.next_line(deadline) {
             Ok(heard) => Ok(heard.flat()),
-            Err(refusal) => Err(refused("output_line", handle, &child, refusal, span)),
+            Err(rejection) => Err(rejected("output_line", handle, &child, rejection, span)),
         }))
     }
 }
@@ -629,14 +629,14 @@ fn deadline(ms: i64) -> Option<Instant> {
     Instant::now().checked_add(Duration::from_millis(ms))
 }
 
-fn refused(op: &'static str, handle: i64, child: &Child, refusal: Refusal, span: Span) -> Failure {
-    match refusal {
-        Refusal::Spent => Failure::Refused(raced(op, handle, span)),
-        Refusal::TooMuch { out, err } => {
-            Failure::Refused(too_much(op, child.program(), out, err, span))
+fn rejected(op: &'static str, handle: i64, child: &Child, rejection: ProcessError, span: Span) -> Failure {
+    match rejection {
+        ProcessError::Spent => Failure::Rejected(raced(op, handle, span)),
+        ProcessError::TooMuch { out, err } => {
+            Failure::Rejected(too_much(op, child.program(), out, err, span))
         }
-        Refusal::Unreaped(why) => {
-            Failure::Said(format!("child {handle}'s ending could not be read: {why}"))
+        ProcessError::Unreaped(reason) => {
+            Failure::Said(format!("child {handle}'s ending could not be read: {reason}"))
         }
     }
 }
@@ -698,8 +698,8 @@ fn too_much(op: &str, program: &Path, out: usize, err: usize, span: Span) -> Dia
 }
 
 #[cold]
-fn unusable(op: &str, handle: i64, at: &Resource, why: Unusable, span: Span) -> Diagnostic {
-    match why {
+fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) -> Diagnostic {
+    match reason {
         Unusable::Unknown => Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!("`process.{op}` was given {handle}, and no child has that handle"),

@@ -5,7 +5,7 @@ use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyOp, PlyType};
 use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_word, word_at};
 use crate::native::{I64, Raises};
 use crate::stack::{Stack, switch};
-use ply_core::builtins::hold_released;
+use ply_core::builtins::scoped_released;
 use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 mod budget;
 mod calls;
-mod crossing;
+mod marshalling;
 mod ctx;
 mod data;
 mod effects;
@@ -27,7 +27,7 @@ mod tables;
 
 pub use budget::*;
 pub use calls::*;
-pub use crossing::*;
+pub use marshalling::*;
 pub use ctx::*;
 pub use data::*;
 pub use effects::*;

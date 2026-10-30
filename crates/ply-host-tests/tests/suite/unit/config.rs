@@ -78,15 +78,15 @@ fn a_hosts_runtime_lends_its_snapshot_and_an_unbound_one_lends_none() {
     let runtime = ply_host::Host::new()
         .configured(Arc::new(granted))
         .runtime();
-    let lent = ply_host::registry::facilities_of(&*runtime)
+    let borrowed = ply_host::registry::facilities_of(&*runtime)
         .expect("a host made it")
         .configuration();
-    assert_eq!(lent.get("SERVICE_REGION"), Some("eu"));
-    assert_eq!(lent.plaintext("SERVICE_API_KEY"), Some("s3cret"));
+    assert_eq!(borrowed.get("SERVICE_REGION"), Some("eu"));
+    assert_eq!(borrowed.plaintext("SERVICE_API_KEY"), Some("s3cret"));
     let unbound = ply_host::registry::unbound()();
-    let lent = ply_host::registry::facilities_of(&*unbound)
+    let borrowed = ply_host::registry::facilities_of(&*unbound)
         .expect("a host made it")
         .configuration();
-    assert_eq!(lent.get("PATH"), None);
-    assert_eq!(lent.plaintext("SERVICE_API_KEY"), None);
+    assert_eq!(borrowed.get("PATH"), None);
+    assert_eq!(borrowed.plaintext("SERVICE_API_KEY"), None);
 }

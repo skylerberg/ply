@@ -8,7 +8,7 @@
 //! written.
 
 use crate::heap::{self, HEADER, Heap, IMMORTAL, Obj, SHARED, Word};
-use crate::native::{Answered, Machine, Taken};
+use crate::native::{Returned, Machine, Taken};
 use crate::rt::Ctx;
 
 /// A block emitted code made, or a runtime object it held the last count of, as a native takes it.
@@ -225,7 +225,7 @@ pub struct PlyOp {
     pub effect: i64,
     pub op: i64,
     /// What the operation answers.
-    pub answer: *const PlyType,
+    pub result: *const PlyType,
     /// Which parameters are the operation's own type parameter, bit `i` for parameter `i`: those
     /// the runtime keeps as [`Carried`] values rather than reading.
     pub own: u64,
@@ -249,8 +249,8 @@ impl PlyOp {
         unsafe { types(self.vars, self.vars_len) }
     }
 
-    pub fn answer(&self) -> &'static PlyType {
-        unsafe { &*self.answer }
+    pub fn result(&self) -> &'static PlyType {
+        unsafe { &*self.result }
     }
 
     /// Whether parameter `i` is the operation's own type parameter.
@@ -429,7 +429,7 @@ unsafe impl Taken for *const Handed {
 }
 
 // SAFETY: each is returned as one machine word, as an `int64_t` is.
-unsafe impl Answered for Block {
+unsafe impl Returned for Block {
     const MACHINE: Option<Machine> = Some(Machine::Block);
     const RAISES: bool = false;
     fn of(w: Word) -> Block {
@@ -437,7 +437,7 @@ unsafe impl Answered for Block {
     }
 }
 
-unsafe impl Answered for Handed {
+unsafe impl Returned for Handed {
     const MACHINE: Option<Machine> = Some(Machine::Handed);
     const RAISES: bool = false;
     fn of(w: Word) -> Handed {
@@ -445,7 +445,7 @@ unsafe impl Answered for Handed {
     }
 }
 
-unsafe impl Answered for Handle {
+unsafe impl Returned for Handle {
     const MACHINE: Option<Machine> = Some(Machine::Handle);
     const RAISES: bool = false;
     fn of(w: Word) -> Handle {
@@ -453,7 +453,7 @@ unsafe impl Answered for Handle {
     }
 }
 
-unsafe impl Answered for SecretHandle {
+unsafe impl Returned for SecretHandle {
     const MACHINE: Option<Machine> = Some(Machine::Secret);
     const RAISES: bool = false;
     fn of(w: Word) -> SecretHandle {

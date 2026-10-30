@@ -230,8 +230,8 @@ impl Sink for Text {
         }
         if record.kind == RecordKind::Exit {
             let _ = write!(line, " {}", record.outcome.as_str());
-            if let Outcome::Failed(why) = record.outcome {
-                let _ = write!(line, "({why})");
+            if let Outcome::Failed(reason) = record.outcome {
+                let _ = write!(line, "({reason})");
             }
         }
         if let Some(amount) = record.amount {
@@ -382,9 +382,9 @@ pub fn write_json(out: &mut String, record: &Record<'_>) {
     );
     if record.kind == RecordKind::Exit {
         let _ = write!(out, ",\"outcome\":\"{}\"", record.outcome.as_str());
-        if let Outcome::Failed(why) = record.outcome {
+        if let Outcome::Failed(reason) = record.outcome {
             out.push_str(",\"reason\":");
-            write_string(out, why);
+            write_string(out, reason);
         }
     }
     if let Some(amount) = record.amount {

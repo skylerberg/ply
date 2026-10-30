@@ -13,7 +13,7 @@ use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::heap;
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use ply_core::crypto::{self, Encodes};
 use ply_core::{Diagnostic, Span, codes};
 use zeroize::Zeroizing;
@@ -174,10 +174,10 @@ pub(crate) fn held<'a>(c: &mut Ctx, s: &SecretHandle) -> Option<&'a Sealed> {
 
 #[cold]
 #[inline(never)]
-fn err_secret(why: &str) -> Diagnostic {
+fn err_secret(reason: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
-        format!("a secret handed to the runtime: {why}"),
+        format!("a secret handed to the runtime: {reason}"),
     )
     .primary(Span::DUMMY, "in compiled code")
     .note("this is Ply's fault, not the program's")
@@ -186,7 +186,7 @@ fn err_secret(why: &str) -> Diagnostic {
 /// The name a string lends at `p`: an encoding's, a hash's, a cipher's or a scheme's. One that is
 /// not UTF-8 names nothing.
 unsafe fn name<'a>(p: Addr, n: I64) -> &'a str {
-    std::str::from_utf8(unsafe { lent(p, n) }).unwrap_or("")
+    std::str::from_utf8(unsafe { borrowed(p, n) }).unwrap_or("")
 }
 
 /// What a native that can find nothing tells: a byte 1 and the bytes found, or a byte 0 alone.
@@ -210,7 +210,7 @@ fn given_or_none(c: &mut Ctx, bytes: Option<Vec<u8>>) -> I64 {
 /// `Secret<Bytes>` otherwise.
 pub unsafe extern "C" fn rt_secret_of(ctx: *mut Ctx, p: Addr, n: I64, text: I64) -> SecretHandle {
     let c = unsafe { &mut *ctx };
-    let bytes = unsafe { lent(p, n) };
+    let bytes = unsafe { borrowed(p, n) };
     if text.0 != 0 && c.text(bytes).is_none() {
         return SecretHandle::of(0);
     }
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn rt_secret_verify(
     let Some(held) = held(c, &stored) else {
         return I64(0);
     };
-    let Some(candidate) = c.text(unsafe { lent(p, n) }) else {
+    let Some(candidate) = c.text(unsafe { borrowed(p, n) }) else {
         return I64(0);
     };
     let same = held.text && ply_core::constant_time_eq(&held.bytes, candidate.as_bytes());
@@ -391,7 +391,7 @@ pub unsafe extern "C" fn rt_secret_rsa_jwk(
     let numbers: Vec<&[u8]> = parts.collect();
     let document = match <[&[u8]; 6]>::try_from(numbers) {
         Ok(private) if leading == Some(&[][..]) => {
-            let (modulus, exponent) = unsafe { (lent(np, nn), lent(ep, en)) };
+            let (modulus, exponent) = unsafe { (borrowed(np, nn), borrowed(ep, en)) };
             crypto::rsa_jwk(modulus, exponent, private)
         }
         _ => None,
@@ -414,7 +414,7 @@ pub unsafe extern "C" fn rt_secret_hmac(
     let Some(held) = held(c, &key) else {
         return I64(-1);
     };
-    let message = unsafe { lent(mp, mn) };
+    let message = unsafe { borrowed(mp, mn) };
     let tag = crypto::hmac(unsafe { name(hp, hn) }, &held.bytes, message);
     given_or_none(c, tag)
 }
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn rt_secret_hkdf_extract(
     let Some(held) = held(c, &key) else {
         return SecretHandle::of(0);
     };
-    let salt = unsafe { lent(sp, sn) };
+    let salt = unsafe { borrowed(sp, sn) };
     let prk = crypto::hkdf_extract(unsafe { name(hp, hn) }, salt, &held.bytes);
     sealed_bytes(c, prk.unwrap_or_default())
 }
@@ -468,7 +468,7 @@ pub unsafe extern "C" fn rt_secret_hkdf_expand(
     let Some(held) = held(c, &key) else {
         return SecretHandle::of(0);
     };
-    let info = unsafe { lent(ip, in_) };
+    let info = unsafe { borrowed(ip, in_) };
     let okm = crypto::hkdf_expand(unsafe { name(hp, hn) }, &held.bytes, info, length.0);
     sealed_bytes(c, okm.unwrap_or_default())
 }
@@ -492,7 +492,7 @@ pub unsafe extern "C" fn rt_secret_pbkdf2(
     let Some(held) = held(c, &password) else {
         return SecretHandle::of(0);
     };
-    let salt = unsafe { lent(sp, sn) };
+    let salt = unsafe { borrowed(sp, sn) };
     let hash = unsafe { name(hp, hn) };
     let key = crypto::pbkdf2(hash, &held.bytes, salt, iterations.0, length.0);
     sealed_bytes(c, key.unwrap_or_default())
@@ -524,7 +524,7 @@ pub unsafe extern "C" fn rt_crypto_sealed(
     let Some(held) = held(c, &key) else {
         return TakenBytes(0);
     };
-    let (nonce, associated, plaintext) = unsafe { (lent(np, nn), lent(ap, an), lent(tp, tn)) };
+    let (nonce, associated, plaintext) = unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(tp, tn)) };
     let cipher = unsafe { name(cp, cn) };
     let sealed = crypto::seal(cipher, &held.bytes, nonce, associated, plaintext);
     c.given(sealed.unwrap_or_default())
@@ -551,7 +551,7 @@ pub unsafe extern "C" fn rt_crypto_opened(
     let Some(held) = held(c, &key) else {
         return TakenBytes(0);
     };
-    let (nonce, associated, sealed) = unsafe { (lent(np, nn), lent(ap, an), lent(sp, sn)) };
+    let (nonce, associated, sealed) = unsafe { (borrowed(np, nn), borrowed(ap, an), borrowed(sp, sn)) };
     let cipher = unsafe { name(cp, cn) };
     let opened = crypto::open(cipher, &held.bytes, nonce, associated, sealed);
     c.given(opened.map_or_else(|_| Vec::new(), found))
@@ -589,7 +589,7 @@ pub unsafe extern "C" fn rt_crypto_signature(
     let Some(held) = held(c, &key) else {
         return TakenBytes(0);
     };
-    let message = unsafe { lent(mp, mn) };
+    let message = unsafe { borrowed(mp, mn) };
     let signature = crypto::sign(unsafe { name(p, n) }, &held.bytes, message);
     c.given(signature.map_or_else(|_| Vec::new(), found))
 }
@@ -608,7 +608,7 @@ pub unsafe extern "C" fn rt_crypto_verified(
     sp: Addr,
     sn: I64,
 ) -> I64 {
-    let (public, message, signature) = unsafe { (lent(kp, kn), lent(mp, mn), lent(sp, sn)) };
+    let (public, message, signature) = unsafe { (borrowed(kp, kn), borrowed(mp, mn), borrowed(sp, sn)) };
     match crypto::verify(unsafe { name(p, n) }, public, message, signature) {
         Ok(holds) => I64(i64::from(holds)),
         Err(_) => I64(-1),
@@ -635,7 +635,7 @@ pub unsafe extern "C" fn rt_crypto_agreed(
     let Some(held) = held(c, &key) else {
         return SecretHandle::of(0);
     };
-    let peer = unsafe { lent(pp, pn) };
+    let peer = unsafe { borrowed(pp, pn) };
     let shared = crypto::agree(unsafe { name(p, n) }, &held.bytes, peer);
     sealed_bytes(c, shared.ok().flatten().unwrap_or_default())
 }

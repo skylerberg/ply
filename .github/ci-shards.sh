@@ -86,7 +86,7 @@ HOST_PACKAGES=(ply-host-tests)
 
 # `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
 # of its own run is never a cache, which the repository's other runs evict while those jobs wait for
-# runners: it is an artifact (`cache-keys` refuses a key that names the run and no later run reads).
+# runners: it is an artifact (`cache-keys` rejects a key that names the run and no later run reads).
 SUPERSEDED=(ply-stores-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
@@ -103,7 +103,7 @@ FIXED=(tcc-)
 # The actions the workflows use: `action:family` for one that saves cache entries under keys of its
 # own, of which a run restores the newest, and the bare name of one that saves none but those a step
 # spells. `supersede` deletes an entry no family names, so an action left out would lose its cache
-# every run: `verify` refuses a workflow that uses one.
+# every run: `verify` rejects a workflow that uses one.
 ACTIONS=(
   actions/cache
   actions/checkout
@@ -138,7 +138,7 @@ workspace() {
   CLI_SUITE=$(role cli-tests)
   # Packages whose own suites are runs too, as `id:path`, the id the directory's name: each failing
   # test is named in the log, where a test wrapping the run would report one failure for all of
-  # them, and a pass is kept until the code its test runs moves, where a test wrapping the run reruns
+  # them, and a pass stands until the code its test runs moves, where a test wrapping the run reruns
   # whenever the CLI moves.
   PACKAGE_SUITES=()
   for dir in $(role compiler) $(role cli) $(role package) $(role suite); do
@@ -677,7 +677,7 @@ covered() {
 
 # The paths the toolchain key hashes (`toolchain_inputs`), and those its core hashes, held to what a
 # bootstrap reads: an `embed` that leaves its path is an input too, and must land in one, or a `ply`
-# kept under the key would stand for a file that moved.
+# cached under the key would stand for a file that moved.
 cmd_toolchain_embeds() {
   local bad=0
   toolchain_embeds all || bad=$((bad + 1))
@@ -1133,7 +1133,7 @@ cmd_verify() {
     limit=$(job_block "$runs_job" | sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p')
     budget=$(deadline_of "$runs_job")
     if [[ -z $budget ]]; then
-      echo "FAIL: job '$runs_job' runs \`ci-ply.sh run\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing kept" >&2
+      echo "FAIL: job '$runs_job' runs \`ci-ply.sh run\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing cached" >&2
       failures=$((failures + 1))
     elif [[ -z $limit ]] || ((budget > limit - RUNS_MARGIN)); then
       echo "FAIL: job '$runs_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
@@ -1153,7 +1153,7 @@ cmd_verify() {
     echo "FAIL: the sweep takes '$(echo $swept)' file by file and ci-warm.sh cuts '$(echo $cut)' file by file" >&2
     failures=$((failures + 1))
   fi
-  # A store of kept records goes whole wherever it is cut or carried: one name in all three.
+  # A store of cached records goes whole wherever it is cut or carried: one name in all three.
   local stores_rs stores_warm stores_ply
   stores_rs=$(sed -n 's/^pub const STORES: &str = "\(.*\)";$/\1/p' "$sweep_rs")
   stores_warm=$(sed -n 's/^stores=\$cache\/\(.*\)$/\1/p' "$root/.github/ci-warm.sh")

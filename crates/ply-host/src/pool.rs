@@ -90,7 +90,7 @@ struct Held {
     what: &'static str,
     /// Whether the run collects it with `resolved`, rather than waiting for it alone.
     watched: bool,
-    answer: Option<JobOutput>,
+    result: Option<JobOutput>,
 }
 
 impl Run {
@@ -145,7 +145,7 @@ impl Run {
                 span,
                 what,
                 watched: false,
-                answer: None,
+                result: None,
             },
         );
     }
@@ -171,9 +171,9 @@ impl Run {
 
     /// Files a job's answer and rings the bell, after the answer is in place, so a wait that
     /// woke finds it.
-    fn file(&self, token: u64, answer: JobOutput) {
+    fn file(&self, token: u64, result: JobOutput) {
         if let Some(held) = lock(&self.held).get_mut(&token) {
-            held.answer = Some(answer);
+            held.result = Some(result);
         }
         self.bell.ring();
     }
@@ -193,13 +193,13 @@ impl Run {
     pub fn ready(&self) -> bool {
         lock(&self.held)
             .values()
-            .any(|held| held.watched && held.answer.is_some())
+            .any(|held| held.watched && held.result.is_some())
     }
 
     /// The watched operations answered and not yet taken, ascending, their answers left for `taken`.
-    pub fn answered(&self) -> Vec<u64> {
+    pub fn returned(&self) -> Vec<u64> {
         let mut tokens: Vec<u64> = (lock(&self.held).iter())
-            .filter(|(_, h)| h.watched && h.answer.is_some())
+            .filter(|(_, h)| h.watched && h.result.is_some())
             .map(|(token, _)| *token)
             .collect();
         tokens.sort_unstable();
@@ -211,7 +211,7 @@ impl Run {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
             None => return Err(err_unowned(pending)),
-            Some(h) if h.answer.is_none() => return Ok(None),
+            Some(h) if h.result.is_none() => return Ok(None),
             Some(_) => {}
         }
         let taken = held.remove(&pending.token);
@@ -220,9 +220,9 @@ impl Run {
             Some(Held {
                 span,
                 what,
-                answer: Some(answer),
+                result: Some(result),
                 ..
-            }) => bytes_of(span, what, answer).map(Some),
+            }) => bytes_of(span, what, result).map(Some),
             _ => Ok(None),
         }
     }
@@ -237,8 +237,8 @@ impl Run {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
             let seen = self.bell.rung();
-            if let Some(answer) = self.taken(pending)? {
-                return Ok(Some(answer));
+            if let Some(result) = self.taken(pending)? {
+                return Ok(Some(result));
             }
             match until {
                 None => self.bell.wait_past(seen),
@@ -283,10 +283,10 @@ impl Run {
 }
 
 /// The bytes a native's job answered, which is all one answers.
-fn bytes_of(span: Span, what: &str, answer: JobOutput) -> Result<Vec<u8>, Diagnostic> {
-    answer.map_err(|failure| match failure {
+fn bytes_of(span: Span, what: &str, result: JobOutput) -> Result<Vec<u8>, Diagnostic> {
+    result.map_err(|failure| match failure {
         Failure::Said(message) => failed(span, what, &message),
-        Failure::Refused(diagnostic) => diagnostic,
+        Failure::Rejected(diagnostic) => diagnostic,
     })
 }
 
@@ -537,10 +537,10 @@ fn err_bounded(what: &str, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn err_no_thread(what: &str, why: &std::io::Error, span: Span) -> Diagnostic {
+fn err_no_thread(what: &str, reason: &std::io::Error, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{what} could not start: {why}"),
+        format!("{what} could not start: {reason}"),
     )
     .primary(span, "the host could not spawn a thread for this operation")
 }

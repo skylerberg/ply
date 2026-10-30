@@ -53,7 +53,7 @@ pub mod fun {
 pub mod shown {
     /// A credential, or any other runtime object but a hold.
     pub const SEALED: u64 = 0;
-    pub const HOLD: u64 = 1;
+    pub const SCOPED: u64 = 1;
 }
 
 /// Whether a value of `tag` is numbered for [`tag::AGAIN`].

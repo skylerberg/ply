@@ -44,7 +44,7 @@ pub fn not_a_byte(span: Span, what: &str, byte: i64) -> Diagnostic {
 
 /// `byte_of_int` given `n`, which is no byte.
 #[cold]
-pub fn byte_of_int_refused(span: Span, n: i64) -> Diagnostic {
+pub fn byte_of_int_rejected(span: Span, n: i64) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, format!("`byte_of_int` was given {n}"))
         .primary(span, "a byte is 0 to 255")
         .note("mask the value before the call if that is what you meant: `n & 0xFF`")
@@ -156,7 +156,7 @@ pub fn assert_failure(message: Option<&str>, span: Span) -> Diagnostic {
 /// A hold reached after its region let it go, which only a continuation captured inside the region
 /// and resumed after the release can do.
 #[cold]
-pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
+pub fn scoped_released(span: Span, doing: &str) -> Diagnostic {
     Diagnostic::error(
         codes::HOLD_RELEASED,
         format!("a hold is {doing} after its region released what it held"),

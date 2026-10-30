@@ -243,13 +243,13 @@ pub fn err_host_in_search(span: Span, operation: &str, path: &'static str) -> Di
 
 #[cold]
 #[inline(never)]
-pub fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diagnostic {
+pub fn err_host_in_simulation(span: Span, operation: &str, scheduler: Span) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_IN_SIMULATION,
         format!("`{operation}` reached the host boundary from inside a `simulate` region"),
     )
     .primary(span, "performed here, against a real resource")
-    .secondary(region, "this region re-runs its body once per interleaving")
+    .secondary(scheduler, "this region re-runs its body once per interleaving")
     .note("the search runs the region whole for every schedule it explores, so this operation would be performed once per interleaving")
     .note("and the result would then be reported as a proof over every interleaving")
     .note("handle the operation with a test double inside the region, or hoist it out of the region entirely")

@@ -81,7 +81,7 @@ unsafe fn evaluated(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
         .ok()
         .and_then(|i| tables.functions.get(i))
     else {
-        c.fail(err_crossing(&format!(
+        c.fail(err_marshalling(&format!(
             "definition {} of a code table of {}",
             index.0,
             tables.functions.len()

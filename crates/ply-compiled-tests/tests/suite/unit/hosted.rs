@@ -143,11 +143,11 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
     note(&mut ctx, b"app", b"made.db", 0);
     assert!(ctx.take_failure().is_none());
     // Where the root lies with its links resolved, as a binding lends it.
-    let lent = [("app".to_string(), dir.path().canonicalize().unwrap())];
+    let borrowed = [("app".to_string(), dir.path().canonicalize().unwrap())];
     let shipped = |_: &str| None;
     let config = std::collections::BTreeMap::new();
     let world = World {
-        roots: &lent,
+        roots: &borrowed,
         binding: "b".to_string(),
         config: &config,
         binary: Binary {
@@ -259,8 +259,8 @@ fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_refused(
 
     let (other_at, other_len) = addr(b"correct horse");
     let other = unsafe { rt_secret_of(&mut ctx, other_at, other_len, I64(0)) };
-    let refused = unsafe { rt_kdf_bcrypt(&mut ctx, other, salt_at, salt_len, I64(31)) };
-    assert_eq!(refused.0, 0);
+    let rejected = unsafe { rt_kdf_bcrypt(&mut ctx, other, salt_at, salt_len, I64(31)) };
+    assert_eq!(rejected.0, 0);
     let failed = ctx.take_failure().expect("the cost was refused");
     assert!(
         failed.message.contains("a cost of 31"),

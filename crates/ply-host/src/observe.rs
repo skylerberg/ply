@@ -409,8 +409,8 @@ pub fn report(recorder: &Recorder, binary: &Binary<'_>) -> String {
     for (line, digest) in digested(&o, binary) {
         out.push_str(&format!("{line}\t{digest}\n"));
     }
-    for why in &o.opaque {
-        out.push_str(&format!("opaque\t{}\n", why.replace('\n', " ")));
+    for reason in &o.opaque {
+        out.push_str(&format!("opaque\t{}\n", reason.replace('\n', " ")));
     }
     out.push_str(END);
     out.push('\n');
@@ -454,7 +454,7 @@ fn fold_children(o: &mut Observed) {
                     format!("{kind}\t{module}\t{at}"),
                     digest.to_string(),
                 ),
-                ["opaque", why] => o.opaque.push(why.to_string()),
+                ["opaque", reason] => o.opaque.push(reason.to_string()),
                 _ => {}
             }
         }
@@ -493,7 +493,7 @@ fn located(root: &str, rest: &str, roots: &[(String, PathBuf)]) -> Option<PathBu
 
 /// What `how` answers of `path` now, as the digest a trace holds, leaving out what lies at `own`
 /// below it: the paths the test wrote there.
-fn answered(how: Read, path: &Path, own: &[PathBuf]) -> String {
+fn returned(how: Read, path: &Path, own: &[PathBuf]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(how.word().as_bytes());
     hasher.update(&[0]);
@@ -633,7 +633,7 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
                 how.word(),
                 listed.join(&OWN.to_string())
             ),
-            answered(*how, path, &own),
+            returned(*how, path, &own),
         );
     }
     Some(
@@ -703,7 +703,7 @@ pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<
                             .map(PathBuf::from)
                             .collect();
                         noted(&|r| r.read(how, &path));
-                        answered(how, &path, &own) == *digest
+                        returned(how, &path, &own) == *digest
                     }
                     None => false,
                 },

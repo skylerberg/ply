@@ -17,7 +17,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
     body: Block,
     cleanup: Block,
     held: *const PlyType,
-    answer: *const PlyType,
+    result: *const PlyType,
 ) -> Handed {
     use crate::frames::{Held, held_across};
     let c = unsafe { &mut *ctx };
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         return Handed::of(0);
     }
     let held = unsafe { Carried::new(Handed::of(acquired), held) };
-    let (answered, body, cleanup, held) = if cancelled {
+    let (returned, body, cleanup, held) = if cancelled {
         c.failed = FAILED_CANCELLED;
         (None, body, cleanup, held)
     } else {
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         else {
             unreachable!("a record gives back what it held");
         };
-        let r = unsafe { Carried::new(Handed::of(r), answer) };
+        let r = unsafe { Carried::new(Handed::of(r), result) };
         (Some(r), body, cleanup, held)
     };
     unsafe { body.let_go_function(ctx) };
@@ -92,13 +92,13 @@ pub unsafe extern "C" fn rt_with_cleanup(
         unsafe { cleanup.let_go_function(ctx) };
         return Handed::of(0);
     };
-    let answered = answered.filter(|_| ending == 0);
+    let returned = returned.filter(|_| ending == 0);
     let (f, given) = (cleanup.word(), held.handed().word());
     let call = || {
         entering();
         unsafe { Block::of(f).call(ctx, &[given]) }
     };
-    let (cleanup, answered) = match answered {
+    let (cleanup, returned) = match returned {
         Some(a) => {
             let (_, back) =
                 unsafe { held_across(ctx, [Held::Closure(cleanup), Held::Carried(a)], call) };
@@ -117,12 +117,12 @@ pub unsafe extern "C" fn rt_with_cleanup(
     };
     unsafe { cleanup.let_go_function(ctx) };
     if !aside.taken_up(unsafe { &mut *ctx }) {
-        if let Some(a) = answered {
+        if let Some(a) = returned {
             a.release(ctx);
         }
         return Handed::of(0);
     }
-    answered.map_or(Handed::of(0), Carried::handed)
+    returned.map_or(Handed::of(0), Carried::handed)
 }
 
 /// What is going on where a release runs, set aside while it runs: a `bracket` holds it across its
@@ -234,7 +234,7 @@ fn cancel_carried(c: &mut Ctx) {
 /// through [`rt_refused`] where the refusal names numbers, and through
 /// [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Refused {
+pub enum Rejected {
     ArrayNew,
     ColumnsNew,
     ArrayOfList,
@@ -264,65 +264,65 @@ pub enum Refused {
 }
 
 /// Every [`Refused`], each numbered by its place here as emitted code numbers it.
-pub const REFUSED: [Refused; 26] = [
-    Refused::ArrayNew,
-    Refused::ColumnsNew,
-    Refused::ArrayOfList,
-    Refused::ColumnsOfList,
-    Refused::ArrayGet,
-    Refused::ArraySet,
-    Refused::ColumnsGet,
-    Refused::ColumnsSet,
-    Refused::BytesAt,
-    Refused::BytesU32Le,
-    Refused::BytesSlice,
-    Refused::StringSlice,
-    Refused::ByteOfInt,
-    Refused::BytesIndexOfByte,
-    Refused::BytesIndexOfFrom,
-    Refused::BytesScan,
-    Refused::BytesScanUntil,
-    Refused::Range,
-    Refused::BytesSplit,
-    Refused::StringSplit,
-    Refused::StringFind,
-    Refused::Assert,
-    Refused::BytesPosition,
-    Refused::SecretDecode,
-    Refused::SecretEncode,
-    Refused::SecretRsaJwk,
+pub const REJECTED: [Rejected; 26] = [
+    Rejected::ArrayNew,
+    Rejected::ColumnsNew,
+    Rejected::ArrayOfList,
+    Rejected::ColumnsOfList,
+    Rejected::ArrayGet,
+    Rejected::ArraySet,
+    Rejected::ColumnsGet,
+    Rejected::ColumnsSet,
+    Rejected::BytesAt,
+    Rejected::BytesU32Le,
+    Rejected::BytesSlice,
+    Rejected::StringSlice,
+    Rejected::ByteOfInt,
+    Rejected::BytesIndexOfByte,
+    Rejected::BytesIndexOfFrom,
+    Rejected::BytesScan,
+    Rejected::BytesScanUntil,
+    Rejected::Range,
+    Rejected::BytesSplit,
+    Rejected::StringSplit,
+    Rejected::StringFind,
+    Rejected::Assert,
+    Rejected::BytesPosition,
+    Rejected::SecretDecode,
+    Rejected::SecretEncode,
+    Rejected::SecretRsaJwk,
 ];
 
-impl Refused {
+impl Rejected {
     /// Its name in the prelude.
     pub fn name(self) -> &'static str {
         match self {
-            Refused::ArrayNew => "Array::new",
-            Refused::ColumnsNew => "Columns::new",
-            Refused::ArrayOfList => "Array::of_list",
-            Refused::ColumnsOfList => "Columns::of_list",
-            Refused::ArrayGet => "Array::get",
-            Refused::ArraySet => "Array::set",
-            Refused::ColumnsGet => "Columns::get",
-            Refused::ColumnsSet => "Columns::set",
-            Refused::BytesAt => "Bytes::at",
-            Refused::BytesU32Le => "Bytes::u32_le",
-            Refused::BytesSlice => "Bytes::slice",
-            Refused::StringSlice => "String::slice",
-            Refused::ByteOfInt => "byte_of_int",
-            Refused::BytesIndexOfByte => "Bytes::index_of_byte",
-            Refused::BytesIndexOfFrom => "Bytes::index_of_from",
-            Refused::BytesScan => "Bytes::scan",
-            Refused::BytesScanUntil => "Bytes::scan_until",
-            Refused::Range => "range",
-            Refused::BytesSplit => "Bytes::split",
-            Refused::StringSplit => "String::split",
-            Refused::StringFind => "String::find",
-            Refused::Assert => "assert",
-            Refused::BytesPosition => "Bytes::position",
-            Refused::SecretDecode => "Secret::decode",
-            Refused::SecretEncode => "Secret::encode",
-            Refused::SecretRsaJwk => "Secret::rsa_jwk",
+            Rejected::ArrayNew => "Array::new",
+            Rejected::ColumnsNew => "Columns::new",
+            Rejected::ArrayOfList => "Array::of_list",
+            Rejected::ColumnsOfList => "Columns::of_list",
+            Rejected::ArrayGet => "Array::get",
+            Rejected::ArraySet => "Array::set",
+            Rejected::ColumnsGet => "Columns::get",
+            Rejected::ColumnsSet => "Columns::set",
+            Rejected::BytesAt => "Bytes::at",
+            Rejected::BytesU32Le => "Bytes::u32_le",
+            Rejected::BytesSlice => "Bytes::slice",
+            Rejected::StringSlice => "String::slice",
+            Rejected::ByteOfInt => "byte_of_int",
+            Rejected::BytesIndexOfByte => "Bytes::index_of_byte",
+            Rejected::BytesIndexOfFrom => "Bytes::index_of_from",
+            Rejected::BytesScan => "Bytes::scan",
+            Rejected::BytesScanUntil => "Bytes::scan_until",
+            Rejected::Range => "range",
+            Rejected::BytesSplit => "Bytes::split",
+            Rejected::StringSplit => "String::split",
+            Rejected::StringFind => "String::find",
+            Rejected::Assert => "assert",
+            Rejected::BytesPosition => "Bytes::position",
+            Rejected::SecretDecode => "Secret::decode",
+            Rejected::SecretEncode => "Secret::encode",
+            Rejected::SecretRsaJwk => "Secret::rsa_jwk",
         }
     }
 
@@ -331,21 +331,21 @@ impl Refused {
     pub fn raises(self) -> bool {
         !matches!(
             self,
-            Refused::ArrayOfList | Refused::ColumnsOfList | Refused::Range
+            Rejected::ArrayOfList | Rejected::ColumnsOfList | Rejected::Range
         )
     }
 }
 
 /// The refusal [`REFUSED`] numbers `what`.
-pub(crate) fn refused_numbered(what: I64) -> Option<Refused> {
+pub(crate) fn rejected_numbered(what: I64) -> Option<Rejected> {
     usize::try_from(what.0)
         .ok()
-        .and_then(|at| REFUSED.get(at).copied())
+        .and_then(|at| REJECTED.get(at).copied())
 }
 
 /// The refusal `d` of `r`: raised for `abort.raise` to answer where `r` raises, else failing the
 /// run.
-pub(crate) fn refuse(c: &mut Ctx, r: Refused, d: Diagnostic) {
+pub(crate) fn refuse(c: &mut Ctx, r: Rejected, d: Diagnostic) {
     if r.raises() {
         raise_error(c, d);
     } else {
@@ -355,7 +355,7 @@ pub(crate) fn refuse(c: &mut Ctx, r: Refused, d: Diagnostic) {
 
 /// The entry failed as Ply's fault: emitted code handed a refusal `what` that names no builtin the
 /// native refuses.
-pub(crate) fn refused_unknown(c: &mut Ctx, what: I64) {
+pub(crate) fn rejected_unknown(c: &mut Ctx, what: I64) {
     c.fail(
         Diagnostic::error(
             codes::INTERNAL_ERROR,
@@ -381,38 +381,38 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
     let cx = unsafe { &mut *ctx };
     let site = cx.site();
     let len = |n: I64| usize::try_from(n.0).unwrap_or(0);
-    let Some(r) = refused_numbered(what) else {
-        refused_unknown(cx, what);
+    let Some(r) = rejected_numbered(what) else {
+        rejected_unknown(cx, what);
         return Raises(());
     };
     let name = r.name();
-    let refused = match r {
-        Refused::ArrayNew | Refused::ColumnsNew | Refused::ArrayOfList | Refused::ColumnsOfList => {
+    let rejected = match r {
+        Rejected::ArrayNew | Rejected::ColumnsNew | Rejected::ArrayOfList | Rejected::ColumnsOfList => {
             said::array_length(site, name, a.0)
         }
-        Refused::ArrayGet | Refused::ArraySet | Refused::ColumnsGet | Refused::ColumnsSet => {
+        Rejected::ArrayGet | Rejected::ArraySet | Rejected::ColumnsGet | Rejected::ColumnsSet => {
             said::out_of_range(site, name, a.0, len(b), "elements")
         }
-        Refused::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
+        Rejected::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
         // Told at the last index it would read, as the builtin tells it.
-        Refused::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
-        Refused::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
-        Refused::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
-        Refused::ByteOfInt => said::byte_of_int_refused(site, a.0),
-        Refused::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
-        Refused::BytesIndexOfFrom | Refused::BytesPosition => {
+        Rejected::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
+        Rejected::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
+        Rejected::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
+        Rejected::ByteOfInt => said::byte_of_int_rejected(site, a.0),
+        Rejected::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
+        Rejected::BytesIndexOfFrom | Rejected::BytesPosition => {
             said::start_outside(a.0, len(b), site, name)
         }
-        Refused::BytesScan | Refused::BytesScanUntil => {
+        Rejected::BytesScan | Rejected::BytesScanUntil => {
             if usize::try_from(a.0).is_ok_and(|from| from <= len(b)) {
                 said::negative_budget(site, name, c.0)
             } else {
                 said::start_outside(a.0, len(b), site, name)
             }
         }
-        Refused::Range => said::range_too_long(site, a.0, b.0),
-        Refused::BytesSplit | Refused::StringSplit => said::empty_separator(site, name),
-        Refused::SecretRsaJwk => ply_core::crypto::misuse(
+        Rejected::Range => said::range_too_long(site, a.0, b.0),
+        Rejected::BytesSplit | Rejected::StringSplit => said::empty_separator(site, name),
+        Rejected::SecretRsaJwk => ply_core::crypto::misuse(
             site,
             "`Secret::rsa_jwk`",
             format!(
@@ -421,11 +421,11 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
             ),
         ),
         _ => {
-            refused_unknown(cx, what);
+            rejected_unknown(cx, what);
             return Raises(());
         }
     };
-    refuse(cx, r, refused);
+    refuse(cx, r, rejected);
     Raises(())
 }
 
@@ -450,8 +450,8 @@ pub unsafe extern "C" fn rt_assert_failed(
     .note(format!("expected: {e}"))
     .note(format!("actual:   {a}"))
     .showing(vec![
-        unsafe { lent(expected, m) }.to_vec(),
-        unsafe { lent(actual, n) }.to_vec(),
+        unsafe { borrowed(expected, m) }.to_vec(),
+        unsafe { borrowed(actual, n) }.to_vec(),
     ]);
     raise_error(c, d);
     Raises(())

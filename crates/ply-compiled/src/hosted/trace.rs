@@ -5,7 +5,7 @@
 use super::{Nondeterministic, asked, done, from_host, handed};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use ply_core::Decimal;
 use ply_host::trace::{
     Field, Level, Outcome, Owner, RecordKind, Trace, fields_read, spans::err_unbalanced,
@@ -58,7 +58,7 @@ fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Fi
         c,
         native,
         "a record's fields",
-        fields_read(unsafe { lent(at, n) }),
+        fields_read(unsafe { borrowed(at, n) }),
     )
 }
 
@@ -112,9 +112,9 @@ pub unsafe extern "C" fn rt_trace_record(
             return;
         };
         let (Some(channel), Some(name), Some(value)) = (
-            c.text(unsafe { lent(channel_at, channel_n) }),
-            c.text(unsafe { lent(name_at, name_n) }),
-            c.text(unsafe { lent(value_at, value_n) }),
+            c.text(unsafe { borrowed(channel_at, channel_n) }),
+            c.text(unsafe { borrowed(name_at, name_n) }),
+            c.text(unsafe { borrowed(value_at, value_n) }),
         ) else {
             return;
         };
@@ -156,8 +156,8 @@ pub unsafe extern "C" fn rt_trace_enter(
         I64(0),
         |c: &mut Ctx| {
             let (Some(channel), Some(name)) = (
-                c.text(unsafe { lent(channel_at, channel_n) }),
-                c.text(unsafe { lent(name_at, name_n) }),
+                c.text(unsafe { borrowed(channel_at, channel_n) }),
+                c.text(unsafe { borrowed(name_at, name_n) }),
             ) else {
                 return I64(0);
             };
@@ -186,8 +186,8 @@ pub unsafe extern "C" fn rt_trace_exit(
 ) {
     asked(ctx, "trace_exit", Nondeterministic, (), |c: &mut Ctx| {
         let (Some(channel), Some(reason)) = (
-            c.text(unsafe { lent(channel_at, channel_n) }),
-            c.text(unsafe { lent(reason_at, reason_n) }),
+            c.text(unsafe { borrowed(channel_at, channel_n) }),
+            c.text(unsafe { borrowed(reason_at, reason_n) }),
         ) else {
             return;
         };
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn rt_trace_exit(
         let span = c.site();
         let closed = trace
             .exit(owner, channel, id.0, outcome)
-            .map_err(|why| err_unbalanced(span, "`trace.exit`", id.0, &why));
+            .map_err(|reason| err_unbalanced(span, "`trace.exit`", id.0, &reason));
         done(c, closed);
     });
 }

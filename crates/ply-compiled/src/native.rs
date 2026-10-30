@@ -71,7 +71,7 @@ impl Machine {
 pub struct Signature {
     pub params: &'static [Machine],
     /// `None` for a native that answers nothing.
-    pub answer: Option<Machine>,
+    pub result: Option<Machine>,
     /// Whether a failure of it is a raise of `abort.raise`, which a `handle` answers, rather than a
     /// fault that ends the run.
     pub raises: bool,
@@ -83,8 +83,8 @@ impl Signature {
         self.params.len()
     }
 
-    pub fn answers(&self) -> bool {
-        self.answer.is_some()
+    pub fn results(&self) -> bool {
+        self.result.is_some()
     }
 }
 
@@ -160,7 +160,7 @@ unsafe impl Taken for Out {
 /// # Safety
 /// A type that answers is returned as the C calling convention returns one `int64_t`, which is what
 /// the emitted C declares a native that answers to return; one that does not is `()` or [`Raises`].
-pub unsafe trait Answered {
+pub unsafe trait Returned {
     /// `None` for `()` and [`Raises`].
     const MACHINE: Option<Machine>;
     const RAISES: bool;
@@ -168,13 +168,13 @@ pub unsafe trait Answered {
     fn of(w: Word) -> Self;
 }
 
-unsafe impl Answered for () {
+unsafe impl Returned for () {
     const MACHINE: Option<Machine> = None;
     const RAISES: bool = false;
     fn of(_: Word) -> Self {}
 }
 
-unsafe impl Answered for Word {
+unsafe impl Returned for Word {
     const MACHINE: Option<Machine> = Some(Machine::Word);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
@@ -182,7 +182,7 @@ unsafe impl Answered for Word {
     }
 }
 
-unsafe impl Answered for Raises {
+unsafe impl Returned for Raises {
     const MACHINE: Option<Machine> = None;
     const RAISES: bool = true;
     fn of(_: Word) -> Self {
@@ -190,7 +190,7 @@ unsafe impl Answered for Raises {
     }
 }
 
-unsafe impl Answered for I64 {
+unsafe impl Returned for I64 {
     const MACHINE: Option<Machine> = Some(Machine::I64);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
@@ -198,7 +198,7 @@ unsafe impl Answered for I64 {
     }
 }
 
-unsafe impl Answered for F64 {
+unsafe impl Returned for F64 {
     const MACHINE: Option<Machine> = Some(Machine::F64);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
@@ -206,7 +206,7 @@ unsafe impl Answered for F64 {
     }
 }
 
-unsafe impl Answered for TakenBytes {
+unsafe impl Returned for TakenBytes {
     const MACHINE: Option<Machine> = Some(Machine::Taken);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
@@ -222,10 +222,10 @@ pub trait Native: Copy {
 
 macro_rules! natives_taking {
     ($($a:ident)*) => {
-        impl<R: Answered, $($a: Taken),*> Native for unsafe extern "C" fn(*mut Ctx $(, $a)*) -> R {
+        impl<R: Returned, $($a: Taken),*> Native for unsafe extern "C" fn(*mut Ctx $(, $a)*) -> R {
             const SIGNATURE: Signature = Signature {
                 params: &[$($a::MACHINE),*],
-                answer: R::MACHINE,
+                result: R::MACHINE,
                 raises: R::RAISES,
             };
             fn address(self) -> *const () {

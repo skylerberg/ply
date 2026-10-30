@@ -192,7 +192,7 @@ fn removed(path: &Path) -> bool {
 
 /// The stage-directory entry holding one runnable per program the builder answered for in memory,
 /// each swept on its own.
-pub const ANSWERED: &str = "answered";
+pub const RETURNED: &str = "answered";
 
 /// The stage-directory entry holding one file per answer a command takes back over an unchanged walk
 /// (`ply run`'s front end, `ply check`'s answer), each swept on its own.
@@ -200,7 +200,7 @@ pub const REUSED: &str = "reused";
 
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 2] = [ANSWERED, REUSED];
+const BY_FILE: [&str; 2] = [RETURNED, REUSED];
 
 /// An entry used within this long is never swept: a run may be reading it, or about to open what
 /// it just wrote.

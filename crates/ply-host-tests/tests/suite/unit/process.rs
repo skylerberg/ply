@@ -93,7 +93,7 @@ fn exit_records_the_first_code_and_unwinds() {
 #[test]
 fn a_host_that_only_starts_programs_withholds_the_runs_own_process() {
     let host = ProcessHost::spawning(Executables::new());
-    let refusals = [
+    let rejections = [
         host.args(S).map(|_| ()).expect_err("no arguments"),
         host.line(Stream::Out, "x", S).expect_err("no stream"),
         host.write(Stream::Err, b"x", S)
@@ -104,15 +104,15 @@ fn a_host_that_only_starts_programs_withholds_the_runs_own_process() {
         host.read(1, S).map(|_| ()).expect_err("no input"),
         host.exit(0, S),
     ];
-    for refused in refusals {
-        assert_eq!(refused.code, codes::HOST_UNBOUND, "{}", refused.message);
+    for rejected in rejections {
+        assert_eq!(rejected.code, codes::HOST_UNBOUND, "{}", rejected.message);
         assert!(
-            refused
+            rejected
                 .notes
                 .iter()
                 .any(|n| n.contains("`ply test` withholds it")),
             "{:?}",
-            refused.notes
+            rejected.notes
         );
     }
     assert!(host.captured().is_empty());
@@ -137,8 +137,8 @@ fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
 /// What a job answered, run on this thread.
 fn ran(job: Refusing) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
-        Failure::Refused(refusal) => refusal,
-        Failure::Said(why) => panic!("the job failed: {why}"),
+        Failure::Rejected(rejection) => rejection,
+        Failure::Said(reason) => panic!("the job failed: {reason}"),
     })
 }
 
@@ -256,21 +256,21 @@ fn a_spawn_runs_in_the_directory_it_was_given() {
 #[test]
 fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
     let host = spawning("sh", SH);
-    let refused =
+    let rejected =
         spawn(&host, "cc", &["-c", "true"], "", &[]).expect_err("`cc` is bound to nothing");
-    assert_eq!(refused.code, codes::PROCESS_EXEC_UNBOUND);
+    assert_eq!(rejected.code, codes::PROCESS_EXEC_UNBOUND);
     assert!(
-        refused.notes.iter().any(|n| n.contains("--exec cc=")),
+        rejected.notes.iter().any(|n| n.contains("--exec cc=")),
         "the diagnostic should name the flag: {:?}",
-        refused.notes
+        rejected.notes
     );
     assert!(
-        refused
+        rejected
             .notes
             .iter()
             .any(|n| n.contains("process.bound[cc]()")),
         "the diagnostic should name the question a program can ask first: {:?}",
-        refused.notes
+        rejected.notes
     );
 }
 
@@ -376,7 +376,7 @@ fn launched(
 fn start(host: &Arc<ProcessHost>, script: &str, dir: &str, io: Io) -> i64 {
     launched(host, "sh", script, dir, io)
         .expect("a start answers")
-        .unwrap_or_else(|why| panic!("not started: {why}"))
+        .unwrap_or_else(|reason| panic!("not started: {reason}"))
 }
 
 fn wait_as(
@@ -674,12 +674,12 @@ fn kept_output_past_the_bound_is_drained_and_refused_at_the_wait() {
         wired(false, Output::Keep, Output::Discard),
     );
     // The child finishes rather than blocking on a full pipe, and the refusal comes at the wait.
-    let refused = wait(&host, child, 60_000).expect_err("more than a kept stream holds");
-    assert_eq!(refused.code, codes::PROCESS_OUTPUT_TOO_LARGE);
+    let rejected = wait(&host, child, 60_000).expect_err("more than a kept stream holds");
+    assert_eq!(rejected.code, codes::PROCESS_OUTPUT_TOO_LARGE);
     assert!(
-        refused.message.contains(&over.to_string()),
+        rejected.message.contains(&over.to_string()),
         "{}",
-        refused.message
+        rejected.message
     );
     let again = wait(&host, child, 0).expect_err("the refusal spent the handle");
     assert_eq!(again.code, codes::RUNTIME_ERROR);
@@ -695,17 +695,17 @@ fn a_spent_handle_and_one_never_answered_are_refusals_rather_than_children() {
         wired(false, Output::Discard, Output::Discard),
     );
     assert!(wait(&host, child, -1).expect("a wait").is_some());
-    for refused in [
+    for rejected in [
         wait(&host, child, 0).map(|_| ()),
         signal(&host, child, Signal::Kill).map(|_| ()),
         input(&host, child, b"x").map(|_| ()),
     ] {
-        let refused = refused.expect_err("a spent handle names nothing");
-        assert_eq!(refused.code, codes::RUNTIME_ERROR);
+        let rejected = rejected.expect_err("a spent handle names nothing");
+        assert_eq!(rejected.code, codes::RUNTIME_ERROR);
         assert!(
-            refused.message.contains("already been waited on"),
+            rejected.message.contains("already been waited on"),
             "{}",
-            refused.message
+            rejected.message
         );
     }
     let unknown = input(&host, 999, b"x").expect_err("no child has this handle");
@@ -733,19 +733,19 @@ fn a_child_is_used_under_the_label_it_was_started_as() {
         "",
         wired(false, Output::Discard, Output::Discard),
     );
-    let refused = wait_as(&host, "shell", child, 0).expect_err("this child is `[sh]`");
-    assert_eq!(refused.code, codes::RUNTIME_ERROR);
+    let rejected = wait_as(&host, "shell", child, 0).expect_err("this child is `[sh]`");
+    assert_eq!(rejected.code, codes::RUNTIME_ERROR);
     assert!(
-        refused.message.contains("[sh]") && refused.message.contains("[shell]"),
+        rejected.message.contains("[sh]") && rejected.message.contains("[shell]"),
         "both labels are named: {}",
-        refused.message
+        rejected.message
     );
 }
 
 #[test]
 fn a_start_of_an_unbound_label_names_the_flag_that_would_bind_it() {
     let host = spawning("sh", SH);
-    let refused = launched(
+    let rejected = launched(
         &host,
         "cc",
         "true",
@@ -753,16 +753,16 @@ fn a_start_of_an_unbound_label_names_the_flag_that_would_bind_it() {
         wired(false, Output::Keep, Output::Keep),
     )
     .expect_err("`cc` is bound to nothing");
-    assert_eq!(refused.code, codes::PROCESS_EXEC_UNBOUND);
+    assert_eq!(rejected.code, codes::PROCESS_EXEC_UNBOUND);
     assert!(
-        refused.message.contains("`process.start`"),
+        rejected.message.contains("`process.start`"),
         "{}",
-        refused.message
+        rejected.message
     );
     assert!(
-        refused.notes.iter().any(|n| n.contains("--exec cc=")),
+        rejected.notes.iter().any(|n| n.contains("--exec cc=")),
         "{:?}",
-        refused.notes
+        rejected.notes
     );
 }
 
@@ -900,7 +900,7 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         parked.elapsed()
     );
     assert!(
-        run.answered().contains(&waiting.token) && run.taken(&waiting).is_ok(),
+        run.returned().contains(&waiting.token) && run.taken(&waiting).is_ok(),
         "the child's end is what woke the park"
     );
 

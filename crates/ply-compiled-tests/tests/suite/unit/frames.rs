@@ -7,7 +7,7 @@ use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
 use ply_compiled::frames::{Held, PlyFrame, base, held_across, release_live};
 use ply_compiled::heap::{HEADER, Word};
-use ply_compiled::native::Answered;
+use ply_compiled::native::Returned;
 use ply_compiled::rt::Ctx;
 use ply_compiled::stack::Stack;
 use std::cell::RefCell;

@@ -147,7 +147,7 @@ pub(super) enum Unusable {
 
 /// Why a job on a child answered no value.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) enum Refusal {
+pub(super) enum ProcessError {
     /// Another `wait` handed the child back first.
     Spent,
     /// A stream outgrew the bound: everything the child wrote to each.
@@ -307,20 +307,20 @@ impl Child {
     /// Once the child has ended and every stream the host collects has ended too, its ending and
     /// what those streams hold; `None` at the deadline, and no deadline waits for as long as it
     /// takes.
-    pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Finished>, Refusal> {
+    pub(super) fn wait(&self, deadline: Option<Instant>) -> Result<Option<Finished>, ProcessError> {
         let mut state = self.lock();
         loop {
             if state.spent {
-                return Err(Refusal::Spent);
+                return Err(ProcessError::Spent);
             }
             if let Some(ended) = state.ended.clone()
                 && !state.out.open
                 && !state.err.open
             {
                 state.spent = true;
-                let ended = ended.map_err(Refusal::Unreaped)?;
+                let ended = ended.map_err(ProcessError::Unreaped)?;
                 if state.out.overflowed || state.err.overflowed {
-                    return Err(Refusal::TooMuch {
+                    return Err(ProcessError::TooMuch {
                         out: state.out.written,
                         err: state.err.written,
                     });
@@ -338,7 +338,7 @@ impl Child {
 
     /// The next line any `Lines` stream took, `Quiet` at the deadline, and `Closed` once every
     /// `Lines` stream has ended and each of its lines has been answered.
-    pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, Refusal> {
+    pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, ProcessError> {
         let mut state = self.lock();
         loop {
             // A `wait` has handed back whatever was unread.
@@ -346,7 +346,7 @@ impl Child {
                 return Ok(Heard::Closed);
             }
             if state.lines_overflowed() {
-                return Err(Refusal::TooMuch {
+                return Err(ProcessError::TooMuch {
                     out: state.out.written,
                     err: state.err.written,
                 });
@@ -751,7 +751,7 @@ fn watch(child: &Child) {
 fn until_ended(pid: u32) {
     loop {
         // SAFETY: `info` is plain data the call only writes, and `WNOWAIT` leaves the child unreaped.
-        let answered = unsafe {
+        let returned = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             libc::waitid(
                 libc::P_PID,
@@ -760,7 +760,7 @@ fn until_ended(pid: u32) {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if answered == 0 || std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+        if returned == 0 || std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
             return;
         }
     }

@@ -68,8 +68,8 @@ impl CredentialSpec {
     }
 }
 
-fn malformed(text: &str, why: &str) -> String {
-    format!("`{text}` is not a TLS credential: {why}; write `--tls NAME=CERT.pem,KEY.pem`")
+fn malformed(text: &str, reason: &str) -> String {
+    format!("`{text}` is not a TLS credential: {reason}; write `--tls NAME=CERT.pem,KEY.pem`")
 }
 
 /// A loaded credential; nothing outside this module can take the key back out.
@@ -191,7 +191,7 @@ struct Certified {
 
 fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
     let chain =
-        certificates(&spec.certificate).map_err(|why| err_invalid(&spec.certificate, why))?;
+        certificates(&spec.certificate).map_err(|reason| err_invalid(&spec.certificate, reason))?;
     let key = private_key(&spec.key)?;
     let fingerprint = fingerprint(&chain[0]);
     let certificates = chain.len();
@@ -260,7 +260,7 @@ impl Credentials {
         for path in trusted {
             match certificates(path) {
                 Ok(chain) => anchors.extend(chain),
-                Err(why) => diagnostics.push(err_untrusted(path, why)),
+                Err(reason) => diagnostics.push(err_untrusted(path, reason)),
             }
         }
         for spec in specs {
@@ -609,10 +609,10 @@ impl Stream {
 
 /// Why a handshake asked to complete within a deadline did not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Unsettled {
+pub enum Unfinished {
     Expired,
     /// One of the `REASON_` strings.
-    Refused(&'static str),
+    Rejected(&'static str),
 }
 
 /// The configuration `config` with `alpn` as the protocols it offers, none when `alpn` is empty.
@@ -719,18 +719,18 @@ impl Session {
                 peer: Mutex::new(None),
                 agreed: Mutex::new(None),
             },
-            None => Session::refused(socket, handshakes, REASON_CONFIGURATION),
+            None => Session::rejected(socket, handshakes, REASON_CONFIGURATION),
         }
     }
 
     /// A session that never starts: the connection is ended, counted under `reason`, and reads as
     /// a peer done sending.
-    pub fn refused(
+    pub fn rejected(
         socket: Arc<TcpStream>,
         handshakes: Arc<Handshakes>,
         reason: &'static str,
     ) -> Session {
-        handshakes.refused(reason);
+        handshakes.rejected(reason);
         let _ = socket.shutdown(Shutdown::Both);
         Session {
             socket,
@@ -749,7 +749,7 @@ impl Session {
 
     /// What a completed handshake leaves to be read without the session: its length, the peer's
     /// certificate and the protocol.
-    fn settled(&self, stream: &Stream, took: u64) {
+    fn finished(&self, stream: &Stream, took: u64) {
         lock(&self.took).get_or_insert(took);
         *lock(&self.peer) = stream.peer_leaf();
         *lock(&self.agreed) = stream.protocol();
@@ -780,15 +780,15 @@ impl Session {
     /// The handshake, completed within `timeout` in all, answering the application protocol it
     /// agreed on. A handshake that does not complete ends the connection, a deadline included:
     /// an upgrade that timed out has left bytes of a handshake on the wire.
-    pub fn settle_within(&self, timeout: Duration) -> Result<Option<String>, Unsettled> {
+    pub fn finish_within(&self, timeout: Duration) -> Result<Option<String>, Unfinished> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
         let Some(stream) = guard.as_mut() else {
-            return Err(Unsettled::Refused(REASON_CONFIGURATION));
+            return Err(Unfinished::Rejected(REASON_CONFIGURATION));
         };
         loop {
             if !stream.is_handshaking() {
-                self.settled(stream, began.elapsed().as_micros() as u64);
+                self.finished(stream, began.elapsed().as_micros() as u64);
                 return Ok(stream.protocol());
             }
             let Some(left) = timeout
@@ -796,24 +796,24 @@ impl Session {
                 .filter(|d| !d.is_zero())
             else {
                 self.finish(&mut guard, Some(REASON_SLOW));
-                return Err(Unsettled::Expired);
+                return Err(Unfinished::Expired);
             };
             let _ = self.socket.set_read_timeout(Some(left));
             let _ = self.socket.set_write_timeout(Some(left));
             match stream.complete_io() {
                 Ok((0, 0)) if stream.is_handshaking() => {
                     self.finish(&mut guard, Some(REASON_GONE));
-                    return Err(Unsettled::Refused(REASON_GONE));
+                    return Err(Unfinished::Rejected(REASON_GONE));
                 }
                 Ok(_) => {}
                 Err(e) if expired(&e) => {
                     self.finish(&mut guard, Some(REASON_SLOW));
-                    return Err(Unsettled::Expired);
+                    return Err(Unfinished::Expired);
                 }
                 Err(e) => {
-                    let why = reason(true, &e);
-                    self.finish(&mut guard, Some(why));
-                    return Err(Unsettled::Refused(why));
+                    let reason = reason(true, &e);
+                    self.finish(&mut guard, Some(reason));
+                    return Err(Unfinished::Rejected(reason));
                 }
             }
         }
@@ -858,13 +858,13 @@ impl Session {
                 }
                 Ok(_) if !stream.is_handshaking() => {
                     let took = began.elapsed().as_micros() as u64;
-                    self.settled(stream, took);
+                    self.finished(stream, took);
                     return Some(took);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    let refused = (!expired(&e)).then(|| reason(true, &e));
-                    self.finish(&mut guard, refused);
+                    let rejected = (!expired(&e)).then(|| reason(true, &e));
+                    self.finish(&mut guard, rejected);
                     return None;
                 }
             }
@@ -920,8 +920,8 @@ impl Session {
                 payload.len()
             }
             Err(e) => {
-                let refused = (!expired(&e)).then(|| reason(handshaking, &e));
-                self.finish(&mut guard, refused);
+                let rejected = (!expired(&e)).then(|| reason(handshaking, &e));
+                self.finish(&mut guard, rejected);
                 0
             }
         }
@@ -942,13 +942,13 @@ impl Session {
     /// the number is the handshake's own and not the wait before it.
     fn completed(&self, began: Instant, was_handshaking: bool, stream: &Stream) {
         if was_handshaking && !stream.is_handshaking() {
-            self.settled(stream, began.elapsed().as_micros() as u64);
+            self.finished(stream, began.elapsed().as_micros() as u64);
         }
     }
 
-    fn finish(&self, guard: &mut MutexGuard<'_, Option<Stream>>, refused: Option<&'static str>) {
-        if let Some(reason) = refused {
-            self.handshakes.refused(reason);
+    fn finish(&self, guard: &mut MutexGuard<'_, Option<Stream>>, rejected: Option<&'static str>) {
+        if let Some(reason) = rejected {
+            self.handshakes.rejected(reason);
         }
         **guard = None;
         let _ = self.socket.shutdown(Shutdown::Both);
@@ -1031,7 +1031,7 @@ pub struct Handshakes {
 #[derive(Default)]
 struct Counts {
     completed: u64,
-    refused: BTreeMap<&'static str, u64>,
+    rejected: BTreeMap<&'static str, u64>,
 }
 
 impl Handshakes {
@@ -1039,19 +1039,19 @@ impl Handshakes {
         lock(&self.counts).completed += 1;
     }
 
-    pub fn refused(&self, reason: &'static str) {
-        *lock(&self.counts).refused.entry(reason).or_default() += 1;
+    pub fn rejected(&self, reason: &'static str) {
+        *lock(&self.counts).rejected.entry(reason).or_default() += 1;
     }
 
     /// Reasons sort by descending count, then text, so one failure always prints one order.
     pub fn snapshot(&self) -> HandshakeCounts {
         let counts = lock(&self.counts);
         let mut reasons: Vec<(&'static str, u64)> =
-            counts.refused.iter().map(|(r, n)| (*r, *n)).collect();
+            counts.rejected.iter().map(|(r, n)| (*r, *n)).collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         HandshakeCounts {
             completed: counts.completed,
-            refused: reasons.iter().map(|(_, n)| n).sum(),
+            rejected: reasons.iter().map(|(_, n)| n).sum(),
             reasons,
         }
     }
@@ -1060,13 +1060,13 @@ impl Handshakes {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HandshakeCounts {
     pub completed: u64,
-    pub refused: u64,
+    pub rejected: u64,
     pub reasons: Vec<(&'static str, u64)>,
 }
 
 impl HandshakeCounts {
     pub fn is_empty(&self) -> bool {
-        self.completed == 0 && self.refused == 0
+        self.completed == 0 && self.rejected == 0
     }
 }
 
@@ -1125,10 +1125,10 @@ fn err_unreadable(path: &Path, error: &io::Error) -> Diagnostic {
 }
 
 #[cold]
-fn err_invalid(path: &Path, why: String) -> Diagnostic {
+fn err_invalid(path: &Path, reason: String) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
-        format!("`{}` is not usable TLS material: {why}", path.display()),
+        format!("`{}` is not usable TLS material: {reason}", path.display()),
     )
     .note("`--tls NAME=CERT,KEY` wants a certificate chain in PEM, leaf first, and a private key in PKCS#8, PKCS#1 or SEC1")
     .note("credentials are loaded before anything runs, so this is refused rather than discovered on the first handshake")
@@ -1159,10 +1159,10 @@ fn err_trust(ignored: usize) -> Diagnostic {
 }
 
 #[cold]
-fn err_untrusted(path: &Path, why: String) -> Diagnostic {
+fn err_untrusted(path: &Path, reason: String) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
-        format!("`{}` is not a certificate to trust: {why}", path.display()),
+        format!("`{}` is not a certificate to trust: {reason}", path.display()),
     )
     .note(TRUSTED)
     .note("roots are loaded before anything runs, so this is refused rather than discovered on the first handshake")

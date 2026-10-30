@@ -33,8 +33,8 @@ fn an_absolute_path_and_a_parent_component_are_refused() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     for path in ["/etc/passwd", "../secrets", "src/../../secrets"] {
-        let refusal = confine(&real, path, span()).expect_err("it should be refused");
-        assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT, "for `{path}`");
+        let rejection = confine(&real, path, span()).expect_err("it should be refused");
+        assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT, "for `{path}`");
     }
 }
 
@@ -48,8 +48,8 @@ fn a_symlink_out_of_the_root_is_refused() {
     std::fs::write(outside_real.join("secrets"), b"s").unwrap();
     std::os::unix::fs::symlink(&outside_real, real.join("link")).unwrap();
 
-    let refusal = confine(&real, "link/secrets", span()).expect_err("it should be refused");
-    assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
+    let rejection = confine(&real, "link/secrets", span()).expect_err("it should be refused");
+    assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
 /// A not-yet-existing target still traverses its parent's link, so the nearest ancestor is checked.
@@ -61,8 +61,8 @@ fn a_write_through_a_symlinked_directory_is_refused() {
     let outside_real = outside.path().canonicalize().unwrap();
     std::os::unix::fs::symlink(&outside_real, real.join("out")).unwrap();
 
-    let refusal = confine(&real, "out/artifact.plyx", span()).expect_err("it should be refused");
-    assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
+    let rejection = confine(&real, "out/artifact.plyx", span()).expect_err("it should be refused");
+    assert_eq!(rejection.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
 /// A link to where nothing is resolves to nothing, so it is held by where it leads.
@@ -75,10 +75,10 @@ fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_refused() {
     std::os::unix::fs::symlink(&made, real.join("link")).unwrap();
     let fs = rooted(&real);
 
-    let refused = perform(&fs, Op::WriteFile, "link", body(b"x"));
+    let rejected = perform(&fs, Op::WriteFile, "link", body(b"x"));
     assert!(!made.exists(), "the write landed outside the root");
     assert_eq!(
-        refused.expect_err("the link leads out").code,
+        rejected.expect_err("the link leads out").code,
         codes::FS_PATH_ESCAPES_ROOT
     );
 }
@@ -89,10 +89,10 @@ fn a_root_that_is_not_a_directory_does_not_bind() {
     let file = dir.path().join("a.ply");
     std::fs::write(&file, b"x").unwrap();
     let mut roots = Roots::new();
-    let refused = roots
+    let rejected = roots
         .bind("src", &file, span())
         .expect_err("a file is not a root");
-    assert_eq!(refused.code, codes::FS_ROOT_INVALID);
+    assert_eq!(rejected.code, codes::FS_ROOT_INVALID);
     assert!(roots.is_empty());
 }
 
@@ -194,8 +194,8 @@ fn rooted(at: &Path) -> FsHost {
 /// What a job answered, run on this thread.
 fn ran(job: ply_host::jobs::Refusing) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
-        Failure::Refused(refusal) => refusal,
-        Failure::Said(why) => panic!("the job failed: {why}"),
+        Failure::Rejected(rejection) => rejection,
+        Failure::Said(reason) => panic!("the job failed: {reason}"),
     })
 }
 
@@ -333,7 +333,7 @@ fn a_ranged_read_of_what_is_not_a_file_is_none() {
 fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
     let dir = root();
     let fs = rooted(dir.path());
-    let refused = perform(
+    let rejected = perform(
         &fs,
         Op::ReadAt,
         "a.dat",
@@ -343,11 +343,11 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
         },
     )
     .expect_err("more than one read answers");
-    assert_eq!(refused.code, codes::FS_FILE_TOO_LARGE);
+    assert_eq!(rejected.code, codes::FS_FILE_TOO_LARGE);
     assert!(
-        refused.notes.iter().any(|n| n.contains("fs.read_at")),
+        rejected.notes.iter().any(|n| n.contains("fs.read_at")),
         "the refusal should name what reads a large file: {:?}",
-        refused.notes
+        rejected.notes
     );
     // The bound is reachable, so the largest allowed call is not itself refused.
     assert_eq!(read_at(&fs, "a.dat", 0, MAX_READ_BYTES as i64), None);
@@ -373,17 +373,17 @@ fn every_operation_refuses_a_label_no_root_is_bound_to() {
     let fs = rooted(dir.path());
     for op in Op::ALL {
         for (path, second, _) in given(op, "a") {
-            let refused =
+            let rejected =
                 asked(&fs, op, "elsewhere", &path, second).expect_err("`elsewhere` has no root");
-            assert_eq!(refused.code, codes::FS_ROOT_UNBOUND, "{}", op.what());
+            assert_eq!(rejected.code, codes::FS_ROOT_UNBOUND, "{}", op.what());
         }
     }
     for chunk in [Chunk::Read(1), Chunk::Write(b"x".to_vec()), Chunk::Close] {
-        let refused = fs
+        let rejected = fs
             .on_file("elsewhere", 1, chunk, span())
             .map(|_| ())
             .expect_err("`elsewhere` has no root");
-        assert_eq!(refused.code, codes::FS_ROOT_UNBOUND);
+        assert_eq!(rejected.code, codes::FS_ROOT_UNBOUND);
     }
 }
 
@@ -550,9 +550,9 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_refused() {
         ("abs", "/etc"),
         ("d/back/esc", "../x"),
     ] {
-        let refused = link(path, target).expect_err("the target leaves the root");
+        let rejected = link(path, target).expect_err("the target leaves the root");
         assert_eq!(
-            refused.code,
+            rejected.code,
             codes::FS_PATH_ESCAPES_ROOT,
             "{path} -> {target}"
         );
@@ -667,8 +667,8 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
         (Op::ReadLink, "../l", Second::None),
         (Op::SetModified, "../a.txt", Second::Millis(1)),
     ] {
-        let refused = perform(&fs, op, path, second).expect_err("it leaves the root");
-        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{}", op.what());
+        let rejected = perform(&fs, op, path, second).expect_err("it leaves the root");
+        assert_eq!(rejected.code, codes::FS_PATH_ESCAPES_ROOT, "{}", op.what());
     }
 }
 
@@ -679,7 +679,7 @@ fn opened(fs: &FsHost, label: &str, path: &str, how: Opening) -> Result<i64, Vec
         .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message));
     match said.split_first() {
         Some((1, descriptor)) => Ok(int_of(descriptor).expect("eight bytes")),
-        Some((0, why)) => Err(why.to_vec()),
+        Some((0, reason)) => Err(reason.to_vec()),
         _ => panic!("not what an open answers: {said:?}"),
     }
 }
@@ -731,22 +731,22 @@ fn an_open_says_why_a_file_did_not_open_and_is_confined_like_every_other() {
     std::fs::create_dir(dir.path().join("d")).unwrap();
     assert_eq!(
         opened(&fs, "cache", "absent", Opening::Read),
-        Err(Refusal::NotFound.flat())
+        Err(FileError::NotFound.flat())
     );
     for how in [Opening::Read, Opening::Write, Opening::Append] {
         assert_eq!(
             opened(&fs, "cache", "d", how),
-            Err(Refusal::NotAFile.flat())
+            Err(FileError::NotAFile.flat())
         );
     }
     assert_eq!(
         opened(&fs, "cache", "no/f", Opening::Write),
-        Err(Refusal::NotFound.flat())
+        Err(FileError::NotFound.flat())
     );
 
-    let refused = perform(&fs, Op::Open, "../escape", Second::Opening(Opening::Read))
+    let rejected = perform(&fs, Op::Open, "../escape", Second::Opening(Opening::Read))
         .expect_err("it leaves the root");
-    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
+    assert_eq!(rejected.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
 #[test]
@@ -792,7 +792,7 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
     for there in ["d/new", "d/a.txt", "d", "d/l"] {
         assert_eq!(
             opened(&fs, "cache", there, Opening::Create),
-            Err(Refusal::Exists.flat()),
+            Err(FileError::Exists.flat()),
             "{there}"
         );
     }
@@ -800,11 +800,11 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
     assert!(!real.join("d/nowhere").exists());
     assert_eq!(
         opened(&fs, "cache", "no/new", Opening::Create),
-        Err(Refusal::NotFound.flat())
+        Err(FileError::NotFound.flat())
     );
     assert_eq!(
         opened(&fs, "cache", "d/a.txt/new", Opening::Create),
-        Err(Refusal::NotADirectory.flat())
+        Err(FileError::NotADirectory.flat())
     );
 }
 
@@ -966,7 +966,7 @@ fn linked(fs: &FsHost, path: &str, to: &str) -> Result<(), Vec<u8>> {
     let said = on(fs, Op::Link, path, other(to));
     match said.split_first() {
         Some((1, [])) => Ok(()),
-        Some((0, why)) => Err(why.to_vec()),
+        Some((0, reason)) => Err(reason.to_vec()),
         _ => panic!("not what a link answers: {said:?}"),
     }
 }
@@ -1010,8 +1010,8 @@ fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
     assert_ne!(link.id, file.id);
 
     assert_eq!(stat(&fs, "d/absent"), None);
-    let refused = perform(&fs, Op::Stat, "../d", Second::None).expect_err("it leaves the root");
-    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
+    let rejected = perform(&fs, Op::Stat, "../d", Second::None).expect_err("it leaves the root");
+    assert_eq!(rejected.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
 #[test]
@@ -1101,21 +1101,21 @@ fn a_file_takes_a_second_name_and_nothing_else_does() {
         assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
     }
 
-    let refused = |path: &str, to: &str, why: Refusal| {
-        assert_eq!(linked(&fs, path, to), Err(why.flat()), "{path} -> {to}");
+    let rejected = |path: &str, to: &str, reason: FileError| {
+        assert_eq!(linked(&fs, path, to), Err(reason.flat()), "{path} -> {to}");
     };
-    refused("n", "absent", Refusal::NotFound);
-    refused("n", "d", Refusal::NotAFile);
-    refused("n", "l", Refusal::NotAFile);
-    refused("l", "d/a.txt", Refusal::Exists);
-    refused("twin.txt", "d/a.txt", Refusal::Exists);
-    refused("no/n", "d/a.txt", Refusal::NotFound);
-    refused("d/a.txt/n", "d/a.txt", Refusal::NotADirectory);
+    rejected("n", "absent", FileError::NotFound);
+    rejected("n", "d", FileError::NotAFile);
+    rejected("n", "l", FileError::NotAFile);
+    rejected("l", "d/a.txt", FileError::Exists);
+    rejected("twin.txt", "d/a.txt", FileError::Exists);
+    rejected("no/n", "d/a.txt", FileError::NotFound);
+    rejected("d/a.txt/n", "d/a.txt", FileError::NotADirectory);
     assert!(!real.join("n").exists());
 
     for (path, to) in [("../n", "d/a.txt"), ("n", "/d/a.txt")] {
-        let refused = perform(&fs, Op::Link, path, other(to)).expect_err("it leaves the root");
-        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{path} -> {to}");
+        let rejected = perform(&fs, Op::Link, path, other(to)).expect_err("it leaves the root");
+        assert_eq!(rejected.code, codes::FS_PATH_ESCAPES_ROOT, "{path} -> {to}");
     }
 }
 
@@ -1313,15 +1313,15 @@ fn no_operation_reaches_through_a_link_out_of_the_root() {
                 let (inside, outside) = linked_out();
                 let fs = rooted(inside.path());
                 let before = held(outside.path());
-                let answer = perform(&fs, op, &path, second);
+                let result = perform(&fs, op, &path, second);
                 let said = format!("{} given `{}` ({way:?})", op.what(), way.path());
                 if itself && way.names_the_link() {
-                    assert!(answer.is_ok(), "{said} acts on the link itself");
+                    assert!(result.is_ok(), "{said} acts on the link itself");
                 } else {
-                    let refused = answer
+                    let rejected = result
                         .err()
                         .unwrap_or_else(|| panic!("{said} was not refused"));
-                    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{said}");
+                    assert_eq!(rejected.code, codes::FS_PATH_ESCAPES_ROOT, "{said}");
                 }
                 assert_eq!(
                     held(outside.path()),
@@ -1351,10 +1351,10 @@ fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
         );
         assert_eq!(
             opened(&fs, "cache", name, Opening::Create),
-            Err(Refusal::Exists.flat())
+            Err(FileError::Exists.flat())
         );
-        assert_eq!(linked(&fs, "named", name), Err(Refusal::NotAFile.flat()));
-        assert_eq!(linked(&fs, name, "plain.txt"), Err(Refusal::Exists.flat()));
+        assert_eq!(linked(&fs, "named", name), Err(FileError::NotAFile.flat()));
+        assert_eq!(linked(&fs, name, "plain.txt"), Err(FileError::Exists.flat()));
         assert!(!did(on(
             &fs,
             Op::Symlink,
@@ -1426,7 +1426,7 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
         assert!(!write(nowhere), "{nowhere}");
         assert_eq!(
             opened(&fs, "cache", nowhere, Opening::Write),
-            Err(Refusal::NotFound.flat()),
+            Err(FileError::NotFound.flat()),
             "{nowhere}"
         );
         assert_eq!(

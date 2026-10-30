@@ -50,7 +50,7 @@ fn an_hmac_is_rfc_4231s_and_each_scheme_makes_a_public_key_and_a_signature() {
 #[test]
 fn a_hash_the_runtime_does_not_key_answers_nothing() {
     let key = [7; 32];
-    let answers = |hash: &str| {
+    let results = |hash: &str| {
         [
             crypto::hmac(hash, &key, b"").is_some(),
             crypto::hkdf_extract(hash, b"salt", &key).is_some(),
@@ -60,10 +60,10 @@ fn a_hash_the_runtime_does_not_key_answers_nothing() {
         ]
     };
     for hash in ["SHA-1", "SHA-256", "SHA-384", "SHA-512"] {
-        assert_eq!(answers(hash), [true; 5], "{hash}");
+        assert_eq!(results(hash), [true; 5], "{hash}");
     }
     for hash in ["SHA3-256", "BLAKE2b", "MD5", "sha-256", ""] {
-        assert_eq!(answers(hash), [false; 5], "{hash}");
+        assert_eq!(results(hash), [false; 5], "{hash}");
     }
 }
 
@@ -120,7 +120,7 @@ fn each_encoding_says_what_it_does_and_one_it_does_not_have_does_nothing() {
 fn a_misuse_is_refused_and_the_refusal_names_no_key() {
     let short = b"hunter2hunter2";
     let key = [7; 32];
-    let refusals = [
+    let rejections = [
         crypto::seal("aes-256-gcm", short, &[0; 12], b"", b"message").unwrap_err(),
         crypto::open("chacha20-poly1305", &key, &[0; 11], b"", b"message").unwrap_err(),
         crypto::seal("aes-128-gcm", &key, &[0; 12], b"", b"").unwrap_err(),
@@ -129,8 +129,8 @@ fn a_misuse_is_refused_and_the_refusal_names_no_key() {
         crypto::verify("ecdsa-p224-sha224", short, b"", b"").unwrap_err(),
         crypto::agree("p384", short, b"").unwrap_err(),
     ];
-    for why in refusals {
-        assert!(!why.contains("hunter2"), "{why}");
+    for reason in rejections {
+        assert!(!reason.contains("hunter2"), "{reason}");
     }
     assert!(!crypto::agrees("p384"));
     assert_eq!(crypto::nonce_length("aes-128-gcm"), None);
@@ -272,8 +272,8 @@ fn a_frame_reads_back_what_it_wrote_and_nothing_it_did_not() {
     assert_eq!(&hex.framed(b"", b"\xab", b"")[..], b"ab");
     assert!(hex.unframed(b"AB", b"", b"").is_none());
     assert!(hex.unframed(b"abc", b"", b"").is_none());
-    for refused in ["rot13", "base32-typed", "RAW", ""] {
-        let d = named(refused).err().unwrap_or_else(|| panic!("{refused}"));
+    for rejected in ["rot13", "base32-typed", "RAW", ""] {
+        let d = named(rejected).err().unwrap_or_else(|| panic!("{rejected}"));
         assert_eq!(d.code, codes::RUNTIME_ERROR);
         assert!(d.message.contains("`fs.write_secret`"), "{}", d.message);
     }

@@ -143,13 +143,13 @@ fn a_root_that_takes_nothing_is_handed_the_empty_list() {
 }
 
 /// The bytes `root` answered over `arguments`.
-fn answered(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Result<Vec<u8>, String> {
+fn returned(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Result<Vec<u8>, String> {
     match entry::enter(opened, root, arguments, run, None, None).ended {
-        Ended::Answered(bytes) => Ok(bytes),
+        Ended::Returned(bytes) => Ok(bytes),
         Ended::Failed(d) => Err(format!("failed: {d}")),
-        Ended::Panicked(why) => Err(format!("panicked: {why}")),
+        Ended::Panicked(reason) => Err(format!("panicked: {reason}")),
         Ended::NoRoot => Err("no root".to_string()),
-        Ended::Unanswerable(why) => Err(format!("unanswerable: {why}")),
+        Ended::Unanswerable(reason) => Err(format!("unanswerable: {reason}")),
     }
 }
 
@@ -163,8 +163,8 @@ fn int_of(bytes: &[u8]) -> i64 {
 }
 
 /// What `root` answered over the `Int`s `xs`, read as the `Int` it answers.
-fn int_answered(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i64, String> {
-    answered(opened, root, ints(xs), run).map(|bytes| int_of(&bytes))
+fn int_returned(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i64, String> {
+    returned(opened, root, ints(xs), run).map(|bytes| int_of(&bytes))
 }
 
 /// A root is entered through its `R#entered`: the arguments cross in as their list's encoding, and
@@ -175,8 +175,8 @@ fn a_root_answers_the_bytes_its_entry_wrote() {
     let Some(opened) = opened(dir.path()) else {
         return;
     };
-    assert_eq!(int_answered(&opened, "m.double", &[21], &run()), Ok(42));
-    let greeted = answered(
+    assert_eq!(int_returned(&opened, "m.double", &[21], &run()), Ok(42));
+    let greeted = returned(
         &opened,
         "m.greet",
         arguments(1, |w| w.str("héllo".as_bytes())),
@@ -204,7 +204,7 @@ fn a_unit_is_entered_only_at_its_roots() {
     };
     for root in ["m.helper", "m.double#entered", "m.nothing"] {
         assert_eq!(
-            int_answered(&opened, root, &[1], &run()),
+            int_returned(&opened, root, &[1], &run()),
             Err("no root".to_string()),
             "{root}"
         );
@@ -221,11 +221,11 @@ fn an_answer_holding_a_function_or_a_handle_stays_in_its_run() {
         return;
     };
     assert_eq!(
-        answered(&opened, "m.closure", ints(&[]), &run()),
+        returned(&opened, "m.closure", ints(&[]), &run()),
         Err("unanswerable: its answer holds a function the program wrote".to_string())
     );
     assert_eq!(
-        answered(&opened, "m.keep", ints(&[]), &run()),
+        returned(&opened, "m.keep", ints(&[]), &run()),
         Err("unanswerable: its answer holds a handle of its run".to_string())
     );
 }
@@ -239,10 +239,10 @@ fn a_raise_ends_its_entry_and_no_other() {
         return;
     };
     for _ in 0..2 {
-        let raised = answered(&opened, "m.fail", arguments(1, |w| w.str(b"no")), &run())
+        let raised = returned(&opened, "m.fail", arguments(1, |w| w.str(b"no")), &run())
             .expect_err("a failed assertion raises");
         assert!(raised.contains("no"), "{raised}");
-        assert_eq!(int_answered(&opened, "m.double", &[5], &run()), Ok(10));
+        assert_eq!(int_returned(&opened, "m.double", &[5], &run()), Ok(10));
     }
 }
 
@@ -256,10 +256,10 @@ fn an_entry_inside_another_runs_on_a_context_of_its_own() {
     };
     let mut outer = crate::bare::context();
     outer.begin();
-    assert_eq!(int_answered(&opened, "m.double", &[8], &run()), Ok(16));
+    assert_eq!(int_returned(&opened, "m.double", &[8], &run()), Ok(16));
     assert_eq!(outer.heap.live(), 0);
     outer.end();
-    assert_eq!(int_answered(&opened, "m.double", &[9], &run()), Ok(18));
+    assert_eq!(int_returned(&opened, "m.double", &[9], &run()), Ok(18));
 }
 
 /// An entry on a program thread nests on that thread's stack, however little stack the thread that
@@ -276,7 +276,7 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
         .spawn(move || {
             entry::on_program_thread(|| {
                 match entry::enter(&opened, "m.ladder", ints(&[100_000]), &deep, None, None).ended {
-                    Ended::Answered(bytes) => Some(bytes),
+                    Ended::Returned(bytes) => Some(bytes),
                     _ => None,
                 }
             })
@@ -311,7 +311,7 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
     let live = |root: &str, tested: bool| {
         let run = Run { tested, ..run() };
         let o = entry::enter(&opened, root, ints(&[1]), &run, None, None);
-        assert!(matches!(o.ended, Ended::Answered(_)), "`{root}` answered");
+        assert!(matches!(o.ended, Ended::Returned(_)), "`{root}` answered");
         o.usage.live
     };
     assert_eq!([live("m.kept", true), live("m.freed", true)], [1, 0]);

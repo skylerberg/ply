@@ -6,7 +6,7 @@ use super::{Deterministic, granted, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::entry::{self, Ended, Opened, Run};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, lent};
+use crate::rt::{Ctx, borrowed};
 use ply_host::native::{found, int, parts};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ pub trait Ships: Send + Sync {
     fn module(&self, name: &str) -> Option<&'static [u8]>;
     /// The frames of `len` bytes from `offset` of the pack's answer file `path`, decompressed;
     /// a `len` of 0 reads to the end.
-    fn answer(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>>;
+    fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>>;
     /// Each shipped file and its digest, as the launcher lays them out beside the modules.
     fn digests(&self) -> String;
     /// The runtime's stamps; empty in a process the launcher did not start.
@@ -85,7 +85,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
 fn shipping(
     ctx: *mut Ctx,
     native: &'static str,
-    answer: impl FnOnce(&mut Ctx, &dyn Ships) -> TakenBytes,
+    result: impl FnOnce(&mut Ctx, &dyn Ships) -> TakenBytes,
 ) -> TakenBytes {
     granted(
         ctx,
@@ -94,7 +94,7 @@ fn shipping(
         Deterministic,
         TakenBytes(0),
         |c| match SHIPS.get() {
-            Some(ships) => answer(c, ships.as_ref()),
+            Some(ships) => result(c, ships.as_ref()),
             None => {
                 super::handed(
                     c,
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn rt_shipped_answer(
             return TakenBytes(0);
         };
         let frame = match (usize::try_from(offset.0), usize::try_from(len.0)) {
-            (Ok(offset), Ok(len)) => ships.answer(&path, offset, len),
+            (Ok(offset), Ok(len)) => ships.result(&path, offset, len),
             _ => None,
         };
         c.given(found(frame))
@@ -212,27 +212,27 @@ pub unsafe extern "C" fn rt_shipped_entered(
         };
         let opened = match opened_unit(Path::new(&library)) {
             Ok(opened) => opened,
-            Err(why) => {
+            Err(reason) => {
                 c.fail(ply_core::Diagnostic::error(
                     ply_core::codes::INTERNAL_ERROR,
-                    format!("an entered unit does not load: {why}"),
+                    format!("an entered unit does not load: {reason}"),
                 ));
                 return TakenBytes(0);
             }
         };
-        let arguments = unsafe { lent(ap, an) }.to_vec();
+        let arguments = unsafe { borrowed(ap, an) }.to_vec();
         let run = Run {
             timeout_ms: u64::try_from(timeout_ms.0).unwrap_or(0),
             ..Run::unbounded()
         };
-        let answered = entry::on_program_thread(|| {
+        let returned = entry::on_program_thread(|| {
             match entry::enter(&opened, &root, arguments, &run, None, None).ended {
-                Ended::Answered(bytes) => Some(bytes),
+                Ended::Returned(bytes) => Some(bytes),
                 _ => None,
             }
         })
         .flatten();
-        c.given(found(answered))
+        c.given(found(returned))
     })
 }
 

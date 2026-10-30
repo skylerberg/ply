@@ -2,7 +2,7 @@
 # ci-warm.sh used MARK    the C cache and the stages cut to what the `ply`s since MARK used: a load
 #                         marks what it reads, so the rest is what earlier runs left that this one
 #                         did not read, and every job after would restore it for nothing. A stage
-#                         and a store of kept records go whole, by their `.used`.
+#                         and a store of cached records go whole, by their `.used`.
 # ci-warm.sh pack TAR     the C cache and the stages as one file, for `handed` in this run's other
 #                         jobs and `shared` on another branch
 # ci-warm.sh shared NAME  the artifact NAME, which a run of these sources packed, laid over the C
@@ -13,13 +13,13 @@
 #                         run's other jobs
 # ci-warm.sh foreign      the C cache and stages another toolchain's run left, less the stages but
 #                         `memo-std`: each file of the C cache is named by what decides it, and each
-#                         of std's records is kept under its query's code and held to its reads, so
+#                         of std's records is keyed by its query's code and held to its reads, so
 #                         either serves any toolchain that names it, but a stage holds what one
-#                         toolchain's binary built and filed for itself
+#                         toolchain's binary built and recorded for itself
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
 stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
-# The stores of kept records, each a directory `sweep` takes whole (its `STORES`).
+# The stores of cached records, each a directory `sweep` takes whole (its `STORES`).
 stores=$cache/bodies
 
 megabytes() { du -sm "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
@@ -69,7 +69,7 @@ case "${1:-}" in
         [ -d "$dir" ] || continue
         case "$(basename "$dir")" in
           # Files swept one by one, as `sweep`'s `BY_FILE` takes them: each a runnable or an
-          # answer of its own.
+          # individual cached result.
           answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
           # A stage, and a memo store, go whole, kept where it or anything in it is newer than the
           # mark: a stage's `.used`, or a store's own time, which each run's directory there moves.
@@ -77,7 +77,7 @@ case "${1:-}" in
         esac
       done
     fi
-    # A file beside the stages is what an older layout kept, which nothing this run read.
+    # A file beside the stages is what an older layout stored, which nothing this run read.
     [ -d "$stage" ] && find "$stage" -maxdepth 1 -type f ! -name '.*' ! -newer "$mark" -delete
     find "$cache" "$stage" -mindepth 1 -type d -empty -delete 2>/dev/null || true
     echo "the C cache and stages kept $(megabytes "$cache" "$stage") MB of $before MB"

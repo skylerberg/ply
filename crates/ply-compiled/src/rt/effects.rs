@@ -318,9 +318,9 @@ pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised
     let carried: Result<Vec<Vec<u8>>, String> = args.0.iter().map(|v| shown(c, v)).collect();
     let carried = match carried {
         Ok(carried) => carried,
-        Err(why) => {
+        Err(reason) => {
             args.release();
-            return c.fail(err_crossing(&why));
+            return c.fail(err_marshalling(&reason));
         }
     };
     let slots: Vec<String> = (0..carried.len()).map(ply_core::slot).collect();

@@ -177,7 +177,7 @@ impl Op {
     fn nothing(self) -> Vec<u8> {
         match self {
             Op::Kind | Op::Resolved => vec![Kind::Missing.number()],
-            Op::Open | Op::Link => tried(Err(Refusal::NotFound)),
+            Op::Open | Op::Link => tried(Err(FileError::NotFound)),
             // Absent, or not done.
             _ => vec![0],
         }
@@ -217,8 +217,8 @@ impl RootSpec {
     }
 }
 
-fn malformed(text: &str, why: &str) -> String {
-    format!("`{text}` is not a filesystem root: {why}; write `--fs NAME=PATH`")
+fn malformed(text: &str, reason: &str) -> String {
+    format!("`{text}` is not a filesystem root: {reason}; write `--fs NAME=PATH`")
 }
 
 /// What `--fs NAME=PATH` bound, resolved once.
@@ -463,12 +463,12 @@ fn open_file(
     root: &Path,
     target: &Path,
     how: Opening,
-) -> Result<i64, Refusal> {
+) -> Result<i64, FileError> {
     use std::os::unix::fs::OpenOptionsExt;
     // A directory opens for reading, and only its first read says it is one.
     if how != Opening::Create && std::fs::symlink_metadata(target).is_ok_and(|meta| !meta.is_file())
     {
-        return Err(Refusal::NotAFile);
+        return Err(FileError::NotAFile);
     }
     let mut options = OpenOptions::new();
     match how {
@@ -478,7 +478,7 @@ fn open_file(
         // `O_EXCL` refuses whatever is at the name, a link included, so nothing is written through one.
         Opening::Create => options.write(true).create_new(true).mode(0o600),
     };
-    let file = unfollowed(&mut options, target).map_err(|e| refusal(&e))?;
+    let file = unfollowed(&mut options, target).map_err(|e| rejection(&e))?;
     let mut held = descriptors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -513,12 +513,12 @@ fn run(
         Second::Opening(Opening::Create) => Last::Kept,
         _ => op.last(),
     };
-    let Some(target) = walked(root, path, last, span).map_err(Failure::Refused)? else {
+    let Some(target) = walked(root, path, last, span).map_err(Failure::Rejected)? else {
         return Ok(op.nothing());
     };
     // A second path of the root, where it leads; what the operation answers where it leads nowhere.
     let other = |to: &str, last: Last| -> Result<Option<PathBuf>, Failure> {
-        walked(root, to, last, span).map_err(Failure::Refused)
+        walked(root, to, last, span).map_err(Failure::Rejected)
     };
     let unhanded = |what: &str| {
         Err(Failure::Said(format!(
@@ -532,7 +532,7 @@ fn run(
         }
         (Op::ReadFile, _) => match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
-                return Err(Failure::Refused(too_large(meta.len(), path, span)));
+                return Err(Failure::Rejected(too_large(meta.len(), path, span)));
             }
             Ok(meta) if meta.is_file() => found_read(meta.len() as usize, |out| {
                 unfollowed(OpenOptions::new().read(true), &target)
@@ -586,7 +586,7 @@ fn run(
             },
         ) => match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
-                return Err(Failure::Refused(too_large(meta.len(), path, span)));
+                return Err(Failure::Rejected(too_large(meta.len(), path, span)));
             }
             Ok(meta) if meta.is_file() => {
                 let read = read_private(&target, meta.len())
@@ -628,7 +628,7 @@ fn run(
         (Op::Mode, _) => found(mode_of(&target).map(|bits| int(i64::from(bits)))),
         (Op::SetMode, Second::Mode(bits)) => done(set_mode(&target, bits)),
         (Op::Symlink, Second::Target(to)) => {
-            link_stays(root, &target, &to, span).map_err(Failure::Refused)?;
+            link_stays(root, &target, &to, span).map_err(Failure::Rejected)?;
             done(std::os::unix::fs::symlink(&to, &target).is_ok())
         }
         (Op::ReadLink, _) => found(
@@ -638,7 +638,7 @@ fn run(
         ),
         (Op::Walk, _) => match walk(path, &target) {
             Ok(entries) => found(entries.map(|entries| entries_flat(&entries))),
-            Err(bytes) => return Err(Failure::Refused(walk_too_large(bytes, path, span))),
+            Err(bytes) => return Err(Failure::Rejected(walk_too_large(bytes, path, span))),
         },
         (Op::SetModified, Second::Millis(ms)) => done(set_modified(&target, ms)),
         (Op::Stat, _) => found(stat_of(&target).map(Stat::flat)),
@@ -651,7 +651,7 @@ fn run(
                 let entries: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
                 parts(&entries)
             })),
-            Err(bytes) => return Err(Failure::Refused(walk_too_large(bytes, path, span))),
+            Err(bytes) => return Err(Failure::Rejected(walk_too_large(bytes, path, span))),
         },
         (Op::Space, _) => found(space_of(&target).map(Space::flat)),
         (Op::Link, Second::Path(to)) => match other(&to, Last::Kept)? {
@@ -701,7 +701,7 @@ impl Kind {
 
 /// Why the file system would not do what an operation asked.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Refusal {
+pub enum FileError {
     NotFound,
     Denied,
     NotAFile,
@@ -712,18 +712,18 @@ pub enum Refusal {
     Other(i64, String),
 }
 
-impl Refusal {
+impl FileError {
     /// One byte, `NotFound` 0 to `NoSpace` 5 as declared, or 6 for `Other` and then its number
     /// and its words as parts.
     pub fn flat(self) -> Vec<u8> {
         match self {
-            Refusal::NotFound => vec![0],
-            Refusal::Denied => vec![1],
-            Refusal::NotAFile => vec![2],
-            Refusal::NotADirectory => vec![3],
-            Refusal::Exists => vec![4],
-            Refusal::NoSpace => vec![5],
-            Refusal::Other(code, text) => {
+            FileError::NotFound => vec![0],
+            FileError::Denied => vec![1],
+            FileError::NotAFile => vec![2],
+            FileError::NotADirectory => vec![3],
+            FileError::Exists => vec![4],
+            FileError::NoSpace => vec![5],
+            FileError::Other(code, text) => {
                 [&[6u8][..], &parts(&[&int(code)[..], text.as_bytes()])].concat()
             }
         }
@@ -732,10 +732,10 @@ impl Refusal {
 
 /// What an operation the file system may refuse answers: byte 1 and what it made, or byte 0 and
 /// why it made nothing.
-fn tried(made: Result<Vec<u8>, Refusal>) -> Vec<u8> {
+fn tried(made: Result<Vec<u8>, FileError>) -> Vec<u8> {
     match made {
         Ok(made) => [&[1u8][..], &made].concat(),
-        Err(why) => [&[0u8][..], &why.flat()].concat(),
+        Err(reason) => [&[0u8][..], &reason.flat()].concat(),
     }
 }
 
@@ -791,15 +791,15 @@ impl Space {
 }
 
 /// Why the file system refused.
-fn refusal(e: &std::io::Error) -> Refusal {
+fn rejection(e: &std::io::Error) -> FileError {
     match e.kind() {
-        ErrorKind::NotFound => Refusal::NotFound,
-        ErrorKind::PermissionDenied => Refusal::Denied,
-        ErrorKind::AlreadyExists => Refusal::Exists,
-        ErrorKind::NotADirectory => Refusal::NotADirectory,
-        ErrorKind::IsADirectory => Refusal::NotAFile,
-        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => Refusal::NoSpace,
-        _ => Refusal::Other(e.raw_os_error().map_or(0, i64::from), e.to_string()),
+        ErrorKind::NotFound => FileError::NotFound,
+        ErrorKind::PermissionDenied => FileError::Denied,
+        ErrorKind::AlreadyExists => FileError::Exists,
+        ErrorKind::NotADirectory => FileError::NotADirectory,
+        ErrorKind::IsADirectory => FileError::NotAFile,
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => FileError::NoSpace,
+        _ => FileError::Other(e.raw_os_error().map_or(0, i64::from), e.to_string()),
     }
 }
 
@@ -872,11 +872,11 @@ fn space_of(target: &Path) -> Option<Space> {
 
 /// `to` made another name for the file at `existing`, which is read without following a link:
 /// only a file takes a second name here.
-fn hard_link(existing: &Path, to: &Path) -> Result<(), Refusal> {
+fn hard_link(existing: &Path, to: &Path) -> Result<(), FileError> {
     match std::fs::symlink_metadata(existing) {
-        Err(e) => Err(refusal(&e)),
-        Ok(meta) if !meta.is_file() => Err(Refusal::NotAFile),
-        Ok(_) => std::fs::hard_link(existing, to).map_err(|e| refusal(&e)),
+        Err(e) => Err(rejection(&e)),
+        Ok(meta) if !meta.is_file() => Err(FileError::NotAFile),
+        Ok(_) => std::fs::hard_link(existing, to).map_err(|e| rejection(&e)),
     }
 }
 
@@ -1383,12 +1383,12 @@ fn unfollowed(options: &mut OpenOptions, target: &Path) -> std::io::Result<File>
 }
 
 #[cold]
-fn escapes(root: &Path, path: &str, why: &str, span: Span) -> Diagnostic {
+fn escapes(root: &Path, path: &str, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_PATH_ESCAPES_ROOT,
         format!("`{path}` leaves the root it was given"),
     )
-    .primary(span, why.to_string())
+    .primary(span, reason.to_string())
     .note(format!("the root is `{}`", root.display()))
     .note("a resource label names a root and an operation reaches only what is under it; a path that leaves one is refused before the operation runs")
 }

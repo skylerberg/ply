@@ -17,7 +17,7 @@ pub enum Failure {
     /// What the system said, which the run's failure names the job by.
     Said(String),
     /// A refusal of the job's own, which fails the run as it stands.
-    Refused(Diagnostic),
+    Rejected(Diagnostic),
 }
 
 /// A job whose failure may be a refusal of its own.

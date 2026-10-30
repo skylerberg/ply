@@ -67,7 +67,7 @@ impl Driver {
     fn exit(&self, who: EntryPoint, channel: &str, id: i64) -> Result<(), Diagnostic> {
         self.trace
             .exit((who.machine, who.task), channel, id, Outcome::Ok)
-            .map_err(|why| err_unbalanced(Span::DUMMY, "`trace.exit`", id, &why))
+            .map_err(|reason| err_unbalanced(Span::DUMMY, "`trace.exit`", id, &reason))
     }
 
     fn event(&self, who: EntryPoint, channel: &str, name: &str) {
@@ -302,14 +302,14 @@ fn a_span_open_on_another_task_of_the_same_entry_point_still_names_it() {
     let d = driver();
     let mine = entry_point();
     let theirs = d.enter(mine.in_task(1), "orders", "place_order");
-    let refused = d
+    let rejected = d
         .exit(mine.in_task(2), "orders", theirs)
         .expect_err("another task's span is `E0445`");
-    assert_eq!(refused.code, codes::SPAN_UNBALANCED);
+    assert_eq!(rejected.code, codes::SPAN_UNBALANCED);
     assert!(
-        rendered(&refused).contains("task @1"),
+        rendered(&rejected).contains("task @1"),
         "{}",
-        rendered(&refused)
+        rendered(&rejected)
     );
 }
 

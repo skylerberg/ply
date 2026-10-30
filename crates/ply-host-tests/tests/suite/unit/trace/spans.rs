@@ -105,12 +105,12 @@ fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
     let second = (id, Some(TaskId(2)));
     let opened = enter(&mut spans, first, "http", "request");
 
-    let Err(why) = spans.exit(second, opened, &channel("http"), Outcome::Ok) else {
+    let Err(reason) = spans.exit(second, opened, &channel("http"), Outcome::Ok) else {
         panic!("task 2 closed task 1's span");
     };
-    assert!(matches!(why, Unbalanced::OtherOwner(owner) if owner == first));
+    assert!(matches!(reason, Unbalanced::OtherOwner(owner) if owner == first));
 
-    let diagnostic = err_unbalanced(Span::DUMMY, "`trace.exit`", opened, &why);
+    let diagnostic = err_unbalanced(Span::DUMMY, "`trace.exit`", opened, &reason);
     assert_eq!(diagnostic.code, codes::SPAN_UNBALANCED);
     assert!(
         diagnostic.notes.iter().any(|n| n.contains("task @1")),
