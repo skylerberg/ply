@@ -7,14 +7,16 @@ import compiler.check.types (Type, TyFn, TyVar, Row, row_empty, bool_type, bytes
 import compiler.check.known (ordering_type)
 import compiler.emit.code (Code, NLit)
 import compiler.emit.typing (unknown_type)
-import compiler.emit.roots (symbol_of, entry_of)
-import compiler.emit.answer (Tables, no_tables, Emitted, Head, Defined, Exact, settled_by_callers)
+import compiler.emit.roots (symbol_of)
+import compiler.emit.answer (Tables, no_tables, Emitted, Head, Defined, Exact, settled_by_callers,
+                             Keyed, KeyedTag, KeyedField, KeyedEntry)
 import compiler.emit.reps (Def, EmitParam, Ctors, substituted_fully, no_ctors)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Written, Law, Clause, Order, Reflect, Shown, Digest,
                            Stated, RootName, root_name, root_text, key_types, unspecialised,
                            has_entry, LetGo, Contained)
-import compiler.emit.pieces (spelled)
+import compiler.emit.pieces (Piece, Hole, TagOf, FieldName, LambdaEntry, spelled, body_spelled,
+                             own_symbol)
 import compiler.emit.tir
 import compiler.emit.tir (Fn, Lambda, Closure)
 import compiler.emit.evidence (declared_arity)
@@ -108,7 +110,11 @@ pub fn emitted_of(f: Fn, ctors: Ctors) -> Emitted / {abort.raise} = {
           panic(String::of_bytes_lossy(b"its typed form fails its check: ".concat(fault))),
         None -> {
           let pr = printed_fn(counted, ctors);
-          { name: full, text: spelled(pr.pieces), tables: form_tables(counted, pr, ctors.stated) }
+          {
+            name: full,
+            text: body_spelled(counted.key, counted.members.map(|m: tir::Member| m.key), pr.pieces),
+            tables: form_tables(counted, pr, ctors.stated),
+          }
         },
       }
     }
@@ -142,8 +148,9 @@ pub fn counts_placed(f: Fn) -> Fn = if f.kind == tir::Plain { f } else { owned(f
 pub fn built_form(f: Fn) -> Fn = release_needs(counts_placed(f))
 
 /// What the root `f` printed as `pr` names of its unit, as an answer's tables hold it: a group's
-/// members by their case, the head and entry each root it holds is declared with (`stated` as
-/// `has_entry` reads it), and the statics it and its closures name.
+/// members by their case, the head each root it holds is declared with and whether it has an entry
+/// (`stated` as `has_entry` reads it), the statics it and its closures name, the natives it calls and
+/// the holes its part's table holds a place for.
 fn form_tables(f: Fn, pr: Printed, stated: Map<Bytes, Bool>) -> Tables / {abort.raise} = {
   let held = if f.members.len() == 0 {
     [{ key: f.key, arity: declared_arity(f.params), head: head_types(f.conv) }]
@@ -169,22 +176,30 @@ fn form_tables(f: Fn, pr: Printed, stated: Map<Bytes, Bool>) -> Tables / {abort.
     performs: pr.performs,
     handles: pr.handles,
     members: f.members.map(|m: tir::Member| m.key),
-    symbols: held.map(|h: { key: RootKey, arity: Int, head: Head }| {
-      let full = root_text(root_name(h.key));
-      {
-        symbol: symbol_of(full),
-        entry: if has_entry(h.key, h.arity, stated) { entry_of(full) } else { b"" },
-        head: h.head,
-      }
-    }),
+    defined: held.map(|h: { key: RootKey, arity: Int, head: Head }|
+      { entered: has_entry(h.key, h.arity, stated), head: h.head }),
     statics: statics,
     // The program's lending settles these, past every body's printing.
     handings: [],
     assumed: [],
     group: [],
     shared: pr.shared,
+    natives: pr.natives,
+    keyed: keyed_in(pr.pieces),
   }
 }
+
+/// Each hole of `pieces` a part's table holds a place for, once, in the order they first stand.
+fn keyed_in(pieces: List<Piece>) -> List<Keyed> =
+  pieces.fold([], |acc: List<Keyed>, p: Piece| {
+    let keyed = match p {
+      Hole(TagOf(name)) -> Some(KeyedTag(name)),
+      Hole(FieldName(i)) -> Some(KeyedField(i)),
+      Hole(LambdaEntry(i)) -> Some(KeyedEntry(i)),
+      _ -> None,
+    };
+    match keyed { Some(k) -> if acc.contains(k) { acc } else { acc.push(k) }, None -> acc }
+  })
 
 /// `held` and then each static `f` and its closures name that `held` does not, in the order they
 /// list them.
@@ -225,11 +240,15 @@ test "a root is defined under its symbol, with the entry the runtime calls it th
     formed_from(bare_setting(), 0, Named(b"m.f"), [], literal_code(LInt(7))),
     no_ctors(),
   );
-  let f = symbol_of(b"m.f");
-  assert_eq(e.tables.symbols.map(|d: Defined| d.symbol), [f]);
+  assert_eq(e.tables.defined.map(|d: Defined| d.entered), [true]);
+  // The body names its own root by the placeholder the unit writes its symbol into, so its C does
+  // not depend on its name.
+  assert_eq(e.text.index_of(symbol_of(b"m.f")), None);
   // The runtime's ABI: every root's entry takes its arguments as an array of words.
   assert(
-    e.text.index_of(Bytes::concat_all([b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args)"]))
+    e.text.index_of(
+        Bytes::concat_all([b"Word ", own_symbol(None), b"_entry(PlyCtx *ctx, const Word *args)"]),
+      )
       != None,
   )
 }
@@ -271,7 +290,7 @@ test "a form letting go of a value of its type variable is settled by its caller
   let settled = emitted_of(f, no_ctors());
   assert_eq(settled.text, b"");
   assert_eq(settled.tables.generics.needs, [{ var: 0, reads: Exact }]);
-  assert_eq(settled.tables.symbols, []);
+  assert_eq(settled.tables.defined, []);
   // The same body letting go of a value of a known type is printed.
   let known = emitted_of({ ..f, params: [{ ..p, ty: bytes_type() }] }, no_ctors());
   assert(known.text.len() > 0 && known.tables.generics.needs == [], None)
