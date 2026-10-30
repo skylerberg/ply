@@ -16,7 +16,7 @@ import compiler.check.types (NamedResource, SingletonResource, ResourceVariable,
                              mark_rigid_row, free_variables, env_bind_global, env_lookup,
                              env_locals, InScope, label_type, applied_args, apply_arguments,
                              NominalType, owning_fn_type)
-import compiler.check.known (hold_name, hold_type, task_name, chan_name, map_parts)
+import compiler.check.known (scoped_name, scoped_type, task_name, chan_name, map_parts)
 import compiler.check.resolve.tables (ParsedModule, Binding, TypeSpace, EffectSpace, qualify,
                                       default_binder, backticked)
 import std.bytes
@@ -26,11 +26,11 @@ import std.string
 import compiler.check.borrowing (parameter_mode)
 import compiler.check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord,
                                      DeclaredSum, TypeDeclaration, RecordDeclaration, OpInfo,
-                                     EffectInfo, Signature, Assumption, OpenRegion, Brand, HoldsOf,
+                                     EffectInfo, Signature, Assumption, OpenScope, Brand, HoldsOf,
                                      Tasks, RigidParam, MapKeySite, Checker, DefinitionConstraint,
                                      ConstraintSite, insert_constraint, dedup_constraints, WithType,
-                                     WithVar, WithRow, WithName, WithTypes, WithAtom, hold,
-                                     is_region_effect, location_of, module_name, scope_of,
+                                     WithVar, WithRow, WithName, WithTypes, WithAtom, scoped_effect,
+                                     is_scoped_effect, location_of, module_name, scope_of,
                                      report_error_at, report_error_at_and, supplied, new_type,
                                      new_type_var, new_row, new_row_var, resolve, is_prelude_effect,
                                      seed_atom, builtin_type_arity, add_constructor, constructor_of,
@@ -255,15 +255,15 @@ fn convert_constructor(
         new_type(
           arity_error(c, span, name.name.name, arity, converted.types.len(), b"type arguments", []),
         )
-      } else if name.name.name == hold_name() {
+      } else if name.name.name == scoped_name() {
         if over.labels.len() != 1 || over.rows.len() != 0 {
           new_type(refuse_label_row_count(c, span, name.name.name, 1, 0, over))
         } else {
           let label = match c.label_params.get(labels.get(0).name) {
             Some(v) -> VariableType(v),
-            None -> label_type(region_label_for(c, hold(), labels.get(0).name)),
+            None -> label_type(scope_label_for(c, scoped_effect(), labels.get(0).name)),
           };
-          { checker: c, ty: hold_type(label, converted.types.get(0)) }
+          { checker: c, ty: scoped_type(label, converted.types.get(0)) }
         }
       } else if labels.len() > 0 || rows.len() > 0 {
         new_type(refuse_label_row_count(c, span, name.name.name, 0, 0, over))
@@ -718,7 +718,7 @@ pub fn convert_atom(
           match a.resource {
             Some(r) -> match checker.label_params.get(r.name) {
               Some(v) -> ResourceVariable(v),
-              None -> NamedResource(region_label_for(checker, eff, r.name)),
+              None -> NamedResource(scope_label_for(checker, eff, r.name)),
             },
             None -> SingletonResource,
           }
@@ -840,7 +840,7 @@ pub fn effect_name(
   checker: Checker,
   qname: QName,
 ) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} =
-  if is_bare(qname) && is_region_effect(qname.name.name) {
+  if is_bare(qname) && is_scoped_effect(qname.name.name) {
     { checker: checker, name: Some(qname.name.name) }
   } else {
     let g: WithName = global(checker, EffectSpace, qname);
@@ -1025,16 +1025,16 @@ pub fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker / {abort
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item { TypeItem(d) -> record_type(c, parsed, d), _ -> c })
 
-fn region_brand(ty: Type) -> Option<Bytes> =
+fn scope_brand(ty: Type) -> Option<Bytes> =
   match ty {
-    NamedType(c) -> if c.name == hold_name() || is_scheduler_handle(c.name) { Some(c.name) }
-    else { first_reason(c.args, region_brand) },
-    FunctionType(f) -> match first_reason(f.params, region_brand) {
+    NamedType(c) -> if c.name == scoped_name() || is_scheduler_handle(c.name) { Some(c.name) }
+    else { first_reason(c.args, scope_brand) },
+    FunctionType(f) -> match first_reason(f.params, scope_brand) {
       Some(b) -> Some(b),
-      None -> region_brand(f.ret),
+      None -> scope_brand(f.ret),
     },
-    RecordType(fs) -> first_reason(fs, |f: Field| region_brand(f.ty)),
-    NominalType(n) -> first_reason(n.fields, |f: Field| region_brand(f.ty)),
+    RecordType(fs) -> first_reason(fs, |f: Field| scope_brand(f.ty)),
+    NominalType(n) -> first_reason(n.fields, |f: Field| scope_brand(f.ty)),
     VariableType(_) -> None,
   }
 
@@ -1045,7 +1045,7 @@ fn reject_declared_brand(
   owner: Bytes,
   what: Bytes,
 ) -> Checker =
-  match region_brand(ty) {
+  match scope_brand(ty) {
     None -> checker,
     Some(brand) ->
       report_error_at(
@@ -1071,16 +1071,16 @@ fn reject_declared_brand(
       ),
   }
 
-fn region_reach(ty: Type) -> Option<Bytes> =
+fn scope_reach(ty: Type) -> Option<Bytes> =
   match ty {
     VariableType(_) -> None,
-    NamedType(c) -> first_reason(c.args, region_reach),
-    RecordType(fs) -> first_reason(fs, |f: Field| region_reach(f.ty)),
-    NominalType(n) -> first_reason(n.fields, |f: Field| region_reach(f.ty)),
+    NamedType(c) -> first_reason(c.args, scope_reach),
+    RecordType(fs) -> first_reason(fs, |f: Field| scope_reach(f.ty)),
+    NominalType(n) -> first_reason(n.fields, |f: Field| scope_reach(f.ty)),
     FunctionType(f) -> if f.effects.atoms.fold(false, |b: Bool, atom: Atom|
-        b || atom.effect == hold()) { Some(b"`Hold`") }
+        b || atom.effect == scoped_effect()) { Some(b"`Hold`") }
     else if row_reaches_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
-      match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
+      match first_reason(f.params, scope_reach) { Some(b) -> Some(b), None -> scope_reach(f.ret) }
     },
   }
 
@@ -1092,7 +1092,7 @@ fn reject_declared_reach(
   what: Bytes,
   notes: List<Bytes>,
 ) -> Checker =
-  match region_reach(ty) {
+  match scope_reach(ty) {
     None -> checker,
     Some(reached) ->
       report_error_at(
@@ -1129,7 +1129,7 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
     match item {
       EffectItem(definition) -> {
         let name = qualify(parsed.name, definition.name.name);
-        if is_region_effect(definition.name.name) {
+        if is_scoped_effect(definition.name.name) {
           report_error_at(
             c,
             b"E0105",
@@ -1664,7 +1664,7 @@ pub fn written_signature(
       match p.ty {
         Some(t) -> {
           let o: WithType = convert_type(acc.checker, t);
-          { checker: check_hold_placement(o.checker, t, o.ty, true), types: acc.types.push(o.ty) }
+          { checker: check_scoped_placement(o.checker, t, o.ty, true), types: acc.types.push(o.ty) }
         },
         None -> {
           let o: WithType = new_type(acc.checker);
@@ -1675,7 +1675,7 @@ pub fn written_signature(
   let ret: WithType = match definition.ret {
     Some(t) -> {
       let o: WithType = convert_type(params.checker, t);
-      { checker: check_hold_placement(o.checker, t, o.ty, false), ty: o.ty }
+      { checker: check_scoped_placement(o.checker, t, o.ty, false), ty: o.ty }
     },
     None -> new_type(params.checker),
   };
@@ -1715,25 +1715,25 @@ pub fn written_signature(
   }
 }
 
-fn keeps_hold(ty: Type, passed: Bool) -> Bool =
+fn keeps_scoped(ty: Type, passed: Bool) -> Bool =
   match ty {
     VariableType(_) -> false,
     NamedType(c) ->
-      (c.name == hold_name() && !passed)
-        || c.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+      (c.name == scoped_name() && !passed)
+        || c.args.fold(false, |b: Bool, a: Type| b || keeps_scoped(a, false)),
     FunctionType(f) ->
-      f.params.fold(false, |b: Bool, p: Type| b || keeps_hold(p, true)) || keeps_hold(f.ret, false),
-    RecordType(fs) -> fs.fold(false, |b: Bool, f: Field| b || keeps_hold(f.ty, false)),
-    NominalType(n) -> n.args.fold(false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+      f.params.fold(false, |b: Bool, p: Type| b || keeps_scoped(p, true)) || keeps_scoped(f.ret, false),
+    RecordType(fs) -> fs.fold(false, |b: Bool, f: Field| b || keeps_scoped(f.ty, false)),
+    NominalType(n) -> n.args.fold(false, |b: Bool, a: Type| b || keeps_scoped(a, false)),
   }
 
-pub fn check_hold_placement(
+pub fn check_scoped_placement(
   checker: Checker,
   written: TypeExpression,
   ty: Type,
   passed: Bool,
 ) -> Checker / {abort.raise} =
-  if !keeps_hold(resolve(checker, ty), passed) { checker } else {
+  if !keeps_scoped(resolve(checker, ty), passed) { checker } else {
     report_error_at(
       checker,
       b"E0446",
@@ -1747,13 +1747,13 @@ pub fn check_hold_placement(
     )
   }
 
-pub fn open_region_named(checker: Checker, name: Bytes) -> Option<OpenRegion> =
-  checker.open_regions.fold(None, |acc: Option<OpenRegion>, region: OpenRegion|
-    if region.name == name { Some(region) } else { acc })
+pub fn open_scope_named(checker: Checker, name: Bytes) -> Option<OpenScope> =
+  checker.open_scopes.fold(None, |acc: Option<OpenScope>, scope: OpenScope|
+    if scope.name == name { Some(scope) } else { acc })
 
-fn region_label_for(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
-  if !is_region_effect(eff) { name }
-  else { match open_region_named(checker, name) { Some(region) -> region.label, None -> name } }
+fn scope_label_for(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
+  if !is_scoped_effect(eff) { name }
+  else { match open_scope_named(checker, name) { Some(scope) -> scope.label, None -> name } }
 
 pub fn first_reason<a | e>(xs: List<a>, f: (a) -> Option<Bytes> / e) -> Option<Bytes> / e =
   xs.fold(None, |acc: Option<Bytes>, x: a| match acc { Some(_) -> acc, None -> f(x) })
@@ -1952,7 +1952,7 @@ pub fn row_reaches_brand(row: Row, brand: Brand) -> Bool =
   match brand {
     HoldsOf(r) ->
       row.atoms.fold(false, |b: Bool, atom: Atom|
-        b || (atom.effect == hold() && atom.resource == NamedResource(r))),
+        b || (atom.effect == scoped_effect() && atom.resource == NamedResource(r))),
     Tasks ->
       [b"join", b"await", b"cancel"].concat(channel_ops()).fold(
         atoms_covered(row.atoms, seed_atom()),

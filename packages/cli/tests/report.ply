@@ -22,11 +22,11 @@ import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, t
                  string_or_null, strings, int_or_null, strings_or_null)
 import std.term (Style, plain, bold, dim, green, red, yellow, ansi, styles)
 import tester (SelectedCase, BindingReport, Options, TestUnit, ListingFailure)
-import suspects (SuspectDiff)
+import changes (ChangeDiff)
 import testing.schedule (Atom, Counts, ScheduledTest, counts, group_by_conflict, isolation_of,
                          isolation_word, parallelism, shared)
 import testing.delta (kind_word)
-import testing.diagnose (Suspect)
+import testing.diagnose (RankedChange)
 import testing.select (Cached, Changed, Decision, New, PreviousFailure, Reason, SameCode, Search,
                        Unhashed, pass_keys_by_test, to_run, reason_word)
 import std.bytes
@@ -61,7 +61,7 @@ pub type Case = {
   module: String,
   nondet: Bool,
   hash: Option<String>,
-  footprint: String,
+  effects: String,
   atoms: List<PrintedAtom>,
   seeded: Bool,
 }
@@ -103,10 +103,10 @@ fn owed_of(decided: RunDecision, index: Int) -> Int =
 pub fn group_of_class(analysis: CheckedProgram, class: List<Int>) -> Group / {abort.raise} =
   {
     tests: class,
-    footprint: footprint_text(
+    effects: outside_effects_text(
       canonical(
         class.fold([], |acc: List<types::Atom>, i: Int|
-          match test_at(analysis, i) { Some(t) -> acc.concat(t.footprint), None -> acc }),
+          match test_at(analysis, i) { Some(t) -> acc.concat(t.effects), None -> acc }),
       ),
     ),
   }
@@ -178,7 +178,7 @@ fn class_numbers(classes: List<List<Int>>) -> Map<Int, Int> =
     classes.at_or(i, []).fold(acc, |a: Map<Int, Int>, index: Int|
       if a.contains(index) { a } else { a.insert(index, i) }))
 
-pub type Group = { tests: List<Int>, footprint: String }
+pub type Group = { tests: List<Int>, effects: String }
 
 pub type Parallelism = {
   total: Int,
@@ -249,8 +249,8 @@ pub type Failed = {
   key: String,
   name: String,
   diagnostic: RuntimeDiagnostic,
-  defect: Bool,
-  suspects: List<{ name: String, hash: Option<String> }>,
+  internal_error: Bool,
+  changes: List<{ name: String, hash: Option<String> }>,
   unchanged: Bool,
   seed: Option<String>,
   race: Option<Race>,
@@ -265,8 +265,8 @@ pub type Fault = {
   key: String,
   name: String,
   diagnostic: RuntimeDiagnostic,
-  defect: Bool,
-  suspects: List<Suspect>,
+  internal_error: Bool,
+  changes: List<RankedChange>,
   unchanged: Bool,
   seed: Option<String>,
   race: Option<Race>,
@@ -278,7 +278,7 @@ pub type Fault = {
   declared: Option<List<String>>,
 }
 
-pub type Summary = { passed: Int, failed: Int, abandoned: Int, cached: Int, duration_us: Int }
+pub type Summary = { passed: Int, failed: Int, timed_out: Int, cached: Int, duration_us: Int }
 
 pub type SimulationSummary = {
   simulated: Int,
@@ -338,7 +338,7 @@ fn opt_bool(v: Option<Bool>) -> Json = match v { Some(b) -> Bool(b), None -> Nul
 
 fn covers(xs: List<Int>, wanted: Int) -> Bool = xs.filter(|x: Int| x == wanted).len() > 0
 
-fn no_group() -> Group = { tests: [], footprint: "" }
+fn no_group() -> Group = { tests: [], effects: "" }
 
 fn ms_tenths(us: Int) -> String = fixed_point((us + 50) / 100, 1)
 
@@ -746,7 +746,7 @@ fn group_block(
   let g: Group = decided.classes.at_or(i, no_group());
   let head = lines.push(
     indent() ++ "  group " ++ i.to_string() ++ " · " ++ count_of(g.tests.len(), "test") ++ " · "
-      ++ dim(style, g.footprint),
+      ++ dim(style, g.effects),
   );
   g.tests.fold(head, |acc: List<String>, index: Int| {
     let named = display_name_at(program, index);
@@ -888,8 +888,8 @@ pub fn summary_line(style: Style, report: RunReport, counted: Counts) -> String 
   let passes = c.passed.to_string() ++ " passed";
   let hosted = if counted.host == 0 { "" }
   else { dim(style, ", " ++ counted.host.to_string() ++ " host-backed") };
-  let given_up = if c.abandoned == 0 { "" }
-  else { yellow(style, ", " ++ c.abandoned.to_string() ++ " abandoned") };
+  let given_up = if c.timed_out == 0 { "" }
+  else { yellow(style, ", " ++ c.timed_out.to_string() ++ " abandoned") };
   indent() ++ (if c.failed > 0 { red(style, failures) } else { dim(style, failures) }) ++ ", "
     ++ (if c.passed > 0 { green(style, passes) } else { dim(style, passes) })
     ++ ", "
@@ -968,11 +968,11 @@ pub fn seed_lines(
       ),
   }
 
-pub fn suspect_text(x: Suspect) -> String =
+pub fn change_text(x: RankedChange) -> String =
   match x.change { Some(c) -> x.name ++ " (" ++ kind_word(c) ++ ")", None -> x.name }
 
-fn suspect_lines(style: Style, fault: Fault) -> List<String> = {
-  let named = fault.suspects.map(suspect_text);
+fn change_lines(style: Style, fault: Fault) -> List<String> = {
+  let named = fault.changes.map(change_text);
   if named.len() > 0 { ["  " ++ yellow(style, "suspects:") ++ " " ++ String::join(named, ", ")] }
   else if fault.unchanged {
     ["  " ++ dim(style, "suspects: none — nothing in this test's closure changed")]
@@ -994,7 +994,7 @@ fn failure_lines(
   ).concat(
     seed_lines(style, places, fault),
   ).concat(
-    suspect_lines(style, fault),
+    change_lines(style, fault),
   )
 }
 
@@ -1017,7 +1017,7 @@ fn painted(style: Style, line: String) -> String =
 fn diff_lines(
   style: Style,
   places: List<SourceText>,
-  d: SuspectDiff,
+  d: ChangeDiff,
 ) -> List<String> / {abort.raise} = {
   let head = "  " ++ bold(style, d.name) ++ " (" ++ kind_word(d.change) ++ ")"
     ++ dim_place(style, places, d.at);
@@ -1039,16 +1039,16 @@ fn diff_lines(
 fn diff_blocks(
   style: Style,
   program: Program,
-  diffs: List<SuspectDiff>,
+  diffs: List<ChangeDiff>,
 ) -> List<String> / {abort.raise} =
   if diffs.len() == 0 { [] } else {
     ["", indent() ++ bold(style, "changed since the failing tests last passed:")].concat(
-      diffs.flat_map(|d: SuspectDiff|
+      diffs.flat_map(|d: ChangeDiff|
         diff_lines(style, program.places, d).map(|l: String| indent() ++ l)),
     )
   }
 
-fn abandoned_lines(
+fn timed_out_lines(
   style: Style,
   places: List<SourceText>,
   outcome: Outcome,
@@ -1067,7 +1067,7 @@ fn abandoned_lines(
   }
 }
 
-fn abandoned_blocks(
+fn timed_out_blocks(
   style: Style,
   program: Program,
   report: RunReport,
@@ -1076,7 +1076,7 @@ fn abandoned_blocks(
     [],
     |acc: List<String>, outcome: Outcome|
       acc.push("").concat(
-        abandoned_lines(style, program.places, outcome).map(|l: String| indent() ++ l),
+        timed_out_lines(style, program.places, outcome).map(|l: String| indent() ++ l),
       ),
   )
 
@@ -1159,7 +1159,7 @@ pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / 
       { key: "why", value: Str(reason_text(reason_word(reason_of(decided, case.index)))) },
       { key: "moved", value: string_or_null(changed_read_of(decided, case.index)) },
       { key: "group", value: int_or_null(group_of(decided, case.index)) },
-      { key: "footprint", value: Str(case.footprint) },
+      { key: "footprint", value: Str(case.effects) },
       { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
       { key: "host", value: Bool(covers(report.reaches, case.index)) },
       { key: "shared_atoms", value: strings(shared_texts(case)) },
@@ -1180,7 +1180,7 @@ fn group_json(decided: RunDecision, i: Int) -> Json = {
   object([
     { key: "index", value: int(i) },
     { key: "tests", value: Array(g.tests.map(|x: Int| int(x))) },
-    { key: "footprint", value: Str(g.footprint) },
+    { key: "footprint", value: Str(g.effects) },
   ])
 }
 
@@ -1283,11 +1283,11 @@ pub fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
     { key: "key", value: Str(fault.key) },
     { key: "name", value: Str(fault.name) },
     { key: "diagnostic", value: runtime_diagnostic_json(fault.diagnostic, program.places) },
-    { key: "defect", value: Bool(fault.defect) },
+    { key: "defect", value: Bool(fault.internal_error) },
     { key: "seed", value: string_or_null(fault.seed) },
     { key: "replay", value: string_or_null(fault.replay) },
     { key: "race", value: race_json(fault.race) },
-    { key: "suspects", value: Array(fault.suspects.map(suspect_json)) },
+    { key: "suspects", value: Array(fault.changes.map(change_json)) },
     { key: "module", value: string_or_null(fault.module) },
     { key: "test_hash", value: string_or_null(fault.test_hash) },
     { key: "nondet", value: opt_bool(fault.nondet) },
@@ -1299,7 +1299,7 @@ pub fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
     },
   ])
 
-fn suspect_json(x: Suspect) -> Json =
+fn change_json(x: RankedChange) -> Json =
   object([
     { key: "name", value: Str(x.name) },
     {
@@ -1311,7 +1311,7 @@ fn suspect_json(x: Suspect) -> Json =
     { key: "test", value: Bool(x.test) },
   ])
 
-fn diff_json(program: Program, d: SuspectDiff) -> Json / {abort.raise} =
+fn diff_json(program: Program, d: ChangeDiff) -> Json / {abort.raise} =
   object([
     { key: "name", value: Str(d.name) },
     { key: "change", value: Str(kind_word(d.change)) },
@@ -1372,7 +1372,7 @@ fn summary_json(c: Summary) -> Json =
   object([
     { key: "passed", value: int(c.passed) },
     { key: "failed", value: int(c.failed) },
-    { key: "abandoned", value: int(c.abandoned) },
+    { key: "abandoned", value: int(c.timed_out) },
     { key: "cached", value: int(c.cached) },
     { key: "duration_ms", value: millis(c.duration_us) },
   ])
@@ -1418,7 +1418,7 @@ fn document(
   program: Program,
   report: RunReport,
   faults: List<Fault>,
-  diffs: List<SuspectDiff>,
+  diffs: List<ChangeDiff>,
   warnings: List<Diagnostic>,
   ok: Bool,
   decided: RunDecision,
@@ -1466,7 +1466,7 @@ fn document(
         ),
       },
       { key: "failures", value: Array(faults.map(|f: Fault| fault_json(program, f))) },
-      { key: "diffs", value: Array(diffs.map(|d: SuspectDiff| diff_json(program, d))) },
+      { key: "diffs", value: Array(diffs.map(|d: ChangeDiff| diff_json(program, d))) },
       { key: "diagnostics", value: all_to_json(report.escapes, program.places) },
       { key: "warnings", value: all_to_json(warnings, program.places) },
     ].concat(
@@ -1480,7 +1480,7 @@ fn survived(report: RunReport) -> Bool =
   match report.mutants { Some(m) -> m.survived > 0, None -> false }
 
 pub fn green_run(report: RunReport) -> Bool =
-  report.summary.failed == 0 && report.summary.abandoned == 0 && report.escapes.len() == 0
+  report.summary.failed == 0 && report.summary.timed_out == 0 && report.escapes.len() == 0
     && !survived(report)
 
 fn nothing_lines(style: Style, flags: Flags, program: Program) -> List<String> =
@@ -1493,7 +1493,7 @@ fn closing_lines(
   program: Program,
   report: RunReport,
   faults: List<Fault>,
-  diffs: List<SuspectDiff>,
+  diffs: List<ChangeDiff>,
   warnings: List<Diagnostic>,
 ) -> List<String> / {abort.raise} =
   [
@@ -1504,7 +1504,7 @@ fn closing_lines(
     warned_lines(style, report.escapes),
     failure_blocks(style, program, faults),
     diff_blocks(style, program, diffs),
-    abandoned_blocks(style, program, report),
+    timed_out_blocks(style, program, report),
     nothing_lines(style, flags, program),
     warned_lines(style, warnings),
     coverage_lines(style, report),
@@ -1522,7 +1522,7 @@ pub fn test_output(
   program: Program,
   report: RunReport,
   faults: List<Fault>,
-  diffs: List<SuspectDiff>,
+  diffs: List<ChangeDiff>,
   decided: RunDecision,
 ) -> CommandOutput / {abort.raise} = {
   let warnings = all_warnings(program, report);
@@ -1584,7 +1584,7 @@ fn atom_before(a: types::Atom, b: types::Atom) -> Bool =
 
 pub fn canonical(atoms: List<types::Atom>) -> List<types::Atom> = dedup(atoms.sort_by(atom_before))
 
-pub fn footprint_text(atoms: List<types::Atom>) -> String / {abort.raise} =
+pub fn outside_effects_text(atoms: List<types::Atom>) -> String / {abort.raise} =
   "{" ++ String::join(atom_texts(atoms), ", ") ++ "}"
 
 pub fn with_sim(options: Json, sim: Json) -> Json =
