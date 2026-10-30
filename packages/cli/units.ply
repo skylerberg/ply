@@ -1,15 +1,16 @@
 //! A program made into the unit the runtime enters. The emitter's answers kept between runs are
 //! read from the toolchain's cache, the rest are asked of the emitter here, in this program, and the
-//! C is assembled over all of them and compiled here into a library: the runtime is handed the
-//! library and compiles nothing.
+//! C is assembled over all of them, kept in the cache part by part, and compiled here into a library:
+//! the runtime is handed the library and compiles nothing.
 
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
-import compiler.cc (compilers, toolchain)
+import compiler.cc (compilers, toolchain, WrittenPart)
 import compiler.syntax.parsing (no_module, dummy_span)
+import compiler.unit
 import compiler.unit (Emission, Made, shipped, shipped_runtime, answers_store, emitted,
-                      emitter_identity, held, unit_text)
+                      emitter_identity, held, kept_sources)
 import compiler.store.kept (Record, kept_records, with_kept)
 import compiler.emit.keys (RootKey)
 import std.env (env)
@@ -20,8 +21,9 @@ import std.random (entropy)
 import std.time (time)
 import std.path (below_root)
 
-/// A unit's C, and what it was made of, which says what each root runs.
-pub type Emitted = { text: Bytes, made: Made }
+/// A unit's sources, each part's C kept in the toolchain's cache, and what it was made of, which says
+/// what each root runs.
+pub type Emitted = { sources: List<cc::Source>, made: Made }
 
 /// A command asks for the unit a run enters, and for the library its C compiles into; what answers
 /// is `emitting`'s, which `main` runs every command under, or a handler of the asker's own. The C
@@ -29,25 +31,28 @@ pub type Emitted = { text: Bytes, made: Made }
 /// deterministic one, whatever the answering keeps.
 pub effect emit {
   read unit(front: LoadedAnalysis, offered: List<RootKey>) -> Result<Emitted, List<Diag>>
-  /// The library `text`, a unit's C, compiles into under `profile`: its path, which the runtime
-  /// opens.
-  read compiled(text: Bytes, profile: cc::Profile) -> Result<String, List<Diag>>
+  /// The library a unit's `sources`, whose C the toolchain's cache keeps, compile into under
+  /// `profile`: its path, which the runtime opens.
+  read compiled(sources: List<cc::Source>, profile: cc::Profile) -> Result<String, List<Diag>>
 }
 
 fn emitted_of(
   front: LoadedAnalysis,
   emission: Result<Emission, Bytes>,
-) -> Result<Emitted, List<Diag>> / {abort.raise} =
+) -> Result<Emitted, List<Diag>> / {toolchain.read, toolchain.write, abort.raise} =
   match held(front.dump, emission) {
     Err(diags) -> Err(diags),
-    Ok(parts) ->
-      Ok({
-        text: unit_text(parts),
-        made: match emission {
-          Ok(e) -> e.produced.made,
-          Err(_) -> { bodies: [], offered: [], named: Map::new() },
-        },
-      }),
+    Ok(parts) -> match kept_sources(parts) {
+      Err(why) -> Err([unbuildable(why)]),
+      Ok(sources) ->
+        Ok({
+          sources: sources,
+          made: match emission {
+            Ok(e) -> e.produced.made,
+            Err(_) -> { bodies: [], offered: [], named: Map::new() },
+          },
+        }),
+    },
   }
 
 /// What emitting a unit here reaches: the runtime it is compiled against, this program's own
@@ -69,23 +74,29 @@ fn told(
   match emission {
     Err(_) -> (),
     Ok(e) -> if env.variable("PLY_C_PHASES") != None {
+      let parts = e.produced.parts;
       process.err[proc](
         "phases: emitter " ++ String::of_bytes(identity) ++ ", " ++ e.kept.to_string()
           ++ " answers read back, "
           ++ e.asked.to_string()
           ++ " asked of it, "
+          ++ parts.filter(|w: WrittenPart| w.text == None).len().to_string()
+          ++ " of "
+          ++ parts.len().to_string()
+          ++ " parts taken back, "
           ++ ms.to_string()
           ++ "ms",
       )
     },
   }
 
-/// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
-/// the toolchain's cache.
+/// The unit over `offered`, its C kept in the toolchain's cache as the runtime compiles it, with the
+/// emitter's answers kept there too. A part an earlier run kept, whose C the cache still holds, is
+/// taken back without reading its bodies.
 fn unit_of(
   front: LoadedAnalysis,
   offered: List<RootKey>,
-) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], toolchain.read, toolchain.write, abort.raise} = {
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped_runtime();
   let started = time.elapsed_ms();
@@ -98,49 +109,47 @@ fn unit_of(
       offered,
       |key: Bytes| kept_records.get[ans](key),
       |rs: List<Record>| kept_records.put[ans](rs),
+      holds: Some(|digest: String| cc::holds_source(digest)),
     ));
   told(emission, identity, time.elapsed_ms() - started);
   emitted_of(front, emission)
 }
 
-/// A unit's C alone, for whoever only enters it.
-pub fn text_of(r: Result<Emitted, List<Diag>>) -> Result<Bytes, List<Diag>> =
-  match r { Ok(e) -> Ok(e.text), Err(diags) -> Err(diags) }
+/// A unit's C whole, read back from the toolchain's cache, for whoever carries it elsewhere.
+pub fn text_of(
+  r: Result<Emitted, List<Diag>>,
+) -> Result<Bytes, List<Diag>> / {toolchain.read, abort.raise} =
+  match r {
+    Err(diags) -> Err(diags),
+    Ok(e) -> match unit::read_back(e.sources) {
+      Err(why) -> Err([unbuildable(why)]),
+      Ok(text) -> Ok(text),
+    },
+  }
 
 /// The whole program's unit, every root it offers, and what it was made of.
 pub fn whole_emitted(
   front: LoadedAnalysis,
 ) -> Result<Emitted, List<Diag>> / {emit.unit, abort.raise} = emit.unit(front, every_root(front))
 
-/// The whole program's unit, as the runtime compiles it.
-pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit, abort.raise} =
-  text_of(whole_emitted(front))
-
-/// The library the whole program's unit compiles into under `profile`, or none for a run that
-/// executes nothing.
-pub fn wanted(
+/// The library the whole program's unit compiles into under `profile`.
+pub fn whole_library(
   front: LoadedAnalysis,
-  build: Bool,
   profile: cc::Profile,
-) -> Result<Option<String>, List<Diag>> / {emit.unit, emit.compiled, abort.raise} =
-  if !build { Ok(None) } else {
-    match whole(front) {
-      Err(diags) -> Err(diags),
-      Ok(text) -> match library(text, profile) { Ok(l) -> Ok(Some(l)), Err(diags) -> Err(diags) },
-    }
-  }
+) -> Result<String, List<Diag>> / {emit.unit, emit.compiled, abort.raise} =
+  library_over(whole_emitted(front), profile)
 
-/// The library `text` compiles into under `profile`, where there is a text.
+/// The library `sources` compile into under `profile`, where there are sources.
 pub fn library_of(
-  text: Option<Bytes>,
+  sources: Option<List<cc::Source>>,
   profile: cc::Profile,
 ) -> Result<Option<String>, List<Diag>> / {emit.compiled} =
-  match text {
+  match sources {
     None -> Ok(None),
-    Some(t) -> match library(t, profile) { Ok(l) -> Ok(Some(l)), Err(diags) -> Err(diags) },
+    Some(s) -> match library(s, profile) { Ok(l) -> Ok(Some(l)), Err(diags) -> Err(diags) },
   }
 
-/// `body` with every unit it asks for emitted and compiled here, the emitter's answers and the
+/// `body` with every unit it asks for emitted and compiled here, the emitter's answers, the C and the
 /// objects kept under the toolchain's cache.
 pub fn emitting<a | e>(
   body: () -> a / {emit.unit, emit.compiled | e},
@@ -149,19 +158,32 @@ pub fn emitting<a | e>(
     body()
   } with {
     emit.unit(front, offered) -> unit_of(front, offered),
-    emit.compiled(text, profile) -> compiled_of(text, profile),
+    emit.compiled(sources, profile) -> compiled_of(sources, profile),
   }
 
-/// The library a unit's text compiles into under `profile`.
-pub fn library(text: Bytes, profile: cc::Profile) -> Result<String, List<Diag>> / {emit.compiled} =
-  emit.compiled(text, profile)
+/// The library a unit's `sources` compile into under `profile`.
+pub fn library(
+  sources: List<cc::Source>,
+  profile: cc::Profile,
+) -> Result<String, List<Diag>> / {emit.compiled} = emit.compiled(sources, profile)
 
 /// The library an emitted unit compiles into under `profile`.
 pub fn library_over(
   r: Result<Emitted, List<Diag>>,
   profile: cc::Profile,
 ) -> Result<String, List<Diag>> / {emit.compiled} =
-  match r { Ok(e) -> library(e.text, profile), Err(diags) -> Err(diags) }
+  match r { Ok(e) -> library(e.sources, profile), Err(diags) -> Err(diags) }
+
+/// The library `text`, a unit's C whole from outside the toolchain's cache such as an artifact
+/// carries, compiles into under `profile`: its parts are cut and kept in the cache first.
+pub fn library_carried(
+  text: Bytes,
+  profile: cc::Profile,
+) -> Result<String, List<Diag>> / {emit.compiled, toolchain.read, toolchain.write, abort.raise} =
+  match cc::kept_text(text) {
+    Err(why) -> Err([unbuildable(why)]),
+    Ok(sources) -> library(sources, profile),
+  }
 
 // --- Compiling a unit ---------------------------------------------------------------
 
@@ -179,13 +201,13 @@ fn unbuildable(why: String) -> Diag =
     b"the C backend shells out to `cc`; `PLY_CC` names another compiler",
   ])
 
-/// `text` compiled into a library the toolchain's cache keeps: an object for each part not compiled
-/// before, and a link where the cache holds none of them together.
+/// `sources` compiled into a library the toolchain's cache keeps: an object for each part not
+/// compiled before, and a link where the cache holds none of them together.
 fn compiled_of(
-  text: Bytes,
+  sources: List<cc::Source>,
   profile: cc::Profile,
 ) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
-  let built = if by_tcc(profile) { cc::library[tcc](profile, text) }
-  else { cc::library[cc](profile, text) };
+  let built = if by_tcc(profile) { cc::library[tcc](profile, sources) }
+  else { cc::library[cc](profile, sources) };
   match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(why)]) }
 }
