@@ -1,0 +1,72 @@
+import std.bytes
+import std.cookie
+import std.dns (dns)
+import std.http
+import std.http (Request, Response)
+import std.ip
+import std.net
+import std.net (net)
+import std.task
+import std.url
+import std.x509
+
+fn answer<| e>(req: Request) -> Response<| {abort.raise | e}> / {abort.raise | e} =
+  http::text_response(200, match req.client_certificate {
+    None -> "none",
+    Some(der) -> match x509::parse(der, x509::limits(), x509::Tolerant) {
+      Err(_) -> "unreadable",
+      Ok(c) ->
+        x509::name_text(x509::info(c).subject) ++ " / " ++ dns_names(c) ++ " / sha256:"
+          ++ x509::fingerprint(c).hex_of(),
+    },
+  })
+
+fn dns_names(c: x509::Certificate) -> String =
+  x509::alt_names(c).fold("", |names: String, n: x509::GeneralName|
+    match n { x509::Dns(name) -> names ++ name, _ -> names })
+
+fn fetched(
+  port: Int,
+  credential: Option<String>,
+) -> String / {dns.lookup, net.write[client], task.write, clock.read, clock.write, abort.raise} = {
+  let to = match url::url_parse("https://localhost:" ++ port.to_string() ++ "/") {
+    Ok(u) -> u,
+    Err(_) -> panic("no URL"),
+  };
+  let options = { ..http::default_fetch_options(), credential: credential };
+  match task::unbounded(||
+      http::fetch[client](
+        http::Get,
+        to,
+        http::empty_headers(),
+        b"",
+        cookie::jar(0),
+        options,
+        Instant(0),
+      )) {
+    Ok(f) -> String::of_bytes_lossy(http::whole_bytes(f.response.body)),
+    Err(_) -> "refused",
+  }
+}
+
+fn main() -> String / {dns.lookup, net.read[listener], net.write[listener], net.read[conn], net.write[conn], net.write[client], task.write, clock.read, clock.write, abort.raise} = {
+  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
+    Ok(l) -> l,
+    Err(why) -> panic("no listener: " ++ net::error_message(why)),
+  };
+  let port = match net.local_port[listener](l) { Some(p) -> p, None -> panic("no port") };
+  let serving = task.spawn(||
+    http::serve_pooled_tls[listener, conn](
+      l,
+      2,
+      http::default_limits(),
+      http::default_shedding(),
+      "api",
+      answer,
+    ));
+  let presenting = fetched(port, Some("caller"));
+  let anonymous = fetched(port, None);
+  let _pooled = task.join(serving);
+  net.close[listener](l);
+  "presenting: " ++ presenting ++ " | anonymous: " ++ anonymous
+}

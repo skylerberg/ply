@@ -88,6 +88,9 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   reference, `live == 0`.
 - A test that touches a real resource uses a handler instead. A few `test/nondet` tests check the
   real handlers.
+- A program a CLI test runs is a file under `tests/programs/<test module>/` that the test reads with
+  `embed`, so `ply check`, `ply fmt` and `ply rename` cover it. Use a raw string only for text that
+  must fail to check, that the test builds, or that is not Ply.
 - Rust tests test only the Rust: none compiles Ply or reads the standard library. Ply tests cover
   what Ply programs do, including the runtime's internals.
 

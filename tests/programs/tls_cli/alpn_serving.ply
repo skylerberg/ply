@@ -1,0 +1,85 @@
+import std.cookie
+import std.dns (dns)
+import std.http
+import std.http (Request, Response)
+import std.ip
+import std.net
+import std.net (net)
+import std.show (show)
+import std.task
+import std.url
+
+fn answer<| e>(req: Request) -> Response<| e> =
+  http::text_response(200, (if req.version == http::Http2 { "h2 " } else { "h1 " }) ++ req.path)
+
+fn read_all(c: Int, got: Bytes, fuel: Int) -> Bytes / {net.write[plain]} =
+  if fuel <= 0 { got } else {
+    match net.recv[plain](c, 4096, 5000) {
+      Some(more) -> if more.len() == 0 { got } else { read_all(c, got.concat(more), fuel - 1) },
+      None -> got,
+    }
+  }
+
+fn asked_plainly(port: Int) -> String / {net.write[plain], abort.raise} = {
+  let c = match net.connect_to[plain](ip::socket_at(ip::loopback_v4(), port), [], 5000) {
+    Ok(c) -> c,
+    Err(why) -> panic("no connection: " ++ net::error_message(why)),
+  };
+  match net.start_tls[plain](c, "localhost", ["http/1.1"], b"", 5000) {
+    Err(why) -> panic("not secured: " ++ net::error_message(why)),
+    Ok(secured) -> {
+      net.send[plain](
+        c,
+        b"GET /plain HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        5000,
+      );
+      let said = String::of_bytes_lossy(read_all(c, b"", 8));
+      net.close[plain](c);
+      show(secured.protocol) ++ " " ++ said
+    },
+  }
+}
+
+fn main() -> Int / {dns.lookup, net.read[listener], net.write[listener], net.read[conn], net.write[conn], net.write[client], net.write[plain], task.write, clock.read, clock.write, abort.raise} = {
+  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
+    Ok(l) -> l,
+    Err(why) -> panic("no listener: " ++ net::error_message(why)),
+  };
+  let port = match net.local_port[listener](l) { Some(p) -> p, None -> panic("no port") };
+  let serving = task.spawn(||
+    http::serve_pooled_tls[listener, conn](
+      l,
+      2,
+      http::default_limits(),
+      http::default_shedding(),
+      "api",
+      answer,
+    ));
+  let to = match url::url_parse("https://localhost:" ++ port.to_string() ++ "/parts") {
+    Ok(u) -> u,
+    Err(_) -> panic("no URL"),
+  };
+  let fetched = task::unbounded(||
+    http::fetch[client](
+      http::Get,
+      to,
+      http::empty_headers(),
+      b"",
+      cookie::jar(0),
+      http::default_fetch_options(),
+      Instant(0),
+    ));
+  let plainly = asked_plainly(port);
+  let pooled = task.join(serving);
+  net.close[listener](l);
+  match fetched {
+    Ok(f) -> if http::whole_bytes(f.response.body) != b"h2 /parts" {
+      panic("the fetch was not HTTP/2: " ++ show(f.response.status))
+    } else if !plainly.starts_with("Some(\"http/1.1\") HTTP/1.1 200 OK")
+        || !plainly.ends_with("h1 /plain") {
+      panic("a client offering http/1.1 alone was not served it: " ++ plainly)
+    } else if pooled.served != 2 { panic("the pool served " ++ show(pooled)) }
+    else { 0 },
+    Err(why) -> panic("the fetch failed: " ++ show(why)),
+  }
+}
