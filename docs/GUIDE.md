@@ -22,7 +22,7 @@ the rest is reference.
 5. [Types](#5-types)
 6. [Expressions](#6-expressions)
 7. [Effects](#7-effects)
-8. [Resources and regions](#8-resources-and-regions)
+8. [Resources and scopes](#8-resources-and-scopes)
 9. [Concurrency and simulation](#9-concurrency-and-simulation)
 10. [Testing](#10-testing)
 11. [Specifications and proofs](#11-specifications-and-proofs)
@@ -64,7 +64,7 @@ fn main() -> Unit / {Console} = print(greeting())
 program writes; `ply`'s own errors go to standard error. `ply run --json` reports the value `main`
 returns.
 
-`/ {Console}` is `main`'s *effect row*: the effects it may perform. Printing is an effect, so a
+`/ {Console}` lists `main`'s *effects*: what it may perform. Printing is an effect, so a
 function that prints says so in its type. `print`, `read_line` and `Console` come from
 `std.console` and need no import. To print a value that is not a `String`, use an interpolated
 string: `print(f"n = {n}")`.
@@ -115,7 +115,7 @@ path, it works on the package that contains the working directory.
 | `ply doc NAME` | prints the documentation of a definition, type, effect or module |
 | `ply prove` | proves the program's laws and specifications (§11) |
 
-`ply check --types` prints the type and effect row of every definition. §17 lists every command
+`ply check --types` prints the type and effects of every definition. §17 lists every command
 and flag.
 
 ### 1.5 The cache
@@ -159,8 +159,8 @@ fn area(s: Shape) -> Int =
 There are no loops or mutable variables. A function that calls itself in tail position runs as a
 loop (§6.6), and `List::map`, `List::filter` and `List::fold` cover most iteration.
 
-**Effects.** An effect is a set of operations that a handler implements. A function's row lists
-the operations it performs, and a `handle` supplies the implementation (§7):
+**Effects.** An effect is a set of operations that a handler implements. A function's signature
+lists the operations it performs, and a `handle` supplies the implementation (§7):
 
 ```ply
 nondet effect wall_clock {
@@ -183,9 +183,9 @@ The test supplies the time, so it gives the same result on every run. `nondet` m
 whose results come from outside the program. A test may not leave one unhandled unless it is
 written `test/nondet` (§10.2).
 
-**Failures.** There are no exceptions. A failure is a `raise` operation, so a function's row lists
-every way it can fail. `try` turns a raise into a `Result`, and `?` returns early from a function
-that returns `Result` or `Option` (§7.7):
+**Failures.** There are no exceptions. A failure is a `raise` operation, so a function's signature
+lists every way it can fail. `try` turns a raise into a `Result`, and `?` returns early from a
+function that returns `Result` or `Option` (§7.7):
 
 ```ply
 type SyntaxError = { line: Int, message: String }
@@ -287,7 +287,7 @@ Other words are keywords only in the position where they have a meaning, and are
 everywhere else: `as`, `read`, `write`, `raise`, `set`, `new`, `opaque`, `law`, `schema`, `forall`,
 `where`, `derivable`, `identity`, `cost`, `space`, `bounded`, `derive`, `for`, `in`, `by`, `key`,
 `show`, `invariant`, `numeric`, `host`, `release`, `keep`, `once`, `reuse`, `transparent`, `const`,
-`returns`, `fresh`, `requires`, `ensures`, `decreases`, `resume`, `return`, `with_hold`,
+`returns`, `fresh`, `requires`, `ensures`, `decreases`, `resume`, `return`, `with_scope`,
 `simulate`, `try` and `parallel`.
 
 ### 3.3 Literals
@@ -374,7 +374,7 @@ and `tag::fill` with the result and the hole values when it runs.
 - `compile` takes the list of text pieces (one more than there are holes) and returns
   `Result<C, {message: String, offset: Int, part: Int}>`.
 - `fill` takes the compiled `C` and a `List<H>` of the hole values, and returns the literal's value.
-- Each takes no type, label or row parameters and may only raise (`E0152`).
+- Each takes no type, label or effect parameters and may only raise (`E0152`).
 - An `Err` from the parser is `E0153`, at the character `offset` of the text as written. A parser
   that raises or runs for more than 60 seconds is `E0154`.
 
@@ -414,10 +414,10 @@ From loosest to tightest binding. Every binary operator is left-associative.
 
 **Arithmetic is checked.**
 
-- Division or remainder by zero raises `abort.raise` (§7.7), unless the divisor is a nonzero literal,
-  the operands are `Float`, or the checker can see that an `Int` divisor is not zero.
+- Division or remainder by zero raises `abort.raise` (§7.7), unless the divisor is a nonzero
+  literal, the operands are `Float`, or the checker can see that an `Int` divisor is not zero.
 - Overflow, a `Decimal` result that cannot be exact, and a shift by a negative count or by the
-  width or more end the program (`E0502`). These do not appear in effect rows.
+  width or more end the program (`E0502`). These do not appear in a function's effects.
 - `+%`, `-%` and `*%` wrap at the type's width, and `+|`, `-|` and `*|` saturate at its limits:
   `255u8 +% 1u8` is `0u8` and `250u8 +| 10u8` is `255u8`. They never fail. Write a space before a
   lambda used as a right operand (`a + |x| x`), since `+|` would otherwise be one operator.
@@ -441,7 +441,7 @@ A body is `=` and an expression. There is no `return`: a function's value is its
 body with `let`s is a block, in braces.
 
 A top-level `fn` writes every parameter type and its return type (`E0126`, which shows the inferred
-type), and its effect row if it has effects. A parameter the body does not use may be written `_`.
+type), and its effects, if it has any. A parameter the body does not use may be written `_`.
 
 **Defaults.** A parameter with a default may be left out of a call. A default must be a constant: a
 literal, or a constructor, record or list of literals (`E0121`). On a `pub fn`, a default may not
@@ -529,7 +529,7 @@ const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
 A `const fn` is computed the first time a run reads it. Later reads in the same process return the
 same value. Use it to parse a data file once.
 
-- It takes no parameters and has no type parameters or effect row.
+- It takes no parameters, type parameters or effects.
 - Its body may raise and do nothing else, and must terminate. Its value must be data: no function,
   `Task`, `Chan` or `Secret`. Anything else is `E0156`.
 - A raise in the body ends the run, whatever handlers surround the read. Test what it returns.
@@ -556,7 +556,7 @@ again exactly when the file changes. A missing or unreadable path, or the wrong 
 
 ## 5. Types
 
-Ply infers types with Hindley–Milner unification and row polymorphism. The types you write in a
+Ply infers types, and effects, with Hindley–Milner unification. The types you write in a
 signature are checked, never widened by inference (§5.6).
 
 ### 5.1 Numbers and other scalars
@@ -671,17 +671,18 @@ its type parameters.
 fn apply<a, b | e>(x: a, f: (a) -> b / e) -> b / e = f(x)
 ```
 
-Type parameters are lowercase names in `<..>`. Row parameters, which stand for effect rows (§7.2),
-come after `|`; write `<| e>` when there are no type parameters. A name in brackets is a *label
-parameter*, which stands for a resource label (§7.2):
+Type parameters are lowercase names in `<..>`. Effect variables, which stand for lists of effects
+(§7.2), come after `|`; write `<| e>` when there are no type parameters. A name in brackets is a
+*label parameter*, which stands for a resource label (§7.2):
 
 ```ply
 fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)
 ```
 
-A call fills a label parameter explicitly, `relay[conn](b)`, or from an argument whose type
-mentions the label. A label of a region (§8.2) is always filled from the argument that carries the
-region. Leaving a label unfilled is `E0306`. `<[l, k]>` is short for `<[l], [k]>`, and label parameters come before the `|`.
+A call fills a label parameter explicitly, `relay[conn](b)`, or from an argument whose type mentions
+the label. A scope's label (§8.2) is always filled from the argument that carries the scope. Leaving
+a label unfilled is `E0306`. `<[l, k]>` is short for `<[l], [k]>`, and label parameters come before
+the `|`.
 
 A type takes parameters the same way:
 
@@ -691,9 +692,9 @@ type Sink<a, [l] | e> = | Sink((a) -> Unit / {net.send[l] | e}) | Quiet
 type Pair<a> = new { first: a, second: a }
 ```
 
-A use fills every parameter (`E0202`). A row argument is a row such as `{fs.read[src]}` or `{}`. A
-declared type may mention only its own parameters. An alias's arguments are substituted into its
-body, but a sum's or `new` record's arguments are part of the type, so `Seq<Int | {}>` and
+A use fills every parameter (`E0202`). An effects argument is a list such as `{fs.read[src]}` or
+`{}`. A declared type may mention only its own parameters. An alias's arguments are substituted into
+its body, but a sum's or `new` record's arguments are part of the type, so `Seq<Int | {}>` and
 `Seq<Int | {fs.read[src]}>` are different types.
 
 **Constraints.** `where numeric(a)` allows `+`, `-`, `*`, unary `-` and ordering on `a`, and
@@ -709,26 +710,26 @@ A definition with a `numeric` or `integer` constraint receives its type as a hid
 must be called directly: using it as a value is `E0310`. A type may put `derivable` constraints on
 its own parameters, which every use of the type must meet (`E0206`).
 
-**Recursion.** A recursive call may fill type, label and row parameters differently, except that it
-may not fill a type parameter with a larger type built from it, as `f<a>` calling `f<List<a>>`
+**Recursion.** A recursive call may fill type, label and effect parameters differently, except that
+it may not fill a type parameter with a larger type built from it, as `f<a>` calling `f<List<a>>`
 (`E0308`).
 
 **Resource parameters.** Filling a type parameter with a resource (§8.1) is `E0317`, unless the
-parameter is written `keep`: `fn hold<keep a>(x: keep a)`.
+parameter is written `keep`: `fn keep_one<keep a>(x: keep a)`.
 
 ### 5.6 Function types, and what you must write
 
 `(A, B) -> C` is a function that performs nothing and cannot raise. `(A) -> B / {db.read[users]}`
-and `(A) -> B / e` have effect rows. A function value may perform less than its type allows, never
+and `(A) -> B / e` have effects. A function value may perform less than its type allows, never
 more. Functions cannot be compared, encoded, ordered or used as map keys.
 
-You write every parameter type, return type and effect row of a top-level `fn`, and the type of
+You write every parameter type, the return type and the effects of a top-level `fn`, and the type of
 every `forall` binder. Everything else is inferred: lambda parameters, `let` types and so on. A
 local `let` is not generic, so `let f = |x| x;` used at two types is `E0201`. Callers are checked
 against the signature, never against the body.
 
-The written row is an upper bound: what the body performs must fit inside it (`E0302`, which shows
-the row to write), and it may be wider than the body needs.
+The written effects are an upper bound: what the body performs must fit inside them (`E0302`, which
+shows the effects to write), and they may include more than the body needs.
 
 **Borrowed function parameters.** A function-typed parameter of a top-level `fn` is *borrowed*: the
 function may use it only until the call returns. It may call it, pass it to another borrowed
@@ -770,8 +771,8 @@ declares its own `Ok` or `Err` cannot use `try` (`E0118`).
 - `Secret::of_string` and `Secret::of_bytes` seal a value. `config.secret` (`std.config`) returns a
   secret the program never sees in plain form, and `entropy.secret(n)` (`std.random`) draws random
   bytes straight into one.
-- `Secret::concat`, `Secret::decode`, `Secret::encode` and the key derivations in `std.hash` make new
-  secrets from secrets.
+- `Secret::concat`, `Secret::decode`, `Secret::encode` and the key derivations in `std.hash` make
+  new secrets from secrets.
 - A program can only compare two secrets (`==`, in time that depends only on their lengths), check
   one against a string (`Secret::verify`), and read its length.
 - Hashing passwords (`std.password`), signing and key agreement (`std.crypto`), and MACs
@@ -780,7 +781,8 @@ declares its own `Ok` or `Err` cannot use `try` (`E0118`).
 - A secret cannot be shown, encoded, ordered, hashed, matched or drawn by a `forall`. Its memory is
   zeroed when it is freed.
 
-`Hold`, `Task` and `Chan` belong to a region and cannot outlive it (§8.2, §9).
+A `Scoped` value belongs to its scope (§8.2), and a `Task` or `Chan` to its scheduler (§9); none
+can outlive it.
 
 ### 5.8 Equality, display, invariants and arithmetic for your own types
 
@@ -821,7 +823,7 @@ Everything is an expression, including `if`, `match`, `handle` and blocks.
 A block `{ statements; tail }` has the value of its last expression, or `Unit` if there is none.
 `let pattern = expression;` binds names, and `let name: Type = expression;` states the type. A later
 `let` may reuse a name. A statement needs `;` unless it is a block, `if`, `match`, `handle`,
-`with_hold` or `simulate`.
+`with_scope` or `simulate`.
 
 A `let` pattern can take a record apart, which is how a function returns several values:
 
@@ -929,8 +931,9 @@ fn sum_to(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { sum_to(n - 1, acc 
 ```
 
 Functions of one module that tail-call each other in a cycle, like `even` and `odd`, also run as a
-loop, unless the cycle has a `handle` whose clause resumes other than in tail position. Every other call uses stack, and the stack is one gigabyte; a call past it ends the program
-(`E0502`). `range`, `List::map`, `List::filter` and `List::fold` use no stack per element.
+loop, unless the cycle has a `handle` whose clause resumes other than in tail position. Every other
+call uses stack, and the stack is one gigabyte; a call past it ends the program (`E0502`). `range`,
+`List::map`, `List::filter` and `List::fold` use no stack per element.
 
 `iterate` is a loop with an early exit and a limit on passes:
 
@@ -964,7 +967,7 @@ inside a function returning `Result<_, E2>` is `E0201`.
   argument with effects, is `E0119`. Bind the value first.
 - Inside a `handle` or `try`, `?` leaves the whole function; no clause sees it.
 - Inside a lambda, `?` needs the lambda's return type written, and leaves the lambda. Inside a
-  `with_hold`, `simulate` or `parallel` branch, it is `E0118`.
+  `with_scope`, `simulate` or `parallel` branch, it is `E0118`.
 
 ### 6.8 `parallel`
 
@@ -979,16 +982,16 @@ whenever that cannot change the result. The checker allows a block only when no 
 another reads or writes (`E0309`, §7.2), so a block is as deterministic as its branches.
 
 - If several branches fail, the leftmost failure is the block's.
-- Branches whose operations could go to a `handle` around the block, or to a `simulate` region,
+- Branches whose operations could go to a `handle` around the block, or to a `simulate` block,
   run one after another, with the same result.
-- A branch may not spawn a task or open a `simulate` region (`E0309`), and may not use `?`.
+- A branch may not spawn a task or open a `simulate` block (`E0309`), and may not use `?`.
 
 `std.parallel` splits a list across nested blocks.
 
 ### 6.9 Termination
 
 The checker proves that each function returns. A function that might not must say so with
-`diverges` in its row.
+`diverges` in its effects.
 
 ```ply
 fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }
@@ -1014,10 +1017,10 @@ as in `climb`. The checker proves that every recursive call lowers it and that i
 there, or reports `E0467`.
 
 A function whose recursion the checker cannot show to end, or that calls such a function, needs
-`diverges` in its row (`E0302`). Write `diverges` only for a loop that waits on something outside
-the program, such as a stream or a network peer; otherwise fix the recursion, use `iterate`, or add
-`decreases`. Tests, laws and handler clauses need no `diverges`, since their time limit bounds them.
-`ply check --types` explains why each function that may not return might not.
+`diverges` in its effects (`E0302`). Write `diverges` only for a loop that waits on something
+outside the program, such as a stream or a network peer; otherwise fix the recursion, use `iterate`,
+or add `decreases`. Tests, laws and handler clauses need no `diverges`, since their time limit
+bounds them. `ply check --types` explains why each function that may not return might not.
 
 ### 6.10 Updates in place
 
@@ -1059,10 +1062,10 @@ pub fn digits(n: Int) -> List<Int>
 
 ## 7. Effects
 
-An *effect* is a named set of *operations*, such as reading a database or the clock. Code
-*performs* an operation the way it calls a function, and a *handler* decides what the operation
-does. A function's *effect row* lists the operations it may perform, so its type shows everything
-it can touch.
+An *effect* is a named set of *operations*, such as reading a database or the clock. Code *performs*
+an operation the way it calls a function, and a *handler* decides what the operation does. A
+function's *effects*, listed in its signature, are the operations it may perform, so its type shows
+everything it can touch.
 
 ### 7.1 Declaring an effect
 
@@ -1088,50 +1091,52 @@ performed. A `raise` never returns, so it has no result type (§7.7).
 `nondet effect` marks an effect whose results come from outside the program, such as a clock or the
 network (§10.2). An operation may take type parameters, as in `read take[r]<a>(key: Int) -> a`; a
 handler clause for it must then work at every type. Effects are nominal, and the names `task`,
-`clock`, `random`, `sim`, `abort`, `diverges` and `hold` belong to built-in effects (`E0105`).
+`clock`, `random`, `sim`, `abort`, `diverges` and `scoped` belong to built-in effects (`E0105`).
 
 `db.get[users](3)` performs an operation, and `store::db.put[orders](id, row)` performs one of an
 effect from another module.
 
-### 7.2 Effect rows
+### 7.2 Effects in a signature
 
-A row is a set of *atoms*, optionally ending with a *row variable* that stands for "and whatever
-else": `/ {db.read[users], clock.read}`, `/ {net.write[conn] | e}`, `/ e`, `/ {}`. An atom is:
+The effects after `/` list what a function may perform: `/ {db.read[users], clock.read}`,
+`/ {net.write[conn] | e}`, `/ e`, `/ {}`. An *effect variable*, like `e`, stands for "and whatever
+else". Each entry is one of:
 
-- a *mode atom*, `net.write[conn]`, which covers every `write` operation of `net` on `conn`;
-- an *operation atom*, `net.send[conn]`, which covers one operation;
-- a raise, such as `toml.syntax`. A raise has no mode atom, so a row lists every way a call can
-  fail;
+- a mode, like `net.write[conn]`, which covers every `write` operation of `net` on `conn`;
+- one operation, like `net.send[conn]`;
+- a raise, like `toml.syntax`. Raises are always listed one by one, so a signature lists every way
+  a call can fail;
 - `diverges`, for a call that may not return (§6.9).
 
-Atoms of another module's effects are written with `::`: `/ {store::db.read[users]}`.
+An effect of another module is written with `::`: `/ {store::db.read[users]}`.
 
-**Inference.** Performing `net.send[conn](..)` adds `net.send[conn]` to the row. A call adds the
-callee's written row. The written row must cover what the body performs, atom by atom: under `/
-{net.send[conn]}`, a body may perform `net.send[conn]` but not `net.recv[conn]`, and may not call a
-function written `/ {net.write[conn]}` (`E0302`, which suggests the atom to add).
+**Inference.** Performing `net.send[conn](..)` adds `net.send[conn]` to the function's effects. A
+call adds the effects the callee's signature lists. The written effects must cover what the body
+performs, entry by entry: under `/ {net.send[conn]}`, a body may perform `net.send[conn]` but not
+`net.recv[conn]`, and may not call a function written `/ {net.write[conn]}` (`E0302`, which
+suggests the effect to add).
 
 **Function values** may perform less than their type allows, never more. Two callbacks given to
-one row variable fill it with both rows:
+one effect variable fill it with the effects of both:
 
 ```ply
 fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / e = { f(); g() }
 ```
 
 `both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`. Inside a parameter's function type, a
-`Task`, a `Chan` or a sum's arguments, rows must match exactly, because a function stored there
+`Task`, a `Chan` or a sum's arguments, effects must match exactly, because a function stored there
 could later be given something its type does not allow.
 
 **Labels.** A label parameter (§5.5) inside the body hides the global label of the same name.
-`[*]` in a handler clause or a row stands for every label (§7.4). Two atoms *conflict* when they
-name the same resource of the same effect and at least one is a `write`. A label parameter or `[*]`
-conflicts with every label of its effect. `parallel` (§6.8) and the test scheduler (§10.4) use this
-rule.
+`[*]` in a handler clause or a signature stands for every label (§7.4). Two effects *conflict* when
+they use the same resource of the same effect and at least one is a `write`. A label parameter or
+`[*]` conflicts with every label of its effect. `parallel` (§6.8) and the test scheduler (§10.4)
+use this rule.
 
-**Counts.** A row also records whether each atom is performed a `bounded` number of times or a
-`scaling` number that grows with the input. An atom scales when it is performed once per element
-of a list or map (through `List::map`, `List::fold`, `iterate` and similar), inside recursion, or by
-a callee where it scales. `ply check --types` prints the count of each atom:
+**Counts.** The checker also records whether each effect is performed a `bounded` number of times
+or a `scaling` number that grows with the input. An effect scales when it is performed once per
+element of a list or map (through `List::map`, `List::fold`, `iterate` and similar), inside
+recursion, or by a callee where it scales. `ply check --types` prints the count of each effect:
 
 ```ply
 fn lookup(id: Int) -> Row / {db.query[conn]} = db.query[conn](id)
@@ -1145,8 +1150,9 @@ fn lookup_all(ids: List<Int>) -> List<Row> / {db.query[conn]} = ids.map(lookup)
                   / {m.db.query[conn] scaling}
 ```
 
-A definition's own row may promise `bounded`: `/ {db.query[conn] bounded}` (`E0466` elsewhere). A
-body that performs that atom once per element is `E0465`, which shows the loop. The usual fix is one query for the whole input.
+A definition's own signature may promise `bounded`: `/ {db.query[conn] bounded}` (`E0466`
+elsewhere). A body that performs that effect once per element is `E0465`, which shows the loop.
+The usual fix is one query for the whole input.
 
 ### 7.3 Effect sets
 
@@ -1155,9 +1161,9 @@ pub effect set Persist = {store.read[db], store.write[db]}
 effect set Full        = {Persist, log.write[app]}
 ```
 
-An effect set is a name for a group of atoms, for use wherever a row is written. Another module imports it
-by name (`import storage (Persist)`) or writes `storage::Persist`. Sets may include other sets but
-not a row variable.
+An effect set is a name for a group of effects, for use in any signature. Another module imports
+it by name (`import storage (Persist)`) or writes `storage::Persist`. Sets may include other sets,
+but not an effect variable.
 
 ### 7.4 Handlers
 
@@ -1189,19 +1195,19 @@ handle { load() } with {
 }
 ```
 
-Clauses are tried in order, so put a clause for one label before a `[*]` clause. A row may also
-use `[*]`, to let a library handle an effect for code it is given: `fn sink<a | e>(body: () -> a /
-{log.note[*] | e}) -> a / {wire.put[c] | e}` lets the body perform `log.note` on any label.
+Clauses are tried in order, so put a clause for one label before a `[*]` clause. A signature may
+also use `[*]`, to let a library handle an effect for code it is given: `fn sink<a | e>(body: () ->
+a / {log.note[*] | e}) -> a / {wire.put[c] | e}` lets the body perform `log.note` on any label.
 
-**What a handler removes.** A clause for `net.send[conn]` removes that atom from the body's row.
-Clauses for every operation of a mode remove the mode atom. The `handle`'s row is the body's row,
-minus what the clauses remove, plus the clauses' own rows. When a body may perform operations of a
-mode atom that the clauses handle only partly, and the enclosing function's row does not cover the
-rest, the `handle` is `E0305`, which offers the missing clauses.
+**What a handler removes.** A clause for `net.send[conn]` removes that effect from the body's
+effects. Clauses for every operation of a mode remove the mode. The `handle`'s effects are the
+body's effects, minus what the clauses remove, plus the clauses' own effects. When a body may
+perform operations of a mode that the clauses handle only partly, and the enclosing function's
+effects do not cover the rest, the `handle` is `E0305`, which offers the missing clauses.
 
-**What a handler sees.** A `handle` handles only the operations its body's row lists. An operation
-that comes into the body through a row variable or a label parameter of the enclosing function belongs
-to the caller, and goes to the handlers around the call:
+**What a handler sees.** A `handle` handles only the operations its body's effects list. An
+operation that comes into the body through an effect variable or a label parameter of the enclosing
+function belongs to the caller, and goes to the handlers around the call:
 
 ```ply
 fn quiet<| e>(f: () -> Int / e) -> Int / e =
@@ -1227,7 +1233,7 @@ result, and the clause's value becomes the `handle`'s value.
 what `acquire` returned when `body` returns, when a raise or an abandoning clause unwinds it, and
 when its task is cancelled (§9.3). A cancel never interrupts an `acquire` or `release`. Nested
 brackets release innermost first, and a `release` that fails replaces whatever was unwinding.
-`with_hold` (§8.2) is a bracket whose body cannot keep the acquired value.
+`with_scope` (§8.2) is a bracket whose body cannot keep the acquired value.
 
 ### 7.6 Handler variables
 
@@ -1252,7 +1258,7 @@ A handler can keep state in variables, declared with `var name = init` at the st
 block. The initializers run in order when the `handle` starts, outside the handler. The variables
 are visible to the clauses and to `return`, never to the body. A clause assigns one with
 `name = value;`. An assignment inside a lambda or a nested `handle`, `try`, `simulate`, `parallel`
-or `with_hold` is `E0315`, since that code may run after the clause returns.
+or `with_scope` is `E0315`, since that code may run after the clause returns.
 
 A clause with `resume k` continues the body with the variables' values at the time it calls `k`.
 
@@ -1263,8 +1269,8 @@ handler's variables, so a test finds a lost update.
 
 ### 7.7 Failures
 
-Ply has no exceptions. A failure is a `raise` operation, so a function's row lists every way it can
-fail:
+Ply has no exceptions. A failure is a `raise` operation, so a function's signature lists every way
+it can fail:
 
 ```ply
 type SyntaxError = { line: Int, message: String }
@@ -1283,16 +1289,16 @@ fn checked(b: Int) -> Result<Int, SyntaxError> = try { digit(b, 1) }
 ```
 
 A raise never returns to where it was performed, so it has whatever type is needed there. Raises
-pass through row variables like any operation, so `lines.map(parse_line)` raises what `parse_line`
-raises.
+pass through effect variables like any operation, so `lines.map(parse_line)` raises what
+`parse_line` raises.
 
-A clause for a raise runs after the body is abandoned and its regions are closed. Its value becomes
+A clause for a raise runs after the body is abandoned and its scopes are closed. Its value becomes
 the `handle`'s value, and it cannot `resume`. A raise nothing handles ends the program with
 `E0502`; in a test, it fails the test.
 
 **`try`.** `try { body }` returns `Ok` of the body's value, or `Err` of what a raise carried: the
 value of a raise's single parameter, `()` for none, or a tuple for several. It handles the one raise
-the body's row lists, other than `abort.raise`. A body with no raise is `E0311`, and one with
+the body's effects list, other than `abort.raise`. A body with no raise is `E0311`, and one with
 several is `E0312`; write `try[toml.syntax] { body }` to choose one. To turn an `Err` back into a
 raise, write `r.unwrap_or_else(|e: SyntaxError| toml.syntax(e))`.
 
@@ -1310,19 +1316,20 @@ fail where it is written:
 fn peek(b: Bytes, i: Int) -> Int = if i < 0 || i >= b.len() { -1 } else { b.at(i) }
 ```
 
-A builtin that can raise states, as a `requires`, when it cannot: `Bytes::at` requires
-`0 <= i && i < Bytes::len(b)`. The checker proves such clauses from the conditions on the way to
-the call (`if` conditions, guards, matched patterns, and `List::at` returning `Some`), using linear
-integer arithmetic and what builtins guarantee about their results. It looks only at the function
-being checked, so a row never depends on another function's body. When it cannot prove a clause, the
-call raises, which is not an error.
+A builtin that can raise states, as a `requires`, when it cannot: `Bytes::at` requires `0 <= i && i
+< Bytes::len(b)`. The checker proves such clauses from the conditions on the way to the call (`if`
+conditions, guards, matched patterns, and `List::at` returning `Some`), using linear integer
+arithmetic and what builtins guarantee about their results. It looks only at the function being
+checked, so a function's effects never depend on another function's body. When it cannot prove a
+clause, the call raises, which is not an error.
 
 `ply check --types --explain` lists every place a function can raise `abort.raise`, and why.
 
-### 7.8 Real handlers
+### 7.8 Host handlers
 
-A standard library module can give an effect a *real handler*: the handler used when the program
-does not handle the effect itself.
+A standard library module can give an effect a *host handler*: the handler used when the program
+does not handle the effect itself. A host handler is where the program reaches the machine it runs
+on.
 
 ```ply
 pub nondet effect os {
@@ -1335,12 +1342,12 @@ fn served<a | e>(go: () -> a / {os.read | e}) -> a / e =
   handle { go() } with { os.pid() -> machine_pid() }
 ```
 
-Every entry point the runtime starts (`main`, a test, or an entry given to `ply run`) runs under the real
-handler of each effect its row lists, outside the program's own handlers. So an `os.pid()` that the
-program does not handle goes to `served`. Only standard library modules declare real handlers
-(`E0161`), and §14 lists the effects that have one.
+Every entry point the runtime starts (`main`, a test, or an entry given to `ply run`) runs under the
+host handler of each effect its signature lists, outside the program's own handlers. So an
+`os.pid()` that the program does not handle goes to `served`. Only standard library modules declare
+host handlers (`E0161`), and §14 lists the effects that have one.
 
-## 8. Resources and regions
+## 8. Resources and scopes
 
 ### 8.1 Resources
 
@@ -1383,37 +1390,37 @@ constructors, so only it can do this; that is how `close` ends a `Conn`. A lambd
 resource it captures can be called at most once, and a handler clause, `simulate` body or `parallel`
 branch may borrow resources from outside but not move them, since it may run several times.
 
-### 8.2 Regions and holds
+### 8.2 Scopes
 
-`with_hold` acquires something, lets a body use it, and releases it when the body ends. The body is
-a *region*, and it uses the value through a *hold*:
+`with_scope` acquires something, lets a body use it, and releases it when the body ends. The body
+is a *scope*, and it reads the acquired value through a *scoped value*:
 
 ```ply
 fn first_byte(path: String)
   -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.close[repo], io.fail, io.closed} =
-  with_hold[file](io::reading[repo](path), io::close_source) { source -> io::read(source, 1) }
+  with_scope[file](io::reading[repo](path), io::close_source) { source -> io::read(source, 1) }
 ```
 
-`with_hold[r](acquire, release) { h -> body }` runs `body` with `h`, a `Hold<a, [r]>` on what
+`with_scope[r](acquire, release) { s -> body }` runs `body` with `s`, a `Scoped<a, [r]>` for what
 `acquire` returned, and calls `release` on that value at the closing `}`. A library exports the two
 functions as a pair, like `std.io`'s `reading` and `close_source`. `release` runs exactly once,
 however the body ends: by returning, by a raise, or by a cancel (§9.3).
 
-`h.get()` reads the value and adds `hold.read[r]` to the row. A function that takes a hold has the
-region as a label parameter, filled from the hold: `fn first<[r]>(h: Hold<Bytes, [r]>) -> Int /
-{hold.read[r]}`.
+`s.get()` reads the value and adds `scoped.read[r]` to the effects. A function that takes a scoped
+value has the scope as a label parameter, filled from the argument: `fn first<[r]>(s: Scoped<Bytes,
+[r]>) -> Int / {scoped.read[r]}`.
 
-**A hold cannot leave its region.** `Hold` may be written only as a parameter type (`E0446`), so a
-hold can be passed into functions and lambdas, and the checker sees every way it could leave: the
-hold through its type, and a closure that reads it through its row. Each region needs its own name
-(`E0330`). A declared type or effect cannot mention `Hold`, `Task` or `Chan`; use a type parameter
-so the region travels with the type argument.
+**A scoped value cannot leave its scope.** `Scoped` may be written only as a parameter type
+(`E0446`), so a scoped value can be passed into functions and lambdas, and the checker sees every
+way it could leave: the value through its type, and a closure that reads it through its effects.
+Each scope needs its own name (`E0330`). A declared type or effect cannot mention `Scoped`, `Task`
+or `Chan`; use a type parameter, so the scope travels with the type argument.
 
-The value `Hold::get` returns is an ordinary value, and a copy may leave the region. So a library
-makes the value useless without its hold, for example by failing with `io.closed` on a closed
-source. A continuation resumed after its region ended finds the hold gone (`E0331`). A task that can
-read a region's hold must run under a scheduler opened inside that region: write
-`with_hold[r](..) { h -> simulate { .. } }`, not the reverse.
+The value `Scoped::get` returns is an ordinary value, and a copy may leave the scope. So a
+library's functions take the `Scoped` value itself and fail once the scope has released it, as
+`std.io` does with `io.closed`. A continuation resumed after its scope ended finds the value
+released (`E0331`). A task that can read a scoped value must run under a scheduler opened inside
+that scope: write `with_scope[r](..) { s -> simulate { .. } }`, not the reverse.
 
 ## 9. Concurrency and simulation
 
@@ -1440,7 +1447,7 @@ nondet effect random { write next() -> Int
 effect sim           { read  seed() -> Int }
 ```
 
-Outside a `simulate` region, the program's own scheduler runs tasks (§14.2), and `clock` is the
+Outside a `simulate` block, the program's own scheduler runs tasks (§14.2), and `clock` is the
 real clock. A task's operations go to the handlers around its `task.spawn`. A task's raise that
 nothing in the task handles fails the run.
 
@@ -1457,8 +1464,8 @@ simulate {
 ```
 
 `simulate { .. }` runs its body under a scheduler that controls the order tasks run in, and handles
-`task`, `clock`, `random` and `sim` itself. Its row has `sim.read`, which a deterministic test may
-have.
+`task`, `clock`, `random` and `sim` itself. Its effects include `sim.read`, which a deterministic
+test may have.
 
 - Time is virtual: it moves forward only when no task can run, so `clock.sleep` takes no real time.
 - Tasks switch only at `task`, `clock` and `random` operations. The search tries the orders of these
@@ -1467,17 +1474,18 @@ have.
 - Two accesses to one handler variable, where one writes, are ordered against each other, as are
   any two allocations. A read and a later write with no scheduler operation between them run as
   one step; put a `task.yield()` between them to let the search interleave there.
-- When a task raises and nothing in the task handles it, the region cancels every other task, waits
-  for them to finish releasing their resources, and then raises at the `simulate`, as if its body had raised.
-- A `parallel` block inside a region runs its branches one after another.
+- When a task raises and nothing in the task handles it, the simulation cancels every other task,
+  waits for them to finish releasing their resources, and then raises at the `simulate`, as if its
+  body had raised.
+- A `parallel` block inside a simulation runs its branches one after another.
 
 Errors:
 
-- `E0413`: a `Task` or `Chan` leaves the region, directly or inside a value or closure, or comes in
-  from outside.
+- `E0413`: a `Task` or `Chan` leaves the simulation, directly or inside a value or closure, or comes
+  in from outside.
 - `E0414`: no task can make progress (deadlock), or an interleaving ran past `--sim-steps`.
 - `E0416`: a `simulate` inside another.
-- `E0425`: an operation that reaches the host, such as a file read, inside the region.
+- `E0425`: an operation that reaches the host, such as a file read, inside the simulation.
 
 ### 9.3 Cancellation
 
@@ -1519,7 +1527,7 @@ the first arm that can. Arm order is the only priority, so rotate the arms for f
 | `--sim random` | one random interleaving per seed |
 | `--sim once` | exactly one interleaving |
 | `--seeds N` | seeds per test (default 1 under `dpor`, 64 under `random`) |
-| `--sim-roots FROM..TO` | the seeds from `FROM` up to, but not including, `TO` |
+| `--seed-range FROM..TO` | the seeds from `FROM` up to, but not including, `TO` |
 | `--sim-budget N` | interleavings per seed, under `dpor` |
 | `--sim-steps N` | steps per interleaving before `E0414` |
 | `--seed 7`, `--seed 7:3.0.2` | replay one interleaving |
@@ -1546,7 +1554,7 @@ their first difference. Any other failure is `E0502`. A test is named `<module>.
 tests in one module need different labels (`E0105`).
 
 A test that passes but leaves one of its own objects alive when it ends fails with `E0505`. That is
-a memory leak, and a defect in Ply rather than in the program.
+a memory leak, and a bug in Ply rather than in the program.
 
 **Tests over cases.** A test can run once for each element of a table. Each run is a *case*:
 
@@ -1586,7 +1594,7 @@ snapshots=snapshots` (§14.1).
 
 ### 10.2 Deterministic and nondeterministic tests
 
-A test must be deterministic. A test whose row, after its own handlers, still has an atom of a
+A test must be deterministic. A test whose effects, after its own handlers, still include a
 `nondet` effect is `E0412`: handle the effect, or write `test/nondet "label" { .. }`. A
 `test/nondet` is cached like any test, but what it reads from the clock or the network does not
 count as an input (§10.3).
@@ -1624,28 +1632,28 @@ count as inputs.
 
 ### 10.4 How tests run
 
-A test's *footprint* is the set of `nondet` effects it performs on the outside world. Tests whose
-footprints do not conflict (§7.2) run at the same time, one per core. `--jobs N` (`-j N`) splits
-the tests into `N` lanes that each run their tests in turn.
+A test's *outside effects* are the `nondet` effects it performs on the world outside the program.
+Tests whose outside effects do not conflict (§7.2) run at the same time, one per core. `--jobs N`
+(`-j N`) splits the tests into `N` lanes that each run their tests in turn.
 
 The report comes in three parts: what was selected and how it will run, then each group's results
 as the group finishes, then a summary with each failure's diagnosis. Under `--json`, the first two
 parts go to standard error as the run goes, and one JSON object goes to standard output at the end.
 
 `--timeout MS` limits each test's wall-clock time (default 60000; `0` for none). A test over the
-limit does not fail: it is *abandoned* (`W0612`), reported apart from failures, and run again next
-time. A run with an abandoned test is not a success.
+limit does not fail: it *timed out* (`W0612`), is reported apart from failures, and runs again next
+time. A run with a test that timed out is not a success.
 
 ### 10.5 When a test fails
 
-A failure lists its *suspects*: the definitions the test uses that changed since it last passed,
+A failure lists its *changes*: the definitions the test uses that changed since it last passed,
 and the test itself if its text changed. Edited definitions come first, then added or removed
 ones, then those that changed only because something they use changed. After the failures, `ply
 test` prints each change once, as a diff of the old and new text. A test that never passed has no
-earlier version, so its suspects are the definitions no passing run has seen.
+earlier version, so its changes are the definitions no passing run has seen.
 
-`--json` gives each failure's diagnostic, footprint, suspects and the command that runs it again,
-plus the diffs.
+`--json` gives each failure's diagnostic, outside effects, changes and the command that runs it
+again, plus the diffs.
 
 ### 10.6 Coverage and mutation testing
 
@@ -1680,7 +1688,7 @@ law "a credit and a matching debit leave an account as it was"
   value. A function's `ensures` must hold for every input its `requires` allow. `requires` is not
   checked at call sites.
 - A law has a label, `forall` binders with types, an optional `where` guard, and a body. Its body
-  may be a `simulate` region.
+  may be a `simulate` block.
 - Clauses, guards and law bodies must be pure (`E0417`), but may raise or not return.
 - `Int` arithmetic is checked, so bound the inputs with guards, as above.
 - Clauses do not change a definition's hash.
@@ -1699,7 +1707,7 @@ law "a credit and a matching debit leave an account as it was"
 | `refuted` (`E0419`) | false at the input shown |
 | `vacuous` (`E0420`) | the guard allows no input |
 | `unproved` (`E0474`) | neither proved nor refuted; the report says where the prover stopped |
-| `defect` | Ply failed, not the program |
+| `internal error` | Ply failed, not the program |
 
 A property that cannot be proved is not one a program may rely on. Check it in a test instead, over
 values `std.gen` generates.
@@ -1709,7 +1717,7 @@ values `std.gen` generates.
 | `--filter TEXT` | prove claims whose owner's name contains `TEXT`; repeatable |
 | `--prove-budget N` | reasoning steps per claim |
 | `--timeout MS` | wall-clock time for each run a claim's evaluation makes (default 60000) |
-| `--reach` | run only the static prover, on every claim |
+| `--static-only` | run only the static prover, on every claim |
 | `--jobs N` | split the work into `N` lanes |
 
 `ply prove` prints each claim's outcome as it is decided, then the definitions no proved claim
@@ -1727,7 +1735,7 @@ The prover combines:
   a terminating recursive definition on known arguments;
 - induction on an `Int` binder (`n <= 0`, then `n` from `n - 1`) or a `List` binder (`[]`, then
   `[h, ..t]` from `t`), checked by a small trusted kernel;
-- searching every interleaving of a `simulate` region;
+- searching every interleaving of a `simulate` block;
 - the contracts of the definitions a claim calls.
 
 **Contracts.** The prover uses a callee's `ensures` instead of its body for a recursive definition
@@ -1772,10 +1780,10 @@ pub law schema round_trip<a, b | e>(encode: (a) -> b / e, decode: (b) -> Option<
 law "a URL round-trips" = round_trip(url_encode, url_decode)
 ```
 
-A schema has parameters with types and at most one row parameter, which may hold only raises.
+A schema has parameters with types and at most one effect variable, which may stand only for raises.
 Each use is its own claim, proved and cached on its own. A schema also defines a function of its
 parameters and binders, so `round_trip(url_encode, url_decode, "a b")` checks the law at one point.
-`std.laws` holds the standard library's schemas.
+`std.laws` contains the standard library's schemas.
 
 ### 11.5 Invariant claims
 
@@ -1865,8 +1873,8 @@ takes a nesting limit. Functions, `Task`, `Chan`, `Secret`, types that take a la
 them.
 
 **SQL rows.** `derive sql` maps a record to a table row, one column per field, in field order. A
-`String`, `Int`, `Bool`, `Float`, `Decimal` or `Bytes` field is a column of that type, an `Option` is
-a nullable column, and a `List` of those is an array. Any other field is stored as JSON with its
+`String`, `Int`, `Bool`, `Float`, `Decimal` or `Bytes` field is a column of that type, an `Option`
+is a nullable column, and a `List` of those is an array. Any other field is stored as JSON with its
 type's own `json` codec.
 
 **Writing a deriver.** A deriver is a module's `pub fn derive(declaration: derive::Declaration) ->
@@ -1884,8 +1892,8 @@ and every module imports it automatically. `ply doc std.prelude` lists them all.
 - Most are functions of a built-in type: `xs.len()`, `Map::new()`, `Bytes::at(b, i)`. `ply doc List`
   lists a type's functions.
 - The rest have plain names, such as `range`, `min`, `panic`, `iterate`, `bracket` and `to_int`.
-- An `extern fn` is implemented by the runtime. Some, like `List::map` and most of `Map`, are written
-  in Ply in the prelude.
+- An `extern fn` is implemented by the runtime. Some, like `List::map` and most of `Map`, are
+  written in Ply in the prelude.
 
 A builtin that can raise states, as a `requires`, when it cannot, and states what is true of its
 result as an `ensures`:
@@ -1925,8 +1933,9 @@ uses, so a change to anything else in the library does not affect it.
 ## 14. Running programs
 
 The *host* is the machine a program runs on. Effects that reach outside the program, such as files,
-the network, processes and the console, are handled by *host handlers*. `ply run`, `ply test` and
-`ply hosts` set up the same host handlers.
+the network, processes and the console, are handled by *host handlers* (§7.8), standard library
+functions that call into the runtime. `ply run`, `ply test` and `ply hosts` set up the same host
+handlers.
 
 ### 14.1 Permissions
 
@@ -1958,17 +1967,17 @@ ready. A task that sleeps or waits on the host waits while the others run.
 it. A cancel stops a sleep, so a deadline one task sets for another fires while the rest of the
 program works. `std.time`'s `time.sleep_ms` blocks the whole thread instead.
 
-### 14.3 Real handlers and tests
+### 14.3 Host handlers and tests
 
-These effects have real handlers (§7.8), which run whatever the flags: `std.os`, `std.env`,
+These effects have host handlers (§7.8), which run whatever the flags: `std.os`, `std.env`,
 `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`, `std.net`, `std.udp`,
 `std.sqlite`, `std.term`, `std.signal`, `std.trace`, `std.time`, `std.random`'s `entropy`,
-`std.process` and `std.fs`. A real handler that would block the program's thread, as hashing does,
+`std.process` and `std.fs`. A host handler that would block the program's thread, as hashing does,
 passes the work to the runtime's own threads, and the task that called it waits while other tasks
 run.
 
 A test that uses the host is cached with what it read and the permissions it ran with, so its pass
-is never reused under other permissions. An operation inside a `simulate` region never reaches the
+is never reused under other permissions. An operation inside a `simulate` block never reaches the
 host (`E0425`). `std.process` (and `std.console`, built on it) is the run's own process under `ply
 run`, but a test is not a process (`E0424`), except that it may start the programs `--exec` grants.
 
@@ -2003,8 +2012,8 @@ connections. On a stop signal, listeners close, so a waiting `net.accept` return
 
 `std.http`'s `serve_pooled` drains this way: it accepts nothing more, finishes the connections it
 had accepted with `Connection: close` on the last response, and closes idle ones. An HTTP/2
-connection gets `GOAWAY`. Under load, it responds with `503` and `Retry-After` to a connection that finds
-its queue full.
+connection gets `GOAWAY`. Under load, it responds with `503` and `Retry-After` to a connection that
+finds its queue full.
 
 A program that starts child processes and drains nothing ends its children and exits at once on a
 stop signal, with status 130 or 143. Ctrl-C ends any other program at once.
@@ -2043,16 +2052,16 @@ whose statements use two schemas is `E0471`.
 ### 14.9 `ply hosts`
 
 `ply hosts` lists every operation the program can perform on the host, as `effect.op[label]`. For
-each it shows the handler, whether the operation is deterministic, whether it may run more than once,
-whether it blocks, and whether it may receive a `Secret`. It also shows the run's file system, TLS,
-database, configuration, tracing and shutdown settings. `--digest` prints one `b3:` line for the
-whole list.
+each it shows the handler, whether the operation is deterministic, whether it may run more than
+once, whether it blocks, and whether it may receive a `Secret`. It also shows the run's file system,
+TLS, database, configuration, tracing and shutdown settings. `--digest` prints one `b3:` line for
+the whole list.
 
 ## 15. Packages
 
 ### 15.1 The manifest
 
-A package's root holds `ply.pkg`, its manifest. It contains one function whose body is a value of
+A package's root contains `ply.pkg`, its manifest. It contains one function whose body is a value of
 `std.pkg`'s `Manifest` (`ply doc std.pkg.Manifest`):
 
 ```ply
@@ -2200,17 +2209,17 @@ changed between two published versions.
 
 **Interfaces.** After the archive, `ply publish` sends the package's *interface*: each module's
 public names with their signatures and hashes, under the *semantics version* of the `ply` that
-produced it. The semantics version changes only when the meaning of hashes, rows or claim outcomes
-changes. `--verify-deps` (on `check`, `test` and `prove`) rejects a dependency whose interface does
-not match its source (`E0149`).
+produced it. The semantics version changes only when the meaning of hashes, effects or claim
+outcomes changes. `--verify-dependencies` (on `check`, `test` and `prove`) rejects a dependency
+whose interface does not match its source (`E0149`).
 
 **Attestations.** `ply attest NAME VERSION` downloads a published version, then checks, tests and
 proves it, and reports the result. With `--sign KEY`, it signs the result and sends it to the
 registry, which keeps it only if its configured attester signed it. `ply resolve` trusts an
 attestation only when a key in `PLY_ATTESTERS` signed it.
 
-**Yanking.** `ply yank NAME VERSION` marks a version yanked. New resolutions skip it, but a lock that
-pins it keeps it. Nothing is ever deleted.
+**Yanking.** `ply yank NAME VERSION` marks a version yanked. New resolutions skip it, but a lock
+that pins it keeps it. Nothing is ever deleted.
 
 **Running a registry.** The registry is a Ply program, `packages/registry`:
 
@@ -2291,10 +2300,10 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | command | options |
 | --- | --- |
 | `ply new PATH` | `--name NAME`, `--lib` |
-| `ply check [path]` | `--types` (each definition's type and row), `--costs` (copying updates, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host and simulation flags |
+| `ply check [path]` | `--types` (each definition's type and effects), `--costs` (copying updates, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-dependencies`, host and simulation flags |
 | `ply run [path] [-- ARGS]` | `--seed`, `--timeout`, `--profile`, `--explain`, `--require-signer KEY`, host, trace and drain flags. `ARGS` is what `process.args` returns. A `.plyx` path runs a built program. |
-| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--workspace`, `--verify-deps`, simulation flags |
+| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--static-only`, `--workspace`, `--verify-dependencies`, simulation flags |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--prove-budget`, `--timeout`, simulation flags |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | host, trace and drain flags, `--digest` |
@@ -2305,8 +2314,8 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply rename --map FILE [paths]` | renames definitions, variables, fields, operations and modules (§17.6) |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it |
 | `ply replace NAME [path]` | replaces one `fn` or `type` with `--with FILE` or standard input (§17.7) |
-| `ply hash [path]` | each definition's hash; `--deps` adds what each refers to |
-| `ply defs [path]` | every definition: location, hash, signature, footprint and references; `--filter` |
+| `ply hash [path]` | each definition's hash; `--dependencies` adds what each refers to |
+| `ply definitions [path]` | every definition: location, hash, signature, effects and references; `--filter` |
 | `ply callers DEF [path]` | what refers to a definition, and every definition, test and law that depends on it |
 | `ply resolve [path]` | writes `ply.lock`, downloading registry dependencies |
 | `ply vendor [path]` | copies dependencies into `vendor/` |
@@ -2323,8 +2332,8 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 
 ### 17.4 Reusing results
 
-`ply check`, `ply test`, `ply run` and `ply defs` remember their last result for the same command
-line. While nothing that result depended on has changed, they return it without loading the
+`ply check`, `ply test`, `ply run` and `ply definitions` remember their last result for the same
+command line. While nothing that result depended on has changed, they return it without loading the
 program. Otherwise they check again only what depends on a change. `--explain` reports whether a
 result was reused. `ply build`, `ply hosts` and `--no-cache` always check from scratch.
 
@@ -2335,7 +2344,7 @@ the program changes compiles, which takes a few seconds; later runs reuse the co
 `--profile development` (the default for `ply test` and `ply run`) compiles quickly, with `tcc` on
 x86-64 Linux and `cc -O0` elsewhere. `--profile release` uses `cc -O2`.
 
-Every program that passes the checker compiles. A definition Ply fails to compile is a defect in
+Every program that passes the checker compiles. A definition Ply fails to compile is a bug in
 Ply, reported as `E0505`.
 
 ### 17.6 Formatting and renaming
@@ -2391,9 +2400,9 @@ the program still checks and no other definition's name or hash changes (`E0128`
 The runtime of every Ply program, `ply` included, reads these flags and removes them before the
 program sees its arguments:
 
-- `--count-allocs=PATH` writes how many objects and bytes the program allocated.
-- `--count-alloc-sites=PATH` also writes where allocations came from, sampled.
-- `--count-alloc-sites-exact=PATH` records every allocation's site: exact, and slower.
+- `--count-allocations=PATH` writes how many objects and bytes the program allocated.
+- `--count-allocation-sites=PATH` also writes where allocations came from, sampled.
+- `--count-allocation-sites-exact=PATH` records every allocation's site: exact, and slower.
 
 ## 18. Diagnostics
 
@@ -2425,7 +2434,7 @@ What Ply does not have:
 
 - No loops, `break` or `return`: use recursion or `iterate` (§6.6).
 - No mutable variables, except handler variables (§7.6).
-- No exceptions: every failure is a raise in a row (§7.7).
+- No exceptions: every failure is a raise, listed in the function's effects (§7.7).
 - No type classes, no implicit arguments, and no dispatch at run time: a call on a value is chosen
   by its type where it is written (§6.4).
 - No modules as values, and no first-class effects.
