@@ -2850,29 +2850,20 @@ pub fn emitted<| e>(
     );
     {
       let c = compiled(all.answers, all.keys);
-      let settled = generics_settled(
-        c.answers,
-        c.keys,
-        c.compiled_as,
-        all.needs,
-        all.called,
-        program,
-      );
+      let settled = generics_settled(c.answers, c.keys, all.needs, all.called, program);
       let unemitted = settled.unemitted;
       let held = settled_bodies(settled.answers, c.keys, unemitted);
       let roots = every.concat(all.added).filter(|k: RootKey|
         !unemitted.contains(root_name(k))).concat(
         entries,
       );
-      // Each specialisation is offered as the code it compiles as, once however many share it, and
-      // sits among the parts of the first one's home: a code keeps no lender to place it by.
-      let compiled_roots = roots.fold(
-        Map::new(),
-        |m: Map<RootName, { key: RootKey, home: Bytes }>, k: RootKey| {
-          let code = match c.compiled_as.get(root_name(k)) { Some(x) -> x, None -> k };
-          if m.contains(root_name(code)) { m }
-          else { m.insert(root_name(code), { key: code, home: home_of(k) }) }
-        },
+      // Each root once, at its home; each code its specialisations share at the least of theirs.
+      let compiled_roots = c.coded.fold(
+        roots.fold(Map::new(), |m: Map<RootName, { key: RootKey, home: Bytes }>, k: RootKey|
+          if m.contains(root_name(k)) { m }
+          else { m.insert(root_name(k), { key: k, home: home_of(k) }) }),
+        |m: Map<RootName, { key: RootKey, home: Bytes }>, x: { key: RootKey, home: Bytes }|
+          m.insert(root_name(x.key), x),
       );
       let natives = read_natives(
         p,
@@ -3136,14 +3127,13 @@ fn settled_root(
 /// `answers` with every generic call settled over the program's constructors `ctors`, by the needs
 /// and the parameters called as functions the walk closed (`settling`), so each call settles on the
 /// root the walk answered for it: each placeholder of a body's C, and of the entries its closures
-/// name, written as the root its call settles on, a specialisation as the code `compiled_as` says it
-/// compiles as, and that root among the body's calls. Answers those answers, and `unemitted`: the
+/// name, written as the root its call settles on, a specialisation by its own name, and that root
+/// among the body's calls. Answers those answers, and `unemitted`: the
 /// generic bodies the unit never emits, whose calls are settled on their specialisations instead
 /// (`settled_only`).
 fn generics_settled(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
-  compiled_as: Map<RootName, RootKey>,
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
   ctors: Ctors,
@@ -3156,10 +3146,8 @@ fn generics_settled(
     Map::new(),
     |acc: Map<RootName, Answer>, n: RootName, a: Answer|
       acc.insert(n, if a.tables.generics.calls.len() == 0 { a } else {
-        let settled = a.tables.generics.calls.map(|g: GenericCall| {
-          let own = asked(settled_root(g, needs, called, ctors));
-          match compiled_as.get(root_name(own)) { Some(k) -> k, None -> own }
-        });
+        let settled = a.tables.generics.calls.map(|g: GenericCall|
+          asked(settled_root(g, needs, called, ctors)));
         let roots = settled.map(root_name);
         let calls = settled.fold(a.tables.calls, |cs: List<RootKey>, r: RootKey|
           if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) });
@@ -3197,42 +3185,104 @@ fn generics_settled(
   { answers: settled_answers, unemitted: unemitted }
 }
 
-/// The answers as a unit compiles them: `answers` with each specialisation's body under the name of
-/// the code it compiles as (`Coded`), which every specialisation of that code shares; `keys` with
-/// each code's key; and `compiled_as`, each specialisation's name to its code's key.
+/// The answers as a unit compiles them, `keys` with each code's key, and `coded` each code's key with
+/// its home. A code two or more specialisations share is one body under the code's name (`Coded`),
+/// and each of them a stub that calls it.
 type Compiled = {
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
-  compiled_as: Map<RootName, RootKey>,
+  coded: List<{ key: RootKey, home: Bytes }>,
 }
 
-/// `answers`, each a root's by its key in `keys`, as the unit compiles them (`Compiled`). A code's
-/// name is a function of its body alone, so a caller's C does not depend on which other
-/// specialisations the program holds. A tail group's members keep their own names, as one body
-/// answers for them all.
+/// `answers`, each a root's by its key in `keys`, as the unit compiles them (`Compiled`). A
+/// specialisation keeps its own name, which its callers call, so their C depends neither on its code
+/// nor on which other specialisations share it; an edit to a generic body moves only the parts of its
+/// bodies and stubs. A code sits among the parts of the least home of those sharing it. A tail
+/// group's members and a root an entry enters keep their own bodies.
 fn compiled(
   answers: Map<RootName, Answer>,
   keys: Map<RootName, RootKey>,
-) -> Compiled / {abort.raise} =
-  answers.fold(
-    { answers: Map::new(), keys: keys, compiled_as: Map::new() },
-    |acc: Compiled, n: RootName, a: Answer|
+) -> Compiled / {abort.raise} = {
+  let sharing = answers.fold(
+    Map::new(),
+    |acc: Map<RootName, { key: RootKey, shared: List<RootName> }>, n: RootName, a: Answer|
       match keys.get(n) {
-        Some(At(spec, _)) -> if a.tables.members.len() > 0 {
-          { ..acc, answers: acc.answers.insert(n, a) }
-        } else {
+        Some(At(spec, _)) -> if a.tables.members.len() > 0
+            || a.tables.defined.any(|d: Defined| d.entered) { acc } else {
           let k = code_of(spec.def, n, a);
           let c = root_name(k);
-          {
-            answers: if acc.answers.contains(c) { acc.answers }
-            else { acc.answers.insert(c, renamed(a, n, k)) },
-            keys: acc.keys.insert(c, k),
-            compiled_as: acc.compiled_as.insert(n, k),
-          }
+          acc.insert(c, {
+            key: k,
+            shared: List::push(match acc.get(c) { Some(x) -> x.shared, None -> [] }, n),
+          })
         },
-        _ -> { ..acc, answers: acc.answers.insert(n, a) },
+        _ -> acc,
+      },
+  );
+  sharing.fold(
+    { answers: answers, keys: keys, coded: [] },
+    |acc: Compiled, c: RootName, s: { key: RootKey, shared: List<RootName> }|
+      match if s.shared.len() < 2 { None } else { answers.get(s.shared.get(0)) } {
+        None -> acc,
+        // Their bodies are alike but for their names, so the first stands for them all.
+        Some(a) ->
+          {
+            answers: s.shared.fold(
+              acc.answers.insert(c, renamed(a, s.shared.get(0), s.key)),
+              |m: Map<RootName, Answer>, n: RootName|
+                match answers.get(n) { Some(b) -> m.insert(n, stub(b, s.key)), None -> m },
+            ),
+            keys: acc.keys.insert(c, s.key),
+            coded: acc.coded.push({
+              key: s.key,
+              home: ordered(
+                s.shared.map(|n: RootName|
+                  match keys.get(n) { Some(k) -> home_of(k), None -> b"" }),
+              ).get(
+                0,
+              ),
+            }),
+          },
       },
   )
+}
+
+/// Specialisation `a` as a stub that calls `code`, the body it shares: its C passes its parameters
+/// through and answers what that answers.
+fn stub(a: Answer, code: RootKey) -> Answer / {abort.raise} =
+  match a.tables.defined.at(0) {
+    None -> panic("a specialisation defines its root"),
+    Some(d) -> {
+      let params = range(0, d.head.params.len());
+      let call = Bytes::concat_all([
+        symbol_of(root_text(root_name(code))),
+        b"(ctx",
+        Bytes::concat_all(params.map(|i: Int| b", p".concat(ascii_of_int(i)))),
+        b");",
+      ]);
+      {
+        text: Bytes::concat_all([
+          d.head.answer,
+          b" ",
+          own_symbol(None),
+          b"(PlyCtx *ctx",
+          Bytes::concat_all(
+            params.map(|i: Int|
+              Bytes::concat_all([b", ", d.head.params.get(i), b" p", ascii_of_int(i)])),
+          ),
+          b") { ",
+          if d.head.answer == b"void" { call } else { b"return ".concat(call) },
+          b" }",
+        ]),
+        tables: {
+          ..no_tables(),
+          calls: [code],
+          defined: a.tables.defined,
+          handings: a.tables.handings,
+        },
+      }
+    },
+  }
 
 /// The code body `a` of specialisation `n` of `def` compiles as: the digest of the body with its
 /// calls of itself made calls of no name, which a specialisation whose body is alike but for its name
@@ -3608,11 +3658,11 @@ fn specialisation_tables(k: RootKey) -> Tables =
 
 /// A program whose root `m.calls_Int` calls `m.f` at `Int`, and so on for each type of `at`, with
 /// the specialisation of `m.f` each call settles on: at `U8` of one code, and at every other type
-/// alike but for its name. Answers the code each specialisation compiles as, and each body as the
+/// alike but for its name. Answers the codes two or more specialisations share, and each body as the
 /// unit compiles it, its generic calls settled.
 fn program_calling_f_at(
   at: List<Bytes>,
-) -> { compiled_as: Map<RootName, RootKey>, bodies: Map<RootName, Answer> } / {abort.raise} = {
+) -> { coded: List<RootKey>, bodies: Map<RootName, Answer> } / {abort.raise} = {
   let specialised = |arg: Bytes| {
     let k = at_key(b"m.f", [spelled(arg)], []);
     {
@@ -3637,11 +3687,10 @@ fn program_calling_f_at(
   );
   let c = compiled(had.answers, had.keys);
   {
-    compiled_as: c.compiled_as,
+    coded: c.coded.map(|x: { key: RootKey, home: Bytes }| x.key),
     bodies: generics_settled(
       c.answers,
       c.keys,
-      c.compiled_as,
       closed_needs(had.answers, had.keys),
       closed_called(had.answers, had.keys),
       no_ctors(),
@@ -3649,43 +3698,53 @@ fn program_calling_f_at(
   }
 }
 
-test "a specialisation compiles as its code, the same with or without a sibling of that code, which shares it" {
-  let code = |p: Map<RootName, RootKey>, arg: Bytes|
-    p.get(root_name(at_key(b"m.f", [spelled(arg)], [])));
-  let alone = program_calling_f_at([b"Int", b"U8"]).compiled_as;
-  let both = program_calling_f_at([b"Int", b"Bool", b"U8"]).compiled_as;
-  assert(code(alone, b"Int") != None, None);
-  assert_eq(code(both, b"Int"), code(alone, b"Int"));
-  assert_eq(code(both, b"Bool"), code(both, b"Int"));
-  assert(code(both, b"U8") != code(both, b"Int"), None)
-}
+/// The specialisation of `m.f` at `arg`.
+fn f_at(arg: Bytes) -> RootKey / {abort.raise} = at_key(b"m.f", [spelled(arg)], [])
 
-test "a specialisation whose code another's is adds no body and moves no other body's C, and a call of either reaches the one body" {
-  let alone = program_calling_f_at([b"Int", b"U8"]).bodies;
-  let program = program_calling_f_at([b"Int", b"Bool", b"U8"]);
-  let both = program.bodies;
-  // Beside the sibling's caller, the program holds the bodies it held, each written as it was.
-  assert_eq(both.keys().filter(|n: RootName| !alone.contains(n)), [def_root(b"m.calls_Bool")]);
-  assert(
-    alone.fold(true, |same: Bool, n: RootName, a: Answer| same && both.get(n) == Some(a)),
-    None,
-  );
-  // Each caller of the shared code names its one body.
-  let code = match program.compiled_as.get(root_name(at_key(b"m.f", [spelled(b"Int")], []))) {
-    Some(k) -> k,
-    None -> Named(b"m.f"),
-  };
-  let own = symbol_of(printed(code));
-  let called = |caller: Bytes| match both.get(def_root(caller)) { Some(a) -> a.text, None -> b"" };
-  assert_eq([called(b"m.calls_Int"), called(b"m.calls_Bool")], [own, own]);
-  assert(called(b"m.calls_U8") != own, None);
+test "a code two specialisations share is one body and a stub of each, and a code one has stays its body" {
+  let alone = program_calling_f_at([b"Int", b"U8"]);
+  let both = program_calling_f_at([b"Int", b"Bool", b"U8"]);
+  assert_eq(alone.coded, []);
   assert_eq(
-    both.get(root_name(code)),
-    Some({ text: specialisation_text(b"0"), tables: specialisation_tables(code) }),
-  )
+    alone.bodies.get(root_name(f_at(b"Int"))),
+    Some({ text: specialisation_text(b"0"), tables: specialisation_tables(f_at(b"Int")) }),
+  );
+  match both.coded {
+    [code] -> {
+      assert_eq(
+        both.bodies.get(root_name(code)),
+        Some({ text: specialisation_text(b"0"), tables: specialisation_tables(code) }),
+      );
+      // Each specialisation sharing it calls it, and nothing else.
+      let calls = |arg: Bytes|
+        match both.bodies.get(root_name(f_at(arg))) { Some(a) -> a.tables.calls, None -> [] };
+      assert_eq([calls(b"Int"), calls(b"Bool")], [[code], [code]]);
+      let stub_text = match both.bodies.get(root_name(f_at(b"Int"))) {
+        Some(a) -> a.text,
+        None -> b"",
+      };
+      assert(
+        stub_text.index_of(symbol_of(printed(code))) != None,
+        Some(String::of_bytes_lossy(stub_text)),
+      )
+    },
+    _ -> assert_eq(both.coded.len(), 1),
+  };
+  assert_eq(both.bodies.get(root_name(f_at(b"U8"))), alone.bodies.get(root_name(f_at(b"U8"))))
 }
 
-test "a unit compiles specialisations whose code is alike as one body, and its C names none of theirs" {
+test "a caller names the specialisation it calls by its own name, whichever other specialisations share its code" {
+  let called = |p: { coded: List<RootKey>, bodies: Map<RootName, Answer> }, caller: Bytes|
+    match p.bodies.get(def_root(caller)) { Some(a) -> a.text, None -> b"" };
+  let alone = program_calling_f_at([b"Int", b"U8"]);
+  let both = program_calling_f_at([b"Int", b"Bool", b"U8"]);
+  assert_eq(called(alone, b"m.calls_Int"), symbol_of(printed(f_at(b"Int"))));
+  assert_eq(called(both, b"m.calls_Int"), called(alone, b"m.calls_Int"));
+  assert_eq(called(both, b"m.calls_Bool"), symbol_of(printed(f_at(b"Bool"))));
+  assert_eq(called(both, b"m.calls_U8"), called(alone, b"m.calls_U8"))
+}
+
+test "a unit compiles specialisations whose code is alike as one body, and each as a stub of its own name" {
   // Each lender's lambda is run in place, and both write the same code.
   let source = Bytes::concat_all([
     b"fn apply<a>(f: (a) -> a, x: a) -> a = f(x)\n",
@@ -3700,7 +3759,7 @@ test "a unit compiles specialisations whose code is alike as one body, and its C
       let codes = e.produced.taken.filter(|n: RootName| root_text(n).starts_with(b"m.apply@="));
       let named = |symbol: Bytes| e.produced.text.index_of(symbol) != None;
       assert_eq([specialisations.len(), codes.len()], [2, 1]);
-      assert_eq(specialisations.filter(|k: RootKey| named(symbol_of(printed(k)))), []);
+      assert(specialisations.all(|k: RootKey| named(symbol_of(printed(k)))), None);
       assert(codes.all(|n: RootName| named(symbol_of(root_text(n)))), None)
     },
   }
@@ -5811,10 +5870,9 @@ test "specialisations whose bodies differ only in their names, each calling itse
         match k { At(a, _) -> a.def == b"m.sum", _ -> false });
       let codes = e.produced.taken.filter(|n: RootName| root_text(n).starts_with(b"m.sum@="));
       assert_eq([specialisations.len(), codes.len()], [2, 1]);
-      assert_eq(
-        specialisations.filter(|k: RootKey|
-          e.produced.text.index_of(symbol_of(printed(k))) != None),
-        [],
+      assert(
+        specialisations.all(|k: RootKey| e.produced.text.index_of(symbol_of(printed(k))) != None),
+        None,
       )
     },
   }
