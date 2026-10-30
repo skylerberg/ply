@@ -5,8 +5,7 @@ import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                               SRequires, ImportDecl, INames, dump_item, stated_type, item_span,
                               IAlias, IModule, IDerive, IInstance, INumeric)
 import compiler.syntax.type_syntax (MWrite)
-import compiler.syntax.exprs (sees_homes, hidden_binder, prelude_module, scheduler_module, Expr,
-                              EPerform, expr_span)
+import compiler.syntax.exprs (sees_homes, hidden_binder, prelude_module, Expr, EPerform, expr_span)
 import compiler.syntax.sites (numbered_module)
 import compiler.expand.rewrite.shared (picked_in)
 import compiler.emit.code (Code, dump)
@@ -38,9 +37,8 @@ import std.list
 import compiler.expand.embed (EmbedAt, EmbedRead, EmbedFile, EmbedBytes, BytesRead, EmbedWant,
                               ItemWants, embed_want_bin, embed_read_bin, item_wants_bin, embed_key,
                               embedded, wants_of, wants_by_item, wants_in, want_of_key, embed_file)
-import compiler.syntax.items (parse, import_decl_bin, read_without_import, scheduler_read,
-                              homes_declaring, homes_for, called_names, is_std, is_shipped,
-                              HomeNames)
+import compiler.syntax.items (parse, import_decl_bin, scheduler_read, homes_declaring, homes_for,
+                              called_names, is_std, is_shipped, HomeNames)
 import compiler.syntax.lexer (is_ident_continue)
 import compiler.front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterCtor, CFn, CList, CMap,
                             CPlain, CRecord, CSum, CVar, CWidth, KnownDefRow, KnownTestRow, Rows,
@@ -55,7 +53,7 @@ import compiler.front.published (no_rows, rows_kept, rows_read, rows_of, walked_
                                  FiledBody, filed_bodies, StubCuts, analyse, analyse_with, Hashed,
                                  hashed_closure, checked_closure, shipped_dump, entry_front,
                                  dump_of, Claim, ClaimDef, ClaimLaw, ClaimSum, ClaimClause, claims,
-                                 claims_in, rechecked, untested)
+                                 claims_in, rechecked, untested, unimported_read)
 
 // --- Pulling in the shipped modules --------------------------------------------
 
@@ -339,11 +337,6 @@ fn homes_added<| e>(
     }
   }
 
-/// Whether a walk for what modules read with no import finds nothing `asked` does not hold: every
-/// home is asked, so `declared` holds none, and the scheduler is asked.
-fn nothing_unasked(declared: List<HomeNames>, asked: List<Bytes>) -> Bool =
-  declared.len() == 0 && asked.contains(scheduler_module())
-
 /// A round of reads at a time, each of what the last round's modules import and nothing read before;
 /// `room` bounds the rounds, as each reads at least one module no earlier round did.
 fn needing<| e>(
@@ -555,7 +548,14 @@ type Pull = {
   diags: List<Diag>,
   /// What each module read whole is cut by, where its tests and laws were left out.
   cuts: List<StubCuts>,
+  /// What each module reads with no import, by its name ([`unimported_read`]).
+  unimported: Map<Bytes, List<Bytes>>,
 }
+
+/// `asked` with every module `unimported` says a module reads with no import: what a load pulls
+/// whatever the modules import.
+fn asked_with(asked: List<Bytes>, unimported: Map<Bytes, List<Bytes>>) -> List<Bytes> =
+  unimported.fold(asked, |acc: List<Bytes>, _: Bytes, read: List<Bytes>| acc.concat(read))
 
 /// A shipped module's parse with the hidden imports its whole text has: a blanked item or a test left
 /// out may have been all that asked for one, and a pass that reads the text, as the emitter does,
@@ -606,6 +606,29 @@ fn pulling(
     if r.diags.len() > 0 { { ..x, diags: r.diags } }
     else if r.wanted.len() == 0 { x }
     else if room <= 0 { panic("a shipped module pulled twice") } else {
+      let read = unimported_read(
+        r.wanted.fold([], |acc: List<Source>, name: Bytes, src: Bytes|
+          acc.push({ name: name, src: src })),
+        declared,
+      );
+      let round = r.wanted.fold(x, |acc: Pull, name: Bytes, src: Bytes| {
+        let at = acc.parsed.len();
+        let o = shipped_embedded(
+          whole,
+          told,
+          data,
+          at,
+          parsed_at(given, derived, at, { name: name, src: src }),
+        );
+        {
+          ..acc,
+          parsed: acc.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
+          cuts: if tested { acc.cuts }
+          else { acc.cuts.push({ name: o.parsed.name, cuts: cuts_of(o.parsed.module) }) },
+          pulled: acc.pulled.push(name),
+          embeds: acc.embeds.concat(o.embeds),
+        }
+      });
       pulling(
         users,
         shipped,
@@ -614,29 +637,15 @@ fn pulling(
         data,
         listed,
         tested,
-        r.wanted.fold(x, |acc: Pull, name: Bytes, src: Bytes| {
-          let at = acc.parsed.len();
-          let o = shipped_embedded(
-            whole,
-            told,
-            data,
-            at,
-            parsed_at(given, derived, at, { name: name, src: src }),
-          );
-          {
-            ..acc,
-            parsed: acc.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
-            cuts: if tested { acc.cuts }
-            else { acc.cuts.push({ name: o.parsed.name, cuts: cuts_of(o.parsed.module) }) },
-            pulled: acc.pulled.push(name),
-            embeds: acc.embeds.concat(o.embeds),
-          }
-        }),
-        room - 1,
-        if nothing_unasked(declared, asked) { asked } else {
-          r.wanted.fold(asked, |acc: List<Bytes>, name: Bytes, src: Bytes|
-            acc.concat(read_without_import(name, start(src).input, || declared)))
+        {
+          ..round,
+          unimported: read.fold(
+            round.unimported,
+            |acc: Map<Bytes, List<Bytes>>, name: Bytes, reads: List<Bytes>| acc.insert(name, reads),
+          ),
         },
+        room - 1,
+        asked_with(asked, read),
         declared,
         given,
         derived,
@@ -883,12 +892,8 @@ pub fn staged_pulling_std_with(
   let held = if unread.contains(prelude_module()) { shipped } else { with_prelude_source(shipped) };
   let texts = held.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source| acc.insert(s.name, s.src));
   let sources = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src));
-  // A home asked already is pulled whatever calls it, so no source is read for a call to it.
-  let declared = homes_declaring(|h: Bytes| if asked.contains(h) { None } else { texts.get(h) });
-  let asking = if nothing_unasked(declared, asked) { asked } else {
-    sources.fold(asked, |acc: List<Bytes>, s: Source|
-      acc.concat(read_without_import(s.name, start(s.src).input, || declared)))
-  };
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  let unimported = unimported_read(sources, declared);
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
     |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
@@ -928,9 +933,16 @@ pub fn staged_pulling_std_with(
     data_held(data),
     listed,
     tested,
-    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, diags: [] },
+    {
+      parsed: assembled,
+      pulled: [],
+      embeds: [],
+      cuts: read.cuts,
+      diags: [],
+      unimported: unimported,
+    },
     texts.len(),
-    asking,
+    asked_with(asked, unimported),
     declared,
     given,
     derived,
@@ -941,6 +953,7 @@ pub fn staged_pulling_std_with(
         clo,
         user.len(),
         tree,
+        x.unimported,
         fixed,
         written.at.concat(x.embeds),
         x.cuts,
@@ -1884,6 +1897,7 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       index: 0,
       items: [b"m.log", b"m.Shape", b"m.Dot", b"m.Line", b"m.say"],
       imports: [prelude_module()],
+      unimported: [],
       sets: [],
       // `say`'s body and the whole test, which a stub of the module blanks.
       cuts: [

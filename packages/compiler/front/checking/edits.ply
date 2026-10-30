@@ -15,8 +15,8 @@ import compiler.front.rows (known_def_row_bin)
 import compiler.front.published (no_rows, analyse, dump_of)
 import compiler.front (published, staged_pulling_std_with, analyse_pulling_std_with, faceted,
                        checked_staged)
-import compiler.front.facts (ModuleShape, ModuleTables, answered_program, answered_load,
-                             functions_of, tests_of)
+import compiler.front.facts (ModuleShape, ModuleTables, Analysis, Framed, View, answered_program,
+                             answered_load, functions_of, tests_of)
 import compiler.syntax.items (derivation_bin)
 import compiler.expand.derive (Wrote, library_ask_bin, library_answer_bin)
 import std.value
@@ -1381,8 +1381,13 @@ fn pulling() -> { user: List<Source>, shipped: List<Source> } =
     ],
   }
 
-test "a program assembled from its modules' answers, a shipped module's among them, is the program checked whole" {
-  let f = pulling();
+/// `f` as a load assembles it from its modules' answers, beside `f` checked whole, each reading its
+/// shipped modules as `tested` and `reached` say.
+fn answered_beside_whole(
+  f: { user: List<Source>, shipped: List<Source> },
+  tested: Bool,
+  reached: Bool,
+) -> { loaded: Framed, assembled: View, whole: Analysis } / {abort.raise} = {
   let w = world_of(
     { root: b"", manifest: None, files: f.user.map(|s: Source| { module: s.name, text: s.src }) },
     [],
@@ -1392,85 +1397,110 @@ test "a program assembled from its modules' answers, a shipped module's among th
     acc.insert(s.name, s.src));
   let held = |name: Bytes| texts.get(name);
   let names = shipped.map(|s: Source| s.name);
+  let done = over_decoding(
+    nothing_held(),
+    packs::no_pack,
+    b"",
+    |kind: Bytes, at: Bytes|
+      looked(w, held, held, || names, nothing_embedded, nothing_derived, kind, at),
+    || {
+      let qs = fresh_registry();
+      let all = asked_all(qs, w.own, if tested { names } else { [] }, tested, started(qs));
+      let fixed = hashed_all(qs, w.own, all.value.pulled, tested, all.run);
+      { answers: all.value.answers, pulled: all.value.pulled, fixing: joined_fixing(fixed.value) }
+    },
+  ).value;
+  let loaded = answered_load(
+    f.user.map(|s: Source| s.name),
+    { root: b"", manifest: None, supplied: [] },
+    done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
+      acc.insert(a.module, a.answer.shape)),
+    done.fixing,
+    done.pulled,
+    names,
+    texts,
+    true,
+    reached,
+    root_warnings(done.answers, f.user.len()),
+  );
+  match analyse_pulling_std_with(f.user, f.shipped, no_rows(), reached: reached).out {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(whole) ->
+      {
+        loaded: loaded,
+        assembled: view_answered(
+          loaded.frame,
+          loaded.reads,
+          done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
+            acc.insert(a.module, a.answer)),
+        ),
+        whole: whole,
+      },
+  }
+}
+
+test "a program assembled from its modules' answers, a shipped module's among them, is the program checked whole" {
+  let f = pulling();
   // As a program reads a shipped module, cut to its reach; and as a run over the standard library's
   // own tests reads it, whole and with its tests.
   [{ tested: false, reached: true }, { tested: true, reached: false }].fold(
     (),
     |u: Unit, mode: { tested: Bool, reached: Bool }| {
-      let done = over_decoding(
-        nothing_held(),
-        packs::no_pack,
-        b"",
-        |kind: Bytes, at: Bytes|
-          looked(w, held, held, || names, nothing_embedded, nothing_derived, kind, at),
-        || {
-          let qs = fresh_registry();
-          let all = asked_all(
-            qs,
-            w.own,
-            if mode.tested { names } else { [] },
-            mode.tested,
-            started(qs),
-          );
-          let fixed = hashed_all(qs, w.own, all.value.pulled, mode.tested, all.run);
-          {
-            answers: all.value.answers,
-            pulled: all.value.pulled,
-            fixing: joined_fixing(fixed.value),
-          }
-        },
-      ).value;
-      let loaded = answered_load(
-        f.user.map(|s: Source| s.name),
-        { root: b"", manifest: None, supplied: [] },
-        done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
-          acc.insert(a.module, a.answer.shape)),
-        done.fixing,
-        done.pulled,
-        names,
-        texts,
-        true,
-        mode.reached,
-        root_warnings(done.answers, f.user.len()),
+      let x = answered_beside_whole(f, mode.tested, mode.reached);
+      let loaded = x.loaded;
+      let assembled = x.assembled;
+      let view = view_of(x.whole);
+      assert_eq(loaded.pulled, [b"std.prelude", b"std.shapes"]);
+      // `std.prelude`'s own tests are read with the rest of the library's.
+      assert_eq(
+        assembled.checked.tests.filter(|t: TestInfo| t.module != prelude_module()).len(),
+        if mode.tested { 2 } else { 1 },
       );
-      match analyse_pulling_std_with(f.user, f.shipped, no_rows(), reached: mode.reached).out {
-        Refused(_) -> panic("the fixture checks"),
-        Analysed(whole) -> {
-          let view = view_of(whole);
-          let assembled = view_answered(
-            loaded.frame,
-            loaded.reads,
-            done.answers.fold(Map::new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
-              acc.insert(a.module, a.answer)),
-          );
-          assert_eq(loaded.pulled, [b"std.prelude", b"std.shapes"]);
-          // `std.prelude`'s own tests are read with the rest of the library's.
-          assert_eq(
-            assembled.checked.tests.filter(|t: TestInfo| t.module != prelude_module()).len(),
-            if mode.tested { 2 } else { 1 },
-          );
-          assert_eq(loaded.frame.outlines, view.frame.outlines);
-          assert_eq(assembled.checked.defs, view.checked.defs);
-          assert_eq(assembled.checked.facts, view.checked.facts);
-          assert_eq(assembled.checked, view.checked);
-          // The call on a value stores what its check found, which a hashing before it has not.
-          match staged_pulling_std_with(f.user, f.shipped, reached: mode.reached).hashed {
-            Ok(h) ->
-              assert(
-                checked_body(body_named(h.hashes.bodies, b"main.ranked"), Map::new())
-                  != body_named(view.frame.hashes.bodies, b"main.ranked"),
-              ),
-            Err(_) -> panic("the fixture hashes"),
-          };
-          assert_eq(loaded.frame.hashes, view.frame.hashes);
-          assert_eq(assembled, view);
-          assert_eq(functions_of(loaded.frame), assembled.checked.defs.len());
-          assert_eq(tests_of(loaded.frame, 1), 1);
-          assert_eq(view_dump(assembled, None), dump_of(Analysed(whole)))
-        },
-      }
+      assert_eq(loaded.frame.outlines, view.frame.outlines);
+      assert_eq(assembled.checked.defs, view.checked.defs);
+      assert_eq(assembled.checked.facts, view.checked.facts);
+      assert_eq(assembled.checked, view.checked);
+      // The call on a value stores what its check found, which a hashing before it has not.
+      match staged_pulling_std_with(f.user, f.shipped, reached: mode.reached).hashed {
+        Ok(h) ->
+          assert(
+            checked_body(body_named(h.hashes.bodies, b"main.ranked"), Map::new())
+              != body_named(view.frame.hashes.bodies, b"main.ranked"),
+          ),
+        Err(_) -> panic("the fixture hashes"),
+      };
+      assert_eq(loaded.frame.hashes, view.frame.hashes);
+      assert_eq(assembled, view);
+      assert_eq(functions_of(loaded.frame), assembled.checked.defs.len());
+      assert_eq(tests_of(loaded.frame, 1), 1);
+      assert_eq(view_dump(assembled, None), dump_of(Analysed(x.whole)))
     },
   )
+}
+
+/// A program whose module reads a type's home and the scheduler with no import.
+fn reading_unimported() -> { user: List<Source>, shipped: List<Source> } =
+  {
+    user: [
+      {
+        name: b"main",
+        src: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
+      },
+    ],
+    shipped: [
+      {
+        name: b"std.list",
+        src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+      },
+      { name: b"std.internal.schedule", src: b"pub fn idle() -> Int = 0\n" },
+    ],
+  }
+
+test "a module's answer names the home and the scheduler it reads with no import, as its program checked whole does" {
+  let x = answered_beside_whole(reading_unimported(), false, true);
+  assert_eq(x.loaded.frame.unimported.at(0), Some([b"std.list", b"std.internal.schedule"]));
+  assert_eq(x.loaded.frame.unimported, view_of(x.whole).frame.unimported);
+  assert_eq(view_dump(x.assembled, None).modules, dump_of(Analysed(x.whole)).modules)
 }
 
 /// The stored body `bodies` holds of `name`.

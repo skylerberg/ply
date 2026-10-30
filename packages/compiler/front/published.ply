@@ -4,7 +4,7 @@ import compiler.syntax.parsing (Span, Ident, ParseDiag, dummy_span, moved_by, pa
                                 parse_label, start)
 import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, TDSum, SpecKind, FnDef, LawDef,
                               OfSchema)
-import compiler.syntax.exprs (expr_span, prelude_module, prelude_own)
+import compiler.syntax.exprs (expr_span, prelude_module, prelude_own, scheduler_module)
 import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NIf,
                            NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate,
                            NParallel, NHandle, NField, NUpdate, NKnown, CodeField, CodeArm,
@@ -48,7 +48,7 @@ import std.bin
 import std.hash (blake3)
 import std.list
 import compiler.expand.embed (EmbedAt, ItemWants)
-import compiler.syntax.items (parse)
+import compiler.syntax.items (parse, read_without_import, homes_declaring, unimported_of, HomeNames)
 import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefRow, KnownTestRow, Rows,
                             known_def_row_bin, rows_bin, ModuleSpan, DefRow, TestRow, HDef,
                             HashFrame, Dump, answered_diag)
@@ -395,9 +395,48 @@ pub fn analyse_with(
       untested({ ..parse_at(closed.len(), { name: prelude_module(), src: src }), src: src }),
     )
   };
+  let texts = all.fold(Map::new(), |acc: Map<Bytes, Bytes>, p: ParsedSource|
+    acc.insert(p.name, p.src));
+  let declared = homes_declaring(|h: Bytes| texts.get(h));
+  // A load that holds no home and no scheduler has no module read one, so none is lexed for it.
+  let unimported = if declared.len() == 0 && !texts.contains(scheduler_module()) { Map::new() }
+  else { unimported_read(all.map(|p: ParsedSource| { name: p.name, src: p.src }), declared) };
   // This path has no shipped modules list to check a tree's coverage against, and only the
   // toolchain's listings use it.
-  analyse_closure(all, clo, rows, parsed.len(), tree_named(parsed.map(|p: ParsedSource| p.name)))
+  analyse_closure(
+    all,
+    clo,
+    rows,
+    parsed.len(),
+    tree_named(parsed.map(|p: ParsedSource| p.name)),
+    unimported,
+  )
+}
+
+/// What each of `sources` reads with no import ([`read_without_import`]), by its name: each home of
+/// `declared` it calls a function of, and the scheduler.
+pub fn unimported_read(
+  sources: List<Source>,
+  declared: List<HomeNames>,
+) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+  sources.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, s: Source|
+    acc.insert(s.name, read_without_import(s.name, start(s.src).input, || declared)))
+
+/// What each of `mods`, resolved as `r`, reads with no import ([`unimported_of`]), in its place, of
+/// what `read` holds by its name.
+fn unimported_in(
+  mods: List<ParsedModule>,
+  r: Resolved,
+  read: Map<Bytes, List<Bytes>>,
+) -> List<List<Bytes>> / {abort.raise} = {
+  let held = mods.fold(Map::new(), |acc: Map<Bytes, Bool>, m: ParsedModule|
+    acc.insert(m.name, true));
+  range(0, mods.len()).map(|i: Int|
+    unimported_of(
+      match read.get(mods.get(i).name) { Some(xs) -> xs, None -> [] },
+      |m: Bytes| held.contains(m),
+      r.imports.get(i).map(|t: Int| mods.get(t).name),
+    ))
 }
 
 /// `sources` with `std.prelude` among them, which every module imports, and `module_packages` with
@@ -463,6 +502,8 @@ fn std_squats(
 pub type Hashed = {
   mods: List<ParsedModule>,
   r: Resolved,
+  /// What each module reads with no import, as `ModuleRow` says, in its place in `mods`.
+  unimported: List<List<Bytes>>,
   index: Index,
   hashes: HashOutput,
   unused: List<Diag>,
@@ -479,11 +520,14 @@ pub type Hashed = {
   embed_items: Map<Bytes, List<ItemWants>>,
 }
 
+/// `unimported` is what each module of `parsed` reads with no import, by its name, as
+/// [`unimported_read`] says.
 pub fn hashed_closure(
   parsed: List<ParsedSource>,
   clo: Closure,
   root_count: Int,
   tree: Tree,
+  unimported: Map<Bytes, List<Bytes>>,
   fixed: Fixing = { nodes: [], tests: [], laws: [] },
   embeds: List<EmbedAt> = [],
   cuts: List<StubCuts> = [],
@@ -527,6 +571,7 @@ pub fn hashed_closure(
               Ok({
                 mods: x.mods,
                 r: x.r,
+                unimported: unimported_in(x.mods, x.r, unimported),
                 index: built.index,
                 hashes: hashed.hashes,
                 // A dependency's unused definitions are its own package's to report.
@@ -561,6 +606,7 @@ pub fn checked_closure(h: Hashed, rows: Rows, walks: Walks) -> AnalysisOutcome /
     Analysed({
       mods: h.mods,
       r: h.r,
+      unimported: h.unimported,
       checked: checked,
       index: h.index,
       hashes: {
@@ -641,14 +687,15 @@ fn analyse_closure(
   rows: Rows,
   root_count: Int,
   tree: Tree,
+  unimported: Map<Bytes, List<Bytes>>,
 ) -> AnalysisOutcome / {abort.raise} =
-  match hashed_closure(parsed, clo, root_count, tree) {
+  match hashed_closure(parsed, clo, root_count, tree, unimported) {
     Err(diags) -> Refused(diags),
     Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module()) {
         None
       } else { prelude_cut(parsed, h) } {
       None -> checked_closure(h, rows, Every),
-      Some(cut) -> match hashed_closure(cut, clo, root_count, tree) {
+      Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
         Err(diags) -> Refused(diags),
         Ok(kept) -> checked_closure(kept, rows, Every),
       },
