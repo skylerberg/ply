@@ -1,11 +1,12 @@
-//! A region's scheduler as data: what its tasks wait on, what each request a task makes does to
-//! them, and which task runs next. `simulate` takes its schedule from a seed and records each step;
-//! a production region runs ready tasks first in, first out, and waits on the run's tickets and
-//! clock where none is ready. Nothing here switches a stack or reads the host: a region's loop hands
-//! each request in with what the runtime knows of it and runs the task each turn names.
+//! A region's scheduler as data: what its tasks wait on, how each request a task makes changes
+//! them, and which task runs next. `simulate` takes its schedule from a seed and records each
+//! step. A production region runs ready tasks first in, first out, and waits on the run's tickets
+//! and clock when none is ready. Nothing here switches a stack or reads the host: a region's loop
+//! passes in each request with what the runtime knows about it, and runs the task each turn names.
 //!
-//! Values a task passes another (`v`) are held without being read. A task's answer is not among
-//! them: the task's handle holds it, and the scheduler tells a joiner only that it is there.
+//! Values one task passes to another (`v`) are stored without being inspected. A task's result is
+//! not among them: the task's handle stores it, and the scheduler only tells a joiner that it is
+//! there.
 
 import std.bin
 import std.internal.native (native)
@@ -14,43 +15,43 @@ import std.internal.trail (Trail, Site, nowhere, Access, Step, Read, Write, site
 import std.list
 import std.string
 
-// --- What a region is told ------------------------------------------------------
+// --- Inputs and outputs ---------------------------------------------------------
 
 /// How a region picks what runs next: by the entry's seed, as `simulate` does (`Seeded`), or in
-/// the order its tasks became ready, answering the host's operations as they come (`Production`).
+/// the order its tasks became ready, handling the host's operations as they come (`Production`).
 pub type Policy = | Seeded | Production
 
-/// Where a task stands in brackets: the `acquire`s and the `release`s it is inside, and whether a
-/// cancel waits for it to leave them. The runtime keeps these, since a bracket is entered and left
-/// without the scheduler.
+/// How deep a task is inside brackets: the `acquire`s and `release`s it is inside, and whether a
+/// cancel waits for it to leave them. The runtime tracks these, since a bracket is entered and
+/// left without the scheduler.
 pub type Shields = { acquiring: Int, releasing: Int, stopping: Bool }
 
-/// No bracket.
+/// Inside no bracket.
 pub fn unshielded() -> Shields = { acquiring: 0, releasing: 0, stopping: false }
 
-/// A task's handle as its holder reads it: the region and the task it names, and how the task
-/// ended where its handle has recorded that.
+/// A task's handle as its owner reads it: the region and the task it refers to, and how the task
+/// ended if the handle has recorded that.
 pub type TaskRef = { region: Int, id: Int, ended: TaskStatus }
 
-/// How a task ended, as its handle records it: not yet, with its answer, or cancelled.
+/// How a task ended, as its handle records it: not yet, with a result, or cancelled.
 pub type TaskStatus = | Live | Returned | Cancelled
 
 /// A channel's handle: its region and its id there.
 pub type ChanRef = { region: Int, id: Int }
 
-/// What a task asks of its region when it gives control back.
+/// What a task requests from its region when it gives up control.
 pub type Request<v> =
   | Spawn
   | Join(TaskRef)
   | Await(TaskRef)
-  /// The task to stop, and the brackets it stands in.
+  /// The task to stop, and the brackets it is inside.
   | Cancel(TaskRef, Shields)
   /// A capacity of at least 0.
   | Channel(Int)
   | Send(ChanRef, v)
   | Recv(ChanRef)
   | Close(ChanRef)
-  /// Each arm's channel beside what it sends, if anything, and whether to wait.
+  /// Each arm's channel with what it sends, if anything, and whether to wait.
   | Select(List<{ chan: ChanRef, send: Option<v> }>, Bool)
   | Yield
   | Now
@@ -60,90 +61,91 @@ pub type Request<v> =
   /// A bound of at least 1.
   | Below(Int)
   | Seed
-  /// Wait until the run's ticket of this token is answered.
+  /// Wait until the run completes the ticket for this token.
   | Ticket(Int)
-  /// The task's body answered, and its handle holds the answer.
+  /// The task's body returned, and its handle stores the result.
   | Finished
   /// The task finished unwinding after a cancel.
   | Unwound
-  /// A raise nothing in the task answered leaves it for the handlers around the region; the
-  /// brackets each other task stands in, by task, where any.
+  /// A raise that nothing in the task handled leaves it for the handlers around the region.
+  /// Carries the brackets each other task is inside, by task, if any.
   | Raised(Map<Int, Shields>)
-  /// The task failed at run time; the runtime holds the failure.
+  /// The task failed at run time; the runtime stores the failure.
   | Failed
 
-/// What the runtime knows of a request: where it was performed, the brackets the task stands in
-/// where a cancel waits for it to leave them (else none), and the run's clock, which a production
+/// What the runtime knows about a request: where it was performed, the brackets the task is inside
+/// if a cancel waits for it to leave them (otherwise none), and the run's clock, which a production
 /// region reads.
 pub type RequestContext = { site: Site, shields: Shields, now: Int }
 
-/// What a task hears when it runs again.
+/// What a task receives when it runs again.
 pub type Reply<v> =
   | Nothing
   | Flag(Bool)
   | Number(Int)
   /// The id of the task spawned.
   | Spawned(Int)
-  /// The id of the channel made.
+  /// The id of the channel created.
   | ChannelCreated(Int)
-  /// The task joined answered: its handle holds the answer.
+  /// The joined task returned: its handle stores the result.
   | Joined
-  /// The task awaited answered (`true`) or was cancelled.
+  /// The awaited task returned (`true`) or was cancelled.
   | Awaited(Bool)
   | Received(Option<v>)
-  /// The arm that went, by its place, beside what it took or sent.
+  /// The arm that completed, by its position, with what it received or sent.
   | Selected(Option<{ at: Int, got: Option<v> }>)
 
-/// How a task runs again: from its body's start, answered, only to unwind, or raising.
+/// How a task runs again: from its body's start, with a reply, only to unwind, or raising.
 pub type Resumption<v> = | Start | Resume(Reply<v>) | Unwind | Raise(Failure)
 
 /// What runs next, or why nothing does.
 pub type Turn<v> =
   | Run(Int, Resumption<v>)
-  /// Every task ended, the body answering.
+  /// Every task ended, and the body returned.
   | Complete
-  /// Every task ended after this one's raise left it, which now lands at the region's site.
+  /// Every task ended after this task's raise left it, and the raise now lands at the region's
+  /// site.
   | Reraise(Int)
   | Ends(Ending)
-  /// A production region with nothing to run until a ticket is answered, the deadline passes
-  /// where there is one, or the run is stopped.
+  /// A production region with nothing to run until a ticket is completed, the deadline passes if
+  /// there is one, or the run is stopped.
   | Idle(Option<Int>)
 
-/// How a region ends without its body's answer.
+/// How a region ends without its body's result.
 pub type Ending =
   /// The region's own failure.
   | RegionFailed(Failure)
-  /// The task failed at run time: the runtime's failure stands, with this note.
+  /// The task failed at run time: the runtime's failure is reported, with this note.
   | TaskFailed(Int, Option<String>)
   /// A drain after a stop ran out of time, which failed the run.
   | Drained
 
-/// What the region's loop does for the scheduler, which only the runtime can.
+/// An action the region's loop takes for the scheduler, which only the runtime can perform.
 pub type Command =
-  /// A cancel waits until the task leaves the brackets it stands in.
+  /// A cancel waits until the task leaves the brackets it is inside.
   | HoldBack(Int)
   /// The task's cancel no longer waits.
   | LetThrough(Int)
-  /// The task never started: its body and stack go.
+  /// The task never started: free its body and stack.
   | Discard(Int)
-  /// The task ended cancelled, which its handle records.
+  /// The task ended by cancellation, which its handle records.
   | MarkCancelled(Int)
-  /// The task's raise goes nowhere: another's already leaves the region.
+  /// The task's raise is dropped: another task's raise is already leaving the region.
   | DropRaise(Int)
 
 /// A failure the region reports: a code, a message, labels at sites, and notes.
 pub type Failure = { code: String, message: String, labels: List<Label>, notes: List<String> }
 
-/// What a failure says at a site: `primary` for the site it is about.
+/// A failure's message at a site, with `primary` set for the site the failure is about.
 pub type Label = { at: Site, primary: Bool, text: String }
 
 derive bin for Label
 derive bin for Failure
 
-/// `f` as the runtime reads the failure it fails a run with.
+/// `f` encoded as the runtime reads the failure it fails a run with.
 pub fn failure_bytes(f: Failure) -> Bytes / {abort.raise} = bin::encode(f, failure_bin())
 
-/// What the region's host tells a production turn.
+/// What the region's host reports to a production turn.
 pub type HostState = { now: Int, stopping: Bool }
 
 // --- A region's state -------------------------------------------------------------
@@ -154,14 +156,15 @@ type Wait<v> =
   /// Until this deadline: virtual time in `simulate`, the run's clock in production.
   | Sleeping(Int)
   | AwaitingTicket(Int)
-  /// To send on the channel what it holds.
+  /// To send this value on the channel.
   | Sending(Int, v)
   | Receiving(Int)
   | Selecting(List<Arm<v>>)
 
 type Arm<v> = { chan: Int, send: Option<v> }
 
-/// What a task does: the running task stays as it was chosen until what it asks changes it.
+/// A task's state. The running task stays in the state it was chosen in until its request changes
+/// it.
 type State<v> =
   | Ready(Resumption<v>)
   | Blocked(Wait<v>, Site)
@@ -178,7 +181,7 @@ type Member<v> = {
   state: State<v>,
   origin: Site,
   joiners: List<Int>,
-  /// A cancel reached it: a later one changes nothing, and every step it takes reads it.
+  /// A cancel reached it. A later cancel changes nothing, and every step it takes reads this.
   cancelled: Bool,
 }
 
@@ -194,23 +197,24 @@ type Channel<v> = {
 }
 
 /// One region's scheduler. Tasks and channels are numbered from 0 in the region and never reused.
-/// Its loop holds it once, so a request updates it in place.
+/// Its loop has the only reference to it, so a request updates it in place.
 pub type Region<v> = {
   policy: Policy,
   id: Int,
   site: Site,
   tasks: Map<Int, Member<v>>,
-  /// `simulate`'s vector clock of each task, by task: how many steps of each task it has observed.
-  /// A production region keeps none.
+  /// In `simulate`, each task's vector clock: how many steps of each task it has observed. A
+  /// production region keeps none.
   stamps: List<List<Int>>,
-  /// The tasks that may run: in `simulate` ascending, the order a choice indexes, the running task
-  /// among them until it stops being ready; in production in the order they became ready.
+  /// The tasks that may run. In `simulate` they are ascending, the order a choice indexes, with
+  /// the running task among them until it stops being ready. In production they are in the order
+  /// they became ready.
   ready: List<Int>,
   timers: Map<(Int, Int), Unit>,
   /// A production region's tasks waiting on tickets, by token.
   tickets: Map<Int, Int>,
   channels: Map<Int, Channel<v>>,
-  /// `simulate`'s: what an operation on each channel writes, by the channel's id. A production
+  /// In `simulate`, what an operation on each channel writes, by the channel's id. A production
   /// region keeps none.
   chan_accesses: List<Access>,
   unfinished: Int,
@@ -222,18 +226,18 @@ pub type Region<v> = {
   trail: Trail,
   /// The steps this region took before its last.
   steps: List<Step>,
-  /// The last step this region took, which the running task takes; none before the first.
+  /// The last step this region took, which the running task is taking; none before the first.
   step: Option<Step>,
   ending: Option<Ending>,
   /// The task whose raise leaves the region once every other task has ended.
   raising: Option<Int>,
   orders: List<Command>,
-  /// What the last `next_turn` decided runs next; nothing it means before the first.
+  /// What the last `next_turn` decided runs next. Before the first call, its value means nothing.
   turn: Turn<v>,
-  /// `simulate`'s loop's: each footprint the runtime wrote, as read, since a program repeats its
-  /// steps' footprints.
+  /// Used by `simulate`'s loop: each footprint the runtime wrote, decoded, and cached because a
+  /// program repeats its steps' footprints.
   footprints: Map<Bytes, List<trail::Touch>>,
-  /// A production region's loop's: how many waits on the run in a row woke nothing.
+  /// Used by a production region's loop: how many waits on the run in a row woke nothing.
   spurious_wakeups: Int,
 }
 
@@ -278,26 +282,27 @@ fn new_region<v>(policy: Policy, id: Int, site: Site, t: Trail) -> Region<v> =
     spurious_wakeups: 0,
   }
 
-/// What a step that touched nothing touched.
+/// The accesses of a step that accessed nothing.
 fn no_accesses() -> List<Access> = []
 
 /// Every step the region took, in order.
 pub fn steps_taken<v>(r: Region<v>) -> List<Step> = steps_with(r.steps, r.step)
 
-/// The trail as the region leaves it, the virtual time it spent counted.
+/// The trail as the region leaves it, including the virtual time it used.
 pub fn final_trail<v>(r: Region<v>) -> Trail = { ..r.trail, virtual_time: r.now }
 
-/// The orders the region gave since they were last taken, oldest first, and the region without them.
+/// The commands the region issued since they were last taken, oldest first, and the region without
+/// them.
 pub fn take_commands<v>(r: Region<v>) -> { orders: List<Command>, region: Region<v> } =
   { orders: r.orders, region: { ..r, orders: [] } }
 
-/// How many tasks the region holds: in `simulate` every one it spawned, in production those not
-/// yet ended.
+/// How many tasks the region has: in `simulate` every one it spawned, in production those not yet
+/// ended.
 pub fn task_count<v>(r: Region<v>) -> Int = r.tasks.len()
 
 // --- Turns -------------------------------------------------------------------------
 
-/// The region as it stands once what runs next is decided, which it holds as its turn.
+/// The region once it has decided what runs next, which it stores as its turn.
 pub fn next_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise} =
   match r.ending {
     Some(e) -> { ..r, turn: Ends(e) },
@@ -320,11 +325,12 @@ fn fail_turn<v>(r: Region<v>, f: Failure) -> Region<v> = {
   { ..s, turn: turn }
 }
 
-/// `r` refused with `f`, unless it already ended otherwise.
+/// `r` failed with `f`, unless it already ended another way.
 fn fail_region<v>(r: Region<v>, f: Failure) -> Region<v> =
   match r.ending { Some(_) -> r, None -> { ..r, ending: Some(RegionFailed(f)) } }
 
-/// What a region whose tasks have all ended answers, and one where some wait for nothing.
+/// The final turn: completion or a re-raise when every task has ended, or a deadlock failure when
+/// some still wait on something that can never happen.
 fn final_turn<v>(r: Region<v>) -> Region<v> / {abort.raise} =
   if r.unfinished > 0 {
     fail_turn(r, match r.policy { Seeded -> deadlock(r), Production -> host_deadlock(r) })
@@ -353,8 +359,8 @@ fn seeded_turn<v>(r: Region<v>) -> Region<v> / {abort.raise} =
       },
     })
 
-/// The scheduling point that takes the enabled task at `choice`, the choices stream at `choices`
-/// after it, recorded.
+/// Records the scheduling point that chooses the enabled task at `choice`, with the choices stream
+/// at `choices` after it.
 fn choose_task<v>(
   s: Region<v>,
   choice: Int,
@@ -395,7 +401,8 @@ fn choose_task<v>(
     },
   }
 
-/// `s` past the scheduling point that took `step`, the choices stream's counter `choices`.
+/// `s` after the scheduling point that took `step`, with the choices stream's counter at
+/// `choices`.
 fn record_step<v>(s: Region<v>, step: Step, choices: Int) -> Region<v> / {abort.raise} =
   {
     ..s,
@@ -405,7 +412,7 @@ fn record_step<v>(s: Region<v>, step: Step, choices: Int) -> Region<v> / {abort.
     step: Some(step),
   }
 
-/// `steps` and then `last`, where there is one.
+/// `steps` followed by `last`, if there is one.
 fn steps_with(steps: List<Step>, last: Option<Step>) -> List<Step> =
   match last { Some(step) -> steps.push(step), None -> steps }
 
@@ -419,7 +426,7 @@ fn widened(xs: List<Int>, n: Int) -> List<Int> =
 
 fn at_or_zero(xs: List<Int>, i: Int) -> Int = match xs.at(i) { Some(n) -> n, None -> 0 }
 
-/// Virtual time moved on to `deadline`, each task asleep until then readied in task order.
+/// Moves virtual time to `deadline`, and readies each task sleeping until then, in task order.
 fn advance_time<v>(s: Region<v>, deadline: Int) -> Region<v> / {abort.raise} = {
   let woken = s.timers.keys().filter(|k: (Int, Int)| k._0 == deadline);
   woken.fold(timers_cut(s, woken, deadline), |acc: Region<v>, k: (Int, Int)|
@@ -441,7 +448,7 @@ fn timer_cut<v>(s: Region<v>, key: (Int, Int)) -> Region<v> = { ..s, timers: s.t
 fn timer_set<v>(s: Region<v>, key: (Int, Int)) -> Region<v> =
   { ..s, timers: s.timers.insert(key, ()) }
 
-/// Each sleeper whose deadline is `now` or earlier readied, earliest first and then in task order.
+/// Readies each sleeper whose deadline is `now` or earlier, earliest first and then in task order.
 fn wake_due_sleepers<v>(r: Region<v>, now: Int) -> Region<v> / {abort.raise} =
   iterate(r, r.timers.len() + 1, |s: Region<v>|
     match s.timers.first() {
@@ -493,8 +500,8 @@ fn production_turn<v>(r: Region<v>, host: HostState) -> Region<v> / {abort.raise
   }
 }
 
-/// Each task waiting on one of `tokens`, whose tickets the run answered, readied in task order.
-/// A token no task here waits on is another region's of the run that has ended.
+/// Readies, in task order, each task waiting on one of `tokens`, whose tickets the run completed.
+/// A token that no task here waits on belongs to another region of the run that has ended.
 pub fn wake_ticket_waiters<v>(r: Region<v>, tokens: List<Int>) -> Region<v> / {abort.raise} = {
   let found = tokens.fold(
     { tickets: r.tickets, tasks: [] },
@@ -520,7 +527,7 @@ pub fn wake_ticket_waiters<v>(r: Region<v>, tokens: List<Int>) -> Region<v> / {a
 
 // --- Requests ---------------------------------------------------------------------
 
-/// What the running `task`'s request does to the region.
+/// Applies the running `task`'s request to the region.
 pub fn handle_request<v>(
   r: Region<v>,
   task: Int,
@@ -628,7 +635,7 @@ fn apply_request<v>(
     Failed -> fail_task(s, task),
   }
 
-/// `s` with a channel of `capacity` more.
+/// `s` with one more channel, of `capacity`.
 fn add_channel<v>(s: Region<v>, capacity: Int) -> Region<v> =
   {
     ..s,
@@ -646,30 +653,31 @@ fn add_channel<v>(s: Region<v>, capacity: Int) -> Region<v> =
     }),
   }
 
-/// `s` with `f` of channel `id` in its place.
+/// `s` with channel `id` replaced by `f` of it.
 fn chan_set<v>(s: Region<v>, id: Int, f: (Channel<v>) -> Channel<v>) -> Region<v> =
   { ..s, channels: s.channels.update(id, f) }
 
-/// `s` with `f` of task `id` in its place.
+/// `s` with task `id` replaced by `f` of it.
 fn task_set<v>(s: Region<v>, id: Int, f: (Member<v>) -> Member<v>) -> Region<v> =
   { ..s, tasks: s.tasks.update(id, f) }
 
 /// `s` without task `id`.
 fn task_removed<v>(s: Region<v>, id: Int) -> Region<v> = { ..s, tasks: s.tasks.remove(id) }
 
-/// The running task readied with `incoming`, giving control back.
+/// Readies the running task with `incoming`, and gives control back to the loop.
 fn reply<v>(s: Region<v>, task: Int, incoming: Reply<v>) -> Region<v> =
   { ..running_readied(s, task, Resume(incoming)), current: None }
 
-/// The task readied to raise `f` where it asked, giving control back.
+/// Readies the task to raise `f` where it made its request, and gives control back to the loop.
 fn raise_in_task<v>(s: Region<v>, task: Int, f: Failure) -> Region<v> =
   { ..running_readied(s, task, Raise(f)), current: None }
 
-/// The running task `id` readied to run again as `res`: in `simulate` among the ready tasks already.
+/// Readies the running task `id` to run again as `res`. In `simulate` it is already among the
+/// ready tasks.
 fn running_readied<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
   match s.policy { Seeded -> set_state(s, id, Ready(res)), Production -> ready_queued(s, id, res) }
 
-/// Task `id`, which the region holds, readied to run again as `res`.
+/// Readies task `id`, which the region has, to run again as `res`.
 fn make_ready<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
   match s.policy { Seeded -> ready_in_order(s, id, res), Production -> ready_queued(s, id, res) }
 
@@ -687,13 +695,14 @@ fn ready_queued<v>(s: Region<v>, id: Int, res: Resumption<v>) -> Region<v> =
     ready: s.ready.push(id),
   }
 
-/// `xs`, ascending, with `id` among them.
+/// `xs`, which is ascending, with `id` added in order.
 fn ascending_with(xs: List<Int>, id: Int) -> List<Int> =
   if at_or_minus(xs, xs.len() - 1) < id { xs.push(id) }
   else if at_or_minus(xs, first_not_below(xs, id, 0, xs.len())) == id { xs }
   else { xs.filter(|x: Int| x < id).push(id).concat(xs.filter(|x: Int| x > id)) }
 
-/// The place in `xs`, ascending, of the first of the `final_trail` from `i` on not below `id`.
+/// The position in `xs`, which is ascending, of the first of the `final_trail` elements from `i`
+/// on that is not below `id`.
 fn first_not_below(xs: List<Int>, id: Int, i: Int, final_trail: Int) -> Int =
   if final_trail <= 0 || at_or_minus(xs, i) >= id { i }
   else { first_not_below(xs, id, i + 1, final_trail - 1) }
@@ -706,7 +715,8 @@ fn set_state<v>(s: Region<v>, id: Int, state: State<v>) -> Region<v> =
 fn block_task<v>(s: Region<v>, id: Int, wait: Wait<v>, site: Site) -> Region<v> =
   stopped_running(s, id, Blocked(wait, site))
 
-/// The running task `id` now `state`, in which it may not run, giving control back.
+/// Puts the running task `id` in `state`, in which it cannot run, and gives control back to the
+/// loop.
 fn stopped_running<v>(s: Region<v>, id: Int, state: State<v>) -> Region<v> = {
   let final_trail = match s.policy { Seeded -> unready(s, id), Production -> s };
   { ..set_state(final_trail, id, state), current: None }
@@ -714,39 +724,39 @@ fn stopped_running<v>(s: Region<v>, id: Int, state: State<v>) -> Region<v> = {
 
 fn add_command<v>(s: Region<v>, order: Command) -> Region<v> = { ..s, orders: s.orders.push(order) }
 
-/// The step the running task took ends at `site`, where it touched nothing before.
+/// Places the running task's step at `site`, if it accessed nothing before.
 fn set_step_site<v>(s: Region<v>, site: Site) -> Region<v> =
   match s.policy { Production -> s, Seeded -> set_last_step_site(s, site) }
 
-/// `s` with its last step placed at `site` where it was placed nowhere yet.
+/// `s` with its last step placed at `site`, if it was not placed yet.
 fn set_last_step_site<v>(s: Region<v>, site: Site) -> Region<v> =
   { ..s, step: with_site(s.step, site) }
 
-/// `step` placed at `site` where it was placed nowhere yet.
+/// `step` placed at `site`, if it was not placed yet.
 fn with_site(step: Option<Step>, site: Site) -> Option<Step> =
   match step {
     Some(st) -> match st.site { Some(_) -> Some(st), None -> Some({ ..st, site: Some(site) }) },
     None -> None,
   }
 
-/// `step` touching `access` too, where there is a step.
+/// `step` with `access` added, if there is a step.
 fn step_touched(step: Option<Step>, access: Access) -> Option<Step> =
   match step { Some(st) -> Some(touching(st, access)), None -> None }
 
-/// `step` touching `access` too.
+/// `step` with `access` added.
 fn touching(step: Step, access: Access) -> Step =
   { ..step, accesses: trail::with_access(step.accesses, access) }
 
-/// `access` among what the step that made this request touched, made at `site`.
+/// Adds `access`, made at `site`, to what the step that made this request accessed.
 fn record_access<v>(s: Region<v>, access: Access, site: Site) -> Region<v> =
   match s.policy { Production -> s, Seeded -> touched_step(s, access, site) }
 
-/// `s` with `access` among what its last step touched, the step placed at `site` where it was
-/// placed nowhere yet.
+/// `s` with `access` added to its last step, and the step placed at `site` if it was not placed
+/// yet.
 fn touched_step<v>(s: Region<v>, access: Access, site: Site) -> Region<v> =
   { ..s, step: step_touched(with_site(s.step, site), access) }
 
-/// An operation on channel `chan` among what the step that made it touched, made at `site`.
+/// Adds an operation on channel `chan`, made at `site`, to what the step that made it accessed.
 fn record_channel_access<v>(s: Region<v>, chan: Int, site: Site) -> Region<v> =
   match s.policy {
     Production -> s,
@@ -756,13 +766,13 @@ fn record_channel_access<v>(s: Region<v>, chan: Int, site: Site) -> Region<v> =
     },
   }
 
-/// What the running task's step performed, each where it was made, among what it touched.
+/// Adds what the running task's step performed, each where it was made, to the step's accesses.
 pub fn record_accesses<v>(r: Region<v>, accesses: List<{ access: Access, at: Site }>) -> Region<v> =
   accesses.fold(r, |acc: Region<v>, a: { access: Access, at: Site }|
     record_access(acc, a.access, a.at))
 
-/// `access` among what the last step task `id` took touched: a cancel is known only once it
-/// happens, and that step could have come after it instead.
+/// Adds `access` to what task `id`'s last step accessed. A cancel is known only once it happens,
+/// and that step could have come after it instead.
 fn record_last_step_access<v>(s: Region<v>, id: Int, access: Access) -> Region<v> / {abort.raise} =
   match s.policy {
     Production -> s,
@@ -789,7 +799,8 @@ fn apply_spawn<v>(s: Region<v>, task: Int, site: Site) -> Region<v> = {
   reply(make_ready(task_born(s, site, stamp), id, Start), task, Spawned(id))
 }
 
-/// `s` with a task more, made at `site` with the clock `stamp` in `simulate`, not yet ready.
+/// `s` with one more task, created at `site` with the clock `stamp` in `simulate`, and not yet
+/// ready.
 fn task_born<v>(s: Region<v>, site: Site, stamp: List<Int>) -> Region<v> =
   {
     ..s,
@@ -839,7 +850,7 @@ fn apply_join<v>(
     }
   }
 
-/// Stops `t` where it stands, as `task.cancel` does: answers whether it stopped anything.
+/// Stops `t` wherever it is, as `task.cancel` does, and replies whether it stopped anything.
 fn apply_cancel<v>(
   s: Region<v>,
   task: Int,
@@ -882,9 +893,9 @@ fn apply_cancel<v>(
     }
   }
 
-/// Task `id` stopped by `by`, which it waited on or ran after: it lets go of its wait and only
-/// unwinds when it next runs. A task in a bracket's `acquire` keeps an answer it was given, one in
-/// a `release` its wait too, and the cancel lands when it leaves them.
+/// Stops task `id` on behalf of `by`, which it waited on or ran after. It abandons its wait, and
+/// only unwinds when it next runs. A task in a bracket's `acquire` keeps a reply it was given, a
+/// task in a `release` also keeps its wait, and the cancel takes effect when it leaves them.
 fn stop_task<v>(
   s: Region<v>,
   by: Int,
@@ -899,7 +910,7 @@ fn stop_task<v>(
       let s1 = task_set(s, id, |x: Member<v>| { ..x, cancelled: true });
       let shielded = shields.acquiring > 0 || shields.releasing > 0;
       match state {
-        // A production region keeps no task that has ended, so its handle says so before it goes.
+        // A production region keeps no ended task, so its handle records the end before it goes.
         Ready(Start) -> match s1.policy {
           Seeded -> set_state(add_command(s1, Discard(id)), id, Dropped),
           Production ->
@@ -914,7 +925,8 @@ fn stop_task<v>(
     },
   }
 
-/// Task `id` taken off what `wait` held it on, which a step on it is ordered against.
+/// Removes task `id` from what `wait` held it on, recording an access so a step on that is ordered
+/// against this.
 fn release_wait<v>(s: Region<v>, id: Int, wait: Wait<v>, site: Site) -> Region<v> / {abort.raise} =
   match wait {
     Sleeping(until) -> { ..s, timers: s.timers.remove((until, id)) },
@@ -941,7 +953,7 @@ fn remove_joiner<v>(s: Region<v>, on: Int, joiner: Int) -> Region<v> =
       { ..t, joiners: t.joiners.filter(|j: Int| j != joiner) }),
   }
 
-/// Task `id` out of each of `chans`' queues.
+/// Removes task `id` from each of `chans`' waiting lists.
 fn remove_waiter<v>(s: Region<v>, id: Int, chans: List<Int>) -> Region<v> =
   chans.fold(s, |acc: Region<v>, c: Int|
     {
@@ -954,8 +966,9 @@ fn remove_waiter<v>(s: Region<v>, id: Int, chans: List<Int>) -> Region<v> =
         }),
     })
 
-/// A wait `task` just began let go, where a cancel held back for the `acquire` it stands in came
-/// first: there an operation that answers keeps its answer, and one that waits does not start.
+/// Cancels a wait `task` just began, if a cancel held back during the `acquire` it is inside came
+/// first. In that case an operation that replied keeps its reply, and one that waits does not
+/// start.
 fn unwind_if_cancelled<v>(
   s: Region<v>,
   task: Int,
@@ -977,8 +990,8 @@ fn unwind_if_cancelled<v>(
     }
   }
 
-/// The running task cancelled, or cancelled before it ran, has ended: an await of it hears it was,
-/// and a join raises.
+/// Marks a cancelled task, whether running or never started, as ended. An await of it returns that
+/// it was cancelled, and a join raises.
 fn finish_cancel<v>(s: Region<v>, id: Int) -> Region<v> / {abort.raise} = {
   let joiners = match s.tasks.get(id) { Some(t) -> Some(t.joiners), None -> None };
   match joiners {
@@ -1017,7 +1030,8 @@ fn finish_cancel<v>(s: Region<v>, id: Int) -> Region<v> / {abort.raise} = {
   }
 }
 
-/// The running task answered, which its handle holds: each task waiting on it hears so.
+/// The running task returned, and its handle stores the result. Each task waiting on it is
+/// notified.
 fn finish_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
   let joiners = match s.tasks.get(task) { Some(t) -> Some(t.joiners), None -> None };
   match joiners {
@@ -1056,9 +1070,9 @@ fn finish_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
   }
 }
 
-/// The running task's raise leaves it for the handlers around the region: every other task still
-/// running is cancelled, so each releases the brackets it stands in, and the raise lands once
-/// they have ended. A second raise while one leaves goes nowhere.
+/// The running task's raise leaves it for the handlers around the region. Every other task still
+/// running is cancelled, so each releases the brackets it is inside, and the raise lands once they
+/// have ended. A second raise while one is leaving is dropped.
 fn raise_from_task<v>(
   s: Region<v>,
   task: Int,
@@ -1104,7 +1118,8 @@ fn raise_from_task<v>(
   }
 }
 
-/// The running task failed at run time: the region ends, the failure noted with where it fell.
+/// The running task failed at run time: the region ends, and the failure is noted with where it
+/// happened.
 fn fail_task<v>(s: Region<v>, task: Int) -> Region<v> / {abort.raise} = {
   let live = max(s.unfinished - 1, 0);
   let note = if s.next_id <= 1 { None } else {
@@ -1174,16 +1189,17 @@ fn ticket_set<v>(s: Region<v>, token: Int, task: Int) -> Region<v> =
 
 // --- Channels --------------------------------------------------------------------
 
-/// Why `c` names no channel of this region, where it names none: one of another region's, or an id
-/// this region never made.
+/// Why `c` does not refer to a channel of this region, if it does not: it belongs to another
+/// region, or its id was never created here.
 fn channel_error<v>(s: Region<v>, c: ChanRef, site: Site) -> Option<Failure> =
   if c.region != s.id { Some(foreign_channel(site, c.id)) }
   else if c.id >= s.next_chan || c.id < 0 {
     Some(internal_error(s, chan_name(c.id) ++ " is not a channel of this region"))
   } else { None }
 
-/// Where a send that does not wait goes: nowhere, refused by a closed channel or one the region no
-/// longer holds; to the receiver waiting longest; into the queue while it has room; or not yet.
+/// Where a send goes without waiting: nowhere, rejected by a closed channel or one the region no
+/// longer has; to the receiver that has waited longest; into the queue while it has room; or not
+/// yet.
 type SendRoute = | Closed | ToReceiver(Int) | Queued | SenderWaits
 
 fn send_route<v>(s: Region<v>, id: Int) -> SendRoute =
@@ -1197,7 +1213,7 @@ fn send_route<v>(s: Region<v>, id: Int) -> SendRoute =
     },
   }
 
-/// `s` once `task`'s send of `value` on channel `id`, which goes as `goes` says, has gone.
+/// `s` after `task`'s send of `value` on channel `id`, which goes where `goes` says, is complete.
 fn complete_send<v>(
   s: Region<v>,
   task: Int,
@@ -1240,7 +1256,7 @@ fn apply_send<v>(
     goes -> reply(complete_send(s, task, id, value, goes), task, Flag(true)),
   }
 
-/// `receiver`, waiting to receive on `chan`, readied with `value`, or with the close.
+/// Readies `receiver`, waiting to receive on `chan`, with `value`, or with the close.
 fn deliver<v>(
   s: Region<v>,
   receiver: Int,
@@ -1286,8 +1302,8 @@ fn deliver<v>(
   }
 }
 
-/// What task `id` waits on: `None` where the region holds no such task, `Some(None)` where it
-/// waits on nothing.
+/// What task `id` waits on: `None` if the region has no such task, `Some(None)` if it waits on
+/// nothing.
 fn wait_of<v>(s: Region<v>, id: Int) -> Option<Option<Wait<v>>> =
   match s.tasks.get(id) {
     Some(t) -> match t.state { Blocked(w, _) -> Some(Some(w)), _ -> Some(None) },
@@ -1305,7 +1321,7 @@ fn sent_value<v>(wait: Option<Option<Wait<v>>>, chan: Int) -> Option<v> =
     _ -> None,
   }
 
-/// `sender`, waiting as `wait` to send on `chan`, readied with whether its value went.
+/// Readies `sender`, waiting as `wait` to send on `chan`, with whether its value was sent.
 fn release_sender<v>(
   s: Region<v>,
   sender: Int,
@@ -1357,9 +1373,9 @@ fn index_where<a>(xs: List<a>, ok: (a) -> Bool) -> Option<Int> =
       None -> match xs.at(i) { Some(x) -> if ok(x) { Some(i) } else { None }, None -> None },
     })
 
-/// Where a receive that does not wait takes from: the oldest value queued; the sender waiting
-/// longest, where nothing is queued; nothing, from a channel closed and spent or one the region no
-/// longer holds; or nowhere yet.
+/// Where a receive takes from without waiting: the oldest queued value; the sender that has waited
+/// longest, if nothing is queued; nothing, from a channel that is closed and empty or one the
+/// region no longer has; or nowhere yet.
 type ReceiveRoute<v> =
   | FromQueue
   | FromSender(Int, Option<Option<Wait<v>>>)
@@ -1377,7 +1393,7 @@ fn receive_route<v>(s: Region<v>, id: Int) -> ReceiveRoute<v> =
     },
   }
 
-/// What a receive on channel `id` that goes as `goes` says takes.
+/// The value a receive on channel `id` takes, from where `goes` says.
 fn received_value<v>(s: Region<v>, id: Int, goes: ReceiveRoute<v>) -> Option<v> =
   match goes {
     FromQueue -> match s.channels.get(id) {
@@ -1388,7 +1404,7 @@ fn received_value<v>(s: Region<v>, id: Int, goes: ReceiveRoute<v>) -> Option<v> 
     _ -> None,
   }
 
-/// `s` once `task`'s receive on channel `id`, which goes as `goes` says, has taken what it takes.
+/// `s` after `task`'s receive on channel `id`, from where `goes` says, is complete.
 fn complete_receive<v>(
   s: Region<v>,
   task: Int,
@@ -1424,8 +1440,8 @@ fn complete_receive<v>(
     _ -> s,
   }
 
-/// `s` with the room `by`'s receive made on channel `id` taking the value of the sender that waited
-/// longest, which goes.
+/// `s` with the room that `by`'s receive made on channel `id` filled by the value of the sender
+/// that has waited longest, which is then released.
 fn refilled<v>(s: Region<v>, id: Int, by: Int) -> Region<v> / {abort.raise} = {
   let sender = match s.channels.get(id) { Some(ch) -> ch.senders.at(0), None -> None };
   match sender {
@@ -1467,15 +1483,15 @@ fn apply_receive<v>(s: Region<v>, task: Int, id: Int, site: Site) -> Region<v> /
     },
   }
 
-/// Ends sending: each waiting receiver hears `None` and each waiting sender `false`, while what
-/// was queued stays to be received.
+/// Closes the channel to sending. Each waiting receiver gets `None` and each waiting sender
+/// `false`, while queued values remain to be received.
 fn apply_close<v>(s: Region<v>, task: Int, id: Int) -> Region<v> / {abort.raise} = {
   let shut = chan_set(s, id, |c: Channel<v>| { ..c, closed: true });
   let wait_description = match shut.channels.get(id) {
     Some(ch) -> ch.receivers.len() + ch.senders.len(),
     None -> 0,
   };
-  // One at a time off the live queues: a select may wait on both sides of one channel.
+  // One waiter at a time off the live queues, since a select may wait on both sides of a channel.
   let drained = iterate(shut, wait_description + 1, |acc: Region<v>| {
     let next = match acc.channels.get(id) {
       None -> None,
@@ -1518,8 +1534,8 @@ fn apply_close<v>(s: Region<v>, task: Int, id: Int) -> Region<v> / {abort.raise}
   reply(remove_if_spent(drained, id), task, Nothing)
 }
 
-/// The first arm, in the order given, that can go without waiting goes; with none, `wait` waits on
-/// every arm for the first another task makes ready.
+/// Completes the first arm, in the order given, that can go without waiting. If none can and
+/// `wait` is true, waits on every arm for the first one another task makes ready.
 fn apply_select<v>(
   s: Region<v>,
   task: Int,
@@ -1587,7 +1603,8 @@ fn apply_select<v>(
   }
 }
 
-/// A closed channel with nothing queued and nobody waiting answers as a spent one, which it is.
+/// Removes a closed channel with nothing queued and nobody waiting. Operations on it then behave
+/// as on an exhausted channel, which it is.
 fn remove_if_spent<v>(s: Region<v>, id: Int) -> Region<v> = {
   let spent = match s.channels.get(id) {
     Some(ch) ->
@@ -1605,7 +1622,7 @@ fn channel_removed<v>(s: Region<v>, id: Int) -> Region<v> = { ..s, channels: s.c
 fn stamp_of<v>(s: Region<v>, id: Int) -> List<Int> =
   match s.stamps.at(id) { Some(stamp) -> stamp, None -> [] }
 
-/// `into` has observed what `from` had, in `simulate`.
+/// In `simulate`, records that `into` has observed everything `from` had.
 fn absorbed<v>(s: Region<v>, into: Int, from: Int) -> Region<v> / {abort.raise} =
   match s.policy { Production -> s, Seeded -> stamp_absorbed(s, into, stamp_of(s, from)) }
 
@@ -1630,13 +1647,15 @@ fn stamps_joined(
     None -> stamps,
   }
 
-/// Whether `mine` counts at least what `theirs` does of each of the `final_trail` tasks from task `i` on.
+/// Whether `mine` counts at least as many steps as `theirs` for each of the `final_trail` tasks
+/// from task `i` on.
 fn seen_all(mine: List<Int>, theirs: List<Int>, i: Int, final_trail: Int) -> Bool =
   if final_trail <= 0 { true }
   else if at_or_zero(theirs, i) > at_or_zero(mine, i) { false }
   else { seen_all(mine, theirs, i + 1, final_trail - 1) }
 
-/// `mine` with each of the `final_trail` tasks' counts from task `i` on the greater of its and `theirs`'s.
+/// `mine` with the count of each of the `final_trail` tasks from task `i` on set to the greater of
+/// its own and `theirs`.
 fn joined_from(
   mine: List<Int>,
   theirs: List<Int>,
@@ -1675,7 +1694,7 @@ fn internal_error<v>(r: Region<v>, message: String) -> Failure =
     notes: [],
   }
 
-/// Each blocked task, ascending, beside where it waits and on what.
+/// Each blocked task, ascending, with where it waits and on what.
 fn blocked_labels<v>(r: Region<v>, now: Option<Int>) -> List<Label> =
   r.tasks.fold([], |acc: List<Label>, id: Int, t: Member<v>|
     match t.state {
@@ -1780,11 +1799,11 @@ fn divergence<v>(r: Region<v>, point: Int, choice: Int, enabled: Int) -> Failure
     ],
   }
 
-/// How many times in a row a production region's park may wake with no ticket answered and no
-/// stop before that is the host's defect.
+/// How many times in a row a production region's park may wake with no ticket completed and no
+/// stop before it counts as a bug in the host.
 pub fn max_spurious_wakeups() -> Int = 1024
 
-/// What a host whose park kept waking for nothing is.
+/// The failure for a host whose park kept waking for no reason.
 pub fn too_many_spurious_wakeups<v>(r: Region<v>) -> Failure =
   {
     code: "E0505",
@@ -1866,7 +1885,7 @@ fn joined_cancelled(site: Site, task: Int) -> Failure =
     ],
   }
 
-/// What a `task.channel` of a negative capacity raises in the task that asked.
+/// What a `task.channel` of a negative capacity raises in the requesting task.
 fn negative_capacity(site: Site, capacity: Int) -> Failure =
   {
     code: "E0502",
@@ -1875,7 +1894,7 @@ fn negative_capacity(site: Site, capacity: Int) -> Failure =
     notes: ["a capacity is how many sent values may wait for a receiver; `0` is a rendezvous"],
   }
 
-/// What a `random.below` of a bound below one raises in the task that asked.
+/// What a `random.below` of a bound below one raises in the requesting task.
 fn invalid_bound(site: Site, bound: Int) -> Failure =
   {
     code: "E0502",
@@ -1897,53 +1916,55 @@ fn invalid_cancel(site: Site, target: Int, task: Int) -> Failure =
     ],
   }
 
-// --- The runtime's half -----------------------------------------------------------------
+// --- The runtime's part -----------------------------------------------------------------
 
-/// A value of any type held beside its type's descriptor: what crosses between a perform of an
-/// operation generic in its own type parameters and the clause that answers it (GUIDE §6.1).
+/// A value of any type stored with its type's descriptor: what is marshalled between a perform of
+/// an operation that is generic in its own type parameters and the clause that handles it.
 pub extern type Kept
 
-/// `x`, kept.
+/// `x` wrapped as a `Kept`.
 extern fn keep<a>(x: a) -> Kept
 
-/// What `k` keeps, which is a value of `a`: the run fails where it keeps another type's.
+/// The value of type `a` that `k` wraps. The run fails if `k` wraps a value of another type.
 extern fn open<a>(k: Kept) -> a
 
-/// The stacks of one region's tasks, the switch between each task and the region's loop, and what
-/// each task asked and heard last; every stack goes back as the last holder lets go of it.
+/// The stacks of one region's tasks, the switch between each task and the region's loop, and each
+/// task's last request and reply. Each stack is freed when its last owner releases it.
 pub extern type Stacks
 
-/// A task's body and the words its row takes as its maker held them, until a region starts it.
+/// A task's body and the words its row takes, as its creator had them, until a region starts it.
 pub extern type TaskBody
 
-/// Stacks for a region opened here, `seeded` for `simulate`, the region written at the site `root`,
-/// `start` and `end` name.
+/// Stacks for a region opened here, `seeded` for `simulate`, for the region written at the site
+/// that `root`, `start` and `end` give.
 extern fn stacks_opened(seeded: Bool, root: Int, start: Int, end: Int) -> Stacks / {native.write}
 
 /// The id of `s`'s region among the entry's regions.
 extern fn stacks_region(s: Stacks) -> Int / {native.read}
 
-/// Where a region open on the context before `s`'s was written, a seeded one's or else a production
-/// one's: the site's root, start or end by `which`, a root of -1 where none is.
+/// Where the region opened on the context before `s`'s was written, a seeded one's or else a
+/// production one's: the site's root, start or end by `which`, with a root of -1 if there is none.
 extern fn stacks_outer(s: Stacks, which: Int) -> Int / {native.read}
 
-/// `body`, which the program's own work runs from: its costs go on from where it left them.
+/// `body`, from which the program's own work runs: its cost counting continues from where it
+/// stopped.
 extern fn program_resumed<a>(body: a) -> a
 
-/// `answer`, kept, the program's own work having ended with it: what follows is the scheduler's.
+/// `answer` wrapped as a `Kept`, with the program's own work ending there: what follows is the
+/// scheduler's work.
 extern fn program_paused<a>(answer: a) -> Kept
 
-/// What `body` answers, kept, as a task's body runs it: the program's own work in it counted, and the
-/// scheduler's around it not.
+/// What `body` returns, wrapped as a `Kept`, when run as a task's body. The program's own work in
+/// it is counted, and the scheduler's work around it is not.
 fn task_ran<a | e>(body: keep () -> a / e) -> Kept / e = program_paused(program_resumed(body)())
 
-/// A task's handle at the type its perform names it at, or its clause does: the same handle.
+/// A task's handle at the type its perform or its clause uses: the same handle.
 extern fn task_as<a, b>(t: Task<a>) -> Task<b>
 
-/// A channel's handle at the type its perform names it at, or its clause does: the same handle.
+/// A channel's handle at the type its perform or its clause uses: the same handle.
 extern fn chan_as<a, b>(c: Chan<a>) -> Chan<b>
 
-/// What the entry's last seeded region left of its trail (`trail::encode_saved_trail`), empty before its
+/// The trail the entry's last seeded region left (`trail::encode_saved_trail`), empty before its
 /// first.
 extern fn trail_entered() -> Bytes / {native.read}
 
@@ -1956,30 +1977,33 @@ extern fn seed_path() -> Bytes / {native.read}
 /// The scheduling points the entry's seeded regions may take.
 extern fn seeded_steps() -> Int / {native.read}
 
-/// Keeps `final_trail` for the entry's next region and `interleaving` as its outcome's.
+/// Stores `final_trail` for the entry's next region, and `interleaving` as its outcome's
+/// interleaving.
 extern fn trail_left(final_trail: Bytes, interleaving: Bytes) -> Unit / {native.write}
 
-/// The site `root`, `start` and `end` name as an outcome places it (`trail::location_of`).
+/// The location of the site that `root`, `start` and `end` give, as an outcome reports it
+/// (`trail::location_of`).
 extern fn site_placed(root: Int, start: Int, end: Int) -> Bytes
 
-/// What the running seeded step touched since this was last asked (`trail::touches_of`).
+/// What the running seeded step accessed since this was last called (`trail::touches_of`).
 extern fn footprint_taken() -> Bytes / {native.write}
 
-/// How many accesses the running seeded step touched since `footprint_taken` was last asked.
+/// How many accesses the running seeded step made since `footprint_taken` was last called.
 extern fn footprint_held() -> Int / {native.read}
 
-/// `body`, to answer into `t`, beside the words its row takes as the caller holds them.
+/// `body`, which returns into `t`, with the words its row takes as the caller has them.
 extern fn task_body<| e>(t: Task<Kept>, body: keep () -> Kept / e) -> TaskBody
 
-/// Task `id`, to run `b`'s body the first time the loop resumes it, its handle numbered so.
+/// Creates task `id`, which runs `b`'s body the first time the loop resumes it, and numbers its
+/// handle `id`.
 extern fn task_started(s: Stacks, id: Int, b: TaskBody) -> Unit / {native.write}
 
-/// Runs task `id` until it asks its loop something, handing it `code` and `n`, a code of -1 to
-/// unwind after a cancel: the code of what it asked, never below 0, or how its body ended, -1
-/// answering, -2 unwound, -3 raising what nothing in it answered, -4 failed.
+/// Runs task `id` until it makes a request of its loop, passing it `code` and `n`, where a code of
+/// -1 unwinds after a cancel. Returns the code of the request, never below 0, or how its body
+/// ended: -1 returned, -2 unwound, -3 raised what nothing in it handled, -4 failed.
 extern fn task_resumed(s: Stacks, id: Int, code: Int, n: Int) -> Int / {native.write}
 
-/// `task_resumed`, handing the task `kept` as well.
+/// `task_resumed`, passing the task `kept` as well.
 extern fn task_resumed_kept(
   s: Stacks,
   id: Int,
@@ -1988,23 +2012,25 @@ extern fn task_resumed_kept(
   kept: Kept,
 ) -> Int / {native.write}
 
-/// `task_resumed`, the task raising at its perform the failure `failure_bytes` wrote.
+/// `task_resumed`, with the task raising at its perform the failure that `failure_bytes` encoded.
 extern fn task_resumed_raising(s: Stacks, id: Int, failure: Bytes) -> Int / {native.write}
 
-/// The `i`th number of what the task last resumed asked.
+/// The `i`th number of the last resumed task's request.
 extern fn asked_number(s: Stacks, i: Int) -> Int / {native.read}
 
-/// Where the task last resumed stood as it asked: the site's root, start or end by `i`.
+/// Where the last resumed task was when it made its request: the site's root, start or end by
+/// `i`.
 extern fn asked_site(s: Stacks, i: Int) -> Int / {native.read}
 
-/// The value the task last resumed handed with what it asked, taken.
+/// Takes the value the last resumed task passed with its request.
 extern fn asked_kept(s: Stacks) -> Kept / {native.write}
 
-/// The running task asks its loop `code`, `a` and `b`, placed where the perform its clause answers
-/// stood, and waits: the code the loop resumes it with. Resumed to unwind or to raise, it does so.
+/// The running task sends its loop the request `code`, `a` and `b`, placed where the perform its
+/// clause handles was, and waits. Returns the code the loop resumes it with. If resumed to unwind
+/// or to raise, it does so.
 extern fn task_yielded(s: Stacks, code: Int, a: Int, b: Int) -> Int / {native.write}
 
-/// `task_yielded`, handing the loop `kept` as well.
+/// `task_yielded`, passing the loop `kept` as well.
 extern fn task_yielded_kept(
   s: Stacks,
   code: Int,
@@ -2016,84 +2042,84 @@ extern fn task_yielded_kept(
 /// The number the loop resumed the running task with.
 extern fn heard_number(s: Stacks) -> Int / {native.read}
 
-/// The value the loop resumed the running task with, taken.
+/// Takes the value the loop resumed the running task with.
 extern fn heard_kept(s: Stacks) -> Kept / {native.write}
 
-/// Lets go of task `id`: its stack, a body it never ran, and the region's hold of its handle.
+/// Frees task `id`: its stack, a body it never ran, and the region's reference to its handle.
 extern fn task_freed(s: Stacks, id: Int) -> Unit / {native.write}
 
-/// Puts back how task `id`'s body left the context where it did not answer, `note` noted where it
-/// is not empty: whether it left anything.
+/// Restores the context that task `id`'s body left without returning, adding `note` if it is not
+/// empty. Returns whether the body left anything.
 extern fn task_restored(s: Stacks, id: Int, note: String) -> Bool / {native.write}
 
-/// The brackets task `id` stands in, by `which`: its `acquire`s, its `release`s, and 1 where a
-/// cancel waits for it to leave them.
+/// The brackets task `id` is inside, by `which`: its `acquire`s, its `release`s, and 1 if a cancel
+/// waits for it to leave them.
 extern fn task_shields(s: Stacks, id: Int, which: Int) -> Int / {native.read}
 
-/// Whether a cancel of task `id` waits for it to leave the brackets it stands in.
+/// Sets whether a cancel of task `id` waits for it to leave the brackets it is inside.
 extern fn task_held_back(s: Stacks, id: Int, stop_task: Bool) -> Unit / {native.write}
 
-/// Records on task `id`'s handle that it ended cancelled.
+/// Records on task `id`'s handle that it was cancelled.
 extern fn task_settled(s: Stacks, id: Int) -> Unit / {native.write}
 
-/// A handle of a task of region `region`, numbered as the region starts it.
+/// A handle for a task of region `region`, numbered when the region starts it.
 extern fn task_made(region: Int) -> Task<Kept>
 
-/// What `t` says, by `which`: its region, its id, or how it ended, 0 not yet, 1 answering, 2
-/// cancelled.
+/// A field of `t`, by `which`: its region, its id, or how it ended (0 not yet, 1 returned, 2
+/// cancelled).
 extern fn task_said(t: Task<Kept>, which: Int) -> Int / {native.read}
 
-/// What the task `t` names answered; the run fails where it has not.
+/// The result of the task `t` refers to. The run fails if it has not returned.
 extern fn task_answer(t: Task<Kept>) -> Kept / {native.read}
 
 /// A handle of channel `id` of region `region`.
 extern fn chan_made(region: Int, id: Int) -> Chan<Kept>
 
-/// What `c` says, by `which`: its region or its id.
+/// A field of `c`, by `which`: its region or its id.
 extern fn chan_said(c: Chan<Kept>, which: Int) -> Int
 
-/// Fails the run with the region's failure `failure_bytes` wrote.
+/// Fails the run with the region's failure that `failure_bytes` encoded.
 extern fn region_failed(failure: Bytes) -> Unit / {native.write}
 
-/// Has `tickets_answered` say the ticket of `token` once it is answered: 1, or 0 with the run
-/// failed for a ticket the run did not hand out.
+/// Makes `tickets_answered` report the ticket for `token` once it is completed. Returns 1, or 0
+/// with the run failed for a ticket the run did not issue.
 extern fn ticket_watch(token: Int) -> Int / {native.write}
 
-/// The watched tickets answered and not yet taken, ascending, each token eight bytes, the least
+/// The watched tickets completed and not yet taken, ascending, each token eight bytes, least
 /// significant first.
 extern fn tickets_answered() -> Bytes / {native.read}
 
-/// Waits until a watched ticket is answered, the run is told to stop, or the run's clock reaches
-/// `deadline` where it is not below 0: 1, or 0 with the run failed where it watches nothing and has
-/// no deadline, which nothing would end.
+/// Waits until a watched ticket is completed, the run is told to stop, or the run's clock reaches
+/// `deadline` if it is not below 0. Returns 1, or 0 with the run failed if it watches nothing and
+/// has no deadline, since nothing would end the wait.
 extern fn tickets_park(deadline: Int) -> Int / {native.read}
 
 /// The run's clock: nanoseconds since it began.
 extern fn host_now() -> Int / {native.read}
 
-/// Notes what the run holds as its root's body returns, before the region whose stacks are `s`
-/// drains its other tasks: `scheduled` tasks it still holds, and the stacks it keeps.
+/// Records what the run still has when its root's body returns, before the region whose stacks are
+/// `s` drains its other tasks: `scheduled` tasks still present, and the stacks it keeps.
 extern fn root_returned(s: Stacks, scheduled: Int) -> Unit / {native.write}
 
-/// 1 where the run has been told to stop, else 0.
+/// 1 if the run has been told to stop, else 0.
 extern fn run_stopping() -> Int / {native.read}
 
-/// 1, with the run failed saying so, where its drain after a stop has run out of time; else 0.
+/// 1, with the run failed and reporting it, if its drain after a stop has run out of time; else 0.
 extern fn run_drained() -> Int / {native.write}
 
-// --- How a perform crosses ------------------------------------------------------------------
+// --- How a perform is marshalled ------------------------------------------------------------
 
-// A perform of a `task` operation at a type other than `Kept` is a call of its crossing here: each
-// value of the operation's type parameter crosses kept, a function answering one is wrapped to
-// keep what it answers, and an answer holding one is opened. A crossing's own perform is at `Kept`,
-// typed so where nothing else fixes its type: the emitter refuses a perform here at another type,
-// which would call its own crossing.
+// A perform of a `task` operation at a type other than `Kept` becomes a call of its marshalling
+// function here. Each value of the operation's type parameter is wrapped as a `Kept`, a function
+// returning one is wrapped to wrap its result, and a result containing one is unwrapped. Each
+// marshalling function's own perform is at `Kept`, annotated where nothing else fixes its type:
+// the emitter rejects a perform here at another type, which would call itself.
 
-/// `task.spawn(body)` at `a`: the body's answer kept.
+/// `task.spawn(body)` at `a`, with the body's result wrapped.
 pub fn crossing_spawn<a | e>(body: keep () -> a / e) -> Task<a> / {task.spawn | e} =
   task_as(task.spawn(|| task_ran(body)))
 
-/// `task.join(t)` at `a`: the answer opened.
+/// `task.join(t)` at `a`, with the result unwrapped.
 pub fn crossing_join<a>(t: Task<a>) -> a / {task.join, abort.raise} = open(task.join(task_as(t)))
 
 /// `task.cancel(t)` at `a`.
@@ -2102,7 +2128,7 @@ pub fn crossing_cancel<a>(t: Task<a>) -> Bool / {task.cancel} = {
   task.cancel(kept)
 }
 
-/// `task.await(t)` at `a`: an answer opened.
+/// `task.await(t)` at `a`, with a result unwrapped.
 pub fn crossing_await<a>(t: Task<a>) -> Option<a> / {task.await} =
   match task.await(task_as(t)) { Some(k) -> Some(open(k)), None -> None }
 
@@ -2112,10 +2138,10 @@ pub fn crossing_channel<a>(capacity: Int) -> Chan<a> / {task.channel, abort.rais
   chan_as(kept)
 }
 
-/// `task.send(c, x)` at `a`: `x` kept.
+/// `task.send(c, x)` at `a`, with `x` wrapped.
 pub fn crossing_send<a>(c: Chan<a>, x: a) -> Bool / {task.send} = task.send(chan_as(c), keep(x))
 
-/// `task.recv(c)` at `a`: what it receives opened.
+/// `task.recv(c)` at `a`, with what it receives unwrapped.
 pub fn crossing_recv<a>(c: Chan<a>) -> Option<a> / {task.recv} =
   match task.recv(chan_as(c)) { Some(k) -> Some(open(k)), None -> None }
 
@@ -2125,7 +2151,8 @@ pub fn crossing_close<a>(c: Chan<a>) -> Unit / {task.close} = {
   task.close(kept)
 }
 
-/// `task.select(arms, wait)` at `a`: each value an arm sends kept, and the one received opened.
+/// `task.select(arms, wait)` at `a`, with each value an arm sends wrapped and the one received
+/// unwrapped.
 pub fn crossing_select<a>(
   arms: List<(Chan<a>, Option<a>)>,
   wait: Bool,
@@ -2139,9 +2166,9 @@ pub fn crossing_select<a>(
     None -> None,
   }
 
-// --- What a task asks its loop, and hears ---------------------------------------------------
+// --- Requests and replies -------------------------------------------------------------------
 
-// The code of each request a clause asks its loop with, never below 0.
+// The code of each request a clause sends its loop, never below 0.
 fn spawn_code() -> Int = 0
 fn join_code() -> Int = 1
 fn await_code() -> Int = 2
@@ -2157,16 +2184,16 @@ fn sleep_code() -> Int = 11
 fn next_code() -> Int = 12
 fn below_code() -> Int = 13
 fn seed_code() -> Int = 14
-// The runtime asks this itself, and `sleep_code`, for a host operation or a native's job that waits
-// on the run or its clock; `tasks.rs` names them `ASK_TICKET` and `ASK_SLEEP`.
+// The runtime itself sends this and `sleep_code` for a host operation or a native's job that
+// waits on the run or its clock; `tasks.rs` calls them `ASK_TICKET` and `ASK_SLEEP`.
 fn ticket_code() -> Int = 15
 
-// How a task's body ended, as `task_resumed` answers it: below 0, as no request's code is.
+// How a task's body ended, as `task_resumed` returns it: below 0, where no request code is.
 fn body_returned() -> Int = 0 - 1
 fn body_unwound() -> Int = 0 - 2
 fn body_raised() -> Int = 0 - 3
 
-// How the loop resumes a task: to start or unwind, or with what it heard, by code and number.
+// How the loop resumes a task: to start or unwind, or with a reply, by code and number.
 fn resume_start() -> Int = 0
 fn resume_unwind() -> Int = 0 - 1
 fn nothing_reply_code() -> Int = 1
@@ -2176,12 +2203,12 @@ fn received_reply_code() -> Int = 4
 fn closed_reply_code() -> Int = 5
 fn selected_reply_code() -> Int = 6
 
-/// The running task asks its loop `code` about the task `t`: its id, then its region and how its
-/// handle says it ended as one number.
+/// The running task sends its loop request `code` about the task `t`: its id, then its region and
+/// how its handle records it ended, packed in one number.
 fn request_on_task(s: Stacks, code: Int, t: Task<Kept>) -> Int / {native.read, native.write} =
   task_yielded(s, code, task_said(t, 1), task_said(t, 0) * 4 + task_said(t, 2))
 
-/// The brackets task `id` stands in.
+/// The brackets task `id` is inside.
 fn shields_of(s: Stacks, id: Int) -> Shields / {native.read} =
   {
     acquiring: task_shields(s, id, 0),
@@ -2189,13 +2216,13 @@ fn shields_of(s: Stacks, id: Int) -> Shields / {native.read} =
     stopping: task_shields(s, id, 2) != 0,
   }
 
-/// The brackets task `id`, which just asked, stands in where a cancel waits for it to leave them:
-/// all a request reads of them.
+/// The brackets task `id`, which just made a request, is inside, if a cancel waits for it to leave
+/// them. This is all a request reads of them.
 fn waited_shields(s: Stacks, id: Int) -> Shields / {native.read} =
   if task_shields(s, id, 2) == 0 { { acquiring: 0, releasing: 0, stopping: false } }
   else { shields_of(s, id) }
 
-/// The task a request names, by the numbers it asked with.
+/// The task a request refers to, from the numbers it was sent with.
 fn requested_task(s: Stacks) -> TaskRef / {native.read} = {
   let b = asked_number(s, 1);
   {
@@ -2205,18 +2232,18 @@ fn requested_task(s: Stacks) -> TaskRef / {native.read} = {
   }
 }
 
-/// The channel a request names, by the numbers it asked with.
+/// The channel a request refers to, from the numbers it was sent with.
 fn requested_channel(s: Stacks) -> ChanRef / {native.read} =
   { region: asked_number(s, 1), id: asked_number(s, 0) }
 
-/// The request the loop just heard from task `id`, `code` its code.
+/// The request the loop just received from task `id`, with code `code`.
 fn request_of(
   s: Stacks,
   r: Region<Kept>,
   id: Int,
   code: Int,
 ) -> Request<Kept> / {abort.raise, native.read, native.write} = {
-  // The codes a program asks most often first: each code read is a call.
+  // The most common codes come first, since each code read is a call.
   if code == yield_code() { Yield }
   else if code == send_code() { Send(requested_channel(s), asked_kept(s)) }
   else if code == recv_code() { Recv(requested_channel(s)) }
@@ -2243,8 +2270,8 @@ fn request_of(
   } else { Failed }
 }
 
-// What a region's clause for each `task` operation answers, the running task of the region whose
-// stacks are `s` asking its loop.
+// How a region's clause handles each `task` operation: the running task of the region whose stacks
+// are `s` sends a request to its loop.
 
 fn request_join(s: Stacks, t: Task<Kept>) -> Kept / {native.read, native.write} = {
   request_on_task(s, join_code(), t);
@@ -2302,7 +2329,7 @@ fn request_select(
   match went { Some(w) -> Some((w.at, w.got)), None -> None }
 }
 
-/// Resumes task `id` as `res`: the code of what it asks next, or of how its body ended.
+/// Resumes task `id` as `res`. Returns the code of its next request, or of how its body ended.
 fn resume_task(s: Stacks, id: Int, res: Resumption<Kept>) -> Int / {abort.raise, native.write} =
   match res {
     Start -> task_resumed(s, id, resume_start(), 0),
@@ -2324,10 +2351,10 @@ fn resume_task(s: Stacks, id: Int, res: Resumption<Kept>) -> Int / {abort.raise,
 
 // --- `simulate`'s region ---------------------------------------------------------------------
 
-/// `simulate`'s region, written at the site `root`, `start` and `end` name: `body` runs as its
-/// task 0, and every task's `task`, `clock`, `random` and `sim` operations are answered here, in
-/// the order the entry's seed takes. A raise that leaves a task lands where the region is written
-/// once every other task has ended; a region that ends otherwise fails the run.
+/// `simulate`'s region, written at the site that `root`, `start` and `end` give. `body` runs as its
+/// task 0, and every task's `task`, `clock`, `random` and `sim` operations are handled here, in the
+/// order the entry's seed picks. A raise that leaves a task lands where the region is written, once
+/// every other task has ended. A region that ends any other way fails the run.
 pub fn simulated<a | e>(
   root: Int,
   start: Int,
@@ -2408,9 +2435,9 @@ fn load_trail() -> trail::SavedTrail / {abort.raise, native.read} =
     },
   }
 
-/// `simulate`'s loop over the stacks `s` of region `id` written at `site`: runs the task each turn
-/// names and applies what it asks, until the region ends; then leaves the trail and answers, fails
-/// the run, or lands the raise that left a task, as the region ended.
+/// `simulate`'s loop over the stacks `s` of region `id` written at `site`. It runs the task each
+/// turn names and applies its requests until the region ends. Then it stores the trail and
+/// returns, fails the run, or lands the raise that left a task, depending on how the region ended.
 fn run_simulation(
   s: Stacks,
   id: Int,
@@ -2469,8 +2496,8 @@ fn run_simulation(
   }
 }
 
-/// `r` with what the running task's step performed, which the runtime wrote as `footprint`, among
-/// what the step touched.
+/// `r` with what the running task's step performed, which the runtime wrote as `footprint`, added
+/// to the step's accesses.
 fn add_footprint(r: Region<Kept>, footprint: Bytes) -> Region<Kept> / {abort.raise} =
   match r.footprints.get(footprint) {
     Some(touches) -> record_accesses(r, touches),
@@ -2480,7 +2507,7 @@ fn add_footprint(r: Region<Kept>, footprint: Bytes) -> Region<Kept> / {abort.rai
     },
   }
 
-/// What a raise that left task `task` notes as the region raises it again, where the region spawned
+/// The note a region adds when it re-raises a raise that left task `task`, if the region spawned
 /// any task: the task, and the seed that replays the run.
 fn raised_note(r: Region<Kept>, task: Int) -> String / {abort.raise} =
   if r.next_id <= 1 { "" } else {
@@ -2488,7 +2515,7 @@ fn raised_note(r: Region<Kept>, task: Int) -> String / {abort.raise} =
       ++ trail::seed_text(r.trail.seed)
   }
 
-/// The region once the loop has done each order it gave since they were last taken.
+/// The region after the loop has carried out each command it issued since they were last taken.
 fn run_commands(s: Stacks, r: Region<Kept>) -> Region<Kept> / {native.write} =
   if r.orders.len() == 0 { r } else {
     let given = take_commands(r);
@@ -2496,7 +2523,7 @@ fn run_commands(s: Stacks, r: Region<Kept>) -> Region<Kept> / {native.write} =
     given.region
   }
 
-/// What the loop does for an order the scheduler gave.
+/// Carries out a command the scheduler issued.
 fn run_command(s: Stacks, o: Command) -> Unit / {native.write} =
   match o {
     HoldBack(id) -> task_held_back(s, id, true),
@@ -2508,10 +2535,10 @@ fn run_command(s: Stacks, o: Command) -> Unit / {native.write} =
 
 // --- The run's region ------------------------------------------------------------------------
 
-/// The run's region, which an entry runs a root that performs `task` under: `body` runs as its task
-/// 0 and every task's `task` operations are answered here, ready tasks first in, first out. A task
-/// that waits on the host or sleeps waits here while the others run. It answers once every task has
-/// ended; a raise that leaves a task lands at the entry once every other task has ended.
+/// The run's region, under which an entry runs a root that performs `task`. `body` runs as its task
+/// 0, and every task's `task` operations are handled here, ready tasks first in, first out. A task
+/// that waits on the host or sleeps waits here while the others run. It returns once every task has
+/// ended. A raise that leaves a task lands at the entry once every other task has ended.
 pub fn scheduled<a | e>(
   body: keep () -> a / {task.write | e},
 ) -> a / {abort.raise, native.read, native.write, diverges | e} = {
@@ -2540,9 +2567,9 @@ pub fn scheduled<a | e>(
   }
 }
 
-/// The run's loop over the stacks `s` of region `id`: runs the task each turn names and applies what
-/// it asks, waiting on the run where none is ready, until the region ends; then answers, fails the
-/// run, or lands the raise that left a task, as the region ended.
+/// The run's loop over the stacks `s` of region `id`. It runs the task each turn names and applies
+/// its requests, waiting on the run when none is ready, until the region ends. Then it returns,
+/// fails the run, or lands the raise that left a task, depending on how the region ended.
 fn host_handler(s: Stacks, id: Int) -> Unit / {abort.raise, native.read, native.write, diverges} = {
   let r = serve_loop(s, production(id, nowhere()));
   match r.turn {
@@ -2561,8 +2588,8 @@ fn host_handler(s: Stacks, id: Int) -> Unit / {abort.raise, native.read, native.
   }
 }
 
-/// The run's loop from `r`, as far as a turn that runs nothing, which the region it answers holds.
-/// A drain after a stop that has run out of time has failed the run, which ends the loop.
+/// The run's loop from `r`, up to a turn that runs nothing, which is stored in the region it
+/// returns. A drain after a stop that has run out of time has failed the run, which ends the loop.
 fn serve_loop(
   s: Stacks,
   r: Region<Kept>,
@@ -2570,7 +2597,7 @@ fn serve_loop(
   if run_drained() != 0 { { ..r, turn: Ends(Drained) } }
   else { serve_turn(s, next_turn(r, { now: host_now(), stopping: run_stopping() != 0 })) }
 
-/// The run's loop past the turn `r` holds.
+/// The run's loop after the turn stored in `r`.
 fn serve_turn(
   s: Stacks,
   r: Region<Kept>,
@@ -2591,7 +2618,7 @@ fn serve_turn(
       if next.next_id > child && code == spawn_code() {
         task_started(s, child, open(asked_kept(s)))
       };
-      // An order records on a handle how its task ended, which freeing the task lets go of.
+      // Run the commands first: one may record how a task ended on its handle, which freeing drops.
       let given = run_commands(s, next);
       if code < 0 && (code == body_returned() || code == body_unwound()) { task_freed(s, task) };
       serve_loop(s, { ..given, spurious_wakeups: 0 })
@@ -2604,10 +2631,10 @@ fn serve_turn(
     _ -> r,
   }
 
-/// The region once a wait on the run ended with `tokens` answered: each task waiting on one of them
-/// readied, the region refused where waits that could only end by an answer woke nothing too many
-/// times in a row. A wait a stop ended is how an idle service hears a signal, and one bounded by
-/// `deadline` ends when it passes, so neither is fruitless.
+/// The region after a wait on the run ended with `tokens` completed. Each task waiting on one of
+/// them is readied. The region fails if waits that could only end by a completion woke nothing too
+/// many times in a row. A wait that a stop ended is how an idle service receives a signal, and one
+/// bounded by `deadline` ends when it passes, so neither counts as a wasted wakeup.
 fn after_park(
   r: Region<Kept>,
   deadline: Option<Int>,
@@ -2622,16 +2649,16 @@ fn after_park(
   } else { { ..woken, spurious_wakeups: parks } }
 }
 
-/// The tokens `bytes` holds, each eight bytes, the least significant first.
+/// The tokens in `bytes`, each eight bytes, least significant first.
 fn tokens_of(bytes: Bytes) -> List<Int> / {abort.raise} =
   range(0, bytes.len() / 8).map(|i: Int|
     Int::of_u32(bytes.u32_le(8 * i)) | Int::of_u32(bytes.u32_le(8 * i + 4)) << 32)
 
 // --- The run's clock -------------------------------------------------------------------------
 
-/// The language's `clock` where no `simulate` answers it, which an entry runs a root that performs
-/// it under: the run's monotonic clock, and a sleep that waits in the run's region where a task of
-/// it sleeps, while the region's other tasks run, and waits the thread anywhere else.
+/// The language's `clock` where no `simulate` handles it, under which an entry runs a root that
+/// performs it. It is the run's monotonic clock. A sleep by a task of the run's region waits in
+/// that region while its other tasks run; anywhere else it blocks the thread.
 pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / {native.read | e} =
   handle {
     go()
@@ -2643,8 +2670,8 @@ pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / {nativ
 /// Nanoseconds on the run's monotonic clock.
 extern fn clock_now() -> Int / {native.read}
 
-/// Waits `nanos` nanoseconds, not at all for a span at or below zero: in the run's region where a
-/// task of it asks, and the thread anywhere else.
+/// Waits `nanos` nanoseconds, or not at all for a span at or below zero. A task of the run's region
+/// waits in the region; anywhere else the thread waits.
 extern fn clock_sleep(nanos: Int) -> Unit / {native.read}
 
 // --- Tests --------------------------------------------------------------------------
@@ -2653,7 +2680,7 @@ fn here() -> RequestContext = { site: nowhere(), shields: unshielded(), now: 0 }
 
 fn region_site() -> Site = { root: 1, start: 0, end: 10 }
 
-/// A `simulate` region whose seed takes `path`, then the lowest enabled task.
+/// A `simulate` region whose seed follows `path`, then picks the lowest enabled task.
 fn seeded_by(path: List<Int>, budget: Int) -> Region<Int> =
   seeded(
     0,
@@ -2665,7 +2692,7 @@ fn lowest() -> Region<Int> = seeded_by([], 1000)
 
 fn next(r: Region<Int>) -> Region<Int> / {abort.raise} = next_turn(r, { now: 0, stopping: false })
 
-/// The turn after the running `task` asks `request`.
+/// The turn after the running `task` makes `request`.
 fn then(t: Region<Int>, task: Int, request: Request<Int>) -> Region<Int> / {abort.raise} =
   next(handle_request(t, task, request, here()))
 
@@ -2681,7 +2708,7 @@ test "the body runs first, and the region completes once every task has ended" {
   assert_eq(then(t, 0, Finished).turn, Complete)
 }
 
-test "a join waits for the task it names, which answers it through its handle" {
+test "a join waits for the task it names, which returns its result through its handle" {
   let apply_spawn = then(next(lowest()), 0, Spawn);
   assert_eq(apply_spawn.turn, Run(0, Resume(Spawned(1))));
   let wait_description = then(apply_spawn, 0, Join(live(1)));
@@ -2702,7 +2729,7 @@ test "a send on a rendezvous waits for the receive that takes it" {
   assert_eq(then(taken, 0, Finished).turn, Run(1, Resume(Received(Some(7)))))
 }
 
-test "a closed channel hands over what was queued, then nothing, and refuses a send" {
+test "a closed channel delivers what was queued, then nothing, and rejects a send" {
   let queued = then(then(next(lowest()), 0, Channel(2)), 0, Send(chan(0), 1));
   assert_eq(queued.turn, Run(0, Resume(Flag(true))));
   let first = then(then(queued, 0, Close(chan(0))), 0, Recv(chan(0)));
@@ -2712,7 +2739,7 @@ test "a closed channel hands over what was queued, then nothing, and refuses a s
   assert_eq(then(after, 0, Send(chan(0), 2)).turn, Run(0, Resume(Flag(false))))
 }
 
-test "a select goes on the first arm that can go, and with none waits on every arm" {
+test "a select completes the first arm that can, and if none can, waits on every arm" {
   let two = then(then(then(next(lowest()), 0, Channel(0)), 0, Channel(1)), 0, Send(chan(1), 5));
   let arms = [{ chan: chan(0), send: None }, { chan: chan(1), send: None }];
   let went = then(two, 0, Select(arms, true));
@@ -2736,7 +2763,8 @@ test "virtual time moves only when every task sleeps, waking one deadline's slee
   assert_eq(then(late, 0, Now).turn, Run(0, Resume(Number(10))))
 }
 
-/// The body spawns task 1, which receives on a channel nothing sends to, and wakes after it.
+/// The body spawns task 1 and sleeps. Task 1 receives on a channel nothing sends to, and the body
+/// wakes after it.
 fn receiver_waiting() -> Region<Int> / {abort.raise} = {
   let apply_spawn = then(then(next(lowest()), 0, Channel(0)), 0, Spawn);
   let receiving = then(then(apply_spawn, 0, Sleep(10)), 1, Recv(chan(0)));
@@ -2744,7 +2772,7 @@ fn receiver_waiting() -> Region<Int> / {abort.raise} = {
   receiving
 }
 
-test "a cancel lets go of what the task waits on, and the task only unwinds" {
+test "a cancel releases what the task waits on, and the task only unwinds" {
   let stopped = then(receiver_waiting(), 0, Cancel(live(1), unshielded()));
   assert_eq(stopped.turn, Run(0, Resume(Flag(true))));
   let again = then(stopped, 0, Cancel(live(1), unshielded()));
@@ -2779,8 +2807,8 @@ test "a raise that leaves a task cancels the region's other tasks, and lands onc
   assert_eq(first.raising, Some(0))
 }
 
-test "a sibling in a bracket's acquire keeps its answer, and the raise waits for it to unwind" {
-  // The body spawns task 1, and the seed runs task 1 before the body hears its answer.
+test "a sibling in a bracket's acquire keeps its reply, and the raise waits for it to unwind" {
+  // The body spawns task 1, and the seed runs task 1 before the body receives its reply.
   let apply_spawn = then(next(seeded_by([0, 1], 1000)), 0, Spawn);
   assert_eq(apply_spawn.turn, Run(1, Start));
   let acquiring = Map::new().insert(0, { acquiring: 1, releasing: 0, stopping: false });
@@ -2805,7 +2833,7 @@ test "each step records what the scheduler orders it against" {
   assert_eq(touched(5), [])
 }
 
-test "a step is placed where it first touched what another task could, else where it gave control back" {
+test "a step is placed where it first accessed what another task could, else where it gave up control" {
   let context = |n: Int| { root: 1, start: n, end: n + 1 };
   let touched = record_accesses(next(lowest()), [
     { access: trail::Hold(1, Write), at: context(2) },
@@ -2853,7 +2881,7 @@ test "a failure is written as the runtime reads it" {
   assert_eq(failure_bytes(f), b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n")
 }
 
-test "a handle another region made is refused" {
+test "a handle another region made is rejected" {
   let r = then(next(lowest()), 0, Join({ region: 5, id: 1, ended: Live }));
   assert_eq(code_of(r), "E0413");
   assert_eq(code_of(then(next(lowest()), 0, Send({ region: 5, id: 0 }, 1))), "E0413")
@@ -2881,7 +2909,7 @@ test "a production region runs ready tasks first in, first out" {
   assert_eq(then(apply_spawn, 1, Yield).turn, Run(0, Resume(Spawned(1))))
 }
 
-test "a production task waits on its ticket while the region idles, and runs once it is answered" {
+test "a production task waits on its ticket while the region idles, and runs once it is completed" {
   let wait_description = then(produced(), 0, Ticket(42));
   assert_eq(wait_description.turn, Idle(None));
   assert_eq(next(wake_ticket_waiters(wait_description, [7, 42])).turn, Run(0, Resume(Nothing)))
@@ -2908,7 +2936,7 @@ test "a production region keeps no task that has ended, and a join reads the han
   assert_eq(code_of(then(ended, 0, Join(live(1)))), "E0413")
 }
 
-test "a production task cancelled before it starts has its handle settled before it is let go" {
+test "a production task cancelled before it starts has its handle marked before it is freed" {
   let both = then(then(then(produced(), 0, Spawn), 1, Yield), 0, Spawn);
   assert_eq(both.turn, Run(1, Resume(Nothing)));
   let stopped = then(both, 1, Cancel(live(2), unshielded()));
@@ -2922,15 +2950,15 @@ test "a production task cancelled before it starts has its handle settled before
   assert_eq(then(incoming, 1, Yield).turn, Run(0, Resume(Awaited(false))))
 }
 
-/// A fresh run's region, `parks` waits in a row having woken nothing.
+/// A new run's region, after `parks` waits in a row that woke nothing.
 fn serving_at(parks: Int) -> Region<Kept> =
   { ..production(0, region_site()), spurious_wakeups: parks }
 
-/// The code the region ended with, where it ended refused.
+/// The code of the failure the region ended with, if it failed.
 fn failure_code(r: Region<Kept>) -> String =
   match r.ending { Some(RegionFailed(f)) -> f.code, _ -> "" }
 
-test "waits on the run that wake nothing refuse the region past the bound, and none a deadline or a stop ended counts" {
+test "waits on the run that wake nothing fail the region past the bound, and a wait a deadline or stop ended does not count" {
   assert_eq(failure_code(after_park(serving_at(max_spurious_wakeups()), None, [], false)), "E0505");
   assert_eq(failure_code(after_park(serving_at(max_spurious_wakeups() - 1), None, [], false)), "");
   assert_eq(
@@ -2943,7 +2971,7 @@ test "waits on the run that wake nothing refuse the region past the bound, and n
   )
 }
 
-test "the tickets the run answered read back from their bytes, the least significant first" {
+test "the tickets the run completed decode from their bytes, least significant first" {
   assert_eq(tokens_of(b"\x01\x00\x00\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00\x00\x00"), [
     1,
     258,

@@ -1,31 +1,31 @@
 //! Structured tasks: deadlines, races, gathers, retries and limits over the language's `task`.
 //!
-//! Every function here that starts tasks ends them before it answers. The tasks are started in
-//! the `acquire` of a `bracket` whose `release` cancels and awaits each one, so when a combinator
-//! answers, raises or is itself cancelled, what it started has stopped and has run its own
-//! releases. A body handed to one runs as a task of its own: a raise in it is that task's and
-//! not its caller's, so a body that can fail answers a `Result`.
+//! Every function here that starts tasks ends them before it returns. The tasks are started in
+//! the `acquire` of a `bracket` whose `release` cancels and awaits each one. So when a combinator
+//! returns, raises or is itself cancelled, every task it started has stopped and has run its own
+//! releases. A body passed to a combinator runs as a task of its own: a raise in it belongs to that
+//! task and not to its caller, so a body that can fail returns a `Result`.
 //!
 //! A deadline is an instant. `until` and `timeout` stop a body at one by cancelling its task,
-//! which is the mechanism the language has, and say which instant through `deadline.at`, so
-//! what runs inside, and every task started there, can read how long it has. Deadlines nest by
-//! the earlier: an inner one that names a later instant is held to the outer. A program says
-//! there is none above it with `unbounded`.
+//! which is the mechanism the language has. They report the instant through `deadline.at`, so the
+//! code inside, and every task started there, can read how much time it has. Nested deadlines take
+//! the earlier one: an inner deadline at a later instant is held to the outer one. A program
+//! states that there is no deadline above it with `unbounded`.
 //!
 //! Retrying, breaking a circuit, limiting a rate and keeping a retry budget are each a value and
-//! the pure functions that step it, which take the reading of the clock they need. The caller
-//! keeps the value, in a handler's variable or threaded through: nothing here is ambient. A
-//! function that steps one while it runs a body (`guarded`, `throttled`, `retry_budgeted`) takes
-//! `load` and `store`, how the caller reads what it keeps and puts one back: over a handler's
-//! variable, operations its clauses answer. Each reads and writes with nothing between that another
-//! task could run in, so tasks sharing one value see each step whole. `single_flight`'s runs are
-//! kept in a channel its callers share, which `flights` makes in the region they run in. Jitter is
-//! drawn from `std.random`'s `entropy`, so a run that answers it from a seed waits what the seed
-//! says.
+//! the pure functions that step it, which take the clock reading they need. The caller stores the
+//! value, in a handler's variable or passed along: nothing here is global. A function that steps
+//! one while it runs a body (`guarded`, `throttled`, `retry_budgeted`) takes `load` and `store`,
+//! which read the caller's value and write one back. Over a handler's variable, these are
+//! operations its clauses handle. Each reads and writes with nothing in between that another task
+//! could run in, so tasks sharing one value see each step whole. `single_flight`'s runs are stored
+//! in a channel its callers share, which `flights` creates in the region they run in. Jitter is
+//! drawn from `std.random`'s `entropy`, so a run that handles it from a seed waits what the seed
+//! decides.
 //!
-//! Under `simulate` every wait here is virtual time and every interleaving of what these start
-//! is searched. Outside one the same waits are on the run's clock, and a task that waits is
-//! parked alone while the others run.
+//! Under `simulate`, every wait here is virtual time and every interleaving of the tasks these
+//! functions start is searched. Outside `simulate`, the same waits use the run's clock, and a task
+//! that waits is parked alone while the others run.
 
 import std.list
 import std.math (rem_euclid)
@@ -35,9 +35,9 @@ import std.gen
 
 // --- Scopes -----------------------------------------------------------------
 
-/// What `inside` answers, handed a task running each of `bodies`. Every one of them has ended
-/// when this answers, however it does: `inside` returning, a raise, or a cancel of the caller
-/// cancels those still running and waits for each to finish releasing what it holds.
+/// Starts a task for each of `bodies`, passes the tasks to `inside`, and returns its result. Every
+/// task has ended when this returns, however it returns: `inside` returning, a raise, or a cancel
+/// of the caller cancels the tasks still running and waits for each to release what it holds.
 pub fn scoped<a, b | e>(
   bodies: List<() -> a / e>,
   inside: (List<Task<a>>) -> b / {task.write, abort.raise | e},
@@ -56,9 +56,9 @@ fn cancel_and_await<a>(kids: List<Task<a>>) -> Unit / {task.write} = {
   })
 }
 
-/// What `step` makes of the answers of `bodies` in the order they end, each beside its place
-/// among them, from `init` until it answers `Stop` or every body has ended. The bodies still
-/// running then are cancelled and awaited.
+/// Folds `step` over the results of `bodies` in the order they end, each with its index, starting
+/// from `init`, until `step` returns `Stop` or every body has ended. The bodies still running then
+/// are cancelled and awaited.
 fn fold_as_completed<a, s | e>(
   bodies: List<() -> a / e>,
   init: s,
@@ -88,12 +88,12 @@ fn fold_as_completed<a, s | e>(
 
 // --- Several at once --------------------------------------------------------
 
-/// What each of `bodies` answers, in their order, all of them run at once.
+/// Runs all of `bodies` at once, and returns their results in their order.
 pub fn all<a | e>(bodies: List<() -> a / e>) -> List<a> / {task.write, abort.raise | e} =
   scoped(bodies, |kids: List<Task<a>>| kids.map(|kid: Task<a>| task.join(kid)))
 
-/// What every one of `bodies` answered, in their order, or the first failure: the bodies still
-/// running when one fails are cancelled, and have ended when this answers.
+/// Returns the results of all `bodies` in their order, or the first failure. The bodies still
+/// running when one fails are cancelled, and have ended when this returns.
 pub fn all_ok<a, x | e>(
   bodies: List<() -> Result<a, x> / e>,
 ) -> Result<List<a>, x> / {task.write, abort.raise | e} =
@@ -111,7 +111,8 @@ pub fn all_ok<a, x | e>(
     Err(failure) -> Err(failure),
   }
 
-/// The first success among `bodies`, the others cancelled, or every failure in their order.
+/// Returns the first success among `bodies` and cancels the others, or returns every failure in
+/// their order.
 pub fn first_ok<a, x | e>(
   bodies: List<() -> Result<a, x> / e>,
 ) -> Result<a, List<x>> / {task.write, abort.raise | e} =
@@ -129,13 +130,13 @@ pub fn first_ok<a, x | e>(
     Err(failures) -> Err(failures.values()),
   }
 
-/// What the first of `bodies` to end answered, `None` of no bodies. The others are cancelled,
-/// and have run their releases when this answers.
+/// Returns the result of the first of `bodies` to end, or `None` for no bodies. The others are
+/// cancelled, and have run their releases when this returns.
 pub fn race<a | e>(bodies: List<() -> a / e>) -> Option<a> / {task.write, abort.raise | e} =
   fold_as_completed(bodies, None, |_none: Option<a>, _i: Int, answer: a| Stop(Some(answer)))
 
-/// `f` of each of `xs`, in their order, at most `limit` of them running at once. Raises for a
-/// `limit` below one.
+/// Applies `f` to each of `xs`, with at most `limit` running at once, and returns the results in
+/// order. Raises for a `limit` below one.
 pub fn map_concurrent<a, b | e>(
   xs: List<a>,
   limit: Int,
@@ -168,7 +169,7 @@ pub fn map_concurrent<a, b | e>(
 
 /// The instant the work around a call must end by.
 pub effect deadline {
-  /// The earliest deadline around this call, `None` where `unbounded` says there is none.
+  /// The earliest deadline around this call, or `None` where `unbounded` states there is none.
   read at() -> Option<Instant>
   /// The work did not end by `at`.
   raise passed(at: Instant)
@@ -176,16 +177,16 @@ pub effect deadline {
 
 /// How work under a deadline ended.
 pub type Timed<a> =
-  /// It answered in time.
+  /// It returned in time.
   | Done(a)
   /// The deadline came first, and the work was stopped there.
   | TimedOut
 
-/// `body` with no deadline above it.
+/// Runs `body` with no deadline above it.
 pub fn unbounded<a | e>(body: () -> a / {deadline.at | e}) -> a / e =
   handle { body() } with { deadline.at() -> None }
 
-/// The earlier of two deadlines, where `None` is none at all.
+/// The earlier of two deadlines, where `None` means no deadline.
 pub fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> =
   match ((a, b)) {
     (Some(x), Some(y)) -> if nanos_at(x) <= nanos_at(y) { a } else { b },
@@ -193,7 +194,7 @@ pub fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> =
     (None, _) -> b,
   }
 
-/// How long is left before the deadline around this call, `None` where there is none; never
+/// How long is left before the deadline around this call, or `None` if there is none. Never
 /// below zero.
 pub fn remaining() -> Option<Duration> / {deadline.at, clock.read} =
   match deadline.at() {
@@ -204,22 +205,22 @@ pub fn remaining() -> Option<Duration> / {deadline.at, clock.read} =
     },
   }
 
-/// Waits until the clock reads `at`; no wait at all for an instant that has passed.
+/// Waits until the clock reads `at`. For an instant that has passed, it does not wait.
 pub fn sleep_until(at: Instant) -> Unit / {clock.read, clock.write} =
   clock.sleep(between(clock.now(), at))
 
-/// `body` run as a task that is stopped at `at`. Inside `body`, and in every task started there,
-/// `deadline.at` answers the instant it is held to: `at`, or the deadline already around this
-/// call where that is no later, which then stops this call with its body and leaves it nothing
-/// to answer. `TimedOut` says the task was cancelled at `at`: it has run its releases, and
-/// whatever it had started through this module has ended.
+/// Runs `body` as a task that is stopped at `at`. Inside `body`, and in every task started there,
+/// `deadline.at` returns the deadline it is held to. That is `at`, or the deadline already around
+/// this call if it is no later. Such an outer deadline stops this call along with its body, so
+/// this call then returns nothing. `TimedOut` means the task was cancelled at `at`: it has run
+/// its releases, and everything it started through this module has ended.
 pub fn until<a | e>(
   at: Instant,
   body: keep () -> a / {deadline.at | e},
 ) -> Timed<a> / {task.write, clock.read, clock.write, deadline.at | e} = {
   let around = deadline.at();
   let bound = match earliest(Some(at), around) { Some(earlier) -> earlier, None -> at };
-  // What set a deadline at or before `at` stops this call's task at it, so no timer is its own.
+  // An outer deadline at or before `at` already stops this call's task, so it needs no timer.
   let timed = match around { Some(outer) -> nanos_at(at) < nanos_at(outer), None -> true };
   let left = between(clock.now(), bound);
   bracket(
@@ -245,7 +246,7 @@ pub fn until<a | e>(
   )
 }
 
-/// `at`, or the deadline around this call where that is earlier.
+/// `at`, or the deadline around this call if that is earlier.
 fn effective_deadline(at: Instant) -> Instant / {deadline.at} =
   match earliest(Some(at), deadline.at()) { Some(bound) -> bound, None -> at }
 
@@ -256,8 +257,8 @@ pub fn timeout<a | e>(
 ) -> Timed<a> / {task.write, clock.read, clock.write, deadline.at | e} =
   until(after(clock.now(), d), body)
 
-/// What `body` answers by `at`, as `until` runs it; raises `deadline.passed` with the instant it
-/// was held to where it was stopped there.
+/// Runs `body` as `until` does, and returns its result if it ends by `at`. If it was stopped,
+/// raises `deadline.passed` with the deadline it was held to.
 pub fn by<a | e>(
   at: Instant,
   body: keep () -> a / {deadline.at | e},
@@ -275,10 +276,10 @@ pub fn within<a | e>(
 
 // --- Permits ----------------------------------------------------------------
 
-/// A count of permits tasks take turns holding. `semaphore` makes one.
+/// A count of permits that tasks take turns holding. `semaphore` creates one.
 pub opaque type Semaphore<c> = | Semaphore(c)
 
-/// A semaphore as `semaphore` makes it.
+/// A semaphore as `semaphore` creates it.
 pub type Permits = Semaphore<Chan<Unit>>
 
 /// A semaphore of `permits` permits. Raises for a count below zero.
@@ -291,9 +292,9 @@ pub fn semaphore(permits: Int) -> Permits / {task.write, abort.raise} = {
   Semaphore(tokens)
 }
 
-/// What `body` answers while it holds one of `sem`'s permits, waiting for one first. Waiters are
-/// served in the order they began to wait. The permit goes back once, however `body` ends, a
-/// cancel among them, and a task cancelled while it waits takes none.
+/// Waits for one of `sem`'s permits, then runs `body` while holding it and returns its result.
+/// Waiters are served in the order they began to wait. The permit is returned once, however `body`
+/// ends, including by a cancel, and a task cancelled while it waits takes none.
 pub fn with_permit<a | e>(sem: Permits, body: () -> a / e) -> a / {task.write | e} =
   match sem {
     Semaphore(tokens) -> with_hold[permit](task.recv(tokens), |_held: Option<Unit>| {
@@ -302,8 +303,8 @@ pub fn with_permit<a | e>(sem: Permits, body: () -> a / e) -> a / {task.write | 
     }) { _permit -> body() },
   }
 
-/// `Some` of what `body` answers while it holds one of `sem`'s permits, or `None`, without
-/// running it, when none is free now.
+/// Runs `body` while holding one of `sem`'s permits, and returns `Some` of its result. Returns
+/// `None` without running it when no permit is free now.
 pub fn try_with_permit<a | e>(sem: Permits, body: () -> a / e) -> Option<a> / {task.write | e} =
   match sem {
     Semaphore(tokens) -> with_hold[permit](
@@ -321,8 +322,9 @@ pub fn try_with_permit<a | e>(sem: Permits, body: () -> a / e) -> Option<a> / {t
 
 // --- Retrying ---------------------------------------------------------------
 
-/// How the wait before another attempt is spread, as the AWS Architecture Blog's "Exponential
-/// Backoff And Jitter" names them. The ceiling after `n` failures is `min(cap, base * 2^(n-1))`.
+/// How the wait before another attempt is spread, with the names the AWS Architecture Blog's
+/// "Exponential Backoff And Jitter" uses. The ceiling after `n` failures is
+/// `min(cap, base * 2^(n-1))`.
 pub type Jitter =
   /// The ceiling itself.
   | NoJitter
@@ -344,8 +346,8 @@ pub type Retry<x> = new {
   jitter: Jitter,
   /// Whether another attempt may follow this failure.
   retryable: (x) -> Bool,
-  /// How long the attempts and the waits between them may take in all, held to the deadline
-  /// around the call where that is earlier; `None` leaves only that deadline.
+  /// How long the attempts and the waits between them may take in all, limited by the deadline
+  /// around the call if that is earlier. `None` leaves only that deadline.
   within: Option<Duration>,
 }
 
@@ -353,7 +355,7 @@ pub type Retry<x> = new {
 pub type Reason =
   /// The body ran `attempts` times.
   | Spent
-  /// `retryable` said no.
+  /// `retryable` returned `false`.
   | NotRetryable
   /// The wait before another attempt would have ended at or past the deadline.
   | OutOfTime
@@ -373,8 +375,8 @@ pub fn wait_ceiling<x>(policy: Retry<x>, failures: Int) -> Duration = {
   )
 }
 
-/// How many waits the jitter chooses among after `failures` failures, the wait before having
-/// been `previous` (`base` before the first): a draw below this picks one. At least one.
+/// How many waits the jitter chooses from after `failures` failures, when the previous wait was
+/// `previous` (`base` before the first). A draw below this number picks one. At least one.
 pub fn wait_choices<x>(policy: Retry<x>, failures: Int, previous: Duration) -> Int = {
   let ceiling = as_nanos(wait_ceiling(policy, failures));
   match policy.jitter {
@@ -396,7 +398,7 @@ pub fn wait_of<x>(policy: Retry<x>, failures: Int, previous: Duration, draw: Int
   })
 }
 
-/// Three times the wait before, held between `base` and what an `Int` holds.
+/// Three times the previous wait or `base`, whichever is larger, and at most `max_wait`.
 fn decorrelated_top<x>(policy: Retry<x>, previous: Duration) -> Int = {
   let before = max(as_nanos(policy.base), as_nanos(previous));
   if before > max_wait() / 3 { max_wait() } else { before * 3 }
@@ -405,20 +407,20 @@ fn decorrelated_top<x>(policy: Retry<x>, previous: Duration) -> Int = {
 /// A wait no jitter passes: about a hundred and forty-six years.
 fn max_wait() -> Int = 4611686018427387904
 
-/// What `body` answers, run again after each failure `policy` lets it retry: at most
-/// `policy.attempts` times, waiting between attempts as `policy.jitter` spreads the waits, each
-/// draw one `entropy.below`. `body` is handed the attempt it is, from 1. It stops at the first
-/// success, and answers the failure it stopped at with why. A wait that would end at or past the
-/// deadline is not begun. Raises for a policy of no attempts, a negative `base`, or a `cap`
-/// below `base`.
+/// Runs `body`, and runs it again after each failure that `policy` allows a retry for, at most
+/// `policy.attempts` times. Between attempts it waits as `policy.jitter` spreads the waits, with
+/// one `entropy.below` per draw. `body` is passed its attempt number, from 1. It stops at the
+/// first success, or returns the failure it stopped at with the reason. A wait that would end at
+/// or past the deadline is not begun. Raises for a policy of no attempts, a negative `base`, or a
+/// `cap` below `base`.
 pub fn retry<a, x | e>(
   policy: Retry<x>,
   body: (Int) -> Result<a, x> / e,
 ) -> Result<a, RetryFailure<x>> / {clock.read, clock.write, random::entropy.below, deadline.at, abort.raise | e} =
   run_retries(policy, || true, body)
 
-/// `retry` under a retry budget the caller keeps: the call pays into it, each retry draws on
-/// it, and a retry it cannot pay for is not made.
+/// `retry` under a retry budget that the caller stores. The call pays into the budget, each retry
+/// draws on it, and a retry it cannot pay for is not made.
 pub fn retry_budgeted<a, x | e>(
   policy: Retry<x>,
   load: () -> Budget / e,
@@ -479,20 +481,20 @@ fn give_up<a, x>(
 ) -> Iter<RetryState, Result<a, RetryFailure<x>>> =
   Stop(Err({ last: failure, attempts: trying.attempt, reason: why }))
 
-/// Whether `at` is at or past `bound`, which `None` never is.
+/// Whether `at` is at or past `bound`. Nothing is past a `None` bound.
 fn past(at: Instant, bound: Option<Instant>) -> Bool =
   match bound { Some(b) -> nanos_at(at) >= nanos_at(b), None -> false }
 
 // --- A retry budget ---------------------------------------------------------
 
-/// How many retries the calls made so far have paid for. Each call pays in `percent`
-/// hundredths of a retry and each retry takes a whole one, so over any run of calls at most
-/// `percent` in a hundred are retries, beside the `reserve` it starts with and never banks past.
+/// How many retries the calls made so far have paid for. Each call pays in `percent` hundredths
+/// of a retry and each retry takes a whole one, so over any series of calls at most `percent` in a
+/// hundred are retries, besides the `reserve` it starts with. It never saves more than `reserve`.
 pub opaque type Budget = new { hundredths: Int, percent: Int, reserve: Int }
 
-/// A budget that lets `percent` retries follow every hundred calls and starts with `reserve`
-/// retries in hand. It banks no more than that many, or than one where that is none. Neither
-/// number is below zero.
+/// A budget that allows `percent` retries for every hundred calls and starts with `reserve`
+/// retries available. It saves no more than `reserve` retries, or one if `reserve` is zero. A
+/// number below zero counts as zero.
 pub fn budget(percent: Int, reserve: Int) -> Budget = {
   let kept = max(0, reserve);
   { hundredths: kept * 100, percent: max(0, percent), reserve: kept }
@@ -502,7 +504,7 @@ pub fn budget(percent: Int, reserve: Int) -> Budget = {
 pub fn pay_in(b: Budget) -> Budget =
   { ..b, hundredths: min(max(1, b.reserve) * 100, b.hundredths + b.percent) }
 
-/// The budget after a retry draws on it, or `None` where it has no whole retry to give.
+/// The budget after a retry draws on it, or `None` if it has no whole retry to give.
 pub fn draw_retry(b: Budget) -> Option<Budget> =
   if b.hundredths < 100 { None } else { Some({ ..b, hundredths: b.hundredths - 100 }) }
 
@@ -511,17 +513,17 @@ pub fn retries_left(b: Budget) -> Int = b.hundredths / 100
 
 // --- A circuit breaker ------------------------------------------------------
 
-/// Where a breaker stands.
+/// The state of a breaker.
 pub type Circuit =
-  /// Calls pass; this many have failed in a row.
+  /// Calls pass, and this many have failed in a row.
   | Closed(Int)
-  /// Calls are refused until this instant.
+  /// Calls are rejected until this instant.
   | Open(Instant)
-  /// One call at a time is let through to probe: this many have succeeded, and one is out now
-  /// or not.
+  /// One call at a time is let through to probe. This many have succeeded, and the flag is
+  /// whether a probe is in progress.
   | HalfOpen(Int, Bool)
 
-/// A circuit breaker: it opens after `trip_after` failures in a row, refuses every call for
+/// A circuit breaker: it opens after `trip_after` failures in a row, rejects every call for
 /// `cooldown`, then lets one call at a time probe, closing after `close_after` of them succeed
 /// and opening again at the first that fails.
 pub opaque type Breaker = new {
@@ -540,12 +542,13 @@ pub fn breaker(trip_after: Int, cooldown: Duration, close_after: Int) -> Breaker
     circuit: Closed(0),
   }
 
-/// Where the breaker stands.
+/// The breaker's state.
 pub fn circuit(b: Breaker) -> Circuit = b.circuit
 
-/// Whether a call may go at `now`, and the breaker after the asking. An open breaker past its
-/// cooldown lets this call probe; a half-open one lets a call probe only while none is out.
-/// `probe` says the call is one, which `record` or `abandon_probe` must then answer.
+/// Whether a call may go at `now`, and the breaker after the check. An open breaker past its
+/// cooldown lets this call probe. A half-open one lets a call probe only while no other probe is
+/// in progress. `probe` reports that the call is a probe, which `record` or `abandon_probe` must
+/// then conclude.
 pub fn admit(b: Breaker, now: Instant) -> { breaker: Breaker, admitted: Bool, probe: Bool } =
   match b.circuit {
     Closed(_) -> { breaker: b, admitted: true, probe: false },
@@ -557,8 +560,8 @@ pub fn admit(b: Breaker, now: Instant) -> { breaker: Breaker, admitted: Bool, pr
       { breaker: { ..b, circuit: HalfOpen(passed, true) }, admitted: true, probe: true },
   }
 
-/// The breaker after a call it admitted ended at `now`, well or not. A call that ends after the
-/// breaker opened changes nothing.
+/// The breaker after a call it admitted ended at `now`, successfully or not. A call that ends
+/// after the breaker opened changes nothing.
 pub fn record(b: Breaker, ok: Bool, now: Instant) -> Breaker =
   match b.circuit {
     Closed(failed) -> if ok { { ..b, circuit: Closed(0) } }
@@ -570,20 +573,20 @@ pub fn record(b: Breaker, ok: Bool, now: Instant) -> Breaker =
     else { { ..b, circuit: HalfOpen(passed + 1, false) } },
   }
 
-/// The breaker after a probe ended without an answer, as a cancelled one does: another may go.
+/// The breaker after a probe ended without a result, as a cancelled probe does, so another may go.
 pub fn abandon_probe(b: Breaker) -> Breaker =
   match b.circuit { HalfOpen(passed, true) -> { ..b, circuit: HalfOpen(passed, false) }, _ -> b }
 
-/// How a call behind a breaker ended without its answer.
+/// How a call behind a breaker ended without a result.
 pub type BreakerError<x> =
-  /// The breaker refused it, and the body did not run.
+  /// The breaker rejected it, and the body did not run.
   | Rejected
   /// The body ran and failed.
   | Failed(x)
 
-/// What `body` answers behind the breaker the caller keeps: refused without running while the
-/// breaker says so, and recorded with the clock's reading when it ends. A probe that is
-/// cancelled is given back, so another may go.
+/// Runs `body` behind the breaker that the caller stores. While the breaker rejects calls, the
+/// body does not run. When it ends, its outcome is recorded with the clock's reading. A probe that
+/// is cancelled is released, so another may go.
 pub fn guarded<a, x | e>(
   load: () -> Breaker / e,
   store: (Breaker) -> Unit / e,
@@ -614,7 +617,7 @@ pub fn guarded<a, x | e>(
 pub opaque type Bucket = new {
   capacity: Int,
   every: Duration,
-  /// When the bucket would be full again were nothing more taken.
+  /// When the bucket would be full again if nothing more were taken.
   full_at: Instant,
 }
 
@@ -623,9 +626,9 @@ pub opaque type Bucket = new {
 pub fn bucket(capacity: Int, every: Duration, now: Instant) -> Bucket =
   { capacity: max(1, capacity), every: Duration(max(1, as_nanos(every))), full_at: now }
 
-/// A token taken at `now`: the bucket after, and how long from `now` until the token is there
-/// to use, nothing while the bucket holds one. Tokens are handed out in the order they are
-/// reserved, so a wait is behind every reservation before it.
+/// Takes a token at `now`. Returns the bucket after, and how long from `now` until the token can
+/// be used, which is zero while the bucket has one. Tokens are given out in the order they are
+/// reserved, so a wait comes after every earlier reservation.
 pub fn reserve(b: Bucket, now: Instant) -> { bucket: Bucket, wait: Duration } = {
   let every = as_nanos(b.every);
   let full_at = max(nanos_at(b.full_at), nanos_at(now)) + every;
@@ -633,7 +636,7 @@ pub fn reserve(b: Bucket, now: Instant) -> { bucket: Bucket, wait: Duration } = 
   { bucket: { ..b, full_at: Instant(full_at) }, wait: Duration(max(0, ready - nanos_at(now))) }
 }
 
-/// The bucket after a token is taken at `now`, or `None` where it holds none then.
+/// The bucket after a token is taken at `now`, or `None` if it has none then.
 pub fn take(b: Bucket, now: Instant) -> Option<Bucket> = {
   let reserved = reserve(b, now);
   if as_nanos(reserved.wait) == 0 { Some(reserved.bucket) } else { None }
@@ -646,9 +649,9 @@ pub fn tokens(b: Bucket, now: Instant) -> Int / {abort.raise} = {
   else { max(0, b.capacity - (owed + as_nanos(b.every) - 1) / as_nanos(b.every)) }
 }
 
-/// What `body` answers once the bucket the caller keeps has a token for it: the token is
-/// reserved at once and the call waits its turn on the clock. A call cancelled while it waits
-/// has spent its token.
+/// Runs `body` once the bucket that the caller stores has a token for it. The token is reserved
+/// at once and the call waits its turn on the clock. A call cancelled while it waits has used up
+/// its token.
 pub fn throttled<a | e>(
   load: () -> Bucket / e,
   store: (Bucket) -> Unit / e,
@@ -663,19 +666,19 @@ pub fn throttled<a | e>(
 
 // --- One run for many callers -----------------------------------------------
 
-/// The runs under way, by key: a channel that holds their table while no caller is changing it.
+/// The runs in progress, by key: a channel that contains their table while no caller changes it.
 pub type Flights<k, a> = { table: Chan<FlightTable<k, a>> }
 
-/// Each run under way by its key, with the id it runs as and the channel each caller waiting on it
-/// is answered on; `next` is the id the next run takes.
+/// Each run in progress by its key, with its id and the channel on which each waiting caller
+/// receives the result. `next` is the id the next run takes.
 type FlightTable<k, a> = { next: Int, runs: Map<k, { id: Int, waiting: List<Chan<a>> }> }
 
-/// What joining answers: run it yourself as this id, or wait on `answered` for its runner's answer,
-/// which closes where that runner was cancelled. A channel is a type argument, where the escape
-/// checks see it.
+/// What joining returns: run it yourself as this id, or wait on `answered` for the runner's
+/// result. The channel closes if that runner was cancelled. The channel is a type argument so that
+/// the escape checks see it.
 type FlightRole<answered> = | Run(Int) | Wait(answered)
 
-/// Flights with no run under way, for the tasks of the region it is made in.
+/// Flights with no run in progress, for the tasks of the region it is created in.
 pub fn flights<k, a>() -> Flights<k, a> / {task.write}
   where derivable(ord, k)
 = {
@@ -684,9 +687,10 @@ pub fn flights<k, a>() -> Flights<k, a> / {task.write}
   { table: table }
 }
 
-/// What `body` answers, run once for every caller that asks `flights` for `key` while it runs: the
-/// first runs it and the others wait for its answer. A later caller, once it has answered, runs it
-/// again. Where the caller running it is cancelled, one of those waiting runs it instead.
+/// Runs `body` once for all callers that request `key` from `flights` while it runs: the first
+/// caller runs it and the others wait for its result. A caller that comes after it has returned
+/// runs it again. If the caller running it is cancelled, one of the waiting callers runs it
+/// instead.
 pub fn single_flight<k, a | e>(
   flights: Flights<k, a>,
   key: k,
@@ -695,8 +699,8 @@ pub fn single_flight<k, a | e>(
   where derivable(ord, k)
 =
 
-  // Joining is the acquire and giving a run back the release, which a cancel waits out, so the
-  // table is always put back and a run handed to this caller is always let go.
+  // Joining is the acquire and finishing the run is the release, which a cancel waits for, so the
+  // table is always put back and a run given to this caller is always released.
   bracket(
     || join_flight(flights, key),
     |j: Option<FlightRole<Chan<a>>>|
@@ -716,7 +720,8 @@ pub fn single_flight<k, a | e>(
       },
   )
 
-/// The run under way for `key` to wait on, or one this caller starts; none where the table is gone.
+/// The run in progress for `key` to wait on, or one this caller starts, or `None` if the table is
+/// gone.
 fn join_flight<k, a>(flights: Flights<k, a>, key: k) -> Option<FlightRole<Chan<a>>> / {task.write}
   where derivable(ord, k)
 =
@@ -741,8 +746,8 @@ fn join_flight<k, a>(flights: Flights<k, a>, key: k) -> Option<FlightRole<Chan<a
     },
   }
 
-/// Ends the run `id` for `key`, if it is still the one under way: each caller waiting on it is sent
-/// `answer`, or told there is none.
+/// Ends the run `id` for `key`, if it is still the one in progress. Each caller waiting on it is
+/// sent `answer`, or has its channel closed if there is none.
 fn finish_flight<k, a>(
   flights: Flights<k, a>,
   key: k,
@@ -808,10 +813,10 @@ pub fn next_due(
   }
 }
 
-/// `tick` run each `period` from one period after now, at most `limit` times: it is handed
-/// what the tick before answered, from `init`, and the instant it was due, and answers
-/// `Continue` to tick again or `Stop` to end. Answers the last of those. `missed` says what
-/// follows a tick that ran past the next. Raises for a period below a nanosecond.
+/// Runs `tick` each `period`, starting one period from now, at most `limit` times. `tick` is
+/// passed the previous tick's result, starting from `init`, and the instant it was due. It returns
+/// `Continue` to tick again or `Stop` to end. Returns the last of those results. `missed` decides
+/// what follows a tick that ran past the next. Raises for a period below a nanosecond.
 pub fn every<s | e>(
   period: Duration,
   missed: MissedTickBehavior,
@@ -852,7 +857,7 @@ effect log {
   read notes() -> List<String>
 }
 
-/// `body` noting into a log that starts empty, and what it noted.
+/// Runs `body` with a log that starts empty, and returns its value and what it noted.
 fn logged<a | e>(
   body: () -> a / {log.note, log.notes | e},
 ) -> { value: a, notes: List<String> } / e =
@@ -873,7 +878,7 @@ effect level {
   write down() -> Unit
 }
 
-/// `body`, where the level it raises and lowers ended, and the highest it reached.
+/// Runs `body`, and returns its value, the level it ended at, and the highest level it reached.
 fn peak<a | e>(
   body: () -> a / {level.up, level.down | e},
 ) -> { value: a, inside: Int, most: Int } / e =
@@ -898,8 +903,8 @@ type Bounded = { name: String, budget: Int, work: Int, ended: Timed<Int>, at: In
 fn bounded() -> List<Bounded> =
   [
     { name: "work past it is stopped there", budget: 100, work: 250, ended: TimedOut, at: 100 },
-    { name: "work inside it answers", budget: 100, work: 40, ended: Done(40), at: 40 },
-    { name: "work that does not wait answers", budget: 100, work: 0, ended: Done(0), at: 0 },
+    { name: "work inside it returns", budget: 100, work: 40, ended: Done(40), at: 40 },
+    { name: "work that does not wait returns", budget: 100, work: 0, ended: Done(0), at: 0 },
   ]
 
 test "a timeout runs on the virtual clock: {c.name}" for c: Bounded in bounded() {
@@ -937,14 +942,14 @@ type Nested = { name: String, outer: Int, inner: Int, ended: Timed<Timed<Int>>, 
 fn nested() -> List<Nested> =
   [
     {
-      name: "an inner one that names a later instant is stopped at the outer",
+      name: "an inner one set to a later instant is stopped at the outer",
       outer: 50,
       inner: 200,
       ended: TimedOut,
       at: 50,
     },
     {
-      name: "an inner one that names an earlier instant stops its work there",
+      name: "an inner one set to an earlier instant stops its work there",
       outer: 50,
       inner: 20,
       ended: Done(TimedOut),
@@ -952,7 +957,7 @@ fn nested() -> List<Nested> =
     },
   ]
 
-test "timeouts nest by the earlier deadline: {c.name}" for c: Nested in nested() {
+test "nested timeouts take the earlier deadline: {c.name}" for c: Nested in nested() {
   simulate {
     unbounded(|| {
       let ended = timeout(Duration(c.outer), || timeout(Duration(c.inner), || nap(1000)));
@@ -970,7 +975,7 @@ test "work under two deadlines reads the earlier, whichever is the inner" {
   }
 }
 
-test "a task started under a deadline reads it, and none is read where there is none" {
+test "a task started under a deadline reads it, and reads none where there is none" {
   simulate {
     unbounded(|| {
       assert_eq(deadline.at(), None);
@@ -987,11 +992,11 @@ test "a task started under a deadline reads it, and none is read where there is 
   }
 }
 
-test "the raising form answers work that ends in time" {
+test "the raising form returns the result of work that ends in time" {
   simulate { unbounded(|| assert_eq(try { within(Duration(5), || nap(3)) }, Ok(3))) }
 }
 
-test "the raising form raises the instant its work was held to" {
+test "the raising form raises the deadline its work was held to" {
   simulate { unbounded(|| assert_eq(try { within(Duration(5), || nap(10)) }, Err(Instant(5)))) }
 }
 
@@ -1005,7 +1010,7 @@ test "the raising form by an instant raises that instant" {
   }
 }
 
-test "work a timeout stops has released what it held when the timeout answers" {
+test "work a timeout stops has released what it held when the timeout returns" {
   logged(||
     simulate {
       unbounded(|| {
@@ -1037,7 +1042,7 @@ test "a cancelled timeout stops its work and its timer: nothing of either runs o
   assert_eq(ran.notes, [])
 }
 
-test "each loser of a race has released what it held when the race answers" {
+test "each loser of a race has released what it held when the race returns" {
   let won = logged(||
     simulate {
       let runner = |name: String, takes: Int|
@@ -1050,7 +1055,7 @@ test "each loser of a race has released what it held when the race answers" {
   assert_eq(won._2, Instant(10))
 }
 
-law "a race answers the body that ends first and takes no longer, in every interleaving"
+law "a race returns the body that ends first and takes no longer, in every interleaving"
   forall (a: Few, b: Few, c: Few) where a != b && a != c && b != c {
     simulate {
       let first = min(count(a), min(count(b), count(c)));
@@ -1059,14 +1064,14 @@ law "a race answers the body that ends first and takes no longer, in every inter
     }
   }
 
-test "a race of no bodies has no answer" {
+test "a race of no bodies has no result" {
   simulate {
     let none: List<() -> Int / {clock.write}> = [];
     assert_eq(race(none), None)
   }
 }
 
-test "all answers each body's answer in the bodies' order, and takes as long as the longest" {
+test "all returns each body's result in the bodies' order, and takes as long as the longest" {
   simulate {
     assert_eq(all([|| nap(30), || nap(10), || nap(20)]), [30, 10, 20]);
     assert_eq(clock.now(), Instant(30));
@@ -1080,7 +1085,7 @@ fn sleep_then_result(takes: Int, ok: Bool) -> Result<Int, String> / {clock.write
   if ok { Ok(takes) } else { Err("failed at " ++ takes.to_string()) }
 }
 
-test "all_ok answers every success in the bodies' order" {
+test "all_ok returns every success in the bodies' order" {
   simulate {
     assert_eq(
       all_ok([
@@ -1109,7 +1114,7 @@ test "all_ok stops at the first failure, and no body is left running" {
   assert_eq(ran.notes, [])
 }
 
-test "first_ok answers the first success and stops the rest" {
+test "first_ok returns the first success and stops the rest" {
   simulate {
     let first = first_ok([
       || sleep_then_result(30, true),
@@ -1120,7 +1125,7 @@ test "first_ok answers the first success and stops the rest" {
   }
 }
 
-test "first_ok of bodies that all fail answers every failure in the bodies' order" {
+test "first_ok of bodies that all fail returns every failure in the bodies' order" {
   simulate {
     assert_eq(
       first_ok([|| sleep_then_result(3, false), || sleep_then_result(1, false)]),
@@ -1129,7 +1134,7 @@ test "first_ok of bodies that all fail answers every failure in the bodies' orde
   }
 }
 
-law "map_concurrent answers in the order given and never runs more than its limit at once"
+law "map_concurrent returns results in the order given and never runs more than its limit at once"
   forall (items: Few, at_once: Few) where at_once != Zero && (items != Three || at_once != Three) {
     simulate {
       let n = count(items);
@@ -1173,13 +1178,13 @@ law "a semaphore never admits more holders than it has permits, in every interle
     }
   }
 
-/// The order a test's tasks asked for a permit in, and the order they were let in.
+/// The order a test's tasks requested a permit in, and the order they were let in.
 effect queue {
   write requested(i: Int) -> Unit
   write entered(i: Int) -> Unit
 }
 
-law "a semaphore of one permit admits its waiters in the order they asked, in every interleaving"
+law "a semaphore of one permit admits waiters in the order they requested, in every interleaving"
   forall (tasks: Few) {
     simulate {
       let sem = semaphore(1);
@@ -1226,7 +1231,7 @@ test "a semaphore serves its waiters in the order they began to wait" {
   assert_eq(ran.notes, ["first", "second", "third", "fourth"])
 }
 
-test "a permit goes back however its holder ends: cancelled anywhere, or by a raise" {
+test "a permit is returned however its holder ends: cancelled anywhere, or by a raise" {
   simulate {
     let sem = semaphore(1);
     let holder = task.spawn(|| with_permit(sem, || task.yield()));
@@ -1277,7 +1282,7 @@ fn retry_policy(
 
 fn always_fails(attempt: Int) -> Result<Int, String> = Err("no " ++ attempt.to_string())
 
-/// The waits `failures` failures in a row make under `policy`, drawn from `r`, in all.
+/// The total wait after `failures` failures in a row under `policy`, with draws from `r`.
 fn total_wait(policy: Retry<String>, r: random::Rand, failures: Int) -> Int / {abort.raise} =
   range(1, failures + 1).fold(
     { total: 0, previous: policy.base, rand: r },
@@ -1315,7 +1320,7 @@ fn spreads() -> List<Spread> =
     { name: "decorrelated", jitter: DecorrelatedJitter },
   ]
 
-test "a retry waits what its jitter makes of the draws the simulation's seed decides: {c.name}" for c: Spread in spreads(
+test "a retry waits what its jitter computes from the draws the simulation's seed decides: {c.name}" for c: Spread in spreads(
   ) {
   simulate {
     unbounded(|| {
@@ -1404,7 +1409,7 @@ effect budgets {
 fn over_budget(attempts: Int) -> Result<Int, RetryFailure<String>> =
   Err({ last: "no " ++ attempts.to_string(), attempts: attempts, reason: OverBudget })
 
-/// A `Jitter` as a test draws one.
+/// Generates any `Jitter`.
 fn jitters() -> gen::Gen<Jitter> =
   gen::elements([NoJitter, FullJitter, EqualJitter, DecorrelatedJitter])
 
@@ -1434,7 +1439,7 @@ test "a budget never pays for more retries than its reserve and its share of the
 
 fn doubled(base: Int, times: Int) -> Int = range(0, times).fold(base, |wait: Int, _i: Int| wait * 2)
 
-test "a wait is never past the cap nor below what its jitter keeps, whatever the draw" {
+test "a wait is never past the cap nor below its jitter's floor, whatever the draw" {
   gen::check(
     gen::and_then(jitters(), |jitter: Jitter|
       gen::and_then(gen::any_int(), |from: Int|
@@ -1474,7 +1479,7 @@ test "a wait is never past the cap nor below what its jitter keeps, whatever the
 
 // --- Tests of the breaker, the bucket and single flight ---------------------
 
-test "an open breaker refuses every call before its cooldown ends, and lets one probe from then on" {
+test "an open breaker rejects every call until its cooldown ends, then lets one probe at a time" {
   gen::check2(gen::any_int(), gen::any_int(), |cools: Int, asks: Int| {
     let cooldown = rem_euclid(cools, 6);
     let asked = rem_euclid(asks, 9);
@@ -1489,7 +1494,7 @@ test "an open breaker refuses every call before its cooldown ends, and lets one 
   })
 }
 
-test "a call behind a breaker is refused while it is open, probes after the cooldown, and closes it" {
+test "a call behind an open breaker is rejected, probes after the cooldown, and closes it" {
   breaking(breaker(2, Duration(10), 1), ||
     simulate {
       let call = |ok: Bool|
@@ -1510,7 +1515,7 @@ effect breakers {
   write store(b: Breaker) -> Unit
 }
 
-/// `body` with its calls sharing the breaker `b` through `breakers`.
+/// Runs `body` with its calls sharing the breaker `b` through `breakers`.
 fn breaking<a | e>(b: Breaker, body: () -> a / {breakers.load, breakers.store | e}) -> a / e =
   handle {
     body()
@@ -1527,7 +1532,7 @@ fn slow_ok(takes: Int) -> Result<Int, String> / {clock.write} = {
   Ok(takes)
 }
 
-test "a probe that is cancelled is given back, so the next call may probe" {
+test "a probe that is cancelled is released, so the next call may probe" {
   breaking(record(breaker(1, Duration(0), 1), false, Instant(0)), ||
     simulate {
       let call = |takes: Int|
@@ -1568,7 +1573,7 @@ effect buckets {
   write store(b: Bucket) -> Unit
 }
 
-/// `body` with its calls sharing the bucket `b` through `buckets`.
+/// Runs `body` with its calls sharing the bucket `b` through `buckets`.
 fn bucketed<a | e>(b: Bucket, body: () -> a / {buckets.load, buckets.store | e}) -> a / e =
   handle {
     body()
@@ -1600,12 +1605,12 @@ test "tasks through one bucket are spaced as one caller's calls are, in every in
   assert_eq(times.sort(), [Instant(0), Instant(10), Instant(20)])
 }
 
-/// Each run a test's flights start.
+/// Records each run a test's flights start.
 effect ran {
   write run() -> Unit
 }
 
-/// `body`, and how many runs it started.
+/// Runs `body`, and returns its value and how many runs it started.
 fn counted_runs<a | e>(body: () -> a / {ran.run | e}) -> { value: a, runs: Int } / e =
   handle {
     body()
@@ -1617,7 +1622,7 @@ fn counted_runs<a | e>(body: () -> a / {ran.run | e}) -> { value: a, runs: Int }
     return value -> { value: value, runs: runs },
   }
 
-test "callers that ask for one key while it runs share one run and its answer, in every interleaving" {
+test "callers of one key while it runs share one run and its result, in every interleaving" {
   let ran = counted_runs(||
     simulate {
       {
@@ -1643,7 +1648,7 @@ test "callers that ask for one key while it runs share one run and its answer, i
   assert_eq(ran.runs, 1)
 }
 
-test "callers that ask for different keys each run their own, and a later caller runs again" {
+test "callers that request different keys each run their own, and a later caller runs again" {
   let ran = counted_runs(||
     simulate {
       {
@@ -1704,13 +1709,13 @@ fn ticked(missed: MissedTickBehavior) -> List<Int> / {clock.read, clock.write, a
     Continue(seen.push(ran))
   })
 
-test "a ticker whose second tick runs long catches up, starts over or skips, as its policy says" {
+test "a ticker whose second tick runs long catches up, starts over or skips, per its policy" {
   assert_eq(simulate { ticked(Burst) }, [10, 20, 45, 45, 50]);
   assert_eq(simulate { ticked(Delay) }, [10, 20, 55, 65, 75]);
   assert_eq(simulate { ticked(Skip) }, [10, 20, 50, 60, 70])
 }
 
-test "a ticker ends when its tick says so, and never ticks past its limit" {
+test "a ticker ends when its tick returns Stop, and never ticks past its limit" {
   simulate {
     let cancel_and_await = every(Duration(10), Burst, 9, 0, |count: Int, _due: Instant|
       if count == 2 { Stop(count + 1) } else { Continue(count + 1) });

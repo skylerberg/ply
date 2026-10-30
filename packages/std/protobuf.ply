@@ -1,24 +1,24 @@
 //! The Protocol Buffers wire format: tags, varints, zigzag, the two fixed widths and
 //! length-delimited fields, written and read by field number.
 //!
-//! This is the encoding and no schema. A message is written as the fields its writer calls for,
-//! in the order it calls them, and read as the list of the fields it holds, each with its number,
-//! the offset of its tag and its payload as the wire frames it. What a payload means (which of
-//! `int64`, `sint64` or `bool` a varint is; whether a delimited one is text, bytes, a message or
-//! a packed run) is said by the function it is read through. A reader passes over a field number
-//! it does not name, which is how a message gains fields without breaking its readers.
+//! This is the encoding only, with no schema. A writer writes the fields it chooses, in the order
+//! it chooses. A reader reads a message as the list of its fields, each with its number, the offset
+//! of its tag, and its payload as the wire type frames it. The function a payload is read through
+//! decides what it means: whether a varint is an `int64`, a `sint64` or a `bool`, and whether a
+//! delimited payload is text, bytes, a message or a packed run. A reader skips a field number it
+//! does not know, which is how a message gains fields without breaking its readers.
 //!
-//! `fields` takes a `Message`, which only `message` and a delimited field make: bytes with the
-//! `Limits` they are read under. A nested message is a range of its parent's bytes and is never
-//! copied, so every offset in a refusal counts from the start of the outermost input. A reader
-//! refuses, saying why and at which byte: an input longer than the limit, a message nested past
-//! it, a truncated field, a varint past ten bytes or past 64 bits, a field number of zero or past
-//! 29 bits, a group (wire types 3 and 4, which proto3 never writes) and the two wire types
-//! nothing defines. `fields` and the readers of a field raise `protobuf.fail`; `parse` answers
-//! it as an `Err`.
+//! `fields` takes a `Message`: bytes together with the `Limits` they are read under. Only `message`
+//! and `message_of` create one. A nested message is a range of its parent's bytes and is never
+//! copied, so every offset in an error counts from the start of the outermost input. A reader
+//! fails, reporting why and at which byte, on: an input longer than the limit, a message nested
+//! deeper than the limit, a truncated field, a varint longer than ten bytes or 64 bits, a field
+//! number of zero or wider than 29 bits, a group (wire types 3 and 4, which proto3 never writes),
+//! and the two undefined wire types. `fields` and the field readers raise `protobuf.fail`; `parse`
+//! returns the error as an `Err`.
 //!
-//! A 32-bit `float` is not here, since no `Float` has that width, and neither is a `.proto`
-//! reader: a message's field numbers are written where it is encoded.
+//! There is no 32-bit `float`, since no `Float` has that width. There is no `.proto` reader either:
+//! the code that encodes a message writes its field numbers.
 
 import std.bin (zigzag_decode, zigzag_encode)
 import std.bytes (u32_le, u64_le)
@@ -50,7 +50,8 @@ fn wire_number(w: WireType) -> Int =
 /// The greatest field number a tag holds: 29 bits.
 pub fn max_field_number() -> Int = 536870911
 
-/// A field's tag. Panics for a field number below one or past `max_field_number`, which no message has.
+/// A field's tag. Raises for a field number below one or above `max_field_number`, which no message
+/// has.
 pub fn tag(field: Int, wire: WireType) -> Bytes / {abort.raise} =
   if field < 1 || field > max_field_number() {
     panic("a field number is from 1 to 536870911, and this one is " ++ field.to_string())
@@ -60,7 +61,8 @@ pub fn tag(field: Int, wire: WireType) -> Bytes / {abort.raise} =
 pub fn int_field(field: Int, n: Int) -> Bytes / {abort.raise} =
   tag(field, VarintWire).concat(varint(n))
 
-/// A `sint32` or `sint64` field: the varint of its zigzag, which is `std.bin`'s `zigzag_encode`.
+/// A `sint32` or `sint64` field: the varint of `n`'s zigzag encoding, as `std.bin`'s
+/// `zigzag_encode` computes it.
 pub fn sint_field(field: Int, n: Int) -> Bytes / {abort.raise} = int_field(field, zigzag_encode(n))
 
 /// A `bool` field.
@@ -91,12 +93,12 @@ pub fn bytes_field(field: Int, b: Bytes) -> Bytes / {abort.raise} =
 pub fn string_field(field: Int, s: String) -> Bytes / {abort.raise} =
   bytes_field(field, Bytes::of_string(s))
 
-/// A field holding a message already encoded as `body`. It is written even where `body` is
-/// empty, which is how a message says a submessage is present and holds nothing.
+/// A field containing a message already encoded as `body`. It is written even when `body` is empty,
+/// which is how a message marks a submessage as present but empty.
 pub fn message_field(field: Int, body: Bytes) -> Bytes / {abort.raise} = bytes_field(field, body)
 
-/// A repeated varint field, packed: one delimited payload of the numbers in order. Nothing for
-/// an empty list, as proto3 writes it.
+/// A repeated varint field, packed: one delimited payload of the numbers in order. No bytes for an
+/// empty list, as proto3 writes it.
 pub fn packed_ints(field: Int, ns: List<Int>) -> Bytes / {abort.raise} =
   packed(field, ns.map(varint))
 
@@ -114,17 +116,17 @@ fn packed(field: Int, items: List<Bytes>) -> Bytes / {abort.raise} =
 fn fixed64(n: U64) -> Bytes / {abort.raise} =
   u32_le(Int::of_u64(n & 0xFFFF_FFFFu64)).concat(u32_le(Int::of_u64(n >>> 32)))
 
-// --- Refusals ---------------------------------------------------------------
+// --- Errors -----------------------------------------------------------------
 
-/// Why a reader refused.
+/// Why a reader failed.
 pub type ErrorKind =
-  /// The input ends inside a field, or a length names more bytes than its message holds.
+  /// The input ends inside a field, or a length counts more bytes than its message has left.
   | Truncated
-  /// A varint of more than ten bytes, or one whose tenth byte holds bits past the sixty-fourth.
+  /// A varint of more than ten bytes, or one whose tenth byte sets bits past the sixty-fourth.
   | Overflow
   /// Wire type 3 or 4: a group, which proto2 wrote and proto3 does not.
   | Group
-  /// Wire type 6 or 7, which it carries: nothing is defined for either.
+  /// Wire type 6 or 7, whose number it contains. Neither is defined.
   | UnknownWireType(Int)
   /// A field number of zero, or one past `max_field_number`.
   | BadFieldNumber
@@ -132,19 +134,19 @@ pub type ErrorKind =
   | TooDeep
   /// An input longer than `Limits.length`.
   | TooLong
-  /// A field read as something its wire type does not frame: a varint read as a message, say.
+  /// A field read as a type its wire type cannot frame, such as a varint read as a message.
   | WrongWireType
   /// A `string` field that is not UTF-8.
   | NotUtf8
   /// A packed run of fixed-width numbers whose length is not a whole number of them.
   | UnevenPackedLength
 
-/// A refusal, and the offset in the outermost input of the byte the reader stood at.
+/// A reading error, and the offset in the outermost input of the byte the reader was at.
 pub type Error = new { at: Int, reason: ErrorKind }
 
-/// What a reader of this module raises where it refuses.
+/// The effect this module's readers raise when they fail.
 pub effect protobuf {
-  /// The bytes are not a message a reader can take, or a field is not what it was read as.
+  /// The bytes are not a message a reader accepts, or a field is not the type it was read as.
   raise fail(e: Error)
 }
 
@@ -152,7 +154,7 @@ fn fail<a>(at: Int, why: ErrorKind) -> a / {protobuf.fail} = protobuf.fail({ at:
 
 // --- Reading ----------------------------------------------------------------
 
-/// What a reader holds an input to.
+/// The limits a reader enforces on an input.
 pub type Limits = new {
   /// How many messages may nest inside the outermost one.
   depth: Int,
@@ -160,12 +162,12 @@ pub type Limits = new {
   length: Int,
 }
 
-/// A message's bytes, where they stand in the input they were read from.
+/// A message's bytes, as a range of the input they were read from.
 pub opaque type Message = new { data: Bytes, from: Int, to: Int, room: Int }
 
 /// A field's payload, as its wire type frames it.
 pub type Value =
-  /// The 64 bits a varint spells.
+  /// The 64 bits a varint encodes.
   | Varint(Int)
   | Fixed64(U64)
   | Delimited(Message)
@@ -174,19 +176,19 @@ pub type Value =
 /// One field of a message: its number, the offset of its tag, and its payload.
 pub type Field = new { number: Int, at: Int, value: Value }
 
-/// `data` as a message to read under `limits`. Refuses one longer than `limits.length`.
+/// `data` as a message to read under `limits`. Fails for `data` longer than `limits.length`.
 pub fn message(data: Bytes, limits: Limits) -> Message / {protobuf.fail} =
   if data.len() > limits.length { fail(limits.length, TooLong) }
   else { { data: data, from: 0, to: data.len(), room: limits.depth } }
 
-/// The bytes a message is.
+/// A message's bytes.
 pub fn payload(m: Message) -> Bytes / {abort.raise} = m.data.slice(m.from, m.to)
 
 /// Where a message starts in the outermost input.
 pub fn offset(m: Message) -> Int = m.from
 
-/// Every field of `m`, in the order the message holds them; a field written twice is there
-/// twice. Refuses a message nested past the limit it was made under.
+/// Every field of `m`, in the order they appear; a field written twice appears twice. Fails for a
+/// message nested deeper than the limit it was made under.
 pub fn fields(m: Message) -> List<Field> / {protobuf.fail, abort.raise} =
   if m.room < 0 { fail(m.from, TooDeep) } else {
     iterate({ at: m.from, acc: [] }, m.to - m.from + 1, |s: { at: Int, acc: List<Field> }|
@@ -274,7 +276,7 @@ fn varint_at(m: Message, at: Int) -> VarintRead / {protobuf.fail, abort.raise} =
 
 // --- Reading a field ----------------------------------------------------------
 
-/// An `int32`, `int64`, `uint64` or enum field: the 64 bits its varint spells.
+/// An `int32`, `int64`, `uint64` or enum field: the 64 bits its varint encodes.
 pub fn int_of(f: Field) -> Int / {protobuf.fail} =
   match f.value { Varint(n) -> n, _ -> fail(f.at, WrongWireType) }
 
@@ -284,7 +286,7 @@ pub fn sint_of(f: Field) -> Int / {protobuf.fail} = zigzag_decode(int_of(f))
 /// A `bool` field: any varint but zero is true.
 pub fn bool_of(f: Field) -> Bool / {protobuf.fail} = int_of(f) != 0
 
-/// A `uint32` field: the low 32 bits of its varint, as every reader truncates one.
+/// A `uint32` field: the low 32 bits of its varint, as every protobuf reader truncates it.
 pub fn uint32_of(f: Field) -> U32 / {protobuf.fail, abort.raise} =
   U32::of_int(int_of(f) & 0xFFFF_FFFF)
 
@@ -302,22 +304,23 @@ pub fn double_of(f: Field) -> Float / {protobuf.fail, abort.raise} = Float::of_b
 pub fn fixed32_of(f: Field) -> U32 / {protobuf.fail} =
   match f.value { Fixed32(n) -> n, _ -> fail(f.at, WrongWireType) }
 
-/// A field holding a message, to hand to `fields`.
+/// A field containing a message, to pass to `fields`.
 pub fn message_of(f: Field) -> Message / {protobuf.fail} =
   match f.value { Delimited(m) -> m, _ -> fail(f.at, WrongWireType) }
 
 /// A `bytes` field.
 pub fn bytes_of(f: Field) -> Bytes / {protobuf.fail, abort.raise} = payload(message_of(f))
 
-/// A `string` field. Refuses bytes that are not UTF-8, at their first byte.
+/// A `string` field. Fails for bytes that are not UTF-8, with the error at the payload's first
+/// byte.
 pub fn string_of(f: Field) -> String / {protobuf.fail, abort.raise} = {
   let m = message_of(f);
   let raw = payload(m);
   if raw.is_utf8() { String::of_bytes(raw) } else { fail(m.from, NotUtf8) }
 }
 
-/// The numbers one occurrence of a repeated varint field holds: a packed run, or the one number
-/// an unpacked occurrence is. A reader takes either, whichever the writer chose.
+/// The numbers in one occurrence of a repeated varint field: a packed run, or the single number of
+/// an unpacked occurrence. A reader accepts either, whichever the writer chose.
 pub fn ints_of(f: Field) -> List<Int> / {protobuf.fail, abort.raise} =
   match f.value {
     Varint(n) -> [n],
@@ -330,7 +333,7 @@ pub fn ints_of(f: Field) -> List<Int> / {protobuf.fail, abort.raise} =
     _ -> fail(f.at, WrongWireType),
   }
 
-/// The numbers one occurrence of a repeated `fixed64` field holds, packed or not.
+/// The numbers in one occurrence of a repeated `fixed64` field, packed or not.
 pub fn fixed64s_of(f: Field) -> List<U64> / {protobuf.fail, abort.raise} =
   match f.value {
     Fixed64(n) -> [n],
@@ -342,11 +345,11 @@ pub fn fixed64s_of(f: Field) -> List<U64> / {protobuf.fail, abort.raise} =
     _ -> fail(f.at, WrongWireType),
   }
 
-/// The numbers one occurrence of a repeated `double` field holds, packed or not.
+/// The numbers in one occurrence of a repeated `double` field, packed or not.
 pub fn doubles_of(f: Field) -> List<Float> / {protobuf.fail, abort.raise} =
   fixed64s_of(f).map(|n: U64| Float::of_bits(signed(n)))
 
-/// The `Int` whose 64 bits `n` is.
+/// The `Int` with the same 64 bits as `n`.
 fn signed(n: U64) -> Int / {abort.raise} =
   Int::of_u64(n >>> 32) << 32 | Int::of_u64(n & 0xFFFF_FFFFu64)
 
@@ -454,10 +457,10 @@ test "a field's number and the fields after it survive any payload before them" 
   })
 }
 
-/// A field number made of any `Int`.
+/// A valid field number derived from any `Int`.
 fn to_field_number(k: Int) -> Int = 1 + (k & 536870910)
 
-test "a reader takes a repeated number packed or one at a time" {
+test "a reader accepts a repeated number packed or one at a time" {
   let unpacked = int_field(6, 3).concat(int_field(6, 270));
   let packed = packed_ints(6, [3, 270]);
   let numbers = |data: Bytes|
@@ -475,7 +478,7 @@ test "a reader takes a repeated number packed or one at a time" {
   )
 }
 
-test "a field a reader does not name is passed over, whatever its wire type" {
+test "a reader skips a field it does not know, whatever its wire type" {
   let data = Bytes::concat_all([
     int_field(1, 7),
     fixed64_field(90, 5u64),
@@ -521,11 +524,11 @@ fn error_cases() -> List<ErrorCase> =
     { name: "wire type seven", hex: "0f", at: 0, reason: UnknownWireType(7) },
   ]
 
-test "refused: {c.name}" for c: ErrorCase in error_cases() {
+test "rejected: {c.name}" for c: ErrorCase in error_cases() {
   assert_eq(error_of(c.hex, generous()), Some({ at: c.at, reason: c.reason }))
 }
 
-test "an input past the length limit is refused before a byte of it is read" {
+test "an input past the length limit is rejected before any of it is read" {
   let limits: Limits = { depth: 4, length: 3 };
   assert_eq(error_of("089601", limits), None);
   assert_eq(error_of("08960108", limits), Some({ at: 3, reason: TooLong }))
@@ -540,13 +543,13 @@ fn deepest(m: Message, left: Int) -> Int / {protobuf.fail, abort.raise} =
       match f.number { 1 -> sum + int_of(f), _ -> sum + deepest(message_of(f), left - 1) })
   }
 
-test "a message nested past the depth limit is refused where the limit ran out" {
+test "a message nested past the depth limit is rejected where the limit ran out" {
   let limits: Limits = { depth: 3, length: 1024 };
   assert_eq(try { deepest(message(nested(3), limits), 16) }, Ok(1));
   assert_eq(try { deepest(message(nested(4), limits), 16) }, Err({ at: 8, reason: TooDeep }))
 }
 
-test "a field read as what its wire type does not frame is refused at its tag" {
+test "a field read as a type its wire type cannot frame is rejected at its tag" {
   assert_eq(
     try { offset(message_of(only(int_field(1, 5)))) },
     Err({ at: 0, reason: WrongWireType }),
@@ -563,7 +566,7 @@ test "a field read as what its wire type does not frame is refused at its tag" {
   )
 }
 
-test "the raising reader raises what `parse` answers, and a task may perform it" {
+test "the raising reader raises the error `parse` returns, and a task may perform it" {
   let got = simulate {
     let t = task.spawn(|| try { read(Bytes::of_hex("0b")) });
     task.join(t)

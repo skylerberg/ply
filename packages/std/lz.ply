@@ -1,15 +1,16 @@
-//! What the writers of `std.zstd` and `std.brotli` share: finding what repeats, and making a
-//! prefix code of how often each symbol occurs.
+//! Code shared by the `std.zstd` and `std.brotli` encoders: finding repeated bytes, and building a
+//! prefix code from how often each symbol occurs.
 //!
-//! `find_matches` reads a block for matches and answers it as sequences, each a run of literals and the
-//! match after it. `code_lengths` is a Huffman code held to a longest length, and `code_bases` the
-//! table both formats spell a length or a count by: a code and a few extra bits.
+//! `find_matches` searches a block for matches and returns it as sequences, each a run of literals
+//! followed by a match. `code_lengths` builds a Huffman code limited to a maximum length.
+//! `code_bases` builds the table both formats use to write a length or a count as a code plus a
+//! few extra bits.
 
 import std.bytes
 import std.list
 
-/// Each code's first value over the count of its extra bits, `first << 5 | extra`: a code starts
-/// where the one before it ends, and `first` is where the first does.
+/// Each code's base value and number of extra bits, packed as `base << 5 | extra`. A code's base
+/// is where the code before it ends, and the first code's base is `first`.
 pub fn code_bases(extra: List<Int>, first: Int) -> Array<Int> =
   Array::of_list(
     extra.fold({ out: [], base: first }, |s: { out: List<Int>, base: Int }, e: Int|
@@ -22,12 +23,13 @@ fn tally_from(b: Bytes, i: Int, counts: Array<Int>) -> Array<Int> / {abort.raise
     tally_from(b, i + 1, counts.set(v, counts.get(v) + 1))
   }
 
-/// How many times each byte value stands in `b`, by value.
+/// How many times each byte value occurs in `b`, indexed by value.
 pub fn tally(b: Bytes) -> Array<Int> / {abort.raise} = tally_from(b, 0, Array::new(256, 0))
 
-/// The two lightest nodes not yet joined are joined under a new one, until one is left. Leaves
-/// stand first, lightest first, and the joined nodes after them in the order they were made,
-/// which is by weight too, so the lightest is the next leaf or the next joined node.
+/// Builds a Huffman tree by joining the two lightest unjoined nodes under a new node until one is
+/// left, and returns each node's parent. Leaves come first, lightest first, and joined nodes
+/// follow in the order they were made. Joined nodes are made in order of weight too, so the
+/// lightest node is always the next leaf or the next joined node.
 fn build_tree(
   weight: Array<Int>,
   parent: Array<Int>,
@@ -52,11 +54,12 @@ fn build_tree(
     )
   }
 
-/// Each node's depth below the last one made, which is the root.
+/// Each node's depth below the root, which is the last node made.
 fn node_depths(parent: Array<Int>, k: Int, depth: Array<Int>) -> Array<Int> / {abort.raise} =
   if k < 0 { depth } else { node_depths(parent, k - 1, depth.set(k, depth.get(parent.get(k)) + 1)) }
 
-/// The lengths over `keyed`, each `count << 10 | symbol` and sorted, into an array of `symbols`.
+/// The code length of each symbol in `keyed`, in an array of `symbols` entries. Each key is
+/// `count << 10 | symbol`, and the keys are sorted.
 fn limited_lengths(
   keyed: List<Int>,
   most: Int,
@@ -77,10 +80,11 @@ fn limited_lengths(
   }
 }
 
-/// The length of each symbol's code, by symbol and 0 for one that does not occur, in a Huffman
-/// code of at most `most` bits, which is eight at least: `counts` holds how often each symbol of
-/// an alphabet of 1024 at most occurs, and two of them at least do. A code that would run longer
-/// than `most` is made again over half the counts, so it is whole and close to the shortest.
+/// The length of each symbol's code in a Huffman code of at most `most` bits, indexed by symbol,
+/// with 0 for a symbol that does not occur. `most` is at least eight. `counts` gives how often
+/// each symbol occurs, for an alphabet of at most 1024 symbols, and at least two symbols occur. If
+/// a code would be longer than `most`, it is rebuilt from halved counts, so the code stays
+/// complete and close to optimal.
 pub fn code_lengths(counts: Array<Int>, most: Int) -> Array<Int> / {abort.raise} =
   limited_lengths(
     range(0, counts.len()).map(|s: Int| counts.get(s) << 10 | s).filter(|k: Int| k > 1023).sort(),
@@ -92,8 +96,9 @@ pub fn code_lengths(counts: Array<Int>, most: Int) -> Array<Int> / {abort.raise}
 /// Each byte value as the one byte it is.
 const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_of_int))
 
-/// `out` and the whole bytes of the `n` bits in `acc`, the lowest eight first: how a writer of
-/// bits lets go of them. What is left to write is `acc >>> (n & 0x78)`, of `n & 7` bits.
+/// Appends to `out` the whole bytes among the `n` bits in `acc`, lowest byte first. This is how a
+/// bit writer flushes its buffer. The bits still to write are `acc >>> (n & 0x78)`, which has
+/// `n & 7` bits.
 pub fn flush_bits(out: Bytes, acc: Int, n: Int) -> Bytes / {abort.raise} =
   if n < 8 { out }
   else if n < 16 { out ++ single_bytes().get(acc & 255) } else {
@@ -104,8 +109,8 @@ pub fn flush_bits(out: Bytes, acc: Int, n: Int) -> Bytes / {abort.raise} =
     )
   }
 
-/// The code of each value below `n`: the last of `code_bases` that starts at or below it, `first`
-/// being the least value they code.
+/// One byte for each `v` below `n`: the code of the value `v + first`, which is the last entry of
+/// `code_bases` whose base is at or below that value.
 pub fn codes_below(code_bases: Array<Int>, first: Int, n: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all(
     range(0, n).map(|v: Int|
@@ -115,17 +120,17 @@ pub fn codes_below(code_bases: Array<Int>, first: Int, n: Int) -> Bytes / {abort
       )),
   )
 
-/// What looking through a block leaves: where the bytes of four last stood, the block's
-/// sequences as `literals | match length << 20 | distance << 40`, and where its last match
-/// ended.
+/// The result of searching a block for matches. `table` records where each four-byte value last
+/// occurred. `sequences` lists the block's sequences, each packed as
+/// `literals | match length << 20 | distance << 40`. `anchor` is where the last match ended.
 pub type Matches = { table: Array<Int>, sequences: List<Int>, anchor: Int }
 
-/// The matches of `buf` from `i` to `end`: at each place, the bytes of the last match's distance
-/// back, or the last place the next four bytes stood within 2 MiB, if either holds the same four.
-/// `table` holds each place plus one, counted from the stream's start, which is `shift` before
-/// `buf`'s; it has 131072 entries, and `anchor` is where the block's unmatched bytes start. A
-/// place nothing matches at is passed, the faster the longer nothing has, and `fuel` bounds the
-/// places.
+/// Finds the matches in `buf` from `i` to `end`. At each position, a match is tried at the last
+/// match's distance back, then at the last position within 2 MiB where the next four bytes
+/// occurred. Either is used if it has the same four bytes. `table` has 131072 entries, each a
+/// position plus one, counted from the start of the stream, which is `shift` bytes before the
+/// start of `buf`. `anchor` is where the block's unmatched bytes start. Positions with no match
+/// are skipped, faster the longer no match has been found. `fuel` limits the positions tried.
 pub fn find_matches(
   buf: Bytes,
   i: Int,
@@ -161,7 +166,7 @@ pub fn find_matches(
       )
     } else {
       let length = buf.agreeing(i - dist, i, end - i, 4);
-      // Two places inside the match are filed as well, so what follows can match from within it.
+      // Record two positions inside the match too, so later bytes can match from within it.
       let inner = marked.set(Int::of_u32(buf.u32_le(i + 2)) * 506832829 >>> 44, i + shift + 3);
       let tail = i + length - 2;
       find_matches(
@@ -179,11 +184,11 @@ pub fn find_matches(
     }
   }
 
-test "spans start each code where the one before ends" {
+test "each code starts where the one before it ends" {
   assert_eq(code_bases([0, 0, 1, 2], 3).to_list(), [3 << 5, 4 << 5, 5 << 5 | 1, 7 << 5 | 2])
 }
 
-test "a code's lengths are a whole code, the commoner symbol never the longer, and none past the most" {
+test "code lengths are complete, never longer for a more common symbol, and within the limit" {
   let counts = Array::of_list([40, 0, 30, 10, 10, 5, 3, 1, 1]);
   let lengths = code_lengths(counts, 15).to_list();
   assert_eq(lengths, [1, 0, 2, 4, 4, 4, 5, 6, 6]);
@@ -196,14 +201,14 @@ test "a code's lengths are a whole code, the commoner symbol never the longer, a
   assert_eq(code_lengths(Array::of_list([0, 7, 0, 9]), 15).to_list(), [0, 1, 0, 1])
 }
 
-test "a byte is counted each time it stands" {
+test "a byte is counted each time it occurs" {
   let counts = tally(b"abracadabra");
   assert_eq(counts.get(97), 5);
   assert_eq(counts.get(98), 2);
   assert_eq(counts.get(122), 0)
 }
 
-test "what repeats is found as literals and a match, and what does not is left unmatched" {
+test "repeated text is found as literals and a match, and text with no repeats stays unmatched" {
   let text = b"a sentence with a sentence in it, and a sentence with a sentence in it again";
   let seen = find_matches(text, 0, 0, text.len(), Array::new(131072, 0), [], 0, 0, 1000);
   let total = seen.sequences.fold(0, |n: Int, s: Int| n + (s & 0xF_FFFF) + (s >>> 20 & 0xF_FFFF));

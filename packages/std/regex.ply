@@ -1,88 +1,88 @@
-//! Regular expressions that match in steps linear in the subject: RE2's syntax, without
+//! Regular expressions that match in time linear in the subject: RE2's syntax, without
 //! backreferences or lookaround, over a `String` a character at a time and over `Bytes` a byte
 //! at a time.
 //!
-//! A pattern is compiled once, by `compile` to a `Result` or by `read`, which raises
-//! `regex.refused`: a refusal says why, and at which character of the pattern. `compile_bytes`
-//! and `read_bytes` make a `ByteRegex`, whose pattern's characters are bytes. A pattern written
-//! in source is a literal, `re"a+b"`, compiled when the program is checked (`std.re`).
+//! A pattern is compiled once, by `compile` to a `Result` or by `read`, which raises `regex.fail`.
+//! An error reports why, and at which character of the pattern. `compile_bytes` and `read_bytes`
+//! make a `ByteRegex`, whose pattern's characters are bytes. A pattern written in source is a
+//! literal, `re"a+b"`, compiled when the program is checked (`std.re`).
 //!
 //! What a search costs. No search goes back over its subject to try another way: it follows
-//! every state the pattern could be in at once, each entered once a position, so its steps grow
-//! as the subject's length times the pattern's size at most, and for no pattern do they double
-//! with a character more. `is_match`, `find` and `find_all` go one state at a time instead
-//! wherever a subject is longer than `Options.short`: each set of states met is kept and stepped
-//! by a table, a step a byte, up to `Options.state_limit` of them, past which the search goes on
-//! by every state at once. A search skips straight to the next byte a match can start with, or
-//! to the next place the text every match starts with stands; where every match holds some
-//! text, as one of `\w+@example\.com` holds `@example.com`, a subject without it is refused
-//! unread; and a pattern that is text alone is found as text. Groups are read only where they
-//! are asked for, and then over the match alone. A pattern compiles to at most
-//! `Options.size_limit` instructions, each counted repetition written out, and one past that is
-//! refused before it is built.
+//! every state the pattern could be in at once, entering each at most once per position, so its
+//! steps grow at most as the subject's length times the pattern's size, and for no pattern do
+//! they double with one more character. `is_match`, `find` and `find_all` instead track one set
+//! of states at a time whenever a subject is longer than `Options.short`: each set of states
+//! found is cached and stepped by a table, one step per byte, up to `Options.state_limit` sets,
+//! beyond which the search continues with every state at once. A search skips straight to the
+//! next byte a match can start with, or to the next occurrence of the text every match starts
+//! with. When every match contains some text, as every match of `\w+@example\.com` contains
+//! `@example.com`, a subject without that text is ruled out without being scanned, and a pattern
+//! that is plain text is found as text. Groups are computed only when requested, and then only
+//! over the match. A pattern compiles to at most `Options.size_limit` instructions, with each
+//! counted repetition written out, and a pattern past that is rejected before it is built.
 //!
 //! The syntax is RE2's:
 //!
-//! - A character is itself; `.` is any but a line feed; `\` before punctuation is that
-//!   character; `\a \f \n \r \t \v`, `\0` and up to two octal digits more, `\xNN` and
-//!   `\x{N...}` write one by its number; `\Q...\E` is its text as it stands.
+//! - A character matches itself; `.` matches any character but a line feed; `\` before
+//!   punctuation is that character; `\a \f \n \r \t \v`, `\0` and up to two more octal digits,
+//!   `\xNN` and `\x{N...}` write one by its number; `\Q...\E` is its text taken literally.
 //! - `[abc]`, `[a-z]` and `[^a-z]` are one character of a class. A `]` first in a class and a
-//!   `-` first or last are themselves. `\d`, `\w` and `\s` are a digit, a word's character
-//!   and white space, `\D`, `\W` and `\S` every other character, and `[[:alpha:]]` and
-//!   `[[:^alpha:]]` the POSIX classes, all of them in or out of a class.
+//!   `-` first or last are themselves. `\d`, `\w` and `\s` are a digit, a word character and
+//!   white space; `\D`, `\W` and `\S` every other character; and `[[:alpha:]]` and
+//!   `[[:^alpha:]]` the POSIX classes; all of them work inside or outside a class.
 //! - `\pL` and `\p{Greek}` are a character with a Unicode property, and `\PL`, `\P{Greek}` and
-//!   `\p{^Greek}` one without it, in or out of a class, over text only: a general category by
-//!   its abbreviation or its name (`Lu`, `Uppercase_Letter`), a major class (`L`, `Letter`),
+//!   `\p{^Greek}` one without it, inside or outside a class, over text only: a general category
+//!   by its abbreviation or its name (`Lu`, `Uppercase_Letter`), a major class (`L`, `Letter`),
 //!   `LC`, a script by its name in the database (`Greek`, `Old_Italic`), `Alphabetic`,
 //!   `Lowercase`, `Uppercase`, `White_Space`, `XID_Start`, `XID_Continue`, and `Any`.
-//! - `^` and `$` are the subject's start and its very end, never the place before a last line
+//! - `^` and `$` are the subject's start and its very end, never the position before a last line
 //!   feed, and `\A` and `\z` are those whatever the flags; `\b` is a word's edge and `\B` any
-//!   other place.
-//! - `xy` is `x` then `y`, and `x|y` either, `x` preferred.
+//!   other position.
+//! - `xy` is `x` then `y`, and `x|y` either, with `x` preferred.
 //! - `x*`, `x+`, `x?`, `x{n}`, `x{n,}` and `x{n,m}` repeat `x`, taking as much as they can, and
-//!   with a `?` after as little. A count is at most 1000, and a `{` that opens no count is
-//!   itself.
-//! - `(x)` is a group, numbered from 1 by where its `(` stands, `(?P<name>x)` or `(?<name>x)` one
-//!   with a name, and `(?:x)` no group at all.
-//! - `(?i)` ignores case, `(?m)` makes `^` and `$` a line's start and end, `(?s)` lets `.` be a
-//!   line feed, `(?U)` swaps which repetitions take little and `(?u)` makes `\d`, `\w`, `\s`
-//!   and `\b` Unicode's: each to the end of the group it is written in, `(?i:x)` for `x` alone,
-//!   and `(?-i)` to end one.
+//!   with a `?` after, as little as they can. A count is at most 1000, and a `{` that does not
+//!   start a count matches itself.
+//! - `(x)` is a group, numbered from 1 in the order of its `(`, `(?P<name>x)` or `(?<name>x)` a
+//!   group with a name, and `(?:x)` no group at all.
+//! - `(?i)` ignores case, `(?m)` makes `^` and `$` a line's start and end, `(?s)` lets `.` match
+//!   a line feed, `(?U)` swaps which repetitions take as little as they can, and `(?u)` makes
+//!   `\d`, `\w`, `\s` and `\b` Unicode's. Each lasts to the end of the group it is written in;
+//!   `(?i:x)` applies to `x` alone, and `(?-i)` ends one.
 //!
-//! What is refused, by name: a backreference (`\1`, `\k<name>`, `(?P=name)`) and lookahead or
-//! lookbehind, either of which would cost more than linear steps; a repetition of a repetition,
-//! which a possessive `a*+` writes; `\C`; and a `\p` that names no property read here. An octal
-//! escape opens with `\0`, so that `\1` to `\9` are always the backreferences they are
-//! elsewhere.
+//! What is rejected, each with its own reason: a backreference (`\1`, `\k<name>`, `(?P=name)`)
+//! and lookahead or lookbehind, either of which would cost more than linear steps; a repetition
+//! of a repetition, such as a possessive `a*+`; `\C`; and a `\p` that names no property this
+//! module reads. An octal escape starts with `\0`, so that `\1` to `\9` are always the
+//! backreferences they are elsewhere.
 //!
-//! Unicode. A character is a code point: `.`, a class written out and a negated class are over
-//! all of them, and a match never ends inside one. `\d`, `\w`, `\s`, `\b` and the POSIX
-//! classes are ASCII's unless `(?u)` is written, as they are in RE2: a pattern is most often
-//! over a protocol's text, where a digit is one of ten and a word's edge must not move with
-//! the Unicode version. Under `(?u)`, `\d` is `\p{Nd}`, `\s` is `\p{White_Space}`, `\w` is
-//! UTS #18's word character (alphabetic, a mark, a decimal digit, connector punctuation or a
-//! joiner), and `\b` is an edge of a run of those; a search for a pattern with such a `\b`
-//! always follows every state at once. `(?i)` folds as Unicode's simple case folding does, so
-//! `(?i)k` also matches the Kelvin sign, `(?i)σ` every sigma and an accented letter its other
-//! case; a character whose other case is several characters, as `ß` and `SS`, is not paired
-//! with them. A pattern over bytes folds ASCII's letters alone, and reads no `\p` and no
-//! `(?u)`. The tables are of the Unicode version `std.ucd` names.
+//! Unicode. A character is a code point: `.`, a class written out and a negated class range over
+//! all of them, and a match never ends inside one. `\d`, `\w`, `\s`, `\b` and the POSIX classes
+//! are ASCII-only unless `(?u)` is written, as in RE2: a pattern is most often over a protocol's
+//! text, where a digit is one of ten and a word's edge must not change with the Unicode version.
+//! Under `(?u)`, `\d` is `\p{Nd}`, `\s` is `\p{White_Space}`, `\w` is UTS #18's word character
+//! (alphabetic, a mark, a decimal digit, connector punctuation or a joiner), and `\b` is an edge
+//! of a run of those. A search for a pattern with such a `\b` always follows every state at once.
+//! `(?i)` folds case as Unicode's simple case folding does, so `(?i)k` also matches the Kelvin
+//! sign, `(?i)σ` every sigma, and an accented letter its other case. A character whose other case
+//! is several characters, such as `ß` and `SS`, is not paired with them. A pattern over bytes
+//! folds only ASCII letters, and accepts no `\p` and no `(?u)`. The tables are from the Unicode
+//! version that `std.ucd` names.
 //!
-//! Which match. Of the matches that start leftmost, the one a search that tried each
-//! alternative in order, and each repetition's more before its less, would find first, as Perl
-//! and RE2 choose; `Options.longest` asks for the longest at the leftmost start instead, as
-//! POSIX has it, a group then being what the first such way to match gives it. `find_all`,
-//! `captures_all`, `replace_all` and `split` take matches in order, none overlapping: a search
-//! starts where the last match ended, and one character on from an empty one, and an empty
-//! match is passed over where the match before it ended.
+//! Which match. Of the matches that start leftmost, a search returns the one that a search trying
+//! each alternative in order, and each repetition's longer option before its shorter, would find
+//! first, as Perl and RE2 choose. `Options.longest` requests the longest match at the leftmost
+//! start instead, as POSIX specifies, with each group getting what the first such way to match
+//! gives it. `find_all`, `captures_all`, `replace_all` and `split` take matches in order, none
+//! overlapping: a search starts where the last match ended, or one character after an empty one,
+//! and an empty match is skipped where the previous match ended.
 //!
 //! A `Span` counts characters of a `String` and bytes of a `Bytes`, as `String::slice` and
 //! `Bytes::slice` do.
 //!
-//! When something else serves. A pattern over paths, with `**` and braces, is `std.glob`'s.
-//! Anything that nests, brackets that must balance or a grammar with a rule that names itself,
-//! is past what a regular expression can say, and text whose parts a program wants as values
-//! rather than spans is a parser's: `std.parse` builds one from smaller ones.
+//! When to use something else. A pattern over paths, with `**` and braces, belongs to
+//! `std.glob`. Anything that nests, such as brackets that must balance or a grammar with a
+//! recursive rule, is beyond what a regular expression can express. Text whose parts a program
+//! wants as values rather than spans needs a parser: `std.parse` builds one from smaller ones.
 
 import std.bytes (hex_value, is_digit, is_letter)
 import std.char
@@ -95,9 +95,9 @@ import std.string
 import std.ucd
 import std.gen
 
-// --- What a pattern is refused for --------------------------------------------
+// --- What a pattern is rejected for --------------------------------------------
 
-/// Why a pattern, or a replacement template, is refused.
+/// Why a pattern, or a replacement template, is rejected.
 pub type ErrorKind =
   /// A `(` with no `)`.
   | UnclosedGroup
@@ -105,25 +105,25 @@ pub type ErrorKind =
   | UnopenedGroup
   /// A `[` whose class the pattern ends inside.
   | UnclosedClass
-  /// A range in a class whose ends stand out of order.
+  /// A range in a class whose ends are out of order.
   | BadRange
-  /// A `[:name:]` that names no class.
+  /// A `[:name:]` that is not a known class.
   | BadClassName
   /// A `\` with no character after it.
   | TrailingEscape
-  /// A `\` before a letter or a digit that is no escape here.
+  /// A `\` before a letter or a digit that is not an escape here.
   | BadEscape
   /// A `*`, `+`, `?` or `{n,m}` with nothing before it to repeat.
   | NothingToRepeat
-  /// A repetition of a repetition, which `a**` and the possessive `a*+` both write.
+  /// A repetition of a repetition, such as `a**` and the possessive `a*+`.
   | NestedRepeat
   /// A count past 1000, or a `{n,m}` whose `n` is the greater.
   | BadRepeat
-  /// A `(?` that opens nothing this dialect has.
+  /// A `(?` that starts nothing this dialect supports.
   | BadGroup
-  /// A group's name that is empty or holds more than letters, digits and `_`.
+  /// A group's name that is empty or contains anything but letters, digits and `_`.
   | BadGroupName
-  /// A name two groups are given.
+  /// A name given to two groups.
   | DuplicateName
   /// `\1`, `\k<name>` or `(?P=name)`.
   | Backreference
@@ -135,27 +135,27 @@ pub type ErrorKind =
   | HalfCharacter
   /// A character past `U+00FF` in a pattern over bytes.
   | NotAByte
-  /// A pattern whose program would hold more instructions than its limit.
+  /// A pattern whose program would have more instructions than its limit.
   | TooLarge
   /// Groups nested more than 200 deep.
   | TooDeep
-  /// A `$` in a template that no group's number or name, and no second `$`, follows.
+  /// A `$` in a template that is not followed by a group's number or name, or by a second `$`.
   | LoneDollar
   /// A `${` in a template with no `}`.
   | UnclosedName
   /// A template that names a group its pattern lacks.
   | NoSuchGroup
 
-/// A refusal, and the character of the pattern or template it is about.
+/// A compile error, and the offset of the character of the pattern or template it is about.
 pub type Error = { at: Int, reason: ErrorKind }
 
-/// What `read` and `read_template` raise where they refuse.
+/// The effect `read` and `read_template` raise when they reject their input.
 pub effect regex {
-  /// The text is no pattern of this dialect, or no template for its pattern.
+  /// The text is not a pattern of this dialect, or not a template for its pattern.
   raise fail(e: Error)
 }
 
-/// A refusal's reason as a sentence, which is what a literal's diagnostic says.
+/// An error's reason as a sentence, which a literal's diagnostic reports.
 pub fn reason(why: ErrorKind) -> String =
   match why {
     UnclosedGroup -> "this `(` has no closing `)`",
@@ -194,7 +194,7 @@ fn fail<a>(at: Int, why: ErrorKind) -> a / {regex.fail} = regex.fail({ at: at, r
 /// The code points from `lo` through `hi`.
 type Interval = { lo: Int, hi: Int }
 
-/// A place a pattern asks about without taking a character.
+/// A condition on a position that a pattern checks without consuming a character.
 type Look =
   | LineStart
   | LineEnd
@@ -202,11 +202,11 @@ type Look =
   | TextEnd
   | WordBoundary
   | NotWordBoundary
-  /// The edge of a word of any script, and any other place: `\b` and `\B` under `(?u)`.
+  /// The edge of a word of any script, and any other position: `\b` and `\B` under `(?u)`.
   | UnicodeWordBoundary
   | NotUnicodeWordBoundary
 
-/// A parsed pattern, every flag already acted on.
+/// A parsed pattern, with every flag already applied.
 type Node =
   /// Nothing, matched everywhere.
   | Empty
@@ -221,15 +221,15 @@ type Node =
   | Alternate(List<Node>)
   /// From the first count to the second, `-1` for no upper end, and whether more is preferred.
   | Repeat(Node, Int, Int, Bool)
-  /// A group by its number, and its name where it has one.
+  /// A group by its number, and its name if it has one.
   | Capture(Int, Option<String>, Node)
 
 /// What is being parsed: its code points, whether it is a pattern over bytes, and the most
 /// instructions it may compile to.
 type Source = { text: Array<Int>, bytes: Bool, limit: Int }
 
-/// What one step of the parse read: the node, the instructions it will compile to, where the
-/// next character stands, the flags in force there, and every group opened so far by its name.
+/// What one step of the parse read: the node, the instructions it will compile to, where the next
+/// character is, the flags in effect there, and the names of every group opened so far.
 type Parse = { node: Node, size: Int, at: Int, flags: Int, groups: List<Option<String>> }
 
 type Meta =
@@ -285,7 +285,7 @@ fn is_unicode(flags: Int) -> Bool = flags & 16 != 0
 
 fn interval(lo: Int, hi: Int) -> Interval = { lo: lo, hi: hi }
 
-/// Intervals in order, with those that touch or overlap made one.
+/// Sorts intervals and merges those that touch or overlap.
 fn canonical(items: List<Interval>) -> List<Interval> =
   items.sort_by(|a: Interval, b: Interval| a.lo <= b.lo).fold(
     [],
@@ -312,8 +312,8 @@ fn complement(set: List<Interval>, most: Int) -> List<Interval> = {
   if walked.next <= most { walked.out.push(interval(walked.next, most)) } else { walked.out }
 }
 
-/// The intervals with the other case of each ASCII letter among them, which is how a pattern
-/// over bytes ignores case.
+/// The intervals plus the other case of each ASCII letter in them, which is how a pattern over
+/// bytes ignores case.
 fn folded_ascii(items: List<Interval>) -> List<Interval> =
   items.fold(items, |acc: List<Interval>, i: Interval| {
     let lower = if i.lo <= 122 && i.hi >= 97 {
@@ -323,9 +323,10 @@ fn folded_ascii(items: List<Interval>) -> List<Interval> =
     else { lower }
   })
 
-/// Simple case folding's orbits, from `ucd/fold.txt`: three numbers a run, its first and last
-/// code point and how far another member of each one's orbit lies, as `ucd::apply_distance` reads it. A
-/// run whose code points have several other members stands once for each. The runs rise.
+/// Simple case folding's orbits, from `ucd/fold.txt`, as three numbers per run: its first and last
+/// code point, and the distance to another member of each one's orbit, as `ucd::apply_distance`
+/// reads it. A run whose code points have several other members appears once for each. The runs are
+/// in ascending order.
 const fn orbits() -> Array<Int> =
   Array::of_list(
     ucd::runs(embed("ucd/fold.txt")).fold([], |required_literal: List<Int>, run: ucd::Run|
@@ -336,9 +337,9 @@ const fn orbits() -> Array<Int> =
       )),
   )
 
-/// The intervals with every other member of each code point's case orbit among them: a pattern
-/// over text ignores case as Unicode's simple case folding pairs characters, so `k` is also `K`
-/// and the Kelvin sign.
+/// The intervals plus every other member of each code point's case orbit: a pattern over text
+/// ignores case as Unicode's simple case folding pairs characters, so `k` also matches `K` and the
+/// Kelvin sign.
 fn folded_unicode(items: List<Interval>) -> List<Interval> / {abort.raise} = {
   let runs = orbits();
   let count = runs.len() / 3;
@@ -379,7 +380,7 @@ fn word() -> List<Interval> =
 
 fn space() -> List<Interval> = [interval(9, 10), interval(12, 13), interval(32, 32)]
 
-/// The code points a property of `std.char` holds of.
+/// The code points that have a property of `std.char`.
 fn of_property(property: char::Property) -> List<Interval> =
   char::code_point_ranges(property).map(|s: CodePointRange| interval(s.first, s.last))
 
@@ -401,8 +402,8 @@ const fn unicode_word() -> List<Interval> =
     ),
   )
 
-/// The class a Perl escape letter names, in either case, before any negation: ASCII's, or
-/// under `(?u)` Unicode's.
+/// The class a Perl escape letter names, in either case, before any negation: the ASCII class, or
+/// under `(?u)` the Unicode one.
 fn perl_class(letter: Int, flags: Int) -> Option<List<Interval>> =
   match letter {
     b'd' | b'D' -> Some(if is_unicode(flags) { unicode_digits() } else { digits() }),
@@ -411,7 +412,7 @@ fn perl_class(letter: Int, flags: Int) -> Option<List<Interval>> =
     _ -> None,
   }
 
-/// Each script's code points by its name in `ucd/scripts.txt`, which is Scripts.txt's.
+/// Each script's code points, by its name in `ucd/scripts.txt`, which comes from Scripts.txt.
 const fn scripts() -> Map<String, List<Interval>> =
   ucd::runs(embed("ucd/scripts.txt")).fold(
     Map::new(),
@@ -485,8 +486,8 @@ fn posix_class(name: String) -> Option<List<Interval>> =
 
 fn is_name_char(c: Int) -> Bool = is_letter(c) || is_digit(c) || c == 95
 
-/// `set` as a pattern's class under these flags: folded where case is ignored, then negated
-/// where the escape or name was.
+/// `set` as a pattern's class under these flags: case-folded if case is ignored, then negated if
+/// the escape or name was.
 fn class_with_flags(
   s: Source,
   set: List<Interval>,
@@ -497,8 +498,8 @@ fn class_with_flags(
   if negated { complement(cased, max_code_point(s)) } else { cased }
 }
 
-/// The class a `\p` or `\P` at `at` names, and where the pattern goes on: `\pL`, `\p{Greek}`,
-/// and `\p{^Greek}` for every other code point, which `\P` turns about again.
+/// The class that a `\p` or `\P` at `at` names, and where the pattern continues: `\pL`,
+/// `\p{Greek}`, and `\p{^Greek}` for every other code point, which `\P` negates again.
 fn property(
   s: Source,
   at: Int,
@@ -681,8 +682,8 @@ fn any(s: Source, flags: Int) -> List<Interval> =
   if dot_all(flags) { [interval(0, max_code_point(s))] }
   else { [interval(0, 9), interval(11, max_code_point(s))] }
 
-/// The node of one literal character, which is the class of its case orbit where case is
-/// ignored and it has another case.
+/// The node for one literal character: the class of its case orbit if case is ignored and it has
+/// another case.
 fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.fail, abort.raise} =
   if s.bytes && c > 0xFF { fail(at, NotAByte) }
   else if !ignores_case(flags) { Literal(c) } else {
@@ -692,8 +693,8 @@ fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.fail, abor
     }
   }
 
-/// A count read from just past a `{`: `n}`, `n,}` or `n,m}`, with `-1` for no upper end, and
-/// 1001 for any count past 1000. `None` where the text is no count, which leaves the `{` a
+/// Reads a count just after a `{`: `n}`, `n,}` or `n,m}`, with `-1` for no upper end, and 1001 for
+/// any count past 1000. `None` if the text is not a count, which leaves the `{` as a plain
 /// character.
 fn repeat_count(s: Source, at: Int) -> Option<{ least: Int, most: Int, at: Int }> = {
   let first = number(s, at);
@@ -712,8 +713,8 @@ fn repeat_count(s: Source, at: Int) -> Option<{ least: Int, most: Int, at: Int }
   }
 }
 
-/// The decimal number at `at`, which opens with no zero another digit follows: what it counts,
-/// stopping at 1001, and where it ends, which is `at` itself where no number stands.
+/// The decimal number at `at`, which does not start with a zero followed by another digit: its
+/// value, capped at 1001, and where it ends, which is `at` itself if there is no number.
 fn number(s: Source, at: Int) -> { value: Int, at: Int } =
   if !is_digit(code_point_at(s, at))
       || (code_point_at(s, at) == 48 && is_digit(code_point_at(s, at + 1))) { { value: 0, at: at } }
@@ -724,7 +725,7 @@ fn digits_from(s: Source, at: Int, value: Int) -> { value: Int, at: Int } =
     digits_from(s, at + 1, if value > 1000 { 1001 } else { value * 10 + code_point_at(s, at) - 48 })
   }
 
-/// The repetition written after `p`, if one is.
+/// The repetition written after `p`, if there is one.
 fn repetition(s: Source, p: Parse) -> Parse / {regex.fail} =
   match meta(code_point_at(s, p.at)) {
     Star -> repeat_node(s, p, 0, -1, p.at + 1),
@@ -764,7 +765,8 @@ fn repeat_size(node: Node, size: Int, least: Int, most: Int) -> Int =
   else if nullable(node) { size + 2 }
   else { size + 1 }
 
-/// The characters from `at` to a `\E` or the end, each itself, and the repetition after the last.
+/// The characters from `at` to a `\E` or the end, each taken literally, and the repetition after
+/// the last one.
 fn quotation(
   s: Source,
   at: Int,
@@ -793,7 +795,7 @@ fn quotation(
   }
 }
 
-/// Where the `\E` that ends a quotation opened before `at` stands, or the end of the pattern.
+/// Where the `\E` that ends a quotation opened before `at` is, or the end of the pattern.
 fn quote_end(s: Source, at: Int) -> Int =
   if at >= s.text.len() { at }
   else if code_point_at(s, at) == b'\\' && code_point_at(s, at + 1) == b'E' { at }
@@ -843,7 +845,7 @@ fn escape_sequence(
   }
 }
 
-/// The one character the escape at `at` writes, and where the text goes on.
+/// The one character the escape at `at` writes, and where the text continues.
 fn escape_code(s: Source, at: Int) -> { code: Int, at: Int } / {regex.fail} = {
   let c = code_point_at(s, at + 1);
   match c {
@@ -881,7 +883,7 @@ fn hexadecimal(s: Source, at: Int) -> { code: Int, at: Int } / {regex.fail} =
     if high < 0 || low < 0 { fail(at, BadEscape) } else { { code: high * 16 + low, at: at + 4 } }
   }
 
-/// The hex digits from `at`, their value stopping past the last code point.
+/// The hex digits from `at`, with their value capped just past the last code point.
 fn hex_run(s: Source, at: Int, value: Int) -> { code: Int, at: Int } = {
   let digit = hex_value(code_point_at(s, at));
   if at >= s.text.len() || digit < 0 { { code: value, at: at } }
@@ -890,7 +892,7 @@ fn hex_run(s: Source, at: Int, value: Int) -> { code: Int, at: Int } = {
 
 // --- Groups ---------------------------------------------------------------------
 
-/// The group whose `(` stands at `at`.
+/// The group whose `(` is at `at`.
 fn parenthesis(
   s: Source,
   at: Int,
@@ -917,7 +919,7 @@ fn parenthesis(
     }
   }
 
-/// What a group read, once its `)` is: the node, with the flags the group was opened under.
+/// What a group read, once its `)` is reached: the node, with the flags the group was opened under.
 fn close_group(s: Source, open: Int, inner: Parse, flags: Int) -> Parse / {regex.fail} =
   if meta(code_point_at(s, inner.at)) != Close { fail(open, UnclosedGroup) }
   else { { ..inner, at: inner.at + 1, flags: flags } }
@@ -962,9 +964,8 @@ fn name_end(text: Array<Int>, at: Int) -> Int =
 fn name_text(text: Array<Int>, from: Int, to: Int) -> String / {abort.raise} =
   String::of_bytes(Bytes::concat_all(range(from, to).map(|i: Int| byte_of_int(text.get(i)))))
 
-/// The flags of a `(?flags)` or `(?flags:...)` read from `at`: `before` is what holds outside,
-/// `on` what they come to so far, `off` whether a `-` was passed, and `seen` whether a flag
-/// follows it.
+/// Reads the flags of a `(?flags)` or `(?flags:...)` from `at`: `before` is the flags outside, `on`
+/// the flags so far, `off` whether a `-` was passed, and `seen` whether a flag follows it.
 fn flag_group(
   s: Source,
   open: Int,
@@ -1006,8 +1007,8 @@ fn flag_group(
     else { fail(at, BadGroup) }
   }
 
-/// Nothing, where no operand stands for a repetition to follow: a `(?flags)`, whose flags hold
-/// from here to the end of the group it is in, or an empty quotation.
+/// Nothing, where there is no operand for a repetition to follow: a `(?flags)`, whose flags apply
+/// from here to the end of its group, or an empty quotation.
 fn no_operand(
   s: Source,
   at: Int,
@@ -1025,7 +1026,7 @@ fn no_operand(
 
 // --- Classes ----------------------------------------------------------------------
 
-/// The class whose `[` stands at `at`.
+/// The class whose `[` is at `at`.
 fn class(
   s: Source,
   at: Int,
@@ -1091,7 +1092,7 @@ fn member(
   } else { class_range(s, at, flags) }
 }
 
-/// A `[:name:]` or `[:^name:]` at `at`, if the text there closes as one.
+/// A `[:name:]` or `[:^name:]` at `at`, if the text there forms one.
 fn posix_at(
   s: Source,
   at: Int,
@@ -1134,8 +1135,8 @@ fn class_code(s: Source, at: Int) -> { code: Int, at: Int } / {regex.fail} = {
 
 // --- A tree as the pattern that parses to it -----------------------------------
 
-/// `node` as a pattern that reads back to it under no flag. `level` is what stands around it:
-/// 0 an alternation, 1 a row, 2 a repetition.
+/// `node` as a pattern that parses back to it with no flags. `level` is what surrounds it: 0 an
+/// alternation, 1 a row, 2 a repetition.
 fn node_text(node: Node, level: Int, bytes: Bool) -> String / {abort.raise} =
   match node {
     Empty -> "(?:)",
@@ -1173,8 +1174,8 @@ fn count_text(least: Int, most: Int) -> String =
   else if least == most { "{" ++ least.to_string() ++ "}" }
   else { "{" ++ least.to_string() ++ "," ++ most.to_string() ++ "}" }
 
-/// One code point as a pattern writes it: after a `\` where it is one of `special`, as `\x{..}`
-/// where it is no character a text shows, and otherwise itself.
+/// One code point as a pattern writes it: after a `\` if it is one of `special`, as `\x{..}` if it
+/// is not a visible character, and otherwise as itself.
 fn char_text(c: Int, bytes: Bool, special: String) -> String / {abort.raise} =
   if c < 32 || c == 127 || (bytes && c > 126) { "\\x{" ++ hex_text(c) ++ "}" } else {
     match Char::of_int(c) {
@@ -1190,7 +1191,8 @@ fn hex_text(n: Int) -> String / {abort.raise} =
   if n < 16 { "0123456789ABCDEF".slice(n, n + 1) }
   else { hex_text(n / 16) ++ "0123456789ABCDEF".slice(n % 16, n % 16 + 1) }
 
-/// A class as a pattern writes it: by what it leaves out where it reaches the last code point.
+/// A class as a pattern writes it: negated, by what it leaves out, if it reaches the last code
+/// point.
 fn class_text(set: List<Interval>, bytes: Bool) -> String / {abort.raise} = {
   let most = if bytes { 0xFF } else { 0x10FFFF };
   if set == [interval(0, most)] { "(?s:.)" } else {
@@ -1214,21 +1216,21 @@ fn class_text(set: List<Interval>, bytes: Bool) -> String / {abort.raise} = {
 type Inst =
   /// A byte from the first through the second, then the place.
   | Range(Int, Int, Int)
-  /// A byte the table gives an arm, then that arm's place: the table holds, for each of the 256
-  /// bytes, an arm's number from 1, or 0 for a byte that is refused.
+  /// A byte the table gives an arm, then that arm's place: the table has, for each of the 256
+  /// bytes, an arm's number from 1, or 0 for a byte that does not match.
   | Switch(Bytes, Array<Int>)
   /// The first place, or failing that the second.
   | Split(Int, Int)
-  /// The position kept in a slot, then the place.
+  /// Stores the position in a slot, then goes to the place.
   | Save(Int, Int)
-  /// The place, where every look of the set holds.
+  /// Goes to the place if every look of the set holds.
   | Check(Int, Int)
   | Match
   | Fail
 
-/// The instructions that take one character of a class, placed from 0 among themselves, with
-/// `-1` for the place that follows the character; `entry` is where they start, and `cuts` every
-/// byte at which what they take changes.
+/// The instructions that consume one character of a class, numbered from 0 among themselves, with
+/// `-1` for the place after the character. `entry` is where they start, and `cuts` lists every byte
+/// at which what they accept changes.
 type ClassFragment = { insts: List<Inst>, entry: Int, cuts: List<Int> }
 
 /// A code point's bytes in UTF-8.
@@ -1238,17 +1240,17 @@ fn utf8_bytes(c: Int) -> List<Int> =
   else if c < 0x10000 { [0xE0 | c >> 12, 0x80 | c >> 6 & 0x3F, 0x80 | c & 0x3F] }
   else { [0xF0 | c >> 18, 0x80 | c >> 12 & 0x3F, 0x80 | c >> 6 & 0x3F, 0x80 | c & 0x3F] }
 
-/// The runs of byte ranges, one range a byte, that between them spell every code point of a
-/// class and nothing else, in the class's order. Over bytes a code point is its own one byte, and
-/// over text the surrogates, which no text holds, are left out.
+/// The runs of byte ranges, one range per byte, that together encode every code point of a class
+/// and nothing else, in the class's order. Over bytes a code point is its own single byte, and over
+/// text the surrogates, which no text contains, are left out.
 fn sequences(set: List<Interval>, bytes: Bool) -> List<List<Interval>> / {abort.raise} =
   if bytes { set.map(|i: Interval| [i]) } else {
     set.fold([], |acc: List<List<Interval>>, i: Interval|
       runs(max(i.lo, 0xE000), i.hi, runs(i.lo, min(i.hi, 0xD7FF), acc, 32), 32))
   }
 
-/// The runs for the code points from `lo` through `hi`, after `done`: the stretch is cut where
-/// the number of bytes changes, and then wherever its ends do not fill a whole trailing byte.
+/// The runs for the code points from `lo` through `hi`, after `done`: the range is split where the
+/// number of bytes changes, and then wherever its ends do not cover a whole trailing byte.
 fn runs(
   lo: Int,
   hi: Int,
@@ -1278,32 +1280,32 @@ fn split_aligned(
     else { split_aligned(lo, hi, bits + 6, done, left) }
   }
 
-/// The run for two code points that spell in as many bytes and differ only in bytes a whole
-/// range of which lies between them.
+/// The run for two code points that encode in the same number of bytes and differ only in bytes
+/// whose whole range lies between them.
 fn utf8_sequence(lo: Int, hi: Int) -> List<Interval> = {
   let high = utf8_bytes(hi);
   utf8_bytes(lo).fold([], |acc: List<Interval>, b: Int|
     acc.push(interval(b, high.at_or(acc.len(), b))))
 }
 
-/// A stencil being built: its instructions, the place already made for a set of runs, and the
+/// A fragment being built: its instructions, the place already made for each set of runs, and the
 /// cuts so far.
 type FragmentBuilder = { insts: List<Inst>, known: Map<List<List<Interval>>, Int>, cuts: List<Int> }
 
 type BuilderEntry = { building: FragmentBuilder, place: Int }
 
-/// Runs that open with one range, and the place that takes what follows it: `-1` where nothing
-/// does.
+/// Runs that start with one range, and the place that consumes what follows it: `-1` if nothing
+/// follows.
 type Arm = { head: Interval, place: Int }
 
-/// Whether a class is one instruction: over bytes any is, and over text one within ASCII.
+/// Whether a class is one instruction: any class over bytes, and over text one within ASCII.
 fn is_flat(set: List<Interval>, bytes: Bool) -> Bool =
   bytes || (match set.at(set.len() - 1) { Some(last) -> last.hi < 0x80, None -> false })
 
-/// The stencil of a class. One of a single byte is one instruction. Most that reach past ASCII
-/// are what a negated class of ASCII characters is, every character past ASCII and some of
-/// those within it, and such a one is the stencil of every character with its first table
-/// rewritten. Any other is built from the runs of bytes its characters spell.
+/// The fragment of a class. A class of single bytes is one instruction. Most classes that reach
+/// past ASCII are negated classes of ASCII characters: every character past ASCII and some within
+/// it. Such a class is the fragment of every character with its first table rewritten. Any other
+/// class is built from the runs of bytes its characters encode to.
 fn class_fragment(
   set: List<Interval>,
   bytes: Bool,
@@ -1330,8 +1332,8 @@ fn class_fragment(
     }
   }
 
-/// The first `size` bytes of a table that gives `arm` to the bytes of `set` below `size` and
-/// refuses the rest, as parts to join, with the bytes at which it changes after `cuts`.
+/// The first `size` bytes of a table that gives `arm` to the bytes of `set` below `size` and 0 to
+/// the rest, as parts to join, with the bytes at which it changes added after `cuts`.
 fn byte_table(
   set: List<Interval>,
   arm: Int,
@@ -1359,7 +1361,7 @@ const fn any_forward() -> ClassFragment = build_fragment([interval(0, 0x10FFFF)]
 
 const fn any_reverse() -> ClassFragment = build_fragment([interval(0, 0x10FFFF)], false, true)
 
-/// The stencil of every character, with only those ASCII characters taken that `set` holds.
+/// The fragment of every character, accepting only the ASCII characters that `set` contains.
 fn narrowed(every: ClassFragment, set: List<Interval>) -> ClassFragment / {abort.raise} =
   match every.insts.at(every.entry) {
     Some(Switch(table, arms)) -> {
@@ -1389,7 +1391,7 @@ fn build_fragment(
   }
 }
 
-/// The place, made once, of instructions that take any of `seqs`.
+/// The place of the instructions that accept any of `seqs`, made only once.
 fn branch(
   b: FragmentBuilder,
   seqs: List<List<Interval>>,
@@ -1416,7 +1418,7 @@ fn branch(
     },
   }
 
-/// Runs gathered by the range each opens with, where neighbours open alike and both go on or
+/// Runs grouped by the range each starts with, where neighbours start alike and both continue or
 /// both end: the range, and what follows it in each.
 fn group_by_head(
   seqs: List<List<Interval>>,
@@ -1432,9 +1434,9 @@ fn group_by_head(
       },
     })
 
-/// The instruction that takes a byte of one of the arms and goes where that arm does: one
-/// `Range` for one arm, a `Switch` where no two arms share a byte, and otherwise a choice
-/// between a `Range` for each.
+/// The instruction that accepts a byte of one of the arms and goes where that arm goes: one `Range`
+/// for one arm, a `Switch` if no two arms share a byte, and otherwise a choice between a `Range`
+/// for each.
 fn dispatch(b: FragmentBuilder, arms: List<Arm>) -> BuilderEntry / {abort.raise} = {
   let cut = {
     ..b,
@@ -1490,7 +1492,7 @@ fn run_of(b: Int, n: Int) -> Bytes / {abort.raise} =
 // --- Compiling ----------------------------------------------------------------------
 
 /// A program being written, back to front: its instructions, every byte at which what some
-/// instruction takes changes, each class's stencil, and what kind of program it is.
+/// instruction accepts changes, each class's fragment, and what kind of program it is.
 type Emitter = {
   insts: List<Inst>,
   cuts: Map<Int, Unit>,
@@ -1522,8 +1524,8 @@ fn look_bits(look: Look, reversed: Bool) -> Int =
     NotUnicodeWordBoundary -> 128,
   }
 
-/// Instructions for `node` that go on to `next`, written after those already there. `depth`
-/// is how much further the tree may nest, which a parsed one never reaches.
+/// Writes instructions for `node` that continue to `next`, after those already written. `depth` is
+/// how much deeper the tree may nest, a limit that a parsed tree never reaches.
 fn emit(e: Emitter, node: Node, next: Int, depth: Int) -> EmitResult / {abort.raise} =
   if depth <= 0 { panic("a parsed pattern nests no deeper than its groups") } else {
     match node {
@@ -1564,7 +1566,8 @@ fn emit(e: Emitter, node: Node, next: Int, depth: Int) -> EmitResult / {abort.ra
     }
   }
 
-/// One literal code point: its bytes in a row, or nothing that can match for a surrogate.
+/// One literal code point: its bytes in a row, or for a surrogate, an instruction that never
+/// matches.
 fn emit_literal(e: Emitter, c: Int, next: Int) -> EmitResult =
   if !e.bytes && c >= 0xD800 && c <= 0xDFFF { emit_instruction(e, Fail) } else {
     let bytes = if e.bytes { [c] } else { utf8_bytes(c) };
@@ -1579,7 +1582,7 @@ fn emit_literal(e: Emitter, c: Int, next: Int) -> EmitResult =
     )
   }
 
-/// One character of a class: its stencil, made once a program, placed here.
+/// One character of a class: its fragment, made once per program, placed here.
 fn emit_class(e: Emitter, set: List<Interval>, next: Int) -> EmitResult / {abort.raise} = {
   let known = e.classes.get(set);
   let t = match known { Some(t) -> t, None -> class_fragment(set, e.bytes, e.reversed) };
@@ -1600,7 +1603,7 @@ fn emit_class(e: Emitter, set: List<Interval>, next: Int) -> EmitResult / {abort
   }
 }
 
-/// A stencil's instruction as the program holds it once the stencil starts at `base`.
+/// A fragment's instruction as the program stores it, once the fragment starts at `base`.
 fn relocate(i: Inst, base: Int, next: Int) -> Inst =
   match i {
     Range(lo, hi, to) -> Range(lo, hi, if to < 0 { next } else { base + to }),
@@ -1613,8 +1616,9 @@ fn relocate(i: Inst, base: Int, next: Int) -> Inst =
     other -> other,
   }
 
-/// `sub` any number of times. One that can match nothing is repeated as one or more, optionally,
-/// so that a pass that takes nothing ends the loop instead of beating the way out of it.
+/// `sub` any number of times. A `sub` that can match nothing is repeated as an optional
+/// one-or-more, so that a pass that consumes nothing ends the loop instead of being preferred over
+/// leaving it.
 fn star(e: Emitter, sub: Node, greedy: Bool, next: Int, depth: Int) -> EmitResult / {abort.raise} =
   if nullable(sub) {
     let more = plus(e, sub, greedy, next, depth);
@@ -1638,7 +1642,7 @@ fn plus(e: Emitter, sub: Node, greedy: Bool, next: Int, depth: Int) -> EmitResul
   }
 }
 
-/// `sub` up to `count` times, each further one inside the one before: `tail` is the place of
+/// `sub` up to `count` times, each further one nested inside the one before. `tail` is the place of
 /// those already written.
 fn optional(
   e: Emitter,
@@ -1672,7 +1676,7 @@ fn anchored(node: Node) -> Bool =
     _ -> false,
   }
 
-/// Every look `node` asks, as a set of bits.
+/// Every look `node` checks, as a set of bits.
 fn looks_of(node: Node) -> Int =
   match node {
     Looking(look) -> look_bits(look, false),
@@ -1681,8 +1685,8 @@ fn looks_of(node: Node) -> Int =
     _ -> 0,
   }
 
-/// The class each byte falls in, bytes no instruction tells apart sharing one, and how many
-/// classes there are.
+/// The class each byte belongs to, where bytes that no instruction tells apart share one, and how
+/// many classes there are.
 fn byte_classes(cuts: Map<Int, Unit>) -> { classes: Bytes, count: Int } / {abort.raise} = {
   let rewrite_case = cuts.keys().fold(
     { at: 0, id: 0, parts: [] },
@@ -1703,10 +1707,11 @@ fn byte_classes(cuts: Map<Int, Unit>) -> { classes: Bytes, count: Int } / {abort
   }
 }
 
-/// What a search can skip to: `first` is every byte a match can start with, empty where a match
-/// may be empty, where a look stands before its first byte, or where any byte starts one; `lead`
-/// is the bytes every match starts with, and `exact` whether they are the whole of every match;
-/// `held` is a text every match holds somewhere, empty where none is known beyond `lead`.
+/// What a search can skip to. `first` is every byte a match can start with, and is empty when a
+/// match may be empty, when a look comes before its first byte, or when any byte can start one.
+/// `lead` is the bytes every match starts with, and `exact` whether they are the whole of every
+/// match. `held` is a text every match contains somewhere, and is empty if none is known beyond
+/// `lead`.
 type Prefilter = { first: Bytes, lead: Bytes, exact: Bool, held: Bytes }
 
 fn prefilter(insts: Array<Inst>, start: Int, tree: Node, bytes: Bool) -> Prefilter / {abort.raise} = {
@@ -1731,8 +1736,8 @@ fn prefilter(insts: Array<Inst>, start: Int, tree: Node, bytes: Bool) -> Prefilt
   }
 }
 
-/// The longest text the tree shows every match of `node` to hold: characters set one after
-/// another, in a row, a group or a repetition no match goes around.
+/// The longest text the tree shows every match of `node` contains: characters in sequence, in a
+/// row, a group, or a repetition that no match can skip.
 fn required_literal(node: Node, bytes: Bool) -> Bytes / {abort.raise} =
   match node {
     Literal(c) -> code_point_bytes(c, bytes),
@@ -1760,7 +1765,7 @@ fn required_literal(node: Node, bytes: Bool) -> Bytes / {abort.raise} =
     _ -> b"",
   }
 
-/// One code point as the bytes a subject holds it in.
+/// One code point as the bytes a subject stores it in.
 fn code_point_bytes(c: Int, bytes: Bool) -> Bytes / {abort.raise} =
   if bytes { byte_of_int(c) } else { Bytes::concat_all(utf8_bytes(c).map(|b: Int| byte_of_int(b))) }
 
@@ -1782,8 +1787,8 @@ fn prefix_from(
     }
   }
 
-/// The bytes the instructions reached from the stack without taking one can take, as stretches
-/// of all the bytes in order; `None` where a `Match` or a `Check` is reached.
+/// The bytes that the instructions reachable from the stack without consuming a byte can accept, as
+/// ranges of all the bytes in order. `None` if a `Match` or a `Check` is reached.
 fn first_from(
   insts: Array<Inst>,
   seen: Array<Bool>,
@@ -1836,33 +1841,33 @@ fn switch_bytes(
 /// The 256 bytes, in order.
 const fn every_byte() -> Bytes = Bytes::concat_all(range(0, 256).map(|b: Int| byte_of_int(b)))
 
-/// How a pattern is compiled and searched with.
+/// How a pattern is compiled and searched.
 pub type Options = {
-  /// Whether the match taken at the leftmost place one starts is the longest there, as POSIX
-  /// has it, where otherwise it is the one a backtracking search would find first, as Perl has it.
+  /// Whether the match taken at the leftmost start is the longest one there, as in POSIX. Otherwise
+  /// it is the one a backtracking search would find first, as in Perl.
   longest: Bool,
-  /// The most instructions the pattern may compile to, every counted repetition written out,
-  /// and 16777216 where more is asked. A pattern past it is refused as `TooLarge`. The program
-  /// that reads a match backwards is written from the same tree and is not counted.
+  /// The most instructions the pattern may compile to, with every counted repetition written out,
+  /// and 16777216 if more is requested. A pattern past it is rejected as `TooLarge`. The program
+  /// that reads a match backwards is built from the same tree and is not counted.
   size_limit: Int,
-  /// The most states a search keeps of the automaton it builds as it reads. A search that
-  /// would keep more goes on by following every state at once, which costs more a byte and
-  /// keeps nothing.
+  /// The most states that a search caches of the automaton it builds as it reads. A search that
+  /// would cache more continues by following every state at once, which costs more per byte and
+  /// caches nothing.
   state_limit: Int,
-  /// A subject of no more bytes than this is short, and searched by following every state at
-  /// once from the start: a short search meets few states twice, so keeping them costs more
-  /// than it saves. A negative number has no subject short.
+  /// A subject of at most this many bytes is short, and is searched by following every state at
+  /// once from the start: a short search meets few states twice, so caching them costs more than it
+  /// saves. With a negative number, no subject is short.
   short: Int,
 }
 
-/// The first match a backtracking search would find, 100000 instructions, 4096 states, and a
-/// subject of 32 bytes or fewer short.
+/// The default options: the first match a backtracking search would find, 100000 instructions, 4096
+/// states, and subjects of 32 bytes or fewer treated as short.
 pub fn options() -> Options = { longest: false, size_limit: 100000, state_limit: 4096, short: 32 }
 
 /// A program as a search by states reads it: its instructions, where a search enters them, the
-/// class each byte falls in, how many classes there are with one more for the subject's end,
-/// whether a match found ends what is tried after it, and whether any instruction asks about a
-/// line's end or a word's.
+/// class each byte belongs to, how many classes there are plus one for the subject's end, whether a
+/// match found stops what is tried after it, and whether any instruction checks for a line's end or
+/// a word's.
 type Automaton = {
   insts: Array<Inst>,
   entry: Int,
@@ -1894,8 +1899,8 @@ type Compiled = {
   finder: Automaton,
   stretcher: Automaton,
   reverse: Automaton,
-  /// Whether a look asks about a word of any script. A search by states steps a byte at a time
-  /// and cannot answer it, so such a pattern is always followed by every state at once.
+  /// Whether a look checks for a word of any script. A search by states steps a byte at a time and
+  /// cannot check that, so such a pattern is always searched by following every state at once.
   wide: Bool,
 }
 
@@ -2033,7 +2038,7 @@ fn looks_at(hay: Bytes, at: Int, is_unicode: Bool) -> Int / {abort.raise} = {
 }
 
 /// The slots of the match a run from `entry` at `from` finds, or no slots at all where there is
-/// none. A slot nothing was kept in holds `-1`.
+/// none. A slot nothing was stored in contains `-1`.
 ///
 /// Every state the program could be in is followed at once, in the order a backtracking search
 /// would try them, so each is entered once a position and a match found first is the one such a
@@ -2440,7 +2445,7 @@ fn threads_add(
 // --- One state at a time -------------------------------------------------------------
 
 /// The states a search has made of one automaton. A state is the places the program could be
-/// in, in order, kept under a number: `ids` finds a state's number and `keys` its places.
+/// in, in order, stored under a number: `ids` finds a state's number and `keys` its places.
 /// `starts` holds the state a search starts in for each of the four things that can stand
 /// before it, `-1` for one not yet made. `room` is how many states fit, and `base` where the
 /// automaton's rows start in the table every automaton of a call shares.
@@ -2471,8 +2476,8 @@ fn empty_search_cache() -> SearchCache =
 type Closure = { seen: Array<Int>, stack: Array<Int>, out: List<Int>, needs: Int, sealed: Bool }
 
 /// Follows the places on the stack through every instruction that takes no byte, under the
-/// looks `have`: a place not yet reached under this `stamp` joins `out`. A look is kept where it
-/// is asked whether or not it holds, since the byte to come may change the answer. Where `cut`,
+/// looks `have`: a place not yet reached under this `stamp` joins `out`. A look stays in `out`
+/// whether or not it matches here, since the next byte may change the result. Where `cut`,
 /// a `Match` ends the walk, as nothing reached after it can be preferred.
 fn close(
   insts: Array<Inst>,
@@ -3056,7 +3061,7 @@ type Hit = {
   slots: Array<Int>,
 }
 
-/// The leftmost match at or after `from`, with `want` slots kept: 2 for where it starts and
+/// The leftmost match at or after `from`, filling `want` slots: 2 for where it starts and
 /// ends, and two more for each group.
 fn search(
   re: Compiled,
@@ -3519,15 +3524,15 @@ pub type Span = { start: Int, end: Int }
 /// with `None` for a group the match went no way through.
 pub type Captures = new { groups: List<Option<Span>>, numbers: Map<String, Int> }
 
-/// The pattern compiled under `options()`, or where and why it is refused.
+/// The pattern compiled under `options()`, or where and why it is rejected.
 pub fn compile(pattern: String) -> Result<Regex, Error> / {abort.raise} =
   try { read(pattern, options()) }
 
-/// The pattern compiled as `o` says, or where and why it is refused.
+/// The pattern compiled as `o` says, or where and why it is rejected.
 pub fn compile_with(pattern: String, o: Options) -> Result<Regex, Error> / {abort.raise} =
   try { read(pattern, o) }
 
-/// The pattern compiled as `o` says, raising `regex.refused` where `compile_with` answers `Err`.
+/// The pattern compiled as `o` says, raising `regex.fail` where `compile_with` returns `Err`.
 pub fn read(pattern: String, o: Options) -> Regex / {regex.fail, abort.raise} =
   Regex(compiled(pattern, o, false))
 
@@ -3632,12 +3637,12 @@ type Part = | Verbatim(String) | Group(Int)
 /// digits and `_` do, and `$$` writes a `$`. A group the match went no way through writes nothing.
 pub type Template = new { parts: List<Part> }
 
-/// The replacement `text` writes for matches of `re`, or where and why it is refused: a `$`
+/// The replacement `text` writes for matches of `re`, or where and why it is rejected: a `$`
 /// that nothing a template reads follows, or a group `re` does not have.
 pub fn template(re: Regex, text: String) -> Result<Template, Error> / {abort.raise} =
   try { read_template(re, text) }
 
-/// As `template`, raising `regex.refused` where that answers `Err`.
+/// As `template`, raising `regex.fail` where that returns `Err`.
 pub fn read_template(re: Regex, text: String) -> Template / {regex.fail, abort.raise} =
   parse_template(inner(re), text)
 
@@ -3748,14 +3753,14 @@ pub fn replace(re: Regex, text: String, to: Template) -> String / {abort.raise} 
 pub fn replace_all(re: Regex, text: String, to: Template) -> String / {abort.raise} =
   String::of_bytes(replace_matches(inner(re), Bytes::of_string(text), to, -1))
 
-/// `text` with its leftmost match replaced by what `each` answers for what it captured.
+/// `text` with its leftmost match replaced by what `each` returns for what it captured.
 pub fn replace_with<| e>(
   re: Regex,
   text: String,
   each: (Captures) -> String / e,
 ) -> String / {abort.raise | e} = replace_matches_with(re, text, each, 1)
 
-/// `text` with every match, as `find_all` finds them, replaced by what `with` answers for what
+/// `text` with every match, as `find_all` finds them, replaced by what `with` returns for what
 /// it captured.
 pub fn replace_all_with<| e>(
   re: Regex,
@@ -3825,7 +3830,7 @@ fn special(c: Int) -> Bool = meta(c) != Plain || c == b']' || c == b'}'
 
 /// A pattern compiled to search `Bytes`, a byte at a time: a character of the pattern is the
 /// byte of its number, so `\xFF` and `[\x80-\xFF]` are bytes, `.` is any byte but a line feed,
-/// and a character past `U+00FF` is refused. Two are equal when their patterns and options are
+/// and a character past `U+00FF` is rejected. Two are equal when their patterns and options are
 /// written alike, and one is shown as its pattern.
 pub type ByteRegex = | ByteRegex(Compiled)
 
@@ -3841,16 +3846,16 @@ pub fn byte_pattern(re: ByteRegex) -> String = match re { ByteRegex(c) -> c.patt
 
 fn byte_inner(re: ByteRegex) -> Compiled = match re { ByteRegex(c) -> c }
 
-/// The pattern compiled over bytes under `options()`, or where and why it is refused.
+/// The pattern compiled over bytes under `options()`, or where and why it is rejected.
 pub fn compile_bytes(pattern: String) -> Result<ByteRegex, Error> / {abort.raise} =
   try { read_bytes(pattern, options()) }
 
-/// The pattern compiled over bytes as `o` says, or where and why it is refused.
+/// The pattern compiled over bytes as `o` says, or where and why it is rejected.
 pub fn compile_bytes_with(pattern: String, o: Options) -> Result<ByteRegex, Error> / {abort.raise} =
   try { read_bytes(pattern, o) }
 
-/// The pattern compiled over bytes as `o` says, raising `regex.refused` where
-/// `compile_bytes_with` answers `Err`.
+/// The pattern compiled over bytes as `o` says, raising `regex.fail` where
+/// `compile_bytes_with` returns `Err`.
 pub fn read_bytes(pattern: String, o: Options) -> ByteRegex / {regex.fail, abort.raise} =
   ByteRegex(compiled(pattern, o, true))
 
@@ -3901,7 +3906,7 @@ fn byte_captures(re: Compiled, hay: Bytes, most: Int) -> List<Captures> / {abort
 pub fn template_bytes(re: ByteRegex, text: String) -> Result<Template, Error> / {abort.raise} =
   try { read_template_bytes(re, text) }
 
-/// As `template_bytes`, raising `regex.refused` where that answers `Err`.
+/// As `template_bytes`, raising `regex.fail` where that returns `Err`.
 pub fn read_template_bytes(re: ByteRegex, text: String) -> Template / {regex.fail, abort.raise} =
   parse_template(byte_inner(re), text)
 

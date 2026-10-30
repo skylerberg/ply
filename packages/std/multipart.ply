@@ -1,34 +1,35 @@
 //! Multipart bodies: the parts of a `multipart/form-data` upload or of any other `multipart` type,
 //! read under limits and written back.
 //!
-//! A body is parts set apart by a delimiter line, `--` and the boundary its `Content-Type` names
-//! (RFC 2046 §5.1), each part header fields, a blank line and data. `read` answers the parts of a
-//! body held whole, and `parse` the same as a `Result`. Every reader takes `Limits` and refuses a
-//! body where it passes one: the parts, a part's header bytes and fields, a part's data, the body,
-//! the boundary, and what stands before the first delimiter and after the last. Its steps grow
-//! with the parts and the header lines it reads and with nothing a part's data holds. A body two
-//! readers could take differently is refused, with a `Error` saying at which byte and why,
-//! never repaired: one that ends inside a part or without its closing delimiter, a delimiter with
-//! anything after it but blanks, one inside a header block, one after the closing delimiter, and,
-//! unless `Lenient` is asked for, a line feed without its carriage return and a folded header.
-//! The preamble and the epilogue are passed over.
+//! A body is parts separated by delimiter lines: `--` followed by the boundary that its
+//! `Content-Type` names (RFC 2046 §5.1). Each part is header fields, a blank line and data. `read`
+//! returns the parts of a complete body in memory, and `parse` returns the same as a `Result`.
+//! Every reader takes `Limits` and rejects a body as soon as it passes one: the parts, a part's
+//! header bytes and fields, a part's data, the body, the boundary, and the bytes before the first
+//! delimiter and after the last. Its steps grow with the parts and the header lines it reads, and
+//! not with anything in a part's data. A body that two readers could read differently is rejected,
+//! never repaired, with an `Error` that gives the byte and the reason. That covers a body that ends
+//! inside a part or without its closing delimiter, a delimiter followed by anything but blanks, a
+//! delimiter inside a header block or after the closing delimiter, and, unless `Lenient` is
+//! requested, a line feed without its carriage return and a folded header. The preamble and the
+//! epilogue are skipped.
 //!
-//! `step` is what `read` is made of: from a `Reader` and the bytes seen so far it answers the next
-//! part's header fields and where its data lies, the end, or that more bytes are needed. The
-//! reader it hands back remembers how far it searched, so a driver that appends bytes and steps
-//! again searches no part's data twice for its delimiter.
+//! `read` is built from `step`. Given a `Reader` and the bytes seen so far, `step` returns the
+//! next part's header fields and where its data lies, the end, or that more bytes are needed. The
+//! reader it returns remembers how far it searched, so a driver that appends bytes and steps again
+//! never searches any part's data twice for its delimiter.
 //!
-//! A part whose own type is `multipart` is a part like any other, its data the nested body's
-//! bytes; `read_tree` follows such parts, as deep as `Limits.max_depth`. `spans` answers where a
-//! body's parts lie and reads no header block, and `frame` writes parts whose header blocks are
-//! already bytes: what a reader and a writer of mail, whose fields fold and are kept as written,
-//! are made of.
+//! A part whose own type is `multipart` is a part like any other, and its data is the nested
+//! body's bytes. `read_tree` follows such parts, as deep as `Limits.max_depth`. `spans` returns
+//! where a body's parts lie without reading any header block, and `frame` writes parts whose header
+//! blocks are already bytes. Readers and writers of mail, whose fields fold and are preserved as
+//! written, are built from these two.
 //!
 //! `read_form` reads a `multipart/form-data` body (RFC 7578) into its text fields and its files,
 //! and `form_data` writes one. A part's `filename` is data a client chose and never a path:
-//! `safe_filename` answers the one name it can be kept under, or `None`. Writing takes the
-//! boundary and refuses one that occurs in a part; `fresh_boundary` draws one from the host's
-//! entropy.
+//! `safe_filename` returns the one name it can be stored under, or `None`. Writing takes the
+//! boundary and fails if the boundary occurs in a part. `fresh_boundary` generates one from the
+//! host's entropy.
 
 import std.base64 (base64_decode)
 import std.bytes
@@ -50,10 +51,10 @@ pub type Header = { name: String, value: String }
 /// One part of a body: its header fields in the order written, and its data.
 pub type Part = new { headers: List<Header>, data: Bytes }
 
-/// What reading one body may cost. A body past a limit is refused where it passes it, and a limit
-/// below zero is read as zero.
+/// What reading one body may cost. A body past a limit is rejected at the point where it passes
+/// it, and a limit below zero counts as zero.
 pub type Limits = {
-  /// Parts in a body, those of the nested bodies `read_tree` follows among them.
+  /// Parts in a body, including those of the nested bodies `read_tree` follows.
   max_parts: Int,
   /// Bytes in one part's header block, its blank line included.
   max_header_bytes: Int,
@@ -63,7 +64,7 @@ pub type Limits = {
   max_part_bytes: Int,
   /// Bytes in the whole body.
   max_body: Int,
-  /// Bytes in the boundary. RFC 2046 allows a boundary 70.
+  /// Bytes in the boundary. RFC 2046 allows at most 70.
   max_boundary: Int,
   /// Bytes before the first delimiter, and after the closing one.
   max_preamble: Int,
@@ -89,37 +90,37 @@ pub fn default_limits() -> Limits =
 pub type Lines =
   /// Every line ends with CRLF and no header field is folded: what HTTP carries.
   | Strict
-  /// A line feed alone ends a line too, and a header line that opens with a blank continues the
+  /// A line feed alone ends a line too, and a header line that starts with a blank continues the
   /// field before it: what mail and a file on disk carry.
   | Lenient
 
-/// Why a body is refused.
+/// Why a body is rejected.
 pub type ErrorKind =
   /// The boundary is empty.
   | NoBoundary
   /// The boundary is longer than `Limits.max_boundary`.
   | LongBoundary
-  /// The boundary holds a character RFC 2046 gives a boundary none of, or ends with a space.
+  /// The boundary contains a character RFC 2046 does not allow in one, or ends with a space.
   | BadBoundary
   /// The body is longer than `Limits.max_body`.
   | BodyTooLarge
-  /// More than `Limits.max_preamble` bytes stand before the first delimiter.
+  /// More than `Limits.max_preamble` bytes come before the first delimiter.
   | PreambleTooLarge
-  /// More than `Limits.max_preamble` bytes stand after the closing delimiter.
+  /// More than `Limits.max_preamble` bytes come after the closing delimiter.
   | EpilogueTooLarge
   /// A line ends with a line feed and no carriage return, in a delimiter, a header block or
-  /// before a delimiter, where `Strict` is asked for.
+  /// before a delimiter, when `Strict` is requested.
   | BareLineFeed
-  /// A line opens with the delimiter and goes on with something other than blanks or `--`.
+  /// A line starts with the delimiter and continues with something other than blanks or `--`.
   | BadDelimiter
-  /// A line of a header block opens with the delimiter.
+  /// A line of a header block starts with the delimiter.
   | DelimiterInHeaders
-  /// A delimiter stands after the closing one.
+  /// A delimiter comes after the closing one.
   | DelimiterAfterClose
-  /// A header line that is no `name: value`: no colon, a name that is no token, a control
+  /// A header line that is not `name: value`: no colon, a name that is not a token, a control
   /// character, or a value that is not UTF-8.
   | BadHeader
-  /// A header line that opens with a blank, where `Strict` is asked for.
+  /// A header line that starts with a blank, when `Strict` is requested.
   | FoldedHeader
   /// A header block is longer than `Limits.max_header_bytes`.
   | HeadersTooLarge
@@ -138,34 +139,34 @@ pub type ErrorKind =
   /// A part of a form that is itself multipart: the nested files RFC 7578 §4.3 deprecates, which
   /// `read_tree` reads.
   | NestedForm
-  /// A part of a form whose `Content-Transfer-Encoding` is not known, or whose data is not in
-  /// it.
+  /// A part of a form whose `Content-Transfer-Encoding` is not known, or whose data is not valid
+  /// in it.
   | BadEncoding
   /// A field of a form in a charset this library does not read, with the charset's name.
   | BadCharset(String)
-  /// A field of a form whose bytes are no text in its charset.
+  /// A field of a form whose bytes are not valid text in its charset.
   | BadText
 
-/// A refusal, and the byte of the body it was found at: for a boundary that is refused, the
-/// body's first.
+/// An error, and the byte of the body where it was found: for a rejected boundary, the body's
+/// first byte.
 pub type Error = { at: Int, reason: ErrorKind }
 
 /// Why parts cannot be written as a body.
 pub type WriteError =
   /// The boundary is not 1 to 70 of RFC 2046's boundary characters, or ends with a space.
   | InvalidBoundary
-  /// `--` and the boundary occur in the part of this index, which a reader would end there.
+  /// `--` and the boundary occur in the part at this index, where a reader would end the part.
   | BoundaryInPart(Int)
-  /// The part of this index has a header whose name is no token or whose value holds a control
-  /// character other than a tab.
+  /// The part at this index has a header whose name is not a token or whose value contains a
+  /// control character other than a tab.
   | InvalidHeader(Int)
-  /// The field or file of this index, counting the fields and then the files, has a name or a
-  /// file name that holds `%22`, `%0D` or `%0A`, which would read back as another.
+  /// The field or file at this index, counting the fields and then the files, has a name or a
+  /// file name that contains `%22`, `%0D` or `%0A`, which would read back as a different name.
   | InvalidName(Int)
 
-/// What this module raises where it refuses.
+/// What this module raises when it fails.
 pub effect multipart {
-  /// The body is not one this module reads.
+  /// The body is not one this module can read.
   raise fail(e: Error)
   /// The parts have no body under the boundary given.
   raise unwritable(why: WriteError)
@@ -173,31 +174,31 @@ pub effect multipart {
 
 // --- The reader -------------------------------------------------------------
 
-/// Where a reader stands in a body.
+/// Where a reader is in a body.
 pub type Phase =
-  /// Before the first delimiter, which no byte before this offset starts.
+  /// Before the first delimiter, which does not start before this offset.
   | Opening(Int)
   /// At a part's header block.
   | Head
-  /// In a part's data: its header fields, where its data starts, and the offset no delimiter
-  /// ends the data before.
+  /// In a part's data: its header fields, where its data starts, and the offset before which no
+  /// delimiter ends the data.
   | Data(List<Header>, Int, Int)
   /// Past the closing delimiter.
   | Closed
 
-/// A place in a body being read: what `step` takes and hands back.
+/// A position in a body being read: what `step` takes and returns.
 pub type Reader = new {
   /// `--` and the boundary.
   dash: Bytes,
   limits: Limits,
   lines: Lines,
-  /// The offset the next part's delimiter or header block starts at, and after the closing
-  /// delimiter where the epilogue does.
+  /// The offset where the next part's delimiter or header block starts, or, after the closing
+  /// delimiter, where the epilogue starts.
   at: Int,
-  /// The parts answered so far.
+  /// The parts returned so far.
   parts: Int,
   phase: Phase,
-  /// What a refusal adds to an offset: where these bytes start in the body they are a part of.
+  /// What an error adds to an offset: where these bytes start in the body they are part of.
   origin: Int,
   /// Whether a part's header block is left unread, as the start of its data.
   whole: Bool,
@@ -249,7 +250,8 @@ fn reader_at(
   }
 }
 
-/// `l` with each limit below zero as zero, so a refusal past one is at a byte of the body.
+/// `l` with each limit below zero set to zero, so an error for passing one is at a byte of the
+/// body.
 fn floored(l: Limits) -> Limits =
   {
     max_parts: max(l.max_parts, 0),
@@ -277,8 +279,8 @@ fn blanks() -> Bytes = b" \t"
 fn fail<a>(r: Reader, at: Int, why: ErrorKind) -> a / {multipart.fail} =
   multipart.fail({ at: r.origin + at, reason: why })
 
-/// The next part of the body `seen` is the start of, from where `r` stands. `seen` is every byte
-/// of the body so far, the ones earlier steps were given among them.
+/// The next part of the body that `seen` starts, from where `r` is. `seen` is every byte of the
+/// body so far, including the bytes earlier steps were given.
 pub fn step(r: Reader, seen: Bytes) -> Step / {multipart.fail, abort.raise} =
   if seen.len() > r.limits.max_body { fail(r, r.limits.max_body, BodyTooLarge) } else {
     match r.phase {
@@ -316,7 +318,7 @@ fn opening(r: Reader, seen: Bytes, searched: Int) -> Step / {multipart.fail, abo
 }
 
 /// What follows a delimiter: the line break that opens a part, the `--` that closes the body,
-/// each with where the next line starts, or too few bytes to say.
+/// each with where the next line starts, or too few bytes to tell.
 type Tail = | Opens(Int) | Closes(Int) | Short
 
 fn tail(r: Reader, seen: Bytes, after: Int) -> Tail / {multipart.fail, abort.raise} =
@@ -332,8 +334,8 @@ fn tail(r: Reader, seen: Bytes, after: Int) -> Tail / {multipart.fail, abort.rai
     else { match line_break(r, seen, pad) { Some(next) -> Closes(next), None -> Short } }
   }
 
-/// Where the next line starts after the line break at `at`, which ends a delimiter line; `None`
-/// where the bytes end before it does.
+/// Where the next line starts after the line break at `at`, which ends a delimiter line. `None`
+/// if the bytes end before it.
 fn line_break(r: Reader, seen: Bytes, at: Int) -> Option<Int> / {multipart.fail, abort.raise} = {
   let c = seen.peek(at);
   if c < 0 { None }
@@ -355,8 +357,8 @@ fn head(r: Reader, seen: Bytes) -> Step / {multipart.fail, abort.raise} =
 
 type Block = { at: Int, headers: List<Header> }
 
-/// The header block from `block.at` on, through its blank line; `None` where the bytes end before
-/// it does. `left` bounds the rounds: each takes a line.
+/// The header block from `block.at` on, through its blank line. `None` if the bytes end before it.
+/// `left` bounds the rounds: each takes a line.
 fn fields(
   r: Reader,
   seen: Bytes,
@@ -374,7 +376,7 @@ fn fields(
   }
 }
 
-/// A line: where its line break starts and where the next line does, or too few bytes to say.
+/// A line: where its line break starts and where the next line does, or too few bytes to tell.
 type Line = | Ended(Int, Int) | Unended
 
 /// The header line at `at`, which with its line break may take `depth_left` bytes, one at least.
@@ -479,10 +481,10 @@ fn data(
   }
 }
 
-// --- A body held whole ------------------------------------------------------
+// --- A complete body --------------------------------------------------------
 
-/// The parts of `body`, whose `Content-Type` names `boundary`, raising `multipart.fail` where
-/// `parse` answers `Err`. A part that is itself multipart is one part.
+/// The parts of `body`, whose `Content-Type` names `boundary`. Raises `multipart.fail` where
+/// `parse` returns `Err`. A part that is itself multipart is one part.
 pub fn read(
   body: Bytes,
   boundary: String,
@@ -491,7 +493,7 @@ pub fn read(
 ) -> List<Part> / {multipart.fail, abort.raise} =
   find_parts(reader(boundary, limits, lines), body).parts.map(|f: PartLocation| part_of(body, f))
 
-/// The parts of `body`, whose `Content-Type` names `boundary`, or where it is refused and why.
+/// The parts of `body`, whose `Content-Type` names `boundary`, or where it was rejected and why.
 pub fn parse(
   body: Bytes,
   boundary: String,
@@ -499,7 +501,7 @@ pub fn parse(
   lines: Lines = Strict,
 ) -> Result<List<Part>, Error> / {abort.raise} = try { read(body, boundary, limits, lines) }
 
-/// A part as `step` answers it: its header fields, where its header block starts, and its data's
+/// A part as `step` returns it: its header fields, where its header block starts, and its data's
 /// range.
 type PartLocation = { headers: List<Header>, head: Int, from: Int, to: Int }
 
@@ -527,8 +529,8 @@ fn find_parts_from(
     }
   }
 
-/// The reader past the closing delimiter, once the epilogue is seen to be short and to hold no
-/// delimiter.
+/// The reader past the closing delimiter, once the epilogue is known to be short and to contain
+/// no delimiter.
 fn finished(r: Reader, body: Bytes) -> Reader / {multipart.fail, abort.raise} =
   if body.len() - r.at > r.limits.max_preamble {
     fail(r, r.at + r.limits.max_preamble, EpilogueTooLarge)
@@ -542,11 +544,11 @@ fn finished(r: Reader, body: Bytes) -> Reader / {multipart.fail, abort.raise} =
 /// Where one part lies in a body: its bytes at `[from, to)`, header block, blank line and data.
 pub type Span = { from: Int, to: Int }
 
-/// Where the parts of `body` lie, whose `Content-Type` names `boundary`, with no header block
-/// read: for a reader that takes a part's fields itself. Raises `multipart.fail` where
-/// `parse_spans` answers `Err`, as `read` does but for what a header block holds: a delimiter is
-/// looked for from a part's first line on, the limits on a part's header block bound nothing, and
-/// `Limits.max_part_bytes` bounds a part whole.
+/// Where the parts of `body` lie, whose `Content-Type` names `boundary`, without reading any
+/// header block: for a reader that parses a part's fields itself. Raises `multipart.fail` where
+/// `parse_spans` returns `Err`. It fails as `read` does, except for what concerns header blocks: a
+/// delimiter is searched for from a part's first line, the limits on a part's header block do not
+/// apply, and `Limits.max_part_bytes` bounds the whole part.
 pub fn spans(
   body: Bytes,
   boundary: String,
@@ -557,7 +559,7 @@ pub fn spans(
   find_parts(r, body).parts.map(|f: PartLocation| { from: f.from, to: f.to })
 }
 
-/// Where the parts of `body` lie, or where it is refused and why.
+/// Where the parts of `body` lie, or where it was rejected and why.
 pub fn parse_spans(
   body: Bytes,
   boundary: String,
@@ -572,9 +574,9 @@ pub type Node =
   | Branch(List<Header>, List<Node>)
 
 /// The parts of `body` with each part whose `Content-Type` is `multipart` read as a body in
-/// turn, raising `multipart.fail` where `parse_tree` answers `Err`. A nested body's offsets
-/// are the whole body's, its parts count toward `Limits.max_parts`, and one nested deeper than
-/// `Limits.max_depth` is refused.
+/// turn. Raises `multipart.fail` where `parse_tree` returns `Err`. A nested body's offsets are
+/// the whole body's, its parts count toward `Limits.max_parts`, and one nested deeper than
+/// `Limits.max_depth` is rejected.
 pub fn read_tree(
   body: Bytes,
   boundary: String,
@@ -583,7 +585,7 @@ pub fn read_tree(
 ) -> List<Node> / {multipart.fail, abort.raise} =
   read_subtree(reader(boundary, limits, lines), body, limits.max_depth).nodes
 
-/// The parts of `body` with each multipart part read in turn, or where it is refused and why.
+/// The parts of `body` with each multipart part read in turn, or where it was rejected and why.
 pub fn parse_tree(
   body: Bytes,
   boundary: String,
@@ -614,7 +616,7 @@ fn read_subtree(
     })
 }
 
-/// The boundary of a part whose type is `multipart`, empty where its type names none.
+/// The boundary of a part whose type is `multipart`, empty if its type names none.
 fn nested_boundary(headers: List<Header>) -> Option<String> / {abort.raise} =
   match typed(headers) {
     Some(m) -> if mime::top_level(m) != "multipart" { None }
@@ -624,8 +626,8 @@ fn nested_boundary(headers: List<Header>) -> Option<String> / {abort.raise} =
 
 // --- Parts ------------------------------------------------------------------
 
-/// A part of these header fields and data, each name in lower case and each value without the
-/// blanks around it: the part a reader answers for what `write` writes of it.
+/// A part with these header fields and data, each name in lower case and each value without the
+/// blanks around it: the part a reader returns for what `write` writes of it.
 pub fn part(headers: List<Header>, data: Bytes) -> Part =
   {
     headers: headers.map(|h: Header| { name: h.name.ascii_lower(), value: h.value.ascii_trim() }),
@@ -642,7 +644,7 @@ fn named(headers: List<Header>, lower: String) -> Option<String> =
       None -> if h.name.ascii_lower() == lower { Some(h.value) } else { None },
     })
 
-/// A part's `Content-Type`; `None` where it has none or it is no media type. A part without one
+/// A part's `Content-Type`. `None` if it has none or it is not a media type. A part without one
 /// is `text/plain` by RFC 2046.
 pub fn content_type(p: Part) -> Option<MediaType> / {abort.raise} = typed(p.headers)
 
@@ -652,9 +654,9 @@ fn typed(headers: List<Header>) -> Option<MediaType> / {abort.raise} =
     None -> None,
   }
 
-/// A part's data with its `Content-Transfer-Encoding` undone: as it is where the part names
-/// none, `7bit`, `8bit` or `binary`, and decoded where it names `quoted-printable` or `base64`.
-/// `None` for any other encoding, and for data that is not in the one named.
+/// A part's data with its `Content-Transfer-Encoding` undone: unchanged when the part names none,
+/// `7bit`, `8bit` or `binary`, and decoded when it names `quoted-printable` or `base64`. `None`
+/// for any other encoding, and for data that is not valid in the named one.
 pub fn content(p: Part) -> Option<Bytes> / {abort.raise} = decoded(p.headers, p.data)
 
 fn decoded(headers: List<Header>, data: Bytes) -> Option<Bytes> / {abort.raise} =
@@ -676,17 +678,17 @@ fn decoded(headers: List<Header>, data: Bytes) -> Option<Bytes> / {abort.raise} 
 
 // --- Content-Disposition ----------------------------------------------------
 
-/// What a part's `Content-Disposition` says of it: its kind in lower case, `form-data` in a
+/// What a part's `Content-Disposition` states about it: its kind in lower case, `form-data` in a
 /// form, the `name` of its field and the `filename` a client gave its file.
 pub type Disposition = new { kind: String, name: Option<String>, filename: Option<String> }
 
-/// A part's `Content-Disposition` as a browser writes one; `None` where the part has none or it
-/// does not read so, a parameter given twice included.
+/// A part's `Content-Disposition`, parsed as a browser writes one. `None` if the part has none or
+/// it does not parse, including when a parameter is given twice.
 ///
-/// The reading is RFC 7578 §4.2's and the HTML standard's: a quoted value runs to the next quote
-/// with a backslash meaning itself, so a Windows path stays whole, and `%22`, `%0D` and `%0A` in
-/// it are the quote and the line breaks they were written for; any other `%` is itself. A
-/// `filename*` (RFC 8187) is decoded and read in place of a `filename`.
+/// The parsing follows RFC 7578 §4.2 and the HTML standard. A quoted value runs to the next quote,
+/// and a backslash is a literal backslash, so a Windows path stays whole. `%22`, `%0D` and `%0A` in
+/// it mean the quote and the line breaks, and any other `%` is literal. A `filename*` (RFC 8187)
+/// is decoded and used in place of a `filename`.
 pub fn disposition(p: Part) -> Option<Disposition> / {abort.raise} = disposed(p.headers)
 
 fn disposed(headers: List<Header>) -> Option<Disposition> / {abort.raise} =
@@ -752,7 +754,7 @@ fn with_parameter(b: Bytes, p: Parameters, name: String, at: Int) -> Parameters 
   }
 }
 
-/// What a browser's escapes in a quoted name stand for.
+/// A quoted name with a browser's escapes decoded.
 fn unescaped(text: String) -> String =
   name_escapes().fold(text, |acc: String, e: { written: String, meant: String }|
     acc.replace(e.written, e.meant))
@@ -766,15 +768,15 @@ fn name_escapes() -> List<{ written: String, meant: String }> =
     { written: "%0a", meant: "\n" },
   ]
 
-/// The name a client's file name can be kept under in one directory, on any system: its last
-/// component, after every `/` and `\`; or `None` where that is no safe name. A file name is data
-/// a client chose, never a path: use it only through this, and only under a directory of the
-/// program's own.
+/// The name under which a client's file can be stored in one directory, on any system: its last
+/// component, after every `/` and `\`, or `None` if that is not a safe name. A file name is data a
+/// client chose, never a path: use it only through this function, and only under a directory the
+/// program owns.
 ///
-/// Refused are the empty name, a name that starts with a dot, `.` and `..` among them, one that
-/// ends with a dot or a space, one longer than 255 bytes, one that holds a control character or
-/// any of `<>:"|?*`, and a device name of Windows (`CON`, `PRN`, `AUX`, `NUL`, and `COM` or `LPT`
-/// with one digit, a superscript one among them), in any case and with any extension.
+/// Rejected are the empty name, a name that starts with a dot (including `.` and `..`), one that
+/// ends with a dot or a space, one longer than 255 bytes, one that contains a control character or
+/// any of `<>:"|?*`, and a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, and `COM` or `LPT` with
+/// one digit, including a superscript one), in any case and with any extension.
 pub fn safe_filename(name: String) -> Option<String> / {abort.raise} = {
   let pieces = name.replace("\\", "/").split("/");
   let last = match pieces.at(pieces.len() - 1) { Some(piece) -> piece, None -> "" };
@@ -799,17 +801,17 @@ fn is_device(stem: String) -> Bool =
 pub type Field = new { name: String, value: String }
 
 /// A file of a form: the field it was chosen in, the name the client gave it, which is data and
-/// no path (`safe_filename`), its type as the client named it, and its bytes.
+/// not a path (`safe_filename`), its type as the client named it, and its bytes.
 pub type File = new { name: String, filename: String, content_type: MediaType, data: Bytes }
 
 /// A form: its text fields and its files, each in the order sent.
 pub type Form = new { fields: List<Field>, files: List<File> }
 
-/// The form `body` is, a `multipart/form-data` body whose `Content-Type` names `boundary`,
-/// raising `multipart.fail` where `parse_form` answers `Err`.
+/// Reads the form in `body`, a `multipart/form-data` body whose `Content-Type` names `boundary`.
+/// Raises `multipart.fail` where `parse_form` returns `Err`.
 ///
-/// A part with a `filename` is a file, of type `text/plain` where it names none, and any other a
-/// field. A field's text is read in the charset its own `Content-Type` names, or else the one a
+/// A part with a `filename` is a file, of type `text/plain` if it names none, and any other part is
+/// a field. A field's text is read in the charset its own `Content-Type` names, or else the one a
 /// field named `_charset_` names, or else UTF-8 (RFC 7578 §4.6), and a part's
 /// `Content-Transfer-Encoding` is undone. Each part must have a `Content-Disposition` of
 /// `form-data` with a `name`, and none may be multipart itself.
@@ -845,7 +847,7 @@ pub fn read_form(
     })
 }
 
-/// The form `body` is, or where it is refused and why.
+/// The form in `body`, or where it was rejected and why.
 pub fn parse_form(
   body: Bytes,
   boundary: String,
@@ -853,7 +855,7 @@ pub fn parse_form(
   lines: Lines = Strict,
 ) -> Result<Form, Error> / {abort.raise} = try { read_form(body, boundary, limits, lines) }
 
-/// A part of a form: where it stands, its header fields, its field's name, its file's name, and
+/// A part of a form: where it is, its header fields, its field's name, its file's name, and
 /// its data with its transfer encoding undone.
 type Entry = {
   head: Int,
@@ -911,9 +913,9 @@ fn field_text(r: Reader, e: Entry, fallback: Charset) -> String / {multipart.fai
 
 // --- Writing ----------------------------------------------------------------
 
-/// The body of `parts` under `boundary`, raising `multipart.unwritable` where `build` answers
-/// `Err`: each part after a delimiter line, its header names capitalized as `Content-Type` is, and
-/// the closing delimiter after the last. What `read` reads back as parts made by `part`.
+/// The body of `parts` under `boundary`: each part after a delimiter line, its header names
+/// capitalized as `Content-Type` is, and the closing delimiter after the last. `read` reads it back
+/// as the parts `part` would make. Raises `multipart.unwritable` where `build` returns `Err`.
 pub fn write(parts: List<Part>, boundary: String) -> Bytes / {multipart.unwritable, abort.raise} = {
   let dash = delimiter_of(boundary);
   framed(
@@ -923,24 +925,24 @@ pub fn write(parts: List<Part>, boundary: String) -> Bytes / {multipart.unwritab
   )
 }
 
-/// The body of `parts` under `boundary`, or why they have none.
+/// The body of `parts` under `boundary`, or why they cannot be written.
 pub fn build(parts: List<Part>, boundary: String) -> Result<Bytes, WriteError> / {abort.raise} =
   try { write(parts, boundary) }
 
-/// A part already written: its header block, each field with its line break and none blank, and
-/// its data.
+/// A part already written: its header block, each field ending in its line break and none of them
+/// blank, and its data.
 pub type RawPart = { head: Bytes, data: Bytes }
 
-/// The body of `parts` under `boundary`, each part's header block taken as it is written: what
-/// `write` is made of, for a writer that folds and encodes its own fields. Raises
-/// `multipart.unwritable` for a boundary that is unfit or occurs in a part; a header block is
-/// not looked into.
+/// The body of `parts` under `boundary`, with each part's header block used as written. `write` is
+/// built on it, and it serves a writer that folds and encodes its own fields. Raises
+/// `multipart.unwritable` for a boundary that is invalid or occurs in a part. Header blocks are not
+/// inspected.
 pub fn frame(
   parts: List<RawPart>,
   boundary: String,
 ) -> Bytes / {multipart.unwritable, abort.raise} = framed(parts, delimiter_of(boundary))
 
-/// `--` and the boundary, where it is one a body can be written under.
+/// `--` and the boundary, if a body can be written under it.
 fn delimiter_of(boundary: String) -> Bytes / {multipart.unwritable, abort.raise} = {
   let b = Bytes::of_string(boundary);
   if b.len() == 0 || b.len() > 70 || !is_valid_boundary(b) { multipart.unwritable(InvalidBoundary) }
@@ -970,8 +972,8 @@ fn block(p: Part, index: Int) -> Bytes / {multipart.unwritable} =
 /// A header's name as it is customarily written: each word between its hyphens capitalized.
 fn titled(name: String) -> String = String::join(name.split("-").map(String::capitalize), "-")
 
-/// The `multipart/form-data` body of these fields and then these files under `boundary`, raising
-/// `multipart.unwritable` where `build_form` answers `Err`. Names are written as browsers write
+/// The `multipart/form-data` body of these fields and then these files under `boundary`. Raises
+/// `multipart.unwritable` where `build_form` returns `Err`. Names are written as browsers write
 /// them: in quotes, as UTF-8, with `%22`, `%0D` and `%0A` for a quote and the line breaks.
 pub fn form_data(
   fields: List<Field>,
@@ -998,7 +1000,7 @@ fn file_part(index: Int, f: File) -> Part / {multipart.unwritable} =
     data: f.data,
   }
 
-/// The `multipart/form-data` body of these fields and files, or why they have none.
+/// The `multipart/form-data` body of these fields and files, or why they cannot be written.
 pub fn build_form(
   fields: List<Field>,
   files: List<File>,
@@ -1023,15 +1025,15 @@ fn escaped(index: Int, name: String) -> String / {multipart.unwritable} =
   if unescaped(name) != name { multipart.unwritable(InvalidName(index)) }
   else { name.replace("\"", "%22").replace("\r", "%0D").replace("\n", "%0A") }
 
-/// A boundary no body is likely to hold: 126 bits of the host's entropy, in boundary characters.
+/// A boundary no body is likely to contain: 126 bits of the host's entropy, in boundary characters.
 pub fn fresh_boundary() -> String / {entropy.next bounded} = "boundary-" ++ nonce()
 
 /// A body, and the `Content-Type` that names its boundary.
 pub type Body = { content_type: MediaType, body: Bytes }
 
-/// The `multipart/form-data` body of these fields and files under a boundary drawn from the
+/// The `multipart/form-data` body of these fields and files under a boundary generated from the
 /// host's entropy, with the `Content-Type` to send it under. `multipart.unwritable` is raised as
-/// `form_data` raises it, should the boundary drawn occur in a part.
+/// `form_data` raises it, if the generated boundary occurs in a part.
 pub fn fresh_form_data(
   fields: List<Field>,
   files: List<File>,
@@ -1104,7 +1106,7 @@ fn charset_meant() -> String =
   \\--AaB03x--
 
 /// A form as Chrome sends one, written by hand from what it sends: two text fields, a file whose
-/// name holds a letter outside ASCII and quotes, and a file input left empty.
+/// name contains a letter outside ASCII and quotes, and a file input left empty.
 fn chrome() -> String =
   \\------WebKitFormBoundary7MA4YWxkTrZu0gW
   \\Content-Disposition: form-data; name="title"
@@ -1521,11 +1523,11 @@ fn unreadable() -> List<Refused> / {abort.raise} =
     },
   ]
 
-test "refuses {c.what}" for c: Refused in unreadable() {
+test "rejects {c.what}" for c: Refused in unreadable() {
   assert_eq(parse(c.body, c.boundary, c.limits, c.lines), Err({ at: c.at, reason: c.reason }))
 }
 
-test "the limits a body is refused past are the ones it is read at" {
+test "the limits a body is rejected past are the ones it is read at" {
   let is_valid_boundary = |body: Bytes|
     parse(body, "b", tight()) != Ok([]) && parse(body, "b", tight()).is_ok();
   assert(is_valid_boundary(b"--b\r\n\r\n1\r\n--b\r\n\r\n2\r\n--b--"));
@@ -1546,7 +1548,7 @@ test "the limits a body is refused past are the ones it is read at" {
   assert_eq(parse(body, "b", { ..limits, max_body: 14 }), Err({ at: 14, reason: BodyTooLarge }))
 }
 
-test "limits that bound nothing, and limits below zero, are read as they are meant" {
+test "limits that bound nothing, and limits below zero, work as intended" {
   let most = 9223372036854775807;
   let unbounded: Limits = {
     max_parts: most,
@@ -1581,7 +1583,7 @@ test "limits that bound nothing, and limits below zero, are read as they are mea
   assert_eq(parse(b"--b--", "b", { ..limits, max_parts: -1 }), Ok([]))
 }
 
-test "a step answers a part where it lies, and a reader keeps the place it reached" {
+test "a step returns a part where it lies, and a reader remembers the position it reached" {
   let body = b"--b\r\nA: 1\r\n\r\ndata\r\n--b\r\n\r\n\r\n--b--\r\ntail";
   let start = reader("b", default_limits());
   let one: Reader = { ..start, at: 24, parts: 1, phase: Head };
@@ -1605,7 +1607,7 @@ test "a step answers a part where it lies, and a reader keeps the place it reach
   )
 }
 
-test "a step refuses a part past its limit as soon as no delimiter can end it in time" {
+test "a step rejects a part past its limit as soon as no delimiter can end it in time" {
   let r = reader("b", tight());
   let waits = |seen: Bytes| match step(r, seen) { More(_) -> true, _ -> false };
   assert(waits(b"--b\r\n\r\n".concat(b"a".repeat(12))));
@@ -1628,7 +1630,7 @@ test "a body read from each of its prefixes and then whole is the body read whol
   assert_eq(range(0, fed.len()).filter(|cut: Int| stepped(fed, "b", Lenient, cut) != lenient), [])
 }
 
-test "the raising readers raise what the others answer" {
+test "the raising readers raise what the others return" {
   assert_eq(try { read(b"--b\r\n", "b", default_limits()) }, Err({ at: 5, reason: Truncated }));
   assert_eq(try { read_tree(b"", "b", default_limits()) }, Err({ at: 0, reason: Truncated }));
   assert_eq(try { read_form(b"", "", default_limits()) }, Err({ at: 0, reason: NoBoundary }));
@@ -1680,7 +1682,7 @@ test "a multipart part is one part, and read_tree reads the parts in it" {
   )
 }
 
-test "a nested body is refused past the depth and the parts allowed, at the whole body's offsets" {
+test "a nested body is rejected past the depth and the parts allowed, at the whole body's offsets" {
   let body = wire(nested());
   let limits: Limits = default_limits();
   assert_eq(
@@ -1713,7 +1715,7 @@ test "a nested body is refused past the depth and the parts allowed, at the whol
 
 type Disposed = { value: String, read: Option<Disposition> }
 
-/// `Content-Disposition` values and what they say. The first is RFC 7578 §4.2's and the one with
+/// `Content-Disposition` values and how they parse. The first is RFC 7578 §4.2's and the one with
 /// both file names RFC 6266 §5's.
 fn dispositions() -> List<Disposed> =
   [
@@ -1999,7 +2001,7 @@ fn form_refusals() -> List<Refused> =
     ),
   ]
 
-test "a form refuses {c.what}" for c: Refused in form_refusals() {
+test "a form rejects {c.what}" for c: Refused in form_refusals() {
   assert_eq(parse_form(c.body, c.boundary, c.limits, c.lines), Err({ at: c.at, reason: c.reason }))
 }
 
@@ -2016,7 +2018,7 @@ test "a part's readers find its fields in any case, its type and its decoded con
   assert_eq(header(p, "content-type"), Some("text/plain; charset=utf-8"));
   assert_eq(header(p, "X-NOTE"), Some("one"));
   assert_eq(header(p, "absent"), None);
-  // A name is folded and a value trimmed as ASCII has them: the Kelvin sign is no `k`, and a
+  // Names are lowercased and values trimmed by ASCII rules only: the Kelvin sign is not `k`, and a
   // no-break space is part of a value.
   let odd = part([{ name: "X-\u{212A}ey", value: " \u{a0}v\u{a0}\t" }], b"");
   assert_eq(header(odd, "x-key"), None);
@@ -2131,7 +2133,7 @@ test "a form's name that would read back as another is not written" {
   assert(filed("C:\\dir\\a.txt").is_ok())
 }
 
-test "a fresh boundary is the host's entropy, and a form under one names it in its type" {
+test "a fresh boundary comes from the host's entropy, and a form under one names it in its type" {
   let made = handle {
     fresh_form_data([{ name: "a", value: "1" }], [])
   } with {
@@ -2154,7 +2156,7 @@ test "a fresh boundary is the host's entropy, and a form under one names it in i
   )
 }
 
-/// Limits no body a test draws comes near.
+/// Limits that no generated test body comes near.
 fn roomy() -> Limits =
   {
     max_parts: 100000,
@@ -2167,7 +2169,7 @@ fn roomy() -> Limits =
     max_depth: 8,
   }
 
-test "a body written of parts reads back as them" {
+test "a body written from parts reads back as those parts" {
   gen::check2(gen::list(gen::bytes()), gen::text(), |datas: List<Bytes>, note: String| {
     let parts = datas.map(|d: Bytes| part([{ name: "X-Note", value: note }], d));
     match build(parts, "boundary") {
@@ -2181,7 +2183,7 @@ test "a body written of parts reads back as them" {
   })
 }
 
-test "a boundary is refused exactly where a part holds it after two dashes" {
+test "a boundary is rejected exactly when a part contains it after two dashes" {
   gen::check(gen::list(gen::bytes()), |datas: List<Bytes>| {
     let parts = datas.map(|d: Bytes| part([], d));
     match build(parts, "-") {
@@ -2193,7 +2195,7 @@ test "a boundary is refused exactly where a part holds it after two dashes" {
 
 type Drained = { reader: Reader, parts: List<Part> }
 
-/// Every part `step` answers from `r` over `seen`, until it asks for more or ends.
+/// Every part `step` returns from `r` over `seen`, until it needs more bytes or ends.
 fn drained(
   r: Reader,
   seen: Bytes,
@@ -2225,7 +2227,7 @@ fn stepped(
   drained(first.reader, body, first.parts, 100000).parts
 }
 
-test "any bytes are parts or a refusal at one of them" {
+test "any bytes are parts or an error at one of them" {
   gen::check(gen::bytes(), |body: Bytes| {
     [body, Bytes::concat_all([b"--b\r\n", body, b"\r\n--b--"])].fold(true, |ok: Bool, b: Bytes|
       ok
@@ -2289,7 +2291,7 @@ test "spans {c.what}" for c: Spanned in spanned() {
   )
 }
 
-test "a body's spans are refused as its parts are, but for what a header block holds" {
+test "a body's spans are rejected as its parts are, except for what concerns header blocks" {
   let limits: Limits = tight();
   assert_eq(
     parse_spans(b"--b\r\nA: 1\r\n\r\ndata", "b", limits),
@@ -2312,7 +2314,7 @@ test "a body's spans are refused as its parts are, but for what a header block h
   assert_eq(try { spans(b"", "", limits) }, Err({ at: 0, reason: NoBoundary }))
 }
 
-test "parts already written are framed as they are, under a boundary none of them holds" {
+test "parts already written are framed unchanged, under a boundary none of them contains" {
   let folded = { head: b"Content-Type: text/plain;\r\n charset=utf-8\r\n", data: b"data" };
   assert_eq(
     try { frame([folded, { head: b"", data: b"" }], "b") },

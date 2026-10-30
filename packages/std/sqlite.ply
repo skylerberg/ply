@@ -1,10 +1,10 @@
-//! SQLite: an embedded SQL database, a file under a root or an image in memory.
+//! SQLite: an embedded SQL database, stored in a file under a root or as an image in memory.
 //!
-//! The effect's label is a database's root, bound as `std.fs`'s are: `--fs app=./data` lends the
-//! directory, and `sqlite.query[app]` reads a database under it. A path that leaves its root is
-//! `E0452`, an unbound label `E0451`, and no part of a database's path, nor the journal beside it,
-//! may be a symbolic link. One writer writes a database at a time, so two endpoints that write
-//! `[app]` conflict and two that query it do not. The engine is SQLite 3.53.2, compiled into
+//! The effect's label is a database's root, bound as `std.fs`'s labels are: `--fs app=./data`
+//! grants the directory, and `sqlite.query[app]` reads a database under it. A path that leaves its
+//! root is `E0452`, and an unbound label is `E0451`. No part of a database's path, nor the journal
+//! beside it, may be a symbolic link. One writer writes a database at a time, so two endpoints that
+//! write `[app]` conflict and two that query it do not. The engine is SQLite 3.53.2, compiled into
 //! `ply` and the same on every machine.
 //!
 //! A connection is opened under a `with_hold`, which closes it however its body ends:
@@ -13,52 +13,57 @@
 //! logging, foreign keys enforced, the wait `Options.busy_ms` on another connection's lock,
 //! defensive mode, an untrusted schema, no extension loading, no attached database, no temporary
 //! or virtual table, and, with `Options.strict`, no table that is not `STRICT` (declare tables
-//! `STRICT` either way: without it a column takes any value). The engine's authorizer holds a
-//! statement to that inside the engine, so a view or a trigger is held to it too: `ATTACH`,
-//! `DETACH` and `VACUUM` are refused, as is a pragma outside `user_version`, `application_id`,
-//! `optimize` and the ones that describe a schema or check it, and a function outside
-//! `functions()`.
+//! `STRICT` either way: without it a column accepts any value). The engine's authorizer enforces
+//! these rules inside the engine, so views and triggers are bound by them too. It rejects
+//! `ATTACH`, `DETACH` and `VACUUM`, any pragma other than `user_version`, `application_id`,
+//! `optimize` and those that describe or check a schema, and any function not in `functions()`.
 //!
-//! A statement is a `Bound`: text the reader has read, and its parameters. `bound(stmt(".."), ps)`
-//! makes one of text a program built, and the tag `sqlite"insert into t (a) values ({IntParameter(n)})"`
-//! one whose text is read when the program is checked and whose holes are its parameters, bound
-//! as `?1`, `?2`; nothing a hole holds is ever statement text. The parameters are `std.sql`'s
-//! `Param`: null, an integer, a float, text and bytes are what SQLite stores, and a `BoolParameter` is
-//! bound 1 or 0. A `Decimal`, a date, JSON and an array are the caller's to encode, as text or an
-//! integer, so `NumericParameter`, `JsonParameter` and `ArrayParameter` are refused. `query` answers rows, each a
-//! `std.sql` `Row`, read a column at a time by `int`, `float`, `text` and `bytes`, and through
-//! `optional` where a column may be null; `execute` answers the rows a statement changed and the
-//! row id it last inserted; `returning` is a write that answers rows; `run` answers either as
-//! `std.sql`'s `QueryResult`. Every one takes its `Limits`, and there is no call without them.
+//! A statement is a `Bound`: text the parser has accepted, and its parameters.
+//! `bound(stmt(".."), ps)` makes one from text a program built. The tag
+//! `sqlite"insert into t (a) values ({IntParameter(n)})"` makes one whose text is parsed when the
+//! program is checked and whose holes are its parameters, bound as `?1`, `?2`. Nothing in a hole
+//! ever becomes statement text. The parameters are `std.sql`'s `Param`: null, an integer, a float,
+//! text and bytes are what SQLite stores, and a `BoolParameter` is bound as 1 or 0. The caller must
+//! encode a `Decimal`, a date, JSON or an array as text or an integer, so `NumericParameter`,
+//! `JsonParameter` and `ArrayParameter` are rejected.
+//!
+//! `query` returns rows, each a `std.sql` `Row`, read a column at a time by `int`, `float`, `text`
+//! and `bytes`, and through `optional` when a column may be null. `execute` returns the number of
+//! rows a statement changed and the row id it last inserted. `returning` is a write that returns
+//! rows. `run` returns either as `std.sql`'s `QueryResult`. Every one takes its `Limits`, and none
+//! can be called without them.
 //!
 //! `transaction` runs its body between `BEGIN IMMEDIATE` and `COMMIT`, and rolls back if the body
-//! raises or its task is cancelled; inside another it is a savepoint. `snapshot` is the same over
-//! a transaction that only reads, which sees one state of the database throughout. `fold_rows`
-//! reads a large answer a page at a time. `backup` writes a compacted copy under the same root.
+//! raises or its task is cancelled. Inside another transaction it is a savepoint. `snapshot` does
+//! the same for a transaction that only reads, which sees one state of the database throughout.
+//! `fold_rows` reads a large result a page at a time. `backup` writes a compacted copy under the
+//! same root.
 //!
-//! What is refused is raised as `sql.fail` with a `Error`: `Busy` is another connection
-//! holding the lock past the wait, and is the one to retry (`is_retryable`); `Constraint` names
-//! its kind and what the engine names, `table.column` for a unique, not-null or strict-type
-//! failure, the constraint's name for a check, and nothing for a foreign key. `try` makes a
-//! `Result` of any call.
+//! Errors are raised as `sql.fail` with an `Error`. `Busy` means another connection held the lock
+//! past the wait, and it is the one error worth retrying (`is_retryable`). `Constraint` gives the
+//! constraint's kind and the name the engine reports: `table.column` for a unique, not-null or
+//! strict-type failure, the constraint's name for a check, and nothing for a foreign key. `try`
+//! turns any call into a `Result`.
 //!
-//! A statement reads no clock and draws no random number: `CURRENT_TIMESTAMP`, `random()` and
-//! `randomblob()` are refused, and so is a date or time function given no time, the time `'now'`
+//! A statement reads no clock and draws no random number. `CURRENT_TIMESTAMP`, `random()` and
+//! `randomblob()` are rejected, and so is a date or time function given no time, the time `'now'`,
 //! or the modifier `'localtime'` or `'utc'`, whether written in the statement or bound to it. The
-//! functions `last_insert_rowid()`, `changes()` and `total_changes()` are refused too, since
-//! `execute` answers what they would; so is a row id of 9223372036854775807, past which the
-//! engine draws row ids at random. What a statement answers is then a function of the database
-//! and the values bound, and the same engine runs over an image in memory as the twin:
-//! `in_memory[app](|| ..)` answers every operation from `sqlite_run`, a native that performs
-//! nothing, so a test over it is deterministic and cached, a law may quantify over it, and
-//! neither needs a root. The twin keeps a database for each path, gives a transaction its own
-//! copy, and answers `Busy` at once to a second writer. It differs from a file in three ways: a
-//! deferred foreign key is checked at its statement, not at the commit; `backup` copies the image
-//! without compacting it; and each statement costs a copy of the database, so a test that fills a
-//! large one belongs on a file under a root `--fs` lends.
+//! functions `last_insert_rowid()`, `changes()` and `total_changes()` are rejected too, since
+//! `execute` returns what they would. So is a row id of 9223372036854775807, past which the engine
+//! picks row ids at random. So a statement's result depends only on the database and the values
+//! bound.
 //!
-//! A schema's version is `pragma user_version`: a migration is a `transaction` that reads it,
-//! runs the statements past it and sets it.
+//! The same engine runs on an image in memory as the fake: `in_memory[app](|| ..)` handles every
+//! operation with `sqlite_run`, a native function that performs no effects. So a test that uses it
+//! is deterministic and cached, a law may quantify over it, and neither needs a root. The fake
+//! keeps a database for each path, gives a transaction its own copy, and returns `Busy` at once to
+//! a second writer. It differs from a file in three ways: a deferred foreign key is checked at its
+//! statement, not at the commit; `backup` copies the image without compacting it; and each
+//! statement costs a copy of the database. So a test that fills a large database belongs on a file
+//! under a root that `--fs` grants.
+//!
+//! A schema's version is `pragma user_version`: a migration is a `transaction` that reads it, runs
+//! the statements after it and sets it.
 
 import std.sql (Stmt, stmt, Param, NullParameter, IntParameter, BoolParameter, TextParameter,
                 BytesParameter, FloatParameter, NumericParameter, JsonParameter, ArrayParameter,
@@ -74,12 +79,13 @@ import std.math (rem_euclid)
 import std.option
 import std.gen
 
-/// One SQL statement run by SQLite over the database `image` holds, a database file's bytes or
-/// none for an empty one, its values and limits written as the natives below read them: parts of
-/// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
-/// its arguments: the engine is the one every `ply` of this version carries, and a statement that
-/// would read a clock, entropy or another file is refused. `reads_only` refuses a statement that
-/// could write, and `strict` a table that is not `STRICT`. `run_on_image` is how the twin runs one.
+/// Runs one SQL statement with SQLite on the database in `image`: a database file's bytes, or
+/// empty for an empty database. Its values and limits are encoded as the native functions below
+/// read them. Returns as parts the image it left, present when it wrote and stored what it wrote,
+/// and its reply. The result depends only on the arguments: every `ply` of this version carries
+/// the same engine, and a statement that would read a clock, entropy or another file is rejected.
+/// `reads_only` rejects a statement that could write, and `strict` a table that is not `STRICT`.
+/// `run_on_image` is how the fake runs one.
 extern fn sqlite_run(
   image: Bytes,
   sql: String,
@@ -89,35 +95,36 @@ extern fn sqlite_run(
   limits: Bytes,
 ) -> Bytes
 
-/// The SQL functions a statement `sqlite_run` runs may call, in order, as parts: any other is
-/// refused.
+/// The SQL functions a statement run by `sqlite_run` may call, in order, as parts. Any other
+/// function is rejected.
 extern fn sqlite_functions() -> Bytes
 
-/// How a database file is opened: to be read, to be read and written, or made if it is not there.
+/// How a database file is opened: to be read, to be read and written, or created if it does not
+/// exist.
 pub type Mode = | ReadOnly | ReadWrite | Create
 
 /// What a connection is opened with: whether every table it makes must be `STRICT`, the
 /// milliseconds a statement waits on another connection's lock before it is `Busy`, and how many
-/// prepared statements the connection keeps for the next statement of the same text.
+/// prepared statements the connection caches for reuse by a later statement with the same text.
 pub type Options = { strict: Bool, busy_ms: Int, statements: Int }
 
-/// What one statement may take and answer: the bytes of its text, its parameters, the rows it
-/// answers, the bytes of the values in them (a text's or a blob's length, eight for a number),
-/// and the steps of the engine's virtual machine it may run, in thousands. The steps bound its
-/// work without a clock, so the same statement over the same database is refused or not alike.
+/// What one statement may take and return: the bytes of its text, its parameters, the rows it
+/// returns, the bytes of the values in them (a text's or a blob's length, eight for a number),
+/// and the steps of the engine's virtual machine it may run, in thousands. The steps limit its
+/// work without a clock, so the same statement on the same database is always rejected or never.
 pub type Limits = { sql_bytes: Int, params: Int, rows: Int, bytes: Int, steps: Int }
 
-/// One value as the engine binds and answers it: `kind` is 0 for null, 1 an integer in `int`, 2 a
-/// float in `real`, 3 text and 4 bytes, both in `bytes`.
+/// One value as the engine binds and returns it: `kind` is 0 for null, 1 for an integer in `int`,
+/// 2 for a float in `real`, 3 for text and 4 for bytes, both in `bytes`.
 pub type Scalar = { kind: Int, int: Int, real: Float, bytes: Bytes }
 
-/// Why the engine did not do what it was asked: the word `refusal_of` types, the constraint,
-/// limit or engine code it names, and the engine's own sentence.
+/// Why the engine did not do what was requested: the kind word that `refusal_of` turns into an
+/// `Error`, the constraint, limit or engine code it names, and the engine's own message.
 pub type Failure = { kind: String, name: String, detail: String }
 
-/// What the engine answered one operation: the columns and rows of a statement that answers
-/// them, whether the statement could have changed the database, the rows it changed itself, the
-/// row id it last inserted or 0, and why it did not run.
+/// The engine's result for one operation: the columns and rows of a statement that returns them,
+/// whether the statement could have changed the database, the number of rows it changed itself,
+/// the row id it last inserted or 0, and why it did not run.
 pub type Reply = {
   columns: List<String>,
   rows: List<List<Scalar>>,
@@ -135,50 +142,51 @@ pub type Control = | Begin | BeginRead | Commit | Rollback
 /// A database under the root its label names. Every operation on a connection goes to the
 /// engine one at a time, in the order it was performed.
 pub nondet effect sqlite {
-  /// Opens the database at `path`, answering the connection's number.
+  /// Opens the database at `path`, returning the connection's number.
   write open[d](path: String, mode: Mode, options: Options) -> Result<Int, Failure>
   /// Closes a connection, rolling back what it left open; `false` for a number that names none.
   write close[d](conn: Int) -> Bool
   /// Runs a statement that only reads.
   read query[d](conn: Int, sql: String, params: List<Scalar>, limits: Limits) -> Reply
-  /// Runs a statement that may write. One refused after it ran, for what it answered or what it
-  /// left, leaves nothing behind.
+  /// Runs a statement that may write. A statement rejected after it ran, because of what it
+  /// returned or left, leaves no changes behind.
   write execute[d](conn: Int, sql: String, params: List<Scalar>, limits: Limits) -> Reply
   /// Opens or closes a transaction or a savepoint.
   write control[d](conn: Int, step: Control) -> Reply
-  /// Writes a compacted copy of the database to `path`, which holds nothing yet.
+  /// Writes a compacted copy of the database to `path`, where no file exists yet.
   write backup[d](conn: Int, path: String) -> Reply
-  /// Opens a statement that only reads to be fetched a page at a time, answering its columns.
+  /// Opens a read-only statement to be fetched a page at a time, returning its columns.
   /// Nothing else runs on the connection until `finish`.
   write cursor[d](conn: Int, sql: String, params: List<Scalar>, limits: Limits) -> Reply
-  /// The next `rows` rows of the open statement; fewer is its end. `limits.rows` bounds all its
-  /// pages together and `limits.bytes` each.
+  /// The next `rows` rows of the open statement; fewer means the end. `limits.rows` limits all its
+  /// pages together, and `limits.bytes` each page.
   write fetch[d](conn: Int, rows: Int) -> Reply
   /// Ends the open statement; `false` when none is open.
   write finish[d](conn: Int) -> Bool
 }
 
-/// What this module raises. It is an effect of its own, so code that handles every `sqlite`
-/// operation, as the twin does, is deterministic though it may still be refused.
+/// What this module raises. It is a separate effect, so code that handles every `sqlite`
+/// operation, as the fake does, is deterministic even though it may still fail.
 pub effect sql {
-  /// A database did not do what it was asked.
+  /// A database did not do what was requested.
   raise fail(why: Error)
 }
 
 /// The constraint a write broke: a unique index or a primary key, a foreign key, `NOT NULL`, a
-/// `CHECK`, a `STRICT` column's type, or another the engine keeps (a trigger's `RAISE`).
+/// `CHECK`, a `STRICT` column's type, or another the engine enforces (a trigger's `RAISE`).
 pub type Violation = | Unique | ForeignKey | NotNull | Check | Datatype | Other
 
-/// Why a database did not do what it was asked.
+/// Why a database did not do what was requested.
 ///
-/// `Busy`: another connection holds the lock past the wait the connection was opened with.
-/// `Constraint`: a write broke one, with what the engine names of it. `Unopened`: the database
-/// did not open. `Refused`: the statement is one this module does not run, which the reader or
-/// the engine's authorizer said before it ran. `Malformed`: the engine could not read the
-/// statement, or it names what the database does not hold. `RunResult`: a limit its caller set, by its
-/// field's name, or `value` for one text or blob past 64 MiB. `Mistyped`: a column does not hold
-/// what a reader asked it for. `Closed`: the connection is closed, or its transaction was rolled
-/// back under it. `Engine`: anything else, with the engine's code.
+/// `Busy`: another connection held the lock past the wait the connection was opened with.
+/// `Constraint`: a write broke a constraint, with the name the engine reports. `Unopened`: the
+/// database did not open. `Refused`: the statement is one this module does not run, as the parser
+/// or the engine's authorizer reported before it ran. `Malformed`: the engine could not parse the
+/// statement, or it names something the database does not contain. `RunResult`: a limit the
+/// caller set was exceeded, given by its field's name, or `value` for one text or blob over
+/// 64 MiB. `Mistyped`: a column does not contain the type a reader requested. `Closed`: the
+/// connection is closed, or its transaction was rolled back under it. `Engine`: anything else,
+/// with the engine's code.
 pub type Error =
   | Busy
   | Constraint(Violation, String)
@@ -190,10 +198,10 @@ pub type Error =
   | Closed(String)
   | Engine(String, String)
 
-/// Whether running the same thing again may succeed: only `Busy` says so.
+/// Whether running the same operation again may succeed. Only `Busy` may.
 pub fn is_retryable(why: Error) -> Bool = match why { Busy -> true, _ -> false }
 
-/// What a `Failure` is as a `Error`.
+/// A `Failure` converted to an `Error`.
 pub fn refusal_of(f: Failure) -> Error =
   if f.kind == "busy" { Busy }
   else if f.kind == "unique" { Constraint(Unique, f.name) }
@@ -223,30 +231,31 @@ pub fn functions() -> List<String> / {abort.raise} =
 
 // --- A statement and its parameters ------------------------------------------------------
 
-/// A statement the reader has read, with the values bound to its `?1`, `?2`.
+/// A statement the parser has accepted, with the values bound to its `?1`, `?2`.
 pub opaque type Bound = | Bound(String, List<Scalar>)
 
-/// `bare_statement` with `ps` bound to its placeholders, in order. Raises `Refused` for a statement the reader
-/// refuses and for a parameter SQLite does not store.
+/// `bare_statement` with `ps` bound to its placeholders, in order. Raises `Refused` for a statement
+/// the parser rejects and for a parameter type SQLite does not store.
 pub fn bound(bare_statement: Stmt, ps: List<Param>) -> Bound / {sql.fail, abort.raise} =
   match scan_statement(Sqlite, bare_statement.sql) {
     Err(e) -> sql.fail(Refused(e.detail)),
     Ok(_) -> Bound(bare_statement.sql, scalars(ps)),
   }
 
-/// The statement a `Bound` holds.
+/// The statement in a `Bound`.
 pub fn statement(b: Bound) -> Stmt = match b { Bound(sql, _) -> stmt(sql) }
 
-/// A tagged literal with no hole: `sqlite"select count(*) from t"`, read when the program is
-/// checked.
+/// Checks a tagged literal with no holes, such as `sqlite"select count(*) from t"`, when the
+/// program is checked.
 pub fn literal(text: String) -> Result<Bound, { message: String, offset: Int }> / {abort.raise} =
   match compile([text]) {
     Ok(bare_statement) -> Ok(Bound(bare_statement.sql, [])),
     Err(e) -> Err({ message: e.message, offset: e.offset }),
   }
 
-/// The statement a tagged literal's texts make, each hole between two of them written `?1`,
-/// `?2`: read when the program is checked, and refused there where the reader refuses it.
+/// The statement made from a tagged literal's texts, with each hole between two of them written
+/// `?1`, `?2`. It is parsed when the program is checked, and rejected there if the parser rejects
+/// it.
 pub fn compile(
   texts: List<String>,
 ) -> Result<Stmt, { message: String, offset: Int, part: Int }> / {abort.raise} = {
@@ -266,8 +275,9 @@ pub fn fill(c: Stmt, holes: List<Param>) -> Bound / {sql.fail} = Bound(c.sql, sc
 
 type PartSearch = { begins: Int, part: Int, offset: Int, found: Bool }
 
-/// Byte `at` of the statement the texts make, as the text it stands in and the characters before
-/// it there. A byte in a hole's `?n` stands at the end of the text before the hole.
+/// Locates byte `at` of the statement the texts make: the text it is in, and the number of
+/// characters before it there. A byte in a hole's `?n` counts as the end of the text before the
+/// hole.
 fn error_in_part(
   texts: List<String>,
   at: Int,
@@ -287,7 +297,7 @@ fn error_in_part(
   { message: message, offset: last.offset, part: last.part }
 }
 
-/// How many characters the first `n` bytes of `text` hold.
+/// How many characters the first `n` bytes of `text` contain.
 fn character_count(text: Bytes, n: Int) -> Int / {abort.raise} =
   if n <= 0 { 0 } else { String::of_bytes(text.slice(0, min(n, text.len()))).chars().len() }
 
@@ -329,8 +339,8 @@ fn datum_of(bare_statement: Scalar) -> Datum / {abort.raise} =
   else if bare_statement.kind == 4 { BytesDatum(bare_statement.bytes) }
   else { NullDatum }
 
-/// The rows of a reply, each by column name. Two columns of one name would be one entry, so a
-/// statement that answers them is refused: name each with `as`.
+/// The rows of a reply, each keyed by column name. Two columns with one name would be one entry,
+/// so a statement that returns them is rejected: name each with `as`.
 fn rows_of(columns: List<String>, rows: List<List<Scalar>>) -> List<Row> / {sql.fail, abort.raise} = {
   let names = columns.fold(Map::new(), |seen: Map<String, Unit>, c: String| seen.insert(c, ()));
   if names.len() != columns.len() {
@@ -354,12 +364,12 @@ fn raise_on_failure(r: Reply) -> Reply / {sql.fail} =
 
 // --- A connection ------------------------------------------------------------------------
 
-/// An open database under the root `d`. What it holds is useless once its `with_hold` has closed
-/// it: an operation on it then raises `Closed`.
+/// An open database under the root `d`. It is useless once its `with_hold` has closed it: any
+/// operation on it then raises `Closed`.
 pub opaque type Connection<[d]> = | Connection(Int)
 
-/// The database at `path` under the root `d`, opened as `mode` and `options` say: what a
-/// `with_hold` acquires. Raises `Unopened` where it does not open.
+/// Opens the database at `path` under the root `d` with `mode` and `options`. A `with_hold`
+/// acquires a connection with this. Raises `Unopened` when the database does not open.
 pub fn opening<[d]>(
   path: String,
   mode: Mode,
@@ -370,8 +380,8 @@ pub fn opening<[d]>(
     Err(f) -> sql.fail(refusal_of(f)),
   }
 
-/// Closes a connection, rolling back a transaction it left open: what a `with_hold` over one
-/// releases it with, written `|c| sqlite::close(c)`.
+/// Closes a connection, rolling back any transaction it left open. A `with_hold` over a connection
+/// releases it with this, written `|c| sqlite::close(c)`.
 pub fn close<[d]>(c: Connection<[d]>) -> Unit / {sqlite.close[d]} =
   match c {
     Connection(conn) -> {
@@ -382,7 +392,7 @@ pub fn close<[d]>(c: Connection<[d]>) -> Unit / {sqlite.close[d]} =
 
 fn connection_number<[d]>(c: Connection<[d]>) -> Int = match c { Connection(conn) -> conn }
 
-/// The rows a statement that only reads answers. Raises `Refused` for one that could write.
+/// The rows a read-only statement returns. Raises `Refused` for a statement that could write.
 pub fn query<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
@@ -397,11 +407,11 @@ pub fn query<[d], [r]>(
     },
   }
 
-/// What a write did: the rows the statement itself changed, a trigger's not among them, and the
-/// row id of the last row it inserted, or 0 where it inserted none.
+/// What a write did: the number of rows the statement itself changed, not counting a trigger's,
+/// and the row id of the last row it inserted, or 0 when it inserted none.
 pub type ExecuteResult = { rows: Int, last_row_id: Int }
 
-/// Runs a statement that writes, a schema statement among them.
+/// Runs a statement that writes, including a schema statement.
 pub fn execute<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
@@ -416,7 +426,7 @@ pub fn execute<[d], [r]>(
     },
   }
 
-/// Runs a statement that writes and answers rows, as one with `returning` does.
+/// Runs a statement that writes and returns rows, as one with `returning` does.
 pub fn returning<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
@@ -431,9 +441,9 @@ pub fn returning<[d], [r]>(
     },
   }
 
-/// What a statement answered as `std.sql` writes an answer: `Rows` where it answers columns,
-/// `Count` of the rows it changed otherwise, and `Failed` in place of a raise, its `code` a
-/// `Failure`'s `kind` and its `constraint` the `name`.
+/// A statement's result in `std.sql`'s form: `Rows` when it returns columns, otherwise `Count` of
+/// the rows it changed, and `Failed` in place of a raise, with a `Failure`'s `kind` as its `code`
+/// and the `name` as its `constraint`.
 pub fn run<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
@@ -459,19 +469,20 @@ pub fn run<[d], [r]>(
     },
   }
 
-/// `body` inside a transaction that holds the write lock from its start, so nothing in it waits
-/// on a lock again: committed when the body returns, and rolled back when it raises, a clause
-/// unwinds through it or its task is cancelled. Inside another transaction it is a savepoint,
-/// which rolls back alone. Raises `Busy` where another connection holds the lock past the wait.
-/// On a connection opened to read it takes no lock and is a `snapshot`.
+/// Runs `body` inside a transaction that holds the write lock from the start, so nothing in it
+/// waits on a lock again. The transaction commits when the body returns. It rolls back when the
+/// body raises, when a handler clause unwinds through it, or when its task is cancelled. Inside
+/// another transaction it is a savepoint, which rolls back on its own. Raises `Busy` when another
+/// connection holds the lock past the wait. On a connection opened to read, it takes no lock and
+/// is a `snapshot`.
 pub fn transaction<a, [d], [r] | e>(
   conn: Hold<Connection<[d]>, [r]>,
   body: () -> a / e,
 ) -> a / {hold.read[r], sqlite.control[d], sql.fail | e} =
   in_transaction[d](connection_number(conn.get()), Begin, body)
 
-/// `body` inside a transaction that only reads: every query in it sees the database as it stood
-/// at the first. A write in it raises `Busy` if another connection has written since.
+/// Runs `body` inside a transaction that only reads: every query in it sees the database as it was
+/// at the first query. A write in it raises `Busy` if another connection has written since.
 pub fn snapshot<a, [d], [r] | e>(
   conn: Hold<Connection<[d]>, [r]>,
   body: () -> a / e,
@@ -494,7 +505,7 @@ fn in_transaction<a, [d] | e>(
         },
       |_u: Unit| {
         let value = body();
-        // Whatever the commit answers, its scope is closed.
+        // Whatever the commit returns, its scope is closed.
         scope_end.end();
         raise_on_failure(sqlite.control[d](conn, Commit));
         value
@@ -509,16 +520,17 @@ fn in_transaction<a, [d] | e>(
   }
 }
 
-/// Whether a transaction's body got as far as its commit, which its release reads.
+/// Whether a transaction's body got as far as its commit. The release step reads it.
 effect scope_end {
   write end() -> Unit
   read ended() -> Bool
 }
 
-/// `f` over each row a statement that only reads answers, fetched `page` rows at a time, so a
-/// large answer is held a page at a time. `limits.rows` is the most rows it folds over, past
-/// which it raises `RunResult`, and `limits.bytes` bounds each page. Nothing else runs on the
-/// connection while it folds: `f` reads another connection, or gathers what it will write.
+/// Folds `f` over each row a read-only statement returns, fetched `page` rows at a time, so only
+/// one page of a large result is in memory at once. `limits.rows` is the most rows it folds over;
+/// past that it raises `RunResult`. `limits.bytes` limits each page. Nothing else runs on the
+/// connection during the fold: `f` reads from another connection, or collects what it will write
+/// later.
 pub fn fold_rows<a, [d], [r] | e>(
   conn: Hold<Connection<[d]>, [r]>,
   q: Bound,
@@ -548,9 +560,9 @@ pub fn fold_rows<a, [d], [r] | e>(
     },
   }
 
-/// A compacted copy of the database written to `path` under the same root, which must hold
-/// nothing yet: `VACUUM INTO`. The copy is a database of its own, consistent though others write
-/// meanwhile. Raises `Malformed` inside a transaction, where the engine cannot copy.
+/// Writes a compacted copy of the database to `path` under the same root, where no file may exist
+/// yet: `VACUUM INTO`. The copy is a separate database, consistent even if others write meanwhile.
+/// Raises `Malformed` inside a transaction, where the engine cannot copy.
 pub fn backup<[d], [r]>(
   conn: Hold<Connection<[d]>, [r]>,
   path: String,
@@ -567,31 +579,31 @@ fn column_value(row: Row, column: String) -> Datum / {sql.fail} =
     None -> sql.fail(Mistyped(column, "a column of the answer")),
   }
 
-/// The integer `column` holds. Raises `Mistyped` for anything else, null and no such column
-/// included.
+/// The integer in `column`. Raises `Mistyped` for anything else, including null and a missing
+/// column.
 pub fn int(row: Row, column: String) -> Int / {sql.fail} =
   match column_value(row, column) {
     IntDatum(n) -> n,
     _ -> sql.fail(Mistyped(column, "an integer")),
   }
 
-/// The float `column` holds. An integer is not one: a `STRICT` table's `REAL` column answers
-/// floats, and an expression is cast.
+/// The float in `column`. An integer is not a float: a `STRICT` table's `REAL` column returns
+/// floats, and an expression can be cast.
 pub fn float(row: Row, column: String) -> Float / {sql.fail} =
   match column_value(row, column) { FloatDatum(x) -> x, _ -> sql.fail(Mistyped(column, "a float")) }
 
-/// The text `column` holds.
+/// The text in `column`.
 pub fn text(row: Row, column: String) -> String / {sql.fail} =
   match column_value(row, column) {
     TextDatum(bare_statement) -> bare_statement,
     _ -> sql.fail(Mistyped(column, "text")),
   }
 
-/// The bytes `column` holds.
+/// The bytes in `column`.
 pub fn bytes(row: Row, column: String) -> Bytes / {sql.fail} =
   match column_value(row, column) { BytesDatum(b) -> b, _ -> sql.fail(Mistyped(column, "bytes")) }
 
-/// `None` where `column` holds null, and what `read` reads of it otherwise:
+/// `None` when `column` is null, and otherwise what `read` returns for it, as in
 /// `optional(row, "note", sqlite::text)`.
 pub fn optional<a | e>(
   row: Row,
@@ -604,8 +616,8 @@ pub fn optional<a | e>(
 
 host for sqlite by served
 
-/// `go` with every database opened under the root its label names on the machine, each operation
-/// waited for in the asking task.
+/// Runs `go`, opening each database under the root its label names on the machine. The calling
+/// task waits for each operation.
 fn served<a | e>(
   go: () -> a / {sqlite.read[*], sqlite.write[*] | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
@@ -649,7 +661,8 @@ fn served<a | e>(
     sqlite.finish[*label](conn) -> job_wait(sqlite_finish(label, conn)) == b"\x01",
   }
 
-/// The ticket of the database at `path` under the root `label` names, opened as `mode` numbers it.
+/// The ticket for opening the database at `path` under the root `label` names, in the mode
+/// `mode_number` numbers.
 extern fn sqlite_open(
   label: String,
   path: String,
@@ -659,10 +672,10 @@ extern fn sqlite_open(
   statements: Int,
 ) -> Int / {native.read}
 
-/// The ticket of a connection closed.
+/// The ticket for closing a connection.
 extern fn sqlite_close(label: String, conn: Int) -> Int / {native.read}
 
-/// The ticket of a statement that only reads, its values and limits written.
+/// The ticket for running a read-only statement, with its values and limits encoded.
 extern fn sqlite_query(
   label: String,
   conn: Int,
@@ -671,7 +684,7 @@ extern fn sqlite_query(
   limits: Bytes,
 ) -> Int / {native.read}
 
-/// The ticket of a statement that may write, its values and limits written.
+/// The ticket for running a statement that may write, with its values and limits encoded.
 extern fn sqlite_execute(
   label: String,
   conn: Int,
@@ -680,7 +693,7 @@ extern fn sqlite_execute(
   limits: Bytes,
 ) -> Int / {native.read}
 
-/// The ticket of a statement opened to be fetched a page at a time.
+/// The ticket for opening a statement to be fetched a page at a time.
 extern fn sqlite_cursor(
   label: String,
   conn: Int,
@@ -689,23 +702,23 @@ extern fn sqlite_cursor(
   limits: Bytes,
 ) -> Int / {native.read}
 
-/// The ticket of a step of a connection's transaction, as `step_number` numbers it.
+/// The ticket for a step of a connection's transaction, numbered by `step_number`.
 extern fn sqlite_control(label: String, conn: Int, step: Int) -> Int / {native.read}
 
-/// The ticket of a compacted copy of a connection's database written to `path`.
+/// The ticket for writing a compacted copy of a connection's database to `path`.
 extern fn sqlite_backup(label: String, conn: Int, path: String) -> Int / {native.read}
 
-/// The ticket of the next `rows` rows of a connection's open statement.
+/// The ticket for fetching the next `rows` rows of a connection's open statement.
 extern fn sqlite_fetch(label: String, conn: Int, rows: Int) -> Int / {native.read}
 
-/// The ticket of a connection's open statement ended.
+/// The ticket for ending a connection's open statement.
 extern fn sqlite_finish(label: String, conn: Int) -> Int / {native.read}
 
 fn mode_number(mode: Mode) -> Int = match mode { ReadOnly -> 0, ReadWrite -> 1, Create -> 2 }
 
-/// What opening the database at `path` read for an observed test's record: the file and the log
-/// beside it, where it only reads, and else what it may write, the files the engine keeps beside
-/// it among them.
+/// Records, for an observed test, the files that opening the database at `path` touches. A
+/// read-only open reads the file and the log beside it. Otherwise it may write all of them,
+/// including the files the engine keeps beside the database.
 fn record_opened_files(label: String, path: String, mode: Mode) -> Unit / {native.read} =
   match mode {
     ReadOnly -> {
@@ -720,8 +733,8 @@ fn record_opened_files(label: String, path: String, mode: Mode) -> Unit / {nativ
 fn step_number(step: Control) -> Int =
   match step { Begin -> 0, BeginRead -> 1, Commit -> 2, Rollback -> 3 }
 
-/// A value as the natives read one: its kind's byte, then a number's eight bytes or what text or
-/// bytes hold.
+/// A value encoded as the native functions read it: its kind's byte, then a number's eight bytes or
+/// the contents of the text or bytes.
 fn encode_scalar(bare_statement: Scalar) -> Bytes =
   match bare_statement.kind {
     1 -> b"\x01".concat(i64_be(bare_statement.int)),
@@ -758,14 +771,16 @@ fn decode_failure(flat: Bytes) -> Failure / {abort.raise} =
     _ -> panic("a database native wrote no failure"),
   }
 
-/// What opening a database answered: byte 1 and the connection's number, or byte 0 and why not.
+/// Decodes the reply to opening a database: byte 1 and the connection's number, or byte 0 and why
+/// it failed.
 fn decode_open_reply(encoded: Bytes) -> Result<Int, Failure> / {abort.raise} = {
   let rest = encoded.slice(1, encoded.len());
   if encoded.at(0) == 1 { Ok(decode_int(rest)) } else { Err(decode_failure(rest)) }
 }
 
-/// A reply as the natives write one: parts of the columns, the rows, whether it could have
-/// written, the rows it changed, the row id it last inserted and its failure found.
+/// Decodes a reply as the native functions write it: parts for the columns, the rows, whether it
+/// could have written, the rows it changed, the row id it last inserted, and its failure encoded
+/// for `found`.
 fn decode_reply(encoded: Bytes) -> Reply / {abort.raise} =
   match parts(encoded) {
     [columns, rows, wrote, changed, last_row_id, failure] ->
@@ -780,15 +795,15 @@ fn decode_reply(encoded: Bytes) -> Reply / {abort.raise} =
     _ -> panic("a database native wrote no reply"),
   }
 
-// --- The twin ----------------------------------------------------------------------------
+// --- The fake ----------------------------------------------------------------------------
 
-/// A statement a fold has open: the rows it answered, how many were fetched, and each page's
-/// bound in bytes.
+/// A statement a fold has open: the rows it returned, how many were fetched, and each page's limit
+/// in bytes.
 type OpenCursor = { rows: List<List<Scalar>>, at: Int, bytes: Int }
 
-/// A twin's connection. `saved` holds the image each open transaction and savepoint rolls back
-/// to, outermost first, and `working` the image the transaction has made; `base` is the image it
-/// began from and `writes` whether it holds the write lock.
+/// A fake's connection. `saved` stores the image each open transaction and savepoint rolls back
+/// to, outermost first, and `working` is the image the transaction has made. `base` is the image
+/// it began from, and `writes` is whether it holds the write lock.
 type FakeConnection = {
   path: String,
   mode: Mode,
@@ -809,28 +824,28 @@ type Twin = {
 
 type FakeStep = { twin: Twin, reply: Reply }
 
-/// The databases of one root, in memory: each path's bytes as a file would hold them, and the
+/// The databases of one root, in memory: each path's bytes as a file would contain them, and the
 /// connections open on them.
 pub opaque type Memory = | Memory(Twin)
 
-/// A root that holds no database.
+/// A root with no databases.
 pub fn memory() -> Memory =
   Memory({ files: Map::new(), open: Map::new(), writer: Map::new(), next: 1 })
 
-/// The bytes of the database at `path`, as a file would hold them: what was last committed.
+/// The bytes of the database at `path`, as a file would contain them: the last committed state.
 pub fn database_bytes(m: Memory, path: String) -> Option<Bytes> =
   match m { Memory(t) -> t.files.get(path) }
 
-/// `m` with the database at `path` holding `image`, a database file's bytes.
+/// `m` with the database at `path` set to `image`, a database file's bytes.
 pub fn with_database_bytes(m: Memory, path: String, image: Bytes) -> Memory =
   match m { Memory(t) -> Memory({ ..t, files: t.files.insert(path, image) }) }
 
-/// What `go` answered over a twin, and the twin it left.
+/// What `go` returned with a fake, and the fake's final state.
 pub type RunResult<a> = { value: a, memory: Memory }
 
-/// `go` run over `m` as the root its row names, every operation answered by the engine over an
-/// image in memory. It performs nothing, so a test or a law over it needs no root and is
-/// cached. A path that leaves the root raises with `E0452`'s words.
+/// Runs `go` with `m` as the root its effect row names, handling every operation with the engine
+/// on an image in memory. It performs no effects, so a test or a law that uses it needs no root
+/// and is cached. A path that leaves the root raises with `E0452`'s message.
 pub fn on_memory<a, [d] | e>(
   m: Memory,
   go: () -> a / {sqlite.read[d], sqlite.write[d] | e},
@@ -892,7 +907,7 @@ pub fn on_memory<a, [d] | e>(
     return value -> { value: value, memory: Memory(t) },
   }
 
-/// `go` over a root that holds no database yet: what a test hands code written against a root.
+/// Runs `go` over a root with no databases yet: what a test gives to code written against a root.
 pub fn in_memory<a, [d] | e>(
   go: () -> a / {sqlite.read[d], sqlite.write[d] | e},
 ) -> a / {abort.raise | e bounded} = on_memory[d](memory(), go).value
@@ -920,7 +935,7 @@ fn confined(path: String) -> String / {abort.raise} =
 
 fn committed(t: Twin, path: String) -> Bytes = t.files.get(path).unwrap_or(b"")
 
-/// The image a connection's next statement runs over: its transaction's, or the last committed.
+/// The image a connection's next statement runs on: its transaction's, or the last committed one.
 fn image_of(t: Twin, o: FakeConnection) -> Bytes =
   if o.saved.len() > 0 { o.working } else { committed(t, o.path) }
 
@@ -961,15 +976,15 @@ fn twin_close(t: Twin, conn: Int) -> Twin =
     Some(o) -> { ..unlocked(t, o, conn), open: t.open.remove(conn) },
   }
 
-/// `t` with the write lock on a connection's database let go, where the connection holds it.
+/// `t` with the write lock on a connection's database released, if the connection holds it.
 fn unlocked(t: Twin, o: FakeConnection, conn: Int) -> Twin =
   if t.writer.get(o.path) == Some(conn) { { ..t, writer: t.writer.remove(o.path) } } else { t }
 
-/// What one statement over an image answered, and the image it left: the one handed in where it
-/// failed or only read.
+/// What one statement on an image returned, and the image it left, which is the one passed in when
+/// it failed or only read.
 type StatementResult = { image: Bytes, reply: Reply }
 
-/// `sql` over the database `image` holds, as `sqlite_run` runs it.
+/// Runs `sql` on the database in `image`, as `sqlite_run` runs it.
 fn run_on_image(
   image: Bytes,
   sql: String,
@@ -1021,8 +1036,9 @@ fn twin_run(
     },
   }
 
-/// A statement that wrote, kept: where another connection holds the write lock, or wrote since
-/// this one's transaction began to read, it is `busy` and nothing is kept.
+/// Stores the result of a statement that wrote. When another connection holds the write lock, or
+/// has written since this one's transaction began reading, the result is `busy` and nothing is
+/// stored.
 fn fake_apply_write(t: Twin, conn: Int, o: FakeConnection, image: Bytes, reply: Reply) -> FakeStep =
   if written_by_another(t, o.path, conn) { { twin: t, reply: busy_reply() } }
   else if o.saved.len() == 0 {
@@ -1051,8 +1067,8 @@ fn twin_control(t: Twin, conn: Int, step: Control) -> FakeStep =
     },
   }
 
-/// `takes_write_lock` is whether the write lock was asked for, which a connection opened to read never
-/// takes: its transaction reads, as the engine's does.
+/// `takes_write_lock` is whether the write lock was requested. A connection opened to read never
+/// takes it: its transaction only reads, as the engine's does.
 fn twin_begin(t: Twin, conn: Int, o: FakeConnection, takes_write_lock: Bool) -> FakeStep = {
   let writes = takes_write_lock && o.mode != ReadOnly;
   if o.saved.len() >= 32 {
@@ -1082,7 +1098,7 @@ fn twin_begin(t: Twin, conn: Int, o: FakeConnection, takes_write_lock: Bool) -> 
   }
 }
 
-/// The innermost scope closed: kept, or rolled back to the image it began from.
+/// Closes the innermost scope: committed, or rolled back to the image it began from.
 fn twin_end(t: Twin, conn: Int, o: FakeConnection, kept: Bool) -> FakeStep = {
   let depth = o.saved.len();
   if depth == 0 { { twin: t, reply: failure_reply("refused", "", "no transaction is open") } }
@@ -1138,7 +1154,7 @@ fn twin_cursor(
   match t.open.get(conn) {
     None -> { twin: t, reply: no_connection_reply() },
     Some(o) -> if o.folding != None { { twin: t, reply: cursor_open_reply() } } else {
-      // Every row at once: a page's bound is held to as each is fetched.
+      // Fetch every row at once; each page's byte limit is enforced as it is fetched.
       let ran = run_on_image(image_of(t, o), sql, params, true, o.strict, {
         ..limits,
         bytes: 9223372036854775807,
@@ -1189,7 +1205,7 @@ fn generous_limits() -> Limits =
 
 fn strict_options() -> Options = { strict: true, busy_ms: 0, statements: 16 }
 
-/// What a column of any type holds after `p` is written to it, read back through the engine.
+/// What a column of any type contains after `p` is written to it, read back through the engine.
 fn kept(p: Param) -> Datum / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
@@ -1217,7 +1233,7 @@ test "a float written is the float read, and a NaN is stored as null" {
     ))
 }
 
-/// The integers a table holds once `ns` are inserted in a transaction that then raises.
+/// The integers a table contains after `ns` are inserted in a transaction that then raises.
 fn after_a_failed_transaction(ns: List<Int>) -> List<Int> / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
@@ -1249,8 +1265,8 @@ test "a transaction whose body raises changes nothing" {
     agrees(after_a_failed_transaction, |_: List<Int>| [7], x))
 }
 
-/// How many rows a query limited to `limit` answers of a table of `held`, or -1 where it is
-/// refused.
+/// How many rows a query limited to `limit` returns from a table of `column_value` rows, or -1 when
+/// it is rejected.
 fn rows_returned(column_value: Int, limit: Int) -> Int / {abort.raise} = {
   let read = try {
     in_memory[scratch](||
@@ -1273,8 +1289,8 @@ fn rows_returned(column_value: Int, limit: Int) -> Int / {abort.raise} = {
   match read { Ok(n) -> n, Err(_) -> -1 }
 }
 
-// Each binder is folded into 0 to 23, so a law over every integer reads small tables.
-test "a query answers every row within its limit, and is refused past it" {
+// Each input is reduced to 0 to 23, so a law over every integer reads small tables.
+test "a query returns every row within its limit, and is rejected past it" {
   gen::check(
     gen::map2(gen::any_int(), gen::any_int(), |column_value: Int, limit: Int|
       { held: column_value, limit: limit }),
@@ -1303,11 +1319,11 @@ fn clock_and_random_statements() -> List<String> =
     "select time('12:00', 'localtime')",
   ]
 
-/// Whether `bound` refuses the statement, before any connection is asked.
+/// Whether `bound` rejects the statement, before any connection is used.
 fn refused_before_running(sql: String) -> Bool / {abort.raise} =
   match try { bound(stmt(sql), []) } { Err(Refused(_)) -> true, _ -> false }
 
-test "a statement that reads the clock or draws a random number is refused before it runs" {
+test "a statement that reads the clock or draws a random number is rejected before it runs" {
   gen::check(gen::any_int(), |x: Int|
     agrees(
       |i: Int|
@@ -1373,7 +1389,7 @@ fn fresh<a>(
   go: () -> a / {sqlite.read[app], sqlite.write[app], sql.fail, abort.raise},
 ) -> Result<a, Error> / {abort.raise} = in_twin(memory(), go)
 
-test "a database that is not there opens only to be made" {
+test "a database that does not exist opens only in Create mode" {
   assert_eq(
     fresh(||
       with_hold[missing](opening[app]("no.db", ReadWrite, strict_options()), |c|
@@ -1434,7 +1450,7 @@ test "each kind of value is read by its reader, and null through optional" {
   )
 }
 
-test "a boolean is bound as 1 or 0, and what SQLite does not store is refused" {
+test "a boolean is bound as 1 or 0, and what SQLite does not store is rejected" {
   let read = fresh(||
     with_hold[bools](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn ->
       numbers(
@@ -1581,7 +1597,7 @@ test "{c.sql} breaks the constraint it names" for c: ViolationCase in violation_
   assert_eq(read, Ok(Some(c.reason)))
 }
 
-test "each limit refuses what passes it, by its name" {
+test "each limit rejects what exceeds it, reporting its name" {
   let read = fresh(||
     with_hold[bounded](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
@@ -1630,7 +1646,7 @@ test "each limit refuses what passes it, by its name" {
   )
 }
 
-test "a write refused for what it answered leaves nothing behind" {
+test "a write rejected for what it returned leaves nothing behind" {
   let read = fresh(||
     with_hold[undone](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
@@ -1716,7 +1732,7 @@ test "fold_rows reads every row a page at a time and nothing else runs meanwhile
 
 fn is_refused(why: Option<Error>) -> Bool = match why { Some(Refused(_)) -> true, _ -> false }
 
-test "a backup is a database of its own, and writes over nothing" {
+test "a backup is a separate database, and never overwrites a file" {
   let made = over_twin(memory(), ||
     with_hold[source](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
@@ -1771,7 +1787,7 @@ test "a connection opened to read writes nothing, and a query never writes" {
   })
 }
 
-test "a strict connection refuses a table that is not, and another takes it" {
+test "a strict connection rejects a table that is not strict, and another connection accepts it" {
   let made = |strict: Bool|
     fresh(||
       with_hold[strictness](
@@ -1795,7 +1811,7 @@ fn engine_refuses() -> List<String> =
     "create view v as select 1 as a; drop table t",
   ]
 
-test "the engine refuses {c}, which the reader cannot tell" for c: String in engine_refuses() {
+test "the engine rejects {c}, which the parser cannot detect" for c: String in engine_refuses() {
   let read = fresh(||
     with_hold[authorized](opening[app]("t.db", Create, strict_options()), |x| close(x)) { conn -> {
       execute(conn, bare_statement("create table t (n integer) strict"), generous_limits());
@@ -1805,7 +1821,7 @@ test "the engine refuses {c}, which the reader cannot tell" for c: String in eng
   assert(match read { Ok(Some(Refused(_))) -> true, _ -> false })
 }
 
-test "a view and a trigger are held to what a statement is" {
+test "a view and a trigger are bound by the same rules as a statement" {
   let read = fresh(||
     with_hold[smuggled](opening[app]("t.db", Create, strict_options()), |c| close(c)) { conn -> {
       execute(
@@ -1849,7 +1865,7 @@ test "a view and a trigger are held to what a statement is" {
   })
 }
 
-test "a tagged literal's holes are its parameters, and its text is placed where it is refused" {
+test "a tagged literal's holes are its parameters, and an error points where its text is rejected" {
   assert_eq(
     compile(["select n from t where a = ", " and b = ", ""]),
     Ok(stmt("select n from t where a = ?1 and b = ?2")),
@@ -1865,7 +1881,7 @@ test "a tagged literal's holes are its parameters, and its text is placed where 
   assert(match literal("select 1") { Ok(_) -> true, Err(_) -> false })
 }
 
-test "a path that leaves its root is refused in E0452's words" {
+test "a path that leaves its root is rejected with E0452's message" {
   let escaped = try[abort.raise] {
     fresh(||
       with_hold[escaping](opening[app]("../t.db", Create, strict_options()), |c|
@@ -1885,7 +1901,7 @@ test "what was closed, and what was never opened, is Closed" {
   assert(match read { Ok(Some(Closed(_))) -> true, _ -> false })
 }
 
-test "every admitted function is listed once, in order" {
+test "every allowed function is listed once, in order" {
   let names = functions();
   assert(names.len() > 80);
   assert(

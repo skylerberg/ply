@@ -1,9 +1,9 @@
 //! Observability as an effect: events, spans and metrics, each on a channel label.
 //!
-//! Every perform is written at its call site. A span still open when its task retires or its entry
-//! point ends is closed `Abandoned`, innermost first, and written; the run warns of it (`W0609`), which
-//! changes no exit code. A test collects records in a `Sink` with the `_step` functions and reads them
-//! with `drain`, `named`, `on_channel` and `counter_total`.
+//! Each record is written when its operation is performed. A span still open when its task finishes
+//! or its entry point ends is closed as `Abandoned`, innermost first, and written. The run then
+//! warns (`W0609`), but its exit code does not change. A test collects records in a `Sink` with the
+//! `_step` functions and reads them with `drain`, `named`, `on_channel` and `counter_total`.
 
 import std.bytes (i64_be)
 import std.internal.native (native, encode_parts)
@@ -35,7 +35,7 @@ pub type Outcome = | Ok | Failed(String) | Abandoned
 pub nondet effect trace {
   /// One event.
   write event[c](level: Level, name: String, fields: Fields) -> Unit
-  /// Opens a span, inside the innermost one open.
+  /// Opens a span inside the innermost open span.
   write enter[c](name: String, fields: Fields) -> Span
   /// Closes a span with how it ended, and every span opened inside it that is still open.
   write exit[c](span: Span, outcome: Outcome) -> Unit
@@ -51,8 +51,8 @@ pub nondet effect trace {
 
 host for trace by host_handler
 
-/// `go` with every record written to the run's sink, a record the sink does not want costing no
-/// more than the asking, and each span kept open for the task that opened it until it is closed.
+/// Runs `go` with every record written to the run's sink. A record the sink does not want costs
+/// only the check. Each span stays open for the task that opened it until it is closed.
 fn host_handler<a | e>(go: () -> a / {trace.write[*] | e}) -> a / {native.read, abort.raise | e} =
   handle {
     go()
@@ -74,11 +74,12 @@ fn host_handler<a | e>(go: () -> a / {trace.write[*] | e}) -> a / {native.read, 
     trace.time[*channel](name, micros, fields) -> metric(3, channel, name, micros, "", fields),
   }
 
-/// Whether the run's sink writes a record at the level `level_number` numbers.
+/// Whether the run's sink writes records at `level`, a number from `level_number`.
 extern fn trace_wants(level: Int) -> Bool / {native.read}
 
-/// One record on `channel` of the kind numbered `kind`, `event` 0, `count` 1, `gauge` 2 and `time`
-/// 3: a count's delta or a time's microseconds in `amount`, and a gauge's value as decimal text.
+/// Writes one record on `channel`. `kind` is 0 for `event`, 1 for `count`, 2 for `gauge` and 3 for
+/// `time`. `amount` is a count's delta or a time's microseconds, and `value` is a gauge's value as
+/// decimal text.
 extern fn trace_record(
   kind: Int,
   channel: String,
@@ -89,14 +90,15 @@ extern fn trace_record(
   fields: Bytes,
 ) -> Unit / {native.read}
 
-/// Opens a span on `channel` inside the innermost one the asking task has open, answering its id.
+/// Opens a span on `channel` inside the innermost span the calling task has open, and returns its
+/// id.
 extern fn trace_enter(channel: String, name: String, fields: Bytes) -> Int / {native.read}
 
-/// Closes span `id` on `channel` with the outcome numbered `outcome`, `Ok` 0, `Failed` 1 for
-/// `reason` and `Abandoned` 2, and every span opened inside it. One that is not open ends the run.
+/// Closes span `id` on `channel`, and every span opened inside it. `outcome` is 0 for `Ok`, 1 for
+/// `Failed` with `reason`, and 2 for `Abandoned`. Closing a span that is not open ends the run.
 extern fn trace_exit(channel: String, id: Int, outcome: Int, reason: String) -> Unit / {native.read}
 
-/// A metric, written at `Info` where the sink wants that.
+/// Writes a metric at `Info`, if the sink wants that level.
 fn metric(
   kind: Int,
   channel: String,
@@ -109,15 +111,15 @@ fn metric(
 
 fn level_number(level: Level) -> Int = match level { Debug -> 0, Info -> 1, Warn -> 2, Error -> 3 }
 
-/// Fields as the natives read them: parts, each name and then its field.
+/// Fields encoded for the natives: as parts, each name followed by its field.
 fn encode_fields(fields: Fields) -> Bytes / {abort.raise} =
   encode_parts(
     fields.fold([], |acc: List<Bytes>, name: String, field: Field|
       acc.push(Bytes::of_string(name)).push(encode_field(field))),
   )
 
-/// A field as its kind's byte and what it holds: a number in eight bytes, a flag in one, and a
-/// decimal or JSON as its text.
+/// A field encoded as its kind's byte followed by its value: a number in eight bytes, a flag in
+/// one, and a decimal or JSON as its text.
 fn encode_field(field: Field) -> Bytes / {abort.raise} =
   match field {
     IntField(n) -> b"\x00".concat(i64_be(n)),
@@ -129,12 +131,13 @@ fn encode_field(field: Field) -> Bytes / {abort.raise} =
     JsonField(j) -> b"\x06".concat(json::to_bytes(j)),
   }
 
-// --- The collecting twin ---------------------------------------------------------
+// --- The collecting fake ---------------------------------------------------------
 
 /// Which operation wrote a record.
 pub type Kind = | Event | Enter | Exit | Count | Gauge | Timing
 
-/// `span` is the record's span (for an event or a metric, the innermost one open); `parent` is its parent.
+/// One collected record. `span` is the record's span; for an event or a metric, that is the
+/// innermost open span. `parent` is that span's parent.
 pub type Record = {
   sequence: Int,
   kind: Kind,
@@ -149,7 +152,8 @@ pub type Record = {
   value: Decimal,
 }
 
-/// Innermost first, so pushing and popping are both at the head.
+/// A span still open. A sink keeps its open spans innermost first, so pushing and popping are both
+/// at the head.
 type OpenSpan = { id: Int, channel: String, name: String, parent: Int }
 
 /// The records a test has collected, and the spans still open.
@@ -164,23 +168,23 @@ pub type EnterResult = { sink: Sink, span: Span }
 /// The sink after `exit_step`; `ok` is false when the span was not open.
 pub type ExitResult = { sink: Sink, ok: Bool }
 
-/// What `trace.event` records.
+/// The sink after recording a `trace.event`.
 pub fn event_step(s: Sink, c: String, l: Level, n: String, field_values: Fields) -> Sink =
   append(s, record(s, Event, l, c, n, innermost(s), field_values, Ok, 0, 0m))
 
-/// What `trace.count` records.
+/// The sink after recording a `trace.count`.
 pub fn count_step(s: Sink, c: String, n: String, d: Int, field_values: Fields) -> Sink =
   append(s, record(s, Count, Info, c, n, innermost(s), field_values, Ok, d, 0m))
 
-/// What `trace.gauge` records.
+/// The sink after recording a `trace.gauge`.
 pub fn gauge_step(s: Sink, c: String, n: String, v: Decimal, field_values: Fields) -> Sink =
   append(s, record(s, Gauge, Info, c, n, innermost(s), field_values, Ok, 0, v))
 
-/// What `trace.time` records.
+/// The sink after recording a `trace.time`.
 pub fn time_step(s: Sink, c: String, n: String, microseconds: Int, field_values: Fields) -> Sink =
   append(s, record(s, Timing, Info, c, n, innermost(s), field_values, Ok, microseconds, 0m))
 
-/// What `trace.enter` records.
+/// The sink after recording a `trace.enter`, and the span it opened.
 pub fn enter_step(s: Sink, c: String, n: String, field_values: Fields) -> EnterResult = {
   let opened = { id: s.next, channel: c, name: n, parent: current_id(s) };
   let pushed = { records: s.records, open: cons(opened, s.open), next: s.next + 1 };
@@ -190,12 +194,12 @@ pub fn enter_step(s: Sink, c: String, n: String, field_values: Fields) -> EnterR
   }
 }
 
-/// Closes `trace_span` and every span opened above it, each of the latter `Abandoned`.
+/// Closes `trace_span` with outcome `o`, and closes every span opened inside it as `Abandoned`.
 pub fn exit_step(s: Sink, trace_span: Span, o: Outcome) -> ExitResult =
   if is_open(s.open, trace_span) { { sink: close_through(s, trace_span.id, o), ok: true } }
   else { { sink: s, ok: false } }
 
-/// Closes every still-open span as `Abandoned`, then answers the records in `sequence` order.
+/// Closes every still-open span as `Abandoned`, then returns the records in `sequence` order.
 pub fn drain(s: Sink) -> List<Record> = abandon_all(s).records
 
 /// How many spans are open.
@@ -214,7 +218,7 @@ pub fn counter_total(record_list: List<Record>, n: String) -> Int =
   record_list.fold(0, |acc: Int, r: Record|
     match r.kind { Count -> if r.name == n { acc + r.amount } else { acc }, _ -> acc })
 
-// --- The twin's own machinery ----------------------------------------------------
+// --- The fake's own machinery ----------------------------------------------------
 
 reuse fn cons<a>(x: a, xs: List<a>) -> List<a> =
   xs.fold([].push(x), |acc: List<a>, y: a| acc.push(y))
@@ -251,7 +255,7 @@ fn innermost(s: Sink) -> Option<OpenSpan> = match s.open { [first, ..] -> Some(f
 
 fn current_id(s: Sink) -> Int = match s.open { [first, ..] -> first.id, _ -> 0 }
 
-/// The channel is compared as well as the id.
+/// Whether `trace_span` is open. The channel must match as well as the id.
 fn is_open(spans: List<OpenSpan>, trace_span: Span) -> Bool =
   match spans {
     [] -> false,
@@ -262,7 +266,8 @@ fn is_open(spans: List<OpenSpan>, trace_span: Span) -> Bool =
 /// Pops spans innermost-first, recording each, until `id` has been closed.
 fn close_through(s: Sink, id: Int, o: Outcome) -> Sink = close_spans(s, s.open, id, o)
 
-/// `open` is `s.open`, walked as a list of its own.
+/// Closes spans from the head of `open`, which starts as `s.open`, until span `id` is closed. The
+/// spans closed before it are `Abandoned`.
 fn close_spans(s: Sink, open: List<OpenSpan>, id: Int, o: Outcome) -> Sink =
   match open {
     [] -> s,
@@ -290,7 +295,8 @@ fn close_spans(s: Sink, open: List<OpenSpan>, id: Int, o: Outcome) -> Sink =
 
 fn abandon_all(s: Sink) -> Sink = abandon_spans(s, s.open)
 
-/// `open` as in `close_spans`: each round closes its head, which leaves the rest open.
+/// Closes every span in `open` as `Abandoned`, innermost first. Each round closes the head, which
+/// leaves the rest open.
 fn abandon_spans(s: Sink, open: List<OpenSpan>) -> Sink =
   match open {
     [] -> s,
@@ -319,7 +325,7 @@ fn outcomes(record_list: List<Record>) -> List<Outcome> = record_list.map(|r: Re
 
 fn record_names(record_list: List<Record>) -> List<String> = record_list.map(|r: Record| r.name)
 
-test "a collecting handler discharges every atom this test reaches" {
+test "a collecting handler handles every operation this test performs" {
   let record_list = handle {
     place_order("BOLT-1")
   } with {
@@ -359,7 +365,6 @@ test "a span nested in a span links to its parent, and closing is innermost firs
   assert_eq(outcomes(record_list), [Ok, Ok, Ok, Ok])
 }
 
-// The record list alone reconstructs the span tree.
 test "an event inside a span carries the span it was recorded in" {
   let outer = enter_step(sink(), "http", "request", Map::new());
   let noted = event_step(outer.sink, "http", Warn, "slow", Map::new());
@@ -367,7 +372,6 @@ test "an event inside a span carries the span it was recorded in" {
   assert_eq(named(drain(noted), "slow").map(|r: Record| r.level), [Warn])
 }
 
-// The rollback case.
 test "closing an outer span abandons the spans still open above it" {
   let outer = enter_step(sink(), "orders", "place_order", Map::new());
   let inner = enter_step(outer.sink, "orders", "reserve", Map::new());
@@ -390,8 +394,8 @@ test "a span nobody closed is drained as abandoned, innermost first" {
   assert_eq(outcomes(record_list), [Ok, Ok, Abandoned, Abandoned])
 }
 
-// Closed twice, never opened, and opened on another channel: each answers `ok: false` and records nothing.
-test "an exit naming a span that is not open answers false and records nothing" {
+// A span closed twice, never opened, or opened on another channel is not open.
+test "an exit naming a span that is not open returns false and records nothing" {
   let opened = enter_step(sink(), "http", "request", Map::new());
   let closed = exit_step(opened.sink, opened.span, Ok);
 
@@ -435,7 +439,7 @@ test "fields survive as a map, so two sets built in different orders are equal" 
   assert_eq(drain(s).map(|r: Record| r.fields), [other])
 }
 
-test "seq is the total order the sink hands records out in" {
+test "`sequence` is the total order in which the sink returns records" {
   let a = event_step(sink(), "http", Info, "one", Map::new());
   let b = count_step(a, "http", "two", 1, Map::new());
   let c = enter_step(b, "http", "three", Map::new());

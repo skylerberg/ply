@@ -1,36 +1,37 @@
 //! WebSockets (RFC 6455) over an HTTP/1.1 `Upgrade`, with permessage-deflate (RFC 7692).
 //!
-//! The protocol is a core with no I/O, bytes in and events out, and sessions over `std.net` on
-//! top of it. `decode_frame` reads one frame from the front of a buffer under `Limits`, and
-//! `encode_frame` writes one, masked under a key where one is given. `handle_frame` is the state
-//! machine: it takes the frames a peer sent, in order, and answers the messages they complete,
+//! The protocol is a core with no I/O, bytes in and events out, with sessions over `std.net` built
+//! on top. `decode_frame` reads one frame from the front of a buffer under `Limits`, and
+//! `encode_frame` writes one, masked with a key when one is given. `handle_frame` is the state
+//! machine: it takes the frames a peer sent, in order, and returns the messages they complete,
 //! the pongs and the close it must send back, and the failure that ends the connection. Every
-//! ambiguity is a failure, closed with the code RFC 6455 §7.4 gives it: a frame from a client that
+//! ambiguity is a failure, closed with the code RFC 6455 §7.4 assigns: a frame from a client that
 //! is not masked or one from a server that is (1002), a reserved bit or opcode (1002), a control
 //! frame fragmented or over 125 bytes (1002), a continuation with nothing to continue or a new
 //! message inside a fragmented one (1002), a close code no endpoint may send (1002), text that is
 //! not UTF-8 (1007), and a frame, a message or a count of fragments past `Limits` (1009). A close
 //! from the peer is echoed, and nothing is read after it.
 //!
-//! `upgrade` answers a request as a server does: the `101` that switches it, with the
-//! subprotocol of the client's offers this server speaks first, or the response that refuses it
-//! (`426` naming version 13 for another version, `400` for a request that is no handshake).
-//! `handshake` writes a client's request and `check_response` checks the server's `101` against it.
+//! `upgrade` responds to a request as a server does. It returns the `101` that switches protocols,
+//! with the subprotocol this server prefers among the client's offers, or the response that
+//! rejects the request: `426` naming version 13 for another version, or `400` for a request that
+//! is not a handshake. `handshake` writes a client's request, and `check_response` checks the
+//! server's `101` against it.
 //!
 //! permessage-deflate keeps each end's compression context from one message to the next (RFC 7692
-//! §7.2.1) unless the negotiation says that end does not: a server takes a client's offer as it
-//! is, answering `server_no_context_takeover` where the offer asks it or `Options.takeover` is
-//! off and `client_no_context_takeover` where the offer says so or that option is off, and a
-//! client offers both where it is off. A message is compressed by `std.gzip`'s writer and ended
-//! with a sync flush whose `00 00 ff ff` is taken off, and decompressed with those bytes put back
-//! under `Limits.max_message`, which makes a decompression bomb a 1009 rather than an allocation.
-//! A context costs 32 KiB a direction for as long as the connection is open; one whose stream a
-//! final block ended is started again.
+//! §7.2.1) unless the negotiation turns that off for that end. A server accepts a client's offer
+//! as it is. It replies with `server_no_context_takeover` when the offer requests it or
+//! `Options.takeover` is off, and with `client_no_context_takeover` when the offer includes it or
+//! that option is off. A client offers both when that option is off. A message is compressed by
+//! `std.gzip`'s writer and ended with a sync flush, whose trailing `00 00 ff ff` is removed. It is
+//! decompressed with those bytes put back, under `Limits.max_message`, so a decompression bomb
+//! fails with 1009 rather than exhausting memory. A context costs 32 KiB per direction while the
+//! connection is open. A context whose stream ended with a final block starts over.
 //!
-//! `serve_connection` reads one request on a connection, upgrades it and answers each message
-//! with what `respond` makes of it; `connect` opens a client session to a `ws` or `wss` URL;
-//! `receive`, `send` and `close` work a session either way. A client masks each frame under a key
-//! drawn from `entropy`.
+//! `serve_connection` reads one request on a connection, upgrades it, and replies to each message
+//! with what `respond` returns for it. `connect` opens a client session to a `ws` or `wss` URL.
+//! `receive`, `send` and `close` work on a session at either end. A client masks each frame with a
+//! key drawn from `entropy`.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes (u16_be, u64_be)
@@ -77,7 +78,7 @@ pub fn default_limits() -> Limits = { max_frame: 1048576, max_message: 4194304, 
 /// Why a connection is failed: the close code it is closed with, and why.
 pub type Failure = { code: Int, reason: String }
 
-/// What the front of a buffer holds.
+/// What the front of a buffer contains.
 pub type DecodeResult =
   /// Not a whole frame yet.
   | NeedMore
@@ -107,8 +108,8 @@ fn code_of(o: Opcode) -> Int =
 /// Whether a frame of this kind is a control frame.
 pub fn is_control(o: Opcode) -> Bool = o == Close || o == Ping || o == Pong
 
-/// The frame at the front of `buf`, read under `limits`; a compressed frame is refused unless
-/// `compression` was agreed.
+/// The frame at the front of `buf`, read under `limits`; a compressed frame is rejected unless
+/// `compression` was negotiated.
 pub fn decode_frame(buf: Bytes, limits: Limits, compression: Bool) -> DecodeResult / {abort.raise} =
   if buf.len() < 2 { NeedMore } else {
     let b0 = buf.at(0);
@@ -152,11 +153,11 @@ fn sized(buf: Bytes, b0: Int, b1: Int, op: Opcode, limits: Limits) -> DecodeResu
   }
 }
 
-/// `payload` under the four-byte masking key `key`, which is also how a masked payload is read.
+/// `payload` XORed with the four-byte masking key `key`. The same operation masks and unmasks.
 pub fn unmasked(payload: Bytes, key: Bytes) -> Bytes / {abort.raise} =
   payload.xor(key.cycle(payload.len()))
 
-/// `f` on the wire, masked under `key` where one is given (a client's frames must be).
+/// `f` as wire bytes, masked with `key` when one is given (a client's frames must be masked).
 pub fn encode_frame(f: Frame, key: Option<Bytes>) -> Bytes / {abort.raise} = {
   let n = f.payload.len();
   let first = (if f.fin { 0x80 } else { 0 }) | (if f.compressed { 0x40 } else { 0 })
@@ -183,18 +184,18 @@ pub type Message = | TextMessage(String) | BinaryMessage(Bytes)
 type Partial = { opcode: Opcode, parts: List<Bytes>, size: Int, count: Int, compressed: Bool }
 
 /// Whether each end keeps its compression context from one message to the next, as
-/// permessage-deflate agreed it (RFC 7692 §7.1.1).
+/// permessage-deflate negotiated (RFC 7692 §7.1.1).
 pub type ContextTakeover = { server: Bool, client: Bool }
 
 /// One end of a connection, as `handle_frame` leaves it.
 pub type State = {
   role: Role,
   limits: Limits,
-  /// What permessage-deflate agreed, where it was.
+  /// What permessage-deflate negotiated, if it was negotiated.
   compression: Option<ContextTakeover>,
-  /// The context this end compresses its messages in, where it keeps one.
+  /// The context this end compresses its messages in, if it keeps one.
   deflater: Option<gzip::Writer>,
-  /// The context the peer's messages are decompressed in, where the peer keeps one.
+  /// The context the peer's messages are decompressed in, if the peer keeps one.
   inflater: Option<gzip::Reader>,
   partial: Option<Partial>,
   /// This end has sent its close.
@@ -220,17 +221,18 @@ pub fn initial_state(role: Role, limits: Limits, compression: Option<ContextTake
 pub type Event =
   /// A message, whole.
   | Received(Message)
-  /// A ping, which a pong among the replies answers.
+  /// A ping; the replies include a pong for it.
   | Pinged(Bytes)
   /// A pong.
   | Ponged(Bytes)
-  /// The peer closed with this code and reason (1005 for a close with no code); a close among the
-  /// replies answers it unless this end had closed first.
+  /// The peer closed with this code and reason (1005 for a close with no code). The replies
+  /// include a close in response unless this end had closed first.
   | ClosedBy({ code: Int, reason: String })
   /// The connection failed: a close with the failure's code is among the replies.
   | Failed(Failure)
 
-/// What `handle_frame` answers: the state after the frame, what it meant, and the frames to send back.
+/// What `handle_frame` returns: the state after the frame, what it meant, and the frames to send
+/// back.
 pub type Step = { state: State, events: List<Event>, replies: List<Frame> }
 
 /// The frame that closes with `code` and `reason`; no code at all for 1005.
@@ -353,8 +355,8 @@ fn handle_close(s: State, payload: Bytes) -> Step / {abort.raise} =
     }
   }
 
-/// The tail of the sync flush RFC 7692 §7.2.1 has a sender take off a compressed message, and a
-/// receiver put back.
+/// The tail of the sync flush that RFC 7692 §7.2.1 has a sender remove from a compressed message
+/// and a receiver put back.
 fn flush_tail() -> Bytes = b"\x00\x00\xff\xff"
 
 /// Whether this end keeps its compression context, and whether its peer does.
@@ -364,9 +366,9 @@ fn keeps_context(s: State, c: ContextTakeover) -> Bool =
 fn peer_keeps_context(s: State, c: ContextTakeover) -> Bool =
   match s.role { Server -> c.client, Client -> c.server }
 
-/// A compressed message's payload decompressed in the peer's context, or a fresh one, at most
-/// `max_message` bytes of it, and the context the next message is read in: none where the peer
-/// keeps none, or where a final block ended its stream.
+/// A compressed message's payload, decompressed in the peer's context or a fresh one, up to
+/// `max_message` bytes. Also returns the context for the next message: none if the peer keeps
+/// none, or if a final block ended its stream.
 fn inflated(
   s: State,
   data: Bytes,
@@ -399,8 +401,8 @@ fn inflated(
   }
 }
 
-/// The frame `m` is sent in, compressed where permessage-deflate was agreed, and the state with
-/// this end's context after it.
+/// The frame `m` is sent in, compressed if permessage-deflate was negotiated, and the state with
+/// this end's updated context.
 pub fn message_frame(s: State, m: Message) -> { state: State, frame: Frame } / {abort.raise} = {
   let plain = match m { TextMessage(t) -> Bytes::of_string(t), BinaryMessage(b) -> b };
   let op = match m { TextMessage(_) -> Text, BinaryMessage(_) -> Binary };
@@ -429,28 +431,28 @@ pub fn message_frame(s: State, m: Message) -> { state: State, frame: Frame } / {
 /// The GUID RFC 6455 §1.3 has both ends append to the key.
 fn guid() -> String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-/// The `Sec-WebSocket-Accept` a server answers the key `key` with.
+/// The `Sec-WebSocket-Accept` value a server returns for the key `key`.
 pub fn accept_key(key: String) -> String / {abort.raise} =
   base64_encode(sha1(Bytes::of_string(key ++ guid())))
 
-/// permessage-deflate, with what it says neither end keeps.
+/// The permessage-deflate extension value, stating which ends keep no context.
 fn deflate_field(c: ContextTakeover) -> String =
   "permessage-deflate" ++ (if c.server { "" } else { "; server_no_context_takeover" })
     ++ (if c.client { "" } else { "; client_no_context_takeover" })
 
-/// What a server says it speaks.
+/// What this end supports, and its limits.
 pub type Options = {
   /// Subprotocols in the order this end prefers them.
   protocols: List<String>,
   /// Whether permessage-deflate is offered or accepted.
   compression: Bool,
-  /// Whether either end may keep its compression context from one message to the next: 32 KiB a
-  /// direction a connection, for messages that compress against the ones before them.
+  /// Whether either end may keep its compression context from one message to the next: 32 KiB per
+  /// direction per connection, so messages compress against the ones before them.
   takeover: Bool,
   limits: Limits,
   /// The longest wait for the next frame.
   idle_timeout_ms: Int,
-  /// Messages one connection is answered before it is closed.
+  /// How many messages are handled on one connection before it is closed.
   max_messages: Int,
 }
 
@@ -466,15 +468,15 @@ pub fn default_options() -> Options =
     max_messages: 10000,
   }
 
-/// What a server agreed in its `101`: a subprotocol, and permessage-deflate's contexts where it
-/// agreed that.
+/// What a server agreed to in its `101`: a subprotocol, and permessage-deflate's context settings
+/// if it accepted that.
 pub type Agreement = { protocol: Option<String>, compression: Option<ContextTakeover> }
 
-/// What a request is answered with.
+/// The server's response to an upgrade request.
 pub type Upgrade =
-  /// The `101` that switches the connection, written, and what it agreed.
+  /// The written `101` that switches the connection, and what it agreed to.
   | Accept({ head: Bytes, negotiated: Agreement })
-  /// The response that refuses it.
+  /// The response that rejects it.
   | Reject(Response<| {}>)
 
 fn tokens(headers: http::Headers, name: String) -> List<String> =
@@ -487,9 +489,9 @@ fn tokens(headers: http::Headers, name: String) -> List<String> =
 fn has_token(headers: http::Headers, name: String, token: String) -> Bool =
   tokens(headers, name).any(|t: String| t.eq_ignore_ascii_case(token))
 
-/// The parameters of the client's first offer of permessage-deflate this end can take, each in
-/// lower case: one that names a parameter RFC 7692 does not, or asks the server for a window under
-/// the 32 KiB its writer keeps, is passed over.
+/// The parameters of the client's first permessage-deflate offer that this end can accept, each in
+/// lower case. An offer is skipped if it names a parameter RFC 7692 does not define, or requests a
+/// server window under the 32 KiB its writer uses.
 fn deflate_offer(headers: http::Headers) -> Option<List<String>> =
   tokens(headers, "sec-websocket-extensions").fold(
     None,
@@ -510,7 +512,7 @@ fn takeable(param: String) -> Bool =
     || param == "server_max_window_bits=15"
     || param.starts_with("client_max_window_bits")
 
-/// The answer to `req` as a server that speaks what `options` say.
+/// The response to `req` from a server configured by `options`.
 pub fn upgrade(req: Request, options: Options) -> Upgrade / {abort.raise} = {
   let h = req.headers;
   let key = match http::header(h, "sec-websocket-key") { Some(k) -> k.ascii_trim(), None -> "" };
@@ -580,10 +582,10 @@ pub fn handshake(authority: String, target: String, key: String, options: Option
   Bytes::of_string(String::join(lines, ""))
 }
 
-/// What a server's answer to `handshake` agreed, or why it is no `101` for that request: another
-/// status, the wrong accept key, a subprotocol or extension the client did not offer, or
-/// permessage-deflate with a parameter the client cannot honour, or that keeps a context the
-/// client asked it not to.
+/// What a server's response to `handshake` agreed to, or why it is not a valid `101` for that
+/// request: another status, the wrong accept key, a subprotocol or extension the client did not
+/// offer, or permessage-deflate with a parameter the client cannot honour or that keeps a context
+/// the client asked it not to keep.
 pub fn check_response(
   head: http::ResponseHead,
   key: String,
@@ -646,8 +648,8 @@ pub type Got =
 /// and pongs between messages, and fragments.
 fn frame_budget(limits: Limits) -> Int = limits.max_fragments + 256
 
-/// The next message on `s`, answering pings and a close on the way, each read within
-/// `timeout_ms`.
+/// The next message on `s`, replying to pings and to a close along the way. Each read waits at
+/// most `timeout_ms`.
 pub fn receive<[l]>(
   s: Session,
   timeout_ms: Int,
@@ -713,7 +715,7 @@ fn receive_result_of(events: List<Event>) -> Option<Got> =
       },
     })
 
-/// The frames, masked where this end is a client.
+/// Sends the frames, masked if this end is a client, and reports whether all were sent.
 fn send_frames<[l]>(
   s: Session,
   frames: List<Frame>,
@@ -727,8 +729,8 @@ fn send_frames<[l]>(
         timeout_ms,
       ))
 
-/// Sends `m` on `s`: the session after it, its compression context moved on, and whether the
-/// peer took it.
+/// Sends `m` on `s`. Returns the session after it, with its compression context advanced, and
+/// whether the send succeeded.
 pub fn send<[l]>(
   s: Session,
   m: Message,
@@ -752,9 +754,9 @@ pub fn close<[l]>(
     { ..s, state: { ..s.state, closing: true } }
   }
 
-/// Reads one request on `c`, upgrades it as `options` say or answers why not, and then answers each
-/// message with the messages `respond` makes of it, up to `options.max_messages`; the connection is
-/// closed however that ends.
+/// Reads one request on `c`, and upgrades it as `options` direct or responds with why not. Then
+/// replies to each message with the messages `respond` returns for it, up to
+/// `options.max_messages`. The connection is closed however that ends.
 pub fn serve_connection<[l] | e>(
   c: Int,
   limits: http::Limits,
@@ -834,7 +836,7 @@ pub type ConnectError =
   | NotWebSocket(String)
   /// No connection was made, or it was not secured.
   | NoConnection(net::Error)
-  /// The server's answer was no `101` for this request, and why.
+  /// The server's response was not a valid `101` for this request, and why.
   | Declined(String)
 
 /// A client session to `to`, a `ws` URL over TCP or a `wss` one over TLS, under `options`.
@@ -1008,7 +1010,7 @@ test "the server's key is the one RFC 6455 derives from the client's" {
   assert_eq(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
 }
 
-test "a handshake is answered 101 with what both ends speak" {
+test "a handshake gets a 101 with what both ends support" {
   let options = { ..default_options(), protocols: ["chat", "superchat"] };
   match upgrade(
       request_of(
@@ -1032,7 +1034,7 @@ test "a handshake is answered 101 with what both ends speak" {
   }
 }
 
-test "what is no handshake is refused, and another version is told this one: {c.what}" for c: { what: String, raw: Bytes, status: Int } in [
+test "a request that is not a handshake is rejected, and another version learns this one: {c.what}" for c: { what: String, raw: Bytes, status: Int } in [
     {
       what: "no Upgrade",
       raw: b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
@@ -1078,7 +1080,7 @@ fn answer_head(extra: String) -> http::ResponseHead / {abort.raise} =
     _ -> panic("a response head"),
   }
 
-test "a client takes a 101 that answers its request, and nothing else: {c.what}" for c: { what: String, extra: String, negotiated: Result<Agreement, String> } in [
+test "a client accepts a 101 that matches its request, and nothing else: {c.what}" for c: { what: String, extra: String, negotiated: Result<Agreement, String> } in [
     { what: "a plain switch", extra: "", negotiated: Ok({ protocol: None, compression: None }) },
     {
       what: "a subprotocol offered",
@@ -1120,7 +1122,7 @@ test "a client takes a 101 that answers its request, and nothing else: {c.what}"
   assert_eq(check_response(answer_head(c.extra), "dGhlIHNhbXBsZSBub25jZQ==", options), c.negotiated)
 }
 
-test "a client that keeps no context asks both ends to keep none, and holds its server to it" {
+test "a client that keeps no context asks both ends to keep none, and enforces that on its server" {
   let options = { ..default_options(), takeover: false };
   assert(
     handshake("x", "/", "dGhlIHNhbXBsZSBub25jZQ==", options).index_of(
@@ -1138,20 +1140,20 @@ test "a client that keeps no context asks both ends to keep none, and holds its 
   )
 }
 
-test "a key of another request is refused" {
+test "an accept key for another request is rejected" {
   assert_eq(
     check_response(answer_head(""), "AQIDBAUGBwgJCgsMDQ4PEA==", default_options()),
     Err("the accept key is not this request's"),
   )
 }
 
-// --- Tests: Autobahn's cases, as an echo server answers them ----------------
+// --- Tests: Autobahn's cases, as an echo server handles them ----------------
 
 /// The limits the cases of sizes run under.
 fn small() -> Options =
   { ..default_options(), limits: { max_frame: 64, max_message: 128, max_fragments: 4 } }
 
-/// What an echo server under `options` wrote after its `101`, to a client that said `frames`
+/// What an echo server under `options` wrote after its `101`, to a client that sent `frames`
 /// after a handshake with `extra` in it.
 fn echoed(extra: String, frames: Bytes, options: Options) -> Bytes / {ip.fail, abort.raise} = {
   let left = with_rand(rand(7), ||
@@ -1350,7 +1352,7 @@ fn autobahn() -> List<Case> / {abort.raise} =
     },
   ]
 
-test "Autobahn {c.case}: an echo server answers as the suite has it" for c: Case in autobahn() {
+test "Autobahn {c.case}: an echo server responds as the suite expects" for c: Case in autobahn() {
   assert_eq(echoed("", c.said, small()), server_says(c.answered))
 }
 
@@ -1453,7 +1455,7 @@ fn deflating() -> List<Deflating> =
     },
   ]
 
-test "Autobahn {c.case}: an echo server agrees what was offered, and echoes each message in its context" for c: Deflating in deflating(
+test "Autobahn {c.case}: an echo server agrees to what was offered, and echoes each message in its context" for c: Deflating in deflating(
   ) {
   let limits = { max_frame: 1048576, max_message: 1048576, max_fragments: 4 };
   let options = { ..default_options(), limits: limits };
@@ -1560,7 +1562,7 @@ test "a compressed message that would decompress past the limit fails the connec
 
 // --- Tests: a client session ------------------------------------------------
 
-test "a client opens a session, sends masked, and reads its server's answer and close" {
+test "a client opens a session, sends masked frames, and reads its server's reply and close" {
   let wanted = with_rand(rand(7), || base64_encode(token_bytes(16))).value;
   let answer = Bytes::concat_all([
     Bytes::of_string(

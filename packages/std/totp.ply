@@ -1,26 +1,26 @@
 //! One-time passwords: HOTP as RFC 4226 defines it, TOTP as RFC 6238 does, and the `otpauth://`
 //! URIs an authenticator app is provisioned with.
 //!
-//! A code is an HMAC of a counter under a shared key, cut to a few decimal digits. HOTP's counter
-//! is a count both sides keep; TOTP's is the present time in steps, which `step_at` reads off an
-//! `Instant` taken as nanoseconds from 1970-01-01T00:00:00Z, the reading `std.date` writes. The
-//! time is always an argument: nothing here reads a clock.
+//! A code is an HMAC of a counter under a shared key, truncated to a few decimal digits. In HOTP
+//! the counter is a count both sides keep. In TOTP it is the current time in steps, which `step_at`
+//! computes from an `Instant` taken as nanoseconds since 1970-01-01T00:00:00Z, as `std.date` writes
+//! it. The time is always an argument: nothing here reads a clock.
 //!
-//! `verify` answers the step whose code was typed, not a `Bool`, because a code is good once: the
-//! caller keeps the step it accepted for a key and hands it back as `last`, and `verify_after`
-//! then refuses that step and every one before it. That record, and counting failed attempts so a
-//! guesser is slowed, are the caller's state, and both RFCs require them.
+//! `verify` returns the step whose code was typed, not a `Bool`, because a code is valid only once.
+//! The caller stores the step it accepted for a key and passes it back as `last`, and
+//! `verify_after` then rejects that step and every step before it. That record, and a count of
+//! failed attempts to slow down a guesser, are the caller's state, and both RFCs require them.
 //!
-//! A key that makes or checks codes is a `Secret`, and the HMAC under it is the runtime's.
-//! `sealed_key` reads one from a sealed base32 text, as a configuration holds it. A key being
-//! provisioned is `Bytes`, because a provisioning URI is the key in the clear, for a person to
-//! scan: `new_key` draws one, `uri` writes it, and both stay out of logs. A code is made for a key
-//! of any length, because an authenticator answers for the key it was given and many services give
-//! ten bytes. RFC 4226 asks for sixteen at least and recommends twenty, which is what `new_key`
-//! draws, and `uri` refuses to provision fewer than sixteen.
+//! A key that makes or checks codes is a `Secret`, and the runtime computes the HMAC under it.
+//! `sealed_key` reads one from a sealed base32 text, as a configuration stores it. A key being
+//! provisioned is `Bytes`, because a provisioning URI contains the key in the clear, for a person
+//! to scan: `new_key` creates one, `uri` writes it, and neither belongs in a log. A code can be
+//! made for a key of any length, because an authenticator accepts whatever key it is given and many
+//! services give ten bytes. RFC 4226 requires at least sixteen and recommends twenty, which is what
+//! `new_key` creates, and `uri` raises for a key under sixteen.
 //!
-//! Many authenticator apps make SHA-1 codes of six digits every thirty seconds whatever a URI
-//! asks for, so `standard` is the only form every one of them answers.
+//! Many authenticator apps make six-digit SHA-1 codes every thirty seconds whatever a URI requests,
+//! so `standard` is the only form that every app supports.
 
 import std.base32
 import std.bytes (u64_be)
@@ -35,20 +35,20 @@ import std.time (as_nanos, nanos_at, seconds)
 import std.url (Pair, query_parse, url_decode, url_encode)
 import std.gen
 
-/// The hash a code's HMAC is under.
+/// The hash function a code's HMAC uses.
 pub type Algorithm = | Sha1 | Sha256 | Sha512
 
-/// How a code is cut from an HMAC: under which hash, and to how many decimal digits, six to ten.
-/// RFC 4226 names six, seven and eight. The cut leaves thirty-one bits, which is short of ten
-/// whole digits: a ten-digit code starts with 0, 1 or 2 and is worth those thirty-one bits.
+/// How a code is made from an HMAC: which hash, and how many decimal digits, from six to ten.
+/// RFC 4226 defines six, seven and eight. Truncation leaves thirty-one bits, which is less than ten
+/// full digits: a ten-digit code starts with 0, 1 or 2 and carries only those thirty-one bits.
 pub type CodeFormat = new { algorithm: Algorithm, digits: Int }
 
 /// How TOTP makes its codes: their form, how long a step lasts, and the instant steps count from.
 pub type Config = new { form: CodeFormat, step: Duration, epoch: Instant }
 
-/// How far from the present step a verifier looks: whole steps before it and after it, a count
-/// below zero being none. One step either way allows for a slow clock and a slow typist; each
-/// step more is one more code that passes.
+/// How far from the current step a verifier looks: whole steps before and after it, where a count
+/// below zero means none. One step either way allows for a slow clock and a slow typist; each extra
+/// step is one more code that passes.
 pub type Window = new { before: Int, after: Int }
 
 /// Whether an account's codes follow the clock or a count.
@@ -58,25 +58,25 @@ pub type Kind =
   /// Counter-based, with the counter its next code is made at.
   | CounterBased(Int)
 
-/// What a provisioning URI hands an authenticator: whose key it is, the key, and how its codes
-/// are made.
+/// What a provisioning URI gives an authenticator: whose key it is, the key, and how its codes are
+/// made.
 pub type Provision = new {
   kind: Kind,
-  /// Who the account is with, or empty for no one. It holds no colon.
+  /// Who the account is with, or empty for no one. It contains no colon.
   issuer: String,
-  /// The account's name. It holds no colon and does not start with a space.
+  /// The account's name. It contains no colon and does not start with a space.
   account: String,
   key: Bytes,
   form: CodeFormat,
 }
 
-/// Why a text is no provisioning URI.
+/// Why a text is not a provisioning URI.
 pub type ErrorKind =
-  /// It does not start `otpauth://`.
+  /// It does not start with `otpauth://`.
   | NotOtpauth
-  /// Its type is this, which is neither `totp` nor `hotp`.
+  /// Its type, which is neither `totp` nor `hotp`.
   | UnknownKind(String)
-  /// Its label is not percent-encoded UTF-8, or holds more than one colon.
+  /// Its label is not percent-encoded UTF-8, or contains more than one colon.
   | BadLabel
   /// Its query is not percent-encoded `name=value` pairs.
   | BadQuery
@@ -86,34 +86,34 @@ pub type ErrorKind =
   | NoSecret
   /// Its `secret` is not base32.
   | BadSecret
-  /// Its label and its `issuer` parameter name two issuers.
+  /// Its label and its `issuer` parameter name different issuers.
   | TwoIssuers
-  /// This parameter's value is not one it can take.
+  /// This parameter has a value it cannot take.
   | BadValue(String)
   /// It is a `hotp` URI with no `counter`.
   | NoCounter
 
-/// Why a function here refused what it was asked for, with what was asked.
+/// Why a function here failed, with the value it rejected.
 pub type Error =
   /// A count of digits outside six to ten.
   | Digits(Int)
   /// A counter below zero.
   | Counter(Int)
-  /// A step that is not above zero, or one a URI cannot carry because it is not whole seconds.
+  /// A step that is not above zero, or one a URI cannot express because it is not whole seconds.
   | Step(Duration)
   /// A reading before the epoch, or further past it than an `Int` of nanoseconds.
   | TimeOutOfRange(Instant)
-  /// A key to provision of this many bytes, which is under sixteen.
+  /// A key to provision that is this many bytes long, under sixteen.
   | ShortKey(Int)
-  /// An issuer or an account a label cannot carry: one holding a colon, or an account that starts
+  /// An issuer or an account a label cannot contain: one with a colon, or an account that starts
   /// with a space.
   | Label(String)
-  /// A text that is no provisioning URI.
+  /// A text that is not a provisioning URI.
   | Malformed(ErrorKind)
 
-/// What a function of this module raises where it refuses.
+/// The effect this module's functions raise when they fail.
 pub effect totp {
-  /// A parameter is outside what the function defines, or a text is no URI.
+  /// A parameter is outside what the function defines, or a text is not a provisioning URI.
   raise fail(e: Error)
 }
 
@@ -121,13 +121,14 @@ pub effect totp {
 pub fn standard() -> Config =
   { form: { algorithm: Sha1, digits: 6 }, step: seconds(30), epoch: Instant(0) }
 
-/// Twenty bytes of the operating system's entropy: the key RFC 4226 recommends. It is plain, to
-/// be provisioned; what checks codes afterwards holds `Secret::of_bytes` of it.
+/// Twenty bytes of the operating system's entropy: the key size RFC 4226 recommends. It is plain
+/// `Bytes` so it can be provisioned; whatever checks codes afterwards stores `Secret::of_bytes` of
+/// it.
 pub fn new_key() -> Bytes / {entropy.next, abort.raise} = token_bytes(20)
 
-/// The key a sealed `secret` names, read as a person typed it: base32 in either case, with or
-/// without its spaces, hyphens and padding. Raises `Malformed(BadSecret)` for any other text and
-/// `Malformed(NoSecret)` for an empty one, and says nothing more of either.
+/// The key in a sealed `secret`, read as a person would type it: base32 in either case, with or
+/// without spaces, hyphens and padding. Raises `Malformed(BadSecret)` for any other text and
+/// `Malformed(NoSecret)` for an empty one, and reveals nothing more about either.
 pub fn sealed_key(secret: Secret<String>) -> Secret<Bytes> / {totp.fail, abort.raise} = {
   let key = required(base32::decode_typed_secret(secret), BadSecret);
   if key.is_empty() { malformed(NoSecret) } else { key }
@@ -135,7 +136,7 @@ pub fn sealed_key(secret: Secret<String>) -> Secret<Bytes> / {totp.fail, abort.r
 
 // --- Codes ------------------------------------------------------------------
 
-/// The HOTP code of `counter` under `key`: `form.digits` decimal digits, zeros leading. Raises
+/// The HOTP code of `counter` under `key`: `form.digits` decimal digits, with leading zeros. Raises
 /// for a count of digits outside six to ten and for a counter below zero.
 pub fn hotp(
   form: CodeFormat,
@@ -174,13 +175,13 @@ pub fn code(c: Config, key: Secret<Bytes>, now: Instant) -> String / {totp.fail,
 
 // --- Verifying --------------------------------------------------------------
 
-/// The step whose code `typed` is, among those of `window` around the step `now` falls in, or
-/// `None` where it is none of theirs. `typed` is the digits alone.
+/// The step whose code is `typed`, among the steps of `window` around the step `now` falls in, or
+/// `None` when no step in the window matches. `typed` is the digits alone.
 ///
-/// Where two steps of the window share the code, the later is answered, so keeping the answer
-/// retires every code before it. Every step of the window is computed and compared as
-/// `std.hash`'s `tags_match` compares, whichever matches, so the calls made depend on the window
-/// and on lengths and not on where a guess goes wrong. Raises as `code` does.
+/// When two steps in the window have the same code, the later one is returned, so storing the
+/// result invalidates every earlier code. Every step in the window is computed and compared as
+/// `std.hash`'s `tags_match` compares, whichever one matches. So the work done depends only on the
+/// window and on lengths, not on where a guess goes wrong. Raises as `code` does.
 pub fn verify(
   c: Config,
   key: Secret<Bytes>,
@@ -189,8 +190,8 @@ pub fn verify(
   window: Window,
 ) -> Option<Int> / {totp.fail, abort.raise} = verify_after(c, key, typed, now, window, None)
 
-/// `verify`, answering no step at or before `last`, the step last accepted for this key: a code
-/// used once, and any older one, is `None`. Store what this answers as the next `last`.
+/// `verify`, but never returning a step at or before `last`, the step last accepted for this key. A
+/// code already used, and any older one, gives `None`. Store the result as the next `last`.
 pub fn verify_after(
   c: Config,
   key: Secret<Bytes>,
@@ -201,9 +202,10 @@ pub fn verify_after(
 ) -> Option<Int> / {totp.fail, abort.raise} =
   latest_match(c.form, key, typed, around(step_at(c, now), window), last)
 
-/// The counter whose HOTP code `typed` is, among `counter` and the `ahead` after it, or `None`.
-/// The later of two that share the code is answered, and every one is computed and compared, as
-/// in `verify`. A server keeps one past the answer as its next counter. Raises as `hotp` does.
+/// The counter whose HOTP code is `typed`, among `counter` and the `ahead` counters after it, or
+/// `None`. As in `verify`, the later of two counters with the same code is returned, and every
+/// counter is computed and compared. A server stores the result plus one as its next counter.
+/// Raises as `hotp` does.
 pub fn hotp_verify(
   form: CodeFormat,
   key: Secret<Bytes>,
@@ -242,11 +244,11 @@ fn is_after_last(counter: Int, last: Option<Int>) -> Bool =
 
 // --- Provisioning URIs ------------------------------------------------------
 
-/// The `otpauth://` URI of `p`, as Google Authenticator's key URI format writes one: the type,
-/// the label `issuer:account`, and `secret` in unpadded base32, `issuer`, `algorithm`, `digits`
-/// and `period` or `counter`, each written out. Raises for a key under sixteen bytes, a count of
-/// digits outside six to ten, a step that is not whole seconds or is under one, a counter below
-/// zero, and an issuer or account the label cannot carry.
+/// The `otpauth://` URI of `p`, in Google Authenticator's key URI format: the type, the label
+/// `issuer:account`, then `secret` in unpadded base32, `issuer`, `algorithm`, `digits`, and
+/// `period` or `counter`, each written out. Raises for a key under sixteen bytes, a count of digits
+/// outside six to ten, a step that is not whole seconds or is under one second, a counter below
+/// zero, and an issuer or account the label cannot contain.
 pub fn uri(p: Provision) -> String / {totp.fail, abort.raise} =
   if p.key.len() < 16 { totp.fail(ShortKey(p.key.len())) }
   else if p.form.digits < 6 || p.form.digits > 10 { totp.fail(Digits(p.form.digits)) }
@@ -263,11 +265,11 @@ pub fn uri(p: Provision) -> String / {totp.fail, abort.raise} =
       ++ kind_parameter(p.kind)
   }
 
-/// What `text` provisions, raising `totp.fail` where `try_parse_uri` answers `Err`.
+/// What `text` provisions. Raises `totp.fail` where `try_parse_uri` returns `Err`.
 ///
-/// `algorithm`, `digits` and `period` may be left out, and are then SHA-1, six and thirty
+/// `algorithm`, `digits` and `period` may be left out, and then default to SHA-1, six and thirty
 /// seconds. A `secret` is read as typed: in either case, with or without its padding. A parameter
-/// this format does not name is passed over, and one it does name may appear once.
+/// this format does not define is ignored, and one it defines may appear only once.
 pub fn parse_uri(text: String) -> Provision / {totp.fail, abort.raise} = {
   let scheme = "otpauth://";
   if !text.starts_with(scheme) { malformed(NotOtpauth) } else {
@@ -294,7 +296,7 @@ pub fn parse_uri(text: String) -> Provision / {totp.fail, abort.raise} = {
   }
 }
 
-/// What `text` provisions, or why it is no provisioning URI.
+/// What `text` provisions, or why it is not a provisioning URI.
 pub fn try_parse_uri(text: String) -> Result<Provision, Error> / {abort.raise} =
   try { parse_uri(text) }
 
@@ -346,7 +348,7 @@ fn skip_spaces(text: String, at: Int) -> Int / {abort.raise} =
   else if text.slice(at, at + 1) == " " { skip_spaces(text, at + 1) }
   else { at }
 
-/// The one value `pairs` gives `name`, or `None` where they give none.
+/// The one value `pairs` gives `name`, or `None` when they give none.
 fn parameter(pairs: List<Pair>, name: String) -> Option<String> / {totp.fail} =
   match pairs.filter(|p: Pair| p.name == name) {
     [] -> None,
@@ -383,7 +385,8 @@ fn algorithm_of(given: Option<String>) -> Algorithm / {totp.fail} =
     },
   }
 
-/// The whole number `pairs` give `name`, from `least` up; `None` where they give none.
+/// The whole number `pairs` give `name`, which must be at least `least`; `None` when they give
+/// none.
 fn number(pairs: List<Pair>, name: String, least: Int) -> Option<Int> / {totp.fail, abort.raise} =
   match parameter(pairs, name) {
     None -> None,
@@ -436,7 +439,7 @@ fn rfc_4226() -> List<CounterVector> =
 
 test "RFC 4226's code at counter {c.counter}" for c: CounterVector in rfc_4226() {
   assert_eq(hotp({ algorithm: Sha1, digits: 6 }, Secret::of_bytes(rfc_key()), c.counter), c.code);
-  // Ten digits are the whole cut, zeros leading.
+  // Ten digits show the whole truncated value, with leading zeros.
   assert_eq(
     hotp({ algorithm: Sha1, digits: 10 }, Secret::of_bytes(rfc_key()), c.counter),
     c.cut.to_string().pad_left(10, "0"),
@@ -500,7 +503,7 @@ test "a step is thirty seconds from the epoch unless the config says otherwise" 
   assert_eq(step_at(late, at_second(220)), 2)
 }
 
-test "a form, a counter, a step or a reading outside what is defined is refused by name" {
+test "a form, a counter, a step or a reading outside what is defined is rejected by name" {
   let five = try { hotp({ algorithm: Sha1, digits: 5 }, Secret::of_bytes(rfc_key()), 0) };
   assert_eq(five, Err(Digits(5)));
   let eleven = try { hotp({ algorithm: Sha1, digits: 11 }, Secret::of_bytes(rfc_key()), 0) };
@@ -541,7 +544,7 @@ test "a code verifies in its window and nowhere else" {
   assert_eq(verify(standard(), Secret::of_bytes(rfc_key()), "", made, either), None)
 }
 
-test "a code accepted once is refused the second time, and so is an older one" {
+test "a code accepted once is rejected the second time, and so is an older one" {
   let now = at_second(1111111109);
   let either: Window = { before: 1, after: 1 };
   let typed = code(standard(), Secret::of_bytes(rfc_key()), now);
@@ -556,7 +559,7 @@ test "a code accepted once is refused the second time, and so is an older one" {
   )
 }
 
-test "a counter-based code verifies within the look-ahead, and the counter it was made at is answered" {
+test "a counter-based code verifies within the look-ahead, and the counter it was made at is returned" {
   let form: CodeFormat = { algorithm: Sha1, digits: 6 };
   assert_eq(hotp_verify(form, Secret::of_bytes(rfc_key()), "969429", 0, 5), Some(3));
   assert_eq(hotp_verify(form, Secret::of_bytes(rfc_key()), "969429", 3, 0), Some(3));
@@ -564,7 +567,7 @@ test "a counter-based code verifies within the look-ahead, and the counter it wa
   assert_eq(hotp_verify(form, Secret::of_bytes(rfc_key()), "969429", 4, 5), None)
 }
 
-test "a new key is twenty bytes of the entropy it is handed" {
+test "a new key is twenty bytes of the entropy it is given" {
   let key = handle { new_key() } with { entropy.next() -> 0x0706_0504_0302_0100 };
   assert_eq(key.len(), 20);
   assert_eq(key.slice(0, 8), b"\x00\x01\x02\x03\x04\x05\x06\x00")
@@ -573,7 +576,7 @@ test "a new key is twenty bytes of the entropy it is handed" {
 /// Google Authenticator's own example key: `Hello!` and four bytes more.
 fn hello() -> Bytes = b"Hello!\xDE\xAD\xBE\xEF"
 
-test "a sealed secret is read as typed, and a refusal says only that it is none" {
+test "a sealed secret is read as typed, and an error reveals only that it is not one" {
   let read = |text: String| try { sealed_key(Secret::of_string(text)) };
   assert_eq(read("jbsw y3dp-ehpk 3pxp"), Ok(Secret::of_bytes(hello())));
   assert_eq(read("JBSWY3DPEHPK3PXP===="), Ok(Secret::of_bytes(hello())));
@@ -687,7 +690,7 @@ fn error_cases() -> List<ErrorCase> =
     { text: "otpauth://hotp/a?secret=JBSWY3DPEHPK3PXP", reason: NoCounter },
   ]
 
-test "`{c.text}` is no provisioning URI" for c: ErrorCase in error_cases() {
+test "`{c.text}` is not a provisioning URI" for c: ErrorCase in error_cases() {
   assert_eq(try_parse_uri(c.text), Err(Malformed(c.reason)))
 }
 
@@ -717,7 +720,7 @@ test "a URI writes every parameter, and percent-encodes its names" {
   )
 }
 
-test "what a URI cannot carry is refused by name" {
+test "what a URI cannot contain is rejected by name" {
   let short: Provision = { ..provision("a", "b"), key: b"123456789012345" };
   assert_eq(try { uri(short) }, Err(ShortKey(15)));
   let wide: Provision = { ..provision("a", "b"), form: { algorithm: Sha1, digits: 12 } };
@@ -733,7 +736,7 @@ test "what a URI cannot carry is refused by name" {
   assert_eq(try { uri(behind) }, Err(Counter(0 - 1)))
 }
 
-test "a timed provision says how its codes are made, and a counted one has no clock" {
+test "a time-based provision has a config, and a counter-based one has none" {
   let fast: Provision = { ..provision("a", "b"), kind: TimeBased(seconds(15)) };
   assert_eq(
     config_of(fast),
@@ -745,10 +748,9 @@ test "a timed provision says how its codes are made, and a counted one has no cl
 
 // --- Properties -------------------------------------------------------------
 //
-// A `Provision`, a `Config` and a `CodeFormat` are not every value of their fields, so each law makes
-// one of what it draws.
+// Not every combination of field values is a valid value, so each test builds one from a draw.
 
-/// A reading some whole seconds past the epoch, a step or more in.
+/// A reading a whole number of seconds past the epoch, at least one step in.
 fn sample_instant(ticks: Int) -> Instant = at_second(1000 + (ticks & 0xFFFF_FFFF))
 
 /// A form of six to ten digits under one of the three hashes.
@@ -769,7 +771,7 @@ fn provision_inputs() -> gen::Gen<ProvisionInput> =
       { issuer: issuer, account: account, key: key, n: n },
   )
 
-test "a code verifies while its step is in the window, and its step is not answered from outside" {
+test "a code verifies while its step is in the window, and not from outside it" {
   gen::check(
     gen::and_then(gen::bytes(), |key: Bytes|
       gen::map4(
@@ -820,11 +822,11 @@ test "a code accepted once is not accepted again" {
   )
 }
 
-/// What a test draws for a provision: any two names, any key and a number its form and kind are
-/// read off.
+/// What a test draws for a provision: any two names, any key, and a number its form and kind are
+/// derived from.
 type ProvisionInput = { issuer: String, account: String, key: Bytes, n: Int }
 
-/// A provision `uri` writes, made of what a test drew.
+/// A provision that `uri` can write, made from what a test drew.
 fn provision_of(d: ProvisionInput) -> Provision =
   {
     kind: if d.n >>> 16 & 1 == 0 { TimeBased(seconds(1 + (d.n >>> 17 & 0xFFF))) }
@@ -835,7 +837,7 @@ fn provision_of(d: ProvisionInput) -> Provision =
     form: form_of(d.n),
   }
 
-test "a provisioning URI is read back as what it was written of" {
+test "a provisioning URI reads back as the provision it was written from" {
   gen::check(provision_inputs(), |x: ProvisionInput|
     agrees(
       |d: ProvisionInput| try_parse_uri(uri(provision_of(d))),

@@ -1,30 +1,31 @@
-//! Names looked up: what the system's resolver answers, as an effect of its own.
+//! Name lookups through the system's resolver, as an effect of its own.
 //!
-//! `dns.lookup` asks the system's resolver for a name's addresses, as a connection by name does,
-//! so it reads the hosts file and whatever else the machine is configured with. The addresses come
-//! back as `std.ip` values in the order the resolver gave them, which is its policy's order; a
-//! text that is already an address answers itself and asks nothing. `dns.reverse` is the names an
-//! address answers to. The system's resolver says nothing of how long an answer holds, so a
-//! `ResolvedAddress` from it has no `ttl`; a record read off the wire by `std.resolver` has one. A name is
-//! ASCII: an internationalized one is looked up by its A-labels, which `std.idna`'s `ascii`
-//! makes, and any other is refused (`not_ascii`) without a question asked.
+//! `dns.lookup` queries the system's resolver for a name's addresses, as connecting by name does,
+//! so it reads the hosts file and whatever else the machine is configured with. It returns the
+//! addresses as `std.ip` values in the resolver's order, which follows the resolver's policy. A
+//! text that is already an address returns itself, with no query. `dns.reverse` returns the names
+//! for an address. The system's resolver does not report how long a result stays valid, so a
+//! `ResolvedAddress` from it has no `ttl`. A record that `std.resolver` reads off the wire has one.
 //!
-//! Neither operation takes a deadline, because the system's resolver has its own patience and
-//! cannot be hurried. `resolve` and `names` bound the wait on the clock instead, as `std.task`
-//! bounds anything: the task that asked is stopped at the deadline and the answer is `TimedOut`,
-//! under `simulate` in virtual time and outside it on the run's clock.
+//! A name must be ASCII. Look up an internationalized name by its A-labels, which `std.idna`'s
+//! `ascii` returns. Any other name fails with `not_ascii`, with no query.
 //!
-//! A lookup is a `read` with no label: a row that names `dns.lookup` says a definition may ask a
-//! resolver, and a deterministic test answers it from a `Table`, a resolver as a value, with
-//! `on_table`. `std.net`'s `dial` looks a name up through this effect, so the table a test hands
-//! it decides where a name connects, and `net::on_mem` answers both from one.
+//! Neither operation takes a deadline, because the system's resolver has its own timeouts and
+//! cannot be hurried. `resolve` and `names` limit the wait on the clock instead, as `std.task`
+//! limits anything: the lookup's task is stopped at the deadline and the result is `TimedOut`.
+//! Under `simulate` the clock is virtual time, and outside it the run's clock.
 //!
-//! `interleave` orders addresses the way a connector should try them: the families alternating
-//! from the resolver's first choice, each family in the order it was given (RFC 8305 §4), so one
-//! family that does not route costs one attempt and not a list of them.
+//! A lookup is a `read` with no label. An effect row that names `dns.lookup` states that a
+//! definition may query a resolver. A deterministic test handles it with `on_table`, from a
+//! `Table`: a resolver as a value. `std.net`'s `dial` looks names up through this effect, so the
+//! table a test passes decides where a name connects. `net::on_mem` handles both from one table.
 //!
-//! Records the system's resolver does not offer (MX, TXT, SRV, CNAME) are `std.resolver`'s, which
-//! asks a server itself.
+//! `interleave` orders addresses the way a connector should try them (RFC 8305 §4). The families
+//! alternate, starting with the resolver's first choice, and each family keeps its given order. So
+//! a family that does not route costs one attempt, not a whole list of them.
+//!
+//! Records the system's resolver does not provide (MX, TXT, SRV, CNAME) are in `std.resolver`,
+//! which queries a server itself.
 
 import std.bytes (i64_be, u32_be)
 import std.internal.native (native, wait, job_wait, found, parts, decode_int)
@@ -37,42 +38,43 @@ import std.task (deadline)
 import std.time (after, seconds)
 import std.gen
 
-/// One address a name resolves to, and how long the answer holds where the resolver says.
+/// One address a name resolves to, and how long the result stays valid when the resolver reports
+/// it.
 pub type ResolvedAddress = { address: Ip, ttl: Option<Duration> }
 
-/// Why a lookup has no answer.
+/// Why a lookup failed.
 pub type Failure =
   /// No such name.
   | NoSuchName
-  /// The name is there and holds nothing of the kind asked for.
+  /// The name exists but has no records of the requested kind.
   | NoData
-  /// A server failed or refused the question.
+  /// A server failed or rejected the query.
   | ServerFailure
   /// No answer came before the deadline.
   | TimedOut
-  /// The resolver failed for a reason of its own: its code, and what it says.
+  /// The resolver failed for another reason: its error code and message.
   | Other(Int, String)
 
 /// The system's resolver.
 pub nondet effect dns {
   /// The addresses of `name`, in the order the system's resolver gives them. An address written
-  /// as text answers itself. Never an empty `Ok`: a name with no address is `NoData` or
-  /// `NoSuchName`. It waits as long as the system's resolver does; `resolve` bounds it.
+  /// as text returns itself. Never an empty `Ok`: a name with no address is `NoData` or
+  /// `NoSuchName`. It waits as long as the system's resolver does; `resolve` limits the wait.
   read lookup(name: String) -> Result<List<ResolvedAddress>, Failure>
-  /// The names `address` answers to, most often one; `names` bounds the wait.
+  /// The names for `address`, most often one. `names` limits the wait.
   read reverse(address: Ip) -> Result<List<String>, Failure>
-  /// The servers the system's resolver is configured to ask, in its order; empty where the host
+  /// The servers the system's resolver is configured to query, in its order. Empty when the host
   /// has no list to read.
   read servers() -> List<SocketAddress>
 }
 
-/// What a name that is not ASCII is refused with.
+/// The error for a name that is not ASCII.
 pub fn not_ascii() -> Failure =
   Other(0, "a name is ASCII: an internationalized name is looked up by its A-labels")
 
-/// The addresses of `name` as `dns.lookup` answers them, or `TimedOut` where the resolver has
-/// not answered within `wait`. The lookup runs as a task of its own, stopped at the deadline or
-/// at the one already around this call where that is earlier.
+/// The addresses of `name` as `dns.lookup` returns them, or `TimedOut` when the resolver has not
+/// replied within `wait`. The lookup runs as a task of its own. It is stopped at this deadline, or
+/// at an enclosing deadline when that one is earlier.
 pub fn resolve(
   name: String,
   wait: Duration,
@@ -82,8 +84,8 @@ pub fn resolve(
     task::TimedOut -> Err(TimedOut),
   }
 
-/// The names `address` answers to as `dns.reverse` answers them, or `TimedOut` where the
-/// resolver has not answered within `wait`.
+/// The names for `address` as `dns.reverse` returns them, or `TimedOut` when the resolver has not
+/// replied within `wait`.
 pub fn names(
   address: Ip,
   wait: Duration,
@@ -114,10 +116,10 @@ fn same_family(a: Ip, b: Ip) -> Bool = ip::bit_width(a) == ip::bit_width(b)
 fn alternate(first: List<Ip>, second: List<Ip>) -> List<Ip> =
   match first { [] -> second, [head, ..rest] -> [head].concat(alternate(second, rest)) }
 
-// --- The twin ---------------------------------------------------------------
+// --- The fake ---------------------------------------------------------------
 
-/// A resolver as a value: what each name and each address answers, and the servers it says it
-/// asks. A name is held in lower case without a final dot, which is how it is looked up.
+/// A resolver as a value: the result for each name and each address, and the servers it reports.
+/// Names are stored in lower case without a final dot, the form they are looked up in.
 pub type Table = {
   names: Map<String, Result<List<ResolvedAddress>, Failure>>,
   reversed: Map<Ip, List<String>>,
@@ -127,18 +129,18 @@ pub type Table = {
 /// A resolver that knows no name.
 pub fn table() -> Table = { names: Map::new(), reversed: Map::new(), servers: [] }
 
-/// The name as a table holds it.
+/// The name in the form a table stores it.
 fn table_key(name: String) -> String / {abort.raise} = {
   let lower = name.ascii_lower();
   if lower.ends_with(".") { lower.slice(0, lower.len() - 1) } else { lower }
 }
 
 /// The table with `name` resolving to `addresses` in that order, none of them with a lifetime.
-/// A name given no address answers `NoData`.
+/// A name given no addresses returns `NoData`.
 pub fn with_name(t: Table, name: String, addresses: List<Ip>) -> Table / {abort.raise} =
   with_resolved(t, name, addresses.map(|a: Ip| { address: a, ttl: None }))
 
-/// The table with `name` resolving to `found`, each with the lifetime it says.
+/// The table with `name` resolving to `found`, each with its own `ttl`.
 pub fn with_resolved(
   t: Table,
   name: String,
@@ -153,15 +155,16 @@ pub fn with_resolved(
 pub fn with_failure(t: Table, name: String, why: Failure) -> Table / {abort.raise} =
   { ..t, names: t.names.insert(table_key(name), Err(why)) }
 
-/// The table with `address` answering to `names`.
+/// The table with `names` as the names for `address`.
 pub fn with_reverse(t: Table, address: Ip, names: List<String>) -> Table =
   { ..t, reversed: t.reversed.insert(address, names) }
 
-/// The table saying it asks `servers`.
+/// The table reporting `servers` as its servers.
 pub fn with_servers(t: Table, servers: List<SocketAddress>) -> Table = { ..t, servers: servers }
 
-/// What `dns.lookup` answers of `name` where `ask` answers a name that is no address and is
-/// ASCII: an address written as text is itself, and a name that is not ASCII is refused unasked.
+/// What `dns.lookup` returns for `name`, with `ask` looking up a name that is ASCII and not an
+/// address. An address written as text returns itself, and a name that is not ASCII fails without
+/// calling `ask`.
 fn lookup_with<| e>(
   name: String,
   ask: (String) -> Result<List<ResolvedAddress>, Failure> / e,
@@ -171,9 +174,9 @@ fn lookup_with<| e>(
     Err(_) -> if !name.is_ascii() { Err(not_ascii()) } else { ask(name) },
   }
 
-/// What `dns.lookup` answers over the table: an address written as text is itself, a name that
-/// is not ASCII is refused as the host refuses it, a name the table holds is what it was given,
-/// and any other is `NoSuchName`.
+/// What `dns.lookup` returns from the table. An address written as text returns itself. A name
+/// that is not ASCII fails as it does on the host. A name in the table returns what it was given,
+/// and any other name is `NoSuchName`.
 pub fn table_lookup(
   t: Table,
   name: String,
@@ -181,14 +184,14 @@ pub fn table_lookup(
   lookup_with(name, |asked: String|
     match t.names.get(table_key(asked)) { Some(answer) -> answer, None -> Err(NoSuchName) })
 
-/// What `dns.reverse` answers over the table.
+/// What `dns.reverse` returns from the table.
 pub fn table_reverse(t: Table, address: Ip) -> Result<List<String>, Failure> =
   match t.reversed.get(address) {
     Some(names) -> if names.len() == 0 { Err(NoData) } else { Ok(names) },
     None -> Err(NoSuchName),
   }
 
-/// `go` with every lookup answered by the table, at once.
+/// Runs `go`, handling every lookup from the table without waiting.
 pub fn on_table<a | e>(
   t: Table,
   go: () -> a / {dns.lookup, dns.reverse, dns.servers | e},
@@ -205,8 +208,8 @@ pub fn on_table<a | e>(
 
 host for dns by served
 
-/// `go` with every question asked of the system's resolver, the asking task waiting for its own
-/// answer.
+/// Runs `go`, sending every query to the system's resolver. The calling task waits for its own
+/// reply.
 fn served<a | e>(go: () -> a / {dns.read | e}) -> a / {native.read, wait.read, abort.raise | e} =
   handle {
     go()
@@ -220,16 +223,17 @@ fn served<a | e>(go: () -> a / {dns.read | e}) -> a / {native.read, wait.read, a
     },
   }
 
-/// The ticket of the addresses the system's resolver gives `name`.
+/// The ticket of a query to the system's resolver for the addresses of `name`.
 extern fn dns_lookup(name: String) -> Int / {native.read}
 
-/// The ticket of the names the system's resolver says the address of these bytes answers to.
+/// The ticket of a query to the system's resolver for the names of the address in these bytes.
 extern fn dns_reverse(address: Bytes) -> Int / {native.read}
 
-/// The system's resolver configuration, found where the host has one to read.
+/// The system's resolver configuration, if the host has one to read.
 extern fn dns_configuration() -> Bytes / {native.read}
 
-/// What the resolver answered a lookup: byte 1 and each address's bytes as parts, or the failure.
+/// Decodes the resolver's reply to a lookup: byte 1 then each address's bytes as parts, or a
+/// failure.
 fn decode_addresses(reply: Bytes) -> Result<List<ResolvedAddress>, Failure> / {abort.raise} =
   if reply.at(0) == 1 {
     Ok(
@@ -238,14 +242,14 @@ fn decode_addresses(reply: Bytes) -> Result<List<ResolvedAddress>, Failure> / {a
     )
   } else { Err(decode_failure(reply)) }
 
-/// What the resolver answered a reverse lookup: byte 1 and each name as parts, or the failure.
+/// Decodes the resolver's reply to a reverse lookup: byte 1 then each name as parts, or a failure.
 fn decode_names(reply: Bytes) -> Result<List<String>, Failure> / {abort.raise} =
   if reply.at(0) == 1 {
     Ok(parts(reply.slice(1, reply.len())).map(|name: Bytes| String::of_bytes_lossy(name)))
   } else { Err(decode_failure(reply)) }
 
-/// A failure as the resolver's natives write it: byte 0, its kind (`NoSuchName` 1, `NoData` 2,
-/// `ServerFailure` 3, `Other` 4), and for `Other` its code and words as parts.
+/// Decodes a failure as the resolver's native functions write it: byte 0, its kind (`NoSuchName`
+/// 1, `NoData` 2, `ServerFailure` 3, `Other` 4), and for `Other` its code and message as parts.
 fn decode_failure(reply: Bytes) -> Failure / {abort.raise} =
   match reply.at(1) {
     1 -> NoSuchName,
@@ -257,8 +261,8 @@ fn decode_failure(reply: Bytes) -> Failure / {abort.raise} =
     },
   }
 
-/// The servers a resolver configuration names, in its order, each at the port a server answers
-/// on; a `nameserver` line naming no address this reads is passed over.
+/// The servers a resolver configuration lists, in its order, each at the DNS port. A `nameserver`
+/// line without an address this can parse is skipped.
 pub fn parse_servers(configuration: String) -> List<SocketAddress> / {abort.raise} =
   configuration.lines().fold([], |acc: List<SocketAddress>, line: String|
     match line.words() {
@@ -279,7 +283,7 @@ fn parse_server(server: String) -> Option<SocketAddress> / {abort.raise} =
 
 // --- Tests ------------------------------------------------------------------
 
-test "a resolver configuration names its servers in order, a zone kept and a stray line passed over" {
+test "a resolver configuration lists its servers in order, keeps a zone and skips a stray line" {
   let named = parse_servers(
     "# the network's\nsearch example.org\nnameserver 192.0.2.53\nnameserver fe80::1%en0\nnameserver   2001:db8::53 # trailing\nnameserver not-an-address\noptions ndots:2\n",
   );
@@ -290,7 +294,7 @@ test "a resolver configuration names its servers in order, a zone kept and a str
   ])
 }
 
-test "the resolver's answers read back as the failures and addresses they are" {
+test "the resolver's replies decode to the failures and addresses they encode" {
   let address = ip::read("192.0.2.7");
   assert_eq(
     decode_addresses(Bytes::concat_all([b"\x01", u32_be(4), ip::to_bytes(address)])),
@@ -349,7 +353,7 @@ fn example() -> Table / {ip.fail, abort.raise} =
     ["example.org"],
   )
 
-test "a table answers a name whatever its case and final dot, an address as itself, and no other" {
+test "a table resolves a name whatever its case and final dot, an address as itself, and no other" {
   let found = on_table(example(), ||
     [
       dns.lookup("example.org"),
@@ -373,7 +377,7 @@ test "a table answers a name whatever its case and final dot, an address as itse
   ])
 }
 
-test "a table answers an address's names and the servers it was given" {
+test "a table returns an address's names and the servers it was given" {
   let asked = on_table(with_servers(example(), [ip::read_socket("192.0.2.53:53")]), || {
     {
       known: dns.reverse(ip::read("192.0.2.7")),
@@ -386,14 +390,14 @@ test "a table answers an address's names and the servers it was given" {
   assert_eq(asked.servers.map(ip::render_socket), ["192.0.2.53:53"])
 }
 
-test "a name that is not ASCII is refused and not looked up" {
+test "a name that is not ASCII fails without a lookup" {
   let named = with_name(table(), "bücher.example", [ip::read("192.0.2.7")]);
   assert_eq(on_table(named, || dns.lookup("bücher.example")), Err(not_ascii()));
   assert_eq(on_table(named, || dns.lookup("xn--bcher-kva.example")), Err(NoSuchName))
 }
 
-/// `go` over a resolver that takes `takes` to answer `at` to any name and `example.org` to any
-/// address.
+/// Runs `go` with a resolver that takes `takes` to reply, with `at` for any name and `example.org`
+/// for any address.
 fn slow_resolver<a | e>(
   takes: Duration,
   at: Ip,
@@ -417,7 +421,7 @@ type WaitCase = { wait: Int, told: String }
 /// A wait longer than the three seconds the resolver takes, and one shorter.
 fn waits() -> List<WaitCase> =
   [
-    { wait: 5, told: "is answered when it answers" },
+    { wait: 5, told: "returns when the resolver replies" },
     { wait: 2, told: "is given up on at the deadline" },
   ]
 
@@ -444,7 +448,7 @@ test "a reverse lookup that takes three seconds, waited on for {c.wait}, {c.told
   }
 }
 
-test "a lookup under a deadline that is earlier than its own is stopped by that one" {
+test "a lookup under an enclosing deadline earlier than its own stops at that one" {
   simulate {
     let asked = slow_resolver(seconds(3), ip::read("192.0.2.7"), ||
       task::unbounded(|| task::timeout(seconds(1), || resolve("example.org", seconds(5)))));

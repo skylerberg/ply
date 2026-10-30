@@ -1,35 +1,36 @@
 //! Shell-style patterns over paths, compiled once and matched in one pass over the path.
 //!
-//! A path is text and nothing here reads a file system. The dialect is no one shell's:
+//! A path is text, and nothing here reads a file system. The dialect is not any one shell's:
 //!
-//! - A pattern writes `/` between segments whatever separates the path's: `Options.separator` names
-//!   the path's character, and nothing is read from the platform.
-//! - `?` is one character and `*` any run of them, neither ever the separator.
-//! - `[abc]`, `[a-z]` and `[!a-z]`, which `[^a-z]` also writes, are one character of a class, as
-//!   Go's `path.Match` writes one: a class is not empty, a `]`, `-` or `\` in it is written `\]`,
-//!   `\-` or `\\`, and a range's ends stand in order of their scalar values, never a locale's. A
-//!   class never matches the separator, and there are no named classes.
-//! - `**` stands for whole segments, and only between a `/` or the pattern's start and a `/` or
-//!   its end. `**/` is no segment or any number of them, so `a/**/b` matches `a/b`; a closing
-//!   `/**` is everything under, so `a/**` matches `a/b/c` and not `a`, as a `.gitignore` reads
-//!   it; `**` alone matches every path but the empty one.
-//! - `{a,b}` is either alternative, as a shell expands one. One may be empty, hold `/` and
-//!   wildcards, and nest another; a `,` outside braces is itself, and a `}` that closes nothing
-//!   is refused.
-//! - `\` makes the next character itself, and `escape` writes a text as the pattern of it alone.
-//! - A `.` that leads a segment of the path is matched only by a `.` that leads a segment of the
-//!   pattern, as `fnmatch` and the shells have it: `*.ply` matches neither `.hidden.ply` nor
-//!   `.ply`, and `**` enters no `.git`. `Options.match_hidden` lets every wildcard match one.
-//! - Case counts unless `Options.ignore_case`, which lower-cases both sides a character at a
-//!   time, by Unicode's simple mapping (`char::to_lowercase`). A text keeps its length that way,
-//!   so `?` is one character of the path whatever its case, where the full mapping makes two of
-//!   `U+0130` and a final sigma of a capital one by where it stands.
+//! - A pattern writes `/` between segments, whatever separates the path's segments.
+//!   `Options.separator` names the path's separator, and nothing is read from the platform.
+//! - `?` matches one character and `*` any run of them, never including the separator.
+//! - `[abc]`, `[a-z]` and `[!a-z]` (also written `[^a-z]`) match one character of a class, as in
+//!   Go's `path.Match`. A class is not empty. A `]`, `-` or `\` in it is written `\]`, `\-` or
+//!   `\\`. A range's ends are in order of their scalar values, never a locale's order. A class
+//!   never matches the separator, and there are no named classes.
+//! - `**` matches whole segments, and is allowed only between a `/` or the pattern's start and a
+//!   `/` or its end. `**/` matches zero or more segments, so `a/**/b` matches `a/b`. A closing
+//!   `/**` matches everything below, so `a/**` matches `a/b/c` but not `a`, as a `.gitignore`
+//!   reads it. `**` alone matches every path except the empty one.
+//! - `{a,b}` matches either alternative, as a shell expands it. An alternative may be empty,
+//!   contain `/` and wildcards, and contain another brace. A `,` outside braces matches itself,
+//!   and a `}` that closes nothing is an error.
+//! - `\` makes the next character match itself, and `escape` writes the pattern that matches a
+//!   text and nothing else.
+//! - A `.` at the start of a path segment is matched only by a `.` at the start of a pattern
+//!   segment, as in `fnmatch` and the shells: `*.ply` matches neither `.hidden.ply` nor `.ply`,
+//!   and `**` does not enter `.git`. `Options.match_hidden` lets every wildcard match one.
+//! - Case matters unless `Options.ignore_case` is set, which lower-cases both sides one character
+//!   at a time by Unicode's simple mapping (`char::to_lowercase`). That keeps a text's length, so
+//!   `?` matches one character of the path whatever its case. The full mapping would turn `U+0130`
+//!   into two characters, and a capital sigma into a final sigma depending on its position.
 //!
-//! Nothing is normalised: `a//b` and `a/./b` are not `a/b`, and `std.path` is what makes them so.
-//! A match follows every state the pattern could be in after each character rather than trying
-//! one and going back, so no pattern's steps double with its length: they grow with the path's
-//! length times the pattern's, and times the pattern's again only where alternatives that may be
-//! empty stand in a row. `base` and `enters` are what a walk of a directory tree prunes with.
+//! Nothing is normalised: `a//b` and `a/./b` are not `a/b`, and `std.path` normalises them. A
+//! match tracks every state the pattern could be in after each character, rather than trying one
+//! and backtracking, so no pattern takes time exponential in its length. The time grows with the
+//! path's length times the pattern's, and times the pattern's again only where alternatives that
+//! may be empty appear in a row. `base` and `enters` let a directory walk prune its search.
 
 import std.char
 import std.laws (agrees)
@@ -37,7 +38,7 @@ import std.list (enumerate)
 import std.map
 import std.gen
 
-/// How a pattern reads a path.
+/// How a pattern matches a path.
 pub type Options = {
   /// The character between a path's segments, which a `/` in the pattern matches.
   separator: Char,
@@ -47,13 +48,14 @@ pub type Options = {
   match_hidden: Bool,
 }
 
-/// `/` between segments, case counted, and a leading `.` matched only by one written.
+/// The default options: `/` between segments, case-sensitive, and a leading `.` matched only by a
+/// literal `.`.
 pub fn options() -> Options = { separator: '/', ignore_case: false, match_hidden: false }
 
-/// The characters from `lo` to `hi`, both among them.
+/// The characters from `lo` to `hi`, inclusive.
 type CharRange = { lo: Char, hi: Char }
 
-/// What a state of a pattern takes of a path: one character, or for `Run` and `Deep` any number.
+/// What a pattern state consumes from a path: one character, or any number for `Run` and `Deep`.
 type Symbol =
   /// This character.
   | Lit(Char)
@@ -61,42 +63,43 @@ type Symbol =
   | Sep
   /// A character within a segment.
   | One
-  /// Characters within a segment, as `*` takes them.
+  /// Characters within a segment, as `*` matches them.
   | Run
-  /// A character, the separator among them.
+  /// Any character, including the separator.
   | Any
-  /// Characters across segments, as `**` takes them.
+  /// Characters across segments, as `**` matches them.
   | Deep
-  /// A character within a segment that is in one of the spans, or in none where the flag is set.
+  /// A character within a segment that is in one of the ranges, or in none of them when the flag
+  /// is set.
   | Among(Bool, List<CharRange>)
-  /// Nothing: the pattern is matched here.
+  /// Nothing: the pattern has matched.
   | End
 
-/// One state of a compiled pattern: what it takes, the states that may follow taking it, and
-/// those of them that no `*` was passed over to reach.
+/// One state of a compiled pattern: what it consumes, the states that may follow it, and the ones
+/// among them reached without passing over a `*`.
 type State = { symbol: Symbol, next: List<Int>, first: List<Int> }
 
-/// A compiled pattern. Two are equal when their patterns and options are written alike.
+/// A compiled pattern. Two are equal when their patterns and options are the same.
 pub type Glob = new {
   options: Options,
   states: Array<State>,
   /// The states a match starts in.
   start: Map<Int, Unit>,
-  /// Those of `start` that no `*` was passed over to reach.
+  /// The states of `start` reached without passing over a `*`.
   first: Map<Int, Unit>,
-  /// What `base` answers.
+  /// What `base` returns.
   base: String,
-  /// What `exact` answers.
+  /// What `exact` returns.
   exact: Option<String>,
 }
 
-/// Why a pattern is refused.
+/// Why a pattern is invalid.
 pub type ErrorKind =
-  /// A `[` whose class the pattern ends inside.
+  /// A `[` whose class is not closed before the pattern ends.
   | UnclosedClass
   /// A class of no characters, `[]` or `[!]`.
   | EmptyClass
-  /// A `-` in a class that no two characters in order stand around.
+  /// A `-` in a class that is not between two characters in order.
   | BadRange
   /// A `{` with no `}`.
   | UnclosedBrace
@@ -107,16 +110,16 @@ pub type ErrorKind =
   /// A `**` that is not a whole segment.
   | Globstar
 
-/// A refusal, and the character of the pattern it is about.
+/// Why a pattern is invalid, and the index of the character the error is at.
 pub type Error = { at: Int, reason: ErrorKind }
 
-/// What `read` raises where it refuses.
+/// What `read` raises for an invalid pattern.
 pub effect glob {
   /// The text is not a pattern of this dialect.
   raise fail(e: Error)
 }
 
-/// A refusal's reason as a sentence, which is what a literal's diagnostic says.
+/// An error's reason as a sentence, as a literal's diagnostic shows it.
 pub fn reason(why: ErrorKind) -> String =
   match why {
     UnclosedClass -> "this class has no closing `]`",
@@ -128,16 +131,16 @@ pub fn reason(why: ErrorKind) -> String =
     Globstar -> "`**` is a whole segment: only `/` or an end of the pattern stands beside it",
   }
 
-/// The pattern compiled under `options()`, or where and why it is refused.
+/// Compiles the pattern under `options()`, or returns where and why it is invalid.
 pub fn compile(pattern: String) -> Result<Glob, Error> / {abort.raise} =
   try { read(pattern, options()) }
 
-/// The pattern compiled to read paths as `o` says, or where and why it is refused.
+/// Compiles the pattern to match paths as `o` specifies, or returns where and why it is invalid.
 pub fn compile_with(pattern: String, o: Options) -> Result<Glob, Error> / {abort.raise} =
   try { read(pattern, o) }
 
-/// The pattern compiled to read paths as `o` says, raising `glob.refused` where `compile_with`
-/// answers `Err`.
+/// Compiles the pattern to match paths as `o` specifies. Raises `glob.fail` where `compile_with`
+/// returns `Err`.
 pub fn read(pattern: String, o: Options) -> Glob / {glob.fail, abort.raise} = {
   let written = program_of(pattern);
   let prefix = literal_prefix(written, o.separator);
@@ -152,17 +155,17 @@ pub fn read(pattern: String, o: Options) -> Glob / {glob.fail, abort.raise} = {
   }
 }
 
-/// What a `glob"..."` literal is checked by: the pattern compiled under `options()`, or the
-/// character it is refused at. A literal's text doubles a brace, so `{a,b}` is written `{{a,b}}`
-/// there, and a `\` is written `\\`.
+/// Checks the text of a `glob"..."` literal. Returns the pattern compiled under `options()`, or the
+/// character where it is invalid. A literal's text doubles each brace, so `{a,b}` is written
+/// `{{a,b}}` there, and a `\` is written `\\`.
 pub fn literal(text: String) -> Result<Glob, { message: String, offset: Int }> / {abort.raise} =
   match compile(text) {
     Ok(g) -> Ok(g),
     Err(refused) -> Err({ message: reason(refused.reason), offset: refused.at }),
   }
 
-/// `text` as the pattern that matches it and nothing else under a `/` separator: each character
-/// a pattern reads as more than itself after a `\`.
+/// The pattern that matches `text` and nothing else under a `/` separator. Each character with a
+/// special meaning in a pattern gets a `\` before it.
 pub fn escape(text: String) -> String =
   String::of_chars(
     text.chars().fold([], |acc: List<Char>, c: Char|
@@ -180,27 +183,27 @@ pub fn matches(g: Glob, path: String) -> Bool = {
   on.contains(g.states.len() - 1)
 }
 
-/// The directory every match lies under, for a walk to start from: the pattern's leading
-/// segments that hold no wildcard, as a path writes them, and empty where its first segment
-/// holds one. The pattern's own case, whatever `ignore_case` says.
+/// The directory every match is under, for a walk to start from. It is the pattern's leading
+/// segments that contain no wildcard, written as a path, or empty when the first segment contains
+/// one. It keeps the pattern's own case, whatever `ignore_case` is set to.
 pub fn base(g: Glob) -> String = g.base
 
-/// The one path a pattern with no wildcard matches, which a walk can ask for by name.
+/// The one path a pattern with no wildcard matches, which a walk can look up by name.
 pub fn exact(g: Glob) -> Option<String> = g.exact
 
-/// Whether a walk has reason to list the directory `dir`: `false` only where no path under it
-/// matches. The empty `dir` is where the walk starts, which it always enters.
+/// Whether a walk needs to list the directory `dir`: `false` only when no path under it can match.
+/// The empty `dir` is where the walk starts, and it is always entered.
 pub fn enters(g: Glob, dir: String) -> Bool = {
   let separator = String::of_chars([g.options.separator]);
   let under = if dir == "" || dir.ends_with(separator) { dir } else { dir ++ separator };
   states_after(g, under).len() > 0
 }
 
-/// Where a match stands in a path: the states it may be in, those of them that lead a segment of
-/// the pattern, and whether the next character leads a segment of the path.
+/// The progress of a match through a path: the states it may be in, those of them that start a
+/// segment of the pattern, and whether the next character starts a segment of the path.
 type MatchState = { on: Map<Int, Unit>, first: Map<Int, Unit>, leads: Bool }
 
-/// `text` with each character in lower case by itself, so that it keeps its length.
+/// `text` with each character lower-cased on its own, so that it keeps its length.
 fn lowered(text: String) -> String = String::of_chars(text.chars().map(Char::to_lowercase))
 
 /// The states the pattern may be in once `text` is read.
@@ -237,8 +240,8 @@ fn advance(g: Glob, w: MatchState, c: Char) -> MatchState = {
 fn insert_all(set: Map<Int, Unit>, more: List<Int>) -> Map<Int, Unit> =
   more.fold(set, |reached: Map<Int, Unit>, to: Int| reached.insert(to, ()))
 
-/// Whether a state takes `c`. `hidden` is a `.` leading a segment of the path, which only a
-/// `Lit` that is `first`, leading its segment of the pattern, takes.
+/// Whether a state accepts `c`. `hidden` means `c` is a `.` that starts a segment of the path,
+/// which only a `Lit` that is `first`, starting its segment of the pattern, accepts.
 fn accepts(symbol: Symbol, c: Char, separator: Char, hidden: Bool, first: Bool) -> Bool =
   match symbol {
     Lit(written) -> c == written && (!hidden || first),
@@ -254,20 +257,21 @@ fn within(spans: List<CharRange>, c: Char) -> Bool =
 
 // --- Compiling --------------------------------------------------------------
 
-/// A pattern as instructions: a state, or a choice of where to go on with nothing taken. Every
-/// `Fork` and `Jump` goes forward, which is what lets `states_of` close them in one pass.
+/// A pattern as instructions: a state, or a choice of where to continue without consuming
+/// anything. Every `Fork` and `Jump` goes forward, which lets `states_of` compute their closures in
+/// one pass.
 type Inst =
   | Take(Symbol)
-  /// The next instruction, or the one at this place.
+  /// The next instruction, or the one at this index.
   | Fork(Int)
   | Jump(Int)
 
-/// An open `{`: where it stands, the `Fork` its current alternative opened with, and the `Jump`
-/// that ends each alternative before it.
+/// An open `{`: its position, the `Fork` that started its current alternative, and the `Jump` that
+/// ends each earlier alternative.
 type Brace = { at: Int, fork: Int, jumps: List<Int> }
 
-/// What stands before the character being read, as far as a `**` asks: a segment's start, one
-/// `*` and whether it stood at a segment's start, a `**`, or anything else.
+/// What comes before the character being read, as far as a `**` cares: a segment's start, one `*`
+/// and whether it was at a segment's start, a `**`, or anything else.
 type Before = | SegmentStart | Star(Bool) | DoubleStar | Mid
 
 type Step = | First | Item | PendingChar(Char) | Dash(Char)
@@ -349,7 +353,8 @@ fn next_alternative(p: Parser) -> Parser / {abort.raise} =
     },
   }
 
-/// A `}`: the last alternative has no other to fork to, and every earlier one goes on from here.
+/// A `}`: the last alternative has no further one to fork to, and every earlier one continues from
+/// here.
 fn close_brace(p: Parser) -> Parser / {glob.fail, abort.raise} =
   match p.braces.at(p.braces.len() - 1) {
     None -> fail(p.at, UnopenedBrace),
@@ -417,9 +422,10 @@ fn finish_program(p: Parser) -> List<Inst> / {glob.fail, abort.raise} =
 
 fn loops(symbol: Symbol) -> Bool = symbol == Run || symbol == Deep
 
-/// Each instruction as a state, and the states a match starts in. What follows a state is every
-/// state reached from the instruction after it, or from itself where it loops, taking nothing;
-/// `first` are those reached with no loop left behind untaken, which is a `*` passed over.
+/// Each instruction as a state, and the states a match starts in. A state is followed by every
+/// state reachable without consuming anything from the next instruction, or from itself when it
+/// loops. `first` are the states reached without skipping a loop, that is, without passing over a
+/// `*`.
 fn states_of(
   program: List<Inst>,
 ) -> { states: Array<State>, start: Map<Int, Unit>, first: Map<Int, Unit> } = {
@@ -445,8 +451,8 @@ fn states_of(
   }
 }
 
-/// For each instruction, the states reached from it taking nothing. A loop goes on to what
-/// follows it only where `past_loops` says so.
+/// For each instruction, the states reachable from it without consuming anything. A loop continues
+/// to what follows it only when `past_loops` is set.
 fn epsilon_closures(program: List<Inst>, past_loops: Bool) -> Map<Int, Map<Int, Unit>> =
   enumerate(program).reverse().fold(
     Map::new(),
@@ -463,12 +469,13 @@ fn epsilon_closures(program: List<Inst>, past_loops: Bool) -> Map<Int, Map<Int, 
       }),
   )
 
-/// The states reached from the instruction at `at` taking nothing; none past the last.
+/// The states reachable from the instruction at `at` without consuming anything, and none past the
+/// last instruction.
 fn closure_at(reached: Map<Int, Map<Int, Unit>>, at: Int) -> Map<Int, Unit> =
   reached.get_or(at, Map::new())
 
-/// The characters a pattern opens with before its first wildcard or brace, where the last
-/// separator among them stands, and whether they are the whole pattern.
+/// The characters a pattern starts with before its first wildcard or brace, the position of the
+/// last separator among them, and whether they are the whole pattern.
 fn literal_prefix(
   program: List<Inst>,
   separator: Char,
@@ -500,9 +507,9 @@ fn yes(pattern: String, path: String) -> Case = { pattern: pattern, path: path, 
 
 fn no(pattern: String, path: String) -> Case = { pattern: pattern, path: path, matches: false }
 
-/// The rows of Go's `matchTests`, which `path/filepath` and `path` both carry, that name no
-/// malformed pattern. Go has no `**`, no braces and no `!`, and its `*` matches a leading `.`,
-/// which no row here asks of it.
+/// The rows of Go's `matchTests`, which `path/filepath` and `path` both contain, that have a valid
+/// pattern. Go has no `**`, no braces and no `!`, and its `*` matches a leading `.`, which no row
+/// here tests.
 fn go_matches() -> List<Case> =
   [
     yes("abc", "abc"),
@@ -662,7 +669,7 @@ test "`{c.pattern}` and `{c.path}`" for c: Case in own_matches() {
   assert_eq(matches(glob_of(c.pattern), c.path), c.matches)
 }
 
-/// The paths of one small tree, its directories among them.
+/// The paths of one small tree, including its directories.
 fn tree() -> List<String> =
   [
     ".git",
@@ -692,8 +699,9 @@ fn tree() -> List<String> =
 
 type Expanded = { pattern: String, paths: List<String> }
 
-/// What bash 3.2, zsh 5.9 and Python 3.14's `glob` each expand a pattern to over `tree`, where
-/// each that reads the pattern answers alike: bash has no `**` there and Python no braces.
+/// What bash 3.2, zsh 5.9 and Python 3.14's `glob` each expand a pattern to over `tree`, for
+/// patterns where every one that supports the pattern gives the same result. Bash has no `**`
+/// there, and Python no braces.
 fn expanded() -> List<Expanded> =
   [
     { pattern: "*", paths: ["a", "a.b", "ab", "c", "src", "test", "x"] },
@@ -769,9 +777,9 @@ fn expanded() -> List<Expanded> =
     },
   ]
 
-/// A closing `**`, where those three part ways and this dialect goes a fourth: zsh reads it as
-/// `*`, and Python, as bash's `globstar` is written to, answers the directory itself too. Here
-/// it is everything under the directory and not the directory.
+/// A closing `**`, where those three disagree and this dialect differs from all of them. Zsh reads
+/// it as `*`. Python, like bash's `globstar`, also returns the directory itself. Here it matches
+/// everything under the directory but not the directory.
 fn expanded_here() -> List<Expanded> =
   [
     {
@@ -820,8 +828,8 @@ test "`{c.pattern}` over the tree is what its row lists" for c: Expanded in expa
 
 type ErrorCase = { pattern: String, at: Int, reason: ErrorKind }
 
-/// The malformed patterns of Go's `matchTests`, each of which it reports for some text and this
-/// reader refuses for all.
+/// The malformed patterns of Go's `matchTests`. Go reports each as an error only for some paths,
+/// and this reader rejects each for all paths.
 fn go_refused() -> List<ErrorCase> =
   [
     { pattern: "[]a]", at: 0, reason: EmptyClass },
@@ -859,14 +867,14 @@ fn own_refused() -> List<ErrorCase> =
     { pattern: "a/**\\/b", at: 2, reason: Globstar },
   ]
 
-test "`{c.pattern}` is refused where it goes wrong" for c: ErrorCase in go_refused().concat(
+test "`{c.pattern}` is rejected where it goes wrong" for c: ErrorCase in go_refused().concat(
     own_refused(),
   ) {
   assert_eq(compile(c.pattern), Err({ at: c.at, reason: c.reason }));
   assert_eq(try { read(c.pattern, options()) }, Err({ at: c.at, reason: c.reason }))
 }
 
-test "the separator, case and hidden segments are the options'" {
+test "the options set the separator, case and hidden segments" {
   let windows = { ..options(), separator: '\\' };
   let g = result_glob(compile_with("src/**/*.ply", windows));
   assert(matches(g, "src\\a\\b.ply"));
@@ -879,7 +887,8 @@ test "the separator, case and hidden segments are the options'" {
   assert(!matches(folded, "src/dee.ply"));
   let cased = |pattern: String|
     result_glob(compile_with(pattern, { ..options(), ignore_case: true }));
-  // A character is lowered by itself: `U+0130` stays one, and a sigma is small wherever it stands.
+  // Each character is lower-cased on its own: `U+0130` stays one character, and a sigma lower-cases
+  // the same wherever it is.
   assert(matches(cased("?stanbul"), "\u{130}STANBUL"));
   assert(matches(cased("\u{130}*"), "\u{130}zmir"));
   assert(!matches(cased("i?stanbul"), "\u{130}stanbul"));
@@ -953,7 +962,7 @@ test "an escaped text is the pattern of that text alone" {
   assert_eq(exact(g), Some("*.{ply,md}"))
 }
 
-test "a literal's check answers the pattern, or the character it is refused at" {
+test "a literal's check returns the pattern, or the character where it is invalid" {
   assert_eq(literal("src/**/*.ply"), Ok(glob_of("src/**/*.ply")));
   assert_eq(
     literal("src/**.ply"),
@@ -965,12 +974,12 @@ test "a literal's check answers the pattern, or the character it is refused at" 
   assert_eq(literal("[a"), Err({ message: "this class has no closing `]`", offset: 0 }))
 }
 
-/// `a*a*..a*b`, the pattern a matcher that goes back and tries again takes `2^n` steps to refuse.
+/// `a*a*..a*b`, which a backtracking matcher takes `2^n` steps to reject.
 fn stars(n: Int) -> String = range(0, n).fold("", |acc: String, _: Int| acc ++ "a*") ++ "b"
 
 fn run_of(n: Int) -> String = range(0, n).fold("", |acc: String, _: Int| acc ++ "a")
 
-test "a pattern of many stars refuses a run that lacks its last character, and matches one that ends in it" {
+test "a pattern of many stars rejects a run that lacks its last character, and matches one that ends in it" {
   let g = glob_of(stars(24));
   assert(!matches(g, run_of(48)));
   assert(matches(g, run_of(48) ++ "b"))
@@ -1005,9 +1014,9 @@ test "an escaped text compiles, and matches that text and no other" {
 /// A pattern as a test draws one: the pieces a naive matcher reads directly.
 type Piece = | Exactly(Char) | Slash | Single | Many | Dirs | Rest | Ranged(Bool, Char, Char)
 
-/// Pieces from any integers, with `**` only where a whole segment may stand and no `*` beside
-/// another, which would write one. Few characters, and many of them dots, stars and slashes, so
-/// that a pattern drawn often matches a path drawn and often meets a leading dot.
+/// Pieces from any integers, with `**` only where a whole segment may be, and no two `*` side by
+/// side, which would form a `**`. The alphabet is small and heavy with dots, stars and slashes, so
+/// a drawn pattern often matches a drawn path and often meets a leading dot.
 fn pieces_of(seeds: List<Int>) -> List<Piece> =
   seeds.fold([], |pieces: List<Piece>, n: Int| {
     let last = pieces.at(pieces.len() - 1);
@@ -1050,9 +1059,9 @@ fn path_of(seeds: List<Int>) -> String =
     seeds.map(|n: Int| match n & 7 { 0 | 1 -> '/', 2 | 3 | 4 -> '.', 5 | 6 -> 'a', _ -> 'b' }),
   )
 
-/// What a pattern means, read off its pieces by trying every way to match: `fresh` is whether
-/// the path stands at a segment's start, and `led` whether the pattern stands at one of its own,
-/// which a `*` passed over is not.
+/// Whether `pieces` match `path`, found by trying every way to match. `fresh` is whether the path
+/// is at a segment's start. `led` is whether the pattern is at the start of one of its own
+/// segments, which it is not after passing over a `*`.
 fn naive(pieces: List<Piece>, path: List<Char>, fresh: Bool, led: Bool) -> Bool =
   match pieces {
     [] -> path.len() == 0,

@@ -1,28 +1,29 @@
-//! Zstandard (RFC 8878): frames read and written.
+//! Zstandard (RFC 8878): reading and writing frames.
 //!
-//! `decompress` reads what any writer of the format wrote: blocks as they are, of one byte
-//! repeated, and of literals and sequences in every mode the format has for either; a stream of
-//! several frames as the one stream they are, skippable frames among them passed; a frame's
-//! length checked where it declares one and its checksum where it ends with one; and, by
-//! `decompress_with`, frames written with a dictionary. `first` reads one frame and says where it
-//! ended.
+//! `decompress` reads the output of any writer of the format. It reads raw blocks, blocks of one
+//! repeated byte, and blocks of literals and sequences in every mode the format defines for each.
+//! It reads several frames as one stream and skips skippable frames among them. It checks a
+//! frame's length when the frame declares one, and its checksum when it ends with one.
+//! `decompress_with` reads frames written with a dictionary. `first` reads one frame and reports
+//! where it ended.
 //!
-//! Every reader takes `Limits`, and there is none without them. `output` is the most bytes it
-//! answers, and a frame that declares more is refused at its header. `window` is the most bytes
-//! of history a frame may ask the reader to keep: a frame of a few bytes can ask for gigabytes,
-//! and one that asks for more than `window` is refused at its header, before a block is read. A
-//! refusal says why and at which byte of the input; `decompress` raises it, as `zstd.refused`, and
-//! `try_decompress` answers it. Bytes after the last frame that open no other are refused.
+//! Every reader takes `Limits`; there is no reader without them. `output` is the most bytes a
+//! reader returns, and a frame that declares more is rejected at its header. `window` is the most
+//! bytes of history a frame may require the reader to keep. A frame of a few bytes can request
+//! gigabytes, so one that requests more than `window` is rejected at its header, before any block
+//! is read. An error reports why and at which byte of the input. `decompress` raises it as
+//! `zstd.fail`, and `try_decompress` returns it. Bytes after the last frame that do not start
+//! another frame are rejected.
 //!
-//! `compress` writes one frame. `Fast` looks one place back for each position, codes literals
-//! under a Huffman code and sequences under tables of each block's own, and writes about a
-//! quarter more than `zstd -1` on prose and source and about what it writes on a binary;
-//! `Stored` writes the bytes as they are. What either writes is a function of the bytes alone.
+//! `compress` writes one frame. `Fast` checks one earlier position for each position, codes
+//! literals with a Huffman code and sequences with each block's own tables, and writes output
+//! somewhat larger than `zstd -1` on prose and source code and about the same on binary data.
+//! `Stored` writes the bytes as they are. What either writes depends only on the input bytes.
 //!
-//! `decoded` and `encoded` are the two directions over a `std.seq` sequence of chunks, as
-//! `std.io`'s `chunks` gives a file: a stream is read or written in the memory of its window and
-//! a block, whatever its length, and `decoded` answers the same bytes as `decompress` however
-//! the input is cut.
+//! `decoded` and `encoded` do the same over a `std.seq` sequence of chunks, such as `std.io`'s
+//! `chunks` returns for a file. A stream of any length is read or written in the memory of its
+//! window and one block. `decoded` returns the same bytes as `decompress` however the input is
+//! split.
 
 import std.bytes (u32_le)
 import std.checksum
@@ -35,15 +36,15 @@ import std.seq
 import std.seq (seq, Seq, Done, Skip, Yield)
 import std.gen
 
-// --- Refusals ---------------------------------------------------------------
+// --- Errors -----------------------------------------------------------------
 
-/// Why a reader refused.
+/// Why a reader failed.
 pub type ErrorKind =
-  /// The bytes do not open with a frame's magic number.
+  /// The bytes do not start with a frame's magic number.
   | NotThisFormat
-  /// The stream holds, or a frame declares, more bytes than `Limits.output`.
+  /// The stream contains, or a frame declares, more bytes than `Limits.output`.
   | OverLimit
-  /// A frame asks its reader to keep more bytes of history than `Limits.window`.
+  /// A frame requires its reader to keep more bytes of history than `Limits.window`.
   | Window
   /// The input ends before the stream does.
   | Truncated
@@ -51,51 +52,50 @@ pub type ErrorKind =
   | Header
   /// A block of the type the format reserves.
   | BlockType
-  /// A block longer than a frame's blocks may be, written or unpacked.
+  /// A block longer than the frame allows, compressed or decompressed.
   | BlockSize
-  /// A literals section whose sizes disagree, whose streams do not end where they say, or that
-  /// reuses a code no block before it set.
+  /// A literals section whose sizes disagree, whose streams do not end at their stated sizes, or
+  /// that reuses a code no earlier block set.
   | Literals
-  /// Weights that are no prefix code of at most eleven bits.
+  /// Weights that do not form a prefix code of at most eleven bits.
   | Weights
-  /// A table of sequence codes that is no distribution, names a code the format has none for, or
-  /// repeats a table no block before it set.
+  /// A table of sequence codes that is not a valid distribution, names a code the format does not
+  /// define, or repeats a table no earlier block set.
   | Table
   /// A sequences section with a reserved bit set, or whose bits do not end where its sequences do.
   | Sequences
-  /// A match that reaches back before the first byte it may, or an offset of zero.
+  /// A match that reaches back before the earliest byte it may copy, or an offset of zero.
   | Offset
-  /// A frame that names a dictionary other than the one given, or bytes that are no dictionary.
+  /// A frame that names a dictionary other than the one given, or bytes that are not a dictionary.
   | Dictionary
-  /// A frame whose checksum is not its content's.
+  /// A frame whose checksum does not match its content.
   | Checksum
-  /// A frame that holds another number of bytes than its header declares.
+  /// A frame that contains a different number of bytes than its header declares.
   | Length
-  /// Bytes after a frame that open no other.
+  /// Bytes after a frame that do not start another.
   | Trailing
 
-/// A refusal, and the offset of the input byte the reader stood at.
+/// Why a reader failed, and the offset of the input byte it was at.
 pub type Error = new { at: Int, reason: ErrorKind }
 
-/// What a reader of this module raises where it refuses.
+/// The error this module's readers raise.
 pub effect zstd {
-  /// The input is not whole frames, or asks for more than the limits.
+  /// The input is not whole frames, or requires more than the limits allow.
   raise fail(e: Error)
 }
 
 fn fail<a>(at: Int, why: ErrorKind) -> a / {zstd.fail} = zstd.fail({ at: at, reason: why })
 
-/// What a reader may spend: the most bytes it answers, and the most bytes of history a frame may
-/// ask it to keep.
+/// What a reader may use: the most bytes it returns, and the most bytes of history a frame may
+/// require it to keep.
 pub type Limits = new { output: Int, window: Int }
 
 // --- Bits -------------------------------------------------------------------
 
-/// Each byte value as the one byte it is.
+/// Each byte value as a one-byte `Bytes`.
 const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_of_int))
 
-// A block is read through sixteen zero bytes before it and eight after, so eight bytes can be
-// read at any bit of it and a little before, and a stream read downward reads zeros below it.
+// Zero padding lets eight bytes be read at any bit, and lets a backward stream read past its start.
 
 fn padded(input: Bytes, from: Int, to: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([
@@ -106,14 +106,14 @@ fn padded(input: Bytes, from: Int, to: Int) -> Bytes / {abort.raise} =
 
 // --- Finite state tables ------------------------------------------------------
 
-/// A distribution as a table description spells it: each symbol's count, -1 for one of less than
-/// a cell, the bits a state is, and the byte after the description.
+/// A distribution as a table description writes it: each symbol's count (-1 for a symbol of less
+/// than one cell), the bits per state, and the byte after the description.
 type NormalizedCounts = { counts: List<Int>, log: Int, next: Int }
 
 type CountState = { counts: List<Int>, bit: Int, left: Int }
 
-/// The counts from bit `bit` until they fill the `left` cells still unclaimed. A count is read in
-/// as few bits as tell it from the ones still possible.
+/// The counts from bit `bit` until they fill the `left` cells still unclaimed. Each count is read
+/// in the fewest bits that distinguish it from the values still possible.
 fn read_counts(
   padded_block: Bytes,
   bit: Int,
@@ -135,7 +135,8 @@ fn read_counts(
     else { read_counts(padded_block, bit + used, stop, after, counts.push(value - 1), fuel - 1) }
   }
 
-/// After a count of zero, two bits say how many more follow it, and three that two more bits do.
+/// After a count of zero, two bits give how many more zeros follow; a value of three means two
+/// more such bits follow.
 fn zero_run(
   padded_block: Bytes,
   bit: Int,
@@ -151,8 +152,8 @@ fn zero_run(
     else { read_counts(padded_block, bit + 2, stop, left, filled, fuel - 1) }
   }
 
-/// The table description at byte `at` of a block that ends at `end`, of at most `max_table_log` bits a
-/// state and symbols up to `most`.
+/// The table description at byte `at` of a block that ends at `end`, with at most `max_table_log`
+/// bits per state and symbols up to `most`.
 fn read_normalized_counts(
   padded_block: Bytes,
   at: Int,
@@ -172,7 +173,7 @@ fn read_normalized_counts(
 
 type LowSymbolCells = { cells: Array<Int>, high: Int }
 
-/// A symbol of less than a cell takes one, from the table's end down.
+/// Each symbol of less than one cell takes one cell, filling from the table's end downward.
 fn place_low_symbols(
   c: Array<Int>,
   s: Int,
@@ -183,7 +184,7 @@ fn place_low_symbols(
   else if c.get(s) == -1 { place_low_symbols(c, s + 1, high - 1, cells.set(high - 1, s)) }
   else { place_low_symbols(c, s + 1, high, cells) }
 
-/// The next cell a step around the table that no low symbol holds.
+/// The next cell, one step around the table, that no low symbol occupies.
 fn next_cell(pos: Int, size: Int, high: Int, fuel: Int) -> Int = {
   let next = pos + (size >>> 1) + (size >>> 3) + 3 & size - 1;
   if next >= high && fuel > 0 { next_cell(next, size, high, fuel - 1) } else { next }
@@ -207,10 +208,10 @@ fn spread(
     spread(c, s, left - 1, next_cell(pos, size, high, size), high, cells.set(pos, s), fuel - 1)
   }
 
-/// Each cell from `i` made the state it is: its symbol's states, in the order of their cells,
-/// count upward from the symbol's count, and one reads the bits that bring it back under the
-/// table's size. A state is what `code_baselines` holds for its symbol above bit 14, the bits it reads
-/// at bit 10, and the state those bits are added to below.
+/// Each cell from `i` on, turned into its decoding state. A symbol's states, in cell order, count
+/// upward from the symbol's count, and each reads the bits that bring it back under the table's
+/// size. A state packs its symbol's `code_baselines` entry above bit 14, the number of bits it
+/// reads at bit 10, and the base those bits are added to below.
 fn states(
   cells: Array<Int>,
   i: Int,
@@ -360,8 +361,7 @@ const fn offset_codes() -> Array<Int> =
 /// A symbol as itself, for a table of weights.
 const fn plain_codes() -> Array<Int> = Array::of_list(range(0, 256))
 
-// The three tables of sequence codes stand in one array: literal lengths from 0, match lengths
-// from 512 and offsets from 1024, so a state is its index there.
+// One array holds all three code tables, at 0, 512 and 1024, so a state is its index in it.
 
 /// Where the table of a kind starts: 0 is literal lengths, 1 offsets, 2 match lengths, the order
 /// a block describes them in.
@@ -509,8 +509,8 @@ const fn predefined() -> Array<Int> = {
 
 type TableUpdate = { tables: Array<Int>, log: Int, next: Int }
 
-/// One of a block's three tables, set as its mode says: the predefined one, one symbol alone, one
-/// described at byte `at`, or the table the block before left.
+/// One of a block's three tables, set as its mode directs: the predefined table, a single symbol,
+/// a table described at byte `at`, or the previous block's table.
 fn read_table(
   padded_block: Bytes,
   at: Int,
@@ -554,8 +554,8 @@ fn read_table(
 
 // --- Literals ---------------------------------------------------------------
 
-/// A prefix code as a reader looks one up: indexed by the next `bits` bits, most significant
-/// first, each entry a symbol over the bits its code takes, `symbol << 4 | length`.
+/// A prefix code as a lookup table, indexed by the next `bits` bits, most significant first. Each
+/// entry packs a symbol and its code's length as `symbol << 4 | length`.
 type Code = { table: Array<Int>, bits: Int }
 
 /// `n` cells of `table` from `at` set to `entry`.
@@ -579,8 +579,8 @@ fn ranked(
     ranked(weights, w, s + 1, pos + span, bits, run(table, pos, s << 4 | bits + 1 - w, span))
   }
 
-/// The code of a list of weights, one a symbol from symbol 0, and the last symbol's, which is
-/// what makes the cells a power of two.
+/// The code of a list of weights, one per symbol from symbol 0. The last symbol's weight is
+/// implied: it is the one that makes the cells total a power of two.
 fn code_of(weights: List<Int>, where: Int) -> Code / {zstd.fail, abort.raise} = {
   let sum = weights.fold(0, |total: Int, w: Int|
     if w > 0 && w <= 12 { total + (1 << w - 1) } else if w == 0 { total } else { total + 8192 });
@@ -602,8 +602,8 @@ fn bits_below(padded_block: Bytes, floor: Int, top: Int, n: Int) -> Int / {abort
   else if top <= floor { 0 }
   else { padded_block.bits_at(floor, top - floor) << n - (top - floor) }
 
-/// Weights coded by two states that take turns down one stream: each gives its symbol and reads
-/// its bits, and when one reads past the stream's start the other gives its last.
+/// Weights decoded by two states that take turns reading one stream backward. Each emits its
+/// symbol and reads its bits. When one reads past the stream's start, the other emits its last.
 fn decode_weights(
   padded_block: Bytes,
   floor: Int,
@@ -705,7 +705,7 @@ fn symbols(
   }
 
 /// The `count` symbols of the stream in bytes `from` to `to`, after `out`. A stream's last byte
-/// holds a set bit above its last bit.
+/// has a set bit above its last bit.
 fn stream(
   padded_block: Bytes,
   from: Int,
@@ -729,8 +729,8 @@ fn stream(
     )
   }
 
-/// Four streams one after another, their sizes in six bytes before them: the first three hold a
-/// quarter of the symbols each, rounded up, and the last the rest.
+/// Four streams one after another, their sizes in six bytes before them. The first three contain
+/// a quarter of the symbols each, rounded up, and the last contains the rest.
 fn four_streams(
   padded_block: Bytes,
   from: Int,
@@ -755,8 +755,9 @@ fn four_streams(
 /// A block's literals, the byte after their section, and the code the next block may reuse.
 type LiteralsSection = { bytes: Bytes, next: Int, code: Code }
 
-/// The literals section at byte `at` of a block that ends at `end`: the bytes as they are, one
-/// byte repeated, or coded, by a code described there or by `before`. None is longer than `most`.
+/// The literals section at byte `at` of a block that ends at `end`: raw bytes, one repeated byte,
+/// or Huffman-coded bytes, using a code described there or `before`. Fails if the literals are
+/// longer than `most`.
 fn literals(
   padded_block: Bytes,
   at: Int,
@@ -804,16 +805,16 @@ fn literals(
 /// What a block's sequences leave: the bytes written and the three offsets last used.
 type SequenceState = { out: Bytes, repeat1: Int, repeat2: Int, repeat3: Int }
 
-// What a block may not pass, in an array a sequence reads: 0 the length its output may reach, 1
-// the first byte of history a match may copy, 2 the frame's window, 3 where the frame's own
-// bytes start, 4 the input offset a refusal names, and 5 whether passing 0 is the limit's doing.
+// A block's limits, in an array each sequence reads: 0 the most output, 1 the earliest history
+// byte a match may copy, 2 the frame's window, 3 where the frame's own bytes start, 4 the input
+// offset an error reports, and 5 whether limit 0 is the output limit (1) or the block size (0).
 
 fn overflow_reason(bounds: Array<Int>) -> ErrorKind / {abort.raise} =
   if bounds.get(5) == 1 { OverLimit } else { BlockSize }
 
 /// One sequence read from below bit `bit`: the extra bits of its offset, match length and literal
-/// length, and then, but for the block's last, the bits that move each state on. All of them are
-/// read at once where they fit a word.
+/// length, then, except for the block's last sequence, the bits that advance each state. When all
+/// of these fit in a word they are read at once.
 fn sequence(
   padded_block: Bytes,
   floor: Int,
@@ -880,9 +881,10 @@ fn sequence(
     }
   }
 
-/// A sequence written: its literals, then its match. `states` is the three states to go on from,
-/// sixteen bits each; `offset` the offset's value, where 1 to 3 name an offset used before; and
-/// `lengths` the match length over the literal length, twenty bits below it.
+/// Executes a sequence: writes its literals, then its match. `states` packs the three next
+/// states, sixteen bits each. `offset` is the offset's value, where 1 to 3 refer to a recent
+/// offset. `lengths` packs the match length above the literal length, which takes the low twenty
+/// bits.
 fn execute_sequence(
   padded_block: Bytes,
   floor: Int,
@@ -899,7 +901,7 @@ fn execute_sequence(
 ) -> SequenceState / {zstd.fail, abort.raise} = {
   let count = lengths & 0xF_FFFF;
   let length = lengths >>> 20;
-  // Which earlier offset: none, the first, second or third, or the first less one.
+  // Which recent offset: none (0), the first, second or third, or the first minus one (4).
   let labelled = if offset > 3 { 0 } else if count == 0 { offset + 1 } else { offset };
   let dist = if labelled == 0 { offset - 3 }
   else if labelled == 1 { run.repeat1 }
@@ -939,7 +941,8 @@ fn execute_sequence(
   }
 }
 
-/// After a block's last sequence its bits are spent, and the literals no sequence took follow.
+/// After a block's last sequence, checks that its bits are used up and appends the literals no
+/// sequence used.
 fn finish_sequences(
   floor: Int,
   bit: Int,
@@ -955,9 +958,9 @@ fn finish_sequences(
 
 // --- Blocks -----------------------------------------------------------------
 
-/// What one block leaves the next of its frame: the three tables of sequence codes and the bits a
-/// state of each is, below zero for a table no block has set; the literals' code; and the three
-/// offsets last used.
+/// What one block passes to the next in its frame: the three tables of sequence codes and the
+/// bits per state of each (below zero for a table no block has set), the literals' code, and the
+/// three offsets last used.
 type Entropy = {
   tables: Array<Int>,
   literal_length_log: Int,
@@ -1083,15 +1086,15 @@ fn compressed_block(
 
 // --- Dictionaries -----------------------------------------------------------
 
-/// A dictionary: bytes a frame's matches may reach before its own, and where it is more than
-/// those bytes, the number a frame names it by and the tables its first block may reuse.
+/// A dictionary: bytes that a frame's matches may reach before the frame's own. A trained
+/// dictionary also has the id a frame refers to it by, and tables the first block may reuse.
 pub opaque type Dictionary = new { id: Int, content: Bytes, entropy: Entropy }
 
 /// No dictionary.
 const fn no_dictionary() -> Dictionary = { id: 0, content: b"", entropy: initial_entropy() }
 
-/// The dictionary `bytes` are: one `zstd --train` made, which opens with its own magic number, or
-/// any other bytes, which are content alone.
+/// The dictionary in `bytes`: one made by `zstd --train`, which starts with its own magic number,
+/// or any other bytes, used as plain content.
 pub fn dictionary(bytes: Bytes) -> Dictionary / {zstd.fail, abort.raise} = {
   let n = bytes.len();
   if n < 8 || bytes.slice(0, 4) != b"\x37\xA4\x30\xEC" {
@@ -1162,30 +1165,30 @@ pub fn dictionary(bytes: Bytes) -> Dictionary / {zstd.fail, abort.raise} = {
 
 // --- Frames -----------------------------------------------------------------
 
-/// A frame being read: the history it may ask for, where in the history its own bytes start, how
-/// many bytes before them a match may still reach, the sum of its bytes where it ends with one,
-/// and the length it declares, or -1.
+/// A frame being read: the history it may require, where in the history its own bytes start, how
+/// many bytes before them a match may still reach, its running checksum if it ends with one, and
+/// the length it declares, or -1.
 type Frame = { window: Int, origin: Int, reach: Int, sum: Option<checksum::State>, content: Int }
 
-/// Everything of a reader but its two buffers.
+/// A reader's state, except its two buffers.
 type DecoderState = {
   limits: Limits,
   dictionary: Dictionary,
   /// The next byte of `input` to read, and the stream offset of its first.
   at: Int,
   base: Int,
-  /// The history up to here has been answered.
+  /// The history up to here has been returned.
   sent: Int,
-  /// Bytes answered before a frame that starts its history over.
+  /// Bytes ready to return from before a frame that starts its history over.
   ready: List<Bytes>,
-  /// The bytes the frames before this one held, and how many frames there were.
+  /// How many bytes the earlier frames contained, and how many frames there were.
   made: Int,
   frames: Int,
   /// 0 between frames, 1 among a frame's blocks, 2 before its checksum, 3 in a skippable frame.
   phase: Int,
-  /// The bytes of a skippable frame still to pass.
+  /// The bytes of a skippable frame still to skip.
   skip: Int,
-  /// How many bytes from `at` the reader needs before it can go on, or 0.
+  /// How many bytes from `at` the reader needs before it can continue, or 0.
   need: Int,
   /// Whether a frame has ended since this was last cleared.
   closed: Bool,
@@ -1193,8 +1196,8 @@ type DecoderState = {
   entropy: Entropy,
 }
 
-/// A reader part of the way through a stream: the input not yet read, the bytes written that a
-/// match may still copy or that are not yet answered, and the rest.
+/// A reader partway through a stream: the input not yet read, the output a match may still copy
+/// or that is not yet returned, and the rest of its state.
 type Decoder = { input: Bytes, history: Bytes, core: DecoderState }
 
 fn decoder(limits: Limits, d: Dictionary, input: Bytes) -> Decoder =
@@ -1221,8 +1224,8 @@ fn decoder(limits: Limits, d: Dictionary, input: Bytes) -> Decoder =
 
 fn needing_input(d: Decoder, need: Int) -> Decoder = { ..d, core: { ..d.core, need: need } }
 
-/// A frame's header at `at`: its magic, a byte of flags, and as the flags say a window, the
-/// number of a dictionary and the length of the content.
+/// A frame's header at `at`: its magic number, a byte of flags, and, as the flags direct, a
+/// window, a dictionary id and the content length.
 fn read_frame_header(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1283,7 +1286,8 @@ fn read_frame_header(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise
   }
 }
 
-/// What stands between frames: the magic of a frame, or of a skippable one and its length.
+/// What comes between frames: a frame's magic number, or a skippable frame's magic number and
+/// length.
 fn between_frames(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise} =
   if have < 4 { needing_input(d, 4) } else {
     let core = d.core;
@@ -1306,7 +1310,7 @@ fn between_frames(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise} =
     } else { fail(core.base + core.at, if core.frames == 0 { NotThisFormat } else { Trailing }) }
   }
 
-/// A skippable frame's bytes are passed as they come.
+/// Skips a skippable frame's bytes as they arrive.
 fn skip_frame_bytes(d: Decoder, have: Int) -> Decoder = {
   let core = d.core;
   let pass = min(have, core.skip);
@@ -1318,7 +1322,8 @@ fn skip_frame_bytes(d: Decoder, have: Int) -> Decoder = {
   } else { { ..d, core: { ..core, at: core.at + pass, skip: core.skip - pass, need: 1 } } }
 }
 
-/// A frame ended: it held what it declared, and the bytes after it are another's.
+/// Ends a frame after checking it contained the length it declared, so the bytes after it belong
+/// to another.
 fn end_frame(d: Decoder) -> Decoder / {zstd.fail} = {
   let core = d.core;
   let pending_bits = d.history.len() - core.frame.origin;
@@ -1352,8 +1357,8 @@ fn read_checksum(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise} =
     else { end_frame({ ..d, core: { ..core, at: core.at + 4 } }) }
   }
 
-/// One block: three bytes that say whether it is the frame's last, its type and its size, then
-/// the bytes as they are, one byte to repeat, or literals and sequences.
+/// One block: three bytes that give whether it is the frame's last, its type and its size, then
+/// raw bytes, one byte to repeat, or literals and sequences.
 fn block(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise} =
   if have < 3 { needing_input(d, 3) } else {
     let core = d.core;
@@ -1416,8 +1421,8 @@ fn block(d: Decoder, have: Int) -> Decoder / {zstd.fail, abort.raise} =
     }
   }
 
-/// One step of a reader: a header, a block, a checksum, or what of a skippable frame the input
-/// holds. A reader that needs more input than it has says how much in `need`.
+/// One step of a reader: a header, a block, a checksum, or the part of a skippable frame the input
+/// contains. A reader that needs more input than it has records how much in `need`.
 fn step(d: Decoder) -> Decoder / {zstd.fail, abort.raise} = {
   let phase = d.core.phase;
   let have = d.input.len() - d.core.at;
@@ -1427,17 +1432,19 @@ fn step(d: Decoder) -> Decoder / {zstd.fail, abort.raise} = {
   else { skip_frame_bytes(d, have) }
 }
 
-/// Steps until the reader needs input, or `stop` says to.
+/// Steps until the reader needs input, has `goal` bytes ready to return, or, when `one` is set,
+/// has finished a frame.
 fn pump(d: Decoder, goal: Int, one: Bool, fuel: Int) -> Decoder / {zstd.fail, abort.raise} =
   if fuel <= 0 || d.core.need > 0 || (one && d.core.closed)
       || d.history.len() - d.core.sent >= goal { d }
   else { pump(step(d), goal, one, fuel - 1) }
 
-/// The reader as it must stand where its input ends: between frames, with one read.
+/// Checks the reader's state where its input ends: it must be between frames, with at least one
+/// frame read.
 fn check_end(d: Decoder) -> Decoder / {zstd.fail, abort.raise} = {
   let at = d.core.at;
   let left = d.input.slice(at, d.input.len());
-  // What is left opens a frame as far as it goes: a magic number, or the start of one.
+  // Whether the leftover bytes could begin a frame: a prefix of either magic number.
   let start = left.slice(0, min(4, left.len()));
   let opens = b"\x28\xB5\x2F\xFD".starts_with(start)
     || (start.len() > 0 && start.at(0) & 0xF0 == 0x50
@@ -1449,11 +1456,11 @@ fn check_end(d: Decoder) -> Decoder / {zstd.fail, abort.raise} = {
   } else { d }
 }
 
-/// The bytes written and not yet answered.
+/// The bytes written and not yet returned.
 fn pending(d: Decoder) -> Bytes / {abort.raise} =
   Bytes::concat_all(d.core.ready.push(d.history.slice(d.core.sent, d.history.len())))
 
-/// The bytes a stream of frames holds, which are `limits.output` at most.
+/// The bytes a stream of frames contains, at most `limits.output` of them.
 pub fn decompress(data: Bytes, limits: Limits) -> Bytes / {zstd.fail, abort.raise} =
   decompress_with(data, no_dictionary(), limits)
 
@@ -1469,12 +1476,11 @@ pub fn decompress_with(
   pending(end)
 }
 
-/// `decompress`, with a refusal answered rather than raised.
+/// `decompress`, returning an error rather than raising it.
 pub fn try_decompress(data: Bytes, limits: Limits) -> Result<Bytes, Error> / {abort.raise} =
   try { decompress(data, limits) }
 
-/// A stream's first frame, and how many bytes of the input it and the skippable frames before it
-/// took.
+/// A stream's first frame, and how many input bytes it and any skippable frames before it used.
 pub type FirstFrame = new { plain: Bytes, used: Int }
 
 /// The first frame of `data`, whatever follows it.
@@ -1491,7 +1497,7 @@ pub fn first(data: Bytes, limits: Limits) -> FirstFrame / {zstd.fail, abort.rais
 
 // --- A stream a chunk at a time -----------------------------------------------
 
-/// The reader with `chunk` after the input it has not read.
+/// The reader with `chunk` appended to its unread input.
 fn feed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
   let core = d.core;
   {
@@ -1503,10 +1509,10 @@ fn feed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
 
 type DecoderOutput = { out: Bytes, next: Decoder }
 
-/// What the reader has written and not yet answered, and the reader without the history no match
-/// can reach: among a frame's blocks a match reaches the frame's window, or the frame's first
-/// byte and the dictionary before it while the frame is shorter than its window, and between
-/// frames nothing.
+/// What the reader has written and not yet returned, and the reader without the history no match
+/// can reach. Among a frame's blocks, a match reaches back the frame's window, or to the frame's
+/// first byte and the dictionary before it while the frame is shorter than its window. Between
+/// frames, a match reaches nothing.
 fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   let core = d.core;
   let frame = core.frame;
@@ -1533,8 +1539,8 @@ fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   } else { { out: out, next: { ..d, core: { ..core, sent: n, ready: [] } } } }
 }
 
-/// How many bytes a reader writes before it answers them: a sixteenth of a megabyte, or an
-/// eighth of the frame's window where that is more.
+/// How many bytes a reader writes before it returns them: a sixteenth of a megabyte, or an eighth
+/// of the frame's window if that is more.
 fn stride(d: Decoder) -> Int = max(65536, d.core.frame.window >>> 3)
 
 fn decode_chunks<| e>(
@@ -1560,12 +1566,12 @@ fn decode_chunks<| e>(
       }
     }
 
-/// What the chunks of a stream of frames unpack to, a chunk for each pull that has bytes to
-/// answer. A pull reads at most one chunk of `packed` and unpacks until it has a stride of bytes,
-/// a sixteenth of a megabyte or an eighth of the frame's window, or needs the next chunk, so the
-/// reader holds one chunk of input, one block, and of what it has written no more than a frame's
-/// window and a quarter again, a stride and a block. The sequence refuses where `decompress`
-/// would, at the same offset, and where `packed` ends before the stream does.
+/// The decompressed chunks of a stream of frames, one chunk for each pull that has bytes to
+/// return. A pull reads at most one chunk of `packed`, and decompresses until it has a stride of
+/// bytes (a sixteenth of a megabyte, or an eighth of the frame's window) or needs the next chunk.
+/// So the reader keeps one chunk of input, one block, and at most a frame's window and a quarter
+/// more, a stride and a block of its output. The sequence fails where `decompress` would, at the
+/// same offset, and when `packed` ends before the stream does.
 pub fn decoded<| e>(
   packed: Seq<Bytes | e>,
   limits: Limits,
@@ -1580,20 +1586,20 @@ pub fn decoded_with<| e>(
 ) -> Seq<Bytes | {zstd.fail, abort.raise | e}> =
   decode_chunks(packed, decoder(limits, d, b""), 0x3FFF_FFFF_FFFF_FFFF)
 
-/// A reader part of the way through a stream of frames: `read` feeds it and `ended` says whether
-/// the stream may end where it stands. It holds of its input what a header or a block left unread,
-/// and of what it wrote a frame's window.
+/// A reader partway through a stream of frames. `read` feeds it, and `ended` reports whether the
+/// stream may end at its current position. It keeps the input a header or block left unread, and
+/// a frame's window of its output.
 pub opaque type Reader = | Reader(Decoder)
 
-/// What a reader answers: the bytes it wrote, and the reader after them.
+/// What a read returns: the bytes written, and the reader after them.
 pub type ReadResult = { out: Bytes, next: Reader }
 
 /// A reader of a stream of frames under `limits`.
 pub fn reader(limits: Limits) -> Reader = Reader(decoder(limits, no_dictionary(), b""))
 
-/// `chunk` read after what the reader holds: every byte it then completes. Refused (`zstd.refused`)
-/// where `decompress` would refuse the stream, but for its ending early: a stream may end where
-/// `ended` says.
+/// Feeds `chunk` to the reader after its buffered input, and returns every byte it can then
+/// complete. Raises `zstd.fail` where `decompress` would fail on the stream, except for ending
+/// early: `ended` reports whether the stream may end.
 pub fn read(r: Reader, chunk: Bytes) -> ReadResult / {zstd.fail, abort.raise} =
   match r {
     Reader(d) -> {
@@ -1608,17 +1614,16 @@ pub fn read(r: Reader, chunk: Bytes) -> ReadResult / {zstd.fail, abort.raise} =
     },
   }
 
-/// Whether the stream may end where the reader stands: between frames, one read at least, and
-/// nothing of another held.
+/// Whether the stream may end at the reader's position: between frames, with at least one frame
+/// read and no part of another buffered.
 pub fn ended(r: Reader) -> Bool =
   match r { Reader(d) -> d.core.phase == 0 && d.core.frames > 0 && d.core.at >= d.input.len() }
 
 // --- Writing: bits ------------------------------------------------------------
 
-// A stream that is read downward is written upward: bits wait in an `Int`, the next to write
-// above the `n` already there, and leave it a byte at a time from the lowest.
+// A stream read backward is written forward: bits collect in an `Int` and leave it lowest first.
 
-/// A stream ended: a set bit above its last, and the bytes that hold what is left.
+/// Ends a stream: adds a set bit above its last bit, and flushes the remaining bits as bytes.
 fn end_bit_stream(out: Bytes, acc: Int, n: Int) -> Bytes / {abort.raise} = {
   let all = acc | 1 << n;
   let whole = flush_bits(out, all, n + 1);
@@ -1627,12 +1632,12 @@ fn end_bit_stream(out: Bytes, acc: Int, n: Int) -> Bytes / {abort.raise} = {
 
 // --- Writing: finite state tables -----------------------------------------------
 
-/// A distribution as a writer codes by it: the bits a state is; the state each cell leads to, the
-/// cells in the order of their symbols; and for each symbol what a state adds to learn how many
-/// bits it writes, above bit 16, and what the rest of it adds to find its cell.
+/// A distribution as a writer's coding tables: the bits per state; the state each cell leads to,
+/// with cells in symbol order; and for each symbol, the value a state adds to find how many bits
+/// it writes (above bit 16), and the value added to find its cell.
 type Coder = { log: Int, states: Array<Int>, widths: Array<Int>, state_deltas: Array<Int> }
 
-/// Each cell from `u` on files its state under its symbol's next place.
+/// Each cell from `u` on stores its state at its symbol's next slot.
 fn encoding_states(
   cells: Array<Int>,
   u: Int,
@@ -1647,7 +1652,7 @@ fn encoding_states(
 
 type CoderTables = { starts: List<Int>, widths: List<Int>, state_deltas: List<Int>, total: Int }
 
-/// The writer's tables of a distribution, laid over the same cells a reader's are.
+/// The writer's tables for a distribution, built over the same cells as the reader's.
 fn coder(counts: List<Int>, log: Int) -> Coder / {abort.raise} = {
   let c = Array::of_list(counts);
   let size = 1 << log;
@@ -1684,9 +1689,9 @@ fn initial_state(c: Coder, symbol: Int) -> Int / {abort.raise} = {
   c.states.get(((n << 16) - width >>> n) + c.state_deltas.get(symbol))
 }
 
-/// A distribution's description, as `read_normalized_counts` reads one: four bits for the bits a state is past
-/// five, then each count in as few bits as tell it from the ones still possible, and after a
-/// zero how many more follow, two bits at a time.
+/// A distribution's description, as `read_normalized_counts` reads one: four bits for the bits per
+/// state minus five, then each count in the fewest bits that distinguish it from the values still
+/// possible, and after a zero, how many more zeros follow, two bits at a time.
 fn counts_written(
   counts: Array<Int>,
   s: Int,
@@ -1742,8 +1747,8 @@ fn zeros_from(counts: Array<Int>, s: Int, n: Int) -> Int / {abort.raise} =
 
 // --- Writing: literals --------------------------------------------------------
 
-/// Each symbol's code over its length, `code << 4 | length`, as a reader's table has them: the
-/// symbols of each weight in turn from the least take the lowest codes.
+/// Each symbol's code and length, packed as `code << 4 | length`, matching the reader's table. The
+/// symbols of each weight in turn, from the least, take the lowest codes.
 fn huffman_codes(
   weights: Array<Int>,
   w: Int,
@@ -1811,8 +1816,8 @@ fn symbols_written(
     )
   } else { end_bit_stream(out, acc, n) }
 
-/// Weights coded as `decode_weights` reads them: two states take turns up the list, the last weight of
-/// each turn starting its state, and both are written out at the end.
+/// Weights coded as `decode_weights` reads them. Two states, started from the last two weights,
+/// take turns moving up the list, and both states are written at the end.
 fn weights_coded(
   weights: Array<Int>,
   i: Int,
@@ -1849,8 +1854,8 @@ fn weights_coded(
   }
 
 /// How many of a table's `1 << log` cells each symbol takes, by how often it occurs among
-/// `total`: its share and one at least, the commonest taking or giving up what that leaves
-/// over. Empty where it would be left no cell, or every one.
+/// `total`. Each symbol gets its share, and at least one, and the most common symbol takes or gives
+/// up the remainder. Empty if that would leave the most common symbol no cells, or all of them.
 fn normalize_counts(counts: Array<Int>, total: Int, log: Int) -> List<Int> / {abort.raise} = {
   let size = 1 << log;
   let rough = counts.to_list().map(|count: Int|
@@ -1864,8 +1869,9 @@ fn normalize_counts(counts: Array<Int>, total: Int, log: Int) -> List<Int> / {ab
   }
 }
 
-/// A code's description: a byte and the weights four bits each where they are 128 at most, or
-/// their own distribution and they coded by it. Empty where neither can say them.
+/// A code's description: a header byte and the weights at four bits each, when there are at most
+/// 128. Otherwise a distribution of the weights, and the weights coded with it. Empty when neither
+/// form can describe them.
 fn tree_written(weights: List<Int>) -> Bytes / {abort.raise} = {
   let n = weights.len();
   if n <= 128 {
@@ -1882,7 +1888,7 @@ fn tree_written(weights: List<Int>) -> Bytes / {abort.raise} = {
         let c = coder(normalized, 6);
         let all = Array::of_list(weights);
         let head = counts_written(Array::of_list(normalized), 0, 64, b"", 1, 4, 64);
-        // The last weight starts the state its place falls to, and the one before it the other.
+        // The last two weights set the two starting states.
         let a = initial_state(c, all.get(n - 1));
         let b = initial_state(c, all.get(n - 2));
         let body = weights_coded(all, n - 3, c, a, b, head, 0, 0);
@@ -1903,8 +1909,8 @@ fn literals_header(kind: Int, count: Int, packed: Int, streams: Int) -> Bytes / 
   else if count < 16384 && packed < 16384 { u32_le(packed << 18 | count << 4 | 8 | kind) }
   else { u32_le(packed << 22 | count << 4 | 12 | kind).concat(byte_of_int(packed >>> 10 & 255)) }
 
-/// A block's literals as a section: under a Huffman code where that is shorter, one byte where
-/// they are all the same, and otherwise as they are.
+/// A block's literals as a section: Huffman-coded when that is shorter, one byte when they are
+/// all the same, and raw otherwise.
 fn literals_written(lits: Bytes) -> Bytes / {abort.raise} = {
   let n = lits.len();
   let plain = literals_header(0, n, 0, 1).concat(lits);
@@ -1953,7 +1959,7 @@ const fn short_lengths() -> Bytes = codes_below(length_codes(), 0, 64)
 /// The code of each match length below 131.
 const fn short_matches() -> Bytes = codes_below(match_codes(), 3, 128)
 
-/// The three distributions a block's sequences are written by.
+/// The three distributions a block's sequences are written with.
 type Coders = { lengths: Coder, matches: Coder, offsets: Coder }
 
 /// The predefined three.
@@ -2064,8 +2070,7 @@ const fn default_coders() -> Coders =
     ),
   }
 
-// A sequence is one `Int`: its literal length, its match length less three above bit 20, and its
-// offset's value above bit 40.
+// A sequence packs its literal length, its match length minus three at bit 20, and offset at 40.
 
 /// A sequence's three codes: its literal length's, its match length's above bit 8, and its
 /// offset's above bit 16.
@@ -2101,19 +2106,19 @@ fn tallied(
     )
   }
 
-/// The most bits `c` takes to write the symbols `counts` count.
+/// An upper bound on the bits `c` needs to write the symbols `counts` tallies.
 fn bits_under(counts: Array<Int>, c: Coder) -> Int / {abort.raise} =
   range(0, counts.len()).fold(0, |bits: Int, s: Int|
     bits + counts.get(s) * ((c.widths.get(s) >>> 16) + 1))
 
-/// The table one kind of code is written by in a block: what a section's second byte calls it,
-/// 0 for the predefined distribution and 2 for one of the block's own; that one's description;
-/// and the writer's tables.
+/// The table one kind of code is written with in a block: its mode in the section's second byte
+/// (0 for the predefined distribution, 2 for the block's own), the description of the block's
+/// own, and the writer's tables.
 type TableChoice = { mode: Int, head: Bytes, coder: Coder }
 
-/// The block's own distribution of the codes `counts` count, `total` in all, in a table of
-/// `most` bits at most, where describing it and writing by it takes fewer bits than writing by
-/// the predefined one, `usual`.
+/// The block's own distribution of the codes `counts` tallies, `total` in all, in a table of at
+/// most `most` bits, when describing and writing with it takes fewer bits than writing with the
+/// predefined one, `usual`.
 fn choose_table(
   counts: Array<Int>,
   total: Int,
@@ -2141,8 +2146,8 @@ fn choose_table(
   }
 }
 
-/// The sequences from `i` down to the first, each moving the three states and then writing its
-/// extra bits, so that the first sequence's are read first.
+/// The sequences from `i` down to the first, each advancing the three states and then writing its
+/// extra bits, so that the first sequence's bits are read first.
 fn sequences_written(
   seqs: Array<Int>,
   i: Int,
@@ -2200,9 +2205,9 @@ fn sequences_written(
     )
   }
 
-/// A sequences section: how many there are, a byte that says which table each kind of code is
-/// written by, the description of each that is the block's own, and the sequences. The last
-/// sequence starts the states and writes its extra bits first.
+/// A sequences section: the count, a byte that states which table each kind of code uses, the
+/// description of each table that is the block's own, and the sequences. The last sequence sets
+/// the starting states and writes its extra bits first.
 fn sequences_section(seqs: Array<Int>) -> Bytes / {abort.raise} = {
   let count = seqs.len();
   if count == 0 { b"\x00" } else {
@@ -2253,7 +2258,7 @@ fn sequences_section(seqs: Array<Int>) -> Bytes / {abort.raise} = {
 
 // --- Writing: matches ---------------------------------------------------------
 
-/// The three offsets a reader will hold, and the sequences as it reads them.
+/// The three recent offsets a reader will track, and the sequences as it reads them.
 type CodedSequences = {
   out: List<Int>,
   lits: List<Bytes>,
@@ -2263,8 +2268,8 @@ type CodedSequences = {
   repeat3: Int,
 }
 
-/// A match's distance as the value a sequence carries: 1 to 3 for one of the last three used,
-/// counted from the second where no literal stands before the match, and three more than itself
+/// A match's distance as the value a sequence encodes: 1 to 3 for one of the last three offsets
+/// used, counted from the second when no literal precedes the match, and the distance plus three
 /// for any other.
 fn code_sequence(buf: Bytes, t: CodedSequences, seq: Int) -> CodedSequences / {abort.raise} = {
   let count = seq & 0xF_FFFF;
@@ -2290,17 +2295,17 @@ fn code_sequence(buf: Bytes, t: CodedSequences, seq: Int) -> CodedSequences / {a
   }
 }
 
-/// How hard a writer looks for what repeats.
+/// How hard a writer searches for repeated bytes.
 pub type Level =
-  /// Not at all: the bytes as they are, in blocks. A frame is its input and a few bytes more.
+  /// No search: the raw bytes, in blocks. A frame is its input plus a few bytes.
   | Stored
-  /// One place a position: where the next four bytes last stood, within 2 MiB, and the distance
-  /// of the match before. Literals go under a Huffman code, and each kind of a block's sequence
-  /// codes under a table of the block's own where that is shorter than the predefined one.
+  /// One candidate per position: where the next four bytes last appeared, within 2 MiB, and the
+  /// previous match's distance. Literals are Huffman-coded, and each kind of sequence code uses
+  /// the block's own table when that is shorter than the predefined one.
   | Fast
 
-/// What a writer carries from block to block: where bytes of four last stood, and the three
-/// offsets a reader holds.
+/// What a writer carries from block to block: where each four-byte string last appeared, and the
+/// three recent offsets a reader tracks.
 type MatchState = { table: Array<Int>, repeat1: Int, repeat2: Int, repeat3: Int }
 
 type EncodedBlock = { bytes: Bytes, packer: MatchState }
@@ -2312,7 +2317,7 @@ fn block_header(last: Bool, kind: Int, size: Int) -> Bytes / {abort.raise} =
   u32_le(size << 3 | kind << 1 | (if last { 1 } else { 0 })).slice(0, 3)
 
 /// The block of `buf` from `from` to `to`, which are 128 KiB apart at most: literals and
-/// sequences where those are shorter than the bytes, and the bytes otherwise.
+/// sequences when those are shorter than the raw bytes, and the raw bytes otherwise.
 fn block_written(
   buf: Bytes,
   from: Int,
@@ -2361,7 +2366,8 @@ fn block_written(
   }
 }
 
-/// The blocks of `buf` from `from` to `to`, the last marked so where `last` is set.
+/// The blocks of `buf` from `from` to `to`, with the last marked as the frame's last when `last`
+/// is set.
 fn blocks_written(
   buf: Bytes,
   from: Int,
@@ -2381,8 +2387,8 @@ fn blocks_written(
     blocks_written(buf, from + 131072, to, shift, last, level, one.packer, grown)
   }
 
-/// `data` as one frame, which says how long it is and ends with a checksum. The frame's window is
-/// the data where that is 2 MiB at most, and 2 MiB otherwise.
+/// `data` as one frame, which declares its length and ends with a checksum. The frame's window is
+/// the data's length when that is at most 2 MiB, and 2 MiB otherwise.
 pub fn compress(data: Bytes, level: Level) -> Bytes / {abort.raise} = {
   let n = data.len();
   let head = if n < 256 { b"\x28\xB5\x2F\xFD\x24".concat(byte_of_int(n)) }
@@ -2397,16 +2403,15 @@ pub fn compress(data: Bytes, level: Level) -> Bytes / {abort.raise} = {
 
 // --- Writing a chunk at a time ------------------------------------------------
 
-/// A writer part of the way through a frame: the bytes a match may reach and after them, from
-/// `from`, the ones no block holds yet; the stream offset of the first of them; the sum of every
-/// byte so far; and what one block leaves the next.
+/// A writer partway through a frame: the bytes a match may reach, followed from `from` by the
+/// bytes no block contains yet; the stream offset of the first byte; the running checksum of
+/// every byte so far; and what one block passes to the next.
 type Encoder = { buf: Bytes, from: Int, shift: Int, sum: checksum::State, packer: MatchState }
 
 type EncoderOutput = { out: Bytes, next: Encoder }
 
-/// The writer with `chunk` taken in, and every whole block it then holds written. It keeps the
-/// 2 MiB before the bytes not yet written, and lets go of what is older once that is as much
-/// again.
+/// The writer with `chunk` added, and every whole block it then has, written out. It keeps the
+/// 2 MiB before the unwritten bytes, and drops older bytes once they reach another 2 MiB.
 fn encode_chunk(w: Encoder, chunk: Bytes, level: Level) -> EncoderOutput / {abort.raise} = {
   let sum = checksum::update(w.sum, chunk);
   let buf = w.buf.concat(chunk);
@@ -2428,14 +2433,14 @@ fn encode_chunk(w: Encoder, chunk: Bytes, level: Level) -> EncoderOutput / {abor
   }
 }
 
-/// What ends a frame: the bytes no block holds yet, in blocks of which the last says so, and the
-/// low half of the sum.
+/// What ends a frame: the bytes no block contains yet, in blocks with the last marked as last,
+/// and the low half of the checksum.
 fn final_blocks(w: Encoder, level: Level) -> Bytes / {abort.raise} = {
   let done = blocks_written(w.buf, w.from, w.buf.len(), w.shift, true, level, w.packer, []);
   Bytes::concat_all(done.out.push(u32_le(Int::of_u64(checksum::finish(w.sum) & 0xFFFF_FFFFu64))))
 }
 
-/// A frame opens with its magic number, a byte that says a checksum ends it, and its window.
+/// A frame starts with its magic number, a byte stating that a checksum ends it, and its window.
 fn frame_header() -> Bytes = b"\x28\xB5\x2F\xFD\x04\x58"
 
 /// A writer before its first byte.
@@ -2464,26 +2469,26 @@ fn encode_chunks<| e>(
       }
     }
 
-/// One frame of the chunks of `plain`, a chunk for each pull that completes a block of 128 KiB or
-/// ends the frame. The frame's window is 2 MiB and it ends with a checksum; it does not say how
-/// long it is, which a writer that has not seen its last chunk does not know. The writer holds
-/// the 2 MiB a match may reach and up to as much again, the block it is filling, and the chunk
-/// it was handed.
+/// One frame of the chunks of `plain`, yielding a chunk for each pull that completes a block of
+/// 128 KiB or ends the frame. The frame's window is 2 MiB and it ends with a checksum. It does not
+/// declare its length, which a writer cannot know before its last chunk. The writer keeps the
+/// 2 MiB a match may reach and up to as much again, the block it is filling, and the chunk it was
+/// given.
 pub fn encoded<| e>(plain: Seq<Bytes | e>, level: Level) -> Seq<Bytes | {abort.raise | e}> =
   encode_chunks(plain, level, None, 0x3FFF_FFFF_FFFF_FFFF)
 
-/// A writer part of the way through a frame: `write` feeds it and `finish` ends it. It holds the
-/// 2 MiB a match may reach and up to as much again, and the block it is filling.
+/// A writer partway through a frame: `write` feeds it and `finish` ends it. It keeps the 2 MiB a
+/// match may reach and up to as much again, and the block it is filling.
 pub opaque type Writer = | Writer({ head: Bytes, encoder: Encoder })
 
-/// What a writer answers: the bytes it wrote, and the writer after them.
+/// What a write returns: the bytes written, and the writer after them.
 pub type WriteResult = { out: Bytes, next: Writer }
 
-/// A writer of one frame whose window is 2 MiB and which ends with a checksum. Its header goes out
-/// with its first bytes.
+/// A writer of one frame whose window is 2 MiB and which ends with a checksum. Its header is
+/// written with its first output.
 pub fn writer() -> Writer = Writer({ head: frame_header(), encoder: initial_encoder() })
 
-/// `chunk` taken in: every whole block of 128 KiB the writer then holds written out.
+/// Adds `chunk` to the writer, and returns every whole block of 128 KiB it then has, written out.
 pub fn write(w: Writer, chunk: Bytes, level: Level) -> WriteResult / {abort.raise} =
   match w {
     Writer(pending_bits) -> {
@@ -2499,8 +2504,8 @@ pub fn write(w: Writer, chunk: Bytes, level: Level) -> WriteResult / {abort.rais
     },
   }
 
-/// The frame's last bytes: what the writer holds, in blocks of which the last says so, and the
-/// checksum.
+/// The frame's last bytes: the writer's remaining bytes, in blocks with the last marked as last,
+/// and the checksum.
 pub fn finish(w: Writer, level: Level) -> Bytes / {abort.raise} =
   match w {
     Writer(pending_bits) -> pending_bits.head.concat(final_blocks(pending_bits.encoder, level)),
@@ -2515,7 +2520,7 @@ fn thrice() -> Bytes = sentence().repeat(3)
 
 fn large_limits() -> Limits = { output: 1048576, window: 2097152 }
 
-/// `n` bytes no match shortens.
+/// `n` bytes that matches cannot shorten.
 fn noise(n: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all(
     range(0, n / 4 + 1).map(|i: Int|
@@ -2547,7 +2552,7 @@ fn samples() -> List<Sample> / {abort.raise} =
     { name: "noise and then a sentence", bytes: noise(5000).concat(sentence().repeat(60)) },
   ]
 
-/// What the chunks of a frame unpack to, joined.
+/// A sequence's chunks, joined.
 fn joined(
   chunks: Seq<Bytes | {zstd.fail, abort.raise}>,
 ) -> Bytes / {zstd.fail, seq.spent, abort.raise} = Bytes::concat_all(seq::to_list(chunks, 1000000))
@@ -2563,7 +2568,7 @@ test "{s.name} survives each level, whole and a chunk at a time" for s: Sample i
   assert(fast.len() <= s.bytes.len() + 16)
 }
 
-test "a frame says how long it is and ends with a checksum, and text packs to under half" {
+test "a frame declares its length and ends with a checksum, and text compresses to under half" {
   assert_eq(compress(b"", Fast), Bytes::of_hex("28b52ffd2400010000" ++ "99e9d851"));
   assert_eq(compress(thrice(), Fast).slice(0, 6), Bytes::of_hex("28b52ffd24ff"));
   assert_eq(compress(sentence().repeat(4), Stored).slice(0, 7), Bytes::of_hex("28b52ffd645400"));
@@ -2576,7 +2581,7 @@ test "a frame says how long it is and ends with a checksum, and text packs to un
   )
 }
 
-test "many sequences are written by tables of the block's own, and a few, or all of one code, by the predefined ones" {
+test "many sequences use the block's own tables, and a few, or all of one code, use the predefined ones" {
   // Literal lengths of three codes, match lengths of five, and one offset code.
   let alike = |n: Int|
     Array::of_list(range(0, n).map(|i: Int| i % 3 | i % 5 << 20 | 4 + i % 2 << 40));
@@ -2588,7 +2593,7 @@ test "many sequences are written by tables of the block's own, and a few, or all
 
 type Fixture = { name: String, packed: String, plain: Bytes }
 
-/// Frames `zstd` 1.5.7 wrote of the sentence three times.
+/// Frames `zstd` 1.5.7 wrote for the sentence repeated three times.
 fn frames() -> List<Fixture> =
   [
     {
@@ -2619,7 +2624,7 @@ test "a frame written fast reads back" {
   gen::check(gen::bytes(), |p: Bytes| inverse(|x: Bytes| compress(x, Fast), unpacked, p))
 }
 
-test "a frame reads the same however its bytes are cut, and so does what is written of them" {
+test "a frame reads the same however its bytes are split, and so does one written from split input" {
   gen::check2(gen::bytes(), gen::list(gen::any_int()), |x: Bytes, cuts: List<Int>| {
     let sizes = cuts.map(|c: Int| c & 7);
     joined(decoded(seq::of_list(compress(x, Fast).pieces(sizes)), large_limits())) == x
@@ -2627,7 +2632,7 @@ test "a frame reads the same however its bytes are cut, and so does what is writ
   })
 }
 
-/// Whether a reader held to 4096 bytes answers no more than that or refuses, and raises nothing
+/// Whether a reader limited to 4096 bytes returns no more than that or fails, and raises nothing
 /// else.
 fn harmless(packed: Bytes) -> Bool = {
   let got: Result<Result<Bytes, Error>, String> = try[abort.raise] {
@@ -2644,14 +2649,14 @@ fn framed(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
     body,
   ])
 
-test "whatever bytes a reader is handed, as a stream, as a frame's blocks or as one block, it answers within its limits or refuses" {
+test "whatever bytes a reader is given, as a stream, as a frame's blocks or as one block, it returns within its limits or fails" {
   gen::check(gen::bytes(), |x: Bytes| {
     harmless(x) && harmless(b"\x28\xB5\x2F\xFD\x00\x30".concat(x)) && harmless(framed(2, x))
       && harmless(framed(1, x))
   })
 }
 
-test "a frame with a byte changed is answered within the limits or refused" {
+test "a frame with a byte changed decodes within the limits or fails" {
   gen::check3(gen::bytes(), gen::any_int(), gen::any_int(), |x: Bytes, at: Int, to: Int| {
     let whole = compress(x.concat(thrice()), Fast);
     harmless(whole.with_byte((at & 0x7FFF_FFFF) % whole.len(), to & 255))
@@ -2661,7 +2666,7 @@ test "a frame with a byte changed is answered within the limits or refused" {
 fn assert_error(got: Result<Bytes, Error>, at: Int, why: ErrorKind) -> Unit / {abort.raise} =
   assert_eq(got, Err({ at: at, reason: why }))
 
-test "a reader says why bytes are no stream of frames, and where" {
+test "a reader reports why bytes are not a stream of frames, and where" {
   let good = compress(b"check me", Fast);
   let n = good.len();
   let read = |packed: Bytes| try_decompress(packed, large_limits());
@@ -2684,7 +2689,7 @@ test "a reader says why bytes are no stream of frames, and where" {
   assert_error(try_decompress(good, { output: 8, window: 7 }), 0, Window)
 }
 
-test "frames one after another are one stream, a skippable frame among them is passed, and the first can be had alone" {
+test "frames one after another are one stream, a skippable frame among them is skipped, and the first can be read alone" {
   let a = compress(b"one, ", Fast);
   let b = compress(b"two", Stored);
   let skip = b"\x5A\x2A\x4D\x18\x03\x00\x00\x00...";
@@ -2704,20 +2709,20 @@ test "frames one after another are one stream, a skippable frame among them is p
   assert_error(try { first(a.slice(0, 7), large_limits()).plain }, 7, Truncated)
 }
 
-test "bytes that are no trained dictionary are one of content alone, and a trained one cut short is refused" {
+test "bytes that are not a trained dictionary are plain content, and a truncated trained one is rejected" {
   assert_eq(dictionary(b"any bytes at all").id, 0);
   assert_eq(dictionary(b"any bytes at all").content, b"any bytes at all");
   let cut: Result<Dictionary, Error> = try { dictionary(b"\x37\xA4\x30\xEC\x01\x00\x00\x00\x00") };
   assert(match cut { Err(_) -> true, Ok(_) -> false })
 }
 
-test "a frame that asks for a window past the limit is refused, whatever it asks for" {
+test "a frame that requests a window past the limit is rejected, whatever it requests" {
   let asks = |window: Bytes| try_decompress(b"\x28\xB5\x2F\xFD\x00".concat(window), large_limits());
   assert_error(asks(b"\xF8"), 0, Window);
   assert_error(asks(b"\x60"), 0, Window)
 }
 
-/// The widest the history stands after an answer, reading `d` to where it needs input.
+/// The largest the history grows after each output, reading `d` until it needs input.
 fn widest(
   d: Decoder,
   most: Int,
@@ -2728,9 +2733,9 @@ fn widest(
     widest(answered.next, max(most, answered.next.history.len()), fuel - 1)
   }
 
-test "a stream is read in a history its window bounds, however long it is" {
+test "a stream of any length is read in a history its window bounds" {
   let plain = sentence().repeat(4000);
-  // A frame of a 1 KiB window, in blocks of 1000 bytes as they are.
+  // A frame with a 1 KiB window, in raw blocks of 1000 bytes.
   let frame = Bytes::concat_all(
     range(0, 340).fold([b"\x28\xB5\x2F\xFD\x00\x00"], |out: List<Bytes>, i: Int|
       out.push(u32_le(1000 << 3 | (if i == 339 { 1 } else { 0 })).slice(0, 3)).push(

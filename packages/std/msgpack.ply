@@ -1,14 +1,16 @@
-//! MessagePack, the compact binary form of the same data JSON carries.
+//! MessagePack, a compact binary format for the same data JSON carries.
 //!
-//! The subset here is the one a program needs: nil, booleans, integers in every width, float64, UTF-8
-//! text, binary, arrays and maps. The writer emits the shortest signed encoding a value fits, never a
-//! `uint`, so one value has one encoding; the reader accepts `uint` widths too, because another writer
-//! will use them. The reader is total: it refuses, saying why and at which byte, a truncated input, a
-//! length that claims more bytes than remain, a value nested past 64 levels, a `float32`, an extension
-//! type, the reserved `0xc1`, a `uint64` past what an `Int` holds, text that is not UTF-8, and bytes
-//! after the one value. Every length is checked against what remains before it is walked, so a hostile
-//! header cannot make it loop. `msgpack_decode` answers a refusal as an `Err`, and `msgpack_read`
-//! raises it.
+//! This module supports the subset a program needs: nil, booleans, integers of every width,
+//! float64, UTF-8 text, binary, arrays and maps. The writer emits the shortest signed encoding that
+//! fits a value and never a `uint`, so each value has exactly one encoding. The reader also accepts
+//! the `uint` widths, because other writers use them.
+//!
+//! The reader is total. It rejects, reporting why and at which byte: a truncated input, a length
+//! that claims more bytes than remain, a value nested deeper than 64 levels, a `float32`, an
+//! extension type, the reserved `0xc1`, a `uint64` too large for an `Int`, text that is not UTF-8,
+//! and bytes after the one value. Every length is checked against the remaining bytes before the
+//! reader visits its elements, so a hostile header cannot make it loop. `msgpack_decode` returns an
+//! error as an `Err`, and `msgpack_read` raises it.
 
 import std.bytes (i16_be, i32_be, i64_be, u16_be, u32_be)
 
@@ -23,7 +25,7 @@ pub type Value =
   | Array(List<Value>)
   | Map(List<Entry>)
 
-/// One key and value of a map; a map is a list of them, in order, since a key may be any value.
+/// One key and value of a map. A map is an ordered list of entries, since a key may be any value.
 pub type Entry = { key: Value, value: Value }
 
 /// A map entry.
@@ -84,26 +86,26 @@ fn map_head(n: Int) -> Bytes / {abort.raise} =
 
 // --- Reading ----------------------------------------------------------------
 
-/// Why a reader refused. `Truncated` is an input that ends before a value does, `TooDeep` a value
-/// nested past 64 levels, `Unsupported` a tag outside this subset, which it carries, `TooWide` a
-/// `uint64` past what an `Int` holds, `NotUtf8` text that is not UTF-8, and `Trailing` bytes after
-/// the one value.
+/// Why the reader rejected its input. `Truncated` is an input that ends before a value does.
+/// `TooDeep` is a value nested deeper than 64 levels. `Unsupported` is a tag outside this subset,
+/// and carries the tag. `TooWide` is a `uint64` too large for an `Int`. `NotUtf8` is text that is
+/// not UTF-8. `Trailing` is bytes after the one value.
 pub type ErrorKind = | Truncated | TooDeep | Unsupported(Int) | TooWide | NotUtf8 | Trailing
 
-/// A refusal, and the offset of the byte the reader stood at.
+/// A decoding error, and the offset of the byte the reader was at.
 pub type Error = { at: Int, reason: ErrorKind }
 
-/// What a reader of this module raises where it refuses.
+/// The effect this module's reader raises when it rejects its input.
 pub effect msgpack {
   /// The input is not exactly one value of this subset.
   raise fail(e: Error)
 }
 
-/// The value `data` holds, or why it is not exactly one value of this subset.
+/// Decodes `data`, or returns why it is not exactly one value of this subset.
 pub fn msgpack_decode(data: Bytes) -> Result<Value, Error> / {abort.raise} =
   try { msgpack_read(data) }
 
-/// The value `data` holds, raising `msgpack.refused` where `msgpack_decode` answers `Err`.
+/// Decodes `data`, raising `msgpack.fail` where `msgpack_decode` returns `Err`.
 pub fn msgpack_read(data: Bytes) -> Value / {msgpack.fail, abort.raise} = {
   let read = read_at(data, 0, max_depth());
   if read.at == data.len() { read.value } else { fail(read.at, Trailing) }
@@ -111,14 +113,14 @@ pub fn msgpack_read(data: Bytes) -> Value / {msgpack.fail, abort.raise} = {
 
 fn fail<a>(at: Int, why: ErrorKind) -> a / {msgpack.fail} = msgpack.fail({ at: at, reason: why })
 
-/// A value read, and where the input stands after it.
+/// A decoded value, and the offset just after it.
 pub type ReadResult = { value: Value, at: Int }
 
-/// How deep a value may nest. A reader that recursed from the input alone could be made to walk a
-/// stack it cannot hold; 64 is deeper than any message and shallower than the stack.
+/// How deep a value may nest. Without a limit, a hostile input could make the recursive reader
+/// overflow the stack. 64 is deeper than any real message and well within the stack.
 fn max_depth() -> Int = 64
 
-/// `depth_left` is how many levels deeper a value may nest; each level below this one spends one.
+/// `depth_left` is how many more levels a value may nest. Each nested level uses one.
 fn read_at(data: Bytes, at: Int, depth_left: Int) -> ReadResult / {msgpack.fail, abort.raise} =
   if depth_left < 0 { fail(at, TooDeep) }
   else if at < 0 || at >= data.len() { fail(at, Truncated) } else {
@@ -129,8 +131,8 @@ fn read_at(data: Bytes, at: Int, depth_left: Int) -> ReadResult / {msgpack.fail,
     else if tag >= 0x90 && tag <= 0x9F { read_array(data, at + 1, tag & 0x0F, depth_left - 1) }
     else if tag >= 0xA0 && tag <= 0xBF { read_text(data, at + 1, tag & 0x1F) }
     else {
-      // A table rather than a chain of comparisons: one level of nesting for twenty-odd tags, and
-      // the emitter's recursion is what the depth costs.
+      // A `match` keeps twenty-odd tags at one level, since each nested `else if` deepens the
+      // emitter's recursion.
       read_tagged(data, at, tag, depth_left - 1)
     }
   }
@@ -171,11 +173,12 @@ fn read_tagged(
 fn read_float(data: Bytes, at: Int) -> ReadResult / {msgpack.fail} =
   { value: Float(Float::of_bits(big_endian_int(read_bytes(data, at + 1, 8)))), at: at + 9 }
 
-/// Eight bytes are the two's complement an `Int` already is.
+/// Eight bytes are already an `Int` in two's complement, so no sign extension is needed.
 fn read_int64(data: Bytes, at: Int) -> ReadResult / {msgpack.fail} =
   { value: Int(big_endian_int(read_bytes(data, at + 1, 8))), at: at + 9 }
 
-/// A `uint64` above `i63` is not an `Int`, and answering the wrapped bits would be a lie.
+/// A `uint64` with its top bit set does not fit an `Int`, and returning the wrapped bits would
+/// give a wrong value.
 fn read_uint64(data: Bytes, at: Int) -> ReadResult / {msgpack.fail, abort.raise} = {
   let eight = read_bytes(data, at + 1, 8);
   if eight.at(0) & 0x80 != 0 { fail(at, TooWide) }
@@ -194,11 +197,12 @@ fn read_signed(
     at: at + 1 + width,
   }
 
-/// What a length-prefixed tag says its payload is.
+/// The kind of payload a length-prefixed tag introduces.
 type PayloadKind = | BinaryKind | TextKind | ArrayKind | MapKind
 
-/// One length-prefixed value. The length is checked against what remains *before* it is walked, so a
-/// header claiming four billion elements is truncation rather than four billion iterations.
+/// Reads one length-prefixed value. The length is checked against the remaining bytes *before* the
+/// reader visits its elements, so a header that claims four billion elements fails as truncated
+/// instead of looping four billion times.
 fn read_length(
   data: Bytes,
   at: Int,
@@ -215,7 +219,7 @@ fn read_length(
   else { read_map(data, from, n, depth_left) }
 }
 
-/// A `uint8`/`uint16`/`uint32`, which fit an `Int` whatever their bits say.
+/// Reads a `uint8`, `uint16` or `uint32`, which always fit an `Int`.
 fn read_unsigned(data: Bytes, at: Int, width: Int, after: Int) -> ReadResult / {msgpack.fail} =
   { value: Int(big_endian_int(read_bytes(data, at + 1, width))), at: at + after }
 
@@ -279,11 +283,11 @@ fn read_entries(
     )
   }
 
-/// The big-endian integer a byte string names, as the `Int` its bits are.
+/// Reads `data` as a big-endian integer. Eight bytes fill an `Int`, so their top bit is its sign.
 fn big_endian_int(data: Bytes) -> Int =
   range(0, data.len()).fold(0, |acc: Int, i: Int| acc << 8 | data.at(i))
 
-/// A width narrower than an `Int` sign-extends from its own high bit.
+/// Sign-extends an integer narrower than an `Int` from its own high bit.
 fn sign_extend(n: Int, high: Int, span: Int) -> Int = if n >= high { n - span } else { n }
 
 // --- Tests ------------------------------------------------------------------
@@ -307,26 +311,25 @@ test "the shortest signed encoding of each width, and each reads back" {
   assert_eq(msgpack_decode(msgpack_encode(Binary(b"\x00\xff"))), Ok(Binary(b"\x00\xff")))
 }
 
-test "text, binary, arrays and maps round-trip, and two values are not one" {
+test "text, binary, arrays and maps round-trip, and two concatenated values are rejected" {
   assert_eq(msgpack_encode(Text("hello")), Bytes::of_hex("a568656c6c6f"));
   assert_eq(msgpack_encode(Binary(b"\x01\x02")), Bytes::of_hex("c4020102"));
   assert_eq(msgpack_encode(Array([Int(1), Int(2)])), Bytes::of_hex("920102"));
   assert_eq(msgpack_encode(Map([entry(Text("a"), Int(1))])), Bytes::of_hex("81a16101"));
   let nested = Array([Int(1), Array([Boolean(true)]), Map([entry(Text("k"), Binary(b"v"))])]);
   assert_eq(msgpack_decode(msgpack_encode(nested)), Ok(nested));
-  // `decode` is one value: two concatenated is not a value this reader answers.
   let two = msgpack_encode(Int(1)).concat(msgpack_encode(Int(2)));
   assert_eq(msgpack_decode(two), Err({ at: 1, reason: Trailing }))
 }
 
-test "a reader accepts the unsigned widths and refuses what this subset does not name" {
+test "a reader accepts the unsigned widths and rejects what this subset does not include" {
   assert_eq(msgpack_decode(Bytes::of_hex("cc80")), Ok(Int(128)));
   assert_eq(msgpack_decode(Bytes::of_hex("cd0100")), Ok(Int(256)));
   assert_eq(msgpack_decode(Bytes::of_hex("ce00010000")), Ok(Int(65536)));
   let refused = |hex: String, at: Int, why: ErrorKind|
     assert_eq(msgpack_decode(Bytes::of_hex(hex)), Err({ at: at, reason: why }));
   // float32, an extension type, the reserved byte, a truncated string, a length past the end, a
-  // `uint64` above i63, a truncated array, text that is not UTF-8, and nothing at all.
+  // `uint64` too large for an Int, a truncated array, text that is not UTF-8, and nothing at all.
   refused("ca3fc00000", 0, Unsupported(0xCA));
   refused("c70102ff", 0, Unsupported(0xC7));
   refused("c1", 0, Unsupported(0xC1));
@@ -338,14 +341,14 @@ test "a reader accepts the unsigned widths and refuses what this subset does not
   refused("", 0, Truncated)
 }
 
-test "a value nested past the depth is refused where the depth ran out" {
+test "a value nested past the depth limit is rejected at the byte where the limit ran out" {
   let nested = |levels: Int|
     Bytes::concat_all(range(0, levels).map(|_: Int| byte_of_int(0x91))).concat(b"\xc0");
   assert(match msgpack_decode(nested(64)) { Ok(_) -> true, Err(_) -> false });
   assert_eq(msgpack_decode(nested(65)), Err({ at: 65, reason: TooDeep }))
 }
 
-test "the raising reader raises what the other answers, and a task may perform it" {
+test "the raising reader raises the error the other returns, and a task may perform it" {
   assert_eq(try { msgpack_read(Bytes::of_hex("c1")) }, Err({ at: 0, reason: Unsupported(0xC1) }));
   let read = simulate {
     let t = task.spawn(|| try { msgpack_read(Bytes::of_hex("9201")) });

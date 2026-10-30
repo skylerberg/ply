@@ -3697,9 +3697,10 @@ that has it and at every use, and a function or local variable spelled the same 
 .held cached
 ```
 
-Types and values have separate names, so renaming a type leaves a variant or function spelled the
-same alone. If a module's name changes, its file moves: renaming `held` to `cached` moves
-`held/store.ply` to `cached/store.ply`.
+A line that starts with a file renames everything that file declares under the old name, so a type
+and a variant of one name in that file are renamed together. A variant of the same name declared in
+another file is left alone. If a module's name changes, its file moves: renaming `held` to `cached`
+moves `held/store.ply` to `cached/store.ply`.
 
 A name inside backticks in a comment is renamed too, where the file renames every use of that name
 the same way, so doc links stay correct. Text in strings is never changed. `ply rename` prints a

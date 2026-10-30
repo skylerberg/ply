@@ -1,18 +1,20 @@
 //! Quoted-printable, the transfer encoding of RFC 2045 §6.7 that leaves ASCII text readable.
 //!
-//! `encode` writes any bytes: a printable ASCII character other than `=` as itself and every other
-//! byte as `=` and two upper-case hex digits, in lines of at most 76 characters, each but the last
-//! ended by a soft line break, `=` before a CRLF, which stands for nothing. A space or a tab is
-//! written as itself except where it would end a line. `encode_text` is the same for text whose
-//! lines matter: each line break of the text, a line feed with or without a carriage return before
-//! it, is a CRLF of the encoding, so the lines stay lines to a reader that knows nothing of it.
+//! `encode` accepts any bytes. It writes a printable ASCII character other than `=` as itself, and
+//! every other byte as `=` followed by two upper-case hex digits. It writes lines of at most 76
+//! characters, each but the last ended by a soft line break: a `=` before a CRLF, which decodes to
+//! nothing. A space or a tab is written as itself except where it would end a line. `encode_text`
+//! is the same for text whose lines matter. It writes each line break of the text, a line feed
+//! with or without a carriage return before it, as a CRLF, so a reader that does not decode
+//! quoted-printable still sees the lines.
 //!
-//! `read` raises a `Error` saying where a text stops being quoted-printable and why, and
-//! `decode` answers it as an `Err`. It reads what the standard asks a robust reader to: hex digits
-//! in either case, a line of any length, a line break as CRLF or a line feed alone, each kept as
-//! written, blanks at the end of a line dropped as padding a transport added, and a soft line
-//! break at the end of the text. It refuses a `=` that neither two hex digits nor the end of its
-//! line follows, and a byte the encoding never writes bare: a control character, or one past `~`.
+//! `read` raises an `Error` stating where a text stops being quoted-printable and why, and
+//! `decode` returns it as an `Err`. They accept what the standard asks a robust reader to accept:
+//! hex digits in either case, a line of any length, and a line break as CRLF or as a line feed
+//! alone, each kept as written. They drop blanks at the end of a line as padding a transport
+//! added, and accept a soft line break at the end of the text. They reject a `=` not followed by
+//! two hex digits or the end of its line, and a byte the encoding never writes unescaped: a control
+//! character, or one past `~`.
 
 import std.bytes (hex_value)
 import std.laws (round_trip)
@@ -23,15 +25,15 @@ import std.gen
 
 /// Why a text is not quoted-printable.
 pub type ErrorKind =
-  /// A `=` that neither two hex digits nor the end of its line follows.
+  /// A `=` not followed by two hex digits or the end of its line.
   | BadEscape
-  /// A byte that is written only as an escape, with the byte.
+  /// A byte that must be escaped but was not, with its value.
   | BadByte(Int)
 
-/// A refusal, and the byte of the text's UTF-8 it was found at.
+/// Why a text was rejected, and the offset in the text's UTF-8 bytes where the problem was found.
 pub type Error = { at: Int, reason: ErrorKind }
 
-/// What a reader of this module raises where it refuses.
+/// The effect this module's readers raise when they reject a text.
 pub effect quoted_printable {
   /// The text is not quoted-printable.
   raise fail(e: Error)
@@ -39,12 +41,12 @@ pub effect quoted_printable {
 
 // --- Writing ----------------------------------------------------------------
 
-/// `data` in quoted-printable, a line break in it written as the bytes it is: what `read` reads
-/// back exactly.
+/// `data` in quoted-printable, with its line breaks escaped like any other bytes, so `read`
+/// returns exactly `data`.
 pub fn encode(data: Bytes) -> String / {abort.raise} = encode_bytes(data, false)
 
 /// `text` in quoted-printable with its line breaks kept as line breaks, each written as CRLF.
-/// A carriage return that no line feed follows is a byte like any other.
+/// A carriage return not followed by a line feed is escaped like any other byte.
 pub fn encode_text(text: String) -> String / {abort.raise} =
   encode_bytes(Bytes::of_string(text), true)
 
@@ -86,7 +88,7 @@ fn append_wrapped(l: Line, piece: Bytes) -> Line = {
 
 // --- Reading ----------------------------------------------------------------
 
-/// The bytes `text` encodes, raising `quoted_printable.refused` where `decode` answers `Err`.
+/// The bytes `text` encodes. Raises `quoted_printable.fail` where `decode` returns `Err`.
 pub fn read(text: String) -> Bytes / {quoted_printable.fail, abort.raise} = {
   let lines = Bytes::of_string(text).split(b"\n");
   let last = lines.len() - 1;
@@ -104,8 +106,8 @@ type ReadState = { out: List<Bytes>, at: Int }
 fn printable() -> Bytes =
   b"\t !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
-/// One line of the text, which starts at `r.at` and stands before a line feed unless it is the
-/// `last`: its bytes, and its line break as written unless a soft one ends it.
+/// Reads one line of the text, which starts at `r.at` and ends before a line feed unless it is the
+/// `last`. Returns its bytes, and its line break as written unless a soft line break ends it.
 fn read_line(
   r: ReadState,
   line: Bytes,
@@ -132,9 +134,9 @@ fn read_line(
 
 type UnescapeState = { out: List<Bytes>, at: Int, bad: Int }
 
-/// The bytes `text` stands for where the byte `marker` and the two hex digits after it, in either
-/// case, are one byte and every other byte, which must be one of `plain`, is itself; or the index
-/// of the first byte that is neither.
+/// Decodes `text`, where `marker` followed by two hex digits in either case is one byte, and every
+/// other byte must be one of `plain` and is copied as is. Returns the bytes, or the index of the
+/// first byte that is neither.
 pub fn unescape(text: Bytes, marker: Int, plain: Bytes) -> Result<Bytes, Int> / {abort.raise} = {
   let pieces = text.split(byte_of_int(marker));
   let done = range(0, pieces.len()).fold({ out: [], at: 0, bad: -1 }, |u: UnescapeState, i: Int|
@@ -145,7 +147,7 @@ pub fn unescape(text: Bytes, marker: Int, plain: Bytes) -> Result<Bytes, Int> / 
   if done.bad >= 0 { Err(done.bad) } else { Ok(Bytes::concat_all(done.out)) }
 }
 
-/// One stretch between markers, which starts at `u.at`: after a marker, two hex digits and then
+/// Decodes one piece between markers, starting at `u.at`: two hex digits after a marker, then
 /// plain bytes.
 fn unescape_piece(
   u: UnescapeState,
@@ -191,8 +193,9 @@ test "no encoded line is longer than 76 characters" {
 
 type Vector = { what: String, encoded: String, decoded: Bytes }
 
-/// Texts and the bytes they stand for. The first is RFC 2045 §6.7's soft line breaks, the second
-/// RFC 7578 §4.5's field, and the rest are what the section asks of a robust reader.
+/// Encoded texts and the bytes they decode to. The first shows RFC 2045 §6.7's soft line breaks,
+/// the second is RFC 7578 §4.5's field, and the rest cover what that section asks of a robust
+/// reader.
 fn vectors() -> List<Vector> =
   [
     {
@@ -252,11 +255,11 @@ fn error_cases() -> List<ErrorCase> =
     { what: "a DEL on a later line", encoded: "one\r\ntwo\u{7f}", at: 8, reason: BadByte(127) },
   ]
 
-test "refuses {c.what}" for c: ErrorCase in error_cases() {
+test "rejects {c.what}" for c: ErrorCase in error_cases() {
   assert_eq(decode(c.encoded), Err({ at: c.at, reason: c.reason }))
 }
 
-test "the raising reader raises what the other answers" {
+test "the raising reader raises what the other returns" {
   assert_eq(try { read("a=zz") }, Err({ at: 1, reason: BadEscape }))
 }
 
@@ -293,7 +296,7 @@ test "a long line breaks softly before its 76th character, and never inside an e
   assert_eq(decode(escapes), Ok(b"\xff".repeat(30)))
 }
 
-test "unescape reads a marker's hex pairs and refuses the first byte that is neither" {
+test "unescape reads a marker's hex pairs and rejects the first byte that is neither" {
   assert_eq(unescape(b"a%20b%2fc", b'%', b"abc"), Ok(b"a b/c"));
   assert_eq(unescape(b"", b'%', b"abc"), Ok(b""));
   assert_eq(unescape(b"%41", b'%', b""), Ok(b"A"));

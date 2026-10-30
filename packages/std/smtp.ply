@@ -1,47 +1,49 @@
 //! Sending mail: an SMTP client (RFC 5321), as an engine over bytes and as sessions over
 //! `std.net`.
 //!
-//! The protocol is an `Engine`, which is a value. `start` makes one for a connection just
-//! opened, and `feed` gives it what the server sent and answers a `Turn`: what to write back,
-//! and whether to wait for more, start TLS, take a command or close. It reads no socket and no
+//! The protocol is an `Engine`, which is a value. `start` makes one for a newly opened
+//! connection, and `feed` gives it what the server sent and returns a `Turn`: what to write back,
+//! and whether to wait for more, start TLS, accept a command or close. It reads no socket and no
 //! clock, so an exchange is data, and a test is a server's lines and the lines the client must
-//! answer them with. The engine greets with `EHLO`, and with `HELO` only where a caller asked
-//! for that fallback; reads what the server offers into `Capabilities`; upgrades by `STARTTLS`
-//! (RFC 3207); proves a credential by `AUTH` (RFC 4954) under `std.sasl`'s mechanisms; and
-//! sends a message as `MAIL FROM`, a `RCPT TO` for each recipient and `DATA`, all at once where
-//! the server offers `PIPELINING`, after a `RSET` for every message but a session's first. A
-//! `Reply` is a `Code`, its lines, and the enhanced `Status` (RFC 3463) its text opens with.
-//! What a server may make a client hold is a `Limits`, which `config` takes.
+//! reply with. The engine greets with `EHLO`, and falls back to `HELO` only when the caller asked
+//! for that. It reads what the server offers into `Capabilities`, upgrades by `STARTTLS` (RFC
+//! 3207), and proves a credential by `AUTH` (RFC 4954) with `std.sasl`'s mechanisms. It sends a
+//! message as `MAIL FROM`, a `RCPT TO` for each recipient and `DATA`, all at once when the server
+//! offers `PIPELINING`, after a `RSET` for every message but a session's first. A `Reply` is a
+//! `Code`, its lines, and the enhanced `Status` (RFC 3463) its text starts with. `Limits`, which
+//! `config` takes, bounds what a server can make a client store.
 //!
-//! A `Config` is what a caller requires. TLS is required unless it says otherwise: over a
-//! connection that starts in the clear the engine asks for `STARTTLS`, refuses a server that
-//! does not offer or grant it, and after the handshake forgets everything the server said
-//! before it. Bytes that arrive between the server's leave and the handshake are refused
-//! (`Injected`), never read as if TLS had carried them. A mechanism that sends the credential
-//! itself is used only over TLS unless the caller says `PasswordInClear`. No credential is in
-//! a refusal, in what a turn or an engine shows, or in the lines a session keeps, and none is
-//! ever a plain value: what the client says in an `AUTH` exchange is a `Veiled` wire, sealed,
-//! which a session writes with `net.send_secret`.
+//! A `Config` is what a caller requires. TLS is required unless the config says otherwise. Over a
+//! connection that starts in the clear, the engine sends `STARTTLS`, rejects a server that does
+//! not offer or accept it, and after the handshake forgets everything the server said before it.
+//! Bytes that arrive between the server's go-ahead and the handshake are rejected (`Injected`),
+//! never read as if TLS had carried them. A mechanism that sends the credential itself is used
+//! only over TLS unless the caller sets `PasswordInClear`. No credential appears in an error, in
+//! what a turn or an engine shows, or in the lines a session keeps, and none is ever a plain
+//! value: what the client sends in an `AUTH` exchange is a secret `Veiled` wire, which a session
+//! writes with `net.send_secret`.
 //!
-//! A message is bytes and an `Envelope`, both `std.email`'s: `send` writes a `Draft`, `relay`
-//! sends a `Message` on as the bytes it was read from, and `submit` takes the two as they are.
-//! Nothing is repaired. Bytes that are not CRLF lines of at most 998 octets are refused, and so
-//! are a message past the server's `SIZE`, one with a byte past 127 for a server without
-//! `8BITMIME`, and one whose addresses or header need `SMTPUTF8` for a server without it. The
-//! answer is a `Delivery` for each recipient, `Accepted`, `Temporary` or `Permanent` with the
-//! command refused and the server's reply, so a message one recipient did not get is never a
-//! bare success.
+//! A message is bytes and an `Envelope`, both from `std.email`. `send` writes a `Draft`, `relay`
+//! forwards a `Message` as the bytes it was read from, and `submit` sends bytes and an envelope
+//! as they are. Nothing is repaired. Bytes that are not CRLF lines of at most 998 octets are
+//! rejected, and so are a message past the server's `SIZE`, one with a byte past 127 for a server
+//! without `8BITMIME`, and one whose addresses or header need `SMTPUTF8` for a server without it.
+//! The result is a `Delivery` for each recipient: `Accepted`, `Temporary` or `Permanent`, with
+//! the rejected command and the server's reply. So a message that did not reach one recipient is
+//! never reported as a plain success.
 //!
-//! A `Session` is an engine on a `std.net` connection, under the caller's label: `open_tls`
-//! over TLS from the first byte (port 465), `open` over a connection that starts in the clear
-//! (ports 587 and 25) and is upgraded by `net.start_tls`, which verifies the server as the host
-//! named; `with_session_tls` and `with_session` hold theirs for the body alone and close it
-//! however the body ends. A wait for a reply lasts what `Timeouts` gives its phase, by default
-//! RFC 5321 §4.5.3.2's, as one deadline on the clock that each read is given what is left of,
-//! held to `std.task`'s deadline around the call where that is earlier: a `task::timeout`
-//! around a session bounds it whole, and a caller with none says so with `task::unbounded`.
+//! A `Session` is an engine on a `std.net` connection, under the caller's label. `open_tls` uses
+//! TLS from the first byte (port 465). `open` uses a connection that starts in the clear (ports
+//! 587 and 25) and is upgraded by `net.start_tls`, which verifies the server as the named host.
+//! `with_session_tls` and `with_session` keep their session for the body alone and close it
+//! however the body ends. A wait for a reply lasts as long as `Timeouts` allows its phase, by
+//! default RFC 5321 §4.5.3.2's values. It is one deadline on the clock, and each read gets what
+//! is left of it. `std.task`'s deadline around the call applies when it is earlier, so a
+//! `task::timeout` around a session bounds the whole session, and a caller who wants none says
+//! so with `task::unbounded`.
 //!
-//! A queue with its retries, a domain's mail servers, DKIM signatures and `BDAT` are not here.
+//! Not included: a queue with retries, looking up a domain's mail servers, DKIM signatures, and
+//! `BDAT`.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes
@@ -67,32 +69,33 @@ import std.time (after, millis, time)
 
 // --- Reply codes --------------------------------------------------------------
 
-/// The three digits a reply opens with (RFC 5321 §4.2), `250` or `550`. The first says what
-/// became of the command, and is all a client may decide by: the other two tell a person more.
+/// The three digits a reply starts with (RFC 5321 §4.2), such as `250` or `550`. The first digit
+/// reports what became of the command, and is all a client may base decisions on; the other two
+/// give a person more detail.
 pub opaque type Code = | Code(Int)
 
 show for Code by code_text
 
 fn code_text(c: Code) -> String = match c { Code(n) -> n.to_string() }
 
-/// The code `n` is; `None` unless it is three digits of which the first is 2, 3, 4 or 5.
+/// `n` as a code; `None` unless it is three digits of which the first is 2, 3, 4 or 5.
 pub fn code(n: Int) -> Option<Code> = if n >= 200 && n <= 599 { Some(Code(n)) } else { None }
 
 /// A code as a number, `250`.
 pub fn number(c: Code) -> Int = match c { Code(n) -> n }
 
-/// What a code's first digit says.
+/// What a code's first digit means.
 pub type Class =
   /// 2: the command was done.
   | Completed
   /// 3: the server waits for the rest of the command.
   | Intermediate
-  /// 4: not this time. The same command may be taken later.
+  /// 4: not now. The same command may succeed later.
   | Transient
   /// 5: no, and not later either.
   | Rejected
 
-/// What a code's first digit says.
+/// What a code's first digit means.
 pub fn class_of(c: Code) -> Class =
   match c {
     Code(n) -> if n < 300 { Completed }
@@ -132,10 +135,10 @@ pub fn codes() -> Gen<Code> =
     gen::map(gen::int_between(200, 599), |n: Int| Code(n)),
   ])
 
-/// An enhanced status code (RFC 3463), `5.1.1`: a class that is 2, 4 or 5 as a reply code's
-/// first digit is, a subject and a detail. Where a reply code says how the command fared, this
-/// says why, in terms a program can act on: `x.1.1` is a mailbox that does not exist, `x.2.2`
-/// one that is full, `x.7.1` a delivery not authorized.
+/// An enhanced status code (RFC 3463), such as `5.1.1`: a class that is 2, 4 or 5, like a reply
+/// code's first digit, then a subject and a detail. Where a reply code reports how the command
+/// went, this reports why, in terms a program can act on: `x.1.1` is a mailbox that does not
+/// exist, `x.2.2` one that is full, `x.7.1` a delivery not authorized.
 pub opaque type Status = | Status(Int, Int, Int)
 
 show for Status by status_text
@@ -157,7 +160,7 @@ pub fn status(kind: Int, subject: Int, detail: Int) -> Option<Status> =
 pub fn status_parts(s: Status) -> List<Int> =
   match s { Status(kind, subject, detail) -> [kind, subject, detail] }
 
-/// The status `text` is, three numbers between dots with no sign and no blank; `None` for
+/// `text` as a status: three numbers between dots, with no sign and no spaces; `None` for
 /// anything else.
 pub fn read_status(text: String) -> Option<Status> / {abort.raise} =
   match text.split(".").map(|part: String|
@@ -177,18 +180,18 @@ pub fn statuses() -> Gen<Status> =
 
 // --- Replies ------------------------------------------------------------------
 
-/// What a server says to a command: a code, and one or more lines of text for a person.
+/// A server's reply to a command: a code, and one or more lines of text for a person.
 ///
-/// A line holds no line break and no control character but a tab. Text a server sent that is
-/// no UTF-8, or that holds a control character, is read with U+FFFD in its place, so that what
-/// a reply says can be logged as it is.
+/// A line contains no line break and no control character except a tab. Text a server sent that
+/// is not UTF-8, or that contains a control character, is read with U+FFFD in its place, so that a
+/// reply can be logged as it is.
 pub opaque type Reply = new {
   code: Code,
   /// The text of each line, without its code. A reply has at least one, which may be empty.
   lines: List<String>,
 }
 
-/// The reply of this code and these lines; `None` for no lines, and for a line that holds a
+/// The reply of this code and these lines; `None` for no lines, and for a line that contains a
 /// control character other than a tab.
 pub fn reply(c: Code, texts: List<String>) -> Option<Reply> =
   if texts.len() == 0 || !texts.all(is_text) { None } else { Some({ code: c, lines: texts }) }
@@ -200,9 +203,9 @@ fn is_control(c: Char) -> Bool = (Int::of_char(c) < 32 && c != '\t') || Int::of_
 /// A reply's lines as one text, a line feed between them.
 pub fn reply_text(r: Reply) -> String = String::join(r.lines, "\n")
 
-/// The enhanced status a reply's text opens with, where it opens with one of the code's own
-/// class; `None` otherwise. A server that offers `ENHANCEDSTATUSCODES` opens every reply to a
-/// command after `EHLO` with one.
+/// The enhanced status a reply's text starts with, if it starts with one of the code's own class;
+/// `None` otherwise. A server that offers `ENHANCEDSTATUSCODES` starts every reply to a command
+/// after `EHLO` with one.
 pub fn enhanced_status(r: Reply) -> Option<Status> / {abort.raise} =
   match r.lines.at_or(0, "").split(" ").first() {
     None -> None,
@@ -214,8 +217,8 @@ pub fn enhanced_status(r: Reply) -> Option<Status> / {abort.raise} =
     },
   }
 
-/// A reply as a server writes it: each line after its code, a hyphen between them on every line
-/// but the last, where a space stands, or nothing before an empty text.
+/// A reply as a server writes it: each line after its code, with a hyphen between code and text
+/// on every line but the last, which has a space, or nothing before an empty text.
 pub fn render_reply(r: Reply) -> Bytes = {
   let digits = code_text(r.code);
   let end = r.lines.len() - 1;
@@ -231,7 +234,7 @@ pub fn render_reply(r: Reply) -> Bytes = {
   )
 }
 
-/// Replies of one line and of several, some of them empty, and some opening with a status.
+/// Replies of one line and of several, some of them empty, and some starting with a status.
 pub fn replies() -> Gen<Reply> =
   gen::map2(
     codes(),
@@ -272,15 +275,15 @@ pub fn replies() -> Gen<Reply> =
 
 // --- Limits and deadlines -----------------------------------------------------
 
-/// What a server may make a client hold and do.
+/// What a server may make a client store and do.
 pub type Limits = new {
   /// Bytes in one line of a reply, its line break among them.
   line: Int,
   /// Bytes in one whole reply, over however many lines.
   reply: Int,
-  /// The most iterations of its hash a SCRAM server may ask for.
+  /// The most iterations of its hash a SCRAM server may request.
   scram_iterations: Int,
-  /// Lines of its exchange a session keeps for `transcript`, the newest; at `0`, none.
+  /// How many of the newest lines of its exchange a session keeps for `transcript`; at `0`, none.
   transcript: Int,
 }
 
@@ -289,58 +292,58 @@ pub type Limits = new {
 pub fn default_limits() -> Limits =
   { line: 4096, reply: 65536, scram_iterations: 1000000, transcript: 0 }
 
-/// What a session waits for, which a deadline and a refusal are named by.
+/// What a session waits for, which names a deadline or an error.
 pub type Phase =
-  /// The server's first word, before the client says anything.
+  /// The server's greeting, before the client sends anything.
   | Greeting
-  /// The answer to `EHLO` or `HELO`.
+  /// The reply to `EHLO` or `HELO`.
   | Hello
-  /// The answer to `STARTTLS`.
+  /// The reply to `STARTTLS`.
   | StartTls
   /// The TLS handshake.
   | Handshake
-  /// An answer in an `AUTH` exchange.
+  /// A reply in an `AUTH` exchange.
   | Auth
-  /// The answer to `RSET`.
+  /// The reply to `RSET`.
   | Reset
-  /// The answer to `MAIL FROM`.
+  /// The reply to `MAIL FROM`.
   | Mail
-  /// The answer to a `RCPT TO`.
+  /// The reply to a `RCPT TO`.
   | Rcpt
-  /// The answer to `DATA`: leave to send the message.
+  /// The reply to `DATA`: the go-ahead to send the message.
   | Data
-  /// The answer to the message, after the dot that ends it.
+  /// The reply to the message, after the dot that ends it.
   | Body
-  /// The answer to `QUIT`.
+  /// The reply to `QUIT`.
   | Quit
 
 /// How long, in milliseconds, each wait may last.
 pub type Timeouts = new {
   /// Reaching the server, and a TLS handshake with it.
   connect_ms: Int,
-  /// The server's first word.
+  /// The server's greeting.
   greeting_ms: Int,
-  /// The answer to `MAIL FROM`.
+  /// The reply to `MAIL FROM`.
   mail_ms: Int,
-  /// The answer to one `RCPT TO`.
+  /// The reply to one `RCPT TO`.
   rcpt_ms: Int,
-  /// The answer to `DATA`.
+  /// The reply to `DATA`.
   data_ms: Int,
   /// One write of a command or of a stretch of the message.
   block_ms: Int,
-  /// The answer to the message, which a server gives only once it has taken responsibility for
+  /// The reply to the message, which a server sends only once it has taken responsibility for
   /// it.
   end_ms: Int,
-  /// The answer to `EHLO`, `STARTTLS`, `RSET` and each step of `AUTH`.
+  /// The reply to `EHLO`, `STARTTLS`, `RSET` and each step of `AUTH`.
   other_ms: Int,
-  /// The answer to `QUIT`.
+  /// The reply to `QUIT`.
   quit_ms: Int,
 }
 
-/// The waits RFC 5321 §4.5.3.2 has a client allow at least: five minutes for the greeting, for
-/// `MAIL` and for each `RCPT`, two for `DATA`, three for each write, ten for the answer to the
-/// message. It names none for the rest: five minutes here, a minute to connect, and thirty
-/// seconds for the answer to `QUIT`, which nothing depends on.
+/// The minimum waits RFC 5321 §4.5.3.2 requires a client to allow: five minutes for the greeting,
+/// for `MAIL` and for each `RCPT`, two for `DATA`, three for each write, and ten for the reply to
+/// the message. It sets none for the rest: here five minutes, a minute to connect, and thirty
+/// seconds for the reply to `QUIT`, which nothing depends on.
 pub fn default_timeouts() -> Timeouts =
   {
     connect_ms: 60000,
@@ -354,7 +357,7 @@ pub fn default_timeouts() -> Timeouts =
     quit_ms: 30000,
   }
 
-/// How long the wait for a phase's answer may last.
+/// How long the wait for a phase's reply may last.
 pub fn timeout(t: Timeouts, p: Phase) -> Int =
   match p {
     Greeting -> t.greeting_ms,
@@ -367,94 +370,94 @@ pub fn timeout(t: Timeouts, p: Phase) -> Int =
     _ -> t.other_ms,
   }
 
-// --- Refusals -----------------------------------------------------------------
+// --- Errors -------------------------------------------------------------------
 
-/// An extension a message cannot travel without.
+/// An extension a message cannot be sent without.
 pub type RequiredExtension =
-  /// `8BITMIME` (RFC 6152): the message holds a byte past 127.
+  /// `8BITMIME` (RFC 6152): the message contains a byte past 127.
   | EightBitMime
   /// `SMTPUTF8` (RFC 6531): an address of the envelope, or the message's header, is outside
   /// ASCII.
   | SmtpUtf8
-  /// `DSN` (RFC 3461): delivery reports were asked for.
+  /// `DSN` (RFC 3461): delivery reports were requested.
   | Notices
 
-/// Why a session does not go on, or a message is not sent.
+/// Why a session cannot continue, or a message is not sent.
 pub type Error =
   /// The name to greet the server by is neither a domain nor an address literal.
   | BadClientName
   /// The server was not reached.
   | Unreachable
-  /// The connection stopped taking bytes.
+  /// The connection stopped accepting bytes.
   | NotSent(Phase)
-  /// No answer came within the phase's wait.
+  /// No reply came within the phase's wait.
   | TimedOut(Phase)
-  /// The server closed the connection before it answered. In `Body` the message was sent
-  /// whole and may or may not have been taken.
+  /// The server closed the connection before it replied. In `Body` the whole message was sent
+  /// and may or may not have been accepted.
   | Closed(Phase)
   /// A reply's line is longer than `Limits.line`.
   | LineTooLong
   /// A reply is longer than `Limits.reply`.
   | ReplyTooLarge
-  /// A line that is not three digits of a reply code and then a space, a hyphen or its end; or
-  /// one that ends with a line feed alone, or holds a carriage return.
+  /// A line that is not a three-digit reply code followed by a space, a hyphen or the line's end;
+  /// or one that ends with a bare line feed, or contains a carriage return.
   | BadLine
-  /// A reply whose lines do not all open with one code.
+  /// A reply whose lines do not all start with the same code.
   | MixedCodes
-  /// The server said more than the commands sent to it asked for.
+  /// The server sent more replies than the commands sent to it called for.
   | Unsolicited
-  /// Bytes arrived between the server's leave to start TLS and the handshake. What is read
-  /// before the handshake was not sent by the server the handshake proves, so nothing of it is
+  /// Bytes arrived between the server's go-ahead to start TLS and the handshake. Anything read
+  /// before the handshake may not come from the server the handshake verifies, so none of it is
   /// kept (RFC 3207 §4.2).
   | Injected
-  /// An answer the phase has no place for: a greeting that is not 220, `EHLO` refused, `STARTTLS`
-  /// refused where TLS is required.
+  /// A reply the phase does not expect: a greeting that is not 220, `EHLO` rejected, or
+  /// `STARTTLS` rejected when TLS is required.
   | Unexpected(Phase, Reply)
   /// TLS is required and the server does not offer `STARTTLS`.
   | NoTls
   /// The TLS handshake failed, for the reason `std.net` gives: the server is not the one named,
-  /// the two agree on nothing, or it went away.
+  /// the two sides share no protocol version or cipher, or the server disconnected.
   | HandshakeFailed(net::Error)
-  /// The server offers no mechanism the credential and the configuration both take, or no
+  /// The server offers no mechanism the credential and the configuration both accept, or no
   /// `AUTH` at all.
   | NoMechanism
-  /// The only mechanisms both sides take send the credential itself, the connection is not TLS,
-  /// and `PasswordInClear` was not asked for.
+  /// The only mechanisms both sides accept send the credential itself, the connection is not
+  /// TLS, and `PasswordInClear` was not set.
   | InClear(Mechanism)
-  /// The server refused the credential.
+  /// The server rejected the credential.
   | Denied(Reply)
-  /// The exchange went wrong on the server's side of it, as `std.sasl` says how.
+  /// The exchange failed on the server's side, for the reason `std.sasl` reports.
   | BadAuth(sasl::Error)
-  /// A command for a session that is waiting for an answer, or is over.
+  /// A command for a session that is waiting for a reply, or is over.
   | NotReady
   /// An envelope to no one.
   | NoRecipients
-  /// The message is this many bytes, and the server takes at most that many.
+  /// The message is this many bytes, and the server accepts at most that many.
   | TooLarge(Int, Int)
   /// The message needs an extension the server does not offer.
   | MissingExtension(RequiredExtension)
-  /// The message is not lines that each end with CRLF and hold at most 998 octets, at the byte
+  /// The message is not lines that each end with CRLF and contain at most 998 octets, at the byte
   /// and for the reason `std.email` gives.
   | Unsendable(email::Error)
-  /// The message holds a NUL, at this byte.
+  /// The message contains a NUL, at this byte.
   | NulByte(Int)
   /// The message's last line has no line break.
   | Unterminated
   /// An envelope identifier that is empty, longer than 100 characters, or not printable ASCII.
   | BadEnvelopeId
-  /// The draft has no bytes, as `std.email` says why.
+  /// The draft cannot be written as bytes, for the reason `std.email` gives.
   | Unwritable(email::Unwritable)
-  /// The message names no envelope, as `std.email` says why.
+  /// The message names no envelope, for the reason `std.email` gives.
   | Unreadable(email::Error)
 
-/// What this module raises where it refuses.
+/// The error this module raises.
 pub effect smtp {
-  /// The session does not go on, or the message is not sent.
+  /// The session cannot continue, or the message is not sent.
   raise fail(why: Error)
 }
 
-/// Whether the session a refusal came from can still send: `true` for a message refused before
-/// anything of it was sent, `false` once the exchange itself went wrong.
+/// Whether the session an error came from can still send: `true` for a message rejected before
+/// any of it was sent, `false` once the exchange itself failed.
 pub fn usable(why: Error) -> Bool =
   match why {
     NoRecipients -> true,
@@ -535,9 +538,8 @@ fn scan_reply(
     },
   }
 
-/// The reply `data` is, raising `smtp.refused` where `parse_reply` answers `Err`: one whole
-/// reply as RFC 5321 §4.2 has a server write it, each line ending with CRLF, and nothing after
-/// it.
+/// `data` read as one whole reply, as RFC 5321 §4.2 has a server write it: each line ending with
+/// CRLF, and nothing after it. Raises `smtp.fail` where `parse_reply` returns `Err`.
 pub fn read_reply(data: Bytes, limits: Limits) -> Reply / {smtp.fail, abort.raise} = {
   let t = scan_reply(data, 0, nothing_read(), limits, data.len());
   match t.whole {
@@ -546,49 +548,49 @@ pub fn read_reply(data: Bytes, limits: Limits) -> Reply / {smtp.fail, abort.rais
   }
 }
 
-/// The reply `data` is, or why it is none: a line or a reply past its limit, a line that is no
-/// reply's, lines of two codes, or bytes after the reply's end.
+/// `data` read as a reply, or why it is not one: a line or a reply past its limit, a line that is
+/// not a reply line, lines with two different codes, or bytes after the reply's end.
 pub fn parse_reply(data: Bytes, limits: Limits) -> Result<Reply, Error> / {abort.raise} =
   try { read_reply(data, limits) }
 
 // --- What a server offers -----------------------------------------------------
 
-/// What a server says of the size of message it takes (RFC 1870).
+/// What a server states about the message size it accepts (RFC 1870).
 pub type Size =
   /// Nothing: it does not offer `SIZE`.
   | NotAdvertised
-  /// That it reads the size a client declares, and names no bound.
+  /// It reads the size a client declares, and states no limit.
   | Unbounded
-  /// That it takes this many bytes at most.
+  /// It accepts at most this many bytes.
   | AtMost(Int)
 
 /// An extension this module has no use for: its keyword in upper case, and its parameters as
 /// written.
 pub type Extension = { keyword: String, params: List<String> }
 
-/// What a server offered in answer to `EHLO`.
+/// What a server offered in reply to `EHLO`.
 pub type Capabilities = new {
-  /// The first line of its answer: the name it goes by, and whatever it says after it.
+  /// The first line of its reply: the server's name, and whatever text follows it.
   greeting: String,
   /// `STARTTLS` (RFC 3207): it will upgrade the connection to TLS.
   starttls: Bool,
-  /// `AUTH` (RFC 4954): the mechanisms it takes that `std.sasl` answers, in its order.
+  /// `AUTH` (RFC 4954): the mechanisms it accepts that `std.sasl` supports, in its order.
   auth: List<Mechanism>,
-  /// The mechanisms it takes that `std.sasl` does not answer, by name in upper case.
+  /// The mechanisms it accepts that `std.sasl` does not support, by name in upper case.
   unsupported_mechanisms: List<String>,
-  /// `PIPELINING` (RFC 2920): it reads commands sent before their answers.
+  /// `PIPELINING` (RFC 2920): it reads commands sent before their replies.
   pipelining: Bool,
-  /// `8BITMIME` (RFC 6152): it takes a message with bytes past 127.
+  /// `8BITMIME` (RFC 6152): it accepts a message with bytes past 127.
   eight_bit: Bool,
-  /// `SMTPUTF8` (RFC 6531): it takes addresses and headers outside ASCII.
+  /// `SMTPUTF8` (RFC 6531): it accepts addresses and headers outside ASCII.
   utf8: Bool,
   /// `SIZE` (RFC 1870).
   size: Size,
-  /// `CHUNKING` (RFC 3030): it takes a message by `BDAT`. Not used here.
+  /// `CHUNKING` (RFC 3030): it accepts a message by `BDAT`. Not used here.
   chunking: Bool,
-  /// `DSN` (RFC 3461): it takes requests for delivery reports.
+  /// `DSN` (RFC 3461): it accepts requests for delivery reports.
   dsn: Bool,
-  /// `ENHANCEDSTATUSCODES` (RFC 2034): its replies open with a status `enhanced` reads.
+  /// `ENHANCEDSTATUSCODES` (RFC 2034): its replies start with a status `enhanced_status` reads.
   enhanced: Bool,
   /// Everything else it offered, in its order.
   others: List<Extension>,
@@ -611,9 +613,9 @@ pub fn nothing_offered(greeting: String) -> Capabilities =
     others: [],
   }
 
-/// What the answer to `EHLO` offers: a keyword a line after the first, in any case, and its
+/// What the reply to `EHLO` offers: one keyword per line after the first, in any case, with its
 /// parameters after spaces. `AUTH=` before the mechanisms, which old servers wrote for old
-/// clients, is read as `AUTH` is. A `SIZE` whose parameter is no number names no bound.
+/// clients, is read as `AUTH`. A `SIZE` whose parameter is not a number states no limit.
 pub fn capabilities(r: Reply) -> Capabilities / {abort.raise} =
   r.lines.drop(1).fold(nothing_offered(r.lines.at_or(0, "")), |c: Capabilities, line: String| {
     let words = line.split(" ").filter(|w: String| w != "");
@@ -650,7 +652,7 @@ fn mechanisms_in(c: Capabilities, offered: List<String>) -> Capabilities =
         },
     })
 
-/// The bound `SIZE`'s parameters name.
+/// The limit `SIZE`'s parameters state.
 fn bound_of(params: List<String>) -> Size / {abort.raise} =
   match params.first() {
     None -> Unbounded,
@@ -662,24 +664,24 @@ fn bound_of(params: List<String>) -> Size / {abort.raise} =
 
 // --- The message as it travels ------------------------------------------------
 
-/// `body` with a dot before every line that opens with one, as RFC 5321 §4.5.2 has a client
+/// `body` with a dot before every line that starts with one, as RFC 5321 §4.5.2 has a client
 /// send it, so that no line of a message is the lone dot that ends one.
 pub fn stuff(body: Bytes) -> Bytes = {
   let inner = body.replace(b"\r\n.", b"\r\n..");
   if inner.peek(0) == b'.' { b".".concat(inner) } else { inner }
 }
 
-/// `data` without the dot `stuff` put before each line that opens with one: what a server
-/// keeps of what it read up to the lone dot.
+/// `data` without the dot `stuff` put before each line that starts with one: what a server
+/// stores of what it read up to the lone dot.
 pub fn unstuff(data: Bytes) -> Bytes / {abort.raise} = {
   let inner = data.replace(b"\r\n.", b"\r\n");
   if data.peek(0) == b'.' { inner.slice(1, inner.len()) } else { inner }
 }
 
-/// What keeps `data` from travelling as a message: a line feed or a carriage return that is not
-/// half of a CRLF, a line past 998 octets, a NUL, or a last line with no line break. None is
-/// repaired, since a repair changes what a signature was taken over, and a line break one
-/// server reads and another does not is how a second message is smuggled inside a first.
+/// What prevents `data` from being sent as a message: a line feed or a carriage return that is
+/// not half of a CRLF, a line past 998 octets, a NUL, or a last line with no line break. None is
+/// repaired, since a repair changes the bytes a signature covers, and a line break that one server
+/// honours and another does not is how a second message is smuggled inside a first.
 pub fn message_error(data: Bytes) -> Option<Error> / {abort.raise} = {
   let n = data.len();
   match email::line_flaws(data).first() {
@@ -703,38 +705,38 @@ pub type Return =
   /// Its header alone.
   | Headers
 
-/// An event a sender is told of (RFC 3461 §4.1).
+/// An event reported to a sender (RFC 3461 §4.1).
 pub type Event =
-  /// The message reached the recipient's mailbox, or left for where no reports are made.
+  /// The message reached the recipient's mailbox, or was relayed to where no reports are made.
   | Delivered
   /// It could not be delivered.
   | Failed
   /// It is late, and still being tried.
   | Delayed
 
-/// What a message asks of the servers that carry it, by RFC 3461's `DSN` extension. A server
-/// that does not offer the extension is not sent a message that asks anything.
+/// What a message requests from the servers that carry it, under RFC 3461's `DSN` extension. A
+/// message that requests anything is not sent to a server that does not offer the extension.
 pub type Dsn = new {
-  /// How much of the message a report returns; the server's choice where `None`.
+  /// How much of the message a report returns; the server's choice if `None`.
   ret: Option<Return>,
   /// An identifier of the sender's own, returned in each report: printable ASCII, 100
   /// characters at most.
   envelope_id: Option<String>,
-  /// The events to report: `Some([])` for none at all, and the server's choice, which is
-  /// failure and often delay, where `None`.
+  /// The events to report: `Some([])` for none at all, and the server's choice, usually failure
+  /// and often delay, if `None`.
   notify: Option<List<Event>>,
-  /// Whether to name each recipient to the servers as it was first addressed, so that a report
-  /// names it so after it was rewritten on the way.
+  /// Whether to tell the servers each recipient's original address, so that a report still names
+  /// it that way after it was rewritten in transit.
   original: Bool,
 }
 
-/// Nothing asked: reports are made as the servers choose.
+/// Nothing requested: reports are made as the servers choose.
 pub fn no_dsn() -> Dsn = { ret: None, envelope_id: None, notify: None, original: false }
 
 fn requests_reports(d: Dsn) -> Bool = d != no_dsn()
 
-/// `text` as RFC 3461 §4 carries it in a parameter: printable ASCII as it is, but for `+` and
-/// `=`, and every other byte as `+` and two hex digits.
+/// `text` encoded as RFC 3461 §4 requires in a parameter: printable ASCII as it is, except `+`
+/// and `=`, and every other byte as `+` and two hex digits.
 pub fn xtext(text: String) -> String / {abort.raise} = {
   let raw = Bytes::of_string(text);
   String::join(
@@ -750,14 +752,13 @@ pub fn xtext(text: String) -> String / {abort.raise} = {
 /// The two upper-case hex digits of a byte.
 fn upper_hex(b: Int) -> String / {abort.raise} = byte_of_int(b).hex_of().ascii_upper()
 
-/// An address as the envelope carries it: in ASCII, its domain's A-labels, wherever its local
-/// part is ASCII, so that only a local part outside ASCII needs `SMTPUTF8`.
+/// An address as the envelope carries it: in ASCII with its domain's A-labels whenever its local
+/// part is ASCII, so that only a non-ASCII local part needs `SMTPUTF8`.
 fn path_text(a: Address) -> String =
   match email::ascii_text(a) { Some(text) -> text, None -> show(a) }
 
-/// An address as `ORCPT` names it: `rfc822;` and its text in `xtext`, or under RFC 6533
-/// `utf-8;` and its text with `\x{..}` for what a parameter cannot hold, where it is outside
-/// ASCII.
+/// An address as `ORCPT` writes it: `rfc822;` and its text in `xtext`, or, for a non-ASCII
+/// address, RFC 6533's `utf-8;` and its text with `\x{..}` for what a parameter cannot contain.
 fn original_of(a: Address) -> String / {abort.raise} =
   if email::is_ascii(a) { "rfc822;" ++ xtext(path_text(a)) } else {
     "utf-8;"
@@ -799,24 +800,24 @@ fn is_envelope_id(id: String) -> Bool / {abort.raise} =
 
 // --- What a caller requires ---------------------------------------------------
 
-/// How much a caller requires of the connection before a credential or a message crosses it.
+/// What a caller requires of the connection before a credential or a message is sent over it.
 pub type Tls =
-  /// TLS, or nothing is sent: on a connection that is not TLS the client asks for `STARTTLS`
-  /// and refuses a server that does not offer it or does not grant it.
+  /// TLS, or nothing is sent: on a connection that is not TLS the client sends `STARTTLS` and
+  /// rejects a server that does not offer or accept it.
   | RequireTls
-  /// TLS where the server offers it, and the connection as it is where it does not. Whoever
-  /// stands between the two ends can take the offer out, so this protects against a listener
-  /// and not against a forger.
+  /// TLS if the server offers it, and the plain connection if it does not. Anyone between the
+  /// two ends can remove the offer, so this protects against an eavesdropper but not against an
+  /// active attacker.
   | Opportunistic
-  /// No TLS: the client never asks for it. For a server on the same host, and for a test.
+  /// No TLS: the client never requests it. For a server on the same host, and for a test.
   | Plain
 
-/// Whether a credential may be sent where anyone on the path reads it.
+/// Whether a credential may be sent where anyone on the path can read it.
 pub type Exposure =
   /// A mechanism that sends the credential itself is used only over TLS.
   | Protected
-  /// Such a mechanism is used on a connection that is not TLS too: the password or the token
-  /// crosses the network as it is.
+  /// Such a mechanism is also used on a connection that is not TLS: the password or the token
+  /// travels the network in the clear.
   | PasswordInClear
 
 /// What a client is configured as: the name it greets a server by, what it requires of the
@@ -833,8 +834,8 @@ pub opaque type Config = new {
 }
 
 /// A client that greets a server as `client`, its own domain or its address in brackets
-/// (`[192.0.2.1]`), requires TLS, has no credential, and waits as `default_timeouts` says.
-/// Raises `smtp.refused(BadClientName)` for a name that is neither.
+/// (`[192.0.2.1]`), requires TLS, has no credential, and waits as `default_timeouts` sets.
+/// Raises `smtp.fail(BadClientName)` for a name that is neither.
 pub fn config(client: String, limits: Limits) -> Config / {smtp.fail, abort.raise} =
   match email::parse_address("postmaster@" ++ client) {
     Err(_) -> smtp.fail(BadClientName),
@@ -854,42 +855,42 @@ pub fn config(client: String, limits: Limits) -> Config / {smtp.fail, abort.rais
 /// `c` requiring this much of the connection.
 pub fn with_tls(c: Config, policy: Tls) -> Config = { ..c, tls: policy }
 
-/// `c` proving itself with `held` to a server that offers `AUTH`, and refusing one that does
-/// not.
+/// `c` proving its identity with `held` to a server that offers `AUTH`, and rejecting one that
+/// does not.
 pub fn with_credential(c: Config, held: Credential) -> Config = { ..c, credential: Some(held) }
 
-/// `c` taking only these mechanisms, the first that the server offers and the credential
-/// serves. Without this it takes `std.sasl`'s, in their order.
+/// `c` using only these mechanisms: the first one the server offers that suits the credential.
+/// Without this it uses `std.sasl`'s, in their order.
 pub fn with_mechanisms(c: Config, order: List<Mechanism>) -> Config = { ..c, mechanisms: order }
 
 /// `c` sending a credential under this much protection.
 pub fn with_exposure(c: Config, e: Exposure) -> Config = { ..c, exposure: e }
 
-/// `c` saying `HELO` to a server that refuses `EHLO`, which then offers no extension at all.
+/// `c` sending `HELO` to a server that rejects `EHLO`; such a server then offers no extensions.
 pub fn with_helo_fallback(c: Config) -> Config = { ..c, helo: true }
 
-/// `c` waiting as `t` says.
+/// `c` with the waits `t` sets.
 pub fn with_timeouts(c: Config, t: Timeouts) -> Config = { ..c, timeouts: t }
 
 // --- Outcomes -----------------------------------------------------------------
 
-/// The command a server refused a message at.
+/// The command at which a server rejected a message.
 pub type Stage =
   /// `MAIL FROM`: the sender, or the message's size or kind.
   | AtMail
   /// `RCPT TO`: this recipient.
   | AtRcpt
-  /// `DATA`: every recipient it had taken.
+  /// `DATA`: every recipient it had accepted.
   | AtData
   /// The message itself, once it had read it.
   | AtEnd
 
 /// What became of a message for one recipient.
 pub type Outcome =
-  /// The server took responsibility for delivering it, with what it said, which often names the
-  /// message in its queue.
+  /// The server took responsibility for delivering it, with its reply, which often gives the
+  /// message's queue id.
   | Accepted(Reply)
-  /// Not this time: the same message may be taken later.
+  /// Not now: the same message may be accepted later.
   | Temporary(Stage, Reply)
   /// No, and not later either.
   | Permanent(Stage, Reply)
@@ -900,11 +901,11 @@ pub type Delivery = { recipient: Address, outcome: Outcome }
 /// Whether sending again later may succeed where this did not.
 pub fn retryable(o: Outcome) -> Bool = match o { Temporary(_, _) -> true, _ -> false }
 
-/// Whether the server took the message for this recipient.
+/// Whether the server accepted the message for this recipient.
 pub fn accepted(o: Outcome) -> Bool = match o { Accepted(_) -> true, _ -> false }
 
-/// A failure at `stage`. RFC 5321 §4.5.3.1.10 has a client read 552 in answer to `RCPT` as too
-/// many recipients for one message, which is 452's meaning: the rest are sent again.
+/// A failure at `stage`. RFC 5321 §4.5.3.1.10 has a client treat 552 in reply to `RCPT` as too
+/// many recipients for one message, which is what 452 means: the rest are sent again.
 fn failure(stage: Stage, r: Reply) -> Outcome =
   if class_of(r.code) == Transient || (stage == AtRcpt && number(r.code) == 552) {
     Temporary(stage, r)
@@ -912,9 +913,9 @@ fn failure(stage: Stage, r: Reply) -> Outcome =
 
 // --- The engine ---------------------------------------------------------------
 
-/// What an engine is told of the connection it speaks over.
+/// What an engine knows of the connection it runs over.
 pub type Link = new {
-  /// The host connected to, which a token mechanism names to the server.
+  /// The host connected to, which a token mechanism sends to the server.
   host: String,
   port: Int,
   /// Whether the connection is TLS already.
@@ -923,7 +924,7 @@ pub type Link = new {
   nonce: String,
 }
 
-/// What a reply to come answers.
+/// Which command an expected reply answers.
 type Expect =
   | ForGreeting
   | ForEhlo
@@ -952,7 +953,7 @@ fn phase_of(x: Expect) -> Phase =
     ForQuit -> Quit,
   }
 
-/// What an engine does once every reply it waits for has come.
+/// What an engine does once every reply it waits for has arrived.
 type NextAction =
   | SayHello
   | SayHelo
@@ -964,17 +965,17 @@ type NextAction =
   | Idle
   | Finish
 
-/// A command of a transaction, and what its reply answers.
+/// A command of a transaction, and the reply it expects.
 type Command = { words: String, expect: Expect }
 
-/// What the server has said to `DATA` and to the message after it.
+/// How the server has replied to `DATA` and to the message after it.
 type DataState = | Unasked | Go | Stopped(Reply) | Ended(Reply)
 
 /// The reply that ended a transaction early, and the command it answered.
 type EarlyEnd = { stage: Stage, by: Reply }
 
-/// A message on its way: the commands not yet sent, the bytes that follow `DATA`, and what the
-/// server has said of the sender and of each recipient.
+/// A message on its way: the commands not yet sent, the bytes that follow `DATA`, and the
+/// server's replies about the sender and each recipient.
 type Transaction = {
   queue: List<Command>,
   payload: Bytes,
@@ -1004,18 +1005,18 @@ type State = {
   over: Bool,
 }
 
-/// One end of an SMTP session as a value: what the client knows of the server, what it waits
-/// for, and the bytes it holds of a reply not yet whole. It reads nothing and writes nothing:
-/// `feed` is given what the server sent and answers what to send back.
+/// The client end of an SMTP session as a value: what the client knows of the server, what it is
+/// waiting for, and the bytes it has of an incomplete reply. It reads nothing and writes nothing:
+/// `feed` is given what the server sent and returns what to send back.
 pub opaque type Engine = | Engine(State)
 
-/// What to write to the server. It shows as it is, but for a line of an `AUTH` exchange, which
-/// shows as stars.
+/// What to write to the server. It shows as it is, except for a line of an `AUTH` exchange,
+/// which shows as stars.
 pub type Wire =
   /// These bytes, written with `net.send`.
   | Open(Bytes)
-  /// A line of an `AUTH` exchange: the bytes before what the client says, what it says, sealed,
-  /// and the line's end, written with `net.send_secret` as the first, the second in base64, and
+  /// A line of an `AUTH` exchange: the bytes before the client's response, the response as a
+  /// secret, and the line's end. `net.send_secret` writes the first, the second in base64, and
   /// the third.
   | Veiled(Bytes, Secret<Bytes>, Bytes)
 
@@ -1031,14 +1032,14 @@ fn wire_size(w: Wire) -> Int =
     Veiled(lead, reply_of, end) -> lead.len() + (reply_of.len() + 2) / 3 * 4 + end.len(),
   }
 
-/// One line of an exchange, as a session keeps it. No line of it holds a credential: what the
-/// client says in an `AUTH` exchange is kept as stars.
+/// One line of an exchange, as a session stores it. No line contains a credential: what the
+/// client sends in an `AUTH` exchange is stored as stars.
 pub type Line =
   /// A line the client sent, without its line break.
   | Client(String)
   /// A line the server sent.
   | Server(String)
-  /// The message, in this many bytes as they were sent, the dot that ends them among them.
+  /// The message, as this many bytes sent, including the dot that ends it.
   | Payload(Int)
   /// The connection became TLS.
   | Upgraded
@@ -1047,17 +1048,16 @@ pub type Line =
 pub type Next =
   /// Read from the server, within the wait the phase is allowed, and `feed` what arrives.
   | Await(Phase)
-  /// Start TLS on the connection, with `unread` handed to whatever starts it, and then call
+  /// Start TLS on the connection, passing `unread` to whatever starts it, and then call
   /// `tls_started`.
   | Secure
-  /// Nothing: the session takes a command.
+  /// Nothing: the session is ready for a command.
   | Ready
   /// Close the connection: the session is over.
   | Over
 
-/// One step of an engine: where it stands now, what to write to the server before anything
-/// else, what to do after that, the lines of the exchange this step read and wrote, and how
-/// many whole replies it read.
+/// One step of an engine: its new state, what to write to the server first, what to do after
+/// that, the lines of the exchange this step read and wrote, and how many whole replies it read.
 pub type Turn = { engine: Engine, out: Wire, next: Next, said: List<Line>, answered: Int }
 
 fn state(e: Engine) -> State = match e { Engine(s) -> s }
@@ -1065,7 +1065,7 @@ fn state(e: Engine) -> State = match e { Engine(s) -> s }
 fn turn(s: State, out: Wire, next: Next, reply_of: List<Line>, replies_read: Int) -> Turn =
   { engine: Engine(s), out: out, next: next, said: reply_of, answered: replies_read }
 
-/// An engine for a connection just made, which waits for the server's greeting.
+/// An engine for a newly made connection, waiting for the server's greeting.
 pub fn start(c: Config, link: Link) -> Turn =
   turn(
     {
@@ -1089,8 +1089,8 @@ pub fn start(c: Config, link: Link) -> Turn =
     0,
   )
 
-/// What the server offered in answer to the last `EHLO`; `None` before one is answered, and
-/// again from the moment TLS starts until the `EHLO` after it is.
+/// What the server offered in reply to the last `EHLO`. `None` before the first reply, and again
+/// from the moment TLS starts until the server replies to the next `EHLO`.
 pub fn offered(e: Engine) -> Option<Capabilities> = state(e).offered
 
 /// Whether the connection is TLS.
@@ -1102,12 +1102,12 @@ pub fn authenticated(e: Engine) -> Bool = state(e).authenticated
 /// What became of the last message for each of its recipients, in the envelope's order.
 pub fn deliveries(e: Engine) -> List<Delivery> = state(e).done
 
-/// The bytes the engine was fed and has not read as a line yet: what whoever starts TLS on the
-/// connection is handed, and refuses the upgrade over.
+/// The bytes the engine was fed and has not yet read as a line. They are passed to whatever
+/// starts TLS on the connection, which rejects the upgrade if there are any.
 pub fn unread(e: Engine) -> Bytes = state(e).held
 
-/// How many bytes the engine holds of the reply it is reading: at most `Limits.reply`, since
-/// it refuses the byte past that.
+/// How many bytes of the reply being read the engine stores: at most `Limits.reply`, since it
+/// rejects any byte past that.
 pub fn buffered_size(e: Engine) -> Int = state(e).partial.size + state(e).held.len()
 
 /// How many bytes a transport may read for the engine now: what is left of `Limits.reply` for
@@ -1119,14 +1119,13 @@ pub fn config_of(e: Engine) -> Config = state(e).config
 
 fn ready(s: State) -> Bool = s.pending.len() == 0 && s.todo == Idle && !s.over
 
-/// The engine after the server sent `data`: every whole reply in it is taken as the answer to
-/// the oldest command still unanswered, and once none is unanswered the next command is
-/// written.
+/// The engine after the server sent `data`. Each whole reply in it is taken as the reply to the
+/// oldest command still waiting for one, and once none is waiting the next command is written.
 ///
-/// Raises `smtp.refused` for a reply that does not read, one the command it answers has no
-/// place for, bytes past the last reply asked for (`Unsolicited`, or `Injected` where they
-/// follow the leave to start TLS), and whatever keeps the session from going on: no TLS where
-/// it is required, no mechanism, a credential refused.
+/// Raises `smtp.fail` for a reply that cannot be read, a reply its command does not expect, bytes
+/// past the last expected reply (`Unsolicited`, or `Injected` when they follow the go-ahead to
+/// start TLS), and anything that keeps the session from continuing: no TLS when it is required,
+/// no usable mechanism, or a rejected credential.
 pub fn feed(e: Engine, data: Bytes) -> Turn / {smtp.fail, abort.raise} = {
   let s = state(e);
   let held = s.held.concat(data);
@@ -1171,7 +1170,7 @@ fn absorb(
     },
   }
 
-/// A reply as the lines a session keeps of it.
+/// A reply as the lines a session stores for it.
 fn reply_lines(r: Reply) -> List<Line> = {
   let end = r.lines.len() - 1;
   list::enumerate(r.lines).map(|l: { index: Int, value: String }|
@@ -1181,7 +1180,7 @@ fn reply_lines(r: Reply) -> List<Line> = {
     ))
 }
 
-/// The state after `r` answered `awaited`.
+/// The state after `r` arrived in reply to `awaited`.
 fn handle_reply(s: State, awaited: Expect, r: Reply) -> State / {smtp.fail, abort.raise} = {
   let kind = class_of(r.code);
   match awaited {
@@ -1207,9 +1206,9 @@ fn handle_reply(s: State, awaited: Expect, r: Reply) -> State / {smtp.fail, abor
   }
 }
 
-/// The state after `r` answered a step of an `AUTH` exchange: 334 carries what the server says
-/// next, 235 is its word that the client is who it says, and anything else is a refusal. A 235
-/// before the mechanism has the server proved is refused, not believed.
+/// The state after `r` arrived in reply to a step of an `AUTH` exchange. 334 carries the server's
+/// next challenge, 235 states that the client is authenticated, and anything else is a rejection.
+/// A 235 that arrives before the mechanism has verified the server is rejected, not trusted.
 fn handle_auth_reply(s: State, r: Reply) -> State / {smtp.fail, abort.raise} =
   match s.proving {
     None -> smtp.fail(Unsolicited),
@@ -1241,9 +1240,9 @@ fn handle_auth_reply(s: State, r: Reply) -> State / {smtp.fail, abort.raise} =
     else { smtp.fail(Unexpected(Auth, r)) },
   }
 
-/// The state after `r` answered a command of the transaction `j`. A 421 says the server is
-/// closing the connection: it ends the transaction and the session, and every recipient not
-/// yet answered for is told to try again.
+/// The state after `r` arrived in reply to a command of the transaction `j`. A 421 means the
+/// server is closing the connection: it ends the transaction and the session, and every recipient
+/// without a result yet is marked to try again.
 fn handle_transaction_reply(
   s: State,
   j: Transaction,
@@ -1311,8 +1310,8 @@ fn take_next_action(
     Finish -> turn(s, Open(b""), Over, reply_of, replies_read),
   }
 
-/// A line of an `AUTH` exchange: `lead`, and what the client says in base64, or `=` where it
-/// says nothing after a command.
+/// A line of an `AUTH` exchange: `lead`, and the client's response in base64, or `=` when the
+/// response after a command is empty.
 fn auth_line(lead: String, response: sasl::Response) -> Wire = {
   let reply_of = sasl::said(response);
   let marked = if lead != "" && reply_of.is_empty() { lead ++ "=" } else { lead };
@@ -1335,10 +1334,10 @@ fn send_command(
     replies_read,
   )
 
-/// The turn that proves the configured credential, or the one that is ready where there is
-/// none. The mechanism is the first the configuration takes that the server offers and the
-/// credential serves; one that sends the credential itself is passed over on a connection that
-/// is not TLS unless `PasswordInClear` is asked for.
+/// The turn that proves the configured credential, or a ready turn if there is none. The
+/// mechanism is the first in the configuration that the server offers and that suits the
+/// credential. One that sends the credential itself is skipped on a connection that is not TLS
+/// unless `PasswordInClear` is set.
 fn authenticate(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {smtp.fail} =
   match s.config.credential {
     None -> turn({ ..s, todo: Idle }, Open(b""), Ready, reply_of, replies_read),
@@ -1368,7 +1367,7 @@ fn authenticate(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {sm
               Some(said_first) -> Some(auth_line(words ++ " ", said_first)),
               None -> None,
             };
-            // RFC 4954 §4: a response that takes the command past 512 octets waits to be asked.
+            // RFC 4954 §4: a response that would push the command past 512 octets waits.
             match inline {
               Some(line) if wire_size(line) <= 512 ->
                 turn(
@@ -1403,7 +1402,7 @@ fn authenticate(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {sm
     },
   }
 
-/// The next step of a transaction: its next command, the message after the leave to send it,
+/// The next step of a transaction: its next command, the message after the go-ahead to send it,
 /// or its end.
 fn advance(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {abort.raise} =
   match s.job {
@@ -1422,7 +1421,7 @@ fn advance(s: State, reply_of: List<Line>, replies_read: Int) -> Turn / {abort.r
         )
       },
       _ -> if j.data != Go || s.over { finish_transaction(s, j, reply_of, replies_read) } else {
-        // A server that gives leave to send a message it took no recipient for is sent none.
+        // A server that gives the go-ahead with no recipient accepted is sent only the final dot.
         let body = if j.mail == None && j.taken.len() > 0 { j.payload } else { b".\r\n" };
         turn(
           { ..s, job: Some({ ..j, data: Unasked }), pending: [ForEnd], todo: Advance },
@@ -1474,9 +1473,9 @@ fn recipient_outcome(j: Transaction, a: Address) -> Outcome / {abort.raise} =
     },
   }
 
-/// The engine after TLS started on its connection: it forgets what the server offered before,
-/// which anyone could have written, and says `EHLO` again. Raises `smtp.refused(NotReady)` for
-/// an engine that did not ask for it.
+/// The engine after TLS started on its connection. It forgets what the server offered before,
+/// which anyone could have written, and sends `EHLO` again. Raises `smtp.fail(NotReady)` for an
+/// engine that did not request TLS.
 pub fn tls_started(e: Engine) -> Turn / {smtp.fail, abort.raise} = {
   let s = state(e);
   if s.todo != StartHandshake || s.pending.len() > 0 || s.held.len() > 0 { smtp.fail(NotReady) }
@@ -1489,8 +1488,8 @@ pub fn tls_started(e: Engine) -> Turn / {smtp.fail, abort.raise} = {
   }
 }
 
-/// The engine after the server closed the connection: over, where that answers `QUIT` or
-/// nothing was awaited, and `smtp.refused(Closed(..))` naming the phase otherwise.
+/// The engine after the server closed the connection: over, if that was the reply to `QUIT` or
+/// nothing was awaited. Otherwise raises `smtp.fail(Closed(..))` naming the phase.
 pub fn connection_closed(e: Engine) -> Turn / {smtp.fail} = {
   let s = state(e);
   match s.pending.first() {
@@ -1499,17 +1498,17 @@ pub fn connection_closed(e: Engine) -> Turn / {smtp.fail} = {
   }
 }
 
-/// The turn that sends `data` under `envelope`: `MAIL FROM`, a `RCPT TO` for each recipient
-/// and `DATA`, all at once to a server that offers `PIPELINING` and one at a time to any other,
-/// after a `RSET` where the session has sent a message before. The message follows the
-/// server's leave to send it, dot-stuffed, and is not sent at all where no recipient was
-/// taken. `deliveries` answers what became of it once the engine is `Ready` again.
+/// The turn that sends `data` under `envelope`: `MAIL FROM`, a `RCPT TO` for each recipient and
+/// `DATA`, all at once to a server that offers `PIPELINING` and one at a time to any other, after
+/// a `RSET` if the session has sent a message before. The message follows the server's go-ahead,
+/// dot-stuffed, and is not sent at all if no recipient was accepted. `deliveries` returns what
+/// became of it once the engine is `Ready` again.
 ///
-/// Raises `smtp.refused` before anything is written, and leaves the session as it was, for an
-/// envelope to no one (`NoRecipients`), a message that is not CRLF lines (`Unsendable`,
-/// `NulByte`, `Unterminated`), one past the size the server takes (`TooLarge`), one that needs
-/// `8BITMIME`, `SMTPUTF8` or `DSN` from a server that does not offer it (`MissingExtension`), and an
-/// envelope identifier that is none (`BadEnvelopeId`); and `NotReady` for an engine that is
+/// Raises `smtp.fail` before anything is written, leaving the session as it was, for an envelope
+/// to no one (`NoRecipients`), a message that is not CRLF lines (`Unsendable`, `NulByte`,
+/// `Unterminated`), one past the size the server accepts (`TooLarge`), one that needs
+/// `8BITMIME`, `SMTPUTF8` or `DSN` from a server that does not offer it (`MissingExtension`), and
+/// an invalid envelope identifier (`BadEnvelopeId`). Raises `NotReady` for an engine that is
 /// waiting or over.
 pub fn mail(
   e: Engine,
@@ -1556,8 +1555,8 @@ pub fn mail(
   }
 }
 
-/// What of a message decides how it is declared: its size, whether it holds a byte past 127,
-/// and whether an address of its envelope or a byte of its header is outside ASCII.
+/// The facts about a message that decide how it is declared: its size, whether it contains a byte
+/// past 127, and whether an address of its envelope or a byte of its header is not ASCII.
 type Shape = { size: Int, eight_bit: Bool, utf8: Bool }
 
 fn shape_of(envelope: Envelope, data: Bytes) -> Shape = {
@@ -1567,7 +1566,7 @@ fn shape_of(envelope: Envelope, data: Bytes) -> Shape = {
   { size: n, eight_bit: high < n, utf8: envelope.utf8 || high < head_end }
 }
 
-/// Why a server that offers `c` is not sent `data` under `envelope`; `None` where it is.
+/// Why `data` under `envelope` cannot be sent to a server that offers `c`; `None` if it can.
 fn send_error(
   c: Capabilities,
   envelope: Envelope,
@@ -1592,8 +1591,8 @@ fn send_error(
     }
   }
 
-/// The commands that send a message of this shape under `envelope`: `RSET` where `again` says
-/// the session sent one before, `MAIL FROM` with what the server is told of the message,
+/// The commands that send a message of this shape under `envelope`: `RSET` if `again` shows the
+/// session sent one before, `MAIL FROM` with what the server is told about the message,
 /// a `RCPT TO` for each recipient, and `DATA`.
 fn commands_of(
   c: Capabilities,
@@ -1620,8 +1619,8 @@ fn commands_of(
   )
 }
 
-/// The turn that says `QUIT`; for an engine that is over already, the turn that is over.
-/// Raises `smtp.refused(NotReady)` for an engine that is waiting for an answer.
+/// The turn that sends `QUIT`; for an engine that is already over, a turn that is over. Raises
+/// `smtp.fail(NotReady)` for an engine that is waiting for a reply.
 pub fn leave(e: Engine) -> Turn / {smtp.fail} = {
   let s = state(e);
   if s.over { turn(s, Open(b""), Over, [], 0) }
@@ -1631,9 +1630,8 @@ pub fn leave(e: Engine) -> Turn / {smtp.fail} = {
 
 // --- Sessions over a connection -----------------------------------------------
 
-/// An SMTP session on an open connection: the handle `std.net` gave, and the engine that
-/// speaks over it. The label it was opened under is the one every function here takes it
-/// under.
+/// An SMTP session on an open connection: the handle from `std.net`, and the engine that runs
+/// over it. Every function here takes the session under the label it was opened with.
 pub opaque type Session = new {
   handle: Int,
   engine: Engine,
@@ -1641,28 +1639,30 @@ pub opaque type Session = new {
   kept: List<Line>,
 }
 
-/// A message sent: the session to send the next one over, and what became of this one for each
-/// of its recipients, in the envelope's order. A message is sent only so far as every outcome
-/// here is `Accepted`.
+/// A sent message: the session to send the next one over, and what became of this one for each
+/// of its recipients, in the envelope's order. The message reached every recipient only if every
+/// outcome here is `Accepted`.
 pub type SendResult = { session: Session, deliveries: List<Delivery> }
 
 /// What a session was driven to: its engine, and the lines exchanged on the way.
 type DriveResult = { engine: Engine, said: List<Line> }
 
-/// The instant a wait of `ms` from now ends, or the deadline around the call where that is
-/// earlier, as `std.net`'s `dial` holds its own: an outer `task::timeout` bounds a session whole.
+/// The instant a wait of `ms` from now ends, or the deadline around the call if that is earlier,
+/// as `std.net`'s `dial` does for its own waits. So an outer `task::timeout` bounds the whole
+/// session.
 fn deadline_after(ms: Int) -> Instant / {clock.read, task::deadline.at} = {
   let own = after(clock.now(), millis(ms));
   match task::earliest(Some(own), task::deadline.at()) { Some(earlier) -> earlier, None -> own }
 }
 
-/// One read of what the server sends, waiting until `end` and no longer: `None` once it passed.
+/// One read of what the server sends, waiting until `end` and no longer: `None` once `end` has
+/// passed.
 fn read_by<[l]>(h: Int, most: Int, end: Instant) -> Option<Bytes> / {net.recv[l], clock.read} =
   match net::ms_left(end) { None -> None, Some(ms) -> net.recv[l](h, most, ms) }
 
-/// Every byte of `out` written by `end`; `false` where the connection stopped taking them. A line
-/// of an `AUTH` exchange goes by `net.send_secret`, so what the client says there is never a
-/// plain value.
+/// Writes every byte of `out` by `end`; `false` if the connection stopped accepting them. A line
+/// of an `AUTH` exchange is sent with `net.send_secret`, so the client's response there is never
+/// a plain value.
 fn sent_by<[l]>(
   h: Int,
   out: Wire,
@@ -1677,8 +1677,8 @@ fn sent_by<[l]>(
     },
   }
 
-/// The connection `h` secured as its client by `net.start_tls`, verifying the server as `host`,
-/// within `ms`: `None` where it is, and why where it is not. Plaintext that waited at the
+/// Secures the connection `h` as its client with `net.start_tls`, verifying the server as `host`,
+/// within `ms`. Returns `None` on success and the error otherwise. Plaintext waiting at the
 /// upgrade, in `unread` or on the socket, is `Injected`, as the engine's own check calls it.
 fn upgrade<[l]>(
   h: Int,
@@ -1696,11 +1696,11 @@ fn upgrade<[l]>(
     },
   }
 
-/// Writes what `t` says and does what it says next, until the engine is ready or over. A wait
-/// for a reply ends at an instant: `deadline_after` the phase's time from when the command was written
-/// or the reply before it ended, and `end` while a reply is half read, so a reply that trickles
-/// in is held to one wait. `secure` starts TLS and answers why it could not, or nothing. `left`
-/// bounds the rounds: each takes what one read brought, or starts TLS.
+/// Writes `t.out` and does what `t.next` directs, until the engine is ready or over. A wait for a
+/// reply ends at an instant: `deadline_after` the phase's time from when the command
+/// was written or the previous reply ended, and `end` while a reply is half read, so a reply that
+/// trickles in gets one wait in total. `secure` starts TLS and returns why it could not, or
+/// `None`. `left` bounds the rounds: each handles one read, or starts TLS.
 fn drive<[l] | e>(
   h: Int,
   t: Turn,
@@ -1752,8 +1752,8 @@ fn trim_transcript(limits: Limits, kept: List<Line>, reply_of: List<Line>) -> Li
   lines.drop(lines.len() - max(limits.transcript, 0))
 }
 
-/// The session on the connection `h`, greeted, secured as `c` requires and authenticated; the
-/// connection closed, and `smtp.refused` raised, where it does not get that far.
+/// The session on the connection `h`, greeted, secured as `c` requires, and authenticated. If it
+/// does not get that far, the connection is closed and `smtp.fail` raised.
 fn established<[l] | e>(
   h: Int,
   c: Config,
@@ -1783,12 +1783,12 @@ fn connected<[l]>(
   }
 
 /// A session with the server at `host` and `port` over TLS from its first byte, as port 465
-/// serves it (RFC 8314): the handshake completed and the server verified as `host` before it
-/// is greeted, and then `c`'s credential given where it has one.
+/// serves it (RFC 8314). The handshake completes and the server is verified as `host` before the
+/// greeting, and then `c`'s credential is given if it has one.
 ///
-/// Raises `smtp.refused`, with the connection closed: `Unreachable`, `HandshakeFailed` with
-/// `std.net`'s reason for a server that is not `host` or agrees on no TLS, and whatever `feed`
-/// raises of the greeting, of what the server offers and of the credential.
+/// Raises `smtp.fail`, with the connection closed: `Unreachable`, `HandshakeFailed` with
+/// `std.net`'s reason for a server that is not `host` or shares no TLS version, and whatever
+/// `feed` raises for the greeting, the server's offer, or the credential.
 pub fn open_tls<[l]>(
   host: String,
   port: Int,
@@ -1811,12 +1811,12 @@ pub fn open_tls<[l]>(
 }
 
 /// A session with the server at `host` and `port` over a connection that starts in the clear,
-/// as ports 587 and 25 serve it: greeted, upgraded by `STARTTLS` as `c` requires, the server
-/// verified as `host`, and given `c`'s credential where it has one.
+/// as ports 587 and 25 serve it: greeted, upgraded by `STARTTLS` as `c` requires, with the server
+/// verified as `host`, and given `c`'s credential if it has one.
 ///
-/// Raises `smtp.refused`, with the connection closed: `Unreachable`, `NoTls` where TLS is
-/// required and not offered, `Injected` for bytes the server sent between its leave to start
-/// TLS and the handshake, `HandshakeFailed` with `std.net`'s reason, and whatever `feed` raises.
+/// Raises `smtp.fail`, with the connection closed: `Unreachable`, `NoTls` when TLS is required
+/// and not offered, `Injected` for bytes the server sent between its go-ahead to start TLS and
+/// the handshake, `HandshakeFailed` with `std.net`'s reason, and whatever `feed` raises.
 pub fn open<[l]>(
   host: String,
   port: Int,
@@ -1831,13 +1831,13 @@ pub fn open<[l]>(
   )
 }
 
-/// Sends `data` under `envelope` and answers what became of it for each recipient, never a
-/// bare success: a recipient the server refused, or told to try later, is in the answer with
-/// what the server said. `dsn_request` is what to ask of the servers about delivery reports.
+/// Sends `data` under `envelope` and returns what became of it for each recipient, never a plain
+/// success. A recipient the server rejected, or told to try later, is in the result with the
+/// server's reply. `dsn_request` is what to request of the servers about delivery reports.
 ///
-/// Raises `smtp.refused`. Where `usable` says so the message was refused before any of it was
-/// written and the session is as it was; otherwise the exchange went wrong and the session is
-/// good only for `close`.
+/// Raises `smtp.fail`. If `usable` returns `true` for the error, the message was rejected before
+/// any of it was written and the session is as it was. Otherwise the exchange failed and the
+/// session is good only for `close`.
 pub fn submit<[l]>(
   s: Session,
   envelope: Envelope,
@@ -1862,10 +1862,10 @@ pub fn submit<[l]>(
   }
 }
 
-/// Sends a draft to everyone `std.email`'s `envelope` names, its `Bcc` recipients among them
-/// and their field left out: written in ASCII wherever the draft can be, under a boundary drawn
-/// from the host's entropy. Answers and raises as `submit` does, and `Unwritable` for a draft
-/// with no bytes.
+/// Sends a draft to everyone `std.email`'s `envelope` names, including its `Bcc` recipients, with
+/// their field left out. It is written in ASCII wherever the draft allows, with a boundary drawn
+/// from the host's entropy. Returns and raises as `submit` does, and raises `Unwritable` for a
+/// draft that cannot be written.
 pub fn send<[l]>(
   s: Session,
   d: Draft,
@@ -1876,9 +1876,10 @@ pub fn send<[l]>(
     Err(why) -> smtp.fail(Unwritable(why)),
   }
 
-/// Sends a message read on to everyone its fields name, as `std.email`'s `message_envelope`
-/// reads them: the bytes it was read from, without its `Bcc` and `Resent-Bcc` lines. Answers
-/// and raises as `submit` does, and `Unreadable` for a message that names no envelope.
+/// Forwards a message that was read to everyone its fields name, as `std.email`'s
+/// `message_envelope` reads them: the bytes it was read from, without its `Bcc` and `Resent-Bcc`
+/// lines. Returns and raises as `submit` does, and raises `Unreadable` for a message that names no
+/// envelope.
 pub fn relay<[l]>(
   s: Session,
   m: Message,
@@ -1895,8 +1896,8 @@ pub fn relay<[l]>(
     Err(why) -> smtp.fail(Unreadable(why)),
   }
 
-/// Says `QUIT` and waits for the server's answer, for as long as `Timeouts.quit_ms` allows. A
-/// server that does not answer, or a session that is over, is left as it is.
+/// Sends `QUIT` and waits for the server's reply, for as long as `Timeouts.quit_ms` allows. A
+/// server that does not reply, or a session that is over, is left as it is.
 fn farewell<[l]>(
   s: Session,
 ) -> Unit / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, abort.raise} =
@@ -1907,8 +1908,8 @@ fn farewell<[l]>(
     Err(_) -> (),
   }
 
-/// Ends a session: `QUIT`, the server's answer where it gives one in time, and the connection
-/// closed.
+/// Ends a session: sends `QUIT`, waits for the server's reply if it comes in time, and closes the
+/// connection.
 pub fn quit<[l]>(
   s: Session,
 ) -> Unit / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, abort.raise} = {
@@ -1916,13 +1917,13 @@ pub fn quit<[l]>(
   net.close[l](s.handle)
 }
 
-/// Closes a session's connection and says nothing: what is left to do with a session after a
-/// refusal `usable` answers `false` for.
+/// Closes a session's connection without sending anything: all that is left to do after an error
+/// for which `usable` returns `false`.
 pub fn close<[l]>(s: Session) -> Unit / {net.close[l]} = net.close[l](s.handle)
 
-/// What `body` answers over a TLS session with the server at `host` and `port`, opened as
-/// `open_tls` opens one and held for `body` alone: told `QUIT` when `body` answers, and closed
-/// however `body` ends. `body` neither quits nor closes the session it is given.
+/// What `body` returns over a TLS session with the server at `host` and `port`, opened as
+/// `open_tls` opens one and kept for `body` alone. The session is sent `QUIT` when `body` returns,
+/// and closed however `body` ends. `body` neither quits nor closes the session it is given.
 pub fn with_session_tls<a, [l] | e>(
   host: String,
   port: Int,
@@ -1957,8 +1958,8 @@ pub fn offered_to(s: Session) -> Option<Capabilities> = offered(s.engine)
 /// first. No credential is among them.
 pub fn transcript(s: Session) -> List<Line> = s.kept
 
-/// Lines of an exchange as text, one to a line: `C:` before what the client said, `S:` before
-/// what the server said, and `*:` before what is neither.
+/// Lines of an exchange as text, one per line: `C:` before what the client sent, `S:` before what
+/// the server sent, and `*:` before anything else.
 pub fn transcript_text(lines: List<Line>) -> String =
   String::join(
     lines.map(|l: Line|
@@ -2030,10 +2031,10 @@ fn reads() -> List<Read> =
     { data: b"", expect: Err(BadLine) },
   ]
 
-test "the reply {r.data} is its code and the text of each of its lines, or refused" for r: Read in reads(
+test "the reply {r.data} is its code and the text of each of its lines, or is rejected" for r: Read in reads(
   ) { assert_eq(parse_reply(r.data, default_limits()).map(told_of), r.expect) }
 
-test "a reply past a limit is refused, whether or not its line has ended" {
+test "a reply past a limit is rejected, whether or not its line has ended" {
   let tight: Limits = { line: 16, reply: 40, scram_iterations: 1, transcript: 0 };
   assert_eq(parse_reply(b"250 0123456789\r\n", tight).map(told_of), Ok("250|0123456789"));
   assert_eq(parse_reply(b"250 01234567890\r\n", tight), Err(LineTooLong));
@@ -2068,9 +2069,9 @@ test "a reply is written as a server writes it" {
 
 fn result_is_ok_some(r: Option<Reply>) -> Bool = r != None
 
-/// Whether `given` is refused, or is a reply within `limits` that is written as bytes which
-/// read as it; `false` where reading it fails any other way. What is written may be longer than
-/// what was read, by the U+FFFD that stands for each byte no text holds.
+/// Whether `given` is rejected, or is a reply within `limits` that writes as bytes that read back
+/// as it; `false` if reading it fails any other way. What is written may be longer than what was
+/// read, by the U+FFFD that replaces each byte that is not text.
 fn reads_or_refuses(given: Bytes, limits: Limits) -> Bool =
   match try[abort.raise] {
       match parse_reply(given, limits) {
@@ -2083,7 +2084,7 @@ fn reads_or_refuses(given: Bytes, limits: Limits) -> Bool =
     Err(_) -> false,
   }
 
-test "any bytes are a reply within the limits or are refused, and a reply read is written as bytes that read as it" {
+test "any bytes are a reply within the limits or are rejected, and a reply read writes as bytes that read back as it" {
   gen::check2(gen::bytes(), gen::any_int(), |data: Bytes, cut: Int| {
     let tight: Limits = { line: 24, reply: 60, scram_iterations: 1, transcript: 0 };
     let lined = Bytes::concat_all([b"250-", data, b"\r\n250 ", data, b"\r\n"]);
@@ -2093,7 +2094,7 @@ test "any bytes are a reply within the limits or are refused, and a reply read i
   })
 }
 
-test "a code is three digits of which the first says what became of the command" {
+test "a code is three digits, the first of which reports what became of the command" {
   assert_eq(
     [199, 200, 250, 354, 421, 550, 599, 600, -250].map(|n: Int|
       match code(n) { Some(c) -> number(c), None -> 0 }),
@@ -2133,7 +2134,7 @@ test "the enhanced status {show(s.text)} is a class, a subject and a detail, or 
 fn option_parts(s: Option<Status>) -> Option<List<Int>> =
   match s { Some(held) -> Some(status_parts(held)), None -> None }
 
-test "a reply's status is the one its text opens with, where that is of the code's class" {
+test "a reply's status is the one its text starts with, if that is of the code's class" {
   assert_eq(show(enhanced_status(reply_of(550, ["5.1.1 No such user"]))), "Some(5.1.1)");
   assert_eq(show(enhanced_status(reply_of(250, ["2.1.5 Ok", "2.1.5 more"]))), "Some(2.1.5)");
   assert_eq(
@@ -2201,7 +2202,7 @@ test "a server that names itself and nothing else offers nothing" {
   assert_eq(capabilities(reply_of(250, [""])), nothing_offered(""))
 }
 
-test "SIZE names a bound, or none, and AUTH is read in the form old servers wrote it too" {
+test "SIZE states a limit, or none, and AUTH is also read in the form old servers wrote" {
   let size_of = |line: String| capabilities(reply_of(250, ["mx.example", line])).size;
   assert_eq(size_of("SIZE"), Unbounded);
   assert_eq(size_of("SIZE 0"), Unbounded);
@@ -2235,7 +2236,7 @@ fn stuffings() -> List<StuffingCase> =
     { body: b"\r\n.", expect: b"\r\n.." },
   ]
 
-test "a line that opens with a dot is sent with one more: {s.body}" for s: StuffingCase in stuffings(
+test "a line that starts with a dot is sent with one more: {s.body}" for s: StuffingCase in stuffings(
   ) {
   assert_eq(stuff(s.body), s.expect);
   assert_eq(unstuff(s.expect), s.body)
@@ -2307,7 +2308,7 @@ fn flawed() -> List<MessageErrorCase> =
     { what: "one line left open", data: b"a", expect: Some(Unterminated) },
   ]
 
-test "a message that is not CRLF lines is refused where it is not, never repaired: {f.what}" for f: MessageErrorCase in flawed(
+test "a message that is not CRLF lines is rejected where it breaks, never repaired: {f.what}" for f: MessageErrorCase in flawed(
   ) { assert_eq(message_error(f.data), f.expect) }
 
 test "a parameter's text is carried as printable ASCII" {
@@ -2340,13 +2341,13 @@ test "a client greets by a domain or an address in brackets, and by nothing else
 
 // --- Tests: recorded exchanges ------------------------------------------------
 
-// A recording is the lines of one exchange: `S:` before what the server said, `C:` before what
-// the client said, with `****` where it said a credential, `*: TLS` where the connection became
-// TLS and `*: closed` where the server closed it. Replaying one feeds the engine the server's
-// lines, a run of them as one read, and writes down what the engine sends: the two are the same
-// text only if the client says each of its lines, byte for byte, where the recording has it.
+// A recording is the lines of one exchange: `S:` before what the server sent, `C:` before what
+// the client sent, `****` where the client sent a credential, `*: TLS` where the connection
+// became TLS, and `*: closed` where the server closed it. A replay feeds the engine the server's
+// lines, each run as one read, and records what the engine sends. The two texts match only if
+// the client sends each of its lines, byte for byte, where the recording has it.
 
-/// What a recording has happen while the client waits.
+/// What happens in a recording while the client waits.
 type ServerEvent = | ServerSends(Bytes) | TlsStarts | ServerCloses
 
 /// What the client is asked to do when it is ready.
@@ -2374,8 +2375,8 @@ fn marked(mark: String, sent: Bytes) -> List<String> =
       if line == "" { mark } else { mark ++ " " ++ line })
   }
 
-/// The lines a turn wrote, as a recording has them: what it sent as the bytes it sent, but for
-/// the lines of an `AUTH` exchange, which are as a session keeps them.
+/// The lines a turn wrote, as a recording has them: the bytes it sent, except for the lines of
+/// an `AUTH` exchange, which appear as a session stores them.
 fn written(t: Turn) -> List<String> =
   List::concat(if t.said.contains(Upgraded) { ["*: TLS"] } else { [] }, match t.out {
     Veiled(_, _, _) ->
@@ -2398,8 +2399,8 @@ fn told(d: Delivery) -> String =
 /// The bytes a wire writes as `net.send` would, none for a line of an `AUTH` exchange.
 fn open_bytes(w: Wire) -> Bytes = match w { Open(reply_of) -> reply_of, Veiled(_, _, _) -> b"" }
 
-/// A wire as a reader of what was written sees it: a line of an `AUTH` exchange with stars where
-/// the client's words go.
+/// A wire as someone reading the output sees it: a line of an `AUTH` exchange with stars in place
+/// of the client's response.
 fn starred_bytes(w: Wire) -> Bytes =
   match w {
     Open(reply_of) -> reply_of,
@@ -2572,11 +2573,11 @@ fn tim() -> Credential / {sasl.fail} = sasl::password("tim", Secret::of_bytes(b"
 
 fn pencil() -> Credential / {sasl.fail} = sasl::password("user", Secret::of_bytes(b"pencil"))
 
-/// The credential a case gives a client, by name: a credential cannot be a case, since a case is
-/// hashed and a hash of one is something to test guesses against.
+/// The credential a case gives a client, by name. A case cannot contain the credential itself,
+/// since cases are hashed, and a hash of a secret lets an attacker test guesses.
 type TestCredential = | Nobody | Tim | Pencil | Bearer(String)
 
-/// A client's configuration as a case holds it.
+/// A client's configuration as a case stores it.
 type Setup = {
   name: String,
   tls: Tls,
@@ -3097,7 +3098,7 @@ fn sendings() -> List<RecordingCase> / {email.fail, abort.raise} =
     },
   ]
 
-test "a message is sent as recorded, and what became of it is answered for each recipient: {r.what}" for r: RecordingCase in sendings(
+test "a message is sent as recorded, and what became of it is reported for each recipient: {r.what}" for r: RecordingCase in sendings(
   ) {
   let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
   assert_eq(got.exchange, r.exchange);
@@ -3436,14 +3437,14 @@ fn failings() -> List<RecordingCase> / {email.fail, abort.raise} =
     },
   ]
 
-test "an exchange that goes wrong is refused where it does, and for the reason it does: {r.what}" for r: RecordingCase in failings(
+test "an exchange that goes wrong fails where it does, and for the reason it does: {r.what}" for r: RecordingCase in failings(
   ) {
   let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
   assert_eq(got.exchange, r.exchange);
   assert_eq(got.ended, r.ended)
 }
 
-/// `beats` with what the server says cut into reads of `size` bytes.
+/// `beats` with what the server sends cut into reads of `size` bytes.
 fn recut(beats: List<ServerEvent>, size: Int) -> List<ServerEvent> / {abort.raise} =
   beats.flat_map(|b: ServerEvent|
     match b {
@@ -3453,9 +3454,9 @@ fn recut(beats: List<ServerEvent>, size: Int) -> List<ServerEvent> / {abort.rais
       other -> [other],
     })
 
-// A reply no command asked for is told from an answer only by arriving before the command was
-// written, so that one recording is left out.
-test "however the server's bytes are cut into reads, the client says the same and ends the same" {
+// An unsolicited reply is told apart only by arriving before its command, so that recording is
+// left out.
+test "however the server's bytes are cut into reads, the client sends the same and ends the same" {
   let cases = sendings().concat(failings()).filter(|r: RecordingCase| r.ended != Err(Unsolicited));
   let differing = cases.flat_map(|r: RecordingCase| {
     let whole = replayed(configured(r.client), r.secure, r.acts, r.exchange);
@@ -3470,8 +3471,8 @@ test "however the server's bytes are cut into reads, the client says the same an
 // --- Tests: credentials -------------------------------------------------------
 
 /// An exchange that proves a credential: what must never show or be sent as plain bytes, what is
-/// sent as plain bytes all the same, and each line of the `AUTH` exchange, in order, as the server
-/// must be sent it sealed.
+/// sent as plain bytes anyway, and each line of the `AUTH` exchange, in order, as the server must
+/// receive it as a secret.
 type AuthCase = {
   what: String,
   client: Setup,
@@ -3597,7 +3598,7 @@ fn provings() -> List<AuthCase> / {abort.raise} =
     },
   ]
 
-test "a credential goes to the server sealed and nowhere else: not into a refusal, a turn as it shows, the lines a session keeps, or the plain bytes it writes, under {p.what}" for p: AuthCase in provings(
+test "a credential goes to the server as a secret and nowhere else: not into an error, a shown turn, the lines a session keeps, or the plain bytes it writes, under {p.what}" for p: AuthCase in provings(
   ) {
   let got = replayed(configured(p.client), p.secure, [], p.exchange);
   let wire = String::of_bytes_lossy(got.wire);
@@ -3633,7 +3634,7 @@ test "a turn that carries a credential shows stars where it carries it" {
 
 fn offering(lines: List<String>) -> Bytes = render_reply({ code: Code(250), lines: lines })
 
-test "what a server offered before TLS is forgotten: after it the client knows the second EHLO's answer alone" {
+test "what a server offered before TLS is forgotten: after it the client knows only the reply to the second EHLO" {
   gen::check2(replies(), replies(), |before: Reply, after: Reply| {
     match try[smtp.fail] { config("client.example", default_limits()) } {
       Err(_) -> false,
@@ -3661,11 +3662,11 @@ test "what a server offered before TLS is forgotten: after it the client knows t
   })
 }
 
-/// What a server might say: whole replies of every kind, the ones that move an exchange on,
-/// and bytes that are no reply at all.
+/// What a server might send: whole replies of every kind, the ones that advance an exchange, and
+/// bytes that are not a reply at all.
 type Script = | Script(List<Bytes>)
 
-/// How far a script takes an exchange before anything may follow: a greeting, an answer to
+/// How far a script takes an exchange before anything may follow: a greeting, a reply to
 /// `EHLO`, and then what the client of one configuration or another waits for next.
 fn openings() -> List<List<Bytes>> = {
   let greeting = b"220 mx.example ESMTP\r\n";
@@ -3732,8 +3733,8 @@ fn whole_lines(sent: Bytes) -> Bool / {abort.raise} =
     && email::line_flaws(sent).all(|f: email::Error| f.reason == email::LongLine))
 
 /// What an engine writes when it is fed `chunks`, asked to send to `envelope` whenever it is
-/// ready, and upgraded whenever it asks; `None` where at some turn it holds more than its
-/// limit or writes what is not whole lines. `left` bounds the turns.
+/// ready, and upgraded whenever it requests it; `None` if at some turn it stores more than its
+/// limit or writes something that is not whole lines. `left` bounds the turns.
 fn driven(
   t: Turn,
   chunks: List<Bytes>,
@@ -3767,8 +3768,8 @@ fn driven(
   }
 }
 
-/// `driven` for a client of one of twenty-four configurations, over a connection that is TLS or
-/// not; `None` too where a turn fails in any way but a refusal.
+/// `driven` for a client with one of twenty-four configurations, over a connection that is TLS or
+/// not; also `None` if a turn fails in any way other than `smtp.fail`.
 fn driven_as(chunks: List<Bytes>, envelope: Envelope, secure: Bool, shape: Int) -> Option<Bytes> = {
   let limits: Limits = { line: 80, reply: 120, scram_iterations: 4, transcript: 0 };
   let kind = (shape % 24 + 24) % 24;
@@ -3795,11 +3796,11 @@ fn driven_as(chunks: List<Bytes>, envelope: Envelope, secure: Bool, shape: Int) 
   }
 }
 
-/// The answers of a server that takes everything, whatever the client's address.
+/// The replies of a server that accepts everything, whatever the client's address.
 fn open_handed() -> List<Bytes> =
   [b"220 mx.example ESMTP\r\n", b"250-mx.example\r\n250-PIPELINING\r\n250 SMTPUTF8\r\n"]
 
-test "whatever a server sends, the client answers or refuses: it fails no other way, holds no more than its limit, and writes whole lines" {
+test "whatever a server sends, the client replies or raises an error: it fails no other way, stores no more than its limit, and writes whole lines" {
   gen::check3(
     scripts(),
     email::envelopes(),
@@ -3817,7 +3818,7 @@ test "whatever a server sends, the client answers or refuses: it fails no other 
 
 // --- Tests: sessions over the in-memory network --------------------------------
 
-/// A network where `mx.example` is a server at `port` that answers each connection with the
+/// A network where `mx.example` is a server at `port` that handles each connection with the
 /// next of `scripts`.
 fn serving(port: Int, scripts: List<List<net::Step>>) -> net::MemNet / {abort.raise} =
   net::mem_serving(
@@ -3829,8 +3830,8 @@ fn serving(port: Int, scripts: List<List<net::Step>>) -> net::MemNet / {abort.ra
     scripts,
   )
 
-/// A recording's server side as a scripted peer: what it says, an upgrade where the connection
-/// became TLS, and its going away where it closed.
+/// A recording's server side as a scripted peer: what it sends, an upgrade where the connection
+/// became TLS, and a disconnect where it closed.
 fn script_of(beats: List<ServerEvent>) -> List<net::Step> =
   beats.map(|b: ServerEvent|
     match b {
@@ -3843,8 +3844,8 @@ fn script_of(beats: List<ServerEvent>) -> List<net::Step> =
 fn implicit(exchange: String) -> List<net::Step> / {abort.raise} =
   list::prepend(net::Upgrades, script_of(beats_of(exchange)))
 
-/// A recording with no credential in it as a peer that also hears each line the client said
-/// there before it goes on, so that a client that says anything else fails where it says it.
+/// A recording with no credential in it, as a peer that also checks each line the client sent
+/// before it continues, so that a client that sends anything else fails at that line.
 fn scripted(exchange: String) -> List<net::Step> / {abort.raise} = {
   let grouped = exchange.split("\n").fold(
     { steps: [], mark: "", run: [] },
@@ -3871,7 +3872,7 @@ fn flushed(g: Grouped) -> List<net::Step> / {abort.raise} =
     g.steps.push(if g.mark == "S:" { net::Sends(reply_of) } else { net::Expects(reply_of) })
   }
 
-/// What `go` answered over `world`, in a simulated run with no deadline above it, its nonces
+/// What `go` returned over `world`, in a simulated run with no outer deadline, with its nonces
 /// and its clock's date fixed.
 fn on_mx<a>(
   world: net::MemNet,
@@ -3912,7 +3913,7 @@ fn submission() -> String =
   \\C: QUIT
   \\S: 221 2.0.0 Bye
 
-test "a session over TLS from its first byte is verified as its host, writes what the engine says, waits each phase's time, and is closed once" {
+test "a session over TLS from its first byte is verified as its host, writes what the engine returns, waits each phase's time, and is closed once" {
   let c = with_credential(client(), tim());
   let envelope = email::envelope_of(ReturnTo(smith()), at_foo(["Jones", "Green"]));
   let ran = on_mx(serving(465, [implicit(submission())]), || {
@@ -3931,7 +3932,7 @@ test "a session over TLS from its first byte is verified as its host, writes wha
   assert_eq(ran.net.closed, [1])
 }
 
-test "a session's credential reaches a server that hears it whole in its line, and no plain byte holds it" {
+test "a session's credential reaches the server whole in its line, and no plain byte contains it" {
   let script = [
     net::Upgrades,
     net::Sends(b"220 mx.example ESMTP\r\n"),
@@ -3963,7 +3964,7 @@ test "a session's credential reaches a server that hears it whole in its line, a
   assert_eq(net::mem_unmet(ran.net, 1), [])
 }
 
-test "STARTTLS over a connection: only EHLO and STARTTLS cross it in the clear, and the credential after the upgrade" {
+test "STARTTLS over a connection: only EHLO and STARTTLS are sent in the clear, and the credential after the upgrade" {
   let r = sendings().get(1);
   let jones = email::envelope_of(ReturnTo(smith()), at_foo(["Jones", "Green"]));
   let brown = email::envelope_of(ReturnTo(smith()), at_foo(["Brown"]));
@@ -3993,8 +3994,8 @@ test "STARTTLS over a connection: only EHLO and STARTTLS cross it in the clear, 
   assert_eq(ran.net.closed, [1])
 }
 
-/// What a session does with `acts` until it is over: each message submitted, a refusal of one
-/// before any of it was sent kept as what became of it, and `QUIT` said where asked.
+/// What a session does with `acts` until it is over: each message submitted, an error raised
+/// before any of a message was sent recorded as its result, and `QUIT` sent when requested.
 fn acted<[l]>(
   s: Session,
   acts: List<Act>,
@@ -4021,7 +4022,7 @@ fn acted<[l]>(
       },
   ).outcomes
 
-test "every recording with no credential in it, played by a server that hears each line the client says, ends over a connection as it does in the engine" {
+test "every recording with no credential in it, played by a server that checks each line the client sends, ends over a connection as it does in the engine" {
   let cases = sendings().concat(failings()).filter(|r: RecordingCase| !r.exchange.contains("****"));
   let differing = cases.filter(|r: RecordingCase| {
     let port = if r.secure { 465 } else { 587 };
@@ -4040,12 +4041,12 @@ test "every recording with no credential in it, played by a server that hears ea
   assert_eq(differing.map(|r: RecordingCase| r.what), [])
 }
 
-test "plaintext waiting at the upgrade is refused before TLS, whether the client read it or the socket holds it" {
+test "plaintext waiting at the upgrade is rejected before TLS, whether the client read it or it is still on the socket" {
   let offered = [
     net::Sends(b"220 mx.example ESMTP\r\n"),
     net::Sends(b"250-mx.example\r\n250 STARTTLS\r\n"),
   ];
-  // CVE-2011-0411: the injected reply arrives with the leave to start TLS, in one read.
+  // CVE-2011-0411: the injected reply arrives with the go-ahead to start TLS, in one read.
   let read_with = on_mx(
     serving(587, [
       offered.concat([
@@ -4075,7 +4076,7 @@ test "plaintext waiting at the upgrade is refused before TLS, whether the client
   )
 }
 
-test "a connection that starts in the clear is refused where its server is not verified, and used as it is where no TLS is asked for" {
+test "a connection that starts in the clear is rejected when its server is not verified, and used as it is when no TLS is requested" {
   let offer = [
     net::Sends(b"220 mx.example ESMTP\r\n"),
     net::Sends(b"250-mx.example\r\n250 STARTTLS\r\n"),
@@ -4118,8 +4119,8 @@ test "a server that cannot be reached, is not the one named, or hangs up at once
   assert_eq(hung.net.closed, [1])
 }
 
-/// `go` with each read of what `mail`'s servers send coming `ms` milliseconds after it was
-/// asked for.
+/// `go` with each read of what `mail`'s servers send arriving `ms` milliseconds after it was
+/// requested.
 fn slowly<a>(
   ms: Int,
   go: () -> a / {net.write[mail], clock.read, task::deadline.at, entropy.next, time.now_ms, smtp.fail, abort.raise},
@@ -4133,7 +4134,7 @@ fn slowly<a>(
     },
   }
 
-test "a wait is one deadline that each read is given what is left of, however the answer trickles in" {
+test "a wait is one deadline, and each read gets what is left of it, however the reply trickles in" {
   let silent = on_mx(serving(465, [[net::Upgrades, net::Silent]]), ||
     secured(open_tls[mail]("mx.example", 465, client()).engine));
   assert_eq(silent.value, Err(TimedOut(Greeting)));
@@ -4164,7 +4165,7 @@ test "a wait is one deadline that each read is given what is left of, however th
   assert_eq(long.net.closed, [])
 }
 
-test "a session is held to the deadline around it, which bounds its every wait" {
+test "a session is bound by the deadline around it, which limits its every wait" {
   let ran = net::on_mem(serving(465, [[net::Upgrades, net::Silent]]), ||
     simulate {
       task::unbounded(||
@@ -4179,7 +4180,7 @@ test "a session is held to the deadline around it, which bounds its every wait" 
   assert_eq(net::mem_deadlines(ran.net, 1), [250])
 }
 
-test "a server that stops taking bytes is told nothing more" {
+test "a server that stops accepting bytes is sent nothing more" {
   let ran = on_mx(
     serving(465, [[net::Upgrades, net::Sends(b"220 mx.example ESMTP\r\n"), net::Leaves]]),
     || secured(open_tls[mail]("mx.example", 465, client()).engine),
@@ -4189,7 +4190,7 @@ test "a server that stops taking bytes is told nothing more" {
   assert_eq(ran.net.closed, [1])
 }
 
-test "a session is told goodbye when its user is done, and closed however its user ends" {
+test "a session is sent QUIT when its user is done, and closed however its user ends" {
   let envelope = email::envelope_of(ReturnTo(smith()), at_foo(["Jones", "Green"]));
   let c = with_credential(client(), tim());
   let done = on_mx(serving(465, [implicit(submission())]), ||
@@ -4214,7 +4215,7 @@ test "a session is told goodbye when its user is done, and closed however its us
   assert_eq(cut.net.closed, [1])
 }
 
-/// What the server was sent between `DATA` and the lone dot, as it would keep it.
+/// What the server was sent between `DATA` and the lone dot, as it would store it.
 fn delivered(sent: Bytes) -> Bytes / {abort.raise} =
   match sent.index_of(b"DATA\r\n") {
     None -> b"",
@@ -4224,7 +4225,7 @@ fn delivered(sent: Bytes) -> Bytes / {abort.raise} =
     },
   }
 
-/// A server's answers to a message for two recipients, each a read of its own: it takes the
+/// A server's replies to a message for two recipients, each in its own read: it accepts the
 /// sender, both recipients and the message.
 fn taking() -> List<net::Step> =
   [

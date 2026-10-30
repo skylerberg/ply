@@ -1,27 +1,26 @@
 //! Files served from a root of `std.fs`, with the conditional requests and the byte ranges of
 //! RFC 9110.
 //!
-//! `decide` is RFC 9110 §13.2.2's order of preconditions and §14's ranges as one pure function of
-//! the method, the request's fields and what the resource is: `Whole` (200), `Partial` (206),
-//! `NotModified` (304), `PreconditionFailed` (412) or `Unsatisfiable` (416). An `If-Match` and an `If-Range`
-//! compare entity tags strongly, an `If-None-Match` weakly, and a date as a whole second. A
-//! `Range` that does not read, of a unit other than bytes, of more ranges than the bound or of
-//! ranges that overlap is answered with the whole representation, which the standard allows and
-//! which leaves nothing for a client to amplify; one none of whose ranges the representation holds
-//! is 416.
+//! `decide` applies RFC 9110 §13.2.2's order of preconditions and §14's ranges as one pure function
+//! of the method, the request's fields and the resource's length and validators. It returns `Whole`
+//! (200), `Partial` (206), `NotModified` (304), `PreconditionFailed` (412) or `Unsatisfiable`
+//! (416). `If-Match` and `If-Range` compare entity tags strongly, `If-None-Match` compares them
+//! weakly, and dates compare to the whole second. The whole representation is sent for a `Range`
+//! that does not parse, uses a unit other than bytes, lists more ranges than the limit, or lists
+//! overlapping ranges. The standard allows this, and it leaves a client nothing to amplify. A
+//! `Range` whose ranges all fall outside the representation gets 416.
 //!
-//! `serve` answers `GET` and `HEAD` with the file a request's path names under the root its label
-//! binds. The path is percent-decoded a segment at a time and refused (404) where a segment is
-//! `.`, `..` or holds a `/`, a `\` or a NUL, and where it names a dotfile, unless `Options` lets
-//! dotfiles through. A link anywhere on the path is not followed, so nothing outside what the
-//! root holds as files and directories is served, and a directory is never listed: it is its
-//! index file where `Options` names one, and 404 where not. The host refuses a path that leaves
-//! the root besides. Each answer names its type with `nosniff`, its strong entity tag (the size
-//! and the modification time), `Last-Modified`, `Date` and `Accept-Ranges: bytes`; several ranges
-//! are one `multipart/byteranges` body under a boundary drawn from `entropy`. A file's body is a
-//! stream of its length, read through a handle, or by `read_at` for a range, a chunk at a time as
-//! it is sent, so a file of any size is answered in the memory of a chunk; an answer to `HEAD`
-//! opens nothing.
+//! `serve` responds to `GET` and `HEAD` with the file that a request's path names under the root
+//! its label binds. The path is percent-decoded one segment at a time. It is rejected with 404 when
+//! a segment is `.` or `..`, contains a `/`, a `\` or a NUL, or names a dotfile and `Options` does
+//! not allow dotfiles. Links on the path are never followed, so only the files and directories
+//! inside the root are served. A directory is never listed: it serves its index file when `Options`
+//! names one, and 404 otherwise. The host also rejects any path that leaves the root. Each response
+//! states its type with `nosniff`, its strong entity tag (from the size and the modification time),
+//! `Last-Modified`, `Date` and `Accept-Ranges: bytes`. Several ranges form one
+//! `multipart/byteranges` body, with a boundary drawn from `entropy`. A file's body is a stream of
+//! its length, read through a handle (or with `read_at` for a range) one chunk at a time as it is
+//! sent. So a file of any size needs only one chunk of memory. A response to `HEAD` opens nothing.
 
 import std.date
 import std.date (OffsetDateTime)
@@ -50,13 +49,13 @@ import std.gen
 /// An entity tag: its opaque text without the quotes, and whether it is weak.
 pub type ETag = { weak: Bool, tag: String }
 
-/// The tag as a field writes it: `"text"`, or `W/"text"` for a weak one.
+/// The tag as a header field writes it: `"text"`, or `W/"text"` for a weak one.
 pub fn etag_text(e: ETag) -> String = (if e.weak { "W/" } else { "" }) ++ "\"" ++ e.tag ++ "\""
 
 /// What an `If-Match` or an `If-None-Match` lists: `*`, or entity tags.
 pub type Tags = | AnyTag | Listed(List<ETag>)
 
-/// The tags a field lists, or `None` where it does not read as RFC 9110 §8.8.3 writes them.
+/// The tags a field lists, or `None` when it does not parse as RFC 9110 §8.8.3 defines them.
 pub fn read_tags(field: String) -> Option<Tags> / {abort.raise} =
   if field.ascii_trim() == "*" { Some(AnyTag) } else {
     field.split(",").fold(Some(Listed([])), |acc: Option<Tags>, piece: String|
@@ -87,27 +86,27 @@ pub fn weak_match(a: ETag, b: ETag) -> Bool = a.tag == b.tag
 
 // --- Preconditions and ranges -----------------------------------------------
 
-/// What the preconditions read of a representation: its entity tag and when it last changed,
-/// where it has them.
+/// The parts of a representation that preconditions check: its entity tag and when it last
+/// changed, if it has them.
 pub type Validators = { etag: Option<ETag>, modified: Option<OffsetDateTime> }
 
 /// A range of bytes resolved against a representation's length: its first and its last byte.
 pub type ByteRange = { first: Int, last: Int }
 
-/// What a request for a representation is answered with.
+/// The response a request for a representation gets.
 pub type Decision =
   /// 200: the whole representation.
   | Whole
-  /// 206: these ranges of it, in the order asked, none overlapping.
+  /// 206: these ranges of it, in the order requested, none overlapping.
   | Partial(List<ByteRange>)
   /// 304: the client's copy is current.
   | NotModified
-  /// 412: a precondition the client set does not hold.
+  /// 412: a precondition the client set is false.
   | PreconditionFailed
-  /// 416: the representation holds none of the ranges asked for.
+  /// 416: none of the requested ranges fall inside the representation.
   | Unsatisfiable
 
-/// The status a decision is answered with.
+/// The HTTP status of a decision.
 pub fn status_of(d: Decision) -> Int =
   match d {
     Whole -> 200,
@@ -117,9 +116,9 @@ pub fn status_of(d: Decision) -> Int =
     Unsatisfiable -> 416,
   }
 
-/// What `method` with `headers` is answered with, for a representation of `length` bytes and
-/// validators `v`, by RFC 9110 §13.2.2, `max_ranges` ranges at most answered as ranges and `now`
-/// deciding a two-digit year.
+/// The response to `method` with `headers` for a representation of `length` bytes with validators
+/// `v`, by RFC 9110 §13.2.2. At most `max_ranges` ranges are served as ranges, and `now` resolves
+/// a two-digit year.
 pub fn decide(
   method: Method,
   headers: Headers,
@@ -178,7 +177,7 @@ fn none_match_holds(headers: Headers, v: Validators) -> Option<Bool> / {abort.ra
     },
   }
 
-/// `If-Modified-Since`: whether the resource changed after the date the client holds.
+/// `If-Modified-Since`: whether the resource changed after the client's date.
 fn modified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool =
   match ((http::date_field(headers, "if-modified-since", now), v.modified)) {
     (Some(at), Some(modified)) -> seconds_of(modified) > seconds_of(at),
@@ -227,9 +226,10 @@ fn if_range_holds(headers: Headers, v: Validators, now: Instant) -> Bool / {abor
     },
   }
 
-/// The ranges a `Range` field asks of `length` bytes, resolved and in the order asked, those the
-/// representation holds none of left out; `None` where the field is to be ignored: it does not
-/// read, names another unit, asks more than `max_ranges` ranges, or ranges that overlap.
+/// The ranges a `Range` field requests of `length` bytes, resolved and in the order requested,
+/// leaving out those that fall entirely outside the representation. `None` when the field must be
+/// ignored: it does not parse, names another unit, or requests more than `max_ranges` ranges or
+/// overlapping ranges.
 pub fn read_ranges(
   field: String,
   length: Int,
@@ -298,15 +298,15 @@ fn overlapping(ranges: List<ByteRange>) -> Bool = {
 
 // --- Serving files ----------------------------------------------------------
 
-/// How `serve` answers.
+/// Settings for `serve`.
 pub type Options = {
-  /// The file a directory's path is answered with; `None` answers a directory 404.
+  /// The file served for a directory's path; with `None`, a directory gets 404.
   index: Option<String>,
   /// Whether a path with a segment that begins with `.` is served.
   dotfiles: Bool,
-  /// The most ranges one request is answered with as ranges.
+  /// The most ranges one request can get as ranges.
   max_ranges: Int,
-  /// The `Cache-Control` each file is answered with, where there is one.
+  /// The `Cache-Control` sent with each file, if any.
   cache_control: Option<String>,
   /// The most bytes one read of a file takes.
   chunk: Int,
@@ -323,10 +323,10 @@ pub fn default_options() -> Options =
     chunk: 1048576,
   }
 
-/// The path under the root a request's `path` names, percent-decoded, or `None` where it names
-/// nothing `serve` would answer: a segment that is `.` or `..`, that holds `/`, `\` or a NUL once
-/// decoded, that does not decode, or, unless `dotfiles`, that begins with `.`. Empty segments are
-/// passed over; the root is `.`.
+/// The path under the root that a request's `path` names, percent-decoded. `None` when it names
+/// nothing `serve` would serve: a segment that is `.` or `..`, contains `/`, `\` or a NUL once
+/// decoded, does not decode, or begins with `.` unless `dotfiles` is set. Empty segments are
+/// skipped; the root is `.`.
 pub fn file_path(path: String, dotfiles: Bool) -> Option<String> / {abort.raise} =
   if !path.starts_with("/") { None } else {
     let decoded = path.split("/").fold(Some([]), |acc: Option<List<String>>, seg: String|
@@ -357,12 +357,12 @@ fn segment_served(seg: String, dotfiles: Bool) -> Bool =
 pub fn file_etag(size: Int, modified: Instant) -> ETag / {abort.raise} =
   { weak: false, tag: to_radix(size, 16) ++ "-" ++ to_radix(max(nanos_at(modified), 0), 16) }
 
-/// The answer to `req` from the file `path` names under the root `r`, `path` being what the
-/// request names below where the files are served, as the request wrote it. `now` is the wall
-/// clock's, for `Date` and for reading the client's dates. The body is a stream of the file's
-/// length, read through a handle `Options.chunk` bytes at a time as it is sent, and a range of it
-/// by `read_at`; a file that ends short of the length it had when it was looked at, or changes,
-/// leaves the stream short and its connection closed. An answer to `HEAD` opens nothing.
+/// The response to `req` from the file that `path` names under the root `r`. `path` is the part of
+/// the request's path below where the files are served, as the request wrote it. `now` is the
+/// wall-clock time, used for `Date` and for reading the client's dates. The body is a stream of the
+/// file's length, read through a handle `Options.chunk` bytes at a time as it is sent; a range is
+/// read with `read_at`. If the file becomes shorter than its length when it was looked up, or
+/// changes, the stream ends early and its connection is closed. A response to `HEAD` opens nothing.
 pub fn serve<[r] | s>(
   req: Request,
   path: String,
@@ -386,8 +386,8 @@ fn not_found<| e>(now: OffsetDateTime) -> Response<| e> =
 
 type FoundFile = { path: String, stat: fs::Stat }
 
-/// The file `under` names, its index where it is a directory, where every step to it is a file or
-/// a directory and none a link.
+/// The file `under` names, or its index file if it is a directory, provided every step of the path
+/// is a file or a directory and none is a link.
 fn find_file<[r]>(under: String, options: Options) -> Option<FoundFile> / {fs.kind[r], fs.stat[r]} =
   if !has_no_symlink[r](under) { None } else {
     match fs.stat[r](under) {
@@ -476,7 +476,7 @@ fn file_response<[r] | s>(
   }
 }
 
-/// A body of `size` bytes that is never read, as the answer to `HEAD` is.
+/// A body of `size` bytes that is never read, as for a response to `HEAD`.
 fn head_body<[r] | s>(
   size: Int,
 ) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
@@ -488,7 +488,8 @@ fn head_body<[r] | s>(
   Streamed(stream)
 }
 
-/// The `size` bytes of the file `f` is open on, as they are pulled, the file closed with the stream.
+/// The `size` bytes of the open file `f`, read as they are pulled; closing the stream closes the
+/// file.
 fn file_body<[r] | s>(
   f: Int,
   size: Int,
@@ -519,8 +520,8 @@ fn range_body<[r] | s>(
   Streamed(stream)
 }
 
-/// The `size` bytes of the file `f` is open on, a chunk of at most `chunk` bytes each pull; it ends
-/// short where the file does.
+/// The `size` bytes of the open file `f`, at most `chunk` bytes per pull; it ends early if the file
+/// does.
 fn file_chunks<[r] | e>(
   f: Int,
   size: Int,
@@ -553,7 +554,7 @@ fn ranged_chunks<[r] | e>(
   seq::unfold(0, step)
 }
 
-/// The fields every answer about a file carries, and no body.
+/// The header fields every response about a file includes, with no body.
 fn base_response<| e>(
   tag: ETag,
   modified: OffsetDateTime,
@@ -579,7 +580,7 @@ fn base_response<| e>(
 fn content_range(r: ByteRange, size: Int) -> String =
   "bytes " ++ r.first.to_string() ++ "-" ++ r.last.to_string() ++ "/" ++ size.to_string()
 
-/// The file changed between its look and its read, which a retry answers.
+/// The response when the file changed between its lookup and its read; a retry resolves it.
 fn file_changed_response<| e>(now: OffsetDateTime) -> Response<| e> =
   http::dated(http::text_response(503, "the file changed while it was read\n"), now)
 
@@ -631,7 +632,7 @@ fn byteranges<[r] | e>(
   }
 }
 
-/// The bytes of `r` in the file, read `chunk` at a time; `None` where the file no longer holds
+/// The bytes of `r` in the file, read `chunk` at a time; `None` if the file no longer contains
 /// them all.
 fn range_bytes<[r]>(
   path: String,
@@ -908,11 +909,11 @@ fn site() -> fs::MemFs / {abort.raise} = {
 
 fn noon() -> OffsetDateTime / {abort.raise} = at_second(1700000100)
 
-/// An answer with its body read whole, and the length it said it had.
+/// A response with its body read whole, and the length it reported.
 type ReadResponse = { status: Int, headers: Headers, body: Bytes, length: Option<Int> }
 
-/// The answer to a request for `path` with `pairs` over the site, under `options`, its body read
-/// while the site is there to read.
+/// The response to a request for `path` with the header fields `pairs`, served from the test site
+/// under `options`. The body is read while the site still exists.
 fn fetch(
   method: Method,
   path: String,
@@ -936,7 +937,7 @@ fn fetch(
     }).value).value
 }
 
-test "a file is served with what it is, when it changed, and how to ask for less of it" {
+test "a file is served with its type, when it changed, and how to request part of it" {
   let r = fetch(http::Get, "/css/site.css", [], default_options());
   assert_eq(r.status, 200);
   assert_eq(r.body, b"body{}");
@@ -954,7 +955,7 @@ test "a file is served with what it is, when it changed, and how to ask for less
   assert_eq(http::header(root.headers, "content-type"), Some("text/html"))
 }
 
-test "a client's copy that is current is told so, and one that is not is sent the file" {
+test "a client whose copy is current gets 304, and one whose copy is stale gets the file" {
   let first = fetch(http::Get, "/css/site.css", [], default_options());
   let etag = match http::header(first.headers, "etag") { Some(e) -> e, None -> "" };
   let again = fetch(
@@ -988,7 +989,7 @@ test "a client's copy that is current is told so, and one that is not is sent th
   assert_eq(guarded.status, 412)
 }
 
-test "ranges of a file are answered one or several at a time, and past its end refused" {
+test "ranges of a file are served one or several at a time, and ranges past its end are rejected" {
   let one = fetch(
     http::Get,
     "/data/parts.csv",
@@ -1048,7 +1049,7 @@ test "nothing outside the files is served: {c.path}" for c: { path: String, stat
     { path: "/data/parts.csv", status: 200 },
   ] { assert_eq(fetch(http::Get, c.path, [], default_options()).status, c.status) }
 
-test "a file is answered over a connection as its client asked for it, a range and then a check" {
+test "a file is served over a connection as requested: a range, then a conditional request" {
   let etag = etag_text(file_etag(20, Instant(1700000000000000000)));
   let asked = Bytes::of_string(
     "GET /data/parts.csv HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n"
@@ -1083,7 +1084,7 @@ test "a file is read a chunk at a time, and a HEAD carries the length a GET woul
   assert_eq((small.body, small.length), (b"0123456789abcdefghij", Some(20)));
   let head = fetch(http::Head, "/data/parts.csv", [], default_options());
   assert_eq((head.status, head.body, head.length), (200, b"", Some(20)));
-  // What a HEAD opens or reads, counted between the serving and the files.
+  // Counts what a HEAD opens or reads, with a handler between `serve` and the files.
   let asked = {
     ..http::request_to(http::Head, "example.org", "/data/parts.csv", b""),
     headers: fields([]),

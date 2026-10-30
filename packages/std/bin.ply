@@ -1,19 +1,21 @@
 //! A compact positional encoding, and what `derive bin for T` targets.
 //!
-//! Both ends know the type, so nothing names a field: a record is its fields in declared order, a
-//! variant its constructor's index and then its fields. `Int`, counts, lengths and the 16- to 128-bit
-//! widths are varints, the signed ones zigzagged; `U8` and `I8` are one byte, `Float` its eight IEEE
-//! bytes, `Decimal` its text, `Char` its scalar value and `Unit` one zero byte, so every value takes at
-//! least a byte and a reader can refuse a count longer than the bytes left. One value has one encoding:
-//! `decode` refuses bytes that end inside the value, bytes left over, and anything no value writes (a
-//! constructor index past the type's, a map's keys out of order, an overlong varint, text that is not
-//! UTF-8). `shape_digest` keys what a store wrote by the shape of its type.
+//! Both ends know the type, so nothing names a field: a record is its fields in declared order, and
+//! a variant is its constructor's index and then its fields. `Int`, counts, lengths and the 16- to
+//! 128-bit widths are varints, the signed ones zigzag-encoded. `U8` and `I8` are one byte, `Float`
+//! its eight IEEE bytes, `Decimal` its text, `Char` its scalar value and `Unit` one zero byte. So
+//! every value takes at least one byte, and a reader can reject a count larger than the bytes left.
+//! Each value has exactly one encoding: `decode` rejects bytes that end inside the value, bytes
+//! left over, and anything no value encodes to (a constructor index past the type's last, a map's
+//! keys out of order, an overlong varint, text that is not UTF-8). A store uses `shape_digest` to
+//! key what it wrote by the shape of its type.
 
 import std.gen
 import std.derive
 import std.derive.codec (derive_bin)
 
-/// `derive bin for T`: `<snake_case(T)>_bin`, `T`'s `BinCodec`, as `std.derive.codec` writes it.
+/// `derive bin for T`: derives `<snake_case(T)>_bin`, `T`'s `BinCodec`, as `std.derive.codec`
+/// writes it.
 pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =
   derive_bin(declaration)
 
@@ -22,7 +24,7 @@ pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refuse
 /// Why bytes do not decode, and the offset where that was found.
 pub type BinError = { at: Int, message: String }
 
-/// How an error reads.
+/// The error as text.
 pub fn error_to_string(e: BinError) -> String = e.message ++ " (at byte " ++ e.at.to_string() ++ ")"
 
 fn short(at: Int) -> BinError = { at: at, message: "the bytes end inside a value" }
@@ -37,17 +39,19 @@ pub type Taken<a> = { value: a, at: Int }
 /// How a value is appended to the bytes written so far.
 pub type Put<a> = (Bytes, a) -> Bytes / {abort.raise}
 
-/// How a value is read at an offset: the value and the offset after it, or why the bytes hold none.
+/// How a value is read at an offset: the value and the offset after it, or why the bytes do not
+/// contain one.
 pub type Take<a> = (Bytes, Int) -> Result<Taken<a>, BinError> / {abort.raise}
 
 /// `shape` digests the type's structure, names included, so bytes written under another
-/// definition of a type are told apart from its own.
+/// definition of a type can be told apart from bytes written under this one.
 pub type BinCodec<a> = { put: Put<a>, take: Take<a>, shape: Shape }
 
-/// The deepest a derived codec over a recursive type nests, which is as deep as calls nest.
+/// The deepest a derived codec over a recursive type nests, which matches how deep calls can nest.
 pub fn max_depth() -> Int = 10000
 
-/// A derived codec over a recursive type, past `max_depth` levels of it.
+/// The codec a derived codec over a recursive type uses past `max_depth` levels: writing panics and
+/// reading fails.
 pub fn too_deep<a>() -> BinCodec<a> =
   {
     put: |_w: Bytes, _x: a| panic(nested_too_deep()),
@@ -59,8 +63,8 @@ fn nested_too_deep() -> String = "nested deeper than " ++ max_depth().to_string(
 
 // --- Varints ----------------------------------------------------------------
 
-/// Appends seven bits a byte, low first, the high bit set on every byte but the last; `n` is read as
-/// its 64 unsigned bits.
+/// Appends seven bits a byte, low first, with the high bit set on every byte but the last. `n` is
+/// read as its 64 unsigned bits.
 pub fn put_varint(w: Bytes, n: Int) -> Bytes / {abort.raise} =
   if n >= 0 { unsigned_varint(w, n) }
   else { unsigned_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
@@ -69,7 +73,7 @@ fn unsigned_varint(w: Bytes, n: Int) -> Bytes / {abort.raise} =
   if n < 128 { w ++ byte_of_int(n) }
   else { unsigned_varint(w ++ byte_of_int(n & 127 | 128), n >>> 7) }
 
-/// The varint at `at`, refusing an overlong one.
+/// The varint at `at`, rejecting an overlong one.
 pub fn take_varint(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.raise} = {
   let b = byte_at(d, at);
   if b >= 0 && b < 128 { Ok({ value: b, at: at + 1 }) } else { varint_from(d, at, at, 0, 0) }
@@ -97,7 +101,7 @@ fn varint_from(
 /// as `0`, `1`, `2`, `3`, which is what a signed varint is written as.
 pub fn zigzag_encode(n: Int) -> Int = n << 1 ^ n >> 63
 
-/// The number a zigzag stands for.
+/// The number a zigzag-encoded value represents.
 pub fn zigzag_decode(z: Int) -> Int = z >>> 1 ^ 0 - (z & 1)
 
 /// A varint that must lie in `lo..=hi`.
@@ -131,7 +135,8 @@ fn take_zigzag(
 
 fn ok_at<a>(value: a, at: Int) -> Result<Taken<a>, BinError> = Ok({ value: value, at: at })
 
-/// A count of what follows: each takes at least a byte, so a count past the bytes left is refused.
+/// A count of what follows: each item takes at least a byte, so a count past the bytes left is
+/// rejected.
 pub fn take_count(d: Bytes, at: Int) -> Result<Taken<Int>, BinError> / {abort.raise} =
   match take_varint(d, at) {
     Err(e) -> Err(e),
@@ -416,8 +421,8 @@ fn i128_from(
 
 // --- Shapes -----------------------------------------------------------------
 
-/// A digest per sum type finished, and the sum types the walk is inside, which a reference back
-/// names instead of re-entering.
+/// A digest for each sum type finished, and the sum types the traversal is inside. A reference
+/// back to an open sum names it instead of entering it again.
 pub type Shapes = { done: Map<Bytes, Bytes>, open: List<Bytes> }
 /// A digest, and the sums finished along the way.
 pub type Shaped = { digest: Bytes, shapes: Shapes }
@@ -466,8 +471,8 @@ pub fn record_shape(shapes: Shapes, fields: List<FieldShape>) -> Shaped / {abort
   }
 }
 
-/// `key` tells apart two sums that share a simple name; only `name` enters the digest, so moving a
-/// module leaves its shapes alone.
+/// `key` tells apart two sums that share a simple name. Only `name` enters the digest, so moving a
+/// module does not change its shapes.
 pub fn sum_shape(
   shapes: Shapes,
   key: String,
@@ -560,8 +565,8 @@ pub fn i64_bin() -> BinCodec<I64> = { put: put_i64, take: take_i64, shape: leaf_
 pub fn i128_bin() -> BinCodec<I128> = { put: put_i128, take: take_i128, shape: leaf_shape("I128") }
 
 // --- Structural codecs ------------------------------------------------------
-// Each is its writer and its reader over those of its parts, which a derived codec calls with its
-// own; the codec is the two beside the shape.
+// Each takes the writers and readers of its parts, which a derived codec passes in; a codec
+// bundles the writer and the reader with the shape.
 
 /// Appends a count and the items, each by `put`.
 pub fn put_list<a>(w: Bytes, xs: List<a>, put: Put<a>) -> Bytes / {abort.raise} =
@@ -612,8 +617,8 @@ pub fn take_array<a>(
     Err(e) -> Err(e),
   }
 
-/// An array is written as a list is, under a shape of its own, so turning one into the other moves
-/// the shape's digest.
+/// An array is written as a list is, but under its own shape, so changing one into the other
+/// changes the shape's digest.
 pub fn array_bin<a>(item: BinCodec<a>) -> BinCodec<Array<a>> =
   {
     put: |w: Bytes, xs: Array<a>| put_array(w, xs, item.put),
@@ -631,7 +636,7 @@ pub fn put_map<k, v>(
   where derivable(ord, k)
 = m.fold(put_varint(w, m.len()), |acc: Bytes, x: k, y: v| put_value(put_key(acc, x), y))
 
-/// Reads a count and that many entries, refusing keys out of order.
+/// Reads a count and that many entries, rejecting keys out of order.
 pub fn take_map<k, v>(
   d: Bytes,
   at: Int,
@@ -680,7 +685,7 @@ fn take_entries<k, v>(
     }
   }
 
-/// Entries in key order; a reader refuses keys out of order, so a map has one encoding.
+/// Entries in key order; a reader rejects keys out of order, so a map has one encoding.
 pub fn map_bin<k, v>(key: BinCodec<k>, value: BinCodec<v>) -> BinCodec<Map<k, v>>
   where derivable(ord, k)
 =
@@ -855,7 +860,8 @@ pub fn rounding_bin() -> BinCodec<Rounding> =
 /// `x` written with `codec`.
 pub fn encode<a>(x: a, codec: BinCodec<a>) -> Bytes / {abort.raise} = (codec.put)(b"", x)
 
-/// Refuses bytes left over after the value as well as bytes that end inside it.
+/// The value `data` encodes with `codec`. Fails on bytes left over after the value, and on bytes
+/// that end inside it.
 pub fn decode<a>(data: Bytes, codec: BinCodec<a>) -> Result<a, BinError> / {abort.raise} =
   match (codec.take)(data, 0) {
     Err(e) -> Err(e),
@@ -944,7 +950,7 @@ test "an array is written as a list is, and its shape is its own" {
   assert(shape_digest(array_bin(int_bin())) != shape_digest(list_bin(int_bin())))
 }
 
-test "a character is its scalar value, and a number that is none is refused" {
+test "a character is its scalar value, and a number that is not one is rejected" {
   assert_eq(encode('a', char_bin()), b"a");
   assert(round_trips('\u{1F600}', char_bin()) && round_trips('\u{0}', char_bin()));
   assert(round_trips(['h', 'é'], list_bin(char_bin())));
@@ -965,7 +971,7 @@ test "an instant and a duration are their nanoseconds, and neither reads as the 
   assert(shape_digest(duration_bin()) != shape_digest(int_bin()))
 }
 
-test "a reader refuses bytes that end early, bytes left over and bytes no value writes" {
+test "a reader rejects bytes that end early, bytes left over and bytes no value encodes to" {
   let c = list_bin(int_bin());
   let full = encode([1, 2, 3], c);
   assert_eq(decode(b"\x80", int_bin()), Err({ at: 1, message: "the bytes end inside a value" }));
@@ -985,7 +991,7 @@ test "a reader refuses bytes that end early, bytes left over and bytes no value 
   assert(decode(b"\x80\x80\x04", u16_bin()) != Ok(0u16))
 }
 
-test "a shape tells types apart by structure and by name, and a recursive one finishes" {
+test "a shape distinguishes types by structure and by name, and a recursive one finishes" {
   assert_eq(shape_digest(int_bin()).len(), 32);
   assert(shape_digest(int_bin()) != shape_digest(i64_bin()));
   assert(shape_digest(list_bin(int_bin())) != shape_digest(option_bin(int_bin())));

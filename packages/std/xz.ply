@@ -1,25 +1,26 @@
-//! xz: `.xz` files read.
+//! xz: reading `.xz` files.
 //!
-//! `decompress` reads what `xz` and liblzma write: a file of one stream or of several, with the
-//! zero padding the format allows between and after them; blocks of LZMA2 in every chunk type and
-//! under any properties; each block's CRC-32, CRC-64 or SHA-256 checked, with the sizes its header
-//! declares; and the index and footer held to the blocks that were read. `decompress_first` reads one stream
-//! and says where it ended. The decoder is written here, in Ply: nothing of it is a C library's.
+//! `decompress` reads what `xz` and liblzma write: a file of one stream or several, with the zero
+//! padding the format allows between and after them; LZMA2 blocks in every chunk type and under
+//! any properties; each block's CRC-32, CRC-64 or SHA-256 checked, along with the sizes its header
+//! declares; and the index and footer checked against the blocks that were read.
+//! `decompress_first` reads one stream and reports where it ended. The decoder is written in Ply;
+//! no part of it comes from a C library.
 //!
-//! Every reader takes `Limits`, and there is none without them. `output` is the most bytes it
-//! answers. `window` is the most bytes of history a block may ask the reader to keep, which is
-//! its LZMA2 dictionary: a file of a few bytes can ask for gigabytes, and a block that asks for
-//! more than `window` is refused at its header, before a chunk is read. A refusal says why and at
-//! which byte of the input; `decompress` raises it, as `xz.refused`, and `try_decompress` answers
-//! it.
+//! Every reader takes `Limits`, and none works without them. `output` is the most bytes it
+//! returns. `window` is the most bytes of history a block may ask the reader to keep, which is the
+//! block's LZMA2 dictionary. A file of a few bytes can request gigabytes, so a block that requests
+//! more than `window` is rejected at its header, before any chunk is read. An error reports the
+//! reason and the offset of the input byte. `decompress` raises it as `xz.fail`, and
+//! `try_decompress` returns it.
 //!
-//! A block whose filters are not LZMA2 alone is refused by the filter's number: the delta filter
-//! and the branch converters for machine code are not read. Neither is the older `.lzma` file,
-//! which has no magic number and no check.
+//! A block whose filters are not LZMA2 alone is rejected with the filter's number: the delta
+//! filter and the branch converters for machine code are not supported. Neither is the older
+//! `.lzma` format, which has no magic number and no check.
 //!
-//! `decompress_stream` is `decompress` over a `std.seq` sequence of chunks, as `std.io`'s `chunks` gives a
-//! file: a file is read in the memory of its dictionary and a chunk, whatever its length, and to
-//! the same bytes however the input is cut. There is no writer.
+//! `decompress_stream` is `decompress` over a `std.seq` sequence of chunks, such as `std.io`'s
+//! `chunks` gives for a file. It reads a file of any length using the memory of its dictionary and
+//! a chunk, and gives the same bytes however the input is split. There is no writer.
 
 import std.bytes (u32_le)
 import std.checksum
@@ -29,61 +30,61 @@ import std.seq
 import std.seq (seq, Seq, Done, Skip, Yield)
 import std.gen
 
-// --- Refusals ---------------------------------------------------------------
+// --- Errors -----------------------------------------------------------------
 
-/// Why a reader refused.
+/// Why a reader failed.
 pub type ErrorKind =
   /// The bytes do not open with a stream's magic number.
   | NotThisFormat
-  /// The stream holds, or a block declares, more bytes than `Limits.output`.
+  /// The stream contains, or a block declares, more bytes than `Limits.output`.
   | OverLimit
   /// A block asks its reader to keep more bytes of history than `Limits.window`, or 2 GiB.
   | Window
   /// The input ends before the stream does.
   | Truncated
-  /// A stream or block header that sets a reserved bit, spells a number in more bytes than it
-  /// needs, gives LZMA2 no dictionary size, or is padded with anything but zeros.
+  /// A stream or block header that sets a reserved bit, encodes a number in more bytes than it
+  /// needs, gives LZMA2 no dictionary size, or is padded with anything other than zeros.
   | Header
-  /// A stream header, block header, index or stream footer whose CRC-32 is not its bytes'.
+  /// A stream header, block header, index or stream footer whose CRC-32 does not match its bytes.
   | HeaderChecksum
   /// A block whose filters are not LZMA2 alone: the number of the first that is not. 3 is the
   /// delta filter, and 4 to 11 the branch converters for x86, PowerPC, IA-64, ARM, ARM Thumb,
   /// SPARC, ARM64 and RISC-V.
   | Filter(Int)
-  /// A stream whose blocks carry a check this reader has no sum for: its number. It has sums for
-  /// 0, none; 1, CRC-32; 4, CRC-64; and 10, SHA-256.
+  /// A stream whose blocks use a check type this reader does not support, with the type's number.
+  /// The supported types are 0, none; 1, CRC-32; 4, CRC-64; and 10, SHA-256.
   | CheckType(Int)
-  /// An LZMA2 chunk of a kind the format has none of, or one that goes on from a dictionary or
-  /// properties no chunk before it set, or properties LZMA has none of.
+  /// An LZMA2 chunk of a kind the format does not define, one that continues from a dictionary or
+  /// properties that no earlier chunk set, or one with properties LZMA does not define.
   | Chunk
-  /// A chunk whose coded bits do not start with a zero byte, do not end where the chunk says, or
-  /// hold a match longer than what the chunk has left to write.
+  /// A chunk whose coded bits do not start with a zero byte, do not end where the chunk states, or
+  /// contain a match longer than what the chunk has left to write.
   | Code
   /// A match that reaches back before the dictionary's first byte.
   | Distance
-  /// A block that holds another number of bytes, packed or unpacked, than its header declares.
+  /// A block whose packed or unpacked size differs from what its header declares.
   | Size
-  /// A block whose check is not its bytes'.
+  /// A block whose check does not match its bytes.
   | Checksum
-  /// An index that does not list the blocks the stream held, or a footer that does not agree with
+  /// An index that does not list the blocks the stream contained, or a footer that does not match
   /// the index or the header.
   | Index
-  /// Bytes after a stream that are neither padding in fours nor another stream.
+  /// Bytes after a stream that are neither zero padding in groups of four nor another stream.
   | Trailing
 
-/// A refusal, and the offset of the input byte the reader stood at.
+/// An error, and the offset of the input byte the reader was at.
 pub type Error = new { at: Int, reason: ErrorKind }
 
-/// What a reader of this module raises where it refuses.
+/// The error a reader in this module raises.
 pub effect xz {
-  /// The input is not whole streams, or asks for more than the limits.
+  /// The input is not made of complete, valid streams, or needs more than the limits allow.
   raise fail(e: Error)
 }
 
 fn fail<a>(at: Int, why: ErrorKind) -> a / {xz.fail} = xz.fail({ at: at, reason: why })
 
-/// What a reader may spend: the most bytes it answers, and the most bytes of history a block may
-/// ask it to keep, which is its LZMA2 dictionary.
+/// The resources a reader may use: the most bytes it returns, and the most bytes of history a
+/// block may ask it to keep, which is the block's LZMA2 dictionary.
 pub type Limits = new { output: Int, window: Int }
 
 /// Each byte value as the one byte it is.
@@ -91,22 +92,22 @@ const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_
 
 // --- LZMA -------------------------------------------------------------------
 
-// Every probability stands in one array: whether a match follows, by state and position, from
-// 0; whether it repeats a distance, from 192, the last one from 204, the one before from 216,
-// the third from 228, and whether a repeat of the last is longer than a byte from 240; distance
-// slots by length from 432, the low bits of the near distances from 688 and of the far ones from
-// 802; the lengths of a match from 818 and of a repeat from 1332, each two choices, sixteen
-// short codes of three bits from 2, sixteen of the next eight lengths from 130, and one code of
-// eight bits from 258; and the literals from 1846, 768 for each context.
+// All probabilities are in one array. From 0: whether a match follows, by state and position.
+// From 192: whether a match repeats a distance. From 204, 216 and 228: whether it repeats the
+// last distance, the one before, or the third. From 240: whether a repeat of the last distance is
+// longer than one byte. From 432: distance slots by length. From 688 and 802: the low bits of near
+// and of far distances. From 818 for a match and 1332 for a repeat: lengths, each with two
+// choices, and within each, sixteen short three-bit codes from 2, sixteen codes for the next eight
+// lengths from 130, and one eight-bit code from 258. From 1846: the literals, 768 per context.
 
-// A chunk's constants ride in one `Int`: the position mask in its low four bits, the literal
-// position mask in the next four, the literal context bits in the next, the low four bits of
-// where the dictionary started in the next, and above them the length the output reaches where
-// the chunk ends. What a symbol seldom reads is in an array: 0 where the dictionary starts in
-// the output, 1 its size, 2 the stream offset of the chunk's coded bytes.
+// A chunk's constants are packed in one `Int`: the position mask in its low four bits, the literal
+// position mask in the next four, the literal context bits in the next four, the low four bits of
+// the dictionary's start in the next four, and above them the output length at the end of the
+// chunk. Values a symbol rarely reads are in an array: at 0 the dictionary's start in the output,
+// at 1 its size, and at 2 the stream offset of the chunk's coded bytes.
 
-/// What a chunk leaves: the bytes written, the probabilities, the state, the last four distances
-/// (the third and fourth in one `Int`, 31 bits each), and where its bits ended.
+/// The decoder state after a chunk: the bytes written, the probabilities, the state, the last four
+/// distances (the third and fourth packed in one `Int`, 31 bits each), and where its bits ended.
 type LzmaState = {
   out: Bytes,
   probs: Array<Int>,
@@ -122,7 +123,7 @@ type LzmaState = {
 fn after_literal(state: Int) -> Int =
   if state < 4 { 0 } else if state < 10 { state - 3 } else { state - 6 }
 
-/// One symbol: a bit says whether it is a literal, read here, or a match.
+/// Decodes one symbol. A bit decides whether it is a literal, which is read here, or a match.
 fn symbol(
   src: Bytes,
   ip: Int,
@@ -198,7 +199,7 @@ fn symbol(
     }
   }
 
-/// A literal's bits from the most significant, each read in the context of those before it.
+/// Reads a literal's bits from the most significant, each in the context of the bits before it.
 fn literal(
   src: Bytes,
   ip: Int,
@@ -300,9 +301,9 @@ fn literal(
     }
   }
 
-/// A literal after a match, read against the byte the match would have copied next: each bit in
-/// the context of that byte's bit as well, for as long as the two agree. `against` is that byte,
-/// its next bit at bit 8.
+/// Reads a literal after a match, against the byte the match would have copied next. Each bit is
+/// also read in the context of that byte's bit, for as long as the two agree. `against` is that
+/// byte, with its next bit at bit 8.
 fn matched(
   src: Bytes,
   ip: Int,
@@ -445,8 +446,9 @@ fn matched(
     }
   }
 
-/// After a bit that said match: a bit says whether its distance is new, which moves the last
-/// three down and leaves the first to be read, marked below zero, or one of the last four.
+/// After a bit that chose a match, a bit decides whether its distance is new or one of the last
+/// four. A new distance moves the last three down and leaves the first to be read, marked by a
+/// value below zero.
 fn choice(
   src: Bytes,
   ip: Int,
@@ -505,7 +507,7 @@ fn choice(
     }
   }
 
-/// A repeat: a bit says whether it is of the last distance.
+/// A repeat: a bit decides whether it repeats the last distance.
 fn repeat_first(
   src: Bytes,
   ip: Int,
@@ -563,7 +565,7 @@ fn repeat_first(
     }
   }
 
-/// A repeat of the last distance: a bit says whether it is one byte or has a length.
+/// A repeat of the last distance: a bit decides whether it is one byte or has a length.
 fn repeat_short(
   src: Bytes,
   ip: Int,
@@ -623,8 +625,8 @@ fn repeat_short(
     }
   }
 
-/// A repeat of an older distance: a bit says whether it is the one before the last, which
-/// changes places with it.
+/// A repeat of an older distance: a bit decides whether it is the one before the last, which then
+/// swaps places with the last.
 fn repeat_second(
   src: Bytes,
   ip: Int,
@@ -743,8 +745,8 @@ fn repeat_third(
     }
   }
 
-/// A length's first choice, among the probabilities from `from`: a short code of three bits, or
-/// another choice.
+/// A length's first choice, using the probabilities from `from`: a short three-bit code, or a
+/// second choice.
 fn length(
   src: Bytes,
   ip: Int,
@@ -872,9 +874,9 @@ fn length_more(
     }
   }
 
-/// A length's code, read as a literal's bits are. The length is the code and `add`, which is
-/// below -200 for the code of eight bits. It then rides above the state's four bits, to where a
-/// new distance is read or a known one copied.
+/// A length's code, read as a literal's bits are. The length is the code plus `add`, which is
+/// below -200 for the eight-bit code. The length is then packed above the state's four bits and
+/// passed on to where a new distance is read or a known one is copied.
 fn length_bits(
   src: Bytes,
   ip: Int,
@@ -948,9 +950,9 @@ fn length_bits(
     }
   }
 
-/// A new distance's slot, six bits among the probabilities its length chose. A slot below 4 is
-/// the distance; one below 14 gives two high bits and reads the rest in a code of its own; and
-/// a higher one reads all but the last four bits plainly.
+/// A new distance's slot: six bits, using the probabilities its length selected. A slot below 4 is
+/// the distance. A slot below 14 gives two high bits and reads the rest in its own code. A higher
+/// slot reads all but the last four bits directly.
 fn slot(
   src: Bytes,
   ip: Int,
@@ -1012,11 +1014,11 @@ fn slot(
     }
   }
 
-/// Five bits, each as five bits read first to last say it from the lowest.
+/// Each five-bit value with its bits reversed.
 fn bit_reversal() -> Bytes =
   b"\x00\x10\x08\x18\x04\x14\x0c\x1c\x02\x12\x0a\x1a\x06\x16\x0e\x1e\x01\x11\x09\x19\x05\x15\x0d\x1d\x03\x13\x0b\x1b\x07\x17\x0f\x1f"
 
-/// The `more` low bits of a near distance, lowest first, in a code of their own.
+/// The `more` low bits of a near distance, lowest first, in their own code.
 fn near(
   src: Bytes,
   ip: Int,
@@ -1069,7 +1071,7 @@ fn near(
     }
   }
 
-/// The middle bits of a far distance, `left` of them, each half the range.
+/// The `left` middle bits of a far distance, each read with a fixed probability of one half.
 fn far(
   src: Bytes,
   ip: Int,
@@ -1149,7 +1151,8 @@ fn last_four(
     }
   }
 
-/// A match written: the length above the state's four bits, from one more than `rep0` back.
+/// Writes a match. Its length is above the state's four bits, and it copies from one more than
+/// `rep0` bytes back.
 fn copy(
   src: Bytes,
   ip: Int,
@@ -1192,12 +1195,12 @@ fn copy(
 
 // --- Streams and blocks -------------------------------------------------------
 
-/// A number read: its value and the byte after it, or below zero a value that says it was cut
-/// short at the end given, -1, or misspelled, -2.
+/// A decoded number: its value and the offset of the byte after it. A value of -1 means the number
+/// was cut short at the given end, and -2 means it was badly encoded.
 type Number = { value: Int, next: Int }
 
-/// A number seven bits a byte from the lowest, a set high bit saying another byte follows: nine
-/// bytes at most, and no last byte of zero that adds nothing.
+/// Reads a number stored seven bits per byte, lowest first, where a set high bit means another
+/// byte follows. It has at most nine bytes, and no last byte of zero, which would add nothing.
 fn number(b: Bytes, at: Int, end: Int, shift: Int, low: Int) -> Number / {abort.raise} =
   if at >= end { { value: -1, next: at } } else {
     let byte = b.at(at);
@@ -1207,14 +1210,14 @@ fn number(b: Bytes, at: Int, end: Int, shift: Int, low: Int) -> Number / {abort.
     else { number(b, at + 1, end, shift + 7, low | (byte & 127) << shift) }
   }
 
-/// `n` as `number` reads it.
+/// `n` encoded as `number` reads it.
 fn number_bytes(n: Int) -> Bytes / {abort.raise} =
   if n < 128 { byte_of_int(n) } else { byte_of_int(n % 128 + 128).concat(number_bytes(n / 128)) }
 
-/// The sum a block's bytes are checked by, part of the way through them.
+/// The running sum that a block's bytes are checked by.
 type RunningCheck = | NoCheck | CrcCheck(checksum::State) | HashCheck(hash::Hasher)
 
-/// The sum of a check type before any bytes.
+/// The initial sum for a check type.
 fn running_check(check: Int) -> RunningCheck =
   if check == 1 { CrcCheck(checksum::init(checksum::Crc(checksum::crc32_iso_hdlc()))) }
   else if check == 4 { CrcCheck(checksum::init(checksum::Crc(crc64_xz()))) }
@@ -1244,11 +1247,11 @@ fn check_of(sum: RunningCheck, check: Int) -> Bytes / {abort.raise} =
 fn check_size(check: Int) -> Int =
   if check == 1 { 4 } else if check == 4 { 8 } else if check == 10 { 32 } else { 0 }
 
-/// A block being read: its header's size and what it declares of its sizes, or -1; its
-/// dictionary's size and where in the history it starts; the stream offset of its first chunk
-/// and the bytes written before it; what one LZMA chunk leaves the next; its properties as
+/// A block being read: its header's size and the sizes it declares, or -1; its dictionary's size
+/// and where in the history it starts; the stream offset of its first chunk and the bytes written
+/// before it; the LZMA state one chunk passes to the next; its properties as
 /// `lc | lp << 4 | pb << 8`, or -1 before a chunk sets them; whether a chunk has started the
-/// dictionary; and the sum of its bytes.
+/// dictionary; and the running sum of its bytes.
 type Block = {
   head: Int,
   packed: Int,
@@ -1286,12 +1289,12 @@ fn no_block() -> Block =
     sum: NoCheck,
   }
 
-/// Everything of a reader but its two buffers: where it is in the input and what it has
-/// answered, how many bytes it has dropped from the front of the history, the streams it has
-/// read, what comes next (0 a stream's header or the padding after one, 1 a block's header or
-/// the index, 2 a chunk, 3 a block's padding and check, 4 a stream's footer), how many bytes it
-/// needs before it can go on, whether a stream has ended, the stream's check type, a record of
-/// each block for the index to agree with, the size the index had, and the block being read.
+/// A reader's state apart from its two buffers: its position in the input and how much it has
+/// returned, how many bytes it has dropped from the front of the history, the number of streams
+/// read, what comes next (0 a stream's header or the padding after one, 1 a block's header or the
+/// index, 2 a chunk, 3 a block's padding and check, 4 a stream's footer), how many bytes it needs
+/// before it can continue, whether a stream has ended, the stream's check type, a record of each
+/// block for the index to match, the index's size, and the block being read.
 type Core = {
   limits: Limits,
   at: Int,
@@ -1308,8 +1311,8 @@ type Core = {
   block: Block,
 }
 
-/// A reader part of the way through its input: the input not yet read, the bytes written that a
-/// match may still copy or that are not yet answered, and the rest.
+/// A reader partway through its input: the input not yet read, the bytes written that a match may
+/// still copy or that are not yet returned, and the rest of its state.
 type Decoder = { input: Bytes, history: Bytes, core: Core }
 
 fn decoder(limits: Limits, input: Bytes) -> Decoder =
@@ -1337,7 +1340,8 @@ fn needing_input(d: Decoder, need: Int) -> Decoder = { ..d, core: { ..d.core, ne
 
 fn magic() -> Bytes = b"\xFD7zXZ\x00"
 
-/// A stream's twelve bytes of header, or the zeros in fours that may stand between two streams.
+/// Reads a stream's twelve-byte header, or the zero padding in groups of four that may come
+/// between two streams.
 fn stream_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1358,8 +1362,8 @@ fn stream_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   }
 }
 
-/// The filters a block header lists from `p`: one, LZMA2, with a byte that says its dictionary's
-/// size. Answers that size.
+/// Reads the filters a block header lists from `p`, which must be LZMA2 alone with a byte giving
+/// its dictionary's size. Returns that size.
 fn filters(
   input: Bytes,
   p: Int,
@@ -1380,8 +1384,8 @@ fn filters(
   }
 }
 
-/// A block's header: its size in a byte, flags, the sizes it declares, its filters, zeros to
-/// fill it, and a CRC-32 of all of that.
+/// Reads a block's header: its size in a byte, flags, the sizes it declares, its filters, zero
+/// padding, and a CRC-32 of all of that.
 fn block_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1429,9 +1433,9 @@ fn block_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   }
 }
 
-/// A chunk of bytes as they are: three bytes of header, the second and third one less than how
-/// many follow. The first kind starts the dictionary over, after which properties must be set
-/// again.
+/// Reads an uncompressed chunk: three bytes of header, where the second and third are one less
+/// than the number of bytes that follow. The first kind resets the dictionary, after which
+/// properties must be set again.
 fn plain_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort.raise} =
   if have < 3 { needing_input(d, 3) } else {
     let core = d.core;
@@ -1464,18 +1468,18 @@ fn plain_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
     }
   }
 
-/// The properties a byte spells, as `lc | lp << 4 | pb << 8`: literal context bits, literal
-/// position bits and position bits, of which the first two are four at most together.
+/// The properties a byte encodes, as `lc | lp << 4 | pb << 8`: literal context bits, literal
+/// position bits and position bits. The first two add up to at most four.
 fn properties(byte: Int, where: Int) -> Int / {xz.fail} = {
   let lc = byte % 9;
   let lp = byte / 9 % 5;
   if byte > 224 || lc + lp > 4 { fail(where, Chunk) } else { lc | lp << 4 | byte / 45 << 8 }
 }
 
-/// A chunk of LZMA: its control byte holds the top bits of one less than what it unpacks to, two
-/// bytes the rest, and two one less than its coded bytes. The control byte also says what is
-/// started over first: nothing, the state, the state with new properties in a byte that follows,
-/// or those and the dictionary.
+/// Reads an LZMA chunk. Its control byte contains the top bits of one less than its unpacked size,
+/// the next two bytes contain the rest, and the two after them are one less than its coded size.
+/// The control byte also states what is reset first: nothing, the state, the state with new
+/// properties in a following byte, or all of those and the dictionary.
 fn coded_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort.raise} = {
   let mode = control >>> 5 & 3;
   let head = if mode >= 2 { 6 } else { 5 };
@@ -1554,8 +1558,8 @@ fn chunk(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   else { plain_chunk(d, have, control) }
 }
 
-/// After a block's data: zeros to a multiple of four bytes, and its check. The block held what
-/// its header declared.
+/// Reads what follows a block's data: zero padding to a multiple of four bytes, and its check.
+/// Also checks that the block's sizes match what its header declared.
 fn block_end(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1588,8 +1592,8 @@ fn block_end(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   }
 }
 
-/// The index a stream's blocks call for: a zero byte, how many they were, each one's size
-/// without its padding and what it unpacked to, zeros to a multiple of four bytes, and a CRC-32.
+/// The index that a stream's blocks require: a zero byte, the number of blocks, each block's size
+/// without padding and its unpacked size, zero padding to a multiple of four bytes, and a CRC-32.
 fn index_of(records: List<Bytes>) -> Bytes / {abort.raise} = {
   let listed = Bytes::concat_all([
     b"\x00",
@@ -1600,7 +1604,7 @@ fn index_of(records: List<Bytes>) -> Bytes / {abort.raise} = {
   filled.concat(u32_le(Int::of_u32(crc32(filled))))
 }
 
-/// The index, which is what the blocks read call for, byte for byte.
+/// Reads the index, which must match what the blocks read require, byte for byte.
 fn index(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let want = index_of(core.records);
@@ -1610,7 +1614,7 @@ fn index(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   else { { ..d, core: { ..core, at: core.at + n, phase: 4, need: 0, index: n, records: [] } } }
 }
 
-/// A stream's twelve bytes of footer: a CRC-32 of the six that follow it, the index's size, the
+/// Reads a stream's twelve-byte footer: a CRC-32 of the six bytes after it, the index's size, the
 /// header's flags again, and two letters.
 fn footer(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} =
   if have < 12 { needing_input(d, 12) } else {
@@ -1629,7 +1633,7 @@ fn footer(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} =
     }
   }
 
-/// One step of a reader. A reader that needs more input than it has says how much in `need`.
+/// One step of a reader. A reader that needs more input than it has records how much in `need`.
 fn step(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   let phase = d.core.phase;
   let have = d.input.len() - d.core.at;
@@ -1642,15 +1646,15 @@ fn step(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   else { block_start(d, have) }
 }
 
-/// Steps until the reader needs input, has `goal` bytes to answer, or, where `one` is set, has
+/// Steps until the reader needs input, has `goal` bytes to return, or, when `one` is set, has
 /// read a stream.
 fn pump(d: Decoder, goal: Int, one: Bool, fuel: Int) -> Decoder / {xz.fail, abort.raise} =
   if fuel <= 0 || d.core.need > 0 || (one && d.core.closed)
       || d.history.len() - d.core.sent >= goal { d }
   else { pump(step(d), goal, one, fuel - 1) }
 
-/// The reader as it must stand where its input ends: after a stream, with nothing left over but
-/// what `stream_start` passed.
+/// Checks the reader's state at the end of its input. It must be just after a stream, with nothing
+/// left over except padding that `stream_start` skipped.
 fn finished(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   let at = d.core.at;
   let left = d.input.slice(at, d.input.len());
@@ -1662,19 +1666,19 @@ fn finished(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   } else { d }
 }
 
-/// The bytes written and not yet answered.
+/// The bytes written and not yet returned.
 fn pending(d: Decoder) -> Bytes / {abort.raise} =
   if d.core.sent == 0 { d.history } else { d.history.slice(d.core.sent, d.history.len()) }
 
-/// The bytes the streams of an `.xz` file hold, which are `limits.output` at most.
+/// The decompressed contents of an `.xz` file's streams, at most `limits.output` bytes.
 pub fn decompress(data: Bytes, limits: Limits) -> Bytes / {xz.fail, abort.raise} =
   pending(finished(pump(decoder(limits, data), 0x3FFF_FFFF_FFFF_FFFF, false, 2 * data.len() + 8)))
 
-/// `decompress`, with a refusal answered rather than raised.
+/// `decompress`, with an error returned rather than raised.
 pub fn try_decompress(data: Bytes, limits: Limits) -> Result<Bytes, Error> / {abort.raise} =
   try { decompress(data, limits) }
 
-/// A file's first stream, and how many bytes of the input it took.
+/// A file's first stream, and how many bytes of the input it used.
 pub type FirstStream = new { plain: Bytes, used: Int }
 
 /// The first stream of `data`, whatever follows it.
@@ -1686,7 +1690,7 @@ pub fn decompress_first(data: Bytes, limits: Limits) -> FirstStream / {xz.fail, 
 
 // --- A stream a chunk at a time -----------------------------------------------
 
-/// The reader with `chunk` after the input it has not read.
+/// The reader with `chunk` appended to the input it has not read.
 fn feed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
   let core = d.core;
   {
@@ -1698,9 +1702,9 @@ fn feed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
 
 type DecoderOutput = { out: Bytes, next: Decoder }
 
-/// What the reader has written and not yet answered, and the reader without the history no match
-/// can reach: among a block's chunks a match reaches the block's dictionary, and nowhere else
-/// anything.
+/// What the reader has written and not yet returned, and the reader without the history no match
+/// can reach. Within a block's chunks a match can reach the block's dictionary, and elsewhere it
+/// can reach nothing.
 fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   let core = d.core;
   let block = core.block;
@@ -1724,8 +1728,8 @@ fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   } else { { out: out, next: { ..d, core: { ..core, sent: n } } } }
 }
 
-/// How many bytes a reader writes before it answers them: a sixteenth of a megabyte, or an
-/// eighth of the block's dictionary where that is more.
+/// How many bytes a reader writes before returning them: 64 KiB, or an eighth of the block's
+/// dictionary if that is more.
 fn stride(d: Decoder) -> Int = max(65536, d.core.block.dict >>> 3)
 
 fn decompress_chunks<| e>(
@@ -1751,13 +1755,13 @@ fn decompress_chunks<| e>(
       }
     }
 
-/// What the chunks of an `.xz` file unpack to, a chunk for each pull that has bytes to answer. A
-/// pull reads at most one chunk of `packed` and unpacks until it has a stride of bytes, a
-/// sixteenth of a megabyte or an eighth of the block's dictionary, or needs the next chunk, so
-/// the reader holds one chunk of input, one LZMA2 chunk, which is at most 64 KiB packed and 2 MiB
-/// unpacked, and of what it has written no more than a block's dictionary and a quarter again
-/// and a stride. The sequence refuses where `decompress` would, at the same offset, and where
-/// `packed` ends before the file does.
+/// The decompressed contents of the `.xz` file in `packed`, as a sequence with a chunk for each
+/// pull that has bytes to return. A pull reads at most one chunk of `packed`, and decompresses
+/// until it has a stride of bytes (64 KiB, or an eighth of the block's dictionary) or needs the
+/// next chunk. So the reader keeps in memory one chunk of input, one LZMA2 chunk, which is at most
+/// 64 KiB packed and 2 MiB unpacked, and no more of its output than a block's dictionary plus a
+/// quarter of it plus a stride. The sequence fails where `decompress` would, at the same offset,
+/// and also when `packed` ends before the file does.
 pub fn decompress_stream<| e>(
   packed: Seq<Bytes | e>,
   limits: Limits,
@@ -1775,7 +1779,7 @@ fn large_limits() -> Limits = { output: 1048576, window: 67108864 }
 
 type Fixture = { name: String, packed: String, plain: Bytes }
 
-/// Files `xz` 5.8.2 wrote.
+/// Files written by `xz` 5.8.2.
 fn files() -> List<Fixture> =
   [
     {
@@ -1803,7 +1807,7 @@ fn files() -> List<Fixture> =
 fn file(i: Int) -> Bytes / {abort.raise} =
   match files().at(i) { Some(f) -> Bytes::of_hex(f.packed), None -> panic("no such file") }
 
-/// What the chunks of a file unpack to, joined.
+/// The decompressed chunks of a file, joined.
 fn joined(
   chunks: Seq<Bytes | {xz.fail, abort.raise}>,
 ) -> Bytes / {xz.fail, seq.spent, abort.raise} = Bytes::concat_all(seq::to_list(chunks, 1000000))
@@ -1815,7 +1819,7 @@ test "decompress reads {f.name}, whole and a few bytes at a time" for f: Fixture
   assert_eq(joined(decompress_stream(seq::slices(packed, 7), large_limits())), f.plain)
 }
 
-test "cut short anywhere, {f.name} is refused as cut short" for f: Fixture in files() {
+test "cut short anywhere, {f.name} fails as truncated" for f: Fixture in files() {
   let whole = Bytes::of_hex(f.packed);
   assert_eq(
     range(0, whole.len()).filter(|n: Int|
@@ -1827,7 +1831,7 @@ test "cut short anywhere, {f.name} is refused as cut short" for f: Fixture in fi
   )
 }
 
-test "whichever byte of {f.name} is changed, a file whose blocks are checked is refused" for f: Fixture in files(
+test "whichever byte of {f.name} is changed, a file whose blocks are checked is rejected" for f: Fixture in files(
   ) {
   let whole = Bytes::of_hex(f.packed);
   let read = range(0, whole.len()).filter(|i: Int|
@@ -1835,7 +1839,7 @@ test "whichever byte of {f.name} is changed, a file whose blocks are checked is 
       Ok(_) -> true,
       Err(_) -> false,
     });
-  // With no check, a changed byte of the data is a changed byte of the answer.
+  // With no check, a changed data byte just changes a byte of the result.
   assert(read == [] || whole.at(7) == 0, Some(read.len().to_string()))
 }
 
@@ -1854,7 +1858,7 @@ fn block_head(dict: Int) -> Bytes / {abort.raise} = {
   head.concat(u32_le(Int::of_u32(crc32(head))))
 }
 
-/// `plain` as an `.xz` file of one block with no check, in chunks of `size` bytes as they are.
+/// `plain` as an `.xz` file of one block with no check, in uncompressed chunks of `size` bytes.
 fn stored(plain: Bytes, size: Int) -> Bytes / {abort.raise} = {
   let n = plain.len();
   let chunks = range(0, (n + size - 1) / size).map(|i: Int| {
@@ -1885,7 +1889,7 @@ fn stored(plain: Bytes, size: Int) -> Bytes / {abort.raise} = {
   ])
 }
 
-test "a reader says why bytes are no .xz file, and where" {
+test "a reader reports why bytes are not an .xz file, and where" {
   let good = file(0);
   let n = good.len();
   let read = |packed: Bytes| try_decompress(packed, large_limits());
@@ -1909,7 +1913,7 @@ test "a reader says why bytes are no .xz file, and where" {
     12,
     Filter(3),
   );
-  // The block's header is twenty bytes, so its first chunk stands at 32 and its coded bits at 38.
+  // The block's header is twenty bytes, so its first chunk starts at 32 and its coded bits at 38.
   assert_error(read(good.with_byte(32, 3)), 32, Chunk);
   assert_error(read(good.with_byte(32, 0x80)), 32, Chunk);
   assert_error(read(good.with_byte(38, 1)), 38, Code);
@@ -1920,7 +1924,7 @@ test "a reader says why bytes are no .xz file, and where" {
   assert_eq(try_decompress(good, { output: 255, window: 8388608 }), Ok(thrice()))
 }
 
-test "files one after another are one file, with zeros in fours between and after them, and the first can be had alone" {
+test "concatenated files are one file, with zero padding between and after, and the first reads alone" {
   let a = file(2);
   let b = file(3);
   let both = checked().concat(checked());
@@ -1944,7 +1948,7 @@ test "files one after another are one file, with zeros in fours between and afte
   assert_eq(head.used, n)
 }
 
-test "a file of chunks as they are reads back, whole and however it is cut" {
+test "a file of uncompressed chunks reads back, whole and however it is split" {
   gen::check3(gen::bytes(), gen::any_int(), gen::any_int(), |x: Bytes, size: Int, cut: Int| {
     let packed = stored(x, 1 + (size & 63));
     let at = (cut & 0x7FFF_FFFF) % packed.len();
@@ -1960,8 +1964,8 @@ test "a file of chunks as they are reads back, whole and however it is cut" {
   })
 }
 
-/// Whether a reader held to 4096 bytes answers no more than that or refuses, and raises nothing
-/// else.
+/// Whether a reader limited to 4096 bytes returns no more than that or fails with an `xz` error,
+/// and raises nothing else.
 fn harmless(packed: Bytes) -> Bool = {
   let got: Result<Result<Bytes, Error>, String> = try[abort.raise] {
     try_decompress(packed, { output: 4096, window: 65536 })
@@ -1969,7 +1973,7 @@ fn harmless(packed: Bytes) -> Bool = {
   match got { Ok(Ok(plain)) -> plain.len() <= 4096, Ok(Err(_)) -> true, Err(_) -> false }
 }
 
-/// `coded` as the one LZMA chunk of a block, said to unpack to `plain` bytes under the
+/// `coded` as the only LZMA chunk of a block, declared to unpack to `plain` bytes under the
 /// properties `props`.
 fn coded_file(coded: Bytes, plain: Int, props: Int) -> Bytes / {abort.raise} = {
   let body = Bytes::concat_all([b"\x00", coded, b"\x00\x00\x00\x00"]);
@@ -1987,20 +1991,20 @@ fn coded_file(coded: Bytes, plain: Int, props: Int) -> Bytes / {abort.raise} = {
   ])
 }
 
-test "whatever bytes a reader is handed, as a file or as the coded bits of a chunk, it answers within its limits or refuses" {
+test "whatever bytes a reader is given, as a file or a chunk's coded bits, it stays within its limits or fails" {
   gen::check2(gen::bytes(), gen::any_int(), |x: Bytes, props: Int| {
     harmless(x) && harmless(stream_head(1).concat(x)) && harmless(coded_file(x, 64, 0x5D))
       && harmless(coded_file(x, 3000, (props & 0xFFFF) % 225))
   })
 }
 
-test "a block that asks for a dictionary past the limit is refused before a chunk is read, whatever it asks for" {
+test "a block that requests a dictionary past the limit is rejected before any chunk is read" {
   let asks = |dict: Int| try_decompress(stream_head(4).concat(block_head(dict)), large_limits());
   assert_error(asks(40), 12, Window);
   assert_error(asks(31), 12, Window)
 }
 
-/// The widest the history stands after an answer, reading `d` to where it needs input.
+/// The largest size the history reaches after returning output, reading `d` until it needs input.
 fn widest(d: Decoder, most: Int, fuel: Int) -> { d: Decoder, most: Int } / {xz.fail, abort.raise} =
   if fuel <= 0 || d.core.need > 0 { { d: d, most: most } } else {
     let answered = take_output(pump(d, stride(d), false, 1000000));

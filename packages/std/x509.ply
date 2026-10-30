@@ -1,39 +1,38 @@
 //! X.509 certificates as RFC 5280 defines them: read, verified to a trust anchor at a given time,
 //! and built, with certificate requests (PKCS #10) beside them.
 //!
-//! A `Certificate` exists only once read. `read` holds the bytes to DER and to the certificate's
-//! structure, keeps the exact bytes its signature is over, and reads each extension it knows into
-//! a `Content`; any other is kept as its DER with its criticality. `Strict` is RFC 5280 to the
-//! letter. `Tolerant` is for certificates as they are served: a root still trusted carries a
-//! serial number of zero, and some certificates write a `critical` of false out.
+//! A `Certificate` can only be created by reading one. `read` checks the bytes against DER and the
+//! certificate's structure, keeps the exact bytes its signature covers, and reads each extension it
+//! knows into a `Content`; any other is kept as its DER with its criticality. `Strict` follows RFC
+//! 5280 to the letter. `Tolerant` accepts certificates as they are served: a root that is still
+//! trusted has a serial number of zero, and some certificates write out a `critical` of false.
 //!
-//! `verify` is a function of what it is handed: the leaf, the certificates offered beside it, the
-//! anchors trusted, the time, who is expected, what for, and a `Policy`. Time is an argument, so a
-//! test of an expiry passes on any day. It builds a path, trying every issuer of the right name
-//! until one holds, so a certificate cross-signed by a root that has expired does not hide the
-//! path through one that has not; a policy bounds the signatures it checks and the names it
-//! compares, so a crafted bundle costs a bounded amount. What stops a path is answered as the
+//! `verify` depends only on its arguments: the leaf, the certificates offered with it, the trusted
+//! anchors, the time, the expected identity, the purpose, and a `Policy`. The time is an argument,
+//! so a test of an expiry passes on any day. It builds a path, trying every issuer of the right
+//! name until one works, so a certificate cross-signed by an expired root does not hide the path
+//! through one that has not expired. A policy bounds the signatures it checks and the names it
+//! compares, so a crafted bundle costs a bounded amount. When no path exists, the result is the
 //! certificate at fault and a `Fault`.
 //!
-//! Names are RFC 9525's. A certificate is for a host by its subject alternative names alone; the
-//! subject's common name is never read. A wildcard is a whole first label, stands for exactly one
-//! label, and is refused over fewer than two labels, which is every name of a top-level domain:
-//! no list of public suffixes is consulted, so `*.co.uk` is taken as written. A host given in
-//! another script is taken through `std.idna` and compared as its A-labels; an address is
-//! compared as an address and never as text.
+//! Names follow RFC 9525. A certificate matches a host by its subject alternative names alone; the
+//! subject's common name is never read. A wildcard is a whole first label and matches exactly one
+//! label. It is rejected over fewer than two labels, which covers every name directly under a
+//! top-level domain. No list of public suffixes is consulted, so `*.co.uk` is taken as written. A
+//! host given in another script is converted through `std.idna` and compared as its A-labels; an
+//! address is compared as an address and never as text.
 //!
-//! What verifies is what the runtime has: RSA PKCS #1 and PSS of 2048 bits and up over SHA-256,
-//! SHA-384 and SHA-512; ECDSA on P-256 and P-384 over SHA-256 and SHA-384; Ed25519. MD5, SHA-1,
-//! DSA and any other curve are `Unverifiable`, under every policy.
+//! Verification supports what the runtime supports: RSA PKCS #1 and PSS of 2048 bits and up over
+//! SHA-256, SHA-384 and SHA-512; ECDSA on P-256 and P-384 over SHA-256 and SHA-384; Ed25519. MD5,
+//! SHA-1, DSA and any other curve are `Unverifiable`, under every policy.
 //!
-//! Revocation is not checked: nothing here fetches, and a CRL or an OCSP response is not read. A
-//! path that holds says the certificate was good when it was issued. `AuthorityAccess` and
-//! `CrlPoints` say where a caller would ask; checking what comes back takes a reader of CRLs and
-//! OCSP responses and a time by which each is fresh, and both would be arguments as the time here
-//! is.
+//! Revocation is not checked: nothing here fetches anything, and no CRL or OCSP response is read. A
+//! valid path shows the certificate was good when it was issued. `AuthorityAccess` and `CrlPoints`
+//! state where a caller would query. Checking the replies needs a reader of CRLs and OCSP responses
+//! and a time by which each is fresh, and both would be arguments, as the time is here.
 //!
-//! `certificate` and `request` build. Each signs through `std.crypto`, and `certificate` answers
-//! what `read` makes of its own bytes, so a built certificate is one that reads.
+//! `certificate` and `request` build. Each signs through `std.crypto`, and `certificate` returns
+//! what `read` makes of its own bytes, so every built certificate can be read.
 
 import std.asn1
 import std.asn1 (asn1, Bits, ReadResult, Reader, Ia5String, Value)
@@ -56,9 +55,9 @@ import std.string
 import std.time (nanos_at)
 import std.gen
 
-// --- What a certificate holds ----------------------------------------------------
+// --- What a certificate contains -------------------------------------------------
 
-/// The most a reader takes of one certificate.
+/// The most a reader accepts of one certificate.
 pub type Limits = new {
   /// Its bytes.
   bytes: Int,
@@ -74,8 +73,8 @@ pub type Limits = new {
 /// levels.
 pub fn limits() -> Limits = { bytes: 65536, extensions: 64, names: 1024, depth: 16 }
 
-/// One attribute of a name: its type and its text, whatever string type wrote it. A value that is
-/// no string is `#` and its DER in hex.
+/// One attribute of a name: its type and its text, whatever string type encoded it. A value that
+/// is not a string is `#` and its DER in hex.
 pub type Attribute = new { id: Oid, value: String }
 
 /// A distinguished name: its relative names, outermost first, each a set of attributes, and the
@@ -131,7 +130,7 @@ pub type Usage =
 /// Where something about a certificate is fetched: the access method and the place.
 pub type Access = new { method: Oid, location: GeneralName }
 
-/// What an extension says, for the extensions this module reads.
+/// The content of an extension, for the extensions this module reads.
 pub type Content =
   /// `basicConstraints`: whether the subject is a CA, and how many CAs may follow it.
   | Basic(Bool, Option<Int>)
@@ -153,8 +152,8 @@ pub type Content =
   /// An extension this module does not read: `value` is all there is.
   | Unparsed
 
-/// An extension: its type, whether a verifier that does not understand it must refuse, the DER
-/// its `OCTET STRING` holds, and what that says.
+/// An extension: its type, whether a verifier that does not understand it must reject the
+/// certificate, the DER its `OCTET STRING` contains, and what that DER means.
 pub type Extension = new { id: Oid, critical: Bool, value: Bytes, content: Content }
 
 /// A subject's public key.
@@ -165,7 +164,7 @@ pub type Key =
   | EcKey(Oid, Bytes)
   /// Ed25519: 32 bytes.
   | Ed25519Key(Bytes)
-  /// A key of an algorithm nothing here verifies under, or written a way nothing here reads: the
+  /// A key of an algorithm nothing here verifies under, or encoded in a way nothing here reads: the
   /// algorithm and the key's bits.
   | OtherKey(Oid, Bytes)
 
@@ -178,7 +177,7 @@ pub type Algorithm =
   /// An algorithm nothing here verifies: MD5 and SHA-1 are these.
   | OtherAlgorithm(Oid)
 
-/// What a certificate says.
+/// The fields of a certificate.
 pub type Info = new {
   /// 1, 2 or 3.
   version: Int,
@@ -195,10 +194,10 @@ pub type Info = new {
   extensions: List<Extension>,
 }
 
-/// A certificate that was read: what it says, and the bytes that say it.
+/// A certificate that was read: its fields, and the bytes they were read from.
 pub opaque type Certificate = new { der: Bytes, tbs: Bytes, signature: Bytes, info: Info }
 
-/// Why bytes are no certificate this module reads.
+/// Why bytes are not a certificate this module reads.
 pub type Error =
   /// More bytes than the limit: how many.
   | TooLong(Int)
@@ -206,15 +205,15 @@ pub type Error =
   | NotDer(asn1::Error)
   /// A version other than 1, 2 or 3, or one that does not allow the fields written.
   | BadVersion(Int)
-  /// A serial number that is negative, or to the letter one that is zero or over twenty octets.
+  /// A serial number that is negative, or under `Strict` one that is zero or over twenty octets.
   | BadSerial
-  /// The signature algorithm is written two ways.
+  /// The certificate's two copies of the signature algorithm differ.
   | AlgorithmMismatch
   /// A signature that is not whole octets.
   | BadSignature
-  /// An extension this module reads whose value is not its type's.
+  /// An extension this module reads whose value does not match its type.
   | Malformed(Oid)
-  /// A name that is none: a relative name of no attributes, an IP address that is not four or
+  /// An invalid name: a relative name with no attributes, an IP address that is not four or
   /// sixteen octets, a network whose mask has a hole.
   | BadName
   /// An extension written twice.
@@ -225,16 +224,16 @@ pub type Error =
   | NotPem
   /// A request not signed by the key it carries.
   | Unproven
-  /// A draft with text no string type holds, or an instant no time writes.
+  /// A draft with text no string type can encode, or an instant no time type can write.
   | Unwritable
 
-/// What this module raises where it refuses.
+/// What this module raises when it rejects input.
 pub effect x509 {
-  /// The bytes are no certificate.
+  /// The bytes are not a certificate.
   raise fail(e: Error)
 }
 
-/// What `c` says.
+/// The fields of `c`.
 pub fn info(c: Certificate) -> Info = c.info
 
 /// The certificate, in DER.
@@ -252,7 +251,7 @@ pub fn fingerprint(c: Certificate) -> Bytes / {abort.raise} = sha256(c.der)
 /// SHA-256 of the `SubjectPublicKeyInfo`: what a pin is.
 pub fn key_pin(c: Certificate) -> Bytes / {abort.raise} = sha256(c.info.spki)
 
-/// What the extension `id` says, or `None` where the certificate has none.
+/// The extension `id`, or `None` when the certificate has none.
 pub fn extension(c: Certificate, id: Oid) -> Option<Extension> =
   c.info.extensions.find(|e: Extension| e.id == id)
 
@@ -261,7 +260,7 @@ pub fn alt_names(c: Certificate) -> List<GeneralName> =
   c.info.extensions.flat_map(|e: Extension|
     match e.content { SubjectAltName(matches_identity) -> matches_identity, _ -> [] })
 
-/// Whether `basicConstraints` says the subject is a CA.
+/// Whether `basicConstraints` marks the subject as a CA.
 pub fn is_ca(c: Certificate) -> Bool =
   c.info.extensions.any(|e: Extension| match e.content { Basic(ca, _) -> ca, _ -> false })
 
@@ -271,7 +270,7 @@ pub fn is_self_issued(c: Certificate) -> Bool = c.info.subject.der == c.info.iss
 /// `commonName`, the attribute a client certificate's subject names its holder by.
 pub fn common_name() -> Oid = oid::Oid([2, 5, 4, 3])
 
-/// The values the attributes of type `id` in `n` hold, outermost first.
+/// The values of the attributes of type `id` in `n`, outermost first.
 pub fn values_of(n: Name, id: Oid) -> List<String> =
   n.rdns.flat_map(|rdn: List<Attribute>|
     rdn.filter(|a: Attribute| a.id == id).map(|a: Attribute| a.value))
@@ -279,8 +278,8 @@ pub fn values_of(n: Name, id: Oid) -> List<String> =
 /// `n` as RFC 4514 writes a distinguished name: its relative names innermost first, separated by
 /// `,`, the attributes of one by `+`, each `TYPE=value`. `TYPE` is the short name RFC 4514 gives
 /// its type (`CN`, `L`, `ST`, `O`, `OU`, `C`, `STREET`, `DC`, `UID`), or its dotted identifier;
-/// `value` has escaped what §2.4 escapes, and one that is no string (`#` and its DER in hex) is
-/// written as it is.
+/// `value` is escaped as §2.4 requires, and a value that is not a string (`#` and its DER in hex)
+/// is written unchanged.
 pub fn name_text(n: Name) -> String =
   String::join(
     n.rdns.reverse().map(|rdn: List<Attribute>|
@@ -302,9 +301,9 @@ fn type_text(id: Oid) -> String =
     _ -> oid::to_string(id),
   }
 
-/// A value as RFC 4514 §2.4 writes it: `"`, `+`, `,`, `;`, `<`, `>` and `\` after a `\`, a space or
-/// a `#` that leads it and a space that ends it the same, and NUL as `\00`. A value that is no
-/// string, `#` and its DER in hex, is written as it is.
+/// A value as RFC 4514 §2.4 writes it: `"`, `+`, `,`, `;`, `<`, `>` and `\` preceded by a `\`,
+/// likewise a leading space or `#` and a trailing space, and NUL as `\00`. A value that is not a
+/// string, `#` and its DER in hex, is written unchanged.
 fn escaped_value(v: String) -> String =
   if v.starts_with("#") && v.len() > 1 && all_hex(v.slice(1, v.len())) { v } else {
     let chars = v.chars();
@@ -353,20 +352,20 @@ pub fn ca_issuers() -> Oid = pkix([48, 2])
 
 // --- Reading ---------------------------------------------------------------------
 
-/// How closely a certificate is held to RFC 5280 as it is read.
+/// How strictly a certificate is checked against RFC 5280 as it is read.
 pub type Strictness =
-  /// To all of it.
+  /// Against all of it.
   | Strict
-  /// But for what certificates in use get wrong: a serial number that is zero, as a root still
-  /// trusted has, or over twenty octets, and an extension whose `critical` is written out as
-  /// false. A negative serial number is refused all the same.
+  /// Against all of it except what certificates in use get wrong: a serial number that is zero, as
+  /// some still-trusted roots have, or over twenty octets, and an extension whose `critical` is
+  /// written out as false. A negative serial number is still rejected.
   | Tolerant
 
 effect set ReadEffects = {asn1.fail, x509.fail, abort.raise}
 
-/// The certificate `data` is, in DER and nothing else: RFC 5280's structure, with the version, the
-/// serial number, the two writings of the signature algorithm and every extension read here held
-/// to it. Raises `x509.fail`.
+/// The certificate in `data`, which must be DER and nothing else: RFC 5280's structure, with the
+/// version, the serial number, the two copies of the signature algorithm and every extension read
+/// here checked against it. Raises `x509.fail`.
 pub fn read(
   data: Bytes,
   limits: Limits,
@@ -379,15 +378,15 @@ pub fn read(
     }
   }
 
-/// `read`, answering a refusal as an `Err`.
+/// `read`, returning an error as an `Err`.
 pub fn parse(
   data: Bytes,
   limits: Limits,
   mode: Strictness,
 ) -> Result<Certificate, Error> / {abort.raise} = try { read(data, limits, mode) }
 
-/// The certificates a PEM text holds, in order, each read as `read` reads one. Raises `NotPem`
-/// for a text that is not PEM or holds a block that is no `CERTIFICATE`.
+/// The certificates in a PEM text, in order, each read as `read` reads one. Raises `NotPem` for a
+/// text that is not PEM or contains a block that is not a `CERTIFICATE`.
 pub fn read_pem(
   text: String,
   limits: Limits,
@@ -496,8 +495,8 @@ fn body_at(
   }
 }
 
-/// Whether a serial number is one `mode` takes: never a negative one, and to the letter a positive
-/// one of at most twenty octets.
+/// Whether `mode` accepts a serial number: never a negative one, and under `Strict` only a
+/// positive one of at most twenty octets.
 fn serial_allowed(serial: Bytes, mode: Strictness) -> Bool / {abort.raise} =
   serial.at(0) < 0x80 && (mode == Tolerant || (serial.len() <= 20 && serial != b"\x00"))
 
@@ -737,7 +736,7 @@ fn usage_at(bit: Int) -> Option<Usage> =
     bit,
   )
 
-/// What the value of the extension `id` says, read from the reader over it.
+/// The content of the extension `id`, read from the reader over its value.
 fn content_at(id: Oid, r: Reader, limits: Limits) -> ReadResult<Content> / {ReadEffects} =
   if id == oid::basic_constraints() {
     asn1::within(asn1::read_sequence(r), |s: Reader| {
@@ -900,9 +899,9 @@ fn all_digits(label: String) -> Bool = {
   b.scan(0, b"0123456789", b.len()) == b.len()
 }
 
-/// The labels of a host's name in lower case, or `None` for a text that is none: a label that is
-/// empty, over 63 octets, not letters, digits and inner hyphens, or a last label of digits alone,
-/// which is how an IP address ends.
+/// The labels of a host's name in lower case, or `None` for text that is not a host name: a label
+/// that is empty, over 63 octets, not letters, digits and inner hyphens, or a last label of digits
+/// alone, which is how an IP address ends.
 fn labels_of(name: String) -> Option<List<String>> =
   if !name.is_ascii() || name.len() == 0 || name.len() > 253 { None } else {
     let labels = name.ascii_lower().split(".");
@@ -910,11 +909,11 @@ fn labels_of(name: String) -> Option<List<String>> =
     if labels.all(is_valid_label) && !numeric { Some(labels) } else { None }
   }
 
-/// A DNS name a certificate presents: its labels, less a leading `*` it may stand a wildcard for.
+/// A DNS name a certificate presents: its labels, without a leading `*` if it is a wildcard.
 type Pattern = { wildcard: Bool, labels: List<String> }
 
-/// `None` for a name that is none, for a `*` anywhere but alone in the first label, and for a
-/// wildcard over fewer than two labels, which is every name of a top-level domain.
+/// `None` for an invalid name, for a `*` anywhere but alone in the first label, and for a wildcard
+/// over fewer than two labels, which covers every name directly under a top-level domain.
 fn pattern_of(name: String) -> Option<Pattern> / {abort.raise} = {
   let wildcard = name.starts_with("*.");
   match labels_of(if wildcard { name.slice(2, name.len()) } else { name }) {
@@ -924,7 +923,8 @@ fn pattern_of(name: String) -> Option<Pattern> / {abort.raise} = {
   }
 }
 
-/// The labels of the host a caller expects, a name of another script taken through `std.idna`.
+/// The labels of the host a caller expects, converted through `std.idna` when it is written in
+/// another script.
 fn host_labels(host: String) -> Option<List<String>> / {abort.raise} = {
   let bare = if host.ends_with(".") { host.slice(0, host.len() - 1) } else { host };
   if bare.is_ascii() { labels_of(bare) } else {
@@ -949,8 +949,8 @@ pub type Identity =
   | Anyone
 
 /// Whether `c` is for `who`, as RFC 9525 reads a certificate: by its subject alternative names
-/// alone, never the subject's common name. A DNS name matches a host without regard to case, a
-/// wildcard standing for exactly one label, the first; an IP address matches an address.
+/// alone, never the subject's common name. A DNS name matches a host without regard to case, with
+/// a wildcard matching exactly one label, the first; an IP address matches an address.
 pub fn matches_identity(c: Certificate, who: Identity) -> Bool / {abort.raise} =
   match who {
     Anyone -> true,
@@ -973,7 +973,7 @@ pub fn matches_identity(c: Certificate, who: Identity) -> Bool / {abort.raise} =
 
 // --- Name constraints ---------------------------------------------------------------
 
-/// Where a name stands to a subtree.
+/// How a name relates to a subtree.
 type Containment = | Inside | Outside | Garbled
 
 fn containment_if(inside: Bool) -> Containment = if inside { Inside } else { Outside }
@@ -1008,9 +1008,9 @@ fn host_containment(host: List<String>, tree: String) -> Containment / {abort.ra
     }
   } else { match labels_of(tree) { Some(exact) -> containment_if(host == exact), None -> Garbled } }
 
-/// Where `name` stands to `tree`, which is on names of its kind. A wildcard is inside a subtree
-/// that holds what follows its `*`; `excluding`, it is also inside one that a name it stands for
-/// would be in.
+/// How `name` relates to `tree`, which constrains names of its kind. A wildcard is inside a
+/// subtree that contains what follows its `*`; when `excluding`, it is also inside one that any
+/// name it matches would be in.
 fn containment(name: GeneralName, tree: Subtree, excluding: Bool) -> Containment / {abort.raise} =
   match ((name, tree)) {
     (Dns(presented), DnsTree(base)) -> match ((pattern_of(presented), labels_of(base))) {
@@ -1082,7 +1082,7 @@ pub type Purpose =
   /// Proving a client to a server: `id-kp-clientAuth`.
   | ClientAuth
 
-/// What a verification spends at most, and what it holds a path to.
+/// The most a verification may spend, and the rules it checks a path against.
 pub type Policy = new {
   /// The most signatures checked.
   signatures: Int,
@@ -1092,22 +1092,22 @@ pub type Policy = new {
   comparisons: Int,
   /// The fewest bits of an RSA modulus.
   rsa_bits: Int,
-  /// Whether a path is held to what the CA/Browser Forum requires of a public one beyond RFC
+  /// Whether a path must meet what the CA/Browser Forum requires of a public one beyond RFC
   /// 5280: version 3 throughout, key identifiers present and not critical, a CA's
   /// `basicConstraints` critical, no empty issuer or CA subject, and alternative names critical
   /// exactly where the subject is empty.
   web: Bool,
 }
 
-/// What a public certificate is held to: 100 signatures, 6 CAs between leaf and anchor, 100000
+/// The policy for a public certificate: 100 signatures, 6 CAs between leaf and anchor, 100000
 /// comparisons, RSA of 2048 bits, and the web's profile.
 pub fn strict() -> Policy =
   { signatures: 100, depth: 6, comparisons: 100000, rsa_bits: 2048, web: true }
 
-/// `strict` without the web's profile, for a CA of one's own that was not made to it.
+/// `strict` without the web's profile, for a private CA not built to that profile.
 pub fn private() -> Policy = { ..strict(), web: false }
 
-/// Why a path is none.
+/// Why no valid path exists.
 pub type Fault =
   /// The time is before the certificate's first instant.
   | NotYetValid
@@ -1115,14 +1115,14 @@ pub type Fault =
   | Expired
   /// It is not for who was expected.
   | NameMismatch
-  /// Its extended key usage does not hold the purpose.
+  /// Its extended key usage does not include the purpose.
   | WrongPurpose
-  /// Its key usage does not allow what it is used for: signing certificates, for one that is no
+  /// Its key usage does not allow what it is used for: signing certificates, for one that is not a
   /// CA.
   | WrongUsage
-  /// A leaf that says it is a CA.
+  /// A leaf marked as a CA.
   | LeafIsCa
-  /// An issuer that is no CA: no `basicConstraints` saying so, or a key usage without
+  /// An issuer that is not a CA: no `basicConstraints` marking it as one, or a key usage without
   /// `keyCertSign`.
   | NotACa
   /// More CAs follow it than its path length allows.
@@ -1146,10 +1146,10 @@ pub type Fault =
   | Misplaced(Oid)
   /// The path is longer than the policy's depth.
   | TooDeep
-  /// The policy's signatures or comparisons were spent.
+  /// The policy's budget of signatures or comparisons ran out.
   | Spent
 
-/// A path that is none: the certificate at fault, and why.
+/// Why verification failed: the certificate at fault, and the reason.
 pub type Failure = new { certificate: Certificate, reason: Fault }
 
 fn first_fault(faults: List<Option<Fault>>) -> Option<Fault> =
@@ -1212,7 +1212,7 @@ fn verifier(key: Key, algorithm: Algorithm, policy: Policy) -> Result<VerifyingK
 fn purpose_id(purpose: Purpose) -> Oid =
   match purpose { ServerAuth -> server_auth(), ClientAuth -> client_auth() }
 
-/// Whether an extended key usage, where `c` has one, holds `purpose`, or for a CA any purpose.
+/// Whether `c`'s extended key usage, if it has one, includes `purpose`, or for a CA any purpose.
 fn allows_purpose(c: Certificate, purpose: Purpose, ca: Bool) -> Bool =
   c.info.extensions.all(|e: Extension|
     match e.content {
@@ -1252,7 +1252,7 @@ fn leaf_fault(
     key_fault(leaf.info.key, policy),
   ])
 
-/// What `c` gets wrong of the web's profile, at its place in a path.
+/// What `c` breaks of the web's profile, at its place in a path.
 fn profile_fault(c: Certificate, leaf: Bool, anchor: Bool) -> Option<Fault> = {
   let aki = oid::authority_key_identifier();
   let ski = oid::subject_key_identifier();
@@ -1349,8 +1349,8 @@ fn trees_of(c: Certificate) -> { permitted: List<Subtree>, excluded: List<Subtre
       },
   )
 
-/// The fault of the first name below a CA that its constraints refuse. A self-issued CA's names
-/// are not held to them; the leaf's always are.
+/// The fault for the first name below a CA that its constraints reject. A self-issued CA's names
+/// are not checked against them; the leaf's always are.
 fn constraints_fault(
   case: VerifyInput,
   path: List<Certificate>,
@@ -1407,9 +1407,9 @@ fn in_path(path: List<Certificate>, c: Certificate) -> Bool =
   path.any(|p: Certificate|
     p.der == c.der || (p.info.subject.der == c.info.subject.der && p.info.spki == c.info.spki))
 
-/// Every way up from the last certificate of `path`, `certificates_left` more certificates at most: each
-/// trusted certificate of its issuer's name, then each offered one, none of them a certificate or
-/// a CA already in the path.
+/// Every way up from the last certificate of `path`, with at most `certificates_left` more
+/// certificates: each trusted certificate with its issuer's name, then each offered one, none of
+/// them a certificate or a CA already in the path.
 fn search_issuers(
   case: VerifyInput,
   path: List<Certificate>,
@@ -1441,7 +1441,7 @@ fn search_issuers(
     },
   }
 
-/// What trying one issuer came to: an end of that way, or a certificate to climb on from.
+/// The result of trying one issuer: the end of that branch, or a certificate to continue from.
 type Attempt = | Finished(PathSearch) | Extended(PathSearch)
 
 fn try_issuer(
@@ -1454,7 +1454,7 @@ fn try_issuer(
 ) -> Attempt / {abort.raise} = {
   let reached = path.len();
   if h.checks >= case.policy.signatures {
-    // Spent outranks whatever a way that was tried came to: the search is not over.
+    // `Spent` outranks the result of any branch already tried: the search is not over.
     Finished(record_failure(h, current, Spent, h.reached + 1))
   } else {
     match issuer_fault(case, path, issuer) {
@@ -1480,15 +1480,15 @@ fn try_issuer(
 }
 
 /// The path from `leaf` to one of `anchors` through `offered`, the leaf first, or the certificate
-/// that stops there being one and why.
+/// that prevents a path and why.
 ///
-/// A path holds at `at`: every certificate in it is within its validity, each is signed by the
-/// next, each issuer is a CA whose path length allows what follows, no certificate carries a
+/// A path is valid at `at` when every certificate in it is within its validity, each is signed by
+/// the next, each issuer is a CA whose path length allows what follows, no certificate carries a
 /// critical extension this module does not read, every name is within every constraint above it,
 /// every CA's extended key usage allows `purpose`, and the leaf is for `who` and for `purpose`.
-/// Every path is tried, trusted issuers first, until one holds or `policy` is spent; the failure
-/// answered is of the attempt that reached furthest. A leaf that is itself an anchor is its own
-/// path. Nothing is fetched and nothing is revoked: see the module.
+/// Every path is tried, trusted issuers first, until one is valid or `policy` is used up; the
+/// failure returned is from the attempt that reached furthest. A leaf that is itself an anchor is
+/// its own path. Nothing is fetched and revocation is not checked: see the module.
 pub fn verify(
   leaf: Certificate,
   offered: List<Certificate>,
@@ -1518,12 +1518,12 @@ pub fn verify(
 
 // --- Building --------------------------------------------------------------------
 
-/// What a certificate or a request to be made says of its subject.
+/// What a certificate or request to be built states about its subject.
 pub type Draft = new {
   /// The subject's name, an attribute to a relative name, outermost first.
   subject: List<Attribute>,
   alt_names: List<GeneralName>,
-  /// `Some` for a CA, holding its path length where it has one.
+  /// `Some` for a CA, containing its path length if it has one.
   ca: Option<Option<Int>>,
   usages: List<Usage>,
   purposes: List<Oid>,
@@ -1534,7 +1534,7 @@ pub type Draft = new {
   extra: List<Extension>,
 }
 
-/// A draft that says nothing: no name, no alternative names, no extensions.
+/// An empty draft: no name, no alternative names, no extensions.
 pub fn draft() -> Draft =
   {
     subject: [],
@@ -1547,8 +1547,8 @@ pub fn draft() -> Draft =
     extra: [],
   }
 
-/// A certificate request, PKCS #10, that was read: who asks, their key, and the extensions asked
-/// for. One exists only where the request is signed by the key it carries.
+/// A certificate request, PKCS #10, that was read: the requester, their key, and the requested
+/// extensions. One exists only when the request is signed by the key it carries.
 pub opaque type Request = new {
   der: Bytes,
   subject: Name,
@@ -1560,13 +1560,13 @@ pub opaque type Request = new {
 /// The request, in DER.
 pub fn request_der(r: Request) -> Bytes = r.der
 
-/// Who asks.
+/// The requester.
 pub fn request_subject(r: Request) -> Name = r.subject
 
-/// The key asked about.
+/// The key to be certified.
 pub fn request_key(r: Request) -> Key = r.key
 
-/// The extensions asked for.
+/// The requested extensions.
 pub fn request_extensions(r: Request) -> List<Extension> = r.extensions
 
 effect set WriteEffects = {asn1.unwritable, abort.raise}
@@ -1616,7 +1616,7 @@ fn usage_bit(usage: Usage) -> Int =
     DecipherOnly -> 8,
   }
 
-/// The extensions a draft asks for, in DER.
+/// The extensions a draft requests, in DER.
 fn draft_extensions(draft: Draft) -> List<Bytes> / {WriteEffects} =
   List::concat(
     match draft.ca {
@@ -1750,7 +1750,7 @@ fn pss_parameters(d: Digest) -> Bytes / {WriteEffects} = {
 }
 
 /// `signer`'s signature over `message`, as a certificate carries one: an ECDSA signature in DER
-/// whichever way the key writes its own.
+/// whatever form the key produces.
 fn signature_der(signer: crypto::SigningKey, message: Bytes) -> Bytes / {abort.raise} = {
   let fixture = crypto::sign(signer, message);
   match crypto::signature_algorithm(crypto::verifying_key(signer)) {
@@ -1786,10 +1786,11 @@ fn catch_unwritable<a>(
 ///
 /// Version 3, with the draft's extensions, a subject key identifier and, under an issuer that has
 /// one, an authority key identifier. `basicConstraints` and the key usage are critical, and the
-/// alternative names are where the subject is empty. What is answered was read back, `Strict`, so
-/// a draft that makes no certificate raises what `read` would: a serial that is zero or over
-/// twenty octets, a name that is none. `Unwritable` for text no string type holds and an instant
-/// no time writes. Nothing is checked of `issuer` and `signer` being one CA.
+/// alternative names are critical when the subject is empty. The result is read back with `Strict`,
+/// so a draft that makes no valid certificate raises what `read` would: a serial that is zero or
+/// over twenty octets, an invalid name. Raises `Unwritable` for text no string type can encode and
+/// an instant no time type can write. Nothing checks that `issuer` and `signer` belong to the same
+/// CA.
 pub fn certificate(
   draft: Draft,
   subject: VerifyingKey,
@@ -1848,7 +1849,7 @@ pub fn self_signed(
 ) -> Certificate / {x509.fail, abort.raise} =
   certificate(draft, crypto::verifying_key(key), serial, not_before, not_after, None, key)
 
-/// A certificate request for `draft`, signed by the key it asks about: PKCS #10, in DER, with the
+/// A certificate request for `draft`, signed by the key to be certified: PKCS #10, in DER, with the
 /// draft's extensions as an extension request.
 pub fn request(draft: Draft, key: crypto::SigningKey) -> Bytes / {x509.fail, abort.raise} =
   catch_unwritable(|| {
@@ -1924,8 +1925,8 @@ fn request_at(r: Reader, data: Bytes, limits: Limits) -> ReadResult<Request> / {
     }
   })
 
-/// The request `data` is, in DER. Raises `Unproven` unless it is signed by the key it carries,
-/// under an algorithm and a key `strict` takes.
+/// The request in `data`, in DER. Raises `Unproven` unless it is signed by the key it carries,
+/// under an algorithm and a key that `strict` accepts.
 pub fn read_request(data: Bytes, limits: Limits) -> Request / {x509.fail, abort.raise} =
   if data.len() > limits.bytes { x509.fail(TooLong(data.len())) } else {
     match asn1::decode_with(data, limits.depth, |r: Reader| request_at(r, data, limits)) {
@@ -1936,9 +1937,9 @@ pub fn read_request(data: Bytes, limits: Limits) -> Request / {x509.fail, abort.
 
 // --- Tests ------------------------------------------------------------------
 //
-// Every certificate here is built here, under Ed25519 keys of fixed seeds and at days counted
-// from 1970, so nothing is read from a file or a clock. What other software wrote is read by the
-// tests beside the fixtures.
+// Every certificate in these tests is built here, under Ed25519 keys from fixed seeds and at days
+// counted from 1970, so nothing is read from a file or a clock. Certificates other software wrote
+// are read by the tests next to the fixtures.
 
 fn key_of(seed: Int) -> crypto::SigningKey / {abort.raise} =
   match crypto::ed25519_signing(
@@ -1967,8 +1968,8 @@ fn leaf_draft(host: String) -> Draft =
     purposes: [server_auth()],
   }
 
-/// `draft` certified for the key of seed `key`, from day 100 to day 900 unless `days` says
-/// otherwise, by `issuer` under the key of seed `signer`.
+/// `draft` certified for the key of seed `key`, from day 100 to day 900 unless `days` gives other
+/// days, by `issuer` under the key of seed `signer`.
 fn issued(
   d: Draft,
   key: Int,
@@ -2021,7 +2022,7 @@ fn fixture<a>(body: () -> a / {x509.fail, abort.raise}) -> a / {abort.raise} =
 
 fn attribute(arcs: List<Int>, value: String) -> Attribute = { id: oid::Oid(arcs), value: value }
 
-test "a name is written as RFC 4514 writes it, innermost first, what it escapes escaped" {
+test "a name is written as RFC 4514 writes it, innermost first, with the required escapes" {
   let n: Name = {
     rdns: [
       [attribute([2, 5, 4, 6], "US")],
@@ -2069,7 +2070,7 @@ test "a built chain verifies to its root, and the path is the leaf, the CA and t
   assert(is_ca(p.root) && is_self_issued(p.root) && !is_ca(p.leaf))
 }
 
-test "a chain is refused out of its time, for another name, without its CA, and for another purpose" {
+test "a chain fails out of its time, for another name, without its CA, and for another purpose" {
   let p = fixture(pki);
   let record_failure = |on: Int, host: String, offered: List<Certificate>|
     match verify(p.leaf, offered, [p.root], at_day(on), Host(host), ServerAuth, strict()) {
@@ -2110,7 +2111,7 @@ test "a chain is refused out of its time, for another name, without its CA, and 
   assert_eq(checked(p.leaf, [p.middle], [p.middle], 350, "www.example.com"), Ok(2))
 }
 
-test "a CA out of its time is the certificate at fault, and another way round it is taken" {
+test "a CA outside its validity is the certificate at fault, and another path around it is taken" {
   let p = fixture(pki);
   let lapsed = fixture(||
     certificate(
@@ -2139,7 +2140,7 @@ test "a CA out of its time is the certificate at fault, and another way round it
   assert_eq(checked(p.leaf, [p.middle, lapsed], [p.root], 350, "www.example.com"), Ok(3))
 }
 
-test "a leaf is no CA: what it signs for another name is refused, and so is a CA past its path length" {
+test "a leaf is not a CA: what it signs for another name fails, as does a CA past its path length" {
   let p = fixture(pki);
   let forged = fixture(|| issued(leaf_draft("bank.example"), 4, Some(p.leaf), 3));
   assert_eq(
@@ -2181,7 +2182,7 @@ test "a self-signed certificate that is trusted is its own path, and one that is
   assert_eq(checked(alone, [], [alone], 901, "localhost"), Err(Expired))
 }
 
-/// A name a certificate presents, a host asked for, and whether the one is for the other.
+/// A name a certificate presents, a requested host, and whether the name matches the host.
 type NameMatchCase = { presented: GeneralName, host: String, matches: Bool }
 
 fn name_match_cases() -> List<NameMatchCase> =
@@ -2232,7 +2233,7 @@ test "an address is matched by an address and by nothing written like one, and a
   assert(!matches_identity(bare, Host("cn.example")) && matches_identity(bare, Anyone))
 }
 
-/// What a CA's constraints say, a name under it, and what that comes to.
+/// A CA's constraints, a name under it, and the result.
 type ConstraintCase = {
   name: String,
   permitted: List<Subtree>,
@@ -2432,7 +2433,7 @@ fn organization() -> List<Attribute> = [{ id: oid::organization_name(), value: "
 fn org(name: String) -> List<Attribute> =
   organization().push({ id: oid::common_name(), value: name })
 
-test "a constraint holds every certificate below it, by its names and by its subject" {
+test "a constraint applies to every certificate below it, by its names and by its subject" {
   let tree = DirectoryTree(
     info(fixture(|| issued({ ..leaf_draft("x"), subject: organization() }, 9, None, 9))).subject,
   );
@@ -2466,7 +2467,7 @@ test "a constraint holds every certificate below it, by its names and by its sub
   )
 }
 
-test "a critical extension nobody reads refuses the path it is in, and one not in it refuses nothing" {
+test "a critical extension nobody reads rejects its path, and one outside a path rejects nothing" {
   let odd: Extension = {
     id: oid::Oid([1, 3, 6, 1, 4, 1, 99999, 1]),
     critical: true,
@@ -2507,7 +2508,7 @@ test "a critical extension nobody reads refuses the path it is in, and one not i
   )
 }
 
-test "a certificate is refused where it is not RFC 5280's, and a request where it is not signed by its key" {
+test "a certificate breaking RFC 5280 is rejected, and so is a request its key did not sign" {
   let p = fixture(pki);
   let whole = der(p.leaf);
   assert_eq(parse(whole, limits(), Strict), Ok(p.leaf));
@@ -2569,12 +2570,12 @@ test "a certificate is refused where it is not RFC 5280's, and a request where i
   assert_eq(Result::err(try { read_request(forged, limits()) }), Some(Unproven))
 }
 
-/// `k` certificates of one name under `k` keys, none of which signed anything: every one is a
-/// way up that a signature check closes.
+/// `k` certificates of one name under `k` keys, none of which signed anything: each is a path up
+/// that a signature check rules out.
 fn decoys(k: Int, root: Certificate) -> List<Certificate> / {abort.raise} =
   range(0, k).map(|i: Int| fixture(|| issued(ca_draft("Middle", None), 40 + i, Some(root), 1)))
 
-test "a verification checks no more signatures than its policy allows, and says so" {
+test "a verification checks no more signatures than its policy allows, and reports it" {
   let p = fixture(pki);
   let crowd = decoys(12, p.root);
   let spent = |most: Int|
@@ -2613,7 +2614,7 @@ test "a chain verifies at exactly the times every certificate in it is valid" {
   })
 }
 
-test "a certificate with one byte altered is refused, or verifies under nothing" {
+test "a certificate with one byte altered is rejected, or verifies under nothing" {
   gen::check2(gen::any_int(), gen::any_int(), |at: Int, to: Int| {
     let p = fixture(pki);
     let whole = der(p.leaf);
@@ -2632,7 +2633,7 @@ test "a certificate with one byte altered is refused, or verifies under nothing"
   })
 }
 
-test "bytes are read as a certificate or refused, and never raised over" {
+test "bytes are read as a certificate or rejected, and never abort" {
   gen::check(gen::bytes(), |data: Bytes| {
     let p = fixture(pki);
     [data, data.concat(der(p.leaf)), der(p.leaf).slice(0, 40).concat(data)].all(
