@@ -613,6 +613,25 @@ fn a_walk_is_depth_first_in_byte_order_and_never_follows_a_link() {
 }
 
 #[test]
+fn a_listing_says_of_each_name_in_byte_order_what_kind_says_of_its_path() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir_all(real.join("a/z")).unwrap();
+    std::fs::write(real.join("a/b.txt"), b"b").unwrap();
+    std::os::unix::fs::symlink("z", real.join("a/link")).unwrap();
+
+    let listed = entries(on(&fs, Op::ListDir, "a", Second::None)).expect("a directory");
+    let names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["b.txt", "link", "z"]);
+    for (name, listed_kind) in &listed {
+        let path = format!("a/{name}");
+        assert_eq!(kind(on(&fs, Op::Kind, &path, Second::None)), *listed_kind);
+    }
+    assert_eq!(entries(on(&fs, Op::ListDir, "a/b.txt", Second::None)), None);
+}
+
+#[test]
 fn a_stamp_sets_the_modification_time() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();

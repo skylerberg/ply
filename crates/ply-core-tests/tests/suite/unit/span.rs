@@ -51,8 +51,8 @@ fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
         .join("\n")
     );
     assert_eq!(
-        Diagnostic::warning(codes::CACHE_CORRUPT, "cache corrupt").to_string(),
-        "Warning[W0602]: cache corrupt"
+        Diagnostic::warning(codes::DRAIN_INCOMPLETE, "drain incomplete").to_string(),
+        "Warning[W0608]: drain incomplete"
     );
 }
 
@@ -62,7 +62,7 @@ fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
 fn a_placed_diagnostic_keeps_each_label_it_can_place_as_a_note() {
     let mut sources = SourceMap::new();
     let id = sources.add("app/m.ply", "fn f() -> Int = 1\nfn g() -> Int = \"x\"\n");
-    let d = Diagnostic::error(codes::TYPE_MISMATCH, "type mismatch")
+    let d = Diagnostic::error(codes::RUNTIME_ERROR, "type mismatch")
         .primary(Span::new(id, 34, 37), "expected Int, found String")
         .secondary(Span::new(id, 0, 2), "")
         .primary(Span::DUMMY, "nowhere")
@@ -70,7 +70,7 @@ fn a_placed_diagnostic_keeps_each_label_it_can_place_as_a_note() {
     assert_eq!(
         d.placed(&sources).to_string(),
         [
-            "Error[E0201]: type mismatch",
+            "Error[E0502]: type mismatch",
             "  = an earlier note",
             "  = at app/m.ply:2:17: expected Int, found String",
             "  = at app/m.ply:1:1",

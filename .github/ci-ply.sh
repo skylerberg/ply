@@ -44,9 +44,6 @@
 #                                   whole, since a load fails over a store that lost an answer. Sets
 #                                   the step's `found`. Nothing found, or a download that failed,
 #                                   leaves the job to what a cache holds
-#   ci-ply.sh upstream-mark         the moment `upstream-new` gathers from
-#   ci-ply.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
-#   ci-ply.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,9 +55,6 @@ TAB=$'\t'
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
 mark=$caches/ply-c-runs.mark
-upstream=$caches/ply-upstream
-upstream_mark=$caches/ply-upstream.mark
-export PLY_CACHE_UPSTREAM=$upstream
 # `ms<TAB>package<TAB>key` per test this job ran, which the job uploads for the run's table of what
 # each test cost.
 durations=$caches/ply-test-durations.tsv
@@ -476,41 +470,8 @@ case "${1:-}" in
     fi
     rm -rf "$dir"
     ;;
-  upstream-mark)
-    mkdir -p "$upstream"
-    touch "$upstream_mark"
-    find "$upstream" -type f | wc -l | sed 's/^ */upstream entries restored: /'
-    ;;
-  upstream-new)
-    tar_out=${2:?a tar file}
-    [ -f "$upstream_mark" ] || { echo "nothing is marked: run 'ci-ply.sh upstream-mark' first" >&2; exit 2; }
-    mkdir -p "$upstream"
-    (cd "$upstream" && find . -type f -newer "$upstream_mark" ! -name '*.tmp' -print0 |
-      tar --null -T - -cf "$tar_out")
-    tar -tf "$tar_out" | wc -l | sed 's/^ */upstream entries published: /'
-    ;;
-  upstream-merge)
-    parts=${2:?a directory of tars}
-    mkdir -p "$upstream"
-    published=()
-    for part in "$parts"/*.tar; do
-      [ -f "$part" ] || continue
-      tar -C "$upstream" -xf "$part"
-      while IFS= read -r stamp; do published+=("$stamp"); done < <(tar -tf "$part" | awk -F/ '$2 == "v2" && $3 != "" { print $3 }')
-    done
-    # A pass filed under an older runtime is never read again.
-    if [ "${#published[@]}" -gt 0 ] && [ -d "$upstream/v2" ]; then
-      for dir in "$upstream"/v2/*; do
-        name=${dir##*/}
-        keep=no
-        for stamp in "${published[@]}"; do [ "$stamp" = "$name" ] && keep=yes; done
-        [ "$keep" = yes ] || rm -rf "$dir"
-      done
-    fi
-    find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
-    ;;
   *)
-    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME" >&2
     exit 2
     ;;
 esac

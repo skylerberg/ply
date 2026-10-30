@@ -20,11 +20,11 @@ import compiler.expand.embed (EmbedRead, BytesRead, EmbedWant, known)
 import compiler.check.resolve.tables (Source, Diag, Label, error_at)
 import builder (builder)
 import compiler.cc (toolchain)
-import walk (walk_room)
+import compiler.load (embedded_below, is_ply)
 import compiler.front.pkg (PackageSources, Supplied, wants)
 import paths
 import paths (Rooted, displayed, read_file)
-import walk (Failure, Found, loading, nothing, is_ply, package)
+import walk (Failure, Found, loading, nothing, package)
 import std.list
 import compiler.syntax.parsing (no_module, Span, dummy_span, span_between)
 
@@ -340,48 +340,27 @@ fn read_one(target: Rooted) -> BytesRead / {fs.read_file[cwd], fs.read_file[abs]
     None -> unread(target, "could not be read"),
   }
 
-/// Every file under the directory, by its path below it and in that order; nothing under a name
-/// starting with `.` is read.
+/// Every file `embed_dir` reads under the directory (`compiler.load.embedded_below`), by its path
+/// below it and in that order.
 fn read_dir(
   target: Rooted,
-) -> BytesRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} =
-  match listed(target, "", Map::new(), walk_room()) {
-    Err(why) -> Err(why),
+) -> BytesRead / {fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
+  let under = |path: String| { label: target.label, path: path };
+  let walked = if target.label == "cwd" { embedded_below[cwd](target.path) }
+  else { embedded_below[abs](target.path) };
+  match walked {
+    Err(stopped) -> unread(under(stopped.path), stopped.why),
     Ok(found) ->
-      found.fold(Ok([]), |acc: BytesRead, name: String, rooted: Rooted|
+      found.fold(Ok([]), |acc: BytesRead, name: String, path: String|
         match acc {
           Err(_) -> acc,
-          Ok(files) -> match read_file(rooted) {
+          Ok(files) -> match read_file(under(path)) {
             Some(b) -> Ok(files.push({ name: Bytes::of_string(name), bytes: b })),
-            None -> unread(rooted, "could not be read"),
+            None -> unread(under(path), "could not be read"),
           },
         }),
   }
-
-fn listed(
-  dir: Rooted,
-  below: String,
-  found: Map<String, Rooted>,
-  room: Int,
-) -> Result<Map<String, Rooted>, Bytes> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
-  match paths::list_dir(dir) {
-    None -> Err(Bytes::of_string("`" ++ displayed(dir) ++ "` could not be listed")),
-    Some(names) ->
-      names.fold(Ok(found), |acc: Result<Map<String, Rooted>, Bytes>, n: String|
-        match acc {
-          Err(_) -> acc,
-          Ok(m) -> if n.starts_with(".") { acc } else {
-            let entry = paths::child(dir, n);
-            let name = if below == "" { n } else { below ++ "/" ++ n };
-            match paths::kind(entry) {
-              fs::Dir -> if room <= 0 {
-                Err(Bytes::of_string("`" ++ displayed(entry) ++ "` is deeper than a path can name"))
-              } else { listed(entry, name, m, room - 1) },
-              _ -> Ok(m.insert(name, entry)),
-            }
-          },
-        }),
-  }
+}
 
 // --- The package walk ---------------------------------------------------------
 // What the root's manifest asks for, round by round, under `abs` so a sibling directory is
@@ -390,7 +369,7 @@ fn listed(
 
 fn read_dep_modules(
   root: String,
-) -> List<File> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+) -> List<File> / {fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let swept = at_abs(root);
   let found = package(nothing(), swept);
   found.files.values().fold([], |acc: List<File>, rooted: Rooted|
@@ -413,7 +392,7 @@ fn at_abs(path: String) -> Rooted / {abort.raise} = { label: "abs", path: below_
 fn read_dep(
   root: Bytes,
   dir: String,
-) -> DepPackage / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+) -> DepPackage / {fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let here = String::of_bytes_lossy(root);
   match read_file(at_abs(join(dir, "ply.pkg"))) {
     None -> { root: here, dir: dir, manifest: None, files: [] },
@@ -585,7 +564,7 @@ pub fn shipped_digest_of(srcs: List<Source>, data: List<ShippedData>) -> String 
 
 /// The names of the shipped modules there are, read off the directory without reading one.
 pub fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
-  match fs.list_dir[shipped](".") {
+  match fs::listed_names(fs.list_dir[shipped](".")) {
     None -> [],
     Some(names) -> names.filter(is_ply).map(|name: String| Bytes::of_string(stem(name))),
   }
@@ -745,7 +724,7 @@ pub fn shipped_listed(s: Shipping) -> List<Bytes> =
   s.read.map(|source: Source| source.name).concat(s.unread)
 
 pub fn shipped_modules() -> List<Source> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  match fs.list_dir[shipped](".") {
+  match fs::listed_names(fs.list_dir[shipped](".")) {
     None -> [],
     Some(names) ->
       names.fold([], |acc: List<Source>, name: String|
@@ -758,6 +737,10 @@ pub fn shipped_modules() -> List<Source> / {fs.list_dir[shipped], fs.read_file[s
   }
 
 // --- Tests ------------------------------------------------------------------
+
+/// A listing of files named `names`, in that order.
+fn files_listed(names: List<String>) -> List<fs::Listed> =
+  names.map(|name: String| { name: name, kind: fs::File })
 
 test "a path names a module by its place, and a segment that is not an identifier does not" {
   assert_eq(module_of("m.ply"), Ok("m"));
@@ -891,7 +874,7 @@ test "a load reads the shipped modules it pulls and what they embed, and only th
   } with {
     var files: List<String> = [],
     fs.list_dir[shipped](p) ->
-      Some(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"]),
+      Some(files_listed(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"])),
     fs.read_file[shipped](p) -> {
       files = files.push(p);
       if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = bytes::b()\n") }
@@ -919,7 +902,7 @@ fn counted_load() -> { read: List<Bytes>, text: Bytes, files: List<String> } / {
     })
   } with {
     var files: List<String> = [],
-    fs.list_dir[shipped](p) -> Some(["std.count.ply", "std.laws.ply"]),
+    fs.list_dir[shipped](p) -> Some(files_listed(["std.count.ply", "std.laws.ply"])),
     fs.read_file[shipped](p) -> {
       files = files.push(p);
       if p == "std.count.ply" { Some(exercised()) }
@@ -943,7 +926,7 @@ fn kept_count(store: MemFs) -> { text: Bytes, toolchain: MemFs } / {abort.raise}
         shipping_kept_of([b"std.count"], Map::new())
       } with {
         toolchain.reused() -> "/reused",
-        fs.list_dir[shipped](p) -> Some(["std.count.ply"]),
+        fs.list_dir[shipped](p) -> Some(files_listed(["std.count.ply"])),
         fs.read_file[shipped](p) -> if p == "std.count.ply" { Some(exercised()) }
         else if p == "definitions" {
           Some(b"compiler.front.pulls_of aa\ncompiler.front.interface.imported bb\n")
@@ -962,7 +945,10 @@ test "what an importer reads of a shipped module is kept for every project, and 
   let viewed = imported(exercised());
   let cold = kept_count(mem_empty());
   assert_eq(cold.text, viewed);
-  let kept = match mem_list(cold.toolchain, "reused") { Some(names) -> names, None -> [] };
+  let kept = match fs::listed_names(mem_list(cold.toolchain, "reused")) {
+    Some(names) -> names,
+    None -> [],
+  };
   assert_eq(kept.len(), 1);
   let entry = "reused/" ++ kept.at_or(0, "");
   // Another project's first load reads what the toolchain kept, and finds nothing itself.
@@ -997,7 +983,10 @@ test "a load reads the data file a shipped module it pulls embeds, under its nam
     })
   } with {
     var files: List<String> = [],
-    fs.list_dir[shipped](p) -> Some(["std", "std.idle.ply", "std.words.ply"]),
+    fs.list_dir[shipped](p) ->
+      Some(
+        [{ name: "std", kind: fs::Dir }].concat(files_listed(["std.idle.ply", "std.words.ply"])),
+      ),
     fs.read_file[shipped](p) -> {
       files = files.push(p);
       if p == "std.words.ply" { Some(embedding_words()) }
@@ -1031,7 +1020,8 @@ test "the shipped modules come back one source per `.ply` file, named by its ste
     shipped_modules()
   } with {
     builder.git[vcs](root, key) -> None,
-    fs.list_dir[shipped](p) -> Some(["std.json.ply", "README.md", "compiler.fmt.ply"]),
+    fs.list_dir[shipped](p) ->
+      Some(files_listed(["std.json.ply", "README.md", "compiler.fmt.ply"])),
     fs.read_file[shipped](p) -> Some(Bytes::of_string(p)),
   };
   assert_eq(out.map(|source: Source| source.name), [b"std.json", b"compiler.fmt"])

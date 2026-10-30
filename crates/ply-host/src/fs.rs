@@ -540,16 +540,7 @@ fn run(
             }),
             _ => found(None::<Vec<u8>>),
         },
-        (Op::ListDir, _) => found(std::fs::read_dir(&target).ok().map(|entries| {
-            let mut names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            // Read order is a fact about the filesystem, not the directory's contents.
-            names.sort();
-            let names: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
-            parts(&names)
-        })),
+        (Op::ListDir, _) => found(listed(&target).map(|entries| entries_flat(&entries))),
         // `symlink_metadata` does not follow, so a symlink is reported as one rather than as its target.
         (Op::Kind, _) => vec![Kind::of(std::fs::symlink_metadata(&target).ok().as_ref()).number()],
         // The walk followed every link to here, so what is at the path is what it resolves to.
@@ -646,14 +637,7 @@ fn run(
                 .and_then(|to| to.to_str().map(str::to_string)),
         ),
         (Op::Walk, _) => match walk(path, &target) {
-            Ok(entries) => found(entries.map(|entries| {
-                let entries: Vec<Vec<u8>> = entries
-                    .iter()
-                    .map(|(path, kind)| parts(&[path.as_bytes(), &[kind.number()][..]]))
-                    .collect();
-                let entries: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
-                parts(&entries)
-            })),
+            Ok(entries) => found(entries.map(|entries| entries_flat(&entries))),
             Err(bytes) => return Err(Failure::Refused(walk_too_large(bytes, path, span))),
         },
         (Op::SetModified, Second::Millis(ms)) => done(set_modified(&target, ms)),
@@ -692,10 +676,14 @@ pub enum Kind {
 
 impl Kind {
     fn of(meta: Option<&std::fs::Metadata>) -> Kind {
-        match meta {
-            Some(meta) if meta.is_symlink() => Kind::Symlink,
-            Some(meta) if meta.is_dir() => Kind::Dir,
-            Some(meta) if meta.is_file() => Kind::File,
+        Kind::of_type(meta.map(std::fs::Metadata::file_type))
+    }
+
+    fn of_type(file_type: Option<std::fs::FileType>) -> Kind {
+        match file_type {
+            Some(t) if t.is_symlink() => Kind::Symlink,
+            Some(t) if t.is_dir() => Kind::Dir,
+            Some(t) if t.is_file() => Kind::File,
             _ => Kind::Missing,
         }
     }
@@ -1050,15 +1038,10 @@ fn walk_into(
     out: &mut Vec<(String, Kind)>,
     bytes: &mut u64,
 ) -> Result<(), u64> {
-    let Ok(entries) = std::fs::read_dir(at) else {
+    let Some(entries) = listed(at) else {
         return Ok(());
     };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    for name in names {
+    for (name, kind) in entries {
         let path = if prefix.is_empty() {
             name.clone()
         } else {
@@ -1068,17 +1051,42 @@ fn walk_into(
         if *bytes > MAX_READ_BYTES {
             return Err(*bytes);
         }
-        let full = at.join(&name);
-        let kind = match Kind::of(std::fs::symlink_metadata(&full).ok().as_ref()) {
-            Kind::Missing => continue,
-            kind => kind,
-        };
+        if kind == Kind::Missing {
+            continue;
+        }
         out.push((path.clone(), kind));
         if kind == Kind::Dir {
-            walk_into(&path, &full, out, bytes)?;
+            walk_into(&path, &at.join(&name), out, bytes)?;
         }
     }
     Ok(())
+}
+
+/// A directory's own names in byte order, each with what it is, a link unfollowed. The kind comes
+/// with the name from the directory read, so no entry is looked at again. `None` where the
+/// directory cannot be read.
+pub(crate) fn listed(at: &Path) -> Option<Vec<(String, Kind)>> {
+    let mut entries: Vec<(String, Kind)> = std::fs::read_dir(at)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            (name, Kind::of_type(e.file_type().ok()))
+        })
+        .collect();
+    // Read order is a fact about the filesystem, not the directory's contents.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(entries)
+}
+
+/// Each entry as parts of its path and its kind's number, and the entries as parts of those.
+fn entries_flat(entries: &[(String, Kind)]) -> Vec<u8> {
+    let entries: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|(path, kind)| parts(&[path.as_bytes(), &[kind.number()][..]]))
+        .collect();
+    let entries: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+    parts(&entries)
 }
 
 /// Every entry under `dir` with what one look reads of it, in a walk's order: its own entries
@@ -1100,15 +1108,10 @@ fn scan_into(
     out: &mut Vec<(String, Stat)>,
     bytes: &mut u64,
 ) -> Result<(), u64> {
-    let Ok(entries) = std::fs::read_dir(at) else {
+    let Some(entries) = listed(at) else {
         return Ok(());
     };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    for name in names {
+    for (name, _) in entries {
         let path = if prefix.is_empty() {
             name.clone()
         } else {

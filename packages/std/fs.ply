@@ -57,6 +57,13 @@ pub type Kind = | File | Dir | Symlink | Missing
 /// One entry a walk found: its path from the root, and what it is, a symlink unfollowed.
 pub type Entry = { path: String, kind: Kind }
 
+/// One name a directory holds, and what it names, a symlink unfollowed.
+pub type Listed = { name: String, kind: Kind }
+
+/// The names a listing holds, in its order; `None` where there is no listing.
+pub fn listed_names(listing: Option<List<Listed>>) -> Option<List<String>> =
+  match listing { Some(listed) -> Some(listed.map(|l: Listed| l.name)), None -> None }
+
 /// Who may do what with a path: its owner, the owner's group, and everyone else.
 pub type Mode = { owner: Access, group: Access, other: Access }
 
@@ -124,8 +131,9 @@ pub nondet effect fs {
   /// under a reader holding an old offset. Compare the answer's length with `len` to tell a short read.
   /// A negative offset or length raises `E0502`.
   read read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
-  /// The names in one directory, not its subtree; `None` when the path is not a directory.
-  read list_dir[r](path: String) -> Option<List<String>>
+  /// The names in one directory, not its subtree, in byte order, each with what `kind` would say of
+  /// it, read with the names; `None` when the path is not a directory.
+  read list_dir[r](path: String) -> Option<List<Listed>>
   /// What the path names, a symlink reported as `Symlink` rather than followed, so a walk that must not
   /// leave the root can refuse one.
   read kind[r](path: String) -> Kind
@@ -300,7 +308,7 @@ fn served<a | e>(
     } else { noted(l, path, 0, found(job_wait(fs_read_at(l, path, offset, len)))) },
     fs.list_dir[*l](path) ->
       noted(l, path, 1, match found(job_wait(fs_list_dir(l, path))) {
-        Some(names) -> Some(parts(names).map(|name: Bytes| String::of_bytes_lossy(name))),
+        Some(flat) -> Some(parts(flat).map(|entry: Bytes| listed_of(entry))),
         None -> None,
       }),
     fs.kind[*l](path) -> noted(l, path, 2, kind_of(job_wait(fs_kind(l, path)))),
@@ -419,11 +427,16 @@ fn refused_of(flat: Bytes) -> Refused / {abort.raise} =
     },
   }
 
-fn entry_of(flat: Bytes) -> Entry / {abort.raise} =
+fn listed_of(flat: Bytes) -> Listed / {abort.raise} =
   match parts(flat) {
-    [path, kind] -> { path: String::of_bytes_lossy(path), kind: kind_of(kind) },
+    [name, kind] -> { name: String::of_bytes_lossy(name), kind: kind_of(kind) },
     _ -> panic("a file system's native wrote no entry"),
   }
+
+fn entry_of(flat: Bytes) -> Entry / {abort.raise} = {
+  let read = listed_of(flat);
+  { path: read.name, kind: read.kind }
+}
 
 fn stat_of(flat: Bytes) -> Stat / {abort.raise} =
   match parts(flat) {
@@ -465,7 +478,7 @@ extern fn fs_read_file(label: String, path: String) -> Int / {native.read}
 /// The ticket of what is there of `len` bytes from `offset`, found.
 extern fn fs_read_at(label: String, path: String, offset: Int, len: Int) -> Int / {native.read}
 
-/// The ticket of a directory's names as parts, found.
+/// The ticket of a directory's entries as parts, each its name and its kind's byte, found.
 extern fn fs_list_dir(label: String, path: String) -> Int / {native.read}
 
 /// The ticket of what the path names, a link unfollowed, as `kind_of` reads its byte.
@@ -809,9 +822,13 @@ pub fn mem_kind(f: MemFs, path: String) -> Kind / {abort.raise} =
   match key_of(f, path, false) { Some(key) -> kind_at(f, key), None -> Missing }
 
 /// One directory, never its subtree, ascending so the order is a fact about the contents.
-pub fn mem_list(tree: MemFs, path: String) -> Option<List<String>> / {abort.raise} = {
+pub fn mem_list(tree: MemFs, path: String) -> Option<List<Listed>> / {abort.raise} = {
   let key = key_of(tree, path, true)?;
-  if kind_at(tree, key) != Dir || !readable(tree, key) { None } else { Some(names_in(tree, key)) }
+  if kind_at(tree, key) != Dir || !readable(tree, key) { None } else {
+    Some(
+      names_in(tree, key).map(|name: String| { name: name, kind: kind_at(tree, under(key, name)) }),
+    )
+  }
 }
 
 /// Depth first, each directory's names ascending, a link listed and never followed.
@@ -2491,7 +2508,7 @@ test "a handled fs write is det and the next read sees it" {
     assert(fs.create_dir[out]("build/cache"));
     assert(fs.write_file[out]("build/cache/a.plyx", b"artifact"));
     assert_eq(fs.read_file[out]("build/cache/a.plyx"), Some(b"artifact"));
-    assert_eq(fs.list_dir[out]("build/cache"), Some(["a.plyx"]));
+    assert_eq(fs.list_dir[out]("build/cache"), Some([{ name: "a.plyx", kind: File }]));
     assert(fs.rename[out]("build/cache/a.plyx", "build/cache/b.plyx"));
     assert_eq(fs.read_file[out]("build/cache/a.plyx"), None);
     assert_eq(fs.read_file[out]("build/cache/b.plyx"), Some(b"artifact"))
@@ -2544,11 +2561,26 @@ test "one directory, never its subtree" {
     { path: "src/deep/b.ply", body: b"b" },
     { path: "top.ply", body: b"t" },
   ]);
-  assert_eq(mem_list(fixture, ""), Some(["src", "top.ply"]));
-  assert_eq(mem_list(fixture, "src"), Some(["a.ply", "deep"]));
-  assert_eq(mem_list(fixture, "src/deep"), Some(["b.ply"]));
+  assert_eq(
+    mem_list(fixture, ""),
+    Some([{ name: "src", kind: Dir }, { name: "top.ply", kind: File }]),
+  );
+  assert_eq(listed_names(mem_list(fixture, "src")), Some(["a.ply", "deep"]));
+  assert_eq(listed_names(mem_list(fixture, "src/deep")), Some(["b.ply"]));
   assert_eq(mem_list(fixture, "src/a.ply"), None);
   assert_eq(mem_list(fixture, "nowhere"), None)
+}
+
+test "a listing says of each name what `kind` says of its path" {
+  let fixture = mem_of([{ path: "src/a.ply", body: b"a" }, { path: "src/deep/b.ply", body: b"b" }]);
+  let linked = mem_symlink(fixture, "src/again", "a.ply").fs;
+  match mem_list(linked, "src") {
+    Some(listed) -> {
+      assert_eq(listed_names(Some(listed)), Some(["a.ply", "again", "deep"]));
+      assert(listed.all(|l: Listed| l.kind == mem_kind(linked, "src/" ++ l.name)))
+    },
+    None -> panic("src is a directory"),
+  }
 }
 
 test "a write stamps, a read does not, and a later write stamps later" {
@@ -2867,7 +2899,7 @@ test "a link is followed by what reads through it and kept by what names it" {
   assert_eq(mem_resolved(linked, "here"), Dir);
   assert_eq(mem_read(linked, "here/a.ply"), Some(b"a"));
   assert_eq(mem_read(linked, "src/again"), Some(b"a"));
-  assert_eq(mem_list(linked, "here"), Some(["a.ply", "again"]));
+  assert_eq(listed_names(mem_list(linked, "here")), Some(["a.ply", "again"]));
   assert_eq(mem_read_link(linked, "src/again"), Some("a.ply"));
   assert_eq(mem_read_link(linked, "src/a.ply"), None);
   // A write through a link writes its target, and removing a link removes only the link.
@@ -3162,7 +3194,7 @@ test "a file with two names is one file, until its last name is removed" {
   assert_eq(mem_read(mem_append(renamed, "b.txt", b"!").fs, "d.txt"), Some(b"both!"));
   let onto_itself = mem_rename(renamed, "b.txt", "d.txt");
   assert(onto_itself.ok);
-  assert_eq(mem_list(onto_itself.fs, ""), Some(["b.txt", "d.txt"]));
+  assert_eq(listed_names(mem_list(onto_itself.fs, "")), Some(["b.txt", "d.txt"]));
   let left = mem_remove(renamed, "b.txt").fs;
   assert_eq(shape(mem_stat(left, "d.txt")), "file 4 rw------- x1");
   assert_eq(mem_read(left, "d.txt"), Some(b"both"));
@@ -3235,8 +3267,8 @@ test "a loss of power keeps a file's bytes as it was synced and its name as its 
   assert_eq(after(removed, "d/old"), Some(b"old"));
   assert_eq(mem_kind(mem_crashed(mem_sync(removed, "d").fs), "d/old"), Missing);
   let renamed = mem_rename(base, "d/old", "d/young").fs;
-  assert_eq(mem_list(mem_crashed(renamed), "d"), Some(["old"]));
-  assert_eq(mem_list(mem_crashed(mem_sync(renamed, "d").fs), "d"), Some(["young"]));
+  assert_eq(listed_names(mem_list(mem_crashed(renamed), "d")), Some(["old"]));
+  assert_eq(listed_names(mem_list(mem_crashed(mem_sync(renamed, "d").fs), "d")), Some(["young"]));
   assert_eq(after(mem_sync(renamed, "d").fs, "d/young"), Some(b"old"));
   assert_eq(after(mem_rename(base, "d", "e").fs, "e/old"), Some(b"old"));
   assert(!mem_sync(base, "d/absent").ok);
@@ -3252,7 +3284,7 @@ test "a counted run says how many operations it asked, a read as much as a write
   });
   assert(ran.value);
   assert_eq(ran.asked, 3);
-  assert_eq(mem_list(ran.tree, ""), Some(["a", "b"]))
+  assert_eq(listed_names(mem_list(ran.tree, "")), Some(["a", "b"]))
 }
 
 test "a disk that fails after so many writes changes nothing from there on, and says it failed" {
@@ -3264,7 +3296,7 @@ test "a disk that fails after so many writes changes nothing from there on, and 
       fs.remove[d]("a"),
     ]);
   assert_eq(over.value, [true, true, false, false]);
-  assert_eq(mem_list(over.tree, ""), Some(["a", "x"]));
+  assert_eq(listed_names(mem_list(over.tree, "")), Some(["a", "x"]));
   let gone = on_mem_failing[d](mem_of([{ path: "a", body: b"1" }]), 0, || {
     let made = fs.open[d]("new", ToCreate);
     let named = fs.link[d]("b", "a");
@@ -3278,7 +3310,7 @@ test "a disk that fails after so many writes changes nothing from there on, and 
     (made, named, read, fs.sync[d]("a"), fs.append[d]("a", b"x"), fs.temp_dir[d]("", "t-"))
   });
   assert_eq(gone.value, (Err(failed()), Err(failed()), Some(b"1"), false, None, None));
-  assert_eq(mem_list(gone.tree, ""), Some(["a"]));
+  assert_eq(listed_names(mem_list(gone.tree, "")), Some(["a"]));
   assert_eq(gone.tree.opened.len(), 0)
 }
 
@@ -3303,7 +3335,7 @@ fn replaced(
     }))
 
 fn temporaries(tree: MemFs, dir: String) -> List<String> / {abort.raise} =
-  match mem_list(tree, dir) {
+  match listed_names(mem_list(tree, dir)) {
     Some(names) -> names.filter(|name: String| name.starts_with(".tmp-")),
     None -> [],
   }
@@ -3324,7 +3356,7 @@ test "an atomic write leaves the new bytes under the old file's mode, and no tem
   assert_eq(mem_mode(over.tree, "d/cfg"), Some(mode_of("rw-r-----")));
   assert_eq(mem_mode(over.tree, "d/fresh"), Some(mode_of("rw-r--r--")));
   assert_eq(mem_mode(over.tree, "d/tool"), Some(mode_of("rwx------")));
-  assert_eq(mem_list(over.tree, "d"), Some(["cfg", "fresh", "tool"]));
+  assert_eq(listed_names(mem_list(over.tree, "d")), Some(["cfg", "fresh", "tool"]));
   assert_eq(over.tree.opened.len(), 0)
 }
 
@@ -3489,7 +3521,7 @@ test "a copy is refused over what is there, merged into it or made in its place,
   assert_eq(mem_kind(merged, "out/sub"), Dir);
   assert_eq(mem_read(merged, "out/sub/b.txt"), Some(b"b"));
   let anew = copy_tried(linked, "src", "out", how(Replace)).tree;
-  assert_eq(mem_list(anew, "out"), Some(["a.txt", "sub"]));
+  assert_eq(listed_names(mem_list(anew, "out")), Some(["a.txt", "sub"]));
   let over_tree = mem_create_dir(mem_of([{ path: "src/a", body: b"file" }]), "out/a/deep").fs;
   assert_eq(copy_tried(over_tree, "src", "out", how(Merge)).value, Err(("out/a", NotAFile)));
   assert_eq(copy_tried(linked, "src", "", how(Replace)).value, Err(("", Other(0, "remove_tree"))))
@@ -3509,7 +3541,7 @@ test "a copy holds to its bounds before it copies anything, stops where its fold
       if seen.len() < 1 { Continue(seen.push(told.path)) } else { Stop(seen.push(told.path)) }));
   assert_eq(stopped.value.value, ["out", "out/a.txt"]);
   assert_eq(stopped.value.stopped, true);
-  assert_eq(mem_list(stopped.tree, "out"), Some(["a.txt"]));
+  assert_eq(listed_names(mem_list(stopped.tree, "out")), Some(["a.txt"]));
   let one = copy_tried(grove(), "src/sub/b.txt", "b.copy", within(1, 2));
   assert_eq(one.value, Ok({ value: 1, entries: 1, bytes: 2, skipped: [], stopped: false }));
   assert_eq(mem_read(one.tree, "b.copy"), Some(b"bb"))
