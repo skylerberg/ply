@@ -1,0 +1,150 @@
+import std.fs (fs)
+import std.hash (blake3)
+import compiler.store.hash.encoding (hex)
+import compiler.check.resolve.tables (Diagnostic)
+import compiler.unit (identity_of, unit_roots)
+import paths
+import semantics (semantics)
+import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
+import store.tables (Stamps)
+
+pub type StoreLocation = { label: String, dir: String, root: String, stamps: Stamps }
+
+pub fn store_location_of(paths: List<paths::ResolvedPath>, stamps: Stamps) -> StoreLocation =
+  match paths.at(0) {
+    Some(r) ->
+      {
+        label: r.label,
+        dir: paths::in_root(r, ".ply-cache").path,
+        root: if r.label == "cwd" { r.root_path } else { "/" ++ r.root_path },
+        stamps: stamps,
+      },
+    None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
+  }
+
+fn verdict_roots() -> List<Bytes> =
+  unit_roots().fold(
+    [b"tests.run.selected", b"prove.run", b"review.run"],
+    |acc: List<Bytes>, r: Bytes| acc.push(r),
+  )
+
+fn code_roots() -> List<Bytes> =
+  [
+    b"tests.concluded.run_job",
+    b"testing.conclude.conclude_run",
+    b"compiler.unit.produce",
+    b"compiler.unit.held",
+    b"units.emitted_of",
+    b"tests.cases.codes_of",
+  ]
+
+pub fn shipped_stamps() -> Stamps / {fs.read_file[shipped], semantics.cached, abort.raise} =
+  match ((fs.read_file[shipped]("stamps"), fs.read_file[shipped]("definitions"))) {
+    (Some(stamps), Some(definitions)) ->
+      full_stamps(stamps_of(String::of_bytes_lossy(stamps)), definitions, semantics.cached()),
+    _ ->
+      panic(
+        "the shipped modules' directory carries no stamps or no definitions; the launcher lays both out beside the modules",
+      ),
+  }
+
+pub fn full_stamps(
+  launched: Stamps,
+  definitions: Bytes,
+  semantics_version: String,
+) -> Stamps / {abort.raise} = {
+  let over = |parts: List<Bytes>|
+    String::of_bytes(hex(blake3(Bytes::concat_all(parts.map(|part: Bytes| part.concat(b"\x00"))))));
+  {
+    runtime: over([
+      b"ply.stamp.runtime.4",
+      Bytes::of_string(launched.runtime),
+      identity_of(definitions, verdict_roots()),
+      Bytes::of_string(semantics_version),
+    ]),
+    code: over([
+      b"ply.stamp.code.1",
+      Bytes::of_string(launched.runtime),
+      identity_of(definitions, code_roots()),
+      Bytes::of_string(semantics_version),
+    ]),
+  }
+}
+
+pub fn stamps_of(text: String) -> Stamps =
+  text.split("\n").fold({ runtime: "", code: "" }, |s: Stamps, line: String|
+    match line.split(" ") { ["runtime", digest] -> { ..s, runtime: digest }, _ -> s })
+
+fn warning(code: Bytes, message: String, notes: List<String>) -> Diagnostic =
+  {
+    code: code,
+    notes: notes.len(),
+    labels: [],
+    text: b"",
+    message: Bytes::of_string(message),
+    notes_text: notes.map(Bytes::of_string),
+    severity: b"warning",
+    fixes: [],
+  }
+
+pub fn diagnostics_of(ws: List<Warning>) -> List<Diagnostic> =
+  ws.map(|w: Warning|
+    match w.kind {
+      Unreadable ->
+        warning(b"W0601", w.message, [
+          "this run is unaffected; the next one will do this work again",
+        ]),
+      Corrupt ->
+        warning(b"W0602", "the cache is corrupt: " ++ w.message, [
+          "whatever needed it is recomputed, and `ply cache compact` rewrites the data file",
+        ]),
+      OtherVersion -> warning(b"W0603", w.message, ["the store is rebuilt as this run files"]),
+    })
+
+fn definitions_with(moved: Bytes) -> Bytes / {abort.raise} = {
+  let roots = code_roots().fold(verdict_roots(), |acc: List<Bytes>, r: Bytes| acc.push(r));
+  roots.push(b"other.unrelated").fold(b"", |acc: Bytes, root: Bytes|
+    Bytes::concat_all([
+      acc,
+      root,
+      b" ",
+      if root == moved { b"moved" } else { hex(blake3(root)) },
+      b"\n",
+    ]))
+}
+
+test "a group's stamp moves with a definition that computes what it holds, and with no other" {
+  let launched = { runtime: "runtime", code: "" };
+  let now = full_stamps(launched, definitions_with(b""), "s");
+  assert_eq(full_stamps(launched, definitions_with(b"other.unrelated"), "s"), now);
+  let deciding = full_stamps(launched, definitions_with(b"tests.run.selected"), "s");
+  assert(deciding.runtime != now.runtime, Some("a verdict's root moved and its stamp did not"));
+  let another = full_stamps({ ..launched, runtime: "another" }, definitions_with(b""), "s");
+  assert(another.runtime != now.runtime, Some("the runtime moved and its stamp did not"));
+  assert(another.code != now.code, Some("the runtime moved and the code passes' stamp did not"));
+  let meant = full_stamps(launched, definitions_with(b""), "t");
+  assert(
+    meant.runtime != now.runtime && meant.code != now.code,
+    Some("the semantics version moved and a stamp did not"),
+  )
+}
+
+test "the code passes' stamp moves with what decides a verdict, and not with what makes the code" {
+  let launched = { runtime: "runtime", code: "" };
+  let now = full_stamps(launched, definitions_with(b""), "s");
+  let emitter = full_stamps(launched, definitions_with(b"compiler.unit.emitted"), "s");
+  assert(emitter.runtime != now.runtime, Some("the emitter moved and the passes' stamp did not"));
+  assert_eq(emitter.code, now.code);
+  assert_eq(full_stamps(launched, definitions_with(b"tests.run.selected"), "s").code, now.code);
+  let running = full_stamps(launched, definitions_with(b"tests.concluded.run_job"), "s");
+  assert(running.code != now.code, Some("what decides a verdict moved and the stamp did not"));
+  let concluding = full_stamps(launched, definitions_with(b"testing.conclude.conclude_run"), "s");
+  assert(concluding.code != now.code, Some("what files a pass moved and the stamp did not"));
+  let assembling = full_stamps(launched, definitions_with(b"compiler.unit.produce"), "s");
+  assert(assembling.code != now.code, Some("what places the bodies moved and the stamp did not"))
+}
+
+test "the shipped modules' stamps are read a name to a line, and a line naming nothing is passed over" {
+  assert_eq(stamps_of("evaluator aa\nruntime bb\n"), { runtime: "bb", code: "" });
+  assert_eq(stamps_of("other cc\n"), { runtime: "", code: "" })
+}

@@ -1,0 +1,300 @@
+import compiler.syntax.parsing (span_between)
+import compiler.check.types (NamedType, list_type, int_type)
+import compiler.check.types (Type)
+import compiler.check.known (none_constructor, some_constructor)
+import compiler.emit.c (int_literal)
+import compiler.emit.layout (PlainWords, RecordFields, InlineRecord, FieldLayout, Pointer,
+                             sum_layout, record_layout, raw, raw_sum, words, header_bytes)
+import compiler.emit.representations (known_layout)
+import compiler.emit.typed_ir (Representation, AsWord, AsFlattened, AsSum, AsUnit, AsListView, Var,
+                               Arg, VarOperand, operand_representation, representation_text,
+                               is_boxed)
+import compiler.emit.pieces (Text, pieces_text)
+import compiler.emit.print.text (Printing, InstructionContext, empty_printing, named, pad, pieces,
+                                 line, arg_text, part_names, unsupported, slot)
+import compiler.emit.print.value_printing (arg_parts, parts_to_word, word_to_parts, word_viewed,
+                                           word_as, declared_as, values_as_words, write_inline)
+import compiler.emit.lower.representation (c_values_of)
+import compiler.emit.print.count_functions (call_text, calls, counts_any, releases_word)
+import compiler.emit.print.ownership (released)
+import compiler.emit.print.lists (list_rest)
+
+pub fn packed(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  k: { arg: Arg, to: Representation },
+) -> Printing / {abort.raise} =
+  match into {
+    None ->
+      unsupported(
+        b"a value held otherwise that nothing holds",
+        Bytes::concat_all([
+          representation_text(operand_representation(k.arg)),
+          b" held as ",
+          representation_text(k.to),
+        ]),
+      ),
+    Some(v) -> {
+      let from = operand_representation(k.arg);
+      let xs = arg_parts(printing, k.arg);
+      if from == k.to { declared_as(p, printing, v, xs) } else {
+        match k.to {
+          AsWord -> if from == AsListView { list_of_view(p, printing, v, xs) } else {
+            match inline_fields(printing, v.ty) {
+              Some(fs) ->
+                box_with_inline_fields(p, printing, v, values_as_words(xs, c_values_of(from)), fs),
+              None -> word_form(p, printing, v, xs, from),
+            }
+          },
+          AsUnit -> declared_as(p, printing, v, []),
+          AsFlattened(_) -> unpacked(p, printing, v, from, k),
+          AsSum(s) -> if !raw_sum(s.layout) { unpacked(p, printing, v, from, k) }
+          else { scalar_borrowed(p, printing, v, from, k) },
+          _ -> scalar_borrowed(p, printing, v, from, k),
+        }
+      }
+    },
+  }
+
+fn word_form(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  xs: List<Bytes>,
+  from: Representation,
+) -> Printing = {
+  let n = named(printing, v);
+  let w = parts_to_word(n.printing, n.name, xs, from);
+  if w.word == n.name { pieces(w.printing, [Text(pad(p.depth))].concat(w.prep).push(Text(b"\n"))) }
+  else { line(w.printing, p.depth, Bytes::concat_all([b"Word ", n.name, b" = ", w.word, b";"])) }
+}
+
+fn inline_fields(printing: Printing, ty: Type) -> Option<List<FieldLayout>> =
+  match known_layout(printing.constructors, ty) {
+    Some(RecordFields(fs)) -> if fs.any(|f: FieldLayout|
+        match f.layout { InlineRecord(_) -> true, _ -> false }) { Some(fs) }
+    else { None },
+    _ -> None,
+  }
+
+fn box_with_inline_fields(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  ws: List<Bytes>,
+  fs: List<FieldLayout>,
+) -> Printing / {abort.raise} = {
+  let n = named(printing, v);
+  let made = line(
+    n.printing,
+    p.depth,
+    Bytes::concat_all([
+      b"Word ",
+      n.name,
+      b" = ply_alloc(ctx, ",
+      int_literal(header_bytes() + 8 * words(RecordFields(fs))),
+      b");",
+    ]),
+  );
+  fs.fold(
+    { printing: made, at: 0 },
+    |acc: { printing: Printing, at: Int }, f: FieldLayout|
+      match f.layout {
+        InlineRecord(r) -> {
+          let moved = write_inline(
+            acc.printing,
+            slot(n.name, f.at),
+            Bytes::concat_all([b"&", slot(n.name, f.at + 1)]),
+            nth(ws, acc.at),
+            r,
+          );
+          { printing: line(moved.printing, p.depth, moved.text), at: acc.at + 1 }
+        },
+        other -> {
+          let k = words(other);
+          {
+            printing: range(0, k).fold(acc.printing, |q: Printing, j: Int|
+              line(
+                q,
+                p.depth,
+                Bytes::concat_all([slot(n.name, f.at + j), b" = ", nth(ws, acc.at + j), b";"]),
+              )),
+            at: acc.at + k,
+          }
+        },
+      },
+  ).printing
+}
+
+fn scalar_borrowed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  from: Representation,
+  k: { arg: Arg, to: Representation },
+) -> Printing / {abort.raise} =
+  if from == AsWord { declared_as(p, printing, v, [word_as(arg_text(printing, k.arg), k.to)]) }
+  else { mismatched(from, k.to) }
+
+fn unpacked(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  from: Representation,
+  k: { arg: Arg, to: Representation },
+) -> Printing / {abort.raise} =
+  if from != AsWord { mismatched(from, k.to) } else {
+    let n = named(printing, v);
+    let word = arg_text(printing, k.arg);
+    let names = part_names(n.name, k.to);
+    pieces(
+      n.printing,
+      [Text(pad(p.depth))].concat(if is_boxed(k.to) { word_viewed(word, k.to, names) }
+      else { word_to_parts(word, k.to, names) }).push(
+        Text(b"\n"),
+      ),
+    )
+  }
+
+fn list_of_view(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  xs: List<Bytes>,
+) -> Printing / {abort.raise} = {
+  let list = nth(xs, 0);
+  let from_at = nth(xs, 1);
+  let n = named(printing, v);
+  let unpacked = line(
+    n.printing,
+    p.depth,
+    Bytes::concat_all([b"Word ", n.name, b" = ", list, b";"]),
+  );
+  let cut = line(unpacked, p.depth, Bytes::concat_all([b"if (", from_at, b") {"]));
+  let made = list_rest(cut, p.depth + 1, n.name, list, from_at, v.ty);
+  let go = released(made, v.ty, AsWord, [list]);
+  line(
+    pieces(go.printing, [Text(pad(p.depth + 1))].concat(go.out).push(Text(b"\n"))),
+    p.depth,
+    b"}",
+  )
+}
+
+fn mismatched(from: Representation, to: Representation) -> Printing / {abort.raise} =
+  unsupported(
+    b"a value held as no type holds both, which the form never packs",
+    Bytes::concat_all([representation_text(from), b" held as ", representation_text(to)]),
+  )
+
+fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"0" }
+
+fn place() -> InstructionContext =
+  {
+    u: {
+      symbol: b"f",
+      base: 0,
+      result: AsWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+      unwinds: [],
+      epilogue: b"",
+    },
+    at: span_between(0, 0),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, rep: Representation) -> Var =
+  { id: id, ty: NamedType({ name: b"T", args: [] }), representation: rep }
+
+fn point() -> Representation =
+  AsFlattened([{ name: b"x", representation: AsWord }, { name: b"y", representation: AsWord }])
+
+test "a record's word form is a box made of its words, and a box read back is viewed in place, taken nowhere" {
+  let printing = { ..empty_printing(Map::new().insert(0, b"p0")), temps: 4 };
+  let word_form = packed(place(), printing, Some(local(1, AsWord)), {
+    arg: VarOperand(local(0, point())),
+    to: AsWord,
+  });
+  let made = pieces_text(word_form.out);
+  assert_eq(
+    [b"ply_alloc(ctx, INT64_C(24))", b"[0] = p0_0;", b"[1] = p0_1;"].filter(|part: Bytes|
+      made.index_of(part) == None),
+    [],
+  );
+  let both = pieces_text(
+    packed(place(), word_form, Some(local(2, point())), {
+      arg: VarOperand(local(1, AsWord)),
+      to: point(),
+    }).out,
+  );
+  let opened_back = both.slice(made.len(), both.len());
+  assert(
+    opened_back.index_of(b"[0]") != None && opened_back.index_of(b"[1]") != None
+      && !counts_any(opened_back)
+      && opened_back.index_of(b"rt_") == None,
+    Some(String::of_bytes_lossy(opened_back)),
+  )
+}
+
+test "a sum of one word is its word either way, and a value of no words is its word 0" {
+  let one = AsSum({
+    layout: sum_layout([
+      { args: record_layout([]), indirect: false },
+      { args: record_layout([PlainWords([Pointer])]), indirect: false },
+    ]),
+    cases: [none_constructor(), some_constructor()],
+  });
+  let printing = empty_printing(Map::new().insert(0, b"p0"));
+  let said = |from: Representation, to: Representation|
+    pieces_text(
+      packed(place(), printing, Some(local(1, to)), {
+        arg: VarOperand(local(0, from)),
+        to: to,
+      }).out,
+    );
+  assert_eq([said(one, AsWord), said(AsWord, one)].map(|c: Bytes| c.ends_with(b" = p0;\n")), [
+    true,
+    true,
+  ]);
+  assert(said(AsUnit, AsWord).ends_with(b" = 0;\n"), None);
+  let tagged = AsSum({
+    layout: sum_layout([
+      { args: record_layout([]), indirect: false },
+      { args: record_layout([PlainWords([raw()])]), indirect: false },
+    ]),
+    cases: [none_constructor(), some_constructor()],
+  });
+  let wide = said(AsWord, tagged);
+  assert(
+    wide.index_of(b"ply_words(p0)[0]") != None && wide.index_of(b"ply_words(p0)[1]") != None
+      && !counts_any(wide),
+    Some(String::of_bytes_lossy(wide)),
+  );
+  let id = AsSum({
+    layout: sum_layout([{ args: record_layout([PlainWords([raw()])]), indirect: false }]),
+    cases: [b"Id"],
+  });
+  let read = said(AsWord, id);
+  assert(!counts_any(read), Some(String::of_bytes_lossy(read)))
+}
+
+test "a view of a list from an offset is made the list of its rest where it leaves" {
+  let printing = empty_printing(Map::new().insert(0, b"p0"));
+  let listed = { ..local(1, AsWord), ty: list_type(int_type()) };
+  let text = pieces_text(
+    packed(place(), printing, Some(listed), {
+      arg: VarOperand(local(0, AsListView)),
+      to: AsWord,
+    }).out,
+  );
+  assert(
+    text.index_of(b"if (p0_1) {") != None && text.index_of(b"rt_list_rest_p") == None
+      && releases_word(text, b"p0_0"),
+    Some(String::of_bytes_lossy(text)),
+  )
+}

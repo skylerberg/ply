@@ -1,43 +1,27 @@
-//! The lexer: source bytes to tokens and diagnostics.
-
 import std.bytes (is_digit, ascii_of_int, hex_value)
 import std.bytes
 import std.math (pow)
 import std.list
 import std.string
 
-// --- Bytes the language cannot spell ----------------------------------------
-
-/// The only inverse of `Bytes::at`: Ply has no `byte_of_int`.
 fn all_bytes() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
 
-/// Every non-ASCII byte: a stop-set inside `b"..."`, which refuses them.
 fn high_bytes() -> Bytes / {abort.raise} = all_bytes().slice(128, 256)
 
-// --- Bounded peeking --------------------------------------------------------
-
-// --- Tokens -----------------------------------------------------------------
-
-/// `FloatLiteral` carries normalised text and `DecimalLiteral` its mantissa as digits: 96 bits do not fit an `Int`.
 pub type TokenKind =
   | Identifier(Bytes)
   | IntLiteral(Int)
-  /// The width's name and the value normalized to that width.
   | FixedLiteral(Bytes, Int)
-  /// A 128-bit literal: the width's name, then its high and low 64 bits as `Int` patterns.
   | WideLiteral(Bytes, Int, Int)
   | FloatLiteral(Bytes)
   | DecimalLiteral(Bytes, Int)
   | StringLiteral(Bytes)
-  /// A line string's lines, joined: a value like a `StringLiteral`'s, which only an expression may be.
   | LineString(Bytes)
   | BytesLiteral(Bytes)
-  /// An interpolated string's text: up to its first hole, between two holes, and after its last.
   | InterpolatedHead(Bytes)
   | InterpolatedMiddle(Bytes)
   | InterpolatedTail(Bytes)
-  /// A character literal's Unicode scalar value.
   | CharLiteral(Int)
   | Keyword(Bytes)
   | Punctuation(Bytes)
@@ -45,63 +29,60 @@ pub type TokenKind =
 
 pub type Token = { start: Int, end: Int, kind: TokenKind }
 
-pub type Diag = { start: Int, end: Int, code: Bytes, message: Bytes, label: Bytes }
+pub type Diagnostic = { start: Int, end: Int, code: Bytes, message: Bytes, label: Bytes }
 
 pub type Comment = { start: Int, end: Int }
 
-/// `///` documents the declaration below it and `//!` the module it opens; `////` is a plain comment.
 pub type DocMark = | ItemDoc | ModuleDoc
 
-pub type Lexed = { tokens: List<Token>, diags: List<Diag>, comments: List<Comment> }
+pub type LexResult = { tokens: List<Token>, diagnostics: List<Diagnostic>, comments: List<Comment> }
 
-/// `tokens` must stay the last field in every `Scanner` literal: anywhere earlier, `List::push` copies the list (quadratic).
-/// `holes` is, per interpolated string open around the scan, the braces opened inside its hole.
-type Scanner = { pos: Int, diags: List<Diag>, holes: List<Int>, tokens: List<Token> }
+type Scanner = { pos: Int, diagnostics: List<Diagnostic>, holes: List<Int>, tokens: List<Token> }
 
-fn push_token(scanner: Scanner, start: Int, fin: Int, kind: TokenKind) -> Scanner =
+fn push_token(scanner: Scanner, start: Int, token_end: Int, kind: TokenKind) -> Scanner =
   {
-    pos: fin,
-    diags: scanner.diags,
+    pos: token_end,
+    diagnostics: scanner.diagnostics,
     holes: scanner.holes,
-    tokens: scanner.tokens.push({ start: start, end: fin, kind: kind }),
+    tokens: scanner.tokens.push({ start: start, end: token_end, kind: kind }),
   }
 
 fn push_error(
   scanner: Scanner,
   start: Int,
-  fin: Int,
+  token_end: Int,
   code: Bytes,
   message: Bytes,
-  label: Bytes,
+  lex_test_label: Bytes,
 ) -> Scanner =
   {
     pos: scanner.pos,
     holes: scanner.holes,
     tokens: scanner.tokens,
-    diags: scanner.diags.push({
+    diagnostics: scanner.diagnostics.push({
       start: start,
-      end: fin,
+      end: token_end,
       code: code,
       message: message,
-      label: label,
+      label: lex_test_label,
     }),
   }
 
 fn with_holes(scanner: Scanner, holes: List<Int>) -> Scanner =
-  { pos: scanner.pos, diags: scanner.diags, holes: holes, tokens: scanner.tokens }
+  { pos: scanner.pos, diagnostics: scanner.diagnostics, holes: holes, tokens: scanner.tokens }
 
-fn bad_suffix(scanner: Scanner, start: Int, fin: Int, suffix: Bytes) -> Scanner =
+fn bad_suffix(scanner: Scanner, start: Int, token_end: Int, suffix: Bytes) -> Scanner =
   push_error(
     scanner,
     start,
-    fin,
+    token_end,
     unexpected(),
     Bytes::concat_all([b"invalid suffix `", suffix, b"` on a numeric literal"]),
     b"the suffixes are `m` for a `Decimal` and a width \xe2\x80\x94 `u8`, `i32` and the six others; separate a name with a space",
   )
 
 fn seek(scanner: Scanner, p: Int) -> Scanner =
-  { pos: p, diags: scanner.diags, holes: scanner.holes, tokens: scanner.tokens }
+  { pos: p, diagnostics: scanner.diagnostics, holes: scanner.holes, tokens: scanner.tokens }
 
 fn unexpected() -> Bytes = b"E0001"
 
@@ -111,27 +92,20 @@ fn unterminated() -> Bytes = b"E0002"
 
 fn non_ascii() -> Bytes = b"X0001"
 
-// --- Character classes ------------------------------------------------------
-
-/// ASCII whitespace only.
 fn whitespace() -> Bytes = b" \t\n\r\x0b\x0c"
 
-fn ident_chars() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+fn identifier_chars() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 
 fn digit_chars() -> Bytes = b"0123456789_"
 
-pub fn is_ident_start(c: Int) -> Bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+pub fn is_identifier_start(c: Int) -> Bool =
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
 
-pub fn is_ident_continue(c: Int) -> Bool = is_ident_start(c) || is_digit(c)
+pub fn is_identifier_continue(c: Int) -> Bool = is_identifier_start(c) || is_digit(c)
 
-/// The UTF-8 length at a lead byte, so one refused character is one diagnostic spanning all of it.
 pub fn utf8_len(c: Int) -> Int =
   if c < 128 { 1 } else if c < 224 { 2 } else if c < 240 { 3 } else { 4 }
 
-// --- Trivia -----------------------------------------------------------------
-
-/// Whitespace and `//` comments, to the first byte of the next token: a comment a round, each
-/// passing at least its `//`.
 fn skip_trivia(src: Bytes, i: Int) -> Int / {abort.raise} =
   iterate(i, src.len() - i + 2, |at: Int| {
     let j = src.skip(at, whitespace());
@@ -139,20 +113,14 @@ fn skip_trivia(src: Bytes, i: Int) -> Int / {abort.raise} =
     else { Stop(j) }
   })
 
-// --- The loop ---------------------------------------------------------------
-
-/// Each name `tokens` write where a binding of it can stand: not after a dot or a `::`, and not
-/// before a dot. Every pattern writes the names it binds so, and a name written nowhere so is an
-/// effect's or a module's: a call on it, `x.f(..)`, is a perform where one on a name the text
-/// binds is a call on a value.
 pub fn bound_names(tokens: List<Token>) -> Map<Bytes, Bool> = {
-  let punct = |i: Int, p: Bytes|
+  let punctuation = |i: Int, p: Bytes|
     i >= 0 && (match tokens.at(i) { Some(t) -> t.kind == Punctuation(p), None -> false });
   range(0, tokens.len()).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
     match tokens.at(i) {
       Some(t) -> match t.kind {
-        Identifier(n) -> if punct(i - 1, b"dot") || punct(i - 1, b"coloncolon")
-            || punct(i + 1, b"dot") { acc }
+        Identifier(n) -> if punctuation(i - 1, b"dot") || punctuation(i - 1, b"coloncolon")
+            || punctuation(i + 1, b"dot") { acc }
         else { acc.insert(n, true) },
         _ -> acc,
       },
@@ -160,16 +128,13 @@ pub fn bound_names(tokens: List<Token>) -> Map<Bytes, Bool> = {
     })
 }
 
-/// The tokens, comments and diagnostics of a source. One that is not UTF-8 is read up to the first
-/// byte that is no part of a character, which is refused as `X0001`: every rule below reads whole
-/// characters.
-pub fn lex(src: Bytes) -> Lexed / {abort.raise} =
+pub fn lex(src: Bytes) -> LexResult / {abort.raise} =
   if src.is_utf8() { lex_text(src) } else {
     let cut = utf8_prefix(src);
     let read = lex_text(src.slice(0, cut));
     {
       tokens: read.tokens,
-      diags: read.diags.push({
+      diagnostics: read.diagnostics.push({
         start: cut,
         end: cut + 1,
         code: non_ascii(),
@@ -180,7 +145,6 @@ pub fn lex(src: Bytes) -> Lexed / {abort.raise} =
     }
   }
 
-/// How many bytes of `src` are whole UTF-8 characters from its start.
 fn utf8_prefix(src: Bytes) -> Int / {abort.raise} = {
   let n = src.len();
   iterate(0, n + 1, |i: Int|
@@ -190,11 +154,9 @@ fn utf8_prefix(src: Bytes) -> Int / {abort.raise} = {
     })
 }
 
-fn lex_text(src: Bytes) -> Lexed / {abort.raise} = {
+fn lex_text(src: Bytes) -> LexResult / {abort.raise} = {
   let n = src.len();
-  let start = { pos: 0, diags: [], holes: [], tokens: [] };
-  // Every step that has work left consumes at least one byte, so `n + 1` steps suffice; the scan
-  // stops at the end rather than stepping once a byte.
+  let start = { pos: 0, diagnostics: [], holes: [], tokens: [] };
   let done = iterate(start, n + 1, |scanner: Scanner|
     if scanner.pos >= n { Stop(scanner) } else { Continue(next_token(src, scanner)) });
   let closed = if done.holes.len() == 0 { done } else {
@@ -208,12 +170,15 @@ fn lex_text(src: Bytes) -> Lexed / {abort.raise} = {
     )
   };
   let with_eof = push_token(closed, n, n, EndOfInput);
-  { diags: with_eof.diags, tokens: with_eof.tokens, comments: comments(src, with_eof.tokens) }
+  {
+    diagnostics: with_eof.diagnostics,
+    tokens: with_eof.tokens,
+    comments: comments(src, with_eof.tokens),
+  }
 }
 
-/// Only trivia lies between two tokens, so the comments are read off the gaps; `end` excludes the newline.
-fn comments(src: Bytes, toks: List<Token>) -> List<Comment> / {abort.raise} = {
-  let walked = toks.fold(
+fn comments(src: Bytes, tokens: List<Token>) -> List<Comment> / {abort.raise} = {
+  let walked = tokens.fold(
     { from: 0, out: [] },
     |s: { from: Int, out: List<Comment> }, token: Token|
       { from: token.end, out: gap_comments(src, s.from, token.start, s.out) },
@@ -221,7 +186,6 @@ fn comments(src: Bytes, toks: List<Token>) -> List<Comment> / {abort.raise} = {
   walked.out
 }
 
-/// A comment a round, each passing at least its `//`.
 fn gap_comments(
   src: Bytes,
   i: Int,
@@ -231,8 +195,8 @@ fn gap_comments(
   iterate({ at: i, out: out }, src.len() - i + 2, |s: { at: Int, out: List<Comment> }| {
     let j = src.skip(s.at, whitespace());
     if j < stop && src.peek(j) == 47 && src.peek(j + 1) == 47 {
-      let fin = src.skip_until(j, b"\n");
-      Continue({ at: fin, out: s.out.push({ start: j, end: fin }) })
+      let token_end = src.skip_until(j, b"\n");
+      Continue({ at: token_end, out: s.out.push({ start: j, end: token_end }) })
     } else { Stop(s.out) }
   })
 
@@ -243,7 +207,6 @@ pub fn doc_mark(src: Bytes, c: Comment) -> Option<DocMark> = {
   else { None }
 }
 
-/// A doc comment's words: past its marker and one space, without the blanks that end its line.
 pub fn doc_line(src: Bytes, c: Comment) -> Bytes / {abort.raise} = {
   let from = if src.peek(c.start + 3) == 32 { c.start + 4 } else { c.start + 3 };
   let to = iterate(c.end, c.end - from + 1, |i: Int|
@@ -264,18 +227,17 @@ fn next_token(src: Bytes, scanner: Scanner) -> Scanner / {abort.raise} = {
 fn token_at(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
   let c = src.at(start);
   if is_digit(c) { number(src, scanner, start) }
-  else if c == 98 && src.peek(start + 1) == 34 { bytes_lit(src, scanner, start) }
-  else if c == 98 && src.peek(start + 1) == 39 { byte_lit(src, scanner, start) }
+  else if c == 98 && src.peek(start + 1) == 34 { bytes_literal(src, scanner, start) }
+  else if c == 98 && src.peek(start + 1) == 39 { byte_literal(src, scanner, start) }
   else if c == 102 && src.peek(start + 1) == 34 {
     interpolated_piece(src, scanner, start, start + 2, true)
-  } else if is_ident_start(c) { ident(src, scanner, start) }
-  else if c == 34 && labels_test(scanner.tokens) { label(src, scanner, start) }
+  } else if is_identifier_start(c) { ident(src, scanner, start) }
+  else if c == 34 && expects_test_label(scanner.tokens) { lex_test_label(src, scanner, start) }
   else if c == 34 && touches_name(scanner.tokens, start) {
     interpolated_piece(src, scanner, start, start + 1, true)
-  } else if c == 34 { string_lit(src, scanner, start) }
+  } else if c == 34 { string_literal(src, scanner, start) }
   else if c == 92 && src.peek(start + 1) == 92 { line_string(src, scanner, start) }
-  else if c == 39 { char_lit(src, scanner, start) } else if c >= 128 {
-    // With no Unicode table, any non-ASCII character outside a literal is refused as `X0001`.
+  else if c == 39 { char_literal(src, scanner, start) } else if c >= 128 {
     push_error(
       seek(scanner, start + utf8_len(c)),
       start,
@@ -284,17 +246,15 @@ fn token_at(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise}
       Bytes::concat_all([b"unexpected character `", src.slice(start, start + utf8_len(c)), b"`"]),
       b"this character has no meaning in Ply source",
     )
-  } else { punct(src, scanner, start, c) }
+  } else { punctuation(src, scanner, start, c) }
 }
 
-// --- Identifiers and keywords -----------------------------------------------
-
 fn ident(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
-  let fin = src.skip(start, ident_chars());
-  let text = src.slice(start, fin);
-  if text == b"_" { push_token(scanner, start, fin, Punctuation(b"underscore")) }
-  else if is_keyword(text) { push_token(scanner, start, fin, Keyword(text)) }
-  else { push_token(scanner, start, fin, Identifier(text)) }
+  let token_end = src.skip(start, identifier_chars());
+  let text = src.slice(start, token_end);
+  if text == b"_" { push_token(scanner, start, token_end, Punctuation(b"underscore")) }
+  else if is_keyword(text) { push_token(scanner, start, token_end, Keyword(text)) }
+  else { push_token(scanner, start, token_end, Identifier(text)) }
 }
 
 fn is_keyword(t: Bytes) -> Bool = {
@@ -307,9 +267,6 @@ fn is_keyword(t: Bytes) -> Bool = {
   else { false }
 }
 
-// --- Numbers ----------------------------------------------------------------
-
-/// `1`, `1_000`, `1.5`, `1.5e-3`, `1.50m`.
 type NumberParts = {
   start: Int,
   whole: Bytes,
@@ -322,53 +279,53 @@ type NumberParts = {
 
 fn strip_underscores(b: Bytes) -> Bytes = Bytes::concat_all(b.split(b"_"))
 
-/// A hex literal is an `Int` bounded as a 64-bit pattern.
 fn number(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} =
   if src.peek(start) == 48 && (src.peek(start + 1) == 120 || src.peek(start + 1) == 88) {
     hex_literal(src, scanner, start)
   } else { decimal_number(src, scanner, start) }
 
 fn hex_literal(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
-  let fin = src.skip(start + 2, b"0123456789abcdefABCDEF_");
-  let digits = strip_underscores(src.slice(start + 2, fin));
+  let token_end = src.skip(start + 2, b"0123456789abcdefABCDEF_");
+  let digits = strip_underscores(src.slice(start + 2, token_end));
   if digits.len() == 0 {
     push_token(
       push_error(
         scanner,
         start,
-        fin,
+        token_end,
         unexpected(),
         b"hex literal with no digits",
         b"write at least one digit after `0x`, as in `0xFF`",
       ),
       start,
-      fin,
+      token_end,
       IntLiteral(0),
     )
   } else {
-    let sufe = if is_ident_start(src.peek(fin)) { src.skip(fin, ident_chars()) } else { fin };
-    let suffix = src.slice(fin, sufe);
+    let sufe = if is_identifier_start(src.peek(token_end)) {
+      src.skip(token_end, identifier_chars())
+    } else { token_end };
+    let suffix = src.slice(token_end, sufe);
     match width_named(suffix) {
-      // A hex literal is a bit pattern, so the width bounds it rather than the type's range.
       Some(w) -> hex_fixed(scanner, start, sufe, digits, w),
       None -> {
-        let s1 = if sufe > fin { bad_suffix(scanner, start, sufe, suffix) } else { scanner };
+        let s1 = if sufe > token_end { bad_suffix(scanner, start, sufe, suffix) } else { scanner };
         let d = strip_zeros(digits);
         if d.len() > 16 {
           push_token(
             push_error(
               s1,
               start,
-              fin,
+              token_end,
               unexpected(),
               Bytes::concat_all([b"hex literal `0x", digits, b"` does not fit in `Int`"]),
               b"`Int` is 64 bits, so a hex literal has at most 16 digits",
             ),
             start,
-            fin,
+            token_end,
             IntLiteral(0),
           )
-        } else { push_token(s1, start, fin, IntLiteral(hex_of_digits(d))) }
+        } else { push_token(s1, start, token_end, IntLiteral(hex_of_digits(d))) }
       },
     }
   }
@@ -377,27 +334,27 @@ fn hex_literal(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.rai
 fn hex_fixed(
   scanner: Scanner,
   start: Int,
-  fin: Int,
+  token_end: Int,
   digits: Bytes,
   width: Width,
 ) -> Scanner / {abort.raise} =
-  if width.bits == 128 { hex_wide(scanner, start, fin, digits, width) }
-  else { hex_narrow(scanner, start, fin, digits, width) }
+  if width.bits == 128 { hex_wide(scanner, start, token_end, digits, width) }
+  else { hex_narrow(scanner, start, token_end, digits, width) }
 
 fn hex_narrow(
   scanner: Scanner,
   start: Int,
-  fin: Int,
+  token_end: Int,
   digits: Bytes,
   width: Width,
 ) -> Scanner / {abort.raise} = {
   let d = strip_zeros(digits);
-  if d.len() > 16 || (width.bits < 64 && d.len() * 4 > width.bits && hex_over(d, width)) {
+  if d.len() > 16 || (width.bits < 64 && d.len() * 4 > width.bits && hex_overflows(d, width)) {
     push_token(
       push_error(
         scanner,
         start,
-        fin,
+        token_end,
         out_of_range(),
         Bytes::concat_all([b"`0x", digits, b"` does not fit in `", width_upper(width), b"`"]),
         Bytes::concat_all([
@@ -409,24 +366,23 @@ fn hex_narrow(
         ]),
       ),
       start,
-      fin,
+      token_end,
       FixedLiteral(width_upper(width), 0),
     )
   } else {
     push_token(
       scanner,
       start,
-      fin,
+      token_end,
       FixedLiteral(width_upper(width), width_normalize(width, hex_of_digits(d))),
     )
   }
 }
 
-/// Thirty-two digits at most, the high sixteen and the low sixteen each one `Int` pattern.
 fn hex_wide(
   scanner: Scanner,
   start: Int,
-  fin: Int,
+  token_end: Int,
   digits: Bytes,
   width: Width,
 ) -> Scanner / {abort.raise} = {
@@ -437,13 +393,13 @@ fn hex_wide(
       push_error(
         scanner,
         start,
-        fin,
+        token_end,
         out_of_range(),
         Bytes::concat_all([b"`0x", digits, b"` does not fit in `", width_upper(width), b"`"]),
         Bytes::concat_all([b"a `", width_upper(width), b"` is 128 bits"]),
       ),
       start,
-      fin,
+      token_end,
       WideLiteral(width_upper(width), 0, 0),
     )
   } else {
@@ -451,7 +407,7 @@ fn hex_wide(
     push_token(
       scanner,
       start,
-      fin,
+      token_end,
       WideLiteral(
         width_upper(width),
         hex_of_digits(d.slice(0, split)),
@@ -461,8 +417,7 @@ fn hex_wide(
   }
 }
 
-/// Decided on the digit string so no `Int` has to hold the pattern.
-fn hex_over(d: Bytes, width: Width) -> Bool / {abort.raise} =
+fn hex_overflows(d: Bytes, width: Width) -> Bool / {abort.raise} =
   strip_zeros(d).len() * 4 > width.bits + 3 && (strip_zeros(d).len() - 1) * 4 >= width.bits
 
 fn hex_of_digits(d: Bytes) -> Int =
@@ -471,7 +426,6 @@ fn hex_of_digits(d: Bytes) -> Int =
 fn decimal_number(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
   let we = src.skip(start, digit_chars());
   let whole = strip_underscores(src.slice(start, we));
-  // `..` is the range separator, so a fraction is a dot followed by a digit.
   let hasf = src.peek(we) == 46 && is_digit(src.peek(we + 1));
   let fe = if hasf { src.skip(we + 1, digit_chars()) } else { we };
   let frac = if hasf { strip_underscores(src.slice(we + 1, fe)) } else { b"" };
@@ -488,7 +442,6 @@ fn decimal_number(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.
   })
 }
 
-/// The first exponent digit, or -1: the `e` is consumed only when digits follow.
 fn exponent_start(src: Bytes, i: Int) -> Int = {
   let c = src.peek(i);
   if c != 101 && c != 69 { -1 } else {
@@ -502,49 +455,47 @@ fn exponent_text(src: Bytes, e: Int, es: Int, ee: Int) -> Bytes / {abort.raise} 
   src.slice(e + 1, es).concat(strip_underscores(src.slice(es, ee)))
 
 fn number_tail(src: Bytes, scanner: Scanner, parts: NumberParts) -> Scanner / {abort.raise} =
-  if src.peek(parts.cursor) == 109 && !is_ident_continue(src.peek(parts.cursor + 1)) {
+  if src.peek(parts.cursor) == 109 && !is_identifier_continue(src.peek(parts.cursor + 1)) {
     decimal(scanner, parts, parts.cursor + 1)
-  } else if is_ident_start(src.peek(parts.cursor)) {
-    let fin = src.skip(parts.cursor, ident_chars());
-    // A width suffix applies only to an integer; `1.5u8` is refused as a bad suffix.
+  } else if is_identifier_start(src.peek(parts.cursor)) {
+    let token_end = src.skip(parts.cursor, identifier_chars());
     match if parts.has_fraction || parts.has_exponent { None }
-      else { width_named(src.slice(parts.cursor, fin)) } {
-      Some(w) -> fixed_value(scanner, parts, fin, w),
+      else { width_named(src.slice(parts.cursor, token_end)) } {
+      Some(w) -> fixed_value(scanner, parts, token_end, w),
       None ->
         number_value(
-          bad_suffix(scanner, parts.start, fin, src.slice(parts.cursor, fin)),
+          bad_suffix(scanner, parts.start, token_end, src.slice(parts.cursor, token_end)),
           parts,
-          fin,
+          token_end,
         ),
     }
   } else { number_value(scanner, parts, parts.cursor) }
 
-/// A decimal spelling is a value, so its bound is the type's range.
 fn fixed_value(
   scanner: Scanner,
   parts: NumberParts,
-  fin: Int,
+  token_end: Int,
   width: Width,
 ) -> Scanner / {abort.raise} =
-  if width.bits == 128 { wide_value(scanner, parts, fin, width) }
-  else { narrow_value(scanner, parts, fin, width) }
+  if width.bits == 128 { wide_value(scanner, parts, token_end, width) }
+  else { narrow_value(scanner, parts, token_end, width) }
 
 fn narrow_value(
   scanner: Scanner,
   parts: NumberParts,
-  fin: Int,
+  token_end: Int,
   width: Width,
 ) -> Scanner / {abort.raise} =
-  if width.bits == 64 && !width.signed { u64_value(scanner, parts, fin, width) } else {
+  if width.bits == 64 && !width.signed { u64_value(scanner, parts, token_end, width) } else {
     let d = strip_zeros(parts.whole);
     let k = d.len();
     let too_long = k > 19 || (k == 19 && compare(d, int_max()) == Greater);
-    if too_long || over_width(d, width) {
+    if too_long || exceeds_width(d, width) {
       push_token(
         push_error(
           scanner,
           parts.start,
-          fin,
+          token_end,
           out_of_range(),
           Bytes::concat_all([
             b"`",
@@ -556,75 +507,73 @@ fn narrow_value(
           Bytes::concat_all([b"`", width_upper(width), b"` holds ", width_range(width)]),
         ),
         parts.start,
-        fin,
+        token_end,
         FixedLiteral(width_upper(width), 0),
       )
     } else {
       push_token(
         scanner,
         parts.start,
-        fin,
+        token_end,
         FixedLiteral(width_upper(width), width_normalize(width, int_of_digits(d))),
       )
     }
   }
 
-/// Past `Int`'s range a `U64` is the pattern its 64 bits make, as a hex spelling of it is.
 fn u64_value(
   scanner: Scanner,
   parts: NumberParts,
-  fin: Int,
+  token_end: Int,
   width: Width,
 ) -> Scanner / {abort.raise} =
   match limbs_of_digits(strip_zeros(parts.whole)) {
     Some(ls) -> if ls.at_or(3, 0) != 0 || ls.at_or(2, 0) != 0 {
-      narrow_out_of_range(scanner, parts, fin, width)
+      narrow_out_of_range(scanner, parts, token_end, width)
     } else {
       push_token(
         scanner,
         parts.start,
-        fin,
+        token_end,
         FixedLiteral(width_upper(width), ls.at_or(1, 0) << 32 | ls.at_or(0, 0)),
       )
     },
-    None -> narrow_out_of_range(scanner, parts, fin, width),
+    None -> narrow_out_of_range(scanner, parts, token_end, width),
   }
 
 fn narrow_out_of_range(
   scanner: Scanner,
   parts: NumberParts,
-  fin: Int,
+  token_end: Int,
   width: Width,
 ) -> Scanner / {abort.raise} =
   push_token(
     push_error(
       scanner,
       parts.start,
-      fin,
+      token_end,
       out_of_range(),
       Bytes::concat_all([b"`", parts.whole, b"` is not a value of `", width_upper(width), b"`"]),
       Bytes::concat_all([b"`", width_upper(width), b"` holds ", width_range(width)]),
     ),
     parts.start,
-    fin,
+    token_end,
     FixedLiteral(width_upper(width), 0),
   )
 
-/// Read into four 32-bit limbs, so no `Int` overflows on the way; a signed width keeps its top bit clear.
 fn wide_value(
   scanner: Scanner,
   parts: NumberParts,
-  fin: Int,
+  token_end: Int,
   width: Width,
 ) -> Scanner / {abort.raise} =
   match limbs_of_digits(strip_zeros(parts.whole)) {
     Some(ls) -> if width.signed && ls.at_or(3, 0) >= pow(2, 31) {
-      wide_out_of_range(scanner, parts, fin, width)
+      wide_out_of_range(scanner, parts, token_end, width)
     } else {
       push_token(
         scanner,
         parts.start,
-        fin,
+        token_end,
         WideLiteral(
           width_upper(width),
           ls.at_or(3, 0) << 32 | ls.at_or(2, 0),
@@ -632,30 +581,29 @@ fn wide_value(
         ),
       )
     },
-    None -> wide_out_of_range(scanner, parts, fin, width),
+    None -> wide_out_of_range(scanner, parts, token_end, width),
   }
 
 fn wide_out_of_range(
   scanner: Scanner,
   parts: NumberParts,
-  fin: Int,
+  token_end: Int,
   width: Width,
 ) -> Scanner / {abort.raise} =
   push_token(
     push_error(
       scanner,
       parts.start,
-      fin,
+      token_end,
       out_of_range(),
       Bytes::concat_all([b"`", parts.whole, b"` is not a value of `", width_upper(width), b"`"]),
       Bytes::concat_all([b"`", width_upper(width), b"` holds ", width_range(width)]),
     ),
     parts.start,
-    fin,
+    token_end,
     WideLiteral(width_upper(width), 0, 0),
   )
 
-/// Least significant first; `None` once the value passes 128 bits.
 fn limbs_of_digits(d: Bytes) -> Option<List<Int>> =
   range(0, d.len()).fold(Some([0, 0, 0, 0]), |acc: Option<List<Int>>, i: Int|
     match acc { None -> None, Some(ls) -> times_ten_plus(ls, d.at(i) - 48) })
@@ -668,7 +616,6 @@ fn times_ten_plus(ls: List<Int>, digit: Int) -> Option<List<Int>> = {
   if step.carry == 0 { Some(step.out) } else { None }
 }
 
-/// The decimal spelling of a 128-bit value given as its high and low 64-bit patterns.
 pub fn wide_decimal(signed: Bool, high: Int, low: Int) -> Bytes =
   if signed && high < 0 {
     b"-".concat(
@@ -679,8 +626,6 @@ pub fn wide_decimal(signed: Bool, high: Int, low: Int) -> Bytes =
 fn high_first(high: Int, low: Int) -> List<Int> =
   [high >>> 32, high & 0xFFFF_FFFF, low >>> 32, low & 0xFFFF_FFFF]
 
-/// Divides by ten down the limbs, most significant first, a digit a round until the quotient is
-/// zero: a 128-bit value has at most 39 digits.
 fn limbs_decimal(ls: List<Int>) -> Bytes = {
   let done = range(0, 39).fold(
     { limbs: ls, digits: b"", zero: false },
@@ -700,8 +645,7 @@ fn limbs_decimal(ls: List<Int>) -> Bytes = {
   done.digits
 }
 
-/// At 64 bits the caller's `int_max` check is the only bound.
-fn over_width(d: Bytes, width: Width) -> Bool =
+fn exceeds_width(d: Bytes, width: Width) -> Bool =
   if width.bits == 64 { false } else { int_of_digits(d) > width_max(width) }
 
 fn width_range(width: Width) -> Bytes =
@@ -721,9 +665,9 @@ fn width_range(width: Width) -> Bytes =
     ])
   } else { Bytes::concat_all([b"0 to ", ascii_of_int(width_max(width))]) }
 
-fn number_value(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort.raise} =
-  if !parts.has_fraction && !parts.has_exponent { int_value(scanner, parts, fin) }
-  else { push_token(scanner, parts.start, fin, FloatLiteral(float_text(parts))) }
+fn number_value(scanner: Scanner, parts: NumberParts, token_end: Int) -> Scanner / {abort.raise} =
+  if !parts.has_fraction && !parts.has_exponent { int_value(scanner, parts, token_end) }
+  else { push_token(scanner, parts.start, token_end, FloatLiteral(float_text(parts))) }
 
 fn float_text(parts: NumberParts) -> Bytes =
   Bytes::concat_all([
@@ -734,9 +678,6 @@ fn float_text(parts: NumberParts) -> Bytes =
     if parts.has_exponent { parts.exp } else { b"" },
   ])
 
-// --- Integers ---------------------------------------------------------------
-
-/// `Int` arithmetic is checked, so a literal's bound is decided on its digits before accumulating.
 fn int_max() -> Bytes = b"9223372036854775807"
 
 fn strip_zeros(b: Bytes) -> Bytes / {abort.raise} = {
@@ -744,7 +685,7 @@ fn strip_zeros(b: Bytes) -> Bytes / {abort.raise} = {
   if k >= b.len() { b"0" } else { b.slice(k, b.len()) }
 }
 
-fn int_value(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort.raise} = {
+fn int_value(scanner: Scanner, parts: NumberParts, token_end: Int) -> Scanner / {abort.raise} = {
   let d = strip_zeros(parts.whole);
   let k = d.len();
   if k > 19 || (k == 19 && compare(d, int_max()) == Greater) {
@@ -752,22 +693,20 @@ fn int_value(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort
       push_error(
         scanner,
         parts.start,
-        fin,
+        token_end,
         unexpected(),
         Bytes::concat_all([b"integer literal `", parts.whole, b"` does not fit in `Int`"]),
         b"`Int` is a 64-bit signed integer; use a smaller value",
       ),
       parts.start,
-      fin,
+      token_end,
       IntLiteral(0),
     )
-  } else { push_token(scanner, parts.start, fin, IntLiteral(int_of_digits(d))) }
+  } else { push_token(scanner, parts.start, token_end, IntLiteral(int_of_digits(d))) }
 }
 
 pub fn int_of_digits(d: Bytes) -> Int =
   range(0, d.len()).fold(0, |a: Int, i: Int| a * 10 + (d.at(i) - 48))
-
-// --- Widths -----------------------------------------------------------------
 
 pub type Width = { name: Bytes, bits: Int, signed: Bool }
 
@@ -781,7 +720,6 @@ pub fn widths() -> List<Width> =
     { name: b"i16", bits: 16, signed: true },
     { name: b"i32", bits: 32, signed: true },
     { name: b"i64", bits: 64, signed: true },
-    // Last, so every narrower width keeps the number a hash and the runtime know it by.
     { name: b"u128", bits: 128, signed: false },
     { name: b"i128", bits: 128, signed: true },
   ]
@@ -793,37 +731,32 @@ pub fn width_named(suffix: Bytes) -> Option<Width> =
 fn width_upper(width: Width) -> Bytes / {abort.raise} =
   Bytes::of_string(String::of_bytes(width.name).ascii_upper())
 
-/// Only below 64 bits: `Float::pow(2, 63)` overflows `Int`.
 fn width_max(width: Width) -> Int =
   if width.signed { pow(2, width.bits - 1) - 1 } else { pow(2, width.bits) - 1 }
 
-/// The low `bits` kept, sign-extended when the width is signed.
 pub fn width_normalize(width: Width, v: Int) -> Int =
   if width.bits >= 64 { v } else {
     let low = v & pow(2, width.bits) - 1;
     if width.signed && low >>> width.bits - 1 == 1 { low | 0 - pow(2, width.bits) } else { low }
   }
 
-// --- Decimals ---------------------------------------------------------------
-
-/// A `Decimal` mantissa is 96 bits and its scale 0..=28; neither fits an `Int` check, so both use the digits.
 fn decimal_max() -> Bytes = b"79228162514264337593543950335"
 
 fn zero_decimal() -> TokenKind = DecimalLiteral(b"0", 0)
 
-fn decimal(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort.raise} =
+fn decimal(scanner: Scanner, parts: NumberParts, token_end: Int) -> Scanner / {abort.raise} =
   if parts.has_exponent {
     push_token(
       push_error(
         scanner,
         parts.start,
-        fin,
+        token_end,
         unexpected(),
         b"a `Decimal` literal has no exponent",
         b"write the digits out, or drop the `m` for a `Float`",
       ),
       parts.start,
-      fin,
+      token_end,
       zero_decimal(),
     )
   } else if parts.fraction.len() > 28 {
@@ -831,7 +764,7 @@ fn decimal(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort.r
       push_error(
         scanner,
         parts.start,
-        fin,
+        token_end,
         unexpected(),
         Bytes::concat_all([
           b"a `Decimal` literal has at most 28 decimal places, not ",
@@ -840,7 +773,7 @@ fn decimal(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort.r
         b"round the literal, or use `Float`",
       ),
       parts.start,
-      fin,
+      token_end,
       zero_decimal(),
     )
   } else {
@@ -851,28 +784,25 @@ fn decimal(scanner: Scanner, parts: NumberParts, fin: Int) -> Scanner / {abort.r
         push_error(
           scanner,
           parts.start,
-          fin,
+          token_end,
           unexpected(),
           b"a `Decimal` literal has at most 96 bits of mantissa",
           b"the largest is 79228162514264337593543950335",
         ),
         parts.start,
-        fin,
+        token_end,
         zero_decimal(),
       )
-    } else { push_token(scanner, parts.start, fin, DecimalLiteral(d, parts.fraction.len())) }
+    } else { push_token(scanner, parts.start, token_end, DecimalLiteral(d, parts.fraction.len())) }
   }
-
-// --- String literals --------------------------------------------------------
 
 fn string_stops() -> Bytes = b"\"\\\n"
 
-/// A string's text, a run to the next stop a round: each round passes at least one byte.
-fn string_lit(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} =
-  iterate({ scanner: scanner, i: open + 1, acc: b"" }, src.len() - open + 2, |at: TextAt|
+fn string_literal(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} =
+  iterate({ scanner: scanner, i: open + 1, acc: b"" }, src.len() - open + 2, |at: TextScan|
     string_run(src, open, at))
 
-fn string_run(src: Bytes, open: Int, at: TextAt) -> Iter<TextAt, Scanner> / {abort.raise} = {
+fn string_run(src: Bytes, open: Int, at: TextScan) -> Iter<TextScan, Scanner> / {abort.raise} = {
   let stop = src.skip_until(at.i, string_stops());
   let so_far = at.acc.concat(src.slice(at.i, stop));
   let c = src.peek(stop);
@@ -918,7 +848,7 @@ fn string_escape(
   open: Int,
   stop: Int,
   so_far: Bytes,
-) -> Iter<TextAt, Scanner> / {abort.raise} = {
+) -> Iter<TextScan, Scanner> / {abort.raise} = {
   let n = src.len();
   if src.peek(stop + 1) < 0 {
     Stop(
@@ -942,8 +872,6 @@ fn string_escape(
   }
 }
 
-/// The escape at the backslash `stop` of a string's text, which is not the last byte: the bytes it
-/// stands for and where the text goes on. An unknown escape is reported and its character kept.
 fn text_escape(
   src: Bytes,
   scanner: Scanner,
@@ -958,7 +886,7 @@ fn text_escape(
   else if c == 34 { { s: scanner, text: b"\"", next: stop + 2 } }
   else if c == 39 { { s: scanner, text: b"'", next: stop + 2 } } else if c == 117 {
     let u = unicode_escape(src, stop);
-    if u.point < 0 { { s: refused(scanner, stop, u), text: b"", next: u.end } }
+    if u.point < 0 { { s: push_escape_error(scanner, stop, u), text: b"", next: u.end } }
     else { { s: scanner, text: utf8_of(u.point), next: u.end } }
   } else {
     let w = utf8_len(c);
@@ -970,14 +898,8 @@ fn text_escape(
   }
 }
 
-// --- Interpolated strings ---------------------------------------------------
-
-/// `f"a {x} b"` is `InterpolatedHead("a ")`, the tokens of `x`, then `InterpolatedTail(" b")`; the text between two
-/// holes is a `InterpolatedMiddle`. One with no hole is a plain `StringLiteral`. `{{` and `}}` are braces of the text.
 fn interpolated_stops() -> Bytes = b"\"\\\n{}"
 
-/// `open` is where the piece's token starts: the `f` of a head, otherwise the `}` closing a hole. Its
-/// text from `i` is a run to the next stop a round, and each round passes at least one byte.
 fn interpolated_piece(
   src: Bytes,
   scanner: Scanner,
@@ -985,15 +907,15 @@ fn interpolated_piece(
   i: Int,
   head: Bool,
 ) -> Scanner / {abort.raise} =
-  iterate({ scanner: scanner, i: i, acc: b"" }, src.len() - i + 2, |at: TextAt|
+  iterate({ scanner: scanner, i: i, acc: b"" }, src.len() - i + 2, |at: TextScan|
     interpolated_run(src, open, head, at))
 
 fn interpolated_run(
   src: Bytes,
   open: Int,
   head: Bool,
-  at: TextAt,
-) -> Iter<TextAt, Scanner> / {abort.raise} = {
+  at: TextScan,
+) -> Iter<TextScan, Scanner> / {abort.raise} = {
   let n = src.len();
   let stop = src.skip_until(at.i, interpolated_stops());
   let so_far = at.acc.concat(src.slice(at.i, stop));
@@ -1039,16 +961,13 @@ fn interpolated_run(
   }
 }
 
-// --- A test's label ---------------------------------------------------------
-
 fn keyword_back(tokens: List<Token>, back: Int, word: Bytes) -> Bool =
   match tokens.at(tokens.len() - back) {
     Some(t) -> match t.kind { Keyword(k) -> k == word, _ -> false },
     None -> false,
   }
 
-/// Whether the next token is a test's label: `test` or `test/nondet` came just before it.
-fn labels_test(tokens: List<Token>) -> Bool =
+fn expects_test_label(tokens: List<Token>) -> Bool =
   keyword_back(tokens, 1, b"test")
     || (keyword_back(tokens, 1, b"nondet") && keyword_back(tokens, 3, b"test")
     && (match tokens.at(tokens.len() - 2) {
@@ -1056,41 +975,33 @@ fn labels_test(tokens: List<Token>) -> Bool =
       None -> false,
     }))
 
-/// Whether the string opening at `start` touches a name, which makes the two a tagged literal: its
-/// text is an interpolated string's, holes and all.
 fn touches_name(tokens: List<Token>, start: Int) -> Bool =
   match tokens.at(tokens.len() - 1) {
     Some(t) -> t.end == start && (match t.kind { Identifier(_) -> true, _ -> false }),
     None -> false,
   }
 
-/// Whether the `"` at `i` touches a name, as `touches_name` says of one a token was cut before.
 pub fn follows_name(src: Bytes, i: Int) -> Bool / {abort.raise} = {
   let from = iterate(i, i + 1, |j: Int|
-    if is_ident_continue(src.peek(j - 1)) { Continue(j - 1) } else { Stop(j) });
+    if is_identifier_continue(src.peek(j - 1)) { Continue(j - 1) } else { Stop(j) });
   let word = src.slice(from, i);
-  from < i && is_ident_start(src.at(from)) && word != b"b" && word != b"_" && !is_keyword(word)
+  from < i && is_identifier_start(src.at(from)) && word != b"b" && word != b"_" && !is_keyword(word)
 }
 
-fn ranges(src: Bytes, i: Int) -> Bool / {abort.raise} = {
+fn followed_by_for(src: Bytes, i: Int) -> Bool / {abort.raise} = {
   let j = skip_trivia(src, i);
   src.peek(j) == 102 && src.peek(j + 1) == 111 && src.peek(j + 2) == 114
-    && !is_ident_continue(src.peek(j + 3))
+    && !is_identifier_continue(src.peek(j + 3))
 }
 
-/// What stands open at `i`, innermost last: `-1` a template's text, `-2` a string's, and a hole by
-/// the braces open inside it.
-type Closing = { i: Int, open: List<Int> }
+type TemplateScan = { i: Int, open: List<Int> }
 
-/// Past the quote of a character literal that opens at `i`.
 fn char_end(src: Bytes, i: Int) -> Int / {abort.raise} =
   src.skip_until(if src.peek(i + 1) == 92 { i + 3 } else { i + 2 }, b"'\n") + 1
 
-/// Where the label opening at `start` would close were it a template: an interpolated string's
-/// text, each hole counted through the strings, characters and braces it holds, all on one line.
 fn template_end(src: Bytes, start: Int) -> Option<Int> / {abort.raise} = {
   let line = src.skip_until(start, b"\n");
-  iterate({ i: start + 1, open: [-1] }, line - start + 2, |s: Closing| {
+  iterate({ i: start + 1, open: [-1] }, line - start + 2, |s: TemplateScan| {
     let c = src.peek(s.i);
     let top = match s.open.at(s.open.len() - 1) { Some(k) -> k, None -> -1 };
     let rest = s.open.drop_last(1);
@@ -1103,7 +1014,7 @@ fn template_end(src: Bytes, start: Int) -> Option<Int> / {abort.raise} = {
       else { Continue({ i: s.i + 1, open: s.open }) }
     } else if c == 34 {
       Continue({ i: s.i + 1, open: s.open.push(if follows_name(src, s.i) { -1 } else { -2 }) })
-    } else if c == 102 && src.peek(s.i + 1) == 34 && !is_ident_continue(src.peek(s.i - 1)) {
+    } else if c == 102 && src.peek(s.i + 1) == 34 && !is_identifier_continue(src.peek(s.i - 1)) {
       Continue({ i: s.i + 2, open: s.open.push(-1) })
     } else if c == 39 { Continue({ i: char_end(src, s.i), open: s.open }) }
     else if c == 123 { Continue({ i: s.i + 1, open: rest.push(top + 1) }) } else if c == 125 {
@@ -1112,44 +1023,39 @@ fn template_end(src: Bytes, start: Int) -> Option<Int> / {abort.raise} = {
   })
 }
 
-/// A label before `for` is a template, its holes an interpolated string's; any other is a string.
-fn label(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
-  let templated = match template_end(src, start) { Some(fin) -> ranges(src, fin), None -> false };
+fn lex_test_label(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
+  let templated = match template_end(src, start) {
+    Some(token_end) -> followed_by_for(src, token_end),
+    None -> false,
+  };
   if templated { interpolated_piece(src, scanner, start, start + 1, true) }
-  else { string_lit(src, scanner, start) }
+  else { string_literal(src, scanner, start) }
 }
 
-/// A brace opened or closed inside the innermost hole; outside every hole there is nothing to count.
-fn nest_hole(scanner: Scanner, d: Int) -> Scanner =
+fn adjust_hole_braces(scanner: Scanner, d: Int) -> Scanner =
   match scanner.holes.at(scanner.holes.len() - 1) {
     None -> scanner,
     Some(k) -> with_holes(scanner, scanner.holes.drop_last(1).push(k + d)),
   }
 
-/// A `}` with no brace of its own open inside the innermost hole ends that hole.
 fn closes_hole(scanner: Scanner) -> Bool =
   match scanner.holes.at(scanner.holes.len() - 1) { Some(k) -> k == 0, None -> false }
 
 fn valid_escapes() -> Bytes = b"valid escapes are \\n \\t \\r \\0 \\\\ \\\" \\' and \\u{...}"
 
-// --- Escapes shared by strings and characters --------------------------------
-
-/// What an escape names: a Unicode scalar value, or `-1` with the refusal in `code` and `message`.
 type Escape = { point: Int, end: Int, code: Bytes, message: Bytes, label: Bytes }
 
-fn escape_at(point: Int, end: Int) -> Escape =
+fn valid_escape(point: Int, end: Int) -> Escape =
   { point: point, end: end, code: b"", message: b"", label: b"" }
 
-fn bad_escape(end: Int, code: Bytes, message: Bytes, label: Bytes) -> Escape =
-  { point: -1, end: end, code: code, message: message, label: label }
+fn bad_escape(end: Int, code: Bytes, message: Bytes, lex_test_label: Bytes) -> Escape =
+  { point: -1, end: end, code: code, message: message, label: lex_test_label }
 
-fn refused(scanner: Scanner, at_backslash: Int, escape: Escape) -> Scanner =
+fn push_escape_error(scanner: Scanner, at_backslash: Int, escape: Escape) -> Scanner =
   push_error(scanner, at_backslash, escape.end, escape.code, escape.message, escape.label)
 
 fn hex_chars() -> Bytes = b"0123456789abcdefABCDEF"
 
-/// `\u{1F600}` at the backslash `i`: one to six hex digits between braces, naming a Unicode scalar
-/// value. Only the braces and digits present are consumed, so a closing quote survives a malformed one.
 fn unicode_escape(src: Bytes, i: Int) -> Escape / {abort.raise} =
   if src.peek(i + 2) != 123 {
     bad_escape(
@@ -1178,11 +1084,10 @@ fn unicode_escape(src: Bytes, i: Int) -> Escape / {abort.raise} =
           b"`\\u{...}` names no character",
           b"a surrogate, `D800` to `DFFF`, or a value past `10FFFF` is not a Unicode scalar value",
         )
-      } else { escape_at(v, stop + 1) }
+      } else { valid_escape(v, stop + 1) }
     }
   }
 
-/// What a one-letter escape names inside single quotes, or `-1` for any other letter.
 fn letter_escape(c: Int) -> Int =
   if c == 110 { 10 }
   else if c == 116 { 9 }
@@ -1191,10 +1096,9 @@ fn letter_escape(c: Int) -> Int =
   else if c == 92 || c == 39 || c == 34 { c }
   else { 0 - 1 }
 
-/// The escape at the backslash `i` inside a character literal.
 fn char_escape(src: Bytes, i: Int) -> Escape / {abort.raise} = {
   let c = src.peek(i + 1);
-  if letter_escape(c) >= 0 { escape_at(letter_escape(c), i + 2) }
+  if letter_escape(c) >= 0 { valid_escape(letter_escape(c), i + 2) }
   else if c == 117 { unicode_escape(src, i) } else if c < 0 || c == 10 {
     bad_escape(i + 1, unterminated(), b"unterminated character literal", b"add a closing `'`")
   } else {
@@ -1208,7 +1112,6 @@ fn char_escape(src: Bytes, i: Int) -> Escape / {abort.raise} = {
   }
 }
 
-/// A scalar value as its UTF-8 bytes.
 pub fn utf8_of(v: Int) -> Bytes / {abort.raise} =
   if v < 128 { byte_of_int(v) }
   else if v < 2048 { byte_of_int(192 | v >> 6).concat(byte_of_int(128 | v & 63)) }
@@ -1227,8 +1130,7 @@ pub fn utf8_of(v: Int) -> Bytes / {abort.raise} =
     ])
   }
 
-/// The scalar value of the `w`-byte UTF-8 sequence at `i`; the source is UTF-8 by the time it is lexed.
-fn utf8_point(src: Bytes, i: Int, w: Int) -> Int =
+fn utf8_code_point(src: Bytes, i: Int, w: Int) -> Int =
   if w == 1 { src.peek(i) }
   else if w == 2 { (src.peek(i) & 31) << 6 | src.peek(i + 1) & 63 }
   else if w == 3 { (src.peek(i) & 15) << 12 | (src.peek(i + 1) & 63) << 6 | src.peek(i + 2) & 63 }
@@ -1237,10 +1139,7 @@ fn utf8_point(src: Bytes, i: Int, w: Int) -> Int =
       | src.peek(i + 3) & 63
   }
 
-// --- Character literals -----------------------------------------------------
-
-/// `'a'`, `'\n'` or `'\u{1F600}'`: exactly one character between single quotes.
-fn char_lit(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} = {
+fn char_literal(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} = {
   let c = src.peek(open + 1);
   if c < 0 || c == 10 { unterminated_char(scanner, open, open + 1, CharLiteral(0)) }
   else if c == 39 {
@@ -1259,20 +1158,18 @@ fn char_lit(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} 
     )
   } else if c == 92 {
     let e = char_escape(src, open + 1);
-    if e.point < 0 { char_close(src, refused(scanner, open + 1, e), open, e.end, CharLiteral(0)) }
-    else { char_close(src, scanner, open, e.end, CharLiteral(e.point)) }
+    if e.point < 0 {
+      char_close(src, push_escape_error(scanner, open + 1, e), open, e.end, CharLiteral(0))
+    } else { char_close(src, scanner, open, e.end, CharLiteral(e.point)) }
   } else {
     let w = utf8_len(c);
-    char_close(src, scanner, open, open + 1 + w, CharLiteral(utf8_point(src, open + 1, w)))
+    char_close(src, scanner, open, open + 1 + w, CharLiteral(utf8_code_point(src, open + 1, w)))
   }
 }
 
-/// What a single-quoted literal holds one of, for its refusals: a byte literal lexes as an `Int`.
 fn quoted_unit(kind: TokenKind) -> Bytes =
   match kind { CharLiteral(_) -> b"character", _ -> b"byte" }
 
-/// The closing quote after the one character or byte, the literal opening at `start`; more before
-/// it is refused, and so is none on the line.
 fn char_close(
   src: Bytes,
   scanner: Scanner,
@@ -1317,11 +1214,7 @@ fn unterminated_char(scanner: Scanner, start: Int, stop: Int, kind: TokenKind) -
     kind,
   )
 
-// --- Byte literals ----------------------------------------------------------
-
-/// `b'a'`, `b'\n'` or `b'\x1f'`: one ASCII character or one escape between single quotes, lexed as
-/// the `Int` that byte is.
-fn byte_lit(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
+fn byte_literal(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise} = {
   let at = start + 2;
   let c = src.peek(at);
   if c < 0 || c == 10 { unterminated_char(scanner, start, at, IntLiteral(0)) } else if c == 39 {
@@ -1340,8 +1233,9 @@ fn byte_lit(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise}
     )
   } else if c == 92 {
     let e = byte_escape(src, at);
-    if e.point < 0 { char_close(src, refused(scanner, at, e), start, e.end, IntLiteral(0)) }
-    else { char_close(src, scanner, start, e.end, IntLiteral(e.point)) }
+    if e.point < 0 {
+      char_close(src, push_escape_error(scanner, at, e), start, e.end, IntLiteral(0))
+    } else { char_close(src, scanner, start, e.end, IntLiteral(e.point)) }
   } else if c >= 128 {
     let w = utf8_len(c);
     char_close(
@@ -1365,13 +1259,12 @@ fn byte_lit(src: Bytes, scanner: Scanner, start: Int) -> Scanner / {abort.raise}
   } else { char_close(src, scanner, start, at + 1, IntLiteral(c)) }
 }
 
-/// The escape at the backslash `i` inside a byte literal: a byte string's, and `\'`.
 fn byte_escape(src: Bytes, i: Int) -> Escape / {abort.raise} = {
   let c = src.peek(i + 1);
-  if letter_escape(c) >= 0 { escape_at(letter_escape(c), i + 2) } else if c == 120 {
+  if letter_escape(c) >= 0 { valid_escape(letter_escape(c), i + 2) } else if c == 120 {
     let hi = hex_value(src.peek(i + 2));
     let lo = hex_value(src.peek(i + 3));
-    if hi >= 0 && lo >= 0 { escape_at(hi * 16 + lo, i + 4) } else {
+    if hi >= 0 && lo >= 0 { valid_escape(hi * 16 + lo, i + 4) } else {
       bad_escape(
         if hi >= 0 { i + 3 } else { i + 2 },
         unexpected(),
@@ -1399,45 +1292,43 @@ fn byte_escape(src: Bytes, i: Int) -> Escape / {abort.raise} = {
   }
 }
 
-// --- Line strings -----------------------------------------------------------
-
-/// A line string, a line a round: each round passes at least the line's `\\` and newline.
 fn line_string(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} =
-  iterate({ scanner: scanner, line: open, done: [] }, src.len() - open + 2, |at: LinesAt|
+  iterate({ scanner: scanner, line: open, done: [] }, src.len() - open + 2, |at: LineStringScan|
     string_line(src, open, at))
 
-/// Where a line string's next line starts, at its `\\`, and the lines read so far.
-type LinesAt = { scanner: Scanner, line: Int, done: List<Bytes> }
+type LineStringScan = { scanner: Scanner, line: Int, done: List<Bytes> }
 
-/// A `\r` before a line's `\n` ends the line rather than being content.
-fn string_line(src: Bytes, open: Int, at: LinesAt) -> Iter<LinesAt, Scanner> / {abort.raise} = {
+fn string_line(
+  src: Bytes,
+  open: Int,
+  at: LineStringScan,
+) -> Iter<LineStringScan, Scanner> / {abort.raise} = {
   let scanner = at.scanner;
   let from = at.line + 2;
   let eol = src.skip_until(from, b"\n");
-  let fin = if eol > from && src.peek(eol - 1) == 13 { eol - 1 } else { eol };
-  let blank = scan_back(src, from, fin);
-  let checked = if blank == fin { scanner } else {
+  let token_end = if eol > from && src.peek(eol - 1) == 13 { eol - 1 } else { eol };
+  let blank = trailing_space_start(src, from, token_end);
+  let checked = if blank == token_end { scanner } else {
     push_error(
       scanner,
       blank,
-      fin,
+      token_end,
       unexpected(),
       b"a line of a line string ends in whitespace",
       b"whitespace at the end of a line is invisible, so it is not content; end the line before it, or write the line as a `\"...\"` string with the spaces in it",
     )
   };
-  let lines = at.done.push(src.slice(from, fin));
+  let lines = at.done.push(src.slice(from, token_end));
   let next = continued_at(src, eol);
-  if next < 0 { Stop(push_token(checked, open, fin, LineString(joined_lines(lines)))) }
+  if next < 0 { Stop(push_token(checked, open, token_end, LineString(joined_lines(lines)))) }
   else { Continue({ scanner: checked, line: next, done: lines }) }
 }
 
-fn scan_back(src: Bytes, from: Int, fin: Int) -> Int / {abort.raise} =
-  iterate(fin, fin - from + 1, |i: Int|
+fn trailing_space_start(src: Bytes, from: Int, token_end: Int) -> Int / {abort.raise} =
+  iterate(token_end, token_end - from + 1, |i: Int|
     if i > from && (src.peek(i - 1) == 32 || src.peek(i - 1) == 9) { Continue(i - 1) }
     else { Stop(i) })
 
-/// The `\\` continuing a line string on the line after `eol`, or -1.
 fn continued_at(src: Bytes, eol: Int) -> Int / {abort.raise} =
   if src.peek(eol) != 10 { -1 } else {
     let k = src.skip(eol + 1, b" \t");
@@ -1453,20 +1344,15 @@ fn joined_lines(lines: List<Bytes>) -> Bytes =
       }),
   )
 
-// --- Byte-string literals ---------------------------------------------------
-
-/// A byte above `~` is refused rather than encoded, so the literal cannot depend on the file's encoding.
 fn bytes_stops() -> Bytes / {abort.raise} = b"\"\\\n".concat(high_bytes())
 
-/// A byte string's text, a run to the next stop a round: each round passes at least one byte.
-fn bytes_lit(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} =
-  iterate({ scanner: scanner, i: open + 2, acc: b"" }, src.len() - open + 2, |at: TextAt|
+fn bytes_literal(src: Bytes, scanner: Scanner, open: Int) -> Scanner / {abort.raise} =
+  iterate({ scanner: scanner, i: open + 2, acc: b"" }, src.len() - open + 2, |at: TextScan|
     bytes_body(src, open, at))
 
-/// Where a literal's text has been read to, and what it has read.
-type TextAt = { scanner: Scanner, i: Int, acc: Bytes }
+type TextScan = { scanner: Scanner, i: Int, acc: Bytes }
 
-fn bytes_body(src: Bytes, open: Int, at: TextAt) -> Iter<TextAt, Scanner> / {abort.raise} = {
+fn bytes_body(src: Bytes, open: Int, at: TextScan) -> Iter<TextScan, Scanner> / {abort.raise} = {
   let stop = src.skip_until(at.i, bytes_stops());
   let so_far = at.acc.concat(src.slice(at.i, stop));
   let c = src.peek(stop);
@@ -1518,7 +1404,7 @@ fn bytes_escape(
   open: Int,
   stop: Int,
   so_far: Bytes,
-) -> Iter<TextAt, Scanner> / {abort.raise} = {
+) -> Iter<TextScan, Scanner> / {abort.raise} = {
   let n = src.len();
   let c = src.peek(stop + 1);
   let past = |text: Bytes| Continue({ scanner: scanner, i: stop + 2, acc: so_far.concat(text) });
@@ -1545,7 +1431,6 @@ fn bytes_escape(
   else if c == 92 { past(b"\\") }
   else if c == 34 { past(b"\"") }
   else if c == 120 { hex_escape(src, scanner, stop, so_far) } else if c == 117 {
-    // Consumed whole, so what follows reads as the literal's next bytes.
     let u = unicode_escape(src, stop);
     Continue({
       scanner: push_error(
@@ -1560,7 +1445,6 @@ fn bytes_escape(
       acc: so_far,
     })
   } else {
-    // Unlike a string's unknown escape, this one contributes no byte.
     let w = utf8_len(c);
     Continue({
       scanner: unknown_escape(
@@ -1576,13 +1460,12 @@ fn bytes_escape(
   }
 }
 
-/// A malformed escape yields a zero byte and consumes only the hex digits present, so the closing quote survives.
 fn hex_escape(
   src: Bytes,
   scanner: Scanner,
   stop: Int,
   so_far: Bytes,
-) -> Iter<TextAt, Scanner> / {abort.raise} = {
+) -> Iter<TextScan, Scanner> / {abort.raise} = {
   let hi = hex_value(src.peek(stop + 2));
   let lo = hex_value(src.peek(stop + 3));
   if hi >= 0 && lo >= 0 {
@@ -1604,14 +1487,12 @@ fn hex_escape(
   }
 }
 
-// --- Punctuation ------------------------------------------------------------
-
-/// Maximal munch.
-fn punct(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.raise} =
+fn punctuation(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.raise} =
   if c == 40 { push_token(scanner, start, start + 1, Punctuation(b"lparen")) }
   else if c == 41 { push_token(scanner, start, start + 1, Punctuation(b"rparen")) }
-  else if c == 123 { push_token(nest_hole(scanner, 1), start, start + 1, Punctuation(b"lbrace")) }
-  else if c == 125 && closes_hole(scanner) {
+  else if c == 123 {
+    push_token(adjust_hole_braces(scanner, 1), start, start + 1, Punctuation(b"lbrace"))
+  } else if c == 125 && closes_hole(scanner) {
     interpolated_piece(
       src,
       with_holes(scanner, scanner.holes.drop_last(1)),
@@ -1620,23 +1501,22 @@ fn punct(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.r
       false,
     )
   } else if c == 125 {
-    push_token(nest_hole(scanner, -1), start, start + 1, Punctuation(b"rbrace"))
+    push_token(adjust_hole_braces(scanner, -1), start, start + 1, Punctuation(b"rbrace"))
   } else if c == 91 { push_token(scanner, start, start + 1, Punctuation(b"lbracket")) }
   else if c == 93 { push_token(scanner, start, start + 1, Punctuation(b"rbracket")) }
   else if c == 44 { push_token(scanner, start, start + 1, Punctuation(b"comma")) }
   else if c == 59 { push_token(scanner, start, start + 1, Punctuation(b"semi")) }
   else { operator(src, scanner, start, c) }
 
-/// What `punct` reads past the brackets and separators.
 fn operator(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abort.raise} =
-  if c == 58 { punct_pair(scanner, src, start, 58, b"coloncolon", b"colon") }
+  if c == 58 { punctuation_pair(scanner, src, start, 58, b"coloncolon", b"colon") }
   else if c == 46 && src.peek(start + 1) == 46 && src.peek(start + 2) == 61 {
     push_token(scanner, start, start + 3, Punctuation(b"dotdoteq"))
-  } else if c == 46 { punct_pair(scanner, src, start, 46, b"dotdot", b"dot") }
-  else if c == 61 { punct_pair(scanner, src, start, 61, b"eqeq", b"eq") }
-  else if c == 33 { punct_pair(scanner, src, start, 61, b"bangeq", b"bang") }
-  else if c == 60 { punct_pair(scanner, src, start, 61, b"le", b"lt") }
-  else if c == 62 { punct_pair(scanner, src, start, 61, b"ge", b"gt") }
+  } else if c == 46 { punctuation_pair(scanner, src, start, 46, b"dotdot", b"dot") }
+  else if c == 61 { punctuation_pair(scanner, src, start, 61, b"eqeq", b"eq") }
+  else if c == 33 { punctuation_pair(scanner, src, start, 61, b"bangeq", b"bang") }
+  else if c == 60 { punctuation_pair(scanner, src, start, 61, b"le", b"lt") }
+  else if c == 62 { punctuation_pair(scanner, src, start, 61, b"ge", b"gt") }
   else if c == 43 && src.peek(start + 1) != 43 { arithmetic(scanner, src, start, b"plus") }
   else if c == 43 { push_token(scanner, start, start + 2, Punctuation(b"plusplus")) }
   else if c == 45 && src.peek(start + 1) != 62 { arithmetic(scanner, src, start, b"minus") }
@@ -1647,13 +1527,12 @@ fn operator(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abor
   else if c == 63 && src.peek(start + 1) == 63 && src.peek(start + 2) == 63 {
     push_token(scanner, start, start + 3, Punctuation(b"hole"))
   } else if c == 63 { push_token(scanner, start, start + 1, Punctuation(b"question")) }
-  else if c == 124 { punct_pair(scanner, src, start, 124, b"pipepipe", b"pipe") }
-  // `<<` and `>>` are not lexed, so `Map<Int, List<Int>>` closes; the parser joins touching `<`s and `>`s.
-  else if c == 38 { punct_pair(scanner, src, start, 38, b"ampamp", b"amp") }
+  else if c == 124 { punctuation_pair(scanner, src, start, 124, b"pipepipe", b"pipe") }
+  else if c == 38 { punctuation_pair(scanner, src, start, 38, b"ampamp", b"amp") }
   else if c == 94 { push_token(scanner, start, start + 1, Punctuation(b"caret")) }
   else if c == 126 { push_token(scanner, start, start + 1, Punctuation(b"tilde")) }
   else if c == 35 && src.peek(start + 1) == 123 {
-    push_token(nest_hole(scanner, 1), start, start + 2, Punctuation(b"hashbrace"))
+    push_token(adjust_hole_braces(scanner, 1), start, start + 2, Punctuation(b"hashbrace"))
   } else if c == 35 && src.peek(start + 1) == 91 {
     push_token(scanner, start, start + 2, Punctuation(b"hashbracket"))
   } else if c == 35 {
@@ -1676,8 +1555,6 @@ fn operator(src: Bytes, scanner: Scanner, start: Int, c: Int) -> Scanner / {abor
     )
   }
 
-/// `+`, `-` or `*`, and with a `%` or a `|` touching it the operator that wraps or saturates:
-/// `+%` is `pluspercent` and `+|` is `pluspipe`.
 fn arithmetic(scanner: Scanner, src: Bytes, start: Int, single: Bytes) -> Scanner = {
   let next = src.peek(start + 1);
   if next == 37 { push_token(scanner, start, start + 2, Punctuation(single.concat(b"percent"))) }
@@ -1685,7 +1562,7 @@ fn arithmetic(scanner: Scanner, src: Bytes, start: Int, single: Bytes) -> Scanne
   else { push_token(scanner, start, start + 1, Punctuation(single)) }
 }
 
-fn punct_pair(
+fn punctuation_pair(
   scanner: Scanner,
   src: Bytes,
   start: Int,
@@ -1696,14 +1573,11 @@ fn punct_pair(
   if src.peek(start + 1) == second { push_token(scanner, start, start + 2, Punctuation(both)) }
   else { push_token(scanner, start, start + 1, Punctuation(single)) }
 
-// --- The dump ---------------------------------------------------------------
-
-/// `start:end:kind[:payload];` per token, then `start:end:!:code;` per diagnostic.
 pub fn dump(src: Bytes) -> String / {abort.raise} = {
   let lx = lex(src);
   String::of_bytes(
     Bytes::concat_all(lx.tokens.map(render_token)).concat(
-      Bytes::concat_all(lx.diags.map(render_diag)),
+      Bytes::concat_all(lx.diagnostics.map(render_diagnostic)),
     ),
   )
 }
@@ -1718,13 +1592,13 @@ fn render_token(token: Token) -> Bytes / {abort.raise} =
     b";",
   ])
 
-fn render_diag(diag: Diag) -> Bytes =
+fn render_diagnostic(diagnostic: Diagnostic) -> Bytes =
   Bytes::concat_all([
-    ascii_of_int(diag.start),
+    ascii_of_int(diagnostic.start),
     b":",
-    ascii_of_int(diag.end),
+    ascii_of_int(diagnostic.end),
     b":!:",
-    diag.code,
+    diagnostic.code,
     b";",
   ])
 
@@ -1748,8 +1622,6 @@ fn token_body(kind: TokenKind) -> Bytes / {abort.raise} =
     Punctuation(b) -> b"p:".concat(b),
     EndOfInput -> b"e",
   }
-
-// --- Tests ------------------------------------------------------------------
 
 test "a keyword and an identifier that starts with one are different tokens" {
   assert_eq(dump(b"fn fnord"), "0:2:k:fn;3:8:i:fnord;8:8:e;")
@@ -1794,7 +1666,6 @@ test "an unterminated string reports from its opening quote" {
 }
 
 test "a line string runs from its backslashes to the end of the line, verbatim" {
-  // `a"\n` and two backslashes, as written: nothing in a line string is an escape.
   assert_eq(dump(b"\\\\a\"\\n\\\\\nx"), "0:8:l:61225c6e5c5c;9:10:i:x;10:10:e;")
 }
 
@@ -2024,9 +1895,7 @@ test "a test's label is a template before `for`, and a string before anything el
     "0:4:k:test;5:9:F:6120;9:10:i:x;10:12:T:;13:16:i:for;16:16:e;",
   );
   assert_eq(dump(b"test \"a {x}\" {"), "0:4:k:test;5:12:s:61207b787d;13:14:p:lbrace;14:14:e;");
-  // A name that only begins with `for` ranges over nothing.
   assert_eq(dump(b"test \"a {x}\" form"), "0:4:k:test;5:12:s:61207b787d;13:17:i:form;17:17:e;");
-  // Any other string keeps its braces, whatever follows it.
   assert_eq(
     dump(b"f(\"a {x}\") for"),
     "0:1:i:f;1:2:p:lparen;2:9:s:61207b787d;9:10:p:rparen;11:14:i:for;14:14:e;",

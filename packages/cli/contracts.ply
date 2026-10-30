@@ -1,25 +1,20 @@
-//! What a package promises the packages that depend on it, definition by definition, and what moved
-//! between two of its versions. `ply publish` holds a version to the bump its changes need: a patch
-//! moves no contract, a minor only adds, a major may change anything. `ply contracts NAME OLD NEW`
-//! lists what moved between two published versions.
-
 import args (Flags, style_of, root_of)
 import std.cli (Parsed)
 import std.env (env)
-import paths (Resolved, here)
-import registry (Base, base_of, unasked, unset, untakeable, variable)
-import remote (Consumed, consumed, index_of)
-import report (Answer, indent, ok_code, count_of, reported)
+import paths (ResolvedPath, here)
+import registry (BaseUrl, base_of, registry_unreachable, unset, rejected_package, url_variable)
+import remote (FetchedClosure, fetch_closure, index_of)
+import report (CommandOutput, indent, ok_code, count_of, reported)
 import sources (shipping_for)
 import std.term (Style, bold, green, yellow)
 import builder (builder)
 import compiler.front.published (no_rows)
 import compiler.front.seam (Analysed, Refused)
 import compiler.front.facts (Analysis)
-import compiler.front (Embedded, Shipping, analyse_pulling_std_with)
+import compiler.front (EmbedRecord, ShippedInputs, analyse_pulling_std_with)
 import compiler.store.hash (Contract, public_contracts)
-import compiler.front.pkg (PackageSources, Supplied, is_dotted_path)
-import compiler.check.resolve.tables (Diag, Source, error_at)
+import compiler.front.pkg (PackageSources, SuppliedPackage, is_dotted_path)
+import compiler.check.resolve.tables (Diagnostic, Source, error_at)
 import std.fs (fs)
 import std.json (Json, Array, Bool, Number, Str, object)
 import std.net (net)
@@ -29,18 +24,12 @@ import std.list
 import std.option
 import compiler.syntax.parsing (no_module, dummy_span)
 
-// --- A package as its consumers read it ------------------------------------------------
-// A root of no modules that depends on the package from the registry, whose slot holds its sources:
-// the package's modules are named as every consumer names them, and nothing of the root reaches
-// what its analysis answers.
-
 fn version_text(version: Version) -> String =
   "{ major: " ++ version.major.to_string() ++ ", minor: " ++ version.minor.to_string()
     ++ ", patch: "
     ++ version.patch.to_string()
     ++ " }"
 
-/// A root name no package calls itself by: an identifier no registry name carries.
 fn consumer_name() -> String = "consumer_of_a_published_package"
 
 fn consumer_manifest(manifest: Manifest) -> Bytes =
@@ -57,32 +46,32 @@ fn consumer_manifest(manifest: Manifest) -> Bytes =
       ++ ", source: Registry }], entry: None }\n",
   )
 
-/// The package `own` under `root`'s slot for it, beside `deps`, as a consumer's load analyses it.
 pub type Consumer = {
-  pkgs: PackageSources,
+  packages: PackageSources,
   whole: Analysis,
   modules: List<Bytes>,
-  shipping: Shipping,
+  shipping: ShippedInputs,
 }
 
-pub fn as_consumed(
+pub fn analyse_as_consumer(
   root: Bytes,
   manifest: Manifest,
-  own: Supplied,
-  deps: List<Supplied>,
-  embeds: List<Embedded>,
-) -> Result<Consumer, List<Diag>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let pkgs: PackageSources = {
+  own: SuppliedPackage,
+  dependencies: List<SuppliedPackage>,
+  embeds: List<EmbedRecord>,
+) -> Result<Consumer, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let packages: PackageSources = {
     root: root,
     manifest: Some(consumer_manifest(manifest)),
-    supplied: deps.fold([own], |acc: List<Supplied>, s: Supplied| acc.push(s)),
+    supplied: dependencies.fold([own], |acc: List<SuppliedPackage>, s: SuppliedPackage|
+      acc.push(s)),
   };
-  let shipping = shipping_for([], pkgs);
+  let shipping = shipping_for([], packages);
   match analyse_pulling_std_with(
       [],
       shipping.read,
       no_rows(),
-      pkgs,
+      packages,
       embeds,
       unread: shipping.unread,
       data: shipping.data,
@@ -91,7 +80,7 @@ pub fn as_consumed(
     Analysed(w) -> {
       let prefix = Bytes::of_string(prefix_of(manifest));
       Ok({
-        pkgs: pkgs,
+        packages: packages,
         whole: w,
         modules: own.modules.map(|s: Source| Bytes::concat_all([prefix, b".", s.name])),
         shipping: shipping,
@@ -100,40 +89,36 @@ pub fn as_consumed(
   }
 }
 
-/// What the consumed package promises: each public definition's contract and each public
-/// declaration's hash.
 pub fn promised(c: Consumer) -> List<Contract> / {abort.raise} = {
   let mine = c.modules.fold(Map::new(), |acc: Map<Bytes, Bool>, m: Bytes| acc.insert(m, true));
   public_contracts(c.whole.index, c.whole.hashes, |m: Bytes| mine.contains(m))
 }
 
-// --- What moved -----------------------------------------------------------------
+pub type ContractChanges = { added: List<String>, changed: List<String>, removed: List<String> }
 
-pub type Moved = { added: List<String>, changed: List<String>, removed: List<String> }
-
-fn keyed(cs: List<Contract>) -> Map<Bytes, Contract> =
+fn by_key(cs: List<Contract>) -> Map<Bytes, Contract> =
   cs.fold(Map::new(), |acc: Map<Bytes, Contract>, c: Contract|
-    acc.insert(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name), c))
+    acc.insert(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name), c))
 
 fn shown_name(c: Contract) -> String = String::of_bytes_lossy(c.name)
 
-pub fn moved(was: List<Contract>, now: List<Contract>) -> Moved = {
-  let before = keyed(was);
-  let after = keyed(now);
+pub fn contract_changes(was: List<Contract>, now: List<Contract>) -> ContractChanges = {
+  let before = by_key(was);
+  let after = by_key(now);
   {
     added: now.filter(|c: Contract|
-      !before.contains(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name))).map(
+      !before.contains(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name))).map(
       shown_name,
     ),
     changed: now.filter(|c: Contract|
-      match before.get(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name)) {
+      match before.get(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name)) {
         Some(b) -> b.hash != c.hash,
         None -> false,
       }).map(
       shown_name,
     ),
     removed: was.filter(|c: Contract|
-      !after.contains(Bytes::concat(if c.decl { b"t " } else { b"v " }, c.name))).map(
+      !after.contains(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name))).map(
       shown_name,
     ),
   }
@@ -146,25 +131,21 @@ fn rank(b: Bump) -> Int = match b { Patch -> 0, Minor -> 1, Major -> 2 }
 pub fn bump_word(b: Bump) -> String =
   match b { Patch -> "patch", Minor -> "minor", Major -> "major" }
 
-/// The least bump a version's moves need.
-pub fn needed(m: Moved) -> Bump =
+pub fn required_bump(m: ContractChanges) -> Bump =
   if m.changed.len() > 0 || m.removed.len() > 0 { Major }
   else if m.added.len() > 0 { Minor }
   else { Patch }
 
-/// Which place of the version moved from `was` to `now`, which is above it.
-pub fn bumped(was: Version, now: Version) -> Bump =
+pub fn bump_between(was: Version, now: Version) -> Bump =
   if now.major != was.major { Major } else if now.minor != was.minor { Minor } else { Patch }
 
-/// The least version above `was` a bump of `b` makes.
-fn least(was: Version, b: Bump) -> Version =
+fn least_version(was: Version, b: Bump) -> Version =
   match b {
     Major -> { major: was.major + 1, minor: 0, patch: 0 },
     Minor -> { major: was.major, minor: was.minor + 1, patch: 0 },
     Patch -> { major: was.major, minor: was.minor, patch: was.patch + 1 },
   }
 
-/// The version a new one is held to: the highest published below it that is not yanked.
 pub fn previous(index: Index, now: Version) -> Option<Release> =
   index.versions.fold(None, |best: Option<Release>, release: Release|
     if release.yanked || compare(release.version, now) != Less { best } else {
@@ -174,47 +155,52 @@ pub fn previous(index: Index, now: Version) -> Option<Release> =
       }
     })
 
-fn listed(names: List<String>) -> String =
+fn quoted_names(names: List<String>) -> String =
   names.fold("", |acc: String, n: String|
     if acc == "" { "`" ++ n ++ "`" } else { acc ++ ", `" ++ n ++ "`" })
 
-fn what_moved(m: Moved, b: Bump) -> String =
-  if b == Minor { "adds " ++ listed(m.added) } else {
+fn change_summary(m: ContractChanges, b: Bump) -> String =
+  if b == Minor { "adds " ++ quoted_names(m.added) } else {
     match ((m.changed, m.removed)) {
-      ([], removed) -> "removes " ++ listed(removed),
-      (changed, []) -> "changes what " ++ listed(changed) ++ " promises",
+      ([], removed) -> "removes " ++ quoted_names(removed),
+      (changed, []) -> "changes what " ++ quoted_names(changed) ++ " promises",
       (changed, removed) ->
-        "changes what " ++ listed(changed) ++ " promises and removes " ++ listed(removed),
+        "changes what " ++ quoted_names(changed) ++ " promises and removes "
+          ++ quoted_names(removed),
     }
   }
 
-/// Why `now` cannot follow `was` as `name`'s next version, when its moves need a larger bump.
-pub fn refusal(name: String, was: Version, now: Version, m: Moved) -> Option<Diag> = {
-  let need = needed(m);
-  let made = bumped(was, now);
-  if rank(made) >= rank(need) { None } else {
+pub fn bump_error(
+  name: String,
+  was: Version,
+  now: Version,
+  m: ContractChanges,
+) -> Option<Diagnostic> = {
+  let need = required_bump(m);
+  let actual_bump = bump_between(was, now);
+  if rank(actual_bump) >= rank(need) { None } else {
     Some(
       error_at(
         b"E0150",
         no_module(),
         dummy_span(),
         Bytes::of_string(
-          "`" ++ name ++ "` " ++ render_version(now) ++ " is a " ++ bump_word(made) ++ " of "
+          "`" ++ name ++ "` " ++ render_version(now) ++ " is a " ++ bump_word(actual_bump) ++ " of "
             ++ render_version(was)
             ++ ", and it "
-            ++ what_moved(m, need),
+            ++ change_summary(m, need),
         ),
         b"a version must say what its changes are",
         [
           b"a patch moves no definition's contract, a minor only adds definitions, and a major may change anything",
-          Bytes::of_string("publish it as " ++ render_version(least(was, need)) ++ " or later"),
+          Bytes::of_string(
+            "publish it as " ++ render_version(least_version(was, need)) ++ " or later",
+          ),
         ],
       ),
     )
   }
 }
-
-// --- `ply contracts NAME OLD NEW` ------------------------------------------------------
 
 pub type Options = { name: String, from: String, to: String }
 
@@ -225,13 +211,14 @@ pub fn options_from(parsed: Parsed) -> Options =
     to: parsed.positionals.at_or(2, ""),
   }
 
-fn version_of(text: String) -> Result<Version, Diag> / {abort.raise} =
+fn version_of(text: String) -> Result<Version, Diagnostic> / {abort.raise} =
   match parse_version(text) {
     Some(v) -> Ok(v),
-    None -> Err(untakeable("`" ++ text ++ "` is not a version", [b"a version reads like `0.2.0`"])),
+    None ->
+      Err(rejected_package("`" ++ text ++ "` is not a version", [b"a version reads like `0.2.0`"])),
   }
 
-pub fn unpublished(name: String, version: Version) -> Diag =
+pub fn unpublished(name: String, version: Version) -> Diagnostic =
   error_at(
     b"E0143",
     no_module(),
@@ -241,19 +228,24 @@ pub fn unpublished(name: String, version: Version) -> Diag =
     [],
   )
 
-/// The contracts of one published version, analysed as a consumer reads it.
-pub fn published_promises(
-  base: Base,
+pub fn published_contracts(
+  base: BaseUrl,
   root: String,
   name: String,
   index: Index,
   version: Version,
-) -> Result<List<Contract>, List<Diag>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> Result<List<Contract>, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match release_at(index, version) {
     None -> Err([unpublished(name, version)]),
-    Some(r) -> match consumed(base, root, name, r) {
+    Some(r) -> match fetch_closure(base, root, name, r) {
       Err(d) -> Err([d]),
-      Ok(c) -> match as_consumed(Bytes::of_string(root), c.manifest, c.own, c.deps, []) {
+      Ok(c) -> match analyse_as_consumer(
+          Bytes::of_string(root),
+          c.manifest,
+          c.own,
+          c.dependencies,
+          [],
+        ) {
         Err(ds) -> Err(ds),
         Ok(x) -> Ok(promised(x)),
       },
@@ -263,29 +255,38 @@ pub fn published_promises(
 pub fn run(
   flags: Flags,
   opts: Options,
-) -> Answer / {env.variable, fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
+) -> CommandOutput / {env.variable, fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
   let s = style_of(flags);
   if !is_dotted_path(opts.name) {
-    reported(s, "contracts", [untakeable("`" ++ opts.name ++ "` is not a package name", [])], [])
+    reported(
+      s,
+      "contracts",
+      [rejected_package("`" ++ opts.name ++ "` is not a package name", [])],
+      [],
+    )
   } else {
     match ((version_of(opts.from), version_of(opts.to))) {
       (Err(d), _) -> reported(s, "contracts", [d], []),
       (_, Err(d)) -> reported(s, "contracts", [d], []),
-      (Ok(from), Ok(to)) -> match env.variable(variable()) {
+      (Ok(from), Ok(to)) -> match env.variable(url_variable()) {
         None ->
-          reported(s, "contracts", [unset(variable(), "the versions are read from a registry")], [
-          ]),
+          reported(
+            s,
+            "contracts",
+            [unset(url_variable(), "the versions are read from a registry")],
+            [],
+          ),
         Some(text) -> match base_of(text) {
-          Err(why) -> reported(s, "contracts", [unasked(why, [])], []),
+          Err(why) -> reported(s, "contracts", [registry_unreachable(why, [])], []),
           Ok(base) -> match index_of(base, opts.name) {
             Err(d) -> reported(s, "contracts", [d], []),
             Ok(index) -> {
               let root = root_of(flags).absolute;
-              match published_promises(base, root, opts.name, index, from) {
+              match published_contracts(base, root, opts.name, index, from) {
                 Err(ds) -> reported(s, "contracts", ds, []),
-                Ok(was) -> match published_promises(base, root, opts.name, index, to) {
+                Ok(was) -> match published_contracts(base, root, opts.name, index, to) {
                   Err(ds) -> reported(s, "contracts", ds, []),
-                  Ok(now) -> answered(s, opts, from, to, moved(was, now)),
+                  Ok(now) -> contracts_output(s, opts, from, to, contract_changes(was, now)),
                 },
               }
             },
@@ -296,9 +297,15 @@ pub fn run(
   }
 }
 
-fn answered(style: Style, opts: Options, from: Version, version: Version, m: Moved) -> Answer = {
-  let need = needed(m);
-  let kept = compare(from, version) == Less && rank(bumped(from, version)) >= rank(need);
+fn contracts_output(
+  style: Style,
+  opts: Options,
+  from: Version,
+  version: Version,
+  m: ContractChanges,
+) -> CommandOutput = {
+  let need = required_bump(m);
+  let kept = compare(from, version) == Less && rank(bump_between(from, version)) >= rank(need);
   let rows = |word: String, names: List<String>|
     names.map(|n: String| indent() ++ "  " ++ word ++ " " ++ n);
   {
@@ -331,16 +338,14 @@ fn answered(style: Style, opts: Options, from: Version, version: Version, m: Mov
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
 fn contract_of(name: String, hash: Bytes) -> Contract =
-  { name: Bytes::of_string(name), decl: false, hash: hash }
+  { name: Bytes::of_string(name), declaration: false, hash: hash }
 
 test "what moved is each definition added, changed or removed, by name and namespace" {
   let was = [
     contract_of("m.a", b"1"),
     contract_of("m.b", b"2"),
-    { ..contract_of("m.T", b"3"), decl: true },
+    { ..contract_of("m.T", b"3"), declaration: true },
   ];
   let now = [
     contract_of("m.a", b"1"),
@@ -348,8 +353,12 @@ test "what moved is each definition added, changed or removed, by name and names
     contract_of("m.T", b"4"),
     contract_of("m.d", b"5"),
   ];
-  assert_eq(moved(was, now), { added: ["m.T", "m.d"], changed: ["m.b"], removed: ["m.T"] });
-  assert_eq(moved(was, was), { added: [], changed: [], removed: [] })
+  assert_eq(contract_changes(was, now), {
+    added: ["m.T", "m.d"],
+    changed: ["m.b"],
+    removed: ["m.T"],
+  });
+  assert_eq(contract_changes(was, was), { added: [], changed: [], removed: [] })
 }
 
 test "a patch moves nothing, a minor only adds, and a major may change anything" {
@@ -357,7 +366,7 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
   let adds = { ..none, added: ["m.d"] };
   let changes = { ..none, changed: ["m.b"] };
   assert_eq(
-    refusal(
+    bump_error(
       "orders",
       parse_version("0.1.0").expect("a fixture's version"),
       parse_version("0.1.1").expect("a fixture's version"),
@@ -366,7 +375,7 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
     None,
   );
   assert_eq(
-    refusal(
+    bump_error(
       "orders",
       parse_version("0.1.0").expect("a fixture's version"),
       parse_version("0.2.0").expect("a fixture's version"),
@@ -375,7 +384,7 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
     None,
   );
   assert_eq(
-    refusal(
+    bump_error(
       "orders",
       parse_version("0.1.0").expect("a fixture's version"),
       parse_version("1.0.0").expect("a fixture's version"),
@@ -383,7 +392,7 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
     ),
     None,
   );
-  match refusal(
+  match bump_error(
       "orders",
       parse_version("0.1.0").expect("a fixture's version"),
       parse_version("0.1.1").expect("a fixture's version"),
@@ -398,7 +407,7 @@ test "a patch moves nothing, a minor only adds, and a major may change anything"
       )
     },
   };
-  match refusal(
+  match bump_error(
       "orders",
       parse_version("0.1.0").expect("a fixture's version"),
       parse_version("0.1.1").expect("a fixture's version"),

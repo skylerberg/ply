@@ -1,7 +1,7 @@
 # The Ply Guide
 
 Ply is a general-purpose, statically typed functional language with tracked effects. A function's
-type says which resources it touches. The compiler and the test runner work one *definition* at a
+type states which resources it uses. The compiler and the test runner work one *definition* at a
 time, identified by a hash of its content, so a test runs again only when something it depends on
 changed. This guide is the reference for writing Ply and using the `ply` command. For what Ply is
 for, read [`GOALS.md`](../GOALS.md).
@@ -21,10 +21,10 @@ fn main() -> Unit / {Console} = print(greeting())
 ```
 
 `ply run hello` calls `main`. It prints `hello from ply` and exits with status `0`. Standard
-output holds only what the program writes. Errors and warnings go to standard error, and `ply run
+output contains only what the program writes. Errors and warnings go to standard error, and `ply run
 --json` reports the value `main` returned.
 
-Printing is an effect, not a builtin. `/ {Console}` in the signature says `main` uses the console.
+Printing is an effect, not a builtin. `/ {Console}` in the signature means `main` uses the console.
 `Console` is a set of effects for standard input, output and error (§6.4); `print` writes a
 `String` to standard output and `read_line` reads a line from standard input. `print`,
 `read_line` and `Console` come from `std.console` and need no import (§13). To print something
@@ -52,22 +52,22 @@ from demo`, and `ply test` runs the test.
   --name core`.
 - `--lib` creates a library instead: a `lib.ply` with one `pub` definition and no `main`.
 - A package name is lowercase letters, digits and `_`, in parts joined by dots.
-- `ply new` refuses a directory that already exists.
+- `ply new` fails if the directory already exists.
 
-**Projects.** A command finds the project's root by walking up from the path it was given (or the
-working directory) to the nearest directory that holds a `ply.pkg`. So `ply test` means the same
-package from its root and from any directory inside it. A path inside the package narrows what the
-command does without moving the root: `ply test store` runs the tests of the modules under
+**Projects.** A command finds the project's root by searching upward from the path it was given (or
+the working directory) for the nearest directory that contains a `ply.pkg`. So `ply test` means the
+same package from its root and from any directory inside it. A path inside the package narrows what
+the command does without moving the root: `ply test store` runs the tests of the modules under
 `store/`, and `ply run tools/gen.ply` runs that file's `main`.
 
-When no directory above holds a `ply.pkg`:
+When no directory above contains a `ply.pkg`:
 
 - A directory you name is the root.
 - A file you name is a program rooted at its own directory. It includes only that file and the
   modules it imports, so `ply run gen.ply` reads `shared.ply` for `import shared` and no other
   file.
-- A command with no path loads nothing and says so (`E0502`), rather than treating whatever is in
-  the working directory as a program.
+- A command with no path loads nothing and reports an error (`E0502`). It does not treat whatever is
+  in the working directory as a program.
 
 **Modules.** Every `*.ply` file under the root is a module named by its path, with `/` replaced by
 `.` and `.ply` removed: `store/orders/place.ply` is `store.orders.place`. Every directory name and
@@ -78,11 +78,11 @@ reached only as dependencies (§3.3).
 `std` and `compiler` are built-in packages, available to every program. A module of your own named
 under either prefix is an error (`E0133`).
 
-**The cache.** `.ply-cache/` at the root holds what `ply` keeps between runs: checked modules, test
-results, proofs, review baselines and fetched git dependencies. Add it to `.gitignore`. It is
+**The cache.** `.ply-cache/` at the root is where `ply` stores data between runs: checked modules,
+test results, proofs, review baselines and fetched git dependencies. Add it to `.gitignore`. It is
 always safe to delete, and `ply cache clear` empties it. A run that crashes or races another run
-can make a later run redo work, but never gives a wrong answer. `vendor/` holds the dependencies
-`ply vendor` copied, for builds without network access (§3.3).
+can make a later run redo work, but never gives a wrong answer. `vendor/` contains the
+dependencies `ply vendor` copied, for builds without network access (§3.3).
 
 A definition's hash covers what it depends on, but not comments or formatting (§8.2). Checking is
 incremental: an edit to a function's body that keeps its signature and effects the same rechecks
@@ -94,7 +94,7 @@ recorded by a `ply` with a different runtime, or whose relevant code changed, is
 that compiles a test to the same code does not run it again.
 
 `PLY_CACHE_UPSTREAM=DIR` names a second cache shared between checkouts and machines: any directory
-they can all reach. Test results and proofs found there count here, and this run's results are
+they can all reach. Test results and proofs found there are used here, and this run's results are
 written there. `PLY_CACHE_UPSTREAM_READONLY=1` only reads it. Entries are keyed by content, so
 nothing machine-specific is shared. `--no-cache` ignores both caches.
 
@@ -128,10 +128,10 @@ pub fn cents_of(o: Order) -> Int = ..
 ```
 
 Put one space after the marker. A bare `///` line separates paragraphs, and the first sentence is
-the summary. A doc says what the signature cannot: what the result means, when the function
-raises, units, edge cases. It holds no examples: the tests and laws that name a definition are its
-examples, and `ply callers` lists them (`ply doc` lists the laws, §16). A blank line between a doc
-and its declaration is allowed, and `ply fmt` removes it.
+the summary. A doc states what the signature cannot: what the result means, when the function
+raises, units, edge cases. It contains no examples: the tests and laws that name a definition are
+its examples, and `ply callers` lists them (`ply doc` lists the laws, §16). A blank line between a
+doc and its declaration is allowed, and `ply fmt` removes it.
 
 A doc comment with nothing to document is an error (`E0003`): one inside a body; one above an
 `import`, `test`, `law`, `derive`, `key`, `show`, `invariant` or `numeric`; one at the end of a
@@ -218,9 +218,9 @@ byte, or one that never closes is `E0001` or `E0002`, as for a character.
 
 **Interpolated strings.** `f"a {x} b"` means `"a " ++ display(x) ++ " b"`, using `std.show`'s
 `display`: a `String` or `Char` is inserted as is, and any other value as `show` writes it. Both
-spellings are the same definition with the same hash.
+forms are the same definition with the same hash.
 
-- A hole `{...}` may hold any expression, including strings and braces.
+- A hole `{...}` may contain any expression, including strings and braces.
 - `{{` and `}}` are literal braces; a lone `}` is an error (`E0001`).
 - A hole's type must be showable (`derivable(show, ·)`, §11), so a `Secret`, a function, a `Task`
   or a `Chan` in a hole is an error (`E0206`).
@@ -228,8 +228,8 @@ spellings are the same definition with the same hash.
   imports cannot use interpolation themselves.
 
 **Map and set literals.** A map literal is a call of `Map::of_entries([{key: k, value: v}, ..])`,
-and a set literal is the same with `()` as each value. Either spelling is the same definition with
-the same hash, and `ply fmt` keeps the one you wrote.
+and a set literal is the same with `()` as each value. Either form is the same definition with the
+same hash, and `ply fmt` keeps the one you wrote.
 
 **Tagged literals.** A tagged literal is a name immediately followed by a string: `uuid"..."` is
 one, while `uuid "..."` is a name followed by a string. It calls the tag module's parser on the
@@ -298,7 +298,7 @@ support is `E0101`. `std.html` and `std.sh` are tags with holes.
 **Line strings.** A line string is one or more lines that each start with `\\` (after optional
 spaces). Everything after `\\` up to the end of the line is text, exactly as written: there are no
 escapes. The lines are joined with `\n`, and the value ends after the last line, so a value that
-ends with a newline ends with a line holding only `\\`:
+ends with a newline ends with a line containing only `\\`:
 
 ```ply
 fn program() -> String =
@@ -458,7 +458,7 @@ pub fn text_of(t: Token) -> String = match t { Token(s) -> s }
 pub fn of_ymd(year: Int, month: Int, day: Int) -> Option<Date> = ..
 ```
 
-Inside the declaring module nothing changes. Other modules can name the type, hold and pass its
+Inside the declaring module nothing changes. Other modules can name the type, store and pass its
 values, and call the module's functions, but cannot build or take apart a value:
 
 - Calling, passing, importing or matching on a constructor of an opaque sum is `E0107`.
@@ -469,9 +469,9 @@ the contents too, declare a sum with one constructor.
 
 `opaque` is not secrecy. `==`, `compare`, `digest`, `show` and `reflect` read the whole value, as
 they do any value (through a `key` or `show` the module declares, §4.4). A `Secret` is the type
-nothing can read (§4.6). A codec the module derives (§11) is public, and its decoder builds a value
-from any document of the right shape, so a type with rules beyond its shape should write its codec
-by hand.
+nothing can read (§4.6). A codec the module derives (§11) is public, and its decoder builds a
+value from any document of the right shape, so a type with rules beyond its shape should write its
+codec by hand.
 
 A law in another module may still quantify over an opaque type. Its proof covers every value the
 declaration allows, which includes every value the module builds; such a law is never proved by
@@ -481,12 +481,12 @@ A default on a `pub fn` is copied into each caller, so one that uses an opaque c
 builds an opaque record is `E0122`. A type does not have to be `pub` to be opaque, since its values
 can still leave the module through its functions. An alias has no values of its own, so `opaque` on
 an alias is `E0221`. Unlike `pub`, `opaque` is part of a type's hash: making a type opaque or not
-rechecks every definition that can hold one.
+rechecks every definition that can contain one.
 
 ### 3.3 Packages and the manifest
 
-A project root may hold a `ply.pkg` file: the package's manifest. It holds exactly one definition,
-whose body is a literal of `std.pkg`'s `Manifest` (`ply doc std.pkg.Manifest`):
+A project root may contain a `ply.pkg` file: the package's manifest. It contains exactly one
+definition, whose body is a literal of `std.pkg`'s `Manifest` (`ply doc std.pkg.Manifest`):
 
 ```ply
 import std.pkg (Manifest)
@@ -516,25 +516,25 @@ import cli.surface         // a module of the declared dependency `cli`
 
 There are three kinds of dependency:
 
-- `Path("../cli")` names the directory holding the dependency's `ply.pkg`, which must exist
+- `Path("../cli")` names the directory containing the dependency's `ply.pkg`, which must exist
   (`E0135`).
 - `Git(url, rev)` is fetched into `.ply-cache/git/`, one directory per URL and revision, using the
   `git` on your `PATH`. `rev` may be a commit, a tag or a branch. A branch means whatever it pointed
-  to when it was fetched; the fetched copy is reused without asking the remote again, so clear the
-  cache to pick up a moved branch (`ply.lock` notices the change). A fetch that fails, or no `git`
-  on the path, is `E0135`.
+  to when it was fetched. The fetched copy is reused without contacting the remote again, so clear
+  the cache to pick up a moved branch (`ply.lock` detects the change). A fetch that fails, or no
+  `git` on the path, is `E0135`.
 - `Registry` names a package in the registry `PLY_REGISTRY` points to (§15.1), at version `min` or
   later. Its `name` must be a valid package name (`E0131`).
 
 `ply resolve` is the only command that contacts the registry. It picks a version, downloads the
 archive (`.ply-cache/registry/<name>@<version>.plyz`), verifies it, and unpacks it into
 `.ply-cache/registry/<name>`, where every other command reads it without the network. A registry
-dependency that is missing from the cache, or older than the closure needs, is `E0135` or `E0136`;
-`ply resolve` fixes either. Before reading anything from a downloaded archive, `ply` checks it: an
-archive whose bytes do not match the digest in the index or in `ply.lock`, or that is not the
-package and version requested, is `E0142`. A published version never changes, so different bytes
-for a pinned version are always refused. An unset, malformed or unreachable registry is `E0141`. A
-name the registry does not have, or a minimum no non-yanked version meets, is `E0143`.
+dependency that is missing from the cache, or older than the other packages require, is `E0135` or
+`E0136`; `ply resolve` fixes either. Before reading anything from a downloaded archive, `ply`
+checks it: an archive whose bytes do not match the digest in the index or in `ply.lock`, or that is
+not the package and version requested, is `E0142`. A published version never changes, so different
+bytes for a pinned version are always rejected. An unset, malformed or unreachable registry is
+`E0141`. A name the registry does not have, or a minimum no non-yanked version meets, is `E0143`.
 
 Inside a dependency, every module is named `<prefix>.<name>`, and its own bare imports refer to its
 own modules. Errors:
@@ -546,14 +546,14 @@ own modules. Errors:
 
 **Version selection.** The manifest is checked on every load. `ply` uses minimal version selection:
 
-- When two manifests ask for different minimum versions of one package, the highest minimum wins.
-  A dependency below what its importer asks for is `E0136`.
+- When two manifests request different minimum versions of one package, the highest minimum wins.
+  A dependency below what its importer requests is `E0136`.
 - One version of each package serves the whole program. The same package name found at two
-  different places is `E0137`, naming both places and who asked for each. A package that two
-  others both depend on (a diamond) is fine and resolves to one version.
+  different places is `E0137`, naming both places and which package requested each. A package that
+  two others both depend on (a diamond) is fine and resolves to one version.
 - Over a registry, each minimum selects the lowest published, non-yanked version at or above it
   (or the version `ply.lock` already pins, if that is high enough). Each selected version adds its
-  own dependencies' minimums, and each name settles on the highest version reached. The order the
+  own dependencies' minimums, and each name resolves to the highest version reached. The order the
   manifests are read in does not matter.
 - A new resolution skips yanked versions, but a lock that already pins one keeps it.
 
@@ -562,7 +562,7 @@ dependency's name and version, sorted by name, with a BLAKE3 digest of its modul
 files (§3.4). A registry dependency also records the digest of its archive.
 
 - A path dependency inside the same git checkout is recorded without a digest, like Cargo does:
-  the commit that holds your project also holds its sources, so editing it does not change the
+  the commit that contains your project also contains its sources, so editing it does not change the
   lock. "Inside" means at or below the nearest directory with a `.git`, with no symlink or nested
   `.git` on the way.
 - Git, registry and outside-the-checkout path dependencies keep their digest. A package is pinned
@@ -578,7 +578,7 @@ named by its prefix: its `ply.pkg`, its modules and its data files, but not git 
 writes `vendor/index`, one line per package. When the index exists, `ply` reads dependencies from
 `vendor/` and needs no cache, network or `git`. Each vendored directory has its own `ply.pkg`, so
 it is a separate package, not part of yours. `ply resolve` in a vendored project also updates the
-vendored copy. `ply why NAME` shows how a package got into the closure: the chain of packages from
+vendored copy. `ply why NAME` shows how a package became a dependency: the chain of packages from
 yours to it, then its version and digest.
 
 **What a command covers.** A command works on the root package, the one you pointed it at. A
@@ -589,11 +589,11 @@ on every package reachable through path dependencies, each as its own root with 
 dependencies first. Fetched and vendored dependencies are never included.
 
 **Workspaces.** A repository with several packages lists them in a `ply.work` at its root. It
-holds one definition, `fn workspace() -> Workspace = ...`, a literal of `std.pkg`'s `Workspace`
+contains one definition, `fn workspace() -> Workspace = ...`, a literal of `std.pkg`'s `Workspace`
 (`ply doc std.pkg.Workspace`), checked like a manifest (`E0129`–`E0131`). It lists:
 
 - `packages`: the directories of the packages the repository maintains;
-- `suites`: packages of tests or examples, each saying whether `ply prove` runs on it;
+- `suites`: packages of tests or examples, each stating whether `ply prove` runs on it;
 - `fixtures`: directories of Ply sources that belong to no package;
 - `toolchain`: only in the repository that builds `ply`; where the standard library, the compiler,
   the CLI package and its entry point, their test suites and the runtime's cargo package are.
@@ -695,10 +695,10 @@ scale, and rounding to no more digits than that only drops digits, so it cannot 
 
 **Float.** Every `Float` operation gives the same bits on every machine, target and build profile.
 Arithmetic is IEEE-754 64-bit with each operation rounded once, as written: operations are never
-fused or reordered, and subnormal numbers are kept. `Float::sqrt`, `exp`, `ln`, `log2`, `log10`,
-`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `pow` and `hypot` are correctly rounded:
-each returns the `Float` nearest the exact value, ties to even. A program sees only one `NaN`:
-whatever NaN the machine produces, `bits_of_float`, encodings and ordering all read it as
+fused or reordered, and subnormal numbers are preserved. `Float::sqrt`, `exp`, `ln`, `log2`,
+`log10`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `pow` and `hypot` are correctly
+rounded: each returns the `Float` nearest the exact value, ties to even. A program sees only one
+`NaN`: whatever NaN the machine produces, `bits_of_float`, encodings and ordering all read it as
 `0x7FF8_0000_0000_0000`.
 
 ### 4.2 Records and tuples
@@ -717,8 +717,8 @@ fn divmod(a: Int, b: Int) -> (Int, Int) = (a / b, a % b)
 A tuple is a record with numbered fields: `(A, B)` is `{_0: A, _1: B}` in types, values and
 patterns, and its fields are read as `t._0`. `(A)` is just grouping; `()` is `Unit`.
 
-An alias can take parameters: `type Index<a> = Map<a, Int>`. A signature that uses an alias is
-held to the same requirements as the type it expands to (§4.3): `Index<k>` requires `k` to be
+An alias can take parameters: `type Index<a> = Map<a, Int>`. A signature that uses an alias must
+meet the same requirements as the type it expands to (§4.3): `Index<k>` requires `k` to be
 ordered, and `Index<Float>` is `E0206`. An alias can also take label and row parameters (§4.5):
 `type Step<a | e> = () -> Option<a> / e` is that function type with whatever row is given for `e`.
 
@@ -747,7 +747,7 @@ type:
   `days.push({..})` and `Some({..})` returning `Option<Date>` all work;
 - a field of a literal that is itself expected, and a field written by an update;
 - a list element, an `if` branch or a `match` arm, when the whole or an earlier element, branch or
-  arm settles the type; the right operand of an operator, at the left operand's type;
+  arm determines the type; the right operand of an operator, at the left operand's type;
 - the last expression of a block, a `let ... else` block, and the body of a `handle` (or its
   `return` clause), `with_hold` or `simulate`, when the whole is expected; the body of a `try`,
   when a `Result` of it is expected; a handler clause, at what it returns.
@@ -758,10 +758,10 @@ type annotation is a plain record from then on.
 The declaration is closed and checked where it is written:
 
 - A field can use only the declaration's own type, label and row parameters (§4.5).
-- A field cannot hold a `Hold`, `Task` or `Chan` (`E0446`, §4.6).
+- A field cannot contain a `Hold`, `Task` or `Chan` (`E0446`, §4.6).
 - A `new` record cannot contain itself except through a sum type (`E0214`).
 
-**Types that carry an order.** If a record or sum holds a `Map` keyed by one of its type
+**Types that carry an order.** If a record or sum contains a `Map` keyed by one of its type
 parameters, anywhere inside, then that parameter must be ordered wherever the type is used, just as
 a `Map`'s key must be. `std.set`'s `Set<a>` is an example. With `type Opt<a> = | Plain(a) |
 Keyed(Map<a, Int>)`, both `Opt<Float>` and `Plain(1.5)` are `E0206`, because `Float` is not
@@ -795,13 +795,13 @@ the map counts as that key: inserting it keeps the existing key and replaces the
 whose `key` (§4.4) is equal.
 
 A map's key type must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Task` and
-`Chan` are refused (`E0206`). A signature that mentions a `Map`, or a type that carries an order
+`Chan` are rejected (`E0206`). A signature that mentions a `Map`, or a type that carries an order
 (§4.2), in a parameter or result automatically requires each type parameter the key ordering
 depends on to be ordered. So `fn size<k>(m: Map<k, Int>) -> Int` can only be called with an
 ordered `k`, and its body may `compare` two `k`s.
 
 Ordering a key reads exactly what `derivable(ord, ..)` reads (§11): a record's fields, a sum's
-variants, or a type's `key` (§4.4). So `Map<Id<a>, v>` needs nothing of `a` if `Id<a>` holds no
+variants, or a type's `key` (§4.4). So `Map<Id<a>, v>` needs nothing of `a` if `Id<a>` contains no
 `a`; a body that compares two `a`s there must write `where derivable(ord, a)` itself. Writing a
 `where derivable(ord, k)` the signature already implies is allowed. Calling with an unordered type
 is one `E0206` for the `Map` that needs it.
@@ -831,12 +831,12 @@ arguments is a different type (§4.5).
 
 A sum may contain itself only at its own parameters or at fixed types. `type Nest<a> = | Leaf(a) |
 Deeper(Nest<List<a>>)` contains itself at a type built from `a`, so each level would be a new type
-and compiling it would never end; it is refused (`E0477`). Through a function type it is allowed:
-`| Later((Later<List<a>>) -> Int)` holds no such value.
+and compiling it would never end; it is rejected (`E0477`). Through a function type it is allowed:
+`| Later((Later<List<a>>) -> Int)` contains no such value.
 
 **Keys and custom display.** By default a value is compared, ordered, hashed and shown by its
 constructor and fields. That is wrong for a type that can represent one thing in two ways. The
-module that declares a sum can say how its values should be read instead:
+module that declares a sum can state how its values are compared and shown instead:
 
 ```ply
 pub type Deque<a> = | Deque(List<a>, List<a>)   // a front, and a reversed back
@@ -895,10 +895,10 @@ value itself.
   raise and always return, and a key that raised inside a `Map` insert would have nowhere to go
   (`E0218`).
 - It may not take a resource label, and a type that takes a label cannot declare these (`E0218`).
-- A key that is or holds a value of its own type would need its own key to compare, so it is
-  refused (`E0219`), however indirectly.
+- A key that is or contains a value of its own type would need its own key to compare, so it is
+  rejected (`E0219`), however indirectly.
 - A type's hash covers these functions, so changing one rechecks and reruns everything that can
-  hold a `T`.
+  contain a `T`.
 
 **Custom arithmetic.** A number type declares its arithmetic the same way:
 
@@ -917,7 +917,7 @@ numeric for BigInt by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
   takes type parameters, and each has an empty row, so `a + b` adds no effects (`E0218`).
 - The type must be a sum the module declares (`E0208`, `E0217`), stated once (`E0105`), with no
   parameters (`E0216`).
-- `/` and `%` are not available, since they have no answer for every pair of values: the module
+- `/` and `%` are not available, since they have no result for every pair of values: the module
   provides its own functions (`std.bigint.div` returns an `Option`). Bit operators, wrapping,
   saturating and checked arithmetic, and rotations stay with the built-in integers (`E0201`,
   `E0223`).
@@ -1028,7 +1028,7 @@ pub fn find<a>(g: Game<Int, a, Int | {}>, x: a, y: a) -> Bool = x == y
 
 `find` needs no `where`: a signature that uses the type at its own parameter gets the constraint
 automatically, as with a `Map`'s key (§4.3). A `Game` whose choices cannot be compared, such as
-`Game<S, (Int) -> Int, C>`, is refused where it is built, not later where a search over it runs. A
+`Game<S, (Int) -> Int, C>`, is rejected where it is built, not later where a search over it runs. A
 sum or `new` record whose fields use the type at one of its own parameters carries the constraint
 the same way. An alias is checked at each use.
 
@@ -1053,7 +1053,7 @@ A module that declares or imports (by name) its own `Ok`, `Err`, `Some` or `None
 One that defines its own `Ok` or `Err` cannot use `try` (§6.8) or tagged literals (§2.3); each is
 `E0118`. One that declares its own `Stop` cannot use `iterate`.
 
-**`Secret<a>`** holds a credential, a `String` or `Bytes`, that no Ply code can read.
+**`Secret<a>`** stores a credential, a `String` or `Bytes`, that no Ply code can read.
 
 - `Secret::of_string` and `Secret::of_bytes` seal a value the program already has. `config.secret`
   (`std.config`) returns a secret the program never sees in plain form. `std.random`'s
@@ -1064,8 +1064,8 @@ One that defines its own `Ok` or `Err` cannot use `try` (§6.8) or tagged litera
   Web Key) and `std.hash`'s key derivations `hkdf` and `pbkdf2`. None returns part of a secret,
   since comparing a one-byte slice against 256 guesses would reveal it a byte at a time. To get two
   keys from one secret, call `hkdf` twice with two different `info` values.
-- A secret's bytes are kept in memory no other value shares, and overwritten with zeros when the
-  last reference is dropped.
+- A secret's bytes are stored in memory that no other value shares, and overwritten with zeros when
+  the last reference is dropped.
 
 A secret can be observed in only four ways: `==` and `!=` between two secrets, `Secret::verify`
 against a string, `Secret::is_empty` and `Secret::len`. Comparison takes time that depends only on
@@ -1077,7 +1077,8 @@ public key, sealing or opening a message and key agreement (`std.crypto`). The r
 signature, a public key) are not secret, since each is one-way in the key.
 
 A secret cannot be shown, encoded, ordered, hashed, matched on or drawn by a `forall`. It can reach
-a native function only through a parameter declared `Secret` (§12). The functions that accept one are:
+a native function only through a parameter declared `Secret` (§12). The functions that accept one
+are:
 
 - `std.password`'s hashing natives, which return a one-way hash;
 - `std.fs`'s `write_secret`, which writes to a file only its owner can read;
@@ -1097,19 +1098,20 @@ that releases them when it ends, and cannot outlive it.
   definition, a lambda or a function type). In a `let` annotation or as a type argument it is
   `E0446`.
 - A `Hold` is not data: it cannot be compared or ordered (`E0201`), hashed, derived or used as a
-  `Map` key (`E0206`), and `reflect` never shows what it holds.
+  `Map` key (`E0206`), and `reflect` never shows what it contains.
 - A declaration exists outside every region. So a variant field, a `new` record field, or an
   operation's parameter or result that mentions a `Hold`, `Task` or `Chan` at any depth is
   `E0446`. Use a type parameter instead, `type Held<t> = Held(t)`, so the region travels with the
   type argument where the escape checks can see it.
-- For the same reason, a field holding a function whose row names `hold`, or joins a task, or uses a
-  channel, is `E0446`. Take the row as a row parameter instead, `type Held<| e> = Held(() -> Int /
-  e)`, and the checker will see a closure that reaches a region leave it through that row. The
-  same applies to an operation's parameters and result, since a handler could keep them past the
-  region: give the operation a row parameter, `write put<| e>(f: () -> Int / e) -> Unit`.
+- For the same reason, a field that contains a function whose row names `hold`, or joins a task, or
+  uses a channel, is `E0446`. Take the row as a row parameter instead:
+  `type Held<| e> = Held(() -> Int / e)`. Then, if a closure that uses a region leaves it through
+  that row, the checker sees it. The same applies to an operation's parameters and result, since a
+  handler could keep them after the region ends. Give the operation a row parameter:
+  `write put<| e>(f: () -> Int / e) -> Unit`.
 - A `new` record's fields are visible wherever it goes, so it may write such a row directly.
-  Still, rows in a declaration cannot name a region (§7.2), so a closure over a hold must go
-  through a row parameter there too.
+  Still, rows in a declaration cannot name a region (§7.2), so a closure that captures a `Hold`
+  must go through a row parameter there too.
 
 ### 4.7 Function types, and what must be written
 
@@ -1133,9 +1135,9 @@ checked against the signature, never the body.
   operation of `net` on `conn`; the operation atom `net.send[conn]` covers only `send` (§6.2).
 
 **Borrowed function parameters.** A parameter of a top-level `fn` or `extern fn` whose type is
-written as a function type is *lent* to the call: the function borrows it for the duration of the
-call. The body may call it, pass it to another borrowed parameter, capture it in a lambda, or use it
-inside a `handle` (whose lambda or continuation is then borrowed too, §5.3). Anything that could
+written as a function type is *borrowed*: the function may use it only until the call returns. The
+body may call it, pass it to another borrowed parameter, capture it in a lambda, or use it inside a
+`handle` (whose lambda or continuation is then borrowed too, §5.3). Anything that could
 keep it after the call returns is `E0475`: returning it, storing it in a record, list, constructor
 or handler variable, performing an operation with it, or passing it to a parameter of another type
 (including a type parameter) or to a function value.
@@ -1150,18 +1152,17 @@ or handler variable, performing an operation with it, or passing it to a paramet
 
 **Inferred inside bodies:** lambda parameter types and rows, `let` types, and everything else. A
 local `let` is not generic, so `let f = |x| x;` used at two types is `E0201`.
-
 ## 5. Expressions
 
 Everything is an expression, including `if`, `match`, `handle` and blocks. Expressions nest at most
-128 levels deep. Each operand, parenthesis and block counts as a level, and the parser refuses
+128 levels deep. Each operand, parenthesis and block counts as a level, and the parser rejects
 deeper nesting ("input is nested too deeply to parse"). An `else if` chain and a run of operators
 of one precedence count as one level, however long.
 
 ### 5.1 Blocks and `let`
 
 A block `{ statements... tail }` has the value of its last expression (its *tail*), or `Unit` if
-it has none. `let <pattern> [: Type] = <expr>;` binds a name once; the `;` is required, and a later
+it has none. `let <pattern> [: Type] = <expression>;` binds a name once; the `;` is required, and a later
 `let` may shadow an earlier one. An expression statement needs `;` unless it is the tail or is
 block-like (`if`, `match`, `handle`, a block, `with_hold`, `simulate`).
 
@@ -1176,7 +1177,7 @@ fn sum_two(input: Bytes) -> Int = {
 ```
 
 A record pattern names every field or ends with `..` (`E0201`). A `let` whose pattern does not
-match raises (§6.8). `let <pattern> = <expr> else { .. };` says what happens instead: when the
+match raises (§6.8). `let <pattern> = <expression> else { .. };` states what happens instead: when the
 pattern does not match, the `else` block becomes the value of the enclosing block, and the
 statements after it do not run. The `else` block has the enclosing block's type and cannot see the
 pattern's names. A `?` inside it exits as it would from the block's tail.
@@ -1209,7 +1210,7 @@ case).
 | pattern | matches |
 | --- | --- |
 | `_` / `name` | anything; `name` binds it |
-| `Ctor`, `Ctor(p, q)`, `mod::Ctor(p)` | a constructor |
+| `Constructor`, `Constructor(p, q)`, `mod::Constructor(p)` | a constructor |
 | `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `b'{'`, `true`, `()` | a literal |
 | `0..=9`, `b'a'..=b'z'`, `1u8..=9u8` | an integer from the first bound to the second, inclusive |
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix |
@@ -1248,8 +1249,8 @@ complete, and a missing range is named: `match b { 0u8..=9u8 -> .., 20u8..=255u8
 ```
 
 Type annotations are optional. A parameter without one takes the type the called function expects
-there, once the earlier arguments settle it: in `accounts.map(|a| a.balance)`, `a` is an
-`Account`. If nothing settles it, its type is inferred from the body, which then cannot read a
+there, once the earlier arguments determine it: in `accounts.map(|a| a.balance)`, `a` is an
+`Account`. If nothing determines it, its type is inferred from the body, which then cannot read a
 field of it or call a function on it (`E0201`). A lambda captures variables by value, and its
 effects become part of the enclosing function's effects. A written return type requires a block
 body and allows `?` inside it.
@@ -1268,7 +1269,7 @@ fn later(f: keep (Int) -> Int) -> () -> Int = || f(1)
 ```
 
 `each_twice` passes `f` on through a lambda that `List::map` only calls. `later` returns a lambda
-that holds `f`, which only `keep` allows. A lambda's own parameters are not borrowed, and neither
+that captures `f`, which only `keep` allows. A lambda's own parameters are not borrowed, and neither
 is a call's result, except a continuation's: a continuation returns what its `handle` may return,
 so a continuation whose `handle` may return a borrowed function cannot be passed to any parameter.
 
@@ -1327,11 +1328,11 @@ the last element (that is `xs.at(xs.len() - 1)`). `xs.set(i, v)` with an index o
 the program (`E0502`).
 
 Values are immutable, but an update reuses memory when nothing else can see the old value.
-`xs.push(x)` appends in place when the caller holds the only reference to `xs`, and otherwise
-copies one path of the list's internal tree. `List::set` works the same way. `Array::set` copies the
-whole array when it cannot update in place. The same holds for `Bytes` and `++`.
+`xs.push(x)` appends in place when the caller has the only reference to `xs`, and otherwise copies
+one path of the list's internal tree. `List::set` works the same way. `Array::set` copies the whole
+array when it cannot update in place. The same applies to `Bytes` and `++`.
 
-A copy happens when something else still holds the value:
+A copy happens when something else still references the value:
 
 - a variable that is used again after the update;
 - a captured variable in a closure that is called again;
@@ -1339,21 +1340,21 @@ A copy happens when something else still holds the value:
 - a caller that keeps using what it passed.
 
 "Used again" means along the path the program actually takes. An `if` or `match` branch releases a
-variable that only another branch uses, and a closure called by its only holder (as a sequence's
-step function is) hands what it captured to that call. A variable passed to a call is read after
-the call's other arguments, so `c.set(i, c.get(i) + 1)` and `f(buf, buf.len())` update in place, as
-does the left side of `++`.
+variable that only another branch uses. A closure called through the only reference to it (as a
+sequence's step function is) passes what it captured to that call. A variable passed to a call is
+read after the call's other arguments, so `c.set(i, c.get(i) + 1)` and `f(buf, buf.len())` update
+in place, as does the left side of `++`.
 
-A record does not count as a second holder once it is done with a value:
+A record does not count as a second reference once it is done with a value:
 
 - Reading a field that nothing reads again (neither the field nor the whole record) moves the field
-  out of a record no one else holds.
+  out of a record no one else references.
 - A branch next to one that reads the whole record releases the fields it does not read.
-- A `let` or `match` pattern releases its subject once its names hold the fields (an arm with a
-  guard keeps it for the arms after it). So `{ ..s, out: s.out.push(x) }` and `let { out, n } = s`
-  grow `out` in place.
+- A `let` or `match` pattern releases its subject once its names are bound to the fields (an arm
+  with a guard retains the subject for the arms after it). So `{ ..s, out: s.out.push(x) }` and
+  `let { out, n } = s` grow `out` in place.
 - A released subject's memory is reused for the next record or constructor of the same size the
-  body builds. So `match s { Set(m) -> Set(m.insert(x, ())) }` updates a set no one else holds
+  body builds. So `match s { Set(m) -> Set(m.insert(x, ())) }` updates a set no one else references
   without allocating a new wrapper.
 
 `ply check --costs` reports every `List::push`, `List::set` and `Array::set` in your modules that
@@ -1372,10 +1373,10 @@ reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
 ```
 
 A call to another package's function is judged by its `returns` clause, never its body. `returns
-fresh` promises a value nothing else holds; `returns xs` says the result may share the parameter
-`xs`. Without a `returns` clause, appending to the result cannot be shown to update in place. The
-clause goes between the signature and its specifications, and is checked against the body when that
-package is checked (`E0148`):
+fresh` promises a value nothing else references; `returns xs` means the result may share the
+parameter `xs`. Without a `returns` clause, appending to the result cannot be shown to update in
+place. The clause goes between the signature and its specifications, and is checked against the
+body when that package is checked (`E0148`):
 
 ```ply
 pub fn digits(n: Int) -> List<Int>
@@ -1383,13 +1384,13 @@ pub fn digits(n: Int) -> List<Int>
 = range(0, n)
 ```
 
-A list literal of at most 32 elements that its function only reads, or passes to a call that keeps
-none of it, lives in the function's stack frame and allocates nothing: for example `sum([a, b,
-c])`, where `sum` walks the list with `at`. A list the function returns, stores, carries through a
-loop, or passes to a call that might keep it or an element of it (such as `List::fold`, which hands
-each element to a function value) is allocated. A frame holds at most 128 words of such lists
-(each list takes its elements' words plus three); further lists are allocated. Every list in a
-function that may stop at a perform for a handler to resume later (§6.6) is allocated.
+A list literal of at most 32 elements that its function only reads, or passes to a call that
+retains none of it, lives in the function's stack frame and allocates nothing: for example `sum([a,
+b, c])`, where `sum` reads the list with `at`. A list the function returns, stores, carries through
+a loop, or passes to a call that might retain it or an element of it (such as `List::fold`, which
+passes each element to a function value) is allocated. A frame has room for at most 128 words of
+such lists (each list takes its elements' words plus three); further lists are allocated. Every
+list in a function that may stop at a perform for a handler to resume later (§6.6) is allocated.
 
 ### 5.7 Iteration
 
@@ -1406,11 +1407,11 @@ recursive group (functions whose tail calls lead back to each other), so mutual 
 `even`/`odd` does not grow the stack either. The exception is a group containing a `handle` whose
 clause resumes somewhere other than its tail (§6.6): it runs the body on a separate stack, so its
 calls nest. A group whose `handle`s return directly, resume in tail position, or handle a raise (as
-`try` does) keeps its loop.
+`try` does) still runs as a loop.
 
 Every other call nests: `1 + f(n - 1)`, a call inside `handle`, `with_hold` or a lambda, and a call
-of another function. Only the stack bounds how deep calls nest. It holds a gigabyte, and a call
-that would nest past it ends the program (`E0502`). Each task has a stack of its own (§9).
+of another function. Only the stack bounds how deep calls nest. The stack is one gigabyte, and a
+call that would nest past it ends the program (`E0502`). Each task has a stack of its own (§9).
 
 A loop that never ends runs until a clock stops it. A test, and each entry `ply prove` makes to
 evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
@@ -1447,8 +1448,8 @@ conditional sits between it and the function's result and everything evaluated b
 - It converts no errors: `Result<_, E1>` inside a function returning `Result<_, E2>` is `E0201`.
 - Inside a `handle` or `try` (its body, a clause or its `return` clause), `?` exits the whole
   function, as a raise would: every `handle` in between is left, none of their `return` clauses
-  runs, and no clause catches it, a `try`'s included. The outermost such `handle` must stand where
-  a `?` could (`E0119`):
+  runs, and no clause catches it, a `try`'s included. The outermost such `handle` must be where a
+  `?` could be (`E0119`):
 
   ```ply
   fn priced(sku: String) -> Result<Int, String> = {
@@ -1485,7 +1486,7 @@ an ordinary name when no `{` follows it.
   own thread. A block written directly in a definition's body is judged against that definition's
   row, so a `handle` that handles none of the branches' effects does not force it. A block inside a
   lambda or a `handle` body runs in turn under any `handle` around it. So does a block whose
-  branches hold a task or a continuation, and every block of a program started from another
+  branches use a task or a continuation, and every block of a program started from another
   program's branch, as each test in a `ply test` run is.
 - `E0309`: two branches perform operations of one effect on one resource and one of them writes;
   or one branch calls a function value with an open row (a row variable) while another performs
@@ -1496,7 +1497,7 @@ an ordinary name when no `{` follows it.
 
 ### 5.10 Termination
 
-Ply checks that functions return. A function that might not must say so.
+Ply checks that functions return. A function that might not must declare that.
 
 ```ply
 fn count(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }
@@ -1538,21 +1539,21 @@ list `List::filter` keeps, a list `List::map` makes from a part of each element,
 `List::fold` when each step returns the accumulator or a part are all made of parts. Each element is
 a part, even though the list itself need not be smaller. A value an `if` or `match` chooses is
 whatever each branch is. What a group member returns is computed to a fixed point over the group,
-so a member that returns a part of its argument hands its caller a part. A definition outside the
-group is read the same way, so a helper that answers the parts of its argument, as a derived
-`<t>_children` does (§11), answers parts at each call. A result made of parts of several
-arguments, as `List::concat` joins two lists, is made of parts of whatever those arguments are
-parts of at the call: `[l].concat([r])` is made of parts of the tree `l` and `r` are taken from.
+so a member that returns a part of its argument gives its caller a part. A definition outside the
+group is read the same way, so a helper that returns the parts of its argument, as a derived
+`<t>_children` does (§11), returns parts at each call. A result made of parts of several arguments,
+as `List::concat` joins two lists, is made of parts of whatever those arguments are parts of at the
+call: `[l].concat([r])` is made of parts of the tree `l` and `r` are taken from.
 
 Function values are followed too. A function given to `List::map`, `List::filter` or `List::fold`
 is called with each element, and one given to `Map::fold` with each key and value. A function
 given to a definition outside the group is called as that definition calls it. A function an `if`
 chooses is followed through each branch. A lambda bound by `let` is followed where it is called, up
 to eight lambdas deep. A group member passed anywhere else, or called from a lambda the checker
-cannot follow, is called with nothing known.
+cannot follow, is treated as called with unknown arguments.
 
 A definition whose group is shown to shrink ends, and so does one that calls only definitions that
-end. Any other may not return, and its row must say so with the atom `diverges` (§6.2):
+end. Any other may not return, and its row must include the atom `diverges` (§6.2):
 
 - If its own recursion is not shown to shrink, or goes beyond what the check follows (a lambda
   deeper than it reads, or calls that combine into more than 10,000 size-change graphs), it must
@@ -1563,11 +1564,11 @@ end. Any other may not return, and its row must say so with the atom `diverges` 
 - A caller inherits `diverges` like any other atom, and there `E0302` offers to add it.
 - A test, law or clause that may not return needs no `diverges`: its timeout bounds it.
 
-`ply check --types` says under each such definition why it may not return: its own recursion is
-not shown to shrink, or goes beyond what the check follows, or it calls a named definition that may
-not return. `ply check --json` gives each definition's `ending`: its `kind` (`ends`, `stated` for
-one that ends thanks to a `decreases` measure, or `diverges`) and, for one that diverges, `through`
-and `at`.
+`ply check --types` reports under each such definition why it may not return: its own recursion
+is not shown to shrink, or goes beyond what the check follows, or it calls a named definition that
+may not return. `ply check --json` gives each definition's `ending`: its `kind` (`ends`, `stated`
+for one that ends thanks to a `decreases` measure, or `diverges`) and, for one that diverges,
+`through` and `at`.
 
 `decreases <measure>`, after the other clauses, states an `Int` over the parameters for a descent no
 single argument shows, as in `climb`. At every call the group makes back into itself, the callee's
@@ -1602,16 +1603,16 @@ the warning reports:
 A run that reaches a hole raises (`E0502`, `panic: unfilled hole`, naming the spot), so `ply test`
 fails each test that reaches one and passes the others. A handler may catch the raise like any
 other (§6.8). `..` and `???` are the same thing: each prints as written, and switching between them
-changes no hash. `??` is not a hole: `x??` is `?` applied twice (§5.8), and `x???` is `x` followed by
-a hole, which is an error. A skeleton of signatures with `..` bodies is a design the checker can
-judge: `ply check` lists every hole with what it must be and may do. Warnings do not count toward
-the cap on reported errors, so no hole is hidden.
+changes no hash. `??` is not a hole: `x??` is `?` applied twice (§5.8), and `x???` is `x` followed
+by a hole, which is an error. A skeleton of signatures with `..` bodies is a design the checker
+can judge: `ply check` lists every hole with what it must be and may do. Warnings do not count
+toward the cap on reported errors, so no hole is hidden.
 
 ## 6. Effects and handlers
 
 An *effect* is a named set of *operations*, such as reading a database or the clock. Code
 *performs* an operation the way it calls a function, and a *handler* decides what the operation
-does. A function's type lists the operations it may perform in its *row* (§6.2), so the type says
+does. A function's type lists the operations it may perform in its *row* (§6.2), so the type shows
 everything the function can touch.
 
 ### 6.1 Declaring an effect
@@ -1636,7 +1637,7 @@ Each operation is a `read`, a `write` or a `raise`.
 - A `read` or `write` returns to where it was performed.
 - A `raise` never returns, so it declares a name and parameters but no result (§6.8).
 - `[r]` makes a `read` or `write` take a *resource label*: every perform must name one, as in
-  `db.get[users](3)` (`E0304` otherwise). Labels say which resource an operation touches, so the
+  `db.get[users](3)` (`E0304` otherwise). Labels name the resource an operation touches, so the
   checker can tell that writing `[orders]` does not conflict with reading `[users]`.
 - `nondet` marks an effect whose results are not determined by the program's state, such as a
   clock or the network (§8.3).
@@ -1658,7 +1659,7 @@ for that parameter (`E0206`), and each clause may assume it.
 ### 6.2 Atoms and rows
 
 An *atom* is one entry of an effect row: `effect.mode[resource]`, or `effect.mode` for an effect
-without labels. A *row* is a set of atoms with an optional *row variable* at the end standing for
+without labels. A *row* is a set of atoms with an optional *row variable* at the end that means
 "and whatever else": `/ {db.read[users], clock.read}`, `/ {net.write[conn] | e}`, `/ e`, `/ {}`.
 Atoms from another module are qualified with `::`: `/ {store::db.read[users]}`.
 
@@ -1684,11 +1685,12 @@ perform `net.send[conn](..)` but not `net.recv[conn](..)`, and may call a functi
 operation or callee and suggests the atom to add. `ply check --types --explain` prints the inferred
 row as `body performs`.
 
-**Function values.** A function value may perform less than its type says, but not more
+**Function values.** A function value may perform less than its type allows, but not more
 (`E0302`). This applies when it is passed as an argument, returned against a written return type,
 bound with a `let` annotation, or used as one of the elements of a list or branches of an `if`,
-`match` or `let ... else`. It also applies to a function held in a record, tuple, `List`, `Array`,
-`Option`, `Result`, `Map`, `Iter` or `Hold` (§7.2), and to a function returned by a function. So:
+`match` or `let ... else`. It also applies to a function stored in a record, tuple, `List`,
+`Array`, `Option`, `Result`, `Map`, `Iter` or `Hold` (§7.2), and to a function returned by a
+function. So:
 
 - `run(|| a.x())` fits `fn run(k: () -> Unit / {a.x, a.z})`;
 - a callback whose row names `net.send[conn]` fits a row written `/ {net.write[conn]}`;
@@ -1796,20 +1798,20 @@ test "expiry is decided against the deadline, not the wall clock" {
 
 `handle { body } with { clauses }` runs the body, and each operation the body performs is handled
 by the matching clause. A clause is `effect.op[resource](params) -> value`. An optional `return x ->
-value` clause transforms the body's result. A handler may also hold variables its clauses update
+value` clause transforms the body's result. A handler may also have variables its clauses update
 (§6.9).
 
 **Wildcard labels.** A clause's label may be `[*]`, which handles the operation for **every**
 label: `log.note[*](line) -> …` handles `log.note[users]` and `log.note[orders]` alike. This lets a
-library serve an effect whose operations are per resource (a database driver over tables, a trace
-sink over channels) when the label is chosen at the call site, not by the handler. A clause naming a
+library handle an effect whose operations are per resource (a database driver over tables, a trace
+sink over channels) when the call site chooses the label, not the handler. A clause naming a
 specific label handles only that label. Clauses are tried in order, so put a specific clause before
 a `[*]` clause that would also match. `[*]` on an operation declared without a label is `E0304`.
 
 `[*t]` matches every label like `[*]`, and **binds** the label the call site used to `t`, a
-`String` in scope in the clause. This lets a handler check what it was asked, not just answer it.
-A database driver's table check works this way: it handles `db.query` on every table and rejects a
-statement that touches a table the call site did not name.
+`String` in scope in the clause. This lets a handler check which label the call site used, not just
+handle the operation. A database driver's table check works this way: it handles `db.query` on
+every table and rejects a statement that touches a table the call site did not name.
 
 ```ply
 handle { load() } with {
@@ -1825,7 +1827,7 @@ handling `relay[users]("k")` binds `"users"` even when the call is inside `fn re
 clause may name a label or bind one, never both.
 
 A **row** may also use `[*]`, which lets a library handle an effect for code it is given: `fn
-sink<a | e>(body: () -> a / {log.note[*] | e}) -> a / {wire.put[c] | e}` says the body may perform
+sink<a | e>(body: () -> a / {log.note[*] | e}) -> a / {wire.put[c] | e}` allows the body to perform
 `log.note` on any label, and `sink` handles it. A row with `[*]` is a permission rather than a
 requirement, so a body that performs nothing satisfies it; the body still may not perform an
 operation the row does not name. `[*]` in a row on an operation declared without a label is
@@ -1842,16 +1844,16 @@ callee reaches it, and the clause to add), unless the enclosing function's writt
 Then it passes on to the caller's handler. For example, `std.db`'s `transaction`, written `/
 {db.begin, db.commit, db.abort | e}`, passes `begin`, `commit` and `abort` on while handling
 `rollback` itself. A body that calls a function written with a mode atom, or a function value whose
-type has one, may perform any operation of that mode: `E0305` then names the mode atom, says which
-callee or value reaches it, and offers a clause for each operation not yet handled. A `handle` is
-judged by rows alone, so a lambda or a function-typed parameter is judged by its type.
+type has one, may perform any operation of that mode: `E0305` then names the mode atom, reports
+which callee or value reaches it, and offers a clause for each operation not yet handled. A `handle`
+is judged by rows alone, so a lambda or a function-typed parameter is judged by its type.
 
 **What a handler sees.** A `handle` handles only what its body's row names: the operations the body
 performs, and those of the definitions and function values it calls whose types name them. An
 operation that reaches the body only through a row variable or a label parameter of the enclosing
 definition belongs to the caller, whatever it turns out to be at run time. It goes to the handlers
 around the call. So a definition generic over a row or label never sees or handles what the row or
-label stands for:
+label represents:
 
 ```ply
 fn quiet<| e>(f: () -> Int / e) -> Int / e =
@@ -1872,16 +1874,16 @@ gets its handlers from where it is called, according to its row there; this incl
 In `amb.flip[coin]() resume k -> k(true) * 2`, `resume k` binds the *continuation*: the rest of
 the body after the perform, as a function. The clause then has the `handle`'s type.
 
-- `k` is a `once` function (§4.7): it may be called at most once (`E0316`), and a value that holds
-  it is a resource (§7.1), so wherever `k` goes it is called at most once.
+- `k` is a `once` function (§4.7): it may be called at most once (`E0316`), and a value that
+  contains it is a resource (§7.1), so wherever `k` goes it is called at most once.
 - Without `resume`, a clause's value is returned to the perform site. A clause for a `raise` is
   different (§6.8).
-- `k` is a function value. It may be kept after the `handle` ends and called later. Whatever the
-  resumed body performs that its own `handle`s do not handle goes to the handlers around that later
-  call, not those around the original capture.
+- `k` is a function value. It may outlive the `handle` and be called later. Whatever the resumed
+  body performs that its own `handle`s do not handle goes to the handlers around that later call,
+  not those around the original capture.
 
 A clause that binds `resume` and never calls it abandons the body where it stopped. To make sure a
-body releases what it holds even then, use `bracket(acquire, release, body)`. `release` runs on
+body releases what it acquired even then, use `bracket(acquire, release, body)`. `release` runs on
 what `acquire` returned when `body` returns, when a clause abandons it this way or a raise unwinds
 it (§6.8), and when its task is cancelled (§9). It runs where the bracket stands, with the handlers
 around it.
@@ -1891,15 +1893,15 @@ around it.
 - Nested brackets release innermost first.
 - A cancel does not interrupt an `acquire` or a `release`: it takes effect when that one returns
   (§9), so whatever was acquired is fully released.
-- The body receives what `acquire` returned as is, and may keep it past the release. `with_hold`
-  (§7.2) is the bracket whose body cannot keep what it holds.
+- The body receives what `acquire` returned as is, and may retain it after the release.
+  `with_hold` (§7.2) is the bracket whose body cannot retain that value.
 
 ### 6.7 Unhandled effects
 
 - `E0302`: the body performs an atom or operation its written row does not cover.
 - `E0303`: an effect escaped inference (a compiler bug).
 - `E0305`: a `handle` lacks a clause for an operation its body performs on an atom it handles.
-- `E0424`: an operation reached the host at run time with nothing set up to serve it, such as a
+- `E0424`: an operation reached the host at run time with no handler set up for it, such as a
   test's process streams. Handle it (§14).
 
 ### 6.8 Raising
@@ -1949,8 +1951,9 @@ for a raise with one parameter, `()` for none, and a tuple for several.
   definition is also `E0311`, since that raise belongs to the caller. A function that handles a
   raise from its callback names it in the callback's type: `f: () -> a / {toml.syntax | e}`.
 - `try` is a `handle` with that one clause and `return v -> Ok(v)`, so everything true of `handle`
-  holds: a recursive group with a `try` keeps its loop (§5.7), a `?` inside exits the function
-  through it (§5.8), and a module that defines its own `Ok` or `Err` cannot use it (`E0118`).
+  is true of `try`: a recursive group with a `try` still runs as a loop (§5.7), a `?` inside exits
+  the function through it (§5.8), and a module that defines its own `Ok` or `Err` cannot use it
+  (`E0118`).
 
 To turn an `Err` back into a raise, use a function:
 `r.unwrap_or_else(|e: SyntaxError| toml.syntax(e))` (`ply doc std.result`).
@@ -1989,7 +1992,7 @@ shown nonzero, and `task.channel` or `random.below` whose argument is shown in r
 
 These conditions count:
 
-- an `if` condition; the left side of `&&` (which held) or of `||` (which did not);
+- an `if` condition; the left side of `&&` (which was true) or of `||` (which was false);
 - a `match` arm's guard; a literal pattern that matched or that an earlier arm failed to match; a
   range pattern (`b'0'..=b'9'` keeps the value between the two, and alternatives keep it between
   the least and greatest of them); a list pattern of a known length;
@@ -2008,13 +2011,13 @@ returns `0..=255`, a length is not negative, `min` returns no more than either a
 known to be positive are each bounded accordingly. So `n & 0xFF` and a byte's `n / 16` are in range
 for `byte_of_int` and for indexing sixteen digits. A string or bytes literal has its written length.
 Nothing else is known: a call of a definition is a value about which nothing is known, whatever its
-body says, and a width other than `Int` is understood only through `Int::of_u8` and similar. What a
-call that can raise ensures holds only after the call.
+body returns, and a width other than `Int` is understood only through `Int::of_u8` and similar.
+What a call that can raise ensures is true only after the call.
 
 This check looks only at the body it is in, so a row never depends on another function's body. It
-decides by elimination over the integers, within a limit. Where it cannot show a clause, the call
-keeps its `abort.raise` and nothing is refused. So an index loop that recurses on `i + 1` with only
-`i >= b.len()` as its guard still raises, at a negative `i`: guard both ends, or fold over a
+decides by elimination over the integers, within a limit. Where it cannot prove a clause, the call
+still adds `abort.raise`, and that is not an error. So an index loop that recurses on `i + 1` with
+only `i >= b.len()` as its guard still raises, at a negative `i`: guard both ends, or fold over a
 `range`. A definition's own `requires` is not used (§10): it is not checked at callers, so the body
 cannot rely on it.
 
@@ -2053,7 +2056,8 @@ A handler can keep state in variables: `var name = init` or `var name: T = init`
 its `with` block, before any clause.
 
 - The initializers run in order when the `handle` starts, before its body and outside the handler:
-  an operation an initializer performs goes to the handlers around the `handle`, and adds to its row.
+  an operation an initializer performs goes to the handlers around the `handle`, and adds to its
+  row.
 - Each initializer sees the variables above it. Two with the same name are `E0105`.
 - The variables are visible in every clause and in `return`, never in the body, which reaches them
   only through the operations its row names.
@@ -2069,9 +2073,10 @@ A clause assigns a variable with `name = value;`, anywhere in its blocks and in 
   that shadows a variable) is `E0314`. In a clause of a nested `handle`, only that handler's
   variables can be assigned.
 
-A clause without `resume` gives the body back the values it ended with. A clause with `resume k`
-continues the body, when it calls `k`, with the values it holds then, and changes made during that
-resumption stay in it unless what it returns carries them out (as `return` can).
+A clause without `resume` returns to the body with the variables as the clause left them. A clause
+with `resume k` continues the body, when it calls `k`, with the values the variables have then.
+Changes made during that resumption stay in it unless what it returns carries them out (as `return`
+can).
 
 Tasks spawned under a handler share its variables (§9). A clause runs without other tasks'
 clauses interleaving until it performs something that may wait, such as a `task` or `clock`
@@ -2098,8 +2103,9 @@ fn served<a | e>(go: () -> a / {os.read | e}) -> a / e =
 
 Every root the runtime starts (`main`, an entry `ply run` names, a test) runs under the real handler
 of each effect its row names, after the root's own handlers. The runtime calls the real handler
-with a closure over the root, so an `os.pid()` that no `handle` in the program handles reaches `served`,
-and one inside `os::on` (`std.os`) never does. A root whose row names no such effect runs as it is.
+with a closure over the root, so an `os.pid()` that no `handle` in the program handles reaches
+`served`, and one inside `os::on` (`std.os`) never does. A root whose row names no such effect runs
+as it is.
 The wrapping happens at the entry point, after checking: a test's row, and so `E0412`, is what the
 test performs, never what a real handler does with it.
 
@@ -2111,13 +2117,12 @@ variable. It returns what that function returns, and its row is the same variabl
 handler adds of its own: raises, and effects that have no real handler. So its body, checked like
 any function, handles every operation (§6.5). The effect's raises are still the program's to
 handle. A real handler takes no label, has no `where` and is not a `const fn`.
-
 ## 7. Resources, holds and regions
 
 ### 7.1 Resources
 
 A *resource* is a value that must be released exactly once, such as a connection. Ply tracks
-ownership of resources, so it can never be used after release or released twice.
+ownership of resources, so a resource can never be used after release or released twice.
 
 ```ply
 pub opaque type Conn = | Conn(Int)
@@ -2135,50 +2140,55 @@ fn greet(host: String) -> Int / {net.write} = {
 ```
 
 `release for T by f` makes `T` a resource: each value has one owner, is never copied, and is
-released once, by `f`. `T` must be an opaque sum type of the module (`E0225`, `E0217`, `E0208`),
-and `f` takes one parameter written `keep T` and returns `Unit` (`E0218`). A type whose constructors
-hold a resource is a resource too, as is a record or tuple holding one, and a `once` function
-(below). Releasing one releases every resource it holds. All other values are copied freely.
+released once, by `f`. `T` must be an opaque sum type declared in the same module (`E0225`,
+`E0217`, `E0208`), and `f` takes one parameter written `keep T` and returns `Unit` (`E0218`). A
+type whose constructors contain a resource is a resource too, as is a record or tuple that contains
+one, and a `once` function (below). Releasing one releases every resource it contains. All other
+values are copied freely.
 
 **Owning, taking and borrowing.**
 
 - A `let`, a name bound by a pattern, and a parameter written `keep` *own* their resource.
 - Passing it to a `keep` parameter, returning it, putting it in a record, list or constructor, or
-  consuming it inside a lambda *takes* it. Using the name afterwards is `E0316`.
-- Passing it to a parameter without `keep` *lends* it: the callee borrows it, may use it and lend
-  it on, but cannot take it (`E0318`), and the owner still owns it.
-- Otherwise a resource is not data: comparing it, showing it, or filling a type parameter with it
-  is `E0317`, unless the type parameter is written `keep` (`fn hold<keep a>(x: keep a) -> ..`).
-- An operation's parameters lend or take in the same way, and a clause's binding borrows or owns
-  accordingly.
+  consuming it inside a lambda *takes* it: ownership moves away from the name. Using the name
+  afterwards is `E0316`.
+- Passing it to a parameter without `keep` lets the callee *borrow* it. The callee may use it and
+  pass it on to other parameters without `keep`, but cannot take it (`E0318`). The owner still
+  owns it.
+- Apart from that, a resource is not ordinary data: comparing it, showing it, or filling a type
+  parameter with it is `E0317`, unless the type parameter is written `keep`
+  (`fn hold<keep a>(x: keep a) -> ..`).
+- An operation's parameters borrow or take in the same way, and the binding in a clause that
+  handles the operation borrows or owns to match.
 
-**Automatic release.** A resource its owner still holds when its block ends is released there,
-last bound first. `f`'s row joins the row of the code that owns it (a definition, test or lambda),
-unless a `handle` around the owner handles it (`E0302`). In `greet`, `close(c)` runs after `send`
-returns.
+**Automatic release.** A resource that its owner still owns when the owner's block ends is released
+there. Resources are released in reverse order of binding. `f`'s row is added to the row of the
+code that owns the resource (a definition, test or lambda), unless a `handle` around the owner
+handles it (`E0302`). In `greet`, `close(c)` runs after `send` returns.
 
 - If the block's last expression does not use the resource, it is released before that
   expression, so a tail call stays a loop.
 - If some branches take it and others do not, it is released at the start of each branch that does
   not.
 - It is also released when a raise, a clause that does not resume, a `?`, or a `let` whose pattern
-  does not match leaves its block, and when a release that runs before it fails.
-- A resource created where nothing owns it is `E0322`: as a statement, as a lent argument, bound to
-  `_`, left out by `..`, or stored in a handler variable. So is a statement that names an owner and
-  does nothing with it, or a whole block lent whose value is something it binds.
+  does not match leaves its block. It is also released when a release that runs before it fails.
+- A resource created where nothing owns it is `E0322`: as a statement, as a borrowed argument,
+  bound to `_`, left out by `..`, or stored in a handler variable. So is a statement that names an
+  owner and does nothing with it, or a block passed as a borrowed argument whose value is something
+  the block binds.
 
-**Taking a resource apart.** A `match` on a resource takes it apart: its parts go to the arm's
-bindings and its own release does not run. Only the declaring module can see an opaque type's
-constructors, so only it can do this, which is how `close` releases a `Conn` without releasing it
-again.
+**Taking a resource apart.** A `match` on a resource takes it apart: its parts are bound by the
+arm's pattern, and its own release does not run. Only the declaring module can see an opaque type's
+constructors, so only that module can do this. This is how `close` releases a `Conn` without
+releasing it again.
 
 - A guard only borrows (`E0316`), since a guard that fails passes the value to the next arm. So does
   the right side of `&&` or `||`, which may not run.
-- A resource field is moved out of a record once (`E0316`), one field at a time, never through a
-  path `r.a.b`. One field cannot be moved out while another resource stays behind (`E0316`): take
-  the record apart instead, `let { conn, .. } = r;`. After that, the record can only be used through
-  an update that writes every moved field again. An update that overwrites a resource the record
-  still holds is `E0322`.
+- A resource field can be moved out of a record only once (`E0316`), one field at a time, and never
+  through a path such as `r.a.b`. One field cannot be moved out while another resource stays behind
+  (`E0316`): take the record apart instead, `let { conn, .. } = r;`. After that, the record can only
+  be used through an update that writes every moved field again. An update that overwrites a
+  resource the record still contains is `E0322`.
 - A field read through a borrowed record is borrowed.
 
 **Closures and continuations.**
@@ -2187,8 +2197,9 @@ again.
   at most once (`E0316`). If its block ends before it is called, what it took is released with it.
 - A `once` function may be called at most once and never copied. Calling it consumes it, so only
   its owner (a parameter written `keep once`) may call it (`E0318`).
-- A lambda that only borrows what it captures (or calls one that does) may be called or lent while
-  the owner holds the resource, but may not be returned, kept or stored (`E0318`).
+- A lambda that only borrows what it captures (or calls one that does) may be called, or passed to a
+  parameter without `keep`, while the owner still owns the resource. It may not be returned, stored
+  or taken in any other way (`E0318`).
 - A clause, a `return` clause, a `simulate` body and a `parallel` branch may run any number of
   times or none, so each may borrow a resource from outside but not consume it (`E0316`).
 - An operation's continuation (§6.6) is a `once` function, so it is a resource too: `resume k`
@@ -2198,7 +2209,7 @@ again.
 
 - `E0225`: `release for` a type that is not opaque.
 - `E0316`: a resource used after it was consumed, or consumed by code that may run more than once;
-  a function that consumed one passed on; a continuation resumed twice.
+  a function that consumed one, passed on instead of called; a continuation resumed twice.
 - `E0317`: a resource would be copied: compared, shown, or used as an ordinary type parameter.
 - `E0318`: a borrowed resource consumed, or a function borrowing one that might outlive it.
 - `E0322`: a resource created or named where nothing owns it.
@@ -2211,63 +2222,64 @@ scope ends. The scope is called a *region*, and the value is accessed through a 
 
 ```ply
 fn first_byte(path: String) -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.close[repo], io.refused, io.closed} =
-  with_hold[file](io::reading[repo](path), io::shut) { source -> io::read(source, 1) }
+  with_hold[file](io::reading[repo](path), io::close_source) { source -> io::read(source, 1) }
 ```
 
 `with_hold[r](acquire, release) { h -> body }` runs `body` with `h` bound to a hold on what
-`acquire` returned, a `Hold<a, [r]>`. At the region's closing `}`, `release` is called on it.
-`release` is any function of the value, `(a) -> Unit / e`, so one form works for every kind of
-resource: a library exports the pair (`std.io`'s `reading` and `shut`). The region's row is
-`acquire`'s, `release`'s and the body's.
+`acquire` returned, a `Hold<a, [r]>`. At the region's closing `}`, `release` is called on the
+acquired value. `release` is any function that takes the value, `(a) -> Unit / e`, so one form
+works for every kind of resource. A library exports the two functions as a pair (`std.io`'s
+`reading` and `shut`). The region's row combines the rows of `acquire`, `release` and the body.
 
-`release` runs exactly once, where the region stands and with the handlers around it, however the
-body ends: it returned; a raise or a clause that did not resume unwound it (before the clause that
+`release` runs exactly once, at the region and under the handlers around it, however the body ends:
+the body returned; a raise or a clause that did not resume unwound it (before the clause that
 handles the raise runs, §6.8); or its task was cancelled (§9). A cancel does not interrupt
-`acquire` or `release` (§6.6), so what was acquired is released. If `acquire` raised, nothing is
-held and nothing is released. A `release` that raises replaces what was unwinding. Nested holds are
-released innermost first. A runtime failure ends the program and releases nothing.
+`acquire` or `release` (§6.6), so what was acquired is released. If `acquire` raised, nothing was
+acquired and nothing is released. A `release` that raises replaces whatever was unwinding the body.
+Nested holds are released innermost first. A runtime failure ends the program and releases nothing.
 
-**Reading a hold.** `h.get()` returns the held value and adds `hold.read[r]` to the caller's row,
-where `r` is the hold's region.
+**Reading a hold.** `h.get()` returns the value the hold gives access to, and adds `hold.read[r]` to
+the caller's row, where `r` is the hold's region.
 
 - A function that takes a hold has the region as a label parameter (§4.5): `fn first<[r]>(h:
-  Hold<Bytes, [r]>) -> Int / {hold.read[r]}`. A call fills it from the hold it passes, never
-  explicitly.
-- A closure that reads a hold carries the atom in its type.
+  Hold<Bytes, [r]>) -> Int / {hold.read[r]}`. A call fills it from the hold it passes; it is never
+  written explicitly.
+- A closure that reads a hold carries the `hold.read[r]` atom in its type.
 - `with_hold[r]` handles `hold.read[r]` for its own hold only. `hold` is a built-in effect
   (`E0105`, `E0103`).
 
 **A hold cannot escape.** `Hold` can be written only as a parameter type (of a definition, a lambda
 or a function type), and anywhere else is `E0446` (§4.6). So holds can be passed to functions and
-into the closures of `List::map`, `List::fold` and `iterate`, and the checker still sees every way
-out of the region: the hold itself by its type, and a closure that reads it by its row, both of
-which name the region. Code that reads one hold may leave another hold's region. A hold is released
-at the `}` of its own region, so each region has its own name: a `with_hold[r]` inside a region
-already named `r` is `E0330`.
+into the closures of `List::map`, `List::fold` and `iterate`, and the checker still sees every way a
+hold could leave the region: the hold itself through its type, and a closure that reads it through
+its row. Both name the region. Code that reads one hold may leave another hold's region. A hold is
+released at the `}` of its own region, so each region needs its own name: a `with_hold[r]` inside a
+region already named `r` is `E0330`.
 
 Inside the region, `r` in a `hold` atom means the region. Everywhere else, and under every other
 effect inside the region, `r` is the global label of that name (§6.2). So a row written outside the
-region cannot name it: a parameter typed `() -> Int / {hold.read[r]}` does not accept a closure over
-the hold (`E0302`), and a `with_hold[r]` does not handle the `hold.read[r]` of a function it calls.
-Pass such a closure through a row parameter instead: `fn twice<| e>(f: () -> Int / e) -> Int / e`.
-A definition's own row says `hold.read[r]` only when a clause that binds `resume` (§6.6) ran the
-rest of a region's body after the region ended. No region handles that atom, so it appears in every
-caller's row.
+region cannot name it: a parameter typed `() -> Int / {hold.read[r]}` does not accept a closure that
+reads the hold (`E0302`), and a `with_hold[r]` does not handle the `hold.read[r]` of a function it
+calls. Pass such a closure through a row parameter instead:
+`fn twice<| e>(f: () -> Int / e) -> Int / e`. A definition's own row contains `hold.read[r]` only
+when a clause that binds `resume` (§6.6) ran the rest of a region's body after the region ended. No
+region handles that atom, so it appears in every caller's row.
 
-**Tasks and regions.** A task's scheduler must be younger than any region whose hold the task can
-reach. Open the scheduler inside the region, `with_hold[r](..) { h -> simulate { .. } }`, not
-around it, `simulate { with_hold[r](..) { h -> .. } }`. An older scheduler (an enclosing `simulate`
-region (§9), or the program's own top-level scheduler (§14)) runs unjoined tasks after the region's
-`}`, and a `task.join` inside the region does not help, because no type records the join. A task
-reaches a hold through the closure it is given, and through the handlers around its `task.spawn`: a
-clause answering an operation the task performs runs on the task's behalf, so under an older
-scheduler it may not read the region's hold either. This check covers spawns a body performs
-itself, not those of functions it calls.
+**Tasks and regions.** A task's scheduler must be *younger* than any region whose hold the task can
+reach: opened inside that region. Open the scheduler inside the region,
+`with_hold[r](..) { h -> simulate { .. } }`, not around it,
+`simulate { with_hold[r](..) { h -> .. } }`. An older scheduler (an enclosing `simulate` region
+(§9), or the program's own top-level scheduler (§14)) can run a task that was never joined after
+the region's `}`. A `task.join` inside the region does not help, because no type records the join.
+A task reaches a hold through the closure it is given, and through the handlers around its
+`task.spawn`: a clause that handles an operation the task performs runs on the task's behalf, so
+under an older scheduler it may not read the region's hold either. This check covers only the
+spawns a body performs itself, not those of functions it calls.
 
 **What a hold protects.** The value `Hold::get` returns is an ordinary value, and a copy of it may
-leave the region even though the hold cannot. So a library makes the held value useless without its
-hold: its functions take the `Hold`, and refuse to work on something already released, as a
-`std.io` source read after its close raises `io.closed`. A lazy `Seq` (`std.seq`) whose steps read a
+leave the region even though the hold cannot. So a library makes the value useless without its
+hold: its functions take the `Hold`, and fail on something already released. For example, reading a
+`std.io` source after it is closed raises `io.closed`. A lazy `Seq` (`std.seq`) whose steps read a
 hold carries `hold.read[r]` in its row, so it must be built and consumed inside the region; letting
 it leave is `E0446`.
 
@@ -2279,11 +2291,11 @@ and `release` does not run again.
 
 - `E0330`: a `with_hold` names a region that is already open.
 - `E0331`: a hold read or released after its region released it (at run time).
-- `E0446`: `Hold` written where a hold would be kept; a hold, or a closure that reads one, escaping
-  its region; a region's value outliving it (passed to an operation, or reached by a task whose
-  scheduler is older than the region); a declared type's field or an operation's signature
-  mentioning `Hold`, `Task` or `Chan`; or a variant field, operation parameter or result holding a
-  function whose written row reaches one (§4.6).
+- `E0446`: `Hold` written where a hold would be stored; a hold, or a closure that reads one,
+  escaping its region; a region's value outliving it (passed to an operation, or reached by a task
+  whose scheduler is older than the region); a declared type's field or an operation's signature
+  mentioning `Hold`, `Task` or `Chan`; or a variant field, operation parameter or result that
+  contains a function whose written row reaches one (§4.6).
 - `E0449`: a task, channel or continuation reaching a host operation, a host result, or an entry
   point's argument or result (at run time). A continuation's type is a function type, so this is
   the only check that catches it.
@@ -2295,21 +2307,21 @@ and `release` does not run again.
 `test "label" { ... }` is an item with a block body (§6.5 shows one). A test cannot be `pub`,
 referenced or given arguments.
 
-- A test is identified as `<module>.<name>`, and its name is its label as written, holes and all.
-  Two tests (or two laws) in one module cannot share a label (`E0105`), with one exception: two
-  tests over cases may share a label that has holes, as long as their case types or tables are
-  written differently. Each of their cases is named by the label it produces (below). A test whose
-  label an earlier test has is named by the label followed by the first of ` (2)`, ` (3)`, … that
-  no test has as its label or name.
+- A test is identified as `<module>.<name>`, and its name is its label as written, including any
+  holes. Two tests (or two laws) in one module cannot share a label (`E0105`), with one exception:
+  two tests over cases may share a label that has holes, as long as their case types or tables are
+  written differently. Each of their cases is named by the label it produces (below). A test with
+  the same label as an earlier test is named by the label followed by the first of ` (2)`, ` (3)`,
+  … that no test uses as its label or name.
 - The body must have type `Unit`: a test passes when it finishes, so one that ends with a value
   (such as a comparison missing its `assert`) is `E0201`.
 - `assert(cond)`, `assert(cond, Some("why"))` and `assert_eq(actual, expected)` fail with `E0501`.
   `assert_eq` reports both values and their first difference. Any other failure is `E0502`.
 - A test that passes but leaves one of its own objects alive once it ends fails with `E0505`. This
-  is checked after its tasks finish and its bodies release what they held. Every value is released
-  once nothing holds it, so an object left alive is a leak, and a defect in Ply. What the build
-  stored, a cached constant's stored copy, and what a scheduler holds for itself are not the test's.
-
+  is checked after its tasks finish and its bodies release what they own. Every value is released
+  once nothing refers to it, so an object left alive is a leak, and a defect in Ply. What the build
+  stored, a cached constant's stored copy, and what a scheduler keeps for itself do not belong to
+  the test.
 
 **Tests over cases.** A test can run once for each element of a table. Each run is a *case*:
 
@@ -2323,26 +2335,26 @@ test "resolves {c.reference}" for c: Resolution in resolutions() {
 
 `for <name>: <Type> in <table>` goes between the label and the body (on a `test/nondet` too).
 
-- The table is an expression of type `List<Type>` (`E0201`), usually a call of a function that
+- The table is an expression of type `List<Type>` (`E0201`), usually a call to a function that
   builds it, often from `embed_dir` (§3.4). A function with no parameters is computed once however
   many cases read it. A record literal in it is a `new` record when the case type is one (§4.2).
 - The name is bound in the body and in the label. The label is read like an interpolated string
-  (§2.3): each `{expr}` is a hole, and `{{` and `}}` are braces.
+  (§2.3): each `{expression}` is a hole, and `{{` and `}}` are literal braces.
 - Each case is identified as `<module>.<label>`, using the label its holes produce, so every case
   and test in a module needs its own label. If a case has the same label as another case in its
   table, another test's name or a case of another test, its test fails as a whole with `E0105`,
-  naming the label, and none of its cases runs. Two identical cases produce the same label, and a label with no holes
-  fits only a table of one case.
-- Cases are told apart by their value as built, which is finer than `==`: `1.5m` and `1.50m` are
-  two cases, as are two values of a keyed type (§4.4) whose keys are equal. So one case's pass
-  never stands for a case its body could tell apart.
+  naming the label, and none of its cases runs. Two identical cases produce the same label, and a
+  label with no holes works only for a table of one case.
+- Cases are distinguished by their value as built, which is finer than `==`: `1.5m` and `1.50m`
+  are two cases, as are two values of a keyed type (§4.4) whose keys are equal. So a pass of one
+  case never counts for another case that its body could distinguish.
 - The case type must be hashable without a `key` (`derivable(hash, ·)`, `E0206`): no `Float`,
   function, `Task`, `Chan` or `Secret`, including inside a keyed type.
 - Cases are listed before any test runs, so the table and the label may raise (any `raise`
   operation, §6.8) but do nothing else (`E0469`). A table that raises fails as a whole, under the
-  test's name. An empty table is no test.
-- A tagged literal (§2.3) in a table, a label hole or a body is checked when the program loads, like
-  any other.
+  test's name. An empty table produces no test.
+- A tagged literal (§2.3) in a table, a label hole or a body is checked when the program loads,
+  like any other.
 - A module with a test over cases imports `std.cases` automatically, so `std.cases` itself cannot
   have one. A doc comment above such a test documents nothing, as above any test (`E0003`, §2.1).
 
@@ -2351,9 +2363,9 @@ test "resolves {c.reference}" for c: Resolution in resolutions() {
 
 ```ply
 import std.snapshot
-import std.snapshot (Stored)
+import std.snapshot (Snapshots)
 
-fn stored() -> Stored = { dir: "snapshots", files: embed_dir("snapshots") }
+fn stored() -> Snapshots = { dir: "snapshots", files: embed_dir("snapshots") }
 
 test "an order renders as stored" {
   snapshot::check(stored(), "order.txt", snapshot::render(order()))
@@ -2361,9 +2373,9 @@ test "an order renders as stored" {
 ```
 
 `check` fails with a unified diff from the stored text to the rendering, or with the diff that
-would create a missing file. It never writes. To store snapshots, an entry point calls
-`snapshot::accept`, which writes through `std.fs`, and you run it with the directory granted: `ply run
-. --fs snapshots=snapshots` (§14). See `ply doc std.snapshot`.
+would create a missing file. It never writes files. To store snapshots, an entry point calls
+`snapshot::accept`, which writes through `std.fs`, and you run it with the directory granted:
+`ply run . --fs snapshots=snapshots` (§14). See `ply doc std.snapshot`.
 
 ### 8.2 Which tests run
 
@@ -2373,96 +2385,96 @@ A call on a value (§5.4) refers to every function of that name the module can s
 those of each module it imports, directly or indirectly), since the hash is computed before types
 are known.
 
-A test runs only when there is no recorded pass for its hash, or for the compiled code it would
-run, that still holds. So renames and comment edits run nothing, and neither does an edit (or a new
-`ply`) that compiles a test to the same code. The summary counts those as `by code` (`by_code` in
-`--json`, reason `same code`). `ply hash` prints the hashes, and `ply check --json` gives each
+A test runs only when there is no recorded pass, still valid, for its hash or for the compiled code
+it would run. So renames and comment edits run no tests, and neither does an edit (or a new `ply`)
+that compiles a test to the same code. The summary counts those as `by code` (`by_code` in
+`--json`, reason `same code`). `ply hash` prints the hashes, and `ply check --json` reports each
 definition's and test's `hash`.
 
 A pass also records what the test read from the outside world, and stays valid only while all of
 that is unchanged; otherwise the test runs again (reason `changed`):
 
 - each file and directory a host handler read for it under a root (recorded by the root's name, so
-  a pass holds across checkouts);
+  a pass stays valid across checkouts);
 - each standard library module it used, recorded as the functions, types and effects the test
-  actually reached, so an edit to a function no test reached runs nothing;
-- what every `ply` process it started read, including that `ply`'s own program;
+  actually reached, so an edit to a function no test reached runs no tests;
+- everything read by each `ply` process it started, including that `ply`'s own program;
 - for a test that reached a host handler, the permissions it ran with (what `--fs`, `--exec` and
-  `--allow` lend).
+  `--allow` grant).
 
-These are not inputs: a read handled by the test's own handler, a read of something the test wrote
-first, the clock, the network, programs other than `ply`, and caches kept between runs
-(`PLY_C_CACHE`, `PLY_C_STAGE`). A `ply` process that ended before reporting what it read records no
-pass.
+These do not count as inputs: a read handled by the test's own handler, a read of something the
+test wrote first, the clock, the network, programs other than `ply`, and caches retained between
+runs (`PLY_C_CACHE`, `PLY_C_STAGE`). A `ply` process that ended before reporting what it read
+records no pass.
 
 Flags:
 
-- `--explain` says why each test was selected. For a `changed` test, it names the input that changed
-  (`moved` in `--json`). It also shows what a pass is recorded under (the test's hash, the runtime,
-  and the compiled code; `filed_under` in `--json`), and where the run's time went, phase by phase
-  (`phases` in `--json`).
-- `--filter SUBSTRING` runs tests whose `<module>.<label>` contains the text. A filter that names a
-  module, one holding a `.` with a whole dotted run that is a module's name (`std.ascii85.`,
-  `std.ascii85`), matches only from within a test's `<module>.`, never inside a label. Repeat it to
-  run tests matching any of them.
+- `--explain` reports why each test was selected. For a `changed` test, it names the input that
+  changed (`moved` in `--json`). It also shows what a pass is recorded under (the test's hash, the
+  runtime, and the compiled code; `filed_under` in `--json`), and where the run's time went, phase
+  by phase (`phases` in `--json`).
+- `--filter SUBSTRING` runs tests whose `<module>.<label>` contains the text. A filter names a
+  module when it contains a `.` and a complete dotted name in it is a module's name
+  (`std.ascii85.`, `std.ascii85`). Such a filter matches only within a test's `<module>.` part,
+  never inside a label. Repeat it to run tests matching any of them.
 - `--shard K/N` runs part K of N of the selected tests. Tests are split by a hash of their name, so
   a test is always in the same part, and parts `1/N` to `N/N` together run each test once.
 - `--no-cache` ignores recorded results and cached checks.
 
 Each case of a test over cases (§8.1) is selected as a test of its own. Its hash is the test's hash
 (covering the body and the case type, but not the table or the label) combined with the case's
-value. A case added to the table runs alone, wherever it is added. Reordering the table or
-rewording the label runs nothing. Editing the body runs every case, and editing what the table is
-built from runs only the cases whose values changed. A case's label is the one its holes produce,
-which is what `--filter` and `--shard` match. Listing the cases runs the table, so a run that
-reports on a test over cases builds the program even when every case has a pass. A run lists only
-the tables of the modules its path names that a `--filter` could match a case of: a filter that
-names a module lists that module's tables and those beneath it.
+value. A case added to the table is the only case that runs, wherever it is added. Reordering the
+table or rewording the label runs no case. Editing the body runs every case, and editing what the
+table is built from runs only the cases whose values changed. A case's label is the one its holes
+produce, which is what `--filter` and `--shard` match. Listing the cases evaluates the table, so a
+run that reports on a test over cases builds the program even when every case has a pass. A run
+lists only the tables in the modules its path names whose cases a `--filter` could match: a filter
+that names a module lists that module's tables and those of the modules beneath it.
 
 ### 8.3 Determinism
 
-A test whose row, after its own handlers, still has an atom of a `nondet` effect is an error
+A test whose row, after its own handlers, still contains an atom of a `nondet` effect is an error
 (`E0412`). Handle the effect, or write `test/nondet "label" { ... }`. A `test/nondet` is cached like
 any test (§8.2): what it reads from the clock or the network does not count as an input.
 
 ### 8.4 Scheduling and failures
 
-Tests whose footprints do not conflict run at the same time, in `parallel` blocks (§5.9) on one
-thread per core. A test's *footprint* is the set of effects it performs on the outside world; a test
+A test's *footprint* is the set of effects it performs on the outside world. Tests whose footprints
+do not conflict run at the same time, in `parallel` blocks (§5.9) on one thread per core. A test
 whose effects are all handled inside it conflicts with nothing. Only atoms of `nondet` effects
 conflict between tests, since anything else is determined by the test's own state. A raise is never
-part of a footprint, since the run handles it as the test's failure. `--jobs N` (`-j`) deals tests
+part of a footprint, since the run handles it as the test's failure. `--jobs N` (`-j`) splits tests
 into `N` lanes, each running its tests in turn (default: one lane per test). `ply prove --jobs N`
-deals out its claims' points the same way.
+splits its claims' points the same way.
 
-The report is printed as the run goes:
+The report is printed as the run proceeds:
 
 1. what was selected and how it will run: the groups and workers, isolation, the host permissions,
-   and what `--explain` says about selection;
+   and what `--explain` reports about selection;
 2. each group's results as that group finishes, in the order the groups ran, with the message and
-   place of each test that did not pass under its line. A long run shows progress and its first
+   location of each test that did not pass under its line. A long run shows progress and its first
    failure early, and a run that ends early still shows every result it finished;
-3. the run's own figures (handshakes, the backend, simulation, and with `--explain` where the time
-   went), the summary, and each failure's diagnosis.
+3. the run's own statistics (handshakes, the backend, simulation, and with `--explain` where the
+   time went), the summary, and each failure's diagnosis.
 
-Under `--json`, items 1 and 2 go to standard error as the run goes, and one object goes to standard
-output when the run ends, in place of item 3. `--workspace` prints each package's heading before it
-runs.
+Under `--json`, items 1 and 2 go to standard error as the run proceeds, and one object goes to
+standard output when the run ends, in place of item 3. `--workspace` prints each package's heading
+before it runs.
 
-`--timeout MS` is how much wall-clock time each test may take (default 60000; `0` is no limit). It
-is not a verdict: a test over it is *abandoned* (`W0612`), reported separately from failures,
-recorded nowhere, and run again next time. A run with an abandoned test is not a success, since it
-decided nothing about that test.
+`--timeout MS` is how much wall-clock time each test may take (default 60000; `0` is no limit). A
+test that runs over it does not fail: it is *abandoned* (`W0612`), reported separately from
+failures, recorded nowhere, and run again next time. A run with an abandoned test is not a success,
+since it reached no result for that test.
 
-**Suspects.** A failure lists its suspects: the definitions its test reaches that changed since the
-test last passed, and the test itself when its own text changed. A passing run stores the text of
-each test that passed and of each definition it reached. A definition whose hash changed is edited
-when its text differs from the stored one, and changed only because something it uses changed when
-its text is the same. The test comes first, then each definition that was edited, added or
-removed, then the rest. After the failures, `ply test` prints each change once as a diff of its
-text then and now, with where it is now. A diff longer than 40 lines is cut short. A test that never
-passed, or a run under `--no-cache`, has no earlier version to compare: its suspects are the
-definitions it reaches that no passing run has seen.
+**Suspects.** A failure lists its *suspects*: the definitions its test reaches that changed since
+the test last passed, and the test itself when its own text changed. A passing run stores the text
+of each test that passed and of each definition it reached. A definition whose hash changed counts
+as edited when its text differs from the stored text. When its text is the same, it changed only
+because something it uses changed. The test comes first, then each definition that was edited,
+added or removed, then the rest. After the failures, `ply test` prints each change once as a diff
+of its old and new text, with its current location. A diff longer than 40 lines is truncated. A
+test that never passed, or a run under `--no-cache`, has no earlier version to compare: its
+suspects are the definitions it reaches that no passing run has seen.
 
 `--json` prints one object with each failure's diagnostic, declared footprint, suspects and replay
 command, and `diffs`: each change once, with its name, kind, location and unified diff
@@ -2471,7 +2483,7 @@ including handled ones. `--watch` reruns on every `.ply` change and on every cha
 last run embedded, keeping caches in memory.
 
 Each case of a test over cases (§8.1) passes, fails and is reported under its own label, so a
-failing table names every failing case. In `--json`, a case's entry under `selection.tests` has
+failing table reports every failing case. In `--json`, a case's entry under `selection.tests` has
 `case`: the test it belongs to (`of`), its position in the table (`at`), and its `identity`, the
 BLAKE3 hash of its value. A failing case's suspects are what it runs, which excludes the table.
 
@@ -2482,13 +2494,14 @@ from the hashes alone.
 
 `--mutate [DEF]` runs after a passing run. Each definition (or only `DEF`, a full name or a unique
 simple name) is changed one operator or literal at a time: `+`/`-`, `<`/`<=`, `>`/`>=`, `==`/`!=`,
-`&&`/`||`, `true`/`false`, a `!` removed, an integer increased by one. The program is checked
-again, and the tests that reach the definition run against the mutant, using a scratch store that
-never touches the cache. A mutant that every one of those tests passes is a *survivor*: it is
-reported with its location and the tests that let it through, and fails the run. A mutant that does
-not type-check is skipped. `--mutate-budget N` (default 64) limits how many mutants are tried. A
-case (§8.1) reaches what its test does, including its table, and a mutant that changes a case's
-value is killed by that case, which the table no longer contains.
+`&&`/`||`, `true`/`false`, a `!` removed, an integer increased by one. Each changed version is a
+*mutant*. The program is checked again, and the tests that reach the definition run against the
+mutant, using a scratch store that never touches the cache. A mutant that every one of those tests
+passes is a *survivor*: it is reported with its location and the tests that let it through, and
+fails the run. A mutant that does not type-check is skipped. `--mutate-budget N` (default 64)
+limits how many mutants are tried. A case (§8.1) reaches what its test reaches, including its
+table. A mutant that changes a case's value is killed by that case, which the table no longer
+contains.
 
 ### 8.6 Compiled backend
 
@@ -2497,12 +2510,12 @@ Every command compiles the program to C and runs the compiled code; there is no 
 `cc -O0`) or `--profile release` (`cc -O2`), which picks the C toolchain settings. Other commands
 compile under `development`.
 
-Every program that checks compiles. A definition Ply fails to compile is a defect in Ply, reported
-as `E0505` when the program is built.
+Every program that passes the checker compiles. A definition Ply fails to compile is a defect in
+Ply, reported as `E0505` when the program is built.
 
 | variable | effect |
 | --- | --- |
-| `PLY_CC=cmd` | the C compiler to run in place of `cc`; while it is set, `tcc` is not used |
+| `PLY_CC=command` | the C compiler to run in place of `cc`; while it is set, `tcc` is not used |
 | `PLY_C_CACHE=DIR` | where compiled code and other build results are cached, keyed by content (default `ply/cache` under the user's cache directory: `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere) |
 | `PLY_C_CACHE_MAX=BYTES` | a size limit for the cache, enforced by deleting the least recently used entries first, but never one used in the last hour; `0` is no limit |
 
@@ -2510,7 +2523,7 @@ These variables are for working on `ply` itself:
 
 | variable | effect |
 | --- | --- |
-| `PLY_C_STAGE=DIR` | where the compiler's own build stages are kept, separate from the cache (default `ply/stage` next to it) |
+| `PLY_C_STAGE=DIR` | where the compiler's own build stages are stored, separate from the cache (default `ply/stage` next to it) |
 | `PLY_C_PHASES=1` | print what each build phase did and how long it took |
 | `PLY_HEAP_POISON=1` | fill freed memory with a pattern and fail on any read of it |
 | `PLY_HEAP_DELAY=N` | reuse freed memory only after `N` more frees |
@@ -2551,22 +2564,23 @@ nondet effect random { write next() -> Int
 effect sim           { read  seed() -> Int }
 ```
 
-- The region's row gains `sim.read`, which a deterministic test may have.
+- A `simulate` region adds `sim.read` to its row, which a deterministic test may have.
 - Time is virtual: it advances only when no task can run, so `clock.sleep` takes no real time.
   Outside a `simulate` region, `task` is the program's own scheduler and `clock` is the real clock
   (§14).
-- A task performs operations against the handlers around its `task.spawn`, so a clause it reaches
-  can read only the holds the task itself may (§7.2). A clause that returns, or resumes in tail
-  position, handles the task's operation as it would the spawner's. One that resumes elsewhere, or does not
-  resume, would capture or abandon the spawner's body rather than the task's, and is refused when
-  the task reaches it (`E0502`). This does not apply to clauses for raises (§6.8).
+- A task's operations are handled by the handlers around its `task.spawn`, so a clause that handles
+  one can read only the holds the task itself may read (§7.2). A clause that returns, or resumes in
+  tail position, handles the task's operation as it would the spawner's. A clause that resumes
+  elsewhere, or does not resume, would capture or abandon the spawner's body rather than the
+  task's, so it fails with `E0502` when the task reaches it. This does not apply to clauses that
+  handle raises (§6.8).
 - If a spawned task raises and no clause the task installed handles it, or a raise in the region's
-  body is not handled there, the region first cancels every other task, so each releases its
-  brackets (§6.6). Once they have ended, the raise arrives where the `simulate` is written, as if
-  the region's body raised it. A second raise from a task during this goes nowhere.
-- A `parallel` block (§5.9) inside a region runs its branches in turn, so the scheduler sees none of
-  it. A branch may not open a region (`E0309`), since a region's schedule is drawn from its entry's
-  seed in the order regions open.
+  body is not handled there, the region first cancels every other task, so each runs the `release`
+  of its brackets (§6.6). Once they have ended, the raise reaches the place where the `simulate` is
+  written, as if the region's body raised it. A second raise from a task during this is dropped.
+- A `parallel` block (§5.9) inside a region runs its branches one after another, so the scheduler
+  sees none of it. A branch may not open a region (`E0309`), since each region's schedule is taken
+  from its entry's seed in the order the regions open.
 
 Errors:
 
@@ -2574,61 +2588,63 @@ Errors:
   closure that captured it. A closure's type shows a captured task only as `task.join`,
   `task.await` or `task.cancel` in its row, a captured channel as `task.send`, `task.recv`,
   `task.close` or `task.select`, and either as the `sim.read` of a `simulate` it opens to use one;
-  so a function whose row has any of these may not leave the region. Nor may a task or channel
-  from outside come in: the region may not use a variable from outside whose value holds one. Each
-  region numbers its own tasks and channels, so a handle that sneaks into another region (in a
+  so a function whose row contains any of these may not leave the region. Nor may a task or channel
+  from outside come in: the region may not use a variable from outside whose value contains one.
+  Each region numbers its own tasks and channels, so a handle that gets into another region (in a
   closure or through a type parameter) fails there at run time with `E0413`.
 - `E0414`: no task can make progress (deadlock), or an interleaving took more scheduling steps than
   `--sim-steps` allows.
 - `E0416`: a `simulate` inside another. A `simulate` inside a task of the program's own scheduler
-  (§14) is allowed, its schedule drawn from the entry's seed.
-- `E0425`: a host operation inside the region, refused before the handler runs, whether or not it
-  is set up. The region handles `task`, `clock`, `random` and `sim.seed` itself.
+  (§14) is allowed, with its schedule taken from the entry's seed.
+- `E0425`: a host operation inside the region, rejected before the handler runs, whether or not a
+  handler is installed. The region handles `task`, `clock`, `random` and `sim.seed` itself.
 
 **Cancellation.** `task.cancel(t)` stops `t` where it is. A sleep, join, channel operation or host
 operation it is waiting on is abandoned; an operation that completed but whose result it has not
 used yet loses its result; and it performs nothing more except the `release` of each `bracket` it is
-in (§6.6). When it next runs, it only unwinds, releasing what it holds.
+in (§6.6). When it next runs, it only unwinds, releasing what it owns.
 
-- A bracket is where a result is kept. Inside an `acquire`, a cancel stops waiting but takes no
-  result: the `acquire` continues (an operation that completes at once still completes, and one that
-  would wait ends it), and the cancel takes effect when it returns, with what it returned released.
-  Inside a `release`, a cancel interrupts nothing and takes effect when the `release` returns.
-- `cancel` returns `false` for a task that had already finished (whose result it leaves alone) and
+- A bracket is how a result survives a cancel. Inside an `acquire`, a cancel ends the wait but does
+  not discard a result: the `acquire` continues (an operation that completes at once still
+  completes, and one that would wait ends the `acquire`), and the cancel takes effect when the
+  `acquire` returns, releasing what it returned. Inside a `release`, a cancel interrupts nothing
+  and takes effect when the `release` returns.
+- `cancel` returns `false` for a task that had already finished (and leaves its result alone) and
   for one already cancelled.
 - `task.await(t)` is a join that returns `Some` of the result, or `None` if `t` was cancelled.
   `task.join` of a cancelled task has nothing to return and raises (§6.8).
 - A task cannot cancel itself or the region's body.
-- A deadline combines the two: one task sleeps and then cancels another, which a third awaits.
-- The search tries each cancel one step earlier and one step later, and from each of those the next,
-  until it has tried every point it could land.
+- A deadline is built from these operations: one task sleeps and then cancels another, which a
+  third awaits.
+- The search tries each cancel one step earlier and one step later, and from each of those the
+  next, until it has tried every point where the cancel could take effect.
 
-**Channels.** `task.channel(n)` makes a channel holding up to `n` values no receiver has taken yet.
-`0` makes a rendezvous channel, where a send waits for the receive that takes it.
+**Channels.** `task.channel(n)` makes a channel that holds up to `n` values no receiver has taken
+yet. `0` makes a rendezvous channel, where a send waits for the receive that takes its value.
 
-- A send waits while the channel is full, and returns `true` once its value is queued or handed
-  over. A receive waits while it is empty and returns the oldest value sent.
+- A send waits while the channel is full, and returns `true` once its value is queued or passed to
+  a receiver. A receive waits while the channel is empty and returns the oldest value sent.
 - `task.close(c)` ends sending: a waiting receiver gets `None` and a waiting sender `false`; later
   sends return `false` without sending; receives take what was queued before the close, then
   `None`. Closing twice changes nothing. A negative capacity raises (§6.8).
-- Cancelling a task waiting on a channel stops its wait, and a value it was sending is dropped. A
-  value a receive returned is lost with a receiver cancelled before it used it, unless the receive
-  was a bracket's `acquire`.
-- All operations on one channel are ordered against each other, so the search tries every order two
-  senders or two receivers could take.
-- A race is one channel: each worker sends its result, the first receive wins, and cancelling the
-  others stops them.
+- Cancelling a task waiting on a channel stops its wait, and a value it was sending is dropped. If
+  a receiver is cancelled before it uses a value a receive returned, the value is lost, unless the
+  receive was a bracket's `acquire`.
+- All operations on one channel are ordered against each other, so the search tries every order in
+  which two senders or two receivers could run.
+- A race uses one channel: each worker sends its result, the first receive wins, and cancelling the
+  other workers stops them.
 
 `task.select(arms, wait)` performs one of several channel operations. An arm is a channel with
 `None`, to receive from it, or with `Some(x)`, to send `x` to it. The first arm (in the order given)
 that can proceed without waiting does, and `select` returns `Some((i, got))`: the arm's index, and
 `Some` of the value received or sent, or `None` if the channel was closed (a receive found it closed
-and empty, or a send was refused). When no arm can proceed, `wait: false` returns `None` at once,
-and `wait: true` waits on every arm, queued in each channel as a plain send or receive would be, and
+and empty, or a send failed). When no arm can proceed, `wait: false` returns `None` at once, and
+`wait: true` waits on every arm, queued in each channel as a plain send or receive would be, and
 proceeds with the first that becomes ready, as if it had never waited on the others. Arm order is
 the only priority, so a caller that wants fairness rotates the arms, as `std.chan` does. All arms
-carry one type, so to select over channels of different types, use channels of one sum type. A
-select is ordered against every operation on each of its channels.
+have one element type, so to select over channels of different types, use channels of one sum type.
+A select is ordered against every operation on each of its channels.
 
 **Interleavings.** Tasks switch only at `task`, `clock` and `random` operations. Any two
 allocations, and any two accesses to one handler variable where one writes, are ordered. A read and
@@ -2679,12 +2695,13 @@ law "a credit and a matching debit leave an account exactly as it was"
   `where` guard, and a block body.
 - A law's or schema's `where` may start with `identity(a)` constraints on its type variables, then
   a comma and the guard: `forall (xs: List<a>, n: Int) where identity(a), n > 0`. Under
-  `identity(a)`, `==` at `a` is identity, so the law only claims types whose `==` is identity: not
-  `Float`, `Decimal`, a type with a `key`, an `extern type`, `Hold`, `Task`, `Chan`, `Secret`, a
-  function, or anything holding them. Without the constraint, `==` at a type variable means only
-  what holds at every type (below). Using a constrained schema at a type that breaks the constraint
-  is `E0479`, and a law over such a variable is not a lemma at other types. A leading `identity(x)`
-  where `x` is not a type variable of the binders (or a schema type parameter) is read as the guard.
+  `identity(a)`, `==` at `a` is identity, so the law makes claims only about types whose `==` is
+  identity: not `Float`, `Decimal`, a type with a `key`, an `extern type`, `Hold`, `Task`, `Chan`,
+  `Secret`, a function, or anything containing them. Without the constraint, `==` at a type
+  variable means only what holds at every type (below). Using a constrained schema at a type that
+  breaks the constraint is `E0479`, and a law over such a variable is not a lemma at other types. A
+  leading `identity(x)` where `x` is not a type variable of the binders (or a schema type
+  parameter) is read as the guard.
 - Specs, guards and law bodies must be pure (`E0417`), except that they may raise (§6.8) or not
   return (§5.10). A law body may be a `simulate` region.
 - Specs do not change a definition's hash. An `ensures` implies that every resource outside the
@@ -2703,8 +2720,8 @@ on is `proved`.
 | `defect` | Ply failed, not the program; nothing is claimed |
 
 A property that cannot be proved is not a claim a program may rely on. Check it in a test (§8.1)
-instead, over values `std.gen` generates. Then it says what a test says: that it held where it was
-run.
+instead, over values `std.gen` generates. Then it shows what a test shows: that the property held
+where it was run.
 
 **What the prover can do.** It proves claims using: evaluation of ground terms; enumeration of
 finite domains up to 4096 points; linear `Int` arithmetic; case splits; congruence; constructor
@@ -2734,34 +2751,34 @@ is read according to the operand type:
 - At a type with a `key` (§4.4), `==` compares the keys. Since the prover does not read the key
   function, such a comparison (and `min`, `max` and `Map` operations on keyed values) is treated as
   a call that may end the program.
-- At a value holding any of these, `==` is read part by part where the shapes are known, and
-  otherwise as a symmetric relation, true of a value and itself only when no `Float`, keyed value or
-  type variable could be inside.
+- At a value containing any of these, `==` is read part by part where the shapes are known, and
+  otherwise as a symmetric relation, true of a value and itself only when no `Float`, keyed value
+  or type variable could be inside.
 - At a type variable, `==` is identity only under an `identity` constraint.
 
 An operator at a type with `numeric` is the function it names. An operator on a type the prover
 does not know (a type variable, or a lambda's result) is a function of its operands that may raise.
 A `perform`, `handle` or `simulate` is a value the prover does not read, and a `let` that can fail
 raises where it does not match. In a law, and in any claim's own clause and guards, each of these
-must be shown unreachable. An `ensures`, by contrast, speaks only about what its definition returns:
-a raise in the body, or a call the prover cannot show returns, is a run that returns nothing the
-`ensures` talks about. Calling a function value returns a known result where the prover can read
+must be shown unreachable. An `ensures`, by contrast, states only what its definition returns: a
+raise in the body, or a call the prover cannot show returns, is a run that returns nothing for the
+`ensures` to describe. Calling a function value returns a known result where the prover can read
 its body, or in a law where a binder's type performs nothing (the law is then about such
-functions). An `ensures` may be given functions by callers it cannot see, so calling a function
-parameter there gives nothing to rely on.
+functions). Callers the prover cannot see may pass any function to a definition with an `ensures`,
+so calling a function parameter there gives nothing to rely on.
 
-An `unproved` claim names each place the prover stopped, and says `unclosed` where it read the whole
-claim and found a case it could not close: the claim may be false there, or may need a lemma or a
-guard.
+An `unproved` claim names each place the prover stopped, and reports `unclosed` where it read the
+whole claim and found a case it could not close: the claim may be false there, or may need a lemma
+or a guard.
 
 **Invariant claims.** Each definition in the module of a type with an `invariant` (§4.4) must prove
-that every value of the type it builds satisfies the invariant, under the conditions on the way to
-the build. These claims are named `<owner> builds <type>`.
+that every value of the type it builds satisfies the invariant, under the conditions on the path to
+where it builds the value. These claims are named `<owner> builds <type>`.
 
 - The definition's `requires` are not assumed, since no call is checked against them. A body that
   raises or never returns builds nothing.
-- What a lambda builds must hold for every argument. A constructor passed on as a function, or
-  applied where the prover cannot read, leaves the claim `unproved` as `unseen_build`.
+- What a lambda builds must satisfy the invariant for every argument. A constructor passed on as a
+  function, or applied where the prover cannot read, leaves the claim `unproved` as `unseen_build`.
 - A value of the type that a claim receives (a law's binder, or a call's result) is assumed to
   satisfy the invariant. A value the claim itself builds is not.
 - No run builds values of the type to test a claim with. Only the prover checks these claims.
@@ -2804,8 +2821,8 @@ every claim in a module that imports its module, directly or indirectly. A guard
 another package, which that package proves, is a lemma for the claims of modules that import its
 module. A lemma is applied through its *trigger*: the first call its body always makes whose
 arguments mention every binder. Where a claim makes a matching call (each argument of its binder's
-type), the law at that call becomes a known fact. A trigger that takes an argument apart, as
-`reverse(ys.push(x))` does, stands in for the call in place of its body:
+type), the law at that call becomes a known fact. When a trigger takes an argument apart, as
+`reverse(ys.push(x))` does, the law is used at that call in place of the callee's body:
 
 ```ply
 fn reverse(xs: List<Int>) -> List<Int> =
@@ -2821,8 +2838,8 @@ law "reverse twice is identity" forall (xs: List<Int>) { reverse(reverse(xs)) ==
 Both are `proved`, the second by structural induction on `xs` using the first. Under `--json`, a
 proof certificate's `rules` name each lemma as `lemma` with its `law` and `label`; each induction as
 `induction` with its `binder`, `def`, `over` (`int` or `list`) and `step`; and each `cost` or
-`space` bound read from a body as `cost_bound` or `space_bound` with its `def`. `ran` says whether
-running the code helped make the proof.
+`space` bound read from a body as `cost_bound` or `space_bound` with its `def`. `ran` reports
+whether running the code helped make the proof.
 
 **Law schemas.** A `law schema` states a law once, over the definitions it is about, and a law
 instantiates it:
@@ -2835,12 +2852,12 @@ law "a URL round-trips" = round_trip(url_encode, url_decode)
 ```
 
 - A schema has a name, type parameters, at most one row parameter, and parameters with written
-  types (function-typed parameters are treated as `keep`, §4.7). Then it has what a law has: binders, a guard and a
-  body, pure like a law's (`E0417`). Calling a function parameter whose row performs anything other
-  than a raise or `diverges` is refused in the body.
+  types (function-typed parameters are treated as `keep`, §4.7). Then it has what a law has:
+  binders, a guard and a body, pure like a law's (`E0417`). Calling a function parameter whose row
+  performs anything other than a raise or `diverges` is rejected in the body.
 - The row parameter is what the given definitions may raise: `abort.raise`, their own raises
-  (§6.8), or nothing. Filling it with anything else is `E0417`. A schema has no label parameters. It
-  may be `pub`, and is imported and qualified like a definition.
+  (§6.8), or nothing. Filling it with anything else is `E0417`. A schema has no label parameters.
+  It may be `pub`, and is imported and qualified like a definition.
 - An instantiation gives one argument per parameter, in order (`E0202`), each of the parameter's
   type (`E0201`, or `E0302` for a function that performs more than the row allows): a definition's
   name, a lambda or a value. It writes no binders: the schema's binders are quantified at the types
@@ -2857,7 +2874,8 @@ law "a URL round-trips" = round_trip(url_encode, url_decode)
   as `<name>_where`. Both are `transparent` (below), share the module's namespace (`E0105`), and do
   not count as definitions with or without claims. What a schema's body calls in its own package is
   read from another package like any definition there: by its contract, unless it is `transparent`
-  too. `std.laws` holds the schemas the standard library states its laws with (`ply doc std.laws`).
+  too. `std.laws` contains the schemas the standard library uses to state its laws
+  (`ply doc std.laws`).
 
 **Other packages.** A definition from another package (a dependency, or the standard library when
 you are not working inside the library itself) is known only by its `requires` and `ensures`. A
@@ -2865,19 +2883,19 @@ proof may use what it promises but never unfolds its body; that package proves i
 fn` is known by its body too: a proof anywhere may unfold it, so its body and everything it reaches
 is part of what dependents are checked and proved against.
 
-**`ply prove` output.** It first says how many definitions carry a claim. It then prints each
-claim's outcome as soon as the claim is decided: those the cache answered first, then the rest as
-they are proved. It ends with the definitions that no claim that holds covers, and the tally.
-Under `--json`, the lines it prints as it runs go to stderr, and the object takes the place of the
-rest (§16).
+**`ply prove` output.** It first reports how many definitions have a claim. It then prints each
+claim's outcome as soon as the claim is decided: first those found in the cache, then the rest as
+they are proved. It ends with the definitions that no proved claim covers, and the totals. Under
+`--json`, the lines it prints as it runs go to stderr, and the object takes the place of the rest
+(§16).
 
-- An `unproved` claim says what stands between it and a proof. Under `--json` this is `gap` (a
-  sentence) and `gap_kind`: `open` (with each place the prover stopped as `stuck`);
-  `unhandled_effect` (an `ensures` whose definition performs effects, which only the prover can
-  close); `raised` (with the point as `raised_at`); `unwitnessed` (proved under a guard no value
-  was found to satisfy); `endless` (a law over a `simulate` region whose binders cannot be covered
-  by running); or `unsearched` (a law with more interleavings than the search ran).
-- A failure of Ply's own, such as a proposition its unit holds no root of, is a `defect`,
+- An `unproved` claim reports what prevents a proof. Under `--json` this is `gap` (a sentence) and
+  `gap_kind`: `open` (with each place the prover stopped as `stuck`); `unhandled_effect` (an
+  `ensures` whose definition performs effects, which only the prover can close); `raised` (with
+  the point as `raised_at`); `unwitnessed` (proved under a guard no value was found to satisfy);
+  `endless` (a law over a `simulate` region whose binders cannot be covered by running); or
+  `unsearched` (a law with more interleavings than the search ran).
+- A failure of Ply's own, such as a proposition whose unit contains no root for it, is a `defect`,
   reported under `E0505` as `ply test` reports one, with `defect`: its `code`, `message`, the
   `bindings` Ply failed at, and a `summary`.
 - `summary` counts `proved`, `refuted`, `vacuous`, `unproved` and `defect`.
@@ -2886,22 +2904,23 @@ rest (§16).
 
 Flags:
 
-- `--filter SUBSTRING`: the claims whose owner's name contains the text, as `ply test` matches a
-  key (§8.2); repeat to match any.
+- `--filter SUBSTRING`: selects the claims whose owner's name contains the text, as `ply test`
+  matches a key (§8.2); repeat to match any.
 - `--prove-budget N`: static reasoning steps per claim; a claim that runs out is `unproved`.
 - `--timeout MS`: wall-clock time each entry a claim's evaluation makes may take (default 60000;
-  `0` is no limit), as `ply test --timeout` bounds a test. An evaluation over it is abandoned
+  `0` is no limit), as `ply test --timeout` limits a test. An evaluation over it is abandoned
   (`W0612`) and proves nothing: the claim is `unproved` as one whose evaluation raised, with the
   runtime's message as its `gap`, and it is not cached.
-- `--reach`: ask the static prover alone about every claim, cached or not. Under `--json`, each
-  claim then has `reach`: what it decided (`proved`, `guard_unsatisfiable`, `open` or
-  `budget_spent`), the steps it took, and each place it left the fragment it can decide, as `{kind,
-  about}`; `null` for a law over interleavings, which the static prover never sees.
+- `--reach`: runs the static prover alone on every claim, cached or not. Under `--json`, each claim
+  then has `reach`: what it decided (`proved`, `guard_unsatisfiable`, `open` or `budget_spent`),
+  the steps it took, and each place it left the fragment it can decide, as `{kind, about}`; `null`
+  for a law over interleavings, which the static prover never sees.
 
-A proof made from the claim alone is cached under the claim's hash, which reads other packages'
-definitions by their contracts, so it survives edits to a dependency's body. A proof that running
-helped make is cached under the hash of every implementation the claim runs. Only proofs are
-cached: any other outcome is recomputed on every run.
+A proof made from the claim alone is cached under the claim's hash. That hash covers other
+packages' definitions only by their contracts, so the cached proof stays valid after edits to a
+dependency's body. A proof that running helped make is cached under the hash of every
+implementation the claim runs. Only proofs are cached: any other outcome is recomputed on every
+run.
 
 **Cost bounds.** A `cost` clause bounds how many steps a call takes:
 
@@ -2911,15 +2930,15 @@ fn pairs(xs: List<Int>, ys: List<Int>) -> Int
 = xs.fold(0, |a: Int, x: Int| ys.fold(a, |b: Int, y: Int| b + x * y))
 ```
 
-The bound is an `Int` expression over the parameters, and the steps must be at most a constant times
-the bound plus a constant, at every size including zero. With `ys` empty, these steps still grow with
-`xs`, so `xs.len() * ys.len()` would not hold. A `cost` clause on a definition whose row has
-`diverges` is `E0468`, and on one that performs anything other than a raise is `E0463`, since a
-handler could change the steps.
+The bound is an `Int` expression over the parameters, and the steps must be at most a constant
+times the bound plus a constant, at every size including zero. With `ys` empty, these steps still
+grow with `xs`, so `xs.len() * ys.len()` would not hold. A `cost` clause on a definition whose row
+contains `diverges` is `E0468`, and on one that performs anything other than a raise is `E0463`,
+since a handler could change the steps.
 
 A function parameter may give a name to the steps one call of it takes, after its type. Only the
-definition's `cost` clauses can use that name, as an `Int` of at least 1 (`E0105` if it clashes with
-a parameter or another cost name):
+definition's `cost` clauses can use that name, as an `Int` of at least 1 (`E0105` if it clashes
+with a parameter or another cost name):
 
 ```ply
 fn each_of<| e>(xs: List<Int>, f: (Int) -> Int / e cost k) -> Int / e
@@ -2931,10 +2950,10 @@ fn pairs(xs: List<Int>, ys: List<Int>) -> Int
 = each_of(xs, |_x: Int| total(ys))
 ```
 
-At a call, the name stands for the steps of the function passed in: a lambda's body, a named
+At a call, the name represents the steps of the function passed in: a lambda's body, a named
 definition's body, or the caller's own parameter's cost name. So `pairs` combines `each_of`'s bound
-with its lambda's. A function passed in whose steps grow with its own input leaves the call
-unreadable.
+with its lambda's. When a function passed in takes steps that grow with its own input, the prover
+cannot read a bound for the call.
 
 A `cost` bound is a claim, `<owner> cost #<n>`, that `ply prove` reads from the body and never
 proves by running:
@@ -2942,36 +2961,37 @@ proves by running:
 - A native function costs at most one step. A function `std.prelude` writes in Ply (§12) costs
   what its body takes: `List::at`, `List::push` and `List::set` take at most a constant number,
   since a list's internal tree is never deeper than an `Int` has bits, and a `Map` function on one
-  key takes the steps of one walk down the map's tree.
+  key takes the steps of one path down the map's tree.
 - `Map::fold`, `iterate`, `Map::update` and `Bytes::position` call a literal lambda or named
   definition as many times as an argument's size allows. `List::map`, `List::filter` and
   `List::fold` cost what they state, `cost xs.len() * k`: one step per element plus each call of
   the function. What `map` and `filter` return is no longer than their input. A raise ends the call.
 - A call of a definition costs its steps at its arguments' sizes; a call of another package's
   definition costs its first `cost` bound.
-- A recursion is understood when every call back either passes a part of one list parameter that a
-  list pattern took the head off, or moves an `Int` parameter by a positive literal toward a limit
-  the path to the call keeps it short of. The limit's parameter must stay unchanged, and the limit
-  can be: a literal, from below or above; a parameter's length, from below (`if i >= xs.len() { 0 }
-  else { walk(xs, i + 1) }`, also through `!`, an `&&` that held, and an `||` that did not); or the
-  length of a list where `List::at` found an element (`match xs.at(i) { Some(x) -> walk(xs, i + 1),
-  None -> 0 }`). No path may call back twice, and every other parameter the steps grow with must be
-  passed on unchanged or as a part of itself. Such a recursion takes as many calls as the list's
-  length, or as lie between the index and its limit. That grows with the `Int` itself unless
-  `List::at` found an element there, since it might start below zero. An `Int` literal's size is its
-  magnitude, so a call starting at `0` grows with the limit alone.
+- The prover understands a recursion when every recursive call either passes a part of one list
+  parameter that a list pattern took the head off, or moves an `Int` parameter by a positive
+  literal toward a limit the path to the call keeps it short of. The limit's parameter must stay
+  unchanged, and the limit can be: a literal, from below or above; a parameter's length, from below
+  (`if i >= xs.len() { 0 } else { walk(xs, i + 1) }`, also through `!`, an `&&` that held, and an
+  `||` that did not); or the length of a list where `List::at` found an element
+  (`match xs.at(i) { Some(x) -> walk(xs, i + 1), None -> 0 }`). No path may make two recursive
+  calls, and every other parameter the steps grow with must be passed on unchanged or as a part of
+  itself. Such a recursion takes as many calls as the list's length, or as lie between the index
+  and its limit. That grows with the `Int` itself unless `List::at` found an element there, since
+  it might start below zero. An `Int` literal's size is its magnitude, so a call starting at `0`
+  grows with the limit alone.
 - The bound may use: lengths of parameters (`List::len`, `Map::len`, `String::len`, `Bytes::len`,
   `Array::len`, `Columns::len`), cost names, positive literals, `+`, `*`, and `ilog2`, alone or next
   to sizes of the one length it applies to.
 
-Steps within the bound are `proved`. Anything else leaves the bound `unproved` (`E0474`), stopped at
-`unbounded` with the reason. That includes another operation, a call of a function value with no cost
-name, definitions calling each other, another package's definition with no `cost` bound, an `Int`
-parameter the steps grow with, and a definition that takes, returns or builds a value of a type with
-a `key` or `numeric` (§4.4), whose comparisons and operators call functions the reading cannot see.
-If a bound cannot be shown this way, do not write it.
+A bound that the steps stay within is `proved`. Anything else leaves the bound `unproved`
+(`E0474`), stopped at `unbounded` with the reason. That includes another operation, a call of a
+function value with no cost name, definitions calling each other, another package's definition with
+no `cost` bound, an `Int` parameter the steps grow with, and a definition that takes, returns or
+builds a value of a type with a `key` or `numeric` (§4.4), whose comparisons and operators call
+functions the prover cannot see. If a bound cannot be shown this way, do not write it.
 
-**Space bounds.** A `space` clause bounds the memory a call holds beyond what it is given:
+**Space bounds.** A `space` clause bounds the memory a call uses beyond its arguments:
 
 ```ply
 type Chain = | Link(Int, Chain) | End
@@ -2981,22 +3001,21 @@ fn reversed(xs: Chain, onto: Chain) -> Chain
 = match xs { End -> onto, Link(x, rest) -> reversed(rest, Link(x, onto)) }
 ```
 
-The bound is read like a `cost` bound, over the parameters, and `0` is allowed: `space 0` says a
-call runs in place, holding no more than a constant amount whatever it is given.
+The bound is read like a `cost` bound, over the parameters, and `0` is allowed: `space 0` states
+that a call runs in place, using no more than a constant amount of memory whatever its arguments.
 
 - A call's space is every object it creates (even ones it frees before returning) plus a frame for
-  each non-tail call back into itself. A number is not an object.
-- The bound holds when each argument has no other holder, all the way down, as an update in place
-  needs (§5.6). A `match` or `let` pattern without a guard releases a subject it was the last to read
-  and held alone, and the next constructor of the same name the body builds reuses its memory. So
-  `reversed` builds no `Link` it did not take apart.
-- `List::push`, `List::set`, `Array::set`, `Columns::set`, `Map::insert` and `++` update a value
-  held once in place and copy one held anywhere else. Only a fold's first call copies a seed held
-  elsewhere.
+  each recursive call that is not a tail call. A number is not an object.
+- The bound holds when no argument is *shared* (referred to from anywhere else), at any depth, as
+  an update in place needs (§5.6). A `match` or `let` pattern without a guard releases a subject
+  that it was the last to read and that was not shared, and the next constructor of the same name
+  the body builds reuses its memory. So `reversed` builds no `Link` it did not take apart.
+- `List::push`, `List::set`, `Array::set`, `Columns::set`, `Map::insert` and `++` update an
+  unshared value in place and copy a shared one. Only a fold's first call copies a shared seed.
 - A record, a record update, a list literal, a closure and a list pattern's rest each create an
   object, as does a constructor with no released subject to reuse.
 
-A function parameter may give a name to the memory one call of it holds, after its type and its
+A function parameter may give a name to the memory one call of it uses, after its type and its
 cost name if any. Only the definition's `space` clauses can use it, as an `Int` that may be `0`
 (`E0105` if it clashes):
 
@@ -3006,24 +3025,23 @@ fn wrapped<| e>(xs: List<Int>, f: (Int) -> List<Int> / e space s) -> List<List<I
 = xs.map(f)
 ```
 
-At a call, the name stands for what one call of the function passed in holds, as a cost name stands
-for its steps. A function may hold nothing, so `space xs.len() * s` would not hold here: `map` builds
-the list it returns whatever `f` holds.
+At a call, the name represents the memory one call of the function passed in uses, as a cost name
+represents its steps. A function may use no memory, so `space xs.len() * s` would not hold here:
+`map` builds the list it returns whatever `f` uses.
 
-A `space` bound is a claim, `<owner> space #<n>`, that `ply prove` reads from the body using the same
-rules for calls and recursion as `cost`, with two differences. A recursion whose calls back create
-nothing and are last holds only what its last call holds, whatever it descends on. A parameter to
-which a call back passes a value held elsewhere is treated as held elsewhere on every call. A call of
-another package's definition holds its first `space` bound, but only when each argument that is not
-a number or function is held alone. `List::map`, `List::filter` and `List::fold`, which state no
-bound, hold what their function holds once per element, as `Map::fold`, `iterate`, `Map::update`
-and `Bytes::position` do per call, and `map` and `filter` also hold a list as long as their
-input. A `space` clause on a definition that performs anything other than a raise is `E0463`.
-Anything else leaves the bound `unproved` (`E0474`), stopped at `unbounded` with the reason.
+A `space` bound is a claim, `<owner> space #<n>`, that `ply prove` reads from the body using the
+same rules for calls and recursion as `cost`, with two differences. A recursion whose recursive
+calls create nothing and are tail calls uses only what its last call uses, whatever it recurses on.
+A parameter to which a recursive call passes a shared value is treated as shared on every call. A
+call of another package's definition uses its first `space` bound, but only when no argument other
+than a number or function is shared. `List::map`, `List::filter` and `List::fold`, which state no
+bound, use what their function uses once per element, as `Map::fold`, `iterate`, `Map::update` and
+`Bytes::position` do per call, and `map` and `filter` also use a list as long as their input. A
+`space` clause on a definition that performs anything other than a raise is `E0463`. Anything else
+leaves the bound `unproved` (`E0474`), stopped at `unbounded` with the reason.
 
 **Review.** `ply review` reports, for each definition changed since the last `ply review --accept`,
 whether its implementation, its spec and its claims changed. The baseline is keyed by name.
-
 ## 11. Derivation
 
 `derive d for T` calls `d::derive(declaration)` of the module the file imports as `d`, before the
@@ -3048,11 +3066,12 @@ The toolchain ships these derivers, each documented in its module:
 | `map` | `std.derive.map` | `T::map` | the value with each type parameter's values mapped |
 | `children` | `std.derive.children` | `<snake_case(T)>_children`, `_children_mapped`, `_nodes`, `_nodes_folded`, `_nodes_mapped` | the `T`s directly inside a value or every one, in order, a fold over them, and the value with each replaced |
 
-`snake_case` is `std.text`'s, so two types that give the same name (`HTTPRequest` and `HttpRequest`
-both give `http_request`) are `E0105`. A `derive` must be in the module that declares its type
-(`E0208`).
+`snake_case` is `std.text`'s, so two types whose names convert to the same name (`HTTPRequest` and
+`HttpRequest` both give `http_request`) are `E0105`. A `derive` must be in the module that declares
+its type (`E0208`).
 
-A codec of a parameterized type takes one codec per type parameter, named as the parameter is:
+A codec of a parameterized type takes one codec per type parameter, each named after its type
+parameter:
 
 ```ply
 pub type Box<a> = { label: String, inner: a }
@@ -3063,24 +3082,26 @@ fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String =
   json::encode_string(b, box_json(c))
 ```
 
-Codecs are plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2) derives like
-a plain record with its fields: the same documents, bytes and shape. A codec for a type that
+Codecs are plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2) derives
+like a plain record with its fields: the same documents, bytes and shape. A codec for a type that
 contains itself, directly or through the types its module derives, takes a nesting limit and passes
 one less to each level, so the recursion visibly ends (§5.10). Beyond the limit, decoding is an
 error and encoding panics (`ply doc std.derive.codec`).
 
-**What cannot be derived.** A refusal is `E0206` at the field or variant that blocks the derivation:
+**What cannot be derived.** These are `E0206`, reported at the field or variant that blocks the
+derivation:
 
 - a function, a `Task`, a `Chan` or a `Secret`, which no codec writes;
-- an `Option<Unit>` or an `Option<Option<a>>`, whose `None` and `Some` would be one JSON document;
+- an `Option<Unit>` or an `Option<Option<a>>`, whose `None` and `Some` would encode to the same JSON
+  document;
 - a type that takes a label (§4.5).
 
-A field whose type's module derives no codec is `E0206` at the name the generated body cannot see. A
-type with a `key` or `show` (§4.4) is encoded by its fields as they are.
+A field whose type's module derives no codec is also `E0206`, reported at the name the generated
+code cannot see. A type with a `key` or `show` (§4.4) is encoded by its fields as they are.
 
-`==`, `compare`, `digest` and `show` need no derivation: they work on any value its type allows.
-`where derivable(eq, a)`, `derivable(ord, a)`, `derivable(hash, a)` and `derivable(show, a)` require
-a type parameter to support them. `where derivable(D, p)` goes after the row and before any
+`==`, `compare`, `digest` and `show` need no derivation: they work on any value whose type allows
+them. `where derivable(eq, a)`, `derivable(ord, a)`, `derivable(hash, a)` and `derivable(show, a)`
+require a type parameter to support them. `where derivable(D, p)` goes after the row and before any
 `requires`.
 
 **SQL rows.** `sql` maps a record to a row of a SQL table, one column per field named after the
@@ -3098,46 +3119,46 @@ derive sql for Order
 ```
 
 - A `String`, `Int`, `Bool`, `Float`, `Decimal` or `Bytes` field is a column of that type. An
-  `Option` is a nullable column, a `List` of those is an array, and a `json::Json` is the document
-  it holds.
-- Any other field is a `jsonb` document read and written with its type's own `json` codec, which the
-  module must import `std.json` for and derive.
+  `Option` is a nullable column, a `List` of those is an array, and a `json::Json` is stored as the
+  document it contains.
+- Any other field is a `jsonb` document read and written with its type's own `json` codec. For
+  this, the module must import `std.json`, and the field's type must derive `json`.
 - A sum, a type with parameters, and an empty record have no row (`E0206`).
-- The codec's `fields` are what the SQL check compares a statement's columns against, when `std.db`'s
-  `fetch` reads rows with it (§16).
+- The codec's `fields` are what the SQL check compares a statement's columns against, when
+  `std.db`'s `fetch` reads rows with it (§16).
 
 **Writing a deriver.**
 
 - A deriver is any module's `pub fn derive(declaration: derive::Declaration) -> Result<String,
-  derive::Refused>`, performing nothing but raises. `std.derive` describes a declaration.
+  derive::Refused>` whose only effect is raising. `std.derive` describes a declaration.
 - The checker compiles a deriver once and runs it for each declaration in isolation, with a limit
   of 60 seconds of wall clock. Each result is cached under the declaration and the source of the
   modules the deriver reaches, so it reruns only after an edit to one of them. A run that raised or
   ran out of time is not cached.
-- A deriver is a standard library module or one of the program's own, and a deriver's own modules
-  derive nothing through a deriver.
-- A name no import binds is `E0207`. A module whose `derive` is not a deriver is `E0160`. A deriver
-  that raises, runs out of time, returns anything other than functions, or writes a definition
-  that does not check is `E0155`.
+- A deriver is a standard library module or one of the program's own modules. A deriver's own
+  modules cannot use `derive`.
+- In `derive d for T`, a `d` that no import binds is `E0207`. A module whose `derive` is not a
+  deriver is `E0160`. A deriver that raises, runs out of time, returns anything other than
+  functions, or writes a definition that does not check is `E0155`.
 
-`std.derive.map` writes `T::map` for a sum or a `new` record: the value rebuilt with each type
-parameter's values replaced by what its function returns, calling the functions in the order the
-value holds what they read (`ply doc std.derive.map`).
+`std.derive.map` writes `T::map` for a sum or a `new` record. `T::map` returns the value rebuilt,
+with each type parameter's values replaced by what that parameter's function returns. It calls the
+functions in the order their inputs appear in the value (`ply doc std.derive.map`).
 
 ## 12. Builtins
 
 Builtins are the functions every module can call without an import. They are all declared in
-`std.prelude`, the standard library module every module reads automatically, each with a doc
+`std.prelude`, the standard library module every module imports automatically, each with a doc
 comment.
 
 - An `extern fn` is a signature, with a row and a `where` like any other, whose body the runtime
   implements.
 - A `pub fn` in the prelude is written in Ply: `List::at`, `List::push`, `List::set`, `List::map`,
-  `List::filter`, `List::fold`, and `Map`'s functions except `Map::new` and `Map::len`. A call reads
-  these by their signatures and clauses, as it reads an `extern fn`, so `List::set`'s `requires` is
-  checked where it is called (§6.8).
-- In a `cost` bound (§10), a call of a native function counts as one step, and a function written
-  in Ply takes the steps its body takes.
+  `List::filter`, `List::fold`, and `Map`'s functions except `Map::new` and `Map::len`. At a call of
+  one of these, the checker uses only its signature and clauses, as it does for an `extern fn`, so
+  `List::set`'s `requires` is checked where it is called (§6.8).
+- In a `cost` bound (§10), a call of a native function (one the runtime implements) counts as one
+  step, and a function written in Ply takes the steps its body takes.
 - Comparing (`==`, `!=`, `compare`, `compare_values`), hashing (`digest`) or reflecting (`reflect`,
   `shown`) a list or map uses `List::at`, `List::push` and `Map::entries`, so a definition that does
   so depends on them and its hash covers them.
@@ -3145,33 +3166,33 @@ comment.
 Only standard library modules may declare an `extern fn` or an `extern type` (`E0151`). An `extern
 type`, such as `extern type ListNode<a>`, is a type the runtime lays out, with parameters but no
 constructors or fields. Its values come only from its module's `extern fn`s. `==` on a value that
-holds one is `E0201`, as on a function, and no deriver reads one, so `compare`, `digest`, `show`, a
-`Map` key and a `derive` over it are `E0206`. Modules under `std.internal` are shared within the
+contains one is `E0201`, as on a function, and no deriver reads one, so `compare`, `digest`, `show`,
+a `Map` key and a `derive` over it are `E0206`. Modules under `std.internal` are shared within the
 standard library, and only standard library modules may import them (`E0159`). A program is compiled
-only against a runtime that implements every native it calls in the way the compiler expects
-(`E0476`, `E0481`).
+only against a runtime that implements every native function it calls in the way the compiler
+expects (`E0476`, `E0481`).
 
 Most builtins are functions of a built-in type, declared under it (`extern fn List::len`) and called
 on a value or through the type like any function of a type (§5.4): `xs.len()`, `Map::new()`. No
 module may declare one of those again, so nothing can hide one. The rest have plain names (`range`,
 `min`, `panic`), which a module may shadow, except `compare_values` and the six functions the
 wrapping and saturating operators call (§2.4), which no binding around such an operator may hide
-(`E0105`). `to_int` reads any integer type as an `Int`, returning `None` if it does not fit, so with
-`numeric_of_int` it converts between any two integer types.
+(`E0105`). `to_int` converts a value of any integer type to an `Int`, returning `None` if it does
+not fit, so with `numeric_of_int` it converts between any two integer types.
 
-`ply doc std.prelude` lists every builtin, natives first, each with its summary. `ply doc List::len`
-shows a native: its signature with parameter names, its doc and its clauses. `ply doc List::map`
-shows one written in Ply like any definition, with its location and hash. `ply doc List` lists the
-functions of a built-in type: the natives, then those `std.prelude` and the type's home module
-declare (§13).
+`ply doc std.prelude` lists every builtin, native functions first, each with its summary.
+`ply doc List::len` shows a native function: its signature with parameter names, its doc and its
+clauses. `ply doc List::map` shows one written in Ply like any definition, with its location and
+hash. `ply doc List` lists the functions of a built-in type: the native functions, then those
+`std.prelude` and the type's home module declare (§13).
 
 A builtin whose row names `abort.raise` may state a `requires`: a condition on its arguments under
 which a call cannot raise. For most builtins it describes exactly when a call cannot raise.
 `Decimal::round`'s describes the part arithmetic can express; beyond it, a call raises only when the
 digits it adds do not fit. A call that satisfies the `requires` adds no `abort.raise` (§6.8). An
-`ensures` describes the result, as `result`, which is what the checker knows about the value when
-it reads a later clause. A builtin with no `requires` raises for reasons its arguments' values
-cannot express in arithmetic: `panic`, a failed `assert`, `String::of_bytes` of invalid UTF-8,
+`ensures` states what is true of the result, named `result`. The checker uses that fact about the
+value when it checks a later clause. A builtin with no `requires` raises for reasons that arithmetic
+on its arguments cannot express: `panic`, a failed `assert`, `String::of_bytes` of invalid UTF-8,
 `String::find` of an absent substring, `iterate` past its budget, `Int::of_u64` of a value too large
 for an `Int`.
 
@@ -3184,7 +3205,7 @@ for an `Int`.
 
 ## 13. The standard library
 
-The standard library is the built-in package `std`, carried inside `ply` and available to every
+The standard library is the built-in package `std`, shipped inside `ply` and available to every
 program without declaring a dependency: `import std.<name>`, with more parts for nested modules
 (`std.hash.legacy` next to `std.hash`).
 
@@ -3212,7 +3233,7 @@ A few other names need no import, wherever a module does not declare or import i
   made of and its functions (§3.1), each of which, like `ply doc Stack::size`, has its own page.
 - `ply std --show std.json` prints one module's source, and `ply std --show` alone prints all of
   them.
-- A module may embed (§3.4) data files that `ply` carries next to it, each named by its path inside
+- A module may embed (§3.4) data files that `ply` ships next to it, each named by its path inside
   the library (`std/oid/names.txt`). `ply std` lists them with the module that embeds each, and
   `ply std --show std/oid/names.txt` prints one. The digest `ply std` prints covers them.
 
@@ -3226,8 +3247,8 @@ with what its specifications name (§10), which a dependent's proof may need.
 ## 14. The host boundary
 
 The *host* is the machine a program runs on. Effects that reach outside the program (files,
-network, processes, the console) are served by host handlers. Every run sets up the host: `ply
-run`, `ply test` and `ply hosts` alike. Flags grant only things that name a place or a power: file
+network, processes, the console) are handled by host handlers. Every run sets up the host handlers:
+`ply run`, `ply test` and `ply hosts` alike. Flags grant only access to places and powers: file
 system roots (`--fs`), programs (`--exec`) and privileged families of operations (`--allow`).
 Everything else is open by default.
 
@@ -3235,38 +3256,38 @@ Everything else is open by default.
 boundary directly: every root whose row names it runs under that handler, whatever the flags. The
 operations of `std.os`, `std.env`, `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`,
 `std.net`, `std.udp`, `std.sqlite`, `std.term`, `std.signal`, `std.trace`, `std.time`,
-`std.random`'s `entropy`, `std.process` and `std.fs` work this way. A native function
-such a handler calls refuses to run inside a `simulate` region, and in a test the search reruns, as a
-host operation does (`E0425`). A native that would block the program's thread, such as hashing, hands
-the work to the runtime's own threads (as many at once as the machine has cores, the rest queued),
-while the task that asked waits and the region's other tasks run. A test that only computes a
-function of its inputs on the machine, like a hash, is cached like any other. A test that read the
+`std.random`'s `entropy`, `std.process` and `std.fs` work this way. A native function that such a
+handler calls fails inside a `simulate` region, and in a test that the search reruns, as a host
+operation does (`E0425`). A native function that would block the program's thread, such as hashing,
+passes the work to the runtime's own threads (as many at once as the machine has cores, the rest
+queued). The task that called it waits while the region's other tasks run. A test that only computes
+a function of its inputs on the machine, like a hash, is cached like any other. A test that read the
 machine is cached with the permissions it ran with (§8.2).
 
 **Tasks.** `task` is handled by the program's own top-level scheduler: every root whose row names it
 runs as the first task, and the root finishes once every task it spawned has ended. Ready tasks run
-first in, first out. A task that sleeps or waits on the host waits while the others run; code outside
-a task, such as a `parallel` branch, blocks its thread. A raise no clause in a task handles fails the
-run. A `simulate` inside a task runs as anywhere else (§9).
+first in, first out. A task that sleeps or waits on the host waits while the others run; code
+outside a task, such as a `parallel` branch, blocks its thread. A raise that no clause in the task
+handles fails the run. A `simulate` inside a task runs as anywhere else (§9).
 
 Outside a `simulate` region, `clock` is handled by its real handler,
-`std.internal.schedule.clocked`, which every root whose row names it runs under. Tasks run in turn on the thread that
-spawned them, and one that waits (on a join, a channel, a host operation or a sleep) is set aside
-while the others run. `clock.now` reads a monotonic clock, in nanoseconds since the run began, and
-`clock.sleep` waits until a deadline on it. A cancel stops a sleep, as in a region (§9), so a
-deadline one task sets for another fires while the rest of the program keeps working.
-`std.time`'s `time.sleep_ms` blocks the whole thread instead, and every task waits with it.
+`std.internal.schedule.clocked`, which every root whose row names it runs under. Tasks run in turn
+on the thread that spawned them, and one that waits (on a join, a channel, a host operation or a
+sleep) is set aside while the others run. `clock.now` reads a monotonic clock, in nanoseconds since
+the run began, and `clock.sleep` waits until a deadline on it. A cancel stops a sleep, as in a
+region (§9), so a deadline one task sets for another fires while the rest of the program keeps
+working. `std.time`'s `time.sleep_ms` blocks the whole thread instead, and every task waits with it.
 
 **What is open by default.**
 
 - The environment: `std.env` reads the process's variables and working directory, which a test
   sets with `env::on`.
 - Configuration: `config.get` and `config.secret` read from `--set`, `--config`, the environment
-  and the schema's defaults, under both `ply run` and `ply test`. `config` is `nondet`, so a test that
-  reads it must be a `test/nondet` (§8.3).
-- The network: a program can look up names, connect and listen. Each socket belongs to the run, under
-  the label its operation names. A TLS listener or upgrade uses the credentials `--tls` gives; a run
-  given none has none (`E0429`).
+  and the schema's defaults, under both `ply run` and `ply test`. `config` is `nondet`, so a test
+  that reads it must be a `test/nondet` (§8.3).
+- The network: a program can look up names, connect and listen. Each socket belongs to the run,
+  under the label its operation names. A TLS listener or upgrade uses the credentials `--tls` gives;
+  a run given none has none (`E0429`).
 - The console: `std.term` uses the terminal the process's streams are connected to, and the run
   restores the terminal mode it found.
 
@@ -3277,34 +3298,34 @@ and exits at once, with status 130 or 143, so no child outlives it. Ctrl-C ends 
 once. A run that listens for no stop signal, such as a test, installs no signal handler.
 
 **Other services.** `std.trace` writes to the sink `--trace` names, and checks that each span is
-closed (`E0445`). A database is opened under a root given with `--fs`, so a run with no roots opens none
-(`E0451`).
+closed (`E0445`). A database is opened under a root given with `--fs`, so a run with no roots opens
+none (`E0451`).
 
 **Tests and the host.** A test that can reach a nondeterministic handler is cached with what it read
-and the permissions it ran with (§8.2), so its pass never stands for a run given other roots,
+and the permissions it ran with (§8.2), so its pass is never reused for a run given other roots,
 programs or families. A test that reaches only deterministic handlers, whose results depend only on
 their inputs, is cached like any other. An operation inside a `simulate` region reaches no host
 handler at all (`E0425`, §9), since the region runs once per interleaving. `std.process` (and
-`std.console`, built on it) is the run's own process under `ply run`. `ply test` withholds it
-(`E0424`, naming the handler that serves it under `ply run`), since a test is not a process. The
+`std.console`, built on it) is the run's own process under `ply run`. `ply test` does not provide it
+(`E0424`, naming the handler that handles it under `ply run`), since a test is not a process. The
 exception: a test may use `process.bound`, `process.spawn`, `process.start` and the operations on a
 started child, which reach only the programs `--exec` names.
 
 **`ply hosts`** lists every operation the program can perform on the host (`effect.op[resource]`:
-one row per operation and label some row names, where a written mode atom names every operation of
-its mode). For each it shows the handler, whether it is deterministic, whether it is `at-most-once`
-or `repeatable`, whether it blocks, and whether it may receive a `Secret`. It also shows the run's
-TLS, file system, database, configuration, tracing and shutdown settings. `--digest` prints one `b3:`
-line. An effect with a real handler (§6.10) is listed under that handler's name: it is deterministic
-unless the effect is `nondet`; an operation is `at-most-once` when it is a `write`; it blocks when
-the handler's clause waits on the runtime's threads; and it may receive a `Secret` when an argument's
-type holds one.
+one line per operation and label that some effect row names, where a mode atom written in a row
+names every operation of its mode). For each it shows the handler, whether it is deterministic,
+whether it is `at-most-once` or `repeatable`, whether it blocks, and whether it may receive a
+`Secret`. It also shows the run's TLS, file system, database, configuration, tracing and shutdown
+settings. `--digest` prints one `b3:` line. An effect with a real handler (§6.10) is listed under
+that handler's name: it is deterministic unless the effect is `nondet`; an operation is
+`at-most-once` when it is a `write`; it blocks when the handler's clause waits on the runtime's
+threads; and it may receive a `Secret` when an argument's type contains one.
 
 | flag | meaning |
 | --- | --- |
-| `--tls NAME=CERT,KEY` | a TLS credential (PEM, leaf first; key in PKCS#8, PKCS#1 or SEC1); repeatable. Used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`, which `std.http`'s `serve_pooled_tls` uses to offer `h2` and `http/1.1`. A name given several times holds several certificates, and each handshake gets the one matching the name the client asks for (SNI), or the first. Changed certificate files are reloaded within a second without a restart, keeping the old one if the new one fails to load. Sessions resume from tickets whose key rotates. `E0430` if it does not load, `E0429` if a program names one not given. |
-| `--trust CERT.pem` | an extra trusted certificate; repeatable. `net.connect_tls` and `net.start_tls` accept servers it signs, in addition to the built-in roots. With any `--trust`, every TLS listener asks clients for a certificate, still serving a client without one unless `--mtls` names the credential. `net.peer_certificate` returns the certificate presented (on a client, the server's, for channel binding); `std.http` puts it on each request as `client_certificate`, and `std.x509` reads it. A client presents one when its connection was opened or set with `net::Presenting("NAME")` (a `--tls` credential), as `std.http`'s `fetch` does for `Fetching.credential`. `net.listen_tls` and `net.connect_tls` offer only `http/1.1`; to offer other protocols (`h2`), use `net.serve_tls` or `net.start_tls`, and `net.protocol` returns what the handshake agreed. `E0430` if it does not parse. The `ply` command's own connections use `PLY_TRUST` instead (§16). |
-| `--mtls NAME` | a `--tls` credential whose listeners require a client certificate; repeatable. A client without one that `--trust` verifies is refused at the handshake. `E0429` if no `--tls` names it, `E0430` without a `--trust`. |
+| `--tls NAME=CERT,KEY` | a TLS credential (PEM, leaf first; key in PKCS#8, PKCS#1 or SEC1); repeatable. Used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`, which `std.http`'s `serve_pooled_tls` uses to offer `h2` and `http/1.1`. A name given several times has several certificates, and each handshake uses the one matching the name the client requests (SNI), or the first. Changed certificate files are reloaded within a second without a restart, keeping the old one if the new one fails to load. Sessions resume from tickets whose key rotates. `E0430` if it does not load, `E0429` if a program names one not given. |
+| `--trust CERT.pem` | an extra trusted certificate; repeatable. `net.connect_tls` and `net.start_tls` accept servers it signs, in addition to the built-in roots. With any `--trust`, every TLS listener requests a certificate from clients, still serving a client without one unless `--mtls` names the credential. `net.peer_certificate` returns the certificate presented (on a client, the server's, for channel binding); `std.http` puts it on each request as `client_certificate`, and `std.x509` reads it. A client presents one when its connection was opened or set with `net::Presenting("NAME")` (a `--tls` credential), as `std.http`'s `fetch` does for `FetchOptions.credential`. `net.listen_tls` and `net.connect_tls` offer only `http/1.1`; to offer other protocols (`h2`), use `net.serve_tls` or `net.start_tls`, and `net.protocol` returns what the handshake agreed. `E0430` if it does not parse. The `ply` command's own connections use `PLY_TRUST` instead (§16). |
+| `--mtls NAME` | a `--tls` credential whose listeners require a client certificate; repeatable. A client without one that `--trust` verifies is rejected at the handshake. `E0429` if no `--tls` names it, `E0430` without a `--trust`. |
 | `--fs NAME=PATH` | a file system root; repeatable. `std.fs` files and `std.sqlite` databases under that label live below it, as does a Unix socket `net.listen_unix` or `net.connect_unix` names. `E0454` if it is not a directory. |
 | `--exec NAME=PATH` | a program that a `process.spawn` or `process.start` with that label may start; repeatable (`ply run`, `ply test`). `E0457` if it cannot be executed. |
 | `--allow NAME` | a privileged family of operations granted to the program, which must declare the family's effect; repeatable (`ply run`, `ply test`). `machine` (`std.machine`'s `machine`) opens a compiled program, gives it host access from what this run was granted, and runs one of its entry points. `shipped` (declared in `compiler.unit`) reads the standard library `ply` carries. `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`) compiles and links C with the host's compiler and reads the program's own heap. `E0459` if the program does not declare it, or if a run that was not granted `machine` performs one of its operations that uses the host, measures, or times an entry. `machine`'s deterministic half, `hermetic_machine`, uses only what it is given (no host, no clock) and needs no grant, so a test that drives a program through it stays cached. |
@@ -3317,16 +3338,16 @@ type holds one.
 | `--drain-ms MS` | then let in-flight requests finish for this long (default 30000); running out is `W0608`, exit 3 |
 
 When the stop signal arrives, listeners are closed, so a waiting `net.accept` returns `0`. That is
-how `std.http`'s `serve_pooled` drains: it accepts nothing more, answers every connection it had
+how `std.http`'s `serve_pooled` drains: it accepts nothing more, serves every connection it had
 already accepted (queued ones included) with `Connection: close` on the last response, and closes
 idle connections at once. An HTTP/2 connection (detected by its preface, or by the `h2` its TLS
 handshake agreed under `serve_pooled_tls`) is drained with `GOAWAY`: the streams the client opened
-before seeing it are answered, then the connection closes. Before a stop, the server sheds load,
-answering `503` with `Retry-After` to a connection that finds its queue full or that waited in it
-too long.
+before seeing it get responses, then the connection closes. Before a stop, the server sheds load: it
+responds `503` with `Retry-After` to a connection that finds its queue full or that waited in it too
+long.
 
-An unreadable configuration source is `E0440`. `std.db` refuses statements the database server
-rejects, and statements that touch a table outside what the call site labelled.
+An unreadable configuration source is `E0440`. `std.db` fails on statements the database server
+rejects, and on statements that touch a table outside what the call site labelled.
 
 ## 15. Building and shipping
 
@@ -3354,17 +3375,17 @@ unchanged. A failure in a built program has no line numbers. A `.plyx` whose par
 under a hash that does not match, a name with no body, a closure or compiled program that is not the
 one these definitions make) is `E0443`, as is a build containing two identical declarations it
 cannot tell apart (two effects, or two members of one recursive group). An artifact built by another
-compiler, or for another runtime, is `E0444`: rebuild it with this `ply`. A `.plyx` carries the
+compiler, or for another runtime, is `E0444`: rebuild it with this `ply`. A `.plyx` contains the
 standard library definitions it uses, so a `ply` with a different standard library runs it as it was
-built. `--diff` shows what a rebuild would change. `--config-schema` includes that function, resolved
-as a run resolves it; a name that is not a pure function with no parameters returning a
+built. `--diff` shows what a rebuild would change. `--config-schema` includes that function,
+resolved as a run resolves it; a name that is not a pure function with no parameters returning a
 `ConfigSpec` is `E0440`.
 
 **Libraries.** A package whose manifest names no entry, and whose modules declare no `main`, is a
 library. `ply build` writes it as a `.plyz` file (default `<name>.plyz`; `-o FILE` to choose). It
-holds every module's source, the `ply.pkg`, and compiled code for every definition (a library has no
-entry to prune from, so nothing is left out). A consumer compiles the sources. A library is not a
-program: `ply run lib.plyz` refuses it (`E0443`).
+contains every module's source, the `ply.pkg`, and compiled code for every definition (a library
+has no entry to prune from, so nothing is left out). A consumer compiles the sources. A library is
+not a program: `ply run lib.plyz` rejects it (`E0443`).
 
 ### 15.1 The registry
 
@@ -3386,7 +3407,7 @@ POST /<name>/<version>/yank                    mark the version yanked
 `index.json` is `{"name": .., "versions": [{"version": "0.2.0", "digest": "b3:..", "yanked":
 false, "runtime": {"major": .., "minor": .., "patch": ..}}]}`, in publication order, where `runtime`
 is the toolchain the version's manifest declares. The index is only advisory: `ply resolve` checks
-every archive against it and against the lock, so a stale or hostile index can cause a refusal but
+every archive against it and against the lock, so a stale or hostile index can cause an error but
 never a wrong build. A version's identity is the digest `ply build` gives its `.plyz`: BLAKE3, over
 the same parts a `.plyx` digest covers, written out in full.
 
@@ -3397,11 +3418,11 @@ sends it to the registry `PLY_REGISTRY` names, with the token in `PLY_REGISTRY_T
 - Only a library can be published, and only one whose dependencies all come from the registry, since
   its users resolve them from the registry alone. A program, the anonymous package, or a path or git
   dependency is `E0145`, as is a `ply yank` of a name or version the registry does not have.
-- The registry recomputes the digest from the body and refuses a mismatch. It refuses different bytes
-  under a version it already lists (a published version never changes; publish a new version), but
-  accepts the same bytes again. It refuses an archive whose manifest is not the package and version
-  it was sent as, names an entry point, or depends on anything but the registry. Each refusal is
-  `E0144` with the registry's reason.
+- The registry recomputes the digest from the body and rejects a mismatch. It rejects different
+  bytes under a version it already lists (a published version never changes; publish a new
+  version), but accepts the same bytes again. It rejects an archive whose manifest is not the
+  package and version it was sent as, names an entry point, or depends on anything but the
+  registry. Each rejection is `E0144` with the registry's reason.
 
 **Semantic versioning is checked.** `ply publish` compares the contract of every public definition
 (its signature and specs, and its body if it is `transparent`; a type's or effect's whole
@@ -3414,23 +3435,23 @@ rules. `ply contracts NAME FROM TO` lists the contracts that changed between two
 **Interfaces.** After the archive, `ply publish` sends the package's *interface*: what each of its
 modules shows to a module that imports it (each name's signature, effects, counts and hashes),
 together with the *semantics version* of the `ply` that produced it and the archive's digest. The
-registry keeps one interface per version and semantics version, and refuses one that names another
-archive or semantics version; the same bytes again are accepted, so a publish whose interface was
-refused can be rerun whole. The semantics version identifies what a definition's hashes, checked
+registry stores one interface per version and semantics version, and rejects one that names another
+archive or semantics version. It accepts the same bytes again, so a publish whose interface was
+rejected can be rerun whole. The semantics version identifies what a definition's hashes, checked
 rows and claim outcomes mean, and changes only when one of them does; so a `ply` that changes none
 of them can use an interface another produced. `ply publish --json` reports it. `ply resolve`
 downloads the interface with each archive. A load checks a dependency's modules from their source,
-and `--verify-deps` (on `check`, `test` and `prove`) refuses a dependency whose interface does not
+and `--verify-deps` (on `check`, `test` and `prove`) rejects a dependency whose interface does not
 match its source (`E0149`).
 
-**Attestations.** A registry with an *attester* vouches for what it serves. `ply attest NAME
-VERSION` sets the published version up as a project of its own, downloaded and checked as `ply
-resolve` would, and runs `ply test` and `ply prove` on it. It reports whether it type-checks,
-whether its `reuse fn` and `returns` promises hold, its test results, and whether each claim is
-proved, under this `ply`'s semantics version.
+**Attestations.** An *attester* checks each published version and signs what it found. A registry
+with an attester vouches for what it serves. `ply attest NAME VERSION` sets the published version
+up as a project of its own, downloaded and checked as `ply resolve` would, and runs `ply test` and
+`ply prove` on it. It reports whether it type-checks, whether its `reuse fn` and `returns` promises
+hold, its test results, and whether each claim is proved, under this `ply`'s semantics version.
 
 - With `--sign KEY`, the result (a `std.pkg.Attestation`) is signed as §15.2 describes and sent to
-  the registry, which keeps it only if its configured attester's public key signed it, for that
+  the registry, which stores it only if its configured attester's public key signed it, for that
   version's archive and semantics version. Without `--sign` nothing is sent, so anyone can rerun an
   attestation.
 - A registry run with `--set attester=<public key hex>`, `--set attest.key=<secret key file>`,
@@ -3440,11 +3461,12 @@ proved, under this `ply`'s semantics version.
   says so.
 - `ply resolve` downloads each dependency's attestation and trusts it only if a key listed in
   `PLY_ATTESTERS` (public key files, separated as `PATH` separates directories) signed it for the
-  archive the lock pins. `--json` reports each as `attestation` (`attested`, `trusted`, `signer`, and
-  what was run).
+  archive the lock pins. `--json` reports each as `attestation` (`attested`, `trusted`, `signer`,
+  and what was run).
 
 **Yanking.** `ply yank NAME VERSION` marks a version yanked, with the same token. New resolutions
-skip it, a lock that pins it keeps it, and its archive is still served. Nothing is ever deleted.
+skip it, a lock that pins it keeps using it, and its archive is still served. Nothing is ever
+deleted.
 
 **Connecting.** `PLY_REGISTRY` is one base URL, `https://host[:port][/prefix]`. The client verifies
 the server against the built-in roots and the certificates `PLY_TRUST` names (§16), so for a
@@ -3481,8 +3503,8 @@ $ ply build . -o app.plyx --verify             # compare, write nothing
 ```
 
 `ply keygen PATH` writes an Ed25519 key pair (`std.ed25519`): the secret key at `PATH`, readable
-only by its owner, and the public key at `PATH.pub`, each one line naming what it holds followed by
-64 hex digits. It never overwrites a file. A key file that cannot be read, decoded or written is
+only by its owner, and the public key at `PATH.pub`, each one line naming what it contains followed
+by 64 hex digits. It never overwrites a file. A key file that cannot be read, decoded or written is
 `E0462`. The secret key is a `Secret` (§4.6) from the moment it is generated, and is read back as
 one.
 
@@ -3543,7 +3565,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 
 | command | flags |
 | --- | --- |
-| `ply new PATH` | `--name NAME` (default: the last part of the path), `--lib` (a library: one `pub` definition, no `main`). Refuses an invalid package name and an existing directory. |
+| `ply new PATH` | `--name NAME` (default: the last part of the path), `--lib` (a library: one `pub` definition, no `main`). Fails on an invalid package name or an existing directory. |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (the checking phases and how much was reused from the cache; with `--types`, also effect sets, where each type came from, and each place a body can raise, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (always one interleaving), `--timeout` (no limit by default, since a server runs forever), `--profile`, `--explain` (on standard error: whether checking was reused from an earlier run, the load's phases, the host operations the program may perform, and how it handles a stop signal), `--require-signer KEY` (repeatable; §15.2), host, trace, drain. `ARGS` is what `process.args` returns. A `.plyx` path runs the built artifact. |
@@ -3555,43 +3577,43 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply explain CODE` | one line on what a diagnostic code means; `--all` lists every code. No path. |
 | `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` or `compiler` documents what the toolchain ships, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
 | `ply fmt [paths]` | rewrites every `.ply` file under the paths (default: the package containing the working directory) in the standard layout. `--check` writes nothing and exits 1, naming the files that would change; `--json` reports the same and requires `--check`. |
-| `ply rename --map FILE [paths]` | renames each old name in the map file to its new name, in the `.ply` files under the paths (default: the package containing the working directory). `--words` renames words inside names instead. `--check` writes nothing and exits 1, listing what would change; `--json` reports the same and requires `--check`. Exits 2 without writing anything if the renamed program would not check, or a name in it would refer to something else. See **Renaming** below. |
+| `ply rename --map FILE [paths]` | renames each old name in the map file to its new name, in the `.ply` files under the paths (default: the package containing the working directory). `--words` renames words inside names instead. `--check` writes nothing and exits 1, listing what would change; `--json` reports the same and requires `--check`. Exits 2 without writing anything if a name or a call in the renamed program would refer to something else. See **Renaming** below. |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line. `--json` adds the byte range. |
-| `ply replace NAME [path]` | rewrites one `fn` or `type` from `--with FILE` or stdin, formatted, leaving every other byte of the file alone. Refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash changes. `--check` writes nothing. |
-| `ply resolve [path]` | writes `ply.lock` from the manifests: each dependency's name, version, and the digest of each one not in this checkout (`in the checkout` for the rest; `"digest": null` in `--json`). Parses no modules. The only command that downloads registry dependencies, from `PLY_REGISTRY`, with their interface and attestation where published (`interface` and `attestation` in `--json`; attestations trusted as `PLY_ATTESTERS` says, §15.1). |
+| `ply replace NAME [path]` | rewrites one `fn` or `type` from `--with FILE` or stdin, formatted, leaving every other byte of the file alone. Fails with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash changes. `--check` writes nothing. |
+| `ply resolve [path]` | writes `ply.lock` from the manifests: each dependency's name, version, and the digest of each one not in this checkout (`in the checkout` for the rest; `"digest": null` in `--json`). Parses no modules. The only command that downloads registry dependencies, from `PLY_REGISTRY`, with their interface and attestation where published (`interface` and `attestation` in `--json`; attestations trusted as `PLY_ATTESTERS` specifies, §15.1). |
 | `ply vendor [path]` | copies every dependency into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is a dependency: the chain from the root package to it, then the version and digest pinned |
 | `ply publish [path]` | builds this library's `.plyz` and uploads it, then its interface, to `PLY_REGISTRY` with `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
 | `ply yank NAME VERSION` | marks a published version yanked, with `PLY_REGISTRY_TOKEN`. No path. |
 | `ply attest NAME VERSION` | runs a published version's tests, claims and promises and reports the result; `--sign KEY` signs it and sends it to the registry (§15.1). No path. |
 | `ply keygen PATH` | writes an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2). No path. |
-| `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that requires, and whether `TO` makes it (`needs`, `kept`). No path. |
+| `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that requires, and whether `TO` makes that bump (`needs`, `kept`). No path. |
 | `ply hash [path]` | `--deps` (references and everything reachable from each) |
 | `ply defs [path]` | every definition: location, hash, signature, footprint and references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what refers to a definition directly, and every definition, test and law of your own modules that reaches it |
 | `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`), using the parts its `ply.work` lists (§3.3). `--profile development\|release` (default `development`; both compile the C with `cc -O2`, and `development`'s checks its reference counts), `--runtime LIBRARY` (default: the runtime's static library in `target/debug`, or `target/release` under `--profile release`), `--out PATH` (default `ply` in that same directory), `--identity` (print one line identifying how this `ply` bootstraps, and build nothing; two `ply`s that print the same line build every checkout alike). Reuses work from earlier bootstraps whenever what it depends on is unchanged. |
 | `ply work [<path>]` | where the `ply.work` at or above a directory (default `.`) places each package and each part of `ply`: one role and path per line, or `--json` (§3.3) |
-| `ply cache clear\|stats\|compact [path]` | empty the cache / report what it holds and how much space could be reclaimed / reclaim that space |
-| `ply cache inspect <DEF> [path]` | what the cache holds for a definition, declaration or test, by full name, simple name or a hash prefix of 4 or more hex digits: its location, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
+| `ply cache clear\|stats\|compact [path]` | empty the cache / report what it contains and how much space could be reclaimed / reclaim that space |
+| `ply cache inspect <DEF> [path]` | what the cache stores for a definition, declaration or test, by full name, simple name or a hash prefix of 4 or more hex digits: its location, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
 **The first run.** The first run after `ply` or the program changes compiles the program, which
 needs a C toolchain and takes a few seconds. Later runs reuse the compiled code.
 
-**Reusing earlier answers.** `ply check`, `ply test`, `ply run` and `ply defs` remember their last
-answer for the same command line. While nothing the run that made the answer read has changed,
-they return it without loading the program. Otherwise they load the program and check again only
-what reads something that changed.
+**Reusing earlier results.** `ply check`, `ply test`, `ply run` and `ply defs` store their last
+result for the same command line. While nothing that run read has changed, they return the stored
+result without loading the program. Otherwise they load the program and check again only what
+depends on something that changed.
 
-- `ply run --explain` says `reused` or `built` on stderr before the program starts, with timings
-  (`front_end` in `--json`). A reused run still sets up permissions (`--allow`, `--exec`, `--fs`) and
-  picks its entry point fresh.
+- `ply run --explain` prints `reused` or `built` on stderr before the program starts, with timings
+  (`front_end` in `--json`). A reused run still sets up permissions (`--allow`, `--exec`, `--fs`)
+  and picks its entry point fresh.
 - `ply check --explain` always checks again, since what it reports is about this run.
-- `ply test` reuses an answer only while every pass it relied on is still recorded. `--watch`,
+- `ply test` reuses a result only while every pass it relied on is still recorded. `--watch`,
   `--explain`, `--coverage`, `--mutate`, `--no-cache`, and a configuration file or schema always
   load the program.
-- Under `--json`, `ply check`, `ply test` and `ply prove` report under `front_end` whether the answer
-  was reused and, when the program was loaded, how many cached results each kind of check took and
-  how many it recomputed.
+- Under `--json`, `ply check`, `ply test` and `ply prove` report under `front_end` whether the
+  result was reused and, when the program was loaded, how many cached results each kind of check
+  took and how many it recomputed.
 - `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental` check your modules from
   scratch and cache nothing. A cache that cannot be read means checking from scratch, never a
   failure.
@@ -3600,13 +3622,13 @@ what reads something that changed.
 two things after checking and before anything else:
 
 1. **Tagged literals** (§2.3). Each literal in the root package's modules is parsed by calling its
-   parser, in isolation with no permissions, with a limit of 60 seconds of wall clock. A refusal
-   is `E0153` or `E0154`. The verdict depends only on the parser and the text, so it is cached under
-   the hash of everything the parser reaches and the text, and a parser runs again only for a new
-   text or after an edit to something it reaches. A parser that runs out of time is not cached, since
-   the clock says nothing about the parser. A dependency's literals are that package's to check. In
-   a program loaded without this step, a literal its parser rejects ends the run where it is read
-   (`E0502`).
+   parser, in isolation with no permissions, with a limit of 60 seconds of wall clock. A literal
+   its parser rejects is `E0153`, and one whose parser raised or ran out of time is `E0154`. The
+   result depends only on the parser and the text, so it is cached under the hash of everything the
+   parser reaches and the text. A parser runs again only for a new text or after an edit to
+   something it reaches. A parser that runs out of time is not cached, since a timeout reveals
+   nothing about the parser. A dependency's literals are that package's to check. In a program
+   loaded without this step, a literal its parser rejects ends the run where it is read (`E0502`).
 2. **SQL statements.** The statements the root package's modules run are checked against the schema
    (§3.5) their module reaches: each `db.query`, `db.batch`, `db.execute`, `db.returning` and
    `db.copy_out`; `std.db`'s `fetch` and `fetch_returning`; and `std.sqlite`'s `query`, `execute`,
@@ -3614,7 +3636,8 @@ two things after checking and before anything else:
    program runs: text (joined by `++` or not), a call of a definition on such values,
    `sqlite::bound` of one, or a tagged literal. Each definition a statement is computed by runs in
    isolation with the literals' time limit; one that raises or runs out of time leaves the statement
-   to be checked at run time. Errors are reported at the call, with the statement, where it came from, and the schema:
+   to be checked at run time. Errors are reported at the call, with the statement, where it came
+   from, and the schema:
    - `E0431`: text the SQL parser rejects.
    - `E0435`: the statement's tables do not include the table the call's label names.
    - `E0436`: the operation does not match the statement: a write run as a query, a read (or a
@@ -3627,20 +3650,20 @@ two things after checking and before anything else:
    - `E0470`: a construct the check does not follow (`with`, a set operation, a subquery in `from`,
      a window function, `on conflict`), reported where the check stops.
    - `E0437`: the columns a `fetch` returns do not match the fields of the row type its codec reads,
-     when `derive sql` wrote it (§11): by name, type and nullability, where a `left join` makes the
-     joined table's columns nullable.
+     when `derive sql` generated it (§11): by name, type and nullability, where a `left join` makes
+     the joined table's columns nullable.
 
    Results are cached under the hashes of everything the statement and schema reach. At run time,
    `std.db` applies the same rules to a statement the check could not compute, and raises.
 
-**Formatting.** `ply fmt` keeps comments, the spelling of every literal, and the order of imports,
+**Formatting.** `ply fmt` keeps comments, how every literal is written, and the order of imports,
 items and statements, and keeps each doc comment directly above what it documents. It prints
 `formatted PATH` for each file it changed. A file that does not parse is left alone, and the command
 exits 2 with the diagnostic. A line string starts on its own line, with each line at the first's
 indentation, and takes no trailing comma as the last item of a list. A file it cannot read or write
 is also an error (exit 2), so `--check` never passes a file it did not read. Directories whose names
-start with `.`, and directories named `target`, are skipped. A symlink found while walking is
-skipped; one named on the command line is an error.
+start with `.`, and directories named `target`, are skipped. A symlink found while traversing a
+directory is skipped; one named on the command line is an error.
 
 **Renaming.** `ply rename` replaces names in many files at once. The map file has one rename per
 line: the old name, a space, and the new name.
@@ -3654,8 +3677,8 @@ Expr Expression
 operation, record field and module named by an old name is renamed where it is declared and
 wherever it is used, in every `.ply` file under the paths. A record field is renamed in every
 record type that has it and at every use: records are structural, so a field belongs to no one
-type. Then `ply rename` checks the renamed program, and refuses unless every name in it still
-refers to what it did.
+type. Then `ply rename` checks the renamed program, and fails unless every name in it still refers
+to what it did.
 
 When several modules declare the same name, put the file that declares the one you mean first:
 
@@ -3666,7 +3689,7 @@ packages/cli/build.ply Made BuildOutput
 This renames what that file binds under the name: its definition `Made`, wherever it is used (in
 files that import it by name, `import build (Made)`, and where a file writes it after the module's
 name, `build::Made`), and any local variable the file names `Made`. Other definitions named `Made`,
-and record fields spelled `Made`, stay as they are. A function of a type, `Stack::size`, is renamed
+and record fields named `Made`, stay as they are. A function of a type, `Stack::size`, is renamed
 by its own name (`size`), and follows its type when the type is renamed.
 
 To rename a module, give its file, or its directory ending in `/`, and the new name:
@@ -3677,7 +3700,7 @@ packages/compiler/emit/lowered/ tests
 ```
 
 The file or directory moves, and every `import` of it changes to match, along with uses written
-`answer::name`. Other names spelled `answer` stay as they are. A string that contains the module's
+`answer::name`. Other names written `answer` stay as they are. A string that contains the module's
 full name, such as `"compiler.emit.answer"`, is reported as a warning.
 
 To rename an operation of an effect, write the effect and the operation joined by a dot, after the
@@ -3691,21 +3714,22 @@ The operation is renamed inside the effect's declaration and wherever a file tha
 module writes `fs.read_file`: calls, effect lists in signatures, and handlers.
 
 To rename only a record field, start the line with `.`. The field is renamed in every record type
-that has it and at every use, and a function or local variable spelled the same stays as it is:
+that has it and at every use, and a function or local variable with the same name stays as it is:
 
 ```
 .held cached
 ```
 
-Types and values have separate names, so renaming a type leaves a variant or function spelled the
-same alone. If a module's name changes, its file moves: renaming `held` to `cached` moves
-`held/store.ply` to `cached/store.ply`.
+A line that starts with a file renames everything that file declares under the old name, so a type
+and a variant of one name in that file are renamed together. A variant of the same name declared in
+another file is left alone. If a module's name changes, its file moves: renaming `held` to `cached`
+moves `held/store.ply` to `cached/store.ply`.
 
 A name inside backticks in a comment is renamed too, where the file renames every use of that name
 the same way, so doc links stay correct. Text in strings is never changed. `ply rename` prints a
 warning with the line for a string that is nothing but a renamed name (`"build.Made"`), and for a
-string holding a word that a line without a file, or `--words`, renames, so you can decide whether
-to change it by hand.
+string containing a word that a line without a file, or `--words`, renames, so you can decide
+whether to change it by hand.
 
 With `--words`, each line renames a word inside names. Words are separated by `_` or by a capital
 letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon`, and `MAX_TY` to
@@ -3714,17 +3738,25 @@ letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon
 `ply rename` changes nothing, and exits 2, if:
 
 - a path's program does not check before the renames;
-- a line names a file the paths do not hold, a name that file does not bind, or a field no record
+- a line names a file not under the paths, a name that file does not bind, or a field no record
   has;
 - a new name is a keyword or not a valid name;
 - a renamed name is declared with `extern`, so code outside Ply uses that name;
 - a module's file would be moved onto a file that already exists, or two files onto one;
-- the renamed program would not check, or a name in it would refer to something other than what it
-  did: two definitions with one name, or a local that another local of its new name hides.
+- a name in the renamed program would refer to something other than what it did: two definitions
+  with one name, or a local that another local of its new name hides;
+- a call on a value, like `x.size()`, could call another function, because another function it can
+  see gets the same new name;
+- a record would name a field twice.
+
+These checks mean the renamed program has the same types as before, so `ply rename` does not
+type-check it again. Code written inside strings is the exception: a string that a deriver turns
+into code, or one that names a definition, keeps its old text, and `ply check` reports what it
+breaks.
 
 Only files under the paths are changed. A file of the same package outside the paths that uses a
-renamed name stops the rename, because the renamed program would not check. Another package that
-uses a renamed name is not checked; `ply check` reports it.
+renamed name stops the rename. Another package that uses a renamed name is not checked; `ply check`
+reports it.
 
 **Editing one definition.** `ply show NAME` and `ply replace NAME` read and rewrite one definition
 without touching anything else in the file. The replacement is one item of the same kind and name,
@@ -3736,12 +3768,12 @@ program, `ply` included, and removed from the command line before the program se
 
 - `--count-allocs=PATH` writes how many objects (`allocations`) and how many `bytes` the entry
   point allocated, across all threads.
-- `--count-alloc-sites=PATH` also writes `sites`: the nearest few `ply_*` C functions each allocation
-  came from, most frequent first. It samples one allocation in `sampled_every` and scales the counts
-  back up, so rows are close to the totals but need not add up to them exactly. Allocations with no
-  `ply_*` function on the stack are counted under `<no ply frame>`. Walking the stack is slow, so
-  this is for measurement, not production.
-- `--count-alloc-sites-exact=PATH` walks every allocation instead: exact, and slower.
+- `--count-alloc-sites=PATH` also writes `sites`: the nearest few `ply_*` C functions each
+  allocation came from, most frequent first. It samples one allocation in `sampled_every` and scales
+  the counts back up, so rows are close to the totals but need not add up to them exactly.
+  Allocations with no `ply_*` function on the stack are counted under `<no ply frame>`. Walking the
+  stack is slow, so this is for measurement, not production.
+- `--count-alloc-sites-exact=PATH` walks the stack for every allocation instead: exact, and slower.
 
 ## 17. Diagnostics
 
@@ -3767,33 +3799,35 @@ starts on. A diagnostic with no labels left is its heading and notes alone. Each
 line. Color never changes this layout: the heading and carets take the severity's color, and a pipe,
 `NO_COLOR` or `--color never` gives exactly these bytes.
 
-A diagnostic that knows its fix carries `fixes` under `--json`. Each fix has a `title` and `edits`;
+A diagnostic with a known fix includes `fixes` under `--json`. Each fix has a `title` and `edits`;
 an edit replaces the text between `start` and `end` of `file` (an empty range inserts) with `text`.
 Applying the edits as given leaves a program where the diagnostic no longer applies. On a terminal,
 a fix is shown as a `= fix:` line under the message.
 
 A diagnostic the runtime raises, such as a failed assertion, writes each value it names in its text.
-A long value is cut there, and `… N more` says how many characters, bytes or items were left out.
-Under `--json` each value it names also comes whole, as `values` beside the text that names it.
+A long value is cut short in the text, and `… N more` shows how many characters, bytes or items were
+left out. Under `--json` each value it names also comes whole, as `values` beside the text that
+names it.
 
 ## 18. What Ply does not have
 
 These describe the language as it is today.
 
 - No loops, `break` or `return`: use recursion (§5.7). `?` is the only early exit, and a raise the
-  only one that passes the caller (§6.8).
+  only one that can go past the caller (§6.8).
 - No mutable variables, except handler variables (§6.9).
 - No exceptions outside the row: every failure is a `raise` operation in a row (§6.8).
 - No typeclasses or implicits, and no dispatch at run time: a call on a value (§5.4) is chosen by
   its type where it is written.
 - No modules as values, and no first-class effects.
 - No `unsafe` and no foreign function interface: everything a program does outside itself is an
-  effect a handler serves, and the builtins are the only functions the runtime implements (§12).
+  effect that a handler handles, and the builtins are the only functions the runtime implements
+  (§12).
 - Specs cannot refer to mutable state.
 - Reference cycles are not collected.
 - A task never moves between OS threads; only a `parallel` block's branches run on the runtime's own
   threads.
-- No file handles: `fs` reads a range and appends by path, with nothing held open between calls.
+- No file handles: `fs` reads a range and appends by path, with nothing kept open between calls.
 - No backpressure.
 - No database migrations or live schema checks.
 - No HTTP/2 over a `listen_tls` listener, whose handshake offers only `http/1.1` (`std.http`'s
@@ -3822,7 +3856,7 @@ In `examples/`:
 - `relay.ply`: one forwarder that is generic over the label it writes under.
 - `shout.ply`: a command line declared with `std.cli` and read into the program's own type.
 - `store.ply`: a handler used to grant a capability.
-- `agreement.ply` and `twin_divergence_audit.ply`: `std.db`'s in-memory twin checked against
-  recorded PostgreSQL answers.
-- `service.ply`: a service over PostgreSQL or its in-memory twin, whose store, TLS and accept loop
+- `agreement.ply` and `fake_divergence_audit.ply`: `std.db`'s in-memory fake checked against
+  recorded PostgreSQL results.
+- `service.ply`: a service over PostgreSQL or its in-memory fake, whose store, TLS and accept loop
   are configuration, with tracing and graceful shutdown.

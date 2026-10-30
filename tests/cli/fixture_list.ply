@@ -3,16 +3,16 @@
 //! with exactly those errors, and every other one checks clean. A fixture a change to the language
 //! breaks fails as itself, rather than as the outcome some other test is waiting for.
 
-import harness (Spawned, Source, project, in_memory, tree, spawned, stdout, stderr, json_of,
-                selected, failed, at, path, items, first, str, int, truth, shown)
+import harness (PlyProcess, Source, write_project, in_memory, tree, spawned, stdout, stderr,
+                json_of, selected, failed, at, path, items, first, str, int, bool, json_text)
 import std.json
 import std.json (Json)
 import std.list
 import std.string
 
-type Listed = { name: String, refused: List<String> }
+type FixtureEntry = { name: String, refused: List<String> }
 
-fn listed() -> List<Listed> =
+fn fixture_entries() -> List<FixtureEntry> =
   [
     { name: "ambiguous_import", refused: ["E0108"] },
     { name: "arity_mismatch", refused: ["E0202"] },
@@ -115,7 +115,7 @@ fn listed() -> List<Listed> =
 fn fixtures() -> List<{ name: String, bytes: Bytes }> = embed_dir("../fixtures")
 
 /// The fixture `name`, a file or a directory, as a project of its own.
-fn copied(name: String) -> List<Source> / {abort.raise} = {
+fn fixture_sources(name: String) -> List<Source> / {abort.raise} = {
   let file = name ++ ".ply";
   let dir = name ++ "/";
   fixtures().fold([], |acc: List<Source>, f: { name: String, bytes: Bytes }|
@@ -127,7 +127,7 @@ fn copied(name: String) -> List<Source> / {abort.raise} = {
 
 fn listing(errors: List<Json>) -> String =
   errors.fold("", |acc: String, d: Json| {
-    let at_line = match items(at(d, "labels")).filter(|l: Json| truth(at(l, "primary"))) {
+    let at_line = match items(at(d, "labels")).filter(|l: Json| bool(at(l, "primary"))) {
       [l, ..] -> " at " ++ str(at(l, "file")) ++ ":" ++ int(path(l, ["start", "line"])).to_string(),
       [] -> "",
     };
@@ -139,7 +139,7 @@ fn listing(errors: List<Json>) -> String =
 fn entering() -> List<String> = ["drain_incomplete", "span_abandoned", "span_unbalanced"]
 
 /// Why the fixture does not check as listed, or `""` when it does, by what `ply check --json` said.
-fn misfit(f: Listed, answer: Json) -> String / {abort.raise} = {
+fn listing_mismatch(f: FixtureEntry, answer: Json) -> String / {abort.raise} = {
   let errors = items(at(answer, "diagnostics")).filter(|d: Json| str(at(d, "severity")) == "error");
   let found = errors.map(|d: Json| str(at(d, "code"))).sort();
   if found == f.refused.sort() { "" } else if f.refused == [] {
@@ -154,17 +154,20 @@ fn misfit(f: Listed, answer: Json) -> String / {abort.raise} = {
   }
 }
 
-test "{f.name} checks as listed" for f: Listed in listed().filter(|f: Listed|
-    !entering().contains(f.name)) {
-  let m = misfit(f, json_of(in_memory(tree(copied(f.name)), ["check", "--json"])));
+test "{f.name} checks as listed" for f: FixtureEntry in fixture_entries().filter(
+    |f: FixtureEntry| !entering().contains(f.name),
+  ) {
+  let m = listing_mismatch(
+    f,
+    json_of(in_memory(tree(fixture_sources(f.name)), ["check", "--json"])),
+  );
   assert(m == "", Some(m))
 }
 
-test/nondet "{f.name} checks as listed through a ply of its own" for f: Listed in listed().filter(
-    |f: Listed| entering().contains(f.name),
-  ) {
-  project(copied(f.name));
-  let m = misfit(f, json_of(spawned(["check", "--json"])));
+test/nondet "{f.name} checks as listed through a ply of its own" for f: FixtureEntry in fixture_entries(
+  ).filter(|f: FixtureEntry| entering().contains(f.name)) {
+  write_project(fixture_sources(f.name));
+  let m = listing_mismatch(f, json_of(spawned(["check", "--json"])));
   assert(m == "", Some(m))
 }
 
@@ -177,7 +180,7 @@ test "every fixture is listed" {
     };
     if n == "" || acc.filter(|m: String| m == n).len() > 0 { acc } else { acc.push(n) }
   });
-  let names = listed().map(|f: Listed| f.name);
+  let names = fixture_entries().map(|f: FixtureEntry| f.name);
   let unlisted = present.filter(|n: String| names.filter(|m: String| m == n).len() == 0);
   let gone = names.filter(|n: String| present.filter(|m: String| m == n).len() == 0);
   assert(
@@ -199,7 +202,7 @@ test "every fixture is listed" {
 // them `Abandoned`, warns of both innermost first on stderr, and still exits 0, since a warning is
 // no failure.
 test/nondet "a run warns of the spans its entry left open and exits zero" {
-  project(copied("span_abandoned"));
+  write_project(fixture_sources("span_abandoned"));
   let run = ["run", "--trace", "json"];
   let warning = "2 spans were still open when their task or the entry point ended: `reserving` on `orders`, `order` on `orders`";
   // The trace goes to the process's own error stream, which only a process has.
@@ -223,31 +226,31 @@ test/nondet "a run warns of the spans its entry left open and exits zero" {
   assert(closed == ["reserving", "order"], Some(stderr(r)));
 
   let document = json_of(spawned(run.concat(["--json", "span_abandoned.ply"]), []));
-  assert(int(at(document, "exit_code")) == 0, Some(shown(document)));
+  assert(int(at(document, "exit_code")) == 0, Some(json_text(document)));
   let warned = items(at(document, "diagnostics")).filter(|d: Json| str(at(d, "code")) == "W0609");
-  assert(warned.len() == 1, Some(shown(document)));
-  assert(str(at(first(warned), "severity")) == "warning", Some(shown(document)));
-  assert(str(at(first(warned), "message")) == warning, Some(shown(document)));
+  assert(warned.len() == 1, Some(json_text(document)));
+  assert(str(at(first(warned), "severity")) == "warning", Some(json_text(document)));
+  assert(str(at(first(warned), "message")) == warning, Some(json_text(document)));
   assert(
     int(path(document, ["shutdown", "spans_left_open"])) == 2,
-    Some("the report counts the spans the warning names: " ++ shown(document)),
+    Some("the report counts the spans the warning names: " ++ json_text(document)),
   )
 }
 
-fn tested(flags: List<String>) -> Json / {Spawned, abort.raise} =
+fn test_report(flags: List<String>) -> Json / {PlyProcess, abort.raise} =
   json_of(spawned(["test", "--json", "--no-cache"].concat(flags)))
 
 fn only_failure(report: Json) -> Json / {abort.raise} =
   match items(at(report, "failures")) {
     [failure] -> failure,
-    _ -> panic("expected exactly one failing test: " ++ shown(report)),
+    _ -> panic("expected exactly one failing test: " ++ json_text(report)),
   }
 
 /// The byte range of `text` in the fixture `name`, which writes it once.
 type Span = { start: Int, end: Int }
 
-fn written_in(name: String, text: String) -> Span / {abort.raise} = {
-  let source = match copied(name).filter(|f: Source| f.path == name ++ ".ply") {
+fn span_of(name: String, text: String) -> Span / {abort.raise} = {
+  let source = match fixture_sources(name).filter(|f: Source| f.path == name ++ ".ply") {
     [f, ..] -> Bytes::of_string(f.text),
     [] -> panic("`tests/fixtures` holds no `" ++ name ++ ".ply`"),
   };
@@ -264,37 +267,37 @@ fn written_in(name: String, text: String) -> Span / {abort.raise} = {
 // `channel_race.ply`'s receiver counts on the first sender spawned being heard first; the search
 // sends the second one first, and the race it reports is the two sends, each where it was performed.
 test/nondet "the search finds the channel race between two senders" {
-  project(copied("channel_race"));
-  let searched = tested([]);
-  assert(int(at(searched, "exit_code")) == 1, Some(shown(searched)));
+  write_project(fixture_sources("channel_race"));
+  let searched = test_report([]);
+  assert(int(at(searched, "exit_code")) == 1, Some(json_text(searched)));
   let failure = only_failure(searched);
   assert(
     str(path(failure, ["diagnostic", "message"]))
       == "assertion failed: expected Some(1), found Some(2)",
-    Some(shown(failure)),
+    Some(json_text(failure)),
   );
   let race = at(failure, "race");
   let sides = [at(race, "left"), at(race, "right")];
   assert(
     sides.map(|s: Json| str(at(s, "task"))).sort() == ["@1", "@2"],
-    Some("the race is between the two senders: " ++ shown(race)),
+    Some("the race is between the two senders: " ++ json_text(race)),
   );
   [{ task: "@1", perform: "task.send(c, 1)" }, { task: "@2", perform: "task.send(c, 2)" }].fold(
     (),
     |u: Unit, a: { task: String, perform: String }| {
       let side = match sides.filter(|s: Json| str(at(s, "task")) == a.task) {
         [s, ..] -> s,
-        [] -> panic("no side of the race is " ++ a.task ++ ": " ++ shown(race)),
+        [] -> panic("no side of the race is " ++ a.task ++ ": " ++ json_text(race)),
       };
       assert(
         str(at(side, "access")) == "task.chan.write[#0]",
-        Some("each side writes the channel: " ++ shown(race)),
+        Some("each side writes the channel: " ++ json_text(race)),
       );
-      let span = written_in("channel_race", a.perform);
+      let span = span_of("channel_race", a.perform);
       assert(
         int(path(side, ["span", "start"])) == span.start
           && int(path(side, ["span", "end"])) == span.end,
-        Some(a.task ++ "'s side is placed at `" ++ a.perform ++ "`: " ++ shown(race)),
+        Some(a.task ++ "'s side is placed at `" ++ a.perform ++ "`: " ++ json_text(race)),
       )
     },
   )
@@ -304,15 +307,18 @@ test/nondet "the search finds the channel race between two senders" {
 // run in which it does holds no step of the receiver to reorder, so the search has to give the
 // cancelled task one: from every root it reaches the run where the receive is answered first.
 test/nondet "the search finds the cancel that comes after the task it stops has run, from every root" {
-  project(copied("cancel_race"));
+  write_project(fixture_sources("cancel_race"));
   range(0, 6).fold((), |u: Unit, root: Int| {
     let roots = root.to_string() ++ ".." ++ Int::to_string(root + 1);
-    let searched = tested(["--sim-roots", roots]);
-    assert(int(at(searched, "exit_code")) == 1, Some("root " ++ roots ++ ": " ++ shown(searched)));
+    let searched = test_report(["--sim-roots", roots]);
+    assert(
+      int(at(searched, "exit_code")) == 1,
+      Some("root " ++ roots ++ ": " ++ json_text(searched)),
+    );
     assert(
       str(path(only_failure(searched), ["diagnostic", "message"]))
         == "assertion failed: expected Some(7), found None",
-      Some("root " ++ roots ++ ": " ++ shown(searched)),
+      Some("root " ++ roots ++ ": " ++ json_text(searched)),
     )
   })
 }
@@ -322,27 +328,32 @@ test/nondet "the search finds the cancel that comes after the task it stops has 
 // that reordering, each at the perform in `transfer` that made its access, and the seed it prints
 // replays it.
 test/nondet "the search finds the bank race and its seed replays it" {
-  project(copied("bank_race"));
-  let searched = tested([]);
-  assert(int(at(searched, "exit_code")) == 1, Some(shown(searched)));
+  write_project(fixture_sources("bank_race"));
+  let searched = test_report([]);
+  assert(int(at(searched, "exit_code")) == 1, Some(json_text(searched)));
   let failure = only_failure(searched);
-  assert(str(at(failure, "key")) == "bank_race.no account is ever overdrawn", Some(shown(failure)));
-  assert(str(path(failure, ["diagnostic", "code"])) == "E0501", Some(shown(failure)));
+  assert(
+    str(at(failure, "key")) == "bank_race.no account is ever overdrawn",
+    Some(json_text(failure)),
+  );
+  assert(str(path(failure, ["diagnostic", "code"])) == "E0501", Some(json_text(failure)));
   assert(
     str(path(failure, ["diagnostic", "message"])) == "assertion failed: expected 0, found 1",
-    Some("alice is overdrawn: " ++ shown(failure)),
+    Some("alice is overdrawn: " ++ json_text(failure)),
   );
 
   let race = at(failure, "race");
   let sides = [at(race, "left"), at(race, "right")];
   assert(
     sides.map(|s: Json| str(at(s, "task"))).sort() == ["@1", "@2"],
-    Some("the race is between the two transfers: " ++ shown(race)),
+    Some("the race is between the two transfers: " ++ json_text(race)),
   );
   assert(
     sides.map(|s: Json| str(at(s, "access"))).sort()
       == ["bank_race.bank.read[accounts]", "bank_race.bank.write[accounts]"],
-    Some("one transfer's balance check is reordered against the other's debit: " ++ shown(race)),
+    Some(
+      "one transfer's balance check is reordered against the other's debit: " ++ json_text(race),
+    ),
   );
   [
     { access: "bank_race.bank.read[accounts]", perform: "bank.balance[accounts](from)" },
@@ -350,36 +361,38 @@ test/nondet "the search finds the bank race and its seed replays it" {
   ].fold((), |u: Unit, a: { access: String, perform: String }| {
     let side = match sides.filter(|s: Json| str(at(s, "access")) == a.access) {
       [s, ..] -> s,
-      [] -> panic("no side of the race is `" ++ a.access ++ "`: " ++ shown(race)),
+      [] -> panic("no side of the race is `" ++ a.access ++ "`: " ++ json_text(race)),
     };
     assert(
       str(at(side, "definition")) == "bank_race.transfer",
-      Some("`" ++ a.access ++ "` is named in the definition that performed it: " ++ shown(race)),
+      Some(
+        "`" ++ a.access ++ "` is named in the definition that performed it: " ++ json_text(race),
+      ),
     );
-    let span = written_in("bank_race", a.perform);
+    let span = span_of("bank_race", a.perform);
     assert(
       int(path(side, ["span", "start"])) == span.start
         && int(path(side, ["span", "end"])) == span.end,
       Some(
         "`" ++ a.access ++ "` is placed at `" ++ a.perform
           ++ "`, where its step first touched the accounts: "
-          ++ shown(race),
+          ++ json_text(race),
       ),
     )
   });
 
   let seed = str(at(failure, "seed"));
-  assert(seed != "", Some("a failure the search found carries its seed: " ++ shown(failure)));
+  assert(seed != "", Some("a failure the search found carries its seed: " ++ json_text(failure)));
   let test_name = "no account is ever overdrawn";
   assert(
     str(at(failure, "replay")) == "ply test --seed " ++ seed ++ " --filter '" ++ test_name ++ "'",
-    Some(shown(failure)),
+    Some(json_text(failure)),
   );
-  let replayed = tested(["--seed", seed, "--filter", test_name]);
+  let replayed = test_report(["--seed", seed, "--filter", test_name]);
   assert(
     path(only_failure(replayed), ["diagnostic", "message"])
       == path(failure, ["diagnostic", "message"]),
-    Some("the seed the failure printed does not replay it: " ++ shown(replayed)),
+    Some("the seed the failure printed does not replay it: " ++ json_text(replayed)),
   )
 }
 
@@ -387,15 +400,15 @@ test/nondet "the search finds the bank race and its seed replays it" {
 // body passes the first and fails the second. A second run stands on the first's pass and still
 // runs and fails the second: one case's pass is never another's.
 test/nondet "a case of a keyed type keeps its failure beside the pass of a case equal to it" {
-  project(copied("case_of_a_keyed_type"));
+  write_project(fixture_sources("case_of_a_keyed_type"));
   let in_metres = "Metres(2) is in metres";
   let in_millimetres = "Millimetres(2000) is in metres";
   let first = json_of(spawned(["test", "--json"]));
-  assert(failed(first) == [in_millimetres], Some(shown(first)));
-  assert(selected(first) == [in_metres, in_millimetres], Some(shown(first)));
-  assert(int(path(first, ["summary", "passed"])) == 1, Some(shown(first)));
+  assert(failed(first) == [in_millimetres], Some(json_text(first)));
+  assert(selected(first) == [in_metres, in_millimetres], Some(json_text(first)));
+  assert(int(path(first, ["summary", "passed"])) == 1, Some(json_text(first)));
   let second = json_of(spawned(["test", "--json"]));
-  assert(failed(second) == [in_millimetres], Some(shown(second)));
-  assert(selected(second) == [in_millimetres], Some(shown(second)));
-  assert(int(path(second, ["summary", "cached"])) == 1, Some(shown(second)))
+  assert(failed(second) == [in_millimetres], Some(json_text(second)));
+  assert(selected(second) == [in_millimetres], Some(json_text(second)));
+  assert(int(path(second, ["summary", "cached"])) == 1, Some(json_text(second)))
 }

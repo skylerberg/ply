@@ -4,78 +4,80 @@
 //! answering what its `ensures` rules out. None is an extern the emitter writes in place, and the
 //! runtime lays out the objects those write over as the emitter writes them.
 
-import compiler.syntax.exprs (Param, expr_span)
+import compiler.syntax.expressions (Param, expression_span)
 import compiler.front.published (BuiltinRow, shipped_builtin_rows)
-import compiler.syntax.items (DNumeric, DOrd, ExternDef, IExtern, Item, SEnsures, SRequires,
-                              SpecClause, SpecKind, parse)
-import compiler.syntax.type_syntax (TypeExpr, TCon, TFn, TVar)
-import compiler.check.types (Atom, TyFn)
+import compiler.syntax.items (NumericDeriver, OrdDeriver, ExternDefinition, ExternItem, Item,
+                              EnsuresClause, RequiresClause, SpecClause, SpecKind, parse)
+import compiler.syntax.type_syntax (TypeExpression, NamedTypeExpression, FunctionTypeExpression,
+                                    VariableTypeExpression)
+import compiler.check.types (Atom, FunctionType)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.unit (Unbound, shipped, shipped_runtime, unbound)
-import compiler.emit.abi (Native, natives, unserved, unserved_line)
+import compiler.emit.abi (Native, natives, runtime_mismatches, mismatch_line)
 import compiler.check.infer.definitions (Extern, program_natives)
-import harness (program, spawned, prelude_file, said, json_of, at, path, items, str, int,
-                std_modules, compiler_modules, StdModule)
+import harness (write_program, spawned, prelude_file, all_output, json_of, at, path, items, str,
+                int, std_modules, compiler_modules, ShippedModule)
 import std.bytes
 import std.json (Json)
 import std.list
 import std.string
 
-fn named(name: Bytes) -> String / {abort.raise} = "`" ++ String::of_bytes(name) ++ "`"
+fn quoted(name: Bytes) -> String / {abort.raise} = "`" ++ String::of_bytes(name) ++ "`"
 
 /// The modules `ply` ships that may declare a native: the standard library's, and those of the
 /// compiler's that declare one.
-fn declaring() -> List<StdModule> / {abort.raise} =
+fn modules_with_natives() -> List<ShippedModule> / {abort.raise} =
   std_modules().concat(
-    compiler_modules().filter(|m: StdModule| m.src.index_of(b"extern fn ") != None),
+    compiler_modules().filter(|m: ShippedModule| m.src.index_of(b"extern fn ") != None),
   )
 
 /// Every builtin the shipped modules declare, under the name the runtime implements it by.
-fn rows() -> List<BuiltinRow> / {abort.raise} =
+fn builtin_rows() -> List<BuiltinRow> / {abort.raise} =
   shipped_builtin_rows(
-    declaring().map(|m: StdModule| { name: Bytes::of_string(m.module), src: m.src }),
+    modules_with_natives().map(|m: ShippedModule| { name: Bytes::of_string(m.module), src: m.src }),
   )
 
-fn implemented() -> Map<Bytes, Native> / {shipped.runtime, abort.raise} =
+fn runtime_natives() -> Map<Bytes, Native> / {shipped.runtime, abort.raise} =
   shipped_runtime().natives.fold(Map::new(), |acc: Map<Bytes, Native>, n: Native|
     acc.insert(n.name, n))
 
 // Whether the runtime implements each native a unit calls is checked as the unit is linked (E0476):
 // one the emitter writes in place it need not.
 test "every native the runtime implements is one the compiler or a shipped module declares, once and as declared" {
-  let implemented = shipped_runtime().natives.map(|n: Native| n.name);
+  let runtime_natives = shipped_runtime().natives.map(|n: Native| n.name);
   let declared = program_natives(
-    declaring().map(|m: StdModule| { name: Bytes::of_string(m.module), text: m.src }),
+    modules_with_natives().map(|m: ShippedModule|
+      { name: Bytes::of_string(m.module), text: m.src }),
   );
   assert_eq(
     unbound(
       shipped_runtime().natives,
-      declared.filter(|d: Extern| implemented.contains(d.name)),
+      declared.filter(|d: Extern| runtime_natives.contains(d.name)),
     ).map(|u: Unbound| u.declared.name),
     [],
   );
-  let names = declared.map(|d: Extern| d.name).concat(rows().map(|r: BuiltinRow| r.name));
-  assert_eq(implemented.filter(|n: Bytes| !names.contains(n)), [])
+  let names = declared.map(|d: Extern| d.name).concat(builtin_rows().map(|r: BuiltinRow| r.name));
+  assert_eq(runtime_natives.filter(|n: Bytes| !names.contains(n)), [])
 }
 
 test "the runtime this ply is linked with serves the code its compiler emits" {
   let runtime = shipped_runtime();
-  assert_eq(unserved(runtime).map(unserved_line), []);
+  assert_eq(runtime_mismatches(runtime).map(mismatch_line), []);
   // Each native the emitted C calls directly takes and answers the kinds the compiler declares.
-  let found = implemented();
+  let found = runtime_natives();
   assert_eq(natives().filter(|d: Native| found.get(d.name) != Some(d)).map(|d: Native| d.name), [])
 }
 
 test "no native of the runtime is an extern the emitter writes in place" {
   let natives = shipped_runtime().natives.map(|n: Native| n.name);
-  let implemented = intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
+  let runtime_natives = intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
     natives.contains(i.name.slice(b"std.prelude.".len(), i.name.len())));
-  assert_eq(implemented.map(|i: { name: Bytes, op: Intrinsic }| i.name), [])
+  assert_eq(runtime_natives.map(|i: { name: Bytes, op: Intrinsic }| i.name), [])
 }
 
 // A name no source can spell is the elaboration's to write, never a program's to call.
 test "every builtin the runtime implements is one a program can call" {
-  let typed = rows().fold(Map::new(), |acc: Map<Bytes, Bool>, row: BuiltinRow|
+  let typed = builtin_rows().fold(Map::new(), |acc: Map<Bytes, Bool>, row: BuiltinRow|
     acc.insert(row.name, true));
   let untyped = shipped_runtime().natives.map(|n: Native| n.name).filter(|n: Bytes|
     !typed.contains(n) && !n.starts_with(b"?"));
@@ -87,21 +89,21 @@ test "every builtin the runtime implements is one a program can call" {
 
 fn typed_raises(row: BuiltinRow) -> Bool =
   match row.scheme.ty {
-    TyFn(f) -> f.effects.atoms.filter(|a: Atom| a.effect == b"abort").len() > 0,
+    FunctionType(f) -> f.effects.atoms.filter(|a: Atom| a.effect == b"abort").len() > 0,
     _ -> false,
   }
 
 // The runtime answers a builtin's failure with a raise only where the scheme lets a `handle` see one.
 test "every builtin raises exactly when its scheme says it may" {
-  let runtime = implemented();
-  rows().fold((), |_u: Unit, row: BuiltinRow|
+  let runtime = runtime_natives();
+  builtin_rows().fold((), |_u: Unit, row: BuiltinRow|
     match runtime.get(row.name) {
       None -> (),
       Some(n) ->
         assert(
           n.raises == typed_raises(row),
           Some(
-            named(row.name) ++ (if typed_raises(row) { " raises" } else { " cannot raise" })
+            quoted(row.name) ++ (if typed_raises(row) { " raises" } else { " cannot raise" })
               ++ " by its scheme, and the runtime says "
               ++ (if n.raises { "it raises" } else { "it cannot" }),
           ),
@@ -114,41 +116,42 @@ test "every builtin raises exactly when its scheme says it may" {
 /// The types a builtin's type parameter is filled with, one test each: every numeric type the
 /// language has under `numeric`, and `Int` under an order, which is where a clause is read, or
 /// under no constraint but where a `Columns` holds it, which holds only records.
-fn fillings(d: ExternDef) -> List<String> / {abort.raise} =
+fn fillings(d: ExternDefinition) -> List<String> / {abort.raise} =
   match d.constraints {
     [] -> if is_columns(d.ret)
         || d.params.any(|p: Param| match p.ty { Some(t) -> is_columns(t), None -> false }) {
       ["{ x: Int }"]
     } else { ["Int"] },
     [c] -> match c.deriver {
-      DNumeric ->
+      NumericDeriver ->
         ["Int", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "U128", "Float", "Decimal"],
-      DOrd -> ["Int"],
+      OrdDeriver -> ["Int"],
       _ ->
-        panic(named(d.name.name) ++ " states a clause under a constraint this test does not fill"),
+        panic(quoted(d.name.name) ++ " states a clause under a constraint this test does not fill"),
     },
-    _ -> panic(named(d.name.name) ++ " states a clause under more than one constraint"),
+    _ -> panic(quoted(d.name.name) ++ " states a clause under more than one constraint"),
   }
 
-fn is_columns(t: TypeExpr) -> Bool =
-  match t { TCon(c) -> c.name.name.name == b"Columns", _ -> false }
+fn is_columns(t: TypeExpression) -> Bool =
+  match t { NamedTypeExpression(c) -> c.name.name.name == b"Columns", _ -> false }
 
 /// A type as a program writes it, each type parameter of its builtin read as `fill`.
-fn written(t: TypeExpr, fill: String) -> String / {abort.raise} =
+fn type_text(t: TypeExpression, fill: String) -> String / {abort.raise} =
   match t {
-    TVar(_) -> fill,
-    TCon(c) ->
+    VariableTypeExpression(_) -> fill,
+    NamedTypeExpression(c) ->
       String::of_bytes(c.name.name.name)
-        ++ (if c.args.len() == 0 { "" }
-        else { "<" ++ String::join(c.args.map(|a: TypeExpr| written(a, fill)), ", ") ++ ">" }),
-    TFn(f) ->
-      "(" ++ String::join(f.params.map(|p: TypeExpr| written(p, fill)), ", ") ++ ") -> "
-        ++ written(f.ret, fill),
+        ++ (if c.args.len() == 0 { "" } else {
+          "<" ++ String::join(c.args.map(|a: TypeExpression| type_text(a, fill)), ", ") ++ ">"
+        }),
+    FunctionTypeExpression(f) ->
+      "(" ++ String::join(f.params.map(|p: TypeExpression| type_text(p, fill)), ", ") ++ ") -> "
+        ++ type_text(f.ret, fill),
     _ -> panic("a builtin that states a clause takes a type this test does not write"),
   }
 
-/// The list in `drawing` a parameter of the type takes each value of.
-fn drawn(ty: String) -> String / {abort.raise} = {
+/// The list in `value_lists` a parameter of the type takes each value of.
+fn values_for(ty: String) -> String / {abort.raise} = {
   let lists = [
     { ty: "Int", from: "ints()" },
     { ty: "U8", from: "u8s()" },
@@ -183,7 +186,7 @@ fn drawn(ty: String) -> String / {abort.raise} = {
 /// with nothing, one thing and several; for a decimal the greatest mantissa, a one and a zero at
 /// every scale, of either sign; and one value, an `Int` or that record, for a parameter of an
 /// unconstrained type parameter's own type, which no builtin can read.
-fn drawing() -> String =
+fn value_lists() -> String =
   \\import std.show (show)
   \\
   \\fn least() -> Int = 0 - 9223372036854775807 - 1
@@ -277,44 +280,44 @@ fn drawing() -> String =
   \\
   \\
 
-/// A parameter of a test's call: its type, the list in `drawing` it takes each value of, and
+/// A parameter of a test's call: its type, the list in `value_lists` it takes each value of, and
 /// whether a failure can print it.
-type Drawn = { name: String, ty: String, from: String, shown: Bool }
+type TestParameter = { name: String, ty: String, from: String, shown: Bool }
 
 /// The declarations of `prelude` that state a clause of `kind`.
-fn stating(prelude: Bytes, kind: SpecKind) -> List<ExternDef> / {abort.raise} =
-  parse(prelude).node.items.fold([], |acc: List<ExternDef>, it: Item|
+fn externs_with_clause(prelude: Bytes, kind: SpecKind) -> List<ExternDefinition> / {abort.raise} =
+  parse(prelude).node.items.fold([], |acc: List<ExternDefinition>, it: Item|
     match it {
-      IExtern(d) -> if d.spec.any(|c: SpecClause| c.kind == kind) { acc.push(d) } else { acc },
+      ExternItem(d) -> if d.spec.any(|c: SpecClause| c.kind == kind) { acc.push(d) } else { acc },
       _ -> acc,
     })
 
 /// A builtin's parameters, its type parameter filled with `fill`. One an order is on is drawn at
 /// that type, since the order reads it.
-fn parameters(d: ExternDef, fill: String) -> List<Drawn> / {abort.raise} =
+fn parameters(d: ExternDefinition, fill: String) -> List<TestParameter> / {abort.raise} =
   d.params.map(|p: Param|
     match p.ty {
       Some(t) ->
         {
           name: String::of_bytes(p.name.name),
-          ty: written(t, fill),
+          ty: type_text(t, fill),
           from: match t {
-            TVar(_) -> if d.constraints.len() == 0 && fill == "Int" { "values()" }
-            else { drawn(fill) },
-            _ -> drawn(written(t, fill)),
+            VariableTypeExpression(_) -> if d.constraints.len() == 0 && fill == "Int" { "values()" }
+            else { values_for(fill) },
+            _ -> values_for(type_text(t, fill)),
           },
-          shown: match t { TFn(_) -> false, _ -> !is_columns(t) },
+          shown: match t { FunctionTypeExpression(_) -> false, _ -> !is_columns(t) },
         },
-      None -> panic(named(d.name.name) ++ " leaves a parameter's type out"),
+      None -> panic(quoted(d.name.name) ++ " leaves a parameter's type out"),
     })
 
 /// A builtin's clauses of `kind` as one condition a test evaluates, in the prelude's own words but
 /// for its arithmetic, which saturates: a clause is over the integers, and an `Int` at its end
 /// would overflow where the clause is only false.
-fn condition(prelude: Bytes, d: ExternDef, kind: SpecKind) -> String / {abort.raise} =
+fn condition(prelude: Bytes, d: ExternDefinition, kind: SpecKind) -> String / {abort.raise} =
   String::join(
     d.spec.filter(|c: SpecClause| c.kind == kind).map(|c: SpecClause| {
-      let span = expr_span(c.expr);
+      let span = expression_span(c.expression);
       let text = String::of_bytes(prelude.slice(span.start, span.end));
       "(" ++ text.replace(" + ", " +| ").replace(" - ", " -| ") ++ ")"
     }),
@@ -324,7 +327,7 @@ fn condition(prelude: Bytes, d: ExternDef, kind: SpecKind) -> String / {abort.ra
 /// A test named for `d` and `what` it checks, whose body is `inner` once for every draw of the
 /// parameters. `inner` is handed the call as a failure prints it and as the program makes it.
 fn over_draws(
-  d: ExternDef,
+  d: ExternDefinition,
   fill: String,
   what: String,
   inner: (String, String) -> String,
@@ -333,27 +336,27 @@ fn over_draws(
   let params = parameters(d, fill);
   let printed = "\"" ++ name ++ "(\" ++ "
     ++ String::join(
-      params.map(|p: Drawn| if p.shown { "show(" ++ p.name ++ ")" } else { "\"_\"" }),
+      params.map(|p: TestParameter| if p.shown { "show(" ++ p.name ++ ")" } else { "\"_\"" }),
       " ++ \", \" ++ ",
     )
     ++ " ++ \")\"";
-  let call = name ++ "(" ++ String::join(params.map(|p: Drawn| p.name), ", ") ++ ")";
-  let body = params.reverse().fold(inner(printed, call), |nested: String, p: Drawn|
+  let call = name ++ "(" ++ String::join(params.map(|p: TestParameter| p.name), ", ") ++ ")";
+  let body = params.reverse().fold(inner(printed, call), |nested: String, p: TestParameter|
     "each(" ++ p.from ++ ", |" ++ p.name ++ ": " ++ p.ty ++ "| " ++ nested ++ ")");
   let at = if d.constraints.len() == 0 { "" } else { " at " ++ fill };
   "test \"" ++ name ++ at ++ " " ++ what ++ "\" {\n  " ++ body ++ "\n}\n"
 }
 
 /// A test that calls `d` on every draw its `requires` holds of, and fails where a call raises.
-fn held(prelude: Bytes, d: ExternDef, fill: String) -> String / {abort.raise} = {
-  let holds = condition(prelude, d, SRequires);
-  let answer = written(d.ret, fill);
+fn requires_test(prelude: Bytes, d: ExternDefinition, fill: String) -> String / {abort.raise} = {
+  let holds = condition(prelude, d, RequiresClause);
+  let return_type = type_text(d.ret, fill);
   over_draws(
     d,
     fill,
     "does not raise where its `requires` holds",
     |printed: String, call: String|
-      "if " ++ holds ++ " {\n    calm(" ++ printed ++ ", || {\n      let answer: " ++ answer
+      "if " ++ holds ++ " {\n    calm(" ++ printed ++ ", || {\n      let answer: " ++ return_type
         ++ " = "
         ++ call
         ++ ";\n      ()\n    })\n  }",
@@ -361,11 +364,11 @@ fn held(prelude: Bytes, d: ExternDef, fill: String) -> String / {abort.raise} = 
 }
 
 /// A test that calls `d` on every draw, and fails where an answer is one its `ensures` rules out.
-fn answering(prelude: Bytes, d: ExternDef, fill: String) -> String / {abort.raise} = {
-  let ensured = condition(prelude, d, SEnsures);
-  let answer = written(d.ret, fill);
+fn ensures_test(prelude: Bytes, d: ExternDefinition, fill: String) -> String / {abort.raise} = {
+  let ensured = condition(prelude, d, EnsuresClause);
+  let return_type = type_text(d.ret, fill);
   over_draws(d, fill, "answers what its `ensures` says", |printed: String, call: String|
-    "sure(" ++ printed ++ ", || {\n    let result: " ++ answer ++ " = " ++ call ++ ";\n    "
+    "sure(" ++ printed ++ ", || {\n    let result: " ++ return_type ++ " = " ++ call ++ ";\n    "
       ++ ensured
       ++ "\n  })")
 }
@@ -373,13 +376,14 @@ fn answering(prelude: Bytes, d: ExternDef, fill: String) -> String / {abort.rais
 /// A test of the one end no draw reaches, since a call at it builds a gigabyte: `Array::new`'s
 /// `requires` holds up to the length the runtime's refusal names, and no further.
 fn array_limit(prelude: Bytes) -> String / {abort.raise} =
-  match stating(prelude, SRequires).filter(|d: ExternDef| d.name.name == b"Array::new") {
+  match externs_with_clause(prelude, RequiresClause).filter(|d: ExternDefinition|
+      d.name.name == b"Array::new") {
     [d, ..] -> match parameters(d, "Int") {
       [length, ..] ->
         "test \"`Array::new`'s `requires` ends where the runtime refuses\" {\n  let holds = |"
           ++ length.name
           ++ ": Int| "
-          ++ condition(prelude, d, SRequires)
+          ++ condition(prelude, d, RequiresClause)
           ++ ";\n  assert(holds(67108864) && !holds(67108865));\n  assert_eq(\n"
           ++ "    try[abort.raise] { Array::new(67108865, 7).len() },\n"
           ++ "    Err(\"`Array::new` of 67108865 elements is outside `0` to `67108864`\"),\n  )\n}\n",
@@ -391,19 +395,19 @@ fn array_limit(prelude: Bytes) -> String / {abort.raise} =
 // A row left without `abort.raise` rests on these clauses, so a builtin one is false of makes it a lie.
 test/nondet "no builtin raises where its `requires` holds or answers what its `ensures` rules out, at the ends of what its parameters take" {
   let prelude = prelude_file();
-  let tests = stating(prelude, SRequires).flat_map(|d: ExternDef|
-    fillings(d).map(|fill: String| held(prelude, d, fill))).concat(
-    stating(prelude, SEnsures).flat_map(|d: ExternDef|
-      fillings(d).map(|fill: String| answering(prelude, d, fill))),
+  let tests = externs_with_clause(prelude, RequiresClause).flat_map(|d: ExternDefinition|
+    fillings(d).map(|fill: String| requires_test(prelude, d, fill))).concat(
+    externs_with_clause(prelude, EnsuresClause).flat_map(|d: ExternDefinition|
+      fillings(d).map(|fill: String| ensures_test(prelude, d, fill))),
   ).push(
     array_limit(prelude),
   );
-  program(drawing() ++ String::join(tests, "\n"));
+  write_program(value_lists() ++ String::join(tests, "\n"));
   let r = spawned(["test", "--json"]);
   let v = json_of(r);
   let broken = items(at(v, "failures")).map(|f: Json|
     str(at(f, "name")) ++ ": " ++ str(path(f, ["diagnostic", "message"])));
   assert(broken == [], Some(String::join(broken, "\n")));
-  assert(r.code == 0, Some(said(r)));
+  assert(r.code == 0, Some(all_output(r)));
   assert_eq(int(path(v, ["summary", "passed"])), tests.len())
 }

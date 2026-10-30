@@ -1,0 +1,718 @@
+import compiler.check.known (none_constructor, some_constructor)
+import compiler.check.types (Type, FunctionType, int_type, row_empty, string_type)
+import std.bytes (ascii_of_int)
+import compiler.syntax.parsing (Span, dummy_span)
+import compiler.syntax.patterns (SourceLiteral, LiteralUnit, LiteralString)
+import compiler.emit.c (Width)
+import compiler.emit.representations (RecordShape, kind_of)
+import compiler.emit.output (GenericCall, Need, ForwardedParameter)
+import compiler.emit.keys (RootKey, Callee, Generic, Named, TypeOp, Copy, Share, Keep)
+import compiler.emit.layout (SumLayout, SumCases, PlainWords, Pointer, RawRange, WordIs,
+                             WordOutside, Nullary, Inline, holds_count, words)
+import compiler.emit.typed_ir.handling (HandleOp, HandleSite, WordArray, Label, empty_instance)
+import compiler.emit.typed_ir.containers (ContainerOp)
+import compiler.emit.typed_ir.calling (CallingOp)
+import compiler.emit.typed_ir.statics (StaticDefinition)
+import compiler.emit.typed_ir.strings (StringOp, StringOperand, TakesBlock, OwnBlock,
+                                       string_operands, string_result)
+
+pub type Representation =
+  | AsInt
+  | AsBool
+  | AsFixed(Width)
+  | AsFloat
+  | AsDecimal
+  | AsWideFixed(Width)
+  | AsWord
+  | AsFlattened(List<Leaf>)
+  | AsListView
+  | AsReuseToken(Int)
+  | AsSum({ layout: SumLayout, cases: List<Bytes> })
+  | AsUnit
+  | AsAddress
+  | AsImmediate
+
+pub type Leaf = { name: Bytes, representation: Representation }
+
+pub type Var = { id: Int, ty: Type, representation: Representation }
+
+pub type Arg =
+  | VarOperand(Var)
+  | IntOperand(Int)
+  | BoolOperand(Bool)
+  | FloatOperand(Int)
+  | FixedOperand({ width: Width, bits: Int })
+  | CharOperand(Int)
+  | ZeroOperand(Representation)
+
+pub type FieldWrite = { at: Int, ty: Type, arg: Arg }
+
+pub type ParamOwnership = | OwnedParam | BorrowedParam
+
+pub type Carried = { var: Var, init: Arg }
+
+pub fn carried_variables(state: List<Carried>) -> List<Var> = state.map(|c: Carried| c.var)
+
+pub fn carried_inits(state: List<Carried>) -> List<Arg> = state.map(|c: Carried| c.init)
+
+pub type ResultOwnership = | OwnedResult | BorrowedResult(List<{ param: Int, whole: Bool }>)
+
+pub type Convention = {
+  params: List<ParamTaking>,
+  result: Representation,
+  destination_passing: Bool,
+  answered: ResultOwnership,
+}
+
+pub type ParamTaking = { handed: ParamOwnership, representation: Representation }
+
+pub fn reps_of(c: Convention) -> List<Representation> =
+  c.params.map(|p: ParamTaking| p.representation)
+
+pub fn handed_of(c: Convention) -> List<ParamOwnership> = c.params.map(|p: ParamTaking| p.handed)
+
+pub fn all_given(reps: List<Representation>) -> List<ParamTaking> =
+  reps.map(|r: Representation| { handed: OwnedParam, representation: r })
+
+pub fn param_rep(c: Convention, i: Int) -> Option<Representation> =
+  match c.params.at(i) { Some(p) -> Some(p.representation), None -> None }
+
+pub fn param_lent(c: Convention, i: Int) -> Bool =
+  match c.params.at(i) { Some(p) -> p.handed == BorrowedParam, None -> false }
+
+pub fn handed_at(c: Convention, by_convention: List<ParamOwnership>) -> Convention =
+  {
+    ..c,
+    params: c.params.fold([], |acc: List<ParamTaking>, p: ParamTaking|
+      acc.push(match by_convention.at(acc.len()) { Some(h) -> { ..p, handed: h }, None -> p })),
+  }
+
+pub fn lent_where(reps: List<Representation>, lent: List<Int>) -> List<ParamTaking> =
+  range(0, reps.len()).fold([], |acc: List<ParamTaking>, i: Int|
+    match reps.at(i) {
+      Some(r) ->
+        acc.push({
+          handed: if lent.contains(i) { BorrowedParam } else { OwnedParam },
+          representation: r,
+        }),
+      None -> acc,
+    })
+
+pub type OperationSignature = { takes: List<Bool>, owned: Bool, fails: Bool, suspends: Bool }
+
+pub type Allocation =
+  | ListAllocation(Int)
+  | ClosureAllocation({ nth: Int, captures: Int, params: Int })
+  | CaseAllocation({ case: Int, skip: Int, words: Int })
+  | StackAllocation(Allocation)
+  | RecordAllocation(List<FieldInitializer>)
+
+pub type FieldInitializer = | FromArgument | BuiltInPlace(List<FieldInitializer>)
+
+pub type Path =
+  | FieldPath({ name: Bytes, at: Int })
+  | ArgumentPath({ ctor: Bytes, at: Int })
+  | CapturePath(Int)
+  | LeafPath(Int)
+  | InlineRecordPath(Int)
+  | CasePath({ case: Int, at: Int })
+  | PayloadPath
+
+pub type Test =
+  | TagTest(List<Bytes>)
+  | IntTest(List<Int>)
+  | RangeTest({ lo: Int, hi: Int })
+  | LengthTest({ at_least: Int })
+
+pub type Operation =
+  | OfHandling(HandleOp)
+  | OfContainers(ContainerOp)
+  | OfCalling(CallingOp)
+  | OfStrings(StringOp)
+
+pub type Rvalue =
+  | Primitive({ op: Bytes, on: Representation, args: List<Arg> })
+  | Literal(SourceLiteral)
+  | Static(Bytes)
+  | Allocate({ made: Allocation, args: List<Arg>, reuse: Option<Var> })
+  | Get({ of: Var, path: Path })
+  | Take({ of: Var, path: Path })
+  | Tag(Bytes)
+  | Convert({ arg: Arg, to: Representation })
+  | Aggregate({ parts: List<Arg> })
+  | Update({ of: Var, sets: List<FieldWrite> })
+  | Call({ callee: Callee, args: List<Arg>, convention: Convention, suspends: Bool })
+  | Apply({ f: Arg, args: List<Arg>, convention: Convention, suspends: Bool, closure: Option<Int> })
+  | Native({ name: Bytes, args: List<Arg>, uses: OperationSignature })
+  | Op({ op: Operation, args: List<Arg>, uses: OperationSignature })
+  | IfUnique(Var)
+  | Unspecialised(List<{ arg: Arg, takes: Bool }>)
+  | WalkLoop({ of: Var, op: TypeOp })
+
+pub type Block = List<Inst>
+
+pub type Inst =
+  | Let({ var: Var, value: Rvalue, at: Span, unwind: List<Var> })
+  | Do({ value: Rvalue, at: Span, unwind: List<Var> })
+  | Declaration(Var)
+  | Assign({ var: Var, arg: Arg })
+  | If({ cond: Arg, then: Block, otherwise: Block })
+  | Case({ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block })
+  | Match({ arms: List<Block>, rest: Block })
+  | Miss
+  | Loop({ state: List<Carried>, body: Block, result: Var })
+  | Next(List<Arg>)
+  | Done(Arg)
+  | Return(Arg)
+  | Restart(List<Arg>)
+  | Jump({ member: Int, args: List<Arg> })
+  | Fail({ reason: MatchFailure, at: Span, letting: List<Unwinding>, unwind: List<Var> })
+  | Handle({ body: Block, args: List<Arg>, uses: OperationSignature, site: HandleSite, result: Var, unwind: List<Var> })
+  | SiteScope(Option<SiteOrigin>)
+  | CleanupScope(Option<List<Unwinding>>)
+  | Inc({ var: Var, n: Int })
+  | Dec(Var)
+  | Reset({ token: Var, of: Var })
+  | Free({ of: Var, bytes: Arg })
+  | Destructure({ of: Var, words: List<Var> })
+
+pub type Unwinding = { arg: Arg, words: List<Arg>, callee: RootKey, convention: Convention }
+
+pub type MatchFailure = | NoMatchingArm | LetMismatch
+
+pub type SiteOrigin = { root: RootKey, base: Int }
+
+pub type FnKind = | Metered | Plain
+
+pub type Links = {
+  generics: List<GenericCall>,
+  needs: List<Need>,
+  called: List<Int>,
+  passes: List<ForwardedParameter>,
+  pending: Option<PendingRaise>,
+}
+
+pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [], pending: None }
+
+pub type PendingRaise = { word: Var, index: Int, op: Bytes, string: Bytes }
+
+pub type Fn = {
+  key: RootKey,
+  kind: FnKind,
+  params: List<Var>,
+  convention: Convention,
+  result_type: Type,
+  body: Block,
+  lambdas: List<Lambda>,
+  base: Int,
+  members: List<Member>,
+  links: Links,
+  statics: List<StaticDefinition>,
+}
+
+pub type Member = { key: RootKey, base: Int, params: List<Var>, convention: Convention }
+
+pub type Lambda = | Closure({ body: Fn, captures: Int, at: Span, words: ClosureEvidence })
+
+pub type ClosureEvidence = { descriptor: Bytes, count: Int, left: List<Int> }
+
+pub fn no_closure_evidence() -> ClosureEvidence = { descriptor: b"", count: 0, left: [] }
+
+pub fn representation_text(r: Representation) -> Bytes =
+  match r {
+    AsInt -> b"Int",
+    AsBool -> b"Bool",
+    AsFixed(_) -> b"a number of a width",
+    AsFloat -> b"Float",
+    AsDecimal -> b"Decimal",
+    AsWideFixed(w) -> if w.signed { b"I128" } else { b"U128" },
+    AsWord -> b"a word",
+    AsFlattened(ls) -> Bytes::concat_all([b"flat, ", ascii_of_int(ls.len()), b" leaves"]),
+    AsListView -> b"a view",
+    AsReuseToken(n) -> Bytes::concat_all([b"a token of ", ascii_of_int(n), b" words"]),
+    AsSum(s) -> Bytes::concat_all([b"a sum's words, ", ascii_of_int(s.cases.len()), b" cases"]),
+    AsUnit -> b"no words",
+    AsAddress -> b"an address into a block",
+    AsImmediate -> b"a word holding no count",
+  }
+
+pub fn var_text(v: Var) -> Bytes =
+  Bytes::concat_all([b"v", ascii_of_int(v.id), b" held as ", representation_text(v.representation)])
+
+pub fn allocation_text(m: Allocation) -> Bytes =
+  match m {
+    ListAllocation(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
+    ClosureAllocation(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
+    CaseAllocation(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
+    RecordAllocation(_) -> b"record",
+    StackAllocation(x) -> Bytes::concat_all([allocation_text(x), b" in the frame"]),
+  }
+
+pub fn base_allocation(m: Allocation) -> Allocation =
+  match m { StackAllocation(x) -> base_allocation(x), _ -> m }
+
+pub fn stack_borrows(m: Allocation, args: List<Arg>) -> Option<List<Arg>> =
+  match m {
+    StackAllocation(ClosureAllocation(c)) -> Some(args.take(c.captures)),
+    StackAllocation(ListAllocation(_)) -> Some(args),
+    _ -> None,
+  }
+
+pub fn is_refcounted(r: Representation) -> Bool =
+  match r {
+    AsWord -> true,
+    AsListView -> true,
+    AsReuseToken(_) -> true,
+    AsFlattened(leaves) ->
+      leaves.fold(false, |any: Bool, l: Leaf| any || is_refcounted(l.representation)),
+    AsSum(s) -> holds_count(SumCases(s.layout)),
+    _ -> false,
+  }
+
+pub fn is_boxed(r: Representation) -> Bool =
+  match r { AsFlattened(_) -> true, AsSum(s) -> words(SumCases(s.layout)) > 1, _ -> false }
+
+pub fn is_unboxing(arg: Arg, to: Representation) -> Bool =
+  operand_representation(arg) == AsWord && is_boxed(to)
+
+pub fn parts_of(r: Representation) -> List<Representation> =
+  match r {
+    AsFlattened(leaves) -> leaves.map(|l: Leaf| l.representation),
+    AsListView -> [AsWord, AsInt],
+    _ -> [r],
+  }
+
+pub fn operand_representation(a: Arg) -> Representation =
+  match a {
+    VarOperand(v) -> v.representation,
+    IntOperand(_) -> AsInt,
+    BoolOperand(_) -> AsBool,
+    FloatOperand(_) -> AsFloat,
+    FixedOperand(n) -> AsFixed(n.width),
+    CharOperand(_) -> AsImmediate,
+    ZeroOperand(r) -> r,
+  }
+
+pub fn operand_var(a: Arg) -> Option<Var> = match a { VarOperand(v) -> Some(v), _ -> None }
+
+pub fn uses_typed_entry(f: Arg) -> Bool =
+  match f { VarOperand(v) -> match v.ty { FunctionType(_) -> true, _ -> false }, _ -> false }
+
+pub fn operands(v: Rvalue) -> List<{ arg: Arg, takes: Bool }> =
+  match v {
+    Primitive(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
+    Literal(_) -> [],
+    Static(_) -> [],
+    Allocate(m) -> if is_record_allocation(m.made) { read_records(m.args) } else {
+      let lent = match stack_borrows(m.made, m.args) { Some(cs) -> cs.len(), None -> 0 };
+      range(0, m.args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+        match m.args.at(i) {
+          Some(a) -> acc.push({ arg: a, takes: i >= lent }),
+          None -> acc,
+        }).concat(match m.reuse { Some(t) -> [{ arg: VarOperand(t), takes: true }], None -> [] })
+    },
+    Get(g) -> [{ arg: VarOperand(g.of), takes: false }],
+    Take(t) -> [{ arg: VarOperand(t.of), takes: false }],
+    Tag(_) -> [],
+    Convert(p) -> [{ arg: p.arg, takes: is_refcounted(p.to) && !is_unboxing(p.arg, p.to) }],
+    Aggregate(g) -> g.parts.map(|a: Arg| { arg: a, takes: true }),
+    Update(u) ->
+      [{ arg: VarOperand(u.of), takes: true }].concat(
+        read_records(u.sets.map(|s: FieldWrite| s.arg)),
+      ),
+    Call(c) -> by_convention(c.args, c.convention),
+    Apply(c) ->
+      [{ arg: c.f, takes: uses_typed_entry(c.f) }].concat(by_convention(c.args, c.convention)),
+    Native(n) -> by_signature(n.args, n.uses),
+    Op(o) -> by_signature(o.args, o.uses),
+    IfUnique(x) -> [{ arg: VarOperand(x), takes: true }],
+    WalkLoop(w) -> [{ arg: VarOperand(w.of), takes: w.op == Copy }],
+    Unspecialised(ops) -> ops,
+  }
+
+fn is_record_allocation(m: Allocation) -> Bool = match m { RecordAllocation(_) -> true, _ -> false }
+
+pub fn read_only(args: List<Arg>) -> List<{ arg: Arg, takes: Bool }> =
+  args.map(|a: Arg| { arg: a, takes: false })
+
+pub fn reads(n: Int) -> OperationSignature =
+  { takes: range(0, n).map(|_: Int| false), owned: false, fails: false, suspends: false }
+
+pub fn read_records(args: List<Arg>) -> List<{ arg: Arg, takes: Bool }> =
+  args.map(|a: Arg|
+    { arg: a, takes: match operand_var(a) { Some(v) -> !is_record_word(v), None -> true } })
+
+pub fn is_record_word(v: Var) -> Bool =
+  v.representation == AsWord && (match kind_of(v.ty).ty { RecordShape(_) -> true, _ -> false })
+
+fn by_convention(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) { Some(a) -> acc.push({ arg: a, takes: !param_lent(conv, i) }), None -> acc })
+
+pub fn string_signature(op: StringOp) -> OperationSignature =
+  {
+    takes: string_operands(op).map(|a: StringOperand| a == TakesBlock),
+    owned: string_result(op) == OwnBlock,
+    fails: false,
+    suspends: false,
+  }
+
+pub fn by_signature(args: List<Arg>, uses: OperationSignature) -> List<{ arg: Arg, takes: Bool }> =
+  range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
+    match args.at(i) {
+      Some(a) -> acc.push({ arg: a, takes: uses.takes.at(i) == Some(true) }),
+      None -> acc,
+    })
+
+pub type Provenance = | Owns | BorrowSources(List<Var>) | Immortal
+
+pub fn provenance(v: Rvalue) -> Provenance =
+  match v {
+    Get(g) -> BorrowSources([g.of]),
+    Static(_) -> Immortal,
+    Tag(_) -> Immortal,
+    Native(n) -> signature_provenance(n.args, n.uses),
+    Op(o) -> signature_provenance(o.args, o.uses),
+    WalkLoop(w) -> if w.op == Share { Immortal } else { Owns },
+    Convert(p) -> if !is_unboxing(p.arg, p.to) { Owns }
+    else { match p.arg { VarOperand(x) -> BorrowSources([x]), _ -> Immortal } },
+    Call(c) -> match c.convention.answered {
+      OwnedResult -> Owns,
+      BorrowedResult(from) ->
+        BorrowSources(
+          from.fold([], |xs: List<Var>, b: { param: Int, whole: Bool }|
+            match c.args.at(b.param) {
+              Some(VarOperand(x)) -> if is_refcounted(x.representation) && !xs.contains(x) {
+                xs.push(x)
+              } else { xs },
+              _ -> xs,
+            }),
+        ),
+    },
+    _ -> Owns,
+  }
+
+fn signature_provenance(args: List<Arg>, uses: OperationSignature) -> Provenance =
+  if uses.owned { Owns }
+  else { match args.at(0) { Some(VarOperand(x)) -> BorrowSources([x]), _ -> Immortal } }
+
+pub fn fails(v: Rvalue) -> Bool =
+  match v {
+    Primitive(p) -> checked(p.op, p.on),
+    Literal(_) -> false,
+    Static(_) -> false,
+    Allocate(_) -> false,
+    Get(_) -> false,
+    Take(_) -> false,
+    Tag(_) -> false,
+    Convert(_) -> false,
+    Aggregate(_) -> false,
+    Update(_) -> false,
+    Call(_) -> true,
+    Apply(_) -> true,
+    Native(n) -> n.uses.fails,
+    Op(o) -> o.uses.fails,
+    IfUnique(_) -> false,
+    WalkLoop(_) -> false,
+    Unspecialised(_) -> false,
+  }
+
+pub fn may_suspend(value: Rvalue) -> Bool =
+  match value {
+    Call(c) -> c.suspends,
+    Apply(c) -> c.suspends,
+    Native(n) -> n.uses.suspends,
+    Op(o) -> o.uses.suspends,
+    _ -> false,
+  }
+
+pub fn any_held(b: Block, at: (Inst) -> Bool) -> Bool =
+  b.any(|i: Inst|
+    at(i)
+      || (match i {
+        If(x) -> any_held(x.then, at) || any_held(x.otherwise, at),
+        Case(c) ->
+          any_held(c.rest, at) || c.arms.any(|a: { when: Int, body: Block }| any_held(a.body, at)),
+        Match(m) -> any_held(m.rest, at) || m.arms.any(|arm: Block| any_held(arm, at)),
+        Loop(l) -> any_held(l.body, at),
+        Handle(h) -> any_held(h.body, at),
+        _ -> false,
+      }))
+
+fn valued(i: Inst, at: (Rvalue) -> Bool) -> Bool =
+  match i { Let(l) -> at(l.value), Do(d) -> at(d.value), _ -> false }
+
+pub fn suspends_in(b: Block) -> Bool = any_held(b, |i: Inst| valued(i, may_suspend))
+
+pub fn calls_in(b: Block) -> Bool =
+  any_held(b, |i: Inst|
+    valued(i, |v: Rvalue| match v { Call(_) -> true, Apply(_) -> true, _ -> false }))
+
+pub fn handle_suspends(body: Block, site: HandleSite) -> Bool =
+  site.clauses.len() > 0 || site.ret != None || site.detached != None || suspends_in(body)
+
+pub fn checked(op: Bytes, on: Representation) -> Bool =
+  match on {
+    AsInt -> arithmetic(op) || shift(op) || op == b"neg" || op == b"of_int",
+    AsFixed(w) ->
+      arithmetic(op) || shift(op) || op == b"neg" || (op == b"to_int" && !w.signed && w.bits == 64),
+    AsFloat -> op == b"rem",
+    AsDecimal -> arithmetic(op),
+    AsWideFixed(_) -> arithmetic(op) || shift(op) || op == b"neg" || op == b"to_int",
+    _ -> false,
+  }
+
+pub fn arithmetic(op: Bytes) -> Bool =
+  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+pub fn shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
+
+pub fn comparison(op: Bytes) -> Bool =
+  op == b"eq" || op == b"ne" || op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+
+pub fn is_terminator(i: Inst) -> Bool =
+  match i {
+    Return(_) -> true,
+    Restart(_) -> true,
+    Jump(_) -> true,
+    Next(_) -> true,
+    Done(_) -> true,
+    Fail(_) -> true,
+    Miss -> true,
+    _ -> false,
+  }
+
+pub fn falls_through(b: Block) -> Bool =
+  b.fold(true, |falls: Bool, i: Inst|
+    match i { SiteScope(_) -> falls, CleanupScope(_) -> falls, _ -> !is_terminator(i) })
+
+test "a word, a view and a flat value with a counted leaf hold a count where a scalar holds none" {
+  assert_eq(
+    [AsInt, AsBool, AsFloat, AsDecimal, AsFixed({ bits: 8, signed: false })].map(is_refcounted),
+    [false, false, false, false, false],
+  );
+  assert_eq([AsWord, AsListView, AsReuseToken(2)].map(is_refcounted), [true, true, true]);
+  assert_eq(
+    [
+      AsFlattened([{ name: b"a", representation: AsInt }]),
+      AsFlattened([{ name: b"a", representation: AsInt }, { name: b"s", representation: AsWord }]),
+    ].map(
+      is_refcounted,
+    ),
+    [false, true],
+  )
+}
+
+test "each operation consumes or borrows each operand as its signature says" {
+  let s = { id: 1, ty: string_type(), representation: AsWord };
+  let conv = {
+    params: [
+      { handed: OwnedParam, representation: AsWord },
+      { handed: BorrowedParam, representation: AsWord },
+    ],
+    result: AsInt,
+    destination_passing: false,
+    answered: OwnedResult,
+  };
+  let call = Call({
+    callee: Generic(0),
+    args: [VarOperand(s), VarOperand(s)],
+    convention: conv,
+    suspends: false,
+  });
+  let takes = |v: Rvalue| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes);
+  assert_eq(takes(call), [true, false]);
+  let f = {
+    id: 2,
+    ty: FunctionType({
+      kept: [],
+      once: false,
+      params: [s.ty, s.ty],
+      ret: int_type(),
+      effects: row_empty(),
+    }),
+    representation: AsWord,
+  };
+  let apply = |f: Arg, args: List<Arg>|
+    Apply({ f: f, args: args, convention: conv, suspends: false, closure: None });
+  assert_eq(takes(apply(VarOperand(f), [VarOperand(s), VarOperand(s)])), [true, true, false]);
+  assert_eq(takes(apply(VarOperand(s), [VarOperand(s)])), [false, true]);
+  assert_eq(takes(Get({ of: s, path: LeafPath(0) })), [false]);
+  assert_eq(takes(Aggregate({ parts: [VarOperand(s), IntOperand(1)] })), [true, true]);
+  assert_eq(takes(Convert({ arg: VarOperand(s), to: AsInt })), [false]);
+  assert_eq(takes(Convert({ arg: IntOperand(1), to: AsWord })), [true]);
+  let flat = AsFlattened([
+    { name: b"a", representation: AsWord },
+    { name: b"b", representation: AsInt },
+  ]);
+  assert_eq(takes(Convert({ arg: VarOperand(s), to: flat })), [false]);
+  assert_eq(provenance(Convert({ arg: VarOperand(s), to: flat })), BorrowSources([s]));
+  let closure = |framed: Bool|
+    Allocate({
+      made: if framed { StackAllocation(ClosureAllocation({ nth: 0, captures: 2, params: 1 })) }
+      else { ClosureAllocation({ nth: 0, captures: 2, params: 1 }) },
+      args: [VarOperand(s), VarOperand(s)],
+      reuse: None,
+    });
+  assert_eq(takes(closure(true)), [false, false]);
+  assert_eq(takes(closure(false)), [true, true]);
+  let taken = Take({ of: s, path: FieldPath({ name: b"buf", at: 1 }) });
+  assert_eq(takes(taken), [false]);
+  assert_eq(provenance(taken), Owns);
+  assert_eq(provenance(Tag(b"m.Box")), Immortal);
+  let lent = { takes: [false, true], owned: false, fails: true, suspends: false };
+  assert_eq(
+    takes(Op({ op: OfHandling(WordArray), args: [VarOperand(s), VarOperand(s)], uses: lent })),
+    [false, true],
+  );
+  assert_eq(provenance(Get({ of: s, path: LeafPath(0) })), BorrowSources([s]));
+  assert_eq(provenance(call), Owns);
+  let borrowed = match call {
+    Call(c) ->
+      Call({
+        ..c,
+        convention: { ..c.convention, answered: BorrowedResult([{ param: 1, whole: true }]) },
+      }),
+    other -> other,
+  };
+  assert_eq(provenance(borrowed), BorrowSources([s]));
+  assert_eq(
+    provenance(Native({ name: b"rt_len_p", args: [VarOperand(s)], uses: lent })),
+    BorrowSources([s]),
+  );
+  assert_eq(provenance(Op({ op: OfHandling(Label(b"r")), args: [], uses: lent })), Immortal)
+}
+
+test "what can fail is what tests the runtime: a checked operator, a call, never an allocation or a constant" {
+  assert_eq(
+    fails(Primitive({ op: b"add", on: AsInt, args: [IntOperand(1), IntOperand(2)] })),
+    true,
+  );
+  assert_eq(
+    fails(Primitive({ op: b"lt", on: AsInt, args: [IntOperand(1), IntOperand(2)] })),
+    false,
+  );
+  assert_eq(
+    fails(Primitive({ op: b"add", on: AsFloat, args: [FloatOperand(0), FloatOperand(0)] })),
+    false,
+  );
+  assert_eq(
+    fails(
+      Primitive({
+        op: b"add",
+        on: AsDecimal,
+        args: [ZeroOperand(AsDecimal), ZeroOperand(AsDecimal)],
+      }),
+    ),
+    true,
+  );
+  assert_eq(fails(Primitive({ op: b"of_int", on: AsInt, args: [IntOperand(300)] })), true);
+  let w = { id: 2, ty: string_type(), representation: AsWord };
+  assert_eq(fails(Get({ of: w, path: LeafPath(0) })), false);
+  let flat = { ..w, representation: AsFlattened([{ name: b"x", representation: AsInt }]) };
+  assert_eq(fails(Convert({ arg: IntOperand(7), to: AsWord })), false);
+  assert_eq(fails(Convert({ arg: VarOperand(flat), to: AsWord })), false);
+  assert_eq(
+    fails(
+      Allocate({
+        made: CaseAllocation({ case: 0, skip: 0, words: 1 }),
+        args: [VarOperand(w)],
+        reuse: None,
+      }),
+    ),
+    false,
+  );
+  assert_eq(fails(Aggregate({ parts: [IntOperand(1)] })), false);
+  assert_eq(fails(Take({ of: w, path: FieldPath({ name: b"x", at: 0 }) })), false);
+  assert_eq(fails(Tag(b"m.Box")), false);
+  assert_eq([Literal(LiteralUnit), Literal(LiteralString(b"a")), Static(b"ply_k_0")].map(fails), [
+    false,
+    false,
+    false,
+  ]);
+  assert_eq(is_terminator(Miss), true);
+  assert_eq(
+    falls_through([Do({ value: Literal(LiteralUnit), at: dummy_span(), unwind: [] })]),
+    true,
+  )
+}
+
+test "a call stops where it says, a block where something it holds does, a handle where anything under it may" {
+  let call = |stops: Bool|
+    Call({
+      callee: Generic(0),
+      args: [],
+      convention: { params: [], result: AsWord, destination_passing: false, answered: OwnedResult },
+      suspends: stops,
+    });
+  let calling = |stops: Bool| [Do({ value: call(stops), at: dummy_span(), unwind: [] })];
+  assert_eq([may_suspend(call(true)), may_suspend(call(false))], [true, false]);
+  assert_eq([suspends_in(calling(true)), suspends_in(calling(false))], [true, false]);
+  assert_eq(
+    suspends_in([If({ cond: BoolOperand(true), then: [], otherwise: calling(true) })]),
+    true,
+  );
+  let quiet = { clauses: [], ret: None, detached: None, instance: empty_instance(0) };
+  let clause = { effect: b"e", op: b"op", mode: 1, string: None, handler: 0 };
+  assert_eq(
+    [
+      handle_suspends(calling(false), quiet),
+      handle_suspends(calling(true), quiet),
+      handle_suspends([], { ..quiet, ret: Some(0) }),
+      handle_suspends([], { ..quiet, detached: Some({ body: 1, forwards: 2 }) }),
+      handle_suspends([], { ..quiet, clauses: [clause] }),
+    ],
+    [false, true, true, true, true],
+  )
+}
+
+test "a block ends where its last instruction but a site's change ends" {
+  let lent = SiteScope(Some({ root: Named(b"m.g"), base: 40 }));
+  let fail = Fail({ reason: NoMatchingArm, at: dummy_span(), letting: [], unwind: [] });
+  assert_eq(falls_through([lent, fail, SiteScope(None)]), false);
+  assert_eq(falls_through([fail, SiteScope(None), Return(IntOperand(0)), lent]), false);
+  assert_eq(falls_through([lent, SiteScope(None)]), true);
+  assert_eq(falls_through([]), true)
+}
+
+test "a sum is one part of the form, counted through its cases, and a last-holder test takes its operand" {
+  let none = { test: WordIs({ at: 0, value: 0 }), payload: Nullary };
+  let pointer = {
+    test: WordOutside({ at: 0, values: [0] }),
+    payload: Inline({ offset: 0, layout: PlainWords([Pointer]), stripped: None }),
+  };
+  let maybe = AsSum({
+    layout: { classes: [Pointer], cases: [none, pointer] },
+    cases: [none_constructor(), some_constructor()],
+  });
+  let flags = AsSum({
+    layout: {
+      classes: [RawRange({ lo: 0, hi: 1 })],
+      cases: [none, { test: WordIs({ at: 0, value: 1 }), payload: Nullary }],
+    },
+    cases: [b"Off", b"On"],
+  });
+  assert_eq([maybe, flags, AsUnit, AsAddress].map(is_refcounted), [true, false, false, false]);
+  assert_eq(
+    parts_of(
+      AsFlattened([{ name: b"o", representation: maybe }, { name: b"n", representation: AsInt }]),
+    ),
+    [maybe, AsInt],
+  );
+  let s = { id: 1, ty: string_type(), representation: AsWord };
+  assert_eq(operands(IfUnique(s)).map(|o: { arg: Arg, takes: Bool }| o.takes), [true]);
+  assert_eq(provenance(IfUnique(s)), Owns);
+  assert_eq(fails(IfUnique(s)), false)
+}
+
+test "a walk takes what it copies and borrows what it shares or keeps, and a share answers no count" {
+  let s = { id: 1, ty: string_type(), representation: AsWord };
+  let walked = [Copy, Share, Keep].map(|op: TypeOp| WalkLoop({ of: s, op: op }));
+  assert_eq(walked.map(|v: Rvalue| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes)), [
+    [true],
+    [false],
+    [false],
+  ]);
+  assert_eq(walked.map(provenance), [Owns, Immortal, Owns]);
+  assert_eq(walked.map(fails), [false, false, false])
+}

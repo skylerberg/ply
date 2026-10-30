@@ -1,0 +1,127 @@
+import compiler.syntax.parsing (Identifier, QName, qualified_name_text)
+import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
+                                    FunctionTypeExpression, RecordTypeExpression,
+                                    UnitTypeExpression, InvalidTypeExpression, RowExpression,
+                                    AtomExpression, mode_text)
+import compiler.syntax.items (Module, Item, TypeItem, DeriveItem, TypeDefinition, AliasBody,
+                              SumBody, NominalBody, ExternBody, VariantDefinition, Public,
+                              ImportDeclaration, WholeModule, ModuleAlias, SelectedNames)
+import compiler.syntax.expressions (is_hidden_binder)
+import std.derive
+import std.list
+import std.string
+
+pub fn declaration_of(
+  path: Bytes,
+  module: Module,
+  target: Bytes,
+  binder: Bytes,
+) -> derive::Declaration / {abort.raise} =
+  {
+    target: String::of_bytes(target),
+    module: String::of_bytes(path),
+    binder: String::of_bytes(binder),
+    types: module.items.fold([], |acc: List<derive::TypeDeclaration>, item: Item|
+      match item { TypeItem(d) -> acc.push(declarations(d)), _ -> acc }),
+    derived: module.items.fold([], |acc: List<String>, item: Item|
+      match item {
+        DeriveItem(d) -> if d.deriver == binder { acc.push(String::of_bytes(d.target.name)) }
+        else { acc },
+        _ -> acc,
+      }),
+    imports: module.imports.fold(
+      [],
+      |acc: List<derive::Imported>, declaration: ImportDeclaration|
+        match import_binder(declaration) {
+          Some(binder) ->
+            acc.push({
+              module: String::of_bytes(
+                Bytes::join(declaration.path.map(|i: Identifier| i.name), b"."),
+              ),
+              binder: String::of_bytes(binder),
+            }),
+          None -> acc,
+        },
+    ),
+  }
+
+pub fn import_binder(declaration: ImportDeclaration) -> Option<Bytes> =
+  match declaration.kind {
+    WholeModule -> declaration.path.at(declaration.path.len() - 1).map(|i: Identifier| i.name),
+    ModuleAlias(a) -> if is_hidden_binder(a.name) { None } else { Some(a.name) },
+    SelectedNames(_) -> None,
+  }
+
+fn declarations(d: TypeDefinition) -> derive::TypeDeclaration / {abort.raise} =
+  {
+    name: String::of_bytes(d.name.name),
+    public: d.visibility == Public,
+    types: d.generics.types.map(name_of),
+    rows: d.generics.effects.map(name_of),
+    labels: d.generics.labels.map(name_of),
+    body: match d.body {
+      AliasBody(t) -> derive::Alias(derive_type(t)),
+      NominalBody(t) -> derive::Nominal(derive_type(t)),
+      SumBody(variants) ->
+        derive::Sum(
+          variants.map(|v: VariantDefinition|
+            { name: String::of_bytes(v.name.name), fields: v.fields.map(derive_type) }),
+        ),
+      ExternBody -> derive::Extern,
+    },
+  }
+
+fn name_of(i: Identifier) -> String / {abort.raise} = String::of_bytes(i.name)
+
+fn derive_type(t: TypeExpression) -> derive::Type / {abort.raise} =
+  match t {
+    VariableTypeExpression(i) -> derive::Param(name_of(i)),
+    NamedTypeExpression(c) ->
+      derive::Applied(
+        {
+          module: match c.name.module { Some(m) -> Some(name_of(m)), None -> None },
+          name: name_of(c.name.name),
+        },
+        c.args.map(derive_type),
+        c.labels.map(name_of),
+        c.rows.map(|r: RowExpression| String::of_bytes(row_text(r))),
+      ),
+    FunctionTypeExpression(f) ->
+      derive::Function(f.params.map(derive_type), derive_type(f.ret), match f.effects {
+        Some(r) -> String::of_bytes(row_text(r)),
+        None -> "",
+      }),
+    RecordTypeExpression(r) ->
+      derive::Record(
+        r.fields.map(|f: { name: Identifier, ty: TypeExpression }|
+          { name: name_of(f.name), ty: derive_type(f.ty) }),
+      ),
+    UnitTypeExpression(_) -> derive::Unit,
+    InvalidTypeExpression(_) -> derive::Unit,
+  }
+
+pub fn row_text(row: RowExpression) -> Bytes = {
+  let members = row.atoms.map(atom_text).concat(row.aliases.map(qualified_name_text));
+  let tail = match row.tail {
+    Some(t) ->
+      Bytes::concat_all([
+        if members.len() == 0 { b"| " } else { b" | " },
+        t.name,
+        if row.tail_bounded { b" bounded" } else { b"" },
+      ]),
+    None -> b"",
+  };
+  Bytes::concat_all([b"{", Bytes::join(members, b", "), tail, b"}"])
+}
+
+fn atom_text(atom: AtomExpression) -> Bytes = {
+  let resource = if atom.every { b"[*]" }
+  else { match atom.resource { Some(r) -> Bytes::concat_all([b"[", r.name, b"]"]), None -> b"" } };
+  Bytes::concat_all([
+    qualified_name_text(atom.effect_name),
+    b".",
+    match atom.op { Some(o) -> o.name, None -> mode_text(atom.mode) },
+    resource,
+    if atom.bounded { b" bounded" } else { b"" },
+  ])
+}

@@ -1,12 +1,14 @@
 //! Parser combinators: a parser is a value, and a bigger one is built from smaller ones.
 //!
-//! A parser takes the input and a position and answers a `Step` or `None`: a refusal is `None` rather
-//! than a diagnostic, and every loop is bounded by the input rather than by a budget. `many` stops
-//! when its parser consumes nothing or answers a position past the input, and `sep_by` when a
-//! separator and an item together consume nothing, so a parser that can match the empty string still
-//! cannot loop and nothing needs a fuel argument. There is no backtracking across a committed choice:
-//! `or_else` runs its second parser from the same position as the first, so there is no half-consumed
-//! state to unwind.
+//! A parser takes the input and a position, and returns a `Match` or `None`. A failed parse is
+//! `None` rather than a diagnostic. Every loop is bounded by the input rather than by a budget:
+//! `many` stops when its parser consumes nothing or returns a position past the input, and `separator_by`
+//! stops when a separator and an item together consume nothing. So a parser that can match the
+//! empty string still cannot loop, and no parser needs a fuel argument.
+//!
+//! A parser returns at most one match, so a sequence never goes back to try another branch of an
+//! earlier choice. `or_else` runs its second parser from the same position as the first, so a
+//! failed first parser leaves nothing to undo.
 
 import std.list (prepend)
 
@@ -16,28 +18,29 @@ pub type Input = String
 /// A position in an `Input`, in characters.
 pub type Position = Int
 
-/// What one parse answered: the value and where the input stood after it.
-pub type Step<a> = { value: a, at: Position }
+/// The result of a successful parse: the value, and the position just after what it consumed.
+pub type Match<a> = { value: a, at: Position }
 
-/// A parser: the input, a position, and `None` if it does not match there.
-pub type Parser<a> = (Input, Position) -> Option<Step<a>> / {abort.raise}
+/// A parser. Given the input and a position, it returns a `Match`, or `None` if it does not match
+/// there.
+pub type Parser<a> = (Input, Position) -> Option<Match<a>> / {abort.raise}
 
-/// The value an input parses to, or `None` if the parser does not consume all of it. A partial parse
-/// is not an answer, so a trailing rest is a refusal; `at` is the one that reads a prefix.
+/// The value `input` parses to, or `None` if the parser does not consume all of it. Unparsed input
+/// left at the end is a failure; `run_prefix` parses a prefix.
 pub fn run<a>(parser: Parser<a>, input: Input) -> Option<a> / {abort.raise} =
   match parser(input, 0) {
     None -> None,
     Some(step) -> if step.at == input.len() { Some(step.value) } else { None },
   }
 
-/// The first `Step` a parser answers, leaving the rest of the input unread.
-pub fn at<a>(
+/// Runs the parser at `position` and returns its `Match`, leaving the rest of the input unread.
+pub fn run_prefix<a>(
   parser: Parser<a>,
   input: Input,
   position: Position,
-) -> Option<Step<a>> / {abort.raise} = parser(input, position)
+) -> Option<Match<a>> / {abort.raise} = parser(input, position)
 
-/// One character for which `ok` answers true.
+/// One character for which `ok` returns true.
 pub fn satisfy(ok: keep (String) -> Bool / {abort.raise}) -> Parser<String> =
   |input: Input, position: Position|
     if position < input.len() {
@@ -48,7 +51,7 @@ pub fn satisfy(ok: keep (String) -> Bool / {abort.raise}) -> Parser<String> =
 /// The one character `c`.
 pub fn char(c: String) -> Parser<String> = text(c)
 
-/// The literal `t`, which is `""` matching at every position.
+/// The literal text `t`. An empty `t` matches at every position.
 pub fn text(t: String) -> Parser<String> =
   |input: Input, position: Position|
     if position + t.len() > input.len() { None }
@@ -64,18 +67,18 @@ pub fn map<a, b>(parser: Parser<a>, f: keep (a) -> b / {abort.raise}) -> Parser<
       Some(step) -> Some({ value: f(step.value), at: step.at }),
     }
 
-/// `parser`, then whatever parser its value names, from where `parser` stopped.
+/// `parser`, then the parser `f` returns for its value, run from where `parser` stopped.
 pub fn and_then<a, b>(parser: Parser<a>, f: keep (a) -> Parser<b>) -> Parser<b> =
   |input: Input, position: Position|
     match parser(input, position) { None -> None, Some(step) -> f(step.value)(input, step.at) }
 
-/// `p`, or `q` from the same position when `p` refuses.
+/// `p`, or `q` from the same position when `p` fails.
 pub fn or_else<a>(p: Parser<a>, q: Parser<a>) -> Parser<a> =
   |input: Input, position: Position|
     match p(input, position) { None -> q(input, position), Some(step) -> Some(step) }
 
-/// `parser` any number of times, ending at the first position where it refuses — or where it answers
-/// without consuming anything, which is the bound that makes an empty-matching parser safe.
+/// `parser` zero or more times. It stops at the first position where the parser fails or matches
+/// without consuming anything, so a parser that matches the empty string cannot loop.
 pub fn many<a>(parser: Parser<a>) -> Parser<List<a>> =
   |input: Input, position: Position| many_from(parser, input, position, [], input.len() - position)
 
@@ -83,7 +86,7 @@ pub fn many<a>(parser: Parser<a>) -> Parser<List<a>> =
 pub fn many1<a>(parser: Parser<a>) -> Parser<List<a>> =
   and_then(parser, |first: a| map(many(parser), |rest: List<a>| prepend(first, rest)))
 
-/// `parser`, or nothing without consuming.
+/// `parser`, or `None` without consuming anything.
 pub fn opt<a>(parser: Parser<a>) -> Parser<Option<a>> =
   |input: Input, position: Position|
     match parser(input, position) {
@@ -91,19 +94,20 @@ pub fn opt<a>(parser: Parser<a>) -> Parser<Option<a>> =
       Some(step) -> Some({ value: Some(step.value), at: step.at }),
     }
 
-/// `parser`, then `sep` between each, so a trailing separator is a refusal rather than a shorter list.
-/// Like `many`, it ends where a separator and an item together consume nothing.
-pub fn sep_by<a, b>(parser: Parser<a>, sep: Parser<b>) -> Parser<List<a>> =
+/// Zero or more of `parser`, separated by `sep`. A trailing separator makes the whole parse fail
+/// rather than ending the list early. Like `many`, it stops where a separator and an item together
+/// consume nothing.
+pub fn separator_by<a, b>(parser: Parser<a>, sep: Parser<b>) -> Parser<List<a>> =
   |input: Input, position: Position|
     match parser(input, position) {
       None -> Some({ value: [], at: position }),
       Some(first) -> separated(parser, sep, input, first.at, [first.value], input.len() - first.at),
     }
 
-/// `s`, then `p`, answering `p`'s value: what a delimiter before an item needs.
+/// `s`, then `p`, returning `p`'s value. Use it to skip a delimiter before an item.
 pub fn after<s, a>(s: Parser<s>, p: Parser<a>) -> Parser<a> = and_then(s, |_: s| p)
 
-/// `p`, then `s`, answering `s`'s value.
+/// `p`, then `s`, returning `s`'s value.
 pub fn before<a, s>(p: Parser<a>, s: Parser<s>) -> Parser<s> = and_then(p, |_: a| s)
 
 /// One decimal digit, as its text.
@@ -122,15 +126,15 @@ pub fn word(stop: String) -> Parser<String> =
 
 fn joined(xs: List<String>) -> String = xs.fold("", |acc: String, x: String| acc ++ x)
 
-/// A round goes on only past where the last one stood and no further than the input, so the
-/// characters left bound the rounds: `left`.
+/// Each round must end past the previous position and within the input, so `left`, the number of
+/// characters left, bounds the number of rounds.
 fn many_from<a>(
   parser: Parser<a>,
   input: Input,
   position: Position,
   acc: List<a>,
   left: Int,
-) -> Option<Step<List<a>>> / {abort.raise} =
+) -> Option<Match<List<a>>> / {abort.raise} =
   match parser(input, position) {
     None -> Some({ value: acc, at: position }),
     Some(step) -> if step.at <= position || step.at > input.len() {
@@ -146,10 +150,10 @@ fn separated<a, b>(
   position: Position,
   acc: List<a>,
   left: Int,
-) -> Option<Step<List<a>>> / {abort.raise} =
+) -> Option<Match<List<a>>> / {abort.raise} =
   match sep(input, position) {
     None -> Some({ value: acc, at: position }),
-    Some(sep_step) -> match parser(input, sep_step.at) {
+    Some(separator_step) -> match parser(input, separator_step.at) {
       None -> None,
       Some(step) -> if step.at <= position || step.at > input.len() {
         Some({ value: acc, at: position })
@@ -160,19 +164,18 @@ fn separated<a, b>(
 
 // --- Tests ------------------------------------------------------------------
 
-fn int_text() -> Parser<Int> =
+fn integer() -> Parser<Int> =
   map(digits(), |ds: String|
     range(0, ds.len()).fold(0, |acc: Int, i: Int| acc * 10 + "0123456789".find(ds.slice(i, i + 1))))
 
-test "a literal consumes exactly what it matches, and `run` wants all of it" {
+test "a literal consumes exactly what it matches, and `run` requires the whole input" {
   assert_eq(run(text("ab"), "ab"), Some("ab"));
   assert_eq(run(text("ab"), "abc"), None);
   assert_eq(run(char("a"), "a"), Some("a"));
   assert_eq(run(char("a"), "b"), None);
   assert_eq(run(text(""), ""), Some(""));
-  // `run` wants the whole input; `at` reads a prefix and answers where it stopped.
-  assert_eq(at(text("ab"), "abc", 0), Some({ value: "ab", at: 2 }));
-  assert_eq(at(text("ab"), "xab", 1), Some({ value: "ab", at: 3 }))
+  assert_eq(run_prefix(text("ab"), "abc", 0), Some({ value: "ab", at: 2 }));
+  assert_eq(run_prefix(text("ab"), "xab", 1), Some({ value: "ab", at: 3 }))
 }
 
 test "or_else tries the second from the same position" {
@@ -180,33 +183,31 @@ test "or_else tries the second from the same position" {
   assert_eq(run(p, "ab"), Some("ab"));
   assert_eq(run(p, "ac"), Some("ac"));
   assert_eq(run(p, "ad"), None);
-  // A prefix is a step, so `or_else` answered it and the fully-consuming `run` is what refused.
-  assert_eq(at(p, "ac", 2), None);
-  assert_eq(at(p, "ab", 0), Some({ value: "ab", at: 2 }))
+  assert_eq(run_prefix(p, "ac", 2), None);
+  assert_eq(run_prefix(p, "ab", 0), Some({ value: "ab", at: 2 }))
 }
 
-test "many stops at a refusal and at a parser that consumes nothing" {
+test "many stops where its parser fails or consumes nothing" {
   assert_eq(run(many(digit()), "123"), Some(["1", "2", "3"]));
   assert_eq(run(many(digit()), ""), Some([]));
-  // An empty match would be an infinite loop without the no-progress bound: it stops at the
-  // position it began at, having consumed nothing.
-  assert_eq(at(many(text("")), "abc", 0), Some({ value: [], at: 0 }));
+  // Without the no-progress bound, an empty match would loop forever.
+  assert_eq(run_prefix(many(text("")), "abc", 0), Some({ value: [], at: 0 }));
   assert_eq(run(many(text("")), ""), Some([]));
   assert_eq(run(many1(digit()), ""), None);
   assert_eq(run(map(digits(), |ds: String| ds.len()), "12345"), Some(5))
 }
 
-test "sep_by refuses a trailing separator, and a sequence reads both sides" {
-  let row = sep_by(word(","), char(","));
+test "sep_by fails on a trailing separator, and a sequence reads both sides" {
+  let row = separator_by(word(","), char(","));
   assert_eq(run(row, "a,b,c"), Some(["a", "b", "c"]));
   assert_eq(run(row, "a,b,"), None);
   assert_eq(run(row, ""), Some([]));
   // A separator and an item that consume nothing end the list, as they end `many`.
-  assert_eq(run(sep_by(opt(char("x")), opt(char(","))), ""), Some([None]));
-  assert_eq(at(opt(char("+")), "x", 0), Some({ value: None, at: 0 }));
+  assert_eq(run(separator_by(opt(char("x")), opt(char(","))), ""), Some([None]));
+  assert_eq(run_prefix(opt(char("+")), "x", 0), Some({ value: None, at: 0 }));
   assert_eq(run(opt(char("+")), ""), Some(None));
   assert_eq(run(opt(char("+")), "+"), Some(Some("+")));
-  let sum = and_then(int_text(), |a: Int| map(after(char(":"), int_text()), |b: Int| a + b));
+  let sum = and_then(integer(), |a: Int| map(after(char(":"), integer()), |b: Int| a + b));
   assert_eq(run(sum, "12:30"), Some(42));
   assert_eq(run(before(spaces(), text("end")), "   end"), Some("end"))
 }

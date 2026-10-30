@@ -1,198 +1,152 @@
-//! What the checking queries read of the world: modules' places and texts, their imports, and the queries' names.
-
 import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
-import compiler.store.memo (memo, memo_keep, Query)
-import compiler.front.exports (Entry, Hashes, Placed, InRoot, InPackage, ShippedModule, Reading,
-                               entry_bin, hashes_bin, placed_bin)
-import compiler.front (Embedded, module_embeds_wanted, shipped_wants_of, embedded_bin)
-import compiler.front.published (no_rows, rows_kept)
-import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_shape_bin, tables_kept)
-import compiler.syntax.items (Module, ImportDecl, header, parse, parse_started, import_decl_bin,
-                              read_without_import, homes_declaring, unimported_of)
-import compiler.expand.derive (LibraryAsk, LibraryAnswer, Unran, dotted, library_ask_bin,
-                               library_answer_bin)
+import compiler.store.memo (memo, memo_store, Query)
+import compiler.front.exports (OwnerInterface, Hashes, ModuleOrigin, InRoot, InPackage,
+                               ShippedModule, CheckInputs, owner_interface_bin, hashes_bin,
+                               module_origin_bin)
+import compiler.front (EmbedRecord, module_embeds_wanted, shipped_wants_of, embed_record_bin)
+import compiler.front.published (no_rows, encode_rows)
+import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_shape_bin,
+                             encode_tables)
+import compiler.syntax.items (Module, ImportDeclaration, header, parse, parse_started,
+                              import_declaration_bin, read_without_import, homes_declaring,
+                              unimported_of)
+import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, import_path,
+                               deriver_request_bin, deriver_response_bin)
 import compiler.front.diagnostics (ParsedSource, parse_from)
-import compiler.syntax.exprs (prelude_module)
+import compiler.syntax.expressions (prelude_module)
 import compiler.front.interface (imported)
 import compiler.expand.embed (EmbedFile, embed_file, embed_file_bin, embed_key)
-import compiler.front.pkg (PackageSources, Judged, judged_bin, place_token, package_sources_bin)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, diag_bin, path_span, source_bin)
+import compiler.front.pkg (PackageSources, JudgedPackages, judged_packages_bin,
+                           location_placeholder, package_sources_bin)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, diagnostic_bin, path_span,
+                                      source_bin)
 import compiler.syntax.parsing (Span, ParseStart, span_bin, start)
 import compiler.syntax.lexer (Token)
-import compiler.store.hash.forms (Fixing, fixing_bin)
+import compiler.store.hash.forms (CachedHashes, cached_hashes_bin)
 
-/// Where a module of the load's own packages is: its package (0 the root, then each dependency in
-/// the order the load's packages list them) and its name there. Where its file is, is no part of it.
-pub type Placing = { package: Int, relative: Bytes }
+pub type PackageLocation = { package: Int, relative: Bytes }
 
-/// A module a query is asked of, by its name in the program, whether the toolchain ships it, and
-/// whether a shipped one is read with its tests and laws, as a load of the standard library's own
-/// tests reads it, rather than as a module that imports it reads it.
-pub type Named = { module: Bytes, shipped: Bool, tested: Bool }
+pub type ModuleKey = { module: Bytes, shipped: Bool, tested: Bool }
 
-/// An entry a query is asked for: the module's, under `name`, or under every name for none.
-pub type EntryNamed = { module: Bytes, shipped: Bool, tested: Bool, name: Bytes }
+pub type InterfaceKey = { module: Bytes, shipped: Bool, tested: Bool, name: Bytes }
 
-/// What an embed read: its files, each known by its digest, or why it read none.
 pub type Embedding = { files: List<EmbedFile>, refused: Option<Bytes> }
 
-/// What a module answers checked: what it shows its importers, the errors that refuse it, the
-/// warnings it holds, how many definitions and tests it checked, and the rows they published. A label points into the module
-/// at module 0; one that pointed into a module it imports is left out.
-pub type ModuleAnswer = {
-  refused: List<Diag>,
-  warnings: List<Diag>,
-  defs: Int,
+pub type ModuleResult = {
+  refused: List<Diagnostic>,
+  warnings: List<Diagnostic>,
+  definitions: Int,
   tests: Int,
-  /// What each of its definitions and tests published, as `rows_kept` keeps it: what an analysis of
-  /// the whole program takes in place of checking them again.
   rows: Bytes,
-  /// The modules its imports name that there are: a module whose import refused it may be refused
-  /// for that alone.
   imports: List<Bytes>,
-  /// What its check said of its shape, which every load assembled from its modules' answers reads.
   shape: ModuleShape,
-  /// What its check said of its own declarations, as `tables_kept` keeps it: what a load reads
-  /// only where its command reads the check's tables.
   tables: Bytes,
 }
 
-derive bin for Placing
+derive bin for PackageLocation
 
-derive bin for Named
+derive bin for ModuleKey
 
-derive bin for EntryNamed
+derive bin for InterfaceKey
 
 derive bin for Embedding
 
-derive bin for ModuleAnswer
+derive bin for ModuleResult
 
-// --- What the queries read of the world ------------------------------------------------------
-
-/// The load's packages, which the root's manifest and its dependencies decide.
 pub fn layout_kind() -> Bytes = b"layout"
 
-/// Where a module of the load's own packages is, by its name; nothing for one they do not hold.
 pub fn module_kind() -> Bytes = b"module"
 
-/// A file's text, by its path.
 pub fn text_kind() -> Bytes = b"text"
 
-/// A shipped module's text, by its name; nothing for one the toolchain does not ship.
 pub fn shipped_kind() -> Bytes = b"shipped"
 
-/// Whether the toolchain ships a module, by its name: empty for one it ships, nothing for one it does
-/// not. What a module that imports it reads to find it, so an edit to its text moves no importer.
 pub fn shipped_there_kind() -> Bytes = b"shipped there"
 
-/// A data file the shipped modules hold, by its name among them.
 pub fn data_kind() -> Bytes = b"data"
 
-/// What a module of the load's own packages embeds, by `embed_at`.
 pub fn embed_kind() -> Bytes = b"embed"
 
-/// The names of the shipped modules there are, which a module whose import names nothing lists.
 pub fn shipped_names_kind() -> Bytes = b"shipped names"
 
-/// What a library deriver answers a declaration, by the encoded `LibraryAsk`: the load runs it.
 pub fn derived_kind() -> Bytes = b"derived"
 
-/// What the world answers a library derivation: a world that runs no deriver answers that it ran none.
-fn derived_read(ask: LibraryAsk) -> LibraryAnswer / {memo.read, abort.raise} =
-  match memo.world(derived_kind(), bin::encode(ask, library_ask_bin())) {
-    Some(b) -> decoded(b, library_answer_bin(), "a derivation"),
+fn derived_read(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} =
+  match memo.external(derived_kind(), bin::encode(ask, deriver_request_bin())) {
+    Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
     None ->
-      Unran({
+      Failed({
         code: b"E0155",
         message: b"no deriver ran for this derivation",
         notes: [b"this command reads modules without running their derivers"],
       }),
   }
 
-/// What an embed of `module`, in the package at `root`, is read under.
 pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
   Bytes::concat_all([root, b"\x00", module, b"\x00", key])
 
-/// What a run's queries have decoded of the answers they read, by each answer's digest: an answer
-/// thousands of checks read is decoded for the first of them.
-pub effect decode {
-  /// The entries decoded of the answer `query` gave under `digest`, where a body held them.
-  read entries(query: Bytes, digest: Bytes) -> Option<List<Entry>>
-  /// Holds `entries` as what the answer `query` gave under `digest` decodes to.
-  write hold_entries(query: Bytes, digest: Bytes, entries: List<Entry>) -> Unit
-  /// The context decoded of the answer under `digest`, where a body held it.
+pub effect decode_cache {
+  read owner_interfaces(query: Bytes, digest: Bytes) -> Option<List<OwnerInterface>>
+  write cache_owner_interfaces(query: Bytes, digest: Bytes, entries: List<OwnerInterface>) -> Unit
   read context(digest: Bytes) -> Option<Context>
-  /// Holds `context` as what the answer under `digest` decodes to.
-  write hold_context(digest: Bytes, context: Context) -> Unit
-  /// What a module's text read as, under [`text_key`], where a read of it this run holds it.
-  read text_read(key: Bytes) -> Option<TextRead>
-  /// Holds `read` as what the module's text `key` names reads as.
-  write hold_text_read(key: Bytes, read: TextRead) -> Unit
-  /// Holds what the module's text `key` names reads as no longer.
-  write release_text_read(key: Bytes) -> Unit
-  /// A shipped module's text as a module that imports it reads it, by the digest of the whole text.
+  write cache_context(digest: Bytes, context: Context) -> Unit
+  read text_read(key: Bytes) -> Option<ParsedText>
+  write cache_text_read(key: Bytes, read: ParsedText) -> Unit
+  write evict_text_read(key: Bytes) -> Unit
   read imported_text(digest: Bytes) -> Option<Bytes>
-  /// Holds `text` as what the shipped text under `digest` reads as to a module that imports it.
-  write hold_imported_text(digest: Bytes, text: Bytes) -> Unit
+  write cache_imported_text(digest: Bytes, text: Bytes) -> Unit
 }
 
-/// A module's text read: lexed, and parsed as it is written and as a check reads it, its derives
-/// expanded.
-pub type TextRead = { lexed: ParseStart, raw: Module, given: ParsedSource }
+pub type ParsedText = { lexed: ParseStart, raw: Module, given: ParsedSource }
 
-/// What a query's body performs: it reads through `memo`, and holds what it decodes.
-pub effect set Answering = {memo.read, decode.read, decode.write}
+pub effect set QueryEffects = {memo.read, decode_cache.read, decode_cache.write}
 
-/// What a run of these queries over a store performs.
-pub effect set Driving = {memo_keep.read, memo_keep.write, decode.read, decode.write}
+pub effect set RunEffects = {memo_store.read, memo_store.write, decode_cache.read, decode_cache.write}
 
-/// A query of this module.
-pub type CheckQuery = Query<| {decode.read, decode.write}>
+pub type CheckQuery = Query<| {decode_cache.read, decode_cache.write}>
 
-/// `work` with what its queries decode held for as long as it runs.
-pub fn decoding_once<a | e>(work: () -> a / {decode.read, decode.write | e}) -> a / e =
+pub fn with_decode_cache<a | e>(
+  work: () -> a / {decode_cache.read, decode_cache.write | e},
+) -> a / e =
   handle {
     work()
   } with {
-    var entries: Map<Bytes, List<Entry>> = Map::new(),
+    var entries: Map<Bytes, List<OwnerInterface>> = Map::new(),
     var contexts: Map<Bytes, Context> = Map::new(),
-    var reads: Map<Bytes, TextRead> = Map::new(),
+    var reads: Map<Bytes, ParsedText> = Map::new(),
     var imports: Map<Bytes, Bytes> = Map::new(),
-    decode.entries(query, digest) -> entries.get(query.concat(digest)),
-    decode.hold_entries(query, digest, es) -> {
+    decode_cache.owner_interfaces(query, digest) -> entries.get(query.concat(digest)),
+    decode_cache.cache_owner_interfaces(query, digest, es) -> {
       entries = entries.insert(query.concat(digest), es);
     },
-    decode.context(digest) -> contexts.get(digest),
-    decode.hold_context(digest, c) -> {
+    decode_cache.context(digest) -> contexts.get(digest),
+    decode_cache.cache_context(digest, c) -> {
       contexts = contexts.insert(digest, c);
     },
-    decode.text_read(key) -> reads.get(key),
-    decode.hold_text_read(key, r) -> {
+    decode_cache.text_read(key) -> reads.get(key),
+    decode_cache.cache_text_read(key, r) -> {
       reads = reads.insert(key, r);
     },
-    decode.release_text_read(key) -> {
+    decode_cache.evict_text_read(key) -> {
       reads = reads.remove(key);
     },
-    decode.imported_text(digest) -> imports.get(digest),
-    decode.hold_imported_text(digest, t) -> {
+    decode_cache.imported_text(digest) -> imports.get(digest),
+    decode_cache.cache_imported_text(digest, t) -> {
       imports = imports.insert(digest, t);
     },
   }
 
-/// What the text of the module `source` names is held under: the module's name, which its parse
-/// reads, beside the text's digest, so a read held is of the very text asked.
 pub fn text_key(source: Source) -> Bytes =
   Bytes::concat_all([source.name, b"\x00", blake3(source.src)])
 
-/// `source` read, once a run for every query of its module that reads it: a module's read, its check
-/// whole and its header read one text. It is held until the module's answer is put together, so a
-/// run holds the parse of few modules at once. Its library derivations are what the world answers.
-pub fn read_once(source: Source) -> TextRead / {memo.read, decode.read, decode.write, abort.raise} = {
+pub fn read_once(
+  source: Source,
+) -> ParsedText / {memo.read, decode_cache.read, decode_cache.write, abort.raise} = {
   let key = text_key(source);
-  match decode.text_read(key) {
+  match decode_cache.text_read(key) {
     Some(r) -> r,
     None -> {
       let lexed = start(source.src);
@@ -202,56 +156,58 @@ pub fn read_once(source: Source) -> TextRead / {memo.read, decode.read, decode.w
         raw: parsed.node,
         given: parse_from(0, source, parsed, library: Some(derived_read)),
       };
-      decode.hold_text_read(key, r);
+      decode_cache.cache_text_read(key, r);
       r
     },
   }
 }
 
-/// `text`, a shipped module's, as a module that imports it reads it: made once a run.
-fn imported_once(text: Bytes) -> Bytes / {decode.read, decode.write, abort.raise} = {
+fn imported_once(text: Bytes) -> Bytes / {decode_cache.read, decode_cache.write, abort.raise} = {
   let digest = blake3(text);
-  match decode.imported_text(digest) {
+  match decode_cache.imported_text(digest) {
     Some(t) -> t,
     None -> {
       let t = imported(text);
-      decode.hold_imported_text(digest, t);
+      decode_cache.cache_imported_text(digest, t);
       t
     },
   }
 }
 
-/// The context of the module `named` names, decoded once a run.
-pub fn context_once(named: Named) -> Context / {Answering, abort.raise} = {
-  let input = bin::encode(named, named_bin());
-  let digest = memo.head(context_query(), input);
-  match decode.context(digest) {
+pub fn context_once(named: ModuleKey) -> Context / {QueryEffects, abort.raise} = {
+  let input = bin::encode(named, module_key_bin());
+  let digest = memo.output_digest(context_query(), input);
+  match decode_cache.context(digest) {
     Some(c) -> c,
     None -> {
       let c = decoded(
-        match memo.held(digest) { Some(b) -> b, None -> memo.ask(context_query(), input) },
+        match memo.stored_output(digest) {
+          Some(b) -> b,
+          None -> memo.fetch(context_query(), input),
+        },
         context_bin(),
         "a module's context",
       );
-      decode.hold_context(digest, c);
+      decode_cache.cache_context(digest, c);
       c
     },
   }
 }
 
-/// The entries the answer `query` gives for `input` holds, as `decoding` reads them of its bytes,
-/// decoded once a run.
-pub fn entries_once(
+pub fn owner_interfaces_once(
   query: Bytes,
   input: Bytes,
-  decoding: (Bytes) -> List<Entry> / {abort.raise},
-) -> List<Entry> / {Answering, abort.raise} = {
-  let digest = memo.head(query, input);
-  match decode.entries(query, digest) {
+  decoding: (Bytes) -> List<OwnerInterface> / {abort.raise},
+) -> List<OwnerInterface> / {QueryEffects, abort.raise} = {
+  let digest = memo.output_digest(query, input);
+  match decode_cache.owner_interfaces(query, digest) {
     Some(es) -> es,
     None -> {
-      let es = decoding(match memo.held(digest) { Some(b) -> b, None -> memo.ask(query, input) });
-      decode.hold_entries(query, digest, es);
+      let es = decoding(match memo.stored_output(digest) {
+        Some(b) -> b,
+        None -> memo.fetch(query, input),
+      });
+      decode_cache.cache_owner_interfaces(query, digest, es);
       es
     },
   }
@@ -263,110 +219,97 @@ pub fn decoded<a>(b: Bytes, codec: bin::BinCodec<a>, what: String) -> a / {abort
     Err(e) -> panic("a query read " ++ what ++ " it cannot decode: " ++ e.message),
   }
 
-pub fn placing_of(module: Bytes) -> Option<Placing> / {memo.read, abort.raise} =
-  match memo.world(module_kind(), module) {
-    Some(b) -> Some(decoded(b, placing_bin(), "a module's place")),
+pub fn package_location_of(module: Bytes) -> Option<PackageLocation> / {memo.read, abort.raise} =
+  match memo.external(module_kind(), module) {
+    Some(b) -> Some(decoded(b, package_location_bin(), "a module's place")),
     None -> None,
   }
 
-fn shipped_text(module: Bytes) -> Option<Bytes> / {memo.read} = memo.world(shipped_kind(), module)
+fn shipped_text(module: Bytes) -> Option<Bytes> / {memo.read} =
+  memo.external(shipped_kind(), module)
 
 fn shipped_there(module: Bytes) -> Bool / {memo.read} =
-  memo.world(shipped_there_kind(), module) != None
+  memo.external(shipped_there_kind(), module) != None
 
-/// The load's packages, judged and placeless: what their manifests say, never where they are.
-fn layout() -> Judged / {memo.read, abort.raise} =
-  match memo.world(layout_kind(), b"") {
-    Some(b) -> decoded(b, judged_bin(), "the load's packages"),
+fn judged_packages() -> JudgedPackages / {memo.read, abort.raise} =
+  match memo.external(layout_kind(), b"") {
+    Some(b) -> decoded(b, judged_packages_bin(), "the load's packages"),
     None -> no_packages(),
   }
 
-fn no_packages() -> Judged = { packages: [], diags: [] }
+fn no_packages() -> JudgedPackages = { packages: [], diagnostics: [] }
 
-/// What a load's staging reads of `j`'s packages, each at its place: the modules it holds are each
-/// staging's own.
-fn pkgs_of(j: Judged) -> PackageSources =
+fn packages_of(j: JudgedPackages) -> PackageSources =
   {
-    root: place_token(0),
+    root: location_placeholder(0),
     manifest: None,
     supplied: range(1, j.packages.len()).map(|k: Int|
-      { root: place_token(k), manifest: None, modules: [] }),
+      { root: location_placeholder(k), manifest: None, modules: [] }),
   }
 
-pub fn prefix_in(j: Judged, package: Int) -> Bytes =
+pub fn prefix_in(j: JudgedPackages, package: Int) -> Bytes =
   if package <= 0 { b"" } else { match j.packages.at(package) { Some(p) -> p.prefix, None -> b"" } }
-
-// --- Imports --------------------------------------------------------------------------------
 
 fn has_dot(name: Bytes) -> Bool = name.index_of(b".") != None
 
-/// The module an import names, from a module that is shipped as `shipped` says and stands in the
-/// package `package` granted `prefix`, as the resolver finds it: a dependency's bare import names its
-/// own package's module, and any other the module of its name, the load's own before a shipped one.
 fn target_of(
   shipped: Bool,
   prefix: Bytes,
   package: Int,
-  d: ImportDecl,
-) -> Named / {memo.read, abort.raise} = {
-  let name = dotted(d);
+  d: ImportDeclaration,
+) -> ModuleKey / {memo.read, abort.raise} = {
+  let name = import_path(d);
   if shipped { { module: name, shipped: true, tested: false } } else {
     let sibling = Bytes::concat_all([prefix, b".", name]);
     if package > 0 && prefix.len() > 0 && !has_dot(name) {
       { module: sibling, shipped: false, tested: false }
-    } else if package > 0 && prefix.len() > 0 && placing_of(sibling) != None {
+    } else if package > 0 && prefix.len() > 0 && package_location_of(sibling) != None {
       { module: sibling, shipped: false, tested: false }
-    } else if placing_of(name) != None { { module: name, shipped: false, tested: false } }
+    } else if package_location_of(name) != None { { module: name, shipped: false, tested: false } }
     else { { module: name, shipped: true, tested: false } }
   }
 }
 
-/// Whether the module of `name` that a module of the load's own packages reads is a shipped one.
 pub fn shipped_for(asker_shipped: Bool, name: Bytes) -> Bool / {memo.read, abort.raise} =
-  asker_shipped || placing_of(name) == None
+  asker_shipped || package_location_of(name) == None
 
-pub fn entries_of(
+pub fn owner_interfaces_of(
   asker_shipped: Bool,
   module: Bytes,
   name: Bytes,
-) -> List<Entry> / {Answering, abort.raise} =
-  entries_once(
-    entry_query(),
+) -> List<OwnerInterface> / {QueryEffects, abort.raise} =
+  owner_interfaces_once(
+    owner_interfaces_query(),
     bin::encode(
       { module: module, shipped: shipped_for(asker_shipped, module), tested: false, name: name },
-      entry_named_bin(),
+      interface_key_bin(),
     ),
     |b: Bytes|
       decoded(b, bin::list_bin(bin::bytes_bin()), "entries").map(|e: Bytes|
-        decoded(e, entry_bin(), "an entry")),
+        decoded(e, owner_interface_bin(), "an entry")),
   )
 
-pub fn entry_bytes_of(
+pub fn owner_interface_bytes_of(
   asker_shipped: Bool,
   module: Bytes,
   name: Bytes,
 ) -> List<Bytes> / {memo.read, abort.raise} =
   decoded(
-    memo.ask(
-      entry_query(),
+    memo.fetch(
+      owner_interfaces_query(),
       bin::encode(
         { module: module, shipped: shipped_for(asker_shipped, module), tested: false, name: name },
-        entry_named_bin(),
+        interface_key_bin(),
       ),
     ),
     bin::list_bin(bin::bytes_bin()),
     "entries",
   )
 
-// --- The queries ----------------------------------------------------------------------------
-
 pub fn module_query() -> Bytes = b"module"
 
-pub fn entry_query() -> Bytes = b"entry"
+pub fn owner_interfaces_query() -> Bytes = b"entry"
 
-/// A module as a query reads it: its text, parsed alone and with its statements expanded, the
-/// modules its imports name that there are, those it reads with no import (`ModuleRow`), where it
-/// stands, and all else its check reads beside the entries it names.
 pub type ModuleRead = {
   source: Source,
   tokens: List<Token>,
@@ -375,38 +318,34 @@ pub type ModuleRead = {
   names: List<Bytes>,
   present: List<Bytes>,
   unimported: List<Bytes>,
-  placed: Placed,
-  reading: Reading,
+  placed: ModuleOrigin,
+  reading: CheckInputs,
 }
 
-pub fn placed_by(p: Option<Placing>) -> Placed =
+pub fn module_origin_of(p: Option<PackageLocation>) -> ModuleOrigin =
   match p {
     None -> ShippedModule,
     Some(x) -> if x.package == 0 { InRoot } else { InPackage(x.package, x.relative) },
   }
 
-/// The text of the module `asked` names as its queries read it, nothing where there is no such
-/// module: a shipped one as a module that imports it reads it, its tests and laws blanked, unless it
-/// is asked after with them.
-pub fn text_of(asked: Named) -> Option<Bytes> / {Answering, abort.raise} =
-  if asked.shipped {
-    match shipped_text(asked.module) {
-      Some(t) -> Some(if asked.tested { t } else { imported_once(t) }),
+pub fn text_of(query_key: ModuleKey) -> Option<Bytes> / {QueryEffects, abort.raise} =
+  if query_key.shipped {
+    match shipped_text(query_key.module) {
+      Some(t) -> Some(if query_key.tested { t } else { imported_once(t) }),
       None -> None,
     }
   } else {
-    match placing_of(asked.module) {
-      Some(_) -> memo.world(text_kind(), asked.module),
+    match package_location_of(query_key.module) {
+      Some(_) -> memo.external(text_kind(), query_key.module),
       None -> None,
     }
   }
 
-/// `module` as `asked` names it read, or nothing where there is no such module.
-pub fn module_read(asked: Named) -> Option<ModuleRead> / {Answering, abort.raise} = {
-  let module = asked.module;
-  let shipped = asked.shipped;
-  let placing = if shipped { None } else { placing_of(module) };
-  match text_of(asked) {
+pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, abort.raise} = {
+  let module = query_key.module;
+  let shipped = query_key.shipped;
+  let placing = if shipped { None } else { package_location_of(module) };
+  match text_of(query_key) {
     None -> None,
     Some(src) -> {
       let source = { name: module, src: src };
@@ -415,33 +354,31 @@ pub fn module_read(asked: Named) -> Option<ModuleRead> / {Answering, abort.raise
       let raw = read.raw;
       let given = read.given;
       let parsed = given.module;
-      let j = if shipped { no_packages() } else { layout() };
-      let pkgs = pkgs_of(j);
+      let j = if shipped { no_packages() } else { judged_packages() };
+      let packages = packages_of(j);
       let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
       let prefix = prefix_in(j, package);
-      let targets = raw.imports.map(|d: ImportDecl| target_of(shipped, prefix, package, d));
-      let imported_there = targets.filter(|t: Named|
-        if t.shipped { shipped_there(t.module) } else { placing_of(t.module) != None });
+      let targets = raw.imports.map(|d: ImportDeclaration| target_of(shipped, prefix, package, d));
+      let imported_there = targets.filter(|t: ModuleKey|
+        if t.shipped { shipped_there(t.module) } else { package_location_of(t.module) != None });
       let unimported = unimported_of(
         read_without_import(module, lexed.input, || homes_declaring(shipped_text)),
         shipped_there,
-        imported_there.map(|t: Named| t.module),
+        imported_there.map(|t: ModuleKey| t.module),
       );
-      // What every module but the prelude imports past its text.
       let prelude = if module == prelude_module() || !shipped_there(prelude_module()) { [] }
       else { [prelude_module()] };
       let present = imported_there;
-      // An import that names nothing is refused with the shipped modules there are.
       let unread = if present.len() == targets.len() { [] } else {
-        match memo.world(shipped_names_kind(), b"") {
+        match memo.external(shipped_names_kind(), b"") {
           Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
           None -> [],
         }
       };
-      let root = place_token(if package < 0 { 0 } else { package });
+      let root = location_placeholder(if package < 0 { 0 } else { package });
       let embeds = if shipped { [] } else {
-        module_embeds_wanted(root, source, raw).map(|e: Embedded| {
-          let read = match memo.world(embed_kind(), embed_at(root, module, embed_key(e.want))) {
+        module_embeds_wanted(root, source, raw).map(|e: EmbedRecord| {
+          let read = match memo.external(embed_kind(), embed_at(root, module, embed_key(e.want))) {
             None -> Err(b"no file is there"),
             Some(b) -> {
               let got = decoded(b, embedding_bin(), "an embed");
@@ -455,20 +392,20 @@ pub fn module_read(asked: Named) -> Option<ModuleRead> / {Answering, abort.raise
       let whole = wants.texts.fold([], |acc: List<Source>, n: Bytes|
         match shipped_text(n) { Some(t) -> acc.push({ name: n, src: t }), None -> acc });
       let data = wants.data.fold([], |acc: List<EmbedFile>, n: Bytes|
-        match memo.world(data_kind(), n) { Some(b) -> acc.push(embed_file(n, b)), None -> acc });
+        match memo.external(data_kind(), n) { Some(b) -> acc.push(embed_file(n, b)), None -> acc });
       Some({
         source: source,
         tokens: lexed.input.tokens,
         raw: raw,
         parsed: parsed,
-        names: targets.map(|t: Named| t.module),
-        present: present.map(|t: Named| t.module).concat(unimported).concat(prelude),
+        names: targets.map(|t: ModuleKey| t.module),
+        present: present.map(|t: ModuleKey| t.module).concat(unimported).concat(prelude),
         unimported: unimported,
-        placed: placed_by(placing),
+        placed: module_origin_of(placing),
         reading: {
-          pkgs: pkgs,
+          packages: packages,
           judged: if shipped { None } else { Some(j) },
-          tested: !shipped || asked.tested,
+          tested: !shipped || query_key.tested,
           unread: unread,
           whole: whole,
           data: data,
@@ -480,21 +417,21 @@ pub fn module_read(asked: Named) -> Option<ModuleRead> / {Answering, abort.raise
   }
 }
 
-/// Where each module of `modules` stands, as a module asked as `shipped` reads it.
-pub fn places_of(
+pub fn module_origins_of(
   shipped: Bool,
   modules: List<Bytes>,
-) -> Map<Bytes, Placed> / {memo.read, abort.raise} =
-  modules.fold(Map::new(), |acc: Map<Bytes, Placed>, m: Bytes|
-    acc.insert(m, if shipped { ShippedModule } else { placed_by(placing_of(m)) }))
+) -> Map<Bytes, ModuleOrigin> / {memo.read, abort.raise} =
+  modules.fold(Map::new(), |acc: Map<Bytes, ModuleOrigin>, m: Bytes|
+    acc.insert(m, if shipped { ShippedModule } else { module_origin_of(package_location_of(m)) }))
 
-pub fn placing_in(places: Map<Bytes, Placed>) -> (Bytes) -> Placed / {abort.raise} =
+pub fn module_origin_lookup(
+  places: Map<Bytes, ModuleOrigin>,
+) -> (Bytes) -> ModuleOrigin / {abort.raise} =
   |m: Bytes| match places.get(m) { Some(x) -> x, None -> ShippedModule }
 
 pub fn imports_query() -> Bytes = b"imports"
 
-/// One import of a module: the module it names, and where in the module's text the name stands.
-pub type ImportOf = { named: Named, span: Span }
+pub type ImportOf = { named: ModuleKey, span: Span }
 
 pub type ImportsOf = { imports: List<ImportOf> }
 
@@ -502,14 +439,12 @@ derive bin for ImportOf
 
 derive bin for ImportsOf
 
-/// The modules a module's written imports name that there are, read as `Named` says: what the
-/// order its load checks its modules in reads, off the module's header alone.
 pub fn imports_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let asked = decoded(input, named_bin(), "a module's name");
-  let module = asked.module;
-  let placing = if asked.shipped { None } else { placing_of(module) };
-  let text = if asked.shipped { shipped_text(module) }
-  else { match placing { Some(_) -> memo.world(text_kind(), module), None -> None } };
+  let query_key = decoded(input, module_key_bin(), "a module's name");
+  let module = query_key.module;
+  let placing = if query_key.shipped { None } else { package_location_of(module) };
+  let text = if query_key.shipped { shipped_text(module) }
+  else { match placing { Some(_) -> memo.external(text_kind(), module), None -> None } };
   bin::encode(
     {
       imports: match text {
@@ -517,11 +452,11 @@ pub fn imports_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         Some(src) -> {
           let raw = match header(src) { Some(m) -> m, None -> parse(src).node };
           let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
-          let prefix = if asked.shipped { b"" } else { prefix_in(layout(), package) };
-          raw.imports.fold([], |acc: List<ImportOf>, d: ImportDecl| {
-            let t = target_of(asked.shipped, prefix, package, d);
+          let prefix = if query_key.shipped { b"" } else { prefix_in(judged_packages(), package) };
+          raw.imports.fold([], |acc: List<ImportOf>, d: ImportDeclaration| {
+            let t = target_of(query_key.shipped, prefix, package, d);
             let there = if t.shipped { shipped_there(t.module) }
-            else { placing_of(t.module) != None };
+            else { package_location_of(t.module) != None };
             if there { acc.push({ named: t, span: path_span(d) }) } else { acc }
           })
         },
@@ -531,53 +466,43 @@ pub fn imports_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   )
 }
 
-pub fn absent(module: Bytes) -> ModuleAnswer / {abort.raise} =
+pub fn absent(module: Bytes) -> ModuleResult / {abort.raise} =
   {
     refused: [],
     warnings: [],
-    defs: 0,
+    definitions: 0,
     tests: 0,
-    rows: rows_kept(no_rows()),
+    rows: encode_rows(no_rows()),
     imports: [],
     shape: no_shape(module),
-    tables: tables_kept(no_module_tables()),
+    tables: encode_tables(no_module_tables()),
   }
 
-/// What hashing a module fixed: each owner's hash entry, and each of its nodes, tests and laws,
-/// which a load of the whole program takes in place of hashing them again, and the digest of its
-/// record. A module whose reading refuses it fixes nothing.
-pub type HashAnswer = {
+pub type HashResult = {
   hashes: Hashes,
   owners: Map<Bytes, List<Bytes>>,
-  fixing: Fixing,
+  fixing: CachedHashes,
   record: Bytes,
 }
 
-derive bin for HashAnswer
+derive bin for HashResult
 
-// --- A module checked a group of owners at a time ------------------------------------------------
-
-/// What a check of a module reads of it beside its text: its imports placed nowhere, the module each
-/// names, those of them there are, and its setting.
 pub type Context = {
-  imports: List<ImportDecl>,
+  imports: List<ImportDeclaration>,
   targets: List<Bytes>,
   present: List<Bytes>,
   setting: Setting,
 }
 
-/// What a check of any group of a module's owners reads of the module beside their own text and
-/// imports: where the module stands, and what else its check reads.
 pub type Setting = {
-  placed: Placed,
-  pkgs: PackageSources,
-  judged: Option<Judged>,
+  placed: ModuleOrigin,
+  packages: PackageSources,
+  judged: Option<JudgedPackages>,
   tested: Bool,
   unread: List<Bytes>,
   whole: List<Source>,
-  /// Each data file the module embeds of the shipped modules, under its name among them.
   data: List<EmbedFile>,
-  embeds: List<Embedded>,
+  embeds: List<EmbedRecord>,
 }
 
 derive bin for Setting

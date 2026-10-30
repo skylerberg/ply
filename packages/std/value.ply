@@ -1,15 +1,17 @@
 //! A value of any type as data, and `render`, the one way a value is shown.
 //!
-//! A `Value` is what `machine.call` takes and answers, what a runtime diagnostic carries, and what a
-//! counterexample binds. `render` writes the language's own spelling: a constructor by the name its
-//! module declares, a `new` record as the literal it is built by, a `std.set` set as the `#[..]`
-//! that builds it, an array as `Array::of_list([..])`.
-//! In a diagnostic, a value is cut once its text passes `shown_characters`, and what is left of
-//! each string, bytes value, list, map, record and constructor is counted; nesting past
+//! A `Value` is what `machine.call` takes and returns, what a runtime diagnostic carries, and what
+//! a counterexample binds. `render` writes a value in the language's own syntax: a constructor by
+//! the name its module declares, a `new` record as the literal that builds it, a `std.set` set as
+//! the `#[..]` that builds it, and an array as `Array::of_list([..])`.
+//!
+//! In a diagnostic, a value is cut once its text passes `shown_characters`, and the items left out
+//! of each string, bytes value, list, map, record and constructor are counted. Nesting past
 //! `shown_depth` shows as `…`, and a credential shows as `Secret(****)`. `render_all` writes every
-//! item at every depth, which is what a program shows. A fixed width holds the bit pattern it reads,
-//! so `-1i8` is `VFixed("I8", 255u128)`. Only a generated function (`FConst`, `FProject`, `FTable`)
-//! crosses back into a run, and `VElided` marks what a diagnostic's snapshot cut short.
+//! item at every depth, which is what a program shows. A fixed-width integer stores its bit
+//! pattern, so `-1i8` is `VFixed("I8", 255u128)`. Only a generated function (`ConstantFunction`,
+//! `ProjectionFunction`, `TableFunction`) can be marshalled back into a run, and `VElided` marks
+//! what a diagnostic's snapshot cut short.
 
 import std.string
 import std.gen
@@ -19,18 +21,19 @@ import std.list
 /// function the program wrote as `VFn(FAnonymous)`.
 pub extern fn reflect<a>(x: a) -> Value
 
-/// As `reflect`, but a value whose type states a `show` is `VShown` of what that function writes,
-/// at any depth.
+/// As `reflect`, but a value whose type declares a `show` becomes `VShown` of what that function
+/// writes, at any depth.
 pub extern fn shown<a>(x: a) -> Value
 
-/// What `machine.call` crosses, what a runtime diagnostic carries, and what the prover draws.
+/// A value of any type: what `machine.call` marshals, what a runtime diagnostic carries, and what
+/// the prover generates.
 pub type Value =
   | VUnit
   | VBool(Bool)
   | VInt(Int)
   | VFloat(Float)
   | VDecimal(Decimal)
-  /// The width's name and the pattern it reads, with nothing above the width: `-1i8` is `0xFFu128`.
+  /// The width's name and its bit pattern, with no bit set above the width: `-1i8` is `0xFFu128`.
   | VFixed(String, U128)
   | VChar(Char)
   | VStr(String)
@@ -50,8 +53,8 @@ pub type Value =
   /// everything nested deeper.
   | VElided(Int)
   | VArray(List<Value>)
-  /// What a type's own `show` wrote in place of a value, which `render` writes as it is; only
-  /// `shown` makes one.
+  /// What a type's own `show` wrote in place of a value, which `render` writes unchanged; only
+  /// `shown` creates one.
   | VShown(String)
 
 /// One field of a record value.
@@ -63,12 +66,12 @@ pub type Entry = { key: Value, value: Value }
 /// A function as data. Only a generated one (constant, projection, table) can be called, and it
 /// takes at most 255 arguments.
 pub type Fun =
-  | FNamed(String)
+  | NamedFunction(String)
   | FAnonymous
-  | FConst({ arity: U8, value: Value })
-  | FProject({ arity: U8, index: U8 })
+  | ConstantFunction({ arity: U8, value: Value })
+  | ProjectionFunction({ arity: U8, index: U8 })
   /// The first entry whose key equals the first argument, else `default`.
-  | FTable({ arity: U8, entries: List<Entry>, default: Value })
+  | TableFunction({ arity: U8, entries: List<Entry>, default: Value })
 
 /// A value a diagnostic shows is cut once its text reaches this many characters.
 pub fn shown_characters() -> Int = 2000
@@ -76,9 +79,9 @@ pub fn shown_characters() -> Int = 2000
 /// Nesting past this shows as `…`.
 pub fn shown_depth() -> Int = 16
 
-/// What a diagnostic shows: once the text reaches `shown_characters`, what is left of each string,
-/// bytes value, list, map, record and constructor is counted, and nesting past `shown_depth` shows
-/// as `…`.
+/// The text a diagnostic shows. Once the text reaches `shown_characters`, the items left out of
+/// each string, bytes value, list, map, record and constructor are counted, and nesting past
+/// `shown_depth` shows as `…`.
 pub fn render(v: Value) -> String = rendered(v, 0, Some(shown_characters()))
 
 /// What a program shows (`std.show`): every item at every depth, in `render`'s format.
@@ -110,8 +113,8 @@ fn rendered(v: Value, depth: Int, room: Option<Int>) -> String =
       VRecord(fields) -> record_text(fields, depth, room),
       VCtor(name, args) -> match set_elements(name, args) {
         Some(keys) -> "#[" ++ values_text(keys, depth, spent(room, "#[")) ++ "]",
-        None -> if args.len() == 0 { ctor_name(name) } else {
-          let head = ctor_name(name) ++ "(";
+        None -> if args.len() == 0 { constructor_name(name) } else {
+          let head = constructor_name(name) ++ "(";
           head ++ values_text(args, depth, spent(room, head)) ++ ")"
         },
       },
@@ -126,7 +129,7 @@ fn rendered(v: Value, depth: Int, room: Option<Int>) -> String =
           ++ "}",
       VFn(f) ->
         "<fn"
-          ++ fun_text(f, spent(room, "<fn"), |x: Value, left: Option<Int>|
+          ++ function_text(f, spent(room, "<fn"), |x: Value, left: Option<Int>|
             rendered(x, depth + 1, left))
           ++ ">",
       VHold -> "<hold>",
@@ -141,9 +144,9 @@ fn rendered(v: Value, depth: Int, room: Option<Int>) -> String =
 fn spent(room: Option<Int>, text: String) -> Option<Int> =
   match room { Some(n) -> Some(n - text.len()), None -> None }
 
-/// The name a constructor's module declares it under, which is how it is shown: where the module
-/// stands is no part of the value.
-pub fn ctor_name(name: String) -> String =
+/// The name a constructor's module declares it under, which is how it is shown: the module's path
+/// is not part of the value.
+pub fn constructor_name(name: String) -> String =
   String::of_chars(
     name.chars().fold([], |acc: List<Char>, c: Char| if c == '.' { [] } else { acc.push(c) }),
   )
@@ -167,11 +170,12 @@ fn entry_text(e: Entry, depth: Int, room: Option<Int>) -> String =
 fn values_text(items: List<Value>, depth: Int, room: Option<Int>) -> String =
   items_text(items, room, |x: Value, left: Option<Int>| rendered(x, depth + 1, left), weight)
 
-/// How many items a value stands for among its list's: what a snapshot left out says how many.
+/// How many items a value represents in its list: one, or for what a snapshot left out, the count
+/// it records.
 fn weight(v: Value) -> Int = match v { VElided(n) -> max(n, 1), _ -> 1 }
 
-/// The items joined, each written in the room those before it left; once the room is spent, the
-/// rest are counted, each as the number of items `count` says it stands for.
+/// The items joined, each written in the `room` the earlier ones left. Once the room is used up,
+/// the rest are counted, each as the number of items `count` returns for it.
 fn items_text<a>(
   items: List<a>,
   room: Option<Int>,
@@ -237,19 +241,19 @@ fn tuple_item(fields: List<Field>, i: Int, depth: Int, room: Option<Int>) -> Str
     None -> "",
   }
 
-/// A generated function shows as the lambda it behaves as, each value in it as `inner` writes it in
-/// the room the text before it left.
-fn fun_text(f: Fun, room: Option<Int>, inner: (Value, Option<Int>) -> String) -> String =
+/// A generated function shows as the lambda it behaves like, with each value in it written by
+/// `inner` in the `room` the text before it left.
+fn function_text(f: Fun, room: Option<Int>, inner: (Value, Option<Int>) -> String) -> String =
   match f {
-    FNamed(name) -> " " ++ name,
+    NamedFunction(name) -> " " ++ name,
     FAnonymous -> "",
-    FConst(c) -> {
+    ConstantFunction(c) -> {
       let head = " |" ++ String::join(range(0, Int::of_u8(c.arity)).map(|_: Int| "_"), ", ")
         ++ "| ";
       head ++ inner(c.value, spent(room, head))
     },
-    FProject(p) -> " |" ++ params(p.arity) ++ "| x" ++ Int::of_u8(p.index).to_string(),
-    FTable(t) -> {
+    ProjectionFunction(p) -> " |" ++ params(p.arity) ++ "| x" ++ Int::of_u8(p.index).to_string(),
+    TableFunction(t) -> {
       let head = " |" ++ params(t.arity) ++ "| ";
       head ++ table_text(t.entries, t.default, spent(room, head), inner)
     },
@@ -277,7 +281,8 @@ fn table_text(
 
 // --- Slots ------------------------------------------------------------------
 
-/// A runtime diagnostic's text stands `values[i]` in as `\x01`, `i` in decimal, `\x02`.
+/// A runtime diagnostic's text marks the place of `values[i]` as `\x01`, then `i` in decimal, then
+/// `\x02`.
 fn opener() -> String / {abort.raise} = String::of_bytes(b"\x01")
 
 fn closer() -> String / {abort.raise} = String::of_bytes(b"\x02")
@@ -290,7 +295,7 @@ pub fn filled(text: String, values: List<Value>) -> String / {abort.raise} =
     [] -> text,
   }
 
-/// A slot naming no value is kept as it came.
+/// A slot that names no value is left unchanged.
 fn slot_piece(piece: String, values: List<Value>) -> String / {abort.raise} =
   match piece.split(closer()) {
     [index, ..rest] -> match slot_value(index, values) {
@@ -306,82 +311,87 @@ fn slot_value(index: String, values: List<Value>) -> Option<Value> / {abort.rais
 
 fn slot(i: Int) -> String / {abort.raise} = opener() ++ i.to_string() ++ closer()
 
-// --- Where two values part ----------------------------------------------------
+// --- Where two values differ ------------------------------------------------
 
 /// One step into a value: an item by its index, an entry by its key, a field by its name, or an
 /// argument by its constructor's name and its place.
-type Step = | PIndex(Int) | PKey(Value) | PField(String) | PArg(String, Int)
+type Step = | IndexStep(Int) | KeyStep(Value) | FieldStep(String) | ArgumentStep(String, Int)
 
-/// Where two values part: the steps to the place, and what each holds there.
-type Parting = { path: List<Step>, expected: Value, actual: Value }
+/// Where two values differ: the steps to the place, and the value each has there.
+type Difference = { path: List<Step>, expected: Value, actual: Value }
 
-/// The note a failed assertion makes of where `actual` first parts from `expected` beneath both: the
-/// path there and what each holds there, each value standing in a slot numbered from `first`, beside
-/// the values its slots name in order. None where they are equal, or part only as wholes. Two lists
-/// or arrays of one length are read item by item, two maps whose keys agree entry by entry, two
-/// records whose fields are named alike field by field, and two values of one constructor argument
-/// by argument.
+/// The note a failed assertion adds about where `actual` first differs from `expected` below the
+/// top level. The note gives the path to that place and the value each has there. Each value
+/// appears as a slot numbered from `first`, and the result also lists the values its slots name, in
+/// order. `None` when the values are equal, or differ only as wholes. Two lists or arrays of the
+/// same length are compared item by item, two maps with the same keys entry by entry, two records
+/// with the same field names field by field, and two values of the same constructor argument by
+/// argument.
 pub fn difference_note(
   actual: Value,
   expected: Value,
   first: Int,
 ) -> Option<{ note: String, values: List<Value> }> / {abort.raise} =
-  match parted(actual, expected, true) {
+  match difference(actual, expected, true) {
     None -> None,
     Some(p) -> {
-      let said = p.path.fold(
+      let path_note = p.path.fold(
         { text: "", values: [] },
         |acc: { text: String, values: List<Value> }, s: Step|
           match s {
-            PIndex(i) -> { ..acc, text: acc.text ++ "[" ++ i.to_string() ++ "]" },
-            PKey(k) ->
+            IndexStep(i) -> { ..acc, text: acc.text ++ "[" ++ i.to_string() ++ "]" },
+            KeyStep(k) ->
               {
                 text: acc.text ++ "[" ++ slot(first + acc.values.len()) ++ "]",
                 values: acc.values.push(k),
               },
-            PField(name) -> { ..acc, text: acc.text ++ "." ++ name },
-            PArg(ctor, i) -> { ..acc, text: acc.text ++ "." ++ ctor ++ "." ++ i.to_string() },
+            FieldStep(name) -> { ..acc, text: acc.text ++ "." ++ name },
+            ArgumentStep(ctor, i) ->
+              { ..acc, text: acc.text ++ "." ++ ctor ++ "." ++ i.to_string() },
           },
       );
-      let at = first + said.values.len();
+      let at = first + path_note.values.len();
       Some({
-        note: "first difference at `" ++ said.text ++ "`: expected " ++ slot(at) ++ ", found "
+        note: "first difference at `" ++ path_note.text ++ "`: expected " ++ slot(at) ++ ", found "
           ++ slot(at + 1),
-        values: said.values.push(p.expected).push(p.actual),
+        values: path_note.values.push(p.expected).push(p.actual),
       })
     },
   }
 
-fn parted(actual: Value, expected: Value, top: Bool) -> Option<Parting> =
+fn difference(actual: Value, expected: Value, top: Bool) -> Option<Difference> =
   match ((actual, expected)) {
-    (VList(a), VList(e)) -> if a.len() == e.len() { items_parted(a, e) }
+    (VList(a), VList(e)) -> if a.len() == e.len() { item_difference(a, e) }
     else { whole(actual, expected, top) },
-    (VArray(a), VArray(e)) -> if a.len() == e.len() { items_parted(a, e) }
+    (VArray(a), VArray(e)) -> if a.len() == e.len() { item_difference(a, e) }
     else { whole(actual, expected, top) },
     (VMap(a), VMap(e)) -> if keys_agree(a, e) {
-      first_parted(a.len(), |i: Int|
+      first_difference(a.len(), |i: Int|
         match ((a.at(i), e.at(i))) {
-          (Some(x), Some(y)) -> within(PKey(x.key), x.value, y.value),
+          (Some(x), Some(y)) -> within(KeyStep(x.key), x.value, y.value),
           _ -> None,
         })
     } else { whole(actual, expected, top) },
     (VRecord(a), VRecord(e)) -> if a.map(|f: Field| f.name) == e.map(|f: Field| f.name) {
-      first_parted(a.len(), |i: Int|
+      first_difference(a.len(), |i: Int|
         match ((a.at(i), e.at(i))) {
-          (Some(x), Some(y)) -> within(PField(x.name), x.value, y.value),
+          (Some(x), Some(y)) -> within(FieldStep(x.name), x.value, y.value),
           _ -> None,
         })
     } else { whole(actual, expected, top) },
     (VCtor(n, a), VCtor(m, e)) -> if n == m && a.len() == e.len() {
-      first_parted(a.len(), |i: Int|
-        match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> within(PArg(n, i), x, y), _ -> None })
+      first_difference(a.len(), |i: Int|
+        match ((a.at(i), e.at(i))) {
+          (Some(x), Some(y)) -> within(ArgumentStep(n, i), x, y),
+          _ -> None,
+        })
     } else { whole(actual, expected, top) },
     _ -> whole(actual, expected, top),
   }
 
-fn items_parted(a: List<Value>, e: List<Value>) -> Option<Parting> =
-  first_parted(a.len(), |i: Int|
-    match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> within(PIndex(i), x, y), _ -> None })
+fn item_difference(a: List<Value>, e: List<Value>) -> Option<Difference> =
+  first_difference(a.len(), |i: Int|
+    match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> within(IndexStep(i), x, y), _ -> None })
 
 /// Whether two maps' keys are the same keys in the same order, as the runtime orders keys.
 fn keys_agree(a: List<Entry>, e: List<Entry>) -> Bool =
@@ -389,20 +399,20 @@ fn keys_agree(a: List<Entry>, e: List<Entry>) -> Bool =
     && range(0, a.len()).all(|i: Int|
       match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> order(x.key, y.key) == Equal, _ -> false })
 
-/// The first of `n` places where `part` finds two values part, by place.
-fn first_parted(n: Int, part: (Int) -> Option<Parting>) -> Option<Parting> =
-  range(0, n).fold(None, |found: Option<Parting>, i: Int|
+/// The first of `n` places, in order, where `part` finds that two values differ.
+fn first_difference(n: Int, part: (Int) -> Option<Difference>) -> Option<Difference> =
+  range(0, n).fold(None, |found: Option<Difference>, i: Int|
     match found { Some(_) -> found, None -> part(i) })
 
-fn within(step: Step, actual: Value, expected: Value) -> Option<Parting> =
-  match parted(actual, expected, false) {
+fn within(step: Step, actual: Value, expected: Value) -> Option<Difference> =
+  match difference(actual, expected, false) {
     Some(p) -> Some({ ..p, path: [step].concat(p.path) }),
     None -> None,
   }
 
-/// Two values part here only below the top, which the assertion's own text says, and where they
-/// differ.
-fn whole(actual: Value, expected: Value, top: Bool) -> Option<Parting> =
+/// A difference at this place when the values differ below the top level. At the top level the
+/// assertion's own text already reports the difference.
+fn whole(actual: Value, expected: Value, top: Bool) -> Option<Difference> =
   if top || actual == expected { None }
   else { Some({ path: [], expected: expected, actual: actual }) }
 
@@ -428,8 +438,8 @@ fn fixed_text(ty: String, bits: U128) -> String = {
 
 // --- Order ------------------------------------------------------------------
 
-/// The order the runtime keeps values in, which is a map's key order where no key is of a type that
-/// states a `key`: by kind first, then within one kind as `compare` orders its payloads.
+/// The order the runtime sorts values in, which is a map's key order when no key's type declares a
+/// `key`: by kind first, then within one kind as `compare` orders the payloads.
 pub fn order(a: Value, b: Value) -> Ordering = {
   let ranks = compare(rank(a), rank(b));
   if ranks != Equal { ranks } else {
@@ -548,11 +558,11 @@ fn inserted(sorted: List<Entry>, e: Entry) -> List<Entry> = {
 
 // --- Encoding ---------------------------------------------------------------
 
-/// `v` as PLV1 writes it, the one format a value crosses into the runtime and is kept in: a value
-/// opens with its tag, a name is written in full once and then by number, and every number is a
-/// little-endian base-128 varint. `None` where `v` holds what the format writes only beside its
-/// bytes or not at all: a hold, a task, a channel, a credential, what a snapshot left out, or what
-/// a type's own `show` wrote.
+/// `v` encoded as PLV1, the one format used to marshal a value into the runtime and to store it. A
+/// value starts with its tag, a name is written in full once and then by number, and every number
+/// is a little-endian base-128 varint. `None` when `v` contains something the format stores only
+/// alongside its bytes, or not at all: a hold, a task, a channel, a credential, what a snapshot
+/// left out, or what a type's own `show` wrote.
 pub fn encode(v: Value) -> Option<Bytes> =
   handle {
     Some(Bytes::concat_all(written(v, { out: [b"PLV1"], names: Map::new() }).out))
@@ -560,25 +570,26 @@ pub fn encode(v: Value) -> Option<Bytes> =
     abort.raise(_) -> None,
   }
 
-/// The value the PLV1 bytes `b` hold, a value written again as `AGAIN` read as a copy of where it
-/// was first written, and a continuation as `FAnonymous`. `None` where `b` holds no one whole value
-/// of the format, or a handle, which only a crossing keeps beside its bytes.
+/// The value the PLV1 bytes `b` encode. A value written again as `AGAIN` decodes as a copy of its
+/// first occurrence, and a continuation decodes as `FAnonymous`. `None` when `b` is not exactly one
+/// whole value of the format, or contains a handle, which only marshalling keeps alongside the
+/// bytes.
 pub fn decode(b: Bytes) -> Option<Value> = decoded(b, false, b.len() + 1)
 
-/// The value a diagnostic shows, whose PLV1 bytes `b` the runtime wrote keeping nothing beside them,
-/// read as `decode` reads one but that a handle reads as what its position says the runtime object
-/// is, `VHold` at 1 and `VSecret` at any other, and a value nested past `shown_levels` levels as
-/// `VElided(0)`.
+/// The value a diagnostic shows, from PLV1 bytes `b` that the runtime wrote with nothing stored
+/// alongside. It decodes as `decode` does, except that a handle decodes as the runtime object its
+/// position identifies (`VHold` at 1 and `VSecret` at any other), and a value nested deeper than
+/// `shown_levels` levels decodes as `VElided(0)`.
 pub fn decode_shown(b: Bytes) -> Option<Value> = decoded(b, true, shown_levels())
 
-/// How many levels deep `decode_shown` reads before what is nested deeper reads as `VElided(0)`:
-/// past what `render` shows, and short of how deeply its reader's calls may nest.
+/// How many levels deep `decode_shown` reads before deeper values decode as `VElided(0)`: more than
+/// `render` shows, and fewer than its reader's calls may nest.
 pub fn shown_levels() -> Int = 256
 
 fn decoded(b: Bytes, shown: Bool, levels: Int) -> Option<Value> =
   handle {
     if !b.starts_with(b"PLV1") { None } else {
-      // A level of nesting is at most three calls deep and takes a byte at least.
+      // Each level of nesting uses at most three calls and at least one byte.
       let read = read_value(
         b,
         { at: 4, names: [], opened: [], levels: levels, shown: shown },
@@ -590,12 +601,12 @@ fn decoded(b: Bytes, shown: Bool, levels: Int) -> Option<Value> =
     abort.raise(_) -> None,
   }
 
-/// The pieces written so far, and each name written, by the number a later write of it is.
-type Writing = { out: List<Bytes>, names: Map<String, Int> }
+/// The pieces written so far, and the number that later writes of each name use.
+type EncodeState = { out: List<Bytes>, names: Map<String, Int> }
 
-fn put(w: Writing, b: Bytes) -> Writing = { ..w, out: w.out.push(b) }
+fn put(w: EncodeState, b: Bytes) -> EncodeState = { ..w, out: w.out.push(b) }
 
-fn written(v: Value, w: Writing) -> Writing / {abort.raise} =
+fn written(v: Value, w: EncodeState) -> EncodeState / {abort.raise} =
   match v {
     VUnit -> put(w, byte_of_int(0)),
     VBool(x) -> put(w, byte_of_int(if x { 2 } else { 1 })),
@@ -606,41 +617,39 @@ fn written(v: Value, w: Writing) -> Writing / {abort.raise} =
     VChar(c) -> put(w, byte_of_int(13).concat(varint(U128::of_int(Int::of_char(c))))),
     VStr(s) -> put(w, byte_of_int(7).concat(blob(Bytes::of_string(s)))),
     VBytes(b) -> put(w, byte_of_int(8).concat(blob(b))),
-    VList(items) -> all_written(items, put(w, counted(9, items.len()))),
-    VArray(items) -> all_written(items, put(w, counted(14, items.len()))),
+    VList(items) -> encode_all(items, put(w, counted(9, items.len()))),
+    VArray(items) -> encode_all(items, put(w, counted(14, items.len()))),
     VMap(entries) ->
-      entries.fold(put(w, counted(10, entries.len())), |acc: Writing, e: Entry|
+      entries.fold(put(w, counted(10, entries.len())), |acc: EncodeState, e: Entry|
         written(e.value, written(e.key, acc))),
     VRecord(fields) ->
-      fields.fold(put(w, counted(11, fields.len())), |acc: Writing, f: Field|
+      fields.fold(put(w, counted(11, fields.len())), |acc: EncodeState, f: Field|
         written(f.value, named(acc, f.name))),
     VCtor(name, args) ->
-      all_written(
-        args,
-        put(named(put(w, byte_of_int(12)), name), varint(U128::of_int(args.len()))),
-      ),
-    VFn(f) -> fun_written(f, put(w, byte_of_int(16))),
+      encode_all(args, put(named(put(w, byte_of_int(12)), name), varint(U128::of_int(args.len())))),
+    VFn(f) -> encode_function(f, put(w, byte_of_int(16))),
     VHold -> abort.raise("a hold, which crosses beside the bytes"),
     VSecret -> abort.raise("a credential, which crosses beside the bytes"),
     VElided(_) -> abort.raise("what a snapshot left out"),
     VShown(_) -> abort.raise("what a type's own `show` wrote"),
   }
 
-fn all_written(items: List<Value>, w: Writing) -> Writing / {abort.raise} =
-  items.fold(w, |acc: Writing, x: Value| written(x, acc))
+fn encode_all(items: List<Value>, w: EncodeState) -> EncodeState / {abort.raise} =
+  items.fold(w, |acc: EncodeState, x: Value| written(x, acc))
 
-/// A function's case and then its parts, as `Fun` holds them.
-fn fun_written(f: Fun, w: Writing) -> Writing / {abort.raise} =
+/// A function's case and then its parts, in the order `Fun` stores them.
+fn encode_function(f: Fun, w: EncodeState) -> EncodeState / {abort.raise} =
   match f {
-    FNamed(name) -> named(put(w, byte_of_int(0)), name),
+    NamedFunction(name) -> named(put(w, byte_of_int(0)), name),
     FAnonymous -> put(w, byte_of_int(1)),
-    FConst(c) -> written(c.value, put(w, byte_of_int(2).concat(small(Int::of_u8(c.arity))))),
-    FProject(p) ->
+    ConstantFunction(c) ->
+      written(c.value, put(w, byte_of_int(2).concat(small(Int::of_u8(c.arity))))),
+    ProjectionFunction(p) ->
       put(
         w,
         Bytes::concat_all([byte_of_int(3), small(Int::of_u8(p.arity)), small(Int::of_u8(p.index))]),
       ),
-    FTable(t) ->
+    TableFunction(t) ->
       written(
         t.default,
         t.entries.fold(
@@ -648,13 +657,13 @@ fn fun_written(f: Fun, w: Writing) -> Writing / {abort.raise} =
             w,
             Bytes::concat_all([byte_of_int(4), small(Int::of_u8(t.arity)), small(t.entries.len())]),
           ),
-          |acc: Writing, e: Entry| written(e.value, written(e.key, acc)),
+          |acc: EncodeState, e: Entry| written(e.value, written(e.key, acc)),
         ),
       ),
   }
 
 /// A name: its number where it was written before, else 0 and then the name in full.
-fn named(w: Writing, name: String) -> Writing / {abort.raise} =
+fn named(w: EncodeState, name: String) -> EncodeState / {abort.raise} =
   match w.names.get(name) {
     Some(n) -> put(w, small(n)),
     None ->
@@ -722,8 +731,8 @@ fn decimal_bytes(d: Decimal) -> Bytes / {abort.raise} = {
 fn le32(n: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all(range(0, 4).map(|i: Int| byte_of_int(n >> 8 * i & 255)))
 
-/// A width by its place among the runtime's widths, then its bits extended as its sign says: the
-/// low 64, and past 64 bits the high 64.
+/// A width by its index among the runtime's widths, then its bits, sign-extended for a signed
+/// width: the low 64 bits, and for widths past 64 bits the high 64 too.
 fn fixed_bytes(ty: String, bits: U128) -> Bytes / {abort.raise} = {
   let place = width_rank(ty);
   if place >= 10 { abort.raise("no width is named " ++ ty) } else {
@@ -737,11 +746,11 @@ fn fixed_bytes(ty: String, bits: U128) -> Bytes / {abort.raise} = {
   }
 }
 
-/// Where reading has reached, each name read so far in the order it was first written, each string,
-/// bytes, list, array and map value in the order it opened, once it has closed, how many levels
-/// deeper a value is read before it reads as `VElided(0)`, and whether the bytes are a value a
-/// diagnostic shows, whose handles say what they are.
-type Reading = {
+/// The decoder's state: the position reached, each name read so far in the order it was first
+/// written, and each string, bytes, list, array and map value in the order it opened, filled in
+/// once it closes. Also how many more levels are read before a value decodes as `VElided(0)`, and
+/// whether the bytes are a value a diagnostic shows, whose handles identify their objects.
+type DecodeState = {
   at: Int,
   names: List<String>,
   opened: List<Option<Value>>,
@@ -749,12 +758,12 @@ type Reading = {
   shown: Bool,
 }
 
-type ReadValue = { v: Value, r: Reading }
+type ReadValue = { v: Value, r: DecodeState }
 
 /// The value at `r` of `b`, read in at most `depth` nested calls.
-fn read_value(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
+fn read_value(b: Bytes, r: DecodeState, depth: Int) -> ReadValue / {abort.raise} =
   if depth <= 0 { abort.raise("a value nested deeper than its bytes") }
-  else if r.levels == 0 { { v: VElided(0), r: skipped(b, r) } } else {
+  else if r.levels == 0 { { v: VElided(0), r: skip_value(b, r) } } else {
     let t = b.at(r.at);
     let past = { ..r, at: r.at + 1, levels: r.levels - 1 };
     let read = if t == 7 || t == 8 || t == 9 || t == 10 || t == 14 {
@@ -765,17 +774,18 @@ fn read_value(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
     { v: read.v, r: { ..read.r, levels: r.levels } }
   }
 
-/// What is left to read past a value as `skipped` reads it: `left` more fields, each a name and
-/// then a value, or values.
-type Left = { fields: Bool, left: Int }
+/// What remains for `skip_value` to skip after a value's head: `left` more fields, each a name and
+/// then a value, or `left` more values.
+type Remaining = { fields: Bool, left: Int }
 
-/// `r` past the value at `r.at`, read without a call per level of it: each name it writes in full
-/// numbered, and each string, bytes, list, array and map that opens in it kept as `VElided(0)`.
-fn skipped(b: Bytes, r: Reading) -> Reading / {abort.raise} =
+/// `r` moved past the value at `r.at`, without one call per level of nesting. Each name the value
+/// writes in full gets its number, and each string, bytes, list, array and map that opens in it is
+/// recorded as `VElided(0)`.
+fn skip_value(b: Bytes, r: DecodeState) -> DecodeState / {abort.raise} =
   iterate(
     { r: r, todo: [{ fields: false, left: 1 }] },
     b.len() + 2,
-    |s: { r: Reading, todo: List<Left> }|
+    |s: { r: DecodeState, todo: List<Remaining> }|
       match s.todo.last() {
         None -> Stop(s.r),
         Some(top) -> {
@@ -785,7 +795,7 @@ fn skipped(b: Bytes, r: Reading) -> Reading / {abort.raise} =
             let name = read_name(b, s.r);
             Continue({ r: name.r, todo: rest.push({ fields: false, left: 1 }) })
           } else {
-            let h = head_skipped(b, s.r);
+            let h = skip_head(b, s.r);
             Continue({ r: h.r, todo: if h.left.left == 0 { rest } else { rest.push(h.left) } })
           }
         },
@@ -793,7 +803,7 @@ fn skipped(b: Bytes, r: Reading) -> Reading / {abort.raise} =
   )
 
 /// `r` past the head of the value at `r.at`, and what of the value is left to read.
-fn head_skipped(b: Bytes, r: Reading) -> { r: Reading, left: Left } / {abort.raise} = {
+fn skip_head(b: Bytes, r: DecodeState) -> { r: DecodeState, left: Remaining } / {abort.raise} = {
   let t = b.at(r.at);
   let at = r.at + 1;
   let alone = |to: Int| { r: { ..r, at: to }, left: { fields: false, left: 0 } };
@@ -838,7 +848,7 @@ fn head_skipped(b: Bytes, r: Reading) -> { r: Reading, left: Left } / {abort.rai
   } else { abort.raise("a value tagged as this format has none") }
 }
 
-fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
+fn read_body(b: Bytes, t: Int, r: DecodeState, depth: Int) -> ReadValue / {abort.raise} =
   if depth <= 0 { abort.raise("a value nested deeper than its bytes") }
   else if t == 0 { { v: VUnit, r: r } }
   else if t == 1 { { v: VBool(false), r: r } }
@@ -884,7 +894,7 @@ fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.rai
     let n = read_count(b, r.at);
     let fields = range(0, n.n).fold(
       { fs: [], r: { ..r, at: n.at } },
-      |acc: { fs: List<Field>, r: Reading }, _: Int| {
+      |acc: { fs: List<Field>, r: DecodeState }, _: Int| {
         let name = read_name(b, acc.r);
         let value = read_value(b, name.r, depth - 1);
         { fs: acc.fs.push({ name: name.name, value: value.v }), r: value.r }
@@ -902,7 +912,7 @@ fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.rai
       Some(ch) -> { v: VChar(ch), r: { ..r, at: c.at } },
       None -> abort.raise("a character that is not a Unicode scalar value"),
     }
-  } else if t == 16 { read_fun(b, r, depth - 1) } else if t == 17 {
+  } else if t == 16 { read_function(b, r, depth - 1) } else if t == 17 {
     let n = read_varint(b, r.at);
     match r.opened.at(Int::of_u128(n.u)) {
       Some(Some(v)) -> { v: v, r: { ..r, at: n.at } },
@@ -916,11 +926,11 @@ fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.rai
 fn read_values(
   b: Bytes,
   n: Int,
-  r: Reading,
+  r: DecodeState,
   depth: Int,
-) -> { vs: List<Value>, r: Reading } / {abort.raise} =
+) -> { vs: List<Value>, r: DecodeState } / {abort.raise} =
   if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
-    range(0, n).fold({ vs: [], r: r }, |acc: { vs: List<Value>, r: Reading }, _: Int| {
+    range(0, n).fold({ vs: [], r: r }, |acc: { vs: List<Value>, r: DecodeState }, _: Int| {
       let x = read_value(b, acc.r, depth - 1);
       { vs: acc.vs.push(x.v), r: x.r }
     })
@@ -929,48 +939,52 @@ fn read_values(
 fn read_entries(
   b: Bytes,
   n: Int,
-  r: Reading,
+  r: DecodeState,
   depth: Int,
-) -> { es: List<Entry>, r: Reading } / {abort.raise} =
+) -> { es: List<Entry>, r: DecodeState } / {abort.raise} =
   if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
-    range(0, n).fold({ es: [], r: r }, |acc: { es: List<Entry>, r: Reading }, _: Int| {
+    range(0, n).fold({ es: [], r: r }, |acc: { es: List<Entry>, r: DecodeState }, _: Int| {
       let k = read_value(b, acc.r, depth - 1);
       let v = read_value(b, k.r, depth - 1);
       { es: acc.es.push({ key: k.v, value: v.v }), r: v.r }
     })
   }
 
-fn read_fun(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
+fn read_function(b: Bytes, r: DecodeState, depth: Int) -> ReadValue / {abort.raise} =
   if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
     let kind = b.at(r.at);
     let past = { ..r, at: r.at + 1 };
     if kind == 0 {
       let name = read_name(b, past);
-      { v: VFn(FNamed(name.name)), r: name.r }
+      { v: VFn(NamedFunction(name.name)), r: name.r }
     } else if kind == 1 || kind == 5 { { v: VFn(FAnonymous), r: past } } else {
       let arity = read_varint(b, past.at);
       let a = U8::of_int(Int::of_u128(arity.u));
       let after = { ..past, at: arity.at };
       if kind == 2 {
         let value = read_value(b, after, depth - 1);
-        { v: VFn(FConst({ arity: a, value: value.v })), r: value.r }
+        { v: VFn(ConstantFunction({ arity: a, value: value.v })), r: value.r }
       } else if kind == 3 {
         let index = read_varint(b, after.at);
         {
-          v: VFn(FProject({ arity: a, index: U8::of_int(Int::of_u128(index.u)) })),
+          v: VFn(ProjectionFunction({ arity: a, index: U8::of_int(Int::of_u128(index.u)) })),
           r: { ..after, at: index.at },
         }
       } else if kind == 4 {
         let n = read_count(b, after.at);
         let entries = read_entries(b, n.n, { ..after, at: n.at }, depth - 1);
         let default = read_value(b, entries.r, depth - 1);
-        { v: VFn(FTable({ arity: a, entries: entries.es, default: default.v })), r: default.r }
+        {
+          v: VFn(TableFunction({ arity: a, entries: entries.es, default: default.v })),
+          r: default.r,
+        }
       } else { abort.raise("a function of a case this format does not have") }
     }
   }
 
-/// A name: in full where its number is 0, which numbers it next, and otherwise the one so numbered.
-fn read_name(b: Bytes, r: Reading) -> { name: String, r: Reading } / {abort.raise} = {
+/// A name: written in full after a 0, which gives it the next number, and otherwise the name with
+/// that number.
+fn read_name(b: Bytes, r: DecodeState) -> { name: String, r: DecodeState } / {abort.raise} = {
   let n = read_varint(b, r.at);
   if n.u == 0u128 {
     let s = read_blob(b, n.at);
@@ -989,7 +1003,8 @@ fn read_blob(b: Bytes, at: Int) -> { b: Bytes, at: Int } / {abort.raise} = {
   { b: b.slice(n.at, n.at + n.n), at: n.at + n.n }
 }
 
-/// A count no larger than the bytes left, so a corrupt one asks for nothing it cannot hold.
+/// A count no larger than the bytes left, so a corrupt count cannot request more items than the
+/// input could contain.
 fn read_count(b: Bytes, at: Int) -> { n: Int, at: Int } / {abort.raise} = {
   let x = read_varint(b, at);
   if x.u > U128::of_int(b.len() - x.at) { abort.raise("a count of more than the bytes left") }
@@ -1036,7 +1051,7 @@ fn digit_char(d: Int) -> Char = match "0123456789".chars().at(d) { Some(c) -> c,
 
 // --- Text -------------------------------------------------------------------
 
-/// As a character literal is written: a quote of its own kind is the one escaped.
+/// `c` as a character literal writes it: of the two quotes, only `'` is escaped.
 fn char_escaped(c: Char) -> String = String::of_chars(escaped_char([], c, '\''))
 
 /// `c` after `acc` as a literal quoted by `quote` writes it.
@@ -1048,8 +1063,8 @@ fn escaped_char(acc: List<Char>, c: Char, quote: Char) -> List<Char> =
   else if c == '\\' || c == quote { acc.push('\\').push(c) }
   else { acc.push(c) }
 
-/// What a text keeps of its units, characters or bytes: what `write` makes of as many from the
-/// first as fit in the room, and how many are left out.
+/// What fits of a text's units, characters or bytes: what `write` produces from as many leading
+/// units as fit in the `room`, and how many are left out.
 type Fitted = { chars: List<Char>, more: Int }
 
 fn fitted<a>(units: List<a>, room: Option<Int>, write: (List<Char>, a) -> List<Char>) -> Fitted =
@@ -1067,7 +1082,7 @@ fn cut_text(open: String, close: String, f: Fitted) -> String =
   open ++ String::of_chars(f.chars) ++ close
     ++ (if f.more == 0 { "" } else { " " ++ elided(f.more) })
 
-// Every index read is below the length, so the clause never answers.
+// Every index read is below the length, so the `abort.raise` clause never runs.
 fn bytes_of(b: Bytes) -> List<Int> =
   handle { range(0, b.len()).map(|i: Int| b.at(i)) } with { abort.raise(_) -> [] }
 
@@ -1204,7 +1219,7 @@ test "containers nest, and a tuple shows as one" {
   assert_eq(render(VMap([{ key: VStr("k"), value: VInt(1) }])), "{\"k\": 1}")
 }
 
-test "a constructor shows under the name its module declares, not where the module stands" {
+test "a constructor shows under the name its module declares, not the module's path" {
   assert_eq(render(VCtor("orders.Shipped", [VInt(3)])), "Shipped(3)");
   assert_eq(render(VCtor("app.models.Red", [])), "Red")
 }
@@ -1228,7 +1243,9 @@ test "render_all writes what render does, every item at every depth" {
   );
   assert(render(long) != render_all(long));
   assert_eq(render_all(VCtor("m.Shipped", [VInt(2)])), "Shipped(2)");
-  let made = VFn(FTable({ arity: 1u8, entries: [{ key: VInt(0), value: long }], default: long }));
+  let made = VFn(
+    TableFunction({ arity: 1u8, entries: [{ key: VInt(0), value: long }], default: long }),
+  );
   assert_eq(
     render_all(made),
     "<fn |x0| if x0 == 0 { " ++ render_all(long) ++ " } else { " ++ render_all(long) ++ " }>",
@@ -1282,9 +1299,9 @@ fn values_at(depth: Int) -> gen::Gen<Value> =
     ])
   }
 
-/// A value as a test draws one: a scalar, or a list, an array, a record, a map or a constructor
-/// of values, a few deep. Its records and maps are in the order drawn, which need not be the
-/// order a value the runtime shows is in.
+/// A generator of values: a scalar, or a list, an array, a record, a map or a constructor of
+/// values, a few levels deep. Its records and maps keep the order generated, which may differ from
+/// the order the runtime uses.
 pub fn values() -> gen::Gen<Value> = gen::sized(|size: Int| values_at(min(max(size / 16, 0), 2)))
 
 test "render_all writes a value inside a list or a constructor as it writes the value alone" {
@@ -1309,7 +1326,7 @@ test "nesting past the shown depth is elided" {
   assert(!render(deep).contains("0"))
 }
 
-test "a slot is filled with its value, and a slot naming none is kept" {
+test "a slot is filled with its value, and a slot that names no value is left as it is" {
   let slot = |i: Int| opener() ++ i.to_string() ++ closer();
   assert_eq(
     filled("expected " ++ slot(0) ++ ", found " ++ slot(1), [VInt(1), VStr("a")]),
@@ -1320,14 +1337,14 @@ test "a slot is filled with its value, and a slot naming none is kept" {
 }
 
 test "a function shows as what it is" {
-  assert_eq(render(VFn(FNamed("m.double"))), "<fn m.double>");
+  assert_eq(render(VFn(NamedFunction("m.double"))), "<fn m.double>");
   assert_eq(render(VFn(FAnonymous)), "<fn>");
-  assert_eq(render(VFn(FConst({ arity: 2u8, value: VInt(3) }))), "<fn |_, _| 3>");
-  assert_eq(render(VFn(FProject({ arity: 2u8, index: 1u8 }))), "<fn |x0, x1| x1>");
+  assert_eq(render(VFn(ConstantFunction({ arity: 2u8, value: VInt(3) }))), "<fn |_, _| 3>");
+  assert_eq(render(VFn(ProjectionFunction({ arity: 2u8, index: 1u8 }))), "<fn |x0, x1| x1>");
   assert_eq(
     render(
       VFn(
-        FTable({
+        TableFunction({
           arity: 1u8,
           entries: [{ key: VInt(1), value: VBool(true) }],
           default: VBool(false),
@@ -1378,7 +1395,7 @@ test "a value is written as the runtime's codec writes it, byte for byte" {
   assert_eq(encode(VFloat(1.0)), Some(plv1(b"\x04\x00\x00\x00\x00\x00\x00\xf0\x3f")));
   assert_eq(encode(VStr(String::of_bytes(b"\xc3\xa9"))), Some(plv1(b"\x07\x02\xc3\xa9")));
   assert_eq(encode(VChar('a')), Some(plv1(b"\x0d\x61")));
-  // A signed width's bits are written extended to a word, as its sign says.
+  // A signed width's bits are written sign-extended to a word.
   assert_eq(
     encode(VFixed("I8", 255u128)),
     Some(plv1(b"\x06\x04\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01")),
@@ -1395,11 +1412,14 @@ test "a value is written as the runtime's codec writes it, byte for byte" {
     Some(plv1(b"\x09\x02\x0b\x01\x00\x01a\x03\x02\x0b\x01\x01\x03\x02")),
   );
   assert_eq(encode(VCtor("Some", [VInt(1)])), Some(plv1(b"\x0c\x00\x04Some\x01\x03\x02")));
-  assert_eq(encode(VFn(FProject({ arity: 2u8, index: 1u8 }))), Some(plv1(b"\x10\x03\x02\x01")));
+  assert_eq(
+    encode(VFn(ProjectionFunction({ arity: 2u8, index: 1u8 }))),
+    Some(plv1(b"\x10\x03\x02\x01")),
+  );
   assert_eq([VHold, VSecret, VElided(0), VShown("x")].map(encode), [None, None, None, None])
 }
 
-test "decoding what encoding wrote writes it again alike" {
+test "decoding what encoding wrote and encoding it again gives the same bytes" {
   gen::check(values(), |v: Value|
     match encode(v) {
       Some(b) -> match decode(b) { Some(back) -> encode(back) == Some(b), None -> false },
@@ -1407,7 +1427,7 @@ test "decoding what encoding wrote writes it again alike" {
     })
 }
 
-test "a value read again is a copy of where it was first written, and only once it is whole" {
+test "a repeated value decodes as a copy of its first occurrence, but only once that is complete" {
   let plv1 = |b: Bytes| b"PLV1".concat(b);
   assert_eq(decode(plv1(b"\x09\x02\x07\x01a\x11\x01")), Some(VList([VStr("a"), VStr("a")])));
   assert_eq(decode(plv1(b"\x09\x01\x11\x00")), None);
@@ -1482,13 +1502,13 @@ test "what a diagnostic shows reads as a program writes each kind of value" {
   assert_eq(shown_text(deep), render(deep))
 }
 
-test "a handle a diagnostic shows reads as the runtime object its position says it is" {
+test "a handle a diagnostic shows decodes as the runtime object its position identifies" {
   let plv1 = |b: Bytes| b"PLV1".concat(b);
   let told = |b: Bytes| match decode_shown(plv1(b)) { Some(v) -> render(v), None -> "no value" };
   assert_eq(told(b"\x0f\x00"), "Secret(****)");
   assert_eq(told(b"\x0f\x01"), "<hold>");
   assert_eq(told(b"\x0b\x01\x00\x05token\x0f\x00"), "{token: Secret(****)}");
-  // Only a value a diagnostic shows says what its handles are.
+  // Only a value a diagnostic shows identifies its handles.
   assert_eq(decode(plv1(b"\x0f\x00")), None);
   // A continuation is a function the program wrote, with no name of its own.
   assert_eq([decode(plv1(b"\x10\x05")), decode_shown(plv1(b"\x10\x05"))], [
@@ -1497,8 +1517,8 @@ test "a handle a diagnostic shows reads as the runtime object its position says 
   ])
 }
 
-test "a value a diagnostic shows is read so deep, and what it holds past that is skipped whole" {
-  // The first item nests as many lists as are read around a string, which the second is again.
+test "a value a diagnostic shows is read to a fixed depth, and what lies past it is skipped whole" {
+  // The first item nests a string in as many lists as are read; the second item is that string.
   let nested = Bytes::concat_all(range(0, shown_levels()).map(|_: Int| b"\x09\x01"));
   let b = Bytes::concat_all([b"PLV1\x09\x02", nested, b"\x07\x01x\x11\x81\x02"]);
   let second = |read: Option<Value>| match read { Some(VList([_, x])) -> Some(x), _ -> None };
@@ -1511,7 +1531,7 @@ test "a value a diagnostic shows is read so deep, and what it holds past that is
   }
 }
 
-test "an assertion notes where its values first part, each value there and each key on the way in a slot" {
+test "an assertion notes where its values first differ, with each value and key in a slot" {
   let noted = |actual: Value, expected: Value|
     match difference_note(actual, expected, 2) {
       Some(n) -> filled(n.note, [expected, actual].concat(n.values)),
@@ -1539,7 +1559,7 @@ test "an assertion notes where its values first part, each value there and each 
     noted(VList([VList([VInt(1)])]), VList([VList([])])),
     "first difference at `[0]`: expected [], found [1]",
   );
-  // Values that part only as wholes, or not at all, say no more than the assertion does.
+  // Values that differ only as wholes, or not at all, add nothing to what the assertion reports.
   assert_eq(
     [
       noted(VInt(1), VInt(2)),

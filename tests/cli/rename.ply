@@ -1,16 +1,16 @@
 //! `ply rename`: each name edited where its program's resolution and check say it is written, and
 //! a rename refused unless every name of the renamed program refers to what it did.
 
-import harness (Kept, Source, kept_in_memory, tree, file_of, stderr, said, Hermetic, Shipped,
-                manifest, dep)
+import harness (RunWithTree, Source, in_memory_with_tree, tree, file_of, stderr, all_output,
+                Hermetic, Shipped, manifest, dependency)
 import std.string
 
 fn renamed(
   files: List<Source>,
   map: String,
   argv: List<String>,
-) -> Kept / {Hermetic, Shipped, abort.raise, diverges} =
-  kept_in_memory(
+) -> RunWithTree / {Hermetic, Shipped, abort.raise, diverges} =
+  in_memory_with_tree(
     tree(files.push({ path: "map.txt", text: map })),
     ["rename", "--map", "map.txt"].concat(argv),
     [],
@@ -20,7 +20,8 @@ fn renamed(
 fn app(files: List<Source>) -> List<Source> =
   [{ path: "app/ply.pkg", text: manifest("app", "") }].concat(files)
 
-fn errors_of(k: Kept) -> List<String> = k.ran.err.filter(|line: String| line.starts_with("error"))
+fn errors_of(k: RunWithTree) -> List<String> =
+  k.ran.err.filter(|line: String| line.starts_with("error"))
 
 fn store_tree() -> List<Source> =
   app([
@@ -62,7 +63,9 @@ test "two definitions becoming one name stops the rename" {
   let text = "fn total() -> Int = 1\n\nfn sum() -> Int = total()\n";
   let k = renamed([{ path: "m.ply", text: text }], "sum total\n", ["m.ply"]);
   assert_eq(k.ran.code, 2);
-  assert(errors_of(k).len() > 0, Some(said(k.ran)));
+  assert(errors_of(k).len() > 0, Some(all_output(k.ran)));
+  assert(errors_of(k).all(|e: String| e.starts_with("error: m.ply:")), Some(all_output(k.ran)));
+  assert_eq(k.ran.out, []);
   assert_eq(file_of(k.tree, "m.ply"), Some(text))
 }
 
@@ -78,7 +81,17 @@ test "a program that does not check is renamed nowhere, and only its own errors 
   let k = renamed([{ path: "m.ply", text: "fn f() -> Int = g()\n" }], "f h\n", ["m.ply"]);
   assert_eq(k.ran.code, 2);
   assert_eq(errors_of(k).len(), 1);
-  assert(errors_of(k).get(0).starts_with("error: m.ply: does not check: "), Some(said(k.ran)))
+  assert(errors_of(k).get(0).starts_with("error: m.ply: does not check: "), Some(all_output(k.ran)))
+}
+
+test "a new name the module also uses for a type is renamed, with a warning" {
+  let text = "type Box = { n: Int }\n\ntype Wrapped = | Boxed(Box)\n";
+  let k = renamed([{ path: "m.ply", text: text }], "Boxed Box\n", ["m.ply"]);
+  assert(k.ran.code == 0, Some(all_output(k.ran)));
+  assert_eq(k.ran.err.filter(|line: String| line.starts_with("warning")), [
+    "warning: m.ply:3: renaming `Boxed` to `Box` gives it the name of a type this module also uses",
+  ]);
+  assert_eq(file_of(k.tree, "m.ply"), Some("type Box = { n: Int }\n\ntype Wrapped = | Box(Box)\n"))
 }
 
 test "a keyword as the new name stops the rename" {
@@ -120,6 +133,25 @@ test "a line that starts with a file renames only the definition in that file, a
       "import build (BuildOutput)\nimport unit\n\nfn sizes(m: BuildOutput, u: unit::UnitCode) -> Int = m.size + u.code\n",
     ),
   )
+}
+
+test "a file of the package outside the paths that uses a renamed name stops the rename" {
+  let k = renamed(store_tree(), "held_count total\n", ["app/held"]);
+  assert_eq(k.ran.code, 2);
+  assert_eq(errors_of(k), [
+    "error: app/main.ply: uses a name the renames change, but is not under the paths",
+  ]);
+  assert_eq(file_of(k.tree, "app/held/store.ply"), Some(store_tree().get(1).text))
+}
+
+test "a call of a renamed type's derived codec by its old name stops the rename" {
+  let text = "import std.bin\n\npub type Box = { n: Int }\n\nderive bin for Box\n\nfn codec() -> bin::BinCodec<Box> = box_bin()\n";
+  let k = renamed([{ path: "m.ply", text: text }], "m.ply Box Crate\n", ["m.ply"]);
+  assert_eq(k.ran.code, 2);
+  assert_eq(errors_of(k), [
+    "error: m.ply:7: `box_bin` would refer to something else after the renames",
+  ]);
+  assert_eq(file_of(k.tree, "m.ply"), Some(text))
 }
 
 test "a line that starts with a file and names nothing it binds stops the rename" {
@@ -164,7 +196,7 @@ test "modules of one name in two packages each move, and an import of one follow
     [
       { path: "lib/ply.pkg", text: manifest("lib", "") },
       { path: "lib/twin.ply", text: "pub fn value() -> Int = 1\n" },
-      { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+      { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
       { path: "app/twin.ply", text: "pub fn other() -> Int = 2\n" },
       {
         path: "app/main.ply",
@@ -334,7 +366,7 @@ test "a string that writes a renamed name after `::` is reported, and left as it
   let k = renamed([{ path: "m.ply", text: text }], "m.ply Made Built\n", ["m.ply"]);
   assert(k.ran.code == 0, Some(stderr(k.ran)));
   assert_eq(k.ran.err, ["warning: m.ply:3: a string contains the renamed name `Made`"]);
-  assert(file_of(k.tree, "m.ply").unwrap_or("").contains("m::Made"), Some(said(k.ran)))
+  assert(file_of(k.tree, "m.ply").unwrap_or("").contains("m::Made"), Some(all_output(k.ran)))
 }
 
 test "operations of two effects in one file may share a name" {
@@ -351,6 +383,6 @@ test "operations of two effects in one file may share a name" {
   assert(k.ran.code == 0, Some(stderr(k.ran)));
   assert(
     file_of(k.tree, "m.ply").unwrap_or("").contains("store.get[r](1) + files.get[r](2)"),
-    Some(said(k.ran)),
+    Some(all_output(k.ran)),
   )
 }

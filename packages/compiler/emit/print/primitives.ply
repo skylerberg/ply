@@ -1,0 +1,1598 @@
+import std.bytes (ascii_of_int)
+import compiler.syntax.patterns (SourceLiteral, LiteralUnit, LiteralString)
+import compiler.check.types (Type, int_type, decimal_type, unit_type, string_type, bool_type)
+import compiler.check.known (less_constructor, equal_constructor, greater_constructor,
+                             ordering_type, char_type)
+import compiler.syntax.parsing (span_between)
+import compiler.emit.c (Width, SizedIntKind, kind_c_type, int_literal, is_bitwise,
+                        bitwise_c_operator, unsigned_c_type, width_index, width_min, width_max,
+                        overflow_code)
+import compiler.emit.pieces (pieces_text)
+import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFixed, AsFloat, AsDecimal,
+                               AsWideFixed, AsWord, AsSum, AsImmediate, Var, Arg, VarOperand,
+                               IntOperand, FixedOperand, operand_representation, arithmetic,
+                               comparison, shift)
+import compiler.emit.print.text (Printing, InstructionContext, empty_printing, line, temp, named,
+                                 arg_text, assigned, site, unsupported)
+import compiler.emit.print.value_printing (c_type)
+import compiler.emit.layout (sum_layout, record_layout)
+import compiler.emit.print.strings (bytes_of, text_field)
+
+pub fn literal(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  l: SourceLiteral,
+) -> Printing / {abort.raise} =
+  match into {
+    None -> printing,
+    Some(v) -> match l {
+      LiteralUnit -> typed_assigned(p, printing, v, b"0"),
+      _ -> unsupported(b"a literal the folded pass did not lay out", c_type(v.representation)),
+    },
+  }
+
+pub fn primitive(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  x: { op: Bytes, on: Representation, args: List<Arg> },
+) -> Printing / {abort.raise} =
+  match into {
+    None -> printing,
+    Some(v) -> {
+      let a = match x.args.at(0) { Some(y) -> arg_text(printing, y), None -> b"0" };
+      let b = match x.args.at(1) { Some(y) -> arg_text(printing, y), None -> b"0" };
+      let count = match x.args.at(1) { Some(y) -> int_text(printing, y), None -> b"0" };
+      if x.op == b"sign" { sign_printed(p, printing, v, x.on, a) } else if x.op == b"narrow" {
+        typed_assigned(p, printing, v, Bytes::concat_all([b"(", c_type(v.representation), b")", a]))
+      } else if x.op == b"within" {
+        let c = match x.args.at(2) { Some(y) -> arg_text(printing, y), None -> b"0" };
+        typed_assigned(
+          p,
+          printing,
+          v,
+          Bytes::concat_all([b"((", a, b") >= (", b, b") && (", a, b") <= (", c, b"))"]),
+        )
+      } else if x.op == b"decimal" {
+        typed_assigned(p, printing, v, Bytes::concat_all([b"((PlyDec){ ", a, b", ", b, b" })"]))
+      } else if x.op == b"wide" {
+        typed_assigned(
+          p,
+          printing,
+          v,
+          Bytes::concat_all([b"((PlyWide){ (Word)(", a, b"), (Word)(", b, b") })"]),
+        )
+      } else {
+        match x.on {
+          AsInt -> int_printed(p, printing, v, x.op, a, b, count, literal_divisor(x.args.at(1))),
+          AsBool -> bool_printed(p, printing, v, x.op, a, b),
+          AsFloat -> float_printed(p, printing, v, x.op, a, b),
+          AsDecimal -> decimal_printed(p, printing, v, x.op, a, b),
+          AsWideFixed(w) -> wide_printed(p, printing, v, x.op, w, a, b, count),
+          AsFixed(w) -> width_printed(p, printing, v, x.op, w, a, b, count),
+          AsWord -> word_printed(p, printing, v, x.op, a, b),
+          AsImmediate -> word_printed(p, printing, v, x.op, a, b),
+          AsSum(_) -> if x.op == b"eq" || x.op == b"ne" {
+            typed_assigned(p, printing, v, infix(a, compare_c(x.op), b))
+          } else { unsupported_operator(p, printing, x.op) },
+          _ -> unsupported_operator(p, printing, x.op),
+        }
+      }
+    },
+  }
+
+fn typed_assigned(p: InstructionContext, printing: Printing, v: Var, e: Bytes) -> Printing =
+  assigned(printing, p.depth, v, c_type(v.representation), e)
+
+fn infix(a: Bytes, c: Bytes, b: Bytes) -> Bytes =
+  Bytes::concat_all([b"(", a, b") ", c, b" (", b, b")"])
+
+fn unsupported_operator(
+  p: InstructionContext,
+  printing: Printing,
+  op: Bytes,
+) -> Printing / {abort.raise} = unsupported(b"an operator this printer does not write", op)
+
+fn int_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+  by_literal: Bool,
+) -> Printing / {abort.raise} =
+  if op == b"ne" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"]))
+  } else if comparison(op) { typed_assigned(p, printing, v, infix(a, compare_c(op), b)) }
+  else if is_bitwise(op) { typed_assigned(p, printing, v, infix(a, bitwise_c_operator(op), b)) }
+  else if op == b"add" || op == b"sub" || op == b"mul" {
+    let n = named(site(p, printing), v);
+    line(
+      line(n.printing, p.depth, Bytes::concat_all([b"int64_t ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([
+        b"if (ply_",
+        op,
+        b"_ov(",
+        a,
+        b", ",
+        b,
+        b", &",
+        n.name,
+        b")) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    )
+  } else if (op == b"div" || op == b"rem") && by_literal {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"(", a, if op == b"div" { b") / " } else { b") % " }, b]),
+    )
+  } else if op == b"div" || op == b"rem" {
+    let s = site(p, printing);
+    let zero = line(
+      s,
+      p.depth,
+      Bytes::concat_all([
+        b"if ((",
+        b,
+        b") == 0) { rt_by_zero_p(ctx, ",
+        if op == b"div" { b"0" } else { b"1" },
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    let past = line(
+      zero,
+      p.depth,
+      Bytes::concat_all([
+        b"if ((",
+        b,
+        b") == -1 && (",
+        a,
+        b") == INT64_MIN) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    typed_assigned(
+      p,
+      past,
+      v,
+      Bytes::concat_all([b"(", a, if op == b"div" { b") / (" } else { b") % (" }, b, b")"]),
+    )
+  } else if shift(op) { shifted(p, printing, v, op, None, a, count) } else if op == b"to_decimal" {
+    let magnitude = Bytes::concat_all([
+      b"((",
+      a,
+      b") < 0 ? 0 - (uint64_t)(",
+      a,
+      b") : (uint64_t)(",
+      a,
+      b"))",
+    ]);
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([
+        b"((PlyDec){ (Word)(((",
+        a,
+        b") < 0 ? (uint64_t)1 << 31 : 0) | ((",
+        magnitude,
+        b" & 0xFFFFFFFF) << 32)), (Word)(",
+        magnitude,
+        b" >> 32) })",
+      ]),
+    )
+  } else if op == b"neg" {
+    let guarded = line(
+      site(p, printing),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        a,
+        b" == INT64_MIN) { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    typed_assigned(p, guarded, v, Bytes::concat_all([b"-(", a, b")"]))
+  } else if op == b"bitnot" { typed_assigned(p, printing, v, Bytes::concat_all([b"~(", a, b")"])) }
+  else if op == b"order" { typed_assigned(p, printing, v, signed_order(a, b)) }
+  else if op == b"ordering" { ordering(p, printing, v, a) } else if op == b"to_float" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(double)(", a, b")"]))
+  } else if op == b"of_bits" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"ply_f64(", a, b")"]))
+  } else if op == b"decimal_flags" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([
+        b"((((uint64_t)(",
+        a,
+        b") & 0x7F00FFFFull) != 0 || ((((uint64_t)(",
+        a,
+        b")) >> 16) & 0xFF) > 28) ? INT64_C(-1) : INT64_C(0))",
+      ]),
+    )
+  } else if op == b"scalar_value" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([
+        b"((",
+        a,
+        b") >= 0 && (",
+        a,
+        b") <= 0x10FFFF && !((",
+        a,
+        b") >= 0xD800 && (",
+        a,
+        b") <= 0xDFFF) ? (",
+        a,
+        b") : -1)",
+      ]),
+    )
+  } else if op == b"char_of" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"((((Word)(uint64_t)(", a, b")) << 3) | 2)"]),
+    )
+  } else if op == b"witness" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(13 + ", a, b")"]))
+  } else if op == b"of_int" {
+    let refused = |w: Width|
+      Bytes::concat_all([
+        b") { rt_not_that_width_p(ctx, ",
+        ascii_of_int(width_index(w)),
+        b", ",
+        a,
+        b"); ",
+        p.leave,
+        b" }",
+      ]);
+    match v.representation {
+      AsWideFixed(w) -> {
+        let s = site(p, printing);
+        let guarded = if w.signed { s }
+        else { line(s, p.depth, Bytes::concat_all([b"if (", a, b" < 0", refused(w)])) };
+        typed_assigned(
+          p,
+          guarded,
+          v,
+          Bytes::concat_all([b"((PlyWide){ (Word)(", a, b"), (Word)((", a, b") < 0 ? -1 : 0) })"]),
+        )
+      },
+      AsFixed(w) -> {
+        let s = site(p, printing);
+        let guarded = if w.bits == 64 && w.signed { s } else if w.bits == 64 {
+          line(s, p.depth, Bytes::concat_all([b"if (", a, b" < 0", refused(w)]))
+        } else {
+          line(
+            s,
+            p.depth,
+            Bytes::concat_all([
+              b"if (",
+              a,
+              b" < ",
+              int_literal(width_min(w)),
+              b" || ",
+              a,
+              b" > ",
+              int_literal(width_max(w)),
+              refused(w),
+            ]),
+          )
+        };
+        typed_assigned(
+          p,
+          guarded,
+          v,
+          Bytes::concat_all([b"(", kind_c_type(SizedIntKind(w)), b")", a]),
+        )
+      },
+      _ -> unsupported_operator(p, printing, op),
+    }
+  } else { unsupported_operator(p, printing, op) }
+
+fn bool_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} =
+  if op == b"not" { typed_assigned(p, printing, v, Bytes::concat_all([b"!(", a, b")"])) }
+  else if op == b"eq" || op == b"ne" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([if op == b"ne" { b"!((" } else { b"((" }, a, b") == (", b, b"))"]),
+    )
+  } else if op == b"order" { typed_assigned(p, printing, v, signed_order(a, b)) }
+  else { unsupported_operator(p, printing, op) }
+
+fn float_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} =
+  if comparison(op) { typed_assigned(p, printing, v, infix(a, compare_c(op), b)) }
+  else if op == b"neg" { typed_assigned(p, printing, v, Bytes::concat_all([b"-(", a, b")"])) }
+  else if op == b"rem" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"fmod(", a, b", ", b, b")"]))
+  } else if op == b"sqrt" || op == b"floor" || op == b"ceil" {
+    typed_assigned(p, printing, v, Bytes::concat_all([op, b"(", a, b")"]))
+  } else if arithmetic(op) { typed_assigned(p, site(p, printing), v, infix(a, float_c(op), b)) }
+  else if op == b"bits" {
+    let t = temp(printing);
+    let read = line(
+      t.printing,
+      p.depth,
+      Bytes::concat_all([b"int64_t ", t.name, b" = ply_f64_bits(", a, b");"]),
+    );
+    typed_assigned(
+      p,
+      read,
+      v,
+      Bytes::concat_all([
+        b"((((uint64_t)",
+        t.name,
+        b" & UINT64_C(0x7FF0000000000000)) == UINT64_C(0x7FF0000000000000) && ((uint64_t)",
+        t.name,
+        b" & UINT64_C(0x000FFFFFFFFFFFFF)) != 0) ? INT64_C(0x7FF8000000000000) : ",
+        t.name,
+        b")",
+      ]),
+    )
+  } else { unsupported_operator(p, printing, op) }
+
+fn decimal_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} =
+  if op == b"lo" || op == b"hi" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(int64_t)(", a, b").", op]))
+  } else if op == b"scale" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"(int64_t)(((uint64_t)(", a, b").lo >> 16) & 0xFF)"]),
+    )
+  } else if comparison(op) {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"(ply_dec_order(", a, b", ", b, b") ", compare_c(op), b" 0)"]),
+    )
+  } else if op == b"order" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"ply_dec_order(", a, b", ", b, b")"]))
+  } else if op == b"add" || op == b"sub" || op == b"mul" {
+    let n = named(site(p, printing), v);
+    let call = if op == b"mul" { Bytes::concat_all([b"ply_dec_mul(", a, b", ", b]) } else {
+      Bytes::concat_all([b"ply_dec_add(", a, b", ", b, if op == b"sub" { b", 1" } else { b", 0" }])
+    };
+    line(
+      line(n.printing, p.depth, Bytes::concat_all([b"PlyDec ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        call,
+        b", &",
+        n.name,
+        b")) { rt_decimal_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    )
+  } else if op == b"rem" {
+    let zero = line(
+      site(p, printing),
+      p.depth,
+      Bytes::concat_all([
+        b"if (((uint64_t)(",
+        b,
+        b").lo >> 32) == 0 && (",
+        b,
+        b").hi == 0) { rt_by_zero_p(ctx, 1); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    typed_assigned(p, zero, v, Bytes::concat_all([b"ply_dec_rem(", a, b", ", b, b")"]))
+  } else if op == b"neg" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"ply_dec_negated(", a, b")"]))
+  } else { unsupported_operator(p, printing, op) }
+
+fn wide_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let part = |x: Bytes, half: Bytes| Bytes::concat_all([b"(", x, b").", half]);
+  let pairwise = |c: Bytes|
+    Bytes::concat_all([
+      b"((PlyWide){ ",
+      part(a, b"lo"),
+      b" ",
+      c,
+      b" ",
+      part(b, b"lo"),
+      b", ",
+      part(a, b"hi"),
+      b" ",
+      c,
+      b" ",
+      part(b, b"hi"),
+      b" })",
+    ]);
+  let order = Bytes::concat_all([
+    b"ply_wide_order(",
+    a,
+    b", ",
+    b,
+    b", ",
+    if w.signed { b"1" } else { b"0" },
+    b")",
+  ]);
+  let same = Bytes::concat_all([
+    b"(",
+    part(a, b"lo"),
+    b" == ",
+    part(b, b"lo"),
+    b" && ",
+    part(a, b"hi"),
+    b" == ",
+    part(b, b"hi"),
+    b")",
+  ]);
+  if op == b"lo" || op == b"hi" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(int64_t)", part(a, op)]))
+  } else if op == b"fits_int" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([
+        b"ply_wide_fits_int(",
+        a,
+        b", ",
+        if w.signed { b"1" } else { b"0" },
+        b")",
+      ]),
+    )
+  } else if op == b"eq" { typed_assigned(p, printing, v, same) }
+  else if op == b"ne" { typed_assigned(p, printing, v, b"!".concat(same)) } else if comparison(op) {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(", order, b" ", compare_c(op), b" 0)"]))
+  } else if op == b"order" { typed_assigned(p, printing, v, order) }
+  else if is_bitwise(op) { typed_assigned(p, printing, v, pairwise(bitwise_c_operator(op))) }
+  else if op == b"bitnot" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"((PlyWide){ ~", part(a, b"lo"), b", ~", part(a, b"hi"), b" })"]),
+    )
+  } else { wide_called(p, printing, v, op, w, a, b, count) }
+}
+
+fn wide_called(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let s = if w.signed { b"1" } else { b"0" };
+  let part = |x: Bytes, half: Bytes| Bytes::concat_all([b"(", x, b").", half]);
+  let failing = |at: Printing, condition: Bytes, report: Bytes|
+    line(
+      at,
+      p.depth,
+      Bytes::concat_all([b"if (", condition, b") { ", report, b"; ", p.leave, b" }"]),
+    );
+  let overflow = Bytes::concat_all([b"rt_overflow_p(ctx, ", ascii_of_int(overflow_code(op)), b")"]);
+  let operands = if op == b"neg" || op == b"checked_neg" { Bytes::concat_all([a, b", ", s]) }
+  else { Bytes::concat_all([a, b", ", b, b", ", s]) };
+  let declared = |at: Printing, names: Bytes|
+    line(at, p.depth, Bytes::concat_all([b"PlyWide ", names, b";"]));
+  if op == b"add" || op == b"sub" || op == b"mul" || op == b"neg" {
+    let n = named(site(p, printing), v);
+    failing(
+      declared(n.printing, n.name),
+      Bytes::concat_all([b"ply_wide_", op, b"(", operands, b", &", n.name, b")"]),
+      overflow,
+    )
+  } else if op == b"div" || op == b"rem" {
+    let n = named(site(p, printing), v);
+    let t = temp(n.printing);
+    let zero = failing(
+      declared(t.printing, Bytes::concat_all([n.name, b", ", t.name])),
+      Bytes::concat_all([part(b, b"lo"), b" == 0 && ", part(b, b"hi"), b" == 0"]),
+      if op == b"div" { b"rt_by_zero_p(ctx, 0)" } else { b"rt_by_zero_p(ctx, 1)" },
+    );
+    let quotient = if op == b"div" { n.name } else { t.name };
+    let remainder = if op == b"div" { t.name } else { n.name };
+    failing(
+      zero,
+      Bytes::concat_all([b"ply_wide_divrem(", operands, b", &", quotient, b", &", remainder, b")"]),
+      overflow,
+    )
+  } else if shift(op) {
+    let c = temp(site(p, printing));
+    let held = line(
+      c.printing,
+      p.depth,
+      Bytes::concat_all([b"int64_t ", c.name, b" = ", count, b";"]),
+    );
+    let guarded = failing(
+      held,
+      Bytes::concat_all([b"(uint64_t)", c.name, b" >= 128"]),
+      Bytes::concat_all([
+        b"rt_shift_count_p(ctx, ",
+        c.name,
+        b", ",
+        ascii_of_int(width_index(w)),
+        b")",
+      ]),
+    );
+    typed_assigned(p, guarded, v, if op == b"shl" {
+      Bytes::concat_all([b"ply_wide_shl(", a, b", ", c.name, b")"])
+    } else {
+      Bytes::concat_all([
+        b"ply_wide_shr(",
+        a,
+        b", ",
+        c.name,
+        if op == b"shr" { Bytes::concat_all([b", ", s, b")"]) } else { b", 0)" },
+      ])
+    })
+  } else if op == b"wrap_add" || op == b"wrap_sub" || op == b"wrap_mul" {
+    let n = named(printing, v);
+    line(
+      declared(n.printing, n.name),
+      p.depth,
+      Bytes::concat_all([
+        b"(void)ply_wide_",
+        op.slice(5, op.len()),
+        b"(",
+        operands,
+        b", &",
+        n.name,
+        b");",
+      ]),
+    )
+  } else if op == b"saturating_add" || op == b"saturating_sub" || op == b"saturating_mul" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"ply_wide_sat_", op.slice(11, op.len()), b"(", operands, b")"]),
+    )
+  } else if op.starts_with(b"checked_") {
+    let t = temp(printing);
+    typed_assigned(
+      p,
+      declared(t.printing, t.name),
+      v,
+      Bytes::concat_all([
+        b"!ply_wide_",
+        op.slice(8, op.len()),
+        b"(",
+        operands,
+        b", &",
+        t.name,
+        b")",
+      ]),
+    )
+  } else if op == b"rotl" || op == b"rotr" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"ply_wide_", op, b"(", a, b", ", count, b")"]),
+    )
+  } else if op == b"to_int" {
+    let held = failing(
+      site(p, printing),
+      Bytes::concat_all([b"!ply_wide_fits_int(", a, b", ", s, b")"]),
+      Bytes::concat_all([
+        b"rt_not_an_int_wide_p(ctx, (int64_t)",
+        part(a, b"lo"),
+        b", (int64_t)",
+        part(a, b"hi"),
+        b", ",
+        s,
+        b")",
+      ]),
+    );
+    typed_assigned(p, held, v, Bytes::concat_all([b"(int64_t)", part(a, b"lo")]))
+  } else { unsupported_operator(p, printing, op) }
+}
+
+fn fits_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} = {
+  let u = |x: Bytes| Bytes::concat_all([b"(uint64_t)(", x, b")"]);
+  if op == b"checked_neg" {
+    typed_assigned(p, printing, v, if w.signed { Bytes::concat_all([b"((", a, b") != INT64_MIN)"]) }
+    else { Bytes::concat_all([b"(", u(a), b" == 0)"]) })
+  } else if w.signed {
+    let t = temp(printing);
+    let held = line(t.printing, p.depth, Bytes::concat_all([b"int64_t ", t.name, b";"]));
+    let f = if op == b"checked_add" { b"ply_add_ov" }
+    else if op == b"checked_sub" { b"ply_sub_ov" }
+    else { b"ply_mul_ov" };
+    typed_assigned(
+      p,
+      held,
+      v,
+      Bytes::concat_all([b"!", f, b"((int64_t)(", a, b"), (int64_t)(", b, b"), &", t.name, b")"]),
+    )
+  } else if op == b"checked_add" {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([b"(", u(a), b" + ", u(b), b" >= ", u(a), b")"]),
+    )
+  } else if op == b"checked_sub" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(", u(a), b" >= ", u(b), b")"]))
+  } else {
+    typed_assigned(
+      p,
+      printing,
+      v,
+      Bytes::concat_all([
+        b"(",
+        u(a),
+        b" == 0 || ",
+        u(a),
+        b" * ",
+        u(b),
+        b" / ",
+        u(a),
+        b" == ",
+        u(b),
+        b")",
+      ]),
+    )
+  }
+}
+
+fn word_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  a: Bytes,
+  b: Bytes,
+) -> Printing / {abort.raise} =
+  if comparison(op) { typed_assigned(p, printing, v, infix(a, compare_c(op), b)) }
+  else if op == b"char_code" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"((int64_t)((uint64_t)(", a, b") >> 3))"]))
+  } else if op == b"bytes_eq" { typed_assigned(p, printing, v, bytes_equal(a, b)) }
+  else if op == b"bytes_ne" { typed_assigned(p, printing, v, b"!".concat(bytes_equal(a, b))) }
+  else if op == b"order" { typed_assigned(p, printing, v, signed_order(a, b)) }
+  else if op == b"bytes_order" {
+    let lx = temp(printing);
+    let ly = temp(
+      line(
+        lx.printing,
+        p.depth,
+        Bytes::concat_all([b"int64_t ", lx.name, b" = (int64_t)", text_field(a, b"len"), b";"]),
+      ),
+    );
+    let n = named(
+      line(
+        ly.printing,
+        p.depth,
+        Bytes::concat_all([b"int64_t ", ly.name, b" = (int64_t)", text_field(b, b"len"), b";"]),
+      ),
+      v,
+    );
+    let x = lx.name;
+    let y = ly.name;
+    line(
+      line(
+        n.printing,
+        p.depth,
+        Bytes::concat_all([
+          b"int64_t ",
+          n.name,
+          b" = (int64_t)memcmp(",
+          bytes_of(a),
+          b", ",
+          bytes_of(b),
+          b", (size_t)(",
+          x,
+          b" < ",
+          y,
+          b" ? ",
+          x,
+          b" : ",
+          y,
+          b"));",
+        ]),
+      ),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        n.name,
+        b" == 0) ",
+        n.name,
+        b" = (",
+        x,
+        b" > ",
+        y,
+        b") - (",
+        x,
+        b" < ",
+        y,
+        b");",
+      ]),
+    )
+  } else { unsupported_operator(p, printing, op) }
+
+fn width_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let t_c = kind_c_type(SizedIntKind(w));
+  let narrowed = |q: Printing, wide: Bytes| {
+    let g = line(
+      q,
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        wide,
+        b" < ",
+        int_literal(width_min(w)),
+        b" || ",
+        wide,
+        b" > ",
+        int_literal(width_max(w)),
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    typed_assigned(p, g, v, Bytes::concat_all([b"(", t_c, b")", wide]))
+  };
+  if op.starts_with(b"checked_") { fits_printed(p, printing, v, op, w, a, b) }
+  else if arithmetic(op) && w.bits < 64 {
+    let t = temp(site(p, printing));
+    if op == b"add" || op == b"sub" {
+      narrowed(
+        line(
+          t.printing,
+          p.depth,
+          Bytes::concat_all([
+            b"int64_t ",
+            t.name,
+            b" = (int64_t)(",
+            a,
+            if op == b"add" { b") + (int64_t)(" } else { b") - (int64_t)(" },
+            b,
+            b");",
+          ]),
+        ),
+        t.name,
+      )
+    } else if op == b"mul" {
+      let declared = line(t.printing, p.depth, Bytes::concat_all([b"int64_t ", t.name, b";"]));
+      narrowed(
+        line(
+          declared,
+          p.depth,
+          Bytes::concat_all([
+            b"if (ply_mul_ov((int64_t)(",
+            a,
+            b"), (int64_t)(",
+            b,
+            b"), &",
+            t.name,
+            b")) { rt_overflow_p(ctx, ",
+            ascii_of_int(overflow_code(op)),
+            b"); ",
+            p.leave,
+            b" }",
+          ]),
+        ),
+        t.name,
+      )
+    } else {
+      let zero = line(
+        t.printing,
+        p.depth,
+        Bytes::concat_all([
+          b"if ((int64_t)(",
+          b,
+          b") == 0) { rt_by_zero_p(ctx, ",
+          if op == b"div" { b"0" } else { b"1" },
+          b"); ",
+          p.leave,
+          b" }",
+        ]),
+      );
+      narrowed(
+        line(
+          zero,
+          p.depth,
+          Bytes::concat_all([
+            b"int64_t ",
+            t.name,
+            b" = (int64_t)(",
+            a,
+            if op == b"div" { b") / (int64_t)(" } else { b") % (int64_t)(" },
+            b,
+            b");",
+          ]),
+        ),
+        t.name,
+      )
+    }
+  } else if op == b"add" || op == b"sub" {
+    let n = named(site(p, printing), v);
+    let over = if w.signed {
+      Bytes::concat_all([
+        if op == b"add" { b"ply_add_ov(" } else { b"ply_sub_ov(" },
+        a,
+        b", ",
+        b,
+        b", &",
+        n.name,
+        b")",
+      ])
+    } else {
+      Bytes::concat_all([
+        b"(",
+        n.name,
+        b" = (uint64_t)(",
+        a,
+        if op == b"add" { b") + (uint64_t)(" } else { b") - (uint64_t)(" },
+        b,
+        b"), ",
+        if op == b"add" { Bytes::concat_all([n.name, b" < (uint64_t)(", a, b"))"]) }
+        else { Bytes::concat_all([b"(uint64_t)(", a, b") < (uint64_t)(", b, b"))"]) },
+      ])
+    };
+    line(
+      line(n.printing, p.depth, Bytes::concat_all([t_c, b" ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        over,
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    )
+  } else if op == b"mul" {
+    let n = named(site(p, printing), v);
+    let u = |x: Bytes| Bytes::concat_all([b"(uint64_t)(", x, b")"]);
+    let over = if w.signed {
+      Bytes::concat_all([b"ply_mul_ov((int64_t)(", a, b"), (int64_t)(", b, b"), &", n.name, b")"])
+    } else {
+      Bytes::concat_all([
+        b"(",
+        n.name,
+        b" = ",
+        u(a),
+        b" * ",
+        u(b),
+        b", ",
+        u(a),
+        b" != 0 && ",
+        n.name,
+        b" / ",
+        u(a),
+        b" != ",
+        u(b),
+        b")",
+      ])
+    };
+    line(
+      line(n.printing, p.depth, Bytes::concat_all([t_c, b" ", n.name, b";"])),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        over,
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    )
+  } else if op == b"div" || op == b"rem" {
+    let zero = line(
+      site(p, printing),
+      p.depth,
+      Bytes::concat_all([
+        b"if ((",
+        t_c,
+        b")(",
+        b,
+        b") == 0) { rt_by_zero_p(ctx, ",
+        if op == b"div" { b"0" } else { b"1" },
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    let past = if !w.signed { zero } else {
+      line(
+        zero,
+        p.depth,
+        Bytes::concat_all([
+          b"if ((int64_t)(",
+          b,
+          b") == -1 && (int64_t)(",
+          a,
+          b") == INT64_MIN) { rt_overflow_p(ctx, ",
+          ascii_of_int(overflow_code(op)),
+          b"); ",
+          p.leave,
+          b" }",
+        ]),
+      )
+    };
+    typed_assigned(
+      p,
+      past,
+      v,
+      Bytes::concat_all([
+        b"(",
+        t_c,
+        b")((",
+        t_c,
+        b")(",
+        a,
+        if op == b"div" { b") / (" } else { b") % (" },
+        t_c,
+        b")(",
+        b,
+        b"))",
+      ]),
+    )
+  } else if is_bitwise(op) { typed_assigned(p, printing, v, infix(a, bitwise_c_operator(op), b)) }
+  else if shift(op) { shifted(p, printing, v, op, Some(w), a, count) } else if op == b"bitnot" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"(", t_c, b") ~(", a, b")"]))
+  } else if op == b"ne" {
+    typed_assigned(p, printing, v, Bytes::concat_all([b"!((", a, b") == (", b, b"))"]))
+  } else if comparison(op) { typed_assigned(p, printing, v, infix(a, compare_c(op), b)) }
+  else if op == b"order" { typed_assigned(p, printing, v, signed_order(a, b)) }
+  else if op == b"neg" && w.bits < 64 {
+    let t = temp(site(p, printing));
+    narrowed(
+      line(
+        t.printing,
+        p.depth,
+        Bytes::concat_all([b"int64_t ", t.name, b" = -(int64_t)(", a, b");"]),
+      ),
+      t.name,
+    )
+  } else if op == b"neg" {
+    let guarded = line(
+      site(p, printing),
+      p.depth,
+      Bytes::concat_all([
+        b"if (",
+        a,
+        if w.signed { b" == INT64_MIN" } else { b" != 0" },
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    typed_assigned(p, guarded, v, Bytes::concat_all([b"-(", a, b")"]))
+  } else if op == b"wrap_add" || op == b"wrap_sub" || op == b"wrap_mul" {
+    let u = unsigned_c_type(w);
+    typed_assigned(
+      p,
+      site(p, printing),
+      v,
+      Bytes::concat_all([
+        b"(",
+        u,
+        b")((uint64_t)(",
+        u,
+        b")(",
+        a,
+        b") ",
+        if op == b"wrap_add" { b"+" } else if op == b"wrap_sub" { b"-" } else { b"*" },
+        b" (uint64_t)(",
+        u,
+        b")(",
+        b,
+        b"))",
+      ]),
+    )
+  } else if op == b"rotl" || op == b"rotr" { rotated(p, printing, v, op, w, a, count) }
+  else if op == b"saturating_add" || op == b"saturating_sub" || op == b"saturating_mul" {
+    if w.bits == 64 { saturated_word(p, printing, v, op, w, a, b) }
+    else { saturated(p, printing, v, op, w, a, b) }
+  } else if op == b"to_int" {
+    let s = site(p, printing);
+    let held = if w.signed || w.bits < 64 { s } else {
+      line(
+        s,
+        p.depth,
+        Bytes::concat_all([
+          b"if ((uint64_t)(",
+          a,
+          b") > (uint64_t)INT64_MAX) { rt_not_an_int_p(ctx, (int64_t)(",
+          a,
+          b")); ",
+          p.leave,
+          b" }",
+        ]),
+      )
+    };
+    typed_assigned(p, held, v, Bytes::concat_all([b"(int64_t)(", a, b")"]))
+  } else if op == b"exact_add" || op == b"exact_sub" || op == b"exact_mul" || op == b"exact_neg" {
+    let wide = |e: Bytes| Bytes::concat_all([b"(", c_type(v.representation), b")(", e, b")"]);
+    typed_assigned(p, site(p, printing), v, if op == b"exact_neg" { b"-".concat(wide(a)) } else {
+      Bytes::concat_all([
+        wide(a),
+        if op == b"exact_add" { b" + " } else if op == b"exact_sub" { b" - " } else { b" * " },
+        wide(b),
+      ])
+    })
+  } else { unsupported_operator(p, printing, op) }
+}
+
+fn rotated(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  count: Bytes,
+) -> Printing = {
+  let u = unsigned_c_type(w);
+  let bits = ascii_of_int(w.bits);
+  let k = temp(site(p, printing));
+  let turned = line(
+    k.printing,
+    p.depth,
+    Bytes::concat_all([
+      b"int64_t ",
+      k.name,
+      b" = ((",
+      if op == b"rotl" { b"-" } else { b"" },
+      b"((",
+      count,
+      b") % ",
+      bits,
+      b")) % ",
+      bits,
+      b" + ",
+      bits,
+      b") % ",
+      bits,
+      b";",
+    ]),
+  );
+  typed_assigned(
+    p,
+    turned,
+    v,
+    Bytes::concat_all([
+      b"(",
+      u,
+      b")(",
+      k.name,
+      b" == 0 ? (",
+      u,
+      b")(",
+      a,
+      b") : ((",
+      u,
+      b")(",
+      a,
+      b") >> ",
+      k.name,
+      b") | ((",
+      u,
+      b")(",
+      a,
+      b") << (",
+      bits,
+      b" - ",
+      k.name,
+      b")))",
+    ]),
+  )
+}
+
+fn saturated_word(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+) -> Printing = {
+  let r = temp(site(p, printing));
+  let held = if w.signed {
+    let past = if op == b"saturating_add" { Bytes::concat_all([b"(", b, b") > 0"]) }
+    else if op == b"saturating_sub" { Bytes::concat_all([b"(", b, b") < 0"]) }
+    else { Bytes::concat_all([b"((", a, b") < 0) == ((", b, b") < 0)"]) };
+    Bytes::concat_all([
+      b"int64_t ",
+      r.name,
+      b"; if (",
+      if op == b"saturating_add" { b"ply_add_ov" }
+      else if op == b"saturating_sub" { b"ply_sub_ov" }
+      else { b"ply_mul_ov" },
+      b"(",
+      a,
+      b", ",
+      b,
+      b", &",
+      r.name,
+      b")) ",
+      r.name,
+      b" = ",
+      past,
+      b" ? INT64_MAX : INT64_MIN;",
+    ])
+  } else {
+    let x = Bytes::concat_all([b"(uint64_t)(", a, b")"]);
+    let y = Bytes::concat_all([b"(uint64_t)(", b, b")"]);
+    if op == b"saturating_sub" {
+      Bytes::concat_all([
+        b"uint64_t ",
+        r.name,
+        b" = ",
+        x,
+        b" < ",
+        y,
+        b" ? 0 : ",
+        x,
+        b" - ",
+        y,
+        b";",
+      ])
+    } else if op == b"saturating_add" {
+      Bytes::concat_all([
+        b"uint64_t ",
+        r.name,
+        b" = ",
+        x,
+        b" + ",
+        y,
+        b"; if (",
+        r.name,
+        b" < ",
+        x,
+        b") ",
+        r.name,
+        b" = UINT64_MAX;",
+      ])
+    } else {
+      Bytes::concat_all([
+        b"uint64_t ",
+        r.name,
+        b" = ",
+        x,
+        b" * ",
+        y,
+        b"; if (",
+        x,
+        b" != 0 && ",
+        r.name,
+        b" / ",
+        x,
+        b" != ",
+        y,
+        b") ",
+        r.name,
+        b" = UINT64_MAX;",
+      ])
+    }
+  };
+  typed_assigned(p, line(r.printing, p.depth, held), v, r.name)
+}
+
+fn saturated(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+) -> Printing = {
+  let unsigned = !w.signed && op == b"saturating_mul";
+  let wide = if unsigned { b"uint64_t" } else { b"int64_t" };
+  let r = temp(site(p, printing));
+  let exact = line(
+    r.printing,
+    p.depth,
+    Bytes::concat_all([
+      wide,
+      b" ",
+      r.name,
+      b" = (",
+      wide,
+      b")(",
+      a,
+      b")",
+      if op == b"saturating_add" { b" + " }
+      else if op == b"saturating_sub" { b" - " }
+      else { b" * " },
+      b"(",
+      wide,
+      b")(",
+      b,
+      b");",
+    ]),
+  );
+  let top = Bytes::concat_all([
+    r.name,
+    b" > ",
+    if unsigned { b"(uint64_t)" } else { b"" },
+    int_literal(width_max(w)),
+    b" ? ",
+    int_literal(width_max(w)),
+    b" : ",
+    r.name,
+  ]);
+  typed_assigned(
+    p,
+    exact,
+    v,
+    Bytes::concat_all([
+      b"(",
+      kind_c_type(SizedIntKind(w)),
+      b")(",
+      if unsigned { top } else {
+        Bytes::concat_all([
+          r.name,
+          b" < ",
+          int_literal(width_min(w)),
+          b" ? ",
+          int_literal(width_min(w)),
+          b" : (",
+          top,
+          b")",
+        ])
+      },
+      b")",
+    ]),
+  )
+}
+
+fn shifted(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  op: Bytes,
+  width: Option<Width>,
+  a: Bytes,
+  count: Bytes,
+) -> Printing = {
+  let c = temp(site(p, printing));
+  let held = line(
+    c.printing,
+    p.depth,
+    Bytes::concat_all([b"int64_t ", c.name, b" = ", count, b";"]),
+  );
+  let guarded = line(
+    held,
+    p.depth,
+    Bytes::concat_all([
+      b"if ((uint64_t)",
+      c.name,
+      b" >= (uint64_t)",
+      ascii_of_int(match width { Some(w) -> w.bits, None -> 64 }),
+      b") { rt_shift_count_p(ctx, ",
+      c.name,
+      b", ",
+      match width { Some(w) -> ascii_of_int(width_index(w)), None -> b"-1" },
+      b"); ",
+      p.leave,
+      b" }",
+    ]),
+  );
+  let n = c.name;
+  typed_assigned(p, guarded, v, match width {
+    Some(w) -> {
+      let u = unsigned_c_type(w);
+      if op == b"shl" { Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") << ", n, b")"]) }
+      else if op == b"shr" && w.signed { Bytes::concat_all([b"(", a, b") >> ", n]) }
+      else { Bytes::concat_all([b"(", u, b")((", u, b")(", a, b") >> ", n, b")"]) }
+    },
+    None -> if op == b"shl" { Bytes::concat_all([b"(int64_t)((uint64_t)(", a, b") << ", n, b")"]) }
+    else if op == b"shr" { Bytes::concat_all([b"(", a, b") >> ", n]) }
+    else { Bytes::concat_all([b"(int64_t)((uint64_t)(", a, b") >> ", n, b")"]) },
+  })
+}
+
+fn ordering(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  s: Bytes,
+) -> Printing / {abort.raise} =
+  match v.representation {
+    AsSum(c) ->
+      typed_assigned(
+        p,
+        printing,
+        v,
+        Bytes::concat_all([
+          s,
+          b" < 0 ? ",
+          case_at(c.cases, less_constructor()),
+          b" : ",
+          s,
+          b" == 0 ? ",
+          case_at(c.cases, equal_constructor()),
+          b" : ",
+          case_at(c.cases, greater_constructor()),
+        ]),
+      ),
+    _ -> unsupported(b"an `Ordering` held other than as its cases", c_type(v.representation)),
+  }
+
+fn sign_printed(
+  p: InstructionContext,
+  printing: Printing,
+  v: Var,
+  on: Representation,
+  o: Bytes,
+) -> Printing / {abort.raise} =
+  match on {
+    AsSum(c) ->
+      typed_assigned(
+        p,
+        printing,
+        v,
+        Bytes::concat_all([
+          b"(",
+          o,
+          b" == ",
+          case_at(c.cases, less_constructor()),
+          b" ? -1 : ",
+          o,
+          b" == ",
+          case_at(c.cases, equal_constructor()),
+          b" ? 0 : 1)",
+        ]),
+      ),
+    _ -> unsupported(b"an `Ordering` held other than as its cases", c_type(on)),
+  }
+
+fn case_at(cases: List<Bytes>, name: Bytes) -> Bytes =
+  ascii_of_int(
+    range(0, cases.len()).fold(0, |k: Int, i: Int| if cases.at(i) == Some(name) { i } else { k }),
+  )
+
+fn signed_order(x: Bytes, y: Bytes) -> Bytes =
+  Bytes::concat_all([b"(int64_t)((", x, b") > (", y, b")) - (int64_t)((", x, b") < (", y, b"))"])
+
+fn bytes_equal(x: Bytes, y: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"(",
+    x,
+    b" == ",
+    y,
+    b" || (",
+    text_field(x, b"len"),
+    b" == ",
+    text_field(y, b"len"),
+    b" && memcmp(",
+    bytes_of(x),
+    b", ",
+    bytes_of(y),
+    b", ",
+    text_field(x, b"len"),
+    b") == 0))",
+  ])
+
+fn int_text(printing: Printing, a: Arg) -> Bytes =
+  match operand_representation(a) {
+    AsFixed(_) -> Bytes::concat_all([b"(int64_t)(", arg_text(printing, a), b")"]),
+    _ -> arg_text(printing, a),
+  }
+
+fn literal_divisor(d: Option<Arg>) -> Bool =
+  match d { Some(IntOperand(n)) -> n != 0 && n != 0 - 1, _ -> false }
+
+fn compare_c(op: Bytes) -> Bytes =
+  if op == b"lt" { b"<" }
+  else if op == b"le" { b"<=" }
+  else if op == b"gt" { b">" }
+  else if op == b"ge" { b">=" }
+  else if op == b"eq" { b"==" }
+  else { b"!=" }
+
+fn float_c(op: Bytes) -> Bytes =
+  if op == b"add" { b"+" } else if op == b"sub" { b"-" } else if op == b"mul" { b"*" } else { b"/" }
+
+fn place() -> InstructionContext =
+  {
+    u: {
+      base: 0,
+      result: AsInt,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+      unwinds: [],
+      symbol: b"f",
+      epilogue: b"",
+    },
+    at: span_between(0, 4),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, ty: Type, rep: Representation) -> Var = { id: id, ty: ty, representation: rep }
+
+fn printed_primitive(
+  names: Map<Int, Bytes>,
+  v: Var,
+  op: Bytes,
+  on: Representation,
+  args: List<Arg>,
+) -> Bytes / {abort.raise} =
+  pieces_text(
+    primitive(place(), empty_printing(names), Some(v), { op: op, on: on, args: args }).out,
+  )
+
+test "an order's sign is made the case of `Ordering` it names, read back off it, and an `Ordering` is held as nothing else" {
+  let index = AsSum({
+    layout: sum_layout(range(0, 3).map(|_: Int| { args: record_layout([]), indirect: false })),
+    cases: [b"Less", b"Equal", b"Greater"],
+  });
+  let made = printed_primitive(
+    Map::new().insert(0, b"p0"),
+    local(1, ordering_type(), index),
+    b"ordering",
+    AsInt,
+    [VarOperand(local(0, int_type(), AsInt))],
+  );
+  let sign = |rep: Representation|
+    printed_primitive(Map::new().insert(0, b"p0"), local(1, int_type(), AsInt), b"sign", rep, [
+      VarOperand(local(0, ordering_type(), rep)),
+    ]);
+  assert_eq(
+    [made, sign(index)].map(|c: Bytes|
+      c.index_of(b"rt_") == None && c.index_of(b"ply_obj") == None),
+    [true, true],
+  );
+  let word = b"unprinted an `Ordering` held other than as its cases";
+  let word_made = handle {
+    printed_primitive(
+      Map::new().insert(0, b"p0"),
+      local(1, ordering_type(), AsWord),
+      b"ordering",
+      AsInt,
+      [VarOperand(local(0, int_type(), AsInt))],
+    )
+  } with {
+    abort.raise(m) -> Bytes::of_string(m),
+  };
+  let read = handle { sign(AsWord) } with { abort.raise(m) -> Bytes::of_string(m) };
+  assert_eq([word_made.starts_with(word), read.starts_with(word)], [true, true])
+}
+
+test "a decimal's constant is its two words in place, `()` the word 0, and no constant is read at run time" {
+  let decimal = printed_primitive(
+    Map::new(),
+    local(0, decimal_type(), AsDecimal),
+    b"decimal",
+    AsInt,
+    [IntOperand(65536), IntOperand(0)],
+  );
+  assert(
+    decimal.index_of(b"INT64_C(65536)") != None && decimal.index_of(b"rt_") == None,
+    Some(String::of_bytes_lossy(decimal)),
+  );
+  let unit = literal(
+    place(),
+    empty_printing(Map::new()),
+    Some(local(0, unit_type(), AsWord)),
+    LiteralUnit,
+  );
+  assert(
+    pieces_text(unit.out).index_of(b" = 0;") != None,
+    Some(String::of_bytes_lossy(pieces_text(unit.out))),
+  );
+  let said = handle {
+    literal(
+      place(),
+      empty_printing(Map::new()),
+      Some(local(1, string_type(), AsWord)),
+      LiteralString(b"a"),
+    );
+    b""
+  } with {
+    abort.raise(m) -> Bytes::of_string(m),
+  };
+  assert(said.starts_with(b"unprinted a literal the folded pass did not lay out"), None)
+}
+
+test "two strings are equal where their bytes are, and two characters as C compares their words" {
+  let names = Map::new().insert(0, b"p0").insert(1, b"p1");
+  let s = |id: Int| VarOperand(local(id, string_type(), AsWord));
+  let strings = printed_primitive(names, local(2, bool_type(), AsBool), b"bytes_ne", AsWord, [
+    s(0),
+    s(1),
+  ]);
+  assert(
+    strings.index_of(b"memcmp(") != None && strings.index_of(b"rt_") == None,
+    Some(String::of_bytes_lossy(strings)),
+  );
+  let c = |id: Int| VarOperand(local(id, char_type(), AsWord));
+  let chars = printed_primitive(names, local(2, bool_type(), AsBool), b"le", AsWord, [c(0), c(1)]);
+  assert(
+    chars.index_of(b"<=") != None && chars.index_of(b"rt_") == None,
+    Some(String::of_bytes_lossy(chars)),
+  )
+}

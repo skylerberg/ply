@@ -6,36 +6,37 @@ import compiler.front.diagnostics (parse_all)
 import compiler.front.facts (Analysis)
 import compiler.front.seam (Analysed, Refused)
 import compiler.front.published (ClaimClause, analyse, claims)
-import compiler.syntax.items (SCost, SEnsures, SRequires)
-import context (Context, Claims, Law, Def, claims_of, context, ends, unfoldable, self_recursive)
-import decide (Decision, Proved, GuardUnsatisfiable, Unknown, Diagnosed, Static, Certified,
-               Unwitnessed, GuardRefuted, Undecided, static_of, decide, decide_and_diagnose)
-import domain (Ty, Fn)
+import compiler.syntax.items (CostClause, EnsuresClause, RequiresClause)
+import context (Context, Claims, Law, Definition, claims_of, context, terminates, unfoldable,
+                self_recursive)
+import decide (Decision, Proved, GuardUnsatisfiable, Unknown, Diagnosis, StaticResult, Certified,
+               Unwitnessed, GuardRefuted, Undecided, to_static_result, decide, decide_and_diagnose)
+import domain (Sort, FunctionSort)
 import goal (Goal, Binder, Limits, Proof, BudgetSpent, default_limits, default_prove_budget,
              default_unfold_depth)
-import kernel (checked, refusal)
-import statics (Prover, Unshown, prover_of, unshown)
-import statics
+import kernel (check_induction, refusal)
+import static_prover (Prover, UnprovedMeasure, prover_of, unproved_measures)
+import static_prover
 import lower (Blocker, BitOperator, DecimalArithmetic)
 import rules (Rule, LinearArithmetic, Propositional, Congruence, Injectivity, CaseSplit, Unfold,
               Induction, Cited, Descent, Spine)
-import sort (canonical, int_ty)
-import world
-import world (Built, Obligation, Signature, world_of)
+import sort (canonical, int_sort)
+import prover_input
+import prover_input (ProverInputResult, Obligation, Signature, prover_input_of)
 import obligation (Builds)
 import std.list
 import std.string
 
-type Fixture = { cx: Context, built: Built, claims: Claims }
+type Fixture = { context: Context, built: ProverInputResult, claims: Claims }
 
 fn fixture(src: String) -> Fixture / {abort.raise} = {
   let sources = [{ name: b"m", src: Bytes::of_string(src) }];
   match analyse(parse_all(sources)) {
     Refused(_) -> panic("the fixture checks"),
     Analysed(w) -> {
-      let built = world_of(w, world::every);
+      let built = prover_input_of(w, prover_input::every);
       let cs = claims_of(claims(sources));
-      { cx: context(cs, built.world), built: built, claims: cs }
+      { context: context(cs, built.world), built: built, claims: cs }
     },
   }
 }
@@ -56,7 +57,7 @@ fn law_goal(f: Fixture, label: String) -> Goal / {abort.raise} =
         partial: false,
         identities: law_identities(f, label),
         contracts: [],
-        inducting: None,
+        induction_hypothesis: None,
         builds: None,
         tainted: [],
       },
@@ -73,19 +74,19 @@ fn law_binders(f: Fixture, label: String) -> List<Binder> =
   match f.built.world.obligations.fold(None, |acc: Option<Obligation>, o: Obligation|
       match acc { Some(_) -> acc, None -> if o.owner == owner(label) { Some(o) } else { None } }) {
     Some(o) ->
-      o.binders.map(|binder: world::Binder| { name: binder.name, ty: canonical(binder.ty) }),
+      o.binders.map(|binder: prover_input::Binder| { name: binder.name, ty: canonical(binder.ty) }),
     // A law with no binders owes no obligation row of its own.
     None -> [],
   }
 
 fn attempt(f: Fixture, label: String) -> Decision / {abort.raise} =
-  decide(f.cx, law_goal(f, label), default_limits())
+  decide(f.context, law_goal(f, label), default_limits())
 
 fn attempt_with(f: Fixture, label: String, limits: Limits) -> Decision / {abort.raise} =
-  decide(f.cx, law_goal(f, label), limits)
+  decide(f.context, law_goal(f, label), limits)
 
-fn diagnosed(f: Fixture, label: String) -> Diagnosed / {abort.raise} =
-  decide_and_diagnose(f.cx, law_goal(f, label), default_limits())
+fn diagnosed(f: Fixture, label: String) -> Diagnosis / {abort.raise} =
+  decide_and_diagnose(f.context, law_goal(f, label), default_limits())
 
 fn proof(f: Fixture, label: String) -> Proof / {abort.raise} =
   match diagnosed(f, label) {
@@ -601,7 +602,7 @@ fn clause_binders(f: Fixture, name: String) -> List<Binder> / {abort.raise} =
   match f.built.world.signatures.fold(None, |acc: Option<Signature>, s: Signature|
       match acc { Some(_) -> acc, None -> if s.name == owner(name) { Some(s) } else { None } }) {
     Some(s) -> match canonical(s.ty) {
-      Fn(params, ret, _) ->
+      FunctionSort(params, ret, _) ->
         range(0, params.len() + 1).map(|i: Int|
           { name: "_" ++ i.to_string(), ty: match params.at(i) { Some(p) -> p, None -> ret } }),
       _ -> panic("`" ++ name ++ "` is not a function"),
@@ -609,20 +610,24 @@ fn clause_binders(f: Fixture, name: String) -> List<Binder> / {abort.raise} =
     None -> panic("no signature for " ++ name),
   }
 
-fn def_of(f: Fixture, name: String) -> Def / {abort.raise} =
-  match f.claims.defs.get(owner(name)) { Some(d) -> d, None -> panic("no definition " ++ name) }
+fn definition_of(f: Fixture, name: String) -> Definition / {abort.raise} =
+  match f.claims.definitions.get(owner(name)) {
+    Some(d) -> d,
+    None -> panic("no definition " ++ name),
+  }
 
-fn clauses(d: Def, ensures: Bool) -> List<Option<Code>> =
+fn clauses(d: Definition, ensures: Bool) -> List<Option<Code>> =
   d.spec.filter(|c: ClaimClause|
-    match c.kind { SEnsures -> ensures, SRequires -> !ensures, _ -> false }).map(|c: ClaimClause|
-    Some(c.clause.code))
+    match c.kind { EnsuresClause -> ensures, RequiresClause -> !ensures, _ -> false }).map(
+    |c: ClaimClause| Some(c.clause.code),
+  )
 
 fn returns_zero(f: Fixture, name: String) -> Decision / {abort.raise} = {
-  let d = def_of(f, name);
+  let d = definition_of(f, name);
   decide(
-    f.cx,
+    f.context,
     {
-      binders: [{ name: "result", ty: int_ty() }],
+      binders: [{ name: "result", ty: int_sort() }],
       guards: [],
       result: Some(d.body),
       body: clauses(d, true).get(0),
@@ -631,7 +636,7 @@ fn returns_zero(f: Fixture, name: String) -> Decision / {abort.raise} = {
       partial: false,
       identities: [],
       contracts: [],
-      inducting: None,
+      induction_hypothesis: None,
       builds: None,
       tainted: [],
     },
@@ -641,9 +646,9 @@ fn returns_zero(f: Fixture, name: String) -> Decision / {abort.raise} = {
 
 fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
   let f = fixture(ledger());
-  let d = def_of(f, "withdraw");
+  let d = definition_of(f, "withdraw");
   decide(
-    f.cx,
+    f.context,
     {
       binders: clause_binders(f, "withdraw"),
       guards: clauses(d, false),
@@ -654,7 +659,7 @@ fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
       partial: false,
       identities: [],
       contracts: [],
-      inducting: None,
+      induction_hypothesis: None,
       builds: None,
       tainted: [],
     },
@@ -665,9 +670,10 @@ fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
 fn spends_its_budget(f: Fixture, label: String, limits: Limits) -> Bool / {abort.raise} =
   match attempt_with(f, label, limits) { Unknown(u) -> u.reason == BudgetSpent, _ -> false }
 
-fn inducted_on(p: Proof, binder: String, def: String) -> Bool =
+fn inducted_on(p: Proof, binder: String, definition: String) -> Bool =
   p.rules.fold(false, |found: Bool, r: Rule|
-    found || (match r { Induction(i) -> i.binder == binder && i.def == def, _ -> false }))
+    found
+      || (match r { Induction(i) -> i.binder == binder && i.definition == definition, _ -> false }))
 
 fn cites(p: Proof, label: String) -> Bool =
   p.rules.fold(false, |found: Bool, r: Rule|
@@ -715,7 +721,7 @@ test "a polymorphic proof records its sorts" {
   let p = proof(fixture(congruence()), "congruence is polymorphic");
   // `g: (a) -> b, u: a, v: a`, by number: naming them is the world's.
   assert_eq(p.sorts, [0, 1]);
-  match static_of({ decision: Proved(p), blockers: [] }, ["a", "b"]) {
+  match to_static_result({ decision: Proved(p), blockers: [] }, ["a", "b"]) {
     Certified(c) -> assert_eq(c.sorts, ["a", "b"]),
     Unwitnessed(c) -> assert_eq(c.sorts, ["a", "b"]),
     _ -> panic("a proof settles the claim"),
@@ -766,8 +772,8 @@ test "a non-recursive definition unfolds to the stated depth" {
 
 test "a recursive definition is unfolded only by induction" {
   let f = fixture(chain());
-  assert(unfoldable(f.cx, "m.countdown") == None);
-  assert(unfoldable(f.cx, "m.three") != None);
+  assert(unfoldable(f.context, "m.countdown") == None);
+  assert(unfoldable(f.context, "m.three") != None);
   assert(inducted_on(proof(f, "counting down counts"), "n", "m.countdown"));
   assert(inducted_on(proof(f, "doubling by recursion"), "n", "m.doubled"));
   // The base case is where a claim false below zero fails.
@@ -803,20 +809,20 @@ test "list patterns over literal spines are decided without induction" {
 test "only recursion the checker reads as ending is unrolled, and a stated measure once a proof shows it" {
   let f = fixture(chain());
   let p = proving(chain());
-  let ends_in = |cx: Context, name: String|
-    match self_recursive(cx, name) {
-      Some(_) -> ends(cx, name),
+  let ends_in = |context: Context, name: String|
+    match self_recursive(context, name) {
+      Some(_) -> terminates(context, name),
       None -> panic("a pure definition calling only itself"),
     };
-  assert(ends_in(f.cx, "m.countdown"));
-  assert(!ends(f.cx, "m.forever"));
+  assert(ends_in(f.context, "m.countdown"));
+  assert(!terminates(f.context, "m.forever"));
   // Halving under a positive guard is a descent the checker sees for itself.
-  assert(ends_in(f.cx, "m.halved"));
-  assert(!ends_in(f.cx, "m.climb"));
-  assert(!ends_in(f.cx, "m.lowered"));
-  assert(ends_in(p.prover.cx, "m.climb"));
-  assert(ends_in(p.prover.cx, "m.lowered"));
-  assert(!ends_in(p.prover.cx, "m.stall"));
+  assert(ends_in(f.context, "m.halved"));
+  assert(!ends_in(f.context, "m.climb"));
+  assert(!ends_in(f.context, "m.lowered"));
+  assert(ends_in(p.prover.context, "m.climb"));
+  assert(ends_in(p.prover.context, "m.lowered"));
+  assert(!ends_in(p.prover.context, "m.stall"));
   assert(not_proved(f, "a measured recursion counts"));
   assert(match decided_by(p, "m.a measured recursion counts") {
     Some(pr) -> inducted_on(pr, "n", "m.lowered"),
@@ -827,42 +833,65 @@ test "only recursion the checker reads as ending is unrolled, and a stated measu
 test "the kernel refuses an induction its record cannot stand behind, whatever its cases come to" {
   let f = fixture(chain());
   let counts = law_goal(f, "counting down counts");
-  let record = { binder: "n", slot: 0, scheme: Descent(1), defs: ["m.countdown"] };
-  assert(refusal(f.cx, counts, record) == None);
-  assert(match checked(f.cx, counts, record, default_limits(), default_prove_budget(), []).proof {
-    Some(pr) -> inducted_on(pr, "n", "m.countdown"),
-    None -> false,
-  });
+  let record = { binder: "n", slot: 0, scheme: Descent(1), definitions: ["m.countdown"] };
+  assert(refusal(f.context, counts, record) == None);
+  assert(
+    match check_induction(
+        f.context,
+        counts,
+        record,
+        default_limits(),
+        default_prove_budget(),
+        [],
+      ).proof {
+      Some(pr) -> inducted_on(pr, "n", "m.countdown"),
+      None -> false,
+    },
+  );
   // A hypothesis at the case it proves closes any step, so with it this false law would be proved.
   let false_law = law_goal(f, "every int is at most zero");
   let circular = { ..record, scheme: Descent(0) };
   assert_eq(
-    refusal(f.cx, false_law, circular),
+    refusal(f.context, false_law, circular),
     Some("the hypothesis is not below the case it proves"),
   );
   assert(
-    checked(f.cx, false_law, circular, default_limits(), default_prove_budget(), []).proof == None,
+    check_induction(
+        f.context,
+        false_law,
+        circular,
+        default_limits(),
+        default_prove_budget(),
+        [],
+      ).proof
+      == None,
   );
-  assert_eq(refusal(f.cx, counts, { ..record, scheme: Spine(1) }), Some("`n` is not a list"));
+  assert_eq(refusal(f.context, counts, { ..record, scheme: Spine(1) }), Some("`n` is not a list"));
   assert_eq(
-    refusal(f.cx, counts, { ..record, binder: "k" }),
+    refusal(f.context, counts, { ..record, binder: "k" }),
     Some("the claim's binder at 0 is `n`"),
   );
-  assert_eq(refusal(f.cx, counts, { ..record, slot: 3 }), Some("the claim has no binder at 3"));
+  assert_eq(
+    refusal(f.context, counts, { ..record, slot: 3 }),
+    Some("the claim has no binder at 3"),
+  );
   // A measure no proof has shown, and a definition whose row says it may not return.
   assert_eq(
-    refusal(f.cx, counts, { ..record, defs: ["m.stall"] }),
+    refusal(f.context, counts, { ..record, definitions: ["m.stall"] }),
     Some("the checker does not see every call `m.stall` makes of itself descend"),
   );
   assert_eq(
-    refusal(f.cx, counts, { ..record, defs: ["m.forever"] }),
+    refusal(f.context, counts, { ..record, definitions: ["m.forever"] }),
     Some("`m.forever` is not a pure definition calling only itself"),
   );
   assert_eq(
-    refusal(f.cx, counts, { ..record, defs: ["m.ping"] }),
+    refusal(f.context, counts, { ..record, definitions: ["m.ping"] }),
     Some("`m.ping` is not a pure definition calling only itself"),
   );
-  assert_eq(refusal(f.cx, counts, { ..record, defs: [] }), Some("it unrolls no definition"))
+  assert_eq(
+    refusal(f.context, counts, { ..record, definitions: [] }),
+    Some("it unrolls no definition"),
+  )
 }
 
 test "a proof uses each proved law above it in its module, and none below" {
@@ -945,19 +974,22 @@ test "a false claim beside a lemma, a list in view or a known constructor is nev
 
 test "a measure is shown where every call its group makes back into it descends, and only then" {
   let p = proving(chain());
-  let missing = unshown(p.analysis, world::every);
+  let missing = unproved_measures(p.analysis, prover_input::every);
   // `stall` calls itself at its own argument; `halved` halves, which the proof does not follow,
   // though the checker sees it end without its measure.
   // `tick` hands `tock` more than it had; `tock` hands back less.
-  assert_eq(missing.map(|u: Unshown| u.measure.owner), ["m.halved", "m.stall", "m.tick"]);
-  assert_eq(missing.map(|u: Unshown| u.ends), [true, false, false]);
-  assert(ends(p.prover.cx, "m.up") && ends(p.prover.cx, "m.across"));
+  assert_eq(missing.map(|u: UnprovedMeasure| u.measure.owner), ["m.halved", "m.stall", "m.tick"]);
+  assert_eq(missing.map(|u: UnprovedMeasure| u.ends), [true, false, false]);
+  assert(terminates(p.prover.context, "m.up") && terminates(p.prover.context, "m.across"));
   // A group the checker reads as ending by its measures ends only when every one of them is shown.
-  assert(match p.prover.cx.claims.defs.get("m.tock") { Some(d) -> d.stated, None -> false });
-  assert(!ends(p.prover.cx, "m.tock"))
+  assert(match p.prover.context.claims.definitions.get("m.tock") {
+    Some(d) -> d.stated,
+    None -> false,
+  });
+  assert(!terminates(p.prover.context, "m.tock"))
 }
 
-type Proving = { prover: Prover, built: Built, analysis: Analysis }
+type Proving = { prover: Prover, built: ProverInputResult, analysis: Analysis }
 
 /// A fixture with the run's prover over it, its measures decided.
 fn proving(src: String) -> Proving / {abort.raise} =
@@ -967,7 +999,7 @@ fn proving_all(sources: List<{ name: Bytes, src: Bytes }>) -> Proving / {abort.r
   match analyse(parse_all(sources)) {
     Refused(_) -> panic("the fixture checks"),
     Analysed(w) -> {
-      let built = world_of(w, world::every);
+      let built = prover_input_of(w, prover_input::every);
       {
         prover: prover_of(claims_of(claims(sources)), built.world, default_prove_budget()),
         built: built,
@@ -980,7 +1012,7 @@ fn proof_of(p: Proving, pick: (Obligation) -> Bool) -> Option<Proof> / {abort.ra
   match p.built.world.obligations.fold(None, |found: Option<Obligation>, o: Obligation|
       match found { Some(_) -> found, None -> if pick(o) { Some(o) } else { None } }) {
     None -> panic("no such obligation"),
-    Some(o) -> match statics::diagnosed(p.prover, o) {
+    Some(o) -> match static_prover::diagnosis_of(p.prover, o) {
       Some(d) -> match d.decision { Proved(pr) -> Some(pr), _ -> None },
       None -> None,
     },
@@ -1005,7 +1037,7 @@ test "two calls to an effectful definition are not one term" {
 }
 
 test "an effectful definition is never unfolded" {
-  assert(unfoldable(fixture(effectful()).cx, "m.shout") == None)
+  assert(unfoldable(fixture(effectful()).context, "m.shout") == None)
 }
 
 test "a literal match decides both directions" {
@@ -1037,9 +1069,9 @@ test "a postcondition over a definition decides both directions" {
 
 test "a postcondition without the definition is unknown" {
   let f = fixture(ledger());
-  let d = def_of(f, "withdraw");
+  let d = definition_of(f, "withdraw");
   let decision = decide(
-    f.cx,
+    f.context,
     {
       binders: clause_binders(f, "withdraw"),
       guards: [],
@@ -1050,7 +1082,7 @@ test "a postcondition without the definition is unknown" {
       partial: false,
       identities: [],
       contracts: [],
-      inducting: None,
+      induction_hypothesis: None,
       builds: None,
       tainted: [],
     },
@@ -1085,13 +1117,13 @@ test "a certificate needs the guard to admit a value" {
   let g = proof(f, "a guard nothing establishes");
   assert(!g.guard_satisfiable);
   // A kept case is what establishes it.
-  assert(match static_of({ decision: Proved(g), blockers: [] }, []) {
+  assert(match to_static_result({ decision: Proved(g), blockers: [] }, []) {
     Unwitnessed(_) -> true,
     _ -> false,
   });
   let u = proof(f, "an unguarded claim");
   assert(u.guard_satisfiable);
-  assert(match static_of({ decision: Proved(u), blockers: [] }, []) {
+  assert(match to_static_result({ decision: Proved(u), blockers: [] }, []) {
     Certified(_) -> true,
     _ -> false,
   })
@@ -1100,7 +1132,7 @@ test "a certificate needs the guard to admit a value" {
 test "an uninhabited domain does not establish satisfiability" {
   let p = proof(fixture(uninhabited()), "anything about nothing");
   assert(!p.guard_satisfiable);
-  assert(match static_of({ decision: Proved(p), blockers: [] }, []) {
+  assert(match to_static_result({ decision: Proved(p), blockers: [] }, []) {
     Unwitnessed(_) -> true,
     _ -> false,
   })

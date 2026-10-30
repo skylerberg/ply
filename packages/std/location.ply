@@ -1,0 +1,245 @@
+//! Locations in a document: a path of steps into its value, a line and column in its text, and the
+//! error a decoder returns with both.
+//!
+//! `std.toml` and `std.yaml` both use these types for paths, locations and errors, so a caller of
+//! either writes one kind of path and reads one kind of error. A path is a list of steps. Each step
+//! goes into a table or mapping by a string key, or into an array or sequence by an index. Lines
+//! and columns count from 1, and columns count characters. A `DecodeError` is built from the inside
+//! out. The innermost decoder states what was wrong, each decoder around it adds the step it took
+//! to the front of the path, and the reader that has the text adds the line and column.
+
+import std.list (prepend)
+import std.string
+import std.text (closest)
+
+/// One step from a value to a value inside it.
+pub type PathSegment =
+  /// Into a table or a mapping, by a string key.
+  | Key(String)
+  /// Into an array or a sequence, by an index from 0.
+  | Index(Int)
+
+/// A key as a path writes it.
+///
+/// A non-empty key of only ASCII letters, digits, `_` and `-` is written bare. Any other key is
+/// written in double quotes, with a backslash before each quote and backslash in it, and its line
+/// breaks written as `\n` and `\r`.
+pub fn key_to_string(name: String) -> String = {
+  let bare = name.len() > 0
+    && name.chars().fold(true, |so_far: Bool, c: Char|
+      so_far
+        && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+        || c == '-'));
+  if bare { name } else {
+    "\""
+      ++ String::join(
+        name.chars().map(|c: Char|
+          if c == '"' { "\\\"" }
+          else if c == '\\' { "\\\\" }
+          else if c == '\n' { "\\n" }
+          else if c == '\r' { "\\r" }
+          else { String::of_chars([c]) }),
+        "",
+      )
+      ++ "\""
+  }
+}
+
+/// A path as text: its keys separated by dots, and each index in brackets.
+pub fn path_to_string(path: List<PathSegment>) -> String =
+  path.fold("", |written: String, step: PathSegment|
+    match step {
+      Key(name) -> (if written == "" { "" } else { written ++ "." }) ++ key_to_string(name),
+      Index(i) -> written ++ "[" ++ i.to_string() ++ "]",
+    })
+
+/// A line and column in a text. Both count from 1, and the column counts characters.
+pub type Location = new { line: Int, column: Int }
+
+/// The line and column of the byte at `offset` in `src`. An offset outside the text moves to the
+/// nearest end.
+pub fn location_at(src: Bytes, offset: Int) -> Location = {
+  let n = src.len();
+  let upto = if offset < 0 { 0 } else if offset > n { n } else { offset };
+  let before = handle { src.slice(0, upto) } with { abort.raise(_) -> src };
+  let lines = handle { before.split(b"\n") } with { abort.raise(_) -> [before] };
+  let last = match lines.at(lines.len() - 1) { Some(line) -> line, None -> b"" };
+  { line: lines.len(), column: String::of_bytes_lossy(last).len() + 1 }
+}
+
+/// The offset of the first byte of `src` that is not part of a valid UTF-8 character, or the
+/// length of `src` when all of it is valid UTF-8.
+pub fn utf8_end(src: Bytes) -> Int / {abort.raise} = first_invalid(src, 0, src.len())
+
+/// `left` bounds the recursion, since each character takes at least one byte.
+fn first_invalid(src: Bytes, i: Int, left: Int) -> Int / {abort.raise} = {
+  let n = src.len();
+  let lead = if i < n { src.at(i) } else { -1 };
+  let width = if lead < 128 { 1 } else if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 };
+  if lead < 0 || left <= 0 || i + width > n || !src.slice(i, i + width).is_utf8() { i }
+  else { first_invalid(src, i + width, left - 1) }
+}
+
+/// `src` with its bytes from `from` to `to` replaced by `text`.
+pub fn spliced(src: Bytes, from: Int, to: Int, text: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all([src.slice(0, from), text, src.slice(to, src.len())])
+
+/// Why a value did not decode: the path to the bad value, its line and column when the text was
+/// available, and a message saying what was wrong.
+pub type DecodeError = new { path: List<PathSegment>, place: Option<Location>, message: String }
+
+/// An error with no path yet; the decoders around it add the steps.
+pub fn decode_error(message: String) -> DecodeError = { path: [], place: None, message: message }
+
+/// `e` with the key `name` added to the front of its path.
+pub fn in_field(name: String, e: DecodeError) -> DecodeError =
+  { path: prepend(Key(name), e.path), place: e.place, message: e.message }
+
+/// `e` with `index` added to the front of its path.
+pub fn in_index(index: Int, e: DecodeError) -> DecodeError =
+  { path: prepend(Index(index), e.path), place: e.place, message: e.message }
+
+/// The error for a key `name` that is not one of a record's keys `names`.
+///
+/// The error is placed at the key and lists `names`. It also suggests the closest of `names`
+/// within two edits of `name`, when there is one.
+pub fn unknown_key(name: String, names: List<String>) -> DecodeError =
+  in_field(
+    name,
+    decode_error(
+      "this key is not one of " ++ String::join(names.map(key_to_string), ", ")
+        ++ (match closest(name, names, 2) {
+          Some(near) -> "; did you mean " ++ key_to_string(near) ++ "?",
+          None -> "",
+        }),
+    ),
+  )
+
+/// The error as `line L, column C: PATH: MESSAGE`, leaving out the location or the path when the
+/// error has none.
+pub fn error_to_string(e: DecodeError) -> String =
+  (match e.place {
+      Some(stood) ->
+        "line " ++ stood.line.to_string() ++ ", column " ++ stood.column.to_string() ++ ": ",
+      None -> "",
+    })
+    ++ (if e.path.len() == 0 { "" } else { path_to_string(e.path) ++ ": " })
+    ++ e.message
+
+/// Decodes every item in order. Returns the decoded items, or the first error with the item's
+/// index added to its path.
+pub fn decode_items<v, a | e>(
+  items: List<v>,
+  decode: (v) -> Result<a, DecodeError> / e,
+) -> Result<List<a>, DecodeError> / e = items_from(items, decode, 0, [])
+
+fn items_from<v, a | e>(
+  items: List<v>,
+  decode: (v) -> Result<a, DecodeError> / e,
+  index: Int,
+  acc: List<a>,
+) -> Result<List<a>, DecodeError> / e =
+  match items {
+    [] -> Ok(acc),
+    [x, ..rest] -> match decode(x) {
+      Err(err) -> Err(in_index(index, err)),
+      Ok(made) -> items_from(rest, decode, index + 1, acc.push(made)),
+    },
+  }
+
+/// Decodes every entry's value into a map under the entry's key. Returns the map, or the first
+/// error with the entry's key added to its path.
+pub fn decode_fields<v, a | e>(
+  entries: List<{ key: String, value: v }>,
+  decode: (v) -> Result<a, DecodeError> / e,
+) -> Result<Map<String, a>, DecodeError> / e = fields_from(entries, decode, Map::new())
+
+fn fields_from<v, a | e>(
+  entries: List<{ key: String, value: v }>,
+  decode: (v) -> Result<a, DecodeError> / e,
+  acc: Map<String, a>,
+) -> Result<Map<String, a>, DecodeError> / e =
+  match entries {
+    [] -> Ok(acc),
+    [entry, ..rest] -> match decode(entry.value) {
+      Err(err) -> Err(in_field(entry.key, err)),
+      Ok(made) -> fields_from(rest, decode, acc.insert(entry.key, made)),
+    },
+  }
+
+test "a path is written with dots and brackets, and a key that is not a bare word in quotes" {
+  assert_eq(
+    path_to_string([Key("servers"), Key("a b"), Index(2), Key("port")]),
+    "servers.\"a b\"[2].port",
+  );
+  assert_eq(path_to_string([]), "");
+  assert_eq(path_to_string([Index(0), Key("")]), "[0].\"\"");
+  assert_eq(
+    path_to_string([Key("a.b"), Key("say \"hi\"\\\n")]),
+    "\"a.b\".\"say \\\"hi\\\"\\\\\\n\"",
+  );
+  assert_eq(key_to_string("plain_key-1"), "plain_key-1")
+}
+
+test "a location counts lines and characters from 1, and an offset past the text is its end" {
+  let text = b"a = 1\nb = \"\xc3\xa9\" x\n";
+  assert_eq(location_at(text, 0), { line: 1, column: 1 });
+  assert_eq(location_at(text, 6), { line: 2, column: 1 });
+  assert_eq(location_at(text, 14), { line: 2, column: 8 });
+  assert_eq(location_at(text, 999), { line: 3, column: 1 });
+  assert_eq(location_at(text, -1), { line: 1, column: 1 });
+  assert_eq(location_at(b"", 0), { line: 1, column: 1 })
+}
+
+test "a text stops being UTF-8 at the first byte that is not part of a character" {
+  assert_eq(utf8_end(b"abc"), 3);
+  assert_eq(utf8_end(b"a\xc3\xa9\xffb"), 3);
+  assert_eq(utf8_end(b"\xed\xa0\x80"), 0);
+  assert_eq(utf8_end(b"ab\xe2\x82"), 2);
+  assert_eq(utf8_end(b""), 0)
+}
+
+test "a splice replaces a range of bytes and leaves the rest" {
+  assert_eq(spliced(b"a = 1 # one", 4, 5, b"22"), b"a = 22 # one");
+  assert_eq(spliced(b"abc", 3, 3, b"d"), b"abcd");
+  assert_eq(spliced(b"abc", 0, 3, b""), b"")
+}
+
+test "a decode error is built inside out and shows its location, its path and what was wrong" {
+  let inner = in_field("servers", in_index(2, in_field("port", decode_error("wrong"))));
+  assert_eq(inner.path, [Key("servers"), Index(2), Key("port")]);
+  assert_eq(error_to_string(inner), "servers[2].port: wrong");
+  assert_eq(
+    error_to_string({ path: inner.path, place: Some({ line: 4, column: 8 }), message: "wrong" }),
+    "line 4, column 8: servers[2].port: wrong",
+  );
+  assert_eq(error_to_string(decode_error("wrong")), "wrong")
+}
+
+test "an unknown key lists the keys there are, and suggests the closest one" {
+  assert_eq(
+    error_to_string(unknown_key("wieght", ["name", "port", "weight"])),
+    "wieght: this key is not one of name, port, weight; did you mean weight?",
+  );
+  assert_eq(
+    error_to_string(unknown_key("colour scheme", ["name", "a b"])),
+    "\"colour scheme\": this key is not one of name, \"a b\"",
+  )
+}
+
+test "a list and the fields of a record decode in order, and an error is placed at its item" {
+  let whole = |n: Int| if n >= 0 { Ok(n) } else { Err(decode_error("below zero")) };
+  assert_eq(decode_items([1, 2, 3], whole), Ok([1, 2, 3]));
+  assert_eq(result_err_text(decode_items([1, -2, -3], whole)), "[1]: below zero");
+  assert_eq(
+    decode_fields([{ key: "b", value: 2 }, { key: "a", value: 1 }], whole),
+    Ok(#{"a": 1, "b": 2}),
+  );
+  assert_eq(
+    result_err_text(decode_fields([{ key: "a b", value: -1 }], whole)),
+    "\"a b\": below zero",
+  )
+}
+
+fn result_err_text<a>(r: Result<a, DecodeError>) -> String =
+  match r { Ok(_) -> "", Err(e) -> error_to_string(e) }

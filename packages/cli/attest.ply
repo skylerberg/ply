@@ -1,16 +1,10 @@
-//! `ply attest NAME VERSION` — what a published version's own tests, claims and promises come to,
-//! run by this `ply` over the version laid out from the registry as a project of its own. With
-//! `--sign KEY`, the answer is signed and sent back to the registry, which keeps it as the
-//! version's attestation under this `ply`'s semantics; without it nothing is sent, which is how a
-//! consumer runs an attestation again for itself.
-
 import compiler.load (Derives)
 import compiler.unit (shipped)
 import args (Flags, style_of, root_of)
 import units (emit)
-import appends (priced)
-import literals (literal)
-import machine (Entering)
+import update_costs (cost_checker)
+import literals (evaluation)
+import machine (MachineAccess)
 import builder (builder)
 import tester
 import args
@@ -19,14 +13,14 @@ import std.cli
 import claims
 import compiler.cc (toolchain)
 import std.env (env)
-import paths (Resolved, here)
+import paths (ResolvedPath, here)
 import paths
 import prove
-import registry (Base, attestation_target, base_of, exchange, put, refused_by, said, unasked, unset,
-                 variable)
+import registry (BaseUrl, attestation_target, base_of, exchange, put, refused_by, response_message,
+                 registry_unreachable, unset, url_variable)
 import remote (index_of, staged)
 import contracts (unpublished)
-import report (Answer, indent, ok_code, reported)
+import report (CommandOutput, indent, ok_code, reported)
 import semantics
 import signing (read_seed)
 import surface (spec)
@@ -34,7 +28,7 @@ import std.term (Style, bold, green, yellow)
 import tests
 import yank (malformed)
 import compiler.store.plyx (digest_text)
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import std.bin
 import std.json (Json, Null, Array, Bool, Number, Object, Str, int_json, object)
 import std.pkg (Attestation, Index, Release, Version, attestation_bin, attested, parse_version,
@@ -52,8 +46,6 @@ import semantics (semantics)
 
 pub type Options = { name: String, version: String }
 
-// --- Reading what the commands answered -----------------------------------------------
-
 fn member(json: Json, key: String) -> Json =
   match json { Object(m) -> match m.get(key) { Some(v) -> v, None -> Null }, _ -> Null }
 
@@ -68,27 +60,22 @@ fn codes(answer: Json) -> List<String> =
     _ -> [],
   }
 
-// --- Running the version ----------------------------------------------------------
-
-/// A command line the attester runs over the staged package, as `ply` would parse it.
-fn line(argv: List<String>) -> Parsed / {abort.raise} =
+fn command_line(argv: List<String>) -> Parsed / {abort.raise} =
   match cli::parse(spec("attest"), argv) {
     cli::Run(p) -> p,
     _ -> panic("the attester's own command lines parse"),
   }
 
-fn flags_for(parsed: Parsed, resolved: Resolved) -> Flags =
+fn flags_for(parsed: Parsed, resolved: ResolvedPath) -> Flags =
   args::from_parsed(parsed, false, resolved.display, [resolved])
 
-/// `ply test` refuses a version whose promises are not kept before it runs a test, so a refusal
-/// for those codes alone is a version that checks.
-fn found(
+fn attestation_of(
   name: String,
   v: Version,
   archive: String,
   builder: String,
-  tested: Answer,
-  proved: Answer,
+  tested: CommandOutput,
+  proved: CommandOutput,
 ) -> Attestation / {abort.raise} = {
   let refusals = codes(tested.json);
   let promises = !refusals.contains("E0127") && !refusals.contains("E0148");
@@ -116,11 +103,9 @@ fn found(
   }
 }
 
-// --- The command ----------------------------------------------------------------
-
 fn signing_key(
   path: Option<String>,
-) -> Result<Option<Secret<Bytes>>, Diag> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
+) -> Result<Option<Secret<Bytes>>, Diagnostic> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
   match path {
     None -> Ok(None),
     Some(p) -> match read_seed(p) { Ok(seed) -> Ok(Some(seed)), Err(why) -> Err(why) },
@@ -129,36 +114,36 @@ fn signing_key(
 pub fn run(
   flags: Flags,
   opts: Options,
-) -> Answer / {semantics.cached, shipped.answer, process.out[proc], env.variable, Entering, shipped.version, env.working_directory, env.variables, fs.read[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.resolved[abs], fs.write[abs], fs.create_dir[abs], fs.remove[abs], fs.rename[abs], fs.write_file[abs], fs.read[cwd], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.resolved[cwd], fs.write[cwd], fs.list_dir[shipped], fs.read_file[shipped], net.close[registry], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], builder.git[vcs], entropy.next, time.elapsed_ms, time.elapsed_us, time.now_ms, emit.unit, emit.compiled, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached, toolchain.reused} = {
+) -> CommandOutput / {semantics.cached, shipped.read_pack, process.out[proc], env.variable, MachineAccess, shipped.version, env.working_directory, env.variables, fs.read[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.resolved_kind[abs], fs.write[abs], fs.create_dir[abs], fs.remove[abs], fs.rename[abs], fs.write_file[abs], fs.read[cwd], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.resolved_kind[cwd], fs.write[cwd], fs.list_dir[shipped], fs.read_file[shipped], net.close[registry], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], builder.git[vcs], entropy.next, time.elapsed_ms, time.elapsed_us, time.now_ms, emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} = {
   let s = style_of(flags);
   match malformed({ name: opts.name, version: opts.version }) {
     Some(d) -> reported(s, "attest", [d], []),
     None -> match signing_key(flags.sign) {
       Err(d) -> reported(s, "attest", [d], []),
-      Ok(seed) -> match env.variable(variable()) {
+      Ok(seed) -> match env.variable(url_variable()) {
         None ->
           reported(
             s,
             "attest",
-            [unset(variable(), "an attestation runs what a registry serves")],
+            [unset(url_variable(), "an attestation runs what a registry serves")],
             [],
           ),
         Some(text) -> match base_of(text) {
-          Err(why) -> reported(s, "attest", [unasked(why, [])], []),
-          Ok(base) -> attesting(s, flags, opts, base, seed),
+          Err(why) -> reported(s, "attest", [registry_unreachable(why, [])], []),
+          Ok(base) -> attest_release(s, flags, opts, base, seed),
         },
       },
     },
   }
 }
 
-fn attesting(
+fn attest_release(
   s: Style,
   flags: Flags,
   opts: Options,
-  base: Base,
+  base: BaseUrl,
   seed: Option<Secret<Bytes>>,
-) -> Answer / {semantics.cached, shipped.answer, process.out[proc], env.variable, Entering, shipped.version, env.working_directory, env.variables, fs.read[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.resolved[abs], fs.write[abs], fs.create_dir[abs], fs.remove[abs], fs.rename[abs], fs.write_file[abs], fs.read[cwd], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.resolved[cwd], fs.write[cwd], fs.list_dir[shipped], fs.read_file[shipped], net.close[registry], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], builder.git[vcs], entropy.next, time.elapsed_ms, time.elapsed_us, time.now_ms, emit.unit, emit.compiled, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached, toolchain.reused} = {
+) -> CommandOutput / {semantics.cached, shipped.read_pack, process.out[proc], env.variable, MachineAccess, shipped.version, env.working_directory, env.variables, fs.read[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.resolved_kind[abs], fs.write[abs], fs.create_dir[abs], fs.remove[abs], fs.rename[abs], fs.write_file[abs], fs.read[cwd], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.resolved_kind[cwd], fs.write[cwd], fs.list_dir[shipped], fs.read_file[shipped], net.close[registry], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], builder.git[vcs], entropy.next, time.elapsed_ms, time.elapsed_us, time.now_ms, emit.unit, emit.compiled, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached, toolchain.reuse_dir} = {
   let v = match parse_version(opts.version) {
     Some(x) -> x,
     None -> { major: 0, minor: 0, patch: 0 },
@@ -174,16 +159,26 @@ fn attesting(
           Err(d) -> reported(s, "attest", [d], []),
           Ok(dir) -> {
             let at = paths::resolve(dir);
-            let tested_line = line(["test", dir, "--json"]);
+            let tested_line = command_line(["test", dir, "--json"]);
             let tested = run::run(
               flags_for(tested_line, at),
               tester::options_from(tested_line),
               None,
             );
-            let proved_line = line(["prove", dir, "--json"]);
+            let proved_line = command_line(["prove", dir, "--json"]);
             let proved = prove::run(flags_for(proved_line, at), claims::options_from(proved_line));
-            let a = found(opts.name, v, r.digest, "ply " ++ shipped.version(), tested, proved);
-            match seed { None -> answered(s, a, false), Some(key) -> sent(s, base, a, key) }
+            let a = attestation_of(
+              opts.name,
+              v,
+              r.digest,
+              "ply " ++ shipped.version(),
+              tested,
+              proved,
+            );
+            match seed {
+              None -> attestation_output(s, a, false),
+              Some(key) -> send_to_registry(s, base, a, key),
+            }
           },
         }
       },
@@ -191,12 +186,12 @@ fn attesting(
   }
 }
 
-fn sent(
+fn send_to_registry(
   style: Style,
-  base: Base,
+  base: BaseUrl,
   a: Attestation,
   key: Secret<Bytes>,
-) -> Answer / {net.connect[registry], net.close[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], abort.raise} = {
+) -> CommandOutput / {net.connect[registry], net.close[registry], net.connect_tls[registry], net.handshake[registry], net.recv[registry], net.send[registry], abort.raise} = {
   let version = render_version(a.version);
   let body = signed_bytes(
     countersigned({ payload: bin::encode(a, attestation_bin()), signatures: [] }, key),
@@ -204,8 +199,9 @@ fn sent(
   let target = attestation_target(base, a.name, version, a.semantics);
   match exchange(base, put(base, target, "", a.archive, body)) {
     Err(d) -> reported(style, "attest", [d], []),
-    Ok(answer) -> if answer.status == 201 || answer.status == 200 { answered(style, a, true) }
-    else {
+    Ok(answer) -> if answer.status == 201 || answer.status == 200 {
+      attestation_output(style, a, true)
+    } else {
       reported(
         style,
         "attest",
@@ -213,7 +209,7 @@ fn sent(
           refused_by(
             "keep the attestation of `" ++ a.name ++ "` " ++ version,
             answer.status,
-            said(answer),
+            response_message(answer),
           ),
         ],
         [],
@@ -222,8 +218,8 @@ fn sent(
   }
 }
 
-fn answered(style: Style, a: Attestation, sent: Bool) -> Answer = {
-  let held = attested(a);
+fn attestation_output(style: Style, a: Attestation, send_to_registry: Bool) -> CommandOutput = {
+  let is_attested = attested(a);
   {
     json: object([
       { key: "command", value: Str("attest") },
@@ -234,7 +230,7 @@ fn answered(style: Style, a: Attestation, sent: Bool) -> Answer = {
       { key: "archive", value: Str(a.archive) },
       { key: "semantics", value: Str(a.semantics) },
       { key: "builder", value: Str(a.builder) },
-      { key: "attested", value: Bool(held) },
+      { key: "attested", value: Bool(is_attested) },
       { key: "checked", value: Bool(a.checked) },
       { key: "promises", value: Bool(a.promises) },
       {
@@ -252,16 +248,17 @@ fn answered(style: Style, a: Attestation, sent: Bool) -> Answer = {
           { key: "unproved", value: Number(Decimal::of_int(a.proofs.unproved)) },
         ]),
       },
-      { key: "sent", value: Bool(sent) },
+      { key: "sent", value: Bool(send_to_registry) },
     ]),
     lines: [
-      indent() ++ (if held { green(style, "attested") } else { yellow(style, "not attested") })
+      indent()
+        ++ (if is_attested { green(style, "attested") } else { yellow(style, "not attested") })
         ++ " "
         ++ a.name
         ++ " "
         ++ render_version(a.version)
         ++ " · "
-        ++ (if sent { "sent to the registry" } else { "kept here" }),
+        ++ (if send_to_registry { "sent to the registry" } else { "kept here" }),
       indent() ++ "  " ++ bold(style, "tests") ++ " " ++ a.tests.passed.to_string() ++ " passed, "
         ++ a.tests.failed.to_string()
         ++ " failed · "
@@ -280,9 +277,7 @@ fn answered(style: Style, a: Attestation, sent: Bool) -> Answer = {
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
-fn answer_of(json: Json) -> Answer = { json: json, lines: [], errs: [], code: 0 }
+fn answer_of(json: Json) -> CommandOutput = { json: json, lines: [], errs: [], code: 0 }
 
 fn summary(pairs: List<{ key: String, n: Int }>) -> Json =
   object([
@@ -305,13 +300,18 @@ test "an attestation reads what the test and prove commands answered" {
       { key: "vacuous", n: 1 },
     ]),
   );
-  let a = found("orders", { major: 0, minor: 1, patch: 0 }, "b3:00", "ply 0.0.0", tested, proved);
+  let a = attestation_of(
+    "orders",
+    { major: 0, minor: 1, patch: 0 },
+    "b3:00",
+    "ply 0.0.0",
+    tested,
+    proved,
+  );
   assert_eq(a.tests, { passed: 3, failed: 1 });
-  // A claim the prover faulted on does not hold, and one that holds of nothing is not proved.
   assert_eq(a.proofs, { proved: 2, refuted: 1, unproved: 2 });
   assert(a.checked && a.promises);
   assert(!attested(a));
-  // One claim nothing proves is enough to withhold the attestation.
   assert(
     attested({
       ..a,
@@ -334,7 +334,7 @@ test "a test run refused over a broken promise is a version that checks and brea
       { key: "diagnostics", value: Array([object([{ key: "code", value: Str("E0127") }])]) },
     ]),
   );
-  let a = found(
+  let a = attestation_of(
     "orders",
     { major: 0, minor: 1, patch: 0 },
     "b3:00",
@@ -350,7 +350,7 @@ test "a test run refused over a broken promise is a version that checks and brea
     ]),
   );
   assert(
-    !found(
+    !attestation_of(
       "orders",
       { major: 0, minor: 1, patch: 0 },
       "b3:00",

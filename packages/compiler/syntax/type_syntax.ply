@@ -1,97 +1,83 @@
-//! Type expressions, generics and effect rows.
-
-import compiler.syntax.parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, SoFar,
-                                ParseDiag, span_bin, ident_bin, q_name_bin, span_to, dummy_span,
-                                no_ident, no_qname, unexpected, error_at, push_diag, error_here,
-                                unclosed, token_kind, token_kind_at, current_span, span_at,
-                                previous_span, at_token, at_eof, at_ident_text, starts_upper,
-                                advance, bump, eat, expect, expect_close, expect_ident,
-                                expect_field_name, fields_once, expect_gt, with_no_brace, too_deep,
-                                qname, comma_list, parsed_or, failed, token_lparen, token_rparen,
-                                token_lbrace, token_rbrace, token_lbracket, token_rbracket,
-                                token_comma, token_colon, token_dot, token_arrow, token_lt,
-                                token_gt, token_ge, token_pipe, token_slash, token_star, dump_node,
-                                dump_count, dump_presence, dump_payload, dump_word, dump_list,
-                                dump_opt, dump_ident, dump_qname, dump_diags, start, is_bare)
+import compiler.syntax.parsing (tuple_field_name, Span, Identifier, QName, Input, Parser,
+                                ParseOutput, EatResult, PartialList, ParseDiagnostic, span_bin,
+                                identifier_bin, q_name_bin, span_to, dummy_span, no_identifier,
+                                no_qualified_name, unexpected, error_at, push_diagnostic,
+                                error_here, unclosed, token_kind, token_kind_at, current_span,
+                                span_at, previous_span, at_token, at_eof, at_identifier_text,
+                                starts_upper, advance, bump, eat, expect, expect_close,
+                                expect_identifier, expect_field_name, report_duplicate_fields,
+                                expect_gt, with_no_brace, too_deep, qname, comma_list, parsed_or,
+                                failed, token_lparen, token_rparen, token_lbrace, token_rbrace,
+                                token_lbracket, token_rbracket, token_comma, token_colon, token_dot,
+                                token_arrow, token_lt, token_gt, token_ge, token_pipe, token_slash,
+                                token_star, dump_node, dump_count, dump_presence, dump_payload,
+                                dump_word, dump_list, dump_opt, dump_identifier,
+                                dump_qualified_name, dump_diagnostics, start, is_bare)
 import compiler.syntax.lexer (TokenKind, Identifier, Punctuation)
 import std.bytes
 import std.bin
 
-// --- The AST ----------------------------------------------------------------
+pub type TypeExpression =
+  | VariableTypeExpression(Identifier)
+  | NamedTypeExpression({ span: Span, name: QName, args: List<TypeExpression>, labels: List<Identifier>, rows: List<RowExpression> })
+  | FunctionTypeExpression({ span: Span, params: List<TypeExpression>, kept: List<Int>, once: Bool, ret: TypeExpression, effects: Option<RowExpression> })
+  | RecordTypeExpression({ span: Span, fields: List<{ name: Identifier, ty: TypeExpression }> })
+  | UnitTypeExpression({ span: Span })
+  | InvalidTypeExpression({ span: Span })
 
-/// Fields stay inline records: a named record alias mutually recursive with an ADT is an unexercised shape.
-pub type TypeExpr =
-  | TVar(Ident)
-  // `labels` and `rows` fill a declared type's label and row parameters: `Seq<a, [l] | e>`.
-  | TCon({ span: Span, name: QName, args: List<TypeExpr>, labels: List<Ident>, rows: List<RowExpr> })
-  // `kept` are the places of the parameters written `keep`; `once` is a function its call consumes.
-  | TFn({ span: Span, params: List<TypeExpr>, kept: List<Int>, once: Bool, ret: TypeExpr, effects: Option<RowExpr> })
-  | TRecord({ span: Span, fields: List<{ name: Ident, ty: TypeExpr }> })
-  | TUnit({ span: Span })
-  /// A placeholder no parse produces, so a leaked one shows up as a mismatch rather than agreeing with a real node.
-  | TBad({ span: Span })
-
-/// `MRaise` is an operation that does not come back: no mode atom stands for it, so a row names each one.
-pub type Mode = | MRead | MWrite | MBad | MRaise
+pub type Mode = | ReadMode | WriteMode | InvalidMode | RaiseMode
 
 derive bin for Mode
-derive bin for AtomExpr
-derive bin for RowExpr
-derive bin for TypeExpr
+derive bin for AtomExpression
+derive bin for RowExpression
+derive bin for TypeExpression
 
-/// `op: Some` names an operation instead of a mode.
-pub type AtomExpr = {
-  eff: QName,
+pub type AtomExpression = {
+  effect_name: QName,
   mode: Mode,
-  op: Option<Ident>,
-  resource: Option<Ident>,
-  /// `[*]`: the atom stands for the operation on every label, which is how a row says what a
-  /// handler consumes.
+  op: Option<Identifier>,
+  resource: Option<Identifier>,
   every: Bool,
-  /// `bounded`: a definition's row promises the atom a number of performs no input decides.
   bounded: Bool,
   span: Span,
 }
 
-/// `tail_bounded`: the row variable's effects are performed a number of times no input decides.
-pub type RowExpr = {
-  atoms: List<AtomExpr>,
+pub type RowExpression = {
+  atoms: List<AtomExpression>,
   aliases: List<QName>,
-  tail: Option<Ident>,
+  tail: Option<Identifier>,
   tail_bounded: Bool,
   span: Span,
 }
 
-pub type RowMember = | RMAtom(AtomExpr) | RMSet(QName)
+pub type RowMember = | AtomMember(AtomExpression) | EffectSetMember(QName)
 
-/// `labels` are the bracketed binders: `fn relay<[l] | e>(..)`. `kept` are the type parameters
-/// written `keep`, which a resource may fill.
 pub type Generics = {
-  types: List<Ident>,
-  effects: List<Ident>,
-  labels: List<Ident>,
-  kept: List<Ident>,
+  types: List<Identifier>,
+  effects: List<Identifier>,
+  labels: List<Identifier>,
+  kept: List<Identifier>,
 }
 
-pub fn ty_span(ty: TypeExpr) -> Span =
+pub fn type_span(ty: TypeExpression) -> Span =
   match ty {
-    TVar(i) -> i.span,
-    TCon(x) -> x.span,
-    TFn(x) -> x.span,
-    TRecord(x) -> x.span,
-    TUnit(x) -> x.span,
-    TBad(x) -> x.span,
+    VariableTypeExpression(i) -> i.span,
+    NamedTypeExpression(x) -> x.span,
+    FunctionTypeExpression(x) -> x.span,
+    RecordTypeExpression(x) -> x.span,
+    UnitTypeExpression(x) -> x.span,
+    InvalidTypeExpression(x) -> x.span,
   }
 
-pub fn no_ty() -> TypeExpr = TBad({ span: dummy_span() })
+pub fn no_type() -> TypeExpression = InvalidTypeExpression({ span: dummy_span() })
 
-pub fn no_row() -> RowExpr =
+pub fn no_row() -> RowExpression =
   { atoms: [], aliases: [], tail: None, tail_bounded: false, span: dummy_span() }
 
-pub fn no_atom() -> AtomExpr =
+pub fn no_atom() -> AtomExpression =
   {
-    eff: no_qname(),
-    mode: MBad,
+    effect_name: no_qualified_name(),
+    mode: InvalidMode,
     op: None,
     resource: None,
     every: false,
@@ -104,8 +90,6 @@ pub fn no_generics() -> Generics = { types: [], effects: [], labels: [], kept: [
 pub fn is_generic(generics: Generics) -> Bool =
   generics.types.len() > 0 || generics.effects.len() > 0 || generics.labels.len() > 0
 
-// What sits between `<` and `>` in a generic list or after a type's name: the types, one bracket
-// a label, then the rows after `|`. Nothing at all when there is none of them.
 pub fn angled(types: List<Bytes>, labels: List<Bytes>, rows: List<Bytes>) -> Bytes =
   if types.len() == 0 && labels.len() == 0 && rows.len() == 0 { b"" } else {
     let ts = Bytes::join(
@@ -122,92 +106,90 @@ pub fn angled(types: List<Bytes>, labels: List<Bytes>, rows: List<Bytes>) -> Byt
 pub fn generics_text(generics: Generics) -> Bytes =
   angled(
     marked(generics.types, generics.kept, b"keep "),
-    ident_names(generics.labels),
-    ident_names(generics.effects),
+    identifier_names(generics.labels),
+    identifier_names(generics.effects),
   )
 
-/// Each name of `idents`, written after `word` where `marked` holds it.
-fn marked(idents: List<Ident>, marked: List<Ident>, word: Bytes) -> List<Bytes> = {
-  let names = ident_names(marked);
-  idents.map(|ident: Ident|
+fn marked(idents: List<Identifier>, marked: List<Identifier>, word: Bytes) -> List<Bytes> = {
+  let names = identifier_names(marked);
+  idents.map(|ident: Identifier|
     if names.contains(ident.name) { word.concat(ident.name) } else { ident.name })
 }
 
-pub fn ident_names(idents: List<Ident>) -> List<Bytes> = idents.map(|ident: Ident| ident.name)
+pub fn identifier_names(idents: List<Identifier>) -> List<Bytes> =
+  idents.map(|ident: Identifier| ident.name)
 
-// --- Modes ------------------------------------------------------------------
-
-/// `read` and `write` are contextual: lexed as identifiers and reserved nowhere.
-pub fn mode(input: Input, parser: Parser) -> Result<Parsed<Mode>, Parser> / {abort.raise} =
-  if at_ident_text(input, parser, b"read") { Ok({ parser: bump(input, parser), node: MRead }) }
-  else if at_ident_text(input, parser, b"write") {
-    Ok({ parser: bump(input, parser), node: MWrite })
+pub fn mode(input: Input, parser: Parser) -> Result<ParseOutput<Mode>, Parser> / {abort.raise} =
+  if at_identifier_text(input, parser, b"read") {
+    Ok({ parser: bump(input, parser), node: ReadMode })
+  } else if at_identifier_text(input, parser, b"write") {
+    Ok({ parser: bump(input, parser), node: WriteMode })
   } else { Err(error_here(input, parser, b"`read`, `write` or `raise` to start an operation")) }
 
-pub fn is_raise(mode: Mode) -> Bool = match mode { MRaise -> true, _ -> false }
+pub fn is_raise(mode: Mode) -> Bool = match mode { RaiseMode -> true, _ -> false }
 
-// --- Type expressions -------------------------------------------------------
-
-/// `{` in a type always opens a record. No `?`: `no_brace` must be restored on the error path too.
-pub fn ty(input: Input, parser: Parser) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} =
-  match ty_inner(input, with_no_brace(parser, false)) {
+pub fn ty(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} =
+  match type_inner(input, with_no_brace(parser, false)) {
     Err(q) -> Err(with_no_brace(q, parser.no_brace)),
     Ok(r) -> Ok({ parser: with_no_brace(r.parser, parser.no_brace), node: r.node }),
   }
 
-fn ty_inner(input: Input, parser: Parser) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} =
+fn type_inner(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} =
   if input.room <= 0 { Err(too_deep(input, parser)) }
-  else { ty_body({ ..input, room: input.room - 1 }, parser) }
+  else { type_body({ ..input, room: input.room - 1 }, parser) }
 
-fn ty_body(input: Input, parser: Parser) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+fn type_body(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let st = current_span(input, parser);
   match token_kind(input, parser) {
-    Punctuation(s) -> if s == b"lparen" { ty_paren(input, parser, st) }
-    else if s == b"lbrace" { ty_record(input, parser) }
+    Punctuation(s) -> if s == b"lparen" { type_paren(input, parser, st) }
+    else if s == b"lbrace" { type_record(input, parser) }
     else { Err(error_here(input, parser, b"a type")) },
     Identifier(n) -> if n == b"once" && token_kind_at(input, parser, 1) == token_lparen() {
-      ty_once(input, parser, st)
-    } else { ty_named(input, parser, st) },
+      type_once(input, parser, st)
+    } else { type_named(input, parser, st) },
     _ -> Err(error_here(input, parser, b"a type")),
   }
 }
 
-/// `once (A) -> B`: a function its call consumes. `once` is contextual: it opens a type only before
-/// `(`, so a type or a definition of that name keeps its meaning.
-fn ty_once(
+fn type_once(
   input: Input,
   parser: Parser,
   span: Span,
-) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
-  let { parser, node: t } = ty_paren(input, o.parser, span)?;
+  let { parser, node: t } = type_paren(input, o.parser, span)?;
   match t {
-    TFn(f) -> Ok({ parser: parser, node: TFn({ ..f, once: true }) }),
-    _ -> Err(refused_at(parser, ty_span(t), b"a function type after `once`")),
+    FunctionTypeExpression(f) ->
+      Ok({ parser: parser, node: FunctionTypeExpression({ ..f, once: true }) }),
+    _ -> Err(expected_at(parser, type_span(t), b"a function type after `once`")),
   }
 }
 
-/// `parser` with `span` refused for not being `what`.
-fn refused_at(parser: Parser, span: Span, what: Bytes) -> Parser =
-  push_diag(
+fn expected_at(parser: Parser, span: Span, what: Bytes) -> Parser =
+  push_diagnostic(
     parser,
     error_at(unexpected(), span, b"expected ".concat(what), b"expected ".concat(what), []),
   )
 
-/// One element between a function type's parentheses: a type, written `keep` where the function
-/// takes what it is handed.
 fn paren_item(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<{ keep: Bool, ty: TypeExpr }>, Parser> / {abort.raise} = {
-  let keep = at_ident_text(input, parser, b"keep") && starts_type(input, parser, 1);
+) -> Result<ParseOutput<{ keep: Bool, ty: TypeExpression }>, Parser> / {abort.raise} = {
+  let keep = at_identifier_text(input, parser, b"keep") && starts_type(input, parser, 1);
   let from = if keep { advance(input, parser).parser } else { parser };
   let { parser, node: t } = ty(input, from)?;
   Ok({ parser: parser, node: { keep: keep, ty: t } })
 }
 
-/// Whether the token `ahead` of the parser's opens a type, so a `keep` before it is the word and
-/// not a type of that name.
 pub fn starts_type(input: Input, parser: Parser, ahead: Int) -> Bool =
   match token_kind_at(input, parser, ahead) {
     Identifier(_) -> true,
@@ -215,46 +197,54 @@ pub fn starts_type(input: Input, parser: Parser, ahead: Int) -> Bool =
     _ -> false,
   }
 
-fn ty_paren(
+fn type_paren(
   input: Input,
   parser: Parser,
   span: Span,
-) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   if at_token(input, o.parser, token_rparen()) {
     let cl = advance(input, o.parser);
     let ar = eat(input, cl.parser, token_arrow());
-    if ar.ok { fn_ty(input, ar.parser, [], [], span) }
-    else { Ok({ parser: ar.parser, node: TUnit({ span: span_to(o.node, cl.node) }) }) }
+    if ar.ok { fn_type(input, ar.parser, [], [], span) }
+    else { Ok({ parser: ar.parser, node: UnitTypeExpression({ span: span_to(o.node, cl.node) }) }) }
   } else {
     let items = comma_list(input, o.parser, token_rparen(), paren_item)?;
-    let ps = { parser: items.parser, node: items.node.map(|i: { keep: Bool, ty: TypeExpr }| i.ty) };
+    let ps = {
+      parser: items.parser,
+      node: items.node.map(|i: { keep: Bool, ty: TypeExpression }| i.ty),
+    };
     let kept = range(0, items.node.len()).filter(|i: Int| items.node.get(i).keep);
     let cl = expect_close(input, ps.parser, token_rparen(), o.node, b"`)`")?;
     let ar = eat(input, cl.parser, token_arrow());
-    if ar.ok { fn_ty(input, ar.parser, ps.node, kept, span) } else if kept.len() > 0 {
+    if ar.ok { fn_type(input, ar.parser, ps.node, kept, span) } else if kept.len() > 0 {
       Err(
-        refused_at(
+        expected_at(
           ar.parser,
-          ty_span(ps.node.get(kept.get(0))),
+          type_span(ps.node.get(kept.get(0))),
           b"`->` after a list whose items are written `keep`, which only a function type's parameters may be",
         ),
       )
     } else {
       match ps.node {
         [only] -> Ok({ parser: ar.parser, node: only }),
-        // Two or more make a tuple: the record `{_0: A, _1: B}` over the elements' spans.
         items ->
           Ok({
             parser: ar.parser,
-            node: TRecord({
+            node: RecordTypeExpression({
               span: span_to(o.node, cl.node),
-              fields: range(0, items.len()).map(|i: Int| -> { name: Ident, ty: TypeExpr } {
-                match items.at(i) {
-                  Some(t) -> { name: positional(i, ty_span(t)), ty: t },
-                  None -> { name: positional(i, o.node), ty: TUnit({ span: o.node }) },
-                }
-              }),
+              fields: range(0, items.len()).map(
+                |i: Int| -> { name: Identifier, ty: TypeExpression } {
+                  match items.at(i) {
+                    Some(t) -> { name: tuple_field_name(i, type_span(t)), ty: t },
+                    None ->
+                      {
+                        name: tuple_field_name(i, o.node),
+                        ty: UnitTypeExpression({ span: o.node }),
+                      },
+                  }
+                },
+              ),
             }),
           }),
       }
@@ -262,21 +252,27 @@ fn ty_paren(
   }
 }
 
-fn ty_record(input: Input, parser: Parser) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+fn type_record(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
-  let { parser, node: fs } = comma_list(input, o.parser, token_rbrace(), ty_field)?;
+  let { parser, node: fs } = comma_list(input, o.parser, token_rbrace(), type_field)?;
   let { parser, node: cl } = expect_close(input, parser, token_rbrace(), o.node, b"`}`")?;
   Ok({
-    parser: fields_once(parser, fs.map(|f: { name: Ident, ty: TypeExpr }| f.name)),
-    node: TRecord({ span: span_to(o.node, cl), fields: fs }),
+    parser: report_duplicate_fields(
+      parser,
+      fs.map(|f: { name: Identifier, ty: TypeExpression }| f.name),
+    ),
+    node: RecordTypeExpression({ span: span_to(o.node, cl), fields: fs }),
   })
 }
 
-fn ty_named(
+fn type_named(
   input: Input,
   parser: Parser,
   span: Span,
-) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let q = qname(input, parser, b"a type")?;
   if at_token(input, q.parser, token_lt()) {
     let o = advance(input, q.parser);
@@ -288,7 +284,7 @@ fn ty_named(
     let cl = expect_gt(input, parser, b"`>` to close the type arguments")?;
     Ok({
       parser: cl.parser,
-      node: TCon({
+      node: NamedTypeExpression({
         span: span_to(span, cl.node),
         name: q.node,
         args: args.types,
@@ -296,26 +292,23 @@ fn ty_named(
         rows: rows,
       }),
     })
-  }
-  // Type parameters are never qualified, so only a bare lowercase name is one.
-  else if is_bare(q.node) && !starts_upper(q.node.name.name) {
-    Ok({ parser: q.parser, node: TVar(q.node.name) })
+  } else if is_bare(q.node) && !starts_upper(q.node.name.name) {
+    Ok({ parser: q.parser, node: VariableTypeExpression(q.node.name) })
   } else { Ok({ parser: q.parser, node: nullary(q.node) }) }
 }
 
-pub fn nullary(name: QName) -> TypeExpr =
-  TCon({ span: name.span, name: name, args: [], labels: [], rows: [] })
+pub fn nullary(name: QName) -> TypeExpression =
+  NamedTypeExpression({ span: name.span, name: name, args: [], labels: [], rows: [] })
 
-type ArgAcc = { parser: Parser, types: List<TypeExpr>, labels: List<Ident> }
+type ArgAccumulator = { parser: Parser, types: List<TypeExpression>, labels: List<Identifier> }
 
-type ArgOut = { types: List<TypeExpr>, labels: List<Ident> }
+type ArgOut = { types: List<TypeExpression>, labels: List<Identifier> }
 
-// Not `comma_list`: a bracketed name is a label argument, and `|` ends the list as `>` does.
-fn type_args(input: Input, parser: Parser) -> Result<Parsed<ArgOut>, Parser> / {abort.raise} =
+fn type_args(input: Input, parser: Parser) -> Result<ParseOutput<ArgOut>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, types: [], labels: [] },
     input.token_count - parser.pos + 1,
-    |s: ArgAcc|
+    |s: ArgAccumulator|
       if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
           || at_token(input, s.parser, token_pipe())
           || at_eof(input, s.parser) {
@@ -325,7 +318,8 @@ fn type_args(input: Input, parser: Parser) -> Result<Parsed<ArgOut>, Parser> / {
           Err(q) -> Stop(Err(q)),
           Ok(n) -> {
             let e = eat(input, n.parser, token_comma());
-            let ls = n.node.fold(s.labels, |acc: List<Ident>, ident: Ident| acc.push(ident));
+            let ls = n.node.fold(s.labels, |acc: List<Identifier>, ident: Identifier|
+              acc.push(ident));
             if e.ok { Continue({ parser: e.parser, types: s.types, labels: ls }) }
             else { Stop(Ok({ parser: e.parser, node: { types: s.types, labels: ls } })) }
           },
@@ -347,10 +341,13 @@ fn type_args(input: Input, parser: Parser) -> Result<Parsed<ArgOut>, Parser> / {
       },
   )
 
-type RowsAcc = { parser: Parser, out: List<RowExpr> }
+type RowsAccumulator = { parser: Parser, out: List<RowExpression> }
 
-fn row_args(input: Input, parser: Parser) -> Result<Parsed<List<RowExpr>>, Parser> / {abort.raise} =
-  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: RowsAcc|
+fn row_args(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<List<RowExpression>>, Parser> / {abort.raise} =
+  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: RowsAccumulator|
     if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
         || at_eof(input, s.parser) { Stop(Ok({ parser: s.parser, node: s.out })) } else {
       match row(input, s.parser) {
@@ -363,20 +360,20 @@ fn row_args(input: Input, parser: Parser) -> Result<Parsed<List<RowExpr>>, Parse
       }
     })
 
-fn fn_ty(
+fn fn_type(
   input: Input,
   parser: Parser,
-  params: List<TypeExpr>,
+  params: List<TypeExpression>,
   kept: List<Int>,
   span: Span,
-) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<TypeExpression>, Parser> / {abort.raise} = {
   let { parser, node: r } = ty(input, parser)?;
   let sl = eat(input, parser, token_slash());
   if !sl.ok {
     Ok({
       parser: sl.parser,
-      node: TFn({
-        span: span_to(span, ty_span(r)),
+      node: FunctionTypeExpression({
+        span: span_to(span, type_span(r)),
         params: params,
         kept: kept,
         once: false,
@@ -388,7 +385,7 @@ fn fn_ty(
     let { parser, node: e } = row(input, sl.parser)?;
     Ok({
       parser: parser,
-      node: TFn({
+      node: FunctionTypeExpression({
         span: span_to(span, e.span),
         params: params,
         kept: kept,
@@ -400,10 +397,10 @@ fn fn_ty(
   }
 }
 
-fn ty_field(
+fn type_field(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<{ name: Ident, ty: TypeExpr }>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<{ name: Identifier, ty: TypeExpression }>, Parser> / {abort.raise} = {
   let { parser, node: f } = expect_field_name(input, parser, b"a field name")?;
   let n = f.name;
   let { parser, .. } = expect(input, parser, token_colon(), b"`:` after the field name")?;
@@ -411,18 +408,17 @@ fn ty_field(
   Ok({ parser: parser, node: { name: n, ty: t } })
 }
 
-// --- Effect rows ------------------------------------------------------------
+type RowAccumulator = { parser: Parser, aliases: List<QName>, atoms: List<AtomExpression> }
 
-/// Each round grows one list, and each literal writes that list last, or it is copied instead of updated in place.
-type RowAcc = { parser: Parser, aliases: List<QName>, atoms: List<AtomExpr> }
+type RowOut = { aliases: List<QName>, atoms: List<AtomExpression> }
 
-type RowOut = { aliases: List<QName>, atoms: List<AtomExpr> }
-
-pub fn row(input: Input, parser: Parser) -> Result<Parsed<RowExpr>, Parser> / {abort.raise} = {
+pub fn row(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<RowExpression>, Parser> / {abort.raise} = {
   let st = current_span(input, parser);
   if at_token(input, parser, token_lbrace()) { row_braced(input, parser, st) } else {
-    // A bare name is a row variable: a set is only ever written inside braces.
-    let { parser, node: t } = expect_ident(
+    let { parser, node: t } = expect_identifier(
       input,
       parser,
       b"an effect row: `{..}` or a row variable",
@@ -440,12 +436,13 @@ fn row_braced(
   input: Input,
   parser: Parser,
   span: Span,
-) -> Result<Parsed<RowExpr>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<RowExpression>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: ms } = row_members(input, o.parser, o.node)?;
   let pi = eat(input, parser, token_pipe());
-  let opt_tail = if pi.ok { expect_ident(input, pi.parser, b"an effect row variable after `|`") }
-  else { Ok({ parser: pi.parser, node: no_ident() }) };
+  let opt_tail = if pi.ok {
+    expect_identifier(input, pi.parser, b"an effect row variable after `|`")
+  } else { Ok({ parser: pi.parser, node: no_identifier() }) };
   let { parser, node: tl } = opt_tail?;
   let b = if pi.ok { bounded_word(input, parser) } else { { parser: parser, node: false } };
   let { parser, node: cl } = expect_close(
@@ -467,22 +464,20 @@ fn row_braced(
   })
 }
 
-/// The contextual word after an atom or a row variable.
-fn bounded_word(input: Input, parser: Parser) -> Parsed<Bool> =
-  if at_ident_text(input, parser, b"bounded") {
+fn bounded_word(input: Input, parser: Parser) -> ParseOutput<Bool> =
+  if at_identifier_text(input, parser, b"bounded") {
     { parser: advance(input, parser).parser, node: true }
   } else { { parser: parser, node: false } }
 
-/// Not `comma_list`: it stops on `}` or `|` and sorts members into two lists.
 fn row_members(
   input: Input,
   parser: Parser,
   open: Span,
-) -> Result<Parsed<RowOut>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<RowOut>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, aliases: [], atoms: [] },
     input.token_count - parser.pos + 1,
-    |s: RowAcc|
+    |s: RowAccumulator|
       if at_token(input, s.parser, token_rbrace()) || at_token(input, s.parser, token_pipe()) {
         Stop(Ok({ parser: s.parser, node: { aliases: s.aliases, atoms: s.atoms } }))
       } else if at_eof(input, s.parser) {
@@ -493,12 +488,12 @@ fn row_members(
           Ok(m) -> {
             let e = eat(input, m.parser, token_comma());
             match m.node {
-              RMAtom(a) -> if e.ok {
+              AtomMember(a) -> if e.ok {
                 Continue({ parser: e.parser, aliases: s.aliases, atoms: s.atoms.push(a) })
               } else {
                 Stop(Ok({ parser: e.parser, node: { aliases: s.aliases, atoms: s.atoms.push(a) } }))
               },
-              RMSet(q) -> if e.ok {
+              EffectSetMember(q) -> if e.ok {
                 Continue({ parser: e.parser, atoms: s.atoms, aliases: s.aliases.push(q) })
               } else {
                 Stop(Ok({ parser: e.parser, node: { atoms: s.atoms, aliases: s.aliases.push(q) } }))
@@ -509,28 +504,27 @@ fn row_members(
       },
   )
 
-/// A `.` after the name makes it an atom; otherwise it names an `effect set`.
 pub fn row_member(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<RowMember>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<RowMember>, Parser> / {abort.raise} = {
   let { parser, node: q } = qname(
     input,
     parser,
     b"an effect atom, or the name of an `effect set`",
   )?;
-  if !at_token(input, parser, token_dot()) { Ok({ parser: parser, node: RMSet(q) }) } else {
+  if !at_token(input, parser, token_dot()) { Ok({ parser: parser, node: EffectSetMember(q) }) }
+  else {
     let { parser, node: a } = atom_rest(input, bump(input, parser), q)?;
-    Ok({ parser: parser, node: RMAtom(a) })
+    Ok({ parser: parser, node: AtomMember(a) })
   }
 }
 
-/// The atom after its effect name and the `.` have been consumed.
 pub fn atom_rest(
   input: Input,
   parser: Parser,
   qname: QName,
-) -> Result<Parsed<AtomExpr>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<AtomExpression>, Parser> / {abort.raise} = {
   let { parser, node: a } = atom_access(input, parser)?;
   let { parser, node: r } = atom_resource(input, parser)?;
   let span = span_to(qname.span, previous_span(input, parser));
@@ -538,7 +532,7 @@ pub fn atom_rest(
   Ok({
     parser: b.parser,
     node: {
-      eff: qname,
+      effect_name: qname,
       mode: a.mode,
       op: a.op,
       resource: r.name,
@@ -549,27 +543,35 @@ pub fn atom_rest(
   })
 }
 
-type Access = { mode: Mode, op: Option<Ident> }
+type Access = { mode: Mode, op: Option<Identifier> }
 
-/// An operation atom's mode is `MWrite` until the checker resolves the name against the effect's declaration.
-fn atom_access(input: Input, parser: Parser) -> Result<Parsed<Access>, Parser> / {abort.raise} =
+fn atom_access(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Access>, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     Identifier(name) -> if name != b"read" && name != b"write" {
       let a = advance(input, parser);
-      Ok({ parser: a.parser, node: { mode: MWrite, op: Some({ name: name, span: a.node }) } })
+      Ok({ parser: a.parser, node: { mode: WriteMode, op: Some({ name: name, span: a.node }) } })
     } else { mode_access(input, parser) },
     _ -> mode_access(input, parser),
   }
 
-fn mode_access(input: Input, parser: Parser) -> Result<Parsed<Access>, Parser> / {abort.raise} =
+fn mode_access(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Access>, Parser> / {abort.raise} =
   match mode(input, parser) {
     Err(q) -> Err(q),
     Ok(m) -> Ok({ parser: m.parser, node: { mode: m.node, op: None } }),
   }
 
-type AtomRes = { every: Bool, name: Option<Ident> }
+type AtomResource = { every: Bool, name: Option<Identifier> }
 
-fn atom_resource(input: Input, parser: Parser) -> Result<Parsed<AtomRes>, Parser> / {abort.raise} =
+fn atom_resource(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<AtomResource>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lbracket()) {
     Ok({ parser: parser, node: { every: false, name: None } })
   } else {
@@ -579,7 +581,7 @@ fn atom_resource(input: Input, parser: Parser) -> Result<Parsed<AtomRes>, Parser
       let { parser, .. } = expect_close(input, st.parser, token_rbracket(), o.node, b"`]`")?;
       Ok({ parser: parser, node: { every: true, name: None } })
     } else {
-      let { parser, node: n } = expect_ident(
+      let { parser, node: n } = expect_identifier(
         input,
         o.parser,
         b"a resource name or `*` inside `[..]`",
@@ -589,15 +591,21 @@ fn atom_resource(input: Input, parser: Parser) -> Result<Parsed<AtomRes>, Parser
     }
   }
 
-// --- Generics and parameters ------------------------------------------------
+type PartialGenericParams = {
+  parser: Parser,
+  types: List<Identifier>,
+  labels: List<Identifier>,
+  kept: List<Identifier>,
+}
 
-type GenAcc = { parser: Parser, types: List<Ident>, labels: List<Ident>, kept: List<Ident> }
+type GenericParams = { types: List<Identifier>, labels: List<Identifier>, kept: List<Identifier> }
 
-type GenOut = { types: List<Ident>, labels: List<Ident>, kept: List<Ident> }
+type RowParamsAccumulator = { parser: Parser, names: List<Identifier> }
 
-type RowParamsAcc = { parser: Parser, names: List<Ident> }
-
-pub fn generics(input: Input, parser: Parser) -> Result<Parsed<Generics>, Parser> / {abort.raise} = {
+pub fn generics(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Generics>, Parser> / {abort.raise} = {
   let { parser, .. } = expect(input, parser, token_lt(), b"`<`")?;
   let { parser, node: ts } = generic_params(input, parser)?;
   let pi = eat(input, parser, token_pipe());
@@ -608,20 +616,20 @@ pub fn generics(input: Input, parser: Parser) -> Result<Parsed<Generics>, Parser
   Ok({ parser: parser, node: { types: ts.types, effects: es, labels: ts.labels, kept: ts.kept } })
 }
 
-/// `word` before a name, where the name follows it: whether it is there, and the parser past it.
-fn marked_by(input: Input, parser: Parser, word: Bytes) -> Parsed<Bool> =
-  if at_ident_text(input, parser, word)
+fn marked_by(input: Input, parser: Parser, word: Bytes) -> ParseOutput<Bool> =
+  if at_identifier_text(input, parser, word)
       && (match token_kind_at(input, parser, 1) { Identifier(_) -> true, _ -> false }) {
     { parser: advance(input, parser).parser, node: true }
   } else { { parser: parser, node: false } }
 
-/// Not `comma_list`: it stops on `>`, on a not-yet-split `>=`, or on `|`. A bracketed name binds a
-/// label, and `keep` before a name lets a resource fill it.
-fn generic_params(input: Input, parser: Parser) -> Result<Parsed<GenOut>, Parser> / {abort.raise} =
+fn generic_params(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<GenericParams>, Parser> / {abort.raise} =
   iterate(
     { parser: parser, types: [], labels: [], kept: [] },
     input.token_count - parser.pos + 1,
-    |s: GenAcc|
+    |s: PartialGenericParams|
       if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge())
           || at_token(input, s.parser, token_pipe()) {
         Stop(Ok({ parser: s.parser, node: { types: s.types, labels: s.labels, kept: s.kept } }))
@@ -632,7 +640,8 @@ fn generic_params(input: Input, parser: Parser) -> Result<Parsed<GenOut>, Parser
           Err(q) -> Stop(Err(q)),
           Ok(n) -> {
             let e = eat(input, n.parser, token_comma());
-            let ls = n.node.fold(s.labels, |acc: List<Ident>, ident: Ident| acc.push(ident));
+            let ls = n.node.fold(s.labels, |acc: List<Identifier>, ident: Identifier|
+              acc.push(ident));
             let next = { ..s, parser: e.parser, labels: ls };
             if e.ok { Continue(next) } else {
               Stop(Ok({ parser: e.parser, node: { types: s.types, labels: ls, kept: s.kept } }))
@@ -641,7 +650,7 @@ fn generic_params(input: Input, parser: Parser) -> Result<Parsed<GenOut>, Parser
         }
       } else {
         let k = marked_by(input, s.parser, b"keep");
-        match expect_ident(input, k.parser, b"a type parameter name, or `[l]` for a label") {
+        match expect_identifier(input, k.parser, b"a type parameter name, or `[l]` for a label") {
           Err(q) -> Stop(Err(q)),
           Ok(n) -> {
             let e = eat(input, n.parser, token_comma());
@@ -656,135 +665,138 @@ fn generic_params(input: Input, parser: Parser) -> Result<Parsed<GenOut>, Parser
       },
   )
 
-/// One bracket may bind several labels: `<[l, k]>` is `<[l], [k]>`.
 fn label_params(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<Ident>>, Parser> / {abort.raise} = {
+) -> Result<ParseOutput<List<Identifier>>, Parser> / {abort.raise} = {
   let o = advance(input, parser);
   let { parser, node: ns } = comma_list(input, o.parser, token_rbracket(), label_name)?;
   let { parser, .. } = expect_close(input, parser, token_rbracket(), o.node, b"`]`")?;
   Ok({ parser: parser, node: ns })
 }
 
-pub fn label_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> / {abort.raise} =
-  expect_ident(input, parser, b"a label name inside `[..]`")
+pub fn label_name(
+  input: Input,
+  parser: Parser,
+) -> Result<ParseOutput<Identifier>, Parser> / {abort.raise} =
+  expect_identifier(input, parser, b"a label name inside `[..]`")
 
-/// The row parameters after `|`.
 fn effect_params(
   input: Input,
   parser: Parser,
-) -> Result<Parsed<List<Ident>>, Parser> / {abort.raise} =
-  iterate({ parser: parser, names: [] }, input.token_count - parser.pos + 1, |s: RowParamsAcc|
-    if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge()) {
-      Stop(Ok({ parser: s.parser, node: s.names }))
-    } else if at_eof(input, s.parser) {
-      Stop(Err(error_here(input, s.parser, b"`>` to close the type parameter list")))
-    } else {
-      match expect_ident(input, s.parser, b"an effect parameter name") {
-        Err(q) -> Stop(Err(q)),
-        Ok(n) -> {
-          let e = eat(input, n.parser, token_comma());
-          let names = s.names.push(n.node);
-          if e.ok { Continue({ parser: e.parser, names: names }) }
-          else { Stop(Ok({ parser: e.parser, node: names })) }
-        },
-      }
-    })
+) -> Result<ParseOutput<List<Identifier>>, Parser> / {abort.raise} =
+  iterate(
+    { parser: parser, names: [] },
+    input.token_count - parser.pos + 1,
+    |s: RowParamsAccumulator|
+      if at_token(input, s.parser, token_gt()) || at_token(input, s.parser, token_ge()) {
+        Stop(Ok({ parser: s.parser, node: s.names }))
+      } else if at_eof(input, s.parser) {
+        Stop(Err(error_here(input, s.parser, b"`>` to close the type parameter list")))
+      } else {
+        match expect_identifier(input, s.parser, b"an effect parameter name") {
+          Err(q) -> Stop(Err(q)),
+          Ok(n) -> {
+            let e = eat(input, n.parser, token_comma());
+            let names = s.names.push(n.node);
+            if e.ok { Continue({ parser: e.parser, names: names }) }
+            else { Stop(Ok({ parser: e.parser, node: names })) }
+          },
+        }
+      },
+  )
 
-// --- The dump ---------------------------------------------------------------
-
-pub fn dump_ty(ty: TypeExpr) -> Bytes / {abort.raise} =
+pub fn dump_type(ty: TypeExpression) -> Bytes / {abort.raise} =
   match ty {
-    TVar(i) -> dump_node(i.span, b"tvar").concat(dump_ident(i)),
-    TCon(x) ->
+    VariableTypeExpression(i) -> dump_node(i.span, b"tvar").concat(dump_identifier(i)),
+    NamedTypeExpression(x) ->
       Bytes::concat_all([
         dump_node(x.span, b"tcon"),
-        dump_qname(x.name),
-        dump_list(x.args, dump_ty),
+        dump_qualified_name(x.name),
+        dump_list(x.args, dump_type),
         if x.labels.len() == 0 && x.rows.len() == 0 { b"" } else {
           Bytes::concat_all([
             dump_word(b"over"),
-            dump_list(x.labels, dump_ident),
+            dump_list(x.labels, dump_identifier),
             dump_list(x.rows, dump_row),
           ])
         },
       ]),
-    TFn(x) ->
+    FunctionTypeExpression(x) ->
       Bytes::concat_all([
         dump_node(x.span, b"tfn"),
         if x.once { dump_word(b"once") } else { b"" },
-        dump_list(x.params, dump_ty),
+        dump_list(x.params, dump_type),
         if x.kept.len() == 0 { b"" }
         else { dump_word(b"keep").concat(dump_list(x.kept, dump_count)) },
-        dump_ty(x.ret),
+        dump_type(x.ret),
         dump_opt(x.effects, dump_row),
       ]),
-    TRecord(x) -> dump_node(x.span, b"trec").concat(dump_list(x.fields, dump_ty_field)),
-    TUnit(x) -> dump_node(x.span, b"tuni"),
-    TBad(x) -> dump_node(x.span, b"tbad"),
+    RecordTypeExpression(x) ->
+      dump_node(x.span, b"trec").concat(dump_list(x.fields, dump_type_field)),
+    UnitTypeExpression(x) -> dump_node(x.span, b"tuni"),
+    InvalidTypeExpression(x) -> dump_node(x.span, b"tbad"),
   }
 
-fn dump_ty_field(f: { name: Ident, ty: TypeExpr }) -> Bytes / {abort.raise} =
-  dump_ident(f.name).concat(dump_ty(f.ty))
+fn dump_type_field(f: { name: Identifier, ty: TypeExpression }) -> Bytes / {abort.raise} =
+  dump_identifier(f.name).concat(dump_type(f.ty))
 
-pub fn dump_row(row: RowExpr) -> Bytes / {abort.raise} =
+pub fn dump_row(row: RowExpression) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(row.span, b"row"),
     dump_list(row.atoms, dump_atom),
-    dump_list(row.aliases, dump_qname),
-    dump_opt(row.tail, dump_ident),
+    dump_list(row.aliases, dump_qualified_name),
+    dump_opt(row.tail, dump_identifier),
     if row.tail_bounded { dump_word(b"bounded") } else { b"" },
   ])
 
-pub fn dump_atom(atom: AtomExpr) -> Bytes / {abort.raise} =
+pub fn dump_atom(atom: AtomExpression) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(atom.span, b"atm"),
-    dump_qname(atom.eff),
+    dump_qualified_name(atom.effect_name),
     dump_mode(atom.mode),
-    match atom.op { Some(op) -> dump_ident(op), None -> b"" },
-    dump_opt(atom.resource, dump_ident),
+    match atom.op { Some(op) -> dump_identifier(op), None -> b"" },
+    dump_opt(atom.resource, dump_identifier),
     if atom.bounded { dump_word(b"bounded") } else { b"" },
   ])
 
 pub fn dump_mode(mode: Mode) -> Bytes =
   match mode {
-    MRead -> dump_word(b"read"),
-    MWrite -> dump_word(b"write"),
-    MBad -> dump_word(b"badmode"),
-    MRaise -> dump_word(b"raise"),
+    ReadMode -> dump_word(b"read"),
+    WriteMode -> dump_word(b"write"),
+    InvalidMode -> dump_word(b"badmode"),
+    RaiseMode -> dump_word(b"raise"),
   }
 
-/// `Generics` has no span, so its dump leads with a word.
 pub fn dump_generics(generics: Generics) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_word(b"gen"),
-    dump_list(generics.types, dump_ident),
-    dump_list(generics.effects, dump_ident),
-    dump_list(generics.labels, dump_ident),
+    dump_list(generics.types, dump_identifier),
+    dump_list(generics.effects, dump_identifier),
+    dump_list(generics.labels, dump_identifier),
     if generics.kept.len() == 0 { b"" }
-    else { dump_word(b"keep").concat(dump_list(generics.kept, dump_ident)) },
+    else { dump_word(b"keep").concat(dump_list(generics.kept, dump_identifier)) },
   ])
 
-// --- The area's own entry point ---------------------------------------------
-
-/// Parses one type on its own, for the tests below.
 pub fn dump_type_of(src: Bytes) -> String / {abort.raise} = {
   let s = start(src);
-  let r = parsed_or(ty(s.input, s.parser), no_ty());
-  String::of_bytes(dump_ty(r.node).concat(dump_diags(r.parser.diags)))
+  let r = parsed_or(ty(s.input, s.parser), no_type());
+  String::of_bytes(dump_type(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
 
 pub fn dump_generics_of(src: Bytes) -> String / {abort.raise} = {
   let s = start(src);
   let r = parsed_or(generics(s.input, s.parser), no_generics());
-  String::of_bytes(dump_generics(r.node).concat(dump_diags(r.parser.diags)))
+  String::of_bytes(dump_generics(r.node).concat(dump_diagnostics(r.parser.diagnostics)))
 }
 
 pub fn mode_text(mode: Mode) -> Bytes =
-  match mode { MRead -> b"read", MWrite -> b"write", MBad -> b"", MRaise -> b"raise" }
-
-// --- Tests ------------------------------------------------------------------
+  match mode {
+    ReadMode -> b"read",
+    WriteMode -> b"write",
+    InvalidMode -> b"",
+    RaiseMode -> b"raise",
+  }
 
 test "a bare uppercase name is a nullary constructor, a lowercase one a variable" {
   assert_eq(dump_type_of(b"Int"), "0:3:tcon;0:3:qname;?0;0:3:ident;@496e74;#0;#0;");
@@ -837,7 +849,6 @@ test "a type's label arguments are bracketed among its type arguments, and its r
     dump_type_of(b"T<| {db.read[users] | e}>"),
     "0:25:tcon;0:1:qname;?0;0:1:ident;@54;#0;%over;#0;#1;4:24:row;#1;5:19:atm;5:7:qname;?0;5:7:ident;@6462;%read;?1;13:18:ident;@7573657273;#0;?1;22:23:ident;@65;#0;",
   );
-  // A `|` no row follows leaves the type applied to its types alone.
   assert_eq(
     dump_type_of(b"T<a |>"),
     "0:6:tcon;0:1:qname;?0;0:1:ident;@54;#1;2:3:tvar;2:3:ident;@61;#0;",
@@ -910,7 +921,6 @@ test "an unclosed delimiter labels the opener as well as the offending token" {
   assert_eq(dump_type_of(b"("), "0:0:tbad;#1;!E0001:1:1:2:0;=1:1:1;=0:1:0;")
 }
 
-// `push_diag` drops the `expect_close` that trips at the same offset with the same code.
 test "a token that cannot start a type is one diagnostic and no more" {
   assert_eq(dump_type_of(b"<"), "0:0:tbad;#1;!E0001:0:1:1:0;=0:1:1;");
   assert_eq(dump_type_of(b"{x: }"), "0:0:tbad;#1;!E0001:4:5:1:0;=4:5:1;")
@@ -932,7 +942,6 @@ test "a bracketed name in the type parameter list binds a label" {
     dump_generics_of(b"<a, [l] | e>"),
     "%gen;#1;1:2:ident;@61;#1;10:11:ident;@65;#1;5:6:ident;@6c;#0;",
   );
-  // One bracket may bind several labels, and two brackets bind the same two.
   assert_eq(dump_generics_of(b"<[l, k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;5:6:ident;@6b;#0;");
   assert_eq(dump_generics_of(b"<[l], [k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;7:8:ident;@6b;#0;")
 }
@@ -948,7 +957,6 @@ test "an unclosed record type labels its opening brace; a `<` has no opener to l
   assert_eq(dump_type_of(b"List<a"), "0:0:tbad;#1;!E0001:6:6:1:0;=6:6:1;")
 }
 
-// `comma_list` breaks on the missing comma, then the close check sees `}`.
 test "a trailing comma in a record type is allowed" {
   assert_eq(
     dump_type_of(b"{x: Int, }"),

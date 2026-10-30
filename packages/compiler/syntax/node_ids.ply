@@ -1,0 +1,867 @@
+import compiler.syntax.parsing (Span, Identifier, QName, node_id_base, synthetic_span,
+                                synthetic_too_deep, role_try_return, role_detached, role_try_arg,
+                                role_member_default)
+import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, SchemaItem, ExternItem,
+                              TypeItem, EffectItem, DeriveItem, InstanceItem, NumericItem,
+                              EffectSetItem, FnDefinition, Binder, SpecClause, ReturnsParam,
+                              AliasBody, SumBody, NominalBody, VariantDefinition, OpDefinition,
+                              NumericOp, parse)
+import compiler.syntax.type_syntax (TypeExpression, NamedTypeExpression, FunctionTypeExpression,
+                                    RecordTypeExpression, RowExpression, AtomExpression)
+import compiler.expand.rewrite.shared (expressions_matching)
+import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
+                                    UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                                    MatchExpression, BlockExpression, RecordExpression,
+                                    RecordUpdateExpression, PropagateExpression, FieldExpression,
+                                    ListExpression, PerformExpression, HandleExpression,
+                                    WithHoldExpression, SimulateExpression, ParallelExpression,
+                                    TaggedLiteralExpression, InvalidExpression, HoleExpression,
+                                    TryBlockExpression, Statement, LetStatement, LetElseStatement,
+                                    ExpressionStatement, AssignmentStatement, Param, NamedArg,
+                                    MatchArm, HandleClause, ReturnClause, HandlerVar,
+                                    RecordLiteralField, Hole, expression_span)
+import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
+                                 PatternRange, PatternConstructor, PatternRecord, PatternList,
+                                 PatternOr, PatternInvalid)
+
+pub fn numbered_module(m: Module) -> Module / {abort.raise} = { ..m, items: m.items.map(numbered) }
+
+pub fn numbered(item: Item) -> Item / {abort.raise} =
+  within(numbering(|s: Span, k: Int| { ..s, site: k }, item, 1))
+
+pub fn numbered_made(item: Item) -> Item / {abort.raise} =
+  within(
+    numbering(
+      |s: Span, k: Int| if s.site == 0 { { ..s, site: k } } else { s },
+      item,
+      last_site(item) + 1,
+    ),
+  )
+
+effect seen {
+  write site(with_node_id: Int) -> Unit
+}
+
+fn last_site(item: Item) -> Int / {abort.raise} =
+  handle {
+    numbering(
+      |s: Span, k: Int| {
+        seen.site(s.site);
+        s
+      },
+      item,
+      1,
+    ).n
+  } with {
+    var top: Int = 0,
+    seen.site(with_node_id) -> if with_node_id < node_id_base() && with_node_id > top {
+      top = with_node_id;
+    } else { () },
+    return walked -> top,
+  }
+
+fn within(out: { item: Item, n: Int }) -> Item / {abort.raise} =
+  if out.n >= node_id_base() { panic("an item of more nodes than its sites can number") }
+  else { out.item }
+
+fn numbering<| e>(
+  mark: (Span, Int) -> Span / e,
+  item: Item,
+  n: Int,
+) -> { item: Item, n: Int } / {abort.raise | e} =
+  match item {
+    FunctionItem(d) -> {
+      let f = number_function(mark, d, n);
+      { item: FunctionItem(f.d), n: f.n }
+    },
+    TypeItem(d) -> {
+      let body = match d.body {
+        AliasBody(t) -> {
+          let o = number_type(mark, t, n + 1);
+          { b: AliasBody(o.t), n: o.n }
+        },
+        NominalBody(t) -> {
+          let o = number_type(mark, t, n + 1);
+          { b: NominalBody(o.t), n: o.n }
+        },
+        SumBody(vs) -> {
+          let o = vs.fold(
+            { vs: [], n: n + 1 },
+            |acc: { vs: List<VariantDefinition>, n: Int }, v: VariantDefinition| {
+              let fs = number_types(mark, v.fields, acc.n + 1);
+              { vs: acc.vs.push({ ..v, name: named(mark, v.name, acc.n), fields: fs.ts }), n: fs.n }
+            },
+          );
+          { b: SumBody(o.vs), n: o.n }
+        },
+        other -> { b: other, n: n + 1 },
+      };
+      { item: TypeItem({ ..d, name: named(mark, d.name, n), body: body.b }), n: body.n }
+    },
+    EffectItem(d) -> {
+      let ops = d.operations.fold(
+        { operations: [], n: n + 1 },
+        |acc: { operations: List<OpDefinition>, n: Int }, op: OpDefinition| {
+          let ps = number_types(mark, op.params, acc.n + 1);
+          let r = number_type(mark, op.ret, ps.n);
+          let documented = idents(mark, op.param_names, r.n);
+          {
+            operations: acc.operations.push({
+              ..op,
+              name: named(mark, op.name, acc.n),
+              params: ps.ts,
+              ret: r.t,
+              param_names: documented.names,
+            }),
+            n: documented.n,
+          }
+        },
+      );
+      {
+        item: EffectItem({ ..d, name: named(mark, d.name, n), operations: ops.operations }),
+        n: ops.n,
+      }
+    },
+    DeriveItem(d) -> { item: DeriveItem({ ..d, target: named(mark, d.target, n) }), n: n + 1 },
+    InstanceItem(d) ->
+      {
+        item: InstanceItem({ ..d, target: named(mark, d.target, n), by: named(mark, d.by, n + 1) }),
+        n: n + 2,
+      },
+    NumericItem(d) -> {
+      let ops = idents(mark, d.operations.map(|x: NumericOp| x.by), n + 1);
+      {
+        item: NumericItem({
+          ..d,
+          target: named(mark, d.target, n),
+          operations: range(0, d.operations.len()).map(|i: Int|
+            { ..d.operations.get(i), by: ops.names.get(i) }),
+        }),
+        n: ops.n,
+      }
+    },
+    EffectSetItem(d) -> {
+      let atoms = number_atoms(mark, d.atoms, n + 1);
+      let includes = number_qnames(mark, d.includes, atoms.n);
+      {
+        item: EffectSetItem({
+          ..d,
+          name: named(mark, d.name, n),
+          atoms: atoms.xs,
+          includes: includes.qs,
+        }),
+        n: includes.n,
+      }
+    },
+    TestItem(d) -> match d.cases {
+      None -> {
+        let b: NumberedExpression = number_expression(mark, d.body, n);
+        { item: TestItem({ ..d, body: b.e }), n: b.n }
+      },
+      Some(c) -> {
+        let ty = number_type(mark, c.ty, n + 3);
+        let table: NumberedExpression = number_expression(mark, c.table, ty.n);
+        let label: NumberedExpression = number_expression(mark, c.label, table.n);
+        let b: NumberedExpression = number_expression(mark, d.body, label.n);
+        {
+          item: TestItem({
+            ..d,
+            cases: Some({
+              ..c,
+              for_span: mark(c.for_span, n),
+              in_span: mark(c.in_span, n + 1),
+              binder: named(mark, c.binder, n + 2),
+              ty: ty.t,
+              table: table.e,
+              label: label.e,
+            }),
+            body: b.e,
+          }),
+          n: b.n,
+        }
+      },
+    },
+    LawItem(d) -> {
+      let bs = number_binders(mark, d.binders, n);
+      let g: { e: Option<Expression>, n: Int } = number_optional(mark, d.guard, bs.n);
+      let b: NumberedExpression = number_expression(mark, d.body, g.n);
+      { item: LawItem({ ..d, binders: bs.bs, guard: g.e, body: b.e }), n: b.n }
+    },
+    SchemaItem(d) -> {
+      let ps = number_binders(mark, d.params, n);
+      let bs = number_binders(mark, d.binders, ps.n);
+      let g: { e: Option<Expression>, n: Int } = number_optional(mark, d.guard, bs.n);
+      let b: NumberedExpression = number_expression(mark, d.body, g.n);
+      { item: SchemaItem({ ..d, params: ps.bs, binders: bs.bs, guard: g.e, body: b.e }), n: b.n }
+    },
+    ExternItem(d) -> {
+      let ps: NumberedParameters = number_parameters(mark, d.params, n + 1);
+      let r = number_type(mark, d.ret, ps.n);
+      let e = number_maybe_row(mark, d.effects, r.n);
+      let sp = number_clauses(mark, d.spec, e.n);
+      {
+        item: ExternItem({
+          ..d,
+          name: named(mark, d.name, n),
+          params: ps.ps,
+          ret: r.t,
+          effects: e.r,
+          spec: sp.cs,
+        }),
+        n: sp.n,
+      }
+    },
+  }
+
+pub fn placed(copied: Expression, with_node_id: Span, slot: Int) -> Expression =
+  number_expression(
+    |_: Span, n: Int| synthetic_span(with_node_id, role_member_default(slot) + n),
+    copied,
+    0,
+  ).e
+
+type NumberedExpression = { e: Expression, n: Int }
+
+type NumberedExpressions = { es: List<Expression>, n: Int }
+
+type NumberedPattern = { p: Pattern, n: Int }
+
+type NumberedParameters = { ps: List<Param>, n: Int }
+
+fn number_function<| e>(
+  mark: (Span, Int) -> Span / e,
+  d: FnDefinition,
+  n: Int,
+) -> { d: FnDefinition, n: Int } / e = {
+  let ps: NumberedParameters = number_parameters(mark, d.params, n + 1);
+  let r = number_maybe_type(mark, d.ret, ps.n);
+  let e = number_maybe_row(mark, d.effects, r.n);
+  let b: NumberedExpression = number_expression(mark, d.body, e.n);
+  let sp = number_clauses(mark, d.spec, b.n);
+  let m: { e: Option<Expression>, n: Int } = number_optional(mark, d.decreases, sp.n);
+  let returns = match d.returns {
+    Some(ReturnsParam(p)) -> Some(ReturnsParam(named(mark, p, m.n))),
+    r -> r,
+  };
+  {
+    d: {
+      ..d,
+      name: named(mark, d.name, n),
+      params: ps.ps,
+      ret: r.t,
+      effects: e.r,
+      body: b.e,
+      spec: sp.cs,
+      decreases: m.e,
+      returns: returns,
+    },
+    n: m.n + 1,
+  }
+}
+
+fn number_parameters<| e>(
+  mark: (Span, Int) -> Span / e,
+  ps: List<Param>,
+  n: Int,
+) -> NumberedParameters / e =
+  ps.fold({ ps: [], n: n }, |acc: NumberedParameters, p: Param| {
+    let ty = number_maybe_type(mark, p.ty, acc.n + 1);
+    let cost = maybe_named(mark, p.cost, ty.n);
+    let space = maybe_named(mark, p.space, cost.n);
+    let d: { e: Option<Expression>, n: Int } = number_optional(mark, p.default, space.n);
+    {
+      ps: acc.ps.push({
+        ..p,
+        name: named(mark, p.name, acc.n),
+        span: mark(p.span, acc.n),
+        ty: ty.t,
+        cost: cost.name,
+        space: space.name,
+        default: d.e,
+      }),
+      n: d.n,
+    }
+  })
+
+fn named<| e>(mark: (Span, Int) -> Span / e, name: Identifier, n: Int) -> Identifier / e =
+  { ..name, span: mark(name.span, n) }
+
+fn idents<| e>(
+  mark: (Span, Int) -> Span / e,
+  names: List<Identifier>,
+  n: Int,
+) -> { names: List<Identifier>, n: Int } / e =
+  names.fold({ names: [], n: n }, |acc: { names: List<Identifier>, n: Int }, name: Identifier|
+    { names: acc.names.push(named(mark, name, acc.n)), n: acc.n + 1 })
+
+fn maybe_named<| e>(
+  mark: (Span, Int) -> Span / e,
+  name: Option<Identifier>,
+  n: Int,
+) -> { name: Option<Identifier>, n: Int } / e =
+  match name {
+    Some(x) -> { name: Some(named(mark, x, n)), n: n + 1 },
+    None -> { name: None, n: n },
+  }
+
+fn number_clauses<| e>(
+  mark: (Span, Int) -> Span / e,
+  cs: List<SpecClause>,
+  n: Int,
+) -> { cs: List<SpecClause>, n: Int } / e =
+  cs.fold({ cs: [], n: n }, |acc: { cs: List<SpecClause>, n: Int }, c: SpecClause| {
+    let o: NumberedExpression = number_expression(mark, c.expression, acc.n + 1);
+    { cs: acc.cs.push({ ..c, span: mark(c.span, acc.n), expression: o.e }), n: o.n }
+  })
+
+fn number_binders<| e>(
+  mark: (Span, Int) -> Span / e,
+  bs: List<Binder>,
+  n: Int,
+) -> { bs: List<Binder>, n: Int } / e =
+  bs.fold({ bs: [], n: n }, |acc: { bs: List<Binder>, n: Int }, b: Binder| {
+    let t = number_type(mark, b.ty, acc.n + 1);
+    {
+      bs: acc.bs.push({
+        ..b,
+        span: mark(b.span, acc.n),
+        name: named(mark, b.name, acc.n),
+        ty: t.t,
+      }),
+      n: t.n,
+    }
+  })
+
+fn number_qualified_name<| e>(
+  mark: (Span, Int) -> Span / e,
+  q: QName,
+  n: Int,
+) -> { q: QName, n: Int } / e =
+  match q.module {
+    Some(m) ->
+      { q: { ..q, module: Some(named(mark, m, n)), name: named(mark, q.name, n + 1) }, n: n + 2 },
+    None -> { q: { ..q, name: named(mark, q.name, n) }, n: n + 1 },
+  }
+
+fn number_type<| e>(
+  mark: (Span, Int) -> Span / e,
+  t: TypeExpression,
+  n: Int,
+) -> { t: TypeExpression, n: Int } / e =
+  match t {
+    NamedTypeExpression(c) -> {
+      let q = number_qualified_name(mark, c.name, n);
+      let args = number_types(mark, c.args, q.n);
+      let rows = c.rows.fold(
+        { rs: [], n: args.n },
+        |acc: { rs: List<RowExpression>, n: Int }, r: RowExpression| {
+          let o = numbered_expression_row(mark, r, acc.n);
+          { rs: acc.rs.push(o.r), n: o.n }
+        },
+      );
+      { t: NamedTypeExpression({ ..c, name: q.q, args: args.ts, rows: rows.rs }), n: rows.n }
+    },
+    FunctionTypeExpression(f) -> {
+      let ps = number_types(mark, f.params, n);
+      let r = number_type(mark, f.ret, ps.n);
+      let e = number_maybe_row(mark, f.effects, r.n);
+      { t: FunctionTypeExpression({ ..f, params: ps.ts, ret: r.t, effects: e.r }), n: e.n }
+    },
+    RecordTypeExpression(r) -> {
+      let fs = r.fields.fold(
+        { fs: [], n: n },
+        |acc: { fs: List<{ name: Identifier, ty: TypeExpression }>, n: Int }, f: { name: Identifier, ty: TypeExpression }| {
+          let o = number_type(mark, f.ty, acc.n);
+          { fs: acc.fs.push({ name: f.name, ty: o.t }), n: o.n }
+        },
+      );
+      { t: RecordTypeExpression({ ..r, fields: fs.fs }), n: fs.n }
+    },
+    other -> { t: other, n: n },
+  }
+
+fn number_types<| e>(
+  mark: (Span, Int) -> Span / e,
+  ts: List<TypeExpression>,
+  n: Int,
+) -> { ts: List<TypeExpression>, n: Int } / e =
+  ts.fold({ ts: [], n: n }, |acc: { ts: List<TypeExpression>, n: Int }, t: TypeExpression| {
+    let o = number_type(mark, t, acc.n);
+    { ts: acc.ts.push(o.t), n: o.n }
+  })
+
+fn number_maybe_type<| e>(
+  mark: (Span, Int) -> Span / e,
+  t: Option<TypeExpression>,
+  n: Int,
+) -> { t: Option<TypeExpression>, n: Int } / e =
+  match t {
+    Some(x) -> {
+      let o = number_type(mark, x, n);
+      { t: Some(o.t), n: o.n }
+    },
+    None -> { t: None, n: n },
+  }
+
+fn number_atoms<| e>(
+  mark: (Span, Int) -> Span / e,
+  atoms: List<AtomExpression>,
+  n: Int,
+) -> { xs: List<AtomExpression>, n: Int } / e =
+  atoms.fold({ xs: [], n: n }, |acc: { xs: List<AtomExpression>, n: Int }, a: AtomExpression| {
+    let e = number_qualified_name(mark, a.effect_name, acc.n);
+    let op = maybe_named(mark, a.op, e.n);
+    { xs: acc.xs.push({ ..a, effect_name: e.q, op: op.name }), n: op.n }
+  })
+
+fn number_qnames<| e>(
+  mark: (Span, Int) -> Span / e,
+  qs: List<QName>,
+  n: Int,
+) -> { qs: List<QName>, n: Int } / e =
+  qs.fold({ qs: [], n: n }, |acc: { qs: List<QName>, n: Int }, q: QName| {
+    let o = number_qualified_name(mark, q, acc.n);
+    { qs: acc.qs.push(o.q), n: o.n }
+  })
+
+fn numbered_expression_row<| e>(
+  mark: (Span, Int) -> Span / e,
+  r: RowExpression,
+  n: Int,
+) -> { r: RowExpression, n: Int } / e = {
+  let atoms = number_atoms(mark, r.atoms, n);
+  let aliases = number_qnames(mark, r.aliases, atoms.n);
+  { r: { ..r, atoms: atoms.xs, aliases: aliases.qs }, n: aliases.n }
+}
+
+fn number_maybe_row<| e>(
+  mark: (Span, Int) -> Span / e,
+  r: Option<RowExpression>,
+  n: Int,
+) -> { r: Option<RowExpression>, n: Int } / e =
+  match r {
+    Some(x) -> {
+      let o = numbered_expression_row(mark, x, n);
+      { r: Some(o.r), n: o.n }
+    },
+    None -> { r: None, n: n },
+  }
+
+fn number_optional<| e>(
+  mark: (Span, Int) -> Span / e,
+  x: Option<Expression>,
+  n: Int,
+) -> { e: Option<Expression>, n: Int } / e =
+  match x {
+    Some(y) -> {
+      let o: NumberedExpression = number_expression(mark, y, n);
+      { e: Some(o.e), n: o.n }
+    },
+    None -> { e: None, n: n },
+  }
+
+fn number_expression<| e>(
+  mark: (Span, Int) -> Span / e,
+  e: Expression,
+  n: Int,
+) -> NumberedExpression / e = {
+  let each = |xs: List<Expression>, from: Int|
+    xs.fold({ es: [], n: from }, |acc: NumberedExpressions, x: Expression| {
+      let o: NumberedExpression = number_expression(mark, x, acc.n);
+      { es: acc.es.push(o.e), n: o.n }
+    });
+  let opt = |x: Option<Expression>, from: Int|
+    match x {
+      Some(y) -> {
+        let o: NumberedExpression = number_expression(mark, y, from);
+        { e: Some(o.e), n: o.n }
+      },
+      None -> { e: None, n: from },
+    };
+  let fields = |fs: List<RecordLiteralField>, from: Int|
+    fs.fold(
+      { fs: [], n: from },
+      |acc: { fs: List<RecordLiteralField>, n: Int }, f: RecordLiteralField| {
+        let v: NumberedExpression = number_expression(mark, f.value, acc.n);
+        { fs: acc.fs.push({ ..f, value: v.e }), n: v.n }
+      },
+    );
+  match e {
+    LiteralExpression(l) -> { e: LiteralExpression({ ..l, span: mark(l.span, n) }), n: n + 1 },
+    NameExpression(v) -> {
+      let m = maybe_named(mark, v.name.module, n + 1);
+      {
+        e: NameExpression({
+          span: mark(v.span, n),
+          name: { ..v.name, module: m.name, name: named(mark, v.name.name, n) },
+        }),
+        n: m.n,
+      }
+    },
+    InvalidExpression(b) -> { e: InvalidExpression({ span: mark(b.span, n) }), n: n + 1 },
+    HoleExpression(h) -> { e: HoleExpression({ ..h, span: mark(h.span, n) }), n: n + 1 },
+    BinaryExpression(b) -> {
+      let l: NumberedExpression = number_expression(mark, b.lhs, n + 1);
+      let r: NumberedExpression = number_expression(mark, b.rhs, l.n);
+      { e: BinaryExpression({ ..b, span: mark(b.span, n), lhs: l.e, rhs: r.e }), n: r.n }
+    },
+    UnaryExpression(u) -> {
+      let o: NumberedExpression = number_expression(mark, u.operand, n + 1);
+      { e: UnaryExpression({ ..u, span: mark(u.span, n), operand: o.e }), n: o.n }
+    },
+    LambdaExpression(l) -> {
+      let ps: NumberedParameters = number_parameters(mark, l.params, n + 1);
+      let r = number_maybe_type(mark, l.ret, ps.n);
+      let b: NumberedExpression = number_expression(mark, l.body, r.n);
+      { e: LambdaExpression({ span: mark(l.span, n), params: ps.ps, ret: r.t, body: b.e }), n: b.n }
+    },
+    CallExpression(a) -> {
+      let f: NumberedExpression = number_expression(mark, a.function, n + 1);
+      let xs: NumberedExpressions = each(a.args, f.n);
+      let ns = a.named.fold(
+        { ns: [], n: xs.n },
+        |acc: { ns: List<NamedArg>, n: Int }, arg: NamedArg| {
+          let o: NumberedExpression = number_expression(mark, arg.value, acc.n);
+          { ns: acc.ns.push({ ..arg, value: o.e }), n: o.n }
+        },
+      );
+      {
+        e: CallExpression({ ..a, span: mark(a.span, n), function: f.e, args: xs.es, named: ns.ns }),
+        n: ns.n,
+      }
+    },
+    IfExpression(i) -> {
+      let c: NumberedExpression = number_expression(mark, i.cond, n + 1);
+      let t: NumberedExpression = number_expression(mark, i.then_branch, c.n);
+      let el: NumberedExpression = number_expression(mark, i.else_branch, t.n);
+      {
+        e: IfExpression({ span: mark(i.span, n), cond: c.e, then_branch: t.e, else_branch: el.e }),
+        n: el.n,
+      }
+    },
+    MatchExpression(m) -> {
+      let sc: NumberedExpression = number_expression(mark, m.scrutinee, n + 1);
+      let arms = m.arms.fold(
+        { arms: [], n: sc.n },
+        |acc: { arms: List<MatchArm>, n: Int }, arm: MatchArm| {
+          let pt: NumberedPattern = number_pattern(mark, arm.pattern, acc.n + 1);
+          let g: { e: Option<Expression>, n: Int } = opt(arm.guard, pt.n);
+          let b: NumberedExpression = number_expression(mark, arm.body, g.n);
+          {
+            arms: acc.arms.push({
+              pattern: pt.p,
+              guard: g.e,
+              body: b.e,
+              span: mark(arm.span, acc.n),
+            }),
+            n: b.n,
+          }
+        },
+      );
+      { e: MatchExpression({ span: mark(m.span, n), scrutinee: sc.e, arms: arms.arms }), n: arms.n }
+    },
+    BlockExpression(b) -> {
+      let st = b.statements.fold(
+        { statements: [], n: n + 1 },
+        |acc: { statements: List<Statement>, n: Int }, stmt: Statement|
+          match stmt {
+            LetStatement(l) -> {
+              let pt: NumberedPattern = number_pattern(mark, l.pattern, acc.n + 1);
+              let ty = number_maybe_type(mark, l.ty, pt.n);
+              let v: NumberedExpression = number_expression(mark, l.value, ty.n);
+              {
+                statements: acc.statements.push(
+                  LetStatement({
+                    ..l,
+                    span: mark(l.span, acc.n),
+                    pattern: pt.p,
+                    ty: ty.t,
+                    value: v.e,
+                  }),
+                ),
+                n: v.n,
+              }
+            },
+            LetElseStatement(l) -> {
+              let pt: NumberedPattern = number_pattern(mark, l.pattern, acc.n + 1);
+              let ty = number_maybe_type(mark, l.ty, pt.n);
+              let v: NumberedExpression = number_expression(mark, l.value, ty.n);
+              let fb: NumberedExpression = number_expression(mark, l.fallback, v.n);
+              {
+                statements: acc.statements.push(
+                  LetElseStatement({
+                    ..l,
+                    span: mark(l.span, acc.n),
+                    pattern: pt.p,
+                    ty: ty.t,
+                    value: v.e,
+                    fallback: fb.e,
+                  }),
+                ),
+                n: fb.n,
+              }
+            },
+            ExpressionStatement(x) -> {
+              let o: NumberedExpression = number_expression(mark, x, acc.n);
+              { statements: acc.statements.push(ExpressionStatement(o.e)), n: o.n }
+            },
+            AssignmentStatement(x) -> {
+              let v: NumberedExpression = number_expression(mark, x.value, acc.n + 1);
+              {
+                statements: acc.statements.push(
+                  AssignmentStatement({
+                    span: mark(x.span, acc.n),
+                    name: named(mark, x.name, acc.n),
+                    value: v.e,
+                  }),
+                ),
+                n: v.n,
+              }
+            },
+          },
+      );
+      let t: { e: Option<Expression>, n: Int } = opt(b.tail, st.n);
+      {
+        e: BlockExpression({ span: mark(b.span, n), tail: t.e, statements: st.statements }),
+        n: t.n,
+      }
+    },
+    RecordExpression(r) -> {
+      let fs: { fs: List<RecordLiteralField>, n: Int } = fields(r.fields, n + 1);
+      { e: RecordExpression({ span: mark(r.span, n), fields: fs.fs }), n: fs.n }
+    },
+    RecordUpdateExpression(r) -> {
+      let base: NumberedExpression = number_expression(mark, r.base, n + 1);
+      let fs: { fs: List<RecordLiteralField>, n: Int } = fields(r.fields, base.n);
+      { e: RecordUpdateExpression({ span: mark(r.span, n), base: base.e, fields: fs.fs }), n: fs.n }
+    },
+    PropagateExpression(t) -> {
+      let o: NumberedExpression = number_expression(mark, t.operand, n + 1);
+      { e: PropagateExpression({ span: mark(t.span, n), operand: o.e }), n: o.n }
+    },
+    FieldExpression(f) -> {
+      let base: NumberedExpression = number_expression(mark, f.base, n + 1);
+      { e: FieldExpression({ ..f, span: mark(f.span, n), base: base.e }), n: base.n }
+    },
+    ListExpression(l) -> {
+      let xs: NumberedExpressions = each(l.items, n + 1);
+      { e: ListExpression({ span: mark(l.span, n), items: xs.es }), n: xs.n }
+    },
+    PerformExpression(p) -> {
+      let m = maybe_named(mark, p.effect_name.module, n + 1);
+      let xs: NumberedExpressions = each(p.args, m.n + 1);
+      {
+        e: PerformExpression({
+          ..p,
+          span: mark(p.span, n),
+          effect_name: {
+            ..p.effect_name,
+            module: m.name,
+            name: named(mark, p.effect_name.name, n),
+          },
+          op: named(mark, p.op, m.n),
+          args: xs.es,
+        }),
+        n: xs.n,
+      }
+    },
+    HandleExpression(h) -> {
+      let vs = h.vars.fold(
+        { vs: [], n: n + 1 },
+        |acc: { vs: List<HandlerVar>, n: Int }, v: HandlerVar| {
+          let ty = number_maybe_type(mark, v.ty, acc.n + 2);
+          let o: NumberedExpression = number_expression(mark, v.init, ty.n);
+          {
+            vs: acc.vs.push({
+              span: mark(v.span, acc.n),
+              name: named(mark, v.name, acc.n + 1),
+              ty: ty.t,
+              init: o.e,
+            }),
+            n: o.n,
+          }
+        },
+      );
+      let body: NumberedExpression = number_expression(mark, h.body, vs.n);
+      let cs = h.clauses.fold(
+        { cs: [], n: body.n },
+        |acc: { cs: List<HandleClause>, n: Int }, c: HandleClause| {
+          let eff = number_qualified_name(mark, c.effect_name, acc.n + 1);
+          let ps = idents(mark, c.params, eff.n + 1);
+          let label = maybe_named(mark, c.label_binder, ps.n);
+          let resume = maybe_named(mark, c.resume, label.n);
+          let o: NumberedExpression = number_expression(mark, c.body, resume.n);
+          {
+            cs: acc.cs.push({
+              ..c,
+              span: mark(c.span, acc.n),
+              effect_name: eff.q,
+              op: named(mark, c.op, eff.n),
+              params: ps.names,
+              label_binder: label.name,
+              resume: resume.name,
+              body: o.e,
+            }),
+            n: o.n,
+          }
+        },
+      );
+      let ret: { r: Option<ReturnClause>, n: Int } = match h.ret {
+        Some(r) -> {
+          let o: NumberedExpression = number_expression(mark, r.body, cs.n + 2);
+          {
+            r: Some({
+              ..r,
+              span: mark(r.span, cs.n),
+              binder: named(mark, r.binder, cs.n + 1),
+              body: o.e,
+            }),
+            n: o.n,
+          }
+        },
+        None -> { r: None, n: cs.n },
+      };
+      {
+        e: HandleExpression({
+          span: mark(h.span, n),
+          body: body.e,
+          ret: ret.r,
+          clauses: cs.cs,
+          vars: vs.vs,
+        }),
+        n: ret.n,
+      }
+    },
+    WithHoldExpression(w) -> {
+      let a: NumberedExpression = number_expression(mark, w.acquire, n + 1);
+      let r: NumberedExpression = number_expression(mark, w.release, a.n);
+      let b: NumberedExpression = number_expression(mark, w.body, r.n + 1);
+      {
+        e: WithHoldExpression({
+          ..w,
+          span: mark(w.span, n),
+          acquire: a.e,
+          release: r.e,
+          binder: named(mark, w.binder, r.n),
+          body: b.e,
+        }),
+        n: b.n,
+      }
+    },
+    SimulateExpression(x) -> {
+      let b: NumberedExpression = number_expression(mark, x.body, n + 1);
+      { e: SimulateExpression({ span: mark(x.span, n), body: b.e }), n: b.n }
+    },
+    ParallelExpression(x) -> {
+      let xs: NumberedExpressions = each(x.branches, n + 1);
+      { e: ParallelExpression({ span: mark(x.span, n), branches: xs.es }), n: xs.n }
+    },
+    TryBlockExpression(t) -> {
+      let raised = match t.raise {
+        Some(r) -> {
+          let eff = number_qualified_name(mark, r.effect_name, n + 1);
+          { r: Some({ effect_name: eff.q, op: named(mark, r.op, eff.n) }), n: eff.n + 1 }
+        },
+        None -> { r: None, n: n + 1 },
+      };
+      let b: NumberedExpression = number_expression(mark, t.body, raised.n);
+      { e: TryBlockExpression({ span: mark(t.span, n), raise: raised.r, body: b.e }), n: b.n }
+    },
+    TaggedLiteralExpression(t) -> {
+      let hs = t.holes.fold({ hs: [], n: n + 3 }, |acc: { hs: List<Hole>, n: Int }, h: Hole| {
+        let o: NumberedExpression = number_expression(mark, h.value, acc.n + 1);
+        { hs: acc.hs.push({ ..h, quoted: mark(h.quoted, acc.n), value: o.e }), n: o.n }
+      });
+      {
+        e: TaggedLiteralExpression({
+          ..t,
+          span: mark(t.span, n),
+          quoted: mark(t.quoted, n + 1),
+          tag: named(mark, t.tag, n + 2),
+          holes: hs.hs,
+        }),
+        n: hs.n,
+      }
+    },
+  }
+}
+
+fn node_ids_of(src: Bytes, name: Bytes) -> List<Int> / {abort.raise} = {
+  let m = numbered_module(parse(src).node);
+  expressions_matching(
+    { ..m, items: m.items.filter(|item: Item| item_named(item, name)) },
+    |_: Expression| true,
+  ).map(|e: Expression| expression_span(e).site)
+}
+
+fn item_named(item: Item, name: Bytes) -> Bool =
+  match item { FunctionItem(d) -> d.name.name == name, TestItem(t) -> t.name == name, _ -> false }
+
+test "an item's sites are its own: an edit to another item, or a cut of its module, moves none" {
+  let g = b"fn g(y: Int) -> Int = if y > 0 { y } else { 0 - y }\n";
+  let before = node_ids_of(Bytes::concat_all([b"fn f(x: Int) -> Int = x + 1\n", g]), b"g");
+  assert(before.len() > 4);
+  assert_eq(before.filter(|s: Int| s == 0), []);
+  assert_eq(before.unique().len(), before.len());
+  let edited = b"/// Doubled.\nfn f(x: Int) -> Int = { let z = x * 2; z + 1 }\ntest \"t\" { () }\n";
+  assert_eq(node_ids_of(edited.concat(g), b"g"), before);
+  assert_eq(node_ids_of(g, b"g"), before)
+}
+
+test "a minted site is no numbered one, nor one another node or role mints" {
+  let src = b"fn f(xs: List<Int>, d: Int = 3) -> Int = match xs { [x, ..] -> try { x + d }, [] -> d }\n";
+  let m = numbered_module(parse(src).node);
+  let spans = expressions_matching(m, |_: Expression| true).map(expression_span);
+  let numbered = spans.map(|s: Span| s.site);
+  let roles = [role_try_return(), role_detached(), role_try_arg(3), role_member_default(2) + 5];
+  let made = spans.flat_map(|s: Span| roles.map(|k: Int| synthetic_span(s, k).site));
+  assert_eq(made.filter(|s: Int| numbered.contains(s)), []);
+  assert_eq(made.unique().len(), made.len());
+  assert_eq(made.filter(synthetic_too_deep), [])
+}
+
+fn number_pattern<| e>(mark: (Span, Int) -> Span / e, p: Pattern, n: Int) -> NumberedPattern / e = {
+  let each = |ps: List<Pattern>, from: Int|
+    ps.fold({ ps: [], n: from }, |acc: { ps: List<Pattern>, n: Int }, x: Pattern| {
+      let o: NumberedPattern = number_pattern(mark, x, acc.n);
+      { ps: acc.ps.push(o.p), n: o.n }
+    });
+  match p {
+    PatternWildcard(w) -> { p: PatternWildcard({ span: mark(w.span, n) }), n: n + 1 },
+    PatternVariable(v) ->
+      { p: PatternVariable({ span: mark(v.span, n), name: named(mark, v.name, n) }), n: n + 1 },
+    PatternLiteral(l) -> { p: PatternLiteral({ ..l, span: mark(l.span, n) }), n: n + 1 },
+    PatternRange(r) -> { p: PatternRange({ ..r, span: mark(r.span, n) }), n: n + 1 },
+    PatternConstructor(c) -> {
+      let q = number_qualified_name(mark, c.name, n + 1);
+      let xs: { ps: List<Pattern>, n: Int } = each(c.args, q.n);
+      { p: PatternConstructor({ span: mark(c.span, n), name: q.q, args: xs.ps }), n: xs.n }
+    },
+    PatternRecord(r) -> {
+      let fs = r.fields.fold(
+        { fs: [], n: n + 1 },
+        |acc: { fs: List<{ name: Identifier, pattern: Pattern }>, n: Int }, f: { name: Identifier, pattern: Pattern }| {
+          let o: NumberedPattern = number_pattern(mark, f.pattern, acc.n);
+          { fs: acc.fs.push({ name: f.name, pattern: o.p }), n: o.n }
+        },
+      );
+      { p: PatternRecord({ ..r, span: mark(r.span, n), fields: fs.fs }), n: fs.n }
+    },
+    PatternList(l) -> {
+      let xs: { ps: List<Pattern>, n: Int } = each(l.items, n + 1);
+      let rest: { p: Option<Pattern>, n: Int } = match l.rest {
+        Some(x) -> {
+          let o: NumberedPattern = number_pattern(mark, x, xs.n);
+          { p: Some(o.p), n: o.n }
+        },
+        None -> { p: None, n: xs.n },
+      };
+      { p: PatternList({ span: mark(l.span, n), rest: rest.p, items: xs.ps }), n: rest.n }
+    },
+    PatternOr(o) -> {
+      let xs: { ps: List<Pattern>, n: Int } = each(o.alternatives, n + 1);
+      { p: PatternOr({ span: mark(o.span, n), alternatives: xs.ps }), n: xs.n }
+    },
+    PatternInvalid(b) -> { p: PatternInvalid({ span: mark(b.span, n) }), n: n + 1 },
+  }
+}

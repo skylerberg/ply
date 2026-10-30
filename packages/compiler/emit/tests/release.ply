@@ -1,0 +1,338 @@
+import compiler.check.types (Type, NamedType, RecordType, int_type, string_type, list_type)
+import compiler.check.known (chan_type)
+import compiler.emit.emit_harness (program_of, printed_by_ir)
+import compiler.emit.layout (SumCases)
+import compiler.emit.representations
+import compiler.emit.representations (Constructors)
+import compiler.emit.release (Part, WordAt, ByCase, CaseBox, Object, BoxContents, layout_parts,
+                              drop_of, generated, case_dropped, never_kept, root_of, case_root)
+import compiler.emit.keys
+import compiler.emit.keys (RootKey, Named, TypeOp, Drop, Dup, Copy, Share, Keep, Lower, Lift,
+                           OnWordForm, generated_key, root_name, root_text)
+import compiler.emit.verify (ownership_fault)
+import compiler.emit.typed_ir (no_closure_evidence, Fn, Var, Block, Inst, Case, Destructure, Let,
+                               If, Restart, Dec, Return, IfUnique, VarOperand, AsWord, AsSum, AsInt,
+                               Metered, BorrowedParam, OwnedParam, OwnedResult, Closure, no_links)
+import compiler.emit.borrow_inference (with_conventions)
+import compiler.emit.root_emission (built_form)
+import compiler.emit.lower.marshalling (word_form_entry)
+import compiler.emit.print.calling (lambda_text)
+import compiler.emit.print.count_functions (allocates)
+import compiler.emit.print.text (empty_printing)
+import compiler.emit.output (SharedFn)
+import compiler.emit.pieces (pieces_text)
+import compiler.emit.roots (symbol_of)
+import compiler.syntax.parsing (span_between)
+import compiler.emit.print (printed_fn)
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Tree = | Leaf | Node(Tree, Int, Tree)\n",
+    b"type Expr = | Num(Int) | Add(Expr, Expr) | Neg(Expr) | Name(String)\n",
+    b"type Pair = { name: String, items: List<Int>, tree: Tree }\n",
+    b"type Job = | Run((Int) -> Int, Int) | Idle\n",
+    b"fn uses(t: Tree, e: Expr, p: Pair, j: Job) -> Int = 0\n",
+  ])
+
+fn named_type(name: Bytes) -> Type = NamedType({ name: name, args: [] })
+
+fn corpus_constructors() -> Result<Constructors, Bytes> / {abort.raise} =
+  match program_of(corpus()) { Ok(p) -> Ok(p.setting.constructors), Err(why) -> Err(why) }
+
+fn insts(b: Block) -> List<Inst> =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    match i {
+      Case(c) ->
+        c.arms.fold(
+          acc.push(i).concat(insts(c.rest)),
+          |a: List<Inst>, arm: { when: Int, body: Block }| a.concat(insts(arm.body)),
+        ),
+      If(x) -> acc.push(i).concat(insts(x.then)).concat(insts(x.otherwise)),
+      _ -> acc.push(i),
+    })
+
+fn opened_and_decremented(b: Block) -> { opened: List<Var>, decremented: List<Var> } =
+  insts(b).fold(
+    { opened: [], decremented: [] },
+    |acc: { opened: List<Var>, decremented: List<Var> }, i: Inst|
+      match i {
+        Destructure(o) -> { ..acc, opened: acc.opened.concat(o.words) },
+        Dec(v) -> { ..acc, decremented: acc.decremented.push(v) },
+        _ -> acc,
+      },
+  )
+
+test "a tree's drop root lets go of its left subtree and starts again on its right" {
+  let tree = named_type(b"m.Tree");
+  match corpus_constructors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(constructors) -> {
+      let f = generated(constructors, drop_of(tree));
+      let all = insts(f.body);
+      let opens = all.fold([], |acc: List<{ of: Var, words: List<Var> }>, i: Inst|
+        match i { Destructure(o) -> acc.push(o), _ -> acc });
+      let subtrees = opened_and_decremented(f.body).opened.filter(|v: Var|
+        v.ty == tree && !opens.any(|o: { of: Var, words: List<Var> }| o.of == v));
+      assert_eq(subtrees.len(), 2);
+      assert(opened_and_decremented(f.body).decremented.contains(subtrees.get(0)), None);
+      let last = all.fold(None, |found: Option<Var>, i: Inst|
+        match i {
+          Let(l) -> if l.value == IfUnique(subtrees.get(1)) { Some(l.var) } else { found },
+          _ -> found,
+        });
+      match last {
+        Some(v) -> assert(all.contains(Restart([VarOperand(v)])), None),
+        None -> assert(false, None),
+      }
+    },
+  }
+}
+
+test "a wide sum is let go of by its case, each boxed case at its own root, which holds its sums whole" {
+  let expression = named_type(b"m.Expr");
+  match corpus_constructors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(constructors) -> match representations::layout_of(constructors, expression) {
+      SumCases(s) -> {
+        match layout_parts(constructors, expression, SumCases(s), 0) {
+          [ByCase(c)] ->
+            assert_eq(
+              c.cases.map(|k: { case: Int, parts: List<Part> }|
+                k.parts.map(|p: Part| match p { WordAt(w) -> Some(w.how), ByCase(_) -> None })),
+              [
+                [Some(CaseBox({ sum: expression, case: 1 }))],
+                [Some(CaseBox({ sum: expression, case: 2 }))],
+                [Some(Object(drop_of(string_type())))],
+              ],
+            ),
+          parts -> assert_eq(parts.len(), 1),
+        };
+        let add = case_dropped(
+          constructors,
+          Named(b"m.drop_add"),
+          expression,
+          1,
+          |t: Type| representations::layout_of(constructors, t),
+          |t: Type| representations::word_form(constructors, t),
+        );
+        let d = opened_and_decremented(add.body);
+        assert_eq(d.opened.map(|v: Var| v.ty), [expression, expression]);
+        assert(
+          d.opened.all(|v: Var| match v.representation { AsSum(_) -> true, _ -> false }),
+          None,
+        );
+        assert_eq(d.decremented, d.opened)
+      },
+      _ -> assert(false, None),
+    },
+  }
+}
+
+test "a record's box lets go of its pointers and of a sum it holds whole" {
+  let pair = RecordType([
+    { name: b"items", ty: list_type(int_type()) },
+    { name: b"name", ty: string_type() },
+    { name: b"tree", ty: named_type(b"m.Tree") },
+  ]);
+  match corpus_constructors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(constructors) -> {
+      let f = generated(constructors, drop_of(pair));
+      let d = opened_and_decremented(f.body);
+      assert_eq(d.opened.map(|v: Var| v.ty), [
+        list_type(named_type(b"Int")),
+        named_type(b"String"),
+        named_type(b"m.Tree"),
+      ]);
+      assert_eq(d.decremented, d.opened);
+      assert(match d.opened.get(2).representation { AsSum(_) -> true, _ -> false }, None)
+    },
+  }
+}
+
+test "a type reaching a function value through a case's box is never kept, and a type holding itself is asked once" {
+  match corpus_constructors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(constructors) -> {
+      let held = |ty: Type|
+        never_kept(
+          constructors,
+          BoxContents({ parts: [{ at: 0, ty: ty, representation: AsWord }], words: 1 }),
+        );
+      let plan = RecordType([
+        { name: b"job", ty: named_type(b"m.Job") },
+        { name: b"name", ty: string_type() },
+      ]);
+      assert_eq(held(named_type(b"m.Tree")), false);
+      assert_eq(held(named_type(b"m.Expr")), false);
+      assert_eq(held(named_type(b"m.Job")), true);
+      assert_eq(held(plan), true)
+    },
+  }
+}
+
+test "a closure capturing a channel is kept as 0, its keep entry making no copy, and shares as before" {
+  let int = int_type();
+  let chan = chan_type(int);
+  let body = {
+    key: Named(b"m.outer"),
+    kind: Metered,
+    params: [
+      { id: 0, ty: chan, representation: AsWord },
+      { id: 1, ty: int, representation: AsInt },
+    ],
+    convention: {
+      params: [
+        { handed: BorrowedParam, representation: AsWord },
+        { handed: OwnedParam, representation: AsInt },
+      ],
+      result: AsInt,
+      destination_passing: false,
+      answered: OwnedResult,
+    },
+    result_type: int,
+    body: [Return(VarOperand({ id: 1, ty: int, representation: AsInt }))],
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: no_links(),
+    statics: [],
+  };
+  let l = Closure({
+    body: body,
+    captures: 1,
+    at: span_between(0, 0),
+    words: no_closure_evidence(),
+  });
+  let printed = lambda_text(symbol_of(b"m.outer"), 0, l, empty_printing(Map::new()));
+  let text = Bytes::concat_all(
+    printed.printing.shared.map(|s: SharedFn| s.text).push(pieces_text(printed.out)),
+  );
+  let name = symbol_of(b"m.outer").concat(b"_lambda0");
+  let named = match text.index_of(name.concat(b"_desc = { ")) {
+    Some(i) -> text.slice(i + name.len() + 10, text.len()),
+    None -> b"",
+  };
+  let entries = named.slice(0, match named.index_of(b" };") { Some(e) -> e, None -> 0 }).split(
+    b", ",
+  );
+  let defined = |at: Int|
+    match text.index_of(entries.get(at).concat(b"(PlyCtx")) {
+      Some(i) -> match text.index_of_from(b"\n}\n", i) { Some(j) -> text.slice(i, j), None -> b"" },
+      None -> b"",
+    };
+  let message = Some(String::of_bytes_lossy(text));
+  let keep = defined(5);
+  assert(keep.len() > 0 && keep.index_of(b"= 0;") != None && !allocates(keep), message);
+  assert(defined(4).index_of(b"= 0;") != None, message)
+}
+
+fn ownership_faults(k: RootKey, f: Fn) -> List<Bytes> / {abort.raise} = {
+  let handed = with_conventions(f, Map::new());
+  if handed.convention != f.convention {
+    [root_text(root_name(k)).concat(b" takes otherwise than its handing")]
+  } else {
+    match ownership_fault(built_form(handed)) {
+      Some(why) -> [root_text(root_name(k)).concat(b": ").concat(why)],
+      None -> [],
+    }
+  }
+}
+
+test "each root written for a type takes its operands as its handing says, and is counted right so taken" {
+  let expression = named_type(b"m.Expr");
+  let pair = RecordType([
+    { name: b"items", ty: list_type(int_type()) },
+    { name: b"name", ty: string_type() },
+    { name: b"tree", ty: named_type(b"m.Tree") },
+  ]);
+  let types = [named_type(b"m.Tree"), expression, pair, named_type(b"m.Job"), string_type()];
+  let over = |ops: List<TypeOp>, key: (TypeOp, Type) -> RootKey|
+    ops.fold([], |acc: List<RootKey>, op: TypeOp| acc.concat(types.map(|t: Type| key(op, t))));
+  match corpus_constructors() {
+    Err(why) -> assert_eq(why, b""),
+    Ok(constructors) -> {
+      let plain = over(
+        [
+          Drop,
+          Dup,
+          keys::Release,
+          Copy,
+          Share,
+          Keep,
+          keys::Unboxed(Dup),
+          keys::Unboxed(keys::Release),
+        ],
+        root_of,
+      ).concat(
+        [Drop, Share, Keep].fold([], |acc: List<RootKey>, op: TypeOp|
+          acc.concat([case_root(op, expression, 1), case_root(op, expression, 2)])),
+      );
+      let entries = over([OnWordForm(Lower), OnWordForm(Lift)], |op: TypeOp, t: Type|
+        generated_key(op, t, b"m"));
+      assert_eq(
+        plain.fold([], |acc: List<Bytes>, k: RootKey|
+          acc.concat(ownership_faults(k, generated(constructors, k)))).concat(
+          entries.fold([], |acc: List<Bytes>, k: RootKey|
+            acc.concat(ownership_faults(k, word_form_entry(constructors, k)))),
+        ),
+        [],
+      )
+    },
+  }
+}
+
+test "a sum of several counted words is let go of by one call of its type's root, which is checked and counts each word" {
+  let src = Bytes::concat_all([
+    b"type Duo = | Both(String, List<Int>) | Neither\n",
+    b"fn g(n: Int) -> Int / {abort.raise} = if n > 3 { panic(\"big\") } else { n }\n",
+    b"fn kept(d: Duo, n: Int) -> Duo / {abort.raise} = { let m = g(n); if m > 0 { d } else { d } }\n",
+    b"fn pick(d: Duo, b: Bool) -> Duo = if b { d } else { Neither }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let held = |op: TypeOp| root_of(keys::Unboxed(op), named_type(b"m.Duo"));
+      let call = |k: RootKey| symbol_of(root_text(root_name(k))).concat(b"(ctx, ");
+      let calls_in = |name: Bytes, k: RootKey|
+        match printed_by_ir(p, name) {
+          Ok(t) -> t.split(call(k)).len() - 1,
+          Err(why) -> panic(String::of_bytes_lossy(why)),
+        };
+      assert_eq(
+        [calls_in(b"pick", held(keys::Release)), calls_in(b"kept", held(keys::Release))],
+        [1, 1],
+      );
+      [keys::Release, Dup].fold((), |_: Unit, op: TypeOp| {
+        let f = generated(p.setting.constructors, held(op));
+        let built = built_form(f);
+        let c = pieces_text(printed_fn(built, p.setting.constructors).pieces);
+        let body = match c.index_of(b"_entry(PlyCtx *ctx, const Word *args) {") {
+          Some(at) -> c.slice(0, at),
+          None -> c,
+        };
+        let each = if op == Dup { b"ply_dup(" } else { b"ply_rel" };
+        assert(
+          ownership_fault(built) == None && body.split(each).len() - 1 == 2
+            && !body.contains(call(held(op))),
+          Some(String::of_bytes_lossy(c)),
+        )
+      })
+    },
+  }
+}
+
+test "a sum of one word's drop root lets go of the word of a case holding no block, so every path passes the check" {
+  let src = b"type Found = | Hit(Bytes) | Miss | Bad(String)\ntype L = | Nil | Cons(Int, L)\nfn uses(f: Found, l: L) -> Int = 0\n";
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [named_type(b"m.Found"), named_type(b"m.L")].map(|t: Type| {
+          let f = generated(p.setting.constructors, drop_of(t));
+          ownership_fault(f)
+        }),
+        [None, None],
+      ),
+  }
+}

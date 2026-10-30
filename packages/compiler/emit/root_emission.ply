@@ -1,0 +1,277 @@
+import compiler.syntax.parsing (dummy_span)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt)
+import compiler.check.types (Type, FunctionType, VariableType, Row, row_empty, bool_type,
+                             bytes_type, named_type, int_type, unit_type)
+import compiler.check.known (ordering_type)
+import compiler.emit.code (Code, CodeLiteral)
+import compiler.emit.typing (unknown_type)
+import compiler.emit.roots (symbol_of)
+import compiler.emit.output (Tables, no_tables, EmittedRoot, Prototype, DefinitionSymbol, Exact,
+                             needs_specialisation, Keyed, KeyedTag, KeyedField, KeyedEntry)
+import compiler.emit.representations (Definition, EmitParam, Constructors, substituted_fully,
+                                      no_constructors)
+import compiler.emit.keys
+import compiler.emit.keys (RootKey, Named, Generated, Law, Clause, Order, Reflect, Show, Digest,
+                           NumericFunction, RootName, root_name, root_text, key_types,
+                           unspecialised, has_entry, ReleaseResource, ContainerWalk)
+import compiler.emit.pieces (Piece, Hole, ConstructorTag, FieldName, LambdaEntry, pieces_text,
+                             body_spelled, own_symbol)
+import compiler.emit.typed_ir
+import compiler.emit.typed_ir (Fn, Lambda, Closure)
+import compiler.emit.evidence (declared_arity)
+import compiler.emit.typed_ir.statics (StaticDefinition, StaticStruct, RawWord, EntryWord,
+                                       named_by_content, entries_of)
+import compiler.emit.lower (root_lowered)
+import compiler.emit.lower.module_context (ModuleContext, Root, param_type)
+import compiler.emit.own (insert_reference_counts)
+import compiler.emit.release (release_needs)
+import compiler.emit.verify (ownership_fault)
+import compiler.emit.print (printed_fn)
+import compiler.emit.print.text (PrintOutput)
+import compiler.emit.print.value_printing (signature_types)
+
+pub fn root_at(
+  s: ModuleContext,
+  key: RootKey,
+  base: Int,
+  ps: List<EmitParam>,
+  code: Code,
+) -> Root / {abort.raise} =
+  {
+    key: key,
+    base: base,
+    params: ps,
+    types: ps.map(param_type),
+    result_type: root_result_type(s.here, key),
+    code: code,
+    performs: row_empty(),
+  }
+
+fn root_result_type(here: List<Definition>, key: RootKey) -> Type / {abort.raise} = {
+  let own = unspecialised(key);
+  let args = key_types(key);
+  here.fold(generated_result_type(key), |acc: Type, d: Definition|
+    if d.root != own { acc } else {
+      match d.scheme {
+        Some(sc) -> match sc.ty { FunctionType(f) -> substituted_fully(f.ret, args), _ -> acc },
+        None -> acc,
+      }
+    })
+}
+
+fn generated_result_type(key: RootKey) -> Type =
+  match key {
+    Generated(w, _) -> match w.op {
+      keys::Equal -> bool_type(),
+      Order -> ordering_type(),
+      NumericFunction(_) -> w.ty,
+      Reflect -> named_type(b"std.value.Value"),
+      Show -> named_type(b"std.value.Value"),
+      Digest -> bytes_type(),
+      ReleaseResource -> unit_type(),
+      ContainerWalk(c) -> if c == b"let_go_items" { unit_type() } else { unknown_type() },
+      _ -> unknown_type(),
+    },
+    Law(_) -> bool_type(),
+    Clause(_) -> bool_type(),
+    _ -> unknown_type(),
+  }
+
+pub fn naming<a>(name: Bytes, run: () -> a / {abort.raise}) -> a / {abort.raise} =
+  handle {
+    run()
+  } with {
+    abort.raise(m) ->
+      panic(String::of_bytes_lossy(Bytes::concat_all([b"Ply failed making `", name, b"`: "])) ++ m),
+  }
+
+pub fn emitted_of(f: Fn, constructors: Constructors) -> EmittedRoot / {abort.raise} = {
+  let full = root_name(f.key);
+  naming(root_text(full), || {
+    let counted = built_form(f);
+    if needs_specialisation(counted.links.needs) { deferred_to_callers(full, counted) } else {
+      match ownership_fault(counted) {
+        Some(fault) ->
+          panic(String::of_bytes_lossy(b"its typed form fails its check: ".concat(fault))),
+        None -> {
+          let pr = printed_fn(counted, constructors);
+          {
+            name: full,
+            text: body_spelled(
+              counted.key,
+              counted.members.map(|m: typed_ir::Member| m.key),
+              pr.pieces,
+            ),
+            tables: ir_tables(counted, pr, constructors.stated),
+          }
+        },
+      }
+    }
+  })
+}
+
+fn deferred_to_callers(full: RootName, f: Fn) -> EmittedRoot =
+  {
+    name: full,
+    text: b"",
+    tables: {
+      ..no_tables(),
+      generics: {
+        calls: f.links.generics,
+        needs: f.links.needs,
+        expects: [],
+        called: f.links.called,
+        passes: f.links.passes,
+      },
+      members: f.members.map(|m: typed_ir::Member| m.key),
+    },
+  }
+
+pub fn with_refcounts(f: Fn) -> Fn =
+  if f.kind == typed_ir::Plain { f } else { insert_reference_counts(f) }
+
+pub fn built_form(f: Fn) -> Fn = release_needs(with_refcounts(f))
+
+fn ir_tables(f: Fn, pr: PrintOutput, stated: Map<Bytes, Bool>) -> Tables / {abort.raise} = {
+  let held = if f.members.len() == 0 {
+    [{ key: f.key, arity: declared_arity(f.params), head: signature_types(f.convention) }]
+  } else {
+    f.members.map(|m: typed_ir::Member|
+      { key: m.key, arity: declared_arity(m.params), head: signature_types(m.convention) })
+  };
+  let statics = statics_named(f, []);
+  {
+    fields: pr.fields,
+    lambdas: pr.lambdas.map(pieces_text),
+    calls: statics.fold(pr.calls, |acc: List<RootKey>, d: StaticDefinition|
+      entries_of(d).fold(acc, |a: List<RootKey>, k: RootKey|
+        if a.contains(k) { a } else { a.push(k) })),
+    generics: {
+      calls: f.links.generics,
+      needs: f.links.needs,
+      expects: pr.expects,
+      called: f.links.called,
+      passes: f.links.passes,
+    },
+    performs: pr.performs,
+    handles: pr.handles,
+    members: f.members.map(|m: typed_ir::Member| m.key),
+    defined: held.map(|h: { key: RootKey, arity: Int, head: Prototype }|
+      { entered: has_entry(h.key, h.arity, stated), head: h.head }),
+    statics: statics,
+    handings: [],
+    assumed: [],
+    group: [],
+    shared: pr.shared,
+    natives: pr.natives,
+    keyed: keyed_in(pr.pieces),
+  }
+}
+
+fn keyed_in(pieces: List<Piece>) -> List<Keyed> =
+  pieces.fold([], |acc: List<Keyed>, p: Piece| {
+    let keyed = match p {
+      Hole(ConstructorTag(name)) -> Some(KeyedTag(name)),
+      Hole(FieldName(i)) -> Some(KeyedField(i)),
+      Hole(LambdaEntry(i)) -> Some(KeyedEntry(i)),
+      _ -> None,
+    };
+    match keyed { Some(k) -> if acc.contains(k) { acc } else { acc.push(k) }, None -> acc }
+  })
+
+fn statics_named(f: Fn, held: List<StaticDefinition>) -> List<StaticDefinition> =
+  f.lambdas.fold(
+    f.statics.fold(held, |acc: List<StaticDefinition>, d: StaticDefinition|
+      if acc.contains(d) { acc } else { acc.push(d) }),
+    |acc: List<StaticDefinition>, l: Lambda| match l { Closure(c) -> statics_named(c.body, acc) },
+  )
+
+pub fn root_from_code(
+  s: ModuleContext,
+  base: Int,
+  key: RootKey,
+  ps: List<EmitParam>,
+  code: Code,
+  performs: Row = { atoms: [], tail: None },
+) -> Fn / {abort.raise} = root_lowered(s, { ..root_at(s, key, base, ps, code), performs: performs })
+
+fn bare_setting() -> ModuleContext =
+  {
+    module: b"m",
+    here: [],
+    imports: [],
+    constructors: no_constructors(),
+    builtins: [],
+    declared: Map::new(),
+    machine: Map::new(),
+    effects: [],
+    release: false,
+  }
+
+fn literal_code(l: SourceLiteral) -> Code =
+  { node: CodeLiteral(l), span: dummy_span(), ty: int_type() }
+
+test "a root is defined under its symbol, with the entry the runtime calls it through" {
+  let e = emitted_of(
+    root_from_code(bare_setting(), 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
+    no_constructors(),
+  );
+  assert_eq(e.tables.defined.map(|d: DefinitionSymbol| d.entered), [true]);
+  assert_eq(e.text.index_of(symbol_of(b"m.f")), None);
+  assert(
+    e.text.index_of(
+        Bytes::concat_all([b"Word ", own_symbol(None), b"_entry(PlyCtx *ctx, const Word *args)"]),
+      )
+      != None,
+  )
+}
+
+test "a root whose function a static holds is among the calls of the body naming the static" {
+  let dup = Named(b"m.dup#T");
+  let held = named_by_content(
+    StaticStruct({
+      of: b"PlyType",
+      fields: [
+        RawWord(1),
+        RawWord(0),
+        RawWord(0),
+        EntryWord(dup),
+        RawWord(0),
+        RawWord(0),
+        RawWord(0),
+      ],
+    }),
+  );
+  let f = root_from_code(bare_setting(), 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
+  let counted = { ..insert_reference_counts(f), statics: [held] };
+  let t = ir_tables(counted, printed_fn(counted, no_constructors()), Map::new());
+  assert(t.calls.contains(dup))
+}
+
+test "a form letting go of a value of its type variable is settled by its callers: no C, its needs in its tables" {
+  let p = { id: 0, ty: VariableType(0), representation: typed_ir::AsWord };
+  let f = {
+    key: Named(b"m.dropping"),
+    kind: typed_ir::Metered,
+    params: [p],
+    convention: {
+      params: [{ handed: typed_ir::OwnedParam, representation: typed_ir::AsWord }],
+      result: typed_ir::AsInt,
+      destination_passing: false,
+      answered: typed_ir::OwnedResult,
+    },
+    result_type: int_type(),
+    body: [typed_ir::Return(typed_ir::IntOperand(0))],
+    lambdas: [],
+    base: 0,
+    members: [],
+    links: typed_ir::no_links(),
+    statics: [],
+  };
+  let settled = emitted_of(f, no_constructors());
+  assert_eq(settled.text, b"");
+  assert_eq(settled.tables.generics.needs, [{ var: 0, reads: Exact }]);
+  assert_eq(settled.tables.defined, []);
+  let known = emitted_of({ ..f, params: [{ ..p, ty: bytes_type() }] }, no_constructors());
+  assert(known.text.len() > 0 && known.tables.generics.needs == [], None)
+}

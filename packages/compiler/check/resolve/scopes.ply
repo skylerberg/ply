@@ -1,53 +1,45 @@
-//! Scopes: what each name in a module denotes, and the order modules depend on one another in.
-
-import compiler.syntax.parsing (Span, Ident, QName, dummy_span)
-import compiler.syntax.items (Module, Item, is_shipped, IType, TDSum, VariantDef, ImportDecl,
-                              IAlias, INames, member_name, Opaque)
-import compiler.syntax.exprs (freed_by)
+import compiler.syntax.parsing (Span, Identifier, QName, dummy_span)
+import compiler.syntax.items (Module, Item, is_shipped, TypeItem, SumBody, VariantDefinition,
+                              ImportDeclaration, ModuleAlias, SelectedNames, member_name, Opaque)
+import compiler.syntax.expressions (implicitly_imported_by)
 import std.list
-import compiler.check.resolve.tables (ParsedModule, Namespace, TypeSpace, ValueSpace, Decls,
-                                      Binding, Bindings, Scope, Diag, Edge, ModuleEntry, Resolved,
-                                      namespaces, push_declared, lookup_declared, push_binding,
-                                      lookup, find_module_binding, position, default_binder,
-                                      qualify, import_module_name, path_span, import_binder,
-                                      binder_span, error_at, error_at_and, backticked, list_names,
-                                      describe_namespace, namespace_keyword, exported_names)
+import compiler.check.resolve.tables (ParsedModule, Namespace, TypeSpace, ValueSpace, Declarations,
+                                      Binding, Bindings, Scope, Diagnostic, Edge, ModuleEntry,
+                                      Resolution, namespaces, push_declared, lookup_declared,
+                                      push_binding, lookup, find_module_binding, position,
+                                      default_binder, qualify, import_module_name, path_span,
+                                      import_binder, binder_span, error_at, error_at_and,
+                                      backticked, list_names, describe_namespace, namespace_keyword,
+                                      exported_names)
 
-// --- Scopes ---------------------------------------------------------------------
-
-pub type Builder = {
+pub type ScopeBuilder = {
   scope: Scope,
-  local: Decls,
-  imported: Decls,
+  local: Declarations,
+  imported: Declarations,
   edges: List<Edge>,
-  diags: List<Diag>,
+  diagnostics: List<Diagnostic>,
 }
 
-pub type World = {
-  mods: List<ParsedModule>,
+pub type ResolutionContext = {
+  modules: List<ParsedModule>,
   names: List<ModuleEntry>,
-  declarations: List<Decls>,
+  declarations: List<Declarations>,
   declared: List<Bindings>,
-  /// The packages of the closure: 0 is the root package, and `module_packages` maps a module to one.
-  /// `std` and `compiler` are the built-in packages every package may import; a `module_packages` of
-  /// `shipped` is a module the toolchain ships outside any package, likewise importable by all.
-  pkgs: List<PackageDeps>,
+  packages: List<PackageDependencies>,
   module_packages: List<Int>,
   std: Int,
   compiler: Int,
   shipped: Int,
 }
 
-/// A package for import resolution: the module prefix it grants and the prefixes it declares.
-pub type PackageDeps = { prefix: Bytes, deps: List<Bytes> }
+pub type PackageDependencies = { prefix: Bytes, dependencies: List<Bytes> }
 
-/// Every module one unnamed package, as projects without packages resolve.
 pub fn no_packages(
-  mods: List<ParsedModule>,
-) -> { pkgs: List<PackageDeps>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int } =
+  modules: List<ParsedModule>,
+) -> { packages: List<PackageDependencies>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int } =
   {
-    pkgs: [{ prefix: b"", deps: [] }],
-    module_packages: mods.map(|parsed: ParsedModule| 0),
+    packages: [{ prefix: b"", dependencies: [] }],
+    module_packages: modules.map(|parsed: ParsedModule| 0),
     std: 1,
     compiler: 2,
     shipped: 3,
@@ -57,57 +49,64 @@ pub fn index_of(names: List<ModuleEntry>, name: Bytes) -> Option<Int> =
   names.fold(None, |acc: Option<Int>, e: ModuleEntry|
     match acc { Some(_) -> acc, None -> if e.name == name { Some(e.at) } else { None } })
 
-pub fn one_import(w: World, i: Int, builder: Builder, decl: ImportDecl) -> Builder / {abort.raise} =
-  match target(w, i, builder, decl) {
+pub fn bind_import(
+  w: ResolutionContext,
+  i: Int,
+  builder: ScopeBuilder,
+  declaration: ImportDeclaration,
+) -> ScopeBuilder / {abort.raise} =
+  match import_target(w, i, builder, declaration) {
     Found(t) -> {
-      let b2: Builder = {
+      let b2: ScopeBuilder = {
         ..builder,
-        edges: builder.edges.push({ from: i, target: t, span: path_span(decl) }),
+        edges: builder.edges.push({ from: i, target: t, span: path_span(declaration) }),
       };
-      match decl.kind {
-        INames(names) -> {
-          let key = default_binder(import_module_name(decl));
+      match declaration.kind {
+        SelectedNames(names) -> {
+          let key = default_binder(import_module_name(declaration));
           let sel = match find_module_binding(b2.scope.selective, key) {
             Some(_) -> b2.scope.selective,
-            None -> b2.scope.selective.push({ binder: key, target: t, span: path_span(decl) }),
+            None ->
+              b2.scope.selective.push({ binder: key, target: t, span: path_span(declaration) }),
           };
-          let b3: Builder = { ..b2, scope: { ..b2.scope, selective: sel } };
-          names.fold(b3, |acc: Builder, ident: Ident| bind_name(w, i, acc, t, ident))
+          let b3: ScopeBuilder = { ..b2, scope: { ..b2.scope, selective: sel } };
+          names.fold(b3, |acc: ScopeBuilder, ident: Identifier| bind_name(w, i, acc, t, ident))
         },
-        // A module the parser imports for names read with no import binds each the importer binds
-        // nothing under.
-        IAlias(a) ->
-          freed_by(a.name).fold(bind_module(w, i, b2, decl, t), |acc: Builder, n: Bytes|
-            if namespaces().any(|namespace: Namespace|
-                  lookup(acc.scope.bound, namespace, n) != None)
-                || !namespaces().any(|namespace: Namespace|
-                  lookup_declared(w.declarations.get(t), namespace, n) != None) { acc }
-            else { bind_name(w, i, acc, t, { name: n, span: path_span(decl) }) }),
-        _ -> bind_module(w, i, b2, decl, t),
+        ModuleAlias(a) ->
+          implicitly_imported_by(a.name).fold(
+            bind_module(w, i, b2, declaration, t),
+            |acc: ScopeBuilder, n: Bytes|
+              if namespaces().any(|namespace: Namespace|
+                    lookup(acc.scope.bound, namespace, n) != None)
+                  || !namespaces().any(|namespace: Namespace|
+                    lookup_declared(w.declarations.get(t), namespace, n) != None) { acc }
+              else { bind_name(w, i, acc, t, { name: n, span: path_span(declaration) }) },
+          ),
+        _ -> bind_module(w, i, b2, declaration, t),
       }
     },
     _ -> builder,
   }
 
-/// What an import aims at: a module it may use, no such module, or a module of a package its
-/// manifest does not declare (naming the importer and the holder).
-type ImportTarget = | Found(Int) | Missing | Undeclared({ importer: Int, holder: Int })
+type ImportTarget = | Found(Int) | Missing | Undeclared({ importer: Int, owning_package: Int })
 
-/// The module an import names, judged against the package table.
-fn target(w: World, i: Int, builder: Builder, decl: ImportDecl) -> ImportTarget / {abort.raise} = {
-  let name = import_module_name(decl);
+fn import_target(
+  w: ResolutionContext,
+  i: Int,
+  builder: ScopeBuilder,
+  declaration: ImportDeclaration,
+) -> ImportTarget / {abort.raise} = {
+  let name = import_module_name(declaration);
   if name.len() == 0 { Missing } else {
     let p = w.module_packages.get(i);
-    // A bare import inside a dependency names that package's own modules and nothing
-    // else: the root package's bare modules are unreachable from a dependency, so a
-    // fallback here would be a reach-back no diagnostic ever sees.
-    if 0 < p && p < w.shipped && p < w.pkgs.len() && name.index_of(b".") == None {
+    if 0 < p && p < w.shipped && p < w.packages.len() && name.index_of(b".") == None {
       sibling(w, i, name)
     } else {
       match sibling(w, i, name) {
         Found(t) -> Found(t),
         _ -> match index_of(w.names, name) {
-          Some(t) -> if w.mods.get(t).name.len() == 0 { Missing } else { declared(w, i, t) },
+          Some(t) -> if w.modules.get(t).name.len() == 0 { Missing }
+          else { allowed_target(w, i, t) },
           None -> Missing,
         },
       }
@@ -115,60 +114,54 @@ fn target(w: World, i: Int, builder: Builder, decl: ImportDecl) -> ImportTarget 
   }
 }
 
-/// A sibling within the importing module's own package: a dependency's `import args` means
-/// `<its prefix>.args` — always ahead of another package's bare `args`. The root package and
-/// the shipped modules resolve bare names as written.
-fn sibling(w: World, i: Int, name: Bytes) -> ImportTarget / {abort.raise} = {
+fn sibling(w: ResolutionContext, i: Int, name: Bytes) -> ImportTarget / {abort.raise} = {
   let p = w.module_packages.get(i);
-  if p == 0 || p >= w.shipped || p >= w.pkgs.len() { Missing } else {
-    let prefix = w.pkgs.get(p).prefix;
+  if p == 0 || p >= w.shipped || p >= w.packages.len() { Missing } else {
+    let prefix = w.packages.get(p).prefix;
     if name.starts_with(prefix.concat(b".")) { Missing } else {
       match index_of(w.names, Bytes::concat_all([prefix, b".", name])) {
-        Some(t) -> if w.mods.get(t).name.len() == 0 { Missing } else { Found(t) },
+        Some(t) -> if w.modules.get(t).name.len() == 0 { Missing } else { Found(t) },
         None -> Missing,
       }
     }
   }
 }
 
-/// An exact hit is usable when it is the importer's own package, the shipped modules, or a package
-/// the importer's manifest declares; anything else is E0132, naming who holds it and who wants it.
-fn declared(w: World, i: Int, t: Int) -> ImportTarget / {abort.raise} = {
+fn allowed_target(w: ResolutionContext, i: Int, t: Int) -> ImportTarget / {abort.raise} = {
   let p = w.module_packages.get(i);
   let q = w.module_packages.get(t);
   if q == p || q == w.std || q == w.compiler || q >= w.shipped || p >= w.shipped { Found(t) } else {
-    let prefix = w.pkgs.get(q).prefix;
-    if w.pkgs.get(p).deps.contains(prefix) { Found(t) }
-    else { Undeclared({ importer: p, holder: q }) }
+    let prefix = w.packages.get(q).prefix;
+    if w.packages.get(p).dependencies.contains(prefix) { Found(t) }
+    else { Undeclared({ importer: p, owning_package: q }) }
   }
 }
 
-/// Whether module `i` imports `t`, a module below `std.internal`, which only the toolchain's own
-/// modules may.
-fn internal_import(w: World, i: Int, t: Int) -> Bool / {abort.raise} = {
-  let held = w.mods.get(t).name;
-  (held == b"std.internal" || held.starts_with(b"std.internal.")) && !is_shipped(w.mods.get(i).name)
+fn internal_import(w: ResolutionContext, i: Int, t: Int) -> Bool / {abort.raise} = {
+  let held = w.modules.get(t).name;
+  (held == b"std.internal" || held.starts_with(b"std.internal."))
+    && !is_shipped(w.modules.get(i).name)
 }
 
 pub fn target_or_report(
-  w: World,
+  w: ResolutionContext,
   i: Int,
-  builder: Builder,
-  decl: ImportDecl,
-) -> { b: Builder, t: Option<Int> } / {abort.raise} =
-  match target(w, i, builder, decl) {
+  builder: ScopeBuilder,
+  declaration: ImportDeclaration,
+) -> { b: ScopeBuilder, t: Option<Int> } / {abort.raise} =
+  match import_target(w, i, builder, declaration) {
     Found(t) -> if internal_import(w, i, t) {
       {
         b: {
           ..builder,
-          diags: builder.diags.push(
+          diagnostics: builder.diagnostics.push(
             error_at(
               b"E0159",
               i,
-              path_span(decl),
+              path_span(declaration),
               Bytes::concat_all([
                 b"`",
-                w.mods.get(t).name,
+                w.modules.get(t).name,
                 b"` is the toolchain's own, which only its shipped modules import",
               ]),
               b"not importable here",
@@ -182,8 +175,8 @@ pub fn target_or_report(
       }
     } else { { b: builder, t: Some(t) } },
     Undeclared(u) -> {
-      let name = import_module_name(decl);
-      let message = if u.holder == 0 {
+      let name = import_module_name(declaration);
+      let message = if u.owning_package == 0 {
         Bytes::concat_all([
           b"`",
           name,
@@ -194,17 +187,17 @@ pub fn target_or_report(
           b"`",
           name,
           b"` belongs to the package `",
-          w.pkgs.get(u.holder).prefix,
+          w.packages.get(u.owning_package).prefix,
           b"`, which `",
-          w.pkgs.get(u.importer).prefix,
+          w.packages.get(u.importer).prefix,
           b"` does not declare as a dependency",
         ])
       };
       {
         b: {
           ..builder,
-          diags: builder.diags.push(
-            error_at(b"E0132", i, path_span(decl), message, b"not a declared dependency", [
+          diagnostics: builder.diagnostics.push(
+            error_at(b"E0132", i, path_span(declaration), message, b"not a declared dependency", [
               b"add it to that package's ply.pkg dependencies to import it",
             ]),
           ),
@@ -213,7 +206,7 @@ pub fn target_or_report(
       }
     },
     Missing -> {
-      let name = import_module_name(decl);
+      let name = import_module_name(declaration);
       let near = w.names.fold([], |acc: List<Bytes>, e: ModuleEntry|
         if e.name.len() > 0 && e.name.ends_with(default_binder(name)) { acc.push(e.name) }
         else { acc });
@@ -223,11 +216,11 @@ pub fn target_or_report(
       {
         b: {
           ..builder,
-          diags: builder.diags.push(
+          diagnostics: builder.diagnostics.push(
             error_at(
               b"E0106",
               i,
-              path_span(decl),
+              path_span(declaration),
               Bytes::concat_all([b"no module named `", name, b"` in this program"]),
               b"not found",
               [note],
@@ -240,22 +233,22 @@ pub fn target_or_report(
   }
 
 fn bind_module(
-  w: World,
+  w: ResolutionContext,
   i: Int,
-  builder: Builder,
-  decl: ImportDecl,
+  builder: ScopeBuilder,
+  declaration: ImportDeclaration,
   t: Int,
-) -> Builder / {abort.raise} =
-  match import_binder(decl) {
+) -> ScopeBuilder / {abort.raise} =
+  match import_binder(declaration) {
     None -> builder,
     Some(binder) -> {
-      let s = binder_span(decl);
+      let s = binder_span(declaration);
       match find_module_binding(builder.scope.modules, binder) {
         Some(first) -> {
-          let name = import_module_name(decl);
+          let name = import_module_name(declaration);
           {
             ..builder,
-            diags: builder.diags.push(
+            diagnostics: builder.diagnostics.push(
               error_at_and(
                 b"E0110",
                 i,
@@ -266,7 +259,7 @@ fn bind_module(
                 first.span,
                 Bytes::concat_all([
                   b"`",
-                  w.mods.get(first.target).name,
+                  w.modules.get(first.target).name,
                   b"` is already bound as `",
                   binder,
                   b"`",
@@ -288,19 +281,25 @@ fn bind_module(
     },
   }
 
-fn bind_name(w: World, i: Int, builder: Builder, t: Int, name: Ident) -> Builder / {abort.raise} = {
-  let decls = w.declarations.get(t);
-  let module = w.mods.get(t).name;
+fn bind_name(
+  w: ResolutionContext,
+  i: Int,
+  builder: ScopeBuilder,
+  t: Int,
+  name: Identifier,
+) -> ScopeBuilder / {abort.raise} = {
+  let declarations = w.declarations.get(t);
+  let module = w.modules.get(t).name;
   let found = namespaces().filter(|namespace: Namespace|
-    match lookup_declared(decls, namespace, name.name) { Some(_) -> true, None -> false });
+    match lookup_declared(declarations, namespace, name.name) { Some(_) -> true, None -> false });
   if found.len() == 0 {
-    let exported = exported_names(decls);
+    let exported = exported_names(declarations);
     let note = if exported.len() == 0 {
       Bytes::concat_all([b"`", module, b"` exports nothing; mark an item `pub` to export it"])
     } else { Bytes::concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")]) };
     {
       ..builder,
-      diags: builder.diags.push(
+      diagnostics: builder.diagnostics.push(
         error_at(
           b"E0101",
           i,
@@ -313,35 +312,49 @@ fn bind_name(w: World, i: Int, builder: Builder, t: Int, name: Ident) -> Builder
     }
   } else {
     let public = found.filter(|namespace: Namespace|
-      match lookup_declared(decls, namespace, name.name) { Some(x) -> x.public, None -> false });
+      match lookup_declared(declarations, namespace, name.name) {
+        Some(x) -> x.public,
+        None -> false,
+      });
     if public.len() == 0 {
-      let declared = match lookup_declared(decls, found.get(0), name.name) {
+      let allowed_target = match lookup_declared(declarations, found.get(0), name.name) {
         Some(x) -> x,
         None -> panic("just found"),
       };
       {
         ..builder,
-        diags: builder.diags.push(match closed_ctor(w.mods, i, name.span, t, name.name) {
-          Some(closed) -> closed,
-          None -> private_name(i, name.span, t, declared.span, found.get(0), name.name, module),
-        }),
+        diagnostics: builder.diagnostics.push(
+          match opaque_constructor_error(w.modules, i, name.span, t, name.name) {
+            Some(closed) -> closed,
+            None ->
+              private_name_error(
+                i,
+                name.span,
+                t,
+                allowed_target.span,
+                found.get(0),
+                name.name,
+                module,
+              ),
+          },
+        ),
       }
     } else {
-      public.fold(builder, |acc: Builder, namespace: Namespace|
+      public.fold(builder, |acc: ScopeBuilder, namespace: Namespace|
         bind_one(w, i, acc, t, name, namespace))
     }
   }
 }
 
-pub fn private_name(
+pub fn private_name_error(
   m: Int,
   span: Span,
   owner: Int,
-  declared: Span,
+  allowed_target: Span,
   namespace: Namespace,
   name: Bytes,
   module: Bytes,
-) -> Diag =
+) -> Diagnostic =
   error_at_and(
     b"E0107",
     m,
@@ -349,7 +362,7 @@ pub fn private_name(
     Bytes::concat_all([b"`", name, b"` is private to module `", module, b"`"]),
     b"not exported",
     owner,
-    declared,
+    allowed_target,
     b"declared here, without `pub`",
     [
       Bytes::concat_all([
@@ -365,10 +378,9 @@ pub fn private_name(
     ],
   )
 
-/// What `module` publishes for a type it declares `opaque`, which is all another module has of it.
-pub fn closed_notes(module: Bytes, opaque: Opaque) -> List<Bytes> / {abort.raise} = {
-  let answered = if opaque.answer.len() == 0 { [] }
-  else { [Bytes::concat_all([b"`", module, b"` answers one from ", list_names(opaque.answer)])] };
+pub fn opaque_notes(module: Bytes, opaque: Opaque) -> List<Bytes> / {abort.raise} = {
+  let answered = if opaque.result.len() == 0 { [] }
+  else { [Bytes::concat_all([b"`", module, b"` answers one from ", list_names(opaque.result)])] };
   if opaque.take.len() == 0 {
     if answered.len() > 0 { answered } else {
       [Bytes::concat_all([b"`", module, b"` publishes no function that answers or takes one"])]
@@ -378,14 +390,13 @@ pub fn closed_notes(module: Bytes, opaque: Opaque) -> List<Bytes> / {abort.raise
   }
 }
 
-/// The `opaque` sum of `module` that declares the constructor `name`, and what it publishes for it.
-fn closed_sum(module: Module, name: Bytes) -> Option<{ name: Bytes, opaque: Opaque }> =
+fn opaque_sum(module: Module, name: Bytes) -> Option<{ name: Bytes, opaque: Opaque }> =
   module.items.fold(None, |found: Option<{ name: Bytes, opaque: Opaque }>, item: Item|
     match found {
       Some(_) -> found,
       None -> match item {
-        IType(d) -> match ((d.opaque, d.body)) {
-          (Some(o), TDSum(vs)) -> if vs.fold(false, |held: Bool, v: VariantDef|
+        TypeItem(d) -> match ((d.opaque, d.body)) {
+          (Some(o), SumBody(vs)) -> if vs.fold(false, |held: Bool, v: VariantDefinition|
               held || v.name.name == name) { Some({ name: d.name.name, opaque: o }) }
           else { None },
           _ -> None,
@@ -394,17 +405,15 @@ fn closed_sum(module: Module, name: Bytes) -> Option<{ name: Bytes, opaque: Opaq
       },
     })
 
-/// `name` as a constructor of an `opaque` sum of module `owner`, named from module `m`: the type's
-/// module keeps it, and what that module publishes for the type is what `m` has.
-pub fn closed_ctor(
-  mods: List<ParsedModule>,
+pub fn opaque_constructor_error(
+  modules: List<ParsedModule>,
   m: Int,
   span: Span,
   owner: Int,
   name: Bytes,
-) -> Option<Diag> / {abort.raise} = {
-  let parsed = mods.get(owner);
-  match closed_sum(parsed.module, name) {
+) -> Option<Diagnostic> / {abort.raise} = {
+  let parsed = modules.get(owner);
+  match opaque_sum(parsed.module, name) {
     None -> None,
     Some(closed) ->
       Some(
@@ -423,31 +432,30 @@ pub fn closed_ctor(
           owner,
           closed.opaque.span,
           b"declared `opaque` here",
-          closed_notes(parsed.name, closed.opaque),
+          opaque_notes(parsed.name, closed.opaque),
         ),
       ),
   }
 }
 
 fn bind_one(
-  w: World,
+  w: ResolutionContext,
   i: Int,
-  builder: Builder,
+  builder: ScopeBuilder,
   t: Int,
-  name: Ident,
+  name: Identifier,
   namespace: Namespace,
-) -> Builder / {abort.raise} = {
+) -> ScopeBuilder / {abort.raise} = {
   let binding = match lookup(w.declared.get(t), namespace, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
-  let module = w.mods.get(t).name;
+  let module = w.modules.get(t).name;
   match lookup_declared(builder.local, namespace, name.name) {
-    // Local-wins was rejected: a local added beside an import would silently steal every existing call site.
     Some(prev) ->
       {
         ..builder,
-        diags: builder.diags.push(
+        diagnostics: builder.diagnostics.push(
           error_at_and(
             b"E0108",
             i,
@@ -484,7 +492,7 @@ fn bind_one(
       Some(prev) ->
         {
           ..builder,
-          diags: builder.diags.push(
+          diagnostics: builder.diagnostics.push(
             error_at_and(
               b"E0110",
               i,
@@ -529,8 +537,6 @@ fn bind_one(
   }
 }
 
-// --- The dependency order ---------------------------------------------------------
-
 pub type Cycle = { nodes: List<Int>, closing: Edge }
 
 type OrderSearch = {
@@ -542,7 +548,6 @@ type OrderSearch = {
   stack: List<{ v: Int, edge: Int }>,
 }
 
-/// One iterative DFS finds every cycle and, when there is none, leaves the dependency-first load order.
 pub fn traverse(edges: List<List<Edge>>) -> OrderSearch / {abort.raise} = {
   let n = edges.len();
   let steps = edges.fold(0, |acc: Int, es: List<Edge>| acc + es.len());
@@ -567,8 +572,6 @@ pub fn traverse(edges: List<List<Edge>>) -> OrderSearch / {abort.raise} = {
     })
 }
 
-/// Modules dependency-first, each importing the modules `targets` gives it by index, as resolving
-/// them orders them.
 pub fn post_order(targets: List<List<Int>>) -> List<Int> / {abort.raise} =
   traverse(
     range(0, targets.len()).map(|i: Int|
@@ -613,7 +616,6 @@ fn order_step(edges: List<List<Edge>>, d: OrderSearch) -> OrderSearch / {abort.r
 fn contains_key(keys: List<List<Int>>, key: List<Int>) -> Bool =
   keys.fold(false, |acc: Bool, k: List<Int>| acc || k == key)
 
-/// Rotated so the smallest index leads: the same cycle reached from two roots compares equal.
 fn canonical(nodes: List<Int>) -> List<Int> / {abort.raise} =
   if nodes.len() == 0 { [] } else {
     let least = range(0, nodes.len()).fold(0, |best: Int, i: Int|
@@ -621,8 +623,8 @@ fn canonical(nodes: List<Int>) -> List<Int> / {abort.raise} =
     range(0, nodes.len()).map(|i: Int| nodes.get((least + i) % nodes.len()))
   }
 
-pub fn cycle_diag(mods: List<ParsedModule>, cycle: Cycle) -> Diag / {abort.raise} = {
-  let names = cycle.nodes.map(|i: Int| mods.get(i).name);
+pub fn cycle_diagnostic(modules: List<ParsedModule>, cycle: Cycle) -> Diagnostic / {abort.raise} = {
+  let names = cycle.nodes.map(|i: Int| modules.get(i).name);
   let first = if names.len() == 0 { b"" } else { names.get(0) };
   if cycle.nodes.len() == 1 {
     error_at(
@@ -648,10 +650,8 @@ pub fn cycle_diag(mods: List<ParsedModule>, cycle: Cycle) -> Diag / {abort.raise
   }
 }
 
-// --- `find`: what a name denotes in a module -----------------------------------------
-
 pub fn find(
-  resolved: Resolved,
+  resolved: Resolution,
   module: Int,
   namespace: Namespace,
   qname: QName,
@@ -661,9 +661,9 @@ pub fn find(
     None -> lookup(scope.bound, namespace, qname.name.name),
     Some(binder) -> match find_module_binding(scope.modules, binder.name) {
       None -> match namespace {
-        ValueSpace -> match of_module(binder.name) {
-          Some(home) -> find_in_home(resolved, module, home, qname.name.name),
-          None -> find_of_type(resolved, module, binder.name, qname.name.name),
+        ValueSpace -> match method_binder_module(binder.name) {
+          Some(home) -> find_in_module(resolved, module, home, qname.name.name),
+          None -> find_method(resolved, module, binder.name, qname.name.name),
         },
         _ -> None,
       },
@@ -673,7 +673,6 @@ pub fn find(
           qname.name.name,
         ) {
         None -> None,
-        // Only a default copied back into its module binds that module, which sees what it keeps.
         Some(d) -> if !d.public && mb.target != module { None }
         else { lookup(resolved.declared.get(mb.target), namespace, qname.name.name) },
       },
@@ -681,18 +680,14 @@ pub fn find(
   }
 }
 
-/// The binder a function of a type is written through once the checker has named it: its
-/// module's name behind a mark no source writes, so it reads from any module, imported or not.
-pub fn of_binder(home: Bytes) -> Bytes = b"?of.".concat(home)
+pub fn method_binder(home: Bytes) -> Bytes = b"?of.".concat(home)
 
-/// The module [`of_binder`] names.
-pub fn of_module(binder: Bytes) -> Option<Bytes> =
+pub fn method_binder_module(binder: Bytes) -> Option<Bytes> =
   if binder.len() > 4 && binder.slice(0, 4) == b"?of." { Some(binder.slice(4, binder.len())) }
   else { None }
 
-/// The value `name` of the module named `home`, read from `module` through [`of_binder`].
-fn find_in_home(
-  resolved: Resolved,
+fn find_in_module(
+  resolved: Resolution,
   module: Int,
   home: Bytes,
   name: Bytes,
@@ -709,16 +704,13 @@ fn find_in_home(
       },
     })
 
-/// The function `name` of the type `of`, as `of::name` names it from `module`: `of` is a type in
-/// scope there, or a type's qualified name, which a call resolved by its receiver's type is
-/// written with. A function its type's module keeps private is found only there.
-pub fn find_of_type(
-  resolved: Resolved,
+pub fn find_method(
+  resolved: Resolution,
   module: Int,
   of: Bytes,
   name: Bytes,
 ) -> Option<Binding> / {abort.raise} =
-  match declaring_type(resolved, module, of) {
+  match locate_type(resolved, module, of) {
     None -> None,
     Some(t) -> {
       let member = member_name(t.simple, name);
@@ -730,10 +722,8 @@ pub fn find_of_type(
     },
   }
 
-/// The module that declares the type `of`, named as [`find_of_type`] reads it, and the type's
-/// name there.
-pub fn declaring_type(
-  resolved: Resolved,
+pub fn locate_type(
+  resolved: Resolution,
   module: Int,
   of: Bytes,
 ) -> Option<{ owner: Int, simple: Bytes }> / {abort.raise} = {
@@ -768,8 +758,6 @@ pub fn declaring_type(
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
 test "a cycle is rotated so the smallest index leads, whichever root reached it" {
   assert_eq(canonical([2, 0, 1]), [0, 1, 2]);
   assert_eq(canonical([1, 2]), [1, 2]);
@@ -778,11 +766,9 @@ test "a cycle is rotated so the smallest index leads, whichever root reached it"
 
 test "the traversal leaves a dependency-first order and names each cycle once" {
   let e: Edge = { from: 0, target: 0, span: dummy_span() };
-  // 0 -> 1 -> 2, and 3 alone: 2 before 1 before 0, then 3.
   let acyclic = traverse([[{ ..e, from: 0, target: 1 }], [{ ..e, from: 1, target: 2 }], [], []]);
   assert_eq(acyclic.order, [2, 1, 0, 3]);
   assert_eq(acyclic.cycles.len(), 0);
-  // 0 -> 1 -> 0 is one cycle, closed by 1's import, however it is entered.
   let ring = traverse([[{ ..e, from: 0, target: 1 }], [{ ..e, from: 1, target: 0 }]]);
   assert_eq(ring.cycles.len(), 1);
   assert_eq(ring.cycles.get(0).closing.from, 1)

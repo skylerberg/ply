@@ -1,47 +1,49 @@
 //! The postgres wire protocol, as framing and nothing else.
 //!
-//! Every message the front end sends after start-up is one byte of kind, an `Int32` length that counts
-//! itself, and a body; the start-up, SSL and cancel requests are the exceptions, their length first.
-//! Values travel as text both ways, so a parameter is the text the server would have printed and a
-//! column the text it printed: this layer never decodes a value. `read` takes what a socket returned
-//! and answers the whole messages in it and the bytes not yet one, so a short read is not an error.
+//! Every message the front end sends after start-up is one kind byte, an `Int32` length that
+//! counts itself, and a body. The start-up, SSL and cancel requests are the exceptions: they start
+//! with their length. Values travel as text both ways, so a parameter is the text the server would
+//! have printed, and a column is the text it printed: this layer never decodes a value. `read`
+//! takes what a socket returned and returns the whole messages in it and the leftover bytes, so a
+//! short read is not an error.
 //!
-//! `connect` gets a session to where the server answers a query, authenticating with a clear-text
-//! password or SCRAM-SHA-256 (md5 is refused with a message naming it); the client's SCRAM nonce is
-//! the caller's to draw, so a run's `random` seed decides it and a test can fix it. The password is
-//! a `Secret<Bytes>` throughout: SCRAM derives its proof from it under `std.sasl`, and a clear-text
-//! password goes out by `net.send_secret`, its message's kind and length in the clear before it and
-//! its NUL after, so no plain value in the program ever holds it. `simple_query` and
-//! `extended_query` answer the columns, the rows and the command tag. The SCRAM steps are
-//! `std.sasl`'s. A connection is `std.net`'s; which statements to send, what a transaction is and
-//! when to retry are `std.db`'s.
+//! `connect` brings a session to the point where the server accepts queries, authenticating with a
+//! clear-text password or SCRAM-SHA-256. md5 is rejected with an error that names it. The caller
+//! draws the client's SCRAM nonce, so a run's `random` seed decides it and a test can fix it. The
+//! password is a `Secret<Bytes>` throughout: SCRAM derives its proof from it under `std.sasl`, and
+//! a clear-text password goes out by `net.send_secret`, with its message's kind and length in the
+//! clear before it and its NUL after, so no plain value in the program ever contains it.
+//! `simple_query` and `extended_query` return the columns, the rows and the command tag. The SCRAM
+//! steps belong to `std.sasl` and the connection to `std.net`. Which statements to send, what a
+//! transaction is and when to retry belong to `std.db`.
 //!
-//! `connect` secures a connection before its start-up when `Tls` asks: after an `SSLRequest` the
-//! server says yes or no, and a no is `Declined` rather than a plaintext session; with direct
-//! negotiation the handshake begins at once. The server is verified as `net.start_tls` verifies one,
-//! and plaintext the server sent behind its yes is `Injected`. Over TLS, SCRAM is bound to the
-//! channel where the server offers it (SCRAM-SHA-256-PLUS), by the `tls-server-end-point` hash of
-//! the certificate the server presented (`end_point`), so a proof made for one connection proves
-//! nothing on another; where it does not, the client says it would have bound one, so a server
-//! whose offer was stripped on the way refuses. An offer the client cannot bind, for a certificate
-//! whose signature names no hash, is refused rather than answered unbound.
+//! `connect` secures a connection before its start-up when `Tls` requests it. After an
+//! `SSLRequest` the server replies yes or no, and a no is `Declined` rather than a plaintext
+//! session. With direct negotiation the handshake begins at once. The server is verified as
+//! `net.start_tls` verifies one, and plaintext the server sent after its yes is `Injected`. Over
+//! TLS, SCRAM is bound to the channel when the server offers that (SCRAM-SHA-256-PLUS), by the
+//! `tls-server-end-point` hash of the certificate the server presented (`end_point`), so a proof
+//! made for one connection proves nothing on another. When the server does not offer it, the
+//! client states that it would have bound one, so a server whose offer was stripped in transit
+//! rejects the exchange. An offer the client cannot bind, for a certificate whose signature names
+//! no hash, is rejected rather than accepted unbound.
 //!
-//! A session that has sent `LISTEN` takes notifications with `await_notification`; one that arrives
-//! while a statement is answered is kept in the session for the next wait. A copy moves rows in
-//! `COPY`'s text format, `copy_row` writing one and `copy_fields` reading one: `copy_in_begin`,
-//! `copy_send` and `copy_in_end` send them, `CopyFail` keeping none, and `copy_out_begin` and
-//! `copy_out_take` read them a piece at a time.
+//! A session that has sent `LISTEN` receives notifications with `await_notification`. A
+//! notification that arrives while a statement is running is stored in the session for the next
+//! wait. A copy moves rows in `COPY`'s text format: `copy_row` writes one and `copy_fields` reads
+//! one. `copy_in_begin`, `copy_send` and `copy_in_end` send rows, and `CopyFail` discards them
+//! all. `copy_out_begin` and `copy_out_take` read rows a piece at a time.
 
 import std.bytes
 import std.bytes (u16_be, u32_be, i32_be, cstring)
 import std.ip
 import std.net
-import std.net (Says, net, send_all)
+import std.net (Sends, net, send_all)
 import std.list
 import std.option
 import std.hash (sha256, sha384, sha512)
-import std.sasl (scram_challenge, scram_final, scram_first, scram_first_bare, scram_verify, Binding,
-                 Unbound, Unoffered, ServerEndPoint)
+import std.sasl (scram_challenge, scram_final, scram_first, scram_first_bare, scram_verify,
+                 ChannelBinding, Unbound, Unoffered, ServerEndPoint)
 import std.gen
 
 // --- Kinds --------------------------------------------------------------------
@@ -212,43 +214,44 @@ pub type Message = { kind: Backend, body: Bytes }
 pub type Frames = { done: List<Message>, rest: Bytes }
 
 /// A length that counts itself, which is what every frame's header is.
-fn counted(body: Bytes) -> Bytes = u32_be(body.len() + 4).concat(body)
+fn length_prefixed(body: Bytes) -> Bytes = u32_be(body.len() + 4).concat(body)
 
 fn frontend(f: Frontend, body: Bytes) -> Bytes / {abort.raise} =
-  byte_of_int(frontend_byte(f)).concat(counted(body))
+  byte_of_int(frontend_byte(f)).concat(length_prefixed(body))
 
 /// The start-up message: the protocol version, then the parameters, then a zero byte. No kind
 /// byte, because the server has no connection to have agreed one on yet. A parameter past `user`
-/// and `database` is a run-time setting the server applies to the session before it answers.
-pub fn startup(user: String, database: String, parameters: List<Set>) -> Bytes =
-  counted(
+/// and `database` is a run-time setting the server applies to the session before it replies.
+pub fn startup(user: String, database: String, parameters: List<Parameter>) -> Bytes =
+  length_prefixed(
     Bytes::concat_all([
       u32_be(196608),
       cstring("user"),
       cstring(user),
       cstring("database"),
       cstring(database),
-      Bytes::concat_all(parameters.map(|p: Set| cstring(p.name).concat(cstring(p.value)))),
+      Bytes::concat_all(parameters.map(|p: Parameter| cstring(p.name).concat(cstring(p.value)))),
       byte_of_int(0),
     ]),
   )
 
-/// The byte a server answers a start-up with to say it will speak TLS; 1234 5679, the magic the
-/// protocol reserves so that it can never be mistaken for a supported version.
-pub fn ssl_request() -> Bytes = counted(u32_be(80877103))
+/// The `SSLRequest` message, which asks the server to speak TLS. Its code, 1234 5679, is a number
+/// the protocol reserves so that it can never be mistaken for a supported version.
+pub fn ssl_request() -> Bytes = length_prefixed(u32_be(80877103))
 
-/// The byte a server answers an SSL request with when it will speak TLS.
+/// The byte a server sends in reply to an SSL request when it will speak TLS.
 pub fn ssl_response() -> Bytes = byte_of_int(83)
 
 /// The request that cancels the statement a session is running, named by its backend key.
 pub fn cancel_request(pid: Int, secret: Int) -> Bytes =
-  counted(Bytes::concat_all([u32_be(80877102), u32_be(pid), u32_be(secret)]))
+  length_prefixed(Bytes::concat_all([u32_be(80877102), u32_be(pid), u32_be(secret)]))
 
-/// The simple query protocol: one statement, answered with rows and a command tag.
+/// The simple query protocol: one statement, to which the server replies with rows and a command
+/// tag.
 pub fn query(sql: String) -> Bytes / {abort.raise} = frontend(Query, cstring(sql))
 
 /// The extended protocol: `parse` names a statement, `bind` names a portal over it, `execute`
-/// runs the portal, and `sync` is what makes the server answer. Text format both ways.
+/// runs the portal, and `sync` makes the server reply. Text format both ways.
 pub fn parse(statement: String, sql: String, param_types: List<Int>) -> Bytes / {abort.raise} =
   frontend(
     Parse,
@@ -269,8 +272,8 @@ fn bound_value(p: Option<String>) -> Bytes =
     },
   }
 
-/// `Bind` of a portal over a prepared statement, every parameter in text and `None` for NULL, and every
-/// result in text.
+/// `Bind` of a portal over a prepared statement, every parameter in text and `None` for NULL, and
+/// every result in text.
 pub fn bind(
   portal: String,
   statement: String,
@@ -297,7 +300,7 @@ pub fn describe(statement: Bool, name: String) -> Bytes / {abort.raise} =
 pub fn execute(portal: String, max_rows: Int) -> Bytes / {abort.raise} =
   frontend(Execute, cstring(portal).concat(u32_be(max_rows)))
 
-/// `Sync`, which ends an extended-protocol exchange and makes the server answer.
+/// `Sync`, which ends an extended-protocol exchange and makes the server reply.
 pub fn sync() -> Bytes / {abort.raise} = frontend(Sync, b"")
 
 /// `Flush`, which asks the server for what it has without ending the exchange.
@@ -316,7 +319,7 @@ pub fn terminate() -> Bytes / {abort.raise} = frontend(Terminate, b"")
 pub type Partial = { frame: Option<Message>, rest: Bytes }
 
 /// The first whole frame in `buf`, and the bytes after it.
-pub fn first(buf: Bytes) -> Partial = {
+pub fn first_frame(buf: Bytes) -> Partial = {
   let n = buf.len();
   if n < 5 { { frame: None, rest: buf } } else {
     match buf.u32_be_at(1) {
@@ -336,7 +339,7 @@ pub fn read(buf: Bytes) -> Frames / {abort.raise} = read_all(buf, [], buf.len())
 
 /// A frame is five bytes at least, so the bytes bound the frames: `left`.
 fn read_all(buf: Bytes, acc: List<Message>, left: Int) -> Frames / {abort.raise} = {
-  let p = first(buf);
+  let p = first_frame(buf);
   match p.frame {
     None -> { done: acc, rest: p.rest },
     Some(m) -> if left <= 0 { panic("more frames than bytes") }
@@ -358,11 +361,12 @@ pub fn read_cstring(b: Bytes, at: Int) -> Option<CString> / {abort.raise} =
     }
   }
 
-/// What the server says before it will talk: 0 is authenticated, 3 wants a clear-text password,
-/// 5 wants md5, 10 offers SASL, 11 and 12 are its two SASL steps.
+/// The authentication code the server sends before it accepts queries: 0 is authenticated, 3
+/// requests a clear-text password, 5 requests md5, 10 offers SASL, and 11 and 12 are its two SASL
+/// steps.
 pub fn auth_code(message: Message) -> Option<Int> = message.body.u32_be_at(0)
 
-/// What an authentication code asks for, as an error names it.
+/// What an authentication code requests, as an error names it.
 pub fn auth_name(code: Int) -> String =
   if code == 0 { "AuthenticationOk" }
   else if code == 3 { "AuthenticationCleartextPassword" }
@@ -376,12 +380,12 @@ pub fn auth_name(code: Int) -> String =
 pub fn auth_body(message: Message) -> Option<Bytes> =
   message.body.slice_at(4, message.body.len() - 4)
 
-/// 'I' idle, 'T' in a transaction, 'E' in a failed transaction, which refuses everything but
+/// 'I' idle, 'T' in a transaction, 'E' in a failed transaction, which rejects everything but
 /// `ROLLBACK` until it ends.
 pub fn ready_status(message: Message) -> Option<Int> =
   if message.body.len() < 1 { None } else { Some(message.body.at(0)) }
 
-/// Where a session's transaction stands, as `ReadyForQuery` says.
+/// Where a session's transaction stands, as `ReadyForQuery` reports.
 pub type Status = | Idle | InTransaction | FailedTransaction | Unknown(Int)
 
 /// The status a `ReadyForQuery` byte names.
@@ -391,7 +395,7 @@ pub fn status_of(b: Int) -> Status =
   else if b == 69 { FailedTransaction }
   else { Unknown(b) }
 
-/// A status as a refusal names it.
+/// A status as an error message names it.
 pub fn status_name(s: Status) -> String =
   match s {
     Idle -> "idle",
@@ -414,10 +418,10 @@ pub fn backend_key(message: Message) -> Option<BackendKey> =
   }
 
 /// A run-time parameter and its value.
-pub type Set = { name: String, value: String }
+pub type Parameter = { name: String, value: String }
 
 /// The parameter a `ParameterStatus` message sets.
-pub fn parameter_status(message: Message) -> Option<Set> / {abort.raise} =
+pub fn parameter_status(message: Message) -> Option<Parameter> / {abort.raise} =
   match read_cstring(message.body, 0) {
     None -> None,
     Some(name) -> match read_cstring(message.body, name.next) {
@@ -487,7 +491,7 @@ fn values(
     }
   }
 
-/// The tag a completed command answers with: `SELECT 3`, `INSERT 0 1`, `BEGIN`.
+/// The tag a completed command reports: `SELECT 3`, `INSERT 0 1`, `BEGIN`.
 pub fn command_tag(message: Message) -> Option<String> / {abort.raise} =
   match read_cstring(message.body, 0) { None -> None, Some(tag) -> Some(tag.text) }
 
@@ -532,17 +536,17 @@ pub fn field_of(message: Message, code: Int) -> Option<String> / {abort.raise} =
 // --- A connection ---------------------------------------------------------------
 
 /// How long a client waits, in milliseconds: to connect, for a read, for a write.
-pub type Client = { connect_ms: Int, read_ms: Int, write_ms: Int }
+pub type Timeouts = { connect_ms: Int, read_ms: Int, write_ms: Int }
 
 /// Five seconds to connect, thirty to read or write.
-pub fn default_client() -> Client = { connect_ms: 5000, read_ms: 30000, write_ms: 30000 }
+pub fn default_timeouts() -> Timeouts = { connect_ms: 5000, read_ms: 30000, write_ms: 30000 }
 
 /// The most bytes one `net.recv` asks for.
 pub fn read_size() -> Int = 65536
 
-/// What the server said when it refused: the SQLSTATE is what a program branches on, the
-/// constraint is the one a violation names, and the rest is what it prints.
-pub type Server = {
+/// What the server reported when it rejected a request: the SQLSTATE is what a program branches
+/// on, the constraint is the one a violation names, and the rest is for display.
+pub type ServerError = {
   severity: String,
   code: String,
   message: String,
@@ -558,7 +562,7 @@ pub type Session = {
   buffer: Bytes,
   user: String,
   database: String,
-  settings: List<Set>,
+  settings: List<Parameter>,
   status: Status,
   notices: List<Notification>,
 }
@@ -570,31 +574,31 @@ pub type Session = {
 /// `net.start_tls` verifies one: against the built-in roots and `--trust`, for the name.
 pub type Tls = | NoTls | Requested(String) | Direct(String)
 
-/// Why a client operation has no answer.
+/// Why a client operation failed.
 pub type ClientError =
   | Unreachable
   | NotSent
   | TimedOut
   | Closed
-  /// TLS was asked for and the server answered that it does not speak it. Nothing goes on in
+  /// TLS was requested and the server replied that it does not support it. Nothing continues in
   /// plaintext.
   | Declined
   /// TLS did not complete: the certificate is not trusted for the name, plaintext was waiting
   /// where the handshake was to begin, or the handshake failed.
-  | Unsecured(net::Refusal)
-  /// The server refused and there is no connection left to use: it refused before it would talk,
-  /// or its error ended the session.
-  | Refused(Server)
-  /// A statement was refused. The connection is still usable — the server is waiting for the
-  /// next one — so the session comes back with the refusal for the caller to decide about.
-  | Rejected(Session, Server)
+  | Unsecured(net::Error)
+  /// The server rejected the client and no connection is left to use: it rejected the client
+  /// before accepting queries, or its error ended the session.
+  | Refused(ServerError)
+  /// A statement was rejected. The connection is still usable, since the server is waiting for the
+  /// next statement, so the session is returned with the error for the caller to handle.
+  | Rejected(Session, ServerError)
   | Unexpected(String)
 
-/// How a refusal reads: the severity, the message, and the SQLSTATE a program branches on.
-pub fn server_text(server: Server) -> String =
+/// A server error as text: the severity, the message, and the SQLSTATE a program branches on.
+pub fn server_error_text(server: ServerError) -> String =
   server.severity ++ ": " ++ server.message ++ " (" ++ server.code ++ ")"
 
-/// How a client error reads.
+/// A client error as text.
 pub fn client_error_text(e: ClientError) -> String =
   match e {
     Unreachable -> "the server could not be reached",
@@ -602,33 +606,33 @@ pub fn client_error_text(e: ClientError) -> String =
     TimedOut -> "the server did not answer in time",
     Closed -> "the server closed the connection",
     Declined -> "the server does not speak TLS, and this connection does not go on without it",
-    Unsecured(why) -> "TLS did not complete: " ++ net::refusal_message(why),
-    Refused(s) -> server_text(s),
-    Rejected(_, s) -> server_text(s),
+    Unsecured(why) -> "TLS did not complete: " ++ net::error_message(why),
+    Refused(s) -> server_error_text(s),
+    Rejected(_, s) -> server_error_text(s),
     Unexpected(what) -> what,
   }
 
 /// The value the server set `name` to at start-up.
 pub fn setting(s: Session, name: String) -> Option<String> =
-  s.settings.fold(None, |acc: Option<String>, set: Set|
+  s.settings.fold(None, |acc: Option<String>, set: Parameter|
     if set.name == name { Some(set.value) } else { acc })
 
 /// A message read, and the buffer after it.
-type Received = { message: Message, rest: Bytes }
+type ReceivedMessage = { message: Message, rest: Bytes }
 
 fn read_message<[l]>(
   c: Int,
   buf: Bytes,
   timeout_ms: Int,
-) -> Result<Received, ClientError> / {net.recv[l], abort.raise} =
+) -> Result<ReceivedMessage, ClientError> / {net.recv[l], abort.raise} =
   match arriving[l](c, buf, timeout_ms) {
     Ok(Arrived(got)) -> Ok(got),
-    Ok(Partly(_)) -> Err(TimedOut),
+    Ok(Incomplete(_)) -> Err(TimedOut),
     Err(e) -> Err(e),
   }
 
 /// A message read, or what had arrived of the next one when a read's deadline passed.
-type Arrival = | Arrived(Received) | Partly(Bytes)
+type Arrival = | Arrived(ReceivedMessage) | Incomplete(Bytes)
 
 fn arriving<[l]>(
   c: Int,
@@ -638,29 +642,29 @@ fn arriving<[l]>(
   awaiting[l](c, buf, timeout_ms, 4294967297)
 
 /// A frame is at most 2^32 bytes past its kind, and a round adds a byte at least, so a well-formed
-/// one is whole within `room` rounds.
+/// one is whole within `rounds_left` rounds.
 fn awaiting<[l]>(
   c: Int,
   buf: Bytes,
   timeout_ms: Int,
-  room: Int,
+  rounds_left: Int,
 ) -> Result<Arrival, ClientError> / {net.recv[l], abort.raise} = {
-  let p = first(buf);
+  let p = first_frame(buf);
   match p.frame {
     Some(m) -> Ok(Arrived({ message: m, rest: p.rest })),
     None -> if buf.len() >= 5 && (match buf.u32_be_at(1) { Some(n) -> n < 4, None -> false }) {
       Err(Unexpected("a frame whose length is less than its own four bytes"))
-    } else if room <= 0 { panic("a frame past its own length") } else {
+    } else if rounds_left <= 0 { panic("a frame past its own length") } else {
       match net.recv[l](c, read_size(), timeout_ms) {
-        None -> Ok(Partly(buf)),
+        None -> Ok(Incomplete(buf)),
         Some(bytes) -> if bytes.len() == 0 { Err(Closed) }
-        else { awaiting[l](c, buf.concat(bytes), timeout_ms, room - 1) },
+        else { awaiting[l](c, buf.concat(bytes), timeout_ms, rounds_left - 1) },
       }
     },
   }
 }
 
-fn server_of(message: Message) -> Server / {abort.raise} =
+fn server_error_of(message: Message) -> ServerError / {abort.raise} =
   {
     severity: field_or(message, 83, "ERROR"),
     code: field_or(message, 67, ""),
@@ -676,20 +680,21 @@ fn status_after(message: Message) -> Status =
 fn field_or(m: Message, code: Int, fallback: String) -> String / {abort.raise} =
   match field_of(m, code) { Some(text) -> text, None -> fallback }
 
-/// Open a socket, secure it as `tls` says, and get to where the server will answer a query:
-/// start-up, whatever authentication it asks for, its parameters, and `ReadyForQuery`.
+/// Opens a socket, secures it as `tls` directs, and brings the session to the point where the
+/// server accepts queries: start-up, whatever authentication the server requests, its parameters,
+/// and `ReadyForQuery`.
 pub fn connect<[l]>(
   host: String,
   port: Int,
   tls: Tls,
   user: String,
   database: String,
-  parameters: List<Set>,
+  parameters: List<Parameter>,
   password: Option<Secret<Bytes>>,
   nonce: String,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Session, ClientError> / {net.connect[l], net.start_tls[l], net.peer_certificate[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], abort.raise, diverges} =
-  match net.connect[l](host, port, client.connect_ms) {
+  match net.connect[l](host, port, timeouts.connect_ms) {
     None -> Err(Unreachable),
     Some(conn) -> {
       let opening: Session = {
@@ -701,11 +706,14 @@ pub fn connect<[l]>(
         status: Idle,
         notices: [],
       };
-      let started = match secured[l](conn, tls, client) {
+      let started = match secured[l](conn, tls, timeouts) {
         Err(e) -> Err(e),
-        Ok(channel) -> if !send_all[l](conn, startup(user, database, parameters), client.write_ms) {
-          Err(NotSent)
-        } else { greet[l](opening, password, nonce, client, nothing_said(channel)) },
+        Ok(channel) -> if !send_all[l](
+            conn,
+            startup(user, database, parameters),
+            timeouts.write_ms,
+          ) { Err(NotSent) }
+        else { greet[l](opening, password, nonce, timeouts, empty_greeting(channel)) },
       };
       match started {
         Ok(s) -> Ok(s),
@@ -725,22 +733,23 @@ pub fn alpn() -> String = "postgresql"
 /// presented, which SCRAM binds the exchange to.
 type Channel = | Plaintext | Secured(Option<Bytes>)
 
-/// `conn` secured as `tls` asks, before anything else is sent on it. The answer to an
-/// `SSLRequest` is read a byte at a time, so a byte the server sent after it is still on the socket
-/// when the handshake begins, where `net.start_tls` refuses it as `Injected`.
+/// `conn` secured as `tls` requests, before anything else is sent on it. The reply to an
+/// `SSLRequest` is read one byte at a time, so any byte the server sent after it is still on the
+/// socket when the handshake begins, where `net.start_tls` rejects it as `Injected`.
 fn secured<[l]>(
   conn: Int,
   tls: Tls,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Channel, ClientError> / {net.send[l], net.recv[l], net.start_tls[l], net.peer_certificate[l], abort.raise} =
   match tls {
     NoTls -> Ok(Plaintext),
-    Direct(name) -> upgraded[l](conn, name, client),
-    Requested(name) -> if !send_all[l](conn, ssl_request(), client.write_ms) { Err(NotSent) } else {
-      match net.recv[l](conn, 1, client.read_ms) {
+    Direct(name) -> upgraded[l](conn, name, timeouts),
+    Requested(name) -> if !send_all[l](conn, ssl_request(), timeouts.write_ms) { Err(NotSent) }
+    else {
+      match net.recv[l](conn, 1, timeouts.read_ms) {
         None -> Err(TimedOut),
         Some(answer) -> if answer.len() == 0 { Err(Closed) }
-        else if answer.at(0) == 83 { upgraded[l](conn, name, client) }
+        else if answer.at(0) == 83 { upgraded[l](conn, name, timeouts) }
         else if answer.at(0) == 78 { Err(Declined) }
         else { Err(Unexpected("the server answered the SSL request with neither `S` nor `N`")) },
       }
@@ -750,9 +759,9 @@ fn secured<[l]>(
 fn upgraded<[l]>(
   conn: Int,
   name: String,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Channel, ClientError> / {net.start_tls[l], net.peer_certificate[l]} =
-  match net.start_tls[l](conn, name, [alpn()], b"", client.connect_ms) {
+  match net.start_tls[l](conn, name, [alpn()], b"", timeouts.connect_ms) {
     Ok(_) -> Ok(Secured(net.peer_certificate[l](conn))),
     Err(why) -> Err(Unsecured(why)),
   }
@@ -761,10 +770,10 @@ fn greet<[l]>(
   s: Session,
   password: Option<Secret<Bytes>>,
   nonce: String,
-  client: Client,
+  timeouts: Timeouts,
   acc: Greeting,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
-  match read_message[l](s.conn, s.buffer, client.read_ms) {
+  match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
     Err(e) -> Err(e),
     Ok(got) -> {
       let m = got.message;
@@ -772,7 +781,7 @@ fn greet<[l]>(
       match m.kind {
         Authentication -> match auth_code(m) {
           None -> Err(Unexpected("an authentication message with no code")),
-          Some(0) -> greet[l](rest, password, nonce, client, acc),
+          Some(0) -> greet[l](rest, password, nonce, timeouts, acc),
           Some(3) -> match password {
             None -> Err(Refused(no_password(s.user, "a clear-text password"))),
             Some(secret) -> if !net.send_secret[l](
@@ -781,19 +790,19 @@ fn greet<[l]>(
                 secret,
                 "raw",
                 b"\x00",
-                client.write_ms,
+                timeouts.write_ms,
               ) { Err(NotSent) }
-            else { greet[l](rest, password, nonce, client, acc) },
+            else { greet[l](rest, password, nonce, timeouts, acc) },
           },
-          Some(10) -> scram_begin[l](rest, password, nonce, client, acc, m),
-          Some(11) -> scram_continue[l](rest, password, nonce, client, acc, m),
+          Some(10) -> scram_begin[l](rest, password, nonce, timeouts, acc, m),
+          Some(11) -> scram_continue[l](rest, password, nonce, timeouts, acc, m),
           Some(12) -> match acc.sasl.expected {
             None -> Err(Unexpected("the server proved itself before it was asked to")),
             Some(expected) -> match auth_text(m) {
               None -> Err(Unexpected("a SASL final that is not text")),
               Some(text) -> if !scram_verify(text, expected) {
                 Err(Unexpected("the server's proof did not verify"))
-              } else { greet[l](rest, password, nonce, client, acc) },
+              } else { greet[l](rest, password, nonce, timeouts, acc) },
             },
           },
           Some(other) ->
@@ -806,19 +815,19 @@ fn greet<[l]>(
         },
         ParameterStatus -> match parameter_status(m) {
           Some(set) ->
-            greet[l](rest, password, nonce, client, { ..acc, settings: acc.settings.push(set) }),
-          None -> greet[l](rest, password, nonce, client, acc),
+            greet[l](rest, password, nonce, timeouts, { ..acc, settings: acc.settings.push(set) }),
+          None -> greet[l](rest, password, nonce, timeouts, acc),
         },
-        BackendKeyData -> greet[l](rest, password, nonce, client, acc),
-        NoticeResponse -> greet[l](rest, password, nonce, client, acc),
-        ErrorResponse -> Err(Refused(server_of(m))),
+        BackendKeyData -> greet[l](rest, password, nonce, timeouts, acc),
+        NoticeResponse -> greet[l](rest, password, nonce, timeouts, acc),
+        ErrorResponse -> Err(Refused(server_error_of(m))),
         ReadyForQuery -> Ok({ ..rest, settings: acc.settings, status: status_after(m) }),
         _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " before the server was ready")),
       }
     },
   }
 
-fn no_password(user: String, what: String) -> Server =
+fn no_password(user: String, what: String) -> ServerError =
   {
     severity: "ERROR",
     code: "28000",
@@ -827,22 +836,22 @@ fn no_password(user: String, what: String) -> Server =
     constraint: "",
   }
 
-/// What a `PasswordMessage` holding a password of `length` bytes begins with: its kind and its
-/// length, which counts itself, the password and the NUL after it. It is all of the message a
-/// server is told in the clear; a SASL step travels in the same frame.
+/// The start of a `PasswordMessage` containing a password of `length` bytes: its kind and its
+/// length, which counts itself, the password and the NUL after it. It is the only part of the
+/// message sent in the clear; a SASL step travels in the same frame.
 pub fn password_head(length: Int) -> Bytes = byte_of_int(112).concat(u32_be(length + 5))
 
 // --- SASL -----------------------------------------------------------------------
 
-/// What the greeting has collected: the parameters the server set, where SASL has got to, and
-/// the channel it runs over.
-type Greeting = { settings: List<Set>, sasl: Sasl, channel: Channel }
+/// What the greeting has collected: the parameters the server set, SASL's progress, and the
+/// channel it runs over.
+type Greeting = { settings: List<Parameter>, sasl: Sasl, channel: Channel }
 
 /// SCRAM's first message without its header, the binding the header named, and the signature the
 /// server is to prove itself with.
-type Sasl = { first_bare: String, binding: Binding, expected: Option<Bytes> }
+type Sasl = { first_bare: String, binding: ChannelBinding, expected: Option<Bytes> }
 
-fn nothing_said(channel: Channel) -> Greeting =
+fn empty_greeting(channel: Channel) -> Greeting =
   { settings: [], sasl: { first_bare: "", binding: Unbound, expected: None }, channel: channel }
 
 /// The bytes after an authentication code, as the text a SASL step carries.
@@ -853,7 +862,8 @@ fn auth_text(message: Message) -> Option<String> / {abort.raise} =
 fn mechanisms(message: Message) -> List<String> / {abort.raise} =
   match auth_body(message) { None -> [], Some(bytes) -> names_from(bytes, 0, [], bytes.len()) }
 
-/// `left` as in `fields_of`: a name that goes on is a byte and its end at least.
+/// `left` bounds the recursion as in `fields_of`: each name before the last is at least a byte and
+/// its terminator.
 fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> / {abort.raise} =
   if at >= b.len() { acc } else {
     match read_cstring(b, at) {
@@ -864,13 +874,13 @@ fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> /
     }
   }
 
-/// The binding SCRAM runs under over `channel`, given the mechanisms the server offers: none over
-/// plaintext; the channel where the server offers SCRAM-SHA-256-PLUS over TLS, and never less; and
-/// otherwise none, saying the client would have bound one.
-fn bound_as(
+/// The binding SCRAM uses over `channel`, given the mechanisms the server offers: none over
+/// plaintext; the channel over TLS when the server offers SCRAM-SHA-256-PLUS, and never less; and
+/// otherwise none, stating that the client would have bound one.
+fn choose_binding(
   channel: Channel,
   offered: List<String>,
-) -> Result<Binding, ClientError> / {abort.raise} = {
+) -> Result<ChannelBinding, ClientError> / {abort.raise} = {
   let plain = offered.contains("SCRAM-SHA-256");
   match channel {
     Plaintext -> if plain { Ok(Unbound) } else { Err(no_scram()) },
@@ -901,7 +911,7 @@ fn bound_as(
 fn no_scram() -> ClientError = Unexpected("the server offers no SCRAM-SHA-256 mechanism")
 
 /// The mechanism SCRAM is named under for a binding.
-fn scram_mechanism(b: Binding) -> String =
+fn scram_mechanism(b: ChannelBinding) -> String =
   match b { ServerEndPoint(_) -> "SCRAM-SHA-256-PLUS", _ -> "SCRAM-SHA-256" }
 
 /// The client's first message: the mechanism, then the length-prefixed first message.
@@ -909,13 +919,13 @@ fn scram_begin<[l]>(
   s: Session,
   password: Option<Secret<Bytes>>,
   nonce: String,
-  client: Client,
+  timeouts: Timeouts,
   acc: Greeting,
   message: Message,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
     None -> Err(Refused(no_password(s.user, "a password"))),
-    Some(_) -> match bound_as(acc.channel, mechanisms(message)) {
+    Some(_) -> match choose_binding(acc.channel, mechanisms(message)) {
       Err(e) -> Err(e),
       Ok(binding) -> {
         let first_bare = scram_first_bare(s.user, nonce);
@@ -925,10 +935,12 @@ fn scram_begin<[l]>(
           i32_be(raw.len()),
           raw,
         ]);
-        if !send_all[l](s.conn, byte_of_int(112).concat(counted(payload)), client.write_ms) {
-          Err(NotSent)
-        } else {
-          greet[l](s, password, nonce, client, {
+        if !send_all[l](
+            s.conn,
+            byte_of_int(112).concat(length_prefixed(payload)),
+            timeouts.write_ms,
+          ) { Err(NotSent) } else {
+          greet[l](s, password, nonce, timeouts, {
             ..acc,
             sasl: { first_bare: first_bare, binding: binding, expected: None },
           })
@@ -946,10 +958,10 @@ type Element = { tag: Int, start: Int, end: Int }
 /// most four bytes, past which no certificate runs.
 fn der_at(b: Bytes, at: Int) -> Option<Element> =
   if at < 0 || at + 2 > b.len() { None } else {
-    let first = b.at(at + 1);
-    let n = if first < 128 { 0 } else { first - 128 };
-    if n > 4 || at + 2 + n > b.len() || first == 128 { None } else {
-      let length = if n == 0 { first }
+    let first_frame = b.at(at + 1);
+    let n = if first_frame < 128 { 0 } else { first_frame - 128 };
+    if n > 4 || at + 2 + n > b.len() || first_frame == 128 { None } else {
+      let length = if n == 0 { first_frame }
       else { range(0, n).fold(0, |acc: Int, i: Int| acc * 256 + b.at(at + 2 + i)) };
       let start = at + 2 + n;
       if start + length > b.len() { None }
@@ -957,16 +969,16 @@ fn der_at(b: Bytes, at: Int) -> Option<Element> =
     }
   }
 
-/// The object identifier the DER element at `at` holds, where it holds one.
+/// The object identifier the DER element at `at` contains, if it contains one.
 fn der_oid(b: Bytes, at: Int) -> Option<Bytes> / {abort.raise} =
   match der_at(b, at) {
     Some(e) -> if e.tag == 6 { Some(b.slice(e.start, e.end)) } else { None },
     None -> None,
   }
 
-/// The hash a signature algorithm's identifier names, SHA-256 where it is MD5 or SHA-1, as RFC
-/// 5929 §4.1 has `tls-server-end-point` take it; `params` is where its parameters are, which
-/// name RSASSA-PSS's.
+/// The hash a signature algorithm's identifier names, with SHA-256 in place of MD5 or SHA-1, as
+/// RFC 5929 §4.1 requires for `tls-server-end-point`. `params` is where its parameters are, which
+/// name RSASSA-PSS's hash.
 fn signing_hash(
   b: Bytes,
   algorithm: Bytes,
@@ -992,17 +1004,18 @@ fn signing_hash(
   else { None }
 }
 
-/// The hash RSASSA-PSS's parameters name in their first, explicitly tagged field; SHA-1, and so
-/// SHA-256 here, where they name none.
+/// The hash RSASSA-PSS's parameters name in their first, explicitly tagged field. When they name
+/// none, the default is SHA-1, and so SHA-256 here.
 fn pss_hash(b: Bytes, params: Int, end: Int) -> Option<String> / {abort.raise} =
   if params >= end { Some("SHA-256") } else {
     match der_at(b, params) {
       None -> None,
       Some(sequence) -> match der_at(b, sequence.start) {
         None -> Some("SHA-256"),
-        Some(first) -> if first.tag != 160 || sequence.start >= sequence.end { Some("SHA-256") }
-        else {
-          match der_at(b, first.start) {
+        Some(first_frame) -> if first_frame.tag != 160 || sequence.start >= sequence.end {
+          Some("SHA-256")
+        } else {
+          match der_at(b, first_frame.start) {
             None -> None,
             Some(identifier) -> match der_oid(b, identifier.start) {
               None -> None,
@@ -1021,9 +1034,9 @@ fn pss_hash(b: Bytes, params: Int, end: Int) -> Option<String> / {abort.raise} =
     }
   }
 
-/// The `tls-server-end-point` data of a DER certificate, RFC 5929 §4.1: the certificate's hash under
-/// the hash its signature algorithm names. `None` for a certificate that does not read, and for an
-/// algorithm that names no hash, as Ed25519's does not.
+/// The `tls-server-end-point` data of a DER certificate (RFC 5929 §4.1): the certificate's hash
+/// under the hash its signature algorithm names. `None` for a certificate that cannot be read, and
+/// for an algorithm that names no hash, as Ed25519's does not.
 pub fn end_point(der: Bytes) -> Option<Bytes> / {abort.raise} =
   match der_at(der, 0) {
     None -> None,
@@ -1056,7 +1069,7 @@ fn scram_continue<[l]>(
   s: Session,
   password: Option<Secret<Bytes>>,
   nonce: String,
-  client: Client,
+  timeouts: Timeouts,
   acc: Greeting,
   message: Message,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
@@ -1076,10 +1089,12 @@ fn scram_continue<[l]>(
           None -> Err(Unexpected("a SASL continue whose nonce is not the one this client sent")),
           Some(proof) -> {
             let raw = Bytes::of_string(proof.reply);
-            if !send_all[l](s.conn, byte_of_int(112).concat(counted(raw)), client.write_ms) {
-              Err(NotSent)
-            } else {
-              greet[l](s, password, nonce, client, {
+            if !send_all[l](
+                s.conn,
+                byte_of_int(112).concat(length_prefixed(raw)),
+                timeouts.write_ms,
+              ) { Err(NotSent) } else {
+              greet[l](s, password, nonce, timeouts, {
                 ..acc,
                 sasl: { ..acc.sasl, expected: Some(proof.expected) },
               })
@@ -1092,20 +1107,20 @@ fn scram_continue<[l]>(
 
 // --- Queries --------------------------------------------------------------------
 
-/// What a query answered: its columns, its rows with `None` for NULL, and its command tag.
-pub type Answer = { columns: List<Column>, rows: List<List<Option<Bytes>>>, tag: String }
+/// What a query returned: its columns, its rows with `None` for NULL, and its command tag.
+pub type QueryResult = { columns: List<Column>, rows: List<List<Option<Bytes>>>, tag: String }
 
-/// The session after a query, and its answer.
-pub type Reply = { session: Session, answer: Answer }
+/// The session after a query, and its result.
+pub type Reply = { session: Session, result: QueryResult }
 
 /// The simple query protocol: one statement, no parameters.
 pub fn simple_query<[l]>(
   s: Session,
   sql: String,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Reply, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
-  if !send_all[l](s.conn, query(sql), client.write_ms) { Err(NotSent) }
-  else { gather[l](s, client, nothing()) }
+  if !send_all[l](s.conn, query(sql), timeouts.write_ms) { Err(NotSent) }
+  else { gather[l](s, timeouts, empty_result()) }
 
 /// The extended query protocol, every parameter and every result in text format, so a parameter
 /// is the text the server would have printed. The statement and the portal are unnamed, which is
@@ -1114,7 +1129,7 @@ pub fn extended_query<[l]>(
   s: Session,
   sql: String,
   params: List<Option<String>>,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Reply, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
   if !send_all[l](
       s.conn,
@@ -1125,65 +1140,65 @@ pub fn extended_query<[l]>(
         execute("", 0),
         sync(),
       ]),
-      client.write_ms,
+      timeouts.write_ms,
     ) { Err(NotSent) }
-  else { gather[l](s, client, nothing()) }
+  else { gather[l](s, timeouts, empty_result()) }
 
-/// The columns `sql` would answer, as its `RowDescription` names them, without running it: none for
-/// a statement that answers no rows.
-pub fn described<[l]>(
+/// The columns `sql` would return, as its `RowDescription` names them, without running it: none
+/// for a statement that returns no rows.
+pub fn describe_statement<[l]>(
   s: Session,
   sql: String,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Reply, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
   if !send_all[l](
       s.conn,
       Bytes::concat_all([parse("", sql, []), describe(true, ""), sync()]),
-      client.write_ms,
+      timeouts.write_ms,
     ) { Err(NotSent) }
-  else { gather[l](s, client, nothing()) }
+  else { gather[l](s, timeouts, empty_result()) }
 
-type Reading = {
+type PartialResult = {
   columns: List<Column>,
   rows: List<List<Option<Bytes>>>,
   tag: String,
-  refused: Option<Server>,
+  refused: Option<ServerError>,
 }
 
-fn nothing() -> Reading = { columns: [], rows: [], tag: "", refused: None }
+fn empty_result() -> PartialResult = { columns: [], rows: [], tag: "", refused: None }
 
-/// Everything a query answers, up to the `ReadyForQuery` that ends it. A refusal is carried to
-/// that point rather than raised where it arrives, so the connection is left usable; a server that
-/// hangs up after its refusal instead, as a `FATAL` one does, is answered with that refusal.
+/// Everything a query returns, up to the `ReadyForQuery` that ends it. An error is carried to that
+/// point rather than raised where it arrives, so the connection is left usable. If the server hangs
+/// up after its error instead, as it does for a `FATAL` one, that error is returned.
 fn gather<[l]>(
   s: Session,
-  client: Client,
-  acc: Reading,
+  timeouts: Timeouts,
+  acc: PartialResult,
 ) -> Result<Reply, ClientError> / {net.recv[l], abort.raise, diverges} =
-  match read_message[l](s.conn, s.buffer, client.read_ms) {
+  match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
     Err(e) -> match acc.refused { Some(server) -> Err(Refused(server)), None -> Err(e) },
     Ok(got) -> {
       let m = got.message;
       let rest: Session = { ..s, buffer: got.rest };
       match m.kind {
         RowDescription ->
-          gather[l](rest, client, {
+          gather[l](rest, timeouts, {
             ..acc,
             columns: match row_description(m) { Some(c) -> c, None -> acc.columns },
           }),
         DataRow ->
-          gather[l](rest, client, {
+          gather[l](rest, timeouts, {
             ..acc,
             rows: acc.rows.concat([match data_row(m) { Some(r) -> r, None -> [] }]),
           }),
         CommandComplete ->
-          gather[l](rest, client, {
+          gather[l](rest, timeouts, {
             ..acc,
             tag: match command_tag(m) { Some(t) -> t, None -> acc.tag },
           }),
-        ErrorResponse -> gather[l](rest, client, { ..acc, refused: Some(server_of(m)) }),
-        NoticeResponse -> gather[l](rest, client, acc),
-        NotificationResponse -> gather[l](kept_notice(rest, m), client, acc),
+        ErrorResponse -> gather[l](rest, timeouts, { ..acc, refused: Some(server_error_of(m)) }),
+        NoticeResponse -> gather[l](rest, timeouts, acc),
+        NotificationResponse -> gather[l](queue_notification(rest, m), timeouts, acc),
         ReadyForQuery -> {
           let ready = { ..rest, status: status_after(m) };
           match acc.refused {
@@ -1191,18 +1206,21 @@ fn gather<[l]>(
             None ->
               Ok({
                 session: ready,
-                answer: { columns: acc.columns, rows: acc.rows, tag: acc.tag },
+                result: { columns: acc.columns, rows: acc.rows, tag: acc.tag },
               }),
           }
         },
-        _ -> gather[l](rest, client, acc),
+        _ -> gather[l](rest, timeouts, acc),
       }
     },
   }
 
 /// The connection is done; the server expects nothing more.
-pub fn finish<[l]>(s: Session, client: Client) -> Unit / {net.send[l], net.close[l], abort.raise} = {
-  send_all[l](s.conn, terminate(), client.write_ms);
+pub fn finish<[l]>(
+  s: Session,
+  timeouts: Timeouts,
+) -> Unit / {net.send[l], net.close[l], abort.raise} = {
+  send_all[l](s.conn, terminate(), timeouts.write_ms);
   net.close[l](s.conn)
 }
 
@@ -1225,36 +1243,37 @@ pub fn notification(message: Message) -> Option<Notification> / {abort.raise} =
     },
   }
 
-fn kept_notice(s: Session, message: Message) -> Session / {abort.raise} =
+fn queue_notification(s: Session, message: Message) -> Session / {abort.raise} =
   match notification(message) { Some(n) -> { ..s, notices: s.notices.push(n) }, None -> s }
 
-/// The session after a wait, and the notification it took: `None` when the deadline passed first.
-pub type Waited = { session: Session, notice: Option<Notification> }
+/// The session after a wait, and the notification it received: `None` when the deadline passed
+/// first.
+pub type WaitResult = { session: Session, notification: Option<Notification> }
 
-/// The next notification for a session that has sent `LISTEN`, the oldest it already holds or the
-/// next to arrive within `timeout_ms`. A notification arrives between statements, and so does what
-/// a server says of a parameter it changed or a notice, which is read past; a refusal there is the
-/// server ending the session.
+/// The next notification for a session that has sent `LISTEN`: the oldest one it already stores,
+/// or the next to arrive within `timeout_ms`. Notifications arrive between statements, as do
+/// parameter changes and notices, which are skipped. An error there means the server is ending the
+/// session.
 pub fn await_notification<[l]>(
   s: Session,
   timeout_ms: Int,
-) -> Result<Waited, ClientError> / {net.recv[l], abort.raise, diverges} =
+) -> Result<WaitResult, ClientError> / {net.recv[l], abort.raise, diverges} =
   match s.notices {
-    [oldest, ..later] -> Ok({ session: { ..s, notices: later }, notice: Some(oldest) }),
+    [oldest, ..later] -> Ok({ session: { ..s, notices: later }, notification: Some(oldest) }),
     [] -> match arriving[l](s.conn, s.buffer, timeout_ms) {
       Err(e) -> Err(e),
-      Ok(Partly(held)) -> Ok({ session: { ..s, buffer: held }, notice: None }),
+      Ok(Incomplete(held)) -> Ok({ session: { ..s, buffer: held }, notification: None }),
       Ok(Arrived(got)) -> {
         let rest = { ..s, buffer: got.rest };
         let m = got.message;
         match m.kind {
           NotificationResponse -> match notification(m) {
-            Some(n) -> Ok({ session: rest, notice: Some(n) }),
+            Some(n) -> Ok({ session: rest, notification: Some(n) }),
             None -> Err(Unexpected("a notification that does not read")),
           },
           ParameterStatus -> await_notification[l](rest, timeout_ms),
           NoticeResponse -> await_notification[l](rest, timeout_ms),
-          ErrorResponse -> Err(Refused(server_of(m))),
+          ErrorResponse -> Err(Refused(server_error_of(m))),
           _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " between statements")),
         }
       },
@@ -1266,15 +1285,15 @@ pub fn await_notification<[l]>(
 /// `CopyData`, a piece of what a copy in sends: a row need not end where a piece does.
 pub fn copy_data(data: Bytes) -> Bytes / {abort.raise} = frontend(CopyData, data)
 
-/// `CopyDone`, which ends a copy in and asks the server to keep what it was sent.
+/// `CopyDone`, which ends a copy in and tells the server to keep what it was sent.
 pub fn copy_done() -> Bytes / {abort.raise} = frontend(CopyDone, b"")
 
-/// `CopyFail`, which ends a copy in and asks the server to keep none of it, saying why.
+/// `CopyFail`, which ends a copy in and tells the server to discard all of it, giving the reason.
 pub fn copy_fail(why: String) -> Bytes / {abort.raise} = frontend(CopyFail, cstring(why))
 
 /// One row in `COPY`'s text format: the values separated by tabs, `\N` for NULL, and a newline at
 /// the end. A backslash, a tab, a newline and a carriage return in a value are written escaped, so
-/// a value holds any text.
+/// a value can contain any text.
 pub fn copy_row(values: List<Option<String>>) -> Bytes =
   Bytes::join(
     values.map(|v: Option<String>|
@@ -1296,9 +1315,9 @@ fn copy_escaped(raw: Bytes) -> Bytes =
     }),
   )
 
-/// The values of one row in `COPY`'s text format, its newline already taken off: `None` for a
-/// NULL, and each other value the text the server printed, its escapes read. A backslash that
-/// ends the row is not a row.
+/// The values of one row in `COPY`'s text format, its newline already removed: `None` for a
+/// NULL, and each other value the text the server printed, with its escapes decoded. A row that
+/// ends in a backslash is not a valid row.
 pub fn copy_fields(line: Bytes) -> Option<List<Option<Bytes>>> / {abort.raise} =
   match copy_split(line, 0, 0, [], line.len() + 1) {
     None -> None,
@@ -1328,9 +1347,9 @@ fn copy_split(
     else { copy_split(line, start, at + 1, acc, left - 1) }
   }
 
-/// A field's escapes read: `\b`, `\f`, `\n`, `\r`, `\t` and `\v` the control characters they name,
-/// one to three octal digits or `x` and one or two hex digits a byte, and a backslash before
-/// anything else that thing.
+/// A field with its escapes decoded: `\b`, `\f`, `\n`, `\r`, `\t` and `\v` are the control
+/// characters they name, one to three octal digits or `x` and one or two hex digits are a byte,
+/// and a backslash before anything else is that character.
 fn copy_unescaped(field: Bytes) -> Option<Bytes> / {abort.raise} =
   unescaping(field, 0, b"", field.len() + 1)
 
@@ -1343,7 +1362,7 @@ fn unescaping(field: Bytes, at: Int, acc: Bytes, left: Int) -> Option<Bytes> / {
     unescaping(field, e.next, acc.concat(e.byte), left - 1)
   }
 
-/// What the escape after a backslash at `at` writes, and where the field goes on.
+/// What the escape after a backslash at `at` decodes to, and where the field continues.
 type Escape = { byte: Bytes, next: Int }
 
 fn escape_at(field: Bytes, at: Int) -> Escape / {abort.raise} = {
@@ -1375,26 +1394,28 @@ fn digits(field: Bytes, at: Int, radix: Int, most: Int) -> Escape / {abort.raise
   { byte: byte_of_int(taken.value & 255), next: taken.next }
 }
 
-/// A copy in under way: the session, and how many columns the server takes in each row.
+/// A copy in under way: the session, and how many columns the server expects in each row.
 pub type CopyIn = { session: Session, columns: Int }
 
-/// Sends `sql`, a `COPY ... FROM STDIN`, and answers once the server waits for rows. A statement
-/// the server refuses leaves the session ready for the next one, as a refused query does.
+/// Sends `sql`, a `COPY ... FROM STDIN`, and returns once the server is waiting for rows. A
+/// statement the server rejects leaves the session ready for the next one, as a rejected query
+/// does.
 pub fn copy_in_begin<[l]>(
   s: Session,
   sql: String,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<CopyIn, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
-  if !send_all[l](s.conn, query(sql), client.write_ms) { Err(NotSent) }
-  else { copy_opened[l](s, client, CopyInResponse) }
+  if !send_all[l](s.conn, query(sql), timeouts.write_ms) { Err(NotSent) }
+  else { copy_opened[l](s, timeouts, CopyInResponse) }
 
-/// Reads to the message that opens a copy, or to the refusal and readiness that say it did not.
+/// Reads up to the message that starts a copy, or to the error and readiness that show it did not
+/// start.
 fn copy_opened<[l]>(
   s: Session,
-  client: Client,
+  timeouts: Timeouts,
   opens: Backend,
 ) -> Result<CopyIn, ClientError> / {net.recv[l], abort.raise, diverges} =
-  match read_message[l](s.conn, s.buffer, client.read_ms) {
+  match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
     Err(e) -> Err(e),
     Ok(got) -> {
       let m = got.message;
@@ -1406,84 +1427,84 @@ fn copy_opened<[l]>(
         }
       } else {
         match m.kind {
-          ErrorResponse -> match gather[l](rest, client, {
-              ..nothing(),
-              refused: Some(server_of(m)),
+          ErrorResponse -> match gather[l](rest, timeouts, {
+              ..empty_result(),
+              refused: Some(server_error_of(m)),
             }) {
-            Ok(r) -> Err(Unexpected("a refused copy that answered " ++ r.answer.tag)),
+            Ok(r) -> Err(Unexpected("a refused copy that answered " ++ r.result.tag)),
             Err(e) -> Err(e),
           },
-          NoticeResponse -> copy_opened[l](rest, client, opens),
-          NotificationResponse -> copy_opened[l](kept_notice(rest, m), client, opens),
+          NoticeResponse -> copy_opened[l](rest, timeouts, opens),
+          NotificationResponse -> copy_opened[l](queue_notification(rest, m), timeouts, opens),
           _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " where a copy was to begin")),
         }
       }
     },
   }
 
-/// Sends a piece of a copy in; the server answers nothing until the copy ends.
+/// Sends a piece of a copy in; the server sends no reply until the copy ends.
 pub fn copy_send<[l]>(
   c: CopyIn,
   data: Bytes,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<CopyIn, ClientError> / {net.send[l], abort.raise} =
-  if data.len() == 0 || send_all[l](c.session.conn, copy_data(data), client.write_ms) { Ok(c) }
+  if data.len() == 0 || send_all[l](c.session.conn, copy_data(data), timeouts.write_ms) { Ok(c) }
   else { Err(NotSent) }
 
-/// Ends a copy in. `None` keeps what was sent, and the answer's tag is `COPY n`, the rows the
-/// server took; `Some(why)` sends `CopyFail`, the server keeps none of it, and the answer is its
-/// refusal (`57014`), with the session ready for the next statement. A row the server could not
-/// take is refused here too.
+/// Ends a copy in. `None` keeps what was sent, and the result's tag is `COPY n`, the number of rows
+/// the server accepted. `Some(why)` sends `CopyFail`, the server discards everything, and the
+/// result is its error (`57014`), with the session ready for the next statement. A row the server
+/// could not accept is also reported here as an error.
 pub fn copy_in_end<[l]>(
   c: CopyIn,
   failure: Option<String>,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Reply, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} = {
   let ending = match failure { None -> copy_done(), Some(why) -> copy_fail(why) };
-  if !send_all[l](c.session.conn, ending, client.write_ms) { Err(NotSent) }
-  else { gather[l](c.session, client, nothing()) }
+  if !send_all[l](c.session.conn, ending, timeouts.write_ms) { Err(NotSent) }
+  else { gather[l](c.session, timeouts, empty_result()) }
 }
 
-/// Sends `sql`, a `COPY ... TO STDOUT`, and answers once the server has begun to send rows, with
+/// Sends `sql`, a `COPY ... TO STDOUT`, and returns once the server has begun to send rows, with
 /// how many columns each has.
 pub fn copy_out_begin<[l]>(
   s: Session,
   sql: String,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<CopyIn, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
-  if !send_all[l](s.conn, query(sql), client.write_ms) { Err(NotSent) }
-  else { copy_opened[l](s, client, CopyOutResponse) }
+  if !send_all[l](s.conn, query(sql), timeouts.write_ms) { Err(NotSent) }
+  else { copy_opened[l](s, timeouts, CopyOutResponse) }
 
 /// The session after a read of a copy out, and the piece read: `None` once the server has sent
 /// everything and is ready for the next statement.
 pub type Piece = { session: Session, data: Option<Bytes> }
 
-/// The next piece of a copy out. A refusal partway through, as a statement that fails on a row
-/// gives, comes back as that refusal with the session ready for the next statement.
+/// The next piece of a copy out. An error partway through, such as a statement failing on a row,
+/// is returned as that error, with the session ready for the next statement.
 pub fn copy_out_take<[l]>(
   s: Session,
-  client: Client,
+  timeouts: Timeouts,
 ) -> Result<Piece, ClientError> / {net.recv[l], abort.raise, diverges} =
-  match read_message[l](s.conn, s.buffer, client.read_ms) {
+  match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
     Err(e) -> Err(e),
     Ok(got) -> {
       let m = got.message;
       let rest: Session = { ..s, buffer: got.rest };
       match m.kind {
         CopyChunk -> Ok({ session: rest, data: Some(m.body) }),
-        CopyEnd -> match gather[l](rest, client, nothing()) {
+        CopyEnd -> match gather[l](rest, timeouts, empty_result()) {
           Ok(r) -> Ok({ session: r.session, data: None }),
           Err(e) -> Err(e),
         },
-        ErrorResponse -> match gather[l](rest, client, {
-            ..nothing(),
-            refused: Some(server_of(m)),
+        ErrorResponse -> match gather[l](rest, timeouts, {
+            ..empty_result(),
+            refused: Some(server_error_of(m)),
           }) {
-          Ok(r) -> Err(Unexpected("a refused copy that answered " ++ r.answer.tag)),
+          Ok(r) -> Err(Unexpected("a refused copy that answered " ++ r.result.tag)),
           Err(e) -> Err(e),
         },
-        NoticeResponse -> copy_out_take[l](rest, client),
-        NotificationResponse -> copy_out_take[l](kept_notice(rest, m), client),
+        NoticeResponse -> copy_out_take[l](rest, timeouts),
+        NotificationResponse -> copy_out_take[l](queue_notification(rest, m), timeouts),
         _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " inside a copy out")),
       }
     },
@@ -1568,7 +1589,7 @@ test "an unnamed message keeps its byte" {
   assert_eq(backend_name(Other(87)), "Other(87)")
 }
 
-test "authentication says which answer it wants" {
+test "authentication reports which reply it expects" {
   let ok = { kind: Authentication, body: u32_be(0).concat(b"") };
   assert_eq(auth_code(ok), Some(0));
   assert_eq(auth_name(0), "AuthenticationOk");
@@ -1579,7 +1600,7 @@ test "authentication says which answer it wants" {
   assert_eq(auth_name(99), "Authentication(99)")
 }
 
-test "a ready-for-query says which state the transaction is in" {
+test "a ready-for-query reports which state the transaction is in" {
   assert_eq(ready_status({ kind: ReadyForQuery, body: b"I" }), Some(73));
   assert_eq(status_of(73), Idle);
   assert_eq(status_of(69), FailedTransaction);
@@ -1590,7 +1611,7 @@ test "a ready-for-query says which state the transaction is in" {
 test "a data row is its columns, with None for a null" {
   let body = Bytes::concat_all([u16_be(2), i32_be(3), b"abc", i32_be(-1)]);
   assert_eq(data_row({ kind: DataRow, body: body }), Some([Some(b"abc"), None]));
-  // A column claiming more bytes than the body holds is not a row.
+  // A column claiming more bytes than the body contains is not a row.
   let short = Bytes::concat_all([u16_be(1), i32_be(9), b"abc"]);
   assert_eq(data_row({ kind: DataRow, body: short }), None)
 }
@@ -1610,7 +1631,7 @@ test "a row description names its columns and their types" {
     row_description({ kind: RowDescription, body: body }),
     Some([{ name: "sku", ty: 25, format: 0 }]),
   );
-  // An empty description is the empty list, not a refusal.
+  // An empty description is the empty list, not an error.
   assert_eq(row_description({ kind: RowDescription, body: u16_be(0) }), Some([]))
 }
 
@@ -1659,13 +1680,13 @@ test "the mechanisms an authentication message offers" {
   ]);
   let plain = Bytes::concat_all([b"PLAIN\x00", b"\x00"]);
   assert_eq(mechanisms({ kind: Authentication, body: u32_be(10).concat(plain) }), ["PLAIN"]);
-  assert_eq(bound_as(Plaintext, ["PLAIN"]), Err(no_scram()))
+  assert_eq(choose_binding(Plaintext, ["PLAIN"]), Err(no_scram()))
 }
 
 /// A certificate whose signature algorithm is the object identifier `algorithm`, with `params`
-/// after it: what `end_point` reads of one, and no more. Its signed part is long enough that it and
+/// after it: the parts `end_point` reads, and no more. Its signed part is long enough that it and
 /// the whole take a length in two bytes, as a real certificate's do.
-fn t_certificate(algorithm: Bytes, params: Bytes) -> Bytes / {abort.raise} = {
+fn sample_certificate(algorithm: Bytes, params: Bytes) -> Bytes / {abort.raise} = {
   let length = |n: Int|
     if n < 128 { byte_of_int(n) }
     else { Bytes::concat_all([byte_of_int(130), byte_of_int(n / 256), byte_of_int(n % 256)]) };
@@ -1686,7 +1707,7 @@ test "a certificate is bound by its hash under the hash its signature names, SHA
   let rsa = |last: Bytes| b"\x2a\x86\x48\x86\xf7\x0d\x01\x01".concat(last);
   let ecdsa = |rest: Bytes| b"\x2a\x86\x48\xce\x3d\x04".concat(rest);
   let bound = |algorithm: Bytes, params: Bytes| {
-    let der = t_certificate(algorithm, params);
+    let der = sample_certificate(algorithm, params);
     (end_point(der), der)
   };
   let sha256_of = |p: (Option<Bytes>, Bytes)| p._0 == Some(sha256(p._1));
@@ -1699,29 +1720,29 @@ test "a certificate is bound by its hash under the hash its signature names, SHA
   assert_eq(sha384_rsa._0, Some(sha384(sha384_rsa._1)));
   let sha512_ecdsa = bound(ecdsa(b"\x03\x04"), b"");
   assert_eq(sha512_ecdsa._0, Some(sha512(sha512_ecdsa._1)));
-  // RSASSA-PSS names its hash in its parameters, and SHA-1 by saying nothing.
+  // RSASSA-PSS names its hash in its parameters, and means SHA-1 by naming none.
   let pss_sha384 = bound(
     rsa(b"\x0a"),
     b"\x30\x0f\xa0\x0d\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02",
   );
   assert_eq(pss_sha384._0, Some(sha384(pss_sha384._1)));
   assert(sha256_of(bound(rsa(b"\x0a"), b"\x30\x00")));
-  // Ed25519 names no hash, and a certificate cut short is none.
+  // Ed25519 names no hash, and a truncated certificate is not a certificate.
   assert_eq(bound(b"\x2b\x65\x70", b"")._0, None);
   assert_eq(end_point(b"\x30\x05\x30"), None);
-  let whole = t_certificate(rsa(b"\x0b"), b"\x05\x00");
+  let whole = sample_certificate(rsa(b"\x0b"), b"\x05\x00");
   assert_eq(end_point(whole.slice(0, whole.len() - 1)), None)
 }
 
-/// The SCRAM step a client takes over a connection its far end does `script` on, secured as `tls`
-/// says, the far end presenting `certificate`.
-fn t_scram(
+/// The SCRAM step a client takes over a connection whose far end runs `script`, secured as `tls`
+/// directs, with the far end presenting `certificate`.
+fn scram_outcome(
   script: List<net::Step>,
   tls: Tls,
   certificate: Bytes,
 ) -> String / {abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
-  let world = net::mem_presenting(
+  let world = net::mem_server_certificate(
     net::mem_serving(net::mem_empty(), server, [script]),
     "db.example",
     certificate,
@@ -1736,96 +1757,101 @@ fn t_scram(
       [],
       Some(Secret::of_bytes(b"pencil")),
       "n",
-      default_client(),
+      default_timeouts(),
     ));
   match over.value { Ok(_) -> "connected", Err(e) -> client_error_text(e) }
 }
 
-fn t_offered(names: List<String>) -> Bytes / {abort.raise} =
-  t_frame(82, Bytes::concat_all([u32_be(10), Bytes::concat_all(names.map(cstring)), b"\x00"]))
+fn sasl_offer(names: List<String>) -> Bytes / {abort.raise} =
+  message_frame(82, Bytes::concat_all([u32_be(10), Bytes::concat_all(names.map(cstring)), b"\x00"]))
 
-fn t_first(mechanism: String, header: String) -> Bytes / {abort.raise} = {
+fn scram_first_frame(mechanism: String, header: String) -> Bytes / {abort.raise} = {
   let raw = Bytes::of_string(header ++ "n=ply,r=n");
-  t_frame(112, Bytes::concat_all([cstring(mechanism), i32_be(raw.len()), raw]))
+  message_frame(112, Bytes::concat_all([cstring(mechanism), i32_be(raw.len()), raw]))
 }
 
-test "over TLS, SCRAM is bound to the server's certificate where it offers the binding, and says so where not" {
+test "over TLS, SCRAM is bound to the server's certificate when it offers the binding, and states otherwise" {
   let begun = startup("ply", "ply", []);
-  let refused = t_frame(69, b"SFATAL\x00C28P01\x00Mno\x00\x00");
-  let der = t_certificate(b"\x2a\x86\x48\xce\x3d\x04\x03\x02", b"");
-  let both = t_offered(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]);
-  // The script hears exactly the first message it names, or the run fails there.
-  let plus = t_scram(
+  let refused = message_frame(69, b"SFATAL\x00C28P01\x00Mno\x00\x00");
+  let der = sample_certificate(b"\x2a\x86\x48\xce\x3d\x04\x03\x02", b"");
+  let both = sasl_offer(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]);
+  // The script receives exactly the first message it names, or the run fails there.
+  let plus = scram_outcome(
     [
       net::Upgrades,
-      net::Hears(begun),
-      Says(both),
-      net::Hears(t_first("SCRAM-SHA-256-PLUS", "p=tls-server-end-point,,")),
-      Says(refused),
+      net::Expects(begun),
+      Sends(both),
+      net::Expects(scram_first_frame("SCRAM-SHA-256-PLUS", "p=tls-server-end-point,,")),
+      Sends(refused),
     ],
     Direct("db.example"),
     der,
   );
   assert(plus.contains("28P01"));
-  let stripped = t_scram(
+  let stripped = scram_outcome(
     [
       net::Upgrades,
-      net::Hears(begun),
-      Says(t_offered(["SCRAM-SHA-256"])),
-      net::Hears(t_first("SCRAM-SHA-256", "y,,")),
-      Says(refused),
+      net::Expects(begun),
+      Sends(sasl_offer(["SCRAM-SHA-256"])),
+      net::Expects(scram_first_frame("SCRAM-SHA-256", "y,,")),
+      Sends(refused),
     ],
     Direct("db.example"),
     der,
   );
   assert(stripped.contains("28P01"));
-  let plain = t_scram(
-    [net::Hears(begun), Says(both), net::Hears(t_first("SCRAM-SHA-256", "n,,")), Says(refused)],
+  let plain = scram_outcome(
+    [
+      net::Expects(begun),
+      Sends(both),
+      net::Expects(scram_first_frame("SCRAM-SHA-256", "n,,")),
+      Sends(refused),
+    ],
     NoTls,
     der,
   );
   assert(plain.contains("28P01"));
-  // An offer the client cannot bind is refused, and nothing is said under it.
-  let unbindable = t_scram(
-    [net::Upgrades, net::Hears(begun), Says(both)],
+  // An offer the client cannot bind is rejected, and nothing is sent under it.
+  let unbindable = scram_outcome(
+    [net::Upgrades, net::Expects(begun), Sends(both)],
     Direct("db.example"),
-    t_certificate(b"\x2b\x65\x70", b""),
+    sample_certificate(b"\x2b\x65\x70", b""),
   );
   assert(unbindable.contains("names no hash"))
 }
 
-fn t_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
-  byte_of_int(kind).concat(counted(body))
+fn message_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
+  byte_of_int(kind).concat(length_prefixed(body))
 
-fn t_session(conn: Int) -> Session =
+fn sample_session(conn: Int) -> Session =
   { conn: conn, buffer: b"", user: "ply", database: "ply", settings: [], status: Idle, notices: [] }
 
 /// Simple queries over a scripted connection: each `recv` takes the next chunk, and once they run
 /// out the server has hung up.
-fn t_queries(
+fn scripted_queries(
   chunks: List<Bytes>,
   sqls: List<String>,
-) -> List<Result<Reply, ClientError>> / {net::socket.refused, abort.raise, diverges} = {
+) -> List<Result<Reply, ClientError>> / {net::socket.fail, abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   let scripted = net::mem_serving(net::mem_empty(), server, [
-    chunks.map(|chunk: Bytes| Says(chunk)),
+    chunks.map(|chunk: Bytes| Sends(chunk)),
   ]);
   net::on_mem(scripted, ||
     sqls.fold(
-      { session: t_session(net::dial_address[conn](server, [], 1000)), answers: [] },
-      |acc: { session: Session, answers: List<Result<Reply, ClientError>> }, sql: String| {
-        let answer = simple_query[conn](acc.session, sql, default_client());
+      { session: sample_session(net::dial_address[conn](server, [], 1000)), results: [] },
+      |acc: { session: Session, results: List<Result<Reply, ClientError>> }, sql: String| {
+        let answer = simple_query[conn](acc.session, sql, default_timeouts());
         let next = match answer {
           Ok(r) -> r.session,
           Err(Rejected(s, _)) -> s,
           Err(_) -> acc.session,
         };
-        { session: next, answers: acc.answers.push(answer) }
+        { session: next, results: acc.results.push(answer) }
       },
-    ).answers).value
+    ).results).value
 }
 
-test "a refusal carries its SQLSTATE, the constraint it names and its detail" {
+test "a server error carries its SQLSTATE, the constraint it names and its detail" {
   let body = Bytes::concat_all([
     b"SERROR\x00",
     b"C23505\x00",
@@ -1834,7 +1860,7 @@ test "a refusal carries its SQLSTATE, the constraint it names and its detail" {
     b"npart_pkey\x00",
     b"\x00",
   ]);
-  assert_eq(server_of({ kind: ErrorResponse, body: body }), {
+  assert_eq(server_error_of({ kind: ErrorResponse, body: body }), {
     severity: "ERROR",
     code: "23505",
     message: "duplicate key value violates unique constraint \"part_pkey\"",
@@ -1843,13 +1869,13 @@ test "a refusal carries its SQLSTATE, the constraint it names and its detail" {
   })
 }
 
-// A `FATAL` refusal is followed by the server hanging up rather than by `ReadyForQuery`.
-test "a refusal that ends the session keeps its SQLSTATE" {
-  let fatal = t_frame(
+// A `FATAL` error is followed by the server hanging up rather than by `ReadyForQuery`.
+test "an error that ends the session keeps its SQLSTATE" {
+  let fatal = message_frame(
     69,
     b"SFATAL\x00C57P01\x00Mterminating connection due to administrator command\x00\x00",
   );
-  match t_queries([fatal], ["select 1"]) {
+  match scripted_queries([fatal], ["select 1"]) {
     [Err(Refused(s))] -> {
       assert_eq(s.code, "57P01");
       assert_eq(s.severity, "FATAL")
@@ -1858,41 +1884,41 @@ test "a refusal that ends the session keeps its SQLSTATE" {
   }
 }
 
-test "a frame shorter than its own length field is refused rather than waited on" {
+test "a frame shorter than its own length field is rejected rather than waited on" {
   let short = Bytes::concat_all([byte_of_int(90), u32_be(3), b"I"]);
-  match t_queries([short, short], ["select 1"]) {
+  match scripted_queries([short, short], ["select 1"]) {
     [Err(Unexpected(why))] -> assert(why.contains("less than its own four bytes")),
     _ -> panic("a malformed frame was waited on"),
   }
 }
 
 test "a session knows where its transaction stood when the server was last ready" {
-  let refused = t_frame(69, b"SERROR\x00C22012\x00Mdivision by zero\x00\x00").concat(
-    t_frame(90, b"E"),
+  let refused = message_frame(69, b"SERROR\x00C22012\x00Mdivision by zero\x00\x00").concat(
+    message_frame(90, b"E"),
   );
-  let rolled = t_frame(67, b"ROLLBACK\x00").concat(t_frame(90, b"I"));
-  match t_queries([refused, rolled], ["select 1/0", "rollback"]) {
+  let rolled = message_frame(67, b"ROLLBACK\x00").concat(message_frame(90, b"I"));
+  match scripted_queries([refused, rolled], ["select 1/0", "rollback"]) {
     [Err(Rejected(failed, s)), Ok(r)] -> {
       assert_eq(s.code, "22012");
       assert_eq(failed.status, FailedTransaction);
       assert_eq(r.session.status, Idle);
-      assert_eq(r.answer.tag, "ROLLBACK")
+      assert_eq(r.result.tag, "ROLLBACK")
     },
     _ -> panic("the two exchanges did not answer a refusal and then a rollback"),
   }
 }
 
 /// Authentication that needs nothing, and readiness.
-fn t_welcome() -> Bytes / {abort.raise} = t_frame(82, u32_be(0)).concat(t_frame(90, b"I"))
+fn welcome() -> Bytes / {abort.raise} = message_frame(82, u32_be(0)).concat(message_frame(90, b"I"))
 
-/// What `connect` came to over a server that does `script`: whether it connected or why not, the
-/// name the connection was secured as, and what the program sent.
-type Connected = { outcome: String, secured: Option<String>, sent: Bytes }
+/// The outcome of `connect` over a server that runs `script`: whether it connected or why not,
+/// the name the connection was secured as, and what the program sent.
+type ConnectOutcome = { outcome: String, secured: Option<String>, sent: Bytes }
 
-fn t_connect(script: List<net::Step>, tls: Tls) -> Connected / {abort.raise, diverges} = {
+fn scripted_connect(script: List<net::Step>, tls: Tls) -> ConnectOutcome / {abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   let over = net::on_mem(net::mem_serving(net::mem_empty(), server, [script]), ||
-    connect[conn]("127.0.0.1", 5432, tls, "ply", "ply", [], None, "n", default_client()));
+    connect[conn]("127.0.0.1", 5432, tls, "ply", "ply", [], None, "n", default_timeouts()));
   {
     outcome: match over.value { Ok(_) -> "connected", Err(e) -> client_error_text(e) },
     secured: net::mem_secured(over.net, 1),
@@ -1900,10 +1926,16 @@ fn t_connect(script: List<net::Step>, tls: Tls) -> Connected / {abort.raise, div
   }
 }
 
-test "an ssl request the server takes secures the connection before the start-up is sent" {
+test "an ssl request the server accepts secures the connection before the start-up is sent" {
   let begun = startup("ply", "ply", []);
-  let c = t_connect(
-    [net::Hears(ssl_request()), Says(b"S"), net::Upgrades, net::Hears(begun), Says(t_welcome())],
+  let c = scripted_connect(
+    [
+      net::Expects(ssl_request()),
+      Sends(b"S"),
+      net::Upgrades,
+      net::Expects(begun),
+      Sends(welcome()),
+    ],
     Requested("db.example"),
   );
   assert_eq(c.outcome, "connected");
@@ -1911,16 +1943,16 @@ test "an ssl request the server takes secures the connection before the start-up
   assert_eq(c.sent, ssl_request().concat(begun))
 }
 
-test "a server that will not speak TLS is refused, and nothing more is sent in plaintext" {
-  let c = t_connect([net::Hears(ssl_request()), Says(b"N")], Requested("db.example"));
+test "a server that will not speak TLS is rejected, and nothing more is sent in plaintext" {
+  let c = scripted_connect([net::Expects(ssl_request()), Sends(b"N")], Requested("db.example"));
   assert_eq(c.outcome, client_error_text(Declined));
   assert_eq(c.secured, None);
   assert_eq(c.sent, ssl_request())
 }
 
 test "plaintext waiting behind the server's yes is injected, and the handshake does not begin" {
-  let c = t_connect(
-    [net::Hears(ssl_request()), Says(b"SR\x00\x00\x00\x08\x00\x00\x00\x00"), net::Upgrades],
+  let c = scripted_connect(
+    [net::Expects(ssl_request()), Sends(b"SR\x00\x00\x00\x08\x00\x00\x00\x00"), net::Upgrades],
     Requested("db.example"),
   );
   assert_eq(c.outcome, client_error_text(Unsecured(net::Injected)));
@@ -1929,8 +1961,8 @@ test "plaintext waiting behind the server's yes is injected, and the handshake d
 }
 
 test "a certificate not trusted for the name ends the connection before the start-up" {
-  let c = t_connect(
-    [net::Hears(ssl_request()), Says(b"S"), net::Refuses(net::Untrusted)],
+  let c = scripted_connect(
+    [net::Expects(ssl_request()), Sends(b"S"), net::Refuses(net::Untrusted)],
     Requested("db.example"),
   );
   assert_eq(c.outcome, client_error_text(Unsecured(net::Untrusted)));
@@ -1939,24 +1971,27 @@ test "a certificate not trusted for the name ends the connection before the star
 
 test "direct negotiation begins the handshake first, with no ssl request" {
   let begun = startup("ply", "ply", []);
-  let c = t_connect([net::Upgrades, net::Hears(begun), Says(t_welcome())], Direct("db.example"));
+  let c = scripted_connect(
+    [net::Upgrades, net::Expects(begun), Sends(welcome())],
+    Direct("db.example"),
+  );
   assert_eq(c.outcome, "connected");
   assert_eq(c.secured, Some("db.example"));
   assert_eq(c.sent, begun);
-  let plain = t_connect([net::Hears(begun), Says(t_welcome())], NoTls);
+  let plain = scripted_connect([net::Expects(begun), Sends(welcome())], NoTls);
   assert_eq(plain.outcome, "connected");
   assert_eq(plain.secured, None)
 }
 
-/// What `connect` with `password` came to over a server that does `script`, the bytes the program
-/// sent in the clear, and how many it sent sealed.
-fn t_authenticated(
+/// The outcome of `connect` with `password` over a server that runs `script`, the bytes the
+/// program sent in the clear, and how many it sent as secrets.
+fn scripted_authentication(
   script: List<net::Step>,
   password: Option<Secret<Bytes>>,
 ) -> { outcome: String, sent: Bytes, sealed: Int } / {abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   let over = net::on_mem(net::mem_serving(net::mem_empty(), server, [script]), ||
-    connect[conn]("127.0.0.1", 5432, NoTls, "ply", "ply", [], password, "n", default_client()));
+    connect[conn]("127.0.0.1", 5432, NoTls, "ply", "ply", [], password, "n", default_timeouts()));
   {
     outcome: match over.value { Ok(_) -> "connected", Err(e) -> client_error_text(e) },
     sent: net::mem_sent(over.net, 1),
@@ -1964,45 +1999,45 @@ fn t_authenticated(
   }
 }
 
-test "a clear-text password goes out sealed: its kind and length, the password raw, then its NUL" {
+test "a clear-text password goes out as a secret: its kind and length, the password raw, then its NUL" {
   let begun = startup("ply", "ply", []);
-  let asked = t_frame(82, u32_be(3));
-  let c = t_authenticated(
+  let asked = message_frame(82, u32_be(3));
+  let c = scripted_authentication(
     [
-      net::Hears(begun),
-      Says(asked),
-      net::HearsSecret(Bytes::concat_all([b"p", u32_be(11), b"pencil\x00"])),
-      Says(t_welcome()),
+      net::Expects(begun),
+      Sends(asked),
+      net::ExpectsSecret(Bytes::concat_all([b"p", u32_be(11), b"pencil\x00"])),
+      Sends(welcome()),
     ],
     Some(Secret::of_bytes(b"pencil")),
   );
   assert_eq(c.outcome, "connected");
-  // No byte the program sent in the clear holds the password.
+  // No byte the program sent in the clear contains the password.
   assert_eq(c.sent, begun);
   assert_eq(c.sealed, 1);
-  // A server that asks for one where none was given is refused, and nothing more is sent.
-  let none = t_authenticated([net::Hears(begun), Says(asked)], None);
+  // A server that requests one when none was given is rejected, and nothing more is sent.
+  let none = scripted_authentication([net::Expects(begun), Sends(asked)], None);
   assert_eq(none.outcome, client_error_text(Refused(no_password("ply", "a clear-text password"))));
   assert_eq(none.sent, begun);
   assert_eq(none.sealed, 0)
 }
 
-fn t_notify(sender: Int, channel: String, payload: String) -> Bytes / {abort.raise} =
-  t_frame(65, Bytes::concat_all([u32_be(sender), cstring(channel), cstring(payload)]))
+fn notification_frame(sender: Int, channel: String, payload: String) -> Bytes / {abort.raise} =
+  message_frame(65, Bytes::concat_all([u32_be(sender), cstring(channel), cstring(payload)]))
 
-/// The waits of a session that listens, over a connection whose far end does `script`.
-fn t_waits(
+/// The waits of a session that listens, over a connection whose far end runs `script`.
+fn scripted_waits(
   script: List<net::Step>,
   waits: Int,
-) -> List<Option<Notification>> / {net::socket.refused, abort.raise, diverges} = {
+) -> List<Option<Notification>> / {net::socket.fail, abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   net::on_mem(net::mem_serving(net::mem_empty(), server, [script]), || {
-    let s = t_session(net::dial_address[conn](server, [], 1000));
+    let s = sample_session(net::dial_address[conn](server, [], 1000));
     range(0, waits).fold(
       { session: s, heard: [] },
       |acc: { session: Session, heard: List<Option<Notification>> }, i: Int|
         match await_notification[conn](acc.session, 50) {
-          Ok(w) -> { session: w.session, heard: acc.heard.push(w.notice) },
+          Ok(w) -> { session: w.session, heard: acc.heard.push(w.notification) },
           Err(e) -> panic(client_error_text(e)),
         },
     ).heard
@@ -2010,16 +2045,16 @@ fn t_waits(
 }
 
 test "a notification is read whole, however its bytes arrive, and a deadline loses none of it" {
-  let one = t_notify(4242, "orders", "7");
-  let two = t_notify(4242, "orders", "");
-  let settings = t_frame(83, b"TimeZone\x00UTC\x00");
+  let one = notification_frame(4242, "orders", "7");
+  let two = notification_frame(4242, "orders", "");
+  let settings = message_frame(83, b"TimeZone\x00UTC\x00");
   assert_eq(
-    t_waits(
+    scripted_waits(
       [
-        Says(one.slice(0, 7)),
+        Sends(one.slice(0, 7)),
         net::Stalls,
-        Says(one.slice(7, one.len())),
-        Says(settings.concat(two)),
+        Sends(one.slice(7, one.len())),
+        Sends(settings.concat(two)),
         net::Silent,
       ],
       4,
@@ -2033,24 +2068,24 @@ test "a notification is read whole, however its bytes arrive, and a deadline los
   )
 }
 
-test "a notification that arrives while a statement is answered is kept for the next wait" {
+test "a notification that arrives while a statement is running is stored for the next wait" {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   let answered = Bytes::concat_all([
-    t_frame(67, b"LISTEN\x00"),
-    t_notify(9, "jobs", "early"),
-    t_frame(90, b"I"),
+    message_frame(67, b"LISTEN\x00"),
+    notification_frame(9, "jobs", "early"),
+    message_frame(90, b"I"),
   ]);
   let heard = net::on_mem(
     net::mem_serving(net::mem_empty(), server, [
-      [net::Hears(query("listen jobs")), Says(answered), net::Silent],
+      [net::Expects(query("listen jobs")), Sends(answered), net::Silent],
     ]),
     || {
-      let s = t_session(net::dial_address[conn](server, [], 1000));
-      match simple_query[conn](s, "listen jobs", default_client()) {
+      let s = sample_session(net::dial_address[conn](server, [], 1000));
+      match simple_query[conn](s, "listen jobs", default_timeouts()) {
         Err(e) -> panic(client_error_text(e)),
         Ok(r) -> match await_notification[conn](r.session, 50) {
           Err(e) -> panic(client_error_text(e)),
-          Ok(w) -> w.notice,
+          Ok(w) -> w.notification,
         },
       }
     },
@@ -2085,18 +2120,18 @@ test "a row written in COPY's text format reads back as the values it was writte
     } else { true })
 }
 
-/// One whole exchange of a copy over a scripted server: what the program's calls answered.
-fn t_copy<a>(
+/// One whole exchange of a copy over a scripted server: what the program's calls returned.
+fn scripted_copy<a>(
   script: List<net::Step>,
   go: (Session) -> a / {net.send[conn], net.recv[conn], abort.raise, diverges},
-) -> a / {net::socket.refused, abort.raise, diverges} = {
+) -> a / {net::socket.fail, abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   net::on_mem(net::mem_serving(net::mem_empty(), server, [script]), ||
-    go(t_session(net::dial_address[conn](server, [], 1000)))).value
+    go(sample_session(net::dial_address[conn](server, [], 1000)))).value
 }
 
-fn t_copy_response(kind: Int, columns: Int) -> Bytes / {abort.raise} =
-  t_frame(
+fn copy_response_frame(kind: Int, columns: Int) -> Bytes / {abort.raise} =
+  message_frame(
     kind,
     Bytes::concat_all([
       b"\x00",
@@ -2105,27 +2140,27 @@ fn t_copy_response(kind: Int, columns: Int) -> Bytes / {abort.raise} =
     ]),
   )
 
-test "a copy in sends its rows as data and is answered with how many the server took" {
+test "a copy in sends its rows as data and reports how many the server accepted" {
   let sql = "copy items (id, name) from stdin";
   let rows = copy_row([Some("1"), Some("one")]).concat(copy_row([Some("2"), None]));
-  let tag = t_copy(
+  let tag = scripted_copy(
     [
-      net::Hears(query(sql)),
-      Says(t_copy_response(71, 2)),
-      net::Hears(copy_data(rows)),
-      net::Hears(copy_done()),
-      Says(t_frame(67, b"COPY 2\x00").concat(t_frame(90, b"I"))),
+      net::Expects(query(sql)),
+      Sends(copy_response_frame(71, 2)),
+      net::Expects(copy_data(rows)),
+      net::Expects(copy_done()),
+      Sends(message_frame(67, b"COPY 2\x00").concat(message_frame(90, b"I"))),
     ],
     |s: Session|
-      match copy_in_begin[conn](s, sql, default_client()) {
+      match copy_in_begin[conn](s, sql, default_timeouts()) {
         Err(e) -> client_error_text(e),
         Ok(c) -> {
           assert_eq(c.columns, 2);
-          match copy_send[conn](c, rows, default_client()) {
+          match copy_send[conn](c, rows, default_timeouts()) {
             Err(e) -> client_error_text(e),
-            Ok(sent) -> match copy_in_end[conn](sent, None, default_client()) {
+            Ok(sent) -> match copy_in_end[conn](sent, None, default_timeouts()) {
               Err(e) -> client_error_text(e),
-              Ok(r) -> r.answer.tag,
+              Ok(r) -> r.result.tag,
             },
           }
         },
@@ -2134,26 +2169,26 @@ test "a copy in sends its rows as data and is answered with how many the server 
   assert_eq(tag, "COPY 2")
 }
 
-test "a failed copy in is the server's refusal, and the session is left ready" {
+test "a failed copy in returns the server's error, and the session is left ready" {
   let sql = "copy items (id) from stdin";
-  let code = t_copy(
+  let code = scripted_copy(
     [
-      net::Hears(query(sql)),
-      Says(t_copy_response(71, 1)),
-      net::Hears(copy_fail("the rows ran out")),
-      Says(
-        t_frame(
+      net::Expects(query(sql)),
+      Sends(copy_response_frame(71, 1)),
+      net::Expects(copy_fail("the rows ran out")),
+      Sends(
+        message_frame(
           69,
           b"SERROR\x00C57014\x00MCOPY from stdin failed: the rows ran out\x00\x00",
         ).concat(
-          t_frame(90, b"I"),
+          message_frame(90, b"I"),
         ),
       ),
     ],
     |s: Session|
-      match copy_in_begin[conn](s, sql, default_client()) {
+      match copy_in_begin[conn](s, sql, default_timeouts()) {
         Err(e) -> client_error_text(e),
-        Ok(c) -> match copy_in_end[conn](c, Some("the rows ran out"), default_client()) {
+        Ok(c) -> match copy_in_end[conn](c, Some("the rows ran out"), default_timeouts()) {
           Err(Rejected(after, server)) -> server.code ++ " " ++ status_name(after.status),
           Err(e) -> client_error_text(e),
           Ok(_) -> "kept",
@@ -2163,30 +2198,30 @@ test "a failed copy in is the server's refusal, and the session is left ready" {
   assert_eq(code, "57014 idle")
 }
 
-test "a copy out answers its pieces, then none once the server is ready again" {
+test "a copy out returns its pieces, then none once the server is ready again" {
   let sql = "copy (select id from items) to stdout";
-  let pieces = t_copy(
+  let pieces = scripted_copy(
     [
-      net::Hears(query(sql)),
-      Says(
+      net::Expects(query(sql)),
+      Sends(
         Bytes::concat_all([
-          t_copy_response(72, 1),
-          t_frame(100, b"1\n"),
-          t_frame(100, b"2\n3\n"),
-          t_frame(99, b""),
-          t_frame(67, b"COPY 3\x00"),
-          t_frame(90, b"I"),
+          copy_response_frame(72, 1),
+          message_frame(100, b"1\n"),
+          message_frame(100, b"2\n3\n"),
+          message_frame(99, b""),
+          message_frame(67, b"COPY 3\x00"),
+          message_frame(90, b"I"),
         ]),
       ),
     ],
     |s: Session|
-      match copy_out_begin[conn](s, sql, default_client()) {
+      match copy_out_begin[conn](s, sql, default_timeouts()) {
         Err(e) -> [client_error_text(e)],
         Ok(c) ->
           range(0, 3).fold(
             { session: c.session, said: [] },
             |acc: { session: Session, said: List<String> }, i: Int|
-              match copy_out_take[conn](acc.session, default_client()) {
+              match copy_out_take[conn](acc.session, default_timeouts()) {
                 Err(e) -> { ..acc, said: acc.said.push(client_error_text(e)) },
                 Ok(p) ->
                   {
@@ -2206,17 +2241,17 @@ test "a copy out answers its pieces, then none once the server is ready again" {
 // --- A client over a scripted server ----------------------------------------------
 
 /// Authentication that needs nothing, the server's version, its key, and readiness.
-fn t_greeting() -> Bytes / {abort.raise} =
+fn server_greeting() -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    t_frame(82, u32_be(0)),
-    t_frame(83, cstring("server_version").concat(cstring("16.0"))),
-    t_frame(75, u32_be(7).concat(u32_be(9))),
-    t_frame(90, b"I"),
+    message_frame(82, u32_be(0)),
+    message_frame(83, cstring("server_version").concat(cstring("16.0"))),
+    message_frame(75, u32_be(7).concat(u32_be(9))),
+    message_frame(90, b"I"),
   ])
 
-/// One text column named `?column?`, of type `int4`, and one row holding `value`.
-fn t_one(value: String) -> Bytes / {abort.raise} =
-  t_frame(
+/// One text column named `?column?`, of type `int4`, and one row containing `value`.
+fn one_row_frames(value: String) -> Bytes / {abort.raise} =
+  message_frame(
     84,
     Bytes::concat_all([
       u16_be(1),
@@ -2229,50 +2264,55 @@ fn t_one(value: String) -> Bytes / {abort.raise} =
       u16_be(0),
     ]),
   ).concat(
-    t_frame(68, Bytes::concat_all([u16_be(1), u32_be(value.len()), Bytes::of_string(value)])),
+    message_frame(68, Bytes::concat_all([u16_be(1), u32_be(value.len()), Bytes::of_string(value)])),
   )
 
-/// `select 1` answered the simple way: a description, one row, the tag, and readiness.
-fn t_select_one() -> Bytes / {abort.raise} =
-  Bytes::concat_all([t_one("1"), t_frame(67, cstring("SELECT 1")), t_frame(90, b"I")])
-
-/// The same through the extended cycle, whose only extra is the two completions.
-fn t_extended_one(value: String) -> Bytes / {abort.raise} =
+/// The server's reply to `select 1` the simple way: a description, one row, the tag, and
+/// readiness.
+fn select_one_frames() -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    t_frame(49, b""),
-    t_frame(50, b""),
-    t_one(value),
-    t_frame(67, cstring("SELECT 1")),
-    t_frame(90, b"I"),
+    one_row_frames("1"),
+    message_frame(67, cstring("SELECT 1")),
+    message_frame(90, b"I"),
   ])
 
-/// A refusal, and the readiness that says the connection is still good.
-fn t_refused(code: String, text: String) -> Bytes / {abort.raise} =
-  t_frame(
+/// The same through the extended cycle, whose only extra is the two completions.
+fn extended_one_frames(value: String) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    message_frame(49, b""),
+    message_frame(50, b""),
+    one_row_frames(value),
+    message_frame(67, cstring("SELECT 1")),
+    message_frame(90, b"I"),
+  ])
+
+/// An error, and the readiness that shows the connection is still good.
+fn error_frames(code: String, text: String) -> Bytes / {abort.raise} =
+  message_frame(
     69,
     Bytes::concat_all([b"S", cstring("ERROR"), b"C", cstring(code), b"M", cstring(text), b"\x00"]),
   ).concat(
-    t_frame(90, b"I"),
+    message_frame(90, b"I"),
   )
 
 /// What the first row's first value reads as.
-fn t_first_text(answer: Answer) -> String / {abort.raise} =
+fn first_value_text(answer: QueryResult) -> String / {abort.raise} =
   match answer.rows {
     [[Some(text), ..], ..] -> String::of_bytes(text),
     [[None, ..], ..] -> "null",
     _ -> "no value",
   }
 
-/// What `ask` answered over a server that says `chunks`, and every byte the client sent.
-fn t_asked(
+/// What `ask` returned over a server that sends `chunks`, and every byte the client sent.
+fn scripted_exchange(
   chunks: List<Bytes>,
   password: Option<Secret<Bytes>>,
   nonce: String,
   ask: (Session) -> Result<String, ClientError> / {net.send[conn], net.recv[conn], net.close[conn], abort.raise, diverges},
-) -> { answer: Result<String, String>, sent: Bytes } / {abort.raise, diverges} = {
+) -> { result: Result<String, String>, sent: Bytes } / {abort.raise, diverges} = {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
   let over = net::on_mem(
-    net::mem_serving(net::mem_empty(), server, [chunks.map(|c: Bytes| Says(c))]),
+    net::mem_serving(net::mem_empty(), server, [chunks.map(|c: Bytes| Sends(c))]),
     ||
       match connect[conn](
           "127.0.0.1",
@@ -2283,7 +2323,7 @@ fn t_asked(
           [],
           password,
           nonce,
-          default_client(),
+          default_timeouts(),
         ) {
         Err(e) -> Err(client_error_text(e)),
         Ok(session) -> match ask(session) {
@@ -2292,97 +2332,106 @@ fn t_asked(
         },
       },
   );
-  { answer: over.value, sent: net::mem_sent(over.net, 1) }
+  { result: over.value, sent: net::mem_sent(over.net, 1) }
 }
 
-fn t_has(hay: Bytes, needle: Bytes) -> Bool = hay.index_of(needle) != None
+fn contains_bytes(hay: Bytes, needle: Bytes) -> Bool = hay.index_of(needle) != None
 
 test "a client shakes hands, runs a query and terminates over a scripted server" {
-  let ran = t_asked([t_greeting(), t_select_one()], None, "n", |s: Session|
-    match simple_query[conn](s, "select 1", default_client()) {
+  let ran = scripted_exchange([server_greeting(), select_one_frames()], None, "n", |s: Session|
+    match simple_query[conn](s, "select 1", default_timeouts()) {
       Err(e) -> Err(e),
       Ok(reply) -> {
-        finish[conn](reply.session, default_client());
-        Ok(t_first_text(reply.answer))
+        finish[conn](reply.session, default_timeouts());
+        Ok(first_value_text(reply.result))
       },
     });
-  assert_eq(ran.answer, Ok("1"));
+  assert_eq(ran.result, Ok("1"));
   // A start-up frame whose length counts itself and whose next word is protocol 3.0, then the
   // query, then the terminate that ends the connection.
   let declared = match ran.sent.u32_be_at(0) { Some(n) -> n, None -> 0 };
   assert_eq(ran.sent.u32_be_at(4), Some(196608));
   assert_eq(ran.sent.at(declared), 81);
-  assert(t_has(ran.sent, b"user\x00user\x00database\x00ply\x00"));
-  assert(t_has(ran.sent, b"select 1"));
+  assert(contains_bytes(ran.sent, b"user\x00user\x00database\x00ply\x00"));
+  assert(contains_bytes(ran.sent, b"select 1"));
   assert(ran.sent.ends_with(b"X\x00\x00\x00\x04"))
 }
 
 test "the extended cycle carries its parameters as text, in one parse" {
-  let ran = t_asked([t_greeting(), t_extended_one("hello")], None, "n", |s: Session|
-    match extended_query[conn](s, "select $1", [Some("hello")], default_client()) {
-      Err(e) -> Err(e),
-      Ok(reply) -> Ok(t_first_text(reply.answer)),
-    });
-  assert_eq(ran.answer, Ok("hello"));
-  assert(t_has(ran.sent, b"select $1") && t_has(ran.sent, b"hello"));
-  assert_eq(ran.sent.split(b"\x00P").len() - 1, 1)
-}
-
-test "a refusal comes back with its SQLSTATE and leaves the connection usable" {
-  let ran = t_asked(
-    [t_greeting(), t_refused("42P01", "relation \"nope\" does not exist"), t_select_one()],
+  let ran = scripted_exchange(
+    [server_greeting(), extended_one_frames("hello")],
     None,
     "n",
     |s: Session|
-      match simple_query[conn](s, "select nope", default_client()) {
+      match extended_query[conn](s, "select $1", [Some("hello")], default_timeouts()) {
+        Err(e) -> Err(e),
+        Ok(reply) -> Ok(first_value_text(reply.result)),
+      },
+  );
+  assert_eq(ran.result, Ok("hello"));
+  assert(contains_bytes(ran.sent, b"select $1") && contains_bytes(ran.sent, b"hello"));
+  assert_eq(ran.sent.split(b"\x00P").len() - 1, 1)
+}
+
+test "an error comes back with its SQLSTATE and leaves the connection usable" {
+  let ran = scripted_exchange(
+    [
+      server_greeting(),
+      error_frames("42P01", "relation \"nope\" does not exist"),
+      select_one_frames(),
+    ],
+    None,
+    "n",
+    |s: Session|
+      match simple_query[conn](s, "select nope", default_timeouts()) {
         Err(Rejected(after, refusal)) -> match simple_query[conn](
             after,
             "select 1",
-            default_client(),
+            default_timeouts(),
           ) {
           Err(e) -> Err(e),
-          Ok(reply) -> Ok(server_text(refusal) ++ " then " ++ t_first_text(reply.answer)),
+          Ok(reply) -> Ok(server_error_text(refusal) ++ " then " ++ first_value_text(reply.result)),
         },
         Err(e) -> Err(e),
         Ok(_) -> Ok("the server accepted what it should have refused"),
       },
   );
-  match ran.answer {
+  match ran.result {
     Ok(text) -> assert(text.contains("42P01") && text.ends_with("then 1"), Some(text)),
     Err(why) -> panic(why),
   };
-  assert(t_has(ran.sent, b"select nope") && t_has(ran.sent, b"select 1"))
+  assert(contains_bytes(ran.sent, b"select nope") && contains_bytes(ran.sent, b"select 1"))
 }
 
 /// RFC 7677's exchange from the server's side: the mechanisms on offer, its first message, its
 /// final one, then the authentication that completes and the readiness that follows it.
-fn t_scram_greeting() -> Bytes / {abort.raise} =
+fn scram_server_greeting() -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    t_frame(82, Bytes::concat_all([u32_be(10), cstring("SCRAM-SHA-256"), b"\x00"])),
-    t_frame(
+    message_frame(82, Bytes::concat_all([u32_be(10), cstring("SCRAM-SHA-256"), b"\x00"])),
+    message_frame(
       82,
       u32_be(11).concat(
         b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
       ),
     ),
-    t_frame(82, u32_be(12).concat(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")),
-    t_frame(82, u32_be(0)),
-    t_frame(90, b"I"),
+    message_frame(82, u32_be(12).concat(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")),
+    message_frame(82, u32_be(0)),
+    message_frame(90, b"I"),
   ])
 
-test "the client answers SCRAM with RFC 7677's proof and checks the server's" {
-  let ran = t_asked(
-    [t_scram_greeting(), t_select_one()],
+test "the client replies to SCRAM with RFC 7677's proof and checks the server's" {
+  let ran = scripted_exchange(
+    [scram_server_greeting(), select_one_frames()],
     Some(Secret::of_string("pencil").bytes()),
     "rOprNGfwEbeRWgbNEkqO",
     |s: Session|
-      match simple_query[conn](s, "select 1", default_client()) {
+      match simple_query[conn](s, "select 1", default_timeouts()) {
         Err(e) -> Err(e),
-        Ok(reply) -> Ok(t_first_text(reply.answer)),
+        Ok(reply) -> Ok(first_value_text(reply.result)),
       },
   );
-  assert_eq(ran.answer, Ok("1"));
-  assert(t_has(ran.sent, b"SCRAM-SHA-256"));
-  assert(t_has(ran.sent, b"n=user,r=rOprNGfwEbeRWgbNEkqO"));
-  assert(t_has(ran.sent, b"p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="))
+  assert_eq(ran.result, Ok("1"));
+  assert(contains_bytes(ran.sent, b"SCRAM-SHA-256"));
+  assert(contains_bytes(ran.sent, b"n=user,r=rOprNGfwEbeRWgbNEkqO"));
+  assert(contains_bytes(ran.sent, b"p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="))
 }

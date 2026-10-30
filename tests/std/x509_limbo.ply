@@ -92,10 +92,10 @@ fn cases() -> List<Case> / {abort.raise} =
     Err(e) -> panic(json::error_to_string(e)),
   }
 
-type Rule = { mark: String, rule: String }
+type SkipRule = { mark: String, rule: String }
 
 /// The features that leave a case out.
-fn by_feature() -> List<Rule> =
+fn by_feature() -> List<SkipRule> =
   [
     { mark: "has-crl", rule: "revocation is not checked" },
     { mark: "has-mldsa", rule: "ML-DSA is not verified" },
@@ -105,7 +105,7 @@ fn by_feature() -> List<Rule> =
   ]
 
 /// The cases left out by name: a whole case, or with a trailing `::` every case under it.
-fn by_id() -> List<Rule> =
+fn by_id() -> List<SkipRule> =
   [
     { mark: "webpki::cn::", rule: "a common name is not read" },
     {
@@ -121,22 +121,22 @@ fn by_id() -> List<Rule> =
   ]
 
 /// The rule that leaves a case out, or `None` for one that is run.
-fn left_out(c: Case) -> Option<String> =
-  match by_feature().find_map(|r: Rule|
+fn skip_reason(c: Case) -> Option<String> =
+  match by_feature().find_map(|r: SkipRule|
       if c.features.contains(r.mark) { Some(r.rule) } else { None }) {
     Some(rule) -> Some(rule),
     None ->
-      by_id().find_map(|r: Rule|
+      by_id().find_map(|r: SkipRule|
         if c.id == r.mark || (r.mark.ends_with("::") && c.id.starts_with(r.mark)) { Some(r.rule) }
         else { None }),
   }
 
-fn run() -> List<Case> / {abort.raise} = cases().filter(|c: Case| left_out(c) == None)
+fn cases_to_run() -> List<Case> / {abort.raise} = cases().filter(|c: Case| skip_reason(c) == None)
 
 fn certificates(
   pems: List<String>,
-  mode: x509::Reading,
-) -> List<Certificate> / {x509.refused, abort.raise} =
+  mode: x509::Strictness,
+) -> List<Certificate> / {x509.fail, abort.raise} =
   pems.fold([], |all: List<Certificate>, text: String|
     x509::read_pem(text, x509::limits(), mode).fold(
       all,
@@ -160,7 +160,7 @@ fn outcome(c: Case) -> Result<Int, String> / {abort.raise} = {
     None -> None,
   };
   let who = if c.name_kind == "DNS" { Some(x509::Host(c.name)) } else if c.name_kind == "IP" {
-    match ip::parse(c.name) { Ok(a) -> Some(x509::At(a)), Err(_) -> None }
+    match ip::parse(c.name) { Ok(a) -> Some(x509::IpAddress(a)), Err(_) -> None }
   } else { Some(x509::Anyone) };
   let purpose = if c.purposes.contains("clientAuth") || (c.client && c.purposes.len() == 0) {
     x509::ClientAuth
@@ -183,14 +183,14 @@ fn outcome(c: Case) -> Result<Int, String> / {abort.raise} = {
           policy,
         ) {
         Ok(path) -> Ok(path.len()),
-        Err(failure) -> Err(show(failure.why)),
+        Err(failure) -> Err(show(failure.reason)),
       },
     },
     _ -> panic(f"{c.id}: a time or a name that is not read"),
   }
 }
 
-test "limbo {c.id}" for c: Case in run() {
+test "limbo {c.id}" for c: Case in cases_to_run() {
   match outcome(c) {
     Ok(_) -> assert(c.succeeds),
     Err(why) -> assert_eq(if c.succeeds { why } else { "" }, ""),
@@ -203,9 +203,10 @@ test "the cases kept are run but for those a rule leaves out, to the count" {
   assert_eq(all.len(), 905);
   assert_eq(under("bettertls::nameconstraints::"), 594);
   assert_eq(under("bettertls::pathbuilding::"), 81);
-  let rules = by_feature().concat(by_id()).map(|r: Rule| r.rule).unique();
+  let rules = by_feature().concat(by_id()).map(|r: SkipRule| r.rule).unique();
   assert_eq(
-    rules.map(|rule: String| { rule: rule, cases: all.count(|c: Case| left_out(c) == Some(rule)) }),
+    rules.map(|rule: String|
+      { rule: rule, cases: all.count(|c: Case| skip_reason(c) == Some(rule)) }),
     [
       { rule: "revocation is not checked", cases: 17 },
       { rule: "ML-DSA is not verified", cases: 6 },
@@ -218,7 +219,7 @@ test "the cases kept are run but for those a rule leaves out, to the count" {
       { rule: "name constraints that are not critical are taken", cases: 1 },
     ],
   );
-  let ran = run();
+  let ran = cases_to_run();
   assert_eq(ran.len(), 861);
   assert_eq(ran.count(|c: Case| c.succeeds), 159);
   assert_eq(ran.count(|c: Case| c.features.contains("pedantic-serial-number")), 3);
@@ -226,7 +227,7 @@ test "the cases kept are run but for those a rule leaves out, to the count" {
 }
 
 test "a negative serial number is refused however it is read, and zero or a long one only to the letter" {
-  let peer = |id: String, mode: x509::Reading|
+  let peer = |id: String, mode: x509::Strictness|
     match cases().filter(|c: Case| c.id == id) {
       [c, ..] -> Result::err(try { certificates([c.peer], mode) }),
       [] -> panic(f"no case {id}"),

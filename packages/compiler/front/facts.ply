@@ -1,85 +1,91 @@
-//! A module's facts: its outline, its claims' literals, its effect sets, and what its guards hold.
-
-import compiler.syntax.parsing (Span, Ident, span_key, is_bare, span_bin)
-import compiler.syntax.items (Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet,
-                              SpecClause, SRequires, SEnsures, SCost, SSpace, INames, FnDef, LawDef,
-                              OfSchema, Derived, is_pub, IDerive, schema_named, schema_guard_name,
-                              dump_item, stated_type, real_handler_of)
-import compiler.syntax.type_syntax (TCon)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Param, SLet,
-                              SLetElse, SExpr, SAssign, HandlerVar, RecField, expr_span, ETagged,
-                              Tagged, Hole, TaggedPart, tagged_parts, tagged_part_bin,
-                              prelude_module, prelude_hosts)
-import compiler.syntax.patterns (Lit, LInt, LStr, LBytes)
-import compiler.check.types (unit_type, TypeTable, HeldType, held_type_bin, types_held, types_of)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, qualify,
+import compiler.syntax.parsing (Span, Identifier, span_key, is_bare, span_bin)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
+                              SchemaItem, EffectSetItem, SpecClause, RequiresClause, EnsuresClause,
+                              CostClause, SpaceClause, SelectedNames, FnDefinition, LawDefinition,
+                              SchemaInstance, DeriveOrigin, is_pub, DeriveItem, schema_named,
+                              schema_guard_name, dump_item, target_type, real_handler_of)
+import compiler.syntax.type_syntax (NamedTypeExpression)
+import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
+                                    UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                                    MatchExpression, BlockExpression, RecordExpression,
+                                    RecordUpdateExpression, PropagateExpression, FieldExpression,
+                                    ListExpression, PerformExpression, HandleExpression,
+                                    WithHoldExpression, SimulateExpression, ParallelExpression,
+                                    InvalidExpression, HoleExpression, TryBlockExpression, Param,
+                                    LetStatement, LetElseStatement, ExpressionStatement,
+                                    AssignmentStatement, HandlerVar, RecordLiteralField,
+                                    expression_span, TaggedLiteralExpression, TaggedLiteral, Hole,
+                                    TaggedPart, tagged_parts, tagged_part_bin, prelude_module,
+                                    prelude_hosts)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralString, LiteralBytes)
+import compiler.check.types (unit_type, TypeTable, InternedType, interned_type_bin, intern_types,
+                             types_of)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Resolution, qualify,
                                       import_module_name)
 import compiler.check.resolve.scopes (post_order)
-import compiler.store.hash.graph (Index, tagged_target, denoted, DenotesFn, DenotesCtor,
-                                  DenotesNothing, effect_called, type_named)
-import compiler.store.hash.forms (HashOutput, Fixing, by_name, reached_functions, Which, TheFn,
-                                  TheDecl, TheItem, hashes_fixed)
+import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFn, DenotesConstructor,
+                                  DenotesNothing, qualified_effect_name, qualified_type_name)
+import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reached_functions, Subject,
+                                  FunctionNamed, DeclarationNamed, ItemKeyed, hashes_from_cache)
 import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
 import compiler.check.typed (TypedBody)
-import compiler.check.infer (CheckOutput, types_joined, stated, EmitFacts, emit_facts_bin,
-                             facts_moved, facts_kept)
-import compiler.check.infer.checker (Location, DefInfo, TestInfo, LawInfo, EffectInfo, OpInfo,
-                                     CtorInfo, KeptFacts, WalkedBody, WitnessOrder, MemberSite,
-                                     InstanceInfo, NumericInfo, def_info_bin, test_info_bin,
-                                     law_info_bin, effect_info_bin, ctor_info_bin,
-                                     instance_info_bin, numeric_info_bin, kept_facts_bin)
+import compiler.check.infer (CheckOutput, types_joined, measured_definitions, EmitFacts,
+                             emit_facts_bin, facts_moved, facts_kept)
+import compiler.check.infer.checker (Location, DefinitionInfo, TestInfo, LawInfo, EffectInfo,
+                                     OpInfo, ConstructorInfo, CachedFacts, CheckedBody,
+                                     WitnessOrder, MemberSite, InstanceInfo, NumericInfo,
+                                     definition_info_bin, test_info_bin, law_info_bin,
+                                     effect_info_bin, constructor_info_bin, instance_info_bin,
+                                     numeric_info_bin, cached_facts_bin)
 import compiler.check.infer.solved (prelude_tables)
 import compiler.emit.keys (test_owner, law_owner)
-import compiler.front.diagnostics (placed)
-import compiler.front.pkg (PackageSources, Closure, Package, Pinned, closure, pins_of)
-import compiler.check.resolve.scopes (PackageDeps)
+import compiler.front.diagnostics (diagnostic_in_module)
+import compiler.front.pkg (PackageSources, Closure, Package, LockedPackage, closure, pins_of)
+import compiler.check.resolve.scopes (PackageDependencies)
 import std.bin
 import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list
-import compiler.expand.rewrite.shared (tagged_in, picked_in)
+import compiler.expand.rewrite.shared (tagged_in, expressions_matching)
 import compiler.expand.derive (derivation_of, deriver_module)
-import compiler.expand.declared (declaration_of)
+import compiler.expand.declarations (declaration_of)
 import std.derive.codec
-import compiler.expand.embed (EmbedAt, ItemWants, item_wants_bin, wants_by_item, embed_at_bin)
+import compiler.expand.embed (ModuleEmbed, ItemEmbeds, item_embeds_bin, requests_by_item,
+                              module_embed_bin)
 import compiler.syntax.items (is_std, is_compiler, is_shipped, is_written)
-import compiler.syntax.sites (numbered_made)
+import compiler.syntax.node_ids (numbered_made)
 import std.bytes (ascii_of_int)
-import compiler.front.rows (span_at, OEffect, OFn, OLaw, OTest, OType, Outlined, Outline,
-                            outline_bin, SetView, effect_sets_of, module_items, imported_names,
-                            skeleton_of_outlines, of_module, Cut, TypeRow)
+import compiler.front.rows (span_at, OutlinedEffect, OutlinedFunction, OutlinedLaw, OutlinedTest,
+                            OutlinedType, OutlineItem, Outline, outline_bin, EffectSetRow,
+                            effect_sets_of, module_items, imported_names, skeleton_of_outlines,
+                            is_declared_in, Cut, TypeRow)
 
-// --- A module's outline ----------------------------------------------------------
-
-/// `parsed`'s outline, `mods` the modules of its program, a law's schema among them.
 fn outline_of(
   parsed: ParsedModule,
-  sets: List<SetView>,
+  sets: List<EffectSetRow>,
   cuts: List<Cut>,
-  mods: List<ParsedModule>,
+  modules: List<ParsedModule>,
 ) -> Outline / {abort.raise} =
   {
     name: parsed.name,
-    items: parsed.module.items.fold([], |acc: List<Outlined>, item: Item|
+    items: parsed.module.items.fold([], |acc: List<OutlineItem>, item: Item|
       match item {
-        IFn(d) ->
+        FunctionItem(d) ->
           acc.push(
-            OFn({
+            OutlinedFunction({
               name: d.name.name,
-              public: is_pub(d.vis),
+              public: is_pub(d.visibility),
               reuse: match d.reuse { Some(_) -> true, None -> false },
               returns: d.returns != None,
               measured: d.decreases != None,
               params: d.params.map(|param: Param| { name: param.name.name, span: param.span }),
               literals: d.spec.fold([], |found: List<Bytes>, clause: SpecClause|
                 match clause.kind {
-                  SRequires -> lits(found, clause.expr),
-                  SEnsures -> found,
-                  SCost -> found,
-                  SSpace -> found,
+                  RequiresClause -> lits(found, clause.expression),
+                  EnsuresClause -> found,
+                  CostClause -> found,
+                  SpaceClause -> found,
                 }),
               spec: d.spec.map(|clause: SpecClause| clause.kind),
               constant: d.constant != None,
@@ -87,23 +93,25 @@ fn outline_of(
               span: d.span,
             }),
           ),
-        ITest(d) ->
-          acc.push(OTest({ name: d.name, label_span: d.label_span, cases: d.cases != None })),
-        ILaw(d) -> acc.push(OLaw({ name: d.name, literals: claim_literals(mods, d) })),
-        IType(d) ->
+        TestItem(d) ->
           acc.push(
-            OType({
+            OutlinedTest({ name: d.name, label_span: d.label_span, cases: d.cases != None }),
+          ),
+        LawItem(d) -> acc.push(OutlinedLaw({ name: d.name, literals: claim_literals(modules, d) })),
+        TypeItem(d) ->
+          acc.push(
+            OutlinedType({
               name: d.name.name,
-              public: is_pub(d.vis),
+              public: is_pub(d.visibility),
               arity: d.generics.types.len(),
               span: d.span,
             }),
           ),
-        IEffect(d) ->
+        EffectItem(d) ->
           acc.push(
-            OEffect({
+            OutlinedEffect({
               name: d.name.name,
-              public: is_pub(d.vis),
+              public: is_pub(d.visibility),
               host: real_handler_of(parsed.module, d.name.name),
             }),
           ),
@@ -115,14 +123,12 @@ fn outline_of(
     sets: sets,
     cuts: cuts,
     stated: parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
-      match stated_type(item) { Some(t) -> acc.push(qualify(parsed.name, t.name)), None -> acc }),
+      match target_type(item) { Some(t) -> acc.push(qualify(parsed.name, t.name)), None -> acc }),
     set_texts: parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
-      match item { IEffectSet(_) -> acc.push(dump_item(item)), _ -> acc }),
+      match item { EffectSetItem(_) -> acc.push(dump_item(item)), _ -> acc }),
     derived: parsed.derived.map(derivation_of),
   }
 
-/// `parsed`'s outline as its text alone says it: no effect set is resolved and no law reads a schema
-/// another module declares. Its items are numbered, as a check of the program numbers them.
 pub fn read_outline(parsed: ParsedModule) -> Outline / {abort.raise} =
   outline_of(
     { ..parsed, module: { ..parsed.module, items: parsed.module.items.map(numbered_made) } },
@@ -131,30 +137,27 @@ pub fn read_outline(parsed: ParsedModule) -> Outline / {abort.raise} =
     [parsed],
   )
 
-/// Each module of `w` outlined.
 pub fn outlines_of(w: Analysis) -> List<Outline> / {abort.raise} =
-  range(0, w.mods.len()).map(|i: Int| {
-    let parsed = w.mods.get(i);
+  range(0, w.modules.len()).map(|i: Int| {
+    let parsed = w.modules.get(i);
     outline_of(
       parsed,
       effect_sets_of(w.r, w.checked.effects, i, parsed),
       match w.stub_cuts.get(parsed.name) { Some(c) -> c, None -> cuts_of(parsed) },
-      w.mods,
+      w.modules,
     )
   })
 
-pub fn effect_written(outlines: List<Outline>) -> Map<Bytes, Bool> =
+pub fn effect_visibility(outlines: List<Outline>) -> Map<Bytes, Bool> =
   outlines.fold(Map::new(), |acc: Map<Bytes, Bool>, o: Outline|
-    o.items.fold(acc, |a: Map<Bytes, Bool>, item: Outlined|
-      match item { OEffect(e) -> a.insert(qualify(o.name, e.name), e.public), _ -> a }))
+    o.items.fold(acc, |a: Map<Bytes, Bool>, item: OutlineItem|
+      match item { OutlinedEffect(e) -> a.insert(qualify(o.name, e.name), e.public), _ -> a }))
 
-/// Each effect whose module declares its real handler, and each of the prelude's whose handler's
-/// module the load holds (`prelude_hosts`), beside that handler, both by program-wide name.
 pub fn effect_hosts(outlines: List<Outline>) -> Map<Bytes, Bytes> =
   outlines.fold(Map::new(), |acc: Map<Bytes, Bytes>, o: Outline| {
-    let declared = o.items.fold(acc, |a: Map<Bytes, Bytes>, item: Outlined|
+    let declared = o.items.fold(acc, |a: Map<Bytes, Bytes>, item: OutlineItem|
       match item {
-        OEffect(e) -> match e.host {
+        OutlinedEffect(e) -> match e.host {
           Some(by) -> a.insert(qualify(o.name, e.name), qualify(o.name, by)),
           None -> a,
         },
@@ -164,23 +167,22 @@ pub fn effect_hosts(outlines: List<Outline>) -> Map<Bytes, Bytes> =
       declared,
       |a: Map<Bytes, Bytes>, h: { effect: Bytes, module: Bytes, by: Bytes }|
         if h.module == o.name
-            && o.items.any(|item: Outlined| match item { OFn(f) -> f.name == h.by, _ -> false }) {
+            && o.items.any(|item: OutlineItem|
+              match item { OutlinedFunction(f) -> f.name == h.by, _ -> false }) {
           a.insert(h.effect, qualify(o.name, h.by))
         } else { a },
     )
   })
 
-/// A prelude effect has no source entry and is public.
 pub fn effect_public_of(m: Map<Bytes, Bool>, effect_info: EffectInfo) -> Bool =
   match m.get(effect_info.name) { Some(b) -> b, None -> true }
 
-/// No table of the checker's holds a `type` declaration, so it is read from the tree.
 pub fn type_rows(outlines: List<Outline>) -> List<TypeRow> / {abort.raise} =
   range(0, outlines.len()).fold([], |acc: List<TypeRow>, i: Int| {
     let o = outlines.get(i);
-    o.items.fold(acc, |a: List<TypeRow>, item: Outlined|
+    o.items.fold(acc, |a: List<TypeRow>, item: OutlineItem|
       match item {
-        OType(t) ->
+        OutlinedType(t) ->
           a.push({
             name: qualify(o.name, t.name),
             module: o.name,
@@ -193,50 +195,47 @@ pub fn type_rows(outlines: List<Outline>) -> List<TypeRow> / {abort.raise} =
       })
   })
 
-/// Where each test's label is, in the order the checker lists tests.
 pub fn test_label_spans(outlines: List<Outline>) -> List<Location> / {abort.raise} =
   range(0, outlines.len()).fold([], |acc: List<Location>, i: Int|
-    outlines.get(i).items.fold(acc, |a: List<Location>, item: Outlined|
-      match item { OTest(t) -> a.push({ module: i, span: t.label_span }), _ -> a }))
+    outlines.get(i).items.fold(acc, |a: List<Location>, item: OutlineItem|
+      match item { OutlinedTest(t) -> a.push({ module: i, span: t.label_span }), _ -> a }))
 
-// --- A claim's literals -------------------------------------------------------
+fn int_literal(k: Int) -> Bytes = b"int ".concat(ascii_of_int(k))
 
-// The order seeds the prover's search for a point, so it is the stack walk's first-reached order, not sorted.
-
-fn int_lit(k: Int) -> Bytes = b"int ".concat(ascii_of_int(k))
-
-fn lit_text(acc: List<Bytes>, literal: Lit) -> List<Bytes> / {abort.raise} =
+fn literal_text(acc: List<Bytes>, literal: SourceLiteral) -> List<Bytes> / {abort.raise} =
   match literal {
-    LInt(k) -> acc.push_unique(int_lit(k)),
-    LStr(s) -> acc.push_unique(b"str ".concat(s)),
-    LBytes(b) -> acc.push_unique(b"bytes ".concat(hex(b))),
+    LiteralInt(k) -> acc.push_unique(int_literal(k)),
+    LiteralString(s) -> acc.push_unique(b"str ".concat(s)),
+    LiteralBytes(b) -> acc.push_unique(b"bytes ".concat(hex(b))),
     _ -> acc,
   }
 
-/// A negated literal is kept negated, as the guard means it; the walk still reaches the literal itself.
-fn neg_lit(acc: List<Bytes>, expr: Expr) -> List<Bytes> =
-  match expr {
-    ELit(v) -> match v.lit { LInt(k) -> acc.push_unique(int_lit(0 - k)), _ -> acc },
+fn neg_literal(acc: List<Bytes>, expression: Expression) -> List<Bytes> =
+  match expression {
+    LiteralExpression(v) -> match v.literal {
+      LiteralInt(k) -> acc.push_unique(int_literal(0 - k)),
+      _ -> acc,
+    },
     _ -> acc,
   }
 
-/// The literals inside `expr`, each child walked after the ones written after it.
-fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
-  let backwards = |a: List<Bytes>, xs: List<Expr>|
+fn lits(acc: List<Bytes>, expression: Expression) -> List<Bytes> / {abort.raise} = {
+  let backwards = |a: List<Bytes>, xs: List<Expression>|
     range(0, xs.len()).fold(a, |b: List<Bytes>, k: Int|
       match xs.at(xs.len() - 1 - k) { Some(x) -> lits(b, x), None -> b });
-  match expr {
-    ELit(v) -> lit_text(acc, v.lit),
-    EVar(_) -> acc,
-    ETagged(v) -> backwards(acc, v.holes.map(|h: Hole| h.value)),
-    EHole(_) -> acc,
-    EBad(_) -> acc,
-    EBinary(v) -> lits(lits(acc, v.rhs), v.lhs),
-    EUnary(v) -> lits(if v.op == b"neg" { neg_lit(acc, v.operand) } else { acc }, v.operand),
-    ELambda(v) -> lits(acc, v.body),
-    EApp(v) -> lits(backwards(acc, v.args), v.func),
-    EIf(v) -> lits(lits(lits(acc, v.else_branch), v.then_branch), v.cond),
-    EMatch(v) -> {
+  match expression {
+    LiteralExpression(v) -> literal_text(acc, v.literal),
+    NameExpression(_) -> acc,
+    TaggedLiteralExpression(v) -> backwards(acc, v.holes.map(|h: Hole| h.value)),
+    HoleExpression(_) -> acc,
+    InvalidExpression(_) -> acc,
+    BinaryExpression(v) -> lits(lits(acc, v.rhs), v.lhs),
+    UnaryExpression(v) ->
+      lits(if v.op == b"neg" { neg_literal(acc, v.operand) } else { acc }, v.operand),
+    LambdaExpression(v) -> lits(acc, v.body),
+    CallExpression(v) -> lits(backwards(acc, v.args), v.function),
+    IfExpression(v) -> lits(lits(lits(acc, v.else_branch), v.then_branch), v.cond),
+    MatchExpression(v) -> {
       let n = v.arms.len();
       let armed = range(0, n).fold(acc, |a: List<Bytes>, k: Int|
         match v.arms.at(n - 1 - k) {
@@ -248,48 +247,44 @@ fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
         });
       lits(armed, v.scrutinee)
     },
-    EBlock(v) -> {
+    BlockExpression(v) -> {
       let tailed = match v.tail { Some(t) -> lits(acc, t), None -> acc };
-      let n = v.stmts.len();
+      let n = v.statements.len();
       range(0, n).fold(tailed, |a: List<Bytes>, k: Int|
-        match v.stmts.at(n - 1 - k) {
-          Some(SLet(x)) -> lits(a, x.value),
-          Some(SLetElse(x)) -> lits(lits(a, x.fallback), x.value),
-          Some(SExpr(x)) -> lits(a, x),
-          Some(SAssign(x)) -> lits(a, x.value),
+        match v.statements.at(n - 1 - k) {
+          Some(LetStatement(x)) -> lits(a, x.value),
+          Some(LetElseStatement(x)) -> lits(lits(a, x.fallback), x.value),
+          Some(ExpressionStatement(x)) -> lits(a, x),
+          Some(AssignmentStatement(x)) -> lits(a, x.value),
           None -> a,
         })
     },
-    ERecord(v) -> backwards(acc, v.fields.map(|field: RecField| field.value)),
-    ERecordUpdate(v) -> lits(backwards(acc, v.fields.map(|field: RecField| field.value)), v.base),
-    EField(v) -> lits(acc, v.base),
-    ETry(v) -> lits(acc, v.operand),
-    EList(v) -> backwards(acc, v.items),
-    EPerform(v) -> backwards(acc, v.args),
-    EHandle(v) -> backwards(lits(acc, v.body), v.vars.map(|x: HandlerVar| x.init)),
-    EWithHold(v) -> lits(lits(lits(acc, v.body), v.release), v.acquire),
-    ESimulate(v) -> lits(acc, v.body),
-    EParallel(v) -> backwards(acc, v.branches),
-    ETryBlock(v) -> lits(acc, v.body),
+    RecordExpression(v) -> backwards(acc, v.fields.map(|field: RecordLiteralField| field.value)),
+    RecordUpdateExpression(v) ->
+      lits(backwards(acc, v.fields.map(|field: RecordLiteralField| field.value)), v.base),
+    FieldExpression(v) -> lits(acc, v.base),
+    PropagateExpression(v) -> lits(acc, v.operand),
+    ListExpression(v) -> backwards(acc, v.items),
+    PerformExpression(v) -> backwards(acc, v.args),
+    HandleExpression(v) -> backwards(lits(acc, v.body), v.vars.map(|x: HandlerVar| x.init)),
+    WithHoldExpression(v) -> lits(lits(lits(acc, v.body), v.release), v.acquire),
+    SimulateExpression(v) -> lits(acc, v.body),
+    ParallelExpression(v) -> backwards(acc, v.branches),
+    TryBlockExpression(v) -> lits(acc, v.body),
   }
 }
 
-/// The literals `written` holds, one expression at a time, as `<int|str|bytes> <value>`: where a
-/// claim's guards turn and where it may fail, which a search for a point tries first.
-pub fn literals_of(written: List<Expr>) -> List<Bytes> / {abort.raise} =
-  written.fold([], |acc: List<Bytes>, expr: Expr| lits(acc, expr))
+pub fn literals_of(written: List<Expression>) -> List<Bytes> / {abort.raise} =
+  written.fold([], |acc: List<Bytes>, expression: Expression| lits(acc, expression))
 
-/// The definitions a program's schemas are, by program-wide name: what a claim states, which is not
-/// itself something to carry one.
-pub fn schema_definitions(mods: List<ParsedModule>) -> Map<Bytes, Bool> =
-  mods.fold(Map::new(), |acc: Map<Bytes, Bool>, parsed: ParsedModule|
+pub fn schema_definitions(modules: List<ParsedModule>) -> Map<Bytes, Bool> =
+  modules.fold(Map::new(), |acc: Map<Bytes, Bool>, parsed: ParsedModule|
     schemas_declared(parsed).fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)))
 
-/// Each schema `parsed` declares, and each schema's guard, by program-wide name.
 fn schemas_declared(parsed: ParsedModule) -> List<Bytes> =
   parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
     match item {
-      ISchema(d) -> {
+      SchemaItem(d) -> {
         let named = acc.push(qualify(parsed.name, d.name.name));
         match d.guard {
           Some(_) -> named.push(qualify(parsed.name, schema_guard_name(d.name.name))),
@@ -299,12 +294,11 @@ fn schemas_declared(parsed: ParsedModule) -> List<Bytes> =
       _ -> acc,
     })
 
-/// The schema each instantiation is of, by the law's program-wide name.
-pub fn schemas_instantiated(mods: List<ParsedModule>) -> Map<Bytes, Bytes> =
-  mods.fold(Map::new(), |acc: Map<Bytes, Bytes>, parsed: ParsedModule|
+pub fn schemas_instantiated(modules: List<ParsedModule>) -> Map<Bytes, Bytes> =
+  modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, parsed: ParsedModule|
     parsed.module.items.fold(acc, |a: Map<Bytes, Bytes>, item: Item|
       match item {
-        ILaw(d) -> match d.of {
+        LawItem(d) -> match d.of {
           Some(of) -> match of.home {
             Some(home) ->
               a.insert(qualify(parsed.name, d.name), qualify(home, of.schema.name.name)),
@@ -315,65 +309,69 @@ pub fn schemas_instantiated(mods: List<ParsedModule>) -> Map<Bytes, Bytes> =
         _ -> a,
       }))
 
-/// What the schema a law instantiates states, where the law instantiates one.
 fn schema_stated(
-  mods: List<ParsedModule>,
-  law_def: LawDef,
-) -> Option<{ guard: Option<Expr>, body: Expr }> / {abort.raise} =
-  match law_def.of {
+  modules: List<ParsedModule>,
+  law_definition: LawDefinition,
+) -> Option<{ guard: Option<Expression>, body: Expression }> / {abort.raise} =
+  match law_definition.of {
     None -> None,
-    Some(of) -> match home_of(mods, of) {
+    Some(of) -> match home_of(modules, of) {
       None -> None,
-      Some(home) -> match schema_named(mods.get(home).module, of.schema.name.name) {
+      Some(home) -> match schema_named(modules.get(home).module, of.schema.name.name) {
         Some(s) -> Some({ guard: s.guard, body: s.body }),
         None -> None,
       },
     },
   }
 
-/// A law's guard: its own, or of an instantiation its schema's.
-fn guard_of(mods: List<ParsedModule>, law_def: LawDef) -> Option<Expr> / {abort.raise} =
-  match schema_stated(mods, law_def) { Some(s) -> s.guard, None -> law_def.guard }
+fn guard_of(
+  modules: List<ParsedModule>,
+  law_definition: LawDefinition,
+) -> Option<Expression> / {abort.raise} =
+  match schema_stated(modules, law_definition) { Some(s) -> s.guard, None -> law_definition.guard }
 
-/// The literals a law is written with, its guard's first: of an instantiation its schema's, and
-/// then what it hands the schema.
-pub fn claim_literals(mods: List<ParsedModule>, law_def: LawDef) -> List<Bytes> / {abort.raise} = {
-  let guarded = match guard_of(mods, law_def) { Some(g) -> lits([], g), None -> [] };
-  let stated = match schema_stated(mods, law_def) {
+pub fn claim_literals(
+  modules: List<ParsedModule>,
+  law_definition: LawDefinition,
+) -> List<Bytes> / {abort.raise} = {
+  let guarded = match guard_of(modules, law_definition) { Some(g) -> lits([], g), None -> [] };
+  let stated = match schema_stated(modules, law_definition) {
     Some(s) -> lits(guarded, s.body),
     None -> guarded,
   };
-  lits(stated, law_def.body)
+  lits(stated, law_definition.body)
 }
 
-/// The names a law's guard holds between two `Int` literals.
-pub fn guard_bounds(mods: List<ParsedModule>, law_def: LawDef) -> List<Bounded> / {abort.raise} =
-  match guard_of(mods, law_def) { Some(g) -> bounds_of([g]), None -> [] }
+pub fn guard_bounds(
+  modules: List<ParsedModule>,
+  law_definition: LawDefinition,
+) -> List<Bounded> / {abort.raise} =
+  match guard_of(modules, law_definition) { Some(g) -> bounds_of([g]), None -> [] }
 
-// --- What a guard holds between two literals --------------------------------------
-
-/// A name the guards admit only from `low` to `high`, both included.
 pub type Bounded = { name: Bytes, low: Int, high: Int }
 
-/// One side a comparison holds a name to.
 type End = { name: Bytes, lower: Bool, at: Int }
 
-/// A literal past this is no end of a domain anyone walks, and keeps the ends' arithmetic exact.
 fn farthest_end() -> Int = 1000000000000
 
-fn int_of(e: Expr) -> Option<Int> =
+fn int_of(e: Expression) -> Option<Int> =
   match e {
-    ELit(v) -> match v.lit { LInt(k) -> Some(k), _ -> None },
-    EUnary(v) -> if v.op != b"neg" { None } else {
-      match v.operand { ELit(x) -> match x.lit { LInt(k) -> Some(0 - k), _ -> None }, _ -> None }
+    LiteralExpression(v) -> match v.literal { LiteralInt(k) -> Some(k), _ -> None },
+    UnaryExpression(v) -> if v.op != b"neg" { None } else {
+      match v.operand {
+        LiteralExpression(x) -> match x.literal { LiteralInt(k) -> Some(0 - k), _ -> None },
+        _ -> None,
+      }
     },
     _ -> None,
   }
 
-fn bare_name(e: Expr) -> Option<Bytes> =
-  match e { EVar(v) -> if is_bare(v.name) { Some(v.name.name.name) } else { None }, _ -> None }
+fn bare_name(e: Expression) -> Option<Bytes> =
+  match e {
+    NameExpression(v) -> if is_bare(v.name) { Some(v.name.name.name) } else { None },
+    _ -> None,
+  }
 
-/// `acc` and the ends `name op k` holds `name` to.
 fn end_of(acc: List<End>, name: Bytes, op: Bytes, k: Int) -> List<End> =
   if k > farthest_end() || k < 0 - farthest_end() { acc }
   else if op == b"gt" { acc.push({ name: name, lower: true, at: k + 1 }) }
@@ -383,24 +381,21 @@ fn end_of(acc: List<End>, name: Bytes, op: Bytes, k: Int) -> List<End> =
     acc.push({ name: name, lower: true, at: k }).push({ name: name, lower: false, at: k })
   } else { acc }
 
-/// The comparison that says of `k op name` what `name op k` says.
-fn turned(op: Bytes) -> Bytes =
+fn flipped_comparison(op: Bytes) -> Bytes =
   if op == b"gt" { b"lt" }
   else if op == b"ge" { b"le" }
   else if op == b"lt" { b"gt" }
   else if op == b"le" { b"ge" }
   else { op }
 
-/// The ends `guard` holds names to: a comparison of a bare name with a literal that is the guard
-/// or one side of its `&&`s, which the guard cannot hold without.
-fn ends_in(acc: List<End>, guard: Expr) -> List<End> =
+fn ends_in(acc: List<End>, guard: Expression) -> List<End> =
   match guard {
-    EBinary(v) -> if v.op == b"and" { ends_in(ends_in(acc, v.lhs), v.rhs) } else {
+    BinaryExpression(v) -> if v.op == b"and" { ends_in(ends_in(acc, v.lhs), v.rhs) } else {
       match bare_name(v.lhs) {
         Some(name) -> match int_of(v.rhs) { Some(k) -> end_of(acc, name, v.op, k), None -> acc },
         None -> match bare_name(v.rhs) {
           Some(name) -> match int_of(v.lhs) {
-            Some(k) -> end_of(acc, name, turned(v.op), k),
+            Some(k) -> end_of(acc, name, flipped_comparison(v.op), k),
             None -> acc,
           },
           None -> acc,
@@ -410,10 +405,7 @@ fn ends_in(acc: List<End>, guard: Expr) -> List<End> =
     _ -> acc,
   }
 
-/// The names `guards`, which hold together, admit only between two `Int` literals: each is
-/// compared with a literal from below and from above, so no value outside is one the guards admit.
-/// A name they hold to nothing, `low` past `high`, is listed as they wrote it.
-pub fn bounds_of(guards: List<Expr>) -> List<Bounded> = {
+pub fn bounds_of(guards: List<Expression>) -> List<Bounded> = {
   let ends = guards.fold([], ends_in);
   ends.fold([], |acc: List<Bounded>, e: End|
     if acc.fold(false, |seen: Bool, b: Bounded| seen || b.name == e.name) { acc } else {
@@ -432,59 +424,40 @@ pub fn bounds_of(guards: List<Expr>) -> List<Bounded> = {
 
 pub fn law_literals(outlines: List<Outline>) -> List<List<Bytes>> =
   outlines.fold([], |acc: List<List<Bytes>>, o: Outline|
-    o.items.fold(acc, |a: List<List<Bytes>>, item: Outlined|
-      match item { OLaw(l) -> a.push(l.literals), _ -> a }))
+    o.items.fold(acc, |a: List<List<Bytes>>, item: OutlineItem|
+      match item { OutlinedLaw(l) -> a.push(l.literals), _ -> a }))
 
-// --- A module's facts -----------------------------------------------------------
-
-// What a module's check says of its own declarations apart from every other module's: a load
-// assembled from its modules' answers merges these where a load of the whole program checks it
-// again. Its shape is what every load reads of it; its tables only what a command that reads the
-// check's tables does.
-
-/// What a module's check says of its shape: its outline, the module each import declaration
-/// resolved to (a hidden one among them), the modules it reads with no import (`ModuleRow`), each
-/// name they name by its program-wide name, the module each names as written, what each of its
-/// embeds read and what each of its items asks to embed, each tagged literal it holds whose parser
-/// resolves, and each call of what a statement module declares, under no hash, since a module's
-/// check fixes none; and each `const` definition it declares with the type it is declared as. Each
-/// place is module 0's.
 pub type ModuleShape = {
   outline: Outline,
   imports: List<Bytes>,
   unimported: List<Bytes>,
   named: List<Bytes>,
   written: List<Bytes>,
-  embeds: List<EmbedAt>,
-  embed_items: List<ItemWants>,
+  embeds: List<ModuleEmbed>,
+  embed_items: List<ItemEmbeds>,
   tagged: List<TaggedSite>,
   statements: List<StatementSite>,
   consts: List<TypedConst>,
 }
 
-/// What the checker said of a module's own definitions, tests, laws, effects, constructors and what
-/// its types state, with the sites its walks recorded. Each place is module 0's, and each test and
-/// law is numbered by its place among the module's.
 pub type ModuleTables = {
-  defs: List<DefInfo>,
+  definitions: List<DefinitionInfo>,
   tests: List<TestInfo>,
   laws: List<LawInfo>,
   effects: List<EffectInfo>,
-  ctors: List<CtorInfo>,
+  constructors: List<ConstructorInfo>,
   instances: List<InstanceInfo>,
   numeric: List<NumericInfo>,
   facts: EmitFacts,
-  kept: List<KeptFacts>,
+  kept: List<CachedFacts>,
 }
 
-/// What a module's check said of it: its shape and its tables.
 pub type ModuleFacts = { shape: ModuleShape, tables: ModuleTables }
 
 derive bin for ModuleShape
 
 derive bin for ModuleTables
 
-/// The shape of a module that answers nothing.
 pub fn no_shape(module: Bytes) -> ModuleShape =
   {
     outline: {
@@ -510,47 +483,42 @@ pub fn no_shape(module: Bytes) -> ModuleShape =
     consts: [],
   }
 
-/// A module's tables as an answer keeps them: each definition's type among `types`, held once, at
-/// the place `at` gives it in the definitions' order, and left out of `tables`.
-pub type KeptTables = { types: List<HeldType>, at: List<Int>, tables: ModuleTables }
+pub type EncodedTables = { types: List<InternedType>, at: List<Int>, tables: ModuleTables }
 
-derive bin for KeptTables
+derive bin for EncodedTables
 
-fn untyped(d: DefInfo) -> DefInfo = { ..d, scheme: { ..d.scheme, ty: unit_type() } }
+fn untyped(d: DefinitionInfo) -> DefinitionInfo = { ..d, scheme: { ..d.scheme, ty: unit_type() } }
 
-/// `t` as an answer keeps it, which [`tables_read`] reads back.
-pub fn tables_kept(t: ModuleTables) -> Bytes / {abort.raise} = {
-  let h = types_held(t.defs.map(|d: DefInfo| d.scheme.ty));
+pub fn encode_tables(t: ModuleTables) -> Bytes / {abort.raise} = {
+  let h = intern_types(t.definitions.map(|d: DefinitionInfo| d.scheme.ty));
   bin::encode(
-    { types: h.held, at: h.at, tables: { ..t, defs: t.defs.map(untyped) } },
-    kept_tables_bin(),
+    { types: h.held, at: h.at, tables: { ..t, definitions: t.definitions.map(untyped) } },
+    encoded_tables_bin(),
   )
 }
 
-/// The tables `tables_kept` kept as `b`: a type two definitions share is one value in both.
-pub fn tables_read(b: Bytes) -> ModuleTables / {abort.raise} =
-  match bin::decode(b, kept_tables_bin()) {
+pub fn decode_tables(b: Bytes) -> ModuleTables / {abort.raise} =
+  match bin::decode(b, encoded_tables_bin()) {
     Err(e) -> panic("a module's tables do not read back: " ++ e.message),
     Ok(k) -> {
-      let tys = types_of(k.types);
+      let types = types_of(k.types);
       {
         ..k.tables,
-        defs: range(0, k.tables.defs.len()).map(|i: Int| {
-          let d = k.tables.defs.get(i);
-          { ..d, scheme: { ..d.scheme, ty: tys.get(k.at.get(i)) } }
+        definitions: range(0, k.tables.definitions.len()).map(|i: Int| {
+          let d = k.tables.definitions.get(i);
+          { ..d, scheme: { ..d.scheme, ty: types.get(k.at.get(i)) } }
         }),
       }
     },
   }
 
-/// The tables of a module that answers nothing.
 pub fn no_module_tables() -> ModuleTables =
   {
-    defs: [],
+    definitions: [],
     tests: [],
     laws: [],
     effects: [],
-    ctors: [],
+    constructors: [],
     instances: [],
     numeric: [],
     facts: { pure: [], orders: [], members: [], types: Map::new(), bodies: [] },
@@ -571,33 +539,30 @@ fn moved_shape(s: ModuleShape, from: Int, to: Int) -> ModuleShape =
 
 fn moved_module(module: Int, from: Int, to: Int) -> Int = if module == from { to } else { module }
 
-/// `t`'s places in module `from` moved to module `to`, its tests' and laws' numbers moved by
-/// `tests` and `laws`.
 fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> ModuleTables = {
   let at = |l: Location| moved_location(l, from, to);
   {
     ..t,
-    defs: t.defs.map(|d: DefInfo| { ..d, at: at(d.at) }),
+    definitions: t.definitions.map(|d: DefinitionInfo| { ..d, at: at(d.at) }),
     tests: t.tests.map(|x: TestInfo| { ..x, at: at(x.at), index: x.index + tests }),
     laws: t.laws.map(|l: LawInfo| { ..l, at: at(l.at), index: l.index + laws }),
     effects: t.effects.map(|x: EffectInfo|
-      { ..x, at: at(x.at), ops: x.ops.map(|op: OpInfo| { ..op, at: at(op.at) }) }),
-    ctors: t.ctors.map(|c: CtorInfo| { ..c, at: at(c.at) }),
+      { ..x, at: at(x.at), operations: x.operations.map(|op: OpInfo| { ..op, at: at(op.at) }) }),
+    constructors: t.constructors.map(|c: ConstructorInfo| { ..c, at: at(c.at) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: at(x.at) }),
     numeric: t.numeric.map(|x: NumericInfo| { ..x, at: at(x.at) }),
     facts: facts_moved(t.facts, |module: Int| moved_module(module, from, to)),
   }
 }
 
-/// What `w`'s check said of its module at `i`, as `ModuleFacts` holds it.
 pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
-  let name = w.mods.get(i).name;
-  let parsed = w.mods.get(i);
+  let name = w.modules.get(i).name;
+  let parsed = w.modules.get(i);
   let mine = |module: Int| module == i;
   let c = w.checked;
   let tests = c.tests.filter(|t: TestInfo| t.module == name);
   let laws = c.laws.filter(|l: LawInfo| l.module == name);
-  let owned = |owner: Bytes| of_module(name, owner);
+  let owned = |owner: Bytes| is_declared_in(name, owner);
   {
     shape: moved_shape(
       {
@@ -605,16 +570,17 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
           parsed,
           effect_sets_of(w.r, c.effects, i, parsed),
           match w.stub_cuts.get(name) { Some(cuts) -> cuts, None -> cuts_of(parsed) },
-          w.mods,
+          w.modules,
         ),
-        imports: w.r.imports.get(i).map(|t: Int| w.mods.get(t).name),
+        imports: w.r.imports.get(i).map(|t: Int| w.modules.get(t).name),
         unimported: w.unimported.get(i),
-        named: named_imports(parsed, w.r.imports.get(i).map(|t: Int| w.mods.get(t).name)),
+        named: named_imports(parsed, w.r.imports.get(i).map(|t: Int| w.modules.get(t).name)),
         written: parsed.module.imports.map(import_module_name),
-        embeds: w.embeds.filter(|x: EmbedAt| x.module == name),
+        embeds: w.embeds.filter(|x: ModuleEmbed| x.module == name),
         embed_items: {
-          let items = wants_by_item(parsed.module);
-          if items.fold(false, |b: Bool, x: ItemWants| b || x.wants.len() > 0) { items } else { [] }
+          let items = requests_by_item(parsed.module);
+          if items.fold(false, |b: Bool, x: ItemEmbeds| b || x.wants.len() > 0) { items }
+          else { [] }
         },
         tagged: tagged_of(w, i),
         statements: statements_of(w, i),
@@ -625,19 +591,19 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
     ),
     tables: moved_tables(
       {
-        defs: c.defs.filter(|d: DefInfo| d.module == name),
+        definitions: c.definitions.filter(|d: DefinitionInfo| d.module == name),
         tests: tests,
         laws: laws,
         effects: c.effects.filter(|x: EffectInfo| x.module == name),
-        ctors: c.ctors.filter(|x: CtorInfo| x.module == name),
+        constructors: c.constructors.filter(|x: ConstructorInfo| x.module == name),
         instances: c.instances.filter(|x: InstanceInfo| mine(x.at.module)),
         numeric: c.numeric_types.filter(|x: NumericInfo| mine(x.at.module)),
         facts: {
           ..facts_kept(c.facts, |module: Int, owner: Bytes| mine(module)),
-          pure: c.facts.pure.filter(|n: Bytes| of_module(name, n)),
+          pure: c.facts.pure.filter(|n: Bytes| is_declared_in(name, n)),
           orders: c.facts.orders.filter(|x: WitnessOrder| mine(x.module)),
         },
-        kept: c.kept.filter(|k: KeptFacts| owned(k.name)),
+        kept: c.kept.filter(|k: CachedFacts| owned(k.name)),
       },
       i,
       0,
@@ -647,13 +613,12 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
   }
 }
 
-/// Each name `parsed`'s import declarations name, qualified by the module each resolved to, in
-/// `targets`.
 pub fn named_imports(parsed: ParsedModule, targets: List<Bytes>) -> List<Bytes> / {abort.raise} =
   range(0, parsed.module.imports.len()).fold([], |acc: List<Bytes>, k: Int|
     match parsed.module.imports.get(k).kind {
-      INames(names) -> match targets.at(k) {
-        Some(module) -> names.fold(acc, |a: List<Bytes>, n: Ident| a.push(qualify(module, n.name))),
+      SelectedNames(names) -> match targets.at(k) {
+        Some(module) ->
+          names.fold(acc, |a: List<Bytes>, n: Identifier| a.push(qualify(module, n.name))),
         None -> acc,
       },
       _ -> acc,
@@ -661,61 +626,52 @@ pub fn named_imports(parsed: ParsedModule, targets: List<Bytes>) -> List<Bytes> 
 
 fn first_index(xs: List<Int>) -> Int = match xs { [x, ..] -> x, [] -> 0 }
 
-/// The functions a program reaches of the shipped modules `shipped` names, as `reach_of` reads it:
-/// what every other definition, declaration, test and law reaches, what a module outside them
-/// imports by a name that is no type or effect, and what a shipped module's types, effects and
-/// statements name. `hashes` are the program's own, every function of those modules among them.
-fn reached_of(
+fn reached_shipped_functions(
   shapes: List<ModuleShape>,
   hashes: HashOutput,
   shipped: Map<Bytes, Bool>,
 ) -> Map<Bytes, Bool> / {abort.raise} = {
-  let roots = shapes.fold([], |acc: List<Which>, s: ModuleShape| {
+  let roots = shapes.fold([], |acc: List<Subject>, s: ModuleShape| {
     let o = s.outline;
     if shipped.contains(o.name) {
       o.items.fold(
-        acc.concat(o.stated.map(|t: Bytes| TheDecl(t))),
-        |a: List<Which>, item: Outlined|
+        acc.concat(o.stated.map(|t: Bytes| DeclarationNamed(t))),
+        |a: List<Subject>, item: OutlineItem|
           match item {
-            OType(x) -> a.push(TheDecl(qualify(o.name, x.name))),
-            OEffect(x) -> a.push(TheDecl(qualify(o.name, x.name))),
+            OutlinedType(x) -> a.push(DeclarationNamed(qualify(o.name, x.name))),
+            OutlinedEffect(x) -> a.push(DeclarationNamed(qualify(o.name, x.name))),
             _ -> a,
           },
       )
     } else {
-      let own = o.items.fold(acc, |a: List<Which>, item: Outlined|
+      let own = o.items.fold(acc, |a: List<Subject>, item: OutlineItem|
         match item {
-          OFn(x) -> a.push(TheFn(qualify(o.name, x.name))),
-          OType(x) -> a.push(TheDecl(qualify(o.name, x.name))),
-          OEffect(x) -> a.push(TheDecl(qualify(o.name, x.name))),
-          OTest(x) -> a.push(TheItem(qualify(o.name, x.name))),
-          OLaw(x) -> a.push(TheItem(qualify(o.name, x.name))),
+          OutlinedFunction(x) -> a.push(FunctionNamed(qualify(o.name, x.name))),
+          OutlinedType(x) -> a.push(DeclarationNamed(qualify(o.name, x.name))),
+          OutlinedEffect(x) -> a.push(DeclarationNamed(qualify(o.name, x.name))),
+          OutlinedTest(x) -> a.push(ItemKeyed(qualify(o.name, x.name))),
+          OutlinedLaw(x) -> a.push(ItemKeyed(qualify(o.name, x.name))),
         });
-      s.named.fold(own, |a: List<Which>, n: Bytes|
-        if hashes.refs.declared.contains(n) { a } else { a.push(TheFn(n)) })
+      s.named.fold(own, |a: List<Subject>, n: Bytes|
+        if hashes.refs.declared.contains(n) { a } else { a.push(FunctionNamed(n)) })
     }
   });
   reached_functions(hashes, roots)
 }
 
-/// Whether a cut of the module `o` outlines to what a program reaches, `reached`, keeps `item`: a
-/// function it reaches, and every declaration, but no test and no law.
-fn kept_in_cut(o: Outline, reached: Map<Bytes, Bool>, item: Outlined) -> Bool =
+fn survives_cut(o: Outline, reached: Map<Bytes, Bool>, item: OutlineItem) -> Bool =
   match item {
-    OFn(x) -> reached.contains(qualify(o.name, x.name)),
-    OTest(_) -> false,
-    OLaw(_) -> false,
+    OutlinedFunction(x) -> reached.contains(qualify(o.name, x.name)),
+    OutlinedTest(_) -> false,
+    OutlinedLaw(_) -> false,
     _ -> true,
   }
 
-/// `s`, a shipped module's shape, cut to what a program reaches of it, `reached`, as `cut_to` cuts
-/// its text.
 fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
   let o = s.outline;
-  // How many times each function the cut leaves out is declared.
-  let gone = o.items.fold(Map::new(), |acc: Map<Bytes, Int>, item: Outlined|
+  let gone = o.items.fold(Map::new(), |acc: Map<Bytes, Int>, item: OutlineItem|
     match item {
-      OFn(x) -> if kept_in_cut(o, reached, item) { acc } else {
+      OutlinedFunction(x) -> if survives_cut(o, reached, item) { acc } else {
         let name = qualify(o.name, x.name);
         acc.insert(name, match acc.get(name) { Some(n) -> n + 1, None -> 1 })
       },
@@ -725,8 +681,7 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
     ..s,
     outline: {
       ..o,
-      items: o.items.filter(|item: Outlined| kept_in_cut(o, reached, item)),
-      // Each leaves the names declared once, the first of its name.
+      items: o.items.filter(|item: OutlineItem| survives_cut(o, reached, item)),
       declared: o.declared.fold(
         { left: gone, names: [] },
         |acc: { left: Map<Bytes, Int>, names: List<Bytes> }, n: Bytes|
@@ -736,14 +691,11 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
             None -> { ..acc, names: acc.names.push(n) },
           },
       ).names,
-      // A test or a law is left out with what it was cut by, as `cut_to` leaves it out.
       cuts: o.cuts.filter(|c: Cut| c.braced && !gone.contains(c.name)),
     },
   }
 }
 
-/// `t`, the tables of the shipped module `o` outlines as it answered, cut to what a program reaches
-/// of it, `reached`: a function it does not reach, its sites and every test and law are left out.
 fn cut_tables(
   t: ModuleTables,
   o: Outline,
@@ -751,35 +703,28 @@ fn cut_tables(
 ) -> ModuleTables / {abort.raise} = {
   {
     ..t,
-    defs: t.defs.filter(|d: DefInfo| reached.contains(d.name)),
+    definitions: t.definitions.filter(|d: DefinitionInfo| reached.contains(d.name)),
     tests: [],
     laws: [],
     facts: {
       ..facts_kept(t.facts, |module: Int, owner: Bytes| reached.contains(owner)),
       pure: t.facts.pure.filter(|n: Bytes| reached.contains(n)),
-      // A witness order names its definition as written.
       orders: t.facts.orders.filter(|x: WitnessOrder| reached.contains(qualify(o.name, x.name))),
     },
-    kept: t.kept.filter(|k: KeptFacts| reached.contains(k.name)),
+    kept: t.kept.filter(|k: CachedFacts| reached.contains(k.name)),
   }
 }
 
-/// The owners the sites of the tests and laws `outlines` outline go by. Those are walked after every
-/// definition, each module in its place; the rest, a body's own or a clause's, are of the walk of
-/// the definitions, which takes each module in the order they are checked in.
-fn walked_apart(outlines: List<Outline>) -> Map<Bytes, Bool> / {abort.raise} =
+fn test_and_law_owners(outlines: List<Outline>) -> Map<Bytes, Bool> / {abort.raise} =
   outlines.fold(Map::new(), |acc: Map<Bytes, Bool>, o: Outline|
-    o.items.fold(acc, |m: Map<Bytes, Bool>, item: Outlined|
+    o.items.fold(acc, |m: Map<Bytes, Bool>, item: OutlineItem|
       match item {
-        OTest(t) -> m.insert(test_owner(o.name, t.name), true),
-        OLaw(l) -> m.insert(law_owner(o.name, l.name), true),
+        OutlinedTest(t) -> m.insert(test_owner(o.name, t.name), true),
+        OutlinedLaw(l) -> m.insert(law_owner(o.name, l.name), true),
         _ -> m,
       }))
 
-/// What `pick` holds of each of `checked`, the modules in the order they are checked in, that
-/// `first` says is of the walk of definitions, then the rest of each of `placed`, the modules in
-/// their places: the order one check of them all records them in.
-fn phased<a>(
+fn in_check_order<a>(
   checked: List<ModuleTables>,
   placed: List<ModuleTables>,
   pick: (ModuleTables) -> List<a>,
@@ -790,53 +735,47 @@ fn phased<a>(
     |acc: List<a>, t: ModuleTables| acc.concat(pick(t).filter(|x: a| !first(x))),
   )
 
-/// The spans of the functions `o` outlines.
 fn fn_spans_of(o: Outline) -> List<Span> =
-  o.items.fold([], |acc: List<Span>, item: Outlined|
-    match item { OFn(x) -> acc.push(x.span), _ -> acc })
+  o.items.fold([], |acc: List<Span>, item: OutlineItem|
+    match item { OutlinedFunction(x) -> acc.push(x.span), _ -> acc })
 
 fn within_any(spans: List<Span>, span: Span) -> Bool =
   spans.fold(false, |b: Bool, at: Span| b || (span.start >= at.start && span.end <= at.end))
 
-/// `s` read without its tests and laws, as a program to ship reads its own modules.
 fn untested_shape(s: ModuleShape) -> ModuleShape = {
   let spans = fn_spans_of(s.outline);
   {
     ..s,
     outline: {
       ..s.outline,
-      items: s.outline.items.filter(|item: Outlined|
-        match item { OTest(_) -> false, OLaw(_) -> false, _ -> true }),
+      items: s.outline.items.filter(|item: OutlineItem|
+        match item { OutlinedTest(_) -> false, OutlinedLaw(_) -> false, _ -> true }),
     },
     tagged: s.tagged.filter(|x: TaggedSite| within_any(spans, x.span)),
     statements: s.statements.filter(|x: StatementSite| within_any(spans, x.span)),
   }
 }
 
-/// `t`, the tables of the module `o` outlines, read without its tests and laws.
 fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} = {
-  let apart = walked_apart([o]);
+  let apart = test_and_law_owners([o]);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ..t,
     tests: [],
     laws: [],
     facts: facts_kept(t.facts, |module: Int, owner: Bytes| of_definitions(owner)),
-    kept: t.kept.filter(|k: KeptFacts| of_definitions(k.name)),
+    kept: t.kept.filter(|k: CachedFacts| of_definitions(k.name)),
   }
 }
 
-/// What a load read of each shipped module of `shapes`, as `views_of` says it: `hashes` are the
-/// program's before the modules are cut, `read` the functions it reaches, `texts` each module's
-/// text as the load read it.
 fn views_read(
   shapes: List<ModuleShape>,
   hashes: HashOutput,
   read: Map<Bytes, Bool>,
   texts: Map<Bytes, Bytes>,
 ) -> List<ShippedView> / {abort.raise} = {
-  let defs = by_name(hashes.defs);
-  let decls = by_name(hashes.decls);
+  let definitions = by_name(hashes.definitions);
+  let declarations = by_name(hashes.declarations);
   let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
     match table.get(name) { Some(hash) -> hash, None -> b"" };
   shapes.fold([], |acc: List<ShippedView>, s: ModuleShape| {
@@ -844,17 +783,17 @@ fn views_read(
     match texts.get(o.name) {
       None -> acc,
       Some(text) -> {
-        let declared = o.items.fold([], |a: List<Bytes>, item: Outlined| {
+        let declared = o.items.fold([], |a: List<Bytes>, item: OutlineItem| {
           let line = |name: Bytes|
             a.push(
               Bytes::concat_all([
                 b"declared ",
                 qualify(o.name, name),
                 b" ",
-                hash_of(decls, qualify(o.name, name)),
+                hash_of(declarations, qualify(o.name, name)),
               ]),
             );
-          match item { OType(x) -> line(x.name), OEffect(x) -> line(x.name), _ -> a }
+          match item { OutlinedType(x) -> line(x.name), OutlinedEffect(x) -> line(x.name), _ -> a }
         });
         let shape = declared.concat(s.imports.map(|m: Bytes| b"imports ".concat(m))).concat(
           o.set_texts.map(|t: Bytes| b"set ".concat(t)),
@@ -863,102 +802,86 @@ fn views_read(
           module: o.name,
           text: hex(blake3(text)),
           form: hex(blake3(Bytes::join(shape, b"\n"))),
-          defs: o.items.fold([], |a: List<{ name: Bytes, hash: Bytes }>, item: Outlined|
-            match item {
-              OFn(x) -> {
-                let name = qualify(o.name, x.name);
-                if read.contains(name) { a.push({ name: name, hash: hex(hash_of(defs, name)) }) }
-                else { a }
+          definitions: o.items.fold(
+            [],
+            |a: List<{ name: Bytes, hash: Bytes }>, item: OutlineItem|
+              match item {
+                OutlinedFunction(x) -> {
+                  let name = qualify(o.name, x.name);
+                  if read.contains(name) {
+                    a.push({ name: name, hash: hex(hash_of(definitions, name)) })
+                  } else { a }
+                },
+                _ -> a,
               },
-              _ -> a,
-            }),
+          ),
         })
       },
     }
   })
 }
 
-/// A program as its modules' shapes say it: every table a load holds of it but its check's.
-/// `order` names the modules in the order they are checked in, `imports` what each imports as
-/// resolved, each once, and `unimported` what each reads with no import; `tagged` every tagged
-/// literal of the root package's modules, `statements` every call of what a statement module
-/// declares there, and `consts` every `const` definition there with its type.
 pub type Frame = {
   outlines: List<Outline>,
   order: List<Bytes>,
   imports: List<List<Bytes>>,
   unimported: List<List<Bytes>>,
   hashes: HashOutput,
-  warnings: List<Diag>,
-  /// The project's `ply.pkg`, decoded; `None` is the anonymous package.
+  warnings: List<Diagnostic>,
   manifest: Option<Manifest>,
-  packages: List<PackageDeps>,
-  pins: List<Pinned>,
+  packages: List<PackageDependencies>,
+  pins: List<LockedPackage>,
   module_packages: List<Int>,
-  embeds: List<EmbedAt>,
-  embed_items: Map<Bytes, List<ItemWants>>,
+  embeds: List<ModuleEmbed>,
+  embed_items: Map<Bytes, List<ItemEmbeds>>,
   tagged: List<TaggedSite>,
   statements: List<StatementSite>,
   consts: List<TypedConst>,
 }
 
-/// A checked program's tables apart from its syntax: what a load assembled from its modules'
-/// answers holds, and what a whole analysis holds besides its parses.
-pub type View = { frame: Frame, checked: CheckOutput }
+pub type CheckedProgram = { frame: Frame, checked: CheckOutput }
 
-/// How a load reads each of its modules' tables into its program's, in its order: each module's
-/// outline as it answered, whether the load read it without its tests and laws, and whether it cut
-/// it to `reach`, what the program reaches of the shipped modules.
 pub type TableReads = { reads: List<TablesRead>, reach: Map<Bytes, Bool> }
 
 pub type TablesRead = { outline: Outline, untested: Bool, cut: Bool }
 
-/// How a load that read no module reads their tables.
 pub fn no_reads() -> TableReads = { reads: [], reach: Map::new() }
 
-/// How many functions `frame` outlines: its check's tables hold one definition of each.
 pub fn functions_of(frame: Frame) -> Int =
   frame.outlines.fold(0, |n: Int, o: Outline|
-    o.items.fold(n, |k: Int, item: Outlined| match item { OFn(_) -> k + 1, _ -> k }))
+    o.items.fold(n, |k: Int, item: OutlineItem|
+      match item { OutlinedFunction(_) -> k + 1, _ -> k }))
 
-/// How many functions `frame` outlines past the prelude's: those the prelude holds are the
-/// language's, reached wherever a body compares or crosses a value, which no program writes.
 pub fn written_functions_of(frame: Frame) -> Int =
   functions_of({
     ..frame,
     outlines: frame.outlines.filter(|o: Outline| o.name != prelude_module()),
   })
 
-/// How many tests the first `own` modules `frame` outlines hold: its check's tables hold one of
-/// each.
 pub fn tests_of(frame: Frame, own: Int) -> Int =
   frame.outlines.take(own).fold(0, |n: Int, o: Outline|
-    o.items.fold(n, |k: Int, item: Outlined| match item { OTest(_) -> k + 1, _ -> k }))
+    o.items.fold(n, |k: Int, item: OutlineItem| match item { OutlinedTest(_) -> k + 1, _ -> k }))
 
-/// The program whose modules' shapes are `shapes`, in its order, each module's hashing as `fixing`
-/// holds it: its frame, how its modules' tables are read into its own, and what it read of each
-/// shipped module. `shipped` holds each shipped module's text as the load read it; each is cut to
-/// what the program reaches where `reached` says. `tested` reads the program's own tests and laws.
 pub fn framed_program(
   shapes: List<ModuleShape>,
-  fixing: Fixing,
+  fixing: CachedHashes,
   shipped: Map<Bytes, Bytes>,
   tested: Bool,
   reached: Bool,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   manifest: Option<Manifest>,
-  packages: List<PackageDeps>,
-  pins: List<Pinned>,
+  packages: List<PackageDependencies>,
+  pins: List<LockedPackage>,
   module_packages: List<Int>,
-  embeds: List<EmbedAt>,
+  embeds: List<ModuleEmbed>,
 ) -> { frame: Frame, reads: TableReads, views: List<ShippedView> } / {abort.raise} = {
   let untested = |s: ModuleShape| !tested && !shipped.contains(s.outline.name);
   let read = shapes.map(|s: ModuleShape| if untested(s) { untested_shape(s) } else { s });
   let cutting = reached
     && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
-  let whole = hashes_fixed(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
+  let whole = hashes_from_cache(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
   let reach = if cutting {
-    reached_of(
+    reached_shipped_functions(
       read,
       whole,
       shipped.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes, _: Bytes| m.insert(n, true)),
@@ -968,7 +891,7 @@ pub fn framed_program(
   let merged = merged_shapes(
     read.map(|s: ModuleShape| if cut(s) { cut_shape(s, reach) } else { s }),
   );
-  let hashes = hashes_fixed(skeleton_of_outlines(merged.outlines), fixing);
+  let hashes = hashes_from_cache(skeleton_of_outlines(merged.outlines), fixing);
   {
     frame: {
       outlines: merged.outlines,
@@ -982,7 +905,7 @@ pub fn framed_program(
       pins: pins,
       module_packages: module_packages,
       embeds: embeds,
-      embed_items: read.fold(Map::new(), |acc: Map<Bytes, List<ItemWants>>, s: ModuleShape|
+      embed_items: read.fold(Map::new(), |acc: Map<Bytes, List<ItemEmbeds>>, s: ModuleShape|
         if s.embed_items.len() == 0 { acc } else { acc.insert(s.outline.name, s.embed_items) }),
       tagged: root_tagged(module_packages, hashes, merged.tagged),
       statements: root_statements(module_packages, hashes, merged.statements),
@@ -997,13 +920,11 @@ pub fn framed_program(
   }
 }
 
-/// The program `frame` holds, its check's tables made of `tables`, each module's as it answered, in
-/// the frame's order, read as `reads` says.
-pub fn view_over(
+pub fn checked_program_over(
   frame: Frame,
   reads: TableReads,
   tables: List<ModuleTables>,
-) -> View / {abort.raise} = {
+) -> CheckedProgram / {abort.raise} = {
   let placed = range(0, tables.len()).fold(
     { out: [], tests: 0, laws: 0 },
     |acc: { out: List<ModuleTables>, tests: Int, laws: Int }, k: Int| {
@@ -1021,21 +942,19 @@ pub fn view_over(
   { frame: frame, checked: merged_tables(prelude_tables(), frame.outlines, frame.order, placed) }
 }
 
-/// The program whose modules' facts are `facts`, in its order, as a load assembles it: its frame
-/// from their shapes, as `framed_program` reads them, and its check's tables from their tables.
-pub fn answered_program(
+pub fn assembled_program(
   facts: List<ModuleFacts>,
-  fixing: Fixing,
+  fixing: CachedHashes,
   shipped: Map<Bytes, Bytes>,
   tested: Bool,
   reached: Bool,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   manifest: Option<Manifest>,
-  packages: List<PackageDeps>,
-  pins: List<Pinned>,
+  packages: List<PackageDependencies>,
+  pins: List<LockedPackage>,
   module_packages: List<Int>,
-  embeds: List<EmbedAt>,
-) -> { view: View, views: List<ShippedView> } / {abort.raise} = {
+  embeds: List<ModuleEmbed>,
+) -> { view: CheckedProgram, views: List<ShippedView> } / {abort.raise} = {
   let f = framed_program(
     facts.map(|x: ModuleFacts| x.shape),
     fixing,
@@ -1049,12 +968,12 @@ pub fn answered_program(
     module_packages,
     embeds,
   );
-  { view: view_over(f.frame, f.reads, facts.map(|x: ModuleFacts| x.tables)), views: f.views }
+  {
+    view: checked_program_over(f.frame, f.reads, facts.map(|x: ModuleFacts| x.tables)),
+    views: f.views,
+  }
 }
 
-/// The shipped modules, of those `listed`, a load's next round of pulling reads, by name: each one a
-/// module of `read`, those read so far, imports as `written` holds its imports, that is not read
-/// yet, and each of `asked`.
 pub fn pulled_next(
   read: List<Bytes>,
   written: Map<Bytes, List<Bytes>>,
@@ -1070,34 +989,31 @@ pub fn pulled_next(
   )
 }
 
-/// A load assembled from its modules' shapes: the program's frame, how its modules' tables are read
-/// into its own, what it read of each shipped module, and the shipped modules it pulled in the
-/// places they stand.
-pub type Framed = { frame: Frame, reads: TableReads, views: List<ShippedView>, pulled: List<Bytes> }
+pub type AssembledLoad = {
+  frame: Frame,
+  reads: TableReads,
+  views: List<ShippedView>,
+  pulled: List<Bytes>,
+}
 
-/// The program whose root package's modules are `own`, with `pkgs`' dependencies and `pulled`, the
-/// shipped modules it pulled in the order it pulled them, of `listed`, those there are, each module
-/// as `shapes` says its check answered it and as `fixing` says hashing fixed it. `texts` holds each
-/// pulled module's text as the load read it; `tested` reads the root package's tests and laws, and
-/// `reached` cuts each shipped module to what the program reaches.
-pub fn answered_load(
+pub fn assembled_load(
   own: List<Bytes>,
-  pkgs: PackageSources,
+  packages: PackageSources,
   shapes: Map<Bytes, ModuleShape>,
-  fixing: Fixing,
+  fixing: CachedHashes,
   pulled: List<Bytes>,
   listed: List<Bytes>,
   texts: Map<Bytes, Bytes>,
   tested: Bool,
   reached: Bool,
-  warnings: List<Diag>,
-) -> Framed / {abort.raise} = {
-  let clo = closure(pkgs, own);
+  warnings: List<Diagnostic>,
+) -> AssembledLoad / {abort.raise} = {
+  let clo = closure(packages, own);
   let users = own.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src.name));
   let names = users.concat(pulled);
   let read = names.map(|n: Bytes| match shapes.get(n) { Some(s) -> s, None -> no_shape(n) });
-  let embeds = read.fold([], |acc: List<EmbedAt>, s: ModuleShape| acc.concat(s.embeds));
-  let tables = pkg_tables(names, own.len(), clo, toolchain_tree(own, listed));
+  let embeds = read.fold([], |acc: List<ModuleEmbed>, s: ModuleShape| acc.concat(s.embeds));
+  let tables = package_tables(names, own.len(), clo, toolchain_tree(own, listed));
   let program = framed_program(
     read,
     fixing,
@@ -1107,7 +1023,7 @@ pub fn answered_load(
     reached,
     warnings,
     clo.packages.get(0).manifest,
-    tables.pkgs,
+    tables.packages,
     pins_of(clo, embeds),
     tables.module_packages,
     embeds,
@@ -1115,8 +1031,6 @@ pub fn answered_load(
   { frame: program.frame, reads: program.reads, views: program.views, pulled: pulled }
 }
 
-/// The order a program's modules, named `names`, are checked in, each importing what `imports` says:
-/// a module after every module it imports, as resolving the program orders them.
 fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {abort.raise} = {
   let at_name = range(0, names.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
     acc.insert(names.get(i), i));
@@ -1126,9 +1040,6 @@ fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {ab
   post_order(edges).map(|i: Int| names.get(i))
 }
 
-/// A program's modules as their shapes say them, each at its place in the list: their outlines, the
-/// order the modules are checked in, the modules each imports, each once, those each reads with no
-/// import, and every tagged literal, statement call and typed `const` definition they hold.
 fn merged_shapes(
   shapes: List<ModuleShape>,
 ) -> { outlines: List<Outline>, order: List<Bytes>, imports: List<List<Bytes>>, unimported: List<List<Bytes>>, tagged: List<TaggedSite>, statements: List<StatementSite>, consts: List<TypedConst> } / {abort.raise} = {
@@ -1147,42 +1058,45 @@ fn merged_shapes(
   }
 }
 
-/// A program's check as its modules' `placed` tables say it, each module's at its place, outlined
-/// by `outlines` and checked in `order`, beside what the prelude declares: the tables a load of the
-/// whole program would hold.
 fn merged_tables(
-  prelude: { effects: List<EffectInfo>, ctors: List<CtorInfo> },
+  prelude: { effects: List<EffectInfo>, constructors: List<ConstructorInfo> },
   outlines: List<Outline>,
   order: List<Bytes>,
   placed: List<ModuleTables>,
 ) -> CheckOutput / {abort.raise} = {
   let at_name = range(0, outlines.len()).fold(Map::new(), |acc: Map<Bytes, Int>, k: Int|
     acc.insert(outlines.get(k).name, k));
-  // The checker takes the modules in the order they are checked in, which its tables hold.
   let checked_order = order.fold([], |acc: List<ModuleTables>, n: Bytes|
     match at_name.get(n) { Some(k) -> acc.push(placed.get(k)), None -> acc });
-  let apart = walked_apart(outlines);
+  let apart = test_and_law_owners(outlines);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ok: true,
-    diags: [],
+    diagnostics: [],
     holes: [],
-    defs: checked_order.fold([], |acc: List<DefInfo>, t: ModuleTables| acc.concat(t.defs)),
+    definitions: checked_order.fold([], |acc: List<DefinitionInfo>, t: ModuleTables|
+      acc.concat(t.definitions)),
     tests: placed.fold([], |acc: List<TestInfo>, t: ModuleTables| acc.concat(t.tests)),
     laws: placed.fold([], |acc: List<LawInfo>, t: ModuleTables| acc.concat(t.laws)),
     effects: checked_order.fold(prelude.effects, |acc: List<EffectInfo>, t: ModuleTables|
       acc.concat(t.effects)),
-    ctors: checked_order.fold(prelude.ctors, |acc: List<CtorInfo>, t: ModuleTables|
-      acc.concat(t.ctors)),
+    constructors: checked_order.fold(
+      prelude.constructors,
+      |acc: List<ConstructorInfo>, t: ModuleTables| acc.concat(t.constructors),
+    ),
     seeded: [],
-    seeded_tests: [],
+    cached_tests: [],
     facts: {
       pure: checked_order.fold([], |acc: List<Bytes>, t: ModuleTables| acc.concat(t.facts.pure)),
       orders: checked_order.fold([], |acc: List<WitnessOrder>, t: ModuleTables|
         acc.concat(t.facts.orders)),
-      members: phased(checked_order, placed, |t: ModuleTables| t.facts.members, |x: MemberSite|
-        of_definitions(x.owner)),
-      bodies: phased(
+      members: in_check_order(
+        checked_order,
+        placed,
+        |t: ModuleTables| t.facts.members,
+        |x: MemberSite| of_definitions(x.owner),
+      ),
+      bodies: in_check_order(
         checked_order,
         placed,
         |t: ModuleTables| t.facts.bodies,
@@ -1191,7 +1105,7 @@ fn merged_tables(
       types: checked_order.fold(Map::new(), |acc: TypeTable, t: ModuleTables|
         types_joined(acc, t.facts.types)),
     },
-    kept: checked_order.fold([], |acc: List<KeptFacts>, t: ModuleTables| acc.concat(t.kept)),
+    kept: checked_order.fold([], |acc: List<CachedFacts>, t: ModuleTables| acc.concat(t.kept)),
     instances: checked_order.fold([], |acc: List<InstanceInfo>, t: ModuleTables|
       acc.concat(t.instances)),
     numeric_types: checked_order.fold([], |acc: List<NumericInfo>, t: ModuleTables|
@@ -1199,21 +1113,17 @@ fn merged_tables(
   }
 }
 
-// --- Cuts -------------------------------------------------------------------
+fn keeps_body(definition: FnDefinition) -> Bool =
+  definition.generics.labels.len() > 0
+    || (match definition.transparent { Some(_) -> true, None -> false })
 
-/// Walked even when seeded (rows cannot carry a label), or `transparent`, which another package's
-/// proofs unfold: its body stays uncut.
-fn keeps_body(def: FnDef) -> Bool =
-  def.generics.labels.len() > 0 || (match def.transparent { Some(_) -> true, None -> false })
-
-/// A generated definition carries the span of the item that regenerates it: its `derive`.
 pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
-  let generated = parsed.derived.fold(Map::new(), |acc: Map<Bytes, Bool>, d: Derived|
+  let generated = parsed.derived.fold(Map::new(), |acc: Map<Bytes, Bool>, d: DeriveOrigin|
     acc.insert(span_key(d.span), true));
   parsed.module.items.fold([], |acc: List<Cut>, item: Item|
     match item {
-      IFn(d) -> if generated.contains(span_key(d.span)) || keeps_body(d) { acc } else {
-        let b = expr_span(d.body);
+      FunctionItem(d) -> if generated.contains(span_key(d.span)) || keeps_body(d) { acc } else {
+        let b = expression_span(d.body);
         if b.end - b.start < 2 { acc } else {
           acc.push({
             start: b.start,
@@ -1224,53 +1134,33 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
           })
         }
       },
-      ITest(d) ->
+      TestItem(d) ->
         acc.push({ start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
-      ILaw(d) ->
+      LawItem(d) ->
         acc.push({ start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
       _ -> acc,
     })
 }
 
-// --- How a value reads at the compiled seam ------------------------------------
-
-/// Every table the front end holds for a program that checks, for a caller that wants them rather
-/// than their framing: `ply defs`, `ply hash` and `ply doc` are written against this.
 pub type Analysis = {
-  mods: List<ParsedModule>,
-  r: Resolved,
-  /// What each module reads with no import, as `ModuleRow` says, in its place in `mods`.
+  modules: List<ParsedModule>,
+  r: Resolution,
   unimported: List<List<Bytes>>,
   checked: CheckOutput,
   index: Index,
   hashes: HashOutput,
-  warnings: List<Diag>,
-  /// What the walk for what nothing uses met of each node hashing normalized, and of each test and
-  /// law: what a check of part of a module tells the walk over the whole of it.
+  warnings: List<Diagnostic>,
   uses: List<UseNode>,
-  /// The project's `ply.pkg`, decoded; `None` is the anonymous package.
   manifest: Option<Manifest>,
-  /// The closure's packages and each module's package, so the emitter and the claims lowerer
-  /// resolve imports the way the front end did.
-  packages: List<PackageDeps>,
-  /// What each dependency is, as `ply.lock` pins it.
-  pins: List<Pinned>,
+  packages: List<PackageDependencies>,
+  pins: List<LockedPackage>,
   module_packages: List<Int>,
-  /// What each module read without its tests and laws was cut by.
   stub_cuts: Map<Bytes, List<Cut>>,
-  /// What each module embeds, for every pass that parses its text again.
-  embeds: List<EmbedAt>,
-  /// What each item of a module that embeds asks for, where the load knew it without a parse of its
-  /// own: from what the module's text was kept as pulling, or from the module read whole.
-  embed_items: Map<Bytes, List<ItemWants>>,
-  /// Each body the check walked, as another check reads it.
-  bodies: List<WalkedBody>,
+  embeds: List<ModuleEmbed>,
+  embed_items: Map<Bytes, List<ItemEmbeds>>,
+  bodies: List<CheckedBody>,
 }
 
-/// A tagged literal of a checked program: where it is, each text of its string as written and as
-/// it reads, and the definition its check runs, under the hash of all that definition reaches.
-/// One with no hole has one text, which its `literal` is run on; any other has a text more than
-/// it has holes, which its `compile` is run on together.
 pub type TaggedSite = {
   module: Int,
   span: Span,
@@ -1282,9 +1172,8 @@ pub type TaggedSite = {
 
 derive bin for TaggedSite
 
-/// Every tagged literal module `i` of `w` holds whose parser resolves, under no hash.
 pub fn tagged_of(w: Analysis, i: Int) -> List<TaggedSite> / {abort.raise} =
-  tagged_in(w.mods.get(i).module).fold([], |sites: List<TaggedSite>, t: Tagged|
+  tagged_in(w.modules.get(i).module).fold([], |sites: List<TaggedSite>, t: TaggedLiteral|
     match tagged_target(w.index, i, t) {
       None -> sites,
       Some(callee) ->
@@ -1298,34 +1187,30 @@ pub fn tagged_of(w: Analysis, i: Int) -> List<TaggedSite> / {abort.raise} =
         }),
     })
 
-/// Those of `sites` the root package's modules hold, each under the hash of its parser.
 pub fn root_tagged(
   module_packages: List<Int>,
   hashes: HashOutput,
   sites: List<TaggedSite>,
 ) -> List<TaggedSite> = {
-  let hashed = by_name(hashes.defs);
+  let hashed = by_name(hashes.definitions);
   sites.fold([], |acc: List<TaggedSite>, t: TaggedSite|
     if module_packages.at(t.module) != Some(0) { acc }
     else { acc.push({ ..t, hash: match hashed.get(t.callee) { Some(h) -> h, None -> b"" } }) })
 }
 
-/// A `const` definition, by program-wide name, and the program-wide name of the type it is declared
-/// as.
 pub type TypedConst = { module: Int, name: Bytes, type_name: Bytes }
 
 derive bin for TypedConst
 
-/// Every `const` definition module `i` of `w` declares as a named type.
 pub fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} =
-  w.mods.get(i).module.items.fold([], |acc: List<TypedConst>, item: Item|
+  w.modules.get(i).module.items.fold([], |acc: List<TypedConst>, item: Item|
     match item {
-      IFn(d) -> match ((d.constant, d.ret)) {
-        (Some(_), Some(TCon(c))) -> match type_named(w.index, i, c.name) {
+      FunctionItem(d) -> match ((d.constant, d.ret)) {
+        (Some(_), Some(NamedTypeExpression(c))) -> match qualified_type_name(w.index, i, c.name) {
           Some(type_name) ->
             acc.push({
               module: i,
-              name: qualify(w.mods.get(i).name, d.name.name),
+              name: qualify(w.modules.get(i).name, d.name.name),
               type_name: type_name,
             }),
           None -> acc,
@@ -1335,28 +1220,20 @@ pub fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} 
       _ -> acc,
     })
 
-/// Those of `consts` the root package's modules declare.
 pub fn root_consts(module_packages: List<Int>, consts: List<TypedConst>) -> List<TypedConst> =
   consts.filter(|c: TypedConst| module_packages.at(c.module) == Some(0))
 
-/// An argument as a check reads it before anything runs: text as written, literals joined by `++`
-/// included; the call of a definition, by its program-wide name and the hash of all it reaches, on
-/// arguments read the same way; the call of a row codec `derive sql` wrote, by the fields it reads;
-/// a tagged literal, by its parser and its texts; a list; a constructor applied, by its type's
-/// program-wide name and its own; or anything else.
 pub type Argument =
-  | AText(Bytes)
-  | ACall({ callee: Bytes, hash: Bytes, args: List<Argument> })
-  | ARow(List<RowField>)
-  | ATagged({ callee: Bytes, hash: Bytes, parts: List<Bytes>, holes: List<Argument> })
-  | AList(List<Argument>)
-  | ACtor({ type_name: Bytes, name: Bytes })
-  | AOther
+  | TextArgument(Bytes)
+  | CallArgument({ callee: Bytes, hash: Bytes, args: List<Argument> })
+  | RowArgument(List<RowField>)
+  | TaggedArgument({ callee: Bytes, hash: Bytes, parts: List<Bytes>, holes: List<Argument> })
+  | ListArgument(List<Argument>)
+  | ConstructorArgument({ type_name: Bytes, name: Bytes })
+  | OtherArgument
 
 derive bin for Argument
 
-/// A call that may run a statement, as `statements_of` finds it: where it is, the operation or the
-/// definition it calls by program-wide name, the label written at it, and its arguments.
 pub type StatementSite = {
   module: Int,
   span: Span,
@@ -1367,37 +1244,30 @@ pub type StatementSite = {
 
 derive bin for StatementSite
 
-/// The modules that declare each operation and definition a statement is run by: a module that is
-/// none of them and imports none runs no statement.
 pub fn statement_modules() -> List<Bytes> = [b"std.db", b"std.sqlite"]
 
-/// Whether `callee`, a program-wide name, is declared in a statement module.
 fn of_statement_module(callee: Bytes) -> Bool =
   statement_modules().fold(false, |b: Bool, m: Bytes| b || callee.starts_with(m.concat(b".")))
 
-/// What reading an argument looks names up in: the scopes, each definition's hash, and each row
-/// codec a module derives, by the program-wide name of the function that answers it.
-type Reading = { index: Index, hashes: Map<Bytes, Bytes>, rows: Map<Bytes, List<RowField>> }
+type ArgumentScope = { index: Index, hashes: Map<Bytes, Bytes>, rows: Map<Bytes, List<RowField>> }
 
-/// How a field of a row is read: by the reader of `std.sql`'s that it names, as an `Option` of what
-/// it holds, as an array of what the reader it names reads, as the document it holds, or through its
-/// type's own JSON codec.
-pub type RowRead = | RScalar(Bytes) | ROptional(RowRead) | RArray(Bytes) | RDocument | RByJson
+pub type RowRead =
+  | ScalarRead(Bytes)
+  | OptionalRead(RowRead)
+  | ArrayRead(Bytes)
+  | DocumentRead
+  | JsonRead
 
-/// A field of a record's row: its column and how it is read.
 pub type RowField = { name: Bytes, read: RowRead }
 
 derive bin for RowRead
 derive bin for RowField
 
-/// Each row codec `derive sql` writes in `mods`, by the program-wide name of the function that
-/// answers it, and the fields it reads: what `std.derive.codec` writes the codec's readers from. A
-/// module an entry stands for holds its `derive sql` as written, beside the types it reads.
-fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort.raise} =
-  mods.fold(Map::new(), |acc: Map<Bytes, List<RowField>>, parsed: ParsedModule|
+fn derived_rows(modules: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort.raise} =
+  modules.fold(Map::new(), |acc: Map<Bytes, List<RowField>>, parsed: ParsedModule|
     parsed.module.items.fold(acc, |rows: Map<Bytes, List<RowField>>, item: Item|
       match item {
-        IDerive(d) -> if deriver_module(parsed.module, d.deriver) != Some(b"std.sql") { rows }
+        DeriveItem(d) -> if deriver_module(parsed.module, d.deriver) != Some(b"std.sql") { rows }
         else {
           match codec::row_columns(
               declaration_of(parsed.name, parsed.module, d.target.name, d.deriver),
@@ -1409,7 +1279,7 @@ fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort
                   Bytes::of_string(codec::row_function(String::of_bytes(d.target.name))),
                 ),
                 columns.map(|c: codec::RowColumn|
-                  { name: Bytes::of_string(c.name), read: read_of(c.read) }),
+                  { name: Bytes::of_string(c.name), read: row_read_of(c.read) }),
               ),
             None -> rows,
           }
@@ -1417,54 +1287,45 @@ fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort
         _ -> rows,
       }))
 
-fn read_of(read: codec::RowRead) -> RowRead =
+fn row_read_of(read: codec::RowRead) -> RowRead =
   match read {
-    codec::Scalar(reader) -> RScalar(Bytes::of_string(reader)),
-    codec::Optional(inner) -> ROptional(read_of(inner)),
-    codec::Array(reader) -> RArray(Bytes::of_string(reader)),
-    codec::Document -> RDocument,
-    codec::ByJson(_) -> RByJson,
+    codec::Scalar(reader) -> ScalarRead(Bytes::of_string(reader)),
+    codec::Optional(inner) -> OptionalRead(row_read_of(inner)),
+    codec::Array(reader) -> ArrayRead(Bytes::of_string(reader)),
+    codec::Document -> DocumentRead,
+    codec::ByJson(_) -> JsonRead,
   }
 
-/// Every call of what a statement module declares that module `i` of `w` holds, where it imports
-/// one, under no hash: a module's check fixes none. A statement module's own calls are its
-/// operations' and their tests', which no database answers.
 pub fn statements_of(w: Analysis, i: Int) -> List<StatementSite> / {abort.raise} = {
-  let name = w.mods.get(i).name;
-  let imported = w.r.imports.get(i).map(|t: Int| w.mods.get(t).name);
+  let name = w.modules.get(i).name;
+  let imported = w.r.imports.get(i).map(|t: Int| w.modules.get(t).name);
   if statement_modules().contains(name)
       || !statement_modules().fold(false, |b: Bool, m: Bytes| b || imported.contains(m)) { [] }
   else { sites_in(w, i, of_statement_module, Map::new()) }
 }
 
-/// Every perform of an operation, and every call of a definition with a label written at it, in
-/// module `i` of `w` whose program-wide name `picked` takes, each argument's definitions under the
-/// hash `hashes` holds of it. An operation is named by its effect's name and its own:
-/// `std.db.db.query`.
 pub fn sites_in(
   w: Analysis,
   i: Int,
   picked: (Bytes) -> Bool,
   hashes: Map<Bytes, Bytes>,
 ) -> List<StatementSite> / {abort.raise} = {
-  let reading = { index: w.index, hashes: hashes, rows: derived_rows(w.mods) };
-  let calls = picked_in(w.mods.get(i).module, |e: Expr|
-    match e { EPerform(_) -> true, EApp(a) -> a.labels.len() > 0, _ -> false });
-  calls.fold([], |sites: List<StatementSite>, e: Expr|
+  let reading = { index: w.index, hashes: hashes, rows: derived_rows(w.modules) };
+  let calls = expressions_matching(w.modules.get(i).module, |e: Expression|
+    match e { PerformExpression(_) -> true, CallExpression(a) -> a.labels.len() > 0, _ -> false });
+  calls.fold([], |sites: List<StatementSite>, e: Expression|
     match statement_site(reading, i, e) {
       Some(site) -> if picked(site.callee) { sites.push(site) } else { sites },
       None -> sites,
     })
 }
 
-/// Those of `sites` the root package's modules hold, each definition an argument calls under the
-/// hash of all it reaches.
 pub fn root_statements(
   module_packages: List<Int>,
   hashes: HashOutput,
   sites: List<StatementSite>,
 ) -> List<StatementSite> / {abort.raise} = {
-  let hashed = by_name(hashes.defs);
+  let hashed = by_name(hashes.definitions);
   sites.fold([], |acc: List<StatementSite>, x: StatementSite|
     if module_packages.at(x.module) != Some(0) { acc }
     else { acc.push({ ..x, args: x.args.map(|a: Argument| hashed_argument(hashed, a)) }) })
@@ -1473,27 +1334,34 @@ pub fn root_statements(
 fn hashed_argument(hashed: Map<Bytes, Bytes>, a: Argument) -> Argument / {abort.raise} = {
   let hash_of = |name: Bytes| match hashed.get(name) { Some(h) -> h, None -> b"" };
   match a {
-    ACall(c) ->
-      ACall({
+    CallArgument(c) ->
+      CallArgument({
         ..c,
         hash: hash_of(c.callee),
         args: c.args.map(|x: Argument| hashed_argument(hashed, x)),
       }),
-    ATagged(t) ->
-      ATagged({
+    TaggedArgument(t) ->
+      TaggedArgument({
         ..t,
         hash: hash_of(t.callee),
         holes: t.holes.map(|x: Argument| hashed_argument(hashed, x)),
       }),
-    AList(xs) -> AList(xs.map(|x: Argument| hashed_argument(hashed, x))),
+    ListArgument(xs) -> ListArgument(xs.map(|x: Argument| hashed_argument(hashed, x))),
     other -> other,
   }
 }
 
-fn statement_site(reading: Reading, module: Int, e: Expr) -> Option<StatementSite> / {abort.raise} = {
-  let args = |xs: List<Expr>| xs.map(|x: Expr| argument(reading, module, x));
+fn statement_site(
+  reading: ArgumentScope,
+  module: Int,
+  e: Expression,
+) -> Option<StatementSite> / {abort.raise} = {
+  let args = |xs: List<Expression>| xs.map(|x: Expression| argument(reading, module, x));
   match e {
-    EPerform(p) -> match ((effect_called(reading.index, module, p.eff), p.resource)) {
+    PerformExpression(p) -> match ((
+        qualified_effect_name(reading.index, module, p.effect_name),
+        p.resource,
+      )) {
       (Some(named), Some(label)) ->
         Some({
           module: module,
@@ -1504,8 +1372,8 @@ fn statement_site(reading: Reading, module: Int, e: Expr) -> Option<StatementSit
         }),
       _ -> None,
     },
-    EApp(a) -> match ((a.func, a.labels.at(0))) {
-      (EVar(v), Some(label)) -> match denoted(reading.index, module, v.name) {
+    CallExpression(a) -> match ((a.function, a.labels.at(0))) {
+      (NameExpression(v), Some(label)) -> match denotation(reading.index, module, v.name) {
         DenotesFn(callee) ->
           Some({
             module: module,
@@ -1522,80 +1390,83 @@ fn statement_site(reading: Reading, module: Int, e: Expr) -> Option<StatementSit
   }
 }
 
-fn argument(reading: Reading, module: Int, e: Expr) -> Argument / {abort.raise} = {
+fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {abort.raise} = {
   let hash_of = |name: Bytes| match reading.hashes.get(name) { Some(h) -> h, None -> b"" };
   match e {
-    ELit(l) -> match l.lit { LStr(s) -> AText(s), _ -> AOther },
-    EBinary(b) -> if b.op != b"++" { AOther } else {
+    LiteralExpression(l) -> match l.literal {
+      LiteralString(s) -> TextArgument(s),
+      _ -> OtherArgument,
+    },
+    BinaryExpression(b) -> if b.op != b"++" { OtherArgument } else {
       match ((argument(reading, module, b.lhs), argument(reading, module, b.rhs))) {
-        (AText(x), AText(y)) -> AText(x.concat(y)),
-        _ -> AOther,
+        (TextArgument(x), TextArgument(y)) -> TextArgument(x.concat(y)),
+        _ -> OtherArgument,
       }
     },
-    EVar(v) -> match denoted(reading.index, module, v.name) {
-      DenotesCtor(c) -> ACtor(c),
-      _ -> AOther,
+    NameExpression(v) -> match denotation(reading.index, module, v.name) {
+      DenotesConstructor(c) -> ConstructorArgument(c),
+      _ -> OtherArgument,
     },
-    EApp(a) -> if a.labels.len() > 0 || a.named.len() > 0 { AOther } else {
-      match a.func {
-        EVar(v) -> match denoted(reading.index, module, v.name) {
+    CallExpression(a) -> if a.labels.len() > 0 || a.named.len() > 0 { OtherArgument } else {
+      match a.function {
+        NameExpression(v) -> match denotation(reading.index, module, v.name) {
           DenotesFn(callee) -> match reading.rows.get(callee) {
-            Some(fields) -> if a.args.len() == 0 { ARow(fields) } else { AOther },
+            Some(fields) -> if a.args.len() == 0 { RowArgument(fields) } else { OtherArgument },
             None ->
-              ACall({
+              CallArgument({
                 callee: callee,
                 hash: hash_of(callee),
-                args: a.args.map(|x: Expr| argument(reading, module, x)),
+                args: a.args.map(|x: Expression| argument(reading, module, x)),
               }),
           },
-          DenotesCtor(c) -> ACtor(c),
-          DenotesNothing -> AOther,
+          DenotesConstructor(c) -> ConstructorArgument(c),
+          DenotesNothing -> OtherArgument,
         },
-        _ -> AOther,
+        _ -> OtherArgument,
       }
     },
-    EList(l) -> AList(l.items.map(|x: Expr| argument(reading, module, x))),
-    ETagged(t) -> match tagged_target(reading.index, module, t) {
+    ListExpression(l) -> ListArgument(l.items.map(|x: Expression| argument(reading, module, x))),
+    TaggedLiteralExpression(t) -> match tagged_target(reading.index, module, t) {
       Some(callee) ->
-        ATagged({
+        TaggedArgument({
           callee: callee,
           hash: hash_of(callee),
           parts: tagged_parts(t).map(|part: TaggedPart| part.text),
           holes: t.holes.map(|h: Hole| argument(reading, module, h.value)),
         }),
-      None -> AOther,
+      None -> OtherArgument,
     },
-    _ -> AOther,
+    _ -> OtherArgument,
   }
 }
 
-// --- The rows an analysis publishes -----------------------------------------------
+pub fn std_package() -> PackageDependencies = { prefix: b"std", dependencies: [] }
 
-/// The built-in packages: every package's implicit dependencies, pulled on demand like the shipped
-/// modules but owned as packages — the two the runtime pre-seeds.
-pub fn std_pkg() -> PackageDeps = { prefix: b"std", deps: [] }
+pub fn compiler_package() -> PackageDependencies = { prefix: b"compiler", dependencies: [b"std"] }
 
-pub fn compiler_pkg() -> PackageDeps = { prefix: b"compiler", deps: [b"std"] }
+pub type PackageTables = {
+  packages: List<PackageDependencies>,
+  module_packages: List<Int>,
+  std: Int,
+  compiler: Int,
+  shipped: Int,
+}
 
-/// The packages of a load as the front end's tables take them: the root package first, then the
-/// closure's, then the built-in std and the compiler, with the shipped modules past the end, and
-/// every module mapped to the package it was parsed from. The order is the root's modules, then the
-/// closure's dependency modules, then the pulled toolchain modules. The standard library's own
-/// tree is the built-in std itself, so its table holds no second one: the compiler's modules it
-/// pulls import it as they import the built-in.
-pub fn pkg_tables(
+pub fn package_tables(
   names: List<Bytes>,
   root_count: Int,
   clo: Closure,
-  tree: Tree,
-) -> { pkgs: List<PackageDeps>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int } / {abort.raise} = {
-  let own = clo.packages.map(|package: Package| { prefix: package.prefix, deps: package.deps });
+  tree: ToolchainTree,
+) -> PackageTables / {abort.raise} = {
+  let own = clo.packages.map(|package: Package|
+    { prefix: package.prefix, dependencies: package.dependencies });
   let std = if tree == StdTree { own.len() - 1 } else { own.len() };
   let compiler = std + 1;
   {
-    pkgs: List::push(if tree == StdTree { own } else { own.push(std_pkg()) }, compiler_pkg()),
-    // Pulled std publishes as the shipped modules, and pulled compiler as a package of its own, so
-    // what its definitions read of the library is a dependency's contract.
+    packages: List::push(
+      if tree == StdTree { own } else { own.push(std_package()) },
+      compiler_package(),
+    ),
     module_packages: range(0, names.len()).map(|i: Int|
       if i < root_count { 0 }
       else if i < root_count + clo.modules.len() { clo.modules.get(i - root_count).pkg }
@@ -1607,34 +1478,22 @@ pub fn pkg_tables(
   }
 }
 
-/// Whether the module at `i` of a load whose tables `pkg_tables` made is one it pulled of the
-/// shipped modules, which sit in a built-in package or one past every package, rather than one of
-/// its own packages': where the load's root is a tree of the toolchain's own, a module's name says
-/// nothing of it.
-pub fn pulled_at(packages: List<PackageDeps>, module_packages: List<Int>, i: Int) -> Bool =
+pub fn pulled_at(packages: List<PackageDependencies>, module_packages: List<Int>, i: Int) -> Bool =
   match module_packages.at(i) {
     Some(k) -> match packages.at(k) { Some(p) -> is_shipped(p.prefix), None -> true },
     None -> false,
   }
 
-/// What a load's root is of the toolchain's own: the whole tree of the standard library, the whole
-/// tree of the compiler, or neither. A root that is one stands in for the shipped modules of its
-/// prefix, and is the one root whose modules may be named under it.
-pub type Tree = | NoTree | StdTree | CompilerTree
+pub type ToolchainTree = | NoTree | StdTree | CompilerTree
 
-/// What the root modules `own` are of the toolchain beside the shipped modules `listed`: a tree where
-/// every one is under one built-in prefix and the shipped set under it, which is not empty, is among
-/// them.
-pub fn toolchain_tree(own: List<Bytes>, listed: List<Bytes>) -> Tree = {
+pub fn toolchain_tree(own: List<Bytes>, listed: List<Bytes>) -> ToolchainTree = {
   let whole = |under: (Bytes) -> Bool|
     named_under(own, under) && listed.any(under)
       && listed.fold(true, |b: Bool, n: Bytes| b && (!under(n) || own.contains(n)));
   if whole(is_std) { StdTree } else if whole(is_compiler) { CompilerTree } else { NoTree }
 }
 
-/// What the root modules `own` are of the toolchain by their names alone, where no listing of the
-/// shipped modules says more: modules read apart from any program, whose whole load judged them.
-pub fn tree_named(own: List<Bytes>) -> Tree =
+pub fn tree_named(own: List<Bytes>) -> ToolchainTree =
   if named_under(own, is_std) { StdTree }
   else if named_under(own, is_compiler) { CompilerTree }
   else { NoTree }
@@ -1642,30 +1501,23 @@ pub fn tree_named(own: List<Bytes>) -> Tree =
 fn named_under(own: List<Bytes>, under: (Bytes) -> Bool) -> Bool =
   own.len() > 0 && own.fold(true, |b: Bool, n: Bytes| b && under(n))
 
-/// The module an instantiation's schema is declared in, once the resolver has found it.
-pub fn home_of(mods: List<ParsedModule>, of: OfSchema) -> Option<Int> =
+pub fn home_of(modules: List<ParsedModule>, of: SchemaInstance) -> Option<Int> =
   match of.home {
     None -> None,
     Some(name) ->
-      range(0, mods.len()).fold(None, |found: Option<Int>, i: Int|
+      range(0, modules.len()).fold(None, |found: Option<Int>, i: Int|
         match found {
           Some(_) -> found,
-          None -> match mods.at(i) {
+          None -> match modules.at(i) {
             Some(m) -> if m.name == name { Some(i) } else { None },
             None -> None,
           },
         }),
   }
 
-// --- Pulling in the shipped modules --------------------------------------------
-
-/// What a load read of a shipped module it pulled, each part in hex: the digest of the module's
-/// text; its form, all that a load keeps of it whatever the program reaches; and each function the
-/// program reached, with its hash. A load that reads the module as it now stands, and reaches no
-/// other function of it, answers as this one did while its form and each of those hashes stand.
 pub type ShippedView = {
   module: Bytes,
   text: Bytes,
   form: Bytes,
-  defs: List<{ name: Bytes, hash: Bytes }>,
+  definitions: List<{ name: Bytes, hash: Bytes }>,
 }

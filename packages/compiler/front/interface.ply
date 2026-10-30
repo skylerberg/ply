@@ -1,10 +1,7 @@
-//! A package as another package reads it: what each of its modules shows the modules that import
-//! it, and the text helpers that blank what a reader of a module does not read.
-
 import std.bin
 import std.hash (blake3)
 import std.list
-import compiler.check.resolve.tables (Source, ParsedModule, Diag)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.pkg (PackageSources)
 import compiler.store.hash (Contract, public_contracts)
@@ -13,23 +10,18 @@ import compiler.front.seam (AnalysisOutcome, Analysed, Refused)
 import compiler.front.published (analyse, analyse_with)
 import compiler.front.rows (Cut)
 import compiler.front.exports (Exports, Hashes, exports_of, hashes_of, exports_bin, hashes_bin)
-import compiler.expand.embed (EmbedRead, EmbedFile)
-import compiler.syntax.items (unimported)
+import compiler.expand.embed (EmbedResult, EmbedFile)
+import compiler.syntax.items (unread_by_importers)
 import compiler.syntax.parsing (Span)
 
-/// One module of a package as a module importing it checks and hashes against it.
 pub type ModuleInterface = { exports: Exports, hashes: Hashes }
 
-/// Each module of a package, in the package's order.
 pub type Interface = { modules: List<ModuleInterface> }
 
 derive bin for ModuleInterface
 
 derive bin for Interface
 
-/// A package's interface as a registry serves it beside a version's archive: the semantics it was
-/// cut under, the archive it was cut from, and the package. A registry reads the frame whatever
-/// semantics wrote the payload.
 pub type Envelope = { semantics: Bytes, archive: Bytes, payload: Bytes }
 
 derive bin for Envelope
@@ -47,9 +39,6 @@ pub fn envelope_of(b: Bytes) -> Option<Envelope> / {abort.raise} =
     }
   }
 
-// --- Stubs ------------------------------------------------------------------
-
-/// `n` spaces, by doubling, so a long body costs a few concatenations.
 fn spaces(n: Int) -> Bytes =
   if n <= 0 { b"" } else {
     let half = spaces(n / 2);
@@ -57,7 +46,6 @@ fn spaces(n: Int) -> Bytes =
     if n % 2 == 1 { twice.concat(b" ") } else { twice }
   }
 
-/// `text` with every byte but a newline turned to a space: the same lines, the same offsets.
 fn blank(text: Bytes) -> Bytes / {abort.raise} = {
   let segs = text.split(b"\n");
   Bytes::concat_all(
@@ -74,19 +62,14 @@ fn cut(src: Bytes, c: Cut) -> List<Bytes> / {abort.raise} =
 pub fn stub_module(src: Bytes, parsed: ParsedModule) -> Bytes / {abort.raise} =
   stubbed(src, cuts_of(parsed))
 
-/// A shipped module as a module that imports it reads it: what `items.unimported` finds of it
-/// blanked, at the offsets it had. Its tests and laws stay for a run over the shipped modules
-/// themselves.
-pub fn imported(src: Bytes) -> Bytes / {abort.raise} = blanked(src, unimported(src))
+pub fn imported(src: Bytes) -> Bytes / {abort.raise} = blanked(src, unread_by_importers(src))
 
-/// `src` with each of `spans`, in order and apart, blanked at the offsets it had.
 pub fn blanked(src: Bytes, spans: List<Span>) -> Bytes / {abort.raise} =
   stubbed(
     src,
     spans.map(|s: Span| { start: s.start, end: s.end, braced: false, name: b"", test: false }),
   )
 
-/// `src` with each cut blanked, at the offsets it had: what a module's published cuts make of it.
 pub fn stubbed(src: Bytes, cuts: List<Cut>) -> Bytes / {abort.raise} = {
   let walked = cuts.fold({ at: 0, parts: [] }, |acc: { at: Int, parts: List<Bytes> }, c: Cut|
     if c.start < acc.at { acc }
@@ -94,20 +77,19 @@ pub fn stubbed(src: Bytes, cuts: List<Cut>) -> Bytes / {abort.raise} = {
   Bytes::concat_all(walked.parts.push(src.slice(walked.at, src.len())))
 }
 
-pub fn sized(b: Bytes) -> Bytes =
+pub fn length_prefixed(b: Bytes) -> Bytes =
   Bytes::concat_all([Bytes::of_string(b.len().to_string()), b":", b])
 
-pub fn read_key(read: EmbedRead) -> Bytes =
+pub fn embed_read_digest(read: EmbedResult) -> Bytes =
   blake3(
     Bytes::concat_all(match read {
       Err(why) -> [b"ply.interface.embed.2\0!", why],
       Ok(files) ->
         files.fold([b"ply.interface.embed.2\0="], |acc: List<Bytes>, f: EmbedFile|
-          acc.push(sized(f.name)).push(sized(f.digest))),
+          acc.push(length_prefixed(f.name)).push(length_prefixed(f.digest))),
     }),
   )
 
-/// What `analysis` shows of each of `modules`, each read from its text among `sources`.
 pub fn interface_of(
   analysis: Analysis,
   sources: List<Source>,
@@ -115,8 +97,8 @@ pub fn interface_of(
 ) -> Interface / {abort.raise} = {
   let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
-  let index = range(0, analysis.mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-    acc.insert(analysis.mods.get(i).name, i));
+  let index = range(0, analysis.modules.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+    acc.insert(analysis.modules.get(i).name, i));
   {
     modules: modules.map(|name: Bytes|
       match ((texts.get(name), index.get(name))) {
@@ -129,8 +111,6 @@ pub fn interface_of(
       }),
   }
 }
-
-// --- Tests ------------------------------------------------------------------
 
 fn whole_of(analysis: AnalysisOutcome) -> Analysis / {abort.raise} =
   match analysis { Analysed(w) -> w, Refused(ds) -> panic("analysis refused") }
@@ -147,8 +127,6 @@ test "a stub keeps every offset and line of its source" {
   let stub = stub_module(base.src, m);
   assert_eq(stub.len(), base.src.len());
   assert_eq(stub.split(b"\n").len(), base.src.split(b"\n").len());
-  // Declarations, signatures and the label-generic body stay; other bodies, the row-generic one
-  // among them, the test and the law go.
   assert(
     stub.index_of(b"pub fn two(x: Int) -> Int requires x >= 0 ensures result > x = {") != None,
   );

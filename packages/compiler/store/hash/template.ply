@@ -1,25 +1,34 @@
-//! What the encoder makes of a definition's syntax: its template, the stored form with what it
-//! references left as nodes of the program (`stored.Template`). Every name is resolved here, once.
-
-import compiler.syntax.parsing (Span, Ident, QName, is_bare, bare, starts_upper)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded,
-                                 LFloat, LDec, LChar, LUnit, LBad)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, Param, MatchArm, HandleClause, ReturnClause,
-                              HandlerVar, RecField, ETagged, Hole, tagged_parser, tagged_filler,
-                              NamedArg, prelude_module)
-import compiler.syntax.items (FnDef, TypeDef, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef,
-                              LawDef, Binder, Constraint, SRequires, SEnsures, SCost, SSpace,
-                              SpecClause, schema_of, ReturnsFresh, ReturnsParam, TDNominal,
-                              TDExtern, InstanceDef, NHost, numeric_ops, numeric_by, member_of,
-                              member_name)
+import compiler.syntax.parsing (Span, Identifier, QName, is_bare, bare, starts_upper)
+import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
+                                    FunctionTypeExpression, RecordTypeExpression,
+                                    UnitTypeExpression, InvalidTypeExpression, RowExpression,
+                                    AtomExpression)
+import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
+                                 PatternRange, PatternConstructor, PatternRecord, PatternList,
+                                 PatternOr, PatternInvalid, SourceLiteral, LiteralInt, LiteralFixed,
+                                 LiteralWide, LiteralBool, LiteralString, LiteralBytes,
+                                 LiteralEmbedded, LiteralFloat, LiteralDecimal, LiteralChar,
+                                 LiteralUnit, LiteralInvalid)
+import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
+                                    UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                                    MatchExpression, BlockExpression, RecordExpression,
+                                    RecordUpdateExpression, PropagateExpression, FieldExpression,
+                                    ListExpression, PerformExpression, HandleExpression,
+                                    WithHoldExpression, SimulateExpression, ParallelExpression,
+                                    InvalidExpression, HoleExpression, TryBlockExpression,
+                                    Statement, LetStatement, LetElseStatement, ExpressionStatement,
+                                    AssignmentStatement, Param, MatchArm, HandleClause,
+                                    ReturnClause, HandlerVar, RecordLiteralField,
+                                    TaggedLiteralExpression, Hole, tagged_parser, tagged_filler,
+                                    NamedArg, prelude_module)
+import compiler.syntax.items (FnDefinition, TypeDefinition, AliasBody, SumBody, VariantDefinition,
+                              EffectDefinition, OpDefinition, TestDefinition, LawDefinition, Binder,
+                              Constraint, RequiresClause, EnsuresClause, CostClause, SpaceClause,
+                              SpecClause, schema_of, ReturnsFresh, ReturnsParam, NominalBody,
+                              ExternBody, InstanceDefinition, HostInstance, numeric_ops, numeric_by,
+                              member_of, member_name)
 import compiler.check.resolve.bindings (item_locals, body_binders)
-import compiler.syntax.items (IFn, ITest, ILaw, result_name)
+import compiler.syntax.items (FunctionItem, TestItem, LawItem, result_name)
 import compiler.check.member (CallsFunction)
 import compiler.check.infer.checker (MemberSite)
 import compiler.check.known (list_name, map_name)
@@ -27,14 +36,15 @@ import std.list
 import std.option
 import std.bytes
 import std.string
-import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, CtorTarget, FnTarget,
-                                  Index, qualifier, value_target, ctor_target, type_target,
-                                  effect_target)
-import compiler.store.hash.encoding (CallSite, rposition, width_index, float_bits, decimal_parts,
-                                     Spot, Bound, Choice, Found, Pick, Waiting)
+import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, ConstructorTarget,
+                                  FnTarget, Index, qualifier, value_target, constructor_target,
+                                  type_target, effect_target)
+import compiler.store.hash.encoding (CallSite, last_index_of, width_index, float_bits,
+                                     decimal_parts, BinderPosition, PositionedBinder, Choice, Known,
+                                     CallResolution, Pending)
 import compiler.store.hash.stored
-import compiler.store.hash.stored (Reference, Itself, Note, Picked, Ran, Slotted, Free, Literal,
-                                   IntLiteral, FixedLiteral, WideLiteral, BoolLiteral,
+import compiler.store.hash.stored (Reference, Itself, Note, CallNote, RunNote, EffectSlot, FreeName,
+                                   Literal, IntLiteral, FixedLiteral, WideLiteral, BoolLiteral,
                                    StringLiteral, BytesLiteral, EmbeddedLiteral, FloatLiteral,
                                    DecimalLiteral, CharLiteral, UnitLiteral, Named, Local, Defined,
                                    Constructed, Unbound, Value, Label, LabelParameter, LabelName,
@@ -47,58 +57,51 @@ import compiler.store.hash.stored (Reference, Itself, Note, Picked, Ran, Slotted
                                    Unwritten, Variable, Binary, Unary, Lambda, Call, OnValue,
                                    OnValueCall, If, Match, Record, RecordUpdate, Field, ListOf,
                                    Perform, Handle, WithHold, Simulate, Parallel, Tagged, Filled,
-                                   FilledHole, TryBlock, Raised, Block, Arm, Handled, Clause, Entry,
-                                   One, Commuting, Let, LetElse, Effectful, Assign, Generics,
-                                   Constrained, Returning, Unstated, Fresh, ParameterReturned,
-                                   FunctionForm, Variant, TypeBody, Alias, Sum, Nominal, Extern,
-                                   Through, Numeric, TypeForm, Operation, EffectForm, TestForm,
-                                   LawForm, SpecForm, Form, FunctionOf, TypeOf, EffectOf, TestOf,
-                                   LawOf, SpecOf, Template, reference_bin, atom_bin,
-                                   constrained_bin, operation_bin, type_field_bin)
+                                   FilledHole, TryBlock, RaisedOperation, Block, Arm, StoredHandle,
+                                   Clause, Entry, One, Commuting, Let, LetElse, Effectful, Assign,
+                                   Generics, ParameterConstraint, Returning, Unstated, Fresh,
+                                   ParameterReturned, FunctionForm, Variant, TypeBody, Alias, Sum,
+                                   Nominal, Extern, InstanceFunction, Numeric, TypeForm, Operation,
+                                   EffectForm, TestForm, LawForm, SpecForm, Form, FunctionOf,
+                                   TypeOf, EffectOf, TestOf, LawOf, SpecOf, Template, reference_bin,
+                                   atom_bin, parameter_constraint_bin, operation_bin,
+                                   type_field_bin)
 import std.bin
 
-pub type TemplateValue = Value<Int, Spot>
+pub type TemplateValue = Value<Int, BinderPosition>
 
-pub type TemplateType = stored::Type<Int, Slotted>
+pub type TemplateType = stored::Type<Int, EffectSlot>
 
-pub type TemplateRow = Row<Int, Slotted>
+pub type TemplateRow = Row<Int, EffectSlot>
 
-pub type TemplatePattern = stored::Pattern<Int, Spot>
+pub type TemplatePattern = stored::Pattern<Int, BinderPosition>
 
-pub type TemplateExpression = stored::Expression<Int, Slotted, Spot, Note>
+pub type TemplateExpression = stored::Expression<Int, EffectSlot, BinderPosition, Note>
 
-pub type TemplateStatement = stored::Statement<Int, Slotted, Spot, Note>
+pub type TemplateStatement = stored::Statement<Int, EffectSlot, BinderPosition, Note>
 
-type TemplateEntry = Entry<Int, Slotted, Spot, Note>
+type TemplateEntry = Entry<Int, EffectSlot, BinderPosition, Note>
 
-type TemplateField = stored::RecordField<Int, Slotted, Spot, Note>
+type TemplateField = stored::RecordField<Int, EffectSlot, BinderPosition, Note>
 
-/// What a template is written in: the program and module, the item whose calls on values the check
-/// filed under `owner`, the binders in scope, and how many commutable runs the definition has.
-/// `scope` is the member of a run being written, with `within` where its binders start among
-/// `values`; `run` -1 outside every run. `chose` is what the check found of each call on a value,
-/// by `CallSite`; `None` where hashing runs before the check, which leaves each call pending.
-/// `reads` is the place in `values` of each binder a name has been resolved to, in order; `locals`
-/// the binder of each local the item names, by the site of the name.
 pub type Encoder = {
   index: Index,
   module: Int,
   owner: Bytes,
   locals: Map<Int, Int>,
-  values: List<Bound>,
+  values: List<PositionedBinder>,
   type_params: List<Bytes>,
   row_params: List<Bytes>,
   label_params: List<Bytes>,
-  scope: Spot,
+  scope: BinderPosition,
   runs: Int,
-  chose: Option<Map<CallSite, Choice>>,
+  choices: Option<Map<CallSite, Choice>>,
   reads: List<Int>,
 }
 
-/// What a walk built and the encoder it leaves.
 pub type Built<a> = { encoder: Encoder, form: a }
 
-fn no_scope() -> Spot = { run: 0 - 1, member: 0, within: 0 }
+fn no_scope() -> BinderPosition = { run: 0 - 1, member: 0, within: 0 }
 
 pub fn new_encoder(index: Index, module: Int, locals: Map<Int, Int>) -> Encoder =
   {
@@ -112,12 +115,10 @@ pub fn new_encoder(index: Index, module: Int, locals: Map<Int, Int>) -> Encoder 
     label_params: [],
     scope: no_scope(),
     runs: 0,
-    chose: Some(Map::new()),
+    choices: Some(Map::new()),
     reads: [],
   }
 
-/// The template of `body` in `module`, each call on a value read as calling what `chose` holds at
-/// its site under `owner`.
 pub fn node_template(
   index: Index,
   module: Int,
@@ -125,8 +126,11 @@ pub fn node_template(
   chose: Option<Map<CallSite, Choice>>,
   body: NodeBody,
 ) -> Template / {abort.raise} = {
-  let locals = match body { NodeFn(definition) -> item_locals(IFn(definition)), _ -> Map::new() };
-  let encoder = { ..new_encoder(index, module, locals), owner: owner, chose: chose };
+  let locals = match body {
+    NodeFn(definition) -> item_locals(FunctionItem(definition)),
+    _ -> Map::new(),
+  };
+  let encoder = { ..new_encoder(index, module, locals), owner: owner, choices: chose };
   match body {
     NodeFn(definition) -> FunctionOf(function_form(encoder, definition)),
     NodeType(definition) -> TypeOf(type_form(encoder, definition)),
@@ -139,61 +143,63 @@ pub fn test_template(
   module: Int,
   owner: Bytes,
   chose: Option<Map<CallSite, Choice>>,
-  definition: TestDef,
+  definition: TestDefinition,
 ) -> Template / {abort.raise} =
   TestOf(
     test_form(
-      { ..new_encoder(index, module, item_locals(ITest(definition))), owner: owner, chose: chose },
+      {
+        ..new_encoder(index, module, item_locals(TestItem(definition))),
+        owner: owner,
+        choices: chose,
+      },
       definition,
     ),
   )
 
-pub fn law_template(index: Index, module: Int, definition: LawDef) -> Template / {abort.raise} =
-  LawOf(law_form(new_encoder(index, module, item_locals(ILaw(definition))), definition))
+pub fn law_template(
+  index: Index,
+  module: Int,
+  definition: LawDefinition,
+) -> Template / {abort.raise} =
+  LawOf(law_form(new_encoder(index, module, item_locals(LawItem(definition))), definition))
 
 pub fn spec_template(
   index: Index,
   module: Int,
-  owner: FnDef,
+  owner: FnDefinition,
   clause: SpecClause,
 ) -> Template / {abort.raise} =
-  SpecOf(spec_form(new_encoder(index, module, item_locals(IFn(owner))), owner, clause))
+  SpecOf(spec_form(new_encoder(index, module, item_locals(FunctionItem(owner))), owner, clause))
 
-/// The template of the expression `written` in `module` under the binders `params`, as a test's
-/// table and roots are: what it references is all that is read of it.
 pub fn expression_template(
   index: Index,
   module: Int,
-  params: List<Ident>,
-  written: Expr,
+  params: List<Identifier>,
+  written: Expression,
 ) -> TemplateExpression / {abort.raise} =
   expression(
     bind_all(new_encoder(index, module, body_binders(params, written)), params),
     written,
   ).form
 
-// --- Scope -------------------------------------------------------------------------------------
-
-/// Where the next binder stands: within the member being written, if any.
-fn spot_here(encoder: Encoder) -> Spot = {
+fn spot_here(encoder: Encoder) -> BinderPosition = {
   let count = encoder.values.len();
   if encoder.scope.run < 0 { { run: 0 - 1, member: 0, within: count } }
   else { { ..encoder.scope, within: count - encoder.scope.within } }
 }
 
-fn binder_of(encoder: Encoder, name: Ident) -> Int =
+fn binder_of(encoder: Encoder, name: Identifier) -> Int =
   encoder.locals.get(name.span.site).unwrap_or(name.span.site)
 
-fn bind(encoder: Encoder, name: Ident) -> Encoder =
+fn bind(encoder: Encoder, name: Identifier) -> Encoder =
   {
     ..encoder,
-    values: encoder.values.push({ binder: binder_of(encoder, name), spot: spot_here(encoder) }),
+    values: encoder.values.push({ binder: binder_of(encoder, name), position: spot_here(encoder) }),
   }
 
-fn bind_all(encoder: Encoder, names: List<Ident>) -> Encoder = names.fold(encoder, bind)
+fn bind_all(encoder: Encoder, names: List<Identifier>) -> Encoder = names.fold(encoder, bind)
 
-/// Where in `values` the local bound at `binder` is, searching from the last bound.
-fn bound_at(values: List<Bound>, binder: Int) -> Option<Int> / {abort.raise} =
+fn bound_at(values: List<PositionedBinder>, binder: Int) -> Option<Int> / {abort.raise} =
   range(0, values.len()).fold(None, |acc: Option<Int>, i: Int|
     if values.get(i).binder == binder { Some(i) } else { acc })
 
@@ -205,27 +211,15 @@ fn local_read(encoder: Encoder, qname: QName) -> Option<Int> / {abort.raise} =
     }
   }
 
-/// `encoder` having read the binder `qname` names, where it names a local.
 fn read(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} =
   match local_read(encoder, qname) {
     Some(i) -> { ..encoder, reads: encoder.reads.push(i) },
     None -> encoder,
   }
 
-/// `encoder` with the binders of `inner` dropped: what a scope that closes leaves.
-fn closed(inner: Encoder, outer: Encoder) -> Encoder = { ..inner, values: outer.values }
+fn close_scope(inner: Encoder, outer: Encoder) -> Encoder = { ..inner, values: outer.values }
 
-// --- What the emitter writes beside the text ---------------------------------------------------
-
-/// The code the emitter writes for a container a body compares, digests, shows or hands the runtime,
-/// as `==` of two lists walks them with `List::at` and of two maps walks their entries with
-/// `Map::entries`; and for a builtin that builds or walks a list in Ply, as `range` pushes its
-/// items: the operators a body writes it for, by name and as the lexer names their tokens, the
-/// builtins, and the functions of [`prelude_module`] it calls, by their names there. Code that reads
-/// a container back from the runtime also calls `lifts`, as a map read back is built with
-/// `Map::insert`. A body that writes one of those references each of what its code calls, so a load
-/// that reaches the body reaches them, and a check groups them with it where they reach it back.
-pub type WrittenCode = {
+pub type EmittedCode = {
   operators: List<Bytes>,
   tokens: List<Bytes>,
   builtins: List<Bytes>,
@@ -233,7 +227,7 @@ pub type WrittenCode = {
   lifts: List<Bytes>,
 }
 
-pub fn written_code() -> WrittenCode =
+pub fn emitted_code() -> EmittedCode =
   {
     operators: [b"eq", b"ne"],
     tokens: [b"eqeq", b"bangeq"],
@@ -255,42 +249,24 @@ pub fn written_code() -> WrittenCode =
     lifts: [b"Map::insert"],
   }
 
-/// What the code the emitter writes where a body names `name` alone calls, by the functions'
-/// names in [`prelude_module`]: none where it writes none.
-pub fn written_for(name: Bytes) -> List<Bytes> =
-  if written_code().builtins.contains(name) { written_code().calls } else { [] }
+pub fn emitted_calls_for(name: Bytes) -> List<Bytes> =
+  if emitted_code().builtins.contains(name) { emitted_code().calls } else { [] }
 
-/// Whether `name` is a container type a root crosses to or from the runtime through code of the
-/// prelude: a reference naming one, as a type or as the qualifier of a function, carries what that
-/// code calls (`crossed_by`).
 pub fn container_named(name: Bytes) -> Bool = name == list_name() || name == map_name()
 
-/// What the code crossing a container to or from the runtime calls (`written_code`) where a text
-/// of `module` names the container type `name`: a root over one crosses it, at an entry or a
-/// perform, though the text names none of that code.
 pub fn crossed_by(module: Bytes, name: Bytes) -> List<Bytes> =
   if !container_named(name) { [] } else { crossing_calls(module) }
 
-/// What the code crossing a container to or from the runtime calls (`written_code`) where a text of
-/// `module` may cross one: an operation's own type parameter stands for whatever type a perform
-/// picks, a container among them, which the perform's descriptors cross. The prelude's own texts
-/// cross none.
 pub fn crossing_calls(module: Bytes) -> List<Bytes> =
-  if module == prelude_module() { [] } else { written_code().calls.concat(written_code().lifts) }
+  if module == prelude_module() { [] } else { emitted_code().calls.concat(emitted_code().lifts) }
 
 fn module_name(encoder: Encoder) -> Bytes =
-  match encoder.index.mods.at(encoder.module) { Some(found) -> found.name, None -> b"" }
+  match encoder.index.modules.at(encoder.module) { Some(found) -> found.name, None -> b"" }
 
-/// The prelude's functions `called` names, as the nodes they are.
-fn written_nodes(encoder: Encoder, called: List<Bytes>) -> List<Int> =
+fn emitted_call_nodes(encoder: Encoder, called: List<Bytes>) -> List<Int> =
   called.fold([], |acc: List<Int>, name: Bytes|
     match encoder.index.written.get(name) { Some(node) -> acc.push(node), None -> acc })
 
-// --- References --------------------------------------------------------------------------------
-
-/// A local binder wins over everything, and only a bare name can be one. A function of a container
-/// type carries what crossing the container calls (`crossed_by`), however it resolves and whichever
-/// module it is named through: `Map::union` and `map::Map::union` are one reference.
 fn value_of(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
   let value = resolved(encoder, qname);
   match container_of(qname) {
@@ -298,15 +274,13 @@ fn value_of(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
       {
         ..value,
         written: value.written.concat(
-          written_nodes(encoder, crossed_by(module_name(encoder), container)),
+          emitted_call_nodes(encoder, crossed_by(module_name(encoder), container)),
         ),
       },
     None -> value,
   }
 }
 
-/// The container type `qname` names a function of: its qualifier, or the type its name is a
-/// function of where a module qualifies it.
 fn container_of(qname: QName) -> Option<Bytes> / {abort.raise} = {
   let of_member = match member_of(qname.name.name) {
     Some(member) -> if container_named(member.of) { Some(member.of) } else { None },
@@ -321,21 +295,18 @@ fn container_of(qname: QName) -> Option<Bytes> / {abort.raise} = {
 fn resolved(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
   let local = local_read(encoder, qname);
   match local {
-    Some(i) -> { named: Local(encoder.values.get(i).spot), written: [] },
+    Some(i) -> { named: Local(encoder.values.get(i).position), written: [] },
     None -> match value_target(encoder.index, encoder.module, qname) {
       Some(FnTarget(node)) -> { named: Defined(node), written: [] },
-      Some(CtorTarget(constructor)) ->
+      Some(ConstructorTarget(constructor)) ->
         { named: Constructed(constructor.owner, constructor.name), written: [] },
-      // A function of a language type that no module declares is the prelude's, under the one
-      // name it has however it is written.
       None -> {
-        let called = written_nodes(encoder, written_for(qname.name.name));
+        let called = emitted_call_nodes(encoder, emitted_calls_for(qname.name.name));
         match qualifier(qname) {
           Some(qualified) -> if starts_upper(qualified)
               && encoder.index.scopes.get(encoder.module).modules.get(qualified) == None {
             {
               named: Unbound({ module: None, name: member_name(qualified, qname.name.name) }),
-              // An extern function of a declared type, which no node stands for, leads to the type.
               written: match type_target(encoder.index, encoder.module, None, qualified) {
                 Some(of) -> [of],
                 None -> [],
@@ -351,18 +322,13 @@ fn resolved(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
   }
 }
 
-fn constructor_named(encoder: Encoder, qname: QName) -> Named<Int, Spot> / {abort.raise} =
-  match ctor_target(encoder.index, encoder.module, qname) {
-    Some(CtorTarget(constructor)) -> Constructed(constructor.owner, constructor.name),
+fn constructor_named(encoder: Encoder, qname: QName) -> Named<Int, BinderPosition> / {abort.raise} =
+  match constructor_target(encoder.index, encoder.module, qname) {
+    Some(ConstructorTarget(constructor)) -> Constructed(constructor.owner, constructor.name),
     _ -> Unbound({ module: qualifier(qname), name: qname.name.name }),
   }
 
-/// Effects are nominal: the declaration referenced, then the slot the component's enumeration gives
-/// it. What makes that true is the simple name in the declaration's own encoding; its module path
-/// is not, so two modules declaring one effect alike declare one effect. A template's slot is the
-/// declaration's node, which filling finds the slot by, and its sketch, which orders atoms equal in
-/// their bytes.
-fn effect_of(encoder: Encoder, qname: QName) -> Effect<Int, Slotted> / {abort.raise} =
+fn effect_of(encoder: Encoder, qname: QName) -> Effect<Int, EffectSlot> / {abort.raise} =
   match effect_target(encoder.index, encoder.module, qname) {
     Some(node) ->
       Declared(node, {
@@ -375,37 +341,36 @@ fn effect_of(encoder: Encoder, qname: QName) -> Effect<Int, Slotted> / {abort.ra
     None -> EffectUnbound({ module: qualifier(qname), name: qname.name.name }),
   }
 
-/// A resource the signature binds is a level, so renaming the binder is not an edit; a real one
-/// stays a name.
-fn label_of(encoder: Encoder, ident: Ident) -> Label / {abort.raise} =
-  match rposition(encoder.label_params, ident.name) {
+fn label_of(encoder: Encoder, ident: Identifier) -> Label / {abort.raise} =
+  match last_index_of(encoder.label_params, ident.name) {
     Some(level) -> LabelParameter(level),
     None -> LabelName(ident.name),
   }
 
-fn optional_label(encoder: Encoder, ident: Option<Ident>) -> Option<Label> / {abort.raise} =
+fn optional_label(encoder: Encoder, ident: Option<Identifier>) -> Option<Label> / {abort.raise} =
   match ident { None -> None, Some(present) -> Some(label_of(encoder, present)) }
 
-/// A `[*]` clause is not the clause that names no label, so the wildcard is spelled out rather
-/// than shared with the empty case. A `[*t]` clause is not a `[*]` one either: naming the label is
-/// what the body reads, so the binder is part of what the clause is.
-fn clause_label(clause: HandleClause) -> Option<Ident> =
+fn clause_label(clause: HandleClause) -> Option<Identifier> =
   match clause.label_binder {
     Some(binder) -> Some({ name: b"*".concat(binder.name), span: clause.span }),
     None -> if clause.every_label { Some({ name: b"*", span: clause.span }) }
     else { clause.resource },
   }
 
-/// `[*]` is not the absence of a label, so the wildcard is spelled out and hashes apart from it.
-fn atom_label(atom: AtomExpr) -> Option<Ident> =
+fn atom_label(atom: AtomExpression) -> Option<Identifier> =
   if atom.every { Some({ name: b"*", span: atom.span }) } else { atom.resource }
 
-// --- Types -------------------------------------------------------------------------------------
+type ResolvedTypeName = { name: TypeName<Int>, written: List<Int> }
 
-type Typed = { name: TypeName<Int>, written: List<Int> }
-
-fn type_named(encoder: Encoder, qualified: Option<Bytes>, name: Bytes) -> Typed / {abort.raise} = {
-  let parameter = match qualified { None -> rposition(encoder.type_params, name), Some(_) -> None };
+fn resolve_type_name(
+  encoder: Encoder,
+  qualified: Option<Bytes>,
+  name: Bytes,
+) -> ResolvedTypeName / {abort.raise} = {
+  let parameter = match qualified {
+    None -> last_index_of(encoder.type_params, name),
+    Some(_) -> None,
+  };
   match parameter {
     Some(level) -> { name: TypeParameter(level), written: [] },
     None -> match type_target(encoder.index, encoder.module, qualified, name) {
@@ -414,7 +379,7 @@ fn type_named(encoder: Encoder, qualified: Option<Bytes>, name: Bytes) -> Typed 
         {
           name: TypeUnbound({ module: qualified, name: name }),
           written: if qualified == None {
-            written_nodes(encoder, crossed_by(module_name(encoder), name))
+            emitted_call_nodes(encoder, crossed_by(module_name(encoder), name))
           } else { [] },
         },
     },
@@ -423,23 +388,26 @@ fn type_named(encoder: Encoder, qualified: Option<Bytes>, name: Bytes) -> Typed 
 
 fn optional_type(
   encoder: Encoder,
-  written: Option<TypeExpr>,
+  written: Option<TypeExpression>,
 ) -> Option<TemplateType> / {abort.raise} =
   match written { None -> None, Some(present) -> Some(type_template(encoder, present)) }
 
-fn types(encoder: Encoder, written: List<TypeExpr>) -> List<TemplateType> / {abort.raise} =
-  written.map(|each: TypeExpr| type_template(encoder, each))
+fn types(encoder: Encoder, written: List<TypeExpression>) -> List<TemplateType> / {abort.raise} =
+  written.map(|each: TypeExpression| type_template(encoder, each))
 
-pub fn type_template(encoder: Encoder, written: TypeExpr) -> TemplateType / {abort.raise} =
+pub fn type_template(encoder: Encoder, written: TypeExpression) -> TemplateType / {abort.raise} =
   match written {
-    TVar(name) -> {
-      let named = type_named(encoder, None, name.name);
+    VariableTypeExpression(name) -> {
+      let named = resolve_type_name(encoder, None, name.name);
       Applied(named.name, named.written, [])
     },
-    TCon(constructed) -> {
-      let named = type_named(encoder, qualifier(constructed.name), constructed.name.name.name);
+    NamedTypeExpression(constructed) -> {
+      let named = resolve_type_name(
+        encoder,
+        qualifier(constructed.name),
+        constructed.name.name.name,
+      );
       let arguments = types(encoder, constructed.args);
-      // Only a use that fills a label or a row writes them, under a form of its own.
       if constructed.labels.len() == 0 && constructed.rows.len() == 0 {
         Applied(named.name, named.written, arguments)
       } else {
@@ -447,12 +415,12 @@ pub fn type_template(encoder: Encoder, written: TypeExpr) -> TemplateType / {abo
           named.name,
           named.written,
           arguments,
-          constructed.labels.map(|label: Ident| label_of(encoder, label)),
-          constructed.rows.map(|written_row: RowExpr| row(encoder, written_row)),
+          constructed.labels.map(|label: Identifier| label_of(encoder, label)),
+          constructed.rows.map(|written_row: RowExpression| row(encoder, written_row)),
         )
       }
     },
-    TFn(function) ->
+    FunctionTypeExpression(function) ->
       Function(
         types(encoder, function.params),
         type_template(encoder, function.ret),
@@ -460,57 +428,51 @@ pub fn type_template(encoder: Encoder, written: TypeExpr) -> TemplateType / {abo
         function.kept,
         function.once,
       ),
-    // A record type is a map from label to type: its fields stand in their names' order.
-    TRecord(record) ->
+    RecordTypeExpression(record) ->
       Fields(
         by_name(
-          record.fields.map(|field: { name: Ident, ty: TypeExpr }|
+          record.fields.map(|field: { name: Identifier, ty: TypeExpression }|
             { name: field.name.name, field_type: type_template(encoder, field.ty) }),
-          |field: TypeField<Int, Slotted>| field.name,
+          |field: TypeField<Int, EffectSlot>| field.name,
         ),
       ),
-    TUnit(_) -> UnitType,
-    TBad(_) -> UnitType,
+    UnitTypeExpression(_) -> UnitType,
+    InvalidTypeExpression(_) -> UnitType,
   }
 
-/// `members` in the order of their names' encodings, which is where a stored encoding that opens
-/// with a name no other member has sorts each one.
 fn by_name<a>(members: List<a>, name: (a) -> Bytes) -> List<a> / {abort.raise} =
-  in_order(
+  sorted_by_key(
     members.map(|member: a|
       { key: bin::encode(name(member), bin::bytes_bin()), tie: b"", value: member }),
   )
 
-/// A set's members, each beside what it sorts by and what orders those equal in it.
-type Keyed<a> = { key: Bytes, tie: Bytes, value: a }
+type SortKeyed<a> = { key: Bytes, tie: Bytes, value: a }
 
-/// `members` sorted by their keys, then their ties, those equal in both in the order given.
-fn in_order<a>(members: List<Keyed<a>>) -> List<a> / {abort.raise} =
-  members.sort_by(|first: Keyed<a>, second: Keyed<a>|
+fn sorted_by_key<a>(members: List<SortKeyed<a>>) -> List<a> / {abort.raise} =
+  members.sort_by(|first: SortKeyed<a>, second: SortKeyed<a>|
     match compare_values(first.key, second.key) {
       Less -> true,
       Greater -> false,
       Equal -> match compare_values(first.tie, second.tie) { Greater -> false, _ -> true },
-    }).map(|member: Keyed<a>| member.value)
+    }).map(|member: SortKeyed<a>| member.value)
 
-fn optional_row(encoder: Encoder, written: Option<RowExpr>) -> Option<TemplateRow> / {abort.raise} =
+fn optional_row(
+  encoder: Encoder,
+  written: Option<RowExpression>,
+) -> Option<TemplateRow> / {abort.raise} =
   match written { None -> None, Some(present) -> Some(row(encoder, present)) }
 
-/// A row is a set. Its atoms stand in the order of their encodings with nothing known of what they
-/// reference, then of their effects' sketches: the order what they reference is mentioned in, so the
-/// slots an enumeration gives its effects follow no order the text wrote. Filling orders them again
-/// by their stored encodings and deduplicates them.
-fn row(encoder: Encoder, written: RowExpr) -> TemplateRow / {abort.raise} =
+fn row(encoder: Encoder, written: RowExpression) -> TemplateRow / {abort.raise} =
   {
-    atoms: in_order(
-      written.atoms.map(|written_atom: AtomExpr| {
+    atoms: sorted_by_key(
+      written.atoms.map(|written_atom: AtomExpression| {
         let template = atom(encoder, written_atom);
         { key: blank_encoding(template), tie: sketch_of(template), value: template }
       }),
     ),
     tail: match written.tail {
       None -> None,
-      Some(tail) -> match rposition(encoder.row_params, tail.name) {
+      Some(tail) -> match last_index_of(encoder.row_params, tail.name) {
         Some(level) -> Some(RowParameter(level)),
         None -> Some(RowName(tail.name)),
       },
@@ -518,8 +480,8 @@ fn row(encoder: Encoder, written: RowExpr) -> TemplateRow / {abort.raise} =
     bounded: written.tail_bounded,
   }
 
-fn atom(encoder: Encoder, written: AtomExpr) -> Atom<Int, Slotted> / {abort.raise} = {
-  let performed = effect_of(encoder, written.eff);
+fn atom(encoder: Encoder, written: AtomExpression) -> Atom<Int, EffectSlot> / {abort.raise} = {
+  let performed = effect_of(encoder, written.effect_name);
   let label = optional_label(encoder, atom_label(written));
   match written.op {
     None -> Moded(performed, written.mode, label, written.bounded),
@@ -527,40 +489,36 @@ fn atom(encoder: Encoder, written: AtomExpr) -> Atom<Int, Slotted> / {abort.rais
   }
 }
 
-/// `atom`'s stored encoding with nothing known: every reference the definition itself, every slot 0.
-pub fn blank_encoding(atom: Atom<Int, Slotted>) -> Bytes / {abort.raise} =
+pub fn blank_encoding(atom: Atom<Int, EffectSlot>) -> Bytes / {abort.raise} =
   bin::encode(
-    atom.map(reference: |_: Int| Itself, slot: |_: Slotted| 0),
+    atom.map(reference: |_: Int| Itself, slot: |_: EffectSlot| 0),
     atom_bin(reference_bin(), bin::int_bin()),
   )
 
-/// The sketch of the effect `atom` names: what orders atoms equal in their bytes.
-pub fn sketch_of(atom: Atom<Int, Slotted>) -> Bytes =
+pub fn sketch_of(atom: Atom<Int, EffectSlot>) -> Bytes =
   match atom {
     Moded(Declared(_, slot), _, _, _) -> slot.sketch,
     OfOperation(Declared(_, slot), _, _, _) -> slot.sketch,
     _ -> b"",
   }
 
-// --- Literals and patterns ---------------------------------------------------------------------
-
-fn literal(written: Lit) -> Literal / {abort.raise} =
+fn literal(written: SourceLiteral) -> Literal / {abort.raise} =
   match written {
-    LInt(value) -> IntLiteral(value),
-    LFixed(width, bits) -> FixedLiteral(width_index(width).at(0), bits),
-    LWide(width, high, low) -> WideLiteral(width_index(width).at(0), high, low),
-    LBool(value) -> BoolLiteral(value),
-    LStr(text) -> StringLiteral(text),
-    LBytes(content) -> BytesLiteral(content),
-    LEmbedded(digest, size) -> EmbeddedLiteral(digest, size),
-    LFloat(text) -> FloatLiteral(float_bits(text)),
-    LDec(text) -> {
+    LiteralInt(value) -> IntLiteral(value),
+    LiteralFixed(width, bits) -> FixedLiteral(width_index(width).at(0), bits),
+    LiteralWide(width, high, low) -> WideLiteral(width_index(width).at(0), high, low),
+    LiteralBool(value) -> BoolLiteral(value),
+    LiteralString(text) -> StringLiteral(text),
+    LiteralBytes(content) -> BytesLiteral(content),
+    LiteralEmbedded(digest, size) -> EmbeddedLiteral(digest, size),
+    LiteralFloat(text) -> FloatLiteral(float_bits(text)),
+    LiteralDecimal(text) -> {
       let parts = decimal_parts(text);
       DecimalLiteral(parts.mantissa, parts.scale)
     },
-    LChar(value) -> CharLiteral(value),
-    LUnit -> UnitLiteral,
-    LBad -> panic("a placeholder literal reached the hasher"),
+    LiteralChar(value) -> CharLiteral(value),
+    LiteralUnit -> UnitLiteral,
+    LiteralInvalid -> panic("a placeholder literal reached the hasher"),
   }
 
 fn pattern(encoder: Encoder, written: Pattern) -> Built<TemplatePattern> / {abort.raise} =
@@ -576,18 +534,14 @@ fn patterns(
     { encoder: built.encoder, form: acc.form.push(built.form) }
   })
 
-/// `again` is where the binders of an or-pattern's first alternative start, inside a later one: a
-/// variable there is that alternative's binder of its name, written by its level, and binds
-/// nothing more. So one binder stands for a name whichever alternative matched, and which binder
-/// each alternative gives it is part of the form.
 fn pattern_in(
   encoder: Encoder,
   written: Pattern,
   again: Option<Int>,
 ) -> Built<TemplatePattern> / {abort.raise} =
   match written {
-    PWild(_) -> { encoder: encoder, form: Wild },
-    PVar(variable) -> {
+    PatternWildcard(_) -> { encoder: encoder, form: Wild },
+    PatternVariable(variable) -> {
       let earlier = match again {
         None -> None,
         Some(from) -> match bound_at(encoder.values, binder_of(encoder, variable.name)) {
@@ -596,29 +550,29 @@ fn pattern_in(
         },
       };
       match earlier {
-        Some(i) -> { encoder: encoder, form: Again(encoder.values.get(i).spot) },
+        Some(i) -> { encoder: encoder, form: Again(encoder.values.get(i).position) },
         None -> { encoder: bind(encoder, variable.name), form: Bind },
       }
     },
-    PLit(literal_pattern) ->
-      { encoder: encoder, form: LiteralPattern(literal(literal_pattern.lit)) },
-    PRange(range_pattern) ->
+    PatternLiteral(literal_pattern) ->
+      { encoder: encoder, form: LiteralPattern(literal(literal_pattern.literal)) },
+    PatternRange(range_pattern) ->
       {
         encoder: encoder,
         form: RangePattern(literal(range_pattern.lo), literal(range_pattern.hi)),
       },
-    PCtor(constructed) -> {
+    PatternConstructor(constructed) -> {
       let arguments = patterns(encoder, constructed.args, again);
       {
         encoder: arguments.encoder,
         form: ConstructorPattern(constructor_named(encoder, constructed.name), arguments.form),
       }
     },
-    PRecord(record) -> {
+    PatternRecord(record) -> {
       let fields = record.fields.fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<PatternField<Int, Spot>>>, field: { name: Ident, pat: Pattern }| {
-          let built = pattern_in(acc.encoder, field.pat, again);
+        |acc: Built<List<PatternField<Int, BinderPosition>>>, field: { name: Identifier, pattern: Pattern }| {
+          let built = pattern_in(acc.encoder, field.pattern, again);
           {
             encoder: built.encoder,
             form: acc.form.push({ name: field.name.name, pattern: built.form }),
@@ -627,7 +581,7 @@ fn pattern_in(
       );
       { encoder: fields.encoder, form: RecordPattern(fields.form, record.rest) }
     },
-    PList(list) -> {
+    PatternList(list) -> {
       let items = patterns(encoder, list.items, again);
       match list.rest {
         None -> { encoder: items.encoder, form: ListPattern(items.form, None) },
@@ -637,35 +591,37 @@ fn pattern_in(
         },
       }
     },
-    POr(alternatives) -> {
+    PatternOr(alternatives) -> {
       let later = match again { Some(_) -> again, None -> Some(encoder.values.len()) };
-      let built = range(0, alternatives.alts.len()).fold(
+      let built = range(0, alternatives.alternatives.len()).fold(
         { encoder: encoder, form: [] },
         |acc: Built<List<TemplatePattern>>, i: Int| {
-          let alternative = pattern_in(acc.encoder, alternatives.alts.get(i), if i == 0 { again }
-          else { later });
+          let alternative = pattern_in(acc.encoder, alternatives.alternatives.get(i), if i == 0 {
+            again
+          } else { later });
           { encoder: alternative.encoder, form: acc.form.push(alternative.form) }
         },
       );
       { encoder: built.encoder, form: OrPattern(built.form) }
     },
-    PBad(_) -> panic("a placeholder pattern reached the hasher"),
+    PatternInvalid(_) -> panic("a placeholder pattern reached the hasher"),
   }
-
-// --- Expressions -------------------------------------------------------------------------------
 
 fn expressions(
   encoder: Encoder,
-  written: List<Expr>,
+  written: List<Expression>,
 ) -> Built<List<TemplateExpression>> / {abort.raise} =
-  written.fold({ encoder: encoder, form: [] }, |acc: Built<List<TemplateExpression>>, each: Expr| {
-    let built = expression(acc.encoder, each);
-    { encoder: built.encoder, form: acc.form.push(built.form) }
-  })
+  written.fold(
+    { encoder: encoder, form: [] },
+    |acc: Built<List<TemplateExpression>>, each: Expression| {
+      let built = expression(acc.encoder, each);
+      { encoder: built.encoder, form: acc.form.push(built.form) }
+    },
+  )
 
 fn optional_expression(
   encoder: Encoder,
-  written: Option<Expr>,
+  written: Option<Expression>,
 ) -> Built<Option<TemplateExpression>> / {abort.raise} =
   match written {
     None -> { encoder: encoder, form: None },
@@ -675,26 +631,28 @@ fn optional_expression(
     },
   }
 
-fn fields(encoder: Encoder, written: List<RecField>) -> Built<List<TemplateField>> / {abort.raise} =
-  written.fold({ encoder: encoder, form: [] }, |acc: Built<List<TemplateField>>, field: RecField| {
-    let built = expression(acc.encoder, field.value);
-    { encoder: built.encoder, form: acc.form.push({ name: field.name.name, value: built.form }) }
-  })
+fn fields(
+  encoder: Encoder,
+  written: List<RecordLiteralField>,
+) -> Built<List<TemplateField>> / {abort.raise} =
+  written.fold(
+    { encoder: encoder, form: [] },
+    |acc: Built<List<TemplateField>>, field: RecordLiteralField| {
+      let built = expression(acc.encoder, field.value);
+      { encoder: built.encoder, form: acc.form.push({ name: field.name.name, value: built.form }) }
+    },
+  )
 
-/// What a call on a value written `.name(..)` at `at` may call: `m::f` where it names its function
-/// in full, and otherwise every function `X::name` of a module its own can see, in the order of
-/// their program-wide names. Which of them it is the value's type says, which no hash reads. The
-/// note carries where the check placed each argument the call names, which `names` says it does.
 fn callees(
   encoder: Encoder,
   at: Span,
-  name: Ident,
+  name: Identifier,
   names: Bool,
-) -> { callees: Callees<Int, Spot>, note: Note } / {abort.raise} = {
+) -> { callees: Callees<Int, BinderPosition>, note: Note } / {abort.raise} = {
   let site = { owner: encoder.owner, site: at.site };
-  let note = match encoder.chose {
-    Some(chose) -> Picked(Found(choice_at(chose, site))),
-    None -> if names { Picked(Waiting(site)) } else { Picked(Found({ named: [] })) },
+  let note = match encoder.choices {
+    Some(chose) -> CallNote(Known(choice_at(chose, site))),
+    None -> if names { CallNote(Pending(site)) } else { CallNote(Known({ named: [] })) },
   };
   match member_of(name.name) {
     Some(member) ->
@@ -710,7 +668,7 @@ fn callees(
       },
     None -> {
       let index = encoder.index;
-      let found = index.scopes.get(encoder.module).sees.fold(
+      let found = index.scopes.get(encoder.module).visible_modules.fold(
         [],
         |acc: List<Int>, seen: Int|
           match index.items.get(seen).members.get(name.name) {
@@ -727,10 +685,6 @@ fn callees(
   }
 }
 
-/// Where a check files what it found of a call on a value: the item the call is a node of, by its
-/// owner, and the call's site there.
-/// What a check found of each call on a value `sites` record, by `CallSite`. A call of a function a
-/// record holds in a field calls none of a type's.
 pub fn called_at(sites: List<MemberSite>) -> Map<CallSite, Choice> =
   sites.fold(Map::new(), |acc: Map<CallSite, Choice>, site: MemberSite|
     match site.callee {
@@ -738,19 +692,16 @@ pub fn called_at(sites: List<MemberSite>) -> Map<CallSite, Choice> =
       _ -> acc,
     })
 
-/// What the check found of the call at `site` among `chose`: one it says nothing of names no
-/// argument.
 pub fn choice_at(chose: Map<CallSite, Choice>, site: CallSite) -> Choice =
   match chose.get(site) { Some(c) -> c, None -> { named: [] } }
 
-/// The call `value.name[labels](arguments, named)` written at `at`.
 fn on_value(
   encoder: Encoder,
   base: TemplateExpression,
   at: Span,
-  name: Ident,
-  labels: List<Ident>,
-  arguments: List<Expr>,
+  name: Identifier,
+  labels: List<Identifier>,
+  arguments: List<Expression>,
   named: List<NamedArg>,
 ) -> Built<TemplateExpression> / {abort.raise} = {
   let passed = expressions(encoder, arguments);
@@ -770,7 +721,7 @@ fn on_value(
     form: OnValue({
       base: base,
       name: name.name,
-      labels: labels.map(|label: Ident| label_of(encoder, label)),
+      labels: labels.map(|label: Identifier| label_of(encoder, label)),
       arguments: passed.form,
       named: given.form,
       callees: called.callees,
@@ -779,43 +730,40 @@ fn on_value(
   }
 }
 
-fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {abort.raise} =
+fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression> / {abort.raise} =
   match written {
-    // `{ e }` and `e` are the same computation.
-    EBlock(written_block) -> if written_block.stmts.len() == 0 {
+    BlockExpression(written_block) -> if written_block.statements.len() == 0 {
       match written_block.tail {
         Some(tail) -> expression(encoder, tail),
-        None -> block(encoder, written_block.stmts, written_block.tail),
+        None -> block(encoder, written_block.statements, written_block.tail),
       }
-    } else { block(encoder, written_block.stmts, written_block.tail) },
-    ELit(constant) -> { encoder: encoder, form: Constant(literal(constant.lit)) },
-    EHole(_) -> { encoder: encoder, form: Unwritten },
-    EVar(variable) ->
+    } else { block(encoder, written_block.statements, written_block.tail) },
+    LiteralExpression(constant) -> { encoder: encoder, form: Constant(literal(constant.literal)) },
+    HoleExpression(_) -> { encoder: encoder, form: Unwritten },
+    NameExpression(variable) ->
       { encoder: read(encoder, variable.name), form: Variable(value_of(encoder, variable.name)) },
-    EBinary(binary) -> {
+    BinaryExpression(binary) -> {
       let left = expression(encoder, binary.lhs);
       let right = expression(left.encoder, binary.rhs);
-      let called = if written_code().operators.contains(binary.op) {
-        written_nodes(encoder, written_code().calls)
+      let called = if emitted_code().operators.contains(binary.op) {
+        emitted_call_nodes(encoder, emitted_code().calls)
       } else { [] };
       { encoder: right.encoder, form: Binary(binary.op, left.form, right.form, called) }
     },
-    EUnary(unary) -> {
+    UnaryExpression(unary) -> {
       let operand = expression(encoder, unary.operand);
       { encoder: operand.encoder, form: Unary(unary.op, operand.form) }
     },
-    ELambda(lambda) -> {
+    LambdaExpression(lambda) -> {
       let annotations = lambda.params.map(|parameter: Param| optional_type(encoder, parameter.ty));
       let body = expression(
         bind_all(encoder, lambda.params.map(|parameter: Param| parameter.name)),
         lambda.body,
       );
-      { encoder: closed(body.encoder, encoder), form: Lambda(annotations, body.form) }
+      { encoder: close_scope(body.encoder, encoder), form: Lambda(annotations, body.form) }
     },
-    EApp(application) -> match application.func {
-      // A call on a value: its named arguments are the call's to fill, and its callee the
-      // value's type's to say, so every function it may be is part of what the call is.
-      EField(field) -> {
+    CallExpression(application) -> match application.function {
+      FieldExpression(field) -> {
         let base = expression(encoder, field.base);
         on_value(
           base.encoder,
@@ -828,77 +776,75 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
         )
       },
       _ -> {
-        let called = expression(encoder, application.func);
+        let called = expression(encoder, application.function);
         let arguments = expressions(called.encoder, application.args);
         {
           encoder: arguments.encoder,
           form: Call(
             called.form,
             arguments.form,
-            application.labels.map(|label: Ident| label_of(encoder, label)),
+            application.labels.map(|label: Identifier| label_of(encoder, label)),
           ),
         }
       },
     },
-    EIf(conditional) -> {
+    IfExpression(conditional) -> {
       let condition = expression(encoder, conditional.cond);
       let then_branch = expression(condition.encoder, conditional.then_branch);
       let else_branch = expression(then_branch.encoder, conditional.else_branch);
       { encoder: else_branch.encoder, form: If(condition.form, then_branch.form, else_branch.form) }
     },
-    EMatch(matched) -> {
+    MatchExpression(matched) -> {
       let scrutinee = expression(encoder, matched.scrutinee);
       let arms = matched.arms.fold(
         { encoder: scrutinee.encoder, form: [] },
-        |acc: Built<List<Arm<Int, Slotted, Spot, Note>>>, arm: MatchArm| {
-          let bound = pattern(acc.encoder, arm.pat);
+        |acc: Built<List<Arm<Int, EffectSlot, BinderPosition, Note>>>, arm: MatchArm| {
+          let bound = pattern(acc.encoder, arm.pattern);
           let guard = optional_expression(bound.encoder, arm.guard);
           let body = expression(guard.encoder, arm.body);
           {
-            encoder: closed(body.encoder, acc.encoder),
+            encoder: close_scope(body.encoder, acc.encoder),
             form: acc.form.push({ pattern: bound.form, guard: guard.form, body: body.form }),
           }
         },
       );
       { encoder: arms.encoder, form: Match(scrutinee.form, arms.form) }
     },
-    ERecord(record) -> {
+    RecordExpression(record) -> {
       let built = fields(encoder, record.fields);
       { encoder: built.encoder, form: Record(built.form) }
     },
-    // The update is the definition, not the literal it expands to: its meaning follows the base's type.
-    ERecordUpdate(update) -> {
+    RecordUpdateExpression(update) -> {
       let base = expression(encoder, update.base);
       let built = fields(base.encoder, update.fields);
       { encoder: built.encoder, form: RecordUpdate(base.form, built.form) }
     },
-    ETry(_) -> panic("`e?` is expanded away before hashing"),
-    EField(field) -> {
+    PropagateExpression(_) -> panic("`e?` is expanded away before hashing"),
+    FieldExpression(field) -> {
       let base = expression(encoder, field.base);
       { encoder: base.encoder, form: Field(base.form, field.field.name) }
     },
-    EList(list) -> {
+    ListExpression(list) -> {
       let items = expressions(encoder, list.items);
       { encoder: items.encoder, form: ListOf(items.form) }
     },
-    EPerform(perform) -> match local_read(encoder, perform.eff) {
+    PerformExpression(perform) -> match local_read(encoder, perform.effect_name) {
       None -> {
         let arguments = expressions(encoder, perform.args);
         {
           encoder: arguments.encoder,
           form: Perform(
-            effect_of(encoder, perform.eff),
+            effect_of(encoder, perform.effect_name),
             perform.op.name,
             optional_label(encoder, perform.resource),
             arguments.form,
           ),
         }
       },
-      // On a binding it is a call on the value the binding holds.
       Some(i) ->
         on_value(
           { ..encoder, reads: encoder.reads.push(i) },
-          Variable({ named: Local(encoder.values.get(i).spot), written: [] }),
+          Variable({ named: Local(encoder.values.get(i).position), written: [] }),
           perform.span,
           perform.op,
           match perform.resource { Some(resource) -> [resource], None -> [] },
@@ -906,12 +852,10 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
           [],
         ),
     },
-    EHandle(handler) -> {
-      // The first values are read where the `handle` stands, before its body, each seeing the
-      // variables above it; the clauses and the `return` see the variables, the body does not.
+    HandleExpression(handler) -> {
       let variables = handler.vars.fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<stored::HandlerVariable<Int, Slotted, Spot, Note>>>, variable: HandlerVar| {
+        |acc: Built<List<stored::HandlerVariable<Int, EffectSlot, BinderPosition, Note>>>, variable: HandlerVar| {
           let first = expression(acc.encoder, variable.init);
           {
             encoder: bind(first.encoder, variable.name),
@@ -922,9 +866,9 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
           }
         },
       );
-      let body = expression(closed(variables.encoder, encoder), handler.body);
+      let body = expression(close_scope(variables.encoder, encoder), handler.body);
       let held = bind_all(
-        closed(body.encoder, encoder),
+        close_scope(body.encoder, encoder),
         handler.vars.map(|variable: HandlerVar| variable.name),
       );
       let clauses = handled_clauses(held, handler.clauses);
@@ -932,11 +876,11 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
         None -> { encoder: clauses.encoder, form: None },
         Some(clause) -> {
           let built = expression(bind(clauses.encoder, clause.binder), clause.body);
-          { encoder: closed(built.encoder, clauses.encoder), form: Some(built.form) }
+          { encoder: close_scope(built.encoder, clauses.encoder), form: Some(built.form) }
         },
       };
       {
-        encoder: closed(returned.encoder, encoder),
+        encoder: close_scope(returned.encoder, encoder),
         form: Handle({
           variables: variables.form,
           body: body.form,
@@ -945,30 +889,29 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
         }),
       }
     },
-    EWithHold(hold) -> {
+    WithHoldExpression(hold) -> {
       let acquire = expression(encoder, hold.acquire);
       let release = expression(acquire.encoder, hold.release);
       let body = expression(bind(release.encoder, hold.binder), hold.body);
       {
-        encoder: closed(body.encoder, encoder),
+        encoder: close_scope(body.encoder, encoder),
         form: WithHold(hold.resource.name, acquire.form, release.form, body.form),
       }
     },
-    ESimulate(simulated) -> {
+    SimulateExpression(simulated) -> {
       let body = expression(encoder, simulated.body);
       { encoder: body.encoder, form: Simulate(body.form) }
     },
-    EParallel(parallel_branches) -> {
+    ParallelExpression(parallel_branches) -> {
       let branches = expressions(encoder, parallel_branches.branches);
       { encoder: branches.encoder, form: Parallel(branches.form) }
     },
-    // Apart from the call it stands for, which has another type and another row.
-    ETagged(tagged) -> if tagged.holes.len() == 0 {
+    TaggedLiteralExpression(tagged) -> if tagged.holes.len() == 0 {
       { encoder: encoder, form: Tagged(value_of(encoder, tagged_parser(tagged)), tagged.text) }
     } else {
       let holes = tagged.holes.fold(
         { encoder: encoder, form: [] },
-        |acc: Built<List<FilledHole<Int, Slotted, Spot, Note>>>, hole: Hole| {
+        |acc: Built<List<FilledHole<Int, EffectSlot, BinderPosition, Note>>>, hole: Hole| {
           let built = expression(acc.encoder, hole.value);
           { encoder: built.encoder, form: acc.form.push({ value: built.form, text: hole.text }) }
         },
@@ -983,9 +926,8 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
         ),
       }
     },
-    EBad(_) -> panic("a placeholder reached the hasher"),
-    // A `try` that names no raise answers the one its body's row names, which the body settles.
-    ETryBlock(tried) -> {
+    InvalidExpression(_) -> panic("a placeholder reached the hasher"),
+    TryBlockExpression(tried) -> {
       let body = expression(encoder, tried.body);
       {
         encoder: body.encoder,
@@ -993,7 +935,7 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
           match tried.raise {
             None -> None,
             Some(raised) ->
-              Some({ effect: effect_of(encoder, raised.eff), operation: raised.op.name }),
+              Some({ effect: effect_of(encoder, raised.effect_name), operation: raised.op.name }),
           },
           body.form,
         ),
@@ -1004,21 +946,20 @@ fn expression(encoder: Encoder, written: Expr) -> Built<TemplateExpression> / {a
 fn handled_clauses(
   encoder: Encoder,
   clauses: List<HandleClause>,
-) -> Built<List<Clause<Int, Slotted, Spot, Note>>> / {abort.raise} =
+) -> Built<List<Clause<Int, EffectSlot, BinderPosition, Note>>> / {abort.raise} =
   clauses.fold(
     { encoder: encoder, form: [] },
-    |acc: Built<List<Clause<Int, Slotted, Spot, Note>>>, clause: HandleClause| {
+    |acc: Built<List<Clause<Int, EffectSlot, BinderPosition, Note>>>, clause: HandleClause| {
       let bound = bind_all(acc.encoder, clause.params);
-      // Whether a clause binds a continuation is part of what the definition is.
       let resumed = match clause.resume {
         None -> bound,
         Some(continuation) -> bind(bound, continuation),
       };
       let body = expression(resumed, clause.body);
       {
-        encoder: closed(body.encoder, acc.encoder),
+        encoder: close_scope(body.encoder, acc.encoder),
         form: acc.form.push({
-          effect: effect_of(acc.encoder, clause.eff),
+          effect: effect_of(acc.encoder, clause.effect_name),
           operation: clause.op.name,
           label: optional_label(acc.encoder, clause_label(clause)),
           parameters: clause.params.len(),
@@ -1031,23 +972,20 @@ fn handled_clauses(
 
 fn block(
   encoder: Encoder,
-  statements: List<Stmt>,
-  tail: Option<Expr>,
+  statements: List<Statement>,
+  tail: Option<Expression>,
 ) -> Built<TemplateExpression> / {abort.raise} = {
   let entries = entries_in_order(encoder, statements);
   let last = optional_expression(entries.encoder, tail);
-  { encoder: closed(last.encoder, encoder), form: Block(entries.form, last.form) }
+  { encoder: close_scope(last.encoder, encoder), form: Block(entries.form, last.form) }
 }
 
-/// Each statement in turn, consecutive `let`s that commute as one run. A run is ordered where it
-/// stands, after the statements before it, so what it reads of an earlier `let` of its block is
-/// that binder's level and never its name.
 fn entries_in_order(
   encoder: Encoder,
-  statements: List<Stmt>,
+  statements: List<Statement>,
 ) -> Built<List<TemplateEntry>> / {abort.raise} = {
   let count = statements.len();
-  let one = |built: Built<List<TemplateEntry>>, written: Stmt| {
+  let one = |built: Built<List<TemplateEntry>>, written: Statement| {
     let alone = statement(built.encoder, written);
     { encoder: alone.encoder, form: built.form.push(One(alone.form)) }
   };
@@ -1079,14 +1017,11 @@ fn entries_in_order(
   ).built
 }
 
-/// Whether a member of `members`, written in turn from `encoder`, reads a binder a member before
-/// it binds: only `let`s that read none of each other's binders commute. What a name reads is the
-/// binder it resolves to, so a binder of the value's own shadows a member's of its name.
-fn reads_run(encoder: Encoder, members: List<Stmt>) -> Bool / {abort.raise} = {
+fn reads_run(encoder: Encoder, members: List<Statement>) -> Bool / {abort.raise} = {
   let from = encoder.values.len();
   members.fold(
     { encoder: encoder, read: false },
-    |acc: { encoder: Encoder, read: Bool }, member: Stmt| {
+    |acc: { encoder: Encoder, read: Bool }, member: Statement| {
       let bound = acc.encoder.values.len();
       let before = acc.encoder.reads.len();
       let built = statement(acc.encoder, member);
@@ -1099,12 +1034,9 @@ fn reads_run(encoder: Encoder, members: List<Stmt>) -> Bool / {abort.raise} = {
   ).read
 }
 
-/// The members of a run, each written from where the run starts: filling orders them by their
-/// encodings, ties in source order, and puts each one's binders after those of the members
-/// before it.
 fn commuting(
   encoder: Encoder,
-  statements: List<Stmt>,
+  statements: List<Statement>,
   from: Int,
   to: Int,
 ) -> Built<TemplateEntry> / {abort.raise} = {
@@ -1112,7 +1044,7 @@ fn commuting(
   let start = encoder.values.len();
   let members = range(from, to).fold(
     { encoder: { ..encoder, runs: id + 1 }, statements: [], binders: [], bound: [] },
-    |acc: { encoder: Encoder, statements: List<TemplateStatement>, binders: List<Int>, bound: List<Bound> }, i: Int| {
+    |acc: { encoder: Encoder, statements: List<TemplateStatement>, binders: List<Int>, bound: List<PositionedBinder> }, i: Int| {
       let inner = statement(
         {
           ..acc.encoder,
@@ -1134,106 +1066,100 @@ fn commuting(
   {
     encoder: { ..members.encoder, values: encoder.values.concat(members.bound) },
     form: Commuting(
-      Ran({ id: id, base: spot_here(encoder), binders: members.binders }),
+      RunNote({ id: id, base: spot_here(encoder), binders: members.binders }),
       members.statements,
     ),
   }
 }
 
-fn statement(encoder: Encoder, written: Stmt) -> Built<TemplateStatement> / {abort.raise} =
+fn statement(encoder: Encoder, written: Statement) -> Built<TemplateStatement> / {abort.raise} =
   match written {
-    SLet(binding) -> {
+    LetStatement(binding) -> {
       let value = expression(encoder, binding.value);
-      let bound = pattern(value.encoder, binding.pat);
+      let bound = pattern(value.encoder, binding.pattern);
       {
         encoder: bound.encoder,
         form: Let(optional_type(encoder, binding.ty), value.form, bound.form),
       }
     },
-    SLetElse(binding) -> {
+    LetElseStatement(binding) -> {
       let value = expression(encoder, binding.value);
-      let bound = pattern(value.encoder, binding.pat);
+      let bound = pattern(value.encoder, binding.pattern);
       let fallback = expression(bound.encoder, binding.fallback);
       {
         encoder: fallback.encoder,
         form: LetElse(optional_type(encoder, binding.ty), value.form, bound.form, fallback.form),
       }
     },
-    SExpr(effectful) -> {
+    ExpressionStatement(effectful) -> {
       let built = expression(encoder, effectful);
       { encoder: built.encoder, form: Effectful(built.form) }
     },
-    SAssign(assignment) -> {
+    AssignmentStatement(assignment) -> {
       let value = expression(read(encoder, bare(assignment.name)), assignment.value);
       { encoder: value.encoder, form: Assign(value_of(encoder, bare(assignment.name)), value.form) }
     },
   }
 
-/// How many consecutive `let`s from `from` have pure values: what may commute, fewer than two
-/// being no run.
-fn pure_run(statements: List<Stmt>, from: Int) -> Int / {abort.raise} = {
+fn pure_run(statements: List<Statement>, from: Int) -> Int / {abort.raise} = {
   let count = statements.len();
   let to = iterate(from, count - from + 1, |at: Int|
     if at >= count { Stop(at) } else {
       match statements.get(at) {
-        SLet(binding) -> if is_pure(binding.value) { Continue(at + 1) } else { Stop(at) },
+        LetStatement(binding) -> if is_pure(binding.value) { Continue(at + 1) } else { Stop(at) },
         _ -> Stop(at),
       }
     });
   if to - from < 2 { 0 } else { to - from }
 }
 
-// --- Items -------------------------------------------------------------------------------------
-
 fn with_generics(
   encoder: Encoder,
-  types: List<Ident>,
-  rows: List<Ident>,
-  labels: List<Ident>,
+  types: List<Identifier>,
+  rows: List<Identifier>,
+  labels: List<Identifier>,
 ) -> Encoder =
   {
     ..encoder,
-    type_params: encoder.type_params.concat(types.map(|ident: Ident| ident.name)),
-    row_params: encoder.row_params.concat(rows.map(|ident: Ident| ident.name)),
-    label_params: encoder.label_params.concat(labels.map(|ident: Ident| ident.name)),
+    type_params: encoder.type_params.concat(types.map(|ident: Identifier| ident.name)),
+    row_params: encoder.row_params.concat(rows.map(|ident: Identifier| ident.name)),
+    label_params: encoder.label_params.concat(labels.map(|ident: Identifier| ident.name)),
   }
 
 fn generics_of(
-  types: List<Ident>,
-  rows: List<Ident>,
-  labels: List<Ident>,
-  kept: List<Ident>,
+  types: List<Identifier>,
+  rows: List<Identifier>,
+  labels: List<Identifier>,
+  kept: List<Identifier>,
 ) -> Generics =
   { types: types.len(), rows: rows.len(), labels: labels.len(), kept: levels_of(types, kept) }
 
-/// The places among `names` of the ones `marked` holds.
-fn levels_of(names: List<Ident>, marked: List<Ident>) -> List<Int> = {
-  let held = marked.map(|ident: Ident| ident.name);
+fn levels_of(names: List<Identifier>, marked: List<Identifier>) -> List<Int> = {
+  let held = marked.map(|ident: Identifier| ident.name);
   range(0, names.len()).filter(|i: Int|
     match names.at(i) { Some(n) -> held.contains(n.name), None -> false })
 }
 
-/// Sorted and deduplicated: the same two constraints in the other order are one definition. One over
-/// a name no type parameter has constrains nothing.
-fn constraints(encoder: Encoder, written: List<Constraint>) -> List<Constrained> / {abort.raise} =
-  in_order(
-    written.fold([], |acc: List<Constrained>, constraint: Constraint|
-      match rposition(encoder.type_params, constraint.param.name) {
+fn constraints(
+  encoder: Encoder,
+  written: List<Constraint>,
+) -> List<ParameterConstraint> / {abort.raise} =
+  sorted_by_key(
+    written.fold([], |acc: List<ParameterConstraint>, constraint: Constraint|
+      match last_index_of(encoder.type_params, constraint.param.name) {
         Some(level) -> acc.push({ level: level, deriver: constraint.deriver }),
         None -> acc,
-      }).map(|constrained: Constrained|
-      { key: bin::encode(constrained, constrained_bin()), tie: b"", value: constrained }),
-  ).fold([], |acc: List<Constrained>, constrained: Constrained|
+      }).map(|constrained: ParameterConstraint|
+      { key: bin::encode(constrained, parameter_constraint_bin()), tie: b"", value: constrained }),
+  ).fold([], |acc: List<ParameterConstraint>, constrained: ParameterConstraint|
     if acc.last() == Some(constrained) { acc } else { acc.push(constrained) })
 
-/// The levels of the type parameters `identity` constrains in the schema `definition` was made of,
-/// where a schema made it.
-fn identities(encoder: Encoder, definition: FnDef) -> List<Int> / {abort.raise} =
-  match schema_of(encoder.index.mods.get(encoder.module).module, definition) {
+fn identities(encoder: Encoder, definition: FnDefinition) -> List<Int> / {abort.raise} =
+  match schema_of(encoder.index.modules.get(encoder.module).module, definition) {
     None -> [],
     Some(schema) -> {
-      let levels = schema.identities.fold([], |acc: List<Int>, ident: Ident|
-        match rposition(encoder.type_params, ident.name) {
+      let levels = schema.identities.fold([], |acc: List<Int>, ident: Identifier|
+        match last_index_of(encoder.type_params, ident.name) {
           Some(level) -> acc.push(level),
           None -> acc,
         });
@@ -1242,8 +1168,7 @@ fn identities(encoder: Encoder, definition: FnDef) -> List<Int> / {abort.raise} 
     },
   }
 
-/// A `returns` clause names a parameter by its position, so renaming one moves nothing.
-fn returning(definition: FnDef) -> Returning / {abort.raise} =
+fn returning(definition: FnDefinition) -> Returning / {abort.raise} =
   match definition.returns {
     None -> Unstated,
     Some(ReturnsFresh(_)) -> Fresh,
@@ -1256,14 +1181,13 @@ fn returning(definition: FnDef) -> Returning / {abort.raise} =
 
 fn function_form(
   encoder: Encoder,
-  definition: FnDef,
-) -> FunctionForm<Int, Slotted, Spot, Note> / {abort.raise} = {
+  definition: FnDefinition,
+) -> FunctionForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} = {
   let generics = definition.generics;
   let generic = with_generics(encoder, generics.types, generics.effects, generics.labels);
-  // Before the parameter names are bound: a default is closed.
   let parameters = definition.params.fold(
     { encoder: generic, form: [] },
-    |acc: Built<List<stored::Parameter<Int, Slotted, Spot, Note>>>, parameter: Param| {
+    |acc: Built<List<stored::Parameter<Int, EffectSlot, BinderPosition, Note>>>, parameter: Param| {
       let default_value = optional_expression(acc.encoder, parameter.default);
       {
         encoder: default_value.encoder,
@@ -1280,7 +1204,6 @@ fn function_form(
     parameters.encoder,
     definition.params.map(|parameter: Param| parameter.name),
   );
-  // A stated measure decides the definition's verdict, so it is part of what was written.
   let measure = optional_expression(bound, definition.decreases);
   let body = expression(measure.encoder, definition.body);
   {
@@ -1292,60 +1215,47 @@ fn function_form(
     identities: identities(generic, definition),
     returns: returning(definition),
     decreases: measure.form,
-    // A `const` publishes no raise its body can make, so its callers read another definition.
     constant: definition.constant != None,
     body: body.form,
   }
 }
 
-/// A sum and a `new` record are nominal and an alias is transparent, exactly as the checker has
-/// them: `conv_type` gives a sum a `TyCon` and a `new` record a `TyNominal` under its name, which
-/// `unify_structural` compares by name, and expands an alias in place, so two aliases of one
-/// expansion are one type there and must be one type here. The name is the simple one: a module
-/// path is no part of an identity, so vendoring a module moves nothing.
 fn type_form(
   encoder: Encoder,
-  definition: TypeDef,
-) -> TypeForm<Int, Slotted, Spot> / {abort.raise} = {
+  definition: TypeDefinition,
+) -> TypeForm<Int, EffectSlot, BinderPosition> / {abort.raise} = {
   let generics = definition.generics;
   let inner = with_generics(encoder, generics.types, generics.effects, generics.labels);
-  let unqualified = |name: Ident| { module: None, name: name, span: name.span };
+  let unqualified = |name: Identifier| { module: None, name: name, span: name.span };
   let items = inner.index.items.get(inner.module);
   {
     generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
     over: generics.effects.len() > 0 || generics.labels.len() > 0,
-    // What a use of the type must meet is part of what the type is, as it is of a `fn`.
     constraints: constraints(inner, definition.constraints),
     body: match definition.body {
-      TDAlias(aliased) -> Alias(type_template(inner, aliased)),
-      TDSum(variants) ->
+      AliasBody(aliased) -> Alias(type_template(inner, aliased)),
+      SumBody(variants) ->
         Sum(
           definition.name.name,
-          variants.map(|variant: VariantDef|
+          variants.map(|variant: VariantDefinition|
             { name: variant.name.name, fields: types(inner, variant.fields) }),
         ),
-      TDNominal(wrapped) -> Nominal(definition.name.name, type_template(inner, wrapped)),
-      TDExtern -> Extern(definition.name.name),
+      NominalBody(wrapped) -> Nominal(definition.name.name, type_template(inner, wrapped)),
+      ExternBody -> Extern(definition.name.name),
     },
-    // Unlike `pub`, `opaque` refuses bodies that name nothing of the type's: a literal where a
-    // closed record is expected. Only the type's own hash reaches each of them.
     opaque: definition.opaque != None,
-    // What a value of the type compares and shows through, and what each satisfies, is part of
-    // what the type is: each function is a reference, so the type's hash moves when the function
-    // it names does.
     through: match items.instances.get(definition.name.name) {
       None -> [],
       Some(stated) ->
-        stated.filter(|instance: InstanceDef| instance.kind != NHost).map(
-          |instance: InstanceDef|
+        stated.filter(|instance: InstanceDefinition| instance.kind != HostInstance).map(
+          |instance: InstanceDefinition|
             { kind: instance.kind, by: value_of(inner, unqualified(instance.by)) },
         ),
     },
-    // In the operations' own order, so the order a module wrote them in moves nothing.
     numerics: match items.numerics.get(definition.name.name) {
       None -> [],
       Some(arithmetic) ->
-        numeric_ops().fold([], |acc: List<Numeric<Int, Spot>>, operation: Bytes|
+        numeric_ops().fold([], |acc: List<Numeric<Int, BinderPosition>>, operation: Bytes|
           match numeric_by(arithmetic, operation) {
             None -> acc,
             Some(function) ->
@@ -1355,89 +1265,89 @@ fn type_form(
   }
 }
 
-/// An effect is nominal: it is the declaration this name declares, not a shape another declaration
-/// could match. Two effects differing only in their names are two effects, so the name is in its
-/// form: a published row names its atoms' effects, and nothing else would make a hash pin those
-/// names. The name is the simple one, so the same declaration vendored under another path is still
-/// that declaration. Operations are looked up by name, so they stand in their names' order. Its real
-/// handler is a reference, so every definition that performs the effect moves with it, and a load
-/// reads it wherever it reads the effect.
 fn effect_form(
   encoder: Encoder,
-  definition: EffectDef,
-) -> EffectForm<Int, Slotted, Spot> / {abort.raise} =
+  definition: EffectDefinition,
+) -> EffectForm<Int, EffectSlot, BinderPosition> / {abort.raise} =
   {
     name: definition.name.name,
     nondet: definition.is_nondet,
     operations: by_name(
-      definition.ops.map(|operation: OpDef| operation_form(encoder, operation)),
-      |operation: Operation<Int, Slotted>| operation.name,
+      definition.operations.map(|operation: OpDefinition| operation_form(encoder, operation)),
+      |operation: Operation<Int, EffectSlot>| operation.name,
     ),
     served: match encoder.index.items.get(encoder.module).instances.get(definition.name.name) {
       None -> None,
       Some(stated) ->
-        stated.fold(None, |found: Option<TemplateValue>, instance: InstanceDef|
-          if instance.kind != NHost { found } else {
+        stated.fold(None, |found: Option<TemplateValue>, instance: InstanceDefinition|
+          if instance.kind != HostInstance { found } else {
             Some(value_of(encoder, { module: None, name: instance.by, span: instance.by.span }))
           }),
     },
   }
 
-/// An operation's own type parameters each carry what crossing a container calls (`crossing_calls`).
-fn operation_form(encoder: Encoder, operation: OpDef) -> Operation<Int, Slotted> / {abort.raise} = {
+fn operation_form(
+  encoder: Encoder,
+  operation: OpDefinition,
+) -> Operation<Int, EffectSlot> / {abort.raise} = {
   let inner = {
     ..encoder,
-    type_params: encoder.type_params.concat(operation.ty_params.map(|ident: Ident| ident.name)),
+    type_params: encoder.type_params.concat(
+      operation.type_params.map(|ident: Identifier| ident.name),
+    ),
   };
   let own = encoder.type_params.len();
-  let written = written_nodes(encoder, crossing_calls(module_name(encoder)));
-  let carried = |t: TemplateType| own_carrying(t, own, written);
+  let written = emitted_call_nodes(encoder, crossing_calls(module_name(encoder)));
+  let carried = |t: TemplateType| with_marshalling_calls(t, own, written);
   {
     name: operation.name.name,
     mode: operation.mode,
     resource: operation.resource_param,
-    types: operation.ty_params.len(),
+    types: operation.type_params.len(),
     parameters: types(inner, operation.params).map(carried),
     kept: operation.kept,
     returned: carried(type_template(inner, operation.ret)),
   }
 }
 
-/// `t` with each type parameter of a level from `own` carrying `written` besides what it carried.
-fn own_carrying(t: TemplateType, own: Int, written: List<Int>) -> TemplateType =
+fn with_marshalling_calls(t: TemplateType, own: Int, written: List<Int>) -> TemplateType =
   match t {
     Applied(name, w, args) -> {
       let carries = match name { TypeParameter(level) -> level >= own, _ -> false };
       Applied(
         name,
         if carries { w.concat(written) } else { w },
-        args.map(|a: TemplateType| own_carrying(a, own, written)),
+        args.map(|a: TemplateType| with_marshalling_calls(a, own, written)),
       )
     },
     AppliedOver(name, w, args, labels, rows) ->
-      AppliedOver(name, w, args.map(|a: TemplateType| own_carrying(a, own, written)), labels, rows),
+      AppliedOver(
+        name,
+        w,
+        args.map(|a: TemplateType| with_marshalling_calls(a, own, written)),
+        labels,
+        rows,
+      ),
     Function(params, ret, row, kept, once) ->
       Function(
-        params.map(|p: TemplateType| own_carrying(p, own, written)),
-        own_carrying(ret, own, written),
+        params.map(|p: TemplateType| with_marshalling_calls(p, own, written)),
+        with_marshalling_calls(ret, own, written),
         row,
         kept,
         once,
       ),
     Fields(fields) ->
       Fields(
-        fields.map(|f: TypeField<Int, Slotted>|
-          { ..f, field_type: own_carrying(f.field_type, own, written) }),
+        fields.map(|f: TypeField<Int, EffectSlot>|
+          { ..f, field_type: with_marshalling_calls(f.field_type, own, written) }),
       ),
     UnitType -> UnitType,
   }
 
-/// A test over cases is what one case runs: the case's type and the body over it. Its table and
-/// its label are no part of that, so a case added to the table moves no other case's hash.
 fn test_form(
   encoder: Encoder,
-  definition: TestDef,
-) -> TestForm<Int, Slotted, Spot, Note> / {abort.raise} =
+  definition: TestDefinition,
+) -> TestForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} =
   match definition.cases {
     None ->
       {
@@ -1453,16 +1363,15 @@ fn test_form(
       },
   }
 
-/// A law's binder types are part of its identity; their names are levels like any other binder.
 fn law_form(
   encoder: Encoder,
-  definition: LawDef,
-) -> LawForm<Int, Slotted, Spot, Note> / {abort.raise} = {
+  definition: LawDefinition,
+) -> LawForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} = {
   let bound = bind_all(encoder, definition.binders.map(|binder: Binder| binder.name));
   let guard = optional_expression(bound, definition.guard);
   {
     binders: definition.binders.map(|binder: Binder| type_template(encoder, binder.ty)),
-    identities: definition.identities.map(|ident: Ident| ident.name).sort().fold(
+    identities: definition.identities.map(|ident: Identifier| ident.name).sort().fold(
       [],
       |acc: List<Bytes>, name: Bytes| if acc.last() == Some(name) { acc } else { acc.push(name) },
     ),
@@ -1471,19 +1380,17 @@ fn law_form(
   }
 }
 
-/// In its owner's scope: generics, parameters, `result` for an `ensures`, cost names for a `cost`
-/// and space names for a `space`. Parameter defaults are not part of it.
 fn spec_form(
   encoder: Encoder,
-  owner: FnDef,
+  owner: FnDefinition,
   clause: SpecClause,
-) -> SpecForm<Int, Slotted, Spot, Note> / {abort.raise} = {
+) -> SpecForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} = {
   let generics = owner.generics;
   let bound = bind_all(
     with_generics(encoder, generics.types, generics.effects, generics.labels),
     owner.params.map(|parameter: Param| parameter.name),
   );
-  let named = |names: List<Option<Ident>>| {
+  let named = |names: List<Option<Identifier>>| {
     let places = range(0, names.len()).filter(|i: Int| names.get(i) != None);
     {
       encoder: places.fold(bound, |acc: Encoder, i: Int|
@@ -1492,85 +1399,80 @@ fn spec_form(
     }
   };
   let scoped = match clause.kind {
-    SEnsures -> { encoder: bind(bound, { name: result_name(), span: clause.span }), form: None },
-    SRequires -> { encoder: bound, form: None },
-    // A `space` over no parameter that names its space binds none, as one over none named does.
-    SSpace -> {
+    EnsuresClause ->
+      { encoder: bind(bound, { name: result_name(), span: clause.span }), form: None },
+    RequiresClause -> { encoder: bound, form: None },
+    SpaceClause -> {
       let spaces = owner.params.map(|parameter: Param| parameter.space);
-      if !spaces.any(|space_name: Option<Ident>| space_name != None) {
+      if !spaces.any(|space_name: Option<Identifier>| space_name != None) {
         { encoder: bound, form: None }
       } else { named(spaces) }
     },
-    SCost -> named(owner.params.map(|parameter: Param| parameter.cost)),
+    CostClause -> named(owner.params.map(|parameter: Param| parameter.cost)),
   };
   {
     kind: clause.kind,
     generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
     parameters: owner.params.len(),
     names: scoped.form,
-    body: expression(scoped.encoder, clause.expr).form,
+    body: expression(scoped.encoder, clause.expression).form,
   }
 }
 
-// --- Which `let`s commute ----------------------------------------------------------------------
-
-pub fn is_pure(written: Expr) -> Bool =
+pub fn is_pure(written: Expression) -> Bool =
   match written {
-    EApp(_) -> false,
-    EPerform(_) -> false,
-    EHandle(_) -> false,
-    EWithHold(_) -> false,
-    ESimulate(_) -> false,
-    ETryBlock(_) -> false,
-    EParallel(parallel_branches) -> all_pure(parallel_branches.branches),
-    ETry(_) -> false,
-    EBad(_) -> false,
-    EHole(_) -> false,
-    ELit(_) -> true,
-    ETagged(tagged) -> tagged.holes.len() == 0,
-    EVar(_) -> true,
-    EBinary(binary) -> is_pure(binary.lhs) && is_pure(binary.rhs),
-    EUnary(unary) -> is_pure(unary.operand),
-    ELambda(lambda) -> is_pure(lambda.body),
-    EIf(conditional) ->
+    CallExpression(_) -> false,
+    PerformExpression(_) -> false,
+    HandleExpression(_) -> false,
+    WithHoldExpression(_) -> false,
+    SimulateExpression(_) -> false,
+    TryBlockExpression(_) -> false,
+    ParallelExpression(parallel_branches) -> all_pure(parallel_branches.branches),
+    PropagateExpression(_) -> false,
+    InvalidExpression(_) -> false,
+    HoleExpression(_) -> false,
+    LiteralExpression(_) -> true,
+    TaggedLiteralExpression(tagged) -> tagged.holes.len() == 0,
+    NameExpression(_) -> true,
+    BinaryExpression(binary) -> is_pure(binary.lhs) && is_pure(binary.rhs),
+    UnaryExpression(unary) -> is_pure(unary.operand),
+    LambdaExpression(lambda) -> is_pure(lambda.body),
+    IfExpression(conditional) ->
       is_pure(conditional.cond) && is_pure(conditional.then_branch)
         && is_pure(conditional.else_branch),
-    EMatch(matched) ->
+    MatchExpression(matched) ->
       is_pure(matched.scrutinee)
         && matched.arms.fold(true, |acc: Bool, arm: MatchArm|
           acc && is_pure(arm.body)
             && (match arm.guard { Some(guard) -> is_pure(guard), None -> true })),
-    EBlock(written_block) ->
-      written_block.stmts.fold(true, |acc: Bool, statement: Stmt|
+    BlockExpression(written_block) ->
+      written_block.statements.fold(true, |acc: Bool, statement: Statement|
           acc
             && (match statement {
-              SLet(binding) -> is_pure(binding.value),
-              SLetElse(binding) -> is_pure(binding.value) && is_pure(binding.fallback),
-              SExpr(effectful) -> is_pure(effectful),
-              SAssign(_) -> false,
+              LetStatement(binding) -> is_pure(binding.value),
+              LetElseStatement(binding) -> is_pure(binding.value) && is_pure(binding.fallback),
+              ExpressionStatement(effectful) -> is_pure(effectful),
+              AssignmentStatement(_) -> false,
             }))
         && (match written_block.tail { Some(tail) -> is_pure(tail), None -> true }),
-    ERecord(record) -> all_pure(record.fields.map(|field: RecField| field.value)),
-    ERecordUpdate(update) ->
-      is_pure(update.base) && all_pure(update.fields.map(|field: RecField| field.value)),
-    EField(field) -> is_pure(field.base),
-    EList(list) -> all_pure(list.items),
+    RecordExpression(record) ->
+      all_pure(record.fields.map(|field: RecordLiteralField| field.value)),
+    RecordUpdateExpression(update) ->
+      is_pure(update.base) && all_pure(update.fields.map(|field: RecordLiteralField| field.value)),
+    FieldExpression(field) -> is_pure(field.base),
+    ListExpression(list) -> all_pure(list.items),
   }
 
-fn all_pure(written: List<Expr>) -> Bool =
-  written.fold(true, |acc: Bool, each: Expr| acc && is_pure(each))
+fn all_pure(written: List<Expression>) -> Bool =
+  written.fold(true, |acc: Bool, each: Expression| acc && is_pure(each))
 
-// --- Another program's numbering ---------------------------------------------------------------
-
-/// `template` with each node it references numbered as `renumber` says: a template taken into a
-/// program that numbers its nodes otherwise.
 pub fn renumbered(
   template: Template,
   renumber: (Int) -> Int / {abort.raise},
 ) -> Template / {abort.raise} =
   template.map(
     reference: renumber,
-    slot: |slot: Slotted| { ..slot, node: renumber(slot.node) },
-    level: |spot: Spot| spot,
+    slot: |slot: EffectSlot| { ..slot, node: renumber(slot.node) },
+    level: |spot: BinderPosition| spot,
     note: |note: Note| note,
   )

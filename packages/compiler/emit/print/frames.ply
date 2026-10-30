@@ -1,67 +1,62 @@
-//! Frame records: what a C function holds across a call that may stop, laid in a record that is
-//! linked into the context's chain while the call runs, so a body that is never resumed lets each
-//! value go. Only a detached body's own stack records: elsewhere the chain's head is null, and a
-//! site costs a test.
-
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (span_between)
-import compiler.check.types (Type, TyCon, TyRecord, fields_sorted, int_type, string_type)
-import compiler.emit.pieces (Piece, Text, merged, spelled)
+import compiler.check.types (Type, NamedType, RecordType, fields_sorted, int_type, string_type)
+import compiler.emit.pieces (Piece, Text, merged, pieces_text)
 import compiler.emit.layout (header_bytes)
-import compiler.emit.keys (Root, Named, Held, Release, root_name, root_text)
+import compiler.emit.keys (Root, Named, Unboxed, Release, root_name, root_text)
 import compiler.emit.roots (symbol_of)
-import compiler.emit.reps (ctors_of)
+import compiler.emit.representations (constructors_of)
 import compiler.emit.release (root_of)
-import compiler.emit.tir (Rep, RInt, RWord, RFlat, RToken, Var, Val, Call, Prim, Native, Block, Do,
-                          Inc, Dec, Free, AInt, AVar, Owned, counted, stops_at, handle_stops)
-import compiler.emit.tir.handling (HandleSite, Clause, instance_alone)
-import compiler.emit.print.text (Printing, Place, printing, function_body, line, named, name_of,
-                                 part_names)
-import compiler.emit.print.counts (count_printed)
-import compiler.emit.print.made (c_type)
-import compiler.emit.lower.held (values_of, held_with)
-import compiler.emit.print.counting (free_fn, call_text, call_start)
+import compiler.emit.typed_ir (Representation, AsInt, AsWord, AsFlattened, AsReuseToken, Var,
+                               Rvalue, Call, Primitive, Native, Block, Do, Inc, Dec, Free,
+                               IntOperand, VarOperand, OwnedResult, is_refcounted, may_suspend,
+                               handle_suspends)
+import compiler.emit.typed_ir.handling (HandleSite, Clause, empty_instance)
+import compiler.emit.print.text (Printing, InstructionContext, empty_printing, function_body, line,
+                                 named, name_of, part_names)
+import compiler.emit.print.ownership (count_printed)
+import compiler.emit.print.value_printing (c_type)
+import compiler.emit.lower.representation (c_values_of, representation_with)
+import compiler.emit.print.count_functions (free_fn, call_text, call_start)
 
-/// What printing a site or a `handle` linked before what it links its record around: the printing,
-/// how a failure under it leaves, the record's unlinking first, and the record, where it linked one.
-pub type Linked = { pr: Printing, leave: Bytes, record: Option<Bytes> }
+pub type FrameLink = { printing: Printing, leave: Bytes, record: Option<Bytes> }
 
-/// The C the head defines the context's chain of records by: its `frames` field.
 pub fn chain_defined() -> Bytes = b"#define PLY_FRAMES(c) ((c)->frames)\n"
 
 fn chain() -> Bytes = b"PLY_FRAMES(ctx)"
 
-/// What site `val` prints before its value, which leaves on a failure by `p.leave`: where `val`
-/// may stop, under a test that the chain records, the reuse tokens `unwind` holds freed, which a
-/// body abandoned there would never free, and the C function's record linked over the rest.
-/// Nothing where `val` cannot stop, or holds nothing across it.
-pub fn site_linked(p: Place, pr: Printing, unwind: List<Var>, val: Val) -> Linked / {abort.raise} =
-  if !stops_at(val) { { pr: pr, leave: p.leave, record: None } } else {
-    let s = slots_of(pr, unwind);
-    let l = linked(p, pr, b"ply_fr", s);
-    { ..l, pr: if s.words.len() > l.pr.widest { { ..l.pr, widest: s.words.len() } } else { l.pr } }
+pub fn site_linked(
+  p: InstructionContext,
+  printing: Printing,
+  unwind: List<Var>,
+  value: Rvalue,
+) -> FrameLink / {abort.raise} =
+  if !may_suspend(value) { { printing: printing, leave: p.leave, record: None } } else {
+    let s = slots_of(printing, unwind);
+    let l = linked(p, printing, b"ply_fr", s);
+    {
+      ..l,
+      printing: if s.words.len() > l.printing.widest { { ..l.printing, widest: s.words.len() } }
+      else { l.printing },
+    }
   }
 
-/// What `handle` `label` prints before it opens, which leaves on a failure by `p.leave`: where
-/// anything may stop under it (a clause, its `return` clause, its body detached or a stop in its
-/// body), a record of its own over `unwind`, what it holds across its body, linked under a test that
-/// the chain records.
 pub fn handle_linked(
-  p: Place,
-  pr: Printing,
+  p: InstructionContext,
+  printing: Printing,
   label: Int,
   body: Block,
   site: HandleSite,
   unwind: List<Var>,
-) -> Linked / {abort.raise} =
-  if !handle_stops(body, site) { { pr: pr, leave: p.leave, record: None } } else {
+) -> FrameLink / {abort.raise} =
+  if !handle_suspends(body, site) { { printing: printing, leave: p.leave, record: None } } else {
     let record = b"ply_fh".concat(ascii_of_int(label));
-    let s = slots_of(pr, unwind);
+    let s = slots_of(printing, unwind);
     linked(
       p,
-      if s.words.len() == 0 { pr } else {
+      if s.words.len() == 0 { printing } else {
         line(
-          pr,
+          printing,
           p.depth,
           Bytes::concat_all([
             b"struct { PlyFrame h; Word s[",
@@ -77,26 +72,21 @@ pub fn handle_linked(
     )
   }
 
-/// After what `l` linked its record around, the record unlinked, where it linked one.
-pub fn unlinked(pr: Printing, depth: Int, l: Linked) -> Printing =
-  match l.record { Some(r) -> line(pr, depth, unlink(r)), None -> pr }
+pub fn unlinked(printing: Printing, depth: Int, l: FrameLink) -> Printing =
+  match l.record { Some(r) -> line(printing, depth, unlink(r)), None -> printing }
 
-/// What the C function `pr` printed declares at its top: the record its sites link, as wide as the
-/// widest; nothing where none linked one.
-pub fn record_declared(pr: Printing) -> Bytes =
-  if pr.widest == 0 { b"" } else {
+pub fn record_declared(printing: Printing) -> Bytes =
+  if printing.widest == 0 { b"" } else {
     Bytes::concat_all([
       b"  struct { PlyFrame h; Word s[",
-      ascii_of_int(pr.widest),
+      ascii_of_int(printing.widest),
       b"]; } ply_fr;\n",
     ])
   }
 
-/// The `each` functions of the root whose C functions are named after `symbol`, which its text opens
-/// with. The runtime passes each `d` as -1.
-pub fn eaches_printed(symbol: Bytes, pr: Printing) -> List<Piece> =
-  range(0, pr.eaches.len()).fold([], |acc: List<Piece>, i: Int|
-    match pr.eaches.at(i) {
+pub fn each_functions_printed(symbol: Bytes, printing: Printing) -> List<Piece> =
+  range(0, printing.each_functions.len()).fold([], |acc: List<Piece>, i: Int|
+    match printing.each_functions.at(i) {
       Some(body) ->
         acc.push(
           Text(
@@ -114,54 +104,55 @@ pub fn eaches_printed(symbol: Bytes, pr: Printing) -> List<Piece> =
       None -> acc,
     })
 
-/// What a record holds at a site: the reuse tokens freed before it links, and the values whose
-/// counts it holds, each value's C values that hold a count its slots in order.
 type Slots = { tokens: List<Var>, held: List<Var>, words: List<Bytes> }
 
-fn slots_of(pr: Printing, unwind: List<Var>) -> Slots = {
-  let held = unwind.filter(|v: Var| counted(v.rep) && !token(v.rep));
+fn slots_of(printing: Printing, unwind: List<Var>) -> Slots = {
+  let held = unwind.filter(|v: Var| is_refcounted(v.representation) && !token(v.representation));
   {
-    tokens: unwind.filter(|v: Var| token(v.rep)),
+    tokens: unwind.filter(|v: Var| token(v.representation)),
     held: held,
     words: held.fold([], |acc: List<Bytes>, v: Var|
-      acc.concat(counted_values(name_of(pr, v), v.rep).map(|c: Valued| c.name))),
+      acc.concat(counted_values(name_of(printing, v), v.representation).map(|c: CValue| c.name))),
   }
 }
 
-fn token(r: Rep) -> Bool = match r { RToken(_) -> true, _ -> false }
+fn token(r: Representation) -> Bool = match r { AsReuseToken(_) -> true, _ -> false }
 
-/// One of a value's C values: its name, and how C holds it.
-type Valued = { name: Bytes, rep: Rep }
+type CValue = { name: Bytes, representation: Representation }
 
-/// The C values of a value named `name` held as `r` that may hold a count, as its type's counts
-/// name them: a sum's every word, a record's counted leaves and its sums' words.
-fn counted_values(name: Bytes, r: Rep) -> List<Valued> = {
-  let reps = values_of(r);
+fn counted_values(name: Bytes, r: Representation) -> List<CValue> = {
+  let reps = c_values_of(r);
   let names = part_names(name, r);
-  range(0, reps.len()).fold([], |acc: List<Valued>, k: Int|
+  range(0, reps.len()).fold([], |acc: List<CValue>, k: Int|
     match ((reps.at(k), names.at(k))) {
-      (Some(c), Some(n)) -> if counted(c) { acc.push({ name: n, rep: c }) } else { acc },
+      (Some(c), Some(n)) -> if is_refcounted(c) { acc.push({ name: n, representation: c }) }
+      else { acc },
       _ -> acc,
     })
 }
 
-/// Under a test that the chain records: `s`'s tokens freed and emptied, then, where it holds
-/// values, `record` laid with them and linked as the chain's head.
-fn linked(p: Place, pr: Printing, record: Bytes, s: Slots) -> Linked / {abort.raise} =
-  if s.tokens.len() == 0 && s.words.len() == 0 { { pr: pr, leave: p.leave, record: None } } else {
+fn linked(
+  p: InstructionContext,
+  printing: Printing,
+  record: Bytes,
+  s: Slots,
+) -> FrameLink / {abort.raise} =
+  if s.tokens.len() == 0 && s.words.len() == 0 {
+    { printing: printing, leave: p.leave, record: None }
+  } else {
     let inner = { ..p, depth: p.depth + 1 };
     let freed = s.tokens.fold(
-      line(pr, p.depth, Bytes::concat_all([b"if (", chain(), b") {"])),
+      line(printing, p.depth, Bytes::concat_all([b"if (", chain(), b") {"])),
       |q: Printing, t: Var| {
-        let words = match t.rep { RToken(n) -> n, _ -> 0 };
+        let words = match t.representation { AsReuseToken(n) -> n, _ -> 0 };
         line(
-          count_printed(inner, q, Free({ of: t, bytes: AInt(header_bytes() + 8 * words) })),
+          count_printed(inner, q, Free({ of: t, bytes: IntOperand(header_bytes() + 8 * words) })),
           inner.depth,
           Bytes::concat_all([name_of(q, t), b" = 0;"]),
         )
       },
     );
-    if s.words.len() == 0 { { pr: line(freed, p.depth, b"}"), leave: p.leave, record: None } }
+    if s.words.len() == 0 { { printing: line(freed, p.depth, b"}"), leave: p.leave, record: None } }
     else {
       let e = each_named(p, freed, s.held);
       let laid = Bytes::join(
@@ -184,14 +175,13 @@ fn linked(p: Place, pr: Printing, record: Bytes, s: Slots) -> Linked / {abort.ra
         b".h;",
       ]);
       {
-        pr: line(line(line(e.pr, inner.depth, laid), inner.depth, head), p.depth, b"}"),
+        printing: line(line(line(e.printing, inner.depth, laid), inner.depth, head), p.depth, b"}"),
         leave: Bytes::concat_all([b"{ ", unlink(record), b" ", p.leave, b" }"]),
         record: Some(record),
       }
     }
   }
 
-/// `record` unlinked where it is the chain's head; off a stack that records, the head is null.
 fn unlink(record: Bytes) -> Bytes =
   Bytes::concat_all([
     b"if (",
@@ -208,20 +198,17 @@ fn unlink(record: Bytes) -> Bytes =
 fn each_name(symbol: Bytes, i: Int) -> Bytes =
   Bytes::concat_all([symbol, b"_each", ascii_of_int(i)])
 
-/// The name of the root's `each` over `held`, its slots each value's C values that hold a count, in
-/// order: one made for slots alike before, or one made now. It prints what a `Dec` of each value
-/// prints, so the record lets go of what the frame's own releases would.
 fn each_named(
-  p: Place,
-  pr: Printing,
+  p: InstructionContext,
+  printing: Printing,
   held: List<Var>,
-) -> { pr: Printing, name: Bytes } / {abort.raise} = {
+) -> { printing: Printing, name: Bytes } / {abort.raise} = {
   let laid = range(0, held.len()).fold(
     { at: 0, names: Map::new(), loads: [], vars: [] },
     |acc: { at: Int, names: Map<Int, Bytes>, loads: List<Bytes>, vars: List<Var> }, i: Int| {
       let v = { ..held.get(i), id: i };
       let x = b"x".concat(ascii_of_int(i));
-      let values = counted_values(x, v.rep);
+      let values = counted_values(x, v.representation);
       {
         at: acc.at + values.len(),
         names: acc.names.insert(i, x),
@@ -229,7 +216,7 @@ fn each_named(
           range(0, values.len()).map(|j: Int| {
             let c = values.get(j);
             Bytes::concat_all([
-              c_type(c.rep),
+              c_type(c.representation),
               b" ",
               c.name,
               b" = s[",
@@ -242,88 +229,94 @@ fn each_named(
       }
     },
   );
-  let down = laid.vars.fold({ ..pr, out: [], names: laid.names }, |q: Printing, v: Var|
+  let down = laid.vars.fold({ ..printing, out: [], names: laid.names }, |q: Printing, v: Var|
     count_printed({ ..p, depth: 0 }, q, Dec(v)));
   let body = merged(
     [Text(Bytes::concat_all([b"  (void)d; ", Bytes::join(laid.loads, b" "), b"\n"]))].concat(
       down.out,
     ),
   );
-  let back = { ..down, out: pr.out, names: pr.names, temps: pr.temps, declared: pr.declared };
-  match range(0, back.eaches.len()).fold(None, |found: Option<Int>, i: Int|
+  let back = {
+    ..down,
+    out: printing.out,
+    names: printing.names,
+    temps: printing.temps,
+    declared: printing.declared,
+  };
+  match range(0, back.each_functions.len()).fold(None, |found: Option<Int>, i: Int|
       match found {
         Some(_) -> found,
-        None -> if back.eaches.at(i) == Some(body) { Some(i) } else { None },
+        None -> if back.each_functions.at(i) == Some(body) { Some(i) } else { None },
       }) {
-    Some(i) -> { pr: back, name: each_name(p.u.symbol, i) },
+    Some(i) -> { printing: back, name: each_name(p.u.symbol, i) },
     None ->
       {
-        pr: { ..back, eaches: back.eaches.push(body) },
-        name: each_name(p.u.symbol, back.eaches.len()),
+        printing: { ..back, each_functions: back.each_functions.push(body) },
+        name: each_name(p.u.symbol, back.each_functions.len()),
       },
   }
 }
 
-fn local(id: Int, ty: Type, rep: Rep) -> Var = { id: id, ty: ty, rep: rep }
+fn local(id: Int, ty: Type, rep: Representation) -> Var = { id: id, ty: ty, representation: rep }
 
 fn pair() -> Type / {abort.raise} =
-  TyRecord(fields_sorted([{ name: b"a", ty: string_type() }, { name: b"b", ty: int_type() }]))
+  RecordType(fields_sorted([{ name: b"a", ty: string_type() }, { name: b"b", ty: int_type() }]))
 
-fn place() -> Place =
+fn place() -> InstructionContext =
   {
     u: {
       symbol: b"m_f",
       base: 0,
-      answer: RWord,
+      result: AsWord,
       site: None,
       arm: None,
       looping: None,
       landing: None,
       group: None,
       unwinds: [],
-      leaving: b"",
+      epilogue: b"",
     },
     at: span_between(0, 0),
     leave: b"goto ply_u0;",
     depth: 0,
   }
 
-/// A call of `m.g` that stops where `stops` says.
-fn call_of(stops: Bool) -> Val =
+fn call_of(stops: Bool) -> Rvalue =
   Call({
     callee: Root(Named(b"m.g")),
     args: [],
-    conv: { params: [], answer: RWord, destined: false, answered: Owned },
-    stops: stops,
+    convention: { params: [], result: AsWord, destination_passing: false, answered: OwnedResult },
+    suspends: stops,
   })
 
-/// A word `p0`, a flat value `t1` whose leaves are a word and an `Int`, an `Int` `t2` and a reuse
-/// token `t3`, as a body names them.
-fn holding() -> { pr: Printing, s: Var, flat: Var, n: Var, tok: Var } / {abort.raise} = {
-  let s = local(0, string_type(), RWord);
+fn holding() -> { printing: Printing, s: Var, flat: Var, n: Var, token: Var } / {abort.raise} = {
+  let s = local(0, string_type(), AsWord);
   let flat = {
     id: 1,
     ty: pair(),
-    rep: RFlat([{ name: b"a", rep: RWord }, { name: b"b", rep: RInt }]),
+    representation: AsFlattened([
+      { name: b"a", representation: AsWord },
+      { name: b"b", representation: AsInt },
+    ]),
   };
-  let n = local(2, int_type(), RInt);
-  let tok = { ..flat, id: 3, rep: RToken(2) };
-  let pr = named(named(named(printing(Map::new().insert(0, b"p0")), flat).pr, n).pr, tok).pr;
-  { pr: pr, s: s, flat: flat, n: n, tok: tok }
+  let n = local(2, int_type(), AsInt);
+  let token = { ..flat, id: 3, representation: AsReuseToken(2) };
+  let printing = named(
+    named(named(empty_printing(Map::new().insert(0, b"p0")), flat).printing, n).printing,
+    token,
+  ).printing;
+  { printing: printing, s: s, flat: flat, n: n, token: token }
 }
 
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
 fn has(t: Bytes, s: Bytes) -> Bool = t.index_of(s) != None
 
-/// Where `s` first stands in `t`, or -1.
 fn at(t: Bytes, s: Bytes) -> Int = match t.index_of(s) { Some(i) -> i, None -> 0 - 1 }
 
-/// Whether `text` links the record named `record` into the context's frames.
 fn links(text: Bytes, record: Bytes) -> Bool =
   has(text, Bytes::concat_all([b"= &", record, b".h;"]))
 
-/// Whether `text` takes the record named `record` back off the context's frames.
 fn unlinks(text: Bytes, record: Bytes) -> Bool =
   has(text, Bytes::concat_all([b"= ", record, b".h.prev;"]))
 
@@ -332,46 +325,47 @@ test "a runtime function that may stop and cannot fail links a record around its
   let quiet = Native({
     name: b"rt_wait_p",
     args: [],
-    uses: { takes: [], owned: true, fails: false, stops: true },
+    uses: { takes: [], owned: true, fails: false, suspends: true },
   });
-  let l = site_linked(place(), h.pr, [h.s], quiet);
+  let l = site_linked(place(), h.printing, [h.s], quiet);
   let r = match l.record { Some(r) -> r, None -> b"" };
-  let text = spelled(l.pr.out);
+  let text = pieces_text(l.printing.out);
   assert(links(text, r) && has(text, b"= p0;"), Some(String::of_bytes_lossy(text)));
-  assert(unlinks(spelled(unlinked({ ..l.pr, out: [] }, 0, l).out), r), None)
+  assert(unlinks(pieces_text(unlinked({ ..l.printing, out: [] }, 0, l).out), r), None)
 }
 
 test "a call that may stop links a record of what the frame holds across it, and a failure unlinks it before leaving" {
   let h = holding();
-  let l = site_linked(place(), h.pr, [h.s, h.flat, h.n], call_of(true));
+  let l = site_linked(place(), h.printing, [h.s, h.flat, h.n], call_of(true));
   let r = match l.record { Some(r) -> r, None -> b"" };
-  let text = spelled(l.pr.out);
-  // The word and the flat value's word are held, the `Int` not.
+  let text = pieces_text(l.printing.out);
   assert(
     links(text, r) && has(text, b"= p0;") && has(text, b"= t1_0;"),
     Some(String::of_bytes_lossy(text)),
   );
   assert(!has(text, b"= t2;"), None);
-  assert(has(record_declared(l.pr), b"s[2]"), None);
+  assert(has(record_declared(l.printing), b"s[2]"), None);
   assert(
     unlinks(l.leave, r) && at(l.leave, b".h.prev") < at(l.leave, b"goto "),
     Some(String::of_bytes_lossy(l.leave)),
   );
-  assert(unlinks(spelled(unlinked({ ..l.pr, out: [] }, 0, l).out), r), None)
+  assert(unlinks(pieces_text(unlinked({ ..l.printing, out: [] }, 0, l).out), r), None)
 }
 
 test "a record's each lets go of each slot as the frame's failure path does" {
   let h = holding();
   let unwind = [h.s, h.flat, h.n];
-  let l = site_linked(place(), h.pr, unwind, call_of(true));
-  let each = spelled(eaches_printed(b"m_f", l.pr));
-  // Its body is what the frame's own `Dec` of each value prints, over its slots.
+  let l = site_linked(place(), h.printing, unwind, call_of(true));
+  let each = pieces_text(each_functions_printed(b"m_f", l.printing));
   let slots = [{ ..h.s, id: 0 }, { ..h.flat, id: 1 }];
-  let named = { ..printing(Map::new().insert(0, b"x0").insert(1, b"x1")), ctors: h.pr.ctors };
-  let down = spelled(
+  let named = {
+    ..empty_printing(Map::new().insert(0, b"x0").insert(1, b"x1")),
+    constructors: h.printing.constructors,
+  };
+  let down = pieces_text(
     slots.fold(named, |q: Printing, v: Var| count_printed(place(), q, Dec(v))).out,
   );
-  let up = spelled(
+  let up = pieces_text(
     slots.fold(named, |q: Printing, v: Var| count_printed(place(), q, Inc({ var: v, n: 1 }))).out,
   );
   assert(has(each, b"= s[0];") && has(each, b"= s[1];"), Some(String::of_bytes_lossy(each)));
@@ -380,10 +374,8 @@ test "a record's each lets go of each slot as the frame's failure path does" {
 
 test "a frame's each counts a value through its type's root naming only the values it loads, wide or with scalar leaves" {
   let string = string_type();
-  // Six strings and three `Int`s, a sum held as its words, cross by reference; two strings and an
-  // `Int`, a record held as its leaves, in their words.
-  let wide = TyCon({ name: b"m.Wide", args: [] });
-  let ctors = ctors_of(
+  let wide = NamedType({ name: b"m.Wide", args: [] });
+  let constructors = constructors_of(
     [],
     [],
     [],
@@ -396,7 +388,7 @@ test "a frame's each counts a value through its type's root naming only the valu
       },
     ]),
   );
-  let record = TyRecord(
+  let record = RecordType(
     fields_sorted([
       { name: b"s0", ty: string },
       { name: b"s1", ty: string },
@@ -404,91 +396,103 @@ test "a frame's each counts a value through its type's root naming only the valu
     ]),
   );
   [wide, record].fold((), |_: Unit, ty: Type| {
-    let held = held_with(ctors, ty);
-    let flat = { id: 1, ty: ty, rep: held };
-    let pr = named({ ..printing(Map::new().insert(0, b"p0")), ctors: ctors }, flat).pr;
-    let each = spelled(eaches_printed(b"m_f", site_linked(place(), pr, [flat], call_of(true)).pr));
+    let held = representation_with(constructors, ty);
+    let flat = { id: 1, ty: ty, representation: held };
+    let printing = named(
+      { ..empty_printing(Map::new().insert(0, b"p0")), constructors: constructors },
+      flat,
+    ).printing;
+    let each = pieces_text(
+      each_functions_printed(
+        b"m_f",
+        site_linked(place(), printing, [flat], call_of(true)).printing,
+      ),
+    );
     let name = |k: Int| b"x0_".concat(ascii_of_int(k));
     let named_at = |k: Int|
       [b",", b")", b"}", b";"].any(|end: Bytes| has(each, name(k).concat(end)));
     let loaded = |k: Int| has(each, name(k).concat(b" = s["));
     let said = Some(String::of_bytes_lossy(each));
-    // The value is let go of through one call of its type's root.
     assert(
-      has(each, symbol_of(root_text(root_name(root_of(Held(Release), ty)))).concat(b"(ctx, ")),
+      has(each, symbol_of(root_text(root_name(root_of(Unboxed(Release), ty)))).concat(b"(ctx, ")),
       said,
     );
-    assert_eq(range(0, values_of(held).len()).filter(|k: Int| named_at(k) && !loaded(k)), [])
+    assert_eq(range(0, c_values_of(held).len()).filter(|k: Int| named_at(k) && !loaded(k)), [])
   })
 }
 
 test "a call that cannot stop, a value that cannot fail, and a call holding no count across it link nothing" {
   let h = holding();
-  let summed = Prim({ op: b"add", on: RInt, args: [AVar(h.n), AInt(1)] });
+  let summed = Primitive({ op: b"add", on: AsInt, args: [VarOperand(h.n), IntOperand(1)] });
   [
-    site_linked(place(), h.pr, [h.s, h.flat], call_of(false)),
-    site_linked(place(), h.pr, [h.s], summed),
-    site_linked(place(), h.pr, [h.n], call_of(true)),
-  ].fold((), |_: Unit, l: Linked| {
-    assert_eq((l.pr.out.len(), l.leave, l.record), (h.pr.out.len(), place().leave, None));
-    assert_eq((record_declared(l.pr), l.pr.eaches.len()), (b"", 0))
+    site_linked(place(), h.printing, [h.s, h.flat], call_of(false)),
+    site_linked(place(), h.printing, [h.s], summed),
+    site_linked(place(), h.printing, [h.n], call_of(true)),
+  ].fold((), |_: Unit, l: FrameLink| {
+    assert_eq((l.printing.out.len(), l.leave, l.record), (
+      h.printing.out.len(),
+      place().leave,
+      None,
+    ));
+    assert_eq((record_declared(l.printing), l.printing.each_functions.len()), (b"", 0))
   })
 }
 
 test "a reuse token live across a call that may stop is freed under the test before the link, never a slot" {
   let h = holding();
   let freed = call_start(free_fn(), [b"ctx", b"t3"]);
-  let l = site_linked(place(), h.pr, [h.s, h.tok], call_of(true));
+  let l = site_linked(place(), h.printing, [h.s, h.token], call_of(true));
   let r = match l.record { Some(r) -> r, None -> b"" };
-  let text = spelled(l.pr.out);
+  let text = pieces_text(l.printing.out);
   assert(
     has(text, freed) && links(text, r) && at(text, freed) < at(text, b"= &"),
     Some(String::of_bytes_lossy(text)),
   );
-  assert(!has(text, b"= t3;") && has(record_declared(l.pr), b"s[1]"), None);
-  // A token alone is freed, and nothing is linked.
-  let alone = site_linked(place(), h.pr, [h.tok], call_of(true));
+  assert(!has(text, b"= t3;") && has(record_declared(l.printing), b"s[1]"), None);
+  let alone = site_linked(place(), h.printing, [h.token], call_of(true));
   assert_eq(alone.record, None);
-  assert(has(spelled(alone.pr.out), freed) && !has(spelled(alone.pr.out), b"= &"), None)
+  assert(
+    has(pieces_text(alone.printing.out), freed) && !has(pieces_text(alone.printing.out), b"= &"),
+    None,
+  )
 }
 
 test "sites holding alike share one each, the record is as wide as the widest, and a lambda's function declares its own" {
   let h = holding();
-  let first = site_linked(place(), h.pr, [h.s], call_of(true));
-  let alike = site_linked(place(), first.pr, [h.s], call_of(true));
-  let wider = site_linked(place(), alike.pr, [h.s, h.flat], call_of(true));
-  let text = spelled(wider.pr.out);
-  assert_eq(wider.pr.eaches.len(), 2);
+  let first = site_linked(place(), h.printing, [h.s], call_of(true));
+  let alike = site_linked(place(), first.printing, [h.s], call_of(true));
+  let wider = site_linked(place(), alike.printing, [h.s, h.flat], call_of(true));
+  let text = pieces_text(wider.printing.out);
+  assert_eq(wider.printing.each_functions.len(), 2);
   assert_eq(
     [occurrences(text, b"h.each = m_f_each0;"), occurrences(text, b"h.each = m_f_each1;")],
     [2, 1],
   );
-  assert(has(record_declared(wider.pr), b"s[2]"), None);
-  assert_eq(occurrences(spelled(eaches_printed(b"m_f", wider.pr)), b" m_f_each"), 2);
-  // A lambda's C function starts with no record of its own, and its sites count by the root's eaches.
-  let lambda = function_body(wider.pr, Map::new().insert(0, b"q0"));
+  assert(has(record_declared(wider.printing), b"s[2]"), None);
+  assert_eq(
+    occurrences(pieces_text(each_functions_printed(b"m_f", wider.printing)), b" m_f_each"),
+    2,
+  );
+  let lambda = function_body(wider.printing, Map::new().insert(0, b"q0"));
   assert_eq(record_declared(lambda), b"");
-  assert_eq(site_linked(place(), lambda, [h.s], call_of(true)).pr.eaches.len(), 2)
+  assert_eq(site_linked(place(), lambda, [h.s], call_of(true)).printing.each_functions.len(), 2)
 }
 
 test "a handle under which something may stop links a record of its own over what it holds across its body" {
   let h = holding();
   let asked = { effect: b"m.ask", op: b"get", mode: 0, string: None, handler: 0 };
   let site = |clauses: List<Clause>|
-    { clauses: clauses, ret: None, detached: None, instance: instance_alone(0) };
-  let l = handle_linked(place(), h.pr, 2, [], site([asked]), [h.s, h.n]);
+    { clauses: clauses, ret: None, detached: None, instance: empty_instance(0) };
+  let l = handle_linked(place(), h.printing, 2, [], site([asked]), [h.s, h.n]);
   let r = match l.record { Some(r) -> r, None -> b"" };
-  let text = spelled(l.pr.out);
-  // Its record is declared where it links it, one slot wide, holding the word and not the `Int`.
+  let text = pieces_text(l.printing.out);
   assert(
     links(text, r) && has(text, b"= p0;") && !has(text, b"= t2;") && has(text, b"s[1]"),
     Some(String::of_bytes_lossy(text)),
   );
-  // The record is the handle's: the function's record for its sites is no wider.
-  assert_eq(record_declared(l.pr), b"");
-  // With no clause, no `return` and nothing in its body that may stop, nothing runs under it to stop.
-  let quiet = handle_linked(place(), h.pr, 2, [], site([]), [h.s]);
-  assert_eq((quiet.record, quiet.pr.out.len()), (None, h.pr.out.len()));
-  let stopping = [Do({ val: call_of(true), at: span_between(0, 0), unwind: [] })];
-  assert(handle_linked(place(), h.pr, 2, stopping, site([]), [h.s]).record != None, None)
+  assert_eq(record_declared(l.printing), b"");
+  let quiet = handle_linked(place(), h.printing, 2, [], site([]), [h.s]);
+  assert_eq((quiet.record, quiet.printing.out.len()), (None, h.printing.out.len()));
+  let stopping = [Do({ value: call_of(true), at: span_between(0, 0), unwind: [] })];
+  assert(handle_linked(place(), h.printing, 2, stopping, site([]), [h.s]).record != None, None)
 }

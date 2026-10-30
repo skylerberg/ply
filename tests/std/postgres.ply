@@ -10,7 +10,7 @@ import std.config (config)
 import std.fs (fs)
 import std.list
 import std.net (net)
-import std.process (process, Finished, Var, exit_code, Discard, Interrupt, Keep)
+import std.process (process, CompletedProcess, Var, exit_code, Discard, Interrupt, Keep)
 import std.random (entropy)
 import std.string
 import std.time (millis)
@@ -55,24 +55,23 @@ fn given(path: String) -> String / {fs.read[certificate], abort.raise} =
 
 /// TCP connections prove `password` by SCRAM.
 pub fn scram(password: String) -> Cluster / {Launch, abort.raise, diverges} =
-  launched("scram-sha-256", password, None)
+  launch("scram-sha-256", password, None)
 
 /// TCP connections send `password` in the clear, which `password` authentication asks for.
 pub fn clear_text(password: String) -> Cluster / {Launch, abort.raise, diverges} =
-  launched("password", password, None)
+  launch("password", password, None)
 
 /// [`scram`]'s cluster, speaking TLS with `credential` as well as plaintext, so a client's `sslmode`
 /// decides which.
-pub fn secured(
+pub fn scram_with_tls(
   password: String,
   credential: Credential,
-) -> Cluster / {Launch, abort.raise, diverges} =
-  launched("scram-sha-256", password, Some(credential))
+) -> Cluster / {Launch, abort.raise, diverges} = launch("scram-sha-256", password, Some(credential))
 
 /// A server without a locale starts threads on macOS before it forks, and refuses to.
-fn located() -> List<Var> = [{ name: "LC_ALL", value: "C" }]
+fn c_locale() -> List<Var> = [{ name: "LC_ALL", value: "C" }]
 
-fn ran(f: Finished) -> String / {abort.raise} =
+fn output_or_fail(f: CompletedProcess) -> String / {abort.raise} =
   if exit_code(f) == Some(0) { String::of_bytes_lossy(f.out) }
   else { panic(String::of_bytes_lossy(f.err)) }
 
@@ -81,7 +80,7 @@ fn written(path: String, text: String) -> Unit / {fs.write[scratch], abort.raise
     panic("could not write `" ++ path ++ "` under the root `scratch`")
   }
 
-fn launched(
+fn launch(
   auth: String,
   password: String,
   tls: Option<Credential>,
@@ -93,7 +92,7 @@ fn launched(
   };
   let data = root ++ "/data";
   written("password", password);
-  let _ = ran(
+  let _ = output_or_fail(
     process.spawn[initdb](
       [
         "-D",
@@ -109,10 +108,10 @@ fn launched(
         "--pwfile=" ++ root ++ "/password",
       ],
       "",
-      located(),
+      c_locale(),
     ),
   );
-  let secured = match tls {
+  let scram_with_tls = match tls {
     None -> [],
     Some(credential) -> {
       written("data/server.crt", credential.certificate);
@@ -145,17 +144,17 @@ fn launched(
         "-c",
         "synchronous_commit=off",
       ].concat(
-        secured,
+        scram_with_tls,
       ),
       "",
-      located(),
+      c_locale(),
       { input: false, out: Discard, err: Keep },
     ) {
     Ok(child) -> child,
     Err(why) -> panic("postgres did not start: " ++ why),
   };
   let cluster = { port: port, server: server, password: password };
-  match ready(cluster, 300, "") {
+  match wait_until_ready(cluster, 300, "") {
     None -> (),
     Some(why) -> {
       let _ = process.signal[postgres](server, Interrupt);
@@ -166,7 +165,7 @@ fn launched(
       panic("postgres did not become ready within thirty seconds: " ++ why ++ "\n" ++ said)
     },
   };
-  let _ = asked(cluster, "postgres", "create database ply");
+  let _ = run_psql(cluster, "postgres", "create database ply");
   cluster
 }
 
@@ -183,16 +182,16 @@ fn reserve() -> Int / {net.read[ports], net.write[ports], abort.raise} = {
 }
 
 /// Why the cluster did not answer within `tries` tenths of a second, if it did not.
-fn ready(c: Cluster, tries: Int, last: String) -> Option<String> / {Postgres, diverges} =
+fn wait_until_ready(c: Cluster, tries: Int, last: String) -> Option<String> / {Postgres, diverges} =
   if tries <= 0 { Some(last) } else {
     let f = spawned_psql(c, "postgres", "select 1");
     if exit_code(f) == Some(0) { None } else {
       clock.sleep(millis(100));
-      ready(c, tries - 1, String::of_bytes_lossy(f.err))
+      wait_until_ready(c, tries - 1, String::of_bytes_lossy(f.err))
     }
   }
 
-fn spawned_psql(c: Cluster, database: String, sql: String) -> Finished / {Postgres} =
+fn spawned_psql(c: Cluster, database: String, sql: String) -> CompletedProcess / {Postgres} =
   process.spawn[psql](
     [
       "-X",
@@ -215,11 +214,11 @@ fn spawned_psql(c: Cluster, database: String, sql: String) -> Finished / {Postgr
     [{ name: "PGPASSWORD", value: c.password }],
   )
 
-fn asked(c: Cluster, database: String, sql: String) -> String / {Postgres, abort.raise} =
-  ran(spawned_psql(c, database, sql)).trim()
+fn run_psql(c: Cluster, database: String, sql: String) -> String / {Postgres, abort.raise} =
+  output_or_fail(spawned_psql(c, database, sql)).trim()
 
 /// What `sql` printed in the database `ply`, trimmed; a statement that fails fails the test.
-pub fn psql(c: Cluster, sql: String) -> String / {Postgres, abort.raise} = asked(c, "ply", sql)
+pub fn psql(c: Cluster, sql: String) -> String / {Postgres, abort.raise} = run_psql(c, "ply", sql)
 
 /// Stops the server the fast way, which ends its sessions and frees its shared memory.
 pub fn stop(c: Cluster) -> Unit / {Postgres} = {
@@ -245,4 +244,4 @@ pub fn url(c: Cluster, host: String, query: String) -> String =
   "postgres://ply:" ++ c.password ++ "@" ++ host ++ ":" ++ c.port.to_string() ++ "/ply?" ++ query
 
 /// [`url`] over `127.0.0.1` in plaintext.
-pub fn plain(c: Cluster) -> String = url(c, "127.0.0.1", "sslmode=disable")
+pub fn plain_url(c: Cluster) -> String = url(c, "127.0.0.1", "sslmode=disable")

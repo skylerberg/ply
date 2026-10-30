@@ -1,0 +1,222 @@
+import compiler.check.types (NamedType)
+import compiler.emit.emit_harness (Program, program_of, checked, printed_text)
+import compiler.emit.keys
+import compiler.emit.keys (RootKey, Root, Named, ReleaseResource)
+import compiler.emit.typed_ir (handed_of, Inst, Let, Do, Call, If, Case, Match, CleanupScope,
+                               Unwinding, Restart, Block, Rvalue, Fail, Take, ParamOwnership,
+                               Handle)
+
+fn connection_module() -> Bytes =
+  Bytes::concat_all([
+    b"pub opaque type Conn = | Conn(Int)\n",
+    b"release for Conn by close\n",
+    b"pub fn close(c: keep Conn) -> Unit = match c { Conn(n) -> () }\n",
+    b"pub fn open(n: Int) -> Conn = Conn(n)\n",
+    b"pub fn send(c: Conn, n: Int) -> Int = n\n",
+  ])
+
+fn program(src: Bytes) -> Program / {abort.raise} =
+  match program_of(connection_module().concat(src)) {
+    Ok(p) -> p,
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+  }
+
+fn let_go_of_conn() -> RootKey =
+  keys::generated_key(ReleaseResource, NamedType({ name: b"m.Conn", args: [] }), b"m")
+
+fn body_of(p: Program, name: Bytes) -> Block / {abort.raise} =
+  match checked(p, name) {
+    Ok(f) -> f.body,
+    Err(why) -> panic(String::of_bytes_lossy(Bytes::concat_all([name, b": ", why]))),
+  }
+
+fn flat(b: Block) -> List<Inst> =
+  b.fold([], |acc: List<Inst>, i: Inst|
+    match i {
+      If(x) -> acc.push(i).concat(flat(x.then)).concat(flat(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(acc.push(i), |a: List<Inst>, arm: { when: Int, body: Block }|
+          a.concat(flat(arm.body))).concat(
+          flat(c.rest),
+        ),
+      Match(m) ->
+        m.arms.fold(acc.push(i), |a: List<Inst>, arm: Block| a.concat(flat(arm))).concat(
+          flat(m.rest),
+        ),
+      Handle(h) -> acc.push(i).concat(flat(h.body)),
+      _ -> acc.push(i),
+    })
+
+fn calls_in(b: Block) -> List<RootKey> =
+  flat(b).fold([], |acc: List<RootKey>, i: Inst|
+    match i { Let(l) -> push_callee(acc, l.value), Do(d) -> push_callee(acc, d.value), _ -> acc })
+
+fn push_callee(acc: List<RootKey>, v: Rvalue) -> List<RootKey> =
+  match v { Call(c) -> match c.callee { Root(k) -> acc.push(k), _ -> acc }, _ -> acc }
+
+fn unwound_in(b: Block) -> List<List<RootKey>> =
+  flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
+    match i { CleanupScope(Some(xs)) -> acc.push(xs.map(|x: Unwinding| x.callee)), _ -> acc })
+
+test "a resource is let go where its block ends, by its type's `LetGo` root" {
+  let p = program(b"fn f() -> Int = { let c = open(1); let n = send(c, 1); n }\n");
+  assert_eq(calls_in(body_of(p, b"f")), [Named(b"m.open"), Named(b"m.send"), let_go_of_conn()]);
+  let q = program(b"fn g() -> Unit = { let c = open(1); close(c) }\n");
+  assert_eq(calls_in(body_of(q, b"g")), [Named(b"m.open"), Named(b"m.close")])
+}
+
+test "a failure unwinding past a resource lets it go first, through the runtime" {
+  let p = program(
+    b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {abort.raise} = { let c = open(1); let n = send(c, might()); n }\n",
+  );
+  let b = body_of(p, b"f");
+  assert_eq(unwound_in(b), [[let_go_of_conn()], [let_go_of_conn()]]);
+  let text = match checked(p, b"f") { Ok(f) -> printed_text(p, f), Err(why) -> why };
+  assert(text.index_of(b"rt_unwind_hold_p(ctx, ") != None, Some(String::of_bytes_lossy(text)))
+}
+
+test "a tail call past what its block lets go stays a loop" {
+  let p = program(
+    b"fn count(xs: List<Int>) -> Int = { let c = open(1); match xs { [] -> 0, [_, ..rest] -> count(rest) } }\n",
+  );
+  let b = body_of(p, b"count");
+  assert(flat(b).any(|i: Inst| match i { Restart(_) -> true, _ -> false }), None);
+  assert_eq(calls_in(b).filter(|k: RootKey| k == let_go_of_conn()).len(), 1)
+}
+
+test "a block that ends in a statement lets go after it, and each alternative of a pattern its own" {
+  let p = program(b"fn f() -> Unit = { let c = open(1); send(c, 1); }\n");
+  assert_eq(calls_in(body_of(p, b"f")), [Named(b"m.open"), Named(b"m.send"), let_go_of_conn()]);
+  let q = program(
+    b"type Either = | L(Conn) | R(Conn)\nfn g(e: keep Either) -> Int = match e { L(c) | R(c) -> send(c, 1) }\n",
+  );
+  assert_eq(calls_in(body_of(q, b"g")).filter(|k: RootKey| k == let_go_of_conn()).len(), 2)
+}
+
+test "a release that fails lets go of what is still owned, through the runtime" {
+  let p = program(b"fn f() -> Unit = { let a = open(1); let b = open(2); () }\n");
+  assert_eq(unwound_in(body_of(p, b"f")), [[let_go_of_conn()], [let_go_of_conn()]]);
+  let q = program(b"fn f() -> Unit = { let a = open(1); () }\n");
+  assert_eq(unwound_in(body_of(q, b"f")), [])
+}
+
+test "a `let` whose pattern misses lets go of what its block owns before it fails" {
+  let p = program(
+    b"fn maybe() -> Option<Int> = None\nfn f() -> Int / {abort.raise} = { let c = open(1); let Some(n) = maybe(); send(c, n) }\n",
+  );
+  let b = body_of(p, b"f");
+  assert(unwound_in(b).all(|xs: List<RootKey>| xs == [let_go_of_conn()]), None);
+  let missed = flat(b).fold([], |acc: List<List<RootKey>>, i: Inst|
+    match i { Fail(x) -> acc.push(x.letting.map(|u: Unwinding| u.callee)), _ -> acc });
+  assert_eq(missed, [[let_go_of_conn()]]);
+  assert_eq(calls_in(b).filter(|k: RootKey| k == let_go_of_conn()).len(), 1)
+}
+
+test "a miss lets go of each value whole, lent to its release, past what a `handle` around holds" {
+  let p = program(
+    b"type Pair = | Pair(Conn, Option<Int>)\ntype Held = | Held(Conn, Int)\nfn mk() -> Pair = Pair(open(1), None)\nfn f() -> Held / {abort.raise} = { let Pair(c, Some(n)) = mk(); Held(c, n) }\n",
+  );
+  let b = body_of(p, b"f");
+  assert(
+    !flat(b).any(|i: Inst|
+      match i { Let(l) -> match l.value { Take(_) -> true, _ -> false }, _ -> false }),
+    None,
+  );
+  let r = program(
+    b"fn might() -> Int / {abort.raise} = 1\nfn maybe() -> Option<Int> = None\nfn g() -> Int / {abort.raise} = { let c = open(1); let n = send(c, might()); let Some(m) = maybe(); n + m }\n",
+  );
+  let handings = flat(body_of(r, b"g")).fold([], |acc: List<List<ParamOwnership>>, i: Inst|
+    match i {
+      CleanupScope(Some(xs)) -> acc.concat(xs.map(|u: Unwinding| handed_of(u.convention))),
+      Fail(x) -> acc.concat(x.letting.map(|u: Unwinding| handed_of(u.convention))),
+      _ -> acc,
+    });
+  assert(handings.len() >= 2 && handings.all(|h: List<ParamOwnership>| h == handings.get(0)), None);
+  let q = program(
+    b"fn f(o: Option<Int>) -> Int / {abort.raise} = { let c = open(1); handle { let Some(x) = o; close(c); x } with { abort.raise(m) -> 0 } }\n",
+  );
+  assert(flat(body_of(q, b"f")).any(|i: Inst| match i { Fail(_) -> true, _ -> false }), None)
+}
+
+test "a name an or-pattern's arm binds again leaves each alternative's resource its own release" {
+  let p = program(
+    b"type Either = | L(Conn) | R(Conn)\nfn g(e: keep Either) -> Int = match e { L(c) | R(c) -> { let n = match Some(1) { Some(c) -> c, None -> 0 }; send(c, n) } }\n",
+  );
+  assert_eq(calls_in(body_of(p, b"g")).filter(|k: RootKey| k == let_go_of_conn()).len(), 2)
+}
+
+test "a `let ... else` whose pattern misses lets go of the value it missed" {
+  let p = program(
+    b"type Either = | L(Conn) | R(Conn)\nfn mk() -> Either = R(open(1))\nfn g() -> Int = { let L(c) = mk() else { 0 }; send(c, 1) }\n",
+  );
+  let either = keys::generated_key(
+    ReleaseResource,
+    NamedType({ name: b"m.Either", args: [] }),
+    b"m",
+  );
+  assert(calls_in(body_of(p, b"g")).any(|k: RootKey| k == either), None)
+}
+
+test "an update whose written field fails lets go of the record it updates" {
+  let p = program(
+    b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {abort.raise} = { let h = { conn: open(1), n: 1 }; let r = { ..h, n: might() }; send(r.conn, r.n) }\n",
+  );
+  assert_eq(unwound_in(body_of(p, b"f")).len(), 2)
+}
+
+test "a raise a `handle` in an argument answers lets go of nothing the call holds" {
+  let p = program(
+    b"fn kept(c: keep Conn, n: Int) -> Int = { close(c); n }\nfn f() -> Int = kept(open(1), handle { abort.raise(\"no\"); 1 } with { abort.raise(m) -> 2 })\n",
+  );
+  let inside = flat(body_of(p, b"f")).fold([], |acc: List<List<RootKey>>, i: Inst|
+    match i { Handle(h) -> acc.concat(unwound_in(h.body)), _ -> acc });
+  assert_eq(inside, [])
+}
+
+test "a clause of a `handle` in an argument lowers past what the call holds" {
+  let p = program(
+    b"fn kept(c: keep Conn, d: keep Conn) -> Int = { close(c); close(d); 1 }\nfn f() -> Int = kept(open(1), handle { abort.raise(\"no\"); open(2) } with { abort.raise(m) -> open(3) })\n",
+  );
+  assert(calls_in(body_of(p, b"f")).any(|k: RootKey| k == Named(b"m.kept")), None)
+}
+
+fn logging_release_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"effect log { write note(n: Int) -> Unit }\n",
+    b"pub opaque type Noted = | Noted(Int)\n",
+    b"release for Noted by noted\n",
+    b"pub fn noted(c: keep Noted) -> Unit / {log.write} = match c { Noted(n) -> log.note(n) }\n",
+  ])
+
+fn argument_counts(b: Block, k: RootKey) -> List<Int> =
+  flat(b).fold([], |acc: List<Int>, i: Inst| {
+    let v = match i { Let(l) -> Some(l.value), Do(d) -> Some(d.value), _ -> None };
+    match v {
+      Some(Call(c)) -> if c.callee == Root(k) { acc.push(c.args.len()) } else { acc },
+      _ -> acc,
+    }
+  })
+
+test "a release that performs is handed the word the body holds for it, where its block ends and where a failure unwinds" {
+  let p = program(
+    logging_release_corpus().concat(
+      b"fn might() -> Int / {abort.raise} = 1\nfn f() -> Int / {log.write, abort.raise} = { let c = Noted(1); let n = might(); n }\n",
+    ),
+  );
+  let b = body_of(p, b"f");
+  assert_eq(
+    argument_counts(
+      b,
+      keys::generated_key(ReleaseResource, NamedType({ name: b"m.Noted", args: [] }), b"m"),
+    ),
+    [2],
+  );
+  let words = flat(b).fold([], |acc: List<Int>, i: Inst|
+    match i {
+      CleanupScope(Some(xs)) -> acc.concat(xs.map(|u: Unwinding| u.words.len())),
+      _ -> acc,
+    });
+  assert(words.len() > 0 && words.all(|n: Int| n == 1), None);
+  let q = program(b"fn g() -> Int / {abort.raise} = { let c = open(1); let n = send(c, 1); n }\n");
+  assert_eq(argument_counts(body_of(q, b"g"), let_go_of_conn()), [1])
+}

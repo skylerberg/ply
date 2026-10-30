@@ -1,23 +1,21 @@
-//! Front-end diagnostics in driver order, where a stage that reports stops the rest.
-
-import compiler.syntax.parsing (ParseDiag, Label, Parsed, no_module)
+import compiler.syntax.parsing (ParseDiagnostic, Label, ParseOutput, no_module)
 import compiler.syntax.items (Module, Derivation, header, parse, with_prelude)
-import compiler.syntax.exprs (prelude_module)
+import compiler.syntax.expressions (prelude_module)
 import compiler.expand.rewrite (expand)
-import compiler.syntax.sites (numbered_module)
-import compiler.expand.derive (Expansion, LibraryAsk, LibraryAnswer, expand_derives)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag)
+import compiler.syntax.node_ids (numbered_module)
+import compiler.expand.derive (Expansion, DeriverRequest, DeriverResponse, expand_derives)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
 import compiler.store.hash.forms (build_index)
 import compiler.check.infer (check_diagnostics)
 import std.list
 import compiler.prelude_source
 
-pub fn placed(module: Int, diag: ParseDiag) -> Diag =
+pub fn diagnostic_in_module(module: Int, diagnostic: ParseDiagnostic) -> Diagnostic =
   {
-    code: diag.code,
-    notes: diag.notes,
-    labels: diag.labels.map(|label: Label|
+    code: diagnostic.code,
+    notes: diagnostic.notes,
+    labels: diagnostic.labels.map(|label: Label|
       {
         module: module,
         start: label.start,
@@ -26,15 +24,18 @@ pub fn placed(module: Int, diag: ParseDiag) -> Diag =
         text: label.text,
       }),
     text: b"",
-    message: diag.message,
-    notes_text: diag.notes_text,
-    severity: diag.severity,
+    message: diagnostic.message,
+    notes_text: diagnostic.notes_text,
+    severity: diagnostic.severity,
     fixes: [],
   }
 
-/// `src` is the module's text as its source holds it, which is the text parsed unless a caller
-/// parsed it cut.
-pub type ParsedSource = { name: Bytes, module: ParsedModule, diags: List<Diag>, src: Bytes }
+pub type ParsedSource = {
+  name: Bytes,
+  module: ParsedModule,
+  diagnostics: List<Diagnostic>,
+  src: Bytes,
+}
 
 pub fn parse_all(sources: List<Source>) -> List<ParsedSource> / {abort.raise} =
   range(0, sources.len()).map(|i: Int| parse_at(i, sources.get(i)))
@@ -42,94 +43,94 @@ pub fn parse_all(sources: List<Source>) -> List<ParsedSource> / {abort.raise} =
 pub fn parse_at(i: Int, source: Source) -> ParsedSource / {abort.raise} =
   parse_from(i, source, parse(source.src))
 
-/// `parse_at` over `r`, what `parse` made of `source`'s text, each derivation `taken` holds expanded
-/// as [`expand_derives`] expands one, and each library derivation run by `library`.
 pub fn parse_from<| e>(
   i: Int,
   source: Source,
-  r: Parsed<Module>,
-  taken: List<Derivation> = [],
-  library: Option<(LibraryAsk) -> LibraryAnswer / {abort.raise | e}> = None,
+  r: ParseOutput<Module>,
+  derivations: List<Derivation> = [],
+  library: Option<(DeriverRequest) -> DeriverResponse / {abort.raise | e}> = None,
 ) -> ParsedSource / {abort.raise | e} = {
-  let x = expand(with_prelude(source.name, numbered_module(r.node)), r.parser.diags);
-  let front = x.diags.map(|d: ParseDiag| placed(i, d));
-  if front.len() > 0 {
+  let x = expand(with_prelude(source.name, numbered_module(r.node)), r.parser.diagnostics);
+  let parse_diagnostics = x.diagnostics.map(|d: ParseDiagnostic| diagnostic_in_module(i, d));
+  if parse_diagnostics.len() > 0 {
     {
       name: source.name,
       module: { name: source.name, module: x.module, derived: [] },
-      diags: front,
+      diagnostics: parse_diagnostics,
       src: source.src,
     }
   } else {
-    let d: Expansion = expand_derives(i, source.name, x.module, taken: taken, library: library);
+    let d: Expansion = expand_derives(
+      i,
+      source.name,
+      x.module,
+      previous: derivations,
+      library: library,
+    );
     {
       name: source.name,
       module: { name: source.name, module: d.module, derived: d.derived },
-      diags: d.diags,
+      diagnostics: d.diagnostics,
       src: source.src,
     }
   }
 }
 
-/// `parse_at` as far as a module's imports go: its header where that says what it imports, which
-/// holds no item, else the whole parse.
-pub fn headed_at(i: Int, source: Source) -> ParsedSource / {abort.raise} =
+pub fn parse_header_at(i: Int, source: Source) -> ParsedSource / {abort.raise} =
   match header(source.src) {
     None -> parse_at(i, source),
     Some(m) ->
       {
         name: source.name,
         module: { name: source.name, module: with_prelude(source.name, m), derived: [] },
-        diags: [],
+        diagnostics: [],
         src: source.src,
       },
   }
 
-/// `sources` with `std.prelude` past them, as the toolchain ships it, where none of them is it:
-/// every module imports it.
 pub fn with_prelude_source(sources: List<Source>) -> List<Source> =
   if sources.any(|s: Source| s.name == prelude_module()) { sources }
   else { sources.push({ name: prelude_module(), src: prelude_source::text() }) }
 
-pub fn diagnostics(sources: List<Source>) -> List<Diag> / {abort.raise} = {
+pub fn diagnostics(sources: List<Source>) -> List<Diagnostic> / {abort.raise} = {
   let parsed = parse_all(with_prelude_source(sources));
-  let front = parsed.fold([], |acc: List<Diag>, p: ParsedSource| acc.concat(p.diags));
-  if front.len() > 0 { front } else {
+  let parse_diagnostics = parsed.fold([], |acc: List<Diagnostic>, p: ParsedSource|
+    acc.concat(p.diagnostics));
+  if parse_diagnostics.len() > 0 { parse_diagnostics } else {
     let later = match resolve_modules(parsed.map(|p: ParsedSource| p.module)) {
       ResolveFailed(ds) -> ds,
       ResolveSucceeded(x) -> {
-        let built = build_index(x.mods, x.r);
-        if built.diags.len() > 0 { built.diags } else { check_diagnostics(x.r, x.mods) }
+        let built = build_index(x.modules, x.r);
+        if built.diagnostics.len() > 0 { built.diagnostics }
+        else { check_diagnostics(x.r, x.modules) }
       },
     };
     later.map(outside_every_module)
   }
 }
 
-/// A `(0, 0)` label is `dummy_span`, except on the module-name clash, which really sits at offset 0.
-pub fn outside_every_module(diag: Diag) -> Diag =
-  if diag.code == b"E0105" && diag.message.starts_with(b"two files claim") { diag } else {
+pub fn outside_every_module(diagnostic: Diagnostic) -> Diagnostic =
+  if diagnostic.code == b"E0105" && diagnostic.message.starts_with(b"two files claim") {
+    diagnostic
+  } else {
     {
-      code: diag.code,
-      notes: diag.notes,
-      labels: diag.labels.map(
+      code: diagnostic.code,
+      notes: diagnostic.notes,
+      labels: diagnostic.labels.map(
         |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
           if l.start == 0 && l.end == 0 {
             { module: no_module(), start: 0, end: 0, primary: l.primary, text: l.text }
           } else { l },
       ),
-      text: diag.text,
-      message: diag.message,
-      notes_text: diag.notes_text,
-      severity: diag.severity,
-      fixes: diag.fixes,
+      text: diagnostic.text,
+      message: diagnostic.message,
+      notes_text: diagnostic.notes_text,
+      severity: diagnostic.severity,
+      fixes: diagnostic.fixes,
     }
   }
 
-// --- Tests ------------------------------------------------------------------
-
-/// The one diagnostic a program's text draws.
-fn only(src: Bytes) -> Diag / {abort.raise} = {
+fn only(src: Bytes) -> Diagnostic / {abort.raise} = {
   let ds = diagnostics([{ name: b"m", src: src }]);
   assert_eq(ds.len(), 1);
   ds.get(0)

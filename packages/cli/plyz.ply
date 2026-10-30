@@ -1,17 +1,12 @@
-//! A library's `.plyz`, section by section: every module's source framed `module <name> <length>`
-//! and its bytes, the package's `ply.pkg` text, and the compiled unit. The container around them is
-//! `compiler.store.plyx`'s; `ply build` writes these sections and `ply resolve` reads them back.
-
-import deployed (Compiled)
+import artifact_builder (LibraryUnit)
 import sources (File)
 import compiler.front.rows (module_of)
-import compiler.store.plyx (Placed, Section, decode_library, digest_of, library_domain)
+import compiler.store.plyx (SectionLocation, Section, decode_library, digest_of, library_domain)
 import std.bytes
 import std.list
 import std.string
-import deployed
+import artifact_builder
 
-/// One module's source, framed as `module <name> <length>` and its bytes.
 pub fn source_frame(file: File) -> Bytes =
   Bytes::concat_all([
     b"module ",
@@ -22,24 +17,18 @@ pub fn source_frame(file: File) -> Bytes =
     file.text,
   ])
 
-pub fn sections(files: List<File>, manifest: Bytes, unit: Compiled) -> List<Section> =
+pub fn sections(files: List<File>, manifest: Bytes, unit: LibraryUnit) -> List<Section> =
   [
     { name: b"sources", count: files.len(), payload: Bytes::concat_all(files.map(source_frame)) },
     { name: b"manifest", count: 1, payload: manifest },
     { name: b"unit", count: unit.count, payload: unit.payload },
   ]
 
-// --- Reading ------------------------------------------------------------------
-
 pub type Module = { name: String, path: String, text: Bytes }
 
-/// An archive as a consumer takes it: the digest its bytes seal, the `ply.pkg` text, and each
-/// module with the path it is written back to under the package's directory.
-pub type Unpacked = { digest: Bytes, manifest: Bytes, modules: List<Module> }
+pub type ArchiveContents = { digest: Bytes, manifest: Bytes, modules: List<Module> }
 
-/// What an archive holds, or why it holds nothing a consumer may use: a container that is not a
-/// library, a digest field its bytes do not seal, or a section that does not read.
-pub fn unpacked(b: Bytes) -> Result<Unpacked, String> / {abort.raise} =
+pub fn unpack(b: Bytes) -> Result<ArchiveContents, String> / {abort.raise} =
   match decode_library(b) {
     Err(r) -> Err(String::of_bytes_lossy(r.message)),
     Ok(x) -> match digest_of(library_domain(), b) {
@@ -47,13 +36,14 @@ pub fn unpacked(b: Bytes) -> Result<Unpacked, String> / {abort.raise} =
       Some(d) -> if d != x.digest {
         Err("the archive's digest field is not the digest of its bytes")
       } else {
-        match placed(x.sections, b"manifest") {
+        match section_named(x.sections, b"manifest") {
           None -> Err("the archive holds no manifest"),
-          Some(m) -> match placed(x.sections, b"sources") {
+          Some(m) -> match section_named(x.sections, b"sources") {
             None -> Err("the archive holds no sources"),
-            Some(s) -> match frames(deployed::payload(b, s), s.count, 0, [], s.count + 1) {
+            Some(s) -> match frames(artifact_builder::payload(b, s), s.count, 0, [], s.count + 1) {
               Err(why) -> Err(why),
-              Ok(modules) -> Ok({ digest: d, manifest: deployed::payload(b, m), modules: modules }),
+              Ok(modules) ->
+                Ok({ digest: d, manifest: artifact_builder::payload(b, m), modules: modules }),
             },
           },
         }
@@ -61,11 +51,10 @@ pub fn unpacked(b: Bytes) -> Result<Unpacked, String> / {abort.raise} =
     },
   }
 
-fn placed(sections: List<Placed>, name: Bytes) -> Option<Placed> =
-  sections.fold(None, |found: Option<Placed>, p: Placed|
+fn section_named(sections: List<SectionLocation>, name: Bytes) -> Option<SectionLocation> =
+  sections.fold(None, |found: Option<SectionLocation>, p: SectionLocation|
     match found { Some(_) -> found, None -> if p.name == name { Some(p) } else { None } })
 
-/// `left` bounds the rounds: each adds a module, and `count` are wanted.
 fn frames(
   src: Bytes,
   count: Int,
@@ -115,8 +104,6 @@ fn frame_at(src: Bytes, at: Int) -> Result<{ module: Module, next: Int }, String
     }
   }
 
-/// A module's name is the path it is written back to, and only a name `module_of` would give a file
-/// is one: a hostile archive cannot name its way out of the package's directory.
 fn path_of(name: String) -> Result<String, String> / {abort.raise} = {
   let path = slashed(name) ++ ".ply";
   match module_of(path) {
@@ -133,14 +120,12 @@ fn slashed(name: String) -> String =
 fn length_of(text: String) -> Option<Int> / {abort.raise} =
   if text.len() > 12 || text.starts_with("-") { None } else { text.int_of_string() }
 
-// --- Tests ------------------------------------------------------------------
-
 fn a_file(module: String, text: Bytes) -> File = {
   let path = slashed(module) ++ ".ply";
   { path: path, module: module, text: text, at: { label: "cwd", path: path } }
 }
 
-fn nothing_compiled() -> Compiled =
+fn nothing_compiled() -> LibraryUnit =
   { head: { frontend: b"", runtime: b"", entry: b"" }, count: 0, payload: b"" }
 
 test "a library frames every module's source under its name" {

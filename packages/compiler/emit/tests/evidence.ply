@@ -1,0 +1,140 @@
+import compiler.check.types (NamedType, SingletonResource, NamedResource, ResourceVariable)
+import compiler.emit.keys (Evidence)
+import compiler.emit.evidence (evidence_type, max_evidence_params)
+import compiler.emit.output (GenericCall, Need, RowGeneric)
+import compiler.emit.typed_ir (handed_of, reps_of, AsImmediate, AsInt, Var, Arg, VarOperand,
+                               ZeroOperand, Rvalue, Call, Apply, Static, Op, OfHandling, Inst, Let,
+                               Do, Handle, Fn, Block, Return, Lambda, Closure)
+import compiler.emit.typed_ir.handling (WordArray, ObjectAt)
+import compiler.emit.emit_harness (Program, program_of, lowered_root, checked, printed_by_ir)
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"effect link {\n  write send[s](payload: Int) -> Int\n}\n",
+    b"fn noted(n: Int) -> Unit / {log.note, abort.raise} = if n < 0 { abort.raise(\"no\") } else { log.note(n) }\n",
+    b"fn relayed(n: Int) -> Unit / {log.note, abort.raise} = noted(n)\n",
+    b"fn quiet(n: Int) -> Unit / {abort.raise} = handle { noted(n) } with { log.note(_n) -> () }\n",
+    b"fn apply<|e>(f: () -> Int / e) -> Int / e = f()\n",
+    b"fn logged() -> Int / {log.note} = apply(|| { log.note(1); 2 })\n",
+    b"fn sent<[l]>(x: Int) -> Int / {link.send[l]} = apply(|| link.send[l](x))\n",
+    b"fn wide() -> Unit / {a.x, b.x, c.x, d.x, e.x} = { a.x(); b.x(); c.x(); d.x(); e.x() }\n",
+    b"effect a {\n  write x() -> Unit\n}\n",
+    b"effect b {\n  write x() -> Unit\n}\n",
+    b"effect c {\n  write x() -> Unit\n}\n",
+    b"effect d {\n  write x() -> Unit\n}\n",
+    b"effect e {\n  write x() -> Unit\n}\n",
+    b"fn widely() -> Unit / {a.x, b.x, c.x, d.x, e.x} = wide()\n",
+    b"fn through<|e>(f: () -> Int / {abort.raise | e}) -> Int / {abort.raise | e} = f()\n",
+    b"fn noting() -> Int / {log.note} = { log.note(1); 2 }\n",
+    b"fn named_noting() -> Int / {log.note, abort.raise} = through(noting)\n",
+  ])
+
+fn program() -> Program / {abort.raise} =
+  match program_of(corpus()) { Ok(p) -> p, Err(why) -> panic(String::of_bytes_lossy(why)) }
+
+fn lowered(name: Bytes) -> Fn / {abort.raise} = lowered_root(program(), name)
+
+fn vals(b: Block) -> List<Rvalue> =
+  b.fold([], |acc: List<Rvalue>, i: Inst|
+    match i {
+      Let(l) -> acc.push(l.value),
+      Do(d) -> acc.push(d.value),
+      Handle(h) -> acc.concat(vals(h.body)),
+      _ -> acc,
+    })
+
+fn call_arguments(f: Fn) -> List<List<Arg>> =
+  vals(f.body).fold([], |acc: List<List<Arg>>, v: Rvalue|
+    match v { Call(c) -> acc.push(c.args), _ -> acc })
+
+fn evidence_of(name: Bytes) -> Evidence = { effect: name, resource: SingletonResource }
+
+test "a definition takes a word for each effect and resource its row names, past its parameters" {
+  let f = lowered(b"noted");
+  assert_eq(f.params.map(|v: Var| v.representation), [AsInt, AsImmediate, AsImmediate]);
+  assert_eq(f.params.drop(1).map(|v: Var| v.ty), [evidence_type(), evidence_type()]);
+  assert_eq(f.convention.params.len(), 3)
+}
+
+test "a call hands its callee the words the caller holds, and a handle around it its own" {
+  let relayed = lowered(b"relayed");
+  assert_eq(call_arguments(relayed), [
+    [
+      VarOperand(relayed.params.get(0)),
+      VarOperand(relayed.params.get(1)),
+      VarOperand(relayed.params.get(2)),
+    ],
+  ]);
+  let quiet = lowered(b"quiet");
+  assert_eq(call_arguments(quiet).map(|args: List<Arg>| args.drop(1)), [
+    [VarOperand(quiet.params.get(1))].concat(evidence_objects(quiet.body).map(VarOperand)),
+  ])
+}
+
+fn evidence_objects(b: Block) -> List<Var> =
+  b.fold([], |acc: List<Var>, i: Inst|
+    match i {
+      Let(l) -> match l.value {
+        Op(o) -> match o.op { OfHandling(ObjectAt(_)) -> acc.push(l.var), _ -> acc },
+        _ -> acc,
+      },
+      Handle(h) -> acc.concat(evidence_objects(h.body)),
+      _ -> acc,
+    })
+
+test "more words than a function takes apart go as one array" {
+  let wide = lowered(b"wide");
+  assert_eq(wide.params.len(), 1);
+  assert(5 > max_evidence_params(), None);
+  let widely = lowered(b"widely");
+  assert_eq(
+    vals(widely.body).any(|v: Rvalue|
+      match v { Op(o) -> o.op == OfHandling(WordArray), _ -> false }),
+    true,
+  )
+}
+
+test "a definition generic over rows is settled by its callers, at the rows they hand words for" {
+  assert_eq(lowered(b"apply").links.needs.contains({ var: 0 - 1, reads: RowGeneric }), true);
+  let logged = lowered(b"logged");
+  assert_eq(logged.links.generics.map(|g: GenericCall| g.rows), [[[evidence_of(b"m.log")]]]);
+  let sent = lowered(b"sent");
+  assert_eq(sent.links.generics.map(|g: GenericCall| g.rows), [
+    [[{ effect: b"m.link", resource: ResourceVariable(0) }]],
+  ]);
+  match call_arguments(sent).at(0) {
+    Some(args) -> assert_eq(args.len(), 3),
+    None -> assert(false, Some("`sent` calls nothing")),
+  }
+}
+
+test "a call of a function value hands it its row's descriptor and an array of the words" {
+  let logged = lowered(b"logged");
+  let applies = vals(logged.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false });
+  assert_eq(applies, []);
+  let apply = lowered(b"apply");
+  let applied = vals(apply.body).fold([], |acc: List<List<Arg>>, v: Rvalue|
+    match v { Apply(c) -> acc.push(c.args), _ -> acc });
+  assert_eq(applied.map(|args: List<Arg>| args.len()), [2]);
+  assert(vals(apply.body).any(|v: Rvalue| match v { Static(_) -> true, _ -> false }), None)
+}
+
+test "each form with words checks and prints" {
+  let p = program();
+  [b"noted", b"relayed", b"quiet", b"logged", b"sent", b"wide", b"widely"].map(|n: Bytes|
+    match printed_by_ir(p, n) {
+      Ok(_) -> (),
+      Err(why) -> panic(String::of_bytes_lossy(n.concat(b": ").concat(why))),
+    });
+  ()
+}
+
+test "a definition handed as a value to a function generic over its row takes its words from the call" {
+  let named = lowered(b"named_noting");
+  assert_eq(named.links.generics.map(|g: GenericCall| g.rows), [[[evidence_of(b"m.log")]]]);
+  assert_eq(named.lambdas.map(|l: Lambda| match l { Closure(c) -> c.words.count }), [1]);
+  let applied = vals(lowered(b"through").body).filter(|v: Rvalue|
+    match v { Apply(_) -> true, _ -> false });
+  assert_eq(applied.len(), 1)
+}

@@ -3,18 +3,19 @@
 
 import compiler.emit.code (Code)
 import context (Context, inhabited)
-import domain (Ty)
+import domain (Sort)
 import lemma (Lemma)
 import rules (RuleLog, Rule)
-import solve (Solver, Answer, Closed, refute)
-import sort (bool_ty, is_con, vars)
-import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym, TOpaque, TLin,
-             TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TEqualAt, TIf,
-             TMatch, Mono, Arm, TestLit, Ge, Le, size, node, sort_of, int_lit, cmp, and, op_add,
-             op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and, op_bit_or, op_bit_xor,
-             op_bit_not, op_shl, op_shr, op_ushr)
+import solve (Solver, Verdict, Closed, refute)
+import sort (bool_sort, is_named_sort, vars)
+import term (Terms, InternedTerm, Node, IntTerm, BoolTerm, StringTerm, DecimalTerm, FixedTerm,
+             UnitTerm, SymbolTerm, OpaqueTerm, LinearSumTerm, ApplicationTerm, ConstructorTerm,
+             NilTerm, ConsTerm, RecordTerm, FieldTerm, NotTerm, AndTerm, OrTerm, CompareTerm,
+             EqualTerm, EqualAtTerm, IfTerm, MatchTerm, Monomial, Arm, TestLiteral, Ge, Le, size,
+             node, sort_of, int_literal, cmp, and, op_add, op_sub, op_mul, op_div, op_rem,
+             op_concat, op_bit_and, op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr)
 
-pub type Binder = { name: String, ty: Ty }
+pub type Binder = { name: String, ty: Sort }
 
 /// Binder `i` is slot `i` of every clause's window. For an `ensures`: the owner's parameters then
 /// `result`, the guards are the `requires` beside it, and `result` is the definition's body; for a
@@ -36,7 +37,7 @@ pub type Goal = {
   /// The definitions of this package whose `ensures` are proved, which a call of one may stand on.
   contracts: List<String>,
   /// For an `ensures` of a definition that ends: the clause, which holds at each call back into it.
-  inducting: Option<{ name: String, clause: Int }>,
+  induction_hypothesis: Option<{ name: String, clause: Int }>,
   /// For a definition's values of a type that states an invariant: the type and its function. The
   /// claim is that each value of it the body builds satisfies it.
   builds: Option<{ type_name: String, by: String }>,
@@ -55,7 +56,7 @@ pub fn default_unfold_depth() -> Int = 3
 pub fn default_limits() -> Limits =
   { steps: default_prove_budget(), unfold_depth: default_unfold_depth(), split_depth: 48 }
 
-pub type Reason = | Open | BudgetSpent
+pub type UnknownReason = | Open | BudgetSpent
 
 /// `rules` in application order; `sorts` the type variables left as uninterpreted sorts, ascending;
 /// `guard_satisfiable` when there is no guard, or a valid one over an inhabited domain.
@@ -64,21 +65,27 @@ pub type Proof = { rules: List<Rule>, steps: Int, sorts: List<Int>, guard_satisf
 pub type Assertion = { term: Int, polarity: Bool }
 
 /// A refutation's store and log after it ran, what it came to, and the budget it left.
-pub type Ran = { terms: Terms, rules: RuleLog, answer: Answer, left: Int }
+pub type RefutationResult = { terms: Terms, rules: RuleLog, result: Verdict, left: Int }
 
-pub fn run(
+pub fn run_refutation(
   terms: Terms,
   context: Context,
   rules: RuleLog,
   budget: Int,
   limits: Limits,
   assertions: List<Assertion>,
-) -> Ran / {abort.raise} = {
+) -> RefutationResult / {abort.raise} = {
   let r = refute(
-    { terms: terms, rules: rules, budget: budget, split_depth: limits.split_depth, cx: context },
+    {
+      terms: terms,
+      rules: rules,
+      budget: budget,
+      split_depth: limits.split_depth,
+      context: context,
+    },
     assertions,
   );
-  { terms: r.sv.terms, rules: r.sv.rules, answer: r.answer, left: r.sv.budget }
+  { terms: r.solver.terms, rules: r.solver.rules, result: r.result, left: r.solver.budget }
 }
 
 pub fn conjunction(
@@ -114,19 +121,19 @@ pub fn int_ranges(
   computed: Option<Int>,
   skip: Map<Int, Bool>,
 ) -> { terms: Terms, out: List<Assertion> } / {abort.raise} = {
-  let derived = derived_from(terms, computed);
+  let derived = terms_containing(terms, computed);
   let atoms = range(0, size(terms)).filter(|t: Int|
     derived.at(t) != Some(true) && !skip.contains(t)
       && (match node(terms, t) {
-        TSym(_) -> true,
-        TField(_) -> true,
-        TApp(a) -> match node(terms, a.head) {
-          TOpaque(name) -> !is_operator_symbol(name),
+        SymbolTerm(_) -> true,
+        FieldTerm(_) -> true,
+        ApplicationTerm(a) -> match node(terms, a.head) {
+          OpaqueTerm(name) -> !is_operator_symbol(name),
           _ -> true,
         },
         _ -> false,
       })
-      && (match sort_of(terms, t) { Some(s) -> is_con(s, "Int"), None -> false }));
+      && (match sort_of(terms, t) { Some(s) -> is_named_sort(s, "Int"), None -> false }));
   ranges_of(terms, atoms)
 }
 
@@ -136,11 +143,11 @@ pub fn ranges_of(
   candidates: List<Int>,
 ) -> { terms: Terms, out: List<Assertion> } / {abort.raise} = {
   let atoms = candidates.filter(|a: Int|
-    match sort_of(terms, a) { Some(s) -> is_con(s, "Int"), None -> false });
-  let min = int_lit(terms, 0 - 9223372036854775807 - 1);
-  let max = int_lit(min.terms, 9223372036854775807);
-  let zero = int_lit(max.terms, 0);
-  let below_max = int_lit(zero.terms, 9223372036854775806);
+    match sort_of(terms, a) { Some(s) -> is_named_sort(s, "Int"), None -> false });
+  let min = int_literal(terms, 0 - 9223372036854775807 - 1);
+  let max = int_literal(min.terms, 9223372036854775807);
+  let zero = int_literal(max.terms, 0);
+  let below_max = int_literal(zero.terms, 9223372036854775806);
   atoms.fold(
     { terms: below_max.terms, out: [] },
     |acc: { terms: Terms, out: List<Assertion> }, a: Int| {
@@ -157,12 +164,15 @@ pub fn ranges_of(
 
 fn is_length(terms: Terms, t: Int) -> Bool / {abort.raise} =
   match node(terms, t) {
-    TApp(a) -> match node(terms, a.head) { TOpaque(name) -> name == "List::len", _ -> false },
+    ApplicationTerm(a) -> match node(terms, a.head) {
+      OpaqueTerm(name) -> name == "List::len",
+      _ -> false,
+    },
     _ -> false,
   }
 
 /// Terms containing `root`, in one pass: the store makes children before their parents.
-pub fn derived_from(terms: Terms, root: Option<Int>) -> List<Bool> / {abort.raise} =
+pub fn terms_containing(terms: Terms, root: Option<Int>) -> List<Bool> / {abort.raise} =
   match root {
     None -> range(0, size(terms)).map(|_: Int| false),
     Some(r) ->
@@ -178,23 +188,23 @@ pub fn derived_from(terms: Terms, root: Option<Int>) -> List<Bool> / {abort.rais
 
 pub fn children(n: Node) -> List<Int> =
   match n {
-    TLin(p) -> p.monomials.map(|m: Mono| m.term),
-    TApp(a) -> a.args.fold([a.head], |acc: List<Int>, x: Int| acc.push(x)),
-    TCtor(c) -> c.args,
-    TCons(c) -> [c.head, c.tail],
-    TRecord(fields) -> fields.map(|f: { name: String, value: Int }| f.value),
-    TField(f) -> [f.base],
-    TNot(a) -> [a],
-    TAnd(a, b) -> [a, b],
-    TOr(a, b) -> [a, b],
-    TCmp(c) -> [c.lhs, c.rhs],
-    TEq(e) -> [e.lhs, e.rhs],
-    TEqualAt(e) -> [e.lhs, e.rhs],
-    TIf(i) -> [i.cond, i.then_branch, i.else_branch],
-    TMatch(m) ->
+    LinearSumTerm(p) -> p.monomials.map(|m: Monomial| m.term),
+    ApplicationTerm(a) -> a.args.fold([a.head], |acc: List<Int>, x: Int| acc.push(x)),
+    ConstructorTerm(c) -> c.args,
+    ConsTerm(c) -> [c.head, c.tail],
+    RecordTerm(fields) -> fields.map(|f: { name: String, value: Int }| f.value),
+    FieldTerm(f) -> [f.base],
+    NotTerm(a) -> [a],
+    AndTerm(a, b) -> [a, b],
+    OrTerm(a, b) -> [a, b],
+    CompareTerm(c) -> [c.lhs, c.rhs],
+    EqualTerm(e) -> [e.lhs, e.rhs],
+    EqualAtTerm(e) -> [e.lhs, e.rhs],
+    IfTerm(i) -> [i.cond, i.then_branch, i.else_branch],
+    MatchTerm(m) ->
       m.arms.fold([m.scrutinee], |acc: List<Int>, arm: Arm| {
         let with_body = arm.binds.fold(acc, |a: List<Int>, x: Int| a.push(x)).push(arm.body);
-        match arm.test { TestLit(literal) -> with_body.push(literal), _ -> with_body }
+        match arm.test { TestLiteral(literal) -> with_body.push(literal), _ -> with_body }
       }),
     _ -> [],
   }
@@ -217,10 +227,5 @@ fn is_operator_symbol(name: String) -> Bool =
     op_ushr(),
   ].fold(false, |f: Bool, op: String| f || op == name)
 
-pub fn set_of(xs: List<Int>) -> Map<Int, Bool> =
-  xs.fold(Map::new(), |m: Map<Int, Bool>, x: Int| m.insert(x, true))
-
-pub fn names_set(xs: List<String>) -> Map<String, Bool> =
-  xs.fold(Map::new(), |m: Map<String, Bool>, x: String| m.insert(x, true))
-
-pub fn with_true(ids: List<Int>) -> List<Assertion> = ids.map(|t: Int| { term: t, polarity: true })
+pub fn true_assertions(ids: List<Int>) -> List<Assertion> =
+  ids.map(|t: Int| { term: t, polarity: true })

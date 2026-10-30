@@ -1,108 +1,99 @@
-//! A root's `Code` lowered to the typed form. Each node is typed from its parts as it is lowered, so
-//! a type belongs to its node and not to its place in the text; each value is held as its type
-//! says. This module holds the one recursion over a body; each construct's family lowers it from its
-//! parts (`emit.lower.*`), and where a construct holds code, says what state each part is lowered
-//! in and assembles the construct from the parts lowered.
-
 import std.list (zip)
-import compiler.emit.code (Code, read_name, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary,
-                           NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda,
-                           NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, CodeStmt, CLet,
-                           CLetPat, CDo, CodeField, CodeArm, CodeClause, CodePattern,
-                           is_label_binder)
+import compiler.emit.code (Code, read_name, CodeLiteral, CodeVar, NDefinition, NConstructor,
+                           NBuiltin, CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
+                           CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda, CodeSimulate,
+                           CodeParallel, CodeHandle, CodeFieldRead, CodeUpdate, CodeKnownLambda,
+                           CodeStatement, CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm,
+                           CodeClause, CodePattern, is_label_binder)
 import compiler.syntax.parsing (Span)
-import compiler.syntax.patterns (LUnit)
-import compiler.syntax.exprs (detached_at, scheduler_module)
-import compiler.emit.reps (Def, resumed, no_ctors)
+import compiler.syntax.patterns (LiteralUnit)
+import compiler.syntax.expressions (detached_closure_span, scheduler_module)
+import compiler.emit.representations (Definition, resumed, no_constructors)
 import compiler.emit.typing (unknown_type)
-import compiler.emit.tir (Arg, RBool, RSlice, Return, Fn, Rooted, falls_through, rep_of_arg,
-                          Unwinds, Unwound, Fail, NoLet, var_of)
-import compiler.emit.lower.setting (Setting, Root)
+import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Fn, Metered, falls_through,
+                               operand_representation, CleanupScope, Unwinding, Fail, LetMismatch,
+                               operand_var)
+import compiler.emit.lower.module_context (ModuleContext, Root)
 import compiler.emit.keys (Named, root_name, root_text, module_of)
 import compiler.check.types (Type, row_empty)
-import compiler.emit.lower.base (Context, Lowering, Lowered, ToCtor, ToBuiltin, ToDef, ToValue,
-                                 ToInPlace, Armed, GroupMember, started, unreachable, opened,
-                                 continued, joined, short_circuit, handed, read_noted, read_note,
-                                 read_taken, unviewed, type_of, noted, none_held, emitted)
-import compiler.emit.lower.data (constructed, recorded, field, updated)
+import compiler.emit.lower.base (Context, Lowering, LoweredValue, ToConstructor, ToBuiltin,
+                                 ToDefinition, ToValue, ToInlinedBody, LoweredArm, GroupMember,
+                                 initial_lowering, unreachable, enter_block, exit_block, joined,
+                                 short_circuit, represented_as, note_slot_read, read_note,
+                                 typed_slot_read, list_of_view, type_of, noted,
+                                 no_captured_evidence, emitted)
+import compiler.emit.lower.data (constructed, record_literal, field, record_update)
 import compiler.emit.lower.scalars (literal, constant, operand, unary, binary, unwound)
-import compiler.emit.lower.containers (listed, columned, column_read)
-import compiler.emit.lower.matching (arm_opened, closed, let_bound, let_missed, compared_side,
+import compiler.emit.lower.containers (list_literal, reads_column, column_read)
+import compiler.emit.lower.matching (arm_start, match_joined, let_bound, let_else, compared_side,
                                      compared_args, compared)
-import compiler.emit.lower.calling (convention, params_held, target, global, known, called, applied,
-                                    entered, left, run_at, counted_at, named_run, lambda_opened,
-                                    closure, group_opened, grouped, known_body, step_captured,
-                                    context_of, called_builtin, resumption_closed, called_at_types,
-                                    simulate_called, laid_here, known_run, known_applied)
-import compiler.emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
-                                     branched, handle_entered, handle_planned, clause_held,
-                                     instance_objects, detached_landed, detaches, crossing_of,
-                                     Planned)
-import compiler.emit.lower.evidence (handed_to, root_opened, entry_opened, words_of,
-                                     handed_param_types, performed_by, held_routed)
+import compiler.emit.lower.calling (convention, parameter_representations, target, global_value,
+                                    known_lambda_read, called, applied, enter_inlined, exit_inlined,
+                                    inlined_argument, range_argument, named_function_call,
+                                    lambda_body_start, closure, group_body_starts, tail_group_root,
+                                    known_body, note_step_captures, context_of, called_builtin,
+                                    continuation_closure, called_at_types, simulate_called,
+                                    stack_allocated, known_run, known_applied)
+import compiler.emit.lower.handling (performed, label, clause_frame, return_frame, body_frame,
+                                     handle_assembled, parallel_block, enter_handle, handle_plan,
+                                     clause_captured_evidence, instance_objects, detached_landing,
+                                     detaches, scheduler_perform_call, HandlePlan)
+import compiler.emit.lower.evidence (evidence_parameters, root_body_start, entry_body_start,
+                                     words_of, evidence_parameter_types, performed_by,
+                                     captured_evidence_for)
 import compiler.emit.evidence (evidence_type)
-import compiler.emit.answer (Rowed)
+import compiler.emit.output (RowGeneric)
 import compiler.emit.statics (folded)
 
-/// Root `r` of `setting` lowered as a build lowers it: its body after `known_body`, so a slot known
-/// to hold a lambda reads as that lambda.
-pub fn root_lowered(setting: Setting, r: Root) -> Fn / {abort.raise} = {
+pub fn root_lowered(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn(context_of(setting, r, body), body)
 }
 
-/// Root `r` lowered as `root_lowered` lowers it, noting where each slot is read and where each
-/// closure captures one, for `emit.moves` to read its moves off.
-pub fn root_observed(setting: Setting, r: Root) -> Fn / {abort.raise} = {
+pub fn root_observed(setting: ModuleContext, r: Root) -> Fn / {abort.raise} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn({ ..context_of(setting, r, body), observing: true }, body)
 }
 
-/// The roots of one tail group of `setting` lowered as a build lowers them: as one root, keyed as its
-/// first member.
-pub fn group_lowered(setting: Setting, roots: List<Root>) -> Fn / {abort.raise} =
+pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Fn / {abort.raise} =
   lowered_group(
     roots.map(|r: Root| {
       let body = known_body(root_text(root_name(r.key)), r.params, r.code);
-      { cx: context_of(setting, r, body), body: body }
+      { context: context_of(setting, r, body), body: body }
     }),
   )
 
-/// A call in tail position of a definition of the module, and the type arguments it names it at.
 pub type TailCall = { full: Bytes, args: List<Type> }
 
-/// The calls `code` makes in tail position of definitions of `here`, after `acc`.
 pub fn tail_calls(
-  here: List<Def>,
+  here: List<Definition>,
   code: Code,
   acc: List<TailCall>,
 ) -> List<TailCall> / {abort.raise} =
   match code.node {
-    NApp(a) -> match a.func.node {
-      NDef(d) -> if here.any(|h: Def| h.root == Named(d.full) && h.arity == a.args.len()) {
+    CodeApply(a) -> match a.function.node {
+      NDefinition(d) -> if here.any(|h: Definition|
+          h.root == Named(d.full) && h.arity == a.args.len()) {
         acc.push({ full: d.full, args: d.args })
       } else { acc },
       _ -> acc,
     },
-    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_calls(here, b.rhs, acc) } else { acc },
-    NIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, acc)),
-    NBlock(b) -> match b.tail { Some(t) -> tail_calls(here, t, acc), None -> acc },
-    NMatch(m) -> m.arms.fold(acc, |a: List<TailCall>, arm: CodeArm| tail_calls(here, arm.body, a)),
+    CodeBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_calls(here, b.rhs, acc) }
+    else { acc },
+    CodeIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, acc)),
+    CodeBlock(b) -> match b.tail { Some(t) -> tail_calls(here, t, acc), None -> acc },
+    CodeMatch(m) ->
+      m.arms.fold(acc, |a: List<TailCall>, arm: CodeArm| tail_calls(here, arm.body, a)),
     _ -> acc,
   }
 
-/// Clause closure `k` of a `handle` planned as `plan`, laid in this frame where the instance is:
-/// the instance's records are all that hold it, and they die with the frame.
-fn held_closure(plan: Planned, k: Lowered) -> Lowered =
-  match plan.instance.block { None -> laid_here(k), Some(_) -> k }
+fn stack_closure(plan: HandlePlan, k: LoweredValue) -> LoweredValue =
+  match plan.instance.block { None -> stack_allocated(k), Some(_) -> k }
 
-/// The closure `task.spawn` is handed, written `x`, a lambda the expansion made of any other value:
-/// holding the words its row takes as they stand at the spawn and the heap instances they live in,
-/// since the region runs it handing none and the task may outlive the function spawning it.
-fn spawned(cx: Context, st: Lowering, x: Code) -> Lowered / {abort.raise} =
+fn spawned(context: Context, state: Lowering, x: Code) -> LoweredValue / {abort.raise} =
   match x.node {
-    NLambda(l) -> {
-      let held = held_routed(cx, st, words_of(cx, l.row), l.at);
+    CodeLambda(l) -> {
+      let held = captured_evidence_for(context, state, words_of(context, l.row), l.at);
       let frame = {
         params: l.params,
         size: l.size,
@@ -111,41 +102,35 @@ fn spawned(cx: Context, st: Lowering, x: Code) -> Lowered / {abort.raise} =
         body: l.body,
         ty: l.ty,
         words: [],
-        held: { words: held.words, instance: None, kept: cx.kept },
+        held: { words: held.words, instance: None, kept: context.kept },
       };
-      let o = lambda_opened(cx, held.st, frame, l.at);
-      closure(cx, held.st, lowered(o.cx, o.st, l.body, true), frame, Rooted, l.at)
+      let o = lambda_body_start(context, held.st, frame, l.at);
+      closure(context, held.st, lowered(o.context, o.st, l.body, true), frame, Metered, l.at)
     },
-    _ -> lowered(cx, st, x, false),
+    _ -> lowered(context, state, x, false),
   }
 
-/// Whether a call of `func` names, around its last argument, the resources a failure in it lets go:
-/// what `emit.code` writes where the check filed them.
-fn unwinds(func: Code) -> Bool =
-  match func.node { NBuiltin(f) -> f.name == b"?unwinds", _ -> false }
+fn is_cleanup_call(function: Code) -> Bool =
+  match function.node { NBuiltin(f) -> f.name == b"?unwinds", _ -> false }
 
-/// Whether `func` is what `emit.code` writes around a pattern `let`'s value, its other arguments
-/// read the resources a miss of the pattern lets go.
-fn let_missing(func: Code) -> Bool =
-  match func.node { NBuiltin(f) -> f.name == b"?let_missing", _ -> false }
+fn is_let_mismatch_call(function: Code) -> Bool =
+  match function.node { NBuiltin(f) -> f.name == b"?let_missing", _ -> false }
 
-/// `let pat = ..`, its value `value` lowered, where `written` is `?let_missing(held.., value)`: a
-/// miss of the pattern fails letting go of each of `held`, and of what the run around it does.
-fn missed_bound(
-  cx: Context,
-  value: Lowered,
+fn let_with_mismatch(
+  context: Context,
+  value: LoweredValue,
   written: Code,
-  pat: CodePattern,
+  pattern: CodePattern,
   at: Span,
 ) -> Lowering / {abort.raise} = {
-  let held = match written.node { NApp(a) -> a.args.take(a.args.len() - 1), _ -> [] };
+  let held = match written.node { CodeApply(a) -> a.args.take(a.args.len() - 1), _ -> [] };
   let own = held.fold(
     { st: value.st, us: [] },
-    |acc: { st: Lowering, us: List<Unwound> }, x: Code|
+    |acc: { st: Lowering, us: List<Unwinding> }, x: Code|
       match x.node {
-        NVar(v) -> match acc.st.env.get(v.slot) {
+        CodeVar(v) -> match acc.st.env.get(v.slot) {
           Some(arg) -> {
-            let u = unwound(cx, acc.st, arg, at);
+            let u = unwound(context, acc.st, arg, at);
             { st: u.st, us: acc.us.push(u.unwound) }
           },
           None -> acc,
@@ -153,132 +138,132 @@ fn missed_bound(
         _ -> acc,
       },
   );
-  let id = |u: Unwound| match var_of(u.arg) { Some(v) -> v.id, None -> -1 };
+  let id = |u: Unwinding| match operand_var(u.arg) { Some(v) -> v.id, None -> -1 };
   let mine = own.us.map(id);
-  let letting = value.st.unwinding.fold(own.us, |us: List<Unwound>, u: Unwound|
+  let letting = value.st.unwinding.fold(own.us, |us: List<Unwinding>, u: Unwinding|
     if mine.contains(id(u)) { us } else { us.push(u) });
-  let_missed(cx, { ..value, st: own.st }, pat, [
-    Fail({ why: NoLet, at: at, letting: letting, unwind: [] }),
+  let_else(context, { ..value, st: own.st }, pattern, [
+    Fail({ reason: LetMismatch, at: at, letting: letting, unwind: [] }),
   ])
 }
 
-/// `args`, reads of the resources a failure lets go and last the node they are let go around, lowered:
-/// the node between the markers that name them for its failure paths.
-fn unwound_around(
-  cx: Context,
-  st: Lowering,
+fn within_cleanup_scope(
+  context: Context,
+  state: Lowering,
   args: List<Code>,
   at: Span,
-) -> Lowered / {abort.raise} =
+) -> LoweredValue / {abort.raise} =
   match args.at(args.len() - 1) {
     None -> unreachable(b"a release on failure around no node"),
     Some(body) -> {
       let held = args.fold(
-        { st: st, unwound: [], at: 0 },
-        |acc: { st: Lowering, unwound: List<Unwound>, at: Int }, x: Code|
+        { st: state, unwound: [], at: 0 },
+        |acc: { st: Lowering, unwound: List<Unwinding>, at: Int }, x: Code|
           if acc.at == args.len() - 1 { acc } else {
-            let o = lowered(cx, acc.st, x, false);
-            let u = unwound(cx, o.st, o.arg, at);
+            let o = lowered(context, acc.st, x, false);
+            let u = unwound(context, o.st, o.arg, at);
             { st: u.st, unwound: acc.unwound.push(u.unwound), at: acc.at + 1 }
           },
       );
-      // Within the node a failure lets go of these and of what the run around it does.
-      let mine = held.unwound.map(|u: Unwound| match var_of(u.arg) { Some(v) -> v.id, None -> -1 });
-      let around = held.st.unwinding.filter(|u: Unwound|
-        !mine.contains(match var_of(u.arg) { Some(v) -> v.id, None -> -1 }));
+      let mine = held.unwound.map(|u: Unwinding|
+        match operand_var(u.arg) { Some(v) -> v.id, None -> -1 });
+      let around = held.st.unwinding.filter(|u: Unwinding|
+        !mine.contains(match operand_var(u.arg) { Some(v) -> v.id, None -> -1 }));
       let out = lowered(
-        cx,
-        { ..emitted(held.st, Unwinds(Some(held.unwound))), unwinding: held.unwound.concat(around) },
+        context,
+        {
+          ..emitted(held.st, CleanupScope(Some(held.unwound))),
+          unwinding: held.unwound.concat(around),
+        },
         body,
         false,
       );
       let closed = { ..out, st: { ..out.st, unwinding: held.st.unwinding } };
-      if falls_through(closed.st.insts) { { ..closed, st: emitted(closed.st, Unwinds(None)) } }
+      if falls_through(closed.st.insts) { { ..closed, st: emitted(closed.st, CleanupScope(None)) } }
       else { closed }
     },
   }
 
-/// The root lowered. A root whose key leaves a row variable of its definition unfilled is settled by
-/// its callers, at the rows they hand it.
-pub fn lowered_fn(cx: Context, body: Code) -> Fn / {abort.raise} = {
-  let conv = convention(cx);
-  let held = params_held(cx);
-  let declared = cx.params.len();
-  let h = handed_to(cx.setting, cx.key);
-  let handed_types = handed_param_types(h);
+pub fn lowered_fn(context: Context, body: Code) -> Fn / {abort.raise} = {
+  let conv = convention(context);
+  let held = parameter_representations(context);
+  let declared = context.params.len();
+  let h = evidence_parameters(context.setting, context.key);
+  let handed_types = evidence_parameter_types(h);
   let params = range(0, conv.params.len()).map(|i: Int|
     {
       id: i,
       ty: if i >= declared {
         match handed_types.at(i - declared) { Some(t) -> t, None -> evidence_type() }
-      } else { match cx.types.at(i) { Some(t) -> t, None -> unknown_type() } },
-      rep: match held.at(i) { Some(r) -> r, None -> conv.params.get(i).rep },
+      } else { match context.types.at(i) { Some(t) -> t, None -> unknown_type() } },
+      representation: match held.at(i) { Some(r) -> r, None -> conv.params.get(i).representation },
     });
-  let begun = entry_opened(root_opened(cx, started(params), params, declared, h), cx.performs);
-  let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: Rowed }) } else { begun.st };
-  let out = lowered(begun.cx, start, body, true);
-  let answered = if falls_through(out.st.insts) { handed(out, conv.answer, body.span) }
+  let begun = entry_body_start(
+    root_body_start(context, initial_lowering(params), params, declared, h),
+    context.performs,
+  );
+  let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: RowGeneric }) }
+  else { begun.st };
+  let out = lowered(begun.context, start, body, true);
+  let answered = if falls_through(out.st.insts) { represented_as(out, conv.result, body.span) }
   else { out };
-  folded(cx.setting.ctors, {
-    key: cx.key,
-    kind: Rooted,
+  folded(context.setting.constructors, {
+    key: context.key,
+    kind: Metered,
     params: params,
-    conv: conv,
-    answer_ty: cx.answer_ty,
+    convention: conv,
+    result_type: context.result_type,
     body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
     else { answered.st.insts },
     lambdas: answered.st.lambdas,
-    base: cx.base,
+    base: context.base,
     members: [],
     links: answered.st.links,
     statics: answered.st.statics,
   })
 }
 
-/// A tail group's members lowered as one root.
 pub fn lowered_group(members: List<GroupMember>) -> Fn / {abort.raise} = {
-  let starts = group_opened(members);
+  let starts = group_body_starts(members);
   let bodies = range(0, members.len()).fold(
     { after: None, out: [] },
-    |acc: { after: Option<Lowering>, out: List<Lowered> }, i: Int|
+    |acc: { after: Option<Lowering>, out: List<LoweredValue> }, i: Int|
       match members.at(i) {
         None -> acc,
         Some(m) -> match starts.at(i) {
           None -> acc,
           Some(o) -> {
-            let from = match acc.after { Some(a) -> continued(o.st, a), None -> o.st };
-            let b = lowered(o.cx, from, m.body, true);
+            let from = match acc.after { Some(a) -> exit_block(o.st, a), None -> o.st };
+            let b = lowered(o.context, from, m.body, true);
             { after: Some(b.st), out: acc.out.push(b) }
           },
         },
       },
   );
-  folded(match members.at(0) { Some(m) -> m.cx.setting.ctors, None -> no_ctors() }, {
-    ..grouped(members, bodies.out),
-    statics: match bodies.after { Some(a) -> a.statics, None -> [] },
-  })
+  folded(
+    match members.at(0) { Some(m) -> m.context.setting.constructors, None -> no_constructors() },
+    {
+      ..tail_group_root(members, bodies.out),
+      statics: match bodies.after { Some(a) -> a.statics, None -> [] },
+    },
+  )
 }
 
-/// An operand that reads a slot where it stands: what the slot holds, noted read only once the
-/// operation's operands are all made, where the operation reads it.
 type SlotRead = { slot: Int, at: Span, arg: Arg }
 
-/// An operation's operands lowered so far, and the slots they read where they stand.
 type Operands = { st: Lowering, args: List<Arg>, read: List<SlotRead> }
 
-/// The operand `x` where it reads a slot where it stands, its value taken as `slot_taken` takes it,
-/// but a view kept as it is where `views` says the operation hands it on as its callee holds it.
 fn slot_read(
-  cx: Context,
-  st: Lowering,
+  context: Context,
+  state: Lowering,
   x: Code,
   views: Bool,
 ) -> Option<{ st: Lowering, read: SlotRead }> / {abort.raise} =
   match x.node {
-    NVar(v) -> match st.env.get(v.slot) {
+    CodeVar(v) -> match state.env.get(v.slot) {
       Some(a) -> {
-        let o = if views && rep_of_arg(a) == RSlice { { st: st, arg: a } }
-        else { slot_taken(cx, st, v.name, v.slot, a, x.ty, x.span) };
+        let o = if views && operand_representation(a) == AsListView { { st: state, arg: a } }
+        else { slot_taken(context, state, v.name, v.slot, a, x.ty, x.span) };
         Some({ st: o.st, read: { slot: v.slot, at: x.span, arg: o.arg } })
       },
       None -> None,
@@ -286,61 +271,57 @@ fn slot_read(
     _ -> None,
   }
 
-/// `a`, read out of slot `slot`, bound as `name`, at `at`: a view as its list, then read as
-/// `read_taken` reads a slot; a label's read is the lowering's own, of the `Int` its binder takes;
-/// a continuation's the function value that resumes it (`resumption_closed`).
 fn slot_taken(
-  cx: Context,
-  st: Lowering,
+  context: Context,
+  state: Lowering,
   name: Bytes,
   slot: Int,
   a: Arg,
   ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = {
-  let l = unviewed({ st: st, arg: a }, at);
+) -> LoweredValue / {abort.raise} = {
+  let l = list_of_view({ st: state, arg: a }, at);
   if is_label_binder(name) { l }
-  else if resumed(type_of(a)) != None { resumption_closed(cx, l.st, slot, a, at) }
-  else { read_taken(cx, l, name, slot, ty, at) }
+  else if resumed(type_of(a)) != None { continuation_closure(context, l.st, slot, a, at) }
+  else { typed_slot_read(context, l, name, slot, ty, at) }
 }
 
-/// The function value a call applies, lowered from `func`: a continuation as the runtime holds it,
-/// which the call resumes through its uniform entry; any other as a value.
-fn callee_lowered(cx: Context, st: Lowering, func: Code) -> Lowered / {abort.raise} =
-  match func.node {
-    NVar(v) -> match st.env.get(v.slot) {
+fn callee_lowered(
+  context: Context,
+  state: Lowering,
+  function: Code,
+) -> LoweredValue / {abort.raise} =
+  match function.node {
+    CodeVar(v) -> match state.env.get(v.slot) {
       Some(a) -> if resumed(type_of(a)) != None {
-        { st: read_noted(cx, st, read_note(), v.slot, func.span), arg: a }
-      } else { lowered(cx, st, func, false) },
-      None -> lowered(cx, st, func, false),
+        { st: note_slot_read(context, state, read_note(), v.slot, function.span), arg: a }
+      } else { lowered(context, state, function, false) },
+      None -> lowered(context, state, function, false),
     },
-    _ -> lowered(cx, st, func, false),
+    _ -> lowered(context, state, function, false),
   }
 
-/// The slot `c` reads and the view of a list it holds, where `c` reads a slot holding one.
-fn viewed_slot(st: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
+fn list_view_slot(state: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
   match c.node {
-    NVar(v) -> match st.env.get(v.slot) {
-      Some(a) -> if rep_of_arg(a) == RSlice { Some({ slot: v.slot, arg: a }) } else { None },
+    CodeVar(v) -> match state.env.get(v.slot) {
+      Some(a) -> if operand_representation(a) == AsListView { Some({ slot: v.slot, arg: a }) }
+      else { None },
       None -> None,
     },
     _ -> None,
   }
 
-/// `st` noting, where `cx` observes, each slot `read` reads.
-fn reads_noted(cx: Context, st: Lowering, read: List<SlotRead>) -> Lowering =
-  read.fold(st, |s: Lowering, r: SlotRead| read_noted(cx, s, read_note(), r.slot, r.at))
+fn reads_noted(context: Context, state: Lowering, read: List<SlotRead>) -> Lowering =
+  read.fold(state, |s: Lowering, r: SlotRead| note_slot_read(context, s, read_note(), r.slot, r.at))
 
-/// The one recursion over a body: each node lowered after its parts, which are lowered here or in a
-/// fold over them, so the recursion descends through the node and nothing else.
-fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.raise} =
+fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredValue / {abort.raise} =
   match c.node {
-    NLit(l) -> literal(cx, st, l, c.span),
-    NVar(v) -> match st.env.get(v.slot) {
+    CodeLiteral(l) -> literal(context, state, l, c.span),
+    CodeVar(v) -> match state.env.get(v.slot) {
       Some(a) ->
         slot_taken(
-          cx,
-          read_noted(cx, st, read_note(), v.slot, c.span),
+          context,
+          note_slot_read(context, state, read_note(), v.slot, c.span),
           v.name,
           v.slot,
           a,
@@ -349,79 +330,85 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         ),
       None -> unreachable(b"a slot nothing bound: ".concat(v.name)),
     },
-    NDef(_) -> global(cx, st, c),
-    NCtor(_) -> global(cx, st, c),
-    NBuiltin(_) -> global(cx, st, c),
-    NKnown(k) -> known(cx, st, k, c.span),
-    NUnary(u) -> unary(cx, lowered(cx, st, u.operand, false), u.op, c.span),
-    NBinary(b) -> if b.op == b"and" || b.op == b"or" {
-      let l = handed(lowered(cx, st, b.lhs, false), RBool, b.lhs.span);
-      short_circuit(cx, l, lowered(cx, opened(l.st), b.rhs, tail), b.op == b"and", c.span)
+    NDefinition(_) -> global_value(context, state, c),
+    NConstructor(_) -> global_value(context, state, c),
+    NBuiltin(_) -> global_value(context, state, c),
+    CodeKnownLambda(k) -> known_lambda_read(context, state, k, c.span),
+    CodeUnary(u) -> unary(context, lowered(context, state, u.operand, false), u.op, c.span),
+    CodeBinary(b) -> if b.op == b"and" || b.op == b"or" {
+      let l = represented_as(lowered(context, state, b.lhs, false), AsBool, b.lhs.span);
+      short_circuit(
+        context,
+        l,
+        lowered(context, enter_block(l.st), b.rhs, tail),
+        b.op == b"and",
+        c.span,
+      )
     } else {
-      match compared_side(cx, b.op, b.lhs, b.rhs) {
+      match compared_side(context, b.op, b.lhs, b.rhs) {
         Some(true) -> {
           let args = match b.lhs.node {
-            NApp(ca) -> {
-              let wanted = compared_args(cx, b.lhs);
+            CodeApply(ca) -> {
+              let wanted = compared_args(context, b.lhs);
               ca.args.fold(
-                { st: st, args: [], at: 0 },
+                { st: state, args: [], at: 0 },
                 |acc: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
                   if wanted.at(acc.at) != Some(true) {
                     { ..acc, args: acc.args.push(None), at: acc.at + 1 }
                   } else {
-                    let o = lowered(cx, acc.st, x, false);
+                    let o = lowered(context, acc.st, x, false);
                     { st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
                   },
               )
             },
-            _ -> { st: st, args: [], at: 0 },
+            _ -> { st: state, args: [], at: 0 },
           };
-          compared(cx, lowered(cx, args.st, b.rhs, false), b.lhs, args.args, b.op, c.span)
+          compared(context, lowered(context, args.st, b.rhs, false), b.lhs, args.args, b.op, c.span)
         },
         Some(false) -> {
-          let v = lowered(cx, st, b.lhs, false);
+          let v = lowered(context, state, b.lhs, false);
           let args = match b.rhs.node {
-            NApp(ca) -> {
-              let wanted = compared_args(cx, b.rhs);
+            CodeApply(ca) -> {
+              let wanted = compared_args(context, b.rhs);
               ca.args.fold(
                 { st: v.st, args: [], at: 0 },
                 |acc: { st: Lowering, args: List<Option<Arg>>, at: Int }, x: Code|
                   if wanted.at(acc.at) != Some(true) {
                     { ..acc, args: acc.args.push(None), at: acc.at + 1 }
                   } else {
-                    let o = lowered(cx, acc.st, x, false);
+                    let o = lowered(context, acc.st, x, false);
                     { st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
                   },
               )
             },
             _ -> { st: v.st, args: [], at: 0 },
           };
-          compared(cx, { st: args.st, arg: v.arg }, b.rhs, args.args, b.op, c.span)
+          compared(context, { st: args.st, arg: v.arg }, b.rhs, args.args, b.op, c.span)
         },
-        None -> match constant(cx, c) {
-          Some(a) -> { st: st, arg: a },
+        None -> match constant(context, c) {
+          Some(a) -> { st: state, arg: a },
           None -> {
-            let lhs = match slot_read(cx, st, b.lhs, false) {
+            let lhs = match slot_read(context, state, b.lhs, false) {
               Some(r) -> { st: r.st, args: [r.read.arg], read: [r.read] },
               None -> {
-                let o = lowered(cx, st, b.lhs, false);
+                let o = lowered(context, state, b.lhs, false);
                 { st: o.st, args: [o.arg], read: [] }
               },
             };
-            let ops = match operand(cx, b.op, b.rhs) {
+            let ops = match operand(context, b.op, b.rhs) {
               Some(a) -> { ..lhs, args: lhs.args.push(a) },
-              None -> match slot_read(cx, lhs.st, b.rhs, false) {
+              None -> match slot_read(context, lhs.st, b.rhs, false) {
                 Some(r) ->
                   { st: r.st, args: lhs.args.push(r.read.arg), read: lhs.read.push(r.read) },
                 None -> {
-                  let o = lowered(cx, lhs.st, b.rhs, false);
+                  let o = lowered(context, lhs.st, b.rhs, false);
                   { ..lhs, st: o.st, args: lhs.args.push(o.arg) }
                 },
               },
             };
-            let s = reads_noted(cx, ops.st, ops.read);
+            let s = reads_noted(context, ops.st, ops.read);
             binary(
-              cx,
+              context,
               { st: s, arg: ops.args.get(0) },
               { st: s, arg: ops.args.get(1) },
               b.op,
@@ -431,62 +418,70 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         },
       }
     },
-    NBlock(bl) -> {
-      let after = bl.stmts.fold(st, |acc: Lowering, s: CodeStmt|
+    CodeBlock(bl) -> {
+      let after = bl.statements.fold(state, |acc: Lowering, s: CodeStatement|
         match s {
-          CLet(l) -> {
-            let v = lowered(cx, acc, l.value, false);
+          CodeLet(l) -> {
+            let v = lowered(context, acc, l.value, false);
             { ..v.st, env: v.st.env.insert(l.slot, v.arg) }
           },
-          CLetPat(l) -> {
-            let missing = match l.value.node { NApp(a) -> let_missing(a.func), _ -> false };
+          CodeLetDestructure(l) -> {
+            let missing = match l.value.node {
+              CodeApply(a) -> is_let_mismatch_call(a.function),
+              _ -> false,
+            };
             let value = match l.value.node {
-              NApp(a) -> if missing {
+              CodeApply(a) -> if missing {
                 match a.args.at(a.args.len() - 1) { Some(x) -> x, None -> l.value }
               } else { l.value },
               _ -> l.value,
             };
-            let v = lowered(cx, acc, value, false);
-            if !missing { let_bound(cx, v, l.pat, l.span) }
-            else { missed_bound(cx, v, l.value, l.pat, l.span) }
+            let v = lowered(context, acc, value, false);
+            if !missing { let_bound(context, v, l.pattern, l.span) }
+            else { let_with_mismatch(context, v, l.value, l.pattern, l.span) }
           },
-          CDo(d) -> lowered(cx, acc, d.code, false).st,
+          CodeDo(d) -> lowered(context, acc, d.code, false).st,
         });
       match bl.tail {
-        Some(t) -> lowered(cx, after, t, tail),
-        None -> literal(cx, after, LUnit, c.span),
+        Some(t) -> lowered(context, after, t, tail),
+        None -> literal(context, after, LiteralUnit, c.span),
       }
     },
-    NIf(i) -> {
-      // A capture, or a value of an erased type, is a word, which a branch cannot test as it is.
-      let cond = handed(lowered(cx, st, i.cond, false), RBool, i.cond.span);
-      let then = lowered(cx, opened(cond.st), i.then_branch, tail);
-      let otherwise = lowered(cx, continued(opened(cond.st), then.st), i.else_branch, tail);
-      joined(cx, cond, then, otherwise, tail, c.span)
+    CodeIf(i) -> {
+      let cond = represented_as(lowered(context, state, i.cond, false), AsBool, i.cond.span);
+      let then = lowered(context, enter_block(cond.st), i.then_branch, tail);
+      let otherwise = lowered(
+        context,
+        exit_block(enter_block(cond.st), then.st),
+        i.else_branch,
+        tail,
+      );
+      joined(context, cond, then, otherwise, tail, c.span)
     },
-    NApp(a) if unwinds(a.func) -> unwound_around(cx, st, a.args, c.span),
-    NApp(a) -> match target(cx, a.func, a.args) {
+    CodeApply(a) if is_cleanup_call(a.function) ->
+      within_cleanup_scope(context, state, a.args, c.span),
+    CodeApply(a) -> match target(context, a.function, a.args) {
       None ->
         unreachable(
-          b"a callee the lowering does not resolve: ".concat(match read_name(a.func) {
+          b"a callee the lowering does not resolve: ".concat(match read_name(a.function) {
             Some(n) -> n,
             None -> b"",
           }),
         ),
-      Some(ToInPlace(how)) -> {
-        let run = run_at(how);
-        let counted = counted_at(how);
+      Some(ToInlinedBody(how)) -> {
+        let run = inlined_argument(how);
+        let counted = range_argument(how);
         let args = a.args.fold(
-          { st: st, args: [], at: 0, range: None },
+          { st: state, args: [], at: 0, range: None },
           |acc: { st: Lowering, args: List<Option<Arg>>, at: Int, range: Option<{ lo: Arg, hi: Arg }> }, x: Code|
             if run == Some(acc.at) { { ..acc, args: acc.args.push(None), at: acc.at + 1 } }
             else if counted == Some(acc.at) {
               let ends = match x.node {
-                NApp(r) ->
+                CodeApply(r) ->
                   r.args.fold(
                     { st: acc.st, ends: [] },
                     |e: { st: Lowering, ends: List<Arg> }, y: Code| {
-                      let o = lowered(cx, e.st, y, false);
+                      let o = lowered(context, e.st, y, false);
                       { st: o.st, ends: e.ends.push(o.arg) }
                     },
                   ),
@@ -499,132 +494,136 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
                 range: match ends.ends { [lo, hi] -> Some({ lo: lo, hi: hi }), _ -> None },
               }
             } else {
-              let o = lowered(cx, acc.st, x, false);
+              let o = lowered(context, acc.st, x, false);
               { ..acc, st: o.st, args: acc.args.push(Some(o.arg)), at: acc.at + 1 }
             },
         );
         let lowered_args = { args: args.args, range: args.range };
-        let before = step_captured(cx, args.st, a.args, how);
-        let e = entered(cx, before, a.func, a.args, lowered_args, how, c.span);
+        let before = note_step_captures(context, args.st, a.args, how);
+        let e = enter_inlined(context, before, a.function, a.args, lowered_args, how, c.span);
         let no_lambda = b"a body run in place that is no lambda";
         let body = match run {
-          None -> match a.func.node {
-            NKnown(k) -> lowered(e.cx, e.st, k.lambda.body, false),
+          None -> match a.function.node {
+            CodeKnownLambda(k) -> lowered(e.context, e.st, k.lambda.body, false),
             _ -> unreachable(no_lambda),
           },
           Some(n) -> match a.args.at(n) {
             Some(x) -> match x.node {
-              NLambda(l) -> lowered(e.cx, e.st, l.body, false),
-              NKnown(k) -> if k.in_place { lowered(e.cx, e.st, k.lambda.body, false) }
-              else { known_run(e.cx, e.st, k, a.row, x.span) },
-              NDef(_) -> named_run(e.cx, e.st, x, how),
+              CodeLambda(l) -> lowered(e.context, e.st, l.body, false),
+              CodeKnownLambda(k) -> if k.in_place { lowered(e.context, e.st, k.lambda.body, false) }
+              else { known_run(e.context, e.st, k, a.row, x.span) },
+              NDefinition(_) -> named_function_call(e.context, e.st, x, how),
               _ -> unreachable(no_lambda),
             },
             None -> unreachable(no_lambda),
           },
         };
-        left(cx, before, e, body, lowered_args, c.span)
+        exit_inlined(context, before, e, body, lowered_args, c.span)
       },
       Some(ToValue) -> {
-        let f = callee_lowered(cx, st, a.func);
+        let f = callee_lowered(context, state, a.function);
         let args = a.args.fold({ st: f.st, args: [], read: [] }, |acc: Operands, x: Code|
-          match slot_read(cx, acc.st, x, false) {
+          match slot_read(context, acc.st, x, false) {
             Some(r) -> { st: r.st, args: acc.args.push(r.read.arg), read: acc.read.push(r.read) },
             None -> {
-              let o = lowered(cx, acc.st, x, false);
+              let o = lowered(context, acc.st, x, false);
               { ..acc, st: o.st, args: acc.args.push(o.arg) }
             },
           });
-        let called = reads_noted(cx, args.st, args.read);
-        match a.func.node {
-          NKnown(k) -> known_applied(cx, called, k, f.arg, args.args, a.row, tail, c.span),
-          _ -> applied(cx, called, f.arg, args.args, a.row, tail, c.span),
+        let called = reads_noted(context, args.st, args.read);
+        match a.function.node {
+          CodeKnownLambda(k) ->
+            known_applied(context, called, k, f.arg, args.args, a.row, tail, c.span),
+          _ -> applied(context, called, f.arg, args.args, a.row, tail, c.span),
         }
       },
       Some(t) -> {
-        // A definition's call hands a view on as the callee holds it: a restart keeps walking it.
-        let views = match t { ToDef(_) -> true, _ -> false };
-        let ops = a.args.fold({ st: st, args: [], read: [] }, |acc: Operands, x: Code|
-          match slot_read(cx, acc.st, x, views) {
+        let views = match t { ToDefinition(_) -> true, _ -> false };
+        let ops = a.args.fold({ st: state, args: [], read: [] }, |acc: Operands, x: Code|
+          match slot_read(context, acc.st, x, views) {
             Some(r) -> { st: r.st, args: acc.args.push(r.read.arg), read: acc.read.push(r.read) },
             None -> {
-              let o = lowered(cx, acc.st, x, false);
+              let o = lowered(context, acc.st, x, false);
               { ..acc, st: o.st, args: acc.args.push(o.arg) }
             },
           });
-        let args = { st: reads_noted(cx, ops.st, ops.read), args: ops.args };
+        let args = { st: reads_noted(context, ops.st, ops.read), args: ops.args };
         match t {
-          ToCtor(name) -> constructed(cx, args.st, name, args.args, c.ty, c.span),
-          ToBuiltin(name) -> called_builtin(cx, args.st, name, args.args, a.func, c.span),
-          ToDef(full) -> called(cx, args.st, full, a.func, a.args, args.args, tail, c.span),
+          ToConstructor(name) -> constructed(context, args.st, name, args.args, c.ty, c.span),
+          ToBuiltin(name) -> called_builtin(context, args.st, name, args.args, a.function, c.span),
+          ToDefinition(full) ->
+            called(context, args.st, full, a.function, a.args, args.args, tail, c.span),
           _ -> unreachable(b"a target taken above"),
         }
       },
     },
-    NList(l) -> {
-      let ops = l.items.fold({ st: st, args: [], read: [] }, |acc: Operands, x: Code|
-        match slot_read(cx, acc.st, x, false) {
+    CodeList(l) -> {
+      let ops = l.items.fold({ st: state, args: [], read: [] }, |acc: Operands, x: Code|
+        match slot_read(context, acc.st, x, false) {
           Some(r) -> { st: r.st, args: acc.args.push(r.read.arg), read: acc.read.push(r.read) },
           None -> {
-            let o = lowered(cx, acc.st, x, false);
+            let o = lowered(context, acc.st, x, false);
             { ..acc, st: o.st, args: acc.args.push(o.arg) }
           },
         });
-      let items = { st: reads_noted(cx, ops.st, ops.read), args: ops.args };
-      listed(cx, items.st, items.args, c.ty, c.span)
+      let items = { st: reads_noted(context, ops.st, ops.read), args: ops.args };
+      list_literal(context, items.st, items.args, c.ty, c.span)
     },
-    NRecord(r) -> {
-      let fs = r.fields.fold({ st: st, args: [], read: [] }, |acc: Operands, f: CodeField|
-        match slot_read(cx, acc.st, f.value, false) {
+    CodeRecord(r) -> {
+      let fs = r.fields.fold({ st: state, args: [], read: [] }, |acc: Operands, f: CodeField|
+        match slot_read(context, acc.st, f.value, false) {
           Some(r) -> { st: r.st, args: acc.args.push(r.read.arg), read: acc.read.push(r.read) },
           None -> {
-            let o = lowered(cx, acc.st, f.value, false);
+            let o = lowered(context, acc.st, f.value, false);
             { ..acc, st: o.st, args: acc.args.push(o.arg) }
           },
         });
-      recorded(
-        cx,
-        reads_noted(cx, fs.st, fs.read),
+      record_literal(
+        context,
+        reads_noted(context, fs.st, fs.read),
         zip(r.fields, fs.args).map(|x: { first: CodeField, second: Arg }|
           { name: x.first.name, arg: x.second }),
         c.ty,
         c.span,
       )
     },
-    NField(f) -> if !columned(cx, f.base, f.field) {
-      field(cx, lowered(cx, st, f.base, false), f.field, c.span)
+    CodeFieldRead(f) -> if !reads_column(context, f.base, f.field) {
+      field(context, lowered(context, state, f.base, false), f.field, c.span)
     } else {
       let args = match f.base.node {
-        NApp(ca) ->
-          ca.args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, x: Code| {
-            let o = lowered(cx, acc.st, x, false);
-            { st: o.st, args: acc.args.push(o.arg) }
-          }),
-        _ -> { st: st, args: [] },
+        CodeApply(ca) ->
+          ca.args.fold(
+            { st: state, args: [] },
+            |acc: { st: Lowering, args: List<Arg> }, x: Code| {
+              let o = lowered(context, acc.st, x, false);
+              { st: o.st, args: acc.args.push(o.arg) }
+            },
+          ),
+        _ -> { st: state, args: [] },
       };
-      column_read(cx, args.st, args.args, f.base, f.field, c.span)
+      column_read(context, args.st, args.args, f.base, f.field, c.span)
     },
-    NUpdate(u) -> {
-      let base = match slot_read(cx, st, u.base, false) {
+    CodeUpdate(u) -> {
+      let base = match slot_read(context, state, u.base, false) {
         Some(r) -> { st: r.st, args: [r.read.arg], read: [r.read] },
         None -> {
-          let o = lowered(cx, st, u.base, false);
+          let o = lowered(context, state, u.base, false);
           { st: o.st, args: [o.arg], read: [] }
         },
       };
       let ops = u.sets.fold(base, |acc: Operands, f: CodeField|
-        match slot_read(cx, acc.st, f.value, false) {
+        match slot_read(context, acc.st, f.value, false) {
           Some(r) -> { st: r.st, args: acc.args.push(r.read.arg), read: acc.read.push(r.read) },
           None -> {
-            let o = lowered(cx, acc.st, f.value, false);
+            let o = lowered(context, acc.st, f.value, false);
             { ..acc, st: o.st, args: acc.args.push(o.arg) }
           },
         });
       match ops.args {
         [b, ..set] ->
-          updated(
-            cx,
-            reads_noted(cx, ops.st, ops.read),
+          record_update(
+            context,
+            reads_noted(context, ops.st, ops.read),
             b,
             u.copies,
             zip(u.sets, set).map(|x: { first: CodeField, second: Arg }|
@@ -635,60 +634,62 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         [] -> unreachable(b"an update lowered without its base"),
       }
     },
-    NMatch(m) -> {
-      // A view is matched as it is: its arms' list patterns read the list it views in place.
-      let s = match viewed_slot(st, m.scrutinee) {
-        Some(v) -> { st: read_noted(cx, st, read_note(), v.slot, m.scrutinee.span), arg: v.arg },
-        None -> lowered(cx, st, m.scrutinee, false),
+    CodeMatch(m) -> {
+      let s = match list_view_slot(state, m.scrutinee) {
+        Some(v) ->
+          { st: note_slot_read(context, state, read_note(), v.slot, m.scrutinee.span), arg: v.arg },
+        None -> lowered(context, state, m.scrutinee, false),
       };
       let arms = m.arms.fold(
         { after: s.st, out: [] },
-        |acc: { after: Lowering, out: List<Armed> }, arm: CodeArm| {
-          let o = arm_opened(cx, continued(opened(s.st), acc.after), s.arg, arm);
+        |acc: { after: Lowering, out: List<LoweredArm> }, arm: CodeArm| {
+          let o = arm_start(context, exit_block(enter_block(s.st), acc.after), s.arg, arm);
           match arm.guard {
             None -> {
-              let b = lowered(cx, o, arm.body, tail);
+              let b = lowered(context, o, arm.body, tail);
               { after: b.st, out: acc.out.push({ arm: arm, guard: None, body: b }) }
             },
             Some(g) -> {
-              let gl = handed(lowered(cx, o, g, false), RBool, g.span);
-              let b = lowered(cx, opened(gl.st), arm.body, tail);
+              let gl = represented_as(lowered(context, o, g, false), AsBool, g.span);
+              let b = lowered(context, enter_block(gl.st), arm.body, tail);
               { after: b.st, out: acc.out.push({ arm: arm, guard: Some(gl), body: b }) }
             },
           }
         },
       );
-      closed(cx, s.st, s.arg, arms.out, arms.after, tail, c.span)
+      match_joined(context, s.st, s.arg, arms.out, arms.after, tail, c.span)
     },
-    NPerform(p) -> {
+    CodePerform(p) -> {
       let lb = match p.label {
         Some(lc) -> {
-          let o = lowered(cx, st, lc, false);
+          let o = lowered(context, state, lc, false);
           { st: o.st, arg: Some(o.arg) }
         },
-        None -> { st: st, arg: None },
+        None -> { st: state, arg: None },
       };
       let spawns = p.effect == b"task" && p.op == b"spawn";
       let args = p.args.fold(
         { st: lb.st, args: [] },
         |acc: { st: Lowering, args: List<Arg> }, x: Code| {
-          let o = if spawns { spawned(cx, acc.st, x) } else { lowered(cx, acc.st, x, false) };
+          let o = if spawns { spawned(context, acc.st, x) }
+          else { lowered(context, acc.st, x, false) };
           { st: o.st, args: acc.args.push(o.arg) }
         },
       );
       let op = { effect: p.effect, op: p.op, resource: p.resource };
-      match crossing_of(cx, op, p.args, args.args, c.ty, c.span) {
-        // The crossings are the scheduler's, so one of its own performs crossed would call itself.
-        Some(x) -> if module_of(cx.key) == scheduler_module() {
+      match scheduler_perform_call(context, op, p.args, args.args, c.ty, c.span) {
+        Some(x) -> if module_of(context.key) == scheduler_module() {
           unreachable(
             b"a perform the scheduler writes at a type other than `Kept`: ".concat(x.name),
           )
-        } else { called_at_types(cx, args.st, x.name, x.types, x.rows, p.args, args.args, c.span) },
-        None -> performed(cx, args.st, op, lb.arg, p.label, args.args, c.ty, c.span),
+        } else {
+          called_at_types(context, args.st, x.name, x.types, x.rows, p.args, args.args, c.span)
+        },
+        None -> performed(context, args.st, op, lb.arg, p.label, args.args, c.ty, c.span),
       }
     },
-    NLabel(n) -> label(cx, st, n, c.span),
-    NLambda(l) -> {
+    CodeLabel(n) -> label(context, state, n, c.span),
+    CodeLambda(l) -> {
       let frame = {
         params: l.params,
         size: l.size,
@@ -696,13 +697,13 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         resumes: None,
         body: l.body,
         ty: l.ty,
-        words: words_of(cx, l.row),
-        held: none_held(),
+        words: words_of(context, l.row),
+        held: no_captured_evidence(),
       };
-      let o = lambda_opened(cx, st, frame, l.at);
-      closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, Rooted, l.at)
+      let o = lambda_body_start(context, state, frame, l.at);
+      closure(context, state, lowered(o.context, o.st, l.body, true), frame, Metered, l.at)
     },
-    NSimulate(x) -> {
+    CodeSimulate(x) -> {
       let frame = {
         params: 0,
         size: x.size,
@@ -710,74 +711,78 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         resumes: None,
         body: x.body,
         ty: { params: [], kept: [], once: false, ret: x.body.ty, effects: row_empty() },
-        words: words_of(cx, x.row),
-        held: none_held(),
+        words: words_of(context, x.row),
+        held: no_captured_evidence(),
       };
-      let o = lambda_opened(cx, st, frame, x.at);
-      let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, Rooted, x.at);
-      simulate_called(cx, k.st, k.arg, x.row, c.span)
+      let o = lambda_body_start(context, state, frame, x.at);
+      let k = closure(context, state, lowered(o.context, o.st, x.body, true), frame, Metered, x.at);
+      simulate_called(context, k.st, k.arg, x.row, c.span)
     },
-    NParallel(pr) -> {
+    CodeParallel(pr) -> {
       let bs = pr.branches.fold(
-        { st: st, args: [] },
+        { st: state, args: [] },
         |acc: { st: Lowering, args: List<Arg> }, x: Code| {
-          let o = lowered(cx, acc.st, x, false);
+          let o = lowered(context, acc.st, x, false);
           { st: o.st, args: acc.args.push(o.arg) }
         },
       );
-      branched(cx, bs.st, bs.args, performed_by(pr.branches), c.span)
+      parallel_block(context, bs.st, bs.args, performed_by(pr.branches), c.span)
     },
-    NHandle(h) -> {
-      let plan = handle_planned(cx, st, h, c.span);
+    CodeHandle(h) -> {
+      let plan = handle_plan(context, state, h, c.span);
       let clauses = h.clauses.fold(
         { st: plan.st, out: [] },
         |acc: { st: Lowering, out: List<Arg> }, cl: CodeClause| {
-          let held = clause_held(cx, acc.st, plan, cl.row, cl.at);
+          let held = clause_captured_evidence(context, acc.st, plan, cl.row, cl.at);
           let frame = clause_frame(cl, held.held);
-          let o = lambda_opened(cx, held.st, frame, cl.at);
-          let k = held_closure(
+          let o = lambda_body_start(context, held.st, frame, cl.at);
+          let k = stack_closure(
             plan,
-            closure(cx, held.st, lowered(o.cx, o.st, cl.body, true), frame, Rooted, cl.at),
+            closure(
+              context,
+              held.st,
+              lowered(o.context, o.st, cl.body, true),
+              frame,
+              Metered,
+              cl.at,
+            ),
           );
           { st: k.st, out: acc.out.push(k.arg) }
         },
       );
       let ret = match h.ret {
         Some(r) -> {
-          let held = clause_held(cx, clauses.st, plan, r.row, r.at);
-          let frame = ret_frame(r, held.held);
-          let o = lambda_opened(cx, held.st, frame, r.at);
-          let k = held_closure(
+          let held = clause_captured_evidence(context, clauses.st, plan, r.row, r.at);
+          let frame = return_frame(r, held.held);
+          let o = lambda_body_start(context, held.st, frame, r.at);
+          let k = stack_closure(
             plan,
-            closure(cx, held.st, lowered(o.cx, o.st, r.body, true), frame, Rooted, r.at),
+            closure(context, held.st, lowered(o.context, o.st, r.body, true), frame, Metered, r.at),
           );
           { st: k.st, arg: Some(k.arg) }
         },
         None -> { st: clauses.st, arg: None },
       };
       let body = if detaches(h.clauses) {
-        // The body runs on a stack of its own, in a closure holding the `handle`'s objects, which
-        // its landing ends.
-        let objects = instance_objects(cx, ret.st, h, plan, c.span);
+        let objects = instance_objects(context, ret.st, h, plan, c.span);
         let answer = c.ty;
-        let frame = body_frame(cx, h, plan, objects.words, answer);
-        let at = detached_at(c.span);
-        let o = lambda_opened(cx, objects.st, frame, at);
-        let inner = lowered(o.cx, opened(o.st), h.body, false);
+        let frame = body_frame(context, h, plan, objects.words, answer);
+        let at = detached_closure_span(c.span);
+        let o = lambda_body_start(context, objects.st, frame, at);
+        let inner = lowered(o.context, enter_block(o.st), h.body, false);
         closure(
-          cx,
+          context,
           objects.st,
-          detached_landed(o.cx, o.st, inner, h, plan, answer, at),
+          detached_landing(o.context, o.st, inner, h, plan, answer, at),
           frame,
-          Rooted,
+          Metered,
           at,
         )
       } else {
-        // A failure inside a `handle`'s body lands in it, past nothing the run around holds.
-        let e = handle_entered(cx, { ..opened(ret.st), unwinding: [] }, h, plan, c.span);
-        lowered(e.cx, e.st, h.body, false)
+        let e = enter_handle(context, { ..enter_block(ret.st), unwinding: [] }, h, plan, c.span);
+        lowered(e.context, e.st, h.body, false)
       };
-      let out = handled(cx, ret.st, body, clauses.out, ret.arg, h, plan, c.span);
+      let out = handle_assembled(context, ret.st, body, clauses.out, ret.arg, h, plan, c.span);
       { ..out, st: { ..out.st, unwinding: ret.st.unwinding } }
     },
   }

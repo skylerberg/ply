@@ -1,0 +1,1268 @@
+import compiler.check.types (Type, VariableType, int_type, list_type)
+import compiler.syntax.parsing (Span, dummy_span)
+import compiler.syntax.expressions (Expression, BlockExpression, LetStatement, expression_span)
+import compiler.syntax.items (Item, FunctionItem, parse)
+import compiler.syntax.node_ids (numbered)
+import compiler.emit.code (CodeListPattern, CodeBindingPattern)
+import compiler.emit.keys (Named)
+import compiler.emit.typed_ir (Representation, AsInt, AsFixed, AsWord, AsFloat, AsSum, AsListView,
+                               Var, VarOperand, BoolOperand, Primitive, Get, CasePath, LeafPath,
+                               Inst, Let, Assign, If, Case, Match, Miss, Fail, NoMatchingArm,
+                               LetMismatch, Block, Test, TagTest, IntTest, RangeTest, LengthTest,
+                               Op, OfContainers)
+import compiler.emit.typed_ir.containers (ItemAt)
+import compiler.emit.lower.base (initial_lowering)
+import compiler.emit.lower.calling (context_of)
+import compiler.emit.lower.matching (arm_start)
+import compiler.emit.emit_harness (program_of, lowered_root, build_failures, printed_in)
+import compiler.emit.own (insert_reference_counts)
+import compiler.emit.verify (ownership_fault)
+import compiler.emit.pieces (pieces_text)
+
+fn param_of(src: Bytes, name: Bytes, i: Int) -> Var / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(p) -> {
+      let f = lowered_root(p, name);
+      f.params.get(i)
+    },
+  }
+
+fn is_sum(r: Representation) -> Bool = match r { AsSum(_) -> true, _ -> false }
+
+fn body_of(src: Bytes, name: Bytes) -> Result<Block, Bytes> / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> Err(why),
+    Ok(p) -> {
+      let f = lowered_root(p, name);
+      Ok(f.body)
+    },
+  }
+
+fn span_in(src: Bytes, name: Bytes, pick: (Expression) -> Span) -> Span / {abort.raise} =
+  parse(src).node.items.fold(dummy_span(), |acc: Span, item: Item|
+    match numbered(item) {
+      FunctionItem(d) -> if d.name.name == name { pick(d.body) } else { acc },
+      _ -> acc,
+    })
+
+fn arms_of(body: Block) -> List<Block> =
+  body.fold([], |acc: List<Block>, i: Inst|
+    match i { Match(m) -> if acc == [] { m.arms } else { acc }, _ -> acc })
+
+fn opening_case(arm: Block) -> Option<{ test: Test, when: Int, body: Block }> =
+  match arm.at(0) {
+    Some(Case(c)) -> match c.arms.at(0) {
+      Some(a) -> Some({ test: c.test, when: a.when, body: a.body }),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn case_read(i: Inst) -> Option<{ of: Var, case: Int }> =
+  match i {
+    Let(l) -> match l.value {
+      Get(g) -> match g.path {
+        CasePath(c) -> Some({ of: g.of, case: c.case }),
+        _ -> Some({ of: g.of, case: 0 - 1 }),
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn first_case(
+  b: Block,
+) -> Option<{ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }> =
+  b.fold(
+    None,
+    |acc: Option<{ on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }>, i: Inst|
+      match acc { Some(_) -> acc, None -> match i { Case(c) -> Some(c), _ -> None } },
+  )
+
+fn printed_of(src: Bytes, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
+  match program_of(src) {
+    Err(why) -> Err(why),
+    Ok(p) -> {
+      let f = lowered_root(p, name);
+      Ok(pieces_text(printed_in(p, f).pieces))
+    },
+  }
+
+test "integer literals and ranges are tested in a Case each, and an arm that does not hold misses to the next" {
+  let src = b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }\n";
+  let matched = span_in(src, b"digit", expression_span);
+  match body_of(src, b"digit") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening_case(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(IntTest([0])), Some(RangeTest({ lo: 1, hi: 9 })), None],
+      );
+      assert(
+        arms_of(body).all(|a: Block|
+          match a.at(0) { Some(Case(c)) -> c.rest == [Miss], _ -> true }),
+      );
+      assert(
+        body.any(|i: Inst|
+          match i {
+            Match(m) ->
+              m.rest == [Fail({ reason: NoMatchingArm, at: matched, letting: [], unwind: [] })],
+            _ -> false,
+          }),
+      )
+    },
+  }
+}
+
+test "a Bool and a width are tested as the integers their registers hold, and a constant subject as it lowers" {
+  match body_of(b"fn flag(b: Bool) -> Int = match b { true -> 1, false -> 0 }\n", b"flag") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening_case(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(IntTest([1])), Some(IntTest([0]))],
+      ),
+  };
+  match body_of(
+      b"fn small(n: U8) -> Int = match n { 255u8 -> 1, 0u8..=9u8 -> 2, _ -> 0 }\n",
+      b"small",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening_case(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(IntTest([255])), Some(RangeTest({ lo: 0, hi: 9 })), None],
+      );
+      assert_eq(
+        match arms_of(body).at(0) { Some([Case(c)]) -> Some(c.on.representation), _ -> None },
+        Some(AsFixed({ bits: 8, signed: false })),
+      )
+    },
+  };
+  match body_of(b"fn seven() -> Int = match 7 { 8 -> 1, 7 -> 2, _ -> 0 }\n", b"seven") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          match a.at(0) {
+            Some(If(x)) -> Some({ cond: x.cond, otherwise: x.otherwise }),
+            _ -> None,
+          }),
+        [
+          Some({ cond: BoolOperand(false), otherwise: [Miss] }),
+          Some({ cond: BoolOperand(true), otherwise: [Miss] }),
+          None,
+        ],
+      ),
+  }
+}
+
+test "a guard is tested under its arm's pattern and misses to the next arm where it does not hold" {
+  let src = b"fn guarded(n: Int, even: Bool) -> Int = match n { 0..=9 if even -> 1, _ -> 0 }\n";
+  let even = param_of(src, b"guarded", 1);
+  match body_of(src, b"guarded") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let arms = arms_of(body);
+      assert_eq(
+        arms.map(|a: Block|
+          opening_case(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(RangeTest({ lo: 0, hi: 9 })), None],
+      );
+      let guard = match match arms.at(0) { Some(a) -> opening_case(a), None -> None } {
+        Some(o) -> match o.body.at(0) {
+          Some(If(x)) -> Some({ cond: x.cond, otherwise: x.otherwise }),
+          _ -> None,
+        },
+        None -> None,
+      };
+      assert_eq(guard, Some({ cond: VarOperand(even), otherwise: [Miss] }))
+    },
+  };
+  match body_of(b"fn either(n: Int) -> Int = match n { 1 | 2 -> 1, _ -> 0 }\n", b"either") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          opening_case(a).map(|o: { test: Test, when: Int, body: Block }| o.test)),
+        [Some(IntTest([1])), Some(IntTest([2])), None],
+      ),
+  }
+}
+
+test "a constructor's test names its place among its sum's constructors, and its arguments are read where it held" {
+  let src = Bytes::concat_all([
+    b"type Shape = | Circle(Float) | Rect(Int, Int) | Dot\n",
+    b"fn area(s: Shape) -> Int = match s { Circle(_) -> 1, Rect(w, h) -> w * h, Dot -> 0 }\n",
+  ]);
+  match body_of(src, b"area") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let opened = arms_of(body).map(opening_case);
+      let names = [b"m.Circle", b"m.Rect", b"m.Dot"];
+      assert_eq(
+        opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
+          match o { Some(x) -> Some({ test: x.test, when: x.when }), None -> None }),
+        [
+          Some({ test: TagTest(names), when: 0 }),
+          Some({ test: TagTest(names), when: 1 }),
+          Some({ test: TagTest(names), when: 2 }),
+        ],
+      );
+      assert_eq(
+        opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
+          match o {
+            Some(x) ->
+              x.body.map(case_read).filter(|r: Option<{ of: Var, case: Int }>| r != None).len(),
+            None -> 0 - 1,
+          }),
+        [0, 2, 0],
+      );
+      let reads = match opened.at(1) { Some(Some(x)) -> x.body.take(2).map(case_read), _ -> [] };
+      assert_eq(
+        reads.map(|r: Option<{ of: Var, case: Int }>|
+          match r {
+            Some(x) -> Some({ of: x.of.id, sum: is_sum(x.of.representation), case: x.case }),
+            None -> None,
+          }),
+        [Some({ of: 0, sum: true, case: 1 }), Some({ of: 0, sum: true, case: 1 })],
+      )
+    },
+  }
+}
+
+test "a constructor's arguments are read at its subject's type arguments, a generic body's own variables among them" {
+  let src = Bytes::concat_all([
+    b"type Pair<a, b> = | Both(a, b) | Neither\n",
+    b"fn unwrapped<a>(o: Option<a>, d: a) -> a = match o { Some(x) -> x, None -> d }\n",
+    b"fn first<a, b>(p: Pair<b, a>, d: b) -> b = match p { Both(x, _) -> x, Neither -> d }\n",
+  ]);
+  let read = |name: Bytes|
+    match body_of(src, name) {
+      Err(why) -> [Err(why)],
+      Ok(body) ->
+        arms_of(body).map(|a: Block|
+          match opening_case(a) {
+            Some(o) -> match o.body.at(0) { Some(Let(l)) -> Ok(l.var.ty), _ -> Err(b"") },
+            None -> Err(b""),
+          }),
+    };
+  assert_eq(read(b"unwrapped"), [Ok(VariableType(0)), Err(b"")]);
+  assert_eq(read(b"first"), [Ok(VariableType(1)), Err(b"")])
+}
+
+test "an Option's constructors are tested on its words as its layout lays them, its payload read where Some laid it" {
+  let src = b"fn payload(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n";
+  let o = param_of(src, b"payload", 0);
+  match body_of(src, b"payload") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let opened = arms_of(body).map(opening_case);
+      assert_eq(
+        opened.map(|x: Option<{ test: Test, when: Int, body: Block }>|
+          match x { Some(y) -> Some({ test: y.test, when: y.when }), None -> None }),
+        [
+          Some({ test: TagTest([b"None", b"Some"]), when: 1 }),
+          Some({ test: TagTest([b"None", b"Some"]), when: 0 }),
+        ],
+      );
+      assert_eq(
+        match opened.at(0) {
+          Some(Some(y)) ->
+            y.body.map(case_read).filter(|r: Option<{ of: Var, case: Int }>| r != None),
+          _ -> [],
+        },
+        [Some({ of: o, case: 1 })],
+      )
+    },
+  }
+}
+
+test "a Result tests its case, and a constructor inside its payload is tested where the payload lays it" {
+  let src = Bytes::concat_all([
+    b"type Tone = | Warm | Cool\n",
+    b"fn settled(r: Result<Int, Tone>) -> Int = match r { Ok(n) -> n, Err(Warm) -> 1, Err(Cool) -> 2 }\n",
+  ]);
+  match body_of(src, b"settled") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let arms = arms_of(body);
+      assert_eq(
+        arms.map(|a: Block|
+          opening_case(a).map(|o: { test: Test, when: Int, body: Block }| o.when)),
+        [Some(0), Some(1), Some(1)],
+      );
+      assert_eq(
+        match opening_case(arms.get(1)) {
+          Some(e) -> match first_case(e.body) {
+            Some(c) ->
+              Some({
+                test: c.test,
+                when: c.arms.map(|a: { when: Int, body: Block }| a.when),
+                on: is_sum(c.on.representation),
+              }),
+            None -> None,
+          },
+          None -> None,
+        },
+        Some({ test: TagTest([b"m.Warm", b"m.Cool"]), when: [0], on: true }),
+      )
+    },
+  };
+  match printed_of(src, b"settled") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> assert(text.index_of(b"->layout") == None),
+  }
+}
+
+test "a sum of constructors taking nothing is tested by its word's value" {
+  let src = Bytes::concat_all([
+    b"type Tone = | Warm | Cool\n",
+    b"fn chosen(c: Bool) -> Int = { let t = if c { Warm } else { Cool }; match t { Warm -> 1, Cool -> 2 } }\n",
+    b"fn inner(o: Option<{ a: Int, b: Int }>) -> Int = match o { Some({ a, b }) -> a + b, None -> 0 }\n",
+  ]);
+  match body_of(src, b"chosen") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          match a.at(0) {
+            Some(Case(c)) -> Some({ test: c.test, cased: is_sum(c.on.representation) }),
+            _ -> None,
+          }),
+        [
+          Some({ test: TagTest([b"m.Warm", b"m.Cool"]), cased: true }),
+          Some({ test: TagTest([b"m.Warm", b"m.Cool"]), cased: true }),
+        ],
+      ),
+  };
+  match body_of(src, b"inner") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        arms_of(body).map(|a: Block|
+          match a.at(0) { Some(Case(c)) -> is_sum(c.on.representation), _ -> false }),
+        [true, true],
+      ),
+  }
+}
+
+test "a list pattern tests the list's length, then reads each item it tests or binds" {
+  let xs = { id: 0, ty: list_type(int_type()), representation: AsWord };
+  let src = b"fn leading(xs: List<Int>) -> Int = match xs { [] -> 0, [x] -> x, [x, _, ..] -> x }\n";
+  match body_of(src, b"leading") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      let opened = arms_of(body).map(opening_case);
+      assert_eq(
+        opened.map(|o: Option<{ test: Test, when: Int, body: Block }>|
+          match o { Some(x) -> Some({ test: x.test, when: x.when }), None -> None }),
+        [
+          Some({ test: LengthTest({ at_least: 1 }), when: 0 }),
+          Some({ test: LengthTest({ at_least: 2 }), when: 1 }),
+          Some({ test: LengthTest({ at_least: 2 }), when: 2 }),
+        ],
+      );
+      assert_eq(
+        (match opened.at(1) { Some(Some(x)) -> x.body.take(1), _ -> [] }).map(|i: Inst|
+          match i {
+            Let(l) -> match l.value {
+              Op(o) -> if o.op != OfContainers(ItemAt) { None } else {
+                Some({
+                  of_list: o.args.at(0) == Some(VarOperand(xs)),
+                  owned: o.uses.owned,
+                  held: l.var.representation,
+                })
+              },
+              _ -> None,
+            },
+            _ -> None,
+          }),
+        [Some({ of_list: true, owned: false, held: AsInt })],
+      )
+    },
+  }
+}
+
+test "a record or tuple pattern tests nothing and reads the fields it binds" {
+  match body_of(b"fn pair(p: (Int, Int)) -> Int = { let (a, b) = p; a * b }\n", b"pair") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        body.filter(|i: Inst|
+          match i { Case(_) -> true, If(_) -> true, Match(_) -> true, _ -> false }),
+        [],
+      );
+      assert_eq(
+        body.take(2).map(|i: Inst| match case_read(i) { Some(r) -> r.of.id, None -> 0 - 1 }),
+        [0, 0],
+      )
+    },
+  };
+  match body_of(
+      b"fn total(p: { a: Int, b: Int }) -> Int = match p { { a, b } -> a + b }\n",
+      b"total",
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(arms_of(body).map(|a: Block| a.take(2).map(|i: Inst| case_read(i) != None)), [
+        [true, true],
+      ]),
+  }
+}
+
+test "a refutable let tests its pattern and fails the let where it does not hold" {
+  let src = b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }\n";
+  let o = param_of(src, b"unwrap", 0);
+  let bound = span_in(src, b"unwrap", |e: Expression|
+    match e {
+      BlockExpression(b) -> match b.statements.at(0) {
+        Some(LetStatement(l)) -> l.span,
+        _ -> dummy_span(),
+      },
+      _ -> dummy_span(),
+    });
+  match body_of(src, b"unwrap") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        first_case(body).map(
+          |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+            {
+              on: c.on,
+              test: c.test,
+              when: c.arms.map(|a: { when: Int, body: Block }| a.when),
+              rest: c.rest,
+            },
+        ),
+        Some({
+          on: o,
+          test: TagTest([b"None", b"Some"]),
+          when: [1],
+          rest: [Fail({ reason: LetMismatch, at: bound, letting: [], unwind: [] })],
+        }),
+      );
+      assert(body.map(case_read).contains(Some({ of: o, case: 1 })))
+    },
+  }
+}
+
+test "a value compared with a constructor of its sum is a Bool joined from the constructor's test" {
+  let o = param_of(b"fn unset(o: Option<Int>) -> Bool = o == None\n", b"unset", 0);
+  let set_to = |b: Block|
+    b.fold([], |acc: List<Bool>, i: Inst|
+      match i { Assign(a) -> match a.arg { BoolOperand(x) -> acc.push(x), _ -> acc }, _ -> acc });
+  let joined = |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+    {
+      test: c.test,
+      when: c.arms.map(|a: { when: Int, body: Block }| a.when),
+      held: c.arms.map(|a: { when: Int, body: Block }| set_to(a.body)),
+      missed: set_to(c.rest),
+    };
+  match body_of(b"fn unset(o: Option<Int>) -> Bool = o == None\n", b"unset") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> {
+      assert_eq(
+        first_case(body).map(
+          |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }| c.on,
+        ),
+        Some(o),
+      );
+      assert_eq(
+        first_case(body).map(joined),
+        Some({ test: TagTest([b"None", b"Some"]), when: [0], held: [[true]], missed: [false] }),
+      )
+    },
+  };
+  match body_of(b"fn not_three(o: Option<Int>) -> Bool = o != Some(3)\n", b"not_three") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) -> match first_case(body) {
+      None -> assert(false, Some("no test of the constructor")),
+      Some(c) -> {
+        assert_eq(joined({ ..c, arms: [] }), {
+          test: TagTest([b"None", b"Some"]),
+          when: [],
+          held: [],
+          missed: [true],
+        });
+        let arm = match c.arms.at(0) { Some(a) -> a.body, None -> [] };
+        assert(arm.map(case_read).contains(Some({ of: o, case: 1 })));
+        assert_eq(
+          first_case(arm).map(joined),
+          Some({ test: IntTest([3]), when: [0], held: [[false]], missed: [true] }),
+        )
+      },
+    },
+  };
+  let nested = Bytes::concat_all([
+    b"type Spec = | Zeroed | Tagged\n",
+    b"type Kind = | Plain | Sum(Spec)\n",
+    b"fn zeroed(k: Kind) -> Bool = k == Sum(Zeroed)\n",
+  ]);
+  match body_of(nested, b"zeroed") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        match first_case(body) {
+          Some(c) -> match c.arms.at(0) {
+            Some(a) -> match first_case(a.body) {
+              Some(inner) ->
+                Some({
+                  outer: { test: c.test, when: a.when, missed: set_to(c.rest) },
+                  inner: joined(inner),
+                }),
+              _ -> None,
+            },
+            None -> None,
+          },
+          _ -> None,
+        },
+        Some({
+          outer: { test: TagTest([b"m.Plain", b"m.Sum"]), when: 1, missed: [false] },
+          inner: {
+            test: TagTest([b"m.Zeroed", b"m.Tagged"]),
+            when: [0],
+            held: [[true]],
+            missed: [false],
+          },
+        }),
+      ),
+  };
+  match body_of(b"fn holds_n(o: Option<Int>, n: Int) -> Bool = Some(n) == o\n", b"holds_n") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        match first_case(body) {
+          Some(c) -> match c.arms.at(0) {
+            Some(a) ->
+              a.body.map(|i: Inst|
+                match i {
+                  Let(l) -> match l.value {
+                    Primitive(p) -> Some(p.op),
+                    Get(_) -> Some(b"get"),
+                    _ -> None,
+                  },
+                  If(x) -> if set_to(x.otherwise) == [false] { Some(b"if") } else { None },
+                  _ -> None,
+                }),
+            None -> [],
+          },
+          _ -> [],
+        },
+        [Some(b"get"), Some(b"eq"), Some(b"if")],
+      ),
+  }
+}
+
+test "a constructor's computed argument is lowered before the comparison and compared by its type's equality" {
+  let src = Bytes::concat_all([
+    b"fn owner_is(o: Option<Int>, r: { owner: Int, n: Int }) -> Bool = o == Some(r.owner)\n",
+    b"fn not_negative_zero(x: Option<Float>) -> Bool = x != Some(-0.0)\n",
+  ]);
+  let ops = |body: Block|
+    body.fold([], |acc: List<Bytes>, i: Inst|
+      match i {
+        Case(c) -> match c.arms.at(0) {
+          Some(a) ->
+            acc.concat(
+              a.body.map(|x: Inst|
+                match x {
+                  Let(l) -> match l.value { Primitive(p) -> p.op, Get(_) -> b"get", _ -> b"other" },
+                  If(_) -> b"if",
+                  _ -> b"other",
+                }),
+            ),
+          None -> acc,
+        },
+        _ -> acc,
+      });
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [b"owner_is", b"not_negative_zero"].map(|n: Bytes| {
+          let f = lowered_root(p, n);
+          ops(f.body)
+        }),
+        [[b"get", b"eq", b"if"], [b"get", b"eq", b"if"]],
+      ),
+  }
+}
+
+fn tags_tested(b: Block) -> List<List<Bytes>> =
+  b.fold([], |acc: List<List<Bytes>>, i: Inst|
+    match i {
+      Case(c) -> {
+        let here = match c.test { TagTest(names) -> acc.push(names), _ -> acc };
+        c.arms.fold(here, |a: List<List<Bytes>>, arm: { when: Int, body: Block }|
+          a.concat(tags_tested(arm.body))).concat(
+          tags_tested(c.rest),
+        )
+      },
+      If(x) -> acc.concat(tags_tested(x.then)).concat(tags_tested(x.otherwise)),
+      Match(m) ->
+        m.arms.fold(acc, |a: List<List<Bytes>>, arm: Block| a.concat(tags_tested(arm))).concat(
+          tags_tested(m.rest),
+        ),
+      _ -> acc,
+    })
+
+test "a value of a type its module states a key for is compared with a constructor as its key is, never by its tag" {
+  let src = Bytes::concat_all([
+    b"type Rounded = | Rounded(Int)\n",
+    b"key for Rounded by rounded\n",
+    b"fn rounded(r: Rounded) -> Int = match r { Rounded(n) -> n / 10 }\n",
+    b"fn same_rounded(r: Rounded, n: Int) -> Bool = r == Rounded(n)\n",
+    b"fn other_rounded(r: Rounded) -> Bool = Rounded(12) != r\n",
+    b"type Wrapped = | Wrapped(Rounded) | Bare\n",
+    b"fn wraps(w: Wrapped, n: Int) -> Bool = w == Wrapped(Rounded(n))\n",
+    b"type Length = | Metres(Int) | Millimetres(Int)\n",
+    b"key for Length by millimetres\n",
+    b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+    b"fn differ(n: Int) -> Bool = Metres(n) != Millimetres(n * 1000)\n",
+  ]);
+  let tagged = |name: Bytes|
+    match body_of(src, name) { Err(why) -> [[why]], Ok(body) -> tags_tested(body) };
+  assert_eq(tagged(b"same_rounded"), []);
+  assert_eq(tagged(b"other_rounded"), []);
+  assert_eq(tagged(b"differ"), []);
+  assert_eq(tagged(b"wraps"), [[b"m.Wrapped", b"m.Bare"]])
+}
+
+test "a list pattern over a view reads its items from the view's list at its offset and binds its rest as a view" {
+  match program_of(b"fn walk(xs: List<Int>) -> Int = 0\n") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match p.roots.at(0) {
+      None -> assert(false),
+      Some(root) -> {
+        let code = root.code;
+        let list = list_type(int_type());
+        let s = { id: 0, ty: list, representation: AsListView };
+        let binder = |name: Bytes, slot: Int, t: Type|
+          CodeBindingPattern({ name: name, slot: slot, span: dummy_span(), ty: t });
+        let st = arm_start(
+          context_of(p.setting, root, code),
+          initial_lowering([s]),
+          VarOperand(s),
+          {
+            pattern: CodeListPattern({
+              items: [binder(b"x", 1, int_type())],
+              rest: Some(binder(b"r", 2, list)),
+            }),
+            guard: None,
+            body: code,
+          },
+        );
+        assert_eq(
+          first_case(st.insts).map(
+            |c: { on: Var, test: Test, arms: List<{ when: Int, body: Block }>, rest: Block }|
+              { on: c.on, test: c.test },
+          ),
+          Some({ on: s, test: LengthTest({ at_least: 1 }) }),
+        );
+        let leaves = st.insts.fold([], |acc: List<Var>, i: Inst|
+          match i {
+            Let(l) -> match l.value {
+              Get(g) -> if g.of == s && (g.path == LeafPath(0) || g.path == LeafPath(1)) {
+                acc.push(l.var)
+              } else { acc },
+              _ -> acc,
+            },
+            _ -> acc,
+          });
+        assert(
+          st.insts.any(|i: Inst|
+            match i {
+              Let(l) -> match l.value {
+                Op(o) -> o.op == OfContainers(ItemAt) && o.args == leaves.map(VarOperand),
+                _ -> false,
+              },
+              _ -> false,
+            }),
+        );
+        assert_eq(
+          match st.env.get(2) { Some(VarOperand(v)) -> Some(v.representation), _ -> None },
+          Some(AsListView),
+        )
+      },
+    },
+  }
+}
+
+test "a literal of any other type is tested by its type's equality" {
+  match body_of(b"fn half(f: Float) -> Int = match f { 0.5 -> 1, _ -> 0 }\n", b"half") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(body) ->
+      assert_eq(
+        match arms_of(body).at(0) {
+          Some([Let(l), If(x)]) -> match l.value {
+            Primitive(p) ->
+              Some({
+                op: p.op,
+                on: p.on,
+                tested: x.cond == VarOperand(l.var),
+                otherwise: x.otherwise,
+              }),
+            _ -> None,
+          },
+          _ -> None,
+        },
+        Some({ op: b"eq", on: AsFloat, tested: true, otherwise: [Miss] }),
+      ),
+  };
+  match program_of(b"fn word(s: String) -> Int = match s { \"one\" -> 1, _ -> 0 }\n") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let f = lowered_root(p, b"word");
+      assert(match arms_of(f.body).at(0) {
+        Some(a) -> a.any(|i: Inst| match i { If(_) -> true, _ -> false }),
+        None -> false,
+      })
+    },
+  }
+}
+
+type CorpusRoot = { name: Bytes, src: Bytes }
+
+fn lowers(name: Bytes, src: Bytes) -> CorpusRoot = { name: name, src: src }
+
+fn corpus_types() -> Bytes =
+  Bytes::concat_all([
+    b"type Shape = | Circle(Float) | Rect(Int, Int) | Dot\n",
+    b"type Tone = | Warm | Cool\n",
+    b"type Tok = | TEof | TNum(Int) | TName(Bytes)\n",
+    b"type Point = { x: Float, y: Float }\n",
+    b"type Figure = | Ring(Point, Float) | Labelled(String, Point) | Tally(U64, I64) | Spot(Float) | Blank\n",
+    b"type P = { x: Int, y: Int }\n",
+    b"type Named = { name: String, weight: Float, at: P }\n",
+    b"type Parsed = { rest: String, node: P }\n",
+    b"type Track = | Mark(P) | Line(P, P) | Empty\n",
+    b"type Coin = | Penny | Nickel | Dime | Quarter\n",
+    b"type Plot = | Round(Int) | Square(Int) | Oblong(Int, Int)\n",
+    b"type Reading = | Level(Int) | Estimate(Int) | Offline | Broken(String)\n",
+    b"type Bad = { why: String, at: Int }\n",
+    b"type Taken = { value: Int, at: Int }\n",
+    b"type Side = | Left(Taken) | Right(Taken)\n",
+    b"type Step = { value: Int, next: Int }\n",
+    b"type Marked = { wide: Int, mark: Option<String> }\n",
+    b"type Tagline = | Tag(Option<String>, Int) | Untagged\n",
+    b"type Tree = | Con({ name: String, args: List<Tree> }) | Leaf\n",
+    b"type Token = | Punct(String) | Num(Int, Float) | Eof\n",
+    b"type Rounded = | Rounded(Int)\n",
+    b"type Wrapper = | Holds(Rounded) | Nothing\n",
+    b"type Ref = | Ref({ name: String, args: List<Int> }) | Anon\n",
+    b"type Pr = | Pr(Bytes, Int)\n",
+    b"type Stream = | Over | More(Bytes, () -> Stream)\n",
+    b"type Wrapped = | Wrap({ name: String }) | Bare(Int)\n",
+    b"fn bigger(p: P, q: P) -> P = if p.x > q.x { p } else { q }\n",
+    b"fn step(n: Int) -> Step = { value: n, next: n + 1 }\n",
+    b"fn stepped(n: Int) -> Result<Step, Int> = if n < 0 { Err(0 - n) } else { Ok(step(n)) }\n",
+    b"fn halves(a: Int) -> (Int, Int) = (a / 2, a % 2)\n",
+    b"fn even(i: Int) -> Option<Int> = if i % 2 == 0 { Some(i) } else { None }\n",
+    b"fn len_of(s: String) -> Int = s.len()\n",
+  ])
+
+fn corpus_roots() -> List<CorpusRoot> =
+  [
+    lowers(b"digit", b"fn digit(n: Int) -> Int = match n { 0 -> 10, 1..=9 -> n, _ -> 99 }"),
+    lowers(b"flag", b"fn flag(b: Bool) -> Int = match b { true -> 1, false -> 0 }"),
+    lowers(b"unit_arm", b"fn unit_arm(u: Unit) -> Int = match u { () -> 1 }"),
+    lowers(b"half", b"fn half(f: Float) -> Int = match f { 0.5 -> 1, -1.5 -> 2, _ -> 0 }"),
+    lowers(b"price", b"fn price(d: Decimal) -> Int = match d { 1.50m -> 1, -0.25m -> 2, _ -> 0 }"),
+    lowers(b"small", b"fn small(n: U8) -> Int = match n { 255u8 -> 1, 0u8..=9u8 -> 2, _ -> 0 }"),
+    lowers(b"signed", b"fn signed(n: I8) -> Int = match n { -1i8 -> 1, 127i8 -> 2, _ -> 0 }"),
+    lowers(
+      b"high",
+      b"fn high(n: U64) -> Int = match n { 0u64..=9u64 -> 1, 0x8000_0000_0000_0000u64..=0xFFFF_FFFF_FFFF_FFFFu64 -> 2, 0xFFFF_FFFF_FFFF_FFFFu64 -> 3, _ -> 0 }",
+    ),
+    lowers(
+      b"low",
+      b"fn low(n: I64) -> Int = match n { -10i64..=-1i64 -> 1, 9223372036854775807i64 -> 2, _ -> 0 }",
+    ),
+    lowers(
+      b"huge",
+      b"fn huge(n: U128) -> Int = match n { 1u128..=18446744073709551616u128 -> 1, _ -> 0 }",
+    ),
+    lowers(
+      b"big",
+      b"fn big(n: Int) -> Int = match n { 4611686018427387904 -> 1, -4611686018427387905 -> 2, 9223372036854775807 -> 3, _ -> 0 }",
+    ),
+    lowers(
+      b"sign",
+      b"fn sign(n: Int) -> Int = match n { -9223372036854775807..=-1 -> -1, 0 -> 0, _ -> 1 }",
+    ),
+    lowers(
+      b"halved",
+      b"fn halved(b: U8) -> Int = match b { 0u8..=127u8 -> 0, 128u8..=255u8 -> 1 }",
+    ),
+    lowers(
+      b"cold",
+      b"fn cold(t: I8) -> Bool = match t { -127i8..=-1i8 -> true, 0i8..=127i8 -> false, _ -> true }",
+    ),
+    lowers(
+      b"port",
+      b"fn port(p: U16) -> Int = match p { 0u16 -> 0, 1u16..=1023u16 -> 1, 1024u16..=49151u16 -> 2, _ -> 3 }",
+    ),
+    lowers(b"seven", b"fn seven() -> Int = match 7 { 8 -> 1, 7 -> 2, _ -> 0 }"),
+    lowers(b"byte_x", b"fn byte_x() -> Int = match b'x' { b'x' -> 1, _ -> 0 }"),
+    lowers(
+      b"digit_of",
+      b"fn digit_of(c: Int) -> Int = match c { b'0'..=b'9' -> c - b'0', _ -> -1 }",
+    ),
+    lowers(
+      b"class_of",
+      b"fn class_of(c: Int) -> Int = match c { b'\"' -> 0, b'-' | b'0'..=b'9' -> 1, b'a'..=b'z' | b'A'..=b'Z' | b'_' -> 2, b' ' | b'\\t' -> 3, _ -> 4 }",
+    ),
+    lowers(
+      b"guarded",
+      b"fn guarded(n: Int, even: Bool) -> Int = match n { 0..=9 if even -> 1, 0..=99 -> 2, _ -> 0 }",
+    ),
+    lowers(
+      b"classify",
+      b"fn classify(n: Int) -> Int = match n { x if x < 0 -> -1, 0 -> 0, x if x > 100 -> 2, _ -> 1 }",
+    ),
+    lowers(b"either", b"fn either(n: Int) -> Int = match n { 1 | 2 -> 1, _ -> 0 }"),
+    lowers(
+      b"digit_word",
+      b"fn digit_word(n: Int) -> Int = match n { 0 | 1 | 2 -> 0, 3 | 4 | 5 | 6 -> 1, _ -> 2 }",
+    ),
+    lowers(b"word", b"fn word(s: String) -> Int = match s { \"one\" -> 1, \"\" -> 3, _ -> 0 }"),
+    lowers(
+      b"tag_of",
+      b"fn tag_of(b: Bytes) -> Int = match b { b\"ab\" -> 1, b\"\\x00\" -> 2, b\"\" -> 3, _ -> 0 }",
+    ),
+    lowers(
+      b"label",
+      b"fn label(s: String) -> Int = match s { t if t == \"a\" -> 1, \"b\" -> 2, _ -> 3 }",
+    ),
+    lowers(
+      b"sized",
+      b"fn sized(s: String) -> Int = match s { _ if s.len() > 3 -> 1, \"ab\" -> 2, _ -> 3 }",
+    ),
+    lowers(
+      b"count_down",
+      b"fn count_down(n: Int) -> Int / {abort.raise} = iterate(n, 100, |k: Int| match k { m if m <= 0 -> Stop(m), m -> Continue(m - 1) })",
+    ),
+    lowers(
+      b"area",
+      b"fn area(s: Shape) -> Int = match s { Circle(_) -> 1, Rect(w, h) -> w * h, Dot -> 0 }",
+    ),
+    lowers(b"warm", b"fn warm(t: Tone) -> Bool = match t { Warm -> true, Cool -> false }"),
+    lowers(
+      b"code_of",
+      b"fn code_of(t: Tok) -> Int = match t { TEof -> 0, TNum(n) -> n, TName(b) -> b.len() }",
+    ),
+    lowers(
+      b"figured",
+      b"fn figured(s: Figure) -> Float = match s { Ring(_, r) -> 3.0 * r * r, Labelled(_, p) -> p.x * p.y, Tally(_, _) -> 0.0, Spot(_) -> 0.0, Blank -> 0.0 }",
+    ),
+    lowers(
+      b"centre",
+      b"fn centre(s: Figure) -> Option<Point> = match s { Ring(p, _) -> Some(p), Labelled(_, p) -> Some(p), _ -> None }",
+    ),
+    lowers(
+      b"unit_ring",
+      b"fn unit_ring(s: Figure) -> Bool = match s { Ring(_, 1.0) -> true, _ -> false }",
+    ),
+    lowers(
+      b"grown",
+      b"fn grown(s: Figure, by: Float) -> Figure = match s { Ring(p, r) -> Ring({ ..p, x: p.x + by }, r + by), other -> other }",
+    ),
+    lowers(
+      b"tallied",
+      b"fn tallied() -> Int = match Tally(7u64, 5i64) { Tally(n, _) -> if n == 7u64 { 1 } else { 0 }, _ -> 0 }",
+    ),
+    lowers(
+      b"first_of",
+      b"fn first_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), [] -> None }",
+    ),
+    lowers(b"radius", b"fn radius(s: Plot) -> Int = match s { Round(r) -> r, _ -> 0 }"),
+    lowers(
+      b"tagged",
+      b"fn tagged(t: Tagline) -> Int = match t { Tag(Some(s), _) -> s.len(), Tag(None, n) -> n, Untagged -> 0 }",
+    ),
+    lowers(b"kids", b"fn kids(t: Tree) -> Int = match t { Con(c) -> c.args.len(), Leaf -> 0 }"),
+    lowers(
+      b"pulled",
+      b"fn pulled(k: () -> Stream) -> Bytes = match k() { Over -> b\"\", More(b, _) -> b }",
+    ),
+    lowers(b"pr_len", b"fn pr_len(p: Pr) -> Int = match p { Pr(b, n) -> b.len() + n }"),
+    lowers(
+      b"name_of",
+      b"fn name_of(x: Wrapped) -> String = match x { Wrap(r) -> r.name, Bare(_) -> \"\" }",
+    ),
+    lowers(b"rounded", b"fn rounded(r: Rounded) -> Int = match r { Rounded(n) -> n / 10 }"),
+    lowers(
+      b"sided",
+      b"fn sided(side: Side) -> Side = match side { Left(n) -> Left({ ..n, at: 0 }), Right(n) -> Right({ ..n, at: 1 }) }",
+    ),
+    lowers(
+      b"side_of",
+      b"fn side_of(s: Plot) -> Int = match s { Round(n) | Square(n) -> n, Oblong(w, _) -> w }",
+    ),
+    lowers(
+      b"small_coin",
+      b"fn small_coin(c: Coin) -> Bool = match c { Penny | Nickel -> true, Dime | Quarter -> false }",
+    ),
+    lowers(b"payload", b"fn payload(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }"),
+    lowers(
+      b"few",
+      b"fn few(o: Option<Int>) -> Int = match o { Some(1..=3) -> 1, Some(_) -> 2, None -> 3 }",
+    ),
+    lowers(
+      b"settled",
+      b"fn settled(r: Result<Int, Tone>) -> Int = match r { Ok(n) -> n, Err(Warm) -> 1, Err(Cool) -> 2 }",
+    ),
+    lowers(
+      b"toned",
+      b"fn toned(t: Result<Tone, Int>) -> Int = match t { Ok(Warm) -> 1, Ok(Cool) -> 2, Err(n) -> n }",
+    ),
+    lowers(
+      b"inner",
+      b"fn inner(o: Option<{ a: Int, b: Int }>) -> Int = match o { Some({ a, b }) -> a + b, None -> 0 }",
+    ),
+    lowers(
+      b"settled_opt",
+      b"fn settled_opt(r: Result<Option<Bool>, Tone>) -> Int = match r { Ok(Some(true)) -> 1, Ok(Some(false)) -> 2, Ok(None) -> 3, Err(Warm) -> 4, Err(Cool) -> 5 }",
+    ),
+    lowers(
+      b"tone_opt",
+      b"fn tone_opt(t: Option<Tone>) -> Int = match t { Some(Warm) -> 1, Some(Cool) -> 2, None -> 3 }",
+    ),
+    lowers(
+      b"heat",
+      b"fn heat(t: Option<Tone>, n: Int) -> Int = match t { Some(Warm) if n > 0 -> 0, Some(Warm) -> 1, Some(Cool) -> 2, _ -> 3 }",
+    ),
+    lowers(
+      b"some_small",
+      b"fn some_small(o: Option<Coin>) -> Bool = match o { Some(Penny | Nickel) -> true, _ -> false }",
+    ),
+    lowers(
+      b"inner_opt",
+      b"fn inner_opt(o: Option<{ a: Option<Int> }>) -> Int = match o { Some({ a: Some(n) }) -> n, _ -> 0 }",
+    ),
+    lowers(
+      b"greeting",
+      b"fn greeting(o: Option<String>) -> Int = match o { Some(s) if s == \"\" -> 0, Some(s) -> s.len(), None -> -1 }",
+    ),
+    lowers(
+      b"pick",
+      b"fn pick(o: Option<Int>, xs: List<Int>) -> Int = match o { Some(n) if xs.len() > n -> n, Some(_) -> xs.len(), None -> 0 - xs.len() }",
+    ),
+    lowers(
+      b"depth_of",
+      b"fn depth_of(o: Option<Option<String>>) -> Int = match o { Some(Some(_)) -> 2, Some(None) -> 1, None -> 0 }",
+    ),
+    lowers(
+      b"counted_here",
+      b"fn counted_here(s: String, n: Int) -> Int = match if s == \"\" { None } else { Some(s) } { Some(t) -> n + t.len(), None -> n }",
+    ),
+    lowers(
+      b"got",
+      b"fn got(m: Map<String, Int>, k: String) -> Int = match m.get(k) { Some(n) if n > 1 -> n, Some(_) -> 1, None -> 0 }",
+    ),
+    lowers(
+      b"pushed_some",
+      b"fn pushed_some(o: Option<List<Int>>, i: Int) -> Option<List<Int>> = match o { Some(xs) -> Some(xs.push(i)), None -> None }",
+    ),
+    lowers(
+      b"chosen_opt",
+      b"fn chosen_opt(a: Option<Int>, b: Option<Int>) -> Int = { let o = match a { Some(_) -> a, None -> b }; match o { Some(n) -> n, None -> 0 } }",
+    ),
+    lowers(
+      b"folded_first",
+      b"fn folded_first(xs: List<Int>, n: Int) -> Option<Int> = xs.fold(None, |acc: Option<Int>, x: Int| match acc { Some(_) -> acc, None -> if x > n { Some(x) } else { None } })",
+    ),
+    lowers(
+      b"told_bad",
+      b"fn told_bad(r: Result<Int, Bad>) -> Int = match r { Ok(n) -> n, Err(b) -> b.why.len() }",
+    ),
+    lowers(
+      b"number_of",
+      b"fn number_of(r: Result<Taken, Bad>, acc: Int) -> Int = match r { Err(e) -> if e.at > 0 { acc } else { 0 }, Ok(t) -> acc * 10 + t.value }",
+    ),
+    lowers(
+      b"sevens",
+      b"fn sevens(o: Option<Taken>, n: Int) -> Int = match o { None -> n, Some(t) -> t.at + n }",
+    ),
+    lowers(
+      b"listed_ok",
+      b"fn listed_ok(n: Int) -> Int = match [Ok(n), Err(2)] { [Ok(a), Err(b)] -> a + b, _ -> 0 }",
+    ),
+    lowers(
+      b"looked",
+      b"fn looked(m: Map<Int, Int>) -> Int = match m.get(2) { Some(5) -> 55, Some(v) -> v, None -> -1 }",
+    ),
+    lowers(
+      b"looked_any",
+      b"fn looked_any(m: Map<Int, Int>) -> Int = match m.get(1) { None -> -1, _ -> 7 }",
+    ),
+    lowers(
+      b"looked_two",
+      b"fn looked_two(m: Map<Int, Int>) -> Int = match m.get(0) { Some(a) -> match m.get(1) { Some(b) -> a + b, None -> a }, None -> 0 }",
+    ),
+    lowers(
+      b"ordered",
+      b"fn ordered(a: Int, b: Int) -> Int = match compare(a, b) { Less -> -1, Equal -> 0, Greater -> 1 }",
+    ),
+    lowers(
+      b"leading",
+      b"fn leading(xs: List<Int>) -> Int = match xs { [] -> 0, [x] -> x, [x, y, ..] -> x + y }",
+    ),
+    lowers(
+      b"rest_of",
+      b"fn rest_of(xs: List<Int>) -> List<Int> = match xs { [_, ..rest] -> rest, _ -> xs }",
+    ),
+    lowers(
+      b"leads",
+      b"fn leads(xs: List<Int>) -> Int = match xs { [0..=9, ..] -> 1, [_, 10..=19] -> 2, _ -> 0 }",
+    ),
+    lowers(
+      b"descent",
+      b"fn descent(xs: List<Int>) -> Int = match xs { [x, y, ..rest] if x > y -> x + rest.len(), [x, ..] -> x, [] -> 0 }",
+    ),
+    lowers(
+      b"leads_some",
+      b"fn leads_some(xs: List<Option<Int>>) -> Int = match xs { [Some(1), ..] -> 1, _ -> 0 }",
+    ),
+    lowers(
+      b"shape_opts",
+      b"fn shape_opts(xs: List<Option<Int>>) -> Int = match xs { [] -> 0, [None, ..] -> 1, [Some(n)] -> n, [Some(_), _, ..rest] -> 10 + rest.len() }",
+    ),
+    lowers(
+      b"head_or_tail",
+      b"fn head_or_tail(xs: List<Int>) -> Int = match xs { [x] | [_, x] -> x, _ -> 0 }",
+    ),
+    lowers(
+      b"first_on_axis",
+      b"fn first_on_axis(ps: List<P>) -> Int = match ps { [{ x, y: 0 }, ..] -> x, _ -> -1 }",
+    ),
+    lowers(
+      b"floats_at",
+      b"fn floats_at(xs: List<Float>, i: Int) -> Float = match xs.at(i) { Some(x) -> x + 1.0, None -> 0.0 }",
+    ),
+    lowers(
+      b"listed_at",
+      b"fn listed_at(rs: List<Result<P, Named>>) -> Int = match rs.at(0) { Some(Ok({ x: 0, y })) -> y, Some(Ok({ x, .. })) -> x, Some(Err({ weight: 0.0, .. })) -> -1, Some(Err(_)) -> -2, None -> -3 }",
+    ),
+    lowers(
+      b"as_arg",
+      b"fn as_arg(names: List<String>, i: Int) -> Int = len_of(match names.at(i) { Some(x) -> x, None -> \"\" })",
+    ),
+    lowers(b"total", b"fn total(p: { a: Int, b: Int }) -> Int = match p { { a, b } -> a + b }"),
+    lowers(b"swap", b"fn swap(p: (Int, Bool)) -> (Bool, Int) = match p { (n, flag) -> (flag, n) }"),
+    lowers(
+      b"paired",
+      b"fn paired(p: (Option<Int>, Bool)) -> Int = match p { (Some(1), true) -> 1, _ -> 0 }",
+    ),
+    lowers(b"other", b"fn other(p: (Int, Int)) -> Int = match p { (x, 0) | (0, x) -> x, _ -> -1 }"),
+    lowers(
+      b"coin_pair",
+      b"fn coin_pair(p: (Coin, Coin)) -> Int = match p { (Penny | Nickel, Dime | Quarter) -> 1, (Dime | Quarter, _) -> 2, _ -> 3 }",
+    ),
+    lowers(
+      b"guarded_or",
+      b"fn guarded_or(p: (Int, Int)) -> Int = match p { (x, 1) | (1, x) if x > 5 -> x, _ -> 0 }",
+    ),
+    lowers(
+      b"both",
+      b"fn both(a: Bool, b: Bool) -> Int = match ((a, b)) { (true, true) -> 1, (true, false) -> 2, (false, _) -> 3 }",
+    ),
+    lowers(
+      b"nested_lit",
+      b"fn nested_lit(p: (Option<String>, Unit)) -> Int = match p { (Some(\"x\"), ()) -> 1, (None, ()) -> 2, _ -> 0 }",
+    ),
+    lowers(
+      b"lamp",
+      b"fn lamp(p: { tone: Tone, on: Bool }) -> Int = match p { { tone: Warm, on: true } -> 1, { tone: Warm, on: false } -> 2, { tone: Cool, .. } -> 3 }",
+    ),
+    lowers(
+      b"at_origin",
+      b"fn at_origin(o: Option<P>) -> Bool = match o { Some({ x: 0, y: 0 }) -> true, _ -> false }",
+    ),
+    lowers(
+      b"from_origin",
+      b"fn from_origin(s: Track) -> Int = match s { Line({ x: 0, y: 0 }, { x, y }) -> x + y, Mark({ x: 0, y }) -> y, Line(_, _) -> -1, Mark(_) -> -2, Empty -> -3 }",
+    ),
+    lowers(
+      b"seventh",
+      b"fn seventh(r: Result<P, String>) -> Int = match r { Ok({ x: 7, y }) -> y, Ok(_) -> 0, Err(_) -> -1 }",
+    ),
+    lowers(
+      b"on_axis",
+      b"fn on_axis(p: P, q: P) -> Bool = match bigger(p, q) { { y: 0, .. } -> true, _ -> false }",
+    ),
+    lowers(
+      b"heavy",
+      b"fn heavy(n: Named) -> Int = match n { { name: \"none\", .. } -> 0, { weight: 0.0, name, .. } -> name.len(), { at: { x: 0, y: 0 }, .. } -> 1, { at: { x, .. }, .. } -> x }",
+    ),
+    lowers(
+      b"told",
+      b"fn told(r: Result<Parsed, Named>) -> String = match r { Ok({ node: { x: 1, .. }, rest }) -> rest, Ok({ rest, .. }) -> rest ++ \"!\", Err({ name, at: { x: 0, .. }, .. }) -> name, Err({ name, .. }) -> name ++ \"?\" }",
+    ),
+    lowers(
+      b"deep",
+      b"fn deep(o: Option<Result<P, Named>>) -> Int = match o { Some(Ok({ x, y })) -> x + y, Some(Err({ at: { x, .. }, .. })) -> 0 - x, None -> 0 }",
+    ),
+    lowers(
+      b"grown_rec",
+      b"fn grown_rec(g: { r: { lo: Int, hi: Int }, n: Int }) -> Int = match g { { r: { lo: l, hi: _ }, n: n } -> l * 10 + n }",
+    ),
+    lowers(
+      b"taken",
+      b"fn taken(n: Int) -> Int = match step(n) { { value, next } -> value + next }",
+    ),
+    lowers(b"ignored", b"fn ignored(n: Int) -> Int = match step(n) { { value, .. } -> value }"),
+    lowers(
+      b"nested_step",
+      b"fn nested_step(n: Int) -> Int = match stepped(n) { Ok({ value, next }) -> value + next, Err(e) -> e }",
+    ),
+    lowers(
+      b"mark_of",
+      b"fn mark_of(m: Marked, n: Int) -> Int = match m.mark { Some(s) -> s.len() + n, None -> n }",
+    ),
+    lowers(
+      b"noted",
+      b"fn noted(n: { name: String, note: Option<String> }) -> String = match n.note { Some(x) -> x, None -> n.name }",
+    ),
+    lowers(
+      b"entry_text",
+      b"fn entry_text(e: { note: Option<String>, parsed: Result<Int, { why: String }> }) -> Int = { let note = match e.note { Some(n) -> n, None -> \"-\" }; let parsed = match e.parsed { Ok(n) -> n, Err(x) -> x.why.len() }; note.len() + parsed }",
+    ),
+    lowers(
+      b"made_rec",
+      b"fn made_rec(t: Tone) -> Int = { let made = match t { Warm -> { a: 1, b: 2 }, Cool -> { a: 3, b: 4 } }; made.a + made.b }",
+    ),
+    lowers(
+      b"keyed",
+      b"fn keyed(h: { table: List<Int>, key: Int }, c: Int) -> { table: List<Int>, key: Int } = match c { 0 -> h, 1 -> { table: [], key: 0 }, _ -> { ..h, key: c } }",
+    ),
+    lowers(b"pair", b"fn pair(p: (Int, Int)) -> Int = { let (a, b) = p; a * b }"),
+    lowers(b"field_a", b"fn field_a(p: { a: Int, b: Int }) -> Int = { let { a, .. } = p; a }"),
+    lowers(b"halved_let", b"fn halved_let(n: Int) -> Int = { let (q, r) = halves(n); q * 10 + r }"),
+    lowers(
+      b"larger_sum",
+      b"fn larger_sum(p: P, q: P) -> Int = { let { x, y } = bigger(p, q); x + y }",
+    ),
+    lowers(
+      b"let_step",
+      b"fn let_step(n: Int) -> Int = { let { value, next } = step(n); let { value: v, .. } = step(next); value + v }",
+    ),
+    lowers(b"let_tuple", b"fn let_tuple(n: Int) -> Int = { let (a, b) = (n, n + 1); a * b }"),
+    lowers(
+      b"let_nested",
+      b"fn let_nested(n: Int) -> Int = { let { left: { value, .. }, right: (r, _) } = { left: step(n), right: (n, n) }; value + r }",
+    ),
+    lowers(
+      b"buffered",
+      b"fn buffered(s: { out: Bytes, n: Int }) -> Int = { let { out, n } = s; out.len() + n }",
+    ),
+    lowers(
+      b"lit_let",
+      b"fn lit_let(s: String) -> Int = { let { name, tags } = { name: s, tags: [s] }; name.len() + tags.len() }",
+    ),
+    lowers(
+      b"parsed_x",
+      b"fn parsed_x(r: Result<Parsed, Named>) -> Result<Int, Named> = { let { rest, node: { x, .. } } = r?; Ok(x + rest.len()) }",
+    ),
+    lowers(b"unwrap", b"fn unwrap(o: Option<Int>) -> Int / {abort.raise} = { let Some(n) = o; n }"),
+    lowers(
+      b"same_either",
+      b"fn same_either(r: Result<Int, Int>) -> Int = { let Ok(v) | Err(v) = r; v }",
+    ),
+    lowers(b"level", b"fn level(r: Reading) -> Int = { let Level(n) = r else { -1 }; n * 2 }"),
+    lowers(
+      b"sum_both",
+      b"fn sum_both(a: Option<Int>, b: Option<Int>) -> Int = { let Some(x) = a else { 0 }; let Some(y) = b else { x }; x + y }",
+    ),
+    lowers(
+      b"head_plus",
+      b"fn head_plus(xs: List<Int>) -> Int = { let [h, ..rest] = xs else { 0 }; h + rest.len() }",
+    ),
+    lowers(
+      b"value_of",
+      b"fn value_of(r: Reading) -> Int = { let Level(n) | Estimate(n) = r else { 0 }; n }",
+    ),
+    lowers(
+      b"describe",
+      b"fn describe(r: Reading) -> String = { let word = { let Broken(why) = r else { \"fine\" }; \"broken: \" ++ why }; word ++ \".\" }",
+    ),
+    lowers(
+      b"parsed_opt",
+      b"fn parsed_opt(o: Option<Int>) -> Result<Int, String> = { let Some(n) = o else { Err(\"missing\") }; Ok(n + 1) }",
+    ),
+    lowers(b"doubled", b"fn doubled(n: Int) -> Int = { let true = n > 10 else { 0 }; n * 2 }"),
+    lowers(b"small_let", b"fn small_let(n: Int) -> Int = { let 0..=9 = n else { -1 }; n }"),
+    lowers(
+      b"found_r",
+      b"fn found_r(r: Result<Option<Int>, String>) -> Result<Int, String> = { let Some(n) = r? else { Ok(-1) }; Ok(n) }",
+    ),
+    lowers(b"unset", b"fn unset(o: Option<Int>) -> Bool = o == None"),
+    lowers(b"not_three", b"fn not_three(o: Option<Int>) -> Bool = o != Some(3)"),
+    lowers(b"holds_n", b"fn holds_n(o: Option<Int>, n: Int) -> Bool = Some(n) == o"),
+    lowers(b"is_warm", b"fn is_warm(t: Tone) -> Bool = t == Warm"),
+    lowers(b"warm_err", b"fn warm_err(r: Result<Int, Tone>) -> Bool = r != Err(Warm)"),
+    lowers(
+      b"owner_is",
+      b"fn owner_is(o: Option<Int>, r: { owner: Int, n: Int }) -> Bool = o == Some(r.owner)",
+    ),
+    lowers(
+      b"not_negative_zero",
+      b"fn not_negative_zero(x: Option<Float>) -> Bool = x != Some(-0.0)",
+    ),
+    lowers(
+      b"found_at",
+      b"fn found_at(xs: List<Int>, x: Int, at: Int) -> Bool = xs.at(at) == Some(x)",
+    ),
+    lowers(b"absent", b"fn absent(o: Option<Taken>) -> Bool = o == None"),
+    lowers(
+      b"evens",
+      b"fn evens(i: Int) -> Int = if even(i) != None && even(i) == Some(i) { 1 } else { 0 }",
+    ),
+    lowers(b"is_punct", b"fn is_punct(t: Token, p: String) -> Bool = t == Punct(p)"),
+    lowers(b"not_num", b"fn not_num(t: Token, n: Int) -> Bool = t != Num(n, 0.5)"),
+    lowers(b"at_end", b"fn at_end(t: Token) -> Bool = t == Eof"),
+    lowers(b"same_rounded", b"fn same_rounded(r: Rounded, n: Int) -> Bool = r == Rounded(n)"),
+    lowers(
+      b"is_ref",
+      b"fn is_ref(x: Ref, n: String) -> Bool = x == Ref({ name: n, args: [1, 2] })",
+    ),
+    lowers(b"nested_var", b"fn nested_var(w: Wrapper, n: Int) -> Bool = w == Holds(Rounded(n))"),
+    lowers(
+      b"nested_computed",
+      b"fn nested_computed(w: Wrapper, n: Int) -> Bool = w == Holds(Rounded(n + 1))",
+    ),
+  ]
+
+fn corpus() -> Bytes =
+  corpus_types().concat(Bytes::concat_all(corpus_roots().map(|r: CorpusRoot| r.src.concat(b"\n"))))
+
+test "every root of the corpus lowers, passes the check and prints" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> assert_eq(build_failures(p, corpus_roots().map(|r: CorpusRoot| r.name)), []),
+  }
+}
+
+test "a payload read out of a sum a type variable leaves open passes the check, closures' too" {
+  let src = Bytes::concat_all([
+    b"fn get_or<a>(o: Option<a>, d: a) -> a = match o { Some(x) -> x, None -> d }\n",
+    b"fn decoded<a>(r: Result<a, String>) -> Option<a> = match r { Ok(v) -> Some(v), Err(_) -> None }\n",
+    b"fn flat<a, b>(cs: List<Option<a>>, of: (a) -> List<b>) -> List<b> = cs.fold([], |acc: List<b>, c: Option<a>| match c { None -> acc, Some(x) -> of(x).fold(acc, |out: List<b>, y: b| out.push(y)) })\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [b"get_or", b"decoded", b"flat"].map(|n: Bytes| {
+          let f = lowered_root(p, n);
+          ownership_fault(insert_reference_counts(f))
+        }),
+        [None, None, None],
+      ),
+  }
+}

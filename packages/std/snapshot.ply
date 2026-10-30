@@ -1,30 +1,31 @@
 //! Golden files: a rendering compared with the copy a package stores, and stored on request.
 //!
-//! A package keeps its snapshots as files in a directory beside the module that reads them, and the
-//! module hands them over as `embed_dir` read them: `{ dir: "snapshots", files:
-//! embed_dir("snapshots") }` is a `Stored`. The files are then part of the hash of every test that
-//! reads them, so a snapshot test performs nothing, is cached like any other, and runs again when a
-//! stored file or the code changes. `embed_dir` takes its path as a literal and reads it beside the
-//! module that writes the call, which is why the caller embeds and this module does not. A snapshot
-//! is found by its name among a directory's files because an `embed` of one file that is not there
-//! yet refuses the load, where a name the directory lacks is a failure `check` can explain. A name
-//! is any text, so a test over cases drawn from a directory of inputs holds each input to the
-//! output stored under its name.
+//! A package stores its snapshots as files in a directory beside the module that reads them. That
+//! module passes them in as `embed_dir` reads them: `{ dir: "snapshots", files:
+//! embed_dir("snapshots") }` is a `Snapshots`. The files then become part of the hash of every test
+//! that reads them. So a snapshot test performs no effects, is cached like any other test, and runs
+//! again when a stored file or the code changes. `embed_dir` takes its path as a literal and
+//! resolves it beside the module that contains the call, which is why the caller embeds the
+//! directory and this module does not. A snapshot is looked up by name among a directory's files,
+//! because an `embed` of a single file that does not exist yet fails the load, while a name missing
+//! from the directory is a failure `check` can explain. A name is any text, so a test over cases
+//! drawn from a directory of inputs can compare each input with the output stored under its name.
 //!
-//! `check` fails a test whose rendering is not the stored one, with the unified diff from the
-//! stored text to the rendering, and one with nothing stored under its name, with the diff that
-//! creates it. It never writes. `accept` is the update: it writes a rendering through `std.fs`
-//! under a root the run lends, so storing a snapshot is an entry a person runs on purpose with the
-//! directory granted, as `ply run . --fs NAME=DIR` grants one, and no flag changes what a
-//! test asserts. A rendering is stored as lines: one whose last line does not end in a newline is
-//! stored with one, and the two are one snapshot.
+//! `check` fails a test whose rendering differs from the stored one, and reports the unified diff
+//! from the stored text to the rendering. When nothing is stored under the name, it fails with the
+//! diff that creates the file. It never writes. `accept` updates a snapshot: it writes a rendering
+//! through `std.fs` under a root the run grants. So storing a snapshot is an entry point a person
+//! runs on purpose, with the directory granted (as `ply run . --fs NAME=DIR` grants one), and no
+//! flag changes what a test asserts. A rendering is stored as lines: a rendering whose last line
+//! lacks a newline is stored with one, and both forms count as the same snapshot.
 //!
-//! `render` writes any value one field, item or entry to a line, which is the form a line diff
-//! reads best: a record's fields in name order, a map's entries in key order, a float as the
-//! shortest text that reads back to it, and a value whose type states a `show` as that writes it.
-//! `masked` blanks fields that vary from run to run before a value is rendered. Text is already lines, so a caller with a rendering of its own hands
-//! `check` that; and a snapshot short enough to read in the test is a string or a line string
-//! beside the assertion, which needs nothing from here.
+//! `render` writes any value with one field, item or entry to a line, the form a line diff shows
+//! best. It writes a record's fields in name order, a map's entries in key order, a float as the
+//! shortest text that reads back to it, and a value whose type declares a `show` as that `show`
+//! writes it. `masked` blanks the fields that vary from run to run before a value is rendered. Text
+//! is already lines, so a caller with its own rendering passes it to `check` directly. A snapshot
+//! short enough to read in the test belongs in a string or line string beside the assertion, which
+//! needs nothing from this module.
 
 import std.diff
 import std.diff (FileDiff)
@@ -36,33 +37,33 @@ import std.path
 import std.string
 import std.value
 import std.value (Entry, Field, Value, VArray, VCtor, VElided, VList, VMap, VRecord, VShown,
-                  ctor_name, is_tuple, render_all, shown)
+                  constructor_name, is_tuple, render_all, shown)
 import std.gen
 
-/// A directory of stored snapshots: its path as the module that embeds it writes it, which is how
-/// a failure names a file, and its files as `embed_dir` read them.
-pub type Stored = new { dir: String, files: List<{ name: String, bytes: Bytes }> }
+/// A directory of stored snapshots: its path as written in the module that embeds it, which a
+/// failure uses to name a file, and its files as `embed_dir` reads them.
+pub type Snapshots = new { dir: String, files: List<{ name: String, bytes: Bytes }> }
 
-/// How a rendering stands against what is stored under its name.
+/// How a rendering compares with what is stored under its name.
 pub type Verdict =
   /// The stored text is the rendering.
   | Same
   /// Nothing is stored under the name: the unified diff that creates the file.
   | Absent(String)
-  /// The stored text is another: the unified diff from it to the rendering.
+  /// The stored text differs: the unified diff from it to the rendering.
   | Changed(String)
 
 /// What `accept` did to a stored file.
 pub type Change =
-  /// It already held the rendering, and was not written.
+  /// It already contained the rendering, and was not written.
   | Unchanged
   | Created
   | Replaced
 
 /// How storing a snapshot fails.
 pub effect snapshot {
-  /// The file at `path`, under the root the run lent, could not be written.
-  raise unwritten(path: String)
+  /// The file at `path`, under the root the run granted, could not be written.
+  raise write_failed(path: String)
 }
 
 /// The lines of context a diff shows around each change.
@@ -70,25 +71,27 @@ fn context() -> Int = 3
 
 // --- Comparing --------------------------------------------------------------
 
-/// How `text` stands against the file `name` of `stored`.
-pub fn compare(stored: Stored, name: String, text: String) -> Verdict = {
-  let now = ended(text);
+/// How `text` compares with the file `name` in `stored`.
+pub fn compare(stored: Snapshots, name: String, text: String) -> Verdict = {
+  let now = with_final_newline(text);
   let path = path::join(stored.dir, name);
-  match held(stored, name) {
+  match stored_text(stored, name) {
     None -> Absent(patch_text("/dev/null", path, "", now)),
     Some(was) -> if was == now { Same } else { Changed(patch_text("a/" ++ path, path, was, now)) },
   }
 }
 
-/// Fails unless the file `name` of `stored` holds `text`: with the diff from the stored text where
-/// it holds another, and with the diff that creates it where nothing is stored under the name.
-pub fn check(stored: Stored, name: String, text: String) -> Unit / {abort.raise} = {
-  let why = refusal(path::join(stored.dir, name), compare(stored, name, text));
+/// Fails unless the file `name` in `stored` contains `text`. The failure shows the diff from the
+/// stored text when the file differs, and the diff that creates the file when nothing is stored
+/// under the name.
+pub fn check(stored: Snapshots, name: String, text: String) -> Unit / {abort.raise} = {
+  let why = failure_message(path::join(stored.dir, name), compare(stored, name, text));
   assert(why == None, why)
 }
 
-/// What a failed check says: the file, what stores the rendering, and the diff that does.
-fn refusal(path: String, verdict: Verdict) -> Option<String> =
+/// The message of a failed check: the file, the function that stores the rendering, and the diff
+/// that storing it applies.
+fn failure_message(path: String, verdict: Verdict) -> Option<String> =
   match verdict {
     Same -> None,
     Absent(patch) -> Some("nothing is stored as `" ++ path ++ "`; " ++ remedy() ++ patch),
@@ -97,20 +100,20 @@ fn refusal(path: String, verdict: Verdict) -> Option<String> =
 
 fn remedy() -> String = "`std.snapshot.accept` stores this one, as this diff does:\n"
 
-/// The stored files that none of `names` reads, in the directory's order: snapshots no test asks
-/// for any more.
-pub fn unused(stored: Stored, names: List<String>) -> List<String> =
+/// The stored files that none of `names` reads, in the directory's order: snapshots no test reads
+/// any more.
+pub fn unused(stored: Snapshots, names: List<String>) -> List<String> =
   list::somes(
     stored.files.map(|f: { name: String, bytes: Bytes }|
       if names.contains(f.name) { None } else { Some(f.name) }),
   )
 
-fn held(stored: Stored, name: String) -> Option<String> =
+fn stored_text(stored: Snapshots, name: String) -> Option<String> =
   stored.files.fold(None, |found: Option<String>, f: { name: String, bytes: Bytes }|
     if f.name == name { Some(String::of_bytes_lossy(f.bytes)) } else { found })
 
-/// `text` as it is stored: its last line ended, as every other is.
-fn ended(text: String) -> String =
+/// `text` as it is stored: its last line ends in a newline, like every other line.
+fn with_final_newline(text: String) -> String =
   if text == "" || text.ends_with("\n") { text } else { text ++ "\n" }
 
 fn patch_text(old: String, path: String, was: String, now: String) -> String =
@@ -122,30 +125,31 @@ fn patch_text(old: String, path: String, was: String, now: String) -> String =
 
 // --- Storing ----------------------------------------------------------------
 
-/// Stores `text` as the file `name` of the directory at `dir` under the root `l`, and answers what
-/// that took. A file that already holds it is left alone, and directories on the way are made.
+/// Stores `text` as the file `name` in the directory at `dir` under the root `l`, and returns what
+/// changed. A file that already contains `text` is left alone, and missing parent directories are
+/// created.
 pub fn accept<[l]>(
   dir: String,
   name: String,
   text: String,
-) -> Change / {fs.read_file[l], fs.create_dir[l], fs.write_file[l], snapshot.unwritten} = {
-  let now = Bytes::of_string(ended(text));
+) -> Change / {fs.read_file[l], fs.create_dir[l], fs.write_file[l], snapshot.write_failed} = {
+  let now = Bytes::of_string(with_final_newline(text));
   let path = path::join(dir, name);
   match fs.read_file[l](path) {
-    Some(was) -> if was == now { Unchanged } else { written[l](path, now, Replaced) },
-    None -> written[l](path, now, Created),
+    Some(was) -> if was == now { Unchanged } else { write_snapshot[l](path, now, Replaced) },
+    None -> write_snapshot[l](path, now, Created),
   }
 }
 
-fn written<[l]>(
+fn write_snapshot<[l]>(
   path: String,
   body: Bytes,
   change: Change,
-) -> Change / {fs.create_dir[l], fs.write_file[l], snapshot.unwritten} = {
+) -> Change / {fs.create_dir[l], fs.write_file[l], snapshot.write_failed} = {
   let above = handle { path::parent(path) } with { abort.raise(_) -> "" };
-  if above != "" && !fs.create_dir[l](above) { snapshot.unwritten(path) }
+  if above != "" && !fs.create_dir[l](above) { snapshot.write_failed(path) }
   else if fs.write_file[l](path, body) { change }
-  else { snapshot.unwritten(path) }
+  else { snapshot.write_failed(path) }
 }
 
 // --- Rendering --------------------------------------------------------------
@@ -155,19 +159,19 @@ pub fn render<a>(value: a) -> String = render_value(shown(value))
 
 /// `v` with one field, item or entry to a line, each line ending in a newline.
 ///
-/// A record, a list, an array and a map with anything in them open on one line, hold each part on
-/// lines of its own, two spaces in and ending in a comma, and close on another; so does a
-/// constructor or a tuple that holds one of those. Everything else is on one line as
-/// `std.value.render_all` writes it.
-pub fn render_value(v: Value) -> String = String::unlines(laid(v))
+/// A non-empty record, list, array or map opens on one line, puts each part on lines of its own,
+/// indented two spaces and ending in a comma, and closes on another line. So does a constructor or
+/// a tuple that contains one of those. Everything else is on one line, as `std.value.render_all`
+/// writes it.
+pub fn render_value(v: Value) -> String = String::unlines(value_lines(v))
 
 /// `v` with the value of every record field named in `fields`, at any depth, replaced by
 /// `<masked>`: what a caller does to the fields that vary from run to run before rendering.
 pub fn masked(v: Value, fields: List<String>) -> Value =
   match v {
-    VRecord(held) ->
+    VRecord(stored_text) ->
       VRecord(
-        held.map(|f: Field|
+        stored_text.map(|f: Field|
           if fields.contains(f.name) { { name: f.name, value: VShown("<masked>") } }
           else { { name: f.name, value: masked(f.value, fields) } }),
       ),
@@ -178,46 +182,52 @@ pub fn masked(v: Value, fields: List<String>) -> Value =
     _ -> v,
   }
 
-fn laid(v: Value) -> List<String> =
+fn value_lines(v: Value) -> List<String> =
   match v {
-    VList(items) -> if items.len() == 0 { ["[]"] } else { framed("[", items.map(laid), "]") },
+    VList(items) -> if items.len() == 0 { ["[]"] }
+    else { bracketed("[", items.map(value_lines), "]") },
     VArray(items) -> if items.len() == 0 { ["Array::of_list([])"] }
-    else { framed("Array::of_list([", items.map(laid), "])") },
+    else { bracketed("Array::of_list([", items.map(value_lines), "])") },
     VMap(entries) -> if entries.len() == 0 { ["{}"] } else {
-      framed(
+      bracketed(
         "{",
         entries.map(|e: Entry|
           match e.key {
             VElided(_) -> [render_all(e.key)],
-            key -> headed(render_all(key) ++ ": ", laid(e.value)),
+            key -> prefix_first(render_all(key) ++ ": ", value_lines(e.value)),
           }),
         "}",
       )
     },
     VRecord(fields) -> if fields.len() == 0 { ["{}"] } else if is_tuple(fields) {
-      grouped("", in_place(fields.map(|f: Field| { name: f.name, lines: laid(f.value) })))
-    } else { framed("{", fields.map(|f: Field| headed(f.name ++ ": ", laid(f.value))), "}") },
-    VCtor(name, args) -> if args.len() == 0 { [ctor_name(name)] }
-    else { grouped(ctor_name(name), args.map(laid)) },
+      parenthesized(
+        "",
+        in_tuple_order(fields.map(|f: Field| { name: f.name, lines: value_lines(f.value) })),
+      )
+    } else {
+      bracketed("{", fields.map(|f: Field| prefix_first(f.name ++ ": ", value_lines(f.value))), "}")
+    },
+    VCtor(name, args) -> if args.len() == 0 { [constructor_name(name)] }
+    else { parenthesized(constructor_name(name), args.map(value_lines)) },
     _ -> [render_all(v)],
   }
 
-/// A constructor's arguments, or a tuple's items under no name, in parentheses: on one line where
-/// each is one line, and a part to a line otherwise.
-fn grouped(name: String, parts: List<List<String>>) -> List<String> =
+/// A constructor's arguments, or a tuple's unnamed items, in parentheses: on one line when each is
+/// one line, and one part to a line otherwise.
+fn parenthesized(name: String, parts: List<List<String>>) -> List<String> =
   if parts.all(|part: List<String>| part.len() == 1) {
     [name ++ "(" ++ String::join(parts.flatten(), ", ") ++ ")"]
-  } else { framed(name ++ "(", parts, ")") }
+  } else { bracketed(name ++ "(", parts, ")") }
 
 /// A tuple's items in the order of their places: its fields come in name order, which puts `_10`
 /// before `_2`.
-fn in_place(items: List<{ name: String, lines: List<String> }>) -> List<List<String>> =
+fn in_tuple_order(items: List<{ name: String, lines: List<String> }>) -> List<List<String>> =
   range(0, items.len()).flat_map(|place: Int|
     items.flat_map(|item: { name: String, lines: List<String> }|
       if item.name == "_" ++ place.to_string() { [item.lines] } else { [] }))
 
 /// `open`, each part two spaces in with a comma after its last line, and `close`.
-fn framed(open: String, parts: List<List<String>>, close: String) -> List<String> =
+fn bracketed(open: String, parts: List<List<String>>, close: String) -> List<String> =
   parts.fold([open], |out: List<String>, part: List<String>|
     list::enumerate(part).fold(
       out,
@@ -228,12 +238,12 @@ fn framed(open: String, parts: List<List<String>>, close: String) -> List<String
   )
 
 /// `lines` with `head` before the first.
-fn headed(head: String, lines: List<String>) -> List<String> =
+fn prefix_first(head: String, lines: List<String>) -> List<String> =
   match lines { [] -> [head], [first, ..rest] -> list::prepend(head ++ first, rest) }
 
 // --- Tests ------------------------------------------------------------------
 
-fn kept(files: List<{ name: String, text: String }>) -> Stored =
+fn snapshots_of(files: List<{ name: String, text: String }>) -> Snapshots =
   {
     dir: "snapshots",
     files: files.map(|f: { name: String, text: String }|
@@ -287,7 +297,7 @@ test "a value renders one field, item or entry to a line" {
   assert_eq(render(Array::of_list([1])), "Array::of_list([\n  1,\n])\n")
 }
 
-test "a hold renders the same, whatever it holds and wherever it stands" {
+test "a hold renders the same, whatever it contains and wherever it appears" {
   let text = with_hold[held](0, |_: Int| ()) { h -> render({ first: h, both: (h, 1) }) };
   assert_eq(text, "{\n  both: (<hold>, 1),\n  first: <hold>,\n}\n")
 }
@@ -306,7 +316,10 @@ test "masked blanks the fields named, at any depth, and leaves the rest" {
 }
 
 test "a rendering is the same as what is stored, with or without its last newline" {
-  let stored = kept([{ name: "order.txt", text: order_text() }, { name: "plain", text: "one\n" }]);
+  let stored = snapshots_of([
+    { name: "order.txt", text: order_text() },
+    { name: "plain", text: "one\n" },
+  ]);
   assert_eq(compare(stored, "order.txt", render(order())), Same);
   assert_eq(compare(stored, "plain", "one"), Same);
   assert_eq(compare(stored, "plain", "one\n"), Same);
@@ -315,7 +328,7 @@ test "a rendering is the same as what is stored, with or without its last newlin
 }
 
 test "a rendering that differs fails with the diff from the stored text, a few lines around it" {
-  let stored = kept([{ name: "order.txt", text: order_text() }]);
+  let stored = snapshots_of([{ name: "order.txt", text: order_text() }]);
   let now = render({ ..order(), buyer: "bob" });
   assert_eq(
     compare(stored, "order.txt", now),
@@ -334,7 +347,7 @@ test "a rendering that differs fails with the diff from the stored text, a few l
   );
   assert((try[abort.raise] { check(stored, "order.txt", now) }) != Ok(()));
   assert_eq(
-    refusal("snapshots/order.txt", Changed("--- a/x\n+++ b/x\n")),
+    failure_message("snapshots/order.txt", Changed("--- a/x\n+++ b/x\n")),
     Some(
       "`snapshots/order.txt` stores another rendering; `std.snapshot.accept` stores this one, as this diff does:\n--- a/x\n+++ b/x\n",
     ),
@@ -342,14 +355,14 @@ test "a rendering that differs fails with the diff from the stored text, a few l
 }
 
 test "a rendering with nothing stored under its name fails with the diff that creates it" {
-  let stored = kept([{ name: "other.txt", text: "x\n" }]);
+  let stored = snapshots_of([{ name: "other.txt", text: "x\n" }]);
   assert_eq(
     compare(stored, "new.txt", "one\ntwo"),
     Absent("--- /dev/null\n+++ b/snapshots/new.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n"),
   );
   assert((try[abort.raise] { check(stored, "new.txt", "one\ntwo") }) != Ok(()));
   assert_eq(
-    refusal("snapshots/new.txt", Absent("--- /dev/null\n")),
+    failure_message("snapshots/new.txt", Absent("--- /dev/null\n")),
     Some(
       "nothing is stored as `snapshots/new.txt`; `std.snapshot.accept` stores this one, as this diff does:\n--- /dev/null\n",
     ),
@@ -357,7 +370,7 @@ test "a rendering with nothing stored under its name fails with the diff that cr
 }
 
 test "unused names the stored files no snapshot reads" {
-  let stored = kept([
+  let stored = snapshots_of([
     { name: "a.txt", text: "" },
     { name: "old/b.txt", text: "" },
     { name: "c.txt", text: "" },
@@ -368,7 +381,7 @@ test "unused names the stored files no snapshot reads" {
 }
 
 /// The files of `tree` under `dir`, as an `embed_dir` of it would read them.
-fn stored_in(tree: fs::MemFs, dir: String, names: List<String>) -> Stored / {abort.raise} =
+fn stored_in(tree: fs::MemFs, dir: String, names: List<String>) -> Snapshots / {abort.raise} =
   {
     dir: dir,
     files: list::somes(
@@ -380,7 +393,7 @@ fn stored_in(tree: fs::MemFs, dir: String, names: List<String>) -> Stored / {abo
     ),
   }
 
-test "accept creates a file, replaces one that differs, and leaves one that holds the rendering" {
+test "accept creates a file, replaces one that differs, and leaves one that already matches" {
   let made = fs::on_mem[work](fs::mem_empty(), ||
     accept[work]("snapshots", "sub/order.txt", "one"));
   assert_eq(made.value, Created);
@@ -402,8 +415,8 @@ test "accept raises where the file cannot be written, and writes nothing" {
   assert_eq(fs::mem_read(tried.tree, "snapshots"), Some(b"a file where the directory would be"))
 }
 
-/// What `check` makes of `text` once `accept` has stored it over a directory that held `was`.
-fn accepted(was: String, text: String) -> Verdict / {abort.raise, snapshot.unwritten} = {
+/// The verdict for `text` after `accept` stores it over a directory that contained `was`.
+fn accepted(was: String, text: String) -> Verdict / {abort.raise, snapshot.write_failed} = {
   let before = fs::mem_of([{ path: "snapshots/s.txt", body: Bytes::of_string(was) }]);
   let after = fs::on_mem[work](before, || accept[work]("snapshots", "s.txt", text));
   compare(stored_in(after.tree, "snapshots", ["s.txt"]), "s.txt", text)
@@ -411,7 +424,7 @@ fn accepted(was: String, text: String) -> Verdict / {abort.raise, snapshot.unwri
 
 type Texts = { was: List<String>, now: List<String> }
 
-/// A `Texts` as a test draws one.
+/// A generator of `Texts`.
 fn texts_drawn() -> gen::Gen<Texts> =
   gen::map2(
     gen::list(gen::text()),
@@ -430,8 +443,8 @@ test "a rendering is the same as what accepting it stored" {
 
 /// The stored text patched by the diff `compare` reports for `now`, or the stored text where it
 /// reports none.
-fn patched(was: String, now: String) -> String / {diff::diff.malformed, diff::diff.refused} =
-  match compare(kept([{ name: "s.txt", text: was }]), "s.txt", now) {
+fn patched(was: String, now: String) -> String / {diff::diff.malformed, diff::diff.fail} =
+  match compare(snapshots_of([{ name: "s.txt", text: was }]), "s.txt", now) {
     Same -> was,
     Absent(patch) -> was,
     Changed(patch) ->

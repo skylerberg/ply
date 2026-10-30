@@ -1,25 +1,15 @@
-//! Keys, and what a build's signature vouches for. A key is an Ed25519 seed in a file and its
-//! public half in another. A seed is a `Secret` from the moment `ply keygen` draws it: its file is
-//! written through `fs.write_secret` and read back through `fs.read_secret`. A signature is
-//! `std.signed`'s, detached in a file beside what it vouches for, so an artifact's digest is the
-//! same whoever signs it and however many do; a registry's attestation is signed the same way.
-
 import std.bin
 import std.bytes
 import std.ed25519
 import std.fs (fs, Dir, File, MemFs, mem_kind, mem_of, mem_read, mem_read_secret, mem_sealed,
                on_mem)
-import std.path (resolve, below_root)
+import std.path (resolve, strip_root)
 import std.random (entropy)
 import std.string
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import paths
 import sources
 import compiler.syntax.parsing (no_module, dummy_span)
-
-// --- Key files ----------------------------------------------------------------------
-// One line: what the key is, and its 32 bytes in hex. The words keep a public key from being taken
-// for a secret one, and a secret one from being handed out as public.
 
 fn secret_word() -> String = "ply-ed25519-secret"
 
@@ -27,9 +17,8 @@ fn public_word() -> String = "ply-ed25519-public"
 
 fn secret_head() -> Bytes = Bytes::of_string(secret_word() ++ " ")
 
-/// Writes `seed` as a secret key file's one line, the seed never a plain value.
 pub fn write_seed(
-  p: paths::Rooted,
+  p: paths::RootedPath,
   seed: Secret<Bytes>,
 ) -> Bool / {fs.write_secret[cwd], fs.write_secret[abs]} =
   paths::write_secret(p, secret_head(), seed, "hex", b"\n")
@@ -49,33 +38,31 @@ fn key_of(text: String, word: String) -> Result<Bytes, String> / {abort.raise} =
     _ -> Err("it is not one `" ++ word ++ " <hex>` line"),
   }
 
-/// The seed of the secret key file at `path`, read sealed, or why there is none: the file is one
-/// line, its newline optional, and nothing of it is a plain value of this program.
 pub fn read_seed(
   path: String,
-) -> Result<Secret<Bytes>, Diag> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
-  let at = paths::spelled(path);
+) -> Result<Secret<Bytes>, Diagnostic> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
+  let at = paths::rooted_path(path);
   let line = match paths::read_secret(at, secret_head(), "hex", b"\n") {
     Some(seed) -> Some(seed),
     None -> paths::read_secret(at, secret_head(), "hex", b""),
   };
   match line {
     Some(seed) -> if seed.len() == 32 { Ok(seed) }
-    else { Err(unkeyed(path, "does not hold a secret key: its key is not 64 hex digits")) },
+    else { Err(unreadable_key(path, "does not hold a secret key: its key is not 64 hex digits")) },
     None -> if paths::read_secret(at, Bytes::of_string(public_word() ++ " "), "raw", b"") != None {
-      Err(unkeyed(path, "does not hold a secret key: it is a `" ++ public_word() ++ "` key"))
-    } else { Err(unkeyed(path, "is not there, or not one `" ++ secret_word() ++ " <hex>` line")) },
+      Err(unreadable_key(path, "does not hold a secret key: it is a `" ++ public_word() ++ "` key"))
+    } else {
+      Err(unreadable_key(path, "is not there, or not one `" ++ secret_word() ++ " <hex>` line"))
+    },
   }
 }
 
 pub fn public_of(text: String) -> Result<Bytes, String> / {abort.raise} =
   key_of(text, public_word())
 
-/// Thirty-two bytes the operating system drew, sealed as they are drawn.
 pub fn fresh_seed() -> Secret<Bytes> / {entropy.secret} = entropy.secret(32)
 
-/// A key file that cannot be read, decoded or written.
-pub fn unkeyed(path: String, why: String) -> Diag =
+pub fn unreadable_key(path: String, why: String) -> Diagnostic =
   error_at(
     b"E0462",
     no_module(),
@@ -85,10 +72,6 @@ pub fn unkeyed(path: String, why: String) -> Diag =
     [b"`ply keygen PATH` writes a secret key to PATH and its public key to PATH.pub"],
   )
 
-// --- What a build vouches for --------------------------------------------------------
-
-/// What a signature over a build says: what was built, its digest, the `ply` and semantics that
-/// built it, and the commit its sources were checked out at, when they were in a repository.
 pub type Provenance = {
   kind: String,
   name: String,
@@ -105,18 +88,14 @@ pub fn provenance_bytes(p: Provenance) -> Bytes / {abort.raise} = bin::encode(p,
 pub fn provenance_of(b: Bytes) -> Option<Provenance> / {abort.raise} =
   match bin::decode(b, provenance_bin()) { Ok(p) -> Some(p), Err(_) -> None }
 
-/// Where an artifact's signatures are kept: beside it.
 pub fn signatures_path(artifact: String) -> String = artifact ++ ".sig"
 
-// --- The commit a tree was checked out at ---------------------------------------------
-
 fn text_at(path: String) -> Option<String> / {fs.read_file[abs], abort.raise} =
-  match fs.read_file[abs](below_root(path)) {
+  match fs.read_file[abs](strip_root(path)) {
     Some(b) -> Some(String::of_bytes_lossy(b).trim()),
     None -> None,
   }
 
-/// The repository directory holding `dir`'s checkout, and the one its refs live in.
 type Repo = { git: String, common: String }
 
 fn repo_of(dir: String) -> Option<Repo> / {fs.kind[abs], fs.read_file[abs], abort.raise} =
@@ -124,11 +103,10 @@ fn repo_of(dir: String) -> Option<Repo> / {fs.kind[abs], fs.read_file[abs], abor
     None -> None,
     Some(tree) -> {
       let dot = tree ++ "/.git";
-      match fs.kind[abs](below_root(dot)) {
+      match fs.kind[abs](strip_root(dot)) {
         Dir -> Some({ git: dot, common: dot }),
         File -> match text_at(dot) {
           Some(line) -> if !line.starts_with("gitdir: ") { None } else {
-            // Either may be relative, and `abs` reads neither a relative path nor one through `..`.
             let git = resolve(tree, line.slice(8, line.len()));
             let common = match text_at(git ++ "/commondir") {
               None -> git,
@@ -157,7 +135,6 @@ fn packed_ref(common: String, name: String) -> Option<String> / {fs.read_file[ab
         }),
   }
 
-/// The commit `HEAD` names in the repository holding `dir`, or `""` outside one.
 pub fn head_commit(dir: String) -> String / {fs.kind[abs], fs.read_file[abs], abort.raise} =
   match repo_of(dir) {
     None -> "",
@@ -175,8 +152,6 @@ pub fn head_commit(dir: String) -> String / {fs.kind[abs], fs.read_file[abs], ab
       },
     },
   }
-
-// --- Tests ------------------------------------------------------------------
 
 pub fn a_seed(n: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all(range(0, 32).map(|i: Int| byte_of_int((i + n) % 256)))
@@ -224,7 +199,7 @@ test "a key written is one sealed line its owner alone reads, and reads back as 
   let seed = Secret::of_bytes(a_seed(9));
   let written = handle {
     on_mem[cwd](mem_of([]), || {
-      let wrote = write_seed(paths::spelled("release.key"), seed);
+      let wrote = write_seed(paths::rooted_path("release.key"), seed);
       let back = match read_seed("release.key") { Ok(s) -> Some(s), Err(_) -> None };
       { wrote: wrote, back: back }
     })

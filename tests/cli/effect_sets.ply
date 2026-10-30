@@ -2,12 +2,12 @@
 //! fixed column, with the alias, its uses and what a row declares beyond its body under `--explain`,
 //! which also says where a body can raise.
 
-import harness (spawned, scratch, program, in_memory, one, on_disk, said, stdout, json_of, at, nth,
-                items, str, int, shown, Hermetic, Shipped)
+import harness (spawned, scratch, write_program, in_memory, one_module_tree, on_disk, all_output,
+                stdout, json_of, at, nth, items, str, int, json_text, Hermetic, Shipped)
 import cli.report (count_of)
 import cli.signature (width, definition_lines, set_lines, provenance_lines, atom_texts)
-import compiler.check.types (Atom, Row, Scheme, RNamed, fn_type, named_type)
-import compiler.syntax.type_syntax (MRead, MWrite)
+import compiler.check.types (Atom, Row, Scheme, NamedResource, fn_type, named_type)
+import compiler.syntax.type_syntax (ReadMode, WriteMode)
 import std.fs (MemFs)
 import std.json (Json, Null, Array, Str)
 import std.string
@@ -63,7 +63,7 @@ fn columns(line: String) -> Int / {abort.raise} = line.code_points().len()
 
 fn types(t: MemFs, extra: List<String>) -> String / {Hermetic, Shipped, abort.raise, diverges} = {
   let r = in_memory(t, extra.fold(["check", "--types"], List::push));
-  assert(r.code == 0, Some(said(r)));
+  assert(r.code == 0, Some(all_output(r)));
   stdout(r)
 }
 
@@ -71,7 +71,8 @@ fn types(t: MemFs, extra: List<String>) -> String / {Hermetic, Shipped, abort.ra
 fn block(
   source: String,
   extra: List<String>,
-) -> String / {Hermetic, Shipped, abort.raise, diverges} = module_block(types(one(source), extra))
+) -> String / {Hermetic, Shipped, abort.raise, diverges} =
+  module_block(types(one_module_tree(source), extra))
 
 fn json_types(t: MemFs, extra: List<String>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
   json_of(in_memory(t, extra.fold(["check", "--json"], List::push)))
@@ -86,7 +87,7 @@ fn own_definitions(report: Json) -> List<Json> =
 /// each definition by name with its row's atoms and, under `--explain`, each set with its expansion
 /// and its uses, each alias a row was written as, what a row declares beyond what its body performs,
 /// and each place a body can raise. Where and how the text lays these out is `cli.signature`'s.
-fn said_of(report: Json) -> List<String> / {abort.raise} = {
+fn expected_facts(report: Json) -> List<String> / {abort.raise} = {
   let sets = items(at(nth(at(report, "modules"), 0), "effect_sets")).fold(
     [],
     |acc: List<String>, s: Json|
@@ -114,13 +115,13 @@ fn said_of(report: Json) -> List<String> / {abort.raise} = {
   })
 }
 
-/// `text` says everything `report` says, `said_of` names.
-fn carries(text: String, report: Json) -> Unit / {abort.raise} =
-  said_of(report).fold((), |u: Unit, fact: String|
+/// `text` says everything `report` says, `expected_facts` names.
+fn assert_text_matches_report(text: String, report: Json) -> Unit / {abort.raise} =
+  expected_facts(report).fold((), |u: Unit, fact: String|
     assert(text.contains(fact), Some("`" ++ fact ++ "` is not in:\n" ++ text)))
 
 test "a service's per-endpoint footprints are legible in one command" {
-  let report = json_types(one(service()), []);
+  let report = json_types(one_module_tree(service()), []);
   assert_eq(
     own_definitions(report).map(|d: Json|
       { name: str(at(d, "name")), atoms: strings_at(d, "atoms").sort() }),
@@ -140,11 +141,11 @@ test "a service's per-endpoint footprints are legible in one command" {
       { name: "m.audit", atoms: ["m.store.read[audit]", "m.store.write[audit]"] },
     ],
   );
-  carries(block(service(), []), report)
+  assert_text_matches_report(block(service(), []), report)
 }
 
 test "the expansion is printed without a flag and the alias is not" {
-  let text = types(one(service()), []);
+  let text = types(one_module_tree(service()), []);
   ["Web", "Reads", "Unused"].fold((), |u: Unit, alias: String|
     assert(
       !text.contains(alias),
@@ -166,17 +167,19 @@ test "no signature line runs past the column it wraps at" {
 fn atom_at(i: Int) -> Atom =
   {
     effect: Bytes::of_string("e" ++ i.to_string()),
-    resource: RNamed(Bytes::of_string("r".repeat(if i % 9 == 8 { 90 } else { i * 7 % 23 + 1 }))),
-    mode: if i % 2 == 0 { MRead } else { MWrite },
+    resource: NamedResource(
+      Bytes::of_string("r".repeat(if i % 9 == 8 { 90 } else { i * 7 % 23 + 1 })),
+    ),
+    mode: if i % 2 == 0 { ReadMode } else { WriteMode },
     op: None,
   }
 
 fn scheme_of(row: Row) -> Scheme =
   {
-    ty_vars: [],
-    row_vars: match row.tail { Some(v) -> [v], None -> [] },
-    label_vars: [],
-    kept_vars: [],
+    type_variables: [],
+    row_variables: match row.tail { Some(v) -> [v], None -> [] },
+    label_variables: [],
+    keep_variables: [],
     ty: fn_type([named_type(b"Request")], named_type(b"Response"), row),
   }
 
@@ -206,17 +209,17 @@ test "no line a row, a set or a provenance is laid out on runs past the column b
 }
 
 test "explain prints the set table, the alias and the difference it hides" {
-  let report = json_types(one(service()), ["--explain"]);
+  let report = json_types(one_module_tree(service()), ["--explain"]);
   assert_eq(
     items(at(nth(at(report, "modules"), 0), "effect_sets")).map(|s: Json|
       { name: str(at(s, "name")), used_by: int(at(s, "used_by")) }),
     [{ name: "Reads", used_by: 2 }, { name: "Web", used_by: 1 }, { name: "Unused", used_by: 0 }],
   );
-  carries(block(service(), ["--explain"]), report)
+  assert_text_matches_report(block(service(), ["--explain"]), report)
 }
 
 test "an included set counts the definitions that reach it" {
-  let text = types(one(service()), ["--explain"]);
+  let text = types(one_module_tree(service()), ["--explain"]);
   match text.split_once("effect set Reads") {
     Some(p) ->
       assert(
@@ -230,10 +233,10 @@ test "an included set counts the definitions that reach it" {
 // Two runs over one tree, so the block is a function of the program and of nothing a run keeps.
 test "explain prints the same bytes on every run" {
   scratch(|| {
-    program(service());
+    write_program(service());
     let typed = || {
       let r = on_disk(["check", "--types", "--explain"]);
-      assert(r.code == 0, Some(said(r)));
+      assert(r.code == 0, Some(all_output(r)));
       module_block(stdout(r))
     };
     assert_eq(typed(), typed())
@@ -241,47 +244,47 @@ test "explain prints the same bytes on every run" {
 }
 
 test "the JSON report carries the provenance only under explain" {
-  let plain = json_types(one(service()), []);
-  assert(at(nth(at(plain, "modules"), 0), "effect_sets") == Null, Some(shown(plain)));
-  assert(at(nth(at(plain, "definitions"), 0), "written_as") == Null, Some(shown(plain)));
+  let plain = json_types(one_module_tree(service()), []);
+  assert(at(nth(at(plain, "modules"), 0), "effect_sets") == Null, Some(json_text(plain)));
+  assert(at(nth(at(plain, "definitions"), 0), "written_as") == Null, Some(json_text(plain)));
 
-  let explained = json_types(one(service()), ["--explain"]);
+  let explained = json_types(one_module_tree(service()), ["--explain"]);
   let sets = items(at(nth(at(explained, "modules"), 0), "effect_sets"));
   assert(
     sets.map(|s: Json| str(at(s, "name"))) == ["Reads", "Web", "Unused"],
-    Some(shown(explained)),
+    Some(json_text(explained)),
   );
-  assert(int(at(nth(Array(sets), 0), "used_by")) == 2, Some(shown(explained)));
+  assert(int(at(nth(Array(sets), 0), "used_by")) == 2, Some(json_text(explained)));
   assert(
     at(nth(Array(sets), 0), "expansion")
       == Array([Str("m.store.read[orders]"), Str("m.store.read[users]")]),
-    Some(shown(explained)),
+    Some(json_text(explained)),
   );
   let orders = match items(at(explained, "definitions")).filter(|d: Json|
       str(at(d, "name")) == "m.list_orders") {
     [d, ..] -> d,
-    [] -> panic("list_orders: " ++ shown(explained)),
+    [] -> panic("list_orders: " ++ json_text(explained)),
   };
-  assert(at(orders, "written_as") == Array([Str("Reads")]), Some(shown(orders)));
-  assert(at(orders, "performed") == Array([Str("m.store.all[orders]")]), Some(shown(orders)));
+  assert(at(orders, "written_as") == Array([Str("Reads")]), Some(json_text(orders)));
+  assert(at(orders, "performed") == Array([Str("m.store.all[orders]")]), Some(json_text(orders)));
   assert(
     at(orders, "declared_not_performed") == Array([Str("m.store.read[users]")]),
-    Some(shown(orders)),
+    Some(json_text(orders)),
   )
 }
 
 test "the JSON provenance is the same on every run" {
   scratch(|| {
-    program(service());
+    write_program(service());
     let explained = || json_of(on_disk(["check", "--json", "--explain"]));
     let once = explained();
     let twice = explained();
     assert(
       at(nth(at(once, "modules"), 0), "effect_sets")
         == at(nth(at(twice, "modules"), 0), "effect_sets"),
-      Some(shown(once)),
+      Some(json_text(once)),
     );
-    assert(at(once, "definitions") == at(twice, "definitions"), Some(shown(once)))
+    assert(at(once, "definitions") == at(twice, "definitions"), Some(json_text(once)))
   })
 }
 
@@ -299,35 +302,35 @@ fn reads() -> String =
   \\
 
 test "explain says where a body can raise and why, and which row names a raise no body makes" {
-  let report = json_types(one(reads()), ["--explain"]);
+  let report = json_types(one_module_tree(reads()), ["--explain"]);
   let text = block(reads(), ["--explain"]);
-  carries(text, report);
+  assert_text_matches_report(text, report);
   assert(text.contains("`Bytes::at` requires `0 <= i`"), Some(text));
   assert(text.contains("calls `m.unguarded`"), Some(text))
 }
 
 test "the JSON report files each raise with its place, its kind and the clause it misses" {
-  let explained = json_types(one(reads()), ["--explain"]);
+  let explained = json_types(one_module_tree(reads()), ["--explain"]);
   let named = |name: String|
     match items(at(explained, "definitions")).filter(|d: Json| str(at(d, "name")) == name) {
       [d, ..] -> d,
-      [] -> panic(name ++ ": " ++ shown(explained)),
+      [] -> panic(name ++ ": " ++ json_text(explained)),
     };
   let raise = nth(at(named("m.unguarded"), "raises"), 0);
-  assert(at(raise, "at") == Str("m.ply:4:61"), Some(shown(raise)));
-  assert(at(raise, "kind") == Str("unshown"), Some(shown(raise)));
-  assert(at(raise, "callee") == Str("Bytes::at"), Some(shown(raise)));
-  assert(at(raise, "requires") == Str("0 <= i"), Some(shown(raise)));
+  assert(at(raise, "at") == Str("m.ply:4:61"), Some(json_text(raise)));
+  assert(at(raise, "kind") == Str("unshown"), Some(json_text(raise)));
+  assert(at(raise, "callee") == Str("Bytes::at"), Some(json_text(raise)));
+  assert(at(raise, "requires") == Str("0 <= i"), Some(json_text(raise)));
   assert(
     items(at(named("m.shared"), "raises")).map(|r: Json| str(at(r, "kind")))
       == ["calls", "zero_divisor"],
-    Some(shown(named("m.shared"))),
+    Some(json_text(named("m.shared"))),
   );
-  assert(at(named("m.peek"), "raises") == Array([]), Some(shown(named("m.peek"))));
-  assert(at(named("m.wide"), "raises") == Array([]), Some(shown(named("m.wide"))));
+  assert(at(named("m.peek"), "raises") == Array([]), Some(json_text(named("m.peek"))));
+  assert(at(named("m.wide"), "raises") == Array([]), Some(json_text(named("m.wide"))));
   assert(
     at(named("m.wide"), "declared_not_performed") == Array([Str("abort.raise")]),
-    Some(shown(named("m.wide"))),
+    Some(json_text(named("m.wide"))),
   )
 }
 
@@ -342,23 +345,23 @@ fn schema() -> String =
   \\
 
 test "a law schema's definition names no row as unperformed, since no one wrote its row" {
-  let explained = json_types(one(schema()), ["--explain"]);
+  let explained = json_types(one_module_tree(schema()), ["--explain"]);
   match items(at(explained, "definitions")).filter(|d: Json| str(at(d, "name")) == "m.settles") {
     [d, ..] -> {
-      assert(at(d, "atoms") != Array([]), Some(shown(d)));
-      assert(at(d, "declared_not_performed") == Array([]), Some(shown(d)))
+      assert(at(d, "atoms") != Array([]), Some(json_text(d)));
+      assert(at(d, "declared_not_performed") == Array([]), Some(json_text(d)))
     },
-    [] -> panic("m.settles: " ++ shown(explained)),
+    [] -> panic("m.settles: " ++ json_text(explained)),
   }
 }
 
 // The second run takes each definition from the rows the first filed, which hold its raises.
 test "a run that walks no body says what the run that walked them said of their raises" {
   scratch(|| {
-    program(reads());
+    write_program(reads());
     let typed = || {
       let r = on_disk(["check", "--types", "--explain"]);
-      assert(r.code == 0, Some(said(r)));
+      assert(r.code == 0, Some(all_output(r)));
       module_block(stdout(r))
     };
     let walked = typed();
@@ -368,7 +371,7 @@ test "a run that walks no body says what the run that walked them said of their 
 }
 
 test/nondet "prove explain names what an over-broad row gave up" {
-  program(
+  write_program(
     \\effect store {
     \\  read  all[table]() -> List<Int>
     \\  write save[table](rows: List<Int>) -> Unit
@@ -389,7 +392,7 @@ test/nondet "prove explain names what an over-broad row gave up" {
   assert(text.contains("m.store.read[users]"), Some(text));
   assert(!text.contains("Web"), Some("the alias name is provenance, never the claim:\n" ++ text));
   // A row exactly its body's gives nothing up, so the line is absent rather than empty.
-  program("pub fn double(x: Int) -> Int\n  ensures result >= x\n  = x + x\n");
+  write_program("pub fn double(x: Int) -> Int\n  ensures result >= x\n  = x + x\n");
   let tight = stdout(spawned(["prove", "--explain"]));
   assert(!tight.contains("frame covers"), Some(tight))
 }

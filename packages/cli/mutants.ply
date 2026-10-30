@@ -1,45 +1,35 @@
-//! `--coverage` and `--mutate`: which tests reach each definition, from the hash closure alone, and
-//! each definition changed one operator or literal at a time. A site is a token of the compiler's
-//! own lexer, and a mutant is the text the load read with that token replaced, checked again over
-//! the load's own packages and seeded with its rows, so only what the change reaches is walked.
-
-import compiler.load (LoadedAnalysis, tell_viewed)
+import compiler.load (LoadedAnalysis, report_viewed)
 import units (emit)
-import compiler.front.seam (Analysed, Refused, view_of)
-import compiler.front.facts (View, pulled_at)
+import compiler.front.seam (Analysed, Refused, checked_program_of)
+import compiler.front.facts (CheckedProgram, pulled_at)
 import compiler.front.rows (ModuleSpan)
-import compiler.store.hash.forms (TheItem, reach)
-import compiler.check.infer.checker (DefInfo, TestInfo)
+import compiler.store.hash.forms (ItemKeyed, reach)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo)
 import compiler.syntax.lexer (Token, IntLiteral, Keyword, Punctuation, lex)
-import compiler.front.pkg (PackageSources, Supplied)
-import compiler.check.resolve.tables (Diag, Source)
-import diagnostic (Place, diag_of, place_json, placeless)
-import program (Program, front_of, published, reanalysed)
+import compiler.front.pkg (PackageSources, SuppliedPackage)
+import compiler.check.resolve.tables (Diagnostic, Source)
+import diagnostic (SourceText, diagnostic_of, editor_location_json, unlocated_label)
+import program (Program, loaded_analysis, definitions_in_order, reanalysed)
 import compiler.unit (shipped)
 import std.json (Json, Null, Str, Bool, Number, Array, object, int)
-import tester (Testing, TestUnit, unit_over)
+import tester (TestRun, TestUnit, unit_over)
 import std.machine as entering
 import std.string
 import compiler.syntax.parsing (no_module)
 
-/// One change to one definition's text: the token at `at` replaced by `to`.
 pub type Mutation = { definition: String, at: ModuleSpan, from: String, to: String }
 
-/// Each mutant beside the tests that reach its definition, cheapest first; and the definitions no
-/// test reaches, which have no mutant worth judging.
 pub type Queue = {
   definitions: Int,
   unreached: List<String>,
   mutants: List<{ tests: List<Int>, mutation: Mutation }>,
 }
 
-/// A mutant's verdict: `killed`, `survived`, `skipped` or `unresolved`, and why when it is either of
-/// the last two.
-pub type Judged = { id: Int, verdict: String, why: String }
+pub type MutantVerdict = { id: Int, verdict: String, reason: String }
 
 pub type Survivor = { definition: String, from: String, to: String, at: Option<ModuleSpan> }
 
-pub type Mutants = {
+pub type MutationReport = {
   killed: Int,
   survived: Int,
   skipped: Int,
@@ -51,28 +41,28 @@ pub type Mutants = {
 
 pub type Coverage = { definitions: Int, unreached: List<String>, json: Json }
 
-/// Every definition of this project, as the load published them, a module it pulled of the shipped
-/// ones left out: what `--mutate *` and `--coverage` are over.
-fn project_defs(analysis: View) -> List<DefInfo> =
-  published(analysis).filter(|def_info: DefInfo|
-    !pulled_at(analysis.frame.packages, analysis.frame.module_packages, def_info.at.module))
+fn project_definitions(analysis: CheckedProgram) -> List<DefinitionInfo> =
+  definitions_in_order(analysis).filter(|definition_info: DefinitionInfo|
+    !pulled_at(analysis.frame.packages, analysis.frame.module_packages, definition_info.at.module))
 
-/// The definitions `--mutate DEF` names: every project definition for `*`, else one by its
-/// program-wide or unique simple name.
-pub fn targets(analysis: View, query: String) -> Result<List<DefInfo>, Diag> = {
-  let project = project_defs(analysis);
-  let exact = project.filter(|def_info: DefInfo| String::of_bytes_lossy(def_info.name) == query);
-  let simple = project.filter(|def_info: DefInfo|
-    String::of_bytes_lossy(def_info.simple_name) == query);
+pub fn targets(
+  analysis: CheckedProgram,
+  query: String,
+) -> Result<List<DefinitionInfo>, Diagnostic> = {
+  let project = project_definitions(analysis);
+  let exact = project.filter(|definition_info: DefinitionInfo|
+    String::of_bytes_lossy(definition_info.name) == query);
+  let simple = project.filter(|definition_info: DefinitionInfo|
+    String::of_bytes_lossy(definition_info.simple_name) == query);
   if query == "*" { Ok(project) }
   else if exact.len() > 0 { Ok(exact) }
   else if simple.len() == 1 { Ok(simple) } else if simple.len() == 0 {
     Err(
-      diag_of(
+      diagnostic_of(
         "error",
         "E0101",
         "no definition is named `" ++ query ++ "`",
-        [placeless("not a definition of this project")],
+        [unlocated_label("not a definition of this project")],
         [
           "`--mutate` takes a program-wide name, a simple name unique in the project, or nothing for every definition",
         ],
@@ -80,15 +70,16 @@ pub fn targets(analysis: View, query: String) -> Result<List<DefInfo>, Diag> = {
     )
   } else {
     Err(
-      diag_of(
+      diagnostic_of(
         "error",
         "E0101",
         "`" ++ query ++ "` names " ++ simple.len().to_string() ++ " definitions",
-        [placeless("say which")],
+        [unlocated_label("say which")],
         [
           "one of: "
             ++ String::join(
-              simple.map(|def_info: DefInfo| String::of_bytes_lossy(def_info.name)),
+              simple.map(|definition_info: DefinitionInfo|
+                String::of_bytes_lossy(definition_info.name)),
               ", ",
             ),
         ],
@@ -97,45 +88,44 @@ pub fn targets(analysis: View, query: String) -> Result<List<DefInfo>, Diag> = {
   }
 }
 
-/// The functions each test reaches, by the test's program-wide name.
-fn closures(analysis: View) -> Map<Bytes, Map<Bytes, Bool>> / {abort.raise} =
+fn test_closures(analysis: CheckedProgram) -> Map<Bytes, Map<Bytes, Bool>> / {abort.raise} =
   analysis.checked.tests.fold(
     Map::new(),
     |acc: Map<Bytes, Map<Bytes, Bool>>, test_info: TestInfo|
-      acc.insert(test_info.key, reach(analysis.frame.hashes, [TheItem(test_info.key)]).fns),
+      acc.insert(test_info.key, reach(analysis.frame.hashes, [ItemKeyed(test_info.key)]).functions),
   )
 
-/// The tests that reach the function, in test order.
-fn reaching(analysis: View, closed: Map<Bytes, Map<Bytes, Bool>>, name: Bytes) -> List<TestInfo> =
+fn tests_reaching(
+  analysis: CheckedProgram,
+  closed: Map<Bytes, Map<Bytes, Bool>>,
+  name: Bytes,
+) -> List<TestInfo> =
   analysis.checked.tests.filter(|test_info: TestInfo|
     match closed.get(test_info.key) { Some(names) -> names.contains(name), None -> false })
 
-// --- Sites ------------------------------------------------------------------
-
-fn token_at(toks: List<Token>, i: Int) -> Option<Token> = if i < 0 { None } else { toks.at(i) }
+fn token_at(tokens: List<Token>, i: Int) -> Option<Token> = if i < 0 { None } else { tokens.at(i) }
 
 fn is_punct(t: Option<Token>, p: Bytes) -> Bool =
   match t { Some(x) -> x.kind == Punctuation(p), None -> false }
 
-/// `<<` and `>>` are two tokens touching, which a comparison never is.
-fn touching(toks: List<Token>, i: Int, p: Bytes) -> Bool =
-  match token_at(toks, i) {
+fn is_doubled_operator(tokens: List<Token>, i: Int, p: Bytes) -> Bool =
+  match token_at(tokens, i) {
     None -> false,
     Some(t) -> {
-      let before = token_at(toks, i - 1);
-      let after = token_at(toks, i + 1);
+      let before = token_at(tokens, i - 1);
+      let after = token_at(tokens, i + 1);
       (is_punct(before, p) && (match before { Some(b) -> b.end == t.start, None -> false }))
         || (is_punct(after, p) && (match after { Some(a) -> a.start == t.end, None -> false }))
     },
   }
 
-fn swapped(toks: List<Token>, i: Int, p: Bytes) -> Option<String> =
+fn swapped_operator(tokens: List<Token>, i: Int, p: Bytes) -> Option<String> =
   if p == b"plus" { Some("-") }
   else if p == b"minus" { Some("+") }
   else if p == b"le" { Some("<") }
   else if p == b"ge" { Some(">") }
-  else if p == b"lt" { if touching(toks, i, b"lt") { None } else { Some("<=") } }
-  else if p == b"gt" { if touching(toks, i, b"gt") { None } else { Some(">=") } }
+  else if p == b"lt" { if is_doubled_operator(tokens, i, b"lt") { None } else { Some("<=") } }
+  else if p == b"gt" { if is_doubled_operator(tokens, i, b"gt") { None } else { Some(">=") } }
   else if p == b"eqeq" { Some("!=") }
   else if p == b"bangeq" { Some("==") }
   else if p == b"bang" { Some("") }
@@ -147,7 +137,6 @@ fn is_digit_or_underscore(c: Int) -> Bool = (c >= 48 && c <= 57) || c == 95
 
 fn is_word(c: Int) -> Bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
 
-/// A decimal literal with nothing fused to it: not hex, not suffixed, and not the start of a range.
 fn plain_decimal(src: Bytes, t: Token) -> Bool / {abort.raise} = {
   let digits = range(t.start, t.end).fold(true, |ok: Bool, i: Int|
     ok && is_digit_or_underscore(src.at(i)));
@@ -155,18 +144,18 @@ fn plain_decimal(src: Bytes, t: Token) -> Bool / {abort.raise} = {
   digits && !is_word(after) && after != 46
 }
 
-/// One change per operator or literal of `src`, outside strings and comments, in source order. A
-/// site the grammar gives another meaning, a `<` opening a type argument, makes a mutant that does
-/// not check, which the run skips.
-pub fn sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> / {abort.raise} = {
-  let toks = lex(src).tokens;
-  range(0, toks.len()).fold([], |acc: List<{ start: Int, end: Int, to: String }>, i: Int|
-    match token_at(toks, i) {
+pub fn mutation_sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> / {abort.raise} = {
+  let tokens = lex(src).tokens;
+  range(0, tokens.len()).fold([], |acc: List<{ start: Int, end: Int, to: String }>, i: Int|
+    match token_at(tokens, i) {
       None -> acc,
       Some(t) -> {
         let site = |to: String| acc.push({ start: t.start, end: t.end, to: to });
         match t.kind {
-          Punctuation(p) -> match swapped(toks, i, p) { Some(to) -> site(to), None -> acc },
+          Punctuation(p) -> match swapped_operator(tokens, i, p) {
+            Some(to) -> site(to),
+            None -> acc,
+          },
           Keyword(k) -> if k == b"true" { site("false") }
           else if k == b"false" { site("true") }
           else { acc },
@@ -178,49 +167,50 @@ pub fn sites(src: Bytes) -> List<{ start: Int, end: Int, to: String }> / {abort.
     })
 }
 
-/// Every mutation of `def_info`, in source order.
-pub fn mutations(places: List<Place>, def_info: DefInfo) -> List<Mutation> / {abort.raise} =
-  match places.at(def_info.at.module) {
+pub fn mutations(
+  places: List<SourceText>,
+  definition_info: DefinitionInfo,
+) -> List<Mutation> / {abort.raise} =
+  match places.at(definition_info.at.module) {
     None -> [],
     Some(place) -> {
-      let start = def_info.at.span.start;
-      let src = place.text.slice(start, def_info.at.span.end);
-      sites(src).map(|s: { start: Int, end: Int, to: String }|
+      let start = definition_info.at.span.start;
+      let src = place.text.slice(start, definition_info.at.span.end);
+      mutation_sites(src).map(|s: { start: Int, end: Int, to: String }|
         {
-          definition: String::of_bytes_lossy(def_info.name),
-          at: { module: def_info.at.module, start: start + s.start, end: start + s.end },
+          definition: String::of_bytes_lossy(definition_info.name),
+          at: { module: definition_info.at.module, start: start + s.start, end: start + s.end },
           from: String::of_bytes_lossy(src.slice(s.start, s.end)),
           to: s.to,
         })
     },
   }
 
-/// Every mutation of every target some test reaches, cheapest first: the fewer tests reach a
-/// mutant, the less judging it costs, and mutants a run reaches equally stay in source order.
-pub fn queued(
-  places: List<Place>,
-  analysis: View,
-  targets: List<DefInfo>,
+pub fn mutation_queue(
+  places: List<SourceText>,
+  analysis: CheckedProgram,
+  targets: List<DefinitionInfo>,
 ) -> Queue / {abort.raise} = {
-  let closed = closures(analysis);
+  let closed = test_closures(analysis);
   let start: { unreached: List<String>, by_cost: Map<Int, List<{ tests: List<Int>, mutation: Mutation }>> } = {
     unreached: [],
     by_cost: Map::new(),
   };
   let sorted = targets.fold(
     start,
-    |acc: { unreached: List<String>, by_cost: Map<Int, List<{ tests: List<Int>, mutation: Mutation }>> }, def_info: DefInfo| {
-      let tests = reaching(analysis, closed, def_info.name).map(|test_info: TestInfo|
-        test_info.index);
+    |acc: { unreached: List<String>, by_cost: Map<Int, List<{ tests: List<Int>, mutation: Mutation }>> }, definition_info: DefinitionInfo| {
+      let tests = tests_reaching(analysis, closed, definition_info.name).map(
+        |test_info: TestInfo| test_info.index,
+      );
       if tests.len() == 0 {
-        { ..acc, unreached: acc.unreached.push(String::of_bytes_lossy(def_info.name)) }
+        { ..acc, unreached: acc.unreached.push(String::of_bytes_lossy(definition_info.name)) }
       } else {
         let held = match acc.by_cost.get(tests.len()) { Some(xs) -> xs, None -> [] };
         {
           ..acc,
           by_cost: acc.by_cost.insert(
             tests.len(),
-            mutations(places, def_info).fold(
+            mutations(places, definition_info).fold(
               held,
               |into: List<{ tests: List<Int>, mutation: Mutation }>, m: Mutation|
                 into.push({ tests: tests, mutation: m }),
@@ -245,8 +235,6 @@ pub fn queued(
   }
 }
 
-// --- One mutant -------------------------------------------------------------
-
 fn spliced_text(original: Bytes, m: Mutation) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     original.slice(0, m.at.start),
@@ -254,7 +242,7 @@ fn spliced_text(original: Bytes, m: Mutation) -> Bytes / {abort.raise} =
     original.slice(m.at.end, original.len()),
   ])
 
-fn spliced_places(places: List<Place>, m: Mutation) -> List<Place> / {abort.raise} =
+fn spliced_places(places: List<SourceText>, m: Mutation) -> List<SourceText> / {abort.raise} =
   range(0, places.len()).map(|i: Int|
     match places.at(i) {
       None -> { path: "", text: b"" },
@@ -262,11 +250,14 @@ fn spliced_places(places: List<Place>, m: Mutation) -> List<Place> / {abort.rais
       else { place },
     })
 
-/// A dependency's modules come after the root's, package by package, as the load placed them.
-fn spliced_pkgs(pkgs: PackageSources, own: Int, places: List<Place>) -> PackageSources = {
-  let done = pkgs.supplied.fold(
+fn spliced_packages(
+  packages: PackageSources,
+  own: Int,
+  places: List<SourceText>,
+) -> PackageSources = {
+  let done = packages.supplied.fold(
     { at: own, out: [] },
-    |acc: { at: Int, out: List<Supplied> }, supplied: Supplied| {
+    |acc: { at: Int, out: List<SuppliedPackage> }, supplied: SuppliedPackage| {
       let modules = range(0, supplied.modules.len()).map(|j: Int|
         match ((supplied.modules.at(j), places.at(acc.at + j))) {
           (Some(src), Some(place)) -> { name: src.name, src: place.text },
@@ -276,17 +267,15 @@ fn spliced_pkgs(pkgs: PackageSources, own: Int, places: List<Place>) -> PackageS
       { at: acc.at + supplied.modules.len(), out: acc.out.push({ ..supplied, modules: modules }) }
     },
   );
-  { ..pkgs, supplied: done.out }
+  { ..packages, supplied: done.out }
 }
 
-/// The unit a mutant's tests run in, under the run's binding, or the verdict a mutant that is not a
-/// program already is.
-pub fn built(
-  testing: Testing,
+pub fn mutant_unit(
+  testing: TestRun,
   program: Program,
-  analysis: View,
+  analysis: CheckedProgram,
   m: Mutation,
-) -> Result<TestUnit, Judged> / {entering::machine.open, emit.unit, emit.compiled, abort.raise, shipped.reached} = {
+) -> Result<TestUnit, MutantVerdict> / {entering::machine.open, emit.unit, emit.compiled, abort.raise, shipped.report_reached} = {
   let places = spliced_places(program.places, m);
   let own = range(0, program.files.len()).map(|i: Int|
     match ((program.files.at(i), places.at(i))) {
@@ -297,39 +286,42 @@ pub fn built(
     program,
     analysis.frame,
     own,
-    spliced_pkgs(program.pkgs, program.files.len(), places),
+    spliced_packages(program.packages, program.files.len(), places),
     [Bytes::of_string(m.definition)],
   );
-  tell_viewed(pulled.viewed, false);
+  report_viewed(pulled.shipped_views, false);
   match pulled.out {
-    Refused(_) -> Err({ id: 0, verdict: "skipped", why: "does not check" }),
+    Refused(_) -> Err({ id: 0, verdict: "skipped", reason: "does not check" }),
     Analysed(mutant) -> {
-      let v = view_of(mutant);
-      let front: LoadedAnalysis = front_of(
+      let v = checked_program_of(mutant);
+      let front: LoadedAnalysis = loaded_analysis(
         {
-          program: { ..program, places: places, diags: mutant.warnings, frame: Some(v.frame) },
+          program: {
+            ..program,
+            places: places,
+            diagnostics: mutant.warnings,
+            frame: Some(v.frame),
+          },
           read_ms: 0,
-          front_ms: 0,
-          file_ms: 0,
+          front_end_ms: 0,
+          store_ms: 0,
           cached: false,
         },
         v,
       );
       match unit_over(testing, front) {
         Ok(unit) -> Ok(unit),
-        Err(_) -> Err({ id: 0, verdict: "unresolved", why: "the C backend could not be built" }),
+        Err(_) -> Err({ id: 0, verdict: "unresolved", reason: "the C backend could not be built" }),
       }
     },
   }
 }
 
-// --- What a mutation and the coverage come to ---------------------------------
-
-fn placed(at: ModuleSpan) -> Option<ModuleSpan> =
+fn located_span(at: ModuleSpan) -> Option<ModuleSpan> =
   if at.module == no_module() { None } else { Some(at) }
 
 fn mutation_json(
-  places: List<Place>,
+  places: List<SourceText>,
   m: Mutation,
   tests: List<String>,
   why: Option<String>,
@@ -338,20 +330,18 @@ fn mutation_json(
     { key: "definition", value: Str(m.definition) },
     { key: "from", value: Str(m.from) },
     { key: "to", value: Str(m.to) },
-    { key: "location", value: place_json(places, m.at) },
+    { key: "location", value: editor_location_json(places, m.at) },
     { key: "tests", value: Array(tests.map(|t: String| Str(t))) },
     { key: "why", value: match why { Some(w) -> Str(w), None -> Null } },
   ])
 
-/// The mutation as the program judged it: each verdict beside its mutant and the tests that reach
-/// it, and every mutant the budget never reached left out.
 pub fn mutants(
-  places: List<Place>,
-  analysis: View,
+  places: List<SourceText>,
+  analysis: CheckedProgram,
   q: Queue,
-  judged: List<Judged>,
+  judged: List<MutantVerdict>,
   budget_spent: Bool,
-) -> Mutants / {abort.raise} = {
+) -> MutationReport / {abort.raise} = {
   let keys = analysis.checked.tests.fold(
     Map::new(),
     |acc: Map<Int, String>, test_info: TestInfo|
@@ -359,7 +349,7 @@ pub fn mutants(
   );
   let rows = judged.fold(
     [],
-    |acc: List<{ judged: Judged, mutation: Mutation, tests: List<String> }>, j: Judged|
+    |acc: List<{ judged: MutantVerdict, mutation: Mutation, tests: List<String> }>, j: MutantVerdict|
       match q.mutants.at(j.id) {
         None -> acc,
         Some(x) ->
@@ -372,18 +362,18 @@ pub fn mutants(
       },
   );
   let said = |verdict: String|
-    rows.filter(|r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+    rows.filter(|r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
       r.judged.verdict == verdict);
   let killed = said("killed").len();
   let survived = said("survived").len();
   let skipped = said("skipped").len();
   let unresolved = said("unresolved").len();
-  let entry = |r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+  let entry = |r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
     mutation_json(
       places,
       r.mutation,
       r.tests,
-      if r.judged.verdict == "skipped" || r.judged.verdict == "unresolved" { Some(r.judged.why) }
+      if r.judged.verdict == "skipped" || r.judged.verdict == "unresolved" { Some(r.judged.reason) }
       else { None },
     );
   {
@@ -393,12 +383,12 @@ pub fn mutants(
     budget_spent: budget_spent,
     unreached: q.unreached,
     survivors: said("survived").map(
-      |r: { judged: Judged, mutation: Mutation, tests: List<String> }|
+      |r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
         {
           definition: r.mutation.definition,
           from: r.mutation.from,
           to: r.mutation.to,
-          at: placed(r.mutation.at),
+          at: located_span(r.mutation.at),
         },
     ),
     json: object([
@@ -415,8 +405,10 @@ pub fn mutants(
       {
         key: "skips",
         value: Array(
-          rows.filter(|r: { judged: Judged, mutation: Mutation, tests: List<String> }|
-            r.judged.verdict == "skipped" || r.judged.verdict == "unresolved").map(
+          rows.filter(
+            |r: { judged: MutantVerdict, mutation: Mutation, tests: List<String> }|
+              r.judged.verdict == "skipped" || r.judged.verdict == "unresolved",
+          ).map(
             entry,
           ),
         ),
@@ -425,29 +417,32 @@ pub fn mutants(
   }
 }
 
-/// Which tests reach each project definition, from the hash closure alone.
-pub fn coverage(analysis: View) -> Coverage / {abort.raise} = {
-  let closed = closures(analysis);
-  let defs = project_defs(analysis).map(|def_info: DefInfo|
+pub fn coverage(analysis: CheckedProgram) -> Coverage / {abort.raise} = {
+  let closed = test_closures(analysis);
+  let definitions = project_definitions(analysis).map(|definition_info: DefinitionInfo|
     {
-      name: String::of_bytes_lossy(def_info.name),
-      reached_by: reaching(analysis, closed, def_info.name).map(|t: TestInfo|
+      name: String::of_bytes_lossy(definition_info.name),
+      reached_by: tests_reaching(analysis, closed, definition_info.name).map(|t: TestInfo|
         String::of_bytes_lossy(t.key)),
     });
-  let unreached = defs.filter(|def_info: { name: String, reached_by: List<String> }|
-    def_info.reached_by.len() == 0).map(|def_info: { name: String, reached_by: List<String> }|
-    def_info.name);
+  let unreached = definitions.filter(
+    |definition_info: { name: String, reached_by: List<String> }|
+      definition_info.reached_by.len() == 0,
+  ).map(|definition_info: { name: String, reached_by: List<String> }| definition_info.name);
   {
-    definitions: defs.len(),
+    definitions: definitions.len(),
     unreached: unreached,
     json: object([
       {
         key: "definitions",
         value: Array(
-          defs.map(|def_info: { name: String, reached_by: List<String> }|
+          definitions.map(|definition_info: { name: String, reached_by: List<String> }|
             object([
-              { key: "name", value: Str(def_info.name) },
-              { key: "reached_by", value: Array(def_info.reached_by.map(|t: String| Str(t))) },
+              { key: "name", value: Str(definition_info.name) },
+              {
+                key: "reached_by",
+                value: Array(definition_info.reached_by.map(|t: String| Str(t))),
+              },
             ])),
         ),
       },
@@ -456,10 +451,8 @@ pub fn coverage(analysis: View) -> Coverage / {abort.raise} = {
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
 fn changes(src: String) -> List<String> / {abort.raise} =
-  sites(Bytes::of_string(src)).map(|s: { start: Int, end: Int, to: String }|
+  mutation_sites(Bytes::of_string(src)).map(|s: { start: Int, end: Int, to: String }|
     String::of_bytes_lossy(Bytes::of_string(src).slice(s.start, s.end)) ++ "->" ++ s.to)
 
 test "each operator and literal is one site, and an arrow, a concatenation and a string are none" {

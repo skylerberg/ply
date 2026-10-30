@@ -1,0 +1,404 @@
+import std.fs
+import std.fs (fs)
+import std.bytes (u32_le, u64_le)
+import compiler.store.segments
+import compiler.store.segments (Manifest, Segment, SegmentWriter, Committed)
+
+pub effect record_store {
+  read get[s](key: Bytes) -> Option<Bytes>
+  write put[s](records: List<Record>) -> Unit
+}
+
+pub type Record = { key: Bytes, bytes: Bytes }
+
+pub fn used_file() -> String = ".used"
+
+fn schema() -> Bytes = b"ply kept records 1".blake3()
+
+fn records_table() -> Int = 1
+
+fn row_width() -> Int = 44
+
+fn digest_of(key: Bytes) -> Bytes = key.blake3()
+
+fn merge_chunk_size() -> Int = 16777216
+
+type OpenStore = {
+  manifest: Manifest,
+  opened: List<Segment>,
+  index: Option<Map<Bytes, FrameLocation>>,
+  mine: Map<Bytes, Bytes>,
+  lost: List<Bytes>,
+  batches: Int,
+}
+
+type FrameLocation = { segment: Segment, at: Int, len: Int }
+
+fn mark_damaged(o: OpenStore, seg: Segment) -> OpenStore =
+  if o.lost.contains(seg.token) { o } else { { ..o, lost: o.lost.push(seg.token) } }
+
+fn load_index<[r]>(dir: String, o: OpenStore) -> OpenStore / {fs.read[r], abort.raise} =
+  match o.index {
+    Some(_) -> o,
+    None ->
+      o.opened.fold({ ..o, index: Some(Map::new()) }, |acc: OpenStore, seg: Segment|
+        match segments::table_rows[r](dir, seg, records_table()) {
+          None -> mark_damaged(acc, seg),
+          Some(rows) ->
+            {
+              ..acc,
+              index: Some(
+                segments::rows_folded(
+                  rows.len() / row_width(),
+                  match acc.index { Some(ix) -> ix, None -> Map::new() },
+                  |ix: Map<Bytes, FrameLocation>, i: Int| {
+                    let at = i * row_width();
+                    ix.insert(rows.slice(at, at + 32), {
+                      segment: seg,
+                      at: segments::read_u64(rows, at + 32),
+                      len: segments::read_u32(rows, at + 40),
+                    })
+                  },
+                ),
+              ),
+            },
+        }),
+  }
+
+fn lookup<[r]>(
+  dir: String,
+  o: OpenStore,
+  digest: Bytes,
+) -> { open: OpenStore, bytes: Option<Bytes> } / {fs.read[r], abort.raise} =
+  match o.mine.get(digest) {
+    Some(b) -> { open: o, bytes: Some(b) },
+    None -> {
+      let x = load_index[r](dir, o);
+      match match x.index { Some(ix) -> ix.get(digest), None -> None } {
+        None -> { open: x, bytes: None },
+        Some(p) -> if x.lost.contains(p.segment.token) { { open: x, bytes: None } } else {
+          match segments::payload[r](dir, p.segment.token, p.at, p.len) {
+            Some(b) -> { open: x, bytes: Some(b) },
+            None -> { open: mark_damaged(x, p.segment), bytes: None },
+          }
+        },
+      }
+    },
+  }
+
+fn put_batch<[r]>(
+  dir: String,
+  run: Option<String>,
+  o: OpenStore,
+  records: List<Record>,
+) -> OpenStore / {fs.read[r], fs.write[r], abort.raise} = {
+  let fresh = records.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: Record| {
+    let d = digest_of(x.key);
+    if o.mine.get(d) == Some(x.bytes) { acc.remove(d) } else { acc.insert(d, x.bytes) }
+  });
+  let mine = fresh.fold(o.mine, |acc: Map<Bytes, Bytes>, d: Bytes, b: Bytes| acc.insert(d, b));
+  if fresh.len() == 0 || run == None { { ..o, mine: mine } } else {
+    let placed = fresh.fold(
+      { writing: segments::new_writer(), rows: Map::new() },
+      |acc: { writing: SegmentWriter, rows: Map<Bytes, Bytes> }, d: Bytes, b: Bytes| {
+        let f = segments::append_payload(acc.writing, b);
+        { writing: f.writing, rows: acc.rows.insert(d, u64_le(f.at).concat(u32_le(b.len()))) }
+      },
+    );
+    let token = segments::segment_token(run, o.manifest.generation, o.batches);
+    let wrote = { ..o, mine: mine, batches: o.batches + 1 };
+    match segments::finish[r](dir, schema(), token, placed.writing, [
+        segments::table(records_table(), placed.rows, |_: Bytes, at: Bytes| Some(at)),
+      ]) {
+      None -> wrote,
+      Some(seg) -> match segments::commit[r](dir, schema(), seg, without: o.lost) {
+        Committed(m) -> { ..wrote, manifest: m, lost: [] },
+        _ -> wrote,
+      },
+    }
+  }
+}
+
+fn frames_end(seg: Segment) -> Int =
+  seg.parts.fold(seg.size, |at: Int, p: segments::TableEntry|
+    if p.offset < at { p.offset } else { at })
+
+fn copy_frames<[r]>(
+  dir: String,
+  token: Bytes,
+  w: SegmentWriter,
+  from: Bytes,
+  end: Int,
+) -> Option<SegmentWriter> / {fs.read[r], fs.write[r], abort.raise} =
+  iterate(
+    { at: segments::header_len(), writing: w },
+    end / merge_chunk_size() + 2,
+    |x: { at: Int, writing: SegmentWriter }|
+      if x.at >= end { Stop(Some(x.writing)) } else {
+        let n = min(end - x.at, merge_chunk_size());
+        match segments::read_range[r](segments::segment_path(dir, from), x.at, n) {
+          None -> Stop(None),
+          Some(b) -> {
+            let more = segments::append_frames(x.writing, b).writing;
+            Continue({
+              at: x.at + n,
+              writing: segments::flush_when_full[r](dir, schema(), token, more),
+            })
+          },
+        }
+      },
+  )
+
+fn merge_segments<[r]>(
+  dir: String,
+  m: Manifest,
+  from: Int,
+  token: Bytes,
+) -> Unit / {fs.read[r], fs.write[r], abort.raise} = {
+  let copied = m.segments.drop(from).fold(
+    Some({ writing: segments::new_writer(), rows: Map::new() }),
+    |acc: Option<{ writing: SegmentWriter, rows: Map<Bytes, Bytes> }>, seg: Segment|
+      match acc {
+        None -> None,
+        Some(x) -> match segments::table_rows[r](dir, seg, records_table()) {
+          None -> None,
+          Some(rows) -> match copy_frames[r](dir, token, x.writing, seg.token, frames_end(seg)) {
+            None -> None,
+            Some(w) -> {
+              let shift = x.writing.end - segments::header_len();
+              Some({
+                writing: w,
+                rows: segments::rows_folded(
+                  rows.len() / row_width(),
+                  x.rows,
+                  |accumulator2: Map<Bytes, Bytes>, i: Int| {
+                    let at = i * row_width();
+                    accumulator2.insert(
+                      rows.slice(at, at + 32),
+                      u64_le(segments::read_u64(rows, at + 32) + shift).concat(
+                        rows.slice(at + 40, at + 44),
+                      ),
+                    )
+                  },
+                ),
+              })
+            },
+          },
+        },
+      },
+  );
+  let discard = || {
+    fs.remove[r](segments::segment_path(dir, token));
+    ()
+  };
+  match copied {
+    None -> discard(),
+    Some(x) -> match segments::finish[r](dir, schema(), token, x.writing, [
+        segments::table(records_table(), x.rows, |_: Bytes, at: Bytes| Some(at)),
+      ]) {
+      None -> discard(),
+      Some(seg) -> match segments::replace_merged[r](dir, schema(), m, from, seg) {
+        Committed(_) -> (),
+        _ -> discard(),
+      },
+    },
+  }
+}
+
+fn close_store<[r]>(
+  dir: String,
+  run: String,
+  o: OpenStore,
+) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
+  if o.batches == 0 { () } else {
+    let m = o.manifest;
+    let from = segments::merge_start(m);
+    if from < m.segments.len() - 1 {
+      merge_segments[r](dir, m, from, segments::segment_token(Some(run), m.generation, o.batches))
+    };
+    segments::sweep[r](dir, schema(), run, [])
+  }
+
+pub fn with_record_store<a, [r], [s] | e>(
+  dir: String,
+  work: () -> a / {record_store.get[s], record_store.put[s] | e},
+) -> a / {fs.read[r], fs.write[r], abort.raise | e} = {
+  let run = segments::start_run[r](dir);
+  if run != None {
+    fs.write_file[r](dir ++ "/" ++ used_file(), b"");
+    ()
+  };
+  let manifest = segments::manifest[r](dir, schema());
+  let opened = {
+    manifest: manifest,
+    opened: manifest.segments,
+    index: None,
+    mine: Map::new(),
+    lost: [],
+    batches: 0,
+  };
+  let value = handle {
+    work()
+  } with {
+    var st: OpenStore = opened,
+    record_store.get[s](key) -> {
+      let f = lookup[r](dir, st, digest_of(key));
+      st = f.open;
+      f.bytes
+    },
+    record_store.put[s](records) -> {
+      st = put_batch[r](dir, run, st, records);
+    },
+    return value -> {
+      match run { Some(path) -> close_store[r](dir, path, st), None -> () };
+      value
+    },
+  };
+  segments::end_run[r](run);
+  value
+}
+
+fn record(key: Bytes, bytes: Bytes) -> Record = { key: key, bytes: bytes }
+
+fn store_bytes<[r]>(dir: String) -> Int / {fs.read[r], abort.raise} =
+  match fs::listed_names(fs.list_dir[r](dir)) {
+    None -> 0,
+    Some(names) ->
+      names.fold(0, |n: Int, name: String|
+        n + (match fs.file_size[r](dir ++ "/" ++ name) { Some(s) -> s, None -> 0 })),
+  }
+
+fn segments_of(tree: fs::MemFs) -> List<String> / {abort.raise} =
+  match fs::listed_names(fs::mem_list(tree, "s")) {
+    Some(names) -> names.filter(|n: String| n.starts_with("seg-")),
+    None -> [],
+  }
+
+test "what one run keeps the next reads, and a run that keeps nothing writes nothing" {
+  let first = fs::on_mem[abs](fs::mem_of([]), ||
+    with_record_store[abs, t]("s", || {
+      record_store.put[t]([record(b"a", b"one"), record(b"b", b"two")]);
+      record_store.get[t](b"a")
+    }));
+  assert_eq(first.value, Some(b"one"));
+  let before = fs::on_mem[abs](first.tree, || store_bytes[abs]("s")).value;
+  let second = fs::on_mem[abs](first.tree, ||
+    with_record_store[abs, t]("s", ||
+      [record_store.get[t](b"a"), record_store.get[t](b"b"), record_store.get[t](b"c")]));
+  assert_eq(second.value, [Some(b"one"), Some(b"two"), None]);
+  assert_eq(segments_of(second.tree), segments_of(first.tree));
+  assert_eq(fs::on_mem[abs](second.tree, || store_bytes[abs]("s")).value, before)
+}
+
+test "a run that dies keeps every batch it finished" {
+  let died = fs::on_mem[abs](fs::mem_of([]), || {
+    handle {
+      with_record_store[abs, t]("s", || {
+        record_store.put[t]([record(b"a", b"one")]);
+        record_store.put[t]([record(b"b", b"two")]);
+        panic("the run dies before its third batch")
+      })
+    } with {
+      abort.raise(_) -> (),
+    }
+  });
+  let read = fs::on_mem[abs](died.tree, ||
+    with_record_store[abs, t]("s", || [record_store.get[t](b"a"), record_store.get[t](b"b")]));
+  assert_eq(read.value, [Some(b"one"), Some(b"two")])
+}
+
+test "a batch writes what it keeps and not what the store holds, however much that grows" {
+  let batch = |n: Int, at: Int|
+    range(0, n).map(|i: Int|
+      record(u64_le(at + i), Bytes::concat_all(range(0, 40).map(|_: Int| b"x"))));
+  let grown = fs::on_mem[abs](fs::mem_of([]), ||
+    with_record_store[abs, t]("s", ||
+      [8, 32, 128, 512].fold(
+        { at: 0, growth: [] },
+        |acc: { at: Int, growth: List<Int> }, n: Int| {
+          let before = store_bytes[abs]("s");
+          record_store.put[t](batch(n, acc.at));
+          { at: acc.at + n, growth: acc.growth.push(store_bytes[abs]("s") - before - n * 40) }
+        },
+      ).growth));
+  let sizes = [8, 32, 128, 512];
+  assert(
+    range(0, sizes.len()).all(|i: Int| grown.value.get(i) <= sizes.get(i) * (12 + 44) + 200),
+    Some(String::join(grown.value.map(|g: Int| g.to_string()), ", ")),
+  )
+}
+
+test "a segment the manifest names that cannot be read is passed over, and the next batch drops it" {
+  let big = Bytes::concat_all([b"one"].concat(range(0, 400).map(|_: Int| b"x")));
+  let made = fs::on_mem[abs](fs::mem_of([]), || {
+    with_record_store[abs, t]("s", || record_store.put[t]([record(b"a", big)]));
+    with_record_store[abs, t]("s", || record_store.put[t]([record(b"b", b"two")]))
+  });
+  let first = segments_of(made.tree).fold(None, |acc: Option<String>, n: String|
+    match acc {
+      Some(_) -> acc,
+      None -> match fs::mem_read(made.tree, "s/" ++ n) {
+        Some(b) -> if b.index_of(b"one") != None { Some(n) } else { None },
+        None -> None,
+      },
+    });
+  let cut = fs::on_mem[abs](made.tree, || {
+    match first { Some(n) -> fs.remove[abs]("s/" ++ n), None -> false };
+    with_record_store[abs, t]("s", || {
+      let lost = record_store.get[t](b"a");
+      record_store.put[t]([record(b"c", b"three")]);
+      [lost, record_store.get[t](b"b"), record_store.get[t](b"c")]
+    })
+  });
+  assert(first != None, None);
+  assert_eq(cut.value, [None, Some(b"two"), Some(b"three")]);
+  let m = fs::on_mem[abs](cut.tree, || segments::manifest[abs]("s", schema())).value;
+  assert(
+    m.segments.all(|seg: Segment|
+      match first { Some(n) -> "seg-" ++ seg.token.hex_of() != n, None -> true }),
+    None,
+  )
+}
+
+test "a key two segments hold reads as the newer keeps it, and one the run keeps as the run does" {
+  let big = Bytes::concat_all(range(0, 400).map(|_: Int| b"x"));
+  let made = fs::on_mem[abs](fs::mem_of([]), || {
+    with_record_store[abs, t]("s", ||
+      record_store.put[t]([record(b"big", big), record(b"a", b"one")]));
+    with_record_store[abs, t]("s", || record_store.put[t]([record(b"a", b"two")]))
+  });
+  let read = fs::on_mem[abs](made.tree, ||
+    with_record_store[abs, t]("s", || {
+      let a = record_store.get[t](b"a");
+      let whole = record_store.get[t](b"big") == Some(big);
+      record_store.put[t]([record(b"b", b"three")]);
+      { a: a, whole: whole, b: record_store.get[t](b"b"), none: record_store.get[t](b"none") }
+    }));
+  assert(segments_of(made.tree).len() >= 2, None);
+  assert_eq(read.value, { a: Some(b"two"), whole: true, b: Some(b"three"), none: None })
+}
+
+test "a key a run keeps again reads as it was kept last, in the run and in the next" {
+  let made = fs::on_mem[abs](fs::mem_of([]), ||
+    with_record_store[abs, t]("s", || {
+      record_store.put[t]([record(b"a", b"one"), record(b"a", b"two")]);
+      let first = record_store.get[t](b"a");
+      record_store.put[t]([record(b"a", b"three")]);
+      [first, record_store.get[t](b"a")]
+    }));
+  let next = fs::on_mem[abs](made.tree, ||
+    with_record_store[abs, t]("s", || record_store.get[t](b"a")));
+  assert_eq(made.value, [Some(b"two"), Some(b"three")]);
+  assert_eq(next.value, Some(b"three"))
+}
+
+test "runs that each keep a little leave a store of a handful of segments, all of it read back" {
+  let runs = fs::on_mem[abs](fs::mem_of([]), ||
+    range(0, 40).fold((), |_: Unit, i: Int|
+      with_record_store[abs, t]("s", || record_store.put[t]([record(u64_le(i), u64_le(i * 7))]))));
+  let read = fs::on_mem[abs](runs.tree, ||
+    with_record_store[abs, t]("s", ||
+      range(0, 40).all(|i: Int| record_store.get[t](u64_le(i)) == Some(u64_le(i * 7)))));
+  assert(read.value, None);
+  assert(segments_of(read.tree).len() <= 8, Some(String::join(segments_of(read.tree), ", ")))
+}

@@ -1,5 +1,5 @@
 //! `std.x509` against what real sites served. Under `x509/chains` a file is one site's answer, the
-//! leaf and then what came with it in the order it came, as the wire had them at `captured()`;
+//! leaf and then what came with it in the order it came, as the wire had them at `capture_time()`;
 //! under `x509/roots` are the roots those end at, out of one system's store, each named by the
 //! first eight bytes of its fingerprint. A shipped module embeds no file, so these stand here.
 //!
@@ -27,7 +27,7 @@ fn chain_files() -> List<File> = embed_dir("x509/chains")
 fn root_files() -> List<File> = embed_dir("x509/roots")
 
 /// When the chains were served: each is verified as of then, whatever the day the test runs.
-fn captured() -> Instant / {abort.raise} =
+fn capture_time() -> Instant / {abort.raise} =
   match date::parse_rfc3339("2026-10-06T14:54:16+00:00") {
     Some(t) -> match date::instant(t) { Some(i) -> i, None -> panic("an instant") },
     None -> panic("a time"),
@@ -35,8 +35,8 @@ fn captured() -> Instant / {abort.raise} =
 
 fn read_all(
   file: File,
-  mode: x509::Reading,
-) -> Result<List<Certificate>, x509::Refusal> / {abort.raise} =
+  mode: x509::Strictness,
+) -> Result<List<Certificate>, x509::Error> / {abort.raise} =
   try { x509::read_pem(String::of_bytes(file.bytes), x509::limits(), mode) }
 
 fn certificates(file: File) -> List<Certificate> / {abort.raise} =
@@ -49,9 +49,9 @@ fn root_name(c: Certificate) -> String / {abort.raise} = x509::fingerprint(c).sl
 
 fn roots() -> List<Certificate> / {abort.raise} = root_files().flat_map(certificates)
 
-type Served = { leaf: Certificate, rest: List<Certificate> }
+type Chain = { leaf: Certificate, rest: List<Certificate> }
 
-fn served(file: String) -> Served / {abort.raise} =
+fn chain_from_file(file: String) -> Chain / {abort.raise} =
   match chain_files().filter(|f: File| f.name == file).flat_map(certificates) {
     [leaf, ..rest] -> { leaf: leaf, rest: rest },
     [] -> panic(f"no chain {file}"),
@@ -59,13 +59,13 @@ fn served(file: String) -> Served / {abort.raise} =
 
 /// A host, or an address where the text is one.
 fn identity(who: String) -> x509::Identity / {abort.raise} =
-  match ip::parse(who) { Ok(address) -> x509::At(address), Err(_) -> x509::Host(who) }
+  match ip::parse(who) { Ok(address) -> x509::IpAddress(address), Err(_) -> x509::Host(who) }
 
 fn digest_text(d: crypto::Digest) -> String =
   match d { Sha256 -> "SHA-256", Sha384 -> "SHA-384", Sha512 -> "SHA-512" }
 
 /// A certificate's key and how the certificate is signed.
-fn shape(c: Certificate) -> String = {
+fn key_and_signature(c: Certificate) -> String = {
   let key = match x509::info(c).key {
     x509::RsaKey(public) -> match crypto::rsa_modulus_bits(public) {
       Some(bits) -> f"RSA {bits}",
@@ -107,10 +107,10 @@ fn sites() -> List<Site> =
     { file: "ip-google-dns.pem", who: "8.8.8.8", other: "8.8.8.9" },
   ]
 
-/// A site's chain under one root alone: the path it verifies by, each certificate's `shape`.
-type Way = { file: String, who: String, root: String, path: List<String> }
+/// A site's chain under one root alone: the path it verifies by, each certificate's `key_and_signature`.
+type ExpectedPath = { file: String, who: String, root: String, path: List<String> }
 
-fn ways() -> List<Way> =
+fn expected_paths() -> List<ExpectedPath> =
   [
     {
       file: "letsencrypt.pem",
@@ -273,30 +273,30 @@ fn ways() -> List<Way> =
     },
   ]
 
-fn checked(
+fn verify_chain(
   leaf: Certificate,
   offered: List<Certificate>,
   anchors: List<Certificate>,
   at: Instant,
   who: String,
-) -> Result<List<Certificate>, { leaf: Bool, why: Fault }> / {abort.raise} =
+) -> Result<List<Certificate>, { leaf: Bool, reason: Fault }> / {abort.raise} =
   match x509::verify(leaf, offered, anchors, at, identity(who), x509::ServerAuth, x509::strict()) {
     Ok(path) -> Ok(path),
-    Err(failure) -> Err({ leaf: failure.certificate == leaf, why: failure.why }),
+    Err(failure) -> Err({ leaf: failure.certificate == leaf, reason: failure.reason }),
   }
 
-test "{w.file} verifies for {w.who} to the root {w.root} alone, as of its capture" for w: Way in ways(
+test "{w.file} verifies for {w.who} to the root {w.root} alone, as of its capture" for w: ExpectedPath in expected_paths(
   ) {
-  let s = served(w.file);
+  let s = chain_from_file(w.file);
   let anchor = roots().filter(|r: Certificate| root_name(r) == w.root);
   assert_eq(anchor.len(), 1);
-  match checked(s.leaf, s.rest, anchor, captured(), w.who) {
+  match verify_chain(s.leaf, s.rest, anchor, capture_time(), w.who) {
     Ok(path) -> {
-      assert_eq(path.map(shape), w.path);
+      assert_eq(path.map(key_and_signature), w.path);
       assert_eq(path.at(0), Some(s.leaf));
       assert_eq(path.last(), anchor.at(0))
     },
-    Err(refused) -> panic(show(refused.why)),
+    Err(refused) -> panic(show(refused.reason)),
   }
 }
 
@@ -306,13 +306,13 @@ fn forger() -> crypto::SigningKey / {abort.raise} =
     None -> panic("thirty-two bytes are a seed"),
   }
 
-fn called(name: String) -> List<x509::Attribute> = [{ id: oid::common_name(), value: name }]
+fn named_subject(name: String) -> List<x509::Attribute> = [{ id: oid::common_name(), value: name }]
 
 /// A certificate for `bank.example` that says `leaf` issued it, over `leaf`'s own validity.
 fn forged(leaf: Certificate) -> Certificate / {abort.raise} = {
   let asked = {
     ..x509::draft(),
-    subject: called("bank.example"),
+    subject: named_subject("bank.example"),
     alt_names: [x509::Dns("bank.example")],
     usages: [x509::DigitalSignature],
     purposes: [x509::server_auth()],
@@ -333,34 +333,34 @@ fn forged(leaf: Certificate) -> Certificate / {abort.raise} = {
 
 test "{s.file} verifies for {s.who}, and is refused once expired, for {s.other}, without its issuer, and as a CA" for s: Site in sites(
   ) {
-  let c = served(s.file);
+  let c = chain_from_file(s.file);
   let anchors = roots();
-  assert_eq(checked(c.leaf, c.rest, anchors, captured(), s.who).err(), None);
+  assert_eq(verify_chain(c.leaf, c.rest, anchors, capture_time(), s.who).err(), None);
   let after = match date::instant(x509::info(c.leaf).not_after) {
     Some(end) -> Instant(nanos_at(end) + 1000000000),
     None -> panic("an instant"),
   };
   assert_eq(
-    checked(c.leaf, c.rest, anchors, after, s.who).err(),
-    Some({ leaf: true, why: x509::Expired }),
+    verify_chain(c.leaf, c.rest, anchors, after, s.who).err(),
+    Some({ leaf: true, reason: x509::Expired }),
   );
   assert_eq(
-    checked(c.leaf, c.rest, anchors, captured(), s.other).err(),
-    Some({ leaf: true, why: x509::Unnamed }),
+    verify_chain(c.leaf, c.rest, anchors, capture_time(), s.other).err(),
+    Some({ leaf: true, reason: x509::NameMismatch }),
   );
   let orphaned = c.rest.filter(|above: Certificate|
     x509::info(above).subject != x509::info(c.leaf).issuer);
   assert(orphaned.len() < c.rest.len());
   assert_eq(
-    checked(c.leaf, orphaned, anchors, captured(), s.who).err(),
-    Some({ leaf: true, why: x509::Unissued }),
+    verify_chain(c.leaf, orphaned, anchors, capture_time(), s.who).err(),
+    Some({ leaf: true, reason: x509::Unissued }),
   );
   let bank = forged(c.leaf);
   match x509::verify(
       bank,
       [c.leaf].concat(c.rest),
       anchors,
-      captured(),
+      capture_time(),
       x509::Host("bank.example"),
       x509::ServerAuth,
       x509::strict(),
@@ -368,29 +368,29 @@ test "{s.file} verifies for {s.who}, and is refused once expired, for {s.other},
     Ok(_) -> panic("a leaf signed as a CA"),
     Err(failure) -> {
       assert(failure.certificate == c.leaf);
-      assert_eq(failure.why, x509::NotACa)
+      assert_eq(failure.reason, x509::NotACa)
     },
   }
 }
 
 test "an address a certificate names is matched as an address, and never as a host written like one" {
-  let cloudflare = served("ip-cloudflare-dns.pem");
-  let google = served("ip-google-dns.pem");
+  let cloudflare = chain_from_file("ip-cloudflare-dns.pem");
+  let google = chain_from_file("ip-google-dns.pem");
   let anchors = roots();
-  let named = |c: Served, who: x509::Identity| x509::names(c.leaf, who);
+  let named = |c: Chain, who: x509::Identity| x509::matches_identity(c.leaf, who);
   assert(named(cloudflare, identity("1.0.0.1")) && named(cloudflare, identity("1.1.1.1")));
   assert(named(google, identity("8.8.4.4")) && named(google, identity("2001:4860:4860::8888")));
   assert(!named(cloudflare, x509::Host("1.1.1.1")) && !named(google, x509::Host("8.8.8.8")));
   assert(!named(cloudflare, identity("8.8.8.8")) && !named(google, identity("1.1.1.1")));
   assert_eq(
-    checked(google.leaf, google.rest, anchors, captured(), "dns.google.example").err(),
-    Some({ leaf: true, why: x509::Unnamed }),
+    verify_chain(google.leaf, google.rest, anchors, capture_time(), "dns.google.example").err(),
+    Some({ leaf: true, reason: x509::NameMismatch }),
   )
 }
 
 test "a host in another script is the A-labels its certificate names, and a wildcard is one label of them" {
-  let muenchen = served("idn-muenchen.pem").leaf;
-  let buecher = served("idn-buecher.pem").leaf;
+  let muenchen = chain_from_file("idn-muenchen.pem").leaf;
+  let buecher = chain_from_file("idn-buecher.pem").leaf;
   assert_eq(x509::alt_names(muenchen), [
     x509::Dns("www.xn--mnchen-3ya.de"),
     x509::Dns("xn--mnchen-3ya.de"),
@@ -399,22 +399,24 @@ test "a host in another script is the A-labels its certificate names, and a wild
     x509::Dns("*.xn--bcher-kva.de"),
     x509::Dns("xn--bcher-kva.de"),
   ]);
-  let named = |c: Certificate, host: String| x509::names(c, x509::Host(host));
+  let named = |c: Certificate, host: String| x509::matches_identity(c, x509::Host(host));
   assert(named(muenchen, "münchen.de") && named(muenchen, "WWW.MÜNCHEN.DE"));
   assert(named(muenchen, "xn--mnchen-3ya.de") && !named(muenchen, "mail.münchen.de"));
   assert(named(buecher, "bücher.de") && named(buecher, "shop.bücher.de"));
   assert(!named(buecher, "a.shop.bücher.de") && !named(buecher, "bucher.de"))
 }
 
-type Unread = { name: String, why: x509::Refusal }
+type ReadFailure = { name: String, reason: x509::Error }
 
-fn unread(files: List<File>) -> List<Unread> / {abort.raise} =
+fn read_failures(files: List<File>) -> List<ReadFailure> / {abort.raise} =
   files.flat_map(|f: File|
-    match read_all(f, x509::Strict) { Ok(_) -> [], Err(why) -> [{ name: f.name, why: why }] })
+    match read_all(f, x509::Strict) { Ok(_) -> [], Err(why) -> [{ name: f.name, reason: why }] })
 
 test "what was served reads to the letter of RFC 5280, and every root but the one numbered zero" {
-  assert_eq(unread(chain_files()), []);
-  assert_eq(unread(root_files()), [{ name: "568d6905a2c88708.pem", why: x509::BadSerial }]);
+  assert_eq(read_failures(chain_files()), []);
+  assert_eq(read_failures(root_files()), [
+    { name: "568d6905a2c88708.pem", reason: x509::BadSerial },
+  ]);
   assert_eq(
     root_files().filter(|f: File| f.name == "568d6905a2c88708.pem").flat_map(certificates).map(
       |c: Certificate| x509::info(c).serial,
@@ -425,10 +427,13 @@ test "what was served reads to the letter of RFC 5280, and every root but the on
 
 test "every chain is a site here, and every root is one a chain ends at" {
   assert_eq(chain_files().map(|f: File| f.name), sites().map(|s: Site| s.file).sort());
-  assert_eq(ways().map(|w: Way| w.file).sort().unique(), sites().map(|s: Site| s.file).sort());
+  assert_eq(
+    expected_paths().map(|w: ExpectedPath| w.file).sort().unique(),
+    sites().map(|s: Site| s.file).sort(),
+  );
   assert_eq(
     root_files().map(|f: File| f.name),
-    ways().map(|w: Way| w.root ++ ".pem").sort().unique(),
+    expected_paths().map(|w: ExpectedPath| w.root ++ ".pem").sort().unique(),
   );
   assert_eq(roots().map(root_name), root_files().map(|f: File| f.name.strip_suffix(".pem")))
 }

@@ -1,54 +1,41 @@
-//! The hole report: what an unfilled `???` or `..` must be, what it may perform, and what in
-//! scope would fill it. A hole is not a fault, so the report is a warning; a run that reaches the
-//! hole raises `abort.raise`.
-
 import std.list
-import compiler.check.types (Atom, Scheme, Type, TyVar, InScope, unify, instantiate, atoms_text,
-                             scheme_text, type_text)
-import compiler.check.resolve.tables (Diag, label_at)
-import compiler.check.infer.checker (Checker, HoleSite, DefInfo, report, resolve, module_name)
+import compiler.check.types (Atom, Scheme, Type, VariableType, InScope, unify, instantiate,
+                             atoms_text, scheme_text, type_text)
+import compiler.check.resolve.tables (Diagnostic, label_at)
+import compiler.check.infer.checker (Checker, HoleSite, DefinitionInfo, report, resolve,
+                                     module_name)
 
-/// The most candidates a report names, and the most globals read looking for them: the search is
-/// a hint, not the program.
 fn candidate_limit() -> Int = 8
 
 fn global_scan_limit() -> Int = 512
 
-/// `checker` with a `W0613` for each hole a walk recorded, once the check's substitutions settle
-/// what each hole's type came to.
 pub fn hole_reports(checker: Checker) -> Checker / {abort.raise} =
-  checker.holes.fold(checker, |c: Checker, site: HoleSite| report(c, hole_diag(c, site)))
+  checker.holes.fold(checker, |c: Checker, site: HoleSite| report(c, hole_diagnostic(c, site)))
 
-/// `d` whose name reads as the hole's module writes it: its own module's and the prelude's by
-/// their simple name, any other's as `module::name`.
-fn shown_name(checker: Checker, site: HoleSite, d: DefInfo) -> Bytes / {abort.raise} =
+fn display_name(checker: Checker, site: HoleSite, d: DefinitionInfo) -> Bytes / {abort.raise} =
   if d.module == module_name(checker, site.module) || d.module == b"std.prelude" { d.simple_name }
   else { Bytes::concat_all([d.module, b"::", d.simple_name]) }
 
-/// Whether a value of `scheme`'s could fill a hole of type `ty`: instantiate it beside the check's
-/// own substitutions and ask, keeping nothing of the answer.
 fn fits(checker: Checker, ty: Type, sc: Scheme) -> Bool / {abort.raise} = {
   let i = instantiate(sc, checker.fresh);
-  unify(checker.subst, i.fresh, ty, i.ty).error == None
+  unify(checker.substitution, i.fresh, ty, i.ty).error == None
 }
 
-/// The names in scope at the hole whose type unifies with the hole's: its locals first, then the
-/// definitions the check knows, each as `name: type`.
 fn candidates(checker: Checker, ty: Type, site: HoleSite) -> List<Bytes> / {abort.raise} = {
   let local = site.locals.fold([], |acc: List<Bytes>, l: InScope|
     if acc.len() >= candidate_limit() { acc } else if fits(checker, ty, l.sc) {
       acc.push(Bytes::concat_all([b"`", l.name, b": ", type_text(l.sc.ty), b"`"]))
     } else { acc });
-  let out = checker.defs.fold(
+  let out = checker.definitions.fold(
     { found: local, read: 0 },
-    |acc: { found: List<Bytes>, read: Int }, d: DefInfo|
+    |acc: { found: List<Bytes>, read: Int }, d: DefinitionInfo|
       if acc.found.len() >= candidate_limit() || acc.read >= global_scan_limit() { acc } else {
         {
           found: if fits(checker, ty, d.scheme) {
             acc.found.push(
               Bytes::concat_all([
                 b"`",
-                shown_name(checker, site, d),
+                display_name(checker, site, d),
                 b": ",
                 scheme_text(d.scheme),
                 b"`",
@@ -62,13 +49,11 @@ fn candidates(checker: Checker, ty: Type, site: HoleSite) -> List<Bytes> / {abor
   out.found
 }
 
-/// What the hole may perform: the written row, and what of it the rest of the body already
-/// performs, or the inference's freedom where no row is written.
 fn row_note(checker: Checker, site: HoleSite) -> Bytes / {abort.raise} =
   match site.declared {
     None -> b"no row is written where the hole stands; what the filling performs is inferred",
     Some(written) -> {
-      let performed = match checker.defs.find(|d: DefInfo| d.name == site.owner) {
+      let performed = match checker.definitions.find(|d: DefinitionInfo| d.name == site.owner) {
         Some(d) -> d.performed,
         None -> [],
       };
@@ -92,13 +77,13 @@ fn row_note(checker: Checker, site: HoleSite) -> Bytes / {abort.raise} =
     },
   }
 
-fn hole_diag(checker: Checker, site: HoleSite) -> Diag / {abort.raise} = {
-  let ty = resolve(checker, TyVar(site.var));
+fn hole_diagnostic(checker: Checker, site: HoleSite) -> Diagnostic / {abort.raise} = {
+  let ty = resolve(checker, VariableType(site.var));
   let label = match ty {
-    TyVar(_) -> b"its type is unconstrained here",
+    VariableType(_) -> b"its type is unconstrained here",
     _ -> Bytes::concat_all([b"expected `", type_text(ty), b"`"]),
   };
-  let found = match ty { TyVar(_) -> [], _ -> candidates(checker, ty, site) };
+  let found = match ty { VariableType(_) -> [], _ -> candidates(checker, ty, site) };
   let notes = [row_note(checker, site)].concat(if found.len() == 0 { [] }
   else { [Bytes::concat_all([b"in scope of that type: ", Bytes::join(found, b", ")])] }).concat([
     b"a run that reaches the hole raises `abort.raise`",

@@ -1,53 +1,57 @@
-//! Encryption, signatures and key agreement, named for what each is for: `seal` and `open`,
-//! `sign` and `verify`, `agree`.
+//! Encryption, signatures and key agreement, named for their purpose: `seal` and `open`, `sign`
+//! and `verify`, and `agree`.
 //!
-//! A key's type says what it is for and its value which algorithm it is a key of, so a key that
-//! seals is never handed to `sign`, and nothing here takes an algorithm's name beside a key. Each
-//! key type is opaque: its makers check what they are given, and a value is one they answered. A
-//! private key holds its material as a `Secret`, cannot be shown or encoded, and is read by the
-//! runtime alone, whose arithmetic takes time that is no function of it. A public key is a value
-//! like any other, compared by what it is and shown as hex.
+//! A key's type states what it is for, and its value states which algorithm it belongs to. So a
+//! key that seals can never be passed to `sign`, and nothing here takes an algorithm's name next
+//! to a key. Each key type is opaque: its constructors check what they are given, so every value
+//! is one a constructor returned. A private key stores its material as a `Secret`, cannot be shown
+//! or encoded, and is read only by the runtime, whose arithmetic takes time independent of the
+//! key. A public key is an ordinary value, compared by its bytes and shown as hex.
 //!
-//! Every operation is a function of its arguments. What needs randomness, a fresh key or the
-//! nonce `seal` draws, asks `std.random`'s `entropy`, which a function's row then names, and has a
-//! twin that takes the bytes instead: the twin is what a test runs.
+//! Every operation is a function of its arguments. An operation that needs randomness, such as a
+//! new key or the nonce `seal` draws, uses `std.random`'s `entropy`, and the function's row then
+//! includes it. Each such operation has a variant that takes the bytes instead, which is what a
+//! test calls.
 //!
 //! **Sealing.** `seal` is XChaCha20-Poly1305 under a 24-byte nonce drawn for each message, which
-//! is long enough that two draws do not meet. AES-256-GCM and ChaCha20-Poly1305 take a 12-byte
-//! nonce, too short for that past `2^32` messages a key, so their key is another type,
-//! `CountedKey`, and `seal_at` takes the nonce: a count the caller keeps, `counter_nonce`. Sealing
-//! twice under one key and nonce gives away both messages and, under GCM, the means to forge more.
-//! `seal_at` therefore performs `nonces.spend` with the key's public name and the nonce before it
-//! seals, and a handler decides: `unwatched` lets every nonce through, for a caller whose count
-//! cannot repeat, and `watched` records each and stops at the first spent twice, which is how a
-//! test holds a protocol to its count. One message is at most `2^36 - 32` bytes under GCM and
-//! `2^38 - 64` under either ChaCha20; a longer one raises.
+//! is long enough that two random nonces will not collide. AES-256-GCM and ChaCha20-Poly1305 take
+//! a 12-byte nonce, too short for random nonces past `2^32` messages per key. So their key is a
+//! separate type, `CountedKey`, and `seal_at` takes the nonce as a count the caller maintains,
+//! built by `counter_nonce`. Sealing twice under one key and nonce exposes both messages and,
+//! under GCM, lets an attacker forge more. So `seal_at` performs `nonces.spend` with the key's
+//! public name and the nonce before it seals, and a handler decides what to do.
+//! `without_nonce_check` allows every nonce, for a caller whose count cannot repeat.
+//! `check_nonce_reuse` records each nonce and stops at the first one used twice, which is how a
+//! test checks that a protocol keeps its count. A message is at most `2^36 - 32` bytes under GCM
+//! and `2^38 - 64` under either ChaCha20; a longer one raises.
 //!
-//! **Signing.** Ed25519 (RFC 8032), strict: an `S` at or past the group order is refused. ECDSA
-//! on P-256, P-384, P-521 and secp256k1, each over the hash JOSE pairs it with, its nonce RFC
-//! 6979's, in the encoding the key was made for: `Der`, an ASN.1 `SEQUENCE` of two `INTEGER`s as
-//! X.509 and TLS carry it, or `Raw`, `r` then `s` as JOSE does. Neither reads the other. RSA of
-//! 2048 bits or more over SHA-256, -384 or -512, PKCS #1 v1.5 and PSS. A PSS salt is as long as
-//! its digest and made of the key and the message, so every signature here is a function of the
-//! two. There is no PKCS #1 v1.5 decryption, and no RSA key is made here.
+//! **Signing.** Ed25519 (RFC 8032), strict: an `S` at or above the group order is rejected. ECDSA
+//! on P-256, P-384, P-521 and secp256k1, each over the hash JOSE pairs it with, with nonces from
+//! RFC 6979, in the encoding the key was made for: `Der`, an ASN.1 `SEQUENCE` of two `INTEGER`s as
+//! X.509 and TLS use, or `Raw`, `r` then `s` as JOSE uses. Neither encoding accepts the other. RSA
+//! of 2048 bits or more over SHA-256, -384 or -512, with PKCS #1 v1.5 or PSS. A PSS salt is as
+//! long as its digest and derived from the key and the message, so every signature here is a
+//! function of the two. There is no PKCS #1 v1.5 decryption, and no RSA key generation.
 //!
 //! **Agreeing.** X25519 (RFC 7748) and ECDH over P-256. A peer's P-256 key is checked to be a
-//! point of the curve where it is made, and an X25519 result of all zeros, which a peer of small
-//! order forces, is refused. What `agree` answers is not uniform and is no key: `derive`, HKDF over
-//! SHA-256, makes keys of it, each under its own `info`, and `seal_key_of` makes a `SealKey`.
+//! point on the curve when it is made, and an X25519 result of all zeros, which a peer of small
+//! order forces, is rejected. What `agree` returns is not uniformly random and is not a key.
+//! `derive`, HKDF over SHA-256, makes keys from it, each under its own `info`, and `seal_key_of`
+//! makes a `SealKey`.
 //!
-//! **Keys in and out.** Each maker takes raw bytes, and each `new_` maker draws them with
-//! `entropy.secret`, so a key is never a plain value. `spki_decode` and `spki_encode` read and
-//! write a public key's `SubjectPublicKeyInfo`. `private_key_of_der` reads a private key from
-//! PKCS #8, SEC 1 or PKCS #1 without opening it, as `std.pem` hands one over, and
-//! `private_key_document` writes a signing key's, sealed, for `std.fs`'s `write_secret`. `Jwk`
-//! is a public key as a JSON Web Key holds its numbers, and `rsa_private_of_jwk` reads an RSA
-//! private key from one without its numbers being plain values.
+//! **Importing and exporting keys.** Each constructor takes raw bytes, and each `new_` constructor
+//! draws them with `entropy.secret`, so a key is never a plain value. `spki_decode` and
+//! `spki_encode` read and write a public key's `SubjectPublicKeyInfo`. `private_key_of_der` reads
+//! a private key from PKCS #8, SEC 1 or PKCS #1 without exposing it, in the form `std.pem`
+//! provides. `private_key_document` writes a signing key's document, as a `Secret`, for
+//! `std.fs`'s `write_secret`. `Jwk` is a public key as a JSON Web Key stores its numbers, and
+//! `rsa_private_of_jwk` reads an RSA private key from one without its numbers ever being plain
+//! values.
 //!
-//! `same` compares two byte strings in time that follows their lengths alone.
+//! `constant_time_equal` compares two byte strings in time that depends only on their lengths.
 
 import std.asn1
-import std.asn1 (Read, Reader, asn1)
+import std.asn1 (ReadResult, Reader, asn1)
 import std.bytes (u32_be, u64_be)
 import std.hex
 import std.internal.crypto (crypto_seal, crypto_open, crypto_public, crypto_sign, crypto_verify,
@@ -59,54 +63,55 @@ import std.oid (Oid)
 import std.random (entropy, token_bytes)
 import std.gen
 
-/// Whether two byte strings are the same, in time that follows their lengths and never where they
-/// first differ: `std.hash`'s `tags_match`. A length is no secret.
-pub fn same(a: Bytes, b: Bytes) -> Bool = tags_match(a, b)
+/// Whether two byte strings are equal, in time that depends on their lengths and never on where
+/// they first differ: `std.hash`'s `tags_match`. Lengths are not treated as secret.
+pub fn constant_time_equal(a: Bytes, b: Bytes) -> Bool = tags_match(a, b)
 
-/// `body`'s answer, or `otherwise` where it raises: a builtin here raises only for a length or a
-/// name its caller already checked.
+/// `body`'s result, or `otherwise` if it raises. A builtin here raises only for a length or a name
+/// its caller already checked.
 fn or_else<a>(otherwise: a, body: () -> a / {abort.raise}) -> a =
   handle { body() } with { abort.raise(_) -> otherwise }
 
 fn hex(b: Bytes) -> String = or_else("", || b.hex_of())
 
-fn whole(material: Secret<Bytes>) -> Bool = material.len() == 32
+fn is_key_size(material: Secret<Bytes>) -> Bool = material.len() == 32
 
 // --- Sealing under a nonce drawn at random ------------------------------------------------
 
 /// A key that seals each message under a nonce it draws: 32 bytes for XChaCha20-Poly1305.
 pub opaque type SealKey = | SealKey(Secret<Bytes>)
 
-/// The key 32 bytes are; `None` for any other length.
+/// The key made of 32 bytes, or `None` for any other length.
 pub fn seal_key(material: Secret<Bytes>) -> Option<SealKey> =
-  if whole(material) { Some(SealKey(material)) } else { None }
+  if is_key_size(material) { Some(SealKey(material)) } else { None }
 
-/// A key of the operating system's entropy, drawn sealed.
+/// A new key drawn from the operating system's entropy as a `Secret`.
 pub fn new_seal_key() -> SealKey / {entropy.secret, abort.raise} =
   match seal_key(entropy.secret(32)) {
     Some(key) -> key,
     None -> panic("thirty-two bytes are a key"),
   }
 
-/// The bytes of a nonce `seal` draws.
+/// The size in bytes of the nonce `seal` draws.
 pub fn nonce_size() -> Int = 24
 
-/// What a sealed message is longer than its plaintext by: `seal`'s nonce and the tag.
+/// How many bytes longer a sealed message is than its plaintext: `seal`'s nonce and the tag.
 pub fn overhead() -> Int = nonce_size() + 16
 
-/// `plaintext` sealed under `key` and bound to `associated`, which is not sealed and must be given
-/// again to open it: a nonce drawn here, the ciphertext, and a 16-byte tag.
+/// Encrypts and authenticates `plaintext` under `key`, bound to `associated`, which is not
+/// encrypted and must be given again to open it. Returns a newly drawn nonce, the ciphertext, and
+/// a 16-byte tag.
 pub fn seal(
   key: SealKey,
   plaintext: Bytes,
   associated: Bytes,
 ) -> Bytes / {entropy.next, abort.raise} =
-  seal_under(key, token_bytes(nonce_size()), plaintext, associated)
+  seal_with_nonce(key, token_bytes(nonce_size()), plaintext, associated)
 
-/// `seal` under the nonce it is handed, which is what `seal` is a function of. Raises for a nonce
-/// that is not `nonce_size()` bytes. A caller that names a nonce twice under one key has given
-/// both messages away: outside a test, `seal` draws it.
-pub fn seal_under(
+/// `seal` with the given nonce instead of a drawn one. Raises for a nonce that is not
+/// `nonce_size()` bytes. Using a nonce twice under one key exposes both messages, so outside a
+/// test, let `seal` draw it.
+pub fn seal_with_nonce(
   key: SealKey,
   nonce: Bytes,
   plaintext: Bytes,
@@ -117,8 +122,8 @@ pub fn seal_under(
       nonce.concat(crypto_seal("xchacha20-poly1305", material, nonce, associated, plaintext)),
   }
 
-/// What `seal` sealed, or `None`: the key, `associated` or a byte of `sealed` is not what it was
-/// sealed with. It never says which.
+/// Decrypts what `seal` sealed. Returns `None` if the key, `associated` or any byte of `sealed`
+/// differs from what was sealed, without saying which.
 pub fn open(key: SealKey, sealed: Bytes, associated: Bytes) -> Option<Bytes> =
   match key {
     SealKey(material) ->
@@ -143,24 +148,25 @@ pub type Cipher =
   /// ChaCha20-Poly1305 (RFC 8439).
   | ChaCha20Poly1305
 
-/// A key for one of them: 32 bytes, and the public name `nonces.spend` knows the key by.
+/// A key for one of these ciphers: 32 bytes, and the public name `nonces.spend` identifies the key
+/// by.
 pub opaque type CountedKey = | CountedKey(Cipher, Secret<Bytes>, Bytes)
 
-/// What `seal_at` tells a handler before it seals.
+/// What `seal_at` reports to a handler before it seals.
 pub effect nonces {
-  /// `nonce` is about to seal a message under the key `key` names.
+  /// `nonce` is about to seal a message under the key named `key`.
   write spend(key: Bytes, nonce: Bytes) -> Unit
 }
 
-/// A nonce spent a second time under one key, by the key's name.
+/// A nonce used a second time under one key, with the key's name.
 pub type Reuse = new { key: Bytes, nonce: Bytes }
 
 fn cipher_name(c: Cipher) -> String =
   match c { Aes256Gcm -> "aes-256-gcm", ChaCha20Poly1305 -> "chacha20-poly1305" }
 
-/// The key 32 bytes are under `cipher`; `None` for any other length.
+/// The `cipher` key made of 32 bytes, or `None` for any other length.
 pub fn counted_key(cipher: Cipher, material: Secret<Bytes>) -> Option<CountedKey> =
-  if !whole(material) { None } else {
+  if !is_key_size(material) { None } else {
     Some(
       CountedKey(
         cipher,
@@ -170,31 +176,31 @@ pub fn counted_key(cipher: Cipher, material: Secret<Bytes>) -> Option<CountedKey
     )
   }
 
-/// A key of the operating system's entropy, drawn sealed.
+/// A new key drawn from the operating system's entropy as a `Secret`.
 pub fn new_counted_key(cipher: Cipher) -> CountedKey / {entropy.secret, abort.raise} =
   match counted_key(cipher, entropy.secret(32)) {
     Some(key) -> key,
     None -> panic("thirty-two bytes are a key"),
   }
 
-/// The name `nonces.spend` knows `key` by: eight bytes that are a one-way function of the key, the
-/// same for the same key wherever it is made, and no secret.
+/// The name `nonces.spend` identifies `key` by: eight bytes computed by a one-way function of the
+/// key. It is the same for the same key wherever it is made, and is not secret.
 pub fn key_name(key: CountedKey) -> Bytes = match key { CountedKey(_, _, name) -> name }
 
-/// The cipher `key` is a key of.
+/// The cipher `key` belongs to.
 pub fn cipher_of(key: CountedKey) -> Cipher = match key { CountedKey(cipher, _, _) -> cipher }
 
-/// The twelve-byte nonce of message `count` from sender `lane`: the lane in four bytes and the
-/// count in eight, most significant first, as RFC 5116 lays one out. Two senders under one key
-/// take two lanes. Raises for a lane outside `0` to `2^32 - 1` and a count below zero.
-pub fn counter_nonce(lane: Int, count: Int) -> Bytes / {abort.raise} =
-  if lane < 0 || lane > 0xFFFF_FFFF { panic("a lane is 0 to 2^32 - 1") }
+/// The twelve-byte nonce for message `count` from sender `sender`: the sender's lane in four bytes
+/// and the count in eight, most significant first, in RFC 5116's layout. Two senders sharing a key
+/// use two lanes. Raises for a lane outside `0` to `2^32 - 1` or a count below zero.
+pub fn counter_nonce(sender: Int, count: Int) -> Bytes / {abort.raise} =
+  if sender < 0 || sender > 0xFFFF_FFFF { panic("a lane is 0 to 2^32 - 1") }
   else if count < 0 { panic("a count is not below zero") }
-  else { u32_be(lane).concat(u64_be(count)) }
+  else { u32_be(sender).concat(u64_be(count)) }
 
-/// `plaintext` sealed under `key` and `nonce`, bound to `associated`: the ciphertext and a 16-byte
-/// tag. The nonce is not in what it answers. Performs `nonces.spend` first; raises for a nonce
-/// that is not twelve bytes.
+/// Encrypts and authenticates `plaintext` under `key` and `nonce`, bound to `associated`. Returns
+/// the ciphertext and a 16-byte tag, without the nonce. Performs `nonces.spend` first. Raises for
+/// a nonce that is not twelve bytes.
 pub fn seal_at(
   key: CountedKey,
   nonce: Bytes,
@@ -208,21 +214,22 @@ pub fn seal_at(
     },
   }
 
-/// What `seal_at` sealed under `nonce`, or `None`: the key, the nonce, `associated` or a byte of
-/// `sealed` is not what it was sealed with. It never says which.
+/// Decrypts what `seal_at` sealed under `nonce`. Returns `None` if the key, the nonce,
+/// `associated` or any byte of `sealed` differs from what was sealed, without saying which.
 pub fn open_at(key: CountedKey, nonce: Bytes, sealed: Bytes, associated: Bytes) -> Option<Bytes> =
   match key {
     CountedKey(cipher, material, _) ->
       or_else(None, || crypto_open(cipher_name(cipher), material, nonce, associated, sealed)),
   }
 
-/// `body` with every nonce it spends let through: for a caller whose nonces cannot repeat.
-pub fn unwatched<a | e>(body: () -> a / {nonces.spend | e}) -> a / e =
+/// Runs `body`, allowing every nonce it uses. For a caller whose nonces cannot repeat.
+pub fn without_nonce_check<a | e>(body: () -> a / {nonces.spend | e}) -> a / e =
   handle { body() } with { nonces.spend(_key, _nonce) -> () }
 
-/// `body` with every nonce it spends recorded under its key: what it answers, or the first nonce
-/// spent a second time under one key, where `body` is stopped before that message is sealed.
-pub fn watched<a | e>(body: () -> a / {nonces.spend | e}) -> Result<a, Reuse> / e =
+/// Runs `body`, recording every nonce it uses under its key. Returns `body`'s result, or the first
+/// nonce used a second time under one key, in which case `body` is stopped before that message is
+/// sealed.
+pub fn check_nonce_reuse<a | e>(body: () -> a / {nonces.spend | e}) -> Result<a, Reuse> / e =
   handle {
     Ok(body())
   } with {
@@ -256,11 +263,11 @@ pub type EcdsaCurve = | NistP256 | NistP384 | NistP521 | Secp256k1
 pub fn curve_digest(curve: EcdsaCurve) -> Digest =
   match curve { NistP256 -> Sha256, NistP384 -> Sha384, NistP521 -> Sha512, Secp256k1 -> Sha256 }
 
-/// The bytes of a scalar on `curve`, and of each of a raw signature's halves.
+/// The size in bytes of a scalar on `curve`, and of each half of a raw signature.
 pub fn scalar_size(curve: EcdsaCurve) -> Int =
   match curve { NistP256 -> 32, NistP384 -> 48, NistP521 -> 66, Secp256k1 -> 32 }
 
-/// The curve's name in the PKCS #8 and X.509 documents that carry a key on it.
+/// The curve's identifier in the PKCS #8 and X.509 documents that contain a key on it.
 pub fn curve_oid(curve: EcdsaCurve) -> Oid =
   match curve {
     NistP256 -> oid::prime256v1(),
@@ -308,23 +315,23 @@ fn verifying_text(key: VerifyingKey) -> String =
 fn public_of(scheme: String, key: Secret<Bytes>) -> Option<Bytes> =
   or_else(None, || crypto_public(scheme, key))
 
-/// The Ed25519 key a 32-byte seed is; `None` for any other length.
+/// The Ed25519 key with a 32-byte seed, or `None` for any other length.
 pub fn ed25519_signing(seed: Secret<Bytes>) -> Option<SigningKey> =
   match public_of("ed25519", seed) {
     Some(public) -> Some(Ed25519Signing(seed, public)),
     None -> None,
   }
 
-/// An Ed25519 key of the operating system's entropy, drawn sealed.
+/// A new Ed25519 key drawn from the operating system's entropy as a `Secret`.
 pub fn new_ed25519_signing() -> SigningKey / {entropy.secret, abort.raise} =
   match ed25519_signing(entropy.secret(32)) {
     Some(key) -> key,
     None -> panic("thirty-two bytes are a seed"),
   }
 
-/// The ECDSA key a scalar on `curve` is, signing over `curve_digest(curve)` in `encoding`, its
-/// nonce RFC 6979's: `scalar_size(curve)` bytes, most significant first, of a number from one to
-/// the curve's order less one. `None` for anything else.
+/// The ECDSA key with a scalar on `curve`, signing over `curve_digest(curve)` in `encoding`, with
+/// nonces from RFC 6979. The scalar is `scalar_size(curve)` bytes, most significant first, of a
+/// number from one to the curve's order minus one. Returns `None` for anything else.
 pub fn ecdsa_signing(
   curve: EcdsaCurve,
   scalar: Secret<Bytes>,
@@ -335,46 +342,47 @@ pub fn ecdsa_signing(
     None -> None,
   }
 
-/// How many draws a fresh scalar is given: one is out of range at most once in `2^32`.
+/// How many draws a new scalar may take. A draw is out of range at most once in `2^32`.
 fn draws() -> Int = 8
 
-/// A scalar of `curve` drawn sealed. A P-521 scalar is a zero byte and 65 drawn, below `2^520`,
-/// since a draw cannot be read to be held below the order: a key half a bit short of the curve's
-/// strength of 260 bits.
-fn drawn_scalar(curve: EcdsaCurve, left: Int) -> Secret<Bytes> / {entropy.secret, abort.raise} = {
+/// A random scalar of `curve`, drawn as a `Secret`. A P-521 scalar is a zero byte followed by 65
+/// random bytes, so it is below `2^520`, because a secret draw cannot be inspected to keep it below
+/// the order. The key is half a bit short of the curve's strength of 260 bits.
+fn random_scalar(curve: EcdsaCurve, left: Int) -> Secret<Bytes> / {entropy.secret, abort.raise} = {
   let scalar = match curve {
     NistP521 -> Secret::of_bytes(b"\x00").concat(entropy.secret(65)),
     _ -> entropy.secret(scalar_size(curve)),
   };
   if public_of(curve_scheme(curve), scalar) != None { scalar }
   else if left <= 1 { panic("the entropy source answers no scalar of the curve") }
-  else { drawn_scalar(curve, left - 1) }
+  else { random_scalar(curve, left - 1) }
 }
 
-/// An ECDSA key on `curve` of the operating system's entropy, drawn sealed, signing in
+/// A new ECDSA key on `curve` drawn from the operating system's entropy as a `Secret`, signing in
 /// `encoding`.
 pub fn new_ecdsa_signing(
   curve: EcdsaCurve,
   encoding: Encoding,
 ) -> SigningKey / {entropy.secret, abort.raise} =
-  match ecdsa_signing(curve, drawn_scalar(curve, draws()), encoding) {
+  match ecdsa_signing(curve, random_scalar(curve, draws()), encoding) {
     Some(key) -> key,
     None -> panic("a drawn scalar is a key"),
   }
 
-/// The RSA key a private-key document is, signing PKCS #1 v1.5 over `digest`: PKCS #8 or PKCS #1
-/// DER, of a modulus of 2048 to 4096 bits and a public exponent of 65537 or more. `None` for
-/// anything else.
+/// The RSA key in a private-key document, signing PKCS #1 v1.5 over `digest`. The document is
+/// PKCS #8 or PKCS #1 DER, with a modulus of 2048 to 4096 bits and a public exponent of 65537 or
+/// more. Returns `None` for anything else.
 pub fn rsa_pkcs1_signing(document: Secret<Bytes>, digest: Digest) -> Option<SigningKey> =
   match public_of("rsa", document) {
     Some(public) -> Some(RsaPkcs1Signing(document, public, digest)),
     None -> None,
   }
 
-/// The RSA key a private-key document is, signing PSS over `digest`, its mask MGF1 over the same
-/// hash and its salt as long as the digest: HMAC, under the document, of the message's digest, so
-/// a signature is a function of the key and the message as an Ed25519 or RFC 6979 one is, and
-/// nobody without the key foresees a salt. `None` as `rsa_pkcs1_signing` answers it.
+/// The RSA key in a private-key document, signing PSS over `digest`, with MGF1 over the same hash
+/// as the mask and a salt as long as the digest. The salt is the HMAC of the message's digest under
+/// the document, so a signature depends only on the key and the message, as an Ed25519 or RFC 6979
+/// signature does, and nobody without the key can predict a salt. Returns `None` where
+/// `rsa_pkcs1_signing` does.
 pub fn rsa_pss_signing(document: Secret<Bytes>, digest: Digest) -> Option<SigningKey> =
   match public_of("rsa", document) {
     Some(public) -> Some(RsaPssSigning(document, public, digest)),
@@ -396,40 +404,40 @@ fn der_length(size: Int) -> Bytes / {abort.raise} =
   else if size < 0x100 { b"\x81".concat(byte_of_int(size)) }
   else { Bytes::concat_all([b"\x82", byte_of_int(size >>> 8), byte_of_int(size & 0xFF)]) }
 
-/// A DER tag and the length of what follows it: how a document's public frame is written around
-/// a secret it cannot hold as a plain value.
-fn der_head(tag: Int, size: Int) -> Bytes / {abort.raise} =
+/// A DER tag and the length of what follows it. This is how a document's public framing is
+/// written around a secret that cannot be a plain value.
+fn der_header(tag: Int, size: Int) -> Bytes / {abort.raise} =
   byte_of_int(tag).concat(der_length(size))
 
-/// The private key's document, sealed: PKCS #8 (RFC 5208, RFC 5958) for an Ed25519 key (RFC 8410)
-/// and an ECDSA one (an RFC 5915 `ECPrivateKey` holding the public point beside the scalar), and
-/// for an RSA key the document it was made of. What `private_key_of_der` reads back, and what
-/// `std.fs`'s `write_secret` writes down.
+/// The private key's document, as a `Secret`: PKCS #8 (RFC 5208, RFC 5958) for an Ed25519 key
+/// (RFC 8410) and an ECDSA key (an RFC 5915 `ECPrivateKey` with the public point next to the
+/// scalar), and for an RSA key the document it was made from. `private_key_of_der` reads it back,
+/// and `std.fs`'s `write_secret` writes it to a file.
 pub fn private_key_document(key: SigningKey) -> Secret<Bytes> / {abort.raise} =
   match key {
     Ed25519Signing(seed, _) -> Secret::of_bytes(hex"302e020100300506032b657004220420").concat(seed),
     EcdsaSigning(curve, scalar, point, _) -> {
       let size = scalar_size(curve);
-      let bits = der_head(3, point.len() + 1).concat(b"\x00".concat(point));
-      let public = der_head(0xA1, bits.len()).concat(bits);
+      let bits = der_header(3, point.len() + 1).concat(b"\x00".concat(point));
+      let public = der_header(0xA1, bits.len()).concat(bits);
       // The `ECPrivateKey`: its version, the scalar as an `OCTET STRING`, then the public point.
       let inner = 5 + size + public.len();
-      let head = der_head(0x30, inner);
-      let held = der_head(4, head.len() + inner);
+      let head = der_header(0x30, inner);
+      let octet_string_header = der_header(4, head.len() + inner);
       let named = handle {
         algorithm(oid::ec_public_key(), Some(curve_oid(curve)))
       } with {
         asn1.unwritable(_) -> panic("a curve's name is written"),
       };
-      let outer = 3 + named.len() + held.len() + head.len() + inner;
+      let outer = 3 + named.len() + octet_string_header.len() + head.len() + inner;
       let before = Bytes::concat_all([
-        der_head(0x30, outer),
+        der_header(0x30, outer),
         b"\x02\x01\x00",
         named,
-        held,
+        octet_string_header,
         head,
         b"\x02\x01\x01",
-        der_head(4, size),
+        der_header(4, size),
       ]);
       Secret::of_bytes(before).concat(scalar).concat(Secret::of_bytes(public))
     },
@@ -437,21 +445,21 @@ pub fn private_key_document(key: SigningKey) -> Secret<Bytes> / {abort.raise} =
     RsaPssSigning(document, _, _) -> document,
   }
 
-/// The Ed25519 key 32 bytes name; `None` for any other length. Bytes that are no point of the
-/// curve are a key that verifies nothing.
+/// The Ed25519 key with these 32 bytes, or `None` for any other length. Bytes that are not a point
+/// on the curve make a key that verifies nothing.
 pub fn ed25519_verifying(public: Bytes) -> Option<VerifyingKey> =
   if public.len() == 32 { Some(Ed25519Verifying(public)) } else { None }
 
-/// The scalar one, under which agreeing with a point answers the point's own `x`.
+/// The scalar one, with which agreeing with a point returns the point's own `x`.
 fn one() -> Secret<Bytes> = Secret::of_bytes(b"\x00".repeat(31).concat(b"\x01"))
 
-/// Whether `point` is a point of P-256 in the 65-byte uncompressed form: `04`, `x`, `y`.
+/// Whether `point` is a point on P-256 in the 65-byte uncompressed form: `04`, `x`, `y`.
 fn on_p256(point: Bytes) -> Bool =
   point.len() == 65 && or_else(false, || crypto_agree("p256", one(), point) != None)
 
-/// How the runtime checks ECDSA on a curve over a digest, and whether the signature it reads is
-/// raw; `None` for a pairing it does not check.
-fn checked_as(curve: EcdsaCurve, digest: Digest) -> Option<{ scheme: String, raw: Bool }> =
+/// The runtime's scheme name for ECDSA on a curve over a digest, and whether its signature is raw.
+/// `None` for a pairing the runtime does not support.
+fn verification_scheme(curve: EcdsaCurve, digest: Digest) -> Option<{ scheme: String, raw: Bool }> =
   match ((curve, digest)) {
     (NistP256, Sha256) -> Some({ scheme: "ecdsa-p256-sha256", raw: true }),
     (NistP256, Sha384) -> Some({ scheme: "ecdsa-p256-sha384", raw: false }),
@@ -462,25 +470,25 @@ fn checked_as(curve: EcdsaCurve, digest: Digest) -> Option<{ scheme: String, raw
     _ -> None,
   }
 
-/// The ECDSA key a point of `curve` is, verifying signatures over `digest` written in `encoding`:
-/// the uncompressed form, `04`, `x`, `y`. The pairings are each curve's own digest, as
-/// `curve_digest` names it, and those certificates use beside them: P-256 over SHA-384 and P-384
-/// over SHA-256. `None` for any other pairing, form or length, and for a P-256 point off the
-/// curve; a point off any other curve is a key that verifies nothing. A secp256k1 signature whose
-/// `s` is in the high half is taken as its low twin.
+/// The ECDSA key for a point on `curve` in the uncompressed form (`04`, `x`, `y`), verifying
+/// signatures over `digest` written in `encoding`. The supported pairings are each curve's own
+/// digest, as `curve_digest` gives it, and two more that certificates use: P-256 over SHA-384 and
+/// P-384 over SHA-256. Returns `None` for any other pairing, form or length, and for a P-256 point
+/// off the curve. A point off any other curve makes a key that verifies nothing. A secp256k1
+/// signature whose `s` is in the high half is treated as its low-half counterpart.
 pub fn ecdsa_verifying(
   curve: EcdsaCurve,
   digest: Digest,
   point: Bytes,
   encoding: Encoding,
 ) -> Option<VerifyingKey> =
-  if checked_as(curve, digest) == None || point.len() != 2 * scalar_size(curve) + 1
+  if verification_scheme(curve, digest) == None || point.len() != 2 * scalar_size(curve) + 1
       || or_else(0, || point.at(0)) != 4
       || (curve == NistP256 && !on_p256(point)) { None }
   else { Some(EcdsaVerifying(curve, digest, point, encoding)) }
 
-/// The bits of the modulus a PKCS #1 `RSAPublicKey` holds, or `None` for bytes that are not one
-/// in DER: what a caller reads to say why a key is refused.
+/// The bit length of the modulus in a PKCS #1 `RSAPublicKey`, or `None` for bytes that are not one
+/// in DER. A caller uses it to report why a key was rejected.
 pub fn rsa_modulus_bits(public: Bytes) -> Option<Int> =
   or_else(None, ||
     match rsa_numbers(public) {
@@ -488,7 +496,7 @@ pub fn rsa_modulus_bits(public: Bytes) -> Option<Int> =
       None -> None,
     })
 
-/// The modulus and the public exponent a PKCS #1 `RSAPublicKey` holds, each without a leading zero.
+/// The modulus and public exponent in a PKCS #1 `RSAPublicKey`, each without a leading zero.
 fn rsa_numbers(public: Bytes) -> Option<{ n: Bytes, e: Bytes }> / {abort.raise} =
   match asn1::decode_with(public, 2, |r: Reader|
       asn1::within(asn1::read_sequence(r), |fields: Reader| {
@@ -506,19 +514,19 @@ fn rsa_public(public: Bytes) -> Option<Bytes> =
     None -> None,
   }
 
-/// The RSA key a PKCS #1 `RSAPublicKey` is, verifying PKCS #1 v1.5 over `digest`. `None` for
-/// bytes that are not one in DER and for a modulus under 2048 bits or over 8192.
+/// The RSA key in a PKCS #1 `RSAPublicKey`, verifying PKCS #1 v1.5 over `digest`. Returns `None`
+/// for bytes that are not one in DER, and for a modulus under 2048 bits or over 8192.
 pub fn rsa_pkcs1_verifying(public: Bytes, digest: Digest) -> Option<VerifyingKey> =
   match rsa_public(public) { Some(key) -> Some(RsaPkcs1Verifying(key, digest)), None -> None }
 
-/// The RSA key a PKCS #1 `RSAPublicKey` is, verifying PSS over `digest`, its mask MGF1 over the
-/// same hash and its salt as long as the digest, whatever the salt is. `None` as
-/// `rsa_pkcs1_verifying` answers it.
+/// The RSA key in a PKCS #1 `RSAPublicKey`, verifying PSS over `digest`, with MGF1 over the same
+/// hash as the mask and a salt as long as the digest, whatever its value. Returns `None` where
+/// `rsa_pkcs1_verifying` does.
 pub fn rsa_pss_verifying(public: Bytes, digest: Digest) -> Option<VerifyingKey> =
   match rsa_public(public) { Some(key) -> Some(RsaPssVerifying(key, digest)), None -> None }
 
-/// How a key's signatures are made, which a document that carries one names beside it.
-pub type Signature =
+/// How a key's signatures are made, which a document containing the key states next to it.
+pub type SignatureAlgorithm =
   | Ed25519Signature
   /// ECDSA on this curve over this hash, written this way.
   | EcdsaSignature(EcdsaCurve, Digest, Encoding)
@@ -528,7 +536,7 @@ pub type Signature =
   | RsaPssSignature(Digest)
 
 /// How the signatures `key` verifies are made.
-pub fn signature_of(key: VerifyingKey) -> Signature =
+pub fn signature_algorithm(key: VerifyingKey) -> SignatureAlgorithm =
   match key {
     Ed25519Verifying(_) -> Ed25519Signature,
     EcdsaVerifying(curve, digest, _, encoding) -> EcdsaSignature(curve, digest, encoding),
@@ -549,8 +557,8 @@ pub fn verifying_bytes(key: VerifyingKey) -> Bytes =
 fn left_padded(magnitude: Bytes, size: Int) -> Bytes =
   b"\x00".repeat(size - magnitude.len()).concat(magnitude)
 
-/// `r` then `s` in `size` bytes each, as the DER signature `der` holds them; `None` for bytes that
-/// are not DER's one writing of a `SEQUENCE` of two `INTEGER`s that are not negative and fit.
+/// `r` then `s` in `size` bytes each, from the DER signature `der`. Returns `None` for bytes that
+/// are not the unique DER encoding of a `SEQUENCE` of two non-negative `INTEGER`s that fit.
 fn raw_of_der(der: Bytes, size: Int) -> Option<Bytes> / {abort.raise} =
   match asn1::decode_with(der, 2, |reader: Reader|
       asn1::within(asn1::read_sequence(reader), |fields: Reader| {
@@ -569,32 +577,35 @@ fn der_of_raw(raw: Bytes) -> Bytes / {abort.raise} = {
   asn1::sequence([asn1::unsigned(raw.slice(0, half)), asn1::unsigned(raw.slice(half, 2 * half))])
 }
 
-fn made(signature: Option<Bytes>) -> Bytes / {abort.raise} =
+fn expect_signature(signature: Option<Bytes>) -> Bytes / {abort.raise} =
   match signature { Some(bytes) -> bytes, None -> panic("a key its maker checked signs") }
 
-/// `key`'s signature over `message`: 64 bytes under Ed25519, twice the scalar's under ECDSA `Raw`
-/// and a few more at most under `Der`, the modulus's length under RSA. A function of the key and
-/// the message alone.
+/// `key`'s signature over `message`: 64 bytes under Ed25519, twice the scalar's size under ECDSA
+/// `Raw` and at most a few more under `Der`, and the modulus's length under RSA. The signature
+/// depends only on the key and the message.
 pub fn sign(key: SigningKey, message: Bytes) -> Bytes / {abort.raise} =
   match key {
-    Ed25519Signing(seed, _) -> made(crypto_sign("ed25519", seed, message)),
+    Ed25519Signing(seed, _) -> expect_signature(crypto_sign("ed25519", seed, message)),
     EcdsaSigning(curve, scalar, _, encoding) -> {
-      let raw = made(crypto_sign(ecdsa_scheme(curve, curve_digest(curve)), scalar, message));
+      let raw = expect_signature(
+        crypto_sign(ecdsa_scheme(curve, curve_digest(curve)), scalar, message),
+      );
       match encoding { Raw -> raw, Der -> der_of_raw(raw) }
     },
     RsaPkcs1Signing(document, _, digest) ->
-      made(crypto_sign("rsa-pkcs1-" ++ digest_name(digest), document, message)),
+      expect_signature(crypto_sign("rsa-pkcs1-" ++ digest_name(digest), document, message)),
     RsaPssSigning(document, _, digest) ->
-      made(crypto_sign("rsa-pss-" ++ digest_name(digest), document, message)),
+      expect_signature(crypto_sign("rsa-pss-" ++ digest_name(digest), document, message)),
   }
 
-/// Whether `signature` is `message` signed by the key `key` verifies. `false` for a signature of
-/// another length, in the other encoding, with a number out of range, or over anything else.
+/// Whether `signature` is a valid signature of `message` for `key`. Returns `false` for a
+/// signature of the wrong length, in the other encoding, with a number out of range, or over
+/// anything else.
 pub fn verify(key: VerifyingKey, message: Bytes, signature: Bytes) -> Bool =
   or_else(false, ||
     match key {
       Ed25519Verifying(public) -> crypto_verify("ed25519", public, message, signature),
-      EcdsaVerifying(curve, digest, point, encoding) -> match checked_as(curve, digest) {
+      EcdsaVerifying(curve, digest, point, encoding) -> match verification_scheme(curve, digest) {
         None -> false,
         Some(native) -> {
           let size = scalar_size(curve);
@@ -622,19 +633,19 @@ pub type Curve =
   /// NIST P-256, Diffie-Hellman over its points (SP 800-56A).
   | P256
 
-/// A private key that agrees, with the public key its peer is sent.
+/// A private key for key agreement, with the public key sent to its peer.
 pub opaque type AgreementKey = | AgreementKey(Curve, Secret<Bytes>, Bytes)
 
-/// A peer's public key: 32 bytes for X25519, a point of the curve for P-256.
+/// A peer's public key: 32 bytes for X25519, a point on the curve for P-256.
 pub opaque type PeerKey = | PeerKey(Curve, Bytes)
 
 show for PeerKey by peer_text
 
-/// Why `agree` answered no secret.
-pub type Disagreed =
-  /// The two keys are of two curves.
-  | OtherCurve
-  /// The peer's X25519 key is a point of small order, under which every key shares zeros.
+/// Why `agree` returned no secret.
+pub type AgreementError =
+  /// The two keys are on different curves.
+  | CurveMismatch
+  /// The peer's X25519 key is a point of small order, with which every key shares all zeros.
   | SmallOrder
 
 fn peer_text(key: PeerKey) -> String =
@@ -651,46 +662,48 @@ fn agreement_key(curve: Curve, private: Secret<Bytes>) -> Option<AgreementKey> =
     None -> None,
   }
 
-/// The X25519 key 32 bytes are; `None` for any other length. Every 32 bytes are a key.
+/// The X25519 key made of 32 bytes, or `None` for any other length. Any 32 bytes are a valid key.
 pub fn x25519_key(private: Secret<Bytes>) -> Option<AgreementKey> = agreement_key(X25519, private)
 
-/// The P-256 key a scalar is, as `ecdsa_signing` reads one on `NistP256`. `None` for anything else.
+/// The P-256 key with a scalar, read as `ecdsa_signing` reads one on `NistP256`. Returns `None`
+/// for anything else.
 pub fn p256_key(scalar: Secret<Bytes>) -> Option<AgreementKey> = agreement_key(P256, scalar)
 
-/// A key of the operating system's entropy on `curve`, drawn sealed.
+/// A new key on `curve` drawn from the operating system's entropy as a `Secret`.
 pub fn new_agreement_key(curve: Curve) -> AgreementKey / {entropy.secret, abort.raise} = {
   let private = match curve {
     X25519 -> entropy.secret(32),
-    P256 -> drawn_scalar(NistP256, draws()),
+    P256 -> random_scalar(NistP256, draws()),
   };
   match agreement_key(curve, private) { Some(key) -> key, None -> panic("a drawn key is a key") }
 }
 
-/// The public key `key`'s peer is sent.
+/// The public key to send to `key`'s peer.
 pub fn peer_key(key: AgreementKey) -> PeerKey =
   match key { AgreementKey(curve, _, public) -> PeerKey(curve, public) }
 
-/// The X25519 peer 32 bytes name; `None` for any other length.
+/// The X25519 peer key made of 32 bytes, or `None` for any other length.
 pub fn x25519_peer(public: Bytes) -> Option<PeerKey> =
   if public.len() == 32 { Some(PeerKey(X25519, public)) } else { None }
 
-/// The P-256 peer a point is: the 65-byte uncompressed form, `04`, `x`, `y`. `None` for any other
-/// form, the compressed one included, and for a point that is not on the curve.
+/// The P-256 peer key for a point in the 65-byte uncompressed form: `04`, `x`, `y`. Returns `None`
+/// for any other form, including the compressed one, and for a point that is not on the curve.
 pub fn p256_peer(point: Bytes) -> Option<PeerKey> =
   if on_p256(point) { Some(PeerKey(P256, point)) } else { None }
 
-/// The peer key's bytes, as its maker took them.
+/// The peer key's bytes, as its constructor received them.
 pub fn peer_bytes(key: PeerKey) -> Bytes = match key { PeerKey(_, public) -> public }
 
 /// The curve a peer's key is on.
 pub fn peer_curve(key: PeerKey) -> Curve = match key { PeerKey(curve, _) -> curve }
 
-/// The secret `key` and `peer` share: 32 bytes, the same from either side's private key and the
-/// other's public one. It is not uniform and is no key: `derive` makes keys of it.
-pub fn agree(key: AgreementKey, peer: PeerKey) -> Result<Secret<Bytes>, Disagreed> =
+/// The 32-byte secret shared by `key` and `expect_peer_key`. Each side computes the same secret
+/// from its private key and the other's public key. It is not uniformly random and is not a key:
+/// use `derive` to make keys from it.
+pub fn agree(key: AgreementKey, expect_peer_key: PeerKey) -> Result<Secret<Bytes>, AgreementError> =
   match key {
-    AgreementKey(curve, private, _) -> match peer {
-      PeerKey(theirs, public) -> if curve != theirs { Err(OtherCurve) } else {
+    AgreementKey(curve, private, _) -> match expect_peer_key {
+      PeerKey(theirs, public) -> if curve != theirs { Err(CurveMismatch) } else {
         match or_else(None, || crypto_agree(curve_name(curve), private, public)) {
           Some(shared) -> Ok(shared),
           None -> Err(SmallOrder),
@@ -699,28 +712,29 @@ pub fn agree(key: AgreementKey, peer: PeerKey) -> Result<Secret<Bytes>, Disagree
     },
   }
 
-/// `length` bytes of key out of what `agree` answered: HKDF over SHA-256 (RFC 5869), under a
-/// `salt` that may be empty and an `info` that says what the key is for. Two keys from one secret
-/// are two calls under two `info`s. Refuses a length as `std.hash`'s `hkdf` does.
+/// `length` bytes of key derived from what `agree` returned: HKDF over SHA-256 (RFC 5869), with a
+/// `salt` that may be empty and an `info` that states what the key is for. To make two keys from
+/// one secret, call this twice with two `info`s. Raises `hash.fail` for a length that
+/// `std.hash`'s `hkdf` rejects.
 pub fn derive(
   shared: Secret<Bytes>,
   salt: Bytes,
   info: Bytes,
   length: Int,
-) -> Secret<Bytes> / {hash.refused} = hkdf(sha256_hash(), salt, shared, info, length)
+) -> Secret<Bytes> / {hash.fail} = hkdf(sha256_hash(), salt, shared, info, length)
 
-/// The `SealKey` `derive` makes of what `agree` answered.
+/// The `SealKey` that `derive` makes from what `agree` returned.
 pub fn seal_key_of(shared: Secret<Bytes>, salt: Bytes, info: Bytes) -> SealKey / {abort.raise} =
   handle {
     SealKey(derive(shared, salt, info, 32))
   } with {
-    hash.refused(_) -> panic("HKDF over SHA-256 derives thirty-two bytes"),
+    hash.fail(_) -> panic("HKDF over SHA-256 derives thirty-two bytes"),
   }
 
-// --- Keys as documents carry them ---------------------------------------------------------
+// --- Keys in documents --------------------------------------------------------------------
 
-/// A public key as a document names one: the algorithm it is a key of and its bytes, unchecked.
-/// A maker above makes a key for a use of it.
+/// A public key as a document records it: its algorithm and its bytes, unchecked. A constructor
+/// above turns it into a key for a specific use.
 pub type PublicKey =
   /// Ed25519: 32 bytes.
   | Ed25519Public(Bytes)
@@ -731,21 +745,21 @@ pub type PublicKey =
   /// RSA: a PKCS #1 `RSAPublicKey`.
   | RsaPublic(Bytes)
 
-/// A private key as a document holds one, still sealed.
+/// A private key as a document stores it, still a `Secret`.
 pub type PrivateKey =
   /// Ed25519: the 32-byte seed.
   | Ed25519Private(Secret<Bytes>)
   /// X25519: 32 bytes.
   | X25519Private(Secret<Bytes>)
-  /// An elliptic curve's: the scalar, `scalar_size(curve)` bytes.
+  /// An elliptic curve key: the scalar, `scalar_size(curve)` bytes.
   | EcPrivate(EcdsaCurve, Secret<Bytes>)
   /// RSA: the document itself, which is what `rsa_pkcs1_signing` and `rsa_pss_signing` take.
   | RsaPrivate(Secret<Bytes>)
 
-/// The private key a DER document holds, read by the runtime without opening it: PKCS #8
-/// (`PRIVATE KEY`) for any of them, SEC 1 (`EC PRIVATE KEY`) on any of the curves, or PKCS #1
-/// (`RSA PRIVATE KEY`). `None` for anything else. A `std.pem` `Key`'s `material` is such a
-/// document, and so is what `private_key_document` answers.
+/// The private key in a DER document, read by the runtime without exposing it: PKCS #8
+/// (`PRIVATE KEY`) for any key type, SEC 1 (`EC PRIVATE KEY`) on any of the curves, or PKCS #1
+/// (`RSA PRIVATE KEY`). Returns `None` for anything else. A `std.pem` `Key`'s `material` is such a
+/// document, and so is what `private_key_document` returns.
 pub fn private_key_of_der(document: Secret<Bytes>) -> Option<PrivateKey> =
   match document.private_key() {
     None -> None,
@@ -761,9 +775,9 @@ pub fn private_key_of_der(document: Secret<Bytes>) -> Option<PrivateKey> =
     },
   }
 
-/// The members of a private RSA JSON Web Key past `n` and `e` (RFC 7518 §6.3.2), each its
-/// base64url text, sealed: `d`, then the primes and the numbers the Chinese remainder theorem
-/// signs with. A key that leaves the last five out is no key here.
+/// The members of a private RSA JSON Web Key besides `n` and `e` (RFC 7518 §6.3.2), each as its
+/// base64url text in a `Secret`: `d`, then the primes and the Chinese remainder theorem values used
+/// for signing. A key without the last five is not accepted.
 pub type RsaJwkPrivate = {
   d: Secret<String>,
   p: Secret<String>,
@@ -773,10 +787,10 @@ pub type RsaJwkPrivate = {
   qi: Secret<String>,
 }
 
-/// The RSA key a JSON Web Key's numbers are, as its document: `n` and `e` most significant byte
-/// first, and the private members. The runtime decodes and assembles them without one of them
-/// ever being a plain value, and answers `None` where they are no key of 2048 to 4096 bits
-/// together.
+/// The RSA key from a JSON Web Key's numbers, as its document: `n` and `e`, most significant byte
+/// first, and the private members. The runtime decodes and assembles them without any of them
+/// ever being a plain value. Returns `None` if together they are not a valid key of 2048 to 4096
+/// bits.
 pub fn rsa_private_of_jwk(n: Bytes, e: Bytes, private: RsaJwkPrivate) -> Option<PrivateKey> =
   match or_else(None, ||
       Secret::rsa_jwk(n, e, [
@@ -797,8 +811,8 @@ fn algorithm(id: Oid, parameters: Option<Oid>) -> Bytes / {asn1.unwritable, abor
     None -> [asn1::oid(id)],
   })
 
-/// The `SubjectPublicKeyInfo` of `key`, in DER (RFC 5280, RFC 8410). Raises for key bytes that are
-/// not their algorithm's length.
+/// The `SubjectPublicKeyInfo` of `key`, in DER (RFC 5280, RFC 8410). Raises for key bytes of the
+/// wrong length for their algorithm.
 pub fn spki_encode(key: PublicKey) -> Bytes / {abort.raise} = {
   let written = |id: Bytes, bytes: Bytes|
     asn1::sequence([id, asn1::bit_string({ unused: 0, bytes: bytes })]);
@@ -818,9 +832,9 @@ pub fn spki_encode(key: PublicKey) -> Bytes / {abort.raise} = {
   }
 }
 
-type Named = { id: Oid, parameters: Option<Oid>, null: Bool, key: Bytes }
+type SpkiFields = { id: Oid, parameters: Option<Oid>, null: Bool, key: Bytes }
 
-fn spki(r: Reader) -> Read<Named> / {asn1.refused, abort.raise} =
+fn read_spki(r: Reader) -> ReadResult<SpkiFields> / {asn1.fail, abort.raise} =
   asn1::within(asn1::read_sequence(r), |fields: Reader| {
     let named = asn1::within(asn1::read_sequence(fields), |inner: Reader| {
       let id = asn1::read_oid(inner);
@@ -849,12 +863,12 @@ fn spki(r: Reader) -> Read<Named> / {asn1.refused, abort.raise} =
     }
   })
 
-/// The public key a `SubjectPublicKeyInfo` names, read as DER; `None` for bytes that are not one,
-/// an algorithm that is none of the four, parameters that are not its own, and key bytes that are
-/// not its length. What it answers is still unchecked: a maker checks it for a use.
+/// The public key in a DER `SubjectPublicKeyInfo`. Returns `None` for bytes that are not one, an
+/// algorithm other than the four, parameters that do not belong to the algorithm, and key bytes of
+/// the wrong length. The result is still unchecked: a constructor checks it for a specific use.
 pub fn spki_decode(der: Bytes) -> Option<PublicKey> =
   or_else(None, ||
-    match asn1::decode_with(der, 3, spki) {
+    match asn1::decode_with(der, 3, read_spki) {
       Err(_) -> None,
       Ok(found) -> {
         let bare = found.parameters == None && !found.null;
@@ -870,9 +884,8 @@ pub fn spki_decode(der: Bytes) -> Option<PublicKey> =
       },
     })
 
-/// A public key as a JSON Web Key holds its numbers (RFC 7517, RFC 7518, RFC 8037), each as the
-/// bytes its base64url member decodes to. Writing one to JSON, and reading one, is a JOSE
-/// module's.
+/// A public key as a JSON Web Key stores its numbers (RFC 7517, RFC 7518, RFC 8037), each as the
+/// bytes its base64url member decodes to. Converting to and from JSON is left to a JOSE module.
 pub type Jwk =
   /// `"kty": "OKP"`: the curve, `Ed25519` or `X25519`, and `x`.
   | Okp(String, Bytes)
@@ -881,7 +894,7 @@ pub type Jwk =
   /// `"kty": "RSA"`: `n` and `e`, most significant byte first with no leading zero.
   | Rsa(Bytes, Bytes)
 
-/// `key` as a JSON Web Key; `None` for key bytes that are not their algorithm's.
+/// `key` as a JSON Web Key, or `None` for key bytes that do not fit their algorithm.
 pub fn jwk_of(key: PublicKey) -> Option<Jwk> =
   or_else(None, ||
     match key {
@@ -895,8 +908,8 @@ pub fn jwk_of(key: PublicKey) -> Option<Jwk> =
       },
     })
 
-/// The public key a JSON Web Key names; `None` for a curve that is none of these and for numbers
-/// that are not its length.
+/// The public key in a JSON Web Key. Returns `None` for an unsupported curve and for numbers of the
+/// wrong length.
 pub fn public_of_jwk(jwk: Jwk) -> Option<PublicKey> =
   or_else(None, ||
     match jwk {
@@ -911,19 +924,19 @@ pub fn public_of_jwk(jwk: Jwk) -> Option<PublicKey> =
 
 // --- Tests ------------------------------------------------------------------
 
-/// Thirty-two bytes out of any: a key for a test that draws bytes.
-fn keyed(material: Bytes) -> Secret<Bytes> = Secret::of_bytes(material.blake3())
+/// Thirty-two bytes derived from any bytes: a key for a test with random input.
+fn test_key(material: Bytes) -> Secret<Bytes> = Secret::of_bytes(material.blake3())
 
-fn seal_key_at(material: Bytes) -> SealKey / {abort.raise} =
-  match seal_key(keyed(material)) { Some(key) -> key, None -> panic("a key") }
+fn test_seal_key(material: Bytes) -> SealKey / {abort.raise} =
+  match seal_key(test_key(material)) { Some(key) -> key, None -> panic("a key") }
 
-fn counted_at(cipher: Cipher, material: Bytes) -> CountedKey / {abort.raise} =
+fn test_counted_key(cipher: Cipher, material: Bytes) -> CountedKey / {abort.raise} =
   match counted_key(cipher, Secret::of_bytes(material)) { Some(key) -> key, None -> panic("a key") }
 
-fn wide(material: Bytes) -> Bytes / {abort.raise} = material.blake3().slice(0, 24)
+fn test_nonce(material: Bytes) -> Bytes / {abort.raise} = material.blake3().slice(0, 24)
 
-/// `b` with one bit turned, the bit `at` counts to round its length.
-fn turned(b: Bytes, at: Int) -> Bytes / {abort.raise} = {
+/// `b` with one bit flipped, at position `at` wrapped around its length.
+fn flip_bit(b: Bytes, at: Int) -> Bytes / {abort.raise} = {
   let bit = (at & 0x7FFF_FFFF) % (8 * b.len());
   Bytes::concat_all([
     b.slice(0, bit / 8),
@@ -942,7 +955,7 @@ test "XChaCha20-Poly1305, the draft's example" {
   let nonce = hex"404142434445464748494a4b4c4d4e4f5051525354555657";
   let associated = hex"50515253c0c1c2c3c4c5c6c7";
   let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
-  let sealed_text = seal_under(key, nonce, plaintext, associated);
+  let sealed_text = seal_with_nonce(key, nonce, plaintext, associated);
   assert_eq(
     sealed_text.hex_of(),
     "404142434445464748494a4b4c4d4e4f5051525354555657"
@@ -955,14 +968,14 @@ test "XChaCha20-Poly1305, the draft's example" {
 }
 
 test "ChaCha20-Poly1305, RFC 8439 section 2.8.2" {
-  let key = counted_at(
+  let key = test_counted_key(
     ChaCha20Poly1305,
     hex"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
   );
   let nonce = hex"070000004041424344454647";
   let associated = hex"50515253c0c1c2c3c4c5c6c7";
   let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
-  let sealed_text = unwatched(|| seal_at(key, nonce, plaintext, associated));
+  let sealed_text = without_nonce_check(|| seal_at(key, nonce, plaintext, associated));
   assert_eq(
     sealed_text.hex_of(),
     "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"
@@ -972,14 +985,14 @@ test "ChaCha20-Poly1305, RFC 8439 section 2.8.2" {
 }
 
 test "AES-256-GCM, the specification's test case 16" {
-  let key = counted_at(
+  let key = test_counted_key(
     Aes256Gcm,
     hex"feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308",
   );
   let nonce = hex"cafebabefacedbaddecaf888";
   let associated = hex"feedfacedeadbeeffeedfacedeadbeefabaddad2";
   let plaintext = hex"d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39";
-  let sealed_text = unwatched(|| seal_at(key, nonce, plaintext, associated));
+  let sealed_text = without_nonce_check(|| seal_at(key, nonce, plaintext, associated));
   assert_eq(
     sealed_text.hex_of(),
     "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662"
@@ -992,22 +1005,22 @@ test "a key is thirty-two bytes, and a nonce is its cipher's length" {
   assert(seal_key(Secret::of_bytes(b"k".repeat(31))) == None);
   assert(seal_key(Secret::of_bytes(b"k".repeat(33))) == None);
   assert(counted_key(Aes256Gcm, Secret::of_bytes(b"k".repeat(16))) == None);
-  let key = counted_at(Aes256Gcm, b"k".repeat(32));
+  let key = test_counted_key(Aes256Gcm, b"k".repeat(32));
   assert_eq(
-    try[abort.raise] { unwatched(|| seal_at(key, b"n".repeat(8), b"m", b"")) },
+    try[abort.raise] { without_nonce_check(|| seal_at(key, b"n".repeat(8), b"m", b"")) },
     Err("`crypto_seal`: a `aes-256-gcm` nonce is 12 bytes, and this one is 8"),
   );
   assert_eq(open_at(key, b"n".repeat(8), b"c".repeat(32), b""), None);
   assert_eq(open_at(key, b"n".repeat(12), b"short", b""), None);
-  assert_eq(open(seal_key_at(b"k"), b"short", b""), None);
+  assert_eq(open(test_seal_key(b"k"), b"short", b""), None);
   assert_eq(counter_nonce(1, 2), hex"000000010000000000000002");
   assert_eq(cipher_of(key), Aes256Gcm);
   assert_eq(key_name(key).len(), 8);
-  assert_eq(key_name(key), key_name(counted_at(ChaCha20Poly1305, b"k".repeat(32))));
-  assert(key_name(key) != key_name(counted_at(Aes256Gcm, b"j".repeat(32))))
+  assert_eq(key_name(key), key_name(test_counted_key(ChaCha20Poly1305, b"k".repeat(32))));
+  assert(key_name(key) != key_name(test_counted_key(Aes256Gcm, b"j".repeat(32))))
 }
 
-test "a fresh key is drawn sealed, and a sealed message's nonce is the entropy it is handed" {
+test "a new key is drawn as a secret, and a sealed message's nonce is the entropy it is given" {
   let drawn = handle {
     let key = new_seal_key();
     { key: key, sealed: seal(key, b"message", b"header") }
@@ -1019,17 +1032,17 @@ test "a fresh key is drawn sealed, and a sealed message's nonce is the entropy i
   let stream = Bytes::concat_all([seven, seven, seven, seven, seven]);
   assert(Some(drawn.key) == seal_key(Secret::of_bytes(b"k".repeat(32))));
   assert_eq(drawn.sealed.slice(0, 24), stream.slice(0, 24));
-  assert_eq(drawn.sealed, seal_under(drawn.key, stream.slice(0, 24), b"message", b"header"));
+  assert_eq(drawn.sealed, seal_with_nonce(drawn.key, stream.slice(0, 24), b"message", b"header"));
   assert_eq(open(drawn.key, drawn.sealed, b"header"), Some(b"message"))
 }
 
-/// What `new_ecdsa_signing` and the others draw under a handler that answers `entropy.secret(n)`
+/// What `new_ecdsa_signing` and the others draw under a handler that handles `entropy.secret(n)`
 /// with `n` bytes counting up from `start`.
 fn counting_secret(start: Int, n: Int) -> Secret<Bytes> =
   Secret::of_bytes(Bytes::concat_all(range(0, n).map(|i: Int| byte_of_int(start + i & 0xFF))))
 
-test "every key std.crypto makes is drawn sealed, and its document reads back as the key" {
-  let made = handle {
+test "every key std.crypto makes is drawn as a secret, and its document reads back as the key" {
+  let expect_signature = handle {
     {
       edwards: new_ed25519_signing(),
       nist: [NistP256, NistP384, NistP521, Secp256k1].map(|c: EcdsaCurve|
@@ -1040,27 +1053,30 @@ test "every key std.crypto makes is drawn sealed, and its document reads back as
   } with {
     entropy.secret(n) -> counting_secret(1, n),
   };
-  assert_eq(Some(made.edwards), ed25519_signing(counting_secret(1, 32)));
+  assert_eq(Some(expect_signature.edwards), ed25519_signing(counting_secret(1, 32)));
   assert_eq(
-    private_key_of_der(private_key_document(made.edwards)),
+    private_key_of_der(private_key_document(expect_signature.edwards)),
     Some(Ed25519Private(counting_secret(1, 32))),
   );
   let p521 = Secret::of_bytes(b"\x00").concat(counting_secret(1, 65));
-  assert_eq(made.nist.map(|k: SigningKey| private_key_of_der(private_key_document(k))), [
-    Some(EcPrivate(NistP256, counting_secret(1, 32))),
-    Some(EcPrivate(NistP384, counting_secret(1, 48))),
-    Some(EcPrivate(NistP521, p521)),
-    Some(EcPrivate(Secp256k1, counting_secret(1, 32))),
-  ]);
-  assert(Some(made.counted) == counted_key(Aes256Gcm, counting_secret(1, 32)));
-  assert(Some(made.agreeing) == x25519_key(counting_secret(1, 32)))
+  assert_eq(
+    expect_signature.nist.map(|k: SigningKey| private_key_of_der(private_key_document(k))),
+    [
+      Some(EcPrivate(NistP256, counting_secret(1, 32))),
+      Some(EcPrivate(NistP384, counting_secret(1, 48))),
+      Some(EcPrivate(NistP521, p521)),
+      Some(EcPrivate(Secp256k1, counting_secret(1, 32))),
+    ],
+  );
+  assert(Some(expect_signature.counted) == counted_key(Aes256Gcm, counting_secret(1, 32)));
+  assert(Some(expect_signature.agreeing) == x25519_key(counting_secret(1, 32)))
 }
 
-type Written = { curve: EcdsaCurve, document: Bytes }
+type OpensslDocument = { curve: EcdsaCurve, document: Bytes }
 
-/// What OpenSSL writes of the key of scalar one on each curve, as PKCS #8 DER: an `ECPrivateKey`
-/// holding the curve's generator as its public point.
-fn written_by_openssl() -> List<Written> =
+/// What OpenSSL writes for the key with scalar one on each curve, as PKCS #8 DER: an
+/// `ECPrivateKey` with the curve's generator as its public point.
+fn written_by_openssl() -> List<OpensslDocument> =
   [
     {
       curve: NistP256,
@@ -1080,10 +1096,10 @@ fn written_by_openssl() -> List<Written> =
     },
   ]
 
-test "the {w.curve} key of scalar one's document is the one OpenSSL writes" for w: Written in written_by_openssl(
+test "the document of the {w.curve} key with scalar one is what OpenSSL writes" for w: OpensslDocument in written_by_openssl(
   ) {
   let one = b"\x00".repeat(scalar_size(w.curve) - 1).concat(b"\x01");
-  let key = signer(ecdsa_signing(w.curve, Secret::of_bytes(one), Der));
+  let key = expect_signing_key(ecdsa_signing(w.curve, Secret::of_bytes(one), Der));
   assert(private_key_document(key) == Secret::of_bytes(w.document));
   assert_eq(
     private_key_of_der(Secret::of_bytes(w.document)),
@@ -1098,13 +1114,14 @@ test "what is sealed opens, under its key and what it was bound to" {
     gen::bytes(),
     gen::bytes(),
     |material: Bytes, nonce: Bytes, plaintext: Bytes, associated: Bytes| {
-      let key = seal_key_at(material);
-      open(key, seal_under(key, wide(nonce), plaintext, associated), associated) == Some(plaintext)
+      let key = test_seal_key(material);
+      open(key, seal_with_nonce(key, test_nonce(nonce), plaintext, associated), associated)
+        == Some(plaintext)
     },
   )
 }
 
-test "a bit turned anywhere in a sealed message, or in what it was bound to, opens nothing" {
+test "a bit flipped anywhere in a sealed message, or in what it was bound to, opens nothing" {
   gen::check(
     gen::and_then(gen::bytes(), |material: Bytes|
       gen::map4(
@@ -1121,42 +1138,42 @@ test "a bit turned anywhere in a sealed message, or in what it was bound to, ope
       let plaintext = drawn._2;
       let associated = drawn._3;
       let at = drawn._4;
-      let key = seal_key_at(material);
-      let whole_text = seal_under(key, wide(nonce), plaintext, associated);
-      open(key, turned(whole_text, at), associated) == None
-        && open(key, whole_text, turned(associated.concat(b"."), at)) == None
-        && open(seal_key_at(material.concat(b".")), whole_text, associated) == None
+      let key = test_seal_key(material);
+      let whole_text = seal_with_nonce(key, test_nonce(nonce), plaintext, associated);
+      open(key, flip_bit(whole_text, at), associated) == None
+        && open(key, whole_text, flip_bit(associated.concat(b"."), at)) == None
+        && open(test_seal_key(material.concat(b".")), whole_text, associated) == None
     },
   )
 }
 
-/// How far a test's body got, which outlives a body stopped short.
-effect reached {
+/// How far a test's body got, recorded so it survives a body that is stopped early.
+effect progress {
   write at(n: Int) -> Unit
 }
 
-test "a watcher stops at the first nonce spent twice under one key, and lets a count through" {
-  let key = counted_at(ChaCha20Poly1305, b"k".repeat(32));
-  let other = counted_at(ChaCha20Poly1305, b"j".repeat(32));
-  let counted = watched(||
+test "the nonce check stops at the first nonce used twice under one key, and allows a count" {
+  let key = test_counted_key(ChaCha20Poly1305, b"k".repeat(32));
+  let other = test_counted_key(ChaCha20Poly1305, b"j".repeat(32));
+  let counted = check_nonce_reuse(||
     range(0, 4).map(|i: Int| seal_at(key, counter_nonce(0, i), b"message", b"")));
   assert(match counted { Ok(texts) -> texts.len() == 4, Err(_) -> false });
-  let lanes = watched(|| {
+  let lanes = check_nonce_reuse(|| {
     seal_at(key, counter_nonce(0, 7), b"one", b"");
     seal_at(key, counter_nonce(1, 7), b"two", b"");
     seal_at(other, counter_nonce(0, 7), b"three", b"")
   });
   assert(match lanes { Ok(_) -> true, Err(_) -> false });
   let repeated = handle {
-    watched(|| {
+    check_nonce_reuse(|| {
       seal_at(key, counter_nonce(0, 7), b"one", b"");
-      reached.at(1);
+      progress.at(1);
       seal_at(key, counter_nonce(0, 7), b"two", b"");
-      reached.at(2)
+      progress.at(2)
     })
   } with {
     var n = 0,
-    reached.at(k) -> {
+    progress.at(k) -> {
       n = k;
     },
     return found -> { found: found, reached: n },
@@ -1167,11 +1184,11 @@ test "a watcher stops at the first nonce spent twice under one key, and lets a c
 
 // --- Signatures -------------------------------------------------------------
 
-fn signer(key: Option<SigningKey>) -> SigningKey / {abort.raise} =
+fn expect_signing_key(key: Option<SigningKey>) -> SigningKey / {abort.raise} =
   match key { Some(k) -> k, None -> panic("a signing key") }
 
 test "Ed25519, RFC 8032 test 2" {
-  let key = signer(
+  let key = expect_signing_key(
     ed25519_signing(
       Secret::of_bytes(hex"4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"),
     ),
@@ -1196,8 +1213,8 @@ fn rfc_6979_point() -> Bytes =
   hex"0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
 
 test "ECDSA over P-256, RFC 6979's example, in both encodings" {
-  let raw = signer(ecdsa_signing(NistP256, Secret::of_bytes(rfc_6979_scalar()), Raw));
-  let der = signer(ecdsa_signing(NistP256, Secret::of_bytes(rfc_6979_scalar()), Der));
+  let raw = expect_signing_key(ecdsa_signing(NistP256, Secret::of_bytes(rfc_6979_scalar()), Raw));
+  let der = expect_signing_key(ecdsa_signing(NistP256, Secret::of_bytes(rfc_6979_scalar()), Der));
   let r = hex"efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716";
   let s = hex"f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8";
   assert_eq(verifying_bytes(verifying_key(raw)), rfc_6979_point());
@@ -1222,7 +1239,7 @@ test "a P-256 key is a scalar in range and a point on the curve" {
   assert(
     ecdsa_signing(NistP256, Secret::of_bytes(b"\x00".repeat(31).concat(b"\x01")), Raw) != None,
   );
-  assert_eq(ecdsa_verifying(NistP256, Sha256, turned(rfc_6979_point(), 8 * 64), Raw), None);
+  assert_eq(ecdsa_verifying(NistP256, Sha256, flip_bit(rfc_6979_point(), 8 * 64), Raw), None);
   assert_eq(ecdsa_verifying(NistP256, Sha256, rfc_6979_point().slice(0, 64), Raw), None);
   assert_eq(
     ecdsa_verifying(NistP256, Sha256, b"\x03".concat(rfc_6979_point().slice(1, 33)), Raw),
@@ -1238,14 +1255,14 @@ test "a signature verifies under its key, and under no other message or key" {
     gen::any_int(),
     |material: Bytes, message: Bytes, which: Int| {
       let made_key = match (which & 0xFF) % 3 {
-        0 -> ed25519_signing(keyed(material)),
-        1 -> ecdsa_signing(NistP256, keyed(material), Raw),
-        _ -> ecdsa_signing(NistP256, keyed(material), Der),
+        0 -> ed25519_signing(test_key(material)),
+        1 -> ecdsa_signing(NistP256, test_key(material), Raw),
+        _ -> ecdsa_signing(NistP256, test_key(material), Der),
       };
       let other = match (which & 0xFF) % 3 {
-        0 -> ed25519_signing(keyed(material.concat(b"."))),
-        1 -> ecdsa_signing(NistP256, keyed(material.concat(b".")), Raw),
-        _ -> ecdsa_signing(NistP256, keyed(material.concat(b".")), Der),
+        0 -> ed25519_signing(test_key(material.concat(b"."))),
+        1 -> ecdsa_signing(NistP256, test_key(material.concat(b".")), Raw),
+        _ -> ecdsa_signing(NistP256, test_key(material.concat(b".")), Der),
       };
       match made_key {
         None -> true,
@@ -1263,7 +1280,7 @@ test "a signature verifies under its key, and under no other message or key" {
   )
 }
 
-test "a DER signature is read in its one writing" {
+test "a DER signature is read only in its unique encoding" {
   let r = b"\x80".concat(b"\x01".repeat(31));
   let s = b"\x00".repeat(31).concat(b"\x7f");
   let der = der_of_raw(r.concat(s));
@@ -1284,19 +1301,19 @@ test "a DER signature is read in its one writing" {
 
 // --- Agreement --------------------------------------------------------------
 
-fn agreeing(key: Option<AgreementKey>) -> AgreementKey / {abort.raise} =
+fn expect_agreement_key(key: Option<AgreementKey>) -> AgreementKey / {abort.raise} =
   match key { Some(k) -> k, None -> panic("an agreement key") }
 
-fn peer(key: Option<PeerKey>) -> PeerKey / {abort.raise} =
+fn expect_peer_key(key: Option<PeerKey>) -> PeerKey / {abort.raise} =
   match key { Some(k) -> k, None -> panic("a peer key") }
 
 test "X25519, RFC 7748 section 6.1" {
-  let alice = agreeing(
+  let alice = expect_agreement_key(
     x25519_key(
       Secret::of_bytes(hex"77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"),
     ),
   );
-  let bob = agreeing(
+  let bob = expect_agreement_key(
     x25519_key(
       Secret::of_bytes(hex"5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"),
     ),
@@ -1319,12 +1336,15 @@ test "X25519, RFC 7748 section 6.1" {
 }
 
 test "a peer of small order shares nothing, and two curves do not agree" {
-  let key = agreeing(x25519_key(keyed(b"a")));
-  assert_eq(agree(key, peer(x25519_peer(b"\x00".repeat(32)))), Err(SmallOrder));
-  assert_eq(agree(key, peer(x25519_peer(b"\x01".concat(b"\x00".repeat(31))))), Err(SmallOrder));
-  let other = agreeing(p256_key(Secret::of_bytes(rfc_6979_scalar())));
-  assert_eq(agree(key, peer_key(other)), Err(OtherCurve));
-  assert_eq(agree(other, peer_key(key)), Err(OtherCurve));
+  let key = expect_agreement_key(x25519_key(test_key(b"a")));
+  assert_eq(agree(key, expect_peer_key(x25519_peer(b"\x00".repeat(32)))), Err(SmallOrder));
+  assert_eq(
+    agree(key, expect_peer_key(x25519_peer(b"\x01".concat(b"\x00".repeat(31))))),
+    Err(SmallOrder),
+  );
+  let other = expect_agreement_key(p256_key(Secret::of_bytes(rfc_6979_scalar())));
+  assert_eq(agree(key, peer_key(other)), Err(CurveMismatch));
+  assert_eq(agree(other, peer_key(key)), Err(CurveMismatch));
   assert_eq(x25519_peer(b"short"), None);
   assert(x25519_key(Secret::of_bytes(b"short")) == None);
   assert_eq(peer_bytes(peer_key(other)), rfc_6979_point())
@@ -1332,8 +1352,8 @@ test "a peer of small order shares nothing, and two curves do not agree" {
 
 test "two keys share one secret, whichever side works it out" {
   gen::check3(gen::bytes(), gen::bytes(), gen::bool(), |ours: Bytes, theirs: Bytes, which: Bool| {
-    let a = if which { x25519_key(keyed(ours)) } else { p256_key(keyed(ours)) };
-    let b = if which { x25519_key(keyed(theirs)) } else { p256_key(keyed(theirs)) };
+    let a = if which { x25519_key(test_key(ours)) } else { p256_key(test_key(ours)) };
+    let b = if which { x25519_key(test_key(theirs)) } else { p256_key(test_key(theirs)) };
     match ((a, b)) {
       (Some(mine), Some(yours)) -> {
         let shared = agree(mine, peer_key(yours));
@@ -1346,15 +1366,15 @@ test "two keys share one secret, whichever side works it out" {
 }
 
 test "a shared secret becomes keys through HKDF, each under its own info" {
-  let alice = agreeing(x25519_key(keyed(b"alice")));
-  let bob = agreeing(x25519_key(keyed(b"bob")));
+  let alice = expect_agreement_key(x25519_key(test_key(b"alice")));
+  let bob = expect_agreement_key(x25519_key(test_key(b"bob")));
   let shared = match agree(alice, peer_key(bob)) { Ok(s) -> s, Err(_) -> panic("a secret") };
   let theirs = match agree(bob, peer_key(alice)) { Ok(s) -> s, Err(_) -> panic("a secret") };
   let key = seal_key_of(shared, b"salt", b"a to b");
   assert(key == seal_key_of(theirs, b"salt", b"a to b"));
   assert(key != seal_key_of(shared, b"salt", b"b to a"));
   assert(Ok(Some(key)) == (try { seal_key(hkdf(sha256_hash(), b"salt", shared, b"a to b", 32)) }));
-  let text = seal_under(key, b"n".repeat(24), b"hello", b"");
+  let text = seal_with_nonce(key, b"n".repeat(24), b"hello", b"");
   assert_eq(open(seal_key_of(theirs, b"salt", b"a to b"), text, b""), Some(b"hello"));
   assert_eq(try { derive(shared, b"", b"", 64).len() }, Ok(64))
 }
@@ -1420,8 +1440,8 @@ test "an RSA key under 2048 bits verifies nothing here" {
 }
 
 test "two byte strings are the same when every byte is" {
-  assert(same(b"tag", b"tag"));
-  assert(!same(b"tag", b"tab"));
-  assert(!same(b"tag", b"ta"));
-  assert(same(b"", b""))
+  assert(constant_time_equal(b"tag", b"tag"));
+  assert(!constant_time_equal(b"tag", b"tab"));
+  assert(!constant_time_equal(b"tag", b"ta"));
+  assert(constant_time_equal(b"", b""))
 }

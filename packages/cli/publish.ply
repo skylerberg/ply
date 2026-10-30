@@ -1,99 +1,95 @@
-//! `ply publish` — a library, sent to the registry `PLY_REGISTRY` names: the `.plyz` `ply build`
-//! writes for it, uploaded under its name and version with the digest its bytes seal, then the
-//! interface a consumer reads it through. The registry recomputes that digest and refuses a
-//! mismatch, and a version it already holds is never replaced.
-
 import compiler.load (Derives, LoadedAnalysis)
 import args (Flags, style_of, root_of)
-import builder (Loaded)
+import builder (LoadedProgram)
 import builder (builder)
-import build (Packed, defs_of, packed, lock_refusal)
-import deployed (artifacts, deploying)
+import build (LibraryArchive, definitions_of, pack_library, lock_refusal)
+import artifact_builder (artifacts, with_artifacts)
 import units (emit)
 import compiler.unit (shipped)
 import std.env (env)
 import lock
-import paths (Resolved, here)
-import program (Program, Timed, front_of, timed_uncached, program_view)
-import registry (Base, base_of, exchange, interface_target, put, refused_by, release_target, said,
-                 token_variable, unasked, unset, untakeable, variable)
+import paths (ResolvedPath, here)
+import program (Program, TimedLoad, loaded_analysis, timed_uncached, program_view)
+import registry (BaseUrl, base_of, exchange, interface_target, put, refused_by, release_target,
+                 response_message, token_variable, registry_unreachable, unset, rejected_package,
+                 url_variable)
 import interfaces
 import semantics
 import sources (Embed, File)
-import report (Answer, indent, ok_code, count_of, refused, reported)
+import report (CommandOutput, indent, ok_code, count_of, refused, reported)
 import std.term (Style, green)
-import contracts (as_consumed, moved, previous, promised, published_promises, refusal)
+import contracts (analyse_as_consumer, contract_changes, previous, promised, published_contracts,
+                  bump_error)
 import remote
 import compiler.store.hash (Contract)
-import compiler.front.facts (View)
+import compiler.front.facts (CheckedProgram)
 import compiler.front.interface (interface_of, interface_bin, enveloped)
-import compiler.front.pkg (Supplied, registry_key)
+import compiler.front.pkg (SuppliedPackage, registry_key)
 import compiler.store.plyx (digest_text)
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diagnostic, error_at)
 import std.bin
 import std.fs (fs)
 import std.json (Json, Bool, Number, Str, object, to_string)
 import std.net (net)
 import std.time (time)
-import std.pkg (Dep, Manifest, Path, Git, Registry, Release, Version, render_version)
+import std.pkg (Dependency, Manifest, Path, Git, Registry, Release, Version, render_version)
 import compiler.syntax.parsing (no_module, dummy_span)
 
-// --- What may be published -----------------------------------------------------------
-
-fn a_program(manifest: Manifest, why: String) -> Diag =
-  untakeable("`" ++ manifest.name ++ "` is a program: " ++ why, [
+fn not_a_library(manifest: Manifest, why: String) -> Diagnostic =
+  rejected_package("`" ++ manifest.name ++ "` is a program: " ++ why, [
     b"only a library is published: a package with no entry whose modules declare no `main`",
   ])
 
-/// A dependency a consumer of the registry could not fetch as the registry's own.
-fn elsewhere(d: Dep) -> Option<String> =
+fn non_registry_source(d: Dependency) -> Option<String> =
   match d.source {
     Registry -> None,
     Path(p) -> Some("`" ++ d.name ++ "` comes from the path `" ++ p ++ "`"),
     Git(url, rev) -> Some("`" ++ d.name ++ "` comes from git, `" ++ url ++ "` at `" ++ rev ++ "`"),
   }
 
-/// Why a package cannot be published, when it cannot: a program, or one whose dependencies are not
-/// all the registry's own, since whoever depends on it resolves them from the registry alone.
-pub fn unpublishable(manifest: Manifest, mains: Int) -> Option<Diag> =
+pub fn unpublishable(manifest: Manifest, mains: Int) -> Option<Diagnostic> =
   match manifest.entry {
-    Some(e) -> Some(a_program(manifest, "its manifest names the entry `" ++ e ++ "`")),
-    None -> if mains > 0 { Some(a_program(manifest, "its modules declare `main`")) } else {
-      match manifest.dependencies.fold(None, |found: Option<String>, d: Dep|
-          match found { Some(_) -> found, None -> elsewhere(d) }) {
+    Some(e) -> Some(not_a_library(manifest, "its manifest names the entry `" ++ e ++ "`")),
+    None -> if mains > 0 { Some(not_a_library(manifest, "its modules declare `main`")) } else {
+      match manifest.dependencies.fold(None, |found: Option<String>, d: Dependency|
+          match found { Some(_) -> found, None -> non_registry_source(d) }) {
         None -> None,
         Some(why) ->
           Some(
-            untakeable("`" ++ manifest.name ++ "` cannot be published: the dependency " ++ why, [
-              b"a published package depends only on the registry, which is where whoever depends on it resolves its dependencies from",
-            ]),
+            rejected_package(
+              "`" ++ manifest.name ++ "` cannot be published: the dependency " ++ why,
+              [
+                b"a published package depends only on the registry, which is where whoever depends on it resolves its dependencies from",
+              ],
+            ),
           ),
       }
     },
   }
 
-// --- What a consumer reads, and what it was promised before ---------------------------
+type PublishedInterface = { envelope: Bytes, promised: List<Contract> }
 
-/// What `ply publish` sends beside the archive, and what the version promises its consumers.
-type Cut = { envelope: Bytes, promised: List<Contract> }
-
-/// Cut from a load of the package as a consumer makes one, so its modules are named as every
-/// consumer names them.
-fn cut_of(
+fn published_interface_of(
   loaded: Program,
   manifest: Manifest,
   archive: String,
-) -> Result<Cut, List<Diag>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let slot = registry_key(loaded.pkgs.root, Bytes::of_string(manifest.name));
-  let mine: Supplied = {
+) -> Result<PublishedInterface, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let slot = registry_key(loaded.packages.root, Bytes::of_string(manifest.name));
+  let mine: SuppliedPackage = {
     root: slot,
-    manifest: loaded.pkgs.manifest,
+    manifest: loaded.packages.manifest,
     modules: loaded.files.map(|file: File| { name: Bytes::of_string(file.module), src: file.text }),
   };
   let embeds = loaded.embeds.map(|embed: Embed|
-    if embed.embedded.root == loaded.pkgs.root { { ..embed.embedded, root: slot } }
+    if embed.embedded.root == loaded.packages.root { { ..embed.embedded, root: slot } }
     else { embed.embedded });
-  match as_consumed(loaded.pkgs.root, manifest, mine, loaded.pkgs.supplied, embeds) {
+  match analyse_as_consumer(
+      loaded.packages.root,
+      manifest,
+      mine,
+      loaded.packages.supplied,
+      embeds,
+    ) {
     Err(ds) -> Err(ds),
     Ok(c) ->
       Ok({
@@ -101,7 +97,7 @@ fn cut_of(
           semantics: Bytes::of_string(semantics::version()),
           archive: Bytes::of_string(archive),
           payload: bin::encode(
-            interface_of(c.whole, interfaces::dependency_sources(c.pkgs, []), c.modules),
+            interface_of(c.whole, interfaces::dependency_sources(c.packages, []), c.modules),
             interface_bin(),
           ),
         }),
@@ -110,27 +106,25 @@ fn cut_of(
   }
 }
 
-/// A version is held to the bump its changes need against the highest one published below it; a
-/// first version, or one the registry already holds, is held to nothing.
 fn bump_refusal(
-  base: Base,
+  base: BaseUrl,
   root: String,
   manifest: Manifest,
   now: List<Contract>,
-) -> Option<List<Diag>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> Option<List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match remote::index_of(base, manifest.name) {
     Err(d) -> if d.code == b"E0143" { None } else { Some([d]) },
     Ok(index) -> if index.versions.fold(false, |held: Bool, release: Release|
         held || release.version == manifest.version) { None } else {
       match previous(index, manifest.version) {
         None -> None,
-        Some(was) -> match published_promises(base, root, manifest.name, index, was.version) {
+        Some(was) -> match published_contracts(base, root, manifest.name, index, was.version) {
           Err(ds) -> Some(ds),
-          Ok(before) -> match refusal(
+          Ok(before) -> match bump_error(
               manifest.name,
               was.version,
               manifest.version,
-              moved(before, now),
+              contract_changes(before, now),
             ) {
             None -> None,
             Some(d) -> Some([d]),
@@ -140,25 +134,28 @@ fn bump_refusal(
     },
   }
 
-// --- The command --------------------------------------------------------------------
-
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Derives, abort.raise, diverges, shipped.report_reached} = {
   let s = style_of(flags);
   let r = root_of(flags);
-  let t: Timed = timed_uncached(flags.paths, flags.verify_deps);
+  let t: TimedLoad = timed_uncached(flags.paths, flags.verify_dependencies);
   match program_view(t.program) {
-    None -> refused(s, "publish", t.program.diags, t.program.places),
+    None -> refused(s, "publish", t.program.diagnostics, t.program.places),
     Some(v) -> {
-      let front = front_of(t, v);
+      let front = loaded_analysis(t, v);
       match builder.loaded[build](root_of(flags).machine, front) {
-        Err(why) -> refused(s, "publish", why.diags, why.places),
+        Err(why) -> refused(s, "publish", why.diagnostics, why.places),
         Ok(p) -> match lock::read(r) {
-          Err(why) -> reported(s, "publish", [lock::refused(r, why)], p.places),
-          Ok(existing) -> match lock_refusal(r, existing, p, lock::committed(t.program.pkgs)) {
+          Err(why) -> reported(s, "publish", [lock::unreadable_lock(r, why)], p.places),
+          Ok(existing) -> match lock_refusal(
+              r,
+              existing,
+              p,
+              lock::committed_packages(t.program.packages),
+            ) {
             Some(d) -> reported(s, "publish", [d], p.places),
-            None -> deploying(|| checked(s, r.absolute, t.program, v, p, front)),
+            None -> with_artifacts(|| publish_loaded(s, r.absolute, t.program, v, p, front)),
           },
         },
       }
@@ -166,21 +163,21 @@ pub fn run(
   }
 }
 
-fn checked(
+fn publish_loaded(
   style: Style,
   root: String,
   loaded: Program,
-  view: View,
-  p: Loaded,
+  view: CheckedProgram,
+  p: LoadedProgram,
   front: LoadedAnalysis,
-) -> Answer / {artifacts.unit, fs.list_dir[shipped], fs.read_file[shipped], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> CommandOutput / {artifacts.unit, fs.list_dir[shipped], fs.read_file[shipped], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match view.frame.manifest {
     None ->
       reported(
         style,
         "publish",
         [
-          untakeable("this is the anonymous package: there is no `ply.pkg` to publish", [
+          rejected_package("this is the anonymous package: there is no `ply.pkg` to publish", [
             b"`ply new NAME --lib` starts a library with one",
           ]),
         ],
@@ -188,28 +185,33 @@ fn checked(
       ),
     Some(m) -> match unpublishable(m, p.mains.len()) {
       Some(d) -> reported(style, "publish", [d], p.places),
-      None -> match packed(front, loaded, defs_of(view)) {
-        Err(why) -> reported(style, "publish", why.diags, p.places),
-        Ok(k) -> match cut_of(loaded, m, digest_text(k.sealed.full)) {
+      None -> match pack_library(front, loaded, definitions_of(view)) {
+        Err(why) -> reported(style, "publish", why.diagnostics, p.places),
+        Ok(k) -> match published_interface_of(loaded, m, digest_text(k.sealed.full)) {
           Err(ds) -> reported(style, "publish", ds, p.places),
-          Ok(cut) -> sent(style, root, m, k, cut),
+          Ok(interface) -> publish_packed(style, root, m, k, interface),
         },
       },
     },
   }
 
-fn sent(
+fn publish_packed(
   style: Style,
   root: String,
   manifest: Manifest,
-  k: Packed,
-  cut: Cut,
-) -> Answer / {fs.list_dir[shipped], fs.read_file[shipped], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
-  match env.variable(variable()) {
+  k: LibraryArchive,
+  interface: PublishedInterface,
+) -> CommandOutput / {fs.list_dir[shipped], fs.read_file[shipped], env.variable, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+  match env.variable(url_variable()) {
     None ->
-      reported(style, "publish", [unset(variable(), "a publish needs a registry to send to")], []),
+      reported(
+        style,
+        "publish",
+        [unset(url_variable(), "a publish needs a registry to send to")],
+        [],
+      ),
     Some(text) -> match base_of(text) {
-      Err(why) -> reported(style, "publish", [unasked(why, [])], []),
+      Err(why) -> reported(style, "publish", [registry_unreachable(why, [])], []),
       Ok(base) -> match env.variable(token_variable()) {
         None ->
           reported(
@@ -218,22 +220,22 @@ fn sent(
             [unset(token_variable(), "a publish is made under a token")],
             [],
           ),
-        Some(token) -> match bump_refusal(base, root, manifest, cut.promised) {
+        Some(token) -> match bump_refusal(base, root, manifest, interface.promised) {
           Some(ds) -> reported(style, "publish", ds, []),
-          None -> uploaded(style, base, token, manifest, k, cut.envelope),
+          None -> upload(style, base, token, manifest, k, interface.envelope),
         },
       },
     },
   }
 
-fn uploaded(
+fn upload(
   style: Style,
-  base: Base,
+  base: BaseUrl,
   token: String,
   manifest: Manifest,
-  k: Packed,
+  k: LibraryArchive,
   iface: Bytes,
-) -> Answer / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} = {
+) -> CommandOutput / {net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], abort.raise} = {
   let version = render_version(manifest.version);
   let digest = digest_text(k.sealed.full);
   let target = release_target(base, manifest.name, version);
@@ -244,7 +246,7 @@ fn uploaded(
       let at = interface_target(base, manifest.name, version, semantics::version());
       match exchange(base, put(base, at, token, digest, iface)) {
         Err(d) -> reported(style, "publish", [d], []),
-        Ok(sent) -> if sent.status == 201 || sent.status == 200 {
+        Ok(publish_packed) -> if publish_packed.status == 201 || publish_packed.status == 200 {
           {
             json: json_of(manifest.name, version, digest, base.url, k.sealed.bytes.len(), held),
             lines: [
@@ -264,7 +266,13 @@ fn uploaded(
           reported(
             style,
             "publish",
-            [interface_refused(manifest.name ++ "` " ++ version, sent.status, said(sent))],
+            [
+              interface_refused(
+                manifest.name ++ "` " ++ version,
+                publish_packed.status,
+                response_message(publish_packed),
+              ),
+            ],
             [],
           )
         },
@@ -273,16 +281,20 @@ fn uploaded(
       reported(
         style,
         "publish",
-        [refused_by("publish `" ++ manifest.name ++ "` " ++ version, answer.status, said(answer))],
+        [
+          refused_by(
+            "publish `" ++ manifest.name ++ "` " ++ version,
+            answer.status,
+            response_message(answer),
+          ),
+        ],
         [],
       )
     },
   }
 }
 
-/// `already`: the registry held this version as these bytes before the publish.
-/// What the registry would not keep beside a version it holds: the version stands either way.
-fn interface_refused(what: String, status: Int, why: String) -> Diag =
+fn interface_refused(what: String, status: Int, why: String) -> Diagnostic =
   error_at(
     b"E0144",
     no_module(),
@@ -316,15 +328,13 @@ fn json_of(
     { key: "semantics", value: Str(semantics::version()) },
   ])
 
-// --- Tests ------------------------------------------------------------------
-
-fn a_library(deps: List<Dep>) -> Manifest =
+fn a_library(dependencies: List<Dependency>) -> Manifest =
   {
     name: "orders",
     version: { major: 0, minor: 2, patch: 0 },
     prefix: None,
     runtime: { major: 0, minor: 16, patch: 0 },
-    dependencies: deps,
+    dependencies: dependencies,
     entry: None,
   }
 

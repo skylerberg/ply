@@ -6,68 +6,78 @@
 //! built after a `match` let go of a subject held once takes the subject's cells, as compiled code
 //! does.
 
-import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NKnown,
-                           NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda,
-                           NSimulate, NParallel, NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat,
-                           CDo, CodeField, CodeArm, CodePattern, PxVar, PxCtor, PxRecord, PxList,
-                           CodePatternField, Capture)
+import compiler.emit.code (Code, CodeLiteral, CodeVar, NDefinition, NConstructor, NBuiltin,
+                           CodeUnary, CodeBinary, CodeApply, CodeKnownLambda, CodeIf, CodeBlock,
+                           CodeList, CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda,
+                           CodeSimulate, CodeParallel, CodeHandle, CodeFieldRead, CodeUpdate,
+                           CodeStatement, CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm,
+                           CodePattern, CodeBindingPattern, CodeConstructorPattern,
+                           CodeRecordPattern, CodeListPattern, CodePatternField, Capture)
 import compiler.emit.moves (Moves, read_moved, capture_moved)
 import compiler.front.published (ClaimClause)
 import compiler.check.infer.checker (Builtin)
-import compiler.syntax.items (SSpace)
-import compiler.syntax.patterns (Lit, LInt, LStr, LBytes, LEmbedded)
-import compiler.check.types (Type, TyCon, TyFn, TyRecord)
-import compiler.check.semantics (Iterates, Handed, Threaded, Taken, Number, Mapped, Kept, Folded,
-                                 Updated, Unstated)
-import context (Context, Def, Moved, ctor, signature, is_recursive, moved_of)
-import cost (Poly, Of, Same, Part, Other, Found, OnTail, OnIndex, zero, constant, size_of, plus,
-             product, at_args, ceiling_of, callees, reachable, params_sized, arithmetic,
-             holding_keyed, descent, descent_calls, kept, is_length, stated, cx_owning, found_by,
-             takes_some, toward, assumed, possible, literal_size, calls_made, iterating_of,
-             by_entry, natives, name_key, dominated_space)
-import domain (Ty, Fn, Con, Record)
+import compiler.syntax.items (SpaceClause)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralString, LiteralBytes,
+                                 LiteralEmbedded)
+import compiler.check.types (Type, NamedType, FunctionType, RecordType)
+import compiler.check.callbacks (CallbackUse, CallbackArgument, Accumulator, ExtractedFrom, Number,
+                                 Mapped, Filtered, Folded, Updated, UnknownReturn)
+import context (Context, Definition, BodyWithMoves, ctor, signature, is_recursive, moved_bodies)
+import cost (Polynomial, ParameterRelation, Same, Part, Other, IndexBound, OnTail, OnIndex, zero,
+             constant, size_of, plus, product, at_args, ceiling_of, callees, reachable,
+             params_sized, arithmetic, holding_keyed, descent, descent_calls, growth_preserved,
+             is_length, stated_cost, context_owning, index_bound_of, takes_some, toward, assumed,
+             possible, literal_size, calls_made, iterating_of, by_entry, natives, name_key,
+             dominated_space)
+import domain (Sort, FunctionSort, NamedSort, RecordSort)
 import std.list
 
-/// Who else holds a value: `Alone`, nothing, nor anything it holds; `Top`, nothing, though what it
-/// holds may be held elsewhere; `Many`, something.
-type Holders = | Alone | Top | Many
+/// Who else holds a value: `Unshared`, nothing, nor anything it holds; `UnsharedTop`, nothing, though what it
+/// holds may be held elsewhere; `Shared`, something.
+type Sharing = | Unshared | UnsharedTop | Shared
 
 /// A local as `cost` reads one, the space one call of it takes where it is a function, who else
 /// holds it, and whether it is a number, which nothing holds.
-type Slot = { size: Option<Poly>, of: Of, fun: Option<Poly>, holders: Holders, number: Bool }
+type Slot = {
+  size: Option<Polynomial>,
+  of: ParameterRelation,
+  fun: Option<Polynomial>,
+  holders: Sharing,
+  number: Bool,
+}
 
 /// Where a path stands: each local, and the constructor a `match` let go of, whose cells the next
 /// one built of it takes.
-type State = { slots: List<Slot>, credit: Option<Bytes> }
+type State = { slots: List<Slot>, reusable_constructor: Option<Bytes> }
 
 /// What walking an expression finds: the state after it; the space it holds on any path, and on
 /// the paths that call back into the definition being read; what it is, as a local is; the local it
 /// reads, where that local goes on holding it; how many calls back one path makes, and the
 /// arguments of each; and for each parameter, numbers aside, that one of those hands a value held by
 /// more than itself alone, the most a call back's value is held by.
-type Walked = {
+type SpaceSummary = {
   state: State,
-  space: Poly,
-  looped: Poly,
-  size: Option<Poly>,
-  of: Of,
-  fun: Option<Poly>,
-  holders: Holders,
+  space: Polynomial,
+  looped: Polynomial,
+  size: Option<Polynomial>,
+  of: ParameterRelation,
+  fun: Option<Polynomial>,
+  holders: Sharing,
   number: Bool,
   read: Option<Int>,
   calls: Int,
-  back: List<List<Of>>,
-  shared: Map<Int, Holders>,
+  back: List<List<ParameterRelation>>,
+  shared: Map<Int, Sharing>,
 }
 
 /// A definition's space and who else holds what it answers, read with each argument held alone and
 /// with each held anywhere.
-type Known = { alone: Result<Spent, String>, anyhow: Result<Spent, String> }
+type KnownSpace = { alone: Result<SpaceUse, String>, anyhow: Result<SpaceUse, String> }
 
-type Spent = { space: Poly, holders: Holders }
+type SpaceUse = { space: Polynomial, holders: Sharing }
 
 /// What a builtin answers: a number, an `Option` of one, or any other value.
-type Answer = | ANumber | AOptionNumber | AValue
+type ResultKind = | NumberResult | OptionNumberResult | ValueResult
 
 /// `own` is the definition being read, `moves` which of its body's reads hand their value on, and
 /// `numbers` which of its parameters are numbers; `known`, what it calls; `answers`, what each builtin
@@ -76,62 +86,63 @@ type Answer = | ANumber | AOptionNumber | AValue
 /// known empty; `found`, where `List::at` answered `Some` on the path; `missed`, where it answers
 /// `None`.
 type Env = {
-  cx: Context,
+  context: Context,
   own: String,
   moves: Moves,
   numbers: List<Bool>,
-  known: Map<String, Known>,
-  answers: Map<String, Answer>,
+  known: Map<String, KnownSpace>,
+  results: Map<String, ResultKind>,
   lambda: Bool,
   tail: Bool,
   empty: Option<Int>,
-  found: List<Found>,
-  missed: Option<Found>,
+  found: List<IndexBound>,
+  missed: Option<IndexBound>,
 }
 
 /// The bound a `space` clause states over `params` parameters and the space names of `spaced`'s,
 /// read from below as a `cost` bound is, where `0` is no space that grows with what a call is given.
-pub fn stated_space(bound: Code, params: Int, spaced: List<Int>) -> Option<Poly> =
+pub fn stated_space(bound: Code, params: Int, spaced: List<Int>) -> Option<Polynomial> =
   match bound.node {
-    NLit(l) -> match l {
-      LInt(k) -> if k == 0 { Some(zero()) } else { stated(bound, params, spaced) },
+    CodeLiteral(l) -> match l {
+      LiteralInt(k) -> if k == 0 { Some(zero()) } else { stated_cost(bound, params, spaced) },
       _ -> None,
     },
-    _ -> stated(bound, params, spaced),
+    _ -> stated_cost(bound, params, spaced),
   }
 
-/// The bound on the space a call of `def` holds, over its parameters' sizes, with each argument held
+/// The bound on the space a call of `definition` holds, over its parameters' sizes, with each argument held
 /// alone; what it reaches is read first, as `steps` reads it.
-pub fn space(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} = {
-  let answers = answers_of_builtins();
-  let reach = reachable(cx, def);
-  let moved = moved_of(cx.claims, reach);
-  let known = iterate(Map::new(), reach.len() + 1, |known: Map<String, Known>| {
+pub fn space(context: Context, definition: String) -> Result<Polynomial, String> / {abort.raise} = {
+  let answers = builtin_result_kinds();
+  let reach = reachable(context, definition);
+  let moved = moved_bodies(context.claims, reach);
+  let known = iterate(Map::new(), reach.len() + 1, |known: Map<String, KnownSpace>| {
     let ready = reach.filter(|n: String|
       !known.contains(n)
-        && callees(cx, n).fold(true, |all: Bool, c: String| all && (c == n || known.contains(c))));
+        && callees(context, n).fold(true, |all: Bool, c: String|
+          all && (c == n || known.contains(c))));
     if ready.len() == 0 { Stop(known) } else {
       Continue(
-        ready.fold(known, |k: Map<String, Known>, n: String|
-          k.insert(n, known_of(cx, answers, moved, n, k))),
+        ready.fold(known, |k: Map<String, KnownSpace>, n: String|
+          k.insert(n, known_of(context, answers, moved, n, k))),
       )
     }
   });
-  match holding_keyed(cx, reach) {
+  match holding_keyed(context, reach) {
     Some(n) ->
       Err(
         "`" ++ n
           ++ "` holds a value compared by its type's `key`, which a comparison calls and no body shows",
       ),
-    None -> match known.get(def) {
-      Some(k) -> match spent_for(k, true) { Ok(s) -> Ok(s.space), Err(why) -> Err(why) },
-      None -> Err("`" ++ def ++ "` reaches definitions that call each other"),
+    None -> match known.get(definition) {
+      Some(k) -> match space_use_for(k, true) { Ok(s) -> Ok(s.space), Err(why) -> Err(why) },
+      None -> Err("`" ++ definition ++ "` reaches definitions that call each other"),
     },
   }
 }
 
 /// What a definition holds for arguments held alone, which what it holds for any also bounds.
-fn spent_for(k: Known, once: Bool) -> Result<Spent, String> =
+fn space_use_for(k: KnownSpace, once: Bool) -> Result<SpaceUse, String> =
   if !once { k.anyhow } else {
     match k.alone {
       Ok(s) -> Ok(s),
@@ -139,40 +150,40 @@ fn spent_for(k: Known, once: Bool) -> Result<Spent, String> =
     }
   }
 
-/// What `def` holds, its body read as the build lowers it where `moved` holds it, else by its
+/// What `definition` holds, its body read as the build lowers it where `moved` holds it, else by its
 /// contract.
 fn known_of(
-  cx: Context,
-  answers: Map<String, Answer>,
-  moved: Map<String, Result<Moved, String>>,
-  def: String,
-  known: Map<String, Known>,
-) -> Known / {abort.raise} =
-  match cx.claims.defs.get(def) {
+  context: Context,
+  answers: Map<String, ResultKind>,
+  moved: Map<String, Result<BodyWithMoves, String>>,
+  definition: String,
+  known: Map<String, KnownSpace>,
+) -> KnownSpace / {abort.raise} =
+  match context.claims.definitions.get(definition) {
     None -> {
-      let why = "`" ++ def ++ "` has no body here to read";
+      let why = "`" ++ definition ++ "` has no body here to read";
       { alone: Err(why), anyhow: Err(why) }
     },
-    Some(d) -> match moved.get(def) {
+    Some(d) -> match moved.get(definition) {
       None ->
         {
-          alone: promised(def, d),
+          alone: promised(definition, d),
           anyhow: Err(
-            "`" ++ def
+            "`" ++ definition
               ++ "` is handed a value something else holds, and its `space` bound is for arguments held alone",
           ),
         },
       Some(Err(why)) -> { alone: Err(why), anyhow: Err(why) },
       Some(Ok(m)) -> {
         let read = |many: List<Int>|
-          held(
-            cx,
+          body_space(
+            context,
             answers,
-            def,
+            definition,
             d,
             m,
             known,
-            many.fold(Map::new(), |m: Map<Int, Holders>, i: Int| m.insert(i, Many)),
+            many.fold(Map::new(), |m: Map<Int, Sharing>, i: Int| m.insert(i, Shared)),
           );
         { alone: read([]), anyhow: read(range(0, d.params)) }
       },
@@ -181,49 +192,52 @@ fn known_of(
 
 /// A definition read by its contract, as another package's is: its first `space` bound read from
 /// above.
-fn promised(def: String, d: Def) -> Result<Spent, String> =
-  match d.spec.filter(|c: ClaimClause| c.kind == SSpace).fold(
+fn promised(definition: String, d: Definition) -> Result<SpaceUse, String> =
+  match d.spec.filter(|c: ClaimClause| c.kind == SpaceClause).fold(
       None,
-      |found: Option<Poly>, c: ClaimClause|
+      |found: Option<Polynomial>, c: ClaimClause|
         match found { Some(_) -> found, None -> ceiling_of(c.clause.code, d.params, d.spaced) },
     ) {
-    Some(p) -> Ok({ space: p, holders: Many }),
+    Some(p) -> Ok({ space: p, holders: Shared }),
     None ->
-      Err("`" ++ def ++ "` has no body here to read, and no `space` bound to read as its space"),
+      Err(
+        "`" ++ definition
+          ++ "` has no body here to read, and no `space` bound to read as its space",
+      ),
   }
 
-/// The space a call of `def` holds, each parameter held alone but those `entry` says are held by
+/// The space a call of `definition` holds, each parameter held alone but those `entry` says are held by
 /// more, a call of a function parameter with a space name holding what that name stands for. A
 /// recursion whose paths that call back hold nothing more, and call back last, holds what the path
 /// that ends does, with no parameter it grows with grown on the way; any other is read as `steps`
 /// reads one.
-fn held(
-  cx: Context,
-  answers: Map<String, Answer>,
-  def: String,
-  d: Def,
-  moved: Moved,
-  known: Map<String, Known>,
-  entry: Map<Int, Holders>,
-) -> Result<Spent, String> / {abort.raise} = {
+fn body_space(
+  context: Context,
+  answers: Map<String, ResultKind>,
+  definition: String,
+  d: Definition,
+  moved: BodyWithMoves,
+  known: Map<String, KnownSpace>,
+  entry: Map<Int, Sharing>,
+) -> Result<SpaceUse, String> / {abort.raise} = {
   let body = moved.body;
   let params = d.params;
-  let sized = params_sized(cx, def, params);
-  let numbers = numbers_of(cx, def, params);
+  let sized = params_sized(context, definition, params);
+  let numbers = numbers_of(context, definition, params);
   let env = {
-    cx: cx,
-    own: def,
+    context: context,
+    own: definition,
     moves: moved.moves,
     numbers: numbers,
     known: known,
-    answers: answers,
+    results: answers,
     lambda: false,
     tail: true,
     empty: None,
     found: [],
     missed: None,
   };
-  let entered = |shared: Map<Int, Holders>|
+  let entered = |shared: Map<Int, Sharing>|
     {
       slots: range(0, params).map(|i: Int| {
         let number = at_or(numbers, i);
@@ -231,18 +245,19 @@ fn held(
           size: if at_or(sized, i) { Some(size_of(i)) } else { None },
           of: Same(i),
           fun: if d.spaced.contains(i) { Some([Map::new().insert(name_key(i), 1)]) } else { None },
-          holders: if number { Alone } else { match shared.get(i) { Some(h) -> h, None -> Alone } },
+          holders: if number { Unshared }
+          else { match shared.get(i) { Some(h) -> h, None -> Unshared } },
           number: number,
         }
       }),
-      credit: None,
+      reusable_constructor: None,
     };
   // A parameter a call back hands a value held by more than itself alone is held so on the calls
   // after the first, so it is read so, until no call back hands one by more.
   let read = iterate(
     { shared: entry, walked: walk(env, entered(entry), body) },
     2 * params + 2,
-    |r: { shared: Map<Int, Holders>, walked: Result<Walked, String> }|
+    |r: { shared: Map<Int, Sharing>, walked: Result<SpaceSummary, String> }|
       match r.walked {
         Err(_) -> Stop(r),
         Ok(w) -> {
@@ -255,13 +270,14 @@ fn held(
   let start = entered(read.shared);
   match read.walked {
     Err(why) -> Err(why),
-    Ok(w) -> if !is_recursive(cx, def) { Ok({ space: w.space, holders: w.holders }) }
-    else if !cx.self_recursive.contains(def) { Err("`" ++ def ++ "` is in a group with others") }
-    else if w.looped == zero() {
-      if kept(w.space, w.back) { Ok({ space: w.space, holders: w.holders }) }
-      else { Err("`" ++ def ++ "` hands on a parameter its space grows with, changed") }
+    Ok(w) -> if !is_recursive(context, definition) { Ok({ space: w.space, holders: w.holders }) }
+    else if !context.self_recursive.contains(definition) {
+      Err("`" ++ definition ++ "` is in a group with others")
+    } else if w.looped == zero() {
+      if growth_preserved(w.space, w.back) { Ok({ space: w.space, holders: w.holders }) }
+      else { Err("`" ++ definition ++ "` hands on a parameter its space grows with, changed") }
     } else {
-      match descent(def, w.calls, w.back, w.space, "space grows") {
+      match descent(definition, w.calls, w.back, w.space, "space grows") {
         Err(why) -> Err(why),
         Ok(None) -> Ok({ space: w.space, holders: w.holders }),
         // As `steps` reads it: a call enters with no element of that list left at most once.
@@ -276,7 +292,8 @@ fn held(
           } {
           Err(why) -> Err(why),
           Ok(e) -> match product(descent_calls(d), w.space) {
-            Ok(chain) -> Ok({ space: plus(chain, e.space), holders: weaker(w.holders, e.holders) }),
+            Ok(chain) ->
+              Ok({ space: plus(chain, e.space), holders: more_shared(w.holders, e.holders) }),
             Err(why) -> Err(why),
           },
         },
@@ -287,24 +304,27 @@ fn held(
 
 // --- Holders and states -------------------------------------------------------------------------
 
-fn weaker(a: Holders, b: Holders) -> Holders =
-  if a == Many || b == Many { Many } else if a == Top || b == Top { Top } else { Alone }
+fn more_shared(a: Sharing, b: Sharing) -> Sharing =
+  if a == Shared || b == Shared { Shared }
+  else if a == UnsharedTop || b == UnsharedTop { UnsharedTop }
+  else { Unshared }
 
 /// A value made of `parts` is held alone where each part is, and else is held once at its top.
-fn made_of(parts: List<Holders>) -> Holders =
-  if parts.fold(true, |all: Bool, h: Holders| all && h == Alone) { Alone } else { Top }
+fn sharing_of_parts(parts: List<Sharing>) -> Sharing =
+  if parts.fold(true, |all: Bool, h: Sharing| all && h == Unshared) { Unshared }
+  else { UnsharedTop }
 
 /// Who else holds what a walk found, a number being held by nothing.
-fn part_of(w: Walked) -> Holders = if w.number { Alone } else { w.holders }
+fn sharing_of(w: SpaceSummary) -> Sharing = if w.number { Unshared } else { w.holders }
 
-fn held_alone(w: Walked) -> Bool = part_of(w) == Alone
+fn is_unshared(w: SpaceSummary) -> Bool = sharing_of(w) == Unshared
 
-fn unknown_slot() -> Slot = { size: None, of: Other, fun: None, holders: Many, number: false }
+fn unknown_slot() -> Slot = { size: None, of: Other, fun: None, holders: Shared, number: false }
 
 fn slot_at(st: State, k: Int) -> Slot =
   match st.slots.at(k) { Some(s) -> s, None -> unknown_slot() }
 
-fn slot_of(w: Walked) -> Slot =
+fn slot_of(w: SpaceSummary) -> Slot =
   { size: w.size, of: w.of, fun: w.fun, holders: w.holders, number: w.number }
 
 fn bind(st: State, k: Int, s: Slot) -> State / {abort.raise} = {
@@ -315,13 +335,13 @@ fn bind(st: State, k: Int, s: Slot) -> State / {abort.raise} = {
 }
 
 /// The state once the local a value was read from goes on holding it beside whatever took it as
-/// `to` says: `Many` where the value is held whole, `Top` where only parts of it are.
-fn retain(st: State, read: Option<Int>, to: Holders) -> State =
+/// `to` says: `Shared` where the value is held whole, `UnsharedTop` where only parts of it are.
+fn retain(st: State, read: Option<Int>, to: Sharing) -> State =
   match read {
     None -> st,
     Some(k) -> match st.slots.at(k) {
       Some(s) -> if s.number { st }
-      else { { ..st, slots: st.slots.set(k, { ..s, holders: weaker(s.holders, to) }) } },
+      else { { ..st, slots: st.slots.set(k, { ..s, holders: more_shared(s.holders, to) }) } },
       None -> st,
     },
   }
@@ -332,15 +352,17 @@ fn merged(a: State, b: State) -> State =
   {
     slots: range(0, max(a.slots.len(), b.slots.len())).map(|i: Int|
       match ((a.slots.at(i), b.slots.at(i))) {
-        (Some(x), Some(y)) -> { ..x, holders: weaker(x.holders, y.holders) },
+        (Some(x), Some(y)) -> { ..x, holders: more_shared(x.holders, y.holders) },
         (Some(x), None) -> x,
         (None, Some(y)) -> y,
         _ -> unknown_slot(),
       }),
-    credit: if a.credit == b.credit { a.credit } else { None },
+    reusable_constructor: if a.reusable_constructor == b.reusable_constructor {
+      a.reusable_constructor
+    } else { None },
   }
 
-fn none(st: State) -> Walked =
+fn none(st: State) -> SpaceSummary =
   {
     state: st,
     space: zero(),
@@ -348,7 +370,7 @@ fn none(st: State) -> Walked =
     size: None,
     of: Other,
     fun: None,
-    holders: Alone,
+    holders: Unshared,
     number: false,
     read: None,
     calls: 0,
@@ -357,16 +379,16 @@ fn none(st: State) -> Walked =
   }
 
 /// Each parameter held by the most either holds it by.
-fn joined(a: Map<Int, Holders>, b: Map<Int, Holders>) -> Map<Int, Holders> =
-  b.fold(a, |acc: Map<Int, Holders>, i: Int, h: Holders|
-    acc.insert(i, match acc.get(i) { Some(g) -> weaker(g, h), None -> h }))
+fn joined(a: Map<Int, Sharing>, b: Map<Int, Sharing>) -> Map<Int, Sharing> =
+  b.fold(a, |acc: Map<Int, Sharing>, i: Int, h: Sharing|
+    acc.insert(i, match acc.get(i) { Some(g) -> more_shared(g, h), None -> h }))
 
 /// `w`, then an object of `p` words made.
-fn made(w: Walked, p: Poly) -> Walked =
+fn allocated(w: SpaceSummary, p: Polynomial) -> SpaceSummary =
   { ..w, space: plus(w.space, p), looped: if w.calls > 0 { plus(w.looped, p) } else { w.looped } }
 
 /// `a`, then `b`: a path that calls back through either holds what the other holds too.
-fn then(a: Walked, b: Walked) -> Walked =
+fn then(a: SpaceSummary, b: SpaceSummary) -> SpaceSummary =
   {
     state: b.state,
     space: plus(a.space, b.space),
@@ -385,7 +407,7 @@ fn then(a: Walked, b: Walked) -> Walked =
   }
 
 /// Either branch.
-fn either(a: Walked, b: Walked) -> Walked =
+fn either(a: SpaceSummary, b: SpaceSummary) -> SpaceSummary =
   {
     state: merged(a.state, b.state),
     space: plus(a.space, b.space),
@@ -393,7 +415,7 @@ fn either(a: Walked, b: Walked) -> Walked =
     size: match ((a.size, b.size)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
     of: Other,
     fun: match ((a.fun, b.fun)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
-    holders: weaker(part_of(a), part_of(b)),
+    holders: more_shared(sharing_of(a), sharing_of(b)),
     number: a.number && b.number,
     read: None,
     calls: max(a.calls, b.calls),
@@ -402,15 +424,15 @@ fn either(a: Walked, b: Walked) -> Walked =
   }
 
 /// A value of `w`'s walk, with nothing of what it is beyond who holds it.
-fn valued(w: Walked, holders: Holders, number: Bool) -> Walked =
+fn as_value(w: SpaceSummary, holders: Sharing, number: Bool) -> SpaceSummary =
   { ..w, size: None, of: Other, fun: None, holders: holders, number: number, read: None }
 
 // --- The walk -----------------------------------------------------------------------------------
 
-fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} =
+fn walk(env: Env, st: State, c: Code) -> Result<SpaceSummary, String> / {abort.raise} =
   match c.node {
-    NLit(l) -> Ok(literal(st, l)),
-    NVar(v) -> {
+    CodeLiteral(l) -> Ok(literal(st, l)),
+    CodeVar(v) -> {
       let s = slot_at(st, v.slot);
       let moved = read_moved(env.moves, c.span) || s.number;
       Ok({
@@ -419,19 +441,19 @@ fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} 
         of: s.of,
         fun: s.fun,
         number: s.number,
-        holders: if moved { s.holders } else { Many },
+        holders: if moved { s.holders } else { Shared },
         read: if moved { None } else { Some(v.slot) },
       })
     },
-    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) ->
-      Ok({ ..none(st), fun: fun_named(env, String::of_bytes_lossy(fname)), holders: Many }),
-    NLabel(_) -> Ok(none(st)),
-    NUnary(u) -> match walk({ ..env, tail: false }, st, u.operand) {
+    NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) ->
+      Ok({ ..none(st), fun: fun_named(env, String::of_bytes_lossy(fname)), holders: Shared }),
+    CodeLabel(_) -> Ok(none(st)),
+    CodeUnary(u) -> match walk({ ..env, tail: false }, st, u.operand) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, of: Other, fun: None, holders: Alone, number: true, read: None }),
+      Ok(w) -> Ok({ ..w, of: Other, fun: None, holders: Unshared, number: true, read: None }),
     },
-    NBinary(b) -> binary(env, st, b.op, b.lhs, b.rhs),
-    NIf(i) -> match walk({ ..env, tail: false }, st, i.cond) {
+    CodeBinary(b) -> binary(env, st, b.op, b.lhs, b.rhs),
+    CodeIf(i) -> match walk({ ..env, tail: false }, st, i.cond) {
       Err(why) -> Err(why),
       Ok(cond) -> {
         let slots = |k: Int| slot_at(st, k).of;
@@ -451,67 +473,70 @@ fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} 
         }
       },
     },
-    NBlock(b) -> block(env, st, b.stmts, b.tail),
-    NList(l) -> match walked_all(env, st, l.items, |_i: Int| Some(Many)) {
+    CodeBlock(b) -> block(env, st, b.statements, b.tail),
+    CodeList(l) -> match walk_all(env, st, l.items, |_i: Int| Some(Shared)) {
       Err(why) -> Err(why),
       Ok(a) ->
         Ok({
-          ..valued(made(a.walked, constant()), made_of(a.all.map(part_of)), false),
+          ..as_value(allocated(a.walked, constant()), sharing_of_parts(a.all.map(sharing_of)), false),
           size: Some(constant()),
         }),
     },
-    NRecord(r) -> match walked_all(env, st, r.fields.map(|f: CodeField| f.value), |_i: Int|
-        Some(Many)) {
+    CodeRecord(r) -> match walk_all(env, st, r.fields.map(|f: CodeField| f.value), |_i: Int|
+        Some(Shared)) {
       Err(why) -> Err(why),
-      Ok(a) -> Ok(valued(made(a.walked, constant()), made_of(a.all.map(part_of)), false)),
+      Ok(a) ->
+        Ok(
+          as_value(allocated(a.walked, constant()), sharing_of_parts(a.all.map(sharing_of)), false),
+        ),
     },
-    NField(f) -> match walk({ ..env, tail: false }, st, f.base) {
+    CodeFieldRead(f) -> match walk({ ..env, tail: false }, st, f.base) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok(valued({ ..w, state: retain(w.state, w.read, Top) }, Many, false)),
+      Ok(w) -> Ok(as_value({ ..w, state: retain(w.state, w.read, UnsharedTop) }, Shared, false)),
     },
     // The written fields are read before the base, as compiled code reads them.
-    NUpdate(u) -> match walked_all(env, st, u.sets.map(|f: CodeField| f.value), |_i: Int|
-        Some(Many)) {
+    CodeUpdate(u) -> match walk_all(env, st, u.sets.map(|f: CodeField| f.value), |_i: Int|
+        Some(Shared)) {
       Err(why) -> Err(why),
       Ok(a) -> match walk({ ..env, tail: false }, a.walked.state, u.base) {
         Err(why) -> Err(why),
         Ok(b) -> {
-          let base = { ..b, state: retain(b.state, b.read, Top) };
+          let base = { ..b, state: retain(b.state, b.read, UnsharedTop) };
           Ok(
-            valued(
-              made(then(a.walked, base), constant()),
-              made_of(a.all.map(part_of).push(part_of(b))),
+            as_value(
+              allocated(then(a.walked, base), constant()),
+              sharing_of_parts(a.all.map(sharing_of).push(sharing_of(b))),
               false,
             ),
           )
         },
       },
     },
-    NMatch(m) -> match walk({ ..env, tail: false }, st, m.scrutinee) {
+    CodeMatch(m) -> match walk({ ..env, tail: false }, st, m.scrutinee) {
       Err(why) -> Err(why),
       Ok(s) -> {
-        let subject = { ..s, state: retain(s.state, s.read, Top) };
-        let at = found_by(|k: Int| slot_at(st, k).of, m.scrutinee);
+        let subject = { ..s, state: retain(s.state, s.read, UnsharedTop) };
+        let at = index_bound_of(|k: Int| slot_at(st, k).of, m.scrutinee);
         match arms(env, subject, m.scrutinee, at, m.arms) {
           Err(why) -> Err(why),
           Ok(a) -> Ok(then(subject, a)),
         }
       },
     },
-    NApp(a) -> application(env, st, a.func, a.args),
-    NKnown(_) -> panic("only the emitter writes a read as a known lambda"),
+    CodeApply(a) -> application(env, st, a.function, a.args),
+    CodeKnownLambda(_) -> panic("only the emitter writes a read as a known lambda"),
     // A raise ends the call; any other operation runs a handler the bound does not read.
-    NPerform(p) -> if p.effect != b"abort" {
+    CodePerform(p) -> if p.effect != b"abort" {
       Err("an operation whose handler the bound does not read")
     } else {
-      match walked_all(env, st, p.args, |_i: Int| Some(Many)) {
+      match walk_all(env, st, p.args, |_i: Int| Some(Shared)) {
         Err(why) -> Err(why),
-        Ok(a) -> Ok(valued(made(a.walked, constant()), Many, false)),
+        Ok(a) -> Ok(as_value(allocated(a.walked, constant()), Shared, false)),
       }
     },
-    NLambda(l) -> {
+    CodeLambda(l) -> {
       let caught = l.captures.fold(st, |s: State, cap: Capture|
-        if capture_moved(env.moves, l.at, cap.src) { s } else { retain(s, Some(cap.src), Many) });
+        if capture_moved(env.moves, l.at, cap.src) { s } else { retain(s, Some(cap.src), Shared) });
       let fun = match lambda_walk(
           env,
           st,
@@ -523,34 +548,34 @@ fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} 
         Ok(w) -> if w.calls > 0 { None } else { Some(w.space) },
         Err(_) -> None,
       };
-      Ok({ ..made(none(caught), constant()), fun: fun, holders: Top })
+      Ok({ ..allocated(none(caught), constant()), fun: fun, holders: UnsharedTop })
     },
-    NSimulate(_) -> Err("a `simulate` region the bound does not read"),
-    NParallel(_) -> Err("a `parallel` block the bound does not read"),
-    NHandle(_) -> Err("a handler the bound does not read"),
+    CodeSimulate(_) -> Err("a `simulate` region the bound does not read"),
+    CodeParallel(_) -> Err("a `parallel` block the bound does not read"),
+    CodeHandle(_) -> Err("a handler the bound does not read"),
   }
 
 /// A literal is a constant, held by the program where it is text.
-fn literal(st: State, l: Lit) -> Walked =
+fn literal(st: State, l: SourceLiteral) -> SpaceSummary =
   match l {
-    LInt(n) -> { ..none(st), size: Some(literal_size(n)), number: true },
-    LStr(_) -> { ..none(st), size: Some(constant()), holders: Many },
-    LBytes(_) -> { ..none(st), size: Some(constant()), holders: Many },
-    LEmbedded(_, _) -> { ..none(st), size: Some(constant()), holders: Many },
+    LiteralInt(n) -> { ..none(st), size: Some(literal_size(n)), number: true },
+    LiteralString(_) -> { ..none(st), size: Some(constant()), holders: Shared },
+    LiteralBytes(_) -> { ..none(st), size: Some(constant()), holders: Shared },
+    LiteralEmbedded(_, _) -> { ..none(st), size: Some(constant()), holders: Shared },
     _ -> { ..none(st), number: true },
   }
 
 /// Each of `cs` walked in turn, a local read and not moved held after as `keeps` says of its place:
 /// once more by what takes it, or not at all.
-fn walked_all(
+fn walk_all(
   env: Env,
   st: State,
   cs: List<Code>,
-  keeps: (Int) -> Option<Holders>,
-) -> Result<{ walked: Walked, all: List<Walked> }, String> / {abort.raise} =
+  keeps: (Int) -> Option<Sharing>,
+) -> Result<{ walked: SpaceSummary, all: List<SpaceSummary> }, String> / {abort.raise} =
   range(0, cs.len()).fold(
     Ok({ walked: none(st), all: [] }),
-    |acc: Result<{ walked: Walked, all: List<Walked> }, String>, i: Int|
+    |acc: Result<{ walked: SpaceSummary, all: List<SpaceSummary> }, String>, i: Int|
       match acc {
         Err(_) -> acc,
         Ok(sofar) -> match cs.at(i) {
@@ -572,7 +597,7 @@ fn binary(
   op: Bytes,
   lhs: Code,
   rhs: Code,
-) -> Result<Walked, String> / {abort.raise} =
+) -> Result<SpaceSummary, String> / {abort.raise} =
   match walk({ ..env, tail: false }, st, lhs) {
     Err(why) -> Err(why),
     Ok(l) -> {
@@ -581,7 +606,7 @@ fn binary(
         Err(why) -> Err(why),
         Ok(r) -> if op == b"concat" { appended(l, r) } else {
           Ok({
-            ..valued(then(l, r), Alone, true),
+            ..as_value(then(l, r), Unshared, true),
             size: arithmetic(op, l.size, r.size),
             of: toward(env.found, op, l.of, rhs, r.of, lhs),
           })
@@ -591,13 +616,13 @@ fn binary(
   }
 
 /// `a ++ b`: in place, where `a` is held once, it grows by what `b` holds; else both are copied.
-fn appended(a: Walked, b: Walked) -> Result<Walked, String> =
-  match if a.holders != Many { b.size }
+fn appended(a: SpaceSummary, b: SpaceSummary) -> Result<SpaceSummary, String> =
+  match if a.holders != Shared { b.size }
     else { match ((a.size, b.size)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None } } {
     None -> Err("an append whose size is not read"),
     Some(p) ->
       Ok({
-        ..valued(made(then(a, { ..b, state: retain(b.state, b.read, Top) }), p), if held_alone(a) && held_alone(b) { Alone } else { Top }, false),
+        ..as_value(allocated(then(a, { ..b, state: retain(b.state, b.read, UnsharedTop) }), p), if is_unshared(a) && is_unshared(b) { Unshared } else { UnsharedTop }, false),
         size: arithmetic(b"concat", a.size, b.size),
       }),
   }
@@ -605,10 +630,10 @@ fn appended(a: Walked, b: Walked) -> Result<Walked, String> =
 fn block(
   env: Env,
   st: State,
-  stmts: List<CodeStmt>,
+  statements: List<CodeStatement>,
   tail: Option<Code>,
-) -> Result<Walked, String> / {abort.raise} =
-  match stmts.fold(Ok(none(st)), |acc: Result<Walked, String>, s: CodeStmt|
+) -> Result<SpaceSummary, String> / {abort.raise} =
+  match statements.fold(Ok(none(st)), |acc: Result<SpaceSummary, String>, s: CodeStatement|
       match acc {
         Err(_) -> acc,
         Ok(sofar) -> match statement({ ..env, tail: false }, sofar.state, s) {
@@ -618,49 +643,64 @@ fn block(
       }) {
     Err(why) -> Err(why),
     Ok(ran) -> match tail {
-      None -> Ok(valued(ran, Alone, true)),
+      None -> Ok(as_value(ran, Unshared, true)),
       Some(t) -> match walk(env, ran.state, t) { Err(why) -> Err(why), Ok(w) -> Ok(then(ran, w)) },
     },
   }
 
-fn statement(env: Env, st: State, s: CodeStmt) -> Result<Walked, String> / {abort.raise} =
+fn statement(
+  env: Env,
+  st: State,
+  s: CodeStatement,
+) -> Result<SpaceSummary, String> / {abort.raise} =
   match s {
-    CDo(d) -> walk(env, st, d.code),
-    CLet(l) -> match walk(env, st, l.value) {
+    CodeDo(d) -> walk(env, st, d.code),
+    CodeLet(l) -> match walk(env, st, l.value) {
       Err(why) -> Err(why),
-      Ok(w) -> Ok({ ..w, state: bind(retain(w.state, w.read, Many), l.slot, slot_of(w)) }),
+      Ok(w) -> Ok({ ..w, state: bind(retain(w.state, w.read, Shared), l.slot, slot_of(w)) }),
     },
-    CLetPat(l) -> match walk(env, st, l.value) {
+    CodeLetDestructure(l) -> match walk(env, st, l.value) {
       Err(why) -> Err(why),
       Ok(w) -> {
         let go = let_go(env, l.value, w);
-        let before = retain(w.state, w.read, Top);
-        let opened = { ..before, credit: credit_after(go, before.credit, l.pat) };
-        Ok(made({ ..w, state: patterned(env, opened, l.pat, w, go) }, rests(l.pat)))
+        let before = retain(w.state, w.read, UnsharedTop);
+        let opened = {
+          ..before,
+          reusable_constructor: credit_after(go, before.reusable_constructor, l.pattern),
+        };
+        Ok(allocated({ ..w, state: patterned(env, opened, l.pattern, w, go) }, rests(l.pattern)))
       },
     },
   }
 
 /// Whether compiled code lets a pattern's subject go once its binders hold its fields: where it is
 /// a local's last read, held once, outside a function value.
-fn let_go(env: Env, subject: Code, w: Walked) -> Bool =
-  !env.lambda && read_moved(env.moves, subject.span) && !w.number && w.holders != Many
-    && (match subject.node { NVar(_) -> true, _ -> false })
+fn let_go(env: Env, subject: Code, w: SpaceSummary) -> Bool =
+  !env.lambda && read_moved(env.moves, subject.span) && !w.number && w.holders != Shared
+    && (match subject.node { CodeVar(_) -> true, _ -> false })
 
 /// The cells a let-go subject leaves for the next constructor of its kind to take, where no other
 /// constructor's wait: a constructor with fields leaves them.
-fn credit_after(go: Bool, credit: Option<Bytes>, pat: CodePattern) -> Option<Bytes> =
-  if !go || credit != None { credit }
-  else { match pat { PxCtor(c) -> if c.args.len() > 0 { Some(c.name) } else { None }, _ -> None } }
+fn credit_after(go: Bool, credit: Option<Bytes>, pattern: CodePattern) -> Option<Bytes> =
+  if !go || credit != None { credit } else {
+    match pattern {
+      CodeConstructorPattern(c) -> if c.args.len() > 0 { Some(c.name) } else { None },
+      _ -> None,
+    }
+  }
 
 /// The objects a pattern makes: a list's rest is one of its own.
-fn rests(pat: CodePattern) -> Poly =
-  match pat {
-    PxList(l) ->
-      l.items.fold(if l.rest == None { zero() } else { constant() }, |acc: Poly, p: CodePattern|
-        plus(acc, rests(p))),
-    PxCtor(c) -> c.args.fold(zero(), |acc: Poly, p: CodePattern| plus(acc, rests(p))),
-    PxRecord(r) -> r.fields.fold(zero(), |acc: Poly, f: CodePatternField| plus(acc, rests(f.pat))),
+fn rests(pattern: CodePattern) -> Polynomial =
+  match pattern {
+    CodeListPattern(l) ->
+      l.items.fold(
+        if l.rest == None { zero() } else { constant() },
+        |acc: Polynomial, p: CodePattern| plus(acc, rests(p)),
+      ),
+    CodeConstructorPattern(c) ->
+      c.args.fold(zero(), |acc: Polynomial, p: CodePattern| plus(acc, rests(p))),
+    CodeRecordPattern(r) ->
+      r.fields.fold(zero(), |acc: Polynomial, f: CodePatternField| plus(acc, rests(f.pattern))),
     _ -> zero(),
   }
 
@@ -669,28 +709,28 @@ fn rests(pat: CodePattern) -> Poly =
 fn patterned(
   env: Env,
   st: State,
-  pat: CodePattern,
-  subject: Walked,
+  pattern: CodePattern,
+  subject: SpaceSummary,
   go: Bool,
 ) -> State / {abort.raise} =
   bound(
     env,
     st,
-    pat,
-    { ..slot_of(subject), holders: if go || subject.number { subject.holders } else { Many } },
-    if go && subject.holders == Alone { Alone } else { Many },
+    pattern,
+    { ..slot_of(subject), holders: if go || subject.number { subject.holders } else { Shared } },
+    if go && subject.holders == Unshared { Unshared } else { Shared },
   )
 
 fn bound(
   env: Env,
   st: State,
-  pat: CodePattern,
+  pattern: CodePattern,
   whole: Slot,
-  parts: Holders,
+  parts: Sharing,
 ) -> State / {abort.raise} =
-  match pat {
-    PxVar(v) -> bind(st, v.slot, whole),
-    PxList(l) -> {
+  match pattern {
+    CodeBindingPattern(v) -> bind(st, v.slot, whole),
+    CodeListPattern(l) -> {
       let heads = l.items.fold(st, |s: State, p: CodePattern|
         bound(env, s, p, part(parts, false), parts));
       match l.rest {
@@ -710,8 +750,8 @@ fn bound(
           ),
       }
     },
-    PxCtor(c) -> {
-      let fields = match ctor(env.cx, String::of_bytes_lossy(c.name)) {
+    CodeConstructorPattern(c) -> {
+      let fields = match ctor(env.context, String::of_bytes_lossy(c.name)) {
         Some(k) -> k.variant.fields,
         None -> [],
       };
@@ -728,19 +768,25 @@ fn bound(
           None -> s,
         })
     },
-    PxRecord(r) ->
+    CodeRecordPattern(r) ->
       r.fields.fold(st, |s: State, f: CodePatternField|
-        bound(env, s, f.pat, part(parts, false), parts)),
+        bound(env, s, f.pattern, part(parts, false), parts)),
     _ -> st,
   }
 
-fn part(parts: Holders, number: Bool) -> Slot =
-  { size: None, of: Other, fun: None, holders: if number { Alone } else { parts }, number: number }
+fn part(parts: Sharing, number: Bool) -> Slot =
+  {
+    size: None,
+    of: Other,
+    fun: None,
+    holders: if number { Unshared } else { parts },
+    number: number,
+  }
 
 /// An arm that takes a head off the list known to be empty is never taken.
-fn needs_head(env: Env, subject: Walked, pat: CodePattern) -> Bool =
-  match ((env.empty, subject.of, pat)) {
-    (Some(p), Same(i), PxList(l)) -> p == i && l.items.len() > 0,
+fn needs_head(env: Env, subject: SpaceSummary, pattern: CodePattern) -> Bool =
+  match ((env.empty, subject.of, pattern)) {
+    (Some(p), Same(i), CodeListPattern(l)) -> p == i && l.items.len() > 0,
     _ -> false,
   }
 
@@ -749,20 +795,20 @@ fn needs_head(env: Env, subject: Walked, pat: CodePattern) -> Bool =
 /// arm only `Some` matches has found an element, and is not taken where it misses.
 fn arms(
   outer: Env,
-  subject: Walked,
+  subject: SpaceSummary,
   scrutinee: Code,
-  at: Option<Found>,
+  at: Option<IndexBound>,
   xs: List<CodeArm>,
-) -> Result<Walked, String> / {abort.raise} =
+) -> Result<SpaceSummary, String> / {abort.raise} =
   match xs.fold(
       Ok({ guards: none(subject.state), taken: None }),
-      |acc: Result<{ guards: Walked, taken: Option<Walked> }, String>, arm: CodeArm|
+      |acc: Result<{ guards: SpaceSummary, taken: Option<SpaceSummary> }, String>, arm: CodeArm|
         match acc {
           Err(_) -> acc,
-          Ok(sofar) -> if needs_head(outer, subject, arm.pat)
-              || (at != None && at == outer.missed && takes_some(arm.pat)) { acc } else {
+          Ok(sofar) -> if needs_head(outer, subject, arm.pattern)
+              || (at != None && at == outer.missed && takes_some(arm.pattern)) { acc } else {
             let env = match at {
-              Some(f) -> if takes_some(arm.pat) { { ..outer, found: outer.found.push(f) } }
+              Some(f) -> if takes_some(arm.pattern) { { ..outer, found: outer.found.push(f) } }
               else { outer },
               None -> outer,
             };
@@ -770,16 +816,19 @@ fn arms(
             let here = sofar.guards.state;
             let start = patterned(
               env,
-              { ..here, credit: credit_after(go, here.credit, arm.pat) },
-              arm.pat,
+              {
+                ..here,
+                reusable_constructor: credit_after(go, here.reusable_constructor, arm.pattern),
+              },
+              arm.pattern,
               subject,
               go,
             );
             match match arm.guard {
-                None -> Ok(made(none(start), rests(arm.pat))),
+                None -> Ok(allocated(none(start), rests(arm.pattern))),
                 Some(g) -> match walk({ ..env, tail: false }, start, g) {
                   Err(why) -> Err(why),
-                  Ok(w) -> Ok(made(w, rests(arm.pat))),
+                  Ok(w) -> Ok(allocated(w, rests(arm.pattern))),
                 },
               } {
               Err(why) -> Err(why),
@@ -807,34 +856,33 @@ fn arms(
 fn application(
   env: Env,
   st: State,
-  func: Code,
+  function: Code,
   args: List<Code>,
-) -> Result<Walked, String> / {abort.raise} =
-  match func.node {
-    NVar(f) -> {
+) -> Result<SpaceSummary, String> / {abort.raise} =
+  match function.node {
+    CodeVar(f) -> {
       let k = f.slot;
-      match walked_all(env, st, args, |_i: Int| Some(Many)) {
+      match walk_all(env, st, args, |_i: Int| Some(Shared)) {
         Err(why) -> Err(why),
         Ok(a) -> match slot_at(a.walked.state, k).fun {
-          Some(p) -> Ok(valued(made(a.walked, p), Many, false)),
+          Some(p) -> Ok(as_value(allocated(a.walked, p), Shared, false)),
           None -> Err("a call of a function value whose space is not read"),
         },
       }
     },
-    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+    NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
       let name = String::of_bytes_lossy(fname);
       if name == env.own { called_back(env, st, args) }
-      else if ctor(env.cx, name) != None { built(env, st, fname, args) }
-      else if env.cx.claims.defs.contains(name) && !by_entry(env.cx, name, SSpace) {
-        called(env, st, name, args)
-      } else {
+      else if ctor(env.context, name) != None { built(env, st, fname, args) }
+      else if env.context.claims.definitions.contains(name)
+          && !by_entry(env.context, name, SpaceClause) { called(env, st, name, args) } else {
         match iterating_of(fname) {
           Some(it) -> iterating(env, st, name, it, args),
           None -> builtin(env, st, name, args),
         }
       }
     },
-    NLambda(l) -> match walked_all(env, st, args, |_i: Int| Some(Many)) {
+    CodeLambda(l) -> match walk_all(env, st, args, |_i: Int| Some(Shared)) {
       Err(why) -> Err(why),
       Ok(a) -> match lambda_walk(
           env,
@@ -842,11 +890,12 @@ fn application(
           l.params,
           l.captures,
           l.body,
-          a.all.map(|w: Walked| { ..slot_of(w), of: Other, holders: part_of(w) }),
+          a.all.map(|w: SpaceSummary| { ..slot_of(w), of: Other, holders: sharing_of(w) }),
         ) {
         Err(why) -> Err(why),
-        Ok(w) -> if w.calls > 0 { Err("a call back inside a function value") }
-        else { Ok(valued(made(a.walked, plus(constant(), w.space)), part_of(w), w.number)) },
+        Ok(w) -> if w.calls > 0 { Err("a call back inside a function value") } else {
+          Ok(as_value(allocated(a.walked, plus(constant(), w.space)), sharing_of(w), w.number))
+        },
       },
     },
     _ -> Err("a call of a computed function the bound does not read"),
@@ -854,17 +903,21 @@ fn application(
 
 /// A call back into the definition being read: a frame of its own unless it is a tail call, which
 /// compiled code makes a jump.
-fn called_back(env: Env, st: State, args: List<Code>) -> Result<Walked, String> / {abort.raise} =
+fn called_back(
+  env: Env,
+  st: State,
+  args: List<Code>,
+) -> Result<SpaceSummary, String> / {abort.raise} =
   if env.lambda { Err("a call back inside a function value") } else {
-    match walked_all(env, st, args, |_i: Int| Some(Many)) {
+    match walk_all(env, st, args, |_i: Int| Some(Shared)) {
       Err(why) -> Err(why),
       Ok(a) -> {
         let frame = if env.tail { zero() } else { constant() };
-        let shared = range(0, a.all.len()).fold(Map::new(), |m: Map<Int, Holders>, i: Int|
+        let shared = range(0, a.all.len()).fold(Map::new(), |m: Map<Int, Sharing>, i: Int|
           if at_or(env.numbers, i) { m } else {
             match a.all.at(i) {
-              Some(w) -> if held_alone(w) { m } else { m.insert(i, part_of(w)) },
-              None -> m.insert(i, Many),
+              Some(w) -> if is_unshared(w) { m } else { m.insert(i, sharing_of(w)) },
+              None -> m.insert(i, Shared),
             }
           });
         Ok(
@@ -872,9 +925,9 @@ fn called_back(env: Env, st: State, args: List<Code>) -> Result<Walked, String> 
             ..none(a.walked.state),
             space: frame,
             looped: frame,
-            holders: Many,
+            holders: Shared,
             calls: 1,
-            back: [a.all.map(|w: Walked| w.of)],
+            back: [a.all.map(|w: SpaceSummary| w.of)],
             shared: shared,
           }),
         )
@@ -888,19 +941,19 @@ fn built(
   st: State,
   name: Bytes,
   args: List<Code>,
-) -> Result<Walked, String> / {abort.raise} =
-  match walked_all(env, st, args, |_i: Int| Some(Many)) {
+) -> Result<SpaceSummary, String> / {abort.raise} =
+  match walk_all(env, st, args, |_i: Int| Some(Shared)) {
     Err(why) -> Err(why),
     Ok(a) -> {
       let now = a.walked.state;
-      let reused = args.len() > 0 && now.credit == Some(name);
+      let reused = args.len() > 0 && now.reusable_constructor == Some(name);
       Ok(
-        valued(
-          made(
-            { ..a.walked, state: if reused { { ..now, credit: None } } else { now } },
+        as_value(
+          allocated(
+            { ..a.walked, state: if reused { { ..now, reusable_constructor: None } } else { now } },
             if args.len() == 0 || reused { zero() } else { constant() },
           ),
-          made_of(a.all.map(part_of)),
+          sharing_of_parts(a.all.map(sharing_of)),
           false,
         ),
       )
@@ -914,29 +967,35 @@ fn called(
   st: State,
   name: String,
   args: List<Code>,
-) -> Result<Walked, String> / {abort.raise} = {
-  let numbers = numbers_of(env.cx, name, args.len());
-  let functions = functions_of(env.cx, name, args.len());
-  let numeric = answers_number(env.cx, name);
-  match walked_all(env, st, args, |_i: Int| if numeric { None } else { Some(Many) }) {
+) -> Result<SpaceSummary, String> / {abort.raise} = {
+  let numbers = numbers_of(env.context, name, args.len());
+  let functions = functions_of(env.context, name, args.len());
+  let numeric = returns_number(env.context, name);
+  match walk_all(env, st, args, |_i: Int| if numeric { None } else { Some(Shared) }) {
     Err(why) -> Err(why),
     Ok(a) -> {
       let alone_all = range(0, a.all.len()).fold(true, |ok: Bool, i: Int|
         ok
           && (at_or(numbers, i) || at_or(functions, i)
-          || (match a.all.at(i) { Some(w) -> held_alone(w), None -> false })));
+          || (match a.all.at(i) { Some(w) -> is_unshared(w), None -> false })));
       match env.known.get(name) {
         None -> Err("`" ++ name ++ "` reaches definitions that call each other"),
-        Some(k) -> match spent_for(k, alone_all) {
+        Some(k) -> match space_use_for(k, alone_all) {
           Err(why) -> Err(why),
           Ok(s) -> match at_args(
               s.space,
-              a.all.map(|w: Walked| w.size),
-              a.all.map(|w: Walked| w.fun),
+              a.all.map(|w: SpaceSummary| w.size),
+              a.all.map(|w: SpaceSummary| w.fun),
             ) {
             Err(why) -> Err(why),
             Ok(q) ->
-              Ok(valued(made(a.walked, q), if numeric { Alone } else { s.holders }, numeric)),
+              Ok(
+                as_value(
+                  allocated(a.walked, q),
+                  if numeric { Unshared } else { s.holders },
+                  numeric,
+                ),
+              ),
           },
         },
       }
@@ -945,21 +1004,21 @@ fn called(
 }
 
 /// The argument a function its entry describes threads through the function it is handed.
-fn threaded(it: Iterates) -> Option<Int> =
-  it.params.fold(None, |found: Option<Int>, h: Handed|
-    match h { Threaded(k) -> Some(k), _ -> found })
+fn threaded(it: CallbackUse) -> Option<Int> =
+  it.params.fold(None, |found: Option<Int>, h: CallbackArgument|
+    match h { Accumulator(k) -> Some(k), _ -> found })
 
 /// What the function an entry describes hands each parameter of the function it is handed, the
 /// accumulator aside.
-fn handed_slots(it: Iterates, all: List<Walked>, st: State) -> List<Slot> = {
+fn handed_slots(it: CallbackUse, all: List<SpaceSummary>, st: State) -> List<Slot> = {
   let arg = |i: Int| match all.at(i) { Some(w) -> w, None -> none(st) };
-  it.params.map(|h: Handed|
+  it.params.map(|h: CallbackArgument|
     match h {
       Number -> number_slot(),
-      Taken(k) ->
+      ExtractedFrom(k) ->
         {
           ..unknown_slot(),
-          holders: if !arg(k).number && arg(k).holders == Alone { Alone } else { Many },
+          holders: if !arg(k).number && arg(k).holders == Unshared { Unshared } else { Shared },
         },
       _ -> unknown_slot(),
     })
@@ -970,22 +1029,22 @@ fn handed_slots(it: Iterates, all: List<Walked>, st: State) -> List<Slot> = {
 fn threaded_calls(
   env: Env,
   st: State,
-  all: List<Walked>,
+  all: List<SpaceSummary>,
   args: List<Code>,
-  it: Iterates,
+  it: CallbackUse,
   slots: List<Slot>,
   k: Int,
-) -> Result<{ first: { space: Poly, holders: Holders, number: Bool }, rest: { space: Poly, holders: Holders, number: Bool } }, String> / {abort.raise} = {
+) -> Result<{ first: { space: Polynomial, holders: Sharing, number: Bool }, rest: { space: Polynomial, holders: Sharing, number: Bool } }, String> / {abort.raise} = {
   let seed = match all.at(k) { Some(w) -> w, None -> none(st) };
   let handing = |acc: Slot|
     range(0, it.params.len()).map(|j: Int|
-      match it.params.get(j) { Threaded(_) -> acc, _ -> slots.get(j) });
+      match it.params.get(j) { Accumulator(_) -> acc, _ -> slots.get(j) });
   match callback(
       env,
       st,
       args,
       it.callback,
-      handing({ ..slot_of(seed), of: Other, holders: part_of(seed) }),
+      handing({ ..slot_of(seed), of: Other, holders: sharing_of(seed) }),
     ) {
     Err(why) -> Err(why),
     Ok(first) -> match steadied(
@@ -1006,8 +1065,8 @@ fn threaded_calls(
 
 /// The space one call of a definition or constructor named as a value holds, handed values held
 /// anywhere, where it grows with nothing it is given.
-fn fun_named(env: Env, name: String) -> Option<Poly> =
-  if ctor(env.cx, name) != None { Some(constant()) } else {
+fn fun_named(env: Env, name: String) -> Option<Polynomial> =
+  if ctor(env.context, name) != None { Some(constant()) } else {
     match env.known.get(name) {
       Some(k) -> match k.anyhow {
         Ok(s) -> match at_args(s.space, [], []) { Ok(q) -> Some(q), Err(_) -> None },
@@ -1025,12 +1084,14 @@ fn lambda_walk(
   captures: List<Capture>,
   body: Code,
   slots: List<Slot>,
-) -> Result<Walked, String> / {abort.raise} = {
-  let start = range(0, params).fold({ slots: [], credit: None }, |s: State, i: Int|
-    bind(s, i, match slots.at(i) { Some(x) -> x, None -> unknown_slot() }));
+) -> Result<SpaceSummary, String> / {abort.raise} = {
+  let start = range(0, params).fold(
+    { slots: [], reusable_constructor: None },
+    |s: State, i: Int| bind(s, i, match slots.at(i) { Some(x) -> x, None -> unknown_slot() }),
+  );
   let captured = captures.fold(start, |s: State, cap: Capture| {
     let from = slot_at(outer, cap.src);
-    bind(s, cap.dst, { ..from, holders: if from.number { Alone } else { Many } })
+    bind(s, cap.destination, { ..from, holders: if from.number { Unshared } else { Shared } })
   });
   walk({ ..env, lambda: true, tail: false, empty: None, missed: None }, captured, body)
 }
@@ -1038,24 +1099,25 @@ fn lambda_walk(
 // --- Builtins -----------------------------------------------------------------------------------
 
 /// What each native answers, by the name a call reaches it by.
-fn answers_of_builtins() -> Map<String, Answer> / {abort.raise} =
-  natives().fold(Map::new(), |m: Map<String, Answer>, b: Builtin|
+fn builtin_result_kinds() -> Map<String, ResultKind> / {abort.raise} =
+  natives().fold(Map::new(), |m: Map<String, ResultKind>, b: Builtin|
     m.insert(String::of_bytes_lossy(b.name), match b.scheme.ty {
-      TyFn(f) -> answer_of(f.ret),
-      other -> answer_of(other),
+      FunctionType(f) -> result_kind_of(f.ret),
+      other -> result_kind_of(other),
     }))
 
-fn answer_of(t: Type) -> Answer =
+fn result_kind_of(t: Type) -> ResultKind =
   match t {
-    TyCon(c) -> if c.args.len() == 0 && is_number_name(String::of_bytes_lossy(c.name)) { ANumber }
-    else if c.name == b"Option" && c.args.len() == 1 {
+    NamedType(c) -> if c.args.len() == 0 && is_number_name(String::of_bytes_lossy(c.name)) {
+      NumberResult
+    } else if c.name == b"Option" && c.args.len() == 1 {
       match c.args.at(0) {
-        Some(x) -> if answer_of(x) == ANumber { AOptionNumber } else { AValue },
-        None -> AValue,
+        Some(x) -> if result_kind_of(x) == NumberResult { OptionNumberResult } else { ValueResult },
+        None -> ValueResult,
       }
-    } else { AValue },
-    TyRecord(fs) -> if fs.len() == 0 { ANumber } else { AValue },
-    _ -> AValue,
+    } else { ValueResult },
+    RecordType(fs) -> if fs.len() == 0 { NumberResult } else { ValueResult },
+    _ -> ValueResult,
   }
 
 fn is_number_name(n: String) -> Bool =
@@ -1081,34 +1143,37 @@ fn is_number_name(n: String) -> Bool =
     n,
   )
 
-fn is_number(t: Ty) -> Bool =
+fn is_number(t: Sort) -> Bool =
   match t {
-    Con(n, args) -> args.len() == 0 && is_number_name(n),
-    Record(fs) -> fs.len() == 0,
+    NamedSort(n, args) -> args.len() == 0 && is_number_name(n),
+    RecordSort(fs) -> fs.len() == 0,
     _ -> false,
   }
 
-/// Which of `def`'s first `n` parameters are numbers, by its signature.
-fn numbers_of(cx: Context, def: String, n: Int) -> List<Bool> = params_are(cx, def, n, is_number)
+/// Which of `definition`'s first `n` parameters are numbers, by its signature.
+fn numbers_of(context: Context, definition: String, n: Int) -> List<Bool> =
+  params_are(context, definition, n, is_number)
 
-/// Which of `def`'s first `n` parameters are functions, by its signature: no call takes a function
+/// Which of `definition`'s first `n` parameters are functions, by its signature: no call takes a function
 /// in place, so who else holds one changes nothing a call does with it.
-fn functions_of(cx: Context, def: String, n: Int) -> List<Bool> =
-  params_are(cx, def, n, |t: Ty| match t { Fn(_, _, _) -> true, _ -> false })
+fn functions_of(context: Context, definition: String, n: Int) -> List<Bool> =
+  params_are(context, definition, n, |t: Sort|
+    match t { FunctionSort(_, _, _) -> true, _ -> false })
 
-/// Which of `def`'s first `n` parameters `is` holds of, by its signature.
-fn params_are(cx: Context, def: String, n: Int, is: (Ty) -> Bool) -> List<Bool> =
-  match signature(cx, def) {
+/// Which of `definition`'s first `n` parameters `is` holds of, by its signature.
+fn params_are(context: Context, definition: String, n: Int, is: (Sort) -> Bool) -> List<Bool> =
+  match signature(context, definition) {
     Some(s) -> match s.ty {
-      Fn(ps, _, _) -> range(0, n).map(|i: Int| match ps.at(i) { Some(t) -> is(t), None -> false }),
+      FunctionSort(ps, _, _) ->
+        range(0, n).map(|i: Int| match ps.at(i) { Some(t) -> is(t), None -> false }),
       _ -> range(0, n).map(|_i: Int| false),
     },
     None -> range(0, n).map(|_i: Int| false),
   }
 
-fn answers_number(cx: Context, def: String) -> Bool =
-  match signature(cx, def) {
-    Some(s) -> match s.ty { Fn(_, ret, _) -> is_number(ret), other -> is_number(other) },
+fn returns_number(context: Context, definition: String) -> Bool =
+  match signature(context, definition) {
+    Some(s) -> match s.ty { FunctionSort(_, ret, _) -> is_number(ret), other -> is_number(other) },
     None -> false,
   }
 
@@ -1146,39 +1211,43 @@ fn reads_parts(name: String) -> Bool =
 
 /// How an argument a builtin reads without moving is held after the call: not at all where the
 /// answer holds nothing of it, by parts where the answer shares them, and else whole.
-fn kept_by(name: String, answer: Answer, i: Int) -> Option<Holders> =
-  if answer != AValue || name == "Bytes::concat" || name == "String::concat"
+fn kept_by(name: String, answer: ResultKind, i: Int) -> Option<Sharing> =
+  if answer != ValueResult || name == "Bytes::concat" || name == "String::concat"
       || name == "Bytes::slice"
       || name == "String::slice" { None }
   else if i == 0 && updates(name) { None }
-  else if i == 0 && reads_parts(name) { Some(Top) }
-  else { Some(Many) }
+  else if i == 0 && reads_parts(name) { Some(UnsharedTop) }
+  else { Some(Shared) }
 
 fn builtin(
   env: Env,
   st: State,
   name: String,
   args: List<Code>,
-) -> Result<Walked, String> / {abort.raise} =
-  match env.answers.get(name) {
+) -> Result<SpaceSummary, String> / {abort.raise} =
+  match env.results.get(name) {
     None -> Err("`" ++ name ++ "` has no body here to read"),
-    Some(answer) -> match walked_all(env, st, args, |i: Int| kept_by(name, answer, i)) {
+    Some(answer) -> match walk_all(env, st, args, |i: Int| kept_by(name, answer, i)) {
       Err(why) -> Err(why),
       Ok(a) -> match contained_by(name, answer, a.walked.state, a.all) {
         Err(why) -> Err(why),
-        Ok(m) -> Ok({ ..valued(made(a.walked, m.space), m.holders, m.number), size: m.size }),
+        Ok(m) ->
+          Ok({ ..as_value(allocated(a.walked, m.space), m.holders, m.number), size: m.size }),
       },
     },
   }
 
 /// What a builtin's own call makes, who else holds its answer, and the answer's size.
-type Made = { space: Poly, holders: Holders, number: Bool, size: Option<Poly> }
+type Allocation = { space: Polynomial, holders: Sharing, number: Bool, size: Option<Polynomial> }
 
-fn object(space: Poly, holders: Holders, size: Option<Poly>) -> Result<Made, String> =
-  Ok({ space: space, holders: holders, number: false, size: size })
+fn object(
+  space: Polynomial,
+  holders: Sharing,
+  size: Option<Polynomial>,
+) -> Result<Allocation, String> = Ok({ space: space, holders: holders, number: false, size: size })
 
 /// `s` and `extra`, where the size `s` is read.
-fn over(name: String, s: Option<Poly>, extra: Poly) -> Result<Poly, String> =
+fn over(name: String, s: Option<Polynomial>, extra: Polynomial) -> Result<Polynomial, String> =
   match s {
     Some(p) -> Ok(plus(p, extra)),
     None -> Err("`" ++ name ++ "` over a value whose size is not read"),
@@ -1188,18 +1257,27 @@ fn over(name: String, s: Option<Poly>, extra: Poly) -> Result<Poly, String> =
 /// it too.
 fn updated(
   name: String,
-  first: Walked,
-  extra: Poly,
-  parts: Holders,
-  size: Option<Poly>,
-) -> Result<Made, String> =
-  if !first.number && first.holders != Many { object(extra, made_of([first.holders, parts]), size) }
-  else {
-    match over(name, first.size, extra) { Ok(p) -> object(p, Top, size), Err(why) -> Err(why) }
+  first: SpaceSummary,
+  extra: Polynomial,
+  parts: Sharing,
+  size: Option<Polynomial>,
+) -> Result<Allocation, String> =
+  if !first.number && first.holders != Shared {
+    object(extra, sharing_of_parts([first.holders, parts]), size)
+  } else {
+    match over(name, first.size, extra) {
+      Ok(p) -> object(p, UnsharedTop, size),
+      Err(why) -> Err(why),
+    }
   }
 
 /// A new value as large as the first argument, and `extra` beside.
-fn as_large(name: String, first: Walked, extra: Poly, holders: Holders) -> Result<Made, String> =
+fn as_large(
+  name: String,
+  first: SpaceSummary,
+  extra: Polynomial,
+  holders: Sharing,
+) -> Result<Allocation, String> =
   match over(name, first.size, extra) {
     Ok(p) -> object(p, holders, first.size),
     Err(why) -> Err(why),
@@ -1210,10 +1288,10 @@ fn iterated(
   env: Env,
   st: State,
   args: List<Code>,
-  times: Option<Poly>,
+  times: Option<Polynomial>,
   position: Int,
   params: List<Slot>,
-) -> Result<Poly, String> / {abort.raise} =
+) -> Result<Polynomial, String> / {abort.raise} =
   match times {
     None -> Err("an iteration over a value whose size is not read"),
     Some(n) -> match callback(env, st, args, position, params) {
@@ -1222,7 +1300,7 @@ fn iterated(
     },
   }
 
-fn number_slot() -> Slot = { ..unknown_slot(), holders: Alone, number: true }
+fn number_slot() -> Slot = { ..unknown_slot(), holders: Unshared, number: true }
 
 /// A call of a function its entry says calls the function it is handed: what the call makes once its
 /// arguments are walked, that function called as many times as their sizes allow.
@@ -1230,41 +1308,42 @@ fn iterating(
   env: Env,
   st: State,
   name: String,
-  it: Iterates,
+  it: CallbackUse,
   args: List<Code>,
-) -> Result<Walked, String> / {abort.raise} = {
-  let numeric = match env.answers.get(name) {
-    Some(a) -> a != AValue,
-    None -> answers_number(env.cx, name),
+) -> Result<SpaceSummary, String> / {abort.raise} = {
+  let numeric = match env.results.get(name) {
+    Some(a) -> a != ValueResult,
+    None -> returns_number(env.context, name),
   };
-  let holds = it.answer == Mapped || it.answer == Kept || it.answer == Folded;
+  let holds = it.result == Mapped || it.result == Filtered || it.result == Folded;
   let keeps = |i: Int|
-    if numeric || it.answer == Updated(i) { None }
-    else if holds && it.over.at(0) == Some(i) { Some(Top) }
-    else { Some(Many) };
-  match walked_all(env, st, args, keeps) {
+    if numeric || it.result == Updated(i) { None }
+    else if holds && it.over.at(0) == Some(i) { Some(UnsharedTop) }
+    else { Some(Shared) };
+  match walk_all(env, st, args, keeps) {
     Err(why) -> Err(why),
     Ok(a) -> {
       let now = a.walked.state;
       let arg = |i: Int| match a.all.at(i) { Some(w) -> w, None -> none(now) };
       let slots = handed_slots(it, a.all, now);
-      let m = match it.answer {
+      let m = match it.result {
         Folded -> folded(env, now, a.all, args, it, slots),
         answer -> match iterated(
             env,
             now,
             args,
-            calls_made(it, a.all.map(|w: Walked| w.size)),
+            calls_made(it, a.all.map(|w: SpaceSummary| w.size)),
             it.callback,
             slots,
           ) {
           Err(why) -> Err(why),
           Ok(p) -> match answer {
-            Updated(k) -> updated(name, arg(k), plus(constant(), p), Top, arg(k).size),
-            Unstated -> if numeric { Ok({ space: p, holders: Alone, number: true, size: None }) }
-            else { object(plus(constant(), p), Many, None) },
+            Updated(k) -> updated(name, arg(k), plus(constant(), p), UnsharedTop, arg(k).size),
+            UnknownReturn -> if numeric {
+              Ok({ space: p, holders: Unshared, number: true, size: None })
+            } else { object(plus(constant(), p), Shared, None) },
             _ -> match it.over.at(0) {
-              Some(k) -> as_large(name, arg(k), p, Top),
+              Some(k) -> as_large(name, arg(k), p, UnsharedTop),
               None -> Err("`" ++ name ++ "` walks nothing"),
             },
           },
@@ -1272,7 +1351,8 @@ fn iterating(
       };
       match m {
         Err(why) -> Err(why),
-        Ok(x) -> Ok({ ..valued(made(a.walked, x.space), x.holders, x.number), size: x.size }),
+        Ok(x) ->
+          Ok({ ..as_value(allocated(a.walked, x.space), x.holders, x.number), size: x.size }),
       }
     },
   }
@@ -1281,29 +1361,35 @@ fn iterating(
 /// A builtin over a container or answering a number: what it makes and how it holds its parts.
 fn contained_by(
   name: String,
-  answer: Answer,
+  answer: ResultKind,
   st: State,
-  all: List<Walked>,
-) -> Result<Made, String> = {
+  all: List<SpaceSummary>,
+) -> Result<Allocation, String> = {
   let arg = |i: Int| match all.at(i) { Some(w) -> w, None -> none(st) };
   let grown = match arg(0).size { Some(s) -> Some(plus(s, constant())), None -> None };
-  if answer == ANumber {
+  if answer == NumberResult {
     Ok({
       space: zero(),
-      holders: Alone,
+      holders: Unshared,
       number: true,
       size: if is_length(name) { arg(0).size } else { None },
     })
-  } else if answer == AOptionNumber { object(constant(), Alone, None) }
-  else if name == "List::push" { updated(name, arg(0), constant(), part_of(arg(1)), grown) }
+  } else if answer == OptionNumberResult { object(constant(), Unshared, None) }
+  else if name == "List::push" { updated(name, arg(0), constant(), sharing_of(arg(1)), grown) }
   else if name == "Map::insert" {
-    updated(name, arg(0), constant(), made_of([part_of(arg(1)), part_of(arg(2))]), grown)
+    updated(
+      name,
+      arg(0),
+      constant(),
+      sharing_of_parts([sharing_of(arg(1)), sharing_of(arg(2))]),
+      grown,
+    )
   } else if name == "List::set" || name == "Array::set" || name == "Columns::set" {
-    updated(name, arg(0), zero(), part_of(arg(2)), arg(0).size)
-  } else if name == "Map::remove" { updated(name, arg(0), constant(), Alone, arg(0).size) }
+    updated(name, arg(0), zero(), sharing_of(arg(2)), arg(0).size)
+  } else if name == "Map::remove" { updated(name, arg(0), constant(), Unshared, arg(0).size) }
   else if name == "Map::pop_first" || name == "Map::pop_last" {
-    updated(name, arg(0), constant(), Top, None)
-  } else if name == "Map::split" { as_large(name, arg(0), constant(), Top) }
+    updated(name, arg(0), constant(), UnsharedTop, None)
+  } else if name == "Map::split" { as_large(name, arg(0), constant(), UnsharedTop) }
   else if name == "Bytes::concat" || name == "String::concat" {
     match appended(arg(0), arg(1)) {
       Err(why) -> Err(why),
@@ -1311,22 +1397,22 @@ fn contained_by(
     }
   } else if name == "range" {
     match ((arg(0).size, arg(1).size)) {
-      (Some(lo), Some(hi)) -> object(plus(lo, hi), Alone, Some(plus(lo, hi))),
+      (Some(lo), Some(hi)) -> object(plus(lo, hi), Unshared, Some(plus(lo, hi))),
       _ -> Err("`range` over a value whose size is not read"),
     }
-  } else if name == "Map::new" { object(constant(), Alone, Some(constant())) }
+  } else if name == "Map::new" { object(constant(), Unshared, Some(constant())) }
   else if name == "Array::new" || name == "Columns::new" {
-    as_large(name, arg(0), zero(), made_of([part_of(arg(1))]))
+    as_large(name, arg(0), zero(), sharing_of_parts([sharing_of(arg(1))]))
   } else if name == "Array::of_list" || name == "Array::to_list" || name == "Columns::of_list"
       || name == "Columns::to_list"
       || name == "Map::keys"
       || name == "Map::values"
       || name == "Map::entries"
       || name == "Map::of_entries"
-      || name == "Map::range" { as_large(name, arg(0), constant(), Top) }
+      || name == "Map::range" { as_large(name, arg(0), constant(), UnsharedTop) }
   else if name == "Map::merge" {
     match ((arg(0).size, arg(1).size)) {
-      (Some(x), Some(y)) -> object(plus(plus(x, y), constant()), Top, Some(plus(x, y))),
+      (Some(x), Some(y)) -> object(plus(plus(x, y), constant()), UnsharedTop, Some(plus(x, y))),
       _ -> Err("`Map::merge` over a value whose size is not read"),
     }
   } else if name == "List::at" || name == "Array::at" || name == "Columns::at" || name == "Map::get"
@@ -1340,50 +1426,50 @@ fn contained_by(
       || name == "checked_sub"
       || name == "checked_mul"
       || name == "checked_neg"
-      || name == "Columns::get" { object(constant(), Top, None) }
-  else if name == "Array::get" { object(zero(), Many, None) }
+      || name == "Columns::get" { object(constant(), UnsharedTop, None) }
+  else if name == "Array::get" { object(zero(), Shared, None) }
   else { valued_by(name, st, all) }
 }
 
 /// A builtin over text, bytes or numbers: what it makes and how it holds its parts.
-fn valued_by(name: String, st: State, all: List<Walked>) -> Result<Made, String> = {
+fn valued_by(name: String, st: State, all: List<SpaceSummary>) -> Result<Allocation, String> = {
   let arg = |i: Int| match all.at(i) { Some(w) -> w, None -> none(st) };
   if name == "String::chars" || name == "String::of_chars" || name == "String::trim"
       || name == "Bytes::of_string"
       || name == "String::of_bytes"
       || name == "String::of_bytes_lossy"
-      || name == "String::slice" { as_large(name, arg(0), constant(), Alone) }
+      || name == "String::slice" { as_large(name, arg(0), constant(), Unshared) }
   else if name == "String::split" || name == "Bytes::split" {
     match over(name, arg(0).size, constant()) {
-      Ok(p) -> object(p, Alone, Some(p)),
+      Ok(p) -> object(p, Unshared, Some(p)),
       Err(why) -> Err(why),
     }
   } else if name == "Bytes::slice" {
     // A view of what it slices, or a short copy; either is copied to grow.
-    object(constant(), Many, arg(0).size)
+    object(constant(), Shared, arg(0).size)
   } else if name == "Int::to_string" || name == "Float::to_string" || name == "Decimal::to_string"
       || name == "U128::to_string"
       || name == "I128::to_string"
       || name == "Bytes::blake3"
-      || name == "digest" { object(constant(), Alone, Some(constant())) }
-  else if name == "byte_of_int" { object(zero(), Many, Some(constant())) }
+      || name == "digest" { object(constant(), Unshared, Some(constant())) }
+  else if name == "byte_of_int" { object(zero(), Shared, Some(constant())) }
   else if name == "min" || name == "max" {
     Ok({
       space: zero(),
-      holders: weaker(part_of(arg(0)), part_of(arg(1))),
+      holders: more_shared(sharing_of(arg(0)), sharing_of(arg(1))),
       number: arg(0).number && arg(1).number,
       size: None,
     })
   } else if name == "observe" {
-    Ok({ space: zero(), holders: part_of(arg(0)), number: arg(0).number, size: arg(0).size })
+    Ok({ space: zero(), holders: sharing_of(arg(0)), number: arg(0).number, size: arg(0).size })
   } else if name == "numeric_of_int" || name == "wrap_add" || name == "wrap_sub"
       || name == "wrap_mul"
       || name == "saturating_add"
       || name == "saturating_sub"
       || name == "saturating_mul"
       || name == "rotr"
-      || name == "rotl" { Ok({ space: zero(), holders: Alone, number: true, size: None }) }
-  else if name == "panic" { object(constant(), Many, None) }
+      || name == "rotl" { Ok({ space: zero(), holders: Unshared, number: true, size: None }) }
+  else if name == "panic" { object(constant(), Shared, None) }
   else { Err("`" ++ name ++ "` holds what the bound does not read") }
 }
 
@@ -1393,12 +1479,12 @@ fn valued_by(name: String, st: State, all: List<Walked>) -> Result<Made, String>
 fn folded(
   env: Env,
   st: State,
-  all: List<Walked>,
+  all: List<SpaceSummary>,
   args: List<Code>,
-  it: Iterates,
+  it: CallbackUse,
   slots: List<Slot>,
-) -> Result<Made, String> / {abort.raise} =
-  match ((threaded(it), calls_made(it, all.map(|w: Walked| w.size)))) {
+) -> Result<Allocation, String> / {abort.raise} =
+  match ((threaded(it), calls_made(it, all.map(|w: SpaceSummary| w.size)))) {
     (_, None) -> Err("an iteration over a value whose size is not read"),
     (None, _) -> Err("a fold threads nothing through the function it is handed"),
     (Some(k), Some(n)) -> {
@@ -1410,7 +1496,7 @@ fn folded(
           Ok(p) ->
             Ok({
               space: plus(t.first.space, p),
-              holders: weaker(part_of(seed), t.rest.holders),
+              holders: more_shared(sharing_of(seed), t.rest.holders),
               number: seed.number && t.first.number,
               size: None,
             }),
@@ -1427,10 +1513,10 @@ fn steadied(
   args: List<Code>,
   position: Int,
   handing: (Slot) -> List<Slot> / {abort.raise},
-  holders: Holders,
+  holders: Sharing,
   number: Bool,
   tries: Int,
-) -> Result<{ space: Poly, holders: Holders, number: Bool }, String> / {abort.raise} =
+) -> Result<{ space: Polynomial, holders: Sharing, number: Bool }, String> / {abort.raise} =
   match callback(
       env,
       st,
@@ -1439,10 +1525,19 @@ fn steadied(
       handing({ ..unknown_slot(), holders: holders, number: number }),
     ) {
     Err(why) -> Err(why),
-    Ok(cb) -> if weaker(holders, cb.holders) == holders || tries <= 0 {
-      Ok({ ..cb, holders: weaker(holders, cb.holders) })
+    Ok(cb) -> if more_shared(holders, cb.holders) == holders || tries <= 0 {
+      Ok({ ..cb, holders: more_shared(holders, cb.holders) })
     } else {
-      steadied(env, st, args, position, handing, weaker(holders, cb.holders), number, tries - 1)
+      steadied(
+        env,
+        st,
+        args,
+        position,
+        handing,
+        more_shared(holders, cb.holders),
+        number,
+        tries - 1,
+      )
     },
   }
 
@@ -1453,26 +1548,27 @@ fn callback(
   args: List<Code>,
   position: Int,
   params: List<Slot>,
-) -> Result<{ space: Poly, holders: Holders, number: Bool }, String> / {abort.raise} =
+) -> Result<{ space: Polynomial, holders: Sharing, number: Bool }, String> / {abort.raise} =
   match args.at(position) {
     None -> Err("a builtin called without its callback"),
     Some(cb) -> match cb.node {
-      NLambda(l) -> match lambda_walk(env, outer, l.params, l.captures, l.body, params) {
+      CodeLambda(l) -> match lambda_walk(env, outer, l.params, l.captures, l.body, params) {
         Err(why) -> Err(why),
         Ok(w) -> if w.calls > 0 { Err("a call back inside an iteration") }
-        else { Ok({ space: w.space, holders: part_of(w), number: w.number }) },
+        else { Ok({ space: w.space, holders: sharing_of(w), number: w.number }) },
       },
-      NVar(f) -> {
+      CodeVar(f) -> {
         let k = f.slot;
         match slot_at(outer, k).fun {
-          Some(p) -> Ok({ space: p, holders: Many, number: false }),
+          Some(p) -> Ok({ space: p, holders: Shared, number: false }),
           None -> Err("a callback whose space is not read"),
         }
       },
-      NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+      NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
         let name = String::of_bytes_lossy(fname);
-        if ctor(env.cx, name) != None { Ok({ space: constant(), holders: Top, number: false }) }
-        else if name == env.own { Err("a call back inside an iteration") } else {
+        if ctor(env.context, name) != None {
+          Ok({ space: constant(), holders: UnsharedTop, number: false })
+        } else if name == env.own { Err("a call back inside an iteration") } else {
           match env.known.get(name) {
             None -> Err("a callback the bound does not read"),
             Some(k) -> match k.anyhow {
@@ -1483,7 +1579,8 @@ fn callback(
                   params.map(|_p: Slot| None),
                 ) {
                 Err(why) -> Err(why),
-                Ok(q) -> Ok({ space: q, holders: s.holders, number: answers_number(env.cx, name) }),
+                Ok(q) ->
+                  Ok({ space: q, holders: s.holders, number: returns_number(env.context, name) }),
               },
             },
           }
@@ -1495,20 +1592,20 @@ fn callback(
 
 // --- Tests ---------------------------------------------------------------------------------------
 
-/// The space of `m.<def>` against its first `space` clause: `Ok(true)` where the clause is shown.
-fn shown(src: Bytes, def: String) -> Result<Bool, String> / {abort.raise} =
-  shown_in(cx_owning([{ name: b"m", src: src }], |_m: Bytes| true), "m." ++ def)
+/// The space of `m.<definition>` against its first `space` clause: `Ok(true)` where the clause is shown.
+fn shown(src: Bytes, definition: String) -> Result<Bool, String> / {abort.raise} =
+  shown_in(context_owning([{ name: b"m", src: src }], |_m: Bytes| true), "m." ++ definition)
 
-/// The space of `name` in `cx` against its first `space` clause.
-fn shown_in(cx: Context, name: String) -> Result<Bool, String> / {abort.raise} =
-  match cx.claims.defs.get(name) {
+/// The space of `name` in `context` against its first `space` clause.
+fn shown_in(context: Context, name: String) -> Result<Bool, String> / {abort.raise} =
+  match context.claims.definitions.get(name) {
     None -> panic("a definition of the fixture"),
-    Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == SSpace) {
+    Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == SpaceClause) {
       [c, ..] -> {
         let b = c.clause.code;
         match stated_space(b, d.params, d.spaced) {
           None -> Err("the bound is not read"),
-          Some(bound) -> match space(cx, name) {
+          Some(bound) -> match space(context, name) {
             Err(why) -> Err(why),
             Ok(p) -> Ok(dominated_space(p, bound)),
           },
@@ -1582,8 +1679,8 @@ test "a function parameter's space name stands for what each call of it holds" {
 }
 
 test "a call of the prelude's `map` with a list something else holds holds what its bound states" {
-  let cx = |bound: Bytes|
-    cx_owning(
+  let context = |bound: Bytes|
+    context_owning(
       [
         {
           name: b"m",
@@ -1596,8 +1693,8 @@ test "a call of the prelude's `map` with a list something else holds holds what 
       ],
       |m: Bytes| m == b"m",
     );
-  assert_eq(shown_in(cx(b"xs.len()"), "m.f"), Ok(true));
-  assert_eq(shown_in(cx(b"1"), "m.f"), Ok(false))
+  assert_eq(shown_in(context(b"xs.len()"), "m.f"), Ok(true));
+  assert_eq(shown_in(context(b"1"), "m.f"), Ok(false))
 }
 
 fn chain() -> Bytes = b"type Chain = | Link(Int, Chain) | End\n"
@@ -1716,7 +1813,7 @@ test "a fold's first call alone copies a seed something else holds" {
 }
 
 test "another package's definition holds what its `space` bound says, for arguments held alone" {
-  let cx = cx_owning(
+  let context = context_owning(
     [
       {
         name: b"base",
@@ -1729,9 +1826,9 @@ test "another package's definition holds what its `space` bound says, for argume
     ],
     |m: Bytes| m == b"app",
   );
-  assert_eq(space(cx, "app.f"), Ok([Map::new().insert(0, 1)]));
+  assert_eq(space(context, "app.f"), Ok([Map::new().insert(0, 1)]));
   assert_eq(
-    space(cx, "app.g"),
+    space(context, "app.g"),
     Err(
       "`base.ones` is handed a value something else holds, and its `space` bound is for arguments held alone",
     ),

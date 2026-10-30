@@ -1,44 +1,41 @@
-//! `ply build` — a deployable artifact, or what a build changes against a deployed one. The front
-//! end is this program's own load and `deployed` makes the artifact of it; everything below decides
-//! which entry is built, where the artifact lands, and what both forms say. The container itself is
-//! `compiler.store.plyx`, which owns the magic, the header and the section table.
-
 import compiler.load (Derives, LoadedAnalysis, SourceFile)
 import args (Flags, no_flags, style_of, root_of)
-import literals (literal, unsettled)
+import literals (evaluation, evaluation_errors)
 import entries
 import std.path (normalize)
-import builder (Loaded, Refusal)
+import builder (LoadedProgram, Refusal)
 import builder (builder)
-import deployed (Compiled, Made, Named, Previous, Reach, artifacts, deploying)
+import artifact_builder (LibraryUnit, BuiltArtifact, Named, Previous, Reach, artifacts,
+                         with_artifacts)
 import units (emit)
 import compiler.unit (shipped)
 import config_schema
 import lock
-import paths (Resolved, Rooted, displayed, here, write_file)
+import paths (ResolvedPath, RootedPath, displayed, here, write_file)
 import paths
 import compiler.front.diagnostics (parse_all)
 import compiler.store.hash.forms (HashOutput)
 import compiler.store.hash (no_hashes)
-import compiler.check.infer.checker (DefInfo)
+import compiler.check.infer.checker (DefinitionInfo)
 import compiler.store.plyx (Header, digest_of, digest_text, domain, encode, encode_named, format,
                             library_domain, library_magic, offset_digest)
-import compiler.check.resolve.tables (Diag, Label, error_with_labels, error_at)
-import compiler.check.types (TyFn)
-import diagnostic (Place, all_to_json, all_to_text)
-import entry (Main, Module, entry_point, marked)
+import compiler.check.resolve.tables (Diagnostic, Label, error_with_labels, error_at)
+import compiler.check.types (FunctionType)
+import diagnostic (SourceText, all_to_json, all_to_text)
+import entry (Main, Module, entry_point, span_label)
 import sources (File)
-import program (Program, Timed, front_of, no_front, no_program, timed_uncached, program_view)
+import program (Program, TimedLoad, loaded_analysis, no_loaded_analysis, no_program, timed_uncached,
+                program_view)
 import plyz
-import report (Answer, indent, ok_code, count_of, refused, reported)
+import report (CommandOutput, indent, ok_code, count_of, refused, reported)
 import std.fs (fs, Missing)
 import std.time (time)
 import std.list
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string, int, string_or_null,
                  strings, int_or_null)
 import std.pkg (Manifest, render_version)
-import compiler.front.facts (View, pulled_at)
-import compiler.front.seam (Analysed, Refused, view_of, no_module_span)
+import compiler.front.facts (CheckedProgram, pulled_at)
+import compiler.front.seam (Analysed, Refused, checked_program_of, no_module_span)
 import compiler.front.published (analyse)
 import compiler.front.rows (ModuleSpan)
 import std.term (Style, plain, bold, green, red)
@@ -53,22 +50,19 @@ import std.fmt (size)
 import proof.obligation (plural)
 import compiler.syntax.parsing (no_module, dummy_span)
 
-/// The container with its digest written into the field no range of the digest covers: `digest`
-/// is the short form a report prints, and `full` the digest itself.
-pub type Sealed = { bytes: Bytes, digest: String, full: Bytes }
+pub type SealedArtifact = { bytes: Bytes, digest: String, full: Bytes }
 
-/// The digest is `compiler.store.plyx`'s, which says the domain, the field and the ranges; sealing is that
-/// digest and a splice, so the program does it itself.
-fn seal(container: Bytes) -> Result<Sealed, Refusal> / {abort.raise} =
-  sealed_at(container, domain())
+fn seal(container: Bytes) -> Result<SealedArtifact, Refusal> / {abort.raise} =
+  seal_in_domain(container, domain())
 
-/// A library's container is the same file under a domain of its own: a library digest is never read
-/// as a program digest, and the ranges `compiler.store.plyx` covers are the same ones.
-fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> / {abort.raise} =
+fn seal_in_domain(
+  container: Bytes,
+  into: Bytes,
+) -> Result<SealedArtifact, Refusal> / {abort.raise} =
   match digest_of(into, container) {
     None ->
       Err({
-        diags: [
+        diagnostics: [
           error_with_labels(
             b"E0443",
             Bytes::of_string(
@@ -94,62 +88,60 @@ fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> / {abort.
     },
   }
 
-// --- Small things -----------------------------------------------------------
+fn human_size(n: Int) -> String = size(n, rounding: HalfUp)
 
-// --- Sizes and lists a person reads -----------------------------------------
+fn max_listed() -> Int = 8
 
-/// Bytes exactly, and one decimal of the largest unit above that.
-fn human(n: Int) -> String = size(n, rounding: HalfUp)
-
-fn shown() -> Int = 8
-
-/// The first eight names, and a count of the rest: a diff of a whole program is not a listing.
-fn listed(all: List<String>) -> String = {
+fn abbreviated_list(all: List<String>) -> String = {
   let n = all.len();
-  let kept = if n < shown() { n } else { shown() };
+  let kept = if n < max_listed() { n } else { max_listed() };
   let head = String::join(range(0, kept).map(|i: Int| all.at_or(i, "")), ", ");
-  if n <= shown() { head } else { head ++ ", and " ++ Int::to_string(n - shown()) ++ " more" }
+  if n <= max_listed() { head }
+  else { head ++ ", and " ++ Int::to_string(n - max_listed()) ++ " more" }
 }
 
-/// `service.run` becomes `service.plyx`: the module is what a deployment thinks it ships.
 fn default_output(entry: String) -> String = {
   let parts = entry.split(".");
   if parts.len() < 2 { entry ++ ".plyx" } else { parts.at_or(parts.len() - 2, entry) ++ ".plyx" }
 }
 
-// --- Which entry is built ---------------------------------------------------
+pub type Definition = { name: String, simple: String, module: String, at: ModuleSpan, arity: Int }
 
-/// One definition `--entry` may name.
-pub type Def = { name: String, simple: String, module: String, at: ModuleSpan, arity: Int }
-
-fn def_of(def_info: DefInfo) -> Def =
+fn definition_of(definition_info: DefinitionInfo) -> Definition =
   {
-    name: String::of_bytes_lossy(def_info.name),
-    simple: String::of_bytes_lossy(def_info.simple_name),
-    module: String::of_bytes_lossy(def_info.module),
-    at: { module: def_info.at.module, start: def_info.at.span.start, end: def_info.at.span.end },
-    arity: match def_info.scheme.ty { TyFn(f) -> f.params.len(), _ -> 0 },
+    name: String::of_bytes_lossy(definition_info.name),
+    simple: String::of_bytes_lossy(definition_info.simple_name),
+    module: String::of_bytes_lossy(definition_info.module),
+    at: {
+      module: definition_info.at.module,
+      start: definition_info.at.span.start,
+      end: definition_info.at.span.end,
+    },
+    arity: match definition_info.scheme.ty { FunctionType(f) -> f.params.len(), _ -> 0 },
   }
 
-/// The program's own definitions, those of a module it pulled of the shipped ones left out, in the
-/// order its files were read and then as written.
-pub fn defs_of(view: View) -> List<Def> =
-  view.checked.defs.filter(|def_info: DefInfo|
-    !pulled_at(view.frame.packages, view.frame.module_packages, def_info.at.module)).map(
-    def_of,
-  ).sort_by(|a: Def, b: Def|
+pub fn definitions_of(view: CheckedProgram) -> List<Definition> =
+  view.checked.definitions.filter(|definition_info: DefinitionInfo|
+    !pulled_at(view.frame.packages, view.frame.module_packages, definition_info.at.module)).map(
+    definition_of,
+  ).sort_by(|a: Definition, b: Definition|
     a.at.module < b.at.module || (a.at.module == b.at.module && a.at.start <= b.at.start))
 
-fn matching(defs: List<Def>, named: String) -> List<Def> =
-  defs.filter(|def: Def| def.name == named || def.simple == named)
+fn matching(definitions: List<Definition>, named: String) -> List<Definition> =
+  definitions.filter(|definition: Definition|
+    definition.name == named || definition.simple == named)
 
-fn declarations(ds: List<Def>) -> List<Label> =
-  ds.fold([], |acc: List<Label>, def: Def|
+fn declarations(ds: List<Definition>) -> List<Label> =
+  ds.fold([], |acc: List<Label>, definition: Definition|
     acc.push(
-      marked(def.at, acc.len() == 0, Bytes::of_string("`" ++ def.module ++ "` declares it here")),
+      span_label(
+        definition.at,
+        acc.len() == 0,
+        Bytes::of_string("`" ++ definition.module ++ "` declares it here"),
+      ),
     ))
 
-fn ambiguous(named: String, ds: List<Def>) -> Diag / {abort.raise} =
+fn ambiguous(named: String, ds: List<Definition>) -> Diagnostic / {abort.raise} =
   error_with_labels(
     b"E0112",
     Bytes::of_string(count_of(ds.len(), "definition") ++ " are named `" ++ named ++ "`"),
@@ -157,19 +149,18 @@ fn ambiguous(named: String, ds: List<Def>) -> Diag / {abort.raise} =
     [b"name it in full, as `<module>.<name>`"],
   )
 
-/// An artifact runs by calling its entry point with nothing.
-fn entry_arity(def: Def) -> Diag / {abort.raise} =
+fn entry_arguments_error(definition: Definition) -> Diagnostic / {abort.raise} =
   error_with_labels(
     b"E0201",
     Bytes::of_string(
-      "`" ++ def.name ++ "` takes " ++ count_of(def.arity, "argument")
+      "`" ++ definition.name ++ "` takes " ++ count_of(definition.arity, "argument")
         ++ ", and a deployed artifact is started with none",
     ),
-    [marked(def.at, true, b"this cannot be an entry point")],
+    [span_label(definition.at, true, b"this cannot be an entry point")],
     [b"wrap it in a nullary function and name that instead"],
   )
 
-fn no_entry(named: String) -> Diag =
+fn no_entry(named: String) -> Diagnostic =
   error_at(
     b"E0101",
     no_module(),
@@ -179,37 +170,46 @@ fn no_entry(named: String) -> Diag =
     [b"`--entry` takes a program-wide name (`app.serve`) or a simple one"],
   )
 
-fn entry_named(defs: List<Def>, named: String) -> Result<String, Diag> / {abort.raise} = {
-  let hits = matching(defs, named);
+fn entry_named(
+  definitions: List<Definition>,
+  named: String,
+) -> Result<String, Diagnostic> / {abort.raise} = {
+  let hits = matching(definitions, named);
   match hits {
     [] -> Err(no_entry(named)),
     [only, ..rest] -> if rest.len() > 0 { Err(ambiguous(named, hits)) }
-    else if only.arity > 0 { Err(entry_arity(only)) }
+    else if only.arity > 0 { Err(entry_arguments_error(only)) }
     else { Ok(only.name) },
   }
 }
 
-fn entry_of(loaded: Loaded, defs: List<Def>, flags: Flags) -> Result<String, Diag> / {abort.raise} =
+fn entry_of(
+  loaded: LoadedProgram,
+  definitions: List<Definition>,
+  flags: Flags,
+) -> Result<String, Diagnostic> / {abort.raise} =
   match flags.entry {
     None -> {
-      let offered = entries::named({ mains: loaded.mains, modules: loaded.modules }, flags.paths);
+      let offered = entries::narrowed_to(
+        { mains: loaded.mains, modules: loaded.modules },
+        flags.paths,
+      );
       match entry_point(offered.mains, offered.modules) { Ok(m) -> Ok(m.name), Err(d) -> Err(d) }
     },
-    Some(named) -> entry_named(defs, named),
+    Some(named) -> entry_named(definitions, named),
   }
 
-/// The schema shipped at build time is what lets the deployed artifact be run with the same flag,
-/// so `--config-schema` is resolved as a run resolves it.
-fn startup_of(view: View, schema: Option<String>) -> Result<List<String>, Diag> / {abort.raise} =
+fn startup_of(
+  view: CheckedProgram,
+  schema: Option<String>,
+) -> Result<List<String>, Diagnostic> / {abort.raise} =
   match schema {
     None -> Ok([]),
-    Some(named) -> match config_schema::resolved(view, named) {
+    Some(named) -> match config_schema::resolve_schema(view, named) {
       Err(d) -> Err(d),
       Ok(name) -> Ok([name]),
     },
   }
-
-// --- What a build changes ---------------------------------------------------
 
 pub type Diff = {
   added: List<String>,
@@ -221,7 +221,6 @@ pub type Diff = {
 
 fn name_at(ns: List<Named>, i: Int) -> String = match ns.at(i) { Some(n) -> n.name, None -> "" }
 
-/// The names are sorted and carry no pair twice, so one run of them is one name.
 fn distinct(ns: List<Named>) -> List<String> =
   range(0, ns.len()).fold([], |acc: List<String>, i: Int|
     if i > 0 && name_at(ns, i - 1) == name_at(ns, i) { acc } else { acc.push(name_at(ns, i)) })
@@ -229,7 +228,7 @@ fn distinct(ns: List<Named>) -> List<String> =
 fn hashes_of(ns: List<Named>, wanted: String) -> List<String> =
   ns.filter(|named: Named| named.name == wanted).map(|named: Named| named.hash)
 
-fn compared(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Diff = {
+fn diff_of(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Diff = {
   let was = distinct(before);
   let now = distinct(after);
   let added = now.filter(|nm: String| !was.contains(nm));
@@ -241,7 +240,6 @@ fn compared(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Di
     changed: changed,
     dropped: was.filter(|nm: String| !now.contains(nm)),
     unchanged: kept.len() - changed.len(),
-    // A definition reaches itself, so a changed one is always among these.
     reached: reaches.filter(|r: Reach|
       r.reaches.filter(|n: String| moved.contains(n)).len() > 0).map(|r: Reach| r.name),
   }
@@ -249,7 +247,7 @@ fn compared(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Di
 
 fn row(label: String, ns: List<String>) -> String / {abort.raise} = {
   let head = indent() ++ label.pad_right(11, " ") ++ count_of(ns.len(), "definition");
-  if ns.len() == 0 { head } else { head ++ "   " ++ listed(ns) }
+  if ns.len() == 0 { head } else { head ++ "   " ++ abbreviated_list(ns) }
 }
 
 fn diff_lines(
@@ -269,7 +267,7 @@ fn diff_lines(
     rows.concat([
       "",
       indent() ++ "reached by a changed definition: " ++ count_of(d.reached.len(), "definition"),
-      indent() ++ "  " ++ listed(d.reached),
+      indent() ++ "  " ++ abbreviated_list(d.reached),
     ])
   }
 }
@@ -301,16 +299,14 @@ fn diff_json(
     { key: "diagnostics", value: all_to_json([], []) },
   ])
 
-// --- What a build says ------------------------------------------------------
-
-fn binary_line(style: Style, loaded: Loaded) -> String =
+fn binary_line(style: Style, loaded: LoadedProgram) -> String =
   match loaded.binary_bytes {
-    Some(n) -> indent() ++ bold(style, "binary") ++ " ply " ++ loaded.version ++ " · " ++ human(n),
+    Some(n) ->
+      indent() ++ bold(style, "binary") ++ " ply " ++ loaded.version ++ " · " ++ human_size(n),
     None ->
       indent() ++ bold(style, "binary") ++ " ply " ++ loaded.version ++ " · size unavailable",
   }
 
-/// Printed even when empty: without a schema an artifact cannot refuse a missing credential.
 fn startup_line(style: Style, roots: List<String>) -> String =
   if roots.len() == 0 {
     indent() ++ bold(style, "startup")
@@ -319,9 +315,9 @@ fn startup_line(style: Style, roots: List<String>) -> String =
 
 fn built_lines(
   style: Style,
-  loaded: Loaded,
-  made: Made,
-  sealed: Sealed,
+  loaded: LoadedProgram,
+  made: BuiltArtifact,
+  sealed: SealedArtifact,
   out: String,
 ) -> List<String> / {abort.raise} =
   [
@@ -329,7 +325,7 @@ fn built_lines(
     indent() ++ bold(style, "artifact") ++ " " ++ made.definitions.to_string() ++ " "
       ++ plural(made.definitions, "definition")
       ++ " · "
-      ++ human(sealed.bytes.len())
+      ++ human_size(sealed.bytes.len())
       ++ " · "
       ++ out,
     binary_line(style, loaded),
@@ -337,9 +333,9 @@ fn built_lines(
   ]
 
 fn built_json(
-  loaded: Loaded,
-  made: Made,
-  sealed: Sealed,
+  loaded: LoadedProgram,
+  made: BuiltArtifact,
+  sealed: SealedArtifact,
   out: String,
   signer: Option<String>,
 ) -> Json / {abort.raise} =
@@ -363,8 +359,7 @@ fn built_json(
     { key: "diagnostics", value: all_to_json([], loaded.places) },
   ])
 
-/// `--digest` is the one line a deployment pins: not the report, and no file.
-fn digest_json(made: Made, sealed: Sealed) -> Json =
+fn digest_json(made: BuiltArtifact, sealed: SealedArtifact) -> Json =
   object([
     { key: "command", value: Str("build") },
     { key: "ok", value: Bool(true) },
@@ -373,13 +368,9 @@ fn digest_json(made: Made, sealed: Sealed) -> Json =
     { key: "digest", value: Str(sealed.digest) },
   ])
 
-// --- Signing and verifying what a build writes ---------------------------------------
-// A signature is detached, in `<artifact>.sig`: the artifact's digest is the same whoever signs it,
-// and a second signer of the same build adds a signature beside the first.
-
 fn signing_key(
   flags: Flags,
-) -> Result<Option<Secret<Bytes>>, Diag> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
+) -> Result<Option<Secret<Bytes>>, Diagnostic> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
   match flags.sign {
     None -> Ok(None),
     Some(path) -> match read_seed(path) { Ok(seed) -> Ok(Some(seed)), Err(why) -> Err(why) },
@@ -387,10 +378,10 @@ fn signing_key(
 
 fn built_provenance(
   flags: Flags,
-  loaded: Loaded,
+  loaded: LoadedProgram,
   kind: String,
   name: String,
-  sealed: Sealed,
+  sealed: SealedArtifact,
 ) -> Provenance / {fs.kind[abs], fs.read_file[abs], abort.raise} =
   {
     kind: kind,
@@ -401,19 +392,17 @@ fn built_provenance(
     commit: head_commit(root_of(flags).absolute),
   }
 
-/// The signatures beside `out` with this key's among them: kept while they vouch for this build,
-/// started again when they vouch for another.
 fn signed(
   seed: Option<Secret<Bytes>>,
   out: String,
   what: Provenance,
-) -> Result<Option<String>, Diag> / {fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
+) -> Result<Option<String>, Diagnostic> / {fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], abort.raise} =
   match seed {
     None -> Ok(None),
     Some(key) -> {
-      let at = paths::spelled(signatures_path(out));
+      let at = paths::rooted_path(signatures_path(out));
       let payload = provenance_bytes(what);
-      let held = match paths::read_file(at) {
+      let on_disk = match paths::read_file(at) {
         None -> None,
         Some(b) -> match signed_of(b) {
           Some(x) -> if x.payload == payload { Some(x) } else { None },
@@ -421,7 +410,7 @@ fn signed(
         },
       };
       let next = countersigned(
-        match held { Some(x) -> x, None -> { payload: payload, signatures: [] } },
+        match on_disk { Some(x) -> x, None -> { payload: payload, signatures: [] } },
         key,
       );
       if write_file(at, signed_bytes(next)) {
@@ -433,14 +422,14 @@ fn signed(
             }),
           ),
         )
-      } else { Err(unstored(signatures_path(out))) }
+      } else { Err(write_error(signatures_path(out))) }
     },
   }
 
 fn signer_lines(style: Style, signer: Option<String>) -> List<String> =
   match signer { Some(h) -> [indent() ++ bold(style, "signed") ++ " " ++ h], None -> [] }
 
-fn unverified(path: String, why: String) -> Diag =
+fn verify_error(path: String, why: String) -> Diagnostic =
   error_at(
     b"E0461",
     no_module(),
@@ -450,24 +439,25 @@ fn unverified(path: String, why: String) -> Diag =
     [b"`ply build --verify` builds in memory and writes nothing; `ply build` writes what it built"],
   )
 
-/// `--verify`: the file `out` holds, held to what these sources build, and every signature beside
-/// it to the build it says it vouches for.
-fn verified(
+fn verify_artifact(
   style: Style,
-  loaded: Loaded,
+  loaded: LoadedProgram,
   out: String,
-  x: Sealed,
+  x: SealedArtifact,
   into: Bytes,
-) -> Answer / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  match paths::read_file(paths::spelled(out)) {
-    None -> reported(style, "build", [unverified(out, "cannot be read")], loaded.places),
-    Some(held) -> if held != x.bytes {
-      let sealed = match digest_of(into, held) { Some(d) -> digest_text(d), None -> "no digest" };
+) -> CommandOutput / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match paths::read_file(paths::rooted_path(out)) {
+    None -> reported(style, "build", [verify_error(out, "cannot be read")], loaded.places),
+    Some(on_disk) -> if on_disk != x.bytes {
+      let sealed = match digest_of(into, on_disk) {
+        Some(d) -> digest_text(d),
+        None -> "no digest",
+      };
       reported(
         style,
         "build",
         [
-          unverified(
+          verify_error(
             out,
             "seals " ++ sealed ++ ", and these sources build " ++ digest_text(x.full),
           ),
@@ -476,14 +466,14 @@ fn verified(
       )
     } else {
       let sig = signatures_path(out);
-      match paths::read_file(paths::spelled(sig)) {
-        None -> verified_answer(style, out, x, [], None),
+      match paths::read_file(paths::rooted_path(sig)) {
+        None -> verified_output(style, out, x, [], None),
         Some(b) -> match signed_of(b) {
           None ->
             reported(
               style,
               "build",
-              [unverified(sig, "does not read as signatures")],
+              [verify_error(sig, "does not read as signatures")],
               loaded.places,
             ),
           Some(g) -> match provenance_of(g.payload) {
@@ -491,20 +481,21 @@ fn verified(
               reported(
                 style,
                 "build",
-                [unverified(sig, "says nothing a build vouches for")],
+                [verify_error(sig, "says nothing a build vouches for")],
                 loaded.places,
               ),
             Some(what) -> if what.digest != digest_text(x.full) {
               reported(
                 style,
                 "build",
-                [unverified(sig, "vouches for " ++ what.digest)],
+                [verify_error(sig, "vouches for " ++ what.digest)],
                 loaded.places,
               )
             } else {
-              match g.signatures.filter(|one: Signature| !signed::holds(one, g.payload)) {
+              match g.signatures.filter(|one: Signature|
+                  !signed::signature_matches(one, g.payload)) {
                 [] ->
-                  verified_answer(
+                  verified_output(
                     style,
                     out,
                     x,
@@ -516,7 +507,7 @@ fn verified(
                     style,
                     "build",
                     [
-                      unverified(
+                      verify_error(
                         sig,
                         "holds a signature by " ++ bad.signer.hex_of() ++ " that does not verify",
                       ),
@@ -531,13 +522,13 @@ fn verified(
     },
   }
 
-fn verified_answer(
+fn verified_output(
   style: Style,
   out: String,
-  sealed: Sealed,
+  sealed: SealedArtifact,
   signers: List<String>,
   what: Option<Provenance>,
-) -> Answer / {abort.raise} =
+) -> CommandOutput / {abort.raise} =
   {
     json: object([
       { key: "command", value: Str("build") },
@@ -573,9 +564,7 @@ fn verified_answer(
     code: ok_code(),
   }
 
-// --- The command ------------------------------------------------------------
-
-fn unstored(path: String) -> Diag =
+fn write_error(path: String) -> Diagnostic =
   error_at(
     b"E0502",
     no_module(),
@@ -585,27 +574,31 @@ fn unstored(path: String) -> Diag =
     [],
   )
 
-fn stored(
+fn store_artifact(
   out: String,
   body: Bytes,
 ) -> Result<Unit, Refusal> / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], abort.raise} = {
-  let at = paths::spelled(out);
-  let room = match paths::parent_of(at) { Some(dir) -> paths::create_dir(dir), None -> true };
-  if room && write_file(at, body) { Ok(()) } else { Err({ diags: [unstored(out)], places: [] }) }
+  let at = paths::rooted_path(out);
+  let has_directory = match paths::parent_of(at) {
+    Some(dir) -> paths::create_dir(dir),
+    None -> true,
+  };
+  if has_directory && write_file(at, body) { Ok(()) }
+  else { Err({ diagnostics: [write_error(out)], places: [] }) }
 }
 
-fn written(
+fn write_artifact(
   style: Style,
   flags: Flags,
-  loaded: Loaded,
-  made: Made,
-  sealed: Sealed,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
+  loaded: LoadedProgram,
+  made: BuiltArtifact,
+  sealed: SealedArtifact,
+) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
   let out = match flags.out { Some(v) -> v, None -> default_output(made.entry) };
   match signing_key(flags) {
     Err(d) -> reported(style, "build", [d], loaded.places),
-    Ok(seed) -> match stored(out, sealed.bytes) {
-      Err(why) -> reported(style, "build", why.diags, loaded.places),
+    Ok(seed) -> match store_artifact(out, sealed.bytes) {
+      Err(why) -> reported(style, "build", why.diagnostics, loaded.places),
       Ok(_) -> match signed(
           seed,
           out,
@@ -627,17 +620,17 @@ fn written(
   }
 }
 
-fn differed(
+fn diff_output(
   style: Style,
-  loaded: Loaded,
-  made: Made,
-  sealed: Sealed,
+  loaded: LoadedProgram,
+  made: BuiltArtifact,
+  sealed: SealedArtifact,
   old: String,
-) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  match artifacts.previous(old, paths::read_file(paths::spelled(old))) {
-    Err(why) -> reported(style, "build", why.diags, why.places),
+) -> CommandOutput / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match artifacts.previous(old, paths::read_file(paths::rooted_path(old))) {
+    Err(why) -> reported(style, "build", why.diagnostics, why.places),
     Ok(was) -> {
-      let d = compared(was.names, made.names, made.reaches);
+      let d = diff_of(was.names, made.names, made.reaches);
       {
         json: diff_json(
           made.entry,
@@ -655,87 +648,85 @@ fn differed(
     },
   }
 
-fn delivered(
+fn deliver(
   style: Style,
   flags: Flags,
-  loaded: Loaded,
-  made: Made,
-  sealed: Sealed,
-) -> Answer / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
+  loaded: LoadedProgram,
+  made: BuiltArtifact,
+  sealed: SealedArtifact,
+) -> CommandOutput / {artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
   match flags.diff {
-    Some(old) -> differed(style, loaded, made, sealed, old),
+    Some(old) -> diff_output(style, loaded, made, sealed, old),
     None -> if flags.digest {
       { json: digest_json(made, sealed), lines: [sealed.digest], errs: [], code: ok_code() }
     } else if flags.action == "verify" {
-      verified(
+      verify_artifact(
         style,
         loaded,
         match flags.out { Some(v) -> v, None -> default_output(made.entry) },
         sealed,
         domain(),
       )
-    } else { written(style, flags, loaded, made, sealed) },
+    } else { write_artifact(style, flags, loaded, made, sealed) },
   }
 
-fn is_diffed(flags: Flags) -> Bool = match flags.diff { Some(_) -> true, None -> false }
+fn has_diff(flags: Flags) -> Bool = match flags.diff { Some(_) -> true, None -> false }
 
-fn assembled(
+fn assemble(
   style: Style,
   flags: Flags,
-  loaded: Loaded,
+  loaded: LoadedProgram,
   front: LoadedAnalysis,
   hashes: HashOutput,
   entry: String,
   startup: List<String>,
-) -> Answer / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
-  match artifacts.made(front, hashes, entry, startup, is_diffed(flags)) {
-    Err(why) -> reported(style, "build", why.diags, loaded.places),
+) -> CommandOutput / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
+  match artifacts.made(front, hashes, entry, startup, has_diff(flags)) {
+    Err(why) -> reported(style, "build", why.diagnostics, loaded.places),
     Ok(m) -> match seal(encode(m.head, m.sections)) {
-      Err(why) -> reported(style, "build", why.diags, loaded.places),
-      Ok(x) -> delivered(style, flags, loaded, m, x),
+      Err(why) -> reported(style, "build", why.diagnostics, loaded.places),
+      Ok(x) -> deliver(style, flags, loaded, m, x),
     },
   }
 
-fn chosen(
+fn build_entry(
   style: Style,
   flags: Flags,
   loaded: Program,
-  p: Loaded,
+  p: LoadedProgram,
   front: LoadedAnalysis,
   hashes: HashOutput,
-  defs: List<Def>,
-  startup: Result<List<String>, Diag>,
-) -> Answer / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
-  match entry_of(p, defs, flags) {
-    // Nothing to build as a program. A library — a package that names no entry and declares no
-    // `main` — is built as the package itself; anything else keeps the entry point's refusal.
+  definitions: List<Definition>,
+  startup: Result<List<String>, Diagnostic>,
+) -> CommandOutput / {artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
+  match entry_of(p, definitions, flags) {
     Err(d) -> if flags.entry == None && p.mains.len() == 0 {
-      library(style, flags, loaded, p, front, defs, d)
+      build_library(style, flags, loaded, p, front, definitions, d)
     } else { reported(style, "build", [d], p.places) },
     Ok(entry) -> match startup {
       Err(d) -> reported(style, "build", [d], p.places),
-      Ok(roots) -> assembled(style, flags, p, front, hashes, entry, roots),
+      Ok(roots) -> assemble(style, flags, p, front, hashes, entry, roots),
     },
   }
 
 pub fn run(
   flags: Flags,
   schema: Option<String>,
-) -> Answer / {shipped.answer, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached} = {
   let s: Style = style_of(flags);
-  let t: Timed = timed_uncached(flags.paths, flags.verify_deps);
+  let t: TimedLoad = timed_uncached(flags.paths, flags.verify_dependencies);
   match program_view(t.program) {
-    None -> refused(s, "build", t.program.diags, t.program.places),
-    Some(w) -> match unsettled(t, w.frame) {
+    None -> refused(s, "build", t.program.diagnostics, t.program.places),
+    Some(w) -> match evaluation_errors(t, w.frame) {
       [] ->
-        deploying(||
-          built_over(
+        with_artifacts(||
+          build_program(
             s,
             flags,
             t.program,
-            defs_of(w),
+            definitions_of(w),
             startup_of(w, schema),
-            front_of(t, w),
+            loaded_analysis(t, w),
             w.frame.hashes,
           )),
       literals -> refused(s, "build", literals, t.program.places),
@@ -743,52 +734,47 @@ pub fn run(
   }
 }
 
-/// `body` with every program it reads back answered from the front end it hands over: the root it
-/// was loaded at, the entry points and the pins the answer holds, and this binary's size and
-/// version.
-pub fn reading_back<a | e>(
+pub fn with_read_back<a | e>(
   body: () -> a / {builder.loaded[build] | e},
-) -> a / {shipped.binary_bytes, shipped.version, abort.raise | e} =
+) -> a / {shipped.binary_size, shipped.version, abort.raise | e} =
   handle { body() } with { builder.loaded[build](root, front) -> Ok(read_back(root, front)) }
 
 fn read_back(
   root: String,
   front: LoadedAnalysis,
-) -> Loaded / {shipped.binary_bytes, shipped.version, abort.raise} =
+) -> LoadedProgram / {shipped.binary_size, shipped.version, abort.raise} =
   {
     root: normalize(root),
     mains: entries::mains_of(front),
     modules: entries::modules_of(front),
     places: front.files.map(|file: SourceFile| { path: file.path, text: file.text }),
     pins: lock::from_front(front.dump.pins),
-    binary_bytes: shipped.binary_bytes(),
+    binary_bytes: shipped.binary_size(),
     version: shipped.version(),
   }
 
-/// The build, over the program `run` loaded, what it decided of it, its front end, and the hashing
-/// that front end was answered from.
-fn built_over(
+fn build_program(
   style: Style,
   flags: Flags,
   loaded: Program,
-  defs: List<Def>,
-  startup: Result<List<String>, Diag>,
+  definitions: List<Definition>,
+  startup: Result<List<String>, Diagnostic>,
   front: LoadedAnalysis,
   hashes: HashOutput,
-) -> Answer / {builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
+) -> CommandOutput / {builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
   let r = root_of(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
   match builder.loaded[build](root_of(flags).machine, front) {
-    Err(why) -> refused(style, "build", why.diags, why.places),
+    Err(why) -> refused(style, "build", why.diagnostics, why.places),
     Ok(p) -> match locked {
-      Err(why) -> reported(style, "build", [lock::refused(r, why)], p.places),
+      Err(why) -> reported(style, "build", [lock::unreadable_lock(r, why)], p.places),
       Ok(existing) -> {
-        let committed = lock::committed(loaded.pkgs);
+        let committed = lock::committed_packages(loaded.packages);
         match lock_refusal(r, existing, p, committed) {
           Some(d) -> reported(style, "build", [d], p.places),
           None -> {
-            let answer = chosen(style, flags, loaded, p, front, hashes, defs, startup);
-            if answer.code == ok_code() { pinned(r, existing, p, committed) };
+            let answer = build_entry(style, flags, loaded, p, front, hashes, definitions, startup);
+            if answer.code == ok_code() { write_lock_file(r, existing, p, committed) };
             answer
           },
         }
@@ -797,14 +783,13 @@ fn built_over(
   }
 }
 
-/// The lock the load pins, written only where it is not the one on file.
-fn pinned(
-  resolved: Resolved,
+fn write_lock_file(
+  resolved: ResolvedPath,
   existing: Option<lock::Lock>,
-  loaded: Loaded,
+  loaded: LoadedProgram,
   committed: List<String>,
 ) -> Unit / {fs.write_file[cwd], fs.write_file[abs], abort.raise} =
-  if existing == Some(lock::written(existing, loaded.pins, [], committed)) { () } else {
+  if existing == Some(lock::updated_lock(existing, loaded.pins, [], committed)) { () } else {
     write_file(
       lock::path_of(resolved),
       Bytes::of_string(lock::text(existing, loaded.pins, [], committed)),
@@ -812,59 +797,49 @@ fn pinned(
     ()
   }
 
-// --- A library ----------------------------------------------------------------------
-
 fn library_name(manifest: Manifest) -> String =
   manifest.name ++ " " ++ render_version(manifest.version)
 
 fn library_output(flags: Flags, name: String) -> String =
   match flags.out { Some(v) -> v, None -> name ++ ".plyz" }
 
-/// A library: a package whose manifest names no entry and whose own modules declare no `main`. It
-/// has no closure to ship, so what a build makes of it is the package itself — its sources, its
-/// manifest and a unit of every definition they declare — under a container of its own.
-fn library(
+fn build_library(
   style: Style,
   flags: Flags,
   loaded: Program,
-  p: Loaded,
+  p: LoadedProgram,
   front: LoadedAnalysis,
-  defs: List<Def>,
-  refused: Diag,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
+  definitions: List<Definition>,
+  refused: Diagnostic,
+) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
   match loaded.frame {
-    // The load behind this report found no entry point; a package that cannot be read keeps that.
     None -> reported(style, "build", [refused], p.places),
     Some(v) -> match v.manifest {
-      // An anonymous directory is not a library: there is no package to write down.
       None -> reported(style, "build", [refused], p.places),
       Some(m) -> if m.entry != None { reported(style, "build", [refused], p.places) }
-      else { library_writing(style, flags, p, loaded, front, defs, m) },
+      else { write_library(style, flags, p, loaded, front, definitions, m) },
     },
   }
 
-/// A library's archive, sealed, with what a report says of it: the definitions its unit compiled.
-pub type Packed = { own: List<Def>, unit: Compiled, sealed: Sealed }
+pub type LibraryArchive = { own: List<Definition>, unit: LibraryUnit, sealed: SealedArtifact }
 
-/// The archive a library ships as: what `ply build` writes and `ply publish` uploads, one function
-/// so the two are the same bytes.
-pub fn packed(
+pub fn pack_library(
   front: LoadedAnalysis,
   loaded: Program,
-  defs: List<Def>,
-) -> Result<Packed, Refusal> / {artifacts.unit, abort.raise} = {
+  definitions: List<Definition>,
+) -> Result<LibraryArchive, Refusal> / {artifacts.unit, abort.raise} = {
   let owned = loaded.files.map(|file: File| file.module);
-  let own = defs.filter(|def: Def| owned.contains(def.module));
-  match artifacts.unit(front, own.map(|def: Def| def.name)) {
+  let own = definitions.filter(|definition: Definition| owned.contains(definition.module));
+  match artifacts.unit(front, own.map(|definition: Definition| definition.name)) {
     Err(why) -> Err(why),
     Ok(compiled) -> {
-      let manifest = match loaded.pkgs.manifest { Some(text) -> text, None -> b"" };
+      let manifest = match loaded.packages.manifest { Some(text) -> text, None -> b"" };
       let container = encode_named(
         library_magic(),
         compiled.head,
         plyz::sections(loaded.files, manifest, compiled),
       );
-      match sealed_at(container, library_domain()) {
+      match seal_in_domain(container, library_domain()) {
         Err(why) -> Err(why),
         Ok(x) -> Ok({ own: own, unit: compiled, sealed: x }),
       }
@@ -872,24 +847,25 @@ pub fn packed(
   }
 }
 
-fn library_writing(
+fn write_library(
   style: Style,
   flags: Flags,
-  p: Loaded,
+  p: LoadedProgram,
   loaded: Program,
   front: LoadedAnalysis,
-  defs: List<Def>,
+  definitions: List<Definition>,
   manifest: Manifest,
-) -> Answer / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
-  match packed(front, loaded, defs) {
-    Err(why) -> reported(style, "build", why.diags, p.places),
+) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
+  match pack_library(front, loaded, definitions) {
+    Err(why) -> reported(style, "build", why.diagnostics, p.places),
     Ok(k) -> {
       let out = library_output(flags, manifest.name);
-      if flags.action == "verify" { verified(style, p, out, k.sealed, library_domain()) } else {
+      if flags.action == "verify" { verify_artifact(style, p, out, k.sealed, library_domain()) }
+      else {
         match signing_key(flags) {
           Err(d) -> reported(style, "build", [d], p.places),
-          Ok(seed) -> match stored(out, k.sealed.bytes) {
-            Err(why) -> reported(style, "build", why.diags, p.places),
+          Ok(seed) -> match store_artifact(out, k.sealed.bytes) {
+            Err(why) -> reported(style, "build", why.diagnostics, p.places),
             Ok(_) -> match signed(
                 seed,
                 out,
@@ -925,9 +901,9 @@ fn library_lines(
   style: Style,
   manifest: Manifest,
   modules: Int,
-  own: List<Def>,
-  unit: Compiled,
-  sealed: Sealed,
+  own: List<Definition>,
+  unit: LibraryUnit,
+  sealed: SealedArtifact,
   out: String,
 ) -> List<String> / {abort.raise} =
   [
@@ -940,11 +916,11 @@ fn library_lines(
   ]
 
 fn library_json(
-  loaded: Loaded,
+  loaded: LoadedProgram,
   manifest: Manifest,
-  own: List<Def>,
-  unit: Compiled,
-  sealed: Sealed,
+  own: List<Definition>,
+  unit: LibraryUnit,
+  sealed: SealedArtifact,
   out: String,
   signer: Option<String>,
 ) -> Json / {abort.raise} =
@@ -966,39 +942,35 @@ fn library_json(
     { key: "diagnostics", value: all_to_json([], loaded.places) },
   ])
 
-/// Every dependency the lock pins must be the one this load found: a build may not ship what the
-/// lockfile does not describe. `committed` is what the checkout pins instead (`lock::committed`).
 pub fn lock_refusal(
-  r: Resolved,
+  r: ResolvedPath,
   existing: Option<lock::Lock>,
-  loaded: Loaded,
+  loaded: LoadedProgram,
   committed: List<String>,
-) -> Option<Diag> =
+) -> Option<Diagnostic> =
   match existing {
     None -> None,
-    Some(lock) -> match lock::verified(r, lock, loaded.pins, committed) {
+    Some(lock) -> match lock::verify(r, lock, loaded.pins, committed) {
       Ok(_) -> None,
       Err(d) -> Some(d),
     },
   }
 
-// --- Tests ------------------------------------------------------------------
-
-fn a_def(name: String, simple: String, module: String, arity: Int) -> Def =
+fn a_definition(name: String, simple: String, module: String, arity: Int) -> Definition =
   { name: name, simple: simple, module: module, at: no_module_span(), arity: arity }
 
-fn some_defs() -> List<Def> =
+fn some_definitions() -> List<Definition> =
   [
-    a_def("m.main", "main", "m", 0),
-    a_def("m.serve", "serve", "m", 1),
-    a_def("m.spec", "spec", "m", 0),
-    a_def("left.util", "util", "left", 0),
-    a_def("right.util", "util", "right", 0),
+    a_definition("m.main", "main", "m", 0),
+    a_definition("m.serve", "serve", "m", 1),
+    a_definition("m.spec", "spec", "m", 0),
+    a_definition("left.util", "util", "left", 0),
+    a_definition("right.util", "util", "right", 0),
   ]
 
 fn a_main() -> Main = { name: "m.main", module: "m", path: "m.ply", at: no_module_span() }
 
-fn a_load() -> Loaded =
+fn a_load() -> LoadedProgram =
   {
     root: "/p",
     mains: [a_main()],
@@ -1011,7 +983,7 @@ fn a_load() -> Loaded =
 
 fn a_head() -> Header = { frontend: b"", runtime: b"", entry: b"" }
 
-fn a_made() -> Made =
+fn an_artifact() -> BuiltArtifact =
   {
     entry: "m.main",
     entry_hash: "9f2c1a4e",
@@ -1026,17 +998,17 @@ fn a_made() -> Made =
 fn flags_of(json: Bool) -> Flags = { ..no_flags(), json: json }
 
 test "a size is exact in bytes and one decimal above that" {
-  assert_eq(human(0), "0 B");
-  assert_eq(human(512), "512 B");
-  assert_eq(human(2048), "2.0 KiB");
-  assert_eq(human(3145728), "3.0 MiB")
+  assert_eq(human_size(0), "0 B");
+  assert_eq(human_size(512), "512 B");
+  assert_eq(human_size(2048), "2.0 KiB");
+  assert_eq(human_size(3145728), "3.0 MiB")
 }
 
 test "a long list is counted rather than printed whole" {
   let many = range(0, 20).map(|i: Int| "m.d" ++ i.to_string());
-  assert(listed(many).ends_with("and 12 more"));
-  assert_eq(listed(["m.a", "m.b", "m.c"]), "m.a, m.b, m.c");
-  assert_eq(listed([]), "")
+  assert(abbreviated_list(many).ends_with("and 12 more"));
+  assert_eq(abbreviated_list(["m.a", "m.b", "m.c"]), "m.a, m.b, m.c");
+  assert_eq(abbreviated_list([]), "")
 }
 
 test "the default output is named after the entry point's module" {
@@ -1046,55 +1018,55 @@ test "the default output is named after the entry point's module" {
 }
 
 test "`--entry` takes a program-wide name or a simple one" {
-  assert_eq(entry_named(some_defs(), "m.main"), Ok("m.main"));
-  assert_eq(entry_named(some_defs(), "spec"), Ok("m.spec"))
+  assert_eq(entry_named(some_definitions(), "m.main"), Ok("m.main"));
+  assert_eq(entry_named(some_definitions(), "spec"), Ok("m.spec"))
 }
 
 test "an entry point that takes an argument is refused, and so is a name nothing declares" {
-  match entry_named(some_defs(), "serve") {
+  match entry_named(some_definitions(), "serve") {
     Ok(_) -> panic("a definition that takes an argument cannot be an entry point"),
     Err(d) -> {
       assert_eq(d.code, b"E0201");
       assert(String::of_bytes_lossy(d.message).contains("takes 1 argument"))
     },
   };
-  match entry_named(some_defs(), "absent") {
+  match entry_named(some_definitions(), "absent") {
     Ok(_) -> panic("a name nothing declares is not an entry point"),
     Err(d) -> assert_eq(d.code, b"E0101"),
   }
 }
 
 test "a simple name two modules declare says which two" {
-  match entry_named(some_defs(), "util") {
+  match entry_named(some_definitions(), "util") {
     Ok(_) -> panic("two definitions named `util` is not one entry point"),
     Err(d) -> {
       assert_eq(d.code, b"E0112");
       assert_eq(d.message, b"2 definitions are named `util`");
       assert_eq(d.labels.len(), 2);
-      assert_eq(d.labels.at_or(0, marked(no_module_span(), false, b"")).primary, true);
-      assert_eq(d.labels.at_or(1, marked(no_module_span(), true, b"")).primary, false)
+      assert_eq(d.labels.at_or(0, span_label(no_module_span(), false, b"")).primary, true);
+      assert_eq(d.labels.at_or(1, span_label(no_module_span(), true, b"")).primary, false)
     },
   }
 }
 
-fn a_whole() -> View / {abort.raise} = {
+fn a_view() -> CheckedProgram / {abort.raise} = {
   let src = b"type Key = { name: String }\ntype ConfigSpec = { keys: List<Key> }\npub fn spec() -> ConfigSpec = { keys: [] }\nfn main() -> Int = 1\nfn serve(port: Int) -> Int = port\n";
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(_) -> panic("the fixture checks"),
-    Analysed(w) -> view_of(w),
+    Analysed(w) -> checked_program_of(w),
   }
 }
 
 test "the definitions `--entry` may name are the program's own, as written, with their arity" {
-  assert_eq(defs_of(a_whole()).map(|def: Def| (def.name, def.simple, def.module, def.arity)), [
-    ("m.spec", "spec", "m", 0),
-    ("m.main", "main", "m", 0),
-    ("m.serve", "serve", "m", 1),
-  ])
+  assert_eq(
+    definitions_of(a_view()).map(|definition: Definition|
+      (definition.name, definition.simple, definition.module, definition.arity)),
+    [("m.spec", "spec", "m", 0), ("m.main", "main", "m", 0), ("m.serve", "serve", "m", 1)],
+  )
 }
 
 test "a schema is resolved as a run resolves it, and one that is not stops the build" {
-  match startup_of(a_whole(), Some("m.absent")) {
+  match startup_of(a_view(), Some("m.absent")) {
     Ok(_) -> panic("a schema nothing declares cannot ship"),
     Err(d) -> {
       assert_eq(d.code, b"E0440");
@@ -1102,23 +1074,22 @@ test "a schema is resolved as a run resolves it, and one that is not stops the b
       assert_eq(d.notes_text, [b"this program has: m.spec"])
     },
   };
-  // The artifact is run with the flag it was built with, so a simple name is no more a schema here.
-  match startup_of(a_whole(), Some("spec")) {
+  match startup_of(a_view(), Some("spec")) {
     Ok(_) -> panic("a simple name is not the name a run takes"),
     Err(d) -> assert_eq(d.code, b"E0440"),
   };
-  match startup_of(a_whole(), Some("m.serve")) {
+  match startup_of(a_view(), Some("m.serve")) {
     Ok(_) -> panic("a function that takes an argument is no schema"),
     Err(d) -> assert_eq(d.code, b"E0440"),
   };
-  assert_eq(startup_of(a_whole(), Some("m.spec")), Ok(["m.spec"]));
-  assert_eq(startup_of(a_whole(), None), Ok([]))
+  assert_eq(startup_of(a_view(), Some("m.spec")), Ok(["m.spec"]));
+  assert_eq(startup_of(a_view(), None), Ok([]))
 }
 
 test "a rename adds a name and drops one without changing a body" {
   let was = [{ name: "m.helper", hash: "aa" }, { name: "m.main", hash: "bb" }];
   let now = [{ name: "m.assistant", hash: "aa" }, { name: "m.main", hash: "bb" }];
-  let d = compared(was, now, []);
+  let d = diff_of(was, now, []);
   assert_eq(d.added, ["m.assistant"]);
   assert_eq(d.dropped, ["m.helper"]);
   assert_eq(d.changed, []);
@@ -1137,7 +1108,7 @@ test "a changed callee changes its caller, and what reaches a change is listed" 
     { name: "m.main", reaches: ["m.main", "m.shade"] },
     { name: "m.shade", reaches: ["m.shade"] },
   ];
-  let d = compared(was, now, reaches);
+  let d = diff_of(was, now, reaches);
   assert_eq(d.added, ["m.other"]);
   assert_eq(d.changed, ["m.main", "m.shade"]);
   assert_eq(d.dropped, []);
@@ -1148,8 +1119,8 @@ test "a changed callee changes its caller, and what reaches a change is listed" 
 test "one name filed under two hashes is one name" {
   let twice = [{ name: "m.main", hash: "aa" }, { name: "m.main", hash: "bb" }];
   assert_eq(distinct(twice), ["m.main"]);
-  assert_eq(compared(twice, twice, []).unchanged, 1);
-  assert_eq(compared([{ name: "m.main", hash: "aa" }], twice, []).changed, ["m.main"])
+  assert_eq(diff_of(twice, twice, []).unchanged, 1);
+  assert_eq(diff_of([{ name: "m.main", hash: "aa" }], twice, []).changed, ["m.main"])
 }
 
 test "the diff reads as three rows, a tally, and what a change is reached by" {
@@ -1173,22 +1144,27 @@ test "the diff reads as three rows, a tally, and what a change is reached by" {
   ])
 }
 
-/// `stores` is whether the artifact's file can be written.
-fn answered_over(
+fn build_with(
   flags: Flags,
-  p: Result<Loaded, Refusal>,
-  m: Result<Made, Refusal>,
+  p: Result<LoadedProgram, Refusal>,
+  m: Result<BuiltArtifact, Refusal>,
   was: Result<Previous, Refusal>,
   stores: Bool,
-) -> Answer / {abort.raise} =
+) -> CommandOutput / {abort.raise} =
   handle {
-    built_over(style_of(flags), flags, no_program(), some_defs(), Ok([]), no_front(), no_hashes())
+    build_program(
+      style_of(flags),
+      flags,
+      no_program(),
+      some_definitions(),
+      Ok([]),
+      no_loaded_analysis(),
+      no_hashes(),
+    )
   } with {
     builder.loaded[build](root, front) -> p,
     artifacts.made(front, hashes, entry, startup, reaches) -> m,
     artifacts.previous(path, bytes) -> was,
-    // A test's project has whatever lockfile it says it has, and a build writes the one that
-    // records the load's pins.
     fs.read_file[cwd](path) -> lockfile(path),
     fs.read_file[abs](path) -> lockfile(path),
     fs.read_secret[cwd](path, before, encoding, after) -> None,
@@ -1197,23 +1173,18 @@ fn answered_over(
     fs.create_dir[abs](path) -> stores,
     fs.write_file[cwd](path, body) -> stores || path.ends_with("ply.lock"),
     fs.write_file[abs](path, body) -> stores || path.ends_with("ply.lock"),
-    // The fixture is checked out nowhere, so its provenance names no commit.
     fs.kind[abs](path) -> Missing,
-    // A library's path is only reached by a test that means it: the fixture is a program.
     artifacts.unit(front, names) -> no_unit(),
   }
 
-/// The fixture has no library to compile: a test that asks for a unit is asking about a path the
-/// fixture does not take, and the answer says so rather than inventing one.
-fn no_unit() -> Result<Compiled, Refusal> = Err({ diags: [], places: [] })
+fn no_unit() -> Result<LibraryUnit, Refusal> = Err({ diagnostics: [], places: [] })
 
-/// The lockfile a test's project holds: none, so a build pins what it loaded.
 fn lockfile(path: String) -> Option<Bytes> = None
 
-fn nothing() -> Refusal = { diags: [], places: [] }
+fn no_refusal() -> Refusal = { diagnostics: [], places: [] }
 
-fn a_build(flags: Flags) -> Answer / {abort.raise} =
-  answered_over(flags, Ok(a_load()), Ok(a_made()), Err(nothing()), true)
+fn a_build(flags: Flags) -> CommandOutput / {abort.raise} =
+  build_with(flags, Ok(a_load()), Ok(an_artifact()), Err(no_refusal()), true)
 
 test "a build says what it wrote, where, and what the artifact and the binary weigh" {
   let answer = a_build(flags_of(false));
@@ -1248,11 +1219,11 @@ test "`-o` names the file, and the entry's module names it otherwise" {
 }
 
 test "`--digest` writes the one line a deployment pins and nothing else" {
-  let answer = answered_over(
+  let answer = build_with(
     { ..no_flags(), digest: true },
     Ok(a_load()),
-    Ok(a_made()),
-    Err(nothing()),
+    Ok(an_artifact()),
+    Err(no_refusal()),
     false,
   );
   assert_eq(answer.lines, ["b3:f5769a2fa8e5"]);
@@ -1262,10 +1233,10 @@ test "`--digest` writes the one line a deployment pins and nothing else" {
 
 test "`--diff` reports against a deployed artifact and writes no file" {
   let was: Previous = { digest: "b3:000000000000", names: [{ name: "m.helper", hash: "cc" }] };
-  let answer = answered_over(
+  let answer = build_with(
     { ..no_flags(), diff: Some("old.plyx"), json: true },
     Ok(a_load()),
-    Ok(a_made()),
+    Ok(an_artifact()),
     Ok(was),
     false,
   );
@@ -1280,7 +1251,7 @@ test "`--diff` reports against a deployed artifact and writes no file" {
 
 test "a program that does not load is the load's own refusal, with the tally under it" {
   let why: Refusal = {
-    diags: [
+    diagnostics: [
       {
         code: b"E0201",
         notes: 0,
@@ -1294,7 +1265,7 @@ test "a program that does not load is the load's own refusal, with the tally und
     ],
     places: [],
   };
-  let answer = answered_over(flags_of(false), Err(why), Err(nothing()), Err(nothing()), false);
+  let answer = build_with(flags_of(false), Err(why), Err(no_refusal()), Err(no_refusal()), false);
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, [
@@ -1304,11 +1275,11 @@ test "a program that does not load is the load's own refusal, with the tally und
 }
 
 test "an artifact that cannot be written is exit 2 with no tally" {
-  let answer = answered_over(
+  let answer = build_with(
     { ..flags_of(false), out: Some("dist/m.plyx") },
     Ok(a_load()),
-    Ok(a_made()),
-    Err(nothing()),
+    Ok(an_artifact()),
+    Err(no_refusal()),
     false,
   );
   assert_eq(answer.code, 2);
@@ -1317,11 +1288,11 @@ test "an artifact that cannot be written is exit 2 with no tally" {
 }
 
 test "an entry point the flags name badly stops the build before anything is made" {
-  let answer = answered_over(
+  let answer = build_with(
     { ..no_flags(), entry: Some("serve") },
     Ok(a_load()),
-    Err(nothing()),
-    Err(nothing()),
+    Err(no_refusal()),
+    Err(no_refusal()),
     false,
   );
   assert_eq(answer.code, 2);

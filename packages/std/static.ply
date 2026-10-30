@@ -1,27 +1,26 @@
 //! Files served from a root of `std.fs`, with the conditional requests and the byte ranges of
 //! RFC 9110.
 //!
-//! `decide` is RFC 9110 §13.2.2's order of preconditions and §14's ranges as one pure function of
-//! the method, the request's fields and what the resource is: `Whole` (200), `Partial` (206),
-//! `NotModified` (304), `Failed` (412) or `Unsatisfiable` (416). An `If-Match` and an `If-Range`
-//! compare entity tags strongly, an `If-None-Match` weakly, and a date as a whole second. A
-//! `Range` that does not read, of a unit other than bytes, of more ranges than the bound or of
-//! ranges that overlap is answered with the whole representation, which the standard allows and
-//! which leaves nothing for a client to amplify; one none of whose ranges the representation holds
-//! is 416.
+//! `decide` applies RFC 9110 §13.2.2's order of preconditions and §14's ranges as one pure function
+//! of the method, the request's fields and the resource's length and validators. It returns `Whole`
+//! (200), `Partial` (206), `NotModified` (304), `PreconditionFailed` (412) or `Unsatisfiable`
+//! (416). `If-Match` and `If-Range` compare entity tags strongly, `If-None-Match` compares them
+//! weakly, and dates compare to the whole second. The whole representation is sent for a `Range`
+//! that does not parse, uses a unit other than bytes, lists more ranges than the limit, or lists
+//! overlapping ranges. The standard allows this, and it leaves a client nothing to amplify. A
+//! `Range` whose ranges all fall outside the representation gets 416.
 //!
-//! `serve` answers `GET` and `HEAD` with the file a request's path names under the root its label
-//! binds. The path is percent-decoded a segment at a time and refused (404) where a segment is
-//! `.`, `..` or holds a `/`, a `\` or a NUL, and where it names a dotfile, unless `Options` lets
-//! dotfiles through. A link anywhere on the path is not followed, so nothing outside what the
-//! root holds as files and directories is served, and a directory is never listed: it is its
-//! index file where `Options` names one, and 404 where not. The host refuses a path that leaves
-//! the root besides. Each answer names its type with `nosniff`, its strong entity tag (the size
-//! and the modification time), `Last-Modified`, `Date` and `Accept-Ranges: bytes`; several ranges
-//! are one `multipart/byteranges` body under a boundary drawn from `entropy`. A file's body is a
-//! stream of its length, read through a handle, or by `read_at` for a range, a chunk at a time as
-//! it is sent, so a file of any size is answered in the memory of a chunk; an answer to `HEAD`
-//! opens nothing.
+//! `serve` responds to `GET` and `HEAD` with the file that a request's path names under the root
+//! its label binds. The path is percent-decoded one segment at a time. It is rejected with 404 when
+//! a segment is `.` or `..`, contains a `/`, a `\` or a NUL, or names a dotfile and `Options` does
+//! not allow dotfiles. Links on the path are never followed, so only the files and directories
+//! inside the root are served. A directory is never listed: it serves its index file when `Options`
+//! names one, and 404 otherwise. The host also rejects any path that leaves the root. Each response
+//! states its type with `nosniff`, its strong entity tag (from the size and the modification time),
+//! `Last-Modified`, `Date` and `Accept-Ranges: bytes`. Several ranges form one
+//! `multipart/byteranges` body, with a boundary drawn from `entropy`. A file's body is a stream of
+//! its length, read through a handle (or with `read_at` for a range) one chunk at a time as it is
+//! sent. So a file of any size needs only one chunk of memory. A response to `HEAD` opens nothing.
 
 import std.date
 import std.date (OffsetDateTime)
@@ -36,7 +35,7 @@ import std.math (abs, to_radix)
 import std.mime
 import std.multipart
 import std.net
-import std.net (Says, net)
+import std.net (Sends, net)
 import std.random (entropy, rand, with_rand)
 import std.seq
 import std.seq (Seq)
@@ -50,13 +49,13 @@ import std.gen
 /// An entity tag: its opaque text without the quotes, and whether it is weak.
 pub type ETag = { weak: Bool, tag: String }
 
-/// The tag as a field writes it: `"text"`, or `W/"text"` for a weak one.
+/// The tag as a header field writes it: `"text"`, or `W/"text"` for a weak one.
 pub fn etag_text(e: ETag) -> String = (if e.weak { "W/" } else { "" }) ++ "\"" ++ e.tag ++ "\""
 
 /// What an `If-Match` or an `If-None-Match` lists: `*`, or entity tags.
 pub type Tags = | AnyTag | Listed(List<ETag>)
 
-/// The tags a field lists, or `None` where it does not read as RFC 9110 §8.8.3 writes them.
+/// The tags a field lists, or `None` when it does not parse as RFC 9110 §8.8.3 defines them.
 pub fn read_tags(field: String) -> Option<Tags> / {abort.raise} =
   if field.ascii_trim() == "*" { Some(AnyTag) } else {
     field.split(",").fold(Some(Listed([])), |acc: Option<Tags>, piece: String|
@@ -87,39 +86,39 @@ pub fn weak_match(a: ETag, b: ETag) -> Bool = a.tag == b.tag
 
 // --- Preconditions and ranges -----------------------------------------------
 
-/// What the preconditions read of a representation: its entity tag and when it last changed,
-/// where it has them.
+/// The parts of a representation that preconditions check: its entity tag and when it last
+/// changed, if it has them.
 pub type Validators = { etag: Option<ETag>, modified: Option<OffsetDateTime> }
 
 /// A range of bytes resolved against a representation's length: its first and its last byte.
 pub type ByteRange = { first: Int, last: Int }
 
-/// What a request for a representation is answered with.
+/// The response a request for a representation gets.
 pub type Decision =
   /// 200: the whole representation.
   | Whole
-  /// 206: these ranges of it, in the order asked, none overlapping.
+  /// 206: these ranges of it, in the order requested, none overlapping.
   | Partial(List<ByteRange>)
   /// 304: the client's copy is current.
   | NotModified
-  /// 412: a precondition the client set does not hold.
-  | Failed
-  /// 416: the representation holds none of the ranges asked for.
+  /// 412: a precondition the client set is false.
+  | PreconditionFailed
+  /// 416: none of the requested ranges fall inside the representation.
   | Unsatisfiable
 
-/// The status a decision is answered with.
+/// The HTTP status of a decision.
 pub fn status_of(d: Decision) -> Int =
   match d {
     Whole -> 200,
     Partial(_) -> 206,
     NotModified -> 304,
-    Failed -> 412,
+    PreconditionFailed -> 412,
     Unsatisfiable -> 416,
   }
 
-/// What `method` with `headers` is answered with, for a representation of `length` bytes and
-/// validators `v`, by RFC 9110 §13.2.2, `max_ranges` ranges at most answered as ranges and `now`
-/// deciding a two-digit year.
+/// The response to `method` with `headers` for a representation of `length` bytes with validators
+/// `v`, by RFC 9110 §13.2.2. At most `max_ranges` ranges are served as ranges, and `now` resolves
+/// a two-digit year.
 pub fn decide(
   method: Method,
   headers: Headers,
@@ -128,12 +127,13 @@ pub fn decide(
   max_ranges: Int,
   now: Instant,
 ) -> Decision / {abort.raise} =
-  if !if_match_holds(headers, v) || !unmodified_since_holds(headers, v, now) { Failed } else {
+  if !if_match_holds(headers, v) || !unmodified_since_holds(headers, v, now) { PreconditionFailed }
+  else {
     match none_match_holds(headers, v) {
-      Some(false) -> if is_safe(method) { NotModified } else { Failed },
-      Some(true) -> ranged(method, headers, v, length, max_ranges, now),
+      Some(false) -> if is_safe(method) { NotModified } else { PreconditionFailed },
+      Some(true) -> range_decision(method, headers, v, length, max_ranges, now),
       None -> if is_safe(method) && !modified_since_holds(headers, v, now) { NotModified }
-      else { ranged(method, headers, v, length, max_ranges, now) },
+      else { range_decision(method, headers, v, length, max_ranges, now) },
     }
   }
 
@@ -177,7 +177,7 @@ fn none_match_holds(headers: Headers, v: Validators) -> Option<Bool> / {abort.ra
     },
   }
 
-/// `If-Modified-Since`: whether the resource changed after the date the client holds.
+/// `If-Modified-Since`: whether the resource changed after the client's date.
 fn modified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool =
   match ((http::date_field(headers, "if-modified-since", now), v.modified)) {
     (Some(at), Some(modified)) -> seconds_of(modified) > seconds_of(at),
@@ -187,7 +187,7 @@ fn modified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool =
 fn seconds_of(o: OffsetDateTime) -> Int = date::unix_seconds(o)
 
 /// §13.2.2's last step: a `Range` on a `GET`, where an `If-Range` lets it through.
-fn ranged(
+fn range_decision(
   method: Method,
   headers: Headers,
   v: Validators,
@@ -226,9 +226,10 @@ fn if_range_holds(headers: Headers, v: Validators, now: Instant) -> Bool / {abor
     },
   }
 
-/// The ranges a `Range` field asks of `length` bytes, resolved and in the order asked, those the
-/// representation holds none of left out; `None` where the field is to be ignored: it does not
-/// read, names another unit, asks more than `max_ranges` ranges, or ranges that overlap.
+/// The ranges a `Range` field requests of `length` bytes, resolved and in the order requested,
+/// leaving out those that fall entirely outside the representation. `None` when the field must be
+/// ignored: it does not parse, names another unit, or requests more than `max_ranges` ranges or
+/// overlapping ranges.
 pub fn read_ranges(
   field: String,
   length: Int,
@@ -240,10 +241,10 @@ pub fn read_ranges(
       let resolved = specs.fold(Some([]), |acc: Option<List<ByteRange>>, spec: String|
         match acc {
           None -> None,
-          Some(found) -> match spec_of(spec.ascii_trim(), length) {
-            Spec(r) -> Some(found.push(r)),
-            Beyond -> Some(found),
-            Unread -> None,
+          Some(find_file) -> match resolve_range_spec(spec.ascii_trim(), length) {
+            InBounds(r) -> Some(find_file.push(r)),
+            PastEnd -> Some(find_file),
+            Malformed -> None,
           },
         });
       match resolved {
@@ -253,25 +254,25 @@ pub fn read_ranges(
     }
   }
 
-type Resolved = | Spec(ByteRange) | Beyond | Unread
+type RangeResolution = | InBounds(ByteRange) | PastEnd | Malformed
 
-fn spec_of(spec: String, length: Int) -> Resolved / {abort.raise} = {
+fn resolve_range_spec(spec: String, length: Int) -> RangeResolution / {abort.raise} = {
   let b = Bytes::of_string(spec);
   match b.index_of(b"-") {
-    None -> Unread,
+    None -> Malformed,
     Some(at) -> {
       let first = digits_of(spec.slice(0, at));
       let last = digits_of(spec.slice(at + 1, spec.len()));
       match ((at == 0, first, last)) {
-        (true, _, Some(n)) -> if n == 0 || length == 0 { Beyond }
-        else { Spec({ first: max(length - n, 0), last: length - 1 }) },
+        (true, _, Some(n)) -> if n == 0 || length == 0 { PastEnd }
+        else { InBounds({ first: max(length - n, 0), last: length - 1 }) },
         (false, Some(a), None) -> if spec.len() == at + 1 {
-          if a >= length { Beyond } else { Spec({ first: a, last: length - 1 }) }
-        } else { Unread },
-        (false, Some(a), Some(z)) -> if a > z { Unread }
-        else if a >= length { Beyond }
-        else { Spec({ first: a, last: min(z, length - 1) }) },
-        _ -> Unread,
+          if a >= length { PastEnd } else { InBounds({ first: a, last: length - 1 }) }
+        } else { Malformed },
+        (false, Some(a), Some(z)) -> if a > z { Malformed }
+        else if a >= length { PastEnd }
+        else { InBounds({ first: a, last: min(z, length - 1) }) },
+        _ -> Malformed,
       }
     },
   }
@@ -297,15 +298,15 @@ fn overlapping(ranges: List<ByteRange>) -> Bool = {
 
 // --- Serving files ----------------------------------------------------------
 
-/// How `serve` answers.
+/// Settings for `serve`.
 pub type Options = {
-  /// The file a directory's path is answered with; `None` answers a directory 404.
+  /// The file served for a directory's path; with `None`, a directory gets 404.
   index: Option<String>,
   /// Whether a path with a segment that begins with `.` is served.
   dotfiles: Bool,
-  /// The most ranges one request is answered with as ranges.
+  /// The most ranges one request can get as ranges.
   max_ranges: Int,
-  /// The `Cache-Control` each file is answered with, where there is one.
+  /// The `Cache-Control` sent with each file, if any.
   cache_control: Option<String>,
   /// The most bytes one read of a file takes.
   chunk: Int,
@@ -322,10 +323,10 @@ pub fn default_options() -> Options =
     chunk: 1048576,
   }
 
-/// The path under the root a request's `path` names, percent-decoded, or `None` where it names
-/// nothing `serve` would answer: a segment that is `.` or `..`, that holds `/`, `\` or a NUL once
-/// decoded, that does not decode, or, unless `dotfiles`, that begins with `.`. Empty segments are
-/// passed over; the root is `.`.
+/// The path under the root that a request's `path` names, percent-decoded. `None` when it names
+/// nothing `serve` would serve: a segment that is `.` or `..`, contains `/`, `\` or a NUL once
+/// decoded, does not decode, or begins with `.` unless `dotfiles` is set. Empty segments are
+/// skipped; the root is `.`.
 pub fn file_path(path: String, dotfiles: Bool) -> Option<String> / {abort.raise} =
   if !path.starts_with("/") { None } else {
     let decoded = path.split("/").fold(Some([]), |acc: Option<List<String>>, seg: String|
@@ -356,26 +357,26 @@ fn segment_served(seg: String, dotfiles: Bool) -> Bool =
 pub fn file_etag(size: Int, modified: Instant) -> ETag / {abort.raise} =
   { weak: false, tag: to_radix(size, 16) ++ "-" ++ to_radix(max(nanos_at(modified), 0), 16) }
 
-/// The answer to `req` from the file `path` names under the root `r`, `path` being what the
-/// request names below where the files are served, as the request wrote it. `now` is the wall
-/// clock's, for `Date` and for reading the client's dates. The body is a stream of the file's
-/// length, read through a handle `Options.chunk` bytes at a time as it is sent, and a range of it
-/// by `read_at`; a file that ends short of the length it had when it was looked at, or changes,
-/// leaves the stream short and its connection closed. An answer to `HEAD` opens nothing.
+/// The response to `request` from the file that `path` names under the root `r`. `path` is the part of
+/// the request's path below where the files are served, as the request wrote it. `now` is the
+/// wall-clock time, used for `Date` and for reading the client's dates. The body is a stream of the
+/// file's length, read through a handle `Options.chunk` bytes at a time as it is sent; a range is
+/// read with `read_at`. If the file becomes shorter than its length when it was looked up, or
+/// changes, the stream ends early and its connection is closed. A response to `HEAD` opens nothing.
 pub fn serve<[r] | s>(
-  req: Request,
+  request: Request,
   path: String,
   options: Options,
   now: OffsetDateTime,
 ) -> Response<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> / {fs.kind[r], fs.stat[r], fs.open[r], fs.read_at[r], entropy.next, abort.raise} =
-  if req.method != http::Get && req.method != http::Head {
+  if request.method != http::Get && request.method != http::Head {
     http::dated(http::method_not_allowed([http::Get, http::Head]), now)
   } else {
     match file_path(path, options.dotfiles) {
       None -> not_found(now),
-      Some(under) -> match found[r](under, options) {
+      Some(under) -> match find_file[r](under, options) {
         None -> not_found(now),
-        Some(file) -> answered[r](req, file, options, now),
+        Some(file) -> file_response[r](request, file, options, now),
       },
     }
   }
@@ -383,12 +384,12 @@ pub fn serve<[r] | s>(
 fn not_found<| e>(now: OffsetDateTime) -> Response<| e> =
   http::dated(http::text_response(404, "there is no such file\n"), now)
 
-type Found = { path: String, stat: fs::Stat }
+type FoundFile = { path: String, stat: fs::Stat }
 
-/// The file `under` names, its index where it is a directory, where every step to it is a file or
-/// a directory and none a link.
-fn found<[r]>(under: String, options: Options) -> Option<Found> / {fs.kind[r], fs.stat[r]} =
-  if !unlinked[r](under) { None } else {
+/// The file `under` names, or its index file if it is a directory, provided every step of the path
+/// is a file or a directory and none is a link.
+fn find_file<[r]>(under: String, options: Options) -> Option<FoundFile> / {fs.kind[r], fs.stat[r]} =
+  if !has_no_symlink[r](under) { None } else {
     match fs.stat[r](under) {
       Some(s) -> if s.kind == fs::File { Some({ path: under, stat: s }) }
       else if s.kind == fs::Dir {
@@ -408,7 +409,7 @@ fn found<[r]>(under: String, options: Options) -> Option<Found> / {fs.kind[r], f
   }
 
 /// Whether no step of `under` is a link.
-fn unlinked<[r]>(under: String) -> Bool / {fs.kind[r]} =
+fn has_no_symlink<[r]>(under: String) -> Bool / {fs.kind[r]} =
   if under == "." { true } else {
     under.split("/").fold({ at: "", ok: true }, |s: { at: String, ok: Bool }, seg: String| {
       let at = if s.at.len() == 0 { seg } else { s.at ++ "/" ++ seg };
@@ -416,9 +417,9 @@ fn unlinked<[r]>(under: String) -> Bool / {fs.kind[r]} =
     }).ok
   }
 
-fn answered<[r] | s>(
-  req: Request,
-  file: Found,
+fn file_response<[r] | s>(
+  request: Request,
+  file: FoundFile,
   options: Options,
   now: OffsetDateTime,
 ) -> Response<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> / {fs.open[r], fs.read_at[r], entropy.next, abort.raise} = {
@@ -430,30 +431,30 @@ fn answered<[r] | s>(
     None -> "application/octet-stream",
   };
   let wall = match date::instant(now) { Some(i) -> i, None -> Instant(0) };
-  let described = described(tag, modified, options, now);
-  match decide(req.method, req.headers, v, file.stat.size, options.max_ranges, wall) {
-    NotModified -> { ..described, status: 304 },
-    Failed -> { ..described, status: 412 },
+  let base_response = base_response(tag, modified, options, now);
+  match decide(request.method, request.headers, v, file.stat.size, options.max_ranges, wall) {
+    NotModified -> { ..base_response, status: 304 },
+    PreconditionFailed -> { ..base_response, status: 412 },
     Unsatisfiable ->
       {
-        ..described,
+        ..base_response,
         status: 416,
         headers: http::set_header(
-          described.headers,
+          base_response.headers,
           "content-range",
           "bytes */" ++ file.stat.size.to_string(),
         ),
       },
     Whole -> {
-      let typed = http::set_header(described.headers, "content-type", kind);
-      if req.method == http::Head {
-        { ..described, headers: typed, body: unread[r](file.stat.size) }
+      let typed = http::set_header(base_response.headers, "content-type", kind);
+      if request.method == http::Head {
+        { ..base_response, headers: typed, body: head_body[r](file.stat.size) }
       } else {
         match fs.open[r](file.path, fs::ToRead) {
-          Err(_) -> changed(now),
+          Err(_) -> file_changed_response(now),
           Ok(opened) ->
             {
-              ..described,
+              ..base_response,
               headers: typed,
               body: file_body[r](opened, file.stat.size, options.chunk),
             },
@@ -464,44 +465,45 @@ fn answered<[r] | s>(
       {
         status: 206,
         headers: http::set_header(
-          http::set_header(described.headers, "content-type", kind),
+          http::set_header(base_response.headers, "content-type", kind),
           "content-range",
           content_range(one, file.stat.size),
         ),
         body: range_body[r](file.path, one, options.chunk),
       },
     Partial(ranges) ->
-      byteranges[r](file.path, ranges, file.stat.size, kind, described, options.chunk, now),
+      byteranges[r](file.path, ranges, file.stat.size, kind, base_response, options.chunk, now),
   }
 }
 
-/// A body of `size` bytes that is never read, as the answer to `HEAD` is.
-fn unread<[r] | s>(
+/// A body of `size` bytes that is never read, as for a response to `HEAD`.
+fn head_body<[r] | s>(
   size: Int,
 ) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
-  let held: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+  let stream: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
     length: Some(size),
     chunks: seq::empty(),
     close: || (),
   };
-  Streamed(held)
+  Streamed(stream)
 }
 
-/// The `size` bytes of the file `f` is open on, as they are pulled, the file closed with the stream.
+/// The `size` bytes of the open file `f`, read as they are pulled; closing the stream closes the
+/// file.
 fn file_body<[r] | s>(
   f: Int,
   size: Int,
   chunk: Int,
 ) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
-  let held: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+  let stream: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
     length: Some(size),
-    chunks: through[r](f, size, chunk),
+    chunks: file_chunks[r](f, size, chunk),
     close: || {
       fs.close[r](f);
       ()
     },
   };
-  Streamed(held)
+  Streamed(stream)
 }
 
 /// The bytes of `range` in the file at `path`, as they are pulled.
@@ -510,17 +512,17 @@ fn range_body<[r] | s>(
   range: ByteRange,
   chunk: Int,
 ) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
-  let held: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+  let stream: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
     length: Some(range.last - range.first + 1),
     chunks: ranged_chunks[r](path, range, chunk),
     close: || (),
   };
-  Streamed(held)
+  Streamed(stream)
 }
 
-/// The `size` bytes of the file `f` is open on, a chunk of at most `chunk` bytes each pull; it ends
-/// short where the file does.
-fn through<[r] | e>(
+/// The `size` bytes of the open file `f`, at most `chunk` bytes per pull; it ends early if the file
+/// does.
+fn file_chunks<[r] | e>(
   f: Int,
   size: Int,
   chunk: Int,
@@ -552,8 +554,8 @@ fn ranged_chunks<[r] | e>(
   seq::unfold(0, step)
 }
 
-/// The fields every answer about a file carries, and no body.
-fn described<| e>(
+/// The header fields every response about a file includes, with no body.
+fn base_response<| e>(
   tag: ETag,
   modified: OffsetDateTime,
   options: Options,
@@ -578,8 +580,8 @@ fn described<| e>(
 fn content_range(r: ByteRange, size: Int) -> String =
   "bytes " ++ r.first.to_string() ++ "-" ++ r.last.to_string() ++ "/" ++ size.to_string()
 
-/// The file changed between its look and its read, which a retry answers.
-fn changed<| e>(now: OffsetDateTime) -> Response<| e> =
+/// The response when the file changed between its lookup and its read; a retry resolves it.
+fn file_changed_response<| e>(now: OffsetDateTime) -> Response<| e> =
   http::dated(http::text_response(503, "the file changed while it was read\n"), now)
 
 /// Several ranges, as one `multipart/byteranges` body read whole: at most `max_ranges` of them.
@@ -588,7 +590,7 @@ fn byteranges<[r] | e>(
   ranges: List<ByteRange>,
   size: Int,
   kind: String,
-  described: Response<| e>,
+  base_response: Response<| e>,
   chunk: Int,
   now: OffsetDateTime,
 ) -> Response<| e> / {fs.read_at[r], entropy.next, abort.raise} = {
@@ -613,24 +615,24 @@ fn byteranges<[r] | e>(
     });
   let boundary = multipart::fresh_boundary();
   match parts {
-    None -> changed(now),
+    None -> file_changed_response(now),
     Some(ps) -> match multipart::build(ps, boundary) {
       Ok(body) ->
         {
           status: 206,
           headers: http::set_header(
-            described.headers,
+            base_response.headers,
             "content-type",
             "multipart/byteranges; boundary=" ++ boundary,
           ),
           body: http::Whole(body),
         },
-      Err(_) -> changed(now),
+      Err(_) -> file_changed_response(now),
     },
   }
 }
 
-/// The bytes of `r` in the file, read `chunk` at a time; `None` where the file no longer holds
+/// The bytes of `r` in the file, read `chunk` at a time; `None` if the file no longer contains
 /// them all.
 fn range_bytes<[r]>(
   path: String,
@@ -711,19 +713,19 @@ test "RFC 9110's preconditions decide in their order: {c.what}" for c: { what: S
       what: "If-Match of another tag",
       method: http::Put,
       fields: [{ name: "If-Match", value: "\"v0\"" }],
-      decision: Failed,
+      decision: PreconditionFailed,
     },
     {
       what: "If-Match of a weak tag",
       method: http::Get,
       fields: [{ name: "If-Match", value: "W/\"v1\"" }],
-      decision: Failed,
+      decision: PreconditionFailed,
     },
     {
       what: "If-Unmodified-Since before the change",
       method: http::Put,
       fields: [{ name: "If-Unmodified-Since", value: "Tue, 14 Nov 2023 22:13:19 GMT" }],
-      decision: Failed,
+      decision: PreconditionFailed,
     },
     {
       what: "If-Unmodified-Since at the change",
@@ -750,7 +752,7 @@ test "RFC 9110's preconditions decide in their order: {c.what}" for c: { what: S
       what: "If-None-Match on a PUT",
       method: http::Put,
       fields: [{ name: "If-None-Match", value: "*" }],
-      decision: Failed,
+      decision: PreconditionFailed,
     },
     {
       what: "If-None-Match of another tag",
@@ -848,7 +850,7 @@ test "RFC 9110's preconditions decide in their order: {c.what}" for c: { what: S
     Whole -> 200,
     Partial(_) -> 206,
     NotModified -> 304,
-    Failed -> 412,
+    PreconditionFailed -> 412,
     Unsatisfiable -> 416,
   })
 }
@@ -907,27 +909,27 @@ fn site() -> fs::MemFs / {abort.raise} = {
 
 fn noon() -> OffsetDateTime / {abort.raise} = at_second(1700000100)
 
-/// An answer with its body read whole, and the length it said it had.
-type Read = { status: Int, headers: Headers, body: Bytes, length: Option<Int> }
+/// A response with its body read whole, and the length it reported.
+type ReadResponse = { status: Int, headers: Headers, body: Bytes, length: Option<Int> }
 
-/// The answer to a request for `path` with `pairs` over the site, under `options`, its body read
-/// while the site is there to read.
-fn fetched(
+/// The response to a request for `path` with the header fields `pairs`, served from the test site
+/// under `options`. The body is read while the site still exists.
+fn fetch(
   method: Method,
   path: String,
   pairs: List<{ name: String, value: String }>,
   options: Options,
-) -> Read / {abort.raise} = {
+) -> ReadResponse / {abort.raise} = {
   let bare = http::request_to(method, "example.org", path, b"");
-  let req = { ..bare, headers: fields(pairs) };
+  let request = { ..bare, headers: fields(pairs) };
   with_rand(rand(7), ||
     fs::on_mem[site](site(), || {
-      let r = serve[site](req, req.path, options, noon());
+      let r = serve[site](request, request.path, options, noon());
       {
         status: r.status,
         headers: r.headers,
         length: http::body_length(r.body),
-        body: match http::gathered(r.body, 1048576) {
+        body: match http::collect_body(r.body, 1048576) {
           Some(b) -> b,
           None -> panic("a site file is under a MiB"),
         },
@@ -935,8 +937,8 @@ fn fetched(
     }).value).value
 }
 
-test "a file is served with what it is, when it changed, and how to ask for less of it" {
-  let r = fetched(http::Get, "/css/site.css", [], default_options());
+test "a file is served with its type, when it changed, and how to request part of it" {
+  let r = fetch(http::Get, "/css/site.css", [], default_options());
   assert_eq(r.status, 200);
   assert_eq(r.body, b"body{}");
   assert_eq(http::header(r.headers, "content-type"), Some("text/css"));
@@ -948,15 +950,15 @@ test "a file is served with what it is, when it changed, and how to ask for less
     http::header(r.headers, "etag"),
     Some(etag_text(file_etag(6, Instant(1700000000000000000)))),
   );
-  let root = fetched(http::Get, "/", [], default_options());
+  let root = fetch(http::Get, "/", [], default_options());
   assert_eq((root.status, root.body), (200, b"<h1>parts</h1>"));
   assert_eq(http::header(root.headers, "content-type"), Some("text/html"))
 }
 
-test "a client's copy that is current is told so, and one that is not is sent the file" {
-  let first = fetched(http::Get, "/css/site.css", [], default_options());
+test "a client whose copy is current gets 304, and one whose copy is stale gets the file" {
+  let first = fetch(http::Get, "/css/site.css", [], default_options());
   let etag = match http::header(first.headers, "etag") { Some(e) -> e, None -> "" };
-  let again = fetched(
+  let again = fetch(
     http::Get,
     "/css/site.css",
     [{ name: "If-None-Match", value: etag }],
@@ -964,21 +966,21 @@ test "a client's copy that is current is told so, and one that is not is sent th
   );
   assert_eq((again.status, again.body), (304, b""));
   assert_eq(http::header(again.headers, "etag"), Some(etag));
-  let dated = fetched(
+  let dated = fetch(
     http::Get,
     "/css/site.css",
     [{ name: "If-Modified-Since", value: "Tue, 14 Nov 2023 22:13:20 GMT" }],
     default_options(),
   );
   assert_eq(dated.status, 304);
-  let stale = fetched(
+  let stale = fetch(
     http::Get,
     "/css/site.css",
     [{ name: "If-None-Match", value: "\"0-0\"" }],
     default_options(),
   );
   assert_eq((stale.status, stale.body), (200, b"body{}"));
-  let guarded = fetched(
+  let guarded = fetch(
     http::Get,
     "/css/site.css",
     [{ name: "If-Match", value: "\"0-0\"" }],
@@ -987,8 +989,8 @@ test "a client's copy that is current is told so, and one that is not is sent th
   assert_eq(guarded.status, 412)
 }
 
-test "ranges of a file are answered one or several at a time, and past its end refused" {
-  let one = fetched(
+test "ranges of a file are served one or several at a time, and ranges past its end are rejected" {
+  let one = fetch(
     http::Get,
     "/data/parts.csv",
     [{ name: "Range", value: "bytes=2-5" }],
@@ -996,12 +998,12 @@ test "ranges of a file are answered one or several at a time, and past its end r
   );
   assert_eq((one.status, one.body), (206, b"2345"));
   assert_eq(http::header(one.headers, "content-range"), Some("bytes 2-5/20"));
-  let tail = fetched(http::Get, "/data/parts.csv", [{ name: "Range", value: "bytes=-3" }], {
+  let tail = fetch(http::Get, "/data/parts.csv", [{ name: "Range", value: "bytes=-3" }], {
     ..default_options(),
     chunk: 2,
   });
   assert_eq(tail.body, b"hij");
-  let two = fetched(
+  let two = fetch(
     http::Get,
     "/data/parts.csv",
     [{ name: "Range", value: "bytes=0-1, 18-19" }],
@@ -1021,7 +1023,7 @@ test "ranges of a file are answered one or several at a time, and past its end r
     },
     Err(_) -> panic("a byteranges body reads as parts"),
   };
-  let beyond = fetched(
+  let beyond = fetch(
     http::Get,
     "/data/parts.csv",
     [{ name: "Range", value: "bytes=20-" }],
@@ -1029,7 +1031,7 @@ test "ranges of a file are answered one or several at a time, and past its end r
   );
   assert_eq(beyond.status, 416);
   assert_eq(http::header(beyond.headers, "content-range"), Some("bytes */20"));
-  let many = fetched(
+  let many = fetch(
     http::Get,
     "/data/parts.csv",
     [{ name: "Range", value: "bytes=0-0,2-2,4-4" }],
@@ -1045,9 +1047,9 @@ test "nothing outside the files is served: {c.path}" for c: { path: String, stat
     { path: "/data", status: 404 },
     { path: "/missing.txt", status: 404 },
     { path: "/data/parts.csv", status: 200 },
-  ] { assert_eq(fetched(http::Get, c.path, [], default_options()).status, c.status) }
+  ] { assert_eq(fetch(http::Get, c.path, [], default_options()).status, c.status) }
 
-test "a file is answered over a connection as its client asked for it, a range and then a check" {
+test "a file is served over a connection as requested: a range, then a conditional request" {
   let etag = etag_text(file_etag(20, Instant(1700000000000000000)));
   let asked = Bytes::of_string(
     "GET /data/parts.csv HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n"
@@ -1056,7 +1058,7 @@ test "a file is answered over a connection as its client asked for it, a range a
       ++ "\r\nConnection: close\r\n\r\n",
   );
   let ran = net::on_mem(
-    net::mem_calling(net::mem_empty(), ip::read_socket("198.51.100.4:5000"), [Says(asked)]),
+    net::mem_calling(net::mem_empty(), ip::read_socket("198.51.100.4:5000"), [Sends(asked)]),
     ||
       with_rand(rand(7), ||
         fs::on_mem[site](site(), || {
@@ -1064,7 +1066,7 @@ test "a file is answered over a connection as its client asked for it, a range a
           http::serve_connection[conn](
             net.accept[listener](listener),
             http::default_limits(),
-            |req: Request| serve[site](req, req.path, default_options(), noon()),
+            |request: Request| serve[site](request, request.path, default_options(), noon()),
           )
         }).value).value,
   );
@@ -1078,11 +1080,11 @@ test "a file is answered over a connection as its client asked for it, a range a
 }
 
 test "a file is read a chunk at a time, and a HEAD carries the length a GET would and reads nothing" {
-  let small = fetched(http::Get, "/data/parts.csv", [], { ..default_options(), chunk: 3 });
+  let small = fetch(http::Get, "/data/parts.csv", [], { ..default_options(), chunk: 3 });
   assert_eq((small.body, small.length), (b"0123456789abcdefghij", Some(20)));
-  let head = fetched(http::Head, "/data/parts.csv", [], default_options());
+  let head = fetch(http::Head, "/data/parts.csv", [], default_options());
   assert_eq((head.status, head.body, head.length), (200, b"", Some(20)));
-  // What a HEAD opens or reads, counted between the serving and the files.
+  // Counts what a HEAD opens or reads, with a handler between `serve` and the files.
   let asked = {
     ..http::request_to(http::Head, "example.org", "/data/parts.csv", b""),
     headers: fields([]),
@@ -1090,7 +1092,7 @@ test "a file is read a chunk at a time, and a HEAD carries the length a GET woul
   let reads = with_rand(rand(7), ||
     fs::on_mem[site](site(), ||
       handle {
-        http::gathered(serve[site](asked, asked.path, default_options(), noon()).body, 1048576)
+        http::collect_body(serve[site](asked, asked.path, default_options(), noon()).body, 1048576)
       } with {
         var n = 0,
         fs.kind[site](path) -> fs.kind[site](path),
@@ -1111,6 +1113,6 @@ test "a file is read a chunk at a time, and a HEAD carries the length a GET woul
         return _body -> n,
       }).value).value;
   assert(reads == 0, Some("a HEAD opened or read the file"));
-  assert_eq(fetched(http::Post, "/data/parts.csv", [], default_options()).status, 405);
-  assert_eq(fetched(http::Get, "/empty/readme.txt", [], default_options()).body, b"")
+  assert_eq(fetch(http::Post, "/data/parts.csv", [], default_options()).status, 405);
+  assert_eq(fetch(http::Get, "/empty/readme.txt", [], default_options()).body, b"")
 }

@@ -1,58 +1,59 @@
-//! The try operator, rewritten with the grammar into the match it is.
-
 import std.list
-import compiler.syntax.parsing (Span, Ident, ParseDiag, bare, error_at, is_bare)
-import compiler.syntax.type_syntax (TypeExpr, TCon, is_generic)
-import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, ISchema, TypeDef, TDAlias, TDSum,
-                              SpecClause, SRequires, SEnsures, SCost, SSpace, TDNominal, TDExtern)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, HandlerVar, NamedArg, MatchArm,
-                              HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole,
-                              with_hole_values, exit_effect, is_exit_effect, exit_op)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PCtor, LUnit)
+import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, bare, error_at, is_bare)
+import compiler.syntax.type_syntax (TypeExpression, NamedTypeExpression, is_generic)
+import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, SchemaItem,
+                              TypeDefinition, AliasBody, SumBody, SpecClause, RequiresClause,
+                              EnsuresClause, CostClause, SpaceClause, NominalBody, ExternBody)
+import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, BinaryExpression,
+                                    UnaryExpression, LambdaExpression, CallExpression, IfExpression,
+                                    MatchExpression, BlockExpression, RecordExpression,
+                                    RecordUpdateExpression, PropagateExpression, FieldExpression,
+                                    ListExpression, PerformExpression, HandleExpression,
+                                    WithHoldExpression, SimulateExpression, ParallelExpression,
+                                    InvalidExpression, TryBlockExpression, Statement, LetStatement,
+                                    LetElseStatement, ExpressionStatement, AssignmentStatement,
+                                    HandlerVar, NamedArg, MatchArm, HandleClause, ReturnClause,
+                                    RecordLiteralField, expression_span, TaggedLiteralExpression,
+                                    Hole, with_hole_values, exit_effect, is_exit_effect, exit_op)
+import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternConstructor,
+                                 LiteralUnit)
 import std.bytes (ascii_of_int)
 import compiler.expand.rewrite.shared (max_alias_depth, collect_types, find_type, is_pure,
-                                       bound_among, count_in)
-import compiler.check.known (ok_ctor, err_ctor, some_ctor, none_ctor, result_name, option_name)
-
-// --- Record update -----------------------------------------------------------------------
-
-// `{..b, f: e}` is the literal it stands for. The shape it copies is the checker's answer for the
-// base, keyed by the update's span, so this runs after the check and not with the other rewrites.
+                                       own_binding_among, count_in)
+import compiler.check.known (ok_constructor, err_constructor, some_constructor, none_constructor,
+                             result_name, option_name)
 
 fn too_deep() -> Bytes =
   Bytes::concat_all([b"more than ", ascii_of_int(max_alias_depth()), b" type aliases deep"])
 
-// --- The try operator ------------------------------------------------------------------------
-
 type TryMode = | TryResult | TryOption
 
-/// `shadowed` is the note for a module whose own `Ok`/`Err`/`Some`/`None` would capture the expansion.
-/// `exit` is the effect a `?` raises to leave the `handle` it stands in, while one is expanded;
-/// `exits` numbers the item's functions and typed lambdas, written at `item_at`, that `?` exits.
 type TryState = {
-  types: List<TypeDef>,
+  types: List<TypeDefinition>,
   shadowed: Option<Bytes>,
-  diags: List<ParseDiag>,
+  diagnostics: List<ParseDiagnostic>,
   mode: Option<TryMode>,
   fresh: Int,
   exit: Option<Bytes>,
   exits: Int,
-  item_at: Int,
+  item_start: Int,
 }
 
-type Lift = { operand: Expr, binder: Ident, at: Span }
+type Lift = { operand: Expression, binder: Identifier, at: Span }
 
 type Scan = | ScanFound(Lift) | ScanPure | ScanImpure
 
-type Scanned = { state: TryState, scan: Scan, expr: Expr }
+type ScanResult = { state: TryState, scan: Scan, expression: Expression }
 
-type TryOut = { state: TryState, expr: Expr }
+type TryOutput = { state: TryState, expression: Expression }
 
-fn shadowing_ctor(module: Module) -> Option<Bytes> =
-  match bound_among(module, [ok_ctor(), err_ctor(), some_ctor(), none_ctor()]) {
+fn shadowing_constructor(module: Module) -> Option<Bytes> =
+  match own_binding_among(module, [
+      ok_constructor(),
+      err_constructor(),
+      some_constructor(),
+      none_constructor(),
+    ]) {
     None -> None,
     Some(own) ->
       Some(if own.imported {
@@ -86,10 +87,10 @@ fn no_return_type() -> Bytes =
 fn not_in_a_function(what: Bytes) -> Bytes =
   what.concat(b" has no written return type, and `?` needs one")
 
-fn mode_of(state: TryState, ty: TypeExpr, depth: Int) -> Result<TryMode, Bytes> =
+fn mode_of(state: TryState, ty: TypeExpression, depth: Int) -> Result<TryMode, Bytes> =
   if depth > max_alias_depth() { Err(too_deep()) } else {
     match ty {
-      TCon(c) -> if !is_bare(c.name) {
+      NamedTypeExpression(c) -> if !is_bare(c.name) {
         Err(
           b"the return type is named through another module, and `?` reads only this file \xe2\x80\x94 a meaning read across a module boundary would go stale in a file that never changed",
         )
@@ -100,10 +101,10 @@ fn mode_of(state: TryState, ty: TypeExpr, depth: Int) -> Result<TryMode, Bytes> 
           None -> Err(not_result_or_option(n)),
           Some(d) -> if is_generic(d.generics) { Err(unreadable()) } else {
             match d.body {
-              TDSum(_) -> Err(not_result_or_option(n)),
-              TDNominal(_) -> Err(not_result_or_option(n)),
-              TDExtern -> Err(not_result_or_option(n)),
-              TDAlias(inner) -> mode_of(state, inner, depth + 1),
+              SumBody(_) -> Err(not_result_or_option(n)),
+              NominalBody(_) -> Err(not_result_or_option(n)),
+              ExternBody -> Err(not_result_or_option(n)),
+              AliasBody(inner) -> mode_of(state, inner, depth + 1),
             }
           },
         }
@@ -112,58 +113,59 @@ fn mode_of(state: TryState, ty: TypeExpr, depth: Int) -> Result<TryMode, Bytes> 
     }
   }
 
-fn mode_for(state: TryState, ret: Option<TypeExpr>) -> Result<TryMode, Bytes> =
+fn mode_for(state: TryState, return_position: Option<TypeExpression>) -> Result<TryMode, Bytes> =
   match state.shadowed {
     Some(why) -> Err(why),
-    None -> match ret { None -> Err(no_return_type()), Some(ty) -> mode_of(state, ty, 0) },
+    None -> match return_position {
+      None -> Err(no_return_type()),
+      Some(ty) -> mode_of(state, ty, 0),
+    },
   }
 
-/// The outermost barrier is the one named.
-fn under(barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
+fn outermost_barrier(barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
   match barrier { Some(_) -> barrier, None -> Some(what) }
 
 fn made_at(at: Span) -> Span = { ..at, site: 0 }
 
-fn fresh_binder(state: TryState, span: Span) -> { state: TryState, binder: Ident } =
+fn fresh_binder(state: TryState, span: Span) -> { state: TryState, binder: Identifier } =
   {
     state: { ..state, fresh: state.fresh + 1 },
     binder: { name: b"?".concat(Bytes::of_string(state.fresh.to_string())), span: made_at(span) },
   }
 
-pub fn var_of(name: Ident) -> Expr = EVar({ span: name.span, name: bare(name) })
+pub fn var_of(name: Identifier) -> Expression =
+  NameExpression({ span: name.span, name: bare(name) })
 
-pub fn var_pattern(name: Ident) -> Pattern = PVar({ span: name.span, name: name })
+pub fn var_pattern(name: Identifier) -> Pattern = PatternVariable({ span: name.span, name: name })
 
-pub fn ctor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
-  PCtor({ span: made_at(span), name: bare({ name: name, span: made_at(span) }), args: args })
+pub fn constructor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
+  PatternConstructor({
+    span: made_at(span),
+    name: bare({ name: name, span: made_at(span) }),
+    args: args,
+  })
 
-/// Where the constructor a `?` written at `at` hands its failure on by stands: the `?` itself, a
-/// place of its own, which the checker files the constructor's type at as it does a written one's.
-fn failed_at(at: Span) -> Span =
+fn failure_span(at: Span) -> Span =
   made_at(if at.end > at.start { { ..at, start: at.end - 1 } } else { at })
 
-/// The raise of `exit` a `?` written at `span` leaves its `handle` by, carrying `value`.
-fn exited(exit: Bytes, span: Span, value: Expr) -> Expr = {
-  let at = failed_at(span);
-  EPerform({
+fn exit_raise(exit: Bytes, span: Span, value: Expression) -> Expression = {
+  let at = failure_span(span);
+  PerformExpression({
     span: at,
-    eff: bare({ name: exit, span: at }),
+    effect_name: bare({ name: exit, span: at }),
     op: { name: exit_op(), span: at },
     resource: None,
     args: [value],
   })
 }
 
-/// `match operand { <failure>, <success>(pat) -> body }`, failure arm first. Inside a `handle`
-/// the failure leaves it by `state.exit`, carrying what the function or lambda would answer
-/// beside the constructor.
-fn wrap(
+fn try_match(
   state: TryState,
-  operand: Expr,
+  operand: Expression,
   span: Span,
-  pat: Pattern,
-  body: Expr,
-) -> TryOut / {abort.raise} = {
+  pattern: Pattern,
+  body: Expression,
+) -> TryOutput / {abort.raise} = {
   let mode = match state.mode {
     Some(m) -> m,
     None -> panic("a mode is established before any lift"),
@@ -171,13 +173,13 @@ fn wrap(
   match mode {
     TryResult -> {
       let fresh = fresh_binder(state, span);
-      let fail_pat = ctor_pattern(err_ctor(), [var_pattern(fresh.binder)], span);
+      let fail_pattern = constructor_pattern(err_constructor(), [var_pattern(fresh.binder)], span);
       let fail_body = match state.exit {
-        Some(exit) -> exited(exit, span, var_of(fresh.binder)),
+        Some(exit) -> exit_raise(exit, span, var_of(fresh.binder)),
         None ->
-          EApp({
+          CallExpression({
             span: made_at(span),
-            func: var_of({ name: err_ctor(), span: failed_at(span) }),
+            function: var_of({ name: err_constructor(), span: failure_span(span) }),
             args: [var_of(fresh.binder)],
             named: [],
             labels: [],
@@ -185,13 +187,13 @@ fn wrap(
       };
       {
         state: fresh.state,
-        expr: EMatch({
+        expression: MatchExpression({
           span: span,
           scrutinee: operand,
           arms: [
-            { pat: fail_pat, guard: None, body: fail_body, span: made_at(span) },
+            { pattern: fail_pattern, guard: None, body: fail_body, span: made_at(span) },
             {
-              pat: ctor_pattern(ok_ctor(), [pat], span),
+              pattern: constructor_pattern(ok_constructor(), [pattern], span),
               guard: None,
               body: body,
               span: made_at(span),
@@ -201,20 +203,25 @@ fn wrap(
       }
     },
     TryOption -> {
-      let fail_pat = ctor_pattern(none_ctor(), [], span);
+      let fail_pattern = constructor_pattern(none_constructor(), [], span);
       let fail_body = match state.exit {
-        Some(exit) -> exited(exit, span, ELit({ span: failed_at(span), lit: LUnit })),
-        None -> var_of({ name: none_ctor(), span: failed_at(span) }),
+        Some(exit) ->
+          exit_raise(
+            exit,
+            span,
+            LiteralExpression({ span: failure_span(span), literal: LiteralUnit }),
+          ),
+        None -> var_of({ name: none_constructor(), span: failure_span(span) }),
       };
       {
         state: state,
-        expr: EMatch({
+        expression: MatchExpression({
           span: span,
           scrutinee: operand,
           arms: [
-            { pat: fail_pat, guard: None, body: fail_body, span: made_at(span) },
+            { pattern: fail_pattern, guard: None, body: fail_body, span: made_at(span) },
             {
-              pat: ctor_pattern(some_ctor(), [pat], span),
+              pattern: constructor_pattern(some_constructor(), [pattern], span),
               guard: None,
               body: body,
               span: made_at(span),
@@ -228,49 +235,46 @@ fn wrap(
 
 fn purity(pure: Bool) -> Scan = if pure { ScanPure } else { ScanImpure }
 
-type Sequenced = { state: TryState, scan: Scan, exprs: List<Expr> }
+type SequenceResult = { state: TryState, scan: Scan, expressions: List<Expression> }
 
-/// Sub-expressions left to right, stopping at the first `?` and at the first impure one.
-fn sequence(state: TryState, parts: List<Expr>) -> Sequenced / {abort.raise} =
-  sequence_on({ state: state, scan: ScanPure, exprs: [] }, parts)
+fn sequence(state: TryState, parts: List<Expression>) -> SequenceResult / {abort.raise} =
+  sequence_on({ state: state, scan: ScanPure, expressions: [] }, parts)
 
-/// `sequence` going on from where one over the sub-expressions before `parts` stopped.
-fn sequence_on(before: Sequenced, parts: List<Expr>) -> Sequenced / {abort.raise} =
-  parts.fold(before, |acc: Sequenced, expr: Expr|
+fn sequence_on(before: SequenceResult, parts: List<Expression>) -> SequenceResult / {abort.raise} =
+  parts.fold(before, |acc: SequenceResult, expression: Expression|
     match acc.scan {
       ScanPure -> {
-        let o = scan(acc.state, expr);
-        { state: o.state, scan: o.scan, exprs: acc.exprs.push(o.expr) }
+        let o = scan(acc.state, expression);
+        { state: o.state, scan: o.scan, expressions: acc.expressions.push(o.expression) }
       },
-      _ -> { ..acc, exprs: acc.exprs.push(expr) },
+      _ -> { ..acc, expressions: acc.expressions.push(expression) },
     })
 
-/// Lifts the first `?` reachable in evaluation order, leaving its binder in its place.
-fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
-  match expr {
-    ELit(_) -> { state: state, scan: ScanPure, expr: expr },
-    EVar(_) -> { state: state, scan: ScanPure, expr: expr },
-    EBad(_) -> { state: state, scan: ScanPure, expr: expr },
-    ETry(t) -> {
+fn scan(state: TryState, expression: Expression) -> ScanResult / {abort.raise} =
+  match expression {
+    LiteralExpression(_) -> { state: state, scan: ScanPure, expression: expression },
+    NameExpression(_) -> { state: state, scan: ScanPure, expression: expression },
+    InvalidExpression(_) -> { state: state, scan: ScanPure, expression: expression },
+    PropagateExpression(t) -> {
       let inner = scan(state, t.operand);
       match inner.scan {
         ScanFound(_) ->
           {
             state: inner.state,
             scan: inner.scan,
-            expr: ETry({ span: t.span, operand: inner.expr }),
+            expression: PropagateExpression({ span: t.span, operand: inner.expression }),
           },
         _ -> {
           let fresh = fresh_binder(inner.state, t.span);
           {
             state: fresh.state,
-            scan: ScanFound({ operand: inner.expr, binder: fresh.binder, at: t.span }),
-            expr: var_of(fresh.binder),
+            scan: ScanFound({ operand: inner.expression, binder: fresh.binder, at: t.span }),
+            expression: var_of(fresh.binder),
           }
         },
       }
     },
-    EBinary(b) -> {
+    BinaryExpression(b) -> {
       let short = b.op == b"and" || b.op == b"or";
       let l = scan(state, b.lhs);
       match l.scan {
@@ -278,113 +282,138 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
           {
             state: l.state,
             scan: l.scan,
-            expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: b.rhs }),
+            expression: BinaryExpression({ span: b.span, op: b.op, lhs: l.expression, rhs: b.rhs }),
           },
-        ScanImpure -> { state: l.state, scan: ScanImpure, expr: expr },
-        ScanPure -> if short { { state: l.state, scan: purity(is_pure(b.rhs)), expr: expr } } else {
+        ScanImpure -> { state: l.state, scan: ScanImpure, expression: expression },
+        ScanPure -> if short {
+          { state: l.state, scan: purity(is_pure(b.rhs)), expression: expression }
+        } else {
           let r = scan(l.state, b.rhs);
           {
             state: r.state,
             scan: r.scan,
-            expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: r.expr }),
+            expression: BinaryExpression({
+              span: b.span,
+              op: b.op,
+              lhs: l.expression,
+              rhs: r.expression,
+            }),
           }
         },
       }
     },
-    EUnary(u) -> {
+    UnaryExpression(u) -> {
       let o = scan(state, u.operand);
-      { state: o.state, scan: o.scan, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
+      {
+        state: o.state,
+        scan: o.scan,
+        expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
+      }
     },
-    EApp(a) -> {
+    CallExpression(a) -> {
       let o = sequence_on(
-        sequence_on(sequence(state, [a.func]), a.args),
+        sequence_on(sequence(state, [a.function]), a.args),
         a.named.map(|n: NamedArg| n.value),
       );
-      let func = o.exprs.get(0);
-      let args = o.exprs.drop(1).take(a.args.len());
-      let nvals = o.exprs.drop(1 + a.args.len());
+      let function = o.expressions.get(0);
+      let args = o.expressions.drop(1).take(a.args.len());
+      let nvals = o.expressions.drop(1 + a.args.len());
       let named = range(0, a.named.len()).map(|i: Int| {
         let n = a.named.get(i);
         { name: n.name, value: nvals.get(i), span: n.span }
       });
-      let rebuilt = EApp({ span: a.span, func: func, named: named, args: args, labels: a.labels });
-      match o.scan {
-        ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
-        _ -> { state: o.state, scan: ScanImpure, expr: rebuilt },
-      }
-    },
-    EPerform(p) -> {
-      let o = sequence(state, p.args);
-      let rebuilt = EPerform({
-        span: p.span,
-        eff: p.eff,
-        op: p.op,
-        resource: p.resource,
-        args: o.exprs,
+      let rebuilt = CallExpression({
+        span: a.span,
+        function: function,
+        named: named,
+        args: args,
+        labels: a.labels,
       });
       match o.scan {
-        ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
-        _ -> { state: o.state, scan: ScanImpure, expr: rebuilt },
+        ScanFound(_) -> { state: o.state, scan: o.scan, expression: rebuilt },
+        _ -> { state: o.state, scan: ScanImpure, expression: rebuilt },
       }
     },
-    ERecord(r) -> {
-      let o = sequence(state, r.fields.map(|f: RecField| f.value));
+    PerformExpression(p) -> {
+      let o = sequence(state, p.args);
+      let rebuilt = PerformExpression({
+        span: p.span,
+        effect_name: p.effect_name,
+        op: p.op,
+        resource: p.resource,
+        args: o.expressions,
+      });
+      match o.scan {
+        ScanFound(_) -> { state: o.state, scan: o.scan, expression: rebuilt },
+        _ -> { state: o.state, scan: ScanImpure, expression: rebuilt },
+      }
+    },
+    RecordExpression(r) -> {
+      let o = sequence(state, r.fields.map(|f: RecordLiteralField| f.value));
       {
         state: o.state,
         scan: o.scan,
-        expr: ERecord({
+        expression: RecordExpression({
           span: r.span,
           fields: range(0, r.fields.len()).map(|i: Int|
-            { name: r.fields.get(i).name, value: o.exprs.get(i) }),
+            { name: r.fields.get(i).name, value: o.expressions.get(i) }),
         }),
       }
     },
-    EList(l) -> {
+    ListExpression(l) -> {
       let o = sequence(state, l.items);
-      { state: o.state, scan: o.scan, expr: EList({ span: l.span, items: o.exprs }) }
-    },
-    EField(f) -> {
-      let o = scan(state, f.base);
-      { state: o.state, scan: o.scan, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
-    },
-    ERecordUpdate(r) -> {
-      let o = sequence_on(sequence(state, [r.base]), r.fields.map(|f: RecField| f.value));
       {
         state: o.state,
         scan: o.scan,
-        expr: ERecordUpdate({
+        expression: ListExpression({ span: l.span, items: o.expressions }),
+      }
+    },
+    FieldExpression(f) -> {
+      let o = scan(state, f.base);
+      {
+        state: o.state,
+        scan: o.scan,
+        expression: FieldExpression({ span: f.span, base: o.expression, field: f.field }),
+      }
+    },
+    RecordUpdateExpression(r) -> {
+      let o = sequence_on(sequence(state, [r.base]), r.fields.map(|f: RecordLiteralField| f.value));
+      {
+        state: o.state,
+        scan: o.scan,
+        expression: RecordUpdateExpression({
           span: r.span,
-          base: o.exprs.get(0),
+          base: o.expressions.get(0),
           fields: range(0, r.fields.len()).map(|i: Int|
-            { name: r.fields.get(i).name, value: o.exprs.get(i + 1) }),
+            { name: r.fields.get(i).name, value: o.expressions.get(i + 1) }),
         }),
       }
     },
-    EIf(i) -> {
+    IfExpression(i) -> {
       let c = scan(state, i.cond);
-      let rebuilt = EIf({
+      let rebuilt = IfExpression({
         span: i.span,
-        cond: c.expr,
+        cond: c.expression,
         then_branch: i.then_branch,
         else_branch: i.else_branch,
       });
       match c.scan {
-        ScanFound(_) -> { state: c.state, scan: c.scan, expr: rebuilt },
-        ScanImpure -> { state: c.state, scan: ScanImpure, expr: rebuilt },
+        ScanFound(_) -> { state: c.state, scan: c.scan, expression: rebuilt },
+        ScanImpure -> { state: c.state, scan: ScanImpure, expression: rebuilt },
         ScanPure ->
           {
             state: c.state,
             scan: purity(is_pure(i.then_branch) && is_pure(i.else_branch)),
-            expr: rebuilt,
+            expression: rebuilt,
           },
       }
     },
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let sc = scan(state, m.scrutinee);
-      let rebuilt = EMatch({ span: m.span, scrutinee: sc.expr, arms: m.arms });
+      let rebuilt = MatchExpression({ span: m.span, scrutinee: sc.expression, arms: m.arms });
       match sc.scan {
-        ScanFound(_) -> { state: sc.state, scan: sc.scan, expr: rebuilt },
-        ScanImpure -> { state: sc.state, scan: ScanImpure, expr: rebuilt },
+        ScanFound(_) -> { state: sc.state, scan: sc.scan, expression: rebuilt },
+        ScanImpure -> { state: sc.state, scan: ScanImpure, expression: rebuilt },
         ScanPure ->
           {
             state: sc.state,
@@ -393,43 +422,48 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
                 acc && is_pure(arm.body)
                   && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
             ),
-            expr: rebuilt,
+            expression: rebuilt,
           },
       }
     },
-    ETagged(t) -> {
+    TaggedLiteralExpression(t) -> {
       let o = sequence(state, t.holes.map(|h: Hole| h.value));
-      let rebuilt = ETagged(with_hole_values(t, o.exprs));
+      let rebuilt = TaggedLiteralExpression(with_hole_values(t, o.expressions));
       match o.scan {
-        ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
-        _ -> { state: o.state, scan: purity(t.holes.len() == 0), expr: rebuilt },
+        ScanFound(_) -> { state: o.state, scan: o.scan, expression: rebuilt },
+        _ -> { state: o.state, scan: purity(t.holes.len() == 0), expression: rebuilt },
       }
     },
-    // A nested block is not entered; a lambda, handler, region, `simulate` or `parallel` is a barrier
-    // to `?`.
-    _ -> { state: state, scan: purity(is_pure(expr)), expr: expr },
+    _ -> { state: state, scan: purity(is_pure(expression)), expression: expression },
   }
 
-/// One `match` per `?` lifted from `expr`'s head, with the rewritten `expr` as the success arm's body.
-/// `room` is how many `?` are left to lift: each lift takes one away and none is copied.
-fn region_cond(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} = {
-  let found = scan_head(state, expr);
+fn lift_from_head(
+  state: TryState,
+  expression: Expression,
+  remaining: Int,
+) -> TryOutput / {abort.raise} = {
+  let found = scan_head(state, expression);
   match found.scan {
     ScanFound(l) -> {
-      let w = wrap(found.state, l.operand, l.at, var_pattern(l.binder), found.expr);
-      match w.expr {
-        EMatch(m) -> {
+      let w = try_match(found.state, l.operand, l.at, var_pattern(l.binder), found.expression);
+      match w.expression {
+        MatchExpression(m) -> {
           let success = m.arms.get(1);
-          let inner = if room <= 0 { panic(lifted_past()) }
-          else { region_cond(w.state, success.body, room - 1) };
+          let inner = if remaining <= 0 { panic(lifted_past()) }
+          else { lift_from_head(w.state, success.body, remaining - 1) };
           {
             state: inner.state,
-            expr: EMatch({
+            expression: MatchExpression({
               span: m.span,
               scrutinee: m.scrutinee,
               arms: [
                 m.arms.get(0),
-                { pat: success.pat, guard: None, body: inner.expr, span: success.span },
+                {
+                  pattern: success.pattern,
+                  guard: None,
+                  body: inner.expression,
+                  span: success.span,
+                },
               ],
             }),
           }
@@ -437,97 +471,139 @@ fn region_cond(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise}
         _ -> w,
       }
     },
-    _ -> { state: found.state, expr: found.expr },
+    _ -> { state: found.state, expression: found.expression },
   }
 }
 
-fn scan_head(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
-  match expr {
-    EIf(i) -> {
+fn scan_head(state: TryState, expression: Expression) -> ScanResult / {abort.raise} =
+  match expression {
+    IfExpression(i) -> {
       let c = scan(state, i.cond);
       {
         state: c.state,
         scan: c.scan,
-        expr: EIf({
+        expression: IfExpression({
           span: i.span,
-          cond: c.expr,
+          cond: c.expression,
           then_branch: i.then_branch,
           else_branch: i.else_branch,
         }),
       }
     },
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let sc = scan(state, m.scrutinee);
       {
         state: sc.state,
         scan: sc.scan,
-        expr: EMatch({ span: m.span, scrutinee: sc.expr, arms: m.arms }),
+        expression: MatchExpression({ span: m.span, scrutinee: sc.expression, arms: m.arms }),
       }
     },
-    _ -> scan(state, expr),
+    _ -> scan(state, expression),
   }
 
 fn lifted_past() -> String = "a `?` lifted past the ones written"
 
-/// An expression in return position, with `room` as in `region_cond`.
-fn ret(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
-  match expr {
-    EBlock(_) -> block(state, expr, room),
-    EIf(i) -> {
-      let t = ret(state, i.then_branch, room);
-      let el = ret(t.state, i.else_branch, room);
-      region_cond(
+fn return_position(
+  state: TryState,
+  expression: Expression,
+  remaining: Int,
+) -> TryOutput / {abort.raise} =
+  match expression {
+    BlockExpression(_) -> return_block(state, expression, remaining),
+    IfExpression(i) -> {
+      let t = return_position(state, i.then_branch, remaining);
+      let el = return_position(t.state, i.else_branch, remaining);
+      lift_from_head(
         el.state,
-        EIf({ span: i.span, cond: i.cond, then_branch: t.expr, else_branch: el.expr }),
-        room,
+        IfExpression({
+          span: i.span,
+          cond: i.cond,
+          then_branch: t.expression,
+          else_branch: el.expression,
+        }),
+        remaining,
       )
     },
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let arms = m.arms.fold(
         { state: state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
-          let b = ret(acc.state, arm.body, room);
+          let b = return_position(acc.state, arm.body, remaining);
           {
             state: b.state,
-            arms: acc.arms.push({ pat: arm.pat, guard: arm.guard, body: b.expr, span: arm.span }),
+            arms: acc.arms.push({
+              pattern: arm.pattern,
+              guard: arm.guard,
+              body: b.expression,
+              span: arm.span,
+            }),
           }
         },
       );
-      region_cond(
+      lift_from_head(
         arms.state,
-        EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }),
-        room,
+        MatchExpression({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }),
+        remaining,
       )
     },
-    _ -> region_cond(state, expr, room),
+    _ -> lift_from_head(state, expression, remaining),
   }
 
-/// A block in return position: split at the first statement a `?` can be lifted from.
-fn block(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
-  match expr {
-    EBlock(b) -> {
-      let split = range(0, b.stmts.len()).fold(
-        { state: state, stmts: b.stmts, tail: b.tail, done: false },
-        |acc: { state: TryState, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
+fn return_block(
+  state: TryState,
+  expression: Expression,
+  remaining: Int,
+) -> TryOutput / {abort.raise} =
+  match expression {
+    BlockExpression(b) -> {
+      let split = range(0, b.statements.len()).fold(
+        { state: state, statements: b.statements, tail: b.tail, done: false },
+        |acc: { state: TryState, statements: List<Statement>, tail: Option<Expression>, done: Bool }, i: Int|
           if acc.done { acc } else {
-            let o = split_at(acc.state, acc.stmts, acc.tail, i, b.stmts.get(i), room);
+            let o = split_at(
+              acc.state,
+              acc.statements,
+              acc.tail,
+              i,
+              b.statements.get(i),
+              remaining,
+            );
             match o.split {
-              None -> { state: o.state, stmts: o.stmts, tail: acc.tail, done: false },
-              Some(t) -> { state: o.state, stmts: o.stmts.take(i), tail: Some(t), done: true },
+              None -> { state: o.state, statements: o.statements, tail: acc.tail, done: false },
+              Some(t) ->
+                { state: o.state, statements: o.statements.take(i), tail: Some(t), done: true },
             }
           },
       );
       if split.done {
-        { state: split.state, expr: EBlock({ span: b.span, tail: split.tail, stmts: split.stmts }) }
+        {
+          state: split.state,
+          expression: BlockExpression({
+            span: b.span,
+            tail: split.tail,
+            statements: split.statements,
+          }),
+        }
       } else {
         match b.tail {
           None ->
-            { state: split.state, expr: EBlock({ span: b.span, tail: None, stmts: split.stmts }) },
+            {
+              state: split.state,
+              expression: BlockExpression({
+                span: b.span,
+                tail: None,
+                statements: split.statements,
+              }),
+            },
           Some(t) -> {
-            let o = ret(split.state, t, room);
+            let o = return_position(split.state, t, remaining);
             {
               state: o.state,
-              expr: EBlock({ span: b.span, tail: Some(o.expr), stmts: split.stmts }),
+              expression: BlockExpression({
+                span: b.span,
+                tail: Some(o.expression),
+                statements: split.statements,
+              }),
             }
           },
         }
@@ -536,59 +612,63 @@ fn block(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
     _ -> panic("only called on a block"),
   }
 
-type Taken = {
+type StatementLift = {
   state: TryState,
-  stmt: Stmt,
-  take: Option<{ operand: Expr, at: Span, pat: Pattern, consumes: Bool }>,
+  stmt: Statement,
+  take: Option<{ operand: Expression, at: Span, pattern: Pattern, consumes: Bool }>,
 }
 
-/// `st` is `stmts`' `i`th as written: only the ones before it are rewritten yet.
 fn split_at(
   state: TryState,
-  stmts: List<Stmt>,
-  tail: Option<Expr>,
+  statements: List<Statement>,
+  tail: Option<Expression>,
   i: Int,
-  st: Stmt,
-  room: Int,
-) -> { state: TryState, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
-  let taken = take_stmt(state, st, room);
+  st: Statement,
+  remaining: Int,
+) -> { state: TryState, statements: List<Statement>, split: Option<Expression> } / {abort.raise} = {
+  let taken = lift_from_statement(state, st, remaining);
   match taken.take {
-    None -> { state: taken.state, stmts: stmts.set(i, taken.stmt), split: None },
+    None -> { state: taken.state, statements: statements.set(i, taken.stmt), split: None },
     Some(t) -> {
-      let kept = stmts.set(i, taken.stmt);
+      let kept = statements.set(i, taken.stmt);
       let rest = kept.drop(if t.consumes { i + 1 } else { i });
-      // A consumed statement goes: its binder is now the success arm's pattern.
-      let body0 = EBlock({ span: made_at(t.at), tail: tail, stmts: rest });
-      let body = if room <= 0 { panic(lifted_past()) } else { block(taken.state, body0, room - 1) };
-      let w = wrap(body.state, t.operand, t.at, t.pat, body.expr);
-      { state: w.state, stmts: kept, split: Some(w.expr) }
+      let body0 = BlockExpression({ span: made_at(t.at), tail: tail, statements: rest });
+      let body = if remaining <= 0 { panic(lifted_past()) }
+      else { return_block(taken.state, body0, remaining - 1) };
+      let w = try_match(body.state, t.operand, t.at, t.pattern, body.expression);
+      { state: w.state, statements: kept, split: Some(w.expression) }
     },
   }
 }
 
-fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
+fn lift_from_statement(
+  state: TryState,
+  stmt: Statement,
+  remaining: Int,
+) -> StatementLift / {abort.raise} =
   match stmt {
-    // Never consumed, since its pattern is not the success arm's. Its `else` block is the block's
-    // value, so it is a return position: expanded once, when no `?` is left in the initializer.
-    SLetElse(l) -> match l.value {
-      ETry(t) -> {
+    LetElseStatement(l) -> match l.value {
+      PropagateExpression(t) -> {
         let fresh = fresh_binder(state, t.span);
-        let o = take_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+        let o = lift_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
         if o.take.consumes {
           {
             state: o.state,
-            stmt: SLetElse({ ..l, value: var_of(fresh.binder) }),
+            stmt: LetElseStatement({ ..l, value: var_of(fresh.binder) }),
             take: Some({
               operand: o.take.operand,
               at: o.take.at,
-              pat: o.take.pat,
+              pattern: o.take.pattern,
               consumes: false,
             }),
           }
         } else {
           {
             state: o.state,
-            stmt: SLetElse({ ..l, value: ETry({ span: t.span, operand: o.operand_left }) }),
+            stmt: LetElseStatement({
+              ..l,
+              value: PropagateExpression({ span: t.span, operand: o.remaining_operand }),
+            }),
             take: Some(o.take),
           }
         }
@@ -599,60 +679,64 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: SLetElse({ ..l, value: o.expr }),
+              stmt: LetElseStatement({ ..l, value: o.expression }),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pat: var_pattern(lift.binder),
+                pattern: var_pattern(lift.binder),
                 consumes: false,
               }),
             },
           _ -> {
-            let f = ret(o.state, l.fallback, room);
-            { state: f.state, stmt: SLetElse({ ..l, fallback: f.expr }), take: None }
+            let f = return_position(o.state, l.fallback, remaining);
+            { state: f.state, stmt: LetElseStatement({ ..l, fallback: f.expression }), take: None }
           },
         }
       },
     },
-    SLet(l) -> match l.value {
-      ETry(t) -> match l.ty {
-        // The annotation stays: the `let` now binds the success arm's binder.
+    LetStatement(l) -> match l.value {
+      PropagateExpression(t) -> match l.ty {
         Some(_) -> {
           let fresh = fresh_binder(state, t.span);
-          let o = take_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+          let o = lift_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
           if o.take.consumes {
             {
               state: o.state,
-              stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: var_of(fresh.binder) }),
+              stmt: LetStatement({
+                span: l.span,
+                pattern: l.pattern,
+                ty: l.ty,
+                value: var_of(fresh.binder),
+              }),
               take: Some({
                 operand: o.take.operand,
                 at: o.take.at,
-                pat: o.take.pat,
+                pattern: o.take.pattern,
                 consumes: false,
               }),
             }
           } else {
             {
               state: o.state,
-              stmt: SLet({
+              stmt: LetStatement({
                 span: l.span,
-                pat: l.pat,
+                pattern: l.pattern,
                 ty: l.ty,
-                value: ETry({ span: t.span, operand: o.operand_left }),
+                value: PropagateExpression({ span: t.span, operand: o.remaining_operand }),
               }),
               take: Some(o.take),
             }
           }
         },
         None -> {
-          let o = take_try(state, t.operand, t.span, l.pat);
+          let o = lift_try(state, t.operand, t.span, l.pattern);
           {
             state: o.state,
-            stmt: SLet({
+            stmt: LetStatement({
               span: l.span,
-              pat: l.pat,
+              pattern: l.pattern,
               ty: None,
-              value: ETry({ span: t.span, operand: o.operand_left }),
+              value: PropagateExpression({ span: t.span, operand: o.remaining_operand }),
             }),
             take: Some(o.take),
           }
@@ -664,11 +748,16 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr }),
+              stmt: LetStatement({
+                span: l.span,
+                pattern: l.pattern,
+                ty: l.ty,
+                value: o.expression,
+              }),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pat: var_pattern(lift.binder),
+                pattern: var_pattern(lift.binder),
                 consumes: false,
               }),
             },
@@ -676,25 +765,28 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
         }
       },
     },
-    SAssign(a) -> match a.value {
-      ETry(t) -> {
+    AssignmentStatement(a) -> match a.value {
+      PropagateExpression(t) -> {
         let fresh = fresh_binder(state, t.span);
-        let o = take_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
+        let o = lift_try(fresh.state, t.operand, t.span, var_pattern(fresh.binder));
         if o.take.consumes {
           {
             state: o.state,
-            stmt: SAssign({ ..a, value: var_of(fresh.binder) }),
+            stmt: AssignmentStatement({ ..a, value: var_of(fresh.binder) }),
             take: Some({
               operand: o.take.operand,
               at: o.take.at,
-              pat: o.take.pat,
+              pattern: o.take.pattern,
               consumes: false,
             }),
           }
         } else {
           {
             state: o.state,
-            stmt: SAssign({ ..a, value: ETry({ span: t.span, operand: o.operand_left }) }),
+            stmt: AssignmentStatement({
+              ..a,
+              value: PropagateExpression({ span: t.span, operand: o.remaining_operand }),
+            }),
             take: Some(o.take),
           }
         }
@@ -705,11 +797,11 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: SAssign({ ..a, value: o.expr }),
+              stmt: AssignmentStatement({ ..a, value: o.expression }),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pat: var_pattern(lift.binder),
+                pattern: var_pattern(lift.binder),
                 consumes: false,
               }),
             },
@@ -717,12 +809,14 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
         }
       },
     },
-    SExpr(v) -> match v {
-      ETry(t) -> {
-        let o = take_try(state, t.operand, t.span, PWild({ span: v_span(v) }));
+    ExpressionStatement(v) -> match v {
+      PropagateExpression(t) -> {
+        let o = lift_try(state, t.operand, t.span, PatternWildcard({ span: expression_span(v) }));
         {
           state: o.state,
-          stmt: SExpr(ETry({ span: t.span, operand: o.operand_left })),
+          stmt: ExpressionStatement(
+            PropagateExpression({ span: t.span, operand: o.remaining_operand }),
+          ),
           take: Some(o.take),
         }
       },
@@ -732,11 +826,11 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
           ScanFound(lift) ->
             {
               state: o.state,
-              stmt: SExpr(o.expr),
+              stmt: ExpressionStatement(o.expression),
               take: Some({
                 operand: lift.operand,
                 at: lift.at,
-                pat: var_pattern(lift.binder),
+                pattern: var_pattern(lift.binder),
                 consumes: false,
               }),
             },
@@ -746,185 +840,224 @@ fn take_stmt(state: TryState, stmt: Stmt, room: Int) -> Taken / {abort.raise} =
     },
   }
 
-fn v_span(expr: Expr) -> Span = expr_span(expr)
-
-type TryTaken = {
+type TryLift = {
   state: TryState,
-  operand_left: Expr,
-  take: { operand: Expr, at: Span, pat: Pattern, consumes: Bool },
+  remaining_operand: Expression,
+  take: { operand: Expression, at: Span, pattern: Pattern, consumes: Bool },
 }
 
-/// An inner `?` in the operand is lifted first and the statement stays; otherwise the statement is consumed.
-fn take_try(state: TryState, operand: Expr, span: Span, pat: Pattern) -> TryTaken / {abort.raise} = {
+fn lift_try(
+  state: TryState,
+  operand: Expression,
+  span: Span,
+  pattern: Pattern,
+) -> TryLift / {abort.raise} = {
   let o = scan(state, operand);
   match o.scan {
     ScanFound(lift) ->
       {
         state: o.state,
-        operand_left: o.expr,
+        remaining_operand: o.expression,
         take: {
           operand: lift.operand,
           at: lift.at,
-          pat: var_pattern(lift.binder),
+          pattern: var_pattern(lift.binder),
           consumes: false,
         },
       },
     _ ->
       {
         state: o.state,
-        operand_left: ELit({ span: made_at(span), lit: LUnit }),
-        take: { operand: o.expr, at: span, pat: pat, consumes: true },
+        remaining_operand: LiteralExpression({ span: made_at(span), literal: LiteralUnit }),
+        take: { operand: o.expression, at: span, pattern: pattern, consumes: true },
       },
   }
 }
 
-// --- A `?` inside a `handle` -------------------------------------------------------------------
+fn lift_exits(state: TryState, body: Expression) -> TryOutput / {abort.raise} =
+  exits_in(
+    { ..state, exits: state.exits + 1 },
+    exit_effect(state.item_start, state.exits),
+    true,
+    body,
+  )
 
-// Inside a `handle` or a `try`, in a return position of its body, a clause or its `return`, a `?`
-// leaves by a raise of the effect its function or typed lambda exits by (`exit_effect`), carrying
-// the failure. The outermost `handle` holding such a `?` is written as the operand of a `?` of its
-// own, inside a `handle` whose one clause answers the raise with that failure, so the function
-// leaves where the `handle` stands, as it would by a `?` written there.
-
-/// `body`, a function's or a typed lambda's, which `?` exits by `state.mode`, with each outermost
-/// `handle` or `try` holding a `?` written out to leave through it.
-fn exits_lifted(state: TryState, body: Expr) -> TryOut / {abort.raise} =
-  exits_in({ ..state, exits: state.exits + 1 }, exit_effect(state.item_at, state.exits), true, body)
-
-/// `expr` with each `handle` or `try` in it holding a `?` written out to leave by `exit`, wrapped
-/// where `outermost`. A lambda's body, a `with_hold`'s, a `simulate`'s and a `parallel` branch are
-/// not entered: a `?` there exits no `handle` around them.
-fn exits_in(state: TryState, exit: Bytes, outermost: Bool, expr: Expr) -> TryOut / {abort.raise} =
-  match expr {
-    EHandle(_) -> handle_exits(state, exit, outermost, expr),
-    ETryBlock(_) -> handle_exits(state, exit, outermost, expr),
-    EBinary(b) -> {
+fn exits_in(
+  state: TryState,
+  exit: Bytes,
+  outermost: Bool,
+  expression: Expression,
+) -> TryOutput / {abort.raise} =
+  match expression {
+    HandleExpression(_) -> handle_exits(state, exit, outermost, expression),
+    TryBlockExpression(_) -> handle_exits(state, exit, outermost, expression),
+    BinaryExpression(b) -> {
       let l = exits_in(state, exit, outermost, b.lhs);
       let r = exits_in(l.state, exit, outermost, b.rhs);
-      { state: r.state, expr: EBinary({ ..b, lhs: l.expr, rhs: r.expr }) }
+      {
+        state: r.state,
+        expression: BinaryExpression({ ..b, lhs: l.expression, rhs: r.expression }),
+      }
     },
-    EUnary(u) -> {
+    UnaryExpression(u) -> {
       let o = exits_in(state, exit, outermost, u.operand);
-      { state: o.state, expr: EUnary({ ..u, operand: o.expr }) }
+      { state: o.state, expression: UnaryExpression({ ..u, operand: o.expression }) }
     },
-    EApp(a) -> {
-      let f = exits_in(state, exit, outermost, a.func);
+    CallExpression(a) -> {
+      let f = exits_in(state, exit, outermost, a.function);
       let args = exits_all(f.state, exit, outermost, a.args);
       let named = a.named.fold(
         { state: args.state, args: [] },
         |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
           let o = exits_in(acc.state, exit, outermost, arg.value);
-          { state: o.state, args: acc.args.push({ ..arg, value: o.expr }) }
+          { state: o.state, args: acc.args.push({ ..arg, value: o.expression }) }
         },
       );
-      { state: named.state, expr: EApp({ ..a, func: f.expr, args: args.exprs, named: named.args }) }
+      {
+        state: named.state,
+        expression: CallExpression({
+          ..a,
+          function: f.expression,
+          args: args.expressions,
+          named: named.args,
+        }),
+      }
     },
-    EIf(i) -> {
+    IfExpression(i) -> {
       let c = exits_in(state, exit, outermost, i.cond);
       let t = exits_in(c.state, exit, outermost, i.then_branch);
       let el = exits_in(t.state, exit, outermost, i.else_branch);
       {
         state: el.state,
-        expr: EIf({ ..i, cond: c.expr, then_branch: t.expr, else_branch: el.expr }),
+        expression: IfExpression({
+          ..i,
+          cond: c.expression,
+          then_branch: t.expression,
+          else_branch: el.expression,
+        }),
       }
     },
-    EMatch(m) -> {
+    MatchExpression(m) -> {
       let sc = exits_in(state, exit, outermost, m.scrutinee);
       let arms = m.arms.fold(
         { state: sc.state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
-            None -> { state: acc.state, expr: None },
+            None -> { state: acc.state, expression: None },
             Some(x) -> {
               let o = exits_in(acc.state, exit, outermost, x);
-              { state: o.state, expr: Some(o.expr) }
+              { state: o.state, expression: Some(o.expression) }
             },
           };
           let b = exits_in(g.state, exit, outermost, arm.body);
-          { state: b.state, arms: acc.arms.push({ ..arm, guard: g.expr, body: b.expr }) }
+          {
+            state: b.state,
+            arms: acc.arms.push({ ..arm, guard: g.expression, body: b.expression }),
+          }
         },
       );
-      { state: arms.state, expr: EMatch({ ..m, scrutinee: sc.expr, arms: arms.arms }) }
+      {
+        state: arms.state,
+        expression: MatchExpression({ ..m, scrutinee: sc.expression, arms: arms.arms }),
+      }
     },
-    EBlock(b) -> {
-      let stmts = b.stmts.fold(
-        { state: state, stmts: [] },
-        |acc: { state: TryState, stmts: List<Stmt> }, stmt: Stmt|
+    BlockExpression(b) -> {
+      let statements = b.statements.fold(
+        { state: state, statements: [] },
+        |acc: { state: TryState, statements: List<Statement> }, stmt: Statement|
           match stmt {
-            SLet(l) -> {
+            LetStatement(l) -> {
               let o = exits_in(acc.state, exit, outermost, l.value);
-              { state: o.state, stmts: acc.stmts.push(SLet({ ..l, value: o.expr })) }
+              {
+                state: o.state,
+                statements: acc.statements.push(LetStatement({ ..l, value: o.expression })),
+              }
             },
-            SLetElse(l) -> {
+            LetElseStatement(l) -> {
               let v = exits_in(acc.state, exit, outermost, l.value);
               let f = exits_in(v.state, exit, outermost, l.fallback);
               {
                 state: f.state,
-                stmts: acc.stmts.push(SLetElse({ ..l, value: v.expr, fallback: f.expr })),
+                statements: acc.statements.push(
+                  LetElseStatement({ ..l, value: v.expression, fallback: f.expression }),
+                ),
               }
             },
-            SExpr(x) -> {
+            ExpressionStatement(x) -> {
               let o = exits_in(acc.state, exit, outermost, x);
-              { state: o.state, stmts: acc.stmts.push(SExpr(o.expr)) }
+              { state: o.state, statements: acc.statements.push(ExpressionStatement(o.expression)) }
             },
-            SAssign(x) -> {
+            AssignmentStatement(x) -> {
               let o = exits_in(acc.state, exit, outermost, x.value);
-              { state: o.state, stmts: acc.stmts.push(SAssign({ ..x, value: o.expr })) }
+              {
+                state: o.state,
+                statements: acc.statements.push(AssignmentStatement({ ..x, value: o.expression })),
+              }
             },
           },
       );
       let tl = match b.tail {
-        None -> { state: stmts.state, expr: None },
+        None -> { state: statements.state, expression: None },
         Some(t) -> {
-          let o = exits_in(stmts.state, exit, outermost, t);
-          { state: o.state, expr: Some(o.expr) }
+          let o = exits_in(statements.state, exit, outermost, t);
+          { state: o.state, expression: Some(o.expression) }
         },
       };
-      { state: tl.state, expr: EBlock({ ..b, tail: tl.expr, stmts: stmts.stmts }) }
+      {
+        state: tl.state,
+        expression: BlockExpression({
+          ..b,
+          tail: tl.expression,
+          statements: statements.statements,
+        }),
+      }
     },
-    ERecord(r) -> {
+    RecordExpression(r) -> {
       let o = exits_fields(state, exit, outermost, r.fields);
-      { state: o.state, expr: ERecord({ ..r, fields: o.fields }) }
+      { state: o.state, expression: RecordExpression({ ..r, fields: o.fields }) }
     },
-    ERecordUpdate(r) -> {
+    RecordUpdateExpression(r) -> {
       let b = exits_in(state, exit, outermost, r.base);
       let o = exits_fields(b.state, exit, outermost, r.fields);
-      { state: o.state, expr: ERecordUpdate({ ..r, base: b.expr, fields: o.fields }) }
+      {
+        state: o.state,
+        expression: RecordUpdateExpression({ ..r, base: b.expression, fields: o.fields }),
+      }
     },
-    ETry(t) -> {
+    PropagateExpression(t) -> {
       let o = exits_in(state, exit, outermost, t.operand);
-      { state: o.state, expr: ETry({ ..t, operand: o.expr }) }
+      { state: o.state, expression: PropagateExpression({ ..t, operand: o.expression }) }
     },
-    EField(f) -> {
+    FieldExpression(f) -> {
       let o = exits_in(state, exit, outermost, f.base);
-      { state: o.state, expr: EField({ ..f, base: o.expr }) }
+      { state: o.state, expression: FieldExpression({ ..f, base: o.expression }) }
     },
-    EList(l) -> {
+    ListExpression(l) -> {
       let o = exits_all(state, exit, outermost, l.items);
-      { state: o.state, expr: EList({ ..l, items: o.exprs }) }
+      { state: o.state, expression: ListExpression({ ..l, items: o.expressions }) }
     },
-    EPerform(p) -> {
+    PerformExpression(p) -> {
       let o = exits_all(state, exit, outermost, p.args);
-      { state: o.state, expr: EPerform({ ..p, args: o.exprs }) }
+      { state: o.state, expression: PerformExpression({ ..p, args: o.expressions }) }
     },
-    ETagged(t) -> {
+    TaggedLiteralExpression(t) -> {
       let o = exits_all(state, exit, outermost, t.holes.map(|h: Hole| h.value));
-      { state: o.state, expr: ETagged(with_hole_values(t, o.exprs)) }
+      { state: o.state, expression: TaggedLiteralExpression(with_hole_values(t, o.expressions)) }
     },
-    _ -> { state: state, expr: expr },
+    _ -> { state: state, expression: expression },
   }
 
 fn exits_all(
   state: TryState,
   exit: Bytes,
   outermost: Bool,
-  exprs: List<Expr>,
-) -> { state: TryState, exprs: List<Expr> } / {abort.raise} =
-  exprs.fold(
-    { state: state, exprs: [] },
-    |acc: { state: TryState, exprs: List<Expr> }, expr: Expr| {
-      let o = exits_in(acc.state, exit, outermost, expr);
-      { state: o.state, exprs: acc.exprs.push(o.expr) }
+  expressions: List<Expression>,
+) -> { state: TryState, expressions: List<Expression> } / {abort.raise} =
+  expressions.fold(
+    { state: state, expressions: [] },
+    |acc: { state: TryState, expressions: List<Expression> }, expression: Expression| {
+      let o = exits_in(acc.state, exit, outermost, expression);
+      { state: o.state, expressions: acc.expressions.push(o.expression) }
     },
   )
 
@@ -932,86 +1065,87 @@ fn exits_fields(
   state: TryState,
   exit: Bytes,
   outermost: Bool,
-  fields: List<RecField>,
-) -> { state: TryState, fields: List<RecField> } / {abort.raise} =
+  fields: List<RecordLiteralField>,
+) -> { state: TryState, fields: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { state: state, fields: [] },
-    |acc: { state: TryState, fields: List<RecField> }, field: RecField| {
+    |acc: { state: TryState, fields: List<RecordLiteralField> }, field: RecordLiteralField| {
       let o = exits_in(acc.state, exit, outermost, field.value);
-      { state: o.state, fields: acc.fields.push({ ..field, value: o.expr }) }
+      { state: o.state, fields: acc.fields.push({ ..field, value: o.expression }) }
     },
   )
 
-/// `part` of a `handle` or a `try`, its body, a clause's or its `return`'s, with each `?` in it
-/// that a return position of it, or of a `handle` inside it, holds leaving by `exit`.
-fn exits_through(state: TryState, exit: Bytes, part: Expr) -> TryOut / {abort.raise} = {
+fn exits_through(state: TryState, exit: Bytes, part: Expression) -> TryOutput / {abort.raise} = {
   let nested = exits_in(state, exit, false, part);
-  ret({ ..nested.state, exit: Some(exit) }, nested.expr, tries_in(nested.expr))
+  return_position(
+    { ..nested.state, exit: Some(exit) },
+    nested.expression,
+    tries_in(nested.expression),
+  )
 }
 
-/// `expr`, a `handle` or a `try`, with each `?` its parts hold leaving by `exit`; the `outermost`
-/// one holding any, written as the operand of a `?` around the `handle` that answers the raise.
 fn handle_exits(
   state: TryState,
   exit: Bytes,
   outermost: Bool,
-  expr: Expr,
-) -> TryOut / {abort.raise} = {
-  let parts: TryOut = match expr {
-    EHandle(h) -> {
+  expression: Expression,
+) -> TryOutput / {abort.raise} = {
+  let parts: TryOutput = match expression {
+    HandleExpression(h) -> {
       let b = exits_through(state, exit, h.body);
       let cs = h.clauses.fold(
         { state: b.state, clauses: [] },
         |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
           let o = exits_through(acc.state, exit, c.body);
-          { state: o.state, clauses: acc.clauses.push({ ..c, body: o.expr }) }
+          { state: o.state, clauses: acc.clauses.push({ ..c, body: o.expression }) }
         },
       );
       let r: { state: TryState, ret: Option<ReturnClause> } = match h.ret {
         None -> { state: cs.state, ret: None },
         Some(rc) -> {
           let o = exits_through(cs.state, exit, rc.body);
-          { state: o.state, ret: Some({ ..rc, body: o.expr }) }
+          { state: o.state, ret: Some({ ..rc, body: o.expression }) }
         },
       };
-      { state: r.state, expr: EHandle({ ..h, body: b.expr, clauses: cs.clauses, ret: r.ret }) }
+      {
+        state: r.state,
+        expression: HandleExpression({ ..h, body: b.expression, clauses: cs.clauses, ret: r.ret }),
+      }
     },
-    ETryBlock(t) -> {
+    TryBlockExpression(t) -> {
       let b = exits_through(state, exit, t.body);
-      { state: b.state, expr: ETryBlock({ ..t, body: b.expr }) }
+      { state: b.state, expression: TryBlockExpression({ ..t, body: b.expression }) }
     },
-    _ -> { state: state, expr: expr },
+    _ -> { state: state, expression: expression },
   };
   let left = { ..parts.state, exit: state.exit };
-  // Each `?` lifted takes a fresh binder, so one that took none holds no `?` that exits through it.
-  if parts.state.fresh == state.fresh { { state: left, expr: expr } }
-  else if !outermost { { state: left, expr: parts.expr } }
-  else { exit_answered(left, exit, parts.expr) }
+  if parts.state.fresh == state.fresh { { state: left, expression: expression } }
+  else if !outermost { { state: left, expression: parts.expression } }
+  else { catch_exit(left, exit, parts.expression) }
 }
 
-/// The `?` of the `handle` around `h` answering `exit`: its one clause answers the failure the
-/// raise carried, and its body `h`'s answer as the success.
-fn exit_answered(state: TryState, exit: Bytes, h: Expr) -> TryOut / {abort.raise} = {
-  let span = made_at(expr_span(h));
+fn catch_exit(state: TryState, exit: Bytes, h: Expression) -> TryOutput / {abort.raise} = {
+  let span = made_at(expression_span(h));
   let fresh = fresh_binder(state, span);
   let named = |n: Bytes| var_of({ name: n, span: span });
-  let called = |n: Bytes, x: Expr|
-    EApp({ span: span, func: named(n), args: [x], named: [], labels: [] });
+  let called = |n: Bytes, x: Expression|
+    CallExpression({ span: span, function: named(n), args: [x], named: [], labels: [] });
   let answered = match state.mode {
-    Some(TryOption) -> { ok: called(some_ctor(), h), failed: named(none_ctor()) },
-    _ -> { ok: called(ok_ctor(), h), failed: called(err_ctor(), var_of(fresh.binder)) },
+    Some(TryOption) -> { ok: called(some_constructor(), h), failed: named(none_constructor()) },
+    _ ->
+      { ok: called(ok_constructor(), h), failed: called(err_constructor(), var_of(fresh.binder)) },
   };
   {
     state: fresh.state,
-    expr: ETry({
+    expression: PropagateExpression({
       span: span,
-      operand: EHandle({
+      operand: HandleExpression({
         span: span,
         body: answered.ok,
         ret: None,
         clauses: [
           {
-            eff: bare({ name: exit, span: span }),
+            effect_name: bare({ name: exit, span: span }),
             op: { name: exit_op(), span: span },
             resource: None,
             every_label: false,
@@ -1028,40 +1162,35 @@ fn exit_answered(state: TryState, exit: Bytes, h: Expr) -> TryOut / {abort.raise
   }
 }
 
-/// Whether `operand` is the `handle` `exit_answered` writes around one holding a `?`.
-fn exit_answering(operand: Expr) -> Bool =
+fn catches_exit(operand: Expression) -> Bool =
   match operand {
-    EHandle(h) -> h.clauses.any(|c: HandleClause| is_exit_effect(c.eff.name.name)),
+    HandleExpression(h) -> h.clauses.any(|c: HandleClause| is_exit_effect(c.effect_name.name.name)),
     _ -> false,
   }
 
-/// What a `handle`'s or a `try`'s parts stand behind as `sweep` reads them: no more than `barrier`
-/// where a `?` there exits the function or typed lambda through it, else the `handle` too.
-fn behind(state: TryState, barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
-  if state.mode == None { under(barrier, what) } else { barrier }
+fn barrier_for_parts(state: TryState, barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
+  if state.mode == None { outermost_barrier(barrier, what) } else { barrier }
 
-/// Refuses and unwraps every `?` left in `expr`: `E0118` when `scope` or `barrier` says why, else `E0119`.
 fn sweep(
   state: TryState,
-  expr: Expr,
+  expression: Expression,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-) -> TryOut / {abort.raise} =
-  sweep_within(state, expr, scope, barrier, count_in(expr, typed_lambda))
+) -> TryOutput / {abort.raise} =
+  sweep_within(state, expression, scope, barrier, count_in(expression, is_typed_lambda))
 
-fn typed_lambda(e: Expr) -> Bool = match e { ELambda(l) -> l.ret != None, _ -> false }
+fn is_typed_lambda(e: Expression) -> Bool =
+  match e { LambdaExpression(l) -> l.ret != None, _ -> false }
 
-/// `room` is how many lambdas with a written return type are left to sweep: the body of one is swept
-/// after `ret` rewrites it, which copies no lambda.
 fn sweep_within(
   state: TryState,
-  expr: Expr,
+  expression: Expression,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-  room: Int,
-) -> TryOut / {abort.raise} =
-  match expr {
-    ETry(t) -> {
+  remaining: Int,
+) -> TryOutput / {abort.raise} =
+  match expression {
+    PropagateExpression(t) -> {
       let d = match barrier {
         Some(what) ->
           error_at(
@@ -1086,7 +1215,7 @@ fn sweep_within(
               b"no `Result` or `Option` to expand this into",
               [why],
             ),
-          None -> if exit_answering(t.operand) {
+          None -> if catches_exit(t.operand) {
             error_at(
               b"E0119",
               t.span,
@@ -1109,194 +1238,276 @@ fn sweep_within(
           },
         },
       };
-      // The `handle` written around one holding a `?` answers what the `?` would unwrap.
-      if exit_answering(t.operand) {
-        { state: { ..state, diags: state.diags.push(d) }, expr: EBad({ span: t.span }) }
+      if catches_exit(t.operand) {
+        {
+          state: { ..state, diagnostics: state.diagnostics.push(d) },
+          expression: InvalidExpression({ span: t.span }),
+        }
       } else {
-        sweep_inner({ ..state, diags: state.diags.push(d) }, t.operand, scope, barrier, room)
+        sweep_inner(
+          { ..state, diagnostics: state.diagnostics.push(d) },
+          t.operand,
+          scope,
+          barrier,
+          remaining,
+        )
       }
     },
-    _ -> sweep_inner(state, expr, scope, barrier, room),
+    _ -> sweep_inner(state, expression, scope, barrier, remaining),
   }
 
 fn sweep_inner(
   state: TryState,
-  expr: Expr,
+  expression: Expression,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-  room: Int,
-) -> TryOut / {abort.raise} =
-  match expr {
-    ETry(t) -> {
-      let o = sweep_within(state, t.operand, scope, barrier, room);
-      { state: o.state, expr: ETry({ span: t.span, operand: o.expr }) }
+  remaining: Int,
+) -> TryOutput / {abort.raise} =
+  match expression {
+    PropagateExpression(t) -> {
+      let o = sweep_within(state, t.operand, scope, barrier, remaining);
+      { state: o.state, expression: PropagateExpression({ span: t.span, operand: o.expression }) }
     },
-    EBinary(b) -> {
-      let l = sweep_within(state, b.lhs, scope, barrier, room);
-      let r = sweep_within(l.state, b.rhs, scope, barrier, room);
-      { state: r.state, expr: EBinary({ span: b.span, op: b.op, lhs: l.expr, rhs: r.expr }) }
+    BinaryExpression(b) -> {
+      let l = sweep_within(state, b.lhs, scope, barrier, remaining);
+      let r = sweep_within(l.state, b.rhs, scope, barrier, remaining);
+      {
+        state: r.state,
+        expression: BinaryExpression({
+          span: b.span,
+          op: b.op,
+          lhs: l.expression,
+          rhs: r.expression,
+        }),
+      }
     },
-    EUnary(u) -> {
-      let o = sweep_within(state, u.operand, scope, barrier, room);
-      { state: o.state, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
+    UnaryExpression(u) -> {
+      let o = sweep_within(state, u.operand, scope, barrier, remaining);
+      {
+        state: o.state,
+        expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
+      }
     },
-    ELambda(l) -> match l.ret {
+    LambdaExpression(l) -> match l.ret {
       None -> {
-        let o = sweep_within(state, l.body, scope, under(barrier, b"a lambda"), room);
+        let o = sweep_within(
+          state,
+          l.body,
+          scope,
+          outermost_barrier(barrier, b"a lambda"),
+          remaining,
+        );
         {
           state: o.state,
-          expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: None }),
+          expression: LambdaExpression({
+            span: l.span,
+            body: o.expression,
+            params: l.params,
+            ret: None,
+          }),
         }
       },
       Some(ty) -> match mode_for(state, Some(ty)) {
         Err(why) -> {
-          let o = sweep_within(state, l.body, Some(why), None, room);
+          let o = sweep_within(state, l.body, Some(why), None, remaining);
           {
             state: o.state,
-            expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: Some(ty) }),
+            expression: LambdaExpression({
+              span: l.span,
+              body: o.expression,
+              params: l.params,
+              ret: Some(ty),
+            }),
           }
         },
         Ok(m) -> {
           let saved = state.mode;
-          let ex = exits_lifted({ ..state, mode: Some(m) }, l.body);
-          let r = ret(ex.state, ex.expr, tries_in(ex.expr));
-          let s: TryOut = if room <= 0 { panic("a lambda swept past the ones written") }
-          else { sweep_within(r.state, r.expr, None, None, room - 1) };
+          let ex = lift_exits({ ..state, mode: Some(m) }, l.body);
+          let r = return_position(ex.state, ex.expression, tries_in(ex.expression));
+          let s: TryOutput = if remaining <= 0 { panic("a lambda swept past the ones written") }
+          else { sweep_within(r.state, r.expression, None, None, remaining - 1) };
           {
             state: { ..s.state, mode: saved },
-            expr: ELambda({ span: l.span, body: s.expr, params: l.params, ret: Some(ty) }),
+            expression: LambdaExpression({
+              span: l.span,
+              body: s.expression,
+              params: l.params,
+              ret: Some(ty),
+            }),
           }
         },
       },
     },
-    EApp(a) -> {
-      let f = sweep_within(state, a.func, scope, barrier, room);
-      let args = sweep_all(f.state, a.args, scope, barrier, room);
+    CallExpression(a) -> {
+      let f = sweep_within(state, a.function, scope, barrier, remaining);
+      let args = sweep_all(f.state, a.args, scope, barrier, remaining);
       let named = a.named.fold(
         { state: args.state, args: [] },
         |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
-          let o = sweep_within(acc.state, arg.value, scope, barrier, room);
-          { state: o.state, args: acc.args.push({ name: arg.name, value: o.expr, span: arg.span }) }
+          let o = sweep_within(acc.state, arg.value, scope, barrier, remaining);
+          {
+            state: o.state,
+            args: acc.args.push({ name: arg.name, value: o.expression, span: arg.span }),
+          }
         },
       );
       {
         state: named.state,
-        expr: EApp({
+        expression: CallExpression({
           span: a.span,
-          func: f.expr,
+          function: f.expression,
           named: named.args,
-          args: args.exprs,
+          args: args.expressions,
           labels: a.labels,
         }),
       }
     },
-    EIf(i) -> {
-      let c = sweep_within(state, i.cond, scope, barrier, room);
-      let t = sweep_within(c.state, i.then_branch, scope, barrier, room);
-      let el = sweep_within(t.state, i.else_branch, scope, barrier, room);
+    IfExpression(i) -> {
+      let c = sweep_within(state, i.cond, scope, barrier, remaining);
+      let t = sweep_within(c.state, i.then_branch, scope, barrier, remaining);
+      let el = sweep_within(t.state, i.else_branch, scope, barrier, remaining);
       {
         state: el.state,
-        expr: EIf({ span: i.span, cond: c.expr, then_branch: t.expr, else_branch: el.expr }),
+        expression: IfExpression({
+          span: i.span,
+          cond: c.expression,
+          then_branch: t.expression,
+          else_branch: el.expression,
+        }),
       }
     },
-    EMatch(m) -> {
-      let sc = sweep_within(state, m.scrutinee, scope, barrier, room);
+    MatchExpression(m) -> {
+      let sc = sweep_within(state, m.scrutinee, scope, barrier, remaining);
       let arms = m.arms.fold(
         { state: sc.state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
-            None -> { state: acc.state, expr: None },
+            None -> { state: acc.state, expression: None },
             Some(x) -> {
-              let o = sweep_within(acc.state, x, scope, barrier, room);
-              { state: o.state, expr: Some(o.expr) }
+              let o = sweep_within(acc.state, x, scope, barrier, remaining);
+              { state: o.state, expression: Some(o.expression) }
             },
           };
-          let b = sweep_within(g.state, arm.body, scope, barrier, room);
+          let b = sweep_within(g.state, arm.body, scope, barrier, remaining);
           {
             state: b.state,
-            arms: acc.arms.push({ pat: arm.pat, guard: g.expr, body: b.expr, span: arm.span }),
+            arms: acc.arms.push({
+              pattern: arm.pattern,
+              guard: g.expression,
+              body: b.expression,
+              span: arm.span,
+            }),
           }
         },
       );
-      { state: arms.state, expr: EMatch({ span: m.span, scrutinee: sc.expr, arms: arms.arms }) }
+      {
+        state: arms.state,
+        expression: MatchExpression({ span: m.span, scrutinee: sc.expression, arms: arms.arms }),
+      }
     },
-    EBlock(b) -> {
-      let stmts = b.stmts.fold(
-        { state: state, stmts: [] },
-        |acc: { state: TryState, stmts: List<Stmt> }, stmt: Stmt|
+    BlockExpression(b) -> {
+      let statements = b.statements.fold(
+        { state: state, statements: [] },
+        |acc: { state: TryState, statements: List<Statement> }, stmt: Statement|
           match stmt {
-            SLet(l) -> {
-              let o = sweep_within(acc.state, l.value, scope, barrier, room);
+            LetStatement(l) -> {
+              let o = sweep_within(acc.state, l.value, scope, barrier, remaining);
               {
                 state: o.state,
-                stmts: acc.stmts.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
+                statements: acc.statements.push(
+                  LetStatement({ span: l.span, pattern: l.pattern, ty: l.ty, value: o.expression }),
+                ),
               }
             },
-            SLetElse(l) -> {
-              let v = sweep_within(acc.state, l.value, scope, barrier, room);
-              let f = sweep_within(v.state, l.fallback, scope, barrier, room);
+            LetElseStatement(l) -> {
+              let v = sweep_within(acc.state, l.value, scope, barrier, remaining);
+              let f = sweep_within(v.state, l.fallback, scope, barrier, remaining);
               {
                 state: f.state,
-                stmts: acc.stmts.push(SLetElse({ ..l, value: v.expr, fallback: f.expr })),
+                statements: acc.statements.push(
+                  LetElseStatement({ ..l, value: v.expression, fallback: f.expression }),
+                ),
               }
             },
-            SExpr(x) -> {
-              let o = sweep_within(acc.state, x, scope, barrier, room);
-              { state: o.state, stmts: acc.stmts.push(SExpr(o.expr)) }
+            ExpressionStatement(x) -> {
+              let o = sweep_within(acc.state, x, scope, barrier, remaining);
+              { state: o.state, statements: acc.statements.push(ExpressionStatement(o.expression)) }
             },
-            SAssign(x) -> {
-              let o = sweep_within(acc.state, x.value, scope, barrier, room);
-              { state: o.state, stmts: acc.stmts.push(SAssign({ ..x, value: o.expr })) }
+            AssignmentStatement(x) -> {
+              let o = sweep_within(acc.state, x.value, scope, barrier, remaining);
+              {
+                state: o.state,
+                statements: acc.statements.push(AssignmentStatement({ ..x, value: o.expression })),
+              }
             },
           },
       );
       let tl = match b.tail {
-        None -> { state: stmts.state, expr: None },
+        None -> { state: statements.state, expression: None },
         Some(t) -> {
-          let o = sweep_within(stmts.state, t, scope, barrier, room);
-          { state: o.state, expr: Some(o.expr) }
+          let o = sweep_within(statements.state, t, scope, barrier, remaining);
+          { state: o.state, expression: Some(o.expression) }
         },
       };
-      { state: tl.state, expr: EBlock({ span: b.span, tail: tl.expr, stmts: stmts.stmts }) }
-    },
-    ERecord(r) -> {
-      let o = sweep_fields(state, r.fields, scope, barrier, room);
-      { state: o.state, expr: ERecord({ span: r.span, fields: o.fields }) }
-    },
-    ERecordUpdate(r) -> {
-      let b = sweep_within(state, r.base, scope, barrier, room);
-      let o = sweep_fields(b.state, r.fields, scope, barrier, room);
-      { state: o.state, expr: ERecordUpdate({ span: r.span, base: b.expr, fields: o.fields }) }
-    },
-    EField(f) -> {
-      let o = sweep_within(state, f.base, scope, barrier, room);
-      { state: o.state, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
-    },
-    EList(l) -> {
-      let o = sweep_all(state, l.items, scope, barrier, room);
-      { state: o.state, expr: EList({ span: l.span, items: o.exprs }) }
-    },
-    EPerform(p) -> {
-      let o = sweep_all(state, p.args, scope, barrier, room);
       {
-        state: o.state,
-        expr: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.exprs }),
+        state: tl.state,
+        expression: BlockExpression({
+          span: b.span,
+          tail: tl.expression,
+          statements: statements.statements,
+        }),
       }
     },
-    EHandle(h) -> {
+    RecordExpression(r) -> {
+      let o = sweep_fields(state, r.fields, scope, barrier, remaining);
+      { state: o.state, expression: RecordExpression({ span: r.span, fields: o.fields }) }
+    },
+    RecordUpdateExpression(r) -> {
+      let b = sweep_within(state, r.base, scope, barrier, remaining);
+      let o = sweep_fields(b.state, r.fields, scope, barrier, remaining);
+      {
+        state: o.state,
+        expression: RecordUpdateExpression({ span: r.span, base: b.expression, fields: o.fields }),
+      }
+    },
+    FieldExpression(f) -> {
+      let o = sweep_within(state, f.base, scope, barrier, remaining);
+      {
+        state: o.state,
+        expression: FieldExpression({ span: f.span, base: o.expression, field: f.field }),
+      }
+    },
+    ListExpression(l) -> {
+      let o = sweep_all(state, l.items, scope, barrier, remaining);
+      { state: o.state, expression: ListExpression({ span: l.span, items: o.expressions }) }
+    },
+    PerformExpression(p) -> {
+      let o = sweep_all(state, p.args, scope, barrier, remaining);
+      {
+        state: o.state,
+        expression: PerformExpression({
+          span: p.span,
+          effect_name: p.effect_name,
+          op: p.op,
+          resource: p.resource,
+          args: o.expressions,
+        }),
+      }
+    },
+    HandleExpression(h) -> {
       let vs = h.vars.fold(
         { state: state, vars: [] },
         |acc: { state: TryState, vars: List<HandlerVar> }, v: HandlerVar| {
-          let o = sweep_within(acc.state, v.init, scope, barrier, room);
-          { state: o.state, vars: acc.vars.push({ ..v, init: o.expr }) }
+          let o = sweep_within(acc.state, v.init, scope, barrier, remaining);
+          { state: o.state, vars: acc.vars.push({ ..v, init: o.expression }) }
         },
       );
       let b = sweep_within(
         vs.state,
         h.body,
         scope,
-        behind(state, barrier, b"a `handle` body"),
-        room,
+        barrier_for_parts(state, barrier, b"a `handle` body"),
+        remaining,
       );
       let cs = h.clauses.fold(
         { state: b.state, clauses: [] },
@@ -1305,19 +1516,19 @@ fn sweep_inner(
             acc.state,
             c.body,
             scope,
-            behind(state, barrier, b"a `handle` clause"),
-            room,
+            barrier_for_parts(state, barrier, b"a `handle` clause"),
+            remaining,
           );
           {
             state: o.state,
             clauses: acc.clauses.push({
-              eff: c.eff,
+              effect_name: c.effect_name,
               op: c.op,
               resource: c.resource,
               every_label: c.every_label,
               label_binder: c.label_binder,
               resume: c.resume,
-              body: o.expr,
+              body: o.expression,
               span: c.span,
               params: c.params,
             }),
@@ -1331,140 +1542,175 @@ fn sweep_inner(
             cs.state,
             rc.body,
             scope,
-            behind(state, barrier, b"a `handle` return clause"),
-            room,
+            barrier_for_parts(state, barrier, b"a `handle` return clause"),
+            remaining,
           );
-          { state: o.state, ret: Some({ binder: rc.binder, body: o.expr, span: rc.span }) }
+          { state: o.state, ret: Some({ binder: rc.binder, body: o.expression, span: rc.span }) }
         },
       };
       {
         state: r.state,
-        expr: EHandle({
+        expression: HandleExpression({
           span: h.span,
-          body: b.expr,
+          body: b.expression,
           ret: r.ret,
           clauses: cs.clauses,
           vars: vs.vars,
         }),
       }
     },
-    EWithHold(c) -> {
-      let a = sweep_within(state, c.acquire, scope, barrier, room);
+    WithHoldExpression(c) -> {
+      let a = sweep_within(state, c.acquire, scope, barrier, remaining);
       let r = sweep_within(
         a.state,
         c.release,
         scope,
-        under(barrier, b"a `with_hold` release"),
-        room,
+        outermost_barrier(barrier, b"a `with_hold` release"),
+        remaining,
       );
-      let b = sweep_within(r.state, c.body, scope, under(barrier, b"a `with_hold` body"), room);
-      { state: b.state, expr: EWithHold({ ..c, acquire: a.expr, release: r.expr, body: b.expr }) }
+      let b = sweep_within(
+        r.state,
+        c.body,
+        scope,
+        outermost_barrier(barrier, b"a `with_hold` body"),
+        remaining,
+      );
+      {
+        state: b.state,
+        expression: WithHoldExpression({
+          ..c,
+          acquire: a.expression,
+          release: r.expression,
+          body: b.expression,
+        }),
+      }
     },
-    ESimulate(x) -> {
-      let o = sweep_within(state, x.body, scope, under(barrier, b"a `simulate` body"), room);
-      { state: o.state, expr: ESimulate({ span: x.span, body: o.expr }) }
+    SimulateExpression(x) -> {
+      let o = sweep_within(
+        state,
+        x.body,
+        scope,
+        outermost_barrier(barrier, b"a `simulate` body"),
+        remaining,
+      );
+      { state: o.state, expression: SimulateExpression({ span: x.span, body: o.expression }) }
     },
-    EParallel(x) -> {
-      let o = sweep_all(state, x.branches, scope, under(barrier, b"a `parallel` branch"), room);
-      { state: o.state, expr: EParallel({ span: x.span, branches: o.exprs }) }
+    ParallelExpression(x) -> {
+      let o = sweep_all(
+        state,
+        x.branches,
+        scope,
+        outermost_barrier(barrier, b"a `parallel` branch"),
+        remaining,
+      );
+      { state: o.state, expression: ParallelExpression({ span: x.span, branches: o.expressions }) }
     },
-    ETryBlock(x) -> {
-      let o = sweep_within(state, x.body, scope, behind(state, barrier, b"a `try` body"), room);
-      { state: o.state, expr: ETryBlock({ ..x, body: o.expr }) }
+    TryBlockExpression(x) -> {
+      let o = sweep_within(
+        state,
+        x.body,
+        scope,
+        barrier_for_parts(state, barrier, b"a `try` body"),
+        remaining,
+      );
+      { state: o.state, expression: TryBlockExpression({ ..x, body: o.expression }) }
     },
-    ETagged(t) -> {
+    TaggedLiteralExpression(t) -> {
       let filled = t.holes.fold(
         { state: state, holes: [] },
         |acc: { state: TryState, holes: List<Hole> }, h: Hole| {
-          let o = sweep_within(acc.state, h.value, scope, barrier, room);
-          { state: o.state, holes: acc.holes.push({ ..h, value: o.expr }) }
+          let o = sweep_within(acc.state, h.value, scope, barrier, remaining);
+          { state: o.state, holes: acc.holes.push({ ..h, value: o.expression }) }
         },
       );
-      { state: filled.state, expr: ETagged({ ..t, holes: filled.holes }) }
+      { state: filled.state, expression: TaggedLiteralExpression({ ..t, holes: filled.holes }) }
     },
-    _ -> { state: state, expr: expr },
+    _ -> { state: state, expression: expression },
   }
 
 fn sweep_all(
   state: TryState,
-  exprs: List<Expr>,
+  expressions: List<Expression>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-  room: Int,
-) -> { state: TryState, exprs: List<Expr> } / {abort.raise} =
-  exprs.fold(
-    { state: state, exprs: [] },
-    |acc: { state: TryState, exprs: List<Expr> }, expr: Expr| {
-      let o = sweep_within(acc.state, expr, scope, barrier, room);
-      { state: o.state, exprs: acc.exprs.push(o.expr) }
+  remaining: Int,
+) -> { state: TryState, expressions: List<Expression> } / {abort.raise} =
+  expressions.fold(
+    { state: state, expressions: [] },
+    |acc: { state: TryState, expressions: List<Expression> }, expression: Expression| {
+      let o = sweep_within(acc.state, expression, scope, barrier, remaining);
+      { state: o.state, expressions: acc.expressions.push(o.expression) }
     },
   )
 
 fn sweep_fields(
   state: TryState,
-  fields: List<RecField>,
+  fields: List<RecordLiteralField>,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
-  room: Int,
-) -> { state: TryState, fields: List<RecField> } / {abort.raise} =
+  remaining: Int,
+) -> { state: TryState, fields: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { state: state, fields: [] },
-    |acc: { state: TryState, fields: List<RecField> }, field: RecField| {
-      let o = sweep_within(acc.state, field.value, scope, barrier, room);
-      { state: o.state, fields: acc.fields.push({ name: field.name, value: o.expr }) }
+    |acc: { state: TryState, fields: List<RecordLiteralField> }, field: RecordLiteralField| {
+      let o = sweep_within(acc.state, field.value, scope, barrier, remaining);
+      { state: o.state, fields: acc.fields.push({ name: field.name, value: o.expression }) }
     },
   )
 
-/// Where `item` is written, which names apart the exit effects of the functions in it.
-fn item_at(item: Item) -> Int =
+fn item_start(item: Item) -> Int =
   match item {
-    IFn(d) -> d.span.start,
-    ITest(d) -> d.span.start,
-    ILaw(d) -> d.span.start,
-    ISchema(d) -> d.name.span.start,
+    FunctionItem(d) -> d.span.start,
+    TestItem(d) -> d.span.start,
+    LawItem(d) -> d.span.start,
+    SchemaItem(d) -> d.name.span.start,
     _ -> 0,
   }
 
-fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {abort.raise} = {
-  let state = { ..outer, fresh: 0, mode: None, exit: None, exits: 0, item_at: item_at(item) };
+fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item } / {abort.raise} = {
+  let state = { ..outer, fresh: 0, mode: None, exit: None, exits: 0, item_start: item_start(item) };
   match item {
-    IFn(d) -> {
+    FunctionItem(d) -> {
       let spec: { state: TryState, clauses: List<SpecClause> } = d.spec.fold(
         { state: state, clauses: [] },
         |acc: { state: TryState, clauses: List<SpecClause> }, clause: SpecClause| {
           let what = match clause.kind {
-            SRequires -> b"a `requires` clause",
-            SEnsures -> b"an `ensures` clause",
-            SCost -> b"a `cost` clause",
-            SSpace -> b"a `space` clause",
+            RequiresClause -> b"a `requires` clause",
+            EnsuresClause -> b"an `ensures` clause",
+            CostClause -> b"a `cost` clause",
+            SpaceClause -> b"a `space` clause",
           };
-          let o = sweep(acc.state, clause.expr, Some(not_in_a_function(what)), None);
+          let o = sweep(acc.state, clause.expression, Some(not_in_a_function(what)), None);
           {
             state: o.state,
-            clauses: acc.clauses.push({ kind: clause.kind, expr: o.expr, span: clause.span }),
+            clauses: acc.clauses.push({
+              kind: clause.kind,
+              expression: o.expression,
+              span: clause.span,
+            }),
           }
         },
       );
-      let measured: { state: TryState, expr: Option<Expr> } = match d.decreases {
-        None -> { state: spec.state, expr: None },
+      let measured: { state: TryState, expression: Option<Expression> } = match d.decreases {
+        None -> { state: spec.state, expression: None },
         Some(e) -> {
           let o = sweep(spec.state, e, Some(not_in_a_function(b"a `decreases` clause")), None);
-          { state: o.state, expr: Some(o.expr) }
+          { state: o.state, expression: Some(o.expression) }
         },
       };
       let body = match mode_for(state, d.ret) {
         Err(why) -> sweep(measured.state, d.body, Some(why), None),
         Ok(m) -> {
-          let ex = exits_lifted({ ..measured.state, mode: Some(m) }, d.body);
-          let r = ret(ex.state, ex.expr, tries_in(ex.expr));
-          let s: TryOut = sweep(r.state, r.expr, None, None);
-          { state: { ..s.state, mode: None }, expr: s.expr }
+          let ex = lift_exits({ ..measured.state, mode: Some(m) }, d.body);
+          let r = return_position(ex.state, ex.expression, tries_in(ex.expression));
+          let s: TryOutput = sweep(r.state, r.expression, None, None);
+          { state: { ..s.state, mode: None }, expression: s.expression }
         },
       };
       {
         state: body.state,
-        item: IFn({
-          vis: d.vis,
+        item: FunctionItem({
+          visibility: d.visibility,
           name: d.name,
           generics: d.generics,
           params: d.params,
@@ -1476,49 +1722,52 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
           reuse: d.reuse,
           transparent: d.transparent,
           constant: d.constant,
-          decreases: measured.expr,
-          body: body.expr,
+          decreases: measured.expression,
+          body: body.expression,
           doc: d.doc,
           span: d.span,
         }),
       }
     },
-    ITest(d) -> {
+    TestItem(d) -> {
       let why = not_in_a_function(b"a `test`");
       let ranged = match d.cases {
         None -> { state: state, cases: None },
         Some(c) -> {
           let table = sweep(state, c.table, Some(why), None);
           let label = sweep(table.state, c.label, Some(why), None);
-          { state: label.state, cases: Some({ ..c, table: table.expr, label: label.expr }) }
+          {
+            state: label.state,
+            cases: Some({ ..c, table: table.expression, label: label.expression }),
+          }
         },
       };
       let o = sweep(ranged.state, d.body, Some(why), None);
-      { state: o.state, item: ITest({ ..d, cases: ranged.cases, body: o.expr }) }
+      { state: o.state, item: TestItem({ ..d, cases: ranged.cases, body: o.expression }) }
     },
-    ILaw(d) -> {
+    LawItem(d) -> {
       let why = not_in_a_function(b"a `law`");
       let g = match d.guard {
-        None -> { state: state, expr: None },
+        None -> { state: state, expression: None },
         Some(x) -> {
           let o = sweep(state, x, Some(why), None);
-          { state: o.state, expr: Some(o.expr) }
+          { state: o.state, expression: Some(o.expression) }
         },
       };
       let b = sweep(g.state, d.body, Some(why), None);
-      { state: b.state, item: ILaw({ ..d, guard: g.expr, body: b.expr }) }
+      { state: b.state, item: LawItem({ ..d, guard: g.expression, body: b.expression }) }
     },
-    ISchema(d) -> {
+    SchemaItem(d) -> {
       let why = not_in_a_function(b"a `law schema`");
       let g = match d.guard {
-        None -> { state: state, expr: None },
+        None -> { state: state, expression: None },
         Some(x) -> {
           let o = sweep(state, x, Some(why), None);
-          { state: o.state, expr: Some(o.expr) }
+          { state: o.state, expression: Some(o.expression) }
         },
       };
       let b = sweep(g.state, d.body, Some(why), None);
-      { state: b.state, item: ISchema({ ..d, guard: g.expr, body: b.expr }) }
+      { state: b.state, item: SchemaItem({ ..d, guard: g.expression, body: b.expression }) }
     },
     _ -> { state: state, item: item },
   }
@@ -1526,28 +1775,27 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
 
 pub fn expand_try(
   module: Module,
-  diags: List<ParseDiag>,
-) -> { module: Module, diags: List<ParseDiag> } / {abort.raise} = {
+  diagnostics: List<ParseDiagnostic>,
+) -> { module: Module, diagnostics: List<ParseDiagnostic> } / {abort.raise} = {
   let start = {
     types: collect_types(module),
-    shadowed: shadowing_ctor(module),
-    diags: diags,
+    shadowed: shadowing_constructor(module),
+    diagnostics: diagnostics,
     mode: None,
     fresh: 0,
     exit: None,
     exits: 0,
-    item_at: 0,
+    item_start: 0,
   };
   let walked = module.items.fold(
     { state: start, items: [] },
     |acc: { state: TryState, items: List<Item> }, item: Item| {
-      let o = try_item(acc.state, item);
+      let o = expand_item_try(acc.state, item);
       { state: o.state, items: acc.items.push(o.item) }
     },
   );
-  { module: { ..module, items: walked.items }, diags: walked.state.diags }
+  { module: { ..module, items: walked.items }, diagnostics: walked.state.diagnostics }
 }
 
-// --- Running the rewrites --------------------------------------------------------------------
-
-fn tries_in(e: Expr) -> Int = count_in(e, |x: Expr| match x { ETry(_) -> true, _ -> false })
+fn tries_in(e: Expression) -> Int =
+  count_in(e, |x: Expression| match x { PropagateExpression(_) -> true, _ -> false })

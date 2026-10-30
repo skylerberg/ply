@@ -1,48 +1,49 @@
-//! What a test over cases is made of.
+//! Support for tests that run once for each case of a table.
 //!
-//! `test "{c.name}" for c: T in table() { .. }` is a test for each element of its table, a case.
-//! A run names a case by its value as it was built, so a case keeps its pass wherever the table
-//! moves it, and two cases a body can tell apart are never one: `1.5m` and `1.50m` are two, as are
-//! two values of a type whose `key` answers the same for both. `listed` is how a run learns the
-//! cases, and `chosen` how a test is entered for one. A module with such a test imports this one
-//! itself, so this module cannot hold one.
+//! `test "{c.name}" for c: T in table() { .. }` runs one test for each element of its table. Each
+//! element is a *case*. A test run identifies a case by its value as it was built, so a case keeps
+//! its recorded pass when the table moves it. Two cases that a test body can tell apart never share
+//! an identity: `1.5m` and `1.50m` are two cases, as are two values whose type's `key` returns the
+//! same for both. A run calls `listed` to learn the cases and `chosen` to start the test for one. A
+//! module with such a test imports this module, so this module cannot contain one.
 
 import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
-                  VArray, VRecord, VCtor, VMap, VFn, FAnonymous, Field, Entry, ctor_name, reflect)
+                  VArray, VRecord, VCtor, VMap, VFn, FAnonymous, Field, Entry, constructor_name,
+                  reflect)
 
-/// What a test ranges over: its cases, in the order a report lists them.
+/// The cases a test runs over, in the order a report lists them.
 pub type Table<a> = List<a>
 
-/// A case as a run knows it.
-pub type Listed = {
-  /// What its test is reported under and `--filter` reads.
+/// A case as a test run identifies it.
+pub type Case = {
+  /// The name its test is reported under, which `--filter` matches.
   label: String,
-  /// BLAKE3 of its value as built: two cases built alike share one, and two that `==` calls equal
-  /// do not where they are built differently.
+  /// The BLAKE3 hash of its value as built. Two cases built the same way share an identity. Two
+  /// that `==` calls equal but that are built differently do not.
   identity: Bytes,
 }
 
-/// Each case of `table`, in the table's order, named by what `label` makes of it.
+/// Lists each case of `table` in the table's order, with the label `label` gives it.
 ///
-/// `derivable(hash, a)` is read here through no `key`, since a case is told from another by what
-/// it holds. Raises on a value that holds a function, a handle or a credential.
-pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e}
+/// The hash ignores any `key` the type declares, since cases are told apart by what they contain.
+/// Raises on a value that contains a function, a handle or a credential.
+pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Case> / {abort.raise | e}
   where derivable(hash, a)
 = table.map(|c: a| { label: label(c), identity: identity(c) })
 
-/// The case whose identity is `wanted`.
+/// Returns the case whose identity is `wanted`.
 ///
-/// The one at `at` where the table still holds it there, and otherwise the first of that identity
-/// wherever it stands now. Raises when the table holds it nowhere.
+/// Returns the element at index `at` if it still has that identity, and otherwise the first
+/// element with that identity anywhere in the table. Raises when no element has it.
 pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise}
   where derivable(hash, a)
 =
   match table.at(at) {
-    Some(c) -> if identity(c) == wanted { c } else { moved(table, wanted) },
-    None -> moved(table, wanted),
+    Some(c) -> if identity(c) == wanted { c } else { find_by_identity(table, wanted) },
+    None -> find_by_identity(table, wanted),
   }
 
-fn moved<a>(table: List<a>, wanted: Bytes) -> a / {abort.raise}
+fn find_by_identity<a>(table: List<a>, wanted: Bytes) -> a / {abort.raise}
   where derivable(hash, a)
 =
   match table.filter(|c: a| identity(c) == wanted) {
@@ -50,15 +51,16 @@ fn moved<a>(table: List<a>, wanted: Bytes) -> a / {abort.raise}
     [] -> panic("the table no longer holds this case"),
   }
 
-/// BLAKE3 of `c` as it was built. `digest` is coarser: it follows `==`.
-fn identity<a>(c: a) -> Bytes / {abort.raise} = written(reflect(c)).blake3()
+/// The BLAKE3 hash of `c` as it was built. `digest` is coarser, because it agrees with `==`.
+fn identity<a>(c: a) -> Bytes / {abort.raise} = encode_value(reflect(c)).blake3()
 
-/// `v` as bytes no other value is written as, with two exceptions that tell no two cases of one
-/// type apart. A width below 64 bits is written as the `Int` it reads as, which is how compiled
-/// code holds one. A constructor is written under the name its module declares, so a module that
-/// moves keeps its cases. A `Decimal` keeps its scale, and a value of a type that states a `key`
-/// its own fields. Raises on what holds no data to write.
-fn written(v: Value) -> Bytes / {abort.raise} =
+/// Encodes `v` as bytes that no other value encodes to, with two exceptions that never merge two
+/// cases of one type. An integer narrower than 64 bits is written as the `Int` of its value, which
+/// is how compiled code stores one. A constructor is written under its name without the module
+/// path, so cases keep their identity when their module moves. A `Decimal` keeps its scale, and a
+/// value whose type declares a `key` keeps all its fields. Raises on a function, a handle or a
+/// credential, which have no data to write.
+fn encode_value(v: Value) -> Bytes / {abort.raise} =
   match v {
     VUnit -> b"u",
     VBool(yes) -> if yes { b"t" } else { b"f" },
@@ -72,24 +74,28 @@ fn written(v: Value) -> Bytes / {abort.raise} =
     VChar(c) -> text(b"c", String::of_chars([c])),
     VStr(s) -> text(b"s", s),
     VBytes(bytes) -> framed(b"b", bytes),
-    VList(items) -> counted(b"l", items.map(|x: Value| written(x))),
-    VArray(items) -> counted(b"a", items.map(|x: Value| written(x))),
+    VList(items) -> counted(b"l", items.map(|x: Value| encode_value(x))),
+    VArray(items) -> counted(b"a", items.map(|x: Value| encode_value(x))),
     VRecord(fields) ->
-      counted(b"r", fields.map(|f: Field| text(b"n", f.name).concat(written(f.value)))),
+      counted(b"r", fields.map(|f: Field| text(b"n", f.name).concat(encode_value(f.value)))),
     VCtor(name, args) ->
-      text(b"k", ctor_name(name)).concat(counted(b"p", args.map(|x: Value| written(x)))),
-    VMap(entries) -> counted(b"m", entries.map(|e: Entry| written(e.key).concat(written(e.value)))),
+      text(b"k", constructor_name(name)).concat(
+        counted(b"p", args.map(|x: Value| encode_value(x))),
+      ),
+    VMap(entries) ->
+      counted(b"m", entries.map(|e: Entry| encode_value(e.key).concat(encode_value(e.value)))),
     _ ->
       panic("a case holds a function, a handle or a credential, which no run tells from another"),
   }
 
-/// `tag`, how long `payload` is, `:`, then `payload`: where it ends is read before it is.
+/// Writes `tag`, the length of `payload`, `:`, then `payload`, so a reader learns where it ends
+/// before reading it.
 fn framed(tag: Bytes, payload: Bytes) -> Bytes =
   Bytes::concat_all([tag, Bytes::of_string(payload.len().to_string()), b":", payload])
 
 fn text(tag: Bytes, s: String) -> Bytes = framed(tag, Bytes::of_string(s))
 
-/// `tag`, how many `parts`, `:`, then each part, which says itself where it ends.
+/// Writes `tag`, the number of `parts`, `:`, then each part, which marks its own end.
 fn counted(tag: Bytes, parts: List<Bytes>) -> Bytes =
   Bytes::concat_all([
     tag,
@@ -98,7 +104,7 @@ fn counted(tag: Bytes, parts: List<Bytes>) -> Bytes =
     Bytes::concat_all(parts),
   ])
 
-/// What a width below 64 bits reads, and `None` of a wider one.
+/// The `Int` value of an integer narrower than 64 bits, or `None` for a wider one.
 fn narrow(ty: String, bits: U128) -> Option<Int> / {abort.raise} =
   if ty == "U8" || ty == "U16" || ty == "U32" { Some(Int::of_u128(bits)) }
   else if ty == "I8" { Some(signed(Int::of_u128(bits), 128)) }
@@ -106,11 +112,11 @@ fn narrow(ty: String, bits: U128) -> Option<Int> / {abort.raise} =
   else if ty == "I32" { Some(signed(Int::of_u128(bits), 2147483648)) }
   else { None }
 
-/// A pattern at or past `half` its width's range reads below zero.
+/// Reads a bit pattern as signed: a pattern at or above `half` its width's range is negative.
 fn signed(pattern: Int, half: Int) -> Int =
   if pattern >= half { pattern - 2 * half } else { pattern }
 
-test "a listing labels each case and names it as it was built, in the table's order" {
+test "a listing labels each case and identifies it as it was built, in the table's order" {
   assert_eq(listed([3, 4], |n: Int| n.to_string()), [
     { label: "3", identity: identity(3) },
     { label: "4", identity: identity(4) },
@@ -118,7 +124,7 @@ test "a listing labels each case and names it as it was built, in the table's or
   assert_eq(listed([], |n: Int| n.to_string()), [])
 }
 
-test "a case is chosen by its identity, at its place or wherever the table now holds it" {
+test "a case is found by its identity, at its index or wherever it now is in the table" {
   assert_eq(chosen(["a", "b"], 1, identity("b")), "b");
   assert_eq(chosen(["new", "a", "b"], 1, identity("b")), "b");
   assert_eq(chosen(["b"], 4, identity("b")), "b")
@@ -127,17 +133,17 @@ test "a case is chosen by its identity, at its place or wherever the table now h
 fn missing() -> Result<String, String> =
   handle { Ok(chosen(["a"], 0, identity("b"))) } with { abort.raise(reason) -> Err(reason) }
 
-test "a case the table no longer holds raises" {
+test "choosing a case the table no longer contains raises" {
   assert_eq(missing(), Err("the table no longer holds this case"))
 }
 
-test "two values `==` calls equal are two cases where they are built differently" {
+test "two values that `==` calls equal are two cases when they are built differently" {
   assert(1.5m == 1.50m);
   assert(identity(1.5m) != identity(1.50m));
   assert(identity([{ price: 2.0m }]) != identity([{ price: 2.00m }]));
   assert_eq(chosen([1.5m, 1.50m], 0, identity(1.50m)).to_string(), "1.50");
   assert_eq(identity([1.50m]), identity([1.50m]));
-  // A `Map` keeps a key at the scale it was given, so these are two ways to build one map.
+  // A `Map` stores a key at the scale it was given, so these build one map in two ways.
   assert(
     identity(Map::of_entries([{ key: 1.50m, value: 0 }]))
       != identity(Map::of_entries([{ key: 1.5m, value: 0 }])),
@@ -181,31 +187,31 @@ fn kinds() -> List<Value> =
     VList([VStr("1:as1:b")]),
   ]
 
-test "no two values are written alike" {
-  let all = kinds().map(|v: Value| written(v));
+test "no two values encode to the same bytes" {
+  let all = kinds().map(|v: Value| encode_value(v));
   assert_eq(
     range(0, all.len()).filter(|i: Int| all.filter(|w: Bytes| Some(w) == all.at(i)).len() != 1),
     [],
   )
 }
 
-test "a narrow width is the Int it reads as, and a constructor is its module's own name" {
-  assert_eq(written(VFixed("U8", 255u128)), written(VInt(255)));
-  assert_eq(written(VFixed("I8", 255u128)), written(VInt(-1)));
-  assert_eq(written(VFixed("I16", 65535u128)), written(VInt(-1)));
-  assert_eq(written(VFixed("I32", 2147483648u128)), written(VInt(-2147483648)));
-  assert_eq(written(VFixed("U32", 4294967295u128)), written(VInt(4294967295)));
+test "a narrow integer encodes as the Int of its value, and a constructor by its bare name" {
+  assert_eq(encode_value(VFixed("U8", 255u128)), encode_value(VInt(255)));
+  assert_eq(encode_value(VFixed("I8", 255u128)), encode_value(VInt(-1)));
+  assert_eq(encode_value(VFixed("I16", 65535u128)), encode_value(VInt(-1)));
+  assert_eq(encode_value(VFixed("I32", 2147483648u128)), encode_value(VInt(-2147483648)));
+  assert_eq(encode_value(VFixed("U32", 4294967295u128)), encode_value(VInt(4294967295)));
   assert_eq(
-    written(VCtor("orders.Shipped", [VInt(2)])),
-    written(VCtor("app.models.Shipped", [VInt(2)])),
+    encode_value(VCtor("orders.Shipped", [VInt(2)])),
+    encode_value(VCtor("app.models.Shipped", [VInt(2)])),
   );
-  assert(written(VCtor("Shipped", [VInt(2)])) != written(VCtor("Held", [VInt(2)])))
+  assert(encode_value(VCtor("Shipped", [VInt(2)])) != encode_value(VCtor("Held", [VInt(2)])))
 }
 
 fn unwritten() -> Result<Bytes, String> =
-  handle { Ok(written(VList([VFn(FAnonymous)]))) } with { abort.raise(reason) -> Err(reason) }
+  handle { Ok(encode_value(VList([VFn(FAnonymous)]))) } with { abort.raise(reason) -> Err(reason) }
 
-test "a value that holds a function is not written" {
+test "encoding a value that contains a function raises" {
   assert_eq(
     unwritten(),
     Err("a case holds a function, a handle or a credential, which no run tells from another"),

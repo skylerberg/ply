@@ -1,0 +1,435 @@
+import compiler.syntax.parsing (Span)
+import compiler.syntax.expressions (Param)
+import compiler.syntax.items (FnDefinition)
+import compiler.syntax.type_syntax (FunctionTypeExpression, type_span)
+import compiler.check.resolve.tables (Diagnostic, Edit, error_at, with_fix, insertion, list_names)
+import compiler.check.types (Type)
+import compiler.check.typed (TypedParam, TypedPattern, pattern_binders)
+import compiler.check.infer.walked (Walked, WalkedLiteral, WalkedRead, WalkedLocal,
+                                    WalkedDefinition, WalkedConstructor, WalkedBuiltin, WalkedUnary,
+                                    WalkedBinary, WalkedCall, WalkedIf, WalkedMatch, WalkedBlock,
+                                    WalkedList, WalkedRecord, WalkedUpdate, WalkedFieldRead,
+                                    WalkedPerform, WalkedLambda, WalkedSimulate, WalkedParallel,
+                                    WalkedHandle, WalkedDefault, WalkedArm, WalkedStatement,
+                                    WalkedLet, WalkedLetElse, WalkedDo, WalkedAssign, WalkedField,
+                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVar)
+import std.list
+
+pub type ParameterMode = { name: Bytes, borrowed: Bool, keep: Bool }
+
+pub type ParameterModes = { name: Bytes, params: List<ParameterMode> }
+
+pub fn parameter_mode(p: Param) -> ParameterMode =
+  {
+    name: p.name.name,
+    borrowed: !p.keep && (match p.ty { Some(FunctionTypeExpression(_)) -> true, _ -> false }),
+    keep: p.keep,
+  }
+
+pub type Callees = { takes: (Bytes) -> Option<ParameterModes> / {abort.raise} }
+
+type EscapeKind =
+  | Returned
+  | Stored
+  | PassedToOperation
+  | PassedToKeepParameter({ callee: Bytes, param: Bytes })
+  | PassedToNonFunctionParameter({ callee: Bytes, param: Bytes })
+  | PassedToFunctionValue
+  | PassedContinuation({ callee: Bytes, param: Bytes })
+
+type Borrow = { param: Bytes, span: Span }
+
+type Escape = { borrowed: List<Borrow>, place: EscapeKind }
+
+type Findings = { escapes: List<Escape>, read: List<Bytes> }
+
+type ValueSummary = { seen: Findings, borrowed: List<Borrow>, results: List<Bytes> }
+
+type Local = { borrowed: List<Bytes>, results: List<Bytes> }
+
+type Scope = { locals: Map<Int, Local>, callees: Callees, room: Int }
+
+type StatementsSummary = { s: Scope, v: ValueSummary }
+
+type EscapeReport = { diagnostics: List<Diagnostic>, fixed: List<Bytes> }
+
+pub fn has_borrowed_parameter(definition: FnDefinition) -> Bool =
+  definition.params.any(|p: Param| parameter_mode(p).borrowed)
+
+pub fn escape_diagnostics(
+  module: Int,
+  definition: FnDefinition,
+  body: Walked,
+  callees: Callees,
+) -> List<Diagnostic> / {abort.raise} =
+  if !has_borrowed_parameter(definition) { [] } else {
+    let lent = definition.params.filter(|p: Param| parameter_mode(p).borrowed).map(|p: Param|
+      p.name.name);
+    let s = definition.params.fold(
+      { locals: Map::new(), callees: callees, room: lent.len() + 1 },
+      |sc: Scope, p: Param|
+        bind(sc, p.name.span.site, if lent.contains(p.name.name) { [p.name.name] } else { [] }),
+    );
+    walk_escaping(s, no_findings(), body, Returned).escapes.fold(
+      { diagnostics: [], fixed: [] },
+      |acc: EscapeReport, e: Escape| report_escape(module, definition, e, acc),
+    ).diagnostics
+  }
+
+fn no_findings() -> Findings = { escapes: [], read: [] }
+
+fn report_escape(
+  module: Int,
+  definition: FnDefinition,
+  e: Escape,
+  acc: EscapeReport,
+) -> EscapeReport / {abort.raise} =
+  e.borrowed.fold([], |spans: List<Span>, l: Borrow| spans.push_unique(l.span)).fold(
+    acc,
+    |r: EscapeReport, span: Span| {
+      let params = e.borrowed.fold([], |ps: List<Bytes>, l: Borrow|
+        if l.span == span { ps.push_unique(l.param) } else { ps });
+      {
+        diagnostics: r.diagnostics.push(
+          escape_diagnostic(
+            module,
+            definition,
+            span,
+            params,
+            params.filter(|p: Bytes| !r.fixed.contains(p)),
+            e.place,
+          ),
+        ),
+        fixed: params.fold(r.fixed, |fs: List<Bytes>, p: Bytes| fs.push_unique(p)),
+      }
+    },
+  )
+
+fn escape_diagnostic(
+  module: Int,
+  definition: FnDefinition,
+  span: Span,
+  params: List<Bytes>,
+  unfixed: List<Bytes>,
+  place: EscapeKind,
+) -> Diagnostic / {abort.raise} = {
+  let d = error_at(
+    b"E0475",
+    module,
+    span,
+    Bytes::concat_all([
+      list_names(params),
+      if params.len() == 1 { b" is" } else { b" are" },
+      b" lent to `",
+      definition.name.name,
+      b"`, and would be held past its call",
+    ]),
+    escape_kind_text(place),
+    [
+      b"a parameter of a function type is lent unless written `keep`: the function may call it, pass it to a parameter lent in turn, or capture it in a lambda, which is then lent too",
+      b"write `keep` before its type to hold it, and each caller passes a function that may be held",
+    ],
+  );
+  if unfixed.len() == 0 { d } else {
+    with_fix(
+      d,
+      b"write `keep` on ".concat(list_names(unfixed)),
+      definition.params.fold([], |edits: List<Edit>, p: Param|
+        match p.ty {
+          Some(t) -> if unfixed.contains(p.name.name) {
+            edits.push(insertion(module, type_span(t).start, b"keep "))
+          } else { edits },
+          None -> edits,
+        }),
+    )
+  }
+}
+
+fn escape_kind_text(place: EscapeKind) -> Bytes =
+  match place {
+    Returned -> b"answered here",
+    Stored -> b"held in a value here",
+    PassedToOperation -> b"passed to an operation, whose handler may hold it",
+    PassedToKeepParameter(k) ->
+      Bytes::concat_all([b"passed to `", k.param, b"` of `", k.callee, b"`, written `keep`"]),
+    PassedToNonFunctionParameter(h) ->
+      Bytes::concat_all([
+        b"passed to `",
+        h.param,
+        b"` of `",
+        h.callee,
+        b"`, which is not written as a function type and may hold what it is passed",
+      ]),
+    PassedToFunctionValue -> b"passed to a function value, which may hold it",
+    PassedContinuation(r) ->
+      Bytes::concat_all([
+        b"passed to `",
+        r.param,
+        b"` of `",
+        r.callee,
+        b"`, which may answer what a call of it answers",
+      ]),
+  }
+
+fn bind(s: Scope, binder: Int, lent: List<Bytes>) -> Scope =
+  bind_local(s, binder, { borrowed: lent, results: [] })
+
+fn bind_local(s: Scope, binder: Int, l: Local) -> Scope =
+  { ..s, locals: s.locals.insert(binder, l) }
+
+fn bind_pattern(s: Scope, p: TypedPattern<Type>, l: Local) -> Scope =
+  pattern_binders(p).fold(s, |sc: Scope, b: TypedParam<Type>| bind_local(sc, b.span.site, l))
+
+fn borrowed_parameters(lent: List<Borrow>) -> List<Bytes> =
+  lent.fold([], |ps: List<Bytes>, l: Borrow| ps.push_unique(l.param))
+
+fn local_of(v: ValueSummary) -> Local =
+  { borrowed: borrowed_parameters(v.borrowed), results: v.results }
+
+fn union(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
+  b.fold(a, |acc: List<Bytes>, p: Bytes| acc.push_unique(p))
+
+fn with_reads(seen: Findings, params: List<Bytes>) -> Findings =
+  { ..seen, read: union(seen.read, params) }
+
+fn no_borrows(seen: Findings) -> ValueSummary = { seen: seen, borrowed: [], results: [] }
+
+fn merge(a: ValueSummary, b: ValueSummary) -> ValueSummary =
+  { seen: b.seen, borrowed: a.borrowed.concat(b.borrowed), results: union(a.results, b.results) }
+
+fn add_escape(seen: Findings, lent: List<Borrow>, place: EscapeKind) -> Findings =
+  if lent.len() == 0 { seen }
+  else { { ..seen, escapes: seen.escapes.push({ borrowed: lent, place: place }) } }
+
+fn walk_discarded(s: Scope, seen: Findings, e: Walked) -> Findings / {abort.raise} =
+  walk(s, seen, e).seen
+
+fn walk_escaping(
+  s: Scope,
+  seen: Findings,
+  e: Walked,
+  place: EscapeKind,
+) -> Findings / {abort.raise} = {
+  let v = walk(s, seen, e);
+  add_escape(v.seen, v.borrowed, place)
+}
+
+fn walk_all_escaping(
+  s: Scope,
+  seen: Findings,
+  xs: List<Walked>,
+  place: EscapeKind,
+) -> Findings / {abort.raise} =
+  xs.fold(seen, |acc: Findings, x: Walked| walk_escaping(s, acc, x, place))
+
+fn walk(s: Scope, seen: Findings, e: Walked) -> ValueSummary / {abort.raise} =
+  match e.node {
+    WalkedLiteral(_) -> no_borrows(seen),
+    WalkedDefault(_) -> no_borrows(seen),
+    WalkedRead(WalkedLocal(x)) -> match s.locals.get(x.binder) {
+      Some(l) ->
+        {
+          seen: with_reads(seen, l.borrowed),
+          borrowed: l.borrowed.map(|p: Bytes| { param: p, span: e.span }),
+          results: l.results,
+        },
+      None -> no_borrows(seen),
+    },
+    WalkedRead(_) -> no_borrows(seen),
+    WalkedBinary(b) -> no_borrows(walk_discarded(s, walk_discarded(s, seen, b.lhs), b.rhs)),
+    WalkedUnary(u) -> no_borrows(walk_discarded(s, seen, u.operand)),
+    WalkedLambda(l) -> {
+      let body = walk_escaping(s, { ..seen, read: [] }, l.body, Returned);
+      {
+        seen: with_reads({ ..body, read: seen.read }, body.read),
+        borrowed: body.read.map(|p: Bytes| { param: p, span: e.span }),
+        results: [],
+      }
+    },
+    WalkedCall(c) -> walk_call(s, seen, e.span, c.callee, c.args),
+    WalkedIf(i) -> {
+      let t = walk(s, walk_discarded(s, seen, i.cond), i.then_branch);
+      merge(t, walk(s, t.seen, i.else_branch))
+    },
+    WalkedMatch(m) -> {
+      let on = walk(s, seen, m.scrutinee);
+      m.arms.fold(no_borrows(on.seen), |acc: ValueSummary, arm: WalkedArm| {
+        let inner = bind_pattern(s, arm.pattern, local_of(on));
+        let guarded = match arm.guard {
+          Some(g) -> walk_discarded(inner, acc.seen, g),
+          None -> acc.seen,
+        };
+        merge(acc, walk(inner, guarded, arm.body))
+      })
+    },
+    WalkedBlock(b) -> {
+      let st = walk_statements(s, seen, b.statements);
+      match b.tail { Some(t) -> merge(st.v, walk(st.s, st.v.seen, t)), None -> st.v }
+    },
+    WalkedRecord(fs) ->
+      no_borrows(walk_all_escaping(s, seen, fs.map(|f: WalkedField| f.value), Stored)),
+    WalkedUpdate(u) ->
+      no_borrows(
+        walk_all_escaping(
+          s,
+          walk_discarded(s, seen, u.base),
+          u.sets.map(|f: WalkedField| f.value),
+          Stored,
+        ),
+      ),
+    WalkedFieldRead(x) -> no_borrows(walk_discarded(s, seen, x.base)),
+    WalkedList(xs) -> no_borrows(walk_all_escaping(s, seen, xs, Stored)),
+    WalkedPerform(p) -> no_borrows(walk_all_escaping(s, seen, p.args, PassedToOperation)),
+    WalkedHandle(h) -> walk_handle(s, seen, h.body, h.ret, h.clauses, h.vars),
+    WalkedSimulate(t) -> walk(s, seen, t.body),
+    WalkedParallel(ts) ->
+      no_borrows(walk_all_escaping(s, seen, ts.map(|t: WalkedThunk| t.body), Stored)),
+  }
+
+fn walk_call(
+  s: Scope,
+  seen: Findings,
+  span: Span,
+  function: Walked,
+  args: List<Walked>,
+) -> ValueSummary / {abort.raise} =
+  match function.node {
+    WalkedRead(WalkedLocal(x)) -> match s.locals.get(x.binder) {
+      Some(l) ->
+        {
+          seen: walk_all_escaping(s, with_reads(seen, l.borrowed), args, PassedToFunctionValue),
+          borrowed: l.results.map(|p: Bytes| { param: p, span: span }),
+          results: [],
+        },
+      None -> no_borrows(walk_all_escaping(s, seen, args, PassedToFunctionValue)),
+    },
+    WalkedRead(WalkedDefinition(d)) ->
+      no_borrows(walk_arguments(s, seen, s.callees.takes(d.key), args)),
+    WalkedRead(WalkedBuiltin(b)) ->
+      no_borrows(match s.callees.takes(b.name) {
+        Some(t) -> walk_arguments(s, seen, Some(t), args),
+        None -> args.fold(seen, |acc: Findings, x: Walked| walk_discarded(s, acc, x)),
+      }),
+    WalkedRead(WalkedConstructor(_)) -> no_borrows(walk_all_escaping(s, seen, args, Stored)),
+    _ ->
+      no_borrows(
+        walk_all_escaping(s, walk_discarded(s, seen, function), args, PassedToFunctionValue),
+      ),
+  }
+
+fn walk_arguments(
+  s: Scope,
+  seen: Findings,
+  takes: Option<ParameterModes>,
+  args: List<Walked>,
+) -> Findings / {abort.raise} =
+  match takes {
+    None -> walk_all_escaping(s, seen, args, PassedToFunctionValue),
+    Some(t) ->
+      args.fold({ seen: seen, at: 0 }, |acc: { seen: Findings, at: Int }, x: Walked|
+        { seen: walk_argument(s, acc.seen, t, acc.at, x), at: acc.at + 1 }).seen,
+  }
+
+fn walk_argument(
+  s: Scope,
+  seen: Findings,
+  t: ParameterModes,
+  at: Int,
+  arg: Walked,
+) -> Findings / {abort.raise} =
+  match t.params.at(at) {
+    Some(p) -> if p.borrowed {
+      let v = walk(s, seen, arg);
+      add_escape(
+        v.seen,
+        v.results.map(|q: Bytes| { param: q, span: arg.span }),
+        PassedContinuation({ callee: t.name, param: p.name }),
+      )
+    } else if p.keep {
+      walk_escaping(s, seen, arg, PassedToKeepParameter({ callee: t.name, param: p.name }))
+    } else {
+      walk_escaping(s, seen, arg, PassedToNonFunctionParameter({ callee: t.name, param: p.name }))
+    },
+    None -> walk_escaping(s, seen, arg, PassedToFunctionValue),
+  }
+
+fn walk_statements(
+  s: Scope,
+  seen: Findings,
+  statements: List<WalkedStatement>,
+) -> StatementsSummary / {abort.raise} =
+  statements.fold({ s: s, v: no_borrows(seen) }, |st: StatementsSummary, x: WalkedStatement|
+    match x {
+      WalkedLet(l) -> {
+        let v = walk(st.s, st.v.seen, l.value);
+        { s: bind_pattern(st.s, l.pattern, local_of(v)), v: { ..st.v, seen: v.seen } }
+      },
+      WalkedLetElse(l) -> {
+        let v = walk(st.s, st.v.seen, l.value);
+        let f = walk(st.s, v.seen, l.fallback);
+        { s: bind_pattern(st.s, l.pattern, local_of(v)), v: merge(st.v, f) }
+      },
+      WalkedDo(y) -> { ..st, v: { ..st.v, seen: walk_discarded(st.s, st.v.seen, y) } },
+      WalkedAssign(y) ->
+        { ..st, v: { ..st.v, seen: walk_escaping(st.s, st.v.seen, y.value, Stored) } },
+    })
+
+fn walk_handle(
+  s: Scope,
+  seen: Findings,
+  body: Walked,
+  ret: Option<WalkedReturn>,
+  clauses: List<WalkedClause>,
+  vars: List<WalkedHandlerVar>,
+) -> ValueSummary / {abort.raise} = {
+  let inits = vars.fold(seen, |acc: Findings, v: WalkedHandlerVar|
+    walk_escaping(s, acc, v.init, Stored));
+  let b = walk(s, { ..inits, read: [] }, body);
+  let returning = match ret {
+    Some(r) -> bind_local(s, r.binder.span.site, local_of(b)),
+    None -> s,
+  };
+  let caught = clauses.fold(
+    union(b.seen.read, match ret {
+      Some(r) -> walk(returning, no_findings(), r.body).seen.read,
+      None -> [],
+    }),
+    |acc: List<Bytes>, c: WalkedClause| union(acc, walk(s, no_findings(), c.body).seen.read),
+  );
+  let after = with_reads({ ..b.seen, read: inits.read }, caught);
+  let returned: ValueSummary = match ret {
+    Some(r) -> walk(returning, after, r.body),
+    None -> { seen: after, borrowed: b.borrowed, results: b.results },
+  };
+  let resumed = |c: WalkedClause, k: TypedParam<Type>, answers: List<Bytes>|
+    bind_local(s, k.span.site, { borrowed: caught, results: answers });
+  let answers = handle_returns(
+    clauses,
+    resumed,
+    union(borrowed_parameters(returned.borrowed), returned.results),
+    s.room,
+  );
+  clauses.fold(returned, |acc: ValueSummary, c: WalkedClause|
+    match c.resume {
+      Some(k) -> merge(acc, walk(resumed(c, k, answers), acc.seen, c.body)),
+      None -> { ..acc, seen: walk_escaping(s, acc.seen, c.body, Returned) },
+    })
+}
+
+fn handle_returns(
+  clauses: List<WalkedClause>,
+  resumed: (WalkedClause, TypedParam<Type>, List<Bytes>) -> Scope,
+  known: List<Bytes>,
+  room: Int,
+) -> List<Bytes> / {abort.raise} =
+  if room <= 0 { known } else {
+    let next = clauses.fold(known, |acc: List<Bytes>, c: WalkedClause|
+      match c.resume {
+        Some(k) -> {
+          let v = walk(resumed(c, k, known), no_findings(), c.body);
+          union(acc, union(borrowed_parameters(v.borrowed), v.results))
+        },
+        None -> acc,
+      });
+    if next.len() == known.len() { known } else { handle_returns(clauses, resumed, next, room - 1) }
+  }

@@ -1,7 +1,3 @@
-//! `ply hash` — every definition and test under the hash content addressing keys it by, grouped by
-//! the module that declares it. The grouping is the one thing here that could be mistaken for part
-//! of a hash, so the listing says it is not.
-
 import compiler.load (Derives)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
@@ -9,46 +5,50 @@ import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import program (Program, ModuleView, Tables, load_program, published, tables_of, modules_of,
-                deps_of, closure_of, hash_of, short_of, own_tests, program_view)
-import report (Answer, ok_code, count_of, indent, refused)
+import program (Program, ModuleView, Tables, load_program, definitions_in_order, tables_of,
+                modules_of, dependencies_of, closure_of, hash_of, short_of, own_tests, program_view)
+import report (CommandOutput, ok_code, count_of, indent, refused)
 import std.term (Style, bold, dim, plain)
-import compiler.front.facts (View)
-import compiler.syntax.exprs (prelude_module)
-import compiler.store.hash.forms (TheFn, TheItem, Which)
+import compiler.front.facts (CheckedProgram)
+import compiler.syntax.expressions (prelude_module)
+import compiler.store.hash.forms (FunctionNamed, ItemKeyed, Subject)
 import compiler.store.hash.encoding (hex)
 import compiler.store.hash (no_hashes, no_refs)
-import compiler.check.infer.checker (DefInfo, TestInfo)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo)
 import std.fs (fs)
 import std.json (Json, Null, Str, Bool, Number, Array, object, string_or_null, strings)
 import sources (File)
 import std.string
 
-pub fn note() -> String =
+pub fn erasure_note() -> String =
   "module names, imports and `pub` are erased by normalization: moving a definition between modules changes no hash"
 
-fn blank() -> String = "------------"
+fn blank_hash() -> String = "------------"
 
 fn edges(
   tables: Tables,
-  deps: Bool,
-  which: Which,
+  dependencies: Bool,
+  which: Subject,
   entry: List<{ key: String, value: Json }>,
 ) -> List<{ key: String, value: Json }> / {abort.raise} =
-  if !deps { entry } else {
-    entry.push({ key: "deps", value: strings(deps_of(tables, which)) }).push({
+  if !dependencies { entry } else {
+    entry.push({ key: "deps", value: strings(dependencies_of(tables, which)) }).push({
       key: "closure",
       value: strings(closure_of(tables, which)),
     })
   }
 
-fn definition_json(tables: Tables, deps: Bool, def_info: DefInfo) -> Json / {abort.raise} = {
-  let hash = hash_of(tables, def_info.name);
+fn definition_json(
+  tables: Tables,
+  dependencies: Bool,
+  definition_info: DefinitionInfo,
+) -> Json / {abort.raise} = {
+  let hash = hash_of(tables, definition_info.name);
   object(
-    edges(tables, deps, TheFn(def_info.name), [
-      { key: "name", value: Str(String::of_bytes_lossy(def_info.name)) },
-      { key: "module", value: Str(String::of_bytes_lossy(def_info.module)) },
-      { key: "simple_name", value: Str(String::of_bytes_lossy(def_info.simple_name)) },
+    edges(tables, dependencies, FunctionNamed(definition_info.name), [
+      { key: "name", value: Str(String::of_bytes_lossy(definition_info.name)) },
+      { key: "module", value: Str(String::of_bytes_lossy(definition_info.module)) },
+      { key: "simple_name", value: Str(String::of_bytes_lossy(definition_info.simple_name)) },
       { key: "hash", value: string_or_null(hash) },
       {
         key: "short",
@@ -58,20 +58,20 @@ fn definition_json(tables: Tables, deps: Bool, def_info: DefInfo) -> Json / {abo
   )
 }
 
-fn test_hash(analysis: View, key: Bytes) -> Option<String> / {abort.raise} =
+fn test_hash(analysis: CheckedProgram, key: Bytes) -> Option<String> / {abort.raise} =
   match analysis.frame.hashes.tests.get(key) {
     Some(h) -> Some(String::of_bytes_lossy(hex(h))),
     None -> None,
   }
 
 fn test_json(
-  analysis: View,
+  analysis: CheckedProgram,
   tables: Tables,
-  deps: Bool,
+  dependencies: Bool,
   test_info: TestInfo,
 ) -> Json / {abort.raise} =
   object(
-    edges(tables, deps, TheItem(test_info.key), [
+    edges(tables, dependencies, ItemKeyed(test_info.key), [
       { key: "index", value: Number(Decimal::of_int(test_info.index)) },
       { key: "key", value: Str(String::of_bytes_lossy(test_info.key)) },
       { key: "name", value: Str(String::of_bytes_lossy(test_info.name)) },
@@ -83,23 +83,21 @@ fn test_json(
 fn module_json(mo: ModuleView) -> Json =
   object([{ key: "name", value: Str(mo.name) }, { key: "file", value: Str(mo.path) }])
 
-// --- The listing ------------------------------------------------------------
-
 fn edge_lines(
   style: Style,
   tables: Tables,
-  which: Which,
+  which: Subject,
   lines: List<String>,
 ) -> List<String> / {abort.raise} = {
-  let named = deps_of(tables, which);
+  let named = dependencies_of(tables, which);
   let reached = closure_of(tables, which);
-  let with_deps = if named.len() == 0 { lines } else {
+  let with_dependencies = if named.len() == 0 { lines } else {
     lines.push(
       indent() ++ "                " ++ dim(style, "deps:") ++ " " ++ String::join(named, ", "),
     )
   };
-  if reached.len() == 0 { with_deps } else {
-    with_deps.push(
+  if reached.len() == 0 { with_dependencies } else {
+    with_dependencies.push(
       indent() ++ "                " ++ dim(style, "closure:") ++ " "
         ++ String::join(reached, ", "),
     )
@@ -108,80 +106,94 @@ fn edge_lines(
 
 fn quoted(name: String) -> String = "\"" ++ name ++ "\""
 
-fn def_lines(
+fn definition_lines(
   style: Style,
   tables: Tables,
-  deps: Bool,
+  dependencies: Bool,
   lines: List<String>,
-  def_info: DefInfo,
+  definition_info: DefinitionInfo,
 ) -> List<String> / {abort.raise} = {
-  let hash = match hash_of(tables, def_info.name) { Some(h) -> short_of(h), None -> blank() };
+  let hash = match hash_of(tables, definition_info.name) {
+    Some(h) -> short_of(h),
+    None -> blank_hash(),
+  };
   let said = lines.push(
-    indent() ++ "  " ++ dim(style, hash) ++ "  " ++ String::of_bytes_lossy(def_info.simple_name),
+    indent() ++ "  " ++ dim(style, hash) ++ "  "
+      ++ String::of_bytes_lossy(definition_info.simple_name),
   );
-  if deps { edge_lines(style, tables, TheFn(def_info.name), said) } else { said }
+  if dependencies { edge_lines(style, tables, FunctionNamed(definition_info.name), said) }
+  else { said }
 }
 
 fn test_lines(
   style: Style,
-  analysis: View,
+  analysis: CheckedProgram,
   tables: Tables,
-  deps: Bool,
+  dependencies: Bool,
   lines: List<String>,
   test_info: TestInfo,
 ) -> List<String> / {abort.raise} = {
-  let hash = match test_hash(analysis, test_info.key) { Some(h) -> short_of(h), None -> blank() };
+  let hash = match test_hash(analysis, test_info.key) {
+    Some(h) -> short_of(h),
+    None -> blank_hash(),
+  };
   let said = lines.push(
     indent() ++ "  " ++ dim(style, hash) ++ "  " ++ dim(style, "test") ++ " "
       ++ quoted(String::of_bytes_lossy(test_info.name)),
   );
-  if deps { edge_lines(style, tables, TheItem(test_info.key), said) } else { said }
+  if dependencies { edge_lines(style, tables, ItemKeyed(test_info.key), said) } else { said }
 }
 
 fn module_lines(
   style: Style,
-  analysis: View,
+  analysis: CheckedProgram,
   tables: Tables,
-  deps: Bool,
-  defs: List<DefInfo>,
+  dependencies: Bool,
+  definitions: List<DefinitionInfo>,
   tests: List<TestInfo>,
   lines: List<String>,
   mo: ModuleView,
 ) -> List<String> / {abort.raise} = {
   let head = lines.push("").push(indent() ++ bold(style, mo.name) ++ " " ++ dim(style, mo.path));
-  let mine = defs.filter(|def_info: DefInfo| String::of_bytes_lossy(def_info.module) == mo.name);
-  let after_defs = mine.fold(head, |acc: List<String>, def_info: DefInfo|
-    def_lines(style, tables, deps, acc, def_info));
+  let mine = definitions.filter(|definition_info: DefinitionInfo|
+    String::of_bytes_lossy(definition_info.module) == mo.name);
+  let after_definitions = mine.fold(head, |acc: List<String>, definition_info: DefinitionInfo|
+    definition_lines(style, tables, dependencies, acc, definition_info));
   let its_tests = tests.filter(|test_info: TestInfo|
     String::of_bytes_lossy(test_info.module) == mo.name);
-  its_tests.fold(after_defs, |acc: List<String>, test_info: TestInfo|
-    test_lines(style, analysis, tables, deps, acc, test_info))
+  its_tests.fold(after_definitions, |acc: List<String>, test_info: TestInfo|
+    test_lines(style, analysis, tables, dependencies, acc, test_info))
 }
 
-fn tally(style: Style, analysis: View, defs: Int, tests: Int) -> List<String> / {abort.raise} = {
+fn tally(
+  style: Style,
+  analysis: CheckedProgram,
+  definitions: Int,
+  tests: Int,
+) -> List<String> / {abort.raise} = {
   let modules = analysis.frame.outlines.len();
   [
     "",
-    indent() ++ count_of(defs, "definition") ++ " · " ++ count_of(tests, "test") ++ " · "
+    indent() ++ count_of(definitions, "definition") ++ " · " ++ count_of(tests, "test") ++ " · "
       ++ count_of(modules, "module"),
-    indent() ++ dim(style, note()),
+    indent() ++ dim(style, erasure_note()),
   ]
 }
 
-fn answered(
+fn hash_output(
   style: Style,
   flags: Flags,
   program: Program,
-  analysis: View,
-) -> Answer / {abort.raise} = {
+  analysis: CheckedProgram,
+) -> CommandOutput / {abort.raise} = {
   let tables: Tables = tables_of(analysis.frame.hashes);
-  // Past the prelude, whose functions a program reaches are the language's (`written_functions_of`).
   let views = modules_of(program, analysis.frame).filter(|mo: ModuleView|
     mo.name != String::of_bytes_lossy(prelude_module()));
-  let defs = published(analysis).filter(|def_info: DefInfo| def_info.module != prelude_module());
+  let definitions = definitions_in_order(analysis).filter(|definition_info: DefinitionInfo|
+    definition_info.module != prelude_module());
   let own = own_tests(program, analysis);
   let listed = views.fold([], |acc: List<String>, mo: ModuleView|
-    module_lines(style, analysis, tables, flags.deps, defs, own, acc, mo));
+    module_lines(style, analysis, tables, flags.dependencies, definitions, own, acc, mo));
   {
     json: object([
       { key: "command", value: Str("hash") },
@@ -191,20 +203,23 @@ fn answered(
       { key: "files", value: Array(program.files.map(|file: File| Str(file.path))) },
       { key: "modules", value: Array(views.map(module_json)) },
       { key: "module_is_hashed", value: Bool(false) },
-      { key: "note", value: Str(note()) },
+      { key: "note", value: Str(erasure_note()) },
       {
         key: "definitions",
-        value: Array(defs.map(|def_info: DefInfo| definition_json(tables, flags.deps, def_info))),
+        value: Array(
+          definitions.map(|definition_info: DefinitionInfo|
+            definition_json(tables, flags.dependencies, definition_info)),
+        ),
       },
       {
         key: "tests",
         value: Array(
-          own.map(|test_info: TestInfo| test_json(analysis, tables, flags.deps, test_info)),
+          own.map(|test_info: TestInfo| test_json(analysis, tables, flags.dependencies, test_info)),
         ),
       },
       { key: "diagnostics", value: Array([]) },
     ]),
-    lines: tally(style, analysis, defs.len(), own.len()).fold(
+    lines: tally(style, analysis, definitions.len(), own.len()).fold(
       listed,
       |acc: List<String>, l: String| acc.push(l),
     ),
@@ -215,20 +230,17 @@ fn answered(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.reached} = {
-  let loaded: Program = load_program(flags.paths, flags.verify_deps);
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_reached} = {
+  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
   match program_view(loaded) {
-    None -> refused(style_of(flags), "hash", loaded.diags, loaded.places),
-    Some(w) -> answered(style_of(flags), flags, loaded, w),
+    None -> refused(style_of(flags), "hash", loaded.diagnostics, loaded.places),
+    Some(w) -> hash_output(style_of(flags), flags, loaded, w),
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
-/// `m.two` calling `m.one`, and an effect `m.one` nothing performs.
 fn a_table() -> Tables =
   {
-    defs: Map::new(),
+    definitions: Map::new(),
     own: Map::new(),
     specs: Map::new(),
     hashes: {
@@ -236,17 +248,17 @@ fn a_table() -> Tables =
       refs: {
         ..no_refs(),
         names: [b"m.one", b"m.two", b"m.one"],
-        decls: [false, false, true],
+        declarations: [false, false, true],
         edges: [[], [0], []],
-        fns: Map::of_entries([{ key: b"m.one", value: 0 }, { key: b"m.two", value: 1 }]),
+        functions: Map::of_entries([{ key: b"m.one", value: 0 }, { key: b"m.two", value: 1 }]),
         declared: Map::of_entries([{ key: b"m.one", value: [2] }]),
       },
     },
   }
 
 test "the note names what the grouping is not" {
-  assert(note().contains("changes no hash"));
-  assert_eq(blank(), "------------")
+  assert(erasure_note().contains("changes no hash"));
+  assert_eq(blank_hash(), "------------")
 }
 
 test "a name list is comma-separated, as the listing prints it" {
@@ -256,10 +268,10 @@ test "a name list is comma-separated, as the listing prints it" {
 }
 
 test "`--deps` adds the references and the closure, the definition's own and not its namesake's" {
-  let line = |which: Which| edge_lines(plain(), a_table(), which, []).map(String::trim);
-  assert_eq(line(TheFn(b"m.two")), ["deps: m.one", "closure: m.one, m.two"]);
-  assert_eq(line(TheFn(b"m.one")), ["closure: m.one"]);
-  assert_eq(line(TheFn(b"m.absent")), [])
+  let line = |which: Subject| edge_lines(plain(), a_table(), which, []).map(String::trim);
+  assert_eq(line(FunctionNamed(b"m.two")), ["deps: m.one", "closure: m.one, m.two"]);
+  assert_eq(line(FunctionNamed(b"m.one")), ["closure: m.one"]);
+  assert_eq(line(FunctionNamed(b"m.absent")), [])
 }
 
 test "a test is listed under its quoted name" { assert_eq(quoted("two is two"), "\"two is two\"") }

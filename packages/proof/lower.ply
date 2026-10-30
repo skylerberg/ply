@@ -1,37 +1,44 @@
 //! `lower` — a claim's lowered code as prover terms, with what must hold for it to have a value.
 
-import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NKnown,
-                           NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda,
-                           NSimulate, NParallel, NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat,
-                           CDo, CodeField, CodeArm, Capture, CodePattern, PxWild, PxVar, PxLit,
-                           PxRange, PxCtor, PxRecord, PxList, CodePatternField, Lambda, irrefutable,
-                           read_name)
-import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
-                                 LDec, LChar, LUnit, LBad)
-import context (Context, Ctor, ctor, arity, ctor_sort, signature, builtin, is_pure, is_recursive,
-                unfoldable, self_recursive, is_identity, is_reflexive, ends, recursive_body,
-                operation_sort, may_call_key)
+import compiler.emit.code (Code, CodeLiteral, CodeVar, NDefinition, NConstructor, NBuiltin,
+                           CodeUnary, CodeBinary, CodeApply, CodeKnownLambda, CodeIf, CodeBlock,
+                           CodeList, CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda,
+                           CodeSimulate, CodeParallel, CodeHandle, CodeFieldRead, CodeUpdate,
+                           CodeStatement, CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm,
+                           Capture, CodePattern, CodeWildcardPattern, CodeBindingPattern,
+                           CodeLiteralPattern, CodeRangePattern, CodeConstructorPattern,
+                           CodeRecordPattern, CodeListPattern, CodePatternField, Lambda,
+                           irrefutable, read_name)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
+                                 LiteralString, LiteralBytes, LiteralEmbedded, LiteralFloat,
+                                 LiteralDecimal, LiteralChar, LiteralUnit, LiteralInvalid)
+import context (Context, Constructor, ctor, arity, constructor_sort, signature, builtin, is_pure,
+                is_recursive, unfoldable, self_recursive, is_identity, is_reflexive, terminates,
+                recursive_body, operation_sort, may_call_key)
 import compiler.syntax.parsing (Span)
-import domain (Ty, Var, Fn, Record, Con, Variant)
+import domain (Sort, SortVariable, FunctionSort, RecordSort, NamedSort, Variant, substituted)
 import lemma (Lemma)
-import rules (RuleLog, Cited, Contract, note, unfolded)
+import rules (RuleLog, Cited, Contract, record_rule, record_unfold)
 import compiler.front.published (ClaimClause)
-import compiler.syntax.items (SEnsures, SRequires)
-import sort (bool_ty, bytes_ty, float_ty, int_ty, string_ty, decimal_ty, is_con, list_elem, list_ty,
-             record_of, substituted, answered, matched, unified, foreign, foreign_base, vars)
-import term (Terms, Made, TInt, TBool, TStr, TDecimal, TFloat, TFixed, TUnit, TSym, TOpaque, TLin,
-             TApp, TCtor, TNil, TCons, TRecord, TIf, TMatch, TClosure, CmpOp, Lt, Le, Gt, Ge, Arm,
-             ArmTest, Always, TestCtor, TestLit, TestList, Undecidable, true_id, false_id,
-             new_terms, size, node, sort_of, force_int, mk, int_lit, boolean, string, decimal,
-             float_lit, fixed, unit, nil, cons, sym, opaque, add, sub, neg, mul, field, not, and,
-             or, cmp, eq, equal_at, app, float_nan, float_rank, decimal_normalized, op_add, op_sub,
-             op_mul, op_div, op_rem, op_concat, op_bit_and, op_bit_or, op_bit_xor, op_bit_not,
-             op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge, op_float)
+import compiler.syntax.items (EnsuresClause, RequiresClause)
+import sort (bool_sort, bytes_sort, float_sort, int_sort, string_sort, decimal_sort, is_named_sort,
+             list_element, list_sort, record_of, call_result_sort, matched, match_strict, foreign,
+             foreign_base, vars)
+import term (Terms, InternedTerm, IntTerm, BoolTerm, StringTerm, DecimalTerm, FloatTerm, FixedTerm,
+             UnitTerm, SymbolTerm, OpaqueTerm, LinearSumTerm, ApplicationTerm, ConstructorTerm,
+             NilTerm, ConsTerm, RecordTerm, IfTerm, MatchTerm, ClosureTerm, CmpOp, Lt, Le, Gt, Ge,
+             Arm, ArmTest, Always, TestConstructor, TestLiteral, TestList, Undecidable, true_id,
+             false_id, new_terms, size, node, sort_of, force_int, intern, int_literal, boolean,
+             string, decimal, float_literal, fixed, unit, nil, cons, symbol, opaque, add, sub, neg,
+             mul, field, not, and, or, cmp, eq, equal_at, app, float_nan, float_rank,
+             decimal_normalized, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
+             op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge,
+             op_float)
 import std.list
 import std.option
 import std.string
-import compiler.syntax.exprs (is_arithmetic, is_ordered)
-import compiler.emit.answer (literal_bits)
+import compiler.syntax.expressions (is_arithmetic, is_order_comparison)
+import compiler.emit.output (float_literal_bits)
 
 /// Past this many terms no definition is unfolded further.
 pub fn max_terms() -> Int = 20000
@@ -43,7 +50,7 @@ pub fn unroll_budget() -> Int = 64
 
 /// How many definitions one reading of a claim unfolds in all. An unrolling over a value in view counts
 /// no depth, and a reading that repeats one makes no new terms, so neither bound counts its work.
-pub fn unfold_room() -> Int = 512
+pub fn max_unfolds() -> Int = 512
 
 /// Prelude functions that cannot raise or diverge, so a call needs no definedness requirement.
 pub fn total_builtins() -> List<String> =
@@ -156,21 +163,21 @@ pub type Blocker =
   | Region
   | UndecidableMatchArm
   /// A body or clause the lowering did not take, which reads as unreached.
-  | Untaken
+  | NotLowered
   | DestructuringLet
   /// Why induction declined: which definition or case, in words.
   | Induction(String)
   /// Why a `cost` bound was not shown, in words.
-  | Unbounded(String)
+  | BoundUnshown(String)
   /// Every part of the claim was read, and the search found a case it could not close: the claim may
   /// be false there, or need a lemma or a guard.
   | Unclosed
   /// A value of the type named, which states an invariant, built where the proof did not read it: in a
   /// constructor handed on as a function, or in code the lowering passed over.
-  | Unseen(String)
+  | UnreadConstruction(String)
   /// A clause shown of what its definition answers only by taking its body to answer: it shows
   /// nothing of whether the body answers.
-  | AnswerAssumed
+  | ResultAssumed
 
 /// The kind a report prints, and the definition or reason it names, if any.
 pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
@@ -188,13 +195,13 @@ pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
     DecimalArithmetic -> { kind: "decimal_arithmetic", detail: None },
     Region -> { kind: "region", detail: None },
     UndecidableMatchArm -> { kind: "undecidable_match_arm", detail: None },
-    Untaken -> { kind: "untaken", detail: None },
+    NotLowered -> { kind: "untaken", detail: None },
     DestructuringLet -> { kind: "destructuring_let", detail: None },
     Induction(why) -> { kind: "induction", detail: Some(why) },
-    Unbounded(why) -> { kind: "unbounded", detail: Some(why) },
+    BoundUnshown(why) -> { kind: "unbounded", detail: Some(why) },
     Unclosed -> { kind: "unclosed", detail: None },
-    Unseen(t) -> { kind: "unseen_build", detail: Some(t) },
-    AnswerAssumed -> { kind: "answer_assumed", detail: None },
+    UnreadConstruction(t) -> { kind: "unseen_build", detail: Some(t) },
+    ResultAssumed -> { kind: "answer_assumed", detail: None },
   }
 
 pub type Lowering = {
@@ -220,19 +227,19 @@ pub type Lowering = {
   /// Calls of a total definition left as terms.
   calls: List<Int>,
   /// Each rest binder of a list pattern, with the list it is the tail of.
-  smaller: List<{ tail: Int, from: Int }>,
+  list_tails: List<{ tail: Int, from: Int }>,
   /// The proved laws this claim may use, and each one's claim at a call that fit its trigger, which
   /// holds.
   lemmas: List<Lemma>,
   facts: List<Int>,
-  /// The lambdas the claim made, each a `TClosure` by its index.
+  /// The lambdas the claim made, each a `ClosureTerm` by its index.
   closures: List<Closure>,
   /// The definitions of this package whose `ensures` a proof showed, which a call of one may stand
   /// on; another package's are its own run's to show.
   contracts: Map<String, Bool>,
   /// The `ensures` clause being proved of a definition that ends: at each call back into it, the
   /// clause holds of what the call answers, which is induction over the calls a run makes.
-  inducting: Option<{ name: String, clause: Int }>,
+  induction_hypothesis: Option<{ name: String, clause: Int }>,
   /// While a body is read for the values it builds of a type that states an invariant: the type and
   /// its function, and in `built`, that function at each value built, on the way to it.
   building: Option<{ type_name: String, by: String }>,
@@ -253,9 +260,9 @@ pub type Lowering = {
   /// Whether what may keep what is being read from answering is owed unreached: a raise, or a call
   /// not known to answer. It is in a law and in any claim's clause and guards; not in the body of a
   /// definition an `ensures` is about, which holds of what the definition answers.
-  answer_owed: Bool,
+  return_owed: Bool,
   /// How many more definitions this reading may unfold.
-  unfold_room: Int,
+  unfolds_left: Int,
   /// Whether what was lowered performs anything, which a closure's body is read on fresh
   /// arguments to learn.
   impure: Bool,
@@ -266,7 +273,7 @@ pub type Lowering = {
 pub type Closure = { lambda: Lambda, window: List<Option<Int>>, pure: Bool, total: Bool }
 
 /// A lowering after a step, and the term the step produced.
-pub type L = { lowering: Lowering, id: Int }
+pub type LoweredTerm = { lowering: Lowering, id: Int }
 
 pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
   {
@@ -284,13 +291,13 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
     equations: [],
     defined: [],
     calls: [],
-    smaller: [],
+    list_tails: [],
     lemmas: [],
     facts: [],
     closures: [],
     impure: false,
     contracts: Map::new(),
-    inducting: None,
+    induction_hypothesis: None,
     building: None,
     built: [],
     seen: [],
@@ -298,17 +305,17 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
     tainted: [],
     in_law: false,
     binder_terms: [],
-    answer_owed: true,
-    unfold_room: unfold_room(),
+    return_owed: true,
+    unfolds_left: max_unfolds(),
   }
 
 /// Lifts a term-store step into the lowering.
-fn on(lowering: Lowering, made: Made) -> L =
+fn lift(lowering: Lowering, made: InternedTerm) -> LoweredTerm =
   { lowering: { ..lowering, terms: made.terms }, id: made.id }
 
 pub fn with_terms(lowering: Lowering, terms: Terms) -> Lowering = { ..lowering, terms: terms }
 
-fn blocked(lowering: Lowering, b: Blocker) -> Lowering =
+fn add_blocker(lowering: Lowering, b: Blocker) -> Lowering =
   { ..lowering, blockers: lowering.blockers.push(b) }
 
 pub fn assume(lowering: Lowering, cond: Int) -> Lowering =
@@ -317,17 +324,17 @@ pub fn assume(lowering: Lowering, cond: Int) -> Lowering =
 /// Forgets the conditions assumed so far, before lowering a hypothesis instance.
 pub fn drop_assumptions(lowering: Lowering) -> Lowering = { ..lowering, path: [] }
 
-fn popped(lowering: Lowering) -> Lowering =
+fn pop_assumption(lowering: Lowering) -> Lowering =
   { ..lowering, path: lowering.path.take(lowering.path.len() - 1) }
 
 /// `p₁ ∧ … ∧ pₙ ⟹ cond` under the current path.
-pub fn under_path(lowering: Lowering, cond: Int) -> L / {abort.raise} =
-  range(0, lowering.path.len()).fold({ lowering: lowering, id: cond }, |acc: L, k: Int| {
+pub fn under_path(lowering: Lowering, cond: Int) -> LoweredTerm / {abort.raise} =
+  range(0, lowering.path.len()).fold({ lowering: lowering, id: cond }, |acc: LoweredTerm, k: Int| {
     let i = lowering.path.len() - 1 - k;
     match lowering.path.at(i) {
       Some(p) -> {
         let negated = not(acc.lowering.terms, p);
-        on(acc.lowering, or(negated.terms, negated.id, acc.id))
+        lift(acc.lowering, or(negated.terms, negated.id, acc.id))
       },
       None -> acc,
     }
@@ -341,15 +348,15 @@ fn require(lowering: Lowering, cond: Int) -> Lowering / {abort.raise} =
 
 /// `lowering` owing that its run goes on past here, where that is owed; elsewhere a proof stands on
 /// it, and says so.
-fn undefined(lowering: Lowering) -> Lowering / {abort.raise} =
-  if lowering.answer_owed { require(lowering, false_id()) }
-  else { blocked(lowering, AnswerAssumed) }
+fn require_unreachable(lowering: Lowering) -> Lowering / {abort.raise} =
+  if lowering.return_owed { require(lowering, false_id()) }
+  else { add_blocker(lowering, ResultAssumed) }
 
 fn require_int_range(lowering: Lowering, t: Int) -> Lowering / {abort.raise} =
   match node(lowering.terms, t) {
-    TLin(_) -> {
-      let min = int_lit(lowering.terms, 0 - 9223372036854775807 - 1);
-      let max = int_lit(min.terms, 9223372036854775807);
+    LinearSumTerm(_) -> {
+      let min = int_literal(lowering.terms, 0 - 9223372036854775807 - 1);
+      let max = int_literal(min.terms, 9223372036854775807);
       let low = cmp(max.terms, Ge, t, min.id);
       let high = cmp(low.terms, Le, t, max.id);
       let both = and(high.terms, low.id, high.id);
@@ -361,19 +368,19 @@ fn require_int_range(lowering: Lowering, t: Int) -> Lowering / {abort.raise} =
 /// Zero divisors raise, and `Int`'s least value divided by `-1` overflows.
 fn require_divisible(lowering: Lowering, lhs: Int, rhs: Int) -> Lowering / {abort.raise} =
   match node(lowering.terms, rhs) {
-    TInt(k) -> if k == 0 { undefined(lowering) } else if k == 0 - 1 {
-      let min = int_lit(lowering.terms, 0 - 9223372036854775807 - 1);
+    IntTerm(k) -> if k == 0 { require_unreachable(lowering) } else if k == 0 - 1 {
+      let min = int_literal(lowering.terms, 0 - 9223372036854775807 - 1);
       let is_min = eq(min.terms, lhs, min.id);
       let not_min = not(is_min.terms, is_min.id);
       require(with_terms(lowering, not_min.terms), not_min.id)
     } else { lowering },
     _ -> {
-      let zero = int_lit(lowering.terms, 0);
+      let zero = int_literal(lowering.terms, 0);
       let is_zero = eq(zero.terms, rhs, zero.id);
       let nonzero = not(is_zero.terms, is_zero.id);
       let lw2 = require(with_terms(lowering, nonzero.terms), nonzero.id);
-      let min = int_lit(lw2.terms, 0 - 9223372036854775807 - 1);
-      let minus_one = int_lit(min.terms, 0 - 1);
+      let min = int_literal(lw2.terms, 0 - 9223372036854775807 - 1);
+      let minus_one = int_literal(min.terms, 0 - 1);
       let lhs_min = eq(minus_one.terms, lhs, min.id);
       let rhs_minus_one = eq(lhs_min.terms, rhs, minus_one.id);
       let overflows = and(rhs_minus_one.terms, lhs_min.id, rhs_minus_one.id);
@@ -384,25 +391,25 @@ fn require_divisible(lowering: Lowering, lhs: Int, rhs: Int) -> Lowering / {abor
 
 /// A shift raises unless its count is a bit position; nothing else makes it raise.
 fn require_shift_count(lowering: Lowering, count: Int) -> Lowering / {abort.raise} = {
-  let zero = int_lit(lowering.terms, 0);
-  let width = int_lit(zero.terms, 63);
+  let zero = int_literal(lowering.terms, 0);
+  let width = int_literal(zero.terms, 63);
   let low = cmp(width.terms, Ge, count, zero.id);
   let high = cmp(low.terms, Le, count, width.id);
   let both = and(high.terms, low.id, high.id);
   require(with_terms(lowering, both.terms), both.id)
 }
 
-pub fn bind_symbolic(lowering: Lowering, ty: Ty) -> L / {abort.raise} =
-  on(lowering, sym(lowering.terms, Some(ty)))
+pub fn bind_symbolic(lowering: Lowering, ty: Sort) -> LoweredTerm / {abort.raise} =
+  lift(lowering, symbol(lowering.terms, Some(ty)))
 
 pub fn lower_root(
   lowering: Lowering,
   context: Context,
   c: Option<Code>,
   binders: List<Int>,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let outer = lowering.window;
-  let r = lower_opt(
+  let r = lower_optional(
     { ..lowering, window: binders.map(|t: Int| Some(t)) },
     context,
     c,
@@ -412,36 +419,41 @@ pub fn lower_root(
 }
 
 /// A body or clause the lowering did not take reads as unreached.
-fn lower_opt(
+fn lower_optional(
   lowering: Lowering,
   context: Context,
   c: Option<Code>,
   unfolds: Int,
-) -> L / {abort.raise} =
+) -> LoweredTerm / {abort.raise} =
   match c {
     Some(code) -> lower(lowering, context, code, unfolds),
-    None -> on(blocked(lowering, Untaken), sym(lowering.terms, None)),
+    None -> lift(add_blocker(lowering, NotLowered), symbol(lowering.terms, None)),
   }
 
 /// What a region answers, of `sort` where that is known, which is not read.
-fn region(lowering: Lowering, sort: Option<Ty>) -> L / {abort.raise} = {
-  let lw = blocked(undefined(lowering), Region);
-  on({ ..lw, impure: true }, sym(lw.terms, sort))
+fn region(lowering: Lowering, sort: Option<Sort>) -> LoweredTerm / {abort.raise} = {
+  let lw = add_blocker(require_unreachable(lowering), Region);
+  lift({ ..lw, impure: true }, symbol(lw.terms, sort))
 }
 
-fn opaque_sym(lowering: Lowering, b: Blocker) -> L / {abort.raise} = {
-  let lw2 = { ..blocked(lowering, b), impure: lowering.impure || b == Region };
-  on(lw2, sym(lw2.terms, None))
+fn opaque_symbol(lowering: Lowering, b: Blocker) -> LoweredTerm / {abort.raise} = {
+  let lw2 = { ..add_blocker(lowering, b), impure: lowering.impure || b == Region };
+  lift(lw2, symbol(lw2.terms, None))
 }
 
 /// A lambda as the value it is: one term for one lambda over the same captures, wherever it is
 /// written in the claim.
-fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L / {abort.raise} = {
+fn closure(
+  lowering: Lowering,
+  context: Context,
+  l: Lambda,
+  unfolds: Int,
+) -> LoweredTerm / {abort.raise} = {
   let captured = l.captures.fold(
     { lowering: lowering, window: range(0, l.params).map(|_k: Int| None) },
     |acc: { lowering: Lowering, window: List<Option<Int>> }, cap: Capture| {
       let r = local(acc.lowering, cap.src);
-      { lowering: r.lowering, window: placed(acc.window, cap.dst, r.id) }
+      { lowering: r.lowering, window: set_slot(acc.window, cap.destination, r.id) }
     },
   );
   let lw = captured.lowering;
@@ -454,13 +466,13 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
       },
     });
   match found {
-    Some(k) -> on(lw, mk(lw.terms, TClosure(k), None)),
+    Some(k) -> lift(lw, intern(lw.terms, ClosureTerm(k), None)),
     None -> {
       let fresh = range(0, l.params).fold(
         { terms: lw.terms, window: captured.window },
         |acc: { terms: Terms, window: List<Option<Int>> }, i: Int| {
-          let x = sym(acc.terms, None);
-          { terms: x.terms, window: placed(acc.window, i, x.id) }
+          let x = symbol(acc.terms, None);
+          { terms: x.terms, window: set_slot(acc.window, i, x.id) }
         },
       );
       // Read at arguments nothing constrains, so what it builds is owed at every argument. No call
@@ -473,16 +485,16 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
           requirements: [],
           path: [],
           impure: false,
-          inducting: None,
-          answer_owed: true,
+          induction_hypothesis: None,
+          return_owed: true,
         },
         context,
         l.body,
         unfolds,
       );
       let k = read.lowering.closures.len();
-      let made = mk(read.lowering.terms, TClosure(k), None);
-      on(
+      let made = intern(read.lowering.terms, ClosureTerm(k), None);
+      lift(
         {
           ..lw,
           terms: made.terms,
@@ -490,7 +502,7 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
           built: read.lowering.built,
           seen: read.lowering.seen,
           constructed: read.lowering.constructed,
-          unfold_room: read.lowering.unfold_room,
+          unfolds_left: read.lowering.unfolds_left,
           closures: read.lowering.closures.push({
             lambda: l,
             window: captured.window,
@@ -504,7 +516,7 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
   }
 }
 
-fn placed(window: List<Option<Int>>, slot: Int, t: Int) -> List<Option<Int>> / {abort.raise} = {
+fn set_slot(window: List<Option<Int>>, slot: Int, t: Int) -> List<Option<Int>> / {abort.raise} = {
   let grown = if window.len() <= slot {
     range(window.len(), slot + 1).fold(window, |w: List<Option<Int>>, _k: Int| w.push(None))
   } else { window };
@@ -519,24 +531,28 @@ fn applied_closure(
   head: Int,
   args: List<Int>,
   unfolds: Int,
-) -> L / {abort.raise} =
+) -> LoweredTerm / {abort.raise} =
   match lowering.closures.at(k) {
-    None -> opaque_sym(lowering, Lambda),
+    None -> opaque_symbol(lowering, Lambda),
     Some(c) -> if unfolds <= 0 || c.lambda.params != args.len() {
-      let lw2 = if c.total { lowering } else { undefined(lowering) };
-      if c.pure { on(lw2, app(lw2.terms, head, args, None)) }
-      else { on({ ..lw2, impure: true }, sym(lw2.terms, None)) }
+      let lw2 = if c.total { lowering } else { require_unreachable(lowering) };
+      if c.pure { lift(lw2, app(lw2.terms, head, args, None)) }
+      else { lift({ ..lw2, impure: true }, symbol(lw2.terms, None)) }
     } else {
       let window = range(0, args.len()).fold(c.window, |w: List<Option<Int>>, i: Int|
-        match args.at(i) { Some(a) -> placed(w, i, a), None -> w });
+        match args.at(i) { Some(a) -> set_slot(w, i, a), None -> w });
       let r = lower(
-        { ..lowering, window: window, inducting: None },
+        { ..lowering, window: window, induction_hypothesis: None },
         context,
         c.lambda.body,
         unfolds - 1,
       );
       {
-        lowering: { ..r.lowering, window: lowering.window, inducting: lowering.inducting },
+        lowering: {
+          ..r.lowering,
+          window: lowering.window,
+          induction_hypothesis: lowering.induction_hypothesis,
+        },
         id: r.id,
       }
     },
@@ -545,10 +561,10 @@ fn applied_closure(
 /// Whether a function value performs nothing, so equal calls of it answer equally.
 fn function_pure(lowering: Lowering, context: Context, t: Int) -> Bool / {abort.raise} =
   match node(lowering.terms, t) {
-    TClosure(k) -> match lowering.closures.at(k) { Some(c) -> c.pure, None -> false },
-    TOpaque(name) ->
+    ClosureTerm(k) -> match lowering.closures.at(k) { Some(c) -> c.pure, None -> false },
+    OpaqueTerm(name) ->
       is_pure(context, name) || is_total_builtin(name) || ctor(context, name) != None,
-    _ -> match sort_of(lowering.terms, t) { Some(Fn(_, _, pure)) -> pure, _ -> false },
+    _ -> match sort_of(lowering.terms, t) { Some(FunctionSort(_, _, pure)) -> pure, _ -> false },
   }
 
 /// Whether a call of a function value over values of `sorts` always answers: a closure that read so,
@@ -559,20 +575,23 @@ fn function_total(
   lowering: Lowering,
   context: Context,
   t: Int,
-  sorts: List<Option<Ty>>,
+  sorts: List<Option<Sort>>,
 ) -> Bool / {abort.raise} =
   match node(lowering.terms, t) {
-    TClosure(k) -> match lowering.closures.at(k) { Some(c) -> c.total, None -> false },
-    TOpaque(name) -> builtin_answers(context, name, sorts) || ctor(context, name) != None,
-    TSym(_) ->
+    ClosureTerm(k) -> match lowering.closures.at(k) { Some(c) -> c.total, None -> false },
+    OpaqueTerm(name) -> builtin_returns(context, name, sorts) || ctor(context, name) != None,
+    SymbolTerm(_) ->
       lowering.in_law && lowering.binder_terms.contains(t)
-        && (match sort_of(lowering.terms, t) { Some(Fn(_, _, total)) -> total, _ -> false }),
+        && (match sort_of(lowering.terms, t) {
+          Some(FunctionSort(_, _, total)) -> total,
+          _ -> false,
+        }),
     _ -> false,
   }
 
 /// A definition whose row is a variable its function parameters are handed, and raises: a call
 /// performs what the functions it is given do.
-fn through_pure(
+fn effect_parameters_pure(
   lowering: Lowering,
   context: Context,
   name: String,
@@ -586,14 +605,19 @@ fn through_pure(
     None -> false,
   }
 
-pub fn lower(lowering: Lowering, context: Context, c: Code, unfolds: Int) -> L / {abort.raise} =
+pub fn lower(
+  lowering: Lowering,
+  context: Context,
+  c: Code,
+  unfolds: Int,
+) -> LoweredTerm / {abort.raise} =
   match c.node {
-    NLit(l) -> literal(lowering, l),
-    NVar(v) -> {
+    CodeLiteral(l) -> literal(lowering, l),
+    CodeVar(v) -> {
       let s = v.slot;
       local(lowering, s)
     },
-    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+    NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
       let name = String::of_bytes_lossy(fname);
       let g = global(lowering, context, name);
       match ctor(context, name) {
@@ -603,57 +627,63 @@ pub fn lower(lowering: Lowering, context: Context, c: Code, unfolds: Int) -> L /
         None -> g,
       }
     },
-    NBinary(b) -> binary_code(lowering, context, b.op, b.lhs, b.rhs, unfolds),
-    NUnary(u) -> unary(lowering, context, u.op, u.operand, unfolds),
-    NLambda(l) -> closure(lowering, context, l, unfolds),
-    NApp(a) -> application(lowering, context, a.func, a.args, unfolds),
-    NKnown(k) -> local(lowering, k.slot),
-    NIf(i) -> {
+    CodeBinary(b) -> binary_code(lowering, context, b.op, b.lhs, b.rhs, unfolds),
+    CodeUnary(u) -> unary(lowering, context, u.op, u.operand, unfolds),
+    CodeLambda(l) -> closure(lowering, context, l, unfolds),
+    CodeApply(a) -> application(lowering, context, a.function, a.args, unfolds),
+    CodeKnownLambda(k) -> local(lowering, k.slot),
+    CodeIf(i) -> {
       let cond = lower(lowering, context, i.cond, unfolds);
       let then_branch = lower(assume(cond.lowering, cond.id), context, i.then_branch, unfolds);
       let otherwise = not(then_branch.lowering.terms, cond.id);
       let else_branch = lower(
-        assume(popped(with_terms(then_branch.lowering, otherwise.terms)), otherwise.id),
+        assume(pop_assumption(with_terms(then_branch.lowering, otherwise.terms)), otherwise.id),
         context,
         i.else_branch,
         unfolds,
       );
-      let lw2 = popped(else_branch.lowering);
-      let sort = surer(sort_of(lw2.terms, then_branch.id), sort_of(lw2.terms, else_branch.id));
-      on(
+      let lw2 = pop_assumption(else_branch.lowering);
+      let sort = more_specific_sort(
+        sort_of(lw2.terms, then_branch.id),
+        sort_of(lw2.terms, else_branch.id),
+      );
+      lift(
         lw2,
-        mk(
+        intern(
           lw2.terms,
-          TIf({ cond: cond.id, then_branch: then_branch.id, else_branch: else_branch.id }),
+          IfTerm({ cond: cond.id, then_branch: then_branch.id, else_branch: else_branch.id }),
           sort,
         ),
       )
     },
-    NMatch(m) -> match_expr(lowering, context, m.scrutinee, m.arms, unfolds),
-    NBlock(b) -> block(lowering, context, b.stmts, b.tail, unfolds),
-    NRecord(r) -> record(lowering, context, [], r.fields, None, unfolds),
+    CodeMatch(m) -> match_expression(lowering, context, m.scrutinee, m.arms, unfolds),
+    CodeBlock(b) -> block(lowering, context, b.statements, b.tail, unfolds),
+    CodeRecord(r) -> record(lowering, context, [], r.fields, None, unfolds),
     // Each branch applied where it stands: the block means the tuple of its branches' answers.
-    NParallel(pr) ->
+    CodeParallel(pr) ->
       recorded(
-        range(0, pr.branches.len()).fold({ lowering: lowering, out: [] }, |acc: Lowered, i: Int|
-          match pr.branches.at(i) {
-            Some(b) -> {
-              let r = application(acc.lowering, context, b, [], unfolds);
-              {
-                lowering: r.lowering,
-                out: acc.out.push({ name: "_" ++ i.to_string(), value: r.id }),
-              }
+        range(0, pr.branches.len()).fold(
+          { lowering: lowering, out: [] },
+          |acc: LoweredFields, i: Int|
+            match pr.branches.at(i) {
+              Some(b) -> {
+                let r = application(acc.lowering, context, b, [], unfolds);
+                {
+                  lowering: r.lowering,
+                  out: acc.out.push({ name: "_" ++ i.to_string(), value: r.id }),
+                }
+              },
+              None -> acc,
             },
-            None -> acc,
-          }),
+        ),
       ),
     // The fields a record update copies read the base; the ones it sets follow them.
-    NUpdate(u) -> record(lowering, context, u.copies, u.sets, Some(u.base), unfolds),
-    NField(f) -> {
+    CodeUpdate(u) -> record(lowering, context, u.copies, u.sets, Some(u.base), unfolds),
+    CodeFieldRead(f) -> {
       let base = lower(lowering, context, f.base, unfolds);
-      on(base.lowering, field(base.lowering.terms, base.id, String::of_bytes_lossy(f.field)))
+      lift(base.lowering, field(base.lowering.terms, base.id, String::of_bytes_lossy(f.field)))
     },
-    NList(l) -> {
+    CodeList(l) -> {
       let items = l.items.fold(
         { lowering: lowering, ids: [] },
         |acc: { lowering: Lowering, ids: List<Int> }, x: Code| {
@@ -663,27 +693,27 @@ pub fn lower(lowering: Lowering, context: Context, c: Code, unfolds: Int) -> L /
       );
       let sort = match items.ids.at(0) {
         Some(t) -> match sort_of(items.lowering.terms, t) {
-          Some(s) -> Some(list_ty(s)),
+          Some(s) -> Some(list_sort(s)),
           None -> None,
         },
         None -> None,
       };
       let empty = nil(items.lowering.terms, sort);
-      let built = range(0, items.ids.len()).fold(empty, |acc: Made, k: Int|
+      let built = range(0, items.ids.len()).fold(empty, |acc: InternedTerm, k: Int|
         match items.ids.at(items.ids.len() - 1 - k) {
           Some(item) -> cons(acc.terms, item, acc.id, sort),
           None -> acc,
         });
-      on(items.lowering, built)
+      lift(items.lowering, built)
     },
-    NPerform(p) -> region(lowering, operation_sort(context, p.effect, p.op)),
-    NSimulate(_) -> region(lowering, None),
-    NHandle(_) -> region(lowering, None),
+    CodePerform(p) -> region(lowering, operation_sort(context, p.effect, p.op)),
+    CodeSimulate(_) -> region(lowering, None),
+    CodeHandle(_) -> region(lowering, None),
     // A label argument is the field-table entry of a resource: opaque, like a perform.
-    NLabel(_) -> opaque_sym(lowering, Region),
+    CodeLabel(_) -> opaque_symbol(lowering, Region),
   }
 
-type Lowered = { lowering: Lowering, out: List<{ name: String, value: Int }> }
+type LoweredFields = { lowering: Lowering, out: List<{ name: String, value: Int }> }
 
 /// A record literal, or an update: each copied field read off `base`, then each set one.
 fn record(
@@ -693,8 +723,8 @@ fn record(
   sets: List<CodeField>,
   base: Option<Code>,
   unfolds: Int,
-) -> L / {abort.raise} = {
-  let copied = copies.fold({ lowering: lowering, out: [] }, |acc: Lowered, n: Bytes|
+) -> LoweredTerm / {abort.raise} = {
+  let copied = copies.fold({ lowering: lowering, out: [] }, |acc: LoweredFields, n: Bytes|
     match base {
       Some(b) -> {
         let r = lower(acc.lowering, context, b, unfolds);
@@ -707,7 +737,7 @@ fn record(
       None -> acc,
     });
   recorded(
-    sets.fold(copied, |acc: Lowered, f: CodeField| {
+    sets.fold(copied, |acc: LoweredFields, f: CodeField| {
       let r = lower(acc.lowering, context, f.value, unfolds);
       {
         lowering: r.lowering,
@@ -717,10 +747,10 @@ fn record(
   )
 }
 
-fn recorded(lowered: Lowered) -> L / {abort.raise} = {
+fn recorded(lowered: LoweredFields) -> LoweredTerm / {abort.raise} = {
   let sorted = sorted_fields(lowered.out);
   let sort = record_sort(lowered.lowering.terms, sorted);
-  on(lowered.lowering, mk(lowered.lowering.terms, TRecord(sorted), sort))
+  lift(lowered.lowering, intern(lowered.lowering.terms, RecordTerm(sorted), sort))
 }
 
 /// Stable, by name.
@@ -734,10 +764,10 @@ fn sorted_fields(fields: List<{ name: String, value: Int }>) -> List<{ name: Str
     )
   })
 
-fn record_sort(terms: Terms, fields: List<{ name: String, value: Int }>) -> Option<Ty> =
+fn record_sort(terms: Terms, fields: List<{ name: String, value: Int }>) -> Option<Sort> =
   match fields.fold(
       Some([]),
-      |acc: Option<List<{ name: String, ty: Ty }>>, f: { name: String, value: Int }|
+      |acc: Option<List<{ name: String, ty: Sort }>>, f: { name: String, value: Int }|
         match acc {
           None -> None,
           Some(xs) -> match sort_of(terms, f.value) {
@@ -756,39 +786,39 @@ fn unary(
   op: Bytes,
   operand: Code,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let t = lower(lowering, context, operand, unfolds);
   let numeric = if op == b"neg" { operand_type(context, t.lowering.terms, t.id, t.id) }
   else { None };
-  if op == b"not" { on(t.lowering, not(t.lowering.terms, t.id)) }
+  if op == b"not" { lift(t.lowering, not(t.lowering.terms, t.id)) }
   else if numeric == Some(FloatOperand) {
     match node(t.lowering.terms, t.id) {
       // The sign bit, which negation alone moves.
-      TFloat(bits) ->
-        on(t.lowering, float_lit(t.lowering.terms, bits ^ 0 - 9223372036854775807 - 1)),
+      FloatTerm(bits) ->
+        lift(t.lowering, float_literal(t.lowering.terms, bits ^ 0 - 9223372036854775807 - 1)),
       _ -> {
         let head = opaque(t.lowering.terms, op_float("neg"), None);
-        on(t.lowering, app(head.terms, head.id, [t.id], Some(float_ty())))
+        lift(t.lowering, app(head.terms, head.id, [t.id], Some(float_sort())))
       },
     }
   } else if numeric == Some(DecimalOperand) {
     let head = opaque(t.lowering.terms, "Decimal neg", None);
-    on(t.lowering, app(head.terms, head.id, [t.id], Some(decimal_ty())))
+    lift(t.lowering, app(head.terms, head.id, [t.id], Some(decimal_sort())))
   } else if match numeric { Some(Stated(_)) -> true, _ -> false } {
     match numeric {
-      Some(Stated(n)) -> match n.fns.at(3) {
-        Some(f) -> if f == "" { opaque_sym(t.lowering, OpaqueCall(n.type_name)) }
+      Some(Stated(n)) -> match n.functions.at(3) {
+        Some(f) -> if f == "" { opaque_symbol(t.lowering, OpaqueCall(n.type_name)) }
         else { call_named(t.lowering, context, f, [t.id], unfolds) },
-        None -> opaque_sym(t.lowering, OpaqueCall(n.type_name)),
+        None -> opaque_symbol(t.lowering, OpaqueCall(n.type_name)),
       },
-      _ -> opaque_sym(t.lowering, OpaqueCall("")),
+      _ -> opaque_symbol(t.lowering, OpaqueCall("")),
     }
   }
   // Not folded to `-x - 1`, which raises at `Int`'s least value where `~` does not.
   else if op == b"bitnot" {
-    let lw2 = blocked(with_terms(t.lowering, force_int(t.lowering.terms, t.id)), BitOperator);
+    let lw2 = add_blocker(with_terms(t.lowering, force_int(t.lowering.terms, t.id)), BitOperator);
     let head = opaque(lw2.terms, op_bit_not(), None);
-    let term = app(head.terms, head.id, [t.id], Some(int_ty()));
+    let term = app(head.terms, head.id, [t.id], Some(int_sort()));
     { lowering: with_terms(lw2, force_int(term.terms, term.id)), id: term.id }
   } else if !int_operands(t.lowering.terms, t.id, t.id) {
     unknown_operator(t.lowering, op, t.id, t.id)
@@ -797,31 +827,32 @@ fn unary(
     match neg(lw2.terms, t.id) {
       Some(out) -> { lowering: require_int_range(with_terms(lw2, out.terms), out.id), id: out.id },
       None -> {
-        let lw3 = undefined(blocked(lw2, CoefficientRange));
-        on(lw3, sym(lw3.terms, Some(int_ty())))
+        let lw3 = require_unreachable(add_blocker(lw2, CoefficientRange));
+        lift(lw3, symbol(lw3.terms, Some(int_sort())))
       },
     }
   }
 }
 
-fn literal(lowering: Lowering, l: Lit) -> L / {abort.raise} =
+fn literal(lowering: Lowering, l: SourceLiteral) -> LoweredTerm / {abort.raise} =
   match l {
-    LInt(k) -> on(lowering, int_lit(lowering.terms, k)),
-    LBool(b) -> on(lowering, boolean(lowering.terms, b)),
-    LStr(s) -> on(lowering, string(lowering.terms, String::of_bytes_lossy(s))),
-    // Not `TStr`: `b"ab"` and `"ab"` must not be congruent.
-    LBytes(_) -> on(lowering, sym(lowering.terms, Some(bytes_ty()))),
-    LEmbedded(_, _) -> on(lowering, sym(lowering.terms, Some(bytes_ty()))),
-    LFloat(raw) -> on(lowering, float_lit(lowering.terms, literal_bits(raw))),
-    LDec(raw) -> on(lowering, decimal(lowering.terms, decimal_of_raw(String::of_bytes_lossy(raw)))),
-    LFixed(width, bits) ->
-      on(lowering, fixed(lowering.terms, String::of_bytes_lossy(width).ascii_upper(), 0, bits)),
-    LWide(width, high, low) ->
-      on(lowering, fixed(lowering.terms, String::of_bytes_lossy(width).ascii_upper(), high, low)),
+    LiteralInt(k) -> lift(lowering, int_literal(lowering.terms, k)),
+    LiteralBool(b) -> lift(lowering, boolean(lowering.terms, b)),
+    LiteralString(s) -> lift(lowering, string(lowering.terms, String::of_bytes_lossy(s))),
+    // Not `StringTerm`: `b"ab"` and `"ab"` must not be congruent.
+    LiteralBytes(_) -> lift(lowering, symbol(lowering.terms, Some(bytes_sort()))),
+    LiteralEmbedded(_, _) -> lift(lowering, symbol(lowering.terms, Some(bytes_sort()))),
+    LiteralFloat(raw) -> lift(lowering, float_literal(lowering.terms, float_literal_bits(raw))),
+    LiteralDecimal(raw) ->
+      lift(lowering, decimal(lowering.terms, decimal_of_raw(String::of_bytes_lossy(raw)))),
+    LiteralFixed(width, bits) ->
+      lift(lowering, fixed(lowering.terms, String::of_bytes_lossy(width).ascii_upper(), 0, bits)),
+    LiteralWide(width, high, low) ->
+      lift(lowering, fixed(lowering.terms, String::of_bytes_lossy(width).ascii_upper(), high, low)),
     // A value of its own sort, so `'a'` and `97` are not congruent.
-    LChar(v) -> on(lowering, fixed(lowering.terms, "Char", 0, v)),
-    LUnit -> on(lowering, unit(lowering.terms)),
-    LBad -> on(lowering, unit(lowering.terms)),
+    LiteralChar(v) -> lift(lowering, fixed(lowering.terms, "Char", 0, v)),
+    LiteralUnit -> lift(lowering, unit(lowering.terms)),
+    LiteralInvalid -> lift(lowering, unit(lowering.terms)),
   }
 
 /// `1.50m` is `1.50`; a pattern's `-` is part of its source, and negates it.
@@ -847,10 +878,10 @@ fn decimal_of_raw(raw: String) -> Decimal / {abort.raise} = {
   match Decimal::of_string(String::of_bytes(spelled)) { Some(d) -> d, None -> Decimal::of_int(0) }
 }
 
-fn local(lowering: Lowering, slot: Int) -> L / {abort.raise} =
+fn local(lowering: Lowering, slot: Int) -> LoweredTerm / {abort.raise} =
   match lowering.window.at(slot) {
     Some(Some(t)) -> { lowering: lowering, id: t },
-    _ -> on(lowering, sym(lowering.terms, None)),
+    _ -> lift(lowering, symbol(lowering.terms, None)),
   }
 
 fn bind(lowering: Lowering, slot: Int, t: Int) -> Lowering / {abort.raise} = {
@@ -861,35 +892,47 @@ fn bind(lowering: Lowering, slot: Int, t: Int) -> Lowering / {abort.raise} = {
   { ..lowering, window: grown.set(slot, Some(t)) }
 }
 
-fn global(lowering: Lowering, context: Context, name: String) -> L / {abort.raise} =
+fn global(lowering: Lowering, context: Context, name: String) -> LoweredTerm / {abort.raise} =
   match ctor(context, name) {
     Some(c) -> if arity(c) == 0 {
-      on(lowering, mk(lowering.terms, TCtor({ name: name, args: [] }), Some(foreign(ctor_sort(c)))))
-    } else { on(lowering, mk(lowering.terms, TOpaque(name), Some(foreign(ctor_sort(c))))) },
+      lift(
+        lowering,
+        intern(
+          lowering.terms,
+          ConstructorTerm({ name: name, args: [] }),
+          Some(foreign(constructor_sort(c))),
+        ),
+      )
+    } else {
+      lift(lowering, intern(lowering.terms, OpaqueTerm(name), Some(foreign(constructor_sort(c)))))
+    },
     None -> match signature(context, name) {
-      Some(s) -> on(lowering, mk(lowering.terms, TOpaque(name), Some(s.ty))),
+      Some(s) -> lift(lowering, intern(lowering.terms, OpaqueTerm(name), Some(s.ty))),
       None -> match builtin(context, name) {
         Some(b) -> if is_total_builtin(name) {
-          on(lowering, opaque(lowering.terms, name, Some(b.ty)))
-        } else { on(lowering, sym(lowering.terms, Some(b.ty))) },
-        None -> if is_total_builtin(name) { on(lowering, opaque(lowering.terms, name, None)) }
-        else { on(lowering, sym(lowering.terms, None)) },
+          lift(lowering, opaque(lowering.terms, name, Some(b.ty)))
+        } else { lift(lowering, symbol(lowering.terms, Some(b.ty))) },
+        None -> if is_total_builtin(name) { lift(lowering, opaque(lowering.terms, name, None)) }
+        else { lift(lowering, symbol(lowering.terms, None)) },
       },
     },
   }
 
 /// An operand type whose operators are not `Int`'s: a type that states `numeric` names its own.
-type Numeric = | FloatOperand | DecimalOperand | Stated({ type_name: String, fns: List<String> })
+type Numeric =
+  | FloatOperand
+  | DecimalOperand
+  | Stated({ type_name: String, functions: List<String> })
 
 fn operand_type(context: Context, terms: Terms, lhs: Int, rhs: Int) -> Option<Numeric> =
   [lhs, rhs].fold(None, |acc: Option<Numeric>, side: Int|
     match acc {
       Some(_) -> acc,
       None -> match sort_of(terms, side) {
-        Some(Con(name, args)) -> if name == "Float" && args.len() == 0 { Some(FloatOperand) }
+        Some(NamedSort(name, args)) -> if name == "Float" && args.len() == 0 { Some(FloatOperand) }
         else if name == "Decimal" && args.len() == 0 { Some(DecimalOperand) } else {
           match context.numerics.get(name) {
-            Some(fns) -> Some(Stated({ type_name: name, fns: fns })),
+            Some(functions) -> Some(Stated({ type_name: name, functions: functions })),
             None -> None,
           }
         },
@@ -905,13 +948,13 @@ fn binary_code(
   lhs: Code,
   rhs: Code,
   unfolds: Int,
-) -> L / {abort.raise} =
+) -> LoweredTerm / {abort.raise} =
   if op == b"and" || op == b"or" {
     let l = lower(lowering, context, lhs, unfolds);
     let reached = if op == b"and" { { lowering: l.lowering, id: l.id } }
-    else { on(l.lowering, not(l.lowering.terms, l.id)) };
+    else { lift(l.lowering, not(l.lowering.terms, l.id)) };
     let r = lower(assume(reached.lowering, reached.id), context, rhs, unfolds);
-    binary(popped(r.lowering), context, op, l.id, r.id, unfolds)
+    binary(pop_assumption(r.lowering), context, op, l.id, r.id, unfolds)
   } else {
     let l = lower(lowering, context, lhs, unfolds);
     let r = lower(l.lowering, context, rhs, unfolds);
@@ -940,38 +983,39 @@ fn non_int_operator(
   rhs: Int,
   numeric: Numeric,
   unfolds: Int,
-) -> L / {abort.raise} =
+) -> LoweredTerm / {abort.raise} =
   match numeric {
-    FloatOperand -> if is_ordered(op) { float_order(lowering, op, lhs, rhs) }
+    FloatOperand -> if is_order_comparison(op) { float_order(lowering, op, lhs, rhs) }
     else { float_arithmetic(lowering, op, lhs, rhs) },
     DecimalOperand -> {
-      let comparison = is_ordered(op);
-      let b = blocked(lowering, DecimalArithmetic);
-      let lw2 = if comparison { b } else { undefined(b) };
+      let comparison = is_order_comparison(op);
+      let b = add_blocker(lowering, DecimalArithmetic);
+      let lw2 = if comparison { b } else { require_unreachable(b) };
       let head = opaque(lw2.terms, arith_symbol(op), None);
-      on(
+      lift(
         lw2,
         app(
           head.terms,
           head.id,
           [lhs, rhs],
-          Some(if comparison { bool_ty() } else { decimal_ty() }),
+          Some(if comparison { bool_sort() } else { decimal_sort() }),
         ),
       )
     },
-    Stated(n) -> stated_operator(lowering, context, op, lhs, rhs, n.type_name, n.fns, unfolds),
+    Stated(n) ->
+      stated_operator(lowering, context, op, lhs, rhs, n.type_name, n.functions, unfolds),
   }
 
 /// `x < y` at `Float`: neither is `NaN`, and `x` falls below `y` in the order.
-fn float_order(lowering: Lowering, op: Bytes, x: Int, y: Int) -> L / {abort.raise} = {
+fn float_order(lowering: Lowering, op: Bytes, x: Int, y: Int) -> LoweredTerm / {abort.raise} = {
   let rx = float_rank(lowering.terms, x);
   let ry = float_rank(rx.terms, y);
   let below = cmp(ry.terms, cmp_of(op), rx.id, ry.id);
-  on(lowering, numbers_both(below.terms, x, y, below.id))
+  lift(lowering, both_not_nan(below.terms, x, y, below.id))
 }
 
 /// `holds` where neither `x` nor `y` is `NaN`, and false where one is.
-fn numbers_both(terms: Terms, x: Int, y: Int, holds: Int) -> Made / {abort.raise} = {
+fn both_not_nan(terms: Terms, x: Int, y: Int, holds: Int) -> InternedTerm / {abort.raise} = {
   let nx = float_nan(terms, x);
   let ny = float_nan(nx.terms, y);
   let not_x = not(ny.terms, nx.id);
@@ -981,7 +1025,7 @@ fn numbers_both(terms: Terms, x: Int, y: Int, holds: Int) -> Made / {abort.raise
 }
 
 /// `a && b`, settled where either is a literal.
-fn both(terms: Terms, a: Int, b: Int) -> Made / {abort.raise} =
+fn both(terms: Terms, a: Int, b: Int) -> InternedTerm / {abort.raise} =
   if a == true_id() { { terms: terms, id: b } }
   else if b == true_id() { { terms: terms, id: a } }
   else if a == false_id() || b == false_id() { boolean(terms, false) }
@@ -989,9 +1033,9 @@ fn both(terms: Terms, a: Int, b: Int) -> Made / {abort.raise} =
 
 /// IEEE arithmetic, each operation rounded once: uninterpreted, but of two literals the bits a run
 /// answers, which every machine agrees on.
-fn float_arithmetic(lowering: Lowering, op: Bytes, x: Int, y: Int) -> L / {abort.raise} =
+fn float_arithmetic(lowering: Lowering, op: Bytes, x: Int, y: Int) -> LoweredTerm / {abort.raise} =
   match ((node(lowering.terms, x), node(lowering.terms, y))) {
-    (TFloat(a), TFloat(b)) -> {
+    (FloatTerm(a), FloatTerm(b)) -> {
       let p = Float::of_bits(a);
       let q = Float::of_bits(b);
       let r = if op == b"add" { p + q }
@@ -999,11 +1043,11 @@ fn float_arithmetic(lowering: Lowering, op: Bytes, x: Int, y: Int) -> L / {abort
       else if op == b"mul" { p * q }
       else if op == b"div" { p / q }
       else { p % q };
-      on(lowering, float_lit(lowering.terms, bits_of_float(r)))
+      lift(lowering, float_literal(lowering.terms, bits_of_float(r)))
     },
     _ -> {
       let head = opaque(lowering.terms, op_float(String::of_bytes_lossy(op)), None);
-      on(lowering, app(head.terms, head.id, [x, y], Some(float_ty())))
+      lift(lowering, app(head.terms, head.id, [x, y], Some(float_sort())))
     },
   }
 
@@ -1016,88 +1060,93 @@ fn stated_operator(
   lhs: Int,
   rhs: Int,
   type_name: String,
-  fns: List<String>,
+  functions: List<String>,
   unfolds: Int,
-) -> L / {abort.raise} =
-  if is_ordered(op) {
+) -> LoweredTerm / {abort.raise} =
+  if is_order_comparison(op) {
     match context.keys.get(type_name) {
       Some(by) -> {
         let kx = call_named(lowering, context, by, [lhs], unfolds);
         let ky = call_named(kx.lowering, context, by, [rhs], unfolds);
         match sort_of(ky.lowering.terms, kx.id) {
-          Some(k) -> if is_con(k, "Int") {
-            let lw2 = forced(ky.lowering, kx.id, ky.id);
-            on(lw2, cmp(lw2.terms, cmp_of(op), kx.id, ky.id))
-          } else if is_con(k, "Float") { float_order(ky.lowering, op, kx.id, ky.id) }
-          else { opaque_sym(ky.lowering, OpaqueCall(by)) },
-          None -> opaque_sym(ky.lowering, OpaqueCall(by)),
+          Some(k) -> if is_named_sort(k, "Int") {
+            let lw2 = force_ints(ky.lowering, kx.id, ky.id);
+            lift(lw2, cmp(lw2.terms, cmp_of(op), kx.id, ky.id))
+          } else if is_named_sort(k, "Float") { float_order(ky.lowering, op, kx.id, ky.id) }
+          else { opaque_symbol(ky.lowering, OpaqueCall(by)) },
+          None -> opaque_symbol(ky.lowering, OpaqueCall(by)),
         }
       },
-      None -> opaque_sym(lowering, OpaqueCall(type_name)),
+      None -> opaque_symbol(lowering, OpaqueCall(type_name)),
     }
   } else {
     let index = if op == b"add" { 0 } else if op == b"sub" { 1 } else { 2 };
-    match fns.at(index) {
-      Some(f) -> if f == "" { opaque_sym(lowering, OpaqueCall(type_name)) }
+    match functions.at(index) {
+      Some(f) -> if f == "" { opaque_symbol(lowering, OpaqueCall(type_name)) }
       else { call_named(lowering, context, f, [lhs, rhs], unfolds) },
-      None -> opaque_sym(lowering, OpaqueCall(type_name)),
+      None -> opaque_symbol(lowering, OpaqueCall(type_name)),
     }
   }
 
 /// The program's `==`, read as what the operands' sort says it is: identity where it is, so
 /// congruence applies; at `Float`, IEEE's; at `Decimal`, of the values; at a type that states a
 /// `key`, of the keys; and part by part where a value holds one of those.
-fn equal(lowering: Lowering, context: Context, x: Int, y: Int, unfolds: Int) -> L / {abort.raise} =
-  equal_within(lowering, context, x, y, unfolds, max_terms())
+fn equal(
+  lowering: Lowering,
+  context: Context,
+  x: Int,
+  y: Int,
+  unfolds: Int,
+) -> LoweredTerm / {abort.raise} = equal_within(lowering, context, x, y, unfolds, max_terms())
 
-/// `room` bounds how deep a comparison reads through keys and parts; past it, the relation alone.
+/// `depth_left` bounds how deep a comparison reads through keys and parts; past it, the relation alone.
 fn equal_within(
   lowering: Lowering,
   context: Context,
   x: Int,
   y: Int,
   unfolds: Int,
-  room: Int,
-) -> L / {abort.raise} = {
+  depth_left: Int,
+) -> LoweredTerm / {abort.raise} = {
   let sort = compared_sort(lowering, context, x, y);
   // A constructor names its type whatever sort its node was first given.
   let key_of = |t: Int|
     match node(lowering.terms, t) {
-      TCtor(c) -> match ctor(context, c.name) {
-        Some(k) -> context.keys.get(k.decl.name),
+      ConstructorTerm(c) -> match ctor(context, c.name) {
+        Some(k) -> context.keys.get(k.declaration.name),
         None -> None,
       },
       _ -> match sort_of(lowering.terms, t) {
-        Some(Con(name, _)) -> context.keys.get(name),
+        Some(NamedSort(name, _)) -> context.keys.get(name),
         _ -> None,
       },
     };
   let keyed = match key_of(x) { Some(by) -> Some(by), None -> key_of(y) };
   match keyed {
-    Some(by) -> if room <= 0 { related(lowering, context, sort, x, y) } else {
+    Some(by) -> if depth_left <= 0 { related(lowering, context, sort, x, y) } else {
       let kx = call_named(lowering, context, by, [x], unfolds);
       let ky = call_named(kx.lowering, context, by, [y], unfolds);
-      equal_within(ky.lowering, context, kx.id, ky.id, unfolds, room - 1)
+      equal_within(ky.lowering, context, kx.id, ky.id, unfolds, depth_left - 1)
     },
     // `==` with a value of no fields is identity, whatever else the sort holds: `xs == []`.
     None -> if nullary(lowering.terms, x) || nullary(lowering.terms, y) {
-      on(lowering, eq(lowering.terms, x, y))
+      lift(lowering, eq(lowering.terms, x, y))
     } else {
       match sort {
-        None -> by_shape(lowering, context, x, y, unfolds, room),
+        None -> by_shape(lowering, context, x, y, unfolds, depth_left),
         Some(s) -> if is_identity(context, s, lowering.identities) {
-          on(lowering, eq(lowering.terms, x, y))
-        } else if room <= 0 { related(lowering, context, Some(s), x, y) }
-        else if is_con(s, "Float") {
+          lift(lowering, eq(lowering.terms, x, y))
+        } else if depth_left <= 0 { related(lowering, context, Some(s), x, y) }
+        else if is_named_sort(s, "Float") {
           let rx = float_rank(lowering.terms, x);
           let ry = float_rank(rx.terms, y);
           let same = eq(ry.terms, rx.id, ry.id);
-          on(lowering, numbers_both(same.terms, x, y, same.id))
-        } else if is_con(s, "Decimal") {
+          lift(lowering, both_not_nan(same.terms, x, y, same.id))
+        } else if is_named_sort(s, "Decimal") {
           let nx = decimal_normalized(lowering.terms, x);
           let ny = decimal_normalized(nx.terms, y);
-          on(lowering, eq(ny.terms, nx.id, ny.id))
-        } else { pointwise(lowering, context, Some(s), x, y, unfolds, room - 1) },
+          lift(lowering, eq(ny.terms, nx.id, ny.id))
+        } else { pointwise(lowering, context, Some(s), x, y, unfolds, depth_left - 1) },
       }
     },
   }
@@ -1105,7 +1154,7 @@ fn equal_within(
 
 /// The sort two operands are compared at: either's, and where both are known and differ (a node of
 /// no fields is one term at every sort), the one whose `==` says least.
-fn compared_sort(lowering: Lowering, context: Context, x: Int, y: Int) -> Option<Ty> =
+fn compared_sort(lowering: Lowering, context: Context, x: Int, y: Int) -> Option<Sort> =
   match ((sort_of(lowering.terms, x), sort_of(lowering.terms, y))) {
     (Some(a), Some(b)) -> if a == b || !is_identity(context, a, lowering.identities) { Some(a) }
     else { Some(b) },
@@ -1114,7 +1163,12 @@ fn compared_sort(lowering: Lowering, context: Context, x: Int, y: Int) -> Option
   }
 
 fn nullary(terms: Terms, t: Int) -> Bool / {abort.raise} =
-  match node(terms, t) { TNil -> true, TUnit -> true, TCtor(c) -> c.args.len() == 0, _ -> false }
+  match node(terms, t) {
+    NilTerm -> true,
+    UnitTerm -> true,
+    ConstructorTerm(c) -> c.args.len() == 0,
+    _ -> false,
+  }
 
 /// `==` of operands no sort is known of, by what their shapes say: a literal of a sort whose `==` is
 /// identity, or constructors, cells and records taken apart.
@@ -1124,19 +1178,19 @@ fn by_shape(
   x: Int,
   y: Int,
   unfolds: Int,
-  room: Int,
-) -> L / {abort.raise} = {
+  depth_left: Int,
+) -> LoweredTerm / {abort.raise} = {
   let plain = |t: Int|
     match node(lowering.terms, t) {
-      TInt(_) -> true,
-      TBool(_) -> true,
-      TStr(_) -> true,
-      TFixed(_, _, _) -> true,
+      IntTerm(_) -> true,
+      BoolTerm(_) -> true,
+      StringTerm(_) -> true,
+      FixedTerm(_, _, _) -> true,
       _ -> false,
     };
-  if plain(x) || plain(y) { on(lowering, eq(lowering.terms, x, y)) }
-  else if room <= 0 { related(lowering, context, None, x, y) }
-  else { pointwise(lowering, context, None, x, y, unfolds, room - 1) }
+  if plain(x) || plain(y) { lift(lowering, eq(lowering.terms, x, y)) }
+  else if depth_left <= 0 { related(lowering, context, None, x, y) }
+  else { pointwise(lowering, context, None, x, y, unfolds, depth_left - 1) }
 }
 
 /// `==` of two values of a sort holding a part whose `==` is not identity: by constructor, cell or
@@ -1144,22 +1198,22 @@ fn by_shape(
 fn pointwise(
   lowering: Lowering,
   context: Context,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   x: Int,
   y: Int,
   unfolds: Int,
-  room: Int,
-) -> L / {abort.raise} = {
+  depth_left: Int,
+) -> LoweredTerm / {abort.raise} = {
   let all = |lw: Lowering, pairs: List<{ a: Int, b: Int }>|
-    pairs.fold(on(lw, boolean(lw.terms, true)), |acc: L, p: { a: Int, b: Int }| {
-      let e = equal_within(acc.lowering, context, p.a, p.b, unfolds, room - 1);
-      on(e.lowering, both(e.lowering.terms, acc.id, e.id))
+    pairs.fold(lift(lw, boolean(lw.terms, true)), |acc: LoweredTerm, p: { a: Int, b: Int }| {
+      let e = equal_within(acc.lowering, context, p.a, p.b, unfolds, depth_left - 1);
+      lift(e.lowering, both(e.lowering.terms, acc.id, e.id))
     });
   match sort {
-    Some(Record(fields)) -> {
+    Some(RecordSort(fields)) -> {
       let read = fields.fold(
         { lowering: lowering, pairs: [] },
-        |acc: { lowering: Lowering, pairs: List<{ a: Int, b: Int }> }, f: { name: String, ty: Ty }| {
+        |acc: { lowering: Lowering, pairs: List<{ a: Int, b: Int }> }, f: { name: String, ty: Sort }| {
           let fx = field(acc.lowering.terms, x, f.name);
           let fy = field(fx.terms, y, f.name);
           {
@@ -1171,9 +1225,8 @@ fn pointwise(
       all(read.lowering, read.pairs)
     },
     _ -> match ((node(lowering.terms, x), node(lowering.terms, y))) {
-      (TCtor(a), TCtor(b)) -> if a.name != b.name || a.args.len() != b.args.len() {
-        on(lowering, boolean(lowering.terms, false))
-      } else {
+      (ConstructorTerm(a), ConstructorTerm(b)) -> if a.name != b.name
+          || a.args.len() != b.args.len() { lift(lowering, boolean(lowering.terms, false)) } else {
         all(
           lowering,
           range(0, a.args.len()).fold([], |acc: List<{ a: Int, b: Int }>, i: Int|
@@ -1183,11 +1236,12 @@ fn pointwise(
             }),
         )
       },
-      (TNil, TNil) -> on(lowering, boolean(lowering.terms, true)),
-      (TNil, TCons(_)) -> on(lowering, boolean(lowering.terms, false)),
-      (TCons(_), TNil) -> on(lowering, boolean(lowering.terms, false)),
-      (TCons(a), TCons(b)) -> all(lowering, [{ a: a.head, b: b.head }, { a: a.tail, b: b.tail }]),
-      (TRecord(a), TRecord(b)) -> if a.map(|f: { name: String, value: Int }| f.name)
+      (NilTerm, NilTerm) -> lift(lowering, boolean(lowering.terms, true)),
+      (NilTerm, ConsTerm(_)) -> lift(lowering, boolean(lowering.terms, false)),
+      (ConsTerm(_), NilTerm) -> lift(lowering, boolean(lowering.terms, false)),
+      (ConsTerm(a), ConsTerm(b)) ->
+        all(lowering, [{ a: a.head, b: b.head }, { a: a.tail, b: b.tail }]),
+      (RecordTerm(a), RecordTerm(b)) -> if a.map(|f: { name: String, value: Int }| f.name)
           != b.map(|f: { name: String, value: Int }| f.name) {
         related(lowering, context, sort, x, y)
       } else {
@@ -1210,29 +1264,30 @@ fn pointwise(
 fn related(
   lowering: Lowering,
   context: Context,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   x: Int,
   y: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let sorts = [sort_of(lowering.terms, x), sort_of(lowering.terms, y)];
   // A sort that leaves nothing unsettled is both operands' type.
-  let settled = sorts.filter(|s: Option<Ty>|
+  let settled = sorts.filter(|s: Option<Sort>|
     match s { Some(t) -> !vars(t, []).any(|v: Int| v >= foreign_base()), None -> false });
   let keyed = match settled.at(0) {
     Some(s) -> may_call_key(context, s),
-    None -> sorts.any(|s: Option<Ty>| may_call_key(context, s)),
+    None -> sorts.any(|s: Option<Sort>| may_call_key(context, s)),
   };
-  let lw = if keyed { undefined(blocked(lowering, OpaqueCall("=="))) } else { lowering };
+  let lw = if keyed { require_unreachable(add_blocker(lowering, OpaqueCall("=="))) }
+  else { lowering };
   let reflexive = match sort {
     Some(t) -> is_reflexive(context, t, lowering.identities),
     None -> false,
   };
-  on(lw, equal_at(lw.terms, x, y, reflexive))
+  lift(lw, equal_at(lw.terms, x, y, reflexive))
 }
 
 /// Of two sorts one value may have, the one that knows more: a sort whose type arguments are known
 /// over one whose are not.
-fn surer(a: Option<Ty>, b: Option<Ty>) -> Option<Ty> =
+fn more_specific_sort(a: Option<Sort>, b: Option<Sort>) -> Option<Sort> =
   match a {
     Some(s) -> if vars(s, []).any(|v: Int| v >= foreign_base()) && b != None { b } else { a },
     None -> b,
@@ -1245,13 +1300,22 @@ fn int_operands(terms: Terms, lhs: Int, rhs: Int) -> Bool / {abort.raise} =
     match sort_of(terms, t) { Some(s) -> vars(s, []).len() == 0, None -> false })
 
 /// An operator over operands of no known type: a function of them, which may raise.
-fn unknown_operator(lowering: Lowering, op: Bytes, lhs: Int, rhs: Int) -> L / {abort.raise} = {
-  let lw2 = undefined(blocked(lowering, OpaqueCall(String::of_bytes_lossy(op))));
+fn unknown_operator(
+  lowering: Lowering,
+  op: Bytes,
+  lhs: Int,
+  rhs: Int,
+) -> LoweredTerm / {abort.raise} = {
+  let lw2 = require_unreachable(add_blocker(lowering, OpaqueCall(String::of_bytes_lossy(op))));
   let head = opaque(lw2.terms, "operator " ++ String::of_bytes_lossy(op), None);
-  on(lw2, app(head.terms, head.id, [lhs, rhs], if is_ordered(op) { Some(bool_ty()) } else { None }))
+  lift(
+    lw2,
+    app(head.terms, head.id, [lhs, rhs], if is_order_comparison(op) { Some(bool_sort()) }
+    else { None }),
+  )
 }
 
-fn forced(lowering: Lowering, a: Int, b: Int) -> Lowering / {abort.raise} =
+fn force_ints(lowering: Lowering, a: Int, b: Int) -> Lowering / {abort.raise} =
   with_terms(lowering, force_int(force_int(lowering.terms, a), b))
 
 fn binary(
@@ -1261,14 +1325,15 @@ fn binary(
   lhs: Int,
   rhs: Int,
   unfolds: Int,
-) -> L / {abort.raise} =
-  match if is_arithmetic(op) || is_ordered(op) { operand_type(context, lowering.terms, lhs, rhs) }
-    else { None } {
+) -> LoweredTerm / {abort.raise} =
+  match if is_arithmetic(op) || is_order_comparison(op) {
+      operand_type(context, lowering.terms, lhs, rhs)
+    } else { None } {
     Some(numeric) -> non_int_operator(lowering, context, op, lhs, rhs, numeric, unfolds),
-    None -> if (is_arithmetic(op) || is_ordered(op)) && !int_operands(lowering.terms, lhs, rhs) {
-      unknown_operator(lowering, op, lhs, rhs)
-    } else if is_arithmetic(op) {
-      let lw2 = forced(lowering, lhs, rhs);
+    None -> if (is_arithmetic(op) || is_order_comparison(op))
+        && !int_operands(lowering.terms, lhs, rhs) { unknown_operator(lowering, op, lhs, rhs) }
+    else if is_arithmetic(op) {
+      let lw2 = force_ints(lowering, lhs, rhs);
       let folded = if op == b"add" { add(lw2.terms, lhs, rhs) }
       else if op == b"sub" { sub(lw2.terms, lhs, rhs) }
       else if op == b"mul" { mul(lw2.terms, lhs, rhs) }
@@ -1277,41 +1342,42 @@ fn binary(
       match folded {
         Some(t) -> { lowering: require_int_range(with_terms(lw2, t.terms), t.id), id: t.id },
         None -> {
-          let literal_factor = (match node(lw2.terms, lhs) { TInt(_) -> true, _ -> false })
-            || (match node(lw2.terms, rhs) { TInt(_) -> true, _ -> false });
+          let literal_factor = (match node(lw2.terms, lhs) { IntTerm(_) -> true, _ -> false })
+            || (match node(lw2.terms, rhs) { IntTerm(_) -> true, _ -> false });
           let divided = op == b"div" || op == b"rem";
-          let lw3 = blocked(lw2, if divided { Division }
+          let lw3 = add_blocker(lw2, if divided { Division }
           else if op == b"mul" && !literal_factor { NonlinearMultiplication }
           else { CoefficientRange });
           // Uninterpreted as values, but their definedness is decidable; everything else left `Int`.
-          let lw4 = if divided { require_divisible(lw3, lhs, rhs) } else { undefined(lw3) };
+          let lw4 = if divided { require_divisible(lw3, lhs, rhs) }
+          else { require_unreachable(lw3) };
           let head = opaque(lw4.terms, arith_symbol(op), None);
-          let term = app(head.terms, head.id, [lhs, rhs], Some(int_ty()));
+          let term = app(head.terms, head.id, [lhs, rhs], Some(int_sort()));
           { lowering: with_terms(lw4, force_int(term.terms, term.id)), id: term.id }
         },
       }
-    } else if is_ordered(op) {
-      let lw2 = forced(lowering, lhs, rhs);
-      on(lw2, cmp(lw2.terms, cmp_of(op), lhs, rhs))
-    } else if op == b"and" { on(lowering, and(lowering.terms, lhs, rhs)) }
-    else if op == b"or" { on(lowering, or(lowering.terms, lhs, rhs)) }
+    } else if is_order_comparison(op) {
+      let lw2 = force_ints(lowering, lhs, rhs);
+      lift(lw2, cmp(lw2.terms, cmp_of(op), lhs, rhs))
+    } else if op == b"and" { lift(lowering, and(lowering.terms, lhs, rhs)) }
+    else if op == b"or" { lift(lowering, or(lowering.terms, lhs, rhs)) }
     // `==` on functions is a type error, so it needs no requirement here.
     else if op == b"eq" { equal(lowering, context, lhs, rhs, unfolds) } else if op == b"ne" {
       let e = equal(lowering, context, lhs, rhs, unfolds);
-      on(e.lowering, not(e.lowering.terms, e.id))
+      lift(e.lowering, not(e.lowering.terms, e.id))
     } else if op == b"concat" {
-      let lw2 = blocked(lowering, Concat);
+      let lw2 = add_blocker(lowering, Concat);
       let head = opaque(lw2.terms, op_concat(), None);
       // Both sides share one sort, so either side that has one gives the answer's.
       let sort = match sort_of(head.terms, lhs) {
         Some(s) -> s,
-        None -> match sort_of(head.terms, rhs) { Some(s) -> s, None -> string_ty() },
+        None -> match sort_of(head.terms, rhs) { Some(s) -> s, None -> string_sort() },
       };
-      on(lw2, app(head.terms, head.id, [lhs, rhs], Some(sort)))
+      lift(lw2, app(head.terms, head.id, [lhs, rhs], Some(sort)))
     } else {
       // Uninterpreted. Folding `x << 1` into `2·x` is wrong: the evaluator refutes `x << 1 > x`
       // at `x = 2^62`.
-      let lw2 = blocked(forced(lowering, lhs, rhs), BitOperator);
+      let lw2 = add_blocker(force_ints(lowering, lhs, rhs), BitOperator);
       let shift = op == b"shl" || op == b"shr" || op == b"ushr";
       let lw3 = if shift { require_shift_count(lw2, rhs) } else { lw2 };
       let symbol = if op == b"bitand" { op_bit_and() }
@@ -1321,7 +1387,7 @@ fn binary(
       else if op == b"shr" { op_shr() }
       else { op_ushr() };
       let head = opaque(lw3.terms, symbol, None);
-      let term = app(head.terms, head.id, [lhs, rhs], Some(int_ty()));
+      let term = app(head.terms, head.id, [lhs, rhs], Some(int_sort()));
       { lowering: with_terms(lw3, force_int(term.terms, term.id)), id: term.id }
     },
   }
@@ -1329,10 +1395,10 @@ fn binary(
 type Callee = | Local | Named(String) | Unresolved(String) | Other
 
 /// Decided from the code, not the head's term: a local and a same-named definition lower alike.
-fn callee(context: Context, func: Code) -> Callee =
-  match func.node {
-    NVar(_) -> Local,
-    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+fn callee(context: Context, function: Code) -> Callee =
+  match function.node {
+    CodeVar(_) -> Local,
+    NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
       let name = String::of_bytes_lossy(fname);
       if ctor(context, name) != None || signature(context, name) != None { Named(name) }
       else { Unresolved(name) }
@@ -1357,16 +1423,16 @@ fn lowered_args(
 fn application(
   lowering: Lowering,
   context: Context,
-  func: Code,
+  function: Code,
   args: List<Code>,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let lowered = lowered_args(lowering, context, args, unfolds);
-  match func.node {
-    NLambda(l) -> if l.params == lowered.ids.len() {
+  match function.node {
+    CodeLambda(l) -> if l.params == lowered.ids.len() {
       apply_lambda(lowered.lowering, context, lowered.ids, l.captures, l.body, unfolds)
-    } else { call(lowered.lowering, context, func, lowered.ids, unfolds) },
-    _ -> call(lowered.lowering, context, func, lowered.ids, unfolds),
+    } else { call(lowered.lowering, context, function, lowered.ids, unfolds) },
+    _ -> call(lowered.lowering, context, function, lowered.ids, unfolds),
   }
 }
 
@@ -1377,26 +1443,32 @@ fn apply_lambda(
   caps: List<Capture>,
   body: Code,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let captured = caps.fold(
     { lowering: lowering, window: args.map(|t: Int| Some(t)) },
     |acc: { lowering: Lowering, window: List<Option<Int>> }, cap: Capture| {
       let r = local(acc.lowering, cap.src);
-      let grown = if acc.window.len() <= cap.dst {
-        range(acc.window.len(), cap.dst + 1).fold(acc.window, |w: List<Option<Int>>, _: Int|
-          w.push(None))
+      let grown = if acc.window.len() <= cap.destination {
+        range(acc.window.len(), cap.destination + 1).fold(
+          acc.window,
+          |w: List<Option<Int>>, _: Int| w.push(None),
+        )
       } else { acc.window };
-      { lowering: r.lowering, window: grown.set(cap.dst, Some(r.id)) }
+      { lowering: r.lowering, window: grown.set(cap.destination, Some(r.id)) }
     },
   );
   let r = lower(
-    { ..captured.lowering, window: captured.window, inducting: None },
+    { ..captured.lowering, window: captured.window, induction_hypothesis: None },
     context,
     body,
     unfolds,
   );
   {
-    lowering: { ..r.lowering, window: captured.lowering.window, inducting: lowering.inducting },
+    lowering: {
+      ..r.lowering,
+      window: captured.lowering.window,
+      induction_hypothesis: lowering.induction_hypothesis,
+    },
     id: r.id,
   }
 }
@@ -1404,19 +1476,19 @@ fn apply_lambda(
 fn call(
   lowering: Lowering,
   context: Context,
-  func: Code,
+  function: Code,
   args: List<Int>,
   unfolds: Int,
-) -> L / {abort.raise} = {
-  let who = callee(context, func);
-  let head = lower(lowering, context, func, unfolds);
+) -> LoweredTerm / {abort.raise} = {
+  let who = callee(context, function);
+  let head = lower(lowering, context, function, unfolds);
   let r = call_head(head, context, who, args, unfolds);
   let applied = match who { Named(name) -> ctor(context, name) != None, _ -> false };
-  if applied { at_site(r, head.lowering, func.span) } else { r }
+  if applied { at_site(r, head.lowering, function.span) } else { r }
 }
 
 /// `r`, which a step from `before` made, with `at` among the places a value it counted was built.
-fn at_site(r: L, before: Lowering, at: Span) -> L =
+fn at_site(r: LoweredTerm, before: Lowering, at: Span) -> LoweredTerm =
   if r.lowering.built.len() > before.built.len() {
     { lowering: { ..r.lowering, seen: r.lowering.seen.push(at) }, id: r.id }
   } else { r }
@@ -1428,32 +1500,35 @@ fn call_named(
   name: String,
   args: List<Int>,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let who = if ctor(context, name) != None || signature(context, name) != None { Named(name) }
   else { Unresolved(name) };
   call_head(global(lowering, context, name), context, who, args, unfolds)
 }
 
 fn call_head(
-  head: L,
+  head: LoweredTerm,
   context: Context,
   who: Callee,
   args: List<Int>,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let arg_sorts = args.map(|a: Int| sort_of(head.lowering.terms, a));
   let head_sort = match sort_of(head.lowering.terms, head.id) {
-    Some(Fn(params, ret, _)) -> answered(params, arg_sorts, ret),
+    Some(FunctionSort(params, ret, _)) -> call_result_sort(params, arg_sorts, ret),
     _ -> None,
   };
   // A total builtin is a function of its arguments, so two calls over one argument are one term.
   let total_builtin = match who {
-    Unresolved(name) -> builtin_answers(context, name, arg_sorts),
+    Unresolved(name) -> builtin_returns(context, name, arg_sorts),
     _ -> false,
   };
   let sort = match who {
     Unresolved(name) -> match builtin(context, name) {
-      Some(b) -> match b.ty { Fn(params, ret, _) -> answered(params, arg_sorts, ret), _ -> None },
+      Some(b) -> match b.ty {
+        FunctionSort(params, ret, _) -> call_result_sort(params, arg_sorts, ret),
+        _ -> None,
+      },
       None -> head_sort,
     },
     _ -> head_sort,
@@ -1464,23 +1539,23 @@ fn call_head(
       _ -> false,
     });
   let opened = match node(head.lowering.terms, head.id) {
-    TClosure(k) -> Done(applied_closure(head.lowering, context, k, head.id, args, unfolds)),
-    TOpaque(name) -> if total_builtin { Keep(pure0, head.lowering, false) } else {
+    ClosureTerm(k) -> Resolved(applied_closure(head.lowering, context, k, head.id, args, unfolds)),
+    OpaqueTerm(name) -> if total_builtin { LeaveCall(pure0, head.lowering, false) } else {
       match match ctor(context, name) {
           Some(_) -> None,
-          None -> list_higher(head.lowering, context, name, head.id, args, sort, unfolds),
+          None -> list_higher_order(head.lowering, context, name, head.id, args, sort, unfolds),
         } {
-        Some(r) -> Done(r),
+        Some(r) -> Resolved(r),
         None -> match ctor(context, name) {
           Some(c) -> if arity(c) == args.len() {
-            Done(
+            Resolved(
               built_value(
-                on(
+                lift(
                   head.lowering,
-                  mk(
+                  intern(
                     head.lowering.terms,
-                    TCtor({ name: name, args: args }),
-                    ctor_result_sort(c, args, head.lowering.terms),
+                    ConstructorTerm({ name: name, args: args }),
+                    constructor_result_sort(c, args, head.lowering.terms),
                   ),
                 ),
                 context,
@@ -1488,22 +1563,23 @@ fn call_head(
                 unfolds,
               ),
             )
-          } else { Keep(pure0, head.lowering, false) },
+          } else { LeaveCall(pure0, head.lowering, false) },
           None -> {
-            let told = instances(head.lowering, context, name, args, unfolds);
+            let told = lemma_instances(head.lowering, context, name, args, unfolds);
             // A recursive call a lemma takes apart is the value its facts describe, not one to unroll.
             if told.apart && is_recursive(context, name) && is_pure(context, name) {
-              let made = on(told.lowering, app(told.lowering.terms, head.id, args, sort));
-              Done({
+              let made = lift(told.lowering, app(told.lowering.terms, head.id, args, sort));
+              Resolved({
                 lowering: { ..made.lowering, defined: made.lowering.defined.push(made.id) },
                 id: made.id,
               })
             } else {
               match try_unfold(told.lowering, context, name, head.id, sort, args, unfolds) {
-                Some(r) -> Done(r),
+                Some(r) -> Resolved(r),
                 None ->
-                  Keep(
-                    is_pure(context, name) || through_pure(told.lowering, context, name, args),
+                  LeaveCall(
+                    is_pure(context, name)
+                      || effect_parameters_pure(told.lowering, context, name, args),
                     note_unfold_refusal(told.lowering, context, name),
                     told.fitted,
                   ),
@@ -1513,18 +1589,18 @@ fn call_head(
         },
       }
     },
-    _ -> Keep(pure0, head.lowering, false),
+    _ -> LeaveCall(pure0, head.lowering, false),
   };
   match opened {
-    Done(r) -> r,
-    Keep(pure, lw2, fitted) -> {
-      let answered = kept_call(lw2, context, who, head, args, sort, pure, fitted, unfolds);
+    Resolved(r) -> r,
+    LeaveCall(pure, lw2, fitted) -> {
+      let answered = call_not_unfolded(lw2, context, who, head, args, sort, pure, fitted, unfolds);
       // What a call answers holds its type's invariant unless the claim made a value of a type that
       // states one, which the call may have been handed.
       if answered.lowering.tainted.len() > 0 { answered } else {
         {
           ..answered,
-          lowering: invariants_held(answered.lowering, context, [answered.id], unfolds),
+          lowering: assume_invariants(answered.lowering, context, [answered.id], unfolds),
         }
       }
     },
@@ -1533,27 +1609,27 @@ fn call_head(
 
 /// A call not unfolded: by its contract where one is in hand, a value of its arguments where it is
 /// a function of them, and a fresh value where it is not.
-fn kept_call(
+fn call_not_unfolded(
   lw2: Lowering,
   context: Context,
   who: Callee,
-  head: L,
+  head: LoweredTerm,
   args: List<Int>,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   pure: Bool,
   fitted: Bool,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let total = fitted || callee_is_total(lw2, context, who, head.id, args);
   // A definition whose contract is in hand answers wherever its `requires` hold.
   match match who {
       Named(name) -> if total || !pure { None }
-      else { contracted(lw2, context, name, head.id, args, sort, unfolds) },
+      else { call_by_contract(lw2, context, name, head.id, args, sort, unfolds) },
       _ -> None,
     } {
     Some(r) -> r,
     None -> {
-      let lw3 = if !total { undefined(lw2) } else { lw2 };
+      let lw3 = if !total { require_unreachable(lw2) } else { lw2 };
       match match who {
           Unresolved(name) -> match folded_builtin(lw3, name, args) {
             Some(r) -> Some(r),
@@ -1564,9 +1640,9 @@ fn kept_call(
         Some(r) -> r,
         None -> if !pure {
           // A call not known to be a function of its arguments gets a fresh symbol per occurrence.
-          on({ ..lw3, impure: true }, sym(lw3.terms, sort))
+          lift({ ..lw3, impure: true }, symbol(lw3.terms, sort))
         } else {
-          let made = on(lw3, app(lw3.terms, head.id, args, sort));
+          let made = lift(lw3, app(lw3.terms, head.id, args, sort));
           let total_named = match who { Named(name) -> lw3.total.contains(name), _ -> false };
           if total_named {
             { lowering: { ..made.lowering, calls: made.lowering.calls.push(made.id) }, id: made.id }
@@ -1577,17 +1653,23 @@ fn kept_call(
   }
 }
 
-/// `Keep(pure, lowering, answers)`: `answers` where a proved law fit the call, which a law's run
+/// `LeaveCall(pure, lowering, answers)`: `answers` where a proved law fit the call, which a law's run
 /// evaluates at every point, so the call answers wherever it fits.
-type Opened = | Done(L) | Keep(Bool, Lowering, Bool)
+type CallHeadResult = | Resolved(LoweredTerm) | LeaveCall(Bool, Lowering, Bool)
 
 /// A value a constructor built: where the body is read for the values it builds of that
 /// constructor's type, the invariant at it is owed, on the way to it.
-fn built_value(made: L, context: Context, c: Ctor, unfolds: Int) -> L / {abort.raise} = {
+fn built_value(
+  made: LoweredTerm,
+  context: Context,
+  c: Constructor,
+  unfolds: Int,
+) -> LoweredTerm / {abort.raise} = {
   let lw = constructing(made.lowering, context, c);
   match lw.building {
-    Some(b) -> if b.type_name != c.decl.name || unfolds <= 0 { { lowering: lw, id: made.id } }
-    else {
+    Some(b) -> if b.type_name != c.declaration.name || unfolds <= 0 {
+      { lowering: lw, id: made.id }
+    } else {
       let checked = call_named({ ..lw, building: None }, context, b.by, [made.id], unfolds - 1);
       let owed = under_path(checked.lowering, checked.id);
       {
@@ -1600,14 +1682,14 @@ fn built_value(made: L, context: Context, c: Ctor, unfolds: Int) -> L / {abort.r
 }
 
 /// `lowering` having applied a constructor of `c`'s type, where that type states an invariant.
-fn constructing(lowering: Lowering, context: Context, c: Ctor) -> Lowering =
-  if !context.invariants.contains(c.decl.name) || lowering.constructed.contains(c.decl.name) {
-    lowering
-  } else { { ..lowering, constructed: lowering.constructed.push(c.decl.name) } }
+fn constructing(lowering: Lowering, context: Context, c: Constructor) -> Lowering =
+  if !context.invariants.contains(c.declaration.name)
+      || lowering.constructed.contains(c.declaration.name) { lowering }
+  else { { ..lowering, constructed: lowering.constructed.push(c.declaration.name) } }
 
 /// Each of `ts` that is a value of a type stating an invariant satisfies it: only the type's module
 /// builds one, and each value it builds is shown to.
-pub fn invariants_held(
+pub fn assume_invariants(
   lowering: Lowering,
   context: Context,
   ts: List<Int>,
@@ -1616,10 +1698,10 @@ pub fn invariants_held(
   if unfolds <= 0 { lowering } else {
     ts.fold(lowering, |lw: Lowering, t: Int|
       match sort_of(lw.terms, t) {
-        Some(Con(name, _)) -> match context.invariants.get(name) {
+        Some(NamedSort(name, _)) -> match context.invariants.get(name) {
           Some(by) -> {
             let r = call_named(
-              { ..lw, path: [], building: None, inducting: None },
+              { ..lw, path: [], building: None, induction_hypothesis: None },
               context,
               by,
               [t],
@@ -1628,7 +1710,7 @@ pub fn invariants_held(
             {
               ..facts_on_path(lw, { ..r.lowering, facts: r.lowering.facts.push(r.id) }),
               building: lw.building,
-              inducting: lw.inducting,
+              induction_hypothesis: lw.induction_hypothesis,
               requirements: lw.requirements,
               blockers: lw.blockers,
             }
@@ -1642,13 +1724,13 @@ pub fn invariants_held(
 /// Whether a law over `declared` binders, bound at `terms`, says the calls it fits answer: not where
 /// a binder holds a function, whose answering the law stood on and no other function may; nor where
 /// a binder's type variable is settled at a value a key is called on, which the law never met.
-fn stands_alike(
+fn law_covers_call(
   lowering: Lowering,
   context: Context,
-  declared: List<Ty>,
+  declared: List<Sort>,
   terms: List<Int>,
 ) -> Bool =
-  !declared.any(|t: Ty| holds_function(context, t))
+  !declared.any(|t: Sort| holds_function(context, t))
     && !keyed_at_variable(lowering, context, declared, terms)
 
 /// Whether a variable of `declared`, settled by the sorts of `terms`, may be a type whose `==` calls
@@ -1656,67 +1738,76 @@ fn stands_alike(
 fn keyed_at_variable(
   lowering: Lowering,
   context: Context,
-  declared: List<Ty>,
+  declared: List<Sort>,
   terms: List<Int>,
 ) -> Bool =
   context.compared_by_key.len() > 0
     && (match range(0, declared.len()).fold(
         Some(Map::new()),
-        |acc: Option<Map<Int, Ty>>, i: Int|
+        |acc: Option<Map<Int, Sort>>, i: Int|
           match ((acc, declared.at(i), terms.at(i))) {
-            (Some(m), Some(d), Some(t)) -> if vars(d, []).len() == 0 { acc }
-            else { match sort_of(lowering.terms, t) { Some(s) -> unified(d, s, m), None -> None } },
+            (Some(m), Some(d), Some(t)) -> if vars(d, []).len() == 0 { acc } else {
+              match sort_of(lowering.terms, t) { Some(s) -> match_strict(d, s, m), None -> None }
+            },
             _ -> acc,
           },
       ) {
       None -> true,
-      Some(settled) -> settled.values().any(|s: Ty| may_call_key(context, Some(s))),
+      Some(settled) -> settled.values().any(|s: Sort| may_call_key(context, Some(s))),
     })
 
 /// Whether a value of `ty` is or holds a function, through any declaration.
-fn holds_function(context: Context, ty: Ty) -> Bool = function_within(context, ty, [], 64)
+fn holds_function(context: Context, ty: Sort) -> Bool = function_within(context, ty, [], 64)
 
-fn function_within(context: Context, ty: Ty, seen: List<String>, room: Int) -> Bool =
-  room <= 0
+fn function_within(context: Context, ty: Sort, seen: List<String>, depth_left: Int) -> Bool =
+  depth_left <= 0
     || (match ty {
-      Var(_) -> false,
-      Fn(_, _, _) -> true,
-      Record(fields) ->
-        fields.any(|f: { name: String, ty: Ty }| function_within(context, f.ty, seen, room - 1)),
-      Con(n, args) ->
-        args.any(|a: Ty| function_within(context, a, seen, room - 1))
+      SortVariable(_) -> false,
+      FunctionSort(_, _, _) -> true,
+      RecordSort(fields) ->
+        fields.any(|f: { name: String, ty: Sort }|
+          function_within(context, f.ty, seen, depth_left - 1)),
+      NamedSort(n, args) ->
+        args.any(|a: Sort| function_within(context, a, seen, depth_left - 1))
           || (!seen.contains(n)
-          && (match context.decls.get(n) {
-            Some(decl) ->
-              decl.variants.any(|v: Variant|
-                v.fields.any(|f: Ty| function_within(context, f, seen.push(n), room - 1))),
+          && (match context.declarations.get(n) {
+            Some(declaration) ->
+              declaration.variants.any(|v: Variant|
+                v.fields.any(|f: Sort| function_within(context, f, seen.push(n), depth_left - 1))),
             None -> false,
           })),
     })
 
 /// Whether a value of `ty` can hold one of the types `names`, at any depth and through any
 /// declaration. A type variable holds none: what stands on it was shown at every type.
-fn mentions_any(context: Context, ty: Ty, names: List<String>) -> Bool =
+fn mentions_any(context: Context, ty: Sort, names: List<String>) -> Bool =
   names.len() > 0 && holds_any(context, ty, names, [], 64)
 
-fn holds_any(context: Context, ty: Ty, names: List<String>, seen: List<String>, room: Int) -> Bool =
-  room <= 0
+fn holds_any(
+  context: Context,
+  ty: Sort,
+  names: List<String>,
+  seen: List<String>,
+  depth_left: Int,
+) -> Bool =
+  depth_left <= 0
     || (match ty {
-      Var(_) -> false,
-      Con(n, args) ->
-        names.contains(n) || args.any(|a: Ty| holds_any(context, a, names, seen, room - 1))
+      SortVariable(_) -> false,
+      NamedSort(n, args) ->
+        names.contains(n) || args.any(|a: Sort| holds_any(context, a, names, seen, depth_left - 1))
           || (!seen.contains(n)
-          && (match context.decls.get(n) {
-            Some(decl) ->
-              decl.variants.any(|v: Variant|
-                v.fields.any(|f: Ty| holds_any(context, f, names, seen.push(n), room - 1))),
+          && (match context.declarations.get(n) {
+            Some(declaration) ->
+              declaration.variants.any(|v: Variant|
+                v.fields.any(|f: Sort| holds_any(context, f, names, seen.push(n), depth_left - 1))),
             None -> false,
           })),
-      Fn(params, ret, _) ->
-        params.any(|p: Ty| holds_any(context, p, names, seen, room - 1))
-          || holds_any(context, ret, names, seen, room - 1),
-      Record(fields) ->
-        fields.any(|f: { name: String, ty: Ty }| holds_any(context, f.ty, names, seen, room - 1)),
+      FunctionSort(params, ret, _) ->
+        params.any(|p: Sort| holds_any(context, p, names, seen, depth_left - 1))
+          || holds_any(context, ret, names, seen, depth_left - 1),
+      RecordSort(fields) ->
+        fields.any(|f: { name: String, ty: Sort }|
+          holds_any(context, f.ty, names, seen, depth_left - 1)),
     })
 
 /// A call of `name` read by its contract, where one is in hand: a proved `ensures` shows the body
@@ -1725,28 +1816,29 @@ fn holds_any(context: Context, ty: Ty, names: List<String>, seen: List<String>, 
 /// proved holds of a call back into its definition only on the way to that call, which the
 /// definition's run makes before it answers. What reading the clauses owes is owed by the run that
 /// proves them. A generic callee was proved at no value whose comparison calls a key.
-fn contracted(
+fn call_by_contract(
   lowering: Lowering,
   context: Context,
   name: String,
   head: Int,
   args: List<Int>,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   unfolds: Int,
-) -> Option<L> / {abort.raise} =
-  if unfolds <= 0 || !answers_by_contract(lowering, context, name) { None } else {
-    match context.claims.defs.get(name) {
+) -> Option<LoweredTerm> / {abort.raise} =
+  if unfolds <= 0 || !contract_applies(lowering, context, name) { None } else {
+    match context.claims.definitions.get(name) {
       None -> None,
       Some(d) -> {
-        let ensures = d.spec.filter(|c: ClaimClause| c.kind == SEnsures);
-        let requires = d.spec.filter(|c: ClaimClause| c.kind == SRequires);
+        let ensures = d.spec.filter(|c: ClaimClause| c.kind == EnsuresClause);
+        let requires = d.spec.filter(|c: ClaimClause| c.kind == RequiresClause);
         let proved = context.claims.trusted.contains(name) || lowering.contracts.contains(name);
-        let usable = |i: Int| proved || lowering.inducting == Some({ name: name, clause: i });
+        let usable = |i: Int|
+          proved || lowering.induction_hypothesis == Some({ name: name, clause: i });
         if !range(0, ensures.len()).any(usable) { None } else {
           let made = app(lowering.terms, head, args, sort);
           let call = made.id;
           let params = match signature(context, name) {
-            Some(s) -> match s.ty { Fn(ps, _, _) -> ps, _ -> [] },
+            Some(s) -> match s.ty { FunctionSort(ps, _, _) -> ps, _ -> [] },
             None -> [],
           };
           if keyed_at_variable(lowering, context, params, args) { None } else {
@@ -1754,18 +1846,18 @@ fn contracted(
               ..with_terms(lowering, made.terms),
               path: [],
               depth: lowering.depth + 1,
-              inducting: None,
+              induction_hypothesis: None,
             };
             let guard = requires.fold(
               { lowering: scratch, id: true_id() },
-              |acc: L, c: ClaimClause| {
-                let r = lower_opt(
+              |acc: LoweredTerm, c: ClaimClause| {
+                let r = lower_optional(
                   { ..acc.lowering, window: args.map(|t: Int| Some(t)) },
                   context,
                   Some(c.clause.code),
                   unfolds - 1,
                 );
-                on(r.lowering, both(r.lowering.terms, acc.id, r.id))
+                lift(r.lowering, both(r.lowering.terms, acc.id, r.id))
               },
             );
             let stated = range(0, ensures.len()).fold(guard.lowering, |lw: Lowering, i: Int|
@@ -1773,7 +1865,7 @@ fn contracted(
                 match ensures.at(i) {
                   None -> lw,
                   Some(c) -> {
-                    let e = lower_opt(
+                    let e = lower_optional(
                       { ..lw, window: args.push(call).map(|t: Int| Some(t)) },
                       context,
                       Some(c.clause.code),
@@ -1794,17 +1886,17 @@ fn contracted(
               ..facts_on_path(lowering, stated),
               window: lowering.window,
               depth: lowering.depth,
-              inducting: lowering.inducting,
+              induction_hypothesis: lowering.induction_hypothesis,
               requirements: lowering.requirements,
               blockers: lowering.blockers,
-              rules: note(stated.rules, Contract({ def: name })),
+              rules: record_rule(stated.rules, Contract({ definition: name })),
             };
             // Another package's `ensures` claims only what its body answers; this package's contracts
             // were shown with every call answering, and a call back is the run being proved.
             let answering = lowering.contracts.contains(name)
-              || (match lowering.inducting { Some(i) -> i.name == name, None -> false });
+              || (match lowering.induction_hypothesis { Some(i) -> i.name == name, None -> false });
             let owed = require(back, guard.id);
-            Some({ lowering: if answering { owed } else { undefined(owed) }, id: call })
+            Some({ lowering: if answering { owed } else { require_unreachable(owed) }, id: call })
           }
         }
       },
@@ -1815,36 +1907,38 @@ fn contracted(
 /// raises nothing, and none of its parameters is of a type whose invariant this claim may not stand
 /// on, which its proof may have. A call back into the definition whose clause is being proved may,
 /// whatever it raises: a raise there is one the definition's run makes, and that run answers nothing.
-fn answers_by_contract(lowering: Lowering, context: Context, name: String) -> Bool =
+fn contract_applies(lowering: Lowering, context: Context, name: String) -> Bool =
   (lowering.tainted.len() == 0
-    && (match lowering.inducting { Some(i) -> i.name == name, None -> false }))
-    || (ends(context, name)
+    && (match lowering.induction_hypothesis { Some(i) -> i.name == name, None -> false }))
+    || (terminates(context, name)
     && (match signature(context, name) {
       Some(s) ->
         !s.raises
           && (match s.ty {
-            Fn(params, _, _) -> !params.any(|p: Ty| mentions_any(context, p, lowering.tainted)),
+            FunctionSort(params, _, _) ->
+              !params.any(|p: Sort| mentions_any(context, p, lowering.tainted)),
             _ -> true,
           }),
       None -> false,
     }))
 
-type Told = { lowering: Lowering, apart: Bool, fitted: Bool }
+type LemmaUse = { lowering: Lowering, apart: Bool, fitted: Bool }
 
 /// Each lemma whose trigger the call `name(args)` fits puts its claim at what the trigger bound into
 /// the proof, lowered on one unfolding less, as a definition's body is.
-fn instances(
+fn lemma_instances(
   lowering: Lowering,
   context: Context,
   name: String,
   args: List<Int>,
   unfolds: Int,
-) -> Told / {abort.raise} =
+) -> LemmaUse / {abort.raise} =
   lowering.lemmas.fold(
     { lowering: lowering, apart: false, fitted: false },
-    |acc: Told, lemma: Lemma|
-      if unfolds <= 0 || lemma.func != name || lemma.args.len() != args.len()
-          || lemma.typed.any(|t: Ty| mentions_any(context, t, acc.lowering.tainted)) { acc } else {
+    |acc: LemmaUse, lemma: Lemma|
+      if unfolds <= 0 || lemma.function != name || lemma.args.len() != args.len()
+          || lemma.typed.any(|t: Sort| mentions_any(context, t, acc.lowering.tainted)) { acc }
+      else {
         match fitted_all(
             acc.lowering,
             context,
@@ -1855,10 +1949,10 @@ fn instances(
           None -> acc,
           Some(binds) -> match Option::all(binds) {
             None -> acc,
-            Some(terms) -> if !typed_fit(acc.lowering, context, lemma, terms) { acc } else {
-              let answers = stands_alike(acc.lowering, context, lemma.typed, terms);
+            Some(terms) -> if !fits_types(acc.lowering, context, lemma, terms) { acc } else {
+              let answers = law_covers_call(acc.lowering, context, lemma.typed, terms);
               {
-                lowering: instance(acc.lowering, context, lemma, terms, unfolds - 1),
+                lowering: lemma_instance(acc.lowering, context, lemma, terms, unfolds - 1),
                 apart: acc.apart || (lemma.apart && answers),
                 fitted: acc.fitted || answers,
               }
@@ -1871,18 +1965,21 @@ fn instances(
 /// A law is a fact at the terms its trigger bound only where each is of its binder's type, the law's
 /// variables settled alike throughout, and each variable an `identity` constraint is on settled at a
 /// type whose `==` is identity.
-fn typed_fit(lowering: Lowering, context: Context, lemma: Lemma, terms: List<Int>) -> Bool =
-  match range(0, lemma.typed.len()).fold(Some(Map::new()), |acc: Option<Map<Int, Ty>>, i: Int|
-      match acc {
-        None -> None,
-        Some(m) -> match ((lemma.typed.at(i), terms.at(i))) {
-          (Some(declared), Some(t)) -> match sort_of(lowering.terms, t) {
-            Some(actual) -> unified(declared, actual, m),
-            None -> None,
+fn fits_types(lowering: Lowering, context: Context, lemma: Lemma, terms: List<Int>) -> Bool =
+  match range(0, lemma.typed.len()).fold(
+      Some(Map::new()),
+      |acc: Option<Map<Int, Sort>>, i: Int|
+        match acc {
+          None -> None,
+          Some(m) -> match ((lemma.typed.at(i), terms.at(i))) {
+            (Some(declared), Some(t)) -> match sort_of(lowering.terms, t) {
+              Some(actual) -> match_strict(declared, actual, m),
+              None -> None,
+            },
+            _ -> None,
           },
-          _ -> None,
         },
-      }) {
+    ) {
     None -> false,
     Some(settled) ->
       lemma.identities.all(|v: Int|
@@ -1920,7 +2017,7 @@ fn fitted(
   binds: List<Option<Int>>,
 ) -> Option<List<Option<Int>>> / {abort.raise} =
   match pattern.node {
-    NVar(v) -> {
+    CodeVar(v) -> {
       let k = v.slot;
       match binds.at(k) {
         Some(Some(u)) -> if u == t { Some(binds) } else { None },
@@ -1928,34 +2025,36 @@ fn fitted(
         None -> None,
       }
     },
-    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> if global(
+    NDefinition({ full: fname, .. }) | NConstructor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> if global(
           lowering,
           context,
           String::of_bytes_lossy(fname),
         ).id
         == t { Some(binds) }
     else { None },
-    NLit(l) -> if literal(lowering, l).id == t { Some(binds) } else { None },
-    NApp(a) -> match read_name(a.func) {
+    CodeLiteral(l) -> if literal(lowering, l).id == t { Some(binds) } else { None },
+    CodeApply(a) -> match read_name(a.function) {
       Some(f) -> {
         let name = String::of_bytes_lossy(f);
         match node(lowering.terms, t) {
-          TApp(called) -> match node(lowering.terms, called.head) {
-            TOpaque(h) -> if h == name { fitted_all(lowering, context, a.args, called.args, binds) }
-            else { None },
+          ApplicationTerm(called) -> match node(lowering.terms, called.head) {
+            OpaqueTerm(h) -> if h == name {
+              fitted_all(lowering, context, a.args, called.args, binds)
+            } else { None },
             _ -> None,
           },
-          TCtor(k) -> if k.name == name { fitted_all(lowering, context, a.args, k.args, binds) }
-          else { None },
+          ConstructorTerm(k) -> if k.name == name {
+            fitted_all(lowering, context, a.args, k.args, binds)
+          } else { None },
           _ -> None,
         }
       },
       None -> None,
     },
-    NList(l) -> {
+    CodeList(l) -> {
       let s = spine(lowering.terms, t);
       match node(lowering.terms, s.end) {
-        TNil -> fitted_all(lowering, context, l.items, s.heads, binds),
+        NilTerm -> fitted_all(lowering, context, l.items, s.heads, binds),
         _ -> None,
       }
     },
@@ -1967,7 +2066,7 @@ fn fitted(
 /// so what lowering it owes is not owed and the calls it makes are values; not where a binder holds
 /// a function, or a keyed value at a type variable, which the law never met: there the fact holds
 /// only where its reading answers.
-fn instance(
+fn lemma_instance(
   lowering: Lowering,
   context: Context,
   lemma: Lemma,
@@ -1981,26 +2080,26 @@ fn instance(
       path: [],
       depth: lowering.depth + 1,
       lemmas: [],
-      inducting: None,
+      induction_hypothesis: None,
     },
     context,
     lemma.body,
     unfolds,
   );
-  let alike = stands_alike(lowering, context, lemma.typed, terms);
+  let alike = law_covers_call(lowering, context, lemma.typed, terms);
   let fact = where_owed(r.lowering, if alike { lowering } else { r.lowering }, r.id);
   {
     ..facts_on_path(lowering, { ..fact.lowering, facts: fact.lowering.facts.push(fact.id) }),
     window: lowering.window,
     depth: lowering.depth,
-    inducting: lowering.inducting,
+    induction_hypothesis: lowering.induction_hypothesis,
     lemmas: lowering.lemmas,
     requirements: lowering.requirements,
     blockers: lowering.blockers,
     calls: lowering.calls,
     defined: if alike { r.lowering.defined.concat(r.lowering.calls.drop(lowering.calls.len())) }
     else { r.lowering.defined },
-    rules: note(fact.lowering.rules, Cited({ law: lemma.law, label: lemma.label })),
+    rules: record_rule(fact.lowering.rules, Cited({ law: lemma.law, label: lemma.label })),
   }
 }
 
@@ -2019,31 +2118,35 @@ fn facts_on_path(before: Lowering, after: Lowering) -> Lowering / {abort.raise} 
 
 /// `fact`, about values `owing` was read to, stated where what that reading owes holds: a fact
 /// about a call is no ground to take its arguments for values.
-fn where_owed(lowering: Lowering, owing: Lowering, fact: Int) -> L / {abort.raise} = {
+fn where_owed(lowering: Lowering, owing: Lowering, fact: Int) -> LoweredTerm / {abort.raise} = {
   let owed = owing.requirements.fold(
-    on(lowering, boolean(lowering.terms, true)),
-    |acc: L, r: Int| on(acc.lowering, both(acc.lowering.terms, acc.id, r)),
+    lift(lowering, boolean(lowering.terms, true)),
+    |acc: LoweredTerm, r: Int| lift(acc.lowering, both(acc.lowering.terms, acc.id, r)),
   );
   let unmet = not(owed.lowering.terms, owed.id);
-  on(owed.lowering, or(unmet.terms, unmet.id, fact))
+  lift(owed.lowering, or(unmet.terms, unmet.id, fact))
 }
 
 /// A `Float` builtin over literals: the bits a run answers, which every machine agrees on.
-fn folded_builtin(lowering: Lowering, name: String, args: List<Int>) -> Option<L> / {abort.raise} = {
+fn folded_builtin(
+  lowering: Lowering,
+  name: String,
+  args: List<Int>,
+) -> Option<LoweredTerm> / {abort.raise} = {
   let float_at = |i: Int|
     match args.at(i) {
       Some(t) -> match node(lowering.terms, t) {
-        TFloat(bits) -> Some(Float::of_bits(bits)),
+        FloatTerm(bits) -> Some(Float::of_bits(bits)),
         _ -> None,
       },
       None -> None,
     };
   let int_at = |i: Int|
     match args.at(i) {
-      Some(t) -> match node(lowering.terms, t) { TInt(k) -> Some(k), _ -> None },
+      Some(t) -> match node(lowering.terms, t) { IntTerm(k) -> Some(k), _ -> None },
       None -> None,
     };
-  let float = |f: Float| Some(on(lowering, float_lit(lowering.terms, bits_of_float(f))));
+  let float = |f: Float| Some(lift(lowering, float_literal(lowering.terms, bits_of_float(f))));
   let one = |op: (Float) -> Float| match float_at(0) { Some(x) -> float(op(x)), None -> None };
   let two = |op: (Float, Float) -> Float|
     match ((float_at(0), float_at(1))) { (Some(x), Some(y)) -> float(op(x, y)), _ -> None };
@@ -2068,7 +2171,7 @@ fn folded_builtin(lowering: Lowering, name: String, args: List<Int>) -> Option<L
     match int_at(0) { Some(k) -> float(Float::of_bits(k)), None -> None }
   } else if name == "bits_of_float" {
     match float_at(0) {
-      Some(x) -> Some(on(lowering, int_lit(lowering.terms, bits_of_float(x)))),
+      Some(x) -> Some(lift(lowering, int_literal(lowering.terms, bits_of_float(x)))),
       None -> None,
     }
   } else { None }
@@ -2081,7 +2184,7 @@ fn list_builtin(
   name: String,
   head: Int,
   args: List<Int>,
-) -> Option<L> / {abort.raise} =
+) -> Option<LoweredTerm> / {abort.raise} =
   match args {
     [xs] -> if name == "List::len" { list_len(lowering, head, xs) } else { None },
     [xs, x] -> if name == "List::push" { list_push(lowering, head, xs, x) } else { None },
@@ -2090,20 +2193,21 @@ fn list_builtin(
 
 /// `map`, `filter` and `fold` over the heads of a spine in view, each function call read where it
 /// stands; what is left of a spine that ends in a symbol stays a call over that symbol.
-fn list_higher(
+fn list_higher_order(
   lowering: Lowering,
   context: Context,
   name: String,
   head: Int,
   args: List<Int>,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   unfolds: Int,
-) -> Option<L> / {abort.raise} =
+) -> Option<LoweredTerm> / {abort.raise} =
   match args {
     [xs, f] -> if name == prelude_list("map") {
       mapped(lowering, context, name, head, xs, f, sort, unfolds)
-    } else if name == prelude_list("filter") { kept(lowering, context, name, head, xs, f, unfolds) }
-    else { None },
+    } else if name == prelude_list("filter") {
+      filtered(lowering, context, name, head, xs, f, unfolds)
+    } else { None },
     [xs, init, f] -> if name == prelude_list("fold") {
       folded(lowering, context, name, head, xs, init, f, sort, unfolds)
     } else { None },
@@ -2120,17 +2224,17 @@ fn apply_function(
   f: Int,
   args: List<Int>,
   unfolds: Int,
-) -> L / {abort.raise} =
+) -> LoweredTerm / {abort.raise} =
   if unfolds <= 0 {
     let sorts = args.map(|a: Int| sort_of(lowering.terms, a));
     let lw = if function_total(lowering, context, f, sorts) { lowering }
-    else { undefined(lowering) };
-    if function_pure(lowering, context, f) { on(lw, app(lw.terms, f, args, None)) }
-    else { on({ ..lw, impure: true }, sym(lw.terms, None)) }
+    else { require_unreachable(lowering) };
+    if function_pure(lowering, context, f) { lift(lw, app(lw.terms, f, args, None)) }
+    else { lift({ ..lw, impure: true }, symbol(lw.terms, None)) }
   } else {
     match node(lowering.terms, f) {
-      TClosure(k) -> applied_closure(lowering, context, k, f, args, unfolds - 1),
-      TOpaque(name) -> call_named(lowering, context, name, args, unfolds - 1),
+      ClosureTerm(k) -> applied_closure(lowering, context, k, f, args, unfolds - 1),
+      OpaqueTerm(name) -> call_named(lowering, context, name, args, unfolds - 1),
       _ -> call_head({ lowering: lowering, id: f }, context, Local, args, unfolds - 1),
     }
   }
@@ -2143,14 +2247,15 @@ fn remainder(
   name: String,
   head: Int,
   args: List<Int>,
-  sort: Option<Ty>,
-) -> L / {abort.raise} = {
+  sort: Option<Sort>,
+) -> LoweredTerm / {abort.raise} = {
   let f = match args.at(args.len() - 1) { Some(t) -> t, None -> 0 };
   // `f` is handed the list's elements and what the other arguments start it at.
   let sorts = args.take(args.len() - 1).map(|a: Int| sort_of(lowering.terms, a));
-  let lw = if function_total(lowering, context, f, sorts) { lowering } else { undefined(lowering) };
-  if function_pure(lowering, context, f) { on(lw, app(lw.terms, head, args, sort)) }
-  else { on({ ..lw, impure: true }, sym(lw.terms, sort)) }
+  let lw = if function_total(lowering, context, f, sorts) { lowering }
+  else { require_unreachable(lowering) };
+  if function_pure(lowering, context, f) { lift(lw, app(lw.terms, head, args, sort)) }
+  else { lift({ ..lw, impure: true }, symbol(lw.terms, sort)) }
 }
 
 fn mapped(
@@ -2160,11 +2265,11 @@ fn mapped(
   head: Int,
   xs: Int,
   f: Int,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   unfolds: Int,
-) -> Option<L> / {abort.raise} = {
+) -> Option<LoweredTerm> / {abort.raise} = {
   let s = spine(lowering.terms, xs);
-  let at_nil = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
+  let at_nil = match node(lowering.terms, s.end) { NilTerm -> true, _ -> false };
   if s.heads.len() == 0 && !at_nil { Some(remainder(lowering, context, name, head, [xs, f], sort)) }
   else {
     let applied = s.heads.fold(
@@ -2178,27 +2283,27 @@ fn mapped(
       Some(t) -> Some(t),
       None -> match applied.ids.at(0) {
         Some(first) -> match sort_of(applied.lowering.terms, first) {
-          Some(e) -> Some(list_ty(e)),
+          Some(e) -> Some(list_sort(e)),
           None -> None,
         },
         None -> None,
       },
     };
-    let tail = if at_nil { on(applied.lowering, nil(applied.lowering.terms, out)) }
+    let tail = if at_nil { lift(applied.lowering, nil(applied.lowering.terms, out)) }
     else { remainder(applied.lowering, context, name, head, [s.end, f], out) };
     Some(consed(tail, applied.ids, out))
   }
 }
 
 /// `items` in front of `tail`.
-fn consed(tail: L, items: List<Int>, sort: Option<Ty>) -> L / {abort.raise} =
-  range(0, items.len()).fold(tail, |acc: L, k: Int|
+fn consed(tail: LoweredTerm, items: List<Int>, sort: Option<Sort>) -> LoweredTerm / {abort.raise} =
+  range(0, items.len()).fold(tail, |acc: LoweredTerm, k: Int|
     match items.at(items.len() - 1 - k) {
-      Some(item) -> on(acc.lowering, cons(acc.lowering.terms, item, acc.id, sort)),
+      Some(item) -> lift(acc.lowering, cons(acc.lowering.terms, item, acc.id, sort)),
       None -> acc,
     })
 
-fn kept(
+fn filtered(
   lowering: Lowering,
   context: Context,
   name: String,
@@ -2206,9 +2311,9 @@ fn kept(
   xs: Int,
   f: Int,
   unfolds: Int,
-) -> Option<L> / {abort.raise} = {
+) -> Option<LoweredTerm> / {abort.raise} = {
   let s = spine(lowering.terms, xs);
-  let at_nil = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
+  let at_nil = match node(lowering.terms, s.end) { NilTerm -> true, _ -> false };
   let sort = sort_of(lowering.terms, xs);
   if s.heads.len() == 0 && !at_nil { Some(remainder(lowering, context, name, head, [xs, f], sort)) }
   else {
@@ -2219,19 +2324,19 @@ fn kept(
         { lowering: r.lowering, ids: acc.ids.push(r.id) }
       },
     );
-    let tail = if at_nil { on(tested.lowering, nil(tested.lowering.terms, sort)) }
+    let tail = if at_nil { lift(tested.lowering, nil(tested.lowering.terms, sort)) }
     else { remainder(tested.lowering, context, name, head, [s.end, f], sort) };
     Some(
-      range(0, s.heads.len()).fold(tail, |acc: L, k: Int| {
+      range(0, s.heads.len()).fold(tail, |acc: LoweredTerm, k: Int| {
         let i = s.heads.len() - 1 - k;
         match ((s.heads.at(i), tested.ids.at(i))) {
           (Some(h), Some(c)) -> {
             let kept_cell = cons(acc.lowering.terms, h, acc.id, sort);
-            on(
+            lift(
               acc.lowering,
-              mk(
+              intern(
                 kept_cell.terms,
-                TIf({ cond: c, then_branch: kept_cell.id, else_branch: acc.id }),
+                IfTerm({ cond: c, then_branch: kept_cell.id, else_branch: acc.id }),
                 sort,
               ),
             )
@@ -2251,15 +2356,15 @@ fn folded(
   xs: Int,
   init: Int,
   f: Int,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   unfolds: Int,
-) -> Option<L> / {abort.raise} = {
+) -> Option<LoweredTerm> / {abort.raise} = {
   let s = spine(lowering.terms, xs);
-  let at_nil = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
+  let at_nil = match node(lowering.terms, s.end) { NilTerm -> true, _ -> false };
   if s.heads.len() == 0 && !at_nil {
     Some(remainder(lowering, context, name, head, [xs, init, f], sort))
   } else {
-    let stepped = s.heads.fold({ lowering: lowering, id: init }, |acc: L, h: Int|
+    let stepped = s.heads.fold({ lowering: lowering, id: init }, |acc: LoweredTerm, h: Int|
       apply_function(acc.lowering, context, f, [acc.id, h], unfolds));
     if at_nil { Some(stepped) } else {
       Some(
@@ -2275,21 +2380,21 @@ fn folded(
 fn spine(terms: Terms, xs: Int) -> { heads: List<Int>, end: Int } / {abort.raise} =
   iterate({ heads: [], end: xs }, size(terms) + 1, |s: { heads: List<Int>, end: Int }|
     match node(terms, s.end) {
-      TCons(c) -> Continue({ heads: s.heads.push(c.head), end: c.tail }),
+      ConsTerm(c) -> Continue({ heads: s.heads.push(c.head), end: c.tail }),
       _ -> Stop(s),
     })
 
-fn list_len(lowering: Lowering, head: Int, xs: Int) -> Option<L> / {abort.raise} = {
+fn list_len(lowering: Lowering, head: Int, xs: Int) -> Option<LoweredTerm> / {abort.raise} = {
   let s = spine(lowering.terms, unmapped(lowering.terms, xs));
   let end = unmapped(lowering.terms, s.end);
   match node(lowering.terms, s.end) {
-    TNil -> Some(on(lowering, int_lit(lowering.terms, s.heads.len()))),
+    NilTerm -> Some(lift(lowering, int_literal(lowering.terms, s.heads.len()))),
     _ -> if s.heads.len() == 0 && end == xs { None } else if s.heads.len() == 0 {
-      let made = app(lowering.terms, head, [end], Some(int_ty()));
+      let made = app(lowering.terms, head, [end], Some(int_sort()));
       Some({ lowering: with_terms(lowering, force_int(made.terms, made.id)), id: made.id })
     } else {
-      let rest = app(lowering.terms, head, [end], Some(int_ty()));
-      let k = int_lit(rest.terms, s.heads.len());
+      let rest = app(lowering.terms, head, [end], Some(int_sort()));
+      let k = int_literal(rest.terms, s.heads.len());
       match add(k.terms, k.id, rest.id) {
         Some(sum) ->
           Some({
@@ -2305,28 +2410,33 @@ fn list_len(lowering: Lowering, head: Int, xs: Int) -> Option<L> / {abort.raise}
 /// A `map` is as long as what it maps, so its length reads through it.
 fn unmapped(terms: Terms, xs: Int) -> Int / {abort.raise} =
   match node(terms, xs) {
-    TApp(a) -> match ((node(terms, a.head), a.args)) {
-      (TOpaque(name), [inner, _]) -> if name == prelude_list("map") { inner } else { xs },
+    ApplicationTerm(a) -> match ((node(terms, a.head), a.args)) {
+      (OpaqueTerm(name), [inner, _]) -> if name == prelude_list("map") { inner } else { xs },
       _ -> xs,
     },
     _ -> xs,
   }
 
-fn list_push(lowering: Lowering, head: Int, xs: Int, x: Int) -> Option<L> / {abort.raise} = {
+fn list_push(
+  lowering: Lowering,
+  head: Int,
+  xs: Int,
+  x: Int,
+) -> Option<LoweredTerm> / {abort.raise} = {
   let sort = sort_of(lowering.terms, xs);
   let s = spine(lowering.terms, xs);
-  let at_nil = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
+  let at_nil = match node(lowering.terms, s.end) { NilTerm -> true, _ -> false };
   if !at_nil && s.heads.len() == 0 { None } else {
     let last = if at_nil {
       let empty = nil(lowering.terms, sort);
       cons(empty.terms, x, empty.id, sort)
     } else { app(lowering.terms, head, [s.end, x], sort) };
-    let built = range(0, s.heads.len()).fold(last, |acc: Made, k: Int|
+    let built = range(0, s.heads.len()).fold(last, |acc: InternedTerm, k: Int|
       match s.heads.at(s.heads.len() - 1 - k) {
         Some(h) -> cons(acc.terms, h, acc.id, sort),
         None -> acc,
       });
-    Some(on(lowering, built))
+    Some(lift(lowering, built))
   }
 }
 
@@ -2341,25 +2451,25 @@ fn callee_is_total(
     Local -> function_total(lowering, context, head, args.map(|a: Int| sort_of(lowering.terms, a))),
     Named(name) -> ctor(context, name) != None || lowering.total.contains(name),
     Unresolved(name) ->
-      builtin_answers(context, name, args.map(|a: Int| sort_of(lowering.terms, a))),
+      builtin_returns(context, name, args.map(|a: Int| sort_of(lowering.terms, a))),
     Other -> false,
   }
 
 /// Whether a call of the builtin `name` over arguments of `sorts` answers: one of the total ones, and
 /// where it compares, over no value whose key's function could end the run.
-fn builtin_answers(context: Context, name: String, sorts: List<Option<Ty>>) -> Bool =
+fn builtin_returns(context: Context, name: String, sorts: List<Option<Sort>>) -> Bool =
   is_total_builtin(name)
     && !((name == "min" || name == "max" || name.starts_with("Map::"))
-      && sorts.any(|s: Option<Ty>| may_call_key(context, s)))
+      && sorts.any(|s: Option<Sort>| may_call_key(context, s)))
 
 fn head_is_pure(terms: Terms, head: Int) -> Bool =
-  match sort_of(terms, head) { Some(Fn(_, _, pure)) -> pure, _ -> false }
+  match sort_of(terms, head) { Some(FunctionSort(_, _, pure)) -> pure, _ -> false }
 
 /// Why `try_unfold` declined; kept in its decision order.
 fn note_unfold_refusal(lowering: Lowering, context: Context, name: String) -> Lowering =
-  blocked(
+  add_blocker(
     lowering,
-    if lowering.depth >= lowering.unfold_limit || lowering.unfold_room <= 0
+    if lowering.depth >= lowering.unfold_limit || lowering.unfolds_left <= 0
         || size(lowering.terms) >= max_terms() { UnfoldLimit(name) }
     else if is_recursive(context, name) { RecursiveCall(name) }
     else if !is_pure(context, name) { EffectfulCall(name) }
@@ -2368,12 +2478,12 @@ fn note_unfold_refusal(lowering: Lowering, context: Context, name: String) -> Lo
 
 /// Whether `t` is a tail of `root`, through the list patterns that took it apart.
 pub fn smaller_than(lowering: Lowering, t: Int, root: Int) -> Bool =
-  range(0, lowering.smaller.len() + 1).fold(
+  range(0, lowering.list_tails.len() + 1).fold(
       { at: t, found: None },
       |st: { at: Int, found: Option<Bool> }, _: Int|
         match st.found {
           Some(_) -> st,
-          None -> match lowering.smaller.fold(
+          None -> match lowering.list_tails.fold(
               None,
               |acc: Option<Int>, s: { tail: Int, from: Int }|
                 match acc {
@@ -2396,17 +2506,17 @@ fn try_unfold(
   context: Context,
   name: String,
   head: Int,
-  sort: Option<Ty>,
+  sort: Option<Sort>,
   args: List<Int>,
   unfolds: Int,
-) -> Option<L> / {abort.raise} =
-  if unfolds <= 0 || lowering.unfold_room <= 0 || size(lowering.terms) >= max_terms() { None }
+) -> Option<LoweredTerm> / {abort.raise} =
+  if unfolds <= 0 || lowering.unfolds_left <= 0 || size(lowering.terms) >= max_terms() { None }
   else {
     let unrolling = lowering.unrolled.contains(name);
     let whole = args.fold(true, |all: Bool, a: Int| all && in_view(lowering.terms, a));
     // A recursion that ends, over a value in view, runs as a call of it does: as deep as `unfolds`
     // allows, apart from the depth an unfolding inside another counts.
-    let over_view = !unrolling && is_recursive(context, name) && ends(context, name)
+    let over_view = !unrolling && is_recursive(context, name) && terminates(context, name)
       && args.any(|a: Int| in_view(lowering.terms, a) && !is_literal(lowering.terms, a))
       && args.all(|a: Int|
         in_view(lowering.terms, a) || scalar(context, sort_of(lowering.terms, a)));
@@ -2421,25 +2531,25 @@ fn try_unfold(
           else { None },
         } {
         None -> None,
-        Some(def) -> if def.params != args.len() { None } else {
+        Some(definition) -> if definition.params != args.len() { None } else {
           let deeper = if over_view { lowering.depth } else { lowering.depth + 1 };
           let lw2 = {
             ..lowering,
-            rules: unfolded(lowering.rules, name, deeper),
+            rules: record_unfold(lowering.rules, name, deeper),
             depth: deeper,
-            unfold_room: lowering.unfold_room - 1,
+            unfolds_left: lowering.unfolds_left - 1,
           };
           let outer = lw2.window;
-          let r = lower_opt(
+          let r = lower_optional(
             { ..lw2, window: args.map(|t: Int| Some(t)) },
             context,
-            def.body,
+            definition.body,
             unfolds - 1,
           );
           // A body that answers a value of no sort answers the call's: `[]` is a `List<Int>` here.
           let typed = match sort {
             Some(t) -> if sort_of(r.lowering.terms, r.id) == None {
-              mk(r.lowering.terms, node(r.lowering.terms, r.id), Some(t)).terms
+              intern(r.lowering.terms, node(r.lowering.terms, r.id), Some(t)).terms
             } else { r.lowering.terms },
             None -> r.lowering.terms,
           };
@@ -2463,10 +2573,10 @@ fn try_unfold(
 
 /// Whether a value of `sort` is one no recursion takes apart: a builtin type of no parameters. A
 /// recursion over a list or a sum not in view is not unrolled by an argument beside it that is.
-fn scalar(context: Context, sort: Option<Ty>) -> Bool =
+fn scalar(context: Context, sort: Option<Sort>) -> Bool =
   match sort {
-    Some(Con(name, [])) -> !context.decls.contains(name),
-    Some(Fn(_, _, _)) -> true,
+    Some(NamedSort(name, [])) -> !context.declarations.contains(name),
+    Some(FunctionSort(_, _, _)) -> true,
     _ -> false,
   }
 
@@ -2475,20 +2585,21 @@ fn scalar(context: Context, sort: Option<Ty>) -> Bool =
 fn in_view(terms: Terms, t: Int) -> Bool / {abort.raise} = seen_whole(terms, t, size(terms))
 
 /// A term's arguments are made before it, so no chain of them is longer than the store.
-fn seen_whole(terms: Terms, t: Int, room: Int) -> Bool / {abort.raise} =
-  if room <= 0 { false } else {
+fn seen_whole(terms: Terms, t: Int, depth_left: Int) -> Bool / {abort.raise} =
+  if depth_left <= 0 { false } else {
     match node(terms, t) {
-      TInt(_) -> true,
-      TBool(_) -> true,
-      TStr(_) -> true,
-      TDecimal(_) -> true,
-      TFloat(_) -> true,
-      TFixed(_, _, _) -> true,
-      TUnit -> true,
-      TClosure(_) -> true,
-      TNil -> true,
-      TCons(c) -> seen_whole(terms, c.tail, room - 1),
-      TCtor(c) -> c.args.fold(true, |all: Bool, a: Int| all && seen_whole(terms, a, room - 1)),
+      IntTerm(_) -> true,
+      BoolTerm(_) -> true,
+      StringTerm(_) -> true,
+      DecimalTerm(_) -> true,
+      FloatTerm(_) -> true,
+      FixedTerm(_, _, _) -> true,
+      UnitTerm -> true,
+      ClosureTerm(_) -> true,
+      NilTerm -> true,
+      ConsTerm(c) -> seen_whole(terms, c.tail, depth_left - 1),
+      ConstructorTerm(c) ->
+        c.args.fold(true, |all: Bool, a: Int| all && seen_whole(terms, a, depth_left - 1)),
       _ -> false,
     }
   }
@@ -2496,63 +2607,72 @@ fn seen_whole(terms: Terms, t: Int, room: Int) -> Bool / {abort.raise} =
 fn block(
   lowering: Lowering,
   context: Context,
-  stmts: List<CodeStmt>,
+  statements: List<CodeStatement>,
   tail: Option<Code>,
   unfolds: Int,
-) -> L / {abort.raise} = {
-  let after = stmts.fold(lowering, |acc: Lowering, st: CodeStmt|
+) -> LoweredTerm / {abort.raise} = {
+  let after = statements.fold(lowering, |acc: Lowering, st: CodeStatement|
     match st {
-      CLet(l) -> {
+      CodeLet(l) -> {
         let r = lower(acc, context, l.value, unfolds);
         bind(r.lowering, l.slot, r.id)
       },
-      CLetPat(l) -> match l.pat {
-        PxWild -> lower(acc, context, l.value, unfolds).lowering,
-        PxVar(v) -> {
+      CodeLetDestructure(l) -> match l.pattern {
+        CodeWildcardPattern -> lower(acc, context, l.value, unfolds).lowering,
+        CodeBindingPattern(v) -> {
           let r = lower(acc, context, l.value, unfolds);
           {
             let s = v.slot;
             bind(r.lowering, s, r.id)
           }
         },
-        pat -> {
+        pattern -> {
           let r = lower(acc, context, l.value, unfolds);
-          match destructured(r.lowering, pat, r.id) {
+          match destructured(r.lowering, pattern, r.id) {
             Some(bound) -> bound,
-            None -> { bind_opaque(blocked(undefined(r.lowering), DestructuringLet), pat) },
+            None -> {
+              bind_opaque(add_blocker(require_unreachable(r.lowering), DestructuringLet), pattern)
+            },
           }
         },
       },
       // A statement run for its effect adds nothing a claim's value is made of, but owes what it owes.
-      CDo(d) -> lower(acc, context, d.code, unfolds).lowering,
+      CodeDo(d) -> lower(acc, context, d.code, unfolds).lowering,
     });
-  match tail { Some(t) -> lower(after, context, t, unfolds), None -> on(after, unit(after.terms)) }
+  match tail {
+    Some(t) -> lower(after, context, t, unfolds),
+    None -> lift(after, unit(after.terms)),
+  }
 }
 
 /// A record pattern's names bound to the fields they read, at any depth; none for a pattern that can
 /// miss.
-fn destructured(lowering: Lowering, pat: CodePattern, t: Int) -> Option<Lowering> / {abort.raise} =
-  match pat {
-    PxWild -> Some(lowering),
-    PxVar(v) -> {
+fn destructured(
+  lowering: Lowering,
+  pattern: CodePattern,
+  t: Int,
+) -> Option<Lowering> / {abort.raise} =
+  match pattern {
+    CodeWildcardPattern -> Some(lowering),
+    CodeBindingPattern(v) -> {
       let slot = v.slot;
       Some(bind(lowering, slot, t))
     },
-    PxRecord(r) ->
+    CodeRecordPattern(r) ->
       r.fields.fold(Some(lowering), |acc: Option<Lowering>, f: CodePatternField|
         match acc {
           None -> None,
           Some(lw) -> {
             let read = field(lw.terms, t, String::of_bytes_lossy(f.name));
-            destructured(with_terms(lw, read.terms), f.pat, read.id)
+            destructured(with_terms(lw, read.terms), f.pattern, read.id)
           },
         }),
     _ -> None,
   }
 
-fn bind_opaque(lowering: Lowering, pat: CodePattern) -> Lowering / {abort.raise} =
-  pattern_slots(pat).fold(lowering, |acc: Lowering, slot: Int| {
-    let t = sym(acc.terms, None);
+fn bind_opaque(lowering: Lowering, pattern: CodePattern) -> Lowering / {abort.raise} =
+  pattern_slots(pattern).fold(lowering, |acc: Lowering, slot: Int| {
+    let t = symbol(acc.terms, None);
     bind(with_terms(acc, t.terms), slot, t.id)
   })
 
@@ -2564,7 +2684,7 @@ fn pattern_slots(p: CodePattern) -> List<Int> / {abort.raise} =
       Some(top) -> {
         let rest = s.stack.take(s.stack.len() - 1);
         Continue(match top {
-          PxVar(v) ->
+          CodeBindingPattern(v) ->
             {
               stack: rest,
               out: {
@@ -2572,18 +2692,18 @@ fn pattern_slots(p: CodePattern) -> List<Int> / {abort.raise} =
                 s.out.push(slot)
               },
             },
-          PxCtor(c) ->
+          CodeConstructorPattern(c) ->
             {
               stack: c.args.fold(rest, |acc: List<CodePattern>, a: CodePattern| acc.push(a)),
               out: s.out,
             },
-          PxRecord(r) ->
+          CodeRecordPattern(r) ->
             {
               stack: r.fields.fold(rest, |acc: List<CodePattern>, f: CodePatternField|
-                acc.push(f.pat)),
+                acc.push(f.pattern)),
               out: s.out,
             },
-          PxList(l) -> {
+          CodeListPattern(l) -> {
             let items = l.items.fold(rest, |acc: List<CodePattern>, a: CodePattern| acc.push(a));
             { stack: match l.rest { Some(r) -> items.push(r), None -> items }, out: s.out }
           },
@@ -2592,27 +2712,27 @@ fn pattern_slots(p: CodePattern) -> List<Int> / {abort.raise} =
       },
     }).out
 
-fn match_expr(
+fn match_expression(
   lowering: Lowering,
   context: Context,
   scrutinee: Code,
   arms: List<CodeArm>,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let s = lower(lowering, context, scrutinee, unfolds);
   let s_sort = sort_of(s.lowering.terms, s.id);
   match taken_in_view(s.lowering, context, s.id, arms) {
     Some(arm) -> {
-      let entered = match arm.pat {
-        PxRecord(_) -> match destructured(s.lowering, arm.pat, s.id) {
+      let entered = match arm.pattern {
+        CodeRecordPattern(_) -> match destructured(s.lowering, arm.pattern, s.id) {
           Some(bound) -> bound,
           None -> s.lowering,
         },
-        PxCtor(c) -> match node(s.lowering.terms, s.id) {
-          TCtor(k) ->
+        CodeConstructorPattern(c) -> match node(s.lowering.terms, s.id) {
+          ConstructorTerm(k) ->
             range(0, c.args.len()).fold(s.lowering, |acc: Lowering, i: Int|
               match ((c.args.at(i), k.args.at(i))) {
-                (Some(PxVar(v)), Some(field)) -> {
+                (Some(CodeBindingPattern(v)), Some(field)) -> {
                   let slot = v.slot;
                   bind(acc, slot, field)
                 },
@@ -2620,7 +2740,7 @@ fn match_expr(
               }),
           _ -> s.lowering,
         },
-        _ -> match arm_shape(s.lowering, context, arm.pat, s.id, s_sort) {
+        _ -> match arm_shape(s.lowering, context, arm.pattern, s.id, s_sort) {
           Some(shaped) -> shaped.lowering,
           None -> s.lowering,
         },
@@ -2646,7 +2766,7 @@ fn taken_in_view(
       if acc.open || acc.arm != None { acc } else {
         match a.guard {
           Some(_) -> { arm: None, open: true },
-          None -> match fits(lowering, context, a.pat, scrutinee) {
+          None -> match fits(lowering, context, a.pattern, scrutinee) {
             Some(true) -> { arm: Some(a), open: false },
             Some(false) -> acc,
             None -> { arm: None, open: true },
@@ -2665,65 +2785,66 @@ fn fits(
   t: Int,
 ) -> Option<Bool> / {abort.raise} =
   match p {
-    PxWild -> Some(true),
-    PxVar(_) -> Some(true),
-    PxLit(l) -> if !is_literal(lowering.terms, t) || !identity_literal(l) { None }
+    CodeWildcardPattern -> Some(true),
+    CodeBindingPattern(_) -> Some(true),
+    CodeLiteralPattern(l) -> if !is_literal(lowering.terms, t) || !identity_literal(l) { None }
     else { Some(literal(lowering, l).id == t) },
-    PxRange(_) -> None,
-    PxCtor(c) -> match node(lowering.terms, t) {
-      TCtor(k) -> if k.name != String::of_bytes_lossy(c.name) { Some(false) }
+    CodeRangePattern(_) -> None,
+    CodeConstructorPattern(c) -> match node(lowering.terms, t) {
+      ConstructorTerm(k) -> if k.name != String::of_bytes_lossy(c.name) { Some(false) }
       else if k.args.len() == c.args.len()
           && c.args.fold(true, |ok: Bool, a: CodePattern| ok && irrefutable(a)) { Some(true) }
       else { None },
       _ -> None,
     },
-    PxList(l) -> if !l.items.fold(true, |ok: Bool, a: CodePattern| ok && irrefutable(a))
+    CodeListPattern(l) -> if !l.items.fold(true, |ok: Bool, a: CodePattern| ok && irrefutable(a))
         || !(match l.rest { Some(r) -> irrefutable(r), None -> true }) { None } else {
       let s = spine(lowering.terms, t);
-      let ended = match node(lowering.terms, s.end) { TNil -> true, _ -> false };
+      let ended = match node(lowering.terms, s.end) { NilTerm -> true, _ -> false };
       if s.heads.len() < l.items.len() { if ended { Some(false) } else { None } }
       else if l.rest != None { Some(true) }
       else if s.heads.len() > l.items.len() { Some(false) }
       else if ended { Some(true) }
       else { None }
     },
-    PxRecord(_) -> if irrefutable(p) { Some(true) } else { None },
+    CodeRecordPattern(_) -> if irrefutable(p) { Some(true) } else { None },
   }
 
-fn identity_literal(l: Lit) -> Bool = match l { LFloat(_) -> false, LDec(_) -> false, _ -> true }
+fn identity_literal(l: SourceLiteral) -> Bool =
+  match l { LiteralFloat(_) -> false, LiteralDecimal(_) -> false, _ -> true }
 
 fn is_literal(terms: Terms, t: Int) -> Bool / {abort.raise} =
   match node(terms, t) {
-    TInt(_) -> true,
-    TBool(_) -> true,
-    TStr(_) -> true,
-    TDecimal(_) -> true,
-    TFloat(_) -> true,
-    TFixed(_, _, _) -> true,
-    TUnit -> true,
+    IntTerm(_) -> true,
+    BoolTerm(_) -> true,
+    StringTerm(_) -> true,
+    DecimalTerm(_) -> true,
+    FloatTerm(_) -> true,
+    FixedTerm(_, _, _) -> true,
+    UnitTerm -> true,
     _ -> false,
   }
 
 fn arms_of(
-  s: L,
-  s_sort: Option<Ty>,
+  s: LoweredTerm,
+  s_sort: Option<Sort>,
   context: Context,
   arms: List<CodeArm>,
   unfolds: Int,
-) -> L / {abort.raise} = {
+) -> LoweredTerm / {abort.raise} = {
   let walked = arms.fold(
     { lowering: s.lowering, arms: [], sort: None },
-    |acc: { lowering: Lowering, arms: List<Arm>, sort: Option<Ty> }, a: CodeArm| {
+    |acc: { lowering: Lowering, arms: List<Arm>, sort: Option<Sort> }, a: CodeArm| {
       // What a guard admits is not modelled, so a guarded arm is never known to be taken.
       let shaped = match a.guard {
         Some(_) -> None,
-        None -> arm_shape(acc.lowering, context, a.pat, s.id, s_sort),
+        None -> arm_shape(acc.lowering, context, a.pattern, s.id, s_sort),
       };
       let tested = match shaped {
         Some(sh) -> sh,
         None ->
           {
-            lowering: bind_opaque(blocked(acc.lowering, UndecidableMatchArm), a.pat),
+            lowering: bind_opaque(add_blocker(acc.lowering, UndecidableMatchArm), a.pattern),
             test: Undecidable,
             binds: [],
           },
@@ -2738,24 +2859,29 @@ fn arms_of(
         TestList(t) -> {
           let empty = nil(guarded.terms, s_sort);
           let at_nil = eq(empty.terms, s.id, empty.id);
-          if t.fixed == 0 && !t.rest { Some(on(guarded, at_nil)) }
-          else { Some(on(guarded, not(at_nil.terms, at_nil.id))) }
+          if t.fixed == 0 && !t.rest { Some(lift(guarded, at_nil)) }
+          else { Some(lift(guarded, not(at_nil.terms, at_nil.id))) }
         },
-        TestCtor(name) -> {
+        TestConstructor(name) -> {
           let at = match ctor(context, name) {
-            Some(c) -> surer(s_sort, ctor_result_sort(c, tested.binds, guarded.terms)),
+            Some(c) ->
+              more_specific_sort(s_sort, constructor_result_sort(c, tested.binds, guarded.terms)),
             None -> s_sort,
           };
-          let built = mk(guarded.terms, TCtor({ name: name, args: tested.binds }), at);
-          Some(on(guarded, eq(built.terms, s.id, built.id)))
+          let built = intern(
+            guarded.terms,
+            ConstructorTerm({ name: name, args: tested.binds }),
+            at,
+          );
+          Some(lift(guarded, eq(built.terms, s.id, built.id)))
         },
-        TestLit(literal) -> Some(on(guarded, eq(guarded.terms, s.id, literal))),
+        TestLiteral(literal) -> Some(lift(guarded, eq(guarded.terms, s.id, literal))),
         _ -> None,
       };
       let entered = match taken { Some(c) -> assume(c.lowering, c.id), None -> guarded };
       let body = lower(entered, context, a.body, unfolds);
-      let left = match taken { Some(_) -> popped(body.lowering), None -> body.lowering };
-      let sort = surer(acc.sort, sort_of(left.terms, body.id));
+      let left = match taken { Some(_) -> pop_assumption(body.lowering), None -> body.lowering };
+      let sort = more_specific_sort(acc.sort, sort_of(left.terms, body.id));
       {
         lowering: left,
         arms: acc.arms.push({ test: tested.test, binds: tested.binds, body: body.id }),
@@ -2763,22 +2889,22 @@ fn arms_of(
       }
     },
   );
-  on(
+  lift(
     walked.lowering,
-    mk(walked.lowering.terms, TMatch({ scrutinee: s.id, arms: walked.arms }), walked.sort),
+    intern(walked.lowering.terms, MatchTerm({ scrutinee: s.id, arms: walked.arms }), walked.sort),
   )
 }
 
 fn arm_shape(
   lowering: Lowering,
   context: Context,
-  pat: CodePattern,
+  pattern: CodePattern,
   scrutinee: Int,
-  s_sort: Option<Ty>,
+  s_sort: Option<Sort>,
 ) -> Option<{ lowering: Lowering, test: ArmTest, binds: List<Int> }> / {abort.raise} =
-  match pat {
-    PxWild -> Some({ lowering: lowering, test: Always, binds: [] }),
-    PxVar(v) ->
+  match pattern {
+    CodeWildcardPattern -> Some({ lowering: lowering, test: Always, binds: [] }),
+    CodeBindingPattern(v) ->
       Some({
         lowering: {
           let slot = v.slot;
@@ -2788,12 +2914,12 @@ fn arm_shape(
         binds: [],
       }),
     // A `Float` or `Decimal` pattern matches by `==`, which is no test of identity.
-    PxLit(l) -> if !identity_literal(l) { None } else {
+    CodeLiteralPattern(l) -> if !identity_literal(l) { None } else {
       let t = literal(lowering, l);
-      Some({ lowering: t.lowering, test: TestLit(t.id), binds: [] })
+      Some({ lowering: t.lowering, test: TestLiteral(t.id), binds: [] })
     },
-    PxRange(_) -> None,
-    PxCtor(c) -> match ctor(context, String::of_bytes_lossy(c.name)) {
+    CodeRangePattern(_) -> None,
+    CodeConstructorPattern(c) -> match ctor(context, String::of_bytes_lossy(c.name)) {
       None -> None,
       Some(k) -> if arity(k) != c.args.len()
           || !c.args.fold(true, |ok: Bool, a: CodePattern| ok && irrefutable(a)) { None } else {
@@ -2801,10 +2927,10 @@ fn arm_shape(
         let bound = range(0, c.args.len()).fold(
           { lowering: lowering, binds: [] },
           |acc: { lowering: Lowering, binds: List<Int> }, i: Int| {
-            let f = sym(acc.lowering.terms, match sorts.at(i) { Some(s) -> s, None -> None });
+            let f = symbol(acc.lowering.terms, match sorts.at(i) { Some(s) -> s, None -> None });
             let lw2 = with_terms(acc.lowering, f.terms);
             let lw3 = match c.args.at(i) {
-              Some(PxVar(v)) -> {
+              Some(CodeBindingPattern(v)) -> {
                 let slot = v.slot;
                 bind(lw2, slot, f.id)
               },
@@ -2815,16 +2941,16 @@ fn arm_shape(
         );
         Some({
           lowering: bound.lowering,
-          test: TestCtor(String::of_bytes_lossy(c.name)),
+          test: TestConstructor(String::of_bytes_lossy(c.name)),
           binds: bound.binds,
         })
       },
     },
-    PxList(l) -> {
+    CodeListPattern(l) -> {
       let simple = l.items.fold(true, |ok: Bool, a: CodePattern| ok && irrefutable(a))
         && (match l.rest { Some(r) -> irrefutable(r), None -> true });
       if !simple { None } else {
-        let elem = match s_sort { Some(s) -> list_elem(s), None -> None };
+        let elem = match s_sort { Some(s) -> list_element(s), None -> None };
         // A spine in view binds its own heads and tail, so a call over the tail is the same term
         // wherever the tail is named; a symbol gets fresh fields.
         let heads = l.items.fold(
@@ -2832,19 +2958,19 @@ fn arm_shape(
           |acc: { lowering: Lowering, at: Option<Int>, binds: List<Int> }, item: CodePattern| {
             let stepped = match acc.at {
               Some(t) -> match node(acc.lowering.terms, t) {
-                TCons(c) -> { lowering: acc.lowering, at: Some(c.tail), field: c.head },
+                ConsTerm(c) -> { lowering: acc.lowering, at: Some(c.tail), field: c.head },
                 _ -> {
-                  let f = sym(acc.lowering.terms, elem);
+                  let f = symbol(acc.lowering.terms, elem);
                   { lowering: with_terms(acc.lowering, f.terms), at: None, field: f.id }
                 },
               },
               None -> {
-                let f = sym(acc.lowering.terms, elem);
+                let f = symbol(acc.lowering.terms, elem);
                 { lowering: with_terms(acc.lowering, f.terms), at: None, field: f.id }
               },
             };
             let lw2 = match item {
-              PxVar(v) -> {
+              CodeBindingPattern(v) -> {
                 let slot = v.slot;
                 bind(stepped.lowering, slot, stepped.field)
               },
@@ -2858,16 +2984,16 @@ fn arm_shape(
           Some(r) -> {
             let tail = match heads.at {
               Some(t) -> { lowering: heads.lowering, id: t },
-              None -> on(heads.lowering, sym(heads.lowering.terms, s_sort)),
+              None -> lift(heads.lowering, symbol(heads.lowering.terms, s_sort)),
             };
             let lw2 = if tail.id != scrutinee {
               {
                 ..tail.lowering,
-                smaller: tail.lowering.smaller.push({ tail: tail.id, from: scrutinee }),
+                list_tails: tail.lowering.list_tails.push({ tail: tail.id, from: scrutinee }),
               }
             } else { tail.lowering };
             let lw3 = match r {
-              PxVar(v) -> {
+              CodeBindingPattern(v) -> {
                 let slot = v.slot;
                 bind(lw2, slot, tail.id)
               },
@@ -2883,36 +3009,43 @@ fn arm_shape(
         })
       }
     },
-    PxRecord(_) -> match destructured(lowering, pat, scrutinee) {
+    CodeRecordPattern(_) -> match destructured(lowering, pattern, scrutinee) {
       Some(bound) -> Some({ lowering: bound, test: Always, binds: [] }),
       None -> None,
     },
   }
 
 /// A constructor's fields, instantiated against the scrutinee's sort when it is known.
-pub fn field_sorts(c: Ctor, sort: Option<Ty>) -> List<Option<Ty>> = {
+pub fn field_sorts(c: Constructor, sort: Option<Sort>) -> List<Option<Sort>> = {
   let args = match sort {
-    Some(Con(name, xs)) -> if name == c.decl.name && xs.len() == c.decl.params { xs }
-    else { range(0, c.decl.params).map(|p: Int| foreign(Var(p))) },
-    _ -> range(0, c.decl.params).map(|p: Int| foreign(Var(p))),
+    Some(NamedSort(name, xs)) -> if name == c.declaration.name && xs.len() == c.declaration.params {
+      xs
+    } else { range(0, c.declaration.params).map(|p: Int| foreign(SortVariable(p))) },
+    _ -> range(0, c.declaration.params).map(|p: Int| foreign(SortVariable(p))),
   };
-  c.variant.fields.map(|f: Ty| Some(substituted(f, args)))
+  c.variant.fields.map(|f: Sort| Some(substituted(f, args)))
 }
 
-fn ctor_result_sort(c: Ctor, args: List<Int>, terms: Terms) -> Option<Ty> = {
-  let subst = range(0, c.variant.fields.len()).fold(Map::new(), |acc: Map<Int, Ty>, i: Int|
-    match c.variant.fields.at(i) {
-      Some(f) -> match args.at(i) {
-        Some(a) -> match sort_of(terms, a) { Some(actual) -> matched(f, actual, acc), None -> acc },
+fn constructor_result_sort(c: Constructor, args: List<Int>, terms: Terms) -> Option<Sort> = {
+  let substitution = range(0, c.variant.fields.len()).fold(
+    Map::new(),
+    |acc: Map<Int, Sort>, i: Int|
+      match c.variant.fields.at(i) {
+        Some(f) -> match args.at(i) {
+          Some(a) -> match sort_of(terms, a) {
+            Some(actual) -> matched(f, actual, acc),
+            None -> acc,
+          },
+          None -> acc,
+        },
         None -> acc,
       },
-      None -> acc,
-    });
+  );
   Some(
-    Con(
-      c.decl.name,
-      range(0, c.decl.params).map(|p: Int|
-        match subst.get(p) { Some(s) -> s, None -> foreign(Var(p)) }),
+    NamedSort(
+      c.declaration.name,
+      range(0, c.declaration.params).map(|p: Int|
+        match substitution.get(p) { Some(s) -> s, None -> foreign(SortVariable(p)) }),
     ),
   )
 }

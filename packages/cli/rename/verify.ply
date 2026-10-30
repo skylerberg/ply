@@ -1,9 +1,9 @@
 import std.fs (fs, Kind, Listed, File, Dir, Missing)
 import std.json (Bool)
-import paths (Resolved, absolute, child, displayed, kind, read_file)
+import paths (ResolvedPath, absolute, child, displayed, kind, read_file)
 import library
 import walk (Failure)
-import program (load_program, walked)
+import program (Parses, Unresolved, renamed_resolution)
 import diagnostic (errors_text)
 import builder (builder)
 import std.random (entropy)
@@ -11,23 +11,27 @@ import std.time (time)
 import compiler.cc (toolchain)
 import compiler.load (Derives)
 import compiler.unit (shipped)
-import compiler.front.facts (Analysis)
-import compiler.front.seam (Refused, Analysed)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, ValueSpace, EffectSpace)
+import compiler.front (ShippedInputs)
+import compiler.check.resolve.defaults (ResolvedProgram)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label, Declaration,
+                                      ValueSpace, EffectSpace, space, module_of_name)
+import compiler.check.member (MemberTarget, CallsFunction)
 import compiler.check.resolve.bindings (Reference, Refers, Local, Definition, Operation, Module,
                                         Unbound)
-import compiler.check.member (MemberTarget, CallsFunction)
 import compiler.syntax.items (parse, Module)
 import compiler.syntax.parsing (is_made)
-import compiler.syntax.sites (numbered_module)
+import compiler.syntax.node_ids (numbered_module)
 import rename.lines (renamed, shown)
 import rename.strings (line_at)
-import rename.programs (Entry, Loaded, Read, DefinitionKey, calls_of, entries_of, indices_of,
-                        key_of)
+import rename.programs (Entry, Loaded, Read, DefinitionKey, entries_of, indices_of, key_of, name_in)
 import rename.edits (Renaming, move_of, moved_name, qualified_after)
 
-fn modules_after(rn: Renaming, l: Loaded, after: Analysis) -> Map<Bytes, Int> / {abort.raise} = {
-  let index = indices_of(after.mods.map(|m: ParsedModule| m.name));
+fn modules_after(
+  rn: Renaming,
+  l: Loaded,
+  after: ResolvedProgram,
+) -> Map<Bytes, Int> / {abort.raise} = {
+  let index = indices_of(after.modules.map(|m: ParsedModule| m.name));
   range(0, l.names.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int| {
     let old = l.names.get(i);
     match index.get(moved_name(old, move_of(rn, l, i))) {
@@ -68,7 +72,7 @@ fn mapped(
 fn moved_failure(r: Read, x: Reference) -> Failure / {abort.raise} =
   {
     path: displayed(r.file.at) ++ ":" ++ line_at(r.file.text, x.start).to_string(),
-    why: shown(x.name) ++ " would refer to something else after the renames",
+    reason: shown(x.name) ++ " would refer to something else after the renames",
   }
 
 fn entry_failures(
@@ -79,7 +83,6 @@ fn entry_failures(
   imports: Bool,
   before: Entry,
   now: Entry,
-  calls: Map<Bytes, Map<Int, MemberTarget>>,
 ) -> List<Failure> / {abort.raise} = {
   let refs = before.names.references;
   let wrong = if imports {
@@ -92,53 +95,34 @@ fn entry_failures(
     refs.filter(|x: Reference|
       !is_made(x.site) && by_site.get(x.site) != Some(mapped(rn, l, modules, x.refers)))
   };
-  let was = r.calls.get(before.owner).unwrap_or(Map::new());
-  let is = calls.get(now.owner).unwrap_or(Map::new());
-  let retargeted = was.fold(0, |n: Int, site: Int, target: MemberTarget| {
-    let expected = match target {
-      CallsFunction(c) -> CallsFunction(qualified_after(rn, l, ValueSpace, c)),
-      other -> other,
-    };
-    if is.get(site) == Some(expected) { n } else { n + 1 }
-  });
-  wrong.map(|x: Reference| moved_failure(r, x)).concat(if retargeted == 0 { [] } else {
-    [
-      {
-        path: displayed(r.file.at),
-        why: "a call on a value in `" ++ String::of_bytes_lossy(before.owner)
-          ++ "` would call another function after the renames",
-      },
-    ]
-  })
+  wrong.map(|x: Reference| moved_failure(r, x))
 }
 
 fn compared(
   rn: Renaming,
   l: Loaded,
-  after: Analysis,
+  after: ResolvedProgram,
   texts: Map<String, Bytes>,
 ) -> List<Failure> / {abort.raise} = {
   let modules = modules_after(rn, l, after);
-  l.reads.fold([], |acc: List<Failure>, r: Read|
-    match ((modules.get(r.name), texts.get(absolute(rn.pwd, r.file.at)))) {
-      (Some(j), Some(text)) -> {
+  l.reads.concat(l.unrenamed).fold([], |acc: List<Failure>, r: Read|
+    match modules.get(r.name) {
+      Some(j) -> {
+        let text = texts.get(absolute(rn.pwd, r.file.at)).unwrap_or(r.file.text);
         let now = entries_of(
-          after,
+          after.r,
           j,
           moved_name(r.name, rn.modules.get(absolute(rn.pwd, r.file.at))),
           numbered_module(parse(text).node),
         );
-        let calls = calls_of(after, j);
         if now.len() != r.entries.len() {
-          acc.push({ path: displayed(r.file.at), why: "would no longer parse as it did" })
+          acc.push({ path: displayed(r.file.at), reason: "would no longer parse as it did" })
         } else {
           range(0, now.len()).fold(acc, |found: List<Failure>, k: Int|
-            found.concat(
-              entry_failures(rn, l, modules, r, k == 0, r.entries.get(k), now.get(k), calls),
-            ))
+            found.concat(entry_failures(rn, l, modules, r, k == 0, r.entries.get(k), now.get(k))))
         }
       },
-      _ -> acc,
+      None -> acc,
     })
 }
 
@@ -150,7 +134,6 @@ pub fn key(r: Renamed, label: String, path: String) -> String / {abort.raise} =
 fn renamed_kind(r: Renamed, label: String, path: String, was: Kind) -> Kind / {abort.raise} =
   kind_renamed(r, key(r, label, path), was)
 
-/// What the path keyed `at` names once the rename is written, where it named `was`.
 fn kind_renamed(r: Renamed, at: String, was: Kind) -> Kind =
   if r.texts.contains(at) { File }
   else if r.gone.contains(at) { Missing }
@@ -208,14 +191,14 @@ fn over_renamed<a | e>(
 }
 
 fn renamed_library(
-  path: Resolved,
+  path: ResolvedPath,
   texts: Map<Bytes, Source>,
-) -> Option<List<library::Shipping>> / {fs.resolved[abs], fs.read_file[abs], fs.read[abs], abort.raise} =
-  match library::checkout_holding(path.absolute) {
+) -> Option<List<library::ShippedFile>> / {fs.resolved_kind[abs], fs.read_file[abs], fs.read[abs], abort.raise} =
+  match library::enclosing_checkout(path.absolute) {
     None -> None,
     Some(c) ->
       Some(
-        library::shipping(c).map(|f: library::Shipping|
+        library::shipped_files(c).map(|f: library::ShippedFile|
           if !f.name.ends_with(".ply") { f } else {
             match texts.get(Bytes::of_string(f.name.slice(0, f.name.len() - 4))) {
               Some(t) -> { ..f, name: String::of_bytes_lossy(t.name) ++ ".ply", bytes: t.src },
@@ -225,28 +208,117 @@ fn renamed_library(
       ),
   }
 
+fn by_new_name(
+  rn: Renaming,
+  l: Loaded,
+) -> Map<Bytes, List<{ module: Int, old: Bytes }>> / {abort.raise} =
+  range(0, l.declarations.len()).fold(
+    Map::new(),
+    |acc: Map<Bytes, List<{ module: Int, old: Bytes }>>, j: Int|
+      space(l.declarations.get(j), ValueSpace).fold(
+        acc,
+        |into: Map<Bytes, List<{ module: Int, old: Bytes }>>, d: Declaration| {
+          let new = match l.module_files.at(j) {
+            Some(Some(file)) ->
+              rn.definitions.values.get({ file: file, name: d.name }).unwrap_or(d.name),
+            _ -> d.name,
+          };
+          into.insert(new, into.get(new).unwrap_or([]).push({ module: j, old: d.name }))
+        },
+      ),
+  )
+
+pub fn retargeted_calls(rn: Renaming, loads: List<Loaded>) -> List<Failure> / {abort.raise} =
+  loads.fold([], |acc: List<Failure>, l: Loaded| {
+    let named = by_new_name(rn, l);
+    let captured = |seen: Map<Int, Bool>, target: MemberTarget|
+      match target {
+        CallsFunction(c) -> {
+          let old = name_in(module_of_name(c), c);
+          let new = key_of(l, c).and_then(|k: DefinitionKey|
+            rn.definitions.values.get(k)).unwrap_or(
+            old,
+          );
+          named.get(new).unwrap_or([]).any(|d: { module: Int, old: Bytes }|
+            d.old != old && seen.contains(d.module))
+        },
+        _ -> false,
+      };
+    l.reads.concat(l.unrenamed).fold(acc, |found: List<Failure>, r: Read| {
+      let seen = l.visible_modules.get(r.index).fold(Map::new(), |m: Map<Int, Bool>, j: Int|
+        m.insert(j, true));
+      r.calls.fold(found, |f: List<Failure>, owner: Bytes, sites: Map<Int, MemberTarget>|
+        if sites.values().any(|t: MemberTarget| captured(seen, t)) {
+          f.push({
+            path: displayed(r.file.at),
+            reason: "a call on a value in `" ++ String::of_bytes_lossy(owner)
+              ++ "` could call another function after the renames",
+          })
+        } else { f })
+    })
+  })
+
+fn unresolved_failures(rn: Renaming, l: Loaded, u: Unresolved) -> List<Failure> / {abort.raise} = {
+  let paths = l.reads.concat(l.unrenamed).fold(Map::new(), |acc: Map<Bytes, String>, r: Read| {
+    let move = rn.modules.get(absolute(rn.pwd, r.file.at));
+    acc.insert(
+      moved_name(r.name, move),
+      displayed(match move { Some(m) -> m.to, None -> r.file.at }),
+    )
+  });
+  u.diagnostics.filter(|d: Diagnostic| d.severity == b"error").map(|d: Diagnostic| {
+    let place = d.labels.find(|x: Label| x.primary).and_then(|x: Label|
+      u.modules.at(x.module).map(|m: Source|
+        paths.get(m.name).unwrap_or(String::of_bytes_lossy(m.name)) ++ ":"
+          ++ line_at(m.src, x.start).to_string()));
+    {
+      path: place.unwrap_or(l.root),
+      reason: errors_text([d])
+        ++ String::join(d.notes_text.map(|note: Bytes| "; " ++ String::of_bytes_lossy(note)), ""),
+    }
+  })
+}
+
+fn renamed_shipping(
+  l: Loaded,
+  library: Map<Bytes, Source>,
+  files: Option<List<library::ShippedFile>>,
+) -> ShippedInputs / {abort.raise} =
+  {
+    read: match files {
+      None -> l.shipping.read,
+      Some(listed) ->
+        listed.filter(|f: library::ShippedFile| f.name.ends_with(".ply")).map(
+          |f: library::ShippedFile|
+            { name: Bytes::of_string(f.name.slice(0, f.name.len() - 4)), src: f.bytes },
+        ),
+    },
+    unread: [],
+    data: l.shipping.data,
+    asked: l.shipping.asked.map(|name: Bytes|
+      match library.get(name) { Some(s) -> s.name, None -> name }),
+    pulls: [],
+  }
+
 pub fn verified(
   rn: Renaming,
   l: Loaded,
   library: Map<Bytes, Source>,
   texts: Map<String, Bytes>,
   renamed: Renamed,
-) -> List<Failure> / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  parses: Parses,
+) -> { failures: List<Failure>, parses: Parses } / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let files = renamed_library(l.path, library);
   let checked = ||
     over_renamed(renamed, || {
-      let program = load_program([l.path], false);
-      let refused = |ds: List<Diag>|
-        [{ path: l.root, why: "would not check after the renames: " ++ errors_text(ds) }];
-      match program.frame {
-        None -> refused(program.diags),
-        Some(_) -> match walked(program).out {
-          Refused(ds) -> refused(ds),
-          Analysed(after) -> compared(rn, l, after, texts),
+      let after = renamed_resolution([l.path], renamed_shipping(l, library, files), parses);
+      {
+        failures: match after.resolved {
+          Err(u) -> unresolved_failures(rn, l, u),
+          Ok(program) -> compared(rn, l, program, texts),
         },
+        parses: after.parses,
       }
     });
-  match renamed_library(l.path, library) {
-    Some(files) -> library::over_shipping(files, checked),
-    None -> checked(),
-  }
+  match files { Some(listed) -> library::with_shipped_files(listed, checked), None -> checked() }
 }

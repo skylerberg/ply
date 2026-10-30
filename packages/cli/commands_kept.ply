@@ -1,6 +1,3 @@
-//! Tests of a command's result stored and reused through `queried`, over loads checked in process
-//! by a toolchain that ships only `std.prelude` and no pack.
-
 import std.fs
 import std.fs (fs)
 import std.hash (blake3)
@@ -9,20 +6,19 @@ import compiler.prelude_source
 import compiler.store.hash.encoding (hex)
 import compiler.load (Derives, deriving_nothing)
 import compiler.unit (shipped)
-import compiler.front.checking.world (Answering)
+import compiler.front.checking.world (QueryEffects)
 import compiler.front.checking.groups (queries)
-import compiler.store.memo (Tally)
+import compiler.store.memo (QueryStats)
 import builder (builder)
-import queried
+import module_queries
 import sources
 import sources (Project)
 import paths
 
-/// Each query's definition under a hash of its name, a `name hash` line each.
 fn listed() -> Bytes / {abort.raise} =
   Bytes::concat_all(
     queries().map(
-      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {Answering, abort.raise} }|
+      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
         Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"]),
     ),
   )
@@ -33,11 +29,9 @@ fn shipped_file(name: String) -> Option<Bytes> / {abort.raise} =
   else if name == "std.prelude.ply" { Some(prelude_source::text()) }
   else { None }
 
-/// `go` over `tree` as the root `abs`, with an empty working directory and the toolchain of the
-/// tests.
 fn over<a>(
   tree: fs::MemFs,
-  go: () -> a / {fs.read[abs], fs.write[abs], fs.read[cwd], fs.write[cwd], fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, builder.git[vcs], Derives, abort.raise, diverges},
+  go: () -> a / {fs.read[abs], fs.write[abs], fs.read[cwd], fs.write[cwd], fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, builder.git[vcs], Derives, abort.raise, diverges},
 ) -> fs::Over<a> / {abort.raise, diverges} =
   fs::on_mem[abs](tree, ||
     fs::on_mem[cwd](fs::mem_empty(), ||
@@ -47,15 +41,15 @@ fn over<a>(
         } with {
           fs.list_dir[shipped](p) -> Some([{ name: "std.prelude.ply", kind: fs::File }]),
           fs.read_file[shipped](p) -> shipped_file(p),
-          shipped.answer(path, offset, len) -> None,
+          shipped.read_pack(path, offset, len) -> None,
           shipped.names() -> ["std.prelude"],
           shipped.module(name) -> if name == "std.prelude" { Some(prelude_source::text()) }
           else { None },
-          shipped.reached(view, pulled) -> (),
+          shipped.report_reached(view, pulled) -> (),
           shipped.definitions() -> listed(),
           shipped.runtime() -> panic("a test's load names no library deriver"),
           shipped.digests() -> b"",
-          shipped.entered(library, root, arguments, timeout_ms) ->
+          shipped.run_root(library, root, arguments, timeout_ms) ->
             panic("a test's load names no library deriver"),
           builder.git[vcs](root, key) -> None,
         })).value)
@@ -73,7 +67,6 @@ fn dependency(name: String, path: String) -> String =
     ++ path
     ++ "\")}"
 
-/// The files of a package at `app` that depends on one at `lib`, beside it.
 fn packages(lib: String) -> List<{ path: String, body: Bytes }> =
   [
     { path: "app/ply.pkg", body: manifest("app", [dependency("lib", "../" ++ lib)]) },
@@ -82,15 +75,13 @@ fn packages(lib: String) -> List<{ path: String, body: Bytes }> =
     { path: lib ++ "/util.ply", body: b"pub fn one() -> Int = 1\n" },
   ]
 
-/// The memo store beside the package at `app`.
 fn store() -> String = "app/.ply-cache/memo"
 
 fn load() -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} =
   sources::load_resolved([paths::at_abs("app")])
 
-fn ran_of(tallies: List<Tally>) -> Int = tallies.fold(0, |n: Int, t: Tally| n + t.ran)
+fn ran_of(tallies: List<QueryStats>) -> Int = tallies.fold(0, |n: Int, t: QueryStats| n + t.ran)
 
-/// How many bytes the segments of the store hold.
 fn store_bytes(tree: fs::MemFs) -> Int / {abort.raise} =
   (match fs::listed_names(fs::mem_list(tree, store())) { Some(names) -> names, None -> [] }).fold(
     0,
@@ -104,32 +95,30 @@ test "a command's answer is not taken back once a dependency of its load lies el
   let said = b"lib.one  /lib1/util.ply:1:1";
   let filed = over(fs::mem_of(packages("lib1")), || {
     let project = load();
-    let q = queried::answered[abs](store(), project);
+    let q = module_queries::query_through_store[abs](store(), project);
     {
-      kept: queried::keep_command[abs](
+      kept: module_queries::cache_command[abs](
         store(),
         project,
-        queried::command_key(queried::program(), b"defs"),
-        queried::program(),
+        module_queries::command_key(module_queries::program_digest(), b"defs"),
+        module_queries::program_digest(),
         q.asked,
         q.looked,
         said,
       ),
-      walk: [project.packages.len(), project.diags.len()],
+      walk: [project.packages.len(), project.diagnostics.len()],
     }
   });
-  // The walk read the dependency and refused nothing.
   assert_eq(filed.value.walk, [1, 0]);
   assert(filed.value.kept);
   let taken = |tree: fs::MemFs|
     over(tree, ||
-      queried::command_kept[abs](
+      module_queries::cached_command[abs](
         store(),
         load(),
-        queried::command_key(queried::program(), b"defs"),
+        module_queries::command_key(module_queries::program_digest(), b"defs"),
       )).value;
   assert_eq(taken(filed.tree), Some(said));
-  // The dependency moves, and the manifest names it where it lies now.
   let moved = packages("lib2").fold(
     fs::mem_create_dir(
       ["lib1/ply.pkg", "lib1/util.ply"].fold(filed.tree, |t: fs::MemFs, path: String|
@@ -144,23 +133,30 @@ test "a command's answer is not taken back once a dependency of its load lies el
 
 test "filing a command's answer keeps what its load answered through the merge the filing makes" {
   let first = over(fs::mem_of(packages("lib")), || {
-    let q = queried::answered[abs](store(), load());
+    let q = module_queries::query_through_store[abs](store(), load());
     { asked: q.asked, looked: q.looked, ran: ran_of(q.tallies) }
   });
   assert(first.value.ran > 0);
-  assert_eq(over(first.tree, || ran_of(queried::answered[abs](store(), load()).tallies)).value, 0);
-  // An answer of just over half what the store holds, so that filing it writes the whole store again.
+  assert_eq(
+    over(first.tree, ||
+      ran_of(module_queries::query_through_store[abs](store(), load()).tallies)).value,
+    0,
+  );
   let said = b"x".repeat(store_bytes(first.tree) * 51 / 100);
   let filed = over(first.tree, ||
-    queried::keep_command[abs](
+    module_queries::cache_command[abs](
       store(),
       load(),
-      queried::command_key(queried::program(), b"run"),
-      queried::program(),
+      module_queries::command_key(module_queries::program_digest(), b"run"),
+      module_queries::program_digest(),
       first.value.asked,
       first.value.looked,
       said,
     ));
   assert(filed.value);
-  assert_eq(over(filed.tree, || ran_of(queried::answered[abs](store(), load()).tallies)).value, 0)
+  assert_eq(
+    over(filed.tree, ||
+      ran_of(module_queries::query_through_store[abs](store(), load()).tallies)).value,
+    0,
+  )
 }

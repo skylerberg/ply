@@ -1,84 +1,41 @@
-//! Roots by value. A root is keyed by what it is: a definition, one at type arguments, an operation
-//! written for a type, a test, a law, a clause, a stored value or an entry. Its name is printed from
-//! the key, never read back into one.
-
-import compiler.check.types (Type, TyCon, TyFn, TyRecord, TyNominal, Field, Resource, RNamed,
-                             RSingleton, RVar, RAny, spelled_type, type_bin, resource_bin, int_type,
+import compiler.check.types (Type, NamedType, FunctionType, RecordType, NominalType, Field,
+                             Resource, NamedResource, SingletonResource, ResourceVariable,
+                             AnyResource, encode_type, type_bin, resource_bin, int_type,
                              string_type, list_type)
 import compiler.check.resolve.tables (qualify, module_of_name)
 import std.bin
 import std.bytes (ascii_of_int)
 import std.hash (blake3)
 
-/// A root. `Named` is a definition, by its qualified name. `At` is a definition at type arguments,
-/// running in place the lambdas `lent` names where it calls the parameters they are handed as, and
-/// at `rows`, what each of its scheme's row variables holds, in the scheme's order, where it has
-/// any: the words it is handed for each, a label in them its caller's (`Evidence`).
-/// `Written` is an operation written for a type, in the module that declares the type where its name
-/// is qualified, and otherwise in `home`, the module asking; its `marks` are the places in `ty` (0
-/// `ty` itself, then each argument's subtree in order) that stand for an operation's own type
-/// parameter, which a crossing hands over as a handle. `Test` is a test's run and `Cases` the root
-/// listing a test's cases; `Law` is a law's guard or body. A test and a law are told apart in their
-/// module by `digest`, their name's as `label_digest` gives it. `Clause` is the `n`th clause of its
-/// kind that definition `def` states. `Entered` is the entry the runtime enters a root through, its
-/// arguments and answer crossing as machine data. `Coded` is the one body a unit compiles for every
-/// specialisation of `def` whose code is `code`, a digest in hex of that code with the
-/// specialisation's own name taken out, so its name is the same whichever specialisations share it.
-/// `At` and `Written`, which spell types, carry the name they print as, which only this module's
-/// constructors make, so it is spelled once and never outlives a change.
 pub type RootKey =
   | Named(Bytes)
-  | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg>, rows: List<List<Evidence>> }, RootName)
-  | Written({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }, RootName)
+  | Specialisation({ definition: Bytes, args: List<KeyArg>, borrowed: List<InlinedLambda>, rows: List<List<Evidence>> }, RootName)
+  | Generated({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }, RootName)
   | Test({ module: Bytes, digest: Bytes })
-  | Cases(RootKey)
+  | TestCases(RootKey)
   | Law({ module: Bytes, digest: Bytes, part: LawPart })
-  | Clause({ def: RootKey, kind: ClauseKind, n: Int })
-  | Entered(RootKey)
-  | Coded({ def: Bytes, code: Bytes })
+  | Clause({ definition: RootKey, kind: ClauseKind, n: Int })
+  | EntryPoint(RootKey)
+  | Coded({ definition: Bytes, code: Bytes })
 
-/// A root of a law: its guard, or its body, the proposition the law states.
 pub type LawPart = | LawGuard | LawBody
 
-/// What a clause states of a definition: what it requires of a call, or ensures of what it answers.
 pub type ClauseKind = | Requires | Ensures
 
-/// A type argument a specialisation is keyed by: the type itself, where the body reads which type
-/// it is; or only the layout it is read at, `key` as `reps.layout_key` spells it, and `at` a type
-/// laid out so, which the body is lowered at. Keys differing only in `at` share a name and so a
-/// symbol, and every type laid out alike lowers alike: whatever dedupes, keeps or links
-/// specialisations reads one by its name.
 pub type KeyArg = | KeyType(Type) | KeyLayout({ key: Bytes, at: Type })
 
-/// A literal lambda handed as argument `param`: the `nth` its owner root lowers. Where the owner
-/// stands in its module is no part of it, so a body kept for a definition names the same lambda
-/// wherever the definition moves.
-pub type FnArg = { param: Int, owner: RootKey, nth: Int }
+pub type InlinedLambda = { param: Int, owner: RootKey, nth: Int }
 
-/// What one evidence word answers: an effect's operations on one resource, which one object serves
-/// whatever atoms of the effect a row names there. A label variable is a place: in a definition's
-/// own row, its label parameter's; in a key's rows, `RVar(k)` the `k`th label the caller hands the
-/// specialisation beside its words.
 pub type Evidence = { effect: Bytes, resource: Resource }
 
-/// An operation written per type. `Equal` and `Order` compare two values of the type; `Contained` is
-/// one of a container's walks (`equal`, `ordered`, their loops); `Dup` and `Release` count a value
-/// of the type once more and once fewer; `Cased` is `op` done to the box of the sum's case at place
-/// `case`, which a recursive sum holds its own type in; `Worded` is `op` taking and answering the
-/// type's word form, which the runtime calls through the type's descriptor; `Held` is `op` taking
-/// the value as a body holds it, in the words its type lays it in. `Stated` is one of the
-/// operations a `numeric` names a function for (`add`, `sub`, `mul`, `neg`, `of_int`), a call of
-/// that function. `Keeping` makes of a value the one its marked places kept, which a perform hands a
-/// program's clause, and `Opening` makes of one with those places kept the value they kept. `LetGo`
-/// lets go of a resource: its type's `release`, or each resource it holds.
 pub type TypeOp =
   | Equal
   | Order
-  | Stated(Bytes)
+  | NumericFunction(Bytes)
   | Reflect
-  | Shown
+  | Show
   | Digest
-  | Contained(Bytes)
+  | ContainerWalk(Bytes)
   | Drop
   | Share
   | Keep
@@ -87,109 +44,88 @@ pub type TypeOp =
   | Lift
   | Dup
   | Release
-  | LetGo
-  | Cased({ op: TypeOp, case: Int })
-  | Worded(TypeOp)
-  | Held(TypeOp)
+  | ReleaseResource
+  | OnCase({ op: TypeOp, case: Int })
+  | OnWordForm(TypeOp)
+  | Unboxed(TypeOp)
   | Keeping
   | Opening
 
-/// A function a call reaches: a root by its key, or the `n`th generic call of the body making the
-/// call, which the unit settles on a root once every body's needs are known.
 pub type Callee = | Root(RootKey) | Generic(Int)
 
-/// The name a root prints as, which tables of roots are keyed and ordered by: two keys differing
-/// only in a layout's representative type share one. Its bytes are read through `root_text`.
 pub opaque type RootName = | RootName(Bytes)
 
 derive bin for KeyArg
 derive bin for TypeOp
-derive bin for FnArg
+derive bin for InlinedLambda
 derive bin for Evidence
 derive bin for LawPart
 derive bin for ClauseKind
 derive bin for RootKey
 derive bin for RootName
 
-/// The bytes a key is kept and looked up by: its encoding, which is only ever compared or decoded.
 pub fn key_bytes(k: RootKey) -> Bytes / {abort.raise} = bin::encode(k, root_key_bin())
 
-/// The name `k` prints as. A definition's own name; a specialisation's spells its type arguments and
-/// lent lambdas after an `@` (`m.f@Int,?|1=m.g:0`); a written root its operation and type after a
-/// `#` (`m.Shape#eq`, `m.equal#List<Int>`, `geo.reflect#geo.Shape`), the type followed by its marks
-/// after a `^` where it has any (`m.lower#m.Box<Int>^1`). A test's is `m.test#` and its digest, its
-/// listing's that then `.cases`; a law's part is `m.law#`, its digest, a dot and the part; a clause
-/// follows its definition's name with `#`, its kind, `#` and its place (`m.f#requires#0`); a stored
-/// root and an entry follow their root's name with `#stored` and `#entered`; a code its definition's
-/// name with `@=` and the code (`m.f@=3f09`). Symbols and site ids are made from it, so it is the
-/// spelling roots had before they were keys.
 pub fn root_name(k: RootKey) -> RootName =
-  match k { At(_, n) -> n, Written(_, n) -> n, _ -> RootName(spelled(k)) }
+  match k { Specialisation(_, n) -> n, Generated(_, n) -> n, _ -> RootName(key_text(k)) }
 
-/// The bytes a root's name is spelled with, for people (a diagnostic, a C comment), for symbols and
-/// the names generated code gives a root, and for the rows a compiler of another generation reads:
-/// never for deciding what a root is, which its key says.
 pub fn root_text(n: RootName) -> Bytes = match n { RootName(b) -> b }
 
-/// What a specialisation of `def` at `args`, running `lent` in place, at `rows`, is called.
-fn at_spelled(
-  a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg>, rows: List<List<Evidence>> },
+fn specialisation_text(
+  a: { definition: Bytes, args: List<KeyArg>, borrowed: List<InlinedLambda>, rows: List<List<Evidence>> },
 ) -> RootName =
   RootName(
     Bytes::concat_all(
       [
-        a.def,
+        a.definition,
         b"@",
         Bytes::join(
-          a.args.map(|x: KeyArg| match x { KeyType(t) -> name_spelled(t), KeyLayout(l) -> l.key }),
+          a.args.map(|x: KeyArg|
+            match x { KeyType(t) -> type_name_text(t), KeyLayout(l) -> l.key }),
           b",",
         ),
       ].concat(
-        a.lent.map(|f: FnArg|
+        a.borrowed.map(|f: InlinedLambda|
           Bytes::concat_all([
             b"|",
             ascii_of_int(f.param),
             b"=",
-            spelled(f.owner),
+            key_text(f.owner),
             b":",
             ascii_of_int(f.nth),
           ])),
       ).concat(
-        a.rows.map(|r: List<Evidence>| b"/".concat(evidence_spelled(r))),
+        a.rows.map(|r: List<Evidence>| b"/".concat(evidence_text(r))),
       ),
     ),
   )
 
-/// Words `ws` as a name spells them: each effect, and its resource between brackets where it names
-/// one, a key's label `k` as `#k`.
-pub fn evidence_spelled(ws: List<Evidence>) -> Bytes =
+pub fn evidence_text(ws: List<Evidence>) -> Bytes =
   Bytes::concat_all([
     b"{",
     Bytes::join(
       ws.map(|w: Evidence|
         match w.resource {
-          RSingleton -> w.effect,
-          RNamed(n) -> Bytes::concat_all([w.effect, b"[", n, b"]"]),
-          RAny -> w.effect.concat(b"[*]"),
-          RVar(k) -> Bytes::concat_all([w.effect, b"[#", ascii_of_int(k), b"]"]),
+          SingletonResource -> w.effect,
+          NamedResource(n) -> Bytes::concat_all([w.effect, b"[", n, b"]"]),
+          AnyResource -> w.effect.concat(b"[*]"),
+          ResourceVariable(k) -> Bytes::concat_all([w.effect, b"[#", ascii_of_int(k), b"]"]),
         }),
       b",",
     ),
     b"}",
   ])
 
-/// What operation `w.op`, written for `w.ty` with its marks, is called. A keeping's or an opening's
-/// name holds the functions its type holds whole, which it wraps by what they take and answer.
-fn written_spelled(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -> RootName = {
-  let ty = if w.marks.len() == 0 { name_spelled(w.ty) } else {
-    Bytes::concat_all([name_spelled(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
+fn generated_name(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -> RootName = {
+  let ty = if w.marks.len() == 0 { type_name_text(w.ty) } else {
+    Bytes::concat_all([type_name_text(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
   };
   let wrapped = match w.op {
     Keeping -> holds_function(w.ty),
     Opening -> holds_function(w.ty),
     _ -> false,
   };
-  let named = if wrapped { Bytes::concat_all([ty, b"@", digest_spelled(whole_spelled(w.ty))]) }
+  let named = if wrapped { Bytes::concat_all([ty, b"@", digest_text(full_type_text(w.ty))]) }
   else { ty };
   RootName(match w.op {
     Equal -> named.concat(b"#eq"),
@@ -200,123 +136,112 @@ fn written_spelled(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -
 
 fn holds_function(ty: Type) -> Bool =
   match ty {
-    TyFn(_) -> true,
-    TyCon(c) -> c.args.any(holds_function),
-    TyRecord(fs) -> fs.any(|f: Field| holds_function(f.ty)),
-    TyNominal(x) -> x.args.any(holds_function) || x.fields.any(|f: Field| holds_function(f.ty)),
+    FunctionType(_) -> true,
+    NamedType(c) -> c.args.any(holds_function),
+    RecordType(fs) -> fs.any(|f: Field| holds_function(f.ty)),
+    NominalType(x) -> x.args.any(holds_function) || x.fields.any(|f: Field| holds_function(f.ty)),
     _ -> false,
   }
 
-/// `ty` spelled whole, a function by what it takes and answers, which no layout's representative
-/// spells.
-fn whole_spelled(ty: Type) -> Bytes =
+fn full_type_text(ty: Type) -> Bytes =
   match ty {
-    TyFn(f) ->
+    FunctionType(f) ->
       Bytes::concat_all([
         b"(",
-        Bytes::join(f.params.map(whole_spelled), b","),
+        Bytes::join(f.params.map(full_type_text), b","),
         b")->",
-        whole_spelled(f.ret),
+        full_type_text(f.ret),
       ]),
-    TyCon(c) -> applied_spelled(c.name, c.args),
-    TyRecord(fs) ->
+    NamedType(c) -> applied_type_text(c.name, c.args),
+    RecordType(fs) ->
       Bytes::concat_all([
         b"{",
         Bytes::join(
-          fs.map(|f: Field| Bytes::concat_all([f.name, b":", whole_spelled(f.ty)])),
+          fs.map(|f: Field| Bytes::concat_all([f.name, b":", full_type_text(f.ty)])),
           b",",
         ),
         b"}",
       ]),
-    TyNominal(x) -> applied_spelled(x.name, x.args),
-    _ -> spelled_type(ty),
+    NominalType(x) -> applied_type_text(x.name, x.args),
+    _ -> encode_type(ty),
   }
 
-fn applied_spelled(name: Bytes, args: List<Type>) -> Bytes =
+fn applied_type_text(name: Bytes, args: List<Type>) -> Bytes =
   if args.len() == 0 { name }
-  else { Bytes::concat_all([name, b"<", Bytes::join(args.map(whole_spelled), b","), b">"]) }
+  else { Bytes::concat_all([name, b"<", Bytes::join(args.map(full_type_text), b","), b">"]) }
 
-fn spelled(k: RootKey) -> Bytes =
+fn key_text(k: RootKey) -> Bytes =
   match k {
     Named(n) -> n,
-    At(_, n) -> root_text(n),
-    Written(_, n) -> root_text(n),
+    Specialisation(_, n) -> root_text(n),
+    Generated(_, n) -> root_text(n),
     Test(t) -> labelled(t.module, b"test", t.digest),
-    Cases(c) -> spelled(c).concat(b".cases"),
-    Law(l) -> Bytes::concat_all([labelled(l.module, b"law", l.digest), b".", part_word(l.part)]),
+    TestCases(c) -> key_text(c).concat(b".cases"),
+    Law(l) -> Bytes::concat_all([labelled(l.module, b"law", l.digest), b".", part_name(l.part)]),
     Clause(c) ->
       Bytes::concat_all([
-        spelled(c.def),
+        key_text(c.definition),
         b"#",
         match c.kind { Requires -> b"requires", Ensures -> b"ensures" },
         b"#",
         ascii_of_int(c.n),
       ]),
-    Entered(e) -> spelled(e).concat(b"#entered"),
-    Coded(c) -> Bytes::concat_all([c.def, b"@=", c.code]),
+    EntryPoint(e) -> key_text(e).concat(b"#entered"),
+    Coded(c) -> Bytes::concat_all([c.definition, b"@=", c.code]),
   }
 
-/// `ty` as a root's name spells it: as `spelled_type` does, but each record it holds as
-/// `digest_spelled` of that record's own spelling here, so a record a type holds twice at each level
-/// is spelled once, and a name grows with the type's distinct records rather than doubling with each.
-fn name_spelled(ty: Type) -> Bytes = spelled_at(ty, Map::new()).text
+fn type_name_text(ty: Type) -> Bytes = spelling_of(ty, Map::new()).text
 
-/// A type's spelling, and the digests of the records spelled so far.
-type Spelled = { text: Bytes, digests: Map<Type, Bytes> }
+type Spelling = { text: Bytes, digests: Map<Type, Bytes> }
 
-/// `ty` spelled as `name_spelled` spells it, the records already spelled read off `digests`.
-fn spelled_at(ty: Type, digests: Map<Type, Bytes>) -> Spelled =
+fn spelling_of(ty: Type, digests: Map<Type, Bytes>) -> Spelling =
   match ty {
-    TyCon(c) -> {
-      let args = all_held(c.args, digests);
-      { text: named_spelled(c.name, args.texts), digests: args.digests }
+    NamedType(c) -> {
+      let args = all_nested(c.args, digests);
+      { text: named_type_text(c.name, args.texts), digests: args.digests }
     },
-    TyRecord(fs) -> fields_spelled(b"", fs, digests),
-    TyNominal(x) -> {
-      let args = all_held(x.args, digests);
-      fields_spelled(named_spelled(x.name, args.texts), x.fields, args.digests)
+    RecordType(fs) -> fields_spelling(b"", fs, digests),
+    NominalType(x) -> {
+      let args = all_nested(x.args, digests);
+      fields_spelling(named_type_text(x.name, args.texts), x.fields, args.digests)
     },
-    _ -> { text: spelled_type(ty), digests: digests },
+    _ -> { text: encode_type(ty), digests: digests },
   }
 
-/// `ty` held in another type: a record as its digest, any other type as `spelled_at` spells it.
-fn held_spelled(ty: Type, digests: Map<Type, Bytes>) -> Spelled =
+fn nested_spelling(ty: Type, digests: Map<Type, Bytes>) -> Spelling =
   match ty {
-    TyRecord(_) -> digested(ty, digests),
-    TyNominal(_) -> digested(ty, digests),
-    _ -> spelled_at(ty, digests),
+    RecordType(_) -> record_digest(ty, digests),
+    NominalType(_) -> record_digest(ty, digests),
+    _ -> spelling_of(ty, digests),
   }
 
-/// Record `ty` as its digest, spelling it where no digest of it is read yet.
-fn digested(ty: Type, digests: Map<Type, Bytes>) -> Spelled =
+fn record_digest(ty: Type, digests: Map<Type, Bytes>) -> Spelling =
   match digests.get(ty) {
     Some(d) -> { text: d, digests: digests },
     None -> {
-      let own = spelled_at(ty, digests);
-      let d = digest_spelled(own.text);
+      let own = spelling_of(ty, digests);
+      let d = digest_text(own.text);
       { text: d, digests: own.digests.insert(ty, d) }
     },
   }
 
-/// `tys` each held in another type, in order.
-fn all_held(
-  tys: List<Type>,
+fn all_nested(
+  types: List<Type>,
   digests: Map<Type, Bytes>,
 ) -> { texts: List<Bytes>, digests: Map<Type, Bytes> } =
-  tys.fold(
+  types.fold(
     { texts: [], digests: digests },
     |acc: { texts: List<Bytes>, digests: Map<Type, Bytes> }, t: Type| {
-      let s = held_spelled(t, acc.digests);
+      let s = nested_spelling(t, acc.digests);
       { texts: acc.texts.push(s.text), digests: s.digests }
     },
   )
 
-/// `head` and the fields `fs` between braces, each named and its type held.
-fn fields_spelled(head: Bytes, fs: List<Field>, digests: Map<Type, Bytes>) -> Spelled = {
+fn fields_spelling(head: Bytes, fs: List<Field>, digests: Map<Type, Bytes>) -> Spelling = {
   let walked = fs.fold(
     { texts: [], digests: digests },
     |acc: { texts: List<Bytes>, digests: Map<Type, Bytes> }, f: Field| {
-      let s = held_spelled(f.ty, acc.digests);
+      let s = nested_spelling(f.ty, acc.digests);
       { texts: acc.texts.push(Bytes::concat_all([f.name, b":", s.text])), digests: s.digests }
     },
   );
@@ -326,69 +251,52 @@ fn fields_spelled(head: Bytes, fs: List<Field>, digests: Map<Type, Bytes>) -> Sp
   }
 }
 
-/// A type named `name`, at the arguments spelled `args`, as `spelled_type` spells it.
-fn named_spelled(name: Bytes, args: List<Bytes>) -> Bytes = {
-  let n = spelled_type(TyCon({ name: name, args: [] }));
+fn named_type_text(name: Bytes, args: List<Bytes>) -> Bytes = {
+  let n = encode_type(NamedType({ name: name, args: [] }));
   if args.len() == 0 { n } else { Bytes::concat_all([n, b"<", Bytes::join(args, b","), b">"]) }
 }
 
-/// A record spelled `text`, as a name holds it: `%` and 63 bits of `text`'s blake3, in decimal.
-fn digest_spelled(text: Bytes) -> Bytes = {
+fn digest_text(text: Bytes) -> Bytes = {
   let h = text.blake3();
   let low = match h.u32_at(0) { Some(v) -> v, None -> 0 };
   let high = match h.u32_at(4) { Some(v) -> v, None -> 0 };
   b"%".concat(ascii_of_int(high << 31 | low >>> 1))
 }
 
-/// The name of the entry of the root named `root`, as `Entered` names it.
 pub fn entry_name(root: RootName) -> RootName = RootName(root_text(root).concat(b"#entered"))
 
-/// Whether root `k`, taking `arity` words, is printed with an entry by words, which only the runtime
-/// calls: an entry, which the runtime enters every root through; a definition of no parameters,
-/// which a constant read runs through it; and a definition a type states, of those named in
-/// `stated`, which the runtime calls over the words it holds.
 pub fn has_entry(k: RootKey, arity: Int, stated: Map<Bytes, Bool>) -> Bool =
-  match k { Named(n) -> arity == 0 || stated.contains(n), Entered(_) -> true, _ -> false }
+  match k { Named(n) -> arity == 0 || stated.contains(n), EntryPoint(_) -> true, _ -> false }
 
-/// The word a law's part is named by after its law's name.
-pub fn part_word(p: LawPart) -> Bytes = match p { LawGuard -> b"guard", LawBody -> b"body" }
+pub fn part_name(p: LawPart) -> Bytes = match p { LawGuard -> b"guard", LawBody -> b"body" }
 
 fn labelled(module: Bytes, kind: Bytes, digest: Bytes) -> Bytes =
   qualify(module, Bytes::concat_all([kind, b"#", digest]))
 
-/// What identifies a test or a law in its module, where no two tests and no two laws share a name:
-/// the first eight bytes of its name's BLAKE3 hash, in hex.
 pub fn label_digest(name: Bytes) -> Bytes / {abort.raise} =
   Bytes::of_string(blake3(name).slice(0, 8).hex_of())
 
-/// The run of the test of `module` named `name`.
 pub fn test_key(module: Bytes, name: Bytes) -> RootKey / {abort.raise} =
   Test({ module: module, digest: label_digest(name) })
 
-/// Part `part` of the law of `module` labelled `label`.
 pub fn law_key(module: Bytes, label: Bytes, part: LawPart) -> RootKey / {abort.raise} =
   Law({ module: module, digest: label_digest(label), part: part })
 
-/// The name a test's sites go by, and what the checker files them under: its run's root's.
 pub fn test_owner(module: Bytes, name: Bytes) -> Bytes / {abort.raise} =
-  filed_as(test_key(module, name))
+  site_owner_text(test_key(module, name))
 
-/// The name the sites of the law of `module` labelled `label` go by, which each of its roots' names
-/// follows with its part.
 pub fn law_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
   labelled(module, b"law", label_digest(label))
 
-/// The word an operation is written under in its root's name: a case's, its operation's and the
-/// case's place after a dot, which no other's holds.
 pub fn op_name(op: TypeOp) -> Bytes =
   match op {
     Equal -> b"eq",
     Order -> b"cmp",
-    Stated(s) -> b"numeric_".concat(s),
+    NumericFunction(s) -> b"numeric_".concat(s),
     Reflect -> b"reflect",
-    Shown -> b"shown",
+    Show -> b"shown",
     Digest -> b"digest",
-    Contained(c) -> c,
+    ContainerWalk(c) -> c,
     Drop -> b"drop",
     Share -> b"share",
     Keep -> b"keep",
@@ -397,157 +305,140 @@ pub fn op_name(op: TypeOp) -> Bytes =
     Lift -> b"lift",
     Dup -> b"dup",
     Release -> b"release",
-    LetGo -> b"let_go",
-    Cased(c) -> Bytes::concat_all([op_name(c.op), b".", ascii_of_int(c.case)]),
-    Worded(o) -> b"word_".concat(op_name(o)),
-    Held(o) -> b"held_".concat(op_name(o)),
+    ReleaseResource -> b"let_go",
+    OnCase(c) -> Bytes::concat_all([op_name(c.op), b".", ascii_of_int(c.case)]),
+    OnWordForm(o) -> b"word_".concat(op_name(o)),
+    Unboxed(o) -> b"held_".concat(op_name(o)),
     Keeping -> b"keeping",
     Opening -> b"opening",
   }
 
-/// The module a root's body is written in: its definition's, test's or law's, or where a written
-/// root says.
 pub fn module_of(k: RootKey) -> Bytes =
   match k {
     Named(n) -> module_of_name(n),
-    At(a, _) -> module_of_name(a.def),
-    Coded(c) -> module_of_name(c.def),
-    Written(w, _) -> type_module(w.ty, w.home),
+    Specialisation(a, _) -> module_of_name(a.definition),
+    Coded(c) -> module_of_name(c.definition),
+    Generated(w, _) -> type_module(w.ty, w.home),
     Test(t) -> t.module,
-    Cases(c) -> module_of(c),
+    TestCases(c) -> module_of(c),
     Law(l) -> l.module,
-    Clause(c) -> module_of(c.def),
-    Entered(e) -> module_of(e),
+    Clause(c) -> module_of(c.definition),
+    EntryPoint(e) -> module_of(e),
   }
 
-/// The modules the roots `ks` are lowered in: each root's own, and that of each root whose lambdas
-/// it runs in place.
 pub fn modules_lowered(ks: List<RootKey>) -> Map<Bytes, Bool> / {abort.raise} =
   ks.fold(Map::new(), |acc: Map<Bytes, Bool>, k: RootKey|
-    key_lent(k).fold(acc.insert(module_of(k), true), |m: Map<Bytes, Bool>, f: FnArg|
-      m.insert(module_of(f.owner), true)))
+    inlined_lambdas(k).fold(
+      acc.insert(module_of(k), true),
+      |m: Map<Bytes, Bool>, f: InlinedLambda| m.insert(module_of(f.owner), true),
+    ))
 
-/// The module declaring `ty`'s name, where it has a dotted one, and `otherwise` where it has not.
 fn type_module(ty: Type, otherwise: Bytes) -> Bytes =
   match ty {
-    TyCon(c) -> {
+    NamedType(c) -> {
       let m = module_of_name(c.name);
       if m.len() == 0 { otherwise } else { m }
     },
     _ -> otherwise,
   }
 
-/// The definition a root runs: its own, the one it specialises or whose specialisations' code it
-/// is, or the one an entry enters; none for any other root.
 pub fn definition_of(k: RootKey) -> Option<Bytes> =
   match k {
     Named(n) -> Some(n),
-    At(a, _) -> Some(a.def),
-    Coded(c) -> Some(c.def),
-    Entered(e) -> definition_of(e),
+    Specialisation(a, _) -> Some(a.definition),
+    Coded(c) -> Some(c.definition),
+    EntryPoint(e) -> definition_of(e),
     _ -> None,
   }
 
-/// The root whose text a root's failure sites count from, as the unit names it: its definition's,
-/// an entry's root's, or any other root's own.
-pub fn sited_as(k: RootKey) -> RootName = RootName(filed_as(k))
+pub fn site_owner(k: RootKey) -> RootName = RootName(site_owner_text(k))
 
-/// What the front end files the facts of a root's sites under: its definition, an entry's root's,
-/// or any other root's own name.
-pub fn filed_as(k: RootKey) -> Bytes =
+pub fn site_owner_text(k: RootKey) -> Bytes =
   match k {
     Named(n) -> n,
-    At(a, _) -> a.def,
-    Coded(c) -> c.def,
-    Entered(e) -> filed_as(e),
-    _ -> spelled(k),
+    Specialisation(a, _) -> a.definition,
+    Coded(c) -> c.definition,
+    EntryPoint(e) -> site_owner_text(e),
+    _ -> key_text(k),
   }
 
-/// The type arguments a root is lowered at: a specialisation's, a layout's representative type for
-/// one keyed by a layout; none for any other root.
 pub fn key_types(k: RootKey) -> List<Type> =
   match k {
-    At(a, _) -> a.args.map(|x: KeyArg| match x { KeyType(t) -> t, KeyLayout(l) -> l.at }),
+    Specialisation(a, _) ->
+      a.args.map(|x: KeyArg| match x { KeyType(t) -> t, KeyLayout(l) -> l.at }),
     _ -> [],
   }
 
-/// The lambdas a root runs in place of calls of the parameters they are handed as.
-pub fn key_lent(k: RootKey) -> List<FnArg> = match k { At(a, _) -> a.lent, _ -> [] }
+pub fn inlined_lambdas(k: RootKey) -> List<InlinedLambda> =
+  match k { Specialisation(a, _) -> a.borrowed, _ -> [] }
 
-/// What a root's key fills its definition's row variables with, in its scheme's order: none but for
-/// a specialisation at rows.
-pub fn key_rows(k: RootKey) -> List<List<Evidence>> = match k { At(a, _) -> a.rows, _ -> [] }
+pub fn key_rows(k: RootKey) -> List<List<Evidence>> =
+  match k { Specialisation(a, _) -> a.rows, _ -> [] }
 
-/// Definition `def` at the types `args`, running `lent` in place.
-pub fn at_key(def: Bytes, args: List<Type>, lent: List<FnArg>) -> RootKey =
-  at_keyed(def, args.map(KeyType), lent)
+pub fn specialisation_key(
+  definition: Bytes,
+  args: List<Type>,
+  lent: List<InlinedLambda>,
+) -> RootKey = specialisation_key_of(definition, args.map(KeyType), lent)
 
-/// The specialisation of a generic definition `def` its claims are judged at: each of its `vars`
-/// type variables an `Int`, a type every constraint holds of.
-pub fn judged_at(def: Bytes, vars: Int) -> RootKey =
-  at_key(def, range(0, vars).map(|_: Int| int_type()), [])
+pub fn claims_key(definition: Bytes, vars: Int) -> RootKey =
+  specialisation_key(definition, range(0, vars).map(|_: Int| int_type()), [])
 
-/// Definition `def` at `args`, each a type or a layout, running `lent` in place.
-pub fn at_keyed(def: Bytes, args: List<KeyArg>, lent: List<FnArg>) -> RootKey =
-  at_rowed(def, args, lent, [])
-
-/// Definition `def` at `args`, running `lent` in place, its row variables at `rows`.
-pub fn at_rowed(
-  def: Bytes,
+pub fn specialisation_key_of(
+  definition: Bytes,
   args: List<KeyArg>,
-  lent: List<FnArg>,
+  lent: List<InlinedLambda>,
+) -> RootKey = specialisation_key_with_rows(definition, args, lent, [])
+
+pub fn specialisation_key_with_rows(
+  definition: Bytes,
+  args: List<KeyArg>,
+  lent: List<InlinedLambda>,
   rows: List<List<Evidence>>,
 ) -> RootKey = {
-  let a = { def: def, args: args, lent: lent, rows: rows };
-  At(a, at_spelled(a))
+  let a = { definition: definition, args: args, borrowed: lent, rows: rows };
+  Specialisation(a, specialisation_text(a))
 }
 
-/// Operation `op` written for `ty`, asked for from module `asking`, unmarked: keyed by the module it
-/// is written in, so two such keys are equal exactly where their names are.
-pub fn written(op: TypeOp, ty: Type, asking: Bytes) -> RootKey =
-  written_whole({ op: op, ty: ty, home: type_module(ty, asking), marks: [] })
+pub fn generated_key(op: TypeOp, ty: Type, asking: Bytes) -> RootKey =
+  generated_with_name({ op: op, ty: ty, home: type_module(ty, asking), marks: [] })
 
-/// Written root `k` with the places `marks` of its type marked, as `Written` reads them; any other
-/// root as it is.
 pub fn marked(k: RootKey, marks: List<Int>) -> RootKey =
-  match k { Written(w, _) -> written_whole({ ..w, marks: marks }), _ -> k }
+  match k { Generated(w, _) -> generated_with_name({ ..w, marks: marks }), _ -> k }
 
-/// Written root `k` doing `op` in place of its own operation; any other root as it is.
 pub fn as_op(k: RootKey, op: TypeOp) -> RootKey =
-  match k { Written(w, _) -> written_whole({ ..w, op: op }), _ -> k }
+  match k { Generated(w, _) -> generated_with_name({ ..w, op: op }), _ -> k }
 
-fn written_whole(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -> RootKey =
-  Written(w, written_spelled(w))
+fn generated_with_name(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -> RootKey =
+  Generated(w, generated_name(w))
 
-/// The root of the definition `k` runs as it stands: a specialisation's definition, and any other
-/// root itself.
-pub fn unspecialised(k: RootKey) -> RootKey = match k { At(a, _) -> Named(a.def), _ -> k }
+pub fn unspecialised(k: RootKey) -> RootKey =
+  match k { Specialisation(a, _) -> Named(a.definition), _ -> k }
 
 fn printed(k: RootKey) -> Bytes = root_text(root_name(k))
 
 test "a root's name spells each record its type holds by digest, once however deep records nest" {
   let string = string_type();
-  // Records nested `d` deep over `leaf`, each holding the one below in a field and in a list.
   let nested = |leaf: Type, d: Int|
     range(0, d).fold(leaf, |below: Type, _: Int|
-      TyRecord([{ name: b"x", ty: below }, { name: b"y", ty: list_type(below) }]));
-  let deep = |d: Int| nested(TyRecord([{ name: b"s", ty: string }]), d);
-  let named = |op: TypeOp, d: Int| printed(written(op, deep(d), b"m"));
-  // The type's own record spells its fields; the record it holds twice is one digest, written twice.
-  let below = digest_spelled(
+      RecordType([{ name: b"x", ty: below }, { name: b"y", ty: list_type(below) }]));
+  let deep = |d: Int| nested(RecordType([{ name: b"s", ty: string }]), d);
+  let named = |op: TypeOp, d: Int| printed(generated_key(op, deep(d), b"m"));
+  let below = digest_text(
     Bytes::concat_all([
       b"{x:",
-      digest_spelled(b"{s:String}"),
+      digest_text(b"{s:String}"),
       b",y:List<",
-      digest_spelled(b"{s:String}"),
+      digest_text(b"{s:String}"),
       b">}",
     ]),
   );
   assert_eq(named(Drop, 2), Bytes::concat_all([b"m.drop#{x:", below, b",y:List<", below, b">}"]));
-  // Two types whose records part deep down have two names, and a name stays short at any depth.
   assert(
     named(Drop, 9)
-      != printed(written(Drop, nested(TyRecord([{ name: b"s", ty: int_type() }]), 9), b"m")),
+      != printed(
+        generated_key(Drop, nested(RecordType([{ name: b"s", ty: int_type() }]), 9), b"m"),
+      ),
     None,
   );
   assert(named(Lift, 16).len() < 64, None)
@@ -559,43 +450,50 @@ test "a key prints as the name roots were spelled with before they were keys" {
   assert_eq(printed(Named(b"m.f")), b"m.f");
   assert_eq(
     printed(
-      at_keyed(b"m.f", [KeyType(int), KeyType(TyCon({ name: b"_", args: [] }))], [
-        { param: 1, owner: Named(b"m.g"), nth: 0 },
-      ]),
+      specialisation_key_of(
+        b"m.f",
+        [KeyType(int), KeyType(NamedType({ name: b"_", args: [] }))],
+        [{ param: 1, owner: Named(b"m.g"), nth: 0 }],
+      ),
     ),
     b"m.f@Int,_|1=m.g:0",
   );
-  // A lambda an owner at type arguments lends is spelled by that owner's own name.
   assert_eq(
-    printed(at_key(b"m.f", [], [{ param: 0, owner: at_key(b"m.g", [int], []), nth: 2 }])),
+    printed(
+      specialisation_key(b"m.f", [], [
+        { param: 0, owner: specialisation_key(b"m.g", [int], []), nth: 2 },
+      ]),
+    ),
     b"m.f@|0=m.g@Int:2",
   );
-  assert_eq(printed(written(Equal, TyCon({ name: b"m.Shape", args: [] }), b"m")), b"m.Shape#eq");
-  assert_eq(printed(written(Contained(b"equal"), list, b"m")), b"m.equal#List<Int>");
-  assert_eq(printed(written(Reflect, list, b"m")), b"m.reflect#List<Int>");
-  // A type a module declares has its operations written in that module, whoever asks.
   assert_eq(
-    printed(written(Reflect, TyCon({ name: b"geo.Shape", args: [] }), b"app")),
+    printed(generated_key(Equal, NamedType({ name: b"m.Shape", args: [] }), b"m")),
+    b"m.Shape#eq",
+  );
+  assert_eq(printed(generated_key(ContainerWalk(b"equal"), list, b"m")), b"m.equal#List<Int>");
+  assert_eq(printed(generated_key(Reflect, list, b"m")), b"m.reflect#List<Int>");
+  assert_eq(
+    printed(generated_key(Reflect, NamedType({ name: b"geo.Shape", args: [] }), b"app")),
     b"geo.reflect#geo.Shape",
   );
-  assert_eq(printed(Entered(Named(b"m.main"))), b"m.main#entered");
-  assert_eq(printed(Coded({ def: b"m.f", code: b"3f09" })), b"m.f@=3f09");
+  assert_eq(printed(EntryPoint(Named(b"m.main"))), b"m.main#entered");
+  assert_eq(printed(Coded({ definition: b"m.f", code: b"3f09" })), b"m.f@=3f09");
   let run = test_key(b"m", b"holds");
   assert_eq(printed(run), b"m.test#".concat(label_digest(b"holds")));
-  assert_eq(printed(Cases(run)), printed(run).concat(b".cases"));
+  assert_eq(printed(TestCases(run)), printed(run).concat(b".cases"));
   assert_eq(printed(law_key(b"m", b"holds", LawBody)), law_owner(b"m", b"holds").concat(b".body"));
-  assert_eq(printed(Clause({ def: Named(b"m.f"), kind: Ensures, n: 1 })), b"m.f#ensures#1")
+  assert_eq(printed(Clause({ definition: Named(b"m.f"), kind: Ensures, n: 1 })), b"m.f#ensures#1")
 }
 
 test "a test's and a law's roots are told apart by kind and label, and each prints apart" {
   let keys = [
     test_key(b"m", b"one"),
     test_key(b"m", b"two"),
-    Cases(test_key(b"m", b"one")),
+    TestCases(test_key(b"m", b"one")),
     law_key(b"m", b"one", LawGuard),
     law_key(b"m", b"one", LawBody),
-    Clause({ def: Named(b"m.f"), kind: Requires, n: 0 }),
-    Clause({ def: Named(b"m.f"), kind: Ensures, n: 0 }),
+    Clause({ definition: Named(b"m.f"), kind: Requires, n: 0 }),
+    Clause({ definition: Named(b"m.f"), kind: Ensures, n: 0 }),
     Named(b"m.f"),
   ];
   assert_eq(label_digest(b"one").len(), 16);
@@ -606,14 +504,14 @@ test "a test's and a law's roots are told apart by kind and label, and each prin
     keys.len(),
   );
   assert_eq(keys.map(definition_of), [None, None, None, None, None, None, None, Some(b"m.f")]);
-  assert_eq(definition_of(Entered(Named(b"m.f"))), Some(b"m.f"));
-  assert_eq(filed_as(Entered(test_key(b"m", b"one"))), test_owner(b"m", b"one"));
-  assert_eq(sited_as(Entered(test_key(b"m", b"one"))), root_name(test_key(b"m", b"one")));
-  assert_eq(entry_name(root_name(Named(b"m.f"))), root_name(Entered(Named(b"m.f"))))
+  assert_eq(definition_of(EntryPoint(Named(b"m.f"))), Some(b"m.f"));
+  assert_eq(site_owner_text(EntryPoint(test_key(b"m", b"one"))), test_owner(b"m", b"one"));
+  assert_eq(site_owner(EntryPoint(test_key(b"m", b"one"))), root_name(test_key(b"m", b"one")));
+  assert_eq(entry_name(root_name(Named(b"m.f"))), root_name(EntryPoint(Named(b"m.f"))))
 }
 
 test "names key a table, ordered as the spellings they print as" {
-  let ks = [Named(b"m.z"), Entered(Named(b"m.a")), Named(b"m.B"), Named(b"m.z")];
+  let ks = [Named(b"m.z"), EntryPoint(Named(b"m.a")), Named(b"m.B"), Named(b"m.z")];
   let table = ks.fold(Map::new(), |m: Map<RootName, Bool>, k: RootKey|
     m.insert(root_name(k), true));
   assert_eq(table.keys().map(root_text), [b"m.B", b"m.a#entered", b"m.z"]);
@@ -624,15 +522,15 @@ test "names key a table, ordered as the spellings they print as" {
 }
 
 test "a root's module is read off its key, never off its name" {
-  let shape = TyCon({ name: b"geo.Shape", args: [] });
+  let shape = NamedType({ name: b"geo.Shape", args: [] });
   assert_eq(module_of(Named(b"app.cli.main")), b"app.cli");
   assert_eq(
     [
       test_key(b"app.cli", b"a.b c"),
-      Cases(test_key(b"app.cli", b"x.y")),
+      TestCases(test_key(b"app.cli", b"x.y")),
       law_key(b"app.cli", b"x.y", LawBody),
-      Clause({ def: Named(b"app.cli.main"), kind: Requires, n: 0 }),
-      Entered(test_key(b"app.cli", b"a.b c")),
+      Clause({ definition: Named(b"app.cli.main"), kind: Requires, n: 0 }),
+      EntryPoint(test_key(b"app.cli", b"a.b c")),
     ].map(
       module_of,
     ),
@@ -640,20 +538,20 @@ test "a root's module is read off its key, never off its name" {
   );
   assert_eq([module_of(test_key(b"", b"t")), module_of(Named(b"main"))], [b"", b""]);
   assert_eq(
-    module_of(at_keyed(b"lib.h", [], [{ param: 0, owner: Named(b"app.g"), nth: 1 }])),
+    module_of(specialisation_key_of(b"lib.h", [], [{ param: 0, owner: Named(b"app.g"), nth: 1 }])),
     b"lib",
   );
-  assert_eq(module_of(written(Equal, shape, b"app")), b"geo");
-  assert_eq(module_of(written(Contained(b"equal"), shape, b"app")), b"geo");
-  assert_eq(module_of(written(Shown, list_type(shape), b"app")), b"app")
+  assert_eq(module_of(generated_key(Equal, shape, b"app")), b"geo");
+  assert_eq(module_of(generated_key(ContainerWalk(b"equal"), shape, b"app")), b"geo");
+  assert_eq(module_of(generated_key(Show, list_type(shape), b"app")), b"app")
 }
 
 test "two keys are kept apart by their encoding, and one key always encodes alike" {
   let int = int_type();
-  let a = at_keyed(b"m.f", [KeyType(int)], []);
-  let b = at_keyed(b"m.f", [KeyLayout({ key: b"Int", at: int })], []);
+  let a = specialisation_key_of(b"m.f", [KeyType(int)], []);
+  let b = specialisation_key_of(b"m.f", [KeyLayout({ key: b"Int", at: int })], []);
   assert_eq(key_bytes(a) == key_bytes(b), false);
-  assert_eq(key_bytes(a), key_bytes(at_key(b"m.f", [int], [])));
+  assert_eq(key_bytes(a), key_bytes(specialisation_key(b"m.f", [int], [])));
   assert_eq(
     match bin::decode(key_bytes(a), root_key_bin()) { Ok(k) -> Some(k), Err(_) -> None },
     Some(a),
@@ -662,35 +560,38 @@ test "two keys are kept apart by their encoding, and one key always encodes alik
 
 test "a specialisation keyed by a layout is named by the layout alone and lowered at its representative" {
   let laid = |name: Bytes|
-    at_keyed(b"m.f", [KeyLayout({ key: b"_", at: TyCon({ name: name, args: [] }) })], []);
+    specialisation_key_of(
+      b"m.f",
+      [KeyLayout({ key: b"_", at: NamedType({ name: name, args: [] }) })],
+      [],
+    );
   assert_eq(printed(laid(b"m.A")), b"m.f@_");
   assert_eq(printed(laid(b"m.A")), printed(laid(b"m.B")));
   assert_eq(laid(b"m.A") == laid(b"m.B"), false);
-  assert_eq(key_types(laid(b"m.B")), [TyCon({ name: b"m.B", args: [] })])
+  assert_eq(key_types(laid(b"m.B")), [NamedType({ name: b"m.B", args: [] })])
 }
 
 test "a specialisation's definition, types and lambdas are read off its key, an owner's among them" {
   let int = int_type();
-  let owner = at_key(b"app.g", [list_type(int)], []);
-  let k = at_key(b"lib.h", [int], [{ param: 1, owner: owner, nth: 0 }]);
+  let owner = specialisation_key(b"app.g", [list_type(int)], []);
+  let k = specialisation_key(b"lib.h", [int], [{ param: 1, owner: owner, nth: 0 }]);
   assert_eq(definition_of(k), Some(b"lib.h"));
-  assert_eq(filed_as(k), b"lib.h");
-  assert_eq(sited_as(k), root_name(Named(b"lib.h")));
+  assert_eq(site_owner_text(k), b"lib.h");
+  assert_eq(site_owner(k), root_name(Named(b"lib.h")));
   assert_eq(key_types(k), [int]);
-  assert_eq(key_lent(k).map(|f: FnArg| definition_of(f.owner)), [Some(b"app.g")]);
-  assert_eq(key_lent(k).map(|f: FnArg| key_types(f.owner)), [[list_type(int)]]);
+  assert_eq(inlined_lambdas(k).map(|f: InlinedLambda| definition_of(f.owner)), [Some(b"app.g")]);
+  assert_eq(inlined_lambdas(k).map(|f: InlinedLambda| key_types(f.owner)), [[list_type(int)]]);
   assert_eq(key_types(Named(b"lib.h")), []);
-  assert_eq(filed_as(written(Reflect, int, b"m")), b"m.reflect#Int");
-  // The code specialisations share is its definition's, and its sites count from that text.
-  let coded = Coded({ def: b"lib.h", code: b"3f09" });
+  assert_eq(site_owner_text(generated_key(Reflect, int, b"m")), b"m.reflect#Int");
+  let coded = Coded({ definition: b"lib.h", code: b"3f09" });
   assert_eq([definition_of(coded), Some(module_of(coded))], [Some(b"lib.h"), Some(b"lib")]);
-  assert_eq(sited_as(coded), sited_as(k))
+  assert_eq(site_owner(coded), site_owner(k))
 }
 
 test "a written root's marks follow its type in its name, so keys differing only in marks differ" {
   let int = int_type();
-  let pair = TyCon({ name: b"m.Pair", args: [int, int] });
-  let at = |op: TypeOp, marks: List<Int>| marked(written(op, pair, b"app"), marks);
+  let pair = NamedType({ name: b"m.Pair", args: [int, int] });
+  let at = |op: TypeOp, marks: List<Int>| marked(generated_key(op, pair, b"app"), marks);
   assert_eq(printed(at(Lower, [1, 2])), b"m.lower#m.Pair<Int,Int>^1,2");
   assert_eq(printed(at(Equal, [0])), b"m.Pair<Int,Int>^0#eq");
   assert_eq(printed(at(Lift, [])), b"m.lift#m.Pair<Int,Int>");
@@ -702,18 +603,15 @@ test "a written root's marks follow its type in its name, so keys differing only
 }
 
 test "a key's name is made with it, and a key remade from another names as one made afresh" {
-  let pair = TyCon({ name: b"m.Pair", args: [int_type()] });
-  let lift = written(Lift, pair, b"app");
-  // Marking or changing the operation of a key is the key made so, its name with it.
-  assert_eq(as_op(lift, Lower), written(Lower, pair, b"app"));
+  let pair = NamedType({ name: b"m.Pair", args: [int_type()] });
+  let lift = generated_key(Lift, pair, b"app");
+  assert_eq(as_op(lift, Lower), generated_key(Lower, pair, b"app"));
   assert_eq(marked(lift, []), lift);
   assert_eq(printed(as_op(marked(lift, [1]), Dup)), b"m.dup#m.Pair<Int>^1");
-  // Neither touches a root that is no written one.
-  assert_eq([as_op(Named(b"m.f"), Lower), marked(at_key(b"m.f", [pair], []), [1])], [
+  assert_eq([as_op(Named(b"m.f"), Lower), marked(specialisation_key(b"m.f", [pair], []), [1])], [
     Named(b"m.f"),
-    at_key(b"m.f", [pair], []),
+    specialisation_key(b"m.f", [pair], []),
   ]);
-  // The name an encoded key decodes with is the one it was made with.
   assert_eq(
     match bin::decode(key_bytes(lift), root_key_bin()) { Ok(k) -> printed(k), Err(_) -> b"" },
     b"m.lift#m.Pair<Int>",
@@ -721,22 +619,23 @@ test "a key's name is made with it, and a key remade from another names as one m
 }
 
 test "a written root is keyed by the module it is written in, so two keys are equal where their names are" {
-  let shape = TyCon({ name: b"geo.Shape", args: [] });
+  let shape = NamedType({ name: b"geo.Shape", args: [] });
   let list = list_type(shape);
-  assert_eq(written(Reflect, shape, b"app"), written(Reflect, shape, b"lib"));
-  assert_eq(written(Shown, list, b"app") == written(Shown, list, b"lib"), false);
-  assert_eq(printed(written(Reflect, shape, b"app")), b"geo.reflect#geo.Shape");
-  assert_eq(unspecialised(at_key(b"m.f", [shape], [])), Named(b"m.f"));
-  assert_eq(unspecialised(written(Equal, shape, b"app")), written(Equal, shape, b"app"))
+  assert_eq(generated_key(Reflect, shape, b"app"), generated_key(Reflect, shape, b"lib"));
+  assert_eq(generated_key(Show, list, b"app") == generated_key(Show, list, b"lib"), false);
+  assert_eq(printed(generated_key(Reflect, shape, b"app")), b"geo.reflect#geo.Shape");
+  assert_eq(unspecialised(specialisation_key(b"m.f", [shape], [])), Named(b"m.f"));
+  assert_eq(unspecialised(generated_key(Equal, shape, b"app")), generated_key(Equal, shape, b"app"))
 }
 
 test "a case's root is written in its sum's module, named by its operation and place apart from every other" {
-  let expr = TyCon({ name: b"m.Expr", args: [] });
-  let cased = |op: TypeOp, case: Int| printed(written(Cased({ op: op, case: case }), expr, b"app"));
+  let expression = NamedType({ name: b"m.Expr", args: [] });
+  let cased = |op: TypeOp, case: Int|
+    printed(generated_key(OnCase({ op: op, case: case }), expression, b"app"));
   assert_eq(cased(Drop, 1), b"m.drop.1#m.Expr");
   let names = [cased(Drop, 1), cased(Drop, 2), cased(Share, 1), cased(Keep, 1)].concat(
     [Drop, Share, Keep, Copy, Dup, Release, Reflect, Equal, Order].map(|op: TypeOp|
-      printed(written(op, expr, b"app"))),
+      printed(generated_key(op, expression, b"app"))),
   );
   assert_eq(
     names.fold([], |seen: List<Bytes>, n: Bytes|

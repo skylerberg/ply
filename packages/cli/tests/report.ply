@@ -1,5 +1,3 @@
-//! What a test run reports: its lines, its summary, its failures, `--explain` and the document `--json` writes.
-
 import args (Flags)
 import std.list (dedup)
 import std.cli (Parsed, has, parse_nat, value, values_of)
@@ -7,56 +5,54 @@ import surface
 import machine
 import compiler.front.diagnostics (parse_all)
 import compiler.front.seam (Analysed, Refused)
-import compiler.front.facts (View)
+import compiler.front.facts (CheckedProgram)
 import compiler.front.published (analyse)
 import compiler.front.rows (ModuleSpan)
 import compiler.check.infer.checker (TestInfo)
-import compiler.check.resolve.tables (Diag, Label, error_with_labels)
+import compiler.check.resolve.tables (Diagnostic, Label, error_with_labels)
 import compiler.check.types
-import compiler.check.types (RAny, RNamed, RSingleton, RVar)
+import compiler.check.types (AnyResource, NamedResource, SingletonResource, ResourceVariable)
 import compiler.syntax.type_syntax
-import compiler.syntax.type_syntax (MRead, MWrite)
-import diagnostic (Place, Raised, place_json, raised_json, shown, all_to_json, all_to_text)
-import mutants (Coverage, Mutants, Survivor)
-import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
+import compiler.syntax.type_syntax (ReadMode, WriteMode)
+import diagnostic (SourceText, RuntimeDiagnostic, editor_location_json, runtime_diagnostic_json,
+                   shown, all_to_json, all_to_text)
+import mutants (Coverage, MutationReport, Survivor)
+import report (CommandOutput, indent, ok_code, compile_error, count_of, refused, warned_lines)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null)
 import std.term (Style, plain, bold, dim, green, red, yellow, ansi, styles)
-import tester (Chosen, Hosted, Options, TestUnit, Unlisted)
+import tester (SelectedCase, BindingReport, Options, TestUnit, ListingFailure)
 import suspects (SuspectDiff)
-import testing.schedule (Atom, Counts, Scheduled, counts, group_by_conflict, isolation_of,
+import testing.schedule (Atom, Counts, ScheduledTest, counts, group_by_conflict, isolation_of,
                          isolation_word, parallelism, shared)
 import testing.delta (kind_word)
 import testing.diagnose (Suspect)
 import testing.select (Cached, Changed, Decision, New, PreviousFailure, Reason, SameCode, Search,
-                       Unhashed, filed, to_run, word)
+                       Unhashed, pass_keys_by_test, to_run, reason_word)
 import std.bytes
 import std.string
 import std.fmt (fixed_point)
-import claims (located)
+import claims (location_text)
 import signature (atom_texts)
-import proof.goal (set_of)
+import proof.context (set_of)
 import proof.obligation (plural)
 import std.option
 
-/// One atom of a test's footprint, as a scheduler compares them and as the printer spells it.
-pub type Printed = { atom: Atom, text: String }
+pub type PrintedAtom = { atom: Atom, text: String }
 
-pub type Refusal = { diags: List<Diag>, places: List<Place> }
+pub type Refusal = { diagnostics: List<Diagnostic>, places: List<SourceText> }
 
-/// Whole microseconds, as the clock the runner reads counts them: every reading in both forms is
-/// printed from the same integer, so a line and its document cannot disagree by a rounding.
-pub type Phases = { read_us: Int, front_us: Int, write_back_us: Int }
+pub type Phases = { read_us: Int, front_end_us: Int, write_back_us: Int }
 
 pub type ModuleView = { name: String, file: String }
 
-/// How the runtime is asked for one of the run's tests: the test of the loaded program it is, by
-/// index and by key, and over cases the case. `unlisted` is why a test's cases could not be listed,
-/// which is then how the test ends.
-pub type Entry = { test: Int, of: Bytes, case: Option<Chosen>, unlisted: Option<Unlisted> }
+pub type Entry = {
+  test: Int,
+  of: Bytes,
+  case: Option<SelectedCase>,
+  unlisted: Option<ListingFailure>,
+}
 
-/// One test still in scope, and what the store said about it. `test` is a reserved word, so a
-/// single one of them is a case.
 pub type Case = {
   index: Int,
   entry: Entry,
@@ -64,63 +60,47 @@ pub type Case = {
   name: String,
   module: String,
   nondet: Bool,
-  /// `None` when the front end produced no hash, which is what `unhashed` means.
   hash: Option<String>,
   footprint: String,
-  /// Every atom of the footprint: which of them another test could contend over is the suite's.
-  atoms: List<Printed>,
-  /// Something in its closure entered a `simulate` region, so it is searched and keyed on the plan.
+  atoms: List<PrintedAtom>,
   seeded: Bool,
 }
 
-/// What the program decided about a run: the reason for each test, the roots a seeded one still owes,
-/// which tests run, the classes they share, and the summary over them. The report reads all of it
-/// from here rather than from the runtime, which no longer decides any of it.
-pub type Decided = {
-  /// The search every seeded test is keyed on, and the options document's account of it.
+pub type RunDecision = {
   search: Search,
   sim: Json,
-  // Each by its test's index: a run reports on thousands, and every line asks of one.
   reasons: Map<Int, Reason>,
   owed: Map<Int, Int>,
   runs: List<Int>,
   running: Map<Int, Bool>,
-  /// Which class each running test landed in.
   at: Map<Int, Int>,
   classes: List<Group>,
   parallelism: Parallelism,
 }
 
-fn reason_of(decided: Decided, index: Int) -> Reason =
+fn reason_of(decided: RunDecision, index: Int) -> Reason =
   match decided.reasons.get(index) { Some(reason) -> reason, None -> Cached }
 
-fn runs_test(decided: Decided, index: Int) -> Bool = decided.running.contains(index)
+fn runs_test(decided: RunDecision, index: Int) -> Bool = decided.running.contains(index)
 
-/// The read whose move brought a cached test back, when one did.
-fn moved_of(decided: Decided, index: Int) -> Option<String> =
+fn changed_read_of(decided: RunDecision, index: Int) -> Option<String> =
   match reason_of(decided, index) { Changed(what) -> Some(what), _ -> None }
 
-/// The same over the tests this run reports on, which `--filter` may have narrowed.
-fn selected_count(program: Program, decided: Decided) -> Int =
+fn selected_count(program: Program, decided: RunDecision) -> Int =
   program.cases.filter(|case: Case| runs_test(decided, case.index)).len()
 
-pub fn cached_count(program: Program, decided: Decided) -> Int =
+pub fn cached_count(program: Program, decided: RunDecision) -> Int =
   program.cases.len() - selected_count(program, decided)
 
-/// The cached tests a pass answered by the code they compile to rather than by their own key.
-fn by_code_count(program: Program, decided: Decided) -> Int =
+fn by_code_count(program: Program, decided: RunDecision) -> Int =
   program.cases.filter(|case: Case| reason_of(decided, case.index) == SameCode).len()
 
-/// What the program decided about the conflict graph: the classes it coloured, the summary over
-/// them, and which class each test landed in — which is only the tests that run, since a class is
-/// what a test *shares a worker* with.
-fn group_of(decided: Decided, index: Int) -> Option<Int> = decided.at.get(index)
+fn group_of(decided: RunDecision, index: Int) -> Option<Int> = decided.at.get(index)
 
-fn owed_of(decided: Decided, index: Int) -> Int =
+fn owed_of(decided: RunDecision, index: Int) -> Int =
   match decided.owed.get(index) { Some(owed) -> owed, None -> 0 }
 
-/// A class's footprint is the union of its tests', printed as one footprint is.
-pub fn group_of_class(analysis: View, class: List<Int>) -> Group / {abort.raise} =
+pub fn group_of_class(analysis: CheckedProgram, class: List<Int>) -> Group / {abort.raise} =
   {
     tests: class,
     footprint: footprint_text(
@@ -131,51 +111,42 @@ pub fn group_of_class(analysis: View, class: List<Int>) -> Group / {abort.raise}
     ),
   }
 
-/// The footprint's atoms, unprinted.
-fn atoms_of(case: Case) -> List<Atom> = case.atoms.map(|printed: Printed| printed.atom)
+fn atoms_of(case: Case) -> List<Atom> = case.atoms.map(|print_lines: PrintedAtom| print_lines.atom)
 
-/// The atoms another test could contend over, printed.
 fn shared_texts(case: Case) -> List<String> =
-  case.atoms.filter(|printed: Printed| shared([printed.atom]).len() > 0).map(|printed: Printed|
-    printed.text)
+  case.atoms.filter(|print_lines: PrintedAtom| shared([print_lines.atom]).len() > 0).map(
+    |print_lines: PrintedAtom| print_lines.text,
+  )
 
-/// The shared footprint, as the printer spells a footprint.
 pub fn shared_of(case: Case) -> String = "{" ++ String::join(shared_texts(case), ", ") ++ "}"
 
-/// The classes the named tests share, coloured from the atoms each row carries.
 pub fn classes_of(program: Program, runs: List<Int>) -> List<List<Int>> / {abort.raise} =
   group_by_conflict(scheduled_of(program, set_of(runs)))
 
-/// The tests of `running` the run reports on, as the scheduler colours them.
-fn scheduled_of(program: Program, running: Map<Int, Bool>) -> List<Scheduled> =
+fn scheduled_of(program: Program, running: Map<Int, Bool>) -> List<ScheduledTest> =
   program.cases.filter(|case: Case| running.contains(case.index)).map(|case: Case|
-    { index: case.index, contends: shared(atoms_of(case)) })
+    { index: case.index, contended_atoms: shared(atoms_of(case)) })
 
-/// The classes over every test the run reports on, when a pass will re-run any of them: only a
-/// mutation does, so a run without one colours nothing it will not use.
-pub fn every_of(program: Program, options: Options) -> List<List<Int>> / {abort.raise} =
+pub fn all_classes(program: Program, options: Options) -> List<List<Int>> / {abort.raise} =
   match options.mutate {
     None -> [],
     Some(_) -> classes_of(program, program.cases.map(|case: Case| case.index)),
   }
 
-/// What the binding reaching some tests makes of each test the run reports on.
-fn reported(reaches: List<Int>, case: Case) -> { atoms: List<Atom>, host: Bool } =
+fn reach_of(reaches: List<Int>, case: Case) -> { atoms: List<Atom>, host: Bool } =
   { atoms: atoms_of(case), host: covers(reaches, case.index) }
 
 pub fn counts_of(program: Program, reaches: List<Int>) -> Counts =
-  counts(program.cases.map(|case: Case| reported(reaches, case)))
+  counts(program.cases.map(|case: Case| reach_of(reaches, case)))
 
-/// The whole decision, as the report reads it: a reason per test, what each seeded one still owes,
-/// which tests run, and the classes they share.
-pub fn decided_of(
+pub fn run_decision_of(
   program: Program,
   decisions: List<Decision>,
   search: Search,
   sim: Json,
   groups: List<Group>,
   classes: List<List<Int>>,
-) -> Decided / {abort.raise} = {
+) -> RunDecision / {abort.raise} = {
   let runs = to_run(decisions).filter(|i: Int| case_of(program, i) != None);
   let running = set_of(runs);
   {
@@ -192,7 +163,7 @@ pub fn decided_of(
       }),
     runs: runs,
     running: running,
-    at: flattened(classes),
+    at: class_numbers(classes),
     classes: groups,
     parallelism: parallelism(
       program.cases.map(|case: Case| shared(atoms_of(case))),
@@ -202,15 +173,13 @@ pub fn decided_of(
   }
 }
 
-/// Each class's number, for the members it holds: a class is what a test shares a worker with.
-fn flattened(classes: List<List<Int>>) -> Map<Int, Int> =
+fn class_numbers(classes: List<List<Int>>) -> Map<Int, Int> =
   range(0, classes.len()).fold(Map::new(), |acc: Map<Int, Int>, i: Int|
     classes.at_or(i, []).fold(acc, |a: Map<Int, Int>, index: Int|
       if a.contains(index) { a } else { a.insert(index, i) }))
 
 pub type Group = { tests: List<Int>, footprint: String }
 
-/// How many of a run's tests are trivially parallel, and what the rest cost.
 pub type Parallelism = {
   total: Int,
   isolated: Int,
@@ -221,56 +190,39 @@ pub type Parallelism = {
 }
 
 pub type Program = {
-  /// The root the load was rooted at, as a report prints it.
   root: String,
   files: List<String>,
-  places: List<Place>,
+  places: List<SourceText>,
   modules: List<ModuleView>,
   incremental: Bool,
   phases: Phases,
-  /// What the report's `front_end` says of the memo run that answered the load.
   reuse: List<Member>,
-  /// Every test in the run's scope, filtered out or not: what "no `test` items" is decided over.
   declared: Int,
-  /// The tests still in scope, in ascending index order.
   cases: List<Case>,
-  /// Where each of `cases` is among them, by its index.
   positions: Map<Int, Int>,
   filtered_out: Int,
-  warnings: List<Diag>,
-  /// What the machine was configured with, placed under the key this report gives it.
+  warnings: List<Diagnostic>,
   options: Json,
-  /// The runtime stamp a pass is filed under beside its test's hash; `None` when the run files none.
-  filed_under: Option<String>,
-  /// The unit the run's tests execute in.
+  stored_under: Option<String>,
   unit: TestUnit,
 }
 
 pub type Backend = {
-  /// Which backend answered.
   name: String,
-  /// The roots the unit is entered at.
   fragment: Int,
   entered: Int,
-  /// Absent unless the provider loaded a unit: once per worker, each load counted in `load_nanos`.
   units: Option<Int>,
   load_nanos: Option<Int>,
 }
 
-/// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
-/// stopped it first.
 pub type Cost = { explored: Int, bounded: Bool, rendered: String }
 
-/// What one test's search did. Absent, never zeroed, on a test that reached no `simulate` region.
-pub type Explored = {
+pub type SearchSummary = {
   explored: Int,
   exhaustive: Bool,
   exhausted: Bool,
-  /// `--measure-reduction` only: the same search blind to the order spawns and joins impose, and the
-  /// same search unpruned.
   blind: Option<Cost>,
   naive: Option<Cost>,
-  /// Tenths, so one division answers both the line and the document.
   reduction_tenths: Option<Int>,
   steps: Int,
   virtual_time_ns: Int,
@@ -282,33 +234,23 @@ pub type Outcome = {
   name: String,
   hash: Option<String>,
   duration_us: Int,
-  /// `passed`, `failed`, `panicked` or `abandoned`.
   status: String,
-  diagnostic: Option<Raised>,
-  search: Option<Explored>,
-  /// `None` when nothing was written: a spent budget or an unobserved search proved nothing.
+  diagnostic: Option<RuntimeDiagnostic>,
+  search: Option<SearchSummary>,
   cached: Option<Bool>,
-  /// The operations the test performed, handled ones included, over every interleaving it ran.
   performs: Int,
 }
 
 pub type Site = { task: String, definition: Option<String>, access: String, at: Option<ModuleSpan> }
 
-/// The two steps whose reordering at scheduling point `step` flipped a passing interleaving to this
-/// one.
 pub type Race = { left: Site, right: Site, step: Int }
 
-/// One failure as the runtime reports it.
 pub type Failed = {
   key: String,
-  /// The label as the source wrote it.
   name: String,
-  diagnostic: Raised,
-  /// Ply failed rather than the program.
+  diagnostic: RuntimeDiagnostic,
   defect: Bool,
-  /// The definitions in the closure the store has never seen pass, each with its current hash.
   suspects: List<{ name: String, hash: Option<String> }>,
-  /// Nothing in this test's closure changed, which is not the same as nothing being ranked.
   unchanged: Bool,
   seed: Option<String>,
   race: Option<Race>,
@@ -316,22 +258,18 @@ pub type Failed = {
   test_hash: Option<String>,
   nondet: Option<Bool>,
   status: Option<String>,
-  /// The atoms the test's footprint declares.
   declared: Option<List<String>>,
 }
 
-/// One failure as a report shows it: the runtime's account, and what changed under it.
 pub type Fault = {
   key: String,
   name: String,
-  diagnostic: Raised,
+  diagnostic: RuntimeDiagnostic,
   defect: Bool,
-  /// Ranked, most likely first.
   suspects: List<Suspect>,
   unchanged: Bool,
   seed: Option<String>,
   race: Option<Race>,
-  /// The command that replays the failing interleaving.
   replay: Option<String>,
   module: Option<String>,
   test_hash: Option<String>,
@@ -342,7 +280,7 @@ pub type Fault = {
 
 pub type Summary = { passed: Int, failed: Int, abandoned: Int, cached: Int, duration_us: Int }
 
-pub type Simulated = {
+pub type SimulationSummary = {
   simulated: Int,
   total: Int,
   seeds: Int,
@@ -357,25 +295,21 @@ pub type RunReport = {
   digest: String,
   handshakes: List<String>,
   hosts: Json,
-  /// The tests this binding can reach, by index, ascending.
   reaches: List<Int>,
   workers: Int,
   backend: Option<Backend>,
   results: List<Outcome>,
   failures: List<Failed>,
   summary: Summary,
-  simulation: Simulated,
-  /// Not warnings: every later run believes an escaped cache entry.
-  escapes: List<Diag>,
-  warnings: List<Diag>,
-  mutants: Option<Mutants>,
+  simulation: SimulationSummary,
+  escapes: List<Diagnostic>,
+  warnings: List<Diagnostic>,
+  mutants: Option<MutationReport>,
   coverage: Option<Coverage>,
-  spent: Spent,
+  spent: TimeSpent,
 }
 
-/// Where a run's time went, in microseconds of its clock: before the load began, then each phase
-/// after it. The load's own phases are `Phases`.
-pub type Spent = {
+pub type TimeSpent = {
   before_us: Int,
   promises_us: Int,
   store_us: Int,
@@ -387,7 +321,7 @@ pub type Spent = {
   conclude_us: Int,
 }
 
-pub fn no_spent() -> Spent =
+pub fn no_time_spent() -> TimeSpent =
   {
     before_us: 0,
     promises_us: 0,
@@ -400,15 +334,11 @@ pub fn no_spent() -> Spent =
     conclude_us: 0,
   }
 
-// --- Small things -----------------------------------------------------------
-
 fn opt_bool(v: Option<Bool>) -> Json = match v { Some(b) -> Bool(b), None -> Null }
 
 fn covers(xs: List<Int>, wanted: Int) -> Bool = xs.filter(|x: Int| x == wanted).len() > 0
 
 fn no_group() -> Group = { tests: [], footprint: "" }
-
-// --- Fixed point ------------------------------------------------------------
 
 fn ms_tenths(us: Int) -> String = fixed_point((us + 50) / 100, 1)
 
@@ -420,47 +350,47 @@ fn secs_hundredths(us: Int) -> String = fixed_point((us + 5000) / 10000, 2)
 
 fn ns_as_ms_tenths(ns: Int) -> String = fixed_point((ns + 50000) / 100000, 1)
 
-/// Per mille is tenths of a percent, so one division answers both digits.
 fn share(part: Int, total: Int) -> String =
   fixed_point(if total == 0 { 0 } else { part * 1000 / total }, 1).pad_left(5, " ") ++ "%"
 
 fn millis(us: Int) -> Json =
   Number(Decimal::of_string(ms_thousandths(us)).unwrap_or(Decimal::of_int(0)))
 
-// --- Naming and placing -----------------------------------------------------
-
-/// The label in a single-module run, `<module>.<label>` otherwise.
 pub fn display_of(program: Program, case: Case) -> String =
   if program.modules.len() > 1 { case.key } else { case.name }
 
 fn short_of(hash: Option<String>) -> String / {abort.raise} =
   match hash { Some(h) -> h.slice(0, 12), None -> "-".repeat(12) }
 
-fn dim_place(style: Style, places: List<Place>, a: Option<ModuleSpan>) -> String / {abort.raise} =
+fn dim_place(
+  style: Style,
+  places: List<SourceText>,
+  a: Option<ModuleSpan>,
+) -> String / {abort.raise} =
   match a {
     None -> "",
-    Some(spot) -> match located(places, spot) {
+    Some(spot) -> match location_text(places, spot) {
       Some(text) -> "   " ++ dim(style, text),
       None -> "",
     },
   }
 
-pub fn primary_of(diag: Diag) -> Option<Label> =
-  diag.labels.fold(None, |acc: Option<Label>, label: Label|
+pub fn primary_of(diagnostic: Diagnostic) -> Option<Label> =
+  diagnostic.labels.fold(None, |acc: Option<Label>, label: Label|
     match acc { Some(_) -> acc, None -> if label.primary { Some(label) } else { None } })
 
 fn label_at(label: Label) -> ModuleSpan =
   { module: label.module, start: label.start, end: label.end }
 
-fn location_json(places: List<Place>, diag: Diag) -> Json / {abort.raise} =
-  match primary_of(diag) { None -> Null, Some(l) -> place_json(places, label_at(l)) }
+fn location_json(places: List<SourceText>, diagnostic: Diagnostic) -> Json / {abort.raise} =
+  match primary_of(diagnostic) {
+    None -> Null,
+    Some(l) -> editor_location_json(places, label_at(l)),
+  }
 
-// --- What the selection decided ---------------------------------------------
+fn reason_key(reason: String) -> String = String::join(reason.split(" "), "_")
 
-/// The document spells a reason as one word, so the halves of a name are joined rather than spaced.
-fn keyed(reason: String) -> String = String::join(reason.split(" "), "_")
-
-fn why(reason: String) -> String =
+fn reason_text(reason: String) -> String =
   if reason == "new" { "this hash has never gone green, so nothing is known about it" }
   else if reason == "changed" {
     "something its last pass read has changed since, so that pass no longer answers for it"
@@ -472,22 +402,15 @@ fn why(reason: String) -> String =
     "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
   } else { "no hash was produced, so the cache cannot answer for it" }
 
-/// `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is not
-/// isolated.
 pub fn isolated_as(reaches: List<Int>, case: Case) -> String =
-  isolation_word(isolation_of(reported(reaches, case)))
+  isolation_word(isolation_of(reach_of(reaches, case)))
 
-// --- The head ---------------------------------------------------------------
-
-// Printed before a test runs, so it says only what the selection and the binding decided.
-
-/// What the binding says before a test runs: which tests it reaches, and how many run at once.
 pub type Opening = { operations: Int, digest: String, reaches: List<Int>, workers: Int }
 
-fn workers_of(options: Options, hosted: Hosted) -> Int =
+fn workers_of(options: Options, hosted: BindingReport) -> Int =
   match options.jobs { Some(n) -> if n > 0 { n } else { hosted.cores }, None -> hosted.cores }
 
-pub fn opening_of(options: Options, program: Program, hosted: Hosted) -> Opening =
+pub fn opening_of(options: Options, program: Program, hosted: BindingReport) -> Opening =
   {
     operations: hosted.operations,
     digest: hosted.digest,
@@ -495,7 +418,7 @@ pub fn opening_of(options: Options, program: Program, hosted: Hosted) -> Opening
     workers: workers_of(options, hosted),
   }
 
-fn selected_line(style: Style, program: Program, decided: Decided) -> String =
+fn selected_line(style: Style, program: Program, decided: RunDecision) -> String =
   indent() ++ bold(style, "selected") ++ " "
     ++ bold(style, selected_count(program, decided).to_string())
     ++ " of "
@@ -506,7 +429,7 @@ fn selected_line(style: Style, program: Program, decided: Decided) -> String =
     ++ (match by_code_count(program, decided) { 0 -> "", n -> ", " ++ n.to_string() ++ " by code" })
     ++ ")"
 
-fn group_line(decided: Decided, workers: Int) -> List<String> / {abort.raise} =
+fn group_line(decided: RunDecision, workers: Int) -> List<String> / {abort.raise} =
   if decided.classes.len() == 0 { [] } else {
     [indent() ++ count_of(decided.classes.len(), "group") ++ " · " ++ count_of(workers, "worker")]
   }
@@ -537,11 +460,9 @@ pub fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abo
     ]
   }
 
-/// What the tests' connections came to, which only the run itself knows.
 pub fn handshake_lines(style: Style, report: RunReport) -> List<String> =
   report.handshakes.map(|line: String| indent() ++ dim(style, line))
 
-/// `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
 pub fn simulation_line(style: Style, report: RunReport) -> List<String> / {abort.raise} =
   if report.simulation.simulated == 0 { [] } else {
     let c = report.simulation;
@@ -554,7 +475,6 @@ pub fn simulation_line(style: Style, report: RunReport) -> List<String> / {abort
     [indent() ++ bold(style, spent)]
   }
 
-/// Apart from the entry counts: a unit is loaded once per worker. Making it is the run's `unit` phase.
 fn compiled_line(style: Style, b: Backend) -> List<String> =
   match b.units {
     None -> [],
@@ -597,7 +517,7 @@ fn head_lines(
   style: Style,
   flags: Flags,
   program: Program,
-  decided: Decided,
+  decided: RunDecision,
   o: Opening,
 ) -> List<String> / {abort.raise} = {
   let c = counts_of(program, o.reaches);
@@ -612,30 +532,24 @@ fn head_lines(
   )
 }
 
-/// The report as far as it goes before a test runs: the head, what `--explain` can say of the
-/// selection, and the blank line the results follow.
 pub fn opening_lines(
   style: Style,
   flags: Flags,
   program: Program,
-  decided: Decided,
+  decided: RunDecision,
   o: Opening,
 ) -> List<String> / {abort.raise} =
   head_lines(style, flags, program, decided, o).concat(if flags.explain {
     explain_lines(style, program, o.reaches, decided)
   } else { [] }).concat(if decided.classes.len() == 0 { [] } else { [""] })
 
-/// What the run itself came to, under its results: the connections, the backend and the search.
 fn run_lines(style: Style, report: RunReport) -> List<String> / {abort.raise} =
   handshake_lines(style, report).concat(backend_lines(style, report)).concat(
     simulation_line(style, report),
   )
 
-// --- Where the time went ----------------------------------------------------
-
 type Phase = { label: String, us: Int }
 
-/// Longest first, so what dominated a run is read first, and ties stay in the order measured.
 fn ordered(rows: List<Phase>) -> List<Phase> =
   rows.fold([], |acc: List<Phase>, p: Phase|
     acc.filter(|q: Phase| q.us >= p.us).push(p).concat(acc.filter(|q: Phase| q.us < p.us)))
@@ -643,11 +557,11 @@ fn ordered(rows: List<Phase>) -> List<Phase> =
 fn phase_rows(phases: Phases) -> List<Phase> =
   ordered([
     { label: "read", us: phases.read_us },
-    { label: "front", us: phases.front_us },
+    { label: "front", us: phases.front_end_us },
     { label: "write back", us: phases.write_back_us },
   ])
 
-fn phase_total(phases: Phases) -> Int = phases.read_us + phases.front_us + phases.write_back_us
+fn phase_total(phases: Phases) -> Int = phases.read_us + phases.front_end_us + phases.write_back_us
 
 fn phase_line(style: Style, phase: Phase, total: Int) -> String =
   indent() ++ "  " ++ phase.label.pad_right(11, " ") ++ " "
@@ -665,7 +579,7 @@ pub fn phase_lines(style: Style, phases: Phases) -> List<String> = {
   ])
 }
 
-fn run_rows(phases: Phases, x: Spent) -> List<Phase> =
+fn run_rows(phases: Phases, x: TimeSpent) -> List<Phase> =
   [
     { label: "before", us: x.before_us },
     { label: "load", us: phase_total(phases) },
@@ -679,10 +593,10 @@ fn run_rows(phases: Phases, x: Spent) -> List<Phase> =
     { label: "conclude", us: x.conclude_us },
   ]
 
-pub fn run_total(phases: Phases, x: Spent) -> Int =
+pub fn run_total(phases: Phases, x: TimeSpent) -> Int =
   run_rows(phases, x).fold(0, |n: Int, phase: Phase| n + phase.us)
 
-pub fn run_phase_lines(style: Style, phases: Phases, x: Spent) -> List<String> = {
+pub fn run_phase_lines(style: Style, phases: Phases, x: TimeSpent) -> List<String> = {
   let total = run_total(phases, x);
   ["", indent() ++ bold(style, "run time")].concat(
     ordered(run_rows(phases, x)).map(|phase: Phase| phase_line(style, phase, total)),
@@ -692,7 +606,7 @@ pub fn run_phase_lines(style: Style, phases: Phases, x: Spent) -> List<String> =
   ])
 }
 
-fn run_phases_json(phases: Phases, x: Spent) -> Json =
+fn run_phases_json(phases: Phases, x: TimeSpent) -> Json =
   object(
     run_rows(phases, x).map(|phase: Phase| { key: phase.label, value: millis(phase.us) }).push({
       key: "total",
@@ -700,20 +614,18 @@ fn run_phases_json(phases: Phases, x: Spent) -> Json =
     }),
   )
 
-// --- `--explain` ------------------------------------------------------------
-
-fn explain_atoms(iso: String, case: Case) -> String =
-  if iso == "region" { "" } else { " " ++ shared_of(case) }
+fn explain_atoms(isolation: String, case: Case) -> String =
+  if isolation == "region" { "" } else { " " ++ shared_of(case) }
 
 fn case_line(
   style: Style,
   program: Program,
   reaches: List<Int>,
   case: Case,
-  decided: Decided,
+  decided: RunDecision,
 ) -> String / {abort.raise} = {
-  let iso = isolated_as(reaches, case);
-  let reason = word(reason_of(decided, case.index));
+  let isolation = isolated_as(reaches, case);
+  let reason = reason_word(reason_of(decided, case.index));
   let verb = if runs_test(decided, case.index) { bold(style, "run ") } else { dim(style, "skip") };
   indent() ++ verb ++ " " ++ dim(style, short_of(case.hash)) ++ " " ++ reason.pad_right(16, " ")
     ++ " "
@@ -721,18 +633,17 @@ fn case_line(
     ++ " "
     ++ dim(
       style,
-      "isolation: " ++ iso ++ explain_atoms(iso, case)
+      "isolation: " ++ isolation ++ explain_atoms(isolation, case)
         ++ (if case.seeded { " · searched" } else { "" })
-        ++ (match moved_of(decided, case.index) {
+        ++ (match changed_read_of(decided, case.index) {
           Some(what) -> " · moved: " ++ what,
           None -> "",
         }),
     )
 }
 
-/// What a pass is filed under.
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
-  let filed = match program.filed_under {
+  let filed = match program.stored_under {
     Some(stamp) ->
       "a pass is filed under its test's hash and the runtime stamp " ++ short_of(Some(stamp))
         ++ ", and under the code the test ran, with what its run read",
@@ -741,18 +652,18 @@ fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
   ["", indent() ++ dim(style, "key"), indent() ++ "  " ++ dim(style, filed)]
 }
 
-fn reasons_seen(program: Program, decided: Decided) -> List<String> =
+fn reasons_seen(program: Program, decided: RunDecision) -> List<String> =
   program.cases.fold([], |acc: List<String>, case: Case| {
-    let reason = word(reason_of(decided, case.index));
+    let reason = reason_word(reason_of(decided, case.index));
     if acc.contains(reason) { acc } else { acc.push(reason) }
   })
 
-fn why_lines(style: Style, program: Program, decided: Decided) -> List<String> = {
+fn why_lines(style: Style, program: Program, decided: RunDecision) -> List<String> = {
   let seen = reasons_seen(program, decided);
   if seen.len() == 0 { [] } else {
     ["", indent() ++ dim(style, "why")].concat(
       seen.map(|reason: String|
-        indent() ++ "  " ++ reason.pad_right(16, " ") ++ " " ++ dim(style, why(reason))),
+        indent() ++ "  " ++ reason.pad_right(16, " ") ++ " " ++ dim(style, reason_text(reason))),
     )
   }
 }
@@ -761,7 +672,7 @@ fn owed_line(
   style: Style,
   program: Program,
   case: Case,
-  decided: Decided,
+  decided: RunDecision,
 ) -> List<String> / {abort.raise} =
   if owed_of(decided, case.index) == decided.search.roots.len() { [] } else {
     [
@@ -775,8 +686,11 @@ fn owed_line(
     ]
   }
 
-/// What the seeded tests will search, and what each of them still owes.
-fn search_lines(style: Style, program: Program, decided: Decided) -> List<String> / {abort.raise} = {
+fn search_lines(
+  style: Style,
+  program: Program,
+  decided: RunDecision,
+) -> List<String> / {abort.raise} = {
   let seeded = program.cases.filter(|case: Case| case.seeded);
   if seeded.len() == 0 { [] } else {
     let head = [
@@ -803,8 +717,7 @@ fn search_lines(style: Style, program: Program, decided: Decided) -> List<String
   }
 }
 
-/// Grouped like any other test, but a host-backed test is never free.
-fn group_tally(style: Style, c: Counts, decided: Decided) -> String / {abort.raise} = {
+fn group_tally(style: Style, c: Counts, decided: RunDecision) -> String / {abort.raise} = {
   let hosted = if c.host == 0 { "" }
   else { " · " ++ c.host.to_string() ++ " host-backed and never free" };
   indent() ++ "  "
@@ -820,13 +733,13 @@ fn group_tally(style: Style, c: Counts, decided: Decided) -> String / {abort.rai
     )
 }
 
-fn named_of(program: Program, index: Int) -> String =
+fn display_name_at(program: Program, index: Int) -> String =
   match case_of(program, index) { Some(case) -> display_of(program, case), None -> "" }
 
 fn group_block(
   style: Style,
   program: Program,
-  decided: Decided,
+  decided: RunDecision,
   lines: List<String>,
   i: Int,
 ) -> List<String> / {abort.raise} = {
@@ -836,7 +749,7 @@ fn group_block(
       ++ dim(style, g.footprint),
   );
   g.tests.fold(head, |acc: List<String>, index: Int| {
-    let named = named_of(program, index);
+    let named = display_name_at(program, index);
     if named == "" { acc } else { acc.push(indent() ++ "    " ++ named) }
   })
 }
@@ -845,7 +758,7 @@ fn concurrency_lines(
   style: Style,
   program: Program,
   c: Counts,
-  decided: Decided,
+  decided: RunDecision,
 ) -> List<String> / {abort.raise} =
   if decided.classes.len() == 0 { [] } else {
     range(0, decided.classes.len()).fold(
@@ -858,19 +771,19 @@ pub fn explain_lines(
   style: Style,
   program: Program,
   reaches: List<Int>,
-  dec: Decided,
+  decision: RunDecision,
 ) -> List<String> / {abort.raise} =
-  [""].concat(program.cases.map(|case: Case| case_line(style, program, reaches, case, dec))).concat(
-    why_lines(style, program, dec).concat(key_lines(style, program)),
+  [""].concat(
+    program.cases.map(|case: Case| case_line(style, program, reaches, case, decision)),
   ).concat(
-    search_lines(style, program, dec),
+    why_lines(style, program, decision).concat(key_lines(style, program)),
   ).concat(
-    concurrency_lines(style, program, counts_of(program, reaches), dec),
+    search_lines(style, program, decision),
+  ).concat(
+    concurrency_lines(style, program, counts_of(program, reaches), decision),
   ).concat(
     phase_lines(style, program.phases),
   )
-
-// --- One test's line --------------------------------------------------------
 
 fn glyph_of(status: String) -> String =
   if status == "passed" { "✓" }
@@ -892,8 +805,6 @@ fn painted_glyph(style: Style, status: String) -> String = {
   else { dim(style, glyph) }
 }
 
-/// A styled mark is one glyph wide whatever escapes it carries, so the column is measured over the
-/// word rather than over the paint.
 fn marked(style: Style, status: String) -> String =
   if styles(style) { painted_glyph(style, status) } else { word_of(status).pad_right(7, " ") }
 
@@ -903,11 +814,10 @@ fn result_name(program: Program, outcome: Outcome) -> String =
     None -> outcome.name,
   }
 
-/// Over the tests the run will run, since their lines are printed as their groups finish.
-pub fn name_column(program: Program, decided: Decided) -> Int = {
+pub fn name_column(program: Program, decided: RunDecision) -> Int = {
   let widest = decided.classes.fold(0, |acc: Int, g: Group|
     g.tests.fold(acc, |most: Int, index: Int| {
-      let n = named_of(program, index).len();
+      let n = display_name_at(program, index).len();
       if n > most { n } else { most }
     }));
   if widest < 24 { 24 } else if widest > 64 { 64 } else { widest }
@@ -920,8 +830,7 @@ pub fn result_line(style: Style, program: Program, outcome: Outcome, width: Int)
     ++ ms_tenths(outcome.duration_us).pad_left(8, " ")
     ++ "ms"
 
-/// A bounded naive count makes the ratio a lower bound.
-fn reduction_part(e: Explored, naive: Cost) -> List<String> =
+fn reduction_part(e: SearchSummary, naive: Cost) -> List<String> =
   match e.reduction_tenths {
     None -> [],
     Some(tenths) ->
@@ -931,8 +840,7 @@ fn reduction_part(e: Explored, naive: Cost) -> List<String> =
       ],
   }
 
-/// What one test's search did, under its result line.
-fn search_parts(e: Explored) -> List<String> / {abort.raise} = {
+fn search_parts(e: SearchSummary) -> List<String> / {abort.raise} = {
   let head = [count_of(e.explored, "interleaving")];
   let thorough = if e.exhaustive { head.push("exhaustive") } else { head };
   let spent = if e.exhausted { thorough.push("budget spent — not cached") } else { thorough };
@@ -943,10 +851,9 @@ fn search_parts(e: Explored) -> List<String> / {abort.raise} = {
   }
 }
 
-/// Why a test that did not pass ended, under its line, so a reader sees it as soon as it fails.
 fn ended_lines(
   style: Style,
-  places: List<Place>,
+  places: List<SourceText>,
   outcome: Outcome,
 ) -> List<String> / {abort.raise} =
   match outcome.diagnostic {
@@ -975,9 +882,6 @@ pub fn result_lines(
     searched.concat(ended_lines(style, program.places, outcome))
   })
 
-// --- The summary ------------------------------------------------------------
-
-/// `host` sits beside `cached`: a host-backed pass stands only while what it read does.
 pub fn summary_line(style: Style, report: RunReport, counted: Counts) -> String = {
   let c = report.summary;
   let failures = c.failed.to_string() ++ " failed";
@@ -998,37 +902,47 @@ pub fn summary_line(style: Style, report: RunReport, counted: Counts) -> String 
     ++ "s)"
 }
 
-// --- One failure ------------------------------------------------------------
+fn note_lines(style: Style, diagnostic: Diagnostic) -> List<String> =
+  diagnostic.notes_text.map(|n: Bytes| "  " ++ dim(style, "=") ++ " " ++ String::of_bytes_lossy(n))
 
-fn note_lines(style: Style, diag: Diag) -> List<String> =
-  diag.notes_text.map(|n: Bytes| "  " ++ dim(style, "=") ++ " " ++ String::of_bytes_lossy(n))
-
-/// A deadlock's cycle lives only in its secondary labels.
 pub fn secondary_lines(
   style: Style,
-  places: List<Place>,
-  diag: Diag,
+  places: List<SourceText>,
+  diagnostic: Diagnostic,
 ) -> List<String> / {abort.raise} =
-  diag.labels.filter(|label: Label| !label.primary).map(|label: Label|
+  diagnostic.labels.filter(|label: Label| !label.primary).map(|label: Label|
     "    " ++ String::of_bytes_lossy(label.text) ++ dim_place(style, places, Some(label_at(label))))
 
-pub fn at_lines(style: Style, places: List<Place>, diag: Diag) -> List<String> / {abort.raise} =
-  match primary_of(diag) {
+pub fn at_lines(
+  style: Style,
+  places: List<SourceText>,
+  diagnostic: Diagnostic,
+) -> List<String> / {abort.raise} =
+  match primary_of(diagnostic) {
     None -> [],
-    Some(l) -> match located(places, label_at(l)) {
+    Some(l) -> match location_text(places, label_at(l)) {
       None -> [],
       Some(text) -> ["    at " ++ dim(style, text)],
     },
   }
 
-fn site_line(style: Style, places: List<Place>, site: Site, first: Bool) -> String / {abort.raise} =
+fn site_line(
+  style: Style,
+  places: List<SourceText>,
+  site: Site,
+  first: Bool,
+) -> String / {abort.raise} =
   "  " ++ yellow(style, if first { "race:" } else { "     " }) ++ " " ++ site.task ++ "  "
     ++ (match site.definition { Some(d) -> d, None -> "-" })
     ++ "   "
     ++ site.access
     ++ dim_place(style, places, site.at)
 
-fn race_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> / {abort.raise} =
+fn race_lines(
+  style: Style,
+  places: List<SourceText>,
+  fault: Fault,
+) -> List<String> / {abort.raise} =
   match fault.race {
     None -> [],
     Some(race) ->
@@ -1041,8 +955,11 @@ fn replay_lines(style: Style, fault: Fault) -> List<String> =
     Some(command) -> ["  " ++ dim(style, "replay:") ++ " " ++ command],
   }
 
-/// The repro, which is a seed rather than a stack trace.
-pub fn seed_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> / {abort.raise} =
+pub fn seed_lines(
+  style: Style,
+  places: List<SourceText>,
+  fault: Fault,
+) -> List<String> / {abort.raise} =
   match fault.seed {
     None -> [],
     Some(seed) ->
@@ -1051,18 +968,22 @@ pub fn seed_lines(style: Style, places: List<Place>, fault: Fault) -> List<Strin
       ),
   }
 
-pub fn described(x: Suspect) -> String =
+pub fn suspect_text(x: Suspect) -> String =
   match x.change { Some(c) -> x.name ++ " (" ++ kind_word(c) ++ ")", None -> x.name }
 
 fn suspect_lines(style: Style, fault: Fault) -> List<String> = {
-  let named = fault.suspects.map(described);
+  let named = fault.suspects.map(suspect_text);
   if named.len() > 0 { ["  " ++ yellow(style, "suspects:") ++ " " ++ String::join(named, ", ")] }
   else if fault.unchanged {
     ["  " ++ dim(style, "suspects: none — nothing in this test's closure changed")]
   } else { [] }
 }
 
-fn failure_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> / {abort.raise} = {
+fn failure_lines(
+  style: Style,
+  places: List<SourceText>,
+  fault: Fault,
+) -> List<String> / {abort.raise} = {
   let d = shown(fault.diagnostic);
   [bold(style, fault.key), "  " ++ String::of_bytes_lossy(d.message)].concat(
     at_lines(style, places, d),
@@ -1085,7 +1006,6 @@ fn failure_blocks(
   faults.fold([], |acc: List<String>, fault: Fault|
     acc.push("").concat(failure_lines(style, program.places, fault).map(|l: String| indent() ++ l)))
 
-/// A diff is cut at this many lines, so one large change does not bury the others.
 fn diff_lines_shown() -> Int = 40
 
 fn painted(style: Style, line: String) -> String =
@@ -1094,9 +1014,11 @@ fn painted(style: Style, line: String) -> String =
   else if line.starts_with("@@") { dim(style, line) }
   else { line }
 
-/// One change: its name, how it changed and where it is now, then its diff under the two lines
-/// that name the sides.
-fn diff_lines(style: Style, places: List<Place>, d: SuspectDiff) -> List<String> / {abort.raise} = {
+fn diff_lines(
+  style: Style,
+  places: List<SourceText>,
+  d: SuspectDiff,
+) -> List<String> / {abort.raise} = {
   let head = "  " ++ bold(style, d.name) ++ " (" ++ kind_word(d.change) ++ ")"
     ++ dim_place(style, places, d.at);
   let body = match d.diff {
@@ -1114,7 +1036,6 @@ fn diff_lines(style: Style, places: List<Place>, d: SuspectDiff) -> List<String>
   [head].concat(body)
 }
 
-/// Each change the failures' suspects name, once, after every failure.
 fn diff_blocks(
   style: Style,
   program: Program,
@@ -1127,11 +1048,9 @@ fn diff_blocks(
     )
   }
 
-/// A test the clock stopped: no suspects — the machine ran out of patience, and what the test would
-/// have decided is still unknown.
 fn abandoned_lines(
   style: Style,
-  places: List<Place>,
+  places: List<SourceText>,
   outcome: Outcome,
 ) -> List<String> / {abort.raise} = {
   let head = [bold(style, outcome.name) ++ " " ++ yellow(style, "abandoned")];
@@ -1161,8 +1080,6 @@ fn abandoned_blocks(
       ),
   )
 
-// --- Coverage and mutants ---------------------------------------------------
-
 fn unreached_lines(style: Style, names: List<String>) -> List<String> =
   names.map(|n: String| indent() ++ indent() ++ dim(style, n ++ ": no test reaches it"))
 
@@ -1181,10 +1098,10 @@ fn coverage_lines(style: Style, report: RunReport) -> List<String> =
       ),
   }
 
-fn survivor_line(style: Style, places: List<Place>, m: Survivor) -> String / {abort.raise} = {
+fn survivor_line(style: Style, places: List<SourceText>, m: Survivor) -> String / {abort.raise} = {
   let spot = match m.at {
     None -> "",
-    Some(a) -> match located(places, a) { Some(text) -> text, None -> "" },
+    Some(a) -> match location_text(places, a) { Some(text) -> text, None -> "" },
   };
   indent() ++ indent() ++ red(style, m.definition) ++ " survives `" ++ m.from ++ "` -> `" ++ m.to
     ++ "` at "
@@ -1212,9 +1129,6 @@ fn no_tests_note(flags: Flags, program: Program) -> String =
     "no test key contains a `--filter` substring; nothing was verified"
   } else { "nothing to report" }
 
-// --- The document -----------------------------------------------------------
-
-/// A case of a test over cases says so: the test it is a case of, and its place and identity there.
 fn case_of_json(case: Case) -> List<Member> / {abort.raise} =
   match case.entry.case {
     None -> [],
@@ -1231,7 +1145,7 @@ fn case_of_json(case: Case) -> List<Member> / {abort.raise} =
       ],
   }
 
-pub fn case_json(report: RunReport, case: Case, decided: Decided) -> Json / {abort.raise} =
+pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / {abort.raise} =
   object(
     case_of_json(case).concat([
       { key: "index", value: int(case.index) },
@@ -1241,20 +1155,16 @@ pub fn case_json(report: RunReport, case: Case, decided: Decided) -> Json / {abo
       { key: "hash", value: string_or_null(case.hash) },
       { key: "nondet", value: Bool(case.nondet) },
       { key: "selected", value: Bool(runs_test(decided, case.index)) },
-      { key: "reason", value: Str(keyed(word(reason_of(decided, case.index)))) },
-      { key: "why", value: Str(why(word(reason_of(decided, case.index)))) },
-      { key: "moved", value: string_or_null(moved_of(decided, case.index)) },
+      { key: "reason", value: Str(reason_key(reason_word(reason_of(decided, case.index)))) },
+      { key: "why", value: Str(reason_text(reason_word(reason_of(decided, case.index)))) },
+      { key: "moved", value: string_or_null(changed_read_of(decided, case.index)) },
       { key: "group", value: int_or_null(group_of(decided, case.index)) },
       { key: "footprint", value: Str(case.footprint) },
       { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
-      // Whether this test reaches the binding.
       { key: "host", value: Bool(covers(report.reaches, case.index)) },
       { key: "shared_atoms", value: strings(shared_texts(case)) },
-      // The same atoms unprinted, as the scheduler compares them, and whether the test is handed a
-      // seed: what a program re-colouring the run needs, without parsing a printed atom.
       { key: "contends", value: Array(shared(atoms_of(case)).map(atom_json)) },
       { key: "seeded", value: Bool(case.seeded) },
-      // Footprint atoms this binary answers from what it ships, which no pass key covers.
     ]),
   )
 
@@ -1265,7 +1175,7 @@ fn atom_json(a: Atom) -> Json =
     { key: "writes", value: Bool(a.writes) },
   ])
 
-fn group_json(decided: Decided, i: Int) -> Json = {
+fn group_json(decided: RunDecision, i: Int) -> Json = {
   let g: Group = decided.classes.at_or(i, no_group());
   object([
     { key: "index", value: int(i) },
@@ -1285,7 +1195,7 @@ fn cost_json(v: Option<Cost>) -> Json =
       ]),
   }
 
-fn search_json(e: Explored) -> Json =
+fn search_json(e: SearchSummary) -> Json =
   object([
     { key: "explored", value: int(e.explored) },
     { key: "exhaustive", value: Bool(e.exhaustive) },
@@ -1307,7 +1217,6 @@ fn search_json(e: Explored) -> Json =
 pub fn case_of(program: Program, index: Int) -> Option<Case> =
   match program.positions.get(index) { Some(place) -> program.cases.at(place), None -> None }
 
-/// Where each case is among `cases`, by its index; the first of an index stands for it.
 pub fn placed_cases(cases: List<Case>) -> Map<Int, Int> =
   range(0, cases.len()).fold(Map::new(), |acc: Map<Int, Int>, place: Int|
     match cases.at(place) {
@@ -1315,7 +1224,7 @@ pub fn placed_cases(cases: List<Case>) -> Map<Int, Int> =
       None -> acc,
     })
 
-fn outcome_json(program: Program, outcome: Outcome, d: Decided) -> Json / {abort.raise} = {
+fn outcome_json(program: Program, outcome: Outcome, d: RunDecision) -> Json / {abort.raise} = {
   let named = case_of(program, outcome.index);
   object([
     { key: "index", value: int(outcome.index) },
@@ -1328,16 +1237,17 @@ fn outcome_json(program: Program, outcome: Outcome, d: Decided) -> Json / {abort
     { key: "duration_ms", value: millis(outcome.duration_us) },
     {
       key: "diagnostic",
-      value: match outcome.diagnostic { Some(r) -> raised_json(r, program.places), None -> Null },
+      value: match outcome.diagnostic {
+        Some(r) -> runtime_diagnostic_json(r, program.places),
+        None -> Null,
+      },
     },
-    // Absent, never zeroed, when no region was reached.
     { key: "simulation", value: match outcome.search { Some(e) -> search_json(e), None -> Null } },
     { key: "cached", value: opt_bool(outcome.cached) },
     { key: "performs", value: int(outcome.performs) },
   ])
 }
 
-/// A place as the artifact carries one: the source and the byte range.
 fn span_json(a: Option<ModuleSpan>) -> Json =
   match a {
     None -> Null,
@@ -1368,25 +1278,21 @@ fn race_json(v: Option<Race>) -> Json =
       ]),
   }
 
-/// The failure artifact: what failed and where, whether it is Ply's fault, how to replay it, and what
-/// changed under it, most likely cause first.
 pub fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
   object([
     { key: "key", value: Str(fault.key) },
     { key: "name", value: Str(fault.name) },
-    { key: "diagnostic", value: raised_json(fault.diagnostic, program.places) },
-    // Whether to go and read the program or go and report a bug in Ply.
+    { key: "diagnostic", value: runtime_diagnostic_json(fault.diagnostic, program.places) },
     { key: "defect", value: Bool(fault.defect) },
     { key: "seed", value: string_or_null(fault.seed) },
     { key: "replay", value: string_or_null(fault.replay) },
-    // Only when the search actually observed the flip.
     { key: "race", value: race_json(fault.race) },
     { key: "suspects", value: Array(fault.suspects.map(suspect_json)) },
     { key: "module", value: string_or_null(fault.module) },
     { key: "test_hash", value: string_or_null(fault.test_hash) },
     { key: "nondet", value: opt_bool(fault.nondet) },
     { key: "status", value: string_or_null(fault.status) },
-    { key: "location", value: location_json(program.places, fault.diagnostic.diag) },
+    { key: "location", value: location_json(program.places, fault.diagnostic.diagnostic) },
     {
       key: "footprint",
       value: object([{ key: "declared", value: strings_or_null(fault.declared) }]),
@@ -1411,7 +1317,7 @@ fn diff_json(program: Program, d: SuspectDiff) -> Json / {abort.raise} =
     { key: "change", value: Str(kind_word(d.change)) },
     {
       key: "location",
-      value: match d.at { Some(at) -> place_json(program.places, at), None -> Null },
+      value: match d.at { Some(at) -> editor_location_json(program.places, at), None -> Null },
     },
     { key: "diff", value: string_or_null(d.diff) },
   ])
@@ -1429,12 +1335,16 @@ fn parallelism_json(v: Parallelism) -> Json =
 pub fn phases_json(phases: Phases) -> Json =
   object([
     { key: "read", value: millis(phases.read_us) },
-    { key: "front", value: millis(phases.front_us) },
+    { key: "front", value: millis(phases.front_end_us) },
     { key: "write_back", value: millis(phases.write_back_us) },
     { key: "total", value: millis(phase_total(phases)) },
   ])
 
-fn selection_json(program: Program, report: RunReport, decided: Decided) -> Json / {abort.raise} = {
+fn selection_json(
+  program: Program,
+  report: RunReport,
+  decided: RunDecision,
+) -> Json / {abort.raise} = {
   let c = counts_of(program, report.reaches);
   object([
     { key: "total", value: int(program.cases.len()) },
@@ -1442,12 +1352,11 @@ fn selection_json(program: Program, report: RunReport, decided: Decided) -> Json
     { key: "cached", value: int(cached_count(program, decided)) },
     { key: "by_code", value: int(by_code_count(program, decided)) },
     { key: "filtered_out", value: int(program.filtered_out) },
-    { key: "filed_under", value: string_or_null(program.filed_under) },
+    { key: "filed_under", value: string_or_null(program.stored_under) },
     {
       key: "groups",
       value: Array(range(0, decided.classes.len()).map(|i: Int| group_json(decided, i))),
     },
-    // A host-backed test counts only under `host`, since it is not isolated.
     { key: "isolated", value: int(c.isolated) },
     { key: "shared", value: int(c.shared) },
     { key: "host", value: int(c.host) },
@@ -1468,7 +1377,7 @@ fn summary_json(c: Summary) -> Json =
     { key: "duration_ms", value: millis(c.duration_us) },
   ])
 
-fn simulated_json(c: Simulated) -> Json =
+fn simulation_summary_json(c: SimulationSummary) -> Json =
   object([
     { key: "simulated", value: int(c.simulated) },
     { key: "seeds", value: int(c.seeds) },
@@ -1491,7 +1400,6 @@ fn backend_json(report: RunReport) -> Json =
       ]),
   }
 
-/// The two documents `--coverage` and `--mutate` add, each written by the pass that measured it.
 fn extra_documents(report: RunReport) -> List<Member> = {
   let covered = match report.coverage {
     None -> [],
@@ -1503,7 +1411,6 @@ fn extra_documents(report: RunReport) -> List<Member> = {
   }
 }
 
-/// Bumped whenever a field in the failure artifact changes meaning or leaves.
 fn artifact_schema() -> Int = 8
 
 fn document(
@@ -1512,9 +1419,9 @@ fn document(
   report: RunReport,
   faults: List<Fault>,
   diffs: List<SuspectDiff>,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
   ok: Bool,
-  decided: Decided,
+  decided: RunDecision,
 ) -> Json / {abort.raise} =
   object(
     [
@@ -1548,7 +1455,7 @@ fn document(
       { key: "hosts", value: report.hosts },
       { key: "workers", value: int(report.workers) },
       { key: "options", value: with_sim(program.options, decided.sim) },
-      { key: "simulation", value: simulated_json(report.simulation) },
+      { key: "simulation", value: simulation_summary_json(report.simulation) },
       { key: "backend", value: backend_json(report) },
       { key: "selection", value: selection_json(program, report, decided) },
       { key: "summary", value: summary_json(report.summary) },
@@ -1560,7 +1467,6 @@ fn document(
       },
       { key: "failures", value: Array(faults.map(|f: Fault| fault_json(program, f))) },
       { key: "diffs", value: Array(diffs.map(|d: SuspectDiff| diff_json(program, d))) },
-      // Not a warning: every later run believes an escaped entry.
       { key: "diagnostics", value: all_to_json(report.escapes, program.places) },
       { key: "warnings", value: all_to_json(warnings, program.places) },
     ].concat(
@@ -1568,9 +1474,6 @@ fn document(
     ),
   )
 
-// --- The answer -------------------------------------------------------------
-
-/// A test failed, was abandoned, a pass escaped into the cache, or a mutant lived.
 fn run_failed() -> Int = 1
 
 fn survived(report: RunReport) -> Bool =
@@ -1584,7 +1487,6 @@ fn nothing_lines(style: Style, flags: Flags, program: Program) -> List<String> =
   if program.cases.len() > 0 { [] }
   else { ["", indent() ++ dim(style, no_tests_note(flags, program))] }
 
-/// The report after its results, which were printed as their groups finished.
 fn closing_lines(
   style: Style,
   flags: Flags,
@@ -1592,7 +1494,7 @@ fn closing_lines(
   report: RunReport,
   faults: List<Fault>,
   diffs: List<SuspectDiff>,
-  warnings: List<Diag>,
+  warnings: List<Diagnostic>,
 ) -> List<String> / {abort.raise} =
   [
     if flags.explain { run_phase_lines(style, program.phases, report.spent) } else { [] },
@@ -1609,22 +1511,21 @@ fn closing_lines(
     mutant_lines(style, program, report),
   ].fold([], |acc: List<String>, part: List<String>| acc.concat(part))
 
-/// A lazy read and a later flush can each report the same unreadable file.
-fn collected(program: Program, report: RunReport) -> List<Diag> =
-  program.warnings.concat(report.warnings).fold([], |acc: List<Diag>, d: Diag|
-    if acc.filter(|x: Diag| x.code == d.code && x.message == d.message).len() > 0 { acc }
+fn all_warnings(program: Program, report: RunReport) -> List<Diagnostic> =
+  program.warnings.concat(report.warnings).fold([], |acc: List<Diagnostic>, d: Diagnostic|
+    if acc.filter(|x: Diagnostic| x.code == d.code && x.message == d.message).len() > 0 { acc }
     else { acc.push(d) })
 
-pub fn answered(
+pub fn test_output(
   style: Style,
   flags: Flags,
   program: Program,
   report: RunReport,
   faults: List<Fault>,
   diffs: List<SuspectDiff>,
-  decided: Decided,
-) -> Answer / {abort.raise} = {
-  let warnings = collected(program, report);
+  decided: RunDecision,
+) -> CommandOutput / {abort.raise} = {
+  let warnings = all_warnings(program, report);
   let ok = green_run(report);
   {
     json: document(flags, program, report, faults, diffs, warnings, ok, decided),
@@ -1634,34 +1535,34 @@ pub fn answered(
   }
 }
 
-/// A registration that does not match the program is a start-up failure: nothing ran.
-pub fn unbound(style: Style, refusal: Refusal) -> Answer / {abort.raise} = {
+pub fn unbound(style: Style, refusal: Refusal) -> CommandOutput / {abort.raise} = {
   let tally = indent() ++ red(style, "no host handler was bound") ++ " ("
-    ++ count_of(refusal.diags.len(), "error")
+    ++ count_of(refusal.diagnostics.len(), "error")
     ++ ")";
   {
     json: object([
       { key: "command", value: Str("test") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: int(compile_error()) },
-      { key: "diagnostics", value: all_to_json(refusal.diags, refusal.places) },
+      { key: "diagnostics", value: all_to_json(refusal.diagnostics, refusal.places) },
     ]),
     lines: [],
-    errs: all_to_text(style, refusal.diags, refusal.places).push(tally),
+    errs: all_to_text(style, refusal.diagnostics, refusal.places).push(tally),
     code: compile_error(),
   }
 }
 
-// --- What the loaded tree tells a selector ------------------------------------
+pub fn test_at(analysis: CheckedProgram, i: Int) -> Option<TestInfo> = analysis.checked.tests.at(i)
 
-pub fn test_at(analysis: View, i: Int) -> Option<TestInfo> = analysis.checked.tests.at(i)
-
-/// The order the runtime holds a footprint's atoms in: by effect, then resource, a named one first
-/// and every label last, then mode and operation.
 fn resource_rank(r: types::Resource) -> Int =
-  match r { RNamed(_) -> 0, RVar(_) -> 1, RSingleton -> 2, RAny -> 3 }
+  match r {
+    NamedResource(_) -> 0,
+    ResourceVariable(_) -> 1,
+    SingletonResource -> 2,
+    AnyResource -> 3,
+  }
 
-fn mode_rank(m: type_syntax::Mode) -> Int = match m { MRead -> 0, MWrite -> 1, _ -> 2 }
+fn mode_rank(m: type_syntax::Mode) -> Int = match m { ReadMode -> 0, WriteMode -> 1, _ -> 2 }
 
 fn atom_before(a: types::Atom, b: types::Atom) -> Bool =
   if a.effect != b.effect { compare(a.effect, b.effect) == Less }
@@ -1669,8 +1570,8 @@ fn atom_before(a: types::Atom, b: types::Atom) -> Bool =
     resource_rank(a.resource) < resource_rank(b.resource)
   } else if a.resource != b.resource {
     match ((a.resource, b.resource)) {
-      (RNamed(x), RNamed(y)) -> compare(x, y) == Less,
-      (RVar(x), RVar(y)) -> x < y,
+      (NamedResource(x), NamedResource(y)) -> compare(x, y) == Less,
+      (ResourceVariable(x), ResourceVariable(y)) -> x < y,
       _ -> false,
     }
   } else if mode_rank(a.mode) != mode_rank(b.mode) { mode_rank(a.mode) < mode_rank(b.mode) } else {
@@ -1681,18 +1582,13 @@ fn atom_before(a: types::Atom, b: types::Atom) -> Bool =
     }
   }
 
-/// The atoms ascending, each once.
 pub fn canonical(atoms: List<types::Atom>) -> List<types::Atom> = dedup(atoms.sort_by(atom_before))
 
 pub fn footprint_text(atoms: List<types::Atom>) -> String / {abort.raise} =
   "{" ++ String::join(atom_texts(atoms), ", ") ++ "}"
 
-// --- A test over cases --------------------------------------------------------
-
 pub fn with_sim(options: Json, sim: Json) -> Json =
   match options { Object(members) -> Object(members.insert("sim", sim)), other -> other }
-
-// --- Tests ------------------------------------------------------------------
 
 test "the mark is a word in a plain run and one glyph in a styled one" {
   assert_eq(marked(plain(), "passed"), "ok     ");
@@ -1703,14 +1599,14 @@ test "the mark is a word in a plain run and one glyph in a styled one" {
 }
 
 test "a reason is spaced in the line and joined in the document" {
-  assert_eq(keyed(word(PreviousFailure)), "previous_failure");
-  assert_eq(keyed(word(New)), "new");
-  assert_eq(word(Changed("the file `a.ply`")), "changed");
-  assert_eq(word(Unhashed), "unhashed")
+  assert_eq(reason_key(reason_word(PreviousFailure)), "previous_failure");
+  assert_eq(reason_key(reason_word(New)), "new");
+  assert_eq(reason_word(Changed("the file `a.ply`")), "changed");
+  assert_eq(reason_word(Unhashed), "unhashed")
 }
 
 test "a search says what it explored and what a blind and an unpruned one would have cost" {
-  let e: Explored = {
+  let e: SearchSummary = {
     explored: 12,
     exhaustive: true,
     exhausted: false,
@@ -1734,7 +1630,7 @@ test "a search says what it explored and what a blind and an unpruned one would 
 }
 
 test "a bounded naive count makes the ratio a lower bound" {
-  let e: Explored = {
+  let e: SearchSummary = {
     explored: 12,
     exhaustive: false,
     exhausted: false,
@@ -1753,9 +1649,9 @@ test "a bounded naive count makes the ratio a lower bound" {
 
 test "every reason has an explanation of its own" {
   let lines = [New, Changed(""), PreviousFailure, Cached, SameCode, Unhashed].map(
-    |r: Reason| word(r),
+    |r: Reason| reason_word(r),
   ).map(
-    why,
+    reason_text,
   );
   assert_eq(
     range(0, 6).filter(|i: Int|
@@ -1774,7 +1670,7 @@ test "a load that refuses tallies its errors and binds nothing" {
 
 test "a binding that does not match the program is a start-up failure naming no line" {
   let answer = unbound(plain(), {
-    diags: [error_with_labels(b"E0412", b"a nondet effect in a det test", [], [])],
+    diagnostics: [error_with_labels(b"E0412", b"a nondet effect in a det test", [], [])],
     places: [],
   });
   assert_eq(answer.code, 2);
@@ -1783,8 +1679,6 @@ test "a binding that does not match the program is a start-up failure naming no 
     "   no host handler was bound (1 error)",
   ])
 }
-
-// --- Footprints over real programs --------------------------------------------
 
 test "a program cannot declare either effect the scheduler reads a name of" {
   let refused = |name: String|

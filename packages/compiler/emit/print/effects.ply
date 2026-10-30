@@ -1,0 +1,1154 @@
+import std.bytes (ascii_of_int)
+import compiler.emit.pieces (Piece, Text, Hole, SiteRoot)
+import compiler.emit.typed_ir (param_rep, Var, Arg, IntOperand, OperationSignature, Representation,
+                               AsWord, operand_representation)
+import compiler.check.types (Type, FunctionType)
+import compiler.emit.typing (unknown_type)
+import compiler.emit.lower.base (type_of)
+import compiler.emit.typed_ir.handling (HandleOp, Perform, Label, Parallel, CurrentSite,
+                                        UnspecialisedBuiltin, WordArray, WordAt, SchedulerEvidence,
+                                        UnhandledEvidence, Instance, VarInit, VarRead, VarWrite,
+                                        Entering, AllocateForwarding, SetForwarding, ObjectAt,
+                                        RowMapping, Slot, ClauseSlot, CopiedSlot, ForwardedSlot,
+                                        KeyedSlot, KeyedRow, ClauseEntry, Answers, Schedules,
+                                        Resumes, Suspends, Raises, Clause, HandleSite,
+                                        HandleInstance, DetachedBody, HeapInstance, InstanceAddress,
+                                        Returning, raise_offset, task_offset)
+import compiler.emit.abi (heap_instance_layout)
+import compiler.emit.print.text (Printing, InstructionContext, line, pad, temp, named, name_of,
+                                 arg_text, part_names, assigned, site, check, field_hole, interned,
+                                 unsupported, nth)
+import compiler.emit.print.value_printing (c_type, c_types, zeros, word_to_parts, entry_opened,
+                                           values_as_words, parts_read, arg_parts)
+import compiler.emit.print.calling (convention_of, typed_convention, typed_callee)
+import compiler.emit.print.count_functions (dup_fn, call_text)
+import compiler.emit.lower.representation (representation_with, c_values_of, passing, InWords,
+                                           ByReference, return_buffer_words)
+import compiler.emit.layout (header_bytes)
+
+pub fn handle_opened(
+  p: InstructionContext,
+  printing: Printing,
+  label: Int,
+  args: List<Arg>,
+  uses: OperationSignature,
+  site: HandleSite,
+  answer: Var,
+) -> Printing =
+  match site.detached {
+    Some(d) -> detached_opened(p, printing, args, site, d, answer),
+    None -> instance_opened(p, printing, args, site, answer),
+  }
+
+fn result_declared(
+  printing: Printing,
+  site: HandleSite,
+  answer: Var,
+) -> { printing: Printing, name: Bytes } = {
+  let a = named(
+    {
+      ..printing,
+      handles: printing.handles.concat(
+        site.clauses.map(|c: Clause| Bytes::concat_all([c.effect, b"#", c.op])),
+      ),
+    },
+    answer,
+  );
+  { printing: a.printing, name: a.name }
+}
+
+fn instance_opened(
+  p: InstructionContext,
+  printing: Printing,
+  args: List<Arg>,
+  site: HandleSite,
+  answer: Var,
+) -> Printing = {
+  let i = site.instance;
+  let a = result_declared(printing, site, answer);
+  let given = match returned_rep(printing, args, site) {
+    Some(r) ->
+      [
+        {
+          representation: r,
+          names: part_names(returned_name(operand(printing, args, i.operand)), r),
+        },
+      ],
+    None -> [],
+  };
+  let values = [
+    { representation: answer.representation, names: part_names(a.name, answer.representation) },
+  ].concat(
+    given,
+  );
+  let declared = values.fold(
+    a.printing,
+    |q: Printing, v: { representation: Representation, names: List<Bytes> }| {
+      let ts = c_types(v.representation);
+      let zs = zeros(v.representation);
+      range(0, v.names.len()).fold(q, |q2: Printing, k: Int|
+        line(
+          q2,
+          p.depth,
+          Bytes::concat_all([nth(ts, k), b" ", nth(v.names, k), b" = ", nth(zs, k), b";"]),
+        ))
+    },
+  );
+  let recorded = if i.preset { declared } else { records_set(p, declared, args, site) };
+  line(variables_linked(p, recorded, instance_word(printing, args, i.operand, 0), i), p.depth, b"{")
+}
+
+fn detached_opened(
+  p: InstructionContext,
+  printing: Printing,
+  args: List<Arg>,
+  site: HandleSite,
+  d: DetachedBody,
+  answer: Var,
+) -> Printing = {
+  let a = result_declared(printing, site, answer);
+  let recorded = records_set(p, a.printing, args, site);
+  let heap = match site.instance.heap { Some(o) -> operand(printing, args, o), None -> b"0" };
+  check(
+    p,
+    assigned(
+      recorded,
+      p.depth,
+      answer,
+      c_type(answer.representation),
+      Bytes::concat_all([
+        b"rt_detached_open_p(ctx, ",
+        operand(printing, args, d.body),
+        b", (Word)(intptr_t)((char *)(intptr_t)",
+        operand(printing, args, d.forwards),
+        b" - PLY_HEADER), ",
+        heap,
+        b")",
+      ]),
+    ),
+  )
+}
+
+fn records_set(
+  p: InstructionContext,
+  printing: Printing,
+  args: List<Arg>,
+  site: HandleSite,
+) -> Printing = {
+  let i = site.instance;
+  let inst = |at: Int| instance_word(printing, args, i.operand, at);
+  let set = |q: Printing, lhs: Bytes, rhs: Bytes|
+    line(q, p.depth, Bytes::concat_all([lhs, b" = ", rhs, b";"]));
+  let described = match i.result {
+    Some(d) -> set(printing, inst(2), operand(printing, args, d)),
+    None -> printing,
+  };
+  let tasked = set(described, inst(task_offset()), b"ctx->task");
+  let record = |q: Printing, at: Int, closure: Int, place: Int|
+    set(
+      set(
+        set(q, inst(at), operand(printing, args, closure)),
+        inst(at + 1),
+        operand(printing, args, i.operand),
+      ),
+      inst(at + 2),
+      ascii_of_int(place),
+    );
+  let recorded = range(0, site.clauses.len()).fold(tasked, |q: Printing, k: Int|
+    match ((site.clauses.at(k), i.records.at(k))) {
+      (Some(c), Some(at)) -> {
+        let placed = record(q, at, c.handler, k + 1);
+        match c.string {
+          Some(d) -> set(placed, inst(at + 3), operand(printing, args, d)),
+          None -> placed,
+        }
+      },
+      _ -> q,
+    });
+  let returned = match ((i.ret, site.ret)) {
+    (Some(at), Some(r)) -> record(recorded, at, r, 0),
+    _ -> recorded,
+  };
+  let closures = site.clauses.map(|c: Clause| c.handler).concat(match site.ret {
+    Some(r) -> [r],
+    None -> [],
+  });
+  match i.heap {
+    None -> returned,
+    Some(_) -> {
+      let first = match i.records.at(0) {
+        Some(r) -> r,
+        None -> match i.ret { Some(r) -> r, None -> 0 },
+      };
+      let head = heap_instance_layout();
+      let counted = set(
+        set(
+          set(
+            set(returned, inst(2 - head.words), ascii_of_int(first)),
+            inst(3 - head.words),
+            ascii_of_int(closures.len()),
+          ),
+          inst(head.vars - head.words),
+          ascii_of_int(i.vars),
+        ),
+        inst(head.vars + 1 - head.words),
+        ascii_of_int(i.count),
+      );
+      closures.fold(counted, |q: Printing, c: Int|
+        line(q, p.depth, Bytes::concat_all([b"ply_dup(", operand(printing, args, c), b");"])))
+    },
+  }
+}
+
+pub fn landing_jump(label: Int) -> Bytes =
+  Bytes::concat_all([b"goto ply_h", ascii_of_int(label), b";"])
+
+pub fn handle_closed(
+  p: InstructionContext,
+  printing: Printing,
+  label: Int,
+  args: List<Arg>,
+  site: HandleSite,
+  answer: Var,
+) -> Printing =
+  match site.detached {
+    Some(_) -> printing,
+    None -> instance_closed(p, printing, label, args, site, answer),
+  }
+
+fn instance_closed(
+  p: InstructionContext,
+  printing: Printing,
+  label: Int,
+  args: List<Arg>,
+  site: HandleSite,
+  answer: Var,
+) -> Printing = {
+  let i = site.instance;
+  let d = p.depth;
+  let inst = |at: Int| instance_word(printing, args, i.operand, at);
+  let ans = name_of(printing, answer);
+  let landed = line(
+    line(printing, d, b"}"),
+    d,
+    Bytes::concat_all([b"ply_h", ascii_of_int(label), b": ;"]),
+  );
+  let closure = |k: Int| match i.records.at(k) { Some(at) -> inst(at), None -> b"0" };
+  let typed = |k: Int|
+    match site.clauses.at(k) { Some(c) -> operand_type(args, c.handler), None -> unknown_type() };
+  let entered = |f: Bytes, t: Type, from: ClauseInput|
+    clause_call(printing, i.preset, f, t, from, answer);
+  let stops = if i.preset || i.result != None {
+    [
+      {
+        cond: b"ply_held == -1",
+        body: stop_result(i.preset, inst(1), answer, part_names(ans, answer.representation)),
+      },
+    ]
+  } else { [] };
+  let branches = range(0, site.clauses.len()).fold(
+    stops,
+    |acc: List<{ cond: Bytes, body: List<Piece> }>, k: Int|
+      match site.clauses.at(k) {
+        Some(c) -> if c.mode != 3 { acc } else {
+          acc.push({
+            cond: b"ply_held == ".concat(ascii_of_int(k + 1)),
+            body: entered(closure(k), typed(k), FromWords(b"&".concat(inst(raise_offset())))),
+          })
+        },
+        None -> acc,
+      },
+  );
+  let unwound = [
+    Text(
+      Bytes::concat_all([
+        b"if (ctx->failed == PLY_FAILED_TARGET && ctx->target == ",
+        operand(printing, args, i.operand),
+        b") {\n",
+        pad(d + 1),
+        b"Word ply_held = ",
+        inst(0),
+        b"; ",
+        inst(0),
+        b" = 0; ctx->failed = 0;\n",
+      ]),
+    ),
+  ].concat(
+    branches.fold([], |acc: List<Piece>, b: { cond: Bytes, body: List<Piece> }|
+      acc.push(
+        Text(
+          Bytes::concat_all([
+            pad(d + 1),
+            if acc.len() == 0 { b"if (" } else { b"else if (" },
+            b.cond,
+            b") ",
+          ]),
+        ),
+      ).concat(
+        b.body,
+      ).push(
+        Text(b"\n"),
+      )),
+  ).push(
+    Text(pad(d).concat(b"}")),
+  );
+  let pending = match i.pending {
+    None -> [],
+    Some(k) -> match site.clauses.at(k) {
+      Some(c) ->
+        [
+          Text(
+            Bytes::concat_all([
+              b" else if (ctx->failed == PLY_FAILED_PENDING) {\n",
+              pad(d + 1),
+              b"Word m[2] = { rt_pending_raised_p(ctx, ",
+              match i.records.at(k) { Some(at) -> inst(at + 3), None -> b"0" },
+              b", 0), 0 };\n",
+              pad(d + 1),
+              b"if (!ctx->failed) ",
+            ]),
+          ),
+        ].concat(
+          entered(closure(k), typed(k), FromWords(b"m")),
+        ).push(
+          Text(Bytes::concat_all([b"\n", pad(d), b"}"])),
+        ),
+      None -> [],
+    },
+  };
+  let returned = match i.ret {
+    None -> [],
+    Some(at) -> {
+      let from = match returned_rep(printing, args, site) {
+        Some(r) ->
+          FromValues({
+            names: part_names(returned_name(operand(printing, args, i.operand)), r),
+            representation: r,
+          }),
+        None -> FromWords(b"&".concat(ans)),
+      };
+      let t = match site.ret { Some(r) -> operand_type(args, r), None -> unknown_type() };
+      [Text(b" else if (!ctx->failed) ")].concat(entered(inst(at), t, from))
+    },
+  };
+  let words = Bytes::concat_all([b"ply_pw", ascii_of_int(label)]);
+  let raised = i.raised.fold(
+    { printing: landed, pieces: [] },
+    |acc: { printing: Printing, pieces: List<Piece> }, k: Int|
+      match site.clauses.at(k) {
+        None -> acc,
+        Some(c) -> {
+          let e = field_hole(acc.printing, c.effect);
+          let o = field_hole(e.printing, c.op);
+          {
+            printing: o.printing,
+            pieces: acc.pieces.concat([
+              Text(
+                Bytes::concat_all([
+                  b" else if (ctx->failed == PLY_FAILED_PENDING && (",
+                  words,
+                  b" = rt_pending_raised_at_p(ctx, ",
+                ]),
+              ),
+              e.piece,
+              Text(b", "),
+              o.piece,
+              Text(Bytes::concat_all([b"))) {\n", pad(d + 1)])),
+            ]).concat(
+              entered(closure(k), typed(k), FromWords(b"(const Word *)(intptr_t)".concat(words))),
+            ).push(
+              Text(Bytes::concat_all([b"\n", pad(d), b"}"])),
+            ),
+          }
+        },
+      },
+  );
+  let declared = if i.raised.len() == 0 { raised.printing }
+  else { line(raised.printing, d, Bytes::concat_all([b"Word ", words, b" = 0;"])) };
+  let call_into = line(
+    spliced(declared, d, unwound.concat(pending).concat(raised.pieces).concat(returned)),
+    d,
+    Bytes::concat_all([
+      b"if (",
+      inst(0),
+      b") ply_held_let_go(ctx, (Word *)(intptr_t)",
+      operand(printing, args, i.operand),
+      b");",
+    ]),
+  );
+  let released = if i.heap != None { call_into } else {
+    range(0, i.count).fold(variables_unlinked(p, call_into, inst(0), i), |q: Printing, j: Int| {
+      let at = i.vars + 2 * j;
+      line(
+        q,
+        d,
+        Bytes::concat_all([
+          b"if (",
+          inst(at + 1),
+          b") ((const PlyType *)(intptr_t)",
+          inst(at + 1),
+          b")->dec(ctx, ",
+          inst(at),
+          b");",
+        ]),
+      )
+    })
+  };
+  check(p, released)
+}
+
+type ClauseInput =
+  | FromWords(Bytes)
+  | FromValues({ names: List<Bytes>, representation: Representation })
+
+fn clause_call(
+  printing: Printing,
+  preset: Bool,
+  f: Bytes,
+  t: Type,
+  from: ClauseInput,
+  answer: Var,
+) -> List<Piece> = {
+  let names = part_names(name_of(printing, answer), answer.representation);
+  if preset {
+    let words = match from { FromWords(w) -> w, FromValues(_) -> b"0" };
+    [Text(Bytes::concat_all([nth(names, 0), b" = ply_uniform(ctx, ", f, b", ", words, b");"]))]
+  } else {
+    let plain = convention_of(printing.constructors, match t {
+      FunctionType(x) -> { params: x.params, ret: x.ret },
+      _ -> { params: [], ret: t },
+    });
+    let handed = match from {
+      FromWords(w) ->
+        range(0, plain.params.len()).fold(
+          { text: [Text(Bytes::concat_all([b"const Word *args = ", w, b";"]))], args: [] },
+          |acc: { text: List<Piece>, args: List<Bytes> }, j: Int| {
+            let o = entry_opened(j, match param_rep(plain, j) { Some(r) -> r, None -> AsWord });
+            { text: acc.text.concat(o.text), args: acc.args.concat(o.args) }
+          },
+        ),
+      FromValues(v) -> match passing(v.representation) {
+        InWords -> { text: [], args: v.names },
+        ByReference ->
+          {
+            text: [
+              Text(
+                Bytes::concat_all([
+                  b"Word ply_rv[] = {",
+                  Bytes::join(values_as_words(v.names, c_values_of(v.representation)), b", "),
+                  b"};",
+                ]),
+              ),
+            ],
+            args: [b"ply_rv"],
+          },
+      },
+    };
+    let conv = typed_convention(plain);
+    let buffer = return_buffer_words(conv.result);
+    let call = Bytes::concat_all([
+      typed_callee(f, conv),
+      b"(ctx, ",
+      Bytes::join(
+        [f].concat(handed.args).concat([b"0", b"0"]).concat(if buffer > 0 { [b"ply_ro"] }
+        else { [] }),
+        b", ",
+      ),
+      b")",
+    ]);
+    let reads = parts_read(b"ply_ro", c_values_of(conv.result).drop(1));
+    [Text(b"{ ")].concat(handed.text).push(
+      Text(
+        Bytes::concat_all([
+          if buffer > 0 { Bytes::concat_all([b"Word ply_ro[", ascii_of_int(buffer), b"]; "]) }
+          else { b"" },
+          call_text(dup_fn(), [f]),
+          b"; ",
+          if names.len() == 0 { call } else { Bytes::concat_all([nth(names, 0), b" = ", call]) },
+          b";",
+          Bytes::concat_all(
+            range(1, names.len()).map(|k: Int|
+              Bytes::concat_all([b" ", nth(names, k), b" = ", nth(reads, k - 1), b";"])),
+          ),
+          b" }",
+        ]),
+      ),
+    )
+  }
+}
+
+fn stop_result(preset: Bool, w: Bytes, answer: Var, names: List<Bytes>) -> List<Piece> =
+  if preset || answer.representation == AsWord {
+    [Text(Bytes::concat_all([nth(names, 0), b" = ", w, b";"]))]
+  } else {
+    let opened = part_names(b"ply_s", answer.representation);
+    [Text(b"{ ")].concat(word_to_parts(w, answer.representation, opened)).push(
+      Text(
+        Bytes::concat_all(
+          range(0, names.len()).map(|k: Int|
+            Bytes::concat_all([b" ", nth(names, k), b" = ", nth(opened, k), b";"])),
+        ).concat(
+          b" }",
+        ),
+      ),
+    )
+  }
+
+fn returned_rep(printing: Printing, args: List<Arg>, site: HandleSite) -> Option<Representation> =
+  if site.instance.preset { None } else {
+    match site.ret {
+      None -> None,
+      Some(r) -> match operand_type(args, r) {
+        FunctionType(f) -> match f.params.at(0) {
+          Some(t) -> Some(representation_with(printing.constructors, t)),
+          None -> None,
+        },
+        _ -> None,
+      },
+    }
+  }
+
+fn returned_name(instance: Bytes) -> Bytes = instance.concat(b"_rv")
+
+fn operand_type(args: List<Arg>, k: Int) -> Type =
+  match args.at(k) { Some(a) -> type_of(a), None -> unknown_type() }
+
+pub fn effect_op(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  op: HandleOp,
+  args: List<Arg>,
+  uses: OperationSignature,
+) -> Printing / {abort.raise} =
+  match op {
+    Perform(x) -> performed(p, printing, into, x, args),
+    Label(name) -> match into {
+      None -> printing,
+      Some(v) -> {
+        let f = field_hole(printing, name);
+        let n = named(f.printing, v);
+        spliced(n.printing, p.depth, [
+          Text(Bytes::concat_all([c_type(v.representation), b" ", n.name, b" = "])),
+          f.piece,
+          Text(b";"),
+        ])
+      },
+    },
+    Parallel -> parallel_printed(p, printing, into, args),
+    CurrentSite(part) -> match into {
+      None -> printing,
+      Some(v) -> {
+        let n = named(printing, v);
+        spliced(n.printing, p.depth, [
+          Text(Bytes::concat_all([c_type(v.representation), b" ", n.name, b" = "])),
+          if part == 0 { Hole(SiteRoot(p.u.site)) }
+          else { Text(ascii_of_int((if part == 1 { p.at.start } else { p.at.end }) - p.u.base)) },
+          Text(b";"),
+        ])
+      },
+    },
+    UnspecialisedBuiltin(name) -> unsupported(b"a crossing settled by its callers only", name),
+    WordArray -> match into {
+      None -> printing,
+      Some(v) -> {
+        let arr = temp(printing);
+        let laid = line(
+          arr.printing,
+          p.depth,
+          Bytes::concat_all([
+            b"Word ",
+            arr.name,
+            b"[] = {",
+            Bytes::join(args.map(|a: Arg| arg_text(printing, a)), b", "),
+            b"};",
+          ]),
+        );
+        let n = named(laid, v);
+        line(
+          n.printing,
+          p.depth,
+          Bytes::concat_all([b"Word ", n.name, b" = (Word)(intptr_t)", arr.name, b";"]),
+        )
+      },
+    },
+    WordAt(i) -> match into {
+      None -> printing,
+      Some(v) -> {
+        let n = named(printing, v);
+        line(
+          n.printing,
+          p.depth,
+          Bytes::concat_all([
+            b"Word ",
+            n.name,
+            b" = ((const Word *)(intptr_t)",
+            operand(printing, args, 0),
+            b")[",
+            ascii_of_int(i),
+            b"];",
+          ]),
+        )
+      },
+    },
+    SchedulerEvidence -> word_set(p, printing, into, b"ctx->bridge"),
+    UnhandledEvidence -> word_set(p, printing, into, b"ctx->unserved"),
+    Entering ->
+      line(
+        printing,
+        p.depth,
+        Bytes::concat_all([
+          b"ctx->entering_desc = ",
+          operand(printing, args, 0),
+          b"; ctx->entering_words = ",
+          operand(printing, args, 1),
+          b";",
+        ]),
+      ),
+    Instance(n) -> frame_instance(p, printing, into, n),
+    HeapInstance(n) -> heap_instance(p, printing, into, n),
+    InstanceAddress ->
+      word_set(
+        p,
+        printing,
+        into,
+        Bytes::concat_all([
+          b"(Word)(intptr_t)(ply_words(",
+          operand(printing, args, 0),
+          b") + ",
+          ascii_of_int(heap_instance_head()),
+          b")",
+        ]),
+      ),
+    AllocateForwarding(words) -> forwards_laid(p, printing, into, words),
+    SetForwarding(at) ->
+      line(
+        printing,
+        p.depth,
+        Bytes::concat_all([
+          instance_word(printing, args, 0, at),
+          b" = ",
+          operand(printing, args, 1),
+          b";",
+        ]),
+      ),
+    ObjectAt(o) -> object_at(p, tables_set(p, printing, args, o.slots), into, args, o.at, o.slots),
+    RowMapping -> word_set(p, printing, into, b"(Word)(intptr_t)&ply_words_mapped"),
+    VarInit(at) ->
+      line(
+        line(
+          printing,
+          p.depth,
+          Bytes::concat_all([
+            instance_word(printing, args, 0, at),
+            b" = ",
+            operand(printing, args, 1),
+            b";",
+          ]),
+        ),
+        p.depth,
+        Bytes::concat_all([
+          instance_word(printing, args, 0, at + 1),
+          b" = ",
+          operand(printing, args, 2),
+          b";",
+        ]),
+      ),
+    VarRead(at) -> match into {
+      None -> printing,
+      Some(v) -> {
+        let n = named(printing, v);
+        line(
+          n.printing,
+          p.depth,
+          Bytes::concat_all([
+            b"Word ",
+            n.name,
+            b" = ",
+            instance_word(printing, args, 0, at),
+            b"; ((const PlyType *)(intptr_t)",
+            instance_word(printing, args, 0, at + 1),
+            b")->inc(ctx, ",
+            n.name,
+            b");",
+          ]),
+        )
+      },
+    },
+    Returning -> {
+      let value = match args.at(1) { Some(a) -> a, None -> IntOperand(0) };
+      let names = part_names(
+        returned_name(operand(printing, args, 0)),
+        operand_representation(value),
+      );
+      let parts = arg_parts(printing, value);
+      range(0, names.len()).fold(printing, |q: Printing, k: Int|
+        line(q, p.depth, Bytes::concat_all([nth(names, k), b" = ", nth(parts, k), b";"])))
+    },
+    VarWrite(at) ->
+      line(
+        printing,
+        p.depth,
+        Bytes::concat_all([
+          b"((const PlyType *)(intptr_t)",
+          instance_word(printing, args, 0, at + 1),
+          b")->dec(ctx, ",
+          instance_word(printing, args, 0, at),
+          b"); ",
+          instance_word(printing, args, 0, at),
+          b" = ",
+          operand(printing, args, 1),
+          b";",
+        ]),
+      ),
+  }
+
+fn instance_word(printing: Printing, args: List<Arg>, instance: Int, at: Int) -> Bytes =
+  Bytes::concat_all([
+    b"((Word *)(intptr_t)",
+    operand(printing, args, instance),
+    b")[",
+    ascii_of_int(at),
+    b"]",
+  ])
+
+fn frame_instance(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  n: Int,
+) -> Printing =
+  match into {
+    None -> printing,
+    Some(_) -> {
+      let arr = temp(printing);
+      let laid = line(
+        arr.printing,
+        p.depth,
+        Bytes::concat_all([b"Word ", arr.name, b"[", ascii_of_int(4 + n), b"] = {0};"]),
+      );
+      word_set(p, laid, into, Bytes::concat_all([b"(Word)(intptr_t)(", arr.name, b" + 4)"]))
+    },
+  }
+
+fn heap_instance_head() -> Int = heap_instance_layout().words
+
+fn heap_instance(p: InstructionContext, printing: Printing, into: Option<Var>, n: Int) -> Printing =
+  match into {
+    None -> printing,
+    Some(_) -> {
+      let b = temp(printing);
+      let size = ascii_of_int(8 * (heap_instance_head() + n));
+      let laid = line(
+        b.printing,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          b.name,
+          b" = ply_alloc(ctx, PLY_HEADER + ",
+          size,
+          b"); memset(ply_words(",
+          b.name,
+          b"), 0, ",
+          size,
+          b"); ply_words(",
+          b.name,
+          b")[0] = (Word)(intptr_t)&ply_instance_desc; ply_words(",
+          b.name,
+          b")[1] = ",
+          ascii_of_int(n),
+          b";",
+        ]),
+      );
+      word_set(p, laid, into, b.name)
+    },
+  }
+
+fn variables_record(first: Bytes) -> Bytes =
+  Bytes::concat_all([b"((PlyFrame *)(intptr_t)(&", first, b" - 4))"])
+
+fn variables_linked(
+  p: InstructionContext,
+  printing: Printing,
+  first: Bytes,
+  i: HandleInstance,
+) -> Printing =
+  if i.count == 0 || i.heap != None { printing } else {
+    let r = variables_record(first);
+    line(
+      printing,
+      p.depth,
+      Bytes::concat_all([
+        b"if (PLY_FRAMES(ctx)) { ((Word *)",
+        r,
+        b")[2] = ",
+        ascii_of_int(i.vars),
+        b"; ((Word *)",
+        r,
+        b")[3] = ",
+        ascii_of_int(i.count),
+        b"; ",
+        r,
+        b"->each = ply_instance_each; ",
+        r,
+        b"->prev = PLY_FRAMES(ctx); PLY_FRAMES(ctx) = ",
+        r,
+        b"; }",
+      ]),
+    )
+  }
+
+fn variables_unlinked(
+  p: InstructionContext,
+  printing: Printing,
+  first: Bytes,
+  i: HandleInstance,
+) -> Printing =
+  if i.count == 0 || i.heap != None { printing } else {
+    let r = variables_record(first);
+    line(
+      printing,
+      p.depth,
+      Bytes::concat_all([b"if (PLY_FRAMES(ctx) == ", r, b") PLY_FRAMES(ctx) = ", r, b"->prev;"]),
+    )
+  }
+
+fn slot_words(printing: Printing, args: List<Arg>, s: Slot) -> List<Bytes> = {
+  let within = |at: Int|
+    Bytes::concat_all([
+      b"(Word)(intptr_t)((Word *)(intptr_t)",
+      operand(printing, args, 0),
+      b" + ",
+      ascii_of_int(at),
+      b")",
+    ]);
+  match s {
+    ClauseSlot(a) ->
+      [Bytes::concat_all([b"(Word)(intptr_t)&", entry_fn(a.entry, a.labelled)]), within(a.record)],
+    CopiedSlot(f) -> {
+      let slot = Bytes::concat_all([
+        b"ply_slot(",
+        operand(printing, args, f.operand),
+        b", ",
+        ascii_of_int(f.op),
+        b")",
+      ]);
+      [slot.concat(b"[0]"), slot.concat(b"[1]")]
+    },
+    ForwardedSlot(f) -> [b"(Word)(intptr_t)&ply_forwarded", within(f.record)],
+    KeyedSlot(k) -> [b"(Word)(intptr_t)&ply_keyed", within(k.table)],
+  }
+}
+
+fn tables_set(
+  p: InstructionContext,
+  printing: Printing,
+  args: List<Arg>,
+  slots: List<Slot>,
+) -> Printing / {abort.raise} =
+  slots.fold(printing, |q: Printing, s: Slot|
+    match s {
+      KeyedSlot(k) -> {
+        let word = |at: Int| instance_word(printing, args, 0, at);
+        let set = |lhs: Bytes, rhs: Bytes| Bytes::concat_all([lhs, b" = ", rhs, b";"]);
+        range(0, k.rows.len()).fold(
+          line(q, p.depth, set(word(k.table), ascii_of_int(k.rows.len()))),
+          |r: Printing, i: Int| {
+            let row = k.rows.get(i);
+            let at = k.table + 1 + 3 * i;
+            let ws = slot_words(printing, args, row.enters);
+            line(
+              r,
+              p.depth,
+              Bytes::concat_all([
+                set(word(at), match row.label {
+                  Some(l) -> operand(printing, args, l),
+                  None -> b"-2",
+                }),
+                b" ",
+                set(word(at + 1), ws.get(0)),
+                b" ",
+                set(word(at + 2), ws.get(1)),
+              ]),
+            )
+          },
+        )
+      },
+      _ -> q,
+    })
+
+fn forwards_laid(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  words: Int,
+) -> Printing =
+  match into {
+    None -> printing,
+    Some(_) -> {
+      let b = temp(printing);
+      let size = ascii_of_int(8 * words);
+      let laid = line(
+        b.printing,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          b.name,
+          b" = ply_alloc(ctx, PLY_HEADER + ",
+          size,
+          b"); memset(ply_words(",
+          b.name,
+          b"), 0, ",
+          size,
+          b");",
+        ]),
+      );
+      word_set(p, laid, into, Bytes::concat_all([b"(Word)(intptr_t)ply_words(", b.name, b")"]))
+    },
+  }
+
+fn object_at(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  args: List<Arg>,
+  at: Int,
+  slots: List<Slot>,
+) -> Printing / {abort.raise} = {
+  let word = |k: Int| instance_word(printing, args, 0, k);
+  let set = |lhs: Bytes, rhs: Bytes| Bytes::concat_all([lhs, b" = ", rhs, b";"]);
+  let address = |k: Int|
+    Bytes::concat_all([
+      b"(Word)(intptr_t)((Word *)(intptr_t)",
+      operand(printing, args, 0),
+      b" + ",
+      ascii_of_int(k),
+      b")",
+    ]);
+  let laid = range(0, slots.len()).fold(
+    line(printing, p.depth, set(word(at), b"0")),
+    |q: Printing, j: Int| {
+      let s = slots.get(j);
+      let ws = slot_words(printing, args, s);
+      let entered = line(
+        q,
+        p.depth,
+        Bytes::concat_all([
+          set(word(at + 1 + 2 * j), ws.get(0)),
+          b" ",
+          set(word(at + 2 + 2 * j), ws.get(1)),
+        ]),
+      );
+      match s {
+        ForwardedSlot(f) ->
+          line(
+            entered,
+            p.depth,
+            Bytes::concat_all([
+              set(word(f.record), address(f.target)),
+              b" ",
+              set(word(f.record + 1), ascii_of_int(j)),
+              b" ",
+              set(word(f.record + 2), address(f.task)),
+            ]),
+          ),
+        _ -> entered,
+      }
+    },
+  );
+  word_set(
+    p,
+    laid,
+    into,
+    Bytes::concat_all([
+      b"(Word)(intptr_t)((Word *)(intptr_t)",
+      operand(printing, args, 0),
+      b" + ",
+      ascii_of_int(at),
+      b")",
+    ]),
+  )
+}
+
+pub fn entry_fn(e: ClauseEntry, labelled: Bool) -> Bytes =
+  match e {
+    Answers -> if labelled { b"ply_answers_labelled" } else { b"ply_answers" },
+    Schedules -> b"ply_schedules",
+    Resumes -> if labelled { b"ply_resumes_labelled" } else { b"ply_resumes" },
+    Raises -> b"ply_raises",
+    Suspends -> b"ply_stops",
+  }
+
+fn word_set(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  value: Bytes,
+) -> Printing =
+  match into {
+    None -> printing,
+    Some(v) -> {
+      let n = named(printing, v);
+      line(n.printing, p.depth, Bytes::concat_all([b"Word ", n.name, b" = ", value, b";"]))
+    },
+  }
+
+fn performed(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  x: { effect: Bytes, op: Bytes, index: Int, resource: Bytes, labelled: Bool, mode: Int, descriptor: Bytes },
+  args: List<Arg>,
+) -> Printing = {
+  let words = if x.labelled { args.drop(2) } else { args.drop(1) };
+  let arr = temp(printing);
+  let held = line(
+    arr.printing,
+    p.depth,
+    Bytes::concat_all([
+      b"Word ",
+      arr.name,
+      b"[] = {",
+      Bytes::join(words.map(|a: Arg| arg_text(printing, a)).push(b"0").push(b"0"), b", "),
+      b"};",
+    ]),
+  );
+  let sited = site(p, {
+    ..held,
+    performs: held.performs.push(Bytes::concat_all([x.effect, b"#", x.op])),
+  });
+  let res = if x.labelled { { printing: sited, piece: Text(operand(printing, args, 1)) } }
+  else if x.resource == b"" { { printing: sited, piece: Text(b"-1") } }
+  else { field_hole(sited, x.resource) };
+  check(
+    p,
+    call_into(res.printing, p.depth, into, [
+      Text(
+        Bytes::concat_all([
+          b"ply_perform(ctx, ",
+          operand(printing, args, 0),
+          b", ",
+          ascii_of_int(x.index),
+          b", (Word)(intptr_t)&",
+          x.descriptor,
+          b", ",
+          ascii_of_int(x.mode),
+          b", ",
+        ]),
+      ),
+      res.piece,
+      Text(Bytes::concat_all([b", (Word)(intptr_t)", arr.name, b")"])),
+    ]),
+  )
+}
+
+fn parallel_printed(
+  p: InstructionContext,
+  printing: Printing,
+  into: Option<Var>,
+  args: List<Arg>,
+) -> Printing = {
+  let n = args.len() / 2;
+  let arr = temp(printing);
+  let held = line(
+    arr.printing,
+    p.depth,
+    Bytes::concat_all([
+      b"Word ",
+      arr.name,
+      b"[] = {",
+      if n == 0 { b"0" }
+      else { Bytes::join(args.take(n).map(|a: Arg| arg_text(printing, a)), b", ") },
+      b"};",
+    ]),
+  );
+  let run = line(
+    site(p, held),
+    p.depth,
+    Bytes::concat_all([
+      b"rt_branches_p(ctx, (Word)(intptr_t)",
+      arr.name,
+      b", ",
+      ascii_of_int(n),
+      b");",
+    ]),
+  );
+  let released = line(
+    run,
+    p.depth,
+    Bytes::concat_all(
+      [b"if (ctx->failed) { "].concat(
+        range(0, n).map(|i: Int| {
+          let slot = Bytes::concat_all([arr.name, b"[", ascii_of_int(i), b"]"]);
+          Bytes::concat_all([
+            b"if (",
+            slot,
+            b") ((const PlyType *)(intptr_t)",
+            operand(printing, args, n + i),
+            b")->dec(ctx, ",
+            slot,
+            b"); ",
+          ])
+        }),
+      ).push(
+        p.leave,
+      ).push(
+        b" }",
+      ),
+    ),
+  );
+  match into {
+    None -> released,
+    Some(v) -> {
+      let box = named(released, v);
+      line(
+        box.printing,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          box.name,
+          b" = ply_alloc(ctx, ",
+          ascii_of_int(header_bytes() + 8 * n),
+          b");",
+          Bytes::concat_all(
+            range(0, n).map(|i: Int|
+              Bytes::concat_all([
+                b" ply_words(",
+                box.name,
+                b")[",
+                ascii_of_int(i),
+                b"] = ",
+                arr.name,
+                b"[",
+                ascii_of_int(i),
+                b"];",
+              ])),
+          ),
+        ]),
+      )
+    },
+  }
+}
+
+fn operand(printing: Printing, args: List<Arg>, i: Int) -> Bytes =
+  match args.at(i) { Some(a) -> arg_text(printing, a), None -> b"0" }
+
+fn call_into(printing: Printing, depth: Int, into: Option<Var>, call: List<Piece>) -> Printing =
+  match into {
+    Some(v) -> {
+      let n = named(printing, v);
+      spliced(
+        n.printing,
+        depth,
+        [Text(Bytes::concat_all([c_type(v.representation), b" ", n.name, b" = "]))].concat(
+          call,
+        ).push(
+          Text(b";"),
+        ),
+      )
+    },
+    None -> spliced(printing, depth, call.push(Text(b";"))),
+  }
+
+fn spliced(printing: Printing, depth: Int, ps: List<Piece>) -> Printing =
+  { ..printing, out: printing.out.push(Text(pad(depth))).concat(ps).push(Text(b"\n")) }

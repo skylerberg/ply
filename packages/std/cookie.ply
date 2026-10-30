@@ -1,30 +1,32 @@
-//! Cookies as RFC 6265bis has them: the `Cookie` field a request carries, the `Set-Cookie` field a
-//! response sets, values signed or sealed under a key, and the jar a client keeps.
+//! Cookies as RFC 6265bis defines them: the `Cookie` field a request carries, the `Set-Cookie`
+//! field a response sends, values signed or encrypted under a key, and the jar where a client
+//! stores cookies.
 //!
-//! `pairs` reads a `Cookie` field leniently, as a server must: a pair it cannot read is passed
-//! over, never the field. `set_cookie` makes a cookie as a server should set one unless told
-//! otherwise: `Secure`, `HttpOnly`, `Path=/` and `SameSite=Lax`. `render` writes one and refuses
-//! (`cookie.refused`) what a browser would drop or what would read back as something else: a name
-//! that is no token, a value outside the cookie octets, a name and value over 4096 bytes or an
-//! attribute over 1024, a `Domain` or `Path` a field cannot carry, a `__Secure-` cookie without
-//! `Secure`, a `__Host-` one with a `Domain` or a `Path` other than `/`, and `SameSite=None` or
-//! `Partitioned` without `Secure`. The prefixes are matched without regard to case, as a browser
-//! matches them.
+//! `pairs` reads a `Cookie` field leniently, as a server must: it skips a pair it cannot read,
+//! never the whole field. `set_cookie` makes a cookie with the defaults a server should use unless
+//! it has a reason not to: `Secure`, `HttpOnly`, `Path=/` and `SameSite=Lax`. `render` writes a
+//! cookie. It raises `cookie.fail` for any cookie a browser would drop or would read back as
+//! something else: a name that is not a token, a value outside the cookie octets, a name and value
+//! over 4096 bytes or an attribute over 1024, a `Domain` or `Path` a field cannot carry, a
+//! `__Secure-` cookie without `Secure`, a `__Host-` one with a `Domain` or a `Path` other than `/`,
+//! and `SameSite=None` or `Partitioned` without `Secure`. The prefixes are matched ignoring case,
+//! as a browser matches them.
 //!
-//! `signed` writes a value a client can read and cannot change: HMAC-SHA-256 under a key, over
-//! the cookie's name and the value. `sealed` writes one it can neither read nor change:
-//! XChaCha20-Poly1305 under a `std.crypto` key, the name bound in. Either binds the name, so a
-//! value set for one cookie is refused under another.
+//! `signed` writes a value a client can read but cannot change: an HMAC-SHA-256 tag under a key,
+//! over the cookie's name and the value. `sealed` writes a value a client can neither read nor
+//! change: XChaCha20-Poly1305 encryption under a `std.crypto` key, with the name bound in. Both
+//! bind the name, so a value set for one cookie is rejected under another.
 //!
 //! A `Jar` is a client's cookies as a value. `store` takes the `Set-Cookie` fields of a response
-//! from a URL, and `header_for` answers the `Cookie` field a request to a URL carries, each at an
-//! instant the caller reads from the wall clock, counted from the Unix epoch. A cookie goes back to
-//! the host that set it, or to the domain it named where that host is in it; under its path; over
-//! `https` alone where it is `Secure`; and until it expires. A response over `http` sets no
-//! `Secure` cookie and replaces none. There is no public suffix list here: a `Domain` of one label
-//! is refused, and one such as `co.uk` is not, so a jar shared between sites that do not trust one
-//! another is not what this is. `SameSite` is a browser's rule about which site started a request,
-//! which a client that starts every request itself does not have.
+//! from a URL. `header_for` returns the `Cookie` field for a request to a URL. Both take the
+//! current instant, which the caller reads from the wall clock, counted from the Unix epoch. A
+//! cookie is sent back to the host that set it, or to the domain it named if that host is in it.
+//! It is sent only under its path, only over `https` if it is `Secure`, and only until it expires.
+//! A response over `http` cannot set a `Secure` cookie or replace one. There is no public suffix
+//! list here: a `Domain` of one label is rejected, but one such as `co.uk` is not. So this jar is
+//! not safe to share between sites that do not trust each other. `SameSite` is a browser's rule
+//! about which site started a request, and does not apply to a client that starts every request
+//! itself.
 
 import std.base64 (base64url_decode, base64url_encode)
 import std.crypto
@@ -48,8 +50,8 @@ import std.gen
 /// One `name=value` of a request's `Cookie` field.
 pub type Pair = { name: String, value: String }
 
-/// The pairs of a `Cookie` field, in the order written. A pair whose name is no token, or that
-/// has no `=`, is passed over; a value in double quotes is read without them.
+/// The pairs of a `Cookie` field, in order. A pair whose name is not a token, or that has no `=`,
+/// is skipped. A value in double quotes is read without the quotes.
 pub fn pairs(field: String) -> List<Pair> / {abort.raise} =
   field.split(";").fold([], |found: List<Pair>, piece: String|
     match pair_of(piece) { Some(p) -> found.push(p), None -> found })
@@ -98,17 +100,18 @@ pub type SetCookie = {
   expires: Option<OffsetDateTime>,
   /// The domain it is sent to besides the host that set it; `None` keeps it to that host.
   domain: Option<String>,
-  /// The path under which it is sent; `None` leaves the client to take the request's directory.
+  /// The path under which it is sent; `None` lets the client use the request's directory.
   path: Option<String>,
   secure: Bool,
   http_only: Bool,
   same_site: SameSite,
-  /// Kept apart for each site that embeds the one that set it (CHIPS); needs `Secure`.
+  /// Stored separately for each site that embeds the site that set it (CHIPS). Needs `Secure`.
   partitioned: Bool,
 }
 
-/// A cookie as a server sets one unless told otherwise: until the browser closes, to the host
-/// alone, under `/`, over `https` alone, out of scripts' reach, and on cross-site navigations only.
+/// A cookie with the defaults a server should use. It lasts until the browser closes, and is sent
+/// only to the host that set it, under `/`, and over `https`. Scripts cannot read it, and it is
+/// sent cross-site only on top-level navigations.
 pub fn set_cookie(name: String, value: String) -> SetCookie =
   {
     name: name,
@@ -123,35 +126,35 @@ pub fn set_cookie(name: String, value: String) -> SetCookie =
     partitioned: false,
   }
 
-/// What tells a client to forget the cookie `c` names: the same name, domain and path, an empty
-/// value, `Max-Age=0`, and an `Expires` at the epoch for a client that reads no `Max-Age`.
+/// A cookie that tells a client to delete `c`: the same name, domain and path, an empty value,
+/// `Max-Age=0`, and an `Expires` at the epoch for clients that ignore `Max-Age`.
 pub fn removal(c: SetCookie) -> SetCookie =
   { ..c, value: "", max_age: Some(0), expires: date::of_unix_seconds(0) }
 
 /// Why a cookie cannot be written.
-pub type Why =
-  /// The name is no token of RFC 9110.
+pub type Error =
+  /// The name is not an RFC 9110 token.
   | BadName
-  /// The value holds a byte outside the cookie octets: a control, a space, `"`, `,`, `;` or `\`.
+  /// The value contains a byte outside the cookie octets: a control, a space, `"`, `,`, `;` or `\`.
   | BadValue
   /// The domain is not one or more labels of letters, digits and `-`.
   | BadDomain
-  /// The path does not begin with `/`, or holds a control or `;`.
+  /// The path does not begin with `/`, or contains a control character or `;`.
   | BadPath
   /// The name and the value are over 4096 bytes together.
   | TooLong
   /// The named attribute's value is over 1024 bytes.
   | AttributeTooLong(String)
-  /// What the text names needs `Secure`: a `__Secure-` or `__Host-` name, `SameSite=None`, or
-  /// `Partitioned`.
+  /// The feature the text names needs `Secure`: a `__Secure-` or `__Host-` name,
+  /// `SameSite=None`, or `Partitioned`.
   | NeedsSecure(String)
   /// A `__Host-` cookie names a `Domain`, or a `Path` other than `/`.
   | HostPrefix
 
-/// What this module raises where it refuses.
+/// The error this module raises.
 pub effect cookie {
   /// The cookie cannot be written as it is.
-  raise refused(why: Why)
+  raise fail(why: Error)
 }
 
 /// The most bytes a name and its value take together.
@@ -160,9 +163,9 @@ pub fn max_pair() -> Int = 4096
 /// The most bytes an attribute's value takes.
 pub fn max_attribute() -> Int = 1024
 
-/// The `Set-Cookie` field's value for `c`, raising `cookie.refused` where `written` answers `Err`.
-pub fn render(c: SetCookie) -> String / {cookie.refused} = {
-  checked(c);
+/// The `Set-Cookie` field's value for `c`. Raises `cookie.fail` where `try_render` returns `Err`.
+pub fn render(c: SetCookie) -> String / {cookie.fail} = {
+  validate(c);
   let parts = [
     c.name ++ "=" ++ c.value,
     attribute("Max-Age", option_map_text(c.max_age, Int::to_string)),
@@ -179,7 +182,7 @@ pub fn render(c: SetCookie) -> String / {cookie.refused} = {
 }
 
 /// The `Set-Cookie` field's value for `c`, or why it cannot be written.
-pub fn written(c: SetCookie) -> Result<String, Why> = try { render(c) }
+pub fn try_render(c: SetCookie) -> Result<String, Error> = try { render(c) }
 
 fn option_map_text<a>(x: Option<a>, f: (a) -> String) -> Option<String> =
   match x { Some(v) -> Some(f(v)), None -> None }
@@ -189,44 +192,42 @@ fn attribute(name: String, value: Option<String>) -> String =
 
 fn flag(name: String, on: Bool) -> String = if on { name } else { "" }
 
-/// How `SameSite` writes each.
+/// How each `SameSite` value is written in a `Set-Cookie` field.
 pub fn same_site_name(s: SameSite) -> String =
   match s { Strict -> "Strict", Lax -> "Lax", Unrestricted -> "None" }
 
-fn checked(c: SetCookie) -> Unit / {cookie.refused} =
-  if !is_token(c.name) { cookie.refused(BadName) }
-  else if !cookie_octets(c.value) { cookie.refused(BadValue) }
-  else if Bytes::of_string(c.name ++ c.value).len() > max_pair() { cookie.refused(TooLong) }
-  else { attributes_checked(c) }
+fn validate(c: SetCookie) -> Unit / {cookie.fail} =
+  if !is_token(c.name) { cookie.fail(BadName) }
+  else if !all_cookie_octets(c.value) { cookie.fail(BadValue) }
+  else if Bytes::of_string(c.name ++ c.value).len() > max_pair() { cookie.fail(TooLong) }
+  else { validate_attributes(c) }
 
-fn attributes_checked(c: SetCookie) -> Unit / {cookie.refused} = {
+fn validate_attributes(c: SetCookie) -> Unit / {cookie.fail} = {
   match c.domain {
     Some(d) -> if Bytes::of_string(d).len() > max_attribute() {
-      cookie.refused(AttributeTooLong("Domain"))
-    } else if !domain_text(d) { cookie.refused(BadDomain) }
+      cookie.fail(AttributeTooLong("Domain"))
+    } else if !is_valid_domain(d) { cookie.fail(BadDomain) }
     else { () },
     None -> (),
   };
   match c.path {
     Some(p) -> if Bytes::of_string(p).len() > max_attribute() {
-      cookie.refused(AttributeTooLong("Path"))
-    } else if !path_text(p) { cookie.refused(BadPath) }
+      cookie.fail(AttributeTooLong("Path"))
+    } else if !is_valid_path(p) { cookie.fail(BadPath) }
     else { () },
     None -> (),
   };
-  prefixes_checked(c)
+  validate_prefixes(c)
 }
 
-fn prefixes_checked(c: SetCookie) -> Unit / {cookie.refused} =
+fn validate_prefixes(c: SetCookie) -> Unit / {cookie.fail} =
   if host_prefixed(c.name) {
-    if !c.secure { cookie.refused(NeedsSecure("a `__Host-` name")) }
-    else if c.domain != None || c.path != Some("/") { cookie.refused(HostPrefix) }
+    if !c.secure { cookie.fail(NeedsSecure("a `__Host-` name")) }
+    else if c.domain != None || c.path != Some("/") { cookie.fail(HostPrefix) }
     else { () }
-  } else if secure_prefixed(c.name) && !c.secure {
-    cookie.refused(NeedsSecure("a `__Secure-` name"))
-  } else if c.same_site == Unrestricted && !c.secure {
-    cookie.refused(NeedsSecure("`SameSite=None`"))
-  } else if c.partitioned && !c.secure { cookie.refused(NeedsSecure("`Partitioned`")) }
+  } else if secure_prefixed(c.name) && !c.secure { cookie.fail(NeedsSecure("a `__Secure-` name")) }
+  else if c.same_site == Unrestricted && !c.secure { cookie.fail(NeedsSecure("`SameSite=None`")) }
+  else if c.partitioned && !c.secure { cookie.fail(NeedsSecure("`Partitioned`")) }
   else { () }
 
 fn host_prefixed(name: String) -> Bool = name.ascii_lower().starts_with("__host-")
@@ -235,21 +236,21 @@ fn secure_prefixed(name: String) -> Bool = name.ascii_lower().starts_with("__sec
 
 /// Whether every byte of `value` is a cookie octet: `!`, `#` to `+`, `-` to `:`, `<` to `[` or `]`
 /// to `~`.
-fn cookie_octets(value: String) -> Bool = {
+fn all_cookie_octets(value: String) -> Bool = {
   let b = Bytes::of_string(value);
-  range(0, b.len()).fold(true, |ok: Bool, i: Int| ok && cookie_octet(b.at(i)))
+  range(0, b.len()).fold(true, |ok: Bool, i: Int| ok && is_cookie_octet(b.at(i)))
 }
 
-fn cookie_octet(o: Int) -> Bool =
+fn is_cookie_octet(o: Int) -> Bool =
   o == 0x21 || (o >= 0x23 && o <= 0x2b) || (o >= 0x2d && o <= 0x3a) || (o >= 0x3c && o <= 0x5b)
     || (o >= 0x5d && o <= 0x7e)
 
 /// One or more labels of letters, digits and `-`, a label neither empty nor longer than 63.
-fn domain_text(d: String) -> Bool =
+fn is_valid_domain(d: String) -> Bool =
   d.is_ascii() && d.len() > 0
-    && d.split(".").fold(true, |ok: Bool, label: String| ok && label_text(label))
+    && d.split(".").fold(true, |ok: Bool, label: String| ok && is_valid_label(label))
 
-fn label_text(label: String) -> Bool = {
+fn is_valid_label(label: String) -> Bool = {
   let b = Bytes::of_string(label);
   b.len() > 0 && b.len() <= 63
     && range(0, b.len()).fold(true, |ok: Bool, i: Int| ok && ldh(b.at(i)))
@@ -258,7 +259,7 @@ fn label_text(label: String) -> Bool = {
 fn ldh(o: Int) -> Bool =
   (o >= 0x30 && o <= 0x39) || (o >= 0x41 && o <= 0x5a) || (o >= 0x61 && o <= 0x7a) || o == 0x2d
 
-fn path_text(p: String) -> Bool = {
+fn is_valid_path(p: String) -> Bool = {
   let b = Bytes::of_string(p);
   p.starts_with("/")
     && range(0, b.len()).fold(true, |ok: Bool, i: Int| {
@@ -269,12 +270,12 @@ fn path_text(p: String) -> Bool = {
 
 // --- Reading a Set-Cookie field ---------------------------------------------
 
-/// A `Set-Cookie` field as a client reads it, by RFC 6265bis §5.6: `None` where it holds no
-/// cookie, a name and value with no `=`, an empty name, or over 4096 bytes. An attribute that does
-/// not read, or whose value is over 1024 bytes, is passed over; of one written twice the last
-/// counts. An `Expires` is read as an HTTP date with `now` deciding a two-digit year; a `Path`
-/// that does not begin with `/` is no path. An unknown `SameSite` is `Lax`. Nothing is checked
-/// against the URL here: that is `store`'s.
+/// A `Set-Cookie` field read as a client reads it, by RFC 6265bis §5.6. `None` if the field has no
+/// cookie: its name and value have no `=`, its name is empty, or its name and value are over 4096
+/// bytes. An attribute that cannot be read, or whose value is over 1024 bytes, is skipped. When an
+/// attribute appears twice, the last one wins. An `Expires` is read as an HTTP date, with `now`
+/// deciding the century of a two-digit year. A `Path` that does not begin with `/` is ignored. An
+/// unknown `SameSite` is `Lax`. Nothing is checked against the URL here; `store` does that.
 pub fn parse_set_cookie(field: String, now: Instant) -> Option<SetCookie> / {abort.raise} = {
   let pieces = field.split(";");
   let first = match pieces.at(0) { Some(p) -> p, None -> "" };
@@ -368,15 +369,15 @@ fn max_age_of(value: String) -> Option<Int> / {abort.raise} = {
 
 // --- Values signed or sealed -----------------------------------------------
 
-/// `value` as a cookie named `name` carries it with a tag under `key`: its bytes and the tag, each
-/// in unpadded base64url, joined by `.`. A client can read it and cannot change it.
+/// `value` signed with `key` for the cookie `name`: the value's bytes and an HMAC tag, each in
+/// unpadded base64url, joined by `.`. A client can read it but cannot change it.
 pub fn signed(key: Secret<Bytes>, name: String, value: Bytes) -> String / {abort.raise} = {
   let text = base64url_encode(value);
   text ++ "." ++ base64url_encode(hmac_sha256(key, tagged(name, text)))
 }
 
-/// What `signed` wrote under `key` for the cookie `name`, or `None`: the tag is not that key's
-/// over that name and value, or the text is not what `signed` writes.
+/// The value `signed` wrote under `key` for the cookie `name`. `None` if the tag does not match
+/// that key, name and value, or the text is not in the form `signed` writes.
 pub fn verified(key: Secret<Bytes>, name: String, text: String) -> Option<Bytes> / {abort.raise} = {
   let b = Bytes::of_string(text);
   match b.index_of(b".") {
@@ -395,21 +396,22 @@ pub fn verified(key: Secret<Bytes>, name: String, text: String) -> Option<Bytes>
 
 fn tagged(name: String, body: String) -> Bytes = Bytes::of_string(name ++ "=" ++ body)
 
-/// `value` sealed under `key` for the cookie `name`, in unpadded base64url: a client can neither
-/// read it nor change it, and a value sealed for one name does not open under another.
+/// `value` encrypted under `key` for the cookie `name`, in unpadded base64url. A client can neither
+/// read it nor change it, and a value sealed for one name does not decrypt under another.
 pub fn sealed(key: SealKey, name: String, value: Bytes) -> String / {entropy.next, abort.raise} =
   base64url_encode(crypto::seal(key, value, Bytes::of_string(name)))
 
-/// `sealed` under the nonce it is handed, which is what a test runs.
+/// `sealed` with a given nonce, so that a test gets the same output on every run.
 pub fn sealed_under(
   key: SealKey,
   nonce: Bytes,
   name: String,
   value: Bytes,
 ) -> String / {abort.raise} =
-  base64url_encode(crypto::seal_under(key, nonce, value, Bytes::of_string(name)))
+  base64url_encode(crypto::seal_with_nonce(key, nonce, value, Bytes::of_string(name)))
 
-/// What `sealed` sealed under `key` for the cookie `name`, or `None`.
+/// The value `sealed` encrypted under `key` for the cookie `name`, or `None` if it does not
+/// decrypt.
 pub fn opened(key: SealKey, name: String, text: String) -> Option<Bytes> / {abort.raise} =
   match base64url_decode(text) {
     Some(b) -> crypto::open(key, b, Bytes::of_string(name)),
@@ -418,10 +420,10 @@ pub fn opened(key: SealKey, name: String, text: String) -> Option<Bytes> / {abor
 
 // --- The jar ----------------------------------------------------------------
 
-/// A cookie a jar holds, as RFC 6265bis §5.7 stores one: the host or domain it goes back to, the
-/// path under which it does, when it expires from the epoch (`None` for one that lasts the session)
-/// and the order it was first set in.
-pub type Stored = {
+/// A cookie in a jar, as RFC 6265bis §5.7 stores one: the host or domain it is sent back to, the
+/// path it is sent under, when it expires, counted from the epoch (`None` for a session cookie),
+/// and the order in which it was first set.
+pub type StoredCookie = {
   name: String,
   value: String,
   domain: String,
@@ -434,31 +436,31 @@ pub type Stored = {
   created: Int,
 }
 
-/// A client's cookies, and the most it keeps: past that the oldest goes first.
-pub type Jar = new { cookies: List<Stored>, made: Int, most: Int }
+/// A client's cookies, and the most it stores. Past that limit the oldest is dropped first.
+pub type Jar = new { cookies: List<StoredCookie>, made: Int, most: Int }
 
-/// A jar that holds no cookie and keeps at most `most`.
+/// An empty jar that stores at most `most` cookies.
 pub fn jar(most: Int) -> Jar = { cookies: [], made: 0, most: max(most, 0) }
 
-/// The cookies `j` holds, in the order they were first set.
-pub fn held(j: Jar) -> List<Stored> = j.cookies
+/// The cookies in `j`, in the order they were first set.
+pub fn all_cookies(j: Jar) -> List<StoredCookie> = j.cookies
 
-/// `j` with what each `Set-Cookie` field of a response from `from` sets, at `now`. A field that
-/// does not read, or that sets a cookie `from` may not set, is passed over: a `Domain` `from`'s
-/// host is not in, or of one label; a `Secure` cookie, or one that would replace one, over
-/// `http`; a prefixed name its attributes do not keep to; `SameSite=None` without `Secure`. A
-/// cookie that has expired removes the one it names.
+/// `j` with the cookies each `Set-Cookie` field of a response from `from` sets, at `now`. A field
+/// is skipped if it cannot be read, or if it sets a cookie `from` may not set: a `Domain` that does
+/// not contain `from`'s host, or that has one label; over `http`, a `Secure` cookie or one that
+/// would replace a `Secure` cookie; a prefixed name whose attributes break the prefix's rules; or
+/// `SameSite=None` without `Secure`. An expired cookie removes the stored cookie it names.
 pub fn store(j: Jar, from: Url, fields: List<String>, now: Instant) -> Jar / {abort.raise} =
   fields.fold(j, |kept: Jar, field: String|
     match parse_set_cookie(field, now) {
-      Some(c) -> match admitted(kept, from, c, now) {
-        Some(s) -> placed(kept, s, now),
+      Some(c) -> match accepted(kept, from, c, now) {
+        Some(s) -> insert_cookie(kept, s, now),
         None -> kept,
       },
       None -> kept,
     })
 
-/// The `Cookie` field a request to `to` carries at `now`, or `None` where no cookie goes there.
+/// The `Cookie` field for a request to `to` at `now`, or `None` if no cookie is sent there.
 pub fn header_for(j: Jar, to: Url, now: Instant) -> Option<String> / {abort.raise} =
   match sent_to(j, to, now) {
     [] -> None,
@@ -470,25 +472,25 @@ pub fn header_for(j: Jar, to: Url, now: Instant) -> Option<String> / {abort.rais
       ),
   }
 
-/// The cookies a request to `to` carries at `now`, the longer paths first and of equal paths the
-/// older first, as RFC 6265bis §5.8.3 orders them.
+/// The cookies sent with a request to `to` at `now`. Longer paths come first, and among equal
+/// paths older cookies come first, as RFC 6265bis §5.8.3 orders them.
 pub fn sent_to(j: Jar, to: Url, now: Instant) -> List<Pair> / {abort.raise} = {
   let host = host_of(to);
   let secure = secure_scheme(to);
   let path = request_path(to);
-  let going = j.cookies.filter(|s: Stored|
-    live(s, now) && domain_goes(s, host) && path_matches(path, s.path) && (secure || !s.secure));
-  going.sort_by(|a: Stored, b: Stored|
+  let going = j.cookies.filter(|s: StoredCookie|
+    live(s, now) && domain_applies(s, host) && path_matches(path, s.path) && (secure || !s.secure));
+  going.sort_by(|a: StoredCookie, b: StoredCookie|
     a.path.len() > b.path.len() || (a.path.len() == b.path.len() && a.created < b.created)).map(
-    |s: Stored| { name: s.name, value: s.value },
+    |s: StoredCookie| { name: s.name, value: s.value },
   )
 }
 
 /// `j` without the cookies that have expired at `now`.
 pub fn expired_removed(j: Jar, now: Instant) -> Jar =
-  { ..j, cookies: j.cookies.filter(|s: Stored| live(s, now)) }
+  { ..j, cookies: j.cookies.filter(|s: StoredCookie| live(s, now)) }
 
-fn live(s: Stored, now: Instant) -> Bool =
+fn live(s: StoredCookie, now: Instant) -> Bool =
   match s.expires { Some(at) -> nanos_at(at) > nanos_at(now), None -> true }
 
 fn host_of(u: Url) -> String =
@@ -516,21 +518,21 @@ fn default_path(u: Url) -> String / {abort.raise} = {
   }
 }
 
-fn domain_goes(s: Stored, host: String) -> Bool =
+fn domain_applies(s: StoredCookie, host: String) -> Bool =
   if s.host_only { host == s.domain } else { domain_matches(host, s.domain) }
 
 /// Whether `host` is `domain`, or a name below it.
 fn domain_matches(host: String, domain: String) -> Bool =
   host == domain || host.ends_with("." ++ domain)
 
-/// RFC 6265bis §5.1.4: the path is the cookie's, or below it at a `/`.
+/// RFC 6265bis §5.1.4: the path equals the cookie's path, or is below it at a `/` boundary.
 fn path_matches(path: String, cookie_path: String) -> Bool / {abort.raise} =
   path == cookie_path
     || (path.starts_with(cookie_path)
     && (cookie_path.ends_with("/") || path.slice(cookie_path.len(), cookie_path.len() + 1) == "/"))
 
-/// What `c`, set by a response from `from`, is stored as, or `None` where it may not be.
-fn admitted(j: Jar, from: Url, c: SetCookie, now: Instant) -> Option<Stored> / {abort.raise} = {
+/// How `c`, set by a response from `from`, is stored, or `None` if it may not be stored.
+fn accepted(j: Jar, from: Url, c: SetCookie, now: Instant) -> Option<StoredCookie> / {abort.raise} = {
   let host = host_of(from);
   let secure = secure_scheme(from);
   let place = match c.domain {
@@ -542,14 +544,14 @@ fn admitted(j: Jar, from: Url, c: SetCookie, now: Instant) -> Option<Stored> / {
     else { None },
   };
   let path = match c.path { Some(p) -> p, None -> default_path(from) };
-  let refused = host.len() == 0 || (c.secure && !secure)
+  let fail = host.len() == 0 || (c.secure && !secure)
     || (host_prefixed(c.name) && (!c.secure || c.domain != None || path != "/"))
     || (secure_prefixed(c.name) && !c.secure)
     || (c.same_site == Unrestricted && !c.secure)
     || (!secure && shadows_secure(j, c.name, host, path));
   match place {
     None -> None,
-    Some(at) -> if refused { None } else {
+    Some(at) -> if fail { None } else {
       Some({
         name: c.name,
         value: c.value,
@@ -566,13 +568,14 @@ fn admitted(j: Jar, from: Url, c: SetCookie, now: Instant) -> Option<Stored> / {
   }
 }
 
-/// Whether a `Secure` cookie of this name is held where a cookie set over `http` would replace it.
+/// Whether the jar has a `Secure` cookie of this name that a cookie set over `http` would replace.
 fn shadows_secure(j: Jar, name: String, host: String, path: String) -> Bool / {abort.raise} =
-  j.cookies.any(|s: Stored|
+  j.cookies.any(|s: StoredCookie|
     s.secure && s.name == name && (domain_matches(s.domain, host) || domain_matches(host, s.domain))
       && path_matches(path, s.path))
 
-/// `Max-Age` wins over `Expires`; zero or less is the earliest instant there is.
+/// When a cookie expires. `Max-Age` wins over `Expires`, and a `Max-Age` of zero or less means
+/// the earliest possible instant.
 fn expiry(c: SetCookie, now: Instant) -> Option<Instant> =
   match c.max_age {
     Some(n) -> Some(if n <= 0 { Instant(0) } else { after(now, seconds(n)) }),
@@ -582,27 +585,28 @@ fn expiry(c: SetCookie, now: Instant) -> Option<Instant> =
 fn date_instant(at: OffsetDateTime) -> Instant =
   match date::instant(at) { Some(i) -> i, None -> Instant(0) }
 
-/// `j` with `s` in place of the cookie of its name, domain and path, which keeps its place in
-/// the order; an expired `s` only removes that one.
-fn placed(j: Jar, s: Stored, now: Instant) -> Jar = {
-  let same = |t: Stored| t.name == s.name && t.domain == s.domain && t.path == s.path;
-  let before = j.cookies.filter(|t: Stored| same(t));
-  let others = j.cookies.filter(|t: Stored| !same(t));
+/// `j` with `s` replacing the cookie with the same name, domain and path, in that cookie's place
+/// in the order. An expired `s` only removes the old cookie.
+fn insert_cookie(j: Jar, s: StoredCookie, now: Instant) -> Jar = {
+  let same = |t: StoredCookie| t.name == s.name && t.domain == s.domain && t.path == s.path;
+  let before = j.cookies.filter(|t: StoredCookie| same(t));
+  let others = j.cookies.filter(|t: StoredCookie| !same(t));
   if !live(s, now) { { ..j, cookies: others } } else {
     let kept = match before { [old, ..] -> { ..s, created: old.created }, [] -> s };
-    let all = others.filter(|t: Stored| live(t, now)).push(kept).sort_by(|a: Stored, b: Stored|
-      a.created < b.created);
+    let all = others.filter(|t: StoredCookie| live(t, now)).push(kept).sort_by(
+      |a: StoredCookie, b: StoredCookie| a.created < b.created,
+    );
     let over = all.len() - j.most;
     { cookies: if over > 0 { drop_oldest(all, over) } else { all }, made: j.made + 1, most: j.most }
   }
 }
 
-fn drop_oldest(xs: List<Stored>, n: Int) -> List<Stored> =
+fn drop_oldest(xs: List<StoredCookie>, n: Int) -> List<StoredCookie> =
   match xs { [_, ..rest] -> if n <= 0 { xs } else { drop_oldest(rest, n - 1) }, [] -> [] }
 
 // --- Tests ------------------------------------------------------------------
 
-test "a Cookie field's pairs are read in order, past what does not read" {
+test "a Cookie field's pairs are read in order, skipping any that cannot be read" {
   assert_eq(pairs("a=1; b=\"two\";c=3;=4; broken; d e=5;f="), [
     { name: "a", value: "1" },
     { name: "b", value: "two" },
@@ -615,9 +619,9 @@ test "a Cookie field's pairs are read in order, past what does not read" {
   assert_eq(get(found, "B"), None)
 }
 
-test "a cookie set by default is secure, out of scripts' reach and lax" {
+test "a default cookie is secure, hidden from scripts and lax" {
   assert_eq(
-    written(set_cookie("session", "abc123")),
+    try_render(set_cookie("session", "abc123")),
     Ok("session=abc123; Path=/; Secure; HttpOnly; SameSite=Lax"),
   );
   let every = {
@@ -629,71 +633,71 @@ test "a cookie set by default is secure, out of scripts' reach and lax" {
     partitioned: true,
   };
   assert_eq(
-    written(every),
+    try_render(every),
     Ok(
       "id=7; Max-Age=3600; Expires=Tue, 14 Nov 2023 22:13:20 GMT; Domain=example.com; Path=/; Secure; HttpOnly; SameSite=None; Partitioned",
     ),
   );
   assert_eq(
-    written(removal(set_cookie("id", "7"))),
+    try_render(removal(set_cookie("id", "7"))),
     Ok(
       "id=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; Secure; HttpOnly; SameSite=Lax",
     ),
   )
 }
 
-test "a cookie that cannot be written is refused: {c.what}" for c: { what: String, cookie: SetCookie, why: Why } in [
-    { what: "a name with a space", cookie: set_cookie("a b", "1"), why: BadName },
-    { what: "a value with a semicolon", cookie: set_cookie("a", "1;2"), why: BadValue },
-    { what: "a value with a space", cookie: set_cookie("a", "1 2"), why: BadValue },
+test "a cookie that cannot be written is rejected: {c.what}" for c: { what: String, cookie: SetCookie, reason: Error } in [
+    { what: "a name with a space", cookie: set_cookie("a b", "1"), reason: BadName },
+    { what: "a value with a semicolon", cookie: set_cookie("a", "1;2"), reason: BadValue },
+    { what: "a value with a space", cookie: set_cookie("a", "1 2"), reason: BadValue },
     {
       what: "a domain of an empty label",
       cookie: { ..set_cookie("a", "1"), domain: Some("a..b") },
-      why: BadDomain,
+      reason: BadDomain,
     },
     {
       what: "a path not from the root",
       cookie: { ..set_cookie("a", "1"), path: Some("x") },
-      why: BadPath,
+      reason: BadPath,
     },
     {
       what: "a path that ends the field",
       cookie: { ..set_cookie("a", "1"), path: Some("/a;b") },
-      why: BadPath,
+      reason: BadPath,
     },
     {
       what: "a `__Secure-` cookie over http",
       cookie: { ..set_cookie("__Secure-a", "1"), secure: false },
-      why: NeedsSecure("a `__Secure-` name"),
+      reason: NeedsSecure("a `__Secure-` name"),
     },
     {
       what: "a `__Host-` cookie that names a domain",
       cookie: { ..set_cookie("__Host-a", "1"), domain: Some("example.com") },
-      why: HostPrefix,
+      reason: HostPrefix,
     },
     {
       what: "a `__host-` cookie under a path",
       cookie: { ..set_cookie("__host-a", "1"), path: Some("/app") },
-      why: HostPrefix,
+      reason: HostPrefix,
     },
     {
       what: "`SameSite=None` over http",
       cookie: { ..set_cookie("a", "1"), secure: false, same_site: Unrestricted },
-      why: NeedsSecure("`SameSite=None`"),
+      reason: NeedsSecure("`SameSite=None`"),
     },
     {
       what: "`Partitioned` over http",
       cookie: { ..set_cookie("a", "1"), secure: false, partitioned: true },
-      why: NeedsSecure("`Partitioned`"),
+      reason: NeedsSecure("`Partitioned`"),
     },
-  ] { assert_eq(written(c.cookie), Err(c.why)) }
+  ] { assert_eq(try_render(c.cookie), Err(c.reason)) }
 
-test "a name and value over 4096 bytes, or an attribute over 1024, is refused" {
+test "a name and value over 4096 bytes, or an attribute over 1024, is rejected" {
   let long = |n: Int| range(0, n).fold("", |acc: String, _i: Int| acc ++ "x");
-  assert_eq(written(set_cookie("a", long(4096))), Err(TooLong));
-  assert(written(set_cookie("a", long(4095))) != Err(TooLong));
+  assert_eq(try_render(set_cookie("a", long(4096))), Err(TooLong));
+  assert(try_render(set_cookie("a", long(4095))) != Err(TooLong));
   assert_eq(
-    written({ ..set_cookie("a", "1"), path: Some("/" ++ long(1024)) }),
+    try_render({ ..set_cookie("a", "1"), path: Some("/" ++ long(1024)) }),
     Err(AttributeTooLong("Path")),
   )
 }
@@ -750,10 +754,10 @@ test "a signed value is read back under its key and name, and under nothing else
   assert_eq(verified(key, "basket", text), None);
   assert_eq(verified(key, "cart", signed(key, "cart", b"4 bolts") ++ "x"), None);
   assert_eq(verified(key, "cart", "no dot here"), None);
-  assert(cookie_octets(text))
+  assert(all_cookie_octets(text))
 }
 
-test "a sealed value opens under its key and name, and is no value to read" {
+test "a sealed value decrypts under its key and name, and cannot be read without them" {
   match crypto::seal_key(Secret::of_bytes(b"0123456789abcdef0123456789abcdef")) {
     None -> panic("a key of 32 bytes"),
     Some(key) -> {
@@ -762,7 +766,7 @@ test "a sealed value opens under its key and name, and is no value to read" {
       assert_eq(opened(key, "cart", text), Some(b"3 bolts"));
       assert_eq(opened(key, "basket", text), None);
       assert(!text.contains(base64url_encode(b"3 bolts")));
-      assert(cookie_octets(text))
+      assert(all_cookie_octets(text))
     },
   }
 }
@@ -794,7 +798,7 @@ test "a jar sends a cookie back where it was set, and no further" {
   )
 }
 
-test "a jar refuses what a response may not set: {c.what}" for c: { what: String, from: Url, field: String } in [
+test "a jar rejects what a response may not set: {c.what}" for c: { what: String, from: Url, field: String } in [
     {
       what: "a domain the host is not in",
       from: url"https://a.example.com/",
@@ -823,14 +827,14 @@ test "a jar refuses what a response may not set: {c.what}" for c: { what: String
       field: "x=1; SameSite=None",
     },
     { what: "a domain on an address", from: url"https://192.0.2.1/", field: "x=1; Domain=0.2.1" },
-  ] { assert_eq(held(store(jar(50), c.from, [c.field], today())), []) }
+  ] { assert_eq(all_cookies(store(jar(50), c.from, [c.field], today())), []) }
 
-test "an http response replaces no secure cookie, and an expired one removes its namesake" {
+test "an http response cannot replace a secure cookie, and an expired one removes its namesake" {
   let secure = store(jar(50), url"https://example.com/", ["id=s; Secure; Path=/"], today());
   let shadowed = store(secure, url"http://example.com/", ["id=plain; Path=/"], today());
   assert_eq(header_for(shadowed, url"https://example.com/", today()), Some("id=s"));
   let gone = store(secure, url"https://example.com/", ["id=; Secure; Path=/; Max-Age=0"], today());
-  assert_eq(held(gone), []);
+  assert_eq(all_cookies(gone), []);
   let later = store(secure, url"https://example.com/", ["t=1; Max-Age=10"], today());
   assert_eq(
     header_for(later, url"https://example.com/", after(today(), seconds(11))),
@@ -848,9 +852,9 @@ test "an http response replaces no secure cookie, and an expired one removes its
   assert_eq(header_for(dated, url"https://example.com/", today()), Some("new=2"))
 }
 
-test "a jar keeps at most its bound, the oldest going first" {
+test "a jar stores at most its limit, dropping the oldest first" {
   let full = store(jar(2), url"https://example.com/", ["a=1", "b=2", "c=3"], today());
-  assert_eq(held(full).map(|s: Stored| s.name), ["b", "c"]);
+  assert_eq(all_cookies(full).map(|s: StoredCookie| s.name), ["b", "c"]);
   let replaced = store(full, url"https://example.com/", ["b=9"], today());
   assert_eq(header_for(replaced, url"https://example.com/", today()), Some("b=9; c=3"))
 }
@@ -870,7 +874,7 @@ test "a cookie set for its own host is never sent to another" {
   })
 }
 
-test "a jar holds no more than its bound" {
+test "a jar never has more cookies than its limit" {
   gen::check2(gen::any_int(), gen::list(gen::any_int()), |most: Int, ns: List<Int>| {
     let j = store(
       jar(abs(most % 8)),
@@ -878,11 +882,11 @@ test "a jar holds no more than its bound" {
       ns.map(|n: Int| named(n) ++ "=1"),
       today(),
     );
-    held(j).len() <= abs(most % 8)
+    all_cookies(j).len() <= abs(most % 8)
   })
 }
 
-test "a value read back from what signing wrote is the value" {
+test "verifying what signing wrote returns the original value" {
   gen::check(gen::bytes(), |b: Bytes| {
     let key = Secret::of_bytes(b"0123456789abcdef0123456789abcdef");
     verified(key, "k", signed(key, "k", b)) == Some(b)

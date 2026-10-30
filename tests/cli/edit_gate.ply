@@ -3,15 +3,16 @@
 //! answer what a check from nothing answers, every hash, type and row included, and once the edit is
 //! undone, what it answered before the edit.
 
-import compiler.syntax.items (parse, Module, Item, IFn, IType, IEffect, IDerive, IEffectSet,
-                              IInstance, INumeric, FnDef, TDSum, VPub)
-import compiler.syntax.exprs (expr_span)
+import compiler.syntax.items (parse, Module, Item, FunctionItem, TypeItem, EffectItem, DeriveItem,
+                              EffectSetItem, InstanceItem, NumericItem, FnDefinition, SumBody,
+                              Public)
+import compiler.syntax.expressions (expression_span)
 import compiler.syntax.fmt (line_end)
-import compiler.expand.embed (EmbedWant, wants_of)
-import harness (Source, Ran, Here, Spawned, project, comparable, json_of, spawned, spawned_cold,
-                shown, at, items, truth)
+import compiler.expand.embed (EmbedRequest, embed_requests)
+import harness (Source, RunResult, WorkingDirectory, PlyProcess, write_project, comparable, json_of,
+                spawned, spawned_cold, json_text, at, items, bool)
 import std.fs (fs)
-import std.place (spliced)
+import std.location (spliced)
 import std.json (Json, Object, Array)
 import std.list
 import std.string
@@ -80,11 +81,12 @@ type Change = { path: String, bytes: Bytes }
 
 fn module_of(src: Bytes) -> Option<Module> / {abort.raise} = {
   let p = parse(src);
-  if p.parser.diags.len() > 0 { None } else { Some(p.node) }
+  if p.parser.diagnostics.len() > 0 { None } else { Some(p.node) }
 }
 
-fn fns_of(m: Module) -> List<FnDef> =
-  m.items.fold([], |acc: List<FnDef>, item: Item| match item { IFn(d) -> acc.push(d), _ -> acc })
+fn functions_of(m: Module) -> List<FnDefinition> =
+  m.items.fold([], |acc: List<FnDefinition>, item: Item|
+    match item { FunctionItem(d) -> acc.push(d), _ -> acc })
 
 /// Where a line goes above every item: past the last import, else past the module's `//!` lines.
 fn above_items(text: Bytes, m: Module) -> Int / {abort.raise} =
@@ -110,13 +112,13 @@ fn last_brace(text: Bytes, start: Int, end: Int) -> Option<Int> / {abort.raise} 
     if text.at(i) == 125 { Some(i) } else { found })
 
 /// The byte before `at` that is no space, tab or newline.
-fn written_before(text: Bytes, at: Int) -> Int / {abort.raise} =
+fn last_non_blank_before(text: Bytes, at: Int) -> Int / {abort.raise} =
   range(0, at).fold(0 - 1, |found: Int, i: Int| {
     let b = text.at(i);
     if b == 32 || b == 9 || b == 10 { found } else { b }
   })
 
-fn in_dir(path: String, file: String) -> String / {abort.raise} = {
+fn sibling_path(path: String, file: String) -> String / {abort.raise} = {
   let b = Bytes::of_string(path);
   let slash = range(0, b.len()).fold(0 - 1, |found: Int, i: Int|
     if b.at(i) == 47 { i } else { found });
@@ -124,7 +126,7 @@ fn in_dir(path: String, file: String) -> String / {abort.raise} = {
 }
 
 /// `xs` each once, in the order each first appears.
-fn once(xs: List<String>) -> List<String> =
+fn distinct(xs: List<String>) -> List<String> =
   xs.fold(
     { seen: Map::new(), out: [] },
     |acc: { seen: Map<String, Bool>, out: List<String> }, x: String|
@@ -134,14 +136,18 @@ fn once(xs: List<String>) -> List<String> =
 
 /// What `e` makes of the module at `path`, whose text is `src`, as the files it writes; none where
 /// the module holds nothing it edits.
-fn edited(e: Edit, path: String, src: Bytes) -> Option<List<Change>> / {Here, abort.raise} =
+fn edited(
+  e: Edit,
+  path: String,
+  src: Bytes,
+) -> Option<List<Change>> / {WorkingDirectory, abort.raise} =
   match e {
     TouchEmbed -> match module_of(src) {
       None -> None,
-      Some(m) -> match wants_of(m).filter(|w: EmbedWant| !w.dir).first() {
+      Some(m) -> match embed_requests(m).filter(|w: EmbedRequest| !w.dir).first() {
         None -> None,
         Some(w) -> {
-          let file = in_dir(path, String::of_bytes(w.path));
+          let file = sibling_path(path, String::of_bytes(w.path));
           match fs.read_file[cwd](file) {
             None -> None,
             Some(bytes) -> Some([{ path: file, bytes: bytes.concat(b"\n") }]),
@@ -164,10 +170,10 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
           let at = above_items(src, m);
           one(spliced(src, at, at, b"// the gate's note\n"))
         },
-        WrapBody -> match fns_of(m).first() {
+        WrapBody -> match functions_of(m).first() {
           None -> None,
           Some(d) -> {
-            let s = expr_span(d.body);
+            let s = expression_span(d.body);
             one(
               spliced(
                 src,
@@ -178,26 +184,26 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
             )
           },
         },
-        RaiseBody -> match fns_of(m).first() {
+        RaiseBody -> match functions_of(m).first() {
           None -> None,
           Some(d) -> {
-            let s = expr_span(d.body);
+            let s = expression_span(d.body);
             one(spliced(src, s.start, s.end, b"panic(\"the gate\")"))
           },
         },
-        Unexport -> match fns_of(m).filter(|d: FnDef| d.vis == VPub).first() {
+        Unexport -> match functions_of(m).filter(|d: FnDefinition| d.visibility == Public).first() {
           None -> None,
           Some(d) -> match last_before(src, b"pub ", d.name.span.start) {
             Some(i) -> one(spliced(src, i, i + 4, b"")),
             None -> None,
           },
         },
-        RenameFn -> match fns_of(m).filter(|d: FnDef| d.vis == VPub).first() {
+        RenameFn -> match functions_of(m).filter(|d: FnDefinition| d.visibility == Public).first() {
           None -> None,
           Some(d) ->
             one(spliced(src, d.name.span.start, d.name.span.end, d.name.name.concat(b"_moved"))),
         },
-        RemoveFn -> match fns_of(m).last() {
+        RemoveFn -> match functions_of(m).last() {
           None -> None,
           Some(d) -> one(spliced(src, d.span.start, d.span.end, b"")),
         },
@@ -213,7 +219,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
         AddVariant -> {
           let sums = m.items.fold([], |acc: List<Int>, item: Item|
             match item {
-              IType(d) -> match d.body { TDSum(_) -> acc.push(d.span.end), _ -> acc },
+              TypeItem(d) -> match d.body { SumBody(_) -> acc.push(d.span.end), _ -> acc },
               _ -> acc,
             });
           match sums.first() {
@@ -224,8 +230,8 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
         AddField -> {
           let records = m.items.fold([], |acc: List<Int>, item: Item|
             match item {
-              IType(d) -> match d.body {
-                TDSum(_) -> acc,
+              TypeItem(d) -> match d.body {
+                SumBody(_) -> acc,
                 _ -> match last_brace(src, d.span.start, d.span.end) {
                   Some(i) -> acc.push(i),
                   None -> acc,
@@ -236,7 +242,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
           match records.first() {
             None -> None,
             Some(i) -> {
-              let before = written_before(src, i);
+              let before = last_non_blank_before(src, i);
               one(
                 spliced(src, i, i, if before == 44 || before == 123 { b" gate_field: Int " }
                 else { b", gate_field: Int " }),
@@ -247,9 +253,9 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
         DropStatement -> {
           let spans = m.items.fold([], |acc: List<{ start: Int, end: Int }>, item: Item|
             match item {
-              IDerive(d) -> acc.push({ start: d.span.start, end: d.span.end }),
-              IInstance(d) -> acc.push({ start: d.span.start, end: d.span.end }),
-              INumeric(d) -> acc.push({ start: d.span.start, end: d.span.end }),
+              DeriveItem(d) -> acc.push({ start: d.span.start, end: d.span.end }),
+              InstanceItem(d) -> acc.push({ start: d.span.start, end: d.span.end }),
+              NumericItem(d) -> acc.push({ start: d.span.start, end: d.span.end }),
               _ -> acc,
             });
           match spans.first() { None -> None, Some(s) -> one(spliced(src, s.start, s.end, b"")) }
@@ -257,7 +263,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
         NarrowSet -> {
           let cuts = m.items.fold([], |acc: List<{ start: Int, end: Int }>, item: Item|
             match item {
-              IEffectSet(d) -> {
+              EffectSetItem(d) -> {
                 let n = d.atoms.len();
                 if n < 2 { acc } else {
                   match ((d.atoms.at(n - 2), d.atoms.at(n - 1))) {
@@ -273,7 +279,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
         AddOp -> {
           let ends = m.items.fold([], |acc: List<Int>, item: Item|
             match item {
-              IEffect(d) -> match last_brace(src, d.span.start, d.span.end) {
+              EffectItem(d) -> match last_brace(src, d.span.start, d.span.end) {
                 Some(i) -> acc.push(i),
                 None -> acc,
               },
@@ -291,17 +297,17 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
 
 // --- Sessions ---------------------------------------------------------------------------------
 
-fn put(c: Change) -> Unit / {Here, abort.raise} =
+fn write_change(c: Change) -> Unit / {WorkingDirectory, abort.raise} =
   assert(fs.write_file[cwd](c.path, c.bytes), Some("`" ++ c.path ++ "` is written"))
 
-fn held(path: String) -> Bytes / {Here, abort.raise} =
+fn read_bytes(path: String) -> Bytes / {WorkingDirectory, abort.raise} =
   match fs.read_file[cwd](path) { Some(b) -> b, None -> panic("`" ++ path ++ "` reads") }
 
 /// Where `a` and `b` first differ, as a path into them and what each holds there.
 fn difference(a: Json, b: Json, at: String) -> String / {abort.raise} =
   match ((a, b)) {
     (Object(x), Object(y)) -> {
-      let keys = once(x.keys().concat(y.keys()));
+      let keys = distinct(x.keys().concat(y.keys()));
       match keys.filter(|k: String| x.get(k) != y.get(k)).first() {
         None -> at ++ ": alike",
         Some(k) -> match ((x.get(k), y.get(k))) {
@@ -316,7 +322,7 @@ fn difference(a: Json, b: Json, at: String) -> String / {abort.raise} =
         ++ "; first apart at "
         ++ apart_at(xs, ys, at)
     } else { apart_at(xs, ys, at) },
-    _ -> at ++ ": " ++ clipped(shown(a)) ++ " against " ++ clipped(shown(b)),
+    _ -> at ++ ": " ++ clipped(json_text(a)) ++ " against " ++ clipped(json_text(b)),
   }
 
 fn apart_at(xs: List<Json>, ys: List<Json>, at: String) -> String / {abort.raise} =
@@ -325,9 +331,9 @@ fn apart_at(xs: List<Json>, ys: List<Json>, at: String) -> String / {abort.raise
     Some(i) -> match ((xs.at(i), ys.at(i))) {
       (Some(u), Some(v)) -> difference(u, v, at ++ "[" ++ i.to_string() ++ "]"),
       (Some(u), None) ->
-        at ++ "[" ++ i.to_string() ++ "] is only in the first: " ++ clipped(shown(u)),
+        at ++ "[" ++ i.to_string() ++ "] is only in the first: " ++ clipped(json_text(u)),
       (None, Some(v)) ->
-        at ++ "[" ++ i.to_string() ++ "] is only in the second: " ++ clipped(shown(v)),
+        at ++ "[" ++ i.to_string() ++ "] is only in the second: " ++ clipped(json_text(v)),
       _ -> at ++ ": alike",
     },
   }
@@ -354,29 +360,30 @@ fn outcome(report: Json) -> Json =
 
 /// What a session compares after each step: the project checked, and with `runs` how its tests
 /// ended too, which the kept emitter answers and passes decide, as the check does not.
-fn answer_of<| e>(
+fn observed_state<| e>(
   runs: Bool,
-  ran: (List<String>) -> Ran / {abort.raise | e},
+  run: (List<String>) -> RunResult / {abort.raise | e},
 ) -> Json / {abort.raise | e} = {
-  let check = comparable(json_of(ran(["check", ".", "--explain", "--json"])));
-  if !runs { check } else { Array([check, outcome(json_of(ran(["test", ".", "--json"])))]) }
+  let check = comparable(json_of(run(["check", ".", "--explain", "--json"])));
+  if !runs { check } else { Array([check, outcome(json_of(run(["test", ".", "--json"])))]) }
 }
 
 /// The project as it stands, answered through its memo store.
-fn warm_of(runs: Bool) -> Json / {Spawned, abort.raise} =
-  answer_of(runs, |argv: List<String>| spawned(argv))
+fn warm_of(runs: Bool) -> Json / {PlyProcess, abort.raise} =
+  observed_state(runs, |argv: List<String>| spawned(argv))
 
 /// The same from nothing.
-fn cold_of(runs: Bool) -> Json / {Spawned, Here, abort.raise} = answer_of(runs, spawned_cold)
+fn cold_of(runs: Bool) -> Json / {PlyProcess, WorkingDirectory, abort.raise} =
+  observed_state(runs, spawned_cold)
 
 /// One step of a session, its edit made: what the warm answer and the cold one say, and, once
 /// `undo` undid it, what the warm one says against `start`.
-fn stepped(
+fn record_step(
   start: Json,
   out: Session,
   step: String,
-  undo: () -> Unit / {Here, abort.raise},
-) -> Session / {Spawned, Here, abort.raise} = {
+  undo: () -> Unit / {WorkingDirectory, abort.raise},
+) -> Session / {PlyProcess, WorkingDirectory, abort.raise} = {
   let warm = warm_of(true);
   let fresh = cold_of(true);
   let seen = if warm == fresh { out.off }
@@ -392,31 +399,31 @@ fn stepped(
 
 /// Each kind of edit made to each module at `paths` under the working directory, one at a time and
 /// undone after, the project checked and its tests run after each.
-fn disagreements(paths: List<String>) -> Session / {Spawned, Here, abort.raise} = {
+fn disagreements(paths: List<String>) -> Session / {PlyProcess, WorkingDirectory, abort.raise} = {
   let start = warm_of(true);
   let cold = cold_of(true);
   let before_any = if start == cold { [] }
   else { ["before any edit: " ++ difference(start, cold, "answer")] };
   paths.fold({ off: before_any, made: 0 }, |acc: Session, path: String|
     every_edit().fold(acc, |out: Session, e: Edit|
-      match edited(e, path, held(path)) {
+      match edited(e, path, read_bytes(path)) {
         None -> out,
         Some(changes) -> {
-          let before = changes.map(|c: Change| { path: c.path, bytes: held(c.path) });
-          changes.fold((), |_: Unit, c: Change| put(c));
-          stepped(start, out, path ++ ", " ++ edit_name(e), ||
-            before.fold((), |_: Unit, c: Change| put(c)))
+          let before = changes.map(|c: Change| { path: c.path, bytes: read_bytes(c.path) });
+          changes.fold((), |_: Unit, c: Change| write_change(c));
+          record_step(start, out, path ++ ", " ++ edit_name(e), ||
+            before.fold((), |_: Unit, c: Change| write_change(c)))
         },
       }))
 }
 
-fn agrees(paths: List<String>) -> Unit / {Spawned, Here, abort.raise} = {
+fn agrees(paths: List<String>) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
   let opening = cold_of(false);
   assert(
-    truth(at(opening, "ok")) && items(at(opening, "diagnostics")).len() == 0,
+    bool(at(opening, "ok")) && items(at(opening, "diagnostics")).len() == 0,
     Some(
       "the project checks cold with nothing to warn of: "
-        ++ clipped(shown(at(opening, "diagnostics"))),
+        ++ clipped(json_text(at(opening, "diagnostics"))),
     ),
   );
   let session = disagreements(paths);
@@ -558,7 +565,7 @@ fn fixture_names() -> List<String> = catalogue().map(|f: Fixture| f.name)
 test/nondet "{name} agrees warm and cold through every edit to its modules" for name: String in fixture_names(
   ) {
   let f = fixture(name);
-  project(f.files);
+  write_project(f.files);
   agrees(f.files.filter(|s: Source| s.path.ends_with(".ply")).map(|s: Source| s.path))
 }
 

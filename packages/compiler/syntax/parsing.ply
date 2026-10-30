@@ -1,43 +1,25 @@
-//! The parser's spine: token access, threaded state, diagnostics, the sequence driver, the dump encoder.
-//! Rule: a parse function answers `Result<R<Thing>, P>` and propagates with `?`, except around a
-//! save/restore of `no_brace` or `no_pipe`, which is a `match` so both paths restore.
-//! Rule: a sequence is one `iterate`, never recursion; recursion is reserved for grammar nesting, and
-//! a rule that nests spends one of `Input.room`.
-//! Rule: the growing field is last in every record literal (`SoFar.out`, `Parser.diags`), or accumulation
-//! turns quadratic; build a `Parser` only through the constructors below.
-
 import compiler.syntax.lexer
 import std.bin
 import std.bytes (hex_digit, ascii_of_int, is_digit)
 import compiler.syntax.lexer (int_of_digits)
 
-// --- Spans, names -----------------------------------------------------------
-
-/// A place in a module's text, and which node of its item stands there: `site` is the number
-/// `syntax.sites.numbered` gave the node within its item (a definition, a test or a law), or one
-/// `minted` from it for a node made later; 0 for what is no node of a body, an identifier or an item.
-/// What a check files of a node it files under the item and the site, never the place.
 pub type Span = { start: Int, end: Int, site: Int }
 
 derive bin for Span
-derive bin for Ident
+derive bin for Identifier
 derive bin for QName
 
-pub type Ident = { name: Bytes, span: Span }
+pub type Identifier = { name: Bytes, span: Span }
 
-pub type QName = { module: Option<Ident>, name: Ident, span: Span }
+pub type QName = { module: Option<Identifier>, name: Identifier, span: Span }
 
-/// A doc comment block: its lines' words, and the span from its first marker to its last line's end.
-/// It is trivia: no hash, key or check reads it.
 pub type Doc = { lines: List<Bytes>, span: Span }
 
 pub fn dummy_span() -> Span = { start: 0, end: 0, site: 0 }
 
-/// `s` moved `by` places along the text; a span at no place stays at none.
 pub fn moved_by(s: Span, by: Int) -> Span =
   if s == dummy_span() { s } else { { ..s, start: s.start + by, end: s.end + by } }
 
-/// The written text from `s` up to `e`.
 pub fn span_between(s: Int, e: Int) -> Span = { start: s, end: e, site: 0 }
 
 pub fn span_to(a: Span, b: Span) -> Span =
@@ -47,8 +29,6 @@ pub fn span_to(a: Span, b: Span) -> Span =
     site: 0,
   }
 
-/// A span as the key a table of what stands at a place is read by: its place, and its site where it
-/// has one.
 pub fn span_key(span: Span) -> Bytes =
   if span.site == 0 { Bytes::concat_all([ascii_of_int(span.start), b":", ascii_of_int(span.end)]) }
   else {
@@ -61,35 +41,18 @@ pub fn span_key(span: Span) -> Bytes =
     ])
   }
 
-// --- Minted sites -----------------------------------------------------------
+pub fn node_id_base() -> Int = 1048576
 
-/// How many sites a digit of a minted site holds: an item's numbering stays below it, and so does
-/// every role.
-pub fn site_digit() -> Int = 1048576
+pub fn synthetic_span(at: Span, k: Int) -> Span = { ..at, site: at.site * node_id_base() + k }
 
-/// The place of a node made for the node at `at` after its item was numbered, in the role `k` its
-/// maker gives it (one of the `role_` functions below): `at`'s place, and `at`'s site followed by the
-/// digit `k`. A minted site is never a numbered one or another minted one, and a node made for a made
-/// node mints from that one's. Three digits are all a site holds: [`minted_too_deep`] says a site
-/// past them.
-pub fn minted(at: Span, k: Int) -> Span = { ..at, site: at.site * site_digit() + k }
+pub fn is_made(site: Int) -> Bool = site >= node_id_base()
 
-pub fn is_made(site: Int) -> Bool = site >= site_digit()
+pub fn synthetic_span_at(at: Span, from: Span, k: Int) -> Span =
+  { ..at, site: synthetic_span(from, k).site }
 
-/// The place `at` as that of the node made in role `k` for the node at `from`.
-pub fn made_at(at: Span, from: Span, k: Int) -> Span = { ..at, site: minted(from, k).site }
+pub fn synthetic_too_deep(site: Int) -> Bool =
+  site < 0 || site >= node_id_base() * node_id_base() * node_id_base()
 
-/// Whether `site` was minted from a site already minted twice, which no maker may do.
-pub fn minted_too_deep(site: Int) -> Bool =
-  site < 0 || site >= site_digit() * site_digit() * site_digit()
-
-// The roles. Each is one maker's alone, whatever the node it mints from, so no two makers mint one
-// site and a maker and the checker that files for what it makes meet at one.
-
-// A test's trees, from its cases' `for` (the listing) and `in` (a case's run): the block, the `let`
-// holding the table to the case's type and its binder, the call into `std.cases` and its callee,
-// the read of the table, a listing's lambda over the case and its parameter, and a run's `let` of
-// the case, its binder and the reads of the case's place and identity.
 pub fn role_case_block() -> Int = 1
 pub fn role_case_table_let() -> Int = 2
 pub fn role_case_table_binder() -> Int = 3
@@ -100,12 +63,9 @@ pub fn role_case_label_lambda() -> Int = 7
 pub fn role_case_label_param() -> Int = 8
 pub fn role_case_let() -> Int = 9
 pub fn role_case_binder() -> Int = 10
-pub fn role_case_at_read() -> Int = 11
+pub fn role_case_index_read() -> Int = 11
 pub fn role_case_identity_read() -> Int = 12
 
-// A tagged literal written out, from the literal, whose block takes its site: the `let` reading
-// the check's call through `Ok`, its binder, the check's call, its callee and the list of texts it
-// takes, the read of what the check answered, and `fill`'s call, callee and holes.
 pub fn role_tag_let() -> Int = 13
 pub fn role_tag_binder() -> Int = 15
 pub fn role_tag_parse() -> Int = 16
@@ -116,22 +76,15 @@ pub fn role_tag_fill() -> Int = 20
 pub fn role_tag_filler() -> Int = 21
 pub fn role_tag_holes() -> Int = 22
 
-// A call on a value written out, from the call, which keeps its site: the value a call on a binding
-// is made on, its callee where no field it replaces gives one a site, and the field a call of a
-// field's function reads.
-pub fn role_member_on() -> Int = 23
+pub fn role_member_receiver() -> Int = 23
 pub fn role_member_callee() -> Int = 24
 pub fn role_member_field() -> Int = 25
 
-// A `try` written out, from the `try`, whose `handle` takes its site: the `return` clause, the
-// raise's clause, `Ok` and `Err` where the two are written, the record of a raise's arguments `Err`
-// holds where it takes several, the calls of `Ok` and `Err`, the read of the `return` binder, what
-// `Err` holds of a raise of nothing, and the read of the raise's `i`th argument.
 pub fn role_try_return() -> Int = 30
 pub fn role_try_clause() -> Int = 31
 pub fn role_try_ok() -> Int = 32
 pub fn role_try_err() -> Int = 33
-pub fn role_try_carried() -> Int = 34
+pub fn role_try_arguments_record() -> Int = 34
 pub fn role_try_ok_call() -> Int = 35
 pub fn role_try_err_call() -> Int = 36
 pub fn role_try_value() -> Int = 37
@@ -141,13 +94,6 @@ pub fn role_try_arg(i: Int) -> Int = 512 + i
 pub fn role_try_value_binder() -> Int = 95
 pub fn role_try_raised(i: Int) -> Int = 768 + i
 
-// A `with_hold` written out as its bracket, from the `with_hold`, whose block takes its site: the
-// `let`s of the acquire and release lambdas, their binders and the lambdas, the release lambda's
-// parameter, call and read of the hold, the bracket's call and callee, the lambda opening the hold,
-// its call making the hold, that call's callee, the call of the acquire lambda and its read, the
-// lambda closing the hold, its parameter, its call of the release lambda and that lambda's read, the
-// call taking the value out of the hold, its callee and its read of the hold, and the body's lambda
-// and parameter.
 pub fn role_hold_acquire_let() -> Int = 39
 pub fn role_hold_acquire_binder() -> Int = 40
 pub fn role_hold_acquire() -> Int = 41
@@ -156,7 +102,7 @@ pub fn role_hold_release_binder() -> Int = 43
 pub fn role_hold_release() -> Int = 44
 pub fn role_hold_release_param() -> Int = 45
 pub fn role_hold_release_call() -> Int = 46
-pub fn role_hold_release_held() -> Int = 47
+pub fn role_hold_release_hold_read() -> Int = 47
 pub fn role_hold_bracket() -> Int = 48
 pub fn role_hold_bracket_callee() -> Int = 49
 pub fn role_hold_open() -> Int = 50
@@ -170,19 +116,14 @@ pub fn role_hold_close_call() -> Int = 57
 pub fn role_hold_release_read() -> Int = 58
 pub fn role_hold_take() -> Int = 59
 pub fn role_hold_take_callee() -> Int = 60
-pub fn role_hold_take_held() -> Int = 61
+pub fn role_hold_take_hold_read() -> Int = 61
 pub fn role_hold_body() -> Int = 62
 pub fn role_hold_body_param() -> Int = 63
 
-// Closures only the lowering makes, from the node they run: what a `handle` runs its body in where
-// it runs detached, what a `simulate` runs its body in, and what a `parallel` branch runs in.
 pub fn role_detached() -> Int = 77
 pub fn role_simulated() -> Int = 78
 pub fn role_branch() -> Int = 79
 
-// A spawn of a value other than a lambda written out, from the perform: the `let` binding the
-// value, its binder, the spawn, the lambda it is handed, that lambda's call of the value, and the
-// read of it there.
 pub fn role_spawn_let() -> Int = 82
 pub fn role_spawn_binder() -> Int = 83
 pub fn role_spawn_perform() -> Int = 84
@@ -199,25 +140,20 @@ pub fn role_case_table_module() -> Int = 92
 pub fn role_case_table_name() -> Int = 93
 pub fn role_case_callee_module() -> Int = 94
 
-/// Where a default a call on a value copies takes its sites: its parameter's place `slot` gives it
-/// a range of its own, and its nodes the sites after it in a walk of it.
 pub fn role_member_default(slot: Int) -> Int = 4096 + slot * 4096
 
-pub fn no_ident() -> Ident = { name: b"", span: dummy_span() }
+pub fn no_identifier() -> Identifier = { name: b"", span: dummy_span() }
 
-pub fn no_qname() -> QName = { module: None, name: no_ident(), span: dummy_span() }
+pub fn no_qualified_name() -> QName = { module: None, name: no_identifier(), span: dummy_span() }
 
-pub fn bare(ident: Ident) -> QName = { module: None, name: ident, span: ident.span }
+pub fn bare(ident: Identifier) -> QName = { module: None, name: ident, span: ident.span }
 
-pub fn qualified(m: Ident, n: Ident) -> QName =
+pub fn qualified(m: Identifier, n: Identifier) -> QName =
   { module: Some(m), name: n, span: span_to(m.span, n.span) }
 
-// --- Diagnostics ------------------------------------------------------------
-
-/// `notes` is always `notes_text.len()`.
 pub type Label = { start: Int, end: Int, primary: Bool, text: Bytes }
 
-pub type ParseDiag = {
+pub type ParseDiagnostic = {
   code: Bytes,
   notes: Int,
   labels: List<Label>,
@@ -227,7 +163,7 @@ pub type ParseDiag = {
 }
 
 derive bin for Label
-derive bin for ParseDiag
+derive bin for ParseDiagnostic
 
 pub fn unexpected() -> Bytes = b"E0001"
 pub fn unterminated() -> Bytes = b"E0002"
@@ -242,12 +178,12 @@ pub fn argument_order() -> Bytes = b"E0124"
 pub fn parse_label(span: Span, primary: Bool, text: Bytes) -> Label =
   { start: span.start, end: span.end, primary: primary, text: text }
 
-pub fn parse_diag(
+pub fn parse_diagnostic(
   code: Bytes,
   message: Bytes,
   labels: List<Label>,
   notes: List<Bytes>,
-) -> ParseDiag =
+) -> ParseDiagnostic =
   {
     code: code,
     notes: notes.len(),
@@ -263,7 +199,7 @@ pub fn error_at(
   message: Bytes,
   label: Bytes,
   notes: List<Bytes>,
-) -> ParseDiag = parse_diag(code, message, [parse_label(span, true, label)], notes)
+) -> ParseDiagnostic = parse_diagnostic(code, message, [parse_label(span, true, label)], notes)
 
 pub fn error_at_and(
   code: Bytes,
@@ -273,21 +209,21 @@ pub fn error_at_and(
   also: Span,
   also_text: Bytes,
   notes: List<Bytes>,
-) -> ParseDiag =
-  parse_diag(
+) -> ParseDiagnostic =
+  parse_diagnostic(
     code,
     message,
     [parse_label(span, true, label), parse_label(also, false, also_text)],
     notes,
   )
 
-pub fn primary_span_of(diag: ParseDiag) -> Span = {
-  let first = diag.labels.fold(
+pub fn primary_span_of(diagnostic: ParseDiagnostic) -> Span = {
+  let first = diagnostic.labels.fold(
     { seen: false, s: dummy_span() },
     |a: { seen: Bool, s: Span }, label: Label|
       if a.seen { a } else { { seen: true, s: span_between(label.start, label.end) } },
   );
-  let prim = diag.labels.fold(
+  let prim = diagnostic.labels.fold(
     { seen: false, s: dummy_span() },
     |a: { seen: Bool, s: Span }, label: Label|
       if a.seen || !label.primary { a }
@@ -296,10 +232,6 @@ pub fn primary_span_of(diag: ParseDiag) -> Span = {
   if prim.seen { prim.s } else { first.s }
 }
 
-// --- The token buffer -------------------------------------------------------
-
-/// What a parse reads, which flows down into what it parses: the tokens, and `room`, how many levels
-/// deeper the grammar may nest from here, which every rule that nests spends one of.
 pub type Input = {
   token_count: Int,
   source: Bytes,
@@ -308,29 +240,32 @@ pub type Input = {
   room: Int,
 }
 
-/// `gt_split` is the index where `expect_gt` split a `>=`: `token_index` reads it as `=` over its
-/// second byte. One slot suffices because `pos` must pass a split before another can happen.
 pub type Parser = {
   pos: Int,
   no_brace: Bool,
-  /// Inside a lambda's parameter list, `|` closes the list and is never bit-or.
   no_pipe: Bool,
   gt_split: Int,
-  diags: List<ParseDiag>,
+  diagnostics: List<ParseDiagnostic>,
 }
 
-pub type Parsed<a> = { parser: Parser, node: a }
+pub type ParseOutput<a> = { parser: Parser, node: a }
 
-pub type Eaten = { parser: Parser, ok: Bool }
+pub type EatResult = { parser: Parser, ok: Bool }
 
-pub type SoFar<a> = { parser: Parser, out: List<a> }
+pub type PartialList<a> = { parser: Parser, out: List<a> }
 
 pub type ParseStart = { input: Input, parser: Parser }
 
 pub fn start(src: Bytes) -> ParseStart / {abort.raise} = {
   let lx = lexer::lex(src);
-  let d = lx.diags.map(|diag: lexer::Diag|
-    error_at(diag.code, span_between(diag.start, diag.end), diag.message, diag.label, []));
+  let d = lx.diagnostics.map(|diagnostic: lexer::Diagnostic|
+    error_at(
+      diagnostic.code,
+      span_between(diagnostic.start, diagnostic.end),
+      diagnostic.message,
+      diagnostic.label,
+      [],
+    ));
   {
     input: {
       token_count: lx.tokens.len(),
@@ -339,13 +274,11 @@ pub fn start(src: Bytes) -> ParseStart / {abort.raise} = {
       comments: lx.comments,
       room: max_depth(),
     },
-    parser: { pos: 0, no_brace: false, no_pipe: false, gt_split: -1, diags: d },
+    parser: { pos: 0, no_brace: false, no_pipe: false, gt_split: -1, diagnostics: d },
   }
 }
 
-/// What `start` makes of `src` where it is lexed already: `tokens`, a lex of it or of parts of it
-/// laid side by side, read in place of lexing it again.
-pub fn started(src: Bytes, tokens: List<lexer::Token>) -> ParseStart =
+pub fn start_from_tokens(src: Bytes, tokens: List<lexer::Token>) -> ParseStart =
   {
     input: {
       token_count: tokens.len(),
@@ -354,10 +287,8 @@ pub fn started(src: Bytes, tokens: List<lexer::Token>) -> ParseStart =
       comments: [],
       room: max_depth(),
     },
-    parser: { pos: 0, no_brace: false, no_pipe: false, gt_split: -1, diags: [] },
+    parser: { pos: 0, no_brace: false, no_pipe: false, gt_split: -1, diagnostics: [] },
   }
-
-// --- Constructing `Parser` -------------------------------------------------------
 
 pub fn at_pos(parser: Parser, pos: Int) -> Parser =
   {
@@ -365,7 +296,7 @@ pub fn at_pos(parser: Parser, pos: Int) -> Parser =
     no_pipe: parser.no_pipe,
     gt_split: parser.gt_split,
     pos: pos,
-    diags: parser.diags,
+    diagnostics: parser.diagnostics,
   }
 
 pub fn with_no_brace(parser: Parser, b: Bool) -> Parser =
@@ -374,7 +305,7 @@ pub fn with_no_brace(parser: Parser, b: Bool) -> Parser =
     no_pipe: parser.no_pipe,
     gt_split: parser.gt_split,
     no_brace: b,
-    diags: parser.diags,
+    diagnostics: parser.diagnostics,
   }
 
 pub fn with_no_pipe(parser: Parser, b: Bool) -> Parser =
@@ -383,7 +314,7 @@ pub fn with_no_pipe(parser: Parser, b: Bool) -> Parser =
     no_brace: parser.no_brace,
     gt_split: parser.gt_split,
     no_pipe: b,
-    diags: parser.diags,
+    diagnostics: parser.diagnostics,
   }
 
 pub fn with_gt_split(parser: Parser, i: Int) -> Parser =
@@ -392,7 +323,7 @@ pub fn with_gt_split(parser: Parser, i: Int) -> Parser =
     no_brace: parser.no_brace,
     no_pipe: parser.no_pipe,
     gt_split: i,
-    diags: parser.diags,
+    diagnostics: parser.diagnostics,
   }
 
 pub fn fresh_item(parser: Parser) -> Parser =
@@ -401,19 +332,18 @@ pub fn fresh_item(parser: Parser) -> Parser =
     no_pipe: parser.no_pipe,
     gt_split: parser.gt_split,
     no_brace: false,
-    diags: parser.diags,
+    diagnostics: parser.diagnostics,
   }
 
 pub fn advance_n(input: Input, parser: Parser, n: Int) -> Parser =
   if n <= 0 { parser } else { advance_n(input, advance(input, parser).parser, n - 1) }
 
-/// Drops a diagnostic with the same code and primary span as the previous one: one mistake trips several expectations.
-pub fn push_diag(parser: Parser, diag: ParseDiag) -> Parser = {
-  let s = primary_span_of(diag);
-  let dup = match parser.diags.at(parser.diags.len() - 1) {
+pub fn push_diagnostic(parser: Parser, diagnostic: ParseDiagnostic) -> Parser = {
+  let s = primary_span_of(diagnostic);
+  let dup = match parser.diagnostics.at(parser.diagnostics.len() - 1) {
     Some(l) -> {
       let ls = primary_span_of(l);
-      l.code == diag.code && ls.start == s.start && ls.end == s.end
+      l.code == diagnostic.code && ls.start == s.start && ls.end == s.end
     },
     None -> false,
   };
@@ -423,23 +353,20 @@ pub fn push_diag(parser: Parser, diag: ParseDiag) -> Parser = {
       no_brace: parser.no_brace,
       no_pipe: parser.no_pipe,
       gt_split: parser.gt_split,
-      diags: parser.diags.push(diag),
+      diagnostics: parser.diagnostics.push(diagnostic),
     }
   }
 }
 
-/// Where `?` cannot stand (tests, lambdas): `parsed_or` answers the state either way; `failed` says which arm.
-pub fn parsed_or<a>(r: Result<Parsed<a>, Parser>, d: a) -> Parsed<a> =
+pub fn parsed_or<a>(r: Result<ParseOutput<a>, Parser>, d: a) -> ParseOutput<a> =
   match r { Ok(x) -> x, Err(q) -> { parser: q, node: d } }
 
-pub fn failed<a>(r: Result<Parsed<a>, Parser>) -> Bool = match r { Ok(x) -> false, Err(q) -> true }
-
-// --- Token access -----------------------------------------------------------
+pub fn failed<a>(r: Result<ParseOutput<a>, Parser>) -> Bool =
+  match r { Ok(x) -> false, Err(q) -> true }
 
 fn eof_token() -> lexer::Token = { start: 0, end: 0, kind: lexer::EndOfInput }
 
-/// Absolute index, clamped to the buffer (the clamped token is observable), with `expect_gt`'s split applied.
-pub fn token_index(input: Input, parser: Parser, i: Int) -> lexer::Token = {
+pub fn token_at_index(input: Input, parser: Parser, i: Int) -> lexer::Token = {
   let j = if i < 0 { 0 } else if i > input.token_count - 1 { input.token_count - 1 } else { i };
   let t = match input.tokens.at(j) { Some(x) -> x, None -> eof_token() };
   if j == parser.gt_split { { start: t.start + 1, end: t.end, kind: lexer::Punctuation(b"eq") } }
@@ -447,7 +374,7 @@ pub fn token_index(input: Input, parser: Parser, i: Int) -> lexer::Token = {
 }
 
 pub fn token_at(input: Input, parser: Parser, n: Int) -> lexer::Token =
-  token_index(input, parser, parser.pos + n)
+  token_at_index(input, parser, parser.pos + n)
 
 pub fn token_kind(input: Input, parser: Parser) -> lexer::TokenKind =
   token_at(input, parser, 0).kind
@@ -463,17 +390,14 @@ pub fn span_at(input: Input, parser: Parser, n: Int) -> Span = {
 pub fn current_span(input: Input, parser: Parser) -> Span = span_at(input, parser, 0)
 
 pub fn previous_span(input: Input, parser: Parser) -> Span = {
-  let t = token_index(input, parser, parser.pos - 1);
+  let t = token_at_index(input, parser, parser.pos - 1);
   span_between(t.start, t.end)
 }
 
 pub fn token_bytes(input: Input, token: lexer::Token) -> Bytes / {abort.raise} =
   input.source.slice(token.start, token.end)
 
-// --- Doc comments -----------------------------------------------------------
-
-/// The first of `n` ascending starts, read by `start_of`, that is at least `at`; `n` when none is.
-fn first_from(n: Int, at: Int, start_of: (Int) -> Int) -> Int / {abort.raise} =
+fn lower_bound(n: Int, at: Int, start_of: (Int) -> Int) -> Int / {abort.raise} =
   iterate({ lo: 0, hi: n }, 64, |s: { lo: Int, hi: Int }|
     if s.lo >= s.hi { Stop(s.lo) } else {
       let mid = (s.lo + s.hi) / 2;
@@ -487,14 +411,13 @@ fn token_start(input: Input, i: Int) -> Int =
 fn comment_start(input: Input, i: Int) -> Int =
   match input.comments.at(i) { Some(c) -> c.start, None -> 0 }
 
-/// The comments marked `mark` from `from` up to `to`, as one block.
 fn docs_between(
   input: Input,
   from: Int,
   to: Int,
   mark: lexer::DocMark,
 ) -> Option<Doc> / {abort.raise} = {
-  let first = first_from(input.comments.len(), from, |i: Int| comment_start(input, i));
+  let first = lower_bound(input.comments.len(), from, |i: Int| comment_start(input, i));
   let found = iterate(
     { i: first, out: [] },
     input.comments.len() - first + 1,
@@ -519,25 +442,21 @@ fn docs_between(
   }
 }
 
-/// The `///` lines in the trivia before the token that starts at `at`.
 pub fn doc_at(input: Input, at: Int) -> Option<Doc> / {abort.raise} = {
-  let i = first_from(input.token_count, at, |k: Int| token_start(input, k));
+  let i = lower_bound(input.token_count, at, |k: Int| token_start(input, k));
   let from = if i == 0 { 0 } else { match input.tokens.at(i - 1) { Some(t) -> t.end, None -> 0 } };
   docs_between(input, from, at, lexer::ItemDoc)
 }
 
-/// The `//!` lines before the module's first token.
 pub fn module_doc(input: Input) -> Option<Doc> / {abort.raise} =
   docs_between(input, 0, token_start(input, 0), lexer::ModuleDoc)
 
-/// Whether a token starts after `from` and before `to`: two comments with none between share a gap.
 pub fn token_between(input: Input, from: Int, to: Int) -> Bool / {abort.raise} = {
-  let i = first_from(input.token_count, from, |k: Int| token_start(input, k));
+  let i = lower_bound(input.token_count, from, |k: Int| token_start(input, k));
   i < input.token_count && token_start(input, i) < to
 }
 
-/// Answers the current span and moves on, except at the last token, where it stays.
-pub fn advance(input: Input, parser: Parser) -> Parsed<Span> =
+pub fn advance(input: Input, parser: Parser) -> ParseOutput<Span> =
   {
     parser: if parser.pos + 1 < input.token_count { at_pos(parser, parser.pos + 1) }
     else { parser },
@@ -549,36 +468,28 @@ pub fn at_token(input: Input, parser: Parser, kind: lexer::TokenKind) -> Bool =
 
 pub fn at_eof(input: Input, parser: Parser) -> Bool = token_kind(input, parser) == lexer::EndOfInput
 
-pub fn at_ident_text(input: Input, parser: Parser, text: Bytes) -> Bool =
+pub fn at_identifier_text(input: Input, parser: Parser, text: Bytes) -> Bool =
   token_kind(input, parser) == lexer::Identifier(text)
 
-/// The binder every module imports `std.prelude` under, and a builtin is written through once the
-/// checker has named it for a call on a value: no source writes it, so nothing a module or a body
-/// binds takes the builtin's place.
 pub fn prelude_binder() -> Bytes = b"?prelude"
 
-/// Constructor versus binder. ASCII suffices: the lexer refuses a token whose first byte is >= 128.
-/// A function of a type, `T::name`, opens with its type's capital and is no constructor.
 pub fn starts_upper(name: Bytes) -> Bool =
   name.len() > 0 && name.at(0) >= 65 && name.at(0) <= 90 && name.index_of(b"::") == None
 
-pub fn is_str(input: Input, parser: Parser) -> Bool =
+pub fn is_string(input: Input, parser: Parser) -> Bool =
   match token_kind(input, parser) { lexer::StringLiteral(v) -> true, _ -> false }
 
 pub fn bump(input: Input, parser: Parser) -> Parser = advance(input, parser).parser
 
 pub fn dump_bool(b: Bool) -> Bytes = if b { dump_word(b"true") } else { dump_word(b"false") }
 
-pub fn is_ident(input: Input, parser: Parser) -> Bool =
+pub fn is_identifier(input: Input, parser: Parser) -> Bool =
   match token_kind(input, parser) { lexer::Identifier(n) -> true, _ -> false }
 
-// --- Expecting --------------------------------------------------------------
-
-pub fn eat(input: Input, parser: Parser, kind: lexer::TokenKind) -> Eaten =
+pub fn eat(input: Input, parser: Parser, kind: lexer::TokenKind) -> EatResult =
   if at_token(input, parser, kind) { { parser: advance(input, parser).parser, ok: true } }
   else { { parser: parser, ok: false } }
 
-/// How a diagnostic names the token it found.
 pub fn describe(kind: lexer::TokenKind) -> Bytes / {abort.raise} =
   match kind {
     lexer::Identifier(n) -> Bytes::concat_all([b"identifier `", n, b"`"]),
@@ -604,11 +515,10 @@ pub fn describe(kind: lexer::TokenKind) -> Bytes / {abort.raise} =
     lexer::CharLiteral(_) -> b"character literal",
     lexer::Keyword(k) -> Bytes::concat_all([b"keyword `", k, b"`"]),
     lexer::EndOfInput -> b"end of file",
-    lexer::Punctuation(name) -> Bytes::concat_all([b"`", punct_text(name), b"`"]),
+    lexer::Punctuation(name) -> Bytes::concat_all([b"`", punctuation_text(name), b"`"]),
   }
 
-/// A table, not an `else if` chain: a long chain overflows the native stack when the emitter compiles itself.
-fn punct_text(name: Bytes) -> Bytes = {
+fn punctuation_text(name: Bytes) -> Bytes = {
   let table = [
     { n: b"lparen", t: b"(" },
     { n: b"rparen", t: b")" },
@@ -659,7 +569,6 @@ fn punct_text(name: Bytes) -> Bytes = {
   table.fold(b"", |acc: Bytes, e: { n: Bytes, t: Bytes }| if e.n == name { e.t } else { acc })
 }
 
-/// The mantissa's digits with the point `scale` places from the end.
 pub fn render_decimal(digits: Bytes, scale: Int) -> Bytes / {abort.raise} =
   if scale == 0 { digits } else {
     let padded = if digits.len() <= scale {
@@ -669,7 +578,6 @@ pub fn render_decimal(digits: Bytes, scale: Int) -> Bytes / {abort.raise} =
     Bytes::concat_all([padded.slice(0, point), b".", padded.slice(point, padded.len())])
   }
 
-/// `f64`'s `Display` over literal text: zeros trimmed, exponent applied; exact up to 17 significant digits.
 pub fn float_display(txt: Bytes) -> Bytes / {abort.raise} = {
   let n = txt.len();
   let e_at = match txt.index_of(b"e") { Some(i) -> i, None -> n };
@@ -704,7 +612,7 @@ fn int_of_signed(b: Bytes) -> Int =
   else { int_of_digits(b) }
 
 pub fn error_here(input: Input, parser: Parser, what: Bytes) -> Parser / {abort.raise} =
-  push_diag(
+  push_diagnostic(
     parser,
     error_at(
       unexpected(),
@@ -716,7 +624,7 @@ pub fn error_here(input: Input, parser: Parser, what: Bytes) -> Parser / {abort.
   )
 
 pub fn unclosed(input: Input, parser: Parser, open: Span, what: Bytes) -> Parser / {abort.raise} =
-  push_diag(
+  push_diagnostic(
     parser,
     error_at_and(
       unexpected(),
@@ -734,7 +642,7 @@ pub fn expect(
   parser: Parser,
   kind: lexer::TokenKind,
   what: Bytes,
-) -> Result<Parsed<Span>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Span>, Parser> / {abort.raise} =
   if at_token(input, parser, kind) { Ok(advance(input, parser)) }
   else { Err(error_here(input, parser, what)) }
 
@@ -744,15 +652,15 @@ pub fn expect_close(
   kind: lexer::TokenKind,
   open: Span,
   what: Bytes,
-) -> Result<Parsed<Span>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Span>, Parser> / {abort.raise} =
   if at_token(input, parser, kind) { Ok(advance(input, parser)) }
   else { Err(unclosed(input, parser, open, what)) }
 
-pub fn expect_ident(
+pub fn expect_identifier(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<Parsed<Ident>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Identifier>, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     lexer::Identifier(n) -> {
       let a = advance(input, parser);
@@ -761,13 +669,11 @@ pub fn expect_ident(
     _ -> Err(error_here(input, parser, what)),
   }
 
-/// A parameter name, or `_` for one the body never names: it binds like any other name and is
-/// unreachable only because `_` never lexes as an identifier in expression position.
 pub fn expect_binder(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<Parsed<Ident>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Identifier>, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     lexer::Identifier(n) -> {
       let a = advance(input, parser);
@@ -780,12 +686,11 @@ pub fn expect_binder(
     _ -> Err(error_here(input, parser, what)),
   }
 
-/// A keyword may name a field; `keyword` flags it for the punned forms that also bind a variable.
 pub fn expect_field_name(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<Parsed<{ name: Ident, keyword: Bool }>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<{ name: Identifier, keyword: Bool }>, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     lexer::Identifier(n) -> {
       let a = advance(input, parser);
@@ -798,8 +703,8 @@ pub fn expect_field_name(
     _ -> Err(error_here(input, parser, what)),
   }
 
-pub fn keyword_pun_refusal(parser: Parser, name: Ident) -> Parser =
-  push_diag(
+pub fn keyword_pun_error(parser: Parser, name: Identifier) -> Parser =
+  push_diagnostic(
     parser,
     error_at(
       unexpected(),
@@ -822,16 +727,14 @@ pub fn keyword_pun_refusal(parser: Parser, name: Ident) -> Parser =
     ),
   )
 
-/// `parser` with `E0004` at each of `names` an earlier one already spells: a record, its type and
-/// a pattern over it name each field once.
-pub fn fields_once(parser: Parser, names: List<Ident>) -> Parser / {abort.raise} =
+pub fn report_duplicate_fields(parser: Parser, names: List<Identifier>) -> Parser / {abort.raise} =
   names.fold(
     { parser: parser, first: Map::new() },
-    |acc: { parser: Parser, first: Map<Bytes, Span> }, name: Ident|
+    |acc: { parser: Parser, first: Map<Bytes, Span> }, name: Identifier|
       match acc.first.get(name.name) {
         Some(first) ->
           {
-            parser: push_diag(
+            parser: push_diagnostic(
               acc.parser,
               error_at_and(
                 b"E0004",
@@ -849,25 +752,21 @@ pub fn fields_once(parser: Parser, names: List<Ident>) -> Parser / {abort.raise}
       },
   ).parser
 
-/// On `>=`, answers the `>` and leaves `pos`, with `gt_split` turning the rest into `=`.
 pub fn expect_gt(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<Parsed<Span>, Parser> / {abort.raise} =
+) -> Result<ParseOutput<Span>, Parser> / {abort.raise} =
   if at_token(input, parser, token_gt()) { Ok(advance(input, parser)) }
   else if at_token(input, parser, token_ge()) {
     let s = current_span(input, parser);
     Ok({ parser: with_gt_split(parser, parser.pos), node: span_between(s.start, s.start + 1) })
   } else { Err(error_here(input, parser, what)) }
 
-// --- Depth ------------------------------------------------------------------
-
 pub fn max_depth() -> Int = 128
 
-/// Where a rule would nest once more than `max_depth()` allows.
 pub fn too_deep(input: Input, parser: Parser) -> Parser =
-  push_diag(
+  push_diagnostic(
     parser,
     error_at(
       unexpected(),
@@ -878,15 +777,13 @@ pub fn too_deep(input: Input, parser: Parser) -> Parser =
     ),
   )
 
-// --- The shared sequence driver ---------------------------------------------
-
 pub fn comma_list<a | e>(
   input: Input,
   parser: Parser,
   close: lexer::TokenKind,
-  item: (Input, Parser) -> Result<Parsed<a>, Parser> / e,
-) -> Result<Parsed<List<a>>, Parser> / {abort.raise | e} =
-  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: SoFar<a>|
+  item: (Input, Parser) -> Result<ParseOutput<a>, Parser> / e,
+) -> Result<ParseOutput<List<a>>, Parser> / {abort.raise | e} =
+  iterate({ parser: parser, out: [] }, input.token_count - parser.pos + 1, |s: PartialList<a>|
     if at_token(input, s.parser, close) || at_eof(input, s.parser) {
       Stop(Ok({ parser: s.parser, node: s.out }))
     } else {
@@ -900,22 +797,19 @@ pub fn comma_list<a | e>(
       }
     })
 
-// --- Qualified names --------------------------------------------------------
-
 pub fn qname(
   input: Input,
   parser: Parser,
   what: Bytes,
-) -> Result<Parsed<QName>, Parser> / {abort.raise} = {
-  let { parser, node: first } = expect_ident(input, parser, what)?;
+) -> Result<ParseOutput<QName>, Parser> / {abort.raise} = {
+  let { parser, node: first } = expect_identifier(input, parser, what)?;
   let cc = eat(input, parser, token_coloncolon());
   if !cc.ok { Ok({ parser: cc.parser, node: bare(first) }) } else {
-    let { parser, node: second } = expect_ident(input, cc.parser, b"a name after `::`")?;
+    let { parser, node: second } = expect_identifier(input, cc.parser, b"a name after `::`")?;
     if !at_token(input, parser, token_coloncolon()) {
       Ok({ parser: parser, node: qualified(first, second) })
     } else if starts_upper(second.name) && token_kind_at(input, parser, 2) != token_coloncolon() {
-      // A function of a type another module declares, named through the module.
-      let { parser, node: third } = expect_ident(
+      let { parser, node: third } = expect_identifier(
         input,
         advance(input, parser).parser,
         b"a function's name after `::`",
@@ -929,7 +823,7 @@ pub fn qname(
       })
     } else {
       Err(
-        push_diag(
+        push_diagnostic(
           parser,
           error_at(
             unexpected(),
@@ -945,8 +839,6 @@ pub fn qname(
     }
   }
 }
-
-// --- The token vocabulary ---------------------------------------------------
 
 pub fn token_lparen() -> lexer::TokenKind = lexer::Punctuation(b"lparen")
 pub fn token_rparen() -> lexer::TokenKind = lexer::Punctuation(b"rparen")
@@ -990,13 +882,9 @@ pub fn keyword_with() -> lexer::TokenKind = lexer::Keyword(b"with")
 pub fn keyword_true() -> lexer::TokenKind = lexer::Keyword(b"true")
 pub fn keyword_false() -> lexer::TokenKind = lexer::Keyword(b"false")
 
-// --- The dump encoder -------------------------------------------------------
-// Printable ASCII with no `"` and no `\`: the dump is read back through `ply run --json`'s escaping.
-
 pub fn dump_node(span: Span, tag: Bytes) -> Bytes =
   Bytes::concat_all([ascii_of_int(span.start), b":", ascii_of_int(span.end), b":", tag, b";"])
 
-/// The dump with every `start:end:` prefix removed, so two parses compare as trees.
 pub fn erase_spans(dump: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all(
     dump.split(b";").map(|u: Bytes|
@@ -1029,14 +917,14 @@ pub fn dump_opt<a | e>(o: Option<a>, f: (a) -> Bytes / e) -> Bytes / e =
 pub fn dump_doc(doc: Doc) -> Bytes / {abort.raise} =
   dump_node(doc.span, b"doc").concat(dump_list(doc.lines, dump_payload))
 
-pub fn dump_ident(ident: Ident) -> Bytes / {abort.raise} =
+pub fn dump_identifier(ident: Identifier) -> Bytes / {abort.raise} =
   dump_node(ident.span, b"ident").concat(dump_payload(ident.name))
 
-pub fn dump_qname(qname: QName) -> Bytes / {abort.raise} =
+pub fn dump_qualified_name(qname: QName) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(qname.span, b"qname"),
-    dump_opt(qname.module, dump_ident),
-    dump_ident(qname.name),
+    dump_opt(qname.module, dump_identifier),
+    dump_identifier(qname.name),
   ])
 
 pub fn dump_label(label: Label) -> Bytes =
@@ -1050,42 +938,38 @@ pub fn dump_label(label: Label) -> Bytes =
     b";",
   ])
 
-pub fn dump_diag(diag: ParseDiag) -> Bytes = {
-  let s = primary_span_of(diag);
+pub fn dump_diagnostic(diagnostic: ParseDiagnostic) -> Bytes = {
+  let s = primary_span_of(diagnostic);
   Bytes::concat_all([
     b"!",
-    diag.code,
+    diagnostic.code,
     b":",
     ascii_of_int(s.start),
     b":",
     ascii_of_int(s.end),
     b":",
-    ascii_of_int(diag.labels.len()),
+    ascii_of_int(diagnostic.labels.len()),
     b":",
-    ascii_of_int(diag.notes),
+    ascii_of_int(diagnostic.notes),
     b";",
   ]).concat(
-    Bytes::concat_all(diag.labels.map(dump_label)),
+    Bytes::concat_all(diagnostic.labels.map(dump_label)),
   )
 }
 
-pub fn dump_diags(diags: List<ParseDiag>) -> Bytes =
-  dump_count(diags.len()).concat(Bytes::concat_all(diags.map(dump_diag)))
-
-// --- The spine's own tests --------------------------------------------------
+pub fn dump_diagnostics(diagnostics: List<ParseDiagnostic>) -> Bytes =
+  dump_count(diagnostics.len()).concat(Bytes::concat_all(diagnostics.map(dump_diagnostic)))
 
 fn probe(src: Bytes) -> ParseStart / {abort.raise} = start(src)
 
-pub fn qname_text(qname: QName) -> Bytes =
+pub fn qualified_name_text(qname: QName) -> Bytes =
   match qname.module {
-    // `::`, not the source's `.`: the dump must match the Rust side's spelling.
     Some(m) -> Bytes::concat_all([m.name, b"::", qname.name.name]),
     None -> qname.name.name,
   }
 
 pub fn is_bare(qname: QName) -> Bool = match qname.module { None -> true, Some(_) -> false }
 
-/// The module index of a span outside every module.
 pub fn no_module() -> Int = 4294967295
 
 test "the token buffer is indexed from zero and ends with the EOF token" {
@@ -1137,44 +1021,48 @@ test "expect_gt splits a `>=` into `>` and leaves an `=` where it stood" {
 test "two diagnostics with the same code and primary span collapse to one" {
   let s = probe(b"fn f");
   let a = error_here(s.input, s.parser, b"one");
-  let b = push_diag(a, error_at(unexpected(), current_span(s.input, s.parser), b"", b"", []));
-  assert_eq(b.diags.len(), 1);
-  let c2 = push_diag(a, error_at(unexpected(), span_between(9, 9), b"", b"", []));
-  assert_eq(c2.diags.len(), 2);
-  let d = push_diag(a, error_at(unterminated(), current_span(s.input, s.parser), b"", b"", []));
-  assert_eq(d.diags.len(), 2);
+  let b = push_diagnostic(a, error_at(unexpected(), current_span(s.input, s.parser), b"", b"", []));
+  assert_eq(b.diagnostics.len(), 1);
+  let c2 = push_diagnostic(a, error_at(unexpected(), span_between(9, 9), b"", b"", []));
+  assert_eq(c2.diagnostics.len(), 2);
+  let d = push_diagnostic(
+    a,
+    error_at(unterminated(), current_span(s.input, s.parser), b"", b"", []),
+  );
+  assert_eq(d.diagnostics.len(), 2);
 }
 
 test "the dedup rule sees the last lexer diagnostic, not only parser ones" {
   let s = probe(b"$");
-  assert_eq(s.parser.diags.len(), 1);
-  let last = match s.parser.diags.at(s.parser.diags.len() - 1) {
+  assert_eq(s.parser.diagnostics.len(), 1);
+  let last = match s.parser.diagnostics.at(s.parser.diagnostics.len() - 1) {
     Some(l) -> l,
     None -> error_at(b"", dummy_span(), b"", b"", []),
   };
   assert_eq(last.code, b"E0001");
   assert_eq(primary_span_of(last).start, 0);
-  let q = push_diag(s.parser, error_at(unexpected(), span_between(0, 1), b"", b"", []));
-  assert_eq(q.diags.len(), 1);
+  let q = push_diagnostic(s.parser, error_at(unexpected(), span_between(0, 1), b"", b"", []));
+  assert_eq(q.diagnostics.len(), 1);
 }
 
 test "an unclosed delimiter carries a secondary label at the opener" {
   let s = probe(b"( ]");
   let u = unclosed(s.input, at_pos(s.parser, 1), span_between(0, 1), b"`)`");
-  assert_eq(u.diags.len(), 1);
-  assert_eq(dump_diags(u.diags), b"#1;!E0001:2:3:2:0;=2:3:1;=0:1:0;");
+  assert_eq(u.diagnostics.len(), 1);
+  assert_eq(dump_diagnostics(u.diagnostics), b"#1;!E0001:2:3:2:0;=2:3:1;=0:1:0;");
 }
 
 test "nesting too deep is refused where it would go deeper, and the diagnostic carries its note" {
   let s = probe(b"fn");
   assert_eq(s.input.room, max_depth());
-  assert_eq(dump_diags(too_deep(s.input, s.parser).diags), b"#1;!E0001:0:2:1:1;=0:2:1;")
+  assert_eq(dump_diagnostics(too_deep(s.input, s.parser).diagnostics), b"#1;!E0001:0:2:1:1;=0:2:1;")
 }
 
-fn a_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> / {abort.raise} =
-  expect_ident(input, parser, b"a name")
+fn a_name(input: Input, parser: Parser) -> Result<ParseOutput<Identifier>, Parser> / {abort.raise} =
+  expect_identifier(input, parser, b"a name")
 
-fn idents(r: Result<Parsed<List<Ident>>, Parser>) -> Parsed<List<Ident>> = parsed_or(r, [])
+fn idents(r: Result<ParseOutput<List<Identifier>>, Parser>) -> ParseOutput<List<Identifier>> =
+  parsed_or(r, [])
 
 test "comma_list reads a comma-separated run and stops at its closer" {
   let s = probe(b"a, b, c)");
@@ -1193,14 +1081,13 @@ test "comma_list accepts an empty run and a trailing comma" {
   assert_eq(at_token(t.input, r.parser, token_rparen()), true);
 }
 
-// The trailing comma matters: without it the run stops at the missing comma, not at end of input.
 test "comma_list stops at end of input rather than running off the buffer" {
   let s = probe(b"a, b,");
   let r = idents(comma_list(s.input, s.parser, token_rparen(), a_name));
   assert_eq(r.node.len(), 2);
   assert_eq(at_eof(s.input, r.parser), true);
   assert_eq(failed(comma_list(s.input, s.parser, token_rparen(), a_name)), false);
-  assert_eq(r.parser.diags.len(), 0);
+  assert_eq(r.parser.diagnostics.len(), 0);
 }
 
 test "two elements with no comma between them are one element and a stop" {
@@ -1215,14 +1102,14 @@ test "an element that fails abandons the list and propagates the failure" {
   let s = probe(b"a, 1, c)");
   let r = comma_list(s.input, s.parser, token_rparen(), a_name);
   assert_eq(failed(r), true);
-  assert_eq(parsed_or(r, []).parser.diags.len(), 1);
+  assert_eq(parsed_or(r, []).parser.diagnostics.len(), 1);
   assert_eq(parsed_or(r, []).node.len(), 0);
 }
 
 test "a list emits its length, so a dropped element shifts what follows" {
   let xs = [{ name: b"a", span: span_between(0, 1) }, { name: b"b", span: span_between(2, 3) }];
-  assert_eq(dump_list(xs, dump_ident), b"#2;0:1:ident;@61;2:3:ident;@62;");
-  assert_eq(dump_list([], dump_ident), b"#0;");
+  assert_eq(dump_list(xs, dump_identifier), b"#2;0:1:ident;@61;2:3:ident;@62;");
+  assert_eq(dump_list([], dump_identifier), b"#0;");
 }
 
 test "span_to covers both spans whichever order they arrive in" {
@@ -1231,14 +1118,14 @@ test "span_to covers both spans whichever order they arrive in" {
 }
 
 test "the primary span is the first primary label, not the first label" {
-  let two = parse_diag(
+  let two = parse_diagnostic(
     unexpected(),
     b"",
     [parse_label(span_between(7, 8), false, b""), parse_label(span_between(1, 2), true, b"")],
     [],
   );
   assert_eq(primary_span_of(two), span_between(1, 2));
-  let none = parse_diag(unexpected(), b"", [parse_label(span_between(7, 8), false, b"")], []);
+  let none = parse_diagnostic(unexpected(), b"", [parse_label(span_between(7, 8), false, b"")], []);
   assert_eq(primary_span_of(none), span_between(7, 8));
 }
 
@@ -1260,20 +1147,19 @@ test "a diagnostic names the token it found the way the reference does" {
   assert_eq(render_decimal(b"5", 3), b"0.005");
   assert_eq(render_decimal(b"150", 2), b"1.50");
   let e = error_here(s.input, s.parser, b"a type");
-  let d = match e.diags.at(0) { Some(x) -> x, None -> parse_diag(b"", b"", [], []) };
+  let d = match e.diagnostics.at(0) { Some(x) -> x, None -> parse_diagnostic(b"", b"", [], []) };
   assert_eq(d.message, b"expected a type, found keyword `fn`");
   assert_eq(match d.labels.at(0) { Some(l) -> l.text, None -> b"" }, b"expected a type");
 }
 
-// `law` is a contextual keyword, so an identifier; `type` checks that a real keyword never matches.
 test "at_ident_text matches an identifier and never a keyword" {
   let s = probe(b"law type");
-  assert_eq(at_ident_text(s.input, s.parser, b"law"), true);
-  assert_eq(at_ident_text(s.input, s.parser, b"lav"), false);
-  assert_eq(is_ident(s.input, s.parser), true);
+  assert_eq(at_identifier_text(s.input, s.parser, b"law"), true);
+  assert_eq(at_identifier_text(s.input, s.parser, b"lav"), false);
+  assert_eq(is_identifier(s.input, s.parser), true);
   let n = advance(s.input, s.parser).parser;
-  assert_eq(at_ident_text(s.input, n, b"type"), false);
-  assert_eq(is_ident(s.input, n), false);
+  assert_eq(at_identifier_text(s.input, n, b"type"), false);
+  assert_eq(is_identifier(s.input, n), false);
   assert_eq(at_token(s.input, n, keyword_type()), true);
 }
 
@@ -1290,9 +1176,9 @@ test "starts_upper is the constructor-versus-binder decision, on ASCII" {
 
 test "is_str is a string literal and not a byte string" {
   let s = probe(b"\"a\" b\"a\" x");
-  assert_eq(is_str(s.input, s.parser), true);
-  assert_eq(is_str(s.input, bump(s.input, s.parser)), false);
-  assert_eq(is_str(s.input, bump(s.input, bump(s.input, s.parser))), false);
+  assert_eq(is_string(s.input, s.parser), true);
+  assert_eq(is_string(s.input, bump(s.input, s.parser)), false);
+  assert_eq(is_string(s.input, bump(s.input, bump(s.input, s.parser))), false);
 }
 
 test "bump moves one token and dump_bool tells the two booleans apart" {
@@ -1310,28 +1196,32 @@ test "the dump encoder emits printable ASCII with no quote and no backslash" {
     dump_presence(false),
     dump_word(b"pub"),
     dump_payload(b"a\"b\\c\n"),
-    dump_ident({ name: b"x", span: span_between(0, 1) }),
+    dump_identifier({ name: b"x", span: span_between(0, 1) }),
   ]);
   assert_eq(d, b"3:9:efoo;#2;?1;?0;%pub;@6122625c630a;0:1:ident;@78;");
 }
 
 test "a qualified name and a bare one differ in the option, not only the span" {
   let s = probe(b"orders::place");
-  let q = parsed_or(qname(s.input, s.parser, b"a name"), no_qname());
-  assert_eq(dump_qname(q.node), b"0:13:qname;?1;0:6:ident;@6f7264657273;8:13:ident;@706c616365;");
+  let q = parsed_or(qname(s.input, s.parser, b"a name"), no_qualified_name());
+  assert_eq(
+    dump_qualified_name(q.node),
+    b"0:13:qname;?1;0:6:ident;@6f7264657273;8:13:ident;@706c616365;",
+  );
   let t = probe(b"place");
-  let b = parsed_or(qname(t.input, t.parser, b"a name"), no_qname());
-  assert_eq(dump_qname(b.node), b"0:5:qname;?0;0:5:ident;@706c616365;");
+  let b = parsed_or(qname(t.input, t.parser, b"a name"), no_qualified_name());
+  assert_eq(dump_qualified_name(b.node), b"0:5:qname;?0;0:5:ident;@706c616365;");
 }
 
 test "a name with two `::` is a diagnostic with a note, and fails" {
   let s = probe(b"a::b::c");
   let q = qname(s.input, s.parser, b"a name");
   assert_eq(failed(q), true);
-  assert_eq(dump_diags(parsed_or(q, no_qname()).parser.diags), b"#1;!E0001:4:6:1:1;=4:6:1;");
+  assert_eq(
+    dump_diagnostics(parsed_or(q, no_qualified_name()).parser.diagnostics),
+    b"#1;!E0001:4:6:1:1;=4:6:1;",
+  );
 }
 
-// --- Tuples -----------------------------------------------------------------
-
-pub fn positional(i: Int, span: Span) -> Ident =
+pub fn tuple_field_name(i: Int, span: Span) -> Identifier =
   { name: b"_".concat(Bytes::of_string(i.to_string())), span: span }

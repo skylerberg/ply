@@ -1,7 +1,3 @@
-//! `ply why` — why a package is in this project's closure. Minimal version selection makes this
-//! cheap and exact: the closure is a set of declarations, so the answer is a path from the root
-//! package to this one, and the version it resolved to is the one the closure pins.
-
 import compiler.load (Derives)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
@@ -9,19 +5,19 @@ import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import lock (Pinned, from_front)
+import lock (Pin, from_front)
 import program (Program, load_program)
-import report (Answer, indent, ok_code, refused, reported)
+import report (CommandOutput, indent, ok_code, refused, reported)
 import std.term (Style)
-import compiler.check.resolve.tables (Diag, error_at)
-import compiler.check.resolve.scopes (PackageDeps)
+import compiler.check.resolve.tables (Diagnostic, error_at)
+import compiler.check.resolve.scopes (PackageDependencies)
 import std.fs (fs)
 import std.json (Json, Array, Bool, Null, Number, Str, object, to_string)
 import std.list
 import std.string
 import compiler.syntax.parsing (no_module, dummy_span)
 
-fn unknown(name: String) -> Diag =
+fn unknown(name: String) -> Diagnostic =
   error_at(
     b"E0101",
     no_module(),
@@ -31,75 +27,77 @@ fn unknown(name: String) -> Diag =
     [b"`ply resolve` lists the packages this project reaches, one line each"],
   )
 
-/// The package a name resolves to. A closure lists the prefixes it is reached through, and a prefix
-/// is the package's own name unless a manifest aliases it — which `E0133` refuses — so a name is a
-/// prefix.
-fn index_of(pkgs: List<PackageDeps>, name: Bytes) -> Option<Int> / {abort.raise} =
-  find_prefix(pkgs, name, 0)
+fn index_of(packages: List<PackageDependencies>, name: Bytes) -> Option<Int> / {abort.raise} =
+  find_prefix(packages, name, 0)
 
-fn find_prefix(pkgs: List<PackageDeps>, name: Bytes, i: Int) -> Option<Int> / {abort.raise} =
-  if i >= pkgs.len() { None }
-  else if pkgs.get(i).prefix == name { Some(i) }
-  else { find_prefix(pkgs, name, i + 1) }
+fn find_prefix(
+  packages: List<PackageDependencies>,
+  name: Bytes,
+  i: Int,
+) -> Option<Int> / {abort.raise} =
+  if i >= packages.len() { None }
+  else if packages.get(i).prefix == name { Some(i) }
+  else { find_prefix(packages, name, i + 1) }
 
 fn prepended(path: List<Int>, x: Int) -> List<Int> =
   path.fold([x], |acc: List<Int>, y: Int| acc.push(y))
 
-/// The chain from the root package down to `wanted`, as package indices. `seen` prunes a package
-/// whose own reachability was already explored on this walk; the closure is acyclic (`E0134`), so a
-/// package that was explored once need not be explored again.
 fn chain(
-  pkgs: List<PackageDeps>,
+  packages: List<PackageDependencies>,
   start: Int,
   wanted: Int,
   seen: List<Int>,
-) -> Option<List<Int>> / {abort.raise} = chained(pkgs, start, wanted, seen, pkgs.len() + 1)
+) -> Option<List<Int>> / {abort.raise} =
+  find_chain(packages, start, wanted, seen, packages.len() + 1)
 
-/// `room` is how many more packages the walk may go down into: `seen` holds each one once.
-fn chained(
-  pkgs: List<PackageDeps>,
+fn find_chain(
+  packages: List<PackageDependencies>,
   start: Int,
   wanted: Int,
   seen: List<Int>,
-  room: Int,
+  depth_left: Int,
 ) -> Option<List<Int>> / {abort.raise} =
   if start == wanted { Some([start]) }
-  else if seen.contains(start) || room <= 0 { None } else {
+  else if seen.contains(start) || depth_left <= 0 { None } else {
     let seen = seen.push(start);
-    match searching(pkgs, pkgs.get(start).deps, wanted, seen, room - 1) {
+    match search_dependencies(
+        packages,
+        packages.get(start).dependencies,
+        wanted,
+        seen,
+        depth_left - 1,
+      ) {
       None -> None,
       Some(path) -> Some(prepended(path, start)),
     }
   }
 
-fn searching(
-  pkgs: List<PackageDeps>,
+fn search_dependencies(
+  packages: List<PackageDependencies>,
   names: List<Bytes>,
   wanted: Int,
   seen: List<Int>,
-  room: Int,
+  depth_left: Int,
 ) -> Option<List<Int>> / {abort.raise} =
   match names {
     [] -> None,
-    [name, ..rest] -> match index_of(pkgs, name) {
-      None -> searching(pkgs, rest, wanted, seen, room),
-      Some(j) -> match chained(pkgs, j, wanted, seen, room) {
+    [name, ..rest] -> match index_of(packages, name) {
+      None -> search_dependencies(packages, rest, wanted, seen, depth_left),
+      Some(j) -> match find_chain(packages, j, wanted, seen, depth_left) {
         Some(path) -> Some(path),
-        None -> searching(pkgs, rest, wanted, seen, room),
+        None -> search_dependencies(packages, rest, wanted, seen, depth_left),
       },
     },
   }
 
-// --- The answer -------------------------------------------------------------------
-
-fn pin_of(pins: List<Pinned>, name: String) -> Option<Pinned> =
-  pins.fold(None, |found: Option<Pinned>, pin: Pinned|
+fn pin_of(pins: List<Pin>, name: String) -> Option<Pin> =
+  pins.fold(None, |found: Option<Pin>, pin: Pin|
     match found { Some(_) -> found, None -> if pin.name == name { Some(pin) } else { None } })
 
-fn names_of(pkgs: List<PackageDeps>, path: List<Int>) -> List<String> / {abort.raise} =
-  path.map(|i: Int| String::of_bytes_lossy(pkgs.get(i).prefix))
+fn names_of(packages: List<PackageDependencies>, path: List<Int>) -> List<String> / {abort.raise} =
+  path.map(|i: Int| String::of_bytes_lossy(packages.get(i).prefix))
 
-fn json_of(names: List<String>, pins: List<Pinned>, name: String, root: Bool, code: Int) -> Json = {
+fn json_of(names: List<String>, pins: List<Pin>, name: String, root: Bool, code: Int) -> Json = {
   let pin = pin_of(pins, name);
   object([
     { key: "command", value: Str("why") },
@@ -113,8 +111,7 @@ fn json_of(names: List<String>, pins: List<Pinned>, name: String, root: Bool, co
   ])
 }
 
-/// What a person reads: the path, then what the closure pinned for the package it ends at.
-fn why_lines(names: List<String>, pins: List<Pinned>) -> List<String> = {
+fn why_lines(names: List<String>, pins: List<Pin>) -> List<String> = {
   let last = match names.at(names.len() - 1) { Some(n) -> n, None -> "" };
   let path = [indent() ++ String::join(names, " -> ")];
   match pin_of(pins, last) {
@@ -125,11 +122,11 @@ fn why_lines(names: List<String>, pins: List<Pinned>) -> List<String> = {
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_reached} = {
   let s: Style = style_of(flags);
-  let loaded: Program = load_program(flags.paths, flags.verify_deps);
+  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
   match loaded.frame {
-    None -> refused(s, "why", loaded.diags, loaded.places),
+    None -> refused(s, "why", loaded.diagnostics, loaded.places),
     Some(w) -> {
       let query = flags.query;
       match index_of(w.packages, Bytes::of_string(query)) {
@@ -156,8 +153,6 @@ pub fn run(
   }
 }
 
-// --- Tests ------------------------------------------------------------------
-
 test "a why answer is the path from the root, then what the closure pinned" {
   let names = ["app", "left", "shared"];
   let pins = [{ name: "shared", version: "0.3.0", digest: "b3:ab" }];
@@ -166,16 +161,16 @@ test "a why answer is the path from the root, then what the closure pinned" {
 }
 
 test "the chain is the declared path, and a package nothing reaches has none" {
-  let pkgs: List<PackageDeps> = [
-    { prefix: b"app", deps: [b"left", b"right"] },
-    { prefix: b"left", deps: [b"shared"] },
-    { prefix: b"right", deps: [] },
-    { prefix: b"shared", deps: [] },
+  let packages: List<PackageDependencies> = [
+    { prefix: b"app", dependencies: [b"left", b"right"] },
+    { prefix: b"left", dependencies: [b"shared"] },
+    { prefix: b"right", dependencies: [] },
+    { prefix: b"shared", dependencies: [] },
   ];
-  assert_eq(chain(pkgs, 0, 3, []), Some([0, 1, 3]));
-  assert_eq(chain(pkgs, 0, 2, []), Some([0, 2]));
-  assert_eq(chain(pkgs, 0, 0, []), Some([0]));
-  assert_eq(chain(pkgs, 1, 2, []), None)
+  assert_eq(chain(packages, 0, 3, []), Some([0, 1, 3]));
+  assert_eq(chain(packages, 0, 2, []), Some([0, 2]));
+  assert_eq(chain(packages, 0, 0, []), Some([0]));
+  assert_eq(chain(packages, 1, 2, []), None)
 }
 
 test "the json answer carries the path, the pin, and whether it is the root" {

@@ -1,105 +1,81 @@
-//! The typed tree: a body as the check settled it, written out. Each node holds its type and what
-//! the check resolved there, so nothing that reads the tree looks a node's facts up by its site.
-//! The tree is generic in how it writes a type: the checker and what lowers a body hold `Type`s,
-//! and a body stored with its row names each type by its key in the row's table.
-
 import compiler.syntax.parsing (Span, span_bin)
-import compiler.syntax.patterns (Lit, lit_bin)
+import compiler.syntax.patterns (SourceLiteral, source_literal_bin)
 import compiler.check.types (Type, Row, Atom, row_bin, atom_bin)
 import std.bin
 import std.derive.children
 import std.list
 
-/// One node: what it is, where its text stands, its type, and what the check lets go there.
-pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t, releases: List<TypedRelease> }
+pub type TypedExpression<t> = {
+  node: TypedNode<t>,
+  span: Span,
+  ty: t,
+  releases: List<TypedRelease>,
+}
 
 pub type TypedNode<t> =
-  | TypedLit(Lit)
+  | TypedLiteral(SourceLiteral)
   | TypedRead(Reading<t>)
-  /// `witness` is the owner's type parameter whose witness does the operator, where its operand is
-  /// of one a `numeric` or `integer` constraint makes a witness of.
-  | TypedUnary({ op: Bytes, operand: TypedExpr<t>, witness: Option<Bytes> })
-  | TypedBinary({ op: Bytes, lhs: TypedExpr<t>, rhs: TypedExpr<t>, witness: Option<Bytes> })
-  /// `args` are in the callee's parameters' order, a default the call leaves out among them. `row`
-  /// is what a call of a function value performs, as the type it calls through says; empty for a
-  /// call of a definition, a constructor or a builtin, whose read says it.
-  | TypedCall({ callee: TypedExpr<t>, args: List<TypedExpr<t>>, row: Row })
-  | TypedIf({ cond: TypedExpr<t>, then_branch: TypedExpr<t>, else_branch: TypedExpr<t> })
-  | TypedMatch({ scrutinee: TypedExpr<t>, arms: List<TypedArm<t>> })
-  | TypedBlock({ stmts: List<TypedStmt<t>>, tail: Option<TypedExpr<t>> })
-  | TypedList(List<TypedExpr<t>>)
+  | TypedUnary({ op: Bytes, operand: TypedExpression<t>, witness: Option<Bytes> })
+  | TypedBinary({ op: Bytes, lhs: TypedExpression<t>, rhs: TypedExpression<t>, witness: Option<Bytes> })
+  | TypedCall({ callee: TypedExpression<t>, args: List<TypedExpression<t>>, row: Row })
+  | TypedIf({ cond: TypedExpression<t>, then_branch: TypedExpression<t>, else_branch: TypedExpression<t> })
+  | TypedMatch({ scrutinee: TypedExpression<t>, arms: List<TypedArm<t>> })
+  | TypedBlock({ statements: List<TypedStatement<t>>, tail: Option<TypedExpression<t>> })
+  | TypedList(List<TypedExpression<t>>)
   | TypedRecord(List<TypedField<t>>)
-  /// `{ ..base, f: e }`: the base's record with the fields `sets` writes replaced, at the node's type;
-  /// `copies` are the base's other fields, in the record's order.
-  | TypedUpdate({ base: TypedExpr<t>, sets: List<TypedField<t>>, copies: List<Bytes> })
-  | TypedFieldRead({ base: TypedExpr<t>, field: Bytes })
-  /// `effect` is the effect's name across the program, `resource` the label as written, and `atom`
-  /// what the perform performs.
-  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<TypedExpr<t>> })
-  | TypedLambda({ params: List<TypedParam<t>>, body: TypedExpr<t>, row: Row })
+  | TypedUpdate({ base: TypedExpression<t>, sets: List<TypedField<t>>, copies: List<Bytes> })
+  | TypedFieldRead({ base: TypedExpression<t>, field: Bytes })
+  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<TypedExpression<t>> })
+  | TypedLambda({ params: List<TypedParam<t>>, body: TypedExpression<t>, row: Row })
   | TypedSimulate(TypedThunk<t>)
   | TypedParallel(List<TypedThunk<t>>)
-  /// `row` is what the body performs. `vars` are the handler's variables, made before the body
-  /// runs, which its clauses read and assign.
-  | TypedHandle({ body: TypedExpr<t>, row: Row, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
+  | TypedHandle({ body: TypedExpression<t>, row: Row, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
 
-/// What a name read as a value is: a binder in scope; a definition at the type arguments, rows and
-/// labels the read fills, each in its scheme's order, with the witnesses it passes in the order of
-/// the parameters they are for; a constructor of a declared sum at the type arguments it fills; or a
-/// native, by its name across the program, at the type arguments and rows it fills, in its own
-/// order, with the witnesses it passes.
 pub type Reading<t> =
   | ReadLocal(Bytes)
   | ReadDefinition({ full: Bytes, args: List<t>, rows: List<Row>, labels: List<FilledLabel>, witnesses: List<NumericWitness> })
   | ReadConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<t> })
   | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row>, witnesses: List<NumericWitness> })
 
-/// A label a read fills: one named, or the owner's own label parameter at its place.
 pub type FilledLabel = | LabelNamed(Bytes) | LabelParam(Int)
 
-/// The type a `numeric` or `integer` constraint is met at, as a call passes it: a numeric type by
-/// name, a type parameter of the caller's by name, which passes the caller's own witness, or a type
-/// that states its own arithmetic by its constructor's name.
 pub type NumericWitness = | ConcreteWitness(Bytes) | ParamWitness(Bytes) | StatedWitness(Bytes)
 
-/// The parameter that holds the witness of type parameter `param`, which no source can spell.
 pub fn witness_param(param: Bytes) -> Bytes = b"?w_".concat(param)
 
 pub type TypedParam<t> = { name: Bytes, ty: t, span: Span }
 
-/// A body run as a function of no parameters, and what it performs.
-pub type TypedThunk<t> = { body: TypedExpr<t>, row: Row }
+pub type TypedThunk<t> = { body: TypedExpression<t>, row: Row }
 
-pub type TypedField<t> = { name: Bytes, value: TypedExpr<t> }
+pub type TypedField<t> = { name: Bytes, value: TypedExpression<t> }
 
-pub type TypedArm<t> = { pat: TypedPattern<t>, guard: Option<TypedExpr<t>>, body: TypedExpr<t> }
+pub type TypedArm<t> = {
+  pattern: TypedPattern<t>,
+  guard: Option<TypedExpression<t>>,
+  body: TypedExpression<t>,
+}
 
-/// A pattern, each binder with the type it binds and each constructor resolved to its case. A `_`
-/// holds where it is written and the type of what it stands for, and a record pattern's `rest` where
-/// its `..` is written and the record's type: what the ownership walk refuses to drop.
 pub type TypedPattern<t> =
   | TypedWild({ span: Span, ty: t })
   | TypedBinder({ name: Bytes, ty: t, span: Span })
-  | TypedLitPattern(Lit)
-  | TypedRange({ lo: Lit, hi: Lit })
+  | TypedLiteralPattern(SourceLiteral)
+  | TypedRange({ lo: SourceLiteral, hi: SourceLiteral })
   | TypedCase({ sum: Bytes, name: Bytes, case: Int, args: List<TypedPattern<t>> })
   | TypedRecordPattern({ fields: List<TypedFieldPattern<t>>, rest: Option<{ span: Span, ty: t }> })
   | TypedListPattern({ items: List<TypedPattern<t>>, rest: Option<TypedPattern<t>> })
   | TypedOr(List<TypedPattern<t>>)
 
-pub type TypedFieldPattern<t> = { name: Bytes, pat: TypedPattern<t> }
+pub type TypedFieldPattern<t> = { name: Bytes, pattern: TypedPattern<t> }
 
-/// Each binder `pat` writes, with where it is written and its type; of an or-pattern, its first
-/// alternative's, as every alternative binds the same names.
-pub fn pattern_binders<t>(pat: TypedPattern<t>) -> List<TypedParam<t>> =
-  match pat {
+pub fn pattern_binders<t>(pattern: TypedPattern<t>) -> List<TypedParam<t>> =
+  match pattern {
     TypedBinder(v) -> [{ name: v.name, ty: v.ty, span: v.span }],
     TypedCase(c) ->
       c.args.fold([], |acc: List<TypedParam<t>>, a: TypedPattern<t>|
         acc.concat(pattern_binders(a))),
     TypedRecordPattern(r) ->
       r.fields.fold([], |acc: List<TypedParam<t>>, x: TypedFieldPattern<t>|
-        acc.concat(pattern_binders(x.pat))),
+        acc.concat(pattern_binders(x.pattern))),
     TypedListPattern(l) -> {
       let items = l.items.fold([], |acc: List<TypedParam<t>>, a: TypedPattern<t>|
         acc.concat(pattern_binders(a)));
@@ -109,18 +85,10 @@ pub fn pattern_binders<t>(pat: TypedPattern<t>) -> List<TypedParam<t>> =
     _ -> [],
   }
 
-/// A value a release lets go of at a node, and where it runs.
 pub type TypedRelease = { held: Holder, place: ReleasePlace }
 
-/// What holds a value a release lets go of: the binder at the site, or, where no binder holds it,
-/// the node at the site that made it.
 pub type Holder = | HeldByBinder(Int) | HeldByNode(Int)
 
-/// Where a release runs, by its node: after the node runs; before it, where the node is the last of
-/// its scope and does not name what is let go, so a tail call there stays a loop; where a raise, a
-/// clause that does not resume, or a cancel unwinds through the node, a call or a perform; where the
-/// pattern a `let` matches the node's value against misses; or where the release of what the
-/// payload names at the node fails, which unwinds from there.
 pub type ReleasePlace =
   | ReleaseAfter
   | ReleaseBefore
@@ -128,25 +96,17 @@ pub type ReleasePlace =
   | ReleaseMissing
   | ReleaseFailing(Holder)
 
-/// The key a release names the binder at site `binder` by: the site negated, so no node's site is
-/// one, and a later binder's key is the smaller, which puts the latest bound first in a walk of keys.
 pub fn binding_key(binder: Int) -> Int = 0 - binder - 1
 
-/// The key a walk follows what `h` names by.
 pub fn holder_key(h: Holder) -> Int =
   match h { HeldByBinder(binder) -> binding_key(binder), HeldByNode(site) -> site }
 
-pub type TypedStmt<t> =
-  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span })
-  /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
-  | TypedLetElse({ pat: TypedPattern<t>, value: TypedExpr<t>, fallback: TypedExpr<t>, span: Span })
-  | TypedDo(TypedExpr<t>)
-  /// `name = value;`: a clause giving its handler's variable a new value.
-  | TypedAssign({ name: Bytes, value: TypedExpr<t>, span: Span })
+pub type TypedStatement<t> =
+  | TypedLet({ pattern: TypedPattern<t>, value: TypedExpression<t>, span: Span })
+  | TypedLetElse({ pattern: TypedPattern<t>, value: TypedExpression<t>, fallback: TypedExpression<t>, span: Span })
+  | TypedDo(TypedExpression<t>)
+  | TypedAssign({ name: Bytes, value: TypedExpression<t>, span: Span })
 
-/// A clause of a `handle`: the operation it answers, under the label written or under every label,
-/// its parameters, the label it binds where it answers every label, its continuation, and its body.
-/// `row` is what its body performs and `resumed` what resuming its continuation does.
 pub type TypedClause<t> = {
   effect: Bytes,
   op: Bytes,
@@ -155,21 +115,16 @@ pub type TypedClause<t> = {
   params: List<TypedParam<t>>,
   label: Option<TypedParam<t>>,
   resume: Option<TypedParam<t>>,
-  body: TypedExpr<t>,
+  body: TypedExpression<t>,
   row: Row,
   resumed: Row,
   span: Span,
 }
 
-/// A `handle`'s `return` clause, run on the body's answer; `row` is what it performs.
-pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpr<t>, row: Row, span: Span }
+pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpression<t>, row: Row, span: Span }
 
-/// A variable a `handle` holds: its type, and its first value, which reads the variables above it.
-pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpr<t>, span: Span }
+pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpression<t>, span: Span }
 
-/// Which of its owner's bodies a typed body is: a definition's body, one of its spec clauses by
-/// its place among them, or its measure; a test's run or the listing of its cases; a law's guard
-/// or the proposition it states.
 pub type BodyPart =
   | WholeBody
   | ClauseBody(Int)
@@ -179,18 +134,14 @@ pub type BodyPart =
   | LawGuard
   | LawBody
 
-/// A body the check settled: what owns it, the module it is in, which of its owner's bodies it is,
-/// the parameters it binds, in order, and its tree, each place in it counted from where its item's
-/// text starts.
 pub type TypedBody<t> = {
   owner: Bytes,
   module: Int,
   part: BodyPart,
   params: List<TypedParam<t>>,
-  body: TypedExpr<t>,
+  body: TypedExpression<t>,
 }
 
-/// What tells a body apart from its owner's others, as text, which bodies are ordered by.
 pub fn part_key(part: BodyPart) -> Bytes =
   match part {
     WholeBody -> b"body",
@@ -210,9 +161,9 @@ derive bin for NumericWitness
 
 derive bin for TypedBody
 
-derive bin for TypedExpr
+derive bin for TypedExpression
 
-derive children for TypedExpr
+derive children for TypedExpression
 
 derive bin for TypedRelease
 
@@ -236,7 +187,7 @@ derive bin for TypedPattern
 
 derive bin for TypedFieldPattern
 
-derive bin for TypedStmt
+derive bin for TypedStatement
 
 derive bin for TypedClause
 
@@ -244,19 +195,17 @@ derive bin for TypedReturn
 
 derive bin for TypedHandlerVar
 
-// --- Reading a tree --------------------------------------------------------------------------------
-
-/// `b` as a reader of its values reads it, which no release changes: with nothing let go.
 pub fn unreleased<t>(b: TypedBody<t>) -> TypedBody<t> =
-  { ..b, body: typed_expr_nodes_mapped(b.body, |e: TypedExpr<t>| { ..e, releases: [] }) }
+  {
+    ..b,
+    body: typed_expression_nodes_mapped(b.body, |e: TypedExpression<t>| { ..e, releases: [] }),
+  }
 
-/// `b` as a reader that draws every type parameter as `Int` reads it: with no witness passed or
-/// taken, each operator its operands' own.
 pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
   {
     ..b,
     params: b.params.filter(|p: TypedParam<t>| !p.name.starts_with(witness_param(b""))),
-    body: typed_expr_nodes_mapped(b.body, |e: TypedExpr<t>|
+    body: typed_expression_nodes_mapped(b.body, |e: TypedExpression<t>|
       {
         ..e,
         node: match e.node {
@@ -269,10 +218,6 @@ pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
       }),
   }
 
-// --- Writing a tree's types another way ------------------------------------------------------------
-
-/// How `retyped` writes a tree: `ty` writes a type, threading a state through the types in the
-/// order a walk meets them; `row` writes a row, `atom` an atom and `span` a place.
 pub type Retyping<a, b, s> = {
   ty: (a, s) -> { ty: b, state: s } / {abort.raise},
   row: (Row) -> Row / {abort.raise},
@@ -280,15 +225,13 @@ pub type Retyping<a, b, s> = {
   span: (Span) -> Span,
 }
 
-/// What retyping a part found, and the state after it.
 pub type Retyped<x, s> = { out: x, state: s }
 
-/// `e` with every type written as `r` writes it.
 pub fn retyped<a, b, s>(
-  e: TypedExpr<a>,
+  e: TypedExpression<a>,
   state: s,
   r: Retyping<a, b, s>,
-) -> Retyped<TypedExpr<b>, s> / {abort.raise} = {
+) -> Retyped<TypedExpression<b>, s> / {abort.raise} = {
   let node = retyped_node(e.node, state, r);
   let t = (r.ty)(e.ty, node.state);
   {
@@ -297,7 +240,6 @@ pub fn retyped<a, b, s>(
   }
 }
 
-/// `b` with every type written as `r` writes it.
 pub fn body_retyped<a, b, s>(
   b: TypedBody<a>,
   state: s,
@@ -312,20 +254,23 @@ pub fn body_retyped<a, b, s>(
 }
 
 fn retyped_all<a, b, s>(
-  xs: List<TypedExpr<a>>,
+  xs: List<TypedExpression<a>>,
   state: s,
   r: Retyping<a, b, s>,
-) -> Retyped<List<TypedExpr<b>>, s> / {abort.raise} =
-  xs.fold({ out: [], state: state }, |acc: Retyped<List<TypedExpr<b>>, s>, x: TypedExpr<a>| {
-    let o = retyped(x, acc.state, r);
-    { out: acc.out.push(o.out), state: o.state }
-  })
+) -> Retyped<List<TypedExpression<b>>, s> / {abort.raise} =
+  xs.fold(
+    { out: [], state: state },
+    |acc: Retyped<List<TypedExpression<b>>, s>, x: TypedExpression<a>| {
+      let o = retyped(x, acc.state, r);
+      { out: acc.out.push(o.out), state: o.state }
+    },
+  )
 
 fn retyped_opt<a, b, s>(
-  x: Option<TypedExpr<a>>,
+  x: Option<TypedExpression<a>>,
   state: s,
   r: Retyping<a, b, s>,
-) -> Retyped<Option<TypedExpr<b>>, s> / {abort.raise} =
+) -> Retyped<Option<TypedExpression<b>>, s> / {abort.raise} =
   match x {
     Some(y) -> {
       let o = retyped(y, state, r);
@@ -335,11 +280,11 @@ fn retyped_opt<a, b, s>(
   }
 
 fn retyped_types<a, b, s>(
-  tys: List<a>,
+  types: List<a>,
   state: s,
   r: Retyping<a, b, s>,
 ) -> Retyped<List<b>, s> / {abort.raise} =
-  tys.fold({ out: [], state: state }, |acc: Retyped<List<b>, s>, t: a| {
+  types.fold({ out: [], state: state }, |acc: Retyped<List<b>, s>, t: a| {
     let o = (r.ty)(t, acc.state);
     { out: acc.out.push(o.ty), state: o.state }
   })
@@ -455,7 +400,7 @@ fn retyped_pattern<a, b, s>(
       let t = (r.ty)(v.ty, state);
       { out: TypedBinder({ name: v.name, ty: t.ty, span: (r.span)(v.span) }), state: t.state }
     },
-    TypedLitPattern(l) -> { out: TypedLitPattern(l), state: state },
+    TypedLiteralPattern(l) -> { out: TypedLiteralPattern(l), state: state },
     TypedRange(g) -> { out: TypedRange(g), state: state },
     TypedCase(c) -> {
       let args = each(c.args, state);
@@ -468,8 +413,8 @@ fn retyped_pattern<a, b, s>(
       let fields = rp.fields.fold(
         { out: [], state: state },
         |acc: Retyped<List<TypedFieldPattern<b>>, s>, f: TypedFieldPattern<a>| {
-          let o = retyped_pattern(f.pat, acc.state, r);
-          { out: acc.out.push({ name: f.name, pat: o.out }), state: o.state }
+          let o = retyped_pattern(f.pattern, acc.state, r);
+          { out: acc.out.push({ name: f.name, pattern: o.out }), state: o.state }
         },
       );
       match rp.rest {
@@ -504,23 +449,28 @@ fn retyped_pattern<a, b, s>(
   }
 }
 
-fn retyped_stmt<a, b, s>(
-  stmt: TypedStmt<a>,
+fn retyped_statement<a, b, s>(
+  stmt: TypedStatement<a>,
   state: s,
   r: Retyping<a, b, s>,
-) -> Retyped<TypedStmt<b>, s> / {abort.raise} =
+) -> Retyped<TypedStatement<b>, s> / {abort.raise} =
   match stmt {
     TypedLet(l) -> {
-      let p = retyped_pattern(l.pat, state, r);
+      let p = retyped_pattern(l.pattern, state, r);
       let v = retyped(l.value, p.state, r);
-      { out: TypedLet({ pat: p.out, value: v.out, span: (r.span)(l.span) }), state: v.state }
+      { out: TypedLet({ pattern: p.out, value: v.out, span: (r.span)(l.span) }), state: v.state }
     },
     TypedLetElse(l) -> {
-      let p = retyped_pattern(l.pat, state, r);
+      let p = retyped_pattern(l.pattern, state, r);
       let v = retyped(l.value, p.state, r);
       let f = retyped(l.fallback, v.state, r);
       {
-        out: TypedLetElse({ pat: p.out, value: v.out, fallback: f.out, span: (r.span)(l.span) }),
+        out: TypedLetElse({
+          pattern: p.out,
+          value: v.out,
+          fallback: f.out,
+          span: (r.span)(l.span),
+        }),
         state: f.state,
       }
     },
@@ -570,7 +520,7 @@ fn retyped_node<a, b, s>(
   r: Retyping<a, b, s>,
 ) -> Retyped<TypedNode<b>, s> / {abort.raise} =
   match node {
-    TypedLit(l) -> { out: TypedLit(l), state: state },
+    TypedLiteral(l) -> { out: TypedLiteral(l), state: state },
     TypedRead(read) -> {
       let o = retyped_reading(read, state, r);
       { out: TypedRead(o.out), state: o.state }
@@ -603,24 +553,24 @@ fn retyped_node<a, b, s>(
       let arms = m.arms.fold(
         { out: [], state: sc.state },
         |acc: Retyped<List<TypedArm<b>>, s>, arm: TypedArm<a>| {
-          let p = retyped_pattern(arm.pat, acc.state, r);
+          let p = retyped_pattern(arm.pattern, acc.state, r);
           let g = retyped_opt(arm.guard, p.state, r);
           let body = retyped(arm.body, g.state, r);
-          { out: acc.out.push({ pat: p.out, guard: g.out, body: body.out }), state: body.state }
+          { out: acc.out.push({ pattern: p.out, guard: g.out, body: body.out }), state: body.state }
         },
       );
       { out: TypedMatch({ scrutinee: sc.out, arms: arms.out }), state: arms.state }
     },
     TypedBlock(blk) -> {
-      let stmts = blk.stmts.fold(
+      let statements = blk.statements.fold(
         { out: [], state: state },
-        |acc: Retyped<List<TypedStmt<b>>, s>, x: TypedStmt<a>| {
-          let o = retyped_stmt(x, acc.state, r);
+        |acc: Retyped<List<TypedStatement<b>>, s>, x: TypedStatement<a>| {
+          let o = retyped_statement(x, acc.state, r);
           { out: acc.out.push(o.out), state: o.state }
         },
       );
-      let tail = retyped_opt(blk.tail, stmts.state, r);
-      { out: TypedBlock({ stmts: stmts.out, tail: tail.out }), state: tail.state }
+      let tail = retyped_opt(blk.tail, statements.state, r);
+      { out: TypedBlock({ statements: statements.out, tail: tail.out }), state: tail.state }
     },
     TypedList(xs) -> {
       let o = retyped_all(xs, state, r);

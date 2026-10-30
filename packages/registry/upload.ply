@@ -5,23 +5,21 @@
 import compiler.front.interface (envelope_of, enveloped)
 import std.bin
 import std.pkg (Attestation, attestation_bin)
-import std.signed (signed_of, vouched_by)
-import compiler.front.pkg (check_source)
-import compiler.store.plyx (Placed, decode_library, digest_of, digest_text, library_domain,
+import std.signed (signed_of, trusted_signer)
+import compiler.front.pkg (check_manifest)
+import compiler.store.plyx (SectionLocation, decode_library, digest_of, digest_text, library_domain,
                             archive_digest)
 import std.bytes
 import std.config
 import std.config (config)
 import std.http
 import std.http (Headers, header)
-import std.pkg (Dep, Manifest, Registry, Release, Version, parse_version, render_version)
-import twin
+import std.pkg (Dependency, Manifest, Registry, Release, Version, parse_version, render_version)
+import fake
 import std.option
 import std.string
 
-pub type Refusal = { status: Int, reason: String }
-
-fn refused<a>(status: Int, reason: String) -> Result<a, Refusal> =
+fn fail<a>(status: Int, reason: String) -> Result<a, http::Error> =
   Err({ status: status, reason: reason })
 
 // --- Who may publish --------------------------------------------------------------
@@ -31,7 +29,7 @@ fn refused<a>(status: Int, reason: String) -> Result<a, Refusal> =
 pub fn token_key(name: String) -> String = "token." ++ name
 
 /// The token `Authorization: Bearer <token>` presents, when it presents one.
-pub fn bearer(headers: Headers) -> Option<String> / {abort.raise} =
+pub fn bearer_token(headers: Headers) -> Option<String> / {abort.raise} =
   match header(headers, "authorization") {
     None -> None,
     Some(v) -> if v.starts_with("Bearer ") {
@@ -42,16 +40,16 @@ pub fn bearer(headers: Headers) -> Option<String> / {abort.raise} =
 
 /// A request allowed to change `name`: 401 without a token, 403 with one this name is not mapped
 /// to. The comparison is the constant-time one a `Secret` allows.
-pub fn allowed(
+pub fn authorize(
   name: String,
   headers: Headers,
-) -> Result<Unit, Refusal> / {config.secret[tokens], abort.raise} =
-  match bearer(headers) {
-    None -> refused(401, "a publish or a yank carries `Authorization: Bearer <token>`"),
+) -> Result<Unit, http::Error> / {config.secret[tokens], abort.raise} =
+  match bearer_token(headers) {
+    None -> fail(401, "a publish or a yank carries `Authorization: Bearer <token>`"),
     Some(presented) -> match config.secret[tokens](token_key(name)) {
-      None -> refused(403, "no token may change `" ++ name ++ "` on this registry"),
+      None -> fail(403, "no token may change `" ++ name ++ "` on this registry"),
       Some(stored) -> if stored.verify(presented) { Ok(()) }
-      else { refused(403, "this token may not change `" ++ name ++ "`") },
+      else { fail(403, "this token may not change `" ++ name ++ "`") },
     },
   }
 
@@ -59,38 +57,39 @@ pub fn allowed(
 
 /// The index entry a publish of `name` at `version` makes, from the body it was sent and the digest
 /// the client says that body seals. The digest is recomputed here and never taken on trust.
-pub fn judged(
+pub fn validate_archive(
   name: String,
   version: Version,
   claimed: Option<String>,
   body: Bytes,
-) -> Result<Release, Refusal> / {abort.raise} =
+) -> Result<Release, http::Error> / {abort.raise} =
   match claimed {
-    None -> refused(400, "a publish carries `X-Ply-Digest: b3:<hex>`, the digest of its body"),
-    Some(said) -> match decode_library(body) {
+    None -> fail(400, "a publish carries `X-Ply-Digest: b3:<hex>`, the digest of its body"),
+    Some(claimed_digest) -> match decode_library(body) {
       Err(r) ->
-        refused(422, "the body is not a library archive: " ++ String::of_bytes_lossy(r.message)),
+        fail(422, "the body is not a library archive: " ++ String::of_bytes_lossy(r.message)),
       Ok(x) -> match digest_of(library_domain(), body) {
-        None -> refused(422, "the body is too short to be a library archive"),
-        Some(d) -> if digest_text(d) != said {
-          refused(
+        None -> fail(422, "the body is too short to be a library archive"),
+        Some(d) -> if digest_text(d) != claimed_digest {
+          fail(
             422,
-            "the body's digest is " ++ digest_text(d) ++ ", and `X-Ply-Digest` says " ++ said,
+            "the body's digest is " ++ digest_text(d) ++ ", and `X-Ply-Digest` says "
+              ++ claimed_digest,
           )
         } else if x.digest != d {
-          refused(422, "the archive's own digest field is not the digest of its bytes")
+          fail(422, "the archive's own digest field is not the digest of its bytes")
         } else {
           match manifest_of(body, x.sections) {
-            None -> refused(422, "the archive holds no manifest"),
-            Some(text) -> described(name, version, digest_text(d), text),
+            None -> fail(422, "the archive holds no manifest"),
+            Some(text) -> validate_manifest(name, version, digest_text(d), text),
           }
         },
       },
     },
   }
 
-fn manifest_of(body: Bytes, sections: List<Placed>) -> Option<Bytes> =
-  sections.fold(None, |found: Option<Bytes>, p: Placed|
+fn manifest_of(body: Bytes, sections: List<SectionLocation>) -> Option<Bytes> =
+  sections.fold(None, |found: Option<Bytes>, p: SectionLocation|
     match found {
       Some(_) -> found,
       None -> if p.name == b"manifest" { body.slice_at(p.at, p.len) } else { None },
@@ -98,18 +97,18 @@ fn manifest_of(body: Bytes, sections: List<Placed>) -> Option<Bytes> =
 
 /// The archive's own manifest, held to what the request says it is: the package and version the
 /// path names, a library, and one whose dependencies whoever depends on it can resolve here.
-fn described(
+fn validate_manifest(
   name: String,
   version: Version,
   digest: String,
   text: Bytes,
-) -> Result<Release, Refusal> / {abort.raise} = {
-  let c = check_source(text);
+) -> Result<Release, http::Error> / {abort.raise} = {
+  let c = check_manifest(text);
   match c.manifest {
-    None -> refused(422, "the archive's manifest does not check"),
-    Some(m) -> if c.diags.len() > 0 { refused(422, "the archive's manifest does not check") }
+    None -> fail(422, "the archive's manifest does not check"),
+    Some(m) -> if c.diagnostics.len() > 0 { fail(422, "the archive's manifest does not check") }
     else if m.name != name || m.version != version {
-      refused(
+      fail(
         422,
         "the archive holds `" ++ m.name ++ "` " ++ render_version(m.version)
           ++ ", and was sent as `"
@@ -118,11 +117,11 @@ fn described(
           ++ render_version(version),
       )
     } else if m.entry != None {
-      refused(422, "`" ++ name ++ "` names an entry, and only a library is published")
+      fail(422, "`" ++ name ++ "` names an entry, and only a library is published")
     } else {
-      match elsewhere(m) {
+      match non_registry_dependency(m) {
         Some(d) ->
-          refused(
+          fail(
             422,
             "the dependency `" ++ d.name
               ++ "` is not from the registry, and a published package depends only on it",
@@ -143,22 +142,22 @@ pub fn is_semantics(s: String) -> Bool =
 
 /// An interface for the version `archive` names, under `semantics`: its frame must say both. What
 /// the payload holds is the consumer's to check, by deriving it again from the archive's sources.
-pub fn judged_interface(
+pub fn validate_interface(
   semantics: String,
   archive: String,
   body: Bytes,
-) -> Result<Unit, Refusal> / {abort.raise} =
+) -> Result<Unit, http::Error> / {abort.raise} =
   match envelope_of(body) {
-    None -> refused(422, "the body is not an interface"),
+    None -> fail(422, "the body is not an interface"),
     Some(e) -> if e.semantics != Bytes::of_string(semantics) {
-      refused(
+      fail(
         422,
         "the interface was cut under the semantics " ++ String::of_bytes_lossy(e.semantics)
           ++ ", and was sent as "
           ++ semantics,
       )
     } else if e.archive != Bytes::of_string(archive) {
-      refused(
+      fail(
         422,
         "the interface was cut from " ++ String::of_bytes_lossy(e.archive)
           ++ ", and the version is "
@@ -169,73 +168,73 @@ pub fn judged_interface(
 
 /// An attestation for the version `archive` names, under `semantics`, signed by the registry's
 /// attester. What it says is the attester's; who said it is the signature's.
-pub fn judged_attestation(
+pub fn validate_attestation(
   name: String,
   version: Version,
   semantics: String,
   archive: String,
   attester: Bytes,
   body: Bytes,
-) -> Result<Unit, Refusal> / {abort.raise} =
+) -> Result<Unit, http::Error> / {abort.raise} =
   match signed_of(body) {
-    None -> refused(422, "the body is not a signed document"),
+    None -> fail(422, "the body is not a signed document"),
     Some(doc) -> match bin::decode(doc.payload, attestation_bin()) {
-      Err(_) -> refused(422, "what the body signs is not an attestation"),
+      Err(_) -> fail(422, "what the body signs is not an attestation"),
       Ok(a) -> if a.name != name || a.version != version {
-        refused(422, "the attestation is of `" ++ a.name ++ "` " ++ render_version(a.version))
+        fail(422, "the attestation is of `" ++ a.name ++ "` " ++ render_version(a.version))
       } else if a.archive != archive {
-        refused(422, "the attestation is of " ++ a.archive ++ ", and the version is " ++ archive)
+        fail(422, "the attestation is of " ++ a.archive ++ ", and the version is " ++ archive)
       } else if a.semantics != semantics {
-        refused(
+        fail(
           422,
           "the attestation is under the semantics " ++ a.semantics ++ ", and was sent as "
             ++ semantics,
         )
-      } else if vouched_by(doc, [attester]) == None {
-        refused(403, "the attestation is not signed by this registry's attester")
+      } else if trusted_signer(doc, [attester]) == None {
+        fail(403, "the attestation is not signed by this registry's attester")
       } else { Ok(()) },
     },
   }
 
-fn elsewhere(m: Manifest) -> Option<Dep> =
-  m.dependencies.fold(None, |found: Option<Dep>, d: Dep|
+fn non_registry_dependency(m: Manifest) -> Option<Dependency> =
+  m.dependencies.fold(None, |found: Option<Dependency>, d: Dependency|
     match found { Some(_) -> found, None -> match d.source { Registry -> None, _ -> Some(d) } })
 
 // --- Tests ------------------------------------------------------------------
 
-fn status_of<a>(r: Result<a, Refusal>) -> Int = match r { Ok(_) -> 0, Err(e) -> e.status }
+fn status_of<a>(r: Result<a, http::Error>) -> Int = match r { Ok(_) -> 0, Err(e) -> e.status }
 
-fn reason_of<a>(r: Result<a, Refusal>) -> String = match r { Ok(_) -> "", Err(e) -> e.reason }
+fn reason_of<a>(r: Result<a, http::Error>) -> String = match r { Ok(_) -> "", Err(e) -> e.reason }
 
 fn with_auth(value: String) -> Headers =
   http::set_header(http::empty_headers(), "authorization", value)
 
 test "a bearer token is the word after `Bearer`, and nothing else is one" {
-  assert_eq(bearer(with_auth("Bearer t0k")), Some("t0k"));
-  assert_eq(bearer(with_auth("Bearer  t0k\t")), Some("t0k"));
-  assert_eq(bearer(with_auth("Bearer t0k\u{a0}")), Some("t0k\u{a0}"));
-  assert_eq(bearer(with_auth("Basic dDBr")), None);
-  assert_eq(bearer(with_auth("Bearer ")), None);
-  assert_eq(bearer(http::empty_headers()), None)
+  assert_eq(bearer_token(with_auth("Bearer t0k")), Some("t0k"));
+  assert_eq(bearer_token(with_auth("Bearer  t0k\t")), Some("t0k"));
+  assert_eq(bearer_token(with_auth("Bearer t0k\u{a0}")), Some("t0k\u{a0}"));
+  assert_eq(bearer_token(with_auth("Basic dDBr")), None);
+  assert_eq(bearer_token(with_auth("Bearer ")), None);
+  assert_eq(bearer_token(http::empty_headers()), None)
 }
 
 test "a token reaches the exact names it is listed under and no other" {
-  let asked = |name: String, headers: Headers|
+  let status_for = |name: String, headers: Headers|
     handle {
-      status_of(allowed(name, headers))
+      status_of(authorize(name, headers))
     } with {
-      config.secret[tokens](k) -> config::secret_step(twin::tokens(), k),
+      config.secret[tokens](k) -> config::get_secret(fake::tokens(), k),
     };
-  assert_eq(asked("orders", with_auth("Bearer t0k")), 0);
-  assert_eq(asked("orders", http::empty_headers()), 401);
-  assert_eq(asked("orders", with_auth("Bearer m0n")), 403);
-  assert_eq(asked("orders.extra", with_auth("Bearer t0k")), 403);
-  assert_eq(asked("billing", with_auth("Bearer t0k")), 403)
+  assert_eq(status_for("orders", with_auth("Bearer t0k")), 0);
+  assert_eq(status_for("orders", http::empty_headers()), 401);
+  assert_eq(status_for("orders", with_auth("Bearer m0n")), 403);
+  assert_eq(status_for("orders.extra", with_auth("Bearer t0k")), 403);
+  assert_eq(status_for("billing", with_auth("Bearer t0k")), 403)
 }
 
 test "a publish is the library it says it is, sealed by the digest it carries" {
-  let body = twin::archive(twin::library("orders", 2));
-  match judged(
+  let body = fake::archive(fake::library("orders", 2));
+  match validate_archive(
       "orders",
       parse_version("0.2.0").expect("a fixture's version"),
       Some(archive_digest(body)),
@@ -249,10 +248,12 @@ test "a publish is the library it says it is, sealed by the digest it carries" {
     },
   };
   assert_eq(
-    status_of(judged("orders", parse_version("0.2.0").expect("a fixture's version"), None, body)),
+    status_of(
+      validate_archive("orders", parse_version("0.2.0").expect("a fixture's version"), None, body),
+    ),
     400,
   );
-  let lied = judged(
+  let lied = validate_archive(
     "orders",
     parse_version("0.2.0").expect("a fixture's version"),
     Some("b3:00"),
@@ -262,7 +263,7 @@ test "a publish is the library it says it is, sealed by the digest it carries" {
   assert(reason_of(lied).contains("`X-Ply-Digest` says b3:00"));
   assert_eq(
     status_of(
-      judged(
+      validate_archive(
         "orders",
         parse_version("0.2.0").expect("a fixture's version"),
         Some("b3:00"),
@@ -274,8 +275,8 @@ test "a publish is the library it says it is, sealed by the digest it carries" {
 }
 
 test "an archive of another package, another version or a program is refused" {
-  let other = twin::archive(twin::library("billing", 2));
-  let named = judged(
+  let other = fake::archive(fake::library("billing", 2));
+  let named = validate_archive(
     "orders",
     parse_version("0.2.0").expect("a fixture's version"),
     Some(archive_digest(other)),
@@ -283,10 +284,10 @@ test "an archive of another package, another version or a program is refused" {
   );
   assert_eq(status_of(named), 422);
   assert(reason_of(named).contains("holds `billing` 0.2.0"));
-  let older = twin::archive(twin::library("orders", 1));
+  let older = fake::archive(fake::library("orders", 1));
   assert_eq(
     status_of(
-      judged(
+      validate_archive(
         "orders",
         parse_version("0.2.0").expect("a fixture's version"),
         Some(archive_digest(older)),
@@ -295,10 +296,10 @@ test "an archive of another package, another version or a program is refused" {
     ),
     422,
   );
-  let program = twin::archive(
-    twin::manifest("orders", 2, "dependencies: [], entry: Some(\"app.serve\")"),
+  let program = fake::archive(
+    fake::manifest("orders", 2, "dependencies: [], entry: Some(\"app.serve\")"),
   );
-  let entry = judged(
+  let entry = validate_archive(
     "orders",
     parse_version("0.2.0").expect("a fixture's version"),
     Some(archive_digest(program)),
@@ -306,32 +307,32 @@ test "an archive of another package, another version or a program is refused" {
   );
   assert_eq(status_of(entry), 422);
   assert(reason_of(entry).contains("only a library is published"));
-  let pathed = twin::archive(
-    twin::manifest(
+  let pathed = fake::archive(
+    fake::manifest(
       "orders",
       2,
       "dependencies: [{name: \"lib\", prefix: None, min: {major: 0, minor: 1, patch: 0}, source: Path(\"../lib\")}], entry: None",
     ),
   );
-  let dep = judged(
+  let dependency = validate_archive(
     "orders",
     parse_version("0.2.0").expect("a fixture's version"),
     Some(archive_digest(pathed)),
     pathed,
   );
-  assert_eq(status_of(dep), 422);
-  assert(reason_of(dep).contains("`lib` is not from the registry"))
+  assert_eq(status_of(dependency), 422);
+  assert(reason_of(dependency).contains("`lib` is not from the registry"))
 }
 
 test "an interface is the version's, under the semantics its path names" {
   let framed = |semantics: Bytes, archive: Bytes|
     enveloped({ semantics: semantics, archive: archive, payload: b"package" });
-  assert_eq(status_of(judged_interface("ab12", "b3:77", framed(b"ab12", b"b3:77"))), 0);
-  assert_eq(status_of(judged_interface("ab12", "b3:77", b"not framed")), 422);
-  let other = judged_interface("ab12", "b3:77", framed(b"cd34", b"b3:77"));
+  assert_eq(status_of(validate_interface("ab12", "b3:77", framed(b"ab12", b"b3:77"))), 0);
+  assert_eq(status_of(validate_interface("ab12", "b3:77", b"not framed")), 422);
+  let other = validate_interface("ab12", "b3:77", framed(b"cd34", b"b3:77"));
   assert(reason_of(other).contains("under the semantics cd34"));
-  let elsewhere = judged_interface("ab12", "b3:77", framed(b"ab12", b"b3:88"));
-  assert(reason_of(elsewhere).contains("cut from b3:88"));
+  let non_registry_dependency = validate_interface("ab12", "b3:77", framed(b"ab12", b"b3:88"));
+  assert(reason_of(non_registry_dependency).contains("cut from b3:88"));
   assert(is_semantics("0123456789abcdef"));
   assert(!is_semantics(".."));
   assert(!is_semantics(""));
@@ -339,14 +340,14 @@ test "an interface is the version's, under the semantics its path names" {
 }
 
 test "an archive whose own digest field lies is refused though its bytes hash as claimed" {
-  let body = twin::archive(twin::library("orders", 2));
+  let body = fake::archive(fake::library("orders", 2));
   let at = 148;
   let forged = Bytes::concat_all([
     body.slice(0, at),
     byte_of_int((body.at(at) + 1) % 256),
     body.slice(at + 1, body.len()),
   ]);
-  let r = judged(
+  let r = validate_archive(
     "orders",
     parse_version("0.2.0").expect("a fixture's version"),
     Some(archive_digest(forged)),

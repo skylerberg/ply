@@ -3,34 +3,35 @@
 //! front end. `--explain` is how a test sees which it was; everything else a run says is the same
 //! either way.
 
-import harness (Spawned, Ran, Server, project, program, write, read, spawned, serving, ended,
-                finished, said, stderr, json_of, at, path, str, truth, shown, Here, assert_ok, dep,
-                manifest, value_of)
+import harness (PlyProcess, RunResult, Server, write_project, write_program, write, read, spawned,
+                start_server, wait_for_exit, completed_result, all_output, stderr, json_of, at,
+                path, str, bool, json_text, WorkingDirectory, assert_ok, dependency, manifest,
+                value_of)
 import std.fs (fs, listed_names)
 import std.json (Null, Array, Str)
 import std.string
 import std.list
 
-fn run(args: List<String>) -> Ran / {Spawned, abort.raise} = spawned(["run"].concat(args))
+fn run(args: List<String>) -> RunResult / {PlyProcess, abort.raise} = spawned(["run"].concat(args))
 
 /// A run whose one document says whether its load was reused, and what `main` returned.
-fn explained(args: List<String>) -> Ran / {Spawned, abort.raise} =
+fn explained(args: List<String>) -> RunResult / {PlyProcess, abort.raise} =
   run(["--json", "--explain"].concat(args))
 
 /// Whether the load of a run `explained` started took an answer an earlier run filed.
-fn reused(ran: Ran) -> Bool / {abort.raise} = {
+fn reused(ran: RunResult) -> Bool / {abort.raise} = {
   let report = json_of(ran);
   if at(report, "front_end") == Null {
-    panic("`--explain` said nothing about the load:\n" ++ said(ran))
-  } else { truth(path(report, ["front_end", "reused"])) }
+    panic("`--explain` said nothing about the load:\n" ++ all_output(ran))
+  } else { bool(path(report, ["front_end", "reused"])) }
 }
 
 test/nondet "a second run of an unchanged package takes the answer the first filed" {
-  program("fn main() -> Int = 42\n");
+  write_program("fn main() -> Int = 42\n");
   let first = explained([]);
   assert(!reused(first), Some("a first run has nothing to reuse"));
   let second = explained([]);
-  assert(reused(second), Some(said(second)));
+  assert(reused(second), Some(all_output(second)));
   assert_eq(value_of(first), "42");
   assert_eq(value_of(second), "42")
 }
@@ -38,7 +39,7 @@ test/nondet "a second run of an unchanged package takes the answer the first fil
 // The document a run writes without `--explain`, compared whole: the reused answer is placed over
 // this run's own files, so nothing it reports can tell the two apart.
 test/nondet "a reused load reports exactly what a built one reported" {
-  program("fn main() -> Int = 42\n");
+  write_program("fn main() -> Int = 42\n");
   let built = run(["--json"]);
   let again = run(["--json"]);
   assert(reused(explained([])), None);
@@ -46,16 +47,16 @@ test/nondet "a reused load reports exactly what a built one reported" {
   let document = json_of(again);
   assert(
     at(document, "files") == Array([Str("m.ply"), Str("<std>/prelude.ply")]),
-    Some(shown(document)),
+    Some(json_text(document)),
   );
-  assert(str(at(document, "value")) == "42", Some(shown(document)));
-  assert(at(document, "front_end") == Null, Some(shown(document)))
+  assert(str(at(document, "value")) == "42", Some(json_text(document)));
+  assert(at(document, "front_end") == Null, Some(json_text(document)))
 }
 
 // A raise is reported where it happened in the source a reader has open, and the reused answer's
 // spans are into this run's own files, so they read the same.
 test/nondet "a raise on a reused load is placed where a built one placed it" {
-  program(
+  write_program(
     "fn boom() -> Int / {abort.raise} = panic(\"boom\")\n\nfn main() -> Int / {abort.raise} = boom() + 1\n",
   );
   let built = run([]);
@@ -67,15 +68,15 @@ test/nondet "a raise on a reused load is placed where a built one placed it" {
   assert_eq(built, after)
 }
 
-fn appended(p: String, text: String) -> Unit / {Here, abort.raise} =
+fn append_to(p: String, text: String) -> Unit / {WorkingDirectory, abort.raise} =
   match read(p) { Some(body) -> write(p, body ++ text), None -> panic("`" ++ p ++ "` reads") }
 
 // app -> lib -> base, each a package of its own beside the others.
 test/nondet "an edit to a module or a dependency runs the front end again, and one that moves no answer does not" {
-  project([
-    { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+  write_project([
+    { path: "app/ply.pkg", text: manifest("app", dependency("lib", "../lib")) },
     { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
-    { path: "lib/ply.pkg", text: manifest("lib", dep("base", "../base")) },
+    { path: "lib/ply.pkg", text: manifest("lib", dependency("base", "../base")) },
     {
       path: "lib/answer.ply",
       text: "import base.deep\npub fn answer() -> Int = deep::deep() + 35\n",
@@ -85,7 +86,7 @@ test/nondet "an edit to a module or a dependency runs the front end again, and o
   ]);
   let app = |expect_reused: Bool, value_is: String| {
     let out = explained(["app"]);
-    assert(reused(out) == expect_reused, Some(said(out)));
+    assert(reused(out) == expect_reused, Some(all_output(out)));
     assert_eq(value_of(out), value_is)
   };
   app(false, "42");
@@ -93,13 +94,13 @@ test/nondet "an edit to a module or a dependency runs the front end again, and o
   write("base/deep.ply", "pub fn deep() -> Int = 8\n");
   app(false, "43");
   app(true, "43");
-  appended("lib/answer.ply", "\npub fn unused() -> Int = 0\n");
+  append_to("lib/answer.ply", "\npub fn unused() -> Int = 0\n");
   app(false, "43");
   app(true, "43");
   // A comment in a manifest moves no judgment of the packages, so no answer the load asked.
-  appended("lib/ply.pkg", "// edited\n");
+  append_to("lib/ply.pkg", "// edited\n");
   app(true, "43");
-  appended("app/ply.pkg", "// edited\n");
+  append_to("app/ply.pkg", "// edited\n");
   app(true, "43");
   write("app/main.ply", "import lib.answer\nfn main() -> Int = answer::answer() * 2\n");
   app(false, "86");
@@ -122,7 +123,7 @@ fn schemas() -> String =
 // `--config-schema` is resolved against the answer before the machine is handed it, so it is part
 // of the key: a schema is never taken as checked on another schema's answer.
 test/nondet "another config schema takes nothing another schema filed" {
-  program(schemas());
+  write_program(schemas());
   let with_schema = |schema: String| explained(["--config-schema", schema]);
   let first = with_schema("m.spec");
   assert_ok(first);
@@ -141,15 +142,15 @@ test/nondet "another config schema takes nothing another schema filed" {
 // What the run lends and binds is this run's own, so a reused load is refused a grant exactly as a
 // load that built its answer is.
 test/nondet "a reused load is granted and bound anew" {
-  program("fn main() -> Int = 42\n");
+  write_program("fn main() -> Int = 42\n");
   assert_ok(run([]));
   let hit = explained(["--allow", "machine"]);
   assert(reused(hit), None);
-  program("fn main() -> Int = 42\n");
+  write_program("fn main() -> Int = 42\n");
   let miss = run(["--json", "--allow", "machine"]);
-  assert(miss.code == 2, Some(said(miss)));
+  assert(miss.code == 2, Some(all_output(miss)));
   assert_eq(hit.code, miss.code);
-  let refusal = |ran: Ran| shown(at(json_of(ran), "diagnostics"));
+  let refusal = |ran: RunResult| json_text(at(json_of(ran), "diagnostics"));
   assert(refusal(miss).contains("E0459"), Some(refusal(miss)));
   assert(
     refusal(hit) == refusal(miss),
@@ -158,7 +159,7 @@ test/nondet "a reused load is granted and bound anew" {
 }
 
 test/nondet "a single file is keyed and reused as a package is" {
-  program("fn main() -> Int = 42\n");
+  write_program("fn main() -> Int = 42\n");
   let first = explained(["m.ply"]);
   assert_ok(first);
   assert(!reused(first), None);
@@ -169,20 +170,20 @@ test/nondet "a single file is keyed and reused as a package is" {
 
 // Two processes, so each files what it built while the other may be reading.
 test/nondet "two runs of one package at once both run it" {
-  program("fn main() -> Int = 42\n");
-  let one = serving(["run", "--json"], [], 0);
-  let two = serving(["run", "--json"], [], 0);
+  write_program("fn main() -> Int = 42\n");
+  let one = start_server(["run", "--json"], [], 0);
+  let two = start_server(["run", "--json"], [], 0);
   [one, two].fold((), |u: Unit, server: Server| {
-    let out = finished(ended(server, 120000, "`ply run` never ended"));
+    let out = completed_result(wait_for_exit(server, 120000, "`ply run` never ended"));
     assert_eq(value_of(out), "42")
   });
   assert(reused(explained([])), None)
 }
 
 test/nondet "a kept answer that does not read is built again and written over" {
-  program("fn main() -> Int = 42\n");
+  write_program("fn main() -> Int = 42\n");
   let first = explained([]);
-  assert(!reused(first), Some(said(first)));
+  assert(!reused(first), Some(all_output(first)));
   let key = str(path(json_of(first), ["front_end", "key"]));
   // Every segment of the memo store cut to its first `to` bytes, and how many there were.
   let cut = |to: Int|
@@ -201,10 +202,10 @@ test/nondet "a kept answer that does not read is built again and written over" {
     );
   if cut(9) == 0 { panic("the run kept its answer in no segment") };
   let torn = explained([]);
-  assert(!reused(torn), Some(said(torn)));
+  assert(!reused(torn), Some(all_output(torn)));
   assert_eq(value_of(torn), "42");
   let after = explained([]);
-  assert(reused(after), Some(said(after)));
+  assert(reused(after), Some(all_output(after)));
   assert_eq(str(path(json_of(after), ["front_end", "key"])), key);
   cut(0);
   assert(!reused(explained([])), None)

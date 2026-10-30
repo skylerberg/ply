@@ -1,72 +1,73 @@
-//! Zip archives as values: read, written, and planned for extraction, with no file system in it.
+//! Zip archives as values: read, written, and planned for extraction, without a file system.
 //!
 //! A zip archive is read from its end. `locate` finds the end record in an archive's last bytes
-//! and answers where the directory lies, `listing` reads the directory's headers, `open` reads one
-//! member's own header from the bytes at its offset and says where its data lies, and `unpack`
-//! turns that data into the member's bytes. Each of the four takes the bytes it needs and no
-//! handle, and `locate` and `open` answer `More` with how many they need where they were handed
-//! fewer, so a driver that reads a file at offsets fetches one member without the archive in
-//! memory and without inflating another. `members` and `read` are those steps over a whole
+//! and returns where the directory is. `listing` reads the directory's headers. `open` reads one
+//! member's own header from the bytes at its offset and returns where its data is, and `unpack`
+//! turns that data into the member's bytes. Each of the four takes the bytes it needs, not a file
+//! handle. `locate` and `open` return `NeedMore` with how many bytes they need when given fewer,
+//! so a driver that reads a file at offsets can fetch one member without holding the archive in
+//! memory or inflating any other member. `members` and `read` run those steps over a whole
 //! archive's bytes.
 //!
-//! It reads stored and deflated members, zip64 in every record that has a form of it, and data
-//! descriptors in each of their four forms. A member's time is MS-DOS's date and time, the wall
-//! clock of whoever wrote it, with no zone and so no instant; the extended timestamp field and
-//! the NTFS field hold instants, read where they are. A Unix's mode says what a member is and
-//! may do, and a directory is also any name that ends in `/`. A header's other flags and its
-//! version numbers are read past.
+//! It reads stored and deflated members, zip64 in every record that has a zip64 form, and data
+//! descriptors in all four of their forms. A member's time is an MS-DOS date and time: the wall
+//! clock of whoever wrote it, with no time zone and so no instant. The extended timestamp field
+//! and the NTFS field store instants, which are read when present. A Unix mode states what a
+//! member is and its permissions, and any name that ends in `/` is also a directory. A header's
+//! other flags and its version numbers are ignored.
 //!
-//! A name is UTF-8 where its header's flag says so, and the Info-ZIP Unicode path field's where
-//! there is one for the header's name. Any other name the format declares to be code page 437,
-//! and the two commonest writers, macOS's `zip` and Finder, write UTF-8 there all the same. So
-//! a reader chooses, by a `Names` it is handed: `Utf8IfValid`, the default, reads such a name
-//! as UTF-8 where its bytes are UTF-8 and as code page 437 where they are not, and `Declared`
-//! reads it as the format says and never guesses. What the default costs is a code page 437
-//! name that is also UTF-8, which it misreads: every character of that name outside ASCII
-//! would have to stand in a run of a box-drawing, Greek or mathematical character and the one
-//! to three accented letters or signs it calls for, which a name written in that code page all
-//! but never does. `Listed.name` and `Member.name` hold the bytes under either rule, and a
-//! member's comment is read by the same rule as its name. The two readings agree on every
-//! ASCII character, so a path has the same `/`, `.`, `\` and `:` in the same places under
-//! both, and alone is as safe under one as under the other; they differ in which letters are
-//! one letter in two cases, and a plan is made, and judged, over the names as they were read.
+//! A name is UTF-8 when its header's flag says so, and is taken from the Info-ZIP Unicode path
+//! field when one exists for the header's name. The format declares every other name to be code
+//! page 437, yet the two most common writers, macOS's `zip` and Finder, write UTF-8 there anyway.
+//! So a reader chooses with the `NameEncoding` it is given. `Utf8IfValid`, the default, reads such
+//! a name as UTF-8 when its bytes are valid UTF-8 and as code page 437 otherwise. `Declared` reads
+//! it as the format specifies and never guesses. The default misreads a code page 437 name that
+//! is also valid UTF-8. For that, every non-ASCII character of the name would have to appear in a
+//! run of a box-drawing, Greek or mathematical character followed by the one to three accented
+//! letters or symbols it requires, which a name written in that code page almost never does.
+//! `DirectoryEntry.name` and `Member.name` keep the raw bytes under either rule, and a member's
+//! comment is read by the same rule as its name. The two readings agree on every ASCII character,
+//! so a path has the same `/`, `.`, `\` and `:` in the same places under both, and on its own is
+//! as safe under one as under the other. They differ in which letters count as one letter in two
+//! cases, so a plan is made, and checked, over the names as they were read.
 //!
-//! An archive that says two things is refused, since each of two readers may believe one of
-//! them. A member's own header must say what the directory says of it: its name, its flags, its
-//! method, and its checksum and sizes where it holds them, with the data descriptor after its
-//! data where it does not. Two members may not share a name or a byte, a member may not run into
-//! the directory, and the directory ends where its end record begins. One end record closes the
-//! bytes: more after it, or its signature again within its comment, is refused. The bytes before
-//! the directory that no member claims, a stub before the first or a signing block after the
-//! last, are held to `Limits.slack`, so at zero an archive is its members end to end. Any method
-//! but stored and deflated is refused by its number, and any encryption.
+//! An archive that contradicts itself is rejected, since two readers may each believe a different
+//! version. A member's own header must agree with what the directory says of it: its name, its
+//! flags, its method, and its checksum and sizes if it contains them, with the data descriptor
+//! after its data if it does not. Two members may not share a name or a byte, a member may not
+//! run into the directory, and the directory ends where its end record begins. One end record
+//! ends the bytes: more bytes after it, or its signature again within its comment, is rejected.
+//! The bytes before the directory that no member claims, such as a stub before the first member
+//! or a signing block after the last, are limited to `Limits.slack`, so at zero an archive is its
+//! members end to end. Any method but stored and deflated is rejected by its number, and so is
+//! any encryption.
 //!
-//! A reader takes its `Limits` as an argument: how many entries, how many bytes one unpacks to
-//! and all do, how many times its stored size one may unpack to, how long a name and a comment,
-//! and that slack. They are judged by what the directory states, before anything is unpacked; a
-//! member is then inflated to the size stated and no further, and what comes out must be that
-//! long and have the directory's CRC-32.
+//! A reader takes its `Limits` as an argument: how many entries, how many bytes one entry and all
+//! entries may unpack to, how many times its stored size one entry may unpack to, how long a name
+//! and a comment may be, and the slack. They are checked against what the directory states,
+//! before anything is unpacked. A member is then inflated to the stated size and no further, and
+//! the output must be that long and match the directory's CRC-32.
 //!
-//! `write` emits the entries in their order, each deflated where that is smaller and stored
-//! where it is not, with whole headers and no data descriptor, the UTF-8 flag where a name or a
-//! comment is not ASCII, a zip64 field exactly where a number passes its header's field, and no
-//! extra field its entry does not ask for. It writes nothing its input does not hold: `file`,
-//! `directory` and `symlink` make entries modified as 1980 began unless told otherwise, so equal
-//! entries give equal bytes. `begin`, `add` and `finish` are `write` a member at a time, and
-//! `flush` hands over what is written so far, for a driver that keeps none of it. What it writes
-//! it reads back, and it refuses what its reader would: a second entry of one name, and bytes a
-//! reader could take for another end record.
+//! `write` emits the entries in order, each deflated when that is smaller and stored otherwise. It
+//! writes complete headers and no data descriptor, the UTF-8 flag when a name or a comment is not
+//! ASCII, a zip64 field exactly where a number overflows its header's field, and no extra field
+//! the entry does not request. It writes nothing its input does not contain: `file`, `directory`
+//! and `symlink` make entries modified at the start of 1980 unless given another time, so equal
+//! entries produce equal bytes. `begin`, `add` and `finish` are `write` one member at a time, and
+//! `flush` returns what is written so far, for a driver that does not keep it in memory. It reads
+//! back what it writes, and it rejects what its reader would: a second entry with the same name,
+//! and bytes a reader could mistake for another end record.
 //!
-//! An entry's path is whatever the archive says. `plan` answers the operations that extract a
+//! An entry's path is whatever the archive says. `plan` returns the operations that extract a
 //! list of entries beneath a root, or the entry that may not be extracted and why. It is
-//! `std.tar`'s plan, whose `Operation`, `Unsafe` and `Danger` these are, over the same rules,
-//! and it refuses besides a path or a link with a backslash or a drive letter, which the systems
-//! zip came from read as another place. A symbolic link's target is its data, and a FIFO, a
-//! device or a socket is carried as an `Other` that no plan makes. `tar::extract` carries a plan
-//! out beneath a directory of a root.
+//! `std.tar`'s plan, with the same rules and the same `Operation`, `UnsafeEntry` and `Danger`
+//! types. It also rejects a path or a link with a backslash or a drive letter, which the systems
+//! zip came from read as a different location. A symbolic link's target is its data, and a FIFO,
+//! a device or a socket is kept as an `Other` that no plan creates. `tar::extract` carries out a
+//! plan beneath a directory of a root.
 //!
-//! Left to their bytes: owners and the times Finder writes (Info-ZIP's Unix fields), and every
-//! other extra field, which `Header.extra` carries as written.
+//! Left as raw bytes: owners and the times Finder writes (Info-ZIP's Unix fields), and every other
+//! extra field, which `Header.extra` keeps as written.
 
 import std.bytes (u32_le, u64_le)
 import std.checksum (crc32)
@@ -80,7 +81,7 @@ import std.result
 import std.string
 import std.tar
 import std.tar (tar, Absolute, Backslash, Danger, Drive, Escapes, LinkEscapes, MakeDirectory,
-                MakeSymlink, NoName, Operation, Special, ThroughLink, Unsafe, WriteFile)
+                MakeSymlink, NoName, Operation, Special, ThroughLink, UnsafeEntry, WriteFile)
 import std.time (nanos_at)
 import std.gen
 
@@ -90,7 +91,7 @@ import std.gen
 pub type Kind =
   | File
   | Directory
-  /// A symbolic link to the text its data holds.
+  /// A symbolic link to the text in its data.
   | Symlink
   /// Anything else a Unix mode names, by its type bits: 1 a FIFO, 2 a character device, 6 a
   /// block device, 12 a socket.
@@ -99,17 +100,17 @@ pub type Kind =
 /// One extra field of a member's header: its id and its data.
 pub type Field = new { id: Int, data: Bytes }
 
-/// The instants an archive holds of a member beside its wall-clock time, each where it holds one.
+/// The instants an archive records for a member besides its wall-clock time, each if recorded.
 pub type Times = new {
   modified: Option<Instant>,
   accessed: Option<Instant>,
   created: Option<Instant>,
 }
 
-/// What an archive's directory says of one member, apart from its data.
+/// What an archive's directory records for one member, apart from its data.
 pub type Header = new {
-  /// As the archive spells it, read as the reader's `Names` says where no flag marks it, and a
-  /// directory's without its trailing `/`. `plan` is what makes it safe to use.
+  /// As the archive writes it, decoded as the reader's `NameEncoding` directs when no flag marks
+  /// it, and without a directory's trailing `/`. `plan` is what makes it safe to use.
   path: String,
   kind: Kind,
   /// The permission, set-id and sticky bits a Unix wrote. From any other system, which writes
@@ -117,13 +118,13 @@ pub type Header = new {
   /// member is marked read-only.
   mode: Int,
   /// The wall clock of whoever wrote it, to two seconds, from 1980 to 2107: MS-DOS's date and
-  /// time, which name no zone and so no instant. `None` where the fields are no date.
+  /// time, which name no time zone and so no instant. `None` if the fields are not a valid date.
   modified: Option<DateTime>,
-  /// From an extended timestamp field, which holds the modification time to the second, or an
-  /// NTFS field, which holds all three to a tenth of a microsecond and is read over it.
+  /// From an extended timestamp field, which stores the modification time to the second, or an
+  /// NTFS field, which stores all three to a tenth of a microsecond and takes precedence.
   times: Times,
   comment: String,
-  /// The extra fields no field above holds, in the directory's order: an owner, a vendor's own.
+  /// The extra fields not covered above, in the directory's order: an owner, a vendor's own.
   extra: List<Field>,
 }
 
@@ -141,7 +142,8 @@ fn header(path: String, kind: Kind, mode: Int, modified: DateTime) -> Header =
     extra: [],
   }
 
-/// A file's entry, mode `0644`, modified as 1980 began: the first time a header holds.
+/// A file's entry, mode `0644`, modified at the start of 1980: the earliest time a header can
+/// store.
 pub fn file(
   path: String,
   data: Bytes,
@@ -163,92 +165,94 @@ pub fn symlink(
   modified: DateTime = DateTime(Date(3652), Time(0)),
 ) -> Entry = { header: header(path, Symlink, 511, modified), data: Bytes::of_string(target) }
 
-// --- Refusals -------------------------------------------------------------------
+// --- Errors ---------------------------------------------------------------------
 
-/// Why a reader refused an archive, or a writer an entry.
-pub type Why =
-  /// The bytes handed over end before the record they should hold does.
+/// Why a reader rejected an archive, or a writer an entry.
+pub type ErrorKind =
+  /// The bytes given end before the record they should contain.
   | Truncated
-  /// No end record closes the bytes: they are no archive, they stop short of one's end, more
-  /// follows it, or its comment is longer than the reader was given.
-  | NoEnd
-  /// More than one place reads as the end record: its signature stands again in the comment,
-  /// or two records' comments both reach the last byte.
-  | ManyEnds
+  /// No end record ends the bytes: they are not an archive, they stop before an archive's end,
+  /// more bytes follow it, or its comment is longer than the reader's limit.
+  | NoEndRecord
+  /// More than one position reads as the end record: its signature appears again in the
+  /// comment, or two records' comments both reach the last byte.
+  | ManyEndRecords
   /// One part of an archive split across several disks.
   | Split
-  /// A directory that does not end where its end record begins, or is not the headers it counts.
+  /// A directory that does not end where its end record begins, or does not contain the headers
+  /// it counts.
   | BadDirectory
-  /// A zip64 field or record that is not there, where a marker or a locator says one is.
+  /// A zip64 field or record that is missing where a marker or a locator says one is.
   | BadZip64
   /// A size, an offset or a count past an `Int`, a stored member whose two sizes differ, or a
   /// mode past `07777`.
   | BadNumber
-  /// Extra data that is not fields, each an id, a length and that many bytes; a field this
-  /// reads given twice, or too short for what it says it holds; or fields past what a header
-  /// holds.
+  /// Extra data that is not a list of fields, each an id, a length and that many bytes; a field
+  /// this module reads that appears twice, or is too short for what it claims to contain; or more
+  /// fields than a header can store.
   | BadExtra
-  /// Two records that should say one thing say two: a member's own header and the directory's
-  /// of it, the data descriptor after its data, or the end record and its zip64 record.
+  /// Two records that should agree do not: a member's own header and the directory's header for
+  /// it, the data descriptor after its data, or the end record and its zip64 record.
   | Disagrees
-  /// Two members of one name.
+  /// Two members with the same name.
   | Duplicate
   /// A member whose bytes run into the next member's or the directory's, or two at one offset.
   | Overlaps
-  /// Bytes before the directory that no member claims, more than the reader was given.
+  /// Bytes before the directory that no member claims, more than the reader's limit.
   | Unclaimed
   /// A member compressed by a method other than stored and deflated: its number.
   | Method(Int)
   /// An encrypted member, or a directory whose headers are masked.
   | Encrypted
-  /// A name or a comment flagged UTF-8, a Unicode path field, or a link's target, that is not.
+  /// A name or a comment flagged UTF-8, a Unicode path field, or a link's target that is not
+  /// valid UTF-8.
   | NotUtf8
-  /// A name that ends in `/` on what its mode calls no directory, a directory's mode on a name
-  /// that does not, or an `Other` whose number is another kind's.
+  /// A name that ends in `/` on a member whose mode is not a directory's, a directory's mode on a
+  /// name that does not end in `/`, or an `Other` whose number belongs to another kind.
   | BadKind
   /// Data on a directory.
   | StrayData
-  /// More entries than the reader was given.
+  /// More entries than the reader's limit.
   | TooMany
-  /// An entry larger than the reader was given.
+  /// An entry larger than the reader's limit.
   | TooLarge
-  /// More data in all than the reader was given.
+  /// More data in all than the reader's limit.
   | TooMuch
-  /// A name or a comment longer than the reader was given, or than a header holds.
+  /// A name or a comment longer than the reader's limit, or than a header can store.
   | TooLong
-  /// A member that unpacks to more times its stored size than the reader was given.
+  /// A member that unpacks to more times its stored size than the reader's limit.
   | TooDense
-  /// Data that does not inflate, or not to the size the directory says.
+  /// Data that does not inflate, or inflates to a size other than the directory states.
   | BadData
-  /// Data whose CRC-32 is not the directory's.
+  /// Data whose CRC-32 does not match the directory's.
   | BadChecksum
-  /// A path a header cannot hold: an empty one, one with a NUL, one that ends in `/`.
+  /// A path a header cannot store: an empty one, one with a NUL, one that ends in `/`.
   | BadName
-  /// A time a header cannot hold: a wall clock before 1980, after 2107 or at an odd second,
+  /// A time a header cannot store: a wall clock before 1980, after 2107 or at an odd second,
   /// or an instant finer than a tenth of a microsecond.
   | BadTime
 
-/// A reader's refusal, and where in the archive: the offset of the record it refused, of the
-/// member whose bytes or data it refused, of bytes no member claims, or of the end of bytes that
-/// no end record closes.
-pub type Refusal = new { at: Int, why: Why }
+/// Why a reader rejected an archive, and where: the offset of the rejected record, of the member
+/// whose bytes or data were rejected, of bytes no member claims, or of the end of bytes that no
+/// end record ends.
+pub type Error = new { at: Int, reason: ErrorKind }
 
-/// A writer's refusal, and which of the entries it was handed it refused: the count of them
-/// for the archive's own comment.
-pub type Unwritable = new { index: Int, why: Why }
+/// Why a writer rejected an entry, and the index of that entry among those it was given. The
+/// index is the number of entries when the archive's own comment was rejected.
+pub type WriteError = new { index: Int, reason: ErrorKind }
 
-/// What this module raises where it refuses. A plan's refusal is `std.tar`'s `tar.unsafe`.
+/// The errors this module raises. A plan's error is `std.tar`'s `tar.unsafe`.
 pub effect zip {
   /// The bytes are not an archive within the limits.
-  raise refused(e: Refusal)
+  raise fail(e: Error)
   /// An entry, or the archive's comment, cannot be written.
-  raise unwritable(e: Unwritable)
+  raise write_failed(e: WriteError)
 }
 
-fn refuse<a>(at: Int, why: Why) -> a / {zip.refused} = zip.refused({ at: at, why: why })
+fn fail<a>(at: Int, why: ErrorKind) -> a / {zip.fail} = zip.fail({ at: at, reason: why })
 
-fn unwritable<a>(index: Int, why: Why) -> a / {zip.unwritable} =
-  zip.unwritable({ index: index, why: why })
+fn fail_write<a>(index: Int, why: ErrorKind) -> a / {zip.write_failed} =
+  zip.write_failed({ index: index, reason: why })
 
 // --- Numbers and fields ---------------------------------------------------------
 
@@ -256,11 +260,11 @@ fn u16(b: Bytes, at: Int) -> Int / {abort.raise} = b.at(at) | b.at(at + 1) << 8
 
 fn u16_le(n: Int) -> Bytes = byte_of_int(n & 0xFF).concat(byte_of_int(n >>> 8 & 0xFF))
 
-/// What a 32-bit field holds where a zip64 field holds its number.
-fn marker() -> Int = 0xFFFF_FFFF
+/// What a 32-bit field contains when a zip64 field stores its number instead.
+fn zip64_marker() -> Int = 0xFFFF_FFFF
 
-/// The fields `block` opens with, each an id, a length and that many bytes, and whether they
-/// are all of it.
+/// The fields `block` starts with, each an id, a length and that many bytes, and whether they
+/// make up all of it.
 fn fields(block: Bytes) -> { found: List<Field>, whole: Bool } / {abort.raise} =
   fields_from(block, 0, [], block.len() / 4 + 1)
 
@@ -291,39 +295,44 @@ fn field(extra: List<Field>, id: Int) -> Option<Bytes> =
 fn field_bytes(id: Int, data: Bytes) -> Bytes =
   Bytes::concat_all([u16_le(id), u16_le(data.len()), data])
 
-/// Whether a header's own fields hold what an extra field of this id says: zip64 numbers, the
-/// NTFS and extended timestamps, and the Unicode path.
-fn read_here(id: Int) -> Bool = id == 0x0001 || id == 0x000A || id == 0x5455 || id == 0x7075
+/// Whether this module reads extra fields of this id into the header's own fields: zip64 numbers,
+/// the NTFS and extended timestamps, and the Unicode path.
+fn is_known_field(id: Int) -> Bool = id == 0x0001 || id == 0x000A || id == 0x5455 || id == 0x7075
 
 /// A header's sizes, offset and disk.
-type Wide = { size: Int, stored: Int, at: Int, disk: Int }
+type HeaderNumbers = { size: Int, stored: Int, at: Int, disk: Int }
 
-fn wide(where: Int, data: Bytes, at: Int) -> Int / {zip.refused} =
-  if data.len() - at < 8 { refuse(where, BadZip64) }
-  else { match data.u64_at(at) { Some(n) -> n, None -> refuse(where, BadNumber) } }
+fn zip64_number(where: Int, data: Bytes, at: Int) -> Int / {zip.fail} =
+  if data.len() - at < 8 { fail(where, BadZip64) }
+  else { match data.u64_at(at) { Some(n) -> n, None -> fail(where, BadNumber) } }
 
-/// `narrow` with each number its 32-bit field marks read from the zip64 field instead: they
-/// stand there in this order, each only where it is marked, but that a member's own header
-/// holds both sizes where it marks either.
-fn widened(where: Int, extra: List<Field>, narrow: Wide, own: Bool) -> Wide / {zip.refused} = {
-  let sized = narrow.size == marker();
-  let packed = narrow.stored == marker();
-  let placed = narrow.at == marker();
+/// `narrow` with each number that its 32-bit field marks read from the zip64 field instead. They
+/// appear there in this order, each only if marked, except that a member's own header stores both
+/// sizes if it marks either.
+fn with_zip64(
+  where: Int,
+  extra: List<Field>,
+  narrow: HeaderNumbers,
+  is_local_header: Bool,
+) -> HeaderNumbers / {zip.fail} = {
+  let sized = narrow.size == zip64_marker();
+  let packed = narrow.stored == zip64_marker();
+  let placed = narrow.at == zip64_marker();
   let spanned = narrow.disk == 0xFFFF;
   if !(sized || packed || placed || spanned) { narrow } else {
     match field(extra, 1) {
-      None -> refuse(where, BadZip64),
+      None -> fail(where, BadZip64),
       Some(data) -> {
-        let second = if sized || own { 8 } else { 0 };
-        let third = second + (if packed { 8 } else { 0 });
+        let second_entry_error = if sized || is_local_header { 8 } else { 0 };
+        let third = second_entry_error + (if packed { 8 } else { 0 });
         let fourth = third + (if placed { 8 } else { 0 });
         {
-          size: if sized { wide(where, data, 0) } else { narrow.size },
-          stored: if packed { wide(where, data, second) } else { narrow.stored },
-          at: if placed { wide(where, data, third) } else { narrow.at },
-          disk: if !spanned { narrow.disk } else {
-            match data.u32_at(fourth) { Some(disk) -> disk, None -> refuse(where, BadZip64) }
-          },
+          size: if sized { zip64_number(where, data, 0) } else { narrow.size },
+          stored: if packed { zip64_number(where, data, second_entry_error) }
+          else { narrow.stored },
+          at: if placed { zip64_number(where, data, third) } else { narrow.at },
+          disk: if !spanned { narrow.disk }
+          else { match data.u32_at(fourth) { Some(disk) -> disk, None -> fail(where, BadZip64) } },
         }
       },
     }
@@ -332,17 +341,17 @@ fn widened(where: Int, extra: List<Field>, narrow: Wide, own: Bool) -> Wide / {z
 
 // --- Names ----------------------------------------------------------------------
 
-/// How a reader takes a name, or a member's comment, that its header does not flag as UTF-8
-/// and no Unicode path field spells.
-pub type Names =
+/// How a reader decodes a name, or a member's comment, that its header does not flag as UTF-8
+/// and no Unicode path field provides.
+pub type NameEncoding =
   /// As the format declares it: code page 437, whatever else its bytes could be.
   | Declared
-  /// As UTF-8 where its bytes are UTF-8, and as code page 437 where they are not. ASCII reads
-  /// alike either way, and bytes that are UTF-8 only by an overlong form or a surrogate are not
-  /// UTF-8.
+  /// As UTF-8 when its bytes are valid UTF-8, and as code page 437 otherwise. ASCII reads the
+  /// same either way, and bytes that would be UTF-8 only through an overlong form or a surrogate
+  /// are not valid UTF-8.
   | Utf8IfValid
 
-/// The character each byte of code page 437 from `0x80` is.
+/// The character for each byte of code page 437 from `0x80` up.
 const fn cp437() -> Array<Int> =
   Array::of_list(
     [
@@ -381,17 +390,17 @@ fn of_cp437(raw: Bytes) -> String / {abort.raise} =
     )
   }
 
-fn utf8(where: Int, raw: Bytes) -> String / {zip.refused, abort.raise} =
-  if raw.is_utf8() { String::of_bytes(raw) } else { refuse(where, NotUtf8) }
+fn utf8(where: Int, raw: Bytes) -> String / {zip.fail, abort.raise} =
+  if raw.is_utf8() { String::of_bytes(raw) } else { fail(where, NotUtf8) }
 
-/// A name or a comment no flag marks, as `names` takes one.
-fn unflagged(raw: Bytes, names: Names) -> String / {abort.raise} =
+/// A name or a comment no flag marks, decoded as `names` directs.
+fn unflagged(raw: Bytes, names: NameEncoding) -> String / {abort.raise} =
   if names == Utf8IfValid && raw.is_utf8() { String::of_bytes(raw) } else { of_cp437(raw) }
 
 // --- Times ----------------------------------------------------------------------
 
-/// The wall clock a header's date and time fields name, `None` where they name none.
-fn clock(day: Int, time: Int) -> Option<DateTime> =
+/// The wall clock a header's date and time fields represent, or `None` if they are not valid.
+fn from_dos_time(day: Int, time: Int) -> Option<DateTime> =
   date::date_time(
     1980 + (day >> 9),
     day >> 5 & 15,
@@ -403,29 +412,29 @@ fn clock(day: Int, time: Int) -> Option<DateTime> =
 
 /// A wall clock as a header's fields, the date above the time: `None` for one before 1980,
 /// after 2107, at an odd second or finer than a second.
-fn clock_fields(at: DateTime) -> Option<Int> = {
+fn to_dos_time(at: DateTime) -> Option<Int> = {
   let day = date::parts(date::date_of(at));
   let time = date::time_of(at);
-  let second = date::second(time);
-  if day.year < 1980 || day.year > 2107 || second % 2 != 0 || date::nanosecond(time) != 0 { None }
-  else {
+  let second_entry_error = date::second(time);
+  if day.year < 1980 || day.year > 2107 || second_entry_error % 2 != 0
+      || date::nanosecond(time) != 0 { None } else {
     Some(
       (day.year - 1980 << 9 | day.month << 5 | day.day) << 16 | date::hour(time) << 11
         | date::minute(time) << 5
-        | second / 2,
+        | second_entry_error / 2,
     )
   }
 }
 
-/// A header's fields for `modified`: zeros, which are no date, for none.
-fn stamp(modified: Option<DateTime>) -> Option<Int> =
-  match modified { Some(at) -> clock_fields(at), None -> Some(0) }
+/// A header's fields for `modified`: zeros, which mean no date, for `None`.
+fn dos_time_or_zero(modified: Option<DateTime>) -> Option<Int> =
+  match modified { Some(at) -> to_dos_time(at), None -> Some(0) }
 
 /// NTFS counts tenths of a microsecond from 1601: this many of them to the Unix epoch.
 fn ntfs_epoch() -> Int = 116444736000000000
 
-/// The instant an NTFS time names: `None` for zero, which is no time, and for one past an
-/// `Instant`.
+/// The instant an NTFS time represents: `None` for zero, which means no time, and for one past
+/// what an `Instant` can store.
 fn of_ticks(ticks: Option<Int>) -> Option<Instant> =
   match ticks {
     Some(n) -> if n == 0 { None }
@@ -433,7 +442,7 @@ fn of_ticks(ticks: Option<Int>) -> Option<Instant> =
     None -> None,
   }
 
-/// An instant as NTFS counts it, zero for none: `None` for one finer than its count.
+/// An instant in NTFS ticks, zero for `None`: `None` for an instant finer than a tick.
 fn ticks_of(at: Option<Instant>) -> Option<Int> =
   match at {
     None -> Some(0),
@@ -443,10 +452,10 @@ fn ticks_of(at: Option<Instant>) -> Option<Int> =
     },
   }
 
-fn timeless() -> Times = { modified: None, accessed: None, created: None }
+fn no_times() -> Times = { modified: None, accessed: None, created: None }
 
-/// An instant's seconds from the Unix epoch, where it is a whole number of them that a signed
-/// 32 bits hold.
+/// An instant's seconds from the Unix epoch, if it is a whole number of seconds that fits in a
+/// signed 32-bit field.
 fn whole_seconds(at: Option<Instant>) -> Option<Int> =
   match at {
     None -> None,
@@ -458,13 +467,13 @@ fn whole_seconds(at: Option<Instant>) -> Option<Int> =
     },
   }
 
-/// The instants an NTFS field's data holds.
-fn ntfs_times(where: Int, data: Bytes) -> Times / {zip.refused, abort.raise} =
-  if data.len() < 4 { refuse(where, BadExtra) } else {
+/// The instants an NTFS field's data contains.
+fn ntfs_times(where: Int, data: Bytes) -> Times / {zip.fail, abort.raise} =
+  if data.len() < 4 { fail(where, BadExtra) } else {
     let attributes = fields(data.slice(4, data.len()));
     match field(attributes.found, 1) {
-      None -> if attributes.whole { timeless() } else { refuse(where, BadExtra) },
-      Some(times) -> if !attributes.whole || times.len() < 24 { refuse(where, BadExtra) } else {
+      None -> if attributes.whole { no_times() } else { fail(where, BadExtra) },
+      Some(times) -> if !attributes.whole || times.len() < 24 { fail(where, BadExtra) } else {
         {
           modified: of_ticks(times.u64_at(0)),
           accessed: of_ticks(times.u64_at(8)),
@@ -474,14 +483,14 @@ fn ntfs_times(where: Int, data: Bytes) -> Times / {zip.refused, abort.raise} =
     }
   }
 
-/// The instants a directory header's extra fields hold.
-fn times_of(where: Int, extra: List<Field>) -> Times / {zip.refused, abort.raise} = {
+/// The instants a directory header's extra fields contain.
+fn times_of(where: Int, extra: List<Field>) -> Times / {zip.fail, abort.raise} = {
   let stamped = match field(extra, 0x5455) {
     None -> None,
-    Some(data) -> if data.len() < 1 { refuse(where, BadExtra) }
+    Some(data) -> if data.len() < 1 { fail(where, BadExtra) }
     else if data.at(0) & 1 == 0 { None } else {
       match data.u32_at(1) {
-        None -> refuse(where, BadExtra),
+        None -> fail(where, BadExtra),
         Some(seconds) ->
           Some(
             Instant(
@@ -500,14 +509,16 @@ fn times_of(where: Int, extra: List<Field>) -> Times / {zip.refused, abort.raise
   }
 }
 
-/// The extra field that holds `times`: none for none, an extended timestamp for a modification
-/// time alone that it holds whole, and an NTFS field for anything else. `None` where no field
-/// holds them.
+/// The extra field that stores `times`: nothing when there are none, an extended timestamp for a
+/// modification time alone that it can store exactly, and an NTFS field for anything else. `None`
+/// when no field can store them.
 fn times_field(times: Times) -> Option<Bytes> = {
-  let alone = if times.accessed == None && times.created == None { whole_seconds(times.modified) }
-  else { None };
-  if times == timeless() { Some(b"") } else if alone != None {
-    alone.map(|seconds: Int| field_bytes(0x5455, b"\x01".concat(u32_le(seconds & 0xFFFF_FFFF))))
+  let one_member_archive = if times.accessed == None && times.created == None {
+    whole_seconds(times.modified)
+  } else { None };
+  if times == no_times() { Some(b"") } else if one_member_archive != None {
+    one_member_archive.map(|seconds: Int|
+      field_bytes(0x5455, b"\x01".concat(u32_le(seconds & 0xFFFF_FFFF))))
   } else {
     match ((ticks_of(times.modified), ticks_of(times.accessed), ticks_of(times.created))) {
       (Some(modified), Some(accessed), Some(created)) ->
@@ -530,8 +541,8 @@ fn times_field(times: Times) -> Option<Bytes> = {
 
 // --- Reading: the end record ----------------------------------------------------
 
-/// What a reader may take: `entries` members, `total` bytes of data in all once unpacked and
-/// `size` in one, `ratio` times its stored size for one to unpack to, `path` bytes in a name,
+/// What a reader accepts: `entries` members, `total` bytes of unpacked data in all and `size` in
+/// one, `ratio` times its stored size for one to unpack to, `path` bytes in a name,
 /// `comment` bytes in a member's comment and in the archive's, and `slack` bytes before the
 /// first member and after each that no member claims.
 pub type Limits = new {
@@ -544,7 +555,7 @@ pub type Limits = new {
   slack: Int,
 }
 
-/// Where an archive's directory lies, as its end record says.
+/// Where an archive's directory is, as its end record states.
 pub type Directory = new {
   /// The offset of its first header, and how many bytes its headers are.
   at: Int,
@@ -555,17 +566,17 @@ pub type Directory = new {
   comment: Bytes,
 }
 
-/// What a reader handed part of an archive found.
-pub type Sought<a> =
+/// What a reader given part of an archive found.
+pub type Lookup<a> =
   | Found(a)
-  /// The bytes handed over stop short: with this many in all, counted as the function says, a
-  /// reader can say more.
-  | More(Int)
+  /// The bytes given stop short: with this many in all, counted as the function's doc states,
+  /// the reader can continue.
+  | NeedMore(Int)
 
 /// An end record's numbers, or its zip64 record's.
-type End = { disk: Int, first: Int, here: Int, entries: Int, size: Int, at: Int }
+type EndRecord = { disk: Int, first: Int, here: Int, entries: Int, size: Int, at: Int }
 
-/// Where each end record's signature stands in `tail` from `from` on, with room for a record
+/// The position of each end record signature in `tail` from `from` on that has room for a record
 /// after it.
 fn signatures(tail: Bytes, from: Int, acc: List<Int>, span: Int) -> List<Int> / {abort.raise} =
   if span <= 0 { acc } else {
@@ -576,38 +587,38 @@ fn signatures(tail: Bytes, from: Int, acc: List<Int>, span: Int) -> List<Int> / 
     }
   }
 
-/// Where an archive's directory lies. `tail` is the last bytes of an archive `length` bytes
-/// long, and `More(n)` asks for its last `n`: an end record, a comment as long as
+/// Where an archive's directory is. `tail` is the last bytes of an archive `length` bytes long,
+/// and `NeedMore(n)` requests its last `n`: room for an end record, a comment as long as
 /// `limits.comment` and the zip64 locator before them, and then a zip64 record from where the
-/// locator says it starts. Raises `zip.refused` for bytes that no one end record closes.
+/// locator says it starts. Raises `zip.fail` for bytes that do not end in exactly one end record.
 pub fn locate(
   tail: Bytes,
   length: Int,
   limits: Limits,
-) -> Sought<Directory> / {zip.refused, abort.raise} = {
+) -> Lookup<Directory> / {zip.fail, abort.raise} = {
   let have = tail.len();
   let window = min(length, 22 + min(max(limits.comment, 0), 0xFFFF));
-  if have > length { refuse(length, NoEnd) }
-  else if have < min(length, window + 20) { More(min(length, window + 20)) } else {
+  if have > length { fail(length, NoEndRecord) }
+  else if have < min(length, window + 20) { NeedMore(min(length, window + 20)) } else {
     let found = signatures(tail, have - window, [], window);
     match found.filter(|p: Int| p + 22 + u16(tail, p + 20) == have) {
-      [] -> refuse(length, NoEnd),
-      [p, ..] -> if found.last() != Some(p) { refuse(length - have + p, ManyEnds) }
-      else { ended(tail, length, limits, p) },
+      [] -> fail(length, NoEndRecord),
+      [p, ..] -> if found.last() != Some(p) { fail(length - have + p, ManyEndRecords) }
+      else { from_end_record(tail, length, limits, p) },
     }
   }
 }
 
-/// The directory the end record at `p` of `tail` names.
-fn ended(
+/// The directory the end record at `p` of `tail` describes.
+fn from_end_record(
   tail: Bytes,
   length: Int,
   limits: Limits,
   p: Int,
-) -> Sought<Directory> / {zip.refused, abort.raise} = {
+) -> Lookup<Directory> / {zip.fail, abort.raise} = {
   let base = length - tail.len();
   let where = base + p;
-  let narrow: End = {
+  let narrow: EndRecord = {
     disk: u16(tail, p + 4),
     first: u16(tail, p + 6),
     here: u16(tail, p + 8),
@@ -618,67 +629,67 @@ fn ended(
   let comment = tail.slice(p + 22, tail.len());
   if p >= 20 && tail.slice(p - 20, p - 16) == b"PK\x06\x07" {
     match tail.u64_at(p - 12) {
-      None -> refuse(where, BadNumber),
+      None -> fail(where, BadNumber),
       Some(record) -> if Int::of_u32(tail.u32_le(p - 16)) != 0
-          || Int::of_u32(tail.u32_le(p - 4)) > 1 { refuse(where, Split) }
-      else if record > where - 76 { refuse(where, BadZip64) }
-      else if record < base { More(length - record) }
-      else { wide_end(tail, base, record, where, narrow, comment, limits) },
+          || Int::of_u32(tail.u32_le(p - 4)) > 1 { fail(where, Split) }
+      else if record > where - 76 { fail(where, BadZip64) }
+      else if record < base { NeedMore(length - record) }
+      else { from_zip64_end_record(tail, base, record, where, narrow, comment, limits) },
     }
   } else if narrow.disk == 0xFFFF || narrow.first == 0xFFFF || narrow.here == 0xFFFF
       || narrow.entries == 0xFFFF
-      || narrow.size == marker()
-      || narrow.at == marker() { refuse(where, BadZip64) }
+      || narrow.size == zip64_marker()
+      || narrow.at == zip64_marker() { fail(where, BadZip64) }
   else { directory_of(where, where, narrow, comment, limits) }
 }
 
-/// The directory the zip64 record at `record` in the archive names for the end record at
-/// `where`, `tail` starting at `base`: the record ends where its locator begins, twenty bytes
-/// before the end record, and the end record says of each number what it says, or marks it.
-fn wide_end(
+/// The directory the zip64 record at `record` describes for the end record at `where`, with `tail`
+/// starting at `base`. The record must end where its locator begins, twenty bytes before the end
+/// record, and the end record must either agree with each of its numbers or mark it.
+fn from_zip64_end_record(
   tail: Bytes,
   base: Int,
   record: Int,
   where: Int,
-  narrow: End,
+  narrow: EndRecord,
   comment: Bytes,
   limits: Limits,
-) -> Sought<Directory> / {zip.refused, abort.raise} = {
+) -> Lookup<Directory> / {zip.fail, abort.raise} = {
   let r = record - base;
-  if tail.slice(r, r + 4) != b"PK\x06\x06" || wide(record, tail, r + 4) != where - 32 - record {
-    refuse(record, BadZip64)
-  } else {
-    let said: End = {
+  if tail.slice(r, r + 4) != b"PK\x06\x06"
+      || zip64_number(record, tail, r + 4) != where - 32 - record { fail(record, BadZip64) } else {
+    let zip64: EndRecord = {
       disk: Int::of_u32(tail.u32_le(r + 16)),
       first: Int::of_u32(tail.u32_le(r + 20)),
-      here: wide(record, tail, r + 24),
-      entries: wide(record, tail, r + 32),
-      size: wide(record, tail, r + 40),
-      at: wide(record, tail, r + 48),
+      here: zip64_number(record, tail, r + 24),
+      entries: zip64_number(record, tail, r + 32),
+      size: zip64_number(record, tail, r + 40),
+      at: zip64_number(record, tail, r + 48),
     };
     let same = |short: Int, mark: Int, long: Int| short == mark || short == long;
-    if same(narrow.disk, 0xFFFF, said.disk) && same(narrow.first, 0xFFFF, said.first)
-        && same(narrow.here, 0xFFFF, said.here)
-        && same(narrow.entries, 0xFFFF, said.entries)
-        && same(narrow.size, marker(), said.size)
-        && same(narrow.at, marker(), said.at) { directory_of(where, record, said, comment, limits) }
-    else { refuse(where, Disagrees) }
+    if same(narrow.disk, 0xFFFF, zip64.disk) && same(narrow.first, 0xFFFF, zip64.first)
+        && same(narrow.here, 0xFFFF, zip64.here)
+        && same(narrow.entries, 0xFFFF, zip64.entries)
+        && same(narrow.size, zip64_marker(), zip64.size)
+        && same(narrow.at, zip64_marker(), zip64.at) {
+      directory_of(where, record, zip64, comment, limits)
+    } else { fail(where, Disagrees) }
   }
 }
 
-/// The directory an end record's numbers name, which ends at `close`, where the first record
-/// after it begins.
+/// The directory an end record's numbers describe, which must end at `close`, where the first
+/// record after it begins.
 fn directory_of(
   where: Int,
   close: Int,
-  end: End,
+  end: EndRecord,
   comment: Bytes,
   limits: Limits,
-) -> Sought<Directory> / {zip.refused} =
-  if end.disk != 0 || end.first != 0 || end.here != end.entries { refuse(where, Split) }
+) -> Lookup<Directory> / {zip.fail} =
+  if end.disk != 0 || end.first != 0 || end.here != end.entries { fail(where, Split) }
   else if checked_add(end.at, end.size) != Some(close) || end.entries > end.size / 46 {
-    refuse(where, BadDirectory)
-  } else if end.entries > limits.entries { refuse(where, TooMany) }
+    fail(where, BadDirectory)
+  } else if end.entries > limits.entries { fail(where, TooMany) }
   else { Found({ at: end.at, size: end.size, entries: end.entries, comment: comment }) }
 
 // --- Reading: the directory -----------------------------------------------------
@@ -690,12 +701,12 @@ pub type Method =
   /// As a DEFLATE stream.
   | Deflated
 
-/// What the directory says of one member, and where its bytes lie.
-pub type Listed = new {
+/// What the directory records for one member, and where its bytes are.
+pub type DirectoryEntry = new {
   header: Header,
-  /// Its name as the directory spells it and its header's flags, which the member's own header
-  /// is held to. Bit 11 of the flags says the name is UTF-8; without it these are the bytes a
-  /// caller who must not guess reads for itself.
+  /// Its name as the directory writes it and its header's flags, which the member's own header
+  /// must match. Bit 11 of the flags means the name is UTF-8. Without it, these are the bytes a
+  /// caller who must not guess the encoding decodes itself.
   name: Bytes,
   flags: Int,
   method: Method,
@@ -711,14 +722,14 @@ pub type Listed = new {
 }
 
 /// One directory header's fields as written.
-type Raw = {
+type CentralHeader = {
   made: Int,
   flags: Int,
   method: Int,
   time: Int,
   date: Int,
   crc: Int,
-  wide: Wide,
+  wide: HeaderNumbers,
   external: Int,
   name: Bytes,
   extra: List<Field>,
@@ -726,50 +737,54 @@ type Raw = {
   length: Int,
 }
 
-/// The directory header at `o` of `held`, which stands at `where` in the archive.
-fn central(held: Bytes, o: Int, where: Int) -> Raw / {zip.refused, abort.raise} =
-  if held.len() - o < 46 { refuse(where, Truncated) }
-  else if held.slice(o, o + 4) != b"PK\x01\x02" { refuse(where, BadDirectory) } else {
-    let n = u16(held, o + 28);
-    let m = u16(held, o + 30);
-    let k = u16(held, o + 32);
+/// The directory header at `o` of `input`, which is at `where` in the archive.
+fn read_central_header(
+  input: Bytes,
+  o: Int,
+  where: Int,
+) -> CentralHeader / {zip.fail, abort.raise} =
+  if input.len() - o < 46 { fail(where, Truncated) }
+  else if input.slice(o, o + 4) != b"PK\x01\x02" { fail(where, BadDirectory) } else {
+    let n = u16(input, o + 28);
+    let m = u16(input, o + 30);
+    let k = u16(input, o + 32);
     let name = o + 46;
-    if held.len() - name < n + m + k { refuse(where, Truncated) } else {
-      let extra = fields(held.slice(name + n, name + n + m));
+    if input.len() - name < n + m + k { fail(where, Truncated) } else {
+      let extra = fields(input.slice(name + n, name + n + m));
       let twice = [0x0001, 0x000A, 0x5455, 0x7075].any(|id: Int|
         extra.found.count(|f: Field| f.id == id) > 1);
-      if !extra.whole || twice { refuse(where, BadExtra) } else {
+      if !extra.whole || twice { fail(where, BadExtra) } else {
         {
-          made: u16(held, o + 4),
-          flags: u16(held, o + 8),
-          method: u16(held, o + 10),
-          time: u16(held, o + 12),
-          date: u16(held, o + 14),
-          crc: Int::of_u32(held.u32_le(o + 16)),
-          wide: widened(
+          made: u16(input, o + 4),
+          flags: u16(input, o + 8),
+          method: u16(input, o + 10),
+          time: u16(input, o + 12),
+          date: u16(input, o + 14),
+          crc: Int::of_u32(input.u32_le(o + 16)),
+          wide: with_zip64(
             where,
             extra.found,
             {
-              size: Int::of_u32(held.u32_le(o + 24)),
-              stored: Int::of_u32(held.u32_le(o + 20)),
-              at: Int::of_u32(held.u32_le(o + 42)),
-              disk: u16(held, o + 34),
+              size: Int::of_u32(input.u32_le(o + 24)),
+              stored: Int::of_u32(input.u32_le(o + 20)),
+              at: Int::of_u32(input.u32_le(o + 42)),
+              disk: u16(input, o + 34),
             },
             false,
           ),
-          external: Int::of_u32(held.u32_le(o + 38)),
-          name: held.slice(name, name + n),
+          external: Int::of_u32(input.u32_le(o + 38)),
+          name: input.slice(name, name + n),
           extra: extra.found,
-          comment: held.slice(name + n + m, name + n + m + k),
+          comment: input.slice(name + n + m, name + n + m + k),
           length: 46 + n + m + k,
         }
       }
     }
   }
 
-/// The UTF-8 name an Info-ZIP Unicode path field holds for the header's own: one of the version
-/// this reads whose checksum is the header's name's.
-fn unicode_path(r: Raw) -> Option<Bytes> / {abort.raise} =
+/// The UTF-8 name an Info-ZIP Unicode path field gives for the header's name: only from a field of
+/// the version this module reads, whose checksum matches the header's name.
+fn unicode_path(r: CentralHeader) -> Option<Bytes> / {abort.raise} =
   match field(r.extra, 0x7075) {
     Some(data) -> if data.u32_at(1) == Some(Int::of_u32(crc32(r.name))) && data.at(0) == 1 {
       Some(data.slice(5, data.len()))
@@ -777,24 +792,24 @@ fn unicode_path(r: Raw) -> Option<Bytes> / {abort.raise} =
     None -> None,
   }
 
-/// A member's path, kind and mode, as its name, its creator and its attributes say.
-fn named(
+/// A member's path, kind and mode, as its name, its creator and its attributes determine.
+fn path_and_kind(
   where: Int,
-  r: Raw,
-  names: Names,
-) -> { path: String, kind: Kind, mode: Int } / {zip.refused, abort.raise} = {
+  r: CentralHeader,
+  names: NameEncoding,
+) -> { path: String, kind: Kind, mode: Int } / {zip.fail, abort.raise} = {
   let flagged = r.flags & 0x800 != 0;
   let unicode = if flagged { None } else { unicode_path(r) };
   let stored = match unicode { Some(text) -> text, None -> r.name };
   let slashed = stored.ends_with(b"/");
-  let spelled = if slashed { stored.slice(0, tar::unslashed(stored, stored.len())) }
+  let spelled = if slashed { stored.slice(0, tar::unslashed_length(stored, stored.len())) }
   else { stored };
   let host = r.made >> 8;
   let unix = host == 3 || host == 19;
   let bits = if unix { r.external >> 28 } else { 0 };
-  let kind = if r.name.ends_with(b"/") != slashed { refuse(where, BadKind) }
-  else if bits == 4 { if slashed { Directory } else { refuse(where, BadKind) } }
-  else if slashed { if bits == 0 { Directory } else { refuse(where, BadKind) } }
+  let kind = if r.name.ends_with(b"/") != slashed { fail(where, BadKind) }
+  else if bits == 4 { if slashed { Directory } else { fail(where, BadKind) } }
+  else if slashed { if bits == 0 { Directory } else { fail(where, BadKind) } }
   else if bits == 0 || bits == 8 { File }
   else if bits == 10 { Symlink }
   else { Other(bits) };
@@ -806,39 +821,39 @@ fn named(
   }
 }
 
-/// What a directory header says of its member, held to the limits.
-fn listed_of(
+/// What a directory header records for its member, checked against the limits.
+fn directory_entry(
   where: Int,
-  r: Raw,
+  r: CentralHeader,
   d: Directory,
   limits: Limits,
-  names: Names,
-) -> Listed / {zip.refused, abort.raise} = {
+  names: NameEncoding,
+) -> DirectoryEntry / {zip.fail, abort.raise} = {
   let w = r.wide;
   let dense = match checked_mul(w.stored, limits.ratio) {
     Some(most) -> w.size > most,
     None -> false,
   };
-  if r.flags & 0x2041 != 0 { refuse(where, Encrypted) }
-  else if r.method != 0 && r.method != 8 { refuse(where, Method(r.method)) }
-  else if w.disk != 0 { refuse(where, Split) }
-  else if r.name.len() > limits.path || r.comment.len() > limits.comment { refuse(where, TooLong) }
-  else if w.size > limits.size { refuse(where, TooLarge) }
-  else if dense { refuse(where, TooDense) }
-  else if r.method == 0 && w.stored != w.size { refuse(where, BadNumber) }
-  else if w.at > d.at || w.stored > d.at { refuse(where, Overlaps) } else {
-    let name = named(where, r, names);
-    if name.kind == Directory && w.size != 0 { refuse(where, StrayData) } else {
+  if r.flags & 0x2041 != 0 { fail(where, Encrypted) }
+  else if r.method != 0 && r.method != 8 { fail(where, Method(r.method)) }
+  else if w.disk != 0 { fail(where, Split) }
+  else if r.name.len() > limits.path || r.comment.len() > limits.comment { fail(where, TooLong) }
+  else if w.size > limits.size { fail(where, TooLarge) }
+  else if dense { fail(where, TooDense) }
+  else if r.method == 0 && w.stored != w.size { fail(where, BadNumber) }
+  else if w.at > d.at || w.stored > d.at { fail(where, Overlaps) } else {
+    let name = path_and_kind(where, r, names);
+    if name.kind == Directory && w.size != 0 { fail(where, StrayData) } else {
       {
         header: {
           path: name.path,
           kind: name.kind,
           mode: name.mode,
-          modified: clock(r.date, r.time),
+          modified: from_dos_time(r.date, r.time),
           times: times_of(where, r.extra),
           comment: if r.flags & 0x800 != 0 { utf8(where, r.comment) }
           else { unflagged(r.comment, names) },
-          extra: r.extra.filter(|f: Field| !read_here(f.id)),
+          extra: r.extra.filter(|f: Field| !is_known_field(f.id)),
         },
         name: r.name,
         flags: r.flags,
@@ -853,34 +868,34 @@ fn listed_of(
   }
 }
 
-/// How far a reader has got through a directory: the offset of the next header in it, the
-/// members so far, their names, the least bytes each takes from its offset, and the data they
-/// unpack to in all.
-type Walk = {
+/// A reader's progress through a directory: the offset of the next header in it, the members so
+/// far, their names, the fewest bytes each takes from its offset, and the total data they unpack
+/// to.
+type ListingState = {
   at: Int,
-  listed: List<Listed>,
+  listed: List<DirectoryEntry>,
   names: Map<String, Unit>,
   least: Map<Int, Int>,
   total: Int,
 }
 
 fn walk(
-  held: Bytes,
+  input: Bytes,
   d: Directory,
   limits: Limits,
-  names: Names,
-  w: Walk,
+  names: NameEncoding,
+  w: ListingState,
   left: Int,
-) -> Walk / {zip.refused, abort.raise} =
+) -> ListingState / {zip.fail, abort.raise} =
   if left <= 0 { w } else {
     let where = d.at + w.at;
-    let r = central(held, w.at, where);
-    let l = listed_of(where, r, d, limits, names);
-    if w.names.contains(l.header.path) { refuse(where, Duplicate) }
-    else if w.least.contains(l.at) { refuse(where, Overlaps) }
-    else if l.size > limits.total - w.total { refuse(where, TooMuch) } else {
+    let r = read_central_header(input, w.at, where);
+    let l = directory_entry(where, r, d, limits, names);
+    if w.names.contains(l.header.path) { fail(where, Duplicate) }
+    else if w.least.contains(l.at) { fail(where, Overlaps) }
+    else if l.size > limits.total - w.total { fail(where, TooMuch) } else {
       walk(
-        held,
+        input,
         d,
         limits,
         names,
@@ -896,15 +911,14 @@ fn walk(
     }
   }
 
-/// Each member with where the one after it begins, or the directory after the last. A member
-/// takes its header, its name and its data at least, and one that passes what follows it
-/// overlaps it.
+/// Each member with where the next one begins, or the directory for the last. A member takes at
+/// least its header, its name and its data, and one that runs past what follows it overlaps it.
 fn bounded(
-  listed: List<Listed>,
+  listed: List<DirectoryEntry>,
   least: Map<Int, Int>,
   d: Directory,
   limits: Limits,
-) -> List<Listed> / {zip.refused} = {
+) -> List<DirectoryEntry> / {zip.fail} = {
   let starts = least.keys();
   let until = enumerate(starts).fold(
     Map::new(),
@@ -912,46 +926,46 @@ fn bounded(
       ends.insert(s.value, match starts.at(s.index + 1) { Some(next) -> next, None -> d.at }),
   );
   let first = match starts { [start, ..] -> start, [] -> d.at };
-  if first > limits.slack { refuse(0, Unclaimed) } else {
-    listed.map(|l: Listed| {
+  if first > limits.slack { fail(0, Unclaimed) } else {
+    listed.map(|l: DirectoryEntry| {
       let end = match until.get(l.at) { Some(next) -> next, None -> d.at };
       let need = match least.get(l.at) { Some(bytes) -> bytes, None -> 30 };
-      if need > end - l.at { refuse(l.at, Overlaps) } else { { ..l, until: end } }
+      if need > end - l.at { fail(l.at, Overlaps) } else { { ..l, until: end } }
     })
   }
 }
 
-/// The members a directory lists, in its order. `held` is the directory's bytes, `d.size` of
-/// them from `d.at`, and `names` how a name no flag marks is read. Raises `zip.refused` for a
-/// header that is none, a member this does not read or that passes a limit, two of one name as
-/// read, and two whose bytes overlap.
+/// The members a directory lists, in its order. `input` is the directory's bytes, `d.size` of
+/// them from `d.at`, and `names` is how a name with no flag is decoded. Raises `zip.fail` for an
+/// invalid header, a member this module does not read or that exceeds a limit, two members with
+/// the same name as read, and two whose bytes overlap.
 pub fn listing(
-  held: Bytes,
+  input: Bytes,
   d: Directory,
   limits: Limits,
-  names: Names = Utf8IfValid,
-) -> List<Listed> / {zip.refused, abort.raise} =
-  if held.len() != d.size { refuse(d.at, Truncated) }
-  else if d.entries > limits.entries { refuse(d.at, TooMany) } else {
+  names: NameEncoding = Utf8IfValid,
+) -> List<DirectoryEntry> / {zip.fail, abort.raise} =
+  if input.len() != d.size { fail(d.at, Truncated) }
+  else if d.entries > limits.entries { fail(d.at, TooMany) } else {
     let walked = walk(
-      held,
+      input,
       d,
       limits,
       names,
       { at: 0, listed: [], names: Map::new(), least: Map::new(), total: 0 },
       d.entries,
     );
-    if walked.at != d.size { refuse(d.at + walked.at, BadDirectory) }
+    if walked.at != d.size { fail(d.at + walked.at, BadDirectory) }
     else { bounded(walked.listed, walked.least, d, limits) }
   }
 
 // --- Reading: one member --------------------------------------------------------
 
-/// A member found: its header, where its data lies in the archive and how many bytes it is
+/// A member found: its header, where its data is in the archive and how many bytes it takes
 /// there, and what the data must unpack to.
 pub type Member = new {
   header: Header,
-  /// Its name as the directory spells it, and its header's flags.
+  /// Its name as the directory writes it, and its header's flags.
   name: Bytes,
   flags: Int,
   method: Method,
@@ -963,24 +977,29 @@ pub type Member = new {
   size: Int,
 }
 
-/// How long the data descriptor that `after` opens with is: the member's checksum and sizes,
-/// the sizes in four bytes each or eight, after a signature or none. `None` where it opens
-/// with none of those.
-fn closing(l: Listed, after: Bytes) -> Option<Int> = {
+/// The length of the data descriptor that `after` starts with: the member's checksum and sizes,
+/// the sizes in four or eight bytes each, with or without a signature before them. `None` when
+/// it starts with none of those forms.
+fn descriptor_length(l: DirectoryEntry, after: Bytes) -> Option<Int> = {
   let sum = u32_le(Int::of_u32(l.crc));
   let long = Bytes::concat_all([sum, u64_le(l.stored), u64_le(l.size)]);
   let short = Bytes::concat_all([sum, u32_le(l.stored), u32_le(l.size)]);
   let forms = [b"PK\x07\x08".concat(long), long].concat(
-    if l.stored >= marker() || l.size >= marker() { [] }
+    if l.stored >= zip64_marker() || l.size >= zip64_marker() { [] }
     else { [b"PK\x07\x08".concat(short), short] },
   );
   forms.find(|form: Bytes| after.starts_with(form)).map(|form: Bytes| form.len())
 }
 
-/// The member whose bytes end `end` bytes after its header begins, where what follows them
-/// until the next member is within the slack.
-fn settled(l: Listed, limits: Limits, data: Int, end: Int) -> Sought<Member> / {zip.refused} =
-  if l.until - l.at - end > limits.slack { refuse(l.at + end, Unclaimed) } else {
+/// The member whose bytes end `end` bytes after its header begins, if the bytes from there to the
+/// next member are within the slack.
+fn found_member(
+  l: DirectoryEntry,
+  limits: Limits,
+  data: Int,
+  end: Int,
+) -> Lookup<Member> / {zip.fail} =
+  if l.until - l.at - end > limits.slack { fail(l.at + end, Unclaimed) } else {
     Found({
       header: l.header,
       name: l.name,
@@ -993,15 +1012,15 @@ fn settled(l: Listed, limits: Limits, data: Int, end: Int) -> Sought<Member> / {
     })
   }
 
-/// The member whose header `seen` holds whole, its data `data` bytes in.
-fn opened(
-  l: Listed,
+/// The member whose whole header is in `seen`, with its data `data` bytes in.
+fn local_member(
+  l: DirectoryEntry,
   seen: Bytes,
   limits: Limits,
   data: Int,
-) -> Sought<Member> / {zip.refused, abort.raise} = {
+) -> Lookup<Member> / {zip.fail, abort.raise} = {
   let n = u16(seen, 26);
-  let own = widened(
+  let is_local_header = with_zip64(
     l.at,
     fields(seen.slice(30 + n, data)).found,
     { size: Int::of_u32(seen.u32_le(22)), stored: Int::of_u32(seen.u32_le(18)), at: 0, disk: 0 },
@@ -1012,98 +1031,102 @@ fn opened(
   let method = match l.method { Stored -> 0, Deflated -> 8 };
   if seen.slice(30, 30 + n) != l.name || u16(seen, 6) != l.flags || u16(seen, 8) != method
       || !same(Int::of_u32(seen.u32_le(14)), Int::of_u32(l.crc))
-      || !same(own.stored, l.stored)
-      || !same(own.size, l.size) { refuse(l.at, Disagrees) }
-  else if !described { settled(l, limits, data, data + l.stored) } else {
+      || !same(is_local_header.stored, l.stored)
+      || !same(is_local_header.size, l.size) { fail(l.at, Disagrees) }
+  else if !described { found_member(l, limits, data, data + l.stored) } else {
     let end = data + l.stored;
     let need = end + min(l.until - l.at - end, 24);
-    if seen.len() < need { More(need) } else {
-      match closing(l, seen.slice(end, need)) {
-        Some(length) -> settled(l, limits, data, end + length),
-        None -> refuse(l.at + end, Disagrees),
+    if seen.len() < need { NeedMore(need) } else {
+      match descriptor_length(l, seen.slice(end, need)) {
+        Some(length) -> found_member(l, limits, data, end + length),
+        None -> fail(l.at + end, Disagrees),
       }
     }
   }
 }
 
-/// Where a listed member's data lies. `seen` is the archive's bytes from `l.at`, the member's
-/// own header, as far as they have arrived, and `More(n)` asks for `n` of them: the header,
-/// and for a member with a data descriptor the data and the descriptor after it. Raises
-/// `zip.refused` where the header or the descriptor does not say what the directory does,
-/// where the member passes what follows it, and where more than `limits.slack` bytes after it
-/// are no member's.
-pub fn open(l: Listed, seen: Bytes, limits: Limits) -> Sought<Member> / {zip.refused, abort.raise} =
-  if l.until - l.at < 30 { refuse(l.at, Overlaps) }
-  else if seen.len() < 30 { More(30) }
-  else if seen.slice(0, 4) != b"PK\x03\x04" { refuse(l.at, Disagrees) } else {
+/// Where a listed member's data is. `seen` is the archive's bytes from `l.at`, starting with the
+/// member's own header, as far as they have arrived. `NeedMore(n)` requests `n` of them: the
+/// header, and for a member with a data descriptor, the data and the descriptor after it. Raises
+/// `zip.fail` when the header or the descriptor disagrees with the directory, when the member
+/// runs past what follows it, and when more than `limits.slack` bytes after it belong to no
+/// member.
+pub fn open(
+  l: DirectoryEntry,
+  seen: Bytes,
+  limits: Limits,
+) -> Lookup<Member> / {zip.fail, abort.raise} =
+  if l.until - l.at < 30 { fail(l.at, Overlaps) }
+  else if seen.len() < 30 { NeedMore(30) }
+  else if seen.slice(0, 4) != b"PK\x03\x04" { fail(l.at, Disagrees) } else {
     let data = 30 + u16(seen, 26) + u16(seen, 28);
-    if data > l.until - l.at || l.stored > l.until - l.at - data { refuse(l.at, Overlaps) }
-    else if seen.len() < data { More(data) }
-    else { opened(l, seen, limits, data) }
+    if data > l.until - l.at || l.stored > l.until - l.at - data { fail(l.at, Overlaps) }
+    else if seen.len() < data { NeedMore(data) }
+    else { local_member(l, seen, limits, data) }
   }
 
-/// A member's data, unpacked: `held` is its `m.stored` bytes from `m.data`. Raises
-/// `zip.refused` for data that does not inflate to `m.size` bytes whose CRC-32 is `m.crc`, and
+/// A member's data, unpacked: `input` is its `m.stored` bytes from `m.data`. Raises
+/// `zip.fail` for data that does not inflate to `m.size` bytes whose CRC-32 is `m.crc`, and
 /// for a symbolic link whose target is not UTF-8.
-pub fn unpack(m: Member, held: Bytes) -> Bytes / {zip.refused, abort.raise} =
-  if held.len() != m.stored { refuse(m.data, Truncated) } else {
+pub fn unpack(m: Member, input: Bytes) -> Bytes / {zip.fail, abort.raise} =
+  if input.len() != m.stored { fail(m.data, Truncated) } else {
     let data = match m.method {
-      Stored -> held,
-      Deflated -> match try_inflate(held, m.size) {
+      Stored -> input,
+      Deflated -> match try_inflate(input, m.size) {
         Ok(inflated) -> inflated,
-        Err(_) -> refuse(m.data, BadData),
+        Err(_) -> fail(m.data, BadData),
       },
     };
-    if data.len() != m.size { refuse(m.data, BadData) }
-    else if crc32(data) != m.crc { refuse(m.data, BadChecksum) }
-    else if m.header.kind == Symlink && !data.is_utf8() { refuse(m.data, NotUtf8) }
+    if data.len() != m.size { fail(m.data, BadData) }
+    else if crc32(data) != m.crc { fail(m.data, BadChecksum) }
+    else if m.header.kind == Symlink && !data.is_utf8() { fail(m.data, NotUtf8) }
     else { data }
   }
 
 // --- Reading: a whole archive ---------------------------------------------------
 
-/// Every member of `archive`, in its directory's order, its header and where its data lies,
-/// with no data unpacked: a listing. Every member's own header is read and held to the
-/// directory, and a name no flag marks is read as `names` says.
+/// Every member of `archive`, in its directory's order, with its header and where its data is,
+/// without unpacking any data. Every member's own header is read and checked against the
+/// directory, and a name with no flag is decoded as `names` directs.
 pub fn members(
   archive: Bytes,
   limits: Limits,
-  names: Names = Utf8IfValid,
-) -> List<Member> / {zip.refused, abort.raise} = {
+  names: NameEncoding = Utf8IfValid,
+) -> List<Member> / {zip.fail, abort.raise} = {
   let length = archive.len();
   match locate(archive, length, limits) {
-    More(_) -> refuse(length, Truncated),
+    NeedMore(_) -> fail(length, Truncated),
     Found(d) ->
-      listing(archive.slice(d.at, d.at + d.size), d, limits, names).map(|l: Listed|
+      listing(archive.slice(d.at, d.at + d.size), d, limits, names).map(|l: DirectoryEntry|
         match open(l, archive.slice(l.at, l.until), limits) {
           Found(m) -> m,
-          More(_) -> refuse(l.at, Truncated),
+          NeedMore(_) -> fail(l.at, Truncated),
         }),
   }
 }
 
-/// The entries of `archive`, raising `zip.refused` where `decode` answers `Err`.
+/// The entries of `archive`. Raises `zip.fail` where `decode` returns `Err`.
 pub fn read(
   archive: Bytes,
   limits: Limits,
-  names: Names = Utf8IfValid,
-) -> List<Entry> / {zip.refused, abort.raise} =
+  names: NameEncoding = Utf8IfValid,
+) -> List<Entry> / {zip.fail, abort.raise} =
   members(archive, limits, names).map(|m: Member| -> Entry {
     { header: m.header, data: unpack(m, archive.slice(m.data, m.data + m.stored)) }
   })
 
-/// The entries of `archive`, or why it is not an archive within `limits`. A name no flag marks
-/// is read as `names` says: as UTF-8 where its bytes are, unless told to read it as declared.
+/// The entries of `archive`, or why it is not an archive within `limits`. A name with no flag is
+/// decoded as `names` directs: as UTF-8 when its bytes are valid UTF-8, unless `Declared` is given.
 pub fn decode(
   archive: Bytes,
   limits: Limits,
-  names: Names = Utf8IfValid,
-) -> Result<List<Entry>, Refusal> / {abort.raise} = try { read(archive, limits, names) }
+  names: NameEncoding = Utf8IfValid,
+) -> Result<List<Entry>, Error> / {abort.raise} = try { read(archive, limits, names) }
 
 // --- Writing --------------------------------------------------------------------
 
 /// Why the entry cannot be written, if it cannot.
-fn fault(e: Entry) -> Option<Why> = {
+fn unwritable_reason(e: Entry) -> Option<ErrorKind> = {
   let h = e.header;
   let sound = match h.kind {
     Other(bits) -> bits >= 1 && bits <= 15 && bits != 4 && bits != 8 && bits != 10,
@@ -1117,19 +1140,19 @@ fn fault(e: Entry) -> Option<Why> = {
   else if h.kind == Directory && e.data.len() > 0 { Some(StrayData) }
   else if h.kind == Symlink && !e.data.is_utf8() { Some(NotUtf8) }
   else if h.mode < 0 || h.mode > 0xFFF { Some(BadNumber) }
-  else if stamp(h.modified) == None || times_field(h.times) == None { Some(BadTime) }
-  else if h.extra.any(|f: Field| f.id < 0 || f.id > 0xFFFF || read_here(f.id))
-      || h.extra.fold(0, |sum: Int, f: Field| sum + 4 + f.data.len()) > field_room() {
+  else if dos_time_or_zero(h.modified) == None || times_field(h.times) == None { Some(BadTime) }
+  else if h.extra.any(|f: Field| f.id < 0 || f.id > 0xFFFF || is_known_field(f.id))
+      || h.extra.fold(0, |sum: Int, f: Field| sum + 4 + f.data.len()) > extra_field_limit() {
     Some(BadExtra)
   } else { None }
 }
 
-/// The bytes of extra fields an entry may carry: what a header holds, less the longest zip64
-/// field and the longest field of times a writer puts before them.
-fn field_room() -> Int = 0xFFFF - 28 - 36
+/// The bytes of extra fields an entry may carry: what a header can store, minus the longest zip64
+/// field and the longest times field a writer puts before them.
+fn extra_field_limit() -> Int = 0xFFFF - 28 - 36
 
 /// What a member's two headers are written from.
-type Image = {
+type HeaderFields = {
   name: Bytes,
   comment: Bytes,
   flags: Int,
@@ -1143,7 +1166,7 @@ type Image = {
   needs: Int,
 }
 
-fn image(e: Entry, deflated: Bool, stored: Int) -> Image = {
+fn header_fields(e: Entry, deflated: Bool, stored: Int) -> HeaderFields = {
   let h = e.header;
   let bits = match h.kind { Directory -> 4, File -> 8, Symlink -> 10, Other(other) -> other };
   {
@@ -1151,7 +1174,7 @@ fn image(e: Entry, deflated: Bool, stored: Int) -> Image = {
     comment: Bytes::of_string(h.comment),
     flags: if h.path.is_ascii() && h.comment.is_ascii() { 0 } else { 0x800 },
     method: if deflated { 8 } else { 0 },
-    stamp: match stamp(h.modified) { Some(stamped) -> stamped, None -> 0 },
+    stamp: match dos_time_or_zero(h.modified) { Some(stamped) -> stamped, None -> 0 },
     crc: Int::of_u32(crc32(e.data)),
     stored: stored,
     size: e.data.len(),
@@ -1165,28 +1188,28 @@ fn image(e: Entry, deflated: Bool, stored: Int) -> Image = {
   }
 }
 
-/// A 32-bit field's bytes for `n`: the marker where it does not fit.
-fn narrowed(n: Int) -> Bytes = u32_le(min(n, marker()))
+/// A 32-bit field's bytes for `n`: the marker if it does not fit.
+fn u32_field(n: Int) -> Bytes = u32_le(min(n, zip64_marker()))
 
 /// A zip64 field of `numbers`, or nothing for none.
 fn zip64_field(numbers: List<Int>) -> Bytes =
   if numbers.len() == 0 { b"" }
   else { field_bytes(1, Bytes::concat_all(numbers.map(|n: Int| u64_le(n)))) }
 
-/// A member's own header: a zip64 field of both sizes where either passes its field.
-fn local_header(i: Image) -> Bytes = {
-  let wide = i.stored >= marker() || i.size >= marker();
-  let extra = zip64_field(if wide { [i.size, i.stored] } else { [] }).concat(i.extra);
+/// A member's own header, with a zip64 field of both sizes if either overflows its field.
+fn local_header(i: HeaderFields) -> Bytes = {
+  let zip64_number = i.stored >= zip64_marker() || i.size >= zip64_marker();
+  let extra = zip64_field(if zip64_number { [i.size, i.stored] } else { [] }).concat(i.extra);
   Bytes::concat_all([
     b"PK\x03\x04",
-    u16_le(if wide { 45 } else { i.needs }),
+    u16_le(if zip64_number { 45 } else { i.needs }),
     u16_le(i.flags),
     u16_le(i.method),
     u16_le(i.stamp & 0xFFFF),
     u16_le(i.stamp >> 16),
     u32_le(i.crc),
-    if wide { u32_le(marker()) } else { u32_le(i.stored) },
-    if wide { u32_le(marker()) } else { u32_le(i.size) },
+    if zip64_number { u32_le(zip64_marker()) } else { u32_le(i.stored) },
+    if zip64_number { u32_le(zip64_marker()) } else { u32_le(i.size) },
     u16_le(i.name.len()),
     u16_le(extra.len()),
     i.name,
@@ -1194,10 +1217,10 @@ fn local_header(i: Image) -> Bytes = {
   ])
 }
 
-/// The directory's header for the member at `at`: a zip64 field of each number that passes its
-/// field, and of no other.
-fn central_header(i: Image, at: Int) -> Bytes = {
-  let numbers = [i.size, i.stored, at].filter(|n: Int| n >= marker());
+/// The directory's header for the member at `at`, with a zip64 field of each number that
+/// overflows its field, and of no other.
+fn central_header(i: HeaderFields, at: Int) -> Bytes = {
+  let numbers = [i.size, i.stored, at].filter(|n: Int| n >= zip64_marker());
   let extra = zip64_field(numbers).concat(i.extra);
   let needs = if numbers.len() == 0 { i.needs } else { 45 };
   Bytes::concat_all([
@@ -1209,22 +1232,22 @@ fn central_header(i: Image, at: Int) -> Bytes = {
     u16_le(i.stamp & 0xFFFF),
     u16_le(i.stamp >> 16),
     u32_le(i.crc),
-    narrowed(i.stored),
-    narrowed(i.size),
+    u32_field(i.stored),
+    u32_field(i.size),
     u16_le(i.name.len()),
     u16_le(extra.len()),
     u16_le(i.comment.len()),
     b"\x00\x00\x00\x00",
     u32_le(i.external),
-    narrowed(at),
+    u32_field(at),
     i.name,
     extra,
     i.comment,
   ])
 }
 
-/// An archive being written: the members' bytes not yet handed over, the offset the next member
-/// starts at, the directory's header for each member so far, and their names.
+/// An archive being written: the members' bytes not yet returned by `flush`, the offset the next
+/// member starts at, the directory's header for each member so far, and their names.
 pub type Writer = new {
   pending: List<Bytes>,
   at: Int,
@@ -1235,22 +1258,22 @@ pub type Writer = new {
 /// A writer with nothing written.
 pub fn begin() -> Writer = { pending: [], at: 0, directory: [], names: Map::new() }
 
-/// `w` with `e` written after the members before it: deflated where that is smaller than its
-/// data, stored where it is not. Raises `zip.unwritable` for an entry no header holds, and for
-/// a second of one name.
-pub fn add(w: Writer, e: Entry) -> Writer / {zip.unwritable, abort.raise} = {
+/// `w` with `e` written after the earlier members: deflated when that is smaller than its data,
+/// and stored otherwise. Raises `zip.write_failed` for an entry no header can store, and for a
+/// second entry with the same name.
+pub fn add(w: Writer, e: Entry) -> Writer / {zip.write_failed, abort.raise} = {
   let index = w.directory.len();
-  match fault(e) {
-    Some(why) -> unwritable(index, why),
-    None -> if w.names.contains(e.header.path) { unwritable(index, Duplicate) } else {
+  match unwritable_reason(e) {
+    Some(why) -> fail_write(index, why),
+    None -> if w.names.contains(e.header.path) { fail_write(index, Duplicate) } else {
       let packed = deflate(e.data);
       let deflated = packed.len() < e.data.len();
       let stored = if deflated { packed } else { e.data };
-      let written = image(e, deflated, stored.len());
-      let own = local_header(written);
+      let written = header_fields(e, deflated, stored.len());
+      let is_local_header = local_header(written);
       {
-        pending: w.pending.push(own).push(stored),
-        at: w.at + own.len() + stored.len(),
+        pending: w.pending.push(is_local_header).push(stored),
+        at: w.at + is_local_header.len() + stored.len(),
         directory: w.directory.push(central_header(written, w.at)),
         names: w.names.insert(e.header.path, ()),
       }
@@ -1258,19 +1281,19 @@ pub fn add(w: Writer, e: Entry) -> Writer / {zip.unwritable, abort.raise} = {
   }
 }
 
-/// What `flush` hands over: the bytes written since the last, and the writer that holds none.
-pub type Flushed = new { bytes: Bytes, writer: Writer }
+/// What `flush` returns: the bytes written since the last flush, and the writer with none pending.
+pub type FlushResult = new { bytes: Bytes, writer: Writer }
 
-/// The members' bytes `w` has not yet handed over, and `w` without them: what a driver appends
-/// to a file between one `add` and the next, so it holds one member at a time.
-pub fn flush(w: Writer) -> Flushed =
+/// The members' bytes `w` has not yet returned, and `w` without them. A driver appends these to a
+/// file between one `add` and the next, so it keeps one member in memory at a time.
+pub fn flush(w: Writer) -> FlushResult =
   { bytes: Bytes::concat_all(w.pending), writer: { ..w, pending: [] } }
 
 /// The end records of an archive whose directory of `entries` headers is `size` bytes at `at`:
-/// a zip64 record and its locator before the end record where a number passes its field.
+/// a zip64 record and its locator before the end record if a number overflows its field.
 fn end_records(entries: Int, size: Int, at: Int, comment: Bytes) -> Bytes =
   Bytes::concat_all([
-    if entries < 0xFFFF && size < marker() && at < marker() { b"" } else {
+    if entries < 0xFFFF && size < zip64_marker() && at < zip64_marker() { b"" } else {
       Bytes::concat_all([
         b"PK\x06\x06",
         u64_le(44),
@@ -1291,16 +1314,22 @@ fn end_records(entries: Int, size: Int, at: Int, comment: Bytes) -> Bytes =
     b"PK\x05\x06\x00\x00\x00\x00",
     u16_le(min(entries, 0xFFFF)),
     u16_le(min(entries, 0xFFFF)),
-    narrowed(size),
-    narrowed(at),
+    u32_field(size),
+    u32_field(at),
     u16_le(comment.len()),
     comment,
   ])
 
-/// Whether a reader of the last bytes of an archive `length` long finds the directory its
-/// writer put there: it does not where what was written holds another end record a reader
-/// could take for it. A `tail` too short for a reader to say is taken to close.
-fn closes(tail: Bytes, length: Int, at: Int, size: Int, entries: Int) -> Bool / {abort.raise} = {
+/// Whether a reader of the last bytes of an archive `length` long finds the directory its writer
+/// put there. It does not if the written bytes contain another end record a reader could mistake
+/// for it. A `tail` too short for the reader to decide counts as finding it.
+fn locates_directory(
+  tail: Bytes,
+  length: Int,
+  at: Int,
+  size: Int,
+  entries: Int,
+) -> Bool / {abort.raise} = {
   let found = try {
     locate(tail, length, {
       entries: entries,
@@ -1314,64 +1343,65 @@ fn closes(tail: Bytes, length: Int, at: Int, size: Int, entries: Int) -> Bool / 
   };
   match found {
     Ok(Found(d)) -> d.at == at && d.size == size && d.entries == entries,
-    Ok(More(_)) -> true,
+    Ok(NeedMore(_)) -> true,
     Err(_) -> false,
   }
 }
 
-/// The bytes `w` has not yet handed over, then its directory and its end record with `comment`:
-/// the whole archive, where nothing was flushed. Raises `zip.unwritable`, at the count of the
-/// entries, for a comment past 65535 bytes, and for a comment or a last member in which a
-/// reader would find another end record.
-pub fn finish(w: Writer, comment: Bytes = b"") -> Bytes / {zip.unwritable, abort.raise} = {
+/// The bytes `w` has not yet returned, then its directory and its end record with `comment`: the
+/// whole archive, if nothing was flushed. Raises `zip.write_failed`, with the number of entries as
+/// its index, for a comment past 65535 bytes, and for a comment or a last member in which a reader
+/// would find another end record.
+pub fn finish(w: Writer, comment: Bytes = b"") -> Bytes / {zip.write_failed, abort.raise} = {
   let entries = w.directory.len();
   let directory = Bytes::concat_all(w.directory);
   let size = directory.len();
-  if comment.len() > 0xFFFF { unwritable(entries, TooLong) } else {
+  if comment.len() > 0xFFFF { fail_write(entries, TooLong) } else {
     let end = end_records(entries, size, w.at, comment);
-    let answered = Bytes::concat_all(w.pending.concat([directory, end]));
-    if closes(answered, w.at + size + end.len(), w.at, size, entries) { answered }
-    else { unwritable(entries, ManyEnds) }
+    let archive_bytes = Bytes::concat_all(w.pending.concat([directory, end]));
+    if locates_directory(archive_bytes, w.at + size + end.len(), w.at, size, entries) {
+      archive_bytes
+    } else { fail_write(entries, ManyEndRecords) }
   }
 }
 
-/// The archive of `entries`, in their order, raising `zip.unwritable` where `encode` answers
-/// `Err`. The same entries give the same bytes.
-pub fn write(entries: List<Entry>) -> Bytes / {zip.unwritable, abort.raise} =
+/// The archive of `entries`, in their order. Raises `zip.write_failed` where `encode` returns
+/// `Err`. The same entries always produce the same bytes.
+pub fn write(entries: List<Entry>) -> Bytes / {zip.write_failed, abort.raise} =
   finish(entries.fold(begin(), add))
 
 /// The archive of `entries`, or the first of them that cannot be written and why.
-pub fn encode(entries: List<Entry>) -> Result<Bytes, Unwritable> / {abort.raise} =
+pub fn encode(entries: List<Entry>) -> Result<Bytes, WriteError> / {abort.raise} =
   try { write(entries) }
 
 // --- Extraction -----------------------------------------------------------------
 
-/// Whether a path's segment opens as a drive does, with a letter and a colon.
-fn lettered(segment: String) -> Bool = {
+/// Whether a path segment starts like a drive, with a letter and a colon.
+fn has_drive_letter(segment: String) -> Bool = {
   let raw = Bytes::of_string(segment);
   raw.len() >= 2 && raw.at(1) == b':'
     && (match raw.at(0) { b'a'..=b'z' -> true, b'A'..=b'Z' -> true, _ -> false })
 }
 
-/// Why a name is one some systems read as another place, if it is: one with a backslash, or
-/// one with a segment that opens as a drive does, wherever in it, since a plan's path is its
-/// segments with the ones that stay or climb resolved.
-fn foreign(name: String) -> Option<Danger> =
+/// Why some systems would read a name as a different location, if they would: it has a
+/// backslash, or a segment anywhere in it starts like a drive. Any segment counts, since a plan's
+/// path is its segments with `.` and `..` resolved.
+fn windows_danger(name: String) -> Option<Danger> =
   if name.contains("\\") { Some(Backslash) }
-  else if name.split("/").any(lettered) { Some(Drive) }
+  else if name.split("/").any(has_drive_letter) { Some(Drive) }
   else { None }
 
-/// A symbolic link's target as text, empty for one that is none.
+/// A symbolic link's target as text, empty for an entry that is not a link.
 fn target(e: Entry) -> String / {abort.raise} =
   if e.header.kind == Symlink && e.data.is_utf8() { String::of_bytes(e.data) } else { "" }
 
-/// Why an entry's path, or its target, is foreign, if either is.
-fn strange(e: Entry) -> Option<Danger> / {abort.raise} =
-  match foreign(e.header.path) { Some(why) -> Some(why), None -> foreign(target(e)) }
+/// Why an entry's path, or its target, is unsafe on some systems, if either is.
+fn entry_danger(e: Entry) -> Option<Danger> / {abort.raise} =
+  match windows_danger(e.header.path) { Some(why) -> Some(why), None -> windows_danger(target(e)) }
 
-/// The entry `std.tar` plans in this one's place: a link with no target for one whose target is
-/// no text, and a FIFO for any kind no plan makes.
-fn planned(e: Entry) -> tar::Entry / {abort.raise} = {
+/// The entry `std.tar` plans in place of this one: a link with no target for one whose target is
+/// not text, and a FIFO for any kind no plan creates.
+fn tar_entry(e: Entry) -> tar::Entry / {abort.raise} = {
   let h = e.header;
   match h.kind {
     File -> tar::file(h.path, e.data, mode: h.mode),
@@ -1384,35 +1414,35 @@ fn planned(e: Entry) -> tar::Entry / {abort.raise} = {
   }
 }
 
-/// The operations that extract `entries`, in order, beneath a root, raising `tar.unsafe` where
-/// `plan` answers `Err`.
+/// The operations that extract `entries`, in order, beneath a root. Raises `tar.unsafe` where
+/// `plan` returns `Err`.
 pub fn extraction(entries: List<Entry>) -> List<Operation> / {tar.unsafe, abort.raise} =
-  match enumerate(entries).find(|e: { index: Int, value: Entry }| strange(e.value) != None) {
-    None -> tar::extraction(entries.map(planned)),
+  match enumerate(entries).find(|e: { index: Int, value: Entry }| entry_danger(e.value) != None) {
+    None -> tar::plan_or_raise(entries.map(tar_entry)),
     Some(first) -> {
-      let before = tar::extraction(entries.take(first.index).map(planned));
-      match strange(first.value) {
-        Some(why) -> tar.unsafe({ index: first.index, path: first.value.header.path, why: why }),
+      let before = tar::plan_or_raise(entries.take(first.index).map(tar_entry));
+      match entry_danger(first.value) {
+        Some(why) -> tar.unsafe({ index: first.index, path: first.value.header.path, reason: why }),
         None -> before,
       }
     },
   }
 
 /// The operations that extract `entries`, in order, beneath a root, or the first entry that may
-/// not be extracted and why: what `std.tar`'s plan refuses, and a path or a link's target with a
+/// not be extracted and why: what `std.tar`'s plan rejects, and a path or a link's target with a
 /// backslash or a drive letter. A file's mode is its permission bits, and a link's target is its
 /// data.
-pub fn plan(entries: List<Entry>) -> Result<List<Operation>, Unsafe> / {abort.raise} =
+pub fn plan(entries: List<Entry>) -> Result<List<Operation>, UnsafeEntry> / {abort.raise} =
   try { extraction(entries) }
 
-/// The path beneath a root that `path` names, as `std.tar`'s `safe_path` answers it: `Err` also
-/// for a path with a backslash or a drive letter.
+/// The path beneath a root that `path` names, as `std.tar`'s `safe_path` returns it, with `Err`
+/// also for a path with a backslash or a drive letter.
 pub fn safe_path(path: String) -> Result<String, Danger> =
-  match foreign(path) { Some(why) -> Err(why), None -> tar::safe_path(path) }
+  match windows_danger(path) { Some(why) -> Err(why), None -> tar::safe_path(path) }
 
 // --- Properties -----------------------------------------------------------------
 
-fn roomy() -> Limits =
+fn large_limits() -> Limits =
   {
     entries: 100000,
     total: 100000000,
@@ -1424,7 +1454,7 @@ fn roomy() -> Limits =
   }
 
 /// Names that stretch a header: plain, nested, outside ASCII, spaced and long.
-fn spellings() -> List<String> =
+fn sample_paths() -> List<String> =
   [
     "a",
     "dir/file.txt",
@@ -1436,22 +1466,23 @@ fn spellings() -> List<String> =
     "x.y",
   ]
 
-fn spelled(pick: Int) -> String = match spellings().at(pick & 7) { Some(path) -> path, None -> "a" }
+fn spelled(pick: Int) -> String =
+  match sample_paths().at(pick & 7) { Some(path) -> path, None -> "a" }
 
-/// A wall clock a header holds, drawn from a `pick` that is not negative.
-fn moment(pick: Int) -> DateTime =
+/// A wall clock a header can store, generated from a non-negative `pick`.
+fn drawn_date_time(pick: Int) -> DateTime =
   DateTime(Date(3652 + pick % 46751), Time(pick / 46751 % 43200 * 2000000000))
 
-/// An instant an extra field holds, or none, drawn from the low bits of `pick`.
+/// An instant an extra field can store, or none, chosen by the low bits of `pick`.
 fn drawn_instant(pick: Int) -> Option<Instant> =
   if pick & 3 == 0 { None }
   else if pick & 3 == 1 { Some(Instant((pick >> 2 & 0x7FFF_FFFF) * 1000000000)) }
   else { Some(Instant((pick >> 2 & 0xFFFF_FFFF_FFFF) * 100)) }
 
-/// An entry a test draws from the bits of `pick`, named apart from every other by `index`: its
-/// kind, path, mode, times, comment and a field carried as it is.
-fn drawn(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
-  // Spread over every bit, whatever range a test draws its numbers from.
+/// An entry generated from the bits of `drawn_pick`, with a name made unique by `index`: its kind,
+/// path, mode, times, comment and an extra field kept as it is.
+fn drawn_entry(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
+  // Mix the bits, whatever range a test generates its numbers from.
   let pick = drawn_pick *% 0x2545_F491_4F6C_DD1D;
   let path = spelled(pick) ++ "-" ++ index.to_string();
   let kind = pick >> 3 & 3;
@@ -1463,7 +1494,8 @@ fn drawn(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
     header: {
       ..made.header,
       mode: pick >> 8 & 0xFFF,
-      modified: if pick & 0x10_0000 == 0 { None } else { Some(moment(pick >> 21 & 0x7FFF_FFFF)) },
+      modified: if pick & 0x10_0000 == 0 { None }
+      else { Some(drawn_date_time(pick >> 21 & 0x7FFF_FFFF)) },
       times: {
         modified: drawn_instant(pick >> 22),
         accessed: drawn_instant(pick >> 30 & 0xFFFF_FFFE),
@@ -1476,29 +1508,30 @@ fn drawn(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
   }
 }
 
-fn drawn_all(picks: List<Int>, data: Bytes) -> List<Entry> =
-  enumerate(picks).map(|p: { index: Int, value: Int }| drawn(p.index, p.value, data))
+fn drawn_entries(picks: List<Int>, data: Bytes) -> List<Entry> =
+  enumerate(picks).map(|p: { index: Int, value: Int }| drawn_entry(p.index, p.value, data))
 
 test "what is written reads back as the entries it was written from, by either rule for names" {
   gen::check2(gen::list(gen::any_int()), gen::bytes(), |picks: List<Int>, data: Bytes| {
-    let entries = drawn_all(picks, data);
+    let entries = drawn_entries(picks, data);
     let whole = write(entries);
-    decode(whole, roomy()) == Ok(entries) && decode(whole, roomy(), Declared) == Ok(entries)
+    decode(whole, large_limits()) == Ok(entries)
+      && decode(whole, large_limits(), Declared) == Ok(entries)
   })
 }
 
-test "an archive's last bytes find its directory, or say how many more would" {
+test "an archive's last bytes find its directory, or report how many more bytes would" {
   gen::check3(
     gen::list(gen::any_int()),
     gen::bytes(),
     gen::any_int(),
     |picks: List<Int>, data: Bytes, cut: Int| {
-      let whole = write(drawn_all(picks, data));
+      let whole = write(drawn_entries(picks, data));
       let length = whole.len();
-      let tight = { ..roomy(), comment: 0 };
+      let tight = { ..large_limits(), comment: 0 };
       let tail = whole.slice(length - (cut & 0x7FFF_FFFF) % (length + 1), length);
       match try { locate(tail, length, tight) } {
-        Ok(More(needed)) -> needed > tail.len() && needed <= length,
+        Ok(NeedMore(needed)) -> needed > tail.len() && needed <= length,
         Ok(found) -> (try { locate(whole, length, tight) }) == Ok(found),
         Err(_) -> false,
       }
@@ -1506,18 +1539,19 @@ test "an archive's last bytes find its directory, or say how many more would" {
   )
 }
 
-/// Path segments a test winds into one path to judge under both readings: plain, staying,
-/// climbing, empty, outside ASCII, a drive's, and any text at all.
-fn windings(text: String) -> List<String> =
+/// Path segments a test joins into one path to check under both readings: plain, `..`, `.`,
+/// empty, non-ASCII, a drive's, and any text at all.
+fn sample_segments(text: String) -> List<String> =
   ["a", "..", ".", "", "caf\u{e9}", "\u{6c34}\u{df}", "c:", text]
 
-/// A UTF-8 text as a reader takes it that reads its bytes as code page 437.
+/// A UTF-8 text as read by a reader that decodes its bytes as code page 437.
 fn misread(text: String) -> String / {abort.raise} = of_cp437(Bytes::of_string(text))
 
 test "a path alone is as safe read as code page 437 as read as the UTF-8 it is" {
   gen::check2(gen::list(gen::any_int()), gen::text(), |picks: List<Int>, text: String| {
     let path = String::join(
-      picks.map(|pick: Int| match windings(text).at(pick & 7) { Some(name) -> name, None -> "a" }),
+      picks.map(|pick: Int|
+        match sample_segments(text).at(pick & 7) { Some(name) -> name, None -> "a" }),
       "/",
     );
     match safe_path(path) {
@@ -1533,37 +1567,42 @@ test "a path alone is as safe read as code page 437 as read as the UTF-8 it is" 
 fn patched(bytes: Bytes, at: Int, patch: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all([bytes.slice(0, at), patch, bytes.slice(at + patch.len(), bytes.len())])
 
-fn refusal(archive: Bytes, limits: Limits) -> Option<Refusal> / {abort.raise} =
+fn read_error(archive: Bytes, limits: Limits) -> Option<Error> / {abort.raise} =
   match decode(archive, limits) { Ok(_) -> None, Err(refused) -> Some(refused) }
 
 /// Two files of a byte each: `a` at 0 with its data at 31, `b` at 32, their directory headers
 /// at 64 and 111, and the end record at 158.
-fn pair() -> Bytes / {zip.unwritable, abort.raise} = write([file("a", b"x"), file("b", b"y")])
+fn pair() -> Bytes / {zip.write_failed, abort.raise} = write([file("a", b"x"), file("b", b"y")])
 
-/// An archive of one member: `own` heads it, `stored` is its data with `after` behind it, and
-/// the directory says of it what `listed` holds.
-fn alone(listed: Image, own: Image, stored: Bytes, after: Bytes) -> Bytes = {
-  let body = Bytes::concat_all([local_header(own), stored, after]);
-  let said = central_header(listed, 0);
-  Bytes::concat_all([body, said, end_records(1, said.len(), body.len(), b"")])
+/// An archive of one member: `is_local_header` is its own header, `stored` is its data followed by
+/// `after`, and the directory says of it what `listed` contains.
+fn one_member_archive(
+  listed: HeaderFields,
+  is_local_header: HeaderFields,
+  stored: Bytes,
+  after: Bytes,
+) -> Bytes = {
+  let body = Bytes::concat_all([local_header(is_local_header), stored, after]);
+  let zip64 = central_header(listed, 0);
+  Bytes::concat_all([body, zip64, end_records(1, zip64.len(), body.len(), b"")])
 }
 
 /// A member as a test lays one out: what its headers say, and its data as stored.
-type Laid = { image: Image, data: Bytes }
+type RawMember = { image: HeaderFields, data: Bytes }
 
-/// A member of no data whose headers say what `i` holds.
-fn bare(i: Image) -> Laid = { image: i, data: b"" }
+/// A member with no data whose headers say what `i` contains.
+fn empty_member(i: HeaderFields) -> RawMember = { image: i, data: b"" }
 
-/// An archive of `members`, each as its image says, whatever a writer would say.
-fn laid(members: List<Laid>) -> Bytes = {
+/// An archive of `members`, each laid out as its image says, whatever a writer would write.
+fn raw_archive(members: List<RawMember>) -> Bytes = {
   let put = members.fold(
     { body: [], directory: [], at: 0 },
-    |so_far: { body: List<Bytes>, directory: List<Bytes>, at: Int }, m: Laid| {
-      let own = local_header(m.image);
+    |so_far: { body: List<Bytes>, directory: List<Bytes>, at: Int }, m: RawMember| {
+      let is_local_header = local_header(m.image);
       {
-        body: so_far.body.push(own).push(m.data),
+        body: so_far.body.push(is_local_header).push(m.data),
         directory: so_far.directory.push(central_header(m.image, so_far.at)),
-        at: so_far.at + own.len() + m.data.len(),
+        at: so_far.at + is_local_header.len() + m.data.len(),
       }
     },
   );
@@ -1574,28 +1613,28 @@ fn laid(members: List<Laid>) -> Bytes = {
 }
 
 /// The archive of `entries`, stored, as a writer that never flags a name writes it.
-fn unmarked(entries: List<Entry>) -> Bytes =
-  laid(
-    entries.map(|e: Entry| -> Laid {
-      { image: { ..image(e, false, e.data.len()), flags: 0 }, data: e.data }
+fn unflagged_archive(entries: List<Entry>) -> Bytes =
+  raw_archive(
+    entries.map(|e: Entry| -> RawMember {
+      { image: { ..header_fields(e, false, e.data.len()), flags: 0 }, data: e.data }
     }),
   )
 
 test "an archive of one file is its header, its data, the directory's header and an end record" {
   let archive = write([file("hello.txt", b"hi\n")]);
   assert_eq(archive.len(), 119);
-  // What both headers say alike: no flags, stored, as 1980 began, a checksum and two sizes.
-  let said = b"\x00\x00\x00\x00\x00\x00\x21\x00\x7a\x7a\x6f\xed\x03\x00\x00\x00\x03\x00\x00\x00";
+  // What both headers share: no flags, stored, the start of 1980, a checksum and two sizes.
+  let zip64 = b"\x00\x00\x00\x00\x00\x00\x21\x00\x7a\x7a\x6f\xed\x03\x00\x00\x00\x03\x00\x00\x00";
   assert_eq(
     archive.slice(0, 30),
-    Bytes::concat_all([b"PK\x03\x04\x0a\x00", said, b"\x09\x00\x00\x00"]),
+    Bytes::concat_all([b"PK\x03\x04\x0a\x00", zip64, b"\x09\x00\x00\x00"]),
   );
   assert_eq(archive.slice(30, 42), b"hello.txthi\n");
   assert_eq(
     archive.slice(42, 88),
     Bytes::concat_all([
       b"PK\x01\x02\x0a\x03\x0a\x00",
-      said,
+      zip64,
       b"\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xa4\x81\x00\x00\x00\x00",
     ]),
   );
@@ -1604,12 +1643,12 @@ test "an archive of one file is its header, its data, the directory's header and
     archive.slice(97, 119),
     b"PK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x37\x00\x00\x00\x2a\x00\x00\x00\x00\x00",
   );
-  assert_eq(read(archive, roomy()), [file("hello.txt", b"hi\n")]);
+  assert_eq(read(archive, large_limits()), [file("hello.txt", b"hi\n")]);
   assert_eq(write([]), b"PK\x05\x06".concat(b"\x00".repeat(18)));
-  assert_eq(read(write([]), roomy()), [])
+  assert_eq(read(write([]), large_limits()), [])
 }
 
-test "the makers write a Unix's modes, no instant, and the first wall clock a header holds" {
+test "the constructors write Unix modes, no instant, and the earliest wall clock a header can store" {
   let made = file("a", b"x");
   assert_eq(made.header, {
     path: "a",
@@ -1637,46 +1676,45 @@ test "the makers write a Unix's modes, no instant, and the first wall clock a he
 test "a file is deflated where that is smaller, and stored where it is not" {
   let lines = b"the same line, again and again\n".repeat(40);
   let archive = write([file("lines", lines), file("word", b"abc"), file("none", b"")]);
-  assert_eq(members(archive, roomy()).map(|m: Member| (m.method, m.stored, m.size, m.data)), [
-    (Deflated, 39, 1240, 35),
-    (Stored, 3, 3, 108),
-    (Stored, 0, 0, 145),
-  ]);
-  assert_eq(read(archive, roomy()).map(|e: Entry| e.data), [lines, b"abc", b""])
+  assert_eq(
+    members(archive, large_limits()).map(|m: Member| (m.method, m.stored, m.size, m.data)),
+    [(Deflated, 39, 1240, 35), (Stored, 3, 3, 108), (Stored, 0, 0, 145)],
+  );
+  assert_eq(read(archive, large_limits()).map(|e: Entry| e.data), [lines, b"abc", b""])
 }
 
 test "a header's date and time are a wall clock from 1980 to 2107, to two seconds" {
-  assert_eq(clock(0x5822, 0x5883), date::date_time(2024, 1, 2, 11, 4, 6));
-  assert_eq(clock(0x0021, 0), date::date_time(1980, 1, 1, 0, 0, 0));
-  assert_eq(clock(0xFF9F, 0xBF7D), date::date_time(2107, 12, 31, 23, 59, 58));
+  assert_eq(from_dos_time(0x5822, 0x5883), date::date_time(2024, 1, 2, 11, 4, 6));
+  assert_eq(from_dos_time(0x0021, 0), date::date_time(1980, 1, 1, 0, 0, 0));
+  assert_eq(from_dos_time(0xFF9F, 0xBF7D), date::date_time(2107, 12, 31, 23, 59, 58));
   assert_eq(
     [(0, 0), (0x0020, 0), (0x0001, 0), (0x01A1, 0), (0x0021, 0xC000), (0x0021, 0x07C0)].map(
-      |f: (Int, Int)| clock(f._0, f._1),
+      |f: (Int, Int)| from_dos_time(f._0, f._1),
     ),
     [None, None, None, None, None, None],
   );
-  assert_eq(clock(0x0021, 0x001E), None);
-  assert_eq(clock(0x005D, 0), date::date_time(1980, 2, 29, 0, 0, 0));
-  assert_eq(clock(0x025D, 0), None);
-  assert_eq(date::date_time(2024, 1, 2, 11, 4, 6).map(clock_fields), Some(Some(0x5822_5883)));
+  assert_eq(from_dos_time(0x0021, 0x001E), None);
+  assert_eq(from_dos_time(0x005D, 0), date::date_time(1980, 2, 29, 0, 0, 0));
+  assert_eq(from_dos_time(0x025D, 0), None);
+  assert_eq(date::date_time(2024, 1, 2, 11, 4, 6).map(to_dos_time), Some(Some(0x5822_5883)));
   assert_eq(
     [
       date::date_time(1979, 12, 31, 23, 59, 58),
       date::date_time(2108, 1, 1, 0, 0, 0),
       date::date_time(2024, 1, 2, 11, 4, 5),
     ].map(|at: Option<DateTime>|
-      match at { Some(clocked) -> clock_fields(clocked), None -> Some(-1) }),
+      match at { Some(clocked) -> to_dos_time(clocked), None -> Some(-1) }),
     [None, None, None],
   );
-  assert_eq(clock_fields(DateTime(Date(19724), Time(1))), None);
+  assert_eq(to_dos_time(DateTime(Date(19724), Time(1))), None);
   // No date at all is written as zeros, and read back as none.
   let undated = file("a", b"");
   let unset = { ..undated, header: { ..undated.header, modified: None } };
   assert_eq(write([unset]).slice(10, 14), b"\x00\x00\x00\x00");
-  assert_eq(read(write([unset]), roomy()), [unset])
+  assert_eq(read(write([unset]), large_limits()), [unset])
 }
 
-test "a name that is no UTF-8 is code page 437, a flagged one UTF-8, a Unicode path field its own" {
+test "a name that is not UTF-8 is code page 437, a flagged one is UTF-8, and a Unicode path field gives its own" {
   assert_eq(
     of_cp437(Bytes::concat_all(range(128, 256).map(|byte: Int| byte_of_int(byte)))),
     "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒ"
@@ -1685,13 +1723,17 @@ test "a name that is no UTF-8 is code page 437, a flagged one UTF-8, a Unicode p
       ++ "αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}",
   );
   assert_eq(of_cp437(b"plain\x00\x1f\x7f"), "plain\0\u{1f}\u{7f}");
-  let plainly = image(file("caf_.txt", b""), false, 0);
-  let paths = |i: Image| read(alone(i, i, b"", b""), roomy()).map(|e: Entry| e.header.path);
+  let plainly = header_fields(file("caf_.txt", b""), false, 0);
+  let paths = |i: HeaderFields|
+    read(one_member_archive(i, i, b"", b""), large_limits()).map(|e: Entry| e.header.path);
   assert_eq(paths({ ..plainly, name: b"caf\x82.txt" }), ["caf\u{e9}.txt"]);
   assert_eq(paths({ ..plainly, name: b"caf\xc3\xa9.txt", flags: 0x800 }), ["caf\u{e9}.txt"]);
   assert_eq(
-    refusal(alone({ ..plainly, name: b"caf\x82.txt", flags: 0x800 }, plainly, b"", b""), roomy()),
-    Some({ at: 38, why: NotUtf8 }),
+    read_error(
+      one_member_archive({ ..plainly, name: b"caf\x82.txt", flags: 0x800 }, plainly, b"", b""),
+      large_limits(),
+    ),
+    Some({ at: 38, reason: NotUtf8 }),
   );
   let unicode = |sum: Int, text: Bytes|
     { ..plainly, extra: field_bytes(0x7075, Bytes::concat_all([b"\x01", u32_le(sum), text])) };
@@ -1699,38 +1741,44 @@ test "a name that is no UTF-8 is code page 437, a flagged one UTF-8, a Unicode p
   assert_eq(paths(unicode(sum, b"caf\xc3\xa9.txt")), ["caf\u{e9}.txt"]);
   assert_eq(paths(unicode(sum + 1, b"caf\xc3\xa9.txt")), ["caf_.txt"]);
   assert_eq(
-    read(alone(unicode(sum, b"x"), plainly, b"", b""), roomy()).map(|e: Entry| e.header.extra),
+    read(one_member_archive(unicode(sum, b"x"), plainly, b"", b""), large_limits()).map(
+      |e: Entry| e.header.extra,
+    ),
     [[]],
   );
   assert_eq(
-    refusal(alone(unicode(sum, b"caf\x82.txt"), plainly, b"", b""), roomy()),
-    Some({ at: 38, why: NotUtf8 }),
+    read_error(one_member_archive(unicode(sum, b"caf\x82.txt"), plainly, b"", b""), large_limits()),
+    Some({ at: 38, reason: NotUtf8 }),
   );
   // A written name outside ASCII is flagged, and so is one whose comment is.
   let noted = file("a", b"");
-  let flags = |e: Entry| members(write([e]), roomy()).map(|m: Member| (m.flags, m.name));
+  let flags = |e: Entry| members(write([e]), large_limits()).map(|m: Member| (m.flags, m.name));
   assert_eq(flags(file("caf\u{e9}", b"")), [(0x800, b"caf\xc3\xa9")]);
   assert_eq(flags(noted), [(0, b"a")]);
   assert_eq(flags({ ..noted, header: { ..noted.header, comment: "\u{e9}" } }), [(0x800, b"a")])
 }
 
-test "a name no flag marks is read as UTF-8 where it is UTF-8, or as declared where a reader says" {
-  let plainly = image(file("a", b""), false, 0);
-  let told = |i: Image, names: Names|
-    read(laid([bare(i)]), roomy(), names).map(|e: Entry| (e.header.path, e.header.comment));
-  let both = |i: Image| (told(i, Utf8IfValid), told(i, Declared));
+test "a name with no flag is read as UTF-8 when it is valid UTF-8, or as declared when a reader requests it" {
+  let plainly = header_fields(file("a", b""), false, 0);
+  let told = |i: HeaderFields, names: NameEncoding|
+    read(raw_archive([empty_member(i)]), large_limits(), names).map(|e: Entry|
+      (e.header.path, e.header.comment));
+  let both = |i: HeaderFields| (told(i, Utf8IfValid), told(i, Declared));
   let accented = { ..plainly, name: b"caf\xc3\xa9-\xe6\xb0\xb4.txt", comment: b"na\xc3\xafve" };
   assert_eq(both(accented), (
     [("caf\u{e9}-\u{6c34}.txt", "na\u{ef}ve")],
     [("caf\u{251c}\u{2310}-\u{b5}\u{2591}\u{2524}.txt", "na\u{251c}\u{bb}ve")],
   ));
-  // The reading asked for by nothing is the first.
-  assert_eq(read(laid([bare(accented)]), roomy()).map(|e: Entry| e.header.path), [
-    "caf\u{e9}-\u{6c34}.txt",
-  ]);
-  assert_eq(members(laid([bare(accented)]), roomy()).map(|m: Member| (m.flags, m.name)), [
-    (0, b"caf\xc3\xa9-\xe6\xb0\xb4.txt"),
-  ]);
+  // The default reading is the first.
+  assert_eq(
+    read(raw_archive([empty_member(accented)]), large_limits()).map(|e: Entry| e.header.path),
+    ["caf\u{e9}-\u{6c34}.txt"],
+  );
+  assert_eq(
+    members(raw_archive([empty_member(accented)]), large_limits()).map(|m: Member|
+      (m.flags, m.name)),
+    [(0, b"caf\xc3\xa9-\xe6\xb0\xb4.txt")],
+  );
   // A name and its comment are each read by their own bytes.
   assert_eq(both({ ..plainly, name: b"caf\x82", comment: b"\xc3\xa9" }), (
     [("caf\u{e9}", "\u{e9}")],
@@ -1740,8 +1788,8 @@ test "a name no flag marks is read as UTF-8 where it is UTF-8, or as declared wh
     [("plain", "too")],
     [("plain", "too")],
   ));
-  // Bytes that spell `/` and `..` the long way, a surrogate, and a number past the last
-  // character are no UTF-8, so no reading finds a `/` in them.
+  // Overlong encodings of `/` and `..`, a surrogate, and a code point past the last are not
+  // valid UTF-8, so no reading finds a `/` in them.
   assert_eq(
     [b"a\xc0\xafb", b"\xc0\xae\xc0\xae", b"\xe0\x80\xaf", b"\xed\xa0\x80", b"\xf4\x90\x80\x80"].map(
       |name: Bytes| both({ ..plainly, name: name }),
@@ -1754,39 +1802,42 @@ test "a name no flag marks is read as UTF-8 where it is UTF-8, or as declared wh
       "\u{2320}\u{c9}\u{c7}\u{c7}",
     ].map(|path: String| ([(path, "")], [(path, "")])),
   );
-  // Two names are one name where they read alike, whatever their bytes.
-  let twice = laid([bare({ ..plainly, name: b"\xc3\xa9" }), bare({ ..plainly, name: b"\x82" })]);
-  assert_eq(refusal(twice, roomy()), Some({ at: 111, why: Duplicate }));
-  assert_eq(read(twice, roomy(), Declared).map(|e: Entry| e.header.path), [
+  // Two names are the same name when they read alike, whatever their bytes.
+  let twice = raw_archive([
+    empty_member({ ..plainly, name: b"\xc3\xa9" }),
+    empty_member({ ..plainly, name: b"\x82" }),
+  ]);
+  assert_eq(read_error(twice, large_limits()), Some({ at: 111, reason: Duplicate }));
+  assert_eq(read(twice, large_limits(), Declared).map(|e: Entry| e.header.path), [
     "\u{251c}\u{2310}",
     "\u{e9}",
   ]);
   // What this writes is flagged, and reads alike by either rule.
   let written = write([file("caf\u{e9}", b"")]);
-  assert_eq(read(written, roomy(), Declared), read(written, roomy(), Utf8IfValid))
+  assert_eq(read(written, large_limits(), Declared), read(written, large_limits(), Utf8IfValid))
 }
 
-test "a plan is made over names as they were read, which settles the letters it takes for one" {
-  // `É` and `é` are one letter in two cases, read as UTF-8; as code page 437 their bytes spell
+test "a plan is made over names as they were read, which decides which letters it treats as one" {
+  // `É` and `é` are one letter in two cases, read as UTF-8; as code page 437 their bytes read as
   // `├ë` and `├⌐`, which are not.
-  let through = unmarked([symlink("\u{c9}", "x"), file("\u{e9}/planted", b"")]);
+  let through = unflagged_archive([symlink("\u{c9}", "x"), file("\u{e9}/planted", b"")]);
   assert_eq(
-    plan(read(through, roomy())),
-    Err({ index: 1, path: "\u{e9}/planted", why: ThroughLink }),
+    plan(read(through, large_limits())),
+    Err({ index: 1, path: "\u{e9}/planted", reason: ThroughLink }),
   );
   assert_eq(
-    plan(read(through, roomy(), Declared)),
+    plan(read(through, large_limits(), Declared)),
     Ok([
       MakeSymlink("\u{251c}\u{eb}", "x"),
       MakeDirectory("\u{251c}\u{2310}", 493),
       WriteFile("\u{251c}\u{2310}/planted", 420, b""),
     ]),
   );
-  // And `À` and `Ç` are two letters, read as UTF-8; as code page 437 their bytes spell `├Ç`
+  // And `À` and `Ç` are two letters, read as UTF-8; as code page 437 their bytes read as `├Ç`
   // and `├ç`, which are one.
-  let apart = unmarked([symlink("\u{c0}", "x"), file("\u{c7}/planted", b"")]);
+  let apart = unflagged_archive([symlink("\u{c0}", "x"), file("\u{c7}/planted", b"")]);
   assert_eq(
-    plan(read(apart, roomy())),
+    plan(read(apart, large_limits())),
     Ok([
       MakeSymlink("\u{c0}", "x"),
       MakeDirectory("\u{c7}", 493),
@@ -1794,124 +1845,197 @@ test "a plan is made over names as they were read, which settles the letters it 
     ]),
   );
   assert_eq(
-    plan(read(apart, roomy(), Declared)),
-    Err({ index: 1, path: "\u{251c}\u{e7}/planted", why: ThroughLink }),
+    plan(read(apart, large_limits(), Declared)),
+    Err({ index: 1, path: "\u{251c}\u{e7}/planted", reason: ThroughLink }),
   )
 }
 
-test "a reader keeps to the entries, the sizes, the ratio and the lengths it was given" {
+test "a reader enforces the entry, size, ratio and length limits it was given" {
   let noted = file("two/long-name", b"123");
   let archive = write([
     file("one", b"12345"),
     { ..noted, header: { ..noted.header, comment: "noted" } },
     directory("d"),
   ]);
-  let tight = { ..roomy(), entries: 3, total: 8, size: 5, path: 13, comment: 5 };
-  assert_eq(refusal(archive, tight), None);
-  assert_eq(refusal(archive, { ..tight, entries: 2 }), Some({ at: 277, why: TooMany }));
-  assert_eq(refusal(archive, { ..tight, size: 4 }), Some({ at: 116, why: TooLarge }));
-  assert_eq(refusal(archive, { ..tight, total: 7 }), Some({ at: 165, why: TooMuch }));
-  assert_eq(refusal(archive, { ..tight, path: 12 }), Some({ at: 165, why: TooLong }));
-  assert_eq(refusal(archive, { ..tight, comment: 4 }), Some({ at: 165, why: TooLong }));
+  let tight = { ..large_limits(), entries: 3, total: 8, size: 5, path: 13, comment: 5 };
+  assert_eq(read_error(archive, tight), None);
+  assert_eq(read_error(archive, { ..tight, entries: 2 }), Some({ at: 277, reason: TooMany }));
+  assert_eq(read_error(archive, { ..tight, size: 4 }), Some({ at: 116, reason: TooLarge }));
+  assert_eq(read_error(archive, { ..tight, total: 7 }), Some({ at: 165, reason: TooMuch }));
+  assert_eq(read_error(archive, { ..tight, path: 12 }), Some({ at: 165, reason: TooLong }));
+  assert_eq(read_error(archive, { ..tight, comment: 4 }), Some({ at: 165, reason: TooLong }));
   let dense = write([file("r", b"the same line, again and again\n".repeat(40))]);
-  assert_eq(refusal(dense, { ..roomy(), ratio: 32 }), None);
-  assert_eq(refusal(dense, { ..roomy(), ratio: 31 }), Some({ at: 70, why: TooDense }));
-  assert_eq(refusal(dense, { ..roomy(), size: 1239 }), Some({ at: 70, why: TooLarge }));
-  // What a stored member holds is what it unpacks to, at any ratio.
-  assert_eq(refusal(archive, { ..tight, ratio: 1 }), None)
+  assert_eq(read_error(dense, { ..large_limits(), ratio: 32 }), None);
+  assert_eq(read_error(dense, { ..large_limits(), ratio: 31 }), Some({ at: 70, reason: TooDense }));
+  assert_eq(
+    read_error(dense, { ..large_limits(), size: 1239 }),
+    Some({ at: 70, reason: TooLarge }),
+  );
+  // A stored member unpacks to exactly what it contains, at any ratio.
+  assert_eq(read_error(archive, { ..tight, ratio: 1 }), None)
 }
 
-test "one end record closes an archive, with nothing after it and no second in its comment" {
+test "one end record ends an archive, with nothing after it and no second one in its comment" {
   let archive = pair();
   assert_eq(archive.len(), 180);
-  assert_eq(refusal(archive.concat(b"!"), roomy()), Some({ at: 181, why: NoEnd }));
-  assert_eq(refusal(archive.slice(0, 179), roomy()), Some({ at: 179, why: NoEnd }));
-  assert_eq(refusal(archive.slice(0, 100), roomy()), Some({ at: 100, why: NoEnd }));
-  assert_eq(refusal(b"", roomy()), Some({ at: 0, why: NoEnd }));
-  let commented = finish(add(begin(), file("a", b"x")), comment: b"a comment");
-  assert_eq(read(commented, roomy()).map(|e: Entry| e.header.path), ["a"]);
   assert_eq(
-    match try { locate(commented, commented.len(), roomy()) } {
+    read_error(archive.concat(b"!"), large_limits()),
+    Some({ at: 181, reason: NoEndRecord }),
+  );
+  assert_eq(
+    read_error(archive.slice(0, 179), large_limits()),
+    Some({ at: 179, reason: NoEndRecord }),
+  );
+  assert_eq(
+    read_error(archive.slice(0, 100), large_limits()),
+    Some({ at: 100, reason: NoEndRecord }),
+  );
+  assert_eq(read_error(b"", large_limits()), Some({ at: 0, reason: NoEndRecord }));
+  let commented = finish(add(begin(), file("a", b"x")), comment: b"a comment");
+  assert_eq(read(commented, large_limits()).map(|e: Entry| e.header.path), ["a"]);
+  assert_eq(
+    match try { locate(commented, commented.len(), large_limits()) } {
       Ok(Found(d)) -> d.comment,
       _ -> b"",
     },
     b"a comment",
   );
-  assert_eq(refusal(commented, { ..roomy(), comment: 9 }), None);
-  assert_eq(refusal(commented, { ..roomy(), comment: 8 }), Some({ at: 110, why: NoEnd }));
+  assert_eq(read_error(commented, { ..large_limits(), comment: 9 }), None);
+  assert_eq(
+    read_error(commented, { ..large_limits(), comment: 8 }),
+    Some({ at: 110, reason: NoEndRecord }),
+  );
   // A record in the comment that reaches the last byte too, and one that stops short of it.
   let fake = b"PK\x05\x06".concat(b"\x00".repeat(18));
   let doubled = patched(archive, 178, b"\x16").concat(fake);
-  assert_eq(refusal(doubled, roomy()), Some({ at: 158, why: ManyEnds }));
+  assert_eq(read_error(doubled, large_limits()), Some({ at: 158, reason: ManyEndRecords }));
   let short = Bytes::concat_all([patched(archive, 178, b"\x17"), fake, b"!"]);
-  assert_eq(refusal(short, roomy()), Some({ at: 158, why: ManyEnds }));
+  assert_eq(read_error(short, large_limits()), Some({ at: 158, reason: ManyEndRecords }));
   // A signature with no room for a record after it is a comment like any other.
-  assert_eq(refusal(patched(archive, 178, b"\x04").concat(b"PK\x05\x06"), roomy()), None);
-  // A writer hands back nothing a reader would refuse so.
-  let closing = |comment: Bytes| try { finish(add(begin(), file("a", b"x")), comment: comment) };
-  assert_eq(closing(fake), Err({ index: 1, why: ManyEnds }));
-  assert_eq(closing(b"c".repeat(65536)), Err({ index: 1, why: TooLong }));
-  assert_eq(closing(b"c".repeat(65535)).ok().map(|whole: Bytes| whole.len()), Some(65636));
-  // Nor an archive whose last member holds a record that reaches the last byte: its comment
+  assert_eq(read_error(patched(archive, 178, b"\x04").concat(b"PK\x05\x06"), large_limits()), None);
+  // A writer returns nothing a reader would reject this way.
+  let descriptor_length = |comment: Bytes|
+    try { finish(add(begin(), file("a", b"x")), comment: comment) };
+  assert_eq(descriptor_length(fake), Err({ index: 1, reason: ManyEndRecords }));
+  assert_eq(descriptor_length(b"c".repeat(65536)), Err({ index: 1, reason: TooLong }));
+  assert_eq(
+    descriptor_length(b"c".repeat(65535)).ok().map(|whole: Bytes| whole.len()),
+    Some(65636),
+  );
+  // Nor an archive whose last member contains a record that reaches the last byte: its comment
   // would be the 69 bytes that follow it here.
   let planted = |reach: Bytes|
     file("p", Bytes::concat_all([b"PK\x05\x06", b"0123456789abcdef", reach]));
-  assert_eq(encode([planted(b"\x45\x00")]), Err({ index: 1, why: ManyEnds }));
+  assert_eq(encode([planted(b"\x45\x00")]), Err({ index: 1, reason: ManyEndRecords }));
   let near = write([planted(b"\x44\x00")]);
-  assert_eq(read(near, roomy()), [planted(b"\x44\x00")]);
-  assert_eq(refusal(patched(near, 51, b"\x45"), roomy()), Some({ at: 31, why: ManyEnds }));
+  assert_eq(read(near, large_limits()), [planted(b"\x44\x00")]);
+  assert_eq(
+    read_error(patched(near, 51, b"\x45"), large_limits()),
+    Some({ at: 31, reason: ManyEndRecords }),
+  );
   // Nor one whose last member's comment ends where a zip64 locator would stand.
   let noted = file("a", b"x");
   let locator = String::of_bytes(b"PK\x06\x07".concat(b"\x00".repeat(16)));
   let pointing = [{ ..noted, header: { ..noted.header, comment: locator } }];
-  assert_eq(encode(pointing), Err({ index: 1, why: ManyEnds }));
+  assert_eq(encode(pointing), Err({ index: 1, reason: ManyEndRecords }));
   assert_eq(encode(pointing.concat([file("b", b"")])).is_ok(), true)
 }
 
 test "a directory is the headers its end record counts, where it says they are" {
   let archive = pair();
   let counted = |count: Bytes| patched(patched(archive, 166, count), 168, count);
-  assert_eq(refusal(counted(b"\x01"), roomy()), Some({ at: 111, why: BadDirectory }));
-  assert_eq(refusal(counted(b"\x03"), roomy()), Some({ at: 158, why: BadDirectory }));
-  assert_eq(refusal(patched(archive, 166, b"\x01"), roomy()), Some({ at: 158, why: Split }));
-  assert_eq(refusal(patched(archive, 162, b"\x01"), roomy()), Some({ at: 158, why: Split }));
-  assert_eq(refusal(patched(archive, 174, b"\x41"), roomy()), Some({ at: 158, why: BadDirectory }));
-  assert_eq(refusal(patched(archive, 170, b"\x5d"), roomy()), Some({ at: 158, why: BadDirectory }));
-  assert_eq(refusal(patched(archive, 64, b"XK"), roomy()), Some({ at: 64, why: BadDirectory }));
-  assert_eq(refusal(patched(archive, 139, b"\x09"), roomy()), Some({ at: 111, why: Truncated }));
-  assert_eq(refusal(counted(b"\xff\xff"), roomy()), Some({ at: 158, why: BadZip64 }));
+  assert_eq(read_error(counted(b"\x01"), large_limits()), Some({ at: 111, reason: BadDirectory }));
+  assert_eq(read_error(counted(b"\x03"), large_limits()), Some({ at: 158, reason: BadDirectory }));
   assert_eq(
-    refusal(patched(archive, 84, b"\xff\xff\xff\xff"), roomy()),
-    Some({ at: 64, why: BadZip64 }),
+    read_error(patched(archive, 166, b"\x01"), large_limits()),
+    Some({ at: 158, reason: Split }),
+  );
+  assert_eq(
+    read_error(patched(archive, 162, b"\x01"), large_limits()),
+    Some({ at: 158, reason: Split }),
+  );
+  assert_eq(
+    read_error(patched(archive, 174, b"\x41"), large_limits()),
+    Some({ at: 158, reason: BadDirectory }),
+  );
+  assert_eq(
+    read_error(patched(archive, 170, b"\x5d"), large_limits()),
+    Some({ at: 158, reason: BadDirectory }),
+  );
+  assert_eq(
+    read_error(patched(archive, 64, b"XK"), large_limits()),
+    Some({ at: 64, reason: BadDirectory }),
+  );
+  assert_eq(
+    read_error(patched(archive, 139, b"\x09"), large_limits()),
+    Some({ at: 111, reason: Truncated }),
+  );
+  assert_eq(read_error(counted(b"\xff\xff"), large_limits()), Some({ at: 158, reason: BadZip64 }));
+  assert_eq(
+    read_error(patched(archive, 84, b"\xff\xff\xff\xff"), large_limits()),
+    Some({ at: 64, reason: BadZip64 }),
   );
   // Bytes put before an archive move everything its end record points at.
-  assert_eq(refusal(b"stub".concat(archive), roomy()), Some({ at: 162, why: BadDirectory }))
+  assert_eq(
+    read_error(b"stub".concat(archive), large_limits()),
+    Some({ at: 162, reason: BadDirectory }),
+  )
 }
 
 test "two members share no name and no byte, and none is of a kind this does not read" {
   let archive = pair();
-  assert_eq(refusal(patched(archive, 157, b"a"), roomy()), Some({ at: 111, why: Duplicate }));
-  assert_eq(refusal(patched(archive, 153, b"\x00"), roomy()), Some({ at: 111, why: Overlaps }));
   assert_eq(
-    refusal(patched(patched(archive, 84, b"\x28"), 88, b"\x28"), roomy()),
-    Some({ at: 0, why: Overlaps }),
+    read_error(patched(archive, 157, b"a"), large_limits()),
+    Some({ at: 111, reason: Duplicate }),
   );
-  assert_eq(refusal(patched(archive, 153, b"\x21"), roomy()), Some({ at: 33, why: Overlaps }));
-  assert_eq(refusal(patched(archive, 153, b"\x41"), roomy()), Some({ at: 111, why: Overlaps }));
-  assert_eq(refusal(patched(archive, 26, b"\x02"), roomy()), Some({ at: 0, why: Overlaps }));
-  assert_eq(refusal(patched(archive, 74, b"\x0c"), roomy()), Some({ at: 64, why: Method(12) }));
-  assert_eq(refusal(patched(archive, 74, b"\x09"), roomy()), Some({ at: 64, why: Method(9) }));
+  assert_eq(
+    read_error(patched(archive, 153, b"\x00"), large_limits()),
+    Some({ at: 111, reason: Overlaps }),
+  );
+  assert_eq(
+    read_error(patched(patched(archive, 84, b"\x28"), 88, b"\x28"), large_limits()),
+    Some({ at: 0, reason: Overlaps }),
+  );
+  assert_eq(
+    read_error(patched(archive, 153, b"\x21"), large_limits()),
+    Some({ at: 33, reason: Overlaps }),
+  );
+  assert_eq(
+    read_error(patched(archive, 153, b"\x41"), large_limits()),
+    Some({ at: 111, reason: Overlaps }),
+  );
+  assert_eq(
+    read_error(patched(archive, 26, b"\x02"), large_limits()),
+    Some({ at: 0, reason: Overlaps }),
+  );
+  assert_eq(
+    read_error(patched(archive, 74, b"\x0c"), large_limits()),
+    Some({ at: 64, reason: Method(12) }),
+  );
+  assert_eq(
+    read_error(patched(archive, 74, b"\x09"), large_limits()),
+    Some({ at: 64, reason: Method(9) }),
+  );
   assert_eq(
     [b"\x01\x00", b"\x40\x00", b"\x00\x20"].map(|flags: Bytes|
-      refusal(patched(archive, 72, flags), roomy())),
-    range(0, 3).map(|_: Int| Some({ at: 64, why: Encrypted })),
+      read_error(patched(archive, 72, flags), large_limits())),
+    range(0, 3).map(|_: Int| Some({ at: 64, reason: Encrypted })),
   );
-  assert_eq(refusal(patched(archive, 88, b"\x02"), roomy()), Some({ at: 64, why: BadNumber }));
-  assert_eq(refusal(patched(archive, 98, b"\x01"), roomy()), Some({ at: 64, why: Split }));
-  assert_eq(refusal(patched(archive, 94, b"\x03"), roomy()), Some({ at: 64, why: BadExtra }))
+  assert_eq(
+    read_error(patched(archive, 88, b"\x02"), large_limits()),
+    Some({ at: 64, reason: BadNumber }),
+  );
+  assert_eq(
+    read_error(patched(archive, 98, b"\x01"), large_limits()),
+    Some({ at: 64, reason: Split }),
+  );
+  assert_eq(
+    read_error(patched(archive, 94, b"\x03"), large_limits()),
+    Some({ at: 64, reason: BadExtra }),
+  )
 }
 
-test "a member's own header says what the directory says of it" {
+test "a member's own header agrees with what the directory records for it" {
   let archive = pair();
   assert_eq(
     [
@@ -1923,59 +2047,77 @@ test "a member's own header says what the directory says of it" {
       patched(archive, 22, b"\x00"),
       patched(archive, 0, b"PK\x01\x02"),
       patched(archive, 32, b"PK\x07\x08"),
-    ].map(|changed: Bytes| refusal(changed, roomy())),
-    List::concat(range(0, 7).map(|_: Int| Some({ at: 0, why: Disagrees })), [
-      Some({ at: 32, why: Disagrees }),
+    ].map(|changed: Bytes| read_error(changed, large_limits())),
+    List::concat(range(0, 7).map(|_: Int| Some({ at: 0, reason: Disagrees })), [
+      Some({ at: 32, reason: Disagrees }),
     ]),
   );
-  assert_eq(refusal(patched(archive, 31, b"z"), roomy()), Some({ at: 31, why: BadChecksum }));
-  // Its date and time, and what it needs to be read, are its own to say.
-  assert_eq(refusal(patched(archive, 4, b"\x2d\x00"), roomy()), None);
-  assert_eq(refusal(patched(archive, 10, b"\x83\x58\x22\x58"), roomy()), None);
+  assert_eq(
+    read_error(patched(archive, 31, b"z"), large_limits()),
+    Some({ at: 31, reason: BadChecksum }),
+  );
+  // Its date and time, and the version needed to read it, need not match the directory's.
+  assert_eq(read_error(patched(archive, 4, b"\x2d\x00"), large_limits()), None);
+  assert_eq(read_error(patched(archive, 10, b"\x83\x58\x22\x58"), large_limits()), None);
   let deflated = write([file("r", b"abcabcabc".repeat(20))]);
-  assert_eq(refusal(patched(deflated, 33, b"\xff"), roomy()), Some({ at: 31, why: BadData }));
+  assert_eq(
+    read_error(patched(deflated, 33, b"\xff"), large_limits()),
+    Some({ at: 31, reason: BadData }),
+  );
   // Both of its headers saying a byte more than it inflates to.
   assert_eq(
-    refusal(
+    read_error(
       patched(patched(deflated, deflated.len() - 22 - 47 + 24, b"\xb5"), 22, b"\xb5"),
-      roomy(),
+      large_limits(),
     ),
-    Some({ at: 31, why: BadData }),
+    Some({ at: 31, reason: BadData }),
   )
 }
 
-test "a data descriptor is read in each of its forms, and is what the directory says" {
-  let listed = { ..image(file("a", b"x"), false, 1), flags: 8 };
-  let own = { ..listed, crc: 0, stored: 0, size: 0 };
+test "a data descriptor is read in each of its forms, and must match the directory" {
+  let listed = { ..header_fields(file("a", b"x"), false, 1), flags: 8 };
+  let is_local_header = { ..listed, crc: 0, stored: 0, size: 0 };
   let sum = u32_le(listed.crc);
   let short = Bytes::concat_all([sum, u32_le(1), u32_le(1)]);
   let long = Bytes::concat_all([sum, u64_le(1), u64_le(1)]);
-  let reads = |after: Bytes| decode(alone(listed, own, b"x", after), roomy());
+  let reads = |after: Bytes|
+    decode(one_member_archive(listed, is_local_header, b"x", after), large_limits());
   assert_eq(
     [short, long, b"PK\x07\x08".concat(short), b"PK\x07\x08".concat(long)].map(reads),
     range(0, 4).map(|_: Int| Ok([file("a", b"x")])),
   );
   // A header may say what its descriptor will, or leave it all to the descriptor.
-  assert_eq(decode(alone(listed, listed, b"x", short), roomy()), Ok([file("a", b"x")]));
-  assert_eq(reads(b"").err(), Some({ at: 32, why: Disagrees }));
-  assert_eq(reads(patched(short, 0, b"\x00")).err(), Some({ at: 32, why: Disagrees }));
-  assert_eq(reads(patched(short, 4, b"\x02")).err(), Some({ at: 32, why: Disagrees }));
-  assert_eq(reads(short.slice(0, 11)).err(), Some({ at: 32, why: Disagrees }));
   assert_eq(
-    decode(alone(listed, { ..own, size: 2 }, b"x", short), roomy()).err(),
-    Some({ at: 0, why: Disagrees }),
+    decode(one_member_archive(listed, listed, b"x", short), large_limits()),
+    Ok([file("a", b"x")]),
   );
-  // What follows a descriptor is no member's.
-  assert_eq(reads(short.concat(b"!")).err(), Some({ at: 44, why: Unclaimed }));
+  assert_eq(reads(b"").err(), Some({ at: 32, reason: Disagrees }));
+  assert_eq(reads(patched(short, 0, b"\x00")).err(), Some({ at: 32, reason: Disagrees }));
+  assert_eq(reads(patched(short, 4, b"\x02")).err(), Some({ at: 32, reason: Disagrees }));
+  assert_eq(reads(short.slice(0, 11)).err(), Some({ at: 32, reason: Disagrees }));
   assert_eq(
-    decode(alone(listed, own, b"x", short.concat(b"!")), { ..roomy(), slack: 1 }).is_ok(),
+    decode(
+      one_member_archive(listed, { ..is_local_header, size: 2 }, b"x", short),
+      large_limits(),
+    ).err(
+    ),
+    Some({ at: 0, reason: Disagrees }),
+  );
+  // What follows a descriptor belongs to no member.
+  assert_eq(reads(short.concat(b"!")).err(), Some({ at: 44, reason: Unclaimed }));
+  assert_eq(
+    decode(one_member_archive(listed, is_local_header, b"x", short.concat(b"!")), {
+      ..large_limits(),
+      slack: 1,
+    }).is_ok(
+    ),
     true,
   );
   // Without the flag a descriptor is bytes no member claims.
-  let unflagged = image(file("a", b"x"), false, 1);
+  let unflagged = header_fields(file("a", b"x"), false, 1);
   assert_eq(
-    decode(alone(unflagged, unflagged, b"x", short), roomy()).err(),
-    Some({ at: 32, why: Unclaimed }),
+    decode(one_member_archive(unflagged, unflagged, b"x", short), large_limits()).err(),
+    Some({ at: 32, reason: Unclaimed }),
   )
 }
 
@@ -1983,67 +2125,78 @@ test "an archive is its members end to end, but for the slack a reader gives it"
   let entries = [file("a", b"x"), file("b", b"y")];
   let behind = finish(entries.fold({ ..begin(), at: 4 }, add));
   let stubbed = b"stub".concat(behind);
-  assert_eq(refusal(stubbed, roomy()), Some({ at: 0, why: Unclaimed }));
-  assert_eq(refusal(stubbed, { ..roomy(), slack: 3 }), Some({ at: 0, why: Unclaimed }));
-  assert_eq(decode(stubbed, { ..roomy(), slack: 4 }), Ok(entries));
+  assert_eq(read_error(stubbed, large_limits()), Some({ at: 0, reason: Unclaimed }));
+  assert_eq(
+    read_error(stubbed, { ..large_limits(), slack: 3 }),
+    Some({ at: 0, reason: Unclaimed }),
+  );
+  assert_eq(decode(stubbed, { ..large_limits(), slack: 4 }), Ok(entries));
   let first = add(begin(), file("a", b"x"));
   let gapped = finish(
     add({ ..first, pending: first.pending.push(b"gap"), at: first.at + 3 }, file("b", b"y")),
   );
-  assert_eq(refusal(gapped, roomy()), Some({ at: 32, why: Unclaimed }));
-  assert_eq(decode(gapped, { ..roomy(), slack: 3 }), Ok(entries));
+  assert_eq(read_error(gapped, large_limits()), Some({ at: 32, reason: Unclaimed }));
+  assert_eq(decode(gapped, { ..large_limits(), slack: 3 }), Ok(entries));
   let last = add(first, file("b", b"y"));
   let blocked = finish({
     ..last,
     pending: last.pending.push(b"a signing block"),
     at: last.at + 15,
   });
-  assert_eq(refusal(blocked, roomy()), Some({ at: 64, why: Unclaimed }));
-  assert_eq(decode(blocked, { ..roomy(), slack: 15 }), Ok(entries));
+  assert_eq(read_error(blocked, large_limits()), Some({ at: 64, reason: Unclaimed }));
+  assert_eq(decode(blocked, { ..large_limits(), slack: 15 }), Ok(entries));
   // An archive of nothing but a stub.
   assert_eq(
-    refusal(b"stub".concat(finish({ ..begin(), at: 4 })), roomy()),
-    Some({ at: 0, why: Unclaimed }),
+    read_error(b"stub".concat(finish({ ..begin(), at: 4 })), large_limits()),
+    Some({ at: 0, reason: Unclaimed }),
   )
 }
 
-test "an archive is read a step at a time from the bytes each step asks for" {
+test "an archive is read a step at a time from the bytes each step requests" {
   let archive = write([file("first", b"0123456789"), file("second", b"abc")]);
   let length = archive.len();
-  let tight = { ..roomy(), comment: 0 };
-  assert_eq(locate(b"", length, tight), More(42));
-  assert_eq(locate(archive.slice(length - 41, length), length, tight), More(42));
-  assert_eq(locate(b"", length, roomy()), More(length));
+  let tight = { ..large_limits(), comment: 0 };
+  assert_eq(locate(b"", length, tight), NeedMore(42));
+  assert_eq(locate(archive.slice(length - 41, length), length, tight), NeedMore(42));
+  assert_eq(locate(b"", length, large_limits()), NeedMore(length));
   let d = match locate(archive.slice(length - 42, length), length, tight) {
     Found(directory) -> directory,
-    More(_) -> panic("an end record and a locator are forty-two bytes"),
+    NeedMore(_) -> panic("an end record and a locator are forty-two bytes"),
   };
   assert_eq(d, { at: 84, size: 103, entries: 2, comment: b"" });
   let listed = listing(archive.slice(84, 187), d, tight);
-  assert_eq(listed.map(|l: Listed| (l.header.path, l.at, l.until, l.stored, l.size, l.method)), [
-    ("first", 0, 45, 10, 10, Stored),
-    ("second", 45, 84, 3, 3, Stored),
-  ]);
+  assert_eq(
+    listed.map(|l: DirectoryEntry| (l.header.path, l.at, l.until, l.stored, l.size, l.method)),
+    [("first", 0, 45, 10, 10, Stored), ("second", 45, 84, 3, 3, Stored)],
+  );
   assert_eq(
     Result::err(try { listing(archive.slice(84, 186), d, tight) }),
-    Some({ at: 84, why: Truncated }),
+    Some({ at: 84, reason: Truncated }),
   );
-  let second = match listed { [_, l] -> l, _ -> panic("two members are listed") };
-  let seen = |n: Int| open(second, archive.slice(45, 45 + n), tight);
-  assert_eq((seen(0), seen(29), seen(30), seen(35)), (More(30), More(30), More(36), More(36)));
-  let m = match seen(36) { Found(member) -> member, More(_) -> panic("a header is a member") };
+  let second_entry_error = match listed { [_, l] -> l, _ -> panic("two members are listed") };
+  let seen = |n: Int| open(second_entry_error, archive.slice(45, 45 + n), tight);
+  assert_eq((seen(0), seen(29), seen(30), seen(35)), (
+    NeedMore(30),
+    NeedMore(30),
+    NeedMore(36),
+    NeedMore(36),
+  ));
+  let m = match seen(36) { Found(member) -> member, NeedMore(_) -> panic("a header is a member") };
   assert_eq((m.data, m.stored, m.size, m.header.path), (81, 3, 3, "second"));
   assert_eq(seen(39), Found(m));
   assert_eq(unpack(m, archive.slice(81, 84)), b"abc");
-  assert_eq(Result::err(try { unpack(m, archive.slice(81, 83)) }), Some({ at: 81, why: Truncated }))
+  assert_eq(
+    Result::err(try { unpack(m, archive.slice(81, 83)) }),
+    Some({ at: 81, reason: Truncated }),
+  )
 }
 
-test "a number past a header's field is written in a zip64 field, and no other is" {
-  let small = image(file("a", b""), false, 0);
+test "a number that overflows a header's field is written in a zip64 field, and no other is" {
+  let small = header_fields(file("a", b""), false, 0);
   let far = 5000000000;
-  let widths = |i: Image, at: Int| {
-    let said = central_header(i, at);
-    (said.len() - 47, said.slice(20, 28), said.slice(42, 46), u16(said, 6))
+  let widths = |i: HeaderFields, at: Int| {
+    let zip64 = central_header(i, at);
+    (zip64.len() - 47, zip64.slice(20, 28), zip64.slice(42, 46), u16(zip64, 6))
   };
   let ones = b"\xff\xff\xff\xff";
   assert_eq(widths(small, 7), (0, b"\x00".repeat(8), b"\x07\x00\x00\x00", 10));
@@ -2057,69 +2210,76 @@ test "a number past a header's field is written in a zip64 field, and no other i
   ));
   assert_eq(widths({ ..small, size: far, stored: far }, far), (28, ones.concat(ones), ones, 45));
   assert_eq(
-    central(central_header({ ..small, size: far, stored: far + 1 }, far + 2), 0, 0).wide,
+    read_central_header(
+      central_header({ ..small, size: far, stored: far + 1 }, far + 2),
+      0,
+      0,
+    ).wide,
     { size: far, stored: far + 1, at: far + 2, disk: 0 },
   );
-  assert_eq(central(central_header({ ..small, stored: far }, 3), 0, 0).wide, {
+  assert_eq(read_central_header(central_header({ ..small, stored: far }, 3), 0, 0).wide, {
     size: 0,
     stored: far,
     at: 3,
     disk: 0,
   });
-  // A member's own header holds both sizes where either passes its field.
-  let own = local_header({ ..small, stored: far });
-  assert_eq(own.len(), 31 + 20);
-  assert_eq((u16(own, 4), own.slice(18, 26)), (45, ones.concat(ones)));
+  // A member's own header stores both sizes in zip64 if either overflows its field.
+  let is_local_header = local_header({ ..small, stored: far });
+  assert_eq(is_local_header.len(), 31 + 20);
+  assert_eq((u16(is_local_header, 4), is_local_header.slice(18, 26)), (45, ones.concat(ones)));
   assert_eq(
-    widened(
+    with_zip64(
       0,
-      fields(own.slice(31, 51)).found,
-      { size: marker(), stored: marker(), at: 0, disk: 0 },
+      fields(is_local_header.slice(31, 51)).found,
+      { size: zip64_marker(), stored: zip64_marker(), at: 0, disk: 0 },
       true,
     ),
     { size: 0, stored: far, at: 0, disk: 0 },
   );
   // A size past an `Int`, and a field too short for what its header marks.
   let field_of = |data: Bytes| fields(field_bytes(1, data)).found;
-  let marked = { size: marker(), stored: 1, at: marker(), disk: 0 };
+  let marked = { size: zip64_marker(), stored: 1, at: zip64_marker(), disk: 0 };
   assert_eq(
-    try { widened(9, field_of(u64_le(1).concat(b"\xff".repeat(8))), marked, false) },
-    Err({ at: 9, why: BadNumber }),
+    try { with_zip64(9, field_of(u64_le(1).concat(b"\xff".repeat(8))), marked, false) },
+    Err({ at: 9, reason: BadNumber }),
   );
   assert_eq(
-    try { widened(9, field_of(u64_le(1).concat(b"\x00".repeat(7))), marked, false) },
-    Err({ at: 9, why: BadZip64 }),
+    try { with_zip64(9, field_of(u64_le(1).concat(b"\x00".repeat(7))), marked, false) },
+    Err({ at: 9, reason: BadZip64 }),
   );
   assert_eq(
-    try { widened(9, field_of(u64_le(1).concat(u64_le(2))), marked, false) },
+    try { with_zip64(9, field_of(u64_le(1).concat(u64_le(2))), marked, false) },
     Ok({ size: 1, stored: 1, at: 2, disk: 0 }),
   )
 }
 
-test "an end record marks what its zip64 record holds, and the two say one thing" {
+test "an end record marks what its zip64 record contains, and the two agree" {
   let far = 5000000000;
   let end = end_records(70000, 3220000, far, b"zip64");
   let length = far + 3220000 + end.len();
-  let loose = { ..roomy(), comment: 5 };
+  let loose = { ..large_limits(), comment: 5 };
   assert_eq(end.len(), 56 + 20 + 22 + 5);
-  assert_eq(locate(end.slice(76, 103), length, loose), More(47));
-  assert_eq(locate(end.slice(56, 103), length, loose), More(103));
-  assert_eq(locate(end.slice(1, 103), length, loose), More(103));
+  assert_eq(locate(end.slice(76, 103), length, loose), NeedMore(47));
+  assert_eq(locate(end.slice(56, 103), length, loose), NeedMore(103));
+  assert_eq(locate(end.slice(1, 103), length, loose), NeedMore(103));
   assert_eq(
     locate(end, length, loose),
     Found({ at: far, size: 3220000, entries: 70000, comment: b"zip64" }),
   );
   assert_eq(
     try { locate(end, length, { ..loose, entries: 69999 }) },
-    Err({ at: length - 27, why: TooMany }),
+    Err({ at: length - 27, reason: TooMany }),
   );
   let refused = |changed: Bytes| Result::err(try { locate(changed, length, loose) });
   // The end record's own numbers, where it does not mark them, are the zip64 record's.
   assert_eq(
     refused(patched(end, 76 + 12, b"\x00\x00\x00\x00")),
-    Some({ at: length - 27, why: Disagrees }),
+    Some({ at: length - 27, reason: Disagrees }),
   );
-  assert_eq(refused(patched(end, 76 + 8, b"\x70\x11")), Some({ at: length - 27, why: Disagrees }));
+  assert_eq(
+    refused(patched(end, 76 + 8, b"\x70\x11")),
+    Some({ at: length - 27, reason: Disagrees }),
+  );
   assert_eq(
     locate(patched(end, 76 + 16, b"\xff\xff\xff\xff"), length, loose),
     locate(end, length, loose),
@@ -2128,24 +2288,24 @@ test "an end record marks what its zip64 record holds, and the two say one thing
     locate(patched(end, 76 + 12, b"\xff\xff\xff\xff"), length, loose),
     locate(end, length, loose),
   );
-  assert_eq(refused(patched(end, 0, b"XK")), Some({ at: length - 103, why: BadZip64 }));
-  assert_eq(refused(patched(end, 4, b"\x2d")), Some({ at: length - 103, why: BadZip64 }));
-  assert_eq(refused(patched(end, 64, b"\x21")), Some({ at: length - 27, why: BadZip64 }));
-  // A locator that points further back asks for the bytes from there, which end no record.
-  assert_eq(locate(patched(end, 64, b"\x1f"), length, loose), More(104));
+  assert_eq(refused(patched(end, 0, b"XK")), Some({ at: length - 103, reason: BadZip64 }));
+  assert_eq(refused(patched(end, 4, b"\x2d")), Some({ at: length - 103, reason: BadZip64 }));
+  assert_eq(refused(patched(end, 64, b"\x21")), Some({ at: length - 27, reason: BadZip64 }));
+  // A locator that points further back requests the bytes from there, which end no record.
+  assert_eq(locate(patched(end, 64, b"\x1f"), length, loose), NeedMore(104));
   assert_eq(
     refused(b"P".concat(patched(patched(end, 64, b"\x1f"), 0, b"K\x06\x06\x2c"))),
-    Some({ at: length - 104, why: BadZip64 }),
+    Some({ at: length - 104, reason: BadZip64 }),
   );
-  assert_eq(refused(patched(end, 60, b"\x01")), Some({ at: length - 27, why: Split }));
-  assert_eq(refused(patched(end, 72, b"\x02")), Some({ at: length - 27, why: Split }));
-  assert_eq(refused(patched(end, 16, b"\x01")), Some({ at: length - 27, why: Disagrees }));
+  assert_eq(refused(patched(end, 60, b"\x01")), Some({ at: length - 27, reason: Split }));
+  assert_eq(refused(patched(end, 72, b"\x02")), Some({ at: length - 27, reason: Split }));
+  assert_eq(refused(patched(end, 16, b"\x01")), Some({ at: length - 27, reason: Disagrees }));
   assert_eq(
     refused(patched(patched(end, 16, b"\x01"), 80, b"\x01")),
-    Some({ at: length - 27, why: Split }),
+    Some({ at: length - 27, reason: Split }),
   );
-  assert_eq(refused(patched(end, 48, b"\x01")), Some({ at: length - 27, why: BadDirectory }));
-  assert_eq(refused(patched(end, 55, b"\x80")), Some({ at: length - 103, why: BadNumber }));
+  assert_eq(refused(patched(end, 48, b"\x01")), Some({ at: length - 27, reason: BadDirectory }));
+  assert_eq(refused(patched(end, 55, b"\x80")), Some({ at: length - 103, reason: BadNumber }));
   // An archive small enough for an end record has no other.
   assert_eq(end_records(65534, 0xFFFF_FFFE, 0xFFFF_FFFE, b"").len(), 22);
   assert_eq(
@@ -2158,20 +2318,23 @@ test "an end record marks what its zip64 record holds, and the two say one thing
   )
 }
 
-test "a Unix's mode says what a member is and may do, and any other system's name does" {
+test "a Unix mode states what a member is and its permissions, and on other systems its name does" {
   let archive = pair();
   let kinds = |changed: Bytes|
-    read(changed, roomy()).map(|e: Entry| (e.header.kind, e.header.mode));
+    read(changed, large_limits()).map(|e: Entry| (e.header.kind, e.header.mode));
   assert_eq(kinds(archive), [(File, 420), (File, 420)]);
   assert_eq(kinds(patched(archive, 104, b"\xff\x1f")), [(Other(1), 4095), (File, 420)]);
   assert_eq(kinds(patched(archive, 104, b"\x6d\x01")), [(File, 365), (File, 420)]);
   assert_eq(kinds(patched(archive, 105, b"\xa1")), [(Symlink, 420), (File, 420)]);
-  assert_eq(refusal(patched(archive, 105, b"\x41"), roomy()), Some({ at: 64, why: BadKind }));
+  assert_eq(
+    read_error(patched(archive, 105, b"\x41"), large_limits()),
+    Some({ at: 64, reason: BadKind }),
+  );
   // From a system that writes no mode: what a file or a directory usually has, less the
   // write bits of one marked read-only.
-  let foreign = patched(patched(archive, 69, b"\x00"), 104, b"\xff\xff");
-  assert_eq(kinds(foreign), [(File, 420), (File, 420)]);
-  assert_eq(kinds(patched(foreign, 102, b"\x01")), [(File, 292), (File, 420)]);
+  let windows_danger = patched(patched(archive, 69, b"\x00"), 104, b"\xff\xff");
+  assert_eq(kinds(windows_danger), [(File, 420), (File, 420)]);
+  assert_eq(kinds(patched(windows_danger, 102, b"\x01")), [(File, 292), (File, 420)]);
   let folder = write([directory("d"), symlink("l", "d")]);
   assert_eq(kinds(folder), [(Directory, 493), (Symlink, 511)]);
   assert_eq(kinds(patched(folder, 69, b"\x00")), [(Directory, 493), (Symlink, 511)]);
@@ -2180,18 +2343,31 @@ test "a Unix's mode says what a member is and may do, and any other system's nam
     (Symlink, 511),
   ]);
   // A name that ends in `/` on a file's mode, and data on a directory.
-  assert_eq(refusal(patched(folder, 105, b"\x81"), roomy()), Some({ at: 64, why: BadKind }));
-  let filled = { ..image(directory("d"), false, 1), size: 1, crc: Int::of_u32(crc32(b"x")) };
-  assert_eq(refusal(alone(filled, filled, b"x", b""), roomy()), Some({ at: 33, why: StrayData }));
-  let link = image(symlink("l", "t"), false, 2);
+  assert_eq(
+    read_error(patched(folder, 105, b"\x81"), large_limits()),
+    Some({ at: 64, reason: BadKind }),
+  );
+  let filled = {
+    ..header_fields(directory("d"), false, 1),
+    size: 1,
+    crc: Int::of_u32(crc32(b"x")),
+  };
+  assert_eq(
+    read_error(one_member_archive(filled, filled, b"x", b""), large_limits()),
+    Some({ at: 33, reason: StrayData }),
+  );
+  let link = header_fields(symlink("l", "t"), false, 2);
   let badly = { ..link, size: 2, crc: Int::of_u32(crc32(b"\xff\xfe")) };
-  assert_eq(refusal(alone(badly, badly, b"\xff\xfe", b""), roomy()), Some({ at: 31, why: NotUtf8 }))
+  assert_eq(
+    read_error(one_member_archive(badly, badly, b"\xff\xfe", b""), large_limits()),
+    Some({ at: 31, reason: NotUtf8 }),
+  )
 }
 
-test "an extra field holds instants, and every field this does not read is carried as it is" {
-  let second = Instant(1704164645000000000);
-  let alone_modified: Times = { modified: Some(second), accessed: None, created: None };
-  assert_eq(times_field(timeless()), Some(b""));
+test "an extra field stores instants, and every field this module does not read is kept as it is" {
+  let second_entry_error = Instant(1704164645000000000);
+  let alone_modified: Times = { modified: Some(second_entry_error), accessed: None, created: None };
+  assert_eq(times_field(no_times()), Some(b""));
   assert_eq(times_field(alone_modified), Some(b"UT\x05\x00\x01\x25\x7d\x93\x65"));
   assert_eq(
     times_field({ modified: Some(Instant(-1000000000)), accessed: None, created: None }),
@@ -2199,7 +2375,7 @@ test "an extra field holds instants, and every field this does not read is carri
   );
   let fine: Times = {
     modified: Some(Instant(1704164645123456700)),
-    accessed: Some(second),
+    accessed: Some(second_entry_error),
     created: None,
   };
   let early: Times = { ..alone_modified, modified: Some(Instant(50)) };
@@ -2216,17 +2392,18 @@ test "an extra field holds instants, and every field this does not read is carri
     ),
   );
   assert_eq(times_field(early), None);
-  assert_eq(times_field(late).map(|held: Bytes| held.len()), Some(36));
+  assert_eq(times_field(late).map(|input: Bytes| input.len()), Some(36));
   let plainly = file("a", b"");
   let timed = |times: Times| { ..plainly, header: { ..plainly.header, times: times } };
-  assert_eq(read(write([timed(alone_modified)]), roomy()), [timed(alone_modified)]);
-  assert_eq(read(write([timed(fine)]), roomy()), [timed(fine)]);
-  assert_eq(encode([timed(early)]), Err({ index: 0, why: BadTime }));
-  assert_eq(read(write([timed(late)]), roomy()), [timed(late)]);
-  // Both fields on one member: NTFS's finer instants are read over the timestamp's.
+  assert_eq(read(write([timed(alone_modified)]), large_limits()), [timed(alone_modified)]);
+  assert_eq(read(write([timed(fine)]), large_limits()), [timed(fine)]);
+  assert_eq(encode([timed(early)]), Err({ index: 0, reason: BadTime }));
+  assert_eq(read(write([timed(late)]), large_limits()), [timed(late)]);
+  // Both fields on one member: NTFS's finer instants take precedence over the timestamp's.
   let both = |fields: List<Bytes>| {
-    let i = { ..image(plainly, false, 0), extra: Bytes::concat_all(fields) };
-    read(alone(i, i, b"", b""), roomy()).map(|e: Entry| (e.header.times, e.header.extra))
+    let i = { ..header_fields(plainly, false, 0), extra: Bytes::concat_all(fields) };
+    read(one_member_archive(i, i, b"", b""), large_limits()).map(|e: Entry|
+      (e.header.times, e.header.extra))
   };
   let stamp_field = field_bytes(0x5455, b"\x03\x25\x7d\x93\x65");
   let ntfs_field = |modified: Int|
@@ -2244,10 +2421,11 @@ test "an extra field holds instants, and every field this does not read is carri
   let finer: Times = { ..alone_modified, modified: Some(Instant(1704164645123456700)) };
   assert_eq(both([stamp_field, ntfs_field(133486382451234567)]), [(finer, [])]);
   assert_eq(both([stamp_field, ntfs_field(0)]), [(alone_modified, [])]);
-  assert_eq(both([field_bytes(0x5455, b"\x02")]), [(timeless(), [])]);
+  assert_eq(both([field_bytes(0x5455, b"\x02")]), [(no_times(), [])]);
   let refused = |fields: List<Bytes>| {
-    let i = { ..image(plainly, false, 0), extra: Bytes::concat_all(fields) };
-    refusal(alone(i, i, b"", b""), roomy()).map(|r: Refusal| (r.at - i.extra.len(), r.why))
+    let i = { ..header_fields(plainly, false, 0), extra: Bytes::concat_all(fields) };
+    read_error(one_member_archive(i, i, b"", b""), large_limits()).map(|r: Error|
+      (r.at - i.extra.len(), r.reason))
   };
   assert_eq(
     [
@@ -2265,30 +2443,33 @@ test "an extra field holds instants, and every field this does not read is carri
   )
 }
 
-/// What a writer answers of two entries where it refuses the second.
-fn second(why: Why) -> Result<Bytes, Unwritable> = Err({ index: 1, why: why })
+/// What a writer returns for two entries when it rejects the second.
+fn second_entry_error(why: ErrorKind) -> Result<Bytes, WriteError> = Err({ index: 1, reason: why })
 
-test "an entry no header holds says which it is and why" {
+test "an entry no header can store is reported with its index and why" {
   let plain = file("a", b"");
   let with_header = |h: Header| encode([plain, { header: h, data: b"" }]);
   assert_eq(["", "a/", "a\0b"].map(|path: String| with_header({ ..plain.header, path: path })), [
-    second(BadName),
-    second(BadName),
-    second(BadName),
+    second_entry_error(BadName),
+    second_entry_error(BadName),
+    second_entry_error(BadName),
   ]);
-  assert_eq(with_header(plain.header), second(Duplicate));
+  assert_eq(with_header(plain.header), second_entry_error(Duplicate));
   let long = |n: Int, kind: Kind|
     with_header({ ..plain.header, path: String::of_bytes(b"n".repeat(n)), kind: kind });
-  assert_eq((long(65536, File), long(65535, Directory)), (second(TooLong), second(TooLong)));
+  assert_eq((long(65536, File), long(65535, Directory)), (
+    second_entry_error(TooLong),
+    second_entry_error(TooLong),
+  ));
   assert_eq((long(65535, File).is_ok(), long(65534, Directory).is_ok()), (true, true));
   assert_eq(
     with_header({ ..plain.header, path: "b", comment: String::of_bytes(b"c".repeat(65536)) }),
-    second(TooLong),
+    second_entry_error(TooLong),
   );
   assert_eq(
     [0, 4, 8, 10, 16, -1].map(|bits: Int|
       with_header({ ..plain.header, path: "b", kind: Other(bits) })),
-    range(0, 6).map(|_: Int| second(BadKind)),
+    range(0, 6).map(|_: Int| second_entry_error(BadKind)),
   );
   assert_eq(
     decode(
@@ -2296,7 +2477,7 @@ test "an entry no header holds says which it is and why" {
         { ..plain, header: { ..plain.header, kind: Other(1) } },
         { ..plain, header: { ..plain.header, path: "s", kind: Other(12), mode: 0 } },
       ]),
-      roomy(),
+      large_limits(),
     ),
     Ok([
       { ..plain, header: { ..plain.header, kind: Other(1) } },
@@ -2305,34 +2486,34 @@ test "an entry no header holds says which it is and why" {
   );
   assert_eq(
     encode([{ header: directory("d").header, data: b"x" }]),
-    Err({ index: 0, why: StrayData }),
+    Err({ index: 0, reason: StrayData }),
   );
   assert_eq(
     encode([{ header: symlink("l", "t").header, data: b"\xff" }]),
-    Err({ index: 0, why: NotUtf8 }),
+    Err({ index: 0, reason: NotUtf8 }),
   );
-  assert_eq(with_header({ ..plain.header, path: "b", mode: 4096 }), second(BadNumber));
-  assert_eq(with_header({ ..plain.header, path: "b", mode: -1 }), second(BadNumber));
+  assert_eq(with_header({ ..plain.header, path: "b", mode: 4096 }), second_entry_error(BadNumber));
+  assert_eq(with_header({ ..plain.header, path: "b", mode: -1 }), second_entry_error(BadNumber));
   assert_eq(
     with_header({ ..plain.header, path: "b", modified: date::date_time(1979, 12, 31, 0, 0, 0) }),
-    second(BadTime),
+    second_entry_error(BadTime),
   );
   assert_eq(
     with_header({ ..plain.header, path: "b", modified: date::date_time(2024, 1, 2, 0, 0, 1) }),
-    second(BadTime),
+    second_entry_error(BadTime),
   );
   let with_field = |id: Int, data: Bytes|
     with_header({ ..plain.header, path: "b", extra: [{ id: id, data: data }] });
   assert_eq(
     [0x0001, 0x000A, 0x5455, 0x7075, 0x10000, -1].map(|id: Int| with_field(id, b"")),
-    range(0, 6).map(|_: Int| second(BadExtra)),
+    range(0, 6).map(|_: Int| second_entry_error(BadExtra)),
   );
-  assert_eq(with_field(0xCAFE, b"x".repeat(65468)), second(BadExtra));
+  assert_eq(with_field(0xCAFE, b"x".repeat(65468)), second_entry_error(BadExtra));
   let roomiest = with_field(0xCAFE, b"x".repeat(65467));
-  assert_eq(roomiest.ok().map(|whole: Bytes| read(whole, roomy()).len()), Some(2))
+  assert_eq(roomiest.ok().map(|whole: Bytes| read(whole, large_limits()).len()), Some(2))
 }
 
-test "a writer that hands over each member as it is added writes the same archive" {
+test "a writer that flushes each member as it is added writes the same archive" {
   let entries = [directory("d"), file("d/lines", b"line\n".repeat(50)), symlink("l", "d/lines")];
   let streamed = entries.fold(
     { bytes: b"", writer: begin() },
@@ -2365,35 +2546,36 @@ test "a plan is std.tar's, over modes, directories and links whose targets are t
   );
   assert_eq(
     plan([file("ok", b""), file("../x", b"")]),
-    Err({ index: 1, path: "../x", why: Escapes }),
+    Err({ index: 1, path: "../x", reason: Escapes }),
   );
   assert_eq(
     plan([file("/etc/passwd", b"")]),
-    Err({ index: 0, path: "/etc/passwd", why: Absolute }),
+    Err({ index: 0, path: "/etc/passwd", reason: Absolute }),
   );
   assert_eq(
     plan([symlink("way", "elsewhere"), file("way/planted", b"")]),
-    Err({ index: 1, path: "way/planted", why: ThroughLink }),
+    Err({ index: 1, path: "way/planted", reason: ThroughLink }),
   );
   assert_eq(
     plan([directory("d"), symlink("d/l", "../..")]),
-    Err({ index: 1, path: "d/l", why: LinkEscapes }),
+    Err({ index: 1, path: "d/l", reason: LinkEscapes }),
   );
   let plain = file("node", b"");
   assert_eq(
     plan([{ ..plain, header: { ..plain.header, kind: Other(1) } }]),
-    Err({ index: 0, path: "node", why: Special }),
+    Err({ index: 0, path: "node", reason: Special }),
   );
   assert_eq(
     plan([{ header: symlink("l", "t").header, data: b"\xff" }]),
-    Err({ index: 0, path: "l", why: NoName }),
+    Err({ index: 0, path: "l", reason: NoName }),
   )
 }
 
-test "a plan refuses a backslash and a drive letter, in a path and in a link's target" {
+test "a plan rejects a backslash and a drive letter, in a path and in a link's target" {
   let after = |path: String| plan([file("ok", b""), file(path, b"")]);
-  // Which entry a plan refused, whether by the path it was handed, and why.
-  let refused = |path: String| after(path).err().map(|u: Unsafe| (u.index, u.path == path, u.why));
+  // Which entry a plan rejected, whether for the path it was given, and why.
+  let refused = |path: String|
+    after(path).err().map(|u: UnsafeEntry| (u.index, u.path == path, u.reason));
   assert_eq(
     ["..\\x", "a\\b", "C:\\x"].map(refused),
     range(0, 3).map(|_: Int| Some((1, true, Backslash))),
@@ -2401,7 +2583,7 @@ test "a plan refuses a backslash and a drive letter, in a path and in a link's t
   assert_eq(["C:x", "c:/x", "z:"].map(refused), range(0, 3).map(|_: Int| Some((1, true, Drive))));
   assert_eq(after("ab:c"), Ok([WriteFile("ok", 420, b""), WriteFile("ab:c", 420, b"")]));
   assert_eq(after("1:c"), Ok([WriteFile("ok", 420, b""), WriteFile("1:c", 420, b"")]));
-  // A drive's letter is one wherever a plan's path could come to open with it.
+  // A drive letter counts anywhere a plan's path could end up starting with it.
   assert_eq(
     ["a/../C:x", "./c:", "d/C:"].map(refused),
     range(0, 3).map(|_: Int| Some((1, true, Drive))),
@@ -2411,18 +2593,18 @@ test "a plan refuses a backslash and a drive letter, in a path and in a link's t
     Ok([WriteFile("ok", 420, b""), MakeDirectory("d", 493), WriteFile("d/1:", 420, b"")]),
   );
   assert_eq(["a\\b", "D:", "x/D:y"].map(|target: String| plan([symlink("l", target)]).err()), [
-    Some({ index: 0, path: "l", why: Backslash }),
-    Some({ index: 0, path: "l", why: Drive }),
-    Some({ index: 0, path: "l", why: Drive }),
+    Some({ index: 0, path: "l", reason: Backslash }),
+    Some({ index: 0, path: "l", reason: Drive }),
+    Some({ index: 0, path: "l", reason: Drive }),
   ]);
-  // The first entry that may not be extracted is the one named, whoever refuses it.
+  // The first entry that may not be extracted is the one named, whichever check rejects it.
   assert_eq(
     plan([file("../a", b""), file("b\\c", b"")]),
-    Err({ index: 0, path: "../a", why: Escapes }),
+    Err({ index: 0, path: "../a", reason: Escapes }),
   );
   assert_eq(
     plan([file("b\\c", b""), file("../a", b"")]),
-    Err({ index: 0, path: "b\\c", why: Backslash }),
+    Err({ index: 0, path: "b\\c", reason: Backslash }),
   );
   assert_eq(["a/b", "./a//b/", "a/../b", "a\\b", "C:b", "../b", "/b"].map(safe_path), [
     Ok("a/b"),
@@ -2441,7 +2623,7 @@ test "a plan is carried out beneath a directory of a root by `std.tar`'s `extrac
       file("d/f.txt", b"data"),
       symlink("l", "d/f.txt"),
     ]) {
-    Ok(planned) -> planned,
+    Ok(tar_entry) -> tar_entry,
     Err(_) -> panic("the entries are safe to extract"),
   };
   let over = fs::on_mem[d](fs::mem_create_dir(fs::mem_empty(), "out").fs, ||

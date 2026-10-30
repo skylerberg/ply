@@ -1,16 +1,17 @@
-//! MD5 and SHA-1, which are broken: two inputs with one digest are found for either at will.
+//! MD5 and SHA-1, which are broken: for either, two inputs with the same digest can be found at
+//! will.
 //!
-//! They are here for the protocols that still name them, such as a version 5 UUID, a one-time
-//! password or an old peer, and in a module of their own so that a use of either shows in an
-//! import. Neither is fit for a signature, a certificate or anything an adversary chooses the input
-//! of. Each is a `std.hash` `Hash`, so `std.hash`'s streaming and `hmac_plain` take it, and the
-//! runtime keys SHA-1 under a `Secret`, so `hmac`, `hkdf` and `pbkdf2` take `sha1_hash()` too;
-//! HMAC over either is not known to be broken.
+//! They are here for the protocols that still require them, such as a version 5 UUID, a one-time
+//! password or an old peer. They are in a module of their own so that a use of either shows in an
+//! import. Neither is fit for a signature, a certificate or any input an adversary chooses. Each
+//! is a `std.hash` `Hash`, so `std.hash`'s streaming and `hmac_plain` accept it. The runtime can
+//! key SHA-1 with a `Secret`, so `hmac`, `hkdf` and `pbkdf2` accept `sha1_hash()` too. HMAC over
+//! either is not known to be broken.
 
 import std.bytes (u32_be, u32_le, u64_be, u64_le)
 import std.float
-import std.hash (Hash, Hasher, Unkeyed, any_split, digest_of, finish, hkdf_expand, hkdf_extract,
-                 hmac, hmac_plain, init, md_closed, pbkdf2, update)
+import std.hash (Hash, Hasher, UnkeyableHash, any_split, digest_of, finish, hkdf_expand,
+                 hkdf_extract, hmac, hmac_plain, init, merkle_damgard_finish, pbkdf2, update)
 import std.list
 
 // --- SHA-1 ------------------------------------------------------------------------
@@ -24,7 +25,14 @@ pub fn sha1_hash() -> Hash =
     start: Array::of_list([0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0]),
     block: sha1_block,
     finish: |h: Array<Int>, seen: Int, tail: Bytes| {
-      let closed = md_closed(sha1_block, 64, h, seen, tail, u64_be((seen + tail.len()) * 8));
+      let closed = merkle_damgard_finish(
+        sha1_block,
+        64,
+        h,
+        seen,
+        tail,
+        u64_be((seen + tail.len()) * 8),
+      );
       Bytes::concat_all(closed.to_list().map(u32_be))
     },
   }
@@ -38,8 +46,8 @@ fn sha1_block(h: Array<Int>, _: Int, data: Bytes, at: Int) -> Array<Int> / {abor
   sha1_rounds(h, Array::new(16, 0), data, at, 0, a, b, c, d, e)
 }
 
-/// The rounds from `t` on. `w` holds the sixteen schedule words before `t`, the word for `t - 16`
-/// where the one for `t` goes.
+/// The rounds from `t` on. `w` contains the sixteen schedule words before `t`, with the word for
+/// `t - 16` in the slot where the word for `t` goes.
 fn sha1_rounds(
   h: Array<Int>,
   w: Array<Int>,
@@ -85,10 +93,10 @@ fn sha1_rounds(
     )
   }
 
-/// Twenty bytes, of SHA-1 as the standard defines it. Broken for collisions.
+/// The SHA-1 digest of `input`: twenty bytes, as the standard defines it. Broken for collisions.
 pub fn sha1(input: Bytes) -> Bytes / {abort.raise} = digest_of(sha1_hash(), input)
 
-/// HMAC-SHA-1 under a secret key, which a one-time password and an old peer still ask for.
+/// HMAC-SHA-1 with a secret key, which one-time passwords and old peers still require.
 pub fn hmac_sha1(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
   match Secret::hmac("SHA-1", key, message) {
     Some(tag) -> tag,
@@ -121,7 +129,7 @@ pub fn md5_hash() -> Hash = {
     start: Array::of_list([0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476]),
     block: block,
     finish: |h: Array<Int>, seen: Int, tail: Bytes| {
-      let closed = md_closed(block, 64, h, seen, tail, u64_le((seen + tail.len()) * 8));
+      let closed = merkle_damgard_finish(block, 64, h, seen, tail, u64_le((seen + tail.len()) * 8));
       Bytes::concat_all(closed.to_list().map(u32_le))
     },
   }
@@ -162,7 +170,7 @@ fn md5_rounds(
     md5_rounds(h, sines, data, at, i + 1, d, b + (x << turn | x >>> 32 - turn) & 0xFFFF_FFFF, b, c)
   }
 
-/// Sixteen bytes, of MD5 as the RFC defines it. Broken for collisions.
+/// The MD5 digest of `input`: sixteen bytes, as the RFC defines it. Broken for collisions.
 pub fn md5(input: Bytes) -> Bytes / {abort.raise} = digest_of(md5_hash(), input)
 
 // --- Tests ------------------------------------------------------------------
@@ -233,7 +241,7 @@ test "FIPS 180-4: SHA-1 of {v.message}" for v: Digest in fips_180() {
   assert_eq(sha1(v.input).hex_of(), v.digest)
 }
 
-test "each one-shot digest is its hash's, and as long as its hash says" {
+test "each one-shot digest matches its hash and has the length its hash reports" {
   let input = b"the quick brown fox";
   assert_eq(md5(input), digest_of(md5_hash(), input));
   assert_eq(sha1(input), digest_of(sha1_hash(), input));
@@ -241,18 +249,18 @@ test "each one-shot digest is its hash's, and as long as its hash says" {
   assert_eq(sha1(input).len(), sha1_hash().digest_size)
 }
 
-/// A hash and the one digest its sweep comes to.
+/// A hash and the single digest its sweep produces.
 type Sweep = { hash: String, digest: String }
 
-/// For each hash, its digest of its own digests of the first `n` of the bytes that count up from
-/// zero, for every `n` to 340, which is past five blocks, as another implementation computes it.
+/// For each hash, the digest of its digests of the first `n` bytes of a sequence that counts up
+/// from zero, for every `n` up to 340 (past five blocks), as another implementation computes it.
 fn sweeps() -> List<Sweep> =
   [
     { hash: "MD5", digest: "acdad58997faecb74cd01406e0e78694" },
     { hash: "SHA-1", digest: "280cb8044538193103c9fc1a9acfe91559955151" },
   ]
 
-// Every padding there is: a message that ends a block, one a byte short, one the length just fits.
+// Every padding case: a message that ends a block, one a byte short, one the length just fits.
 test "{v.hash} of every length to 340 bytes, as one digest of the digests" for v: Sweep in sweeps(
   ) {
   let h = if v.hash == "MD5" { md5_hash() } else { sha1_hash() };
@@ -381,7 +389,7 @@ test "RFC 2202: HMAC-{v.hash}, case {v.case}" for v: Mac in rfc_2202() {
   let h = if v.hash == "MD5" { md5_hash() } else { sha1_hash() };
   assert_eq(hmac_plain(h, v.key, v.data).hex_of(), v.tag);
   if v.hash == "SHA-1" { assert_eq(hmac_sha1(Secret::of_bytes(v.key), v.data).hex_of(), v.tag) }
-  else { assert_eq(try { hmac(h, Secret::of_bytes(v.key), v.data) }, Err(Unkeyed("MD5"))) }
+  else { assert_eq(try { hmac(h, Secret::of_bytes(v.key), v.data) }, Err(UnkeyableHash("MD5"))) }
 }
 
 /// One of RFC 5869's cases: what goes in, the pseudorandom key the first step makes of it, and the
@@ -460,7 +468,7 @@ test "RFC 5869, case {v.case}" for v: Derivation in rfc_5869() {
 /// One published PBKDF2 key.
 type Stretch = { password: Bytes, salt: Bytes, iterations: Int, length: Int, key: String }
 
-/// RFC 6070's vectors but the fourth, whose 16777216 iterations are a minute of nothing new.
+/// RFC 6070's vectors except the fourth, whose 16777216 iterations are slow and test nothing new.
 fn rfc_6070() -> List<Stretch> =
   [
     {

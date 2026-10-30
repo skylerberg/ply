@@ -1,17 +1,17 @@
-//! Directed graphs: components, orders, walks and shortest paths.
+//! Directed graphs: components, orders, traversals and shortest paths.
 //!
-//! A `Graph` numbers its nodes from zero and holds each one's successors, so a caller with adjacency
-//! lists already has one, `{ out: lists }`. `of` asks a successor function for each node, `of_edges`
-//! reads pairs, and `keyed` and `explore` number nodes of any ordered type. A successor that is not
-//! one of the graph's nodes is no edge, and every walk passes it by.
+//! A `Graph` numbers its nodes from zero and stores each one's successors, so a caller with
+//! adjacency lists already has one: `{ out: lists }`. `of` calls a successor function for each
+//! node, `of_edges` reads pairs, and `keyed` and `explore` number nodes of any ordered type. A
+//! successor that is not one of the graph's nodes is not an edge, and every traversal skips it.
 //!
-//! An answer is a function of the graph as written: a walk tries nodes in ascending order and a
-//! node's successors in the order the graph lists them, and where several nodes could come next in
-//! an order, the least does.
+//! A result depends only on the graph as written. A traversal tries nodes in ascending order and a
+//! node's successors in the order the graph lists them. Where several nodes could come next in an
+//! order, the least comes first.
 //!
-//! No walk recurses with the graph: each is a loop over a stack it keeps itself, so a chain longer
-//! than calls nest is walked as a short one is. A loop spends a budget of the graph's nodes and
-//! edges, which is what shows it ends, and takes that many steps.
+//! No traversal recurses: each is a loop over a stack it manages itself, so a chain deeper than
+//! the call stack is traversed like a short one. A loop spends a budget of the graph's nodes and
+//! edges, which proves that it ends, and takes that many steps.
 
 import std.laws (agrees)
 import std.list
@@ -19,30 +19,30 @@ import std.gen
 
 /// A directed graph over the nodes `0..len(out)`.
 ///
-/// `out` holds each node's successors, in the order a walk takes them. An edge may be listed twice,
-/// and a successor outside the nodes is no edge.
+/// `out` contains each node's successors, in the order a traversal visits them. An edge may be
+/// listed twice, and a successor outside the nodes is not an edge.
 pub type Graph = new { out: List<List<Int>> }
 
 /// An edge, from one node to another.
 pub type Edge = { from: Int, target: Int }
 
-/// An edge and what crossing it costs.
-pub type Weighed = { from: Int, target: Int, weight: Int }
+/// An edge and the cost of following it.
+pub type WeightedEdge = { from: Int, target: Int, weight: Int }
 
-/// What a graph is refused for.
+/// The errors that graph functions raise.
 pub effect graph {
-  /// The graph has a cycle where an order was asked for. `path` is one: each node has an edge to the
-  /// next, and the last to the first.
+  /// The graph has a cycle where an order was requested. `path` is one such cycle: each node has an
+  /// edge to the next, and the last to the first.
   raise cyclic(path: List<Int>)
-  /// An edge on the way weighs less than zero, which a shortest path cannot be read through.
-  raise negative(edge: Weighed)
+  /// An edge along the way has a weight below zero, so no shortest path through it can be found.
+  raise negative(edge: WeightedEdge)
 }
 
 // --- Building ---------------------------------------------------------------
 
 /// The graph over `0..n` in which `next(v)` are `v`'s successors.
 ///
-/// `next` is asked once for each node, in ascending order.
+/// `next` is called once for each node, in ascending order.
 pub fn of<| e>(n: Int, next: (Int) -> List<Int> / e) -> Graph / e = { out: range(0, n).map(next) }
 
 /// The graph over `0..n` with these edges, each node's successors in the order its edges come.
@@ -60,7 +60,7 @@ pub fn of_edges(n: Int, edges: List<Edge>) -> Graph = {
 /// How many nodes the graph has.
 pub fn size(g: Graph) -> Int = g.out.len()
 
-/// The successors of `v` that are nodes, in the graph's order; none where `v` is not a node.
+/// The successors of `v` that are nodes, in the graph's order. None if `v` is not a node.
 pub fn successors(g: Graph, v: Int) -> List<Int> = {
   let n = g.out.len();
   g.out.at_or(v, []).filter(|w: Int| w >= 0 && w < n)
@@ -71,9 +71,9 @@ pub fn edges(g: Graph) -> List<Edge> =
   range(0, g.out.len()).fold([], |acc: List<Edge>, v: Int|
     successors(g, v).fold(acc, |es: List<Edge>, w: Int| es.push({ from: v, target: w })))
 
-/// The graph with every edge turned round.
+/// The graph with every edge reversed.
 ///
-/// A node's successors come in ascending order of the node each edge left.
+/// A node's successors come in ascending order of the node each edge came from.
 pub fn transpose(g: Graph) -> Graph =
   of_edges(g.out.len(), edges(g).map(|e: Edge| { from: e.target, target: e.from }))
 
@@ -81,15 +81,16 @@ fn listed(out: List<List<Int>>) -> Int = out.fold(0, |sum: Int, next: List<Int>|
 
 fn blank(n: Int) -> List<Int> = range(0, n).map(|_: Int| -1)
 
-fn spent<a>() -> a / {abort.raise} = panic("a walk past the graph's nodes and edges")
+fn out_of_budget<a>() -> a / {abort.raise} = panic("a walk past the graph's nodes and edges")
 
 // --- Components -------------------------------------------------------------
 
 /// The strongly connected components: the largest sets of nodes in which each reaches every other.
 ///
 /// A component comes after every component it has an edge into, which is reverse topological
-/// order, so folding over the answer meets a node's successors before the node. Its members come in
-/// the order the walk met them, the first being the one the walk entered the component by.
+/// order, so folding over the result reaches a node's successors before the node. A component's
+/// members come in the order the search found them, starting with the node through which the search
+/// entered the component.
 pub fn components(g: Graph) -> List<List<Int>> / {abort.raise} = {
   let n = g.out.len();
   let none = blank(n);
@@ -106,11 +107,12 @@ pub fn components(g: Graph) -> List<List<Int>> / {abort.raise} = {
   )
 }
 
-/// Tarjan's walk. `mark` is -1 for a node not met, its place on `stack` while it waits there for
-/// its component, and `n` once that is out; a node's place stands for the number Tarjan gives it,
-/// since the two order the waiting nodes alike. `parent` is the node the walk came to a node from,
-/// -1 for the first of a tree, and `low` and `cursor` hold what a node on the way down had reached
-/// when the walk left it for a successor.
+/// The state of Tarjan's algorithm. `mark` is -1 for a node not yet visited, its position on
+/// `stack` while it waits there for its component, and `n` once the component is complete. A
+/// node's position replaces the index Tarjan assigns it, since both order the waiting nodes the
+/// same way. `parent` is the node the search came from, or -1 for a tree's root. `low` and `cursor`
+/// store how low a node on the current path had reached, and at which successor, when the search
+/// left it for that successor.
 type Tarjan = {
   mark: List<Int>,
   low: List<Int>,
@@ -121,8 +123,8 @@ type Tarjan = {
   found: List<List<Int>>,
 }
 
-/// The walk stands at `v`, the `i`th of whose successors `next` comes now, having reached as low
-/// as `low` from it; between trees `v` is -1 and `root` is the next node to start one at.
+/// The search is at `v`, whose `i`th successor `next` comes now, and has reached as low as `low`
+/// from it. Between trees, `v` is -1 and `root` is the next node to start a tree from.
 reuse fn tarjan(
   out: List<List<Int>>,
   n: Int,
@@ -134,7 +136,7 @@ reuse fn tarjan(
   low: Int,
   room: Int,
 ) -> List<List<Int>> / {abort.raise} =
-  if room <= 0 { spent() } else if v < 0 {
+  if room <= 0 { out_of_budget() } else if v < 0 {
     if root >= n { s.found }
     else if s.mark.get(root) >= 0 { tarjan(out, n, s, root + 1, -1, [], 0, 0, room - 1) } else {
       let { mark, low: lows, cursor, parent, stack, depth, found } = s;
@@ -193,7 +195,7 @@ reuse fn tarjan(
     }
   }
 
-/// A component leaves the stack: everything from its first member's place, `from`, up.
+/// Pops a component off the stack: everything from its first member's position, `from`, upward.
 reuse fn close(s: Tarjan, from: Int, n: Int) -> Tarjan / {abort.raise} = {
   let { mark, low, cursor, parent, stack, depth, found } = s;
   let left = leave(mark, stack, from, depth, n, []);
@@ -208,7 +210,7 @@ reuse fn close(s: Tarjan, from: Int, n: Int) -> Tarjan / {abort.raise} = {
   }
 }
 
-type Left = { mark: List<Int>, members: List<Int> }
+type PoppedComponent = { mark: List<Int>, members: List<Int> }
 
 reuse fn leave(
   mark: List<Int>,
@@ -217,7 +219,7 @@ reuse fn leave(
   depth: Int,
   n: Int,
   members: List<Int>,
-) -> Left / {abort.raise} =
+) -> PoppedComponent / {abort.raise} =
   if k >= depth { { mark: mark, members: members } } else {
     let w = stack.get(k);
     leave(mark.set(w, n), stack, k + 1, depth, n, members.push(w))
@@ -225,60 +227,64 @@ reuse fn leave(
 
 /// A graph's strongly connected components, as a graph of their own.
 ///
-/// `members` is `components`, `component` says which of them each node is in, and `graph` has an
-/// edge from one component to another where a member of the first has one to a member of the
-/// second, once each, in the order the members' edges come. The components come in reverse
-/// topological order, so every edge of `graph` runs to a lower node, and it has no cycle.
-pub type Condensed = new { graph: Graph, members: List<List<Int>>, component: List<Int> }
+/// `members` is `components`, and `component` gives the component of each node. `graph` has an
+/// edge from one component to another when a member of the first has an edge to a member of the
+/// second. Each such edge appears once, in the order of the members' edges. The components come in
+/// reverse topological order, so every edge of `graph` goes to a lower node, and it has no cycle.
+pub type Condensation = new { graph: Graph, members: List<List<Int>>, component: List<Int> }
 
 /// The graph of `g`'s strongly connected components.
-pub fn condensation(g: Graph) -> Condensed / {abort.raise} = {
+pub fn condensation(g: Graph) -> Condensation / {abort.raise} = {
   let n = g.out.len();
   let members = components(g);
   let count = members.len();
   let component = range(0, count).fold(blank(n), |of: List<Int>, c: Int|
     members.get(c).fold(of, |o: List<Int>, v: Int| o.set(v, c)));
-  let joined = range(0, count).fold({ out: [], last: blank(count) }, |acc: Joined, c: Int| {
-    let row = members.get(c).fold({ next: [], last: acc.last }, |r: Row, v: Int|
-      g.out.get(v).fold(r, |r: Row, w: Int|
-        if w < 0 || w >= n { r } else {
-          let d = component.get(w);
-          if d == c || r.last.get(d) == c { r } else {
-            let { next, last } = r;
-            { next: next.push(d), last: last.set(d, c) }
-          }
-        }));
-    { out: acc.out.push(row.next), last: row.last }
-  });
+  let joined = range(0, count).fold(
+    { out: [], last: blank(count) },
+    |acc: CondensedEdges, c: Int| {
+      let row = members.get(c).fold({ next: [], last: acc.last }, |r: Row, v: Int|
+        g.out.get(v).fold(r, |r: Row, w: Int|
+          if w < 0 || w >= n { r } else {
+            let d = component.get(w);
+            if d == c || r.last.get(d) == c { r } else {
+              let { next, last } = r;
+              { next: next.push(d), last: last.set(d, c) }
+            }
+          }));
+      { out: acc.out.push(row.next), last: row.last }
+    },
+  );
   { graph: { out: joined.out }, members: members, component: component }
 }
 
-/// `last` holds, for each component, the latest component an edge into it was listed for.
-type Joined = { out: List<List<Int>>, last: List<Int> }
+/// `last` records, for each component, the last source component that listed an edge into it.
+type CondensedEdges = { out: List<List<Int>>, last: List<Int> }
 
 type Row = { next: List<Int>, last: List<Int> }
 
 // --- Depth first ------------------------------------------------------------
 
-/// A cycle as its path, or `None` where the graph has none.
+/// A cycle as its path, or `None` if the graph has none.
 ///
 /// Each node of the path has an edge to the next and the last has one to the first, so a node with
-/// an edge to itself is a path of one. It is the first cycle a depth-first walk closes: the walk's
-/// own path, from the node an edge came back to down to the node the edge left.
+/// an edge to itself is a path of one. It is the first cycle a depth-first search closes: the
+/// search's own path, from the node a back edge reaches down to the node the edge leaves.
 pub fn cycle(g: Graph) -> Option<List<Int>> / {abort.raise} =
   descend(g, range(0, g.out.len()), true).back
 
-/// The nodes a depth-first walk from `from` reaches, each where the walk first met it.
+/// The nodes a depth-first search from `from` reaches, in the order it first visits them.
 ///
-/// A node comes, then everything its first successor leads to, then its second's. The walk starts
-/// at each of `from` in turn, passing by one it has met and one that is no node.
+/// A node comes first, then everything its first successor leads to, then everything its second
+/// leads to. The search starts at each of `from` in turn, skipping one it has already visited and
+/// one that is not a node.
 pub fn depth_first(g: Graph, from: List<Int>) -> List<Int> / {abort.raise} =
   descend(g, from, false).pre
 
-/// The nodes a depth-first walk from `from` reaches, each where the walk left it.
+/// The nodes a depth-first search from `from` reaches, in the order it finishes them.
 ///
-/// A node comes after everything it leads to that the walk had not left already, which over a
-/// graph with no cycle is after every one of its successors.
+/// A node comes after everything it leads to that the search had not already finished. In a graph
+/// with no cycle, that means after all of its successors.
 pub fn post_order(g: Graph, from: List<Int>) -> List<Int> / {abort.raise} =
   descend(g, from, false).post
 
@@ -290,9 +296,9 @@ type Descent = {
   post: List<Int>,
 }
 
-type Descended = { pre: List<Int>, post: List<Int>, back: Option<List<Int>> }
+type DescentResult = { pre: List<Int>, post: List<Int>, back: Option<List<Int>> }
 
-fn descend(g: Graph, from: List<Int>, halt: Bool) -> Descended / {abort.raise} = {
+fn descend(g: Graph, from: List<Int>, halt: Bool) -> DescentResult / {abort.raise} = {
   let n = g.out.len();
   let none = blank(n);
   descent(
@@ -310,9 +316,9 @@ fn descend(g: Graph, from: List<Int>, halt: Bool) -> Descended / {abort.raise} =
   )
 }
 
-/// `mark` is -1 for a node not met, its place on `path` while the walk is below it, and `n` once
-/// the walk has left it. The walk stands at `v`, `height` nodes down `path`, the `i`th of whose
-/// successors `next` comes now; at no height it starts at the `r`th of `from`. With `halt` it
+/// `mark` is -1 for a node not yet visited, its position on `path` while the search is below it,
+/// and `n` once the search has finished it. The search is at `v`, `height` nodes down `path`, and
+/// `next` is `v`'s `i`th successor. At height zero it starts at the `r`th of `from`. With `halt` it
 /// stops at the first edge back into its own path.
 reuse fn descent(
   out: List<List<Int>>,
@@ -326,8 +332,8 @@ reuse fn descent(
   next: List<Int>,
   i: Int,
   room: Int,
-) -> Descended / {abort.raise} =
-  if room <= 0 { spent() } else if height == 0 {
+) -> DescentResult / {abort.raise} =
+  if room <= 0 { out_of_budget() } else if height == 0 {
     match from.at(r) {
       None -> { pre: s.pre, post: s.post, back: None },
       Some(root) -> if root < 0 || root >= n || s.mark.get(root) >= 0 {
@@ -394,13 +400,14 @@ reuse fn descent(
 
 // --- Breadth first ----------------------------------------------------------
 
-/// The nodes a breadth-first walk from `from` reaches, nearest first.
+/// The nodes a breadth-first search from `from` reaches, nearest first.
 ///
-/// `from` come in the order given, then what they have edges to, then what those do. A node comes
-/// once, where the walk first met it, and one of `from` that is no node is passed by.
+/// The nodes of `from` come in the order given, then the nodes they have edges to, then the nodes
+/// those have edges to. Each node comes once, where the search first found it, and a node of `from`
+/// that is not in the graph is skipped.
 pub fn breadth_first(g: Graph, from: List<Int>) -> List<Int> / {abort.raise} = spread(g, from).queue
 
-/// The nodes `from` reaches, themselves among them, in ascending order.
+/// The nodes `from` reaches, including themselves, in ascending order.
 pub fn reachable(g: Graph, from: List<Int>) -> List<Int> / {abort.raise} = {
   let met = spread(g, from).met;
   range(0, g.out.len()).filter(|v: Int| met.at_or(v, false))
@@ -421,8 +428,9 @@ fn spread(g: Graph, from: List<Int>) -> Spread / {abort.raise} = {
   )
 }
 
-/// `queue` is the walk so far and `head` the place in it of the next node to spread from; `next`
-/// are the nodes being met now, from the `i`th on: `from` first, then a node's successors.
+/// `queue` is the search so far, and `head` is the position in it of the next node to expand.
+/// `next` are the nodes being visited now, from the `i`th on: `from` first, then a node's
+/// successors.
 reuse fn spreading(
   out: List<List<Int>>,
   n: Int,
@@ -432,7 +440,7 @@ reuse fn spreading(
   i: Int,
   room: Int,
 ) -> Spread / {abort.raise} =
-  if room <= 0 { spent() } else if i < next.len() {
+  if room <= 0 { out_of_budget() } else if i < next.len() {
     spreading(out, n, admit(n, s, next.get(i)), head, next, i + 1, room - 1)
   } else {
     match s.queue.at(head) {
@@ -451,20 +459,20 @@ reuse fn admit(n: Int, s: Spread, v: Int) -> Spread / {abort.raise} =
 
 /// A topological sort in progress, for a caller that runs the nodes itself.
 ///
-/// `take` hands out the nodes that may run, `done` says one has, and that frees the nodes that were
-/// waiting on it alone. `waiting` counts, for a node not yet handed out, the edges into it from
-/// nodes not done; it is -1 while the node runs and -2 once it is done. `ready` are the nodes to
-/// hand out next, and `left` how many are not done.
+/// `take` returns the nodes that may run, and `done` marks one as finished, which releases the
+/// nodes that were waiting only on it. `waiting` counts, for a node `take` has not yet returned,
+/// the edges into it from nodes not done. It is -1 while the node runs and -2 once it is done.
+/// `ready` are the nodes `take` returns next, and `left` is how many are not done.
 pub type Sorter = new { graph: Graph, waiting: List<Int>, ready: Map<Int, Unit>, left: Int }
 
 /// A sort of `g` with nothing done.
 ///
-/// Its first `take` hands out the nodes no edge runs into. Raises `graph.cyclic` for a graph with a
-/// cycle, whose nodes could never all be handed out.
+/// Its first `take` returns the nodes with no incoming edges. Raises `graph.cyclic` for a graph
+/// with a cycle, whose nodes could never all be returned.
 pub fn sorter(g: Graph) -> Sorter / {graph.cyclic, abort.raise} =
-  match cycle(g) { Some(path) -> graph.cyclic(path), None -> unsorted(g) }
+  match cycle(g) { Some(path) -> graph.cyclic(path), None -> sorter_unchecked(g) }
 
-fn unsorted(g: Graph) -> Sorter / {abort.raise} = {
+fn sorter_unchecked(g: Graph) -> Sorter / {abort.raise} = {
   let n = g.out.len();
   let waiting = g.out.fold(range(0, n).map(|_: Int| 0), |counts: List<Int>, next: List<Int>|
     next.fold(counts, |c: List<Int>, w: Int|
@@ -477,10 +485,10 @@ fn unsorted(g: Graph) -> Sorter / {abort.raise} = {
   { graph: g, waiting: waiting, ready: ready, left: n }
 }
 
-/// The nodes that may run now, in ascending order, and the sort with them running.
+/// The nodes that may run now, in ascending order, and the sort with them marked as running.
 ///
-/// They are every node whose predecessors are all done and that was not handed out before: none
-/// while the sort waits on a running node, and none once it is finished.
+/// They are every node whose predecessors are all done and that `take` has not returned before.
+/// There are none while the sort waits on a running node, and none once it is finished.
 pub fn take(s: Sorter) -> { nodes: List<Int>, sorter: Sorter } / {abort.raise} = {
   let { graph: g, waiting, ready, left } = s;
   let nodes = ready.keys();
@@ -497,15 +505,15 @@ pub fn take(s: Sorter) -> { nodes: List<Int>, sorter: Sorter } / {abort.raise} =
 
 /// The sort with `node` done.
 ///
-/// `node` is one `take` handed out and nothing has said is done; any other is the caller's mistake,
-/// and raises.
+/// `node` must be one that `take` returned and that is not yet done. Any other node is the
+/// caller's mistake, and raises.
 pub fn done(s: Sorter, node: Int) -> Sorter / {abort.raise} = {
   let { graph: g, waiting, ready, left } = s;
   if waiting.at_or(node, 0) != -1 { panic("a node that is not running") } else {
     let n = g.out.len();
     let freed = g.out.get(node).fold(
       { waiting: waiting.set(node, -2), ready: ready },
-      |acc: Freed, w: Int|
+      |acc: ReadyCounts, w: Int|
         if w < 0 || w >= n { acc } else {
           let { waiting: counts, ready: free } = acc;
           let still = counts.get(w) - 1;
@@ -519,26 +527,26 @@ pub fn done(s: Sorter, node: Int) -> Sorter / {abort.raise} = {
   }
 }
 
-type Freed = { waiting: List<Int>, ready: Map<Int, Unit> }
+type ReadyCounts = { waiting: List<Int>, ready: Map<Int, Unit> }
 
 /// Whether every node is done.
 pub fn is_finished(s: Sorter) -> Bool = s.left == 0
 
-/// The nodes in the rounds a sort hands them out in when each round is done before the next.
+/// The nodes grouped in the rounds a sort returns them in, when each round is done before the next.
 ///
-/// First come the nodes no edge runs into, then the nodes that waited only on those, and so on, a
-/// node coming in the round after the last of its predecessors. A round is in ascending order, and
-/// no edge joins two nodes of one. Raises `graph.cyclic` for a graph with a cycle.
+/// First come the nodes with no incoming edges, then the nodes that waited only on those, and so
+/// on: a node comes in the round after the last of its predecessors. A round is in ascending order,
+/// and no edge joins two nodes of the same round. Raises `graph.cyclic` for a graph with a cycle.
 pub fn layers(g: Graph) -> List<List<Int>> / {graph.cyclic, abort.raise} = {
-  let swept = sweep(unsorted(g), [], g.out.len() + 1);
+  let swept = sweep(sorter_unchecked(g), [], g.out.len() + 1);
   if swept.sorter.left == 0 { swept.layers }
-  else { match cycle(g) { Some(path) -> graph.cyclic(path), None -> spent() } }
+  else { match cycle(g) { Some(path) -> graph.cyclic(path), None -> out_of_budget() } }
 }
 
-type Swept = { sorter: Sorter, layers: List<List<Int>> }
+type SweepResult = { sorter: Sorter, layers: List<List<Int>> }
 
-fn sweep(s: Sorter, layers: List<List<Int>>, room: Int) -> Swept / {abort.raise} =
-  if room <= 0 { spent() } else {
+fn sweep(s: Sorter, layers: List<List<Int>>, room: Int) -> SweepResult / {abort.raise} =
+  if room <= 0 { out_of_budget() } else {
     let taken = take(s);
     if taken.nodes.len() == 0 { { sorter: taken.sorter, layers: layers } }
     else { sweep(taken.nodes.fold(taken.sorter, done), layers.push(taken.nodes), room - 1) }
@@ -546,9 +554,9 @@ fn sweep(s: Sorter, layers: List<List<Int>>, room: Int) -> Swept / {abort.raise}
 
 /// A topological order: every node, each before every node it has an edge to.
 ///
-/// It is `layers` end to end, so of the nodes that could come next the ones that have waited
-/// longest come first, the least of them leading. Raises `graph.cyclic` for a graph with a cycle,
-/// which has no such order.
+/// It is `layers` joined end to end. So of the nodes that could come next, the ones that have
+/// waited longest come first, the least of them leading. Raises `graph.cyclic` for a graph with a
+/// cycle, which has no such order.
 pub fn order(g: Graph) -> List<Int> / {graph.cyclic, abort.raise} = layers(g).flatten()
 
 /// `order`, or the path of a cycle where `order` raises.
@@ -562,18 +570,19 @@ pub fn try_order(g: Graph) -> Result<List<Int>, List<Int>> / {abort.raise} = try
 /// the node before each on a shortest path, `None` for `from` and for one not reached.
 pub type Paths = new { from: Int, distance: List<Option<Int>>, before: List<Option<Int>> }
 
-/// The shortest paths from `from`, where crossing the edge from `a` to `b` costs `weight(a, b)`.
+/// The shortest paths from `from`, where following the edge from `a` to `b` costs `weight(a, b)`.
 ///
-/// It is Dijkstra's algorithm. A path's length is the sum of its edges' weights; of two shortest
-/// paths to a node, the one through the nearer node before it is kept, and the lesser of two as
-/// near.
+/// It is Dijkstra's algorithm. A path's length is the sum of its edges' weights. Of two shortest
+/// paths to a node, the one whose previous node is nearer wins, or the one whose previous node is
+/// lesser when both are equally near.
 ///
-/// `weight` is asked once for each edge leaving a node `from` reaches. Raises `graph.negative` at
-/// the first of those that weighs less than zero. A `from` that is no node reaches nothing, and a
-/// distance past `Int` ends the run as any sum does.
+/// `weight` is called once for each edge leaving a node that `from` reaches. Raises
+/// `graph.negative` at the first of those with a weight below zero. A `from` that is not a node
+/// reaches nothing, and a distance that overflows `Int` ends the run as any overflowing sum does.
 ///
-/// A round settles the nearest node reached and not yet settled, which the frontier gives up along
-/// one path of its tree, so a search takes its nodes and edges however many of them wait at once.
+/// Each round settles the nearest node that is reached but not yet settled, which makes its
+/// distance final. Taking that node from the frontier visits one path of the frontier's tree,
+/// however many nodes wait in it.
 pub fn shortest<| e>(
   g: Graph,
   from: Int,
@@ -601,9 +610,10 @@ pub fn try_shortest<| e>(
   g: Graph,
   from: Int,
   weight: (Int, Int) -> Int / e,
-) -> Result<Paths, Weighed> / {abort.raise | e} = try[graph.negative] { shortest(g, from, weight) }
+) -> Result<Paths, WeightedEdge> / {abort.raise | e} =
+  try[graph.negative] { shortest(g, from, weight) }
 
-/// `frontier` holds each node reached and not yet settled, under its distance so far.
+/// `frontier` contains each node reached and not yet settled, keyed by its distance so far.
 type Search = { distance: List<Int>, before: List<Int>, frontier: Map<(Int, Int), Unit> }
 
 /// Settles the nearest node of the frontier: nothing shorter can reach it, since no edge is
@@ -615,8 +625,8 @@ fn settle<| e>(
   s: Search,
   room: Int,
 ) -> Search / {graph.negative, abort.raise | e} =
-  if room <= 0 { spent() } else {
-    // Bound before the pop, so the pop is the last reader of the record that holds the frontier.
+  if room <= 0 { out_of_budget() } else {
+    // Read first, so the pop is the record's last use and updates the frontier in place.
     let distance = s.distance;
     let before = s.before;
     match s.frontier.pop_first() {
@@ -659,12 +669,12 @@ reuse fn relax(s: Search, v: Int, w: Int, through: Int) -> Search / {abort.raise
   }
 }
 
-/// How far `to` is from where the paths start, or `None` where they do not reach it.
+/// How far `to` is from where the paths start, or `None` if they do not reach it.
 pub fn distance(p: Paths, to: Int) -> Option<Int> =
   match p.distance.at(to) { Some(d) -> d, None -> None }
 
-/// A shortest path to `to`: the nodes from where the paths start to `to`, both among them, or
-/// `None` where they do not reach it.
+/// A shortest path to `to`: the nodes from the start to `to`, both included, or `None` if the
+/// paths do not reach it.
 pub fn path(p: Paths, to: Int) -> Option<List<Int>> / {abort.raise} =
   match distance(p, to) {
     None -> None,
@@ -672,7 +682,7 @@ pub fn path(p: Paths, to: Int) -> Option<List<Int>> / {abort.raise} =
   }
 
 fn back(before: List<Option<Int>>, v: Int, acc: List<Int>, room: Int) -> List<Int> / {abort.raise} =
-  if room <= 0 { spent() } else {
+  if room <= 0 { out_of_budget() } else {
     match before.get(v) { None -> acc.push(v), Some(u) -> back(before, u, acc.push(v), room - 1) }
   }
 
@@ -680,15 +690,15 @@ fn back(before: List<Option<Int>>, v: Int, acc: List<Int>, room: Int) -> List<In
 
 /// A graph over nodes of any ordered type.
 ///
-/// `keys` are the nodes in ascending order, each numbered by its place, `index` is the number of
-/// each, and `graph` is the graph over those numbers, which every function here takes. Its answers
-/// are numbers, and `named` reads them back.
+/// `keys` are the nodes in ascending order, each numbered by its position. `index` maps each node
+/// to its number, and `graph` is the graph over those numbers, which every function here takes.
+/// Results are numbers, and `named` maps them back to nodes.
 pub type Keyed<k> = new { keys: List<k>, index: Map<k, Int>, graph: Graph }
 
 /// The graph over `nodes` in which `next(node)` are a node's successors.
 ///
-/// `next` is asked once for each node, in ascending order; a node listed twice is one node, and a
-/// successor that is not among `nodes` is no edge.
+/// `next` is called once for each node, in ascending order. A node listed twice is one node, and
+/// a successor that is not among `nodes` is not an edge.
 pub fn keyed<k | e>(nodes: List<k>, next: (k) -> List<k> / e) -> Keyed<k> / e
   where derivable(ord, k)
 = {
@@ -710,8 +720,8 @@ type Numbering<k> = { index: Map<k, Int>, at: Int }
 
 /// The graph of everything `roots` reach, where `next(node)` are a node's successors.
 ///
-/// `next` is asked once for each node, nearest to the roots first. `None` where they reach more
-/// than `limit` nodes, at which the walk stops asking.
+/// `next` is called once for each node, nearest to the roots first. `None` if the roots reach
+/// more than `limit` nodes, at which point the search stops calling `next`.
 pub fn explore<k | e>(
   roots: List<k>,
   next: (k) -> List<k> / e,
@@ -720,16 +730,17 @@ pub fn explore<k | e>(
   where derivable(ord, k)
 = {
   let start = roots.fold({ met: Map::new(), queue: [], asked: Map::new() }, found);
-  let walked = exploring(next, limit, start, 0, limit + 1);
+  let walked = explore_from(next, limit, start, 0, limit + 1);
   if walked.met.len() > limit { None } else {
     Some(keyed(walked.queue, |key: k| match walked.asked.get(key) { Some(to) -> to, None -> [] }))
   }
 }
 
-/// `queue` is every node met, in the order met, and `asked` what `next` answered for each asked.
-type Explored<k> = { met: Map<k, Unit>, queue: List<k>, asked: Map<k, List<k>> }
+/// `queue` is every node found, in the order found, and `asked` stores what `next` returned for
+/// each node it was called on.
+type Exploration<k> = { met: Map<k, Unit>, queue: List<k>, asked: Map<k, List<k>> }
 
-fn found<k>(s: Explored<k>, key: k) -> Explored<k>
+fn found<k>(s: Exploration<k>, key: k) -> Exploration<k>
   where derivable(ord, k)
 =
   if s.met.contains(key) { s } else {
@@ -737,22 +748,22 @@ fn found<k>(s: Explored<k>, key: k) -> Explored<k>
     { met: met.insert(key, ()), queue: queue.push(key), asked: asked }
   }
 
-fn exploring<k | e>(
+fn explore_from<k | e>(
   next: (k) -> List<k> / e,
   limit: Int,
-  s: Explored<k>,
+  s: Exploration<k>,
   head: Int,
   room: Int,
-) -> Explored<k> / {abort.raise | e}
+) -> Exploration<k> / {abort.raise | e}
   where derivable(ord, k)
 =
   if s.met.len() > limit { s } else {
     match s.queue.at(head) {
       None -> s,
-      Some(key) -> if room <= 0 { spent() } else {
+      Some(key) -> if room <= 0 { out_of_budget() } else {
         let to = next(key);
         let { met, queue, asked } = s;
-        exploring(
+        explore_from(
           next,
           limit,
           to.fold({ met: met, queue: queue, asked: asked.insert(key, to) }, found),
@@ -763,19 +774,19 @@ fn exploring<k | e>(
     }
   }
 
-/// The number of the node `key`, or `None` where the graph has no such node.
+/// The number of the node `key`, or `None` if the graph has no such node.
 pub fn node<k>(g: Keyed<k>, key: k) -> Option<Int>
   where derivable(ord, k)
 = g.index.get(key)
 
-/// The numbers of `keys`, in their order; a key that is no node is left out.
+/// The numbers of `keys`, in their order. A key that is not a node is left out.
 pub fn numbered<k>(g: Keyed<k>, keys: List<k>) -> List<Int>
   where derivable(ord, k)
 =
   keys.fold([], |acc: List<Int>, key: k|
     match g.index.get(key) { Some(v) -> acc.push(v), None -> acc })
 
-/// The nodes `nodes` number, in their order; a number that is no node is left out.
+/// The nodes that `nodes` number, in their order. A number that is not a node is left out.
 pub fn named<k>(g: Keyed<k>, nodes: List<Int>) -> List<k> =
   nodes.fold([], |acc: List<k>, v: Int|
     match g.keys.at(v) { Some(key) -> acc.push(key), None -> acc })
@@ -785,13 +796,13 @@ pub fn named<k>(g: Keyed<k>, nodes: List<Int>) -> List<k> =
 /// Three nodes in a ring that leads to a ring of two, and a sixth node that leads to the first ring.
 fn rings() -> Graph = { out: [[1], [2], [0, 3], [4], [3], [0]] }
 
-/// How many times a test's callbacks were asked.
+/// How many times a test's callbacks were called.
 effect asks {
   write one() -> Unit
-  read so_far() -> Int
+  read total() -> Int
 }
 
-test "a graph is its nodes' successors, however it is written" {
+test "a graph is its nodes' successors, however it was built" {
   let g = of_edges(3, [
     { from: 0, target: 2 },
     { from: 2, target: 1 },
@@ -809,7 +820,7 @@ test "a graph is its nodes' successors, however it is written" {
   assert_eq(edges(loose), [{ from: 0, target: 1 }, { from: 1, target: 0 }])
 }
 
-test "components come out successors first, each in the order the walk met its members" {
+test "components come out successors first, each in the order the search found its members" {
   assert_eq(components(rings()), [[3, 4], [0, 1, 2], [5]]);
   assert_eq(components({ out: [[2], [0], [1]] }), [[0, 2, 1]]);
   assert_eq(components({ out: [[1, 9], [0, -1], []] }), [[0, 1], [2]]);
@@ -824,16 +835,16 @@ test "a condensation is the components and the edges between them, each once" {
   assert_eq(condensation({ out: [[1, 2], [0, 2, 2], []] }).graph, { out: [[], [0]] })
 }
 
-test "a cycle is the walk's own path round it, and a graph without one has none" {
+test "a cycle is the search's own path around it, and a graph without one has none" {
   assert_eq(cycle(rings()), Some([0, 1, 2]));
   assert_eq(cycle({ out: [[1], [2], [1]] }), Some([1, 2]));
   assert_eq(cycle({ out: [[], [1]] }), Some([1]));
-  // Two ways to one node are no cycle.
+  // Two paths to one node are not a cycle.
   assert_eq(cycle({ out: [[1, 2], [3], [3], []] }), None);
   assert_eq(cycle({ out: [] }), None)
 }
 
-test "a walk meets each node once: depth first by a node's first successor, breadth first by the nearest" {
+test "a traversal visits each node once: depth first by first successor, breadth first by nearest" {
   let g: Graph = { out: [[1, 2], [3], [3, 4], [], [0], [0]] };
   assert_eq(depth_first(g, [0]), [0, 1, 3, 2, 4]);
   assert_eq(post_order(g, [0]), [3, 1, 4, 2, 0]);
@@ -845,7 +856,7 @@ test "a walk meets each node once: depth first by a node's first successor, brea
   assert_eq(reachable(g, []), [])
 }
 
-test "an order runs every edge forward, round by round, and a cycle is refused with its path" {
+test "an order puts every edge forward, round by round, and a cycle is rejected with its path" {
   let g: Graph = { out: [[2], [2], [3], [], []] };
   assert_eq(layers(g), [[0, 1, 4], [2], [3]]);
   assert_eq(order(g), [0, 1, 4, 2, 3]);
@@ -855,7 +866,7 @@ test "an order runs every edge forward, round by round, and a cycle is refused w
   assert_eq(order({ out: [] }), [])
 }
 
-test "a sorter hands a node out once its predecessors are done, and never twice" {
+test "a sorter returns a node once its predecessors are done, and never twice" {
   let first = take(sorter({ out: [[1, 2], [3], [3], []] }));
   assert_eq(first.nodes, [0]);
   assert_eq(take(first.sorter).nodes, []);
@@ -869,7 +880,7 @@ test "a sorter hands a node out once its predecessors are done, and never twice"
   assert(is_finished(done(last.sorter, 3)))
 }
 
-test "a sorter refuses a graph with a cycle, and a node that is not running" {
+test "a sorter rejects a graph with a cycle, and a node that is not running" {
   assert_eq(match try { sorter(rings()) } { Ok(_) -> [], Err(path) -> path }, [0, 1, 2]);
   let taken = take(sorter({ out: [[1], []] }));
   let early = try[abort.raise] { done(taken.sorter, 1) };
@@ -893,7 +904,7 @@ test "the shortest paths go by the lightest edges, and a node they do not reach 
   assert_eq(shortest(g, 7, |_: Int, _: Int| 1).distance, [None, None, None, None, None])
 }
 
-test "a negative weight is refused by its edge, and only where the paths come to it" {
+test "a negative weight is rejected with its edge, and only where the paths reach it" {
   let g: Graph = { out: [[1], [2], []] };
   assert_eq(
     match try_shortest(g, 0, |a: Int, _: Int| 1 - 3 * a) { Ok(_) -> None, Err(edge) -> Some(edge) },
@@ -906,7 +917,7 @@ test "a negative weight is refused by its edge, and only where the paths come to
   ])
 }
 
-test "nodes of any ordered type are numbered in their order, and an answer reads back" {
+test "nodes of any ordered type are numbered in their order, and a result maps back to them" {
   let needs = |name: String|
     if name == "app" { ["lib", "std", "gone"] } else if name == "lib" { ["std"] } else { [] };
   let g = keyed(["std", "app", "lib", "app"], needs);
@@ -919,7 +930,7 @@ test "nodes of any ordered type are numbered in their order, and an answer reads
   assert_eq(named(g, [2, 7, 0]), ["std", "app"])
 }
 
-test "exploring asks each node it reaches once, and gives up past its limit" {
+test "exploring visits each node it reaches once, and gives up past its limit" {
   let asked = handle {
     let halves = |n: Int| {
       asks.one();
@@ -932,13 +943,13 @@ test "exploring asks each node it reaches once, and gives up past its limit" {
         assert_eq(g.graph, { out: [[], [0, 0], [0, 1], [2, 2], [3, 3]] })
       },
     };
-    asks.so_far()
+    asks.total()
   } with {
     var n = 0,
     asks.one() -> {
       n = n + 1;
     },
-    asks.so_far() -> n,
+    asks.total() -> n,
   };
   assert_eq(asked, 5);
   let doubles = |n: Int| [n * 2, n * 2 + 1];
@@ -948,7 +959,7 @@ test "exploring asks each node it reaches once, and gives up past its limit" {
 
 fn chain(n: Int) -> Graph = { out: range(0, n).map(|v: Int| if v + 1 < n { [v + 1] } else { [] }) }
 
-test "a chain longer than calls nest is walked like any other" {
+test "a chain deeper than the call stack is traversed like any other" {
   let n = 20000;
   let g = chain(n);
   assert_eq(components(g).len(), n);
@@ -963,7 +974,7 @@ test "a chain longer than calls nest is walked like any other" {
   assert_eq(match path(p, n - 1) { Some(nodes) -> nodes.len(), None -> 0 }, n)
 }
 
-/// A graph of `n` nodes read off any integers, two to an edge.
+/// A graph of `n` nodes built from arbitrary integers, two to an edge.
 fn drawn(n: Int, seeds: List<Int>) -> Graph / {abort.raise} =
   of_edges(
     n,
@@ -975,7 +986,8 @@ fn within(n: Int, x: Int) -> Int / {abort.raise} = (x % n + n) % n
 
 fn has_edge(g: Graph, from: Int, target: Int) -> Bool = successors(g, from).contains(target)
 
-/// What `from` reaches, found by adding what the nodes found so far have edges to, once a node.
+/// What `from` reaches, found by passing over every edge once per node and adding the targets of
+/// edges from nodes found so far.
 fn closure(g: Graph, from: Int) -> List<Int> = {
   let n = size(g);
   range(0, n).fold(
@@ -987,7 +999,7 @@ fn closure(g: Graph, from: Int) -> List<Int> = {
   )
 }
 
-/// Each node's place in `order`, -1 for one it does not hold.
+/// Each node's position in `order`, or -1 if `order` does not contain it.
 fn places(n: Int, order: List<Int>) -> List<Int> / {abort.raise} =
   range(0, order.len()).fold(blank(n), |at_of: List<Int>, i: Int| at_of.set(order.get(i), i))
 
@@ -1004,7 +1016,7 @@ fn closes(g: Graph, path: List<Int>) -> Bool / {abort.raise} =
     && range(0, path.len()).fold(true, |ok: Bool, i: Int|
       ok && has_edge(g, path.get(i), path.get((i + 1) % path.len())))
 
-test "every walk from a node meets exactly what the node reaches" {
+test "every traversal from a node visits exactly what the node reaches" {
   gen::check(gen::list(gen::any_int()), |seeds: List<Int>| {
     let g = drawn(6, seeds);
     let from = [seeds.len() % 6];
@@ -1026,7 +1038,7 @@ test "the components are the sets of nodes that reach each other" {
     ))
 }
 
-test "every edge runs forward in a topological order, and a graph with none shows a cycle" {
+test "every edge goes forward in a topological order, and a graph without one has a cycle" {
   gen::check(gen::list(gen::any_int()), |seeds: List<Int>| {
     let g = drawn(6, seeds);
     match try_order(g) {
@@ -1038,7 +1050,8 @@ test "every edge runs forward in a topological order, and a graph with none show
 
 fn toll(seeds: List<Int>, a: Int, b: Int) -> Int = (a * 7 + b * 3 + seeds.len()) % 5
 
-/// The distances from `from` by relaxing every edge once a node, which needs no order to be right.
+/// The distances from `from`, found by relaxing every edge once per node, which is correct in any
+/// order.
 fn relaxed(g: Graph, from: Int, seeds: List<Int>) -> List<Int> / {abort.raise} =
   range(0, size(g)).fold(blank(size(g)).set(from, 0), |far: List<Int>, _: Int|
     edges(g).fold(far, |d: List<Int>, e: Edge| {
@@ -1049,7 +1062,7 @@ fn relaxed(g: Graph, from: Int, seeds: List<Int>) -> List<Int> / {abort.raise} =
       } else { d }
     }))
 
-test "the shortest distances are the ones relaxing every edge settles on" {
+test "the shortest distances match the ones that relaxing every edge produces" {
   gen::check(gen::list(gen::any_int()), |x: List<Int>|
     agrees(
       |seeds: List<Int>|

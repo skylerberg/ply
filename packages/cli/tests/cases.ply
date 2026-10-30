@@ -1,7 +1,5 @@
-//! A test over cases: the cases a table or a generator gives, run one by one.
-
 import compiler.load (Derives, LoadedAnalysis, every_root)
-import args (Flags, could_keep, kept, module_names)
+import args (Flags, could_match_filters, kept, module_names)
 import units
 import units (emit, Emitted, whole_emitted)
 import std.hash (blake3)
@@ -10,54 +8,48 @@ import std.time (time)
 import surface
 import machine
 import compiler.front.published (no_rows)
-import compiler.front.seam (Analysed, Refused, Within, view_of, test_root_at)
-import compiler.front.facts (View, test_label_spans)
+import compiler.front.seam (Analysed, Refused, TestRunScope, checked_program_of, test_root_at)
+import compiler.front.facts (CheckedProgram, test_label_spans)
 import compiler.front (analyse_pulling_std_with)
 import compiler.unit (codes, shipped)
-import compiler.store.hash.forms (TheItem, Which, listing_reach, reached_functions)
-import compiler.check.infer.checker (DefInfo, TestInfo, Location)
-import compiler.emit.keys (RootKey, Named, Cases, Clause, RootName, root_name)
-import compiler.check.resolve.tables (Diag, Label, Source, qualify)
-import diagnostic (Raised, diag_of, shown)
-import program (Timed, keep_command, sourced)
+import compiler.store.hash.forms (ItemKeyed, Subject, listing_reach, reached_functions)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo, Location)
+import compiler.emit.keys (RootKey, Named, TestCases, Clause, RootName, root_name)
+import compiler.check.resolve.tables (Diagnostic, Label, Source, qualify)
+import diagnostic (RuntimeDiagnostic, diagnostic_of, shown)
+import program (TimedLoad, cache_command, sources_of)
 import results
-import report (Answer, ok_code, printed)
+import report (CommandOutput, ok_code, printed)
 import sources (Project)
 import compiler.syntax.items (is_shipped)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, object, to_string, int)
 import std.term (Style, plain)
 import tester
-import tester (ledger, Filed, Hosted, Listed, Options, Testing, Unlisted)
+import tester (result_cache, StoreResult, BindingReport, ListedCase, Options, TestRun,
+               ListingFailure)
 import std.machine as entering
 import views
 import std.bin
 import testing.keys (case_hash)
-import testing.conclude (Concluded)
+import testing.conclude (Conclusion)
 import testing.conclude
-import testing.select (Cached, Decision, Pass, Reason, Search, Stands, asked_by_code, filed,
-                       narrowed)
+import testing.select (Cached, Decision, Pass, Reason, Search, Stands, code_keys_to_query,
+                       pass_keys_by_test, narrowed_searches)
 import std.bytes
 import sim.plan
 import std.string
-import proof.goal (set_of)
+import proof.context (set_of)
 import std.option
-import tests.report (Entry, Case, Decided, Group, Program, Spent, opening_of, opening_lines,
-                     name_column, result_lines, answered, test_at, with_sim)
-import tests.concluded (entry_of, Done, job_of, ran_class, hashes_of, conclude_tests, seen_of,
-                        conclusion_of, ran_outcome, ran_of, mutated, traces_of, standing,
-                        diagnosed_all, history_of)
+import tests.report (Entry, Case, RunDecision, Group, Program, TimeSpent, opening_of, opening_lines,
+                     name_column, result_lines, test_output, test_at, with_sim)
+import tests.concluded (entry_of, JobResult, job_of, run_class, hashes_of, conclude_tests, seen_of,
+                        conclusion_of, job_outcome, run_report_of, mutated, traces_of, pass_status,
+                        diagnosed_all, store_history)
 
-// --- The load ---------------------------------------------------------------
+pub type CacheTarget = { key: Bytes, project: Project, passes: List<Bytes>, after: Bool }
 
-/// Where a run keeps its answer for the next run over the same command: the key, the walk the memo
-/// store's record of it is made over, and the keys of the passes it took. `after` is an answer
-/// selected again after the run filed its passes, which the store's warnings on opening are not in.
-pub type Keeping = { key: Bytes, project: Project, passes: List<Bytes>, after: Bool }
-
-/// What a run that ran nothing answered: the lines it printed before its answer, the answer, and the
-/// keys of the passes it took.
-pub type Kept = {
+pub type CachedOutput = {
   opening: List<String>,
   lines: List<String>,
   errs: List<String>,
@@ -66,16 +58,15 @@ pub type Kept = {
   passes: List<Bytes>,
 }
 
-derive bin for Kept
+derive bin for CachedOutput
 
-/// Every test in scope taken from a pass filed under its own key, or under each root's.
 pub fn all_cached(decisions: List<Decision>, scope: Scope) -> Bool = {
   let visible = set_of(scope.visible);
   decisions.fold(true, |all: Bool, d: Decision|
     all && (!visible.contains(d.case.index) || d.reason == Cached))
 }
 
-fn unwarned(answer: Answer) -> Bool =
+fn has_no_warnings(answer: CommandOutput) -> Bool =
   match answer.json {
     Object(members) -> match members.get("warnings") {
       Some(Array(ws)) -> ws.len() == 0,
@@ -84,15 +75,9 @@ fn unwarned(answer: Answer) -> Bool =
     _ -> false,
   }
 
-// --- What the loaded tree tells a selector ------------------------------------
-
-/// Which tests a run reports on: the package being loaded — a dependency's tests are its own to run,
-/// and a shipped module's its library's own checkout's — narrowed
-/// by a path the line names in the package to the modules under it, by `--filter` to the keys it
-/// keeps (`args.kept`), and by `--shard` to its part.
 pub type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
-fn root_modules(analysis: View) -> Map<String, Bool> =
+fn root_modules(analysis: CheckedProgram) -> Map<String, Bool> =
   range(0, analysis.frame.outlines.len()).fold(Map::new(), |acc: Map<String, Bool>, i: Int|
     match ((analysis.frame.outlines.at(i), analysis.frame.module_packages.at(i))) {
       (Some(o), Some(pkg)) -> if pkg == 0 { acc.insert(String::of_bytes_lossy(o.name), true) }
@@ -101,7 +86,7 @@ fn root_modules(analysis: View) -> Map<String, Bool> =
     })
 
 pub fn scope_of(
-  analysis: View,
+  analysis: CheckedProgram,
   filters: List<String>,
   shard: Option<surface::Shard>,
   named: Option<List<String>>,
@@ -130,8 +115,6 @@ pub fn scope_of(
   )
 }
 
-/// Whether the test keyed `key` is in the part `--shard` asks for: its key's hash decides, so it is in
-/// the same part every run, whatever else the run selects.
 fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
   match shard {
     None -> true,
@@ -141,55 +124,48 @@ fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
     },
   }
 
-// --- A test over cases --------------------------------------------------------
-
-/// The tests over cases this run may report on: those of the modules `named` holds that `--filter`
-/// could keep whatever labels their tables list (`args.could_keep`). `--shard` reads a case's
-/// label, which only its listing knows.
 pub fn over_cases(
-  analysis: View,
+  analysis: CheckedProgram,
   filters: List<String>,
   named: Option<List<String>>,
 ) -> List<Int> / {abort.raise} = {
   let loaded = module_names(analysis.frame.order);
   scope_of(analysis, [], None, named).visible.filter(|i: Int|
     match test_at(analysis, i) {
-      Some(t) -> t.cases && could_keep(filters, loaded, String::of_bytes_lossy(t.module)),
+      Some(t) -> t.cases && could_match_filters(filters, loaded, String::of_bytes_lossy(t.module)),
       None -> false,
     })
 }
 
-/// A dump scoped to what listing some tests over cases enters, and what their listings reach.
-type Lister = { front: LoadedAnalysis, reach: Map<Bytes, Bool> }
+type ListingScope = { front: LoadedAnalysis, reach: Map<Bytes, Bool> }
 
-/// Each asked test's cases, or why they could not be listed, from a unit of their tables alone.
-pub fn listed(
-  testing: Testing,
-  lister: Option<Lister>,
+pub fn list_cases(
+  testing: TestRun,
+  lister: Option<ListingScope>,
   asked: List<Int>,
-) -> Result<Map<Int, Result<List<Listed>, Unlisted>>, List<Diag>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
+) -> Result<Map<Int, Result<List<ListedCase>, ListingFailure>>, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
   match lister {
     None -> Ok(Map::new()),
     Some(l) -> {
       let handed = l.front;
       let tables = asked.fold(Map::new(), |acc: Map<RootName, Bool>, i: Int|
         match test_root_at(handed.dump, i) {
-          Some(r) -> acc.insert(root_name(Cases(r)), true),
+          Some(r) -> acc.insert(root_name(TestCases(r)), true),
           None -> acc,
         });
       match emit.unit(handed, offered_over(handed, tables, l.reach)) {
-        Err(diags) -> Err(diags),
+        Err(diagnostics) -> Err(diagnostics),
         Ok(e) -> match units::library(e.sources, testing.options.machine.profile) {
-          Err(diags) -> Err(diags),
+          Err(diagnostics) -> Err(diagnostics),
           Ok(library) -> match tester::unit_of(testing, handed, Some(library), false) {
-            Err(diags) -> Err(diags),
+            Err(diagnostics) -> Err(diagnostics),
             Ok(unit) -> {
               let cases = asked.fold(
                 Map::new(),
-                |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int|
+                |acc: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int|
                   acc.insert(i, tester::cases(unit, i)),
               );
-              tester::closed(unit);
+              tester::close_unit(unit);
               Ok(cases)
             },
           },
@@ -198,9 +174,10 @@ pub fn listed(
     },
   }
 
-/// What listing the tests over cases at `listing` enters of the program: their tables and labels,
-/// and what those reach.
-pub fn listing_within(analysis: View, listing: List<Int>) -> Within / {abort.raise} = {
+pub fn listing_within(
+  analysis: CheckedProgram,
+  listing: List<Int>,
+) -> TestRunScope / {abort.raise} = {
   let keys = listing.fold([], |acc: List<Bytes>, i: Int|
     match test_at(analysis, i) { Some(t) -> acc.push(t.key), None -> acc });
   {
@@ -209,24 +186,20 @@ pub fn listing_within(analysis: View, listing: List<Int>) -> Within / {abort.rai
   }
 }
 
-/// What running the entries at `running` enters of the program: their tests and all they reach.
-pub fn run_within(over: Ranged, running: List<Int>) -> Within / {abort.raise} =
+pub fn run_within(over: ExpandedTests, running: List<Int>) -> TestRunScope / {abort.raise} =
   {
     owners: reached_by(over.analysis, running),
     tests: running.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Int|
       match over.entries.at(k) { Some(entry) -> acc.insert(entry.of, true), None -> acc }),
   }
 
-/// The functions the tests at `tests` reach, and what a reached definition's clauses reach.
-fn reached_by(analysis: View, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
+fn reached_by(analysis: CheckedProgram, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
   reached_functions(
     analysis.frame.hashes,
-    tests.fold([], |acc: List<Which>, i: Int|
-      match test_at(analysis, i) { Some(t) -> acc.push(TheItem(t.key)), None -> acc }),
+    tests.fold([], |acc: List<Subject>, i: Int|
+      match test_at(analysis, i) { Some(t) -> acc.push(ItemKeyed(t.key)), None -> acc }),
   )
 
-/// The roots a unit offers: those `own` names, and each root of a definition `reached` names, so a
-/// root runs here as in the whole program's unit and its code digests alike.
 fn offered_over(
   front: LoadedAnalysis,
   own: Map<RootName, Bool>,
@@ -236,43 +209,35 @@ fn offered_over(
     own.contains(root_name(r))
       || (match root_owner(r) { Named(d) -> reached.contains(d), _ -> false }))
 
-/// The root a root answers for: a clause's is its definition.
-fn root_owner(root: RootKey) -> RootKey = match root { Clause(c) -> c.def, _ -> root }
+fn root_owner(root: RootKey) -> RootKey = match root { Clause(c) -> c.definition, _ -> root }
 
-/// The unit the run's tests at `tests` execute in: their roots, a test over cases with the root that
-/// lists its table, and all they reach (`reached`); or the whole program's where a schema has
-/// constants to enter.
 pub fn run_unit(
   front: LoadedAnalysis,
-  over: Ranged,
+  over: ExpandedTests,
   tests: List<Int>,
   reached: Map<Bytes, Bool>,
   schema: Bool,
-) -> Result<Option<Emitted>, List<Diag>> / {emit.unit, abort.raise} =
-  if schema { match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diags) -> Err(diags) } }
-  else if tests.len() == 0 { Ok(None) } else {
+) -> Result<Option<Emitted>, List<Diagnostic>> / {emit.unit, abort.raise} =
+  if schema {
+    match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diagnostics) -> Err(diagnostics) }
+  } else if tests.len() == 0 { Ok(None) } else {
     let own = tests.fold(Map::new(), |acc: Map<RootName, Bool>, k: Int|
       match over.entries.at(k) {
         Some(entry) -> match test_root_at(front.dump, entry.test) {
-          Some(r) -> acc.insert(root_name(r), true).insert(root_name(Cases(r)), true),
+          Some(r) -> acc.insert(root_name(r), true).insert(root_name(TestCases(r)), true),
           None -> acc,
         },
         None -> acc,
       });
     match emit.unit(front, offered_over(front, own, reached)) {
       Ok(e) -> Ok(Some(e)),
-      Err(diags) -> Err(diags),
+      Err(diagnostics) -> Err(diagnostics),
     }
   }
 
-/// The run's tests, each case of a test over cases a test of its own: its label is its name, and its
-/// test's hash and its identity make its hash. In `analysis` a case reaches what its test does, its
-/// table among it, which is what covers a definition; in `judged` it reaches only what it runs,
-/// which is what a failure of it is suspected against. `entries` is how the runtime is asked for
-/// each, by the index it has here.
-pub type Ranged = { analysis: View, judged: View, entries: List<Entry> }
+pub type ExpandedTests = { analysis: CheckedProgram, judged: CheckedProgram, entries: List<Entry> }
 
-type Ranging = {
+type ExpansionState = {
   tests: List<TestInfo>,
   hashes: Map<Bytes, Bytes>,
   entries: List<Entry>,
@@ -280,8 +245,7 @@ type Ranging = {
   runs: Map<Bytes, List<Int>>,
 }
 
-/// `key` starting where it did and at `reached` besides.
-fn starting(
+fn add_starts(
   starts: Map<Bytes, List<Int>>,
   key: Bytes,
   reached: Option<List<Int>>,
@@ -295,22 +259,17 @@ fn starting(
       ),
   }
 
-/// One thing a run identifies by a key: test `test` by its name, or its case at position `case`
-/// by that case's label.
 type Claim = { test: Int, case: Option<Int> }
 
 fn claimed(claims: Map<Bytes, List<Claim>>, key: Bytes, by: Claim) -> Map<Bytes, List<Claim>> =
   claims.insert(key, List::push(match claims.get(key) { Some(held) -> held, None -> [] }, by))
 
-/// The listings, except that a test fails as a whole, running none of its cases, when one of its
-/// cases has the label of another case in its table, of another test, or of a case of another
-/// test. A run identifies each case by its label, so two with one label would be mixed up.
 fn distinct_labels(
   tests: List<TestInfo>,
   labels: List<Location>,
-  listings: Map<Int, Result<List<Listed>, Unlisted>>,
-) -> Map<Int, Result<List<Listed>, Unlisted>> = {
-  let case_key = |t: TestInfo, c: Listed| qualify(t.module, Bytes::of_string(c.label));
+  listings: Map<Int, Result<List<ListedCase>, ListingFailure>>,
+) -> Map<Int, Result<List<ListedCase>, ListingFailure>> = {
+  let case_key = |t: TestInfo, c: ListedCase| qualify(t.module, Bytes::of_string(c.label));
   let claims = range(0, tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Claim>>, i: Int|
     match tests.at(i) {
       None -> acc,
@@ -329,10 +288,10 @@ fn distinct_labels(
     });
   listings.fold(
     listings,
-    |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int, listed: Result<List<Listed>, Unlisted>|
-      match ((listed, tests.at(i))) {
+    |acc: Map<Int, Result<List<ListedCase>, ListingFailure>>, i: Int, list_cases: Result<List<ListedCase>, ListingFailure>|
+      match ((list_cases, tests.at(i))) {
         (Ok(listing), Some(t)) -> {
-          let first = range(0, listing.len()).fold(None, |found: Option<Unlisted>, k: Int|
+          let first = range(0, listing.len()).fold(None, |found: Option<ListingFailure>, k: Int|
             match ((found, listing.at(k))) {
               (None, Some(c)) ->
                 label_clash(labels, i, k, c.label, match claims.get(case_key(t, c)) {
@@ -348,16 +307,13 @@ fn distinct_labels(
   )
 }
 
-/// Why test `i` fails when its case at position `k` has the label `label`, given everything in
-/// the run with that label's key; `None` when nothing else has it. `labels` is where each test's
-/// label is written.
 fn label_clash(
   labels: List<Location>,
   i: Int,
   k: Int,
   label: String,
   claims: List<Claim>,
-) -> Option<Unlisted> =
+) -> Option<ListingFailure> =
   match labels.at(i) {
     None -> None,
     Some(at) -> match claims.filter(|c: Claim| c.test != i) {
@@ -399,14 +355,19 @@ fn label_clash(
     },
   }
 
-/// A test failing as a whole with `message`, pointing at its label `at` and at `also`.
-fn refused(at: Location, also: List<Label>, message: String) -> Unlisted =
+fn refused(at: Location, also: List<Label>, message: String) -> ListingFailure =
   {
     status: "failed",
     failure: {
-      diag: diag_of("error", "E0105", message, [pointing(at, true, "this test")].concat(also), [
-        "each test and each case in a module needs its own label, so none of this test's cases ran",
-      ]),
+      diagnostic: diagnostic_of(
+        "error",
+        "E0105",
+        message,
+        [pointing(at, true, "this test")].concat(also),
+        [
+          "each test and each case in a module needs its own label, so none of this test's cases ran",
+        ],
+      ),
       values: [],
     },
   }
@@ -420,7 +381,6 @@ fn pointing(at: Location, primary: Bool, text: String) -> Label =
     text: Bytes::of_string(text),
   }
 
-/// Positions in a table, listing the first three and counting the rest.
 fn places(at: List<Int>) -> String =
   match at {
     [a, b] -> a.to_string() ++ " and " ++ b.to_string(),
@@ -433,10 +393,10 @@ fn places(at: List<Int>) -> String =
     [] -> "",
   }
 
-pub fn ranged(
-  analysis: View,
-  listings: Map<Int, Result<List<Listed>, Unlisted>>,
-) -> Ranged / {abort.raise} = {
+pub fn expand_cases(
+  analysis: CheckedProgram,
+  listings: Map<Int, Result<List<ListedCase>, ListingFailure>>,
+) -> ExpandedTests / {abort.raise} = {
   let tests = analysis.checked.tests;
   let cases = distinct_labels(tests, test_label_spans(analysis.frame.outlines), listings);
   let plain = range(0, tests.len()).map(|i: Int|
@@ -450,13 +410,13 @@ pub fn ranged(
         starts: analysis.frame.hashes.refs.items,
         runs: analysis.frame.hashes.refs.items,
       },
-      |acc: Ranging, i: Int|
+      |acc: ExpansionState, i: Int|
         match ((tests.at(i), plain.at(i))) {
           (Some(t), Some(whole)) -> {
             let hash = analysis.frame.hashes.tests.get(t.key);
             match cases.get(i) {
               Some(Ok(listing)) ->
-                range(0, listing.len()).fold(acc, |a: Ranging, k: Int|
+                range(0, listing.len()).fold(acc, |a: ExpansionState, k: Int|
                   match listing.at(k) {
                     None -> a,
                     Some(c) -> {
@@ -476,12 +436,12 @@ pub fn ranged(
                           ..whole,
                           case: Some({ at: k, identity: c.identity }),
                         }),
-                        starts: starting(
+                        starts: add_starts(
                           a.starts,
                           key,
                           analysis.frame.hashes.refs.items.get(t.key),
                         ),
-                        runs: starting(a.runs, key, analysis.frame.hashes.refs.cases.get(t.key)),
+                        runs: add_starts(a.runs, key, analysis.frame.hashes.refs.cases.get(t.key)),
                       }
                     },
                   }),
@@ -516,8 +476,6 @@ pub fn ranged(
   }
 }
 
-/// Each test's code by index: the digest of what its root runs in the unit, and for a case its
-/// identity with it.
 pub fn codes_of(
   front: LoadedAnalysis,
   emitted: Emitted,
@@ -537,33 +495,29 @@ pub fn codes_of(
     })
 }
 
-/// The tests the store holds a pass for under the code they run that still stands, each with the
-/// trace it stands on. `loaded` is what the run's load read of the shipped modules
-/// (`views.held_texts`); `options` the run's, whose roots a pass's reads are read against.
 pub fn passed_by_code(
   decisions: List<Decision>,
   keyed: Map<Int, Bytes>,
   loaded: Map<Bytes, Bytes>,
   options: Options,
-  supplied: machine::Configured,
-) -> Map<Int, Bytes> / {ledger.code_passes, entering::machine.moved, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let asked = asked_by_code(decisions, keyed);
+  supplied: machine::RunConfiguration,
+) -> Map<Int, Bytes> / {result_cache.code_passes, entering::machine.changed_read, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let asked = code_keys_to_query(decisions, keyed);
   let answers = if asked.len() == 0 { [] }
-  else { ledger.code_passes(asked.map(|a: { index: Int, key: Bytes }| a.key)) };
-  let now = views::now_for(views::viewed_in(traces_of(answers)), |m: Bytes|
-    views::read_held(loaded, m));
+  else { result_cache.code_passes(asked.map(|a: { index: Int, key: Bytes }| a.key)) };
+  let now = views::shipped_state_of(views::views_in(traces_of(answers)), |m: Bytes|
+    views::read_shipped_text(loaded, m));
   range(0, asked.len()).fold(Map::new(), |acc: Map<Int, Bytes>, i: Int|
     match answers.at(i) {
-      Some(Some(trace)) -> if standing(now, Some(trace), options, supplied) == Some(Stands) {
+      Some(Some(trace)) -> if pass_status(now, Some(trace), options, supplied) == Some(Stands) {
         acc.insert(asked.at_or(i, { index: 0 - 1, key: b"" }).index, trace)
       } else { acc },
       _ -> acc,
     })
 }
 
-/// What the binding came to, its reach said of the run's tests: a case is reached as its test is.
-fn hosted_over(program: Program) -> Hosted / {abort.raise} = {
-  let hosted = tester::hosted_of(program.unit.testing, program.unit);
+fn binding_report_over(program: Program) -> BindingReport / {abort.raise} = {
+  let hosted = tester::binding_report_of(program.unit.testing, program.unit);
   let reached = set_of(hosted.reaches);
   {
     ..hosted,
@@ -573,67 +527,60 @@ fn hosted_over(program: Program) -> Hosted / {abort.raise} = {
   }
 }
 
-/// The run itself, what it establishes, filed, and what it is asked after: a mutation of a green
-/// run, and what changed under every failure. `judged` is the tests as a pass is recorded and a failure
-/// suspected: a case reaching only what it runs. The binding of `program`'s unit is torn down once
-/// its tests ran; the unit stays the caller's to close.
 pub fn concluded_run(
   flags: Flags,
   style: Style,
   options: Options,
   program: Program,
-  timed: Timed,
-  analysis: View,
-  judged: View,
+  timed: TimedLoad,
+  analysis: CheckedProgram,
+  judged: CheckedProgram,
   scope: Scope,
   decisions: List<Decision>,
-  decided: Decided,
+  decided: RunDecision,
   keyed: Map<Int, Bytes>,
-  // The passes refiled under their own keys, and where the run keeps its answer.
-  keeps: { refiled: List<Pass>, kept: Option<Keeping> },
+  keeps: { refiled: List<Pass>, kept: Option<CacheTarget> },
   searching: plan::Plan,
-  configured: List<Diag>,
-  targeted: Option<List<DefInfo>>,
-  spent: Spent,
-) -> Answer / {process.out[proc], time.elapsed_us, entering::machine.open, entering::machine.enter, entering::machine.unbind, entering::machine.close, ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.texts, ledger.unfiled, ledger.history, ledger.filed, emit.unit, emit.compiled, shipped.answer, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, shipped.reached} = {
+  configured: List<Diagnostic>,
+  targeted: Option<List<DefinitionInfo>>,
+  spent: TimeSpent,
+) -> CommandOutput / {process.out[proc], time.elapsed_us, entering::machine.open, entering::machine.enter, entering::machine.unbind, entering::machine.close, result_cache.open_warnings, result_cache.passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing, emit.unit, emit.compiled, shipped.read_pack, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, shipped.report_reached} = {
   let refiled = keeps.refiled;
   let kept = keeps.kept;
-  // What the next run answers: this run's notices of its cache and its store are not in it.
   let after = match kept { Some(k) -> k.after, None -> false };
   let asked = {
     plan: searching,
     measuring: options.sim.measure_reduction,
     lanes: match options.jobs { Some(n) -> if n > 0 { Some(n) } else { None }, None -> None },
   };
-  let narrowing = narrowed(decisions, decided.search.roots);
-  // The head and each group's results are printed as they are known, so a run that ends early
-  // still shows what it finished. A run made only to keep the next run's answer prints nothing.
+  let narrowing = narrowed_searches(decisions, decided.search.roots);
   let shown = !after;
   let width = name_column(program, decided);
-  let hosted = hosted_over(program);
+  let hosted = binding_report_over(program);
   let opening = opening_lines(style, flags, program, decided, opening_of(options, program, hosted));
   if shown { printed(opening) };
   let started = time.elapsed_us();
   let done = decided.classes.flat_map(|group: Group| {
-    let ran = ran_class(
+    let ran = run_class(
       group.tests.map(|i: Int| job_of(program, program.unit, i, narrowing, searching)),
       asked,
     );
     if shown {
-      printed(result_lines(style, program, ran.map(|d: Done| ran_outcome(analysis, d)), width))
+      printed(result_lines(style, program, ran.map(|d: JobResult| job_outcome(analysis, d)), width))
     };
     ran
   });
   let elapsed = time.elapsed_us() - started;
-  let h = hashes_of(judged, results::era_digest_of(timed.program.modules));
+  let h = hashes_of(judged, results::snapshot_digest_of(timed.program.modules));
   let running = set_of(decided.runs);
-  let by_test = done.fold(Map::new(), |acc: Map<Int, Done>, d: Done| acc.insert(d.test, d));
-  let c: Concluded<Raised> = conclude::concluded(
+  let by_test = done.fold(Map::new(), |acc: Map<Int, JobResult>, d: JobResult|
+    acc.insert(d.test, d));
+  let c: Conclusion<RuntimeDiagnostic> = conclude::conclude_run(
     conclude_tests(analysis, program),
     h,
     {
       groups: decided.classes.map(|group: Group| group.tests),
-      filed: filed(decisions, decided.search).fold(
+      filed: pass_keys_by_test(decisions, decided.search).fold(
         Map::new(),
         |acc: Map<Int, List<Bytes>>, e: { index: Int, keys: List<Bytes> }|
           if running.contains(e.index) { acc.insert(e.index, e.keys) } else { acc },
@@ -648,9 +595,14 @@ pub fn concluded_run(
     done.map(conclusion_of),
   );
   let said = if flags.no_cache { [] } else {
-    history_of(analysis, sourced(timed.program, analysis.frame), timed.program.modules, c.filing);
-    filing_said(
-      ledger.filed({ ..c.filing, passes: c.filing.passes.concat(refiled) }),
+    store_history(
+      analysis,
+      sources_of(timed.program, analysis.frame),
+      timed.program.modules,
+      c.filing,
+    );
+    store_warnings(
+      result_cache.store_filing({ ..c.filing, passes: c.filing.passes.concat(refiled) }),
       "could not write the test cache: ",
       "the run itself is valid; every test will simply be re-run next time",
     )
@@ -660,7 +612,7 @@ pub fn concluded_run(
     timed,
     analysis,
     program,
-    ran_of(
+    run_report_of(
       options,
       program,
       analysis,
@@ -676,12 +628,11 @@ pub fn concluded_run(
     asked,
     targeted,
   );
-  // Every test the binding serves has run, a mutant's among them.
-  let r = { ..tried, handshakes: tester::unbound(program.unit.testing) };
+  let r = { ..tried, handshakes: tester::unbind(program.unit.testing) };
   let found = diagnosed_all(flags.no_cache, timed, judged, c, r.failures);
-  let lazily = if flags.no_cache || after { [] } else { ledger.opened() };
+  let lazily = if flags.no_cache || after { [] } else { result_cache.open_warnings() };
   let concluding = time.elapsed_us() - started - elapsed;
-  let answer = answered(
+  let answer = test_output(
     style,
     flags,
     program,
@@ -695,9 +646,9 @@ pub fn concluded_run(
     decided,
   );
   match kept {
-    Some(k) -> if decided.runs.len() == 0 && answer.code == ok_code() && unwarned(answer)
+    Some(k) -> if decided.runs.len() == 0 && answer.code == ok_code() && has_no_warnings(answer)
         && all_cached(decisions, scope) {
-      let _ = keep_command(
+      let _ = cache_command(
         flags.paths,
         k.project,
         k.key,
@@ -711,7 +662,7 @@ pub fn concluded_run(
             json: to_string(answer.json),
             passes: k.passes,
           },
-          kept_bin(),
+          cached_output_bin(),
         ),
       );
       ()
@@ -721,14 +672,13 @@ pub fn concluded_run(
   answer
 }
 
-/// What writing to the store had to say, its own failure first.
-fn filing_said(f: Filed, unflushed: String, note: String) -> List<Diag> =
+fn store_warnings(f: StoreResult, unflushed: String, note: String) -> List<Diagnostic> =
   match f.unflushed {
     None -> f.warnings,
-    Some(why) -> [diag_of("warning", "W0601", unflushed ++ why, [], [note])].concat(f.warnings),
+    Some(why) ->
+      [diagnostic_of("warning", "W0601", unflushed ++ why, [], [note])].concat(f.warnings),
   }
 
-/// The search a seeded test's key is computed against, as the selector reads one.
 pub fn search_of(p: plan::Plan) -> Search / {abort.raise} =
   {
     mode: plan::mode_word(p.mode),
@@ -738,7 +688,6 @@ pub fn search_of(p: plan::Plan) -> Search / {abort.raise} =
     path: p.path,
   }
 
-/// The whole plan, as the document's options carry it: every field is in a seeded test's key.
 pub fn sim_json(p: plan::Plan, sim: machine::SimulationOptions) -> Json / {abort.raise} =
   object([
     { key: "budget", value: int(p.budget) },
@@ -765,8 +714,6 @@ pub fn sim_json(p: plan::Plan, sim: machine::SimulationOptions) -> Json / {abort
     { key: "steps", value: int(p.steps) },
   ])
 
-// --- Tests ------------------------------------------------------------------
-
 test "the search a seeded test is keyed on is the plan the flags name, and the document says it" {
   let p = machine::sim_plan_of({
     ..machine::no_sim_options(),
@@ -781,8 +728,6 @@ test "the search a seeded test is keyed on is the plan the flags name, and the d
   assert(doc.contains("\"roots\":[16]"))
 }
 
-// --- Footprints over real programs --------------------------------------------
-
 test "a run takes in its root's tests, the library's own tree's among them, and no pulled module's" {
   let library = {
     name: b"std.y",
@@ -794,7 +739,7 @@ test "a run takes in its root's tests, the library's own tree's among them, and 
   };
   let keys = |user: List<Source>, shipped: List<Source>| {
     let w = match analyse_pulling_std_with(user, shipped, no_rows(), reached: false).out {
-      Analysed(w) -> view_of(w),
+      Analysed(w) -> checked_program_of(w),
       Refused(_) -> panic("the fixture checks"),
     };
     scope_of(w, [], None, None).visible.map(|i: Int|
@@ -805,7 +750,5 @@ test "a run takes in its root's tests, the library's own tree's among them, and 
     src: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
   };
   assert_eq(keys([program], [library, compiler]), [b"m.own"]);
-  // A root holding the whole of the library the toolchain lists is the library: its tests are the
-  // run's.
   assert_eq(keys([library], [library, compiler]), [b"std.y.library"])
 }

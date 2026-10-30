@@ -1,0 +1,162 @@
+//! `egraph` — union-find over terms, and the two structural rules a constructor obeys.
+
+import term (Terms, Node, IntTerm, BoolTerm, StringTerm, DecimalTerm, FloatTerm, ConstructorTerm,
+             NilTerm, ConsTerm, ApplicationTerm, OpaqueTerm, RecordTerm, node, size)
+
+pub type TermPair = { a: Int, b: Int }
+
+/// Every term points straight at its class's least id, which is the class's representative.
+pub type Classes = { parent: List<Int>, disequalities: List<TermPair>, contradiction: Bool }
+
+/// The classes after a union, and whether the two were not already one.
+pub type UnionResult = { cs: Classes, changed: Bool }
+
+pub fn classes(n: Int) -> Classes = { parent: range(0, n), disequalities: [], contradiction: false }
+
+/// Terms made after this branch started join as their own classes.
+pub fn grow(cs: Classes, n: Int) -> Classes =
+  if cs.parent.len() >= n { cs } else {
+    {
+      ..cs,
+      parent: range(cs.parent.len(), n).fold(cs.parent, |acc: List<Int>, i: Int| acc.push(i)),
+    }
+  }
+
+pub fn find(cs: Classes, t: Int) -> Int = match cs.parent.at(t) { Some(p) -> p, None -> t }
+
+/// The lower id is kept, so representatives do not depend on the order of assertion.
+pub fn union(cs: Classes, a: Int, b: Int) -> UnionResult = {
+  let ra = find(cs, a);
+  let rb = find(cs, b);
+  if ra == rb { { cs: cs, changed: false } } else {
+    let keep = if ra < rb { ra } else { rb };
+    let drop = if ra < rb { rb } else { ra };
+    {
+      cs: { ..cs, parent: cs.parent.map(|p: Int| if p == drop { keep } else { p }) },
+      changed: true,
+    }
+  }
+}
+
+pub fn equal(cs: Classes, a: Int, b: Int) -> Bool = find(cs, a) == find(cs, b)
+
+pub fn distinguish(cs: Classes, a: Int, b: Int) -> Classes =
+  { ..cs, disequalities: cs.disequalities.push({ a: a, b: b }) }
+
+pub fn has_disequality(cs: Classes, a: Int, b: Int) -> Bool =
+  cs.disequalities.fold(false, |found: Bool, d: TermPair| found || (d.a == a && d.b == b))
+
+pub fn check_disequalities(cs: Classes) -> Classes =
+  if cs.disequalities.fold(false, |found: Bool, d: TermPair| found || equal(cs, d.a, d.b)) {
+    { ..cs, contradiction: true }
+  } else { cs }
+
+/// Each class's representative and members, in order of first appearance.
+pub fn groups(cs: Classes, n: Int) -> List<{ representation: Int, members: List<Int> }> = {
+  let placed = range(0, n).fold(
+    { out: [], at: Map::new() },
+    |acc: { out: List<{ representation: Int, members: List<Int> }>, at: Map<Int, Int> }, t: Int| {
+      let rep = find(cs, t);
+      match acc.at.get(rep) {
+        Some(i) -> match acc.out.at(i) {
+          Some(g) ->
+            {
+              out: acc.out.set(i, { representation: g.representation, members: g.members.push(t) }),
+              at: acc.at,
+            },
+          None -> acc,
+        },
+        None ->
+          {
+            out: acc.out.push({ representation: rep, members: [t] }),
+            at: acc.at.insert(rep, acc.out.len()),
+          },
+      }
+    },
+  );
+  placed.out
+}
+
+/// What a term's head says about its value, for the injectivity and disjointness rules.
+pub type Shape =
+  | IntShape(Int)
+  | BoolShape(Bool)
+  | StringShape(String)
+  | DecimalShape(String)
+  | FloatShape(Int)
+  | ConstructorShape(String)
+  | NilShape
+  | ConsShape
+  | RecordShape(List<String>)
+
+pub fn shape_of(terms: Terms, t: Int) -> Option<Shape> / {abort.raise} =
+  match node(terms, t) {
+    IntTerm(k) -> Some(IntShape(k)),
+    BoolTerm(b) -> Some(BoolShape(b)),
+    StringTerm(s) -> Some(StringShape(s)),
+    DecimalTerm(d) -> Some(DecimalShape(d)),
+    FloatTerm(bits) -> Some(FloatShape(bits)),
+    ConstructorTerm(c) -> Some(ConstructorShape(c.name)),
+    NilTerm -> Some(NilShape),
+    ConsTerm(_) -> Some(ConsShape),
+    // `List::push` always answers a cons, so its result is never `[]`.
+    ApplicationTerm(a) -> match node(terms, a.head) {
+      OpaqueTerm(name) -> if name == "List::push" { Some(ConsShape) } else { None },
+      _ -> None,
+    },
+    RecordTerm(fields) -> Some(RecordShape(fields.map(|f: { name: String, value: Int }| f.name))),
+    _ -> None,
+  }
+
+/// Whether two shapes of one kind name different values; `None` when they are not of one kind.
+pub fn conflict(a: Shape, b: Shape) -> Option<Bool> =
+  match a {
+    IntShape(x) -> match b { IntShape(y) -> Some(x != y), _ -> None },
+    BoolShape(x) -> match b { BoolShape(y) -> Some(x != y), _ -> None },
+    StringShape(x) -> match b { StringShape(y) -> Some(x != y), _ -> None },
+    DecimalShape(x) -> match b { DecimalShape(y) -> Some(x != y), _ -> None },
+    FloatShape(x) -> match b { FloatShape(y) -> Some(x != y), _ -> None },
+    NilShape -> match b { NilShape -> Some(false), ConsShape -> Some(true), _ -> None },
+    ConsShape -> match b { ConsShape -> Some(false), NilShape -> Some(true), _ -> None },
+    ConstructorShape(x) -> match b { ConstructorShape(y) -> Some(x != y), _ -> None },
+    RecordShape(x) -> match b { RecordShape(y) -> Some(x != y), _ -> None },
+  }
+
+test "a union keeps the lower id, and a union of one class changes nothing" {
+  let j = union(classes(4), 3, 1);
+  assert(j.changed);
+  assert_eq(find(j.cs, 3), 1);
+  assert(!union(j.cs, 1, 3).changed);
+  assert_eq(groups(j.cs, 4), [
+    { representation: 0, members: [0] },
+    { representation: 1, members: [1, 3] },
+    { representation: 2, members: [2] },
+  ])
+}
+
+test "a disequality between one class is a contradiction" {
+  let cs = distinguish(classes(3), 0, 2);
+  assert(!check_disequalities(cs).contradiction);
+  assert(check_disequalities(union(cs, 0, 2).cs).contradiction)
+}
+
+test "shapes of one kind conflict exactly when their values differ" {
+  assert_eq(conflict(IntShape(1), IntShape(2)), Some(true));
+  assert_eq(conflict(DecimalShape("1.5"), DecimalShape("1.50")), Some(true));
+  assert_eq(conflict(FloatShape(0), FloatShape(0 - 9223372036854775807 - 1)), Some(true));
+  assert_eq(conflict(NilShape, ConsShape), Some(true));
+  assert_eq(conflict(ConstructorShape("a"), IntShape(1)), None)
+}
+
+test "a class representative does not depend on the union order" {
+  let forward = union(union(classes(4), 0, 1).cs, 1, 2).cs;
+  let backward = union(union(classes(4), 2, 1).cs, 1, 0).cs;
+  assert_eq(find(forward, 2), find(backward, 0));
+  assert_eq(find(forward, 2), 0)
+}
+
+test "shapes of different kinds conclude nothing" {
+  assert_eq(conflict(IntShape(1), BoolShape(true)), None);
+  assert_eq(conflict(NilShape, IntShape(0)), None);
+  assert_eq(conflict(IntShape(1), IntShape(1)), Some(false))
+}

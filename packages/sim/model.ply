@@ -3,84 +3,84 @@
 //! schedules a region, from the same stream. Its counts are the Rust search's on the same programs.
 
 import plan (Seed, Plan, Dpor, Once, Random, default_plan, once, root_seed, u64_le)
-import recording (Step, Interleaving, Passed, Failed, Access, AAtom, AVar)
-import search (Exploration, Explored, Exact, All, Cost, explore, explore_under, measure_reduction,
-               backtracks, passed, Unscheduled, Diverged)
+import recording (Step, Interleaving, Passed, Failed, Access, AtomAccess, VariableAccess)
+import search (Exploration, SearchResult, Exact, All, Cost, explore, explore_under,
+               measure_reduction, backtracks, passed, InvalidRecording, Diverged)
 import std.list
 
-type Op =
+type Operation =
   | Load(Int)
   | Store(Int)
   /// `db.read[resource]` or `db.write[resource]`.
   | Perform(String, Bool)
-  | Spawn(String, List<Op>)
+  | Spawn(String, List<Operation>)
   /// This task's `n`th child by spawn order, so a program means the same under every interleaving.
   | Join(Int)
   | Yield
 
-type Actor = {
+type ModelTask = {
   name: String,
-  ops: List<Op>,
-  pc: Int,
+  operations: List<Operation>,
+  program_counter: Int,
   register: Int,
   children: List<Int>,
   blocked: Option<Int>,
   clock: List<Int>,
 }
 
-type Model = { main: List<Op>, expect: List<{ variable: Int, value: Int }> }
+type Model = { main: List<Operation>, expect: List<{ variable: Int, value: Int }> }
 
-fn program(main: List<Op>) -> Model = { main: main, expect: [] }
+fn program(main: List<Operation>) -> Model = { main: main, expect: [] }
 
 fn expecting(model: Model, expected: List<{ variable: Int, value: Int }>) -> Model =
   { ..model, expect: expected }
 
-fn step_cap() -> Int = 4096
+fn max_steps() -> Int = 4096
 
 /// Done with its operations and blocked on nothing unfinished. A chain longer than the tasks has
 /// come round on itself, and tasks waiting on each other never finish.
-fn finished(tasks: List<Actor>, t: Int) -> Bool / {abort.raise} =
+fn finished(tasks: List<ModelTask>, t: Int) -> Bool / {abort.raise} =
   match range(0, tasks.len() + 1).fold(
-      { task: t, answer: None },
-      |s: { task: Int, answer: Option<Bool> }, _round: Int|
-        match s.answer {
+      { task: t, result: None },
+      |s: { task: Int, result: Option<Bool> }, _round: Int|
+        match s.result {
           Some(_) -> s,
           None -> {
             let task = tasks.get(s.task);
-            if task.pc != task.ops.len() { { ..s, answer: Some(false) } } else {
+            if task.program_counter != task.operations.len() { { ..s, result: Some(false) } } else {
               match task.blocked {
-                None -> { ..s, answer: Some(true) },
+                None -> { ..s, result: Some(true) },
                 Some(on) -> { ..s, task: on },
               }
             }
           },
         },
-    ).answer {
+    ).result {
     Some(done) -> done,
     None -> false,
   }
 
-fn enabled_of(tasks: List<Actor>) -> List<Int> / {abort.raise} =
+fn enabled_tasks(tasks: List<ModelTask>) -> List<Int> / {abort.raise} =
   range(0, tasks.len()).filter(|t: Int| {
     let task = tasks.get(t);
-    task.pc < task.ops.len()
+    task.program_counter < task.operations.len()
       && (match task.blocked { None -> true, Some(on) -> finished(tasks, on) })
   })
 
-fn widened(clock: List<Int>, width: Int) -> List<Int> =
+fn widen_clock(clock: List<Int>, width: Int) -> List<Int> =
   range(clock.len(), width).fold(clock, |acc: List<Int>, _i: Int| acc.push(0))
 
-fn ticked(tasks: List<Actor>, t: Int) -> List<Actor> / {abort.raise} = {
+fn tick_clock(tasks: List<ModelTask>, t: Int) -> List<ModelTask> / {abort.raise} = {
   let width = tasks.len();
-  let wide = tasks.map(|task: Actor| { ..task, clock: widened(task.clock, width) });
+  let wide = tasks.map(|task: ModelTask| { ..task, clock: widen_clock(task.clock, width) });
   let task = wide.get(t);
   wide.set(t, { ..task, clock: task.clock.set(t, task.clock.get(t) + 1) })
 }
 
-fn absorbed(tasks: List<Actor>, into: Int, from: Int) -> List<Actor> / {abort.raise} = {
+fn merge_clock(tasks: List<ModelTask>, into: Int, from: Int) -> List<ModelTask> / {abort.raise} = {
   let source = tasks.get(from).clock;
   let target = tasks.get(into);
-  let wide = widened(target.clock, source.len());
+  let wide = widen_clock(target.clock, source.len());
   let merged = range(0, wide.len()).map(|i: Int|
     max(wide.get(i), match source.at(i) { Some(s) -> s, None -> 0 }));
   tasks.set(into, { ..target, clock: merged })
@@ -101,7 +101,7 @@ fn draw(root: U64, counter: Int) -> U64 / {abort.raise} = {
 }
 
 /// Uniform over `0..n`, drawing again past the last whole multiple of `n`.
-fn below(root: U64, counter: Int, n: Int) -> { value: Int, counter: Int } / {abort.raise} = {
+fn draw_below(root: U64, counter: Int, n: Int) -> { value: Int, counter: Int } / {abort.raise} = {
   let limit = 18446744073709551615u64 / U64::of_int(n) * U64::of_int(n);
   iterate(counter, 64, |c: Int| {
     let x = draw(root, c);
@@ -110,8 +110,8 @@ fn below(root: U64, counter: Int, n: Int) -> { value: Int, counter: Int } / {abo
   })
 }
 
-type Running = {
-  tasks: List<Actor>,
+type RunState = {
+  tasks: List<ModelTask>,
   vars: Map<Int, Int>,
   counter: Int,
   steps: List<Step>,
@@ -121,19 +121,19 @@ type Running = {
 fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
   let main = {
     name: "main",
-    ops: model.main,
-    pc: 0,
+    operations: model.main,
+    program_counter: 0,
     register: 0,
     children: [],
     blocked: None,
     clock: [0],
   };
   let start = { tasks: [main], vars: Map::new(), counter: 0, steps: [], capped: false };
-  let end = iterate(start, step_cap() + 2, |st: Running| {
-    let enabled = enabled_of(st.tasks);
+  let end = iterate(start, max_steps() + 2, |st: RunState| {
+    let enabled = enabled_tasks(st.tasks);
     if enabled.len() == 0 { Stop(st) }
-    else if st.steps.len() >= step_cap() { Stop({ ..st, capped: true }) }
-    else { Continue(stepped(st, seed, enabled)) }
+    else if st.steps.len() >= max_steps() { Stop({ ..st, capped: true }) }
+    else { Continue(take_step(st, seed, enabled)) }
   });
   if end.capped {
     { steps: end.steps, verdict: Failed("the model ran out of steps"), virtual_time: 0 }
@@ -160,43 +160,43 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
 
 fn variable_of(vars: Map<Int, Int>, v: Int) -> Int = match vars.get(v) { Some(x) -> x, None -> 0 }
 
-fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.raise} = {
+fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.raise} = {
   let point = st.steps.len();
   let drawn = match seed.path.at(point) {
     Some(fixed) -> { value: fixed, counter: st.counter },
-    None -> below(seed.root, st.counter, enabled.len()),
+    None -> draw_below(seed.root, st.counter, enabled.len()),
   };
   let chosen = min(drawn.value, enabled.len() - 1);
   let t = enabled.get(chosen);
   let task = st.tasks.get(t);
-  let op = task.ops.get(task.pc);
-  let moved = ticked(st.tasks.set(t, { ..task, pc: task.pc + 1 }), t);
+  let op = task.operations.get(task.program_counter);
+  let moved = tick_clock(st.tasks.set(t, { ..task, program_counter: task.program_counter + 1 }), t);
   let did = match op {
     Load(v) ->
       {
         tasks: moved.set(t, { ..moved.get(t), register: variable_of(st.vars, v) }),
         vars: st.vars,
-        accesses: [AVar({ handler: 0, index: v, write: false })],
+        accesses: [VariableAccess({ handler: 0, index: v, write: false })],
       },
     Store(v) ->
       {
         tasks: moved,
         vars: st.vars.insert(v, moved.get(t).register + 1),
-        accesses: [AVar({ handler: 0, index: v, write: true })],
+        accesses: [VariableAccess({ handler: 0, index: v, write: true })],
       },
     Perform(resource, write) ->
       {
         tasks: moved,
         vars: st.vars,
-        accesses: [AAtom({ effect: "db", resource: Some(resource), write: write, op: None })],
+        accesses: [AtomAccess({ effect: "db", resource: Some(resource), write: write, op: None })],
       },
     Spawn(name, ops) -> {
       let child = moved.len();
       let parent = moved.get(t);
       let born = {
         name: name,
-        ops: ops,
-        pc: 0,
+        operations: ops,
+        program_counter: 0,
         register: 0,
         children: [],
         blocked: None,
@@ -211,7 +211,7 @@ fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.rais
     Join(nth) -> {
       let child = moved.get(t).children.get(nth);
       if finished(moved, child) {
-        { tasks: absorbed(moved, t, child), vars: st.vars, accesses: [] }
+        { tasks: merge_clock(moved, t, child), vars: st.vars, accesses: [] }
       } else {
         {
           tasks: moved.set(t, { ..moved.get(t), blocked: Some(child) }),
@@ -223,9 +223,9 @@ fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.rais
     Yield -> { tasks: moved, vars: st.vars, accesses: [] },
   };
   // A task blocked on a join observes everything its target did once the target finishes.
-  let woken = range(0, did.tasks.len()).fold(did.tasks, |ts: List<Actor>, i: Int|
+  let woken = range(0, did.tasks.len()).fold(did.tasks, |ts: List<ModelTask>, i: Int|
     match ts.get(i).blocked {
-      Some(on) -> if finished(ts, on) { absorbed(ts, i, on) } else { ts },
+      Some(on) -> if finished(ts, on) { merge_clock(ts, i, on) } else { ts },
       None -> ts,
     });
   {
@@ -247,12 +247,12 @@ fn stepped(st: Running, seed: Seed, enabled: List<Int>) -> Running / {abort.rais
 
 fn dpor(budget: Int) -> Plan = { ..default_plan(), budget: budget }
 
-fn explored(model: Model, plan: Plan) -> Explored<String> / {abort.raise} =
+fn explore_model(model: Model, plan: Plan) -> SearchResult<String> / {abort.raise} =
   explore(plan, |seed: Seed| run(model, seed))
 
-fn read(r: String) -> Op = Perform(r, false)
+fn read(r: String) -> Operation = Perform(r, false)
 
-fn write(r: String) -> Op = Perform(r, true)
+fn write(r: String) -> Operation = Perform(r, true)
 
 /// Whether the two tasks ran in both orders across the interleavings the search ran.
 fn both_orders(model: Model, seeds: List<Seed>, a: Int, b: Int) -> Bool / {abort.raise} = {
@@ -273,7 +273,7 @@ fn lost_update() -> Model =
   program([Spawn("a", [Load(1), Store(1)]), Spawn("b", [Load(1), Store(1)]), Join(0), Join(1)])
 
 test "tasks that never conflict explore exactly one interleaving" {
-  let e = explored(
+  let e = explore_model(
     expecting(independent(), [{ variable: 1, value: 1 }, { variable: 2, value: 1 }]),
     dpor(64),
   );
@@ -291,7 +291,7 @@ test "the naive count for the same program is larger" {
 }
 
 test "a shared variable costs interleavings and still reduces" {
-  assert_eq(explored(lost_update(), dpor(4096)).exploration.explored, 9);
+  assert_eq(explore_model(lost_update(), dpor(4096)).exploration.explored, 9);
   assert_eq(
     explore_under(dpor(4096), All, |seed: Seed| run(lost_update(), seed)).exploration.explored,
     71,
@@ -325,7 +325,7 @@ test "a conflicting pair is explored in both orders, and a lost update is found 
     program([Spawn("a", [Store(1)]), Spawn("b", [Store(1)]), Join(0), Join(1)]),
     [{ variable: 1, value: 1 }],
   );
-  let e = explored(pair, dpor(64));
+  let e = explore_model(pair, dpor(64));
   assert(passed(e) && e.exploration.exhaustive && e.exploration.explored >= 2);
   assert(both_orders(pair, e.seeds, 1, 2));
   let race_model = expecting(
@@ -337,7 +337,7 @@ test "a conflicting pair is explored in both orders, and a lost update is found 
     ]),
     [{ variable: 1, value: 2 }],
   );
-  let raced = explored(race_model, dpor(256));
+  let raced = explore_model(race_model, dpor(256));
   assert(!passed(raced));
   match ((raced.exploration.failure, raced.exploration.race)) {
     (Some(seed), Some(race)) -> {
@@ -345,7 +345,7 @@ test "a conflicting pair is explored in both orders, and a lost update is found 
       assert(race.left.access.starts_with("var.") && race.right.access.starts_with("var."));
       assert(race.left.definition != None && race.right.definition != None);
       // The seed the artifact prints reproduces the failure, and a sampled run infers no race.
-      let again = explored(race_model, once(seed));
+      let again = explore_model(race_model, once(seed));
       assert_eq((passed(again), again.exploration.explored, again.exploration.race), (
         false,
         1,
@@ -363,7 +363,7 @@ test "footprints conflict on one resource only, and readers commute" {
     Join(0),
     Join(1),
   ]);
-  let read_only = explored(disjoint, dpor(64));
+  let read_only = explore_model(disjoint, dpor(64));
   assert_eq((read_only.exploration.explored, read_only.exploration.exhaustive), (1, true));
   let contended = program([
     Spawn("a", [write("x"), write("y")]),
@@ -371,13 +371,13 @@ test "footprints conflict on one resource only, and readers commute" {
     Join(0),
     Join(1),
   ]);
-  let contested = explored(contended, dpor(64));
+  let contested = explore_model(contended, dpor(64));
   assert(contested.exploration.explored > 1 && contested.exploration.exhaustive);
   assert(both_orders(contended, contested.seeds, 1, 2));
   let readers = program([Spawn("a", [read("x")]), Spawn("b", [read("x")]), Join(0), Join(1)]);
-  assert_eq(explored(readers, dpor(64)).exploration.explored, 1);
+  assert_eq(explore_model(readers, dpor(64)).exploration.explored, 1);
   let writer = program([Spawn("a", [read("x")]), Spawn("b", [write("x")]), Join(0), Join(1)]);
-  let w = explored(writer, dpor(64));
+  let w = explore_model(writer, dpor(64));
   assert(w.exploration.explored >= 2 && w.exploration.explored <= 3 && w.exploration.exhaustive);
   assert(both_orders(writer, w.seeds, 1, 2))
 }
@@ -392,7 +392,7 @@ test "a nested spawn racing a sibling is found, and one that conflicts with noth
     ]),
     [{ variable: 1, value: 2 }],
   );
-  let e = explored(nested, dpor(256));
+  let e = explore_model(nested, dpor(256));
   assert(!passed(e));
   match e.exploration.race {
     Some(race) -> assert(race.left.task == 3 || race.right.task == 3),
@@ -407,7 +407,7 @@ test "a nested spawn racing a sibling is found, and one that conflicts with noth
     ]),
     [{ variable: 2, value: 1 }, { variable: 3, value: 1 }],
   );
-  let q = explored(quiet, dpor(64));
+  let q = explore_model(quiet, dpor(64));
   assert_eq((passed(q), q.exploration.explored, q.exploration.exhaustive), (true, 1, true))
 }
 
@@ -422,13 +422,13 @@ test "a race with a task that was blocked at the backtrack point is still found"
     [{ variable: 1, value: 2 }],
   );
   range(0, 8).fold((), |_u: Unit, root: Int| {
-    let e = explored(m, { ..default_plan(), roots: [U64::of_int(root)], budget: 512 });
+    let e = explore_model(m, { ..default_plan(), roots: [U64::of_int(root)], budget: 512 });
     assert(!passed(e))
   })
 }
 
 test "the backtrack rule queues alternatives when the racer is not enabled" {
-  let var = |w: Bool| [AVar({ handler: 0, index: 1, write: w })];
+  let var = |w: Bool| [VariableAccess({ handler: 0, index: 1, write: w })];
   let step = |task: Int, enabled: List<Int>, choice: Int, accesses: List<Access>|
     {
       region: 0,
@@ -466,7 +466,7 @@ test "a read the join already ordered costs no interleavings, and the clock-blin
     ]),
     [{ variable: 1, value: 1 }, { variable: 2, value: 1 }],
   );
-  let e = explored(m, dpor(4096));
+  let e = explore_model(m, dpor(4096));
   assert_eq((passed(e), e.exploration.explored, e.exploration.exhaustive), (true, 1, true));
   let measured = measure_reduction(dpor(2), |seed: Seed| run(m, seed));
   assert_eq((passed(measured), measured.exploration.explored), (true, 1));
@@ -474,26 +474,26 @@ test "a read the join already ordered costs no interleavings, and the clock-blin
 }
 
 test "a spent budget is exhausted and not exhaustive, and no interleaving runs twice" {
-  let e = explored(lost_update(), dpor(3));
+  let e = explore_model(lost_update(), dpor(3));
   assert_eq((e.exploration.explored, e.exploration.exhausted, e.exploration.exhaustive), (
     3,
     true,
     false,
   ));
-  let all = explored(lost_update(), dpor(4096));
+  let all = explore_model(lost_update(), dpor(4096));
   let distinct = all.seeds.fold([], |acc: List<List<Int>>, seed: Seed| {
     let trace = run(lost_update(), seed).steps.map(|st: Step| st.task);
     if acc.fold(false, |b: Bool, t: List<Int>| b || t == trace) { acc } else { acc.push(trace) }
   });
   assert_eq(distinct.len(), all.seeds.len());
   // The same search twice runs the same seeds.
-  assert_eq(explored(lost_update(), dpor(4096)).seeds, all.seeds)
+  assert_eq(explore_model(lost_update(), dpor(4096)).seeds, all.seeds)
 }
 
 test "once runs the interleaving its seed names, and random one per root" {
-  let e = explored(lost_update(), once({ root: 3u64, path: [0, 1] }));
+  let e = explore_model(lost_update(), once({ root: 3u64, path: [0, 1] }));
   assert_eq((e.exploration.explored, e.seeds), (1, [{ root: 3u64, path: [0, 1] }]));
-  let r = explored(lost_update(), {
+  let r = explore_model(lost_update(), {
     mode: Random,
     roots: [0u64, 1u64, 2u64],
     budget: 1,
@@ -522,7 +522,7 @@ test "a step its enabled set does not offer is Ply's defect, and a replay that s
     };
   match explore(dpor(4), bad).failure {
     Some(f) -> match f.cause {
-      Unscheduled(u) -> assert(u.what.contains("does not offer")),
+      InvalidRecording(u) -> assert(u.what.contains("does not offer")),
       _ -> panic("not unscheduled"),
     },
     None -> panic("a malformed recording was accepted"),

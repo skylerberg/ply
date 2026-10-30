@@ -1,14 +1,3 @@
-//! `ply doc` — what a name documents, as an agent reads it. A definition: its signature with the
-//! parameter names the source wrote, its doc and clauses, its place, hash and footprint, and the
-//! laws that name it. A law schema: the same, under the schema as it is written. A type, an effect
-//! or a module: its doc and its members'. A native: what the prelude declares; a function the
-//! prelude writes in Ply is a definition of `std.prelude`. A type of the language's: its natives,
-//! then the functions the prelude and its home module write. Each page is read
-//! off what its module answers it documents, which the memo store keeps for a project's modules
-//! and the toolchain carries for the standard library's, so no command parses a module to print
-//! one. A name under `std` is the toolchain's wherever the command runs; any other is looked for
-//! in the program, then among the builtins, then the standard library.
-
 import compiler.load (Derives)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
@@ -16,34 +5,32 @@ import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import diagnostic (Place, spot_of)
-import program (Program, timed_over, unknown_def, noted, pseudo_path)
+import diagnostic (SourceText, position_of)
+import program (Program, timed_over, unknown_definition, with_note, pseudo_path)
 import program
-import queried (shipped_declaring, shipped_documented)
-import report (Answer, schema_version, ok_code, indent, refused, reported)
+import module_queries (shipped_declarations, shipped_doc_pages)
+import report (CommandOutput, schema_version, ok_code, indent, refused, reported)
 import sources (load_resolved, shipped_names)
 import sources
 import std.term (Style, bold, dim, plain)
 import compiler.front.facts (Frame)
 import compiler.front.rows (Outline)
-import compiler.syntax.exprs (prelude_module)
+import compiler.syntax.expressions (prelude_module)
 import compiler.check.infer.checker (Builtin, builtin_named, builtins)
 import compiler.syntax.items (parse, is_shipped)
-import compiler.front.pages (Page, Member, Typed, Pages, Signed, bare_page, signature)
-import compiler.check.resolve.tables (Diag, qualify)
+import compiler.front.pages (Page, Member, TypedParameter, Pages, PrintedSignature, bare_page,
+                             signature)
+import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.check.types (scheme_text)
 import std.fs (fs)
 import std.json (Json, Null, Str, Bool, Number, Array, object, string_or_null, strings)
 import std.list
 import std.string
 
-/// A page as an answer prints it: with the module that declares what it documents, and its place
-/// where it has one.
-pub type Placed = { page: Page, module: Option<String>, location: Option<String> }
+pub type LocatedPage = { page: Page, module: Option<String>, location: Option<String> }
 
-fn unplaced(page: Page) -> Placed = { page: page, module: None, location: None }
+fn unlocated_page(page: Page) -> LocatedPage = { page: page, module: None, location: None }
 
-/// A doc's first sentence: its first paragraph as one line, up to the first `. `.
 pub fn summary_of(doc: List<String>) -> String / {abort.raise} = {
   let first = doc.fold({ done: false, text: "" }, |acc: { done: Bool, text: String }, l: String|
     if acc.done { acc }
@@ -52,21 +39,16 @@ pub fn summary_of(doc: List<String>) -> String / {abort.raise} = {
   match first.text.index_of(". ") { Some(i) -> first.text.slice(0, i + 1), None -> first.text }
 }
 
-// --- The prelude ------------------------------------------------------------------
-
-fn builtin_signature(found: Builtin) -> Signed / {abort.raise} =
+fn builtin_signature(found: Builtin) -> PrintedSignature / {abort.raise} =
   signature("", String::of_bytes_lossy(found.name), found.scheme, found.params)
 
-/// The builtins the runtime implements: what the prelude declares with no body.
 fn natives() -> List<Builtin> / {abort.raise} = builtins().filter(|b: Builtin| !b.body)
 
-/// The page of a builtin the runtime implements; none for one the prelude writes in Ply, which its
-/// definition's page documents.
 fn builtin_page(query: String) -> Option<Page> / {abort.raise} =
   match builtin_named(Bytes::of_string(query)) {
     None -> None,
     Some(found) -> if found.body { None } else {
-      let signed: Signed = builtin_signature(found);
+      let signed: PrintedSignature = builtin_signature(found);
       Some({
         ..bare_page("builtin", String::of_bytes_lossy(found.name), signed.text),
         ty: String::of_bytes_lossy(scheme_text(found.scheme)),
@@ -77,7 +59,6 @@ fn builtin_page(query: String) -> Option<Page> / {abort.raise} =
     },
   }
 
-/// `std.prelude`'s page as it documents itself, with each native it declares listed first.
 fn with_natives(found: Lookup) -> Lookup / {abort.raise} =
   match found {
     Found(p) ->
@@ -88,97 +69,83 @@ fn with_natives(found: Lookup) -> Lookup / {abort.raise} =
     other -> other,
   }
 
-// --- Naming one thing --------------------------------------------------------------
-
-/// A query that names nothing may still name a builtin, which the page for it says.
-fn unknown_name(query: String, names: List<String>) -> Diag = {
-  let d: Diag = unknown_def(query, names);
+fn unknown_name(query: String, names: List<String>) -> Diagnostic = {
+  let d: Diagnostic = unknown_definition(query, names);
   if names.len() > 0 { d }
-  else { noted(d, b"a builtin is named as the prelude declares it, as in `ply doc List::len`") }
+  else { with_note(d, b"a builtin is named as the prelude declares it, as in `ply doc List::len`") }
 }
 
-/// A page, beside the module that documents it.
-type Held = { module: Bytes, page: Page }
+type ModulePage = { module: Bytes, page: Page }
 
-type Lookup = | Found(Placed) | Many(List<String>) | Nothing
+type Lookup = | Found(LocatedPage) | Ambiguous(List<String>) | NotFound
 
-/// The modules a full name may be under: each whose name it is, or leads it.
-fn holding(modules: List<Bytes>, q: Bytes) -> List<Bytes> =
+fn modules_holding(modules: List<Bytes>, q: Bytes) -> List<Bytes> =
   modules.filter(|m: Bytes| q == m || q.starts_with(m.concat(b".")))
 
-/// Each page of each of `modules`, as `documented` answers them in that order.
-fn held_of(modules: List<Bytes>, documented: List<Pages>) -> List<Held> =
-  range(0, modules.len()).fold([], |acc: List<Held>, i: Int|
+fn pages_of(modules: List<Bytes>, documented: List<Pages>) -> List<ModulePage> =
+  range(0, modules.len()).fold([], |acc: List<ModulePage>, i: Int|
     match ((modules.at(i), documented.at(i))) {
       (Some(m), Some(d)) ->
-        d.pages.fold(acc, |held: List<Held>, page: Page| held.push({ module: m, page: page })),
+        d.pages.fold(acc, |module_pages: List<ModulePage>, page: Page|
+          module_pages.push({ module: m, page: page })),
       _ -> acc,
     })
 
-fn label(h: Held) -> String =
+fn label(h: ModulePage) -> String =
   if h.page.kind == "definition" { h.page.name } else { h.page.name ++ " (" ++ h.page.kind ++ ")" }
 
-/// The page a query names: a full name, or a simple name that names exactly one. `Err` holds what a
-/// simple name matched, and is empty when nothing did.
-fn resolved(held: List<Held>, query: String) -> Result<Held, List<String>> =
-  match held.find(|h: Held| h.page.name == query) {
+fn find_page(module_pages: List<ModulePage>, query: String) -> Result<ModulePage, List<String>> =
+  match module_pages.find(|h: ModulePage| h.page.name == query) {
     Some(h) -> Ok(h),
-    None -> match held.filter(|h: Held| h.page.simple == query) {
+    None -> match module_pages.filter(|h: ModulePage| h.page.simple == query) {
       [] -> Err([]),
       [only] -> Ok(only),
       many -> Err(many.map(label)),
     },
   }
 
-/// `path:line:col`, one-based, as every other command prints a place.
-fn place_in(path: String, text: Bytes, at: Int) -> String / {abort.raise} = {
-  let spot = spot_of(text, at);
-  path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.col.to_string()
+fn location_in(path: String, text: Bytes, at: Int) -> String / {abort.raise} = {
+  let spot = position_of(text, at);
+  path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.column.to_string()
 }
 
-/// A page of a module read at `path`, whose text is `text`: a module's own page stands at its file,
-/// and any other where the text declares it.
-fn placed(h: Held, path: String, text: Bytes) -> Placed / {abort.raise} =
+fn locate_page(h: ModulePage, path: String, text: Bytes) -> LocatedPage / {abort.raise} =
   if h.page.kind == "module" { { page: h.page, module: None, location: Some(path) } } else {
     {
       page: h.page,
       module: Some(String::of_bytes_lossy(h.module)),
-      location: Some(place_in(path, text, h.page.at)),
+      location: Some(location_in(path, text, h.page.at)),
     }
   }
 
-fn looked<| e>(
-  found: Result<Held, List<String>>,
-  place: (Held) -> Placed / {abort.raise | e},
+fn lookup_of<| e>(
+  found: Result<ModulePage, List<String>>,
+  place: (ModulePage) -> LocatedPage / {abort.raise | e},
 ) -> Lookup / {abort.raise | e} =
   match found {
     Ok(h) -> Found(place(h)),
-    Err(names) -> if names.len() > 0 { Many(names) } else { Nothing },
+    Err(names) -> if names.len() > 0 { Ambiguous(names) } else { NotFound },
   }
 
-/// What a simple name's first word is: the declaration an `effect.op` is under, or the name itself.
-fn head_of(q: Bytes) -> Bytes / {abort.raise} =
+fn first_word(q: Bytes) -> Bytes / {abort.raise} =
   match q.index_of(b".") { Some(i) -> q.slice(0, i), None -> q }
 
-/// A name among the shipped modules: under the module that leads a full name, or in whichever
-/// module of the standard library declares a simple one.
-fn shipped_named(
+fn find_shipped(
   query: String,
-) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} = {
   let q = Bytes::of_string(query);
-  let under = holding(shipped_names().filter(is_shipped), q);
+  let under = modules_holding(shipped_names().filter(is_shipped), q);
   let asked = if under.len() > 0 { under }
-  else { match shipped_declaring().get(q) { Some(modules) -> modules, None -> [] } };
-  looked(resolved(held_of(asked, shipped_documented(asked)), query), |h: Held| {
+  else { match shipped_declarations().get(q) { Some(modules) -> modules, None -> [] } };
+  lookup_of(find_page(pages_of(asked, shipped_doc_pages(asked)), query), |h: ModulePage| {
     let module = String::of_bytes_lossy(h.module);
-    placed(h, pseudo_path(module), match sources::shipped_text(Bytes::of_string(module)) {
+    locate_page(h, pseudo_path(module), match sources::shipped_text(Bytes::of_string(module)) {
       Some(text) -> text,
       None -> b"",
     })
   })
 }
 
-/// A builtin as a member of the page that lists it.
 fn builtin_member(b: Builtin) -> Member / {abort.raise} =
   {
     kind: "builtin",
@@ -187,72 +154,67 @@ fn builtin_member(b: Builtin) -> Member / {abort.raise} =
     doc: b.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
   }
 
-/// A type of the language's as a page: the natives the prelude declares under it, then the
-/// functions the prelude and its home module write. None for a name that has none.
 fn language_type_page(
   query: String,
-) -> Option<Page> / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+) -> Option<Page> / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} = {
   let under = query ++ "::";
   let declared = natives().filter(|b: Builtin| b.name.starts_with(Bytes::of_string(under)));
   let names = shipped_names();
   let homes = [prelude_module(), Bytes::of_string("std." ++ query.ascii_lower())].filter(
     |n: Bytes| names.contains(n),
   );
-  let own = held_of(homes, shipped_documented(homes)).fold([], |acc: List<Member>, h: Held|
-    if h.page.kind != "module" { acc }
-    else { acc.concat(h.page.members.filter(|m: Member| m.name.starts_with(under))) });
+  let own = pages_of(homes, shipped_doc_pages(homes)).fold(
+    [],
+    |acc: List<Member>, h: ModulePage|
+      if h.page.kind != "module" { acc }
+      else { acc.concat(h.page.members.filter(|m: Member| m.name.starts_with(under))) },
+  );
   if declared.len() == 0 && own.len() == 0 { None } else {
     Some({ ..bare_page("type", query, query), members: declared.map(builtin_member).concat(own) })
   }
 }
 
-/// A name the program does not hold: a builtin's or a type of the language's, else one of the
-/// standard library's. A function the prelude writes in Ply is its definition there.
-fn elsewhere(
+fn outside_program(
   query: String,
-) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} = {
   let prelude = String::of_bytes_lossy(prelude_module());
-  if query == prelude { with_natives(shipped_named(query)) } else {
+  if query == prelude { with_natives(find_shipped(query)) } else {
     match builtin_page(query) {
-      Some(page) -> Found(unplaced(page)),
+      Some(page) -> Found(unlocated_page(page)),
       None -> match builtin_named(Bytes::of_string(query)) {
-        Some(_) -> shipped_named(prelude ++ "." ++ query),
+        Some(_) -> find_shipped(prelude ++ "." ++ query),
         None -> match language_type_page(query) {
-          Some(page) -> Found(unplaced(page)),
-          None -> shipped_named(query),
+          Some(page) -> Found(unlocated_page(page)),
+          None -> find_shipped(query),
         },
       },
     }
   }
 }
 
-/// Whether the module `o` outlines could declare what a simple name whose first word is `head`
-/// names: a function, a type or an effect its outline lists, or an effect set, which it does not.
 fn could_declare(o: Outline, head: Bytes) -> Bool =
   o.set_texts.len() > 0 || o.declared.contains(qualify(o.name, head))
 
-/// A name among a load's modules, its own and each it pulled: under the module that leads a full
-/// name, or in whichever could declare a simple one.
 fn in_program(
   flags: Flags,
   project: sources::Project,
   loaded: Program,
   frame: Frame,
-) -> Lookup / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, Derives, abort.raise} = {
+) -> Lookup / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
   let q = Bytes::of_string(flags.query);
-  let under = holding(frame.outlines.map(|o: Outline| o.name), q);
+  let under = modules_holding(frame.outlines.map(|o: Outline| o.name), q);
   let asked = if under.len() > 0 { under } else {
-    let head = head_of(q);
+    let head = first_word(q);
     frame.outlines.filter(|o: Outline| could_declare(o, head)).map(|o: Outline| o.name)
   };
   let pulled = program::pulled_modules(frame);
-  let documented = program::documented(
+  let documented = program::doc_pages(
     flags.paths,
     project,
     asked.map(|m: Bytes| { module: m, shipped: pulled.contains(m), tested: false }),
   );
-  looked(resolved(held_of(asked, documented), flags.query), |h: Held| {
-    let at = range(0, frame.outlines.len()).fold(None, |found: Option<Place>, i: Int|
+  lookup_of(find_page(pages_of(asked, documented), flags.query), |h: ModulePage| {
+    let at = range(0, frame.outlines.len()).fold(None, |found: Option<SourceText>, i: Int|
       match found {
         Some(_) -> found,
         None -> match frame.outlines.at(i) {
@@ -261,13 +223,11 @@ fn in_program(
         },
       });
     match at {
-      Some(place) -> placed(h, place.path, place.text),
+      Some(place) -> locate_page(h, place.path, place.text),
       None -> { page: h.page, module: Some(String::of_bytes_lossy(h.module)), location: None },
     }
   })
 }
-
-// --- The answer -----------------------------------------------------------------
 
 fn joined_lines(lines: List<String>) -> String =
   range(0, lines.len()).fold("", |acc: String, i: Int|
@@ -282,7 +242,7 @@ fn member_json(m: Member) -> Json / {abort.raise} =
     { key: "summary", value: Str(summary_of(m.doc)) },
   ])
 
-fn page_json(p: Placed) -> Json / {abort.raise} = {
+fn page_json(p: LocatedPage) -> Json / {abort.raise} = {
   let page = p.page;
   object([
     { key: "command", value: Str("doc") },
@@ -296,7 +256,7 @@ fn page_json(p: Placed) -> Json / {abort.raise} = {
     {
       key: "params",
       value: Array(
-        page.params.map(|named: Typed|
+        page.params.map(|named: TypedParameter|
           object([{ key: "name", value: Str(named.name) }, { key: "type", value: Str(named.ty) }])),
       ),
     },
@@ -312,10 +272,20 @@ fn page_json(p: Placed) -> Json / {abort.raise} = {
   ])
 }
 
-fn said(style: Style, label: String, value: Option<String>, lines: List<String>) -> List<String> =
+fn with_field(
+  style: Style,
+  label: String,
+  value: Option<String>,
+  lines: List<String>,
+) -> List<String> =
   match value { None -> lines, Some(v) -> lines.push(indent() ++ dim(style, label) ++ " " ++ v) }
 
-fn listed(style: Style, label: String, names: List<String>, lines: List<String>) -> List<String> =
+fn with_names(
+  style: Style,
+  label: String,
+  names: List<String>,
+  lines: List<String>,
+) -> List<String> =
   if names.len() == 0 { lines } else {
     lines.push(
       indent() ++ dim(style, label) ++ " "
@@ -323,33 +293,31 @@ fn listed(style: Style, label: String, names: List<String>, lines: List<String>)
     )
   }
 
-/// A module lists what it publishes by summary; a type or an effect gives each member its whole doc.
 fn member_lines(whole: Bool, m: Member, lines: List<String>) -> List<String> / {abort.raise} = {
   let head = lines.push("").push(indent() ++ m.signature);
   let words = if whole { m.doc } else {
     let s = summary_of(m.doc);
     if s == "" { [] } else { [s] }
   };
-  words.fold(head, |acc: List<String>, l: String| acc.push(deep(l)))
+  words.fold(head, |acc: List<String>, l: String| acc.push(doc_line(l)))
 }
 
-/// A line of prose under a heading; an empty one stays empty rather than ending in blanks.
-fn deep(l: String) -> String = if l == "" { "" } else { indent() ++ indent() ++ l }
+fn doc_line(l: String) -> String = if l == "" { "" } else { indent() ++ indent() ++ l }
 
-pub fn page_text(style: Style, p: Placed) -> List<String> / {abort.raise} = {
+pub fn page_text(style: Style, p: LocatedPage) -> List<String> / {abort.raise} = {
   let page = p.page;
   let head = page.doc.fold(
     ["", indent() ++ bold(style, page.signature)],
-    |acc: List<String>, l: String| acc.push(deep(l)),
+    |acc: List<String>, l: String| acc.push(doc_line(l)),
   );
   let clauses = page.clauses.fold(head, |acc: List<String>, c: String|
     acc.push(indent() ++ indent() ++ dim(style, c)));
   let members = page.members.fold(clauses, |acc: List<String>, m: Member|
     member_lines(page.kind != "module", m, acc));
-  let stood = said(style, "at", p.location, members.push(""));
-  let touched = said(style, "touches", page.footprint, stood);
-  let hashed = said(style, "hash", page.hash, touched);
-  let lawed = listed(style, "laws", page.laws, hashed);
+  let stood = with_field(style, "at", p.location, members.push(""));
+  let touched = with_field(style, "touches", page.footprint, stood);
+  let hashed = with_field(style, "hash", page.hash, touched);
+  let lawed = with_names(style, "laws", page.laws, hashed);
   let kinded = match p.location {
     Some(_) -> lawed,
     None -> lawed.push(indent() ++ dim(style, "kind") ++ " " ++ page.kind),
@@ -357,60 +325,53 @@ pub fn page_text(style: Style, p: Placed) -> List<String> / {abort.raise} = {
   kinded.push("")
 }
 
-fn answered(style: Style, p: Placed) -> Answer / {abort.raise} =
+fn page_output(style: Style, p: LocatedPage) -> CommandOutput / {abort.raise} =
   { json: page_json(p), lines: page_text(style, p), errs: [], code: ok_code() }
 
-/// The answer for a name no program holds: a builtin's page or a standard library module's, else
-/// `fallback`, what refused the program, or that nothing is so named, beside `more`.
-fn looked_elsewhere(
+fn lookup_outside_program(
   style: Style,
   query: String,
-  places: List<Place>,
-  fallback: List<Diag>,
-  more: List<Diag>,
-) -> Answer / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
-  match elsewhere(query) {
-    Found(p) -> answered(style, p),
-    Many(names) -> reported(style, "doc", [unknown_name(query, names)], places),
-    Nothing -> if fallback.len() > 0 { refused(style, "doc", fallback, places) }
+  places: List<SourceText>,
+  fallback: List<Diagnostic>,
+  more: List<Diagnostic>,
+) -> CommandOutput / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} =
+  match outside_program(query) {
+    Found(p) -> page_output(style, p),
+    Ambiguous(names) -> reported(style, "doc", [unknown_name(query, names)], places),
+    NotFound -> if fallback.len() > 0 { refused(style, "doc", fallback, places) }
     else { reported(style, "doc", [unknown_name(query, [])].concat(more), places) },
   }
 
-/// The page for a name where no package holds the working directory: a builtin's or a standard
-/// library module's, which no project decides. `nowhere` says so beside a name neither holds.
-pub fn unrooted(
+pub fn without_project(
   flags: Flags,
-  nowhere: Diag,
-) -> Answer / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
-  looked_elsewhere(style_of(flags), flags.query, [], [], [nowhere])
+  nowhere: Diagnostic,
+) -> CommandOutput / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} =
+  lookup_outside_program(style_of(flags), flags.query, [], [], [nowhere])
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, Derives, abort.raise, diverges, shipped.reached} = {
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, Derives, abort.raise, diverges, shipped.report_reached} = {
   let s = style_of(flags);
-  // What the toolchain ships has pages the same wherever the command runs, and no project is read
-  // for one.
-  if is_shipped(Bytes::of_string(flags.query)) { looked_elsewhere(s, flags.query, [], [], []) }
-  else {
+  if is_shipped(Bytes::of_string(flags.query)) {
+    lookup_outside_program(s, flags.query, [], [], [])
+  } else {
     let project = load_resolved(flags.paths);
     let loaded: Program = timed_over(
       flags.paths,
       project,
       time.elapsed_ms(),
-      flags.verify_deps,
+      flags.verify_dependencies,
     ).program;
     match loaded.frame {
-      None -> looked_elsewhere(s, flags.query, loaded.places, loaded.diags, []),
+      None -> lookup_outside_program(s, flags.query, loaded.places, loaded.diagnostics, []),
       Some(frame) -> match in_program(flags, project, loaded, frame) {
-        Found(p) -> answered(s, p),
-        Many(names) -> reported(s, "doc", [unknown_name(flags.query, names)], loaded.places),
-        Nothing -> looked_elsewhere(s, flags.query, loaded.places, [], []),
+        Found(p) -> page_output(s, p),
+        Ambiguous(names) -> reported(s, "doc", [unknown_name(flags.query, names)], loaded.places),
+        NotFound -> lookup_outside_program(s, flags.query, loaded.places, [], []),
       },
     }
   }
 }
-
-// --- Tests ------------------------------------------------------------------
 
 test "a doc's summary is its first sentence, its first paragraph joined into one line" {
   assert_eq(
@@ -433,7 +394,6 @@ test "a builtin prints with the parameter names and the doc the prelude declares
       assert_eq(page.signature, "Array::of_list<a>(xs: List<a>) -> Array<a>")
     },
   };
-  // One the prelude writes in Ply is documented by its definition's page.
   assert_eq(
     ["List::map", "List::at", "List::push"].map(|n: String|
       match builtin_page(n) { Some(_) -> true, None -> false }),
@@ -465,9 +425,8 @@ test "a name nothing declares is `E0101`, and an ambiguous one says which" {
   assert_eq(many.notes_text, [b"one of: a.total, b.total (effect)"])
 }
 
-/// The pages two modules document, each beside its module.
-fn two_modules() -> List<Held> =
-  held_of([b"a", b"b"], [
+fn two_modules() -> List<ModulePage> =
+  pages_of([b"a", b"b"], [
     {
       pages: [
         bare_page("module", "a", "a"),
@@ -488,14 +447,13 @@ fn two_modules() -> List<Held> =
 
 test "a query names a page by its full name, or by a simple name only one page goes by" {
   let named = |query: String|
-    match resolved(two_modules(), query) { Ok(h) -> [h.page.name], Err(names) -> names };
+    match find_page(two_modules(), query) { Ok(h) -> [h.page.name], Err(names) -> names };
   assert_eq(named("a.total"), ["a.total"]);
   assert_eq(named("b"), ["b"]);
   assert_eq(named("ledger.record"), ["a.ledger.record"]);
   assert_eq(named("total"), ["a.total", "b.total (effect)"]);
   assert_eq(named("nothing_here"), []);
-  // A full name is under the module that leads it, and under no other.
-  assert_eq(holding([b"a", b"ab", b"a.b"], b"a.b.c"), [b"a", b"a.b"])
+  assert_eq(modules_holding([b"a", b"ab", b"a.b"], b"a.b.c"), [b"a", b"a.b"])
 }
 
 test "a page with no place names its kind instead" {
@@ -504,7 +462,7 @@ test "a page with no place names its kind instead" {
     ty: "<a>(List<a>) -> Int",
     params: [{ name: "xs", ty: "List<a>" }],
   };
-  assert_eq(page_text(plain(), unplaced(page)), [
+  assert_eq(page_text(plain(), unlocated_page(page)), [
     "",
     "   List::len<a>(xs: List<a>) -> Int",
     "",
@@ -545,7 +503,7 @@ test "a module lists each member by summary, and a type gives each member its wh
 }
 
 test "a page says the laws that name what it documents, and where it stands by line and column" {
-  let h: Held = {
+  let h: ModulePage = {
     module: b"m",
     page: {
       ..bare_page("definition", "m.twice", "pub fn twice(n: Int) -> Int"),
@@ -554,7 +512,7 @@ test "a page says the laws that name what it documents, and where it stands by l
       laws: ["twice doubles"],
     },
   };
-  let p = placed(h, "m.ply", b"// a line\n  fn twice");
+  let p = locate_page(h, "m.ply", b"// a line\n  fn twice");
   assert_eq(p.module, Some("m"));
   assert_eq(p.location, Some("m.ply:2:3"));
   assert_eq(page_text(plain(), p), [
@@ -570,7 +528,9 @@ test "a page says the laws that name what it documents, and where it stands by l
 test "the prelude's page lists every native it declares, then what it writes in Ply" {
   let own = { kind: "definition", name: "List::map", signature: "pub fn List::map", doc: [] };
   match with_natives(
-      Found(unplaced({ ..bare_page("module", "std.prelude", "std.prelude"), members: [own] })),
+      Found(
+        unlocated_page({ ..bare_page("module", "std.prelude", "std.prelude"), members: [own] }),
+      ),
     ) {
     Found(p) -> {
       let kinds = p.page.members.map(|m: Member| m.kind);

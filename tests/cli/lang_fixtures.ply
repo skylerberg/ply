@@ -2,8 +2,8 @@
 //! tests fail with `E0502` carrying `<text>`, in `// refused <test> :: <text>` lines which fail with
 //! `E0424` carrying it, and in `// footprint <definition> :: <row>` lines what the checker infers.
 
-import harness (Ran, in_memory, one, program, spawned, said, json_of, at, items, str, int, shown,
-                Here, Spawned)
+import harness (RunResult, in_memory, one_module_tree, write_program, spawned, all_output, json_of,
+                at, items, str, int, json_text, WorkingDirectory, PlyProcess)
 import std.json (Json, Str)
 import std.string
 
@@ -16,11 +16,11 @@ fn fixture(name: String) -> String / {abort.raise} =
     [] -> panic("`tests/fixtures/lang` holds no `" ++ name ++ ".ply`"),
   }
 
-type Stated = { test: String, text: String }
+type Annotation = { test: String, text: String }
 
 /// Every `// <word> <first> :: <second>` line of a fixture.
-fn stated(source: String, word: String) -> List<Stated> / {abort.raise} =
-  source.split("\n").fold([], |acc: List<Stated>, line: String| {
+fn annotations(source: String, word: String) -> List<Annotation> / {abort.raise} =
+  source.split("\n").fold([], |acc: List<Annotation>, line: String| {
     let lead = "// " ++ word ++ " ";
     if !line.starts_with(lead) { acc } else {
       let rest = line.slice(lead.len(), line.len());
@@ -33,7 +33,7 @@ fn stated(source: String, word: String) -> List<Stated> / {abort.raise} =
 
 /// The message, labels and notes of a diagnostic as one text: the machine labels a span, and
 /// compiled code, which has none, says the same in a note.
-fn carried(d: Json) -> String = {
+fn diagnostic_text(d: Json) -> String = {
   let texts = |key: String|
     String::join(
       items(at(d, key)).map(|x: Json| match x { Str(s) -> s, _ -> str(at(x, "message")) }),
@@ -43,77 +43,91 @@ fn carried(d: Json) -> String = {
 }
 
 /// `source` alone, its tests run as `ply test` runs them.
-fn tested_alone(source: String) -> Ran / {Spawned, Here, abort.raise} = {
-  program(source);
+fn tested_alone(source: String) -> RunResult / {PlyProcess, WorkingDirectory, abort.raise} = {
+  write_program(source);
   spawned(["test", "--json", "--no-cache"])
 }
 
 /// The fixture alone, its raises judged on the C backend.
-fn raises_hold(name: String) -> Unit / {Spawned, Here, abort.raise} =
-  failures_hold(name, "raises", "E0502")
+fn assert_fixture_raises(name: String) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} =
+  assert_fixture_failures(name, "raises", "E0502")
 
 /// The fixture alone, each failure its `word` lines state judged on the C backend to be `code`.
-fn failures_hold(name: String, word: String, code: String) -> Unit / {Spawned, Here, abort.raise} = {
+fn assert_fixture_failures(
+  name: String,
+  word: String,
+  code: String,
+) -> Unit / {PlyProcess, WorkingDirectory, abort.raise} = {
   let source = fixture(name);
-  let expected = stated(source, word);
+  let expected = annotations(source, word);
   assert(expected.len() > 0, Some(name ++ " states no " ++ word));
-  judged(name, code, expected, tested_alone(source))
+  assert_report_failures(name, code, expected, tested_alone(source))
 }
 
-fn judged(name: String, code: String, expected: List<Stated>, ran: Ran) -> Unit / {abort.raise} = {
+fn assert_report_failures(
+  name: String,
+  code: String,
+  expected: List<Annotation>,
+  ran: RunResult,
+) -> Unit / {abort.raise} = {
   let failed = items(at(json_of(ran), "failures"));
-  expected.fold((), |u: Unit, e: Stated| {
+  expected.fold((), |u: Unit, e: Annotation| {
     let failure = match failed.filter(|f: Json| str(at(f, "name")) == e.test) {
       [f, ..] -> f,
-      [] -> panic(name ++ ": `" ++ e.test ++ "` did not fail: " ++ said(ran)),
+      [] -> panic(name ++ ": `" ++ e.test ++ "` did not fail: " ++ all_output(ran)),
     };
     let d = at(failure, "diagnostic");
-    assert(str(at(d, "code")) == code, Some(name ++ ": `" ++ e.test ++ "`: " ++ shown(d)));
+    assert(str(at(d, "code")) == code, Some(name ++ ": `" ++ e.test ++ "`: " ++ json_text(d)));
     assert(
-      carried(d).contains(e.text),
-      Some(name ++ ": `" ++ e.test ++ "` raised without `" ++ e.text ++ "`: " ++ shown(d)),
+      diagnostic_text(d).contains(e.text),
+      Some(name ++ ": `" ++ e.test ++ "` raised without `" ++ e.text ++ "`: " ++ json_text(d)),
     )
   });
   assert(
     failed.len() == expected.len(),
-    Some(name ++ ": every failure must be one the fixture states: " ++ said(ran)),
+    Some(name ++ ": every failure must be one the fixture states: " ++ all_output(ran)),
   )
 }
 
 test "the footprints the checker infers are the ones stated" {
   let source = fixture("footprints");
-  let expected = stated(source, "footprint");
+  let expected = annotations(source, "footprint");
   assert(expected.len() > 0, Some("the fixture states footprints"));
-  let defs = items(at(json_of(in_memory(one(source), ["check", "--json"])), "definitions"));
-  expected.fold((), |u: Unit, e: Stated| {
+  let definitions = items(
+    at(json_of(in_memory(one_module_tree(source), ["check", "--json"])), "definitions"),
+  );
+  expected.fold((), |u: Unit, e: Annotation| {
     let name = "m." ++ e.test;
-    match defs.filter(|d: Json| str(at(d, "name")) == name) {
-      [d, ..] -> assert(str(at(d, "footprint")) == e.text, Some("`" ++ name ++ "`: " ++ shown(d))),
+    match definitions.filter(|d: Json| str(at(d, "name")) == name) {
+      [d, ..] ->
+        assert(str(at(d, "footprint")) == e.text, Some("`" ++ name ++ "`: " ++ json_text(d))),
       [] -> panic("`" ++ name ++ "` is not reported"),
     }
   })
 }
 
-test/nondet "the numeric raises hold" { raises_hold("numbers_raise") }
+test/nondet "the numeric raises hold" { assert_fixture_raises("numbers_raise") }
 
-test/nondet "the shift and overflow raises hold" { raises_hold("bits_raise") }
+test/nondet "the shift and overflow raises hold" { assert_fixture_raises("bits_raise") }
 
-test/nondet "a width raises at its type through every binder" { raises_hold("widths_raise") }
+test/nondet "a width raises at its type through every binder" {
+  assert_fixture_raises("widths_raise")
+}
 
-test/nondet "the byte builtins' raises hold" { raises_hold("bytes_raise") }
+test/nondet "the byte builtins' raises hold" { assert_fixture_raises("bytes_raise") }
 
-test/nondet "the list update raises hold" { raises_hold("lists_raise") }
+test/nondet "the list update raises hold" { assert_fixture_raises("lists_raise") }
 
 test/nondet "a raise nothing answers fails its test with what it carried" {
-  raises_hold("unanswered_raise")
+  assert_fixture_raises("unanswered_raise")
 }
 
 test/nondet "a task is refused a clause that leaves a handle it did not open, and a raise leaves the task" {
-  raises_hold("task_handles")
+  assert_fixture_raises("task_handles")
 }
 
 test/nondet "an operation nothing answers is refused at the host boundary, naming it" {
-  failures_hold("unserved", "refused", "E0424")
+  assert_fixture_failures("unserved", "refused", "E0424")
 }
 
 test "a `?` does not leave a function through a hold's region" {
@@ -126,6 +140,6 @@ test "a `?` does not leave a function through a hold's region" {
     \\  with_hold[r](1, free) { h -> Some(positive(n)? + h.get()) }
     \\
   ;
-  let report = json_of(in_memory(one(source), ["check", "--json"]));
+  let report = json_of(in_memory(one_module_tree(source), ["check", "--json"]));
   assert_eq(items(at(report, "diagnostics")).map(|d: Json| str(at(d, "code"))), ["E0118"])
 }
