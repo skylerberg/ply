@@ -933,21 +933,21 @@ fn fields_part(
   statics: List<StaticDefinition>,
   constant_c: (StaticDefinition) -> Bytes / {abort.raise},
 ) -> Bytes / {abort.raise} = {
-  let held = statics.filter(has_fields);
-  let own = held.fold(Map::new(), |acc: Map<Bytes, Bool>, d: StaticDefinition|
+  let with_fields = statics.filter(has_fields);
+  let own = with_fields.fold(Map::new(), |acc: Map<Bytes, Bool>, d: StaticDefinition|
     acc.insert(d.name, true));
-  if held.len() == 0 { b"" } else {
+  if with_fields.len() == 0 { b"" } else {
     section(
       "fields",
       Bytes::concat_all([
         Bytes::concat_all(
           sorted_unique(
-            held.fold([], |acc: List<Bytes>, d: StaticDefinition| acc.concat(addressed(d))),
+            with_fields.fold([], |acc: List<Bytes>, d: StaticDefinition| acc.concat(addressed(d))),
           ).filter(|n: Bytes| !own.contains(n)).map(
             static_extern,
           ),
         ),
-        Bytes::concat_all(held.map(constant_c)),
+        Bytes::concat_all(with_fields.map(constant_c)),
       ]),
     )
   }
@@ -1940,32 +1940,32 @@ fn scoped_asked(
   p: Program,
   constructors: List<Constructor>,
   offered: List<RootKey>,
-  held: EmitterScope,
+  scope: EmitterScope,
   roots: List<RootKey>,
   handed: Map<RootName, OwnershipSignature>,
   done: KnownResults,
 ) -> EmitterReply<EmitterScope> / {abort.raise} = {
   let needed = modules_asked(p, roots);
-  let covers = needed.fold(true, |all: Bool, m: Bytes, _: Bool| all && held.covered.contains(m));
-  let scoped = match held.scope {
-    Some(s) -> if covers { { scope: s, covered: held.covered } } else {
+  let covers = needed.fold(true, |all: Bool, m: Bytes, _: Bool| all && scope.covered.contains(m));
+  let scoped = match scope.scope {
+    Some(s) -> if covers { { scope: s, covered: scope.covered } } else {
       let pending = offered.filter(|k: RootKey|
         !done.before.contains(root_name(k)) && !done.now.contains(root_name(k)));
       let covered = modules_asked(p, roots.concat(pending)).fold(
-        held.covered,
+        scope.covered,
         |acc: Map<Bytes, Bool>, m: Bytes, _: Bool| acc.insert(m, true),
       );
       { scope: scope_over(dump, p, constructors, offered, covered), covered: covered }
     },
     None -> {
-      let covered = modules_asked(p, roots.concat(held.ahead));
+      let covered = modules_asked(p, roots.concat(scope.ahead));
       { scope: scope_over(dump, p, constructors, offered, covered), covered: covered }
     },
   };
   let batch_count = batches(p, roots);
   let a = results_in_parallel(scoped.scope, batch_count, 0, batch_count.len(), 64, handed, done);
   {
-    held: { scope: Some(scoped.scope), covered: scoped.covered, ahead: held.ahead },
+    scope: { scope: Some(scoped.scope), covered: scoped.covered, ahead: scope.ahead },
     results: decoded_results(a),
     found: a.found,
   }
@@ -2050,7 +2050,7 @@ fn results_closed(
   handed: Map<RootName, OwnershipSignature>,
   done: KnownResults,
 ) -> BatchResults / {abort.raise} = {
-  let held = |n: RootName| done.before.contains(n) || done.now.contains(n);
+  let done_already = |n: RootName| done.before.contains(n) || done.now.contains(n);
   iterate(
     {
       out: { results: [], found: [] },
@@ -2072,7 +2072,7 @@ fn results_closed(
                 match c {
                   Generated(_, _) -> {
                     let n = root_name(c);
-                    if m.seen.contains(n) || held(n) { m }
+                    if m.seen.contains(n) || done_already(n) { m }
                     else { { keys: m.keys.push(c), seen: m.seen.insert(n, true) } }
                   },
                   _ -> m,
@@ -2110,32 +2110,32 @@ fn published_handings(
     a.tables.handings.fold(acc, |m: Map<RootName, PublishedSignature>, h: PublishedSignature|
       m.insert(h.definition, h)))
 
-fn written_stale(a: Output, held: Map<RootName, PublishedSignature>) -> Bool =
+fn written_stale(a: Output, published: Map<RootName, PublishedSignature>) -> Bool =
   a.tables.assumed.any(|x: PublishedSignature|
-    match held.get(x.definition) { Some(h) -> h != x, None -> false })
+    match published.get(x.definition) { Some(h) -> h != x, None -> false })
 
 fn handing_mismatches(
   results: Map<RootName, Output>,
   taken: List<RootName>,
 ) -> List<HandingMismatch> = {
-  let held = published_handings(Map::new(), results);
+  let published = published_handings(Map::new(), results);
   taken.fold([], |acc: List<HandingMismatch>, n: RootName|
     match results.get(n) {
       Some(b) ->
         b.tables.assumed.fold(acc, |a: List<HandingMismatch>, x: PublishedSignature|
-          if agrees(x, held.get(x.definition)) { a }
-          else { a.push({ caller: n, assumed: x, published: held.get(x.definition) }) }),
+          if agrees(x, published.get(x.definition)) { a }
+          else { a.push({ caller: n, assumed: x, published: published.get(x.definition) }) }),
       _ -> acc,
     })
 }
 
 fn stale_of(
   results: Map<RootName, Output>,
-  held: Map<RootName, PublishedSignature>,
+  published: Map<RootName, PublishedSignature>,
   keys: Map<RootName, RootKey>,
 ) -> List<RootKey> =
   results.fold([], |acc: List<RootKey>, n: RootName, a: Output|
-    if !written_stale(a, held) { acc } else {
+    if !written_stale(a, published) { acc } else {
       let own = match keys.get(n) { Some(k) -> [k], None -> [] };
       let group = a.tables.group;
       own.concat(group).fold(acc, |xs: List<RootKey>, g: RootKey|
@@ -2183,13 +2183,13 @@ fn batch_key(k: RootKey) -> Bytes / {abort.raise} =
     _ -> batch_module(k),
   }
 
-type EmitterReply<s> = { held: s, results: List<RootOutput>, found: List<RootKey> }
+type EmitterReply<s> = { state: s, results: List<RootOutput>, found: List<RootKey> }
 
 type EmissionProgress<s> = {
   results: Map<RootName, Output>,
   stored: Map<RootName, Stored>,
   keys: Map<RootName, RootKey>,
-  held: Map<RootName, PublishedSignature>,
+  published: Map<RootName, PublishedSignature>,
   handed: Map<RootName, OwnershipSignature>,
   kept: Int,
   asked: Int,
@@ -2241,7 +2241,7 @@ fn walk_levels<s | e>(
       results: Map::new(),
       stored: Map::new(),
       keys: Map::new(),
-      held: Map::new(),
+      published: Map::new(),
       handed: Map::new(),
       kept: 0,
       asked: 0,
@@ -2375,7 +2375,7 @@ fn stale_here<s>(w: EmissionProgress<s>, changed: List<RootName>) -> List<RootKe
             match w.results.get(n) { Some(a) -> acc.insert(n, a), None -> acc }),
         None -> m,
       }),
-    w.held,
+    w.published,
     w.keys,
   )
 
@@ -2392,7 +2392,7 @@ fn dependents_with(
 
 type AskProgress<s> = {
   fresh: Map<RootName, Output>,
-  kept: Map<RootName, Output>,
+  cached: Map<RootName, Output>,
   asked: Int,
   pending: List<RootKey>,
   emitter: s,
@@ -2415,7 +2415,7 @@ fn with_results<s | e>(
   let materials = materials_of(p, types, keys);
   let looked = look(materials);
   let standing_now = complete_groups(looked.results, asked);
-  let stale = stale_of(standing_now, published_handings(w.held, standing_now), keys);
+  let stale = stale_of(standing_now, published_handings(w.published, standing_now), keys);
   let kept = without_partial_groups(
     stale.fold(standing_now, |m: Map<RootName, Output>, k: RootKey| m.remove(root_name(k))),
     names,
@@ -2434,7 +2434,7 @@ fn with_results<s | e>(
     |t: AskProgress<s>| {
       let now = t.fresh.fold(t.kept, |m: Map<RootName, Output>, n: RootName, a: Output|
         m.insert(n, a));
-      let moved = stale_of(now, published_handings(w.held, now), keys);
+      let moved = stale_of(now, published_handings(w.published, now), keys);
       let asking = t.pending.concat(moved);
       if asking.len() == 0 { Stop(t) } else {
         let got = ask(t.emitter, asking, handed_with(w.handed, now), {
@@ -2452,7 +2452,7 @@ fn with_results<s | e>(
           kept: moved.fold(t.kept, |m: Map<RootName, Output>, k: RootKey| m.remove(root_name(k))),
           asked: t.asked + asking.len() + found.len() - t.found.len(),
           pending: [],
-          emitter: got.held,
+          emitter: got.state,
           found: found,
         })
       }
@@ -2502,7 +2502,7 @@ fn with_results<s | e>(
       |acc: Map<RootName, RootKey>, n: RootName, k: RootKey| acc.insert(n, k),
     ),
     added: w.added.concat(reached.values()),
-    held: published_handings(w.held, all),
+    published: published_handings(w.published, all),
     handed: handed_with(w.handed, all),
     dependents: dependents_with(w.dependents, all),
     kept: w.kept + all.len() - body_names.len(),
@@ -2619,14 +2619,14 @@ pub fn emitted<| e>(
       keep,
       phases,
       unscoped,
-      |held: EmitterScope, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults|
-        scoped_asked(dump, p, constructors, offered, held, roots, handed, done),
+      |scope: EmitterScope, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults|
+        scoped_asked(dump, p, constructors, offered, scope, roots, handed, done),
     );
     {
       let c = compiled(all.results, all.keys, all.stored);
       let resolved = generic_calls_specialised(c.results, c.keys, all.needs, all.called, program);
       let unemitted = resolved.unemitted;
-      let held = with_unemitted_rejected(resolved.results, c.keys, unemitted);
+      let outputs = with_unemitted_rejected(resolved.results, c.keys, unemitted);
       let roots = every.concat(all.added).filter(|k: RootKey|
         !unemitted.contains(root_name(k))).concat(
         entries,
@@ -2640,7 +2640,7 @@ pub fn emitted<| e>(
       );
       let natives = read_natives(
         p,
-        held.fold(Map::new(), |acc: Map<Bytes, Bool>, _: RootName, a: Output|
+        outputs.fold(Map::new(), |acc: Map<Bytes, Bool>, _: RootName, a: Output|
           a.tables.natives.fold(acc, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true))),
       );
       let produced = produce(
@@ -2672,7 +2672,7 @@ pub fn emitted<| e>(
           }
         }),
         p.modules.len(),
-        held,
+        outputs,
         inputs,
         |called: Map<Bytes, Bool>| machine_bound(called_externs(called, natives)),
         part_rule(),
@@ -2744,7 +2744,7 @@ fn extended_needs(
 ) -> Map<RootName, List<Need>> / {abort.raise} = {
   let start = bodies.fold(closed, |acc: Map<RootName, List<Need>>, n: RootName, t: Tables|
     acc.insert(n, t.generics.needs));
-  let held = |needs: Map<RootName, List<Need>>|
+  let needs_count = |needs: Map<RootName, List<Need>>|
     bodies.fold(0, |c: Int, n: RootName, _: Tables|
       c + (match needs.get(n) { Some(ns) -> ns.len(), None -> 0 }));
   let most = bodies.fold(1, |acc: Int, _: RootName, t: Tables|
@@ -2753,7 +2753,7 @@ fn extended_needs(
     let next = bodies.fold(needs, |acc: Map<RootName, List<Need>>, n: RootName, t: Tables|
       t.generics.calls.fold(acc, |a: Map<RootName, List<Need>>, call: GenericCall|
         with_callee_needs(a, n, call, needs)));
-    if held(next) == held(needs) { Stop(needs) } else { Continue(next) }
+    if needs_count(next) == needs_count(needs) { Stop(needs) } else { Continue(next) }
   })
 }
 
@@ -2803,7 +2803,7 @@ fn extended_called(
     if t.members.len() <= 1 { acc.insert(n, t.generics) } else { acc });
   let start = alone.fold(closed, |acc: Map<RootName, List<Int>>, n: RootName, g: Generics|
     acc.insert(n, g.called));
-  let held = |called: Map<RootName, List<Int>>|
+  let calls_count = |called: Map<RootName, List<Int>>|
     alone.fold(0, |c: Int, n: RootName, _: Generics|
       c + (match called.get(n) { Some(cs) -> cs.len(), None -> 0 }));
   let most = alone.fold(1, |acc: Int, _: RootName, g: Generics| acc + g.passes.len());
@@ -2816,7 +2816,7 @@ fn extended_called(
           a.insert(n, mine.push(pass.param))
         } else { a }
       }));
-    if held(next) == held(called) { Stop(called) } else { Continue(next) }
+    if calls_count(next) == calls_count(called) { Stop(called) } else { Continue(next) }
   })
 }
 
@@ -3703,10 +3703,10 @@ test "a root's code moves with how it and its callees were offered" {
       constants,
     );
   let called = program([]);
-  let held = program([b"m.g"]);
-  assert(called.get(b"m.g") != held.get(b"m.g"), None);
-  assert(called.get(b"m.f") != held.get(b"m.f"), None);
-  assert_eq(called.get(b"m.h"), held.get(b"m.h"))
+  let only_g = program([b"m.g"]);
+  assert(called.get(b"m.g") != only_g.get(b"m.g"), None);
+  assert(called.get(b"m.f") != only_g.get(b"m.f"), None);
+  assert_eq(called.get(b"m.h"), only_g.get(b"m.h"))
 }
 
 test "a cycle is digested whole, whatever order the unit holds its roots in" {
@@ -4127,25 +4127,25 @@ test "a static is defined once, in the part of the first body that names it, and
 
 test "a static holding a field's position is defined in the `fields` part, and declared where a body names it" {
   let child = statics_of(StringDatum(b"child")).get(0);
-  let held = named_by_content(
+  let parent = named_by_content(
     StaticWords([FieldWord(b"op"), AddressWord({ name: child.name, tag: 0 })]),
   );
   let p = unit_of(
-    [{ key: b"m.f", value: with_statics(one_body(b"m.f", []), [child, held]) }],
+    [{ key: b"m.f", value: with_statics(one_body(b"m.f", []), [child, parent]) }],
     Map::new(),
   );
   let fields = part_labelled(p.text, "fields");
   let own = part_holding(p.text, body_of(b"m.f"));
   assert(
-    fields.index_of(static_defined(held)) != None
+    fields.index_of(static_defined(parent)) != None
       && fields.index_of(static_extern(child.name)) != None,
     Some(String::of_bytes_lossy(fields)),
   );
   assert(
-    own.index_of(static_defined(child)) != None && own.index_of(static_extern(held.name)) != None,
+    own.index_of(static_defined(child)) != None && own.index_of(static_extern(parent.name)) != None,
     Some(String::of_bytes_lossy(own)),
   );
-  assert_eq([child, held].map(|d: StaticDefinition| p.text.split(static_defined(d)).len() - 1), [
+  assert_eq([child, parent].map(|d: StaticDefinition| p.text.split(static_defined(d)).len() - 1), [
     1,
     1,
   ])
@@ -4488,7 +4488,7 @@ test "a walk answers the roots it deals over lists, place by place, as the emitt
     |asks: Int, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults| {
       let batch_count = batches(p, roots);
       let a = results_in_parallel(scope, batch_count, 0, batch_count.len(), 64, handed, done);
-      { held: asks + 1, results: decoded_results(a), found: a.found }
+      { state: asks + 1, results: decoded_results(a), found: a.found }
     },
   );
   assert(
@@ -5160,8 +5160,8 @@ test "an entry hands its root, for each effect nothing of the program answers, t
         unit_text(e.produced.parts),
         symbol_of(root_text(root_name(EntryPoint(Named(b"m.main"))))),
       );
-      let held = |object: Bytes| entry.split(object).len() - 1;
-      assert_eq([b"ctx->unserved", b"ctx->bridge"].map(held), [1, 1])
+      let count_of = |object: Bytes| entry.split(object).len() - 1;
+      assert_eq([b"ctx->unserved", b"ctx->bridge"].map(count_of), [1, 1])
     },
   }
 }
@@ -6172,8 +6172,8 @@ test "a read of a definition of no parameters keeps its value for good through i
       b"fn nothing() -> Option<Int> = none()\n",
     ]),
   );
-  let held = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"].map(Named));
-  let text = unit_text(held.produced.parts);
+  let unit = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"].map(Named));
+  let text = unit_text(unit.produced.parts);
   let read_with = |keep: Bytes|
     text.index_of(Bytes::concat_all([b", (Word)(intptr_t)", keep, b")"])) != None;
   assert(text.index_of(b"rt_memo_p(ctx, ") != None, None);
@@ -6278,17 +6278,17 @@ fn walk_in_store(
     |rs: List<Record>| body_store.put(rs),
     None,
     |ahead: List<RootKey>| { scoped: unscoped(ahead), built: 0, asked: [] },
-    |held: CountingEmitter, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults| {
-      let a = scoped_asked(dump, p, constructors, offered, held.scoped, roots, handed, done);
-      let grew = match held.scoped.scope {
+    |emitter: CountingEmitter, roots: List<RootKey>, handed: Map<RootName, OwnershipSignature>, done: KnownResults| {
+      let a = scoped_asked(dump, p, constructors, offered, emitter.scoped, roots, handed, done);
+      let grew = match emitter.scoped.scope {
         None -> true,
-        Some(_) -> a.held.covered.len() > held.scoped.covered.len(),
+        Some(_) -> a.state.covered.len() > emitter.scoped.covered.len(),
       };
       {
-        held: {
-          scoped: a.held,
-          built: if grew { held.built + 1 } else { held.built },
-          asked: held.asked.concat(roots.map(root_name)).concat(a.found.map(root_name)),
+        state: {
+          scoped: a.state,
+          built: if grew { emitter.built + 1 } else { emitter.built },
+          asked: emitter.asked.concat(roots.map(root_name)).concat(a.found.map(root_name)),
         },
         results: a.results,
         found: a.found,
@@ -6347,10 +6347,10 @@ test "a warm walk's scope holds what the roots it misses read, and no module of 
     let missed = [Named(b"d.bump"), Named(b"e.h")];
     let read = program_of(warm.dump, warm.program.sources, missed).read.keys();
     assert(!read.contains(b"g") && !read.contains(b"k"), None);
-    let held = warm.walk.emitter;
-    assert_eq(sorted_unique_names(held.asked), sorted_unique_names(missed.map(root_name)));
-    assert_eq(held.scoped.covered.keys(), read);
-    assert_eq(held.built, 1)
+    let emitter = warm.walk.emitter;
+    assert_eq(sorted_unique_names(emitter.asked), sorted_unique_names(missed.map(root_name)));
+    assert_eq(emitter.scoped.covered.keys(), read);
+    assert_eq(emitter.built, 1)
   })
 }
 
@@ -6359,9 +6359,9 @@ test "a walk grows its scope once, over what is left, where a kept body's call s
     walk_in_store(parted_program(b"f(x)", b"1"));
     let edited = parted_program(b"f(f(x))", b"1");
     let warm = walk_in_store(edited);
-    let held = warm.walk.emitter.scoped;
-    assert(!modules_asked(warm.program, held.ahead).contains(b"k"), None);
-    assert(held.covered.contains(b"k"), None);
+    let scoped = warm.walk.emitter.scoped;
+    assert(!modules_asked(warm.program, scoped.ahead).contains(b"k"), None);
+    assert(scoped.covered.contains(b"k"), None);
     assert_eq(warm.walk.emitter.built, 2);
     let cold = with_body_store(|| walk_in_store(edited)).walk;
     let summaries = |results: Map<RootName, Output>|
