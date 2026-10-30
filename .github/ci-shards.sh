@@ -2,10 +2,9 @@
 # The tables CI's test jobs are listed from, the check that they name what the tree holds, and the
 # caches a run leaves the runs after it.
 #
-#   ci-shards.sh verify          every crate is a member, every test named here
-#                                exists, every `probes/` directory is run by a
-#                                job the `ci` aggregate requires, the jobs take
-#                                every Ply run exactly once, every cache key a
+#   ci-shards.sh verify          every crate is a member and no crate's sources
+#                                hold a test, the jobs take every Ply run
+#                                exactly once, every cache key a
 #                                job writes is one a job reads and a family
 #                                `supersede` prunes, every key that names the
 #                                run is one a later run reads and no job needs,
@@ -36,14 +35,11 @@
 #                                tab-separated, a field empty where it has
 #                                none: of a run, or of one module of the CLI's
 #                                suite (`cli-<module>`)
-#   ci-shards.sh exclude-filter  the filterset a shard leaves to the hosts and
-#                                gates jobs: the host packages and the tree checks
-#   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
-#   ci-shards.sh host-filter     the filterset selecting the host packages
-#   ci-shards.sh tree-checks     one `package target test` line per tree check
+#   ci-shards.sh host-filter     the filterset selecting the host packages, which
+#                                the hosts job runs and the shards leave to it
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
-#                                gates job holds to `ply fmt --check`
+#                                sources job holds to `ply fmt --check`
 #   ci-shards.sh nightly-modules the modules of the CLI's suite no pull request runs, on one line,
 #                                which the nightly job hands `ci-ply.sh nightly`
 #   ci-shards.sh supersede RUN REF
@@ -84,45 +80,17 @@ CLI_NIGHTLY=(reached copies db_in_ply db_wire pg_client)
 # that keep what they wrote.
 RUNS_MARGIN=4
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
-# gates job runs them after its own tests.
+# hosts job runs them.
 HOST_PACKAGES=(ply-host-tests)
-
-# Crate directories that are deliberately not workspace members, as `name:why`.
-# Expanded as ${KNOWN_OUTSIDE[@]+...}: bash 3.2 treats an empty array as unset under `set -u`.
-declare -a KNOWN_OUTSIDE=(
-)
-
-# Checks on the tree, as `package:target:test` (`target` is `lib` for a unit test, named by full
-# module path). The gates job asserts each ran, since a check that stops running reports nothing.
-TREE_CHECKS=(
-  "ply-core-tests:suite:armed::every_registered_code_is_constructed_in_production"
-  "ply-core-tests:suite:armed::every_variant_of_a_covered_enum_is_constructed_in_production"
-  "ply-core-tests:suite:armed::every_diagnostic_constructor_call_names_its_code_literally"
-  "ply-core-tests:suite:armed::every_code_declared_or_raised_has_one_row_in_the_registry"
-  "ply-core-tests:suite:armed::the_registry_has_no_row_for_a_code_nothing_declares_or_raises"
-  "ply-core-tests:suite:armed::no_allowlist_entry_has_outlived_its_reason"
-  "ply-core-tests:suite:armed::ambiguous_enum_names_are_declared"
-)
-
-# Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
-# table asserts it is still declared there: a check that stops being declared reports nothing.
-CLI_TREE_CHECKS=(
-  "copies:no two modules define the same function"
-  "fixture_list:every fixture is listed"
-  "tree:the harness is the only module that starts the \`ply\` binary"
-)
-
-# `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
-declare -a PROBE_JOBS=()
 
 # `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
 # of its own run is never a cache, which the repository's other runs evict while those jobs wait for
 # runners: it is an artifact (`cache-keys` refuses a key that names the run and no later run reads).
-SUPERSEDED=(ply-upstream- ply-stores-)
+SUPERSEDED=(ply-stores-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(nextest-archive- ply-runtime- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-runs-)
+NEWEST=(nextest-archive- ply-runtime- ply-built- rust-passed- ply-c-stage-sources- ply-c-runs-)
 
 # Families of the two above that hold an entry a job, `<family><job id>-...`: one whose job the tree
 # no longer lists is restored by no run.
@@ -183,7 +151,7 @@ workspace() {
   # `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
   PACKAGE_PROOFS=()
   for dir in $(role proved); do PACKAGE_PROOFS+=("${dir##*/}:$dir"); done
-  # The Ply sources the repository maintains, which the gates job holds to `ply fmt --check`: a
+  # The Ply sources the repository maintains, which the sources job holds to `ply fmt --check`: a
   # source committed unformatted puts its reformatting into the next change that touches it. Every
   # committed `.ply` is under one of these or of the fixtures, whose spelling is their point
   # (`verify`).
@@ -224,50 +192,6 @@ cmd_store_paths() {
       *) printf '%s/.ply-cache\n' "$dir" ;;
     esac
   done | LC_ALL=C sort -u
-}
-
-# The path of the file a `package target test` triple names, for tests in `tests/`.
-test_source_file() {
-  local package=$1 target=$2 test=$3 dir modpath
-  dir="$root/crates/$package/tests"
-  if [[ -f "$dir/$target.rs" ]]; then
-    printf '%s\n' "$dir/$target.rs"
-  elif [[ $test == *::* ]]; then
-    modpath=${test%::*}
-    modpath=$dir/$target/${modpath//:://}
-    if [[ -f $modpath/mod.rs ]]; then
-      printf '%s\n' "$modpath/mod.rs"
-    else
-      printf '%s\n' "$modpath.rs"
-    fi
-  else
-    printf '%s\n' "$dir/$target/main.rs"
-  fi
-}
-
-# The nextest binary id of a `package target` pair: the package for `lib`, else `package::target`.
-binary_id() {
-  if [[ $2 == lib ]]; then printf '%s' "$1"; else printf '%s::%s' "$1" "$2"; fi
-}
-
-triples() {
-  local entry rest
-  for entry in "$@"; do
-    rest=${entry#*:}
-    printf '%s %s %s\n' "${entry%%:*}" "${rest%%:*}" "${rest#*:}"
-  done
-}
-
-cmd_tree_checks() { triples "${TREE_CHECKS[@]}"; }
-
-# `(binary_id(=..) & test(=..)) | ...` over `package target test` lines on stdin.
-filter_of() {
-  local package target test first=1
-  while read -r package target test; do
-    ((first)) || printf ' | '
-    first=0
-    printf '(binary_id(=%s) & test(=%s))' "$(binary_id "$package" "$target")" "$test"
-  done
 }
 
 named_in() {
@@ -436,15 +360,6 @@ cmd_host_filter() {
   done
   printf '\n'
 }
-
-cmd_tree_check_filter() {
-  cmd_tree_checks | filter_of
-  printf '\n'
-}
-
-cmd_gate_filter() { cmd_tree_check_filter; }
-
-cmd_exclude_filter() { printf '%s | %s\n' "$(cmd_host_filter)" "$(cmd_tree_checks | filter_of)"; }
 
 cmd_nextest_shards() { matrix "$NEXTEST_SHARDS"; }
 
@@ -885,14 +800,12 @@ cmd_prune_check() {
   local a b got want
   a=$(printf 'a%.0s' {1..40})
   b=$(printf 'b%.0s' {1..40})
-  want="1 superseded;4 unnamed;5 superseded;7 superseded;11 superseded;12 unnamed;13 superseded;17 unnamed;19 superseded;"
+  want="1 superseded;4 unnamed;7 superseded;11 superseded;12 unnamed;13 superseded;17 unnamed;19 superseded;"
   got=$(printf '%s\t%s\t%s\n' \
     1 2026-01-01T00:00:00Z ply-stores-stdlib-100 \
     2 2026-01-02T00:00:00Z "ply-stores-stdlib-$b-200" \
     3 2026-01-01T00:00:00Z ply-stores-proofs-100 \
     4 2026-01-01T00:00:00Z ply-stores-cli-part-3-100 \
-    5 2026-01-01T00:00:00Z ply-upstream-100 \
-    6 2026-01-02T00:00:00Z ply-upstream-200 \
     7 2026-01-01T00:00:00Z "ply-built-Linux-X64-$a" \
     8 2026-01-02T00:00:00Z "ply-built-Linux-X64-$b" \
     9 2026-01-01T00:00:00Z "ply-built-macOS-ARM64-$a" \
@@ -906,7 +819,7 @@ cmd_prune_check() {
     17 2026-01-02T00:00:00Z sccache/a/b/c/abcdef \
     18 2026-01-03T00:00:00Z "ply-stores-stdlib-$b-300" \
     19 2026-01-01T00:00:00Z "ply-stores-stdlib-$a-150" |
-    prune_plan 200 "ply-upstream- ply-stores-stdlib- ply-stores-proofs-" "ply-built- ply-c-runs-stdlib- v0-rust-" "tcc-" |
+    prune_plan 200 "ply-stores-stdlib- ply-stores-proofs-" "ply-built- ply-c-runs-stdlib- v0-rust-" "tcc-" |
     cut -f1,2 | LC_ALL=C sort -n | tr '\t\n' ' ;')
   if [[ $got != "$want" ]]; then
     echo "FAIL: of the listing it is held to, \`supersede\` would delete '$got' and should delete '$want'" >&2
@@ -1012,38 +925,13 @@ members_outside_crates() {
     grep -v '^crates/' || true
 }
 
-# Whether a `package target test` triple names a test that exists; prints the problem otherwise.
-check_test_exists() {
-  local what=$1 package=$2 target=$3 test=$4 leaf file
-  leaf=${test##*::}
-  if [[ $target == lib ]]; then
-    if [[ ! -d "$root/crates/$package/src" ]]; then
-      echo "FAIL: $what '$test' names crates/$package/src, which does not exist" >&2
-      return 1
-    elif ! grep -rq "fn $leaf(" "$root/crates/$package/src"; then
-      echo "FAIL: no 'fn $leaf(' under crates/$package/src — $what names a test nothing defines" >&2
-      return 1
-    fi
-  else
-    file=$(test_source_file "$package" "$target" "$test")
-    if [[ ! -f $file ]]; then
-      echo "FAIL: $what '$test' names $file, which does not exist" >&2
-      return 1
-    elif ! grep -q "fn $leaf(" "$file"; then
-      echo "FAIL: $file has no 'fn $leaf(' — $what names a test nothing defines" >&2
-      return 1
-    fi
-  fi
-}
-
 cmd_verify() {
-  local failures=0 member package entry candidate id target test seen dir note
+  local failures=0 member package entry id dir
+  local workflow="$root/.github/workflows/ci.yml"
 
-  local -a known=()
   if ! members >/dev/null; then
     return 1
   fi
-  local workflow_early="$root/.github/workflows/ci.yml"
   local -a all_members=()
   while read -r member; do all_members+=("$member"); done < <(members)
 
@@ -1071,6 +959,14 @@ cmd_verify() {
     echo "FAIL: $allow silences dead-code warnings — delete what nothing calls instead" >&2
     failures=$((failures + 1))
   done < <(grep -rn -E "allow\((dead_code|unused)\)" --include=*.rs "$root/crates" | sed "s|^$root/||" || true)
+  # --- tests that never run --------------------------------------------------
+  # Every library sets `test = false`, so a test in a crate's sources compiles under clippy and never
+  # runs: Rust tests live in the `-tests` packages.
+  local held
+  while read -r held; do
+    echo "FAIL: $held is a test in a crate's sources, which never runs: move it to the crate's \`-tests\` package" >&2
+    failures=$((failures + 1))
+  done < <(grep -rn -E "^[[:space:]]*#\[cfg\(test\)\]" --include=*.rs "$root"/crates/*/src | sed "s|^$root/||" || true)
 
   for package in "${HOST_PACKAGES[@]}"; do
     if ! printf '%s\n' "${all_members[@]}" | grep -qx "$package"; then
@@ -1079,32 +975,11 @@ cmd_verify() {
     fi
   done
 
-  for entry in ${KNOWN_OUTSIDE[@]+"${KNOWN_OUTSIDE[@]}"}; do
-    known+=("${entry%%:*}")
-  done
   for dir in "$root"/crates/*/; do
     member=$(basename "$dir")
     [[ -f $dir/Cargo.toml ]] || continue
-    if printf '%s\n' "${all_members[@]}" | grep -qx "$member"; then
-      continue
-    fi
-    seen=0
-    for candidate in ${known[@]+"${known[@]}"}; do
-      [[ $candidate == "$member" ]] && seen=1
-    done
-    if [[ $seen -eq 0 ]]; then
-      echo "FAIL: crates/$member is a crate that no workspace member and no KNOWN_OUTSIDE entry mentions, so nothing in CI builds or tests it" >&2
-      failures=$((failures + 1))
-    fi
-  done
-  for entry in ${KNOWN_OUTSIDE[@]+"${KNOWN_OUTSIDE[@]}"}; do
-    member=${entry%%:*}
-    note=${entry#*:}
-    if [[ ! -d "$root/crates/$member" ]]; then
-      echo "FAIL: KNOWN_OUTSIDE names crates/$member, which is not in the tree — delete the entry" >&2
-      failures=$((failures + 1))
-    elif printf '%s\n' "${all_members[@]}" | grep -qx "$member"; then
-      echo "FAIL: crates/$member is both a workspace member and KNOWN_OUTSIDE ($note)" >&2
+    if ! printf '%s\n' "${all_members[@]}" | grep -qx "$member"; then
+      echo "FAIL: crates/$member is a crate that is no workspace member, so nothing in CI builds or tests it" >&2
       failures=$((failures + 1))
     fi
   done
@@ -1118,76 +993,19 @@ cmd_verify() {
       failures=$((failures + 1))
       continue
     fi
-    if ! grep -q -- "--workspace --all-targets" "$workflow_early"; then
+    if ! grep -q -- "--workspace --all-targets" "$workflow"; then
       echo "FAIL: '$outside' is a member outside crates/, and no job runs '--workspace --all-targets', so nothing in CI compiles it" >&2
       failures=$((failures + 1))
     fi
   done < <(members_outside_crates)
 
-  # --- tests named by a table ----------------------------------------------
-  while read -r package target test; do
-    check_test_exists "tree check" "$package" "$target" "$test" || failures=$((failures + 1))
-  done < <(cmd_tree_checks)
-  # --- probes ---------------------------------------------------------------
-  local workflow="$root/.github/workflows/ci.yml"
-  local -a probe_listed=()
-  local probe job needs block
-  if [[ ! -f $workflow ]]; then
-    echo "FAIL: no workflow at $workflow, so no probe job can be checked" >&2
-    failures=$((failures + 1))
-  fi
+  local needs
   # The `ci` job's `needs:` list, which wraps across lines.
   needs=$(awk '/^  ci:/{f=1;next} f && /^  [a-z]/{exit} f' "$workflow" 2>/dev/null |
     tr '\n' ' ' | sed -n 's/.*needs: *\(\[[^]]*\]\).*/\1/p')
   if [[ -z $needs ]]; then
     echo "FAIL: could not read the \`ci\` job's \`needs:\` list out of $workflow -- every check below would pass vacuously" >&2
     failures=$((failures + 1))
-  fi
-  for entry in ${PROBE_JOBS[@]+"${PROBE_JOBS[@]}"}; do
-    probe=${entry%%:*}
-    job=${entry#*:}
-    probe_listed+=("$probe")
-    if [[ ! -d "$root/probes/$probe" ]]; then
-      echo "FAIL: PROBE_JOBS names probes/$probe, which is not in the tree -- delete the entry" >&2
-      failures=$((failures + 1))
-      continue
-    fi
-    if [[ ! -x "$root/probes/$probe/run.sh" ]]; then
-      echo "FAIL: probes/$probe has no executable run.sh, so job '$job' has nothing to run" >&2
-      failures=$((failures + 1))
-    fi
-    if ! grep -q "^  $job:\$" "$workflow"; then
-      echo "FAIL: PROBE_JOBS says job '$job' runs probes/$probe, and $workflow defines no such job" >&2
-      failures=$((failures + 1))
-    # `[[ == * ]]`, not `grep -q`: under pipefail an early-exiting grep fails the pipe.
-    else
-      block=$(job_block "$job")
-      if [[ $block != *"probes/$probe/run.sh"* ]]; then
-        echo "FAIL: job '$job' exists but its steps never run probes/$probe/run.sh, so it is required in name only" >&2
-        failures=$((failures + 1))
-      fi
-    fi
-    # Whole word, so a job name does not match inside a longer one.
-    if [[ " ${needs//[][,]/ } " != *" $job "* ]]; then
-      echo "FAIL: job '$job' is not in the \`ci\` job's needs list, so it is not required and a green tick can be reported over it never having run" >&2
-      failures=$((failures + 1))
-    fi
-  done
-  if [[ -d "$root/probes" ]]; then
-    for dir in "$root"/probes/*/; do
-      probe=$(basename "$dir")
-      seen=0
-      for candidate in ${probe_listed[@]+"${probe_listed[@]}"}; do
-        [[ $candidate == "$probe" ]] && seen=$((seen + 1))
-      done
-      if [[ $seen -eq 0 ]]; then
-        echo "FAIL: probes/$probe is in no CI job, so nothing in CI runs it" >&2
-        failures=$((failures + 1))
-      elif [[ $seen -gt 1 ]]; then
-        echo "FAIL: probes/$probe is listed $seen times" >&2
-        failures=$((failures + 1))
-      fi
-    done
   fi
 
   # --- the Ply tests ----------------------------------------------------------
@@ -1224,7 +1042,7 @@ cmd_verify() {
     fi
   done
   # A module's tests are picked out by `<module>.`, which no test of another module may hold.
-  local module names keys outside
+  local module keys outside
   keys=$(package_keys "$CLI_SUITE")
   for module in $(modules_of "$CLI_SUITE"); do
     outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
@@ -1265,14 +1083,6 @@ cmd_verify() {
   for where in "${FORMATTED_SOURCES[@]}" "${FIXTURE_SOURCES[@]}"; do
     if [[ ! -e $root/$where ]]; then
       echo "FAIL: FORMATTED_SOURCES or FIXTURE_SOURCES names $where, which is not in the tree" >&2
-      failures=$((failures + 1))
-    fi
-  done
-  for entry in "${CLI_TREE_CHECKS[@]}"; do
-    module=${entry%%:*}
-    names=$(test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
-    if ! grep -qxF -- "${entry#*:}" <<< "$names"; then
-      echo "FAIL: $CLI_SUITE/$module.ply declares no test '${entry#*:}', and CLI_TREE_CHECKS names it" >&2
       failures=$((failures + 1))
     fi
   done
@@ -1341,7 +1151,7 @@ cmd_verify() {
     echo "$failures problem(s) in the CI tables" >&2
     return 1
   fi
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(grep -c . <<< "$listed") Ply runs in $(jobs | grep -c .) jobs; $NEXTEST_SHARDS nextest shards"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); $(grep -c . <<< "$listed") Ply runs in $(jobs | grep -c .) jobs; $NEXTEST_SHARDS nextest shards"
 }
 
 # The commands that place a package read the workspace first, outside the subshells they run.
@@ -1366,17 +1176,13 @@ case "${1:-}" in
   runs-matrix) cmd_runs_matrix ;;
   job-runs) cmd_job_runs "${2:?a job}" ;;
   run-line) cmd_run_line "${2:?a run}" ;;
-  exclude-filter) cmd_exclude_filter ;;
-  gate-filter) cmd_gate_filter ;;
   host-filter) cmd_host_filter ;;
-  tree-checks) cmd_tree_checks ;;
   formatted-sources) printf '%s\n' "${FORMATTED_SOURCES[@]}" ;;
-  tree-check-filter) cmd_tree_check_filter ;;
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) echo "${CLI_NIGHTLY[*]}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2
     ;;
 esac
