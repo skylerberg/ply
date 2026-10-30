@@ -289,7 +289,7 @@ pub type MachineCall = { params: List<MachineValue>, result: MachineValue }
 pub fn machine_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<MachineValue> =
   match t {
     VariableType(v) -> position_of(scheme.type_variables, v).map(MachineTypeVariable),
-    FunctionType(f) -> match f.effects.tail {
+    FunctionType(f) -> match f.effects.variable {
       Some(r) -> if f.effects.listed.len() > 0 { None }
       else { position_of(scheme.effect_variables, r).map(MachineFunction) },
       None -> None,
@@ -532,8 +532,8 @@ fn reused_body(checker: Checker, name: Bytes) -> Option<ReusedBody> =
 fn checked_body_of(name: Bytes, labels: List<Int>, body: ClosedBody) -> CheckedBody =
   {
     name: name,
-    listed: positional_effects(body.row.listed, labels),
-    through: body.row.tail != None,
+    listed: positional_effects(body.effects.listed, labels),
+    through: body.effects.variable != None,
     performs: body.performs.map(|s: PerformSite|
       { ..s, entry: List::at_or(positional_effects([s.entry], labels), 0, s.entry) }),
     repeated: body.repeated,
@@ -816,7 +816,7 @@ fn with_declared_mode(checker: Checker, entry: Effect) -> Effect / {abort.raise}
   }
 
 fn effects_of_cached(checker: Checker, effects: List<Effect>) -> Effects / {abort.raise} =
-  { listed: effects_sorted(effects.map(|entry: Effect| with_declared_mode(checker, entry))), tail: None }
+  { listed: effects_sorted(effects.map(|entry: Effect| with_declared_mode(checker, entry))), variable: None }
 
 fn cached_rows(checker: Checker, name: Bytes) -> Option<CachedDefinition> =
   checker.known.definitions.get(name)
@@ -940,7 +940,7 @@ fn check_function(
       );
       {
         checker: p.checker,
-        body: body_of_signature(p.checker, sig, p.row, p.written),
+        body: body_of_signature(p.checker, sig, p.effects, p.written),
         left: Signed,
       }
     } else { checked_or_cached(checker, parsed, definition, name, sig, member, stated, answers) },
@@ -967,13 +967,13 @@ fn reused_function(
       };
       let effects = {
         ..effects_of_cached(filed, effects),
-        tail: if kept.body.through { resolve_effects_in(filed, sig.published_effects).tail } else { None },
+        variable: if kept.body.through { resolve_effects_in(filed, sig.published_effects).variable } else { None },
       };
       let p = record_function(filed, parsed, definition, name, sig, effects);
       {
         checker: p.checker,
         body: {
-          ..body_of_signature(p.checker, sig, p.row, p.written),
+          ..body_of_signature(p.checker, sig, p.effects, p.written),
           performs: range(0, performed.len()).map(|i: Int|
             { ..kept.body.performs.get(i), entry: performed.get(i) }),
           repeated: kept.body.repeated,
@@ -1001,7 +1001,7 @@ fn checked_or_cached(
   answers: (Bytes) -> Option<Type> / {abort.raise},
 ) -> { checker: Checker, body: ClosedBody, left: BodySource } / {abort.raise} = {
   let handed = cached_rows(checker, name);
-  let taken: Option<{ checker: Checker, row: Effects, count: Count }> = match handed {
+  let taken: Option<{ checker: Checker, effects: Effects, count: Count }> = match handed {
     None -> None,
     Some(rows) -> match ((
         effects_with_label_variables(rows.effects, member.labels),
@@ -1011,7 +1011,7 @@ fn checked_or_cached(
       (Some(footprint), Some(performed), Some(scaling)) -> {
         let u = unify_effects(checker.substitution, checker.fresh, sig.published_effects, {
           ..effects_of_cached(checker, footprint),
-          tail: resolve_effects_in(checker, sig.published_effects).tail,
+          variable: resolve_effects_in(checker, sig.published_effects).variable,
         });
         match u.error {
           Some(_) -> None,
@@ -1019,7 +1019,7 @@ fn checked_or_cached(
             let c: Checker = with_unified(checker, u);
             Some({
               checker: c,
-              row: effects_of_cached(c, performed),
+              effects: effects_of_cached(c, performed),
               count: {
                 scaling: effects_of_cached(c, scaling).listed,
                 sites: [],
@@ -1045,11 +1045,11 @@ fn checked_or_cached(
           facts: match handed { Some(rows) -> rows.facts, None -> b"" },
         }),
       };
-      let p = record_function(filed, parsed, definition, name, sig, x.row);
+      let p = record_function(filed, parsed, definition, name, sig, x.effects);
       {
         checker: p.checker,
         body: {
-          ..body_of_signature(p.checker, sig, p.row, p.written),
+          ..body_of_signature(p.checker, sig, p.effects, p.written),
           filed: handed,
           count: Some(x.count),
         },
@@ -1091,7 +1091,7 @@ fn checked_or_cached(
         sig,
         tree,
       );
-      let effects = judged.released.fold(o.row, |r: Effects, a: Effect|
+      let effects = judged.released.fold(o.effects, |r: Effects, a: Effect|
         { ..r, listed: effects_insert(r.listed, a) });
       let p = record_function(judged.checker, parsed, definition, name, sig, effects);
       let c = p.checker;
@@ -1103,14 +1103,14 @@ fn checked_or_cached(
       {
         checker: c,
         body: {
-          ..body_of_signature(c, sig, p.row, p.written),
+          ..body_of_signature(c, sig, p.effects, p.written),
           performs: o.performs.map(|site: PerformSite|
             { ..site, entry: resolve_effect(c.substitution, site.entry) }),
           repeated: o.repeated_variables.map(|r: RepeatedEffectVariable| {
-            let v = match resolve_effects_in(c, open_effects(r.var)).tail { Some(v) -> v, None -> r.var };
+            let v = match resolve_effects_in(c, open_effects(r.var)).variable { Some(v) -> v, None -> r.var };
             {
               params: range(0, held.len()).filter(|i: Int| held.get(i).contains(v)),
-              tail: published.tail == Some(v),
+              variable: published.variable == Some(v),
               over: r.over,
               maybe: r.maybe,
             }
@@ -1147,7 +1147,7 @@ fn checked_or_cached(
                 let grows = match ty {
                   VariableType(_) -> false,
                   _ ->
-                    free_variables(c.substitution, ty, { types: [], rows: [] }).types.fold(
+                    free_variables(c.substitution, ty, { types: [], effect_variables: [] }).types.fold(
                       false,
                       |b: Bool, v: Int| b || own.contains(v),
                     ),
@@ -1275,7 +1275,7 @@ fn check_body_ownership(
         );
         {
           checker: check_lambda_release_effects(check_resource_copies(refused, b, j.resource), o.held),
-          held: o.held.filter(|x: ownership::OwnedValue| x.row == None),
+          held: o.held.filter(|x: ownership::OwnedValue| x.effects == None),
         }
       }
     },
@@ -1418,7 +1418,7 @@ fn check_lambda_release_effects(
   held: List<ownership::OwnedValue>,
 ) -> Checker / {abort.raise} =
   held.fold(checker, |c: Checker, x: ownership::OwnedValue|
-    match x.row {
+    match x.effects {
       None -> c,
       Some(r) -> {
         let effects = resolve_effects_in(c, r).listed;
@@ -1449,12 +1449,12 @@ fn record_function(
   name: Bytes,
   sig: Signature,
   effects: Effects,
-) -> { checker: Checker, row: Effects, written: { scaling: List<Effect>, repeats: List<Int> } } / {abort.raise} = {
+) -> { checker: Checker, effects: Effects, written: { scaling: List<Effect>, repeats: List<Int> } } / {abort.raise} = {
   let c: Checker = { ..checker, env: env_remove_global(checker.env, name) };
   let body_effects = resolve_effects_in(c, effects);
   let overran = match definition.effects {
     Some(_) -> false,
-    None -> definition.constant == None && (body_effects.listed.len() > 0 || body_effects.tail != None),
+    None -> definition.constant == None && (body_effects.listed.len() > 0 || body_effects.variable != None),
   };
   let fn_type = if overran { fn_type(sig.params, sig.ret, body_effects) } else { sig.fn_type };
   let g: Generalization = generalize(c.substitution, c.env, fn_type);
@@ -1491,7 +1491,7 @@ fn record_function(
         at: location_of(bound, definition.span),
       },
     ),
-    row: body_effects,
+    effects: body_effects,
     written: written_counts(fn_type, footprint.listed, bounded, sig.variable_bounded),
   }
 }
@@ -1504,17 +1504,17 @@ fn body_of_signature(
 ) -> ClosedBody / {abort.raise} = {
   let published = resolve_effects_in(checker, sig.published_effects);
   {
-    row: effects,
+    effects: effects,
     filed: None,
     count: None,
     params: sig.params.map(|ty: Type| resolve(checker, ty)),
-    tail: published.tail,
+    variable: published.variable,
     bounded: sig.bounded.map(|a: Effect| {
       let entry = resolve_effect(checker.substitution, a);
       { entry: entry, written: written_effect_text(checker, entry) }
     }),
     variable_bounded: sig.variable_bounded,
-    variable_name: match published.tail {
+    variable_name: match published.variable {
       Some(v) ->
         sig.effect_params.fold(None, |found: Option<Bytes>, n: Bytes, w: Int|
           match found { Some(_) -> found, None -> if w == v { Some(n) } else { None } }),
@@ -1860,7 +1860,7 @@ fn check_fn_body(
     Some(at) -> check_const_shape(popped, definition, at, signature),
     None -> popped,
   };
-  let left = effects_outside_definition(resolve_effects_in(shaped, body.row));
+  let left = effects_outside_definition(resolve_effects_in(shaped, body.effects));
   let rowed: Checker = match signature.declared {
     Some(declared) -> check_upper_bound(shaped, definition, declared, left),
     None -> {
@@ -1889,7 +1889,7 @@ fn check_fn_body(
       tag_uses: [],
       group_fills: [],
     },
-    row: left,
+    effects: left,
     performs: rowed.performs,
     repeated_variables: rowed.repeated_variables,
     raise_notes: rowed.raise_notes,
@@ -1946,7 +1946,7 @@ fn counted_body(
       Some(o) -> acc.push({ ..r, over: Some(o), maybe: [] }),
       None -> acc,
     });
-  let counted = counts_of(view, body.params, body.tail != None, body.row, repeated);
+  let counted = counts_of(view, body.params, body.variable != None, body.effects, repeated);
   {
     scaling: counted.scaling.map(|site: PerformSite| site.entry),
     sites: counted.scaling,
@@ -2067,7 +2067,7 @@ fn counts_of(
       Some(again) -> Some(again),
       None ->
         repeated.fold(None, |found: Option<Span>, r: RepeatedEffects|
-          match found { Some(_) -> found, None -> if r.tail { r.over } else { None } }),
+          match found { Some(_) -> found, None -> if r.variable { r.over } else { None } }),
     }
   };
   { scaling: scaling, repeats: repeats, variable_over: variable_over }
@@ -2215,7 +2215,7 @@ fn narrowed_by_effects(dec: List<Effect>, o: Offence) -> Bool =
   match o.site { Some(s) -> narrowed_site(dec, s), None -> false }
 
 fn effects_edit(checker: Checker, effects: EffectsExpression, text: Bytes) -> Edit =
-  match effects.tail {
+  match effects.variable {
     None ->
       insertion(checker.module, effects.span.end - 1, if effects.listed.len() + effects.aliases.len() == 0 {
         text
@@ -2258,11 +2258,11 @@ fn check_upper_bound(
             if definition.name.name == schema.name.name { InSchemaBody } else { InWhere },
             [],
             expression_span(definition.body),
-            { listed: effects.listed, tail: None },
+            { listed: effects.listed, variable: None },
           ),
           definition,
           declared,
-          { listed: [], tail: effects.tail },
+          { listed: [], variable: effects.variable },
         )
       },
     },
@@ -2452,7 +2452,7 @@ fn check_const_effects(
   at: Span,
   inferred: Effects,
 ) -> Checker / {abort.raise} = {
-  let checker: Checker = match resolve_effects_in(unclosed, inferred).tail {
+  let checker: Checker = match resolve_effects_in(unclosed, inferred).variable {
     None -> unclosed,
     Some(v) -> {
       let u = unify_effects(unclosed.substitution, unclosed.fresh, no_effects(), open_effects(v));
@@ -2502,7 +2502,7 @@ fn check_unwritten(
   inferred: Effects,
 ) -> Checker / {abort.raise} = {
   let unclosed_effects = resolve_effects_in(unclosed, inferred);
-  let closed: { checker: Checker, forwarded: Bool } = match unclosed_effects.tail {
+  let closed: { checker: Checker, forwarded: Bool } = match unclosed_effects.variable {
     None -> { checker: unclosed, forwarded: false },
     Some(v) -> {
       let u = unify_effects(unclosed.substitution, unclosed.fresh, no_effects(), open_effects(v));
@@ -2520,7 +2520,7 @@ fn check_unwritten(
     let effects = grouped.sets.concat(
       grouped.rest.map(|entry: Effect| written_effect_text(checker, entry)),
     );
-    let variable: Option<Bytes> = match inferred_effects.tail {
+    let variable: Option<Bytes> = match inferred_effects.variable {
       None -> None,
       Some(v) -> effect_param_named(checker, v),
     };
@@ -2564,7 +2564,7 @@ fn check_unwritten(
         ),
       ),
       [
-        if inferred_effects.listed.len() > 0 && inferred_effects.tail == None
+        if inferred_effects.listed.len() > 0 && inferred_effects.variable == None
             && inferred_effects.listed.fold(true, |all: Bool, a: Effect| all && is_diverges(a)) {
           Bytes::concat_all([
             b"a call that may not return makes `",
@@ -2805,10 +2805,10 @@ fn check_written(
     };
     report(checker, fixed)
   };
-  match inf.tail {
+  match inf.variable {
     None -> c1,
-    Some(v) -> if dec.tail == Some(v) { c1 } else {
-      let u = unify_effects(c1.substitution, c1.fresh, { listed: [], tail: dec.tail }, open_effects(v));
+    Some(v) -> if dec.variable == Some(v) { c1 } else {
+      let u = unify_effects(c1.substitution, c1.fresh, { listed: [], variable: dec.variable }, open_effects(v));
       let c2: Checker = with_unified(c1, u);
       match u.error {
         Some(_) ->
@@ -2983,7 +2983,7 @@ fn writable(checker: Checker, signature: Signature, t: Type) -> Option<Bytes> / 
   let resolved = resolve(checker, t);
   let bound = signature.type_params.fold([], |acc: List<Int>, k: Bytes, p: Type|
     match resolve(checker, p) { VariableType(v) -> acc.push(v), _ -> acc });
-  let found = free_variables(substitution_new(), resolved, { types: [], rows: [] }).types;
+  let found = free_variables(substitution_new(), resolved, { types: [], effect_variables: [] }).types;
   if found.fold(false, |b: Bool, v: Int| b || !bound.contains(v)) { None }
   else { Some(type_text(resolved)) }
 }
@@ -3035,13 +3035,13 @@ fn require_written_signature(
 
 fn close_unreachable_effects(checker: Checker, signature: Signature) -> Checker / {abort.raise} =
   match resolve(checker, signature.fn_type) {
-    FunctionType(f) -> match f.effects.tail {
+    FunctionType(f) -> match f.effects.variable {
       None -> checker,
       Some(variable) -> if is_rigid_effects(checker.substitution, variable) { checker } else {
-        let fv = f.params.fold({ types: [], rows: [] }, |acc: FreeVariables, ty: Type|
+        let fv = f.params.fold({ types: [], effect_variables: [] }, |acc: FreeVariables, ty: Type|
           free_variables(checker.substitution, ty, acc));
         let all = free_variables(checker.substitution, f.ret, fv);
-        if all.rows.contains(variable) { checker } else {
+        if all.effect_variables.contains(variable) { checker } else {
           let u = unify_effects(checker.substitution, checker.fresh, no_effects(), open_effects(variable));
           with_unified(checker, u)
         }
@@ -3185,7 +3185,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               };
               let popped: Checker = { ..listed, env: env_pop(listed.env) };
               let effects = unhandled_release_effects(popped, judged.held).fold(
-                effects_outside_definition(resolve_effects_in(popped, o.row)).listed,
+                effects_outside_definition(resolve_effects_in(popped, o.effects)).listed,
                 |xs: List<Effect>, a: Effect| effects_insert(xs, a),
               );
               let unlisted = listed.diagnostics.len() > answered.diagnostics.len();
@@ -3273,7 +3273,7 @@ fn check_listing(
     o,
     test_listing(cases),
   );
-  match run_needs(resolve_effects_in(c, o.row).listed).at(0) {
+  match run_needs(resolve_effects_in(c, o.effects).listed).at(0) {
     None -> c,
     Some(entry) ->
       report_error_with_labels(
@@ -3511,9 +3511,9 @@ fn check_law(
           b"a `where` guard states a proposition",
         ).checker,
         definition,
-        o.row,
+        o.effects,
       );
-      check_spec_purity(c, InWhere, [], expression_span(g), resolve_effects_in(c, o.row))
+      check_spec_purity(c, InWhere, [], expression_span(g), resolve_effects_in(c, o.effects))
     },
     None -> bound,
   };
@@ -3537,8 +3537,8 @@ fn check_law(
     body.ty,
     b"a law states a proposition",
   ).checker;
-  let c2: Checker = unfilled(stated, definition, body.row);
-  let effects = resolve_effects_in(c2, body.row);
+  let c2: Checker = unfilled(stated, definition, body.effects);
+  let effects = resolve_effects_in(c2, body.effects);
   let c3: Checker = check_spec_purity(
     c2,
     InLawBody,
@@ -3673,7 +3673,7 @@ fn not_identity_at(
 }
 
 fn unfilled(checker: Checker, definition: LawDefinition, effects: Effects) -> Checker / {abort.raise} =
-  match ((definition.of, resolve_effects_in(checker, effects).tail)) {
+  match ((definition.of, resolve_effects_in(checker, effects).variable)) {
     (Some(_), Some(v)) -> {
       let u = unify_effects(checker.substitution, checker.fresh, no_effects(), open_effects(v));
       match u.error { Some(_) -> checker, None -> with_unified(checker, u) }
@@ -3775,7 +3775,7 @@ fn unquantifiable(checker: Checker, binder: Binder, reason: Bytes) -> Checker =
 
 fn effects_display(effects: Effects) -> Bytes / {abort.raise} = {
   let listed = Bytes::join(effects.listed.map(effect_text), b", ");
-  match effects.tail {
+  match effects.variable {
     None -> Bytes::concat_all([b"{", listed, b"}"]),
     Some(v) -> if effects.listed.len() == 0 { Bytes::concat_all([b"{| e", ascii_of_int(v), b"}"]) }
     else { Bytes::concat_all([b"{", listed, b" | e", ascii_of_int(v), b"}"]) },
@@ -3825,7 +3825,7 @@ fn raises(entry: EffectExpression) -> Bool =
   is_bare(entry.effect_name) && entry.effect_name.name.name == b"abort"
 
 fn law_effects_reason(effects: EffectsExpression) -> Option<Bytes> =
-  match effects.tail {
+  match effects.variable {
     Some(_) ->
       Some(
         b"an effect variable has no binder here, and a law quantifies over values rather than over effects",
@@ -3848,7 +3848,7 @@ fn written_effects_reason(ty: TypeExpression) -> Option<Bytes> =
     VariableTypeExpression(_) -> None,
     UnitTypeExpression(_) -> None,
     InvalidTypeExpression(_) -> None,
-    NamedTypeExpression(c) -> match first_reason(c.rows, law_effects_reason) {
+    NamedTypeExpression(c) -> match first_reason(c.effect_arguments, law_effects_reason) {
       Some(r) -> Some(r),
       None -> first_reason(c.args, written_effects_reason),
     },
@@ -3904,7 +3904,7 @@ fn ungeneratable_within(
         },
       }
     },
-    FunctionType(f) -> if f.effects.tail != None {
+    FunctionType(f) -> if f.effects.variable != None {
       Some(
         b"a function a declared type holds under its effect variable is not generated, whatever effects the type is given",
       )
@@ -4002,7 +4002,7 @@ fn not_identity_within(
           Some(shape) -> if shape.native { refused(extern_type_note(c.name)) }
           else if room <= 0 { panic("a type entered twice on one path") } else {
             within(
-              shape.fields.map(|f: Type| apply_arguments(f, shape.params, shape.rows, c.args)),
+              shape.fields.map(|f: Type| apply_arguments(f, shape.params, shape.effect_params, c.args)),
               visiting.push(c.name),
               room - 1,
             )
@@ -4118,7 +4118,7 @@ fn check_spec_purity(
       )
     },
   );
-  match effects.tail {
+  match effects.variable {
     Some(_) ->
       report_error_at(
         c1,
@@ -4277,7 +4277,7 @@ fn check_measure(
     InDecreases,
     [],
     expression_span(expression),
-    resolve_effects_in(c1, o.row),
+    resolve_effects_in(c1, o.effects),
   )
 }
 
@@ -4371,7 +4371,7 @@ fn check_clause(
         b"a spec clause states a proposition",
       ).checker,
   };
-  let effects = resolve_effects_in(c1, o.row);
+  let effects = resolve_effects_in(c1, o.effects);
   {
     checker: check_spec_purity(
       { ..c1, assumed: checker.assumed },
@@ -4478,7 +4478,7 @@ pub fn algebraic_shapes(checker: Checker) -> Shapes =
     |acc: Shapes, name: Bytes, declaration: TypeDeclaration|
       match declaration.declared {
         DeclaredExtern ->
-          acc.insert(name, { name: name, params: [], rows: [], fields: [], native: true }),
+          acc.insert(name, { name: name, params: [], effect_params: [], fields: [], native: true }),
         _ -> acc,
       },
   )
@@ -4492,7 +4492,7 @@ pub fn sum_shapes(constructors: List<ConstructorInfo>) -> Shapes =
           name: constructor_info.type_name,
           params: if scheme.label_variables.len() == 0 { scheme.type_variables }
           else { scheme.type_variables.concat(scheme.label_variables) },
-          rows: scheme.effect_variables,
+          effect_params: scheme.effect_variables,
           fields: constructor_info.fields,
           native: false,
         })

@@ -299,7 +299,7 @@ fn check_release_signature(
               kind: ReleaseInstance,
               by: f.name,
               params: own.params,
-              rows: own.rows,
+              effect_params: own.effect_params,
               results: sig.ret,
               at: { module: checker.module, span: definition.span },
             }),
@@ -319,13 +319,13 @@ fn released_params(ty: Type, type_name: Bytes) -> Option<OwnParams> = {
   match args {
     None -> None,
     Some(xs) ->
-      xs.fold(Some({ params: [], rows: [] }), |acc: Option<OwnParams>, a: Type|
+      xs.fold(Some({ params: [], effect_params: [] }), |acc: Option<OwnParams>, a: Type|
         match acc {
           None -> None,
           Some(own) -> match arg_effects(a) {
-            Some(effects) -> match effects.tail {
-              Some(v) -> if effects.listed.len() > 0 || own.rows.contains(v) { None }
-              else { Some({ ..own, rows: own.rows.push(v) }) },
+            Some(effects) -> match effects.variable {
+              Some(v) -> if effects.listed.len() > 0 || own.effect_params.contains(v) { None }
+              else { Some({ ..own, effect_params: own.effect_params.push(v) }) },
               None -> None,
             },
             None -> match match arg_label(a) { Some(l) -> l, None -> a } {
@@ -661,7 +661,7 @@ fn check_instance_signature(
             },
           )
         } else if !result_over_own_params(
-            free_variables(checker.substitution, sig.ret, { types: [], rows: [] }),
+            free_variables(checker.substitution, sig.ret, { types: [], effect_variables: [] }),
             own,
           ) {
           report_unfit_instance(
@@ -695,7 +695,7 @@ fn check_instance_signature(
               kind: definition.kind,
               by: f.name,
               params: own.params,
-              rows: own.rows,
+              effect_params: own.effect_params,
               results: sig.ret,
               at: { module: checker.module, span: definition.span },
             }),
@@ -730,7 +730,7 @@ fn constrained_beyond_type(
 
 fn result_over_own_params(free: FreeVariables, own: OwnParams) -> Bool =
   free.types.fold(true, |all: Bool, v: Int| all && own.params.contains(v))
-    && free.rows.fold(true, |all: Bool, v: Int| all && own.rows.contains(v))
+    && free.effect_variables.fold(true, |all: Bool, v: Int| all && own.effect_params.contains(v))
 
 pub fn collect_instances(checker: Checker, parsed: ParsedModule) -> Checker =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
@@ -818,7 +818,7 @@ fn check_numeric(
           named(b"` is an `extern type`, which states no `numeric`"),
           b"the toolchain lays out its values, and no operator reads one",
         ),
-      DeclaredSum -> if declaration.params.len() + declaration.labels.len() + declaration.rows.len()
+      DeclaredSum -> if declaration.params.len() + declaration.labels.len() + declaration.effect_params.len()
           > 0 {
         report_error_at_and(
           checker,
@@ -1015,7 +1015,7 @@ fn key_loop(
       Some(x) -> if path.contains(c.name) { Some(path.push(c.name)) } else {
         if room <= 0 { None } else {
           key_loop(
-            apply_arguments(x.results, x.params, x.rows, c.args),
+            apply_arguments(x.results, x.params, x.effect_params, c.args),
             instances,
             adts,
             path.push(c.name),
@@ -1028,7 +1028,7 @@ fn key_loop(
         Some(adt) -> if path.contains(c.name) { None } else {
           if room <= 0 { None } else {
             first_key_loop(
-              adt.fields.map(|f: Type| apply_arguments(f, adt.params, adt.rows, c.args)),
+              adt.fields.map(|f: Type| apply_arguments(f, adt.params, adt.effect_params, c.args)),
               instances,
               adts,
               path.push(c.name),
@@ -1285,8 +1285,8 @@ fn encloses(outer: Span, inner: Span) -> Bool =
 
 pub fn check_parallels(checker: Checker) -> Checker / {abort.raise} =
   checker.parallels.fold({ ..checker, parallels: [] }, |c: Checker, site: ParallelSite| {
-    let rows = site.branches.map(|b: { span: Span, row: Effects }|
-      { span: b.span, row: resolve_effects_in(c, b.row) });
+    let rows = site.branches.map(|b: { span: Span, effects: Effects }|
+      { span: b.span, effects: resolve_effects_in(c, b.effects) });
     match parallel_refusal(rows) {
       None -> c,
       Some(r) ->
@@ -1313,7 +1313,7 @@ fn parallel_refusal(rows: List<Branch>) -> Option<Refusal> / {abort.raise} = {
     rows.fold(None, |acc: Option<{ branch: Branch, entry: Effect }>, b: Branch|
       match acc {
         Some(_) -> acc,
-        None -> match b.row.listed.filter(pick) {
+        None -> match b.effects.listed.filter(pick) {
           [entry, ..] -> Some({ branch: b, entry: entry }),
           [] -> None,
         },
@@ -1377,7 +1377,7 @@ fn parallel_refusal(rows: List<Branch>) -> Option<Refusal> / {abort.raise} = {
   }
 }
 
-type Branch = { span: Span, row: Effects }
+type Branch = { span: Span, effects: Effects }
 
 type Clash = { earlier: Branch, earlier_does: Bytes, later: Branch, later_does: Bytes }
 
@@ -1386,8 +1386,8 @@ fn may_alias(a: Resource, b: Resource) -> Bool =
     || (match b { ResourceVariable(_) -> true, AnyResource -> true, _ -> false })
 
 fn clash(x: Branch, y: Branch) -> Option<Clash> / {abort.raise} = {
-  let effects = x.row.listed.fold(None, |acc: Option<Clash>, a: Effect|
-    y.row.listed.fold(acc, |inner: Option<Clash>, b: Effect|
+  let effects = x.effects.listed.fold(None, |acc: Option<Clash>, a: Effect|
+    y.effects.listed.fold(acc, |inner: Option<Clash>, b: Effect|
       match inner {
         Some(_) -> inner,
         None -> if effects_conflict({ ..a, resource: b.resource }, b)
@@ -1403,14 +1403,14 @@ fn clash(x: Branch, y: Branch) -> Option<Clash> / {abort.raise} = {
   match effects {
     Some(_) -> effects,
     None -> {
-      let open = |effects: Effects| effects.tail != None;
-      let busy = |effects: Effects| effects.listed.len() > 0 || effects.tail != None;
-      if (open(x.row) && busy(y.row)) || (open(y.row) && busy(x.row)) {
+      let open = |effects: Effects| effects.variable != None;
+      let busy = |effects: Effects| effects.listed.len() > 0 || effects.variable != None;
+      if (open(x.effects) && busy(y.effects)) || (open(y.effects) && busy(x.effects)) {
         Some({
           earlier: x,
-          earlier_does: backticked_text(effects_text(x.row)),
+          earlier_does: backticked_text(effects_text(x.effects)),
           later: y,
-          later_does: backticked_text(effects_text(y.row)),
+          later_does: backticked_text(effects_text(y.effects)),
         })
       } else { None }
     },
@@ -1764,7 +1764,7 @@ fn reaching_clause(
 fn may_perform(task: Type, op: Effect) -> Bool =
   match task {
     FunctionType(f) ->
-      f.effects.tail != None
+      f.effects.variable != None
         || f.effects.listed.fold(false, |b: Bool, a: Effect|
           b
             || (a.effect == op.effect
