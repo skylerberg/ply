@@ -33,7 +33,7 @@ import compiler.check.types (effects_insert, NamedResource, SingletonResource, R
                              type_text, effects_text, Printer, printer_new, printer_naming, print_type,
                              NominalType, record_fields, apply_arguments, string_type, secret_type)
 import compiler.check.known (is_int, is_bool, is_char, is_float, is_string, is_bytes, is_unit,
-                             secret_item, task_answer, chan_item, task_type, is_integer_name,
+                             secret_item, task_result, chan_item, task_type, is_integer_name,
                              float_name, char_name, decimal_name, bool_name, string_name,
                              bytes_name, unit_name, list_name, array_name, columns_name, map_name,
                              scoped_name, task_name, chan_name, secret_name)
@@ -75,7 +75,7 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      ConstraintSite, SpecEnv, GroupDefinition, CachedDefinition,
                                      listing_type, CheckEvery, ReuseBodies, CheckOnly, ReusedBody,
                                      Checker, Inference, WithType, WithTypes, WithSignature,
-                                     BoundSignatures, InferredBody, ClosedBody, TagRefusal,
+                                     BoundSignatures, InferredBody, ClosedBody, TagRejection,
                                      GrowingArgument, NamedCallee, CheckedBody, ModuleFunctions,
                                      DeferredSites, InstanceFunctions, InstanceCalls, Count,
                                      Generalization, compare_values_name, location_of, scope_of,
@@ -84,7 +84,7 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      new_type, resolve, resolve_effects_in, with_unified,
                                      simulated_effect_names, seed_effect, builtin_type_arity,
                                      effect_of, definition_of, set_definition, Builtin,
-                                     prelude_imports, builtin_of_extern, builtins, refuse_externs,
+                                     prelude_imports, builtin_of_extern, builtins, reject_externs,
                                      mode_eq, is_direct, bind_builtin, insert_constraint,
                                      dedup_constraints, Shapes, derivable, variables_of_type,
                                      scoped_effect)
@@ -96,10 +96,10 @@ import compiler.check.infer.declarations (convert_type, convert_effect, op_named
 import compiler.check.infer.expression (site_for, resolved_sites, site_among, report_unify, expect,
                                         check_bit_ops, check_concats, check_columns, hint_of,
                                         infer_whole, effects_in, scales_like, tag_rule, check_updates,
-                                        is_group_member, expect_or_widen, refuse_growth,
+                                        is_group_member, expect_or_widen, reject_growth,
                                         TrailingArgument, written_as, as_written, holds_fn,
                                         written_effect_text, numeric_of, ordered_variables,
-                                        body_filed)
+                                        body_recorded)
 import compiler.check.typed (BodyPart, WholeBody, ClauseBody, MeasureBody, TestRun, CaseListing,
                              LawGuard, LawBody, TypedParam)
 import compiler.check.infer.walked (Walked, WalkedNode, WalkedTree, WalkedRead, WalkedDefinition,
@@ -132,7 +132,7 @@ pub fn bind_signatures(
   parsed: ParsedModule,
 ) -> { checker: Checker, signed: ModuleSignatures } / {abort.raise} = {
   let collected = parsed.module.items.fold(
-    { checker: refuse_externs(checker, parsed), functions: [], names: [] },
+    { checker: reject_externs(checker, parsed), functions: [], names: [] },
     |acc: { checker: Checker, functions: List<FnDefinition>, names: List<Bytes> }, item: Item|
       match item {
         FunctionItem(definition) -> if acc.names.contains(definition.name.name) {
@@ -295,7 +295,7 @@ pub fn machine_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<Ma
       None -> None,
     },
     NamedType(c) -> if secret_item(t) != None { Some(MachineSecret(t)) }
-    else if task_answer(t) != None || chan_item(t) != None || objects.contains(c.name) {
+    else if task_result(t) != None || chan_item(t) != None || objects.contains(c.name) {
       Some(MachineObject(t))
     } else if c.args.len() > 0 { None }
     else if is_int(t) || is_bool(t) || is_char(t) { Some(MachineInt(t)) }
@@ -315,18 +315,18 @@ pub fn machine_call(module: Bytes, b: Builtin, objects: List<Bytes>) -> Option<M
       || b.contract.raises { None } else {
     match b.scheme.ty {
       FunctionType(f) -> {
-        let crossing = |t: Type| machine_value(t, b.scheme, objects);
-        let params = f.params.map(crossing);
+        let marshalling = |t: Type| machine_value(t, b.scheme, objects);
+        let params = f.params.map(marshalling);
         match if f.params.push(f.ret).any(layout_depends_on_variable) { None }
-          else { crossing(f.ret) } {
+          else { marshalling(f.ret) } {
           None -> None,
           Some(MachineFunction(_)) -> None,
-          Some(answer) -> if params.any(|p: Option<MachineValue>|
+          Some(result) -> if params.any(|p: Option<MachineValue>|
               p == None || p == Some(MachineUnit)) { None } else {
             Some({
               params: params.fold([], |acc: List<MachineValue>, p: Option<MachineValue>|
                 match p { Some(v) -> acc.push(v), None -> acc }),
-              result: answer,
+              result: result,
             })
           },
         }
@@ -447,7 +447,7 @@ pub fn check_bodies(
   let own = range(0, names.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
     m.insert(names.get(i), i));
   let stated = instance_functions_of(parsed);
-  let answers = |f: Bytes|
+  let results = |f: Bytes|
     match own.get(f) { Some(i) -> Some(signed.sigs.get(i).ret), None -> None };
   let walked = check_order_indices(functions).fold(
     { checker: { ..checker, own_functions: own }, bodies: Map::new(), signed: Map::new() },
@@ -460,7 +460,7 @@ pub fn check_bodies(
         signed.sigs.get(i),
         signed.members.get(i),
         stated,
-        answers,
+        results,
       );
       {
         checker: if o.left != BodyChecked { o.checker } else {
@@ -696,7 +696,7 @@ fn instance_functions_of(parsed: ParsedModule) -> Map<Bytes, InstanceFunctions> 
 fn instance_calls_in(
   checker: Checker,
   stated: Map<Bytes, InstanceFunctions>,
-  answers: (Bytes) -> Option<Type> / {abort.raise},
+  results: (Bytes) -> Option<Type> / {abort.raise},
   ty: Type,
   key: Bool,
   room: Int,
@@ -707,13 +707,13 @@ fn instance_calls_in(
     FunctionType(_) -> acc,
     RecordType(fs) ->
       fs.fold(acc, |a: InstanceCalls, f: Field|
-        instance_calls_in(checker, stated, answers, f.ty, key, room, a)),
+        instance_calls_in(checker, stated, results, f.ty, key, room, a)),
     NominalType(n) ->
       n.fields.fold(acc, |a: InstanceCalls, f: Field|
-        instance_calls_in(checker, stated, answers, f.ty, key, room, a)),
+        instance_calls_in(checker, stated, results, f.ty, key, room, a)),
     NamedType(c) -> {
       let args = c.args.fold(acc, |a: InstanceCalls, x: Type|
-        instance_calls_in(checker, stated, answers, x, key, room, a));
+        instance_calls_in(checker, stated, results, x, key, room, a));
       if room <= 0 || args.seen.contains(c.name) { args } else {
         let within: InstanceCalls = { seen: args.seen.push(c.name), functions: args.functions };
         let said = match stated.get(c.name) {
@@ -727,12 +727,12 @@ fn instance_calls_in(
               functions: if within.functions.contains(f) { within.functions }
               else { within.functions.push(f) },
             };
-            match ((key, answers(f))) {
+            match ((key, results(f))) {
               (true, Some(t)) ->
                 instance_calls_in(
                   checker,
                   stated,
-                  answers,
+                  results,
                   resolve(checker, t),
                   key,
                   room - 1,
@@ -746,7 +746,7 @@ fn instance_calls_in(
               within,
               |a: InstanceCalls, k: ConstructorInfo|
                 k.fields.fold(a, |b: InstanceCalls, f: Type|
-                  instance_calls_in(checker, stated, answers, f, key, room - 1, b)),
+                  instance_calls_in(checker, stated, results, f, key, room - 1, b)),
             ),
         }
       }
@@ -756,14 +756,14 @@ fn instance_calls_in(
 fn instance_calls(
   checker: Checker,
   stated: Map<Bytes, InstanceFunctions>,
-  answers: (Bytes) -> Option<Type> / {abort.raise},
+  results: (Bytes) -> Option<Type> / {abort.raise},
   body: DeferredSites,
 ) -> List<OwnCall> / {abort.raise} = {
   let reached = |ty: Type, key: Bool|
     instance_calls_in(
       checker,
       stated,
-      answers,
+      results,
       resolve(checker, ty),
       key,
       declaration_depth_limit(checker),
@@ -917,7 +917,7 @@ fn check_function(
   sig: Signature,
   member: GroupDefinition,
   stated: Map<Bytes, InstanceFunctions>,
-  answers: (Bytes) -> Option<Type> / {abort.raise},
+  results: (Bytes) -> Option<Type> / {abort.raise},
 ) -> { checker: Checker, body: ClosedBody, left: BodySource } / {abort.raise} =
   match reused_body(checker, name) {
     Some(kept) -> {
@@ -925,25 +925,25 @@ fn check_function(
       { checker: o.checker, body: o.body, left: Taken }
     },
     None -> if !checks_body(checker, name) && cached_rows(checker, name) == None {
-      let filed: Checker = {
+      let recorded: Checker = {
         ..checker,
         seeded: checker.seeded.push(name),
         kept: checker.kept.push({ name: name, facts: b"" }),
       };
       let p = record_function(
-        filed,
+        recorded,
         parsed,
         definition,
         name,
         sig,
-        resolve_effects_in(filed, sig.published_effects),
+        resolve_effects_in(recorded, sig.published_effects),
       );
       {
         checker: p.checker,
         body: body_of_signature(p.checker, sig, p.effects, p.written),
         left: Signed,
       }
-    } else { checked_or_cached(checker, parsed, definition, name, sig, member, stated, answers) },
+    } else { checked_or_cached(checker, parsed, definition, name, sig, member, stated, results) },
   }
 
 fn reused_function(
@@ -960,16 +960,16 @@ fn reused_function(
       effects_with_label_variables(kept.body.performs.map(|s: PerformSite| s.entry), member.labels),
     )) {
     (Some(effects), Some(performed)) -> {
-      let filed: Checker = {
+      let recorded: Checker = {
         ..checker,
         seeded: checker.seeded.push(name),
         kept: checker.kept.push({ name: name, facts: kept.facts }),
       };
       let effects = {
-        ..effects_of_cached(filed, effects),
-        variable: if kept.body.through { resolve_effects_in(filed, sig.published_effects).variable } else { None },
+        ..effects_of_cached(recorded, effects),
+        variable: if kept.body.through { resolve_effects_in(recorded, sig.published_effects).variable } else { None },
       };
-      let p = record_function(filed, parsed, definition, name, sig, effects);
+      let p = record_function(recorded, parsed, definition, name, sig, effects);
       {
         checker: p.checker,
         body: {
@@ -998,7 +998,7 @@ fn checked_or_cached(
   sig: Signature,
   member: GroupDefinition,
   stated: Map<Bytes, InstanceFunctions>,
-  answers: (Bytes) -> Option<Type> / {abort.raise},
+  results: (Bytes) -> Option<Type> / {abort.raise},
 ) -> { checker: Checker, body: ClosedBody, left: BodySource } / {abort.raise} = {
   let handed = cached_rows(checker, name);
   let taken: Option<{ checker: Checker, effects: Effects, count: Count }> = match handed {
@@ -1008,9 +1008,9 @@ fn checked_or_cached(
         effects_with_label_variables(rows.performed, member.labels),
         effects_with_label_variables(rows.scaling, member.labels),
       )) {
-      (Some(footprint), Some(performed), Some(scaling)) -> {
+      (Some(effects), Some(performed), Some(scaling)) -> {
         let u = unify_effects(checker.substitution, checker.fresh, sig.published_effects, {
-          ..effects_of_cached(checker, footprint),
+          ..effects_of_cached(checker, effects),
           variable: resolve_effects_in(checker, sig.published_effects).variable,
         });
         match u.error {
@@ -1037,7 +1037,7 @@ fn checked_or_cached(
   };
   let stepped: { checker: Checker, body: ClosedBody } = match taken {
     Some(x) -> {
-      let filed: Checker = {
+      let recorded: Checker = {
         ..x.checker,
         seeded: x.checker.seeded.push(name),
         kept: x.checker.kept.push({
@@ -1045,12 +1045,12 @@ fn checked_or_cached(
           facts: match handed { Some(rows) -> rows.facts, None -> b"" },
         }),
       };
-      let p = record_function(filed, parsed, definition, name, sig, x.effects);
+      let p = record_function(recorded, parsed, definition, name, sig, x.effects);
       {
         checker: p.checker,
         body: {
           ..body_of_signature(p.checker, sig, p.effects, p.written),
-          filed: handed,
+          recorded: handed,
           count: Some(x.count),
         },
       }
@@ -1065,7 +1065,7 @@ fn checked_or_cached(
       let members = walked.member_calls.drop(checker.member_calls.len());
       let calls = if stated.len() == 0 { members } else {
         members.concat(
-          instance_calls(walked, stated, answers, {
+          instance_calls(walked, stated, results, {
             numerics: walked.numerics.drop(checker.numerics.len()),
             comparisons: walked.comparisons.drop(checker.comparisons.len()),
             map_keys: walked.map_keys.drop(checker.map_keys.len()),
@@ -1073,14 +1073,14 @@ fn checked_or_cached(
           }),
         )
       };
-      let settled: Checker = check_columns(
+      let resolved: Checker = check_columns(
         check_bit_ops(check_numerics(check_concats(check_updates(walked)))),
       );
-      let tree = tree_filed(walked, checker.typed_bodies.len(), name, WholeBody);
+      let tree = tree_recorded(walked, checker.typed_bodies.len(), name, WholeBody);
       let judged = ownership_errors(
         check_borrowed_functions(
           close_unreachable_effects(
-            check_bounded_effects(require_written_signature(settled, definition, sig), definition, sig),
+            check_bounded_effects(require_written_signature(resolved, definition, sig), definition, sig),
             sig,
           ),
           definition,
@@ -1206,7 +1206,7 @@ fn ownership_errors(
   { checker: held, released: unhandled_release_effects(held, j.held) }
 }
 
-fn tree_filed(checker: Checker, from: Int, owner: Bytes, part: BodyPart) -> Option<Walked> =
+fn tree_recorded(checker: Checker, from: Int, owner: Bytes, part: BodyPart) -> Option<Walked> =
   match checker.typed_bodies.drop(from).find(|t: WalkedTree| t.owner == owner && t.part == part) {
     Some(t) -> Some(t.body),
     None -> None,
@@ -1258,7 +1258,7 @@ fn check_body_ownership(
         { checker: checker, held: [] }
       } else {
         let o = ownership::check_ownership(facts, params, b);
-        let refused = o.diagnostics.fold(
+        let rejected = o.diagnostics.fold(
           {
             ..checker,
             release_sites: checker.release_sites.concat(
@@ -1274,7 +1274,7 @@ fn check_body_ownership(
           report,
         );
         {
-          checker: check_lambda_release_effects(check_resource_copies(refused, b, j.resource), o.held),
+          checker: check_lambda_release_effects(check_resource_copies(rejected, b, j.resource), o.held),
           held: o.held.filter(|x: ownership::OwnedValue| x.effects == None),
         }
       }
@@ -1397,7 +1397,7 @@ fn unhandled_effects(checker: Checker, x: ownership::OwnedValue) -> List<Effect>
   release_effect_list(checker, x.ty).fold([], |acc: List<Effect>, a: Effect|
     acc.concat(operation_effects(checker, a))).filter(|a: Effect|
     match a.op {
-      Some(o) -> !x.answered.contains(Bytes::concat_all([a.effect, b".", o])),
+      Some(o) -> !x.returned.contains(Bytes::concat_all([a.effect, b".", o])),
       None -> true,
     })
 
@@ -1459,7 +1459,7 @@ fn record_function(
   let fn_type = if overran { fn_type(sig.params, sig.ret, body_effects) } else { sig.fn_type };
   let g: Generalization = generalize(c.substitution, c.env, fn_type);
   let sc: Scheme = split_labels(g.scheme, definition, sig);
-  let footprint = if overran { body_effects } else { resolve_effects_in(c, sig.published_effects) };
+  let effects = if overran { body_effects } else { resolve_effects_in(c, sig.published_effects) };
   let bounded = sig.bounded.map(|a: Effect| resolve_effect(c.substitution, a));
   let bound: Checker = { ..c, env: env_bind_global(g.env, name, sc), type_params: sig.type_params };
   let constraints = definition_constraints(bound, definition, sc);
@@ -1476,7 +1476,7 @@ fn record_function(
         module: parsed.name,
         simple_name: definition.name.name,
         scheme: sc,
-        effects: footprint.listed,
+        effects: effects.listed,
         performed: body_effects.listed,
         scaling: [],
         repeats: [],
@@ -1492,7 +1492,7 @@ fn record_function(
       },
     ),
     effects: body_effects,
-    written: written_counts(fn_type, footprint.listed, bounded, sig.variable_bounded),
+    written: written_counts(fn_type, effects.listed, bounded, sig.variable_bounded),
   }
 }
 
@@ -1505,7 +1505,7 @@ fn body_of_signature(
   let published = resolve_effects_in(checker, sig.published_effects);
   {
     effects: effects,
-    filed: None,
+    recorded: None,
     count: None,
     params: sig.params.map(|ty: Type| resolve(checker, ty)),
     variable: published.variable,
@@ -1554,15 +1554,15 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
   let bodies = comp.map(|i: Int| m.bodies.get(i));
   let grouped: Checker = { ..checker, group_definitions: members };
   let tagged: Checker = bodies.fold(grouped, |c: Checker, b: ClosedBody|
-    b.tags.fold(c, |cc: Checker, u: TagRefusal|
+    b.tags.fold(c, |cc: Checker, u: TagRejection|
       if qualified.contains(u.name) { report(cc, u.refusal) } else { cc }));
   let counts = range(0, comp.len()).map(|slot: Int|
     match bodies.get(slot).count {
       Some(count) -> count,
       None -> counted_body(tagged, definitions.get(slot), bodies.get(slot)),
     });
-  let filed = bodies.map(|b: ClosedBody| b.filed);
-  let walked = filed.fold(false, |any: Bool, k: Option<CachedDefinition>| any || k == None);
+  let recorded = bodies.map(|b: ClosedBody| b.recorded);
+  let walked = recorded.fold(false, |any: Bool, k: Option<CachedDefinition>| any || k == None);
   let names = bodies.map(|b: ClosedBody|
     b.names.fold(Map::new(), |held: Map<Int, Callee>, x: NamedCallee|
       held.insert(x.site, member_or(qualified, x.callee))));
@@ -1615,16 +1615,16 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
     })
   };
   let ending_of = |slot: Int|
-    match filed.get(slot) { Some(k) -> k.ending, None -> read.endings.get(slot) };
+    match recorded.get(slot) { Some(k) -> k.ending, None -> read.endings.get(slot) };
   let summary_of = |slot: Int|
-    match filed.get(slot) { Some(k) -> k.summary, None -> read.summaries.get(slot) };
+    match recorded.get(slot) { Some(k) -> k.summary, None -> read.summaries.get(slot) };
   let summarized: Checker = {
     ..tagged,
     summaries: range(0, comp.len()).fold(tagged.summaries, |acc: Map<Bytes, Summary>, slot: Int|
       acc.insert(qualified.get(slot), summary_of(slot))),
   };
   let grown: Checker = bodies.fold(summarized, |c: Checker, b: ClosedBody|
-    refuse_growth(c, members, b.fills));
+    reject_growth(c, members, b.fills));
   let kept: Checker = range(0, comp.len()).fold(grown, |c: Checker, slot: Int|
     unwritten_divergence(
       if c.module >= c.known.root { c }
@@ -1834,7 +1834,7 @@ fn check_fn_body(
   let walked: Inference = infer_whole(bound, definition.body, hint_of(signature.ret));
   let body: Inference = {
     ..walked,
-    checker: body_filed(
+    checker: body_recorded(
       walked.checker,
       bound.walking,
       WholeBody,
@@ -1982,7 +1982,7 @@ fn raises_of(checker: Checker, start: Int) -> List<Raise> / {abort.raise} = {
             Some(_) -> known,
             None -> if n.span == site.span { Some(n.reason) } else { None },
           });
-        let why = match noted {
+        let reason = match noted {
           Some(w) -> w,
           None -> match site.source {
             PerformViaCall(name) -> raise_reason(checker, name),
@@ -1992,9 +1992,9 @@ fn raises_of(checker: Checker, start: Int) -> List<Raise> / {abort.raise} = {
         };
         let raise = {
           span: span_between(site.span.start - start, site.span.end - start),
-          reason: why,
+          reason: reason,
         };
-        match why {
+        match reason {
           RaisingCall(name) -> if acc.called.contains(name) { acc }
           else { { out: acc.out.push(raise), called: acc.called.push(name) } },
           _ -> { ..acc, out: acc.out.push(raise) },
@@ -2118,12 +2118,12 @@ fn no_effect() -> Effect = { effect: b"", resource: SingletonResource, mode: Rea
 
 pub fn written_counts(
   fn_type: Type,
-  footprint: List<Effect>,
+  effects: List<Effect>,
   bounded: List<Effect>,
   variable_bounded: Bool,
 ) -> { scaling: List<Effect>, repeats: List<Int> } / {abort.raise} =
   {
-    scaling: footprint.filter(|entry: Effect| !effects_cover(bounded, entry)),
+    scaling: effects.filter(|entry: Effect| !effects_cover(bounded, entry)),
     repeats: if variable_bounded { [] } else {
       match fn_type {
         FunctionType(f) ->
@@ -2348,7 +2348,7 @@ fn folded_into_sets(
   }
 }
 
-fn const_refused(
+fn const_rejected(
   checker: Checker,
   definition: FnDefinition,
   at: Span,
@@ -2379,7 +2379,7 @@ fn check_const_shape(
   let bound: Checker = match binders.at(0) {
     None -> checker,
     Some(b) ->
-      const_refused(
+      const_rejected(
         checker,
         definition,
         at,
@@ -2391,7 +2391,7 @@ fn check_const_shape(
   let taken: Checker = match definition.params.at(0) {
     None -> bound,
     Some(p) ->
-      const_refused(
+      const_rejected(
         bound,
         definition,
         at,
@@ -2403,7 +2403,7 @@ fn check_const_shape(
   let rowed: Checker = match definition.effects {
     None -> taken,
     Some(r) ->
-      const_refused(
+      const_rejected(
         taken,
         definition,
         at,
@@ -2416,8 +2416,8 @@ fn check_const_shape(
     None -> rowed,
     Some(b) -> match b.reason {
       Unconstrained(_) -> rowed,
-      why ->
-        const_refused(
+      reason ->
+        const_rejected(
           rowed,
           definition,
           at,
@@ -2430,7 +2430,7 @@ fn check_const_shape(
               b"holds `",
               print_type(printer_new(), b.ty).text,
               b"`, ",
-              match why {
+              match reason {
                 HoldsFunction -> b"a function",
                 HoldsHandle -> b"which names a location rather than a value",
                 HoldsSecret -> b"a credential",
@@ -2468,7 +2468,7 @@ fn check_const_effects(
         None -> (c.module, expression_span(definition.body)),
       };
       if is_diverges(entry) {
-        const_refused(
+        const_rejected(
           c,
           definition,
           at,
@@ -2477,7 +2477,7 @@ fn check_const_effects(
           [b"a `const fn` is evaluated with no step budget, so it must end: call only what ends"],
         )
       } else {
-        const_refused(
+        const_rejected(
           c,
           definition,
           at,
@@ -2669,7 +2669,7 @@ fn unwritten_divergence(
   match ending {
     Diverges(d) -> if d.through != None || says_diverges { checker }
     else if definition.constant != None {
-      const_refused(
+      const_rejected(
         checker,
         definition,
         match definition.constant { Some(at) -> at, None -> definition.name.span },
@@ -2993,7 +2993,7 @@ fn require_written_signature(
   definition: FnDefinition,
   signature: Signature,
 ) -> Checker / {abort.raise} = {
-  let why = b"a signature is a claim about what a definition means, so it is written rather than inferred; the effects are the exception and stays inferred";
+  let reason = b"a signature is a claim about what a definition means, so it is written rather than inferred; the effects are the exception and stays inferred";
   let params = range(0, definition.params.len()).fold(checker, |c: Checker, i: Int| {
     let p = definition.params.get(i);
     match p.ty {
@@ -3009,7 +3009,7 @@ fn require_written_signature(
           p.span,
           Bytes::concat_all([b"parameter `", p.name.name, b"` has no written type"]),
           label,
-          [why],
+          [reason],
         )
       },
     }
@@ -3027,7 +3027,7 @@ fn require_written_signature(
         definition.name.span,
         Bytes::concat_all([b"`", definition.name.name, b"` has no written return type"]),
         label,
-        [why],
+        [reason],
       )
     },
   }
@@ -3068,7 +3068,7 @@ fn shared_label(earlier: List<TestLabel>, later: TestLabel) -> Option<TestLabel>
       },
     })
 
-fn refuse_shared_label(
+fn reject_shared_label(
   checker: Checker,
   later: TestLabel,
   first: TestLabel,
@@ -3107,7 +3107,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
           };
           let seen: Checker = match shared_label(acc.labels, written) {
             None -> acc.checker,
-            Some(first) -> refuse_shared_label(acc.checker, written, first),
+            Some(first) -> reject_shared_label(acc.checker, written, first),
           };
           let c: Checker = {
             ..seen,
@@ -3115,7 +3115,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
             binders: item_binders(seen.resolved, seen.module, item),
           };
           let owner = test_owner(parsed.name, definition.name);
-          let footprint: WithEffectList = match c.known.tests.get(
+          let effects: WithEffectList = match c.known.tests.get(
               qualify(parsed.name, definition.name),
             ) {
             Some(cached) ->
@@ -3155,7 +3155,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               let ran: Inference = infer_whole(entered, test_run(definition), hint_of(unit_type()));
               let o: Inference = {
                 ..ran,
-                checker: body_filed(
+                checker: body_recorded(
                   ran.checker,
                   owner,
                   TestRun,
@@ -3176,19 +3176,19 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                 o.checker,
                 { resource: |t: Type| is_resource_type(o.checker, [], t), owner: owner },
                 [],
-                tree_filed(o.checker, entered.typed_bodies.len(), owner, TestRun),
+                tree_recorded(o.checker, entered.typed_bodies.len(), owner, TestRun),
               );
-              let answered: Checker = check_test_result(judged.checker, definition, o.ty);
+              let returned: Checker = check_test_result(judged.checker, definition, o.ty);
               let listed: Checker = match definition.cases {
-                None -> answered,
-                Some(cases) -> check_listing(answered, definition, cases),
+                None -> returned,
+                Some(cases) -> check_listing(returned, definition, cases),
               };
               let popped: Checker = { ..listed, env: env_pop(listed.env) };
               let effects = unhandled_release_effects(popped, judged.held).fold(
                 effects_outside_definition(resolve_effects_in(popped, o.effects)).listed,
                 |xs: List<Effect>, a: Effect| effects_insert(xs, a),
               );
-              let unlisted = listed.diagnostics.len() > answered.diagnostics.len();
+              let unlisted = listed.diagnostics.len() > returned.diagnostics.len();
               {
                 checker: if definition.is_nondet || unlisted { popped }
                 else { check_determinism(popped, definition, effects) },
@@ -3196,7 +3196,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               }
             },
           };
-          let checked: Checker = footprint.checker;
+          let checked: Checker = effects.checker;
           {
             checker: {
               ..checked,
@@ -3207,7 +3207,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                 index: checked.tests.len(),
                 nondet: definition.is_nondet,
                 cases: definition.cases != None,
-                effects: footprint.listed,
+                effects: effects.listed,
                 at: location_of(checked, definition.span),
               }),
               walking: b"",
@@ -3264,7 +3264,7 @@ fn check_listing(
   cases: Cases,
 ) -> Checker / {abort.raise} = {
   let o: Inference = infer_whole(checker, test_listing(cases), hint_of(listing_type()));
-  let c = body_filed(
+  let c = body_recorded(
     o.checker,
     checker.walking,
     CaseListing,
@@ -3307,9 +3307,9 @@ type WithEffectList = { checker: Checker, listed: List<Effect> }
 fn check_determinism(
   checker: Checker,
   definition: TestDefinition,
-  footprint: List<Effect>,
+  effects: List<Effect>,
 ) -> Checker / {abort.raise} =
-  footprint.fold(checker, |c: Checker, entry: Effect|
+  effects.fold(checker, |c: Checker, entry: Effect|
     match effect_of(c, entry.effect) {
       None -> c,
       Some(info) -> if !info.nondet { c } else {
@@ -3492,7 +3492,7 @@ fn check_law(
       let walked: Inference = infer_whole({ ..bound, performs: [] }, g);
       let o: Inference = {
         ..walked,
-        checker: body_filed(
+        checker: body_recorded(
           walked.checker,
           bound.walking,
           LawGuard,
@@ -3520,7 +3520,7 @@ fn check_law(
   let walked: Inference = infer_whole({ ..guarded, performs: [] }, definition.body);
   let body: Inference = {
     ..walked,
-    checker: body_filed(
+    checker: body_recorded(
       walked.checker,
       guarded.walking,
       LawBody,
@@ -3622,12 +3622,12 @@ fn instance_identities(
         match args.at(x.position) {
           None -> acc,
           Some(arg) -> {
-            let settled = resolve(acc.checker, arg);
-            let vars = variables_of_type(settled);
-            match not_identity(shapes, acc.checker.keyed_names, settled, vars) {
+            let resolved = resolve(acc.checker, arg);
+            let vars = variables_of_type(resolved);
+            match not_identity(shapes, acc.checker.keyed_names, resolved, vars) {
               None -> { ..acc, vars: ints_union(acc.vars, vars) },
-              Some(refusal) ->
-                { ..acc, checker: not_identity_at(acc.checker, of, x.name, settled, refusal) },
+              Some(rejection) ->
+                { ..acc, checker: not_identity_at(acc.checker, of, x.name, resolved, rejection) },
             }
           },
         },
@@ -3638,12 +3638,12 @@ fn not_identity_at(
   checker: Checker,
   of: SchemaInstance,
   param: Bytes,
-  settled: Type,
-  refusal: NotIdentity,
+  resolved: Type,
+  rejection: NotIdentity,
 ) -> Checker / {abort.raise} = {
   let schema = of.schema.name.name;
-  let shown = type_text(settled);
-  let part = type_text(refusal.part);
+  let shown = type_text(resolved);
+  let part = type_text(rejection.part);
   report_error_at(
     checker,
     b"E0479",
@@ -3659,8 +3659,8 @@ fn not_identity_at(
     ]),
     Bytes::concat_all([b"`", param, b"` is `", shown, b"` here"]),
     [
-      if part == shown { refusal.reason }
-      else { Bytes::concat_all([b"`", shown, b"` holds `", part, b"`: ", refusal.reason]) },
+      if part == shown { rejection.reason }
+      else { Bytes::concat_all([b"`", shown, b"` holds `", part, b"`: ", rejection.reason]) },
       Bytes::concat_all([
         b"`",
         schema,
@@ -3965,10 +3965,10 @@ fn not_identity_within(
         Some(_) -> acc,
         None -> not_identity_within(shapes, keyed, t, assumed, inside, left),
       });
-  let refused = |why: Bytes| Some({ part: ty, reason: why });
+  let rejected = |reason: Bytes| Some({ part: ty, reason: reason });
   let stated = |name: Bytes|
     if !keyed.contains(name) { None } else {
-      refused(
+      rejected(
         Bytes::concat_all([
           b"`",
           simple_name_of(name),
@@ -3978,11 +3978,11 @@ fn not_identity_within(
     };
   match ty {
     VariableType(v) -> if assumed.contains(v) { None } else {
-      refused(
+      rejected(
         b"a type variable no `identity` constrains may be `Float`, whose `NaN` is not `==` to itself",
       )
     },
-    FunctionType(_) -> refused(b"a function has no `==`"),
+    FunctionType(_) -> rejected(b"a function has no `==`"),
     RecordType(fs) -> within(fs.map(|f: Field| f.ty), visiting, room),
     NominalType(n) -> match stated(n.name) {
       Some(x) -> Some(x),
@@ -3991,15 +3991,15 @@ fn not_identity_within(
     NamedType(c) -> match stated(c.name) {
       Some(x) -> Some(x),
       None -> if compares_as_is(c.name) { None } else if c.name == float_name() {
-        refused(
+        rejected(
           b"`Float`'s `==` is IEEE 754's: `NaN != NaN`, and `0.0 == -0.0` though the two are different values",
         )
       } else if c.name == decimal_name() {
-        refused(b"a `Decimal` keeps its scale: `1.5m == 1.50m`, though the two print apart")
+        rejected(b"a `Decimal` keeps its scale: `1.5m == 1.50m`, though the two print apart")
       } else if holds_by_value(c.name) { within(c.args, visiting, room) }
       else if visiting.contains(c.name) { within(c.args, visiting, room) } else {
         match shapes.get(c.name) {
-          Some(shape) -> if shape.native { refused(extern_type_note(c.name)) }
+          Some(shape) -> if shape.native { rejected(extern_type_note(c.name)) }
           else if room <= 0 { panic("a type entered twice on one path") } else {
             within(
               shape.fields.map(|f: Type| apply_arguments(f, shape.params, shape.effect_params, c.args)),
@@ -4008,7 +4008,7 @@ fn not_identity_within(
             )
           },
           None ->
-            refused(if c.name == scoped_name() || is_scheduler_handle(c.name) {
+            rejected(if c.name == scoped_name() || is_scheduler_handle(c.name) {
               Bytes::concat_all([b"a `", c.name, b"` names a location rather than a value"])
             } else if c.name == secret_name() {
               b"a `Secret` holds a credential nothing written in Ply reads"
@@ -4254,7 +4254,7 @@ fn check_measure(
   );
   let o: Inference = {
     ..walked,
-    checker: body_filed(
+    checker: body_recorded(
       walked.checker,
       env.name,
       MeasureBody,
@@ -4329,7 +4329,7 @@ fn check_clause(
   );
   let o: Inference = {
     ..walked,
-    checker: body_filed(
+    checker: body_recorded(
       walked.checker,
       env.name,
       ClauseBody(index),

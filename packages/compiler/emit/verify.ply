@@ -1,4 +1,4 @@
-import compiler.emit.typed_ir (param_rep, param_lent, reps_of, handed_of, lent_where, FieldWrite,
+import compiler.emit.typed_ir (param_rep, param_borrowed, reps_of, handed_of, borrowed_where, FieldWrite,
                                Representation, AsWord, AsInt, AsBool, AsFixed, AsFlattened,
                                AsListView, AsReuseToken, Leaf, Var, Arg, VarOperand, IntOperand,
                                BoolOperand, Rvalue, Call, Apply, Allocate, Convert, Aggregate,
@@ -65,7 +65,7 @@ type Enclosing = {
   arm: Option<PathState>,
   handled: Bool,
   result: Representation,
-  answered: ResultOwnership,
+  returned: ResultOwnership,
   member: Option<Int>,
   known: Map<Int, Int>,
 }
@@ -185,27 +185,27 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
     arm: None,
     handled: false,
     result: f.convention.result,
-    answered: f.convention.answered,
+    returned: f.convention.returned,
     member: None,
     known: Map::new(),
   };
-  let unlent = |ps: List<Var>, c: Convention| !borrows_lent(ps.map(|p: Var| p.representation), c);
+  let unborrowed = |ps: List<Var>, c: Convention| !borrows_from_borrowed(ps.map(|p: Var| p.representation), c);
   let dead = immortals(f);
   let own = if f.members.len() == 0 {
     if !held_as_taken(f) { Some(b"a parameter held otherwise than its convention takes it") }
-    else if unlent(f.params, f.convention) {
+    else if unborrowed(f.params, f.convention) {
       Some(b"a root answering borrowed of other than a counted parameter it is lent")
     } else { body_fault(f, top, holding_params(f.params, f.convention, dead), f.body) }
-  } else if f.members.any(|m: Member| unlent(m.params, m.convention)) {
+  } else if f.members.any(|m: Member| unborrowed(m.params, m.convention)) {
     Some(b"a root answering borrowed of other than a counted parameter it is lent")
   } else {
     match f.body {
       [Case(c)] ->
         c.arms.fold(
           body_fault(f, top, holding_params([], f.convention, dead), c.rest),
-          |why: Option<Bytes>, a: { when: Int, body: Block }|
-            match why {
-              Some(_) -> why,
+          |reason: Option<Bytes>, a: { when: Int, body: Block }|
+            match reason {
+              Some(_) -> reason,
               None -> match f.members.at(a.when) {
                 None -> Some(b"an arm of no member of the group"),
                 Some(m) ->
@@ -214,7 +214,7 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
                     {
                       ..top,
                       result: m.convention.result,
-                      answered: m.convention.answered,
+                      returned: m.convention.returned,
                       member: Some(a.when),
                     },
                     holding_params(m.params, m.convention, dead),
@@ -233,7 +233,7 @@ fn body_verified(f: Fn) -> Option<Bytes> = {
         Some(_) -> s.reason,
         None -> match l {
           Closure(c) -> match ownership_fault(c.body) {
-            Some(why) -> Some(Bytes::concat_all([b"in closure ", ascii_of_int(s.n), b": ", why])),
+            Some(reason) -> Some(Bytes::concat_all([b"in closure ", ascii_of_int(s.n), b": ", reason])),
             None -> None,
           },
         },
@@ -260,7 +260,7 @@ fn holding_params(params: List<Var>, conv: Convention, immortal: Map<Int, Bool>)
     |h: PathState, i: Int|
       match params.at(i) {
         None -> h,
-        Some(p) -> if !is_refcounted(p.representation) { h } else if param_lent(conv, i) {
+        Some(p) -> if !is_refcounted(p.representation) { h } else if param_borrowed(conv, i) {
           {
             ..h,
             borrowed_from: h.borrowed_from.insert(p.id, []),
@@ -273,7 +273,7 @@ fn holding_params(params: List<Var>, conv: Convention, immortal: Map<Int, Bool>)
 fn body_fault(f: Fn, context: Enclosing, start: PathState, b: Block) -> Option<Bytes> = {
   let w = walked(f, context, { h: start, fault: None, live: true, missed: None, done: false }, b);
   match w.fault {
-    Some(why) -> Some(why),
+    Some(reason) -> Some(reason),
     None -> if w.live { Some(b"a body that falls off its end without answering") } else { None },
   }
 }
@@ -356,7 +356,7 @@ fn walked(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState =
               ..acc,
               fault: Some(b"a closure on this frame's stack handed beyond the call it is lent to"),
             }
-          } else if answers_count(d.value) {
+          } else if results_count(d.value) {
             { ..acc, fault: Some(b"a value whose count nothing holds") }
           } else {
             match or_else(bytes_fault(acc.h, None, d.value), uses_fault(None, d.value)) {
@@ -569,9 +569,9 @@ fn walked(f: Fn, context: Enclosing, w: CheckState, b: Block) -> CheckState =
           { ..acc, fault: Some(b"an answer held otherwise than the root answers") }
         } else {
           ended(
-            match context.answered {
+            match context.returned {
               OwnedResult -> passed(acc, a),
-              BorrowedResult(from) -> lent_back(acc, a, from),
+              BorrowedResult(from) -> borrowed_back(acc, a, from),
             },
             Map::new(),
             b"a count left held where the body answers: v",
@@ -700,7 +700,7 @@ fn bound_walked(
             { ..read, h: { ..read.h, stacks: read.h.stacks.insert(y.id, read_arg) } }
           },
           None -> match held_otherwise(y, value) {
-            Some(why) -> faulted(acc, why, y),
+            Some(reason) -> faulted(acc, reason, y),
             None -> if acc.h.immortal.contains(y.id) {
               failing(context, used(acc, operands(value)), value, unwind)
             } else {
@@ -923,10 +923,10 @@ fn string_fault(
     match operand {
       Some(_) -> operand,
       None -> {
-        let answer = match y { Some(a) -> a.representation, None -> AsInt };
+        let result = match y { Some(a) -> a.representation, None -> AsInt };
         let read_arg = match string_result(op) {
-          OwnBlock -> y != None && answer == AsWord,
-          _ -> !is_refcounted(answer),
+          OwnBlock -> y != None && result == AsWord,
+          _ -> !is_refcounted(result),
         };
         if read_arg { None } else {
           Some({
@@ -1130,7 +1130,7 @@ fn borrowed_after(before: PathState, out: List<PathState>) -> Map<Int, List<Int>
         n.insert(id, ints_joined(match n.get(id) { Some(xs) -> xs, None -> [] }, bs))
       } else { n }))
 
-fn settled(before: PathState, x: PathState, y: PathState) -> PathState =
+fn resolved(before: PathState, x: PathState, y: PathState) -> PathState =
   x.pending.fold(x, |h: PathState, id: Int, _: Bool|
     if !before.joins.contains(id) || before.pending.contains(id) || y.pending.contains(id) { h }
     else {
@@ -1171,8 +1171,8 @@ fn joined(before: CheckState, a: CheckState, b: CheckState) -> CheckState =
         let done = a.done || b.done;
         if both { { ..a, fault: Some(b"the misses of an arm hold different counts") } }
         else if a.live && b.live {
-          let ah = settled(before.h, a.h, b.h);
-          let bh = settled(before.h, b.h, a.h);
+          let ah = resolved(before.h, a.h, b.h);
+          let bh = resolved(before.h, b.h, a.h);
           let ours = scoped(ah, before.h);
           if ah.owned != bh.owned {
             { ..a, fault: Some(b"the paths out of a branch hold different counts") }
@@ -1582,7 +1582,7 @@ fn owned_join(w: CheckState, j: Var) -> CheckState =
   if is_refcounted(j.representation) { { ..w, h: { ..w.h, owned: w.h.owned.insert(j.id, 1) } } }
   else { w }
 
-fn lent_back(w: CheckState, a: Arg, from: List<{ param: Int, whole: Bool }>) -> CheckState =
+fn borrowed_back(w: CheckState, a: Arg, from: List<{ param: Int, whole: Bool }>) -> CheckState =
   match operand_var(a) {
     None -> w,
     Some(v) -> if !is_refcounted(v.representation) { w }
@@ -1596,14 +1596,14 @@ fn lent_back(w: CheckState, a: Arg, from: List<{ param: Int, whole: Bool }>) -> 
     },
   }
 
-fn ended(w: CheckState, kept: Map<Int, Int>, why: Bytes) -> CheckState = {
+fn ended(w: CheckState, kept: Map<Int, Int>, reason: Bytes) -> CheckState = {
   let read_arg = pending_held(w.h, kept);
   if w.fault != None { w }
   else if read_arg == kept { { ..w, live: false } } else {
     let odd = read_arg.keys().concat(kept.keys()).filter(|id: Int|
       read_arg.get(id) != kept.get(id));
     match odd.at(0) {
-      Some(id) -> { ..w, fault: Some(why.concat(ascii_of_int(id))), live: false },
+      Some(id) -> { ..w, fault: Some(reason.concat(ascii_of_int(id))), live: false },
       None -> { ..w, live: false },
     }
   }
@@ -1665,16 +1665,16 @@ fn called_otherwise(v: Var, args: List<Arg>, conv: Convention) -> Option<Bytes> 
     Some(b"a call's answer bound otherwise than its convention holds it: v")
   } else if !conv_reps(args, reps_of(conv)) {
     Some(b"a call's operand held otherwise than its convention takes it: v")
-  } else if !borrows_lent(args.map(operand_representation), conv) {
+  } else if !borrows_from_borrowed(args.map(operand_representation), conv) {
     Some(b"a call's answer borrowed of other than a counted operand it lends: v")
   } else { None }
 
-fn borrows_lent(read_arg: List<Representation>, conv: Convention) -> Bool =
-  match conv.answered {
+fn borrows_from_borrowed(read_arg: List<Representation>, conv: Convention) -> Bool =
+  match conv.returned {
     OwnedResult -> true,
     BorrowedResult(from) ->
       from.all(|x: { param: Int, whole: Bool }|
-        param_lent(conv, x.param)
+        param_borrowed(conv, x.param)
           && (match read_arg.at(x.param) { Some(r) -> is_refcounted(r), None -> false })),
   }
 
@@ -1693,9 +1693,9 @@ fn same_reps(args: List<Arg>, vars: List<Var>) -> Bool =
       None -> false,
     })
 
-fn answers_count(v: Rvalue) -> Bool =
+fn results_count(v: Rvalue) -> Bool =
   match v {
-    Call(c) -> is_refcounted(c.convention.result) && c.convention.answered == OwnedResult,
+    Call(c) -> is_refcounted(c.convention.result) && c.convention.returned == OwnedResult,
     Apply(c) -> is_refcounted(c.convention.result),
     Allocate(_) -> true,
     Take(_) -> true,
@@ -1710,8 +1710,8 @@ fn answers_count(v: Rvalue) -> Bool =
 
 fn count(h: PathState, v: Var) -> Int = match h.owned.get(v.id) { Some(n) -> n, None -> 0 }
 
-fn faulted(w: CheckState, why: Bytes, v: Var) -> CheckState =
-  { ..w, fault: Some(why.concat(ascii_of_int(v.id))) }
+fn faulted(w: CheckState, reason: Bytes, v: Var) -> CheckState =
+  { ..w, fault: Some(reason.concat(ascii_of_int(v.id))) }
 
 fn same_rep(a: Arg, r: Representation) -> Bool =
   match a { VarOperand(v) -> v.representation == r, _ -> true }
@@ -1728,16 +1728,16 @@ fn int(id: Int) -> Var = { id: id, ty: int_type(), representation: AsInt }
 
 fn flag(id: Int) -> Var = { id: id, ty: bool_type(), representation: AsBool }
 
-fn root_of(params: List<Var>, lent: List<Int>, answer: Representation, body: Block) -> Fn =
+fn root_of(params: List<Var>, borrowed: List<Int>, result: Representation, body: Block) -> Fn =
   {
     key: Named(b"m.f"),
     kind: Metered,
     params: params,
     convention: {
-      params: lent_where(params.map(|p: Var| p.representation), lent),
-      result: answer,
+      params: borrowed_where(params.map(|p: Var| p.representation), borrowed),
+      result: result,
       destination_passing: false,
-      answered: OwnedResult,
+      returned: OwnedResult,
     },
     result_type: NamedType({ name: b"T", args: [] }),
     body: body,
@@ -1748,15 +1748,15 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Representation, body: Blo
     statics: [],
   }
 
-fn call_of(args: List<Arg>, lent: List<Int>) -> Rvalue =
+fn call_of(args: List<Arg>, borrowed: List<Int>) -> Rvalue =
   Call({
     callee: Root(Named(b"m.g")),
     args: args,
     convention: {
-      params: lent_where(args.map(operand_representation), lent),
+      params: borrowed_where(args.map(operand_representation), borrowed),
       result: AsWord,
       destination_passing: false,
-      answered: OwnedResult,
+      returned: OwnedResult,
     },
     suspends: false,
   })
@@ -1871,7 +1871,7 @@ test "a branch tests a Bool, and a case a number, held as one, never a word that
 test "a variable is used held as it was bound, which its C names follow" {
   let p = word(0);
   let n = word(1);
-  let body = |answer: Var| [bind(n, call_of([VarOperand(p)], []), []), Return(VarOperand(answer))];
+  let body = |result: Var| [bind(n, call_of([VarOperand(p)], []), []), Return(VarOperand(result))];
   assert_eq(ownership_fault(root_of([p], [], AsWord, body(n))), None);
   assert_eq(
     ownership_fault(
@@ -2709,7 +2709,7 @@ test "an operand is held as its operation takes it, and a counted answer is held
       params: [{ handed: OwnedParam, representation: AsInt }],
       result: AsWord,
       destination_passing: false,
-      answered: OwnedResult,
+      returned: OwnedResult,
     },
     suspends: false,
   });
@@ -2762,7 +2762,7 @@ test "a root holds a parameter as its convention takes it or as a view of the li
         ],
         result: AsInt,
         destination_passing: false,
-        answered: OwnedResult,
+        returned: OwnedResult,
       },
     };
   assert_eq(ownership_fault(walk([Dec(view), Return(VarOperand(n))])), None);
@@ -2780,7 +2780,7 @@ test "a root holds a parameter as its convention takes it or as a view of the li
         params: [{ handed: OwnedParam, representation: AsWord }],
         result: AsInt,
         destination_passing: false,
-        answered: OwnedResult,
+        returned: OwnedResult,
       },
     }),
     Some(b"a parameter held otherwise than its convention takes it"),
@@ -2901,8 +2901,8 @@ test "an operation over bytes is handed, takes and answers as its rule says, and
     at: dummy_span(),
     unwind: [],
   });
-  let checked = |params: List<Var>, lent: List<Int>, answer: Representation, body: Block|
-    ownership_fault(root_of(params, lent, answer, body));
+  let checked = |params: List<Var>, borrowed: List<Int>, result: Representation, body: Block|
+    ownership_fault(root_of(params, borrowed, result, body));
   assert_eq(
     checked([b, fresh], [], AsWord, [addressed, copied, Dec(b), Return(VarOperand(fresh))]),
     None,
@@ -3193,14 +3193,14 @@ test "an answer borrowed is read out of counted operands the call lends, and a r
   let p = word(0);
   let r = word(1);
   let n = int(2);
-  let borrowing = |args: List<Arg>, lent: List<Int>, from: List<Int>|
-    match call_of(args, lent) {
+  let borrowing = |args: List<Arg>, borrowed: List<Int>, from: List<Int>|
+    match call_of(args, borrowed) {
       Call(c) ->
         Call({
           ..c,
           convention: {
             ..c.convention,
-            answered: BorrowedResult(from.map(|k: Int| { param: k, whole: false })),
+            returned: BorrowedResult(from.map(|k: Int| { param: k, whole: false })),
           },
         }),
       v -> v,
@@ -3209,7 +3209,7 @@ test "an answer borrowed is read out of counted operands the call lends, and a r
     let f = root_of([p, n], [0], AsWord, [bind(r, value, []), Return(VarOperand(r))]);
     ownership_fault({
       ..f,
-      convention: { ..f.convention, answered: BorrowedResult([{ param: 0, whole: false }]) },
+      convention: { ..f.convention, returned: BorrowedResult([{ param: 0, whole: false }]) },
     })
   };
   assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [0, 1], [0])), None);
@@ -3222,38 +3222,38 @@ test "an answer borrowed is read out of counted operands the call lends, and a r
     ),
     Some(b"a borrowed value consumed with no count of its own: v1"),
   );
-  let refused = Some(b"a call's answer borrowed of other than a counted operand it lends: v1");
-  assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [1], [0])), refused);
-  assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [0, 1], [1])), refused);
-  assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [0, 1], [2])), refused);
+  let rejected = Some(b"a call's answer borrowed of other than a counted operand it lends: v1");
+  assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [1], [0])), rejected);
+  assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [0, 1], [1])), rejected);
+  assert_eq(called(borrowing([VarOperand(p), VarOperand(n)], [0, 1], [2])), rejected);
   let given = root_of([p, n], [], AsWord, [Return(VarOperand(p))]);
-  let answering = |from: Int|
+  let returning = |from: Int|
     ownership_fault({
       ..given,
-      convention: { ..given.convention, answered: BorrowedResult([{ param: from, whole: true }]) },
+      convention: { ..given.convention, returned: BorrowedResult([{ param: from, whole: true }]) },
     });
-  let unlent = Some(b"a root answering borrowed of other than a counted parameter it is lent");
-  assert_eq(answering(0), unlent);
-  assert_eq(answering(1), unlent)
+  let unborrowed = Some(b"a root answering borrowed of other than a counted parameter it is lent");
+  assert_eq(returning(0), unborrowed);
+  assert_eq(returning(1), unborrowed)
 }
 
 test "an answer handed back borrowed holds no count and is read out of only the lent parameters its root names" {
   let p = word(0);
   let q = word(1);
   let y = word(2);
-  let answering = |lent: List<Int>, from: List<Int>, body: Block| {
-    let f = root_of([p, q], lent, AsWord, body);
+  let returning = |borrowed: List<Int>, from: List<Int>, body: Block| {
+    let f = root_of([p, q], borrowed, AsWord, body);
     ownership_fault({
       ..f,
       convention: {
         ..f.convention,
-        answered: BorrowedResult(from.map(|k: Int| { param: k, whole: false })),
+        returned: BorrowedResult(from.map(|k: Int| { param: k, whole: false })),
       },
     })
   };
   let read = |of: Var| bind(y, Get({ of: of, path: LeafPath(0) }), []);
-  assert_eq(answering([0, 1], [0], [read(p), Return(VarOperand(y))]), None);
-  assert_eq(answering([0, 1], [0, 1], [Return(VarOperand(q))]), None);
+  assert_eq(returning([0, 1], [0], [read(p), Return(VarOperand(y))]), None);
+  assert_eq(returning([0, 1], [0, 1], [Return(VarOperand(q))]), None);
   let o = { ..word(3), representation: maybe_word() };
   let gathered = |parts: List<Arg>| {
     let f = root_of([p, q], [0, 1], maybe_word(), [
@@ -3262,7 +3262,7 @@ test "an answer handed back borrowed holds no count and is read out of only the 
     ]);
     ownership_fault({
       ..f,
-      convention: { ..f.convention, answered: BorrowedResult([{ param: 0, whole: true }]) },
+      convention: { ..f.convention, returned: BorrowedResult([{ param: 0, whole: true }]) },
     })
   };
   assert_eq(gathered([IntOperand(1), VarOperand(p)]), None);
@@ -3280,11 +3280,11 @@ test "an answer handed back borrowed holds no count and is read out of only the 
     [Some(p), None],
   );
   assert_eq(
-    answering([0, 1], [0], [read(q), Return(VarOperand(y))]),
+    returning([0, 1], [0], [read(q), Return(VarOperand(y))]),
     Some(b"a borrowed answer read out of other than the parameters its root names: v2"),
   );
   assert_eq(
-    answering([0, 1], [0], [read(p), Inc({ var: y, n: 1 }), Return(VarOperand(y))]),
+    returning([0, 1], [0], [read(p), Inc({ var: y, n: 1 }), Return(VarOperand(y))]),
     Some(b"a borrowed answer holding a count of its own: v2"),
   )
 }
@@ -3359,14 +3359,14 @@ test "a value walked to copy is consumed for the copy it answers, and one walked
   let p = word(0);
   let r = word(1);
   let n = int(2);
-  let walked = |op: TypeOp, answer: Var, rest: List<Inst>|
+  let walked = |op: TypeOp, result: Var, rest: List<Inst>|
     ownership_fault(
       root_of(
         [p],
         [],
-        answer.representation,
-        [bind(answer, WalkLoop({ of: p, op: op }), [])].concat(rest).push(
-          Return(VarOperand(answer)),
+        result.representation,
+        [bind(result, WalkLoop({ of: p, op: op }), [])].concat(rest).push(
+          Return(VarOperand(result)),
         ),
       ),
     );

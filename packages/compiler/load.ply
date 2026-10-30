@@ -1,6 +1,6 @@
 import compiler.front.published (no_rows, dump_of)
 import compiler.front.rows (Dump, Rows, module_of, HashTableRow, DefinitionHashRow)
-import compiler.front.seam (AnalysisOutcome, Analysed, Refused, view_dump)
+import compiler.front.seam (AnalysisOutcome, Analysed, Rejected, view_dump)
 import compiler.front (ShippedInputs, analyse_pulling_std_with, checked_staged, dependencies_of,
                        shipped_inputs_of, staged_pulling_std_with, viewed_text, embed_inputs_of,
                        shipped_bytes, EmbedRecord, embeds_wanted)
@@ -14,12 +14,12 @@ import compiler.store.memo
 import compiler.store.memo (Run, memo, memo_store, start_run)
 import compiler.store.memo_files
 import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_load, entry_hash,
-                                evaluator_of, hashed_all, lookup_input, packages_refused,
-                                refused_first, registry, root_warnings,
+                                evaluator_of, hashed_all, lookup_input, packages_rejected,
+                                rejected_first, registry, root_warnings,
                                 checked_program_from_results, load_inputs_of, package_location_in)
 import compiler.front.checking.world (QueryEffects, CheckQuery, RunEffects, ModuleResult,
                                       with_decode_cache)
-import compiler.expand.derive (DeriverRequest, DeriverResponse, Refusal, Generated, Declined,
+import compiler.expand.derive (DeriverRequest, DeriverResponse, Rejection, Generated, Declined,
                                Failed, import_path, deriver_request_bin, deriver_response_bin)
 import compiler.syntax.items (header, parse, is_shipped)
 import compiler.cc
@@ -126,7 +126,7 @@ fn package_at<[r]>(
       match acc {
         Err(e) -> Err(e),
         Ok(done) -> match module_of(p) {
-          Err(why) -> Err([load_error("`" ++ joined(root, p) ++ "` cannot be a module: " ++ why)]),
+          Err(reason) -> Err([load_error("`" ++ joined(root, p) ++ "` cannot be a module: " ++ reason)]),
           Ok(name) -> match fs.read_file[r](joined(root, p)) {
             None -> Err([load_error("could not read `" ++ joined(root, p) ++ "`")]),
             Some(text) -> Ok(done.push({ path: joined(root, p), name: name, text: text })),
@@ -397,13 +397,13 @@ fn check_modules(
   run: Run,
 ) -> { run: Run, value: CheckResults } / {RunEffects, abort.raise} = {
   let all = query_load(qs, w.own, [], false, run);
-  let answers = all.value.results;
+  let results = all.value.results;
   let pulled = all.value.pulled;
-  if refused_first(answers).len() > 0 {
-    { run: all.run, value: { results: answers, pulled: pulled, modules: [] } }
+  if rejected_first(results).len() > 0 {
+    { run: all.run, value: { results: results, pulled: pulled, modules: [] } }
   } else {
     let fixed = hashed_all(qs, w.own, pulled, false, all.run);
-    { run: fixed.run, value: { results: answers, pulled: pulled, modules: fixed.value } }
+    { run: fixed.run, value: { results: results, pulled: pulled, modules: fixed.value } }
   }
 }
 
@@ -457,8 +457,8 @@ fn entry_module(entry: Bytes) -> Bytes / {abort.raise} = {
   if k < 0 { b"" } else { entry.slice(0, k) }
 }
 
-fn refusals(
-  answers: List<CheckedModule>,
+fn rejections(
+  results: List<CheckedModule>,
   files: List<SourceFile>,
   own: List<Bytes>,
 ) -> List<Diagnostic> / {abort.raise} = {
@@ -467,7 +467,7 @@ fn refusals(
       match own.at(i) { Some(name) -> name, None -> Bytes::of_string(files.get(i).name) },
       i,
     ));
-  refused_first(answers).fold([], |acc: List<Diagnostic>, a: CheckedModule| {
+  rejected_first(results).fold([], |acc: List<Diagnostic>, a: CheckedModule| {
     let i = match placed_at.get(a.module) {
       Some(k) -> k,
       None ->
@@ -490,21 +490,21 @@ pub fn checked_program<[s]>(
   let texts = pulled_texts(check_modules.pulled);
   let files_below = shipped.names().map(Bytes::of_string);
   let mine = indexed_sources(p.own, p.dependencies, check_modules.pulled, texts);
-  let answers = check_modules.results;
+  let results = check_modules.results;
   let modules = p.dependencies.fold(p.own.files.len(), |n: Int, d: Package| n + d.files.len())
     + check_modules.pulled.len();
-  let packaged = packages_refused(
+  let packaged = packages_rejected(
     p.packages,
     p.own.files.map(|f: SourceFile| Bytes::of_string(f.name)),
     modules,
     files_below,
   );
-  match if packaged.len() > 0 { packaged } else { refusals(answers, mine, world_for(p).own) } {
+  match if packaged.len() > 0 { packaged } else { rejections(results, mine, world_for(p).own) } {
     [] -> {
       let loaded = assembled_load(
         p.own.files.map(|f: SourceFile| Bytes::of_string(f.name)),
         p.packages,
-        answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
+        results.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
           acc.insert(a.module, a.result.shape)),
         joined_cached_hashes(check_modules.modules),
         check_modules.pulled,
@@ -512,12 +512,12 @@ pub fn checked_program<[s]>(
         texts,
         tested,
         true,
-        root_warnings(answers, p.own.files.len()),
+        root_warnings(results, p.own.files.len()),
       );
       let view = checked_program_from_results(
         loaded.frame,
         loaded.reads,
-        answers.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
+        results.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
           acc.insert(a.module, a.result)),
       );
       report_viewed(loaded.views, true);
@@ -610,11 +610,11 @@ pub fn check_in_memory(
   files: List<SourceFile>,
   inputs: Map<Bytes, Bytes>,
 ) -> Result<LoadedAnalysis, LoadFailure> / {shipped.names, shipped.module, shipped.report_reached, abort.raise} = {
-  let answered = analyse_in_memory(files, inputs);
+  let returned = analyse_in_memory(files, inputs);
   let own = files.fold(Map::new(), |acc: Map<Bytes, Bool>, f: SourceFile|
     acc.insert(Bytes::of_string(f.name), true));
-  match answered.out {
-    Refused(diagnostics) -> Err({ diagnostics: diagnostics, files: answered.files }),
+  match returned.out {
+    Rejected(diagnostics) -> Err({ diagnostics: diagnostics, files: returned.files }),
     Analysed(w) -> {
       let dump = dump_of(Analysed(w));
       match embed_inputs_of(dump.embeds, |e: ModuleEmbed|
@@ -626,11 +626,11 @@ pub fn check_in_memory(
               None -> Err(b"the program was handed no file of that digest"),
             }
           }) {
-        Err(diagnostics) -> Err({ diagnostics: diagnostics, files: answered.files }),
+        Err(diagnostics) -> Err({ diagnostics: diagnostics, files: returned.files }),
         Ok(inputs) ->
           Ok({
             dump: dump,
-            files: answered.files,
+            files: returned.files,
             inputs: inputs,
             read_ms: 0,
             front_end_ms: 0,
@@ -811,7 +811,7 @@ fn compile_deriver(
     name: String::of_bytes(name),
     text: derivation_source(module),
   });
-  let refused = |diagnostics: List<Diagnostic>|
+  let rejected = |diagnostics: List<Diagnostic>|
     Err({
       result: unran(
         b"E0160",
@@ -824,10 +824,10 @@ fn compile_deriver(
       ),
       keep: true,
     });
-  let unkept = |why: Bytes, notes: List<Bytes>|
-    Err({ result: unran(b"E0155", why, notes), keep: false });
+  let unkept = |reason: Bytes, notes: List<Bytes>|
+    Err({ result: unran(b"E0155", reason, notes), keep: false });
   match check_in_memory(files, Map::new()) {
-    Err(u) -> refused(u.diagnostics),
+    Err(u) -> rejected(u.diagnostics),
     Ok(front) -> {
       let roots = every_root(front);
       let emission = emitted(
@@ -841,15 +841,15 @@ fn compile_deriver(
         entered: Some([Named(derived_root(name))]),
       );
       match unit::held(front.dump, emission) {
-        Err(diagnostics) -> refused(diagnostics),
+        Err(diagnostics) -> rejected(diagnostics),
         Ok(parts) -> if compilers.find[cc]() == None {
           unkept(b"no C compiler is found to run the deriver", [])
         } else {
           match match unit::cache_parts(parts) {
-              Err(why) -> Err(why),
+              Err(reason) -> Err(reason),
               Ok(sources) -> cc::library[cc](cc::development(), sources),
             } {
-            Err(why) -> unkept(b"the deriver's program did not compile", [Bytes::of_string(why)]),
+            Err(reason) -> unkept(b"the deriver's program did not compile", [Bytes::of_string(reason)]),
             Ok(l) -> {
               let library = cache_relative(l);
               if toolchain.write_file(kept, Bytes::of_string(library)) { Ok(library) } else {
@@ -870,7 +870,7 @@ fn cache_relative(path: String) -> String / {toolchain.read, abort.raise} = {
 
 fn derivation_run_of(
   ask: DeriverRequest,
-  answered: Option<Bytes>,
+  returned: Option<Bytes>,
 ) -> DerivationRun / {abort.raise} = {
   let failed = {
     result: unran(
@@ -884,20 +884,20 @@ fn derivation_run_of(
         ]),
       ],
     ),
-    keep: answered != None,
+    keep: returned != None,
   };
-  match answered.and_then(value::decode) {
+  match returned.and_then(value::decode) {
     Some(VCtor(c, [VStr(text)])) -> if value::constructor_name(c) == "Ok" {
       { result: Generated(Bytes::of_string(text)), keep: true }
     } else { failed },
     Some(VCtor(c, [VRecord(fields)])) -> if value::constructor_name(c) != "Err" { failed } else {
-      match refused_of(fields) { Some(r) -> { result: Declined(r), keep: true }, None -> failed }
+      match rejected_of(fields) { Some(r) -> { result: Declined(r), keep: true }, None -> failed }
     },
     _ -> failed,
   }
 }
 
-fn refused_of(fields: List<value::Field>) -> Option<Refusal> =
+fn rejected_of(fields: List<value::Field>) -> Option<Rejection> =
   match ((
       value::field_named(fields, "message"),
       value::field_named(fields, "at"),

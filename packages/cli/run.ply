@@ -30,7 +30,7 @@ import units (emit)
 import sources (load_resolved)
 import std.fs (fs)
 import std.time (time)
-import report (CommandOutput, indent, ok_code, compile_error, count_of, refused, warned_lines)
+import report (CommandOutput, indent, ok_code, compile_error, count_of, rejected, warned_lines)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, to_string, int,
                  string_or_null, strings)
 import std.value (Value, VInt, VUnit, render)
@@ -45,11 +45,11 @@ import compiler.unit (shipped)
 import artifact_builder
 import hosts (filesystem_json, transport_json)
 import host_listing
-import host_listing (Disclosures, Listing, RefusalCount)
+import host_listing (Disclosures, Listing, RejectionCount)
 import entries (Runnable, RestoredLoad)
 import machine
 import machine (Artifact, RunConfiguration, Deployed, BindingSummary, Counters, RunOutcome,
-                MachineAccess, Options, Program, Project, ProgramFiles, Refusal, Signals,
+                MachineAccess, Options, Program, Project, ProgramFiles, Rejection, Signals,
                 StopReport, Target, Teardown, Trace, program_of)
 import std.bin
 import std.machine as entering
@@ -206,7 +206,7 @@ fn trace_lines(style: Style, e: RunOutcome) -> List<String> =
             style,
             "trace       " ++ c.events.to_string() ++ " event(s) · " ++ c.spans.to_string()
               ++ " span(s) · "
-              ++ c.abandoned.to_string()
+              ++ c.timed_out.to_string()
               ++ " abandoned · "
               ++ (if c.flushed { "flushed" } else { "not flushed" }),
           ),
@@ -385,24 +385,24 @@ fn ended(
     },
   }
 
-fn unreadable_artifact(style: Style, path: String, why: Refusal) -> CommandOutput / {abort.raise} =
+fn unreadable_artifact(style: Style, path: String, reason: Rejection) -> CommandOutput / {abort.raise} =
   {
     json: object([
       { key: "command", value: Str("run") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: int(compile_error()) },
       { key: "artifact", value: Str(path) },
-      { key: "diagnostics", value: all_to_json(why.diagnostics, why.places) },
+      { key: "diagnostics", value: all_to_json(reason.diagnostics, reason.places) },
     ]),
     lines: [],
-    errs: all_to_text(style, why.diagnostics, why.places),
+    errs: all_to_text(style, reason.diagnostics, reason.places),
     code: compile_error(),
   }
 
-fn unloaded(style: Style, why: Refusal) -> CommandOutput / {abort.raise} =
-  match why.artifact {
-    None -> refused(style, "run", why.diagnostics, why.places),
-    Some(path) -> unreadable_artifact(style, path, why),
+fn unloaded(style: Style, reason: Rejection) -> CommandOutput / {abort.raise} =
+  match reason.artifact {
+    None -> rejected(style, "run", reason.diagnostics, reason.places),
+    Some(path) -> unreadable_artifact(style, path, reason),
   }
 
 fn unentered(
@@ -425,19 +425,19 @@ fn unentered(
     code: compile_error(),
   }
 
-fn unbound(style: Style, why: Refusal) -> CommandOutput / {abort.raise} = {
+fn unbound(style: Style, reason: Rejection) -> CommandOutput / {abort.raise} = {
   let tally = indent() ++ red(style, "no host handler was bound") ++ " ("
-    ++ count_of(why.diagnostics.len(), "error")
+    ++ count_of(reason.diagnostics.len(), "error")
     ++ ")";
   {
     json: object([
       { key: "command", value: Str("run") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: int(compile_error()) },
-      { key: "diagnostics", value: all_to_json(why.diagnostics, why.places) },
+      { key: "diagnostics", value: all_to_json(reason.diagnostics, reason.places) },
     ]),
     lines: [],
-    errs: all_to_text(style, why.diagnostics, why.places).push(tally),
+    errs: all_to_text(style, reason.diagnostics, reason.places).push(tally),
     code: compile_error(),
   }
 }
@@ -450,13 +450,13 @@ fn bind_and_run<| e>(
   target: Target,
   entry_name: String,
   config: Result<Resolution, List<Diagnostic>>,
-  bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Refusal> / e,
+  bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Rejection> / e,
 ) -> CommandOutput / {process.err[proc], abort.raise | e} =
   match config {
     Err(diagnostics) ->
       unbound(style, { diagnostics: diagnostics, places: places_of(target), artifact: None }),
     Ok(r) -> match bind(entry_name, configuration::run_configuration(r.configuration)) {
-      Err(why) -> unbound(style, why),
+      Err(reason) -> unbound(style, reason),
       Ok(b) -> {
         print_disclosures(style, flags, target, b.bound, r);
         ended(style, flags, target, entry_name, r, (b.enter)())
@@ -469,7 +469,7 @@ fn choose_entry<| e>(
   flags: Flags,
   target: Target,
   config: Result<Resolution, List<Diagnostic>>,
-  bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Refusal> / e,
+  bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Rejection> / e,
 ) -> CommandOutput / {process.err[proc], abort.raise | e} =
   match entry_of(target) {
     Err(d) -> unentered(style, target, d),
@@ -495,20 +495,20 @@ fn bound_over(
   entry_name: String,
   config: RunConfiguration,
   stderr: Bool,
-) -> Result<BoundEntry<| {entering::machine.enter, entering::machine.unbind, abort.raise}>, Refusal> / {entering::machine.hosting, entering::machine.bind, abort.raise} = {
+) -> Result<BoundEntry<| {entering::machine.enter, entering::machine.unbind, abort.raise}>, Rejection> / {entering::machine.hosting, entering::machine.bind, abort.raise} = {
   let unheard = machine::run_grants(options, config, machine::PlatformDefault, stderr);
   let declared = loaded.runnable.declared;
-  let refused = |diagnostics: List<Diagnostic>|
+  let rejected = |diagnostics: List<Diagnostic>|
     Err({ diagnostics: diagnostics, places: places_of(loaded.target), artifact: None });
   match host_listing::allow_error(unheard.allow, declared) {
-    Some(d) -> refused([d]),
+    Some(d) -> rejected([d]),
     None -> {
       let hosting = entering::machine.hosting(unheard);
-      if hosting.refusals.len() > 0 { refused(hosting.refusals.map(machine::unplaced)) } else {
+      if hosting.rejections.len() > 0 { rejected(hosting.rejections.map(machine::unplaced)) } else {
         let l = host_listing::listing_of(declared, loaded.runnable.performed);
         let stop = host_listing::shutdown_mode_of(l.rows);
         match entering::machine.bind(machine::run_grants(options, config, stop, stderr)) {
-          Err(failures) -> refused(failures.map(machine::unplaced)),
+          Err(failures) -> rejected(failures.map(machine::unplaced)),
           Ok(binding) -> {
             let bounds = { lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms };
             let disclosures = host_listing::disclosures_of(l, hosting, config, Some(bounds));
@@ -555,11 +555,11 @@ fn entered(
   });
   let reports = entering::machine.unbind(binding);
   let roots = entries::roots_of(loaded.runnable);
-  let answer = machine::result_of(o, roots, entry_name);
+  let result = machine::result_of(o, roots, entry_name);
   {
     exit: o.exit,
-    value: if o.exit != None { None } else { match answer { Ok(v) -> Some(v), Err(_) -> None } },
-    raised: match answer { Ok(_) -> None, Err(r) -> Some(r) },
+    value: if o.exit != None { None } else { match result { Ok(v) -> Some(v), Err(_) -> None } },
+    raised: match result { Ok(_) -> None, Err(r) -> Some(r) },
     counters: counters_of(o.usage),
     warnings: machine::warnings_of(o, roots),
     stopping: host_listing::report_of(reports, "stopping", machine::stop_report_bin()),
@@ -611,7 +611,7 @@ fn handshakes_json(reports: List<entering::Report>) -> Json / {abort.raise} = {
     {
       key: "reasons",
       value: Array(
-        h.reasons.map(|r: RefusalCount|
+        h.reasons.map(|r: RejectionCount|
           object([{ key: "reason", value: Str(r.reason) }, { key: "count", value: int(r.count) }])),
       ),
     },
@@ -627,7 +627,7 @@ pub fn run(
   if is_artifact(named) {
     match config_schema::name_error(options.config.schema) {
       Some(d) -> unbound(s, { diagnostics: [d], places: [], artifact: None }),
-      None -> match signer_refusal(flags) {
+      None -> match signer_rejection(flags) {
         Some(d) ->
           unreadable_artifact(s, named, { diagnostics: [d], places: [], artifact: Some(named) }),
         None ->
@@ -647,18 +647,18 @@ fn deployed_target(
   path: String,
   bytes: Option<Bytes>,
   profile: cc::Profile,
-) -> Result<LoadedTarget, Refusal> / {entering::machine.open, emit.compiled, shipped.definitions, shipped.runtime, toolchain.read, toolchain.write, abort.raise} =
+) -> Result<LoadedTarget, Rejection> / {entering::machine.open, emit.compiled, shipped.definitions, shipped.runtime, toolchain.read, toolchain.write, abort.raise} =
   if path.ends_with(".plyz") { Err({ diagnostics: [a_library(path)], places: [], artifact: None }) }
   else {
-    let refused = |d: List<Diagnostic>| Err({ diagnostics: d, places: [], artifact: Some(path) });
+    let rejected = |d: List<Diagnostic>| Err({ diagnostics: d, places: [], artifact: Some(path) });
     match bytes {
-      None -> refused([artifact_builder::unreadable(path)]),
+      None -> rejected([artifact_builder::unreadable(path)]),
       Some(b) -> match artifact_builder::open_artifact(path, b) {
-        Err(d) -> refused([d]),
+        Err(d) -> rejected([d]),
         Ok(o) -> match units::library_carried(o.unit, profile) {
-          Err(diagnostics) -> refused(diagnostics),
+          Err(diagnostics) -> rejected(diagnostics),
           Ok(library) -> match entering::machine.open(library) {
-            Err(why) -> refused([machine::unit_load_error(why)]),
+            Err(reason) -> rejected([machine::unit_load_error(reason)]),
             Ok(unit) ->
               Ok({
                 target: Deployed({
@@ -692,12 +692,12 @@ fn a_library(path: String) -> Diagnostic =
 fn artifact_bytes(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_file[abs]} =
   match flags.paths.at(0) { Some(r) -> paths::read_file(paths::rooted(r)), None -> None }
 
-fn unsigned(path: String, why: String) -> Diagnostic =
+fn unsigned(path: String, reason: String) -> Diagnostic =
   error_at(
     b"E0460",
     no_module(),
     dummy_span(),
-    Bytes::of_string("the artifact `" ++ path ++ "` " ++ why),
+    Bytes::of_string("the artifact `" ++ path ++ "` " ++ reason),
     b"not signed by a key `--require-signer` trusts",
     [
       b"`ply build --sign KEY` signs what it builds, in `<artifact>.sig` beside it; `--require-signer` names the public key files a run trusts",
@@ -714,7 +714,7 @@ fn trusted_keys(
         None -> Err(unreadable_key(path, "cannot be read")),
         Some(b) -> match public_of(String::of_bytes_lossy(b)) {
           Ok(k) -> Ok(keys.push(k)),
-          Err(why) -> Err(unreadable_key(path, "does not hold a public key: " ++ why)),
+          Err(reason) -> Err(unreadable_key(path, "does not hold a public key: " ++ reason)),
         },
       },
     })
@@ -728,7 +728,7 @@ fn signatures_of(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_fi
     None -> None,
   }
 
-fn signer_refusal(
+fn signer_rejection(
   flags: Flags,
 ) -> Option<Diagnostic> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   if flags.signers.len() == 0 { None } else {
@@ -868,8 +868,8 @@ fn built(
       None -> match broken_promises(t.program, w.frame) {
         [] -> match evaluation_errors(t, w.frame) {
           [] -> loaded_built(style, flags, options, project, t, w, key),
-          refused ->
-            unloaded(style, { diagnostics: refused, places: t.program.places, artifact: None }),
+          rejected ->
+            unloaded(style, { diagnostics: rejected, places: t.program.places, artifact: None }),
         },
         broken ->
           unloaded(style, { diagnostics: broken, places: t.program.places, artifact: None }),
@@ -892,12 +892,12 @@ fn loaded_built(
   let emitted = units::whole_library(front, options.profile);
   let offered = entries::narrowed_to(entries::of_front(front), flags.paths);
   let runnable = entries::runnable_of(front);
-  let refused = |diagnostics: List<Diagnostic>|
+  let rejected = |diagnostics: List<Diagnostic>|
     Err({ diagnostics: diagnostics, places: timed.program.places, artifact: None });
   let loaded = match emitted {
-    Err(diagnostics) -> refused(diagnostics),
+    Err(diagnostics) -> rejected(diagnostics),
     Ok(library) -> match entering::machine.open(library) {
-      Err(why) -> refused([machine::unit_load_error(why)]),
+      Err(reason) -> rejected([machine::unit_load_error(reason)]),
       Ok(unit) ->
         Ok({
           target: program_of(
@@ -942,13 +942,13 @@ fn run_loaded(
   style: Style,
   flags: Flags,
   options: Options,
-  loaded: Result<LoadedTarget, Refusal>,
+  loaded: Result<LoadedTarget, Rejection>,
   l: Option<LoadTiming>,
 ) -> CommandOutput / {MachineAccess, process.err[proc], env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match loaded {
-    Err(why) -> unloaded(style, why),
+    Err(reason) -> unloaded(style, reason),
     Ok(t) -> {
-      let answer = run_target(
+      let result = run_target(
         style,
         flags,
         Ok(t.target),
@@ -958,20 +958,20 @@ fn run_loaded(
         l,
       );
       entering::machine.close(t.unit.unit);
-      answer
+      result
     },
   }
 
 fn run_target<| e>(
   style: Style,
   flags: Flags,
-  target: Result<Target, Refusal>,
+  target: Result<Target, Rejection>,
   config: Result<Resolution, List<Diagnostic>>,
-  bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Refusal> / e,
+  bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Rejection> / e,
   l: Option<LoadTiming>,
 ) -> CommandOutput / {process.err[proc], abort.raise | e} =
   match target {
-    Err(why) -> unloaded(style, why),
+    Err(reason) -> unloaded(style, reason),
     Ok(t) -> match l {
       None -> choose_entry(style, flags, t, config, bind),
       Some(loading) -> {
@@ -1024,12 +1024,12 @@ fn load_timing_json(l: LoadTiming) -> Json =
     },
   ])
 
-fn with_load_timing(flags: Flags, l: LoadTiming, answer: CommandOutput) -> CommandOutput =
-  if !(flags.explain && flags.json) { answer } else {
-    match answer.json {
+fn with_load_timing(flags: Flags, l: LoadTiming, result: CommandOutput) -> CommandOutput =
+  if !(flags.explain && flags.json) { result } else {
+    match result.json {
       Object(members) ->
-        { ..answer, json: Object(members.insert("front_end", load_timing_json(l))) },
-      _ -> answer,
+        { ..result, json: Object(members.insert("front_end", load_timing_json(l))) },
+      _ -> result,
     }
   }
 
@@ -1093,14 +1093,14 @@ fn a_diagnostic(code: Bytes, message: Bytes, labels: List<Label>) -> Diagnostic 
     fixes: [],
   }
 
-fn no_refusal() -> Refusal = { diagnostics: [], places: [], artifact: None }
+fn no_rejection() -> Rejection = { diagnostics: [], places: [], artifact: None }
 
 type RunCapture = { result: CommandOutput, err: List<String> }
 
 fn run_fixture(
   flags: Flags,
-  t: Result<Target, Refusal>,
-  b: Result<BindingSummary, Refusal>,
+  t: Result<Target, Rejection>,
+  b: Result<BindingSummary, Rejection>,
   e: RunOutcome,
 ) -> RunCapture / {abort.raise} = run_fixture_loaded(flags, t, Ok(unconfigured()), b, e, None)
 
@@ -1130,9 +1130,9 @@ fn configured_service() -> Resolution / {abort.raise} =
 
 fn run_fixture_loaded(
   flags: Flags,
-  t: Result<Target, Refusal>,
+  t: Result<Target, Rejection>,
   config: Result<Resolution, List<Diagnostic>>,
-  b: Result<BindingSummary, Refusal>,
+  b: Result<BindingSummary, Rejection>,
   e: RunOutcome,
   l: Option<LoadTiming>,
 ) -> RunCapture / {abort.raise} =
@@ -1143,7 +1143,7 @@ fn run_fixture_loaded(
       t,
       config,
       |entry_name: String, config: RunConfiguration|
-        match b { Ok(bound) -> Ok({ bound: bound, enter: || e }), Err(why) -> Err(why) },
+        match b { Ok(bound) -> Ok({ bound: bound, enter: || e }), Err(reason) -> Err(reason) },
       l,
     )
   } with {
@@ -1151,7 +1151,7 @@ fn run_fixture_loaded(
     process.err[proc](text) -> {
       io = err_step(io, text);
     },
-    return answer -> { result: answer, err: io.err },
+    return result -> { result: result, err: io.err },
   }
 
 fn bare() -> Flags / {abort.raise} = from_argv("run", [])
@@ -1293,7 +1293,7 @@ test "under `--explain` a stopped run says its handshakes, what was in flight, h
     ..returned_value(VUnit),
     stopping: Some({ signal: Some("SIGTERM"), listeners: 1, connections: 2, elapsed_ms: 40 }),
     teardown: { ..no_teardown(), spans_left_open: 1 },
-    trace: Some({ events: 9, spans: 4, abandoned: 2, flushed: true }),
+    trace: Some({ events: 9, spans: 4, timed_out: 2, flushed: true }),
     handshakes: ["handshakes: 1 completed, 0 refused"],
   };
   let ran = run_fixture(explaining(), Ok(a_program()), Ok(a_binding()), stopped);
@@ -1392,12 +1392,12 @@ test "an artifact says which file it ran, its digest, and what it carries" {
 }
 
 test "a program that does not load is the load's own refusal with the tally under it" {
-  let why: Refusal = {
+  let reason: Rejection = {
     diagnostics: [a_diagnostic(b"E0201", b"type mismatch", [])],
     places: [],
     artifact: None,
   };
-  let ran = run_fixture(bare(), Err(why), Err(no_refusal()), returned_value(VUnit));
+  let ran = run_fixture(bare(), Err(reason), Err(no_rejection()), returned_value(VUnit));
   assert_eq(ran.result.code, 2);
   assert_eq(ran.result.lines, []);
   assert_eq(ran.result.errs, [
@@ -1407,17 +1407,17 @@ test "a program that does not load is the load's own refusal with the tally unde
 }
 
 test "a file that is not an artifact is refused about the file and tallies nothing" {
-  let why: Refusal = {
+  let reason: Rejection = {
     diagnostics: [a_diagnostic(b"E0443", b"not a program at all", [])],
     places: [],
     artifact: Some("junk.plyx"),
   };
   let text = to_string(
-    run_fixture(as_json(), Err(why), Err(no_refusal()), returned_value(VUnit)).result.json,
+    run_fixture(as_json(), Err(reason), Err(no_rejection()), returned_value(VUnit)).result.json,
   );
   assert(text.contains("\"artifact\":\"junk.plyx\""));
   assert(text.contains("\"E0443\""));
-  let ran = run_fixture(bare(), Err(why), Err(no_refusal()), returned_value(VUnit));
+  let ran = run_fixture(bare(), Err(reason), Err(no_rejection()), returned_value(VUnit));
   assert_eq(ran.result.code, 2);
   assert_eq(ran.result.errs, ["Error[E0443]: not a program at all"])
 }
@@ -1430,7 +1430,7 @@ test "a program with no `main` is refused over its own files before anything is 
     mains: [],
     modules: [{ name: "m", path: "m.ply", at: { module: 0, start: 18, end: 18 } }],
   });
-  let ran = run_fixture(as_json(), Ok(empty), Err(no_refusal()), returned_value(VUnit));
+  let ran = run_fixture(as_json(), Ok(empty), Err(no_rejection()), returned_value(VUnit));
   assert_eq(ran.result.code, 2);
   let text = to_string(ran.result.json);
   assert(text.contains("\"root\":\"/p\""));
@@ -1438,12 +1438,12 @@ test "a program with no `main` is refused over its own files before anything is 
 }
 
 test "a binding that does not match the program is a start-up failure naming no line" {
-  let why: Refusal = {
+  let reason: Rejection = {
     diagnostics: [a_diagnostic(b"E0412", b"a nondet effect in a det test", [])],
     places: [],
     artifact: None,
   };
-  let ran = run_fixture(bare(), Ok(a_program()), Err(why), returned_value(VUnit));
+  let ran = run_fixture(bare(), Ok(a_program()), Err(reason), returned_value(VUnit));
   assert_eq(ran.result.code, 2);
   assert_eq(ran.result.errs, [
     "Error[E0412]: a nondet effect in a det test",
@@ -1451,7 +1451,7 @@ test "a binding that does not match the program is a start-up failure naming no 
   ]);
   assert(
     to_string(
-      run_fixture(as_json(), Ok(a_program()), Err(why), returned_value(VUnit)).result.json,
+      run_fixture(as_json(), Ok(a_program()), Err(reason), returned_value(VUnit)).result.json,
     ).contains(
       "\"exit_code\":2",
     ),
@@ -1558,16 +1558,16 @@ test "`--json --explain` carries the load in the one document and says nothing a
 }
 
 test "a load the machine refused says nothing about where its time went" {
-  let why: Refusal = {
+  let reason: Rejection = {
     diagnostics: [a_diagnostic(b"E0201", b"type mismatch", [])],
     places: [],
     artifact: None,
   };
   let ran = run_fixture_loaded(
     explaining(),
-    Err(why),
+    Err(reason),
     Ok(unconfigured()),
-    Err(no_refusal()),
+    Err(no_rejection()),
     returned_value(VUnit),
     Some(a_build()),
   );

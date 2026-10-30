@@ -5,7 +5,7 @@ import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
-import compiler.front.seam (Refused, Analysed, TestRunScope, view_dump, checked_program_of)
+import compiler.front.seam (Rejected, Analysed, TestRunScope, view_dump, checked_program_of)
 import compiler.front.facts (Analysis, ShippedView, CheckedProgram, Frame, TableReads, ModuleShape,
                              assembled_load, no_reads, pulled_at, statement_modules)
 import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, pins_of_load,
@@ -37,7 +37,7 @@ import builder (builder)
 import module_queries
 import module_queries (QueryResults)
 import compiler.store.memo (Dependency, QueryStats)
-import compiler.front.checking (CheckedModule, packages_refused, refused_first, root_warnings,
+import compiler.front.checking (CheckedModule, packages_rejected, rejected_first, root_warnings,
                                 rows_of_result, checked_program_from_results)
 import compiler.front.checking.world (ModuleResult, ModuleKey)
 import compiler.front.pages (Pages)
@@ -54,7 +54,7 @@ pub type Program = {
   places: List<SourceText>,
   diagnostics: List<Diagnostic>,
   frame: Option<Frame>,
-  answered: Map<Bytes, ModuleResult>,
+  returned: Map<Bytes, ModuleResult>,
   reads: TableReads,
   whole: Option<Analysis>,
   sources: List<Source>,
@@ -116,7 +116,7 @@ fn failed_program(
     places: places,
     diagnostics: diagnostics,
     frame: None,
-    answered: Map::new(),
+    returned: Map::new(),
     reads: no_reads(),
     whole: None,
     sources: project.sources,
@@ -140,7 +140,7 @@ pub fn no_program() -> Program =
     places: [],
     diagnostics: [],
     frame: None,
-    answered: Map::new(),
+    returned: Map::new(),
     reads: no_reads(),
     whole: None,
     sources: [],
@@ -270,7 +270,7 @@ pub fn reanalysed(
 fn analysed(
   project: Project,
   shipping: ShippedInputs,
-  answers: List<CheckedModule>,
+  results: List<CheckedModule>,
   pulled: List<Bytes>,
   embeds: List<Embed>,
   inputs: Map<Bytes, Bytes>,
@@ -280,11 +280,11 @@ fn analysed(
   let texts = shipping.read.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
     acc.insert(String::of_bytes_lossy(source.name), source.src));
   let packages: PackageSources = packages_of(project);
-  let warnings = root_warnings(answers, project.sources.len());
+  let warnings = root_warnings(results, project.sources.len());
   let loaded = assembled_load(
     project.sources.map(|s: Source| s.name),
     packages,
-    answers.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
+    results.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
       acc.insert(a.module, a.result.shape)),
     joined_cached_hashes(modules),
     pulled,
@@ -306,7 +306,7 @@ fn analysed(
     ),
     diagnostics: warnings,
     frame: Some(loaded.frame),
-    answered: answers.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
+    returned: results.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
       acc.insert(a.module, a.result)),
     reads: loaded.reads,
     whole: None,
@@ -334,12 +334,12 @@ fn analysed(
           m || (match item { OutlinedFunction(f) -> pick(f), _ -> false })));
   let measured = held(|f: FnOutline| f.measured);
   if !measured && !held(|f: FnOutline| f.reuse || f.returns) { program } else {
-    let refused = |ds: List<Diagnostic>| { ..program, diagnostics: ds, frame: None };
+    let rejected = |ds: List<Diagnostic>| { ..program, diagnostics: ds, frame: None };
     match whole_of(program) {
-      Err(ds) -> refused(ds),
+      Err(ds) -> rejected(ds),
       Ok(w) -> match if measured { unproved_measures(w, mine) } else { [] } {
         [] -> { ..program, whole: Some(w) },
-        missing -> refused(missing.map(unproved_measure)),
+        missing -> rejected(missing.map(unproved_measure)),
       },
     }
   }
@@ -355,14 +355,14 @@ pub fn runs_statements(program: Program, frame: Frame) -> Bool =
   uses_statement_modules(frame.outlines.take(program.files.len()))
 
 pub fn module_derivations(program: Program) -> List<ModuleDerivations> =
-  program.answered.fold([], |acc: List<ModuleDerivations>, _: Bytes, a: ModuleResult| {
+  program.returned.fold([], |acc: List<ModuleDerivations>, _: Bytes, a: ModuleResult| {
     let outline = a.shape.outline;
     if outline.derived.len() == 0 { acc }
     else { acc.push({ module: outline.name, derivations: outline.derived }) }
   })
 
 fn published_rows(program: Program) -> Rows / {abort.raise} =
-  program.answered.fold(no_rows(), |acc: Rows, _: Bytes, a: ModuleResult| {
+  program.returned.fold(no_rows(), |acc: Rows, _: Bytes, a: ModuleResult| {
     let rows = rows_of_result(a);
     {
       definitions: acc.definitions.concat(rows.definitions),
@@ -379,7 +379,7 @@ pub fn own_diagnostics(diagnostics: List<Diagnostic>, frame: Frame) -> List<Diag
 pub fn program_view(program: Program) -> Option<CheckedProgram> / {abort.raise} =
   match program.frame {
     None -> None,
-    Some(f) -> Some(checked_program_from_results(f, program.reads, program.answered)),
+    Some(f) -> Some(checked_program_from_results(f, program.reads, program.returned)),
   }
 
 pub fn whole_of(program: Program) -> Result<Analysis, List<Diagnostic>> / {abort.raise} =
@@ -396,7 +396,7 @@ pub fn whole_of(program: Program) -> Result<Analysis, List<Diagnostic>> / {abort
         joined_cached_hashes(program.modules),
         module_derivations(program),
       ).out {
-      Refused(ds) -> Err(ds),
+      Rejected(ds) -> Err(ds),
       Analysed(w) -> Ok({ ..w, warnings: f.warnings }),
     },
   }
@@ -558,7 +558,7 @@ fn assembled_from(
   q: QueryResults,
   reached: Bool,
 ) -> Program / {abort.raise} = {
-  let answers = q.results;
+  let results = q.results;
   if project.diagnostics.len() > 0 {
     failed_program(project, shipping, own_places(project), project.diagnostics)
   } else if project.sources.len() == 0 {
@@ -566,12 +566,12 @@ fn assembled_from(
       no_ply_files(match paths.at(0) { Some(r) -> r.display, None -> "." }),
     ])
   } else {
-    let first = refused_first(answers).fold(
+    let first = rejected_first(results).fold(
       Map::new(),
       |acc: Map<Bytes, Bool>, a: CheckedModule| acc.insert(a.module, true),
     );
     let own = project_sources(project);
-    let packaged = packages_refused(
+    let packaged = packages_rejected(
       packages_of(project),
       project.sources.map(|s: Source| s.name),
       own.modules.len(),
@@ -582,10 +582,10 @@ fn assembled_from(
     } else if first.len() > 0 {
       let texts = shipping.read.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
         acc.insert(String::of_bytes_lossy(source.name), source.src));
-      let pulled = answers.drop(own.modules.len()).map(|a: CheckedModule|
+      let pulled = results.drop(own.modules.len()).map(|a: CheckedModule|
         shipped_place(texts, String::of_bytes_lossy(a.module)));
-      let diagnostics = range(0, answers.len()).fold([], |acc: List<Diagnostic>, i: Int| {
-        let a = answers.get(i);
+      let diagnostics = range(0, results.len()).fold([], |acc: List<Diagnostic>, i: Int| {
+        let a = results.get(i);
         if !first.contains(a.module) { acc } else {
           acc.concat(
             a.result.refused.map(|d: Diagnostic|
@@ -603,7 +603,7 @@ fn assembled_from(
       match q.inputs {
         Err(moved) -> failed_program(project, shipping, own.modules.concat(own.manifests), moved),
         Ok(inputs) ->
-          analysed(project, shipping, answers, q.pulled, q.embeds, inputs, reached, q.modules),
+          analysed(project, shipping, results, q.pulled, q.embeds, inputs, reached, q.modules),
       }
     }
   }
@@ -633,7 +633,7 @@ fn verified(
           w,
         ) {
         [] -> program,
-        refused -> { ..program, diagnostics: program.diagnostics.concat(refused), frame: None },
+        rejected -> { ..program, diagnostics: program.diagnostics.concat(rejected), frame: None },
       },
     }
   }
@@ -755,13 +755,13 @@ pub fn load_program(
   verify: Bool,
 ) -> Program / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
-  let answers = check_modules(paths, project);
-  let shipping = shipping_cached(answers.pulled, answers.wants);
+  let results = check_modules(paths, project);
+  let shipping = shipping_cached(results.pulled, results.wants);
   let p: Program = verified(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, answers),
+    assembled(project, shipping, paths, results),
   );
   report_viewed(p.shipped_views, true);
   p
@@ -810,7 +810,7 @@ pub fn loaded_analysis(
 
 pub fn no_loaded_analysis() -> LoadedAnalysis / {abort.raise} =
   {
-    dump: dump_of(Refused([])),
+    dump: dump_of(Rejected([])),
     files: [],
     inputs: Map::new(),
     read_ms: 0,
@@ -833,14 +833,14 @@ pub fn timed_over(
   started: Int,
   verify: Bool,
 ) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
-  let answers = check_modules(paths, project);
-  let shipping = shipping_cached(answers.pulled, answers.wants);
+  let results = check_modules(paths, project);
+  let shipping = shipping_cached(results.pulled, results.wants);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, answers),
+    assembled(project, shipping, paths, results),
   );
   report_viewed(p.shipped_views, true);
   {
@@ -866,14 +866,14 @@ pub fn timed_uncached_over(
   started: Int,
   verify: Bool,
 ) -> TimedLoad / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise} = {
-  let answers = check_modules_uncached(project);
-  let shipping = shipping_of(answers.pulled);
+  let results = check_modules_uncached(project);
+  let shipping = shipping_of(results.pulled);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
     shipping,
     verify,
-    assembled(project, shipping, paths, answers),
+    assembled(project, shipping, paths, results),
   );
   report_viewed(p.shipped_views, true);
   {
@@ -1122,7 +1122,7 @@ test "a proof answers for the root package's claims and never a shipped module's
       reached: false,
     ).out {
     Analysed(w) -> w,
-    Refused(_) -> panic("the fixture checks"),
+    Rejected(_) -> panic("the fixture checks"),
   };
   let owned = in_root_package(checked_program_of(w).frame);
   assert(owned(b"m") && !owned(b"std.y") && !owned(b"compiler.x"))

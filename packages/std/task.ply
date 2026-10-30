@@ -77,7 +77,7 @@ fn fold_as_completed<a, s | e>(
         if so_far.heard == n { Stop(so_far.state) } else {
           match task.recv(ended) {
             None -> Stop(so_far.state),
-            Some(answer) -> match step(so_far.state, answer._0, answer._1) {
+            Some(result) -> match step(so_far.state, result._0, result._1) {
               Continue(next) -> Continue({ state: next, heard: so_far.heard + 1 }),
               Stop(last) -> Stop(last),
             },
@@ -102,12 +102,12 @@ pub fn all_ok<a, x | e>(
       Ok(Map::new()),
       |so_far: Result<Map<Int, a>, x>, i: Int, r: Result<a, x>|
         match ((so_far, r)) {
-          (Ok(answers), Ok(answer)) -> Continue(Ok(answers.insert(i, answer))),
+          (Ok(results), Ok(result)) -> Continue(Ok(results.insert(i, result))),
           (_, Err(failure)) -> Stop(Err(failure)),
           (Err(failure), _) -> Stop(Err(failure)),
         },
     ) {
-    Ok(answers) -> Ok(answers.values()),
+    Ok(results) -> Ok(results.values()),
     Err(failure) -> Err(failure),
   }
 
@@ -121,19 +121,19 @@ pub fn first_ok<a, x | e>(
       Err(Map::new()),
       |so_far: Result<a, Map<Int, x>>, i: Int, r: Result<a, x>|
         match ((so_far, r)) {
-          (_, Ok(answer)) -> Stop(Ok(answer)),
+          (_, Ok(result)) -> Stop(Ok(result)),
           (Err(failures), Err(failure)) -> Continue(Err(failures.insert(i, failure))),
-          (Ok(answer), _) -> Stop(Ok(answer)),
+          (Ok(result), _) -> Stop(Ok(result)),
         },
     ) {
-    Ok(answer) -> Ok(answer),
+    Ok(result) -> Ok(result),
     Err(failures) -> Err(failures.values()),
   }
 
 /// Returns the result of the first of `bodies` to end, or `None` for no bodies. The others are
 /// cancelled, and have run their releases when this returns.
 pub fn race<a | e>(bodies: List<() -> a / e>) -> Option<a> / {task.write, abort.raise | e} =
-  fold_as_completed(bodies, None, |_none: Option<a>, _i: Int, answer: a| Stop(Some(answer)))
+  fold_as_completed(bodies, None, |_none: Option<a>, _i: Int, result: a| Stop(Some(result)))
 
 /// Applies `f` to each of `xs`, with at most `limit` running at once, and returns the results in
 /// order. Raises for a `limit` below one.
@@ -242,7 +242,7 @@ pub fn until<a | e>(
       cancel_and_await([held.worker])
     },
     |held: { worker: Task<a>, timers: List<Task<Unit>> }|
-      match task.await(held.worker) { Some(answer) -> Done(answer), None -> TimedOut },
+      match task.await(held.worker) { Some(result) -> Done(result), None -> TimedOut },
   )
 }
 
@@ -264,7 +264,7 @@ pub fn by<a | e>(
   body: keep () -> a / {deadline.at | e},
 ) -> a / {task.write, clock.read, clock.write, deadline.at, deadline.passed | e} = {
   let bound = effective_deadline(at);
-  match until(bound, body) { Done(answer) -> answer, TimedOut -> deadline.passed(bound) }
+  match until(bound, body) { Done(result) -> result, TimedOut -> deadline.passed(bound) }
 }
 
 /// `by` the instant `d` from now.
@@ -462,7 +462,7 @@ fn run_retries<a, x | e>(
     );
     iterate({ attempt: 1, previous: policy.base }, policy.attempts + 1, |trying: RetryState|
       match body(trying.attempt) {
-        Ok(answer) -> Stop(Ok(answer)),
+        Ok(result) -> Stop(Ok(result)),
         Err(failure) -> if !(policy.retryable)(failure) { give_up(failure, trying, NotRetryable) }
         else if trying.attempt >= policy.attempts { give_up(failure, trying, Spent) }
         else if !allowed() { give_up(failure, trying, OverBudget) } else {
@@ -480,9 +480,9 @@ fn run_retries<a, x | e>(
 fn give_up<a, x>(
   failure: x,
   trying: RetryState,
-  why: Reason,
+  reason: Reason,
 ) -> Iter<RetryState, Result<a, RetryFailure<x>>> =
-  Stop(Err({ last: failure, attempts: trying.attempt, reason: why }))
+  Stop(Err({ last: failure, attempts: trying.attempt, reason: reason }))
 
 /// Whether `at` is at or past `bound`. Nothing is past a `None` bound.
 fn past(at: Instant, bound: Option<Instant>) -> Bool =
@@ -598,14 +598,14 @@ pub fn guarded<a, x | e>(
   let asked = clock.now();
   bracket(
     || {
-      let answer = admit(load(), asked);
-      store(answer.breaker);
-      answer
+      let result = admit(load(), asked);
+      store(result.breaker);
+      result
     },
-    |answer: { breaker: Breaker, admitted: Bool, probe: Bool }|
-      if answer.probe { store(abandon_probe(load())) } else { () },
-    |answer: { breaker: Breaker, admitted: Bool, probe: Bool }|
-      if !answer.admitted { Err(Rejected) } else {
+    |result: { breaker: Breaker, admitted: Bool, probe: Bool }|
+      if result.probe { store(abandon_probe(load())) } else { () },
+    |result: { breaker: Breaker, admitted: Bool, probe: Bool }|
+      if !result.admitted { Err(Rejected) } else {
         let ended = body();
         let now = clock.now();
         store(record(load(), match ended { Ok(_) -> true, Err(_) -> false }, now));
@@ -676,7 +676,7 @@ pub type Flights<k, a> = { table: Chan<FlightTable<k, a>> }
 /// receives the result. `next` is the id the next run takes.
 type FlightTable<k, a> = { next: Int, runs: Map<k, { id: Int, waiting: List<Chan<a>> }> }
 
-/// What joining returns: run it yourself as this id, or wait on `answered` for the runner's
+/// What joining returns: run it yourself as this id, or wait on `returned` for the runner's
 /// result. The channel closes if that runner was cancelled. The channel is a type argument so that
 /// the escape checks see it.
 type FlightRole<answered> = | Run(Int) | Wait(answered)
@@ -711,12 +711,12 @@ pub fn single_flight<k, a | e>(
     |j: Option<FlightRole<Chan<a>>>|
       match j {
         Some(Run(id)) -> {
-          let answer = body();
-          bracket(|| finish_flight(flights, key, id, Some(answer)), |_u: Unit| (), |_u: Unit|
-            answer)
+          let result = body();
+          bracket(|| finish_flight(flights, key, id, Some(result)), |_u: Unit| (), |_u: Unit|
+            result)
         },
-        Some(Wait(answered)) -> match task.recv(answered) {
-          Some(answer) -> answer,
+        Some(Wait(returned)) -> match task.recv(returned) {
+          Some(result) -> result,
           None -> single_flight(flights, key, body),
         },
         None -> body(),
@@ -750,12 +750,12 @@ fn join_flight<k, a>(flights: Flights<k, a>, key: k) -> Option<FlightRole<Chan<a
   }
 
 /// Ends the run `id` for `key`, if it is still the one in progress. Each caller waiting on it is
-/// sent `answer`, or has its channel closed if there is none.
+/// sent `result`, or has its channel closed if there is none.
 fn finish_flight<k, a>(
   flights: Flights<k, a>,
   key: k,
   id: Int,
-  answer: Option<a>,
+  result: Option<a>,
 ) -> Unit / {task.write}
   where derivable(ord, k)
 =
@@ -765,7 +765,7 @@ fn finish_flight<k, a>(
       Some(run) -> if run.id != id { put_back(flights, t) } else {
         put_back(flights, { ..t, runs: t.runs.remove(key) });
         run.waiting.fold((), |_u: Unit, waiter: Chan<a>|
-          match answer {
+          match result {
             Some(x) -> {
               task.send(waiter, x);
               ()
@@ -1688,7 +1688,7 @@ test "where the caller running a flight is cancelled, a caller waiting on it run
             clock.sleep(Duration(10));
             7
           });
-        let answers = unbounded(||
+        let results = unbounded(||
           all([
             || timeout(Duration(5), ask),
             || {
@@ -1696,7 +1696,7 @@ test "where the caller running a flight is cancelled, a caller waiting on it run
               Done(ask())
             },
           ]));
-        (answers, clock.now())
+        (results, clock.now())
       }
     });
   assert_eq(ran.value, ([TimedOut, Done(7)], Instant(15)));

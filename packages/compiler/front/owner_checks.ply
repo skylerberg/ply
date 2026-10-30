@@ -6,7 +6,7 @@ import compiler.front.facts (Analysis, ModuleFacts, read_outline, module_tables_
                              tagged_site_bin, statement_site_bin, typed_const_bin, ModuleShape,
                              ModuleTables, TaggedSite, StatementSite, TypedConst, module_facts,
                              no_module_tables)
-import compiler.front.seam (AnalysisOutcome, Analysed, Refused, types_of_rows)
+import compiler.front.seam (AnalysisOutcome, Analysed, Rejected, types_of_rows)
 import compiler.front.rows (EffectSetRow, OutlineItem, OutlinedLaw, OutlinedTest, LawOutline,
                             rows_bin, effect_set_row_bin, law_outline_bin, Rows, KnownDefinitionRow,
                             is_declared_in)
@@ -330,8 +330,8 @@ pub fn encode_group(a: GroupResult) -> Bytes / {abort.raise} = {
   encode_group_with_types(a, h.held, h.at)
 }
 
-pub fn encode_groups(answers: List<GroupResult>) -> List<Bytes> / {abort.raise} =
-  answers.fold(
+pub fn encode_groups(results: List<GroupResult>) -> List<Bytes> / {abort.raise} =
+  results.fold(
     { h: empty_interner(), out: [] },
     |acc: { h: TypeInterner, out: List<Bytes> }, a: GroupResult| {
       let p = intern_more_types(acc.h, definition_types(a));
@@ -385,7 +385,7 @@ pub fn group_result(
   let spots = items.map(|x: ItemAt| { at: at(x), len: x.len, rel: x.from });
   let back = { from: 0, to: 0, by: |p: Int| group_offset(spots, p) };
   match out {
-    Refused(ds) ->
+    Rejected(ds) ->
       {
         members: [],
         refused: ds.map(|d: Diagnostic|
@@ -420,7 +420,7 @@ pub type InferenceResult = {
   facts: EmitFacts,
   kept: List<CachedFacts>,
   clauses: List<Clauses>,
-  filed: List<CachedFacts>,
+  recorded: List<CachedFacts>,
   types: TypeTable,
   bodies: List<CheckedBody>,
   refused: List<Diagnostic>,
@@ -431,13 +431,13 @@ derive bin for InferenceResult
 
 pub fn no_inference_result() -> InferenceResult = inference_result_from(no_owner_result(), [])
 
-fn inference_result_from(answer: OwnerResult, bodies: List<CheckedBody>) -> InferenceResult =
+fn inference_result_from(result: OwnerResult, bodies: List<CheckedBody>) -> InferenceResult =
   {
-    facts: answer.tables.facts,
-    kept: answer.tables.kept,
-    clauses: answer.tables.definitions.map(|d: DefinitionInfo| { name: d.name, spec: d.spec }),
-    filed: answer.rows.definitions.map(|r: KnownDefinitionRow| { name: r.name, facts: r.facts }),
-    types: answer.rows.types,
+    facts: result.tables.facts,
+    kept: result.tables.kept,
+    clauses: result.tables.definitions.map(|d: DefinitionInfo| { name: d.name, spec: d.spec }),
+    recorded: result.rows.definitions.map(|r: KnownDefinitionRow| { name: r.name, facts: r.facts }),
+    types: result.rows.types,
     bodies: bodies,
     refused: [],
   }
@@ -474,11 +474,11 @@ pub fn inference_results(
   let cut = group_results(said, module, alone, stands);
   range(0, members.len()).map(|i: Int| {
     let o = members.get(i);
-    let answer = match cut.get(i).members { [m, ..] -> m.result, [] -> no_owner_result() };
+    let result = match cut.get(i).members { [m, ..] -> m.result, [] -> no_owner_result() };
     let spots = item_ranges(alone.get(i).items, o.owner, stands);
-    let own = answer.tables.definitions.map(|d: DefinitionInfo| d.name);
+    let own = result.tables.definitions.map(|d: DefinitionInfo| d.name);
     inference_result_from(
-      answer,
+      result,
       said.w.bodies.filter(|b: CheckedBody| own.contains(b.name)).map(|b: CheckedBody|
         relocated_body(b, 0, |p: Int| group_offset(spots, p))),
     )
@@ -519,9 +519,9 @@ pub type SignatureCheck = { shown: List<EncodedInterface>, refused: List<Diagnos
 
 derive bin for SignatureCheck
 
-pub fn signature_check_of(answer: GroupResult) -> SignatureCheck / {abort.raise} =
+pub fn signature_check_of(result: GroupResult) -> SignatureCheck / {abort.raise} =
   {
-    shown: answer.members.map(|m: MemberResult|
+    shown: result.members.map(|m: MemberResult|
       {
         owner: m.owner,
         entry: match m.entry {
@@ -529,7 +529,7 @@ pub fn signature_check_of(answer: GroupResult) -> SignatureCheck / {abort.raise}
           None -> b"",
         },
       }),
-    refused: answer.refused,
+    refused: result.refused,
   }
 
 pub fn signature_check_from(
@@ -573,13 +573,13 @@ pub fn supplied_bodies(
       { bodies: Map::new(), sites: [] },
       |acc: { bodies: Map<Bytes, ReusedBody>, sites: List<MemberSite> }, m: OwnerInference| {
         let base = offset + base_of(items, m.owner);
-        let filed = m.typed.filed.fold(Map::new(), |held: Map<Bytes, Bytes>, k: CachedFacts|
+        let recorded = m.typed.recorded.fold(Map::new(), |held: Map<Bytes, Bytes>, k: CachedFacts|
           held.insert(k.name, k.facts));
         {
           bodies: m.typed.bodies.fold(acc.bodies, |held: Map<Bytes, ReusedBody>, b: CheckedBody|
             held.insert(b.name, {
               body: relocated_body(b, slot, |p: Int| base + p),
-              facts: match filed.get(b.name) { Some(f) -> f, None -> b"" },
+              facts: match recorded.get(b.name) { Some(f) -> f, None -> b"" },
             })),
           sites: acc.sites.concat(m.typed.facts.members.map(|x: MemberSite| { ..x, module: slot })),
         }
@@ -589,13 +589,13 @@ pub fn supplied_bodies(
   }
 
 pub fn finalized_result(
-  settled: GroupResult,
+  resolved: GroupResult,
   members: List<OwnerInference>,
   items: List<ItemAt>,
 ) -> GroupResult =
   {
-    ..settled,
-    members: settled.members.map(|m: MemberResult|
+    ..resolved,
+    members: resolved.members.map(|m: MemberResult|
       match members.find(|w: OwnerInference| w.owner == m.owner) {
         None -> m,
         Some(w) -> {
@@ -866,7 +866,7 @@ pub fn assembled(
   module: Bytes,
   shape: ModuleShape,
   order: List<Bytes>,
-  filed: List<Bytes>,
+  recorded: List<Bytes>,
   groups: List<PositionedGroup>,
   unused: Bool,
 ) -> AssembledModule / {abort.raise} = {
@@ -875,7 +875,7 @@ pub fn assembled(
       acc.insert(names.get(i), i));
   let place = at(order);
   let walked = |name: Bytes| match place.get(name) { Some(k) -> k, None -> order.len() };
-  let walk = at(filed);
+  let walk = at(recorded);
   let placed = ranked(
     groups.fold(
       [],
@@ -1172,7 +1172,7 @@ fn joined_tables(owners: List<OwnerResult>) -> ModuleTables =
 fn agrees(sources: List<Source>) -> Unit / {abort.raise} = {
   let whole = match analyse_pulling_std_with(sources, [], no_rows()).out {
     Analysed(w) -> w,
-    Refused(_) -> panic("the fixture checks"),
+    Rejected(_) -> panic("the fixture checks"),
   };
   owned_apart(whole, sources).fold((), |u: Unit, m: Whole| {
     let apart = normalized_tables(joined_tables(m.owners));
@@ -1301,8 +1301,8 @@ fn assembled_apart(
             ),
           }
         });
-        let answers = placed.map(|x: { items: List<ItemAt>, result: GroupResult }| x.result);
-        assert_eq(encode_groups(answers), answers.map(encode_group));
+        let results = placed.map(|x: { items: List<ItemAt>, result: GroupResult }| x.result);
+        assert_eq(encode_groups(results), results.map(encode_group));
         acc.push({
           module: parsed.name,
           whole: facts,
@@ -1352,7 +1352,7 @@ pub fn diagnostic_summaries(ds: List<Diagnostic>) -> List<Bytes> =
 fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
   let whole = match analyse_pulling_std_with(sources, [], no_rows()).out {
     Analysed(w) -> w,
-    Refused(_) -> panic("the fixture checks"),
+    Rejected(_) -> panic("the fixture checks"),
   };
   assembled_apart(whole, sources).fold(
     (),
@@ -1417,7 +1417,7 @@ test "a group holds the files its own items embed, and no other group's" {
       embeds: [file(b"x.txt"), file(b"y.txt")],
     ).out {
     Analysed(w) -> w,
-    Refused(_) -> panic("the fixture checks"),
+    Rejected(_) -> panic("the fixture checks"),
   };
   let said = module_check_of(w, 0, src);
   let reads = owner_texts(w.modules.get(0), parse(src).node, src);

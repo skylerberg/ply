@@ -14,7 +14,7 @@ import compiler.emit.keys (Named, Root)
 import compiler.emit.typed_ir.containers (Retain)
 import compiler.emit.typed_ir.handling (empty_instance)
 import compiler.emit.representations (RecordShape, kind_of)
-import compiler.emit.typed_ir (param_lent, handed_of, lent_where, no_closure_evidence,
+import compiler.emit.typed_ir (param_borrowed, handed_of, borrowed_where, no_closure_evidence,
                                Representation, AsWord, AsInt, AsBool, AsFloat, AsFlattened,
                                AsReuseToken, AsSum, CaseAllocation, Var, Arg, VarOperand,
                                IntOperand, BoolOperand, FloatOperand, ZeroOperand, Rvalue,
@@ -64,7 +64,7 @@ type Exits = {
   known: Map<Int, Bytes>,
   restart: List<ParamOwnership>,
   enters: List<List<ParamOwnership>>,
-  answered: ResultOwnership,
+  returned: ResultOwnership,
 }
 
 type ReuseCandidate = { at: Int, route: List<{ at: Int, arm: Int }>, made: Allocation }
@@ -91,7 +91,7 @@ pub fn insert_reference_counts(given: Fn) -> Fn = {
     known: Map::new(),
     restart: handed_of(f.convention),
     enters: f.members.map(|m: Member| handed_of(m.convention)),
-    answered: f.convention.answered,
+    returned: f.convention.returned,
   };
   let counted = if f.members.len() == 0 {
     counted_block(facts, top, f.params, f.body, Map::new(), facts.next)
@@ -106,7 +106,7 @@ pub fn insert_reference_counts(given: Fn) -> Fn = {
               facts,
               match member {
                 Some(m) ->
-                  { ..top, restart: handed_of(m.convention), answered: m.convention.answered },
+                  { ..top, restart: handed_of(m.convention), returned: m.convention.returned },
                 None -> { ..top, restart: [] },
               },
               match member { Some(m) -> m.params, None -> [] },
@@ -493,7 +493,7 @@ fn passed_joined(
 fn given_bound(params: List<Var>, conv: Convention, m: Map<Int, Int>) -> Map<Int, Int> =
   range(0, params.len()).fold(m, |acc: Map<Int, Int>, i: Int|
     match params.at(i) {
-      Some(p) -> if param_lent(conv, i) { acc } else { acc.insert(p.id, 0 - 1) },
+      Some(p) -> if param_borrowed(conv, i) { acc } else { acc.insert(p.id, 0 - 1) },
       None -> acc,
     })
 
@@ -1021,7 +1021,7 @@ fn given_defined(params: List<Var>, conv: Convention, facts: Facts) -> Facts =
   range(0, params.len()).fold(facts, |acc: Facts, i: Int|
     match params.at(i) {
       None -> acc,
-      Some(p) -> if param_lent(conv, i) { defined(acc, p, BorrowsFrom([])) }
+      Some(p) -> if param_borrowed(conv, i) { defined(acc, p, BorrowsFrom([])) }
       else { { ..defined(acc, p, OwnsCount), made: acc.made.insert(p.id, true) } },
     })
 
@@ -1410,9 +1410,9 @@ fn walked_back(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Backw
       },
       Handle(h) -> {
         let ops = by_signature(h.args, h.uses);
-        let lent = ops.filter(|o: Operand| !o.takes).fold(Map::new(), |l: Live, o: Operand|
+        let borrowed = ops.filter(|o: Operand| !o.takes).fold(Map::new(), |l: Live, o: Operand|
           arg_live(facts, l, o.arg));
-        let inner = Map::merge(outer_reads(facts, h.body, [h.result]), lent);
+        let inner = Map::merge(outer_reads(facts, h.body, [h.result]), borrowed);
         let across = Map::merge(acc.live.remove(h.result.id), inner);
         let k = { ..ex, looped: None, miss: Map::new(), landing: across };
         let ends = if h.site.ret == None { across.insert(h.result.id, h.result) } else { across };
@@ -1438,7 +1438,7 @@ fn walked_back(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Backw
           ex,
           acc,
           i,
-          match ex.answered {
+          match ex.returned {
             OwnedResult -> all_taken([a]),
             BorrowedResult(_) -> [{ arg: a, takes: false }],
           },
@@ -1475,8 +1475,8 @@ fn known_at(known: Map<Int, Bytes>, on: Var, tested: Test, when: Int) -> Map<Int
 
 fn looped_live(ex: Exits) -> Live = match ex.looped { Some(l) -> l, None -> Map::new() }
 
-fn dead_result(facts: Facts, live: Live, answer: Var) -> List<Var> =
-  if owns(facts, answer) && !live.contains(answer.id) { [answer] } else { [] }
+fn dead_result(facts: Facts, live: Live, result: Var) -> List<Var> =
+  if owns(facts, result) && !live.contains(result.id) { [result] } else { [] }
 
 fn outer_reads(facts: Facts, b: Block, bound: List<Var>) -> Live = {
   let m = mentioned(facts, { used: Map::new(), bound: Map::new() }, b);
@@ -1930,16 +1930,16 @@ fn word(id: Int) -> Var = of_type(id, b"String")
 
 fn flag(id: Int) -> Var = { id: id, ty: bool_type(), representation: AsBool }
 
-fn root_of(params: List<Var>, lent: List<Int>, answer: Representation, body: Block) -> Fn =
+fn root_of(params: List<Var>, borrowed: List<Int>, result: Representation, body: Block) -> Fn =
   {
     key: Named(b"m.f"),
     kind: Metered,
     params: params,
     convention: {
-      params: lent_where(params.map(|p: Var| p.representation), lent),
-      result: answer,
+      params: borrowed_where(params.map(|p: Var| p.representation), borrowed),
+      result: result,
       destination_passing: false,
-      answered: OwnedResult,
+      returned: OwnedResult,
     },
     result_type: NamedType({ name: b"T", args: [] }),
     body: body,
@@ -1950,15 +1950,15 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Representation, body: Blo
     statics: [],
   }
 
-fn call_of(args: List<Arg>, lent: List<Int>) -> Rvalue =
+fn call_of(args: List<Arg>, borrowed: List<Int>) -> Rvalue =
   Call({
     callee: Root(Named(b"m.g")),
     args: args,
     convention: {
-      params: lent_where(args.map(operand_representation), lent),
+      params: borrowed_where(args.map(operand_representation), borrowed),
       result: AsWord,
       destination_passing: false,
-      answered: OwnedResult,
+      returned: OwnedResult,
     },
     suspends: false,
   })
@@ -1971,7 +1971,7 @@ fn counted_body(f: Fn) -> { body: Block, refused: Option<Bytes> } = {
   { body: o.body, refused: ownership_fault(o) }
 }
 
-fn refused_with(f: Fn, body: Block) -> Option<Bytes> = ownership_fault({ ..f, body: body })
+fn rejected_with(f: Fn, body: Block) -> Option<Bytes> = ownership_fault({ ..f, body: body })
 
 test "a word read as the box it is views its words, taking nothing, and a leaf is read out of the word" {
   let scalars = AsFlattened([
@@ -1985,8 +1985,8 @@ test "a word read as the box it is views its words, taking nothing, and a leaf i
   ]);
   let held = root_of([p], [], AsWord, [viewed, leaf, Return(VarOperand(p))]);
   assert_eq(counted_body(held), { body: [viewed, leaf, Return(VarOperand(p))], refused: None });
-  let lent = root_of([p], [0], AsInt, [viewed, leaf, Return(IntOperand(0))]);
-  assert_eq(counted_body(lent), { body: [viewed, leaf, Return(IntOperand(0))], refused: None });
+  let borrowed = root_of([p], [0], AsInt, [viewed, leaf, Return(IntOperand(0))]);
+  assert_eq(counted_body(borrowed), { body: [viewed, leaf, Return(IntOperand(0))], refused: None });
   assert_eq(counted_body(root_of([p], [], AsWord, [viewed, Return(VarOperand(p))])).body, [
     Return(VarOperand(p)),
   ]);
@@ -2004,7 +2004,7 @@ test "a word read as the box it is views its words, taking nothing, and a leaf i
   assert_eq(
     counted_body({
       ..reader,
-      convention: { ..reader.convention, answered: BorrowedResult([{ param: 0, whole: false }]) },
+      convention: { ..reader.convention, returned: BorrowedResult([{ param: 0, whole: false }]) },
     }).refused,
     None,
   )
@@ -2027,7 +2027,7 @@ test "a value consumed again later takes a count first, and its last use moves" 
   ];
   assert_eq(counted_body(f), { body: counts, refused: None });
   assert_eq(
-    refused_with(f, counts.set(1, bind(r, call_of([VarOperand(p)], []), []))),
+    rejected_with(f, counts.set(1, bind(r, call_of([VarOperand(p)], []), []))),
     Some(b"a failure path that releases other than what it holds"),
   )
 }
@@ -2060,7 +2060,7 @@ test "a function value applied is lent to the call, held across each and let go 
         params: [{ handed: OwnedParam, representation: AsWord }],
         result: AsWord,
         destination_passing: false,
-        answered: OwnedResult,
+        returned: OwnedResult,
       },
       suspends: false,
       closure: None,
@@ -2104,7 +2104,7 @@ test "a closure laid on this frame's stack reads its captures, which are let go 
     refused: None,
   });
   assert_eq(
-    refused_with(f, [laid([]), Return(VarOperand(c))]),
+    rejected_with(f, [laid([]), Return(VarOperand(c))]),
     Some(b"a closure on this frame's stack handed beyond the call it is lent to: v1"),
   )
 }
@@ -2133,7 +2133,7 @@ test "an owned value nothing reads is let go of where it is made, an unread para
   let counts = [Dec(p), bind(r, call_of([VarOperand(q)], []), []), Dec(r), Return(IntOperand(0))];
   assert_eq(counted_body(f), { body: counts, refused: None });
   assert_eq(
-    refused_with(f, counts.remove_at(2)),
+    rejected_with(f, counts.remove_at(2)),
     Some(b"a count left held where the body answers: v2"),
   )
 }
@@ -2149,7 +2149,7 @@ test "a branch lets go first of what only the other branch reads" {
     [If({ cond: VarOperand(c), then: then, otherwise: [Dec(p), Return(VarOperand(q))] })];
   assert_eq(counted_body(f), { body: branch([Dec(q), Return(VarOperand(p))]), refused: None });
   assert_eq(
-    refused_with(f, branch([Dec(q), Dec(q), Return(VarOperand(p))])),
+    rejected_with(f, branch([Dec(q), Dec(q), Return(VarOperand(p))])),
     Some(b"a value consumed with no count left: v2"),
   )
 }
@@ -2213,7 +2213,7 @@ test "a field of a sum's payload, the sum read out of a record, keeps the record
     refused: None,
   });
   assert_eq(
-    refused_with(
+    rejected_with(
       f,
       cased([Dec(t), bind(r, call_of([VarOperand(b)], [0]), []), Return(VarOperand(r))], [Dec(t)]),
     ),
@@ -2245,7 +2245,7 @@ test "a value read out of a value read out of another keeps the first one live" 
     refused: None,
   });
   assert_eq(
-    refused_with(
+    rejected_with(
       f,
       reads.concat([Dec(p), bind(r, call_of([VarOperand(z)], [0]), []), Return(VarOperand(r))]),
     ),
@@ -2297,7 +2297,7 @@ test "a value read out of another keeps that one live until its last read" {
   let counts = [get, bind(r, call_of([VarOperand(x)], [0]), [p]), Dec(p), Return(VarOperand(r))];
   assert_eq(counted_body(read), { body: counts, refused: None });
   assert_eq(
-    refused_with(read, [
+    rejected_with(read, [
       get,
       Dec(p),
       bind(r, call_of([VarOperand(x)], [0]), []),
@@ -2411,10 +2411,10 @@ test "a value read out of another, used past the other's last use where that use
   let r = word(2);
   let s = word(3);
   let read = bind(y, Get({ of: p, path: FieldPath({ name: b"f", at: 0 }) }), []);
-  let after = |lent: List<Int>|
+  let after = |borrowed: List<Int>|
     root_of([p], [], AsWord, [
       read,
-      bind(r, call_of([VarOperand(p)], lent), []),
+      bind(r, call_of([VarOperand(p)], borrowed), []),
       bind(s, call_of([VarOperand(r), VarOperand(y)], [1]), []),
       Return(VarOperand(s)),
     ]);
@@ -2472,7 +2472,7 @@ test "a join is set from a value held as the join is, on every path" {
   let x = { id: 4, ty: float_type(), representation: AsFloat };
   let sum = Primitive({ op: b"add", on: AsFloat, args: [FloatOperand(0), FloatOperand(0)] });
   assert_eq(
-    refused_with(f, joined([bind(x, sum, []), Assign({ var: j, arg: VarOperand(x) })])),
+    rejected_with(f, joined([bind(x, sum, []), Assign({ var: j, arg: VarOperand(x) })])),
     Some(b"a join set from a value held otherwise: v3"),
   )
 }
@@ -2624,7 +2624,7 @@ test "a value that holds no count, a static or a case gathered from constants, i
       refused: None,
     },
   );
-  let lent = root_of([c, p], [1], AsWord, [
+  let borrowed = root_of([c, p], [1], AsWord, [
     literal,
     Declaration(j),
     If({
@@ -2635,8 +2635,8 @@ test "a value that holds no count, a static or a case gathered from constants, i
     Return(VarOperand(j)),
   ]);
   unchanged({
-    ..lent,
-    convention: { ..lent.convention, answered: BorrowedResult([{ param: 1, whole: true }]) },
+    ..borrowed,
+    convention: { ..borrowed.convention, returned: BorrowedResult([{ param: 1, whole: true }]) },
   });
   unchanged(
     root_of([], [], AsWord, [
@@ -2690,8 +2690,8 @@ test "a join set from a value read out of one bound inside its branch holds a co
     ];
   let literal = [bind(s, Static(b"ply_k_0"), []), Assign({ var: j, arg: VarOperand(s) })];
   assert_eq(joined(literal), { body: after(literal), refused: None });
-  let lent = [bind(t, Get({ of: p, path: field }), []), Assign({ var: j, arg: VarOperand(t) })];
-  assert_eq(joined(lent), {
+  let borrowed = [bind(t, Get({ of: p, path: field }), []), Assign({ var: j, arg: VarOperand(t) })];
+  assert_eq(joined(borrowed), {
     body: after([
       bind(t, Get({ of: p, path: field }), []),
       Inc({ var: t, n: 1 }),
@@ -2705,9 +2705,9 @@ test "an answer handed back borrowed takes no count, and a join of borrowed valu
   let p = word(0);
   let y = word(1);
   let read = bind(y, Get({ of: p, path: FieldPath({ name: b"f", at: 0 }) }), []);
-  let getter = |answered: ResultOwnership| {
+  let getter = |returned: ResultOwnership| {
     let f = root_of([p], [0], AsWord, [read, Return(VarOperand(y))]);
-    { ..f, convention: { ..f.convention, answered: answered } }
+    { ..f, convention: { ..f.convention, returned: returned } }
   };
   assert_eq(counted_body(getter(BorrowedResult([{ param: 0, whole: false }]))), {
     body: [read, Return(VarOperand(y))],
@@ -2722,9 +2722,9 @@ test "an answer handed back borrowed takes no count, and a join of borrowed valu
   let j = word(4);
   let set = |x: Var| [Assign({ var: j, arg: VarOperand(x) })];
   let branch = If({ cond: VarOperand(c), then: set(p), otherwise: set(q) });
-  let pick = |answered: ResultOwnership| {
+  let pick = |returned: ResultOwnership| {
     let f = root_of([c, p, q], [1, 2], AsWord, [Declaration(j), branch, Return(VarOperand(j))]);
-    { ..f, convention: { ..f.convention, answered: answered } }
+    { ..f, convention: { ..f.convention, returned: returned } }
   };
   assert_eq(
     counted_body(pick(BorrowedResult([{ param: 1, whole: true }, { param: 2, whole: true }]))),
@@ -2735,9 +2735,9 @@ test "an answer handed back borrowed takes no count, and a join of borrowed valu
     refused: None,
   });
   let o = { id: 5, ty: option_type(string_type()), representation: maybe_word() };
-  let some = |value: Rvalue, answered: ResultOwnership| {
+  let some = |value: Rvalue, returned: ResultOwnership| {
     let f = root_of([p], [0], maybe_word(), [bind(o, value, []), Return(VarOperand(o))]);
-    { ..f, convention: { ..f.convention, answered: answered } }
+    { ..f, convention: { ..f.convention, returned: returned } }
   };
   [
     Convert({ arg: VarOperand(p), to: maybe_word() }),
@@ -2773,7 +2773,7 @@ test "an answer handed back borrowed takes no count, and a join of borrowed valu
   assert_eq(
     counted_body({
       ..found,
-      convention: { ..found.convention, answered: BorrowedResult([{ param: 1, whole: true }]) },
+      convention: { ..found.convention, returned: BorrowedResult([{ param: 1, whole: true }]) },
     }),
     { body: [Declaration(either), maybe, Return(VarOperand(either))], refused: None },
   )
@@ -2786,9 +2786,9 @@ test "a sum's payload that is its one count, held again as another sum's word, i
   let s = word(1);
   let y = { id: 2, ty: opt(text), representation: maybe_word() };
   let some_of = |of: Var| bind(s, Get({ of: of, path: CasePath({ case: 1, at: 0 }) }), []);
-  let answering = |p: Var, body: Block, answered: ResultOwnership| {
+  let returning = |p: Var, body: Block, returned: ResultOwnership| {
     let f = root_of([p], [0], maybe_word(), body);
-    { ..f, convention: { ..f.convention, answered: answered } }
+    { ..f, convention: { ..f.convention, returned: returned } }
   };
   let whole = BorrowedResult([{ param: 0, whole: true }]);
   [
@@ -2796,8 +2796,8 @@ test "a sum's payload that is its one count, held again as another sum's word, i
     Aggregate({ parts: [IntOperand(1), VarOperand(s)] }),
   ].fold((), |_: Unit, value: Rvalue| {
     let body = [some_of(m), bind(y, value, []), Return(VarOperand(y))];
-    assert_eq(counted_body(answering(m, body, whole)), { body: body, refused: None });
-    assert_eq(counted_body(answering(m, body, OwnedResult)), {
+    assert_eq(counted_body(returning(m, body, whole)), { body: body, refused: None });
+    assert_eq(counted_body(returning(m, body, OwnedResult)), {
       body: [some_of(m), bind(y, value, []), Inc({ var: y, n: 1 }), Return(VarOperand(y))],
       refused: None,
     })
@@ -2827,7 +2827,7 @@ test "a sum's payload that is its one count, held again as another sum's word, i
     again,
     Return(VarOperand(y)),
   ];
-  assert_eq(counted_body(answering(n, nested, whole)), { body: nested, refused: None });
+  assert_eq(counted_body(returning(n, nested, whole)), { body: nested, refused: None });
   let r = word(0);
   let f = { ..m, id: 3 };
   let field = [
@@ -2836,7 +2836,7 @@ test "a sum's payload that is its one count, held again as another sum's word, i
     again,
     Return(VarOperand(y)),
   ];
-  assert_eq(counted_body(answering(r, field, BorrowedResult([{ param: 0, whole: false }]))), {
+  assert_eq(counted_body(returning(r, field, BorrowedResult([{ param: 0, whole: false }]))), {
     body: field,
     refused: None,
   })
@@ -2956,7 +2956,7 @@ test "a token held across a call that can fail or stop is released on its way ou
     );
   assert_eq(counted_body(f(false)), { body: counts(false, [v, token]), refused: None });
   assert_eq(
-    refused_with(f(false), counts(false, [v])),
+    rejected_with(f(false), counts(false, [v])),
     Some(b"a failure path that releases other than what it holds"),
   );
   assert_eq(counted_body(f(true)), { body: counts(true, [v, token]), refused: None })
@@ -2995,7 +2995,7 @@ test "an arm lets go before it misses of what only it reads" {
     refused: None,
   });
   assert_eq(
-    refused_with(f, matched([Dec(q), Return(VarOperand(p))], [Miss])),
+    rejected_with(f, matched([Dec(q), Return(VarOperand(p))], [Miss])),
     Some(b"a count left held where the body answers: v0"),
   )
 }
@@ -3090,7 +3090,7 @@ test "a sum let go of before a branch lends its box to the arms that make a case
       [Dec(r)],
     );
   assert_eq(counted_body(f), { body: counts([free]), refused: None });
-  assert_eq(refused_with(f, counts([])), Some(b"a count left held where the body answers: v5"))
+  assert_eq(rejected_with(f, counts([])), Some(b"a count left held where the body answers: v5"))
 }
 
 test "a sum let go of before a branch lends its box to a case made after it, carried through the branch" {
@@ -3141,11 +3141,11 @@ test "a sum let go of before a branch lends its box to a case made after it, car
   let free = Free({ of: token, bytes: IntOperand(24) });
   assert_eq(counted_body(f), { body: counts([free], [v, token]), refused: None });
   assert_eq(
-    refused_with(f, counts([], [v, token])),
+    rejected_with(f, counts([], [v, token])),
     Some(b"a count left held where the body answers: v6"),
   );
   assert_eq(
-    refused_with(f, counts([free], [v])),
+    rejected_with(f, counts([free], [v])),
     Some(b"a failure path that releases other than what it holds"),
   )
 }
@@ -3191,7 +3191,7 @@ test "a loop holds what its body reads across its passes, and lets it go after" 
     refused: None,
   });
   assert_eq(
-    refused_with(f, looped([bind(n, call_of([VarOperand(p), VarOperand(s)], []), [])], [Dec(p)])),
+    rejected_with(f, looped([bind(n, call_of([VarOperand(p), VarOperand(s)], []), [])], [Dec(p)])),
     Some(b"a count held otherwise than the loop holds where it passes again: v0"),
   )
 }
@@ -3229,7 +3229,7 @@ test "a pass that leaves the root lets go first of what the loop holds across it
   let f = root_of([p, q], [], AsWord, looped([], [], []));
   assert_eq(counted_body(f), { body: looped([Dec(p)], [p], [Dec(p)]), refused: None });
   assert_eq(
-    refused_with(f, looped([], [p], [Dec(p)])),
+    rejected_with(f, looped([], [p], [Dec(p)])),
     Some(b"a count left held where the body answers: v0"),
   )
 }
@@ -3255,7 +3255,7 @@ test "a handle holds across its body what the body reads, which its landing rele
   let f = root_of([p, c], [], AsWord, [around([]), Return(VarOperand(a))]);
   assert_eq(counted_body(f), { body: [around([p]), Dec(p), Return(VarOperand(a))], refused: None });
   assert_eq(
-    refused_with(f, [around([]), Dec(p), Return(VarOperand(a))]),
+    rejected_with(f, [around([]), Dec(p), Return(VarOperand(a))]),
     Some(b"a handle whose landing releases other than what it holds across its body"),
   );
   assert_eq(counted_body(root_of([p, c], [], AsInt, [around([]), Return(IntOperand(0))])), {
@@ -3370,7 +3370,7 @@ test "a lent parameter handed back to a restart is only read" {
     { body: [Restart([VarOperand(p), VarOperand(f)])], refused: None },
   );
   assert_eq(
-    refused_with(root_of([p, f], [1], AsWord, []), [
+    rejected_with(root_of([p, f], [1], AsWord, []), [
       Inc({ var: f, n: 1 }),
       Restart([VarOperand(f), VarOperand(p)]),
     ]),
@@ -3508,7 +3508,7 @@ test "a handle inside another's body releases at its landing only what the outer
     refused: None,
   });
   assert_eq(
-    refused_with(f, [outer([t, p], [p]), Dec(p), Return(VarOperand(a))]),
+    rejected_with(f, [outer([t, p], [p]), Dec(p), Return(VarOperand(a))]),
     Some(b"a handle whose landing releases other than what it holds across its body"),
   )
 }

@@ -19,7 +19,7 @@ import compiler.check.types (Type, NamedType, VariableType, FunctionType, Scheme
 import compiler.emit.lower.module_context (ModuleContext, declared_schemes, walked_read,
                                            definitions_in, resolved_imports, declared_effects,
                                            filings_of, param_type, scheduler_imported,
-                                           published_operations, root_body, settled_at, root_params,
+                                           published_operations, root_body, resolved_at, root_params,
                                            body_code)
 import compiler.check.typed
 import compiler.check.typed (BodyPart, WholeBody, ClauseBody, TestRun, CaseListing)
@@ -134,13 +134,13 @@ pub fn emit_program(
   )
 
 pub fn emitted_program(w: LoweredProgram) -> List<EmittedRoot> / {abort.raise} = {
-  let settled = infer_signatures(inference_targets_of(w.borrowed, w.roots), w.handed, w.borrowed);
-  roots_emitted(w.roots, settled, w.stated, w.constructors, 0, w.roots.len(), 64)
+  let resolved = infer_signatures(inference_targets_of(w.borrowed, w.roots), w.handed, w.borrowed);
+  roots_emitted(w.roots, resolved, w.stated, w.constructors, 0, w.roots.len(), 64)
 }
 
 fn roots_emitted(
   roots: List<Fn>,
-  settled: InferenceResult,
+  resolved: InferenceResult,
   stated: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
   lo: Int,
@@ -148,23 +148,23 @@ fn roots_emitted(
   depth_left: Int,
 ) -> List<EmittedRoot> / {abort.raise} =
   if hi - lo <= 1 {
-    match roots.at(lo) { Some(r) -> [root_emitted(r, settled, stated, constructors)], None -> [] }
+    match roots.at(lo) { Some(r) -> [root_emitted(r, resolved, stated, constructors)], None -> [] }
   } else if depth_left <= 0 { panic("more halvings than a length has") } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
-      roots_emitted(roots, settled, stated, constructors, lo, mid, depth_left - 1),
-      roots_emitted(roots, settled, stated, constructors, mid, hi, depth_left - 1),
+      roots_emitted(roots, resolved, stated, constructors, lo, mid, depth_left - 1),
+      roots_emitted(roots, resolved, stated, constructors, mid, hi, depth_left - 1),
     };
     both._0.concat(both._1)
   }
 
 fn root_emitted(
   f: Fn,
-  settled: InferenceResult,
+  resolved: InferenceResult,
   stated: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
 ) -> EmittedRoot / {abort.raise} = {
-  let l = inferred_fn(f, settled);
+  let l = inferred_fn(f, resolved);
   let e = with_instance_calls(stated, tags_in(l.form), emitted_of(l.form, constructors));
   { ..e, tables: { ..e.tables, handings: l.handings, assumed: l.assumed, group: l.group } }
 }
@@ -215,7 +215,7 @@ pub type ModuleScope = {
   effects: List<EffectName>,
 }
 
-pub fn answered(
+pub fn returned(
   s: Scope,
   roots: List<RootKey>,
   handed: Map<RootName, OwnershipSignature>,
@@ -284,7 +284,7 @@ pub fn scope_of(
     acc.insert(m.name, true));
   let facts = match facts_read(rows, w, Some({ roots: reading, modules: every }), x.modules) {
     Ok(f) -> f,
-    Err(why) -> unread(why),
+    Err(reason) -> unread(reason),
   };
   let modules = x.modules;
   let program = modules.fold(Map::new(), |acc: Map<Bytes, List<Definition>>, m: ParsedModule|
@@ -340,10 +340,10 @@ pub fn scope_of(
   }
 }
 
-fn unread<a>(why: Bytes) -> a / {abort.raise} =
+fn unread<a>(reason: Bytes) -> a / {abort.raise} =
   panic(
     String::of_bytes_lossy(
-      b"the emitter cannot read the program the front end checked: ".concat(why),
+      b"the emitter cannot read the program the front end checked: ".concat(reason),
     ),
   )
 
@@ -419,7 +419,7 @@ pub fn lowered_in(
     match definition_root(k) { Some(d) -> acc.insert(d, true), None -> acc });
   let lowered = modules_lowered(roots);
   let specialised = specialisations_wanted(roots);
-  let lent_by = specialised.fold(
+  let borrowed_by = specialised.fold(
     Map::new(),
     |acc: Map<RootName, Option<BoundLambda>>, _: Bytes, sps: List<RootKey>|
       sps.fold(acc, |held: Map<RootName, Option<BoundLambda>>, sp: RootKey|
@@ -437,7 +437,7 @@ pub fn lowered_in(
     touched: touched,
     specialised: specialised,
     written: written_wanted(roots),
-    lent_by: lent_by,
+    borrowed_by: borrowed_by,
   };
   let lowering = range(0, s.modules.len()).filter(|i: Int|
     match s.modules.at(i) { Some(m) -> lowered.contains(m.name), None -> false });
@@ -456,7 +456,7 @@ type FormInputs = {
   touched: Map<Bytes, Bool>,
   specialised: Map<Bytes, List<RootKey>>,
   written: List<{ key: RootKey, op: TypeOp, ty: Type, module: Bytes }>,
-  lent_by: Map<RootName, Option<BoundLambda>>,
+  borrowed_by: Map<RootName, Option<BoundLambda>>,
 }
 
 fn modules_formed(
@@ -507,11 +507,11 @@ fn module_scope(s: Scope, i: Int) -> ModuleScope =
 
 fn lambda_in(
   s: Scope,
-  lent_by: Map<RootName, Option<BoundLambda>>,
+  borrowed_by: Map<RootName, Option<BoundLambda>>,
   owner: RootKey,
   nth: Int,
 ) -> Option<BoundLambda> / {abort.raise} =
-  match match lent_by.get(root_name(owner)) { Some(o) -> o, None -> owner_lambdas(s, owner) } {
+  match match borrowed_by.get(root_name(owner)) { Some(o) -> o, None -> owner_lambdas(s, owner) } {
     None -> None,
     Some(o) -> match o.written.at(nth) {
       None -> None,
@@ -523,7 +523,7 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
   let modules = s.modules;
   let schemes = s.schemes;
   let module_at = |i: Int| module_scope(s, i);
-  let filed_of = |o: Bytes| filings_of(s.owned, o);
+  let recorded_of = |o: Bytes| filings_of(s.owned, o);
   let of = match owner {
     Specialisation(a, _) ->
       { base: a.definition, args: key_types(owner), allows_lambda_inlining: a.borrowed.len() == 0 },
@@ -531,7 +531,7 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
   };
   let module = module_of(owner);
   let short = default_binder(of.base);
-  let lent = |i: Int, m: ParsedModule, code: Code, base: Int| {
+  let borrowed = |i: Int, m: ParsedModule, code: Code, base: Int| {
     let tab = module_at(i);
     let emitted = known_body(root_text(root_name(owner)), [], code);
     let written = lambdas_of(emitted).concat(named_in(m.name, tab.here, tab.imports, emitted));
@@ -568,16 +568,16 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
             }) {
           None -> None,
           Some(t) -> {
-            let filed = filed_of(site_owner_text(owner));
-            lent(i, m, root_body(filed, TestRun, t.span.start, [], []).code, t.span.start)
+            let recorded = recorded_of(site_owner_text(owner));
+            borrowed(i, m, root_body(recorded, TestRun, t.span.start, [], []).code, t.span.start)
           },
         },
         Some(d) -> {
-          let filed = filed_of(of.base);
-          lent(
+          let recorded = recorded_of(of.base);
+          borrowed(
             i,
             m,
-            root_body(filed, WholeBody, d.span.start, labels_of(d), of.args).code,
+            root_body(recorded, WholeBody, d.span.start, labels_of(d), of.args).code,
             d.span.start,
           )
         },
@@ -914,16 +914,16 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
   let here = s.here;
   let module_tree = x.module_tree;
   let written_roots = x.written_roots;
-  let filed_of = |owner: Bytes| filings_of(f.scope.owned, owner);
-  let lambda_at = |owner: RootKey, nth: Int| lambda_in(f.scope, f.lent_by, owner, nth);
+  let recorded_of = |owner: Bytes| filings_of(f.scope.owned, owner);
+  let lambda_at = |owner: RootKey, nth: Int| lambda_in(f.scope, f.borrowed_by, owner, nth);
   let read_of = |full: Bytes|
     match if reading.contains(full) { definitions.get(full) } else { None } {
       None -> None,
       Some(d) -> {
-        let filed = filed_of(full);
+        let recorded = recorded_of(full);
         Some({
-          code: root_body(filed, WholeBody, d.span.start, labels_of(d), []).code,
-          filed: filed,
+          code: root_body(recorded, WholeBody, d.span.start, labels_of(d), []).code,
+          recorded: recorded,
         })
       },
     };
@@ -936,20 +936,20 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
   match item {
     FunctionItem(d) -> if !touched.contains(qualify(module, d.name.name)) { acc } else {
       let full = qualify(module, d.name.name);
-      let p = { full: full, base: d.span.start, filed: filed_of(full) };
+      let p = { full: full, base: d.span.start, recorded: recorded_of(full) };
       let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
         acc.out,
         |a: List<Fn>, sp: RootKey|
           match if inlined_lambdas(sp).len() > 0 { None } else { looped(a, sp) } {
             Some(out) -> out,
-            None -> a.push(specialised_lowered(s, d, sp, lambda_at, p.filed)),
+            None -> a.push(specialised_lowered(s, d, sp, lambda_at, p.recorded)),
           },
       );
       let out = if !wants_root(wanted, Named(p.full)) { specialisations } else {
         match looped(specialisations, Named(p.full)) {
           Some(o) -> o,
           None -> {
-            let b = root_body(p.filed, WholeBody, p.base, labels_of(d), []);
+            let b = root_body(p.recorded, WholeBody, p.base, labels_of(d), []);
             specialisations.push(root_from_code(s, p.base, Named(p.full), b.params, b.code))
           },
         }
@@ -959,13 +959,13 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
         d,
         s,
         wanted,
-        p.filed,
+        p.recorded,
         schemes,
       )
     },
     TestItem(t) -> {
       let tested = test_key(module, t.name);
-      let filed = || filed_of(site_owner_text(tested));
+      let recorded = || recorded_of(site_owner_text(tested));
       let ps = if t.cases == None { [] } else {
         [
           {
@@ -985,7 +985,7 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
         ]
       };
       let rooted = |within: ModuleContext, key: RootKey, part: BodyPart| {
-        let f = filed();
+        let f = recorded();
         let b = root_body(f, part, t.span.start, [], []);
         root_from_code(within, t.span.start, key, b.params, b.code)
       };
@@ -1033,14 +1033,14 @@ fn item_walked(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {ab
       let asked = |which: LawPart|
         wants_root(wanted, part(which)) || wants_root(wanted, EntryPoint(part(which)));
       if !asked(LawGuard) && !asked(LawBody) { acc } else {
-        let filed = filed_of(law_owner(module, d.name));
+        let recorded = recorded_of(law_owner(module, d.name));
         let rooted = |out: List<Fn>, which: LawPart, body: BodyPart| {
-          let b = settled_at(filed, body, d.span.start, []);
+          let b = resolved_at(recorded, body, d.span.start, []);
           let ps = root_params(b, []);
           with_claim_entry(s, wanted, part(which), ps, [], if !wants_root(wanted, part(which)) {
             out
           } else {
-            out.push(root_from_code(s, d.span.start, part(which), ps, body_code(b, [], filed)))
+            out.push(root_from_code(s, d.span.start, part(which), ps, body_code(b, [], recorded)))
           })
         };
         let with_guard = match d.guard {
@@ -1247,7 +1247,7 @@ fn clause_roots(
   definition: FnDefinition,
   s: ModuleContext,
   wanted: Map<RootName, Bool>,
-  filed: SiteAnnotations,
+  recorded: SiteAnnotations,
   schemes: Map<Bytes, Scheme>,
 ) -> RootForms / {abort.raise} = {
   let full = qualify(s.module, definition.name.name);
@@ -1256,13 +1256,13 @@ fn clause_roots(
   let base = definition.span.start;
   let clause = |kind: ClauseKind, k: Int| Clause({ definition: Named(full), kind: kind, n: k });
   let rooted = |out: List<Fn>, key: RootKey, at: Int| {
-    let b = settled_at(filed, ClauseBody(at), base, []);
+    let b = resolved_at(recorded, ClauseBody(at), base, []);
     let ps = root_params(b, []);
     let own = if !wants_root(wanted, key) { out }
-    else { out.push(root_from_code(s, base, key, ps, body_code(b, [], filed))) };
+    else { out.push(root_from_code(s, base, key, ps, body_code(b, [], recorded))) };
     let callee = judged_callee(key, vars.len());
     let specialised = if callee == key || !wants_root(wanted, callee) { own } else {
-      let sp = root_body(filed, ClauseBody(at), base, [], ints);
+      let sp = root_body(recorded, ClauseBody(at), base, [], ints);
       own.push(root_from_code(s, base, callee, sp.params, sp.code))
     };
     with_claim_entry(s, wanted, key, ps, vars, specialised)

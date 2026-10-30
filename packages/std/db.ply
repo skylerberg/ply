@@ -119,7 +119,7 @@ pub nondet effect db {
   /// Sends rows to a copy that `copy_in` started, each row its columns' values in order.
   write copy_rows[t](copy: Int, rows: List<List<Param>>) -> Result<Unit, DbError>
   /// Ends a copy. A copy in with `None` stores every row it was sent and returns how many. With
-  /// `Some(why)` the server stores none of them and the result is its error, `57014`, which is also
+  /// `Some(reason)` the server stores none of them and the result is its error, `57014`, which is also
   /// the error when the server could not accept a row. A copy out reads and drops the rows not
   /// taken, and returns how many rows were taken, or what made it fail.
   write copy_end[t](copy: Int, failure: Option<String>) -> Result<Int, DbError>
@@ -328,9 +328,9 @@ pub fn copy_from<a, [t] | e>(
             ()
           },
         |u: Unit| {
-          let answer = body(page_rows[t](id, max(page, 1), [], 4611686018427387903));
+          let result = body(page_rows[t](id, max(page, 1), [], 4611686018427387903));
           closing.close();
-          match db.copy_end[t](id, None) { Err(e) -> Err(e), Ok(_) -> Ok(answer) }
+          match db.copy_end[t](id, None) { Err(e) -> Err(e), Ok(_) -> Ok(result) }
         },
       )
     } with {
@@ -416,9 +416,9 @@ fn run_rounds<b, [t]>(
   if asking.len() == 0 {
     steps.fold([], |acc: List<b>, s: Step<b>| match s { Finished(v) -> acc.push(v), _ -> acc })
   } else {
-    let answers = run_round_queries[t](steps, asking);
+    let results = run_round_queries[t](steps, asking);
     run_rounds[t](
-      resumed(steps, 0, answers, reversed(waiting, NoneWaiting), {
+      resumed(steps, 0, results, reversed(waiting, NoneWaiting), {
         steps: [],
         waiting: NoneWaiting,
       }),
@@ -435,20 +435,20 @@ fn reversed<b>(waiting: keep Waiting<b>, onto: keep Waiting<b>) -> Waiting<b> =
 fn resumed<b>(
   steps: List<Step<b>>,
   at: Int,
-  answers: Map<Int, QueryResult>,
+  results: Map<Int, QueryResult>,
   waiting: keep Waiting<b>,
   next: keep Round<b>,
 ) -> Round<b> / {abort.raise} =
   match steps {
     [] -> next,
-    [Finished(v), ..rest] -> resumed(rest, at + 1, answers, waiting, added(next, Completed(v))),
+    [Finished(v), ..rest] -> resumed(rest, at + 1, results, waiting, added(next, Completed(v))),
     [Asked(_), ..rest] -> match waiting {
       Waits(k, later) -> {
-        let answer = match answers.get(at) {
-          Some(answer) -> answer,
+        let result = match results.get(at) {
+          Some(result) -> result,
           None -> Failed(db_error("XX000", "", "a batched ask went unanswered")),
         };
-        resumed(rest, at + 1, answers, later, added(next, k(answer)))
+        resumed(rest, at + 1, results, later, added(next, k(result)))
       },
       NoneWaiting -> panic("a waiting lookup has no continuation"),
     },
@@ -483,10 +483,10 @@ fn run_round_queries<b, [t]>(
     match g.at {
       [only] -> acc.insert(only, db.query[t](g.s, params(only))),
       _ -> {
-        let answers = db.batch[t](g.s, g.at.map(params));
+        let results = db.batch[t](g.s, g.at.map(params));
         range(0, g.at.len()).fold(acc, |m: Map<Int, QueryResult>, k: Int|
-          match ((g.at.at(k), answers.at(k))) {
-            (Some(i), Some(answer)) -> m.insert(i, answer),
+          match ((g.at.at(k), results.at(k))) {
+            (Some(i), Some(result)) -> m.insert(i, result),
             (Some(i), None) ->
               m.insert(
                 i,
@@ -3302,7 +3302,7 @@ pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
   };
   match db.stack.at(0) {
     None -> done(memdb(db, db.tables, db.sequences, [frame], false), Count(0)),
-    Some(outer) -> match nested_refusal(
+    Some(outer) -> match nested_rejection(
         db.failed,
         db.stack.len(),
         outer.level,
@@ -3319,7 +3319,7 @@ pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
 /// Why a `begin` cannot be a savepoint of the transaction it is nested in, where `depth` scopes are
 /// open and `outer` is what the transaction's own `begin` requested. The fake and the driver share
 /// it.
-fn nested_refusal(
+fn nested_rejection(
   failed: Bool,
   depth: Int,
   outer: Isolation,
@@ -3844,7 +3844,7 @@ fn test_deepen(db: MemDb, left: Int) -> Outcome = {
 
 test "what the fake does not model, it rejects by name" {
   let d = test_seed();
-  let refused = [
+  let rejected = [
     "select p.sku from part p join bin b on p.sku = b.sku",
     "select sku from part where sku in (select sku from bin)",
     "select count(*), sku from part group by sku",
@@ -3861,8 +3861,8 @@ test "what the fake does not model, it rejects by name" {
     "select sku from part order by 1",
   ];
   assert_eq(
-    refused.map(|s: String| test_code(test_out(d, s, []))),
-    refused.map(|s: String| "0A000"),
+    rejected.map(|s: String| test_code(test_out(d, s, []))),
+    rejected.map(|s: String| "0A000"),
   )
 }
 
@@ -3982,7 +3982,7 @@ effect outage {
 
 /// Runs `body` over a fake with no tables, handling its transactions, notifications on `jobs` and
 /// outages from the fake.
-fn on_twin<a | e>(
+fn on_fake<a | e>(
   body: () -> a / {db.begin, db.commit, db.abort, db.notify[jobs], db.listen[jobs], db.next_notification, outage.cut | e},
 ) -> a / {abort.raise | e} =
   handle {
@@ -4071,7 +4071,7 @@ test "a listener over the fake receives what is committed while it listens, in o
   ) {
   simulate {
     let n = times(c.sent) + 1;
-    let heard = on_twin(|| {
+    let heard = on_fake(|| {
       db.listen[jobs]();
       let notifier = task.spawn(||
         range(0, n).fold((), |u: Unit, i: Int| {
@@ -4427,14 +4427,14 @@ type Claim = | Idle(PooledConnection) | Fresh(Int)
 
 fn claim_n(c: Claim) -> Int = match c { Idle(l) -> l.n, Fresh(n) -> n }
 
-type Plan = | Answered(QueryResult) | Outside(Claim) | Within(Scope, pg::Session)
+type Plan = | Returned(QueryResult) | Outside(Claim) | Within(Scope, pg::Session)
 
 type Decision = { pool: Pool, plan: Plan }
 
 fn outside(p: Pool, size: Int) -> Decision =
   match p.idle {
     [first, ..rest] -> { pool: { ..p, idle: rest }, plan: Outside(Idle(first)) },
-    [] -> if p.opened >= size { { pool: p, plan: Answered(Failed(pool_busy(size))) } } else {
+    [] -> if p.opened >= size { { pool: p, plan: Returned(Failed(pool_busy(size))) } } else {
       { pool: { ..p, opened: p.opened + 1, made: p.made + 1 }, plan: Outside(Fresh(p.made)) }
     },
   }
@@ -4443,9 +4443,9 @@ fn pool_busy(size: Int) -> DbError =
   db_error("53300", "", "the pool of " ++ size.to_string() ++ " connection(s) is busy")
 
 fn within(p: Pool, scope: Scope) -> Decision =
-  if scope.copying { { pool: p, plan: Answered(Failed(copy_holds())) } } else {
+  if scope.copying { { pool: p, plan: Returned(Failed(copy_holds())) } } else {
     match scope.session {
-      None -> { pool: p, plan: Answered(Failed(connection_lost())) },
+      None -> { pool: p, plan: Returned(Failed(connection_lost())) },
       Some(session) -> { pool: busy(p, scope.n), plan: Within(scope, session) },
     }
   }
@@ -4475,7 +4475,7 @@ fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decision /
     NoTransaction -> outside(p, size),
     Own(scope) -> match scope.session {
       None -> within(p, scope),
-      Some(s) -> match nested_refusal(
+      Some(s) -> match nested_rejection(
           s.status == pg::FailedTransaction,
           scope.depth,
           scope.level,
@@ -4483,13 +4483,13 @@ fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decision /
           level,
           access,
         ) {
-        Some(e) -> { pool: p, plan: Answered(Failed(e)) },
+        Some(e) -> { pool: p, plan: Returned(Failed(e)) },
         None -> within(p, scope),
       },
     },
   }
 
-type Closing = | Settled(QueryResult) | Closes(Scope, pg::Session)
+type Closing = | Resolved(QueryResult) | Closes(Scope, pg::Session)
 
 type ToClose = { pool: Pool, closing: Closing }
 
@@ -4498,10 +4498,10 @@ type ToClose = { pool: Pool, closing: Closing }
 fn for_close(p: Pool, what: String, lost: QueryResult) -> ToClose / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
-    NoTransaction -> { pool: p, closing: Settled(Failed(no_transaction(what))) },
-    Own(scope) -> if scope.copying { { pool: p, closing: Settled(Failed(copy_holds())) } } else {
+    NoTransaction -> { pool: p, closing: Resolved(Failed(no_transaction(what))) },
+    Own(scope) -> if scope.copying { { pool: p, closing: Resolved(Failed(copy_holds())) } } else {
       match scope.session {
-        None -> { pool: { ..p, open: without_scope(p.open, scope) }, closing: Settled(lost) },
+        None -> { pool: { ..p, open: without_scope(p.open, scope) }, closing: Resolved(lost) },
         Some(session) -> { pool: busy(p, scope.n), closing: Closes(scope, session) },
       }
     },
@@ -4536,7 +4536,7 @@ fn apply_result(p: Pool, left: OperationResult) -> Pool = {
 fn client_error(e: pg::ClientError) -> DbError =
   match e {
     pg::Rejected(_, s) -> server_error(s),
-    pg::Refused(s) -> server_error(s),
+    pg::Rejected(s) -> server_error(s),
     pg::Unreachable -> db_error("08001", "", pg::client_error_text(e)),
     pg::Declined -> db_error("08001", "", pg::client_error_text(e)),
     pg::Unsecured(_) -> db_error("08001", "", pg::client_error_text(e)),
@@ -4790,8 +4790,8 @@ fn open_savepoint(
   }
 
 /// A transaction that has ended, its connection back in the pool.
-fn end_transaction(scope: Scope, session: pg::Session, answer: QueryResult) -> OperationResult =
-  { result: answer, n: scope.n, scope: None, freed: Some(Reuse({ n: scope.n, session: session })) }
+fn end_transaction(scope: Scope, session: pg::Session, result: QueryResult) -> OperationResult =
+  { result: result, n: scope.n, scope: None, freed: Some(Reuse({ n: scope.n, session: session })) }
 
 /// A `commit` closes its scope whatever the server replies: a savepoint's leaves the scope around
 /// it, and a transaction's gives its connection back.
@@ -4860,7 +4860,7 @@ fn abort_scope(
 
 /// Where a copy is to run: rejected, on a connection outside any transaction, or on the performer's
 /// transaction's connection.
-type CopyClaim = | CopyRefused(DbError) | CopyOutside(Claim) | CopyWithin(Scope, pg::Session)
+type CopyClaim = | CopyRejected(DbError) | CopyOutside(Claim) | CopyWithin(Scope, pg::Session)
 
 type ClaimedCopy = { pool: Pool, claim: CopyClaim }
 
@@ -4871,13 +4871,13 @@ fn for_copy(p: Pool, size: Int, what: String) -> ClaimedCopy / {abort.raise} =
       let d = outside(p, size);
       match d.plan {
         Outside(c) -> { pool: d.pool, claim: CopyOutside(c) },
-        Answered(Failed(e)) -> { pool: d.pool, claim: CopyRefused(e) },
-        _ -> { pool: d.pool, claim: CopyRefused(pool_busy(size)) },
+        Returned(Failed(e)) -> { pool: d.pool, claim: CopyRejected(e) },
+        _ -> { pool: d.pool, claim: CopyRejected(pool_busy(size)) },
       }
     },
-    Own(scope) -> if scope.copying { { pool: p, claim: CopyRefused(copy_holds()) } } else {
+    Own(scope) -> if scope.copying { { pool: p, claim: CopyRejected(copy_holds()) } } else {
       match scope.session {
-        None -> { pool: p, claim: CopyRefused(connection_lost()) },
+        None -> { pool: p, claim: CopyRejected(connection_lost()) },
         Some(session) ->
           {
             pool: {
@@ -4910,7 +4910,7 @@ fn begin_copy(
   out: Option<String>,
 ) -> CopyStart / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match claim {
-    CopyRefused(e) -> { n: 0 - 1, within: false, session: None, columns: [], failed: Some(e) },
+    CopyRejected(e) -> { n: 0 - 1, within: false, session: None, columns: [], failed: Some(e) },
     CopyOutside(c) -> match open_connection(config, nonce, c) {
       Err(e) -> { n: claim_n(c), within: false, session: None, columns: [], failed: Some(e) },
       Ok(l) -> copy_on(config, l.n, false, l.session, sql, out),
@@ -4929,10 +4929,10 @@ fn copy_on(
   match out {
     None -> match pg::copy_in_begin[link](session, sql, config.client) {
       Ok(c) -> { n: n, within: within, session: Some(c.session), columns: [], failed: None },
-      Err(e) -> copy_refused(config, n, within, session, e),
+      Err(e) -> copy_rejected(config, n, within, session, e),
     },
     Some(query) -> match pg::describe_statement[link](session, query, config.client) {
-      Err(e) -> copy_refused(config, n, within, session, e),
+      Err(e) -> copy_rejected(config, n, within, session, e),
       Ok(r) -> match pg::copy_out_begin[link](r.session, sql, config.client) {
         Ok(c) ->
           {
@@ -4942,14 +4942,14 @@ fn copy_on(
             columns: r.result.columns,
             failed: None,
           },
-        Err(e) -> copy_refused(config, n, within, r.session, e),
+        Err(e) -> copy_rejected(config, n, within, r.session, e),
       },
     },
   }
 
 /// A copy that did not start. An error from the server leaves the connection usable, and anything
 /// else ends it.
-fn copy_refused(
+fn copy_rejected(
   config: Server,
   n: Int,
   within: Bool,
@@ -5087,7 +5087,7 @@ fn take_rows(
   rows: Int,
 ) -> TakeResult / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} = {
   let ready = first_lines(c.pending, rows);
-  let answered = |copy: Copy, release: Option<Option<pg::Session>>, lines: Lines|
+  let returned = |copy: Copy, release: Option<Option<pg::Session>>, lines: Lines|
     match copied_rows(copy.columns, lines.lines) {
       Ok(found) ->
         {
@@ -5098,15 +5098,15 @@ fn take_rows(
       Err(e) -> { copy: { ..copy, failed: Some(e) }, release: release, result: Err(e) },
     };
   match session {
-    None -> answered(c, None, ready),
-    Some(s) -> if ready.lines.len() >= rows { answered({ ..c, session: Some(s) }, None, ready) }
+    None -> returned(c, None, ready),
+    Some(s) -> if ready.lines.len() >= rows { returned({ ..c, session: Some(s) }, None, ready) }
     else {
       match pg::copy_out_take[link](s, config.client) {
         Ok(piece) -> match piece.data {
           Some(data) ->
             take_rows(config, { ..c, pending: c.pending.concat(data) }, Some(piece.session), rows),
           None ->
-            answered(
+            returned(
               { ..c, session: None, done: true },
               Some(Some(piece.session)),
               first_lines(c.pending, rows),
@@ -5324,15 +5324,15 @@ pub fn serve<a | e>(
       pool_state.replace(d.pool);
       d.plan
     };
-    let settled = |left: OperationResult| {
+    let resolved = |left: OperationResult| {
       pool_state.replace(apply_result(pool_state.current(), left));
       left.result
     };
     let statement = |s: Statement, ps: List<Param>, rows: Bool, what: String|
       match taken(for_statement(pool_state.current(), size, what)) {
-        Answered(a) -> a,
-        Outside(c) -> settled(statement_outside(config, nonce, c, s, ps, rows)),
-        Within(scope, session) -> settled(statement_within(config, scope, session, s, ps, rows)),
+        Returned(a) -> a,
+        Outside(c) -> resolved(statement_outside(config, nonce, c, s, ps, rows)),
+        Within(scope, session) -> resolved(statement_within(config, scope, session, s, ps, rows)),
       };
     let closing = |d: ToClose| {
       pool_state.replace(d.pool);
@@ -5351,9 +5351,9 @@ pub fn serve<a | e>(
     // The savepoint a batch inside a transaction runs under, released or rolled back to.
     let ended_savepoint = |updated_scope: Bool|
       match closing(for_close(pool_state.current(), "`db.batch`", Count(0))) {
-        Settled(_) -> (),
+        Resolved(_) -> (),
         Closes(scope, session) -> {
-          settled(if updated_scope { commit_scope(config, scope, session) }
+          resolved(if updated_scope { commit_scope(config, scope, session) }
           else { abort_scope(config, scope, session) });
           ()
         },
@@ -5367,12 +5367,12 @@ pub fn serve<a | e>(
           Own(scope) -> match taken(
               for_begin(pool_state.current(), size, scope.level, scope.access),
             ) {
-            Within(inner, session) -> match settled(open_savepoint(config, inner, session)) {
+            Within(inner, session) -> match resolved(open_savepoint(config, inner, session)) {
               Failed(_) -> alone(s, each),
               _ -> match shared(s, each) {
-                Some(answers) -> {
+                Some(results) -> {
                   ended_savepoint(true);
-                  answers
+                  results
                 },
                 None -> {
                   ended_savepoint(false);
@@ -5382,7 +5382,7 @@ pub fn serve<a | e>(
             },
             _ -> alone(s, each),
           },
-          _ -> match shared(s, each) { Some(answers) -> answers, None -> alone(s, each) },
+          _ -> match shared(s, each) { Some(results) -> results, None -> alone(s, each) },
         }
       };
     // A copy started on the connection it claims, numbered once the server has started it.
@@ -5390,7 +5390,7 @@ pub fn serve<a | e>(
       let claimed = for_copy(pool_state.current(), size, what);
       pool_state.replace(claimed.pool);
       match claimed.claim {
-        CopyRefused(e) -> Err(e),
+        CopyRejected(e) -> Err(e),
         claim -> {
           let b = begin_copy(config, nonce, claim, sql, out);
           match b.failed {
@@ -5481,7 +5481,7 @@ pub fn serve<a | e>(
       pool_state.replace({ ..pool_state.current(), listener: { ..l, waiting: false } });
       ()
     };
-    let answer = handle {
+    let result = handle {
       body()
     } with {
       db.query[*t](s, ps) -> {
@@ -5501,19 +5501,19 @@ pub fn serve<a | e>(
         statement(s, ps, true, "`db.returning`")
       },
       db.begin(level, access) -> match taken(for_begin(pool_state.current(), size, level, access)) {
-        Answered(a) -> a,
-        Outside(c) -> settled(open_transaction(config, nonce, c, level, access)),
-        Within(scope, session) -> settled(open_savepoint(config, scope, session)),
+        Returned(a) -> a,
+        Outside(c) -> resolved(open_transaction(config, nonce, c, level, access)),
+        Within(scope, session) -> resolved(open_savepoint(config, scope, session)),
       },
       db.commit() -> match closing(
           for_close(pool_state.current(), "`db.commit`", Failed(connection_lost())),
         ) {
-        Settled(a) -> a,
-        Closes(scope, session) -> settled(commit_scope(config, scope, session)),
+        Resolved(a) -> a,
+        Closes(scope, session) -> resolved(commit_scope(config, scope, session)),
       },
       db.abort() -> match closing(for_close(pool_state.current(), "`db.abort`", Count(0))) {
-        Settled(a) -> a,
-        Closes(scope, session) -> settled(abort_scope(config, scope, session)),
+        Resolved(a) -> a,
+        Closes(scope, session) -> resolved(abort_scope(config, scope, session)),
       },
       db.notify[*c](payload) ->
         statement(
@@ -5578,7 +5578,7 @@ pub fn serve<a | e>(
       db.copy_take[*t](id, rows) -> copy_take(id, rows),
     };
     close_pool(pool_state.current(), config);
-    answer
+    result
   } with {
     var pool: Pool = {
       idle: [],
@@ -5760,7 +5760,7 @@ fn rsplit_at(text: String, sep: String) -> Option<Split> / {abort.raise} = {
 /// `@`.
 fn unpercent(text: String) -> Result<String, String> / {abort.raise} =
   match unpercent_from(Bytes::of_string(text), 0, b"") {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(bytes) -> if bytes.is_utf8() { Ok(String::of_bytes(bytes)) }
     else { Err("a `%` escape in the URL is not UTF-8") },
   }
@@ -5780,7 +5780,7 @@ fn unpercent_from(whole: Bytes, at: Int, acc: Bytes) -> Result<Bytes, String> / 
 
 fn is_hex(c: Int) -> Bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
 
-fn url_refusal(url: String) -> String =
+fn url_rejection(url: String) -> String =
   if url.contains("=") && !url.contains("://") {
     "this is libpq's keyword/value form; the URI form is `postgres://user@host:5432/database`"
   } else { "a connection string begins `postgres://`, as in `postgres://user@host:5432/database`" }
@@ -5804,9 +5804,9 @@ fn url_refusal(url: String) -> String =
 /// form.
 pub fn server_of(url: String) -> Result<Server, String> / {abort.raise} =
   match sealed_password(url) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(unsealed) -> match split_at(unsealed.url, "://") {
-      None -> Err(url_refusal(unsealed.url)),
+      None -> Err(url_rejection(unsealed.url)),
       Some(scheme) -> if scheme.head != "postgres" && scheme.head != "postgresql" {
         Err(
           "`" ++ scheme.head
@@ -5831,7 +5831,7 @@ fn sealed_password(url: String) -> Result<ExtractedPassword, String> / {abort.ra
   let colon = match b.index_of_from(b":", start) { Some(i) -> i, None -> end };
   if at < 0 || colon >= at { Ok({ url: url, password: None }) } else {
     match sealed_unpercent(b, colon + 1, at, Secret::of_bytes(b""), at - colon + 1) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(password) ->
         Ok({
           url: String::of_bytes(b.slice(0, colon).concat(b.slice(at, b.len()))),
@@ -5872,7 +5872,7 @@ fn sealed_unpercent(
 
 fn user_of(userinfo: String) -> Result<String, String> / {abort.raise} =
   match unpercent(userinfo) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(user) -> if user.len() == 0 { Err("the user is empty") } else { Ok(user) },
   }
 
@@ -5907,7 +5907,7 @@ fn database_of(path_and_query: String) -> Result<Database, String> / {abort.rais
     None -> { head: path_and_query, tail: "" },
   };
   match unpercent(split.head) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(name) -> if name.len() == 0 { Err("there is no database name after the host") }
     else { Ok({ name: name, query: split.tail }) },
   }
@@ -5924,11 +5924,11 @@ fn server_parts(
         "there is no `user@` before the host; a run whose database user comes from the environment is a run whose identity depends on who invoked it",
       ),
     Some(who) -> match user_of(who.head) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(user) -> match hostport_of(who.tail) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(hp) -> match database_of(split.tail) {
-          Err(why) -> Err(why),
+          Err(reason) -> Err(reason),
           Ok(database) ->
             with_query(database.query, server(hp.host, hp.port, user, database.name, password)),
         },
@@ -5949,20 +5949,20 @@ fn with_query(query: String, s: Server) -> Result<Server, String> / {abort.raise
       Ok({ server: s, mode: None, negotiation: None }),
       |acc: Result<QuerySettings, String>, pair: String|
         match acc {
-          Err(why) -> Err(why),
+          Err(reason) -> Err(reason),
           Ok(so_far) -> match split_at(pair, "=") {
             None -> Err("`" ++ pair ++ "` is not a `key=value` parameter"),
             Some(key_value) -> match unpercent(key_value.tail) {
-              Err(why) -> Err(why),
+              Err(reason) -> Err(reason),
               Ok(value) -> with_parameter(so_far, key_value.head, value),
             },
           },
         },
     );
     match read {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(r) -> match ssl_of(r.mode, r.negotiation) {
-        Err(why) -> Err(why),
+        Err(reason) -> Err(reason),
         Ok(ssl) -> Ok({ ..r.server, ssl: ssl }),
       },
     }
@@ -5985,7 +5985,7 @@ fn with_parameter(
     }
   } else {
     match with_setting(r.server, key, value) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(server) -> Ok({ ..r, server: server }),
     }
   }
@@ -5993,7 +5993,7 @@ fn with_parameter(
 /// What the two TLS settings request together.
 fn ssl_of(mode: Option<String>, negotiation: Option<String>) -> Result<Ssl, String> =
   match secures(mode) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(secured) -> match negotiation {
       None -> Ok(if secured { Negotiated } else { Disabled }),
       Some(way) -> if way == "postgres" { Ok(if secured { Negotiated } else { Disabled }) }
@@ -6035,12 +6035,12 @@ fn with_setting(s: Server, key: String, value: String) -> Result<Server, String>
     else { set_once(s.application_name, key, { ..s, application_name: Some(value) }) }
   } else if key == "statement_timeout" {
     match millis_of(key, value) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(ms) -> set_once(s.statement_timeout_ms, key, { ..s, statement_timeout_ms: Some(ms) }),
     }
   } else if key == "idle_in_transaction_session_timeout" {
     match millis_of(key, value) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(ms) ->
         set_once(s.idle_in_transaction_timeout_ms, key, {
           ..s,
@@ -6078,9 +6078,9 @@ pub fn with_server<a | e>(
   password: Option<Secret<Bytes>> = None,
 ) -> Result<a, String> / {diverges, abort.raise, net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], entropy.next | e} =
   match server_of(url) {
-    Err(why) -> Err(why),
+    Err(reason) -> Err(reason),
     Ok(read) -> match with_password(read, password) {
-      Err(why) -> Err(why),
+      Err(reason) -> Err(reason),
       Ok(config) -> Ok(serve(config, size, nonce(), body)),
     },
   }
@@ -6100,7 +6100,7 @@ test "a connection string reads into the parts a driver needs" {
   match server_of(
       "postgres://ply:hunter2@127.0.0.1:5433/app?sslmode=disable&application_name=ply",
     ) {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> {
       assert_eq(s.user, "ply");
       assert_eq(s.password, Some(Secret::of_bytes(b"hunter2")));
@@ -6116,7 +6116,7 @@ test "a connection string's timeouts and name are what every connection starts w
   match server_of(
       "postgres://ply@db/app?statement_timeout=250&application_name=the%20service&idle_in_transaction_session_timeout=0",
     ) {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> {
       assert_eq(s.statement_timeout_ms, Some(250));
       assert_eq(s.idle_in_transaction_timeout_ms, Some(0));
@@ -6128,7 +6128,7 @@ test "a connection string's timeouts and name are what every connection starts w
     },
   };
   match server_of("postgres://ply@db/app?sslmode=disable") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> {
       assert_eq(s.statement_timeout_ms, None);
       assert_eq(startup_parameters(s), [])
@@ -6147,7 +6147,7 @@ test "a timeout is whole milliseconds, given once, and no more than postgres tak
 
 test "a connection string may leave out the port, the password and the parameters" {
   match server_of("postgresql://ply@db/app") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> {
       assert_eq(s.port, 5432);
       assert_eq(s.password, None);
@@ -6158,7 +6158,7 @@ test "a connection string may leave out the port, the password and the parameter
 
 test "a password may contain the field separators, escaped, and is read as a secret" {
   match server_of("postgres://ply:a%40b%3Ac@db:5433/app") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> {
       assert_eq(s.password, Some(Secret::of_bytes(b"a@b:c")));
       assert_eq(s.user, "ply");
@@ -6167,11 +6167,11 @@ test "a password may contain the field separators, escaped, and is read as a sec
   };
   // The last `@` before the host ends it, and a byte that is not valid UTF-8 is part of it.
   match server_of("postgres://ply:p@ss%FF@db/app") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> assert_eq(s.password, Some(Secret::of_bytes(b"p@ss\xff"))),
   };
   match server_of("postgres://ply:@db/app") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> assert_eq(s.password, None),
   };
   assert_err("postgres://ply:a%4@db/app", "two hex digits")
@@ -6180,11 +6180,11 @@ test "a password may contain the field separators, escaped, and is read as a sec
 test "a password is taken from settings once, and rejected alongside a connection string's" {
   let given = Some(Secret::of_bytes(b"b"));
   match server_of("postgres://ply@db/app") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> assert_eq(with_password(s, given).map(|t: Server| t.password), Ok(given)),
   };
   match server_of("postgres://ply:a@db/app") {
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
     Ok(s) -> {
       assert(with_password(s, given).map(|t: Server| t.password) != Ok(given));
       assert_eq(with_password(s, None).map(|t: Server| t.password), Ok(s.password))
@@ -6206,7 +6206,7 @@ test "what a connection string cannot mean is rejected rather than guessed" {
 }
 
 fn ssl_in(url: String) -> Ssl / {abort.raise} =
-  match server_of(url) { Ok(s) -> s.ssl, Err(why) -> panic(why) }
+  match server_of(url) { Ok(s) -> s.ssl, Err(reason) -> panic(reason) }
 
 test "every sslmode that secures verifies the server, and one open to a TLS downgrade is rejected" {
   assert_eq(ssl_in("postgres://ply@db/app"), Disabled);
@@ -6230,11 +6230,11 @@ test "every sslmode that secures verifies the server, and one open to a TLS down
 fn assert_err(url: String, wanted: String) -> Unit / {abort.raise} =
   match server_of(url) {
     Ok(_) -> panic("`" ++ url ++ "` was accepted"),
-    Err(why) ->
+    Err(reason) ->
       assert(
-        why.contains(wanted),
+        reason.contains(wanted),
         Some(
-          "`" ++ url ++ "` was refused with `" ++ why ++ "`, which does not name `" ++ wanted
+          "`" ++ url ++ "` was refused with `" ++ reason ++ "`, which does not name `" ++ wanted
             ++ "`",
         ),
       ),
@@ -6283,9 +6283,9 @@ type FakeConnection = {
   open: Bool,
 }
 
-type FakeServer = { wires: List<FakeConnection>, refusals: List<ScriptedError> }
+type FakeServer = { wires: List<FakeConnection>, rejections: List<ScriptedError> }
 
-type FeedResult = { wire: FakeConnection, refusals: List<ScriptedError> }
+type FeedResult = { wire: FakeConnection, rejections: List<ScriptedError> }
 
 type ScriptRun<a> = { value: a, wires: List<FakeConnection> }
 
@@ -6344,7 +6344,7 @@ fn test_in_failed() -> FakeReply / {abort.raise} =
 fn test_rolled_back_to() -> FakeReply / {abort.raise} =
   { bytes: test_done("ROLLBACK").concat(test_done("RELEASE")), status: 84 }
 
-fn test_answer(sql: String, status: Int, extended: Bool) -> FakeReply / {abort.raise} =
+fn test_result(sql: String, status: Int, extended: Bool) -> FakeReply / {abort.raise} =
   if extended { test_extended(sql, status) } else { test_simple(sql, status) }
 
 fn test_extended(sql: String, status: Int) -> FakeReply / {abort.raise} =
@@ -6380,8 +6380,8 @@ fn test_after_error(sql: String, status: Int) -> Int =
 
 type PickResult = { found: Option<ScriptedError>, rest: List<ScriptedError> }
 
-fn test_pick(refusals: List<ScriptedError>, sql: String) -> PickResult =
-  refusals.fold({ found: None, rest: [] }, |acc: PickResult, r: ScriptedError|
+fn test_pick(rejections: List<ScriptedError>, sql: String) -> PickResult =
+  rejections.fold({ found: None, rest: [] }, |acc: PickResult, r: ScriptedError|
     match acc.found {
       None -> if sql.starts_with(r.on) { { ..acc, found: Some(r) } }
       else { { ..acc, rest: acc.rest.push(r) } },
@@ -6390,17 +6390,17 @@ fn test_pick(refusals: List<ScriptedError>, sql: String) -> PickResult =
 
 fn test_statement(
   w: FakeConnection,
-  refusals: List<ScriptedError>,
+  rejections: List<ScriptedError>,
   sql: String,
   extended: Bool,
 ) -> FeedResult / {abort.raise} = {
   let heard = { ..w, said: w.said.push(sql) };
-  let picked = test_pick(refusals, sql);
+  let picked = test_pick(rejections, sql);
   match picked.found {
     Some(r) -> if r.fatal {
       {
         wire: { ..heard, outbox: heard.outbox.concat(test_error("FATAL", r)), open: false },
-        refusals: picked.rest,
+        rejections: picked.rest,
       }
     } else {
       let status = test_after_error(sql, w.status);
@@ -6410,18 +6410,18 @@ fn test_statement(
           outbox: Bytes::concat_all([heard.outbox, test_error("ERROR", r), test_ready(status)]),
           status: status,
         },
-        refusals: picked.rest,
+        rejections: picked.rest,
       }
     },
     None -> {
-      let a = test_answer(sql, w.status, extended);
+      let a = test_result(sql, w.status, extended);
       {
         wire: {
           ..heard,
           outbox: Bytes::concat_all([heard.outbox, a.bytes, test_ready(a.status)]),
           status: a.status,
         },
-        refusals: picked.rest,
+        rejections: picked.rest,
       }
     },
   }
@@ -6433,54 +6433,54 @@ fn test_cstring(b: Bytes, at: Int) -> String / {abort.raise} =
 /// A `Query` or a `Parse` while a reply is unread is a second conversation on the connection.
 fn test_message(
   w: FakeConnection,
-  refusals: List<ScriptedError>,
+  rejections: List<ScriptedError>,
   kind: Int,
   body: Bytes,
 ) -> FeedResult / {abort.raise} =
   if (kind == 81 || kind == 80) && w.outbox.len() > 0 {
     panic("a connection was sent a statement before its last one was answered")
-  } else if kind == 81 { test_statement(w, refusals, test_cstring(body, 0), false) }
+  } else if kind == 81 { test_statement(w, rejections, test_cstring(body, 0), false) }
   else if kind == 80 {
     // A `Parse` names its statement before its text.
     match pg::read_cstring(body, 0) {
-      Some(name) -> { wire: { ..w, parsed: test_cstring(body, name.next) }, refusals: refusals },
-      None -> { wire: w, refusals: refusals },
+      Some(name) -> { wire: { ..w, parsed: test_cstring(body, name.next) }, rejections: rejections },
+      None -> { wire: w, rejections: rejections },
     }
-  } else if kind == 83 { test_statement(w, refusals, w.parsed, true) }
-  else if kind == 88 { { wire: { ..w, open: false }, refusals: refusals } }
-  else { { wire: w, refusals: refusals } }
+  } else if kind == 83 { test_statement(w, rejections, w.parsed, true) }
+  else if kind == 88 { { wire: { ..w, open: false }, rejections: rejections } }
+  else { { wire: w, rejections: rejections } }
 
 /// Every whole message in the inbox; the start-up message has no kind byte, and a length under
 /// its own four bytes is not a message. `left` limits the number of rounds, since each takes at
 /// least four bytes.
 fn test_feed(
   w: FakeConnection,
-  refusals: List<ScriptedError>,
+  rejections: List<ScriptedError>,
   left: Int,
 ) -> FeedResult / {abort.raise} =
   if left <= 0 { panic("more rounds than input") } else {
     if !w.started {
       match w.inbox.u32_be_at(0) {
-        None -> { wire: w, refusals: refusals },
-        Some(n) -> if n < 4 || w.inbox.len() < n { { wire: w, refusals: refusals } } else {
+        None -> { wire: w, rejections: rejections },
+        Some(n) -> if n < 4 || w.inbox.len() < n { { wire: w, rejections: rejections } } else {
           test_feed(
             { ..w, inbox: w.inbox.slice(n, w.inbox.len()), started: true },
-            refusals,
+            rejections,
             left - 1,
           )
         },
       }
     } else {
       match w.inbox.u32_be_at(1) {
-        None -> { wire: w, refusals: refusals },
-        Some(n) -> if n < 4 || w.inbox.len() < 1 + n { { wire: w, refusals: refusals } } else {
+        None -> { wire: w, rejections: rejections },
+        Some(n) -> if n < 4 || w.inbox.len() < 1 + n { { wire: w, rejections: rejections } } else {
           let fed = test_message(
             { ..w, inbox: w.inbox.slice(1 + n, w.inbox.len()) },
-            refusals,
+            rejections,
             w.inbox.at(0),
             w.inbox.slice(5, 1 + n),
           );
-          test_feed(fed.wire, fed.refusals, left - 1)
+          test_feed(fed.wire, fed.rejections, left - 1)
         },
       }
     }
@@ -6491,8 +6491,8 @@ fn test_sent(f: FakeServer, c: Int, payload: Bytes) -> FakeServer / {abort.raise
     None -> panic("a send on a connection the script never opened"),
     Some(w) -> if !w.open { f } else {
       let inbox = w.inbox.concat(payload);
-      let fed = test_feed({ ..w, inbox: inbox }, f.refusals, inbox.len() + 1);
-      { wires: f.wires.set(c, fed.wire), refusals: fed.refusals }
+      let fed = test_feed({ ..w, inbox: inbox }, f.rejections, inbox.len() + 1);
+      { wires: f.wires.set(c, fed.wire), rejections: fed.rejections }
     },
   }
 
@@ -6514,13 +6514,13 @@ fn test_closed(f: FakeServer, c: Int) -> FakeServer =
 /// interleaving of its tasks at the replies is run.
 fn over_script<a | e>(
   size: Int,
-  refusals: List<ScriptedError>,
+  rejections: List<ScriptedError>,
   body: () -> a / {db.read[*], db.write[*] | e},
 ) -> ScriptRun<a> / {diverges, abort.raise, task.yield | e} =
   handle {
     serve(server("db", 5432, "ply", "ply", None), size, "t", body)
   } with {
-    var fake = { wires: [], refusals: refusals },
+    var fake = { wires: [], rejections: rejections },
     net.connect[link](host, port, timeout_ms) -> {
       let f = fake;
       fake = { ..f, wires: f.wires.push(test_greeted()) };
@@ -6801,7 +6801,7 @@ test "a nested begin the transaction cannot accept is rejected before anything i
         { bounded: bounded, failed: failed }
       },
     );
-    assert_eq(match r.value.bounded { Ok(answers) -> answers.map(test_code), Err(_) -> [] }, [
+    assert_eq(match r.value.bounded { Ok(results) -> results.map(test_code), Err(_) -> [] }, [
       "25001",
       "25001",
     ]);

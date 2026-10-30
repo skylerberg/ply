@@ -588,7 +588,7 @@ pub type ClientError =
   | Unsecured(net::Error)
   /// The server rejected the client and no connection is left to use: it rejected the client
   /// before accepting queries, or its error ended the session.
-  | Refused(ServerError)
+  | Rejected(ServerError)
   /// A statement was rejected. The connection is still usable, since the server is waiting for the
   /// next statement, so the session is returned with the error for the caller to handle.
   | Rejected(Session, ServerError)
@@ -606,8 +606,8 @@ pub fn client_error_text(e: ClientError) -> String =
     TimedOut -> "the server did not answer in time",
     Closed -> "the server closed the connection",
     Declined -> "the server does not speak TLS, and this connection does not go on without it",
-    Unsecured(why) -> "TLS did not complete: " ++ net::error_message(why),
-    Refused(s) -> server_error_text(s),
+    Unsecured(reason) -> "TLS did not complete: " ++ net::error_message(reason),
+    Rejected(s) -> server_error_text(s),
     Rejected(_, s) -> server_error_text(s),
     Unexpected(what) -> what,
   }
@@ -748,9 +748,9 @@ fn secured<[l]>(
     else {
       match net.recv[l](conn, 1, timeouts.read_ms) {
         None -> Err(TimedOut),
-        Some(answer) -> if answer.len() == 0 { Err(Closed) }
-        else if answer.at(0) == 83 { upgraded[l](conn, name, timeouts) }
-        else if answer.at(0) == 78 { Err(Declined) }
+        Some(result) -> if result.len() == 0 { Err(Closed) }
+        else if result.at(0) == 83 { upgraded[l](conn, name, timeouts) }
+        else if result.at(0) == 78 { Err(Declined) }
         else { Err(Unexpected("the server answered the SSL request with neither `S` nor `N`")) },
       }
     },
@@ -763,7 +763,7 @@ fn upgraded<[l]>(
 ) -> Result<Channel, ClientError> / {net.start_tls[l], net.peer_certificate[l]} =
   match net.start_tls[l](conn, name, [alpn()], b"", timeouts.connect_ms) {
     Ok(_) -> Ok(Secured(net.peer_certificate[l](conn))),
-    Err(why) -> Err(Unsecured(why)),
+    Err(reason) -> Err(Unsecured(reason)),
   }
 
 fn greet<[l]>(
@@ -783,7 +783,7 @@ fn greet<[l]>(
           None -> Err(Unexpected("an authentication message with no code")),
           Some(0) -> greet[l](rest, password, nonce, timeouts, acc),
           Some(3) -> match password {
-            None -> Err(Refused(no_password(s.user, "a clear-text password"))),
+            None -> Err(Rejected(no_password(s.user, "a clear-text password"))),
             Some(secret) -> if !net.send_secret[l](
                 rest.conn,
                 password_head(secret.len()),
@@ -820,7 +820,7 @@ fn greet<[l]>(
         },
         BackendKeyData -> greet[l](rest, password, nonce, timeouts, acc),
         NoticeResponse -> greet[l](rest, password, nonce, timeouts, acc),
-        ErrorResponse -> Err(Refused(server_error_of(m))),
+        ErrorResponse -> Err(Rejected(server_error_of(m))),
         ReadyForQuery -> Ok({ ..rest, settings: acc.settings, status: status_after(m) }),
         _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " before the server was ready")),
       }
@@ -924,7 +924,7 @@ fn scram_begin<[l]>(
   message: Message,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
-    None -> Err(Refused(no_password(s.user, "a password"))),
+    None -> Err(Rejected(no_password(s.user, "a password"))),
     Some(_) -> match choose_binding(acc.channel, mechanisms(message)) {
       Err(e) -> Err(e),
       Ok(binding) -> {
@@ -1074,7 +1074,7 @@ fn scram_continue<[l]>(
   message: Message,
 ) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
-    None -> Err(Refused(no_password(s.user, "a password"))),
+    None -> Err(Rejected(no_password(s.user, "a password"))),
     Some(secret) -> match auth_text(message) {
       None -> Err(Unexpected("a SASL continue that is not text")),
       Some(server_first) -> match scram_challenge(server_first) {
@@ -1176,7 +1176,7 @@ fn gather<[l]>(
   acc: PartialResult,
 ) -> Result<Reply, ClientError> / {net.recv[l], abort.raise, diverges} =
   match read_message[l](s.conn, s.buffer, timeouts.read_ms) {
-    Err(e) -> match acc.refused { Some(server) -> Err(Refused(server)), None -> Err(e) },
+    Err(e) -> match acc.refused { Some(server) -> Err(Rejected(server)), None -> Err(e) },
     Ok(got) -> {
       let m = got.message;
       let rest: Session = { ..s, buffer: got.rest };
@@ -1273,7 +1273,7 @@ pub fn await_notification<[l]>(
           },
           ParameterStatus -> await_notification[l](rest, timeout_ms),
           NoticeResponse -> await_notification[l](rest, timeout_ms),
-          ErrorResponse -> Err(Refused(server_error_of(m))),
+          ErrorResponse -> Err(Rejected(server_error_of(m))),
           _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " between statements")),
         }
       },
@@ -1289,7 +1289,7 @@ pub fn copy_data(data: Bytes) -> Bytes / {abort.raise} = frontend(CopyData, data
 pub fn copy_done() -> Bytes / {abort.raise} = frontend(CopyDone, b"")
 
 /// `CopyFail`, which ends a copy in and tells the server to discard all of it, giving the reason.
-pub fn copy_fail(why: String) -> Bytes / {abort.raise} = frontend(CopyFail, cstring(why))
+pub fn copy_fail(reason: String) -> Bytes / {abort.raise} = frontend(CopyFail, cstring(reason))
 
 /// One row in `COPY`'s text format: the values separated by tabs, `\N` for NULL, and a newline at
 /// the end. A backslash, a tab, a newline and a carriage return in a value are written escaped, so
@@ -1452,7 +1452,7 @@ pub fn copy_send<[l]>(
   else { Err(NotSent) }
 
 /// Ends a copy in. `None` keeps what was sent, and the result's tag is `COPY n`, the number of rows
-/// the server accepted. `Some(why)` sends `CopyFail`, the server discards everything, and the
+/// the server accepted. `Some(reason)` sends `CopyFail`, the server discards everything, and the
 /// result is its error (`57014`), with the session ready for the next statement. A row the server
 /// could not accept is also reported here as an error.
 pub fn copy_in_end<[l]>(
@@ -1460,7 +1460,7 @@ pub fn copy_in_end<[l]>(
   failure: Option<String>,
   timeouts: Timeouts,
 ) -> Result<Reply, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} = {
-  let ending = match failure { None -> copy_done(), Some(why) -> copy_fail(why) };
+  let ending = match failure { None -> copy_done(), Some(reason) -> copy_fail(reason) };
   if !send_all[l](c.session.conn, ending, timeouts.write_ms) { Err(NotSent) }
   else { gather[l](c.session, timeouts, empty_result()) }
 }
@@ -1772,7 +1772,7 @@ fn scram_first_frame(mechanism: String, header: String) -> Bytes / {abort.raise}
 
 test "over TLS, SCRAM is bound to the server's certificate when it offers the binding, and states otherwise" {
   let begun = startup("ply", "ply", []);
-  let refused = message_frame(69, b"SFATAL\x00C28P01\x00Mno\x00\x00");
+  let rejected = message_frame(69, b"SFATAL\x00C28P01\x00Mno\x00\x00");
   let der = sample_certificate(b"\x2a\x86\x48\xce\x3d\x04\x03\x02", b"");
   let both = sasl_offer(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]);
   // The script receives exactly the first message it names, or the run fails there.
@@ -1782,7 +1782,7 @@ test "over TLS, SCRAM is bound to the server's certificate when it offers the bi
       net::Expects(begun),
       Sends(both),
       net::Expects(scram_first_frame("SCRAM-SHA-256-PLUS", "p=tls-server-end-point,,")),
-      Sends(refused),
+      Sends(rejected),
     ],
     Direct("db.example"),
     der,
@@ -1794,7 +1794,7 @@ test "over TLS, SCRAM is bound to the server's certificate when it offers the bi
       net::Expects(begun),
       Sends(sasl_offer(["SCRAM-SHA-256"])),
       net::Expects(scram_first_frame("SCRAM-SHA-256", "y,,")),
-      Sends(refused),
+      Sends(rejected),
     ],
     Direct("db.example"),
     der,
@@ -1805,7 +1805,7 @@ test "over TLS, SCRAM is bound to the server's certificate when it offers the bi
       net::Expects(begun),
       Sends(both),
       net::Expects(scram_first_frame("SCRAM-SHA-256", "n,,")),
-      Sends(refused),
+      Sends(rejected),
     ],
     NoTls,
     der,
@@ -1840,13 +1840,13 @@ fn scripted_queries(
     sqls.fold(
       { session: sample_session(net::dial_address[conn](server, [], 1000)), results: [] },
       |acc: { session: Session, results: List<Result<Reply, ClientError>> }, sql: String| {
-        let answer = simple_query[conn](acc.session, sql, default_timeouts());
-        let next = match answer {
+        let result = simple_query[conn](acc.session, sql, default_timeouts());
+        let next = match result {
           Ok(r) -> r.session,
           Err(Rejected(s, _)) -> s,
           Err(_) -> acc.session,
         };
-        { session: next, results: acc.results.push(answer) }
+        { session: next, results: acc.results.push(result) }
       },
     ).results).value
 }
@@ -1876,7 +1876,7 @@ test "an error that ends the session keeps its SQLSTATE" {
     b"SFATAL\x00C57P01\x00Mterminating connection due to administrator command\x00\x00",
   );
   match scripted_queries([fatal], ["select 1"]) {
-    [Err(Refused(s))] -> {
+    [Err(Rejected(s))] -> {
       assert_eq(s.code, "57P01");
       assert_eq(s.severity, "FATAL")
     },
@@ -1887,17 +1887,17 @@ test "an error that ends the session keeps its SQLSTATE" {
 test "a frame shorter than its own length field is rejected rather than waited on" {
   let short = Bytes::concat_all([byte_of_int(90), u32_be(3), b"I"]);
   match scripted_queries([short, short], ["select 1"]) {
-    [Err(Unexpected(why))] -> assert(why.contains("less than its own four bytes")),
+    [Err(Unexpected(reason))] -> assert(reason.contains("less than its own four bytes")),
     _ -> panic("a malformed frame was waited on"),
   }
 }
 
 test "a session knows where its transaction stood when the server was last ready" {
-  let refused = message_frame(69, b"SERROR\x00C22012\x00Mdivision by zero\x00\x00").concat(
+  let rejected = message_frame(69, b"SERROR\x00C22012\x00Mdivision by zero\x00\x00").concat(
     message_frame(90, b"E"),
   );
   let rolled = message_frame(67, b"ROLLBACK\x00").concat(message_frame(90, b"I"));
-  match scripted_queries([refused, rolled], ["select 1/0", "rollback"]) {
+  match scripted_queries([rejected, rolled], ["select 1/0", "rollback"]) {
     [Err(Rejected(failed, s)), Ok(r)] -> {
       assert_eq(s.code, "22012");
       assert_eq(failed.status, FailedTransaction);
@@ -1962,7 +1962,7 @@ test "plaintext waiting behind the server's yes is injected, and the handshake d
 
 test "a certificate not trusted for the name ends the connection before the start-up" {
   let c = scripted_connect(
-    [net::Expects(ssl_request()), Sends(b"S"), net::Refuses(net::Untrusted)],
+    [net::Expects(ssl_request()), Sends(b"S"), net::Rejects(net::Untrusted)],
     Requested("db.example"),
   );
   assert_eq(c.outcome, client_error_text(Unsecured(net::Untrusted)));
@@ -2017,7 +2017,7 @@ test "a clear-text password goes out as a secret: its kind and length, the passw
   assert_eq(c.sealed, 1);
   // A server that requests one when none was given is rejected, and nothing more is sent.
   let none = scripted_authentication([net::Expects(begun), Sends(asked)], None);
-  assert_eq(none.outcome, client_error_text(Refused(no_password("ply", "a clear-text password"))));
+  assert_eq(none.outcome, client_error_text(Rejected(no_password("ply", "a clear-text password"))));
   assert_eq(none.sent, begun);
   assert_eq(none.sealed, 0)
 }
@@ -2070,14 +2070,14 @@ test "a notification is read whole, however its bytes arrive, and a deadline los
 
 test "a notification that arrives while a statement is running is stored for the next wait" {
   let server = ip::socket_at(ip::loopback_v4(), 5432);
-  let answered = Bytes::concat_all([
+  let returned = Bytes::concat_all([
     message_frame(67, b"LISTEN\x00"),
     notification_frame(9, "jobs", "early"),
     message_frame(90, b"I"),
   ]);
   let heard = net::on_mem(
     net::mem_serving(net::mem_empty(), server, [
-      [net::Expects(query("listen jobs")), Sends(answered), net::Silent],
+      [net::Expects(query("listen jobs")), Sends(returned), net::Silent],
     ]),
     || {
       let s = sample_session(net::dial_address[conn](server, [], 1000));
@@ -2296,8 +2296,8 @@ fn error_frames(code: String, text: String) -> Bytes / {abort.raise} =
   )
 
 /// What the first row's first value reads as.
-fn first_value_text(answer: QueryResult) -> String / {abort.raise} =
-  match answer.rows {
+fn first_value_text(result: QueryResult) -> String / {abort.raise} =
+  match result.rows {
     [[Some(text), ..], ..] -> String::of_bytes(text),
     [[None, ..], ..] -> "null",
     _ -> "no value",
@@ -2384,13 +2384,13 @@ test "an error comes back with its SQLSTATE and leaves the connection usable" {
     "n",
     |s: Session|
       match simple_query[conn](s, "select nope", default_timeouts()) {
-        Err(Rejected(after, refusal)) -> match simple_query[conn](
+        Err(Rejected(after, rejection)) -> match simple_query[conn](
             after,
             "select 1",
             default_timeouts(),
           ) {
           Err(e) -> Err(e),
-          Ok(reply) -> Ok(server_error_text(refusal) ++ " then " ++ first_value_text(reply.result)),
+          Ok(reply) -> Ok(server_error_text(rejection) ++ " then " ++ first_value_text(reply.result)),
         },
         Err(e) -> Err(e),
         Ok(_) -> Ok("the server accepted what it should have refused"),
@@ -2398,7 +2398,7 @@ test "an error comes back with its SQLSTATE and leaves the connection usable" {
   );
   match ran.result {
     Ok(text) -> assert(text.contains("42P01") && text.ends_with("then 1"), Some(text)),
-    Err(why) -> panic(why),
+    Err(reason) -> panic(reason),
   };
   assert(contains_bytes(ran.sent, b"select nope") && contains_bytes(ran.sent, b"select 1"))
 }

@@ -27,7 +27,7 @@ import std.ip
 import std.ip (Ip, SocketAddress, V4, V6, ip)
 import std.list
 import std.net
-import std.net (AddressInUse, Other, PermissionDenied, Error, Refused, SocketOption, TimedOut,
+import std.net (AddressInUse, Other, PermissionDenied, Error, Rejected, SocketOption, TimedOut,
                 socket)
 import std.random (Rand, rand, rand_below)
 
@@ -47,7 +47,7 @@ pub nondet effect udp {
   write send_to[s](socket: Int, to: SocketAddress, payload: Bytes, timeout_ms: Int) -> Result<Int, Error>
   /// `send_to` the far end that `connect` fixed. A socket with no far end is a runtime error.
   write send[s](socket: Int, payload: Bytes, timeout_ms: Int) -> Result<Int, Error>
-  /// Receives the next datagram, up to `max` bytes of it. On a connected socket, `Refused` means
+  /// Receives the next datagram, up to `max` bytes of it. On a connected socket, `Rejected` means
   /// the far end reported that no one was listening for an earlier send.
   write recv_from[s](socket: Int, max: Int, timeout_ms: Int) -> Result<Datagram, Error>
   /// Sets one option of a socket.
@@ -65,7 +65,7 @@ pub fn bound<[l]>(
   at: SocketAddress,
   options: List<SocketOption>,
 ) -> Int / {udp.bind[l], socket.fail} =
-  match udp.bind[l](at, options) { Ok(s) -> s, Err(why) -> socket.fail(why) }
+  match udp.bind[l](at, options) { Ok(s) -> s, Err(reason) -> socket.fail(reason) }
 
 // --- The fake ---------------------------------------------------------------
 
@@ -96,7 +96,7 @@ pub type MemSocket = {
   options: List<SocketOption>,
 }
 
-/// One datagram network, as a value. `answering` maps each address to the far end the fake was
+/// One datagram network, as a value. `returning` maps each address to the far end the fake was
 /// given for it. `fates` decides what happens to the next datagrams, in order, and `faults` and
 /// `rand` decide what happens to the ones after. `met` lists every fate a datagram has met, in
 /// order.
@@ -104,7 +104,7 @@ pub type MemUdp = {
   next: Int,
   port: Int,
   sockets: Map<Int, MemSocket>,
-  answering: Map<String, (Bytes) -> List<Bytes> / {abort.raise}>,
+  returning: Map<String, (Bytes) -> List<Bytes> / {abort.raise}>,
   fates: List<Fate>,
   faults: Faults,
   rand: Rand,
@@ -121,7 +121,7 @@ pub fn mem_empty() -> MemUdp =
     next: 1,
     port: 49152,
     sockets: Map::new(),
-    answering: Map::new(),
+    returning: Map::new(),
     fates: [],
     faults: { drop: 0, duplicate: 0, reorder: 0 },
     rand: rand(0),
@@ -135,7 +135,7 @@ pub fn mem_with_responder(
   u: MemUdp,
   at: SocketAddress,
   respond: keep (Bytes) -> List<Bytes> / {abort.raise},
-) -> MemUdp = { ..u, answering: u.answering.insert(ip::render_socket(at), respond) }
+) -> MemUdp = { ..u, returning: u.returning.insert(ip::render_socket(at), respond) }
 
 /// Sets `fates` as the fates of the next datagrams the network carries, one each, in order,
 /// before any others.
@@ -308,7 +308,7 @@ fn is_broadcast(address: Ip) -> Bool =
 /// Performs `udp.send_to` on the fake network. The datagram goes to each of the program's own
 /// sockets that receives at `to`, or to the far end the network was given there, whose replies
 /// come back the same way. Each trip meets a fate. When no one is at `to`, nothing arrives, and on
-/// a connected socket the next receive returns `Refused`.
+/// a connected socket the next receive returns `Rejected`.
 pub fn mem_send_to(
   u: MemUdp,
   label: String,
@@ -328,7 +328,7 @@ pub fn mem_send_to(
     let key = ip::render_socket(to);
     if receivers(u, to).len() > 0 { { udp: transmit(u, from, to, payload), result: Ok(size) } }
     else {
-      match u.answering.get(key) {
+      match u.returning.get(key) {
         Some(respond) -> {
           let dealt = next_fate(u);
           let times = match dealt.fate { Dropped -> 0, Duplicated -> 2, _ -> 1 };
@@ -376,7 +376,7 @@ pub fn mem_recv_from(
   let s = socket_of(u, label, socket);
   let wanted = s.waiting.filter(|d: Datagram|
     match s.peer { Some(peer) -> d.from == peer, None -> true });
-  if s.refused { { udp: with_socket(u, socket, { ..s, refused: false }), result: Err(Refused) } }
+  if s.refused { { udp: with_socket(u, socket, { ..s, refused: false }), result: Err(Rejected) } }
   else {
     match wanted {
       [] -> { udp: with_socket(u, socket, { ..s, waiting: [] }), result: Err(TimedOut) },
@@ -591,7 +591,7 @@ fn bind_socket<[l]>(text: String) -> Int / {udp.bind[l], ip.fail, abort.raise} =
   }
 
 fn payload_of(received: Result<Datagram, Error>) -> Result<Bytes, Error> =
-  match received { Ok(d) -> Ok(d.payload), Err(why) -> Err(why) }
+  match received { Ok(d) -> Ok(d.payload), Err(reason) -> Err(reason) }
 
 test "a datagram goes from one of the program's sockets to another and reports its sender" {
   let ran = on_mem(mem_empty(), || {
@@ -644,7 +644,7 @@ test "a connected socket sends to its far end, receives only from it, and learns
   assert_eq(ran.value.sent, Ok(5));
   assert_eq(ran.value.heard, Ok(b"reply"));
   assert_eq(ran.value.reached, Ok(b"hello"));
-  assert_eq(ran.value.after, Err(Refused))
+  assert_eq(ran.value.after, Err(Rejected))
 }
 
 test "a run binds only loopback or no address, and each address once" {
@@ -736,8 +736,8 @@ test "each datagram meets the fate listed for it" {
 fn mirror(question: Bytes) -> List<Bytes> =
   if question.len() == 0 { [] } else {
     [
-      range(1, question.len()).fold(question.slice(0, 1), |answer: Bytes, i: Int|
-        answer.concat(question.slice(question.len() - i, question.len() - i + 1))),
+      range(1, question.len()).fold(question.slice(0, 1), |result: Bytes, i: Int|
+        result.concat(question.slice(question.len() - i, question.len() - i + 1))),
     ]
   }
 
@@ -752,14 +752,14 @@ fn asked<[l]>(
   iterate(0, attempts + 1, |attempt: Int|
     if attempt >= attempts { Stop(None) } else {
       let _sent = udp.send_to[l](socket, server, question, 250);
-      match answer_to[l](socket, question, 8) {
-        Some(answer) -> Stop(Some(answer)),
+      match result_to[l](socket, question, 8) {
+        Some(result) -> Stop(Some(result)),
         None -> Continue(attempt + 1),
       }
     })
 
 /// The first waiting datagram that replies to `question`, reading at most `most` datagrams.
-fn answer_to<[l]>(
+fn result_to<[l]>(
   socket: Int,
   question: Bytes,
   most: Int,

@@ -22,7 +22,7 @@ import compiler.check.infer (BodyFacts, body_facts_bin, types_named)
 import compiler.check.typed (TypedBody, witness_param)
 import compiler.front.facts (Analysis, cuts_of)
 import compiler.front.rows (Rows, KnownDefinitionRow, KnownTestRow, Cut)
-import compiler.front.seam (InferredFacts, Analysed, Refused)
+import compiler.front.seam (InferredFacts, Analysed, Rejected)
 import compiler.front.published (analyse, rows_of, inferred_facts)
 import compiler.front (analyse_pulling_std)
 import compiler.store.hash.encoding (hex)
@@ -788,7 +788,7 @@ fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} =
     },
   }
 
-fn settle(program: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
+fn resolve(program: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
   range(0, program.bodies.len()).fold(start_tables(program.definitions), |acc: Tables, i: Int| {
     let b: Body = program.bodies.get(i);
     let f: WalkResult = found.get(i);
@@ -828,7 +828,7 @@ type Run = {
   failed: Bool,
 }
 
-type Settled = { run: Run, tables: Tables, rounds: Int }
+type Resolved = { run: Run, tables: Tables, rounds: Int }
 
 fn still_valid(f: WalkResult, rets: List<ReturnOwnership>) -> Bool =
   f.reads.fold(true, |acc: Bool, r: ReturnRead| acc && rets.at(r.callee) == Some(r.ret))
@@ -985,8 +985,8 @@ fn iterate(
   readers: Map<Int, List<Int>>,
   tables: Tables,
   rounds: Int,
-) -> Settled / {abort.raise} = {
-  let next = settle(run.prog, run.found, tables);
+) -> Resolved / {abort.raise} = {
+  let next = resolve(run.prog, run.found, tables);
   let moved = moved_readers(readers, tables, next);
   let walked = evaluate(p, run, |i: Int| moved.contains(i), next);
   if walked.failed || next == tables || rounds + 1 >= 24 {
@@ -1649,7 +1649,7 @@ pub type Costing = { report: Report, kept: List<Option<Bytes>>, walked: Int, low
 
 pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
   let n = p.analysis.modules.len();
-  let refused = {
+  let rejected = {
     report: { ok: false, rounds: 0, definitions: [], unkept: [] },
     kept: range(0, n).map(|_: Int| None),
     walked: 0,
@@ -1658,15 +1658,15 @@ pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.r
   let start = started(p, kept);
   let tables = start_tables(start.prog.definitions);
   let first = evaluate(p, start, |_: Int| true, tables);
-  if first.failed { refused } else {
-    let settled = iterate(p, first, readers_of(first.found), tables, 0);
-    if settled.run.failed { refused } else {
+  if first.failed { rejected } else {
+    let resolved = iterate(p, first, readers_of(first.found), tables, 0);
+    if resolved.run.failed { rejected } else {
       {
-        report: report_of(settled.run, settled.tables, settled.rounds),
-        kept: cache_entries(settled.run, n),
-        walked: settled.run.made.fold(0, |acc: Int, xs: List<WalkResult>|
+        report: report_of(resolved.run, resolved.tables, resolved.rounds),
+        kept: cache_entries(resolved.run, n),
+        walked: resolved.run.made.fold(0, |acc: Int, xs: List<WalkResult>|
           if xs.len() > 0 { acc + 1 } else { acc }),
-        lowered: settled.run.lowered,
+        lowered: resolved.run.lowered,
       }
     }
   }
@@ -1788,7 +1788,7 @@ fn embeds_by_module(embeds: List<ModuleEmbed>) -> Map<Bytes, Bytes> =
             Bytes::concat_all(
               files.map(|f: EmbedFile| Bytes::concat_all([f.name, b"\x00", f.digest, b"\x00"])),
             ),
-          Err(why) -> b"!".concat(why),
+          Err(reason) -> b"!".concat(reason),
         },
         b"\x00",
       ]),
@@ -1813,13 +1813,13 @@ fn loose_by_module(
             match acc.get(i) { Some(was) -> was, None -> b"" },
             l.owner,
             b"\x00",
-            bin::encode(filed_facts_of(l.facts), body_facts_bin()),
+            bin::encode(recorded_facts_of(l.facts), body_facts_bin()),
           ]),
         ),
     })
 }
 
-fn filed_facts_of(f: BodyFacts) -> BodyFacts / {abort.raise} =
+fn recorded_facts_of(f: BodyFacts) -> BodyFacts / {abort.raise} =
   {
     members: f.members.map(|x: MemberSite| { ..x, module: 0 }),
     types: types_named(f.types, f.bodies),
@@ -1834,7 +1834,7 @@ fn checked(
   match analyse(
       parse_all(range(0, names.len()).map(|i: Int| { name: names.get(i), src: sources.get(i) })),
     ) {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) ->
       cost_input_of(
         {
@@ -2040,7 +2040,7 @@ fn checked_pulling(user: List<Source>, shipped: List<Source>) -> CostInput / {ab
     |acc: Map<Bytes, Bytes>, x: Source| acc.insert(x.name, x.src),
   );
   match analyse_pulling_std(user, shipped).out {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) ->
       cost_input_of(
         w,

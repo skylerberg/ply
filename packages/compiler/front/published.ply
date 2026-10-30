@@ -58,7 +58,7 @@ import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefinitionRo
 import compiler.front.facts (Analysis, PackageTables, package_tables, toolchain_tree, tree_named,
                              home_of, ToolchainTree, NoTree)
 import compiler.front.seam (test_root_at, checked_program_of, view_dump, Analysed, AnalysisOutcome,
-                            Refused, known_from_rows, InferredFacts, inferred_facts_of, rows_from)
+                            Rejected, known_from_rows, InferredFacts, inferred_facts_of, rows_from)
 
 pub fn no_rows() -> Rows = { definitions: [], tests: [], types: Map::new() }
 
@@ -120,12 +120,12 @@ fn joined_facts(g: BodyFacts, f: BodyFacts) -> BodyFacts =
 fn gathered(
   g: GatheredFacts,
   owner: Bytes,
-  filed: Option<Bytes>,
+  recorded: Option<Bytes>,
   module: Int,
 ) -> GatheredFacts / {abort.raise} =
   match g.missing {
     Some(_) -> g,
-    None -> match filed {
+    None -> match recorded {
       None -> { ..g, missing: Some(owner) },
       Some(bytes) -> match decode_facts(bytes, module, owner) {
         None -> { ..g, missing: Some(owner) },
@@ -579,7 +579,7 @@ pub fn checked_closure(
     walks: walks,
   });
   let checked: CheckOutput = out.checked;
-  if !checked.ok { Refused(checked.diagnostics.map(outside_every_module)) } else {
+  if !checked.ok { Rejected(checked.diagnostics.map(outside_every_module)) } else {
     Analysed({
       modules: h.modules,
       r: h.r,
@@ -633,7 +633,7 @@ fn kept_calls(
             None -> a,
             Some(x) -> match kept.get(x.owner) {
               None -> a,
-              Some(filed) -> match decode_facts(filed, i, x.owner) {
+              Some(recorded) -> match decode_facts(recorded, i, x.owner) {
                 None -> a,
                 Some(f) ->
                   { sites: a.sites.concat(f.members), placed: a.placed.insert(x.owner, true) },
@@ -664,13 +664,13 @@ fn analyse_closure(
   unimported: Map<Bytes, List<Bytes>>,
 ) -> AnalysisOutcome / {abort.raise} =
   match hashed_closure(parsed, clo, root_count, tree, unimported) {
-    Err(diagnostics) -> Refused(diagnostics),
+    Err(diagnostics) -> Rejected(diagnostics),
     Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module()) {
         None
       } else { prelude_cut(parsed, h) } {
       None -> checked_closure(h, rows, CheckEvery),
       Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
-        Err(diagnostics) -> Refused(diagnostics),
+        Err(diagnostics) -> Rejected(diagnostics),
         Ok(kept) -> checked_closure(kept, rows, CheckEvery),
       },
     },
@@ -791,7 +791,7 @@ pub fn entry_header(d: Dump, entry: Bytes) -> Option<Bytes> / {abort.raise} =
 
 pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
   match outcome {
-    Refused(ds) ->
+    Rejected(ds) ->
       {
         diagnostics: ds.map(normalized_diagnostic),
         order: [],
@@ -849,20 +849,20 @@ pub type LoweredClause = { at: ModuleSpan, code: Code }
 
 pub type ClaimClause = { kind: SpecKind, clause: LoweredClause }
 
-type Settled = Map<Bytes, List<TypedBody<Type>>>
+type Resolved = Map<Bytes, List<TypedBody<Type>>>
 
-fn settled_by_owner(bodies: List<TypedBody<Type>>) -> Settled =
-  bodies.fold(Map::new(), |m: Settled, b: TypedBody<Type>|
+fn resolved_by_owner(bodies: List<TypedBody<Type>>) -> Resolved =
+  bodies.fold(Map::new(), |m: Resolved, b: TypedBody<Type>|
     m.insert(b.owner, match m.get(b.owner) { Some(xs) -> xs.push(b), None -> [b] }))
 
 fn claimed(
-  settled: Settled,
+  resolved: Resolved,
   owner: Bytes,
   part: BodyPart,
   base: Int,
   labels: List<Bytes> = [],
 ) -> Option<Code> / {abort.raise} =
-  match settled_at(settled, owner, part, base) {
+  match resolved_at(resolved, owner, part, base) {
     None -> None,
     Some(b) -> {
       let l = lower_fn(b.params, labels, b.body);
@@ -870,13 +870,13 @@ fn claimed(
     },
   }
 
-fn settled_at(
-  settled: Settled,
+fn resolved_at(
+  resolved: Resolved,
   owner: Bytes,
   part: BodyPart,
   base: Int,
 ) -> Option<TypedBody<Type>> / {abort.raise} =
-  match match settled.get(owner) {
+  match match resolved.get(owner) {
       Some(bs) -> bs.find(|b: TypedBody<Type>| b.part == part),
       None -> None,
     } {
@@ -928,7 +928,7 @@ fn clause_claimed(c: Option<Code>) -> Code / {abort.raise} =
   match c { Some(x) -> x, None -> panic("a checked definition's clause the check did not settle") }
 
 fn definition_claim(
-  settled: Settled,
+  resolved: Resolved,
   m: Int,
   module: Bytes,
   definition: FnDefinition,
@@ -938,7 +938,7 @@ fn definition_claim(
 ) -> Claim / {abort.raise} = {
   let full = qualify(module, definition.name.name);
   let labels = definition.generics.labels.map(|i: Identifier| i.name);
-  let code = |part: BodyPart| claimed(settled, full, part, definition.span.start, labels);
+  let code = |part: BodyPart| claimed(resolved, full, part, definition.span.start, labels);
   let costed = range(0, definition.params.len()).filter(|i: Int|
     definition.params.get(i).cost != None);
   let spaced = range(0, definition.params.len()).filter(|i: Int|
@@ -1093,7 +1093,7 @@ fn fn_named(module: Module, name: Bytes) -> Option<FnDefinition> =
 
 fn instantiated(
   modules: List<ParsedModule>,
-  settled: Settled,
+  resolved: Resolved,
   binders: Int,
   of: SchemaInstance,
   call: TypedExpression<Type>,
@@ -1105,8 +1105,8 @@ fn instantiated(
           default_binder(callee.full),
         ) {
         None -> None,
-        Some(definition) -> match settled_at(
-            settled,
+        Some(definition) -> match resolved_at(
+            resolved,
             callee.full,
             WholeBody,
             definition.span.start,
@@ -1140,25 +1140,25 @@ fn instantiated(
 
 fn law_statement(
   modules: List<ParsedModule>,
-  settled: Settled,
+  resolved: Resolved,
   owner: Bytes,
   law_definition: LawDefinition,
   part: BodyPart,
 ) -> Option<Code> / {abort.raise} =
   match law_definition.of {
-    Some(of) -> match settled_at(settled, owner, part, law_definition.span.start) {
-      Some(b) -> match instantiated(modules, settled, law_definition.binders.len(), of, b.body) {
+    Some(of) -> match resolved_at(resolved, owner, part, law_definition.span.start) {
+      Some(b) -> match instantiated(modules, resolved, law_definition.binders.len(), of, b.body) {
         Some(w) -> Some(w),
-        None -> claimed(settled, owner, part, law_definition.span.start),
+        None -> claimed(resolved, owner, part, law_definition.span.start),
       },
       None -> None,
     },
-    None -> claimed(settled, owner, part, law_definition.span.start),
+    None -> claimed(resolved, owner, part, law_definition.span.start),
   }
 
 fn law_claim(
   modules: List<ParsedModule>,
-  settled: Settled,
+  resolved: Resolved,
   m: Int,
   module: Bytes,
   law_definition: LawDefinition,
@@ -1171,12 +1171,12 @@ fn law_claim(
         Some({
           at: span_at(m, expression_span(g)),
           code: clause_claimed(
-            law_statement(modules, settled, owner, law_definition, typed::LawGuard),
+            law_statement(modules, resolved, owner, law_definition, typed::LawGuard),
           ),
         }),
       None -> None,
     },
-    body: clause_claimed(law_statement(modules, settled, owner, law_definition, typed::LawBody)),
+    body: clause_claimed(law_statement(modules, resolved, owner, law_definition, typed::LawBody)),
   })
 }
 
@@ -1189,7 +1189,7 @@ fn claims_of_modules(
   stated: Map<Bytes, Bool>,
 ) -> List<Claim> / {abort.raise} = {
   let modelled = prover_modelled();
-  let settled = settled_by_owner(
+  let resolved = resolved_by_owner(
     bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, unreleased(b))),
   );
   wanted.fold([], |acc: List<Claim>, i: Int| {
@@ -1200,7 +1200,7 @@ fn claims_of_modules(
           let name = qualify(m.name, d.name.name);
           a.push(
             definition_claim(
-              settled,
+              resolved,
               i,
               m.name,
               d,
@@ -1215,7 +1215,7 @@ fn claims_of_modules(
             a.push(ClaimSum({ name: qualify(m.name, d.name.name), variants: vs.len() })),
           _ -> a,
         },
-        LawItem(d) -> a.push(law_claim(modules, settled, i, m.name, d)),
+        LawItem(d) -> a.push(law_claim(modules, resolved, i, m.name, d)),
         _ -> a,
       })
   })
@@ -1334,7 +1334,7 @@ fn size_over(home: Bytes, declared: Bytes) -> Bytes / {abort.raise} = {
     b"::log.put(1); 1 }\n",
   ]);
   match analyse(parse_all([{ name: b"m", src: src }, { name: home, src: declared }])) {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
         d.name == b"m.size") {
       Some(d) -> d.interface,
@@ -1374,7 +1374,7 @@ test "a type sharing its name with an effect is told apart from it in an interfa
           },
         ]),
       ) {
-      Refused(_) -> panic("the program checks"),
+      Rejected(_) -> panic("the program checks"),
       Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
           d.name == b"m.open") {
         Some(d) -> d.interface,
@@ -1385,9 +1385,9 @@ test "a type sharing its name with an effect is told apart from it in an interfa
 }
 
 test "an interface tells a taken parameter from a lent one, and a `keep` variable from a plain one" {
-  let filed = |src: Bytes|
+  let recorded = |src: Bytes|
     match analyse(parse_all([{ name: b"m", src: src }])) {
-      Refused(_) -> panic("the program checks"),
+      Rejected(_) -> panic("the program checks"),
       Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
           d.name == b"m.f") {
         Some(d) -> d.interface,
@@ -1395,12 +1395,12 @@ test "an interface tells a taken parameter from a lent one, and a `keep` variabl
       },
     };
   assert(
-    filed(b"pub fn f(g: keep (Int) -> Int) -> Int = g(1)\n")
-      != filed(b"pub fn f(g: (Int) -> Int) -> Int = g(1)\n"),
+    recorded(b"pub fn f(g: keep (Int) -> Int) -> Int = g(1)\n")
+      != recorded(b"pub fn f(g: (Int) -> Int) -> Int = g(1)\n"),
     None,
   );
   assert(
-    filed(b"pub fn f<keep a>(x: keep a) -> a = x\n") != filed(b"pub fn f<a>(x: a) -> a = x\n"),
+    recorded(b"pub fn f<keep a>(x: keep a) -> a = x\n") != recorded(b"pub fn f<a>(x: a) -> a = x\n"),
     None,
   )
 }
@@ -1408,7 +1408,7 @@ test "an interface tells a taken parameter from a lent one, and a `keep` variabl
 test "the types a body binds and uses are filed by key, read from one table the rows carry" {
   let src = b"fn first<a>(xs: List<a>, d: a) -> a = match xs { [x, ..] -> x, _ -> d }\nfn go(ys: List<Int>) -> Int = first(ys, 0)\n";
   match analyse(parse_all([{ name: b"m", src: src }])) {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) -> {
       let rows = rows_of(w);
       let sites = |name: Bytes|
@@ -1473,7 +1473,7 @@ test "a test's root is named by its module and its label, in the program's test 
 test "a dump within a run keeps every test's root, and keys what it keeps as the whole dump does" {
   let src = b"fn base(x: Int) -> Int = x + 1\nfn used(x: Int) -> Int requires x > 0 = base(x)\nfn other(x: Int) -> Int = x * 2\ntest \"uses\" { assert_eq(used(1), 2) }\ntest \"others\" { assert_eq(other(1), 2) }\nlaw \"l\" forall (x: Int) { other(x) == x * 2 }";
   match analyse(parse_all([{ name: b"m", src: src }])) {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) -> {
       let whole = dump_of(Analysed(w));
       let within = view_dump(
@@ -1508,7 +1508,7 @@ test "a test's key reads the atoms of the rows it reads, however a set spells th
       b"test \"listed\" { handle { assert_eq(listed(), 0) } with { store.all[orders]() -> [] } }\n",
     ]);
     match analyse(parse_all([{ name: b"m", src: src }])) {
-      Refused(_) -> panic("the program checks"),
+      Rejected(_) -> panic("the program checks"),
       Analysed(w) ->
         dump_of(Analysed(w)).keys.filter(|k: KeyRow| k.root == test_owner(b"m", b"listed")).map(
           |k: KeyRow| k.key,
@@ -1544,7 +1544,7 @@ test "the prelude's bodies call its externs and its own functions of a type by t
     b"pub fn List::twice<a>(xs: List<a>) -> Int = xs.count() + List::count(xs)\n",
   ]);
   match analyse(parse_all([{ name: prelude_module(), src: src }])) {
-    Refused(ds) ->
+    Rejected(ds) ->
       panic(String::of_bytes_lossy(Bytes::join(ds.map(|d: Diagnostic| d.message), b"; "))),
     Analysed(w) ->
       assert_eq(
@@ -1569,7 +1569,7 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
     b"pub fn n(m: Map<Int, Int>) -> Int = m.remove(1).insert(2, 3).update(2, |v: Int| v + 1).fold(0, |s: Int, k: Int, v: Int| s + k + v) + m.keys().len() + m.values().len() + m.entries().len() + Map::of_entries(m.entries()).merge(m).len() + e(m.first()) + e(m.last()) + e(m.floor(1)) + e(m.ceiling(1)) + e(m.below(1)) + e(m.above(1)) + p(m.pop_first()) + p(m.pop_last()) + m.range(None, true, None, true, 3).len() + (if m.contains(1) { 1 } else { 0 }) + m.split(1).below.len() + match m.get(1) { Some(v) -> v, None -> 0 }\n",
   ]);
   match analyse(parse_all([{ name: b"m", src: src }])) {
-    Refused(_) -> panic("the program checks"),
+    Rejected(_) -> panic("the program checks"),
     Analysed(w) -> {
       let checked = w.checked.definitions.fold(
         Map::new(),
@@ -1592,7 +1592,7 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
 test "a body read whole prints a call on a value naming the parameter its argument fills" {
   let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)\n";
   match analyse(parse_all([{ name: b"m", src: src }])) {
-    Refused(_) -> panic("the fixture checks"),
+    Rejected(_) -> panic("the fixture checks"),
     Analysed(w) -> {
       let more = match print_bodies(
           w.hashes.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
@@ -1605,7 +1605,7 @@ test "a body read whole prints a call on a value naming the parameter its argume
         Printed(ms) ->
           ms.get(0).text.split(b"\n\n").fold(b"", |acc: Bytes, it: Bytes|
             if it.contains(b"fn more(") { it } else { acc }),
-        Unprintable(why) -> panic(String::of_bytes(why.message)),
+        Unprintable(reason) -> panic(String::of_bytes(reason.message)),
       };
       assert(more.contains(b".scaled(_l2: 3)"), Some(String::of_bytes_lossy(more)))
     },

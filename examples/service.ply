@@ -580,7 +580,7 @@ fn placed(p: Placement) -> http::Response<| {}> / {Service, abort.raise} =
   else if bad_qty(p.lines) {
     problem(422, "bad quantity", "every line needs a quantity above zero")
   } else {
-    settled(db::transaction(db::ReadCommitted, db::ReadWrite, || placing(p)), "out of stock")
+    resolved(db::transaction(db::ReadCommitted, db::ReadWrite, || placing(p)), "out of stock")
   }
 
 /// The span that shows where a placement's time went, and the one place in this file where a span
@@ -681,7 +681,7 @@ fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
   }
 
 /// What `db::transaction` hands back, turned into a response.
-fn settled(
+fn resolved(
   out: Result<http::Response<| {}>, db::Rollback>,
   error: String,
 ) -> http::Response<| {}> / {abort.raise} =
@@ -695,7 +695,7 @@ pub fn cancel_order(params: Map<String, String>) -> http::Response<| {}> / {Serv
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
-      settled(
+      resolved(
         db::transaction(db::Serializable, db::ReadWrite, || cancelling(id)),
         "the shelf moved",
       ),
@@ -931,7 +931,7 @@ fn dispatched(
     Receipt -> receipt(params),
   }
 
-pub fn answer(req: http::Request) -> Reply / {Serving, abort.raise} =
+pub fn result(req: http::Request) -> Reply / {Serving, abort.raise} =
   if req.target == "*" {
     // `OPTIONS *` asks about the server rather than about a path, so it is not routed.
     Buffered(server_options())
@@ -983,7 +983,7 @@ fn method_not_allowed(ms: List<http::Method>) -> http::Response<| {}> / {abort.r
 /// Every route, buffered — the shape a test drives and the shape `http::serve` would take as its
 /// `app`.
 pub fn app(req: http::Request) -> http::Response<| {}> / {Serving, abort.raise} =
-  collapse(answer(req))
+  collapse(result(req))
 
 pub fn collapse(r: Reply) -> http::Response<| {}> =
   match r {
@@ -1104,8 +1104,8 @@ fn heard<| e>(
     },
     // Every framing refusal closes the connection: what a refusal did not establish is exactly
     // where the next message begins, so there is nothing to resynchronise to.
-    http::Refused(why) ->
-      write_out(c, l, http::Get, http::Http11, false, http::error_response(why)),
+    http::Rejected(reason) ->
+      write_out(c, l, http::Get, http::Http11, false, http::error_response(reason)),
     http::Parsed(h) -> continued(c, l, h, buf, left, stopping),
   }
 
@@ -1154,12 +1154,12 @@ fn with_body<| e>(
         http::text_response(408, "the request body did not arrive\n"),
       ),
     http::BodyClosed -> (),
-    http::BodyRefused(why) ->
-      write_out(c, l, h.request.method, h.request.version, false, http::error_response(why)),
-    http::BodyComplete(got) -> answered(c, l, h, got, left, stopping),
+    http::BodyRejected(reason) ->
+      write_out(c, l, h.request.method, h.request.version, false, http::error_response(reason)),
+    http::BodyComplete(got) -> returned(c, l, h, got, left, stopping),
   }
 
-fn answered<| e>(
+fn returned<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
@@ -1167,7 +1167,7 @@ fn answered<| e>(
   left: Int,
   stopping: () -> Bool / e,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} = {
-  let reply = answer(whole(h, got.bytes, got.trailers));
+  let reply = result(whole(h, got.bytes, got.trailers));
   // A stop seen once the answer is ready makes it the connection's last, unless a request is
   // already read behind it.
   let keep = h.keep_alive && left > 0 && !(got.rest.len() == 0 && stopping());
@@ -1454,7 +1454,7 @@ fn postgres(
   handle {
     match with_server(configured_url(url), s.connections, || listening(s)) {
       Ok(served) -> served,
-      Err(why) -> panic("the service will not start: " ++ why),
+      Err(reason) -> panic("the service will not start: " ++ reason),
     }
   } with {
     // Answered from the value read above, once.
@@ -1474,7 +1474,7 @@ fn configured_url(resolved: Option<String>) -> String / {abort.raise} =
   }
 
 fn configured<a>(resolved: Result<a, String>) -> a / {abort.raise} =
-  match resolved { Ok(value) -> value, Err(why) -> panic("the service will not start: " ++ why) }
+  match resolved { Ok(value) -> value, Err(reason) -> panic("the service will not start: " ++ reason) }
 
 // --- What the service is stocked with ------------------------------------------------
 
@@ -2200,15 +2200,15 @@ fn key_named(keys: List<config::Key>, name: String) -> Option<config::Key> =
 test "a service told nothing about its port refuses to start and says which flag to pass" {
   match port_of(None) {
     Ok(port) -> panic("an unset port must not resolve to " ++ port.to_string()),
-    Err(why) -> {
-      assert(mentions(why, b"SERVICE_PORT"));
-      assert(mentions(why, b"--config-schema"))
+    Err(reason) -> {
+      assert(mentions(reason, b"SERVICE_PORT"));
+      assert(mentions(reason, b"--config-schema"))
     },
   };
   assert_eq(port_of(Some("8137")), Ok(8137));
   match port_of(Some("eight")) {
     Ok(_) -> panic("`eight` is not a port"),
-    Err(why) -> assert(mentions(why, b"eight")),
+    Err(reason) -> assert(mentions(reason, b"eight")),
   };
   // A port past 65535 is a configuration nobody meant, and it is refused here rather than turning
   // into a listener that never binds; port 0 is any free one.
@@ -2221,7 +2221,7 @@ test "a connection budget that is absent defaults and one that is zero refuses" 
   assert_eq(connections_of(Some("8")), Ok(8));
   match connections_of(Some("0")) {
     Ok(_) -> panic("a service that serves zero connections would look healthy"),
-    Err(why) -> assert(mentions(why, b"SERVICE_CONNECTIONS")),
+    Err(reason) -> assert(mentions(reason, b"SERVICE_CONNECTIONS")),
   }
 }
 
@@ -2255,16 +2255,16 @@ test "each way of running the service is a setting, and a value it does not know
   );
   match settings_of(port: Some("8137"), store: Some("sqlite")) {
     Ok(_) -> panic("`sqlite` is not a store the service has"),
-    Err(why) -> assert(mentions(why, b"SERVICE_STORE")),
+    Err(reason) -> assert(mentions(reason, b"SERVICE_STORE")),
   };
   match settings_of(port: Some("8137"), accept: Some("threads")) {
     Ok(_) -> panic("`threads` is not an accept loop the service has"),
-    Err(why) -> assert(mentions(why, b"SERVICE_ACCEPT")),
+    Err(reason) -> assert(mentions(reason, b"SERVICE_ACCEPT")),
   };
   // An empty credential name would listen over TLS with nothing to present.
   match settings_of(port: Some("8137"), tls: Some("")) {
     Ok(_) -> panic("an empty credential name is not a credential"),
-    Err(why) -> assert(mentions(why, b"SERVICE_TLS")),
+    Err(reason) -> assert(mentions(reason, b"SERVICE_TLS")),
   }
 }
 
@@ -2761,7 +2761,7 @@ test "run_memory serves the service with no database bound and no host at all" {
 /// The status the peer was given — and, for every case below rather than for the ones a test author
 /// remembered, three properties that make a refusal a refusal: exactly one response was written,
 /// the connection was closed, and neither the shelf nor the order book moved.
-fn refused(raw: Bytes) -> Int / {abort.raise} = {
+fn rejected(raw: Bytes) -> Int / {abort.raise} = {
   let e = served(raw);
   assert_eq(e.sent, 1);
   assert_eq(e.closes, 1);
@@ -2782,56 +2782,56 @@ test "Content-Length and Transfer-Encoding together are refused and nothing is r
 
 test "two Content-Length lines are refused even when they agree" {
   assert_eq(
-    refused(
+    rejected(
       b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
     ),
     400,
   );
-  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5, 5\r\n\r\nhello"), 400)
+  assert_eq(rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 5, 5\r\n\r\nhello"), 400)
 }
 
 test "a Content-Length that is not one or more ASCII digits is refused" {
-  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: +5\r\n\r\nhello"), 400);
-  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length:  5x\r\n\r\nhello"), 400);
-  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 0x5\r\n\r\nhello"), 400)
+  assert_eq(rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: +5\r\n\r\nhello"), 400);
+  assert_eq(rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length:  5x\r\n\r\nhello"), 400);
+  assert_eq(rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 0x5\r\n\r\nhello"), 400)
 }
 
 test "a Content-Length past this service's max_body is refused before a body byte" {
-  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 99999999\r\n\r\n"), 413)
+  assert_eq(rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nContent-Length: 99999999\r\n\r\n"), 413)
 }
 
 test "a transfer coding that is not chunked, and one that is not last, are refused" {
-  assert_eq(refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: gzip\r\n\r\n"), 501);
+  assert_eq(rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: gzip\r\n\r\n"), 501);
   assert_eq(
-    refused(b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"),
+    rejected(b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"),
     400,
   )
 }
 
 test "a bare LF terminator, an obs-fold and a space before a colon are each refused" {
-  assert_eq(refused(b"GET /health HTTP/1.1\nHost: d\r\n\r\n"), 400);
-  assert_eq(refused(b"GET /health HTTP/1.1\r\nHost: d\r\n obsolete\r\n\r\n"), 400);
-  assert_eq(refused(b"GET /health HTTP/1.1\r\nHost : d\r\n\r\n"), 400)
+  assert_eq(rejected(b"GET /health HTTP/1.1\nHost: d\r\n\r\n"), 400);
+  assert_eq(rejected(b"GET /health HTTP/1.1\r\nHost: d\r\n obsolete\r\n\r\n"), 400);
+  assert_eq(rejected(b"GET /health HTTP/1.1\r\nHost : d\r\n\r\n"), 400)
 }
 
 test "HTTP/1.1 with no Host, and with two, are each refused" {
-  assert_eq(refused(b"GET /health HTTP/1.1\r\n\r\n"), 400);
-  assert_eq(refused(b"GET /health HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"), 400)
+  assert_eq(rejected(b"GET /health HTTP/1.1\r\n\r\n"), 400);
+  assert_eq(rejected(b"GET /health HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"), 400)
 }
 
 test "a version that is not 1.0 or 1.1 is 505, and no version at all is 400" {
-  assert_eq(refused(b"GET /health HTTP/2.0\r\nHost: d\r\n\r\n"), 505);
-  assert_eq(refused(b"GET /health\r\nHost: d\r\n\r\n"), 400)
+  assert_eq(rejected(b"GET /health HTTP/2.0\r\nHost: d\r\n\r\n"), 505);
+  assert_eq(rejected(b"GET /health\r\nHost: d\r\n\r\n"), 400)
 }
 
 test "an authority-form target and a lone asterisk under GET are each refused" {
-  assert_eq(refused(b"GET service.example:80 HTTP/1.1\r\nHost: d\r\n\r\n"), 400);
-  assert_eq(refused(b"GET * HTTP/1.1\r\nHost: d\r\n\r\n"), 400)
+  assert_eq(rejected(b"GET service.example:80 HTTP/1.1\r\nHost: d\r\n\r\n"), 400);
+  assert_eq(rejected(b"GET * HTTP/1.1\r\nHost: d\r\n\r\n"), 400)
 }
 
 test "a chunk size that is empty, not hex, or unterminated is refused" {
   assert_eq(
-    refused(
+    rejected(
       b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n".concat(
         b"\r\nhello\r\n0\r\n\r\n",
       ),
@@ -2839,7 +2839,7 @@ test "a chunk size that is empty, not hex, or unterminated is refused" {
     400,
   );
   assert_eq(
-    refused(
+    rejected(
       b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n".concat(
         b"zz\r\nhello\r\n0\r\n\r\n",
       ),
@@ -2847,7 +2847,7 @@ test "a chunk size that is empty, not hex, or unterminated is refused" {
     400,
   );
   assert_eq(
-    refused(
+    rejected(
       b"POST /orders HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n".concat(
         b"5\r\nhelloXX0\r\n\r\n",
       ),
@@ -2874,12 +2874,12 @@ test "trailers arrive in their own field and are never merged into the headers" 
 }
 
 test "a request line longer than this service will hold is 414" {
-  assert_eq(refused(b"GET /".concat(filler(9000)).concat(b" HTTP/1.1\r\nHost: d\r\n\r\n")), 414)
+  assert_eq(rejected(b"GET /".concat(filler(9000)).concat(b" HTTP/1.1\r\nHost: d\r\n\r\n")), 414)
 }
 
 test "more header bytes than this service will hold is 431" {
   assert_eq(
-    refused(b"GET /health HTTP/1.1\r\nHost: d\r\nX: ".concat(filler(20000)).concat(b"\r\n\r\n")),
+    rejected(b"GET /health HTTP/1.1\r\nHost: d\r\nX: ".concat(filler(20000)).concat(b"\r\n\r\n")),
     431,
   )
 }
@@ -2935,10 +2935,10 @@ law "every endpoint the service can dispatch is reachable through the table"
 
 // The property a framework enforces with a macro is here a value a law asserts.
 law "no two routes overlap ambiguously, and every pattern is well formed" {
-  conflicts_and_defects() == 0
+  conflicts_and_internal_errors() == 0
 }
 
-pub fn conflicts_and_defects() -> Int / {abort.raise} =
+pub fn conflicts_and_internal_errors() -> Int / {abort.raise} =
   router::conflicts(table()).len() + router::well_formed(table()).len()
 
 fn drawn_lines() -> Gen<List<Line>> =
@@ -3031,7 +3031,7 @@ pub fn placed_over(ws: List<Want>) -> Ran<http::Response<| {}>> / {abort.raise} 
     ))
 
 /// The claim a rollback is for.
-pub fn refused_without_trace(ws: List<Want>) -> Bool / {abort.raise} = {
+pub fn rejected_without_trace(ws: List<Want>) -> Bool / {abort.raise} = {
   let r = placed_over(ws);
   r.out.status == 409 && r.shelf == seed_shelf() && r.book == []
     && trace::named(r.records, "placed") == []
@@ -3039,7 +3039,7 @@ pub fn refused_without_trace(ws: List<Want>) -> Bool / {abort.raise} = {
 }
 
 test "a placement the shelf cannot cover leaves no row behind" {
-  gen::check(wants(), |ws: List<Want>| covered(ws) || refused_without_trace(ws))
+  gen::check(wants(), |ws: List<Want>| covered(ws) || rejected_without_trace(ws))
 }
 
 /// And the other half, without which the first is satisfied by a service that refuses everything:
