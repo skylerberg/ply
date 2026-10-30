@@ -65,10 +65,8 @@ import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
-import compiler.syntax.parsing
 import compiler.syntax.parsing (no_module)
-import compiler.syntax.items (read_without_import, homes_declaring, SRequires, SEnsures,
-                              spec_kind_text)
+import compiler.syntax.items (SRequires, SEnsures, spec_kind_text)
 import compiler.syntax.exprs (prelude_module)
 import compiler.emit.print.counting (same_word_fn)
 
@@ -1690,7 +1688,7 @@ fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program
     acc.insert(m.name, m));
   // The program's own prelude, which every module imports; a scope left without one takes the
   // shipped prelude's text.
-  let read = modules_read(by_name, sources, modules_lowered(roots).keys().push(prelude_module()));
+  let read = modules_read(by_name, modules_lowered(roots).keys().push(prelude_module()));
   let reads = dump.embeds.fold(Map::new(), |acc: Map<Int, List<Bytes>>, e: EmbedAt|
     match by_name.get(e.module) {
       None -> acc,
@@ -1753,24 +1751,13 @@ fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program
 
 /// Each module the roots written in `starts` read, by its name, with the modules it depends on: what
 /// it imports and what it reads with no import (a type's home, the scheduler), closed over those.
-/// `by_name` holds the program's modules, whose texts `sources` holds by index; a module is lexed
-/// only once the closure reaches it.
+/// `by_name` holds the program's modules.
 fn modules_read(
   by_name: Map<Bytes, ModuleRow>,
-  sources: List<Bytes>,
   starts: List<Bytes>,
 ) -> Map<Bytes, List<Bytes>> / {abort.raise} = {
-  let text = |m: Bytes| match by_name.get(m) { Some(row) -> sources.at(row.index), None -> None };
-  let declared = homes_declaring(text);
-  let deps = |m: Bytes| {
-    let homes = match text(m) {
-      Some(t) -> read_without_import(m, parsing::start(t).input, || declared),
-      None -> [],
-    };
-    (match by_name.get(m) { Some(row) -> row.imports, None -> [] }).concat(homes).filter(
-      |d: Bytes| d != m && by_name.contains(d),
-    )
-  };
+  let deps = |m: Bytes|
+    match by_name.get(m) { Some(row) -> row.imports.concat(row.unimported), None -> [] };
   // Each round reads a module no earlier one did.
   iterate(
     { read: Map::new(), next: starts.filter(|m: Bytes| by_name.contains(m)) },
@@ -6351,6 +6338,30 @@ test "a function of a type a module calls with no import is read from its home, 
     ),
     [b"m.first"],
   )
+}
+
+test "a module's row names the home and the scheduler it reads with no import, which a unit reads with it" {
+  let user = [
+    {
+      name: b"m",
+      src: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
+    },
+    { name: b"n", src: b"import m\npub fn one() -> Int = 1\n" },
+  ];
+  let shipped = [
+    {
+      name: b"std.list",
+      src: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
+    },
+    { name: b"std.internal.schedule", src: b"pub fn idle() -> Int = 0\n" },
+  ];
+  let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
+  let unimported = |module: Bytes|
+    dump.modules.filter(|row: ModuleRow| row.name == module).map(|row: ModuleRow| row.unimported);
+  assert_eq(unimported(b"m"), [[b"std.list", b"std.internal.schedule"]]);
+  assert_eq(unimported(b"n"), [[]]);
+  let p = program_of(dump, sources_placed(dump, user.concat(shipped)), [Named(b"m.first")]);
+  assert_eq(p.read.keys(), [b"m", b"std.internal.schedule", b"std.list", prelude_module()])
 }
 
 test "a law's body over a sort it leaves uninterpreted is lowered as a generic body as it stands" {
