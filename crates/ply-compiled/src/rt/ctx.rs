@@ -39,22 +39,22 @@ pub struct Ctx {
     /// The `handle` instance a [`FAILED_TARGET`] failure unwinds to, which its landing compares
     /// with its own. Compiled code reads and writes it, as it does the three below.
     pub target: Word,
-    /// The row descriptor and words the next closure the runtime calls is handed by its uniform
+    /// The effects descriptor and words the next closure the runtime calls is handed by its uniform
     /// entry, which takes them and sets both to 0; 0 for none, which hands it the bridge.
     pub entering_desc: Word,
     pub entering_words: Word,
-    /// Whether a perform a clause answers in place is recorded through [`rt_performed`]: while a
-    /// test reads what its entries performed or a seeded region runs.
+    /// Whether a perform a clause handles in place is recorded through [`rt_performed`]: while a
+    /// test reads what its entries performed or a seeded scheduler runs.
     pub recording: i64,
-    /// The evidence object of every effect for code that holds no word answering one
+    /// The evidence object of every effect for code that holds no word handling one
     /// ([`BRIDGE`]).
     pub bridge: Word,
     /// A word no code reads, where the release's compiler lays the context out with one.
     pub hosted: Word,
-    /// What an entry hands its root for an effect nothing answers ([`UNSERVED`]).
+    /// What an entry hands its root for an effect nothing handles ([`UNSERVED`]).
     pub unserved: Word,
-    /// Where the perform a clause answers stood, as the site fields hold one, which compiled code
-    /// stores as it enters the clause: what a region's request is placed at.
+    /// Where the perform a clause handles stood, as the site fields hold one, which compiled code
+    /// stores as it enters the clause: what a scheduler's request is placed at.
     pub performed_root: i64,
     pub performed_start: i64,
     pub performed_end: i64,
@@ -76,7 +76,7 @@ pub struct Ctx {
     /// Indices of `stacks` a finished production task gave back, which nothing names any longer.
     pub(super) free_stacks: Vec<usize>,
     pub(crate) current: usize,
-    /// Every atom a compiled `perform` performed since the entry began, for the machine's trace.
+    /// Every effect a compiled `perform` performed since the entry began, for the machine's trace.
     pub performed: Vec<EffectAtom>,
     /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
@@ -84,7 +84,7 @@ pub struct Ctx {
     /// The running entry's number, which no other entry in the process shares: a continuation
     /// carries it, since its index names a body of that entry alone.
     pub(crate) entry: u64,
-    /// The host boundary: what a `perform` nothing on the stack answers reaches.
+    /// The host boundary: what a `perform` nothing on the stack handles reaches.
     pub(crate) binding: Arc<ply_core::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_core::HostRuntime>>,
     /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of:
@@ -97,19 +97,19 @@ pub struct Ctx {
     pub(crate) pooled: bool,
     /// What the host runtime said when an entry ended, for the machine's teardown warnings.
     pub(crate) teardown: Vec<Diagnostic>,
-    /// The seed the driver set, and the step budget, for the regions this entry opens.
+    /// The seed the driver set, and the step budget, for the schedulers this entry opens.
     pub(crate) seed: ply_core::Seed,
     pub(crate) sim_steps: u32,
     pub(crate) entered_sims: u32,
-    /// The regions `std.internal.schedule` opened on this context, innermost last, which a bracket
+    /// Schedulers `std.internal.schedule` opened on this context, innermost last, which a bracket
     /// shields its running task in and a seeded step records what it touched for.
     pub(crate) schedulers: Vec<(*mut crate::tasks::Scheduler, [i64; 3])>,
     /// What the running seeded step touched, each beside where it was made.
     pub effects: Vec<(crate::tasks::Touched, [i64; 3])>,
-    /// The trail the entry's last seeded region left, and the interleaving its regions took, each as
+    /// The trail the entry's last seeded scheduler left, and its schedulers' interleaving, each as
     /// the scheduler wrote it.
     pub(crate) trail_kept: Option<Vec<u8>>,
-    /// What the run held as its root's body returned, where the run's region noted it.
+    /// What the run held as its root's body returned, where the run's scheduler noted it.
     pub(crate) held_at_root: Option<crate::entry::Held>,
     pub interleaving: Option<Vec<u8>>,
     /// The raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
@@ -119,7 +119,7 @@ pub struct Ctx {
     pub(crate) pending_words: Vec<Word>,
     /// Whether whoever runs this context's entries reads what they performed.
     pub(crate) traced: bool,
-    /// How many holds this entry has made, which numbers the next.
+    /// How many scoped values this entry has made, which numbers the next.
     pub(super) scoped_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
     pub(super) outer: (*mut Heap, *const i64),
@@ -128,9 +128,9 @@ pub struct Ctx {
     /// Stops whose continuation's last holder let it go, by body and capture, for the next drain to
     /// drop: never inside the release that let it go.
     pub(crate) continuations_died: Vec<(usize, usize)>,
-    /// The crossings under way, the innermost last.
+    /// The marshallings under way, the innermost last.
     pub(crate) marshallings: Vec<Marshalling>,
-    /// The bytes a native answered, until compiled code copies them out with [`rt_taken`].
+    /// The bytes a native returned, until compiled code copies them out with [`rt_taken`].
     pub(crate) taken: Vec<u8>,
     /// The context running on this thread when this one's entry began, put back when it ends.
     pub(super) outer_running: *mut Ctx,
@@ -143,8 +143,8 @@ pub(crate) struct BranchFailure {
     pending: Option<Unanswered>,
 }
 
-/// A raise no clause answers in place, left for the code around the failure, whose innermost
-/// `handle` answering it takes it: `abort.raise` of a message, or another raise with what it
+/// A raise no clause handles in place, left for the code around the failure, whose innermost
+/// `handle` handling it takes it: `abort.raise` of a message, or another raise with what it
 /// carries.
 pub(crate) enum Unanswered {
     Abort(String),
@@ -180,7 +180,7 @@ pub(crate) fn running() -> *mut Ctx {
     c
 }
 
-/// Makes `c` the context running on this thread, answering the one that was.
+/// Makes `c` the context running on this thread, returning the one that was.
 pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
     RUNNING.with(|r| r.replace(c))
 }
@@ -259,7 +259,7 @@ impl Ctx {
         }
     }
 
-    /// Keeps `k` on the running stack while a runtime frame calls into the program; answers the
+    /// Keeps `k` on the running stack while a runtime frame calls into the program; returns the
     /// stack, for [`Ctx::kept_back`].
     pub(crate) fn keep(&mut self, k: Kept) -> usize {
         let s = self.current;
@@ -296,7 +296,7 @@ impl Ctx {
     }
 
     /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now: whoever runs
-    /// its entries, or a seeded region's steps. A production region reads none.
+    /// its entries, or a seeded scheduler's steps. A production scheduler reads none.
     pub(crate) fn rearm_recording(&mut self) {
         let seeded = (self.schedulers.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
         self.recording = i64::from(self.traced || seeded);
@@ -319,9 +319,9 @@ impl Ctx {
         self.teardown.append(&mut branch.teardown);
     }
 
-    /// Whether a `parallel` block's branches may run on other threads: where no seeded region
+    /// Whether a `parallel` block's branches may run on other threads: where no seeded scheduler
     /// records their steps. A branch performs no `task` operation, and one that waits waits on its
-    /// own thread, so the run's region keeps no block in turn.
+    /// own thread, so the run's scheduler keeps no block in turn.
     pub(crate) fn runs_branches_at_once(&self) -> bool {
         !(self.schedulers.iter()).any(|(r, _)| unsafe { (**r).is_seeded() })
     }
@@ -415,7 +415,7 @@ impl Ctx {
         }
     }
 
-    /// Fails the entry where its wall clock ran out, answering whether it did.
+    /// Fails the entry where its wall clock ran out, returning whether it did.
     pub(super) fn out_of_time(&mut self) -> bool {
         if self.deadline.is_none_or(|d| std::time::Instant::now() <= d) {
             return false;
@@ -588,7 +588,7 @@ impl Ctx {
     }
 
     /// Fails as a raise of `abort.raise` of `message` the runtime makes, left pending for the code
-    /// around the failure, whose innermost `handle` answering it takes it: an instance's landing,
+    /// around the failure, whose innermost `handle` handling it takes it: an instance's landing,
     /// or a function holding a word for `abort`, which raises it through that word as it leaves.
     /// `d` is what the entry fails with should none take it.
     pub(crate) fn pend(&mut self, d: Diagnostic, message: String) -> i64 {
@@ -599,7 +599,7 @@ impl Ctx {
         self.fail_with(FAILED_PENDING, d)
     }
 
-    /// Fails as the raise of `effect.op` carrying `args`, which no clause answers in place, left
+    /// Fails as the raise of `effect.op` carrying `args`, which no clause handles in place, left
     /// pending as [`Ctx::pend`] leaves `abort.raise`. Takes `args`.
     pub(crate) fn pend_raised(
         &mut self,
@@ -644,7 +644,7 @@ impl Ctx {
         self.span_at(self.site_root, self.site_start, self.site_end)
     }
 
-    /// Puts `touched` into the running seeded step of the innermost region `std.internal.schedule`
+    /// Puts `touched` in the running seeded step of the innermost scheduler `std.internal.schedule`
     /// opened, made where the body last stored a site; nothing where no such step runs, and nothing
     /// of a `task` or `clock` operation.
     pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
@@ -712,7 +712,7 @@ impl Ctx {
 
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
         // A raise left pending is over once its failure is taken: what it carries goes back, and
-        // the host hears of one nothing answered, which may end the run its way.
+        // the host hears of one nothing handled, which may end the run its way.
         match self.pending.take() {
             Some(Unanswered::Raised { effect, op, args }) => {
                 self.host_runtime().unanswered(&effect, &op);

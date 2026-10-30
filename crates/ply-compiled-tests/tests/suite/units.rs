@@ -117,7 +117,7 @@ pub fn lifting(read: &str) -> String {
     )
 }
 
-/// The C of an `R#entered` that reads one `Int`, calls `root` over it and writes the `Int` it answers.
+/// The C of an `R#entered` that reads an `Int`, calls `root` on it and writes the `Int` it returns.
 pub fn int_entry(root: &str) -> String {
     format!(
         "{}  Word r = {}(ctx, ply_imm(n));\n  if (ctx->failed) return 0;\n  {}(ctx, ply_imm_value(r));\n  return 0;",
@@ -306,7 +306,7 @@ pub fn opened(
     Some(ply_compiled::c::load_opened(&lib).map_err(|e| format!("{e:#}")))
 }
 
-/// One entry of `native`'s `name`: what it answered as a word, or what it raised.
+/// One entry of `native`'s `name`: what it returned as a word, or what it raised.
 pub fn entered(
     native: &ply_compiled::c::Native,
     name: &str,

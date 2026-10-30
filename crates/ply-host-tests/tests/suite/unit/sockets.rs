@@ -1,5 +1,5 @@
 //! The run's socket table over real sockets on loopback, as `std.net`'s and `std.udp`'s natives
-//! drive it: each operation that waits is a job, run here, and every answer is flat as the real
+//! drive it: each operation that waits is a job, run here, and every result is flat as the real
 //! handlers read it.
 
 use ply_core::{Span, codes};
@@ -25,7 +25,7 @@ fn loopback() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
-/// An answer that may be refused: what follows byte 1, or the refusal written after byte 0.
+/// A result that may be an error: what follows byte 1, or the error written after byte 0.
 fn outcome(result: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
     match result.split_first() {
         Some((1, rest)) => Ok(rest.to_vec()),
@@ -506,7 +506,7 @@ fn upgrade(alpn: &[&str], unread: usize, timeout: Duration) -> Upgrade {
     }
 }
 
-/// What an upgrade settled: the protocol agreed, or the refusal's bytes.
+/// What an upgrade finished with: the protocol agreed, or the error's bytes.
 type Finished = Result<Option<String>, Vec<u8>>;
 
 fn finished(result: Vec<u8>) -> Finished {
@@ -514,7 +514,7 @@ fn finished(result: Vec<u8>) -> Finished {
         .map(|agreed| found(agreed).map(|p| String::from_utf8(p).expect("a protocol is text")))
 }
 
-/// Both halves of an upgrade, each waiting on the other, settled together.
+/// Both halves of an upgrade, each waiting on the other, finished together.
 fn upgraded(
     net: &Net,
     client: i64,
@@ -911,7 +911,7 @@ fn datagram_socket(net: &Net, label: &str) -> (i64, Endpoint) {
     (socket, here)
 }
 
-/// A datagram received, or its refusal's bytes: who sent it, its bytes, and whether it was cut.
+/// A datagram received, or its error's bytes: who sent it, its bytes, and whether it was cut.
 fn received(
     net: &Net,
     label: &str,

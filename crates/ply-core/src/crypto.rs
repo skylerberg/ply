@@ -10,14 +10,14 @@
 use crate::{Diagnostic, Span, codes};
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::elliptic_curve::sec1::ToSec1Point;
-// `ring` takes a generator only of its own types; this one answers the bytes it is handed.
+// `ring` takes a generator only of its own types; this one returns the bytes it is handed.
 use ring::signature::KeyPair;
 #[allow(deprecated)]
 use ring::test::rand::FixedSliceRandom;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-/// The runtime error of the operation `what` handed what it takes no part of, `why` saying what.
+/// The runtime error of the operation `what` handed what it takes no part of, `reason` saying what.
 #[cold]
 pub fn misuse(span: Span, what: &str, reason: String) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, format!("{what}: {reason}"))
@@ -230,7 +230,7 @@ pub fn encode(name: &str, bytes: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
 /// How a credential crosses the edge of a program inside plain bytes, which is the only way one
 /// does: plain bytes before it, the credential in an encoding, and plain bytes after it. A host
 /// operation that writes a credential out writes [`Framing::framed`], and one that reads a
-/// credential in answers [`Framing::unframed`].
+/// credential in returns [`Framing::unframed`].
 #[derive(Clone, Copy)]
 pub struct Framing {
     /// `None` is `"raw"`: the bytes themselves.
@@ -498,7 +498,7 @@ pub fn seal(
 }
 
 /// What [`seal`] sealed; `None` where the key, the nonce, `associated` or a byte of `sealed` is not
-/// what it was sealed with. `Err` as [`seal`] answers one for its cipher, key and nonce.
+/// what it was sealed with. `Err` as [`seal`] returns one for its cipher, key and nonce.
 pub fn open(
     cipher: &str,
     key: &[u8],
@@ -696,7 +696,7 @@ pub fn verify(
             .ok()
             .zip(p521::ecdsa::Signature::from_slice(signature).ok())
             .is_some_and(|(key, signature)| key.verify(message, &signature).is_ok()),
-        // `k256` refuses a high `s` as Bitcoin does; JOSE and X.509 take it as its low twin.
+        // `k256` rejects a high `s` as Bitcoin does; JOSE and X.509 take it as its low twin.
         "ecdsa-k256-sha256" => k256::ecdsa::VerifyingKey::from_sec1_bytes(public)
             .ok()
             .zip(k256::ecdsa::Signature::from_slice(signature).ok())
@@ -765,7 +765,7 @@ fn curve_key(der: &[u8]) -> Option<(&'static str, Zeroizing<Vec<u8>>)> {
 }
 
 /// The private key a DER document holds, and the scheme it is a key of: PKCS #8 for any of them, a
-/// SEC 1 `ECPrivateKey` on an elliptic curve, or a PKCS #1 `RSAPrivateKey`. An RSA key is answered
+/// SEC 1 `ECPrivateKey` on an elliptic curve, or a PKCS #1 `RSAPrivateKey`. An RSA key is returned
 /// as the document it came in, which is what `rsa` signs under.
 pub fn private_key(der: &[u8]) -> Option<(&'static str, Zeroizing<Vec<u8>>)> {
     use p256::pkcs8::{
@@ -797,7 +797,7 @@ pub fn private_key(der: &[u8]) -> Option<(&'static str, Zeroizing<Vec<u8>>)> {
 }
 
 /// The key [`private_key`] reads out of `der`, where it names `scheme` the scheme of that key: an
-/// RSA document is answered whole without being read again, so its key is checked once, by
+/// RSA document is returned whole without being read again, so its key is checked once, by
 /// [`private_key`]. `None` where `der` holds no key of `scheme`.
 pub fn private_key_as(der: &[u8], scheme: &str) -> Option<Zeroizing<Vec<u8>>> {
     if scheme == "rsa" {
@@ -833,7 +833,7 @@ fn integer_der(magnitude: &[u8], out: &mut Vec<u8>) {
 
 /// The PKCS #1 `RSAPrivateKey` an RSA JSON Web Key's numbers make (RFC 7518 §6.3): `n` and `e` as
 /// bytes, and `d`, `p`, `q`, `dp`, `dq` and `qi` as their unpadded base64url texts. Each is decoded
-/// into memory that is wiped, and the document is answered only where `ring` takes it as a key, so
+/// into memory that is wiped, and the document is returned only where `ring` takes it as a key, so
 /// numbers that disagree are no key. The lengths of the numbers are not kept secret.
 pub fn rsa_jwk(n: &[u8], e: &[u8], private: [&[u8]; 6]) -> Option<Zeroizing<Vec<u8>>> {
     let unpadded = Encoding {

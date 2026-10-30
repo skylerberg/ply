@@ -1,10 +1,10 @@
-//! What a function compiled code calls through a unit's table takes and answers, read off its Rust
+//! What a function compiled code calls through a unit's table takes and returns, read off its Rust
 //! type, so what the runtime reports of a native is the function it binds and nothing written apart.
 
 use crate::heap::Word;
 use crate::rt::Ctx;
 
-/// What a native's parameter or answer is at the machine: what compiled code passes for it, each
+/// What a native's parameter or result is at the machine: what compiled code passes for it, each
 /// in one machine word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Machine {
@@ -21,7 +21,7 @@ pub enum Machine {
     Addr,
     /// The address of words the native writes.
     Out,
-    /// A runtime object the runtime lays out: a bridge, a hold or what a native made.
+    /// A runtime object the runtime lays out: a bridge, a scoped value or what a native made.
     Handle,
     /// A value's word form, which the runtime moves and never reads.
     Handed,
@@ -38,7 +38,7 @@ pub enum Machine {
     KeepRoot,
     /// How many bytes a native left as the context's taken bytes, which emitted code copies out.
     Taken,
-    /// A `Secret`'s handle: lent to a native that takes one, owned by the code a native answers
+    /// A `Secret`'s handle: borrowed by a native that takes one, owned by the code a native returns
     /// one to.
     Secret,
 }
@@ -66,13 +66,13 @@ impl Machine {
     }
 }
 
-/// What a native takes past the context and what it answers, as its function's type says.
+/// What a native takes past the context and what it returns, as its function's type says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signature {
     pub params: &'static [Machine],
-    /// `None` for a native that answers nothing.
+    /// `None` for a native that returns nothing.
     pub result: Option<Machine>,
-    /// Whether a failure of it is a raise of `abort.raise`, which a `handle` answers, rather than a
+    /// Whether a failure of it is a raise of `abort.raise`, which a `handle` handles, rather than a
     /// fault that ends the run.
     pub raises: bool,
 }
@@ -88,24 +88,24 @@ impl Signature {
     }
 }
 
-/// What a native that answers nothing but may raise returns: nothing, the raise left in the context.
+/// What a native returns that has no result but may raise: nothing, the raise left in the context.
 /// Transparent over `()`, it is returned as `()` is, so the emitted C declares the native `void`;
 /// a native returning it allows `improper_ctypes_definitions`, which does not know that.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Raises(pub ());
 
-/// A raw 64-bit integer compiled code passes or is answered.
+/// A raw 64-bit integer compiled code passes or receives.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct I64(pub i64);
 
-/// A `Float`'s bits, as compiled code passes or is answered them.
+/// A `Float`'s bits, as compiled code passes or receives them.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct F64(pub u64);
 
-/// The address of bytes compiled code lends a native, to read or to write as the native says;
+/// The address of bytes a native borrows from compiled code, to read or write as the native says;
 /// their count is a parameter beside it.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,16 +155,16 @@ unsafe impl Taken for Out {
     const MACHINE: Machine = Machine::Out;
 }
 
-/// What a native answers compiled code.
+/// What a native returns to compiled code.
 ///
 /// # Safety
-/// A type that answers is returned as the C calling convention returns one `int64_t`, which is what
-/// the emitted C declares a native that answers to return; one that does not is `()` or [`Raises`].
+/// A type with a result is returned as the C calling convention returns one `int64_t`, which is
+/// what the emitted C declares a native with a result to return; one without is `()` or [`Raises`].
 pub unsafe trait Returned {
     /// `None` for `()` and [`Raises`].
     const MACHINE: Option<Machine>;
     const RAISES: bool;
-    /// What the function answers when its work answered `w`.
+    /// What the function returns when its work returned `w`.
     fn of(w: Word) -> Self;
 }
 

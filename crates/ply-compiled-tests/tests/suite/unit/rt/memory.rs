@@ -160,8 +160,8 @@ fn a_native_object_is_given_back_with_what_it_holds() {
     assert_eq!(ctx.heap.natives(), 0);
 }
 
-/// `drop#Hold<a>` reads what a hold holds at the payload word the description reports, and empties
-/// it there before the hold is given back.
+/// `drop#Hold<a>` reads what a scoped value holds at the payload word the description reports,
+/// and empties it there before the scoped value is given back.
 #[test]
 fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     use ply_compiled::c::builtin_helper_name;

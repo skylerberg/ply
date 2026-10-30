@@ -1,4 +1,4 @@
-//! `compiler.cc`'s natives, the family `toolchain` a run is lent with `--allow toolchain`: the C
+//! `compiler.cc`'s natives, the family `toolchain` that `--allow toolchain` grants: the C
 //! compilers by label, each run a job of the run's on the waiting pool; the toolchain's cache,
 //! read and written below it and nowhere else, and the programs linked there, each run a job too;
 //! and the asking program's own heap. What to compile, with what flags and what to keep is the
@@ -259,7 +259,7 @@ pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> T
 }
 
 /// The compiler the label at `lp` names started with the arguments at `ap`, as parts: byte 1 and
-/// the ticket of its end, eight bytes, which answers byte 0 where it succeeded and byte 1 and what
+/// the ticket of its end, eight bytes, which returns byte 0 where it succeeded and byte 1 and what
 /// it wrote to standard error where it did not; or byte 0 and why it could not start.
 pub unsafe extern "C" fn rt_compilers_started(
     ctx: *mut Ctx,
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn rt_toolchain_cache(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-/// The directory what `ply run` and `ply check` reuse is filed in, under the stage root, where the
+/// The directory what `ply run` and `ply check` reuse is stored in, under the stage root, where the
 /// sweep keeps it to the cache's budget.
 pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
     borrowed_toolchain(ctx, "toolchain_reused", Deterministic, TakenBytes(0), |c| {
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-/// The directory the emitter's answers are kept in between runs, under the toolchain's sweep.
+/// The directory the emitter's results are cached in between runs, under the toolchain's sweep.
 pub unsafe extern "C" fn rt_toolchain_bodies(ctx: *mut Ctx) -> TakenBytes {
     borrowed_toolchain(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::bodies_dir().display().to_string().into_bytes())

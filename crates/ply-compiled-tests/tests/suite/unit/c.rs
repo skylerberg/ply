@@ -16,7 +16,7 @@ fn every_declared_helper_has_an_address() {
 }
 
 /// What the runtime reports of a native is read off the type of the function it binds: the words
-/// past the context, whether it answers, and whether what it answers may be a raise.
+/// past the context, whether it returns, and whether what it returns may be a raise.
 #[test]
 fn a_natives_signature_is_its_functions_type() {
     use ply_compiled::emitted::{Handed, PlyType};
@@ -95,7 +95,7 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
 }
 
 /// What the runtime says of itself to a compiler is read off its own functions and structs: each
-/// helper of its own and each native with what its function's type takes and answers, and where it
+/// helper of its own and each native with what its function's type takes and returns, and where it
 /// lays out what emitted code reads in place.
 #[test]
 fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
@@ -170,7 +170,7 @@ fn a_units_table_reads_as_a_unit_writes_it() {
     assert_eq!(read.encode(), said);
 }
 
-/// The last release's units list what their emitter refused after their modules: such a table reads
+/// The last release's units list what their emitter rejected after their modules: that table reads
 /// as the same table without the list, since the release's builder runs on this runtime.
 #[test]
 fn a_table_listing_refusals_reads_as_one_without_them() {
@@ -182,7 +182,7 @@ fn a_table_listing_refusals_reads_as_one_without_them() {
 }
 
 /// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
-/// another shape, refuses the unit by name rather than binding it to nothing.
+/// another shape, rejects the unit by name rather than binding it to nothing.
 #[test]
 fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_name() {
     let mut retired = units::exports_of(&[]);
@@ -284,7 +284,7 @@ extern "C" fn enter_from_an_unknown_stack(arg: usize) {
     std::process::abort();
 }
 
-/// `m.ladder(DEEP)` begun on a stack the runtime does not know: what it answered, the chunks it grew
+/// `m.ladder(DEEP)` begun on a stack unknown to the runtime: what it returned, the chunks it grew
 /// by, and how it failed.
 fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -312,7 +312,7 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     Some((imm_value(result), grown, failed, raised))
 }
 
-/// A recursion past a stack's first chunk makes the stack writable further down and answers on
+/// A recursion past a stack's first chunk makes the stack writable further down and returns on
 /// it, so a program nests as deeply as its stack's reservation holds. An entry begun where the
 /// runtime knows no stack is given one of its own.
 #[test]

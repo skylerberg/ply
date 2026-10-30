@@ -1,5 +1,5 @@
 //! What `std.password`'s operations compute, against each algorithm's published vectors, and what
-//! they refuse before computing anything.
+//! they reject before computing anything.
 
 use ply_host::password::{
     self, MAX_ARGON2_WORK, MAX_BCRYPT_COST, MAX_LANES, MAX_LENGTH, MAX_MEMORY_KIB,
@@ -171,7 +171,7 @@ fn pbkdf2_answers_the_rfcs_vectors() {
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 
-/// What was asked, refused, with no `Work` made of it and so nothing computed.
+/// What was asked, rejected, with no `Work` made of it and so nothing computed.
 fn rejected(asked: Result<Work, String>, names: &str) {
     let reason = match asked {
         Ok(_) => panic!("nothing refused what should say `{names}`"),

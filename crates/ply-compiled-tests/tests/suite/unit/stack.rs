@@ -71,7 +71,7 @@ struct Descent {
     stack: *const Stack,
     /// Each frame's pad, from the top down.
     frames: Vec<usize>,
-    /// Whether an extension the floor asked for was refused.
+    /// Whether an extension the floor asked for was rejected.
     rejected: bool,
     /// What it counts to at the bottom.
     counts: usize,

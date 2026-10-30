@@ -381,7 +381,7 @@ fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_i
     let _other = recorder.child_trace();
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
     assert_eq!(lines(&trace), ["file\tcwd\ta.ply\t", "shipped\tstd.list"]);
-    // The child's binary answered, not ours.
+    // The child's binary responded, not ours.
     assert!(trace.contains("shipped\tstd.list\tits own digest\n"));
     let unfinished = recorder.child_trace();
     std::fs::write(&unfinished, "read\tfile\t/x\n").unwrap();

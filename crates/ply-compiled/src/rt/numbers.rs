@@ -77,7 +77,7 @@ pub unsafe extern "C" fn rt_not_an_int_wide(ctx: *mut Ctx, lo: i64, hi: i64, sig
     raise_error(ctx, d);
 }
 
-/// A `Decimal` operator's answer past what a `Decimal` holds exactly; `what` is `emit/c.ply`'s
+/// A `Decimal` operator's result past what a `Decimal` holds exactly; `what` is `emit/c.ply`'s
 /// `overflow_code`.
 pub unsafe extern "C" fn rt_decimal_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };

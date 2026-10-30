@@ -1,5 +1,5 @@
 //! What an operation emitted code writes in place leaves in the context when it hands the runtime
-//! its refusal of its operands: raised where the operation raises, which `abort.raise` answers, and
+//! its operands' rejection: raised where the operation raises, which `abort.raise` handles, and
 //! failing the run where it fails.
 
 use crate::bare::{context_of, helper};

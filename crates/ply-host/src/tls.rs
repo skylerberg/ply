@@ -81,7 +81,7 @@ pub struct Credential {
     chooser: Arc<Chooser>,
 }
 
-/// One certificate a credential answers with, and when its two files last changed.
+/// One certificate a credential responds with, and when its two files last changed.
 #[derive(Debug)]
 struct Loaded {
     spec: CredentialSpec,
@@ -129,7 +129,7 @@ impl Chooser {
         self.refresh(true);
     }
 
-    /// The leaf each certificate answers with now, in the order given.
+    /// The leaf each certificate responds with now, in the order given.
     pub fn leaves(&self) -> Vec<Vec<u8>> {
         lock(&self.loaded)
             .iter()
@@ -197,7 +197,7 @@ fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
     let certificates = chain.len();
     let key =
         CertifiedKey::from_der(chain, key, &provider()).map_err(|e| err_mismatch(spec, &e))?;
-    // rustls refuses a key that does not match the leaf certificate's public key.
+    // rustls rejects a key that does not match the leaf certificate's public key.
     key.keys_match().map_err(|e| err_mismatch(spec, &e))?;
     Ok(Certified {
         key: Arc::new(key),
@@ -220,7 +220,7 @@ impl Credential {
         &self.chooser
     }
 
-    /// The configuration a listener under this name answers with.
+    /// The configuration a listener under this name responds with.
     pub fn config(&self) -> &Arc<ServerConfig> {
         &self.config
     }
@@ -233,7 +233,7 @@ pub struct Credentials {
     client: Option<Arc<ClientConfig>>,
     /// The same, presenting each credential to a server that asks a client for a certificate.
     presenting: BTreeMap<String, Arc<ClientConfig>>,
-    /// The credentials whose listeners refuse a client that presents no certificate.
+    /// The credentials whose listeners reject a client that presents no certificate.
     required: Vec<String>,
     trusted: usize,
 }
@@ -325,7 +325,7 @@ impl Credentials {
         })
     }
 
-    /// Whether the listener of the credential `name` refuses a client that presents no certificate.
+    /// Whether the listener of the credential `name` rejects a client that presents no certificate.
     pub fn requires_client(&self, name: &str) -> bool {
         self.required.iter().any(|r| r == name)
     }
@@ -383,7 +383,7 @@ impl fmt::Debug for Credentials {
 }
 
 /// What every listener of a run shares: the client verifiers the trusted certificates make, one
-/// that serves a client presenting no certificate and one that refuses it, and one ticket key,
+/// that serves a client presenting no certificate and one that rejects it, and one ticket key,
 /// which rotates, so a session one listener began resumes at another.
 struct Shared {
     verifier: Option<Arc<dyn ClientCertVerifier>>,
@@ -434,7 +434,7 @@ impl Shared {
 }
 
 /// What verifies a client's certificate against `anchors`, none where there are none: one that
-/// serves a client presenting no certificate, or where `required` one that refuses it.
+/// serves a client presenting no certificate, or where `required` one that rejects it.
 fn client_verifier(
     anchors: &[CertificateDer<'static>],
     required: bool,
@@ -777,7 +777,7 @@ impl Session {
         &self.socket
     }
 
-    /// The handshake, completed within `timeout` in all, answering the application protocol it
+    /// The handshake, completed within `timeout` in all, returning the application protocol it
     /// agreed on. A handshake that does not complete ends the connection, a deadline included:
     /// an upgrade that timed out has left bytes of a handshake on the wire.
     pub fn finish_within(&self, timeout: Duration) -> Result<Option<String>, Unfinished> {
@@ -836,12 +836,12 @@ impl Session {
         let _ = self.socket.shutdown(Shutdown::Write);
     }
 
-    /// The handshake, completed now rather than when a request needs it, answering what it took in
+    /// The handshake, completed now rather than when a request needs it, returning what it took in
     /// microseconds.
     ///
-    /// `None` when this connection has none to complete: a session whose configuration refused to
+    /// `None` when this connection has none to complete: a session whose configuration failed to
     /// start, or one whose handshake failed, which closes the connection the way the read/write path
-    /// would. A session that already handshook answers what that earlier handshake took.
+    /// would. A session that already handshook returns what that earlier handshake took.
     pub fn handshake(&self) -> Option<u64> {
         let began = Instant::now();
         let mut guard = lock(&self.session);
@@ -981,7 +981,7 @@ fn expired(error: &io::Error) -> bool {
     )
 }
 
-/// Why a handshake was refused, as one of a fixed set of strings.
+/// Why a handshake was rejected, as one of a fixed set of strings.
 pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
     if !handshaking {
         return REASON_TRANSPORT;

@@ -1,5 +1,5 @@
 //! The runtime's stamp: a digest of the sources of the crates that run a test or a law, and of the
-//! `Cargo.lock` entries they reach. It digests sources, not the binary, so both build profiles file
+//! `Cargo.lock` entries they reach. It digests sources, not the binary, so both profiles record
 //! the same.
 
 #[path = "src/code.rs"]
@@ -7,7 +7,7 @@ mod code;
 
 use std::path::{Path, PathBuf};
 
-/// What runs a test or a law, the handlers a kept pass's trace was read through, and the launcher a
+/// What runs a test or law, the handlers a cached pass's trace was read through, and the launcher a
 /// `ply` it started ran under.
 const RUNTIME: &[&str] = &[
     "ply-core",

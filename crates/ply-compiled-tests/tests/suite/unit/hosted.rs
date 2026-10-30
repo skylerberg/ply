@@ -86,7 +86,7 @@ fn a_secret_line_is_taken_from_its_run_and_none_outlives_the_entry_point() {
     );
 }
 
-/// A run handed no stop hears no signal: its ask answers `false` and installs no handler, so the
+/// A run handed no stop hears no signal: its ask returns `false` and installs no handler, so the
 /// platform's handling stays for every other run of the process, a `ctrl-C` on `ply test` among
 /// them.
 #[test]
@@ -142,7 +142,7 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
     note(&mut ctx, b"app", b"made.db", 4);
     note(&mut ctx, b"app", b"made.db", 0);
     assert!(ctx.take_failure().is_none());
-    // Where the root lies with its links resolved, as a binding lends it.
+    // Where the root lies with its links resolved, as a binding passes it borrowed.
     let borrowed = [("app".to_string(), dir.path().canonicalize().unwrap())];
     let shipped = |_: &str| None;
     let config = std::collections::BTreeMap::new();
@@ -198,7 +198,7 @@ fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {
     assert!(trace.contains("program\tentered"), "{trace}");
 }
 
-/// Outside a production region the thread waits for a job, and is handed its bytes.
+/// Outside a production scheduler the thread waits for a job, and is handed its bytes.
 #[test]
 fn a_jobs_bytes_come_back_through_job_wait() {
     let mut ctx = context();
@@ -227,7 +227,7 @@ fn a_failed_job_fails_the_run_that_waits_on_it() {
 }
 
 /// A hash is computed off the program's thread and is a function of what it was handed, so the
-/// run is recorded as having asked the host and read nothing of it; one past its bounds is refused
+/// run is recorded as having asked the host and read nothing of it; one past its bounds is rejected
 /// before any job starts, saying which number and nothing of the password.
 #[test]
 fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_refused() {

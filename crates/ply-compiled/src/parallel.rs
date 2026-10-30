@@ -1,5 +1,5 @@
 //! `parallel { .. }`: branches the checker showed touch no resource in common, run at once on
-//! threads of their own and answered as evaluating them left to right answers.
+//! threads of their own and returned as evaluating them left to right returns.
 
 use crate::blocks::Blocks;
 use crate::emitted::Block;
@@ -20,7 +20,7 @@ fn let_go(ctx: *mut Ctx, f: Word) {
     unsafe { Block::of(f).let_go_function(ctx) }
 }
 
-/// Marks everything the branches hold shared, or answers that one cannot leave this thread.
+/// Marks everything the branches hold shared, or returns that one cannot leave this thread.
 fn share(ctx: *mut Ctx, branches: &[Word]) -> bool {
     branches.iter().all(|f| unsafe { Block::of(*f).share(ctx) })
 }
@@ -30,7 +30,7 @@ thread_local! {
     static BRANCH_OF: Cell<u64> = const { Cell::new(0) };
 
     /// By machine, the blocks the branches a pool thread runs take from, kept from one branch to the
-    /// next: what a branch leaves behind its answer stays this thread's, freed back to it from
+    /// next: what a branch leaves behind its result stays this thread's, freed back to it from
     /// wherever it dies, and the room around it is the next branch's, where a heap of the branch's
     /// own would leave it to the parent. A machine's go when its entry ends (`workers_ended`).
     static WORKERS: RefCell<HashMap<u64, Blocks>> = RefCell::new(HashMap::new());
@@ -94,9 +94,9 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Runs the `n` nullary closures at `slots`, writing each one's answer over it, at once where
+/// Runs the `n` nullary closures at `slots`, writing each one's result over it, at once where
 /// `allowed`. Where the block fails, a branch that failed or never ran leaves 0 in its slot, and
-/// one that answered after one before it failed its answer, for the code that knows its type.
+/// one that returned after one before it failed its result, for the code that knows its type.
 pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: bool) {
     let branches = unsafe { std::slice::from_raw_parts_mut(slots, n) };
     let c = unsafe { &mut *ctx };
@@ -117,7 +117,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     }
 }
 
-/// Whether every word of the row whose descriptor and words are `words` is the bridge
+/// Whether every word of the effects whose descriptor and words are `words` is the bridge
 /// ([`crate::rt::BRIDGE`]).
 fn bridged_only(c: &Ctx, (desc, words): (Word, Word)) -> bool {
     if desc == 0 {
@@ -147,7 +147,7 @@ unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
     }
 }
 
-/// One branch: its own context, the closure it calls, and what that answered.
+/// One branch: its own context, the closure it calls, and what that returned.
 struct Branch {
     ctx: Box<Ctx>,
     closure: Word,

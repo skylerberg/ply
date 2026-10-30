@@ -1,5 +1,5 @@
 //! The helpers compiled code calls into and the context an entry runs in. A helper that takes an
-//! argument owns it, one that reads leaves its count alone, and every answer is the caller's.
+//! argument owns it, one that reads leaves its count alone, and every result is the caller's.
 
 use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyOp, PlyType};
 use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_word, word_at};

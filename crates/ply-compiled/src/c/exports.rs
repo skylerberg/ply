@@ -53,13 +53,13 @@ pub struct Exports {
 
 /// What opens a line after a unit's tables naming a root `R` the unit is entered at through the
 /// definition `R#entered` it takes, which takes no words: the runtime opens a lowering for the
-/// answer and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
-/// writes its answer. The runtime enters no root such a line does not name.
+/// result and over it a lifting of the arguments' list, and `R#entered` reads them, calls `R` and
+/// writes its result. The runtime enters no root such a line does not name.
 pub const ENTERED: &str = "entered ";
 
 impl Exports {
     /// The address of each helper the unit binds, in its order; a unit recording one this runtime
-    /// lacks, or has under another shape, is refused.
+    /// lacks, or has under another shape, is rejected.
     pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
         let said = |h: &HelperShape| {
             format!(
@@ -141,7 +141,7 @@ impl Exports {
             constants.push((name.to_string(), slot.parse().ok()?));
         }
         let modules = count(line(s, &mut at)?, "modules")?;
-        // A unit the last release wrote lists what its emitter refused, two lines each.
+        // A unit the last release wrote lists what its emitter rejected, two lines each.
         let mut past = at;
         if let Some(n) = line(s, &mut past).and_then(|l| count(l, "refused")) {
             for _ in 0..2 * n {

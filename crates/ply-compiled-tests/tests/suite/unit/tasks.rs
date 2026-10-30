@@ -103,7 +103,7 @@ unsafe fn breaks(ctx: *mut Ctx, _: usize) {
     unsafe { (*ctx).failed = 1 };
 }
 
-/// A body that did not answer leaves the context clear for the loop, and how it ended is put back
+/// A body that did not return leaves the context clear for the loop, and how it ended is put back
 /// where the loop asks.
 #[test]
 fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
@@ -327,7 +327,7 @@ const fn scalar(identity: u64, spelled: &'static [u8]) -> PlyType {
 static INTS: PlyType = scalar(7, b"Int");
 static TEXTS: PlyType = scalar(8, b"String");
 
-/// The word a native's answer is, each of one word.
+/// The word a native's result is, each of one word.
 fn word_of<T>(x: T) -> Word {
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<Word>());
     let w = unsafe { std::mem::transmute_copy(&x) };
@@ -424,7 +424,7 @@ const fn function(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> 
     }
 }
 
-/// Keeps the descriptor and the first word it was entered with, and answers 5 kept.
+/// Keeps the descriptor and the first word it was entered with, and returns 5 kept.
 unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let c = unsafe { &mut *ctx };
     let first = if c.entering_words == 0 {
@@ -438,7 +438,7 @@ unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -
     word_of(unsafe { tasks::rt_keep(ctx, handed(5), &INTS) })
 }
 
-/// Asks its loop code 3 with 4 and 5, and answers nothing once it hears back.
+/// Asks its loop code 3 with 4 and 5, and returns nothing once it hears back.
 unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let s = STACKS.with(Cell::get);
     unsafe { tasks::rt_task_yielded(ctx, handle(s), I64(3), I64(4), I64(5)) };
@@ -460,8 +460,8 @@ fn block(f: &'static Immortal) -> Block {
     <Block as Returned>::of(f as *const Immortal as Word)
 }
 
-/// Stacks for a region, a task handle in it, and `f` made a body of task 1 answering into it, the
-/// row's descriptor and its words `row` and `words`.
+/// Stacks for a scheduler, a task handle in it, and `f` made a body of task 1 returning into it,
+/// the effects' descriptor and its words `row` and `words`.
 fn started(ctx: &mut Ctx, f: &'static Immortal, row: &[Word], words: &mut [Word]) -> (Word, Word) {
     let c: *mut Ctx = ctx;
     let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1), I64(-1), I64(0), I64(0)) });

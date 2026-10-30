@@ -1,6 +1,6 @@
 //! The blocks compiled code and the runtime lay out: a one-word header, the count, then the payload,
 //! which only the code that made the block reads. A word is a scalar's bits or a block's address;
-//! what the runtime keeps of its own (a native object, a hold) it tells apart by its first
+//! what the runtime keeps of its own (a native object, a scoped value) it tells apart by its first
 //! payload word.
 
 use crate::blocks::{self, Blocks, Filling};
@@ -113,7 +113,7 @@ pub mod poison {
         static SITE: std::cell::Cell<*const i64> = const { std::cell::Cell::new(std::ptr::null()) };
     }
 
-    /// Points poison reports at `site` until the matching swap back, answering what it replaced.
+    /// Points poison reports at `site` until the matching swap back, returning what it replaced.
     pub fn swap(site: *const i64) -> *const i64 {
         SITE.with(|s| s.replace(site))
     }
@@ -162,7 +162,7 @@ pub unsafe fn set_word(o: *mut Obj, i: usize, w: Word) {
     unsafe { *words(o).add(i) = w }
 }
 
-/// Where a function value's block, and a hold, which is laid out as one no call enters, keep the
+/// Where a function value's block, and a scoped value, laid out as one no call enters, keep the
 /// word that says what they are, and their captures after it.
 pub const CLOSURE_CODE: usize = 0;
 pub const CLOSURE_CAPTURES: usize = 1;
@@ -179,7 +179,7 @@ static NATIVE_MARK: u8 = 0;
 /// of, boxed.
 const NATIVE_BYTES: usize = 8 * NATIVE_HELD + std::mem::size_of::<Box<dyn Native>>();
 
-/// What a runtime object a native makes holds: a word in a scheduler's handle, a region's stacks.
+/// What a runtime object a native made holds: a word in a scheduler's handle, a scheduler's stacks.
 /// Its Rust memory goes with the object; what it holds of emitted code's it lets go of as its last
 /// holder lets it go, and at the entry's end the entry's memory goes whole.
 pub trait Native: std::any::Any {
@@ -211,7 +211,7 @@ pub fn is_native(w: Word) -> bool {
 /// What the native object `w` holds, where it is one holding a `T`.
 ///
 /// # Safety
-/// `w` is live, and nothing else reads what it holds while the answer is held.
+/// `w` is live, and nothing else reads what it holds while the result is held.
 pub unsafe fn native_of<'a, T: Native>(w: Word) -> Option<&'a mut T> {
     if !is_native(w) {
         return None;
@@ -382,8 +382,8 @@ unsafe fn sized_as(o: *mut Obj, heap: *mut Heap, object: usize) {
 }
 
 /// Gives back a runtime handle whose last holder was emitted code, with what the runtime keeps for
-/// it, and without a walk: a native object lets go of what it holds and is dropped, and a hold's
-/// words are left unread, emitted code having let go of what it held.
+/// it, and without a walk: a native object lets go of what it holds and is dropped, and a
+/// scoped value's words are left unread, emitted code having let go of what it held.
 /// `ctx`, which a native object lets go of what it holds through, is null only for another.
 pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap, ctx: *mut crate::rt::Ctx) {
     unsafe {
@@ -423,7 +423,7 @@ pub(crate) unsafe fn last_of_shared(o: *mut Obj) -> bool {
     last
 }
 
-/// One holder fewer of `w`, a native object or a hold; the last gives it back to the running entry's heap.
+/// One holder fewer of `w`, a native object or scoped value; the last gives it back to its heap.
 pub fn release_handle(w: Word) {
     unsafe { released(w, CURRENT.with(|c| c.get()), std::ptr::null_mut()) }
 }
@@ -506,7 +506,7 @@ impl Heap {
         self.alloc.count += other.alloc.count;
     }
 
-    /// `blocks` in place of the blocks this heap takes from, which it answers.
+    /// `blocks` in place of the blocks this heap takes from, which it returns.
     pub(crate) fn swap_blocks(&mut self, blocks: Blocks) -> Blocks {
         let was = std::mem::replace(&mut self.blocks, blocks);
         self.alloc.blocks = self.blocks.filling();
@@ -621,7 +621,7 @@ impl Heap {
         o as Word
     }
 
-    /// Gives the entry's memory back; the answer is already copied out.
+    /// Gives the entry's memory back; the result is already copied out.
     pub fn end(&mut self) {
         if self.persistent {
             return;

@@ -3,7 +3,7 @@
 use crate::{Diagnostic, Span, codes};
 
 /// What may not cross a boundary: a continuation, which no type records as one, and a task or a
-/// channel, which only the region that made it can hold.
+/// channel, which only the scheduler that made it can hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
     Continuation,
@@ -34,7 +34,7 @@ impl Handle {
         }
     }
 
-    /// Why no type refused it before the boundary did.
+    /// Why no type rejected it before the boundary did.
     fn unseen(self) -> &'static str {
         match self {
             Handle::Continuation => {
@@ -48,7 +48,7 @@ impl Handle {
         }
     }
 
-    /// What the program does instead, at an entry's answer.
+    /// What the program does instead, at an entry's result.
     fn instead(self) -> &'static str {
         match self {
             Handle::Continuation => {
@@ -114,7 +114,7 @@ impl Boundary<'_> {
     }
 }
 
-/// `escapee` refused at `boundary`.
+/// `escapee` rejected at `boundary`.
 #[cold]
 #[inline(never)]
 pub fn rejected(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {

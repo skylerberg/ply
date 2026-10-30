@@ -90,7 +90,7 @@ impl Writer {
     }
 }
 
-/// Bytes being read, each read refusing what no writer of the format writes.
+/// Bytes being read, each read rejecting what no writer of the format writes.
 pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -101,7 +101,7 @@ impl<'a> Reader<'a> {
         Reader { bytes, at: 0 }
     }
 
-    /// Refuses bytes left over.
+    /// Rejects bytes left over.
     pub fn end(&self) -> Result<(), String> {
         if self.at == self.bytes.len() {
             Ok(())

@@ -1,7 +1,7 @@
 //! `std.fs`'s natives: each operation on a path under the root its label names, or on a file a
 //! run holds open there, a job of the run's on the filing pool, and confined to its root there.
-//! Each answers what `ply_host::fs` writes of it. A read is no function of its arguments: asking
-//! twice may answer otherwise.
+//! Each returns what `ply_host::fs` writes of it. A read is no function of its arguments: asking
+//! twice may return otherwise.
 
 use super::{Nondeterministic, asked, from_host, handed, text_at};
 use crate::c::{MachineNative, machine_native};
@@ -441,7 +441,7 @@ pub unsafe extern "C" fn rt_fs_write_secret(
 }
 
 /// The ticket of `fs.read_secret`: the secret between the bytes at `bp` and those at `ap`, in the
-/// encoding named at `ep`, kept by the run under the number answered, found.
+/// encoding named at `ep`, kept by the run under the number returned, found.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_fs_read_secret(
     ctx: *mut Ctx,

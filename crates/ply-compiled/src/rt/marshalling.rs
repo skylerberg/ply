@@ -1,10 +1,10 @@
-//! Crossings: a value emitted code lays out written as PLV1 bytes the runtime reads (a lowering),
+//! Marshalling: a value emitted code lays out written as PLV1 bytes for the runtime (a lowering),
 //! or bytes the runtime wrote read into one (a lifting), by emitted code calling the natives here a
 //! part at a time. What the bytes cannot hold a lowering writes as a handle, which nothing reads
-//! back. Crossings stack in the context, so one begun inside another works on a frame of its own
+//! back. Marshallings stack in the context, so one begun inside another works on a frame of its own
 //! and leaves the outer as it found it.
 //!
-//! A native that answers bytes leaves them in the context's taken bytes and answers their count;
+//! A native that returns bytes leaves them in the context's taken bytes and returns their count;
 //! emitted code makes room for them and copies them out with [`rt_taken`] before it calls another.
 
 use super::*;
@@ -13,7 +13,7 @@ use crate::native::{Addr, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 use ply_core::{Escapee, escape};
 
-/// One crossing under way.
+/// One marshalling under way.
 pub(crate) enum Marshalling {
     Lowering(Lowering),
     Lifting(Lifting),
@@ -30,10 +30,10 @@ pub(crate) struct Lowering {
     /// Whether a function the program wrote was written, which no reader outside its run can hold.
     functions: bool,
     /// Whether a function holding what may not leave its run was written, which the boundary
-    /// refuses as the continuation it holds.
+    /// rejects as the continuation it holds.
     resumes: bool,
-    /// Whether this is an entry's answer, and the first handle of its run written into it, which
-    /// the boundary refuses.
+    /// Whether this is an entry's result, and the first handle of its run written into it, which
+    /// the boundary rejects.
     results_entry: bool,
     escaping: Option<escape::Handle>,
     /// Whether this is a value a diagnostic shows, which keeps nothing beside its bytes: a runtime
@@ -109,8 +109,8 @@ impl Lifting {
     }
 }
 
-/// Why a crossing failed, which is Ply's defect: the bytes and the type disagree, or emitted code
-/// called a native outside the crossing it belongs to.
+/// Why marshalling failed, which is Ply's defect: the bytes and the type disagree, or emitted code
+/// called a native outside the marshalling it belongs to.
 #[cold]
 #[inline(never)]
 pub(crate) fn err_marshalling(reason: &str) -> Diagnostic {
@@ -133,7 +133,7 @@ impl Ctx {
         }
     }
 
-    /// Whether the innermost crossing is a lowering of a value a diagnostic shows.
+    /// Whether the innermost marshalling is a lowering of a value a diagnostic shows.
     fn showing(&self) -> bool {
         matches!(self.marshallings.last(), Some(Marshalling::Lowering(l)) if l.shown)
     }
@@ -166,19 +166,19 @@ impl Ctx {
         }
     }
 
-    /// The crossing's bytes compiled code copies out, held until it does.
+    /// The marshalling's bytes compiled code copies out, held until it does.
     pub(crate) fn give(&mut self, bytes: Vec<u8>) -> I64 {
         self.taken = bytes;
         I64(self.taken.len() as i64)
     }
 
-    /// The bytes a machine-word native answers, held until compiled code copies them out.
+    /// The bytes a machine-word native returns, held until compiled code copies them out.
     pub(crate) fn given(&mut self, bytes: Vec<u8>) -> TakenBytes {
         TakenBytes(self.give(bytes).0)
     }
 }
 
-/// The `n` bytes compiled code lends at `p`.
+/// The `n` bytes compiled code passes borrowed at `p`.
 ///
 /// # Safety
 /// `p` holds `n` bytes, or `n` is 0.
@@ -295,8 +295,8 @@ pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
     unsafe { &mut *ctx }.write(|l| l.w.name(name));
 }
 
-/// A runtime object, written as a handle: one of the run in an entry's answer is noted for the
-/// boundary to refuse, and in a value a diagnostic shows, the handle says what the object is.
+/// A runtime object, written as a handle: one of the run in an entry's result is noted for the
+/// boundary to reject, and in a value a diagnostic shows, the handle says what the object is.
 pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     let c = unsafe { &mut *ctx };
     let w = h.word();
@@ -319,7 +319,7 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     c.write(Lowering::handle);
 }
 
-/// A value the runtime keeps rather than reads, with its type, which compiled code lends: what is
+/// A value the runtime keeps rather than reads, with its type, borrowed from compiled code: what is
 /// in the position of an operation's own type parameter, written as a handle; in a value a
 /// diagnostic shows, written in place through its type.
 pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const PlyType) {
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const Ply
     unsafe { &mut *ctx }.write(Lowering::handle);
 }
 
-/// A function the program wrote, `f`, which compiled code lends: named by the `len` bytes at
+/// A function the program wrote, `f`, borrowed from compiled code: named by the `len` bytes at
 /// `name`, or anonymous where `len` is 0; or, an anonymous one holding what may not leave its
 /// thread, as a continuation's closure does, one no run but its own can resume.
 pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I64) {
@@ -352,7 +352,7 @@ pub unsafe extern "C" fn rt_out_fun(ctx: *mut Ctx, f: Handed, name: Addr, len: I
     });
 }
 
-/// Asked before a string, bytes, list, array or map, `w` its word, which is lent: 1 where the
+/// Asked before a string, bytes, list, array or map, `w` its word, which is borrowed: 1 where the
 /// lowering shares values and wrote `w` before, which it has now written again, else 0, and the
 /// caller writes the value.
 pub unsafe extern "C" fn rt_out_again(ctx: *mut Ctx, w: Handed) -> I64 {
@@ -407,7 +407,7 @@ pub unsafe extern "C" fn rt_in_float(ctx: *mut Ctx) -> F64 {
 }
 
 /// A `Decimal`'s low word, the first eight bytes of `rust_decimal`'s serialization read
-/// little-endian; [`rt_in_high`] answers the other eight.
+/// little-endian; [`rt_in_high`] returns the other eight.
 pub unsafe extern "C" fn rt_in_decimal(ctx: *mut Ctx) -> I64 {
     I64(unsafe { &mut *ctx }.read(|l| {
         l.r.expect(tag::DECIMAL)?;
@@ -417,7 +417,7 @@ pub unsafe extern "C" fn rt_in_decimal(ctx: *mut Ctx) -> I64 {
 }
 
 /// A fixed width, which must be the one at `width` among PLV1's: its low word, its bits sign- or
-/// zero-extended as the width's sign says; [`rt_in_high`] answers the word above it.
+/// zero-extended as the width's sign says; [`rt_in_high`] returns the word above it.
 pub unsafe extern "C" fn rt_in_fixed(ctx: *mut Ctx, width: I64) -> I64 {
     I64(unsafe { &mut *ctx }.read(|l| {
         l.r.expect(tag::FIXED)?;
@@ -526,7 +526,7 @@ pub unsafe extern "C" fn rt_never_shown(ctx: *mut Ctx) {
     ));
 }
 
-/// Begins a lowering of a value a diagnostic shows inside whatever crossing is under way, which
+/// Begins a lowering of a value a diagnostic shows inside whatever marshalling is under way, which
 /// [`rt_lower_close`] ends: nothing is held beside its bytes.
 pub unsafe extern "C" fn rt_shown_open(ctx: *mut Ctx) {
     unsafe { &mut *ctx }
@@ -579,7 +579,7 @@ pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
 
 impl Ctx {
     /// Begins a lifting of `bytes`; one that does not open fails the context and lifts nothing, so
-    /// the crossings still nest.
+    /// the marshallings still nest.
     pub fn lift_from(&mut self, bytes: Vec<u8>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
@@ -660,7 +660,7 @@ fn lifted_from(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
 }
 
 impl Ctx {
-    /// Opens what an entry through `R#entered` runs between: a lowering for its answer, and over it
+    /// Opens what an entry through `R#entered` runs between: a lowering for its result, and over it
     /// a lifting of `bytes`, the arguments' list.
     pub(crate) fn open_entry(&mut self, bytes: Vec<u8>) {
         self.marshallings.push(Marshalling::Lowering(Lowering {
@@ -671,20 +671,20 @@ impl Ctx {
     }
 }
 
-/// What an entry's `R#entered` wrote of its root's answer, kept as the bytes it wrote.
+/// What an entry's `R#entered` wrote of its root's result, kept as the bytes it wrote.
 pub(crate) enum EntryBytes {
-    /// The answer's PLV1, untouched.
+    /// The result's PLV1, untouched.
     Bytes(Vec<u8>),
-    /// The answer holds what the bytes cannot, which only its own run can hold.
+    /// The result holds what the bytes cannot, which only its own run can hold.
     Holding,
-    /// The answer holds a function the program wrote, which only its own run can hold.
+    /// The result holds a function the program wrote, which only its own run can hold.
     Function,
-    /// The answer holds a continuation or a handle of its run, the first written, which the
-    /// boundary refuses.
+    /// The result holds a continuation or a handle of its run, the first written, which the
+    /// boundary rejects.
     Escaping(Escapee),
 }
 
-/// Ends the lowering [`Ctx::open_entry`] opened: the answer kept as the bytes the entry wrote
+/// Ends the lowering [`Ctx::open_entry`] opened: the result kept as the bytes the entry wrote
 /// where they hold all of it.
 pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
     let l = entry_lowering(ctx)?;
@@ -724,7 +724,7 @@ pub fn continuation_in(bytes: &[u8]) -> Result<Option<Vec<String>>, String> {
     Ok(Some(route))
 }
 
-/// Reads one value, answering whether it reaches a continuation, with the way to it in `route`,
+/// Reads one value, returning whether it reaches a continuation, with the way to it in `route`,
 /// innermost first.
 fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String> {
     let t = r.byte()?;
@@ -816,8 +816,8 @@ fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String
     Ok(false)
 }
 
-/// Ends the lowering [`Ctx::open_entry`] opened and answers it; an error where the entry ended that
-/// lowering or left another crossing open.
+/// Ends the lowering [`Ctx::open_entry`] opened and returns it; an error where the entry ended that
+/// lowering or left another marshalling open.
 fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
     let c = unsafe { &mut *ctx };
     let open = c.marshallings.len();

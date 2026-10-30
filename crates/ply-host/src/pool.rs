@@ -1,6 +1,6 @@
 //! Where a host operation goes when it has to wait. A [`Pool`] runs it on a thread, and the [`Run`]
-//! that submitted it holds it until it takes the answer: an operation is its run's alone, so one
-//! run's answers, kept or abandoned, never wake another's wait. Every pool mints from one count of
+//! that submitted it holds it until it takes the result: an operation is its run's alone, so one
+//! run's results, kept or abandoned, never wake another's wait. Every pool mints from one count of
 //! tokens.
 
 use crate::jobs::Failure;
@@ -19,12 +19,12 @@ pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 /// mint the same one, and none mints 0, which a zeroed `Pending` carries.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// What a job answered: its bytes, or why it answered none.
+/// What a job returned: its bytes, or why it returned none.
 pub type JobOutput = Result<Vec<u8>, Failure>;
 
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
-/// Rung whenever an answer is filed with a run it is handed to, and by a stop, so one wait covers
+/// Rung whenever a result is recorded with a run it is handed to, and by a stop, so one wait covers
 /// every pool and the stop at once: separate condition variables cannot be waited on together.
 #[derive(Default)]
 pub struct Bell {
@@ -62,8 +62,8 @@ impl Bell {
 }
 
 /// One run's operations, of whichever pool runs each: an operation is the run's from its
-/// submission until the run takes its answer. The run holds this, and each operation's job holds it
-/// weakly, so the answer of a job that finishes after its run has ended is dropped, and what an
+/// submission until the run takes its result. The run holds this, and each operation's job holds it
+/// weakly, so the result of a job that finishes after its run has ended is dropped, and what an
 /// ended run left goes with it. What its jobs read for a `Secret` is kept here too, until the run
 /// takes it or its entry point ends, and so is the record a test's reads are entered into.
 pub struct Run {
@@ -76,7 +76,7 @@ pub struct Run {
 /// A secret's bytes as a job read them, wiped when they are dropped.
 pub type Kept = Zeroizing<Vec<u8>>;
 
-/// What was read for a `Secret` and not yet taken, each under the number its job answered, wiped
+/// What was read for a `Secret` and not yet taken, each under the number its job returned, wiped
 /// as each is dropped.
 #[derive(Default)]
 struct Secrets {
@@ -84,7 +84,7 @@ struct Secrets {
     kept: HashMap<i64, Kept>,
 }
 
-/// An operation a run holds, until its answer is taken.
+/// An operation a run holds, until its result is taken.
 struct Held {
     span: Span,
     what: &'static str,
@@ -94,7 +94,7 @@ struct Held {
 }
 
 impl Run {
-    /// A run whose answers ring `bell` as they are filed.
+    /// A run whose results ring `bell` as they are recorded.
     pub fn new(bell: Arc<Bell>) -> Arc<Run> {
         Arc::new(Run {
             held: Mutex::new(HashMap::new()),
@@ -118,7 +118,7 @@ impl Run {
         lock(&self.recorder).clone()
     }
 
-    /// Keeps `secret` for this run under a number nothing else of it is kept under, answered.
+    /// Keeps `secret` for this run under a number nothing else of it is kept under, returned.
     pub fn keep_secret(&self, secret: Kept) -> i64 {
         let mut secrets = lock(&self.secrets);
         secrets.last += 1;
@@ -154,8 +154,8 @@ impl Run {
         lock(&self.held).remove(&token);
     }
 
-    /// `job` run on this thread, its answer held as an operation's until the run takes it: for a
-    /// job no other task of the run could go on beside. Its ticket is answered as it is handed.
+    /// `job` run on this thread, its result held as an operation's until the run takes it: for a
+    /// job no other task of the run could go on beside. Its ticket is resolved as it is handed.
     pub fn done_here(
         &self,
         span: Span,
@@ -169,7 +169,7 @@ impl Run {
         Pending { token, label }
     }
 
-    /// Files a job's answer and rings the bell, after the answer is in place, so a wait that
+    /// Records a job's result and rings the bell, after the result is in place, so a wait that
     /// woke finds it.
     fn file(&self, token: u64, result: JobOutput) {
         if let Some(held) = lock(&self.held).get_mut(&token) {
@@ -178,7 +178,7 @@ impl Run {
         self.bell.ring();
     }
 
-    /// Has `answered` name `pending` once it is answered; refuses a token this run did not submit.
+    /// Has `returned` name `pending` once it has returned; rejects a token this run did not submit.
     pub fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
         match lock(&self.held).get_mut(&pending.token) {
             Some(held) => {
@@ -189,14 +189,14 @@ impl Run {
         }
     }
 
-    /// Whether a watched operation has been answered and not collected.
+    /// Whether a watched operation has returned and not collected.
     pub fn ready(&self) -> bool {
         lock(&self.held)
             .values()
             .any(|held| held.watched && held.result.is_some())
     }
 
-    /// The watched operations answered and not yet taken, ascending, their answers left for `taken`.
+    /// The watched operations returned, not yet taken, ascending, their results left for `taken`.
     pub fn returned(&self) -> Vec<u64> {
         let mut tokens: Vec<u64> = (lock(&self.held).iter())
             .filter(|(_, h)| h.watched && h.result.is_some())
@@ -206,7 +206,7 @@ impl Run {
         tokens
     }
 
-    /// The bytes a native's job answered `pending` where it has answered, which are then taken.
+    /// The bytes a native's job returned for `pending` where it has returned, which are then taken.
     pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
@@ -227,7 +227,7 @@ impl Run {
         }
     }
 
-    /// The bytes a native's job answered `pending` once it has answered, waiting for at most
+    /// The bytes a native's job returned for `pending` once it has returned, waiting for at most
     /// `bound` where one is given: `None` where the bound passed first.
     pub fn block_on(
         &self,
@@ -253,7 +253,7 @@ impl Run {
         }
     }
 
-    /// Waits until a watched operation is answered, `stop` says to stop waiting, or `bound`
+    /// Waits until a watched operation has returned, `stop` says to stop waiting, or `bound`
     /// passes; `false`, at once, where no bound is given and the run watches nothing, so nothing
     /// would end the wait.
     pub fn park(&self, bound: Option<Duration>, stop: &dyn Fn() -> bool) -> bool {
@@ -282,7 +282,7 @@ impl Run {
     }
 }
 
-/// The bytes a native's job answered, which is all one answers.
+/// The bytes a native's job returned, which is all one returns.
 fn bytes_of(span: Span, what: &str, result: JobOutput) -> Result<Vec<u8>, Diagnostic> {
     result.map_err(|failure| match failure {
         Failure::Said(message) => failed(span, what, &message),
@@ -303,7 +303,7 @@ struct Shared {
     queue: Option<Queue>,
 }
 
-/// A job and the run it answers.
+/// A job and the run it returns to.
 struct Entry {
     token: u64,
     run: Weak<Run>,
@@ -355,7 +355,7 @@ impl Pool {
 
     /// A pool whose operations wait their turn for one of `threads` threads, however many are
     /// submitted: for work that fills a core, where a thread each would finish none sooner and a
-    /// bound on how many wait would refuse a burst. A thread is started when an operation first
+    /// bound on how many wait would reject a burst. A thread is started when an operation first
     /// needs one, and ends when the pool is dropped.
     pub fn queued(threads: usize) -> Pool {
         Pool::over(Some(Queue {
@@ -374,7 +374,7 @@ impl Pool {
         }
     }
 
-    /// `job` run for `run`, which holds the operation as `what` until it takes the answer.
+    /// `job` run for `run`, which holds the operation as `what` until it takes the result.
     ///
     /// # Errors
     /// No thread could be had for it: the pool's bound was reached, or one could not start.
@@ -453,13 +453,13 @@ impl Pool {
     }
 }
 
-/// What `job` answered: one that panics is answered as one that failed.
+/// What `job` returned: one that panics counts as one that failed.
 fn outcome_of(job: Job) -> JobOutput {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
         .unwrap_or_else(|_| Err(Failure::Said("the host panicked doing it".to_string())))
 }
 
-/// Runs a job, gives back its thread with `freed`, and files its answer with its run where the run
+/// Runs a job, gives back its thread with `freed`, and records its result in its run where the run
 /// has not ended: what every pool's threads do with a job.
 fn finish(entry: Entry, freed: impl FnOnce()) {
     let outcome = outcome_of(entry.job);

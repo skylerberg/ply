@@ -1,6 +1,6 @@
 //! The runtime as compiled code meets it, with no C compiled: a context over a unit of nothing, and
 //! each helper at the address a unit binds, called at the C type every helper has, a word for each
-//! parameter and for its answer.
+//! parameter and for its result.
 
 use ply_compiled::c::helpers;
 use ply_compiled::heap::Heap;

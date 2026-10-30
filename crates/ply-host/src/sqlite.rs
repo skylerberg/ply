@@ -5,7 +5,7 @@
 //! statement waiting on another connection's lock holds no scheduler, and a fold's statement
 //! stays open between its pages without leaving that thread.
 //!
-//! What the natives hand and answer is flat. A value is its kind's byte, 0 for null, 1 an integer,
+//! What the natives hand and return is flat. A value is its kind's byte, 0 for null, 1 an integer,
 //! 2 a float and 3 text, each number in eight bytes, the most significant first, and 4 bytes,
 //! then its bytes; a statement's values are parts. Limits are five integers. A failure is parts of
 //! its kind, its name and its detail. A reply is parts: the columns, the rows, each parts of its
@@ -68,8 +68,8 @@ struct Handle {
     commands: Sender<Command>,
 }
 
-/// The connections a run holds open, each under the number `sqlite.open` answered. A number is
-/// never answered twice, so one that was closed names nothing afterwards.
+/// The connections a run holds open, each under the number `sqlite.open` returned. A number is
+/// never returned twice, so one that was closed names nothing afterwards.
 #[derive(Default)]
 struct Connections {
     last: i64,
@@ -359,7 +359,7 @@ fn placed(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagno
 }
 
 /// The connection `id` names under `root`. One another root opened is not open under this one,
-/// and answers as a number that names nothing does.
+/// and returns as a number that names nothing does.
 fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option<Sender<Command>> {
     lock(connections)
         .open
@@ -368,7 +368,7 @@ fn commands_of(connections: &Mutex<Connections>, root: &Path, id: i64) -> Option
         .map(|handle| handle.commands.clone())
 }
 
-/// What a connection's thread answers `ask`; `None` when the thread is gone.
+/// What a connection's thread returns for `ask`; `None` when the thread is gone.
 fn asked(commands: &Sender<Command>, ask: Ask) -> Option<Response> {
     let (result, returned) = channel();
     commands.send(Command { ask, result }).ok()?;

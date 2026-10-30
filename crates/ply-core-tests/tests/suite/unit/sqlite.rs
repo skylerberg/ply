@@ -498,7 +498,7 @@ fn each_limit_refuses_what_passes_it() {
         Some(("steps", String::new()))
     );
     assert_eq!(first(&done(&mut engine, "SELECT 7")), Scalar::Int(7));
-    // A write refused for what it answered leaves nothing behind.
+    // A write rejected for what it returned leaves nothing behind.
     assert_eq!(
         limited(
             &mut engine,
@@ -615,7 +615,7 @@ fn a_statement_is_read_a_page_at_a_time() {
     );
 }
 
-/// One statement over `image` as the twin runs it, every table `STRICT`.
+/// One statement over `image` as the fake runs it, every table `STRICT`.
 fn over(image: &[u8], sql: &str, params: &[Scalar], reads_only: bool) -> (Reply, Option<Vec<u8>>) {
     ply_core::sqlite::run_over(image, sql, params, roomy(), reads_only, true)
 }

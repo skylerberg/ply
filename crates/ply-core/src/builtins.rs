@@ -153,7 +153,7 @@ pub fn assert_failure(message: Option<&str>, span: Span) -> Diagnostic {
     }
 }
 
-/// A hold reached after its region let it go, which only a continuation captured inside the region
+/// A scoped value used after its scope let it go, which only a continuation captured in the scope
 /// and resumed after the release can do.
 #[cold]
 pub fn scoped_released(span: Span, doing: &str) -> Diagnostic {

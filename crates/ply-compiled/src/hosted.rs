@@ -1,15 +1,15 @@
 //! The natives the host handlers of the standard library's host effects call (`host for`): each asks
-//! the machine the program runs on and answers machine data, integers, bytes or a secret, which the
-//! effect's module reads into its own types. Each that asks the host refuses where a run may not
-//! reach it, inside a `simulate` region or in a test the search re-runs, as a host operation does.
+//! the machine the program runs on and returns machine data, integers, bytes or a secret, which the
+//! effect's module reads into its own types. Each that asks the host fails where a run may not
+//! reach it, inside a simulation or in a test the search re-runs, as a host operation does.
 //!
-//! A native that would block the program's thread answers a ticket, which `job_wait` reads the
-//! job's bytes by. In a production region the job runs on the process's pools while the region's
+//! A native that would block the program's thread returns a ticket, which `job_wait` reads the
+//! job's bytes by. In a production scheduler the job runs on the process's pools as the scheduler's
 //! other tasks run. Outside one, where no other task could run, a job that reads files or computes
 //! runs on the program's thread; one that waits on what is outside the process still runs on a
 //! pool, so a shutdown's drain can give up waiting on it.
 //!
-//! A native answering structured data writes it in the flat forms of `ply_host::native`.
+//! A native returning structured data writes it in the flat forms of `ply_host::native`.
 
 mod dns;
 mod env;
@@ -125,9 +125,9 @@ pub fn natives() -> Vec<MachineNative> {
 
 impl Ctx {
     /// Whether the native `native` may ask the host now. Where it may, the run has asked it as a
-    /// host operation is asked: a `Nondeterministic` answer means its pass answers only for the
+    /// host operation is asked: a `Nondeterministic` response means its pass holds only for the
     /// binding it ran under. Where it may not, the run fails as a host operation's would, and the
-    /// native answers nothing it reads.
+    /// native returns nothing it reads.
     fn reaches_host(&mut self, native: &'static str, determinism: Determinism) -> bool {
         let operation = format!("the native `{native}`");
         let span = self.site();
@@ -156,7 +156,7 @@ impl Ctx {
         self.refusing(native, what, work, move || job().map_err(Failure::Said))
     }
 
-    /// The ticket of `job` as [`Ctx::submitted`] hands one, where the job may refuse with a
+    /// The ticket of `job` as [`Ctx::submitted`] hands one, where the job may fail with a
     /// diagnostic of its own.
     fn refusing(
         &mut self,
@@ -203,8 +203,8 @@ impl Ctx {
     }
 }
 
-/// What `answer` answers, where the native `native` may ask the host for an answer of
-/// `determinism`; `refused` where it may not.
+/// What `result` returns, where the native `native` may ask the host for a response of
+/// `determinism`; `rejected` where it may not.
 fn asked<R>(
     ctx: *mut Ctx,
     native: &'static str,
@@ -220,8 +220,8 @@ fn asked<R>(
     }
 }
 
-/// What `answer` answers where the run is lent `family` and the native `native` may ask the host
-/// for an answer of `determinism`; `refused`, with the run failed, where it is not lent the family.
+/// What `result` returns where the run is granted `family` and the native `native` may ask the host
+/// for a response of `determinism`; `rejected`, with the run failed, where it lacks the family.
 fn granted<R>(
     ctx: *mut Ctx,
     family: &'static str,
@@ -246,7 +246,7 @@ fn granted<R>(
     asked(ctx, native, determinism, rejected, result)
 }
 
-/// What `read` takes of the facilities the run's host lends; `None`, with the run failed, for a
+/// What `read` takes of the facilities the run's host grants; `None`, with the run failed, for a
 /// runtime no host made.
 fn from_host<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
     let runtime = c.host_runtime();
@@ -274,7 +274,7 @@ fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T
     read
 }
 
-/// `answer`'s bytes as taken bytes; none, with the run failed, where it is a diagnostic.
+/// `result`'s bytes as taken bytes; none, with the run failed, where it is a diagnostic.
 fn given(c: &mut Ctx, result: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
     match result {
         Ok(bytes) => c.given(bytes),
@@ -302,12 +302,12 @@ fn waited(
     }
 }
 
-/// The text a native was lent at `p`; `None`, with the run failed, where it is not UTF-8.
+/// The text a native borrowed at `p`; `None`, with the run failed, where it is not UTF-8.
 fn text_at(c: &mut Ctx, p: Addr, n: I64) -> Option<String> {
     c.text(unsafe { borrowed(p, n) }).map(str::to_string)
 }
 
-/// The texts lent as parts at `p`; `None`, with the run failed, where they are not.
+/// The texts borrowed as parts at `p`; `None`, with the run failed, where they are not.
 fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
     let read = parts_of(unsafe { borrowed(p, n) }).and_then(|texts| {
         texts
@@ -331,8 +331,8 @@ fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
     }
 }
 
-/// The bytes the job of `ticket` answered, as taken bytes: inside a production region the running
-/// task waits for them while the region's other tasks run, and outside one the thread waits. A job
+/// The bytes the job of `ticket` returned, as taken bytes: in a production scheduler the running
+/// task waits for them as the scheduler's other tasks run, and outside one the thread waits. A job
 /// that failed fails the run, naming what asked for it.
 pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
@@ -433,7 +433,7 @@ pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
 
 /// The run's value of `key`: a plain one, or, where `secret`, the one only `config.secret` reads.
 /// `None` where the run was granted no such key. The read is entered into the record of the run
-/// asking, where it is observed: a plain value as what it answered, a secret as one read.
+/// asking, where it is observed: a plain value as what it returned, a secret as one read.
 fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
     let runtime = c.host_runtime();
     let value = ply_host::registry::facilities_of(&*runtime).and_then(|facilities| {

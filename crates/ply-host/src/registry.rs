@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 pub struct Host {
-    /// Rung as an answer is filed with any run of this host, and by a stop, so a park waits on
+    /// Rung as a result is recorded with any run of this host, and by a stop, so a park waits on
     /// every pool and the stop at once.
     bell: Arc<Bell>,
     /// The run's configuration, read once before this `Host` existed and immutable thereafter.
@@ -32,7 +32,7 @@ pub struct Host {
     /// The database connections open under `fs`'s roots.
     sqlite: Arc<sqlite::SqliteHost>,
     /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
-    /// region's sleeps are deadlines on.
+    /// scheduler's sleeps are deadlines on.
     time: Arc<time::TimeHost>,
     trace: Arc<trace::Trace>,
 }
@@ -156,14 +156,14 @@ pub fn unbound() -> RuntimeFactory {
     Arc::new(move || host.get_or_init(Host::new).runtime())
 }
 
-/// The facilities `runtime` lends the natives, where a host made it.
+/// The facilities `runtime` grants the natives, where a host made it.
 pub fn facilities_of(runtime: &dyn HostRuntime) -> Option<&Facilities> {
     runtime.facilities()?.downcast_ref()
 }
 
-/// The bytes a native's job answered `pending`, the thread waiting for them until the drain
+/// The bytes a native's job returned for `pending`, the thread waiting for them until the drain
 /// deadline says the run is out of time. A wait begun past the deadline ends the run however soon
-/// its job would answer, so a loop of quick waits still stops there.
+/// its job would return, so a loop of quick waits still stops there.
 ///
 /// # Errors
 /// The job failed, the drain ran out, or no host made `runtime`.
@@ -199,7 +199,7 @@ fn err_no_host() -> Diagnostic {
     .note("this is Ply's fault: report it with the program that produced it")
 }
 
-/// The runtime: one run's operations, and what it lends the natives.
+/// The runtime: one run's operations, and what it grants the natives.
 pub struct Facilities {
     run: Arc<Run>,
     /// The run's configuration, which `config`'s natives read.
@@ -248,7 +248,7 @@ impl Facilities {
         &self.sqlite
     }
 
-    /// The run's own process and the programs it may start, where it was lent either.
+    /// The run's own process and the programs it may start, where it was granted either.
     pub fn process(&self) -> Option<&Arc<process::ProcessHost>> {
         self.process.as_ref()
     }
@@ -328,7 +328,7 @@ impl HostRuntime for Facilities {
         }
         // The sink flushes before the run's own state is gone.
         self.trace.flush();
-        // `term.mode` serves every run, whatever process it was lent.
+        // `term.mode` serves every run, whatever process it was granted.
         crate::stdio::restore_terminal();
         // Last, since a buffer whose reader has gone ends the process here.
         if let Some(process) = &self.process {

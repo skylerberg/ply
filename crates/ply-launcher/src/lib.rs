@@ -80,7 +80,7 @@ pub fn install_own_pack() -> Result<(), String> {
     }
 }
 
-/// What the `ply` program is lent: every family; its roots, `cwd` at `root`, `shipped` at the
+/// What the `ply` program is granted: every family; its roots, `cwd` at `root`, `shipped` at the
 /// shipped modules and `abs` at the filesystem's root (the program is the tool, so a path that
 /// leaves the working directory is addressed under `abs`); its command line; the `git` on `PATH`
 /// for its `process.spawn[git]`, which fetches a git dependency, and is unbound where none can be
@@ -128,8 +128,8 @@ const DIGESTS: &str = "digests";
 
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
-/// The runtime's side of what kept answers are a function of beyond their own keys, as `name hex`
-/// lines: a query's answer is the evaluator's, and a pass or a claim's evidence the whole runtime's.
+/// The runtime's side of what cached results are a function of beyond their own keys, as `name hex`
+/// lines: a query's result is the evaluator's, and a pass or claim's evidence the whole runtime's.
 /// The program adds its own side to each, from the definitions it is told it has.
 pub fn stamps() -> String {
     let stamp = |parts: &[&str]| {
@@ -248,7 +248,7 @@ impl Launched {
     }
 }
 
-/// Enter the program on the command's own big-stack thread, lent every family.
+/// Enter the program on the command's own big-stack thread, granted every family.
 pub fn run(
     program: Program,
     root: &Path,
@@ -278,7 +278,7 @@ pub fn run(
                 Some(asked) => {
                     let (launched, counted, sites) =
                         crate::count::window_sampled(launch, asked.every());
-                    // The entry's answer stands: the run happened, and a count that could not
+                    // The entry's result stands: the run happened, and a count that could not
                     // be written is reported rather than replacing what the program did.
                     if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
                     {

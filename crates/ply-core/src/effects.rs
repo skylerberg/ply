@@ -1,4 +1,4 @@
-//! The effect model: the atoms a row is made of.
+//! The effect model: what a function's effects are made of.
 
 use crate::Symbol;
 use std::fmt;
@@ -7,7 +7,7 @@ use std::fmt;
 pub enum Mode {
     Read,
     Write,
-    /// An operation that does not come back; no mode atom stands for it.
+    /// An operation that does not come back; no effect of this mode stands for it.
     Raise,
 }
 
@@ -21,7 +21,7 @@ impl Mode {
     }
 }
 
-/// The resource an atom touches; the variant order is the atom order the compiler sorts rows by.
+/// The resource an effect touches; the variant order is the order the compiler sorts effects by.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Resource {
     Named(Symbol),
@@ -29,7 +29,7 @@ pub enum Resource {
     /// appears in its effects.
     Var(u32),
     Singleton,
-    /// Every label: what an atom written `op[*]` stands for, so a row can say which atoms it
+    /// Every label: what an effect written `op[*]` stands for, so a list can say which effects it
     /// consumes without naming a label.
     Every,
 }
@@ -59,13 +59,13 @@ pub fn label_var_name(v: u32) -> String {
     }
 }
 
-/// Ordering is structural so rows are canonical, which content addressing depends on.
+/// Ordering is structural so effects are canonical, which content addressing depends on.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct EffectAtom {
     pub effect: Symbol,
     pub resource: Resource,
     pub mode: Mode,
-    /// `Some` names one operation, which the mode atom of the same effect and resource covers.
+    /// `Some` names one operation, which the effect of the same name, resource and mode covers.
     pub op: Option<Symbol>,
 }
 

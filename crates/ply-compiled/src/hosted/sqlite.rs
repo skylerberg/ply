@@ -1,6 +1,6 @@
 //! `std.sqlite`'s natives: the run's databases, each under the root its label names, every
-//! operation a ticket of a job on the process's waiting pool, and the twin's statement over an
-//! image, which reaches no host. What they are handed and answer is flat as `ply_host::sqlite`
+//! operation a ticket of a job on the process's waiting pool, and the fake's statement over an
+//! image, which reaches no host. What they are handed and return is flat as `ply_host::sqlite`
 //! reads and writes it.
 
 use super::{Nondeterministic, asked, from_host, handed, waited};
@@ -62,7 +62,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// One statement over the database the image at `image_at` holds, as the twin runs it: parts of
+/// One statement over the database the image at `image_at` holds, as the fake runs it: parts of
 /// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
 /// what it is handed, so it asks the host nothing.
 #[allow(clippy::too_many_arguments)]
@@ -210,7 +210,7 @@ pub unsafe extern "C" fn rt_sqlite_close(
     )
 }
 
-/// The ticket of a statement run on a connection: its reply. `reads_only` refuses one that could
+/// The ticket of a statement run on a connection: its reply. `reads_only` rejects one that could
 /// write, and `cursor` opens it to be fetched a page at a time.
 #[allow(clippy::too_many_arguments)]
 fn ran(

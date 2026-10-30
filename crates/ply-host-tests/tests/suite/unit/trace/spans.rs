@@ -116,7 +116,7 @@ fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
         diagnostic.notes.iter().any(|n| n.contains("task @1")),
         "the refusal must name the task that holds it: {diagnostic:?}"
     );
-    // And the span is still open, because refusing is not closing.
+    // And the span is still open, because rejecting is not closing.
     assert_eq!(spans.depth(first), 1);
 }
 

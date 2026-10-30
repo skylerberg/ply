@@ -18,8 +18,8 @@ pub const FAILED_CANCELLED: i64 = 7;
 /// left in it.
 pub const FAILED_TARGET: i64 = 9;
 
-/// A raise no clause answers in place, which `Ctx::pending` keeps for the emitted code that holds
-/// the word answering it: [`rt_pending_raised`] hands it over. One never handed over fails the
+/// A raise no clause handles in place, which `Ctx::pending` keeps for the emitted code that holds
+/// the word handling it: [`rt_pending_raised`] hands it over. One never handed over fails the
 /// entry with the diagnostic it keeps.
 pub const FAILED_PENDING: i64 = 10;
 

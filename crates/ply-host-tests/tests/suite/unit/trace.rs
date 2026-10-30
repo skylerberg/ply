@@ -172,7 +172,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
         "{rejected:?}"
     );
 
-    // Nothing was recorded for the refusal, and the span is still task 1's to close.
+    // Nothing was recorded for the rejection, and the span is still task 1's to close.
     assert_eq!(f.kinds(), [RecordKind::Enter]);
     f.exit_as(Some(TaskId(1)), "http", first, Outcome::Ok)
         .expect("task 1 closes its own span");

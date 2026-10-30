@@ -45,7 +45,7 @@ fn level_of(n: I64) -> Option<Level> {
     }
 }
 
-/// The run's trace, and who performs on this machine: the running task of a production region,
+/// The run's trace, and who performs on this machine: the running task of a production scheduler,
 /// or the machine itself outside one.
 fn traced(c: &mut Ctx) -> Option<(Arc<Trace>, Owner)> {
     let trace = from_host(c, |facilities| Arc::clone(facilities.tracing()))?;
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn rt_trace_record(
     });
 }
 
-/// Opens a span on the channel at `channel_at`, answering its id.
+/// Opens a span on the channel at `channel_at`, returning its id.
 pub unsafe extern "C" fn rt_trace_enter(
     ctx: *mut Ctx,
     channel_at: Addr,

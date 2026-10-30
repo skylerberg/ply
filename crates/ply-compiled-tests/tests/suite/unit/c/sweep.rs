@@ -304,7 +304,7 @@ fn a_stage_used_lately_outlives_one_written_later() {
     assert!(!root.path().join("written-late").exists());
 }
 
-/// A store of kept records is its segments and manifest together, written over many runs and read
+/// A store of cached records is its segments and manifest together, written over many runs and read
 /// by more: it goes whole, by when a run last used it, and never a segment of it alone.
 #[test]
 fn a_store_of_kept_records_goes_whole_by_its_last_use() {
@@ -356,8 +356,8 @@ fn a_front_being_written_and_a_file_beside_the_stages_are_never_swept() {
     assert!(root.path().join(STAMP).exists());
 }
 
-/// An answer `ply run` or `ply check` filed goes on its own, like an artifact's front, and never as
-/// one stage holding every answer: the least recently used go first, and the directory stays.
+/// A result `ply run` or `ply check` cached goes on its own, like an artifact's front, and never as
+/// one stage holding every result: the least recently used go first, and the directory stays.
 #[test]
 fn a_reused_answer_goes_on_its_own_least_recently_used_first() {
     let root = tempfile::tempdir().unwrap();
@@ -383,7 +383,7 @@ fn a_reused_answer_goes_on_its_own_least_recently_used_first() {
     );
 }
 
-/// An answer half written belongs to a run still writing it, and the directory is no stage to
+/// A cached result half written belongs to a run still writing it, and the directory is no stage to
 /// remove whole however far over budget its files are.
 #[test]
 fn a_reused_answer_being_written_is_never_swept() {

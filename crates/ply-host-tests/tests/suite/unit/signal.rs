@@ -14,7 +14,7 @@ fn listen(host: &TcpHost, port: u16) -> i64 {
         .expect("a loopback port")
 }
 
-/// What a listener's next `accept` answers once it does, its job waiting on a thread of its own as
+/// What a listener's next `accept` returns once it does, its job waiting on a thread of its own as
 /// a run's would.
 fn accepting(host: &TcpHost, listener: i64) -> mpsc::Receiver<i64> {
     let job = host

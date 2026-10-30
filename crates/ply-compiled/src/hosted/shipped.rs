@@ -1,4 +1,4 @@
-//! `compiler.unit`'s `shipped` natives, the family `shipped` a run is lent with `--allow shipped`:
+//! `compiler.unit`'s `shipped` natives, the family `shipped` that `--allow shipped` grants:
 //! what this binary ships, which `ply-privileged` holds and installs, a function of the binary
 //! alone, so each is asked as computing; and the units a load enters for its derivers.
 
@@ -18,7 +18,7 @@ pub trait Ships: Send + Sync {
     fn names(&self) -> Vec<String>;
     /// A shipped module's text, or the bytes of a data file one embeds, by its name.
     fn module(&self, name: &str) -> Option<&'static [u8]>;
-    /// The frames of `len` bytes from `offset` of the pack's answer file `path`, decompressed;
+    /// The frames of `len` bytes from `offset` of the pack's result file `path`, decompressed;
     /// a `len` of 0 reads to the end.
     fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>>;
     /// Each shipped file and its digest, as the launcher lays them out beside the modules.
@@ -81,7 +81,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// What `answer` answers of what the binary ships, where the run is lent `shipped`.
+/// What `result` returns of what the binary ships, where the run is granted `shipped`.
 fn shipping(
     ctx: *mut Ctx,
     native: &'static str,
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn rt_shipped_module(ctx: *mut Ctx, p: Addr, n: I64) -> Ta
     })
 }
 
-/// The frames of `len` bytes from `offset` of the answer file the path at `p` names, found;
+/// The frames of `len` bytes from `offset` of the result file the path at `p` names, found;
 /// neither is negative.
 pub unsafe extern "C" fn rt_shipped_answer(
     ctx: *mut Ctx,
@@ -192,9 +192,9 @@ pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
-/// What the root at `rp` of the unit compiled into the library at `lp` answers for the arguments,
+/// What the root at `rp` of the unit compiled into the library at `lp` returns for the arguments,
 /// the PLV1 list at `ap`, within `timeout_ms` of wall clock, found: none where it raised, ran out
-/// of time or answered nothing a run can hold.
+/// of time or returned nothing a run can hold.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_shipped_entered(
     ctx: *mut Ctx,
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn rt_shipped_entered(
     })
 }
 
-/// The unit compiled into `library`, opened the first time this process asks and kept after.
+/// The unit compiled into `library`, opened the first time this process asks and cached after.
 fn opened_unit(library: &Path) -> Result<Arc<Opened>, String> {
     type Units = Mutex<HashMap<PathBuf, Arc<Opened>>>;
     static UNITS: OnceLock<Units> = OnceLock::new();

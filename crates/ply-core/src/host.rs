@@ -1,5 +1,5 @@
-//! The host effect boundary: what a run is lent, how much of the host it asked, the runtime a
-//! machine waits on the host through, and the refusals of an operation that reaches it.
+//! The host effect boundary: what a run is granted, how much of the host it asked, the runtime a
+//! machine waits on the host through, and the rejections of an operation that reaches it.
 
 use crate::{Diagnostic, Span, Symbol, codes};
 use std::fmt;
@@ -52,7 +52,7 @@ impl fmt::Display for Pending {
 pub type RuntimeFactory = std::sync::Arc<dyn Fn() -> std::rc::Rc<dyn HostRuntime> + Send + Sync>;
 
 pub trait HostRuntime {
-    /// Waits until at least one ticket the run watches is answered.
+    /// Waits until at least one ticket the run watches is resolved.
     fn park(&self) -> Result<(), Diagnostic>;
 
     /// What the natives of the host handlers reach the machine through: the run's sockets, its
@@ -62,26 +62,26 @@ pub trait HostRuntime {
         None
     }
 
-    /// Nanoseconds the host's monotonic clock reads, which `clock.now` answers and the run's
-    /// region's sleeps are deadlines on; only the difference of two readings means anything.
+    /// Nanoseconds the host's monotonic clock reads, which `clock.now` returns and the run's
+    /// scheduler's sleeps are deadlines on; only the difference of two readings means anything.
     fn now(&self) -> Result<i64, Diagnostic> {
         Err(err_no_clock("read the clock"))
     }
 
-    /// Waits until a watched ticket is answered or the clock reads `deadline`, whichever is first.
+    /// Waits until a watched ticket is resolved or the clock reads `deadline`, whichever is first.
     fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
         let _ = deadline;
         Err(err_no_clock("wait on the clock"))
     }
 
-    /// Called on every exit path from an entry point, before the machine resets; answers what its
+    /// Called on every exit path from an entry point, before the machine resets; returns what its
     /// ending warns of.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
         let _ = machine;
         Vec::new()
     }
 
-    /// Called when the run's region lets go of `task`, whose id nothing will name again.
+    /// Called when the run's scheduler lets go of `task`, whose id nothing will name again.
     fn end_task(&self, machine: MachineId, task: crate::sim::TaskId) {
         let _ = (machine, task);
     }
@@ -99,7 +99,7 @@ pub trait HostRuntime {
         ShutdownReport::default()
     }
 
-    /// Called with a raise no clause answers, before the entry fails with it: a host whose own
+    /// Called with a raise no clause handles, before the entry fails with it: a host whose own
     /// the raise is may end the run its way here and never return.
     fn unanswered(&self, effect: &Symbol, op: &Symbol) {
         let _ = (effect, op);
@@ -112,7 +112,7 @@ pub struct ShutdownReport {
     pub spans_left_open: usize,
 }
 
-/// A run's grants; the default, [`HostBinding::unbound`], is a run lent nothing.
+/// A run's grants; the default, [`HostBinding::unbound`], is a run granted nothing.
 #[derive(Debug, Default)]
 pub struct HostBinding {
     /// Whether a run's grants made it.
@@ -120,7 +120,7 @@ pub struct HostBinding {
     grants: Grants,
 }
 
-/// What a run is lent, as named entries, each a list of fields: the natives of the host handlers
+/// What a run is granted, as named entries, each a list of fields: the natives of the host handlers
 /// read the ones they serve (`fs NAME PATH`, `exec NAME PATH`, `allow FAMILY`, `argv ARG..`, ...).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
@@ -157,12 +157,12 @@ impl Grants {
 }
 
 impl HostBinding {
-    /// What a context entered with no binding has: a run lent nothing.
+    /// What a context entered with no binding has: a run granted nothing.
     pub fn unbound() -> HostBinding {
         HostBinding::default()
     }
 
-    /// The binding of a run lent `grants`, which the natives read.
+    /// The binding of a run granted `grants`, which the natives read.
     pub fn granted(grants: Grants) -> HostBinding {
         HostBinding {
             granted: true,
@@ -175,7 +175,7 @@ impl HostBinding {
         self.granted
     }
 
-    /// What the run this binding serves is lent.
+    /// What the run this binding serves is granted.
     pub fn grants(&self) -> &Grants {
         &self.grants
     }
@@ -187,11 +187,11 @@ const _: fn() = || {
     shareable::<HostBinding>();
 };
 
-/// How much of the host a run asked: every operation and native answered, and how many of those
-/// a run asking again may be answered otherwise.
+/// How much of the host a run asked: every operation and native that returned, and how many
+/// of those may return something else when a run asks again.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HostUse {
-    /// Every host operation answered, `Repeatable` ones included.
+    /// Every host operation that returned, `Repeatable` ones included.
     pub operations: u64,
     pub nondeterministic: u64,
 }
@@ -266,7 +266,7 @@ fn err_no_clock(what: &str) -> Diagnostic {
 }
 
 /// An operation of an effect that no handler of the program, no host handler and no host family
-/// answers, refused at the entry that performed it.
+/// handles, rejected at the entry that performed it.
 #[cold]
 #[inline(never)]
 pub fn err_unserved(span: Span, operation: &str) -> Diagnostic {

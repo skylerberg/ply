@@ -1,5 +1,5 @@
-//! A unit entered at a root on a context of its own, with no front end: the answer as the bytes its
-//! `R#entered` wrote, a failure as the entry's own, and what can never leave its run refused. Each
+//! A unit entered at a root on a context of its own, with no front end: the result as the bytes its
+//! `R#entered` wrote, a failure as the entry's own, and what can never leave its run rejected. Each
 //! unit here is written by hand (`crate::units`), so no program is compiled.
 
 use crate::units::{self, Def, def, int_entry, lifting, native};
@@ -75,7 +75,7 @@ pub fn encoded_defs() -> Vec<Def> {
             "m.fail#entered",
             0,
             &format!(
-                // An `assert` failing with the text it was handed, numbered as `REFUSED` numbers it.
+                // An `assert` failing with its message, numbered as `REJECTED` numbers it.
                 "{}  {}(ctx, 21, (Word)(intptr_t)buf, n, 0, 0);\n  return 0;",
                 lifting(&string_read()),
                 native("?refused_text"),
@@ -142,7 +142,7 @@ fn a_root_that_takes_nothing_is_handed_the_empty_list() {
     assert_eq!(entry::NO_ARGUMENTS, ints(&[]));
 }
 
-/// The bytes `root` answered over `arguments`.
+/// The bytes `root` returned over `arguments`.
 fn returned(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Result<Vec<u8>, String> {
     match entry::enter(opened, root, arguments, run, None, None).ended {
         Ended::Returned(bytes) => Ok(bytes),
@@ -153,7 +153,7 @@ fn returned(opened: &Opened, root: &str, arguments: Vec<u8>, run: &Run) -> Resul
     }
 }
 
-/// The `Int` the bytes of an answer are.
+/// The `Int` the bytes of a result are.
 fn int_of(bytes: &[u8]) -> i64 {
     let mut r = Reader::new(bytes).expect("the answer opens with the format");
     r.expect(tag::INT).expect("an `Int`");
@@ -162,13 +162,13 @@ fn int_of(bytes: &[u8]) -> i64 {
     n
 }
 
-/// What `root` answered over the `Int`s `xs`, read as the `Int` it answers.
+/// What `root` returned over the `Int`s `xs`, read as the `Int` it returns.
 fn int_returned(opened: &Opened, root: &str, xs: &[i64], run: &Run) -> Result<i64, String> {
     returned(opened, root, ints(xs), run).map(|bytes| int_of(&bytes))
 }
 
 /// A root is entered through its `R#entered`: the arguments cross in as their list's encoding, and
-/// the answer out as the bytes the entry wrote, whatever its type.
+/// the result out as the bytes the entry wrote, whatever its type.
 #[test]
 fn a_root_answers_the_bytes_its_entry_wrote() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -230,7 +230,7 @@ fn an_answer_holding_a_function_or_a_handle_stays_in_its_run() {
     );
 }
 
-/// A raise inside an entry is the entry's alone, whatever crossings it left open, and the next entry
+/// A raise in an entry is the entry's alone, whatever marshalling it left open, and the next entry
 /// of the unit runs as if it had not happened.
 #[test]
 fn a_raise_ends_its_entry_and_no_other() {
@@ -287,7 +287,7 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
     assert_eq!(asked.flatten().map(|bytes| int_of(&bytes)), Some(100_000));
 }
 
-/// A test's entry that answered says how many of its objects nothing let go of, and any other entry
+/// A test's entry that returned says how many of its objects nothing let go of, and any other entry
 /// counts none.
 #[test]
 fn a_tests_entry_counts_the_objects_it_left_live() {
@@ -322,7 +322,7 @@ fn a_tests_entry_counts_the_objects_it_left_live() {
     );
 }
 
-/// A task in an entry's answer is refused at the boundary as a continuation is: the region it is a
+/// A task an entry returns is rejected at the boundary like a continuation: the scheduler it is a
 /// key into ended before the entry did.
 #[test]
 fn a_task_in_an_entrys_answer_is_refused_at_the_boundary() {

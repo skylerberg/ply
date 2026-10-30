@@ -145,7 +145,7 @@ pub(super) enum Unusable {
     Elsewhere(Resource),
 }
 
-/// Why a job on a child answered no value.
+/// Why a job on a child returned no value.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum ProcessError {
     /// Another `wait` handed the child back first.
@@ -337,7 +337,7 @@ impl Child {
     }
 
     /// The next line any `Lines` stream took, `Quiet` at the deadline, and `Closed` once every
-    /// `Lines` stream has ended and each of its lines has been answered.
+    /// `Lines` stream has ended and each of its lines has been returned.
     pub(super) fn next_line(&self, deadline: Option<Instant>) -> Result<Heard, ProcessError> {
         let mut state = self.lock();
         loop {
@@ -389,7 +389,7 @@ impl Child {
         self.lock().stdin = None;
     }
 
-    /// Delivers `signal`, answering `false` when the child had already ended.
+    /// Delivers `signal`, returning `false` when the child had already ended.
     pub(super) fn signal(&self, signal: Signal) -> std::io::Result<bool> {
         let mut state = self.lock();
         if state.ended.is_some() {
@@ -432,7 +432,7 @@ struct State {
     stdin: Option<Arc<ChildStdin>>,
     out: CollectedStream,
     err: CollectedStream,
-    /// Lines the `Lines` streams took and no `output_line` has answered, in the order they arrived.
+    /// Lines the `Lines` streams took and no `output_line` has returned, in the order they arrived.
     lines: VecDeque<(Stream, Vec<u8>)>,
     spent: bool,
 }
@@ -602,7 +602,7 @@ fn text_of(line: &[u8]) -> String {
     String::from_utf8_lossy(line).into_owned()
 }
 
-/// A sink that refuses a line has nowhere else to put it, and the child is not the one to tell.
+/// A sink that rejects a line has nowhere else to put it, and the child is not the one to tell.
 fn forward(sink: &OutputSink, to: Stream, line: &[u8]) {
     let _ = sink.line(to, &text_of(line));
 }
@@ -834,7 +834,7 @@ fn signal_of(_: &ExitStatus) -> i64 {
     0
 }
 
-/// Waits for a change, or answers `None` once `deadline` has passed; no deadline waits forever.
+/// Waits for a change, or returns `None` once `deadline` has passed; no deadline waits forever.
 fn until<'a>(
     changed: &Condvar,
     state: MutexGuard<'a, State>,

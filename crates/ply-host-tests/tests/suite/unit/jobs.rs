@@ -34,7 +34,7 @@ fn a_jobs_ticket_is_answered_through_an_unbound_runtime_and_a_hosts() {
     assert_eq!(returned(&*host, &ticket), [1, 2, 3]);
 }
 
-/// The run's region waits on a ticket it watches and takes its answer once it is answered.
+/// The run's scheduler waits on a ticket it watches and takes its result once it is resolved.
 #[test]
 fn a_watched_ticket_is_answered_to_the_run_that_watched_it() {
     let runtime = ply_host::Host::new().runtime();
@@ -53,7 +53,7 @@ fn a_watched_ticket_is_answered_to_the_run_that_watched_it() {
     );
 }
 
-/// A job that answers why it failed fails the run that waits on it, naming what asked.
+/// A job that returns why it failed fails the run that waits on it, naming what asked.
 #[test]
 fn a_failed_job_is_a_diagnostic_naming_what_asked_for_it() {
     let runtime = ply_host::Host::new().runtime();
@@ -68,7 +68,7 @@ fn a_failed_job_is_a_diagnostic_naming_what_asked_for_it() {
     );
 }
 
-/// A wait begun past the drain deadline ends the run though its job answers at once, so a serve
+/// A wait begun past the drain deadline ends the run though its job returns at once, so a serve
 /// loop of quick reads still stops there.
 #[test]
 fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
@@ -95,7 +95,7 @@ fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
     assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
 }
 
-/// A job's refusal of its own fails the run as it stands, its code kept.
+/// A job's rejection of its own fails the run as it stands, its code kept.
 #[test]
 fn a_jobs_own_refusal_fails_the_run_with_its_code() {
     let runtime = ply_host::Host::new().runtime();
@@ -134,8 +134,8 @@ fn an_unbound_factorys_runtimes_share_one_host() {
     assert_ne!(sockets(&*first), sockets(&*other));
 }
 
-/// A job done here runs on the asking thread and is answered before its ticket is waited on; one
-/// that panics is answered as one that failed.
+/// A job done here runs on the asking thread and is resolved before its ticket is waited on; one
+/// that panics is resolved as one that failed.
 #[test]
 fn a_job_done_here_runs_on_the_asking_thread_and_is_answered_at_once() {
     let runtime = ply_host::Host::new().runtime();

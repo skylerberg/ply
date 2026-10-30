@@ -108,7 +108,7 @@ fn op(params: &'static Params) -> PlyOp {
     }
 }
 
-/// A perform through the bridge, as emitted code performs through it where nothing between answers.
+/// A perform through the bridge, as emitted code performs where nothing between handles it.
 fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
     let entry = BRIDGE.slot.entry;
     let result = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
@@ -169,7 +169,7 @@ fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
 }
 
 /// A host operation's arguments cross as their types lower them, and are let go through those
-/// types whatever the host makes of them: here, nothing answers.
+/// types whatever the host makes of them: here, nothing handles them.
 #[test]
 fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go() {
     let mut ctx = naming(&["m", "ask"]);
@@ -229,7 +229,7 @@ unsafe extern "C" fn acquire(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Wor
     boxed(unsafe { &mut *ctx }, 5)
 }
 
-/// Takes what was acquired and lets it go; answers 7, or unwinds where it was acquired as 6.
+/// Takes what was acquired and lets it go; returns 7, or unwinds where it was acquired as 6.
 unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let held = unsafe { *args };
     let n = unsafe { *(held as *const Word).byte_add(HEADER) };

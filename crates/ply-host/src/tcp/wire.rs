@@ -1,10 +1,10 @@
 //! What `std.net`'s and `std.udp`'s host handlers hand their natives and read back, in flat forms
 //! the handlers' own readers and writers in `std.net` share. A socket address is parts: its
 //! address's bytes, its port in two bytes and its zone, empty for none. An option is its setting's
-//! byte, as `std.net` numbers settings, and then what it sets. A refusal is its kind's byte,
-//! `Refused` 1 to `Other` 11 in declaration order, then `Handshake`'s reason, or `Other`'s code and
-//! words as parts. An answer that may be refused is byte 1 and what it answers, or byte 0 and the
-//! refusal.
+//! byte, as `std.net` numbers settings, and then what it sets. An error is its kind's byte,
+//! `Rejected` 1 to `Other` 11 in declaration order, then `Handshake`'s reason, or `Other`'s code
+//! and words as parts. A result that may fail is byte 1 and what it returns, or byte 0 and
+//! the error.
 
 use crate::dns::{address_bytes, address_of};
 use crate::native::{int, int_of, parts, parts_of};
@@ -12,7 +12,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
-/// A `std.net.Refusal`.
+/// A `std.net.Error`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NetError {
     Rejected,
@@ -68,7 +68,7 @@ impl NetError {
     }
 }
 
-/// `outcome` as an answer that may be refused.
+/// `outcome` as a result that may be an error.
 pub fn result(outcome: Result<Vec<u8>, NetError>) -> Vec<u8> {
     match outcome {
         Ok(returned) => [&[1u8][..], &returned].concat(),
@@ -150,7 +150,7 @@ fn zone_name(scope: u32) -> Option<String> {
     if found.is_null() {
         return Some(scope.to_string());
     }
-    // SAFETY: a non-null answer is the buffer, holding a terminated name.
+    // SAFETY: a non-null result is the buffer, holding a terminated name.
     let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
     Some(name.to_string_lossy().into_owned())
 }

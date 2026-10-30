@@ -1,5 +1,5 @@
-//! A hold as emitted code meets it: made of a word it takes, read and taken through natives that
-//! never read or count what it holds.
+//! A scoped value as emitted code meets it: made of a word it takes, read and taken through
+//! natives that never read or count what it holds.
 
 use crate::bare::{context, helper};
 use ply_compiled::rt::Ctx;

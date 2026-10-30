@@ -25,7 +25,7 @@ pub struct Detached {
     result: Word,
     /// Owned here, not by the entry frame, which never returns where the body is abandoned.
     body: Word,
-    /// The block whose objects the body and clauses hold for what their rows take around the
+    /// The block whose objects the body and clauses hold for what their effects take around the
     /// `handle`, kept as the body is.
     forwards: Option<Word>,
     starting: Option<Word>,
@@ -152,7 +152,7 @@ enum Stopped {
     Failed,
 }
 
-/// `rt_detached_open`: runs the body of a `handle` on a fresh stack until it stops or ends; answers
+/// `rt_detached_open`: runs the body of a `handle` on a fresh stack until it stops or ends; returns
 /// the `handle`'s value, its landing the body's own. Takes `body` and `forwards`, the body's
 /// forwarding block where it has one; holds `instance`, the counted block of the `handle`'s
 /// instance, once more, writing the body's place into its head.
@@ -289,8 +289,8 @@ fn vars_let_go(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
 }
 
 /// `rt_detached_perform`: the body of the `handle` the instance of clause record `record` belongs
-/// to stops at a perform the clause answers off its tail, `args` its words and `resource` its
-/// label's field-table entry; the clause runs where the body was entered or resumed from. Answers
+/// to stops at a perform the clause handles off its tail, `args` its words and `resource` its
+/// label's field-table entry; the clause runs where the body was entered or resumed from. Returns
 /// what `k` is resumed with.
 pub(crate) unsafe fn stop_over(
     ctx: *mut Ctx,
@@ -325,7 +325,7 @@ pub(crate) unsafe fn stop_over(
     unsafe { stopped(ctx, id, closure, bound) }
 }
 
-/// Runs the body from where it stopped, `answer` returned from its `perform`, until it stops again.
+/// Runs the body from where it stopped, `result` returned from its `perform`, until it stops again.
 pub(crate) unsafe fn resume(
     ctx: *mut Ctx,
     id: usize,
@@ -465,7 +465,7 @@ fn give_back(c: &mut Ctx, id: usize) {
     settle(c, id);
 }
 
-/// Records the stop the body just made, and answers its capture's index.
+/// Records the stop the body just made, and returns its capture's index.
 fn capture_stop(ctx: *mut Ctx, id: usize) -> usize {
     let d = &mut unsafe { &mut *ctx }.detached[id];
     d.captures.push(Capture { vars: Vec::new() });
@@ -474,7 +474,7 @@ fn capture_stop(ctx: *mut Ctx, id: usize) -> usize {
     k
 }
 
-/// The body's perform: hands the clause to whoever resumed the body, and answers what `k` got.
+/// The body's perform: hands the clause to whoever resumed the body, and returns what `k` got.
 /// Nothing that needs letting go may be owned across the switch: a body abandoned here never
 /// returns to let it go.
 unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>) -> Word {
@@ -510,7 +510,7 @@ extern "C" fn entry(arg: usize) {
         c.frames = frames::base();
         (id, body)
     };
-    // The body ends in its `handle`'s landing, which answers what unwinds to it.
+    // The body ends in its `handle`'s landing, which returns what unwinds to it.
     let r = call_fun(ctx, body, &[]);
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
@@ -592,7 +592,7 @@ unsafe extern "C" fn token_released(ctx: *mut Ctx, k: Handed) -> Word {
     0
 }
 
-/// A continuation is its entry's: it crosses to no other thread and is kept past no entry.
+/// A continuation is its entry's: it is marshalled to no other thread and is kept past no entry.
 unsafe extern "C" fn crosses_nowhere(_ctx: *mut Ctx, _k: Word) -> Word {
     0
 }
@@ -699,7 +699,7 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
 }
 
 /// `E0505`: a continuation resumed after it was resumed once. Its type is a `once` function, so
-/// the check refuses a program that could.
+/// the check rejects a program that could.
 #[cold]
 #[inline(never)]
 fn err_resumed_again() -> Diagnostic {

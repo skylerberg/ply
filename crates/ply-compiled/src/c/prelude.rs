@@ -5,7 +5,7 @@ use crate::heap::Word;
 use crate::native::{Addr, F64, I64, Native, Raises, Signature};
 use crate::rt::Ctx;
 
-/// A runtime helper the emitted C may call: what it takes past the context and answers, as its
+/// A runtime helper the emitted C may call: what it takes past the context and returns, as its
 /// function's type says, and the function a loaded unit binds it to.
 #[derive(Clone, Copy)]
 pub struct Helper {
@@ -19,7 +19,7 @@ unsafe impl Send for Helper {}
 unsafe impl Sync for Helper {}
 
 impl Helper {
-    /// The helper `name` bound to `f`, taking and answering what `f`'s type says.
+    /// The helper `name` bound to `f`, taking and returning what `f`'s type says.
     fn of<F: Native>(name: &'static str, f: F) -> Helper {
         Helper {
             name,
@@ -67,7 +67,7 @@ fn signature_of<F: Native>(_: F) -> Signature {
     F::SIGNATURE
 }
 
-/// The native the compiler declares as `name`, bound to `f` and taking and answering what `f`'s
+/// The native the compiler declares as `name`, bound to `f` and taking and returning what `f`'s
 /// type says.
 pub(crate) fn machine_native<F: Native>(name: &'static str, f: F) -> MachineNative {
     let helper = Box::leak(builtin_helper_name(name).into_boxed_str());
@@ -117,7 +117,7 @@ machine! {
     "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
 }
 
-/// The natives over machine data: the crossings' and the rest of this table's, then strings' and
+/// The natives over machine data: marshalling's and the rest of this table's, then strings' and
 /// byte strings' (`crate::machine`), then those the standard library's host handlers call
 /// (`crate::hosted`), then what `std.machine` declares (`crate::entry`) and what
 /// `std.internal.schedule` does (`crate::tasks`).

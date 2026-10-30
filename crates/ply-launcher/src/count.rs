@@ -26,7 +26,7 @@ static SAMPLE: AtomicU32 = AtomicU32::new(0);
 static SEEN: AtomicU64 = AtomicU64::new(0);
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
-/// Attributions in flight. A window waits for this to reach zero before it answers, so its rows
+/// Attributions in flight. A window waits for this to reach zero before it returns, so its rows
 /// are the whole of its total rather than whatever had finished by the time it looked.
 static ATTRIBUTING: AtomicU64 = AtomicU64::new(0);
 /// Site -> what it allocated, in site order.
@@ -74,7 +74,7 @@ impl Counting {
 
     #[inline(never)]
     fn attribute(allocations: u64, bytes: u64) {
-        // Registering before the re-check is what makes the window's answer coherent: an
+        // Registering before the re-check is what makes the window's result coherent: an
         // attribution that counts has announced itself before the window can observe zero, so the
         // window's wait sees it, and one that arrives after the window closed finds `ON` false and
         // counts nothing.
@@ -154,7 +154,7 @@ fn named(frame: &backtrace::Frame, into: &mut Vec<String>) {
 /// The `ply_*` names at one frame, resolved once per instruction pointer.
 ///
 /// One call site allocates over and over, and symbolizing answers the same question every time;
-/// the answer is kept per address. A frame with no `ply_*` name is kept too, since a Rust frame in
+/// the answer is cached per address. A frame with no `ply_*` name is too, since a Rust frame in
 /// the toolchain is the common case.
 fn resolved_names(frame: &backtrace::Frame) -> Vec<String> {
     let at = frame.ip() as usize;
@@ -204,7 +204,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-/// Runs `f` with the window open, answering what it allocated, and where when the run asked for
+/// Runs `f` with the window open, returning what it allocated, and where when the run asked for
 /// sites. Windows do not nest: the outermost one is the entry.
 pub fn window<R>(
     f: impl FnOnce() -> R,

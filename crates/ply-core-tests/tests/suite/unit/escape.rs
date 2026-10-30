@@ -1,8 +1,8 @@
 use ply_core::escape::*;
 use ply_core::{Span, codes};
 
-/// The boundary a handle leaves by rather than enters by: it names the definition that answered,
-/// the way to the handle, and what to answer instead.
+/// The boundary a handle leaves by rather than enters by: it names the definition that returned,
+/// the way to the handle, and what to return instead.
 #[test]
 fn an_entry_points_answer_refuses_a_continuation_by_the_way_to_it() {
     let boundary = Boundary::EntryResult { name: "m.parked" };

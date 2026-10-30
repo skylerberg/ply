@@ -169,7 +169,7 @@ struct Record {
 }
 
 /// Lays three records on `stack` as three frames between `sp` and the top would hold them, slots
-/// 1 to 3 from the outermost in, and answers the innermost.
+/// 1 to 3 from the outermost in, and returns the innermost.
 fn laid(stack: &Stack, sp: usize) -> *mut PlyFrame {
     let top = stack.top();
     let mut below = base();

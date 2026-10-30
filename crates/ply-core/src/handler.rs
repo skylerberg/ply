@@ -1,4 +1,4 @@
-//! The diagnostic for a `perform` no handler answers.
+//! The diagnostic for a `perform` no handler handles.
 
 use crate::{Diagnostic, Span, Symbol, codes};
 

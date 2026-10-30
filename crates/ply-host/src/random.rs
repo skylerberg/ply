@@ -1,7 +1,7 @@
 //! The operating system's entropy, which `std.random`'s natives draw: `/dev/urandom` is the only
 //! source a run has.
 //!
-//! The prelude's `random` is the scheduler's, answered with values a seed decides so a simulation
+//! The prelude's `random` is the scheduler's, handled with values a seed decides so a simulation
 //! is reproducible.
 
 use ply_core::{Diagnostic, codes};

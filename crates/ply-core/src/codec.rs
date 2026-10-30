@@ -1,6 +1,6 @@
 //! PLV1: plain values as bytes, the one format a compiled value crosses into the runtime and back
 //! in, written and read a part at a time. A value the bytes cannot hold (a task, a channel, a
-//! credential, a hold, a function the program wrote) crosses as a [`tag::HANDLE`], a position.
+//! credential, a scoped value, a function the program wrote) becomes a [`tag::HANDLE`], a position.
 
 use crate::{Fixed, INT_TYPES, IntTy, Symbol};
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ pub mod tag {
 
 /// What follows [`tag::FUN`], `std.value.Fun`'s cases in its order. `NAMED` is followed by the
 /// name; `CONST` by its arity and value; `PROJECT` by its arity and the index of the argument it
-/// answers; `TABLE` by its arity, how many entries, each entry's key and value, and its default.
+/// returns; `TABLE` by its arity, how many entries, each entry's key and value, and its default.
 pub mod fun {
     pub const NAMED: u8 = 0;
     pub const ANON: u8 = 1;
@@ -44,14 +44,14 @@ pub mod fun {
     pub const PROJECT: u8 = 3;
     pub const TABLE: u8 = 4;
     /// A function the program wrote that holds what may not leave the run that made it, as a
-    /// continuation does: read back as a continuation, which the boundary refuses by name.
+    /// continuation does: read back as a continuation, which the boundary rejects by name.
     pub const RESUMES: u8 = 5;
 }
 
 /// The position a [`tag::HANDLE`] is written at in a value a diagnostic shows, which keeps nothing
 /// beside its bytes: what the runtime object is, as `std.value.decode_shown` reads it.
 pub mod shown {
-    /// A credential, or any other runtime object but a hold.
+    /// A credential, or any other runtime object but a scoped value.
     pub const SEALED: u64 = 0;
     pub const SCOPED: u64 = 1;
 }
@@ -198,7 +198,7 @@ impl Writer {
 }
 
 /// PLV1 read a part at a time, over bytes it borrows or owns: what compiled code reads a value with
-/// through the runtime. Every read answers an error where the bytes end early or do not hold what
+/// through the runtime. Every read returns an error where the bytes end early or do not hold what
 /// it reads.
 pub struct Reader<B> {
     bytes: B,

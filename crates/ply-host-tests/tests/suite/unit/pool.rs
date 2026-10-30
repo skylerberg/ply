@@ -11,12 +11,12 @@ fn run() -> Arc<Run> {
     Run::new(Arc::new(Bell::default()))
 }
 
-/// The bytes a job that answers `n` writes.
+/// The bytes a job that returns `n` writes.
 fn written(n: i64) -> Vec<u8> {
     n.to_be_bytes().to_vec()
 }
 
-/// What a job that answers `n` answers.
+/// What a job that returns `n` returns.
 fn said(n: i64) -> JobOutput {
     Ok(written(n))
 }
@@ -38,8 +38,8 @@ fn returned(run: &Run, pending: Pending) -> Vec<u8> {
         .expect("an unbounded wait ends answered")
 }
 
-/// What `run` takes once a watched operation has been answered: each answered token beside its
-/// answer.
+/// What `run` takes once a watched operation has returned: each returned token beside its
+/// result.
 fn collected(run: &Run) -> Vec<(u64, Result<Vec<u8>, Diagnostic>)> {
     assert!(
         run.park(Some(Duration::from_secs(10)), &|| false),
@@ -83,7 +83,7 @@ fn a_run_collects_its_own_operations_and_none_of_anothers() {
     assert!(mine.returned().is_empty(), "an answer is handed back once");
 }
 
-/// A job that finishes after its run has ended answers no one, and keeps no thread.
+/// A job that finishes after its run has ended returns to no one, and keeps no thread.
 #[test]
 fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
     let pool = Pool::new();
@@ -141,8 +141,8 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
     assert_eq!(returned(&after, pending), written(9));
 }
 
-/// A pool that gives each operation a thread refuses the one past its bound; a queued one has no
-/// such bound, and answers each in its turn.
+/// A pool that gives each operation a thread rejects the one past its bound; a queued one has no
+/// such bound, and serves each in its turn.
 #[test]
 fn a_queued_pool_answers_more_operations_than_a_thread_each_would_be_given() {
     let pool = Pool::queued(2);
@@ -213,7 +213,7 @@ fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
     }
 }
 
-/// A token is a run's, so one minted twice would answer the wrong run, and a zeroed `Pending`
+/// A token is a run's, so one minted twice would return to the wrong run, and a zeroed `Pending`
 /// carries 0.
 #[test]
 fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
@@ -241,7 +241,7 @@ fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
     }
 }
 
-/// A park waits for the run's own watched answer, through every ring of a bell other runs share.
+/// A park waits for the run's own watched result, through every ring of a bell other runs share.
 #[test]
 fn a_park_wakes_for_its_own_answer_and_not_for_anothers() {
     let bell = Arc::new(Bell::default());

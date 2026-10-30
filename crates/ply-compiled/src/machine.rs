@@ -1,11 +1,11 @@
 //! The natives over machine data that strings and byte strings emitted code lays out reach the
 //! runtime through: each takes the bytes it reads as an address and a count, borrowed for the call,
-//! and answers raw integers, a `Float`'s bits, a runtime object, or bytes left as the context's
+//! and returns raw integers, a `Float`'s bits, a runtime object, or bytes left as the context's
 //! taken bytes, which emitted code copies out into a block of its own. None reads or makes a string,
-//! a byte string or a list. A native whose builtin can fail answers a value that says so, and
-//! emitted code hands the refusal to [`rt_refused`](crate::rt::rt_refused), or to
-//! [`rt_refused_text`] where it names text. What each answers is what the value builtin of the same
-//! name answers.
+//! a byte string or a list. A native whose builtin can fail returns a value that says so, and
+//! emitted code hands the rejection to [`rt_refused`](crate::rt::rt_refused), or to
+//! [`rt_refused_text`] where it names text. What each returns is what the value builtin of the same
+//! name returns.
 
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, F64, I64, Raises};
@@ -39,7 +39,7 @@ pub fn natives() -> Vec<MachineNative> {
     .collect()
 }
 
-/// Each `Float` function as compiled code calls it: its operands' bits in, its answer's out,
+/// Each `Float` function as compiled code calls it: its operands' bits in, its result's out,
 /// computed as the value builtin of the same name computes it.
 macro_rules! float_functions {
     ($($name:literal => $f:ident = $($math:ident)::+ ($($a:ident),+);)+) => {
@@ -82,7 +82,7 @@ fn err_machine(reason: &str) -> Diagnostic {
 }
 
 impl Ctx {
-    /// The UTF-8 a string lends, which emitted code only ever makes valid.
+    /// The UTF-8 of a string, borrowed, which emitted code only ever makes valid.
     pub(crate) fn text<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a str> {
         match std::str::from_utf8(bytes) {
             Ok(s) => Some(s),
@@ -94,7 +94,7 @@ impl Ctx {
     }
 }
 
-/// The encoding `digest` hashes of a scalar, left as taken bytes, answering their count: `kind` 0 a
+/// The encoding `digest` hashes of a scalar, left as taken bytes, returning their count: `kind` 0 a
 /// `()`, 1 a `Bool` that is `lo`, 2 an `Int` or a narrower width that reads as `lo`, 3 the width at
 /// `t` in [`ply_core::INT_TYPES`] whose bits are `lo` and above them `hi`, 4 the `Char` of scalar
 /// value `lo`, 5 the `Decimal` whose two words are `lo` and `hi`.
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn rt_scalar_encoded(
 }
 
 /// The encoding `digest` hashes of the string, where `text` is not 0, or else the byte string, of
-/// the `n` bytes at `p`, left as taken bytes, answering their count.
+/// the `n` bytes at `p`, left as taken bytes, returning their count.
 pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I64) -> I64 {
     let c = unsafe { &mut *ctx };
     let bytes = unsafe { borrowed(p, n) };
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
 }
 
-/// Fails the run: two functions were compared for equality, which no function has. Answers 0.
+/// Fails the run: two functions were compared for equality, which no function has. Returns 0.
 pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
     c.fail(
@@ -163,8 +163,8 @@ pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
     I64(0)
 }
 
-/// [`rt_refused`](crate::rt::rt_refused) for a builtin whose refusal names text, `what` numbered as
-/// [`REFUSED`](crate::rt::REFUSED) numbers it: `String::find`, which did not find the `m` bytes at
+/// [`rt_refused`](crate::rt::rt_refused) for a builtin whose rejection names text, `what` numbered
+/// as [`REJECTED`](crate::rt::REJECTED) numbers it: `String::find`, not finding the `m` bytes at
 /// `q` among the `n` at `p`; `String::of_bytes`, given the `n` bytes at `p`, which are not UTF-8;
 /// `assert`, whose message is the string of `n` bytes at `p`, or none where `n` is below 0;
 /// `Secret::decode` and `Secret::encode`, whose encoding, the `n` bytes at `p`, is none they read or

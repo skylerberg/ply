@@ -366,7 +366,7 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
                 for _ in 0..100 {
                     assert_eq!(shared.get("SERVICE_REGION"), Some("eu"));
                     assert_eq!(shared.get("SERVICE_PORT"), Some("8137"));
-                    // The `SSecret` gate: `config.get` answers `None` whatever the sources hold.
+                    // The `SSecret` gate: `config.get` returns `None` whatever the sources hold.
                     assert_eq!(shared.get("SERVICE_API_KEY"), None);
                     assert_eq!(shared.get("NOTHING_SUPPLIED"), None);
                 }
@@ -400,7 +400,7 @@ fn listen(net: &TcpHost) -> i64 {
         .expect("a loopback port")
 }
 
-/// What a listener's next `accept` answers, its job run here.
+/// What a listener's next `accept` returns, its job run here.
 fn accepted(net: &TcpHost, listener: i64) -> i64 {
     let job = net
         .accept(LISTENER, listener, Span::DUMMY)
@@ -440,7 +440,7 @@ fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
     assert!(!untouched.second_requested());
 }
 
-/// `ply test` builds exactly such a `Host`; the park loop and the deadlock check read this answer.
+/// `ply test` builds exactly such a `Host`; the park loop and the deadlock check read this result.
 #[test]
 fn a_host_with_no_coordinator_is_never_stopping() {
     let stopping = Shutdown::new(Bounds::default());
@@ -547,7 +547,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
 
     impl Accepting for SlowToWake {
         fn stop_accepting(&self) -> usize {
-            // The socket table's flag goes up and `net.accept` answers `0` from here.
+            // The socket table's flag goes up and `net.accept` returns `0` from here.
             self.stopped.fetch_add(1, Ordering::Release);
             1
         }
@@ -575,7 +575,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
     assert!(shutdown.request(ShutdownSignal::Terminate));
 
-    // Wait until the run stops: every `net.accept` answers `0`.
+    // Wait until the run stops: every `net.accept` returns `0`.
     let until = Instant::now() + Duration::from_secs(5);
     while net.stopped.load(Ordering::Acquire) == 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(1));

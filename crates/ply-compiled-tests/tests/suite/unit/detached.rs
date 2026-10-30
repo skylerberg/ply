@@ -28,7 +28,7 @@ thread_local! {
     /// Whether each clause ran on a stack whose chain was null.
     static CLAUSES_UNRECORDED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     /// What each continuation a clause was handed says of itself: whether its descriptor has no
-    /// typed entry, and whether sharing and keeping it answer 0.
+    /// typed entry, and whether sharing and keeping it return 0.
     static TOKENS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
     /// The clause's record in the running `handle`'s instance.
     static STOP: Cell<*const Word> = const { Cell::new(std::ptr::null()) };
@@ -99,7 +99,7 @@ static FLIP_OP: PlyOp = PlyOp {
 };
 
 /// The body: its own box held across a runtime frame holding a value of every kind, across a
-/// compiled frame holding a box, across `amb.flip()`. Answers 1 for `true` and 2 for `false`.
+/// compiled frame holding a box, across `amb.flip()`. Returns 1 for `true` and 2 for `false`.
 unsafe extern "C" fn body(ctx: *mut Ctx, _block: Word, _args: *const Word) -> Word {
     unsafe { holding_a_box(ctx, HELD[0], || through_a_runtime_frame(ctx)) }
 }
@@ -187,7 +187,7 @@ unsafe extern "C" fn never(ctx: *mut Ctx, _block: Word, args: *const Word) -> Wo
     imm(42)
 }
 
-/// `amb.flip() resume k -> Parked(k)`, the continuation the handle's answer.
+/// `amb.flip() resume k -> Parked(k)`, the continuation the handle's result.
 unsafe extern "C" fn parks(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
     unsafe {
         clause_ran(ctx, *args);
@@ -289,7 +289,7 @@ fn failure(ctx: *mut Ctx) -> String {
     unsafe { (*ctx).take_failure() }.map_or_else(String::new, |d| d.message)
 }
 
-/// What the continuation a clause is handed says of itself: a block with no typed entry, crossing
+/// What the continuation a clause is handed says of itself: a block with no typed entry, marshalled
 /// nowhere.
 const TOKEN: (bool, bool) = (true, true);
 

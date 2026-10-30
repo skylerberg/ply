@@ -3,10 +3,10 @@
 //!
 //! One [`Engine`] serves both forms. Over a file it is a connection a host handler opened and
 //! holds; over an image it is [`run_over`], which opens the bytes it is handed, runs one
-//! statement and answers the bytes that leaves, so its answer is a function of its arguments: no
+//! statement and returns the bytes that leaves, so its result is a function of its arguments: no
 //! clock, no entropy, no file and no state kept between calls. The engine holds a generator of its
-//! own, and nothing a statement may do reads it: the functions that draw from it are refused, and so
-//! is a row at the largest row id, past which it would choose the next.
+//! own, and nothing a statement may do reads it: the functions that draw from it are rejected,
+//! and so is a row at the largest row id, past which it would choose the next.
 
 use rusqlite::config::DbConfig;
 use rusqlite::functions::{Context, FunctionFlags};
@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// The most bytes one text or blob holds, as one `fs` read answers.
+/// The most bytes one text or blob holds, as one `fs` read returns.
 pub const MAX_VALUE_BYTES: i32 = 64 * 1024 * 1024;
 
 /// How many transactions and savepoints one connection nests: deeper is a program that recursed.
@@ -27,11 +27,11 @@ pub const MAX_DEPTH: u32 = 32;
 /// The virtual-machine steps between two looks at the step budget.
 const STEP_GRAIN: i32 = 1000;
 
-/// What opens a refusal a guarded function raises, so it is told from the engine's own errors.
+/// What opens a rejection a guarded function raises, so it is told from the engine's own errors.
 const REJECTED: &str = "refused: ";
 
 /// The scalar, aggregate and window functions a statement may call. The list is closed: the
-/// authorizer refuses any other name wherever it is written, a view or a trigger included.
+/// authorizer rejects any other name wherever it is written, a view or a trigger included.
 pub const FUNCTIONS: &[&str] = &[
     "->",
     "->>",
@@ -141,7 +141,7 @@ const INTERNAL_FUNCTIONS: &[&str] = &[
     "stat_get",
 ];
 
-/// The date and time functions, each replaced by a guard that refuses the calls that read the
+/// The date and time functions, each replaced by a guard that rejects the calls that read the
 /// clock or the machine's zone and hands every other to the engine's own.
 const CLOCKED: &[&str] = &[
     "date",
@@ -208,14 +208,14 @@ impl rusqlite::ToSql for Scalar {
     }
 }
 
-/// What one statement may take and answer, each a bound its caller chose.
+/// What one statement may take and return, each a bound its caller chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The statement's text, in bytes.
     pub sql_bytes: i64,
     pub params: i64,
     pub rows: i64,
-    /// The values answered, in bytes: a text's or a blob's length, eight for a number.
+    /// The values returned, in bytes: a text's or a blob's length, eight for a number.
     pub bytes: i64,
     /// Steps of the engine's virtual machine, counted in thousands.
     pub steps: i64,
@@ -253,7 +253,7 @@ impl Failure {
     }
 }
 
-/// What a statement answered.
+/// What a statement returned.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Reply {
     pub columns: Vec<String>,
@@ -292,7 +292,7 @@ pub enum Mode {
 pub struct Options {
     /// Whether every table the connection makes must be `STRICT`.
     pub strict: bool,
-    /// How long a statement waits on another connection's lock before it answers `busy`.
+    /// How long a statement waits on another connection's lock before it returns `busy`.
     pub busy_ms: i64,
     /// How many prepared statements the connection keeps.
     pub statements: i64,
@@ -315,7 +315,7 @@ pub enum Control {
 struct Guard {
     /// Set while the engine runs a statement of its own, which the authorizer lets through.
     internal: AtomicBool,
-    /// Why the authorizer last refused, for the failure the refused statement answers with.
+    /// Why the authorizer last rejected a statement, for the failure that statement returns.
     rejected: Mutex<Option<String>>,
     /// The steps the running statement has left.
     steps: AtomicI64,
@@ -390,12 +390,12 @@ impl Engine {
         engine
             .internal(|conn| {
                 if mode != Mode::ReadOnly {
-                    // Refused where the file cannot be written or the filesystem cannot share
+                    // Rejected where the file cannot be written or the filesystem cannot share
                     // memory, which leaves a rollback journal: as safe, and one writer at a time.
                     let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()));
                 }
                 conn.execute_batch("PRAGMA cell_size_check=ON")?;
-                // The first read of the file, so one that is no database is refused at its open.
+                // The first read of the file, so one that is no database is rejected at its open.
                 conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
             })
             .map_err(unopened)?;
@@ -415,7 +415,7 @@ impl Engine {
             .map_err(|e| self.failure_of(e))
     }
 
-    /// Runs one statement of the program's. `reads_only` refuses one that could write.
+    /// Runs one statement of the program's. `reads_only` rejects one that could write.
     pub fn run(&mut self, sql: &str, params: &[Scalar], limits: Limits, reads_only: bool) -> Reply {
         let mut pages = Vec::new();
         self.paged(sql, params, limits, reads_only, |page| {
@@ -434,8 +434,8 @@ impl Engine {
         }
     }
 
-    /// Runs one statement a page at a time. `pager` is handed what opening it answered, the
-    /// columns or a failure, and then each page; it answers how many rows the next page may hold,
+    /// Runs one statement a page at a time. `pager` is handed what opening it returned, the
+    /// columns or a failure, and then each page; it returns how many rows the next page may hold,
     /// or `None` to end the statement. A page shorter than was asked for is the last with rows.
     /// `limits.rows` bounds the rows of every page together and `limits.bytes` each page.
     pub fn paged(
@@ -496,8 +496,8 @@ impl Engine {
             .into_iter()
             .map(str::to_string)
             .collect();
-        // A statement that writes runs inside a savepoint, so one refused after it ran, for what
-        // it answered or what it left, leaves nothing behind.
+        // A statement that writes runs inside a savepoint, so one rejected after it ran, for what
+        // it returned or what it left, leaves nothing behind.
         let guarded = wrote;
         if guarded
             && let Err(e) = self.internal(|conn| conn.execute_batch("SAVEPOINT ply_statement"))
@@ -601,7 +601,7 @@ impl Engine {
     }
 
     /// One step of the connection's transaction. A `Begin` inside a transaction is a savepoint,
-    /// and a `Commit` or `Rollback` closes the innermost scope whatever the engine answers.
+    /// and a `Commit` or `Rollback` closes the innermost scope whatever the engine returns.
     pub fn control(&mut self, step: Control) -> Reply {
         if self.depth > 0 && self.conn.is_autocommit() {
             // The engine rolled the whole transaction back under a failed statement.
@@ -643,8 +643,8 @@ impl Engine {
             }
             Control::Commit | Control::Rollback => {
                 self.depth -= 1;
-                // A commit the engine refused leaves its transaction open, and this scope is
-                // closed whatever it answered.
+                // A commit the engine rejected leaves its transaction open, and this scope is
+                // closed whatever it returned.
                 if done.is_err() && self.depth == 0 && !self.conn.is_autocommit() {
                     let _ = self.internal(|conn| conn.execute_batch("ROLLBACK"));
                 }
@@ -740,7 +740,7 @@ impl Engine {
             Ok(()) => None,
             Err(e) => {
                 let failure = self.failure_of(e);
-                // A release the engine refused is a commit that did not happen.
+                // A release the engine rejected is a commit that did not happen.
                 if self.depth == 0 && !self.conn.is_autocommit() {
                     let _ = self.internal(|conn| conn.execute_batch("ROLLBACK"));
                 }
@@ -915,7 +915,7 @@ fn unreadable(e: rusqlite::Error) -> Failure {
     Failure::new("engine", "", e.to_string())
 }
 
-/// The settings every connection holds, which no statement changes: the authorizer refuses the
+/// The settings every connection holds, which no statement changes: the authorizer rejects the
 /// pragmas that would.
 fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqlite::Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
@@ -983,7 +983,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     Ok(())
 }
 
-/// Why the authorizer refuses `action`, or `None` for one a statement may take.
+/// Why the authorizer rejects `action`, or `None` for one a statement may take.
 fn rejection(action: AuthAction<'_>) -> Option<String> {
     match action {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Some(
@@ -1045,7 +1045,7 @@ thread_local! {
     static UNGUARDED: Option<Connection> = Connection::open_in_memory().ok();
 }
 
-/// A date or time function, refused where it would read the clock or the machine's zone: with no
+/// A date or time function, rejected where it would read the clock or the machine's zone: with no
 /// time given, with the time `now`, or with the modifier `localtime` or `utc`. Which of those a
 /// call does is decided by its values, so it is judged as it runs.
 fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::types::Value> {
@@ -1095,7 +1095,7 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
 }
 
 /// One statement over the database `image` holds, a database file's bytes or none for an empty
-/// one: what it answered, and the image it left where it wrote and kept what it wrote. A function
+/// one: what it returned, and the image it left where it wrote and kept what it wrote. A function
 /// of its arguments.
 pub fn run_over(
     image: &[u8],

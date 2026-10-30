@@ -1,6 +1,6 @@
 //! `std.net`'s and `std.udp`'s natives: the run's socket table, each socket named by its handle and
-//! the label the clause that asks binds. What they are handed and answer is flat as
-//! `ply_host::tcp::wire` reads and writes it; an operation that waits answers a ticket.
+//! the label the clause that asks binds. What they are handed and return is flat as
+//! `ply_host::tcp::wire` reads and writes it; an operation that waits returns a ticket.
 
 use super::{Nondeterministic, asked, done, from_host, given, handed, waited};
 use crate::c::{MachineNative, machine_native};
@@ -815,10 +815,10 @@ pub unsafe extern "C" fn rt_net_local_port(
     )
 }
 
-/// What a native that reads what a socket is answers, under `label` and of `socket`.
+/// What a native that reads what a socket is returns, under `label` and of `socket`.
 type Described = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
 
-/// What `read` answers of a socket, a datagram one where `datagram` says it must be: what a socket
+/// What `read` returns of a socket, a datagram one where `datagram` says it must be: what a socket
 /// is, read as it stands.
 fn described(
     ctx: *mut Ctx,

@@ -1,6 +1,6 @@
 //! The runtime a native Ply program is linked with. The program's `main` calls [`ply_native_enter`]
 //! with its unit's descriptor; this binds the runtime to the unit and enters the program's entry
-//! with the command line, its pack's shipped modules and its environment lent.
+//! with the command line, its pack's shipped modules and its environment granted.
 
 use ply_compiled::c::descriptor::Descriptor;
 use std::ffi::{c_char, c_int};
@@ -27,7 +27,7 @@ pub extern "C" fn ply_runtime_described() -> *const c_char {
         .as_ptr()
 }
 
-/// Runs the linked program, whose unit lays `unit` out, and answers its exit code. The command
+/// Runs the linked program, whose unit lays `unit` out, and returns its exit code. The command
 /// line is read from the process, as Rust's own `main` reads it.
 ///
 /// # Safety
@@ -45,7 +45,7 @@ pub unsafe extern "C" fn ply_native_enter(
 unsafe fn run(unit: *const Descriptor) -> c_int {
     ply_host::time::mark_start(std::time::Instant::now());
     // Rust's own `main` does this before any user code, so a write to a closed pipe is an error the
-    // program answers rather than a signal that ends it; entered from C, the runtime does it here.
+    // program handles rather than a signal that ends it; entered from C, the runtime does it here.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     if let Err(reason) = unsafe { ply_compiled::c::linked::install(unit) } {
         eprintln!("ply: {reason}");

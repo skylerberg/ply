@@ -1,6 +1,6 @@
 //! What `std.process`'s host handler asks the host through its natives: the arguments, the two
 //! output streams, standard input, the exit code, and the programs a run may start, to completion
-//! or beside it. Each answer that is structured is flat: a child's ending as [`Finished::flat`]
+//! or beside it. Each result that is structured is flat: a child's ending as [`Finished::flat`]
 //! writes it, a line heard as [`Heard::flat`] does.
 
 mod children;
@@ -19,10 +19,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// The effect, by the program-wide name a refusal names its module by.
+/// The effect, by the program-wide name a rejection names its module by.
 const EFFECT: &str = "std.process.process";
 
-/// What serves the effect, for a refusal to name.
+/// What serves the effect, for a rejection to name.
 const SERVED_BY: &str = "std.process::served";
 
 /// The effect whose raise says a standard stream's reader went away, and that raise.
@@ -302,7 +302,7 @@ impl ProcessHost {
         std::process::exit(stdio::BROKEN_PIPE_STATUS);
     }
 
-    /// What this host makes of a raise no clause answered: an unanswered `pipe.broken` ends the
+    /// What this host makes of a raise no clause handled: an unhandled `pipe.broken` ends the
     /// process as the closed pipe would have.
     pub fn unanswered(&self, effect: &Symbol, op: &Symbol) {
         if self.owns_the_streams() && effect.as_str() == PIPE_EFFECT && op.as_str() == PIPE_BROKEN {
@@ -343,10 +343,10 @@ impl ProcessHost {
     }
 
     /// `text` and a line ending written to `stream`. A stream whose reader has gone ends the
-    /// process, since a line answers nothing its writer could be told by.
+    /// process, since a line returns nothing its writer could be told by.
     ///
     /// # Errors
-    /// The host is not the run's own process, or the stream refused the write.
+    /// The host is not the run's own process, or the stream rejected the write.
     pub fn line(&self, stream: Stream, text: &str, span: Span) -> Result<(), Diagnostic> {
         let op = match stream {
             Stream::Out => "out",
@@ -363,7 +363,7 @@ impl ProcessHost {
     /// Whether `bytes` reached `stream`: `false` once its reader has gone away.
     ///
     /// # Errors
-    /// The host is not the run's own process, or the stream refused the write.
+    /// The host is not the run's own process, or the stream rejected the write.
     pub fn write(&self, stream: Stream, bytes: &[u8], span: Span) -> Result<bool, Diagnostic> {
         let op = match stream {
             Stream::Out => "out_bytes",
@@ -376,7 +376,7 @@ impl ProcessHost {
     /// Whether what standard output's buffer held reached it: `false` once its reader has gone.
     ///
     /// # Errors
-    /// The host is not the run's own process, or the stream refused the write.
+    /// The host is not the run's own process, or the stream rejected the write.
     pub fn flush(&self, span: Span) -> Result<bool, Diagnostic> {
         self.own("flush", span)?;
         taken("flush", self.sink.flush(), span)
@@ -601,13 +601,13 @@ impl ProcessHost {
     }
 }
 
-/// Where an operation about the run's own process is served, for a refusal to say.
+/// Where an operation about the run's own process is served, for a rejection to say.
 const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
 /// Where an operation on a program `--exec` binds is served.
 const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
 
-/// `process.<op>` refused in a run whose host serves none of what `reach` names.
+/// `process.<op>` rejected in a run whose host serves none of what `reach` names.
 #[cold]
 pub fn withheld(op: &'static str, reach: Reach, span: Span) -> Diagnostic {
     let served = match reach {
@@ -723,7 +723,7 @@ fn unusable(op: &str, handle: i64, at: &Resource, reason: Unusable, span: Span) 
     }
 }
 
-/// Another `process.wait` on the same child answered while this one was waiting.
+/// Another `process.wait` on the same child returned while this one was waiting.
 #[cold]
 fn raced(op: &str, handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(

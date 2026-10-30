@@ -95,7 +95,7 @@ pub fn recv_from(
 }
 
 /// One datagram, at most `max` bytes of it; what the kernel cut off a longer one is gone, and the
-/// answer says it was.
+/// result says it was.
 fn received(socket: &UdpSocket, max: usize) -> Result<Vec<u8>, NetError> {
     let mut buffer = vec![0u8; max];
     // SAFETY: `u8` and `MaybeUninit<u8>` share a layout, and a receive writes only initialised

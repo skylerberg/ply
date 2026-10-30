@@ -134,7 +134,7 @@ fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
     Arc::new(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables))
 }
 
-/// What a job answered, run on this thread.
+/// What a job returned, run on this thread.
 fn ran(job: Refusing) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
@@ -274,7 +274,7 @@ fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
     );
 }
 
-/// The table the run was given is the whole answer, and asking again reads the same one.
+/// The table the run was given is the whole result, and asking again reads the same one.
 #[test]
 fn bound_answers_whether_the_run_bound_a_program_to_the_label() {
     let shell = spawning("sh", SH);
@@ -353,7 +353,7 @@ fn file(path: &str) -> Output {
     Output::File(path.to_string())
 }
 
-/// What `start` answered under `label`: the handle, or why the child could not start.
+/// What `start` returned under `label`: the handle, or why the child could not start.
 fn launched(
     host: &Arc<ProcessHost>,
     label: &str,
@@ -500,7 +500,7 @@ fn a_signal_to_a_child_that_has_ended_answers_false() {
         "",
         wired(false, Output::Discard, Output::Discard),
     );
-    // A signal that lands before the child is gone still reaches it; the answer turns once it is.
+    // A signal that lands before the child is gone still reaches it; the result turns once it is.
     let until = Instant::now() + Duration::from_secs(10);
     while signal(&host, child, Signal::Hangup).expect("an unspent handle") {
         assert!(Instant::now() < until, "the child never ended");
@@ -673,7 +673,7 @@ fn kept_output_past_the_bound_is_drained_and_refused_at_the_wait() {
         "",
         wired(false, Output::Keep, Output::Discard),
     );
-    // The child finishes rather than blocking on a full pipe, and the refusal comes at the wait.
+    // The child finishes rather than blocking on a full pipe, and the rejection comes at the wait.
     let rejected = wait(&host, child, 60_000).expect_err("more than a kept stream holds");
     assert_eq!(rejected.code, codes::PROCESS_OUTPUT_TOO_LARGE);
     assert!(

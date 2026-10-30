@@ -1,6 +1,6 @@
 //! What this runtime says of itself to a compiler that emits code for it, in the form
 //! `compiler.emit.abi.runtime_of` reads: what a unit emitted against it is a function of, each
-//! native and helper it binds with what its function's type takes and answers, where it lays out
+//! native and helper it binds with what its function's type takes and returns, where it lays out
 //! what emitted code reads in place, each as a named integer, and the diagnostic codes it raises.
 
 use super::prelude::{machine_natives, own_helpers};

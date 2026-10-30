@@ -22,7 +22,7 @@ impl Clock for HostClock {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
-            // A clock set before the epoch is no reason to refuse a log line.
+            // A clock set before the epoch is no reason to reject a log line.
             .unwrap_or(0)
     }
 }

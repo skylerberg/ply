@@ -1,5 +1,5 @@
 //! The families this binary serves itself, as the runtime's natives bind them: a binding from what
-//! a run is lent alone, what the families register and the facts a run's disclosures print, and the
+//! a run is granted alone, what families register and the facts a run's disclosures print, and the
 //! world a trace of the run's reads is read against.
 
 use crate::hosts::Hosts;
@@ -155,7 +155,7 @@ impl Bound for Borrowed {
     }
 }
 
-/// What a trace is read against: the roots a run is lent, what the run binds apart from the
+/// What a trace is read against: the roots a run is granted, what the run binds apart from the
 /// program, and the plain value of each configuration key it is given.
 #[derive(Clone)]
 struct Worldly {
@@ -201,7 +201,7 @@ impl Worldly {
 }
 
 /// What a run binds apart from the program, which a pass's key covers: the roots, programs and
-/// families it is lent, by name.
+/// families it is granted, by name.
 fn binding_digest(grants: &Grants) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in ["fs", "exec", "allow"] {

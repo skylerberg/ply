@@ -1,5 +1,5 @@
-//! Values crossing between emitted code and the runtime a part at a time, as emitted code calls the
-//! natives: written as the codec writes them, read back part by part, and crossings begun inside
+//! Values marshalled between emitted code and runtime a part at a time, as emitted code calls the
+//! natives: written as the codec writes them, read back part by part, and marshalling begun inside
 //! others leaving the outer as they found it.
 
 use crate::bare::{context, helper};
@@ -321,7 +321,7 @@ fn bytes_that_do_not_read_as_the_type_fail_the_context() {
     assert!(said.contains("not an encoded value"), "{said}");
 }
 
-/// The read that answers a width's or a `Decimal`'s low word keeps the word above it for one ask:
+/// The read that returns a width's or a `Decimal`'s low word keeps the word above it for one ask:
 /// a narrow width's as the width's sign extends it, a 128-bit width's its own.
 #[test]
 fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
@@ -379,7 +379,7 @@ fn a_128_bit_widths_two_words_box_as_its_two_words() {
     assert!(said.contains("no 128-bit width"), "{said}");
 }
 
-/// A crossing begun inside another works on a frame of its own, and the outer one goes on where it
+/// Marshalling begun inside another works on a frame of its own, and the outer one goes on where it
 /// was.
 #[test]
 fn a_crossing_inside_a_crossing_leaves_the_outer_as_it_was() {
@@ -474,7 +474,7 @@ unsafe extern "C" fn lower_pair(ctx: *mut Ctx, w: Word) -> Word {
     0
 }
 
-/// What a diagnostic shows of a value is its bytes alone: a credential and a hold each a handle at
+/// A diagnostic shows a value's bytes alone: a credential and a scoped value each a handle at
 /// the position saying what it is, the credential's payload nowhere, and a carried value written in
 /// place through its type and what it carries through theirs.
 #[test]

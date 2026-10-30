@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-/// How many connections a listener bound here queues before the kernel refuses more.
+/// How many connections a listener bound here queues before the kernel rejects more.
 const BACKLOG: i32 = 128;
 
 /// A plaintext byte stream.
@@ -195,7 +195,7 @@ impl Sockets {
 
     /// The plaintext TCP connection an upgrade secures, with the session `secured` makes of it put
     /// in its place: every later operation on the handle goes through the session. A connection
-    /// another operation still holds is refused, since that operation would read or write the
+    /// another operation still holds is rejected, since that operation would read or write the
     /// plaintext under the session.
     fn upgraded(
         &self,
@@ -326,7 +326,7 @@ impl TcpHost {
         }
     }
 
-    /// A datagram socket put in this host's table under `label`, answering its handle.
+    /// A datagram socket put in this host's table under `label`, returning its handle.
     pub(crate) fn open_datagram(&self, label: &str, socket: UdpSocket) -> i64 {
         self.sockets
             .insert(Some(label), Socket::Datagram(Arc::new(socket)))
@@ -360,7 +360,7 @@ impl TcpHost {
             .note(format!("bind one beside the run: `--fs {root}=<directory>`"))
             .note("a Unix socket is a path, and a path is reached only under a root the run was given"));
         };
-        // A path that leads nowhere goes to the system as written, which answers that nothing is there.
+        // A path that leads nowhere goes to the system as written, which says nothing is there.
         Ok(fs::confine(base, path, span)?.unwrap_or_else(|| base.join(path)))
     }
 
@@ -563,7 +563,7 @@ impl TcpHost {
     /// An open plaintext connection secured as the client's end, verifying the server as `name`:
     /// the protocol agreed found, or why not. The session takes the handle before the handshake
     /// starts, so nothing reaches the plaintext while it runs. Plaintext the caller holds unread,
-    /// or the socket does, is a refusal: a TLS server never speaks first, so it was sent behind
+    /// or the socket does, is a rejection: a TLS server never speaks first, so it was sent behind
     /// the go-ahead to be read as if secured.
     pub fn start_tls(
         &self,
@@ -620,7 +620,7 @@ impl TcpHost {
 
     /// The server's end of `start_tls`, with the credential named `credential`. Bytes the socket
     /// already holds are the client's handshake, which it may send as soon as it has the go-ahead,
-    /// so only what the caller read past the request to upgrade is refused.
+    /// so only what the caller read past the request to upgrade is rejected.
     pub fn serve_tls(
         &self,
         label: &str,
@@ -668,7 +668,7 @@ impl TcpHost {
         }))
     }
 
-    /// At most `max` bytes found, as soon as any arrive: none is the deadline, and an empty answer
+    /// At most `max` bytes found, as soon as any arrive: none is the deadline, and an empty result
     /// the peer done sending.
     pub fn recv(
         &self,
@@ -781,7 +781,7 @@ impl TcpHost {
             Some(Socket::Stream(s)) => s.shutdown(Shutdown::Both),
             // `close_notify` first, so the peer sees a clean end rather than a truncation.
             Some(Socket::Tls(s)) => s.close(),
-            // The file is the listener's, so it goes with it; a path left behind refuses the
+            // The file is the listener's, so it goes with it; a path left behind fails the
             // next bind.
             #[cfg(unix)]
             Some(Socket::Listener(Listening::Unix(_, path))) => {
@@ -1216,7 +1216,7 @@ fn reuse_port(_: &RawSocket, _: bool) -> io::Result<()> {
     ))
 }
 
-/// Each option the socket answers for; one it does not have (a Unix socket's `NoDelay`) is left
+/// Each option the socket handles; one it does not have (a Unix socket's `NoDelay`) is left
 /// out.
 fn standing(socket: &RawSocket) -> Vec<SocketOption> {
     let mut options = Vec::new();

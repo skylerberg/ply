@@ -12,18 +12,18 @@ macro_rules! codes {
 
 codes! {
     UNHANDLED_EFFECT = "E0303";
-    /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
+    /// A `Task` in a simulation's result, or a `join` after its scheduler ended.
     TASK_ESCAPES_SCOPE = "E0413";
-    /// A simulated region with nothing enabled and no timer to fire, or out of step budget.
+    /// A simulation with nothing enabled and no timer to fire, or out of step budget.
     DEADLOCK = "E0414";
     /// Replaying a seed did not reproduce the recorded schedule.
     SIMULATION_DIVERGENCE = "E0415";
-    /// A `simulate` region inside a `simulate` region, lexically or through a call.
+    /// A simulation inside a simulation, lexically or through a call.
     NESTED_SIMULATION = "E0416";
     /// An operation reached the host boundary with nothing bound to serve it, or a run that is no
     /// test's read what it cost.
     HOST_UNBOUND = "E0424";
-    /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
+    /// A host operation performed inside a simulation, or in a test the search re-runs.
     HOST_IN_SIMULATION = "E0425";
     /// A listener, a connection presenting one, or `--mtls` named a credential the binding does not
     /// hold.
@@ -33,16 +33,16 @@ codes! {
     TLS_CREDENTIAL_INVALID = "E0430";
     /// `trace.exit` naming a span not open on the performing task's stack.
     SPAN_UNBALANCED = "E0445";
-    /// A hold read or let go after its region released what it held.
+    /// A scoped value read or let go after its scope released what it held.
     HOLD_RELEASED = "E0331";
-    /// A task, channel or continuation crossing a runtime boundary, where no type is left to check it.
+    /// A task, channel or continuation marshalled across a runtime boundary, unchecked by any type.
     REGION_ESCAPE_AT_BOUNDARY = "E0449";
     BACKEND_UNAVAILABLE = "E0450";
     /// An `fs` operation named a resource label the run bound no root to.
     FS_ROOT_UNBOUND = "E0451";
     /// A path leaving its label's root via `..`, an absolute path, or a symlink.
     FS_PATH_ESCAPES_ROOT = "E0452";
-    /// A read whose answer would be larger than one value holds; `fs.read_at` reads a range.
+    /// A read whose result would be larger than one value holds; `fs.read_at` reads a range.
     FS_FILE_TOO_LARGE = "E0453";
     /// A `--fs NAME=PATH` root that is missing, not a directory, or unresolvable.
     FS_ROOT_INVALID = "E0454";

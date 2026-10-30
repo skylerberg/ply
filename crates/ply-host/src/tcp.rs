@@ -1,6 +1,6 @@
 //! The sockets `std.net` and `std.udp` open, in one table: TCP, TLS and Unix streams, listeners and
 //! datagram sockets, each under the handle and the resource label the program uses it by. The real
-//! handlers' natives call in here, and an operation that waits answers a job for the process's
+//! handlers' natives call in here, and an operation that waits returns a job for the process's
 //! waiting pool.
 
 mod socket;

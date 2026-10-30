@@ -80,9 +80,9 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// What `answer` answers of the run's process host, where the native may ask the host for an
-/// answer of `determinism`; `refused`, with the run failed, where the run was lent no process host, or
-/// `answer` refuses. `op` and `reach` name what a refusal names.
+/// What `result` returns of the run's process host, where the native may ask the host for a
+/// response of `determinism`; `rejected`, with the run failed, where the run was granted no
+/// process host, or `result` fails. `op` and `reach` name what a rejection names.
 fn hosted<R: Copy>(
     ctx: *mut Ctx,
     native: &'static str,
@@ -116,7 +116,7 @@ fn stream_of(number: I64) -> Stream {
     }
 }
 
-/// The environment lent as parts at `p`, each variable's name then its value, and, where the run
+/// The environment borrowed as parts at `p`, each variable's name and value, and, where the run
 /// asking is observed, where a `ply` the child is reports what it read.
 fn environment_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<(String, String)>> {
     let texts = texts_at(c, p, n)?;
@@ -324,7 +324,7 @@ pub unsafe extern "C" fn rt_process_spawn(
     )
 }
 
-/// How a child is wired, lent as parts: three bytes, 1 where it reads input and each output
+/// How a child is wired, borrowed as parts: three bytes, 1 where it reads input and each output
 /// stream's number (`Keep` 0, `Discard` 1, `Inherit` 2, `Lines` 3 and `File` 4), then the path
 /// of each stream that is a file.
 fn wiring_of(wiring: &[u8]) -> Option<Io> {

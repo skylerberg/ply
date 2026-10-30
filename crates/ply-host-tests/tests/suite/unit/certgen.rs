@@ -80,7 +80,7 @@ fn a_named_certificate_is_a_certificate_for_that_name() {
         &[],
     )
     .expect("the issued material loads as a credential");
-    // Resolving the server config reads the leaf, so a malformed pair would refuse here.
+    // Resolving the server config reads the leaf, so a malformed pair would fail here.
     let server = loaded
         .resolve("issued", ply_core::Span::DUMMY)
         .expect("resolves");

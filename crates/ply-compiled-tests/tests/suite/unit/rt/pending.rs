@@ -1,6 +1,6 @@
 //! A raise the runtime left pending, which a closure holding a word for `abort` raises through it as
 //! it leaves: handed over as its message to a clause's slot, and through the bridge's raised on as
-//! the raise it is, its diagnostic kept where nothing answers it the second time either.
+//! the raise it is, its diagnostic kept where nothing handles it the second time either.
 
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
@@ -72,14 +72,14 @@ static STRING_T: PlyType = PlyType {
     lift: text_lift,
 };
 
-/// `Bytes::at` given index 5 of 2 bytes, left pending, numbered as `REFUSED` numbers it.
+/// `Bytes::at` given index 5 of 2 bytes, left pending, numbered as `REJECTED` numbers it.
 fn rejected(ctx: &mut Ctx) {
     let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
         helper(&builtin_helper_name("?refused"));
     unsafe { rejected(ctx, 8, 5, 2, 0) };
 }
 
-/// Through the bridge, which answers no raise, the entry fails as the runtime left it failing:
+/// Through the bridge, which handles no raise, the entry fails as the runtime left it failing:
 /// `left`'s code, message and notes, not a `panic:` made of its text.
 fn raised_on_keeps(ctx: &mut Ctx) {
     assert_eq!(ctx.failed, FAILED_PENDING, "nothing answers the refusal");
@@ -117,7 +117,7 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin();
     let said = "the sides differ";
-    // `assert` with a message, numbered as `REFUSED` numbers it.
+    // `assert` with a message, numbered as `REJECTED` numbers it.
     let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word, Word) =
         helper(&builtin_helper_name("?refused_text"));
     unsafe {
@@ -134,7 +134,7 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
     raised_on_keeps(&mut ctx);
 }
 
-/// A clause's slot is handed the message, and the entry fails no longer: the clause answers it.
+/// A clause's slot is handed the message, and the entry fails no longer: the clause handles it.
 #[test]
 fn a_clause_is_handed_the_message_of_a_raise_left_pending() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());

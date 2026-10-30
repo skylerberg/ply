@@ -1,8 +1,8 @@
 //! `std.term`'s natives: whether the process's streams are a terminal, the terminal's size and
 //! input mode, and what is typed at it, read from the buffer `process.line` reads.
 //!
-//! A line read for a `Secret` crosses as one alone: the job that reads it keeps it with the run
-//! that asked, under a number, and answers the number found, and `term_secret_taken` makes the
+//! A line read for a `Secret` is marshalled alone: the job that reads it keeps it with the run
+//! that asked, under a number, and returns the number found, and `term_secret_taken` makes the
 //! secret of what the run keeps.
 
 use super::{Nondeterministic, asked, from_host, handed, waited};
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
     )
 }
 
-/// The terminal standard input is put in the mode numbered `mode`, answering the mode it was in,
+/// The terminal standard input is put in the mode numbered `mode`, returning the mode it was in,
 /// or -1, nothing changed, where standard input is no terminal.
 pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
     asked(

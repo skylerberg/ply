@@ -20,27 +20,27 @@ pub use load::{Library, cache_dir};
 pub(crate) use prelude::machine_native;
 pub use prelude::{MachineNative, builtin_helper_name, helpers, machine_natives, own_helpers};
 
-/// The runtime's sources, as `build.rs` digests them, less how C is compiled, kept, swept and
-/// loaded and how Rust asks the compiler: what an answer computed inside a loaded unit is a
+/// The runtime's sources, as `build.rs` digests them, less how C is compiled, cached, swept and
+/// loaded and how Rust asks the compiler: what a result computed inside a loaded unit is a
 /// function of. Not the binary: a change anywhere else in `ply`, or the other build profile,
-/// answers the same.
+/// returns the same.
 pub fn semantics_digest() -> &'static str {
     env!("PLY_SEMANTICS_DIGEST")
 }
 
-/// Where the emitter's answers are kept between runs, beside the objects they compile to and under
+/// Where the emitter's results are cached between runs, by the objects they compile to and under
 /// the same sweep.
 pub fn bodies_dir() -> std::path::PathBuf {
     load::cache_dir().join("bodies")
 }
 
-/// Every directory a run keeps for the next one in: the compiled objects and the stages. What is
-/// there is a product of its key, so no answer depends on finding it.
+/// Every directory a run caches in for the next one: the compiled objects and the stages. What is
+/// there is a product of its key, so no result depends on finding it.
 pub fn kept_dirs() -> Vec<std::path::PathBuf> {
     vec![load::cache_dir(), stage::stage_root()]
 }
 
-/// The directory a run keeps `kind` of what it keeps in: the one the variable `named` names, else
+/// The directory a run caches `kind` of what it caches in: the one the variable `named` names, else
 /// `ply/<kind>` under the user's caches, which a restart of the machine leaves as they were.
 pub(crate) fn kept_dir(kind: &str, named: &str) -> std::path::PathBuf {
     let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);

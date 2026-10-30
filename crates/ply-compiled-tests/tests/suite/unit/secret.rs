@@ -1,6 +1,6 @@
 //! The natives a `Secret` is made, read and computed over through, called as a unit binds them over
 //! hand-built bytes: a name, plain bytes and integers in, and plain bytes, a count, a verdict or a
-//! secret's handle out, an empty answer or a code below 0 where an operation has nothing.
+//! secret's handle out, an empty result or a code below 0 where an operation has nothing.
 
 use crate::bare::{context, helper};
 use ply_compiled::c::builtin_helper_name;
@@ -54,13 +54,13 @@ fn hex(digits: &str) -> Vec<u8> {
         .collect()
 }
 
-/// What a native taking a name and a secret answers.
+/// What a native taking a name and a secret returns.
 fn named_secret(ctx: &mut Ctx, native_name: &str, name: &str, secret: Word) -> Word {
     let (p, n) = borrowed(name.as_bytes());
     unsafe { native::<A3>(native_name)(ctx, p, n, secret) }
 }
 
-/// What a native taking a name alone answers.
+/// What a native taking a name alone returns.
 fn of_name(ctx: &mut Ctx, native_name: &str, name: &str) -> Word {
     let (p, n) = borrowed(name.as_bytes());
     unsafe { native::<A2>(native_name)(ctx, p, n) }
@@ -324,7 +324,7 @@ fn pbkdf2_derives_as_rfc_6070_says_within_its_bounds() {
     assert_eq!(ctx.failed, 0);
 }
 
-/// What `crypto_sealed` or `crypto_opened` answers over `cipher`, `key`, `nonce` and `text`.
+/// What `crypto_sealed` or `crypto_opened` returns over `cipher`, `key`, `nonce` and `text`.
 fn sealing(
     ctx: &mut Ctx,
     native_name: &str,
@@ -367,7 +367,7 @@ fn a_sealed_message_opens_under_its_key_alone() {
         sealing(&mut ctx, "crypto_opened", cipher, key, &nonce, &turned),
         [0]
     );
-    // What the Ply around them refuses: a short key, a nonce of another cipher's length.
+    // What the Ply around them rejects: a short key, a nonce of another cipher's length.
     let short = sealed(&mut ctx, &[9; 16], false);
     let aes = "aes-256-gcm";
     assert!(sealing(&mut ctx, "crypto_sealed", aes, short, &nonce[..12], b"x").is_empty());
@@ -405,7 +405,7 @@ fn a_signature_and_a_public_key_are_found_under_their_scheme() {
     let mut turned = signed[1..].to_vec();
     turned[3] ^= 1;
     assert_eq!(verify(&mut ctx, "ed25519", &found[1..], &turned), 0);
-    // A key that is none of its scheme is found to be none; a scheme it has not is no answer.
+    // A key that is none of its scheme is found to be none; a scheme it has not gives no result.
     let short = sealed(&mut ctx, &[5; 3], false);
     assert_eq!(public(&mut ctx, "p256", short), [0]);
     assert_eq!(sign(&mut ctx, "ecdsa-p256-sha256", short), [0]);

@@ -118,7 +118,7 @@ fn a_lock_is_taken_once_and_released_only_by_its_holder() {
 
     assert!(take_lock(&lock, &held));
     assert!(lock.exists(), "the lock is the file's existence");
-    // A second taker waits out the holder and answers `false` rather than raising. Waiting the
+    // A second taker waits out the holder and returns `false` rather than raising. Waiting the
     // two seconds `fs.lock` waits proves nothing this does not, so the wait is the caller's here.
     let brief = Duration::from_millis(20);
     let waited = Instant::now();
@@ -191,7 +191,7 @@ fn rooted(at: &Path) -> FsHost {
     FsHost::new(roots)
 }
 
-/// What a job answered, run on this thread.
+/// What a job returned, run on this thread.
 fn ran(job: ply_host::jobs::Refusing) -> Result<Vec<u8>, Diagnostic> {
     job().map_err(|failure| match failure {
         Failure::Rejected(rejection) => rejection,
@@ -286,7 +286,7 @@ fn an_append_creates_the_log_and_answers_where_each_frame_landed() {
 
     let whole = dir.path().canonicalize().unwrap().join("frontend.dat");
     assert_eq!(std::fs::read(&whole).unwrap(), b"headerframetail");
-    // The offset an append answered is the one the frame is read back at.
+    // The offset an append returned is the one the frame is read back at.
     assert_eq!(read_at(&fs, "frontend.dat", 6, 5), Some(b"frame".to_vec()));
     assert_eq!(read_at(&fs, "frontend.dat", 11, 4), Some(b"tail".to_vec()));
 }
@@ -313,7 +313,7 @@ fn a_ranged_read_answers_what_is_there_and_is_short_past_the_end() {
 
     assert_eq!(read_at(&fs, "a.dat", 0, 10), Some(b"0123456789".to_vec()));
     assert_eq!(read_at(&fs, "a.dat", 3, 4), Some(b"3456".to_vec()));
-    // Short rather than refused: a file can end before a range a reader recorded earlier does.
+    // Short rather than rejected: a file can end before a range a reader recorded earlier does.
     assert_eq!(read_at(&fs, "a.dat", 8, 100), Some(b"89".to_vec()));
     assert_eq!(read_at(&fs, "a.dat", 10, 5), Some(Vec::new()));
     assert_eq!(read_at(&fs, "a.dat", 99, 5), Some(Vec::new()));
@@ -349,7 +349,7 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
         "the refusal should name what reads a large file: {:?}",
         rejected.notes
     );
-    // The bound is reachable, so the largest allowed call is not itself refused.
+    // The bound is reachable, so the largest allowed call is not itself rejected.
     assert_eq!(read_at(&fs, "a.dat", 0, MAX_READ_BYTES as i64), None);
 }
 
@@ -559,7 +559,7 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_refused() {
     }
 }
 
-/// The entries a walk answered, each its path and kind.
+/// The entries a walk returned, each its path and kind.
 fn entries(said: Vec<u8>) -> Option<Vec<(String, Kind)>> {
     found(&said).map(|flat| {
         parts_of(flat)
@@ -719,7 +719,7 @@ fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
     assert!(closed(&fs, "cache", first));
     assert!(!closed(&fs, "cache", first));
     assert_eq!(chunk(&fs, "cache", first, 4), None);
-    // A descriptor names one open, so the next open answers another.
+    // A descriptor names one open, so the next open returns another.
     let second = opened(&fs, "cache", "log", Opening::Read).expect("the file opens again");
     assert_ne!(second, first);
 }
@@ -763,7 +763,7 @@ fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
         .map(|_| ())
         .expect_err("more than one read answers");
     assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
-    // The refusal did not move the descriptor.
+    // The rejection did not move the descriptor.
     assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
 }
 
@@ -796,7 +796,7 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
             "{there}"
         );
     }
-    // The link was refused as itself: nothing was made where it points.
+    // The link was rejected as itself: nothing was made where it points.
     assert!(!real.join("d/nowhere").exists());
     assert_eq!(
         opened(&fs, "cache", "no/new", Opening::Create),
@@ -901,7 +901,7 @@ fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
     );
 }
 
-/// A secret read after its run ended is kept by no one, and answers as one not there.
+/// A secret read after its run ended is kept by no one, and returns as one not there.
 #[test]
 fn a_secret_read_for_a_run_that_has_ended_is_kept_by_no_one() {
     let dir = root();
@@ -1300,7 +1300,7 @@ fn given(op: Op, path: &str) -> Vec<(String, Second, bool)> {
             (p(), Second::Path(plain()), true),
             ("named".to_string(), Second::Path(p()), true),
         ],
-        // An open file is named by the descriptor `open` answered, and takes no path.
+        // An open file is named by the descriptor `open` returned, and takes no path.
         Op::ReadChunk | Op::WriteChunk | Op::Close => Vec::new(),
     }
 }
@@ -1442,7 +1442,7 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
     );
 
     // A link's target that steps back out of a name that is not there names nothing, as the
-    // system answers it.
+    // system resolves it.
     std::os::unix::fs::symlink("absent/../d/a.txt", real.join("back")).unwrap();
     assert_eq!(read("back"), None);
     assert!(!write("back"));

@@ -1,14 +1,14 @@
-//! The runtime's part of `bracket`, and the refusals and notes compiled code over data raises or makes.
+//! `bracket`'s runtime part, and the rejections and notes compiled code over data raises or makes.
 
 use super::*;
 use crate::native::Addr;
 
-/// `bracket(acquire, release, body)`: `body` given what `acquire` answered and `cleanup` given it
+/// `bracket(acquire, release, body)`: `body` given what `acquire` returned and `cleanup` given it
 /// after, however `body` ends: by returning, by a raise or a clause that did not resume it unwinding
 /// through, or by a cancel. It runs where the bracket stands, with the handlers around it, and a
 /// failure in it replaces whatever was unwinding. Each closure is let go once called. `held` is the
-/// type of what `acquire` answers, which both take a count of, and `answer` the type of what `body`
-/// answers, let go of where `cleanup` fails. A value a clause unwinds with is abandoned with the
+/// type of what `acquire` returns, which both take a count of, and `result` the type of what `body`
+/// returns, let go of where `cleanup` fails. A value a clause unwinds with is abandoned with the
 /// unwind, uncounted: its type is not known here. What this holds across each call is in a record
 /// on the stack's chain, so a body abandoned at a stop under the call lets it go.
 pub unsafe extern "C" fn rt_with_cleanup(
@@ -21,7 +21,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
 ) -> Handed {
     use crate::frames::{Held, held_across};
     let c = unsafe { &mut *ctx };
-    // The three share the bracket's row: each is handed the words its caller set for it.
+    // The three share the bracket's effects: each is handed the words its caller set for it.
     let words = (c.entering_desc, c.entering_words);
     let entering = move || {
         let c = unsafe { &mut *ctx };
@@ -193,7 +193,7 @@ impl Unwinding {
 
 /// Sets aside the failure going on, where it is one a release runs during (a raise, a clause that
 /// did not resume, a cancel), so emitted code can let go of a resource on the failure's way out:
-/// answers 1, the failure written into the words at `held`, or 0 where nothing is failing or the
+/// returns 1, the failure written into the words at `held`, or 0 where nothing is failing or the
 /// failure is the run's, which releases nothing. The release runs where the failure stands, with the
 /// handlers around it, as a `bracket`'s does.
 pub unsafe extern "C" fn rt_unwind_hold(ctx: *mut Ctx, held: Word) -> Word {
@@ -230,8 +230,8 @@ fn cancel_carried(c: &mut Ctx) {
     c.failed = FAILED_CANCELLED;
 }
 
-/// A builtin emitted code writes in place whose refusal of its operands it hands the runtime:
-/// through [`rt_refused`] where the refusal names numbers, and through
+/// A builtin emitted code writes in place whose rejection of its operands it hands the runtime:
+/// through [`rt_refused`] where the rejection names numbers, and through
 /// [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rejected {
@@ -263,7 +263,7 @@ pub enum Rejected {
     SecretRsaJwk,
 }
 
-/// Every [`Refused`], each numbered by its place here as emitted code numbers it.
+/// Every [`Rejected`], each numbered by its place here as emitted code numbers it.
 pub const REJECTED: [Rejected; 26] = [
     Rejected::ArrayNew,
     Rejected::ColumnsNew,
@@ -326,7 +326,7 @@ impl Rejected {
         }
     }
 
-    /// Whether its refusal raises for `abort.raise` to answer, as the prelude declares it, rather
+    /// Whether its rejection raises for `abort.raise` to handle, as the prelude declares it, rather
     /// than ending the run.
     pub fn raises(self) -> bool {
         !matches!(
@@ -336,14 +336,14 @@ impl Rejected {
     }
 }
 
-/// The refusal [`REFUSED`] numbers `what`.
+/// The rejection [`REJECTED`] numbers `what`.
 pub(crate) fn rejected_numbered(what: I64) -> Option<Rejected> {
     usize::try_from(what.0)
         .ok()
         .and_then(|at| REJECTED.get(at).copied())
 }
 
-/// The refusal `d` of `r`: raised for `abort.raise` to answer where `r` raises, else failing the
+/// The rejection `d` of `r`: raised for `abort.raise` to handle where `r` raises, else failing the
 /// run.
 pub(crate) fn refuse(c: &mut Ctx, r: Rejected, d: Diagnostic) {
     if r.raises() {
@@ -353,8 +353,8 @@ pub(crate) fn refuse(c: &mut Ctx, r: Rejected, d: Diagnostic) {
     }
 }
 
-/// The entry failed as Ply's fault: emitted code handed a refusal `what` that names no builtin the
-/// native refuses.
+/// The entry failed as Ply's fault: emitted code handed a rejection `what` that names no builtin
+/// the native rejects.
 pub(crate) fn rejected_unknown(c: &mut Ctx, what: I64) {
     c.fail(
         Diagnostic::error(
@@ -365,9 +365,9 @@ pub(crate) fn rejected_unknown(c: &mut Ctx, what: I64) {
     );
 }
 
-/// An operation emitted code writes in place, refused numbers among its operands: left in the
-/// context as [`refuse`] leaves the builtin's own refusal of them. `what` numbers the builtin as
-/// [`REFUSED`] does, and `a`, `b` and `c` are what its refusal names: `Array::new`, `Columns::new`,
+/// An operation emitted code writes in place, rejected numbers among its operands: left in the
+/// context as [`refuse`] leaves the builtin's own rejection of them. `what` numbers the builtin as
+/// [`REJECTED`] does; `a`, `b` and `c` are what its rejection names: `Array::new`, `Columns::new`,
 /// `Array::of_list` and `Columns::of_list` a length `a`; `Array::get`, `Array::set`,
 /// `Columns::get`, `Columns::set`, `Bytes::at` and `Bytes::u32_le` an index `a` into `b` elements or
 /// bytes; `Bytes::slice` and `String::slice` a range `a..b` of `c` bytes or characters;
@@ -429,7 +429,7 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
     Raises(())
 }
 
-/// `assert_eq` found its two values unequal: raised for `abort.raise` to answer, showing the actual
+/// `assert_eq` found its two values unequal: raised for `abort.raise` to handle, showing the actual
 /// value, the `n` PLV1 bytes at `actual`, and the expected, the `m` at `expected`, which the CLI
 /// renders, noting where the two first part.
 #[allow(improper_ctypes_definitions)]
@@ -457,7 +457,7 @@ pub unsafe extern "C" fn rt_assert_failed(
     Raises(())
 }
 
-/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a step answer
+/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a step result
 /// that is no `Iter`, which its type rules out.
 pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     let ctx = unsafe { &mut *ctx };

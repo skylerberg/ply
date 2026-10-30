@@ -1,6 +1,6 @@
 //! Reads of a pure nullary definition, as emitted code writes one: the first evaluates the
 //! definition and keeps its value for good through the type's keep root, and each later read
-//! answers that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
+//! returns that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
 //! roots here are written as emitted code writes them, over blocks laid out as it lays one.
 
 use crate::bare::{context_of, helper};
@@ -119,7 +119,7 @@ fn a_value_its_keep_root_refuses_is_kept_nowhere_and_each_read_evaluates_it() {
 
 static NINES: AtomicUsize = AtomicUsize::new(0);
 
-/// Fails the first time it is evaluated, and answers a box of 9 after.
+/// Fails the first time it is evaluated, and returns a box of 9 after.
 unsafe extern "C" fn nine_after_a_failure(ctx: *mut Ctx, _args: *const Word) -> Word {
     if NINES.fetch_add(1, Ordering::SeqCst) == 0 {
         unsafe { (*ctx).failed = 1 };
@@ -263,7 +263,7 @@ fn a_constant_is_evaluated_once_and_every_later_read_answers_the_copy() {
     ctx.end();
 }
 
-/// `Bytes::at` refused, left pending as a raise of `abort.raise`.
+/// `Bytes::at`'s rejection, left pending as a raise of `abort.raise`.
 unsafe extern "C" fn refusing(ctx: *mut Ctx, _args: *const Word) -> Word {
     let rejected: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
         helper(&builtin_helper_name("?refused"));

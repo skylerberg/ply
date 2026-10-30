@@ -269,7 +269,7 @@ fn shaken(
     (s, c)
 }
 
-/// The error a handshake between the two ends with, whichever end refused.
+/// The error a handshake between the two ends with, whichever end rejected.
 fn rejection(server: &Arc<ServerConfig>, client: &Arc<ClientConfig>, name: &str) -> TlsError {
     let (mut s, mut c) = ends(server, client, name);
     for _ in 0..8 {
@@ -299,7 +299,7 @@ fn pump(from: &mut rustls::Connection, to: &mut rustls::Connection) {
     passed(from, to).expect("the peer's records are good");
 }
 
-/// What `from` has to write, read by `to`, or the error `to` refused it with.
+/// What `from` has to write, read by `to`, or the error `to` rejected it with.
 fn passed(from: &mut rustls::Connection, to: &mut rustls::Connection) -> Result<(), TlsError> {
     let mut wire = Vec::new();
     while from.wants_write() {
@@ -724,7 +724,7 @@ fn a_request_over_tls_reads_and_writes_the_same_bytes_the_plaintext_path_would()
     assert!(counts.reasons.is_empty());
 
     session.close();
-    // End of stream is not a one-shot answer, and a closed session never wakes.
+    // End of stream is not a one-shot result, and a closed session never wakes.
     assert_eq!(session.read(64), Some(Vec::new()));
     assert_eq!(session.write(RESPONSE), 0);
 }
@@ -748,7 +748,7 @@ fn a_client_offering_only_h2_is_refused_and_one_offering_http_1_1_is_served() {
     assert_eq!(counts.completed, 0);
     assert_eq!(counts.reasons, [(REASON_ALPN, 1)]);
 
-    // The listener survives: the half of the claim one refused connection cannot show.
+    // The listener survives: the half of the claim one rejected connection cannot show.
     let client = speak(
         peer.port(),
         material.der.clone(),
@@ -779,7 +779,7 @@ fn a_peer_that_does_not_speak_tls_closes_that_connection_and_nothing_else() {
     let plaintext = std::thread::spawn(move || {
         let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let _ = socket.write_all(REQUEST);
-        // Held open so the server's answer is a refusal rather than an EOF.
+        // Held open so the server's response is a rejection rather than an EOF.
         std::thread::sleep(std::time::Duration::from_millis(50));
     });
 
@@ -900,7 +900,7 @@ fn every_reason_is_one_of_a_fixed_set_and_names_what_to_do() {
     assert!(REASON_VERSION.contains("TLS 1.3") && REASON_VERSION.contains("TLS 1.2"));
     assert!(REASON_ALPN.contains("http/1.1"));
 
-    // After the handshake it is a transport failure; counting it refused would inflate the summary.
+    // Past the handshake it is a transport failure; counting it rejected would inflate the summary.
     let after = io::Error::new(io::ErrorKind::InvalidData, TlsError::DecryptError);
     assert_eq!(reason(false, &after), REASON_TRANSPORT);
 }

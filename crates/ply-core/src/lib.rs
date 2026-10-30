@@ -1,4 +1,4 @@
-//! The runtime's vocabulary: PLV1, spans, diagnostics and their codes, effects and their atoms, and
+//! The runtime's vocabulary: PLV1, spans, diagnostics and their codes, effects, and
 //! the host boundary.
 
 pub mod builtins;

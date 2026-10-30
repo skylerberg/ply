@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 static UNIT: OnceLock<&'static Descriptor> = OnceLock::new();
 
-/// Installs the descriptor `main` hands over. Refused when one is installed already.
+/// Installs the descriptor `main` hands over. Rejected when one is installed already.
 ///
 /// # Safety
 /// `unit` points at a unit's descriptor, which lives as long as the process.

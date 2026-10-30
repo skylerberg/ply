@@ -167,7 +167,7 @@ impl Trace {
         });
     }
 
-    /// Opens a span on `channel` inside the innermost one `owner` has open, answering its id. The
+    /// Opens a span on `channel` inside the innermost one `owner` has open, returning its id. The
     /// span is kept whatever the sink does, so whether an `exit` balances cannot depend on
     /// `--trace`; its record is written where the sink wants `info`.
     pub fn enter(

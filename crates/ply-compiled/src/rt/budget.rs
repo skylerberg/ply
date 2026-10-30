@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// The slow path of a prologue or a loop's restart, for a frame below `ctx.stack_floor`: ends an
 /// entry whose wall clock ran out, which the watchdog marks by raising its floor past every frame;
 /// otherwise makes room below the floor of the stack it runs on and lowers the floor to match.
-/// Answers 1, or 0 with the context failed for a spent clock, a call nesting past what the native
+/// Returns 1, or 0 with the context failed for a spent clock, a call nesting past what the native
 /// stack holds, on a thread's own stack, whose floor is final, on a runtime stack whose reservation
 /// is spent, and on a stack the runtime does not know.
 pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
@@ -58,7 +58,7 @@ pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
 
 /// Runs `call`, which begins compiled code, where that code can make room as it nests: here, on a
 /// stack the runtime knows, or else, on a segment a Rust recursion grew onto, on a runtime stack of
-/// its own for the call's duration. Answers 0 with the context failed when no stack can be had.
+/// its own for the call's duration. Returns 0 with the context failed when no stack can be had.
 pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
     if let Some(floor) = floor_here() {
         unsafe { (*ctx).stack_floor.store(floor, Relaxed) };
@@ -240,7 +240,7 @@ pub(crate) fn floor_here() -> Option<usize> {
 }
 
 /// [`floor_here`], or above every address on a stack the runtime does not know, where a probe then
-/// asks [`rt_stack_more`], which refuses.
+/// asks [`rt_stack_more`], which fails.
 pub(crate) fn stack_floor() -> usize {
     floor_here().unwrap_or(usize::MAX)
 }
@@ -302,7 +302,7 @@ pub(super) fn stack_of_this_thread() -> (usize, usize) {
 }
 
 /// Assumes a spawned thread's default stack below this frame, and every address above that the
-/// thread's: refusing early beats overflowing.
+/// thread's: failing early beats overflowing.
 #[cfg(not(target_os = "macos"))]
 pub(super) fn fallback_stack() -> (usize, usize) {
     let here = 0u8;

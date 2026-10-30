@@ -71,7 +71,7 @@ pub unsafe fn reserve(len: usize) -> *mut u8 {
     p
 }
 
-/// Makes the `len` bytes at `addr`, within what [`reserve`] answered and a multiple of the page
+/// Makes the `len` bytes at `addr`, within what [`reserve`] returned and a multiple of the page
 /// size, readable and writable: zeros, backed as they are touched. `false` when the system will
 /// commit no more.
 pub unsafe fn commit(addr: *mut u8, len: usize) -> bool {
@@ -97,7 +97,7 @@ pub unsafe fn map_aligned(len: usize) -> *mut u8 {
     }
 }
 
-/// Gives back `len` bytes [`map`] or [`reserve`] answered at `addr`.
+/// Gives back `len` bytes [`map`] or [`reserve`] returned at `addr`.
 pub unsafe fn unmap(addr: *mut u8, len: usize) {
     unsafe { munmap(addr, len) };
 }

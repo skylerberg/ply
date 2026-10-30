@@ -1,17 +1,17 @@
 //! What a test read of the world while it ran: the files and directories the host handlers that
-//! answered it read, what they wrote, the configuration keys it read, the shipped modules it asked
+//! handled it read, what they wrote, the configuration keys it read, the shipped modules it asked
 //! for, and what any `ply` it started read in turn, but for that `ply`'s configuration, which is what
 //! the test handed it. No trace holds anything of a secret, so a run that read a secret
-//! configuration value files no pass. A test's pass is filed with what this comes to, and stands only while every read
-//! still answers as it did. A load that read a shipped module for only what its program reaches says
+//! configuration value records no pass. A pass is recorded with what this comes to, and stands only while every read
+//! still returns as before. A load that read a shipped module for only what its program reaches says
 //! so in a view: the module's form and each function reached, with its hash, stand in for that read
 //! of the whole module.
 //!
-//! A test's record is its run's, which the handler that answers a read enters it into; a handler of
+//! A test's record is its run's, which the handler that handles a read enters it into; a handler of
 //! the test's own touches no host and records nothing. A run made on a test's behalf (a nested
 //! machine a command drives) shares its caller's record. What the test writes is its own: a read
 //! under a path it wrote is not an input, and a directory it wrote into is read without what it wrote
-//! there. Nor is a read under a directory a run keeps for the next one an input, a front end's store
+//! there. Nor is a read under a cache directory an input, a front end's store
 //! included wherever it sits, since what is there is a product of its key; nor one of a checkout's
 //! version control, whose commit moves with every change, as the clock does. A `ply` a test starts
 //! is handed a file in [`TRACE_VAR`] and reports there what its whole process read; a program that is
@@ -30,7 +30,7 @@ pub const TRACE_VAR: &str = "PLY_TRACE";
 /// The last line of a report a `ply` finished.
 const END: &str = "end";
 
-/// The digest of a line two answers disagreed on, which nothing answers again.
+/// The digest of a line two results disagreed on, which nothing returns again.
 const SPLIT: &str = "split";
 
 /// Between the paths a listing leaves out, which no name holds.
@@ -90,7 +90,7 @@ struct Observed {
     digested: BTreeMap<String, String>,
     /// Report files handed to the programs this record started.
     children: Vec<PathBuf>,
-    /// Each configuration key read, with the digest of what it answered. A run made on the record's
+    /// Each configuration key read, with the digest of what it returned. A run made on the record's
     /// behalf, a nested one's or a child's, is configured by what this one handed it, so what it
     /// read of its own configuration is none of this.
     config: BTreeMap<String, String>,
@@ -136,14 +136,14 @@ const STORE: &str = ".ply-cache";
 /// A checkout's version control.
 const VCS: &str = ".git";
 
-/// Where this `ply` lays its shipped modules out as files, and the directories it keeps what one
+/// Where this `ply` lays its shipped modules out as files, and the directories it caches what one
 /// run leaves for the next in.
 pub fn laid_out(shipped_dir: &Path, kept: Vec<PathBuf>) {
     let _ = SHIPPED_DIR.set(resolved(shipped_dir));
     keeps(kept);
 }
 
-/// The directories this process keeps what one run leaves for the next in.
+/// The directories this process caches what one run leaves for the next in.
 pub fn keeps(kept: Vec<PathBuf>) {
     let _ = KEPT.set(
         kept.into_iter()
@@ -220,7 +220,7 @@ impl Recorder {
     }
 
     /// `path` was read as `how` says; a read of the shipped modules' files is one of a module or
-    /// of the program, and one under a kept directory is no input.
+    /// of the program, and one under a cache directory is no input.
     pub fn read(&self, how: Read, path: &Path) {
         if let Some(rest) = SHIPPED_DIR
             .get()
@@ -243,7 +243,7 @@ impl Recorder {
         self.observed().reads.insert((how, path.to_path_buf()));
     }
 
-    /// The configuration key `key` was read, and answered `value`.
+    /// The configuration key `key` was read, and returned `value`.
     pub fn configured(&self, key: &str, value: Option<&str>) {
         settle(
             &mut self.observed().config,
@@ -368,7 +368,7 @@ fn settle(lines: &mut BTreeMap<String, String>, line: String, digest: String) {
         .or_insert(digest);
 }
 
-/// What a binary answers about itself, which a trace's `shipped` and `program` lines hold: each
+/// What a binary reports about itself, which a trace's `shipped` and `program` lines hold: each
 /// shipped module's digest by name, or the list's for the empty name, and its program's digest.
 pub struct Binary<'a> {
     pub shipped: &'a dyn Fn(&str) -> Option<String>,
@@ -491,7 +491,7 @@ fn located(root: &str, rest: &str, roots: &[(String, PathBuf)]) -> Option<PathBu
     })
 }
 
-/// What `how` answers of `path` now, as the digest a trace holds, leaving out what lies at `own`
+/// What `how` returns of `path` now, as the digest a trace holds, leaving out what lies at `own`
 /// below it: the paths the test wrote there.
 fn returned(how: Read, path: &Path, own: &[PathBuf]) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -581,12 +581,12 @@ pub struct World<'a> {
 
 /// A trace: one line a read, sorted — `<how>\t<root>\t<path>\t<own>\t<digest>`, the root empty for
 /// a path no root of the run holds and `own` the paths below it the read leaves out;
-/// `config\t<key>\t<digest>` of what a configuration key answered; `shipped\t<module>\t<digest>`; a
+/// `config\t<key>\t<digest>` of what a configuration key returned; `shipped\t<module>\t<digest>`; a
 /// view's `shipform` and `shipdef` lines ([`reached`]); `program\t<digest>`; and `binding\t<digest>`
 /// for a run that reached a host handler, whose verdict is the binding's.
 pub type Trace = String;
 
-/// What a configuration key answering `value` is held at in a trace.
+/// What a configuration key returning `value` is held at in a trace.
 fn configured_digest(value: Option<&str>) -> String {
     let mut hasher = blake3::Hasher::new();
     match value {
@@ -662,7 +662,7 @@ fn own_below(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf>
     own.into_iter().collect()
 }
 
-/// The first read `trace` holds that no longer answers as it did, read against `world` now, as a
+/// The first read `trace` holds that no longer returns what it did, read against `world` now, as a
 /// person reads it; `None` when every one still does. Each read checked is entered into `into`, the
 /// asking run's record, since what it decides rests on them. A view stands here while its module's
 /// text does; what can hash the module again holds its form and functions instead.

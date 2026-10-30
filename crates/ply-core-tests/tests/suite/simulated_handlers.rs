@@ -12,7 +12,7 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
 }
 
 /// The one generator the evaluator names, once: `ring`'s RSA signing takes one for a PSS salt, and
-/// it is handed this one, which answers the salt the evaluator made of the key and the message.
+/// it is handed this one, which returns the salt the evaluator made of the key and the message.
 const FIXED_GENERATOR: (&str, &str) = ("crypto.rs", "use ring::test::rand::FixedSliceRandom;");
 
 #[test]

@@ -93,7 +93,7 @@ impl Default for Bounds {
 }
 
 pub trait Accepting: Send + Sync {
-    /// Answer `0` to every further `net.accept`, close the listening sockets, and return any
+    /// Return `0` from every further `net.accept`, close the listening sockets, and return any
     /// `accept` already parked on a pool thread.
     fn stop_accepting(&self) -> usize;
 
@@ -121,7 +121,7 @@ pub struct Shutdown {
     drains: bool,
     /// The whole of what a signal handler touches.
     requested: AtomicBool,
-    /// Set at the stop, so a later `net.accept` answers `0` even if the table is rebuilt.
+    /// Set at the stop, so a later `net.accept` returns `0` even if the table is rebuilt.
     stopped_accepting: AtomicBool,
     second: AtomicBool,
     state: Mutex<State>,
@@ -142,7 +142,7 @@ static WATCHES: std::sync::LazyLock<[Watch; 4]> = std::sync::LazyLock::new(Defau
 impl Shutdown {
     /// Whether `which` has arrived since it was last asked about, however many times it did:
     /// arrivals are not counted. The first ask installs the handler, for the whole process, and
-    /// answers `false`. Only a run that listens for a stop holds a `Shutdown` to ask through, so a
+    /// returns `false`. Only a run that listens for a stop holds a `Shutdown` to ask through, so a
     /// run that does not, as a test's, leaves every signal as the platform has it.
     ///
     /// # Errors
