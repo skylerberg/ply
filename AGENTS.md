@@ -39,6 +39,9 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - Correct in place. Never write "previously", "corrected" or "a draft of this said".
 - Measurements belong in the description of the PR they decide, not in the tree.
 - PR descriptions and commit messages: a few lines on what changed and why.
+- Cards on the board follow these rules too. A card's title is one imperative deliverable. Its
+  description gives the problem, the direction and when it is done, in words a reader new to the
+  code can follow. No card codes, dates or links to scratch files.
 
 ## Comments
 
