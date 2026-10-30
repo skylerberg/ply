@@ -422,8 +422,8 @@ impl Ctx {
         }
         let ms = self.time_budget_ms;
         let d = Diagnostic::warning(
-            codes::RUN_ABANDONED,
-            format!("abandoned after {ms} ms of wall clock"),
+            codes::RUN_TIMED_OUT,
+            format!("timed out after {ms} ms of wall clock"),
         )
         .primary(Span::DUMMY, "still running here")
         .note("the clock says nothing about the program, so this run decided nothing")

@@ -1717,7 +1717,7 @@ values `std.gen` generates.
 | `--filter TEXT` | prove claims whose owner's name contains `TEXT`; repeatable |
 | `--prove-budget N` | reasoning steps per claim |
 | `--timeout MS` | wall-clock time for each run a claim's evaluation makes (default 60000) |
-| `--static-only` | run only the static prover, on every claim |
+| `--static-prover` | also run the static prover alone on every claim, and report what it decided |
 | `--jobs N` | split the work into `N` lanes |
 
 `ply prove` prints each claim's outcome as it is decided, then the definitions no proved claim
@@ -2303,7 +2303,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply check [path]` | `--types` (each definition's type and effects), `--costs` (copying updates, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-dependencies`, host and simulation flags |
 | `ply run [path] [-- ARGS]` | `--seed`, `--timeout`, `--profile`, `--explain`, `--require-signer KEY`, host, trace and drain flags. `ARGS` is what `process.args` returns. A `.plyx` path runs a built program. |
-| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--static-only`, `--workspace`, `--verify-dependencies`, simulation flags |
+| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--prove-budget`, `--timeout`, simulation flags |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | host, trace and drain flags, `--digest` |

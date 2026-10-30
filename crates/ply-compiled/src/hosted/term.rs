@@ -42,7 +42,7 @@ pub(super) fn natives() -> Vec<MachineNative> {
     ]
 }
 
-/// The modes as the real handler numbers them: `Cooked` 0, `Silent` 1 and `Raw` 2.
+/// The modes as the host handler numbers them: `Cooked` 0, `Silent` 1 and `Raw` 2.
 fn mode_of(n: i64) -> Option<Mode> {
     match n {
         0 => Some(Mode::Cooked),

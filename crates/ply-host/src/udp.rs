@@ -16,7 +16,7 @@ use std::time::Duration;
 pub const MAX_DATAGRAM: usize = 65535;
 
 /// A socket bound at `to`, with `options` set before the bind: its handle, or why not. Which
-/// addresses a run may bind is the real handler's to hold it to.
+/// addresses a run may bind is the host handler's to hold it to.
 pub fn bind(net: &TcpHost, label: &str, to: &Endpoint, options: &[SocketOption]) -> Vec<u8> {
     wire::answer(bound(to, options).map(|socket| int(net.open_datagram(label, socket)).to_vec()))
 }

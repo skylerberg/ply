@@ -26,7 +26,7 @@ impl Mode {
 pub enum Resource {
     Named(Symbol),
     /// A label the definition is generic over, filled at each call, numbered by where it first
-    /// appears in its footprint.
+    /// appears in its effects.
     Var(u32),
     Singleton,
     /// Every label: what an atom written `op[*]` stands for, so a row can say which atoms it

@@ -1,4 +1,4 @@
-//! The trusted computing base: the OS calls behind the natives of the real handlers, and the run's
+//! The trusted computing base: the OS calls behind the natives of the host handlers, and the run's
 //! clocks and pools a production region waits on.
 
 pub mod certgen;

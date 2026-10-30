@@ -1,4 +1,4 @@
-//! What a test read of the world while it ran: the files and directories the real handlers that
+//! What a test read of the world while it ran: the files and directories the host handlers that
 //! answered it read, what they wrote, the configuration keys it read, the shipped modules it asked
 //! for, and what any `ply` it started read in turn, but for that `ply`'s configuration, which is what
 //! the test handed it. No trace holds anything of a secret, so a run that read a secret

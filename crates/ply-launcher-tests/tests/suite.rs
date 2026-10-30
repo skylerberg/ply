@@ -1,4 +1,4 @@
-//! The launcher's own `--count-allocs` flag.
+//! The launcher's own `--count-allocations` flag.
 
 /// The counting allocator is a whole-binary decision, so this test binary installs it too, which
 /// is what makes the window tests meaningful here.
@@ -10,9 +10,9 @@ static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 #[test]
 fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
     for line in [
-        vec!["--count-allocs=out.json", "run", "p.ply"],
-        vec!["run", "--count-allocs=out.json", "p.ply"],
-        vec!["run", "p.ply", "--count-allocs=out.json"],
+        vec!["--count-allocations=out.json", "run", "p.ply"],
+        vec!["run", "--count-allocations=out.json", "p.ply"],
+        vec!["run", "p.ply", "--count-allocations=out.json"],
     ] {
         let mut argv: Vec<String> = line.iter().map(|s| s.to_string()).collect();
         let asked = ply_launcher::count::flag(&mut argv).unwrap().unwrap();
@@ -30,7 +30,7 @@ fn the_count_allocations_flag_is_read_from_the_line_and_taken_out() {
 
 #[test]
 fn the_count_allocations_flag_may_name_its_path_with_a_space() {
-    let mut argv: Vec<String> = ["run", "--count-allocs", "out.json", "p.ply"]
+    let mut argv: Vec<String> = ["run", "--count-allocations", "out.json", "p.ply"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -42,7 +42,7 @@ fn the_count_allocations_flag_may_name_its_path_with_a_space() {
 
 #[test]
 fn the_count_allocations_flag_requires_a_path() {
-    let mut argv: Vec<String> = ["run", "--count-allocs"]
+    let mut argv: Vec<String> = ["run", "--count-allocations"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -141,21 +141,21 @@ fn a_window_counts_what_it_ran_and_only_attributes_when_asked() {
 #[test]
 fn the_sites_flags_choose_between_every_allocation_and_a_sample() {
     for (line, exact) in [
-        (vec!["run", "--count-alloc-sites=out.json"], false),
-        (vec!["run", "--count-alloc-sites-exact=out.json"], true),
+        (vec!["run", "--count-allocation-sites=out.json"], false),
+        (vec!["run", "--count-allocation-sites-exact=out.json"], true),
         (
             vec![
                 "run",
-                "--count-alloc-sites=out.json",
-                "--count-alloc-sites-exact=e.json",
+                "--count-allocation-sites=out.json",
+                "--count-allocation-sites-exact=e.json",
             ],
             true,
         ),
         (
             vec![
                 "run",
-                "--count-alloc-sites-exact=e.json",
-                "--count-alloc-sites=out.json",
+                "--count-allocation-sites-exact=e.json",
+                "--count-allocation-sites=out.json",
             ],
             true,
         ),

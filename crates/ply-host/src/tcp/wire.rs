@@ -1,4 +1,4 @@
-//! What `std.net`'s and `std.udp`'s real handlers hand their natives and read back, in flat forms
+//! What `std.net`'s and `std.udp`'s host handlers hand their natives and read back, in flat forms
 //! the handlers' own readers and writers in `std.net` share. A socket address is parts: its
 //! address's bytes, its port in two bytes and its zone, empty for none. An option is its setting's
 //! byte, as `std.net` numbers settings, and then what it sets. A refusal is its kind's byte,

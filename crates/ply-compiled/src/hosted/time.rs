@@ -50,7 +50,7 @@ pub unsafe extern "C" fn rt_time_elapsed_ns(ctx: *mut Ctx) -> I64 {
     asked(ctx, "time_elapsed_ns", Nondeterministic, I64(0), monotonic)
 }
 
-/// The asking thread parked for `ms` milliseconds, which the real handler hands only above 0.
+/// The asking thread parked for `ms` milliseconds, which the host handler hands only above 0.
 pub unsafe extern "C" fn rt_time_sleep_ms(ctx: *mut Ctx, ms: I64) {
     asked(ctx, "time_sleep_ms", Nondeterministic, (), |_| {
         std::thread::sleep(Duration::from_millis(u64::try_from(ms.0).unwrap_or(0)));

@@ -2,16 +2,16 @@
 //! they declare, and how a run's tests split once the binding is taken into account. The graph is a
 //! *conflict* graph, not a sharing one: two tests may share a resource freely as long as neither
 //! writes it, so a conflict is an effect and a resource both name plus a write on one side. Colouring
-//! is greedy, largest footprint first, and a test takes the first class it clears *every* member of —
+//! is greedy, largest effects first, and a test takes the first class it clears *every* member of —
 //! conflict is not transitive, so clearing one member is not enough.
 //!
-//! The runtime hands over every atom of a test's footprint; which of them another test could reach,
+//! The runtime hands over every atom of a test's effects; which of them another test could reach,
 //! and what that makes the test, is decided here. Which effects are ambient is a fact about the
 //! language, not about the runtime, so it lives here too.
 
 import std.list
 
-/// One atom of a test's footprint. `nondet` is whether its effect is declared `nondet` or is the
+/// One atom of a test's effects. `nondet` is whether its effect is declared `nondet` or is the
 /// language's own: any other is answered from the test's own state, by a handler that is a function
 /// of it, so no other test reaches what it names.
 pub type Atom = { effect: String, resource: String, writes: Bool, nondet: Bool }
@@ -28,25 +28,25 @@ pub fn is_ambient(a: Atom) -> Bool = contains_text(ambient_effects(), a.effect)
 pub fn contends(a: Atom) -> Bool = a.nondet && !is_ambient(a)
 
 /// Nothing this test names can be reached from another one.
-pub fn region_isolated(f: List<Atom>) -> Bool = f.all(|a: Atom| !contends(a))
+pub fn is_isolated(f: List<Atom>) -> Bool = f.all(|a: Atom| !contends(a))
 
-/// The atoms that can contend across tests: the footprint minus the inputs only this test is handed.
+/// The atoms that can contend across tests: the effects minus the inputs only this test is handed.
 pub fn shared(f: List<Atom>) -> List<Atom> = f.filter(contends)
 
 // --- What a run's tests are, once the binding is taken into account ----------
 
-/// One test the run reports on: its footprint, and whether the run's binding reaches it.
+/// One test the run reports on: its effects, and whether the run's binding reaches it.
 pub type ReportedTest = { atoms: List<Atom>, host: Bool }
 
 /// Whether a test can interfere with any other test at all. A test the binding reaches acts on the
-/// world, which lives outside every region, so it is never isolated.
-pub type Isolation = | Region | Shared | Host
+/// world outside the test, so it is never isolated.
+pub type Isolation = | Isolated | Shared | Host
 
 pub fn isolation_of(t: ReportedTest) -> Isolation =
-  if t.host { Host } else if region_isolated(t.atoms) { Region } else { Shared }
+  if t.host { Host } else if is_isolated(t.atoms) { Isolated } else { Shared }
 
 pub fn isolation_word(i: Isolation) -> String =
-  match i { Region -> "region", Shared -> "shared", Host -> "host" }
+  match i { Isolated -> "isolated", Shared -> "shared", Host -> "host" }
 
 /// How a run's tests split: each counts under exactly one of the three.
 pub type Counts = { total: Int, isolated: Int, shared: Int, host: Int }
@@ -55,7 +55,7 @@ pub fn counts(tests: List<ReportedTest>) -> Counts =
   tests.fold({ total: 0, isolated: 0, shared: 0, host: 0 }, |c: Counts, t: ReportedTest| {
     let one = { ..c, total: c.total + 1 };
     match isolation_of(t) {
-      Region -> { ..one, isolated: c.isolated + 1 },
+      Isolated -> { ..one, isolated: c.isolated + 1 },
       Shared -> { ..one, shared: c.shared + 1 },
       Host -> { ..one, host: c.host + 1 },
     }
@@ -75,7 +75,7 @@ fn any_conflicts(ys: List<Atom>, a: Atom) -> Bool = some(ys, |b: Atom| conflicts
 /// One selected test, with the atoms another test could contend over.
 pub type ScheduledTest = { index: Int, contended_atoms: List<Atom> }
 
-/// Greedy colouring of the conflict graph, largest footprint first, ties by index. Each class is
+/// Greedy colouring of the conflict graph, largest effects first, ties by index. Each class is
 /// returned with its indices ascending, and the classes come out in the order they were opened.
 pub fn group_by_conflict(tests: List<ScheduledTest>) -> List<List<Int>> / {abort.raise} =
   in_order(tests).fold([], |classes: List<List<ScheduledTest>>, t: ScheduledTest|
@@ -145,8 +145,8 @@ pub fn parallelism(
   groups: List<List<Int>>,
 ) -> Parallelism / {abort.raise} = {
   let total = universe.len();
-  let isolated = universe.filter(region_isolated).len();
-  let shared_only = scheduled.filter(|t: ScheduledTest| !region_isolated(t.contended_atoms));
+  let isolated = universe.filter(is_isolated).len();
+  let shared_only = scheduled.filter(|t: ScheduledTest| !is_isolated(t.contended_atoms));
   {
     total: total,
     isolated: isolated,
@@ -170,7 +170,7 @@ fn atom(e: String, r: String, w: Bool) -> Atom = { effect: e, resource: r, write
 // --- Tests ------------------------------------------------------------------
 //
 // The cases are chosen where a colouring could go wrong — a class that must clear every member, the
-// order the largest footprint imposes, and the two ways a class may be shared.
+// order the largest effects imposes, and the two ways a class may be shared.
 
 fn writes(label: String) -> Atom = atom("store", label, true)
 
@@ -187,21 +187,21 @@ fn unreached(atoms: List<Atom>) -> ReportedTest = { atoms: atoms, host: false }
 
 test "a seed or a hold contends with nothing, and a write does" {
   let hold = atom("hold", "log", false);
-  assert_eq(region_isolated([sim()]), true);
-  assert_eq(region_isolated([hold]), true);
-  assert_eq(region_isolated([]), true);
-  assert_eq(isolation_of(unreached([sim(), hold])), Region);
+  assert_eq(is_isolated([sim()]), true);
+  assert_eq(is_isolated([hold]), true);
+  assert_eq(is_isolated([]), true);
+  assert_eq(isolation_of(unreached([sim(), hold])), Isolated);
   assert_eq(shared([writes("a"), sim(), hold]), [writes("a")]);
   assert_eq(isolation_of(unreached([writes("a")])), Shared);
   assert_eq(isolation_word(Shared), "shared");
   // A program's own effects are module-qualified, so none of them can pass for `hold`.
-  assert_eq(region_isolated([atom("m.hold", "log", false)]), false)
+  assert_eq(is_isolated([atom("m.hold", "log", false)]), false)
 }
 
 // A seed read is an input only the test reading it is handed, so a simulated test is not shared for
 // reading one, and still contends over what its tasks touch.
 test "a seed never makes a test shared, and what its tasks touch still does" {
-  assert_eq(isolation_of(unreached([sim()])), Region);
+  assert_eq(isolation_of(unreached([sim()])), Isolated);
   assert_eq(isolation_of(unreached([sim(), writes("a")])), Shared);
   assert_eq(shared([sim(), writes("a")]), [writes("a")]);
   // Two simulated tests over one label are two classes, and two over nothing share one.
@@ -214,12 +214,12 @@ test "a seed never makes a test shared, and what its tasks touch still does" {
   ])
 }
 
-// A socket lives outside every region, so a test the binding reaches is host whatever its footprint
+// A socket lives outside every region, so a test the binding reaches is host whatever its effects
 // says, and each test counts under exactly one heading.
 test "a test the binding reaches is host rather than isolated, and counts only there" {
   assert_eq(isolation_of({ atoms: [sim()], host: true }), Host);
   assert_eq(isolation_word(Host), "host");
-  assert_eq(isolation_word(Region), "region");
+  assert_eq(isolation_word(Isolated), "isolated");
   let c = counts([
     { atoms: [atom("db", "users", false)], host: true },
     unreached([]),
@@ -319,8 +319,8 @@ fn loaded(label: String) -> Atom = { ..atom("hermetic_machine", label, true), no
 
 test "what a deterministic handler answers contends with nothing, whatever it writes" {
   assert_eq(contends(loaded("run")), false);
-  assert_eq(region_isolated([loaded("run"), sim()]), true);
-  assert_eq(isolation_of(unreached([loaded("run")])), Region);
+  assert_eq(is_isolated([loaded("run"), sim()]), true);
+  assert_eq(isolation_of(unreached([loaded("run")])), Isolated);
   assert_eq(shared([loaded("run"), fs("/tmp/x")]), [fs("/tmp/x")]);
   assert_eq(group_by_conflict(range(0, 3).map(|i: Int| scheduled(i, shared([loaded("run")])))), [
     [0, 1, 2],
@@ -367,7 +367,7 @@ test "one label separates all its writers, and a label each separates none" {
   )
 }
 
-// Declaration order would colour this six-cycle in three classes; the largest footprints first need
+// Declaration order would colour this six-cycle in three classes; the largest effects first need
 // the two it has.
 test "coloured largest first, a six-cycle takes the two classes it needs" {
   let tests = [

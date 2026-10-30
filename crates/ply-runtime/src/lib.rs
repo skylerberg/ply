@@ -6,7 +6,7 @@ use ply_compiled::c::descriptor::Descriptor;
 use std::ffi::{c_char, c_int};
 
 /// Counts what the entry allocates; nothing but the entry is counted, and only when
-/// `--count-allocs` asked for it.
+/// `--count-allocations` asked for it.
 #[global_allocator]
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 

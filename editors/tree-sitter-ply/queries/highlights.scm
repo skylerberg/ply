@@ -74,7 +74,7 @@
   "try"
   "simulate"
   "parallel"
-  "with_hold"
+  "with_scope"
 ] @keyword.control
 
 "fn" @keyword.function

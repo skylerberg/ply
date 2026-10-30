@@ -66,5 +66,5 @@ codes! {
     SPAN_ABANDONED = "W0609";
     /// A run the harness stopped at its wall clock: a fact about the machine, not about the
     /// program, so nothing it did is recorded.
-    RUN_ABANDONED = "W0612";
+    RUN_TIMED_OUT = "W0612";
 }

@@ -1,4 +1,4 @@
-//! The system's resolver, which `std.dns`'s real handler asks off the program's thread. The resolver
+//! The system's resolver, which `std.dns`'s host handler asks off the program's thread. The resolver
 //! has its own patience and cannot be interrupted, so a caller that stops waiting (`std.dns`'s
 //! `resolve` cancels the task that asked) leaves the question on its thread until the system
 //! answers it.

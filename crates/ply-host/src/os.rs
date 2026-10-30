@@ -1,5 +1,5 @@
 //! What the machine and the process a program runs in say of themselves, as the natives `std.os`'s
-//! real handler calls read it. None of it reads the environment, so no variable a user sets changes
+//! host handler calls read it. None of it reads the environment, so no variable a user sets changes
 //! an answer.
 
 /// The processors this process may run on at once: what its affinity mask and its control

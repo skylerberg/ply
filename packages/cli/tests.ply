@@ -154,7 +154,7 @@ fn a_run(results: List<Outcome>, failed: Int) -> RunReport =
     summary: {
       passed: results.filter(|outcome: Outcome| outcome.status == "passed").len(),
       failed: failed,
-      timed_out: results.filter(|outcome: Outcome| outcome.status == "abandoned").len(),
+      timed_out: results.filter(|outcome: Outcome| outcome.status == "timed_out").len(),
       cached: 0,
       duration_us: 20000,
     },
@@ -270,7 +270,7 @@ test "a failure is exit 1, and each change its suspects name is shown once after
   assert_eq(answer.code, 1);
   assert(answer.lines.contains("   m.two is two"));
   assert(answer.lines.contains("     assertion failed"));
-  assert_eq(answer.lines.filter(|l: String| l == "     suspects: m.total (edited)").len(), 2);
+  assert_eq(answer.lines.filter(|l: String| l == "     changes: m.total (edited)").len(), 2);
   let from = match answer.lines.index_of("   changed since the failing tests last passed:") {
     Some(i) -> i,
     None -> panic("the changes follow the failures"),
@@ -343,9 +343,9 @@ test "a test the clock stopped is abandoned rather than judged, and the run is n
   let p = a_program([a_case(0, "slow")]);
   let keys = [a_key(0, "slow", false, false, false)];
   let stopped = {
-    ..an_outcome(0, "slow", "abandoned"),
+    ..an_outcome(0, "slow", "timed_out"),
     diagnostic: Some({
-      diagnostic: error_with_labels(b"E0504", b"the run was abandoned", [], [b"raise the clock"]),
+      diagnostic: error_with_labels(b"E0504", b"the run timed out", [], [b"raise the clock"]),
       values: [],
     }),
   };
@@ -359,8 +359,8 @@ test "a test the clock stopped is abandoned rather than judged, and the run is n
     a_decided(p, keys),
   );
   assert_eq(answer.code, 1);
-  assert(answer.lines.contains("   slow abandoned"));
-  assert(answer.lines.contains("     the run was abandoned"));
+  assert(answer.lines.contains("   slow timed out"));
+  assert(answer.lines.contains("     the run timed out"));
   assert(answer.lines.contains("     = raise the clock"))
 }
 
@@ -467,7 +467,7 @@ test "`--explain` says why each test ran, once per reason, and how the groups fo
   let keys = [a_key(0, "one", false, false, false), a_key(1, "two", true, false, false)];
   let lines = explain_lines(plain(), p, [], a_decided(p, keys));
   assert(lines.at_or(1, "").contains("run  abcdef012345 new "));
-  assert(lines.at_or(1, "").contains("isolation: region"));
+  assert(lines.at_or(1, "").contains("isolation: isolated"));
   assert(lines.at_or(2, "").contains("skip abcdef012345 cached "));
   assert(lines.contains("   why"));
   assert(lines.contains("   concurrency groups"));
@@ -565,7 +565,7 @@ test "a failure's artifact says what failed, how to replay it, and what changed 
   let text = to_string(fault_json(p, raced));
   assert(text.contains("\"key\":\"m.two is two\""));
   assert(text.contains("\"name\":\"two is two\""));
-  assert(text.contains("\"defect\":false"));
+  assert(text.contains("\"internal_error\":false"));
   assert(text.contains("\"module\":\"m\""));
   assert(text.contains("\"status\":\"failed\""));
   assert(text.contains("\"nondet\":false"));
@@ -713,7 +713,7 @@ test "a run's time is its load and every phase after it, longest first" {
 test "a test the binding can reach is host rather than isolated" {
   let c = a_case(0, "one");
   let unreached = a_run([], 0);
-  assert_eq(isolated_as(unreached.reaches, c), "region");
+  assert_eq(isolated_as(unreached.reaches, c), "isolated");
   assert_eq(isolated_as([0], c), "host");
   let fs_write = {
     atom: { effect: "fs", resource: "/tmp/x", writes: true, nondet: true },
@@ -723,7 +723,7 @@ test "a test the binding can reach is host rather than isolated" {
     atom: { effect: "sim", resource: "", writes: false, nondet: false },
     text: "sim.read",
   };
-  assert_eq(isolated_as(unreached.reaches, { ..c, atoms: [seed] }), "region");
+  assert_eq(isolated_as(unreached.reaches, { ..c, atoms: [seed] }), "isolated");
   assert_eq(isolated_as(unreached.reaches, { ..c, atoms: [seed, fs_write] }), "shared");
   assert_eq(shared_of({ ..c, atoms: [seed, fs_write] }), "{fs.write[/tmp/x]}")
 }
@@ -867,15 +867,15 @@ test "an effect whose name merely resembles a region's names a real resource" {
 
 test "a hold's label beside a real write does not launder the write" {
   let w = analysed(
-    "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {hold.read[table]} = n\ntest \"hold only\" { let seen = with_hold[table](1, |x: Int| ()) { c -> c.get() }; assert_eq(touches(seen), 1) }\ntest/nondet \"hold and a real write\" { let seen = with_hold[table](1, |x: Int| ()) { c -> c.get() }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
+    "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {scoped.read[table]} = n\ntest \"hold only\" { let seen = with_scope[table](1, |x: Int| ()) { c -> c.get() }; assert_eq(touches(seen), 1) }\ntest/nondet \"hold and a real write\" { let seen = with_scope[table](1, |x: Int| ()) { c -> c.get() }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
   );
-  assert_eq(texts_of_case(w, 1), ["db.put[users]", "hold.read[table]"]);
+  assert_eq(texts_of_case(w, 1), ["db.put[users]", "scoped.read[table]"]);
   assert_eq(coloured(w), [[0, 1], [2]])
 }
 
 test "a test whose regions discharge their holds contends over nothing" {
   let w = analysed(
-    "test \"users hold\" { with_hold[users](1, |x: Int| ()) { c -> assert_eq(c.get(), 1) } }\ntest \"orders hold\" { with_hold[orders](2, |x: Int| ()) { c -> assert_eq(c.get(), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
+    "test \"users hold\" { with_scope[users](1, |x: Int| ()) { c -> assert_eq(c.get(), 1) } }\ntest \"orders hold\" { with_scope[orders](2, |x: Int| ()) { c -> assert_eq(c.get(), 2) } }\ntest \"pure\" { assert_eq(1, 1) }\n",
   );
   assert_eq(cases_of_whole(w).map(|case: Case| case.effects), ["{}", "{}", "{}"]);
   assert_eq(coloured(w), [[0, 1, 2]])

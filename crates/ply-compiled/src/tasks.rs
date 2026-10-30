@@ -1133,7 +1133,7 @@ pub unsafe extern "C" fn rt_site_placed(
     c.given(bytes)
 }
 
-/// How many accesses the running seeded step touched since its footprint was last taken.
+/// How many accesses the running seeded step touched since its effects were last taken.
 pub unsafe extern "C" fn rt_footprint_held(ctx: *mut Ctx) -> I64 {
     I64(unsafe { &*ctx }.footprint.len() as i64)
 }

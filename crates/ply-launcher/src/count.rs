@@ -255,7 +255,7 @@ pub struct Asked {
     /// Whether each allocation is also attributed to the `ply_*` frames that asked for it.
     pub sites: bool,
     /// Whether every allocation is walked rather than one in [`SAMPLED`], which is what
-    /// `--count-alloc-sites-exact` asks for.
+    /// `--count-allocation-sites-exact` asks for.
     pub exact: bool,
 }
 
@@ -279,8 +279,8 @@ impl Asked {
 /// sampled ones times this.
 pub const SAMPLED: u32 = 64;
 
-/// `--count-allocs=PATH` (totals), `--count-alloc-sites=PATH` (totals and where, one allocation in
-/// [`SAMPLED`] walked) and `--count-alloc-sites-exact=PATH` (every allocation walked), wherever
+/// `--count-allocations=PATH` (totals), `--count-allocation-sites=PATH` (totals and where, one allocation in
+/// [`SAMPLED`] walked) and `--count-allocation-sites-exact=PATH` (every allocation walked), wherever
 /// they are written: the launcher's own flags. `None` when none was given.
 pub fn flag(argv: &mut Vec<String>) -> Result<Option<Asked>, String> {
     let mut asked: Option<Asked> = None;
@@ -288,9 +288,9 @@ pub fn flag(argv: &mut Vec<String>) -> Result<Option<Asked>, String> {
     while i < argv.len() {
         let mut consumed = false;
         for (name, sites, exact) in [
-            ("--count-allocs", false, false),
-            ("--count-alloc-sites", true, false),
-            ("--count-alloc-sites-exact", true, true),
+            ("--count-allocations", false, false),
+            ("--count-allocation-sites", true, false),
+            ("--count-allocation-sites-exact", true, true),
         ] {
             let joined = format!("{name}=");
             if let Some(path) = argv[i].strip_prefix(&joined).map(str::to_string) {

@@ -3,7 +3,7 @@
 //!
 //! A `Source` is where bytes come from and a `Sink` is where they go. Each is a pair of functions,
 //! so a file, a socket and a pipe are all read by the same `read`, `fold_lines` and `copy`. Open a
-//! stream with `with_hold` over `reading`, `writing` or `appending`, and release it with
+//! stream with `with_scope` over `reading`, `writing` or `appending`, and release it with
 //! `close_source` or `close_sink`, which closes it however the region's body ends. The stream is
 //! read or written through the hold, which cannot leave the region.
 //!
@@ -22,7 +22,7 @@
 //!
 //! `stdin`, `stdout` and `stderr` are the process's own streams, as a source and two sinks. So a
 //! filter is `copy(from, to, ..)`, and a line reader is `fold_lines` over standard input, each
-//! under `with_hold` like any stream. These streams belong to the process and outlive every hold.
+//! under `with_scope` like any stream. These streams belong to the process and outlive every hold.
 //! Closing standard output flushes its buffer, and closing the other two does nothing. A write
 //! whose reader has gone away raises `std.process`'s `pipe.broken`, and never returns `false`.
 //! Code written against them runs unchanged over `std.process`'s fake (`process::over`).
@@ -39,7 +39,7 @@ import std.seq (Seq, seq)
 import std.gen
 
 /// Where bytes are read from. `pull(max)` returns the next bytes, at most `max` of them, and none
-/// at the end. `close` releases the source. A source is a value, so `Hold::get` returns a copy
+/// at the end. `close` releases the source. A source is a value, so `Scoped::get` returns a copy
 /// that can leave the hold's region even though the hold cannot. Pulling from such a copy after
 /// `close` raises, and never looks like the end.
 pub type Source<| e> = { pull: (Int) -> Bytes / e, close: () -> Unit / e }
@@ -137,7 +137,7 @@ pub fn stderr<[p]>() -> Sink<| {process.err_bytes[p], pipe.broken}> =
 ///
 /// The sink is passed to `body` as a value, which a hold opened by this function could not be. Its
 /// `close` does nothing. `body` writes through its `push`, or opens its own hold on it,
-/// `with_hold[out](sink, close_sink) { .. }`, to write with `write` and `copy`. Once `body` has
+/// `with_scope[out](sink, close_sink) { .. }`, to write with `write` and `copy`. Once `body` has
 /// returned, the sink accepts nothing more.
 pub fn replacing<a, [l] | e>(
   path: String,
@@ -145,7 +145,7 @@ pub fn replacing<a, [l] | e>(
   mode: Option<fs::Mode>,
   body: (Sink<| {fs.write_chunk[l]}>) -> a / e,
 ) -> a / {fs.open[l], fs.sync[l], fs.close[l], fs.stat[l], fs.set_mode[l], fs.rename[l], fs.remove[l], files.fail, entropy.next, abort.raise | e} =
-  with_hold[pending](fs::begin_atomic[l](path), |p: fs::Pending|
+  with_scope[pending](fs::begin_atomic[l](path), |p: fs::Pending|
     fs::abandon_atomic[l](p)) { held -> {
     let p = held.get();
     let value = body(unowned_sink[l](p.file));
@@ -157,34 +157,34 @@ pub fn replacing<a, [l] | e>(
 fn unowned_sink<[l]>(file: Int) -> Sink<| {fs.write_chunk[l]}> =
   { push: |bytes: Bytes| fs.write_chunk[l](file, bytes), close: || () }
 
-/// Closes a source. Pass it to `with_hold` as the release function.
+/// Closes a source. Pass it to `with_scope` as the release function.
 pub fn close_source<| e>(source: Source<| e>) -> Unit / e = (source.close)()
 
-/// Closes a sink. Pass it to `with_hold` as the release function.
+/// Closes a sink. Pass it to `with_scope` as the release function.
 pub fn close_sink<| e>(sink: Sink<| e>) -> Unit / e = (sink.close)()
 
 /// The next bytes of the source, at most `max` of them, and empty at its end. Every reader is built
 /// from this one step.
-pub fn read<[r] | e>(source: Hold<Source<| e>, [r]>, max: Int) -> Bytes / {hold.read[r] | e} =
+pub fn read<[r] | e>(source: Scoped<Source<| e>, [r]>, max: Int) -> Bytes / {scoped.read[r] | e} =
   source.get().pull(max)
 
 /// Writes all of `bytes`.
 pub fn write<[r] | e>(
-  sink: Hold<Sink<| e>, [r]>,
+  sink: Scoped<Sink<| e>, [r]>,
   bytes: Bytes,
-) -> Unit / {hold.read[r], io.write_failed | e} =
+) -> Unit / {scoped.read[r], io.write_failed | e} =
   if sink.get().push(bytes) { () } else { io.write_failed() }
 
 /// Folds `f` over each chunk the source gives until it ends. No chunk is longer than `chunk`
 /// bytes, which must be at least one. Reads at most `limit` bytes in total, and keeps one chunk in
 /// memory at a time.
 pub fn fold_chunks<a, [r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   chunk: Int,
   limit: Int,
   init: a,
   f: (a, Bytes) -> a / e,
-) -> a / {hold.read[r], io.too_long, abort.raise | e} =
+) -> a / {scoped.read[r], io.too_long, abort.raise | e} =
   iterate({ acc: init, read: 0 }, max_reads(chunk, limit), |s: { acc: a, read: Int }| {
     let bytes = next_chunk(source, chunk, limit, s.read);
     if bytes.len() == 0 { Stop(s.acc) }
@@ -200,21 +200,21 @@ fn max_reads(chunk: Int, limit: Int) -> Int / {abort.raise} =
 /// source's end. It requests one byte past the limit, to tell a source that has more apart from
 /// one that ends there.
 fn next_chunk<[r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   chunk: Int,
   limit: Int,
   so_far: Int,
-) -> Bytes / {hold.read[r], io.too_long | e} = {
+) -> Bytes / {scoped.read[r], io.too_long | e} = {
   let bytes = read(source, min(chunk, max(limit - so_far, 0) + 1));
   if so_far + bytes.len() > limit { io.too_long(limit) } else { bytes }
 }
 
 /// Everything left in the source, read `chunk` bytes at a time, up to `limit` bytes.
 pub fn read_all<[r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   chunk: Int,
   limit: Int,
-) -> Bytes / {hold.read[r], io.too_long, abort.raise | e} =
+) -> Bytes / {scoped.read[r], io.too_long, abort.raise | e} =
   Bytes::concat_all(
     fold_chunks(source, chunk, limit, [], |parts: List<Bytes>, bytes: Bytes| parts.push(bytes)),
   )
@@ -243,12 +243,12 @@ pub fn split_lines(
 /// and a source that ends in `\n` has no empty line after it. Reads `chunk` bytes at a time and at
 /// most `limit` in total. A line costs time linear in its length, however many chunks it spans.
 pub fn fold_lines<a, [r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   chunk: Int,
   limit: Int,
   init: a,
   f: (a, Bytes) -> a / e,
-) -> a / {hold.read[r], io.too_long, abort.raise | e} = {
+) -> a / {scoped.read[r], io.too_long, abort.raise | e} = {
   let ended = iterate(
     { acc: init, pending: b"", read: 0 },
     max_reads(chunk, limit),
@@ -270,11 +270,11 @@ pub fn fold_lines<a, [r] | e>(
 /// Copies what is left in the source into the sink, `chunk` bytes at a time, using the memory of
 /// one chunk, up to `limit` bytes. Returns the number of bytes copied.
 pub fn copy<[r], [w] | e>(
-  from: Hold<Source<| e>, [r]>,
-  to: Hold<Sink<| e>, [w]>,
+  from: Scoped<Source<| e>, [r]>,
+  to: Scoped<Sink<| e>, [w]>,
   chunk: Int,
   limit: Int,
-) -> Int / {hold.read[r], hold.read[w], io.too_long, io.write_failed, abort.raise | e} =
+) -> Int / {scoped.read[r], scoped.read[w], io.too_long, io.write_failed, abort.raise | e} =
   iterate(0, max_reads(chunk, limit), |copied: Int| {
     let bytes = next_chunk(from, chunk, limit, copied);
     if bytes.len() == 0 { Stop(copied) } else {
@@ -286,9 +286,9 @@ pub fn copy<[r], [w] | e>(
 /// The next `n` bytes of the source, or fewer only if it ends first. Reads repeatedly until it has
 /// them, however short each read is.
 pub fn fill<[r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   n: Int,
-) -> Bytes / {hold.read[r], abort.raise | e} =
+) -> Bytes / {scoped.read[r], abort.raise | e} =
   Bytes::concat_all(
     iterate({ parts: [], got: 0 }, max(n, 0) + 1, |s: { parts: List<Bytes>, got: Int }|
       if s.got >= n { Stop(s.parts) } else {
@@ -303,9 +303,9 @@ pub fn fill<[r] | e>(
 /// sequence reads the source as it is pulled. Pulling it again from the start continues from the
 /// source's current position.
 pub fn chunks<[r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   size: Int,
-) -> Seq<Bytes | {hold.read[r] | e}> =
+) -> Seq<Bytes | {scoped.read[r] | e}> =
   seq::unfold((), |u: Unit| {
     let bytes = read(source, size);
     if bytes.len() == 0 { None } else { Some({ value: bytes, next: () }) }
@@ -315,9 +315,9 @@ pub fn chunks<[r] | e>(
 /// reads at most one chunk of `chunk` bytes, and a chunk that completes no line yields no line.
 /// Like `chunks`, it can be pulled through only once.
 pub fn lines<[r] | e>(
-  source: Hold<Source<| e>, [r]>,
+  source: Scoped<Source<| e>, [r]>,
   chunk: Int,
-) -> Seq<Bytes | {hold.read[r], abort.raise | e}> =
+) -> Seq<Bytes | {scoped.read[r], abort.raise | e}> =
   seq::flat_map(
     seq::unfold(Some(b""), |left: Option<Bytes>|
       match left {
@@ -372,7 +372,7 @@ fn lines_of(
   path: String,
   chunk: Int,
 ) -> List<Bytes> / {fs.open[data], fs.read_chunk[data], fs.close[data], io.fail, io.too_long, io.closed, abort.raise} =
-  with_hold[file](
+  with_scope[file](
     reading[data](path),
     close_source,
   ) { source ->
@@ -381,7 +381,7 @@ fn lines_of(
 
 test "a file is read in chunks no longer than requested, and ends with an empty one" {
   let over = fs::on_mem[data](tree(), ||
-    with_hold[file](
+    with_scope[file](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source -> [read(source, 5), read(source, 5), read(source, 5), read(source, 5)] });
@@ -413,13 +413,13 @@ test "a file that ends in a newline has no empty line after it, and an empty fil
 test "a source with more bytes than its reader may read fails, and is still closed" {
   let over = fs::on_mem[data](tree(), || {
     let read: Result<Bytes, Int> = try[io.too_long] {
-      with_hold[file](
+      with_scope[file](
         reading[data]("notes/poem.txt"),
         close_source,
       ) { source -> read_all(source, 4, 12) }
     };
     let whole: Result<Bytes, Int> = try[io.too_long] {
-      with_hold[file](
+      with_scope[file](
         reading[data]("notes/poem.txt"),
         close_source,
       ) { source -> read_all(source, 4, 13) }
@@ -432,7 +432,7 @@ test "a source with more bytes than its reader may read fails, and is still clos
 
 test "a source pulled after its region closed it raises, and does not look ended" {
   let over = fs::on_mem[data](tree(), || {
-    let escaped = with_hold[file](
+    let escaped = with_scope[file](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source -> source.get() };
@@ -446,7 +446,7 @@ test "a file that does not open reports why, and nothing is left open" {
   let over = fs::on_mem[data](tree(), || {
     let why = |path: String| {
       let opened: Result<Int, (String, FileError)> = try[io.fail] {
-        with_hold[file](reading[data](path), close_source) { source -> read(source, 1).len() }
+        with_scope[file](reading[data](path), close_source) { source -> read(source, 1).len() }
       };
       opened
     };
@@ -462,15 +462,15 @@ test "a file that does not open reports why, and nothing is left open" {
 
 test "a written file contains its chunks in order, and an appended file keeps what came before" {
   let over = fs::on_mem[data](tree(), || {
-    with_hold[out](
+    with_scope[out](
       writing[data]("notes/poem.txt"),
       close_sink,
     ) { sink -> {
       write(sink, b"a");
       write(sink, b"bc")
     } };
-    with_hold[out](appending[data]("notes/poem.txt"), close_sink) { sink -> write(sink, b"\nd") };
-    with_hold[out](appending[data]("notes/new.txt"), close_sink) { sink -> write(sink, b"e") }
+    with_scope[out](appending[data]("notes/poem.txt"), close_sink) { sink -> write(sink, b"\nd") };
+    with_scope[out](appending[data]("notes/new.txt"), close_sink) { sink -> write(sink, b"e") }
   });
   assert_eq(fs::mem_read(over.tree, "notes/poem.txt"), Some(b"abc\nd"));
   assert_eq(fs::mem_read(over.tree, "notes/new.txt"), Some(b"e"));
@@ -479,11 +479,11 @@ test "a written file contains its chunks in order, and an appended file keeps wh
 
 test "a copy moves a file a chunk at a time and returns how much it moved" {
   let over = fs::on_mem[data](fs::mem_short_reads(tree(), 2), ||
-    with_hold[from](
+    with_scope[from](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source ->
-      with_hold[to](
+      with_scope[to](
         writing[data]("notes/copy.txt"),
         close_sink,
       ) { sink -> copy(source, sink, 4, 1024) }
@@ -495,7 +495,7 @@ test "a copy moves a file a chunk at a time and returns how much it moved" {
 test "a reader still closes its file when a raise unwinds through it" {
   let over = fs::on_mem[data](tree(), || {
     let first: Result<Bytes, Int> = try[io.too_long] {
-      with_hold[file](
+      with_scope[file](
         reading[data]("notes/poem.txt"),
         close_source,
       ) { source ->
@@ -510,7 +510,7 @@ test "a reader still closes its file when a raise unwinds through it" {
 
 test "a fill reads until it has all it requested, however short the reads, or less at the end" {
   let over = fs::on_mem[data](fs::mem_short_reads(tree(), 2), ||
-    with_hold[file](
+    with_scope[file](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source -> [fill(source, 5), fill(source, 0), fill(source, 100), fill(source, 3)] });
@@ -519,7 +519,7 @@ test "a fill reads until it has all it requested, however short the reads, or le
 
 test "the chunks of a source are a sequence that ends where the source does" {
   let over = fs::on_mem[data](tree(), ||
-    with_hold[file](
+    with_scope[file](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source -> seq::to_list(seq::map(chunks(source, 5), Bytes::len), 8) });
@@ -536,7 +536,7 @@ test "the lines of a source are one sequence whatever the chunk and whatever sho
     { chunk: 7, short: 5 },
   ] {
   let read = fs::on_mem[data](fs::mem_short_reads(tree(), c.short), ||
-    with_hold[file](
+    with_scope[file](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source -> seq::to_list(lines(source, c.chunk), 64) });
@@ -545,7 +545,7 @@ test "the lines of a source are one sequence whatever the chunk and whatever sho
 
 test "a sequence over a source reads as it is pulled, and a budget of one pull reads two chunks" {
   let over = fs::on_mem[data](tree(), ||
-    with_hold[file](
+    with_scope[file](
       reading[data]("notes/poem.txt"),
       close_source,
     ) { source -> {
@@ -564,11 +564,11 @@ test "a sequence over a source reads as it is pulled, and a budget of one pull r
 fn cat(
   chunk: Int,
 ) -> Int / {process.in_bytes[proc], process.out_bytes[proc], process.flush[proc], pipe.broken, io.too_long, io.write_failed, abort.raise} =
-  with_hold[input](
+  with_scope[input](
     stdin[proc](),
     close_source,
   ) { from ->
-    with_hold[output](stdout[proc](), close_sink) { to -> copy(from, to, chunk, 1048576) }
+    with_scope[output](stdout[proc](), close_sink) { to -> copy(from, to, chunk, 1048576) }
   }
 
 test "standard input is copied to standard output byte for byte, whatever the reads: {c}" for c: { chunks: List<Bytes>, chunk: Int } in [
@@ -589,7 +589,7 @@ test "standard input is copied to standard output byte for byte, whatever the re
 test "the lines of standard input are read as a file's are" {
   let typed = process::with_chunks(process::captured([]), [b"one\ntw", b"o\n", b"three"]);
   let ran = process::over[proc](typed, ||
-    with_hold[input](
+    with_scope[input](
       stdin[proc](),
       close_source,
     ) { source ->
@@ -600,17 +600,17 @@ test "the lines of standard input are read as a file's are" {
 
 test "standard error gets exactly what is written, and closing standard output flushes it" {
   let ran = process::over[proc](process::captured([]), || {
-    with_hold[errors](stderr[proc](), close_sink) { sink -> write(sink, b"\x00warn") };
-    with_hold[output](stdout[proc](), close_sink) { sink -> write(sink, b"half a line") }
+    with_scope[errors](stderr[proc](), close_sink) { sink -> write(sink, b"\x00warn") };
+    with_scope[output](stdout[proc](), close_sink) { sink -> write(sink, b"half a line") }
   });
   assert_eq(process::written_to(ran.captured, Stderr), b"\x00warn");
   assert_eq(process::written_to(ran.captured, Stdout), b"half a line");
   let closed = process::over[proc](process::hung_up(process::captured([]), Stdout), || {
     let wrote: Result<Unit, process::Stream> = try[pipe.broken] {
-      with_hold[output](stdout[proc](), close_sink) { sink -> write(sink, b"into nothing") }
+      with_scope[output](stdout[proc](), close_sink) { sink -> write(sink, b"into nothing") }
     };
     let let_go: Result<Unit, process::Stream> = try[pipe.broken] {
-      with_hold[output](stdout[proc](), close_sink) { unwritten -> () }
+      with_scope[output](stdout[proc](), close_sink) { unwritten -> () }
     };
     [wrote, let_go]
   });
@@ -625,7 +625,7 @@ test "a replaced file keeps its old contents until the body returns, and then ha
         fs::Durable,
         None,
         |sink: Sink<| {fs.write_chunk[data]}>|
-          with_hold[out](
+          with_scope[out](
             sink,
             close_sink,
           ) { out -> {

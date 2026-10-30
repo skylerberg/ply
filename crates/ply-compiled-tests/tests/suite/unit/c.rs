@@ -387,7 +387,7 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
     let said = ctx.take_failure().map(|d| d.message).unwrap_or_default();
     ctx.end();
     assert_eq!(failed, ply_compiled::rt::FAILED_ABANDONED, "{said}");
-    assert!(said.contains("abandoned after 20 ms"), "{said}");
+    assert!(said.contains("timed out after 20 ms"), "{said}");
 }
 
 /// The watchdog writes to a context only while its entry runs, since the context may be reused or

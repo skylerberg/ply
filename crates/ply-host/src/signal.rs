@@ -1,4 +1,4 @@
-//! The signals `std.signal`'s real handler asks about, and the coordinator that turns a stop into a
+//! The signals `std.signal`'s host handler asks about, and the coordinator that turns a stop into a
 //! shutdown.
 
 use crate::pool::Bell;

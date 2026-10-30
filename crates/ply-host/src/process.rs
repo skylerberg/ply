@@ -1,4 +1,4 @@
-//! What `std.process`'s real handler asks the host through its natives: the arguments, the two
+//! What `std.process`'s host handler asks the host through its natives: the arguments, the two
 //! output streams, standard input, the exit code, and the programs a run may start, to completion
 //! or beside it. Each answer that is structured is flat: a child's ending as [`Finished::flat`]
 //! writes it, a line heard as [`Heard::flat`] does.

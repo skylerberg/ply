@@ -1,4 +1,4 @@
-//! The records `std.trace`'s real handler writes through its natives, the spans it keeps open, and
+//! The records `std.trace`'s host handler writes through its natives, the spans it keeps open, and
 //! the sinks that serve them.
 
 mod fields;

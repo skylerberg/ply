@@ -1,4 +1,4 @@
-//! The natives the real handlers of the standard library's host effects call (`host for`): each asks
+//! The natives the host handlers of the standard library's host effects call (`host for`): each asks
 //! the machine the program runs on and answers machine data, integers, bytes or a secret, which the
 //! effect's module reads into its own types. Each that asks the host refuses where a run may not
 //! reach it, inside a `simulate` region or in a test the search re-runs, as a host operation does.
@@ -356,7 +356,7 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     }
 }
 
-/// What a real handler read or wrote, entered into the record of the run asking where it is
+/// What a host handler read or wrote, entered into the record of the run asking where it is
 /// observed. Under the root the label at `label_at` names, at the path at `path_at` below it,
 /// `kind` 0 is a file's bytes read, 1 a directory's names, 2 what is there, 3 every path below,
 /// and 4 a write; a label no root is bound to holds nothing to record. Of what the binary ships,
