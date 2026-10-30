@@ -10,15 +10,14 @@ import compiler.syntax.exprs (crossing_perform, scheduler_module)
 import compiler.check.types (Type, TyCon, int_type, string_type, bool_type)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (int_lit)
-import compiler.emit.roots (symbol_of, root_id)
+import compiler.emit.roots (root_id, builtin_pointed)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry,
-                           definition_of)
+import compiler.emit.keys (RootKey, Named, Root, Written, has_entry, definition_of)
 import compiler.emit.evidence (declared_arity)
 import compiler.emit.reps (Ctors, no_ctors, laid_known)
 import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, SiteOf, InGroup, LentBy, Called,
-                             merged, spelled)
+                             merged, spelled, own_symbol)
 import compiler.emit.release (drop_of)
 import compiler.emit.tir.handling (instance_alone)
 import compiler.emit.tir (carried_vars, reps_of, all_given, param_rep, no_closure_words, Rep, RInt,
@@ -34,7 +33,7 @@ import compiler.emit.tir (carried_vars, reps_of, all_given, param_rep, no_closur
 import compiler.emit.print.text (Under, Place, Printing, Printed, printing, function_body, line,
                                  text, pieces, pad, named, name_of, arg_text, assigned, label,
                                  check, failing_return, site, slot, part_names, part_name,
-                                 unprinted)
+                                 unprinted, native_noted)
 import compiler.emit.print.counts (block_opened, block_closed, count_printed, walked_value, last_of,
                                    updated, exit_through)
 import compiler.emit.print.made (c_type, as_word, word_as, word_parts, made, got, gathered, statics,
@@ -63,9 +62,10 @@ import compiler.emit.print.counting (dup_fn, rel_fn, call_text)
 /// Root `f` as its C function and entry, or a tail group as its group function, the group's entry
 /// and each member's wrapper; then each of its closures' functions in `f.lambdas` order; the `each`
 /// functions their frame records name, and the entries by type its calls of its closures enter,
-/// declared before them all. `ctors` is the program's constructor table.
+/// declared before them all. Each is named after the root's symbol as the unit fills it in
+/// (`own_symbol`). `ctors` is the program's constructor table.
 pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
-  let name = symbol_of(root_text(root_name(f.key)));
+  let name = own_symbol(None);
   let own = if f.members.len() == 0 { root_printed(name, f, ctors) }
   else { group_printed(name, f, ctors) };
   let closures = range(0, f.lambdas.len()).fold(
@@ -73,7 +73,7 @@ pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
     |acc: { pr: Printing, out: List<Piece> }, k: Int|
       match f.lambdas.at(k) {
         Some(l) -> {
-          let t = lambda_text(f, k, l, closure_printed(name, k, l, acc.pr));
+          let t = lambda_text(name, k, l, closure_printed(name, k, l, acc.pr));
           { pr: t.pr, out: acc.out.concat(t.out) }
         },
         None -> acc,
@@ -94,6 +94,7 @@ pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
     handles: tables.handles,
     expects: tables.expects,
     shared: tables.shared,
+    natives: tables.natives,
   }
 }
 
@@ -261,7 +262,7 @@ fn group_printed(
   let wrappers = range(0, f.members.len()).fold(
     { pr: switched, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, i: Int| {
-      let w = group_wrapper(f, i, acc.pr);
+      let w = group_wrapper(name, f, i, acc.pr);
       { pr: w.pr, out: acc.out.concat(w.out) }
     },
   );
@@ -898,14 +899,15 @@ fn native(
   pr: Printing,
   into: Option<Var>,
   n: { name: Bytes, args: List<Arg>, uses: Uses },
-) -> Printing = {
+) -> Printing / {abort.raise} = {
   let call = Bytes::concat_all([
     n.name,
     b"(ctx",
     Bytes::concat_all(n.args.map(|a: Arg| b", ".concat(arg_text(pr, a)))),
     b")",
   ]);
-  let sited = if n.uses.fails { site(p, pr) } else { pr };
+  let noted = match builtin_pointed(n.name) { Some(h) -> native_noted(pr, h), None -> pr };
+  let sited = if n.uses.fails { site(p, noted) } else { noted };
   let written = match into {
     Some(v) -> assigned(sited, p.depth, v, c_type(v.rep), call),
     None -> line(sited, p.depth, call.concat(b";")),
@@ -1138,7 +1140,7 @@ test "a tail group is one function switching on its member's place, each arm ope
       no_ctors(),
     ).pieces,
   );
-  let g = symbol_of(b"m.even").concat(b"_group");
+  let g = own_symbol(None).concat(b"_group");
   let said = Some(String::of_bytes_lossy(text));
   let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
   // One function, taking the member's place beside the group's words, switching on the place.
@@ -1187,14 +1189,14 @@ test "a closure's function follows its root's, and its body numbers its temporar
   };
   let l = Closure({ body: body, captures: 0, at: span_between(20, 30), words: no_closure_words() });
   let f = { ..body, lambdas: [l] };
-  let name = symbol_of(b"m.outer");
+  let name = own_symbol(None);
   let inner = closure_printed(name, 0, l, { ..printing(Map::new()), temps: 7, labels: 3 });
   // Its first temporary is `t1`, whatever the root's printing had numbered before it.
   let body = spelled(inner.out);
   assert(body.index_of(b" t1;") != None && body.index_of(b"t8") == None, None);
   let printed = printed_fn(f, no_ctors());
   assert(
-    spelled(printed.pieces).ends_with(b"}\n".concat(spelled(lambda_text(f, 0, l, inner).out))),
+    spelled(printed.pieces).ends_with(b"}\n".concat(spelled(lambda_text(name, 0, l, inner).out))),
   );
   // A closure's descriptor names its entries, so it puts none in the code table.
   assert_eq(printed.lambdas, [])
@@ -1226,7 +1228,7 @@ test "a plain root never probes the stack; a drop root nests through the release
     let f = plain(op);
     let all = spelled(printed_fn(f, no_ctors()).pieces);
     // The root's own function, its entry after it aside.
-    let own = Bytes::concat_all([head(symbol_of(root_text(root_name(f.key))), f), b" {"]);
+    let own = Bytes::concat_all([head(own_symbol(None), f), b" {"]);
     match all.index_of(own) {
       Some(i) -> match all.index_of_from(b"\n}\n", i) { Some(j) -> all.slice(i, j), None -> b"" },
       None -> b"",

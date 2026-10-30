@@ -11,13 +11,14 @@ import compiler.emit.answer (Answer, RootAnswer, Tables, Defined, Head, Expect, 
                              GenericAt, expected_callee, word_head, no_generics, answer_bin,
                              tables_bin, root_answer_bin, no_tables, GenericCall, Generics, Need,
                              Pass, Reads, Scalar, Layout, Exact, Rowed, settled_by_callers,
-                             Published)
+                             Published, Keyed, KeyedTag, KeyedField, KeyedEntry)
 import compiler.emit.tir.statics (StaticDef, SFile, SPlain, StaticWord, WField, WAddress, named,
                                   words_of)
 import compiler.emit.print.statics (static_c, static_extern, escaped, c_string)
 import compiler.emit.release (root_of)
 import compiler.emit.statics (SStr, statics_of)
 import compiler.emit.roots (builtin_helper, symbol_of, entry_of, root_id)
+import compiler.emit.pieces (own_symbol)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, At, Written, Test, Cases, Clause, Law, Entered, Coded,
                            Requires, Ensures, LawGuard, LawBody, LawPart, FnArg, KeyArg, KeyType,
@@ -259,37 +260,12 @@ fn machine_bound(declared: List<Extern>) -> List<Native> / {abort.raise} =
 
 /// The C helper of each native a unit's bodies call, by its name without the `_p` its pointer
 /// adds.
-fn natives_called(made: Made) -> Map<Bytes, Bool> / {abort.raise} =
-  made.bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, k: UnitBody|
-    pointers_named(k.text, b"builtin_", acc))
+fn natives_called(made: Made) -> Map<Bytes, Bool> = natives_of(made.bodies)
 
-fn identifier_bytes() -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    range(48, 58).concat(range(65, 91)).push(95).concat(range(97, 123)).map(byte_of_int),
-  )
-
-/// `into` with each function `text` calls through a pointer whose name opens with `prefix`: an
-/// identifier `<prefix>…_p`, by its name less the `_p`.
-fn pointers_named(
-  text: Bytes,
-  prefix: Bytes,
-  into: Map<Bytes, Bool>,
-) -> Map<Bytes, Bool> / {abort.raise} =
-  iterate({ from: 0, found: into }, text.len() + 1, |s: { from: Int, found: Map<Bytes, Bool> }|
-    match text.index_of_from(prefix, s.from) {
-      None -> Stop(s.found),
-      Some(at) -> {
-        let end = text.scan(at, identifier_bytes(), text.len() - at);
-        let name = text.slice(at, end);
-        let opens = at == 0 || identifier_bytes().index_of_byte(text.at(at - 1)) == None;
-        Continue({
-          from: end,
-          found: if opens && name.ends_with(b"_p") {
-            s.found.insert(name.slice(0, name.len() - 2), true)
-          } else { s.found },
-        })
-      },
-    })
+/// The helper of each machine native `bodies` call, as their tables report them.
+fn natives_of(bodies: List<UnitBody>) -> Map<Bytes, Bool> =
+  bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, k: UnitBody|
+    k.tables.natives.fold(acc, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)))
 
 /// What the natives whose helpers are `called` are declared to be, as `program_natives` declares
 /// them over the modules the unit of `p` reads; the modules are read only where the compiler does
@@ -617,11 +593,11 @@ fn positions(keys: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
 /// A body the unit holds once: a group's under its first member.
 pub type UnitBody = { name: RootName, text: Bytes, tables: Tables }
 
-/// The C a body publishes for `name`: its place among the members, or the body's one definition.
+/// How a body defines `name`: by its place among the members, or the body's one definition.
 fn defines(name: RootName, tables: Tables) -> Defined / {abort.raise} = {
   let found = range(0, tables.members.len()).fold(0 - 1, |acc: Int, i: Int|
     if acc < 0 && root_name(tables.members.get(i)) == name { i } else { acc });
-  match tables.symbols.at(if found < 0 { 0 } else { found }) {
+  match tables.defined.at(if found < 0 { 0 } else { found }) {
     Some(d) -> d,
     None ->
       panic(
@@ -642,17 +618,24 @@ fn heads_its_group(name: RootName, tables: Tables, taken: Map<RootName, Bool>) -
     None -> true,
   }
 
-/// The bodies of the roots `taken`, each once, and the C each root publishes. A unit takes what its
+/// The symbol the unit's C defines root `name` by.
+fn symbol_named(name: RootName) -> Bytes / {abort.raise} = symbol_of(root_text(name))
+
+/// The entry the loader binds root `name`, defined as `d`, by; empty where it has none.
+fn entry_defined(name: RootName, d: Defined) -> Bytes / {abort.raise} =
+  if d.entered { entry_of(root_text(name)) } else { b"" }
+
+/// The bodies of the roots `taken`, each once, and how each root is defined. A unit takes what its
 /// roots reach, so every root taken has an answer and calls only roots taken; either failing is a
 /// defect in Ply.
 fn taken_bodies(
   answers: Map<RootName, Answer>,
   taken: List<RootName>,
-) -> { bodies: List<UnitBody>, symbols: Map<RootName, Defined> } / {abort.raise} = {
+) -> { bodies: List<UnitBody>, defined: Map<RootName, Defined> } / {abort.raise} = {
   let set = taken.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
   taken.fold(
-    { bodies: [], symbols: Map::new() },
-    |r: { bodies: List<UnitBody>, symbols: Map<RootName, Defined> }, name: RootName|
+    { bodies: [], defined: Map::new() },
+    |r: { bodies: List<UnitBody>, defined: Map<RootName, Defined> }, name: RootName|
       match answers.get(name) {
         None ->
           panic(
@@ -678,7 +661,7 @@ fn taken_bodies(
               bodies: if heads_its_group(name, b.tables, set) {
                 r.bodies.push({ name: name, text: b.text, tables: b.tables })
               } else { r.bodies },
-              symbols: r.symbols.insert(name, defines(name, b.tables)),
+              defined: r.defined.insert(name, defines(name, b.tables)),
             },
         },
       },
@@ -883,16 +866,21 @@ fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
       },
     })
 
-/// What a placeholder names in the unit's tables, its kind leading so a part's table sorts by kind;
-/// `None` for a root, written as its id.
-fn hole_key(h: Hole, tables: Tables) -> Option<Bytes> / {abort.raise} =
-  if h.kind == 84 { Some(b"T".concat(h.digits)) }
-  else if h.kind == 114 { None } else {
-    let i = digits(h.digits);
-    if h.kind == 102 { Some(b"f".concat(tables.fields.get(i))) }
-    else if h.kind == 108 { Some(b"l".concat(tables.lambdas.get(i))) }
-    else { panic("an emitted placeholder of no kind the unit resolves") }
+/// What a hole a body's tables report names in the unit's tables, its kind leading so a part's table
+/// sorts by kind.
+fn keyed_key(k: Keyed, tables: Tables) -> Bytes / {abort.raise} =
+  match k {
+    KeyedTag(name) -> b"T".concat(name),
+    KeyedField(i) -> b"f".concat(tables.fields.get(i)),
+    KeyedEntry(i) -> b"l".concat(tables.lambdas.get(i)),
   }
+
+/// The hole of the unit's tables placeholder `h` is.
+fn keyed_of(h: Hole) -> Keyed / {abort.raise} =
+  if h.kind == 84 { KeyedTag(h.digits) }
+  else if h.kind == 102 { KeyedField(digits(h.digits)) }
+  else if h.kind == 108 { KeyedEntry(digits(h.digits)) }
+  else { panic("an emitted placeholder of no kind the unit resolves") }
 
 /// A key's position in the unit's table of its kind, which is what the loader writes for it.
 fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.raise} = {
@@ -906,30 +894,35 @@ fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.rais
 /// The table a part's C reads the unit's positions from, which the `tables` part defines.
 fn part_table(label: String) -> Bytes = b"ply_part".concat(Bytes::of_string(label))
 
-/// A body's C with each placeholder written as its part names it: a root as its id, and the rest as
-/// a position in the part's own table, so the C reads the same whatever else the unit holds.
+/// The root whose symbol a body's own placeholder stands for: its own, or a group's first member's.
+fn own_root(body: UnitBody) -> RootName =
+  match body.tables.members.at(0) { Some(m) -> root_name(m), None -> body.name }
+
+/// `body`'s C with each placeholder written as its part names it: the root a failure site names as
+/// its id, a root the body defines as its symbol, and the rest as a position in the part's own
+/// table, so the C reads the same whatever else the unit holds. `site` is the root its failure sites
+/// name, and `local` holds each key of the part's table `table` by its position.
 fn resolved(
-  text: Bytes,
-  hs: List<Hole>,
-  keys: List<Option<Bytes>>,
-  tables: Tables,
+  body: UnitBody,
   site: RootName,
   table: Bytes,
   local: Map<Bytes, Int>,
 ) -> Bytes / {abort.raise} = {
-  let walked = range(0, hs.len()).fold(
+  let text = body.text;
+  let member = |h: Hole, otherwise: RootName|
+    if h.digits.len() == 0 { otherwise }
+    else { root_name(body.tables.members.get(digits(h.digits))) };
+  let walked = holes(text).fold(
     { from: 0, out: [] },
-    |s: { from: Int, out: List<Bytes> }, i: Int| {
-      let h = hs.get(i);
-      let value = match keys.get(i) {
-        None ->
-          ascii_of_int(
-            root_id(
-              root_text(if h.digits.len() == 0 { site }
-              else { root_name(tables.members.get(digits(h.digits))) }),
-            ),
-          ),
-        Some(k) -> Bytes::concat_all([table, b"[", ascii_of_int(place(local, k)), b"]"]),
+    |s: { from: Int, out: List<Bytes> }, h: Hole| {
+      let value = if h.kind == 114 { ascii_of_int(root_id(root_text(member(h, site)))) }
+      else if h.kind == 115 { symbol_named(member(h, own_root(body))) } else {
+        Bytes::concat_all([
+          table,
+          b"[",
+          ascii_of_int(place(local, keyed_key(keyed_of(h), body.tables))),
+          b"]",
+        ])
       };
       { from: h.close + 2, out: s.out.push(text.slice(s.from, h.open)).push(value) }
     },
@@ -1121,10 +1114,12 @@ type Placing = {
   statics: List<Bytes>,
   /// The functions closures alike share that its C names, which its part defines once.
   shared: List<SharedFn>,
+  /// The helpers of the machine natives its C calls, whose pointers its part declares.
+  natives: List<Bytes>,
 }
 
-/// A body's placeholders and what each names, which its part's table is made of.
-type Marked = { body: UnitBody, holes: List<Hole>, keys: List<Option<Bytes>> }
+/// A body and the keys of the unit's tables its holes name, which its part's table is made of.
+type Marked = { body: UnitBody, keys: List<Bytes> }
 
 /// Where a unit's C starts a new part, in bytes of its bodies' C before their placeholders are
 /// resolved: at a body whose root id has its low `bits` bits all zero, once the part holds `min`;
@@ -1170,12 +1165,8 @@ fn part_label(name: RootName) -> String / {abort.raise} =
 type Part = { label: String, places: List<Int>, bodies: List<Placing>, constants: List<StaticDef> }
 
 /// The keys a part's table holds: each one its bodies' placeholders name, once, in byte order.
-fn part_keys(group: List<Marked>) -> List<Bytes> / {abort.raise} =
-  ordered(
-    group.fold([], |acc: List<Bytes>, m: Marked|
-      m.keys.fold(acc, |ks: List<Bytes>, k: Option<Bytes>|
-        match k { Some(key) -> ks.push(key), None -> ks })),
-  )
+fn part_keys(group: List<Marked>) -> List<Bytes> =
+  ordered(group.fold([], |acc: List<Bytes>, m: Marked| acc.concat(m.keys)))
 
 /// The constants the part of `group`'s bodies defines, in the order they name them, and every
 /// constant defined once it does: each one they name that holds no field's position and that no
@@ -1244,7 +1235,7 @@ fn part_c(
   let defined = p.constants.fold(Map::new(), |acc: Map<Bytes, Bool>, d: StaticDef|
     acc.insert(d.name, true));
   let called = p.bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, body: Placing|
-    pointers_named(body.text, b"builtin_", acc));
+    body.natives.fold(acc, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)));
   Bytes::concat_all([
     part_mark(p.label),
     b"\n",
@@ -1272,18 +1263,13 @@ fn part_c(
 }
 
 /// The natives of shipped modules `bodies` call over machine words, which the head declares no
-/// pointer to: each one `machine_of` declares among the helpers their C names beyond `bound`'s.
+/// pointer to: each one `machine_of` declares among the helpers they call beyond `bound`'s.
 fn machine_called(
   bodies: List<UnitBody>,
   machine_of: (Map<Bytes, Bool>) -> List<Native> / {abort.raise},
 ) -> List<Native> / {abort.raise} = {
-  let own = bound().fold(Map::new(), |acc: Map<Bytes, Bool>, n: Native| acc.insert(n.name, true));
-  let beyond = bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, k: UnitBody|
-    pointers_named(k.text, b"builtin_", acc)).fold(
-    Map::new(),
-    |acc: Map<Bytes, Bool>, name: Bytes, _: Bool|
-      if own.contains(name) { acc } else { acc.insert(name, true) },
-  );
+  let beyond = bound().fold(natives_of(bodies), |acc: Map<Bytes, Bool>, n: Native|
+    acc.remove(n.name));
   if beyond.len() == 0 { [] } else { machine_of(beyond) }
 }
 
@@ -1308,10 +1294,11 @@ fn placing(
 ) -> Placing / {abort.raise} =
   {
     name: m.body.name,
-    text: resolved(m.body.text, m.holes, m.keys, m.body.tables, site, table, local),
+    text: resolved(m.body, site, table, local),
     reaches: reaches_of(m.body.name, m.body.tables),
     statics: m.body.tables.statics.map(|d: StaticDef| d.name),
     shared: m.body.tables.shared,
+    natives: m.body.tables.natives,
   }
 
 /// `bodies`, in the unit's order, cut into parts by `rule`: each part's table holding the unit's
@@ -1363,24 +1350,25 @@ pub fn produce(
   let s = taken_bodies(answers, names);
   let machine = machine_called(s.bodies, machine_of);
   let published = |n: RootName|
-    match s.symbols.get(n) {
+    match s.defined.get(n) {
       Some(d) -> d,
       None -> panic("every definition a unit takes emitted, and an emitted body publishes its C"),
     };
+  let entry = |n: RootName| entry_defined(n, published(n));
   let constants = names.filter(|n: RootName|
     match offers.get(n) { Some(o) -> o.constant, None -> false });
   let statics = statics_placed(s.bodies);
   let pools = pools_of(
     s.bodies,
     statics,
-    constants.map(|n: RootName| { name: n, entry: published(n).entry }),
+    constants.map(|n: RootName| { name: n, entry: entry(n) }),
   );
   let placed = placed_of(pools);
   let constant_c = |d: StaticDef|
     static_c(
       d,
       |f: Bytes| place(placed.fields, f),
-      |k: RootKey| symbol_of(root_text(root_name(k))),
+      |k: RootKey| symbol_named(root_name(k)),
       |digest: Bytes|
         match inputs.get(digest) {
           Some(b) -> b,
@@ -1391,22 +1379,20 @@ pub fn produce(
         },
     );
   let tags = positions(ctors.map(|c: Ctor| c.name));
-  let taken = names.map(|n: RootName| {
-    let d = published(n);
+  let taken = names.map(|n: RootName|
     {
       name: n,
       arity: match offers.get(n) { Some(o) -> o.arity, None -> 0 },
-      symbol: d.symbol,
-      entry: d.entry,
-      head: d.head,
-    }
-  });
+      symbol: symbol_named(n),
+      entry: entry(n),
+      head: published(n).head,
+    });
   // Each call was written to the head its caller read; the callee's own must be that head.
   s.bodies.fold((), |_u: Unit, k: UnitBody|
     k.tables.generics.expects.fold((), |_v: Unit, e: Expect|
       match expected_callee(k.tables, e) {
         None -> (),
-        Some(callee) -> match s.symbols.get(callee) {
+        Some(callee) -> match s.defined.get(callee) {
           Some(d) -> if d.head != e.head {
             panic(
               String::of_bytes_lossy(
@@ -1416,9 +1402,9 @@ pub fn produce(
                   b"` calls `",
                   root_text(callee),
                   b"` as ",
-                  prototype(d.symbol, e.head),
+                  prototype(symbol_named(callee), e.head),
                   b"which it defines as ",
-                  prototype(d.symbol, d.head),
+                  prototype(symbol_named(callee), d.head),
                 ]),
               ),
             )
@@ -1426,25 +1412,18 @@ pub fn produce(
           None -> (),
         },
       }));
-  let marked = s.bodies.fold(Map::new(), |acc: Map<Bytes, Marked>, k: UnitBody| {
-    let hs = holes(k.text);
+  let marked = s.bodies.fold(Map::new(), |acc: Map<Bytes, Marked>, k: UnitBody|
     acc.insert(order_key(offer_of(k.name).home, k.name), {
       body: k,
-      holes: hs,
-      keys: hs.map(|h: Hole| hole_key(h, k.tables)),
-    })
-  }).values(
+      keys: k.tables.keyed.map(|x: Keyed| keyed_key(x, k.tables)),
+    })).values(
   );
   let parts = parts_of(marked, rule, |n: RootName| offer_of(n).site, |k: Bytes|
     unit_place(k, placed, tags));
   let exports = exports_text(
     bound().concat(machine),
     constants.map(|n: RootName|
-      Bytes::concat_all([
-        root_text(n),
-        b" ",
-        ascii_of_int(place(placed.lambdas, published(n).entry)),
-      ])),
+      Bytes::concat_all([root_text(n), b" ", ascii_of_int(place(placed.lambdas, entry(n)))])),
     modules,
     pools,
     // An entry's site is the root it enters, which the unit need not hold: a generic definition's
@@ -1821,7 +1800,7 @@ fn definition_material(program: Program, name: RootName) -> Option<Bytes> =
 pub fn answers_store(bodies: String, runtime: Runtime, emitter: Bytes) -> String / {abort.raise} = {
   let id = blake3(
     Bytes::concat_all(
-      [b"ply.unit.answer.4", hex(bin::shape_digest(kept_bin())), runtime.identity, emitter].map(
+      [b"ply.unit.answer.5", hex(bin::shape_digest(kept_bin())), runtime.identity, emitter].map(
         |b: Bytes| sized(b),
       ),
     ),
@@ -3115,8 +3094,9 @@ fn compiled(
       },
   )
 
-/// The code body `a` of specialisation `n` of `def` compiles as: the digest of the body with its own
-/// name taken out, which a specialisation whose body is alike but for its name shares.
+/// The code body `a` of specialisation `n` of `def` compiles as: the digest of the body with its
+/// calls of itself made calls of no name, which a specialisation whose body is alike but for its name
+/// shares.
 fn code_of(def: Bytes, n: RootName, a: Answer) -> RootKey / {abort.raise} = {
   let unnamed = renamed(a, n, Coded({ def: def, code: b"" }));
   Coded({
@@ -3125,24 +3105,16 @@ fn code_of(def: Bytes, n: RootName, a: Answer) -> RootKey / {abort.raise} = {
   })
 }
 
-/// Body `a` of root `n` as the body of root `k`: each name made from `n`'s symbol made from `k`'s,
-/// and each call of `n` a call of `k`.
-fn renamed(a: Answer, n: RootName, k: RootKey) -> Answer / {abort.raise} = {
-  let from = symbol_of(root_text(n));
-  let to = symbol_of(root_text(root_name(k)));
-  let renaming = |x: Bytes| Bytes::join(x.split(from), to);
+/// Body `a` of root `n` as the body of root `k`: each call of `n` a call of `k`. Its C names the root
+/// it defines by a placeholder (`pieces.own_symbol`), so nothing else names `n`.
+fn renamed(a: Answer, n: RootName, k: RootKey) -> Answer =
   {
-    text: renaming(a.text),
+    ..a,
     tables: {
       ..a.tables,
       calls: a.tables.calls.map(|c: RootKey| if root_name(c) == n { k } else { c }),
-      lambdas: a.tables.lambdas.map(renaming),
-      symbols: a.tables.symbols.map(|d: Defined|
-        { ..d, symbol: renaming(d.symbol), entry: renaming(d.entry) }),
-      shared: a.tables.shared.map(|f: SharedFn| { ..f, text: renaming(f.text) }),
     },
   }
-}
 
 /// `text` with each `@@gN@@` written as the symbol of root `N`.
 fn placeholders_named(text: Bytes, roots: List<RootName>) -> Bytes / {abort.raise} = {
@@ -3470,13 +3442,15 @@ test "a call of a generic tail loop at a type settles on the loop at it, whichev
   }
 }
 
-/// The C of a specialisation of `m.f` whose symbol is `own`: it calls itself and adds `answer`.
-fn specialisation_text(own: Bytes, answer: Bytes) -> Bytes =
+/// The C of a specialisation of `m.f`, as the emitter writes it: it calls itself and adds `answer`.
+fn specialisation_text(answer: Bytes) -> Bytes = {
+  let own = own_symbol(None);
   Bytes::concat_all([b"Word ", own, b"(PlyCtx *ctx) { return ", own, b"(ctx) + ", answer, b"; }"])
+}
 
-/// The tables of a specialisation of `m.f` keyed `k`, whose symbol is `own`: it calls itself.
-fn specialisation_tables(k: RootKey, own: Bytes) -> Tables =
-  { ..no_tables(), calls: [k], symbols: [{ symbol: own, entry: b"", head: word_head(0) }] }
+/// The tables of a specialisation of `m.f` keyed `k`: it calls itself.
+fn specialisation_tables(k: RootKey) -> Tables =
+  { ..no_tables(), calls: [k], defined: [{ entered: false, head: word_head(0) }] }
 
 /// A program whose root `m.calls_Int` calls `m.f` at `Int`, and so on for each type of `at`, with
 /// the specialisation of `m.f` each call settles on: at `U8` of one code, and at every other type
@@ -3487,12 +3461,11 @@ fn program_calling_f_at(
 ) -> { compiled_as: Map<RootName, RootKey>, bodies: Map<RootName, Answer> } / {abort.raise} = {
   let specialised = |arg: Bytes| {
     let k = at_key(b"m.f", [spelled(arg)], []);
-    let own = symbol_of(printed(k));
     {
       key: k,
       value: {
-        text: specialisation_text(own, if arg == b"U8" { b"1" } else { b"0" }),
-        tables: specialisation_tables(k, own),
+        text: specialisation_text(if arg == b"U8" { b"1" } else { b"0" }),
+        tables: specialisation_tables(k),
       },
     }
   };
@@ -3547,7 +3520,7 @@ test "a specialisation whose code another's is adds no body and moves no other b
   assert(called(b"m.calls_U8") != own, None);
   assert_eq(
     both.get(root_name(code)),
-    Some({ text: specialisation_text(own, b"0"), tables: specialisation_tables(code, own) }),
+    Some({ text: specialisation_text(b"0"), tables: specialisation_tables(code) }),
   )
 }
 
@@ -3633,13 +3606,14 @@ test "lines are read as a final newline ends the last one" {
   assert_eq(split_lines(b"a\r\n\nb"), [b"a", b"", b"b"])
 }
 
-/// A body of root `name` calling `calls` and naming a static of its own.
+/// A body of root `name` calling `calls` and naming a static of its own, as the emitter writes it:
+/// by a placeholder of its symbol (`body_of` reads it as its part writes it).
 fn one_body(name: Bytes, calls: List<Bytes>) -> Answer / {abort.raise} = {
   let own = statics_of(SStr(name));
   {
     text: Bytes::concat_all([
-      b"Word f_",
-      name,
+      b"Word ",
+      own_symbol(None),
       b"(PlyCtx *ctx) { return (Word)(intptr_t)&",
       own.get(0).name,
       b" + @@r@@; }",
@@ -3648,14 +3622,14 @@ fn one_body(name: Bytes, calls: List<Bytes>) -> Answer / {abort.raise} = {
       ..no_tables(),
       statics: own,
       calls: calls.map(Named),
-      symbols: [{ symbol: b"f_".concat(name), entry: b"e_".concat(name), head: word_head(0) }],
+      defined: [{ entered: true, head: word_head(0) }],
     },
   }
 }
 
 /// `a` publishing `head` as its definition's.
 fn headed(a: Answer, head: Head) -> Answer =
-  { ..a, tables: { ..a.tables, symbols: a.tables.symbols.map(|d: Defined| { ..d, head: head }) } }
+  { ..a, tables: { ..a.tables, defined: a.tables.defined.map(|d: Defined| { ..d, head: head }) } }
 
 /// `one_body` with other text, as an edit to its definition would make it.
 fn edited_body(name: Bytes) -> Answer / {abort.raise} = {
@@ -3743,7 +3717,11 @@ test "a cycle is digested whole, whatever order the unit holds its roots in" {
 test "a constructor's tag is its part's to read, at the position the unit's own table gives it" {
   let answer = {
     text: b"Word f_m.f(PlyCtx *ctx) { return @@Tm.Line@@ + @@TNone@@; }",
-    tables: { ..no_tables(), symbols: [{ symbol: b"f_m.f", entry: b"e_m.f", head: word_head(0) }] },
+    tables: {
+      ..no_tables(),
+      defined: [{ entered: true, head: word_head(0) }],
+      keyed: [KeyedTag(b"m.Line"), KeyedTag(b"None")],
+    },
   };
   let unit = |ctors: List<Ctor>|
     produce(
@@ -3809,8 +3787,9 @@ fn part_labelled(text: Bytes, label: String) -> Bytes / {abort.raise} =
 fn part_holding(text: Bytes, c: Bytes) -> Bytes / {abort.raise} =
   match parts_in(text).find(|p: Cut| p.text.index_of(c) != None) { Some(p) -> p.text, None -> b"" }
 
-/// How `one_body` opens the definition of `name`.
-fn body_of(name: Bytes) -> Bytes = Bytes::concat_all([b"Word f_", name, b"(PlyCtx *ctx)"])
+/// How `one_body`'s definition of `name` opens once its part writes it.
+fn body_of(name: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all([b"Word ", symbol_of(name), b"(PlyCtx *ctx)"])
 
 /// Where `needle` first stands in `hay`, or -1.
 fn found_at(hay: Bytes, needle: Bytes) -> Int =
@@ -3842,7 +3821,10 @@ test "a part's C reads the same whatever another part adds to the unit's tables"
   // A body naming a field of the unit's field table, the name `field`.
   let fielded = |n: Bytes, field: Bytes| {
     let b = one_body(n, []);
-    { text: b.text.concat(b" /* @@f0@@ */"), tables: { ..b.tables, fields: [field] } }
+    {
+      text: b.text.concat(b" /* @@f0@@ */"),
+      tables: { ..b.tables, fields: [field], keyed: [KeyedField(0)] },
+    }
   };
   let unit = |names: List<Bytes>|
     produce(
@@ -4009,7 +3991,7 @@ test "a part declares what its bodies reach, and nothing else" {
     one_each(),
   );
   let declares = |part: Bytes, name: Bytes, arity: Int|
-    part.index_of(prototype(b"f_".concat(name), word_head(arity))) != None;
+    part.index_of(prototype(symbol_of(name), word_head(arity))) != None;
   let calling = part_holding(p.text, body_of(caller));
   assert(
     declares(calling, caller, 0) && declares(calling, callee, 2),
@@ -4024,7 +4006,7 @@ test "a part declares what its bodies reach, and nothing else" {
   let head = head_in(p.text);
   [caller, callee, apart].fold((), |u: Unit, name: Bytes| {
     assert_eq(p.text.split(body_of(name)).len() - 1, 1);
-    assert(head.index_of(b"f_".concat(name)) == None, None)
+    assert(head.index_of(symbol_of(name)) == None, None)
   })
 }
 
@@ -4090,7 +4072,13 @@ test "a call written to another head than the callee defines fails the unit" {
     Ok(_) -> assert(false, Some("a call to another head was taken")),
     Err(why) ->
       assert(
-        Bytes::of_string(why).index_of(b"which it defines as double f_m.callee(PlyCtx*, double)")
+        Bytes::of_string(why).index_of(
+            Bytes::concat_all([
+              b"which it defines as double ",
+              symbol_of(callee),
+              b"(PlyCtx*, double)",
+            ]),
+          )
           != None,
         Some(why),
       ),
@@ -5473,6 +5461,182 @@ test "a unit is refused where its runtime binds a helper or lays out what its co
   assert_eq(over({ ..moved, natives: [] }).at(0), Some(b"E0481"))
 }
 
+fn identifier_bytes() -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    range(48, 58).concat(range(65, 91)).push(95).concat(range(97, 123)).map(byte_of_int),
+  )
+
+/// `into` with each function `text` calls through a pointer whose name opens with `prefix`: an
+/// identifier `<prefix>…_p`, by its name less the `_p`.
+fn pointers_named(
+  text: Bytes,
+  prefix: Bytes,
+  into: Map<Bytes, Bool>,
+) -> Map<Bytes, Bool> / {abort.raise} =
+  iterate({ from: 0, found: into }, text.len() + 1, |s: { from: Int, found: Map<Bytes, Bool> }|
+    match text.index_of_from(prefix, s.from) {
+      None -> Stop(s.found),
+      Some(at) -> {
+        let end = text.scan(at, identifier_bytes(), text.len() - at);
+        let name = text.slice(at, end);
+        let opens = at == 0 || identifier_bytes().index_of_byte(text.at(at - 1)) == None;
+        Continue({
+          from: end,
+          found: if opens && name.ends_with(b"_p") {
+            s.found.insert(name.slice(0, name.len() - 2), true)
+          } else { s.found },
+        })
+      },
+    })
+
+/// A unit over roots that call natives through pointers, hand a type's stated arithmetic by a
+/// constructor's tag, land a raise left pending by its operation's names in the field table, read a
+/// constant through the code table, and call a definition that calls itself at two lenders' lambdas.
+fn pointing_unit() -> Emission / {abort.raise} =
+  kept_unit(
+    Bytes::concat_all([
+      b"effect e {\n  write op(k: Int) -> Int\n}\n",
+      b"effect oops {\n  raise boom(n: Int)\n}\n",
+      b"fn bang(n: Int) -> Int / {oops.boom} = if n > 0 { oops.boom(n) } else { n }\n",
+      b"fn caught(n: Int) -> Int = handle { bang(n) } with { oops.boom(k) -> k + 1 }\n",
+      b"type Shape = | Dot | Line(Int)\n",
+      b"fn handled() -> Int = handle { e.op(1) } with { var n = 0, e.op(k) -> { n = k; n }, return x -> x + n }\n",
+      b"fn decimals(d: Decimal) -> Decimal = d * d + d\n",
+      b"fn floats(x: Float) -> Float = x.sqrt()\n",
+      b"fn texts(s: String) -> Int = (s ++ s).len()\n",
+      b"fn listed(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n",
+      b"fn shaped(n: Int) -> Shape = if n > 0 { Line(n) } else { Dot }\n",
+      b"fn width(s: Shape) -> Int = match s { Line(n) -> n, Dot -> 0 }\n",
+      b"fn table() -> List<Int> = [1, 2]\n",
+      b"fn read() -> Int = table().len()\n",
+      b"fn sum(f: (Int) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { f(n) + sum(f, n - 1) }\n",
+      b"fn one() -> Int = sum(|x: Int| x, 3)\n",
+      b"fn two() -> Int = sum(|x: Int| x, 4)\n",
+      b"type Length = | Metres(Int) | Millimetres(Int)\n",
+      b"key for Length by millimetres\n",
+      b"numeric for Length by { add: plus, sub: minus, mul: times, neg: negated, of_int: metres }\n",
+      b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+      b"fn plus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) + millimetres(b))\n",
+      b"fn minus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) - millimetres(b))\n",
+      b"fn times(a: Length, b: Length) -> Length = Millimetres(millimetres(a) * millimetres(b))\n",
+      b"fn negated(a: Length) -> Length = Millimetres(0 - millimetres(a))\n",
+      b"fn metres(n: Int) -> Length = Metres(n)\n",
+      b"fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+      b"fn all(xs: List<Length>) -> Length = total(xs)\n",
+    ]),
+  ).unit(
+    [
+      b"m.handled",
+      b"m.caught",
+      b"m.decimals",
+      b"m.floats",
+      b"m.texts",
+      b"m.listed",
+      b"m.shaped",
+      b"m.width",
+      b"m.read",
+      b"m.one",
+      b"m.two",
+      b"m.all",
+    ].map(
+      Named,
+    ),
+  )
+
+test "the natives a body reports are the ones its C calls through a pointer" {
+  let bodies = pointing_unit().produced.made.bodies;
+  let scanned = |k: UnitBody|
+    k.tables.shared.fold(
+      pointers_named(k.text, b"builtin_", Map::new()),
+      |m: Map<Bytes, Bool>, f: SharedFn| pointers_named(f.text, b"builtin_", m),
+    ).keys(
+    );
+  assert_eq(
+    bodies.filter(|k: UnitBody| ordered(k.tables.natives) != scanned(k)).map(|k: UnitBody|
+      root_text(k.name)),
+    [],
+  );
+  assert(bodies.any(|k: UnitBody| k.tables.natives.len() > 0), None)
+}
+
+test "the holes a body reports are the ones its C holds that its part's table places" {
+  let bodies = pointing_unit().produced.made.bodies;
+  let scanned = |k: UnitBody|
+    ordered(
+      holes(k.text).filter(|h: Hole| h.kind != 114 && h.kind != 115).map(|h: Hole|
+        keyed_key(keyed_of(h), k.tables)),
+    );
+  let reported = |k: UnitBody| ordered(k.tables.keyed.map(|x: Keyed| keyed_key(x, k.tables)));
+  assert_eq(
+    bodies.filter(|k: UnitBody| reported(k) != scanned(k)).map(|k: UnitBody| root_text(k.name)),
+    [],
+  );
+  // Among them a tag, a field and a constant's entry.
+  let all = bodies.fold([], |acc: List<Bytes>, k: UnitBody| acc.concat(reported(k)));
+  assert_eq([84, 102, 108].filter(|kind: Int| !all.any(|key: Bytes| key.at(0) == kind)), [])
+}
+
+test "a part reads as it would were each root its bodies define written as its symbol" {
+  let made = pointing_unit().produced.made;
+  let ctors = ordered(
+    made.bodies.fold([], |acc: List<Bytes>, k: UnitBody|
+      k.tables.keyed.fold(acc, |a: List<Bytes>, x: Keyed|
+        match x { KeyedTag(n) -> a.push(n), _ -> a })),
+  ).map(|n: Bytes| { name: n, arity: 0 });
+  let unit = |texts: List<Bytes>|
+    produce(
+      ctors,
+      made.offered,
+      1,
+      answers_of(
+        range(0, made.bodies.len()).map(|i: Int| {
+          let k = made.bodies.get(i);
+          { name: k.name, answer: { text: texts.get(i), tables: k.tables } }
+        }),
+      ),
+      Map::new(),
+      no_machine,
+      one_each(),
+    ).text;
+  let symbol = |n: RootName| symbol_of(root_text(n));
+  let spelled_out = |k: UnitBody| {
+    let members = k.tables.members.map(root_name);
+    Bytes::join(
+      range(0, members.len()).fold(k.text, |t: Bytes, i: Int|
+        Bytes::join(t.split(own_symbol(Some(i))), symbol(members.get(i)))).split(
+        own_symbol(None),
+      ),
+      symbol(own_root(k)),
+    )
+  };
+  let written = unit(made.bodies.map(|k: UnitBody| k.text));
+  assert(made.bodies.any(|k: UnitBody| k.text.index_of(own_symbol(None)) != None), None);
+  assert_eq(written.index_of(b"@@"), None);
+  assert_eq(written, unit(made.bodies.map(spelled_out)))
+}
+
+test "specialisations whose bodies differ only in their names, each calling itself, compile as one code" {
+  let source = Bytes::concat_all([
+    b"fn sum(f: (Int) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { f(n) + sum(f, n - 1) }\n",
+    b"fn one() -> Int = sum(|x: Int| x, 3)\n",
+    b"fn two() -> Int = sum(|x: Int| x, 4)\n",
+  ]);
+  match built([{ name: b"m", src: source }]) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(e) -> {
+      let specialisations = e.roots.filter(|k: RootKey|
+        match k { At(a, _) -> a.def == b"m.sum", _ -> false });
+      let codes = e.produced.taken.filter(|n: RootName| root_text(n).starts_with(b"m.sum@="));
+      assert_eq([specialisations.len(), codes.len()], [2, 1]);
+      assert_eq(
+        specialisations.filter(|k: RootKey|
+          e.produced.text.index_of(symbol_of(printed(k))) != None),
+        [],
+      )
+    },
+  }
+}
+
 test "every function a unit's C calls through a pointer is one the unit binds" {
   let k = kept_unit(
     Bytes::concat_all([
@@ -5664,16 +5828,17 @@ test "a unit asks the emitter for a root a kept body names, though the body's de
     // What the next run starts from: the body of `scaled`, and of no root it names, beside the keys
     // of the roots it calls.
     let answer = |k: Bytes| !k.starts_with(key_key(b""));
+    // An answer is filed under its material, which opens with its definition's name; the entry of
+    // `scaled` is filed so too, and calls it.
+    let scaled = |k: Bytes, v: Bytes|
+      k.starts_with(answer_key(b"m.scaled\x00"))
+        && (match bin::decode(v, kept_bin()) {
+          Ok(filed) -> !filed.calls.contains(key_digest(Named(b"m.scaled"))),
+          Err(_) -> false,
+        });
     body_store.replace(
       body_store.all().fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-        if !answer(k) { acc.insert(k, v) } else {
-          match bin::decode(v, kept_bin()) {
-            Ok(filed) -> if filed.answer.tables.symbols.map(|d: Defined| d.symbol)
-                == [symbol_of(b"m.scaled")] { acc.insert(k, v) }
-            else { acc },
-            Err(_) -> acc,
-          }
-        }),
+        if !answer(k) || scaled(k, v) { acc.insert(k, v) } else { acc }),
     );
     assert_eq(body_store.all().keys().filter(answer).len(), 1);
     let moved = unit(
@@ -5836,11 +6001,14 @@ test "a unit takes what it is offered, resolves its bodies and says what it hold
   );
   assert_eq(p.taken, [def_root(b"m.f")]);
   let own = statics_of(SStr(b"m.f")).get(0);
+  let symbol = symbol_of(b"m.f");
+  let entry = entry_of(b"m.f");
   let body = part_holding(p.text, body_of(b"m.f"));
   assert(
     body.index_of(
         Bytes::concat_all([
-          b"Word f_m.f(PlyCtx *ctx) { return (Word)(intptr_t)&",
+          body_of(b"m.f"),
+          b" { return (Word)(intptr_t)&",
           own.name,
           b" + ",
           ascii_of_int(root_id(b"m.f")),
@@ -5851,7 +6019,7 @@ test "a unit takes what it is offered, resolves its bodies and says what it hold
     None,
   );
   // The body's part declares it and defines the static it names.
-  assert(body.index_of(b"Word f_m.f(PlyCtx*);\n") != None, None);
+  assert(body.index_of(Bytes::concat_all([b"Word ", symbol, b"(PlyCtx*);\n"])) != None, None);
   assert(body.index_of(static_defined(own)) != None, None);
   // A constant says its row of the code table, and the loader takes that table and each
   // definition's entry by address.
@@ -5859,13 +6027,27 @@ test "a unit takes what it is offered, resolves its bodies and says what it hold
   assert(tables.index_of(b"\"constants 1\" \"\\n\"\n\"m.f 0\" \"\\n\"") != None, None);
   assert(p.text.index_of(b"\"taken ") == None && p.text.index_of(b"\"lambdas ") == None, None);
   assert(
-    tables.index_of(b"extern char e_m.f;\nvoid *const ply_code[] = {\n  (void *)&e_m.f,\n  0 };\n")
+    tables.index_of(
+        Bytes::concat_all([
+          b"extern char ",
+          entry,
+          b";\nvoid *const ply_code[] = {\n  (void *)&",
+          entry,
+          b",\n  0 };\n",
+        ]),
+      )
       != None,
     None,
   );
   assert(
     part_labelled(p.text, "taken").index_of(
-        b"extern char e_m.f;\nconst struct ply_taken ply_taken[] = {\n  { \"m.f\", (void *)&e_m.f, 0 },\n  { 0, 0, 0 } };\n",
+        Bytes::concat_all([
+          b"extern char ",
+          entry,
+          b";\nconst struct ply_taken ply_taken[] = {\n  { \"m.f\", (void *)&",
+          entry,
+          b", 0 },\n  { 0, 0, 0 } };\n",
+        ]),
       )
       != None,
     None,
@@ -5888,9 +6070,17 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
     no_machine,
     part_rule(),
   );
+  let row = |n: Bytes|
+    Bytes::concat_all([b"  { \"", n, b"\", (void *)&", entry_of(n), b", 2 },\n"]);
   assert(
     p.text.index_of(
-        b"ply_taken[] = {\n  { \"m.B\", (void *)&e_m.B, 2 },\n  { \"m.a#entered\", (void *)&e_m.a#entered, 2 },\n  { \"m.z\", (void *)&e_m.z, 2 },\n  { 0, 0, 0 } };\n",
+        Bytes::concat_all([
+          b"ply_taken[] = {\n",
+          row(b"m.B"),
+          row(b"m.a#entered"),
+          row(b"m.z"),
+          b"  { 0, 0, 0 } };\n",
+        ]),
       )
       != None,
     Some(String::of_bytes_lossy(p.text)),
