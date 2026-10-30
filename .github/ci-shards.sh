@@ -73,9 +73,9 @@ CLI_PARTS=4
 # a job of their own instead: the compiler's own tests take every core.
 RUNS_ALONE=(package-compiler)
 # Modules of the CLI's suite no pull request runs, which the `nightly` job does: minutes each, the
-# reach audit checking packages cold and the copies audit listing every one, or against a postgres
+# repository audit checking packages cold and the copies audit listing every one, or against a postgres
 # they start.
-CLI_NIGHTLY=(reached copies db_in_ply db_wire pg_client)
+CLI_NIGHTLY=(repository_audit copies db_in_ply db_wire pg_client)
 # Minutes of a job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the steps
 # that keep what they wrote.
 RUNS_MARGIN=4
