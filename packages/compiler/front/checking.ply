@@ -38,17 +38,18 @@ import compiler.front.checking.world (Placing, Named, Embedding, ModuleAnswer, p
                                       Answering, Driving, CheckQuery, decoding_once, decoded,
                                       prefix_in, module_query, imports_query, ImportOf,
                                       imports_of_bin, absent, hash_answer_bin, context_query,
-                                      entry_query)
+                                      entry_query, entry_named_bin)
 import compiler.front.checking.groups (group_named_bin, owners_answer_bin, group_hashes_bin,
-                                       owners_query, owner_query, calls_query, cycles_query,
-                                       shape_query, sign_unit_query, setting_query,
-                                       group_imports_query, sees_query, wants_query, group_query,
-                                       owner_entry_query, shown_query, signatures_query,
-                                       signature_query, signed_query, typed_query, group_hash_query,
-                                       names_query, whole_query, header_text_query, header_query,
-                                       exported_query, hashes_query, documented_query,
-                                       declaring_query, declaring_bin, queries, tables_answered,
-                                       answering_query, declared_query, owner_hash_query)
+                                       owner_named_bin, group_of_query, unit_of_query, owners_query,
+                                       owner_query, calls_query, cycles_query, shape_query,
+                                       sign_unit_query, setting_query, group_imports_query,
+                                       sees_query, wants_query, group_query, owner_entry_query,
+                                       shown_query, signatures_query, signature_query, signed_query,
+                                       typed_query, group_hash_query, names_query, whole_query,
+                                       header_text_query, header_query, exported_query,
+                                       hashes_query, documented_query, declaring_query,
+                                       declaring_bin, queries, tables_answered, answering_query,
+                                       declared_query, owner_hash_query)
 
 // --- Asking a program's modules -------------------------------------------------------------
 
@@ -345,32 +346,38 @@ fn shipped_listed() -> List<Bytes> / {memo_keep.read, abort.raise} =
     None -> [],
   }
 
-/// The queries whose answers of a shipped module the toolchain ships, which a load cannot cheaply
-/// make again: the module read for its owners, the check of it whole, which every group of it asks
-/// first and which checks the module for a load that holds none of its groups, the signing of each
-/// sign unit, the walk of each owner of a unit of several, what it calls and how each unit is cut
-/// into groups, each group's check and hashing, the module's answer and hashing put together, what
-/// its imports alone refuse and the header text that reads, which a load over a pack it does not
-/// trust reads to vouch for the module's answer, what a module of the standard library documents,
-/// and which of them declare each name. What one owner or one name answers is read off those.
+/// The queries whose answers of a shipped module the toolchain ships: what a load reads across into
+/// a shipped module and never inside it. Its answer and hashing put together, what it embeds,
+/// documents and declares, the header a load over a pack it does not trust vouches for its answer
+/// with, and what a check of an importer reads of it: each name's owners and entries, each owner's
+/// entries and hashing and the group and unit it checks in. A load over a pack it trusts takes these
+/// and runs no body of the module; the module's own checks stay with the toolchain that made them.
 pub fn shipped_queries() -> List<Bytes> =
   [
-    owners_query(),
-    whole_query(),
-    signatures_query(),
-    typed_query(),
-    calls_query(),
-    cycles_query(),
-    group_query(),
-    group_hash_query(),
     module_query(),
-    header_query(),
-    header_text_query(),
     hashes_query(),
     wants_query(),
     documented_query(),
     declaring_query(),
+    header_query(),
+    header_text_query(),
+    names_query(),
+    entry_query(),
+    declared_query(),
+    exported_query(),
+    owner_entry_query(),
+    shown_query(),
+    group_of_query(),
+    unit_of_query(),
+    owner_hash_query(),
   ]
+
+/// `qs` with each query a pack carries keeping its answers, so the answers can be packed: a
+/// projection a load reads of a shipped module is cheap to answer again from what a store keeps, but
+/// a pack holds nothing else to answer it from.
+pub fn packing(qs: Map<Bytes, CheckQuery>) -> Map<Bytes, CheckQuery> =
+  shipped_queries().fold(qs, |acc: Map<Bytes, CheckQuery>, name: Bytes|
+    match acc.get(name) { Some(q) -> acc.insert(name, { ..q, kept: true }), None -> acc })
 
 /// The queries whose answers a store keeps only the digests of, so a load that needs one answers it
 /// again: no later load reads them back, and each is a cheap reading of answers that are kept.
@@ -443,8 +450,48 @@ pub fn shipped_all(
       }
     },
   );
-  { run: declaring_in(qs, b"std", asked.run).run, refused: asked.refused }
+  {
+    run: declaring_in(qs, b"std", crossed_all(qs, ordered.order, asked.run)).run,
+    refused: asked.refused,
+  }
 }
+
+/// What a load reads across into each of `modules`, asked of `qs` over a run: each name's owners and
+/// entries, every name's among them, and each owner's entries, hashing, group and unit.
+fn crossed_all(
+  qs: Map<Bytes, CheckQuery>,
+  modules: List<Named>,
+  run: Run,
+) -> Run / {Driving, abort.raise} =
+  modules.fold(run, |r: Run, named: Named| {
+    let at = bin::encode(named, named_bin());
+    let read = answer(qs, r, owners_query(), at);
+    let owners = decoded(read.output, owners_answer_bin(), "a module's owners");
+    let by_owner = owners.owners.fold(
+      answer(qs, read.run, names_query(), at).run,
+      |x: Run, o: { owner: Bytes, facts: Bytes, starts: List<Int> }| {
+        let input = bin::encode(
+          { module: named.module, shipped: named.shipped, tested: named.tested, owner: o.owner },
+          owner_named_bin(),
+        );
+        [
+          owner_entry_query(),
+          shown_query(),
+          owner_hash_query(),
+          group_of_query(),
+          unit_of_query(),
+        ].fold(x, |y: Run, q: Bytes| answer(qs, y, q, input).run)
+      },
+    );
+    owners.declared.keys().push(b"").fold(by_owner, |x: Run, name: Bytes| {
+      let input = bin::encode(
+        { module: named.module, shipped: named.shipped, tested: named.tested, name: name },
+        entry_named_bin(),
+      );
+      [entry_query(), declared_query(), exported_query()].fold(x, |y: Run, q: Bytes|
+        answer(qs, y, q, input).run)
+    })
+  })
 
 /// What each of `pulled`, shipped modules a load pulled, read with their tests where `tested` says,
 /// embeds of the shipped modules, asked of `qs` over a run, by module.
@@ -948,8 +995,12 @@ pub fn files_apart(steps: List<Step>, company: Company) -> List<Bytes> / {abort.
 
 pub type Step = { what: Bytes, sources: List<Source> }
 
-test "every query whose answers the toolchain ships keeps its answers" {
-  assert_eq(shipped_queries().filter(|n: Bytes| unkept_queries().contains(n)), [])
+test "a pack's maker keeps every query whose answers the toolchain ships" {
+  let qs = packing(fresh_registry());
+  assert_eq(
+    shipped_queries().filter(|n: Bytes| match qs.get(n) { Some(q) -> !q.kept, None -> true }),
+    [],
+  )
 }
 
 // --- What a store keeps reads back ------------------------------------------------------------
@@ -1063,14 +1114,7 @@ test "an embedded file's bytes move the definition that embeds it, and no other"
 
 /// What a load answered: each module's answer, what hashing fixed of each, the warnings its root
 /// modules answered, and what each read of a pack below it answered, in order.
-type Load = {
-  held: Held,
-  run: Run,
-  answers: List<Answered>,
-  fixing: Fixing,
-  warnings: List<Diag>,
-  fetched: List<Bytes>,
-}
+type Load = { held: Held, run: Run, answers: List<Answered>, fixing: Fixing, warnings: List<Diag> }
 
 /// What each module of `sources`, and each of `shipped` they pull, answered through `held`.
 pub fn fixed_over(
@@ -1080,8 +1124,8 @@ pub fn fixed_over(
   derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> Load / {abort.raise} = fixed_beside(held, prelude_pack(), sources, shipped, derived: derived)
 
-/// [`fixed_over`] with `packed` below `held`, as a pack the load does not trust: it lists no shipped
-/// files the pack was made over.
+/// [`fixed_over`] with `packed` below `held`, the load listing `files` as the shipped files it reads:
+/// a pack it trusts lists the same ([`pack_of`]), and by default it lists none.
 pub fn fixed_beside(
   held: Held,
   packed: Option<packs::Written>,
@@ -1089,60 +1133,36 @@ pub fn fixed_beside(
   shipped: List<Source>,
   // What each library derivation the load asks answers, as a world's `derived` reader answers it.
   derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
+  files: Bytes = b"",
 ) -> Load / {abort.raise} = {
   let w = world_of(
     { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
     [],
   );
-  handle {
-    let done = over_decoding(
-      held,
-      |path: String, offset: Int, len: Int| {
-        let found = packs::frame_in(packed, path, offset, len);
-        match found { Some(b) -> fetching.fetched(b), None -> () };
-        found
-      },
-      b"",
-      |kind: Bytes, at: Bytes| looked_shipping(w, shipped, kind, at, derived: derived),
-      || {
-        let qs = fresh_registry();
-        let all = asked_all(qs, w.own, [], false, started(qs));
-        let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
-        {
-          run: fixed.run,
-          answers: all.value.answers,
-          fixing: joined_fixing(fixed.value),
-          warnings: root_warnings(all.value.answers, sources.len()),
-        }
-      },
-    );
-    {
-      held: done.held,
-      run: done.value.run,
-      answers: done.value.answers,
-      fixing: done.value.fixing,
-      warnings: done.value.warnings,
-    }
-  } with {
-    var fetched: List<Bytes> = [],
-    fetching.fetched(b) -> {
-      fetched = fetched.push(b);
-    },
-    return d ->
+  let done = over_decoding(
+    held,
+    |path: String, offset: Int, len: Int| packs::frame_in(packed, path, offset, len),
+    files,
+    |kind: Bytes, at: Bytes| looked_shipping(w, shipped, kind, at, derived: derived),
+    || {
+      let qs = fresh_registry();
+      let all = asked_all(qs, w.own, [], false, started(qs));
+      let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
       {
-        held: d.held,
-        run: d.run,
-        answers: d.answers,
-        fixing: d.fixing,
-        warnings: d.warnings,
-        fetched: fetched,
-      },
+        run: fixed.run,
+        answers: all.value.answers,
+        fixing: joined_fixing(fixed.value),
+        warnings: root_warnings(all.value.answers, sources.len()),
+      }
+    },
+  );
+  {
+    held: done.held,
+    run: done.value.run,
+    answers: done.value.answers,
+    fixing: done.value.fixing,
+    warnings: done.value.warnings,
   }
-}
-
-/// Each frame of the pack a load fetched.
-effect fetching {
-  write fetched(b: Bytes) -> Unit
 }
 
 pub fn layered(lib: Bytes) -> List<Source> =
@@ -1201,7 +1221,7 @@ fn shipped_asked(shipped: List<Source>) -> { held: Held, value: List<Answered> }
     b"",
     |kind: Bytes, at: Bytes| looked_shipping(nowhere, shipped, kind, at),
     || {
-      let qs = fresh_registry();
+      let qs = packing(fresh_registry());
       shipped_all(qs, with_prelude_source(shipped).map(|s: Source| s.name), started(qs)).refused
     },
   )
@@ -1233,45 +1253,57 @@ test "a compiler module imports another below the compiler's root by its full na
   assert_eq(f.answers.fold([], |acc: List<Diag>, a: Answered| acc.concat(a.answer.refused)), [])
 }
 
-/// The pack cut from `held`: what it holds of the queries a pack carries, over shipped files a
-/// load does not list.
-pub fn pack_of(held: Held) -> Option<packs::Written> / {abort.raise} =
+/// The pack cut from `held`, made over the shipped files `the shipped files`: what it holds of the
+/// queries a pack carries, each record keeping the summary a pack's record keeps.
+pub fn pack_of(held: Held) -> Option<packs::Written> / {abort.raise} = {
+  let qs = packing(fresh_registry());
+  let current = memo::current(held);
+  let packed = current.fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
+    if shipped_queries().contains(r.query) { acc.insert(k, r) } else { acc });
+  let summaries = memo::carried_summaries(qs, packed.keys(), shipped_queries(), |key: Bytes|
+    current.get(key));
   Some(
     memo::packed_of(
       {
         ..held,
-        records: memo::current(held).fold(
-          Map::new(),
-          |acc: Map<Bytes, Record>, k: Bytes, r: Record|
-            if shipped_queries().contains(r.query) { acc.insert(k, r) } else { acc },
-        ),
+        records: packed.fold(Map::new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
+          acc.insert(k, match summaries.get(k) { Some(s) -> { ..r, summary: s }, None -> r })),
       },
-      fresh_registry(),
+      qs,
       b"the shipped files",
     ),
   )
+}
 
-// Each owner of a module asks what the module's read says of it, and the read answers for them all.
-test "a load fetches a module's read from a pack for what the read offered nothing of, not once an owner" {
-  let owners = 24;
+test "a load over a pack it trusts runs no body of a shipped module and reads none of its checks" {
   let shipped = [
     {
-      name: b"std.many",
-      src: Bytes::concat_all(
-        range(0, owners).map(|i: Int|
-          Bytes::of_string(f"pub fn f{i.to_string()}() -> Int = {i.to_string()} + 1\n\n")),
-      ),
+      name: b"std.pair",
+      src: b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\npub fn both(n: Int) -> Bool = even(n) || odd(n)\n",
+    },
+    {
+      name: b"std.wrap",
+      src: b"import std.pair (both)\n\npub type Box = { n: Int }\n\npub fn boxed(n: Int) -> Box = { n: n }\n\npub fn check(b: Box) -> Bool = both(b.n)\n",
     },
   ];
-  let held = shipped_held(shipped);
-  let read = memo::current(held).fold(b"", |found: Bytes, _: Bytes, r: Record|
-    if r.query == owners_query() { r.output } else { found });
-  let read_bytes = match held.outputs.get(read) { Some(o) -> o, None -> b"" };
-  let user = [{ name: b"main", src: b"import std.many (f0)\npub fn main() -> Int = f0()\n" }];
-  let load = fixed_beside(nothing_held(), pack_of(held), user, shipped);
-  let fetches = load.fetched.filter(|b: Bytes| b == read_bytes).len();
-  assert(fetches > 0, Some("the read is short enough to be kept inside its record"));
-  assert(fetches < owners, Some(f"the read was fetched {fetches.to_string()} times"))
+  let user = [
+    {
+      name: b"main",
+      src: b"import std.wrap (boxed, check)\npub fn main() -> Bool = check(boxed(3))\n",
+    },
+  ];
+  let load = fixed_beside(
+    nothing_held(),
+    pack_of(shipped_held(shipped)),
+    user,
+    shipped,
+    files: b"the shipped files",
+  );
+  let shipped_runs = load.run.inputs.filter(|r: { query: Bytes, input: Bytes }|
+    r.input.index_of(b"std.") != None).map(|r: { query: Bytes, input: Bytes }| r.query);
+  assert_eq(shipped_runs, []);
+  assert_eq(load.run.took.keys().filter(|q: Bytes| !shipped_queries().contains(q)), []);
+  assert_eq(load.answers, fixed_over(nothing_held(), user, shipped).answers)
 }
 
 test "a load over a pack walks no owner of a shipped module" {

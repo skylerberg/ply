@@ -700,7 +700,15 @@ fn noting(x: Summing, rest: List<Read>, id: Bytes, r: Read) -> Summing =
 fn summary_of<| e>(
   queries: Map<Bytes, Query<| e>>,
   reads: List<Read>,
-) -> Option<List<Read>> / {memo_keep.read, abort.raise} = {
+) -> Option<List<Read>> / {memo_keep.read, abort.raise} =
+  summary_through(queries, reads, |key: Bytes| memo_keep.record(key))
+
+/// [`summary_of`], each record below read through `record`.
+fn summary_through<| e, f>(
+  queries: Map<Bytes, Query<| e>>,
+  reads: List<Read>,
+  record: (Bytes) -> Option<Record> / {abort.raise | f},
+) -> Option<List<Read>> / {abort.raise | f} = {
   let made = iterate(
     { work: reads, seen: Map::new(), summary: [], whole: true },
     100000000,
@@ -721,7 +729,7 @@ fn summary_of<| e>(
                   place_id(query_kind(), name),
                   World(query_kind(), name, digest_of(Some(aq.hash))),
                 );
-                match memo_keep.record(key_of(aq, input)) {
+                match record(key_of(aq, input)) {
                   None -> Stop({ ..defined, whole: false }),
                   Some(below) -> Continue({ ..defined, work: below.reads.concat(defined.work) }),
                 }
@@ -733,6 +741,120 @@ fn summary_of<| e>(
   );
   if made.whole { Some(made.summary) } else { None }
 }
+
+/// The summary a pack's record keeps of each of `keys`, its records found through `record`: its
+/// summary with each summarized answer below it of a query outside `carried`, the queries the pack
+/// carries, read through as what that answer's summary holds and its query's definition. So a packed
+/// record is held to the places and definitions behind it, and to no answer the pack does not hold.
+/// None for a key whose record, or a record below it, is missing.
+pub fn carried_summaries<| e, f>(
+  queries: Map<Bytes, Query<| e>>,
+  keys: List<Bytes>,
+  carried: List<Bytes>,
+  record: (Bytes) -> Option<Record> / {abort.raise | f},
+) -> Map<Bytes, List<Read>> / {abort.raise | f} =
+  keys.fold(
+    { done: Map::new(), out: Map::new() },
+    |acc: { done: Map<Bytes, Option<List<Read>>>, out: Map<Bytes, List<Read>> }, key: Bytes| {
+      let c = carried_at(queries, carried, record, acc.done, key, 100000000);
+      { done: c.done, out: match c.reads { Some(s) -> acc.out.insert(key, s), None -> acc.out } }
+    },
+  ).out
+
+type Carrying = {
+  done: Map<Bytes, Option<List<Read>>>,
+  reads: Option<List<Read>>,
+  seen: Map<Bytes, Bool>,
+}
+
+/// [`carried_summaries`] of the record under `key`, beside `done`, each record below it read through
+/// already, at most `left` records deep: a record that reads round to itself has none.
+fn carried_at<| e, f>(
+  queries: Map<Bytes, Query<| e>>,
+  carried: List<Bytes>,
+  record: (Bytes) -> Option<Record> / {abort.raise | f},
+  done: Map<Bytes, Option<List<Read>>>,
+  key: Bytes,
+  left: Int,
+) -> { done: Map<Bytes, Option<List<Read>>>, reads: Option<List<Read>> } / {abort.raise | f} =
+  if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
+    match done.get(key) {
+      Some(reads) -> { done: done, reads: reads },
+      None -> {
+        let open = done.insert(key, None);
+        let own = match record(key) {
+          None -> None,
+          Some(r) -> if r.summary.len() > 0 { Some(r.summary) }
+          else { summary_through(queries, r.reads, record) },
+        };
+        let made = match own {
+          None -> { done: open, reads: None, seen: Map::new() },
+          Some(summary) ->
+            summary.fold(
+              { done: open, reads: Some([]), seen: Map::new() },
+              |acc: Carrying, item: Read|
+                match acc.reads {
+                  None -> acc,
+                  Some(_) -> match item {
+                    World(kind, at, _) -> carrying(acc, place_id(kind, at), [item]),
+                    Asked(name, input, _) -> match queries.get(name) {
+                      None -> { ..acc, reads: None },
+                      Some(q) -> if carried.contains(name) {
+                        carrying(acc, asked_id(name, input), [item])
+                      } else {
+                        let below = carried_at(
+                          queries,
+                          carried,
+                          record,
+                          acc.done,
+                          key_of(q, input),
+                          left - 1,
+                        );
+                        match below.reads {
+                          None -> { ..acc, done: below.done, reads: None },
+                          Some(reads) ->
+                            reads.fold(
+                              carrying(
+                                { ..acc, done: below.done },
+                                place_id(query_kind(), name),
+                                [World(query_kind(), name, digest_of(Some(q.hash)))],
+                              ),
+                              |a: Carrying, r: Read| carrying(a, read_id(r), [r]),
+                            ),
+                        }
+                      },
+                    },
+                  },
+                },
+            ),
+        };
+        { done: made.done.insert(key, made.reads), reads: made.reads }
+      },
+    }
+  }
+
+/// `acc` with `reads` added under `id` unless it holds that already.
+fn carrying(acc: Carrying, id: Bytes, reads: List<Read>) -> Carrying =
+  if acc.seen.contains(id) { acc } else {
+    match acc.reads {
+      None -> acc,
+      Some(held) -> { ..acc, reads: Some(held.concat(reads)), seen: acc.seen.insert(id, true) },
+    }
+  }
+
+/// What a read is told apart from another by in a summary: its place, or the answer it asks.
+fn read_id(r: Read) -> Bytes =
+  match r {
+    World(kind, at, _) -> place_id(kind, at),
+    Asked(name, input, _) -> asked_id(name, input),
+  }
+
+/// The record `b` encodes with `summary` in place of its own, the answer it holds inside kept.
+pub fn summarized_as(b: Bytes, summary: List<Read>) -> Bytes / {abort.raise} =
+  match record_from(b) {
+    Some(r) -> record_bytes({ ..r, summary: summary }, inline_named(b)),
+    None -> b,
+  }
 
 /// The record `r` stored again under `key` with the summary of its reads now: for a record whose
 /// summary changed while its reads did not.
@@ -1678,6 +1800,42 @@ test "a summary holds each place and definition below, down to records that keep
   assert(middle.contains(World(query_kind(), b"length", digest_of(Some(b"h1")))));
   // `top`'s ends at `middle`, which keeps a summary of its own.
   assert_eq(summary_of_key(b"top"), [Asked(b"middle", b"a", digest_of(Some(b"mid 4")))])
+}
+
+test "a pack's record is summarized through each answer below it the pack does not carry" {
+  let q = summed().insert(b"middle", { ..query(b"middle", b"m1", middled), summarized: true });
+  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
+  let records = first.world.held.records;
+  let top = key_of(query_of(q, b"top"), b"a");
+  let reads = match carried_summaries(q, [top], [b"top"], |k: Bytes| records.get(k)).get(top) {
+    Some(s) -> s,
+    None -> panic("every record below is kept"),
+  };
+  assert(reads.contains(World(b"file", b"a", digest_of(Some(b"four")))));
+  assert(reads.contains(World(query_kind(), b"middle", digest_of(Some(b"m1")))));
+  assert(!reads.contains(Asked(b"middle", b"a", digest_of(Some(b"mid 4")))));
+  // Carried, `middle` is held to as it answers.
+  assert_eq(
+    carried_summaries(q, [top], [b"top", b"middle"], |k: Bytes| records.get(k)).get(top),
+    Some([Asked(b"middle", b"a", digest_of(Some(b"mid 4")))]),
+  )
+}
+
+test "a record given another summary keeps its answer, held inside or apart, and its reads" {
+  let r = {
+    query: b"q",
+    input: b"i",
+    reads: [World(b"file", b"a", digest_of(Some(b"x")))],
+    output: digest_of(Some(b"out")),
+    summary: [],
+  };
+  let s = [World(b"file", b"b", digest_of(Some(b"y")))];
+  [Some(b"out"), None].map(|inline: Option<Bytes>| {
+    let b = summarized_as(record_bytes(r, inline), s);
+    assert_eq(record_from(b), Some({ ..r, summary: s }));
+    assert_eq(inline_named(b), inline)
+  });
+  ()
 }
 
 test "a summary that moved under an answer that came out the same is made anew" {
