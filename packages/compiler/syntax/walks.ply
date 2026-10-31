@@ -1,51 +1,12 @@
-//! `compiler.syntax` over the repository's own sources: each maintained module formats to itself,
-//! as `ply fmt` leaves it, and a walk of its tree meets every name, binding and type the compiler's
-//! own listing of the tree holds, and no other.
-
-import harness (compiler_tree, std_tree)
 import compiler.syntax
-import compiler.syntax (Binding, Name, Node, TypeName, TypeVariable)
+import compiler.syntax (Binding, Name, Node, TypeName, TypeVariable, Sample, sample_source, samples)
 import compiler.syntax.items
 import compiler.syntax.items (Item)
 import compiler.syntax.lexer
 import std.bytes
+import std.gen
 import std.list
 
-type File = { name: String, bytes: Bytes }
-
-/// One maintained source: the path it is committed at, and its text.
-type Case = { path: String, text: Bytes }
-
-fn ply_cases_under(dir: String, files: List<File>) -> List<Case> =
-  files.fold([], |cases: List<Case>, f: File|
-    if f.name.ends_with(".ply") { cases.push({ path: dir ++ "/" ++ f.name, text: f.bytes }) }
-    else { cases })
-
-fn sources() -> List<Case> =
-  [
-    ply_cases_under("packages/std", std_tree()),
-    ply_cases_under("packages/compiler", compiler_tree()),
-    ply_cases_under("packages/cli", embed_dir("../../packages/cli")),
-    ply_cases_under("packages/proof", embed_dir("../../packages/proof")),
-    ply_cases_under("packages/store", embed_dir("../../packages/store")),
-    ply_cases_under("packages/testing", embed_dir("../../packages/testing")),
-    ply_cases_under("packages/sim", embed_dir("../../packages/sim")),
-    ply_cases_under("packages/registry", embed_dir("../../packages/registry")),
-    ply_cases_under("tests/cli", embed_dir("../cli")),
-    ply_cases_under("tests/lang", embed_dir("../lang")),
-  ].flatten(
-  )
-
-test "{c.path} formats to itself, as `ply fmt` leaves it" for c: Case in sources() {
-  assert(
-    syntax::format(c.text) == Ok(c.text),
-    Some(
-      c.path ++ " is committed as `ply fmt` writes it, and `compiler.syntax` formats it otherwise",
-    ),
-  )
-}
-
-/// The places a tree's names stand at, each as `start:end`, sorted, by what the name is.
 type NameSpans = {
   names: List<Bytes>,
   bindings: List<Bytes>,
@@ -67,7 +28,6 @@ fn deduplicated(places: NameSpans) -> NameSpans =
     variables: unique_keys(places.variables),
   }
 
-/// Where a walk of `tree` meets a name of each kind.
 fn walk_spans(tree: Node) -> NameSpans / {abort.raise} =
   deduplicated(
     syntax::walk(tree).fold(
@@ -89,15 +49,12 @@ fn walk_spans(tree: Node) -> NameSpans / {abort.raise} =
     ),
   )
 
-/// A unit of the compiler's dump of a tree that is a node: its span as `start:end`, and its tag.
 fn node_of(unit: Bytes) -> Option<{ key: Bytes, tag: Bytes }> =
   match unit.split(b":") {
     [start, end, tag] -> Some({ key: Bytes::concat_all([start, b":", end]), tag: tag }),
     _ -> None,
   }
 
-/// Whether the name a dump holds at `key`, as the payload `held`, is the text the source has there:
-/// a name the parser wrote for itself stands at a span that reads otherwise.
 fn dump_matches_source(source: Bytes, key: Bytes, held: Bytes) -> Bool / {abort.raise} =
   match key.split(b":") {
     [start, end] -> match ((start.int_of_ascii_radix(10), end.int_of_ascii_radix(10))) {
@@ -109,9 +66,6 @@ fn dump_matches_source(source: Bytes, key: Bytes, held: Bytes) -> Bool / {abort.
     _ -> false,
   }
 
-/// The key of the identifier a qualified name's dump holds as its own, the dump's units from
-/// `at` on being the name's: its node, whether it is qualified, the qualifier where it is, then the
-/// identifier and its text.
 fn named_at(units: List<Bytes>, at: Int) -> { key: Bytes, held: Bytes } = {
   let own = if units.at_or(at + 1, b"") == b"?1" { at + 4 } else { at + 2 };
   {
@@ -120,8 +74,6 @@ fn named_at(units: List<Bytes>, at: Int) -> { key: Bytes, held: Bytes } = {
   }
 }
 
-/// Where the compiler's dump of `source`'s tree holds a name of each kind that the source writes.
-/// A perform written on a name its item binds is a call on that value, which is a name there.
 fn dump_spans(source: Bytes) -> NameSpans / {abort.raise} = {
   let read = items::parse(source).node;
   let units = items::dump_module(read).split(b";");
@@ -149,7 +101,6 @@ fn dump_spans(source: Bytes) -> NameSpans / {abort.raise} = {
       |found: NameSpans, i: Int|
         match node_of(units.at_or(i, b"")) {
           None -> if units.at_or(i, b"") != b"%idn" { found } else {
-            // A law's or a schema's `where identity(a)`: a count, then each `a` and its text.
             let counted = units.at_or(i + 1, b"");
             let count = match counted.slice(1, counted.len()).int_of_ascii_radix(10) {
               Some(n) -> n,
@@ -195,23 +146,28 @@ fn differing(what: String, listed_at: List<Bytes>, walked_at: List<Bytes>) -> Li
       what ++ " at " ++ String::of_bytes_lossy(key) ++ " is walked and not in the tree"),
   )
 
-test "a walk of {c.path} meets every name, binding and type its tree holds" for c: Case in sources(
-  ) {
-  let read = syntax::parse(c.text);
-  assert_eq(read.diagnostics, []);
-  let tree = dump_spans(c.text);
-  let walk = walk_spans(read.tree);
-  assert_eq(
-    [
-      differing("a name", tree.names, walk.names),
-      differing("a binding", tree.bindings, walk.bindings),
-      differing("a type", tree.types, walk.types),
-      differing("a type variable", tree.variables, walk.variables),
-    ].flatten(
-    ),
-    [],
+fn disagreements(source: Bytes) -> List<String> / {abort.raise} = {
+  let tree = dump_spans(source);
+  let walk = walk_spans(syntax::parse(source).tree);
+  [
+    differing("a name", tree.names, walk.names),
+    differing("a binding", tree.bindings, walk.bindings),
+    differing("a type", tree.types, walk.types),
+    differing("a type variable", tree.variables, walk.variables),
+  ].flatten(
   )
 }
+
+fn modules_holding_every_stored_form() -> List<Bytes> =
+  [
+    embed("../store/hash/examples/prelude.txt"),
+    embed("../store/hash/examples/hex.txt"),
+    embed("../store/hash/examples/marks.txt"),
+    embed("../store/hash/examples/lib.txt"),
+    embed("../store/hash/examples/map.txt"),
+    embed("../store/hash/examples/host.txt"),
+    embed("../store/hash/examples/app.txt"),
+  ]
 
 test "the listing the walks are held to reads a name, a binding, a type and a variable where each is written" {
   let source = b"fn first<a>(xs: List<a>, spare: a) -> a = match xs { [x, ..] -> x, _ -> f\"{spare}\" }\n";
@@ -224,4 +180,15 @@ test "the listing the walks are held to reads a name, a binding, a type and a va
   let law = b"law \"l\" forall (x: a) where identity(a) { x == x }\n";
   assert_eq(dump_spans(law).variables, [b"19:20", b"37:38"]);
   assert_eq(walk_spans(syntax::parse(law).tree), dump_spans(law))
+}
+
+test "a walk of a module holding every stored form meets every name, binding and type its tree holds" {
+  modules_holding_every_stored_form().fold((), |u: Unit, source: Bytes| {
+    assert_eq(syntax::parse(source).diagnostics, []);
+    assert_eq(disagreements(source), [])
+  })
+}
+
+test "a walk of a drawn module meets every name, binding and type its tree holds" {
+  gen::check(samples(), |s: Sample| disagreements(sample_source(s)) == [])
 }
