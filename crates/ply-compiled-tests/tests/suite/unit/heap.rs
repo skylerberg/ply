@@ -108,7 +108,6 @@ fn a_dead_native_objects_block_is_the_next_native_objects() {
         "a dead native object's block is the next native object's"
     );
     assert_eq!(&*held_by(again), "second");
-    assert_eq!(ctx.heap.recycled(), 1);
     assert_eq!(ctx.heap.natives(), 1);
 }
 

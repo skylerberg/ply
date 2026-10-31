@@ -2398,15 +2398,6 @@ its byte range. `ply replace NAME --with FILE` replaces exactly that range with 
 definition of the same kind and name, leaving the rest of the file alone. It writes nothing unless
 the program still checks and no other definition's name or hash changes (`E0128`).
 
-### 17.8 Measuring allocation
-
-The runtime of every Ply program, `ply` included, reads these flags and removes them before the
-program sees its arguments:
-
-- `--count-allocations=PATH` writes how many objects and bytes the program allocated.
-- `--count-allocation-sites=PATH` also writes where allocations came from, sampled.
-- `--count-allocation-sites-exact=PATH` records every allocation's site: exact, and slower.
-
 ## 18. Diagnostics
 
 Every command prints diagnostics in one format:
