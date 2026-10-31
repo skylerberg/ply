@@ -78,9 +78,16 @@ pub unsafe extern "C" fn rt_detached_stop(
 pub type OpEntry =
     unsafe extern "C" fn(*mut Ctx, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
 
+/// The flag of an evidence object with one slot, which handles every operation and reads the
+/// operation from its descriptor.
+pub const EVIDENCE_ONE_SLOT: i64 = 1;
+
+/// The flag of an evidence object any thread may perform through while the thread that holds it
+/// waits: nothing it reaches is written, and no clause it reaches unwinds that thread's stack.
+pub const EVIDENCE_SHARED: i64 = 2;
+
 /// An evidence object of the runtime's own, laid out as an evidence object is: its flags, then an
-/// entry and its environment per operation, or, with the flags set as here, one slot that handles
-/// every operation, which reads the operation from its descriptor.
+/// entry and its environment per operation, or the one slot [`EVIDENCE_ONE_SLOT`] says.
 #[repr(C)]
 pub struct RuntimeObject {
     pub flags: i64,
@@ -98,7 +105,7 @@ pub struct Slot {
 /// The bridge: what code that holds no word for an effect performs it through: an operation is
 /// unhandled, and a raise is left pending.
 pub static BRIDGE: RuntimeObject = RuntimeObject {
-    flags: 1,
+    flags: EVIDENCE_ONE_SLOT | EVIDENCE_SHARED,
     slot: Slot {
         entry: bridged,
         env: 0,
@@ -108,7 +115,7 @@ pub static BRIDGE: RuntimeObject = RuntimeObject {
 /// What an entry hands its root for an effect nothing handles: an operation is rejected (`E0424`),
 /// and a raise is left unanswered.
 pub static UNSERVED: RuntimeObject = RuntimeObject {
-    flags: 1,
+    flags: EVIDENCE_ONE_SLOT | EVIDENCE_SHARED,
     slot: Slot {
         entry: unserved,
         env: 0,

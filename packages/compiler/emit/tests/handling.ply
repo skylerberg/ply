@@ -1458,6 +1458,7 @@ test "a clause on every label is its object's slot, handed the label it binds be
       ObjectAt({
         at: raise_offset() + 4,
         slots: [ClauseSlot({ entry: Resumes, record: raise_offset(), labelled: true })],
+        shared_from: None,
       }),
     ],
   );
@@ -1494,9 +1495,59 @@ test "clauses of one operation on a label and on every label are a table its slo
             ],
           }),
         ],
+        shared_from: Some(3),
       }),
     ],
   )
+}
+
+fn sharing_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"effect ask {\n  read get() -> Int\n}\n",
+    b"effect tell {\n  write say(n: Int) -> Unit\n}\n",
+    b"effect gate {\n  raise shut(at: Int)\n}\n",
+    b"fn returns() -> Int = handle { ask.get() } with { ask.get() -> 1 }\n",
+    b"fn performs() -> Int / {tell.say} = handle { ask.get() } with { ask.get() -> { tell.say(1); 2 } }\n",
+    b"fn holds(n: Int) -> Int = handle { ask.get() } with { ask.get() -> n }\n",
+    b"fn counts() -> Int = handle { ask.get() } with { var n = 0, ask.get() -> { n = n + 1; n } }\n",
+    b"fn resumes() -> Int = handle { ask.get() } with { ask.get() resume k -> k(1) }\n",
+    b"fn raises() -> Int = handle { gate.shut(1) } with { gate.shut(at) -> at }\n",
+  ])
+
+test "an object is shared where its clauses only return and hold nothing, as far as the words they perform through are" {
+  match program_of(sharing_corpus()) {
+    Err(reason) -> assert_eq(reason, b""),
+    Ok(p) -> {
+      let over = |name: Bytes|
+        all_ops_in(lowered_root(p, name)).fold(
+          [],
+          |acc: List<Option<Int>>, o: { var: Var, op: HandleOp, args: List<Arg>, uses: OperationSignature }|
+            match o.op {
+              ObjectAt(x) ->
+                acc.push(match x.shared_from {
+                  Some(from) -> Some(o.args.len() - from),
+                  None -> None,
+                }),
+              _ -> acc,
+            },
+        );
+      assert_eq(over(b"returns"), [Some(0)]);
+      assert_eq(over(b"performs"), [Some(1)]);
+      assert_eq(over(b"holds"), [None]);
+      assert_eq(over(b"counts"), [None]);
+      assert_eq(over(b"resumes"), [None]);
+      assert_eq(over(b"raises"), [None]);
+      let text = |name: Bytes| match printed_by_ir(p, name) { Ok(t) -> t, Err(reason) -> reason };
+      assert(
+        text(b"performs").index_of(b"PLY_EVIDENCE_SHARED & ply_evidence_flags(") != None,
+        Some(String::of_bytes_lossy(text(b"performs"))),
+      );
+      assert(
+        text(b"holds").index_of(b"PLY_EVIDENCE_SHARED") == None,
+        Some(String::of_bytes_lossy(text(b"holds"))),
+      )
+    },
+  }
 }
 
 test "a detached body's block is the heap's, forwarding what is around its handle to the words each resumption hands" {
@@ -1512,10 +1563,15 @@ test "a detached body's block is the heap's, forwarding what is around its handl
   );
   assert_eq(laid, [
     AllocateForwarding(13),
-    ObjectAt({ at: 7, slots: [ForwardedSlot({ target: 5, task: 6, record: 10 })] }),
+    ObjectAt({
+      at: 7,
+      slots: [ForwardedSlot({ target: 5, task: 6, record: 10 })],
+      shared_from: None,
+    }),
     ObjectAt({
       at: raise_offset() + 4,
       slots: [ClauseSlot({ entry: Suspends, record: raise_offset(), labelled: false })],
+      shared_from: None,
     }),
   ]);
   let instance = f.operations.fold(

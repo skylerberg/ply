@@ -107,8 +107,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     // entered inside another's branch, as a test a run's lane enters is, would then carry a whole
     // other test on its stack and its clock, so its own blocks run in turn.
     let nested = BRANCH_OF.with(|of| of.get() != 0 && of.get() != c.id.0);
-    // An object other than the bridge lives on this thread's stack.
-    let at_once = !nested && allowed && bridged_only(c, words);
+    let at_once = !nested && allowed && shared_only(words);
     match pool() {
         Some(pool) if n >= 2 && at_once && share(ctx, branches) => unsafe {
             in_parallel(ctx, pool, branches, words)
@@ -117,14 +116,18 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     }
 }
 
-/// Whether every word of the effects whose descriptor and words are `words` is the bridge
-/// ([`crate::rt::BRIDGE`]).
-fn bridged_only(c: &Ctx, (desc, words): (Word, Word)) -> bool {
+/// Whether any thread may perform through every word of the effects whose descriptor and words are
+/// `words`: where one may not, what handles it is reached only from the thread that holds it.
+fn shared_only((desc, words): (Word, Word)) -> bool {
     if desc == 0 {
         return true;
     }
     let n = unsafe { *(desc as *const Word) };
-    (0..n).all(|i| unsafe { *(words as *const Word).add(i as usize) } == c.bridge)
+    (0..n).all(|i| {
+        let object = unsafe { *(words as *const Word).add(i as usize) } as *const Word;
+        let flags = unsafe { *object };
+        flags & crate::rt::EVIDENCE_SHARED != 0
+    })
 }
 
 /// What the block means: each branch in turn, until one fails, each handed the block's `words`.
