@@ -781,18 +781,17 @@ cmd_comments() {
     git grep -n -E '^\s*//' -- tests/fixtures/lang | grep -vE ':\s*// (raises|refused|effects) .* ::' || true
     git grep -n -E '^\s*#([^!]|$)' -- '*.sh' 'scripts/*' '.github/*.yml' '.github/*.yaml' '*.toml' \
       ':!tests' ':!examples/same-tests.sh' | grep -v '# shellcheck ' || true
-    git ls-files 'packages/std/*.ply' ':!packages/std/internal' ':!packages/std/prelude.ply' |
-      while read -r file; do
-        awk -v file="$file" '
-          /^\/\/\// { doc = FNR; next }
-          /^[ \t]+\/\/\// { if (!public) print file ":" FNR ": a doc comment inside a private declaration"; next }
-          /^[^] \t\/})]/ {
-            public = ($0 ~ /^pub /)
-            if (doc && !public) print file ":" doc ": a doc comment on a private definition"
-            doc = 0
-          }
-        ' "$file"
-      done
+    git ls-files -z 'packages/std/*.ply' ':!packages/std/internal' ':!packages/std/prelude.ply' |
+      xargs -0 awk '
+        FNR == 1 { doc = 0; public = 0 }
+        /^\/\/\// { doc = FNR; next }
+        /^[ \t]+\/\/\// { if (!public) print FILENAME ":" FNR ": a doc comment inside a private declaration"; next }
+        /^[^] \t\/})]/ {
+          public = ($0 ~ /^pub /)
+          if (doc && !public) print FILENAME ":" doc ": a doc comment on a private definition"
+          doc = 0
+        }
+      '
   )
   if [[ -n $found ]]; then
     echo "$found" >&2
@@ -800,6 +799,22 @@ cmd_comments() {
     return 1
   fi
   echo "comments: only the public definitions of the standard library have them"
+}
+
+cmd_names() {
+  local retired='inst|insts|stmt|qname|ident|ctor|lhs|rhs|asked|judged|kept|keeps' found
+  found=$(
+    cd "$root"
+    git grep -n -w -E "$retired" -- '*.ply' ':!tests/fixtures' ':!tests/programs' |
+      grep -v -E '^[^:]+:[0-9]+:\s*(\\\\|///|//!|(test(/[a-z]+)?|law) ")' |
+      sed -E 's/"([^"\\]|\\.)*"//g' | grep -w -E "$retired" || true
+  )
+  if [[ -n $found ]]; then
+    echo "$found" >&2
+    echo "FAIL: these names are retired: use the full word, or a name that says what the value is" >&2
+    return 1
+  fi
+  echo "names: no retired name is back"
 }
 
 cmd_verify() {
@@ -1002,6 +1017,7 @@ cmd_verify() {
   cmd_actions || failures=$((failures + 1))
   cmd_toolchain_embeds || failures=$((failures + 1))
   cmd_comments || failures=$((failures + 1))
+  cmd_names || failures=$((failures + 1))
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
