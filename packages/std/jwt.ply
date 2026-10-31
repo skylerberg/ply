@@ -128,7 +128,7 @@ pub fn algorithm(key: Key) -> String =
 /// scalar or an RSA document, or for an HMAC secret, the secret itself, which both sides share.
 /// Raises for a key that `sign` would reject.
 pub fn verification_key(key: Key) -> Key / {jwt.fail, abort.raise} =
-  match usable(key) {
+  match validated_key(key) {
     Ed25519Seed(seed) -> Ed25519(ed25519::public_key(seed)),
     EcdsaScalar(curve, scalar) ->
       Ecdsa(curve, public_of(crypto::ecdsa_signing(curve, scalar, Raw), key)),
@@ -151,11 +151,11 @@ fn public_of(signer: Option<crypto::SigningKey>, key: Key) -> Bytes / {jwt.fail}
   }
 
 /// Returns `key`, or fails if its algorithm cannot use it.
-fn usable(key: Key) -> Key / {jwt.fail} =
+fn validated_key(key: Key) -> Key / {jwt.fail} =
   match key {
-    HmacSha256(secret) -> if secret.len() < 32 { short_key(secret) } else { key },
-    HmacSha384(secret) -> if secret.len() < 48 { short_key(secret) } else { key },
-    HmacSha512(secret) -> if secret.len() < 64 { short_key(secret) } else { key },
+    HmacSha256(secret) -> if secret.len() < 32 { fail_short_key(secret) } else { key },
+    HmacSha384(secret) -> if secret.len() < 48 { fail_short_key(secret) } else { key },
+    HmacSha512(secret) -> if secret.len() < 64 { fail_short_key(secret) } else { key },
     Ed25519(public) -> if public.len() != 32 { wrong_key_length(public.len()) } else { key },
     Ed25519Seed(seed) -> if seed.len() != 32 { wrong_key_length(seed.len()) } else { key },
     Ecdsa(curve, point) -> if point_key(curve, point) == None { no_key(key) } else { key },
@@ -180,7 +180,7 @@ fn rsa_usable(key: Key, public: Bytes) -> Key / {jwt.fail} =
     else { key },
   }
 
-fn short_key<a>(secret: Secret<Bytes>) -> a / {jwt.fail} = jwt.fail(ShortKey(secret.len()))
+fn fail_short_key<a>(secret: Secret<Bytes>) -> a / {jwt.fail} = jwt.fail(ShortKey(secret.len()))
 
 fn wrong_key_length<a>(size: Int) -> a / {jwt.fail} = jwt.fail(KeyLength(size))
 
@@ -210,7 +210,7 @@ fn sign_with(
 ) -> Bytes / {jwt.fail, abort.raise} =
   match signer { Some(made) -> crypto::sign(made, input), None -> no_key(key) }
 
-fn signed_by(key: Key, input: Bytes, signature: Bytes) -> Bool / {abort.raise} =
+fn signature_matches(key: Key, input: Bytes, signature: Bytes) -> Bool / {abort.raise} =
   match key {
     HmacSha256(secret) -> tags_match(hmac_sha256(secret, input), signature),
     HmacSha384(secret) -> tags_match(hmac_sha384(secret, input), signature),
@@ -466,7 +466,7 @@ pub fn sign_bytes(
   key: Key,
   marks: HeaderParameters,
 ) -> String / {jwt.fail, abort.raise} = {
-  let signer = usable(key);
+  let signer = validated_key(key);
   let header = json::to_bytes(header_json(algorithm(signer), marks));
   let input = base64url_encode(header) ++ "." ++ base64url_encode(payload);
   input ++ "." ++ base64url_encode(signature(signer, Bytes::of_string(input)))
@@ -518,12 +518,12 @@ pub fn try_verify(
 /// Returns the payload of `token` if `key` signed it. It checks what `verify` checks up to the
 /// signature, for a payload that is not claims. `max_bytes` is the longest token that is read.
 pub fn verify_bytes(token: String, key: Key, max_bytes: Int) -> Signed / {jwt.fail, abort.raise} = {
-  let verifier = usable(key);
+  let verifier = validated_key(key);
   let parts = parts_of(token, max_bytes);
   let header = header_of(parts.header);
   check_header(header, verifier);
   let registered_members = decoded(InSignature, parts.signature);
-  if !signed_by(
+  if !signature_matches(
       verifier,
       Bytes::of_string(parts.header ++ "." ++ parts.payload),
       registered_members,
@@ -577,7 +577,7 @@ fn header_of(text: String) -> Header / {jwt.fail, abort.raise} = {
 /// Checks that `key` may verify a token with this header. The algorithm is checked first, so
 /// nothing is computed for a token that names another.
 fn check_header(header: Header, key: Key) -> Unit / {jwt.fail} =
-  if spells_none(header.alg) { jwt.fail(Unsecured(header.alg)) }
+  if is_none_algorithm(header.alg) { jwt.fail(Unsecured(header.alg)) }
   else if header.alg != algorithm(key) { jwt.fail(WrongAlgorithm(header.alg, algorithm(key))) }
   else if header.members.get("b64") == Some(json::Bool(false)) { jwt.fail(Unencoded) } else {
     match header.members.get("crit") {
@@ -588,7 +588,7 @@ fn check_header(header: Header, key: Key) -> Unit / {jwt.fail} =
 
 /// Whether `alg` is `none` in any capitalization: setting bit five of an ASCII letter makes it
 /// lower case.
-fn spells_none(alg: String) -> Bool =
+fn is_none_algorithm(alg: String) -> Bool =
   alg.chars().map(|c: Char| Int::of_char(c) | 0x20) == [110, 111, 110, 101]
 
 fn strings_in(j: Json) -> List<String> =
@@ -775,7 +775,7 @@ pub fn jwk(j: Json) -> Jwk / {jwt.fail, abort.raise} =
         "RSA" -> rsa_key(members, alg),
         kind -> jwt.fail(Unsupported(kind)),
       };
-      { kid: text_of(members, "kid"), key: usable(key) }
+      { kid: text_of(members, "kid"), key: validated_key(key) }
     },
     other -> jwt.fail(Malformed(InKeys, json::expected("an object", other))),
   }
@@ -838,9 +838,9 @@ fn edwards_key(members: Map<String, Json>, alg: Option<String>) -> Key / {jwt.fa
   check_optional_member("alg", alg, "EdDSA");
   let curve = required_text(members, "crv");
   if curve != "Ed25519" { jwt.fail(Unsupported(curve)) } else {
-    let public = usable(Ed25519(octets(members, "x")));
+    let public = validated_key(Ed25519(octets(members, "x")));
     if !members.contains("d") { public } else {
-      let seed = usable(Ed25519Seed(secret_octets(members, "d")));
+      let seed = validated_key(Ed25519Seed(secret_octets(members, "d")));
       if verification_key(seed) == public { seed }
       else { jwt.fail(Unexpected("x", [required_text(members, "x")])) }
     }
@@ -867,9 +867,9 @@ fn curve_key(members: Map<String, Json>, alg: Option<String>) -> Key / {jwt.fail
       let x = octets(members, "x");
       let y = octets(members, "y");
       let public = if x.len() != size || y.len() != size { jwt.fail(NoKey(curve_algorithm(curve))) }
-      else { usable(Ecdsa(curve, Bytes::concat_all([b"\x04", x, y]))) };
+      else { validated_key(Ecdsa(curve, Bytes::concat_all([b"\x04", x, y]))) };
       if !members.contains("d") { public } else {
-        let scalar = usable(EcdsaScalar(curve, secret_octets(members, "d")));
+        let scalar = validated_key(EcdsaScalar(curve, secret_octets(members, "d")));
         if verification_key(scalar) == public { scalar }
         else { jwt.fail(Unexpected("x", [required_text(members, "x")])) }
       }
@@ -933,7 +933,7 @@ fn check_optional_member(
 
 // --- Tests ------------------------------------------------------------------
 
-fn the_bytes(text: String) -> Bytes / {abort.raise} = base64url_decode(text).expect(text)
+fn decode_base64url(text: String) -> Bytes / {abort.raise} = base64url_decode(text).expect(text)
 
 /// A key as a table of cases describes one, with its bytes in the clear: a test tells its cases
 /// apart by their digests, and a `Secret` has no digest.
@@ -1012,17 +1012,17 @@ fn unmarked() -> HeaderParameters = { typ: None, kid: None }
 
 /// A token of this header and payload, signed by `key` whatever the header says.
 fn forged(header: String, payload: String, key: Key) -> String / {jwt.fail, abort.raise} =
-  resigned(b64(header) ++ "." ++ b64(payload), key)
+  sign_input(b64(header) ++ "." ++ b64(payload), key)
 
 /// These two parts as written, with `key`'s signature over them.
-fn resigned(input: String, key: Key) -> String / {jwt.fail, abort.raise} =
+fn sign_input(input: String, key: Key) -> String / {jwt.fail, abort.raise} =
   input ++ "." ++ base64url_encode(signature(key, Bytes::of_string(input)))
 
 /// The key of RFC 7515 appendix A.1, whose token RFC 7519 §3.1 shows again.
 fn rfc_stated() -> Stated / {abort.raise} =
   Shared(
     256,
-    the_bytes(
+    decode_base64url(
       "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow",
     ),
   )
@@ -1055,9 +1055,9 @@ test "RFC 7519's example token verifies under its key, and its claims are the RF
 }
 
 /// The seed of RFC 8037 appendix A's Ed25519 key.
-fn rfc_seed() -> Bytes / {abort.raise} = the_bytes("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A")
+fn rfc_seed() -> Bytes / {abort.raise} = decode_base64url("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A")
 
-fn rfc_public() -> Bytes / {abort.raise} = the_bytes("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo")
+fn rfc_public() -> Bytes / {abort.raise} = decode_base64url("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo")
 
 fn rfc_edwards_token() -> String =
   "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg"
@@ -1078,13 +1078,13 @@ test "RFC 8037's Ed25519 example is what its seed signs" {
 /// The RSA key of RFC 7515 appendix A.2 as a PKCS #1 `RSAPrivateKey`: the numbers its JWK gives,
 /// written as the document a signer stores.
 fn rsa_document() -> Bytes / {abort.raise} =
-  the_bytes(
+  decode_base64url(
     "MIIEowIBAAKCAQEAofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQIDAQABAoIBABKucaRpzQorw35SbEUAVx8dYXUdZOlJcHtiWQ-dC6V8ljxAHj_PLyzTveyI5QO_xkObCyjIL303l2cfUhPu2MFaJdjVzqACXuOrLot_eSFvxjvqVidTtAZExqFRJ9mylUVAoLvhowVWmC1On95fZCXxTUtxNEG1Xcc7m0rtzJKs45J-N_V9DP1edYH6USyPSWGp6wuA-KgHRnKKVf9GRx80JQY7nVNkL17eHoTWEwga-lwi0FEoW9Y7lDtWXYmKBWhUE-U8PGxlJf8f40493HDw1WRQ_aSLoS4QTp3rn7gYgeHEvfJdkkf0UMhlknlo53M09EFPdadQ4TlUbjqKc50CgYEA4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPGBY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUcCgYEAuQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdcCgYAHAp9XcCSrn8wVkMVkKdb7DOX4IKjzdahm-ctDAJN4O_y7OW5FKebvUjdAIt2GuoTZ71iTG-7F0F-lP88jtjP4U4qe7VHoewl4MKOfXZKTe-YCS1XbNvfgwJ3Ltyl1OH9hWvu2yza7q-d5PCsDzqtm27kxuvULVeya-TEdAB1ijQKBgQCH_3r6YrVH_uCWGy6bzV1nGNOdjKc9tmkfOJmN54dxdixdpozCQ6U4OxZrsj3FcOhHBsqAHvX2uuYjagqvo3cOj1TRqNocX40omfCCMx3bD1yPPf_6TI2XECva_ggqEY2mYzmIiA5LVVmc5nrybr-lssFKneeyxN2Wq93S0iJMdQKBgCGHewxzoa1r8ZMD0LETNrToK423K377UCYqXfg5XMclbrjPbEC3YI1ZNqMtuhdBJqUnBi6tjKMF-34Xf0CUN8ncuXGO2CAYvO8PdyCixHX52ybaDjy1FtCE6yUXjoKNXKvUm7MWGsAYH6f4IegOetN5NvmUMFStCSkh7ixZLkN1",
   )
 
 /// The same key's public half, as a PKCS #1 `RSAPublicKey`.
 fn rsa_public() -> Bytes / {abort.raise} =
-  the_bytes(
+  decode_base64url(
     "MIIBCgKCAQEAofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQIDAQAB",
   )
 
@@ -1096,13 +1096,13 @@ fn rsa_token() -> String =
 fn curve_point() -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"\x04",
-    the_bytes("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"),
-    the_bytes("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"),
+    decode_base64url("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"),
+    decode_base64url("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"),
   ])
 
 /// Its private key: the JWK's `d`.
 fn curve_scalar() -> Bytes / {abort.raise} =
-  the_bytes("jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI")
+  decode_base64url("jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI")
 
 fn curve_token() -> String =
   "eyJhbGciOiJFUzI1NiJ9." ++ rfc_claims_part()
@@ -1153,7 +1153,7 @@ fn published() -> List<Published> / {abort.raise} =
 
 /// A key on a curve as a JWK describes it, and a token over `Payload` that another implementation
 /// signed with it: RFC 7515 appendix A.4's on P-521, and OpenSSL's on P-384 and secp256k1.
-type Curved = {
+type ExternalCurveToken = {
   alg: String,
   curve: EcdsaCurve,
   crv: String,
@@ -1163,7 +1163,7 @@ type Curved = {
   token: String,
 }
 
-fn curved() -> List<Curved> =
+fn curved() -> List<ExternalCurveToken> =
   [
     {
       alg: "ES512",
@@ -1194,9 +1194,9 @@ fn curved() -> List<Curved> =
     },
   ]
 
-test "{c.alg}: another's token verifies, the JWK's scalar signs what its point verifies, and a flipped bit is rejected" for c: Curved in curved(
+test "{c.alg}: another's token verifies, the JWK's scalar signs what its point verifies, and a flipped bit is rejected" for c: ExternalCurveToken in curved(
   ) {
-  let point = Bytes::concat_all([b"\x04", the_bytes(c.x), the_bytes(c.y)]);
+  let point = Bytes::concat_all([b"\x04", decode_base64url(c.x), decode_base64url(c.y)]);
   let public = key_of(Point(c.curve, point));
   assert_eq(algorithm(public), c.alg);
   assert_eq(verify_bytes(c.token, public, 4096).payload, b"Payload");
@@ -1215,7 +1215,7 @@ test "{c.alg}: another's token verifies, the JWK's scalar signs what its point v
   assert_eq(ours, sign_bytes(b"Payload", read.key, unmarked()));
   assert_eq(verify_bytes(ours, public, 4096).payload, b"Payload");
   assert_eq(
-    ours.split(".").at(2).map(|part: String| the_bytes(part).len()),
+    ours.split(".").at(2).map(|part: String| decode_base64url(part).len()),
     Some(2 * crypto::scalar_size(c.curve)),
   );
   let parts = ours.split(".");
@@ -1258,11 +1258,11 @@ test "RFC 7515's RSA example is what its key signs, and its key verifies it" {
   assert_eq(try { sign_bytes(b"x", RsaPkcs1(Sha256, rsa_public()), unmarked()) }, Err(CannotSign))
 }
 
-type Crossed256 = { alg: String, key: Stated, token: String }
+type ExternalRsaToken = { alg: String, key: Stated, token: String }
 
 /// RFC 7515's claims under its RSA key and each other RSA algorithm, as `openssl dgst -sign`
 /// signs them: PKCS #1 v1.5 over SHA-384 and SHA-512, and PSS with a salt of its digest's length.
-fn rsa_crossed() -> List<Crossed256> / {abort.raise} =
+fn external_rsa_tokens() -> List<ExternalRsaToken> / {abort.raise} =
   [
     {
       alg: "RS384",
@@ -1291,7 +1291,7 @@ fn rsa_crossed() -> List<Crossed256> / {abort.raise} =
     },
   ]
 
-test "{c.alg} verifies the token openssl signs under RFC 7515's RSA key" for c: Crossed256 in rsa_crossed(
+test "{c.alg} verifies the token openssl signs under RFC 7515's RSA key" for c: ExternalRsaToken in external_rsa_tokens(
   ) {
   let signed = verify_bytes(c.token, key_of(c.key), 4096);
   assert_eq(signed.payload, rfc_payload());
@@ -1309,8 +1309,8 @@ test "{c.alg} verifies the token openssl signs under RFC 7515's RSA key" for c: 
 test "PKCS #1 v1.5 over each digest is what openssl signs, and PSS signs what its key verifies" {
   let token = |digest: Digest|
     sign_bytes(rfc_payload(), key_of(Document(digest, rsa_document())), unmarked());
-  assert_eq(Some(token(Sha384)), rsa_crossed().at(0).map(|c: Crossed256| c.token));
-  assert_eq(Some(token(Sha512)), rsa_crossed().at(1).map(|c: Crossed256| c.token));
+  assert_eq(Some(token(Sha384)), external_rsa_tokens().at(0).map(|c: ExternalRsaToken| c.token));
+  assert_eq(Some(token(Sha512)), external_rsa_tokens().at(1).map(|c: ExternalRsaToken| c.token));
   let holds = |digest: Digest| {
     let signer = key_of(PssDocument(digest, rsa_document()));
     let signed = sign_bytes(rfc_payload(), signer, unmarked());
@@ -1335,7 +1335,7 @@ test "RFC 7515's ES256 example verifies, and its key signs r and s and never DER
     verify_bytes(ours, Ecdsa(crypto::NistP256, curve_point()), 4096).payload,
     rfc_payload(),
   );
-  assert_eq(ours.split(".").at(2).map(|part: String| the_bytes(part).len()), Some(64));
+  assert_eq(ours.split(".").at(2).map(|part: String| decode_base64url(part).len()), Some(64));
   // The same signature as X.509 writes it, a DER SEQUENCE of two INTEGERs, is rejected.
   let input = "eyJhbGciOiJFUzI1NiJ9." ++ rfc_claims_part();
   let der = match crypto::ecdsa_signing(
@@ -1432,18 +1432,18 @@ fn good() -> String =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." ++ sample_part()
     ++ ".KUdvKNCD6zaE2hd1zWnynapMmo8MgtTvVbbWH272D0s"
 
-fn good_stated() -> Stated / {abort.raise} = Shared(256, counting(32))
+fn good_shared_key() -> Stated / {abort.raise} = Shared(256, counting(32))
 
-fn good_key() -> Key / {abort.raise} = key_of(good_stated())
+fn good_key() -> Key / {abort.raise} = key_of(good_shared_key())
 
 /// An instant `sample` is valid at.
 fn in_time_of_sample() -> Instant = at_second(1800000000)
 
-type Crossed = { alg: String, claims: Claims, key: Stated, marks: HeaderParameters, token: String }
+type ExternalToken = { alg: String, claims: Claims, key: Stated, marks: HeaderParameters, token: String }
 
-fn crossed() -> List<Crossed> / {abort.raise} =
+fn crossed() -> List<ExternalToken> / {abort.raise} =
   [
-    { alg: "HS256", claims: sample(), key: good_stated(), marks: as_jwt(), token: good() },
+    { alg: "HS256", claims: sample(), key: good_shared_key(), marks: as_jwt(), token: good() },
     {
       alg: "HS384",
       claims: sample(),
@@ -1470,11 +1470,11 @@ fn crossed() -> List<Crossed> / {abort.raise} =
   ]
 
 /// `sample` under RFC 8037's seed, with `kid` `ed-1`, as Python's `cryptography` signs it.
-fn crossed_edwards_token() -> String =
+fn external_edwards_token() -> String =
   "eyJhbGciOiJFZERTQSIsImtpZCI6ImVkLTEiLCJ0eXAiOiJKV1QifQ." ++ sample_part()
     ++ ".csmT3VGLM6WQjyCqxzRHOVTbl8eUkwfE1P9p0IOYa-ebI19PV-0o7053vItcsJ4H9MJ9Lec0GIqvH08GrlGyCw"
 
-test "{c.alg} signs the token Python signs, and verifies it" for c: Crossed in crossed() {
+test "{c.alg} signs the token Python signs, and verifies it" for c: ExternalToken in crossed() {
   assert_eq(sign(c.claims, key_of(c.key), c.marks), c.token);
   let v = verify(c.token, key_of(c.key), lax(), in_time_of_sample());
   assert_eq(v.claims, c.claims);
@@ -1499,7 +1499,7 @@ fn attack(name: String, token: String, rejection: Error) -> Attack / {abort.rais
   {
     name: name,
     token: token,
-    key: good_stated(),
+    key: good_shared_key(),
     policy: lax(),
     now: in_time_of_sample(),
     rejection: rejection,
@@ -1629,7 +1629,7 @@ fn malformed() -> List<Attack> / {jwt.fail, abort.raise} =
     ),
     attack(
       "a padded payload under a signature that covers the padding",
-      resigned(b64(hs256_header()) ++ ".e30=", good_key()),
+      sign_input(b64(hs256_header()) ++ ".e30=", good_key()),
       Encoding(InPayload),
     ),
     attack(
@@ -1736,7 +1736,7 @@ fn malformed() -> List<Attack> / {jwt.fail, abort.raise} =
   ]
 
 /// Errors that depend on the verifier's key, policy or clock.
-fn judged() -> List<Attack> / {jwt.fail, abort.raise} =
+fn verifier_dependent_attacks() -> List<Attack> / {jwt.fail, abort.raise} =
   [
     // RFC 8725 section 2.1: a verifier that lets the token choose its algorithm uses an RSA
     // public key, which anyone has, as an HMAC secret. Here the key names RS256 and nothing is
@@ -1788,7 +1788,7 @@ fn judged() -> List<Attack> / {jwt.fail, abort.raise} =
     },
     {
       ..attack("an Ed25519 token under another public key", rfc_edwards_token(), BadSignature),
-      key: Edwards(the_bytes("PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw")),
+      key: Edwards(decode_base64url("PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw")),
     },
     {
       ..attack("a secret a byte short of its digest", good(), ShortKey(31)),
@@ -1864,7 +1864,7 @@ fn judged() -> List<Attack> / {jwt.fail, abort.raise} =
   ]
 
 fn attacks() -> List<Attack> / {jwt.fail, abort.raise} =
-  unsigned().concat(malformed().concat(judged()))
+  unsigned().concat(malformed().concat(verifier_dependent_attacks()))
 
 test "{c.name} is rejected" for c: Attack in attacks() {
   assert_eq(try_verify(c.token, key_of(c.key), c.policy, c.now), Err(c.rejection))
@@ -2076,12 +2076,12 @@ test "a key set reads as the keys this module can use, and a header picks its ow
     { kid: Some("ed-2"), key: other_public() },
     { kid: Some("mac-1"), key: rfc_key() },
   ]);
-  let seen = peek(crossed_edwards_token(), 4096);
+  let seen = peek(external_edwards_token(), 4096);
   assert_eq(seen.header.kid, Some("ed-1"));
   assert_eq(key_for(keys, seen.header), Some(Ed25519(rfc_public())));
   assert_eq(
     key_for(keys, seen.header).map(|key: Key|
-      verify(crossed_edwards_token(), key, lax(), in_time_of_sample()).claims),
+      verify(external_edwards_token(), key, lax(), in_time_of_sample()).claims),
     Some(sample()),
   );
   // RFC 7519's token names no key: one key is of its algorithm, and two are of EdDSA.
@@ -2117,11 +2117,11 @@ fn rfc_edwards_header() -> String = "eyJhbGciOiJFZERTQSJ9"
 
 /// The public key of RFC 8032's second test: one that did not sign RFC 8037's example.
 fn other_public() -> Key / {abort.raise} =
-  Ed25519(the_bytes("PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"))
+  Ed25519(decode_base64url("PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"))
 
 type Unread = { name: String, key: String, rejection: Error }
 
-fn unread() -> List<Unread> =
+fn invalid_jwk_cases() -> List<Unread> =
   [
     {
       name: "an RSA key that names no algorithm",
@@ -2241,7 +2241,7 @@ fn unread() -> List<Unread> =
     },
   ]
 
-test "{c.name} is not read" for c: Unread in unread() {
+test "{c.name} is not read" for c: Unread in invalid_jwk_cases() {
   assert_eq(try { jwk(document(c.key)) }, Err(c.rejection))
 }
 
@@ -2260,7 +2260,7 @@ test "a key set is a bounded JSON object with a list of keys" {
 // --- Properties -------------------------------------------------------------
 
 /// A policy that requires no claims and reads any size, for a law about the signature.
-fn roomy() -> Policy = { ..lax(), max_bytes: 1 << 30 }
+fn permissive_policy() -> Policy = { ..lax(), max_bytes: 1 << 30 }
 
 fn signable(c: Claims) -> Bool = !registered().any(|name: String| c.other.contains(name))
 
@@ -2271,7 +2271,7 @@ fn timely(c: Claims, now: Instant) -> Bool =
 fn untimed(c: Claims) -> Claims = { ..c, expires: None, not_before: None }
 
 fn rejects(token: String, key: Key) -> Bool / {abort.raise} =
-  match try_verify(token, key, roomy(), Instant(0)) { Err(_) -> true, Ok(_) -> false }
+  match try_verify(token, key, permissive_policy(), Instant(0)) { Err(_) -> true, Ok(_) -> false }
 
 /// `raw` with one bit flipped: bit number `at`, wrapped around its length.
 fn flipped(raw: Bytes, at: Int) -> Bytes / {abort.raise} = {
@@ -2318,7 +2318,7 @@ test "verify returns the claims sign was given, while they are valid" {
     gen::map(gen::any_int(), |n: Int| Instant(n)),
     |c: Claims, key: Stated, now: Instant|
       if signable(c) && timely(c, now) {
-        verify(sign(c, key_of(key), as_jwt()), verification_key(key_of(key)), roomy(), now).claims
+        verify(sign(c, key_of(key), as_jwt()), verification_key(key_of(key)), permissive_policy(), now).claims
           == c
       } else { true },
   )
@@ -2340,7 +2340,7 @@ type Place = { token: String, key: Stated, from: Int, to: Int }
 /// Ed25519 token, and RFC 7515's ES256 and RS256 tokens.
 fn places() -> List<Place> / {abort.raise} =
   [
-    { token: good(), key: good_stated() },
+    { token: good(), key: good_shared_key() },
     { token: rfc_edwards_token(), key: Edwards(rfc_public()) },
     { token: curve_token(), key: Point(crypto::NistP256, curve_point()) },
     { token: rsa_token(), key: Pkcs1(Sha256, rsa_public()) },

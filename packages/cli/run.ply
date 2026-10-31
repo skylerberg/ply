@@ -1,6 +1,6 @@
 import compiler.load (Derives, SourceFile)
 import std.random (entropy)
-import update_costs (broken_promises, cost_checker)
+import update_costs (reuse_violations, cost_checker)
 import literals (evaluation, evaluation_errors)
 import args (Flags, from_argv, style_of, root_of)
 import compiler.front.facts (CheckedProgram)
@@ -37,7 +37,7 @@ import std.value (Value, VInt, VUnit, render)
 import std.process (process, captured, err_step)
 import std.term (Style, dim, plain, red)
 import signing (provenance_of, public_of, signatures_path, unreadable_key)
-import std.signed (signed_of, trusted_signer)
+import std.signed (decode_signed, trusted_signer)
 import std.list
 import compiler.store.plyx (digest_of, digest_text, domain, library_domain)
 import compiler.check.resolve.tables (error_at)
@@ -45,7 +45,7 @@ import compiler.unit (shipped)
 import artifact_builder
 import hosts (filesystem_json, transport_json)
 import host_listing
-import host_listing (Disclosures, Listing, RejectionCount)
+import host_listing (HostSettings, Listing, RejectionCount)
 import entries (Runnable, RestoredLoad)
 import machine
 import machine (Artifact, RunConfiguration, Deployed, BindingSummary, Counters, RunOutcome,
@@ -88,7 +88,7 @@ fn binding_lines(
           "binding host · " ++ count_of(bound.operations, "operation") ++ " · " ++ bound.digest,
         ),
     ];
-    let configured = if configuration::opened(c) {
+    let configured = if configuration::has_input(c) {
       head.push(indent() ++ dim(style, "config      " ++ configuration::banner(c)))
     } else { head };
     match bound.trace {
@@ -156,12 +156,12 @@ fn print_disclosures(
     }
   }
 
-fn drain_expired(diagnostic: Diagnostic) -> Bool = diagnostic.code == b"W0608"
+fn shutdown_deadline_exceeded(diagnostic: Diagnostic) -> Bool = diagnostic.code == b"W0608"
 
 fn timed_out(diagnostic: Diagnostic) -> Bool = machine::is_timed_out(diagnostic.code)
 
 fn expired_of(e: RunOutcome) -> Bool =
-  match e.raised { Some(r) -> drain_expired(r.diagnostic), None -> false }
+  match e.raised { Some(r) -> shutdown_deadline_exceeded(r.diagnostic), None -> false }
 
 fn handshake_lines(style: Style, e: RunOutcome) -> List<String> =
   e.handshakes.map(|line: String| indent() ++ dim(style, line))
@@ -181,7 +181,7 @@ fn stopped_line(style: Style, g: StopReport, w: Teardown) -> String =
         ++ " connection(s) in flight",
     )
 
-fn drain_line(style: Style, g: StopReport, expired: Bool) -> String =
+fn drain_report_line(style: Style, g: StopReport, expired: Bool) -> String =
   indent()
     ++ dim(
       style,
@@ -219,7 +219,7 @@ fn stop_lines(style: Style, e: RunOutcome) -> List<String> =
     Some(g) ->
       [
         stopped_line(style, g, e.teardown),
-        drain_line(style, g, expired_of(e)),
+        drain_report_line(style, g, expired_of(e)),
         teardown_line(style, e.teardown),
       ].concat(
         trace_lines(style, e),
@@ -244,7 +244,7 @@ fn label_location(places: List<SourceText>, label: Label) -> Option<String> / {a
   }
 
 fn raised_at(style: Style, target: Target, diagnostic: Diagnostic) -> List<String> / {abort.raise} =
-  if drain_expired(diagnostic) || timed_out(diagnostic) { [] } else {
+  if shutdown_deadline_exceeded(diagnostic) || timed_out(diagnostic) { [] } else {
     match primary_of(diagnostic) {
       None -> [],
       Some(l) -> match label_location(places_of(target), l) {
@@ -354,7 +354,7 @@ fn raised(
   r: RuntimeDiagnostic,
 ) -> CommandOutput / {abort.raise} = {
   let diagnostic = shown(r);
-  let code = if drain_expired(diagnostic) { drain_incomplete() } else { failed() };
+  let code = if shutdown_deadline_exceeded(diagnostic) { drain_incomplete() } else { failed() };
   {
     json: document(target, entry_name, resolution, e, false, code, Some(r)),
     lines: [],
@@ -403,13 +403,13 @@ fn unreadable_artifact(
     code: compile_error(),
   }
 
-fn unloaded(style: Style, reason: Rejection) -> CommandOutput / {abort.raise} =
+fn load_error_output(style: Style, reason: Rejection) -> CommandOutput / {abort.raise} =
   match reason.artifact {
     None -> rejected(style, "run", reason.diagnostics, reason.places),
     Some(path) -> unreadable_artifact(style, path, reason),
   }
 
-fn unentered(
+fn entry_error_output(
   style: Style,
   target: Target,
   diagnostic: Diagnostic,
@@ -476,7 +476,7 @@ fn choose_entry<| e>(
   bind: (String, RunConfiguration) -> Result<BoundEntry<| e>, Rejection> / e,
 ) -> CommandOutput / {process.err[proc], abort.raise | e} =
   match entry_of(target) {
-    Err(d) -> unentered(style, target, d),
+    Err(d) -> entry_error_output(style, target, d),
     Ok(entry_name) -> bind_and_run(style, flags, target, entry_name, config, bind),
   }
 
@@ -493,7 +493,7 @@ fn configured_over(
       name,
     ))
 
-fn bound_over(
+fn bind_entry(
   loaded: LoadedTarget,
   options: Options,
   entry_name: String,
@@ -515,7 +515,7 @@ fn bound_over(
           Err(failures) -> rejected(failures.map(machine::unplaced)),
           Ok(binding) -> {
             let bounds = { lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms };
-            let disclosures = host_listing::disclosures_of(l, hosting, config, Some(bounds));
+            let disclosures = host_listing::host_settings_of(l, hosting, config, Some(bounds));
             Ok({
               bound: {
                 operations: l.rows.len(),
@@ -545,7 +545,7 @@ fn entered(
   entry_name: String,
   binding: Int,
   l: Listing,
-  disclosures: Disclosures,
+  disclosures: HostSettings,
 ) -> RunOutcome / {entering::machine.enter, entering::machine.unbind, abort.raise} = {
   let o = entering::machine.enter(loaded.unit.unit, entry_name, machine::arguments_of([]), {
     ..entering::unbounded(),
@@ -586,7 +586,7 @@ fn counters_of(u: entering::Usage) -> Counters =
     else { Decimal::of_float(Float::of_int(u.updates_in_place) / Float::of_int(u.updates)) },
   }
 
-fn hosts_json(l: Listing, d: Disclosures, reports: List<entering::Report>) -> Json / {abort.raise} =
+fn hosts_json(l: Listing, d: HostSettings, reports: List<entering::Report>) -> Json / {abort.raise} =
   object(
     [
       { key: "handlers", value: int(l.handlers) },
@@ -625,7 +625,7 @@ fn handshakes_json(reports: List<entering::Report>) -> Json / {abort.raise} = {
 pub fn run(
   flags: Flags,
   options: Options,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, shipped.definitions, shipped.runtime, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached} = {
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, shipped.definitions, shipped.runtime, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let named = paths::display_path(root_of(flags));
   if is_artifact(named) {
@@ -659,7 +659,7 @@ fn deployed_target(
       None -> rejected([artifact_builder::unreadable(path)]),
       Some(b) -> match artifact_builder::open_artifact(path, b) {
         Err(d) -> rejected([d]),
-        Ok(o) -> match units::library_carried(o.unit, profile) {
+        Ok(o) -> match units::cached_library(o.unit, profile) {
           Err(diagnostics) -> rejected(diagnostics),
           Ok(library) -> match entering::machine.open(library) {
             Err(reason) -> rejected([machine::unit_load_error(reason)]),
@@ -696,7 +696,7 @@ fn a_library(path: String) -> Diagnostic =
 fn artifact_bytes(flags: Flags) -> Option<Bytes> / {fs.read_file[cwd], fs.read_file[abs]} =
   match flags.paths.at(0) { Some(r) -> paths::read_file(paths::rooted(r)), None -> None }
 
-fn unsigned(path: String, reason: String) -> Diagnostic =
+fn untrusted_artifact(path: String, reason: String) -> Diagnostic =
   error_at(
     b"E0460",
     no_module(),
@@ -747,19 +747,19 @@ fn signer_rejection(
           match signatures_of(flags) {
             None ->
               Some(
-                unsigned(
+                untrusted_artifact(
                   path,
                   "carries no signatures: `" ++ signatures_path(path) ++ "` is not there",
                 ),
               ),
-            Some(b) -> match signed_of(b) {
-              None -> Some(unsigned(path, "has signatures beside it that do not read")),
+            Some(b) -> match decode_signed(b) {
+              None -> Some(untrusted_artifact(path, "has signatures beside it that do not read")),
               Some(g) -> match provenance_of(g.payload) {
                 None ->
-                  Some(unsigned(path, "has signatures beside it over nothing a build vouches for")),
+                  Some(untrusted_artifact(path, "has signatures beside it over nothing a build vouches for")),
                 Some(what) -> if what.digest != digest {
                   Some(
-                    unsigned(
+                    untrusted_artifact(
                       path,
                       "is " ++ digest ++ ", and its signatures vouch for " ++ what.digest,
                     ),
@@ -767,7 +767,7 @@ fn signer_rejection(
                 } else {
                   match trusted_signer(g, keys) {
                     Some(_) -> None,
-                    None -> Some(unsigned(path, "is signed by no key `--require-signer` names")),
+                    None -> Some(untrusted_artifact(path, "is signed by no key `--require-signer` names")),
                   }
                 },
               },
@@ -784,7 +784,7 @@ fn run_sources(
   style: Style,
   flags: Flags,
   options: Options,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached} = {
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let bind_and_run = time.elapsed_ms();
   let project: sources::Project = load_resolved(flags.paths);
   let key = command_key(module_queries::program_digest(), command_identity(flags, options));
@@ -808,7 +808,7 @@ fn run_sources(
       };
       run_loaded(style, flags, options, Ok(t), Some(l))
     },
-    None -> built(style, flags, options, project, key, bind_and_run),
+    None -> run_uncached(style, flags, options, project, key, bind_and_run),
   }
 }
 
@@ -851,32 +851,32 @@ fn command_identity(flags: Flags, options: Options) -> Bytes =
     length_prefixed(Bytes::of_string(options.profile.name)),
   ])
 
-fn built(
+fn run_uncached(
   style: Style,
   flags: Flags,
   options: Options,
   project: sources::Project,
   key: Bytes,
   bind_and_run: Int,
-) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_reached} = {
+) -> CommandOutput / {shipped.read_pack, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, MachineAccess, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.compiled, toolchain.reuse_dir, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_view_used} = {
   let t: TimedLoad = timed_over(flags.paths, project, bind_and_run, flags.verify_dependencies);
   match program_view(t.program) {
     None ->
-      unloaded(style, {
+      load_error_output(style, {
         diagnostics: t.program.diagnostics,
         places: t.program.places,
         artifact: None,
       }),
     Some(w) -> match config_schema::schema_error(w, options.config.schema) {
       Some(d) -> unbound(style, { diagnostics: [d], places: t.program.places, artifact: None }),
-      None -> match broken_promises(t.program, w.frame) {
+      None -> match reuse_violations(t.program, w.frame) {
         [] -> match evaluation_errors(t, w.frame) {
           [] -> loaded_built(style, flags, options, project, t, w, key),
           rejected ->
-            unloaded(style, { diagnostics: rejected, places: t.program.places, artifact: None }),
+            load_error_output(style, { diagnostics: rejected, places: t.program.places, artifact: None }),
         },
         broken ->
-          unloaded(style, { diagnostics: broken, places: t.program.places, artifact: None }),
+          load_error_output(style, { diagnostics: broken, places: t.program.places, artifact: None }),
       },
     },
   }
@@ -950,7 +950,7 @@ fn run_loaded(
   l: Option<LoadTiming>,
 ) -> CommandOutput / {MachineAccess, process.err[proc], env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match loaded {
-    Err(reason) -> unloaded(style, reason),
+    Err(reason) -> load_error_output(style, reason),
     Ok(t) -> {
       let result = run_target(
         style,
@@ -958,7 +958,7 @@ fn run_loaded(
         Ok(t.target),
         configured_over(t, options),
         |entry_name: String, config: RunConfiguration|
-          bound_over(t, options, entry_name, config, flags.json),
+          bind_entry(t, options, entry_name, config, flags.json),
         l,
       );
       entering::machine.close(t.unit.unit);
@@ -975,7 +975,7 @@ fn run_target<| e>(
   l: Option<LoadTiming>,
 ) -> CommandOutput / {process.err[proc], abort.raise | e} =
   match target {
-    Err(reason) -> unloaded(style, reason),
+    Err(reason) -> load_error_output(style, reason),
     Ok(t) -> match l {
       None -> choose_entry(style, flags, t, config, bind),
       Some(loading) -> {
@@ -1042,7 +1042,7 @@ fn short_key(key: String) -> String / {abort.raise} = "b3:" ++ key.slice(0, 12)
 fn a_main() -> Main =
   { name: "m.main", module: "m", path: "m.ply", at: { module: 0, start: 3, end: 7 } }
 
-fn a_program() -> Target =
+fn example_project() -> Target =
   Project({
     root: "/p",
     files: ["m.ply"],
@@ -1054,7 +1054,7 @@ fn a_program() -> Target =
 fn an_artifact() -> Target =
   Deployed({ path: "m.plyx", digest: "b3:1f2e3d4c5b6a", entry: "m.main", definitions: 3 })
 
-fn reaching_nothing() -> BindingSummary = { operations: 0, digest: "", trace: None, signals: None }
+fn empty_binding() -> BindingSummary = { operations: 0, digest: "", trace: None, signals: None }
 
 fn a_binding() -> BindingSummary =
   {
@@ -1160,10 +1160,10 @@ fn run_fixture_loaded(
 
 fn bare() -> Flags / {abort.raise} = from_argv("run", [])
 
-fn as_json() -> Flags / {abort.raise} = from_argv("run", ["--json"])
+fn json_flags() -> Flags / {abort.raise} = from_argv("run", ["--json"])
 
 test "a run that returned says nothing of its own, not even the value, and exits 0" {
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(a_binding()), returned_value(VInt(42)));
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(a_binding()), returned_value(VInt(42)));
   assert_eq(ran.result.code, 0);
   assert_eq(ran.result.lines, []);
   assert_eq(ran.result.errs, []);
@@ -1173,9 +1173,9 @@ test "a run that returned says nothing of its own, not even the value, and exits
 test "the object keys off `command` and `exit_code`, and names the entry and its module" {
   let text = to_string(
     run_fixture(
-      as_json(),
-      Ok(a_program()),
-      Ok(reaching_nothing()),
+      json_flags(),
+      Ok(example_project()),
+      Ok(empty_binding()),
       returned_value(VInt(42)),
     ).result.json,
   );
@@ -1190,8 +1190,8 @@ test "the object keys off `command` and `exit_code`, and names the entry and its
 
 test "under `--explain` a bound run discloses what it may reach before the entry is entered" {
   let ran = run_fixture_loaded(
-    explaining(),
-    Ok(a_program()),
+    explain_flags(),
+    Ok(example_project()),
     Ok(configured_service()),
     Ok(a_binding()),
     returned_value(VInt(42)),
@@ -1208,7 +1208,7 @@ test "under `--explain` a bound run discloses what it may reach before the entry
 
 test "under `--explain` a run that ends at once on a stop says so before the entry is entered" {
   let ending = { ..a_binding(), signals: Some({ names: ["SIGINT", "SIGTERM"], drain: None }) };
-  let ran = run_fixture(explaining(), Ok(a_program()), Ok(ending), returned_value(VInt(42)));
+  let ran = run_fixture(explain_flags(), Ok(example_project()), Ok(ending), returned_value(VInt(42)));
   assert_eq(
     ran.err.at_or(ran.err.len() - 1, ""),
     "   shutdown    signals SIGINT SIGTERM · children ended · exits 130/143",
@@ -1216,16 +1216,16 @@ test "under `--explain` a run that ends at once on a stop says so before the ent
 }
 
 test "`--json` promises stdout to the one object, so nothing else is written at all" {
-  let ran = run_fixture(as_json(), Ok(a_program()), Ok(a_binding()), returned_value(VInt(42)));
+  let ran = run_fixture(json_flags(), Ok(example_project()), Ok(a_binding()), returned_value(VInt(42)));
   assert_eq(ran.err, []);
   assert(to_string(ran.result.json).contains("\"value\":\"42\""))
 }
 
 test "a run that performs nothing of the host discloses nothing, because there is nothing it could reach" {
   let ran = run_fixture(
-    explaining(),
-    Ok(a_program()),
-    Ok(reaching_nothing()),
+    explain_flags(),
+    Ok(example_project()),
+    Ok(empty_binding()),
     returned_value(VUnit),
   );
   assert_eq(ran.err, [])
@@ -1243,7 +1243,7 @@ test "a raise is exit 1, and says where it was raised for a reader with the file
       ),
     ),
   };
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(reaching_nothing()), raise);
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(empty_binding()), raise);
   assert_eq(ran.result.code, 1);
   assert_eq(ran.result.lines, []);
   assert_eq(ran.result.errs.at_or(0, ""), "Error[E0501]: nope");
@@ -1259,10 +1259,10 @@ test "a raise shows the values it carries where its text names them, and the doc
       values: [VInt(3)],
     }),
   };
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(reaching_nothing()), raise);
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(empty_binding()), raise);
   assert_eq(ran.result.errs.at_or(0, ""), "Error[E0501]: expected 3");
   let text = to_string(
-    run_fixture(as_json(), Ok(a_program()), Ok(reaching_nothing()), raise).result.json,
+    run_fixture(json_flags(), Ok(example_project()), Ok(empty_binding()), raise).result.json,
   );
   assert(text.contains("\"message\":\"expected 3\""));
   assert(text.contains("\"values\":[\"3\"]"))
@@ -1274,18 +1274,18 @@ test "an expired drain is exit 3, and is not attributed to a line of the program
     value: None,
     raised: Some(raised_without_values(a_diagnostic(b"W0608", b"the drain deadline expired", []))),
   };
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(a_binding()), expired);
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(a_binding()), expired);
   assert_eq(ran.result.code, 3);
   assert_eq(ran.result.errs.filter(|l: String| l.contains("raised at")).len(), 0)
 }
 
 test "a program that chose its own exit code exits with that code and no value" {
   let chose = { ..returned_value(VUnit), exit: Some(7), value: None };
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(reaching_nothing()), chose);
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(empty_binding()), chose);
   assert_eq(ran.result.code, 7);
   assert_eq(ran.result.lines, []);
   let text = to_string(
-    run_fixture(as_json(), Ok(a_program()), Ok(reaching_nothing()), chose).result.json,
+    run_fixture(json_flags(), Ok(example_project()), Ok(empty_binding()), chose).result.json,
   );
   assert(text.contains("\"exit_code\":7"));
   assert(text.contains("\"ok\":false"));
@@ -1300,7 +1300,7 @@ test "under `--explain` a stopped run says its handshakes, what was in flight, h
     trace: Some({ events: 9, spans: 4, timed_out: 2, flushed: true }),
     handshakes: ["handshakes: 1 completed, 0 rejected"],
   };
-  let ran = run_fixture(explaining(), Ok(a_program()), Ok(a_binding()), stopped);
+  let ran = run_fixture(explain_flags(), Ok(example_project()), Ok(a_binding()), stopped);
   assert_eq(ran.result.lines, []);
   assert_eq(ran.result.errs, [
     "   handshakes: 1 completed, 0 rejected",
@@ -1309,7 +1309,7 @@ test "under `--explain` a stopped run says its handshakes, what was in flight, h
     "   teardown    1 span(s) left open · sink flushed",
     "   trace       9 event(s) · 4 span(s) · 2 abandoned · flushed",
   ]);
-  assert_eq(run_fixture(bare(), Ok(a_program()), Ok(a_binding()), stopped).result.errs, [])
+  assert_eq(run_fixture(bare(), Ok(example_project()), Ok(a_binding()), stopped).result.errs, [])
 }
 
 test "the shutdown block counts the spans left open, as the warning that named them did" {
@@ -1319,7 +1319,7 @@ test "the shutdown block counts the spans left open, as the warning that named t
     teardown: { ..no_teardown(), spans_left_open: 2 },
   };
   let text = to_string(
-    run_fixture(as_json(), Ok(a_program()), Ok(reaching_nothing()), finished).result.json,
+    run_fixture(json_flags(), Ok(example_project()), Ok(empty_binding()), finished).result.json,
   );
   assert(text.contains("\"spans_left_open\":2"))
 }
@@ -1341,12 +1341,12 @@ fn warned_of_spans() -> List<String> =
 
 test "spans an entry left open are warned of on stderr, and its exit 0 stands" {
   let finished = { ..returned_value(VInt(3)), warnings: [left_open()] };
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(reaching_nothing()), finished);
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(empty_binding()), finished);
   assert_eq(ran.result.code, 0);
   assert_eq(ran.result.lines, []);
   assert_eq(ran.result.errs, warned_of_spans());
   let text = to_string(
-    run_fixture(as_json(), Ok(a_program()), Ok(reaching_nothing()), finished).result.json,
+    run_fixture(json_flags(), Ok(example_project()), Ok(empty_binding()), finished).result.json,
   );
   assert(text.contains("\"code\":\"W0609\""));
   assert(text.contains("\"exit_code\":0"))
@@ -1365,7 +1365,7 @@ test "a raise that left spans open is said first, and the spans after where it w
     ),
     warnings: [left_open()],
   };
-  let ran = run_fixture(bare(), Ok(a_program()), Ok(reaching_nothing()), finished);
+  let ran = run_fixture(bare(), Ok(example_project()), Ok(empty_binding()), finished);
   assert_eq(ran.result.code, 1);
   let errs = ran.result.errs;
   assert_eq(errs.at_or(0, ""), "Error[E0502]: boom");
@@ -1375,17 +1375,17 @@ test "a raise that left spans open is said first, and the spans after where it w
 
 test "an artifact says which file it ran, its digest, and what it carries" {
   let ran = run_fixture(
-    explaining(),
+    explain_flags(),
     Ok(an_artifact()),
-    Ok(reaching_nothing()),
+    Ok(empty_binding()),
     returned_value(VInt(42)),
   );
   assert_eq(ran.err, ["   program b3:1f2e3d4c5b6a · 3 definitions"]);
   let text = to_string(
     run_fixture(
-      as_json(),
+      json_flags(),
       Ok(an_artifact()),
-      Ok(reaching_nothing()),
+      Ok(empty_binding()),
       returned_value(VInt(42)),
     ).result.json,
   );
@@ -1417,7 +1417,7 @@ test "a file that is not an artifact is rejected with an error about the file an
     artifact: Some("junk.plyx"),
   };
   let text = to_string(
-    run_fixture(as_json(), Err(reason), Err(no_rejection()), returned_value(VUnit)).result.json,
+    run_fixture(json_flags(), Err(reason), Err(no_rejection()), returned_value(VUnit)).result.json,
   );
   assert(text.contains("\"artifact\":\"junk.plyx\""));
   assert(text.contains("\"E0443\""));
@@ -1434,7 +1434,7 @@ test "a program with no `main` is rejected over its own files before anything is
     mains: [],
     modules: [{ name: "m", path: "m.ply", at: { module: 0, start: 18, end: 18 } }],
   });
-  let ran = run_fixture(as_json(), Ok(empty), Err(no_rejection()), returned_value(VUnit));
+  let ran = run_fixture(json_flags(), Ok(empty), Err(no_rejection()), returned_value(VUnit));
   assert_eq(ran.result.code, 2);
   let text = to_string(ran.result.json);
   assert(text.contains("\"root\":\"/p\""));
@@ -1447,7 +1447,7 @@ test "a binding that does not match the program is a start-up failure naming no 
     places: [],
     artifact: None,
   };
-  let ran = run_fixture(bare(), Ok(a_program()), Err(reason), returned_value(VUnit));
+  let ran = run_fixture(bare(), Ok(example_project()), Err(reason), returned_value(VUnit));
   assert_eq(ran.result.code, 2);
   assert_eq(ran.result.errs, [
     "Error[E0412]: a nondet effect in a det test",
@@ -1455,7 +1455,7 @@ test "a binding that does not match the program is a start-up failure naming no 
   ]);
   assert(
     to_string(
-      run_fixture(as_json(), Ok(a_program()), Err(reason), returned_value(VUnit)).result.json,
+      run_fixture(json_flags(), Ok(example_project()), Err(reason), returned_value(VUnit)).result.json,
     ).contains(
       "\"exit_code\":2",
     ),
@@ -1468,16 +1468,16 @@ test "what the machine reused is a count and a ratio, and no ratio at all over n
     counters: { updates: 4, updates_in_place: 3, in_place: Decimal::of_string("0.75") },
   };
   let text = to_string(
-    run_fixture(as_json(), Ok(a_program()), Ok(reaching_nothing()), reused).result.json,
+    run_fixture(json_flags(), Ok(example_project()), Ok(empty_binding()), reused).result.json,
   );
   assert(text.contains("\"updates\":4"));
   assert(text.contains("\"updates_in_place\":3"));
   assert(text.contains("\"in_place\":0.75"));
   let over_nothing = to_string(
     run_fixture(
-      as_json(),
-      Ok(a_program()),
-      Ok(reaching_nothing()),
+      json_flags(),
+      Ok(example_project()),
+      Ok(empty_binding()),
       returned_value(VInt(42)),
     ).result.json,
   );
@@ -1514,12 +1514,12 @@ fn a_reuse() -> LoadTiming =
 fn a_build() -> LoadTiming =
   { reused: false, key: a_key(), read_ms: 7, front_end_ms: 1774, store_ms: 44, load_ms: 1392 }
 
-fn explaining() -> Flags / {abort.raise} = from_argv("run", ["--explain"])
+fn explain_flags() -> Flags / {abort.raise} = from_argv("run", ["--explain"])
 
 fn loaded(flags: Flags, l: LoadTiming) -> RunCapture / {abort.raise} =
   run_fixture_loaded(
     flags,
-    Ok(a_program()),
+    Ok(example_project()),
     Ok(unconfigured()),
     Ok(a_binding()),
     returned_value(VInt(42)),
@@ -1528,27 +1528,27 @@ fn loaded(flags: Flags, l: LoadTiming) -> RunCapture / {abort.raise} =
 
 test "a run over a reused front end gives exactly the result of one over a front end it ran" {
   assert_eq(loaded(bare(), a_reuse()), loaded(bare(), a_build()));
-  assert_eq(loaded(as_json(), a_reuse()), loaded(as_json(), a_build()));
+  assert_eq(loaded(json_flags(), a_reuse()), loaded(json_flags(), a_build()));
   assert_eq(
     loaded(bare(), a_reuse()),
-    run_fixture(bare(), Ok(a_program()), Ok(a_binding()), returned_value(VInt(42))),
+    run_fixture(bare(), Ok(example_project()), Ok(a_binding()), returned_value(VInt(42))),
   )
 }
 
 test "`--explain` says whether the front end ran, under which key, and where the time went" {
-  let reused = loaded(explaining(), a_reuse());
+  let reused = loaded(explain_flags(), a_reuse());
   assert_eq(
     reused.err.at_or(0, ""),
     "   front end   reused b3:0123456789ab · read 9ms · load 41ms",
   );
-  let built = loaded(explaining(), a_build());
+  let run_uncached = loaded(explain_flags(), a_build());
   assert_eq(
-    built.err.at_or(0, ""),
+    run_uncached.err.at_or(0, ""),
     "   front end   built b3:0123456789ab · read 7ms · front 1774ms · write back 44ms · load 1392ms",
   );
-  assert_eq(built.err.at_or(1, ""), "   binding host · 7 operations · b3:aabbccddeeff");
+  assert_eq(run_uncached.err.at_or(1, ""), "   binding host · 7 operations · b3:aabbccddeeff");
   assert_eq(loaded(bare(), a_build()).err, []);
-  assert_eq(built.result, loaded(bare(), a_build()).result)
+  assert_eq(run_uncached.result, loaded(bare(), a_build()).result)
 }
 
 test "`--json --explain` carries the load in the one document and says nothing aloud" {
@@ -1558,7 +1558,7 @@ test "`--json --explain` carries the load in the one document and says nothing a
   assert(text.contains("\"front_end\":{\"key\":\"" ++ a_key() ++ "\""));
   assert(text.contains("\"phases\":{\"front\":0,\"load\":41,\"read\":9,\"write_back\":0}"));
   assert(text.contains("\"reused\":true"));
-  assert(!to_string(loaded(as_json(), a_reuse()).result.json).contains("front_end"))
+  assert(!to_string(loaded(json_flags(), a_reuse()).result.json).contains("front_end"))
 }
 
 test "a load the machine rejected says nothing about where its time went" {
@@ -1568,7 +1568,7 @@ test "a load the machine rejected says nothing about where its time went" {
     artifact: None,
   };
   let ran = run_fixture_loaded(
-    explaining(),
+    explain_flags(),
     Err(reason),
     Ok(unconfigured()),
     Err(no_rejection()),

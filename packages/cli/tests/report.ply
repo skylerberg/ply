@@ -20,11 +20,11 @@ import mutants (Coverage, MutationReport, Survivor)
 import report (CommandOutput, indent, ok_code, compile_error, count_of, rejected, warned_lines)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null)
-import std.term (Style, plain, bold, dim, green, red, yellow, ansi, styles)
+import std.term (Style, plain, bold, dim, green, red, yellow, ansi, has_colors)
 import tester (SelectedCase, BindingReport, Options, TestUnit, ListingFailure)
 import changes (ChangeDiff)
 import testing.schedule (Effect, Counts, ScheduledTest, counts, group_by_conflict, isolation_of,
-                         isolation_word, parallelism, shared)
+                         isolation_word, parallelism, cross_test_effects)
 import testing.delta (kind_word)
 import testing.diagnose (RankedChange)
 import testing.select (Cached, Changed, Decision, New, PreviousFailure, Reason, SameCode, Search,
@@ -97,7 +97,7 @@ fn by_code_count(program: Program, decided: RunDecision) -> Int =
 
 fn group_of(decided: RunDecision, index: Int) -> Option<Int> = decided.at.get(index)
 
-fn owed_of(decided: RunDecision, index: Int) -> Int =
+fn pending_seeds(decided: RunDecision, index: Int) -> Int =
   match decided.owed.get(index) { Some(owed) -> owed, None -> 0 }
 
 pub fn group_of_class(analysis: CheckedProgram, class: List<Int>) -> Group / {abort.raise} =
@@ -115,18 +115,18 @@ fn effects_of(case: Case) -> List<Effect> =
   case.listed.map(|print_lines: PrintedEffect| print_lines.entry)
 
 fn shared_texts(case: Case) -> List<String> =
-  case.listed.filter(|print_lines: PrintedEffect| shared([print_lines.entry]).len() > 0).map(
+  case.listed.filter(|print_lines: PrintedEffect| cross_test_effects([print_lines.entry]).len() > 0).map(
     |print_lines: PrintedEffect| print_lines.text,
   )
 
-pub fn shared_of(case: Case) -> String = "{" ++ String::join(shared_texts(case), ", ") ++ "}"
+pub fn conflicting_effects_text(case: Case) -> String = "{" ++ String::join(shared_texts(case), ", ") ++ "}"
 
 pub fn classes_of(program: Program, runs: List<Int>) -> List<List<Int>> / {abort.raise} =
   group_by_conflict(scheduled_of(program, set_of(runs)))
 
 fn scheduled_of(program: Program, running: Map<Int, Bool>) -> List<ScheduledTest> =
   program.cases.filter(|case: Case| running.contains(case.index)).map(|case: Case|
-    { index: case.index, contended_effects: shared(effects_of(case)) })
+    { index: case.index, contended_effects: cross_test_effects(effects_of(case)) })
 
 pub fn all_classes(program: Program, options: Options) -> List<List<Int>> / {abort.raise} =
   match options.mutate {
@@ -134,11 +134,11 @@ pub fn all_classes(program: Program, options: Options) -> List<List<Int>> / {abo
     Some(_) -> classes_of(program, program.cases.map(|case: Case| case.index)),
   }
 
-fn reach_of(reaches: List<Int>, case: Case) -> { listed: List<Effect>, host: Bool } =
+fn host_use_of(reaches: List<Int>, case: Case) -> { listed: List<Effect>, host: Bool } =
   { listed: effects_of(case), host: covers(reaches, case.index) }
 
 pub fn counts_of(program: Program, reaches: List<Int>) -> Counts =
-  counts(program.cases.map(|case: Case| reach_of(reaches, case)))
+  counts(program.cases.map(|case: Case| host_use_of(reaches, case)))
 
 pub fn run_decision_of(
   program: Program,
@@ -167,7 +167,7 @@ pub fn run_decision_of(
     at: class_numbers(classes),
     classes: groups,
     parallelism: parallelism(
-      program.cases.map(|case: Case| shared(effects_of(case))),
+      program.cases.map(|case: Case| cross_test_effects(effects_of(case))),
       scheduled_of(program, running),
       classes,
     ),
@@ -195,7 +195,7 @@ pub type Program = {
   files: List<String>,
   places: List<SourceText>,
   modules: List<ModuleView>,
-  incremental: Bool,
+  loaded_from_cache: Bool,
   phases: Phases,
   reuse: List<Member>,
   declared: Int,
@@ -204,7 +204,7 @@ pub type Program = {
   filtered_out: Int,
   warnings: List<Diagnostic>,
   options: Json,
-  stored_under: Option<String>,
+  cache_stamp: Option<String>,
   unit: TestUnit,
 }
 
@@ -354,7 +354,7 @@ fn ns_as_ms_tenths(ns: Int) -> String = fixed_point((ns + 50000) / 100000, 1)
 fn share(part: Int, total: Int) -> String =
   fixed_point(if total == 0 { 0 } else { part * 1000 / total }, 1).pad_left(5, " ") ++ "%"
 
-fn millis(us: Int) -> Json =
+fn milliseconds_json(us: Int) -> Json =
   Number(Decimal::of_string(ms_thousandths(us)).unwrap_or(Decimal::of_int(0)))
 
 pub fn display_of(program: Program, case: Case) -> String =
@@ -404,7 +404,7 @@ fn reason_text(reason: String) -> String =
   } else { "no hash was produced, so the cache cannot vouch for it" }
 
 pub fn isolated_as(reaches: List<Int>, case: Case) -> String =
-  isolation_word(isolation_of(reach_of(reaches, case)))
+  isolation_word(isolation_of(host_use_of(reaches, case)))
 
 pub type Opening = { operations: Int, digest: String, reaches: List<Int>, workers: Int }
 
@@ -609,14 +609,14 @@ pub fn run_phase_lines(style: Style, phases: Phases, x: TimeSpent) -> List<Strin
 
 fn run_phases_json(phases: Phases, x: TimeSpent) -> Json =
   object(
-    run_rows(phases, x).map(|phase: Phase| { key: phase.label, value: millis(phase.us) }).push({
+    run_rows(phases, x).map(|phase: Phase| { key: phase.label, value: milliseconds_json(phase.us) }).push({
       key: "total",
-      value: millis(run_total(phases, x)),
+      value: milliseconds_json(run_total(phases, x)),
     }),
   )
 
 fn explain_effects(isolation: String, case: Case) -> String =
-  if isolation == "isolated" { "" } else { " " ++ shared_of(case) }
+  if isolation == "isolated" { "" } else { " " ++ conflicting_effects_text(case) }
 
 fn case_line(
   style: Style,
@@ -644,7 +644,7 @@ fn case_line(
 }
 
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
-  let recorded = match program.stored_under {
+  let recorded = match program.cache_stamp {
     Some(stamp) ->
       "a pass is recorded under its test's hash and the runtime stamp " ++ short_of(Some(stamp))
         ++ ", and under the code the test ran, with what its run read",
@@ -669,18 +669,18 @@ fn reason_lines(style: Style, program: Program, decided: RunDecision) -> List<St
   }
 }
 
-fn owed_line(
+fn remaining_seeds_line(
   style: Style,
   program: Program,
   case: Case,
   decided: RunDecision,
 ) -> List<String> / {abort.raise} =
-  if owed_of(decided, case.index) == decided.search.roots.len() { [] } else {
+  if pending_seeds(decided, case.index) == decided.search.roots.len() { [] } else {
     [
       indent() ++ "  "
         ++ dim(
           style,
-          display_of(program, case) ++ ": " ++ owed_of(decided, case.index).to_string() ++ " of "
+          display_of(program, case) ++ ": " ++ pending_seeds(decided, case.index).to_string() ++ " of "
             ++ count_of(decided.search.roots.len(), "seed")
             ++ " still owed; the rest already passed on their own",
         ),
@@ -714,7 +714,7 @@ fn search_lines(
         ),
     ];
     seeded.fold(head, |acc: List<String>, case: Case|
-      acc.concat(owed_line(style, program, case, decided)))
+      acc.concat(remaining_seeds_line(style, program, case, decided)))
   }
 }
 
@@ -807,7 +807,7 @@ fn painted_glyph(style: Style, status: String) -> String = {
 }
 
 fn marked(style: Style, status: String) -> String =
-  if styles(style) { painted_glyph(style, status) } else { word_of(status).pad_right(7, " ") }
+  if has_colors(style) { painted_glyph(style, status) } else { word_of(status).pad_right(7, " ") }
 
 fn result_name(program: Program, outcome: Outcome) -> String =
   match case_of(program, outcome.index) {
@@ -1164,7 +1164,7 @@ pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / 
       { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
       { key: "host", value: Bool(covers(report.reaches, case.index)) },
       { key: "shared_effects", value: strings(shared_texts(case)) },
-      { key: "contends", value: Array(shared(effects_of(case)).map(effect_json)) },
+      { key: "contends", value: Array(cross_test_effects(effects_of(case)).map(effect_json)) },
       { key: "seeded", value: Bool(case.seeded) },
     ]),
   )
@@ -1235,7 +1235,7 @@ fn outcome_json(program: Program, outcome: Outcome, d: RunDecision) -> Json / {a
     { key: "hash", value: string_or_null(outcome.hash) },
     { key: "group", value: int(match group_of(d, outcome.index) { Some(g) -> g, None -> 0 }) },
     { key: "status", value: Str(outcome.status) },
-    { key: "duration_ms", value: millis(outcome.duration_us) },
+    { key: "duration_ms", value: milliseconds_json(outcome.duration_us) },
     {
       key: "diagnostic",
       value: match outcome.diagnostic {
@@ -1335,10 +1335,10 @@ fn parallelism_json(v: Parallelism) -> Json =
 
 pub fn phases_json(phases: Phases) -> Json =
   object([
-    { key: "read", value: millis(phases.read_us) },
-    { key: "front", value: millis(phases.front_end_us) },
-    { key: "write_back", value: millis(phases.write_back_us) },
-    { key: "total", value: millis(phase_total(phases)) },
+    { key: "read", value: milliseconds_json(phases.read_us) },
+    { key: "front", value: milliseconds_json(phases.front_end_us) },
+    { key: "write_back", value: milliseconds_json(phases.write_back_us) },
+    { key: "total", value: milliseconds_json(phase_total(phases)) },
   ])
 
 fn selection_json(
@@ -1353,7 +1353,7 @@ fn selection_json(
     { key: "cached", value: int(cached_count(program, decided)) },
     { key: "same_code", value: int(by_code_count(program, decided)) },
     { key: "filtered_out", value: int(program.filtered_out) },
-    { key: "recorded_under", value: string_or_null(program.stored_under) },
+    { key: "recorded_under", value: string_or_null(program.cache_stamp) },
     {
       key: "groups",
       value: Array(range(0, decided.classes.len()).map(|i: Int| group_json(decided, i))),
@@ -1375,7 +1375,7 @@ fn summary_json(c: Summary) -> Json =
     { key: "failed", value: int(c.failed) },
     { key: "timed_out", value: int(c.timed_out) },
     { key: "cached", value: int(c.cached) },
-    { key: "duration_ms", value: millis(c.duration_us) },
+    { key: "duration_ms", value: milliseconds_json(c.duration_us) },
   ])
 
 fn simulation_summary_json(c: SimulationSummary) -> Json =
@@ -1432,7 +1432,7 @@ fn document(
         key: "front_end",
         value: object(
           [
-            { key: "incremental", value: Bool(program.incremental) },
+            { key: "incremental", value: Bool(program.loaded_from_cache) },
             { key: "phases", value: phases_json(program.phases) },
           ].concat(
             program.reuse,

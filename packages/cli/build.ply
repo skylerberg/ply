@@ -5,7 +5,7 @@ import entries
 import std.path (normalize)
 import builder (LoadedProgram, Rejection)
 import builder (builder)
-import artifact_builder (LibraryUnit, BuiltArtifact, Named, Previous, Reach, artifacts,
+import artifact_builder (LibraryUnit, BuiltArtifact, Named, PreviousArtifact, Dependencies, artifacts,
                          with_artifacts)
 import units (emit)
 import compiler.unit (shipped)
@@ -17,7 +17,7 @@ import compiler.front.diagnostics (parse_all)
 import compiler.store.hash.forms (HashOutput)
 import compiler.store.hash (no_hashes)
 import compiler.check.infer.checker (DefinitionInfo)
-import compiler.store.plyx (Header, digest_of, digest_text, domain, encode, encode_named, format,
+import compiler.store.plyx (Header, digest_of, digest_text, domain, encode, encode_named, format_version,
                             library_domain, library_magic, offset_digest)
 import compiler.check.resolve.tables (Diagnostic, Label, error_with_labels, error_at)
 import compiler.check.types (FunctionType)
@@ -34,7 +34,7 @@ import std.list
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string, int, string_or_null,
                  strings, int_or_null)
 import std.pkg (Manifest, render_version)
-import compiler.front.facts (CheckedProgram, pulled_at)
+import compiler.front.facts (CheckedProgram, is_shipped_module)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of, no_module_span)
 import compiler.front.published (analyse)
 import compiler.front.rows (ModuleSpan)
@@ -43,7 +43,7 @@ import semantics
 import signing (Provenance, head_commit, provenance_bytes, provenance_of, read_seed,
                 signatures_path)
 import std.signed
-import std.signed (Signature, countersigned, signed_bytes, signed_of)
+import std.signed (Signature, countersigned, encode_signed, decode_signed)
 import std.bytes
 import std.string
 import std.fmt (size)
@@ -122,7 +122,7 @@ fn definition_of(definition_info: DefinitionInfo) -> Definition =
 
 pub fn definitions_of(view: CheckedProgram) -> List<Definition> =
   view.checked.definitions.filter(|definition_info: DefinitionInfo|
-    !pulled_at(view.frame.packages, view.frame.module_packages, definition_info.at.module)).map(
+    !is_shipped_module(view.frame.packages, view.frame.module_packages, definition_info.at.module)).map(
     definition_of,
   ).sort_by(|a: Definition, b: Definition|
     a.at.module < b.at.module || (a.at.module == b.at.module && a.at.start <= b.at.start))
@@ -228,7 +228,7 @@ fn distinct(ns: List<Named>) -> List<String> =
 fn hashes_of(ns: List<Named>, wanted: String) -> List<String> =
   ns.filter(|named: Named| named.name == wanted).map(|named: Named| named.hash)
 
-fn diff_of(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Diff = {
+fn diff_of(before: List<Named>, after: List<Named>, reaches: List<Dependencies>) -> Diff = {
   let was = distinct(before);
   let now = distinct(after);
   let added = now.filter(|nm: String| !was.contains(nm));
@@ -240,8 +240,8 @@ fn diff_of(before: List<Named>, after: List<Named>, reaches: List<Reach>) -> Dif
     changed: changed,
     dropped: was.filter(|nm: String| !now.contains(nm)),
     unchanged: kept.len() - changed.len(),
-    reached: reaches.filter(|r: Reach|
-      r.reaches.filter(|n: String| moved.contains(n)).len() > 0).map(|r: Reach| r.name),
+    reached: reaches.filter(|r: Dependencies|
+      r.reaches.filter(|n: String| moved.contains(n)).len() > 0).map(|r: Dependencies| r.name),
   }
 }
 
@@ -349,7 +349,7 @@ fn built_json(
     { key: "startup", value: strings(made.startup) },
     { key: "artifact", value: Str(out) },
     { key: "digest", value: Str(sealed.digest) },
-    { key: "format", value: int(format()) },
+    { key: "format", value: int(format_version()) },
     { key: "definitions", value: int(made.definitions) },
     { key: "names", value: int(made.names.len()) },
     { key: "unit", value: Bool(true) },
@@ -392,7 +392,7 @@ fn built_provenance(
     commit: head_commit(root_of(flags).absolute),
   }
 
-fn signed(
+fn write_signature(
   seed: Option<Secret<Bytes>>,
   out: String,
   what: Provenance,
@@ -404,7 +404,7 @@ fn signed(
       let payload = provenance_bytes(what);
       let on_disk = match paths::read_file(at) {
         None -> None,
-        Some(b) -> match signed_of(b) {
+        Some(b) -> match decode_signed(b) {
           Some(x) -> if x.payload == payload { Some(x) } else { None },
           None -> None,
         },
@@ -413,7 +413,7 @@ fn signed(
         match on_disk { Some(x) -> x, None -> { payload: payload, signatures: [] } },
         key,
       );
-      if write_file(at, signed_bytes(next)) {
+      if write_file(at, encode_signed(next)) {
         Ok(
           Some(
             Bytes::hex_of(match next.signatures.at(next.signatures.len() - 1) {
@@ -468,7 +468,7 @@ fn verify_artifact(
       let sig = signatures_path(out);
       match paths::read_file(paths::rooted_path(sig)) {
         None -> verified_output(style, out, x, [], None),
-        Some(b) -> match signed_of(b) {
+        Some(b) -> match decode_signed(b) {
           None ->
             reported(
               style,
@@ -599,7 +599,7 @@ fn write_artifact(
     Err(d) -> reported(style, "build", [d], loaded.places),
     Ok(seed) -> match store_artifact(out, sealed.bytes) {
       Err(reason) -> reported(style, "build", reason.diagnostics, loaded.places),
-      Ok(_) -> match signed(
+      Ok(_) -> match write_signature(
           seed,
           out,
           built_provenance(flags, loaded, "program", made.entry, sealed),
@@ -712,7 +712,7 @@ fn build_entry(
 pub fn run(
   flags: Flags,
   schema: Option<String>,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_reached} = {
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let t: TimedLoad = timed_uncached(flags.paths, flags.verify_dependencies);
   match program_view(t.program) {
@@ -866,7 +866,7 @@ fn write_library(
           Err(d) -> reported(style, "build", [d], p.places),
           Ok(seed) -> match store_artifact(out, k.sealed.bytes) {
             Err(reason) -> reported(style, "build", reason.diagnostics, p.places),
-            Ok(_) -> match signed(
+            Ok(_) -> match write_signature(
                 seed,
                 out,
                 built_provenance(flags, p, "library", library_name(manifest), k.sealed),
@@ -935,7 +935,7 @@ fn library_json(
     { key: "definitions", value: int(own.len()) },
     { key: "artifact", value: Str(out) },
     { key: "digest", value: Str(sealed.digest) },
-    { key: "format", value: int(format()) },
+    { key: "format", value: int(format_version()) },
     { key: "unit", value: Bool(unit.payload.len() > 0) },
     { key: "artifact_bytes", value: int(sealed.bytes.len()) },
     { key: "signed_by", value: string_or_null(signer) },
@@ -1148,7 +1148,7 @@ fn build_with(
   flags: Flags,
   p: Result<LoadedProgram, Rejection>,
   m: Result<BuiltArtifact, Rejection>,
-  was: Result<Previous, Rejection>,
+  was: Result<PreviousArtifact, Rejection>,
   stores: Bool,
 ) -> CommandOutput / {abort.raise} =
   handle {
@@ -1210,7 +1210,7 @@ test "the object keys off `command` and `exit_code`, and names the file it wrote
   assert(text.contains("\"unit\":true"));
   assert(text.contains("\"artifact_bytes\":178"));
   assert(text.contains("\"root\":\"/p\""));
-  assert(text.contains("\"format\":" ++ format().to_string()))
+  assert(text.contains("\"format\":" ++ format_version().to_string()))
 }
 
 test "`-o` names the file, and the entry's module names it otherwise" {
@@ -1232,7 +1232,7 @@ test "`--digest` writes the one line a deployment pins and nothing else" {
 }
 
 test "`--diff` reports against a deployed artifact and writes no file" {
-  let was: Previous = { digest: "b3:000000000000", names: [{ name: "m.helper", hash: "cc" }] };
+  let was: PreviousArtifact = { digest: "b3:000000000000", names: [{ name: "m.helper", hash: "cc" }] };
   let result = build_with(
     { ..no_flags(), diff: Some("old.plyx"), json: true },
     Ok(a_load()),

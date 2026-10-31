@@ -2,7 +2,7 @@
 //!
 //! A mechanism is an exchange of byte strings that a protocol frames: SMTP's `AUTH` in lines of
 //! base64, postgres in messages of its own. `begin` returns the client's first message, and
-//! `respond` returns its reply to each server message. `proven` reports whether the server may now
+//! `respond` returns its reply to each server message. `is_authenticated` reports whether the server may now
 //! treat the exchange as a success. Under SCRAM that is only once the server has also proved it
 //! knows the password. Nothing here reads a socket, a clock or the host's entropy: the nonce SCRAM
 //! needs is an argument, and so is the most work a server may request.
@@ -12,7 +12,7 @@
 //! `Secret<Bytes>` from the moment it is given, as `std.config` returns one, and is never a plain
 //! value here. SCRAM stretches and keys the password in the runtime without revealing it, and the
 //! mechanisms that send the credential itself put it into their messages as a secret. So every
-//! `Response` is secret, and `said` is the only way to get at it: a protocol frames it and writes
+//! `Response` is secret, and `secret_bytes` is the only way to get at it: a protocol frames it and writes
 //! it to a connection with `std.net`'s `send_secret`, as SMTP sends it in base64 on an `AUTH` line.
 //! `reveals` reports whether a mechanism sends the credential itself. A protocol allows that only
 //! on a connection no one else can read. A name and a password are taken as their UTF-8 bytes.
@@ -179,7 +179,7 @@ fn response_text(r: Response) -> String = "Response(****)"
 
 /// A response's bytes, as a secret, for the protocol to frame and write with `std.net`'s
 /// `send_secret`.
-pub fn said(r: Response) -> Secret<Bytes> = match r { Response(bytes) -> bytes }
+pub fn secret_bytes(r: Response) -> Secret<Bytes> = match r { Response(bytes) -> bytes }
 
 /// A response that contains nothing secret.
 fn plain_response(bytes: Bytes) -> Response = Response(Secret::of_bytes(bytes))
@@ -228,12 +228,12 @@ pub fn respond(x: Exchange, challenge: Bytes) -> ExchangeStep / {sasl.fail, abor
       { exchange: LoginSecret(secret), response: plain_response(Bytes::of_string(user)) },
     LoginSecret(secret) -> { exchange: Finished(true), response: Response(secret) },
     ScramFirst(secret, bare, most) -> if !challenge.is_utf8() { sasl.fail(BadChallenge) } else {
-      let said = String::of_bytes(challenge);
-      match scram_challenge(said) {
+      let secret_bytes = String::of_bytes(challenge);
+      match scram_challenge(secret_bytes) {
         None -> sasl.fail(BadChallenge),
         Some(asked) -> if asked.iterations > most { sasl.fail(TooManyIterations(asked.iterations)) }
         else {
-          match scram_final(Unbound, secret, bare, said, asked) {
+          match scram_final(Unbound, secret, bare, secret_bytes, asked) {
             None -> sasl.fail(BadChallenge),
             Some(proof) ->
               {
@@ -257,7 +257,7 @@ pub fn respond(x: Exchange, challenge: Bytes) -> ExchangeStep / {sasl.fail, abor
 
 /// Whether the server may now treat the exchange as a success. A client that trusts a server's
 /// success message before this is `true` has skipped the checks the mechanism requires.
-pub fn proven(x: Exchange) -> Bool =
+pub fn is_authenticated(x: Exchange) -> Bool =
   match x { Finished(ok) -> ok, BearerSent(_) -> true, _ -> false }
 
 fn is_nonce(nonce: String) -> Bool =
@@ -322,8 +322,8 @@ fn scram_name(user: String) -> String =
   })
 
 /// One `name=value` out of a comma-separated message, or `None` when it is not there.
-fn scram_attribute(said: String, attribute: String) -> Option<String> / {abort.raise} =
-  said.split(",").fold(None, |acc: Option<String>, part: String|
+fn scram_attribute(secret_bytes: String, attribute: String) -> Option<String> / {abort.raise} =
+  secret_bytes.split(",").fold(None, |acc: Option<String>, part: String|
     match acc {
       Some(found) -> Some(found),
       None -> if part.starts_with(attribute ++ "=") {
@@ -414,7 +414,7 @@ fn setting(nonce: String) -> Options =
 fn begun(m: Mechanism, c: Result<Credential, Error>, s: Options) -> Result<ExchangeStart, Error> =
   match c { Err(reason) -> Err(reason), Ok(held) -> try { begin(m, held, s) } }
 
-fn tim() -> Result<Credential, Error> =
+fn tim_password_credential() -> Result<Credential, Error> =
   try { password("tim", Secret::of_bytes(b"tanstaaftanstaaf")) }
 
 fn token() -> Result<Credential, Error> =
@@ -424,14 +424,14 @@ fn token() -> Result<Credential, Error> =
 
 fn first_of(b: Result<ExchangeStart, Error>) -> Option<Secret<Bytes>> =
   match b {
-    Ok(started) -> match started.first { Some(first) -> Some(said(first)), None -> None },
+    Ok(started) -> match started.first { Some(first) -> Some(secret_bytes(first)), None -> None },
     Err(_) -> None,
   }
 
 /// Whether a response is exactly `bytes`. A response is compared whole, as any secret is.
-fn says(r: Response, bytes: Bytes) -> Bool = said(r) == Secret::of_bytes(bytes)
+fn says(r: Response, bytes: Bytes) -> Bool = secret_bytes(r) == Secret::of_bytes(bytes)
 
-fn returned(
+fn respond_all(
   b: Result<ExchangeStart, Error>,
   challenges: List<Bytes>,
 ) -> Result<ExchangeStep, Error> / {abort.raise} =
@@ -446,34 +446,34 @@ fn returned(
   }
 
 test "PLAIN sends RFC 4616's message first, and nothing follows it" {
-  let started = begun(Plain, tim(), setting("unused"));
+  let started = begun(Plain, tim_password_credential(), setting("unused"));
   assert(first_of(started) == Some(Secret::of_bytes(b"\x00tim\x00tanstaaftanstaaf")));
-  assert_eq(result_map_proven(started), Ok(true));
-  assert_eq(returned(started, [b"more?"]), Err(BadChallenge))
+  assert_eq(result_is_authenticated(started), Ok(true));
+  assert_eq(respond_all(started, [b"more?"]), Err(BadChallenge))
 }
 
-fn result_map_proven(b: Result<ExchangeStart, Error>) -> Result<Bool, Error> =
-  match b { Ok(started) -> Ok(proven(started.exchange)), Err(reason) -> Err(reason) }
+fn result_is_authenticated(b: Result<ExchangeStart, Error>) -> Result<Bool, Error> =
+  match b { Ok(started) -> Ok(is_authenticated(started.exchange)), Err(reason) -> Err(reason) }
 
 test "LOGIN waits for prompts, and sends the name and then the password" {
-  let started = begun(Login, tim(), setting("unused"));
+  let started = begun(Login, tim_password_credential(), setting("unused"));
   assert(first_of(started) == None);
-  assert_eq(result_map_proven(started), Ok(false));
-  match returned(started, [b"Username:"]) {
+  assert_eq(result_is_authenticated(started), Ok(false));
+  match respond_all(started, [b"Username:"]) {
     Ok(a) -> {
       assert(says(a.response, b"tim"));
-      assert(!proven(a.exchange))
+      assert(!is_authenticated(a.exchange))
     },
     Err(_) -> panic("LOGIN rejected its first question"),
   };
-  match returned(started, [b"Username:", b"Password:"]) {
+  match respond_all(started, [b"Username:", b"Password:"]) {
     Ok(a) -> {
       assert(says(a.response, b"tanstaaftanstaaf"));
-      assert(proven(a.exchange))
+      assert(is_authenticated(a.exchange))
     },
     Err(_) -> panic("LOGIN rejected its second question"),
   };
-  assert_eq(returned(started, [b"Username:", b"Password:", b"Again:"]), Err(BadChallenge))
+  assert_eq(respond_all(started, [b"Username:", b"Password:", b"Again:"]), Err(BadChallenge))
 }
 
 // RFC 7628 §4.1's SMTP exchange, and §4.3's failure.
@@ -487,11 +487,11 @@ test "OAUTHBEARER sends RFC 7628's message, and replies to a rejection with one 
         ),
       ),
   );
-  assert_eq(result_map_proven(started), Ok(true));
-  match returned(started, [b"{\"status\":\"invalid_token\"}"]) {
+  assert_eq(result_is_authenticated(started), Ok(true));
+  match respond_all(started, [b"{\"status\":\"invalid_token\"}"]) {
     Ok(a) -> {
       assert(says(a.response, b"\x01"));
-      assert(!proven(a.exchange))
+      assert(!is_authenticated(a.exchange))
     },
     Err(_) -> panic("a rejection was not responded to"),
   }
@@ -520,10 +520,10 @@ test "XOAUTH2 sends the user and the token, and replies to a rejection with noth
         ),
       ),
   );
-  match returned(started, [b"{\"status\":\"401\"}"]) {
+  match respond_all(started, [b"{\"status\":\"401\"}"]) {
     Ok(a) -> {
       assert(says(a.response, b""));
-      assert(!proven(a.exchange))
+      assert(!is_authenticated(a.exchange))
     },
     Err(_) -> panic("a rejection was not responded to"),
   }
@@ -569,16 +569,16 @@ test "SCRAM matches RFC 7677's worked example" {
   }
 }
 
-fn pencil() -> Result<Credential, Error> = try { password("user", Secret::of_bytes(b"pencil")) }
+fn pencil_password_credential() -> Result<Credential, Error> = try { password("user", Secret::of_bytes(b"pencil")) }
 
 fn example_first() -> Bytes =
   b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
 
 test "a SCRAM exchange follows RFC 7677, and only the server's correct proof completes it" {
-  let started = begun(ScramSha256, pencil(), setting("rOprNGfwEbeRWgbNEkqO"));
+  let started = begun(ScramSha256, pencil_password_credential(), setting("rOprNGfwEbeRWgbNEkqO"));
   assert(first_of(started) == Some(Secret::of_bytes(b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO")));
-  assert_eq(result_map_proven(started), Ok(false));
-  match returned(started, [example_first()]) {
+  assert_eq(result_is_authenticated(started), Ok(false));
+  match respond_all(started, [example_first()]) {
     Ok(a) -> {
       assert(
         says(
@@ -586,44 +586,44 @@ test "a SCRAM exchange follows RFC 7677, and only the server's correct proof com
           b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
         ),
       );
-      assert(!proven(a.exchange))
+      assert(!is_authenticated(a.exchange))
     },
     Err(_) -> panic("the example's challenge was rejected"),
   };
-  match returned(started, [example_first(), b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="]) {
+  match respond_all(started, [example_first(), b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="]) {
     Ok(a) -> {
       assert(says(a.response, b""));
-      assert(proven(a.exchange))
+      assert(is_authenticated(a.exchange))
     },
     Err(_) -> panic("the example's proof was rejected"),
   };
   assert_eq(
-    returned(started, [example_first(), b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]),
+    respond_all(started, [example_first(), b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]),
     Err(BadServerProof),
   );
-  assert_eq(returned(started, [example_first(), b"e=invalid-proof"]), Err(BadServerProof))
+  assert_eq(respond_all(started, [example_first(), b"e=invalid-proof"]), Err(BadServerProof))
 }
 
 test "a SCRAM server must echo the client's nonce, stay within the iteration limit, and send readable messages" {
-  let started = begun(ScramSha256, pencil(), setting("rOprNGfwEbeRWgbNEkqO"));
+  let started = begun(ScramSha256, pencil_password_credential(), setting("rOprNGfwEbeRWgbNEkqO"));
   assert_eq(
-    returned(started, [
+    respond_all(started, [
       b"r=another%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
     ]),
     Err(BadChallenge),
   );
   assert_eq(
-    returned(started, [b"r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=100001"]),
+    respond_all(started, [b"r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=100001"]),
     Err(TooManyIterations(100001)),
   );
-  assert_eq(returned(started, [b"\xff\xfe"]), Err(BadChallenge));
-  assert_eq(returned(started, [b"e=unknown-user"]), Err(BadChallenge));
+  assert_eq(respond_all(started, [b"\xff\xfe"]), Err(BadChallenge));
+  assert_eq(respond_all(started, [b"e=unknown-user"]), Err(BadChallenge));
   assert_eq(
-    returned(started, [b"m=ext,r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"]),
+    respond_all(started, [b"m=ext,r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"]),
     Err(BadChallenge),
   );
-  assert_eq(begun(ScramSha256, pencil(), setting("a,b")), Err(BadNonce));
-  assert_eq(begun(ScramSha256, pencil(), setting("")), Err(BadNonce))
+  assert_eq(begun(ScramSha256, pencil_password_credential(), setting("a,b")), Err(BadNonce));
+  assert_eq(begun(ScramSha256, pencil_password_credential(), setting("")), Err(BadNonce))
 }
 
 /// A password read from configuration as text, made secret as `std.config` does.
@@ -631,9 +631,9 @@ fn configured_pencil() -> Result<Credential, Error> =
   try { password("user", Secret::of_string("pencil").bytes()) }
 
 test "a secret password made from text works under each mechanism as its bytes do" {
-  let proofs = [pencil(), configured_pencil()].map(|c: Result<Credential, Error>|
+  let proofs = [pencil_password_credential(), configured_pencil()].map(|c: Result<Credential, Error>|
     result_map_response(
-      returned(begun(ScramSha256, c, setting("rOprNGfwEbeRWgbNEkqO")), [
+      respond_all(begun(ScramSha256, c, setting("rOprNGfwEbeRWgbNEkqO")), [
         example_first(),
         b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
       ]),
@@ -641,7 +641,7 @@ test "a secret password made from text works under each mechanism as its bytes d
   assert_eq(proofs, [Ok(true), Ok(true)]);
   assert(
     first_of(begun(Plain, configured_pencil(), setting("n")))
-      == first_of(begun(Plain, pencil(), setting("n"))),
+      == first_of(begun(Plain, pencil_password_credential(), setting("n"))),
   );
   assert(
     mechanisms().all(|m: Mechanism|
@@ -655,7 +655,7 @@ test "a secret password made from text works under each mechanism as its bytes d
 }
 
 fn result_map_response(a: Result<ExchangeStep, Error>) -> Result<Bool, Error> =
-  match a { Ok(done) -> Ok(proven(done.exchange)), Err(reason) -> Err(reason) }
+  match a { Ok(done) -> Ok(is_authenticated(done.exchange)), Err(reason) -> Err(reason) }
 
 test "a scram user name escapes what separates fields" {
   assert_eq(scram_first_bare("a=b,c", "n"), "n=a=3Db=2Cc,r=n");
@@ -761,12 +761,12 @@ test "a mechanism takes the credential that is its kind, and no other" {
   assert_eq(begun(Plain, token(), setting("n")), Err(WrongCredential));
   assert_eq(begun(Login, token(), setting("n")), Err(WrongCredential));
   assert_eq(begun(ScramSha256, token(), setting("n")), Err(WrongCredential));
-  assert_eq(begun(OAuthBearer, tim(), setting("n")), Err(WrongCredential));
-  assert_eq(begun(XOAuth2, tim(), setting("n")), Err(WrongCredential));
+  assert_eq(begun(OAuthBearer, tim_password_credential(), setting("n")), Err(WrongCredential));
+  assert_eq(begun(XOAuth2, tim_password_credential(), setting("n")), Err(WrongCredential));
   assert(
     mechanisms().all(|m: Mechanism|
-      match tim() {
-        Ok(c) -> supports(c, m) == result_is_begun(begun(m, tim(), setting("n"))),
+      match tim_password_credential() {
+        Ok(c) -> supports(c, m) == result_is_begun(begun(m, tim_password_credential(), setting("n"))),
         Err(_) -> false,
       }),
   )
@@ -788,7 +788,7 @@ test "a mechanism is found by its name in any case, and only SCRAM never sends t
 }
 
 test "nothing shows a credential's secret, in the credential or in an exchange that contains it" {
-  let held = tim();
+  let held = tim_password_credential();
   assert_eq(show(held), "Ok(password(\"tim\", ****))");
   assert_eq(show(token()), "Ok(bearer(\"user@example.com\", ****))");
   let exchanges = [
@@ -809,7 +809,7 @@ test "nothing shows a credential's secret, in the credential or in an exchange t
     show(begun(Plain, held, setting("n"))),
     "Ok({exchange: Exchange(****), first: Some(Response(****))})",
   );
-  assert(!show(returned(begun(Login, held, setting("n")), [b"Username:"])).contains("tanstaaf"))
+  assert(!show(respond_all(begun(Login, held, setting("n")), [b"Username:"])).contains("tanstaaf"))
 }
 
 test "what a credential shows is its user alone, whatever its secret" {

@@ -185,7 +185,7 @@ pub type Error = new { at: Int, reason: ErrorKind }
 pub type WriteError = new { index: Int, reason: ErrorKind }
 
 /// Why an entry may not be extracted.
-pub type Danger =
+pub type UnsafeReason =
   /// An empty path, or a path or a link with a NUL.
   | NoName
   /// A path that starts at the file system's root.
@@ -216,7 +216,7 @@ pub type Danger =
 
 /// An entry a plan rejected: its index among the entries, its path as the archive writes it, and
 /// why.
-pub type UnsafeEntry = new { index: Int, path: String, reason: Danger }
+pub type UnsafeEntry = new { index: Int, path: String, reason: UnsafeReason }
 
 /// The effects this module raises when it rejects its input.
 pub effect tar {
@@ -243,7 +243,7 @@ fn text(header_block: Bytes, from: Int, width: Int) -> Bytes / {abort.raise} = {
 /// `None` for anything else and for a number past an `Int`.
 fn number(header_block: Bytes, from: Int, width: Int) -> Option<Int> / {abort.raise} = {
   let field = header_block.slice(from, from + width);
-  if field.at(0) >= 0x80 { binary(field) } else {
+  if field.at(0) >= 0x80 { twos_complement_number(field) } else {
     let start = field.skip(0, b" \x00");
     let end = field.skip(start, b"01234567");
     if end < width && field.at(end) != 0x20 && field.at(end) != 0 { None }
@@ -251,7 +251,7 @@ fn number(header_block: Bytes, from: Int, width: Int) -> Option<Int> / {abort.ra
   }
 }
 
-fn binary(field: Bytes) -> Option<Int> / {abort.raise} = {
+fn twos_complement_number(field: Bytes) -> Option<Int> / {abort.raise} = {
   let negative = field.at(0) & 0x40 != 0;
   let flip = if negative { 0xFF } else { 0 };
   let magnitude = range(0, field.len()).fold(Some(0), |so_far: Option<Int>, i: Int|
@@ -266,7 +266,7 @@ fn binary(field: Bytes) -> Option<Int> / {abort.raise} = {
 /// Sizes at or above this are rejected: nothing in memory is that large, and offsets stay `Int`s.
 fn size_ceiling() -> Int = 0x1000_0000_0000_0000
 
-fn natural(header_block: Bytes, at: Int, from: Int, width: Int) -> Int / {tar.fail, abort.raise} =
+fn field_number(header_block: Bytes, at: Int, from: Int, width: Int) -> Int / {tar.fail, abort.raise} =
   match number(header_block, from, width) {
     Some(n) -> if n < 0 || n >= size_ceiling() { fail(at, BadNumber) } else { n },
     None -> fail(at, BadNumber),
@@ -322,17 +322,17 @@ fn read_raw_header(seen: Bytes, at: Int) -> RawHeader / {tar.fail, abort.raise} 
     let device = format != Old && (flag == 51 || flag == 52);
     {
       name: text(header_block, 0, 100),
-      mode: natural(header_block, at, 100, 8),
-      uid: natural(header_block, at, 108, 8),
-      gid: natural(header_block, at, 116, 8),
-      size: natural(header_block, at, 124, 12),
+      mode: field_number(header_block, at, 100, 8),
+      uid: field_number(header_block, at, 108, 8),
+      gid: field_number(header_block, at, 116, 8),
+      size: field_number(header_block, at, 124, 12),
       seconds: match number(header_block, 136, 12) { Some(n) -> n, None -> fail(at, BadNumber) },
       flag: flag,
       link: text(header_block, 157, 100),
       uname: if format == Old { b"" } else { text(header_block, 265, 32) },
       gname: if format == Old { b"" } else { text(header_block, 297, 32) },
-      major: if device { natural(header_block, at, 329, 8) } else { 0 },
-      minor: if device { natural(header_block, at, 337, 8) } else { 0 },
+      major: if device { field_number(header_block, at, 329, 8) } else { 0 },
+      minor: if device { field_number(header_block, at, 337, 8) } else { 0 },
       prefix: if format == Ustar { text(header_block, 345, 155) } else { b"" },
       continued: format == Gnu && flag == 83 && header_block.at(482) != 0,
     }
@@ -376,8 +376,8 @@ fn padded(size: Int) -> Int = (size + 511) / 512 * 512
 
 /// How much of a directory's `stored` name is the name: all but its trailing slashes, and at least
 /// one byte. `n` is the name's length.
-pub fn unslashed_length(stored: Bytes, n: Int) -> Int / {abort.raise} =
-  if n > 1 && stored.at(n - 1) == 0x2F { unslashed_length(stored, n - 1) } else { n }
+pub fn slash_trimmed_length(stored: Bytes, n: Int) -> Int / {abort.raise} =
+  if n > 1 && stored.at(n - 1) == 0x2F { slash_trimmed_length(stored, n - 1) } else { n }
 
 // --- Extended headers -----------------------------------------------------------
 
@@ -457,7 +457,7 @@ fn instant_of(text: Bytes) -> Option<Instant> / {abort.raise} = {
 fn instant_text(nanos: Int) -> Bytes / {abort.raise} = {
   let size = if nanos < 0 { 0 - nanos } else { nanos };
   let fraction = Bytes::of_string(Int::to_string(1000000000 + size % 1000000000));
-  let kept = unzeroed_length(fraction, 10);
+  let kept = zero_trimmed_length(fraction, 10);
   Bytes::concat_all([
     if nanos < 0 { b"-" } else { b"" },
     ascii_of_int(size / 1000000000),
@@ -466,8 +466,8 @@ fn instant_text(nanos: Int) -> Bytes / {abort.raise} = {
 }
 
 /// How much of `digits` is left without its trailing zeros, its first digit kept.
-fn unzeroed_length(digits: Bytes, n: Int) -> Int / {abort.raise} =
-  if n > 1 && digits.at(n - 1) == 0x30 { unzeroed_length(digits, n - 1) } else { n }
+fn zero_trimmed_length(digits: Bytes, n: Int) -> Int / {abort.raise} =
+  if n > 1 && digits.at(n - 1) == 0x30 { zero_trimmed_length(digits, n - 1) } else { n }
 
 // --- Reading: one member at a time ----------------------------------------------
 
@@ -599,7 +599,7 @@ fn finish_member(
   let kind = if pax_records.keys().any(|keyword: String| keyword.starts_with("GNU.sparse.")) {
     Sparse
   } else { kind_of(h.flag, stored) };
-  let path = if kind == Directory { stored.slice(0, unslashed_length(stored, stored.len())) }
+  let path = if kind == Directory { stored.slice(0, slash_trimmed_length(stored, stored.len())) }
   else { stored };
   let link = match pending.link {
     Some(long) -> long,
@@ -770,7 +770,7 @@ fn unwritable<a>(index: Int, reason: ErrorKind) -> a / {tar.unwritable} =
   tar.unwritable({ index: index, reason: reason })
 
 /// The largest numbers that seven and eleven octal digits can write.
-fn seven_digits() -> Int = 0x1F_FFFF
+fn max_octal_field() -> Int = 0x1F_FFFF
 fn eleven_digits() -> Int = 0x1_FFFF_FFFF
 
 /// Why no header can be written for an entry with this header and `size` bytes of data, if none
@@ -783,8 +783,8 @@ fn header_error(h: Header, size: Int) -> Option<ErrorKind> = {
   else if flag_of(h.kind) == None { Some(BadKind) }
   else if size > 0 && !has_data(h.kind) { Some(StrayData) }
   else if h.mode < 0 || h.mode > 0xFFF || h.uid < 0 || h.gid < 0 || h.major < 0 || h.minor < 0
-      || h.major > seven_digits()
-      || h.minor > seven_digits()
+      || h.major > max_octal_field()
+      || h.minor > max_octal_field()
       || (!device && (h.major != 0 || h.minor != 0))
       || size >= size_ceiling()
       || checked_neg(nanos_at(h.modified)) == None { Some(BadNumber) }
@@ -827,8 +827,8 @@ fn header_bytes(index: Int, h: Header, size: Int) -> Bytes / {tar.unwritable, ab
         { keyword: "path", value: stored, written: !plain_path },
         { keyword: "linkpath", value: link, written: !plain_link },
         { keyword: "size", value: ascii_of_int(size), written: size > eleven_digits() },
-        { keyword: "uid", value: ascii_of_int(h.uid), written: h.uid > seven_digits() },
-        { keyword: "gid", value: ascii_of_int(h.gid), written: h.gid > seven_digits() },
+        { keyword: "uid", value: ascii_of_int(h.uid), written: h.uid > max_octal_field() },
+        { keyword: "gid", value: ascii_of_int(h.gid), written: h.gid > max_octal_field() },
         { keyword: "uname", value: uname, written: !plain_uname },
         { keyword: "gname", value: gname, written: !plain_gname },
         { keyword: "mtime", value: instant_text(nanos), written: !plain_time },
@@ -847,8 +847,8 @@ fn header_bytes(index: Int, h: Header, size: Int) -> Bytes / {tar.unwritable, ab
         else if at == 0 { stored }
         else { stored.slice(at + 1, stored.len()) },
         mode: h.mode,
-        uid: if h.uid > seven_digits() { 0 } else { h.uid },
-        gid: if h.gid > seven_digits() { 0 } else { h.gid },
+        uid: if h.uid > max_octal_field() { 0 } else { h.uid },
+        gid: if h.gid > max_octal_field() { 0 } else { h.gid },
         size: if size > eleven_digits() { 0 } else { size },
         seconds: if plain_time { seconds } else { min(max(seconds, 0), eleven_digits()) },
         flag: match flag_of(h.kind) { Some(flag) -> flag, None -> 48 },
@@ -933,7 +933,7 @@ type Plan = {
 /// The entry a plan is checking.
 type EntryPath = { index: Int, path: String }
 
-fn danger<a>(entry: EntryPath, reason: Danger) -> a / {tar.unsafe} =
+fn danger<a>(entry: EntryPath, reason: UnsafeReason) -> a / {tar.unsafe} =
   tar.unsafe({ index: entry.index, path: entry.path, reason: reason })
 
 fn joined(segments: List<String>) -> String = String::join(segments, "/")
@@ -948,7 +948,7 @@ fn resolve_path(
   made: Map<String, PlannedPath>,
   text: String,
   from: List<String>,
-  climbing: Danger,
+  climbing: UnsafeReason,
 ) -> { at: List<String>, passed: List<List<String>> } / {tar.unsafe} =
   text.split("/").fold(
     { at: from, passed: [] },
@@ -1071,7 +1071,7 @@ pub fn plan(entries: List<Entry>) -> Result<List<Operation>, UnsafeEntry> =
 /// ones and `.` dropped and each `..` resolved. `Err` for an empty path, one with a NUL, an
 /// absolute one, and one that climbs out. This checks a path alone; `plan` checks it against what
 /// the entries before it made.
-pub fn safe_path(path: String) -> Result<String, Danger> =
+pub fn safe_path(path: String) -> Result<String, UnsafeReason> =
   match try { entry_segments({ index: 0, path: path }, Map::new()) } {
     Ok(at) -> Ok(if at.len() == 0 { "." } else { joined(at) }),
     Err(rejected) -> Err(rejected.reason),
@@ -1080,19 +1080,19 @@ pub fn safe_path(path: String) -> Result<String, Danger> =
 // --- Extraction onto a file system ----------------------------------------------
 
 /// What became of one operation of a plan.
-pub type Outcome =
+pub type OperationOutcome =
   /// It was carried out.
   | Extracted
   /// The file system does not contain what the plan made, and nothing was written: `ThroughLink`
   /// where a directory above the path is reached through a link, or under another name than the
   /// plan gave it; `Replaces` where the path contains something the operation may not replace;
   /// `LinkMissing` where a hard link's target is not a file.
-  | Barred(Danger)
+  | Barred(UnsafeReason)
   /// The file system failed to do it.
   | Failed(FileError)
 
 /// An operation's path beneath the directory extracted into, and what became of it.
-pub type ExtractionResult = new { path: String, outcome: Outcome }
+pub type ExtractionResult = new { path: String, outcome: OperationOutcome }
 
 /// What a directory waits to be given until everything beneath it is made: its mode, its time if
 /// the archive gave one, and which operation made it.
@@ -1126,7 +1126,7 @@ fn begin_extraction<[l]>(into: String) -> Extraction / {fs.canonical[l]} = {
 
 /// Why nothing may be written in `dir`, a directory beneath the extraction's, if that is so: it is
 /// not there, or the host reaches it through a link or under another name than the plan's.
-fn check_directory<[l]>(x: Extraction, dir: String) -> Option<Outcome> / {fs.canonical[l]} =
+fn check_directory<[l]>(x: Extraction, dir: String) -> Option<OperationOutcome> / {fs.canonical[l]} =
   match x.base {
     None -> Some(Failed(fs::NotFound)),
     Some(base) -> {
@@ -1140,14 +1140,14 @@ fn check_directory<[l]>(x: Extraction, dir: String) -> Option<Outcome> / {fs.can
     },
   }
 
-fn record_outcome(x: Extraction, index: Int, path: String, outcome: Outcome) -> Extraction = {
-  let carry_out: ExtractionResult = { path: path, outcome: outcome };
-  { ..x, outcomes: x.outcomes.insert(index, carry_out) }
+fn record_outcome(x: Extraction, index: Int, path: String, outcome: OperationOutcome) -> Extraction = {
+  let apply_operation: ExtractionResult = { path: path, outcome: outcome };
+  { ..x, outcomes: x.outcomes.insert(index, apply_operation) }
 }
 
 /// Why a new file cannot be created at `full`, if that is so. A file already there is removed, and
 /// anything else is in the way.
-fn clear_path<[l]>(full: String) -> Option<Outcome> / {fs.stat[l], fs.remove[l]} =
+fn clear_path<[l]>(full: String) -> Option<OperationOutcome> / {fs.stat[l], fs.remove[l]} =
   match fs.stat[l](full) {
     None -> None,
     Some(found) -> if found.kind != fs::File { Some(Barred(Replaces)) }
@@ -1160,7 +1160,7 @@ fn clear_path<[l]>(full: String) -> Option<Outcome> / {fs.stat[l], fs.remove[l]}
 fn open_new_file<[l]>(
   x: Extraction,
   path: String,
-) -> Result<Int, Outcome> / {fs.canonical[l], fs.stat[l], fs.remove[l], fs.open[l]} = {
+) -> Result<Int, OperationOutcome> / {fs.canonical[l], fs.stat[l], fs.remove[l], fs.open[l]} = {
   let full = full_path(x.into, path);
   match check_directory[l](x, parent_path(path)) {
     Some(outcome) -> Err(outcome),
@@ -1175,7 +1175,7 @@ fn open_new_file<[l]>(
 }
 
 /// Closes the descriptor `open_new_file` returned, if it returned one.
-fn close_new_file<[l]>(opened: Result<Int, Outcome>) -> Unit / {fs.close[l]} =
+fn close_new_file<[l]>(opened: Result<Int, OperationOutcome>) -> Unit / {fs.close[l]} =
   match opened {
     Ok(file) -> {
       fs.close[l](file);
@@ -1192,7 +1192,7 @@ fn finish_file<[l]>(
   written: Bool,
   mode: Int,
   modified: Option<Instant>,
-) -> Outcome / {fs.remove[l], fs.set_mode[l], fs.set_modified[l]} = {
+) -> OperationOutcome / {fs.remove[l], fs.set_mode[l], fs.set_modified[l]} = {
   let full = full_path(x.into, path);
   if !written {
     fs.remove[l](full);
@@ -1215,7 +1215,7 @@ fn make_hard_link<[l]>(
   x: Extraction,
   path: String,
   target: String,
-) -> Outcome / {fs.canonical[l], fs.stat[l], fs.remove[l], fs.link[l]} = {
+) -> OperationOutcome / {fs.canonical[l], fs.stat[l], fs.remove[l], fs.link[l]} = {
   let full = full_path(x.into, path);
   let to = full_path(x.into, target);
   if path == target { Extracted } else {
@@ -1265,7 +1265,7 @@ fn make_directory<[l]>(
 
 /// The extraction after one operation of its plan: a directory is made and waits for its mode, a
 /// file is written whole, a hard link is made, and a symbolic link waits for everything else.
-fn carry_out<[l]>(
+fn apply_operation<[l]>(
   x: Extraction,
   index: Int,
   op: Operation,
@@ -1280,8 +1280,8 @@ fn carry_out<[l]>(
         path,
         bracket(
           || open_new_file[l](x, path),
-          |opened: Result<Int, Outcome>| close_new_file[l](opened),
-          |opened: Result<Int, Outcome>|
+          |opened: Result<Int, OperationOutcome>| close_new_file[l](opened),
+          |opened: Result<Int, OperationOutcome>|
             match opened {
               Err(outcome) -> outcome,
               Ok(file) -> finish_file[l](x, path, fs.write_chunk[l](file, data), mode, modified),
@@ -1344,10 +1344,10 @@ fn finish_extraction<[l]>(
 pub fn extract<[l]>(
   steps: List<Operation>,
   into: String,
-) -> List<Outcome> / {fs.canonical[l], fs.stat[l], fs.create_dir[l], fs.remove[l], fs.open[l], fs.write_chunk[l], fs.close[l], fs.link[l], fs.symlink[l], fs.set_mode[l], fs.set_modified[l]} = {
+) -> List<OperationOutcome> / {fs.canonical[l], fs.stat[l], fs.create_dir[l], fs.remove[l], fs.open[l], fs.write_chunk[l], fs.close[l], fs.link[l], fs.symlink[l], fs.set_mode[l], fs.set_modified[l]} = {
   let done = enumerate(steps).fold(
     begin_extraction[l](into),
-    |x: Extraction, s: { index: Int, value: Operation }| carry_out[l](x, s.index, s.value, None),
+    |x: Extraction, s: { index: Int, value: Operation }| apply_operation[l](x, s.index, s.value, None),
   );
   finish_extraction[l](done).map(|c: ExtractionResult| c.outcome)
 }
@@ -1505,7 +1505,7 @@ fn write_member_data<[l], [r] | e>(
   source: Scoped<Source<| e>, [r]>,
   limits: Limits,
   window: Int,
-  opened: Result<Int, Outcome>,
+  opened: Result<Int, OperationOutcome>,
 ) -> { reading: ReaderState, written: Bool } / {scoped.read[r], tar.fail, fs.write_chunk[l], abort.raise | e} =
   iterate(
     { reading: r, written: true },
@@ -1546,8 +1546,8 @@ fn unpack_member<[l], [r] | e>(
         WriteFile(path, mode, _) ->
           bracket(
             || open_new_file[l](u.x, path),
-            |opened: Result<Int, Outcome>| close_new_file[l](opened),
-            |opened: Result<Int, Outcome>| {
+            |opened: Result<Int, OperationOutcome>| close_new_file[l](opened),
+            |opened: Result<Int, OperationOutcome>| {
               let poured = write_member_data[l](u.reading, source, limits, window, opened);
               let outcome = match opened {
                 Err(barring) -> barring,
@@ -1556,7 +1556,7 @@ fn unpack_member<[l], [r] | e>(
               { ..u, reading: poured.reading, x: record_outcome(u.x, at, path, outcome) }
             },
           ),
-        other -> { ..u, x: carry_out[l](u.x, at, other, modified) },
+        other -> { ..u, x: apply_operation[l](u.x, at, other, modified) },
       }
     },
   )
@@ -1803,7 +1803,7 @@ fn sample_path(pick: Int) -> String =
 
 /// An entry a test draws from the bits of `pick`: its kind, path, mode, owner and time. Each is
 /// drawn from values a header stores in its own fields and values that need a pax record.
-fn drawn(pick: Int, data: Bytes) -> Entry = {
+fn generated_entry(pick: Int, data: Bytes) -> Entry = {
   let kind = pick >> 3 & 7;
   let made = if kind == 0 { directory(sample_path(pick)) }
   else if kind == 1 { symlink(sample_path(pick), sample_path(pick >> 12)) }
@@ -1827,7 +1827,7 @@ fn drawn(pick: Int, data: Bytes) -> Entry = {
 
 test "what is written reads back as the entries it was written from" {
   gen::check2(gen::list(gen::any_int()), gen::bytes(), |picks: List<Int>, data: Bytes| {
-    let entries = picks.map(|pick: Int| drawn(pick, data));
+    let entries = picks.map(|pick: Int| generated_entry(pick, data));
     decode(write(entries), generous_limits()) == Ok(entries)
   })
 }
@@ -1863,7 +1863,7 @@ fn inside(path: String) -> Bool =
 
 /// Whether the target of a link made at `path` stays beneath the root however it winds. It counts
 /// depth alone, which is all that matters for a path through real directories.
-fn stays(path: String, text: String) -> Bool =
+fn stays_inside(path: String, text: String) -> Bool =
   !text.starts_with("/")
     && text.split("/").fold(path.split("/").len() - 1, |depth: Int, name: String|
       if depth < 0 || name == "" || name == "." { depth }
@@ -1883,7 +1883,7 @@ test "a plan names only paths inside the root, through no link it makes, and its
         steps.all(|step: Operation|
           inside(target_of(step))
             && (match step {
-              MakeSymlink(path, text) -> stays(path, text),
+              MakeSymlink(path, text) -> stays_inside(path, text),
               MakeHardLink(_, file) -> inside(file),
               _ -> true,
             })
@@ -2139,13 +2139,13 @@ test "a path past a header's fields is split at a slash, or carried by a pax rec
   let prefix_split = write([file(split, b"")]);
   assert_eq(prefix_split.slice(0, 100), b"n".repeat(100));
   assert_eq(prefix_split.slice(345, 500), b"n".repeat(155));
-  let carry_out = write([file(past, b"")]);
-  assert_eq(carry_out.slice(0, 10), b"PaxHeader\x00");
-  assert_eq(carry_out.slice(156, 157), b"x");
-  assert_eq(carry_out.slice(512, 521), b"267 path=");
-  assert_eq(carry_out.slice(1024, 1124), b"n".repeat(100));
+  let apply_operation = write([file(past, b"")]);
+  assert_eq(apply_operation.slice(0, 10), b"PaxHeader\x00");
+  assert_eq(apply_operation.slice(156, 157), b"x");
+  assert_eq(apply_operation.slice(512, 521), b"267 path=");
+  assert_eq(apply_operation.slice(1024, 1124), b"n".repeat(100));
   assert_eq(paths(prefix_split), [split]);
-  assert_eq(paths(carry_out), [past]);
+  assert_eq(paths(apply_operation), [past]);
   assert_eq(paths(write([directory(name(99)), directory(name(100)), file("d/" ++ whole, b"")])), [
     name(99),
     name(100),
@@ -2381,7 +2381,7 @@ test "an entry whose header cannot be written is reported with its index and the
   assert_eq(decode(write(kinds), generous_limits()), Ok(kinds))
 }
 
-fn unsafe_at(index: Int, path: String, reason: Danger) -> Result<List<Operation>, UnsafeEntry> =
+fn unsafe_at(index: Int, path: String, reason: UnsafeReason) -> Result<List<Operation>, UnsafeEntry> =
   Err({ index: index, path: path, reason: reason })
 
 test "a plan makes each directory before what is beneath it, and keeps permission bits alone" {
@@ -2639,7 +2639,7 @@ test "a long name and a long link each name the member after them" {
 
 /// A tree to pack: files of two modes, a directory in a directory and an empty one, each with a
 /// time of its own, a link, and a file with two names.
-fn orchard() -> fs::MemFs / {abort.raise} = {
+fn sample_file_system() -> fs::MemFs / {abort.raise} = {
   let files = fs::mem_of([
     { path: "src/a.txt", body: b"alpha" },
     { path: "src/sub/b.sh", body: b"#!/bin/sh\n" },
@@ -2705,8 +2705,8 @@ fn packed_to_file(
     io::close_sink,
   ) { sink -> pack[d]("src", paths, sink, options) }
 
-fn outcomes(carry_out: List<ExtractionResult>) -> List<(String, Outcome)> =
-  carry_out.map(|c: ExtractionResult| (c.path, c.outcome))
+fn path_outcomes(apply_operation: List<ExtractionResult>) -> List<(String, OperationOutcome)> =
+  apply_operation.map(|c: ExtractionResult| (c.path, c.outcome))
 
 test "a tree packed and unpacked through a root is the tree, its modes, times and links included: {c}" for c: { chunk: Int, window: Int, short: Int } in [
     { chunk: 64, window: 8192, short: 0 },
@@ -2714,15 +2714,15 @@ test "a tree packed and unpacked through a root is the tree, its modes, times an
     { chunk: 64, window: 4096, short: 7 },
     { chunk: 1, window: 0, short: 1 },
   ] {
-  let over = fs::on_mem[d](fs::mem_short_reads(orchard(), c.short), || {
+  let over = fs::on_mem[d](fs::mem_short_reads(sample_file_system(), c.short), || {
     let packed = packed_to_file([""], keep_all_options(c.chunk));
     let made = fs.create_dir[d]("out");
-    let carry_out = unpack[d, d]("a.tar", "out", generous_limits(), c.window);
-    { packed: packed, made: made, carried: carry_out, size: fs.file_size[d]("a.tar") }
+    let apply_operation = unpack[d, d]("a.tar", "out", generous_limits(), c.window);
+    { packed: packed, made: made, carried: apply_operation, size: fs.file_size[d]("a.tar") }
   });
   assert_eq(over.value.size, Some(over.value.packed.bytes));
   assert_eq(over.value.packed.entries, 6);
-  assert_eq(outcomes(over.value.carried), [
+  assert_eq(path_outcomes(over.value.carried), [
     ("a.txt", Extracted),
     ("empty", Extracted),
     ("l", Extracted),
@@ -2730,7 +2730,7 @@ test "a tree packed and unpacked through a root is the tree, its modes, times an
     ("sub/b.sh", Extracted),
     ("sub/twin.txt", Extracted),
   ]);
-  assert_eq(describe_tree(over.tree, "out", true), describe_tree(orchard(), "src", true));
+  assert_eq(describe_tree(over.tree, "out", true), describe_tree(sample_file_system(), "src", true));
   assert_eq(describe_tree(over.tree, "out", true), [
     "a.txt: file alpha, mode 420, x2, at 5000",
     "empty: dir, mode 448, x1, at 9001",
@@ -2746,7 +2746,7 @@ test "a pack without times and modes is the archive `write` makes of the same en
   let archived = |tree: fs::MemFs, paths: List<String>, options: PackOptions|
     fs::mem_read(fs::on_mem[d](tree, || packed_to_file(paths, options)).tree, "a.tar");
   let archive = |tree: fs::MemFs, paths: List<String>| archived(tree, paths, plain_options());
-  let moved = fs::mem_set_modified(orchard(), "src/a.txt", 123456).fs;
+  let moved = fs::mem_set_modified(sample_file_system(), "src/a.txt", 123456).fs;
   let whole = write([
     file("a.txt", b"alpha"),
     directory("empty"),
@@ -2755,14 +2755,14 @@ test "a pack without times and modes is the archive `write` makes of the same en
     file("sub/b.sh", b"#!/bin/sh\n", mode: 493),
     hard_link("sub/twin.txt", "a.txt"),
   ]);
-  assert_eq(archive(orchard(), [""]), Some(whole));
+  assert_eq(archive(sample_file_system(), [""]), Some(whole));
   assert_eq(archive(moved, ["./"]), Some(whole));
   assert_eq(
-    archive(orchard(), ["sub/twin.txt", "l", "sub", "empty", "a.txt", "sub/b.sh"]),
+    archive(sample_file_system(), ["sub/twin.txt", "l", "sub", "empty", "a.txt", "sub/b.sh"]),
     Some(whole),
   );
   assert_eq(
-    archive(orchard(), ["sub/twin.txt", "l"]),
+    archive(sample_file_system(), ["sub/twin.txt", "l"]),
     Some(write([symlink("l", "sub/b.sh"), file("sub/twin.txt", b"alpha")])),
   );
   assert_eq(
@@ -2785,7 +2785,7 @@ fn pack_rejected(
   paths: List<String>,
   options: PackOptions,
 ) -> String / {io.fail, io.closed, io.write_failed, abort.raise} =
-  fs::on_mem[d](orchard(), || {
+  fs::on_mem[d](sample_file_system(), || {
     let unwritten: Result<String, WriteError> = try[tar.unwritable] {
       let missing: Result<PackResult, (String, FileError)> = try[files.fail] {
         packed_to_file(paths, options)
@@ -2892,7 +2892,7 @@ test "an operation writes nothing where the directory above it is reached throug
 fn unpack_tried(
   archive: Bytes,
   window: Int,
-) -> fs::Over<Result<Result<List<ExtractionResult>, UnsafeEntry>, Error>> / {io.fail, io.closed, abort.raise} =
+) -> fs::MemResult<Result<Result<List<ExtractionResult>, UnsafeEntry>, Error>> / {io.fail, io.closed, abort.raise} =
   fs::on_mem[d](fs::mem_create_dir(fs::mem_of([{ path: "a.tar", body: archive }]), "out").fs, || {
     let rejected: Result<Result<List<ExtractionResult>, UnsafeEntry>, Error> = try[tar.fail] {
       let unsafe: Result<List<ExtractionResult>, UnsafeEntry> = try[tar.unsafe] {
@@ -2911,7 +2911,7 @@ fn paths_of(entries: List<Entry>) -> String =
     ", ",
   )
 
-test "an archive with a member that may not be extracted extracts nothing, wherever the member is: {paths_of(c.entries)}" for c: { entries: List<Entry>, index: Int, reason: Danger } in [
+test "an archive with a member that may not be extracted extracts nothing, wherever the member is: {paths_of(c.entries)}" for c: { entries: List<Entry>, index: Int, reason: UnsafeReason } in [
     { entries: [file("ok", b"1"), file("../out", b"x")], index: 1, reason: Escapes },
     {
       entries: [file("ok", b"1"), file("d/../../out", b"x"), file("z", b"z")],
@@ -2954,7 +2954,7 @@ test "an archive that is cut short, or whose headers do not fit the window, extr
   );
   assert_eq(fs::listed_names(fs::mem_list(narrow.tree, "out")), Some([]));
   let wide = unpack_tried(long, 8192);
-  assert_eq(match wide.value { Ok(Ok(carry_out)) -> carry_out.len(), _ -> 0 }, 2)
+  assert_eq(match wide.value { Ok(Ok(apply_operation)) -> apply_operation.len(), _ -> 0 }, 2)
 }
 
 /// Runs `go` over the root `d`, and returns the longest chunk it requested to read and the longest

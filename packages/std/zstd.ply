@@ -108,7 +108,7 @@ fn padded(input: Bytes, from: Int, to: Int) -> Bytes / {abort.raise} =
 
 /// A distribution as a table description writes it: each symbol's count (-1 for a symbol of less
 /// than one cell), the bits per state, and the byte after the description.
-type NormalizedCounts = { counts: List<Int>, log: Int, next: Int }
+type NormalizedCounts = { counts: List<Int>, table_log: Int, next: Int }
 
 type CountState = { counts: List<Int>, bit: Int, left: Int }
 
@@ -167,7 +167,7 @@ fn read_normalized_counts(
     if log > max_table_log { fail(where, Table) } else {
       let read = read_counts(padded_block, at * 8 + 4, end * 8, 1 << log, [], 2 * most + 8);
       if read.left != 0 || read.bit > end * 8 || read.counts.len() > most + 1 { fail(where, Table) }
-      else { { counts: read.counts, log: log, next: read.bit + 7 >>> 3 } }
+      else { { counts: read.counts, table_log: log, next: read.bit + 7 >>> 3 } }
     }
   }
 
@@ -191,7 +191,7 @@ fn next_cell(pos: Int, size: Int, high: Int, fuel: Int) -> Int = {
 }
 
 /// Each symbol from `s` takes as many cells as its count, a step apart.
-fn spread(
+fn spread_symbols(
   c: Array<Int>,
   s: Int,
   left: Int,
@@ -202,17 +202,17 @@ fn spread(
 ) -> Array<Int> / {abort.raise} =
   if fuel <= 0 || s >= c.len() { cells } else if left <= 0 {
     let more = if s + 1 < c.len() { max(c.get(s + 1), 0) } else { 0 };
-    spread(c, s + 1, more, pos, high, cells, fuel - 1)
+    spread_symbols(c, s + 1, more, pos, high, cells, fuel - 1)
   } else {
     let size = cells.len();
-    spread(c, s, left - 1, next_cell(pos, size, high, size), high, cells.set(pos, s), fuel - 1)
+    spread_symbols(c, s, left - 1, next_cell(pos, size, high, size), high, cells.set(pos, s), fuel - 1)
   }
 
 /// Each cell from `i` on, turned into its decoding state. A symbol's states, in cell order, count
 /// upward from the symbol's count, and each reads the bits that bring it back under the table's
 /// size. A state packs its symbol's `code_baselines` entry above bit 14, the number of bits it
 /// reads at bit 10, and the base those bits are added to below.
-fn states(
+fn decoding_states(
   cells: Array<Int>,
   i: Int,
   next: Array<Int>,
@@ -223,7 +223,7 @@ fn states(
     let s = cells.get(i);
     let n = next.get(s);
     let width = log + 1 - bit_length(n);
-    states(
+    decoding_states(
       cells.set(i, code_baselines.get(s) << 14 | width << 10 | (n << width) - (1 << log)),
       i + 1,
       next.set(s, n + 1),
@@ -239,8 +239,8 @@ fn fse(counts: List<Int>, log: Int, code_baselines: Array<Int>) -> Array<Int> / 
   let low = place_low_symbols(c, 0, size, Array::new(size, 0));
   let high = low.high;
   let first = if c.len() > 0 { max(c.get(0), 0) } else { 0 };
-  let cells = spread(c, 0, first, 0, high, low.cells, size + c.len() + 2);
-  states(
+  let cells = spread_symbols(c, 0, first, 0, high, low.cells, size + c.len() + 2);
+  decoding_states(
     cells,
     0,
     Array::of_list(counts.map(|p: Int| if p == -1 { 1 } else { p })),
@@ -507,7 +507,7 @@ const fn predefined() -> Array<Int> = {
   )
 }
 
-type TableUpdate = { tables: Array<Int>, log: Int, next: Int }
+type TableUpdate = { tables: Array<Int>, table_log: Int, next: Int }
 
 /// One of a block's three tables, set as its mode directs: the predefined table, a single symbol,
 /// a table described at byte `at`, or the previous block's table.
@@ -524,14 +524,14 @@ fn read_table(
   if mode == 0 {
     {
       tables: copy_cells(tables, predefined(), table_start(kind), 1 << default_log(kind), 0),
-      log: default_log(kind),
+      table_log: default_log(kind),
       next: at,
     }
   } else if mode == 1 {
     if at >= end || padded_block.at(at) > max_symbol(kind) { fail(where, Table) } else {
       {
         tables: tables.set(table_start(kind), code_baselines(kind).get(padded_block.at(at)) << 14),
-        log: 0,
+        table_log: 0,
         next: at + 1,
       }
     }
@@ -545,12 +545,12 @@ fn read_table(
       where,
     );
     {
-      tables: copy_table(tables, table_start(kind), fse(n.counts, n.log, code_baselines(kind)), 0),
-      log: n.log,
+      tables: copy_table(tables, table_start(kind), fse(n.counts, n.table_log, code_baselines(kind)), 0),
+      table_log: n.table_log,
       next: n.next,
     }
   } else if before < 0 { fail(where, Table) }
-  else { { tables: tables, log: before, next: at } }
+  else { { tables: tables, table_log: before, next: at } }
 
 // --- Literals ---------------------------------------------------------------
 
@@ -644,10 +644,10 @@ fn tree(padded_block: Bytes, at: Int, end: Int, where: Int) -> Tree / {zstd.fail
         let floor = n.next * 8;
         let top = last * 8 + bit_length(padded_block.at(last)) - 1;
         if n.next > last { fail(where, Weights) } else {
-          let table = fse(n.counts, n.log, plain_codes());
-          let a = bits_below(padded_block, floor, top, n.log);
-          let b = bits_below(padded_block, floor, top - n.log, n.log);
-          let weights = decode_weights(padded_block, floor, top - 2 * n.log, table, a, b, [], 256);
+          let table = fse(n.counts, n.table_log, plain_codes());
+          let a = bits_below(padded_block, floor, top, n.table_log);
+          let b = bits_below(padded_block, floor, top - n.table_log, n.table_log);
+          let weights = decode_weights(padded_block, floor, top - 2 * n.table_log, table, a, b, [], 256);
           { code: code_of(weights, where), next: last + 1 }
         }
       }
@@ -889,7 +889,7 @@ fn execute_sequence(
   padded_block: Bytes,
   floor: Int,
   bit: Int,
-  states: Int,
+  decoding_states: Int,
   tables: Array<Int>,
   lits: Bytes,
   literal_position: Int,
@@ -921,9 +921,9 @@ fn execute_sequence(
         padded_block,
         floor,
         bit,
-        states & 0xFFFF,
-        states >>> 16 & 0xFFFF,
-        states >>> 32,
+        decoding_states & 0xFFFF,
+        decoding_states >>> 16 & 0xFFFF,
+        decoding_states >>> 32,
         tables,
         lits,
         literal_position + count,
@@ -1021,7 +1021,7 @@ fn compressed_block(
         e.literal_length_log,
         where,
       );
-      let ll = lengths.log;
+      let ll = lengths.table_log;
       let offsets = read_table(
         padded_block,
         lengths.next,
@@ -1032,7 +1032,7 @@ fn compressed_block(
         e.of,
         where,
       );
-      let of = offsets.log;
+      let of = offsets.table_log;
       let matches = read_table(
         padded_block,
         offsets.next,
@@ -1043,7 +1043,7 @@ fn compressed_block(
         e.match_length_log,
         where,
       );
-      let ml = matches.log;
+      let ml = matches.table_log;
       let from = matches.next;
       if from >= end || padded_block.at(end - 1) == 0 { fail(where, Sequences) } else {
         let floor = from * 8;
@@ -1113,7 +1113,7 @@ pub fn dictionary(bytes: Bytes) -> Dictionary / {zstd.fail, abort.raise} = {
       -1,
       literal.next - 16,
     );
-    let of = offsets.log;
+    let of = offsets.table_log;
     let matches = read_table(
       padded_block,
       offsets.next,
@@ -1124,7 +1124,7 @@ pub fn dictionary(bytes: Bytes) -> Dictionary / {zstd.fail, abort.raise} = {
       -1,
       offsets.next - 16,
     );
-    let ml = matches.log;
+    let ml = matches.table_log;
     let lengths = read_table(
       padded_block,
       matches.next,
@@ -1149,7 +1149,7 @@ pub fn dictionary(bytes: Bytes) -> Dictionary / {zstd.fail, abort.raise} = {
           content: bytes.slice(at - 16 + 12, n),
           entropy: {
             tables: lengths.tables,
-            literal_length_log: lengths.log,
+            literal_length_log: lengths.table_log,
             of: of,
             match_length_log: ml,
             code: literal.code,
@@ -1635,19 +1635,19 @@ fn end_bit_stream(out: Bytes, acc: Int, n: Int) -> Bytes / {abort.raise} = {
 /// A distribution as a writer's coding tables: the bits per state; the state each cell leads to,
 /// with cells in symbol order; and for each symbol, the value a state adds to find how many bits
 /// it writes (above bit 16), and the value added to find its cell.
-type Coder = { log: Int, states: Array<Int>, widths: Array<Int>, state_deltas: Array<Int> }
+type Coder = { table_log: Int, states: Array<Int>, widths: Array<Int>, state_deltas: Array<Int> }
 
 /// Each cell from `u` on stores its state at its symbol's next slot.
 fn encoding_states(
   cells: Array<Int>,
   u: Int,
   next: Array<Int>,
-  states: Array<Int>,
+  decoding_states: Array<Int>,
 ) -> Array<Int> / {abort.raise} =
-  if u >= cells.len() { states } else {
+  if u >= cells.len() { decoding_states } else {
     let s = cells.get(u);
     let at = next.get(s);
-    encoding_states(cells, u + 1, next.set(s, at + 1), states.set(at, cells.len() + u))
+    encoding_states(cells, u + 1, next.set(s, at + 1), decoding_states.set(at, cells.len() + u))
   }
 
 type CoderTables = { starts: List<Int>, widths: List<Int>, state_deltas: List<Int>, total: Int }
@@ -1659,7 +1659,7 @@ fn coder(counts: List<Int>, log: Int) -> Coder / {abort.raise} = {
   let low = place_low_symbols(c, 0, size, Array::new(size, 0));
   let high = low.high;
   let lead = if c.len() > 0 { max(c.get(0), 0) } else { 0 };
-  let cells = spread(c, 0, lead, 0, high, low.cells, size + c.len() + 2);
+  let cells = spread_symbols(c, 0, lead, 0, high, low.cells, size + c.len() + 2);
   let places = counts.fold(
     { starts: [], widths: [], state_deltas: [], total: 0 },
     |t: CoderTables, p: Int| {
@@ -1675,7 +1675,7 @@ fn coder(counts: List<Int>, log: Int) -> Coder / {abort.raise} = {
     },
   );
   {
-    log: log,
+    table_log: log,
     states: encoding_states(cells, 0, Array::of_list(places.starts), Array::new(size, 0)),
     widths: Array::of_list(places.widths),
     state_deltas: Array::of_list(places.state_deltas),
@@ -1818,7 +1818,7 @@ fn symbols_written(
 
 /// Weights coded as `decode_weights` reads them. Two states, started from the last two weights,
 /// take turns moving up the list, and both states are written at the end.
-fn weights_coded(
+fn encode_weights(
   weights: Array<Int>,
   i: Int,
   c: Coder,
@@ -1830,18 +1830,18 @@ fn weights_coded(
 ) -> Bytes / {abort.raise} =
   if i < 0 {
     // The state that coded the first weight is read first, so it is written last.
-    let all = acc | (mine & (1 << c.log) - 1) << n | (other & (1 << c.log) - 1) << n + c.log;
+    let all = acc | (mine & (1 << c.table_log) - 1) << n | (other & (1 << c.table_log) - 1) << n + c.table_log;
     end_bit_stream(
-      flush_bits(out, all, n + 2 * c.log),
-      all >>> (n + 2 * c.log & 0x78),
-      n + 2 * c.log & 7,
+      flush_bits(out, all, n + 2 * c.table_log),
+      all >>> (n + 2 * c.table_log & 0x78),
+      n + 2 * c.table_log & 7,
     )
   } else {
     let symbol = weights.get(i);
     let width = mine + c.widths.get(symbol) >>> 16;
     let all = acc | (mine & (1 << width) - 1) << n;
     let pending_bits = n + width;
-    weights_coded(
+    encode_weights(
       weights,
       i - 1,
       c,
@@ -1891,7 +1891,7 @@ fn tree_written(weights: List<Int>) -> Bytes / {abort.raise} = {
         // The last two weights set the two starting states.
         let a = initial_state(c, all.get(n - 1));
         let b = initial_state(c, all.get(n - 2));
-        let body = weights_coded(all, n - 3, c, a, b, head, 0, 0);
+        let body = encode_weights(all, n - 3, c, a, b, head, 0, 0);
         if body.len() > 127 { b"" } else { byte_of_int(body.len()).concat(body) }
       },
     }
@@ -2161,10 +2161,10 @@ fn sequences_written(
 ) -> Bytes / {abort.raise} =
   if i < 0 {
     // The states are read lengths first, so they are written last, each in its table's bits.
-    let wide = k.matches.log + k.offsets.log + k.lengths.log;
-    let all = acc | (match_length_state & (1 << k.matches.log) - 1) << n
-      | (offset_state & (1 << k.offsets.log) - 1) << n + k.matches.log
-      | (literal_length_state & (1 << k.lengths.log) - 1) << n + k.matches.log + k.offsets.log;
+    let wide = k.matches.table_log + k.offsets.table_log + k.lengths.table_log;
+    let all = acc | (match_length_state & (1 << k.matches.table_log) - 1) << n
+      | (offset_state & (1 << k.offsets.table_log) - 1) << n + k.matches.table_log
+      | (literal_length_state & (1 << k.lengths.table_log) - 1) << n + k.matches.table_log + k.offsets.table_log;
     end_bit_stream(flush_bits(out, all, n + wide), all >>> (n + wide & 0x78), n + wide & 7)
   } else {
     let seq = seqs.get(i);
@@ -2271,7 +2271,7 @@ type CodedSequences = {
 /// A match's distance as the value a sequence encodes: 1 to 3 for one of the last three offsets
 /// used, counted from the second when no literal precedes the match, and the distance plus three
 /// for any other.
-fn code_sequence(buf: Bytes, t: CodedSequences, seq: Int) -> CodedSequences / {abort.raise} = {
+fn encode_sequence(buf: Bytes, t: CodedSequences, seq: Int) -> CodedSequences / {abort.raise} = {
   let count = seq & 0xF_FFFF;
   let length = seq >>> 20 & 0xF_FFFF;
   let dist = seq >>> 40;
@@ -2345,7 +2345,7 @@ fn block_written(
         repeat2: r2,
         repeat3: r3,
       };
-      let told = seqs.fold(start, |t: CodedSequences, seq: Int| code_sequence(buf, t, seq));
+      let told = seqs.fold(start, |t: CodedSequences, seq: Int| encode_sequence(buf, t, seq));
       let body = literals_written(Bytes::concat_all(told.lits.push(buf.slice(told.at, to)))).concat(
         sequences_section(Array::of_list(told.out)),
       );

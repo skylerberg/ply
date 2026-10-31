@@ -4,7 +4,7 @@ import compiler.emit.code (Code, CodeVar, NDefinition, NConstructor, NBuiltin, C
                            CodeBlock, CodeList, CodeRecord, CodeUpdate, CodeMatch, CodePerform,
                            CodeSimulate, CodeParallel, CodeHandle, Lambda, Capture, CodeStatement,
                            CodeLet, CodeLetDestructure, CodeDo, CodeField, CodeArm, CodeClause,
-                           CodeListPattern, CodeBindingPattern, KnownRead, labels_among,
+                           CodeListPattern, CodeBindingPattern, KnownLambdaCall, labels_among,
                            code_children)
 import compiler.check.types (Type, FunctionType, VariableType, NamedType, Scheme, Effects, Effect,
                              ResourceVariable, int_type, bool_type, option_type, run_needs,
@@ -17,7 +17,7 @@ import std.bytes (ascii_of_int)
 import std.list (zip)
 import compiler.emit.representations (Definition, Imported, EmitParam, BoundLambda, has_variables,
                                       word_type, substituted, substituted_fully, type_variables,
-                                      resumption, resumed, resumed_as, layout_key, known_layout)
+                                      resumption, resume_result_type, resume_function_type, layout_key, known_layout)
 import compiler.emit.layout (Pointer, classes, OfMap, MapRoot, MapHeight, NodeCount, NodeKey,
                              NodeValue)
 import compiler.emit.typed_ir.containers (ContainerOp, NodeIntrinsic, Length)
@@ -29,7 +29,7 @@ import compiler.emit.keys (RootKey, InlinedLambda, Named, Specialisation, Test, 
                            Callee, Root, Generic, Evidence, root_name, root_text, definition_of,
                            key_types, key_effects, unspecialised, specialisation_key)
 import compiler.emit.typed_ir
-import compiler.emit.typed_ir (reps_of, all_given, Representation, AsInt, AsBool, AsWord,
+import compiler.emit.typed_ir (reps_of, owned_params, Representation, AsInt, AsBool, AsWord,
                                AsListView, AsSum, AsUnit, AsImmediate, Var, Arg, VarOperand,
                                IntOperand, ZeroOperand, no_closure_evidence, OwnedParam, Convention,
                                Rvalue, Primitive, Allocate, Get, Aggregate, Convert, Native, Op,
@@ -44,31 +44,31 @@ import compiler.emit.typed_ir.handling (Entering, CurrentSite)
 import compiler.emit.lower.module_context (ModuleContext, Root, imported_target, module_import)
 import compiler.syntax.expressions (scheduler_module)
 import compiler.emit.lower.representation (representation_of, case_index, case_argument_offset,
-                                           typed_convention, value_words, passing, InWords)
+                                           typed_convention, value_words, passing, ByValue)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, Target, ToConstructor, ToBuiltin,
                                  ToDefinition, ToValue, ToInlinedBody, InlinedBody, KnownLambda,
                                  IterateStep, WalkFunction, Walk, WalkKind, Folding, Mapping,
                                  Filtering, EntryFolding, Frame, Opened, GroupMember, Restarts,
-                                 Enters, Calls, EvidenceWord, unreachable, fresh, bound_as,
+                                 Enters, PlainCalls, EvidenceWord, unreachable, fresh, bound_as,
                                  run_for_effect, emitted, enter_block, static_added, enter_function,
                                  exit_function, with_lambda, initial_lowering, typed_slot_read,
                                  type_of, represented_as, note_slot_read, read_note, capture_note,
-                                 note_frame_entry, retyped, noted, no_captured_evidence, Holding,
-                                 holding_laid, held_values, held_inside, exit_block)
+                                 note_frame_entry, retyped, with_need, no_captured_evidence, EvidenceValues,
+                                 listed_evidence_values, evidence_values_of, substitute_evidence_vars, exit_block)
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read,
                                        empty_list_with_capacity, intrinsic_call)
-import compiler.emit.lower.marshalling (pending_raised)
+import compiler.emit.lower.marshalling (pending_abort_raise)
 import compiler.emit.lower.strings (range_guarded)
 import compiler.emit.lower.handling (performed)
-import compiler.emit.lower.scalars (let_go)
+import compiler.emit.lower.scalars (release_value)
 import compiler.emit.lower.evidence (EvidenceArguments, evidence_parameters,
                                      with_evidence_parameters, evidence_arguments,
                                      evidence_arguments_filled, function_value_evidence,
-                                     wanted_handing, label_values_at, caller_filled_labels,
-                                     labels_read, label_value, words_read, effects_descriptor,
-                                     passed_evidence_arguments, label_codes, effects_static,
-                                     root_body_start, evidence_parameter_types, evidence_for,
+                                     wanted_evidence_arguments, label_values_at, caller_filled_labels,
+                                     labels_read, label_value, read_evidence_words, effects_descriptor,
+                                     passed_evidence_arguments, label_codes, has_static_effects,
+                                     enter_root_body, evidence_parameter_types, evidence_for,
                                      builtin_effects)
 import compiler.emit.evidence (EffectsEvidence, evidence_type, instance_block_type,
                                evidence_param_count, max_evidence_params, evidence_array_type,
@@ -102,7 +102,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
           None -> m,
         },
     ),
-    observing: false,
+    emits_notes: false,
     frame: dummy_span(),
     captured: [],
     allows_lambda_inlining: false,
@@ -117,7 +117,7 @@ pub fn context_of(setting: ModuleContext, r: Root, body: Code) -> Context / {abo
     kept: [],
     performs: r.performs,
   });
-  { ..context, tails: Restarts(restart_parameter_representations(context)) }
+  { ..context, tails: Restarts(tail_parameter_representations(context)) }
 }
 
 fn param_effects_of(setting: ModuleContext, r: Root) -> List<Option<Effects>> =
@@ -259,12 +259,12 @@ fn signature_convention(s: ModuleContext, c: Signature) -> Convention =
 pub fn parameter_representations(context: Context) -> List<Representation> / {abort.raise} =
   match context.tails { Restarts(reps) -> reps, _ -> reps_of(convention(context)) }
 
-fn restart_parameter_representations(context: Context) -> List<Representation> / {abort.raise} = {
+fn tail_parameter_representations(context: Context) -> List<Representation> / {abort.raise} = {
   let reps = reps_of(convention(context));
   range(0, reps.len()).map(|i: Int|
     match reps.at(i) {
       Some(AsWord) -> match context.types.at(i) {
-        Some(t) -> if list_item(t) != None && restarts_on_list_rest(context, context.body, i) {
+        Some(t) -> if list_item(t) != None && recurses_on_rest(context, context.body, i) {
           AsListView
         } else { AsWord },
         _ -> AsWord,
@@ -274,17 +274,17 @@ fn restart_parameter_representations(context: Context) -> List<Representation> /
     })
 }
 
-fn restarts_on_list_rest(context: Context, c: Code, i: Int) -> Bool / {abort.raise} =
+fn recurses_on_rest(context: Context, c: Code, i: Int) -> Bool / {abort.raise} =
   match c.node {
     CodeIf(x) ->
-      restarts_on_list_rest(context, x.then_branch, i)
-        || restarts_on_list_rest(context, x.else_branch, i),
-    CodeBlock(b) -> match b.tail { Some(t) -> restarts_on_list_rest(context, t, i), None -> false },
-    CodeBinary(b) -> (b.op == b"and" || b.op == b"or") && restarts_on_list_rest(context, b.rhs, i),
+      recurses_on_rest(context, x.then_branch, i)
+        || recurses_on_rest(context, x.else_branch, i),
+    CodeBlock(b) -> match b.tail { Some(t) -> recurses_on_rest(context, t, i), None -> false },
+    CodeBinary(b) -> (b.op == b"and" || b.op == b"or") && recurses_on_rest(context, b.rhs, i),
     CodeMatch(m) -> {
       let on_param = match m.scrutinee.node { CodeVar(v) -> v.slot == i, _ -> false };
       m.arms.fold(false, |found: Bool, a: CodeArm|
-        found || restarts_on_list_rest(context, a.body, i)
+        found || recurses_on_rest(context, a.body, i)
           || (on_param
           && (match a.pattern {
             CodeListPattern(l) -> match l.rest {
@@ -528,7 +528,7 @@ pub fn continuation_closure(
   k: Arg,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
-  match resumed_as(type_of(k)) {
+  match resume_function_type(type_of(k)) {
     None -> unreachable(b"a continuation of no function type read as a value"),
     Some(t) -> match t {
       FunctionType(f) -> {
@@ -567,7 +567,7 @@ pub fn continuation_closure(
 pub fn known_lambda_read(
   context: Context,
   st: Lowering,
-  k: KnownRead,
+  k: KnownLambdaCall,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match st.env.get(k.slot) {
@@ -631,7 +631,7 @@ pub fn applied(
 pub fn known_applied(
   context: Context,
   st: Lowering,
-  k: KnownRead,
+  k: KnownLambdaCall,
   f: Arg,
   args: List<Arg>,
   effects: Effects,
@@ -661,7 +661,7 @@ fn applied_wanting(
     } else {
       let reps = t.params.map(|p: Type| representation_of(context.setting, p));
       let result = representation_of(context.setting, t.ret);
-      let e = wanted_handing(
+      let e = wanted_evidence_arguments(
         context,
         note_parameter_called(context, note_function_layout(st, FunctionType(t)), f),
         wanted,
@@ -677,7 +677,7 @@ fn applied_wanting(
           f: f,
           args: h.args,
           convention: {
-            params: all_given(all),
+            params: owned_params(all),
             result: result,
             destination_passing: false,
             returned: typed_ir::OwnedResult,
@@ -691,7 +691,7 @@ fn applied_wanting(
     _ -> {
       let words = args.map(|_: Arg| AsWord);
       let h = all_represented_as(note_parameter_called(context, st, f), args, words, at);
-      let enter_inlined = match resumed_as(type_of(f)) {
+      let enter_inlined = match resume_function_type(type_of(f)) {
         Some(FunctionType(k)) -> {
           let e = function_value_evidence(context, h.st, k.effects, at);
           run_for_effect(
@@ -706,7 +706,7 @@ fn applied_wanting(
         },
         _ -> h.st,
       };
-      let returned = resumed(type_of(f));
+      let returned = resume_result_type(type_of(f));
       let word = bound_as(
         enter_inlined,
         match returned { Some(a) -> a, None -> unknown_type() },
@@ -715,7 +715,7 @@ fn applied_wanting(
           f: f,
           args: h.args,
           convention: {
-            params: all_given(words),
+            params: owned_params(words),
             result: AsWord,
             destination_passing: false,
             returned: typed_ir::OwnedResult,
@@ -734,17 +734,17 @@ fn applied_wanting(
   }
 
 fn note_function_layout(st: Lowering, t: Type) -> Lowering =
-  type_variables(t).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Layout }))
+  type_variables(t).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Layout }))
 
 fn note_capture_releases(st: Lowering, captures: List<Var>) -> Lowering =
   captures.fold(st, |s: Lowering, v: Var|
-    released_variables(v.ty).fold(s, |q: Lowering, x: Int| noted(q, { var: x, reads: Exact })))
+    released_variables(v.ty).fold(s, |q: Lowering, x: Int| with_need(q, { var: x, reads: Exact })))
 
 pub type InPlaceArgs = { args: List<Option<Arg>>, range: Option<{ lo: Arg, hi: Arg }> }
 
-pub type Entered = { context: Context, st: Lowering, looped: Looped }
+pub type Entered = { context: Context, st: Lowering, looped: LoopKind }
 
-pub type Looped =
+pub type LoopKind =
   | NotLooped
   | StepLoop(StepVariables)
   | WalkLoop({ walk: Walk, vars: WalkVariables, entry: Option<MapWalkVariables> })
@@ -948,7 +948,7 @@ fn entry_read(
     [VarOperand(e.root), VarOperand(e.height), greatest.arg],
     at,
   );
-  let found = some_read(context, enter_block(above.st), above.arg, map_node(w), at);
+  let found = some_payload_read(context, enter_block(above.st), above.arg, map_node(w), at);
   let next = emitted(
     exit_block(above.st, found.st),
     Case({
@@ -1009,7 +1009,7 @@ fn prelude_called(
     None -> unreachable(b"a walk's call of what the prelude does not define: ".concat(name)),
   }
 
-fn some_read(
+fn some_payload_read(
   context: Context,
   st: Lowering,
   o: Arg,
@@ -1111,7 +1111,7 @@ fn inlined_in_frame(
   context: Context,
   st: Lowering,
   f: Option<Var>,
-  k: KnownRead,
+  k: KnownLambdaCall,
   lowered: List<Option<Arg>>,
   lender: Option<BoundLambda>,
   at: Span,
@@ -1201,7 +1201,7 @@ pub fn exit_inlined(
   match enter_inlined.looped {
     NotLooped ->
       {
-        st: sites_restored(enter_inlined.st.insts, before.insts.len(), {
+        st: end_site_scope(enter_inlined.st.insts, before.insts.len(), {
           ..body.st,
           env: before.env,
         }),
@@ -1240,7 +1240,7 @@ pub fn exit_inlined(
     },
   }
 
-fn sites_restored(insts: Block, from: Int, back: Lowering) -> Lowering =
+fn end_site_scope(insts: Block, from: Int, back: Lowering) -> Lowering =
   if insts.drop(from).any(|i: Inst| match i { SiteScope(Some(_)) -> true, _ -> false }) {
     emitted(back, SiteScope(None))
   } else { back }
@@ -1271,7 +1271,7 @@ fn exit_walk(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let outside = |s: Lowering| { ..s, insts: before.insts, env: before.env };
-  let back = sites_restored(enter_inlined.st.insts, 0, { ..body.st, env: before.env });
+  let back = end_site_scope(enter_inlined.st.insts, 0, { ..body.st, env: before.env });
   let after = bound_as(
     back,
     int_type(),
@@ -1282,12 +1282,12 @@ fn exit_walk(
   let went = |s: Lowering, held: Arg| emitted(s, Next([after.arg, held]));
   let item = match w.by {
     Mapping -> {
-      let o = pushed(context, after.st, VarOperand(v.held), body.arg, w.held, at);
+      let o = list_push(context, after.st, VarOperand(v.held), body.arg, w.held, at);
       went(o.st, o.arg)
     },
     Filtering -> {
       let k = represented_as({ st: after.st, arg: body.arg }, AsBool, at);
-      let o = pushed(
+      let o = list_push(
         context,
         enter_block(k.st),
         VarOperand(v.held),
@@ -1371,7 +1371,7 @@ fn exit_map_walk(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let outside = |s: Lowering| { ..s, insts: before.insts, env: before.env };
-  let back = sites_restored(enter_inlined.st.insts, 0, { ..body.st, env: before.env });
+  let back = end_site_scope(enter_inlined.st.insts, 0, { ..body.st, env: before.env });
   let plus_one = |s: Lowering, x: Var|
     bound_as(
       s,
@@ -1463,7 +1463,7 @@ fn exit_map_walk(
   }
 }
 
-fn pushed(
+fn list_push(
   context: Context,
   st: Lowering,
   out: Arg,
@@ -1508,7 +1508,7 @@ fn enter_step(
       Some(t) -> match lowered.at(1) {
         Some(Some(budget)) -> {
           let v = step_variables(context, st, t.state, t.result);
-          let begun = pass_begun(
+          let begun = budget_checked(
             note_frame_entry({ ..context, frame: l.at }, enter_block(v.st), at),
             v.left,
             budget,
@@ -1551,7 +1551,7 @@ fn enter_step(
   }
 }
 
-fn pass_begun(
+fn budget_checked(
   st: Lowering,
   exit_inlined: Var,
   budget: Arg,
@@ -1608,7 +1608,7 @@ fn pass_begun(
   }
 }
 
-pub fn iterated(
+pub fn iterate_builtin(
   context: Context,
   st: Lowering,
   args: List<Arg>,
@@ -1623,7 +1623,7 @@ pub fn iterated(
       None -> unreachable(b"a step at no `Iter` type"),
       Some(t) -> {
         let v = step_variables(context, st, t.state, t.result);
-        let begun = pass_begun(enter_block(v.st), v.left, budget, at);
+        let begun = budget_checked(enter_block(v.st), v.left, budget, at);
         let r = applied(context, begun.st, step, [VarOperand(v.state)], effects, false, at);
         let exit_inlined = begun.spent;
         let pass = iter_tested(context, r.st.insts, r.arg, {
@@ -1663,7 +1663,7 @@ pub fn called_builtin(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let effects = builtin_effects(function);
-  if name == b"iterate" { iterated(context, st, args, effects, at) } else if name == b"panic" {
+  if name == b"iterate" { iterate_builtin(context, st, args, effects, at) } else if name == b"panic" {
     match function_parts(function.ty, args.len()) {
       Some(f) ->
         performed(
@@ -1680,7 +1680,7 @@ pub fn called_builtin(
     }
   } else if name == b"?let_go" {
     match args {
-      [a] -> let_go(context, st, a, at),
+      [a] -> release_value(context, st, a, at),
       _ -> unreachable(b"a release of other than one value"),
     }
   } else { builtin(context, st, name, args, function, at) }
@@ -1874,7 +1874,7 @@ fn iter_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
               { when: 0, body: go.block.push(Next([go.arg, VarOperand(e.left)])) },
               { when: 1, body: stop.block.push(Done(stop.arg)) },
             ],
-            rest: [Fail({ reason: NoMatchingArm, at: e.at, letting: [], unwind: [] })],
+            rest: [Fail({ reason: NoMatchingArm, at: e.at, resource: [], unwind: [] })],
           }),
         ),
         next: stop.next,
@@ -1882,7 +1882,7 @@ fn iter_tested(context: Context, b: Block, v: Arg, e: PassEnd) -> Pass =
     },
     _ ->
       {
-        block: b.push(Fail({ reason: NoMatchingArm, at: e.at, letting: [], unwind: [] })),
+        block: b.push(Fail({ reason: NoMatchingArm, at: e.at, resource: [], unwind: [] })),
         next: e.next,
       },
   }
@@ -1935,7 +1935,7 @@ pub fn lambda_body_start(
   let reserved = with_lambda(
     st,
     Closure({
-      body: placeholder(context),
+      body: empty_function(context),
       captures: shape_captures(s).len(),
       at: at,
       words: no_closure_evidence(),
@@ -1961,12 +1961,12 @@ pub fn lambda_body_start(
     env: range(0, s.own.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
       match s.own.at(j) { Some(p) -> m.insert(j, VarOperand(p)), None -> m }),
   };
-  let read = words_read(given, s.words, frame.words, at);
-  let inside = held_inside(frame.held, s.holding);
+  let read = read_evidence_words(given, s.words, frame.words, at);
+  let inside = substitute_evidence_vars(frame.held, s.holding);
   {
     context: {
       ..context,
-      tails: Calls,
+      tails: PlainCalls,
       params: [],
       types: [],
       result: s.result,
@@ -2040,10 +2040,10 @@ pub fn closure(
   };
   let unraised = exit_function(outer, returned.st);
   let exit_inlined = frame_labels(context, frame);
-  let raising = match held_inside(frame.held, s.holding).words.find(|w: EvidenceWord|
+  let raising = match substitute_evidence_vars(frame.held, s.holding).words.find(|w: EvidenceWord|
       w.evidence.effect == b"abort" && !w.through) {
     Some(w) -> match w.word {
-      VarOperand(v) -> pending_raised(context, unraised, v),
+      VarOperand(v) -> pending_abort_raise(context, unraised, v),
       _ -> { st: unraised, pending: None },
     },
     None -> { st: unraised, pending: None },
@@ -2098,10 +2098,10 @@ pub fn closure(
     AsWord,
     Allocate({
       made: ClosureAllocation({ nth: nth, captures: laid.len(), params: s.own.len() }),
-      args: captures_laid(
+      args: captures_in_order(
         caps.args,
         exit_inlined.map(|p: Int| label_value(context, p)),
-        held_values(frame.held),
+        evidence_values_of(frame.held),
       ),
       reuse: None,
     }),
@@ -2122,7 +2122,7 @@ pub fn group_body_starts(members: List<GroupMember>) -> List<Opened> / {abort.ra
       None -> acc,
       Some(m) -> {
         let own = match params.at(i) { Some(ps) -> ps, None -> [] };
-        let begun = root_body_start(
+        let begun = enter_root_body(
           {
             ..m.context,
             tails: Enters(keys),
@@ -2269,7 +2269,7 @@ pub fn known_body(full_name: Bytes, params: List<EmitParam>, body: Code) -> Code
       None -> acc,
     });
   let own = lambdas_of(body);
-  let sites = in_place_sites(known_values(body, slots, full_name, own, []));
+  let sites = called_known_lambdas(known_values(body, slots, full_name, own, []));
   known_values(
     body,
     slots,
@@ -2281,7 +2281,7 @@ pub fn known_body(full_name: Bytes, params: List<EmitParam>, body: Code) -> Code
 
 type KnownLambda = { owner: Bytes, nth: Int }
 
-fn in_place_sites(c: Code) -> List<KnownLambda> = {
+fn called_known_lambdas(c: Code) -> List<KnownLambda> = {
   let known_lambda_read = |x: Code|
     match x.node { CodeKnownLambda(k) -> [{ owner: k.owner, nth: k.nth }], _ -> [] };
   match c.node {
@@ -2295,7 +2295,7 @@ fn in_place_sites(c: Code) -> List<KnownLambda> = {
         _ -> [],
       };
       code_children(c).fold(definitions, |acc: List<KnownLambda>, x: Code|
-        acc.concat(in_place_sites(x)))
+        acc.concat(called_known_lambdas(x)))
     },
   }
 }
@@ -2307,7 +2307,7 @@ type Reference = { st: Lowering, callee: Callee, args: List<Type>, given: List<T
 type ClosureLayout = {
   captured: List<Var>,
   labels: List<Var>,
-  holding: Holding<Var>,
+  holding: EvidenceValues<Var>,
   own: List<Var>,
   words: List<Var>,
   result: Representation,
@@ -2315,17 +2315,17 @@ type ClosureLayout = {
   ret: Type,
 }
 
-fn captures_laid<a>(note_captures: List<a>, labels: List<a>, holding: Holding<a>) -> List<a> =
-  note_captures.concat(labels).concat(holding_laid(holding))
+fn captures_in_order<a>(note_captures: List<a>, labels: List<a>, holding: EvidenceValues<a>) -> List<a> =
+  note_captures.concat(labels).concat(listed_evidence_values(holding))
 
-fn shape_captures(s: ClosureLayout) -> List<Var> = captures_laid(s.captured, s.labels, s.holding)
+fn shape_captures(s: ClosureLayout) -> List<Var> = captures_in_order(s.captured, s.labels, s.holding)
 
 fn shape_params(s: ClosureLayout) -> List<Var> = shape_captures(s).concat(s.own).concat(s.words)
 
 fn shape_convention(s: ClosureLayout) -> Convention = {
   let params = shape_params(s);
   {
-    params: all_given(params.map(|v: Var| v.representation)),
+    params: owned_params(params.map(|v: Var| v.representation)),
     result: s.result,
     destination_passing: false,
     returned: typed_ir::OwnedResult,
@@ -2411,7 +2411,7 @@ fn frame_labels(context: Context, frame: Frame) -> List<Int> =
     ),
   )
 
-fn placeholder(context: Context) -> Fn =
+fn empty_function(context: Context) -> Fn =
   {
     key: context.key,
     kind: Metered,
@@ -2449,7 +2449,7 @@ fn capture_representations(
     match slot_read(body, c.destination) {
       Some(read) -> {
         let r = representation_of(context.setting, read.ty);
-        if passing(r) == InWords { r } else { AsWord }
+        if passing(r) == ByValue { r } else { AsWord }
       },
       None -> AsWord,
     })
@@ -2589,7 +2589,7 @@ fn tail_jump(
   args: List<Arg>,
   at: Span,
 ) -> Option<LoweredValue> / {abort.raise} =
-  if context.tails == Calls || !borrows_outlive_jump(context, d, args) { None } else {
+  if context.tails == PlainCalls || !borrows_outlive_jump(context, d, args) { None } else {
     let given = evidence_arguments(
       context,
       st,
@@ -3015,7 +3015,7 @@ fn note_forwarded_functions(
   codes: List<Code>,
   args: List<Arg>,
 ) -> Lowering =
-  if context.tails == Calls { st } else {
+  if context.tails == PlainCalls { st } else {
     range(0, codes.len()).fold(st, |acc: Lowering, i: Int|
       match codes.at(i) {
         Some(c) -> match c.node {
@@ -3045,7 +3045,7 @@ fn note_forwarded_functions(
 fn note_parameter_called(context: Context, st: Lowering, f: Arg) -> Lowering =
   match f {
     VarOperand(p) -> match context.parameter_positions.get(p.id) {
-      Some(j) -> if context.tails == Calls || st.links.called.contains(j) { st }
+      Some(j) -> if context.tails == PlainCalls || st.links.called.contains(j) { st }
       else { { ..st, links: { ..st.links, called: st.links.called.push(j) } } },
       None -> st,
     },
@@ -3120,7 +3120,7 @@ fn labelled_param(d: Definition, j: Int) -> Bool =
   }
 
 fn inlinable(context: Context, l: Lambda) -> Bool / {abort.raise} =
-  !has_handle(l.body) && effects_static({ node: CodeLambda(l), span: l.at, ty: FunctionType(l.ty) })
+  !has_handle(l.body) && has_static_effects({ node: CodeLambda(l), span: l.at, ty: FunctionType(l.ty) })
 
 fn owner_named(context: Context, name: Bytes) -> RootKey / {abort.raise} =
   match context.owners.get(name) {
@@ -3205,7 +3205,7 @@ fn named_lambda(c: Code, n: Int) -> Lambda = {
   }
 }
 
-fn called_frame(k: KnownRead) -> Lambda =
+fn called_frame(k: KnownLambdaCall) -> Lambda =
   {
     ..k.lambda,
     size: k.lambda.params + 1,
@@ -3215,7 +3215,7 @@ fn called_frame(k: KnownRead) -> Lambda =
 pub fn known_run(
   context: Context,
   st: Lowering,
-  k: KnownRead,
+  k: KnownLambdaCall,
   effects: Effects,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
@@ -3342,42 +3342,42 @@ fn position_in(ls: List<Lambda>, l: Lambda) -> Option<Int> =
   range(0, ls.len()).fold(None, |acc: Option<Int>, k: Int|
     match acc { Some(_) -> acc, None -> if ls.at(k) == Some(l) { Some(k) } else { None } })
 
-pub fn has_handle(c: Code) -> Bool = holds_handle(c, |clauses: List<CodeClause>| true)
+pub fn has_handle(c: Code) -> Bool = has_handle_matching(c, |clauses: List<CodeClause>| true)
 
-pub fn holds_handle(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool = {
+pub fn has_handle_matching(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool = {
   let within = |codes: List<Code>|
-    codes.fold(false, |acc: Bool, x: Code| acc || holds_handle(x, counted));
+    codes.fold(false, |acc: Bool, x: Code| acc || has_handle_matching(x, counted));
   match c.node {
     CodeHandle(h) ->
-      counted(h.clauses) || holds_handle(h.body, counted)
+      counted(h.clauses) || has_handle_matching(h.body, counted)
         || within(h.clauses.map(|cl: CodeClause| cl.body))
-        || (match h.ret { Some(r) -> holds_handle(r.body, counted), None -> false }),
-    CodeUnary(u) -> holds_handle(u.operand, counted),
+        || (match h.ret { Some(r) -> has_handle_matching(r.body, counted), None -> false }),
+    CodeUnary(u) -> has_handle_matching(u.operand, counted),
     CodeBinary(b) -> within([b.lhs, b.rhs]),
-    CodeFieldRead(f) -> holds_handle(f.base, counted),
+    CodeFieldRead(f) -> has_handle_matching(f.base, counted),
     CodeApply(a) -> within(a.args.push(a.function)),
     CodeIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
     CodeBlock(b) ->
-      (match b.tail { Some(t) -> holds_handle(t, counted), None -> false })
+      (match b.tail { Some(t) -> has_handle_matching(t, counted), None -> false })
         || b.statements.fold(false, |acc: Bool, stmt: CodeStatement|
           acc
             || (match stmt {
-              CodeLet(l) -> holds_handle(l.value, counted),
-              CodeLetDestructure(l) -> holds_handle(l.value, counted),
-              CodeDo(d) -> holds_handle(d.code, counted),
+              CodeLet(l) -> has_handle_matching(l.value, counted),
+              CodeLetDestructure(l) -> has_handle_matching(l.value, counted),
+              CodeDo(d) -> has_handle_matching(d.code, counted),
             })),
     CodeList(l) -> within(l.items),
     CodeRecord(r) -> within(r.fields.map(|f: CodeField| f.value)),
     CodeUpdate(u) -> within(u.sets.map(|f: CodeField| f.value).push(u.base)),
     CodeMatch(m) ->
-      holds_handle(m.scrutinee, counted)
+      has_handle_matching(m.scrutinee, counted)
         || m.arms.fold(false, |acc: Bool, a: CodeArm|
-          acc || (match a.guard { Some(g) -> holds_handle(g, counted), None -> false })
-            || holds_handle(a.body, counted)),
+          acc || (match a.guard { Some(g) -> has_handle_matching(g, counted), None -> false })
+            || has_handle_matching(a.body, counted)),
     CodePerform(p) -> within(p.args),
-    CodeLambda(l) -> holds_handle(l.body, counted),
-    CodeSimulate(x) -> holds_handle(x.body, counted),
-    CodeKnownLambda(k) -> holds_handle(k.lambda.body, counted),
+    CodeLambda(l) -> has_handle_matching(l.body, counted),
+    CodeSimulate(x) -> has_handle_matching(x.body, counted),
+    CodeKnownLambda(k) -> has_handle_matching(k.lambda.body, counted),
     CodeParallel(pr) -> within(pr.branches),
     _ -> false,
   }

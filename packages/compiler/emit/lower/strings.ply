@@ -6,7 +6,7 @@ import compiler.check.types (Type, NamedType, FunctionType, RecordType, int_type
 import compiler.check.known (char_type, width_type, some_constructor, none_constructor)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.code (Code, NDefinition, CodeLet)
-import compiler.emit.writing (bare, prelude_call, slot_code, applied, int_code, bytes_code,
+import compiler.emit.writing (unspanned_code, prelude_call, slot_code, applied, int_code, bytes_code,
                               binary_of, if_code, block_code, builtin_call, some_or)
 import compiler.check.resolve.tables (qualify)
 import compiler.emit.keys
@@ -94,7 +94,7 @@ pub fn string_builtin_call(
     FunctionType(f) -> if f.ret == string_type() || f.ret == bytes_type() { f.ret } else { named },
     _ -> named,
   };
-  if secret_operation(name) { secret_operated(c, st, args) }
+  if secret_operation(name) { secret_basic_call(c, st, args) }
   else if secret_derivations().contains(name) { secret_derived(c, st, args) } else {
     match args {
       [a, b] -> if name == b"String::concat" || name == b"Bytes::concat" {
@@ -109,8 +109,8 @@ pub fn string_builtin_call(
       } else if name == b"Bytes::index_of" {
         position(context, first_occurrence(st, a, b, IntOperand(0), at), at)
       } else if name == b"Bytes::index_of_byte" { index_of_byte(c, st, a, b) }
-      else if name == b"String::find" { find(c, st, a, b) }
-      else if name == b"Secret::verify" { verified(c, st, a, b) }
+      else if name == b"String::find" { string_find(c, st, a, b) }
+      else if name == b"Secret::verify" { secret_verify(c, st, a, b) }
       else if name == b"Bytes::at" { byte_read(c, st, a, b, false) }
       else if name == b"Bytes::u32_le" { byte_read(c, st, a, b, true) }
       else if name == b"range" { range_builtin(c, st, a, b) }
@@ -137,7 +137,7 @@ fn unary_builtin(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abort.
   let at = c.at;
   if n == b"Bytes::of_string" { recast(st, a, bytes_type(), at) } else if n == b"String::chars" {
     let e = empty_list(c, st, char_type());
-    root_called(c, e.st, b"chars_from", string_type(), [a, IntOperand(0), e.arg])
+    generated_string_call(c, e.st, b"chars_from", string_type(), [a, IntOperand(0), e.arg])
   } else if n == b"Char::of_int" {
     let x = represented_as({ st: st, arg: a }, AsInt, at);
     let k = bound_as(
@@ -172,10 +172,10 @@ fn unary_builtin(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abort.
     )
   } else if n == b"String::of_chars" {
     let e = strings_op(st, string_type(), AsWord, AllocateBytes, [IntOperand(0)], at);
-    root_called(c, e.st, b"of_chars_from", list_type(char_type()), [a, IntOperand(0), e.arg])
+    generated_string_call(c, e.st, b"of_chars_from", list_type(char_type()), [a, IntOperand(0), e.arg])
   } else if n == b"Bytes::concat_all" {
     let e = strings_op(st, bytes_type(), AsWord, AllocateBytes, [IntOperand(0)], at);
-    root_called(c, e.st, b"concat_all_from", list_type(bytes_type()), [a, IntOperand(0), e.arg])
+    generated_string_call(c, e.st, b"concat_all_from", list_type(bytes_type()), [a, IntOperand(0), e.arg])
   } else if n == b"String::len" {
     let t = bytes_address(st, a, at);
     int_op(t.st, CharCount, [t.address, t.count], at)
@@ -232,7 +232,7 @@ fn unary_conversion(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abo
       c,
       ok,
       represented_as(unary_builtin, representation_of(c.context.setting, bytes_type()), at),
-      |r: Lowering| rejected(c, r, [i.arg]),
+      |r: Lowering| raise_rejection(c, r, [i.arg]),
     )
   } else { unreachable(b"a string's builtin on one operand: ".concat(n)) }
 }
@@ -240,7 +240,7 @@ fn unary_conversion(c: BuiltinCall, st: Lowering, a: Arg) -> LoweredValue / {abo
 fn range_builtin(c: BuiltinCall, st: Lowering, lo: Arg, hi: Arg) -> LoweredValue / {abort.raise} =
   range_guarded(c.context, st, lo, hi, c.at, |s: Lowering, l: Arg, h: Arg| {
     let e = empty_list(c, s, int_type());
-    root_called(c, e.st, b"range_from", list_type(int_type()), [l, h, e.arg])
+    generated_string_call(c, e.st, b"range_from", list_type(int_type()), [l, h, e.arg])
   })
 
 pub fn range_guarded(
@@ -260,7 +260,7 @@ pub fn range_guarded(
   let near = compared(reach.st, b"le", h.arg, reach.arg, at);
   let ok = short_circuit(context, top, near, false, at);
   failing_else(c, ok, then(enter_block(ok.st), l.arg, h.arg), |r: Lowering|
-    rejected(c, r, [l.arg, h.arg]))
+    raise_rejection(c, r, [l.arg, h.arg]))
 }
 
 fn split(c: BuiltinCall, st: Lowering, s: Arg, sep: Arg, ty: Type) -> LoweredValue / {abort.raise} = {
@@ -270,8 +270,8 @@ fn split(c: BuiltinCall, st: Lowering, s: Arg, sep: Arg, ty: Type) -> LoweredVal
   failing_else(
     c,
     ok,
-    root_called(c, e.st, b"split_from", ty, [s, sep, IntOperand(0), e.arg]),
-    |r: Lowering| rejected(c, r, []),
+    generated_string_call(c, e.st, b"split_from", ty, [s, sep, IntOperand(0), e.arg]),
+    |r: Lowering| raise_rejection(c, r, []),
   )
 }
 
@@ -286,7 +286,7 @@ fn empty_list(c: BuiltinCall, st: Lowering, item: Type) -> LoweredValue = {
   )
 }
 
-fn root_called(c: BuiltinCall, st: Lowering, op: Bytes, t: Type, args: List<Arg>) -> LoweredValue = {
+fn generated_string_call(c: BuiltinCall, st: Lowering, op: Bytes, t: Type, args: List<Arg>) -> LoweredValue = {
   let typed = string_root_signature(op, t);
   let conv = typed_convention(
     c.context.setting.constructors,
@@ -369,7 +369,7 @@ fn index_of(
   let ok = short_circuit(c.context, lo, hi, true, c.at);
   let offset = first_occurrence(enter_block(ok.st), a, b, f.arg, c.at);
   failing_else(c, ok, position(c.context, offset, c.at), |r: Lowering|
-    rejected(c, r, [f.arg, x.count]))
+    raise_rejection(c, r, [f.arg, x.count]))
 }
 
 fn index_of_byte(c: BuiltinCall, st: Lowering, a: Arg, byte: Arg) -> LoweredValue / {abort.raise} = {
@@ -392,13 +392,13 @@ fn index_of_byte(c: BuiltinCall, st: Lowering, a: Arg, byte: Arg) -> LoweredValu
     c.at,
   );
   let f = first_occurrence(set, a, unary_builtin.arg, IntOperand(0), c.at);
-  failing_else(c, ok, position(c.context, f, c.at), |r: Lowering| rejected(c, r, [i.arg]))
+  failing_else(c, ok, position(c.context, f, c.at), |r: Lowering| raise_rejection(c, r, [i.arg]))
 }
 
 fn position(context: Context, l: LoweredValue, at: Span) -> LoweredValue / {abort.raise} =
   option_if_nonnegative(context, l, int_type(), |s: Lowering| { st: s, arg: l.arg }, at)
 
-fn find(c: BuiltinCall, st: Lowering, a: Arg, b: Arg) -> LoweredValue / {abort.raise} = {
+fn string_find(c: BuiltinCall, st: Lowering, a: Arg, b: Arg) -> LoweredValue / {abort.raise} = {
   let x = bytes_address(st, a, c.at);
   let y = bytes_address(x.st, b, c.at);
   let f = int_op(y.st, FindBytes, [x.address, x.count, y.address, y.count, IntOperand(0)], c.at);
@@ -425,7 +425,7 @@ fn byte_slice(
   let ok = within(c.context, to.st, from.arg, to.arg, x.count, c.at);
   let n = arithmetic(enter_block(ok.st), b"sub", to.arg, from.arg, c.at);
   failing_else(c, ok, copied_out(n.st, ty, x.address, from.arg, n.arg, c.at), |r: Lowering|
-    rejected(c, r, [from.arg, to.arg, x.count]))
+    raise_rejection(c, r, [from.arg, to.arg, x.count]))
 }
 
 fn char_slice(
@@ -450,7 +450,7 @@ fn char_slice(
     copied_out(n.st, string_type(), x.address, b0.arg, n.arg, c.at),
     |r: Lowering| {
       let chars = int_op(r, CharCount, [x.address, x.count], c.at);
-      rejected(c, chars.st, [from.arg, to.arg, chars.arg])
+      raise_rejection(c, chars.st, [from.arg, to.arg, chars.arg])
     },
   )
 }
@@ -479,7 +479,7 @@ fn byte_read(
       c.at,
     )
   } else { int_op(enter_block(ok.st), ByteRead, [x.address, k.arg], c.at) };
-  failing_else(c, ok, read, |r: Lowering| rejected(c, r, [k.arg, x.count]))
+  failing_else(c, ok, read, |r: Lowering| raise_rejection(c, r, [k.arg, x.count]))
 }
 
 fn within(context: Context, st: Lowering, s: Arg, e: Arg, n: Arg, at: Span) -> LoweredValue = {
@@ -515,7 +515,7 @@ fn scanned(
       [x.address, x.count, f.arg, k.address, k.count, b.arg],
       c.at,
     ),
-    |r: Lowering| rejected(c, r, [f.arg, x.count, b.arg]),
+    |r: Lowering| raise_rejection(c, r, [f.arg, x.count, b.arg]),
   )
 }
 
@@ -523,7 +523,7 @@ fn secret_operation(name: Bytes) -> Bool =
   name == b"Secret::len" || name == b"Secret::is_empty" || name == b"Secret::bytes"
     || name == b"Secret::concat"
 
-fn secret_operated(c: BuiltinCall, st: Lowering, args: List<Arg>) -> LoweredValue / {abort.raise} = {
+fn secret_basic_call(c: BuiltinCall, st: Lowering, args: List<Arg>) -> LoweredValue / {abort.raise} = {
   let h = args.fold({ st: st, words: [] }, |acc: { st: Lowering, words: List<Arg> }, a: Arg| {
     let w = represented_as({ st: acc.st, arg: a }, AsWord, c.at);
     { st: w.st, words: acc.words.push(w.arg) }
@@ -550,7 +550,7 @@ fn secret_operated(c: BuiltinCall, st: Lowering, args: List<Arg>) -> LoweredValu
   }
 }
 
-fn verified(c: BuiltinCall, st: Lowering, s: Arg, a: Arg) -> LoweredValue / {abort.raise} = {
+fn secret_verify(c: BuiltinCall, st: Lowering, s: Arg, a: Arg) -> LoweredValue / {abort.raise} = {
   let h = represented_as({ st: st, arg: s }, AsWord, c.at);
   let t = bytes_address(h.st, a, c.at);
   let v = native_int(t.st, b"?secret_verify", [h.arg, t.address, t.count], c.at);
@@ -728,7 +728,7 @@ fn secret_rsa_jwk(
     [IntOperand(0), IntOperand(0), IntOperand(0)],
     bytes_type(),
   );
-  let joined = root_called(c, none.st, b"jwk_from", texts, [xs.arg, IntOperand(0), none.arg]);
+  let joined = generated_string_call(c, none.st, b"jwk_from", texts, [xs.arg, IntOperand(0), none.arg]);
   let ns = bytes_address(joined.st, n, c.at);
   let es = bytes_address(ns.st, e, c.at);
   failing_else(
@@ -744,7 +744,7 @@ fn secret_rsa_jwk(
         bytes_type(),
       ),
     ),
-    |r: Lowering| rejected(c, r, [count.arg]),
+    |r: Lowering| raise_rejection(c, r, [count.arg]),
   )
 }
 
@@ -847,12 +847,12 @@ fn pbkdf2_derived(
 
 fn asserted(c: BuiltinCall, st: Lowering, cond: Arg, message: Arg) -> LoweredValue / {abort.raise} = {
   let b = represented_as({ st: st, arg: cond }, AsBool, c.at);
-  let rejected = assert_failure(c, enter_block(b.st), message);
+  let raise_rejection = assert_failure(c, enter_block(b.st), message);
   literal(
     c.context,
     {
-      ..exit_block(b.st, rejected),
-      insts: b.st.insts.push(If({ cond: b.arg, then: [], otherwise: rejected.insts })),
+      ..exit_block(b.st, raise_rejection),
+      insts: b.st.insts.push(If({ cond: b.arg, then: [], otherwise: raise_rejection.insts })),
     },
     LiteralUnit,
     c.at,
@@ -948,7 +948,7 @@ fn failing_else(
   )
 }
 
-fn rejected(c: BuiltinCall, st: Lowering, ns: List<Arg>) -> Lowering / {abort.raise} =
+fn raise_rejection(c: BuiltinCall, st: Lowering, ns: List<Arg>) -> Lowering / {abort.raise} =
   raising(c, st, b"?refused", ns, 3)
 
 fn rejected_text(c: BuiltinCall, st: Lowering, texts: List<Arg>) -> Lowering / {abort.raise} =
@@ -1158,7 +1158,7 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> GeneratedRoot / {abort
     });
   let again = |args: List<Code>|
     applied(
-      bare(
+      unspanned_code(
         NDefinition({ full: qualify(module, name), args: [], effect_arguments: [], labels: [] }),
         fn_type(param_types, typed_of.ret, no_effects()),
       ),

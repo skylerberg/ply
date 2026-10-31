@@ -55,7 +55,7 @@
 //!
 //! `MemDb` is the in-memory fake: `open` a schema, then `step`, `begin_step`, `commit_step` and
 //! `abort_step` return what a server would, and `notify_step`, `listen_step`, `unlisten_step`,
-//! `next_notification_step` and `cut_step` what its notifications would. It does not model `COPY`.
+//! `next_notification_step` and `disconnect_step` what its notifications would. It does not model `COPY`.
 
 import std.bytes (u32_be, cstring)
 import std.json
@@ -367,11 +367,11 @@ type Pending<b> =
 type Step<b> = | Finished(b) | Asked({ s: Statement, ps: List<Param> })
 
 /// The continuations of a round's waiting lookups, one per `Asked` step.
-type Waiting<b> = | NoneWaiting | Waits(once (QueryResult) -> Pending<b>, Waiting<b>)
+type Continuations<b> = | NoContinuations | Waits(once (QueryResult) -> Pending<b>, Continuations<b>)
 
 /// A round of lookups: each one's step in order, and the waiting ones' continuations, the last to
 /// query first.
-type Round<b> = { steps: List<Step<b>>, waiting: Waiting<b> }
+type Round<b> = { steps: List<Step<b>>, waiting: Continuations<b> }
 
 /// `lookup` applied to each of `xs`, returning what `List::map` would. Each lookup runs until it
 /// queries the store, and the queries of one round that share a statement become one `db.batch`. A
@@ -381,24 +381,24 @@ pub fn map_batched<a, b, [t]>(
   xs: List<a>,
   lookup: keep (a) -> b / {db.query[t]},
 ) -> List<b> / {db.query[t], db.batch[t], abort.raise, diverges} =
-  run_rounds[t](started[t](xs, lookup, { steps: [], waiting: NoneWaiting }))
+  run_rounds[t](start_lookups[t](xs, lookup, { steps: [], waiting: NoContinuations }))
 
 fn start_lookup<b, [t]>(go: keep () -> b / {db.query[t]}) -> Pending<b> =
   handle { Completed(go()) } with { db.query[t](s, ps) resume k -> Querying(s, ps, k) }
 
 /// `round` with each of `xs` run up to its first query.
-fn started<a, b, [t]>(
+fn start_lookups<a, b, [t]>(
   xs: List<a>,
   lookup: keep (a) -> b / {db.query[t]},
   round: keep Round<b>,
 ) -> Round<b> =
   match xs {
     [] -> round,
-    [x, ..rest] -> started[t](rest, lookup, added(round, start_lookup[t](|| lookup(x)))),
+    [x, ..rest] -> start_lookups[t](rest, lookup, append_step(round, start_lookup[t](|| lookup(x)))),
   }
 
 /// `round` with `p` the step of its next lookup.
-fn added<b>(round: keep Round<b>, p: keep Pending<b>) -> Round<b> = {
+fn append_step<b>(round: keep Round<b>, p: keep Pending<b>) -> Round<b> = {
   let { steps, waiting } = round;
   match p {
     Completed(v) -> { steps: steps.push(Finished(v)), waiting: waiting },
@@ -418,17 +418,17 @@ fn run_rounds<b, [t]>(
   } else {
     let results = run_round_queries[t](steps, asking);
     run_rounds[t](
-      resumed(steps, 0, results, reversed(waiting, NoneWaiting), {
+      resumed(steps, 0, results, reversed(waiting, NoContinuations), {
         steps: [],
-        waiting: NoneWaiting,
+        waiting: NoContinuations,
       }),
     )
   }
 }
 
 /// `waiting` reversed onto the front of `onto`, so the first to query comes first.
-fn reversed<b>(waiting: keep Waiting<b>, onto: keep Waiting<b>) -> Waiting<b> =
-  match waiting { NoneWaiting -> onto, Waits(k, rest) -> reversed(rest, Waits(k, onto)) }
+fn reversed<b>(waiting: keep Continuations<b>, onto: keep Continuations<b>) -> Continuations<b> =
+  match waiting { NoContinuations -> onto, Waits(k, rest) -> reversed(rest, Waits(k, onto)) }
 
 /// `next` with each of `steps`, from the `at`th of the round on, stepped again: a finished one
 /// unchanged, and a waiting one by resuming the first of `waiting` with its result.
@@ -436,21 +436,21 @@ fn resumed<b>(
   steps: List<Step<b>>,
   at: Int,
   results: Map<Int, QueryResult>,
-  waiting: keep Waiting<b>,
+  waiting: keep Continuations<b>,
   next: keep Round<b>,
 ) -> Round<b> / {abort.raise} =
   match steps {
     [] -> next,
-    [Finished(v), ..rest] -> resumed(rest, at + 1, results, waiting, added(next, Completed(v))),
+    [Finished(v), ..rest] -> resumed(rest, at + 1, results, waiting, append_step(next, Completed(v))),
     [Asked(_), ..rest] -> match waiting {
       Waits(k, later) -> {
         let result = match results.get(at) {
           Some(result) -> result,
           None -> Failed(db_error("XX000", "", "a batched ask went unanswered")),
         };
-        resumed(rest, at + 1, results, later, added(next, k(result)))
+        resumed(rest, at + 1, results, later, append_step(next, k(result)))
       },
-      NoneWaiting -> panic("a waiting lookup has no continuation"),
+      NoContinuations -> panic("a waiting lookup has no continuation"),
     },
   }
 
@@ -1037,7 +1037,7 @@ type Token =
   | ParameterToken(Int)  // $1
   | SymbolToken(String)
 
-fn sql_ws() -> Bytes = b" \t\r\n"
+fn sql_whitespace() -> Bytes = b" \t\r\n"
 fn sql_digits() -> Bytes = b"0123456789"
 fn identifier_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789$"
 fn identifier_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
@@ -1061,7 +1061,7 @@ reuse fn lex(
   left: Int,
 ) -> Result<List<Token>, DbError> / {abort.raise} =
   if left <= 0 { panic("more tokens than bytes") } else {
-    let j = src.skip(i, sql_ws());
+    let j = src.skip(i, sql_whitespace());
     let c = src.peek(j);
     if c < 0 { Ok(acc) }
     else if c == 59 { Err(unsupported("more than one statement in one `Statement`")) }
@@ -2911,7 +2911,7 @@ fn build_tuple(
         ),
       }
     } else {
-      collect_tuple(
+      append_built_row(
         build_columns(definition, definition.columns, cols, expressions, ps, {
           sequences: acc.sequences,
           row: Map::new(),
@@ -2922,7 +2922,7 @@ fn build_tuple(
     },
   }
 
-fn collect_tuple(built: EffectsAccumulator, acc: Build) -> Build =
+fn append_built_row(built: EffectsAccumulator, acc: Build) -> Build =
   match built.err {
     Some(e) -> { sequences: built.sequences, rows: acc.rows, err: Some(e) },
     None -> { sequences: built.sequences, rows: acc.rows.push(built.row), err: None },
@@ -3304,7 +3304,7 @@ pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
   };
   match db.stack.at(0) {
     None -> done(memdb(db, db.tables, db.sequences, [frame], false), Count(0)),
-    Some(outer) -> match nested_rejection(
+    Some(outer) -> match nested_begin_error(
         db.failed,
         db.stack.len(),
         outer.level,
@@ -3321,7 +3321,7 @@ pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
 /// Why a `begin` cannot be a savepoint of the transaction it is nested in, where `depth` scopes are
 /// open and `outer` is what the transaction's own `begin` requested. The fake and the driver share
 /// it.
-fn nested_rejection(
+fn nested_begin_error(
   failed: Bool,
   depth: Int,
   outer: Isolation,
@@ -3496,7 +3496,7 @@ pub fn next_notification_step(db: MemDb) -> FakeWaitResult / {abort.raise} =
 
 /// The fake with its listener's connection cut: what was received and not taken is lost, and so is
 /// every notification until the next wait listens again.
-pub fn cut_step(db: MemDb) -> MemDb = { ..db, listener: { ..db.listener, inbox: [], cut: true } }
+pub fn disconnect_step(db: MemDb) -> MemDb = { ..db, listener: { ..db.listener, inbox: [], cut: true } }
 
 fn nothing_listened() -> String =
   "`db.notified` waits on the channels `db.listen` named, and there are none"
@@ -3965,7 +3965,7 @@ test "a notification the fake rejects is rejected as the server rejects it" {
 
 test "a cut listener loses what it had and what is sent until its next wait, which reports it" {
   let held = test_notified(test_listening(), "before");
-  let cut = cut_step(held);
+  let cut = disconnect_step(held);
   let lost = test_notified(cut, "during");
   let back = next_notification_step(lost);
   assert_eq(back.notification, Reconnected);
@@ -4022,14 +4022,14 @@ fn on_fake<a | e>(
       w.notification
     },
     outage.cut() -> {
-      t = cut_step(t);
+      t = disconnect_step(t);
     },
   }
 
 /// How often something happens in a test's run: a domain small enough to search whole.
-type Times = | Never | Once | Twice
+type SmallCount = | Never | Once | Twice
 
-fn times(t: Times) -> Int = match t { Never -> 0, Once -> 1, Twice -> 2 }
+fn times(t: SmallCount) -> Int = match t { Never -> 0, Once -> 1, Twice -> 2 }
 
 /// `waits` waits, each followed by a yield, and what each returned.
 fn test_waits(waits: Int) -> List<Notice> / {db.next_notification, task.yield} =
@@ -4062,11 +4062,11 @@ fn announced(heard: List<Notice>, sent: Int) -> Bool / {abort.raise} = {
 
 /// Notices sent past the first and cuts of the link, each a count small enough that a test runs
 /// every interleaving.
-type Strain = { sent: Times, cut: Times }
+type Strain = { sent: SmallCount, cut: SmallCount }
 
 fn strains() -> List<Strain> =
-  [Never, Once, Twice].fold([], |acc: List<Strain>, sent: Times|
-    [Never, Once, Twice].fold(acc, |inner: List<Strain>, cut: Times|
+  [Never, Once, Twice].fold([], |acc: List<Strain>, sent: SmallCount|
+    [Never, Once, Twice].fold(acc, |inner: List<Strain>, cut: SmallCount|
       inner.push({ sent: sent, cut: cut })))
 
 test "a listener over the fake receives what is committed while it listens, in order, and learns of every loss, in every interleaving of {times(c.sent) + 1} notices and {times(c.cut)} cuts" for c: Strain in strains(
@@ -4217,7 +4217,7 @@ type Pool = {
   opened: Int,
   made: Int,
   open: List<Scope>,
-  copies: List<Copy>,
+  copied_fields: List<Copy>,
   copied: Int,
   listener: Listener,
 }
@@ -4433,7 +4433,7 @@ type Plan = | Returned(QueryResult) | Outside(Claim) | Within(Scope, pg::Session
 
 type Decision = { pool: Pool, plan: Plan }
 
-fn outside(p: Pool, size: Int) -> Decision =
+fn outside_transaction(p: Pool, size: Int) -> Decision =
   match p.idle {
     [first, ..rest] -> { pool: { ..p, idle: rest }, plan: Outside(Idle(first)) },
     [] -> if p.opened >= size { { pool: p, plan: Returned(Failed(pool_busy(size))) } } else {
@@ -4448,7 +4448,7 @@ fn within(p: Pool, scope: Scope) -> Decision =
   if scope.copying { { pool: p, plan: Returned(Failed(copy_holds())) } } else {
     match scope.session {
       None -> { pool: p, plan: Returned(Failed(connection_lost())) },
-      Some(session) -> { pool: busy(p, scope.n), plan: Within(scope, session) },
+      Some(session) -> { pool: mark_scope_busy(p, scope.n), plan: Within(scope, session) },
     }
   }
 
@@ -4459,14 +4459,14 @@ fn copy_holds() -> DbError =
     "a copy holds this transaction's connection, which runs nothing else until the copy ends",
   )
 
-fn busy(p: Pool, n: Int) -> Pool =
+fn mark_scope_busy(p: Pool, n: Int) -> Pool =
   { ..p, open: p.open.map(|s: Scope| if s.n == n { { ..s, busy: true } } else { s }) }
 
 fn for_statement(p: Pool, size: Int, what: String) -> Decision / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
     Own(scope) -> within(p, scope),
-    NoTransaction -> outside(p, size),
+    NoTransaction -> outside_transaction(p, size),
   }
 
 /// A `begin` inside the performer's transaction is a savepoint of it; any other opens a transaction
@@ -4474,10 +4474,10 @@ fn for_statement(p: Pool, size: Int, what: String) -> Decision / {abort.raise} =
 fn for_begin(p: Pool, size: Int, level: Isolation, access: Access) -> Decision / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous("`db.begin`")),
-    NoTransaction -> outside(p, size),
+    NoTransaction -> outside_transaction(p, size),
     Own(scope) -> match scope.session {
       None -> within(p, scope),
-      Some(s) -> match nested_rejection(
+      Some(s) -> match nested_begin_error(
           s.status == pg::FailedTransaction,
           scope.depth,
           scope.level,
@@ -4497,14 +4497,14 @@ type ToClose = { pool: Pool, closing: Closing }
 
 /// A transaction whose connection is lost has nothing to send: the server ended it when the
 /// connection went, and `lost` is the result.
-fn for_close(p: Pool, what: String, lost: QueryResult) -> ToClose / {abort.raise} =
+fn prepare_transaction_close(p: Pool, what: String, lost: QueryResult) -> ToClose / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
     NoTransaction -> { pool: p, closing: Resolved(Failed(no_transaction(what))) },
     Own(scope) -> if scope.copying { { pool: p, closing: Resolved(Failed(copy_holds())) } } else {
       match scope.session {
         None -> { pool: { ..p, open: without_scope(p.open, scope) }, closing: Resolved(lost) },
-        Some(session) -> { pool: busy(p, scope.n), closing: Closes(scope, session) },
+        Some(session) -> { pool: mark_scope_busy(p, scope.n), closing: Closes(scope, session) },
       }
     },
   }
@@ -4675,7 +4675,7 @@ fn updated_scope(scope: Scope, session: pg::Session, deeper: Int) -> Scope =
 
 /// An exchange inside a transaction that failed. An error from the server leaves the transaction as
 /// it was, and anything else loses its connection and the transaction with it.
-fn failed_within(
+fn failed_in_transaction(
   scope: Scope,
   session: pg::Session,
   e: pg::ClientError,
@@ -4739,7 +4739,7 @@ fn statement_within(
         scope: Some(updated_scope(scope, ran.session, 0)),
         freed: None,
       },
-    Err(e) -> failed_within(scope, session, e, config, 0),
+    Err(e) -> failed_in_transaction(scope, session, e, config, 0),
   }
 
 fn open_transaction(
@@ -4788,7 +4788,7 @@ fn open_savepoint(
         scope: Some(updated_scope(scope, reply.session, 1)),
         freed: None,
       },
-    Err(e) -> failed_within(scope, session, e, config, 0),
+    Err(e) -> failed_in_transaction(scope, session, e, config, 0),
   }
 
 /// A transaction that has ended, its connection back in the pool.
@@ -4811,7 +4811,7 @@ fn commit_scope(
           scope: Some(updated_scope(scope, reply.session, -1)),
           freed: None,
         },
-      Err(e) -> failed_within(scope, session, e, config, -1),
+      Err(e) -> failed_in_transaction(scope, session, e, config, -1),
     }
   } else {
     match control(session, "commit", config) {
@@ -4849,7 +4849,7 @@ fn abort_scope(
           scope: Some(updated_scope(scope, reply.session, -1)),
           freed: None,
         },
-      Err(e) -> failed_within(scope, session, e, config, -1),
+      Err(e) -> failed_in_transaction(scope, session, e, config, -1),
     }
   } else {
     match control(session, "rollback", config) {
@@ -4862,7 +4862,7 @@ fn abort_scope(
 
 /// Where a copy is to run: rejected, on a connection outside any transaction, or on the performer's
 /// transaction's connection.
-type CopyClaim = | CopyRejected(DbError) | CopyOutside(Claim) | CopyWithin(Scope, pg::Session)
+type CopyClaim = | CopyRejected(DbError) | CopyOutsideTransaction(Claim) | CopyWithin(Scope, pg::Session)
 
 type ClaimedCopy = { pool: Pool, claim: CopyClaim }
 
@@ -4870,9 +4870,9 @@ fn for_copy(p: Pool, size: Int, what: String) -> ClaimedCopy / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
     NoTransaction -> {
-      let d = outside(p, size);
+      let d = outside_transaction(p, size);
       match d.plan {
-        Outside(c) -> { pool: d.pool, claim: CopyOutside(c) },
+        Outside(c) -> { pool: d.pool, claim: CopyOutsideTransaction(c) },
         Returned(Failed(e)) -> { pool: d.pool, claim: CopyRejected(e) },
         _ -> { pool: d.pool, claim: CopyRejected(pool_busy(size)) },
       }
@@ -4913,7 +4913,7 @@ fn begin_copy(
 ) -> CopyStart / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match claim {
     CopyRejected(e) -> { n: 0 - 1, within: false, session: None, columns: [], failed: Some(e) },
-    CopyOutside(c) -> match open_connection(config, nonce, c) {
+    CopyOutsideTransaction(c) -> match open_connection(config, nonce, c) {
       Err(e) -> { n: claim_n(c), within: false, session: None, columns: [], failed: Some(e) },
       Ok(l) -> copy_on(config, l.n, false, l.session, sql, out),
     },
@@ -4975,7 +4975,7 @@ fn copy_rejected(
 
 /// The pool after a copy releases its connection: back to its transaction, or to the idle ones,
 /// while the connection is still usable; otherwise lost, and its transaction with it.
-fn let_copy_go(p: Pool, n: Int, within: Bool, session: Option<pg::Session>) -> Pool = {
+fn release_copy_connection(p: Pool, n: Int, within: Bool, session: Option<pg::Session>) -> Pool = {
   let counted = match session { Some(_) -> p, None -> { ..p, opened: p.opened - 1 } };
   if within {
     {
@@ -4991,15 +4991,15 @@ fn let_copy_go(p: Pool, n: Int, within: Bool, session: Option<pg::Session>) -> P
   }
 }
 
-fn copy_of(p: Pool, id: Int) -> Option<Copy> = p.copies.find(|c: Copy| c.id == id)
+fn copy_of(p: Pool, id: Int) -> Option<Copy> = p.copied_fields.find(|c: Copy| c.id == id)
 
 fn with_copy(p: Pool, c: Copy) -> Pool =
-  { ..p, copies: p.copies.map(|held: Copy| if held.id == c.id { c } else { held }) }
+  { ..p, copied_fields: p.copied_fields.map(|held: Copy| if held.id == c.id { c } else { held }) }
 
 fn without_copy(p: Pool, id: Int) -> Pool =
-  { ..p, copies: p.copies.filter(|held: Copy| held.id != id) }
+  { ..p, copied_fields: p.copied_fields.filter(|held: Copy| held.id != id) }
 
-fn no_copy(id: Int) -> DbError =
+fn unknown_copy(id: Int) -> DbError =
   db_error("55000", "", "no copy is open under the number " ++ id.to_string())
 
 fn copy_busy(id: Int) -> DbError =
@@ -5009,7 +5009,7 @@ fn copy_busy(id: Int) -> DbError =
     "copy " ++ id.to_string() ++ " is already on the wire for another operation",
   )
 
-fn copy_direction(id: Int, out: Bool) -> DbError =
+fn wrong_copy_direction(id: Int, out: Bool) -> DbError =
   db_error(
     "55000",
     "",
@@ -5022,8 +5022,8 @@ type CopyConnection = { pool: Pool, copy: Copy, session: pg::Session }
 
 fn take_copy_connection(p: Pool, id: Int, out: Bool) -> Result<CopyConnection, DbError> =
   match copy_of(p, id) {
-    None -> Err(no_copy(id)),
-    Some(c) -> if c.out != out { Err(copy_direction(id, c.out)) } else {
+    None -> Err(unknown_copy(id)),
+    Some(c) -> if c.out != out { Err(wrong_copy_direction(id, c.out)) } else {
       match c.session {
         None -> Err(copy_busy(id)),
         Some(session) ->
@@ -5187,7 +5187,7 @@ fn copy_in_sql(t: String, columns: List<String>) -> String =
 // --- The listening connection --------------------------------------------------------
 
 /// A connection of its own that listens on every one of `channels`.
-fn listening(
+fn connect_listener(
   config: Server,
   nonce: String,
   made: Int,
@@ -5231,7 +5231,7 @@ fn listen_on(
   channel: String,
 ) -> ListenResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match l.session {
-    None -> match listening(config, nonce, l.made, l.channels.push(channel)) {
+    None -> match connect_listener(config, nonce, l.made, l.channels.push(channel)) {
       Err(e) -> { listener: { ..l, made: l.made + 1 }, result: Failed(e) },
       Ok(s) ->
         {
@@ -5301,7 +5301,7 @@ fn reopen_listener(
   nonce: String,
   l: Listener,
 ) -> WaitResult / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send[link], net.send_secret[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match listening(config, nonce, l.made, l.channels) {
+  match connect_listener(config, nonce, l.made, l.channels) {
     Ok(s) ->
       {
         listener: { ..l, session: Some(s), lost: false, made: l.made + 1 },
@@ -5343,7 +5343,7 @@ pub fn serve<a | e>(
     let alone = |s: Statement, each: List<List<Param>>|
       each.map(|ps: List<Param>| statement(s, ps, true, "`db.batch`"));
     let shared = |s: Statement, each: List<List<Param>>|
-      match coalesce(s, each) {
+      match combine_batch(s, each) {
         None -> None,
         Some(c) -> match statement(c.s, c.ps, true, "`db.batch`") {
           Rows(rows) -> Some(split_asks(rows, each.len())),
@@ -5352,7 +5352,7 @@ pub fn serve<a | e>(
       };
     // The savepoint a batch inside a transaction runs under, released or rolled back to.
     let ended_savepoint = |updated_scope: Bool|
-      match closing(for_close(pool_state.current(), "`db.batch`", Count(0))) {
+      match closing(prepare_transaction_close(pool_state.current(), "`db.batch`", Count(0))) {
         Resolved(_) -> (),
         Closes(scope, session) -> {
           resolved(if updated_scope { commit_scope(config, scope, session) }
@@ -5397,14 +5397,14 @@ pub fn serve<a | e>(
           let b = begin_copy(config, nonce, claim, sql, out);
           match b.failed {
             Some(e) -> {
-              pool_state.replace(let_copy_go(pool_state.current(), b.n, b.within, b.session));
+              pool_state.replace(release_copy_connection(pool_state.current(), b.n, b.within, b.session));
               Err(e)
             },
             None -> {
               let p = pool_state.current();
               pool_state.replace({
                 ..p,
-                copies: p.copies.push({
+                copied_fields: p.copied_fields.push({
                   id: p.copied,
                   n: b.n,
                   session: b.session,
@@ -5427,13 +5427,13 @@ pub fn serve<a | e>(
     // A copy ended: its connection released and its number forgotten.
     let copy_closed = |c: Copy, e: CopyEnd| {
       pool_state.replace(
-        let_copy_go(without_copy(pool_state.current(), c.id), c.n, c.within, e.session),
+        release_copy_connection(without_copy(pool_state.current(), c.id), c.n, c.within, e.session),
       );
       e.result
     };
     let copy_end = |id: Int, failure: Option<String>|
       match copy_of(pool_state.current(), id) {
-        None -> Err(no_copy(id)),
+        None -> Err(unknown_copy(id)),
         Some(c) -> if c.out && c.done {
           pool_state.replace(without_copy(pool_state.current(), id));
           match c.failed { Some(e) -> Err(e), None -> Ok(c.taken) }
@@ -5453,14 +5453,14 @@ pub fn serve<a | e>(
       let updated_scope = with_copy(pool_state.current(), t.copy);
       pool_state.replace(match t.release {
         None -> updated_scope,
-        Some(left) -> let_copy_go(updated_scope, c.n, c.within, left),
+        Some(left) -> release_copy_connection(updated_scope, c.n, c.within, left),
       });
       t.result
     };
     let copy_take = |id: Int, rows: Int|
       match copy_of(pool_state.current(), id) {
-        None -> Err(no_copy(id)),
-        Some(c) -> if !c.out { Err(copy_direction(id, false)) }
+        None -> Err(unknown_copy(id)),
+        Some(c) -> if !c.out { Err(wrong_copy_direction(id, false)) }
         else if c.done { taken_from(c, None, rows) } else {
           match take_copy_connection(pool_state.current(), id, true) {
             Err(e) -> Err(e),
@@ -5508,12 +5508,12 @@ pub fn serve<a | e>(
         Within(scope, session) -> resolved(open_savepoint(config, scope, session)),
       },
       db.commit() -> match closing(
-          for_close(pool_state.current(), "`db.commit`", Failed(connection_lost())),
+          prepare_transaction_close(pool_state.current(), "`db.commit`", Failed(connection_lost())),
         ) {
         Resolved(a) -> a,
         Closes(scope, session) -> resolved(commit_scope(config, scope, session)),
       },
-      db.abort() -> match closing(for_close(pool_state.current(), "`db.abort`", Count(0))) {
+      db.abort() -> match closing(prepare_transaction_close(pool_state.current(), "`db.abort`", Count(0))) {
         Resolved(a) -> a,
         Closes(scope, session) -> resolved(abort_scope(config, scope, session)),
       },
@@ -5587,7 +5587,7 @@ pub fn serve<a | e>(
       opened: 0,
       made: 0,
       open: [],
-      copies: [],
+      copied_fields: [],
       copied: 0,
       listener: { session: None, channels: [], waiting: false, lost: false, made: 0 },
     },
@@ -5621,7 +5621,7 @@ fn statement_text(sql: String) -> String / {abort.raise} =
 /// its position among that query's rows, so the results can be separated in order. `None` when the
 /// queries cannot share one statement: text the parser cannot take apart, a query whose parameters
 /// do not match the placeholders, or more parameters than one statement may carry.
-fn coalesce(
+fn combine_batch(
   s: Statement,
   each: List<List<Param>>,
 ) -> Option<{ s: Statement, ps: List<Param> }> / {abort.raise} =
@@ -5717,7 +5717,7 @@ fn close_pool(p: Pool, config: Server) -> Unit / {net.send[link], net.close[link
     match s { Some(session) -> pg::finish[link](session, config.client), None -> () };
   p.idle.fold((), |done: Unit, l: PooledConnection| pg::finish[link](l.session, config.client));
   p.open.fold((), |done: Unit, scope: Scope| close(scope.session));
-  p.copies.filter(|c: Copy| !c.within).fold((), |done: Unit, c: Copy| close(c.session));
+  p.copied_fields.filter(|c: Copy| !c.within).fold((), |done: Unit, c: Copy| close(c.session));
   close(p.listener.session)
 }
 
@@ -5782,7 +5782,7 @@ fn unpercent_from(whole: Bytes, at: Int, acc: Bytes) -> Result<Bytes, String> / 
 
 fn is_hex(c: Int) -> Bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
 
-fn url_rejection(url: String) -> String =
+fn url_error_message(url: String) -> String =
   if url.contains("=") && !url.contains("://") {
     "this is libpq's keyword/value form; the URI form is `postgres://user@host:5432/database`"
   } else { "a connection string begins `postgres://`, as in `postgres://user@host:5432/database`" }
@@ -5805,10 +5805,10 @@ fn url_rejection(url: String) -> String =
 /// the rest is read from the string without them, so no step of parsing holds the password in plain
 /// form.
 pub fn server_of(url: String) -> Result<Server, String> / {abort.raise} =
-  match sealed_password(url) {
+  match extract_password(url) {
     Err(reason) -> Err(reason),
     Ok(unsealed) -> match split_at(unsealed.url, "://") {
-      None -> Err(url_rejection(unsealed.url)),
+      None -> Err(url_error_message(unsealed.url)),
       Some(scheme) -> if scheme.head != "postgres" && scheme.head != "postgresql" {
         Err(
           "`" ++ scheme.head
@@ -5824,7 +5824,7 @@ type ExtractedPassword = { url: String, password: Option<Secret<Bytes>> }
 /// The password between the first `:` of the userinfo and the last `@` before the host, read
 /// straight into a secret, and the string without the `:` and the password. An empty password
 /// counts as none.
-fn sealed_password(url: String) -> Result<ExtractedPassword, String> / {abort.raise} = {
+fn extract_password(url: String) -> Result<ExtractedPassword, String> / {abort.raise} = {
   let b = Bytes::of_string(url);
   let start = match b.index_of(b"://") { Some(i) -> i + 3, None -> 0 };
   let end = match b.index_of_from(b"/", start) { Some(i) -> i, None -> b.len() };
@@ -5832,7 +5832,7 @@ fn sealed_password(url: String) -> Result<ExtractedPassword, String> / {abort.ra
     if b.at(i) == 64 { i } else { found });
   let colon = match b.index_of_from(b":", start) { Some(i) -> i, None -> end };
   if at < 0 || colon >= at { Ok({ url: url, password: None }) } else {
-    match sealed_unpercent(b, colon + 1, at, Secret::of_bytes(b""), at - colon + 1) {
+    match percent_decode_secret(b, colon + 1, at, Secret::of_bytes(b""), at - colon + 1) {
       Err(reason) -> Err(reason),
       Ok(password) ->
         Ok({
@@ -5846,7 +5846,7 @@ fn sealed_password(url: String) -> Result<ExtractedPassword, String> / {abort.ra
 /// Bytes `at` to `end` of `b`, with each `%XX` decoded to its byte, appended to `acc` a run at a
 /// time without leaving the secret. `left` limits the number of runs, since each takes at least one
 /// byte.
-fn sealed_unpercent(
+fn percent_decode_secret(
   b: Bytes,
   at: Int,
   end: Int,
@@ -5857,7 +5857,7 @@ fn sealed_unpercent(
     if at + 2 >= end || !is_hex(b.at(at + 1)) || !is_hex(b.at(at + 2)) {
       Err("a `%` in the URL is not followed by two hex digits")
     } else {
-      sealed_unpercent(
+      percent_decode_secret(
         b,
         at + 3,
         end,
@@ -5869,7 +5869,7 @@ fn sealed_unpercent(
     }
   } else {
     let run = match b.index_of_from(b"%", at) { Some(i) -> min(i, end), None -> end };
-    sealed_unpercent(b, run, end, acc.concat(Secret::of_bytes(b.slice(at, run))), left - 1)
+    percent_decode_secret(b, run, end, acc.concat(Secret::of_bytes(b.slice(at, run))), left - 1)
   }
 
 fn user_of(userinfo: String) -> Result<String, String> / {abort.raise} =
@@ -6207,19 +6207,19 @@ test "what a connection string cannot mean is rejected rather than guessed" {
   assert_err("postgres://ply@db/app?sslmode", "key=value")
 }
 
-fn ssl_in(url: String) -> Ssl / {abort.raise} =
+fn ssl_of_url(url: String) -> Ssl / {abort.raise} =
   match server_of(url) { Ok(s) -> s.ssl, Err(reason) -> panic(reason) }
 
 test "every sslmode that secures verifies the server, and one open to a TLS downgrade is rejected" {
-  assert_eq(ssl_in("postgres://ply@db/app"), Disabled);
-  assert_eq(ssl_in("postgres://ply@db/app?sslmode=disable"), Disabled);
-  assert_eq(ssl_in("postgres://ply@db/app?sslmode=require"), Negotiated);
-  assert_eq(ssl_in("postgres://ply@db/app?sslmode=verify-ca"), Negotiated);
+  assert_eq(ssl_of_url("postgres://ply@db/app"), Disabled);
+  assert_eq(ssl_of_url("postgres://ply@db/app?sslmode=disable"), Disabled);
+  assert_eq(ssl_of_url("postgres://ply@db/app?sslmode=require"), Negotiated);
+  assert_eq(ssl_of_url("postgres://ply@db/app?sslmode=verify-ca"), Negotiated);
   assert_eq(
-    ssl_in("postgres://ply@db/app?sslmode=verify-full&sslnegotiation=postgres"),
+    ssl_of_url("postgres://ply@db/app?sslmode=verify-full&sslnegotiation=postgres"),
     Negotiated,
   );
-  assert_eq(ssl_in("postgres://ply@db/app?sslnegotiation=direct&sslmode=verify-full"), Immediate);
+  assert_eq(ssl_of_url("postgres://ply@db/app?sslnegotiation=direct&sslmode=verify-full"), Immediate);
   assert_err("postgres://ply@db/app?sslmode=prefer", "plaintext");
   assert_err("postgres://ply@db/app?sslmode=allow", "plaintext");
   assert_err("postgres://ply@db/app?sslmode=on", "not a mode");
@@ -6296,7 +6296,7 @@ fn test_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
 
 fn test_ready(status: Int) -> Bytes / {abort.raise} = test_frame(90, byte_of_int(status))
 
-fn test_done(tag: String) -> Bytes / {abort.raise} = test_frame(67, cstring(tag))
+fn test_command_complete(tag: String) -> Bytes / {abort.raise} = test_frame(67, cstring(tag))
 
 fn test_field(code: String, text: String) -> Bytes =
   if text == "" { b"" } else { Bytes::of_string(code).concat(cstring(text)) }
@@ -6337,14 +6337,14 @@ fn test_greeted() -> FakeConnection / {abort.raise} =
 type FakeReply = { bytes: Bytes, status: Int }
 
 fn test_tagged(tag: String, status: Int) -> FakeReply / {abort.raise} =
-  { bytes: test_done(tag), status: status }
+  { bytes: test_command_complete(tag), status: status }
 
 fn test_in_failed() -> FakeReply / {abort.raise} =
   { bytes: test_error("ERROR", test_aborted()), status: 69 }
 
 /// Rolling back to a savepoint un-aborts the transaction, and the release that follows closes it.
 fn test_rolled_back_to() -> FakeReply / {abort.raise} =
-  { bytes: test_done("ROLLBACK").concat(test_done("RELEASE")), status: 84 }
+  { bytes: test_command_complete("ROLLBACK").concat(test_command_complete("RELEASE")), status: 84 }
 
 fn test_result(sql: String, status: Int, extended: Bool) -> FakeReply / {abort.raise} =
   if extended { test_extended(sql, status) } else { test_simple(sql, status) }
@@ -6356,7 +6356,7 @@ fn test_extended(sql: String, status: Int) -> FakeReply / {abort.raise} =
         test_frame(49, b""),
         test_frame(50, b""),
         test_frame(110, b""),
-        test_done(test_tag(sql)),
+        test_command_complete(test_tag(sql)),
       ]),
       status: status,
     }
@@ -6576,7 +6576,7 @@ fn test_has_run(runs: List<List<String>>, run: List<String>) -> Bool =
   runs.fold(false, |acc: Bool, r: List<String>| acc || r == run)
 
 /// A serialization failure is the server asking for the transaction again, from its `begin`.
-fn retried(
+fn retry_serializable(
   left: Int,
   seen: List<String>,
 ) -> { result: Result<Int, Rollback>, seen: List<String> } / {db.begin, db.commit, db.abort, db.execute[part]} =
@@ -6587,7 +6587,7 @@ fn retried(
     Ok(v) -> { result: Ok(v), seen: seen },
     Err(rolled) -> match rolled.error {
       None -> { result: Err(rolled), seen: seen },
-      Some(e) -> if is_retryable(e) && left > 1 { retried(left - 1, seen.push(e.code)) }
+      Some(e) -> if is_retryable(e) && left > 1 { retry_serializable(left - 1, seen.push(e.code)) }
       else { { result: Err(rolled), seen: seen.push(e.code) } },
     },
   }
@@ -6645,7 +6645,7 @@ test "a serialization failure at commit is retryable, and the retry begins a tra
           "",
         ),
       ],
-      || retried(3, []),
+      || retry_serializable(3, []),
     );
     assert_eq(r.value, { result: Ok(1), seen: ["40001"] });
     let begin = test_begin("serializable");
@@ -6854,7 +6854,7 @@ test "a connection lost inside a transaction fails the rest of it, and nothing o
 // --- Batching's own tests --------------------------------------------------------
 
 /// A store of `id * 10` for every id, handling each query alone and counting the queries.
-fn tens<a>(
+fn times_ten_store<a>(
   go: () -> a / {db.query[items], db.batch[items], abort.raise, diverges},
 ) -> { value: a, queries: Int, batches: Int } / {abort.raise, diverges} = {
   let row = |ps: List<Param>|
@@ -6886,8 +6886,8 @@ fn ten_of(id: Int) -> Int / {db.query[items]} =
 
 test "a lookup mapped over its ids queries the store once, and returns what each alone would" {
   let ids = [3, 1, 4, 1, 5];
-  let alone = tens(|| ids.map(ten_of));
-  let together = tens(|| map_batched[items](ids, ten_of));
+  let alone = times_ten_store(|| ids.map(ten_of));
+  let together = times_ten_store(|| map_batched[items](ids, ten_of));
   assert_eq(together.value, alone.value);
   assert_eq({ queries: alone.queries, batches: alone.batches }, { queries: 5, batches: 0 });
   assert_eq({ queries: together.queries, batches: together.batches }, { queries: 0, batches: 1 })
@@ -6895,10 +6895,10 @@ test "a lookup mapped over its ids queries the store once, and returns what each
 
 test "a lookup that queries twice takes two rounds, and a lone query is a db.query" {
   let twice = |id: Int| ten_of(id) + ten_of(id + 100);
-  let r = tens(|| map_batched[items]([1, 2, 3], twice));
+  let r = times_ten_store(|| map_batched[items]([1, 2, 3], twice));
   assert_eq(r.value, [1020, 1040, 1060]);
   assert_eq({ queries: r.queries, batches: r.batches }, { queries: 0, batches: 2 });
-  let one = tens(|| map_batched[items]([7], ten_of));
+  let one = times_ten_store(|| map_batched[items]([7], ten_of));
   assert_eq({ value: one.value, queries: one.queries, batches: one.batches }, {
     value: [70],
     queries: 1,
@@ -6907,7 +6907,7 @@ test "a lookup that queries twice takes two rounds, and a lone query is a db.que
 }
 
 test "a batch is the statement once per query, its placeholders renumbered and its rows marked" {
-  let c = coalesce(stmt("select v from items where id = $1 and kind = $2;"), [
+  let c = combine_batch(stmt("select v from items where id = $1 and kind = $2;"), [
     [IntParameter(1), TextParameter("a")],
     [IntParameter(2), TextParameter("b")],
   ]);
@@ -6923,10 +6923,10 @@ test "a batch is the statement once per query, its placeholders renumbered and i
   ]);
   // A query whose parameters do not match the placeholders could get another's result, so it runs
   // alone.
-  assert_eq(coalesce(stmt("select v from items where id = $1"), [[IntParameter(1)], []]), None);
+  assert_eq(combine_batch(stmt("select v from items where id = $1"), [[IntParameter(1)], []]), None);
   // A placeholder inside text is text.
   assert_eq(
-    match coalesce(stmt("select '$1' as t from items where id = $1"), [
+    match combine_batch(stmt("select '$1' as t from items where id = $1"), [
         [IntParameter(1)],
         [IntParameter(2)],
       ]) {

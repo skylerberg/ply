@@ -79,7 +79,7 @@ fn bidi(name: Bytes) -> Int =
     _ -> 0,
   }
 
-fn left() -> Int = 1
+fn left_to_right() -> Int = 1
 
 fn right() -> Int = 2
 
@@ -92,7 +92,7 @@ fn european_number() -> Int = 5
 fn nonspacing() -> Int = 11
 
 /// The bits a word stores for the Joining_Type the joiner rules read, and for a virama.
-fn joining(letters: Bytes) -> Int / {abort.raise} =
+fn joining_type_bits(letters: Bytes) -> Int / {abort.raise} =
   range(0, letters.len()).fold(0, |bits: Int, i: Int|
     bits
       | (match letters.at(i) {
@@ -104,7 +104,7 @@ fn joining(letters: Bytes) -> Int / {abort.raise} =
         _ -> panic("a joining type is D, L, R or T, and v marks a virama"),
       }))
 
-fn several_bit() -> Int = 1 << 11
+fn sequence_mapping_bit() -> Int = 1 << 11
 
 /// The table while it is being built.
 type TableBuilder = { valued: List<ValueRun>, gathering: SequencePool }
@@ -112,10 +112,10 @@ type TableBuilder = { valued: List<ValueRun>, gathering: SequencePool }
 fn idna_table_of(runs: List<Run>) -> IdnaTable / {abort.raise} = {
   let made = runs.fold({ valued: [], gathering: ucd::empty_pool() }, |m: TableBuilder, run: Run| {
     let field = |i: Int| match run.fields.at(i) { Some(text) -> text, None -> b"" };
-    let bits = status(field(0)) | bidi(field(2)) << 3 | joining(field(3));
+    let bits = status(field(0)) | bidi(field(2)) << 3 | joining_type_bits(field(3));
     let mapping = field(1);
     if mapping.starts_with(b"+") || mapping.starts_with(b"-") || mapping.len() == 0 {
-      let far = ucd::distance(if mapping.starts_with(b"+") { mapping.slice(1, mapping.len()) }
+      let far = ucd::parse_offset(if mapping.starts_with(b"+") { mapping.slice(1, mapping.len()) }
       else { mapping });
       {
         valued: m.valued.push({ first: run.first, last: run.last, value: bits | far << 12 }),
@@ -127,7 +127,7 @@ fn idna_table_of(runs: List<Run>) -> IdnaTable / {abort.raise} = {
         valued: m.valued.push({
           first: run.first,
           last: run.last,
-          value: bits | several_bit() | put.place << 12,
+          value: bits | sequence_mapping_bit() | put.place << 12,
         }),
         gathering: put.gathering,
       }
@@ -252,7 +252,7 @@ fn mapped_into(table: IdnaTable, out: List<Int>, cp: Int) -> List<Int> =
     let kind = status_of(word);
     if kind == ignored() { out }
     else if kind != mapped() { out.push(cp) }
-    else if word & several_bit() == 0 { out.push(ucd::apply_distance(cp, word >> 12)) }
+    else if word & sequence_mapping_bit() == 0 { out.push(ucd::apply_distance(cp, word >> 12)) }
     else { out.concat(ucd::sequence(table.points, word >> 12)) }
   }
 
@@ -327,7 +327,7 @@ fn faults(table: IdnaTable, label: List<Int>, options: Options, read: Bool) -> L
       && !(options.use_std3_ascii_rules && cp < 128
         && !((cp >= 0x61 && cp <= 0x7A) || (cp >= 0x30 && cp <= 0x39) || cp == 0x2D))
   };
-  let found = |reason: ErrorKind, wrong: Bool| if wrong { [reason] } else { [] };
+  let found = |reason: ErrorKind, invalid_name_cases: Bool| if invalid_name_cases { [reason] } else { [] };
   found(NotNormalized, read && !unicode::is_normalized(text_of(label), unicode::Nfc)).concat(
     found(
       Hyphens,
@@ -360,7 +360,7 @@ fn last_spacing(classes: List<Int>) -> Int =
   classes.fold(0, |last: Int, class: Int| if class == nonspacing() { last } else { class })
 
 /// Whether a label of these Bidi classes meets the six conditions of RFC 5893 section 2.
-fn bidi_holds(classes: List<Int>) -> Bool =
+fn meets_bidi_rule(classes: List<Int>) -> Bool =
   match classes {
     [] -> true,
     [first, ..] -> if is_rtl(first) {
@@ -371,8 +371,8 @@ fn bidi_holds(classes: List<Int>) -> Bool =
         && !(classes.any(|c: Int| c == european_number())
           && classes.any(|c: Int| c == arabic_number()))
     } else {
-      first == left() && classes.all(|c: Int| c == left() || c == european_number() || c >= 6)
-        && (last_spacing(classes) == left() || last_spacing(classes) == european_number())
+      first == left_to_right() && classes.all(|c: Int| c == left_to_right() || c == european_number() || c >= 6)
+        && (last_spacing(classes) == left_to_right() || last_spacing(classes) == european_number())
     },
   }
 
@@ -415,7 +415,7 @@ fn process_domain(domain: String, options: Options) -> List<Label> / {abort.rais
   if !options.check_bidi || !classes.any(has_rtl) { labels } else {
     range(0, labels.len()).map(|i: Int| {
       let l = labels.at_or(i, { points: [], wrong: [] });
-      if bidi_holds(classes.at_or(i, [])) { l }
+      if meets_bidi_rule(classes.at_or(i, [])) { l }
       else { { points: l.points, wrong: l.wrong.push(Bidi) } }
     })
   }
@@ -590,7 +590,7 @@ test "{c.written} is {c.ascii} on the wire and converts back" for c: Name in nam
 
 type Wrong = { written: String, problems: List<Problem> }
 
-fn wrong() -> List<Wrong> =
+fn invalid_name_cases() -> List<Wrong> =
   [
     { written: "-a.example", problems: [{ label: 0, reason: Hyphens }] },
     { written: "a-.example", problems: [{ label: 0, reason: Hyphens }] },
@@ -615,7 +615,7 @@ fn wrong() -> List<Wrong> =
     { written: "\u{FFFD}.example", problems: [{ label: 0, reason: Disallowed }] },
   ]
 
-test "{c.written} is rejected with what is wrong with it" for c: Wrong in wrong() {
+test "{c.written} is rejected with what is wrong with it" for c: Wrong in invalid_name_cases() {
   assert_eq(to_ascii(c.written, strict()), Err(c.problems))
 }
 

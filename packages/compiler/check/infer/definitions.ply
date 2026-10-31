@@ -37,7 +37,7 @@ import compiler.check.known (is_int, is_bool, is_char, is_float, is_string, is_b
                              secret_item, task_result, chan_item, task_type, is_integer_name,
                              float_name, char_name, decimal_name, bool_name, string_name,
                              bytes_name, unit_name, list_name, array_name, columns_name, map_name,
-                             scoped_name, task_name, chan_name, secret_name)
+                             scoped_name, task_name, builtin_channel_name, secret_name)
 import compiler.check.termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee,
                                    DefinedCallee, OtherCallee, Termination, Terminates, Diverges,
                                    Summary, Verdict, verdict, unknown_summary)
@@ -89,17 +89,17 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      reject_externs, mode_eq, is_direct, bind_builtin,
                                      insert_constraint, dedup_constraints, Shapes, derivable,
                                      variables_of_type, scoped_effect)
-import compiler.check.infer.names (Found, look_up_language_type, declared_value, written_binder,
+import compiler.check.infer.names (Found, look_up_language_type, declared_value, is_explicit_binding,
                                    local_at, simple_name_of, home_module)
 import compiler.check.infer.declarations (convert_type, convert_effect, op_named, duplicate,
                                           constraints_in_force, member_scheme, written_signature,
                                           first_reason, note_witness_params, is_scheduler_handle)
 import compiler.check.infer.expression (site_for, resolved_sites, site_among, report_unify, expect,
                                         check_bit_ops, check_concats, check_columns, hint_of,
-                                        infer_whole, effects_in, scales_like, tag_rule,
+                                        infer_whole, effects_in, repeated_effects_include, tag_rule,
                                         check_updates, is_group_member, expect_or_widen,
                                         reject_growth, TrailingArgument, written_as, as_written,
-                                        holds_fn, written_effect_text, numeric_of,
+                                        contains_function, written_effect_text, numeric_of,
                                         ordered_variables, body_recorded)
 import compiler.check.typed (BodyPart, WholeBody, ClauseBody, MeasureBody, TestRun, CaseListing,
                              LawGuard, LawBody, TypedParam)
@@ -287,7 +287,7 @@ pub type MachineValue =
 
 pub type MachineCall = { params: List<MachineValue>, result: MachineValue }
 
-pub fn machine_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<MachineValue> =
+pub fn runtime_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<MachineValue> =
   match t {
     VariableType(v) -> position_of(scheme.type_variables, v).map(MachineTypeVariable),
     FunctionType(f) -> match f.effects.variable {
@@ -316,7 +316,7 @@ pub fn machine_call(module: Bytes, b: Builtin, objects: List<Bytes>) -> Option<M
       || b.contract.raises { None } else {
     match b.scheme.ty {
       FunctionType(f) -> {
-        let marshalling = |t: Type| machine_value(t, b.scheme, objects);
+        let marshalling = |t: Type| runtime_value(t, b.scheme, objects);
         let params = f.params.map(marshalling);
         match if f.params.push(f.ret).any(layout_depends_on_variable) { None }
           else { marshalling(f.ret) } {
@@ -473,7 +473,7 @@ pub fn check_bodies(
           }
         },
         bodies: acc.bodies.insert(i, o.body),
-        signed: if o.left == Signed { acc.signed.insert(i, true) } else { acc.signed },
+        signed: if o.left == FromSignature { acc.signed.insert(i, true) } else { acc.signed },
       }
     },
   );
@@ -881,7 +881,7 @@ fn bind_signature(
     derived: None,
     env: env_bind_global(s.checker.env, name, scheme),
     constraints: s.checker.constraints.insert(name, constraints),
-    takings: s.checker.takings.insert(name, {
+    parameter_modes: s.checker.parameter_modes.insert(name, {
       name: definition.name.name,
       params: definition.params.map(parameter_mode),
     }),
@@ -911,7 +911,7 @@ fn bind_signature(
   }
 }
 
-type BodySource = | BodyChecked | Taken | Signed
+type BodySource = | BodyChecked | Taken | FromSignature
 
 fn check_function(
   checker: Checker,
@@ -945,7 +945,7 @@ fn check_function(
       {
         checker: p.checker,
         body: body_of_signature(p.checker, sig, p.effects, p.written),
-        left: Signed,
+        left: FromSignature,
       }
     } else { checked_or_cached(checker, parsed, definition, name, sig, member, stated, results) },
   }
@@ -1063,11 +1063,11 @@ fn checked_or_cached(
     },
     None -> {
       let o: InferredBody = check_fn_body(
-        { ..checker, derived: derived_of(parsed, definition), walking: name },
+        { ..checker, derived: derived_of(parsed, definition), current_definition: name },
         definition,
         sig,
       );
-      let walked: Checker = { ..o.checker, derived: None, walking: b"" };
+      let walked: Checker = { ..o.checker, derived: None, current_definition: b"" };
       let members = walked.member_calls.drop(checker.member_calls.len());
       let calls = if stated.len() == 0 { members } else {
         members.concat(
@@ -1082,7 +1082,7 @@ fn checked_or_cached(
       let resolved: Checker = check_columns(
         check_bit_ops(check_numerics(check_concats(check_updates(walked)))),
       );
-      let tree = tree_recorded(walked, checker.typed_bodies.len(), name, WholeBody);
+      let tree = typed_body(walked, checker.typed_bodies.len(), name, WholeBody);
       let judged = ownership_errors(
         check_borrowed_functions(
           close_unreachable_effects(
@@ -1188,7 +1188,7 @@ fn check_borrowed_functions(
   match body {
     Some(b) -> if !borrowing::has_borrowed_parameter(definition) { checker } else {
       borrowing::escape_diagnostics(checker.module, definition, b, {
-        takes: |n: Bytes| checker.takings.get(n),
+        takes: |n: Bytes| checker.parameter_modes.get(n),
       }).fold(
         checker,
         report,
@@ -1219,7 +1219,7 @@ fn ownership_errors(
   { checker: held, released: unhandled_release_effects(held, j.held) }
 }
 
-fn tree_recorded(checker: Checker, from: Int, owner: Bytes, part: BodyPart) -> Option<Walked> =
+fn typed_body(checker: Checker, from: Int, owner: Bytes, part: BodyPart) -> Option<Walked> =
   match checker.typed_bodies.drop(from).find(|t: WalkedTree| t.owner == owner && t.part == part) {
     Some(t) -> Some(t.body),
     None -> None,
@@ -1248,11 +1248,11 @@ fn check_body_ownership(
         resource: j.resource,
         resolved: |t: Type| resolve(checker, t),
         taking: |key: Bytes|
-          match checker.takings.get(key) {
-            Some(t) -> Some({ kept: kept_places(t.params), all: false }),
+          match checker.parameter_modes.get(key) {
+            Some(t) -> Some({ kept: keep_parameter_indexes(t.params), all: false }),
             None -> None,
           },
-        op_keep_parameters: |name: Bytes, op: Bytes|
+        operation_consumed_parameters: |name: Bytes, op: Bytes|
           match effect_info(checker, name) {
             Some(e) -> match e.operations.find(|o: OpInfo| o.name == op) {
               Some(o) -> o.kept,
@@ -1267,7 +1267,7 @@ fn check_body_ownership(
             _ -> false,
           },
       };
-      if !params.any(|p: ownership::Param| j.resource(p.ty)) && !ownership::judged(facts, b) {
+      if !params.any(|p: ownership::Param| j.resource(p.ty)) && !ownership::needs_ownership_check(facts, b) {
         { checker: checker, held: [] }
       } else {
         let o = ownership::check_ownership(facts, params, b);
@@ -1297,7 +1297,7 @@ fn check_body_ownership(
     },
   }
 
-fn kept_places(params: List<ParameterMode>) -> List<Int> =
+fn keep_parameter_indexes(params: List<ParameterMode>) -> List<Int> =
   params.fold({ at: 0, kept: [] }, |acc: { at: Int, kept: List<Int> }, p: ParameterMode|
     { at: acc.at + 1, kept: if p.keep { acc.kept.push(acc.at) } else { acc.kept } }).kept
 
@@ -1577,7 +1577,7 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
   let counts = range(0, comp.len()).map(|slot: Int|
     match bodies.get(slot).count {
       Some(count) -> count,
-      None -> counted_body(tagged, definitions.get(slot), bodies.get(slot)),
+      None -> body_effect_count(tagged, definitions.get(slot), bodies.get(slot)),
     });
   let recorded = bodies.map(|b: ClosedBody| b.recorded);
   let walked = recorded.fold(false, |any: Bool, k: Option<CachedDefinition>| any || k == None);
@@ -1644,7 +1644,7 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
   let grown: Checker = bodies.fold(summarized, |c: Checker, b: ClosedBody|
     reject_growth(c, members, b.fills));
   let kept: Checker = range(0, comp.len()).fold(grown, |c: Checker, slot: Int|
-    unwritten_divergence(
+    require_declared_divergence(
       if c.module >= c.known.root { c }
       else { check_bounded_promises(c, bodies.get(slot), counts.get(slot)) },
       definitions.get(slot),
@@ -1854,7 +1854,7 @@ fn check_fn_body(
     ..walked,
     checker: body_recorded(
       walked.checker,
-      bound.walking,
+      bound.current_definition,
       WholeBody,
       definition.span.start,
       params_typed_as(definition.params, signature.params),
@@ -1932,7 +1932,7 @@ fn iteration(
             None -> None,
             Some(d) -> if match m.param {
                 Some(i) -> d.repeats.contains(i),
-                None -> scales_like(d.scaling, entry),
+                None -> repeated_effects_include(d.scaling, entry),
               } { Some(m.span) }
             else { None },
           }
@@ -1942,7 +1942,7 @@ fn iteration(
     None -> over,
   }
 
-fn counted_body(
+fn body_effect_count(
   checker: Checker,
   definition: FnDefinition,
   body: ClosedBody,
@@ -2105,14 +2105,14 @@ fn check_bounded_promises(
             None -> if effects_cover([w.entry], s.entry) { Some(s) } else { None },
           }) {
         None -> c,
-        Some(s) -> broken_promise(c, backticked_text(w.written), s, count.recursed),
+        Some(s) -> report_exceeds_bound(c, backticked_text(w.written), s, count.recursed),
       },
   );
   if !body.variable_bounded { effects } else {
     match count.variable_over {
       None -> effects,
       Some(over) ->
-        broken_promise(
+        report_exceeds_bound(
           effects,
           match body.variable_name {
             Some(n) -> backticked_text(n).concat(b"'s operations"),
@@ -2146,13 +2146,13 @@ pub fn written_counts(
       match fn_type {
         FunctionType(f) ->
           range(0, f.params.len()).fold([], |acc: List<Int>, i: Int|
-            if holds_fn(f.params.get(i)) { acc.push(i) } else { acc }),
+            if contains_function(f.params.get(i)) { acc.push(i) } else { acc }),
         _ -> [],
       }
     },
   }
 
-fn broken_promise(
+fn report_exceeds_bound(
   checker: Checker,
   what: Bytes,
   site: PerformSite,
@@ -2270,7 +2270,7 @@ fn check_upper_bound(
   match definition.effects {
     None -> match definition.constant {
       Some(at) -> check_const_effects(checker, definition, at, inferred),
-      None -> check_unwritten(checker, definition, inferred),
+      None -> require_written_effects(checker, definition, inferred),
     },
     Some(_) -> match schema_of(checker.modules.get(checker.module).module, definition) {
       None -> check_written(checker, definition, declared, inferred),
@@ -2331,7 +2331,7 @@ fn named_sets(checker: Checker) -> List<NamedSet> / {abort.raise} = {
       Some(xs) -> acc.push({ name: b.name, listed: xs }),
       None -> acc,
     });
-  scope.modules.filter(written_binder).fold(bound, |acc: List<NamedSet>, mb: ModuleBinding|
+  scope.modules.filter(is_explicit_binding).fold(bound, |acc: List<NamedSet>, mb: ModuleBinding|
     checker.resolved.declarations.get(mb.target).sets.fold(
       acc,
       |a: List<NamedSet>, declared: Declaration|
@@ -2529,7 +2529,7 @@ fn check_const_effects(
   )
 }
 
-fn check_unwritten(
+fn require_written_effects(
   unclosed: Checker,
   definition: FnDefinition,
   inferred: Effects,
@@ -2696,7 +2696,7 @@ fn check_bounded_effects(
   )
 }
 
-fn unwritten_divergence(
+fn require_declared_divergence(
   checker: Checker,
   definition: FnDefinition,
   says_diverges: Bool,
@@ -3027,7 +3027,7 @@ fn numeric_mismatch(
     ],
   )
 
-fn writable(checker: Checker, signature: Signature, t: Type) -> Option<Bytes> / {abort.raise} = {
+fn signature_type_text(checker: Checker, signature: Signature, t: Type) -> Option<Bytes> / {abort.raise} = {
   let resolved = resolve(checker, t);
   let bound = signature.type_params.fold([], |acc: List<Int>, k: Bytes, p: Type|
     match resolve(checker, p) { VariableType(v) -> acc.push(v), _ -> acc });
@@ -3050,7 +3050,7 @@ fn require_written_signature(
     match p.ty {
       Some(_) -> c,
       None -> {
-        let label = match writable(c, signature, signature.params.get(i)) {
+        let label = match signature_type_text(c, signature, signature.params.get(i)) {
           Some(shown) -> Bytes::concat_all([b"write `", p.name.name, b": ", shown, b"`"]),
           None -> b"write a type here",
         };
@@ -3068,7 +3068,7 @@ fn require_written_signature(
   match definition.ret {
     Some(_) -> params,
     None -> {
-      let label = match writable(params, signature, signature.ret) {
+      let label = match signature_type_text(params, signature, signature.ret) {
         Some(shown) -> Bytes::concat_all([b"write `-> ", shown, b"`"]),
         None -> b"write a return type here",
       };
@@ -3196,7 +3196,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                 effects_written: false,
                 guards: guards::no_guards(),
                 raise_notes: [],
-                walking: owner,
+                current_definition: owner,
               };
               let pushed: Checker = { ..c1, env: env_push(c1.env) };
               let entered: Checker = match definition.cases {
@@ -3234,7 +3234,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                 o.checker,
                 { resource: |t: Type| is_resource_type(o.checker, [], t), owner: owner },
                 [],
-                tree_recorded(o.checker, entered.typed_bodies.len(), owner, TestRun),
+                typed_body(o.checker, entered.typed_bodies.len(), owner, TestRun),
               );
               let returned: Checker = check_test_result(judged.checker, definition, o.ty);
               let listed: Checker = match definition.cases {
@@ -3268,7 +3268,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                 effects: effects.listed,
                 at: location_of(checked, definition.span),
               }),
-              walking: b"",
+              current_definition: b"",
             },
             labels: acc.labels.push(written),
           }
@@ -3324,7 +3324,7 @@ fn check_listing(
   let o: Inference = infer_whole(checker, test_listing(cases), hint_of(listing_type()));
   let c = body_recorded(
     o.checker,
-    checker.walking,
+    checker.current_definition,
     CaseListing,
     definition.span.start,
     [],
@@ -3522,7 +3522,7 @@ fn check_law(
     guards: guards::no_guards(),
     raise_notes: [],
     auto_type_params: true,
-    walking: law_owner(parsed.name, definition.name),
+    current_definition: law_owner(parsed.name, definition.name),
     binders: item_binders(outer.resolved, outer.module, LawItem(definition)),
   };
   let types: WithTypes = definition.binders.fold(
@@ -3552,7 +3552,7 @@ fn check_law(
         ..walked,
         checker: body_recorded(
           walked.checker,
-          bound.walking,
+          bound.current_definition,
           LawGuard,
           definition.span.start,
           binders_typed,
@@ -3560,7 +3560,7 @@ fn check_law(
           g,
         ),
       };
-      let c: Checker = unfilled(
+      let c: Checker = default_no_effects(
         expect(
           o.checker,
           expression_span(g),
@@ -3580,7 +3580,7 @@ fn check_law(
     ..walked,
     checker: body_recorded(
       walked.checker,
-      guarded.walking,
+      guarded.current_definition,
       LawBody,
       definition.span.start,
       binders_typed,
@@ -3595,7 +3595,7 @@ fn check_law(
     body.ty,
     b"a law states a proposition",
   ).checker;
-  let c2: Checker = unfilled(stated, definition, body.effects);
+  let c2: Checker = default_no_effects(stated, definition, body.effects);
   let effects = resolve_effects_in(c2, body.effects);
   let c3: Checker = check_spec_purity(
     c2,
@@ -3634,7 +3634,7 @@ fn check_law(
     ..last,
     type_params: Map::new(),
     effect_params: Map::new(),
-    walking: outer.walking,
+    current_definition: outer.current_definition,
     laws: last.laws.push({
       name: definition.name,
       module: parsed.name,
@@ -3685,19 +3685,19 @@ fn instance_identities(
             match not_identity(shapes, acc.checker.keyed_names, resolved, vars) {
               None -> { ..acc, vars: ints_union(acc.vars, vars) },
               Some(rejection) ->
-                { ..acc, checker: not_identity_at(acc.checker, of, x.name, resolved, rejection) },
+                { ..acc, checker: identity_failure_at(acc.checker, of, x.name, resolved, rejection) },
             }
           },
         },
     )
   }
 
-fn not_identity_at(
+fn identity_failure_at(
   checker: Checker,
   of: SchemaInstance,
   param: Bytes,
   resolved: Type,
-  rejection: NotIdentity,
+  rejection: IdentityFailure,
 ) -> Checker / {abort.raise} = {
   let schema = of.schema.name.name;
   let shown = type_text(resolved);
@@ -3730,7 +3730,7 @@ fn not_identity_at(
   )
 }
 
-fn unfilled(
+fn default_no_effects(
   checker: Checker,
   definition: LawDefinition,
   effects: Effects,
@@ -3795,7 +3795,7 @@ pub fn check_schemas(outer: Checker, parsed: ParsedModule) -> Checker / {abort.r
     })
 
 fn law_binder(checker: Checker, binder: Binder) -> { checker: Checker, ty: Type } / {abort.raise} =
-  match handler_mention(checker, binder.ty) {
+  match undeclared_handler_span(checker, binder.ty) {
     Some(span) ->
       new_type(
         report_error_at(
@@ -3857,7 +3857,7 @@ fn handler_named(checker: Checker, name: Bytes, span: Span) -> Option<Span> / {a
   if is_handler && !declared { Some(span) } else { None }
 }
 
-fn handler_mention(checker: Checker, ty: TypeExpression) -> Option<Span> / {abort.raise} =
+fn undeclared_handler_span(checker: Checker, ty: TypeExpression) -> Option<Span> / {abort.raise} =
   match ty {
     UnitTypeExpression(_) -> None,
     InvalidTypeExpression(_) -> None,
@@ -3869,11 +3869,11 @@ fn handler_mention(checker: Checker, ty: TypeExpression) -> Option<Span> / {abor
     },
     FunctionTypeExpression(f) -> match first_handler_mention(checker, f.params) {
       Some(s) -> Some(s),
-      None -> handler_mention(checker, f.ret),
+      None -> undeclared_handler_span(checker, f.ret),
     },
     RecordTypeExpression(r) ->
       r.fields.fold(None, |acc: Option<Span>, f: { name: Identifier, ty: TypeExpression }|
-        match acc { Some(_) -> acc, None -> handler_mention(checker, f.ty) }),
+        match acc { Some(_) -> acc, None -> undeclared_handler_span(checker, f.ty) }),
   }
 
 fn first_handler_mention(
@@ -3881,7 +3881,7 @@ fn first_handler_mention(
   types: List<TypeExpression>,
 ) -> Option<Span> / {abort.raise} =
   types.fold(None, |acc: Option<Span>, ty: TypeExpression|
-    match acc { Some(_) -> acc, None -> handler_mention(checker, ty) })
+    match acc { Some(_) -> acc, None -> undeclared_handler_span(checker, ty) })
 
 fn raises(entry: EffectExpression) -> Bool =
   is_bare(entry.effect_name) && entry.effect_name.name.name == b"abort"
@@ -3944,7 +3944,7 @@ fn ungeneratable_within(
       Some(b"a `Scoped` is created by `with_scope` and exists only inside its scope")
     } else if c.name == task_name() {
       Some(b"a `Task` is a key into the scheduler of the simulation that spawned it")
-    } else if c.name == chan_name() {
+    } else if c.name == builtin_channel_name() {
       Some(b"a `Chan` is a key into the scheduler of the simulation that made it")
     } else if c.name == secret_name() {
       Some(
@@ -3989,21 +3989,21 @@ fn ungeneratable_within(
       first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
   }
 
-pub type NotIdentity = { part: Type, reason: Bytes }
+pub type IdentityFailure = { part: Type, reason: Bytes }
 
 pub fn not_identity(
   shapes: Shapes,
   keyed: List<Bytes>,
   ty: Type,
   assumed: List<Int>,
-) -> Option<NotIdentity> / {abort.raise} =
+) -> Option<IdentityFailure> / {abort.raise} =
   not_identity_within(shapes, keyed, ty, assumed, [], shapes.len())
 
-fn compares_as_is(name: Bytes) -> Bool =
+fn compares_by_value(name: Bytes) -> Bool =
   is_integer_name(name)
     || [bool_name(), char_name(), string_name(), bytes_name(), unit_name()].contains(name)
 
-fn holds_by_value(name: Bytes) -> Bool =
+fn is_collection_name(name: Bytes) -> Bool =
   [list_name(), array_name(), columns_name(), map_name()].contains(name)
 
 fn extern_type_note(name: Bytes) -> Bytes / {abort.raise} =
@@ -4020,9 +4020,9 @@ fn not_identity_within(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<NotIdentity> / {abort.raise} = {
+) -> Option<IdentityFailure> / {abort.raise} = {
   let within = |types: List<Type>, inside: List<Bytes>, left: Int|
-    types.fold(None, |acc: Option<NotIdentity>, t: Type|
+    types.fold(None, |acc: Option<IdentityFailure>, t: Type|
       match acc {
         Some(_) -> acc,
         None -> not_identity_within(shapes, keyed, t, assumed, inside, left),
@@ -4052,13 +4052,13 @@ fn not_identity_within(
     },
     NamedType(c) -> match stated(c.name) {
       Some(x) -> Some(x),
-      None -> if compares_as_is(c.name) { None } else if c.name == float_name() {
+      None -> if compares_by_value(c.name) { None } else if c.name == float_name() {
         rejected(
           b"`Float`'s `==` is IEEE 754's: `NaN != NaN`, and `0.0 == -0.0` though the two are different values",
         )
       } else if c.name == decimal_name() {
         rejected(b"a `Decimal` keeps its scale: `1.5m == 1.50m`, though the two print apart")
-      } else if holds_by_value(c.name) { within(c.args, visiting, room) }
+      } else if is_collection_name(c.name) { within(c.args, visiting, room) }
       else if visiting.contains(c.name) { within(c.args, visiting, room) } else {
         match shapes.get(c.name) {
           Some(shape) -> if shape.native { rejected(extern_type_note(c.name)) }
@@ -4312,7 +4312,7 @@ fn check_measure(
   env: SpecEnv,
 ) -> Checker / {abort.raise} = {
   let walked: Inference = infer_whole(
-    { ..spec_scope(checker, definition, env), walking: unlowered(env.name) },
+    { ..spec_scope(checker, definition, env), current_definition: body_walking_name(env.name) },
     expression,
   );
   let o: Inference = {
@@ -4327,7 +4327,7 @@ fn check_measure(
       expression,
     ),
   };
-  let popped: Checker = { ..o.checker, env: env_pop(o.checker.env), walking: checker.walking };
+  let popped: Checker = { ..o.checker, env: env_pop(o.checker.env), current_definition: checker.current_definition };
   let c1: Checker = expect(
     popped,
     expression_span(expression),
@@ -4385,7 +4385,7 @@ fn check_clause(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
-      walking: if clause.kind == CostClause || clause.kind == SpaceClause { unlowered(env.name) }
+      current_definition: if clause.kind == CostClause || clause.kind == SpaceClause { body_walking_name(env.name) }
       else { env.name },
     },
     clause.expression,
@@ -4405,7 +4405,7 @@ fn check_clause(
   let popped: Checker = {
     ..o.checker,
     spec_kind: outer,
-    walking: with_result.walking,
+    current_definition: with_result.current_definition,
     env: env_pop(o.checker.env),
   };
   let c1: Checker = match clause.kind {
@@ -4671,7 +4671,7 @@ pub fn is_key(kind: InstanceKind) -> Bool =
     ReleaseInstance -> false,
   }
 
-pub fn unlowered(owner: Bytes) -> Bytes = owner.concat(b"#")
+pub fn body_walking_name(owner: Bytes) -> Bytes = owner.concat(b"#")
 
 pub fn unlowered_of(walked: Bytes) -> Option<Bytes> =
   if walked.ends_with(b"#") { walked.slice_at(0, walked.len() - 1) } else { None }

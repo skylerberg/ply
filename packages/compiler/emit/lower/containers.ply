@@ -7,10 +7,10 @@ import compiler.check.known (option_item, map_name, array_type, columns_type, so
                              none_constructor)
 import compiler.check.resolve.tables (qualify)
 import compiler.emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt,
-                             NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap,
+                             NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap, ChildSwap,
                              TailStart, Spill, NewBranch, MapRoot, NodeCount, MapHeight, NodeKey,
-                             NodeValue, NodeKid, KidMax, KidSize, NewLeaf, NewMapBranch, PairPut,
-                             PairSet, PairTake, LeafCut, BranchCut, KidOut, KidBack, KidPut,
+                             NodeValue, NodeKid, ChildMaxKey, KidSize, NewLeaf, NewMapBranch, PairPut,
+                             PairSet, PairTake, LeafSplit, BranchSplit, KidOut, KidRestore, KidPut,
                              KidDrop, MapSwap, Recast, Pointer, PointerSum, CaseLayout, Inline,
                              classes, words, intrinsic_named)
 import compiler.emit.representations (Definition, has_variables, layout_variables, numeric_sum,
@@ -34,17 +34,17 @@ import compiler.emit.lower.module_context (imported_target, qualified, from_impo
                                            builtin_call_types)
 import compiler.emit.lower.representation (representation_of, layout_leaves)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, unreachable, bound_as,
-                                 run_for_effect, represented_as, noted, type_of, enter_block,
+                                 run_for_effect, represented_as, with_need, type_of, enter_block,
                                  exit_block, fresh, emitted, read_typed)
 import compiler.emit.lower.base
 import compiler.emit.lower.data (constructed_as)
-import compiler.emit.lower.scalars (scalar_builtin_call, stated, binary, numeric_in_place,
-                                    numeric_converted, decimal_conversion)
+import compiler.emit.lower.scalars (scalar_builtin_call, numeric_function_call, binary, numeric_in_place,
+                                    numeric_converted, is_decimal_conversion)
 import compiler.expand.rewrite (float_function, float_exact)
 import compiler.emit.statics (empty_map_static)
 import compiler.emit.typed_ir.statics (StaticDefinition)
 import compiler.emit.lower.marshalling (marshalling_builtin, marshalling_builtin_call,
-                                        type_descriptor, over_machine_words, fully_known,
+                                        type_descriptor, machine_word_call, fully_known,
                                         left_to_callers, assertion_failed)
 import compiler.emit.lower.kept (kept_builtin, kept_builtin_call)
 import compiler.emit.lower.strings
@@ -76,7 +76,7 @@ fn typed_builtin(
       None ->
         unreachable(b"an imported name that is neither a definition nor a builtin: ".concat(name)),
       Some(b) -> if b == b"assert_eq" { asserted(context, st, args, at) }
-      else if b == b"observe" { observed(context, st, args, at) }
+      else if b == b"observe" { observe_call(context, st, args, at) }
       else if b == b"Map::new" && args.len() == 0 { empty_map(context, st, args, callee, at) }
       else if kept_builtin(b) { kept_builtin_call(context, st, b, args, callee, at) }
       else if marshalling_builtin(b) { marshalling_builtin_call(context, st, b, args, callee, at) }
@@ -121,7 +121,7 @@ fn asserted(
     _ -> unreachable(b"`assert_eq` of other than two values"),
   }
 
-fn observed(
+fn observe_call(
   context: Context,
   st: Lowering,
   args: List<Arg>,
@@ -328,7 +328,7 @@ pub fn rest_read(st: Lowering, ty: Type, xs: Arg, k: Arg) -> LoweredValue =
   )
 
 fn note_block_layout(st: Lowering, ty: Type) -> Lowering =
-  released_variables(ty).fold(st, |acc: Lowering, v: Int| noted(acc, { var: v, reads: Layout }))
+  released_variables(ty).fold(st, |acc: Lowering, v: Int| with_need(acc, { var: v, reads: Layout }))
 
 type BuiltinCallTypes = { ret: Option<Type>, args: List<Type> }
 
@@ -379,7 +379,7 @@ fn container_builtin_call(
       }) {
     match f.ret {
       Some(t) -> if numeric_sum(context.setting.constructors, t) {
-        stated(context, st, b"of_int", args.drop(1), [int_type()], t, at)
+        numeric_function_call(context, st, b"of_int", args.drop(1), [int_type()], t, at)
       } else { numeric_converted(context, st, args.get(1), t, at) },
       None -> unreachable(b"`numeric_of_int` at no type the checker recorded"),
     }
@@ -453,12 +453,12 @@ fn runtime_builtin_call(
     }
   } else {
     match context.setting.machine.get(name) {
-      Some(call) -> over_machine_words(context, st, name, call, args, f.ret, callee, at),
-      None -> left_open(context, st, name, args, f, callee, at),
+      Some(call) -> machine_word_call(context, st, name, call, args, f.ret, callee, at),
+      None -> unspecialised_builtin_call(context, st, name, args, f, callee, at),
     }
   }
 
-fn left_open(
+fn unspecialised_builtin_call(
   context: Context,
   st: Lowering,
   name: Bytes,
@@ -514,7 +514,7 @@ fn scoped_builtin_call(
 
 fn note_element_layout(st: Lowering, t: Type) -> Lowering =
   if !has_open_layout(t) { st } else {
-    layout_variables(t).fold(st, |acc: Lowering, v: Int| noted(acc, { var: v, reads: Layout }))
+    layout_variables(t).fold(st, |acc: Lowering, v: Int| with_need(acc, { var: v, reads: Layout }))
   }
 
 fn has_open_layout(t: Type) -> Bool =
@@ -688,10 +688,10 @@ fn intrinsic_items(op: Intrinsic) -> IntrinsicItems =
     OfList(LeafSet) -> { read: false, at: [2] },
     OfMap(NodeKey) -> { read: true, at: [] },
     OfMap(NodeValue) -> { read: true, at: [] },
-    OfMap(KidMax) -> { read: true, at: [] },
+    OfMap(ChildMaxKey) -> { read: true, at: [] },
     OfMap(PairPut) -> { read: false, at: [2, 3] },
     OfMap(PairSet) -> { read: false, at: [2, 3] },
-    OfMap(KidBack) -> { read: false, at: [3] },
+    OfMap(KidRestore) -> { read: false, at: [3] },
     OfMap(KidPut) -> { read: false, at: [3] },
     _ -> { read: false, at: [] },
   }
@@ -718,26 +718,26 @@ fn intrinsic_shape(op: Intrinsic) -> IntrinsicShape = {
     OfList(LeafSet) -> written([Consumed, Index, Consumed]),
     OfList(NewBranch) -> made,
     OfList(RootSwap) -> record([Consumed, ConsumedOption]),
-    OfList(KidSwap) -> record([Consumed, Index, ConsumedOption]),
+    OfList(ChildSwap) -> record([Consumed, Index, ConsumedOption]),
     OfList(Spill) -> record([Consumed]),
     OfMap(MapRoot) -> read([Read], AsWord),
     OfMap(NodeCount) -> read([Read], AsInt),
     OfMap(MapHeight) -> read([Read], AsInt),
     OfMap(NodeKey) -> item,
     OfMap(NodeValue) -> item,
-    OfMap(KidMax) -> item,
+    OfMap(ChildMaxKey) -> item,
     OfMap(NodeKid) -> read([Read, Index], AsWord),
     OfMap(KidSize) -> read([Read, Index], AsInt),
     OfMap(NewLeaf) -> made,
     OfMap(NewMapBranch) -> made,
     OfMap(PairPut) -> written([Consumed, Index, Consumed, Consumed]),
     OfMap(PairSet) -> written([Consumed, Index, Consumed, Consumed]),
-    OfMap(KidBack) -> written([Consumed, Index, Consumed, Consumed, Index]),
+    OfMap(KidRestore) -> written([Consumed, Index, Consumed, Consumed, Index]),
     OfMap(KidPut) -> written([Consumed, Index, Consumed, Consumed, Index]),
     OfMap(KidDrop) -> written([Consumed, Index]),
     OfMap(PairTake) -> record([Consumed, Index]),
-    OfMap(LeafCut) -> record([Consumed, Index]),
-    OfMap(BranchCut) -> record([Consumed, Index]),
+    OfMap(LeafSplit) -> record([Consumed, Index]),
+    OfMap(BranchSplit) -> record([Consumed, Index]),
     OfMap(KidOut) -> record([Consumed, Index]),
     OfMap(MapSwap) -> record([Consumed, ConsumedOption, Index, Index]),
     Recast -> written([Consumed]),
@@ -1165,7 +1165,7 @@ pub fn scalar_builtin(name: Bytes) -> Bool =
     )
     || float_function(name) != None
     || float_exact(name) != None
-    || decimal_conversion(name)
+    || is_decimal_conversion(name)
 
 fn resolved(context: Context, name: Bytes) -> Option<Bytes> =
   match imported_target(context.setting.imports, name) {

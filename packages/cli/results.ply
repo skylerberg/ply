@@ -5,7 +5,7 @@ import std.random (entropy)
 import std.time (time)
 import std.bytes
 import compiler.store.hash.forms (CachedNode, ModuleHashes, ModuleRecord, NodeRef, RecordedGraph,
-                                  module_record, record_digest, recorded_graph, recorded_reach)
+                                  module_record, record_digest, recorded_graph, recorded_reachable_hashes)
 import compiler.check.resolve.tables (Diagnostic)
 import project_store
 import paths
@@ -63,7 +63,7 @@ pub fn open_store(
 
 type StoreRead<a> = { value: a, cache: tables::Cache }
 
-fn passes_over<[r], [u]>(
+fn read_pass_traces<[r], [u]>(
   c0: tables::Cache,
   keys: List<Bytes>,
 ) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], fs.read[u], abort.raise} =
@@ -138,7 +138,7 @@ fn last_passes_over<[r]>(
       match rec {
         None -> None,
         Some(p) -> match eras.value.get(p.era) {
-          Some(Some(g)) -> match recorded_reach(g, p.of, p.case) {
+          Some(Some(g)) -> match recorded_reachable_hashes(g, p.of, p.case) {
             Some(reached) -> Some({ test: p.test_hash, reached: reached }),
             None -> None,
           },
@@ -149,7 +149,7 @@ fn last_passes_over<[r]>(
   }
 }
 
-fn texts_over<[r]>(
+fn read_texts<[r]>(
   c0: tables::Cache,
   hashes: List<Bytes>,
 ) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], abort.raise} =
@@ -159,7 +159,7 @@ fn texts_over<[r]>(
   })
 
 pub fn unstored_in(cache: tables::Cache, hashes: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  hashes.filter(|h: Bytes| !tables::holds_text(cache, h))
+  hashes.filter(|h: Bytes| !tables::has_text(cache, h))
 
 pub fn store_pass(
   c0: tables::Cache,
@@ -170,7 +170,7 @@ pub fn store_pass(
     tables::put_text(c, t.hash, t.text));
   if modules.len() == 0 { store_state } else {
     let record_evidence = modules.fold(store_state, |c: tables::Cache, m: ModuleHashes|
-      if tables::holds_module_record(c, m.record) { c }
+      if tables::has_module_record(c, m.record) { c }
       else { tables::put_module_record(c, module_record(m.fixing)) });
     tables::put_snapshot(record_evidence, snapshot_of(modules))
   }
@@ -239,8 +239,8 @@ pub fn with_result_cache<a | e>(
     result_cache.passes(keys) -> match store_state {
       None -> keys.map(|key: Bytes| None),
       Some(k) -> {
-        let o = if k.place.label == "cwd" { passes_over[cwd, abs](k.cache, keys) }
-        else { passes_over[abs, abs](k.cache, keys) };
+        let o = if k.place.label == "cwd" { read_pass_traces[cwd, abs](k.cache, keys) }
+        else { read_pass_traces[abs, abs](k.cache, keys) };
         store_state = Some({ ..k, cache: o.cache });
         o.value
       },
@@ -270,8 +270,8 @@ pub fn with_result_cache<a | e>(
     result_cache.texts(hashes) -> match store_state {
       None -> hashes.map(|h: Bytes| None),
       Some(k) -> {
-        let o = if k.place.label == "cwd" { texts_over[cwd](k.cache, hashes) }
-        else { texts_over[abs](k.cache, hashes) };
+        let o = if k.place.label == "cwd" { read_texts[cwd](k.cache, hashes) }
+        else { read_texts[abs](k.cache, hashes) };
         store_state = Some({ ..k, cache: o.cache });
         o.value
       },
@@ -490,26 +490,26 @@ fn a_filing() -> Filing / {abort.raise} =
 
 fn some_stamps() -> tables::Stamps = { runtime: "runtime", code: "code" }
 
-fn old_f() -> { hash: Bytes, text: Bytes } = { hash: hashed("old f"), text: b"fn f() -> Int = 1\n" }
+fn original_definition() -> { hash: Bytes, text: Bytes } = { hash: hashed("old f"), text: b"fn f() -> Int = 1\n" }
 
 fn read_back(
   f: Filing,
 ) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   run_in_memory(mem_empty(), || {
-    let c0 = store_pass(tables::open_cache[mem]("cache", some_stamps()), [old_f()], [a_module()]);
+    let c0 = store_pass(tables::open_cache[mem]("cache", some_stamps()), [original_definition()], [a_module()]);
     let c1 = tables::flush_cache[mem](put_filing[mem, mem](c0, f));
     let r = tables::open_cache[mem]("cache", some_stamps());
     let moved = tables::open_cache[mem]("cache", { ..some_stamps(), runtime: "another" });
     {
-      passes: passes_over[mem, mem](r, [hashed("t key"), hashed("other")]).value,
+      passes: read_pass_traces[mem, mem](r, [hashed("t key"), hashed("other")]).value,
       codes: code_passes_over[mem, mem](r, [hashed("t code"), hashed("t key")]).value,
       moved: code_passes_over[mem, mem](moved, [hashed("t code")]).value.fold(
-        passes_over[mem, mem](moved, [hashed("t key")]).value,
+        read_pass_traces[mem, mem](moved, [hashed("t key")]).value,
         |acc: List<Option<Bytes>>, o: Option<Bytes>| acc.push(o),
       ),
       seen: [hashed("f"), hashed("g")].map(|h: Bytes| tables::knows_definition(r, h)),
       baselines: last_passes_over[mem](r, [b"m.t", b"m.u"]).value,
-      texts: texts_over[mem](r, [old_f().hash, hashed("missing")]).value,
+      texts: read_texts[mem](r, [original_definition().hash, hashed("missing")]).value,
     }
   }).value
 
@@ -529,7 +529,7 @@ test "a run's passes, baselines and sightings are kept, and a baseline is walked
     }),
     None,
   ]);
-  assert_eq(back.texts, [Some(old_f().text), None])
+  assert_eq(back.texts, [Some(original_definition().text), None])
 }
 
 test "a baseline whose era lost a module record is no baseline" {
@@ -542,18 +542,18 @@ test "a baseline whose era lost a module record is no baseline" {
 
 test "another build's baselines are dropped with its passes, and the texts stay" {
   let back = run_in_memory(mem_empty(), || {
-    let recorded = store_pass(tables::open_cache[mem]("cache", some_stamps()), [old_f()], [
+    let recorded = store_pass(tables::open_cache[mem]("cache", some_stamps()), [original_definition()], [
       a_module(),
     ]);
     let c1 = tables::flush_cache[mem](put_filing[mem, mem](recorded, a_filing()));
     let moved = tables::open_cache[mem]("cache", { ..some_stamps(), runtime: "another" });
     {
       baselines: last_passes_over[mem](moved, [b"m.t"]).value,
-      texts: texts_over[mem](moved, [old_f().hash]).value,
+      texts: read_texts[mem](moved, [original_definition().hash]).value,
     }
   }).value;
   assert_eq(back.baselines, [None]);
-  assert_eq(back.texts, [Some(old_f().text)])
+  assert_eq(back.texts, [Some(original_definition().text)])
 }
 
 test "a filing of nothing keeps nothing" {

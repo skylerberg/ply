@@ -14,7 +14,7 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     LetElseStatement, ExpressionStatement, AssignmentStatement,
                                     HandlerVar, NamedArg, MatchArm, HandleClause, ReturnClause,
                                     RecordLiteralField, expression_span, TaggedLiteralExpression,
-                                    Hole, with_hole_values, exit_effect, is_exit_effect, exit_op)
+                                    Hole, with_hole_values, exit_effect, is_exit_effect, exit_operation_name)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternConstructor,
                                  LiteralUnit)
 import std.bytes (ascii_of_int)
@@ -39,9 +39,9 @@ type TryState = {
   item_start: Int,
 }
 
-type Lift = { operand: Expression, binder: Identifier, at: Span }
+type FoundTry = { operand: Expression, binder: Identifier, at: Span }
 
-type Scan = | ScanFound(Lift) | ScanPure | ScanImpure
+type Scan = | ScanFound(FoundTry) | ScanPure | ScanImpure
 
 type ScanResult = { state: TryState, scan: Scan, expression: Expression }
 
@@ -71,7 +71,7 @@ fn shadowing_constructor(module: Module) -> Option<Bytes> =
       }),
   }
 
-fn unreadable() -> Bytes =
+fn unreadable_return_message() -> Bytes =
   b"the return type has no head constructor this file can read: a type parameter and a generic alias have none until they are applied"
 
 fn not_result_or_option(head: Bytes) -> Bytes =
@@ -99,7 +99,7 @@ fn mode_of(state: TryState, ty: TypeExpression, depth: Int) -> Result<TryMode, B
         let n = c.name.name.name;
         match find_type(state.types, n) {
           None -> Err(not_result_or_option(n)),
-          Some(d) -> if is_generic(d.generics) { Err(unreadable()) } else {
+          Some(d) -> if is_generic(d.generics) { Err(unreadable_return_message()) } else {
             match d.body {
               SumBody(_) -> Err(not_result_or_option(n)),
               NominalBody(_) -> Err(not_result_or_option(n)),
@@ -109,7 +109,7 @@ fn mode_of(state: TryState, ty: TypeExpression, depth: Int) -> Result<TryMode, B
           },
         }
       },
-      _ -> Err(unreadable()),
+      _ -> Err(unreadable_return_message()),
     }
   }
 
@@ -153,7 +153,7 @@ fn exit_raise(exit: Bytes, span: Span, value: Expression) -> Expression = {
   PerformExpression({
     span: at,
     effect_name: bare({ name: exit, span: at }),
-    op: { name: exit_op(), span: at },
+    op: { name: exit_operation_name(), span: at },
     resource: None,
     args: [value],
   })
@@ -449,7 +449,7 @@ fn lift_from_head(
       match w.expression {
         MatchExpression(m) -> {
           let success = m.arms.get(1);
-          let inner = if remaining <= 0 { panic(lifted_past()) }
+          let inner = if remaining <= 0 { panic(extra_lift_message()) }
           else { lift_from_head(w.state, success.body, remaining - 1) };
           {
             state: inner.state,
@@ -501,7 +501,7 @@ fn scan_head(state: TryState, expression: Expression) -> ScanResult / {abort.rai
     _ -> scan(state, expression),
   }
 
-fn lifted_past() -> String = "a `?` lifted past the ones written"
+fn extra_lift_message() -> String = "a `?` lifted past the ones written"
 
 fn return_position(
   state: TryState,
@@ -633,7 +633,7 @@ fn split_at(
       let kept = statements.set(i, taken.stmt);
       let rest = kept.drop(if t.consumes { i + 1 } else { i });
       let body0 = BlockExpression({ span: made_at(t.at), tail: tail, statements: rest });
-      let body = if remaining <= 0 { panic(lifted_past()) }
+      let body = if remaining <= 0 { panic(extra_lift_message()) }
       else { return_block(taken.state, body0, remaining - 1) };
       let w = try_match(body.state, t.operand, t.at, t.pattern, body.expression);
       { state: w.state, statements: kept, split: Some(w.expression) }
@@ -1146,7 +1146,7 @@ fn catch_exit(state: TryState, exit: Bytes, h: Expression) -> TryOutput / {abort
         clauses: [
           {
             effect_name: bare({ name: exit, span: span }),
-            op: { name: exit_op(), span: span },
+            op: { name: exit_operation_name(), span: span },
             resource: None,
             every_label: false,
             label_binder: None,
@@ -1171,18 +1171,18 @@ fn catches_exit(operand: Expression) -> Bool =
 fn barrier_for_parts(state: TryState, barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
   if state.mode == None { outermost_barrier(barrier, what) } else { barrier }
 
-fn sweep(
+fn rewrite_tries(
   state: TryState,
   expression: Expression,
   scope: Option<Bytes>,
   barrier: Option<Bytes>,
 ) -> TryOutput / {abort.raise} =
-  sweep_within(state, expression, scope, barrier, count_in(expression, is_typed_lambda))
+  rewrite_tries_within(state, expression, scope, barrier, count_in(expression, is_typed_lambda))
 
 fn is_typed_lambda(e: Expression) -> Bool =
   match e { LambdaExpression(l) -> l.ret != None, _ -> false }
 
-fn sweep_within(
+fn rewrite_tries_within(
   state: TryState,
   expression: Expression,
   scope: Option<Bytes>,
@@ -1265,12 +1265,12 @@ fn sweep_inner(
 ) -> TryOutput / {abort.raise} =
   match expression {
     PropagateExpression(t) -> {
-      let o = sweep_within(state, t.operand, scope, barrier, remaining);
+      let o = rewrite_tries_within(state, t.operand, scope, barrier, remaining);
       { state: o.state, expression: PropagateExpression({ span: t.span, operand: o.expression }) }
     },
     BinaryExpression(b) -> {
-      let l = sweep_within(state, b.lhs, scope, barrier, remaining);
-      let r = sweep_within(l.state, b.rhs, scope, barrier, remaining);
+      let l = rewrite_tries_within(state, b.lhs, scope, barrier, remaining);
+      let r = rewrite_tries_within(l.state, b.rhs, scope, barrier, remaining);
       {
         state: r.state,
         expression: BinaryExpression({
@@ -1282,7 +1282,7 @@ fn sweep_inner(
       }
     },
     UnaryExpression(u) -> {
-      let o = sweep_within(state, u.operand, scope, barrier, remaining);
+      let o = rewrite_tries_within(state, u.operand, scope, barrier, remaining);
       {
         state: o.state,
         expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
@@ -1290,7 +1290,7 @@ fn sweep_inner(
     },
     LambdaExpression(l) -> match l.ret {
       None -> {
-        let o = sweep_within(
+        let o = rewrite_tries_within(
           state,
           l.body,
           scope,
@@ -1309,7 +1309,7 @@ fn sweep_inner(
       },
       Some(ty) -> match mode_for(state, Some(ty)) {
         Err(reason) -> {
-          let o = sweep_within(state, l.body, Some(reason), None, remaining);
+          let o = rewrite_tries_within(state, l.body, Some(reason), None, remaining);
           {
             state: o.state,
             expression: LambdaExpression({
@@ -1325,7 +1325,7 @@ fn sweep_inner(
           let ex = lift_exits({ ..state, mode: Some(m) }, l.body);
           let r = return_position(ex.state, ex.expression, tries_in(ex.expression));
           let s: TryOutput = if remaining <= 0 { panic("a lambda swept past the ones written") }
-          else { sweep_within(r.state, r.expression, None, None, remaining - 1) };
+          else { rewrite_tries_within(r.state, r.expression, None, None, remaining - 1) };
           {
             state: { ..s.state, mode: saved },
             expression: LambdaExpression({
@@ -1339,12 +1339,12 @@ fn sweep_inner(
       },
     },
     CallExpression(a) -> {
-      let f = sweep_within(state, a.function, scope, barrier, remaining);
-      let args = sweep_all(f.state, a.args, scope, barrier, remaining);
+      let f = rewrite_tries_within(state, a.function, scope, barrier, remaining);
+      let args = rewrite_tries_all(f.state, a.args, scope, barrier, remaining);
       let named = a.named.fold(
         { state: args.state, args: [] },
         |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
-          let o = sweep_within(acc.state, arg.value, scope, barrier, remaining);
+          let o = rewrite_tries_within(acc.state, arg.value, scope, barrier, remaining);
           {
             state: o.state,
             args: acc.args.push({ name: arg.name, value: o.expression, span: arg.span }),
@@ -1363,9 +1363,9 @@ fn sweep_inner(
       }
     },
     IfExpression(i) -> {
-      let c = sweep_within(state, i.cond, scope, barrier, remaining);
-      let t = sweep_within(c.state, i.then_branch, scope, barrier, remaining);
-      let el = sweep_within(t.state, i.else_branch, scope, barrier, remaining);
+      let c = rewrite_tries_within(state, i.cond, scope, barrier, remaining);
+      let t = rewrite_tries_within(c.state, i.then_branch, scope, barrier, remaining);
+      let el = rewrite_tries_within(t.state, i.else_branch, scope, barrier, remaining);
       {
         state: el.state,
         expression: IfExpression({
@@ -1377,18 +1377,18 @@ fn sweep_inner(
       }
     },
     MatchExpression(m) -> {
-      let sc = sweep_within(state, m.scrutinee, scope, barrier, remaining);
+      let sc = rewrite_tries_within(state, m.scrutinee, scope, barrier, remaining);
       let arms = m.arms.fold(
         { state: sc.state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
             None -> { state: acc.state, expression: None },
             Some(x) -> {
-              let o = sweep_within(acc.state, x, scope, barrier, remaining);
+              let o = rewrite_tries_within(acc.state, x, scope, barrier, remaining);
               { state: o.state, expression: Some(o.expression) }
             },
           };
-          let b = sweep_within(g.state, arm.body, scope, barrier, remaining);
+          let b = rewrite_tries_within(g.state, arm.body, scope, barrier, remaining);
           {
             state: b.state,
             arms: acc.arms.push({
@@ -1411,7 +1411,7 @@ fn sweep_inner(
         |acc: { state: TryState, statements: List<Statement> }, stmt: Statement|
           match stmt {
             LetStatement(l) -> {
-              let o = sweep_within(acc.state, l.value, scope, barrier, remaining);
+              let o = rewrite_tries_within(acc.state, l.value, scope, barrier, remaining);
               {
                 state: o.state,
                 statements: acc.statements.push(
@@ -1420,8 +1420,8 @@ fn sweep_inner(
               }
             },
             LetElseStatement(l) -> {
-              let v = sweep_within(acc.state, l.value, scope, barrier, remaining);
-              let f = sweep_within(v.state, l.fallback, scope, barrier, remaining);
+              let v = rewrite_tries_within(acc.state, l.value, scope, barrier, remaining);
+              let f = rewrite_tries_within(v.state, l.fallback, scope, barrier, remaining);
               {
                 state: f.state,
                 statements: acc.statements.push(
@@ -1430,11 +1430,11 @@ fn sweep_inner(
               }
             },
             ExpressionStatement(x) -> {
-              let o = sweep_within(acc.state, x, scope, barrier, remaining);
+              let o = rewrite_tries_within(acc.state, x, scope, barrier, remaining);
               { state: o.state, statements: acc.statements.push(ExpressionStatement(o.expression)) }
             },
             AssignmentStatement(x) -> {
-              let o = sweep_within(acc.state, x.value, scope, barrier, remaining);
+              let o = rewrite_tries_within(acc.state, x.value, scope, barrier, remaining);
               {
                 state: o.state,
                 statements: acc.statements.push(AssignmentStatement({ ..x, value: o.expression })),
@@ -1445,7 +1445,7 @@ fn sweep_inner(
       let tl = match b.tail {
         None -> { state: statements.state, expression: None },
         Some(t) -> {
-          let o = sweep_within(statements.state, t, scope, barrier, remaining);
+          let o = rewrite_tries_within(statements.state, t, scope, barrier, remaining);
           { state: o.state, expression: Some(o.expression) }
         },
       };
@@ -1463,7 +1463,7 @@ fn sweep_inner(
       { state: o.state, expression: RecordExpression({ span: r.span, fields: o.fields }) }
     },
     RecordUpdateExpression(r) -> {
-      let b = sweep_within(state, r.base, scope, barrier, remaining);
+      let b = rewrite_tries_within(state, r.base, scope, barrier, remaining);
       let o = sweep_fields(b.state, r.fields, scope, barrier, remaining);
       {
         state: o.state,
@@ -1471,18 +1471,18 @@ fn sweep_inner(
       }
     },
     FieldExpression(f) -> {
-      let o = sweep_within(state, f.base, scope, barrier, remaining);
+      let o = rewrite_tries_within(state, f.base, scope, barrier, remaining);
       {
         state: o.state,
         expression: FieldExpression({ span: f.span, base: o.expression, field: f.field }),
       }
     },
     ListExpression(l) -> {
-      let o = sweep_all(state, l.items, scope, barrier, remaining);
+      let o = rewrite_tries_all(state, l.items, scope, barrier, remaining);
       { state: o.state, expression: ListExpression({ span: l.span, items: o.expressions }) }
     },
     PerformExpression(p) -> {
-      let o = sweep_all(state, p.args, scope, barrier, remaining);
+      let o = rewrite_tries_all(state, p.args, scope, barrier, remaining);
       {
         state: o.state,
         expression: PerformExpression({
@@ -1498,11 +1498,11 @@ fn sweep_inner(
       let vs = h.vars.fold(
         { state: state, vars: [] },
         |acc: { state: TryState, vars: List<HandlerVar> }, v: HandlerVar| {
-          let o = sweep_within(acc.state, v.init, scope, barrier, remaining);
+          let o = rewrite_tries_within(acc.state, v.init, scope, barrier, remaining);
           { state: o.state, vars: acc.vars.push({ ..v, init: o.expression }) }
         },
       );
-      let b = sweep_within(
+      let b = rewrite_tries_within(
         vs.state,
         h.body,
         scope,
@@ -1512,7 +1512,7 @@ fn sweep_inner(
       let cs = h.clauses.fold(
         { state: b.state, clauses: [] },
         |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
-          let o = sweep_within(
+          let o = rewrite_tries_within(
             acc.state,
             c.body,
             scope,
@@ -1538,7 +1538,7 @@ fn sweep_inner(
       let r = match h.ret {
         None -> { state: cs.state, ret: None },
         Some(rc) -> {
-          let o = sweep_within(
+          let o = rewrite_tries_within(
             cs.state,
             rc.body,
             scope,
@@ -1560,15 +1560,15 @@ fn sweep_inner(
       }
     },
     WithScopeExpression(c) -> {
-      let a = sweep_within(state, c.acquire, scope, barrier, remaining);
-      let r = sweep_within(
+      let a = rewrite_tries_within(state, c.acquire, scope, barrier, remaining);
+      let r = rewrite_tries_within(
         a.state,
         c.release,
         scope,
         outermost_barrier(barrier, b"a `with_scope` release"),
         remaining,
       );
-      let b = sweep_within(
+      let b = rewrite_tries_within(
         r.state,
         c.body,
         scope,
@@ -1586,7 +1586,7 @@ fn sweep_inner(
       }
     },
     SimulateExpression(x) -> {
-      let o = sweep_within(
+      let o = rewrite_tries_within(
         state,
         x.body,
         scope,
@@ -1596,7 +1596,7 @@ fn sweep_inner(
       { state: o.state, expression: SimulateExpression({ span: x.span, body: o.expression }) }
     },
     ParallelExpression(x) -> {
-      let o = sweep_all(
+      let o = rewrite_tries_all(
         state,
         x.branches,
         scope,
@@ -1606,7 +1606,7 @@ fn sweep_inner(
       { state: o.state, expression: ParallelExpression({ span: x.span, branches: o.expressions }) }
     },
     TryBlockExpression(x) -> {
-      let o = sweep_within(
+      let o = rewrite_tries_within(
         state,
         x.body,
         scope,
@@ -1619,7 +1619,7 @@ fn sweep_inner(
       let filled = t.holes.fold(
         { state: state, holes: [] },
         |acc: { state: TryState, holes: List<Hole> }, h: Hole| {
-          let o = sweep_within(acc.state, h.value, scope, barrier, remaining);
+          let o = rewrite_tries_within(acc.state, h.value, scope, barrier, remaining);
           { state: o.state, holes: acc.holes.push({ ..h, value: o.expression }) }
         },
       );
@@ -1628,7 +1628,7 @@ fn sweep_inner(
     _ -> { state: state, expression: expression },
   }
 
-fn sweep_all(
+fn rewrite_tries_all(
   state: TryState,
   expressions: List<Expression>,
   scope: Option<Bytes>,
@@ -1638,7 +1638,7 @@ fn sweep_all(
   expressions.fold(
     { state: state, expressions: [] },
     |acc: { state: TryState, expressions: List<Expression> }, expression: Expression| {
-      let o = sweep_within(acc.state, expression, scope, barrier, remaining);
+      let o = rewrite_tries_within(acc.state, expression, scope, barrier, remaining);
       { state: o.state, expressions: acc.expressions.push(o.expression) }
     },
   )
@@ -1653,7 +1653,7 @@ fn sweep_fields(
   fields.fold(
     { state: state, fields: [] },
     |acc: { state: TryState, fields: List<RecordLiteralField> }, field: RecordLiteralField| {
-      let o = sweep_within(acc.state, field.value, scope, barrier, remaining);
+      let o = rewrite_tries_within(acc.state, field.value, scope, barrier, remaining);
       { state: o.state, fields: acc.fields.push({ name: field.name, value: o.expression }) }
     },
   )
@@ -1680,7 +1680,7 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
             CostClause -> b"a `cost` clause",
             SpaceClause -> b"a `space` clause",
           };
-          let o = sweep(acc.state, clause.expression, Some(not_in_a_function(what)), None);
+          let o = rewrite_tries(acc.state, clause.expression, Some(not_in_a_function(what)), None);
           {
             state: o.state,
             clauses: acc.clauses.push({
@@ -1694,16 +1694,16 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
       let measured: { state: TryState, expression: Option<Expression> } = match d.decreases {
         None -> { state: spec.state, expression: None },
         Some(e) -> {
-          let o = sweep(spec.state, e, Some(not_in_a_function(b"a `decreases` clause")), None);
+          let o = rewrite_tries(spec.state, e, Some(not_in_a_function(b"a `decreases` clause")), None);
           { state: o.state, expression: Some(o.expression) }
         },
       };
       let body = match mode_for(state, d.ret) {
-        Err(reason) -> sweep(measured.state, d.body, Some(reason), None),
+        Err(reason) -> rewrite_tries(measured.state, d.body, Some(reason), None),
         Ok(m) -> {
           let ex = lift_exits({ ..measured.state, mode: Some(m) }, d.body);
           let r = return_position(ex.state, ex.expression, tries_in(ex.expression));
-          let s: TryOutput = sweep(r.state, r.expression, None, None);
+          let s: TryOutput = rewrite_tries(r.state, r.expression, None, None);
           { state: { ..s.state, mode: None }, expression: s.expression }
         },
       };
@@ -1734,15 +1734,15 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
       let ranged = match d.cases {
         None -> { state: state, cases: None },
         Some(c) -> {
-          let table = sweep(state, c.table, Some(reason), None);
-          let label = sweep(table.state, c.label, Some(reason), None);
+          let table = rewrite_tries(state, c.table, Some(reason), None);
+          let label = rewrite_tries(table.state, c.label, Some(reason), None);
           {
             state: label.state,
             cases: Some({ ..c, table: table.expression, label: label.expression }),
           }
         },
       };
-      let o = sweep(ranged.state, d.body, Some(reason), None);
+      let o = rewrite_tries(ranged.state, d.body, Some(reason), None);
       { state: o.state, item: TestItem({ ..d, cases: ranged.cases, body: o.expression }) }
     },
     LawItem(d) -> {
@@ -1750,11 +1750,11 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
       let g = match d.guard {
         None -> { state: state, expression: None },
         Some(x) -> {
-          let o = sweep(state, x, Some(reason), None);
+          let o = rewrite_tries(state, x, Some(reason), None);
           { state: o.state, expression: Some(o.expression) }
         },
       };
-      let b = sweep(g.state, d.body, Some(reason), None);
+      let b = rewrite_tries(g.state, d.body, Some(reason), None);
       { state: b.state, item: LawItem({ ..d, guard: g.expression, body: b.expression }) }
     },
     SchemaItem(d) -> {
@@ -1762,11 +1762,11 @@ fn expand_item_try(outer: TryState, item: Item) -> { state: TryState, item: Item
       let g = match d.guard {
         None -> { state: state, expression: None },
         Some(x) -> {
-          let o = sweep(state, x, Some(reason), None);
+          let o = rewrite_tries(state, x, Some(reason), None);
           { state: o.state, expression: Some(o.expression) }
         },
       };
-      let b = sweep(g.state, d.body, Some(reason), None);
+      let b = rewrite_tries(g.state, d.body, Some(reason), None);
       { state: b.state, item: SchemaItem({ ..d, guard: g.expression, body: b.expression }) }
     },
     _ -> { state: state, item: item },

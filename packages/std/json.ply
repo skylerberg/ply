@@ -522,9 +522,9 @@ fn write(j: Json, depth: Int, pad: Option<Bytes>) -> Bytes / {abort.raise} =
     Number(d) -> Bytes::of_string(d.to_string()),
     Str(s) -> quote(s),
     Array(items) -> if depth >= max_depth() { unwritable() }
-    else { held(b"[", items.map(|x: Json| write(x, depth + 1, pad)), b"]", depth, pad) },
+    else { container_contents(b"[", items.map(|x: Json| write(x, depth + 1, pad)), b"]", depth, pad) },
     Object(m) -> if depth >= max_depth() { unwritable() }
-    else { held(b"{", m.entries().map(|e: Member| member(e, depth + 1, pad)), b"}", depth, pad) },
+    else { container_contents(b"{", m.entries().map(|e: Member| member(e, depth + 1, pad)), b"}", depth, pad) },
   }
 
 /// Valid UTF-8 by construction: every emitted byte is ASCII or comes from a `String`.
@@ -539,7 +539,7 @@ fn member(e: Member, depth: Int, pad: Option<Bytes>) -> Bytes / {abort.raise} =
   )
 
 /// The contents of an array or an object at `depth`, between its brackets.
-fn held(open: Bytes, parts: List<Bytes>, close: Bytes, depth: Int, pad: Option<Bytes>) -> Bytes =
+fn container_contents(open: Bytes, parts: List<Bytes>, close: Bytes, depth: Int, pad: Option<Bytes>) -> Bytes =
   match pad {
     None -> wrap(open, Bytes::join(parts, b","), close),
     Some(step) -> if parts.len() == 0 { open.concat(close) } else {
@@ -991,7 +991,7 @@ fn b64_group(raw: Bytes, i: Int) -> Bytes / {abort.raise} = {
   let n = raw.len();
   let a = raw.at(i);
   if i + 3 <= n { b64_three(a, raw.at(i + 1), raw.at(i + 2)) }
-  else if i + 2 == n { b64_two(a, raw.at(i + 1)) }
+  else if i + 2 == n { b64_tail_two(a, raw.at(i + 1)) }
   else { b64_one(a) }
 }
 
@@ -1000,7 +1000,7 @@ fn b64_three(a: Int, b: Int, c: Int) -> Bytes / {abort.raise} =
     b64_symbol(b % 16 * 4 + c / 64).concat(b64_symbol(c % 64)),
   )
 
-fn b64_two(a: Int, b: Int) -> Bytes / {abort.raise} =
+fn b64_tail_two(a: Int, b: Int) -> Bytes / {abort.raise} =
   b64_symbol(a / 4).concat(b64_symbol(a % 4 * 16 + b / 16)).concat(
     b64_symbol(b % 16 * 4).concat(b"="),
   )
@@ -1281,16 +1281,16 @@ test "a codec's decode undoes its encode" {
 
 test "a reader returns the same result wherever its input is cut" {
   gen::check2(gen::list(jsons()), gen::any_int(), |js: List<Json>, cut: Int| {
-    fed(cut_in_two(lines_to_bytes(js), cut), no_line_limit(), max_depth())
+    read_chunks(cut_in_two(lines_to_bytes(js), cut), no_line_limit(), max_depth())
       == parse_lines(lines_to_bytes(js), no_line_limit(), max_depth())
   })
 }
 
-type Squeeze = { out: Bytes, inside: Bool, escaped: Bool }
+type StringScan = { out: Bytes, inside: Bool, escaped: Bool }
 
 /// `text` without the whitespace outside its strings.
 fn squeezed(text: Bytes) -> Bytes =
-  range(0, text.len()).fold({ out: b"", inside: false, escaped: false }, |s: Squeeze, i: Int| {
+  range(0, text.len()).fold({ out: b"", inside: false, escaped: false }, |s: StringScan, i: Int| {
     let c = text.at(i);
     let kept = s.out.concat(byte_of_int(c));
     if s.inside { { out: kept, inside: s.escaped || c != 34, escaped: !s.escaped && c == 92 } }
@@ -1309,7 +1309,7 @@ fn cut_in_two(text: Bytes, cut: Int) -> List<Bytes> / {abort.raise} = {
 }
 
 /// What a reader returns for an input given to it as these chunks.
-fn fed(
+fn read_chunks(
   chunks: List<Bytes>,
   max_line: Int,
   max_depth: Int,
@@ -1829,7 +1829,7 @@ fn collect_prices(
 
 // --- Tests: the round trip --------------------------------------------------
 
-fn stable(src: Bytes) -> Bool / {abort.raise} = to_bytes(parsed(src)) == src
+fn round_trips(src: Bytes) -> Bool / {abort.raise} = to_bytes(parsed(src)) == src
 
 test "a large array renders and parses back to itself" {
   let big = Array(range(0, 2000).map(|i: Int| Number(Decimal::of_int(i))));
@@ -1841,13 +1841,13 @@ test "a large array renders and parses back to itself" {
 }
 
 test "rendering is canonical, so a rendered document parses to itself" {
-  assert(stable(b"null"));
-  assert(stable(b"[1,2,3]"));
-  assert(stable(b"{\"a\":1,\"b\":[true,null]}"));
-  assert(stable(b"\"\\u0000\\n\\\"\""));
-  assert(stable(b"-1.50"));
+  assert(round_trips(b"null"));
+  assert(round_trips(b"[1,2,3]"));
+  assert(round_trips(b"{\"a\":1,\"b\":[true,null]}"));
+  assert(round_trips(b"\"\\u0000\\n\\\"\""));
+  assert(round_trips(b"-1.50"));
   // Whitespace and key order round-trip through the value but not byte for byte.
-  assert(!stable(b"[1, 2]"));
+  assert(!round_trips(b"[1, 2]"));
   assert_eq(parsed(b"[1, 2]"), parsed(b"[1,2]"))
 }
 
@@ -1922,9 +1922,9 @@ test "a blank line contains no value and still counts, and a carriage return is 
   )
 }
 
-type Unread = { name: String, text: Bytes, line: Int, offset: Int, message: String }
+type InvalidInput = { name: String, text: Bytes, line: Int, offset: Int, message: String }
 
-fn unread() -> List<Unread> =
+fn invalid_inputs() -> List<InvalidInput> =
   [
     {
       name: "a byte order mark",
@@ -1977,13 +1977,13 @@ fn unread() -> List<Unread> =
     },
   ]
 
-test "{c.name} is rejected with its line" for c: Unread in unread() {
+test "{c.name} is rejected with its line" for c: InvalidInput in invalid_inputs() {
   let rejected: Result<List<Json>, LineError> = Err({
     line: c.line,
     error: error_at(c.offset, c.message),
   });
   assert_eq(parse_lines(c.text, 12, 2), rejected);
-  assert_eq(fed(each_byte(c.text), 12, 2), rejected)
+  assert_eq(read_chunks(each_byte(c.text), 12, 2), rejected)
 }
 
 fn each_byte(text: Bytes) -> List<Bytes> = range(0, text.len()).map(|i: Int| text.slice(i, i + 1))
@@ -2029,7 +2029,7 @@ test "a reader carries a line across chunks, cut inside a value or inside a char
     whole,
     Ok([parsed(Bytes::of_string("{\"name\":\"zoë\"}")), Array([int(1), Str("😀")])]),
   );
-  assert_eq(fed(each_byte(text), 64, 8), whole);
+  assert_eq(read_chunks(each_byte(text), 64, 8), whole);
   let first = lines_step(lines_start(64, 8), text.slice(0, 12));
   assert_eq(
     first,
@@ -2048,14 +2048,14 @@ test "JSON Lines are written a value a line, with no line feed inside one" {
 // --- Tests: pointers --------------------------------------------------------
 
 /// The document of RFC 6901, section 5.
-fn pointed_at() -> Json / {abort.raise} =
+fn rfc6901_document() -> Json / {abort.raise} =
   parsed(
     b"{\"foo\":[\"bar\",\"baz\"],\"\":0,\"a/b\":1,\"c%d\":2,\"e^f\":3,\"g|h\":4,\"i\\\\j\":5,\"k\\\"l\":6,\" \":7,\"m~n\":8}",
   )
 
 type Pointed = { pointer: String, value: Bytes }
 
-fn pointed() -> List<Pointed> =
+fn pointer_cases() -> List<Pointed> =
   [
     { pointer: "/foo", value: b"[\"bar\",\"baz\"]" },
     { pointer: "/foo/0", value: b"\"bar\"" },
@@ -2072,16 +2072,16 @@ fn pointed() -> List<Pointed> =
 
 fn pointed_by(text: String) -> Option<Json> / {abort.raise} =
   match pointer_of(text) {
-    Some(p) -> resolve(pointed_at(), p),
+    Some(p) -> resolve(rfc6901_document(), p),
     None -> panic("not a pointer: " ++ text),
   }
 
-test "RFC 6901 resolves `{c.pointer}`" for c: Pointed in pointed() {
+test "RFC 6901 resolves `{c.pointer}`" for c: Pointed in pointer_cases() {
   assert_eq(pointed_by(c.pointer), Some(parsed(c.value)))
 }
 
 test "the empty pointer is the document, and a pointer leads nowhere rather than failing" {
-  assert_eq(pointed_by(""), Some(pointed_at()));
+  assert_eq(pointed_by(""), Some(rfc6901_document()));
   assert_eq(pointed_by("/nope"), None);
   assert_eq(pointed_by("/foo/2"), None);
   assert_eq(pointed_by("/foo/-"), None);

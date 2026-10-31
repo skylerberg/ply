@@ -158,11 +158,11 @@ pub type OutputLine = | LineWritten(String) | TimedOut | Closed
 
 // --- The host handler -------------------------------------------------------
 
-host for process by served
+host for process by host_process
 
 /// Runs `go` with the run's own process and the programs `--exec` binds. An operation that waits
 /// on another program, on a person or on a child's pipe waits in the calling task.
-fn served<a | e>(
+fn host_process<a | e>(
   go: () -> a / {process.read[*], process.write[*] | e},
 ) -> a / {native.read, wait.read, abort.raise | e} =
   handle {
@@ -188,7 +188,7 @@ fn served<a | e>(
     process.spawn[*label](args, dir, env) ->
       completed_process_of(job_wait(process_spawn(label, texts(args), dir, environment(env)))),
     process.start[*label](args, dir, env, io) -> {
-      let said = process_start(label, texts(args), dir, environment(env), wiring(io));
+      let said = process_start(label, texts(args), dir, environment(env), encode_io(io));
       let rest = said.slice(1, said.len());
       if said.at(0) == 1 { Ok(decode_int(rest)) } else { Err(String::of_bytes_lossy(rest)) }
     },
@@ -215,7 +215,7 @@ fn environment(env: List<Var>) -> Bytes =
 
 /// Encodes `io` as parts: bytes of 1 if the child reads input and of each stream's number, then
 /// each stream's file.
-fn wiring(io: Io) -> Bytes / {abort.raise} =
+fn encode_io(io: Io) -> Bytes / {abort.raise} =
   encode_parts([
     Bytes::concat_all(
       [if io.input { 1 } else { 0 }, output_number(io.out), output_number(io.err)].map(|b: Int|
@@ -289,14 +289,14 @@ extern fn process_exit(code: Int) -> Unit / {native.read}
 /// code or signal, and both streams.
 extern fn process_spawn(label: String, args: Bytes, dir: String, env: Bytes) -> Int / {native.read}
 
-/// Starts a child as `process_spawn` does, wired as `wiring` encodes it. Returns byte 1 and its
+/// Starts a child as `process_spawn` does, wired as `encode_io` encodes it. Returns byte 1 and its
 /// handle, or byte 0 and why it could not start.
 extern fn process_start(
   label: String,
   args: Bytes,
   dir: String,
   env: Bytes,
-  wiring: Bytes,
+  encode_io: Bytes,
 ) -> Bytes / {native.read}
 
 /// A ticket for how the child ended, in the form `found` decodes.
@@ -371,12 +371,12 @@ pub fn args_step(c: FakeProcess) -> List<String> = c.args
 /// empty.
 pub type Line = { captured: FakeProcess, line: Option<String> }
 
-type Cut = { before: List<Bytes>, after: List<Bytes>, ended: Bool }
+type LineSplit = { before: List<Bytes>, after: List<Bytes>, ended: Bool }
 
 /// The chunks cut at their first `\n`: what comes before it, what follows it, and whether there
 /// was one.
-fn cut_at_newline(chunks: List<Bytes>) -> Cut / {abort.raise} =
-  chunks.fold({ before: [], after: [], ended: false }, |cut: Cut, chunk: Bytes|
+fn cut_at_newline(chunks: List<Bytes>) -> LineSplit / {abort.raise} =
+  chunks.fold({ before: [], after: [], ended: false }, |cut: LineSplit, chunk: Bytes|
     if cut.ended { { ..cut, after: cut.after.push(chunk) } } else {
       match chunk.index_of_byte(b'\n') {
         None -> { ..cut, before: cut.before.push(chunk) },
@@ -474,14 +474,14 @@ pub fn exit_step(c: FakeProcess, code: Int) -> FakeProcess =
 /// What a program returned under a fake, and the fake it left. `value` is `None` when the program
 /// ended itself: by `process.exit`, or by a line written to a stream whose reader had gone, which
 /// sets the code 141.
-pub type Over<a> = { value: Option<a>, captured: FakeProcess }
+pub type FakeRun<a> = { value: Option<a>, captured: FakeProcess }
 
 /// Runs `go` as the program whose process is `c`. The fake handles every operation on its own
 /// streams, arguments and exit code, as the host handles them.
 pub fn over<a, [p] | e>(
   c: FakeProcess,
   go: () -> a / {process.args[p], process.out[p], process.err[p], process.out_bytes[p], process.err_bytes[p], process.flush[p], process.line[p], process.in_bytes[p], process.exit[p] | e},
-) -> Over<a> / {abort.raise | e} =
+) -> FakeRun<a> / {abort.raise | e} =
   handle {
     go()
   } with {
@@ -572,12 +572,12 @@ pub fn signalled(signal: Int, out: Bytes, err: Bytes) -> CompletedProcess =
 
 /// One child a test plans: how many `wait`s find it still running, how it ends, and what
 /// `output_line` returns from it, in order.
-pub type Script = { polls: Int, finished: CompletedProcess, heard: List<OutputLine> }
+pub type Script = { polls: Int, finished: CompletedProcess, output_lines: List<OutputLine> }
 
 /// A child that `wait` finds running `polls` times and then `finished`, and whose lines are
 /// `heard`.
 pub fn script(polls: Int, finished: CompletedProcess, heard: List<OutputLine>) -> Script =
-  { polls: polls, finished: finished, heard: heard }
+  { polls: polls, finished: finished, output_lines: heard }
 
 /// A started child and what the program did to it: the bytes it wrote to the child's input,
 /// whether that input is still open, and the signals it sent.
@@ -595,21 +595,21 @@ pub type Child = {
 /// given to `start`s in order, and each child started, whose handle is its index in `started`
 /// counting from 1. The label is bound if a child is planned, unless the test sets `bound`, and no
 /// step changes it.
-pub type Children = { planned: List<Script>, started: List<Child>, bound: Bool }
+pub type Children = { unstarted: List<Script>, started: List<Child>, bound: Bool }
 
 /// A fake that gives the planned children to `start`s, in order.
 pub fn children(planned: List<Script>) -> Children =
-  { planned: planned, started: [], bound: planned.len() > 0 }
+  { unstarted: planned, started: [], bound: planned.len() > 0 }
 
 /// What `process.bound` returns for `c`.
-pub fn bound_step(c: Children) -> Bool = c.bound
+pub fn children_bound(c: Children) -> Bool = c.bound
 
 /// One step of the fake: the fake with the step recorded, and what the host would have returned.
 pub type ChildResult<a> = { children: Children, result: a }
 
 /// A start the test planned no child for fails, as a spawn it planned no reply for cannot run.
 pub fn start_step(c: Children, launch: Launch, io: Io) -> ChildResult<Result<Int, String>> =
-  match c.planned {
+  match c.unstarted {
     [] -> { children: c, result: Err("no child was planned for this start") },
     [first, ..rest] -> {
       let child = {
@@ -622,7 +622,7 @@ pub fn start_step(c: Children, launch: Launch, io: Io) -> ChildResult<Result<Int
         spent: false,
       };
       let started = c.started.push(child);
-      { children: { ..c, planned: rest, started: started }, result: Ok(started.len()) }
+      { children: { ..c, unstarted: rest, started: started }, result: Ok(started.len()) }
     },
   }
 
@@ -678,10 +678,10 @@ pub fn end_input_step(c: Children, child: Int) -> Children / {abort.raise} =
 /// When the script runs out, the child's lines are closed, as at the end of a stream.
 pub fn output_line_step(c: Children, child: Int) -> ChildResult<OutputLine> / {abort.raise} = {
   let one = child_at(c, child);
-  match one.script.heard {
+  match one.script.output_lines {
     [] -> { children: c, result: Closed },
     [first, ..rest] -> {
-      let heard = { ..one, script: { ..one.script, heard: rest } };
+      let heard = { ..one, script: { ..one.script, output_lines: rest } };
       { children: replaced(c, child, heard), result: first }
     },
   }
@@ -1044,13 +1044,13 @@ test "`bound` returns true for a label the fake binds and false for one it does 
     assert_eq(tools_bound(), [true, false])
   } with {
     process.bound[cc]() -> spawns_bound_step(runs([exited(0, b"", b"")])),
-    process.bound[srv]() -> bound_step(children([])),
+    process.bound[srv]() -> children_bound(children([])),
   };
   handle {
     assert_eq(tools_bound(), [false, true])
   } with {
     process.bound[cc]() -> spawns_bound_step(runs([])),
-    process.bound[srv]() -> bound_step(children([script(0, exited(0, b"", b""), [])])),
+    process.bound[srv]() -> children_bound(children([script(0, exited(0, b"", b""), [])])),
   }
 }
 
@@ -1061,9 +1061,9 @@ test "a label stays bound whatever steps its fake takes, and a test may override
   assert(spawns_bound_step(spent));
   let planned = children([script(0, exited(0, b"", b""), [])]);
   let started = start_step(planned, launch, { input: false, out: Keep, err: Keep });
-  assert_eq(started.children.planned, []);
-  assert(bound_step(wait_step(started.children, 1).children));
-  assert(!bound_step({ ..planned, bound: false }));
+  assert_eq(started.children.unstarted, []);
+  assert(children_bound(wait_step(started.children, 1).children));
+  assert(!children_bound({ ..planned, bound: false }));
   assert(spawns_bound_step({ ..runs([]), bound: true }))
 }
 

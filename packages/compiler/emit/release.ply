@@ -4,7 +4,7 @@ import compiler.check.types (Type, NamedType, FunctionType, VariableType, Record
                              option_type, map_type, secret_type, bool_type, float_type,
                              decimal_type)
 import compiler.check.known
-import compiler.check.known (list_node_name, list_node_type, map_node_type, task_name, chan_name,
+import compiler.check.known (list_node_name, list_node_type, map_node_type, task_name, builtin_channel_name,
                              secret_name, string_name, bytes_name, list_name, map_name, array_name,
                              columns_name, scoped_name, option_name, none_constructor,
                              some_constructor, array_type, columns_type, task_type, chan_type,
@@ -15,14 +15,14 @@ import compiler.emit.layout (ValueLayout, PlainWords, RecordFields, SumCases, In
                              FieldLayout, SumLayout, CaseLayout, Payload, Nullary, Inline, Boxed,
                              WordClass, Pointer, PointerSum, RawRange, Mixed, Always, WordIs,
                              WordOutside, WordForm, Itself, Bits, RuntimeBox, Box, words,
-                             holds_count, record_layout, sum_layout, raw_sum, inside, by_pointer)
+                             has_counted_references, record_layout, sum_layout, raw_sum, inside, by_pointer)
 import compiler.emit.abi (scoped_layout)
 import compiler.emit.evidence (is_evidence)
 import compiler.emit.representations
 import compiler.emit.representations (Constructors, SumConstructor, constructors_of)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Generated, Drop, Dup, Copy, Share, Keep, generated_key)
-import compiler.emit.typed_ir (handed_of, param_borrowed, Var, Representation, AsWord, AsInt, AsSum,
+import compiler.emit.typed_ir (param_ownerships, param_borrowed, Var, Representation, AsWord, AsInt, AsSum,
                                AsFlattened, AsListView, AsReuseToken, Leaf, VarOperand, ZeroOperand,
                                IntOperand, Block, Inst, Let, Do, If, Case, Match, Loop, Handle,
                                Return, Restart, Inc, Dec, Reset, Destructure, Fn, Metered, Plain,
@@ -51,7 +51,7 @@ pub type Part =
 pub type BlockPart = { at: Int, ty: Type, representation: Representation }
 
 pub type BlockContents =
-  | BoxContents({ parts: List<BlockPart>, words: Int })
+  | WordBlock({ parts: List<BlockPart>, words: Int })
   | ScopedContents(BlockPart)
   | BytesBlock
   | ListOf({ node: RootKey, item: List<Part>, stride: Int })
@@ -100,7 +100,7 @@ pub fn boxed_case_rep(
   k: Int,
 ) -> Option<Representation> / {abort.raise} = boxed_case_of(sum_rep(constructors, ty, s), k)
 
-pub fn boxed_alone(
+pub fn sole_boxed_payload(
   s: SumLayout,
 ) -> Option<{ at: Int, stripped: Bool, skip: Int, layout: ValueLayout }> =
   match ((s.classes, s.cases)) {
@@ -162,10 +162,10 @@ fn pointer(
   }
 
 fn function_valued(ty: Type) -> Bool =
-  match ty { FunctionType(_) -> true, _ -> representations::resumed(ty) != None }
+  match ty { FunctionType(_) -> true, _ -> representations::resume_result_type(ty) != None }
 
 fn runtime_handle(name: Bytes) -> Bool =
-  [task_name(), chan_name(), secret_name()].contains(name)
+  [task_name(), builtin_channel_name(), secret_name()].contains(name)
     || representations::scheduler_objects().contains(name)
 
 fn is_emitted_block(name: Bytes) -> Bool =
@@ -207,11 +207,11 @@ fn joined(a: List<Int>, b: List<Int>) -> List<Int> =
   b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
 
 pub fn release_needs(f: Fn) -> Fn =
-  { ..f, links: { ..f.links, needs: fn_needs(entered(f.links.needs, f), f) } }
+  { ..f, links: { ..f.links, needs: fn_needs(signature_needs(f.links.needs, f), f) } }
 
-pub fn release_reads(f: Fn) -> List<Need> = fn_needs(entered([], f), f)
+pub fn release_reads(f: Fn) -> List<Need> = fn_needs(signature_needs([], f), f)
 
-fn entered(needs: List<Need>, f: Fn) -> List<Need> = {
+fn signature_needs(needs: List<Need>, f: Fn) -> List<Need> = {
   let held = if f.members.len() == 0 { [{ params: f.params, convention: f.convention }] }
   else { f.members.map(|m: Member| { params: m.params, convention: m.convention }) };
   held.fold(needs, |acc: List<Need>, h: { params: List<Var>, convention: Convention }| {
@@ -239,8 +239,8 @@ fn block_needs(needs: List<Need>, b: Block) -> List<Need> =
   b.fold(needs, |acc: List<Need>, i: Inst|
     match i {
       Let(l) ->
-        across(unwound(value_needs(acc, l.value), l.unwind), may_suspend(l.value), l.unwind),
-      Do(d) -> across(unwound(value_needs(acc, d.value), d.unwind), may_suspend(d.value), d.unwind),
+        add_suspend_needs(unwound(value_needs(acc, l.value), l.unwind), may_suspend(l.value), l.unwind),
+      Do(d) -> add_suspend_needs(unwound(value_needs(acc, d.value), d.unwind), may_suspend(d.value), d.unwind),
       If(x) -> block_needs(block_needs(acc, x.then), x.otherwise),
       Case(c) ->
         c.arms.fold(block_needs(acc, c.rest), |a: List<Need>, arm: { when: Int, body: Block }|
@@ -248,7 +248,7 @@ fn block_needs(needs: List<Need>, b: Block) -> List<Need> =
       Match(m) -> m.arms.fold(block_needs(acc, m.rest), block_needs),
       Loop(l) -> block_needs(acc, l.body),
       Handle(h) ->
-        across(
+        add_suspend_needs(
           unwound(block_needs(acc, h.body), h.unwind),
           handle_suspends(h.body, h.site),
           h.unwind,
@@ -267,13 +267,13 @@ fn value_needs(needs: List<Need>, value: Rvalue) -> List<Need> =
   match value { IfUnique(v) -> reading(needs, v.ty, Exact), _ -> needs }
 
 fn unwound(needs: List<Need>, unwind: List<Var>) -> List<Need> =
-  holding(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Exact))
+  refcounted_unwind(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Exact))
 
-fn across(needs: List<Need>, stops: Bool, unwind: List<Var>) -> List<Need> =
+fn add_suspend_needs(needs: List<Need>, stops: Bool, unwind: List<Var>) -> List<Need> =
   if !stops { needs }
-  else { holding(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Layout)) }
+  else { refcounted_unwind(unwind).fold(needs, |acc: List<Need>, v: Var| reading(acc, v.ty, Layout)) }
 
-fn holding(unwind: List<Var>) -> List<Var> =
+fn refcounted_unwind(unwind: List<Var>) -> List<Var> =
   unwind.filter(|v: Var| match v.representation { AsReuseToken(_) -> false, r -> is_refcounted(r) })
 
 fn reading(needs: List<Need>, ty: Type, reads: NeedKind) -> List<Need> =
@@ -323,8 +323,8 @@ fn sum_parts(
   s: SumLayout,
   at: Int,
 ) -> List<Part> / {abort.raise} =
-  if !holds_count(SumCases(s)) { [] } else {
-    let cases = cased(constructors, ty, s);
+  if !has_counted_references(SumCases(s)) { [] } else {
+    let cases = parts_by_case(constructors, ty, s);
     let one = |own: CountedWord| [WordAt({ at: at, masked: false, how: own })];
     match s.classes {
       [PointerSum(m)] ->
@@ -340,7 +340,7 @@ fn sum_parts(
     }
   }
 
-fn cased(
+fn parts_by_case(
   constructors: Constructors,
   ty: Type,
   s: SumLayout,
@@ -436,12 +436,12 @@ pub fn word_form_functions(
   ty: Type,
 ) -> Option<WordFormFunctions> / {abort.raise} =
   match form_parts(constructors, ty) {
-    [] -> Some(immediate_functions()),
+    [] -> Some(uncounted_functions()),
     [WordAt(w)] -> match w.how { ScalarWord(s) -> Some(box_functions(s.words)), _ -> None },
     _ -> None,
   }
 
-pub fn immediate_functions() -> WordFormFunctions =
+pub fn uncounted_functions() -> WordFormFunctions =
   { dup: identity_fn(), release: noop_release_fn() }
 
 pub fn box_functions(words: Int) -> WordFormFunctions =
@@ -472,7 +472,7 @@ pub fn held_parts_with(
     _ -> parts_of(rep).map(|_: Representation| []),
   }
 
-pub fn held_parts(
+pub fn counted_parts(
   constructors: Constructors,
   ty: Type,
   rep: Representation,
@@ -509,7 +509,7 @@ pub fn contents_with(
   form_of: (Type) -> WordForm / {abort.raise},
 ) -> BlockContents / {abort.raise} =
   match rep {
-    AsSum(s) -> match ((boxed_alone(s.layout), s.cases)) {
+    AsSum(s) -> match ((sole_boxed_payload(s.layout), s.cases)) {
       (Some(b), [name]) ->
         case_box_contents(constructors, ty, args_named(constructors, ty, name), b, laid_of),
       _ -> rejected(b"a sum opened as a block that holds no box alone", ty),
@@ -541,14 +541,14 @@ fn args_named(constructors: Constructors, ty: Type, name: Bytes) -> List<Type> /
     _ -> rejected(Bytes::concat_all([b"no one case named ", name, b" of the sum"]), ty),
   }
 
-pub fn held_root(
+pub fn root_of_representation(
   op: keys::TypeOp,
   constructors: Constructors,
   ty: Type,
   rep: Representation,
 ) -> RootKey / {abort.raise} =
   match rep {
-    AsSum(s) -> match ((boxed_alone(s.layout), s.cases)) {
+    AsSum(s) -> match ((sole_boxed_payload(s.layout), s.cases)) {
       (Some(_), [name]) -> {
         let names = cases_of(constructors, ty).map(|c: { name: Bytes, args: List<Type> }| c.name);
         case_root(
@@ -598,7 +598,7 @@ fn named_contents(
     ScopedContents({ at: scoped_layout().value, ty: arg(args.len() - 1), representation: AsWord })
   } else if runtime_handle(name) { HandleBlock }
   else if name == representations::parallel_results_name() {
-    BoxContents({
+    WordBlock({
       parts: range(0, args.len()).fold([], |acc: List<BlockPart>, i: Int|
         if form_parts_of(constructors, arg(i), form_of(arg(i)), laid_of(arg(i))) == [] { acc }
         else { acc.push({ at: i, ty: arg(i), representation: AsWord }) }),
@@ -618,17 +618,17 @@ fn in_box(
   laid_of: (Type) -> ValueLayout / {abort.raise},
 ) -> BlockContents / {abort.raise} = {
   let l = laid_of(ty);
-  BoxContents({ parts: held_in(constructors, ty, l, 0, laid_of), words: words(l) })
+  WordBlock({ parts: block_parts_in(constructors, ty, l, 0, laid_of), words: words(l) })
 }
 
-pub fn never_kept(constructors: Constructors, o: BlockContents) -> Bool / {abort.raise} = {
+pub fn holds_unkeepable_value(constructors: Constructors, o: BlockContents) -> Bool / {abort.raise} = {
   let first = contents_reach(constructors, o);
-  first.found || first.types.any(|t: Type| representations::holds_unkept(constructors, t))
+  first.found || first.types.any(|t: Type| representations::holds_unstorable(constructors, t))
 }
 
 type Reach = { found: Bool, types: List<Type> }
 
-fn reached(a: Reach, b: Reach) -> Reach =
+fn merge_reach(a: Reach, b: Reach) -> Reach =
   { found: a.found || b.found, types: a.types.concat(b.types) }
 
 fn contents_reach(constructors: Constructors, o: BlockContents) -> Reach / {abort.raise} = {
@@ -637,15 +637,15 @@ fn contents_reach(constructors: Constructors, o: BlockContents) -> Reach / {abor
   match o {
     HandleBlock -> { found: true, types: [] },
     ScopedContents(_) -> { found: true, types: [] },
-    BoxContents(b) ->
+    WordBlock(b) ->
       b.parts.fold(none, |acc: Reach, h: BlockPart|
-        reached(acc, parts_reach(stored_parts(constructors, h)))),
+        merge_reach(acc, parts_reach(stored_parts(constructors, h)))),
     ListOf(l) -> parts_reach(l.item),
     ListNodeOf(n) -> parts_reach(n.item),
     MapOf(k) -> root(k),
-    MapNodeOf(m) -> reached(parts_reach(m.key), parts_reach(m.value)),
+    MapNodeOf(m) -> merge_reach(parts_reach(m.key), parts_reach(m.value)),
     ArrayOf(a) -> parts_reach(a.element),
-    ColumnsOf(ks) -> ks.fold(none, |acc: Reach, k: RootKey| reached(acc, root(k))),
+    ColumnsOf(ks) -> ks.fold(none, |acc: Reach, k: RootKey| merge_reach(acc, root(k))),
     InlineSum(s) -> { found: false, types: [s.ty] },
     _ -> none,
   }
@@ -653,7 +653,7 @@ fn contents_reach(constructors: Constructors, o: BlockContents) -> Reach / {abor
 
 fn parts_reach(parts: List<Part>) -> Reach =
   parts.fold({ found: false, types: [] }, |acc: Reach, p: Part|
-    reached(acc, match p {
+    merge_reach(acc, match p {
       WordAt(w) -> match w.how {
         RuntimeHandle -> { found: true, types: [] },
         ThroughDescriptor -> { found: true, types: [] },
@@ -671,7 +671,7 @@ fn parts_reach(parts: List<Part>) -> Reach =
       ByCase(c) ->
         c.cases.fold(
           { found: false, types: [] },
-          |a: Reach, k: { case: Int, parts: List<Part> }| reached(a, parts_reach(k.parts)),
+          |a: Reach, k: { case: Int, parts: List<Part> }| merge_reach(a, parts_reach(k.parts)),
         ),
     }))
 
@@ -682,33 +682,33 @@ fn case_box_contents(
   b: { at: Int, stripped: Bool, skip: Int, layout: ValueLayout },
   laid_of: (Type) -> ValueLayout / {abort.raise},
 ) -> BlockContents / {abort.raise} =
-  BoxContents({
-    parts: payload_held(constructors, args, b.layout, b.skip, sum, laid_of),
+  WordBlock({
+    parts: payload_block_parts(constructors, args, b.layout, b.skip, sum, laid_of),
     words: b.skip + words(b.layout),
   })
 
-pub fn held_at(
+pub fn block_parts_at(
   constructors: Constructors,
   ty: Type,
   rep: Representation,
   at: Int,
 ) -> List<BlockPart> / {abort.raise} =
   if rep == AsWord { [{ at: at, ty: ty, representation: AsWord }] } else {
-    held_in(constructors, ty, representations::layout_of(constructors, ty), at, |t: Type|
+    block_parts_in(constructors, ty, representations::layout_of(constructors, ty), at, |t: Type|
       representations::layout_of(constructors, t))
   }
 
-fn held_in(
+fn block_parts_in(
   constructors: Constructors,
   ty: Type,
   l: ValueLayout,
   at: Int,
   laid_of: (Type) -> ValueLayout / {abort.raise},
 ) -> List<BlockPart> / {abort.raise} =
-  if !holds_count(l) { [] } else {
+  if !has_counted_references(l) { [] } else {
     match l {
-      RecordFields(fs) -> fields_held(constructors, field_types(ty), fs, at, ty, laid_of),
-      InlineRecord(r) -> held_in(constructors, ty, r, at + 1, laid_of),
+      RecordFields(fs) -> field_block_parts(constructors, field_types(ty), fs, at, ty, laid_of),
+      InlineRecord(r) -> block_parts_in(constructors, ty, r, at + 1, laid_of),
       _ -> match ty {
         NamedType(c) -> if constructors.sums.contains(c.name) {
           match laid_of(ty) {
@@ -718,23 +718,23 @@ fn held_in(
         } else {
           match l {
             SumCases(s) -> [{ at: at, ty: ty, representation: sum_rep(constructors, ty, s) }],
-            PlainWords(cs) -> pointers_held(ty, cs, at),
+            PlainWords(cs) -> pointer_block_parts(ty, cs, at),
             _ -> [],
           }
         },
-        _ -> match l { PlainWords(cs) -> pointers_held(ty, cs, at), _ -> [] },
+        _ -> match l { PlainWords(cs) -> pointer_block_parts(ty, cs, at), _ -> [] },
       },
     }
   }
 
-fn pointers_held(ty: Type, cs: List<WordClass>, at: Int) -> List<BlockPart> =
+fn pointer_block_parts(ty: Type, cs: List<WordClass>, at: Int) -> List<BlockPart> =
   range(0, cs.len()).fold([], |acc: List<BlockPart>, i: Int|
     match cs.at(i) {
       Some(Pointer) -> acc.push({ at: at + i, ty: ty, representation: AsWord }),
       _ -> acc,
     })
 
-fn fields_held(
+fn field_block_parts(
   constructors: Constructors,
   types: List<Type>,
   fs: List<FieldLayout>,
@@ -747,12 +747,12 @@ fn fields_held(
       Some(t) ->
         {
           i: acc.i + 1,
-          out: acc.out.concat(held_in(constructors, t, f.layout, at + f.at, laid_of)),
+          out: acc.out.concat(block_parts_in(constructors, t, f.layout, at + f.at, laid_of)),
         },
       None -> rejected(b"a layout of more fields than its type has", of),
     }).out
 
-fn payload_held(
+fn payload_block_parts(
   constructors: Constructors,
   args: List<Type>,
   l: ValueLayout,
@@ -762,7 +762,7 @@ fn payload_held(
 ) -> List<BlockPart> / {abort.raise} =
   match l {
     RecordFields(fs) -> if fs.len() == args.len() {
-      fields_held(constructors, args, fs, at, sum, laid_of)
+      field_block_parts(constructors, args, fs, at, sum, laid_of)
     } else { rejected(b"a case laid out other than as its arguments", sum) },
     _ -> rejected(b"a case laid out other than as a record of its arguments", sum),
   }
@@ -793,12 +793,12 @@ pub fn generated_with(
 ) -> Fn / {abort.raise} =
   match k {
     Generated(w, _) -> match w.op {
-      Drop -> dropped(constructors, k, w.ty, laid_of, form_of),
+      Drop -> drop_function(constructors, k, w.ty, laid_of, form_of),
       Dup -> duped(k, w.ty),
-      keys::Release -> released(k, w.ty),
+      keys::Release -> release_function(k, w.ty),
       keys::Unboxed(o) -> match o {
-        Dup -> held_duped(constructors, k, w.ty),
-        keys::Release -> held_released(constructors, k, w.ty),
+        Dup -> representation_dup_function(constructors, k, w.ty),
+        keys::Release -> representation_release_function(constructors, k, w.ty),
         _ -> panic("a root over a stored value that counts nothing"),
       },
       Copy -> walk_root(k, { id: 0, ty: w.ty, representation: AsWord }, Copy),
@@ -881,7 +881,7 @@ fn plain_result_type(k: RootKey) -> Type =
 
 fn return_nothing() -> Inst = Return(ZeroOperand(AsWord))
 
-fn dropped(
+fn drop_function(
   constructors: Constructors,
   k: RootKey,
   ty: Type,
@@ -947,7 +947,7 @@ fn block_dropped(
   next: Int,
   root: Var,
 ) -> { body: List<Inst>, next: Int } = {
-  let held = match o { BoxContents(x) -> x.parts, ScopedContents(h) -> [h], _ -> [] };
+  let held = match o { WordBlock(x) -> x.parts, ScopedContents(h) -> [h], _ -> [] };
   let ws = range(0, held.len()).fold([], |acc: List<Var>, i: Int|
     match held.at(i) {
       Some(h) -> acc.push({ id: next + i, ty: h.ty, representation: h.representation }),
@@ -1044,7 +1044,7 @@ fn by_case_dropped(
                 }
               },
               block_contents -> {
-                let alone = match boxed_alone(s) { Some(_) -> true, None -> false };
+                let alone = match sole_boxed_payload(s) { Some(_) -> true, None -> false };
                 let b = if alone { on }
                 else { { id: acc.next, ty: blk.ty, representation: blk.representation } };
                 let d = block_dropped(
@@ -1127,7 +1127,7 @@ fn case_block(
         }),
       None -> None,
     },
-    Inline(i) -> match payload_held(constructors, args, i.layout, i.offset, ty, laid_of) {
+    Inline(i) -> match payload_block_parts(constructors, args, i.layout, i.offset, ty, laid_of) {
       [] -> None,
       [h] -> match h.representation {
         AsSum(x) ->
@@ -1152,18 +1152,18 @@ fn duped(k: RootKey, ty: Type) -> Fn = {
   plain(k, o, BorrowedParam, [Inc({ var: o, n: 1 }), Return(VarOperand(o))])
 }
 
-fn released(k: RootKey, ty: Type) -> Fn = {
+fn release_function(k: RootKey, ty: Type) -> Fn = {
   let o = { id: 0, ty: ty, representation: AsWord };
   plain(k, o, OwnedParam, [Dec(o), return_nothing()])
 }
 
-fn held_duped(constructors: Constructors, k: RootKey, ty: Type) -> Fn = {
+fn representation_dup_function(constructors: Constructors, k: RootKey, ty: Type) -> Fn = {
   let o = { id: 0, ty: ty, representation: representation_with(constructors, ty) };
   let f = plain(k, o, BorrowedParam, [Inc({ var: o, n: 1 }), Return(VarOperand(o))]);
   { ..f, convention: { ..f.convention, result: o.representation } }
 }
 
-fn held_released(constructors: Constructors, k: RootKey, ty: Type) -> Fn = {
+fn representation_release_function(constructors: Constructors, k: RootKey, ty: Type) -> Fn = {
   let o = { id: 0, ty: ty, representation: representation_with(constructors, ty) };
   plain(k, o, OwnedParam, [Dec(o), return_nothing()])
 }
@@ -1177,7 +1177,7 @@ pub fn counted_through(
   let several = match rep { AsFlattened(_) -> true, AsSum(_) -> true, _ -> false };
   if !several || representations::has_variables(ty)
       || representation_with(constructors, ty) != rep { None }
-  else if held_parts(constructors, ty, rep).fold(0, |n: Int, ps: List<Part>| n + counts_in(ps))
+  else if counted_parts(constructors, ty, rep).fold(0, |n: Int, ps: List<Part>| n + counts_in(ps))
       < 2 { None }
   else { Some(root_of(keys::Unboxed(op), ty)) }
 }
@@ -1227,7 +1227,7 @@ fn table() -> Constructors =
     ]),
   )
 
-fn reaching() -> Constructors = {
+fn unkeepable_constructors() -> Constructors = {
   let t = table();
   let a = VariableType(0);
   let b = VariableType(1);
@@ -1282,7 +1282,7 @@ fn reaching() -> Constructors = {
 }
 
 test "a block reaching a handle, a scoped value or a function value at any depth is never kept, and only such a block" {
-  let t = reaching();
+  let t = unkeepable_constructors();
   let con = |name: Bytes, args: List<Type>| NamedType({ name: name, args: args });
   let chan = chan_type(int_type());
   let fun = FunctionType({
@@ -1318,23 +1318,23 @@ test "a block reaching a handle, a scoped value or a function value at any depth
     con(b"m.Ghost", [chan]),
   ];
   let wrong = |types: List<Type>, expected: Bool|
-    types.filter(|ty: Type| never_kept(t, block_contents(t, ty, AsWord)) != expected).map(
+    types.filter(|ty: Type| holds_unkeepable_value(t, block_contents(t, ty, AsWord)) != expected).map(
       encode_type,
     );
   assert_eq(wrong(never, true), []);
   assert_eq(wrong(kept, false), [])
 }
 
-fn reply_laid() -> SumLayout = maybe_laid()
+fn reply_layout() -> SumLayout = maybe_laid()
 
 fn todo_laid() -> SumLayout =
   sum_layout([
     { args: record_layout([]), indirect: false },
     { args: record_layout([]), indirect: false },
-    { args: record_layout([SumCases(reply_laid())]), indirect: false },
+    { args: record_layout([SumCases(reply_layout())]), indirect: false },
   ])
 
-fn hue_laid() -> SumLayout =
+fn two_nullary_layout() -> SumLayout =
   sum_layout([
     { args: record_layout([]), indirect: false },
     { args: record_layout([]), indirect: false },
@@ -1362,7 +1362,7 @@ fn alone_laid() -> SumLayout =
     ],
   }
 
-fn more_laid() -> SumLayout =
+fn mixed_sum_layout() -> SumLayout =
   {
     classes: [PointerSum(1)],
     cases: [
@@ -1467,12 +1467,12 @@ fn laid_for(ty: Type) -> ValueLayout / {abort.raise} =
   else if ty == named(b"m.E") { SumCases(expression_laid()) }
   else if ty == option_type(string_type()) { SumCases(maybe_laid()) }
   else if ty == named(b"m.A") { SumCases(alone_laid()) }
-  else if ty == named(b"m.B") { SumCases(more_laid()) }
-  else if ty == named(b"m.R") { SumCases(reply_laid()) }
+  else if ty == named(b"m.B") { SumCases(mixed_sum_layout()) }
+  else if ty == named(b"m.R") { SumCases(reply_layout()) }
   else if ty == named(b"m.T") { SumCases(todo_laid()) }
-  else if ty == named(b"m.Hue") { SumCases(hue_laid()) }
-  else if ty == option_type(named(b"m.R")) { SumCases(maybe_of(reply_laid())) }
-  else if ty == option_type(named(b"m.Hue")) { SumCases(maybe_of(hue_laid())) }
+  else if ty == named(b"m.Hue") { SumCases(two_nullary_layout()) }
+  else if ty == option_type(named(b"m.R")) { SumCases(maybe_of(reply_layout())) }
+  else if ty == option_type(named(b"m.Hue")) { SumCases(maybe_of(two_nullary_layout())) }
   else if ty == int_type() || ty == bool_type() { PlainWords([raw()]) }
   else if ty == float_type() { PlainWords([raw()]) }
   else if ty == width_type({ bits: 128, signed: false }) || ty == decimal_type() {
@@ -1510,7 +1510,7 @@ test "a record counts its pointers at their words, a record held in it at its ow
   assert_eq(layout_parts(table(), gathered, PlainWords([Pointer]), 0), [object(gathered, 0)]);
   assert_eq(
     contents_with(table(), gathered, AsWord, laid_for, form_for),
-    BoxContents({ parts: [{ at: 0, ty: string_type(), representation: AsWord }], words: 2 }),
+    WordBlock({ parts: [{ at: 0, ty: string_type(), representation: AsWord }], words: 2 }),
   );
   assert_eq(layout_parts(table(), int_type(), PlainWords([raw()]), 0), []);
   let said = |t: Type|
@@ -1610,12 +1610,12 @@ test "a word form counts as its type lays it in one word, a scalar's box by its 
       bool_type(),
     ].map(|t: Type| word_form_functions(table(), t)),
     [
-      Some(immediate_functions()),
-      Some(immediate_functions()),
+      Some(uncounted_functions()),
+      Some(uncounted_functions()),
       Some(box_functions(2)),
-      Some(immediate_functions()),
+      Some(uncounted_functions()),
       Some(box_functions(2)),
-      Some(immediate_functions()),
+      Some(uncounted_functions()),
     ],
   );
   assert_eq(word_form_functions(table(), string_type()), None);
@@ -1771,13 +1771,13 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
     match arm_of(f, 1) { Some(a) -> assert(by_its_case(a.body), None), None -> assert(false, None) }
   };
   let hues = option_type(named(b"m.Hue"));
-  assert_eq(case_blocks(table(), hues, maybe_of(hue_laid())), []);
+  assert_eq(case_blocks(table(), hues, maybe_of(two_nullary_layout())), []);
   assert_eq(
     case_blocks(table(), todo, todo_laid()).map(
       |b: { case: Int, ty: Type, representation: Representation, opening: BlockContents }|
         { case: b.case, ty: b.ty, opening: b.opening },
     ),
-    [{ case: 2, ty: reply, opening: InlineSum({ ty: reply, layout: reply_laid() }) }],
+    [{ case: 2, ty: reply, opening: InlineSum({ ty: reply, layout: reply_layout() }) }],
   )
 }
 
@@ -1796,7 +1796,7 @@ test "a boxed case's drop root holds its sums whole, and a sum of its type there
   assert(!f.body.any(|i: Inst| match i { Restart(_) -> true, _ -> false }), None);
   assert_eq(
     contents_with(table(), e, boxed, laid_for, form_for),
-    BoxContents({
+    WordBlock({
       parts: [{ at: 0, ty: e, representation: held }, { at: 2, ty: e, representation: held }],
       words: 4,
     }),
@@ -1840,7 +1840,7 @@ test "a container's drop root opens it whole, and its opening names its parts' r
   assert_eq(opened(width_type({ bits: 128, signed: false })), ScalarBox(2));
   assert_eq(
     opened(named(b"m.E")),
-    BoxContents({
+    WordBlock({
       parts: [
         {
           at: 0,
@@ -1988,7 +1988,7 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
   };
   {
     let f = generated_here(root_of(Share, l));
-    assert_eq(handed_of(f.convention), [BorrowedParam]);
+    assert_eq(param_ownerships(f.convention), [BorrowedParam]);
     assert_eq(f.convention.result, AsInt);
     assert_eq(walk(f), Some({ ty: l, representation: sum_rep(table(), l, list_laid()), op: Share }))
   };
@@ -2012,12 +2012,12 @@ test "a dup root counts its word form once more and returns it; a release root l
   {
     let f = generated_here(k(Dup));
     let o = f.params.get(0);
-    assert_eq(handed_of(f.convention), [BorrowedParam]);
+    assert_eq(param_ownerships(f.convention), [BorrowedParam]);
     assert(f.body.contains(Inc({ var: o, n: 1 })) && f.body.contains(Return(VarOperand(o))), None)
   };
   {
     let f = generated_here(k(keys::Release));
-    assert_eq(handed_of(f.convention), [OwnedParam]);
+    assert_eq(param_ownerships(f.convention), [OwnedParam]);
     assert_eq(dropping(f.body).decremented, f.params)
   }
 }
@@ -2126,10 +2126,10 @@ test "a value held across what may stop is read by its layout too, as the frame'
       statics: [],
     };
   let site = |stops: Bool| [Do({ value: call(stops), at: dummy_span(), unwind: [held, token] })];
-  let across = release_reads(root(site(true)));
+  let add_suspend_needs = release_reads(root(site(true)));
   assert(
-    across.len() == 2 && across.contains({ var: 0, reads: Exact })
-      && across.contains({ var: 0, reads: Layout }),
+    add_suspend_needs.len() == 2 && add_suspend_needs.contains({ var: 0, reads: Exact })
+      && add_suspend_needs.contains({ var: 0, reads: Layout }),
     None,
   );
   assert_eq(release_reads(root(site(false))), [{ var: 0, reads: Exact }]);

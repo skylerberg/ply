@@ -22,7 +22,7 @@ import compiler.emit.keys (RootKey, Named, Generated, Lower, Lift, Keeping, Open
                            OnWordForm, ContainerWalk, Root, root_name, root_text, op_name)
 import compiler.emit.pieces (pieces_text)
 import compiler.emit.evidence (evidence_type)
-import compiler.emit.typed_ir (handed_of, all_given, Representation, AsInt, AsWord, AsUnit,
+import compiler.emit.typed_ir (param_ownerships, owned_params, Representation, AsInt, AsWord, AsUnit,
                                AsImmediate, AsAddress, Var, Arg, VarOperand, IntOperand,
                                ZeroOperand, Primitive, Convert, Allocate, ClosureAllocation, Op,
                                OfHandling, OfContainers, OperationSignature, Inst, Let, Do, Assign,
@@ -36,7 +36,7 @@ import compiler.emit.typed_ir.handling (HandleOp, HandleSite, Clause, Perform, L
                                         CurrentSite, UnspecialisedBuiltin, Entering,
                                         AllocateForwarding, SetForwarding, ObjectAt,
                                         InstanceAddress, SchedulerEvidence, ClauseSlot, KeyedSlot,
-                                        Results, Resumes, Suspends, ForwardedSlot, Returning,
+                                        ReturnsResult, Resumes, Suspends, ForwardedSlot, Returning,
                                         VarInit, VarRead, VarWrite, raise_offset, task_offset)
 import compiler.emit.typing (SiteType, unknown_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo, Builtin, builtins)
@@ -52,7 +52,7 @@ import compiler.emit.lower.calling (context_of)
 import compiler.emit.lower.handling (label, clause_frame, body_frame, handle_assembled,
                                      parallel_block, handle_plan, detaches)
 import compiler.emit.lower.marshalling (marshalling_builtin_call, marshalling_builtin,
-                                        type_descriptor, shown_described, word_form_entry,
+                                        type_descriptor, serializable_type_descriptor, serialization_function,
                                         operation_descriptor)
 import compiler.emit.lower.containers (builtin)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticStruct, AddressWord, RawWord,
@@ -60,14 +60,14 @@ import compiler.emit.typed_ir.statics (StaticDefinition, StaticStruct, AddressWo
 import compiler.emit.lower.scalars (comparison_built)
 import compiler.emit.print.count_functions (never_lifted_fn, never_shown_fn)
 import compiler.emit.generated (GeneratedRoot, marshal_root, container_code, container_definitions,
-                                runtime_entry_code, container_op_generated, container_op_reads,
-                                marshalled_sums, marshals, is_marshal_op)
+                                runtime_entry_code, container_op_generated, container_reads_argument,
+                                marshalled_sums, is_marshallable, is_marshal_op)
 import compiler.emit.marks (marked_type, marks_of, mark_type_params)
 import compiler.check.infer.definitions (Extern, prelude_externs)
 import compiler.store.hash.template (emitted_code)
 import compiler.emit.print (printed_fn)
 import compiler.emit.print.effects (landing_jump)
-import compiler.emit.emit_harness (entered_words, Program, program_of, scheduled_program_of,
+import compiler.emit.emit_harness (entry_handler_words, Program, program_of, scheduled_program_of,
                                    lowered_root, checked, printed_by_ir, build_failures,
                                    printed_text, build_failure, built_c, shipped_lowered)
 
@@ -362,7 +362,7 @@ test "a continuation read as a value is the closure of a lambda that resumes it,
             match i {
               Let(x) -> match x.value {
                 typed_ir::Apply(a) -> match a.f {
-                  VarOperand(v) -> representations::resumed(v.ty) != None,
+                  VarOperand(v) -> representations::resume_result_type(v.ty) != None,
                   _ -> false,
                 },
                 _ -> false,
@@ -692,7 +692,7 @@ test "a place an operation's own type parameter stands at crosses carried, which
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let marked = |op: keys::TypeOp, t: Type, marks: List<Int>|
-        keys::marked(keys::generated_key(op, t, b"m"), marks);
+        keys::with_marks(keys::generated_key(op, t, b"m"), marks);
       let names = |k: RootKey|
         named_calls(written_at(p.setting.constructors, k).code).map(
           |c: { name: Bytes, recorded: Option<SiteType> }|
@@ -806,7 +806,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
         assert(
           raised.st.statics.any(|s: StaticDefinition|
             entries_of(s).contains(
-              keys::marked(keys::generated_key(OnWordForm(Lower), option_type(int), b"m"), [1]),
+              keys::with_marks(keys::generated_key(OnWordForm(Lower), option_type(int), b"m"), [1]),
             )),
           None,
         );
@@ -826,7 +826,7 @@ test "an operation's descriptor names its types at the perform, the parameters i
   }
 }
 
-fn kept_marshalling_corpus() -> Bytes =
+fn generic_operation_corpus() -> Bytes =
   Bytes::concat_all([
     b"effect box {\n  write swap<a>(x: a) -> a\n  write same<a>(x: a, y: a) -> Bool\n}\n",
     b"fn swapped() -> Int = handle { box.swap(4) + 1 } with { box.swap(x) -> x }\n",
@@ -842,7 +842,7 @@ fn natives_in(body: List<Inst>) -> List<Bytes> =
       _ -> acc,
     })
 
-fn kept_entries(statics: List<StaticDefinition>) -> List<List<Option<RootKey>>> =
+fn static_comparison_entries(statics: List<StaticDefinition>) -> List<List<Option<RootKey>>> =
   statics.fold([], |acc: List<List<Option<RootKey>>>, d: StaticDefinition|
     match d.layout {
       StaticStruct(s) -> if s.of != b"PlyKept" { acc } else {
@@ -858,7 +858,7 @@ fn comparison_entries(t: Type) -> List<Option<RootKey>> =
     Some(keys::generated_key(OnWordForm(op), t, b"m")))
 
 test "a value a program's generic operation hands its clause crosses kept, the clause holding and returning it, and the perform opens what it returns at its own type" {
-  match program_of(kept_marshalling_corpus()) {
+  match program_of(generic_operation_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let f = lowered_root(p, b"swapped");
@@ -866,7 +866,7 @@ test "a value a program's generic operation hands its clause crosses kept, the c
       let called = natives_in(f.body);
       assert(called.contains(b"builtin_elaborated_keep_p"), None);
       assert(called.contains(b"builtin_elaborated_open_p"), None);
-      assert_eq(kept_entries(f.statics), [comparison_entries(int_type())]);
+      assert_eq(static_comparison_entries(f.statics), [comparison_entries(int_type())]);
       match f.lambdas.at(0) {
         Some(Closure(c)) -> {
           assert(c.body.params.any(|v: Var| v.ty == kept && v.representation == AsWord), None);
@@ -879,7 +879,7 @@ test "a value a program's generic operation hands its clause crosses kept, the c
 }
 
 test "a clause compares the kept values it is handed through their type's equality, which `==` at a type no sum names is" {
-  match program_of(kept_marshalling_corpus()) {
+  match program_of(generic_operation_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let ints = list_type(int_type());
@@ -890,9 +890,9 @@ test "a clause compares the kept values it is handed through their type's equali
             assert(natives_in(c.body.body).contains(b"builtin_elaborated_kept_equal_p"), None),
           _ -> assert(false),
         };
-        assert_eq(kept_entries(f.statics), [comparison_entries(ints)]);
+        assert_eq(static_comparison_entries(f.statics), [comparison_entries(ints)]);
         {
-          let e = word_form_entry(
+          let e = serialization_function(
             p.setting.constructors,
             keys::generated_key(OnWordForm(keys::Equal), ints, b"m"),
           );
@@ -966,7 +966,7 @@ test "a value nested in what a program's generic operation is handed crosses kep
         f.body.fold([], rooted_call)
       };
       let at = |op: keys::TypeOp, t: Type, marks: List<Int>|
-        keys::marked(keys::generated_key(op, t, b"m"), marks);
+        keys::with_marks(keys::generated_key(op, t, b"m"), marks);
       assert_eq(calls(b"first"), [
         at(keys::Keeping, list_type(int), [1]),
         at(keys::Opening, option_type(int), [1]),
@@ -1048,7 +1048,7 @@ fn fn_of(name: Bytes, params: List<Var>, body: List<Inst>) -> Fn =
     kind: Metered,
     params: params,
     convention: {
-      params: all_given(params.map(|v: Var| v.representation)),
+      params: owned_params(params.map(|v: Var| v.representation)),
       result: AsWord,
       destination_passing: false,
       returned: OwnedResult,
@@ -1480,11 +1480,11 @@ test "clauses of one operation on a label and on every label are a table its slo
             rows: [
               {
                 label: Some(2),
-                enters: ClauseSlot({ entry: Results, record: raise_offset(), labelled: false }),
+                enters: ClauseSlot({ entry: ReturnsResult, record: raise_offset(), labelled: false }),
               },
               {
                 label: None,
-                enters: ClauseSlot({ entry: Results, record: raise_offset() + 4, labelled: true }),
+                enters: ClauseSlot({ entry: ReturnsResult, record: raise_offset() + 4, labelled: true }),
               },
             ],
           }),
@@ -1789,7 +1789,7 @@ test "a parallel block is handed the words of what it performs, which the handle
     Ok(p) -> match printed_by_ir(p, b"under") {
       Err(reason) -> assert_eq(reason, b""),
       Ok(t) -> {
-        let set = entered_words(t);
+        let set = entry_handler_words(t);
         assert(set.len() > 0 && !set.contains(b"0"), Some(String::of_bytes_lossy(t)))
       },
     },
@@ -1905,7 +1905,7 @@ fn marshalling_corpus() -> Bytes =
     b"fn alike<t>(a: t, b: t) -> Unit / {abort.raise} = assert_eq(a, b)\n",
   ])
 
-fn crossed_parts(body: List<Inst>) -> List<Bytes> / {abort.raise} =
+fn marshalled_parts(body: List<Inst>) -> List<Bytes> / {abort.raise} =
   body.fold([], |acc: List<Bytes>, i: Inst|
     match i {
       Let(l) -> acc.concat(part_of(l.value)),
@@ -1951,7 +1951,7 @@ fn calls_in(
               acc.push({
                 callee: root_text(root_name(k)),
                 args: c.args,
-                handed: handed_of(c.convention),
+                handed: param_ownerships(c.convention),
               }),
             _ -> acc,
           },
@@ -1994,7 +1994,7 @@ test "a marshalling native is handed machine words: a string as its bytes' addre
           bare_read(b"?out_str"),
           sample_span(),
         );
-        assert_eq(crossed_parts(text.st.insts).take(3), [
+        assert_eq(marshalled_parts(text.st.insts).take(3), [
           b"payload",
           b"length",
           b"builtin_elaborated_out_str_p",
@@ -2010,7 +2010,7 @@ test "a marshalling native is handed machine words: a string as its bytes' addre
           bare_read(b"?out_float"),
           sample_span(),
         );
-        assert_eq(crossed_parts(float.st.insts).take(2), [
+        assert_eq(marshalled_parts(float.st.insts).take(2), [
           b"bits",
           b"builtin_elaborated_out_float_p",
         ]);
@@ -2049,7 +2049,7 @@ test "an `assert_eq` at a type left open is the specialisations' to resolve" {
             a.function,
             sample_span(),
           );
-          assert_eq(crossed_parts(l.st.insts), [b"unsettled assert_eq"]);
+          assert_eq(marshalled_parts(l.st.insts), [b"unsettled assert_eq"]);
           assert(l.st.links.needs.any(|n: Need| n.reads == Exact));
           let message = handle {
             printed_text(p, fn_of(b"alike", start.vars, l.st.insts.push(Return(IntOperand(0)))));
@@ -2388,7 +2388,7 @@ test "a written root calls only marshalling builtins, what it records a type for
         ].fold([], |acc: List<RootKey>, m: { ty: Type, at: Int }|
           acc.concat(
             [Keeping, Opening].map(|op: keys::TypeOp|
-              keys::marked(keys::generated_key(op, m.ty, b"m"), [m.at])),
+              keys::with_marks(keys::generated_key(op, m.ty, b"m"), [m.at])),
           )),
       );
       let roots = asked.fold([], |acc: List<{ key: RootKey, root: GeneratedRoot }>, k: RootKey| {
@@ -2432,7 +2432,7 @@ test "a written root calls only marshalling builtins, what it records a type for
       assert(loops.contains(b"lower_entries") && loops.contains(b"lift_entries"));
       assert_eq(
         [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"].map(|c: Bytes|
-          container_op_reads(c, 0)),
+          container_reads_argument(c, 0)),
         [true, true, false, false],
       );
       let written_names = |k: RootKey| literal_bytes(written_at(p.setting.constructors, k).code);
@@ -2500,7 +2500,7 @@ test "a type crosses where its roots and those of every type it crosses at are w
         VariableType(0),
         list_node_type(int_type()),
       ];
-      let message = |back: Bool| types.map(|t: Type| marshals(held, t, back));
+      let message = |back: Bool| types.map(|t: Type| is_marshallable(held, t, back));
       let written = |op: keys::TypeOp|
         types.map(|t: Type| written_whole(constructors, keys::generated_key(op, t, b"m")));
       assert_eq(message(false), written(Lower));
@@ -2541,23 +2541,23 @@ test "a type crosses where its roots and those of every type it crosses at are w
         !emitted_code().lifts.contains(n));
       assert_eq(
         [
-          marshals(inserting, map, false),
-          marshals(inserting, map, true),
-          marshals(inserting, list_type(shape), true),
+          is_marshallable(inserting, map, false),
+          is_marshallable(inserting, map, true),
+          is_marshallable(inserting, list_type(shape), true),
         ],
         [true, false, true],
       );
       let bare = marshalled_sums(constructors.sums, |_: Bytes| false);
       assert_eq(
         [
-          marshals(bare, list_type(int_type()), false),
-          marshals(bare, shape, true),
-          marshals(bare, option_type(list_type(int_type())), false),
+          is_marshallable(bare, list_type(int_type()), false),
+          is_marshallable(bare, shape, true),
+          is_marshallable(bare, option_type(list_type(int_type())), false),
         ],
         [false, true, false],
       );
       assert_eq(
-        [marshals(bare, chan_type(int_type()), false), marshals(bare, chan_type(int_type()), true)],
+        [is_marshallable(bare, chan_type(int_type()), false), is_marshallable(bare, chan_type(int_type()), true)],
         [true, false],
       )
     },
@@ -2600,7 +2600,7 @@ test "a type's descriptor is laid once, its identity and spelling before the ent
           _ -> assert(false),
         };
         assert_eq(operand_representation(once.arg), AsInt);
-        let shown = laid(shown_described(r.context, start.st, shape, sample_span()));
+        let shown = laid(serializable_type_descriptor(r.context, start.st, shape, sample_span()));
         assert_eq(entries_of(shown), [
           key(Dup, shape),
           key(keys::Release, shape),
@@ -2612,7 +2612,7 @@ test "a type's descriptor is laid once, its identity and spelling before the ent
         let open = type_descriptor(r.context, start.st, list_type(VariableType(0)), sample_span());
         assert_eq(open.st.statics, []);
         assert(open.st.links.needs.any(|n: Need| n.reads == Exact));
-        assert_eq(crossed_parts(open.st.insts), [b"unsettled type#List<'0>"])
+        assert_eq(marshalled_parts(open.st.insts), [b"unsettled type#List<'0>"])
       },
     },
   }
@@ -2635,7 +2635,7 @@ test "a type's word-form entries open the word for its lowering and box what its
       ];
       let entries = types.fold([], |acc: List<Fn>, t: Type|
         [OnWordForm(Lower), OnWordForm(Lift)].fold(acc, |a: List<Fn>, op: keys::TypeOp| {
-          let f = word_form_entry(constructors, keys::generated_key(op, t, b"m"));
+          let f = serialization_function(constructors, keys::generated_key(op, t, b"m"));
           a.push(f)
         }));
       let rejected = entries.fold([], |acc: List<Bytes>, f: Fn|

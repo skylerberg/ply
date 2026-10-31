@@ -9,13 +9,13 @@ import compiler.emit.representations (SumConstructor, Constructors, kind_of, kno
                                       inside_layout, constructors_of, constructor_fields_at)
 import compiler.emit.c (Width, Kind, IntKind, BoolKind, SizedIntKind, FloatKind, DecimalKind,
                         WideKind, in_register)
-import compiler.emit.typed_ir (all_given, Representation, AsInt, AsBool, AsFixed, AsFloat,
+import compiler.emit.typed_ir (owned_params, Representation, AsInt, AsBool, AsFixed, AsFloat,
                                AsDecimal, AsWideFixed, AsWord, AsFlattened, Leaf, AsSum, AsUnit,
                                AsListView, AsImmediate, Convention, OwnedParam, OwnedResult,
                                parts_of)
 import compiler.emit.layout (ValueLayout, SumCases, RecordFields, PlainWords, InlineRecord,
                              FieldLayout, Pointer, Mixed, Always, Inline, Boxed, Nullary, SumLayout,
-                             words, register_words, raw, holds_count)
+                             words, max_flat_words, any_integer, has_counted_references)
 import compiler.emit.lower.module_context (ModuleContext)
 
 pub fn representation_of(s: ModuleContext, ty: Type) -> Representation =
@@ -27,7 +27,7 @@ pub fn typed_convention(
   result: Type,
 ) -> Convention =
   {
-    params: all_given(params.map(|t: Type| representation_with(constructors, t))),
+    params: owned_params(params.map(|t: Type| representation_with(constructors, t))),
     result: representation_with(constructors, result),
     destination_passing: match inside_layout(constructors, result) {
       Some(InlineRecord(_)) -> true,
@@ -53,7 +53,7 @@ fn representation_of_layout(
       RecordFields(fs) -> AsFlattened(record_leaves(constructors, ty, fs)),
       InlineRecord(_) -> AsWord,
       PlainWords(_) -> match scalar_representation(kind_of(ty).kind) {
-        AsWord -> if holds_count(l) { AsWord } else { AsImmediate },
+        AsWord -> if has_counted_references(l) { AsWord } else { AsImmediate },
         r -> r,
       },
     }
@@ -68,10 +68,10 @@ pub fn layout_leaves(constructors: Constructors, ty: Type) -> Option<List<Leaf>>
     _ -> None,
   }
 
-pub fn leaves_inside(constructors: Constructors, ty: Type) -> Option<List<Leaf>> =
+pub fn flattened_leaves(constructors: Constructors, ty: Type) -> Option<List<Leaf>> =
   match representation_with(constructors, ty) { AsFlattened(ls) -> Some(ls), _ -> None }
 
-pub fn inline_with_header(constructors: Constructors, ty: Type) -> Bool =
+pub fn is_inline_record(constructors: Constructors, ty: Type) -> Bool =
   match inside_layout(constructors, ty) { Some(InlineRecord(_)) -> true, _ -> false }
 
 fn case_names(constructors: Constructors, ty: Type) -> List<Bytes> =
@@ -236,13 +236,13 @@ pub fn case_argument_offset(s: SumLayout, i: Int, at: Int) -> Option<Int> = {
   }
 }
 
-pub type Passing = | InWords | ByReference
+pub type Passing = | ByValue | ByReference
 
 pub fn passing(r: Representation) -> Passing =
-  match r { AsFlattened(_) -> passing_by_size(r), AsSum(_) -> passing_by_size(r), _ -> InWords }
+  match r { AsFlattened(_) -> passing_by_size(r), AsSum(_) -> passing_by_size(r), _ -> ByValue }
 
 fn passing_by_size(r: Representation) -> Passing =
-  if value_words(r) > register_words() { ByReference } else { InWords }
+  if value_words(r) > max_flat_words() { ByReference } else { ByValue }
 
 pub fn c_values_of(r: Representation) -> List<Representation> =
   match r {
@@ -286,21 +286,21 @@ fn record(fs: List<{ name: Bytes, ty: Type }>) -> Type = RecordType(fs)
 
 fn point() -> Type = record([{ name: b"x", ty: float_type() }, { name: b"y", ty: float_type() }])
 
-fn line() -> Type = record([{ name: b"from", ty: point() }, { name: b"to", ty: point() }])
+fn point_pair() -> Type = record([{ name: b"from", ty: point() }, { name: b"to", ty: point() }])
 
-fn segment() -> Type =
+fn large_record() -> Type =
   record(
     [
       { name: b"from", ty: point() },
       { name: b"label", ty: string_type() },
       { name: b"to", ty: point() },
     ].concat(
-      range(0, register_words()).map(|i: Int|
+      range(0, max_flat_words()).map(|i: Int|
         { name: b"z".concat(Bytes::of_string(i.to_string())), ty: int_type() }),
     ),
   )
 
-fn sums() -> Constructors = {
+fn test_constructors() -> Constructors = {
   let ctor = |n: Bytes, i: Int, fields: List<Type>, params: List<Int>|
     { name: n, index: i, fields: fields, params: params };
   constructors_of(
@@ -322,7 +322,7 @@ fn sums() -> Constructors = {
 }
 
 test "a scalar is held as itself, a pointer as a word, and a value of no words in none" {
-  let s = module_context_of(sums());
+  let s = module_context_of(test_constructors());
   assert_eq(representation_of(s, int_type()), AsInt);
   assert_eq(representation_of(s, float_type()), AsFloat);
   assert_eq(
@@ -347,7 +347,7 @@ test "a scalar is held as itself, a pointer as a word, and a value of no words i
 }
 
 test "a declared sum is held as the words its type lays it in, and one a variable leaves open as a word" {
-  let s = module_context_of(sums());
+  let s = module_context_of(test_constructors());
   match representation_of(s, option_type(string_type())) {
     AsSum(x) -> {
       assert_eq(x.cases, [b"None", b"Some"]);
@@ -361,12 +361,12 @@ test "a declared sum is held as the words its type lays it in, and one a variabl
 }
 
 test "a record is held as its leaves in its words' order, a record it holds among them and no word of its own" {
-  let s = module_context_of(sums());
+  let s = module_context_of(test_constructors());
   assert_eq(
     representation_of(s, point()),
     AsFlattened([{ name: b"x", representation: AsFloat }, { name: b"y", representation: AsFloat }]),
   );
-  let leaves = match representation_of(s, line()) { AsFlattened(ls) -> ls, _ -> [] };
+  let leaves = match representation_of(s, point_pair()) { AsFlattened(ls) -> ls, _ -> [] };
   assert_eq(leaves.map(|l: Leaf| l.name), [b"from.x", b"from.y", b"to.x", b"to.y"]);
   assert_eq(leaf_span(leaves, b"to"), Some({ at: 2, n: 2 }));
   assert_eq(leaf_span(leaves, b"from"), Some({ at: 0, n: 2 }));
@@ -384,39 +384,39 @@ test "a record is held as its leaves in its words' order, a record it holds amon
 }
 
 test "a record wider than a call's registers is a box, lies in place in a record holding it, and in a case as a pointer" {
-  let s = module_context_of(sums());
-  assert_eq(representation_of(s, segment()), AsWord);
-  let small = record([{ name: b"n", ty: int_type() }, { name: b"s", ty: segment() }]);
+  let s = module_context_of(test_constructors());
+  assert_eq(representation_of(s, large_record()), AsWord);
+  let small = record([{ name: b"n", ty: int_type() }, { name: b"s", ty: large_record() }]);
   assert(representation_of(s, small) != AsWord, None);
   let holder = record(
-    range(0, register_words()).map(|i: Int|
+    range(0, max_flat_words()).map(|i: Int|
       { name: b"a".concat(Bytes::of_string(i.to_string())), ty: int_type() }).push({
       name: b"s",
-      ty: segment(),
+      ty: large_record(),
     }),
   );
   assert_eq(representation_of(s, holder), AsWord);
-  assert(inline_with_header(s.constructors, segment()), None);
+  assert(is_inline_record(s.constructors, large_record()), None);
   assert_eq(
-    case_parts(s.constructors, option_type(segment()), 1).map(|p: CasePart| p.representation),
+    case_parts(s.constructors, option_type(large_record()), 1).map(|p: CasePart| p.representation),
     [AsWord],
   );
-  assert_eq(c_values_of(representation_of(s, option_type(segment()))), [AsWord])
+  assert_eq(c_values_of(representation_of(s, option_type(large_record()))), [AsWord])
 }
 
 test "a field lies at its first word in the box of its record's words" {
-  let s = module_context_of(sums());
-  assert_eq(field_offsets(s, segment()).get(b"label"), Some(2));
-  assert_eq(field_offsets(s, segment()).get(b"to"), Some(3));
+  let s = module_context_of(test_constructors());
+  assert_eq(field_offsets(s, large_record()).get(b"label"), Some(2));
+  assert_eq(field_offsets(s, large_record()).get(b"to"), Some(3));
   assert_eq(
     field_offsets(s, record([{ name: b"inner", ty: VariableType(0) }])).get(b"inner"),
     None,
   );
-  assert_eq(field_type(segment(), b"to"), Some(point()))
+  assert_eq(field_type(large_record(), b"to"), Some(point()))
 }
 
 test "a case's argument starts where the case's arguments, laid as a record, lay it" {
-  let s = module_context_of(sums());
+  let s = module_context_of(test_constructors());
   match representation_of(s, result_type(int_type(), point())) {
     AsSum(x) -> {
       assert_eq([case_argument_offset(x.layout, 0, 0), case_argument_offset(x.layout, 1, 0)], [
@@ -474,11 +474,11 @@ test "a result of one word needs no buffer, and a wider one its other words" {
 test "a record or a sum wider than a call's registers crosses by reference" {
   let flat = |reps: List<Representation>|
     AsFlattened(reps.map(|r: Representation| { name: b"f", representation: r }));
-  let n = register_words();
+  let n = max_flat_words();
   let ints = |k: Int| range(0, k).map(|_: Int| AsInt);
-  assert_eq(passing(flat(ints(n))), InWords);
+  assert_eq(passing(flat(ints(n))), ByValue);
   assert_eq(passing(flat(ints(n + 1))), ByReference);
-  assert_eq(passing(flat(ints(n - 2).push(AsDecimal))), InWords);
+  assert_eq(passing(flat(ints(n - 2).push(AsDecimal))), ByValue);
   assert_eq(passing(flat(ints(n - 1).push(AsDecimal))), ByReference);
   let sum = |n: Int|
     AsSum({
@@ -489,7 +489,7 @@ test "a record or a sum wider than a call's registers crosses by reference" {
             test: Always,
             payload: Inline({
               offset: 0,
-              layout: PlainWords(range(0, n).map(|_: Int| raw())),
+              layout: PlainWords(range(0, n).map(|_: Int| any_integer())),
               stripped: None,
             }),
           },
@@ -497,12 +497,12 @@ test "a record or a sum wider than a call's registers crosses by reference" {
       },
       cases: [b"m.Only"],
     });
-  assert_eq([sum(n), sum(n + 1)].map(passing), [InWords, ByReference]);
+  assert_eq([sum(n), sum(n + 1)].map(passing), [ByValue, ByReference]);
   assert_eq(
     value_words(
       AsFlattened([{ name: b"s", representation: sum(3) }, { name: b"n", representation: AsInt }]),
     ),
     4,
   );
-  assert_eq([AsDecimal, AsWord, AsInt, AsUnit].map(passing), [InWords, InWords, InWords, InWords])
+  assert_eq([AsDecimal, AsWord, AsInt, AsUnit].map(passing), [ByValue, ByValue, ByValue, ByValue])
 }

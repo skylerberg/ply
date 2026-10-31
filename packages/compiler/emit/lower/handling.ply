@@ -12,7 +12,7 @@ import compiler.syntax.items (is_shipped)
 import compiler.check.types (Type, FunctionType, RecordType, Effects, Resource, NamedResource,
                              SingletonResource, AnyResource, ResourceVariable, int_type,
                              string_type, fields_sorted, no_effects)
-import compiler.check.infer.expression (kept_type, marshalling_variables, marshalling_own)
+import compiler.check.infer.expression (kept_type, marshalling_variables, variables_in_signature)
 import compiler.emit.typing (unknown_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, RaiseMode, InvalidMode, is_raise)
@@ -29,7 +29,7 @@ import compiler.emit.typed_ir.handling (Perform, Label, Parallel, UnspecialisedB
                                         SchedulerEvidence, Instance, HeapInstance, InstanceAddress,
                                         Entering, AllocateForwarding, SetForwarding, ObjectAt,
                                         EffectsMapping, Slot, ClauseSlot, CopiedSlot, ForwardedSlot,
-                                        KeyedSlot, KeyedRow, ClauseEntry, Results, Schedules,
+                                        KeyedSlot, KeyedCase, ClauseEntry, ReturnsResult, Schedules,
                                         Suspends, Resumes, Raises, HandleInstance, Returning,
                                         raise_offset)
 import compiler.emit.lower.marshalling (operation_descriptor, type_descriptor, effect_of, own_types)
@@ -37,7 +37,7 @@ import compiler.emit.lower.kept (kept_conversion)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, Frame, EvidenceWord,
                                  CapturedEvidence, unreachable, fresh, bound_as, run_for_effect,
                                  emitted, exit_block, type_of, represented_as, static_added)
-import compiler.emit.lower.evidence (words_of, evidence_for, outer_evidence, bridged,
+import compiler.emit.lower.evidence (words_of, evidence_for, covering_evidence_word, fill_missing_evidence,
                                      captured_evidence_for, label_resource, function_value_evidence,
                                      effects_descriptor, label_value)
 import compiler.emit.lower.representation (representation_of)
@@ -62,7 +62,7 @@ pub fn performed(
         Some(c) -> label_resource(context, c),
         None -> if p.resource == b"" { SingletonResource } else { NamedResource(p.resource) },
       };
-      let word = bridged(
+      let word = fill_missing_evidence(
         st,
         evidence_for(context, [
           { evidence: { effect: en.global, resource: resource }, through: false },
@@ -152,7 +152,7 @@ pub fn performed(
 
 fn kept_type_parameters(global: Bytes, op: EffectOperation) -> List<Int> / {abort.raise} =
   if global.index_of(b".") == None || is_shipped(global) { [] }
-  else { marshalling_own(op.params, op.ret, op.mode, op.own) }
+  else { variables_in_signature(op.params, op.ret, op.mode, op.own) }
 
 fn names_kept(declared: Type, kept: List<Int>) -> Bool =
   type_variables(declared).any(|v: Int| kept.contains(v))
@@ -476,7 +476,7 @@ fn forwarding_header(
   );
   let d = static_added(mapped.st, effects_descriptor(outer.map(|w: EvidenceWord| w.evidence)));
   let desc = bound_as(d.st, effects_descriptor_type(), AsImmediate, Static(d.name), at);
-  let words = bridged(desc.st, outer.map(|w: EvidenceWord| w.word), at);
+  let words = fill_missing_evidence(desc.st, outer.map(|w: EvidenceWord| w.word), at);
   let headed = set(
     set(set(set(words.st, 1, mapped.arg), 2, desc.arg), 3, IntOperand(outer.len())),
     4,
@@ -682,14 +682,14 @@ fn write_object(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let routed_to = if kp.slots.any(|x: SlotPlan| x == ByWord) {
-    bridged(st, [outer_evidence(context, kp.key.evidence)], at)
+    fill_missing_evidence(st, [covering_evidence_word(context, kp.key.evidence)], at)
   } else { { st: st, args: [ZeroOperand(AsImmediate)] } };
   let first_label = 2 + kp.outer.len();
   let clause_slot = |c: Int| {
     let cl = clauses.get(c);
     let entry = match entry_of(clause_mode(context, cl)) {
-      Results -> if module_of(context.key) == scheduler_module() && !cl.binds_label { Schedules }
-      else { Results },
+      ReturnsResult -> if module_of(context.key) == scheduler_module() && !cl.binds_label { Schedules }
+      else { ReturnsResult },
       other -> other,
     };
     ClauseSlot({ entry: entry, record: i.layout.records.get(c), labelled: cl.binds_label })
@@ -719,7 +719,7 @@ fn write_object(
         ByTable(t) -> {
           let by_clause = t.clauses.fold(
             { st: acc.st, labels: acc.labels, rows: [] },
-            |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedRow> }, c: Int| {
+            |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedCase> }, c: Int| {
               let l = labelled(r.st, r.labels, clause_resource(context, clauses.get(c)));
               {
                 st: l.st,
@@ -730,7 +730,7 @@ fn write_object(
           );
           let by_word = t.words.fold(
             by_clause,
-            |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedRow> }, w: Int| {
+            |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedCase> }, w: Int| {
               let l = labelled(r.st, r.labels, kp.outer.get(w).evidence.resource);
               {
                 st: l.st,
@@ -748,7 +748,7 @@ fn write_object(
         },
       },
   );
-  let outer = bridged(laid.st, kp.outer.map(|w: EvidenceWord| w.word), at);
+  let outer = fill_missing_evidence(laid.st, kp.outer.map(|w: EvidenceWord| w.word), at);
   let operands = [i.word].concat(routed_to.args).concat(outer.args).concat(laid.labels);
   bound_as(
     outer.st,
@@ -767,7 +767,7 @@ fn entry_of(mode: Int) -> ClauseEntry =
   if mode == 3 { Raises }
   else if mode == 1 { Resumes }
   else if mode == 2 { Suspends }
-  else { Results }
+  else { ReturnsResult }
 
 fn may_stop(c: Clause) -> Bool = match entry_of(c.mode) { Resumes -> true, _ -> false }
 
@@ -849,7 +849,7 @@ pub fn handle_assembled(
     }
   };
   let laid = range(0, h.clauses.len()).fold(
-    { st: inner.outer, args: [], takes: [], clauses: [], unknown: None },
+    { st: inner.outer, args: [], takes: [], clauses: [], unknown_effect: None },
     |acc: ClauseLayout, i: Int|
       match h.clauses.at(i) {
         None -> acc,
@@ -890,7 +890,7 @@ pub fn handle_assembled(
     },
   };
   let a = fresh(site.st, ty, result_rep);
-  match laid.unknown {
+  match laid.unknown_effect {
     Some(name) -> unreachable(b"an effect the lowering does not resolve: ".concat(name)),
     None -> if escapes(inner.block, false, false) {
       unreachable(b"a handle body that leaves other than by its end")
@@ -923,7 +923,7 @@ pub fn handle_assembled(
   }
 }
 
-pub fn detached_landing(
+pub fn lower_detached_handle(
   context: Context,
   before: Lowering,
   body: LoweredValue,
@@ -1063,7 +1063,7 @@ type ClauseLayout = {
   args: List<Arg>,
   takes: List<Bool>,
   clauses: List<Clause>,
-  unknown: Option<Bytes>,
+  unknown_effect: Option<Bytes>,
 }
 
 fn clause_added(
@@ -1074,7 +1074,7 @@ fn clause_added(
   at: Span,
 ) -> ClauseLayout / {abort.raise} =
   match effect_of(context, cl.effect) {
-    None -> { ..acc, unknown: match acc.unknown { Some(u) -> Some(u), None -> Some(cl.effect) } },
+    None -> { ..acc, unknown_effect: match acc.unknown_effect { Some(u) -> Some(u), None -> Some(cl.effect) } },
     Some(en) -> {
       let stringed = cl.binds_label || (en.global == b"abort" && cl.op == b"raise");
       let bound = if stringed {
@@ -1092,7 +1092,7 @@ fn clause_added(
           string: if stringed { Some(acc.args.len() + 1) } else { None },
           handler: acc.args.len(),
         }),
-        unknown: acc.unknown,
+        unknown_effect: acc.unknown_effect,
       }
     },
   }

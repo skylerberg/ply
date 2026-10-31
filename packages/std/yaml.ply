@@ -216,7 +216,7 @@ type Token = { token: TokenKind, from: Int, to: Int }
 type Stack<a> = | Empty | Top(a, Stack<a>)
 
 /// A node that is a key if a `:` follows it on its line: the slot for its tokens, and its position.
-type SimpleKey = { slot: Int, pos: Int, line: Int, column: Int, tabbed: Bool }
+type SimpleKey = { slot: Int, pos: Int, line: Int, column: Int, tab_skipped: Bool }
 
 /// An open flow collection, and the candidate among its entries where it is a sequence.
 type FlowLevel = { map: Bool, key: Option<SimpleKey> }
@@ -225,10 +225,10 @@ type Span = { from: Int, to: Int }
 
 /// The scanner's position and what it has made of the text before it.
 ///
-/// `lead` is whether no token is on the line yet, and `tabbed` whether a tab was skipped on it
+/// `lead` is whether no token is on the line yet, and `tab_skipped` whether a tab was skipped on it
 /// between tokens. `indent` is the column of the innermost open block collection, and `indents`
 /// those around it. `asked` are the columns of the block mappings whose last key is written after
-/// `?` and has no `:` yet. `hold` is the first token before which a candidate on this line may
+/// `?` and has no `:` yet. `pending_key_token` is the first token before which a candidate on this line may
 /// still put a key, and `required` is the position of a candidate that must become a key.
 type Scanner = {
   src: Bytes,
@@ -239,7 +239,7 @@ type Scanner = {
   line_start: Int,
   line_indent: Int,
   lead: Bool,
-  tabbed: Bool,
+  tab_skipped: Bool,
   indent: Int,
   indents: Stack<Int>,
   open: Int,
@@ -248,7 +248,7 @@ type Scanner = {
   block_simple_key: Option<SimpleKey>,
   asked: Stack<Int>,
   allow_key: Bool,
-  hold: Int,
+  pending_key_token: Int,
   required: Int,
   after_json: Bool,
   tokens: List<Token>,
@@ -327,7 +327,7 @@ fn scanner(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
         line_start: start,
         line_indent: src.skip(start, b" ") - start,
         lead: true,
-        tabbed: false,
+        tab_skipped: false,
         indent: -1,
         indents: Empty,
         open: 0,
@@ -336,7 +336,7 @@ fn scanner(src: Bytes, limits: Limits) -> Scanner / {fault.at, abort.raise} = {
         block_simple_key: None,
         asked: Empty,
         allow_key: true,
-        hold: -1,
+        pending_key_token: -1,
         required: -1,
         after_json: false,
         tokens: [],
@@ -351,12 +351,12 @@ fn with_token(s: Scanner, token: TokenKind, from: Int, to: Int) -> Scanner =
   { ..s, tokens: s.tokens.push({ token: token, from: from, to: to }) }
 
 /// The scanner past a token that ends at `to`.
-fn past(s: Scanner, to: Int, allow_key: Bool) -> Scanner =
+fn finish_token(s: Scanner, to: Int, allow_key: Bool) -> Scanner =
   { ..s, pos: to, lead: false, allow_key: allow_key, after_json: false }
 
 /// The column of a token at the scanner's position. When a tab leads the line, it is the spaces
 /// before the tab, since no tab indents.
-fn column(s: Scanner) -> Int = if s.lead && s.tabbed { s.line_indent } else { s.pos - s.line_start }
+fn column(s: Scanner) -> Int = if s.lead && s.tab_skipped { s.line_indent } else { s.pos - s.line_start }
 
 fn in_flow_map(s: Scanner) -> Bool = match s.levels { Top(level, _) -> level.map, Empty -> false }
 
@@ -370,7 +370,7 @@ fn with_simple_key(s: Scanner, key: Option<SimpleKey>) -> Scanner =
   }
 
 fn blocked_without(s: Scanner, key: Option<SimpleKey>) -> Int =
-  match key { Some(locate) -> if locate.slot == s.hold { -1 } else { s.hold }, None -> s.hold }
+  match key { Some(locate) -> if locate.slot == s.pending_key_token { -1 } else { s.pending_key_token }, None -> s.pending_key_token }
 
 fn missing_colon<a>(at: Int) -> a / {fault.at} =
   fail(at, Expected("`:` after this key, on its line"))
@@ -386,8 +386,8 @@ fn on_line(s: Scanner, start: Int, lines: Int) -> Scanner / {fault.at, abort.rai
       line_start: start,
       line_indent: s.src.skip(start, b" ") - start,
       lead: true,
-      tabbed: false,
-      hold: -1,
+      tab_skipped: false,
+      pending_key_token: -1,
       allow_key: s.allow_key || s.flow_level == 0,
     }
   }
@@ -400,7 +400,7 @@ fn skip(s: Scanner, left: Int) -> Scanner / {fault.at, abort.raise} = {
   let p = src.skip(s.pos, b" ");
   let c = src.peek(p);
   if left <= 0 { panic("more blanks than bytes") }
-  else if c == b'\t' { skip({ ..s, pos: src.skip(p, b" \t"), tabbed: true }, left - 1) }
+  else if c == b'\t' { skip({ ..s, pos: src.skip(p, b" \t"), tab_skipped: true }, left - 1) }
   else if is_break(c) { skip(on_line(s, p + break_len(src, p), 1), left - 1) }
   else if c == b'#' && (p == s.line_start || is_blank(src.peek(p - 1))) {
     let end = src.skip_until(p, b"\r\n");
@@ -411,18 +411,18 @@ fn skip(s: Scanner, left: Int) -> Scanner / {fault.at, abort.raise} = {
 
 type UnrollResult = { indent: Int, indents: Stack<Int>, ends: Int }
 
-fn unrolled(indent: Int, indents: Stack<Int>, col: Int, ends: Int) -> UnrollResult =
+fn ended_blocks(indent: Int, indents: Stack<Int>, col: Int, ends: Int) -> UnrollResult =
   if indent <= col { { indent: indent, indents: indents, ends: ends } } else {
     match indents {
       Empty -> { indent: -1, indents: Empty, ends: ends },
-      Top(outer, rest) -> unrolled(outer, rest, col, ends + 1),
+      Top(outer, rest) -> ended_blocks(outer, rest, col, ends + 1),
     }
   }
 
 /// The scanner with every block collection indented past `col` ended.
-fn unroll(s: Scanner, col: Int) -> Scanner =
+fn end_deeper_blocks(s: Scanner, col: Int) -> Scanner =
   if s.indent <= col { s } else {
-    let u = unrolled(s.indent, s.indents, col, 0);
+    let u = ended_blocks(s.indent, s.indents, col, 0);
     {
       ..s,
       indent: u.indent,
@@ -462,12 +462,12 @@ fn save_simple_key(s: Scanner) -> Scanner =
     let slot = s.tokens.len();
     let noted = with_simple_key(
       s,
-      Some({ slot: slot, pos: s.pos, line: s.line, column: col, tabbed: s.tabbed }),
+      Some({ slot: slot, pos: s.pos, line: s.line, column: col, tab_skipped: s.tab_skipped }),
     );
     {
       ..noted,
       tokens: s.tokens.push(none_at(s.pos)).push(none_at(s.pos)),
-      hold: if s.hold < 0 { slot } else { s.hold },
+      pending_key_token: if s.pending_key_token < 0 { slot } else { s.pending_key_token },
       required: if s.flow_level == 0 && s.indent == col { s.pos } else { s.required },
     }
   }
@@ -476,22 +476,22 @@ fn save_simple_key(s: Scanner) -> Scanner =
 fn remove_simple_key(s: Scanner) -> Scanner / {fault.at} =
   if s.flow_level == 0 && s.required >= 0 { missing_colon(s.required) } else {
     let key = simple_key(s);
-    { ..with_simple_key(s, None), hold: blocked_without(s, key) }
+    { ..with_simple_key(s, None), pending_key_token: blocked_without(s, key) }
   }
 
 /// The scanner past one more token. Every call passes a byte or ends the stream.
-fn fetch(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
+fn scan_token(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   let locate = skip(s, s.src.len() - s.pos + 2);
   let c = locate.src.peek(locate.pos);
   if c < 0 { finish(locate) }
   else if locate.flow_level > 0 { in_flow(locate, c) }
-  else { in_block(unroll(locate, column(locate)), c) }
+  else { in_block(end_deeper_blocks(locate, column(locate)), c) }
 }
 
 fn finish(s: Scanner) -> Scanner / {fault.at} =
   if s.required >= 0 { missing_colon(s.required) } else {
-    let ended = unroll(s, -1);
-    { ..with_token(ended, StreamEndToken, s.pos, s.pos), ended: true, hold: -1 }
+    let ended = end_deeper_blocks(s, -1);
+    { ..with_token(ended, StreamEndToken, s.pos, s.pos), ended: true, pending_key_token: -1 }
   }
 
 /// A token inside a flow collection. On a new line it must be indented past the enclosing block,
@@ -520,8 +520,8 @@ fn token(s: Scanner, c: Int, next: Int) -> Scanner / {fault.at, abort.raise} =
   match c {
     b'[' -> flow_start(s, false),
     b'{' -> flow_start(s, true),
-    b']' -> flow_end(s, false),
-    b'}' -> flow_end(s, true),
+    b']' -> end_flow_collection(s, false),
+    b'}' -> end_flow_collection(s, true),
     b',' -> flow_entry(s),
     b'*' -> anchor(s, true),
     b'&' -> anchor(s, false),
@@ -532,23 +532,23 @@ fn token(s: Scanner, c: Int, next: Int) -> Scanner / {fault.at, abort.raise} =
     34 -> quoted(s, true),
     b'#' -> fail(s.pos, Expected("a blank before a comment")),
     b'%' | b'@' | b'`' -> fail(s.pos, Expected("a node, which this character starts none of")),
-    b'-' -> if safe_after(s, next) { plain(s) } else { block_entry(s) },
-    63 -> if safe_after(s, next) { plain(s) } else { key_indicator(s) },
+    b'-' -> if safe_after(s, next) { scan_plain_scalar(s) } else { block_entry(s) },
+    63 -> if safe_after(s, next) { scan_plain_scalar(s) } else { key_indicator(s) },
     b':' -> if (s.after_json && s.flow_level > 0) || !safe_after(s, next) { value_indicator(s) }
-    else { plain(s) },
-    _ -> plain(s),
+    else { scan_plain_scalar(s) },
+    _ -> scan_plain_scalar(s),
   }
 
 /// `---` or `...` at the start of a line: every block collection ends.
 fn marker(s: Scanner, start: Bool) -> Scanner / {fault.at, abort.raise} = {
-  let ended = unroll(remove_simple_key(s), -1);
+  let ended = end_deeper_blocks(remove_simple_key(s), -1);
   let to = s.pos + 3;
   let rest = s.src.skip(to, b" \t");
   let c = s.src.peek(rest);
   if !start && !(c < 0 || is_break(c) || c == b'#') {
     fail(rest, Expected("nothing after `...` on its line but a comment"))
   } else {
-    past(
+    finish_token(
       with_token(ended, if start { DocumentStartToken } else { DocumentEndToken }, s.pos, to),
       to,
       false,
@@ -562,7 +562,7 @@ type ScannedDirective = { token: TokenKind, to: Int }
 
 fn directive(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   let src = s.src;
-  let ended = unroll(remove_simple_key(s), -1);
+  let ended = end_deeper_blocks(remove_simple_key(s), -1);
   let name_end = src.skip_until(s.pos + 1, b" \t\r\n");
   let name = src.slice(s.pos + 1, name_end);
   let args = src.skip(name_end, b" \t");
@@ -573,7 +573,7 @@ fn directive(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   let c = src.peek(rest);
   if !ends_word(src.peek(read.to)) || !(c < 0 || is_break(c) || c == b'#') {
     fail(read.to, Expected("nothing after a directive on its line but a comment"))
-  } else { past(with_token(ended, read.token, s.pos, read.to), read.to, false) }
+  } else { finish_token(with_token(ended, read.token, s.pos, read.to), read.to, false) }
 }
 
 fn digits() -> Bytes = b"0123456789"
@@ -663,7 +663,7 @@ fn flow_start(s: Scanner, map: Bool) -> Scanner / {fault.at} =
       flow_level: s.flow_level + 1,
       levels: Top({ map: map, key: None }, noted.levels),
     };
-    past(
+    finish_token(
       with_token(
         inside,
         if map { FlowMappingStartToken } else { FlowSequenceStartToken },
@@ -675,7 +675,7 @@ fn flow_start(s: Scanner, map: Bool) -> Scanner / {fault.at} =
     )
   }
 
-fn flow_end(s: Scanner, map: Bool) -> Scanner / {fault.at} =
+fn end_flow_collection(s: Scanner, map: Bool) -> Scanner / {fault.at} =
   match s.levels {
     Empty -> fail(s.pos, Expected("a flow collection open, for this to close")),
     Top(level, rest) -> {
@@ -683,9 +683,9 @@ fn flow_end(s: Scanner, map: Bool) -> Scanner / {fault.at} =
         ..s,
         flow_level: s.flow_level - 1,
         levels: rest,
-        hold: blocked_without(s, level.key),
+        pending_key_token: blocked_without(s, level.key),
       };
-      let end_collection = past(
+      let end_collection = finish_token(
         with_token(
           outside,
           if map { FlowMappingEndToken } else { FlowSequenceEndToken },
@@ -703,26 +703,26 @@ fn flow_entry(s: Scanner) -> Scanner / {fault.at} =
   if s.flow_level == 0 {
     fail(s.pos, Expected("a flow collection open, for `,` to separate its entries"))
   } else {
-    past(with_token(remove_simple_key(s), FlowEntryToken, s.pos, s.pos + 1), s.pos + 1, true)
+    finish_token(with_token(remove_simple_key(s), FlowEntryToken, s.pos, s.pos + 1), s.pos + 1, true)
   }
 
 fn block_entry(s: Scanner) -> Scanner / {fault.at} =
   if s.flow_level > 0 { fail(s.pos, Expected("no `-` entry inside a flow collection")) }
   else if !s.allow_key { fail(s.pos, Expected("a block sequence to start on a line of its own")) }
-  else if s.tabbed { fail(s.pos, Tab) } else {
+  else if s.tab_skipped { fail(s.pos, Tab) } else {
     let col = column(s);
     let cleared = remove_simple_key(s);
     let start_collection = if cleared.indent < col {
       with_token(roll(cleared, col, s.pos), BlockSequenceStartToken, s.pos, s.pos)
     } else { cleared };
-    past(with_token(start_collection, BlockEntryToken, s.pos, s.pos + 1), s.pos + 1, true)
+    finish_token(with_token(start_collection, BlockEntryToken, s.pos, s.pos + 1), s.pos + 1, true)
   }
 
 fn key_indicator(s: Scanner) -> Scanner / {fault.at} =
   if s.flow_level > 0 {
-    past(with_token(remove_simple_key(s), KeyToken, s.pos, s.pos + 1), s.pos + 1, false)
+    finish_token(with_token(remove_simple_key(s), KeyToken, s.pos, s.pos + 1), s.pos + 1, false)
   } else if !s.allow_key { fail(s.pos, Expected("a block mapping to start on a line of its own")) }
-  else if s.tabbed { fail(s.pos, Tab) } else {
+  else if s.tab_skipped { fail(s.pos, Tab) } else {
     let col = column(s);
     let cleared = remove_simple_key(s);
     let start_collection = if cleared.indent < col {
@@ -733,7 +733,7 @@ fn key_indicator(s: Scanner) -> Scanner / {fault.at} =
       asked: if has_explicit_key(start_collection.asked, col) { start_collection.asked }
       else { Top(col, start_collection.asked) },
     };
-    past(with_token(asking, KeyToken, s.pos, s.pos + 1), s.pos + 1, true)
+    finish_token(with_token(asking, KeyToken, s.pos, s.pos + 1), s.pos + 1, true)
   }
 
 /// The candidate at the scanner's level that a `:` here turns into a key: one on this line, and
@@ -749,20 +749,20 @@ fn usable_simple_key(s: Scanner) -> Option<SimpleKey> =
 /// a collection may start on its line. With no `?` to complete, it has an empty key, and its value
 /// is one node, as any key's is.
 fn value_indicator(s: Scanner) -> Scanner / {fault.at, abort.raise} =
-  if in_flow_map(s) { past(with_token(s, ValueToken, s.pos, s.pos + 1), s.pos + 1, false) } else {
+  if in_flow_map(s) { finish_token(with_token(s, ValueToken, s.pos, s.pos + 1), s.pos + 1, false) } else {
     match usable_simple_key(s) {
       Some(locate) -> after_key(s, locate),
       None -> if s.flow_level > 0 {
-        past(with_token(with_simple_key(s, None), ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
+        finish_token(with_token(with_simple_key(s, None), ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
       } else if !s.allow_key { fail(s.pos, Expected("no `:` here: a mapping's value is one node")) }
-      else if s.tabbed { fail(s.pos, Tab) } else {
+      else if s.tab_skipped { fail(s.pos, Tab) } else {
         let col = column(s);
         let cleared = remove_simple_key(s);
         let start_collection = if cleared.indent < col {
           with_token(roll(cleared, col, s.pos), BlockMappingStartToken, s.pos, s.pos)
         } else { cleared };
         let results = has_explicit_key(start_collection.asked, col);
-        past(
+        finish_token(
           with_token(
             { ..start_collection, asked: without_explicit_key(start_collection.asked, col) },
             ValueToken,
@@ -779,7 +779,7 @@ fn value_indicator(s: Scanner) -> Scanner / {fault.at, abort.raise} =
 /// A `:` after a candidate: the candidate's slots take a key token, and in a block also the start
 /// of a mapping when its column opens one.
 fn after_key(s: Scanner, locate: SimpleKey) -> Scanner / {fault.at, abort.raise} =
-  if s.flow_level == 0 && locate.tabbed { fail(locate.pos, Tab) } else {
+  if s.flow_level == 0 && locate.tab_skipped { fail(locate.pos, Tab) } else {
     let opens = s.flow_level == 0 && s.indent < locate.column;
     let start_collection = if opens { roll(s, locate.column, locate.pos) } else { s };
     let started = if opens {
@@ -797,12 +797,12 @@ fn after_key(s: Scanner, locate: SimpleKey) -> Scanner / {fault.at, abort.raise}
     let cleared = {
       ..with_simple_key(start_collection, None),
       tokens: marked,
-      hold: blocked_without(s, Some(locate)),
+      pending_key_token: blocked_without(s, Some(locate)),
       required: if s.flow_level == 0 { -1 } else { s.required },
       asked: if s.flow_level == 0 { without_explicit_key(start_collection.asked, locate.column) }
       else { start_collection.asked },
     };
-    past(with_token(cleared, ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
+    finish_token(with_token(cleared, ValueToken, s.pos, s.pos + 1), s.pos + 1, false)
   }
 
 fn anchor(s: Scanner, alias: Bool) -> Scanner / {fault.at, abort.raise} = {
@@ -812,7 +812,7 @@ fn anchor(s: Scanner, alias: Bool) -> Scanner / {fault.at, abort.raise} = {
   else {
     let name = String::of_bytes(s.src.slice(s.pos + 1, end));
     require_printable(s.src, s.pos, end);
-    past(
+    finish_token(
       with_token(
         save_simple_key(s),
         if alias { AliasToken(name) } else { AnchorToken(name) },
@@ -832,7 +832,7 @@ fn tag(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   else { shorthand(s.src, s.pos) };
   if !ends_properties(s, s.src.peek(read.to)) { fail(read.to, Expected("a blank after a tag")) }
   else {
-    past(
+    finish_token(
       with_token(save_simple_key(s), TagToken(read.handle, read.suffix), s.pos, read.to),
       read.to,
       false,
@@ -896,7 +896,7 @@ fn scalar(
   let quotes = style == SingleQuoted || style == DoubleQuoted;
   if !quotes { require_printable(s.src, from, run.to) } else { () };
   if content.len() > s.scalar { fail(from, ScalarTooLong) } else {
-    past(
+    finish_token(
       with_token(run.s, ScalarToken(String::of_bytes(content), style), from, run.to),
       run.to,
       allow_key,
@@ -904,7 +904,7 @@ fn scalar(
   }
 }
 
-fn plain(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
+fn scan_plain_scalar(s: Scanner) -> Scanner / {fault.at, abort.raise} = {
   let run = plain_lines(save_simple_key(s), s.pos, [], s.src.len() - s.pos + 2);
   scalar(s, run, Plain, s.pos, false)
 }
@@ -1134,7 +1134,7 @@ fn block_scalar(s: Scanner, literal: Bool) -> Scanner / {fault.at, abort.raise} 
         src.len() - first + 2,
       );
       let content = chomped(read, h.chomp);
-      let ended = if src.peek(line_end) < 0 { past(remove_simple_key(noted), line_end, true) }
+      let ended = if src.peek(line_end) < 0 { finish_token(remove_simple_key(noted), line_end, true) }
       else { { ..on_line(remove_simple_key(noted), read.start, read.lines), allow_key: true } };
       let read_on = scalar(
         ended,
@@ -1303,7 +1303,7 @@ fn parser(scan: Scanner) -> Parser =
 /// The parser with a token to read at its head, asking the scanner for more while a key may still
 /// be placed before it. Each round consumes a token or a byte, so `left` bounds the rounds.
 fn fetch_more_tokens(p: Parser, left: Int) -> Parser / {fault.at, abort.raise} = {
-  let mapping_entries = if p.scan.hold >= 0 { p.scan.hold } else { p.scan.tokens.len() };
+  let mapping_entries = if p.scan.pending_key_token >= 0 { p.scan.pending_key_token } else { p.scan.tokens.len() };
   if left <= 0 { panic("more tokens than bytes") } else if p.head < mapping_entries {
     match p.scan.tokens.at(p.head) {
       Some(t) -> match t.token {
@@ -1313,7 +1313,7 @@ fn fetch_more_tokens(p: Parser, left: Int) -> Parser / {fault.at, abort.raise} =
       None -> p,
     }
   } else if p.scan.ended { p }
-  else { fetch_more_tokens({ ..p, scan: fetch(p.scan) }, left - 1) }
+  else { fetch_more_tokens({ ..p, scan: scan_token(p.scan) }, left - 1) }
 }
 
 fn step_limit(p: Parser) -> Int = 8 * p.scan.src.len() + 64
@@ -1328,7 +1328,7 @@ fn current(p: Parser) -> Token =
 fn consume(p: Parser) -> Parser / {fault.at, abort.raise} =
   fetch_more_tokens({ ..p, head: p.head + 1 }, step_limit(p))
 
-fn said(p: Parser, kind: Kind, from: Int, to: Int) -> Parser =
+fn emitted(p: Parser, kind: Kind, from: Int, to: Int) -> Parser =
   { ..p, events: p.events.push({ kind: kind, from: from, to: to }) }
 
 fn pushed(p: Parser, state: State) -> Parser = { ..p, states: Top(state, p.states) }
@@ -1342,7 +1342,7 @@ fn popped(p: Parser) -> Parser =
 fn no_properties() -> Properties = { anchor: None, tag: None }
 
 fn emit_empty_scalar(p: Parser, at: Int) -> Parser =
-  said(p, Scalar(no_properties(), "", Plain), at, at)
+  emitted(p, Scalar(no_properties(), "", Plain), at, at)
 
 /// The parser inside a collection whose start it has just reported.
 fn start_collection(
@@ -1353,17 +1353,17 @@ fn start_collection(
   to: Int,
 ) -> Parser / {fault.at} =
   if p.open >= p.scan.depth { fail(from, TooDeep) }
-  else { said({ ..p, state: state, open: p.open + 1 }, kind, from, to) }
+  else { emitted({ ..p, state: state, open: p.open + 1 }, kind, from, to) }
 
 fn end_collection(p: Parser, kind: Kind, from: Int, to: Int) -> Parser =
-  said({ ..popped(p), open: p.open - 1 }, kind, from, to)
+  emitted({ ..popped(p), open: p.open - 1 }, kind, from, to)
 
 /// The parser one step on: a token read, an event reported, or both.
 fn step(before: Parser) -> Parser / {fault.at, abort.raise} = {
   let p = fetch_more_tokens(before, step_limit(before));
   let t = current(p);
   match p.state {
-    AtStreamStart -> said({ ..p, state: AtDocumentStart }, StreamStart, 0, 0),
+    AtStreamStart -> emitted({ ..p, state: AtDocumentStart }, StreamStart, 0, 0),
     AtDocumentStart -> document_start(p, t),
     AfterDirectives -> after_directives(p, t),
     AtDocumentContent -> document_content(p, t),
@@ -1376,7 +1376,7 @@ fn step(before: Parser) -> Parser / {fault.at, abort.raise} = {
     AtPairKey -> pair_key(p, t),
     AtPairValue -> pair_value(p, t),
     AtPairEnd ->
-      said(
+      emitted(
         { ..p, state: AtFlowSequenceEntry(false), open: p.open - 1 },
         MappingEnd,
         t.from,
@@ -1397,7 +1397,7 @@ fn is_directive(token: TokenKind) -> Bool =
 fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   match t.token {
     DocumentEndToken -> { ..consume(p), bare: true },
-    StreamEndToken -> said({ ..p, state: AtEnd, done: true }, StreamEnd, t.from, t.to),
+    StreamEndToken -> emitted({ ..p, state: AtEnd, done: true }, StreamEnd, t.from, t.to),
     DocumentStartToken -> explicit_start(p, t),
     _ -> if !p.bare {
       fail(
@@ -1406,7 +1406,7 @@ fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
         else { "`---` to start another document" }),
       )
     } else if is_directive(t.token) { apply_directive({ ..p, state: AfterDirectives }, t) } else {
-      said(
+      emitted(
         pushed({ ..p, state: AtDocumentContent, bare: false }, AtDocumentEnd),
         DocumentStart(false),
         t.from,
@@ -1416,7 +1416,7 @@ fn document_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
   }
 
 fn explicit_start(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
-  said(
+  emitted(
     pushed({ ..consume(p), state: AtDocumentContent, bare: false }, AtDocumentEnd),
     DocumentStart(true),
     t.from,
@@ -1458,7 +1458,7 @@ fn document_content(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} =
 fn document_end(p: Parser, t: Token) -> Parser / {fault.at, abort.raise} = {
   let explicit = match t.token { DocumentEndToken -> true, _ -> false };
   let after = if explicit { consume(p) } else { p };
-  said(
+  emitted(
     {
       ..after,
       state: AtDocumentStart,
@@ -1486,7 +1486,7 @@ fn resolve_tag(p: Parser, t: Token, named: String, suffix: String) -> String / {
 /// A node from the token `t` at the parser's head: its properties, then its content.
 fn node(p: Parser, t: Token, indentless: Bool) -> Parser / {fault.at, abort.raise} =
   match t.token {
-    AliasToken(name) -> popped(said(consume(p), Alias(name), t.from, t.to)),
+    AliasToken(name) -> popped(emitted(consume(p), Alias(name), t.from, t.to)),
     AnchorToken(name) -> {
       let q = consume(p);
       let next = current(q);
@@ -1525,7 +1525,7 @@ fn content(
   to: Int,
 ) -> Parser / {fault.at, abort.raise} =
   match t.token {
-    ScalarToken(text, style) -> popped(said(consume(p), Scalar(props, text, style), from, t.to)),
+    ScalarToken(text, style) -> popped(emitted(consume(p), Scalar(props, text, style), from, t.to)),
     FlowSequenceStartToken ->
       start_collection(
         consume(p),
@@ -1544,7 +1544,7 @@ fn content(
       let entry = match t.token { BlockEntryToken -> indentless, _ -> false };
       if entry { start_collection(p, SequenceStart(props, false), AtIndentlessEntry, from, t.from) }
       else if props.anchor == None && props.tag == None { fail(t.from, Expected("a node")) }
-      else { popped(said(p, Scalar(props, "", Plain), from, to)) }
+      else { popped(emitted(p, Scalar(props, "", Plain), from, to)) }
     },
   }
 
@@ -1745,7 +1745,7 @@ fn error_at(src: Bytes, offset: Int, reason: ErrorKind) -> Error = {
   { offset: offset, line: stood.line, column: stood.column, reason: reason }
 }
 
-fn defect(said: String) -> Error = { offset: 0, line: 1, column: 1, reason: Defect(said) }
+fn internal_error(emitted: String) -> Error = { offset: 0, line: 1, column: 1, reason: Defect(emitted) }
 
 /// Every event of a stream, comments included. Raises `yaml.fail` for a stream that is not YAML 1.2
 /// within the limits.
@@ -1817,7 +1817,7 @@ fn unique(entries: List<Entry>) -> List<Entry> = {
 fn core_tag(name: String) -> String = "tag:yaml.org,2002:" ++ name
 
 /// Whether the tag adds nothing to a value's own kind: no tag, `!`, or one of the core schema's.
-fn says_nothing(tag: String) -> Bool =
+fn is_implicit_tag(tag: String) -> Bool =
   tag == "" || tag == "!"
     || ["null", "bool", "int", "float", "str", "seq", "map"].any(|name: String|
       tag == core_tag(name))
@@ -1827,7 +1827,7 @@ fn says_nothing(tag: String) -> Bool =
 /// The empty tag, `!` and the core schema's own tags add nothing to a value, and return the value
 /// itself.
 pub fn tagged(tag: String, value: Yaml) -> Yaml =
-  if says_nothing(tag) { value } else {
+  if is_implicit_tag(tag) { value } else {
     match value {
       Tagged(_, tagged_value) -> tagged(tag, tagged_value),
       Sequence(_) -> Tagged(tag, value),
@@ -1839,7 +1839,7 @@ pub fn tagged(tag: String, value: Yaml) -> Yaml =
 
 /// The value a tag is over, or the value itself.
 fn untagged(v: Yaml) -> Yaml =
-  match v { Tagged(_, tagged_value) -> untagged(tagged_value), plain -> plain }
+  match v { Tagged(_, tagged_value) -> untagged(tagged_value), scan_plain_scalar -> scan_plain_scalar }
 
 /// The value of a mapping under `key`; `None` for an absent key and for a value that is not a
 /// mapping. A tag over a mapping is ignored. Each call scans the mapping's entries.
@@ -2264,7 +2264,7 @@ fn scalar_value(
     } else { String(text) },
     Some(named) -> if named == "!" || named == core_tag("str") { String(text) }
     else if named == core_tag("seq") || named == core_tag("map") { fail(at, Mistagged(named)) }
-    else if says_nothing(named) { as_tagged(named, Bytes::of_string(text), at) }
+    else if is_implicit_tag(named) { as_tagged(named, Bytes::of_string(text), at) }
     else if c.keep.contains(named) { Tagged(named, String(text)) }
     else { fail(at, UnknownTag(named)) },
   }
@@ -2299,7 +2299,7 @@ fn tagged_collection(
   match open.tag {
     None -> v,
     Some(named) -> if named == "!" || named == core_tag(kind) { v }
-    else if says_nothing(named) { fail(open.from, Mistagged(named)) }
+    else if is_implicit_tag(named) { fail(open.from, Mistagged(named)) }
     else if c.keep.contains(named) { Tagged(named, v) }
     else { fail(open.from, UnknownTag(named)) },
   }
@@ -2430,7 +2430,7 @@ fn guarded<a>(src: Bytes, body: () -> a / {fault.at, abort.raise}) -> a / {yaml.
   handle {
     handle { body() } with { fault.at(offset, reason) -> yaml.fail(error_at(src, offset, reason)) }
   } with {
-    abort.raise(said) -> yaml.fail(defect(said)),
+    abort.raise(emitted) -> yaml.fail(internal_error(emitted)),
   }
 
 /// The one document of a stream.
@@ -3157,7 +3157,7 @@ fn error_kind_message(reason: ErrorKind) -> String =
     Uneditable(path) -> if path.len() == 0 {
       "the document has no place for this edit of all it holds"
     } else { "the document has no place for an edit at `" ++ path_to_string(path) ++ "`" },
-    Defect(said) -> "std.yaml failed, which is its defect and no fault of the text: " ++ said,
+    Defect(emitted) -> "std.yaml failed, which is its defect and no fault of the text: " ++ emitted,
   }
 
 /// A code point in hexadecimal, of four digits at least.
@@ -3307,7 +3307,7 @@ pub fn set(d: Document, path: List<PathSegment>, v: Yaml) -> Document / {yaml.fa
         handle {
           set_texts(d, path, normalized(v))
         } with {
-          abort.raise(said) -> yaml.fail(defect(said)),
+          abort.raise(emitted) -> yaml.fail(internal_error(emitted)),
         },
         wanted,
       ),
@@ -3316,7 +3316,7 @@ pub fn set(d: Document, path: List<PathSegment>, v: Yaml) -> Document / {yaml.fa
 fn set_texts(d: Document, path: List<PathSegment>, v: Yaml) -> List<Bytes> / {abort.raise} =
   match locate(d.node, path, false) {
     Some(f) -> replaced(d.source, f, v),
-    None -> added(d, path, v, path.len() - 1),
+    None -> add_key(d, path, v, path.len() - 1),
   }
 
 /// The texts with `v` in place of a node: moved up to the line of what introduces it when the node
@@ -3347,10 +3347,10 @@ fn wrapped(path: List<PathSegment>, n: Int, v: Yaml) -> Option<Yaml> =
 
 /// The texts with a key added for `v`: to the deepest mapping the path reaches, which is the one
 /// `n` steps along it.
-fn added(d: Document, path: List<PathSegment>, v: Yaml, n: Int) -> List<Bytes> / {abort.raise} =
+fn add_key(d: Document, path: List<PathSegment>, v: Yaml, n: Int) -> List<Bytes> / {abort.raise} =
   if n < 0 { [] } else {
     match locate(d.node, path.take(n), false) {
-      None -> added(d, path, v, n - 1),
+      None -> add_key(d, path, v, n - 1),
       Some(f) -> match path.at(n) {
         Some(Key(name)) -> match wrapped(path, n + 1, v) {
           Some(tagged_value) -> entry_texts(d.source, f, name, tagged_value),
@@ -3416,7 +3416,7 @@ pub fn remove(d: Document, path: List<PathSegment>) -> Document / {yaml.fail} =
       first_fit(
         d,
         path,
-        handle { removed(d, path) } with { abort.raise(said) -> yaml.fail(defect(said)) },
+        handle { removed(d, path) } with { abort.raise(emitted) -> yaml.fail(internal_error(emitted)) },
         without(d.value, path),
       ),
   }
@@ -3430,7 +3430,7 @@ fn removed(d: Document, path: List<PathSegment>) -> List<Bytes> / {abort.raise} 
         Some(Key(name)) -> match members.find_index(|m: Member| m.key == String(name)) {
           None -> [],
           Some(i) -> if members.len() == 1 { replaced(src, f, Mapping([])) } else {
-            cut_entry(
+            remove_entry(
               src,
               members.map(|m: Member| { from: start_of(m.at), to: content_end(m.value) }),
               i,
@@ -3443,7 +3443,7 @@ fn removed(d: Document, path: List<PathSegment>) -> List<Bytes> / {abort.raise} 
       SequenceNode(nodes, _, _, flow) -> match path.at(path.len() - 1) {
         Some(Index(i)) -> if i < 0 || i >= nodes.len() { [] }
         else if nodes.len() == 1 { replaced(src, f, Sequence([])) } else {
-          cut_entry(
+          remove_entry(
             src,
             nodes.map(|n: Node| { from: entry_start(src, n, flow), to: content_end(n) }),
             i,
@@ -3467,7 +3467,7 @@ fn entry_start(src: Bytes, node: Node, flow: Bool) -> Int / {abort.raise} = {
 /// The texts without entry `i` of a collection whose entries are at `spans`. An entry that is not
 /// the last is removed up to the next one, or up to the line after it with that line's indentation.
 /// The last is removed with its lines, or with what separates it from the one before.
-fn cut_entry(src: Bytes, spans: List<Span>, i: Int, flow: Bool) -> List<Bytes> / {abort.raise} =
+fn remove_entry(src: Bytes, spans: List<Span>, i: Int, flow: Bool) -> List<Bytes> / {abort.raise} =
   match spans.at(i) {
     None -> [],
     Some(this) -> match spans.at(i + 1) {
@@ -3515,7 +3515,7 @@ fn nested(depth: Int) -> Gen<Yaml> =
       scalars(),
       gen::map(gen::list_of(nested(depth - 1), 3), |items: List<Yaml>| Sequence(items)),
       gen::map(gen::list_of(pairs(depth - 1), 3), mapping),
-      gen::map2(gen::elements(drawn_tags()), nested(depth - 1), tagged),
+      gen::map2(gen::elements(sample_tags()), nested(depth - 1), tagged),
     ])
   }
 
@@ -3592,7 +3592,7 @@ fn pieces() -> List<String> =
 
 /// The tags a drawn value has: a local one, one of YAML 1.1's, a URI, one that needs escapes, one
 /// with two marks, and three that add nothing and leave the value as it is.
-fn drawn_tags() -> List<String> =
+fn sample_tags() -> List<String> =
   [
     "!a",
     "tag:yaml.org,2002:binary",
@@ -3608,7 +3608,7 @@ fn drawn_tags() -> List<String> =
 fn large_limits() -> Limits =
   { bytes: 1073741824, depth: 512, nodes: 1073741824, scalar: 1073741824, documents: 1073741824 }
 
-fn keep_drawn_tags() -> Options = { merge_keys: false, keep_tags: drawn_tags() }
+fn keep_drawn_tags() -> Options = { merge_keys: false, keep_tags: sample_tags() }
 
 /// An `Entry` as a test draws one.
 fn entries() -> gen::Gen<Entry> =
@@ -4728,21 +4728,21 @@ test "the documents of a stream are written each after its marker" {
 // --- Tests: events ----------------------------------------------------------
 
 test "the events of a stream are placed where they are written, comments included" {
-  let plain: Properties = { anchor: None, tag: None };
+  let scan_plain_scalar: Properties = { anchor: None, tag: None };
   assert_eq(
     try { events(b"# top\na: [1, &x two] # tail\nb: !!str |\n  text\n", limited()) },
     Ok([
       { kind: StreamStart, from: 0, to: 0 },
       { kind: Comment(" top"), from: 0, to: 5 },
       { kind: DocumentStart(false), from: 6, to: 6 },
-      { kind: MappingStart(plain, false), from: 6, to: 6 },
-      { kind: Scalar(plain, "a", Plain), from: 6, to: 7 },
-      { kind: SequenceStart(plain, true), from: 9, to: 10 },
-      { kind: Scalar(plain, "1", Plain), from: 10, to: 11 },
+      { kind: MappingStart(scan_plain_scalar, false), from: 6, to: 6 },
+      { kind: Scalar(scan_plain_scalar, "a", Plain), from: 6, to: 7 },
+      { kind: SequenceStart(scan_plain_scalar, true), from: 9, to: 10 },
+      { kind: Scalar(scan_plain_scalar, "1", Plain), from: 10, to: 11 },
       { kind: Scalar({ anchor: Some("x"), tag: None }, "two", Plain), from: 13, to: 19 },
       { kind: SequenceEnd, from: 19, to: 20 },
       { kind: Comment(" tail"), from: 21, to: 27 },
-      { kind: Scalar(plain, "b", Plain), from: 28, to: 29 },
+      { kind: Scalar(scan_plain_scalar, "b", Plain), from: 28, to: 29 },
       {
         kind: Scalar({ anchor: None, tag: Some("tag:yaml.org,2002:str") }, "text\n", Literal),
         from: 31,
@@ -4760,7 +4760,7 @@ test "events report what a value does not: styles, markers, an alias, a tag no r
   let kinds = |text: String|
     Result::map(try { events(Bytes::of_string(text), limited()) }, |es: List<Event>|
       es.map(|e: Event| e.kind));
-  let plain: Properties = { anchor: None, tag: None };
+  let scan_plain_scalar: Properties = { anchor: None, tag: None };
   assert_eq(
     kinds("--- !local 'a'\n...\n--- >-\n b\n"),
     Ok([
@@ -4769,7 +4769,7 @@ test "events report what a value does not: styles, markers, an alias, a tag no r
       Scalar({ anchor: None, tag: Some("!local") }, "a", SingleQuoted),
       DocumentEnd(true),
       DocumentStart(true),
-      Scalar(plain, "b", Folded),
+      Scalar(scan_plain_scalar, "b", Folded),
       DocumentEnd(false),
       StreamEnd,
     ]),
@@ -4779,11 +4779,11 @@ test "events report what a value does not: styles, markers, an alias, a tag no r
     Ok([
       StreamStart,
       DocumentStart(false),
-      MappingStart(plain, true),
-      Scalar(plain, "a", Plain),
+      MappingStart(scan_plain_scalar, true),
+      Scalar(scan_plain_scalar, "a", Plain),
       Alias("x"),
-      Scalar(plain, "a", Plain),
-      Scalar(plain, "y", DoubleQuoted),
+      Scalar(scan_plain_scalar, "a", Plain),
+      Scalar(scan_plain_scalar, "y", DoubleQuoted),
       MappingEnd,
       DocumentEnd(false),
       StreamEnd,
@@ -4948,7 +4948,7 @@ test "a string-keyed map is a mapping, and a key that is not a string is rejecte
   )
 }
 
-fn manifest() -> String =
+fn sample_deployment() -> String =
   \\# A deployment.
   \\apiVersion: apps/v1
   \\kind: Deployment
@@ -4986,7 +4986,7 @@ fn edited(
   }
 
 test "a document is its bytes and its value, and reports where a path is written" {
-  let text = Bytes::of_string(manifest());
+  let text = Bytes::of_string(sample_deployment());
   match parse_document(text, limited()) {
     Err(e) -> panic(error_message(e)),
     Ok(d) -> {
@@ -5018,8 +5018,8 @@ test "a document is its bytes and its value, and reports where a path is written
 fn changed(
   edit: (Document) -> Document / {yaml.fail, abort.raise},
 ) -> List<String> / {abort.raise} = {
-  let before = manifest().lines();
-  let after = edited(manifest(), edit).lines();
+  let before = sample_deployment().lines();
+  let after = edited(sample_deployment(), edit).lines();
   before.filter(|l: String| !after.contains(l)).map(|l: String| "-" ++ l).concat(
     after.filter(|l: String| !before.contains(l)).map(|l: String| "+" ++ l),
   )

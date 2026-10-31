@@ -3,7 +3,7 @@ import std.fs (fs)
 import std.bytes (u32_le, u64_le)
 import std.list
 import compiler.store.memo
-import compiler.store.memo (Record, Look, memo, memo_store, query_output, start_run, digest_of,
+import compiler.store.memo (Record, ExternalRead, memo, memo_store, query_output, start_run, digest_of,
                             inline_output_of, inline_output, output_digest_of, record_bytes,
                             record_from)
 import compiler.store.packs
@@ -25,7 +25,7 @@ fn record_width() -> Int = 80
 
 fn key_width() -> Int = 32
 
-fn location_width() -> Int = 44
+fn output_row_width() -> Int = 44
 
 fn query_width() -> Int = 40
 
@@ -62,7 +62,7 @@ type OwnRow = { result: Bytes, query: Bytes, seen: Int, frame: Option<{ offset: 
 type OpenStore = {
   own: Map<Bytes, Bool>,
   now: Int,
-  looked: Map<Bytes, Look>,
+  looked: Map<Bytes, ExternalRead>,
   manifest: Manifest,
   tables: Map<Bytes, Bytes>,
   lost: List<Bytes>,
@@ -229,7 +229,7 @@ fn output_row<[r]>(
       if x.i < 0 { Stop({ open: x.open, at: None }) } else {
         let seg = x.open.manifest.segments.get(x.i);
         let t = table[r](dir, x.open, seg, outputs_table());
-        match segments::row_of(t.rows, location_width(), name) {
+        match segments::row_of(t.rows, output_row_width(), name) {
           None -> Continue({ i: x.i - 1, open: t.open }),
           Some(b) ->
             Stop({
@@ -431,12 +431,12 @@ fn retained_queries(
     KeepRecent(own) -> if !whole { own } else {
       let lengths = all.fold(Map::new(), |acc: Map<Bytes, Int>, x: MergeInput|
         segments::rows_folded(
-          x.results.len() / location_width(),
+          x.results.len() / output_row_width(),
           acc,
           |into: Map<Bytes, Int>, i: Int|
             into.insert(
-              x.results.slice(i * location_width(), i * location_width() + 32),
-              segments::read_u32(x.results, i * location_width() + 40),
+              x.results.slice(i * output_row_width(), i * output_row_width() + 32),
+              segments::read_u32(x.results, i * output_row_width() + 40),
             ),
         ));
       let held = carried.fold(Map::new(), |acc: Map<Bytes, Int>, _: Bytes, c: MergedKey|
@@ -520,10 +520,10 @@ fn merge_segments<[r]>(
         { frames: records, met: Map::new(), dropped: 0, bytes: 0 },
         |acc: { frames: Map<Int, Frame>, met: Map<Bytes, Bool>, dropped: Int, bytes: Int }, x: MergeInput|
           segments::rows_folded(
-            x.results.len() / location_width(),
+            x.results.len() / output_row_width(),
             acc,
             |a: { frames: Map<Int, Frame>, met: Map<Bytes, Bool>, dropped: Int, bytes: Int }, i: Int| {
-              let b = x.results.slice(i * location_width(), (i + 1) * location_width());
+              let b = x.results.slice(i * output_row_width(), (i + 1) * output_row_width());
               let name = b.slice(0, 32);
               let size = segments::read_u32(b, 40);
               if a.met.contains(name) { a } else if !wanted.contains(name) {
@@ -883,7 +883,7 @@ pub fn with_memo_store<a, [r] | e>(
         },
       };
     },
-    memo_store.adopt(key, rec) -> {
+    memo_store.store_record(key, rec) -> {
       st = keeping(st, key, rec, st.inlined.get(rec.output), None);
     },
     memo_store.external(kind, place) -> {
@@ -897,13 +897,13 @@ pub fn with_memo_store<a, [r] | e>(
       l.looked.digest
     },
     memo_store.looked() ->
-      st.looked.values().map(|x: Look| memo::ExternalDependency(x.kind, x.at, x.digest)),
-    memo_store.standing(key) -> {
+      st.looked.values().map(|x: ExternalRead| memo::ExternalDependency(x.kind, x.at, x.digest)),
+    memo_store.has_trusted_record(key) -> {
       let p = standing_at(st, key);
       st = p.open;
       p.bytes != None
     },
-    memo_store.below(key) -> {
+    memo_store.pack_record(key) -> {
       let h = held(st, key);
       st = h.open;
       match h.held {
@@ -1099,10 +1099,10 @@ pub fn usage<[r]>(dir: String, queries: List<Bytes>) -> Usage / {fs.read[r], abo
         newest: laid.newest,
         frames: laid.frames,
         lengths: segments::rows_folded(
-          results.len() / location_width(),
+          results.len() / output_row_width(),
           acc.lengths,
           |l: Map<Bytes, Int>, i: Int| {
-            let b = results.slice(i * location_width(), (i + 1) * location_width());
+            let b = results.slice(i * output_row_width(), (i + 1) * output_row_width());
             l.insert(b.slice(0, 32), segments::read_u32(b, 40))
           },
         ),
@@ -1200,7 +1200,7 @@ fn quoted_under<[r]>(
 fn quoted_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
   quoted_under[r](text, b"").output
 
-fn asked_keeping<[r]>(
+fn run_named_query<[r]>(
   text: Bytes,
   name: Bytes,
   lasting: Bool,
@@ -1275,7 +1275,7 @@ test "what changed under some queries is computed again under others" {
   assert_eq(back.value, { output: b"\"forty\"", ran: 0 })
 }
 
-effect rival {
+effect concurrent_run {
   write first() -> Bool
 }
 
@@ -1289,7 +1289,7 @@ test "two runs at once over an edit leave a store that returns what a fresh one 
           packs::no_pack,
           b"",
           |_: Bytes, _: Bytes| {
-            if rival.first() {
+            if concurrent_run.first() {
               quoted_over[abs](b"forty");
               ()
             };
@@ -1299,7 +1299,7 @@ test "two runs at once over an edit leave a store that returns what a fresh one 
         )
       } with {
         var begun = false,
-        rival.first() -> {
+        concurrent_run.first() -> {
           let first = !begun;
           begun = true;
           first
@@ -1372,7 +1372,7 @@ test "a store several `ply`s keep holds the one writing and as much again of the
   assert_eq(after(four, b"a").value, 2)
 }
 
-fn command_outlived<[r]>(
+fn command_record_stored<[r]>(
   output: Bytes,
   text: Bytes,
   commands: List<Bytes>,
@@ -1401,8 +1401,8 @@ fn command_outlived<[r]>(
 test "a run writing the store again keeps its own commands' results, whatever they hold" {
   let output = b"handle ".repeat(1200);
   let text = b"text ".repeat(600);
-  assert(fs::on_mem[abs](fs::mem_of([]), || command_outlived[abs](output, text, [b"p"])).value);
-  assert(!fs::on_mem[abs](fs::mem_of([]), || command_outlived[abs](output, text, [])).value)
+  assert(fs::on_mem[abs](fs::mem_of([]), || command_record_stored[abs](output, text, [b"p"])).value);
+  assert(!fs::on_mem[abs](fs::mem_of([]), || command_record_stored[abs](output, text, [])).value)
 }
 
 test "a long result is stored once, and one that cannot be read costs its body once" {
@@ -1430,14 +1430,14 @@ test "a long result is stored once, and one that cannot be read costs its body o
 
 test "a query that caches no results writes none, and a later run that needs one computes it again" {
   let long = b"long ".repeat(1000);
-  let first = fs::on_mem[abs](fs::mem_of([]), || asked_keeping[abs](long, b"quoted", false));
+  let first = fs::on_mem[abs](fs::mem_of([]), || run_named_query[abs](long, b"quoted", false));
   assert_eq(first.value.ran, 2);
   let name = match segments_in(first.tree) { [name] -> "s/" ++ name, _ -> "" };
   let bytes = match fs::mem_read(first.tree, name) { Some(b) -> b, None -> b"" };
   assert(bytes.len() > 5000 && bytes.len() < 10000);
-  let again = fs::on_mem[abs](first.tree, || asked_keeping[abs](long, b"quoted", false));
+  let again = fs::on_mem[abs](first.tree, || run_named_query[abs](long, b"quoted", false));
   assert_eq(again.value.ran, 0);
-  let text = fs::on_mem[abs](again.tree, || asked_keeping[abs](long, b"text", false));
+  let text = fs::on_mem[abs](again.tree, || run_named_query[abs](long, b"text", false));
   assert_eq(text.value.output, long);
   assert_eq(text.value.ran, 1)
 }
@@ -1487,7 +1487,7 @@ fn quoted_below(
   pack: packs::PackFiles,
   files: Bytes,
   text: Bytes,
-) -> fs::Over<{ output: Bytes, ran: Int }> / {abort.raise} = {
+) -> fs::MemResult<{ output: Bytes, ran: Int }> / {abort.raise} = {
   let queries = test_queries(b"");
   fs::on_mem[abs](tree, ||
     with_memo_store[abs](

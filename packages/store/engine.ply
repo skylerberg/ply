@@ -33,10 +33,10 @@ fn retired_files() -> List<String> =
 
 fn slot(table: Int, key: Bytes) -> Bytes / {abort.raise} = byte_of_int(table) ++ key
 
-fn row_value(dropped: Bool, offset: Int, size: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([byte_of_int(if dropped { 1 } else { 0 }), u64_le(offset), u32_le(size)])
+fn row_value(is_deleted: Bool, offset: Int, size: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([byte_of_int(if is_deleted { 1 } else { 0 }), u64_le(offset), u32_le(size)])
 
-fn dropped(row: Bytes) -> Bool / {abort.raise} = row.at(slot_width()) == 1
+fn is_deleted(row: Bytes) -> Bool / {abort.raise} = row.at(slot_width()) == 1
 
 fn offset_of(row: Bytes) -> Int = segments::read_u64(row, slot_width() + 1)
 
@@ -57,7 +57,7 @@ pub type Store = {
   rows: List<Bytes>,
   lost: List<Bytes>,
   puts: Map<Bytes, Bytes>,
-  drops: Map<Bytes, Bool>,
+  deleted: Map<Bytes, Bool>,
   warnings: List<Warning>,
 }
 
@@ -113,7 +113,7 @@ pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise
     rows: read.rows,
     lost: read.lost,
     puts: Map::new(),
-    drops: Map::new(),
+    deleted: Map::new(),
     warnings: [],
   });
   if m.generation > 0 { store } else if segments::unreadable[r](dir, shapes) {
@@ -148,14 +148,14 @@ fn find_row(store: Store, sl: Bytes) -> Option<SegmentRow> / {abort.raise} =
 pub fn get<[r]>(store: Store, table: Int, key: Bytes) -> Lookup / {fs.read[r], abort.raise} =
   if key.len() != key_width() { Miss } else {
     let sl = slot(table, key);
-    let unwritten = store.puts.len() == 0 && store.drops.len() == 0;
+    let unwritten = store.puts.len() == 0 && store.deleted.len() == 0;
     match if unwritten { None } else { store.puts.get(sl) } {
       Some(payload) -> Hit(payload),
-      None -> if !unwritten && store.drops.contains(sl) { Miss } else {
+      None -> if !unwritten && store.deleted.contains(sl) { Miss } else {
         match find_row(store, sl) {
           None -> Miss,
           // An entry that holds nothing is all in its row, which its table's checksum vouched for.
-          Some(p) -> if dropped(p.row) { Miss }
+          Some(p) -> if is_deleted(p.row) { Miss }
           else if size_of(p.row) == 0 { Hit(b"") } else {
             match segments::payload[r](store.dir, p.token, offset_of(p.row), size_of(p.row)) {
               Some(payload) -> Hit(payload),
@@ -172,8 +172,8 @@ pub fn contains_key(store: Store, table: Int, key: Bytes) -> Bool / {abort.raise
   if key.len() != key_width() { false } else {
     let sl = slot(table, key);
     if store.puts.contains(sl) { true }
-    else if store.drops.contains(sl) { false }
-    else { match find_row(store, sl) { Some(p) -> !dropped(p.row), None -> false } }
+    else if store.deleted.contains(sl) { false }
+    else { match find_row(store, sl) { Some(p) -> !is_deleted(p.row), None -> false } }
   }
 
 /// The rows of `table` among `rows`, in order: a table's rows lie together, since a row leads with
@@ -196,7 +196,7 @@ pub fn keys(store: Store, table: Int) -> List<Bytes> / {abort.raise} = {
   let contains_key = store.rows.fold(Map::new(), |acc: Map<Bytes, Bool>, rows: Bytes|
     table_rows(rows, table).fold(acc, |m: Map<Bytes, Bool>, row: Bytes| {
       let key = row.slice(1, slot_width());
-      if dropped(row) || store.drops.contains(slot(table, key)) { m.remove(key) }
+      if is_deleted(row) || store.deleted.contains(slot(table, key)) { m.remove(key) }
       else { m.insert(key, true) }
     }));
   store.puts.fold(contains_key, |acc: Map<Bytes, Bool>, sl: Bytes, _: Bytes|
@@ -226,7 +226,7 @@ pub fn stats(store: Store) -> Stats / {abort.raise} = {
   let live = newest_rows(store, 0).fold(
     { counts: Map::new(), frames: 0, rows: 0 },
     |acc: Live, sl: Bytes, p: SegmentRow|
-      if dropped(p.row) { acc } else {
+      if is_deleted(p.row) { acc } else {
         let table = sl.at(0);
         {
           counts: acc.counts.insert(
@@ -257,15 +257,15 @@ fn checked_slot(table: Int, key: Bytes) -> Bytes / {abort.raise} =
 /// Stored by the next `flush`; until then this store's reads see it.
 pub fn put(store: Store, table: Int, key: Bytes, payload: Bytes) -> Store / {abort.raise} = {
   let sl = checked_slot(table, key);
-  { ..store, puts: store.puts.insert(sl, payload), drops: store.drops.remove(sl) }
+  { ..store, puts: store.puts.insert(sl, payload), deleted: store.deleted.remove(sl) }
 }
 
 pub fn drop(store: Store, table: Int, key: Bytes) -> Store / {abort.raise} = {
   let sl = checked_slot(table, key);
-  { ..store, puts: store.puts.remove(sl), drops: store.drops.insert(sl, true) }
+  { ..store, puts: store.puts.remove(sl), deleted: store.deleted.insert(sl, true) }
 }
 
-pub fn pending_count(store: Store) -> Int = store.puts.len() + store.drops.len()
+pub fn pending_count(store: Store) -> Int = store.puts.len() + store.deleted.len()
 
 fn warn_not_flushed(store: Store, reason: String) -> Store =
   warn(store, Unreadable, reason ++ "; this run's entries were not kept")
@@ -284,7 +284,7 @@ fn with_manifest<[r]>(store: Store, m: Manifest) -> Store / {fs.read[r], abort.r
     rows: read.rows,
     lost: read.lost,
     puts: Map::new(),
-    drops: Map::new(),
+    deleted: Map::new(),
   })
 }
 
@@ -343,7 +343,7 @@ fn write_segment<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.writ
   );
   let segment = {
     ..framed,
-    rows: store.drops.fold(framed.rows, |acc: Map<Bytes, Bytes>, sl: Bytes, _: Bool|
+    rows: store.deleted.fold(framed.rows, |acc: Map<Bytes, Bytes>, sl: Bytes, _: Bool|
       acc.insert(sl, row_value(true, 0, 0))),
   };
   match finish_segment[r](store, token, segment) {
@@ -362,7 +362,7 @@ fn write_segment<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.writ
   }
 }
 
-fn wasteful(st: Stats) -> Bool = (st.data_bytes - st.live_bytes) * 2 > st.data_bytes
+fn mostly_dead(st: Stats) -> Bool = (st.data_bytes - st.live_bytes) * 2 > st.data_bytes
 
 /// `store` after a flush: what no manifest names removed, then its newest segments written again
 /// as one where they are due, and all of them where most of what they hold is replaced or dropped.
@@ -374,7 +374,7 @@ fn clean_up<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.write[r],
     fs.remove[r](join(store.dir, name));
     ()
   });
-  let from = if wasteful(stats(store)) { 0 } else { segments::merge_start(store.manifest) };
+  let from = if mostly_dead(stats(store)) { 0 } else { segments::merge_start(store.manifest) };
   if from < store.manifest.segments.len() - 1 { rewrite_segments[r](store, from, run, 1) }
   else { store }
 }
@@ -392,7 +392,7 @@ fn rewrite_segments<[r]>(
   let segment = newest_rows(store, from).fold(
     { writing: segments::new_writer(), rows: Map::new(), lost: 0 },
     |acc: PendingSegment, sl: Bytes, p: SegmentRow|
-      if dropped(p.row) {
+      if is_deleted(p.row) {
         if from == 0 { acc } else { { ..acc, rows: acc.rows.insert(sl, row_value(true, 0, 0)) } }
       } else {
         match segments::payload[r](store.dir, p.token, offset_of(p.row), size_of(p.row)) {
@@ -476,7 +476,7 @@ pub fn name_key(name: String) -> Bytes = Bytes::of_string(name).blake3()
 
 fn schema_a() -> Bytes = b"schema a"
 
-fn hit(f: Lookup) -> Bytes =
+fn lookup_payload(f: Lookup) -> Bytes =
   match f { Hit(b) -> b, Miss -> b"<miss>", Bad(reason) -> Bytes::of_string(reason) }
 
 fn all_messages(xs: List<List<Warning>>) -> List<String> =
@@ -502,15 +502,15 @@ test "what a store puts it reads at once, and again after a flush and a reopen" 
       name_key("b"),
       b"beta",
     );
-    assert_eq(hit(get[mem](s1, 1, name_key("a"))), b"alpha");
+    assert_eq(lookup_payload(get[mem](s1, 1, name_key("a"))), b"alpha");
     let s2 = flush[mem](s1);
     assert_eq(s2.warnings, []);
     assert_eq(pending_count(s2), 0);
-    assert_eq(hit(get[mem](s2, 1, name_key("b"))), b"beta");
+    assert_eq(lookup_payload(get[mem](s2, 1, name_key("b"))), b"beta");
     let s3 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s3, 1, name_key("a"))), b"alpha");
-    assert_eq(hit(get[mem](s3, 1, name_key("b"))), b"beta");
-    assert_eq(hit(get[mem](s3, 2, name_key("a"))), b"other table");
+    assert_eq(lookup_payload(get[mem](s3, 1, name_key("a"))), b"alpha");
+    assert_eq(lookup_payload(get[mem](s3, 1, name_key("b"))), b"beta");
+    assert_eq(lookup_payload(get[mem](s3, 2, name_key("a"))), b"other table");
     assert(is_miss(get[mem](s3, 1, name_key("c"))));
     assert_eq(keys(s3, 1).len(), 2);
     assert_eq(stats(s3).entries.map(|e: { table: Int, count: Int }| e.count), [2, 1]);
@@ -528,7 +528,7 @@ test "a drop and a replacement hold across a flush" {
     assert(is_miss(get[mem](s2, 1, name_key("a"))));
     let s3 = open[mem]("cache", schema_a());
     assert(is_miss(get[mem](s3, 1, name_key("a"))));
-    assert_eq(hit(get[mem](s3, 1, name_key("b"))), b"three");
+    assert_eq(lookup_payload(get[mem](s3, 1, name_key("b"))), b"three");
     assert_eq(keys(s3, 1), [name_key("b")]);
     messages(s3.warnings)
   });
@@ -552,11 +552,11 @@ test "two runs flushing one store keep each other's entries, and the later wins 
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
     // The later flush reads the manifest again, so it holds what the earlier one wrote.
-    assert_eq(hit(get[mem](b1, 1, name_key("mine"))), b"a");
+    assert_eq(lookup_payload(get[mem](b1, 1, name_key("mine"))), b"a");
     let c = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](c, 1, name_key("mine"))), b"a");
-    assert_eq(hit(get[mem](c, 1, name_key("theirs"))), b"b");
-    assert_eq(hit(get[mem](c, 1, name_key("both"))), b"from b");
+    assert_eq(lookup_payload(get[mem](c, 1, name_key("mine"))), b"a");
+    assert_eq(lookup_payload(get[mem](c, 1, name_key("theirs"))), b"b");
+    assert_eq(lookup_payload(get[mem](c, 1, name_key("both"))), b"from b");
     assert_eq(keys(c, 1), keys(b1, 1));
     all_messages([a1.warnings, b1.warnings, c.warnings])
   });
@@ -572,7 +572,7 @@ test "a drop by one run holds over what another flushed before it" {
     let b1 = flush[mem](b);
     let c = open[mem]("cache", schema_a());
     assert(is_miss(get[mem](c, 1, name_key("first"))));
-    assert_eq(hit(get[mem](c, 1, name_key("mine"))), b"a");
+    assert_eq(lookup_payload(get[mem](c, 1, name_key("mine"))), b"a");
     assert_eq(keys(c, 1), [name_key("mine")]);
     all_messages([s0.warnings, a1.warnings, b1.warnings, c.warnings])
   });
@@ -585,12 +585,12 @@ test "a segment no manifest names is never read, and goes with the next flush" {
     assert(fs.write_file[mem]("cache/seg-00000000000000ff", b"left by a run that died"));
     let s2 = open[mem]("cache", schema_a());
     assert_eq(s2.warnings, []);
-    assert_eq(hit(get[mem](s2, 1, name_key("a"))), b"kept");
+    assert_eq(lookup_payload(get[mem](s2, 1, name_key("a"))), b"kept");
     let s3 = flush[mem](put(s2, 1, name_key("b"), b"after"));
     assert(!fs.exists[mem]("cache/seg-00000000000000ff"));
     let s4 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s4, 1, name_key("a"))), b"kept");
-    assert_eq(hit(get[mem](s4, 1, name_key("b"))), b"after");
+    assert_eq(lookup_payload(get[mem](s4, 1, name_key("a"))), b"kept");
+    assert_eq(lookup_payload(get[mem](s4, 1, name_key("b"))), b"after");
     all_messages([s1.warnings, s3.warnings, s4.warnings])
   });
   assert_eq(run.value, [])
@@ -620,7 +620,7 @@ test "a store written under another schema opens empty, says why, and leaves the
     assert(is_miss(get[mem](other, 1, name_key("a"))));
     assert_eq(pending_count(flush[mem](put(other, 1, name_key("b"), b"y"))), 0);
     assert_eq(messages(open[mem]("cache", b"schema b").warnings), []);
-    assert_eq(hit(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))), b"x");
+    assert_eq(lookup_payload(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))), b"x");
     all_messages([s1.warnings, other.warnings])
   });
   assert_eq(run.value, ["the store was written by another version; this run starts empty"])
@@ -639,12 +639,12 @@ test "a store missing a segment says so, reads the rest, and names the segment n
     assert(fs.remove[mem]("cache/" ++ first));
     let gone = open[mem]("cache", schema_a());
     assert(is_miss(get[mem](gone, 1, name_key("a"))));
-    assert_eq(hit(get[mem](gone, 1, name_key("c"))), b"x");
+    assert_eq(lookup_payload(get[mem](gone, 1, name_key("c"))), b"x");
     let again = flush[mem](put(gone, 1, name_key("d"), b"y"));
     assert_eq(pending_count(again), 0);
     let back = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](back, 1, name_key("d"))), b"y");
-    assert_eq(hit(get[mem](back, 1, name_key("c"))), b"x");
+    assert_eq(lookup_payload(get[mem](back, 1, name_key("d"))), b"y");
+    assert_eq(lookup_payload(get[mem](back, 1, name_key("c"))), b"x");
     all_messages([s2.warnings, gone.warnings, back.warnings])
   });
   assert_eq(run.value, ["a part of the store does not read; its entries are treated as absent"])
@@ -686,9 +686,9 @@ test "compaction keeps the live entries in one segment and reclaims the rest" {
     assert_eq(s3.manifest.segments.len(), 1);
     assert_eq(segment_files().len(), 1);
     let s4 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s4, 1, name_key("a"))), b"second");
+    assert_eq(lookup_payload(get[mem](s4, 1, name_key("a"))), b"second");
     assert(is_miss(get[mem](s4, 1, name_key("b"))));
-    assert_eq(hit(get[mem](s4, 1, name_key("c"))), long);
+    assert_eq(lookup_payload(get[mem](s4, 1, name_key("c"))), long);
     assert_eq(keys(s4, 1), keys(s3, 1));
     all_messages([s3.warnings, s4.warnings])
   });
@@ -704,11 +704,11 @@ test "a flush that leaves most of what the store holds unreachable writes it aga
     assert_eq(stats(s2).data_bytes, stats(s2).live_bytes);
     assert_eq(s2.manifest.segments.len(), 1);
     // A run that opened the store before the flush still reads what it was shown, until the next.
-    assert_eq(hit(get[mem](s1, 1, name_key("a"))), big);
+    assert_eq(lookup_payload(get[mem](s1, 1, name_key("a"))), big);
     let s3 = open[mem]("cache", schema_a());
     assert_eq(pending_count(flush[mem](put(s3, 1, name_key("b"), b"next"))), 0);
     assert(!fs.exists[mem](first));
-    assert_eq(hit(get[mem](s3, 1, name_key("a"))), b"small");
+    assert_eq(lookup_payload(get[mem](s3, 1, name_key("a"))), b"small");
     all_messages([s2.warnings, s3.warnings])
   });
   assert_eq(run.value, [])
@@ -725,7 +725,7 @@ test "what a store kept as two files reads as another version's, and the next fl
     let s1 = flush[mem](put(old, 1, name_key("a"), b"x"));
     assert(!fs.exists[mem]("cache/store.idx") && !fs.exists[mem]("cache/store.dat"));
     let s2 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s2, 1, name_key("a"))), b"x");
+    assert_eq(lookup_payload(get[mem](s2, 1, name_key("a"))), b"x");
     assert(clear_dir[mem]("cache"));
     assert(is_miss(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))));
     all_messages([old.warnings, s2.warnings])

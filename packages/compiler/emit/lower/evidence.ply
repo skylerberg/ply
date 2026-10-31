@@ -60,14 +60,14 @@ pub fn evidence_parameter_types(h: EvidenceParameters) -> List<Type> =
     h.own.map(|_: EffectsEvidence| evidence_type())
   } else { [evidence_array_of(h.own.len())] })
 
-pub fn root_body_start(
+pub fn enter_root_body(
   context: Context,
   st: Lowering,
   params: List<Var>,
   declared: Int,
   h: EvidenceParameters,
 ) -> { context: Context, st: Lowering } = {
-  let read = words_read(st, params.drop(declared + h.hidden), h.own, context.body.span);
+  let read = read_evidence_words(st, params.drop(declared + h.hidden), h.own, context.body.span);
   {
     context: {
       ..context,
@@ -129,7 +129,7 @@ fn entry_object(name: Bytes) -> HandleOp =
   if name == b"sim" || simulated_effect_names().contains(name) { SchedulerEvidence }
   else { UnhandledEvidence }
 
-pub fn words_read(
+pub fn read_evidence_words(
   st: Lowering,
   carried: List<Var>,
   own: List<EffectsEvidence>,
@@ -209,11 +209,11 @@ fn effects_of(c: Code) -> { effect_arguments: List<Effects>, listed: List<Effect
     _ -> { effect_arguments: [], listed: [] },
   }
 
-pub fn effects_static(c: Code) -> Bool / {abort.raise} = {
+pub fn has_static_effects(c: Code) -> Bool / {abort.raise} = {
   let own = effects_of(c);
   own.effect_arguments.all(static_effects)
     && own.listed.all(|a: Effect| match a.resource { ResourceVariable(_) -> false, _ -> true })
-    && code_children(c).all(effects_static)
+    && code_children(c).all(has_static_effects)
 }
 
 fn static_effects(r: Effects) -> Bool =
@@ -279,7 +279,7 @@ pub fn evidence_for(context: Context, wanted: List<EffectsEvidence>) -> List<Arg
       },
   ).out
 
-pub fn outer_evidence(context: Context, e: Evidence) -> Arg =
+pub fn covering_evidence_word(context: Context, e: Evidence) -> Arg =
   match context.words.find(|x: EvidenceWord| !x.through && covers(x.evidence, e)) {
     Some(x) -> x.word,
     None -> match context.words.find(|x: EvidenceWord| x.through && covers(x.evidence, e)) {
@@ -345,7 +345,7 @@ pub fn scheme_evidence_arguments(
             acc.push({
               callee: callee,
               wanted: {
-                evidence: { effect: a.effect, resource: filled_label(context, labels, a.resource) },
+                evidence: { effect: a.effect, resource: resolve_label_resource(context, labels, a.resource) },
                 through: false,
               },
             })
@@ -386,7 +386,7 @@ pub fn passed_evidence_arguments(
   h: EvidenceArguments,
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } = {
-  let words = bridged(st, h.words, at);
+  let words = fill_missing_evidence(st, h.words, at);
   if words.args.len() <= max_evidence_params() {
     { st: words.st, args: h.labels.concat(words.args) }
   } else {
@@ -407,7 +407,7 @@ pub fn captured_evidence_for(
   own: List<EffectsEvidence>,
   at: Span,
 ) -> { st: Lowering, words: List<EvidenceWord> } = {
-  let words = bridged(st, evidence_for(context, own), at);
+  let words = fill_missing_evidence(st, evidence_for(context, own), at);
   {
     st: words.st,
     words: range(0, own.len()).fold([], |acc: List<EvidenceWord>, k: Int|
@@ -419,7 +419,7 @@ pub fn captured_evidence_for(
   }
 }
 
-pub fn bridged(st: Lowering, words: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
+pub fn fill_missing_evidence(st: Lowering, words: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
   if !words.contains(ZeroOperand(AsImmediate)) { { st: st, args: words } } else {
     let b = bound_as(
       st,
@@ -434,11 +434,11 @@ pub fn bridged(st: Lowering, words: List<Arg>, at: Span) -> { st: Lowering, args
 pub fn label_codes(d: Definition, codes: List<Code>) -> List<Code> =
   match d.scheme { Some(sc) -> labels_among(codes, sc.label_variables.len()), None -> [] }
 
-fn filled_label(context: Context, labels: List<Code>, r: Resource) -> Resource / {abort.raise} =
+fn resolve_label_resource(context: Context, labels: List<Code>, r: Resource) -> Resource / {abort.raise} =
   match r {
     ResourceVariable(q) -> match labels.at(q) {
       Some(c) -> label_resource(context, c),
-      None -> unfilled(),
+      None -> unknown_resource(),
     },
     _ -> r,
   }
@@ -446,18 +446,18 @@ fn filled_label(context: Context, labels: List<Code>, r: Resource) -> Resource /
 pub fn label_resource(context: Context, c: Code) -> Resource / {abort.raise} =
   match c.node {
     CodeLabel(n) -> NamedResource(n),
-    CodeVar(v) -> if !is_label_binder(v.name) { unfilled() } else {
+    CodeVar(v) -> if !is_label_binder(v.name) { unknown_resource() } else {
       let name = v.name.slice(1, v.name.len() - 1);
       match range(0, context.label_names.len()).find(|i: Int|
           context.label_names.at(i) == Some(name)) {
         Some(p) -> ResourceVariable(p),
-        None -> unfilled(),
+        None -> unknown_resource(),
       }
     },
-    _ -> unfilled(),
+    _ -> unknown_resource(),
   }
 
-fn unfilled() -> Resource = NamedResource(b"?")
+fn unknown_resource() -> Resource = NamedResource(b"?")
 
 pub fn function_value_evidence(
   context: Context,
@@ -465,20 +465,20 @@ pub fn function_value_evidence(
   effects: Effects,
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } / {abort.raise} =
-  wanted_handing(
+  wanted_evidence_arguments(
     context,
     st,
     effects_evidence(effects, context.effect_evidence, context.labels),
     at,
   )
 
-pub fn wanted_handing(
+pub fn wanted_evidence_arguments(
   context: Context,
   st: Lowering,
   wanted: List<EffectsEvidence>,
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } / {abort.raise} = {
-  let words = bridged(st, evidence_for(context, wanted), at);
+  let words = fill_missing_evidence(st, evidence_for(context, wanted), at);
   let left = wanted.fold([], |acc: List<Arg>, o: EffectsEvidence|
     match o.evidence.resource {
       ResourceVariable(p) -> acc.push(label_value(context, p)),

@@ -54,7 +54,7 @@ pub type Run = {
   runs: Map<Bytes, Int>,
   lost: Map<Bytes, Int>,
   judged: Map<Bytes, Bool>,
-  judging: Bool,
+  checking_reuse: Bool,
   provisional: Map<Bytes, Bytes>,
 }
 
@@ -74,7 +74,7 @@ fn new_run() -> Run =
     runs: Map::new(),
     lost: Map::new(),
     judged: Map::new(),
-    judging: false,
+    checking_reuse: false,
     provisional: Map::new(),
   }
 
@@ -207,7 +207,7 @@ pub fn current_records(held: MemoryStore) -> Map<Bytes, Record> = {
 fn keep_previous(key: Bytes, next: Record) -> Unit / {memo_store.read, memo_store.write} =
   match memo_store.record(key) {
     Some(old) -> if old.output != next.output || old.reads != next.reads {
-      memo_store.adopt(previous_key(key), old)
+      memo_store.store_record(previous_key(key), old)
     },
     None -> (),
   }
@@ -237,17 +237,17 @@ fn length_prefixed_at(b: Bytes, at: Int) -> Option<{ value: Bytes, next: Int }> 
     else { Some({ value: b.slice(at + 8, at + 8 + n), next: at + 8 + n }) },
   }
 
-fn of_record(b: Bytes) -> Bool = b.len() >= 9 && b.slice(0, 1) == record_format()
+fn has_record_format(b: Bytes) -> Bool = b.len() >= 9 && b.slice(0, 1) == record_format()
 
 pub fn output_digest_of(b: Bytes) -> Option<Bytes> / {abort.raise} =
-  if !of_record(b) { None }
+  if !has_record_format(b) { None }
   else { match length_prefixed_at(b, 1) { Some(o) -> Some(o.value), None -> None } }
 
 fn hashes_of<| e>(queries: Map<Bytes, Query<| e>>) -> List<Bytes> =
   queries.fold([], |acc: List<Bytes>, _: Bytes, q: Query<| e>| acc.push(q.hash))
 
 pub fn inline_output_of(b: Bytes) -> Option<Bytes> / {abort.raise} =
-  if !of_record(b) { None } else {
+  if !has_record_format(b) { None } else {
     match length_prefixed_at(b, 1) {
       None -> None,
       Some(o) -> if o.next >= b.len() || b.at(o.next) != 1 { None }
@@ -255,7 +255,7 @@ pub fn inline_output_of(b: Bytes) -> Option<Bytes> / {abort.raise} =
     }
   }
 
-fn after_inline(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
+fn after_embedded_output(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
   if at >= b.len() { None }
   else if b.at(at) == 0 { Some(at + 1) }
   else if b.at(at) != 1 { None }
@@ -264,10 +264,10 @@ fn after_inline(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
 pub fn record_head_size() -> Int = 4096
 
 pub fn record_from(b: Bytes) -> Option<Record> / {abort.raise} =
-  if !of_record(b) { None } else {
+  if !has_record_format(b) { None } else {
     match length_prefixed_at(b, 1) {
       None -> None,
-      Some(o) -> match match after_inline(b, o.next) {
+      Some(o) -> match match after_embedded_output(b, o.next) {
           Some(at) -> length_prefixed_at(b, at),
           None -> None,
         } {
@@ -301,12 +301,12 @@ pub effect memo_store {
   read record(key: Bytes) -> Option<Record>
   read output(digest: Bytes) -> Option<Bytes>
   write put(key: Bytes, r: Record, output: Bytes, lasting: Bool) -> Unit
-  write adopt(key: Bytes, r: Record) -> Unit
+  write store_record(key: Bytes, r: Record) -> Unit
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
   read looked() -> List<Dependency>
-  read standing(key: Bytes) -> Bool
-  read below(key: Bytes) -> Option<Record>
+  read has_trusted_record(key: Bytes) -> Bool
+  read pack_record(key: Bytes) -> Option<Record>
   write running(id: Bytes, queries: List<Bytes>) -> Unit
 }
 
@@ -367,7 +367,7 @@ fn fetch_output<| e>(
     let s = verify_key(queries, run, q, key, input, left - 1);
     match memo_store.output(s.head) {
       Some(o) -> { run: s.run, output: o, head: s.head },
-      None -> if s.run.open.contains(key) { abort.raise(judgment_stopped()) } else {
+      None -> if s.run.open.contains(key) { abort.raise(reuse_cycle_message()) } else {
         let e = execute(queries, s.run, q, key, input, left - 1);
         if e.head != s.head {
           panic(
@@ -404,10 +404,10 @@ fn verify_key<| e>(
       None -> {
         let step = { query: q.name, input: input };
         if run.open.contains(key) {
-          if !run.judging { report_cycle(run, step) } else {
+          if !run.checking_reuse { report_cycle(run, step) } else {
             match memo_store.output_digest(key) {
               Some(h) -> { run: { ..run, provisional: run.provisional.insert(key, h) }, head: h },
-              None -> abort.raise(judgment_stopped()),
+              None -> abort.raise(reuse_cycle_message()),
             }
           }
         } else {
@@ -446,7 +446,7 @@ fn checked<| e>(
 ) -> { run: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} =
   match memo_store.output_digest(key) {
     None -> execute(queries, run, q, key, input, left),
-    Some(out) -> if memo_store.standing(key) { reuse(run, q.name, out) } else {
+    Some(out) -> if memo_store.has_trusted_record(key) { reuse(run, q.name, out) } else {
       match memo_store.record(key) {
         None -> execute(queries, run, q, key, input, left),
         Some(r) -> {
@@ -455,16 +455,16 @@ fn checked<| e>(
           if s.ok { reuse(s.run, q.name, r.output) } else {
             let d = dependencies_unchanged(queries, s.run, r.reads, left);
             if d.ok {
-              if q.summarized { resummarized(queries, key, r) };
+              if q.summarized { update_summary(queries, key, r) };
               reuse(d.run, q.name, r.output)
-            } else { undone_or_run(queries, d.run, q, key, input, left) }
+            } else { restore_or_run(queries, d.run, q, key, input, left) }
           }
         },
       }
     },
   }
 
-fn undone_or_run<| e>(
+fn restore_or_run<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
   q: Query<| e>,
@@ -472,21 +472,21 @@ fn undone_or_run<| e>(
   input: Bytes,
   left: Int,
 ) -> { run: Run, head: Bytes } / {memo_store.read, memo_store.write, abort.raise | e} = {
-  let earlier = taken_back(queries, run, memo_store.record(previous_key(key)), left);
-  let back = match earlier.record {
+  let earlier = record_if_unchanged(queries, run, memo_store.record(previous_key(key)), left);
+  let cycle_to_switched = match earlier.record {
     Some(_) -> earlier,
-    None -> taken_back(queries, earlier.run, memo_store.below(key), left),
+    None -> record_if_unchanged(queries, earlier.run, memo_store.pack_record(key), left),
   };
-  match back.record {
-    None -> execute(queries, back.run, q, key, input, left),
+  match cycle_to_switched.record {
+    None -> execute(queries, cycle_to_switched.run, q, key, input, left),
     Some(e) -> {
       match memo_store.record(key) {
-        Some(r) -> memo_store.adopt(previous_key(key), r),
+        Some(r) -> memo_store.store_record(previous_key(key), r),
         None -> (),
       };
-      memo_store.adopt(key, e);
+      memo_store.store_record(key, e);
       reuse(
-        { ..back.run, restored: back.run.restored.push({ query: q.name, input: input }) },
+        { ..cycle_to_switched.run, restored: cycle_to_switched.run.restored.push({ query: q.name, input: input }) },
         q.name,
         e.output,
       )
@@ -494,7 +494,7 @@ fn undone_or_run<| e>(
   }
 }
 
-fn taken_back<| e>(
+fn record_if_unchanged<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
   record: Option<Record>,
@@ -511,7 +511,7 @@ fn taken_back<| e>(
     },
   }
 
-fn judgment_stopped() -> String = "a judgment reached a record being computed"
+fn reuse_cycle_message() -> String = "a judgment reached a record being computed"
 
 fn report_cycle(
   run: Run,
@@ -557,7 +557,7 @@ type Summing = {
   whole: Bool,
 }
 
-fn noting(x: Summing, rest: List<Dependency>, id: Bytes, r: Dependency) -> Summing =
+fn add_to_summary(x: Summing, rest: List<Dependency>, id: Bytes, r: Dependency) -> Summing =
   if x.seen.contains(id) { { ..x, work: rest } }
   else { { ..x, work: rest, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
 
@@ -572,15 +572,15 @@ fn summary_of<| e>(
       match x.work {
         [] -> Stop(x),
         [r, ..rest] -> match r {
-          ExternalDependency(kind, at, _) -> Continue(noting(x, rest, location_id(kind, at), r)),
+          ExternalDependency(kind, at, _) -> Continue(add_to_summary(x, rest, location_id(kind, at), r)),
           QueryDependency(name, input, _) -> match queries.get(name) {
             None -> Stop({ ..x, whole: false }),
             Some(aq) -> if aq.summarized {
-              Continue(noting(x, rest, query_dependency_id(name, input), r))
+              Continue(add_to_summary(x, rest, query_dependency_id(name, input), r))
             } else {
               let id = query_dependency_id(name, input);
               if x.seen.contains(id) { Continue({ ..x, work: rest }) } else {
-                let defined = noting(
+                let defined = add_to_summary(
                   { ..x, seen: x.seen.insert(id, true) },
                   rest,
                   location_id(query_kind(), name),
@@ -599,13 +599,13 @@ fn summary_of<| e>(
   if made.whole { Some(made.summary) } else { None }
 }
 
-fn resummarized<| e>(
+fn update_summary<| e>(
   queries: Map<Bytes, Query<| e>>,
   key: Bytes,
   r: Record,
 ) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
   match summary_of(queries, r.reads) {
-    Some(s) -> if s != r.summary { memo_store.adopt(key, { ..r, summary: s }) },
+    Some(s) -> if s != r.summary { memo_store.store_record(key, { ..r, summary: s }) },
     None -> (),
   }
 
@@ -620,7 +620,7 @@ fn would_reuse<| e>(
   else if run.resolved.contains(key) { { run: run, ok: true } }
   else if run.open.contains(key) || memo_store.output_digest(key) == None {
     { run: run, ok: false }
-  } else if memo_store.standing(key) { { run: run, ok: true } } else {
+  } else if memo_store.has_trusted_record(key) { { run: run, ok: true } } else {
     match run.judged.get(key) {
       Some(ok) -> { run: run, ok: ok },
       None -> {
@@ -628,14 +628,14 @@ fn would_reuse<| e>(
           None -> { run: run, ok: false },
           Some(rec) -> {
             let s = if rec.summary.len() == 0 { { run: run, ok: false } }
-            else { judged_reads(queries, run, q.name, rec.summary, left - 1) };
+            else { would_reuse_reads(queries, run, q.name, rec.summary, left - 1) };
             let d = if s.ok { s }
-            else { judged_reads(queries, s.run, q.name, rec.reads, left - 1) };
+            else { would_reuse_reads(queries, s.run, q.name, rec.reads, left - 1) };
             { run: d.run, ok: d.ok && (q.kept || memo_store.output(rec.output) != None) }
           },
         };
         let j = if current_records.ok { current_records } else {
-          let earlier = judged_back(
+          let earlier = would_reuse_record(
             queries,
             current_records.run,
             q.name,
@@ -643,14 +643,14 @@ fn would_reuse<| e>(
             left - 1,
           );
           if earlier.ok { earlier }
-          else { judged_back(queries, earlier.run, q.name, memo_store.below(key), left - 1) }
+          else { would_reuse_record(queries, earlier.run, q.name, memo_store.pack_record(key), left - 1) }
         };
         { run: { ..j.run, judged: j.run.judged.insert(key, j.ok) }, ok: j.ok }
       },
     }
   }
 
-fn judged_back<| e>(
+fn would_reuse_record<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
   judged: Bytes,
@@ -660,12 +660,12 @@ fn judged_back<| e>(
   match record {
     None -> { run: run, ok: false },
     Some(e) -> {
-      let t = judged_reads(queries, run, judged, e.reads, left);
+      let t = would_reuse_reads(queries, run, judged, e.reads, left);
       { run: t.run, ok: t.ok && memo_store.output(e.output) != None }
     },
   }
 
-fn judged_reads<| e>(
+fn would_reuse_reads<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
   judged: Bytes,
@@ -756,7 +756,7 @@ fn execute<| e>(
         asked: a,
       }
     };
-    let offering = |s: Execution, by: Bytes, name: Bytes, asked: Bytes, output: Bytes|
+    let provide_taken = |s: Execution, by: Bytes, name: Bytes, asked: Bytes, output: Bytes|
       {
         ..s,
         run: {
@@ -794,14 +794,14 @@ fn execute<| e>(
         let k = key_of(jq, asked);
         let was = st.run;
         let judged = handle {
-          Some(would_reuse(queries, { ..was, judging: true }, jq, k, left - 1))
+          Some(would_reuse(queries, { ..was, checking_reuse: true }, jq, k, left - 1))
         } with {
           abort.raise(_) -> None,
         };
         match judged {
           None -> match was.provided.get(k) { Some(o) -> provided_valid(was, o), None -> false },
           Some(w) -> {
-            st = { ..st, run: { ..w.run, judging: was.judging } };
+            st = { ..st, run: { ..w.run, checking_reuse: was.checking_reuse } };
             w.ok
               || (match w.run.provided.get(k) {
                 Some(o) -> provided_valid(w.run, o),
@@ -811,10 +811,10 @@ fn execute<| e>(
         }
       },
       memo.provide(name, asked, output) -> {
-        st = offering(st, q.name, name, asked, output);
+        st = provide_taken(st, q.name, name, asked, output);
       },
       memo.provide_as(by, name, asked, output) -> {
-        st = offering(st, query_of(queries, by).name, name, asked, output);
+        st = provide_taken(st, query_of(queries, by).name, name, asked, output);
       },
       memo.provided() -> match st.run.provided.get(key) {
         None -> None,
@@ -877,10 +877,10 @@ pub fn record_output<| e>(
   memo_store.put(key, rec, output, true)
 }
 
-pub type Look = { kind: Bytes, at: Bytes, value: Option<Bytes>, digest: Bytes }
+pub type ExternalRead = { kind: Bytes, at: Bytes, value: Option<Bytes>, digest: Bytes }
 
 type MemoryRunState = {
-  looked: Map<Bytes, Look>,
+  looked: Map<Bytes, ExternalRead>,
   pack: packs::PackReader,
   trusted: Bool,
   packed: Map<Bytes, Option<Record>>,
@@ -996,7 +996,7 @@ pub fn with_memory_store<a | e>(
         outputs: if persisted { store.outputs.insert(rec.output, output) } else { store.outputs },
       };
     },
-    memo_store.adopt(key, rec) -> {
+    memo_store.store_record(key, rec) -> {
       store = {
         records: store.records.insert(key, rec),
         outputs: match inlined.get(rec.output) {
@@ -1016,14 +1016,14 @@ pub fn with_memory_store<a | e>(
       l.looked.digest
     },
     memo_store.looked() ->
-      running.looked.values().map(|x: Look| ExternalDependency(x.kind, x.at, x.digest)),
-    memo_store.below(key) -> if !store.records.contains(key) { None } else {
+      running.looked.values().map(|x: ExternalRead| ExternalDependency(x.kind, x.at, x.digest)),
+    memo_store.pack_record(key) -> if !store.records.contains(key) { None } else {
       let p = packed_at(running, inlined, key);
       running = p.running;
       inlined = p.inlined;
       p.rec
     },
-    memo_store.standing(key) -> if !running.trusted { false } else {
+    memo_store.has_trusted_record(key) -> if !running.trusted { false } else {
       let p = packed_at(running, inlined, key);
       running = p.running;
       inlined = p.inlined;
@@ -1112,7 +1112,7 @@ fn length_of(input: Bytes) -> Bytes / {memo.read} =
     None -> b"none",
   }
 
-fn longer(input: Bytes) -> Bytes / {memo.read} = {
+fn length_label(input: Bytes) -> Bytes / {memo.read} = {
   let n = memo.fetch(b"length", input);
   b"long ".concat(n)
 }
@@ -1120,18 +1120,18 @@ fn longer(input: Bytes) -> Bytes / {memo.read} = {
 fn test_queries(length_hash: Bytes) -> Map<Bytes, Query<| {}>> =
   Map::new().insert(b"length", query(b"length", length_hash, length_of)).insert(
     b"longer",
-    query(b"longer", b"l1", longer),
+    query(b"longer", b"l1", length_label),
   )
 
-fn asked_over(
+fn run_query(
   queries: Map<Bytes, Query<| {}>>,
   w: TestEnvironment,
   name: Bytes,
   input: Bytes,
 ) -> { output: Bytes, executed: Int, lost: Int, read: Int, world: TestEnvironment } / {abort.raise} =
-  asked_with(queries, w, None, None, name, input)
+  ask_with_packs(queries, w, None, None, name, input)
 
-fn asked_with(
+fn ask_with_packs(
   queries: Map<Bytes, Query<| {}>>,
   w: TestEnvironment,
   packed: Option<packs::PackFiles>,
@@ -1188,26 +1188,26 @@ fn only_record(w: TestEnvironment, key: Bytes) -> TestEnvironment / {abort.raise
 
 test "a query's record returns its result again while what it read returns the same" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   assert_eq(first.output, b"4");
   assert_eq(first.executed, 1);
-  let again = asked_over(q, first.world, b"length", b"a");
+  let again = run_query(q, first.world, b"length", b"a");
   assert_eq(again.output, b"4");
   assert_eq(again.executed, 0);
-  let moved = asked_over(q, edited(again.world, b"a", b"seven!!"), b"length", b"a");
+  let moved = run_query(q, edited(again.world, b"a", b"seven!!"), b"length", b"a");
   assert_eq(moved.output, b"7");
   assert_eq(moved.executed, 1)
 }
 
 test "a result that comes out the same stops an edit's change from spreading" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
   assert_eq(first.output, b"long 4");
   assert_eq(first.executed, 2);
-  let same = asked_over(q, edited(first.world, b"a", b"FOUR"), b"longer", b"a");
+  let same = run_query(q, edited(first.world, b"a", b"FOUR"), b"longer", b"a");
   assert_eq(same.output, b"long 4");
   assert_eq(same.executed, 1);
-  let longer_now = asked_over(q, edited(same.world, b"a", b"forty"), b"longer", b"a");
+  let longer_now = run_query(q, edited(same.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(longer_now.output, b"long 5");
   assert_eq(longer_now.executed, 2)
 }
@@ -1218,14 +1218,14 @@ fn switched(input: Bytes) -> Bytes / {memo.read} =
     if relayed == b"loop" { memo.fetch(b"back", input) } else { relayed }
   } else { b"alone" }
 
-fn leveled(input: Bytes) -> Bytes / {memo.read} = {
+fn file_text(input: Bytes) -> Bytes / {memo.read} = {
   let _ = memo.fetch(b"length", b"pad");
   match memo.external(b"file", b"f") { Some(text) -> text, None -> b"none" }
 }
 
 fn relayed(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"leveled", input)
 
-fn back(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"switched", input)
+fn cycle_to_switched(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"switched", input)
 
 fn paired(input: Bytes) -> Bytes / {memo.read} =
   Bytes::concat_all([memo.fetch(b"switched", input), b"|", memo.fetch(b"relayed", input)])
@@ -1233,13 +1233,13 @@ fn paired(input: Bytes) -> Bytes / {memo.read} =
 fn relay_queries() -> Map<Bytes, Query<| {}>> =
   test_queries(b"h1").insert(b"switched", query(b"switched", b"s1", switched)).insert(
     b"leveled",
-    query(b"leveled", b"v1", leveled),
+    query(b"leveled", b"v1", file_text),
   ).insert(
     b"relayed",
     query(b"relayed", b"r1", relayed),
   ).insert(
     b"back",
-    query(b"back", b"b1", back),
+    query(b"back", b"b1", cycle_to_switched),
   ).insert(
     b"paired",
     query(b"paired", b"o1", paired),
@@ -1252,7 +1252,7 @@ test "records whose reads now lead round to what asked them return what a cold r
     { at: b"f", text: b"loop" },
     { at: b"pad", text: b"x" },
   ];
-  let first = asked_over(q, test_world(files), b"paired", b"s");
+  let first = run_query(q, test_world(files), b"paired", b"s");
   assert_eq(first.output, b"alone|loop");
   let moved = edited(edited(first.world, b"switch", b"ask"), b"f", b"fine");
   let cold = edited(
@@ -1261,8 +1261,8 @@ test "records whose reads now lead round to what asked them return what a cold r
     b"fine",
   );
   assert_eq(
-    asked_over(q, moved, b"paired", b"s").output,
-    asked_over(q, cold, b"paired", b"s").output,
+    run_query(q, moved, b"paired", b"s").output,
+    run_query(q, cold, b"paired", b"s").output,
   )
 }
 
@@ -1285,34 +1285,34 @@ fn round_queries() -> Map<Bytes, Query<| {}>> =
 
 test "records stored in other worlds that ask one another return what a cold run does, and reject a cycle it makes" {
   let q = round_queries();
-  let first = asked_over(
+  let first = run_query(
     q,
     test_world([{ at: b"hd", text: b"on" }, { at: b"yd", text: b"off" }]),
     b"g",
     b"x",
   );
   assert_eq(first.output, b"y");
-  let second = asked_over(q, edited(edited(first.world, b"hd", b"off"), b"yd", b"on"), b"y", b"x");
+  let second = run_query(q, edited(edited(first.world, b"hd", b"off"), b"yd", b"on"), b"y", b"x");
   assert_eq(second.output, b"h");
-  assert_eq(asked_over(q, edited(second.world, b"yd", b"off"), b"g", b"x").output, b"h");
+  assert_eq(run_query(q, edited(second.world, b"yd", b"off"), b"g", b"x").output, b"h");
   let both = edited(second.world, b"hd", b"on");
-  assert_eq(try_result(|| asked_over(q, both, b"g", b"x").output), None);
+  assert_eq(try_result(|| run_query(q, both, b"g", b"x").output), None);
   assert_eq(
-    try_result(|| asked_over(q, { ..both, store: empty_memory_store() }, b"g", b"x").output),
+    try_result(|| run_query(q, { ..both, store: empty_memory_store() }, b"g", b"x").output),
     None,
   )
 }
 
 test "an edit undone returns what it did before with no body run, from the records it replaced" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
-  let moved = asked_over(q, edited(first.world, b"a", b"forty"), b"longer", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
+  let moved = run_query(q, edited(first.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(moved.output, b"long 5");
   assert_eq(moved.executed, 2);
-  let undone = asked_over(q, edited(moved.world, b"a", b"four"), b"longer", b"a");
+  let undone = run_query(q, edited(moved.world, b"a", b"four"), b"longer", b"a");
   assert_eq(undone.output, b"long 4");
   assert_eq(undone.executed, 0);
-  let redone = asked_over(q, edited(undone.world, b"a", b"forty"), b"longer", b"a");
+  let redone = run_query(q, edited(undone.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(redone.output, b"long 5");
   assert_eq(redone.executed, 0)
 }
@@ -1335,7 +1335,7 @@ test "what a driver's asks reach is each record their reads ask, at any depth" {
   )
 }
 
-fn loudest(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"longer", input).concat(b"!")
+fn exclaim_longer(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"longer", input).concat(b"!")
 
 fn loudest_by_digest(input: Bytes) -> Bytes / {memo.read} =
   Bytes::concat(
@@ -1349,8 +1349,8 @@ fn loudest_by_digest(input: Bytes) -> Bytes / {memo.read} =
 test "a result asked for by its digest is the read an ask makes, and is handed over by it" {
   let by = |body: (Bytes) -> Bytes / {memo.read}|
     test_queries(b"h1").insert(b"loudest", query(b"loudest", b"d1", body));
-  let asked = asked_over(by(loudest), test_world([{ at: b"a", text: b"four" }]), b"loudest", b"a");
-  let headed = asked_over(
+  let asked = run_query(by(exclaim_longer), test_world([{ at: b"a", text: b"four" }]), b"loudest", b"a");
+  let headed = run_query(
     by(loudest_by_digest),
     test_world([{ at: b"a", text: b"four" }]),
     b"loudest",
@@ -1358,7 +1358,7 @@ test "a result asked for by its digest is the read an ask makes, and is handed o
   );
   assert_eq(headed.output, b"long 4!");
   assert_eq(headed.world.store.records, asked.world.store.records);
-  let moved = asked_over(
+  let moved = run_query(
     by(loudest_by_digest),
     edited(headed.world, b"a", b"forty"),
     b"loudest",
@@ -1370,8 +1370,8 @@ test "a result asked for by its digest is the read an ask makes, and is handed o
 
 test "a run where nothing moved reads each place once and runs no body" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
-  let again = asked_over(q, first.world, b"longer", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
+  let again = run_query(q, first.world, b"longer", b"a");
   assert_eq(again.output, b"long 4");
   assert_eq(again.executed, 0);
   assert_eq(again.read, 1)
@@ -1379,43 +1379,43 @@ test "a run where nothing moved reads each place once and runs no body" {
 
 test "a record no run asked for since a place moved is checked when one asks" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
-  let moved = asked_over(q, edited(first.world, b"a", b"forty"), b"length", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
+  let moved = run_query(q, edited(first.world, b"a", b"forty"), b"length", b"a");
   assert_eq(moved.output, b"5");
   assert_eq(moved.executed, 1);
-  let later = asked_over(q, moved.world, b"longer", b"a");
+  let later = run_query(q, moved.world, b"longer", b"a");
   assert_eq(later.output, b"long 5");
   assert_eq(later.executed, 1)
 }
 
 test "a query whose definition changed is computed again, and what asked it stands where it returns the same" {
-  let first = asked_over(
+  let first = run_query(
     test_queries(b"h1"),
     test_world([{ at: b"a", text: b"four" }]),
     b"longer",
     b"a",
   );
-  let moved = asked_over(test_queries(b"h2"), first.world, b"longer", b"a");
+  let moved = run_query(test_queries(b"h2"), first.world, b"longer", b"a");
   assert_eq(moved.output, b"long 4");
   assert_eq(moved.executed, 1)
 }
 
 test "what stood through a definition that changed under it is computed again where that result changes later" {
-  let first = asked_over(
+  let first = run_query(
     test_queries(b"h1"),
     test_world([{ at: b"a", text: b"four" }]),
     b"longer",
     b"a",
   );
-  let stood = asked_over(test_queries(b"h2"), first.world, b"longer", b"a");
+  let stood = run_query(test_queries(b"h2"), first.world, b"longer", b"a");
   assert_eq(stood.executed, 1);
-  let moved = asked_over(test_queries(b"h2"), edited(stood.world, b"a", b"forty"), b"longer", b"a");
+  let moved = run_query(test_queries(b"h2"), edited(stood.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(moved.output, b"long 5");
   assert_eq(moved.executed, 2)
 }
 
 test "a store written under queries defined differently returns what they return now" {
-  let first = asked_over(
+  let first = run_query(
     test_queries(b"h1"),
     test_world([{ at: b"a", text: b"four" }]),
     b"longer",
@@ -1429,7 +1429,7 @@ test "a store written under queries defined differently returns what they return
         None -> b"none",
       }),
   );
-  let moved = asked_over(counting_twice, first.world, b"longer", b"a");
+  let moved = run_query(counting_twice, first.world, b"longer", b"a");
   assert_eq(moved.output, b"long 8");
   assert_eq(moved.executed, 2)
 }
@@ -1437,7 +1437,7 @@ test "a store written under queries defined differently returns what they return
 test "a run reads each place once, whatever the place holds later in it" {
   let q = test_queries(b"h1");
   let edited_after = Map::new().insert(b"a", b"forty");
-  let first = asked_with(
+  let first = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"four" }]),
     None,
@@ -1447,34 +1447,34 @@ test "a run reads each place once, whatever the place holds later in it" {
   );
   assert_eq(first.output, b"4");
   assert_eq(first.read, 1);
-  let next = asked_over(q, edited(first.world, b"a", b"forty"), b"length", b"a");
+  let next = run_query(q, edited(first.world, b"a", b"forty"), b"length", b"a");
   assert_eq(next.output, b"5");
   assert_eq(next.executed, 1)
 }
 
-fn topped(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"middle", input).concat(b"!")
+fn exclaim_middle(input: Bytes) -> Bytes / {memo.read} = memo.fetch(b"middle", input).concat(b"!")
 
-fn middled(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.fetch(b"length", input))
+fn middle_label(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.fetch(b"length", input))
 
 fn summed() -> Map<Bytes, Query<| {}>> =
-  test_queries(b"h1").insert(b"top", { ..query(b"top", b"t1", topped), summarized: true }).insert(
+  test_queries(b"h1").insert(b"top", { ..query(b"top", b"t1", exclaim_middle), summarized: true }).insert(
     b"middle",
-    query(b"middle", b"m1", middled),
+    query(b"middle", b"m1", middle_label),
   )
 
 test "a record whose summary returns what it did stands with no record below it read" {
   let q = summed();
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   assert_eq(first.output, b"mid 4!");
   let top = key_of(query_of(q, b"top"), b"a");
-  let again = asked_over(q, only_record(first.world, top), b"top", b"a");
+  let again = run_query(q, only_record(first.world, top), b"top", b"a");
   assert_eq(again.output, b"mid 4!");
   assert_eq(again.executed, 0)
 }
 
 test "a summary holds each place and definition below, down to records that keep their own" {
-  let q = summed().insert(b"middle", { ..query(b"middle", b"m1", middled), summarized: true });
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
+  let q = summed().insert(b"middle", { ..query(b"middle", b"m1", middle_label), summarized: true });
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   let summary_of_key = |name: Bytes|
     match first.world.store.records.get(key_of(query_of(q, name), b"a")) {
       Some(r) -> r.summary,
@@ -1488,23 +1488,23 @@ test "a summary holds each place and definition below, down to records that keep
 
 test "a summary that changed under a result that came out the same is made again" {
   let q = summed();
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   let top = key_of(query_of(q, b"top"), b"a");
-  let same = asked_over(q, edited(first.world, b"a", b"FOUR"), b"top", b"a");
+  let same = run_query(q, edited(first.world, b"a", b"FOUR"), b"top", b"a");
   assert_eq(same.output, b"mid 4!");
   assert_eq(same.executed, 1);
-  let again = asked_over(q, only_record(same.world, top), b"top", b"a");
+  let again = run_query(q, only_record(same.world, top), b"top", b"a");
   assert_eq(again.executed, 0);
-  let moved = asked_over(q, edited(same.world, b"a", b"forty"), b"top", b"a");
+  let moved = run_query(q, edited(same.world, b"a", b"forty"), b"top", b"a");
   assert_eq(moved.output, b"mid 5!");
   assert_eq(moved.executed, 3)
 }
 
 test "a summary moves with the definition of a query below it" {
-  let first = asked_over(summed(), test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
+  let first = run_query(summed(), test_world([{ at: b"a", text: b"four" }]), b"top", b"a");
   let top = key_of(query_of(summed(), b"top"), b"a");
   let redefined = summed().insert(b"length", query(b"length", b"h2", length_of));
-  let moved = asked_over(redefined, only_record(first.world, top), b"top", b"a");
+  let moved = run_query(redefined, only_record(first.world, top), b"top", b"a");
   assert_eq(moved.output, b"mid 4!");
   assert_eq(moved.executed, 2)
 }
@@ -1520,8 +1520,8 @@ fn pack_over(q: Map<Bytes, Query<| {}>>, w: TestEnvironment) -> packs::PackFiles
 
 test "a packed result stands as it is over the very files it was made over, and nothing of it is cached" {
   let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let first = asked_with(
+  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let first = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"four" }]),
     Some(pack_over(q, four.world)),
@@ -1536,9 +1536,9 @@ test "a packed result stands as it is over the very files it was made over, and 
 
 test "a packed result over other files is checked against its reads, and computed again where they changed" {
   let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let packed = pack_over(q, four.world);
-  let beside = asked_with(
+  let beside = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"four" }, { at: b"z", text: b"more" }]),
     Some(packed),
@@ -1548,7 +1548,7 @@ test "a packed result over other files is checked against its reads, and compute
   );
   assert_eq(beside.output, b"long 4");
   assert_eq(beside.executed, 1);
-  let moved = asked_with(
+  let moved = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"forty" }]),
     Some(packed),
@@ -1562,9 +1562,9 @@ test "a packed result over other files is checked against its reads, and compute
 
 test "what asked for a packed result is computed again where another pack is below the store" {
   let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
-  let first = asked_with(
+  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let forty = run_query(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
+  let first = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"four" }]),
     Some(pack_over(q, four.world)),
@@ -1573,9 +1573,9 @@ test "what asked for a packed result is computed again where another pack is bel
     b"a",
   );
   assert_eq(first.output, b"long 4");
-  let again = asked_with(q, first.world, Some(pack_over(q, four.world)), None, b"longer", b"a");
+  let again = ask_with_packs(q, first.world, Some(pack_over(q, four.world)), None, b"longer", b"a");
   assert_eq(again.executed, 0);
-  let moved = asked_with(
+  let moved = ask_with_packs(
     q,
     { ..again.world, files: forty.world.files },
     Some(pack_over(q, forty.world)),
@@ -1586,16 +1586,16 @@ test "what asked for a packed result is computed again where another pack is bel
   assert_eq(moved.output, b"long 5");
   assert_eq(moved.executed, 1);
   assert_eq(
-    asked_with(q, moved.world, Some(pack_over(q, forty.world)), None, b"longer", b"a").executed,
+    ask_with_packs(q, moved.world, Some(pack_over(q, forty.world)), None, b"longer", b"a").executed,
     0,
   )
 }
 
 test "what asked for a packed result is computed again where the files below the pack changed" {
   let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let packed = pack_over(q, four.world);
-  let first = asked_with(
+  let first = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"four" }]),
     Some(packed),
@@ -1603,7 +1603,7 @@ test "what asked for a packed result is computed again where the files below the
     b"longer",
     b"a",
   );
-  let moved = asked_with(
+  let moved = ask_with_packs(
     q,
     edited(first.world, b"a", b"forty"),
     Some(packed),
@@ -1617,9 +1617,9 @@ test "what asked for a packed result is computed again where the files below the
 
 test "a run takes what the pack below its store holds for what moved" {
   let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
-  let first = asked_with(
+  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let forty = run_query(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
+  let first = ask_with_packs(
     q,
     test_world([{ at: b"a", text: b"four" }]),
     Some(pack_over(q, four.world)),
@@ -1628,7 +1628,7 @@ test "a run takes what the pack below its store holds for what moved" {
     b"a",
   );
   assert_eq(first.executed, 0);
-  let next = asked_with(
+  let next = ask_with_packs(
     q,
     edited(first.world, b"a", b"forty"),
     Some(pack_over(q, forty.world)),
@@ -1703,8 +1703,8 @@ test "a result cached over what a run asked changes with a query's definition" {
 
 test "a command's result over a packed result falls where another pack is below the store" {
   let q = test_queries(b"h1");
-  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let forty = asked_over(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
+  let four = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let forty = run_query(q, test_world([{ at: b"a", text: b"forty" }]), b"length", b"a");
   let commanded = |held: MemoryStore, w: TestEnvironment|
     commanded_over(q, { ..w, store: held }, Some(pack_over(q, w)), b"length", b"k");
   let first = commanded(empty_memory_store(), four.world);
@@ -1717,8 +1717,8 @@ test "a command's result over a packed result falls where another pack is below 
 
 test "a record whose result is no longer cached is computed again" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
-  let lost = asked_over(
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let lost = run_query(
     q,
     { ..first.world, store: { ..first.world.store, outputs: Map::new() } },
     b"length",
@@ -1731,7 +1731,7 @@ test "a record whose result is no longer cached is computed again" {
 
 test "a result made again that differs from its record is rejected" {
   let q = test_queries(b"h1");
-  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   let unrecorded = Map::new().insert(
     b"length",
     query(b"length", b"h1", |input: Bytes| {
@@ -1740,7 +1740,7 @@ test "a result made again that differs from its record is rejected" {
     }),
   );
   let lost = { ..first.world, store: { ..first.world.store, outputs: Map::new() } };
-  assert_eq(try_result(|| asked_over(unrecorded, lost, b"length", b"a").output), None)
+  assert_eq(try_result(|| run_query(unrecorded, lost, b"length", b"a").output), None)
 }
 
 pub fn read_file(input: Bytes) -> Bytes / {memo.read} =
@@ -1752,24 +1752,24 @@ test "a query that caches no long results keeps its records, and a run that need
     ..query(b"length", b"h1", read_file),
     kept: false,
   });
-  let first = asked_over(q, test_world([{ at: b"a", text: text }]), b"longer", b"a");
+  let first = run_query(q, test_world([{ at: b"a", text: text }]), b"longer", b"a");
   assert_eq(first.output, b"long ".concat(text));
   assert(!first.world.store.outputs.contains(digest_of(Some(text))));
   assert(first.world.store.outputs.contains(digest_of(Some(first.output))));
-  let again = asked_over(q, first.world, b"longer", b"a");
+  let again = run_query(q, first.world, b"longer", b"a");
   assert_eq([again.executed, again.lost], [0, 0]);
-  let whole = asked_over(q, again.world, b"length", b"a");
+  let whole = run_query(q, again.world, b"length", b"a");
   assert_eq(whole.output, text);
   assert_eq([whole.executed, whole.lost], [1, 0]);
   let short = test_queries(b"h1").insert(b"length", {
     ..query(b"length", b"h1", length_of),
     kept: false,
   });
-  let held = asked_over(short, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let held = run_query(short, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
   assert(held.world.store.outputs.contains(digest_of(Some(b"4"))))
 }
 
-fn offering(input: Bytes) -> Bytes / {memo.read} = {
+fn provide_taken(input: Bytes) -> Bytes / {memo.read} = {
   memo.provide(b"taken", input, b"v ".concat(input));
   b"offered"
 }
@@ -1783,7 +1783,7 @@ fn both(input: Bytes) -> Bytes / {memo.read} = {
 }
 
 fn offer_queries(offering_hash: Bytes) -> Map<Bytes, Query<| {}>> =
-  Map::new().insert(b"offering", query(b"offering", offering_hash, offering)).insert(
+  Map::new().insert(b"offering", query(b"offering", offering_hash, provide_taken)).insert(
     b"taken",
     query(b"taken", b"t1", taking),
   ).insert(
@@ -1792,25 +1792,25 @@ fn offer_queries(offering_hash: Bytes) -> Map<Bytes, Query<| {}>> =
   )
 
 test "a result taken from an offer is made again when the query that offered it is redefined" {
-  let first = asked_over(offer_queries(b"o1"), test_world([]), b"both", b"a");
+  let first = run_query(offer_queries(b"o1"), test_world([]), b"both", b"a");
   assert_eq(first.output, b"v a");
-  let again = asked_over(offer_queries(b"o1"), first.world, b"both", b"a");
+  let again = run_query(offer_queries(b"o1"), first.world, b"both", b"a");
   assert_eq(again.executed, 0);
-  let moved = asked_over(offer_queries(b"o2"), again.world, b"both", b"a");
+  let moved = run_query(offer_queries(b"o2"), again.world, b"both", b"a");
   assert_eq(moved.output, b"v a");
   assert_eq(moved.executed, 2)
 }
 
-fn judging(input: Bytes) -> Bytes / {memo.read} = {
+fn check_taken_cached(input: Bytes) -> Bytes / {memo.read} = {
   let _ = memo.output_digest(b"offering", input);
   if memo.is_cached(b"taken", input) { b"kept" } else { b"not kept" }
 }
 
 test "a record is judged cached by a result offered in the run, with no body run for it" {
-  let q = offer_queries(b"o1").insert(b"judging", query(b"judging", b"j1", judging));
-  let first = asked_over(q, test_world([]), b"both", b"a");
-  let moved = q.insert(b"offering", query(b"offering", b"o2", offering));
-  let judged = asked_over(moved, first.world, b"judging", b"a");
+  let q = offer_queries(b"o1").insert(b"judging", query(b"judging", b"j1", check_taken_cached));
+  let first = run_query(q, test_world([]), b"both", b"a");
+  let moved = q.insert(b"offering", query(b"offering", b"o2", provide_taken));
+  let judged = run_query(moved, first.world, b"judging", b"a");
   assert_eq(judged.output, b"kept");
   assert_eq(judged.executed, 2)
 }
@@ -1820,7 +1820,7 @@ test "a query asking for its own result is rejected" {
     b"self",
     query(b"self", b"s", |input: Bytes| memo.fetch(b"self", input)),
   );
-  assert_eq(try_result(|| asked_over(looping, test_world([]), b"self", b"x").output), None)
+  assert_eq(try_result(|| run_query(looping, test_world([]), b"self", b"x").output), None)
 }
 
 fn records() -> gen::Gen<Record> =

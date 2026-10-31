@@ -16,7 +16,7 @@ import compiler.check.types (NamedResource, SingletonResource, ResourceVariable,
                              ints_insert, mark_rigid_type, mark_rigid_effects, free_variables,
                              env_bind_global, env_lookup, env_locals, InScope, label_type,
                              applied_args, apply_arguments, NominalType, owning_fn_type)
-import compiler.check.known (scoped_name, scoped_type, task_name, chan_name, map_parts)
+import compiler.check.known (scoped_name, scoped_type, task_name, builtin_channel_name, map_parts)
 import compiler.check.resolve.tables (ParsedModule, Binding, TypeSpace, EffectSpace, qualify,
                                       default_binder, backticked)
 import std.bytes
@@ -26,7 +26,7 @@ import std.string
 import compiler.check.borrowing (parameter_mode)
 import compiler.check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord,
                                      DeclaredSum, TypeDeclaration, RecordDeclaration, OpInfo,
-                                     EffectInfo, Signature, Assumption, OpenScope, Brand, HoldsOf,
+                                     EffectInfo, Signature, Assumption, OpenScope, ScopedValueKind, ScopedLabel,
                                      Tasks, RigidParam, MapKeySite, Checker, DefinitionConstraint,
                                      ConstraintSite, insert_constraint, dedup_constraints, WithType,
                                      WithVar, WithEffects, WithName, WithTypes, WithEffect,
@@ -270,7 +270,7 @@ fn convert_constructor(
         new_type(reject_label_and_effects_count(c, span, name.name.name, 0, 0, over))
       } else {
         let built = NamedType({ name: name.name.name, args: converted.types });
-        { checker: note_parts(c, span, own_parts(c.carrying, built, [])), ty: built }
+        { checker: note_parts(c, span, own_parts(c.ordered_parameters, built, [])), ty: built }
       },
       None -> {
         let g: WithName = global(c, TypeSpace, name);
@@ -312,7 +312,7 @@ fn convert_constructor(
                   });
                   {
                     checker: note_type_constraints(
-                      note_parts(g.checker, span, own_parts(g.checker.carrying, built, [])),
+                      note_parts(g.checker, span, own_parts(g.checker.ordered_parameters, built, [])),
                       span,
                       qualified,
                       converted.types,
@@ -341,7 +341,7 @@ fn convert_constructor(
                       );
                       {
                         checker: note_type_constraints(
-                          note_parts(o.checker, span, own_parts(o.checker.carrying, built, [])),
+                          note_parts(o.checker, span, own_parts(o.checker.ordered_parameters, built, [])),
                           span,
                           qualified,
                           converted.types,
@@ -496,7 +496,7 @@ fn declared_record(
           type_params: vars.params,
           alias_stack: checker.alias_stack.push(qualified),
           module: declaration.owner,
-          collecting: qualified,
+          declaring_type: qualified,
         },
         declaration,
       );
@@ -508,7 +508,7 @@ fn declared_record(
         |c: Checker, f: { name: Identifier, ty: TypeExpression }|
           match field_get(fields, f.name.name) {
             Some(t) ->
-              reject_declared_brand(
+              reject_scoped_type(
                 c,
                 t,
                 type_span(f.ty),
@@ -539,7 +539,7 @@ fn declared_record(
           label_params: checker.label_params,
           alias_stack: checker.alias_stack,
           module: checker.module,
-          collecting: checker.collecting,
+          declaring_type: checker.declaring_type,
           nominals: checked.nominals.insert(qualified, record),
         },
         record: Some(record),
@@ -668,11 +668,11 @@ fn convert_bounded_effects(
 
 fn reject_marks(checker: Checker, effects: EffectsExpression) -> Checker = {
   let marked = effects.listed.fold(checker, |c: Checker, entry: EffectExpression|
-    if entry.bounded { reject_mark(c, entry.span) } else { c });
-  if effects.variable_bounded { reject_mark(marked, effects.span) } else { marked }
+    if entry.bounded { reject_bounded(c, entry.span) } else { c });
+  if effects.variable_bounded { reject_bounded(marked, effects.span) } else { marked }
 }
 
-fn reject_mark(checker: Checker, span: Span) -> Checker =
+fn reject_bounded(checker: Checker, span: Span) -> Checker =
   report_error_at(
     checker,
     b"E0466",
@@ -1047,7 +1047,7 @@ fn scope_brand(ty: Type) -> Option<Bytes> =
     VariableType(_) -> None,
   }
 
-fn reject_declared_brand(
+fn reject_scoped_type(
   checker: Checker,
   ty: Type,
   span: Span,
@@ -1080,20 +1080,20 @@ fn reject_declared_brand(
       ),
   }
 
-fn scope_reach(ty: Type) -> Option<Bytes> =
+fn first_scoped_effect(ty: Type) -> Option<Bytes> =
   match ty {
     VariableType(_) -> None,
-    NamedType(c) -> first_reason(c.args, scope_reach),
-    RecordType(fs) -> first_reason(fs, |f: Field| scope_reach(f.ty)),
-    NominalType(n) -> first_reason(n.fields, |f: Field| scope_reach(f.ty)),
+    NamedType(c) -> first_reason(c.args, first_scoped_effect),
+    RecordType(fs) -> first_reason(fs, |f: Field| first_scoped_effect(f.ty)),
+    NominalType(n) -> first_reason(n.fields, |f: Field| first_scoped_effect(f.ty)),
     FunctionType(f) -> if f.effects.listed.fold(false, |b: Bool, entry: Effect|
         b || entry.effect == scoped_effect()) { Some(b"`Scoped`") }
-    else if effects_reach_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
-      match first_reason(f.params, scope_reach) { Some(b) -> Some(b), None -> scope_reach(f.ret) }
+    else if effects_include_brand(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
+      match first_reason(f.params, first_scoped_effect) { Some(b) -> Some(b), None -> first_scoped_effect(f.ret) }
     },
   }
 
-fn reject_declared_reach(
+fn reject_scoped_effect(
   checker: Checker,
   ty: Type,
   span: Span,
@@ -1101,7 +1101,7 @@ fn reject_declared_reach(
   what: Bytes,
   notes: List<Bytes>,
 ) -> Checker =
-  match scope_reach(ty) {
+  match first_scoped_effect(ty) {
     None -> checker,
     Some(reached) ->
       report_error_at(
@@ -1121,13 +1121,13 @@ fn reject_declared_reach(
       ),
   }
 
-fn variant_reach() -> List<Bytes> =
+fn variant_scoped_notes() -> List<Bytes> =
   [
     b"a declared type hides the effects of the functions it holds, so no later check could tell that this one had outlived the scope it reaches",
     b"take the effects as an effect variable instead, `type T<| e> = ..`, so it stays in the type argument, where the escape check can see it",
   ]
 
-fn operation_reach() -> List<Bytes> =
+fn operation_scoped_notes() -> List<Bytes> =
   [
     b"an operation's handler may be installed anywhere, and may keep what it is handed in a variable that outlives the scope the function reaches",
     b"take the effects as an effect variable of the operation, `write put<| e>(f: () -> Int / e) -> Unit`, which no clause can keep a function of",
@@ -1207,22 +1207,22 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                     let c3: Checker = range(0, ps.types.len()).fold(c2, |cc: Checker, i: Int| {
                       let what = b"parameter ".concat(ascii_of_int(i + 1));
                       let at = type_span(op.params.get(i));
-                      reject_declared_reach(
-                        reject_declared_brand(cc, ps.types.get(i), at, op.name.name, what),
+                      reject_scoped_effect(
+                        reject_scoped_type(cc, ps.types.get(i), at, op.name.name, what),
                         ps.types.get(i),
                         at,
                         op.name.name,
                         what,
-                        operation_reach(),
+                        operation_scoped_notes(),
                       )
                     });
-                    let c4 = reject_declared_reach(
-                      reject_declared_brand(c3, r.ty, type_span(op.ret), op.name.name, b"result"),
+                    let c4 = reject_scoped_effect(
+                      reject_scoped_type(c3, r.ty, type_span(op.ret), op.name.name, b"result"),
                       r.ty,
                       type_span(op.ret),
                       op.name.name,
                       b"result",
-                      operation_reach(),
+                      operation_scoped_notes(),
                     );
                     {
                       checker: c4,
@@ -1281,7 +1281,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                 { ..vars.checker, type_params: vars.params },
                 declaration,
               );
-              let c1: Checker = { ..own.checker, collecting: type_name };
+              let c1: Checker = { ..own.checker, declaring_type: type_name };
               let result = NamedType({
                 name: type_name,
                 args: applied_args(
@@ -1300,8 +1300,8 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                     let checked: Checker = range(0, fs.types.len()).fold(
                       fs.checker,
                       |c3: Checker, i: Int|
-                        reject_declared_reach(
-                          reject_declared_brand(
+                        reject_scoped_effect(
+                          reject_scoped_type(
                             c3,
                             fs.types.get(i),
                             type_span(variant.fields.get(i)),
@@ -1312,7 +1312,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                           type_span(variant.fields.get(i)),
                           variant.name.name,
                           b"field ".concat(ascii_of_int(i + 1)),
-                          variant_reach(),
+                          variant_scoped_notes(),
                         ),
                     );
                     let ty = if fs.types.len() == 0 { result }
@@ -1343,7 +1343,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
                 type_params: Map::new(),
                 effect_params: Map::new(),
                 label_params: Map::new(),
-                collecting: c.collecting,
+                declaring_type: c.declaring_type,
               }
             },
           }
@@ -1816,7 +1816,7 @@ pub fn note_type_constraints(
   name: Bytes,
   args: List<Type>,
 ) -> Checker / {abort.raise} =
-  if checker.collecting != b"" { checker } else {
+  if checker.declaring_type != b"" { checker } else {
     match checker.stated.get(name) {
       None -> checker,
       Some(cs) ->
@@ -1859,7 +1859,7 @@ pub fn note_type_constraint(
       assumed: assumed_for(checker, deriver),
       params: rigid_params(checker),
       called: true,
-      owner: checker.walking,
+      owner: checker.current_definition,
       stated: Some(written),
     }),
   }
@@ -1870,7 +1870,7 @@ fn note_alias_constraints(
   name: Bytes,
   args: List<Type>,
 ) -> Checker / {abort.raise} =
-  if checker.collecting == b"" { checker } else {
+  if checker.declaring_type == b"" { checker } else {
     match checker.stated.get(name) {
       None -> checker,
       Some(cs) ->
@@ -1881,7 +1881,7 @@ fn note_alias_constraints(
               {
                 ..c,
                 alias_constraints: c.alias_constraints.push({
-                  on: c.collecting,
+                  on: c.declaring_type,
                   from: name,
                   deriver: dc.deriver,
                   ty: ty,
@@ -1959,14 +1959,14 @@ pub fn note_witness_params(checker: Checker, cs: List<Constraint>) -> Checker =
       }
     })
 
-pub fn is_scheduler_handle(name: Bytes) -> Bool = name == task_name() || name == chan_name()
+pub fn is_scheduler_handle(name: Bytes) -> Bool = name == task_name() || name == builtin_channel_name()
 
 pub fn task_op(op: Bytes) -> Effect =
   { effect: b"task", resource: SingletonResource, mode: WriteMode, op: Some(op) }
 
-pub fn effects_reach_brand(effects: Effects, brand: Brand) -> Bool =
+pub fn effects_include_brand(effects: Effects, brand: ScopedValueKind) -> Bool =
   match brand {
-    HoldsOf(r) ->
+    ScopedLabel(r) ->
       effects.listed.fold(false, |b: Bool, entry: Effect|
         b || (entry.effect == scoped_effect() && entry.resource == NamedResource(r))),
     Tasks ->

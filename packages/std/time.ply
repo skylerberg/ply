@@ -201,10 +201,10 @@ pub fn parse_duration(text: String) -> Result<Duration, Error> / {abort.raise} =
 /// longer than a `Duration` can hold, are rejected, never rounded or wrapped.
 pub fn read_duration(text: String) -> Duration / {duration.fail, abort.raise} = {
   let b = Bytes::of_string(text);
-  let start = sign_width(b);
+  let start = minus_sign_width(b);
   if start >= b.len() { fail(b, Empty, start) }
   else if b.slice(start, b.len()) == b"0" { Duration(0) } else {
-    signed(
+    apply_sign(
       b,
       start,
       iterate({ at: start, below: 0 }, b.len() + 1, |s: CompoundState|
@@ -239,7 +239,7 @@ pub fn parse_iso_duration(text: String) -> Result<Duration, Error> / {abort.rais
 /// nanoseconds, or is longer than a `Duration` can hold, is rejected too.
 pub fn read_iso_duration(text: String) -> Duration / {duration.fail, abort.raise} = {
   let b = Bytes::of_string(text);
-  let start = sign_width(b);
+  let start = minus_sign_width(b);
   if start >= b.len() { fail(b, Empty, start) }
   else if b.at(start) != 80 { fail(b, MissingP, start) } else {
     let read = iterate(
@@ -247,7 +247,7 @@ pub fn read_iso_duration(text: String) -> Duration / {duration.fail, abort.raise
       b.len() + 1,
       |s: IsoState| if s.at >= b.len() { Stop(s) } else { Continue(iso_step(b, s)) },
     );
-    if read.bare { fail(b, Empty, read.at) } else { signed(b, start, read.below) }
+    if read.bare { fail(b, Empty, read.at) } else { apply_sign(b, start, read.below) }
   }
 }
 
@@ -271,10 +271,10 @@ fn fail<a>(b: Bytes, reason: ErrorKind, at: Int) -> a / {duration.fail, abort.ra
 fn characters_before(b: Bytes, at: Int) -> Int / {abort.raise} =
   range(0, at).fold(0, |count: Int, i: Int| if b.at(i) & 0xC0 == 0x80 { count } else { count + 1 })
 
-fn sign_width(b: Bytes) -> Int = if b.len() > 0 && b.at(0) == 45 { 1 } else { 0 }
+fn minus_sign_width(b: Bytes) -> Int = if b.len() > 0 && b.at(0) == 45 { 1 } else { 0 }
 
 /// The span from the nanoseconds read below zero, with the sign the text started with.
-fn signed(b: Bytes, start: Int, below: Int) -> Duration / {duration.fail, abort.raise} =
+fn apply_sign(b: Bytes, start: Int, below: Int) -> Duration / {duration.fail, abort.raise} =
   if start == 1 { Duration(below) }
   else { match checked_neg(below) { Some(n) -> Duration(n), None -> fail(b, TooLong, 0) } }
 
@@ -433,21 +433,21 @@ fn decimal_text(whole: Int, part: Int, places: Int) -> String =
 pub type Ticks = { wall: List<Int>, mono: List<Int>, last_wall: Int, last_mono: Int }
 
 /// One reading, and the ticks left to return.
-pub type Tick = { at: Int, ticks: Ticks }
+pub type ClockReading = { at: Int, ticks: Ticks }
 
 /// A fake clock that returns `wall` for `now_ms` and `mono` for `elapsed_ms`, each in order.
 pub fn ticks(wall: List<Int>, mono: List<Int>) -> Ticks =
   { wall: wall, mono: mono, last_wall: 0, last_mono: 0 }
 
 /// What `time.now_ms` returns from `t`.
-pub fn now_step(t: Ticks) -> Tick =
+pub fn now_step(t: Ticks) -> ClockReading =
   match t.wall {
     [] -> { at: t.last_wall, ticks: t },
     [first, ..rest] -> { at: first, ticks: { ..t, wall: rest, last_wall: first } },
   }
 
 /// What `time.elapsed_ms` returns from `t`.
-pub fn elapsed_step(t: Ticks) -> Tick =
+pub fn elapsed_step(t: Ticks) -> ClockReading =
   match t.mono {
     [] -> { at: t.last_mono, ticks: t },
     [first, ..rest] -> { at: first, ticks: { ..t, mono: rest, last_mono: first } },
@@ -455,17 +455,17 @@ pub fn elapsed_step(t: Ticks) -> Tick =
 
 /// What `time.elapsed_us` returns from `t`: its millisecond reading times a thousand, so a test
 /// that gives five milliseconds means five thousand microseconds.
-pub fn elapsed_us_step(t: Ticks) -> Tick = {
+pub fn elapsed_us_step(t: Ticks) -> ClockReading = {
   let step = elapsed_step(t);
   { at: step.at * 1000, ticks: step.ticks }
 }
 
 // --- The host handler -------------------------------------------------------
 
-host for time by served
+host for time by with_host
 
 /// Runs `go` with the host's clocks, and with each wait blocking the calling thread.
-fn served<a | e>(go: () -> a / {time.read, time.write | e}) -> a / {native.read | e} =
+fn with_host<a | e>(go: () -> a / {time.read, time.write | e}) -> a / {native.read | e} =
   handle {
     go()
   } with {
@@ -492,14 +492,14 @@ fn measure() -> Int / {time.elapsed_ms} = {
   since(started)
 }
 
-fn polled(interval: Int) -> Int / {time.elapsed_ms, time.sleep_ms} = {
+fn sleep_then_elapsed(interval: Int) -> Int / {time.elapsed_ms, time.sleep_ms} = {
   time.sleep_ms(interval);
   time.elapsed_ms()
 }
 
 test "a wait is an operation, so a program that polls is tested without waiting" {
   let polls = handle {
-    polled(120) + polled(120)
+    sleep_then_elapsed(120) + sleep_then_elapsed(120)
   } with {
     var waited = 0,
     time.sleep_ms(ms) -> {
@@ -627,7 +627,7 @@ type RenderCase = { nanos: Int, text: String }
 /// A text, and the error a reader rejects it with.
 type ErrorCase = { text: String, reason: ErrorKind, at: Int }
 
-fn least() -> Int = 0 - 9223372036854775807 - 1
+fn min_nanos() -> Int = 0 - 9223372036854775807 - 1
 
 test "a span has one compound text, the largest unit first and none written at zero" {
   let texts: List<RenderCase> = [
@@ -654,7 +654,7 @@ test "a span has one compound text, the largest unit first and none written at z
     { nanos: 0 - 1, text: "-1ns" },
     { nanos: 0 - 120000000000, text: "-2m" },
     { nanos: 9223372036854775807, text: "2562047h47m16.854775807s" },
-    { nanos: least(), text: "-2562047h47m16.854775808s" },
+    { nanos: min_nanos(), text: "-2562047h47m16.854775808s" },
   ];
   texts.fold((), |_: Unit, c: RenderCase| {
     assert_eq(render_duration(Duration(c.nanos)), c.text);
@@ -682,8 +682,8 @@ test "terms add in any order, and a fraction is read wherever it is whole nanose
     { nanos: 9, text: "0.0000000000025h" },
     { nanos: 1500000000, text: "1.50000000000000000000000000000s" },
     { nanos: 9223372036854775807, text: "9223372036854775807ns" },
-    { nanos: least(), text: "-9223372036854775808ns" },
-    { nanos: least(), text: "-9223372036s854775808ns" },
+    { nanos: min_nanos(), text: "-9223372036854775808ns" },
+    { nanos: min_nanos(), text: "-9223372036s854775808ns" },
   ];
   read.fold((), |_: Unit, c: RenderCase| assert_eq(parse_duration(c.text), Ok(Duration(c.nanos))))
 }
@@ -733,7 +733,7 @@ test "a span has one ISO 8601 text, in hours, minutes and seconds" {
     { nanos: 129600000000000, text: "PT36H" },
     { nanos: 0 - 120000000000, text: "-PT2M" },
     { nanos: 9223372036854775807, text: "PT2562047H47M16.854775807S" },
-    { nanos: least(), text: "-PT2562047H47M16.854775808S" },
+    { nanos: min_nanos(), text: "-PT2562047H47M16.854775808S" },
   ];
   texts.fold((), |_: Unit, c: RenderCase| {
     assert_eq(render_iso_duration(Duration(c.nanos)), c.text);

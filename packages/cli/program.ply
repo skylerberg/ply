@@ -7,10 +7,10 @@ import std.fs (fs)
 import std.time (time)
 import compiler.front.emitter_input (Rejected, Analysed, TestRunScope, view_dump,
                                      checked_program_of)
-import compiler.front.facts (Analysis, ShippedView, CheckedProgram, Frame, TableReads, ModuleShape,
-                             assembled_load, no_reads, pulled_at, statement_modules)
-import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, pins_of_load,
-                       resolved_pulling_std_with)
+import compiler.front.facts (Analysis, ShippedModuleSummary, CheckedProgram, Frame, TableReads, ModuleShape,
+                             assembled_load, no_reads, is_shipped_module, statement_modules)
+import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, locked_packages,
+                       resolved_with_shipped)
 import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FnOutline,
                             KnownDefinitionRow, KnownTestRow, ModuleDerivations)
@@ -32,7 +32,7 @@ import paths
 import proof.static_prover (UnprovedMeasure, unproved_measures)
 import proof.prover_input (measures_in)
 import sources (File, Project, DependencyPackage, Embed, load_resolved, shipping_cached,
-                shipping_of, shipped_at, all_shipped_names, no_ply_files, embeds_changed,
+                shipping_of, shipped_path, all_shipped_names, no_ply_files, embeds_changed,
                 embeds_parsed)
 import builder (builder)
 import module_queries
@@ -65,7 +65,7 @@ pub type Program = {
   inputs: Map<Bytes, Bytes>,
   shipping: ShippedInputs,
   reached: Bool,
-  shipped_views: List<ShippedView>,
+  shipped_views: List<ShippedModuleSummary>,
   tallies: List<QueryStats>,
   lost: Int,
   asked: List<Dependency>,
@@ -113,7 +113,7 @@ fn failed_program(
 ) -> Program =
   {
     files: project.files,
-    read_at: read_at(project),
+    read_at: read_paths(project),
     places: places,
     diagnostics: diagnostics,
     frame: None,
@@ -177,7 +177,7 @@ fn supplied(project: Project) -> List<SuppliedPackage> =
         { name: Bytes::of_string(file.module), src: file.text }),
     })
 
-fn read_at(project: Project) -> List<paths::RootedPath> =
+fn read_paths(project: Project) -> List<paths::RootedPath> =
   project.files.map(|file: File| file.at).concat(
     project.packages.fold([], |acc: List<paths::RootedPath>, package: DependencyPackage|
       acc.concat(package.files.map(|file: File| file.at))),
@@ -299,7 +299,7 @@ fn analysed(
   let own = project_sources(project);
   let program = {
     files: project.files,
-    read_at: read_at(project).concat(loaded.pulled.map(shipped_at)),
+    read_at: read_paths(project).concat(loaded.pulled.map(shipped_path)),
     places: own.modules.concat(
       loaded.pulled.map(|n: Bytes| shipped_place(texts, String::of_bytes_lossy(n))),
     ).concat(
@@ -375,7 +375,7 @@ fn published_rows(program: Program) -> Rows / {abort.raise} =
 pub fn own_diagnostics(diagnostics: List<Diagnostic>, frame: Frame) -> List<Diagnostic> =
   diagnostics.filter(|diagnostic: Diagnostic|
     !diagnostic.labels.any(|l: Label|
-      l.primary && pulled_at(frame.packages, frame.module_packages, l.module)))
+      l.primary && is_shipped_module(frame.packages, frame.module_packages, l.module)))
 
 pub fn program_view(program: Program) -> Option<CheckedProgram> / {abort.raise} =
   match program.frame {
@@ -402,16 +402,16 @@ pub fn whole_of(program: Program) -> Result<Analysis, List<Diagnostic>> / {abort
     },
   }
 
-pub type Parses = Map<Bytes, ParsedSource>
+pub type ParsedSources = Map<Bytes, ParsedSource>
 
 pub type Unresolved = { diagnostics: List<Diagnostic>, modules: List<Source> }
 
 fn parsed_into<| e>(
-  parses: Parses,
+  parses: ParsedSources,
   sources: List<Source>,
   parsing: (Source) -> ParsedSource / {abort.raise | e},
-) -> Parses / {abort.raise | e} =
-  sources.fold(parses, |acc: Parses, s: Source|
+) -> ParsedSources / {abort.raise | e} =
+  sources.fold(parses, |acc: ParsedSources, s: Source|
     match acc.get(s.name) {
       Some(p) -> if p.src == s.src { acc } else { acc.insert(s.name, parsing(s)) },
       None -> acc.insert(s.name, parsing(s)),
@@ -422,9 +422,9 @@ fn resolved_from(
   shipping: ShippedInputs,
   packages: PackageSources,
   embeds: List<Embed>,
-  parses: Parses,
+  parses: ParsedSources,
 ) -> Result<ResolvedProgram, Unresolved> / {abort.raise} =
-  resolved_pulling_std_with(
+  resolved_with_shipped(
     sources,
     shipping.read,
     packages,
@@ -445,8 +445,8 @@ fn supplied_sources(
 
 pub fn resolution_of(
   program: Program,
-  parses: Parses,
-) -> { resolved: Result<ResolvedProgram, List<Diagnostic>>, parses: Parses } / {abort.raise} =
+  parses: ParsedSources,
+) -> { resolved: Result<ResolvedProgram, List<Diagnostic>>, parses: ParsedSources } / {abort.raise} =
   match program.frame {
     None -> { resolved: Err(program.diagnostics), parses: parses },
     Some(_) -> {
@@ -486,8 +486,8 @@ pub fn resolution_of(
 pub fn renamed_resolution(
   paths: List<paths::ResolvedPath>,
   shipping: ShippedInputs,
-  parses: Parses,
-) -> { resolved: Result<ResolvedProgram, Unresolved>, parses: Parses } / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise, diverges} = {
+  parses: ParsedSources,
+) -> { resolved: Result<ResolvedProgram, Unresolved>, parses: ParsedSources } / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
   if project.diagnostics.len() > 0 {
     { resolved: Err({ diagnostics: project.diagnostics, modules: [] }), parses: parses }
@@ -776,7 +776,7 @@ pub fn pins_for(
     Err({ diagnostics: project.diagnostics, places: own_places(project) })
   } else {
     let packages = packages_of(project);
-    match pins_of_load(
+    match locked_packages(
         project.sources,
         packages,
         embeds_parsed(project).map(|e: Embed| e.embedded),
@@ -939,7 +939,7 @@ pub fn pulled_modules(frame: Frame) -> Map<Bytes, Bool> =
     |acc: { i: Int, pulled: Map<Bytes, Bool> }, o: Outline|
       {
         i: acc.i + 1,
-        pulled: if pulled_at(frame.packages, frame.module_packages, acc.i) {
+        pulled: if is_shipped_module(frame.packages, frame.module_packages, acc.i) {
           acc.pulled.insert(o.name, true)
         } else { acc.pulled },
       },
@@ -963,9 +963,9 @@ pub fn location_of(program: Program, location: Location) -> Option<String> / {ab
     },
   }
 
-type Picking = { seen: Map<Bytes, Bool>, out: List<DefinitionInfo> }
+type DefinitionSelection = { seen: Map<Bytes, Bool>, out: List<DefinitionInfo> }
 
-fn pick(acc: Picking, by_name: Map<Bytes, DefinitionInfo>, name: Bytes) -> Picking =
+fn pick(acc: DefinitionSelection, by_name: Map<Bytes, DefinitionInfo>, name: Bytes) -> DefinitionSelection =
   match acc.seen.get(name) {
     Some(_) -> acc,
     None -> match by_name.get(name) {
@@ -985,13 +985,13 @@ pub fn definitions_in_order(view: CheckedProgram) -> List<DefinitionInfo> = {
       acc.insert(definition_info.name, definition_info),
   );
   let a_definition = view.frame.outlines.fold([], module_functions);
-  let first: Picking = a_definition.fold(
+  let first: DefinitionSelection = a_definition.fold(
     { seen: Map::new(), out: [] },
-    |acc: Picking, name: Bytes| pick(acc, by_name, name),
+    |acc: DefinitionSelection, name: Bytes| pick(acc, by_name, name),
   );
-  let all: Picking = view.checked.definitions.fold(
+  let all: DefinitionSelection = view.checked.definitions.fold(
     first,
-    |acc: Picking, definition_info: DefinitionInfo| pick(acc, by_name, definition_info.name),
+    |acc: DefinitionSelection, definition_info: DefinitionInfo| pick(acc, by_name, definition_info.name),
   );
   all.out
 }
@@ -1096,7 +1096,7 @@ pub fn direct_callers(tables: Tables, name: Bytes) -> List<Bytes> / {abort.raise
   n.functions.concat(n.items)
 }
 
-pub fn specs_of(tables: Tables, name: Bytes) -> Int =
+pub fn specialization_count(tables: Tables, name: Bytes) -> Int =
   match tables.specs.get(name) { Some(n) -> n, None -> 0 }
 
 pub fn short_of(hex_text: String) -> String / {abort.raise} = hex_text.slice(0, 12)

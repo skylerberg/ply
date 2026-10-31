@@ -810,7 +810,7 @@ fn bin_put(at: Context, t: Type, w: String, x: String) -> String / {abort.raise}
   match t {
     Record(fields) ->
       fields.fold(w, |acc: String, f: Field| bin_put(at, f.ty, acc, x ++ "." ++ f.name)),
-    _ -> bin_call(at, t, "put", [w, x]),
+    _ -> binary_codec_call(at, t, "put", [w, x]),
   }
 
 /// The read of a value of the type `t` at `from`: a record's fields in place. `path` keeps the
@@ -818,13 +818,13 @@ fn bin_put(at: Context, t: Type, w: String, x: String) -> String / {abort.raise}
 fn bin_take(at: Context, t: Type, from: String, path: String) -> String / {abort.raise} =
   match t {
     Record(fields) -> record_take(at, fields, from, path),
-    _ -> bin_call(at, t, "take", [at.fresh ++ "d", from]),
+    _ -> binary_codec_call(at, t, "take", [at.fresh ++ "d", from]),
   }
 
 /// The call of `member` (`put` or `take`) of the codec of `t`, which is not a record, on `args`.
 /// It calls `std.bin`'s function for a scalar, or for a builtin type with the functions of its
 /// parts; the definition of a type on the cycle; and a dictionary's field for any other type.
-fn bin_call(at: Context, t: Type, member: String, args: List<String>) -> String / {abort.raise} = {
+fn binary_codec_call(at: Context, t: Type, member: String, args: List<String>) -> String / {abort.raise} = {
   let through = ||
     "(" ++ codec(at, t, type_text(t)) ++ "." ++ member ++ ")(" ++ String::join(args, ", ") ++ ")";
   match bin_scalar(t) {
@@ -1077,10 +1077,10 @@ fn bin_sum(
 /// How a field of a row is read: by the named `std.sql` reader, as an `Option` of an inner read, as
 /// an array read by the named reader, as the document it contains, or through the type's own JSON
 /// codec.
-pub type RowRead = | Scalar(String) | Optional(RowRead) | Array(String) | Document | ByJson(Type)
+pub type ColumnRead = | Scalar(String) | Optional(ColumnRead) | Array(String) | Document | ByJson(Type)
 
 /// A column of a record's row: the field's name and how it is read.
-pub type RowColumn = { name: String, read: RowRead }
+pub type RowColumn = { name: String, read: ColumnRead }
 
 /// The columns `derive sql` reads the declaration's target from, in field order. The checker
 /// compares a statement's columns against these. `None` when the target is not a record.
@@ -1132,7 +1132,7 @@ fn row_scalar(t: Type) -> Option<String> =
     _ -> None,
   }
 
-fn row_read(at: Context, t: Type, left: Int) -> RowRead / {abort.raise} = {
+fn row_read(at: Context, t: Type, left: Int) -> ColumnRead / {abort.raise} = {
   let resolved = resolve_aliases(at, t);
   match row_scalar(resolved) {
     Some(reader) -> Scalar(reader),
@@ -1152,8 +1152,8 @@ fn row_read(at: Context, t: Type, left: Int) -> RowRead / {abort.raise} = {
 }
 
 /// Whether a field of this type is stored as a document through its JSON codec.
-fn row_by_json(read: RowRead) -> Bool =
-  match read { ByJson(_) -> true, Optional(inner) -> row_by_json(inner), _ -> false }
+fn reads_through_json(read: ColumnRead) -> Bool =
+  match read { ByJson(_) -> true, Optional(inner) -> reads_through_json(inner), _ -> false }
 
 /// How a row's documents refer to `std.json`: by the name the module imports it as, which a row
 /// with a field stored through its JSON codec needs. Empty for any other derivation.
@@ -1172,7 +1172,7 @@ fn json_module_of(
   };
   let wanted = format == Row
     && (match record_fields(target) {
-      Some(fields) -> fields.any(|f: Field| row_by_json(row_read(at, f.ty, 8))),
+      Some(fields) -> fields.any(|f: Field| reads_through_json(row_read(at, f.ty, 8))),
       None -> false,
     });
   if !wanted { Ok("") } else {
@@ -1189,7 +1189,7 @@ fn json_module_of(
 }
 
 /// The reader of a field read this way, as an expression the module can write.
-fn row_reader(at: Context, read: RowRead) -> String / {abort.raise} =
+fn row_reader(at: Context, read: ColumnRead) -> String / {abort.raise} =
   match read {
     Scalar(reader) -> at.runtime ++ reader ++ "()",
     Optional(inner) -> at.runtime ++ "optional_field(" ++ row_reader(at, inner) ++ ")",
@@ -1256,7 +1256,7 @@ fn declaring(target: String, types: List<TypeDeclaration>, binder: String) -> De
     imports: [{ module: "std.json", binder: "json" }],
   }
 
-fn written(r: Result<String, Refused>) -> String =
+fn derived_text(r: Result<String, Refused>) -> String =
   match r { Ok(text) -> text, Err(rejected) -> "rejected: " ++ rejected.message }
 
 test "a codec is built from its fields' codecs: a scalar's from its module, a derived type's by name" {
@@ -1265,10 +1265,10 @@ test "a codec is built from its fields' codecs: a scalar's from its module, a de
     { name: "qty", ty: named("Int", []) },
   ]);
   let order = record("Order", [{ name: "lines", ty: named("List", [named("Line", [])]) }]);
-  let json = written(derive_json(declaring("Order", [line, order], "json")));
+  let json = derived_text(derive_json(declaring("Order", [line, order], "json")));
   assert(json.starts_with("pub fn order_json() -> json::JsonCodec<Order> = "), Some(json));
   assert(json.contains("json::list_json(line_json())"), Some(json));
-  let bin = written(derive_bin(declaring("Line", [line], "bin")));
+  let bin = derived_text(derive_bin(declaring("Line", [line], "bin")));
   assert(bin.contains("bin::put_string(") && bin.contains("bin::take_int("), Some(bin))
 }
 
@@ -1281,7 +1281,7 @@ test "a codec of a parameterized type takes one for each parameter, named as the
     labels: [],
     body: Alias(Record([{ name: "inner", ty: Param("a") }])),
   };
-  let json = written(derive_json(declaring("Box", [boxed], "j")));
+  let json = derived_text(derive_json(declaring("Box", [boxed], "j")));
   assert(
     json.starts_with("fn box_json<a>(a: j::JsonCodec<a>) -> j::JsonCodec<Box<a>> = "),
     Some(json),
@@ -1314,7 +1314,7 @@ test "a field no codec can write is rejected at its field, and a variant's at it
   };
   assert_eq(at([sum], "S").at, Some("Held"));
   assert(
-    written(
+    derived_text(
       derive_bin(
         declaring("R", [record("R", [{ name: "x", ty: named("Option", [Unit]) }])], "bin"),
       ),
@@ -1337,13 +1337,13 @@ test "a codec whose type reaches itself takes how much deeper it may nest" {
       { name: "Node", fields: [named("List", [named("Tree", [])])] },
     ]),
   };
-  let json = written(derive_json(declaring("Tree", [tree], "json")));
+  let json = derived_text(derive_json(declaring("Tree", [tree], "json")));
   assert(
     json.contains("fn tree_json() -> json::JsonCodec<Tree> = tree_json_at(json::max_depth())"),
     Some(json),
   );
   assert(json.contains("tree_json_at(ddepth - 1)"), Some(json));
-  let bin = written(derive_bin(declaring("Tree", [tree], "bin")));
+  let bin = derived_text(derive_bin(declaring("Tree", [tree], "bin")));
   assert(
     bin.contains("fn tree_bin_put(") && bin.contains("fn tree_bin_take(")
       && bin.contains("fn tree_bin_shape("),
@@ -1358,7 +1358,7 @@ test "a row reads a column per field, a document through the type's own codec" {
     { name: "note", ty: named("Option", [named("String", [])]) },
     { name: "lines", ty: named("List", [named("Line", [])]) },
   ]);
-  let row = written(derive_row(declaring("Order", [line, order], "sql")));
+  let row = derived_text(derive_row(declaring("Order", [line, order], "sql")));
   assert(row.starts_with("pub fn order_row() -> sql::RowCodec<Order> = "), Some(row));
   assert(row.contains("sql::field(\"id\", sql::int_field())"), Some(row));
   assert(row.contains("sql::optional_field(sql::text_field())"), Some(row));

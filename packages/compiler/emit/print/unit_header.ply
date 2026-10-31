@@ -7,20 +7,20 @@ import compiler.emit.abi (Native, Machine, natives, machine_structs, object_stru
                           unwinding_words)
 import compiler.emit.typed_ir.handling (raise_offset, task_offset)
 import compiler.emit.roots (builtin_helper)
-import compiler.cc (tail_mark)
+import compiler.cc (runtime_part_mark)
 import compiler.emit.print.frames (chain_defined)
 import compiler.emit.print.count_functions (dup_fn, last_fn, release_fn, release_sum_fn,
-                                            release_box_fn, free_fn, inc_shared_fn,
+                                            release_box_fn, free_fn, increment_shared_fn,
                                             dec_shared_last_fn, runtime_free_fn, alloc_fn,
-                                            alloc_block_fn, release_later_fn, release_drain_fn,
+                                            alloc_block_fn, release_later_fn, drain_releases_fn,
                                             released_twice_fn, sized_box_release_fn,
                                             never_lifted_fn, never_lifted_runtime_fn,
                                             never_shown_fn, never_shown_rt_fn, call_text, calls)
-import compiler.emit.release (immediate_functions, box_functions, scalar_box_words)
+import compiler.emit.release (uncounted_functions, box_functions, scalar_box_words)
 import compiler.emit.print.probe (probed_helper, probed_fn)
-import compiler.emit.print.lists (list_helpers, item_fn, leaf_fn)
+import compiler.emit.print.lists (list_helpers, item_fn, list_leaf_fn)
 import compiler.emit.print.ownership (walk_helpers, persistent_copy_fn, fresh_block_fn, unshared_fn,
-                                      mark_fn)
+                                      mark_shared_fn)
 import compiler.emit.print.wide (wide_helpers)
 import compiler.emit.print.decimal (decimal_helpers)
 
@@ -36,7 +36,7 @@ pub fn unit_header() -> Bytes / {abort.raise} =
 pub fn unit_tail(natives: List<Native>) -> Bytes / {abort.raise} = {
   let all = bound_functions().concat(natives);
   Bytes::concat_all([
-    tail_mark(),
+    runtime_part_mark(),
     b"\n",
     Bytes::concat_all(all.map(|n: Native| pointer(n).concat(b";\n"))),
     b"\nvoid ply_bind(void **fns) {\n",
@@ -431,7 +431,7 @@ fn drop_helpers() -> Bytes / {abort.raise} = {
       b"  if (--",
       depth,
       b" == 0 && ctx->release_waiting != 0) ",
-      call_text(release_drain_fn(), [b"ctx"]),
+      call_text(drain_releases_fn(), [b"ctx"]),
       b";\n",
     ]),
     b"}\n",
@@ -468,7 +468,7 @@ fn helpers() -> Bytes = {
     b"    PlyObj *h = ply_obj(ply_dup_o); uint32_t rc = h->rc; \\\n",
     b"    if (rc < UINT32_C(0x80000000)) h->rc = rc + 1; \\\n",
     b"    else if (rc < PLY_RC_FRAME) ",
-    call_text(inc_shared_fn(), [b"0", b"ply_dup_o"]),
+    call_text(increment_shared_fn(), [b"0", b"ply_dup_o"]),
     b"; \\\n",
     b"  } })\n",
     b"typedef Word (*PlyDrop)(PlyCtx *, Word);\n",
@@ -507,7 +507,7 @@ fn helpers() -> Bytes = {
 fn descriptor_helpers(tags: Bytes) -> Bytes = {
   let fn_of = |name: Bytes, body: Bytes|
     Bytes::concat_all([b"static inline Word ", name, b"(PlyCtx *ctx, Word w) { ", body, b" }\n"]);
-  let immediate = immediate_functions();
+  let immediate = uncounted_functions();
   let dup = call_text(dup_fn(), [b"w"]);
   Bytes::concat_all([
     fn_of(immediate.dup, b"(void)ctx; return w;"),
@@ -540,7 +540,7 @@ fn descriptor_helpers(tags: Bytes) -> Bytes = {
 }
 
 fn allocation() -> Bytes = {
-  let laid = abi::alloc_laid();
+  let laid = abi::alloc_layout();
   let link = ascii_of_int(laid.link_at);
   let small = Bytes::concat_all([
     b"size >= ",
@@ -695,7 +695,7 @@ test "a release takes the count, the last one dropping the block, and a checked 
   assert(defined_in(h, release_sum_fn()).index_of(ascii_of_int(pointer_floor())) != None, None);
   let boxed = defined_in(h, release_box_fn());
   assert(calls(boxed, last_fn()) && calls(boxed, free_fn()), Some(String::of_bytes_lossy(boxed)));
-  let named = [immediate_functions()].concat(scalar_box_words().map(box_functions)).fold(
+  let named = [uncounted_functions()].concat(scalar_box_words().map(box_functions)).fold(
     [],
     |acc: List<Bytes>, x: { dup: Bytes, release: Bytes }| acc.push(x.dup).push(x.release),
   );
@@ -758,7 +758,7 @@ test "a drop root nests to the release depth, then puts its block off; the outer
   assert(calls(deep, release_later_fn()), None);
   assert(done.index_of(b"ctx->release_depth") != None, None);
   assert(done.index_of(b"ctx->release_waiting") != None, None);
-  assert(calls(done, release_drain_fn()), None)
+  assert(calls(done, drain_releases_fn()), None)
 }
 
 test "the head declares the context and a block's header field by field, at their offsets" {
@@ -814,7 +814,7 @@ test "the head declares a pointer to each function the unit binds once, and the 
     ]);
     assert(t.index_of(bind) != None, Some(String::of_bytes_lossy(bind)))
   });
-  assert(t.starts_with(tail_mark()), None);
+  assert(t.starts_with(runtime_part_mark()), None);
   assert(
     h.index_of(b"extern void (*builtin_elaborated_out_str_p)(PlyCtx*, Word, Word);\n") != None,
     None,
@@ -883,11 +883,11 @@ test "each sequence the printers share is defined once in the head, which each u
   let shared = [
     probed_fn(),
     item_fn(),
-    leaf_fn(),
+    list_leaf_fn(),
     persistent_copy_fn(),
     fresh_block_fn(),
     unshared_fn(),
-    mark_fn(),
+    mark_shared_fn(),
     writable_fn(),
   ];
   assert_eq(shared.filter(|f: Bytes| h.split(f.concat(b"(")).len() != 2), []);

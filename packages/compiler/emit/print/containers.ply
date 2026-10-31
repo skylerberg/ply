@@ -8,10 +8,10 @@ import compiler.emit.representations (layout_of, pointer_layout, known_layout, n
 import compiler.emit.c (int_literal)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt,
-                             NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap,
+                             NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap, ChildSwap,
                              TailStart, Spill, NewBranch, MapRoot, NodeCount, MapHeight, NodeKey,
-                             NodeValue, NodeKid, KidMax, KidSize, NewLeaf, NewMapBranch, PairPut,
-                             PairSet, PairTake, LeafCut, BranchCut, KidOut, KidBack, KidPut,
+                             NodeValue, NodeKid, ChildMaxKey, KidSize, NewLeaf, NewMapBranch, PairPut,
+                             PairSet, PairTake, LeafSplit, BranchSplit, KidOut, KidRestore, KidPut,
                              KidDrop, MapSwap, Recast, container_layouts, header_bytes, words,
                              raw_sum, head_field, head_words, length_head, text_head, list_head,
                              node_head, map_head, array_head)
@@ -26,20 +26,20 @@ import compiler.emit.typed_ir (reps_of, Representation, AsInt, AsBool, AsFixed, 
                                OperationSignature, Convention, OwnedParam, OwnedResult,
                                is_refcounted, var_text, allocation_text, operand_representation,
                                is_boxed, base_allocation)
-import compiler.emit.layout (BranchLayout, branch_layout, rejection, first_capacity)
+import compiler.emit.layout (BranchLayout, branch_layout, rejection, minimum_list_capacity)
 import compiler.emit.typed_ir.containers (ContainerOp, NodeIntrinsic, Length, ArrayLength, InBounds,
                                           ArrayNew, ArraySet, ArrayOfList, ArrayGet, ColumnsNew,
                                           ColumnsSet, ColumnsOfList, ColumnsGet, ColumnField,
                                           ColumnOf, ItemAt, Rest, LeafOf, WithCapacity, Position,
                                           CopyOut, Retain, Element)
 import compiler.emit.print.text (Printing, InstructionContext, empty_printing, line, pad, pieces,
-                                 temp, named, name_of, arg_text, assigned, site, check, zero,
+                                 temp, named, name_of, arg_text, assigned, source_position, check, zero,
                                  part_names, unsupported, slot, nth, native_noted)
 import compiler.emit.lower.representation (leaf_span, leaves_within, leaf_values, c_values_of,
                                            representation_with)
 import compiler.emit.print.value_printing (c_type, c_types, as_word, word_as, word_to_parts,
                                            signature_types, arg_parts, values_as_words, parts_read,
-                                           values_read, layout_dups, layout_dups_at)
+                                           values_read, layout_dups, layout_retain_at)
 import compiler.emit.print.ownership (Fragment, released, duped, parts_released, dup_of,
                                       fragment_line)
 import compiler.emit.print.lists (item_read, leaf_read, list_rest, list_of_items, empty_list_alloc,
@@ -86,7 +86,7 @@ fn retained_printed(
     Some(l) -> {
       let m = words(l);
       let n = named(printing, v);
-      let counted = layout_dups_at(n.printing, l, Bytes::concat_all([b"ply_words(", n.name, b")"]));
+      let counted = layout_retain_at(n.printing, l, Bytes::concat_all([b"ply_words(", n.name, b")"]));
       line(
         counted.printing,
         p.depth,
@@ -139,14 +139,14 @@ pub fn container_op(
     Some(v) -> match op {
       Length ->
         assigned(
-          site(p, printing),
+          source_position(p, printing),
           p.depth,
           v,
           c_type(v.representation),
           Bytes::concat_all([b"(int64_t)", head_field(length_head(), object, b"len")]),
         ),
       ArrayLength ->
-        assigned(site(p, printing), p.depth, v, c_type(v.representation), array_len(object)),
+        assigned(source_position(p, printing), p.depth, v, c_type(v.representation), array_len(object)),
       InBounds ->
         assigned(
           printing,
@@ -211,7 +211,7 @@ pub fn container_op(
           v.ty,
         )
       },
-      Position -> position_printed(p, printing, v, args),
+      Position -> find_bytes_printed(p, printing, v, args),
       CopyOut -> match args.at(0) {
         Some(n) -> taken_printed(p, printing, v, n),
         None ->
@@ -234,7 +234,7 @@ fn strided_slot(obj: Bytes, from: Int, k: Bytes, stride: Int, j: Int) -> Bytes =
   slot_of(obj, run_start(from + j, k, stride))
 
 fn run_start(from: Int, k: Bytes, stride: Int) -> Bytes =
-  if stride == 1 { past(from, k) }
+  if stride == 1 { offset_by(from, k) }
   else { Bytes::concat_all([ascii_of_int(from), b" + (", k, b") * ", ascii_of_int(stride)]) }
 
 type PairLayout = { key: Element, value: Element, pair: Int, branch: BranchLayout }
@@ -304,7 +304,7 @@ fn intrinsic_printed(
   let a = name_of(held, v);
   let at = |k: Bytes| slot_of(a, k);
   let written = |text: Bytes| line(held, p.depth, text);
-  let owned = |copied: Option<Bytes>| writable(held, p.depth, a, operand_type(args, 0), copied);
+  let owned = |copied: Option<Bytes>| copy_unless_unique(held, p.depth, a, operand_type(args, 0), copied);
   let shifted = |from: Bytes, n: Bytes, by: Bytes|
     Bytes::concat_all([
       b"memmove(&",
@@ -373,7 +373,7 @@ fn intrinsic_printed(
         v,
         item_values(o, first, i, item_element(printing, v.ty), v.representation),
       ),
-    OfList(KidAt) -> read(slot_of(o, past(first, i))),
+    OfList(KidAt) -> read(slot_of(o, offset_by(first, i))),
     OfList(NewBranch) ->
       assigned(
         printing,
@@ -406,9 +406,9 @@ fn intrinsic_printed(
         empty_list_alloc(
           Bytes::concat_all([
             b"(2 * n > ",
-            ascii_of_int(first_capacity()),
+            ascii_of_int(minimum_list_capacity()),
             b" ? 2 * n : ",
-            ascii_of_int(first_capacity()),
+            ascii_of_int(minimum_list_capacity()),
             b")",
           ]),
           e.stride,
@@ -488,8 +488,8 @@ fn intrinsic_printed(
         strided_values(o, first + l.key.stride, i, l.pair, v.representation),
       )
     },
-    OfMap(NodeKid) -> read(slot_of(o, past(first, i))),
-    OfMap(KidMax) -> {
+    OfMap(NodeKid) -> read(slot_of(o, offset_by(first, i))),
+    OfMap(ChildMaxKey) -> {
       let l = pl();
       parts_declared(
         p,
@@ -499,7 +499,7 @@ fn intrinsic_printed(
       )
     },
     OfMap(KidSize) ->
-      raw(Bytes::concat_all([b"ply_imm_value(", slot_of(o, past(pl().branch.sizes, i)), b")"])),
+      raw(Bytes::concat_all([b"ply_imm_value(", slot_of(o, offset_by(pl().branch.sizes, i)), b")"])),
     OfMap(NewLeaf) -> made(laid.tree.leaf, laid.tree.width * pl().pair),
     OfMap(NewMapBranch) -> made(laid.tree.branch, pl().branch.words),
     OfMap(PairPut) -> {
@@ -510,7 +510,7 @@ fn intrinsic_printed(
         p.depth,
         Bytes::concat_all([
           shifted(
-            past(first, Bytes::concat_all([index, b" * ", ps])),
+            offset_by(first, Bytes::concat_all([index, b" * ", ps])),
             Bytes::concat_all([b"(", after(b""), b") * ", ps]),
             ps,
           ),
@@ -544,7 +544,7 @@ fn intrinsic_printed(
         operand_arg(args, 3),
       )
     },
-    OfMap(KidBack) -> {
+    OfMap(KidRestore) -> {
       let l = pl();
       let maxed = replaced(
         owned(None),
@@ -559,11 +559,11 @@ fn intrinsic_printed(
         maxed,
         p.depth,
         Bytes::concat_all([
-          at(past(first, i)),
+          at(offset_by(first, i)),
           b" = ",
           operand(printing, args, 2),
           b"; ",
-          at(past(l.branch.sizes, i)),
+          at(offset_by(l.branch.sizes, i)),
           b" = ply_imm(",
           operand(printing, args, 4),
           b");",
@@ -578,20 +578,20 @@ fn intrinsic_printed(
         owned(None),
         p.depth,
         Bytes::concat_all([
-          shifted(past(first, i), n, b"1"),
+          shifted(offset_by(first, i), n, b"1"),
           shifted(
             run_start(l.branch.keys, index, ks),
             Bytes::concat_all([b"(", n, b") * ", ascii_of_int(ks)]),
             ascii_of_int(ks),
           ),
-          shifted(past(l.branch.sizes, i), n, b"1"),
-          at(past(first, i)),
+          shifted(offset_by(l.branch.sizes, i), n, b"1"),
+          at(offset_by(first, i)),
           b" = ",
           operand(printing, args, 2),
           b"; ",
           strided_set(printing, a, l.branch.keys, i, ks, l.key, operand_arg(args, 3)),
           b" ",
-          at(past(l.branch.sizes, i)),
+          at(offset_by(l.branch.sizes, i)),
           b" = ply_imm(",
           operand(printing, args, 4),
           b"); ",
@@ -605,7 +605,7 @@ fn intrinsic_printed(
       let ks = l.key.stride;
       let n = after(b" - 1");
       let next = index.concat(b" + 1");
-      let kid = fragment_line(p.depth, released(owned(None), node, AsWord, [at(past(first, i))]));
+      let kid = fragment_line(p.depth, released(owned(None), node, AsWord, [at(offset_by(first, i))]));
       let key = fragment_line(
         p.depth,
         parts_released(
@@ -618,13 +618,13 @@ fn intrinsic_printed(
         key,
         p.depth,
         Bytes::concat_all([
-          shifted(past(first, next), n, b"-1"),
+          shifted(offset_by(first, next), n, b"-1"),
           shifted(
             run_start(l.branch.keys, next, ks),
             Bytes::concat_all([b"(", n, b") * ", ascii_of_int(ks)]),
             Bytes::concat_all([b"-", ascii_of_int(ks)]),
           ),
-          shifted(past(l.branch.sizes, next), n, b"-1"),
+          shifted(offset_by(l.branch.sizes, next), n, b"-1"),
           nh(a, b"len"),
           b" -= 1;",
         ]),
@@ -655,7 +655,7 @@ fn record_printed(
   let at = |k: Bytes| slot_of(a, k);
   let first = laid.trie.first;
   let pairs = || pair_layout(printing, operand_type(args, 0));
-  let started = writable(
+  let started = copy_unless_unique(
     line(
       held.printing,
       d,
@@ -728,7 +728,7 @@ fn record_printed(
         |old: Bytes| [whole(b"list", a), whole(b"old", old)],
       )
     },
-    OfList(KidSwap) ->
+    OfList(ChildSwap) ->
       took(
         |old: Bytes|
           Bytes::concat_all([
@@ -741,13 +741,13 @@ fn record_printed(
             b") ",
             old,
             b" = ",
-            at(past(first, i)),
+            at(offset_by(first, i)),
             b"; else ",
             nh(a, b"len"),
             b" = (uint32_t)(",
             i,
             b") + 1; ",
-            at(past(first, i)),
+            at(offset_by(first, i)),
             b" = ",
             operand(printing, args, 2),
             b";",
@@ -784,7 +784,7 @@ fn record_printed(
     OfMap(PairTake) -> {
       let l = pairs();
       let ps = ascii_of_int(l.pair);
-      let start = past(first, Bytes::concat_all([index, b" * ", ps]));
+      let start = offset_by(first, Bytes::concat_all([index, b" * ", ps]));
       let words = range(0, l.pair).fold(
         { printing: started, names: [] },
         |acc: { printing: Printing, names: List<Bytes> }, j: Int| {
@@ -828,11 +828,11 @@ fn record_printed(
         { name: b"value", words: words.names.drop(l.key.stride), item: true },
       ])
     },
-    OfMap(LeafCut) -> {
+    OfMap(LeafSplit) -> {
       let l = pairs();
       cut(laid.tree.leaf, laid.tree.width * l.pair, [{ from: first, width: l.pair }])
     },
-    OfMap(BranchCut) -> {
+    OfMap(BranchSplit) -> {
       let l = pairs();
       cut(laid.tree.branch, l.branch.words, [
         { from: first, width: 1 },
@@ -847,9 +847,9 @@ fn record_printed(
             b"Word ",
             kid,
             b" = ",
-            at(past(first, i)),
+            at(offset_by(first, i)),
             b"; ",
-            at(past(first, i)),
+            at(offset_by(first, i)),
             b" = 0;",
           ]),
         |kid: Bytes| [whole(b"kid", kid), whole(b"node", a)],
@@ -935,9 +935,9 @@ fn fields_set(
 
 fn slot_of(w: Bytes, at: Bytes) -> Bytes = Bytes::concat_all([b"ply_words(", w, b")[", at, b"]"])
 
-fn past(from: Int, at: Bytes) -> Bytes = Bytes::concat_all([ascii_of_int(from), b" + (", at, b")"])
+fn offset_by(from: Int, at: Bytes) -> Bytes = Bytes::concat_all([ascii_of_int(from), b" + (", at, b")"])
 
-fn writable(
+fn copy_unless_unique(
   printing: Printing,
   depth: Int,
   a: Bytes,
@@ -1011,7 +1011,7 @@ fn array_new(
   let xs = arg_parts(printing, x);
   let r = operand_representation(x);
   let d = p.depth;
-  let started = assigned(site(p, printing), d, v, c_type(v.representation), b"0");
+  let started = assigned(source_position(p, printing), d, v, c_type(v.representation), b"0");
   let a = name_of(started, v);
   let opened = line(
     started,
@@ -1074,7 +1074,7 @@ fn array_set(
   let r = operand_representation(x);
   let d = p.depth;
   let started = assigned(
-    site(p, printing),
+    source_position(p, printing),
     d,
     v,
     c_type(v.representation),
@@ -1095,9 +1095,9 @@ fn array_set(
     n.name,
   );
   let raised = line(raising.printing, d + 1, Bytes::concat_all([a, b" = 0; ", raising.text]));
-  let writable = array_writable(line(raised, d, b"} else {"), d + 1, a, n.name, e, v.ty);
+  let copy_unless_unique = array_writable(line(raised, d, b"} else {"), d + 1, a, n.name, e, v.ty);
   let replaced = parts_released(
-    writable,
+    copy_unless_unique,
     layout_parts(printing.constructors, ty, e.layout, 0),
     element_slots(a, i, e),
   );
@@ -1175,7 +1175,7 @@ fn array_of_list(
   let l = operand(printing, args, 0);
   let listed = list_type(ty);
   let d = p.depth;
-  let count = temp(site(p, printing));
+  let count = temp(source_position(p, printing));
   let n = count.name;
   let started = assigned(
     line(
@@ -1284,7 +1284,7 @@ fn index_check(
   i: Bytes,
 ) -> Printing / {abort.raise} = {
   let length = array_len(a);
-  let raising = rejected(site(p, printing), what, i, length);
+  let raising = rejected(source_position(p, printing), what, i, length);
   line(
     raising.printing,
     p.depth,
@@ -1302,7 +1302,7 @@ fn index_check(
   )
 }
 
-fn position_printed(
+fn find_bytes_printed(
   p: InstructionContext,
   printing: Printing,
   v: Var,
@@ -1315,7 +1315,7 @@ fn position_printed(
   let words = operand(printing, args, 4);
   let d = p.depth;
   let len = Bytes::concat_all([b"(int64_t)", head_field(text_head(), b, b"len")]);
-  let raising = rejected(site(p, printing), b"Bytes::position", from, len);
+  let raising = rejected(source_position(p, printing), b"Bytes::position", from, len);
   let guarded = line(
     raising.printing,
     d,
@@ -1355,7 +1355,7 @@ fn position_printed(
   let called = temp(opened);
   let inside = { ..p, depth: d + 1 };
   let asked = line(
-    site(inside, called.printing),
+    source_position(inside, called.printing),
     d + 1,
     Bytes::concat_all([
       call_text(dup_fn(), [f]),
@@ -1435,7 +1435,7 @@ fn columns_new(
   let r = operand_representation(x);
   let ws = values_as_words(xs, c_values_of(r));
   let d = p.depth;
-  let started = assigned(site(p, printing), d, v, c_type(v.representation), b"0");
+  let started = assigned(source_position(p, printing), d, v, c_type(v.representation), b"0");
   let c = name_of(started, v);
   let opened = line(
     started,
@@ -1492,7 +1492,7 @@ fn columns_of_list(
   let l = operand(printing, args, 0);
   let listed = list_type(ty);
   let d = p.depth;
-  let count = temp(site(p, printing));
+  let count = temp(source_position(p, printing));
   let n = count.name;
   let started = assigned(
     line(
@@ -1605,7 +1605,7 @@ fn columns_set(
   let ws = values_as_words(xs, c_values_of(r));
   let d = p.depth;
   let started = assigned(
-    site(p, printing),
+    source_position(p, printing),
     d,
     v,
     c_type(v.representation),
@@ -1678,9 +1678,9 @@ fn columns_set(
       d + 1,
       Bytes::concat_all([b"{ Word ", col.name, b" = ", slot_of(c, ascii_of_int(f)), b";"]),
     );
-    let writable = array_writable(held, d + 2, col.name, n.name, e, column_type(f));
+    let copy_unless_unique = array_writable(held, d + 2, col.name, n.name, e, column_type(f));
     let replaced = parts_released(
-      writable,
+      copy_unless_unique,
       layout_parts(printing.constructors, element_type(column_type(f)), e.layout, 0),
       element_slots(col.name, i, e),
     );

@@ -60,7 +60,7 @@
 //!
 //! An entry's path is whatever the archive says. `plan` returns the operations that extract a
 //! list of entries beneath a root, or the entry that may not be extracted and why. It is
-//! `std.tar`'s plan, with the same rules and the same `Operation`, `UnsafeEntry` and `Danger`
+//! `std.tar`'s plan, with the same rules and the same `Operation`, `UnsafeEntry` and `UnsafeReason`
 //! types. It also rejects a path or a link with a backslash or a drive letter, which the systems
 //! zip came from read as a different location. A symbolic link's target is its data, and a FIFO,
 //! a device or a socket is kept as an `Other` that no plan creates. `tar::extract` carries out a
@@ -80,7 +80,7 @@ import std.option
 import std.result
 import std.string
 import std.tar
-import std.tar (tar, Absolute, Backslash, Danger, Drive, Escapes, LinkEscapes, MakeDirectory,
+import std.tar (tar, Absolute, Backslash, UnsafeReason, Drive, Escapes, LinkEscapes, MakeDirectory,
                 MakeSymlink, NoName, Operation, Special, ThroughLink, UnsafeEntry, WriteFile)
 import std.time (nanos_at)
 import std.gen
@@ -101,7 +101,7 @@ pub type Kind =
 pub type Field = new { id: Int, data: Bytes }
 
 /// The instants an archive records for a member besides its wall-clock time, each if recorded.
-pub type Times = new {
+pub type MemberTimes = new {
   modified: Option<Instant>,
   accessed: Option<Instant>,
   created: Option<Instant>,
@@ -122,7 +122,7 @@ pub type Header = new {
   modified: Option<DateTime>,
   /// From an extended timestamp field, which stores the modification time to the second, or an
   /// NTFS field, which stores all three to a tenth of a microsecond and takes precedence.
-  times: Times,
+  times: MemberTimes,
   comment: String,
   /// The extra fields not covered above, in the directory's order: an owner, a vendor's own.
   extra: List<Field>,
@@ -394,7 +394,7 @@ fn utf8(where: Int, raw: Bytes) -> String / {zip.fail, abort.raise} =
   if raw.is_utf8() { String::of_bytes(raw) } else { fail(where, NotUtf8) }
 
 /// A name or a comment no flag marks, decoded as `names` directs.
-fn unflagged(raw: Bytes, names: NameEncoding) -> String / {abort.raise} =
+fn decode_unflagged(raw: Bytes, names: NameEncoding) -> String / {abort.raise} =
   if names == Utf8IfValid && raw.is_utf8() { String::of_bytes(raw) } else { of_cp437(raw) }
 
 // --- Times ----------------------------------------------------------------------
@@ -452,7 +452,7 @@ fn ticks_of(at: Option<Instant>) -> Option<Int> =
     },
   }
 
-fn no_times() -> Times = { modified: None, accessed: None, created: None }
+fn no_times() -> MemberTimes = { modified: None, accessed: None, created: None }
 
 /// An instant's seconds from the Unix epoch, if it is a whole number of seconds that fits in a
 /// signed 32-bit field.
@@ -468,7 +468,7 @@ fn whole_seconds(at: Option<Instant>) -> Option<Int> =
   }
 
 /// The instants an NTFS field's data contains.
-fn ntfs_times(where: Int, data: Bytes) -> Times / {zip.fail, abort.raise} =
+fn ntfs_times(where: Int, data: Bytes) -> MemberTimes / {zip.fail, abort.raise} =
   if data.len() < 4 { fail(where, BadExtra) } else {
     let attributes = fields(data.slice(4, data.len()));
     match field(attributes.found, 1) {
@@ -484,7 +484,7 @@ fn ntfs_times(where: Int, data: Bytes) -> Times / {zip.fail, abort.raise} =
   }
 
 /// The instants a directory header's extra fields contain.
-fn times_of(where: Int, extra: List<Field>) -> Times / {zip.fail, abort.raise} = {
+fn times_of(where: Int, extra: List<Field>) -> MemberTimes / {zip.fail, abort.raise} = {
   let stamped = match field(extra, 0x5455) {
     None -> None,
     Some(data) -> if data.len() < 1 { fail(where, BadExtra) }
@@ -512,7 +512,7 @@ fn times_of(where: Int, extra: List<Field>) -> Times / {zip.fail, abort.raise} =
 /// The extra field that stores `times`: nothing when there are none, an extended timestamp for a
 /// modification time alone that it can store exactly, and an NTFS field for anything else. `None`
 /// when no field can store them.
-fn times_field(times: Times) -> Option<Bytes> = {
+fn times_field(times: MemberTimes) -> Option<Bytes> = {
   let one_member_archive = if times.accessed == None && times.created == None {
     whole_seconds(times.modified)
   } else { None };
@@ -802,7 +802,7 @@ fn path_and_kind(
   let unicode = if flagged { None } else { unicode_path(r) };
   let stored = match unicode { Some(text) -> text, None -> r.name };
   let slashed = stored.ends_with(b"/");
-  let spelled = if slashed { stored.slice(0, tar::unslashed_length(stored, stored.len())) }
+  let spelled = if slashed { stored.slice(0, tar::slash_trimmed_length(stored, stored.len())) }
   else { stored };
   let host = r.made >> 8;
   let unix = host == 3 || host == 19;
@@ -814,7 +814,7 @@ fn path_and_kind(
   else if bits == 10 { Symlink }
   else { Other(bits) };
   {
-    path: if flagged || unicode != None { utf8(where, spelled) } else { unflagged(spelled, names) },
+    path: if flagged || unicode != None { utf8(where, spelled) } else { decode_unflagged(spelled, names) },
     kind: kind,
     mode: if unix { r.external >> 16 & 0xFFF }
     else { (if slashed { 493 } else { 420 }) & (if r.external & 1 == 0 { 0xFFF } else { 0x16D }) },
@@ -852,7 +852,7 @@ fn directory_entry(
           modified: from_dos_time(r.date, r.time),
           times: times_of(where, r.extra),
           comment: if r.flags & 0x800 != 0 { utf8(where, r.comment) }
-          else { unflagged(r.comment, names) },
+          else { decode_unflagged(r.comment, names) },
           extra: r.extra.filter(|f: Field| !is_known_field(f.id)),
         },
         name: r.name,
@@ -875,7 +875,7 @@ type ListingState = {
   at: Int,
   listed: List<DirectoryEntry>,
   names: Map<String, Unit>,
-  least: Map<Int, Int>,
+  minimum_sizes: Map<Int, Int>,
   total: Int,
 }
 
@@ -892,7 +892,7 @@ fn walk(
     let r = read_central_header(input, w.at, where);
     let l = directory_entry(where, r, d, limits, names);
     if w.names.contains(l.header.path) { fail(where, Duplicate) }
-    else if w.least.contains(l.at) { fail(where, Overlaps) }
+    else if w.minimum_sizes.contains(l.at) { fail(where, Overlaps) }
     else if l.size > limits.total - w.total { fail(where, TooMuch) } else {
       walk(
         input,
@@ -903,7 +903,7 @@ fn walk(
           at: w.at + r.length,
           listed: w.listed.push(l),
           names: w.names.insert(l.header.path, ()),
-          least: w.least.insert(l.at, 30 + r.name.len() + l.stored),
+          minimum_sizes: w.minimum_sizes.insert(l.at, 30 + r.name.len() + l.stored),
           total: w.total + l.size,
         },
         left - 1,
@@ -952,11 +952,11 @@ pub fn listing(
       d,
       limits,
       names,
-      { at: 0, listed: [], names: Map::new(), least: Map::new(), total: 0 },
+      { at: 0, listed: [], names: Map::new(), minimum_sizes: Map::new(), total: 0 },
       d.entries,
     );
     if walked.at != d.size { fail(d.at + walked.at, BadDirectory) }
-    else { bounded(walked.listed, walked.least, d, limits) }
+    else { bounded(walked.listed, walked.minimum_sizes, d, limits) }
   }
 
 // --- Reading: one member --------------------------------------------------------
@@ -1386,7 +1386,7 @@ fn has_drive_letter(segment: String) -> Bool = {
 /// Why some systems would read a name as a different location, if they would: it has a
 /// backslash, or a segment anywhere in it starts like a drive. Any segment counts, since a plan's
 /// path is its segments with `.` and `..` resolved.
-fn windows_danger(name: String) -> Option<Danger> =
+fn windows_danger(name: String) -> Option<UnsafeReason> =
   if name.contains("\\") { Some(Backslash) }
   else if name.split("/").any(has_drive_letter) { Some(Drive) }
   else { None }
@@ -1396,7 +1396,7 @@ fn target(e: Entry) -> String / {abort.raise} =
   if e.header.kind == Symlink && e.data.is_utf8() { String::of_bytes(e.data) } else { "" }
 
 /// Why an entry's path, or its target, is unsafe on some systems, if either is.
-fn entry_danger(e: Entry) -> Option<Danger> / {abort.raise} =
+fn entry_danger(e: Entry) -> Option<UnsafeReason> / {abort.raise} =
   match windows_danger(e.header.path) {
     Some(reason) -> Some(reason),
     None -> windows_danger(target(e)),
@@ -1441,7 +1441,7 @@ pub fn plan(entries: List<Entry>) -> Result<List<Operation>, UnsafeEntry> / {abo
 
 /// The path beneath a root that `path` names, as `std.tar`'s `safe_path` returns it, with `Err`
 /// also for a path with a backslash or a drive letter.
-pub fn safe_path(path: String) -> Result<String, Danger> =
+pub fn safe_path(path: String) -> Result<String, UnsafeReason> =
   match windows_danger(path) { Some(reason) -> Err(reason), None -> tar::safe_path(path) }
 
 // --- Properties -----------------------------------------------------------------
@@ -1478,14 +1478,14 @@ fn drawn_date_time(pick: Int) -> DateTime =
   DateTime(Date(3652 + pick % 46751), Time(pick / 46751 % 43200 * 2000000000))
 
 /// An instant an extra field can store, or none, chosen by the low bits of `pick`.
-fn drawn_instant(pick: Int) -> Option<Instant> =
+fn random_instant(pick: Int) -> Option<Instant> =
   if pick & 3 == 0 { None }
   else if pick & 3 == 1 { Some(Instant((pick >> 2 & 0x7FFF_FFFF) * 1000000000)) }
   else { Some(Instant((pick >> 2 & 0xFFFF_FFFF_FFFF) * 100)) }
 
 /// An entry generated from the bits of `drawn_pick`, with a name made unique by `index`: its kind,
 /// path, mode, times, comment and an extra field kept as it is.
-fn drawn_entry(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
+fn random_entry(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
   // Mix the bits, whatever range a test generates its numbers from.
   let pick = drawn_pick *% 0x2545_F491_4F6C_DD1D;
   let path = spelled(pick) ++ "-" ++ index.to_string();
@@ -1501,9 +1501,9 @@ fn drawn_entry(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
       modified: if pick & 0x10_0000 == 0 { None }
       else { Some(drawn_date_time(pick >> 21 & 0x7FFF_FFFF)) },
       times: {
-        modified: drawn_instant(pick >> 22),
-        accessed: drawn_instant(pick >> 30 & 0xFFFF_FFFE),
-        created: drawn_instant(pick >> 30 & 0xFFFF_FFFE),
+        modified: random_instant(pick >> 22),
+        accessed: random_instant(pick >> 30 & 0xFFFF_FFFE),
+        created: random_instant(pick >> 30 & 0xFFFF_FFFE),
       },
       comment: if pick & 0x20_0000 == 0 { "" } else { spelled(pick >> 24) },
       extra: if pick & 0x40_0000 == 0 { [] } else { [{ id: 0xCAFE, data: data }] },
@@ -1512,12 +1512,12 @@ fn drawn_entry(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
   }
 }
 
-fn drawn_entries(picks: List<Int>, data: Bytes) -> List<Entry> =
-  enumerate(picks).map(|p: { index: Int, value: Int }| drawn_entry(p.index, p.value, data))
+fn random_entries(picks: List<Int>, data: Bytes) -> List<Entry> =
+  enumerate(picks).map(|p: { index: Int, value: Int }| random_entry(p.index, p.value, data))
 
 test "what is written reads back as the entries it was written from, by either rule for names" {
   gen::check2(gen::list(gen::any_int()), gen::bytes(), |picks: List<Int>, data: Bytes| {
-    let entries = drawn_entries(picks, data);
+    let entries = random_entries(picks, data);
     let whole = write(entries);
     decode(whole, large_limits()) == Ok(entries)
       && decode(whole, large_limits(), Declared) == Ok(entries)
@@ -1530,7 +1530,7 @@ test "an archive's last bytes find its directory, or report how many more bytes 
     gen::bytes(),
     gen::any_int(),
     |picks: List<Int>, data: Bytes, cut: Int| {
-      let whole = write(drawn_entries(picks, data));
+      let whole = write(random_entries(picks, data));
       let length = whole.len();
       let tight = { ..large_limits(), comment: 0 };
       let tail = whole.slice(length - (cut & 0x7FFF_FFFF) % (length + 1), length);
@@ -1549,7 +1549,7 @@ fn sample_segments(text: String) -> List<String> =
   ["a", "..", ".", "", "caf\u{e9}", "\u{6c34}\u{df}", "c:", text]
 
 /// A UTF-8 text as read by a reader that decodes its bytes as code page 437.
-fn misread(text: String) -> String / {abort.raise} = of_cp437(Bytes::of_string(text))
+fn utf8_as_cp437(text: String) -> String / {abort.raise} = of_cp437(Bytes::of_string(text))
 
 test "a path alone is as safe read as code page 437 as read as the UTF-8 it is" {
   gen::check2(gen::list(gen::any_int()), gen::text(), |picks: List<Int>, text: String| {
@@ -1559,8 +1559,8 @@ test "a path alone is as safe read as code page 437 as read as the UTF-8 it is" 
       "/",
     );
     match safe_path(path) {
-      Ok(safe) -> safe_path(misread(path)) == Ok(misread(safe)),
-      Err(reason) -> safe_path(misread(path)) == Err(reason),
+      Ok(safe) -> safe_path(utf8_as_cp437(path)) == Ok(utf8_as_cp437(safe)),
+      Err(reason) -> safe_path(utf8_as_cp437(path)) == Err(reason),
     }
   })
 }
@@ -2118,9 +2118,9 @@ test "a data descriptor is read in each of its forms, and must match the directo
     true,
   );
   // Without the flag a descriptor is bytes no member claims.
-  let unflagged = header_fields(file("a", b"x"), false, 1);
+  let decode_unflagged = header_fields(file("a", b"x"), false, 1);
   assert_eq(
-    decode(one_member_archive(unflagged, unflagged, b"x", short), large_limits()).err(),
+    decode(one_member_archive(decode_unflagged, decode_unflagged, b"x", short), large_limits()).err(),
     Some({ at: 32, reason: Unclaimed }),
   )
 }
@@ -2370,20 +2370,20 @@ test "a Unix mode states what a member is and its permissions, and on other syst
 
 test "an extra field stores instants, and every field this module does not read is kept as it is" {
   let second_entry_error = Instant(1704164645000000000);
-  let alone_modified: Times = { modified: Some(second_entry_error), accessed: None, created: None };
+  let alone_modified: MemberTimes = { modified: Some(second_entry_error), accessed: None, created: None };
   assert_eq(times_field(no_times()), Some(b""));
   assert_eq(times_field(alone_modified), Some(b"UT\x05\x00\x01\x25\x7d\x93\x65"));
   assert_eq(
     times_field({ modified: Some(Instant(-1000000000)), accessed: None, created: None }),
     Some(b"UT\x05\x00\x01\xff\xff\xff\xff"),
   );
-  let fine: Times = {
+  let fine: MemberTimes = {
     modified: Some(Instant(1704164645123456700)),
     accessed: Some(second_entry_error),
     created: None,
   };
-  let early: Times = { ..alone_modified, modified: Some(Instant(50)) };
-  let late: Times = { ..alone_modified, modified: Some(Instant(2147483648000000000)) };
+  let early: MemberTimes = { ..alone_modified, modified: Some(Instant(50)) };
+  let late: MemberTimes = { ..alone_modified, modified: Some(Instant(2147483648000000000)) };
   assert_eq(
     times_field(fine),
     Some(
@@ -2398,7 +2398,7 @@ test "an extra field stores instants, and every field this module does not read 
   assert_eq(times_field(early), None);
   assert_eq(times_field(late).map(|input: Bytes| input.len()), Some(36));
   let plainly = file("a", b"");
-  let timed = |times: Times| { ..plainly, header: { ..plainly.header, times: times } };
+  let timed = |times: MemberTimes| { ..plainly, header: { ..plainly.header, times: times } };
   assert_eq(read(write([timed(alone_modified)]), large_limits()), [timed(alone_modified)]);
   assert_eq(read(write([timed(fine)]), large_limits()), [timed(fine)]);
   assert_eq(encode([timed(early)]), Err({ index: 0, reason: BadTime }));
@@ -2422,7 +2422,7 @@ test "an extra field stores instants, and every field this module does not read 
   assert_eq(both([stamp_field, owner]), [
     (alone_modified, [{ id: 0x7875, data: b"\x01\x04\xe8\x03\x00\x00\x04\x64\x00\x00\x00" }]),
   ]);
-  let finer: Times = { ..alone_modified, modified: Some(Instant(1704164645123456700)) };
+  let finer: MemberTimes = { ..alone_modified, modified: Some(Instant(1704164645123456700)) };
   assert_eq(both([stamp_field, ntfs_field(133486382451234567)]), [(finer, [])]);
   assert_eq(both([stamp_field, ntfs_field(0)]), [(alone_modified, [])]);
   assert_eq(both([field_bytes(0x5455, b"\x02")]), [(no_times(), [])]);

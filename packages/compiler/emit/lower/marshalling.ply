@@ -3,7 +3,7 @@ import std.list
 import std.bytes
 import compiler.syntax.parsing (Span, dummy_span)
 import compiler.syntax.type_syntax (RaiseMode, is_raise)
-import compiler.syntax.expressions (is_exit_effect, exit_op)
+import compiler.syntax.expressions (is_exit_effect, exit_operation_name)
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, RecordType, NominalType,
                              Field, int_type, unit_type, bytes_type, string_type, encode_type,
                              bool_type, float_type, decimal_type)
@@ -31,7 +31,7 @@ import compiler.emit.lower.module_context (CallTypes, op_mode_of)
 import compiler.emit.lower.representation (representation_of, representation_with, typed_convention)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, HandlerInstance, unreachable,
                                  bound, bound_as, run_for_effect, represented_as, type_of,
-                                 pair_words, noted, static_added, read_typed)
+                                 pair_words, with_need, static_added, read_typed)
 import compiler.emit.representations (Constructors, EffectOperation, EffectName, type_variables,
                                       word_type)
 import compiler.emit.print.count_functions (never_lifted_fn, never_shown_fn)
@@ -53,7 +53,7 @@ pub fn left_to_callers(
   bound(
     context,
     types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
-      type_variables(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+      type_variables(t).fold(s, |n: Lowering, v: Int| with_need(n, { var: v, reads: Exact }))),
     types.ret,
     Op({
       op: OfHandling(UnspecialisedBuiltin(name)),
@@ -87,7 +87,7 @@ pub fn marshalling_builtin_call(
     match args {
       [x] -> {
         let word = represented_as({ st: st, arg: x }, AsWord, at);
-        let d = shown_described(context, word.st, at_type, at);
+        let d = serializable_type_descriptor(context, word.st, at_type, at);
         unit_after(native_for_effect(d.st, b"?out_carried", [word.arg, d.arg], false, at))
       },
       _ -> unreachable(b"a carried value written other than alone"),
@@ -320,7 +320,7 @@ fn marshalling_native_call(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   if m.name == b"?out_decimal" { decimal_out(context, st, args, at) }
-  else if m.name == b"?out_fixed" { fixed_out(context, st, args, at) }
+  else if m.name == b"?out_fixed" { write_fixed_width(context, st, args, at) }
   else if m.name == b"?in_decimal" { decimal_in(context, st, ty, at) }
   else if m.name == b"?in_fixed" { fixed_in(context, st, ty, at) }
   else if args.len() != m.takes.len() {
@@ -389,7 +389,7 @@ fn decimal_out(
     _ -> unreachable(b"a `Decimal` written other than alone"),
   }
 
-fn fixed_out(
+fn write_fixed_width(
   context: Context,
   st: Lowering,
   args: List<Arg>,
@@ -568,7 +568,7 @@ pub fn concatenated(
   represented_as(g, representation_of(context.setting, ty), at)
 }
 
-pub fn over_machine_words(
+pub fn machine_word_call(
   context: Context,
   st: Lowering,
   name: Bytes,
@@ -821,7 +821,7 @@ pub fn type_descriptor(
   at: Span,
 ) -> LoweredValue / {abort.raise} = described(context, st, t, false, at)
 
-pub fn shown_described(
+pub fn serializable_type_descriptor(
   context: Context,
   st: Lowering,
   t: Type,
@@ -837,7 +837,7 @@ fn described(
 ) -> LoweredValue / {abort.raise} =
   if !fully_known(t) {
     bound_as(
-      type_variables(t).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
+      type_variables(t).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Exact })),
       int_type(),
       AsInt,
       Op({
@@ -868,7 +868,7 @@ pub fn kept_descriptor(
 ) -> LoweredValue / {abort.raise} =
   if !fully_known(t) {
     bound_as(
-      type_variables(t).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
+      type_variables(t).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Exact })),
       int_type(),
       AsInt,
       Op({
@@ -908,7 +908,7 @@ pub fn operation_descriptor(
   if !params.push(result).all(fully_known) {
     {
       st: params.push(result).fold(st, |s: Lowering, t: Type|
-        type_variables(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+        type_variables(t).fold(s, |n: Lowering, v: Int| with_need(n, { var: v, reads: Exact }))),
       name: None,
     }
   } else {
@@ -930,7 +930,7 @@ pub fn operation_descriptor(
             acc.st,
             params.get(i),
             if whole(i) { [] } else { marks_of(walked.get(i).marked).marks },
-            shows_what_it_carries(eff, op),
+            serializes_parameters(eff, op),
           );
           { st: d.st, names: acc.names.push(d.name) }
         },
@@ -979,7 +979,7 @@ pub fn operation_descriptor(
     }
   }
 
-fn shows_what_it_carries(eff: Bytes, op: EffectOperation) -> Bool =
+fn serializes_parameters(eff: Bytes, op: EffectOperation) -> Bool =
   is_raise(op.mode) || (eff == b"abort" && op.name == b"raise")
 
 pub fn own_types(
@@ -1013,7 +1013,7 @@ pub fn exit_effect_named(name: Bytes) -> EffectName =
     global: name,
     operations: [
       {
-        name: exit_op(),
+        name: exit_operation_name(),
         mode: RaiseMode,
         params: [VariableType(0)],
         ret: VariableType(1),
@@ -1022,7 +1022,7 @@ pub fn exit_effect_named(name: Bytes) -> EffectName =
     ],
   }
 
-pub fn pending_raised(
+pub fn pending_abort_raise(
   context: Context,
   st: Lowering,
   word: Var,
@@ -1069,7 +1069,7 @@ fn type_static(
 ) -> { st: Lowering, name: Bytes } / {abort.raise} = {
   let spelled = encode_type(t);
   let text = static_added(st, StaticWords([BytesWord(spelled)]));
-  let marked = |op: TypeOp| keys::marked(keys::generated_key(op, t, module), marks);
+  let marked = |op: TypeOp| keys::with_marks(keys::generated_key(op, t, module), marks);
   let heads = word_form_functions(constructors, t);
   static_added(
     text.st,
@@ -1096,7 +1096,7 @@ fn type_static(
   )
 }
 
-pub fn word_form_entry(constructors: Constructors, k: RootKey) -> Fn / {abort.raise} =
+pub fn serialization_function(constructors: Constructors, k: RootKey) -> Fn / {abort.raise} =
   match k {
     Generated(w, _) -> {
       let rep = representation_with(constructors, w.ty);
