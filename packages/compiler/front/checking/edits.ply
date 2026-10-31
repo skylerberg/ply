@@ -43,46 +43,78 @@ import compiler.front.checking.groups (GroupKey, owner_key_bin, group_key_bin, o
 import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
                                 facts_of_result, checked_program_from_results, query_load,
                                 hashed_all, cycles_among, root_warnings, rejected_first,
-                                PublicationSummary, RejectionSummary, outcome_summary, reject_embed,
-                                nothing_derived, over_decoding, queried_over, queried_under,
-                                prelude_frames, lookup_input_alone, Alone, Concurrent, Turns,
-                                files_differing, Step, check_sources, check_with_pack, layered,
-                                shipped_store, pack_of)
+                                PublicationSummary, RejectionSummary, OutcomeSummary,
+                                outcome_summary, reject_embed, nothing_derived, over_decoding,
+                                queried_over, queried_under, prelude_frames, prelude_files,
+                                lookup_input_alone, queried_results, outcome_of, Step,
+                                check_sources, check_with_pack, layered, shipped_store, pack_of)
 
-fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
+type Reference = {
+  whole: OutcomeSummary,
+  fixing: CachedHashes,
+  results: List<CheckedModule>,
+  group_inputs: Option<Map<Bytes, Bytes>>,
+  hash_inputs: Option<Map<Bytes, Bytes>>,
+}
+
+fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
+  let fresh = queried_results(fresh_registry(), empty_memory_store(), sources);
+  {
+    whole: outcome_summary(analyse(parse_all(sources))),
+    fixing: fresh.fixing,
+    results: fresh.results,
+    group_inputs: inputs_over(fresh.store, sources, b"group inputs"),
+    hash_inputs: inputs_over(fresh.store, sources, b"hash inputs"),
+  }
+}
+
+fn sources_key(sources: List<Source>) -> Bytes =
+  Bytes::concat_all(sources.map(|s: Source| Bytes::concat_all([s.name, b"\x00", s.src, b"\x00"])))
+
+type EditSession = {
+  store: MemoryStore,
+  checks: Map<Bytes, Bytes>,
+  hashes: Map<Bytes, Bytes>,
+  references: Map<Bytes, Reference>,
+  off: List<Bytes>,
+}
+
+pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
   steps.fold(
-    { store: empty_memory_store(), checks: Map::new(), hashes: Map::new(), off: [] },
-    |s: { store: MemoryStore, checks: Map<Bytes, Bytes>, hashes: Map<Bytes, Bytes>, off: List<Bytes> }, step: Step| {
+    {
+      store: empty_memory_store(),
+      checks: Map::new(),
+      hashes: Map::new(),
+      references: Map::new(),
+      off: [],
+    },
+    |s: EditSession, step: Step| {
       let warm = queried_over(s.store, step.sources);
       let now = outcome_summary(warm.outcome);
-      let whole = outcome_summary(analyse(parse_all(step.sources)));
-      let fresh = queried_over(empty_memory_store(), step.sources);
-      let agrees = now == outcome_summary(fresh.outcome) && warm.fixing == fresh.fixing
-        && (match whole {
-          PublicationSummary(_) -> now == whole,
+      let key = sources_key(step.sources);
+      let r = match s.references.get(key) {
+        Some(known) -> known,
+        None -> reference_of(step.sources),
+      };
+      let same_outcome = r.results == warm.results
+        || now == outcome_summary(outcome_of(step.sources, r.results));
+      let agrees = same_outcome && warm.fixing == r.fixing
+        && (match r.whole {
+          PublicationSummary(_) -> now == r.whole,
           RejectionSummary(_) -> match now {
             RejectionSummary(_) -> true,
             PublicationSummary(_) -> false,
           },
         });
-      let checked = pulled(
-        warm.run,
-        group_query(),
-        s.checks,
-        inputs_over(fresh.store, step.sources, b"group inputs"),
-      );
-      let hashed = pulled(
-        warm.run,
-        group_hash_query(),
-        s.hashes,
-        inputs_over(fresh.store, step.sources, b"hash inputs"),
-      );
+      let checked = pulled(warm.run, group_query(), s.checks, r.group_inputs);
+      let hashed = pulled(warm.run, group_hash_query(), s.hashes, r.hash_inputs);
       {
         store: warm.store,
         checks: checked.made,
         hashes: hashed.made,
+        references: s.references.insert(key, r),
         off: if !agrees {
-          s.off.push(Bytes::concat_all([step.what, hash_differences(warm.fixing, fresh.fixing)]))
+          s.off.push(Bytes::concat_all([step.what, hash_differences(warm.fixing, r.fixing)]))
         } else {
           match checked.mismatches {
             Some(reason) -> s.off.push(Bytes::concat_all([step.what, b" (work)", reason])),
@@ -226,7 +258,7 @@ fn inputs_over(
   over_decoding(
     store,
     prelude_frames,
-    b"",
+    prelude_files(),
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     || {
       let qs = fresh_registry().insert(b"group inputs", {
@@ -1010,37 +1042,11 @@ fn drawn_sessions() -> gen::Gen<List<List<Change>>> =
   gen::and_then(gen::int_between(1, 3), |steps: Int|
     gen::list_of_length(gen::list_of(changes(), 3), steps))
 
-test "the result through the store matches the fresh one at every step of a random session of edits" {
-  gen::check(
-    drawn_sessions(),
-    |edits: List<List<Change>>| { disagreements(steps_from_edits(edits)) == [] },
-    cases: 4,
-  )
-}
-
-test "the store's files give the results the store in memory does over a random session, stored by one run alone" {
-  gen::check(
-    drawn_sessions(),
-    |edits: List<List<Change>>| { files_differing(steps_from_edits(edits), Alone) == [] },
-    cases: 4,
-  )
-}
-
-test "the store's files give the results the store in memory does over a random session, a competing run of each step storing them too" {
-  gen::check(
-    drawn_sessions(),
-    |edits: List<List<Change>>| { files_differing(steps_from_edits(edits), Concurrent) == [] },
-    cases: 4,
-  )
-}
-
-test "the store's files give the results the store in memory does over a random session, each step a `ply` of other queries" {
-  gen::check(
-    drawn_sessions(),
-    |edits: List<List<Change>>| { files_differing(steps_from_edits(edits), Turns) == [] },
-    cases: 4,
-  )
-}
+pub fn drawn_session(root: Int, size: Int) -> List<Step> / {abort.raise} =
+  match gen::sample(drawn_sessions(), root, b"edit session", size, None).value {
+    Some(edits) -> steps_from_edits(edits),
+    None -> panic("a session of edits has no condition to give up on"),
+  }
 
 fn chain_lib(label: Bytes) -> Bytes =
   Bytes::concat_all([
