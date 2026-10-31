@@ -2311,6 +2311,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply hash [path]` | each definition's hash; `--dependencies` adds what each refers to |
 | `ply definitions [path]` | every definition: location, hash, signature, effects and references; `--filter` |
 | `ply callers DEF [path]` | what refers to a definition, and every definition, test and law that depends on it |
+| `ply unused [path]` | definitions nothing uses, and those only tests and laws use; in a package with `main`, `pub` does not count as a use, and a leading `_` opts a name out |
 | `ply resolve [path]` | writes `ply.lock`, downloading registry dependencies |
 | `ply vendor [path]` | copies dependencies into `vendor/` |
 | `ply why NAME [path]` | why a package is a dependency |
