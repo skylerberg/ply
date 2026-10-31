@@ -16,8 +16,8 @@ pub struct Ctx {
     /// The lowest address a compiled frame may begin at. The watchdog raises it past every frame
     /// once the entry's clock runs out ([`watched`]).
     pub stack_floor: std::sync::atomic::AtomicUsize,
-    /// The site the body stored before a fallible call, as bytes from its root's start; the root
-    /// is `-1` until one is.
+    /// The site the body last stored, before a call or on the branch of an operation that fails,
+    /// as bytes from its root's start; the root is `-1` until one is.
     pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
