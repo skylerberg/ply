@@ -84,18 +84,35 @@ fn subject_of(w: Written) -> Subject =
     EffectKind -> DeclarationNamed(w.name),
   }
 
-fn reached(names: ReachableNames, w: Listed) -> Bool =
-  match w.kind {
-    FunctionKind -> names.functions.contains(w.name),
-    TypeKind -> names.declarations.contains(w.name),
-    EffectKind -> names.declarations.contains(w.name),
+fn reached(names: ReachableNames, name: Bytes, kind: Kind) -> Bool =
+  match kind {
+    FunctionKind -> names.functions.contains(name),
+    TypeKind -> names.declarations.contains(name),
+    EffectKind -> names.declarations.contains(name),
   }
+
+fn with_name(names: ReachableNames, name: Bytes, kind: Kind) -> ReachableNames =
+  match kind {
+    FunctionKind -> { ..names, functions: names.functions.insert(name, true) },
+    TypeKind -> { ..names, declarations: names.declarations.insert(name, true) },
+    EffectKind -> { ..names, declarations: names.declarations.insert(name, true) },
+  }
+
+fn importers_root(frame: Frame) -> Option<Bytes> =
+  match frame.manifest {
+    None -> None,
+    Some(m) -> Some(Bytes::of_string(match m.prefix { Some(p) -> p, None -> m.name })),
+  }
+
+fn as_imported(root: Option<Bytes>, name: Bytes) -> Bytes / {abort.raise} =
+  match root { Some(r) -> qualify(r, name), None -> name }
 
 fn walk_of(
   frame: Frame,
   tests: List<TestInfo>,
   laws: List<LawInfo>,
   public_is_used: Bool,
+  root: Option<Bytes>,
   located: (Location) -> Option<String> / {abort.raise},
 ) -> Walk / {abort.raise} = {
   let written = written_in_root_package(frame);
@@ -106,18 +123,25 @@ fn walk_of(
   let checks = tests.map(|t: TestInfo| ItemKeyed(t.key)).concat(
     laws.map(|l: LawInfo| ItemKeyed(l.key)),
   );
+  let imported = |names: ReachableNames|
+    written.filter(|w: Written| reached(names, w.name, w.kind)).fold(
+      names,
+      |acc: ReachableNames, w: Written| with_name(acc, as_imported(root, w.name), w.kind),
+    );
   {
-    written: written.map(|w: Written| { name: w.name, kind: w.kind, location: located(w.at) }),
-    running: used_from(frame.hashes, roots),
-    testing: used_from(frame.hashes, roots.concat(checks)),
+    written: written.map(|w: Written|
+      { name: as_imported(root, w.name), kind: w.kind, location: located(w.at) }),
+    running: imported(used_from(frame.hashes, roots)),
+    testing: imported(used_from(frame.hashes, roots.concat(checks))),
   }
 }
 
 fn judged(written: List<Listed>, running: ReachableNames, testing: ReachableNames) -> Unused =
   {
     definitions: written.len(),
-    never_used: written.filter(|w: Listed| !reached(testing, w)),
-    only_tests: written.filter(|w: Listed| reached(testing, w) && !reached(running, w)),
+    never_used: written.filter(|w: Listed| !reached(testing, w.name, w.kind)),
+    only_tests: written.filter(|w: Listed|
+      reached(testing, w.name, w.kind) && !reached(running, w.name, w.kind)),
   }
 
 fn joined(a: ReachableNames, b: ReachableNames) -> ReachableNames =
@@ -185,6 +209,7 @@ fn walked_package(
           own_tests(loaded, w),
           own_laws(loaded, w),
           public_is_used,
+          if public_is_used { None } else { importers_root(w.frame) },
           |at: Location| location_of(loaded, at),
         ),
       ),
@@ -259,19 +284,24 @@ fn analysed(sources: List<Source>) -> CheckedProgram / {abort.raise} =
       ),
   }
 
-fn walk_in(sources: List<Source>, public_is_used: Bool) -> Walk / {abort.raise} = {
+fn walk_in(
+  sources: List<Source>,
+  public_is_used: Bool,
+  root: Option<Bytes>,
+) -> Walk / {abort.raise} = {
   let analysis = analysed(sources);
   walk_of(
     analysis.frame,
     analysis.checked.tests,
     analysis.checked.laws,
     public_is_used,
+    root,
     |at: Location| None,
   )
 }
 
 fn found_in(src: String) -> Unused / {abort.raise} = {
-  let walk = walk_in([{ name: b"m", src: Bytes::of_string(src) }], true);
+  let walk = walk_in([{ name: b"m", src: Bytes::of_string(src) }], true, None);
   judged(walk.written, walk.running, walk.testing)
 }
 
@@ -315,40 +345,44 @@ test "a definition reached only through a `requires` clause is used" {
   assert_eq(found.never_used, [])
 }
 
-fn a_library(extra: Bytes) -> Source =
+fn shapes(name: Bytes, extra: Bytes) -> Source =
   {
-    name: b"lib",
+    name: name,
     src: Bytes::concat_all([b"pub fn kept() -> Int = 1\npub fn gone() -> Int = 2\n", extra]),
   }
 
 fn a_program_using_kept() -> Source =
-  { name: b"app", src: b"import lib\npub fn main() -> Int = lib::kept()\n" }
+  { name: b"app", src: b"import lib.shapes\npub fn main() -> Int = shapes::kept()\n" }
 
-test "across a workspace, a `pub` definition is used only where another package uses it" {
-  let library = walk_in([a_library(b"")], false);
-  let program = walk_in([a_library(b""), a_program_using_kept()], false);
-  let found = across_packages([library], [program]);
-  assert_eq(names(found.never_used), [b"lib.gone"]);
+fn the_library(extra: Bytes) -> Walk / {abort.raise} =
+  walk_in([shapes(b"shapes", extra)], false, Some(b"lib"))
+
+test "across a workspace, a library goes by the name its importers use" {
+  let program = walk_in([shapes(b"lib.shapes", b""), a_program_using_kept()], false, None);
+  let found = across_packages([the_library(b"")], [program]);
+  assert_eq(names(found.never_used), [b"lib.shapes.gone"]);
   assert_eq(found.only_tests, [])
 }
 
 test "across a workspace, a library's own `main` does not hide what other packages use" {
   let with_entry = b"pub fn main() -> Int = 0\n";
-  let library = walk_in([a_library(with_entry)], false);
-  let program = walk_in([a_library(with_entry), a_program_using_kept()], false);
-  assert_eq(names(across_packages([library], [program]).never_used), [b"lib.gone"])
+  let program = walk_in([shapes(b"lib.shapes", with_entry), a_program_using_kept()], false, None);
+  assert_eq(names(across_packages([the_library(with_entry)], [program]).never_used), [
+    b"lib.shapes.gone",
+  ])
 }
 
-test "across a workspace, what only another package's tests use is reported as tests' alone" {
-  let library = walk_in([a_library(b"")], false);
+test "across a workspace, what only tests use is reported, wherever those tests live" {
+  let own_test = b"test \"own\" { assert_eq(gone(), 2) }\n";
   let suite = walk_in(
     [
-      a_library(b""),
-      { name: b"suite", src: b"import lib\ntest \"t\" { assert_eq(lib::kept(), 1) }\n" },
+      shapes(b"lib.shapes", own_test),
+      { name: b"suite", src: b"import lib.shapes\ntest \"t\" { assert_eq(shapes::kept(), 1) }\n" },
     ],
     false,
+    None,
   );
-  let found = across_packages([library], [suite]);
-  assert_eq(names(found.only_tests), [b"lib.kept"]);
-  assert_eq(names(found.never_used), [b"lib.gone"])
+  let found = across_packages([the_library(own_test)], [suite]);
+  assert_eq(names(found.only_tests), [b"lib.shapes.kept", b"lib.shapes.gone"]);
+  assert_eq(found.never_used, [])
 }
