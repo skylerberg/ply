@@ -18,7 +18,7 @@ import compiler.front (ShippedInputs)
 import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.check.resolve.tables (ParsedModule, Diagnostic, Declarations, Resolution, Scope,
                                       module_of_name)
-import compiler.check.resolve.bindings (written, Written, ModuleQualifier)
+import compiler.check.resolve.bindings (written, Written, Reference, ModuleQualifier, Unbound)
 import compiler.check.infer (item_owner, decode_facts)
 import compiler.check.infer.checker (MemberSite, CachedFacts)
 import compiler.check.member (MemberTarget)
@@ -28,8 +28,8 @@ import compiler.check.typed (TypedBody, TypedExpression, TypedPattern, TypedFiel
                              TypedMatch, TypedBlock, TypedLet, TypedLetElse, TypedRecordPattern,
                              TypedCase, TypedListPattern, TypedOr, typed_expression_nodes)
 import compiler.syntax.items (parse, Module, ImportDeclaration, Item, EffectItem, ExternItem,
-                              TypeItem, SumBody, AliasBody, NominalBody, VariantDefinition,
-                              OpDefinition)
+                              FunctionItem, TypeItem, SumBody, AliasBody, NominalBody,
+                              VariantDefinition, OpDefinition, DeriveOrigin)
 import compiler.syntax.type_syntax (TypeExpression, RecordTypeExpression)
 import compiler.syntax.parsing (Identifier)
 import compiler.check.resolve.tables (qualify)
@@ -91,7 +91,28 @@ pub type Read = {
   sums: List<{ name: Bytes, variants: List<Bytes> }>,
   records: List<DeclaredRecord>,
   typed_records: Map<Bytes, Map<Int, Record>>,
+  derived: List<DeriveOrigin>,
+  derived_unbound: Map<Bytes, Bool>,
 }
+
+pub fn derived_names(origin: DeriveOrigin) -> List<Bytes> / {abort.raise} =
+  origin.written.fold([], |acc: List<Bytes>, text: Bytes|
+    parse(text).node.items.fold(acc, |names: List<Bytes>, item: Item|
+      match item { FunctionItem(d) -> names.push(d.name.name), _ -> names }))
+
+pub fn derived_unbound(
+  resolution: Resolution,
+  index: Int,
+  origins: List<DeriveOrigin>,
+) -> Map<Bytes, Bool> / {abort.raise} =
+  origins.fold(Map::new(), |acc: Map<Bytes, Bool>, origin: DeriveOrigin|
+    origin.written.fold(acc, |found: Map<Bytes, Bool>, text: Bytes|
+      written(resolution, index, numbered_module(parse(text).node)).fold(
+        found,
+        |into: Map<Bytes, Bool>, w: Written|
+          w.references.fold(into, |names: Map<Bytes, Bool>, x: Reference|
+            if x.target == Unbound { names.insert(x.name, true) } else { names }),
+      )))
 
 pub type Loaded = {
   path: ResolvedPath,
@@ -279,6 +300,7 @@ fn read_of(
   match range(0, resolved.modules.len()).find(|i: Int| resolved.modules.get(i).name == name) {
     None -> None,
     Some(index) -> {
+      let parsed = resolved.modules.get(index);
       let tree = numbered_module(parse(file.text).node);
       let targets = resolved.resolution.imports.get(index);
       let entries = entries_of(resolved.resolution, index, name, tree);
@@ -326,6 +348,8 @@ fn read_of(
             },
         ),
         records: declared_records(name, tree),
+        derived: parsed.derived,
+        derived_unbound: derived_unbound(resolved.resolution, index, parsed.derived),
         typed_records: entries.fold(Map::new(), |acc: Map<Bytes, Map<Int, Record>>, e: Entry|
           match owner_records.get(e.owner) {
             Some(sites) -> acc.insert(e.owner, sites),
