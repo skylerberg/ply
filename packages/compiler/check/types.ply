@@ -932,13 +932,13 @@ fn unify_effects_at(
   }
 }
 
-pub type Scope = { locals: Map<Int, Scheme>, names: Map<Bytes, Int>, open: List<Int> }
+pub type Scope = { locals: Map<Int, Scheme>, names: Map<Bytes, Int>, ungeneralized: List<Int> }
 
 pub type TypeEnv = { globals: Map<Bytes, Scheme>, open: List<Bytes>, scopes: List<Scope> }
 
 pub type InScope = { binder: Int, name: Bytes, sc: Scheme }
 
-fn scope_new() -> Scope = { locals: Map::new(), names: Map::new(), open: [] }
+fn scope_new() -> Scope = { locals: Map::new(), names: Map::new(), ungeneralized: [] }
 
 pub fn env_new() -> TypeEnv = { globals: Map::new(), open: [], scopes: [] }
 pub fn env_push(env: TypeEnv) -> TypeEnv = { ..env, scopes: env.scopes.push(scope_new()) }
@@ -956,7 +956,7 @@ pub fn env_bind(env: TypeEnv, name: Identifier, scheme: Scheme) -> TypeEnv / {ab
     scopes: env.scopes.set(last, {
       locals: s.locals.insert(binder, scheme),
       names: s.names.insert(name.name, binder),
-      open: s.open.push(binder),
+      ungeneralized: s.ungeneralized.push(binder),
     }),
   }
 }
@@ -1017,11 +1017,11 @@ pub fn env_free_variables(
     |acc: { scopes: List<Scope>, free: FreeVariables }, scope: Scope| {
       let kept = still_open(
         substitution,
-        scope.open,
+        scope.ungeneralized,
         |binder: Int| scope.locals.get(binder),
         acc.free,
       );
-      { scopes: acc.scopes.push({ ..scope, open: kept.open }), free: kept.free }
+      { scopes: acc.scopes.push({ ..scope, ungeneralized: kept.open }), free: kept.free }
     },
   );
   { e: { ..env, open: globals.open, scopes: walked.scopes }, free: walked.free }
@@ -1428,12 +1428,13 @@ derive bin for InternedField
 derive bin for InternedType
 
 pub type TypeInterner = {
-  held: List<InternedType>,
-  places: Map<Bytes, Int>,
-  whole: Map<Bytes, Int>,
+  nodes: List<InternedType>,
+  index_by_node: Map<Bytes, Int>,
+  index_by_type: Map<Bytes, Int>,
 }
 
-pub fn empty_interner() -> TypeInterner = { held: [], places: Map::new(), whole: Map::new() }
+pub fn empty_interner() -> TypeInterner =
+  { nodes: [], index_by_node: Map::new(), index_by_type: Map::new() }
 
 type InternedPositions = { h: TypeInterner, at: List<Int> }
 
@@ -1479,13 +1480,13 @@ fn intern_type(h: TypeInterner, ty: Type) -> { h: TypeInterner, at: Int } / {abo
     },
     NominalType(x) -> {
       let whole = bin::encode(ty, type_bin()).blake3();
-      match h.whole.get(whole) {
+      match h.index_by_type.get(whole) {
         Some(at) -> { h: h, at: at },
         None -> {
           let a = intern_parts(h, x.args);
           let p = intern_fields(a.h, x.fields);
           let n = intern_node(p.h, InternedNominal({ name: x.name, args: a.at, fields: p.fields }));
-          { h: { ..n.h, whole: n.h.whole.insert(whole, n.at) }, at: n.at }
+          { h: { ..n.h, index_by_type: n.h.index_by_type.insert(whole, n.at) }, at: n.at }
         },
       }
     },
@@ -1496,11 +1497,14 @@ fn intern_node(
   node: InternedType,
 ) -> { h: TypeInterner, at: Int } / {abort.raise} = {
   let key = bin::encode(node, interned_type_bin());
-  match h.places.get(key) {
+  match h.index_by_node.get(key) {
     Some(at) -> { h: h, at: at },
     None -> {
-      let at = h.held.len();
-      { h: { ..h, held: h.held.push(node), places: h.places.insert(key, at) }, at: at }
+      let at = h.nodes.len();
+      {
+        h: { ..h, nodes: h.nodes.push(node), index_by_node: h.index_by_node.insert(key, at) },
+        at: at,
+      }
     },
   }
 }
@@ -1512,9 +1516,9 @@ pub fn intern_more_types(
 
 pub fn intern_types(
   types: List<Type>,
-) -> { held: List<InternedType>, at: List<Int> } / {abort.raise} = {
+) -> { labels: List<InternedType>, at: List<Int> } / {abort.raise} = {
   let p = intern_parts(empty_interner(), types);
-  { held: p.h.held, at: p.at }
+  { labels: p.h.nodes, at: p.at }
 }
 
 fn interned_parts_of(node: InternedType) -> List<Int> =
@@ -1562,11 +1566,11 @@ fn numbered_from(
 pub fn interned_subset(
   h: TypeInterner,
   places: List<Int>,
-) -> { held: List<InternedType>, at: List<Int> } / {abort.raise} = {
+) -> { labels: List<InternedType>, at: List<Int> } / {abort.raise} = {
   let n = places.fold({ numbered: Map::new(), out: [] }, |acc: Numbering, p: Int|
-    numbered_from(h.held, acc, p, h.held.len()));
+    numbered_from(h.nodes, acc, p, h.nodes.len()));
   {
-    held: n.out,
+    labels: n.out,
     at: places.map(|p: Int|
       match n.numbered.get(p) { Some(i) -> i, None -> panic("a type stored has a place") }),
   }
@@ -2609,9 +2613,9 @@ test "types stored once read back as they were, each part they share stored once
     NominalType({ name: b"m.Point", args: [], fields: [] }),
   ];
   let h = intern_types(types);
-  let back = types_of(h.held);
+  let back = types_of(h.labels);
   assert_eq(h.at.map(|i: Int| back.get(i)), types);
-  assert_eq(h.held.len(), 10)
+  assert_eq(h.labels.len(), 10)
 }
 
 test "a type table reads back each type stored in it, and stores a type met again once" {

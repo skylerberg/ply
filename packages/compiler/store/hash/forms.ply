@@ -253,7 +253,7 @@ pub fn build_index(
     scopes: scopes,
     effect_sketches: Map::new(),
     written: prelude.fold(Map::new(), |acc: Map<Bytes, Int>, m: Int|
-      emitted_code().calls.concat(emitted_code().lifts).fold(
+      emitted_code().calls.concat(emitted_code().insert_calls).fold(
         acc,
         |a: Map<Bytes, Int>, n: Bytes|
           match built.items.get(m).functions.get(n) { Some(v) -> a.insert(n, v), None -> a },
@@ -323,7 +323,8 @@ pub fn encoded_resolutions(picks: List<List<Choice>>) -> Bytes = {
     picks.map(|p: List<Choice>|
       u32_le(p.len()).concat(
         Bytes::concat_all(
-          p.map(|c: Choice| u32_le(c.named.len()).concat(Bytes::concat_all(c.named.map(u32_le)))),
+          p.map(|c: Choice|
+            u32_le(c.targets.len()).concat(Bytes::concat_all(c.targets.map(u32_le)))),
         ),
       )),
   );
@@ -372,12 +373,12 @@ pub type HashOutput = {
   test_refs: Map<Bytes, List<Int>>,
   test_runs: Map<Bytes, List<Int>>,
   law_refs: Map<Bytes, List<Int>>,
-  enumerations: List<List<Int>>,
+  component_members: List<List<Int>>,
 }
 
 pub type Refs = {
   names: List<Bytes>,
-  declarations: List<Bool>,
+  is_declaration: List<Bool>,
   edges: List<List<Int>>,
   functions: Map<Bytes, Int>,
   declared: Map<Bytes, List<Int>>,
@@ -434,7 +435,7 @@ pub type NodeForm = {
 
 pub type ClauseForm = { kind: Int, form: Template }
 
-pub type ItemForm = { form: Template, listed: List<Int>, listing: List<Int> }
+pub type ItemForm = { form: Template, case_refs: List<Int>, listing: List<Int> }
 
 pub type HashItem = { key: Bytes, form: Option<ItemForm> }
 
@@ -638,7 +639,7 @@ type TestHashes = {
   listings: List<List<Int>>,
 }
 
-type ComponentKeys = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int, Bytes> }
+type ComponentKeys = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, computed: Map<Int, Bytes> }
 
 type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
 
@@ -698,7 +699,7 @@ fn test_form(
       chose,
       t.definition,
     ),
-    listed: listed_refs(index, t),
+    case_refs: listed_refs(index, t),
     listing: match t.definition.cases {
       Some(c) -> expression_references(expression_template(index, t.module, [], test_listing(c))),
       None -> [],
@@ -706,7 +707,7 @@ fn test_form(
   }
 
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
-  { form: law_template(index, l.module, l.definition), listed: [], listing: [] }
+  { form: law_template(index, l.module, l.definition), case_refs: [], listing: [] }
 
 type Shaped = { shapes: HashInput, first: List<FirstPass> }
 
@@ -820,7 +821,7 @@ fn key_components(
   cached: Map<Int, CachedNode>,
 ) -> ComponentKeys / {abort.raise} =
   range(0, over.graph.components.len()).fold(
-    { hashes: Map::new(), bodies: Map::new(), fresh: Map::new() },
+    { hashes: Map::new(), bodies: Map::new(), computed: Map::new() },
     |acc: ComponentKeys, ci: Int| {
       let component = over.graph.components.get(ci);
       if component.fold(true, |all: Bool, v: Int|
@@ -832,7 +833,7 @@ fn key_components(
               {
                 hashes: a.hashes.insert(v, f.hash),
                 bodies: a.bodies.insert(v, f.body),
-                fresh: a.fresh.insert(v, f.hash),
+                computed: a.computed.insert(v, f.hash),
               },
           })
       } else { key_component(over, pinned, acc, ci, component) }
@@ -853,7 +854,7 @@ fn key_component(
       let class = match refined.classes.get(m.node) { Some(c) -> c, None -> 0 };
       {
         ..a,
-        fresh: a.fresh.insert(m.node, m.hash),
+        computed: a.computed.insert(m.node, m.hash),
         bodies: a.bodies.insert(m.node, member_body(refined, class)),
       }
     })
@@ -862,7 +863,7 @@ fn key_component(
     let encoding = filled_under(over, form_of(over, v), acc.hashes, effects, false);
     {
       ..acc,
-      fresh: acc.fresh.insert(v, blake3(encoding.bytes)),
+      computed: acc.computed.insert(v, blake3(encoding.bytes)),
       bodies: acc.bodies.insert(v, single_body(encoding)),
     }
   };
@@ -871,7 +872,7 @@ fn key_component(
     hashes: component.fold(own.hashes, |h: Map<Int, Bytes>, v: Int|
       match pinned.get(v) {
         Some(x) -> h.insert(v, x),
-        None -> match own.fresh.get(v) { Some(x) -> h.insert(v, x), None -> h },
+        None -> match own.computed.get(v) { Some(x) -> h.insert(v, x), None -> h },
       }),
   }
 }
@@ -943,14 +944,14 @@ pub fn module_record(fixing: CachedHashes) -> Bytes / {abort.raise} =
     module_record_bin(),
   )
 
-pub type ModuleHashes = { record: Bytes, fixing: CachedHashes }
+pub type ModuleHashes = { record: Bytes, cached: CachedHashes }
 
 pub fn joined_cached_hashes(modules: List<ModuleHashes>) -> CachedHashes =
   modules.fold(no_cached_hashes(), |acc: CachedHashes, m: ModuleHashes|
     {
-      nodes: acc.nodes.concat(m.fixing.nodes),
-      tests: acc.tests.concat(m.fixing.tests),
-      laws: acc.laws.concat(m.fixing.laws),
+      nodes: acc.nodes.concat(m.cached.nodes),
+      tests: acc.tests.concat(m.cached.tests),
+      laws: acc.laws.concat(m.cached.laws),
     })
 
 fn record_domain() -> Bytes = b"ply.record.1"
@@ -1086,7 +1087,7 @@ pub fn hash_all(
             bodies: acc.bodies.push(single_body(f)),
             texts: acc.texts.push(own_hash(text.bytes)),
             refs: acc.refs.push(
-              form.listed.fold(referenced, |rs: List<Int>, r: Int| rs.push_unique(r)),
+              form.case_refs.fold(referenced, |rs: List<Int>, r: Int| rs.push_unique(r)),
             ),
             runs: acc.runs.push(referenced),
             listings: acc.listings.push(form.listing),
@@ -1441,7 +1442,8 @@ pub fn selection_forms(
   let test_forms = tests.map(|t: TestNode| test_form(index, t, chosen.called));
   let law_forms = laws.map(|l: LawNode| law_form(index, l));
   let item_nodes = |acc: NodeOrder, x: ItemForm|
-    x.listed.concat(x.listing).fold(form_nodes(x.form, acc), |a: NodeOrder, v: Int| add_node(a, v));
+    x.case_refs.concat(x.listing).fold(form_nodes(x.form, acc), |a: NodeOrder, v: Int|
+      add_node(a, v));
   let table = law_forms.fold(
     test_forms.fold(
       forms.fold(
@@ -1460,7 +1462,7 @@ pub fn selection_forms(
   let item = |x: ItemForm|
     {
       form: renumber(x.form, ids),
-      listed: x.listed.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
+      case_refs: x.case_refs.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
       listing: x.listing.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
     };
   {
@@ -1528,7 +1530,8 @@ pub fn joined_forms(parts: List<HashInput>) -> HashInput / {abort.raise} = {
           Some(f) ->
             Some({
               form: renumber(f.form, ids.get(k)),
-              listed: f.listed.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
+              case_refs: f.case_refs.map(|v: Int|
+                match ids.get(k).get(v) { Some(w) -> w, None -> v }),
               listing: f.listing.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
             }),
         },
@@ -1733,7 +1736,10 @@ pub fn cached_nodes(
                 else { match check_keys.get(node.name) { Some(c) -> c, None -> b"" } },
                 body: body.body,
                 edges: edges_of(v, node),
-                effects: node_refs(match hashes.enumerations.at(v) { Some(es) -> es, None -> [] }),
+                effects: node_refs(match hashes.component_members.at(v) {
+                  Some(es) -> es,
+                  None -> [],
+                }),
                 clauses: node_refs(match hashes.refs.clauses.at(v) { Some(cs) -> cs, None -> [] }),
               }),
             }
@@ -1842,7 +1848,7 @@ pub fn assemble(
     dependencies: [],
     refs: {
       names: sk.nodes.map(|node: NodeRef| node.name),
-      declarations: sk.nodes.map(|node: NodeRef| node.declaration),
+      is_declaration: sk.nodes.map(|node: NodeRef| node.declaration),
       edges: edges,
       functions: functions,
       declared: declared,
@@ -1866,7 +1872,7 @@ pub fn assemble(
     test_refs: by_key(tests, h.test_refs),
     test_runs: by_key(tests, h.test_runs),
     law_refs: by_key(sk.laws, h.law_refs),
-    enumerations: h.enumerations,
+    component_members: h.enumerations,
   };
   sk.order.fold({ out: empty, dependencies_at: Map::new() }, |acc: Recording, e: IndexEntry|
     match e {
@@ -2041,7 +2047,7 @@ fn meanings(key: Bytes) -> List<Subject> =
 
 fn reachable_names(r: Refs, nodes: List<Int>) -> ReachableNames / {abort.raise} =
   nodes.fold({ functions: Map::new(), declarations: Map::new() }, |acc: ReachableNames, v: Int|
-    if r.declarations.get(v) {
+    if r.is_declaration.get(v) {
       { ..acc, declarations: acc.declarations.insert(r.names.get(v), true) }
     } else { { ..acc, functions: acc.functions.insert(r.names.get(v), true) } })
 
@@ -2074,7 +2080,7 @@ pub fn reached_functions(
 fn unit_reach(r: Refs, starts: List<Int>) -> Map<Bytes, Bool> / {abort.raise} = {
   let scheduled = scheduler_module().concat(b".");
   let written = range(0, r.names.len()).filter(|v: Int|
-    !r.declarations.get(v) && r.names.get(v).starts_with(scheduled));
+    !r.is_declaration.get(v) && r.names.get(v).starts_with(scheduled));
   reachable_names(r, walked(with_clauses(r), starts.concat(written)).all).functions
 }
 
@@ -2097,7 +2103,7 @@ pub fn references_in(hashes: HashOutput, which: Subject) -> List<NodeRef> / {abo
     ItemKeyed(_) -> nodes_of(r, which),
     _ -> nodes_of(r, which).fold([], |acc: List<Int>, v: Int| acc.concat(r.edges.get(v))),
   };
-  direct.map(|v: Int| { name: r.names.get(v), declaration: r.declarations.get(v) })
+  direct.map(|v: Int| { name: r.names.get(v), declaration: r.is_declaration.get(v) })
 }
 
 fn back_edges(r: Refs) -> List<List<Int>> / {abort.raise} = {
@@ -2159,7 +2165,7 @@ pub fn build_closure(hashes: HashOutput, roots: List<Bytes>) -> List<ClosureEntr
   let definitions = by_name(hashes.definitions);
   let declarations = by_name(hashes.declarations);
   let hash_of = |v: Int|
-    Map::get(if r.declarations.get(v) { declarations } else { definitions }, r.names.get(v));
+    Map::get(if r.is_declaration.get(v) { declarations } else { definitions }, r.names.get(v));
   let reached = walked(
     r.edges,
     start_nodes(r, roots.map(|name: Bytes| FunctionNamed(name))),
@@ -2169,7 +2175,7 @@ pub fn build_closure(hashes: HashOutput, roots: List<Bytes>) -> List<ClosureEntr
   reached.map(|v: Int|
     {
       name: r.names.get(v),
-      declaration: r.declarations.get(v),
+      declaration: r.is_declaration.get(v),
       hash: match hash_of(v) { Some(h) -> h, None -> b"" },
       refs: r.edges.get(v).fold([], |acc: List<Int>, w: Int|
         match place.get(w) { Some(i) -> acc.push(i), None -> acc }),

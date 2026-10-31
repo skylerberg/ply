@@ -33,18 +33,18 @@ type Spaces = {
   values: Map<DefinitionKey, Bytes>,
   types: Map<DefinitionKey, Bytes>,
   effects: Map<DefinitionKey, Bytes>,
-  sets: Map<DefinitionKey, Bytes>,
+  effect_sets: Map<DefinitionKey, Bytes>,
 }
 
 fn no_spaces() -> Spaces =
-  { values: Map::new(), types: Map::new(), effects: Map::new(), sets: Map::new() }
+  { values: Map::new(), types: Map::new(), effects: Map::new(), effect_sets: Map::new() }
 
 fn names_in_namespace(s: Spaces, namespace: Namespace) -> Map<DefinitionKey, Bytes> =
   match namespace {
     ValueSpace -> s.values,
     TypeSpace -> s.types,
     EffectSpace -> s.effects,
-    SetSpace -> s.sets,
+    SetSpace -> s.effect_sets,
   }
 
 fn with_entry(s: Spaces, namespace: Namespace, key: DefinitionKey, value: Bytes) -> Spaces =
@@ -52,10 +52,10 @@ fn with_entry(s: Spaces, namespace: Namespace, key: DefinitionKey, value: Bytes)
     ValueSpace -> { ..s, values: s.values.insert(key, value) },
     TypeSpace -> { ..s, types: s.types.insert(key, value) },
     EffectSpace -> { ..s, effects: s.effects.insert(key, value) },
-    SetSpace -> { ..s, sets: s.sets.insert(key, value) },
+    SetSpace -> { ..s, effect_sets: s.effect_sets.insert(key, value) },
   }
 
-pub type ModuleMove = { to: RootedPath, before: List<Bytes>, after: List<Bytes> }
+pub type ModuleMove = { to: RootedPath, before: List<Bytes>, new_parts: List<Bytes> }
 
 pub type RecordRenames = { path: String, declared: DeclaredRecord, renamed: Map<Bytes, Bytes> }
 
@@ -222,7 +222,7 @@ fn with_move(rn: Renaming, r: Read, package: RootedPath) -> Renaming / {abort.ra
       modules: rn.modules.insert(absolute(rn.pwd, at), {
         to: child(package, String::join(new, "/") ++ ".ply"),
         before: parts.map(Bytes::of_string),
-        after: new.map(Bytes::of_string),
+        new_parts: new.map(Bytes::of_string),
       }),
     }
   }
@@ -238,7 +238,7 @@ pub fn moved_name(name: Bytes, move: Option<ModuleMove>) -> Bytes / {abort.raise
       let named = name.split(b".");
       let kept = named.len() - m.before.len();
       if kept < 0 || named.drop(kept) != m.before { name }
-      else { joined(named.take(kept).concat(m.after), b".") }
+      else { joined(named.take(kept).concat(m.new_parts), b".") }
     },
   }
 
@@ -326,7 +326,7 @@ pub type Edit = { start: Int, end: Int, text: Bytes, names: List<Bytes> }
 pub type Edited = {
   edits: List<Edit>,
   renamed: Map<Bytes, List<Bytes>>,
-  kept: Map<Bytes, Bool>,
+  unchanged: Map<Bytes, Bool>,
   failures: List<Failure>,
 }
 
@@ -335,7 +335,7 @@ fn qualifier_new(rn: Renaming, l: Loaded, r: Read, text: Bytes, m: Int) -> Bytes
     None -> text,
     Some(move) -> if r.imports.any(|i: { declaration: ImportDeclaration, target: Int }|
         match i.declaration.kind { ModuleAlias(a) -> a.name == text, _ -> false }) { text }
-    else { move.after.at(move.after.len() - 1).unwrap_or(text) },
+    else { move.new_parts.at(move.new_parts.len() - 1).unwrap_or(text) },
   }
 
 fn definition_new(
@@ -481,7 +481,7 @@ fn noted_edit(
   name: Bytes,
   new: Bytes,
 ) -> Edited / {abort.raise} =
-  if new == name { { ..edited, kept: edited.kept.insert(name, true) } }
+  if new == name { { ..edited, unchanged: edited.unchanged.insert(name, true) } }
   else if text.slice(start, end) != name {
     {
       ..edited,
@@ -507,12 +507,12 @@ fn import_edits(rn: Renaming, l: Loaded, r: Read) -> List<Edit> / {abort.raise} 
         range(0, move.before.len()).fold(acc, |edits: List<Edit>, j: Int|
           match i.declaration.path.at(offset + j) {
             Some(part) -> if part.name != move.before.get(j)
-                || move.before.get(j) == move.after.get(j) { edits } else {
+                || move.before.get(j) == move.new_parts.get(j) { edits } else {
               edits.push({
                 start: part.span.start,
                 end: part.span.end,
-                text: move.after.get(j),
-                names: [move.after.get(j)],
+                text: move.new_parts.get(j),
+                names: [move.new_parts.get(j)],
               })
             },
             None -> edits,
@@ -527,7 +527,7 @@ pub fn uses_renamed(rn: Renaming, l: Loaded, r: Read) -> Bool / {abort.raise} =
       e.names.references.any(|x: Reference|
           match x.target {
             Local(_) -> false,
-            _ -> !is_synthetic_site(x.site) && reference_new(rn, l, r, x) != x.name,
+            _ -> !is_synthetic_site(x.identifier_id) && reference_new(rn, l, r, x) != x.name,
           })
         || e.names.members.any(|m: Member| member_new(rn, l, r, e.owner, m) != m.name))
 
@@ -535,7 +535,7 @@ pub fn edited_of(rn: Renaming, l: Loaded, r: Read) -> Edited / {abort.raise} = {
   let text = r.file.text;
   let path = displayed(r.file.at);
   r.entries.fold(
-    { edits: import_edits(rn, l, r), renamed: Map::new(), kept: Map::new(), failures: [] },
+    { edits: import_edits(rn, l, r), renamed: Map::new(), unchanged: Map::new(), failures: [] },
     |acc: Edited, e: Entry| {
       let fields = e.names.members.fold(Map::new(), |m: Map<Int, Bytes>, x: Member|
         match x.kind {
@@ -555,13 +555,13 @@ pub fn edited_of(rn: Renaming, l: Loaded, r: Read) -> Edited / {abort.raise} = {
       let shorthands = e.names.references.fold(Map::new(), |m: Map<Int, Bool>, x: Reference|
         if x.shorthand { m.insert(x.start, true) } else { m });
       let referred = e.names.references.fold(known, |done: Edited, x: Reference|
-        if is_synthetic_site(x.site) { done } else {
+        if is_synthetic_site(x.identifier_id) { done } else {
           let new = reference_new(rn, l, r, x);
           let field = fields.get(x.start).unwrap_or(x.name);
           if x.shorthand && field != new {
             {
               ..done,
-              kept: done.kept.insert(x.name, true),
+              unchanged: done.unchanged.insert(x.name, true),
               edits: done.edits.push({
                 start: x.start,
                 end: x.end,
@@ -594,7 +594,7 @@ pub fn comment_edits(
         lexed.tokens.fold(edits, |done: List<Edit>, t: Token|
           match t.kind {
             Identifier(n) -> match edited.renamed.get(n) {
-              Some([new]) -> if edited.kept.contains(n) { done } else {
+              Some([new]) -> if edited.unchanged.contains(n) { done } else {
                 done.push({ start: from + t.start, end: from + t.end, text: new, names: [] })
               },
               _ -> done,

@@ -133,7 +133,9 @@ pub fn check_output_with(
 fn canonical_definition(d: DefinitionInfo) -> DefinitionInfo / {abort.raise} = {
   let c = canonical_beside(
     d.scheme,
-    [d.effects, d.performed, d.scaling, d.bounded].concat(d.spec.map(|s: SpecInfo| s.effects)),
+    [d.effects, d.performed, d.scaling, d.promised_bounded].concat(
+      d.spec.map(|s: SpecInfo| s.effects),
+    ),
   );
   {
     ..d,
@@ -141,7 +143,7 @@ fn canonical_definition(d: DefinitionInfo) -> DefinitionInfo / {abort.raise} = {
     effects: c.effect_lists.get(0),
     performed: c.effect_lists.get(1),
     scaling: c.effect_lists.get(2),
-    bounded: c.effect_lists.get(3),
+    promised_bounded: c.effect_lists.get(3),
     spec: range(0, d.spec.len()).map(|i: Int|
       { ..d.spec.get(i), effects: c.effect_lists.get(4 + i) }),
   }
@@ -654,7 +656,7 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
             ]),
           ],
         );
-        report(in_module, match ((a.params.keys(), a.written)) {
+        report(in_module, match ((a.params.keys(), a.explicit_vars)) {
           ([own], [w]) -> if label_named(in_module, a, w) != None { unfilled } else {
             with_fix(unfilled, Bytes::concat_all([b"pass `", own, b"` along"]), [
               insertion(a.module, a.named, Bytes::concat_all([b"[", own, b"]"])),
@@ -843,11 +845,11 @@ fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
 
 fn dedup_diagnostics(diagnostics: List<Diagnostic>) -> List<Diagnostic> =
   diagnostics.fold(
-    { seen: Map::new(), kept: [] },
-    |acc: { seen: Map<Diagnostic, Bool>, kept: List<Diagnostic> }, diagnostic: Diagnostic|
+    { seen: Map::new(), unique: [] },
+    |acc: { seen: Map<Diagnostic, Bool>, unique: List<Diagnostic> }, diagnostic: Diagnostic|
       if acc.seen.contains(diagnostic) { acc }
-      else { { seen: acc.seen.insert(diagnostic, true), kept: acc.kept.push(diagnostic) } },
-  ).kept
+      else { { seen: acc.seen.insert(diagnostic, true), unique: acc.unique.push(diagnostic) } },
+  ).unique
 
 type ExpandedSource = {
   name: Bytes,
@@ -891,7 +893,7 @@ pub fn check_dump(sources: List<Source>) -> String / {abort.raise} =
   String::of_bytes(
     dump_head(sources).concat(match resolved_all(sources) {
       Err(rejected) -> rejected,
-      Ok(x) -> dump_outcome(check_program(x.r, x.modules)),
+      Ok(x) -> dump_outcome(check_program(x.resolution, x.modules)),
     }),
   )
 
@@ -906,12 +908,12 @@ fn cache_of(checker: Checker) -> CheckCache = {
       acc.insert(definition_info.name, {
         effects: definition_info.effects,
         performed: definition_info.performed,
-        scaling: definition_info.scaling,
-        repeats: definition_info.repeats,
+        unbounded_effects: definition_info.scaling,
+        repeated_parameters: definition_info.repeats,
         ending: definition_info.ending,
         summary: definition_info.summary,
         raises: definition_info.raises,
-        facts: b"",
+        ownership_facts: b"",
       }),
   );
   let tests = checker.tests.fold(Map::new(), |acc: Map<Bytes, CachedTest>, t: TestInfo|
@@ -925,24 +927,24 @@ fn cache_of(checker: Checker) -> CheckCache = {
   }
 }
 
-pub type Dumps = { walked: String, seeded: String }
+pub type Dumps = { uncached: String, seeded: String }
 
 pub fn check_dumps(sources: List<Source>) -> Dumps / {abort.raise} = {
   let head = dump_head(sources);
   let both = match resolved_all(sources) {
-    Err(rejected) -> { walked: rejected, seeded: rejected },
+    Err(rejected) -> { uncached: rejected, seeded: rejected },
     Ok(x) -> {
-      let first = check_program(x.r, x.modules);
+      let first = check_program(x.resolution, x.modules);
       let walked = dump_outcome(first);
       {
-        walked: walked,
+        uncached: walked,
         seeded: if !first.ok { walked }
-        else { dump_outcome(check_program_with(x.r, x.modules, cache_of(first.checker))) },
+        else { dump_outcome(check_program_with(x.resolution, x.modules, cache_of(first.checker))) },
       }
     },
   };
   {
-    walked: String::of_bytes(head.concat(both.walked)),
+    uncached: String::of_bytes(head.concat(both.uncached)),
     seeded: String::of_bytes(head.concat(both.seeded)),
   }
 }
@@ -962,7 +964,7 @@ test "the dump writes each definition, test, law, effect and constructor of a pr
 fn checked_m(src: Bytes) -> CheckResult / {abort.raise} =
   match resolved_all([{ name: b"m", src: src }]) {
     Err(rejected) -> panic("`m` does not resolve: " ++ String::of_bytes_lossy(rejected)),
-    Ok(x) -> check_program(x.r, x.modules),
+    Ok(x) -> check_program(x.resolution, x.modules),
   }
 
 fn valid_module_checker(src: Bytes) -> Checker / {abort.raise} = {
@@ -1141,7 +1143,8 @@ test "a clause binding its continuation holds what resuming it performs" {
     |b: TypedBody<Type>| typed_expression_nodes(b.body),
   ).flat_map(|e: TypedExpression<Type>|
     match e.node {
-      TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| placed_effects_text(c.resumed)),
+      TypedHandle(h) ->
+        h.clauses.map(|c: TypedClause<Type>| placed_effects_text(c.continuation_effects)),
       _ -> [],
     });
   assert_eq(resumed, [b"{m.trace.step}"])
@@ -1251,7 +1254,7 @@ test "a try has its body's effects, and the clauses it expands to perform nothin
   let one = expression_span(source_expression_at(checker, placed_in(src, b"try { digit", b"\n")));
   let at = try_spans(one);
   assert_eq(effects_at(checker, one), [b"{m.log.write, m.parse.bad}"]);
-  assert_eq(effects_at(checker, at.ret), [b"{}"]);
+  assert_eq(effects_at(checker, at.early_return), [b"{}"]);
   assert_eq(effects_at(checker, at.clause), [b"{}"])
 }
 
@@ -1317,13 +1320,13 @@ test "the parts of the handle a try is written out as stand where the rewrite pu
   assert_eq(typed(one), [result]);
   assert_eq(typed(at.ok), [b"(Int) -> ".concat(result)]);
   assert_eq(typed(at.err), [b"(String) -> ".concat(result)]);
-  assert_eq(typed(at.carried), []);
+  assert_eq(typed(at.arguments_record), []);
   let lookup = b"try { lookup(key) }";
   let s = placed_in(src, lookup, lookup).start;
   let several = try_spans(
     expression_span(source_expression_at(checker, span_between(s, s + lookup.len()))),
   );
-  assert_eq(typed(several.carried).len(), 1)
+  assert_eq(typed(several.arguments_record).len(), 1)
 }
 
 test "a default a call leaves out is among its arguments, at the call's types" {
@@ -1788,7 +1791,7 @@ fn checked_context(src: Bytes) -> Checker / {abort.raise} = {
   let d: Expansion = expand_derives(0, b"m", x.module);
   match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
     ResolveFailed(_) -> panic("a source the test wrote does not resolve"),
-    ResolveSucceeded(y) -> check_program(y.r, y.modules).checker,
+    ResolveSucceeded(y) -> check_program(y.resolution, y.modules).checker,
   }
 }
 
@@ -2141,7 +2144,8 @@ fn module_diagnostics(name: Bytes, src: Bytes) -> List<Diagnostic> / {abort.rais
   let d: Expansion = expand_derives(0, name, x.module);
   match resolve_modules([{ name: name, module: d.module, derived: d.derived }]) {
     ResolveFailed(ds) -> ds,
-    ResolveSucceeded(y) -> dedup_diagnostics(check_program(y.r, y.modules).checker.diagnostics),
+    ResolveSucceeded(y) ->
+      dedup_diagnostics(check_program(y.resolution, y.modules).checker.diagnostics),
   }
 }
 
@@ -3882,8 +3886,8 @@ test "a program checked from its own published interfaces publishes the same thi
     },
   ];
   let dumps = check_dumps(src);
-  assert_eq(dumps.seeded, dumps.walked);
-  assert_eq(dumps.walked, check_dump(src))
+  assert_eq(dumps.seeded, dumps.uncached);
+  assert_eq(dumps.uncached, check_dump(src))
 }
 
 test "a spec clause that reaches an effect through a call is rejected at the call" {
@@ -3924,7 +3928,7 @@ fn label_rejections(src: Bytes) -> List<Bytes> / {abort.raise} =
     ]) {
     Err(dump) -> [dump],
     Ok(x) ->
-      dedup_diagnostics(check_program(x.r, x.modules).checker.diagnostics).filter(
+      dedup_diagnostics(check_program(x.resolution, x.modules).checker.diagnostics).filter(
         |d: Diagnostic| d.code == b"E0105",
       ).map(|d: Diagnostic| d.message),
   }
@@ -4183,7 +4187,7 @@ fn errors_across(sources: List<Source>) -> List<Diagnostic> / {abort.raise} = {
       ) {
       ResolveFailed(ds) -> ds,
       ResolveSucceeded(x) ->
-        dedup_diagnostics(check_program(x.r, x.modules).checker.diagnostics).filter(
+        dedup_diagnostics(check_program(x.resolution, x.modules).checker.diagnostics).filter(
           |diagnostic: Diagnostic| diagnostic.severity == b"error",
         ),
     }
@@ -4324,8 +4328,9 @@ fn not_covered(src: Bytes) -> List<Bytes> / {abort.raise} = {
   match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
     ResolveFailed(_) -> [b"does not resolve"],
     ResolveSucceeded(ok) ->
-      check_program(ok.r, ok.modules).checker.diagnostics.filter(|diagnostic: Diagnostic|
-        diagnostic.code == b"E0205").map(|diagnostic: Diagnostic| diagnostic.labels.get(0).text),
+      check_program(ok.resolution, ok.modules).checker.diagnostics.filter(
+        |diagnostic: Diagnostic| diagnostic.code == b"E0205",
+      ).map(|diagnostic: Diagnostic| diagnostic.labels.get(0).text),
   }
 }
 
@@ -6822,7 +6827,7 @@ fn codes_of(sources: List<Source>) -> List<Bytes> / {abort.raise} =
     ) {
     ResolveFailed(ds) -> ds.map(|diagnostic: Diagnostic| diagnostic.code),
     ResolveSucceeded(y) ->
-      dedup_diagnostics(check_program(y.r, y.modules).checker.diagnostics).map(
+      dedup_diagnostics(check_program(y.resolution, y.modules).checker.diagnostics).map(
         |diagnostic: Diagnostic| diagnostic.code,
       ),
   }
@@ -7261,7 +7266,7 @@ fn failing_places(body: Bytes) -> List<Int> / {abort.raise} = {
   sites.fold([], |acc: List<Int>, r: ReleaseSite|
     if r.release.place != ReleaseAfter && r.release.place != ReleaseBefore { acc } else {
       let n = sites.filter(|x: ReleaseSite|
-        x.at == r.at && x.release.place == ReleaseFailing(r.release.held)).len(
+        x.at == r.at && x.release.place == ReleaseFailing(r.release.holder)).len(
       );
       if n == 0 { acc } else { acc.push(n) }
     })

@@ -48,7 +48,7 @@ pub type ModuleView = { name: String, file: String }
 
 pub type Entry = {
   test: Int,
-  of: Bytes,
+  key: Bytes,
   case: Option<SelectedCase>,
   unlisted: Option<ListingFailure>,
 }
@@ -184,7 +184,7 @@ pub type Group = { tests: List<Int>, effects: String }
 
 pub type Parallelism = {
   total: Int,
-  isolated: Int,
+  conflict_free: Int,
   shared: Int,
   scheduled: Int,
   groups: Int,
@@ -198,7 +198,7 @@ pub type Program = {
   modules: List<ModuleView>,
   loaded_from_cache: Bool,
   phases: Phases,
-  reuse: List<Member>,
+  reused_members: List<Member>,
   declared: Int,
   cases: List<Case>,
   positions: Map<Int, Int>,
@@ -223,7 +223,7 @@ pub type SearchSummary = {
   explored: Int,
   exhaustive: Bool,
   exhausted: Bool,
-  blind: Option<Cost>,
+  clockless: Option<Cost>,
   naive: Option<Cost>,
   reduction_tenths: Option<Int>,
   steps: Int,
@@ -297,14 +297,14 @@ pub type RunReport = {
   digest: String,
   handshakes: List<String>,
   hosts: Json,
-  reaches: List<Int>,
+  tests_using_host: List<Int>,
   workers: Int,
   backend: Option<Backend>,
   results: List<Outcome>,
   failures: List<Failed>,
   summary: Summary,
   simulation: SimulationSummary,
-  escapes: List<Diagnostic>,
+  unbound_pass_diagnostics: List<Diagnostic>,
   warnings: List<Diagnostic>,
   mutants: Option<MutationReport>,
   coverage: Option<Coverage>,
@@ -407,7 +407,7 @@ fn reason_text(reason: String) -> String =
 pub fn isolated_as(reaches: List<Int>, case: Case) -> String =
   isolation_word(isolation_of(host_use_of(reaches, case)))
 
-pub type Opening = { operations: Int, digest: String, reaches: List<Int>, workers: Int }
+pub type Opening = { operations: Int, digest: String, tests_using_host: List<Int>, workers: Int }
 
 fn workers_of(options: Options, hosted: BindingReport) -> Int =
   match options.jobs { Some(n) -> if n > 0 { n } else { hosted.cores }, None -> hosted.cores }
@@ -416,7 +416,7 @@ pub fn opening_of(options: Options, program: Program, hosted: BindingReport) -> 
   {
     operations: hosted.operations,
     digest: hosted.digest,
-    reaches: hosted.reaches.filter(|i: Int| case_of(program, i) != None),
+    tests_using_host: hosted.host_test_indices.filter(|i: Int| case_of(program, i) != None),
     workers: workers_of(options, hosted),
   }
 
@@ -522,7 +522,7 @@ fn head_lines(
   decided: RunDecision,
   o: Opening,
 ) -> List<String> / {abort.raise} = {
-  let c = counts_of(program, o.reaches);
+  let c = counts_of(program, o.tests_using_host);
   [selected_line(style, program, decided)].concat(group_line(decided, o.workers)).concat(
     isolated_line(style, c),
   ).concat(
@@ -542,7 +542,7 @@ pub fn opening_lines(
   o: Opening,
 ) -> List<String> / {abort.raise} =
   head_lines(style, flags, program, decided, o).concat(if flags.explain {
-    explain_lines(style, program, o.reaches, decided)
+    explain_lines(style, program, o.tests_using_host, decided)
   } else { [] }).concat(if decided.classes.len() == 0 { [] } else { [""] })
 
 fn run_lines(style: Style, report: RunReport) -> List<String> / {abort.raise} =
@@ -848,7 +848,7 @@ fn search_parts(e: SearchSummary) -> List<String> / {abort.raise} = {
   let head = [count_of(e.explored, "interleaving")];
   let thorough = if e.exhaustive { head.push("exhaustive") } else { head };
   let spent = if e.exhausted { thorough.push("budget spent — not cached") } else { thorough };
-  let blind = match e.blind { None -> spent, Some(b) -> spent.push("blind " ++ b.rendered) };
+  let blind = match e.clockless { None -> spent, Some(b) -> spent.push("blind " ++ b.rendered) };
   match e.naive {
     None -> blind,
     Some(naive) -> blind.push("naive " ++ naive.rendered).concat(reduction_part(e, naive)),
@@ -1107,7 +1107,8 @@ fn survivor_line(style: Style, places: List<SourceText>, m: Survivor) -> String 
     None -> "",
     Some(a) -> match location_text(places, a) { Some(text) -> text, None -> "" },
   };
-  indent() ++ indent() ++ red(style, m.definition) ++ " survives `" ++ m.from ++ "` -> `" ++ m.to
+  indent() ++ indent() ++ red(style, m.definition) ++ " survives `" ++ m.original ++ "` -> `"
+    ++ m.replacement
     ++ "` at "
     ++ dim(style, spot)
 }
@@ -1143,7 +1144,7 @@ fn case_of_json(case: Case) -> List<Member> / {abort.raise} =
           value: object([
             { key: "at", value: int(c.at) },
             { key: "identity", value: Str(c.identity.hex_of()) },
-            { key: "of", value: Str(String::of_bytes_lossy(case.entry.of)) },
+            { key: "of", value: Str(String::of_bytes_lossy(case.entry.key)) },
           ]),
         },
       ],
@@ -1164,8 +1165,8 @@ pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / 
       { key: "changed_input", value: string_or_null(changed_read_of(decided, case.index)) },
       { key: "group", value: int_or_null(group_of(decided, case.index)) },
       { key: "outside_effects", value: Str(case.effects) },
-      { key: "isolation", value: Str(isolated_as(report.reaches, case)) },
-      { key: "host", value: Bool(covers(report.reaches, case.index)) },
+      { key: "isolation", value: Str(isolated_as(report.tests_using_host, case)) },
+      { key: "host", value: Bool(covers(report.tests_using_host, case.index)) },
       { key: "shared_effects", value: strings(shared_texts(case)) },
       { key: "contends", value: Array(cross_test_effects(effects_of(case)).map(effect_json)) },
       { key: "seeded", value: Bool(case.seeded) },
@@ -1204,7 +1205,7 @@ fn search_json(e: SearchSummary) -> Json =
     { key: "explored", value: int(e.explored) },
     { key: "exhaustive", value: Bool(e.exhaustive) },
     { key: "exhausted", value: Bool(e.exhausted) },
-    { key: "blind", value: cost_json(e.blind) },
+    { key: "blind", value: cost_json(e.clockless) },
     { key: "naive", value: cost_json(e.naive) },
     {
       key: "reduction",
@@ -1329,7 +1330,7 @@ fn diff_json(program: Program, d: ChangeDiff) -> Json / {abort.raise} =
 fn parallelism_json(v: Parallelism) -> Json =
   object([
     { key: "total", value: int(v.total) },
-    { key: "isolated", value: int(v.isolated) },
+    { key: "isolated", value: int(v.conflict_free) },
     { key: "shared", value: int(v.shared) },
     { key: "scheduled", value: int(v.scheduled) },
     { key: "groups", value: int(v.groups) },
@@ -1349,7 +1350,7 @@ fn selection_json(
   report: RunReport,
   decided: RunDecision,
 ) -> Json / {abort.raise} = {
-  let c = counts_of(program, report.reaches);
+  let c = counts_of(program, report.tests_using_host);
   object([
     { key: "total", value: int(program.cases.len()) },
     { key: "selected", value: int(selected_count(program, decided)) },
@@ -1438,7 +1439,7 @@ fn document(
             { key: "incremental", value: Bool(program.loaded_from_cache) },
             { key: "phases", value: phases_json(program.phases) },
           ].concat(
-            program.reuse,
+            program.reused_members,
           ),
         ),
       },
@@ -1471,7 +1472,7 @@ fn document(
       },
       { key: "failures", value: Array(faults.map(|f: Fault| fault_json(program, f))) },
       { key: "diffs", value: Array(diffs.map(|d: ChangeDiff| diff_json(program, d))) },
-      { key: "diagnostics", value: all_to_json(report.escapes, program.places) },
+      { key: "diagnostics", value: all_to_json(report.unbound_pass_diagnostics, program.places) },
       { key: "warnings", value: all_to_json(warnings, program.places) },
     ].concat(
       extra_documents(report),
@@ -1484,7 +1485,8 @@ fn survived(report: RunReport) -> Bool =
   match report.mutants { Some(m) -> m.survived > 0, None -> false }
 
 pub fn green_run(report: RunReport) -> Bool =
-  report.summary.failed == 0 && report.summary.timed_out == 0 && report.escapes.len() == 0
+  report.summary.failed == 0 && report.summary.timed_out == 0
+    && report.unbound_pass_diagnostics.len() == 0
     && !survived(report)
 
 fn nothing_lines(style: Style, flags: Flags, program: Program) -> List<String> =
@@ -1504,8 +1506,8 @@ fn closing_lines(
     if flags.explain { run_phase_lines(style, program.phases, report.spent) } else { [] },
     [""],
     run_lines(style, report),
-    [summary_line(style, report, counts_of(program, report.reaches))],
-    warned_lines(style, report.escapes),
+    [summary_line(style, report, counts_of(program, report.tests_using_host))],
+    warned_lines(style, report.unbound_pass_diagnostics),
     failure_blocks(style, program, faults),
     diff_blocks(style, program, diffs),
     timed_out_blocks(style, program, report),
@@ -1615,7 +1617,7 @@ test "a search says what it explored and what a blind and an unpruned one would 
     explored: 12,
     exhaustive: true,
     exhausted: false,
-    blind: Some({ explored: 30, bounded: false, rendered: "30" }),
+    clockless: Some({ explored: 30, bounded: false, rendered: "30" }),
     naive: Some({ explored: 120, bounded: false, rendered: "120" }),
     reduction_tenths: Some(100),
     steps: 8,
@@ -1629,7 +1631,7 @@ test "a search says what it explored and what a blind and an unpruned one would 
   let doc = to_string(search_json(e));
   assert(doc.contains("\"blind\":{\"bounded\":false,\"explored\":30,\"rendered\":\"30\"}"));
   assert(doc.contains("\"naive\":{\"bounded\":false,\"explored\":120,\"rendered\":\"120\"}"));
-  let unmeasured = { ..e, blind: None, naive: None, reduction_tenths: None };
+  let unmeasured = { ..e, clockless: None, naive: None, reduction_tenths: None };
   assert_eq(String::join(search_parts(unmeasured), " · "), "12 interleavings · exhaustive");
   assert(to_string(search_json(unmeasured)).contains("\"blind\":null"))
 }
@@ -1639,7 +1641,7 @@ test "a bounded naive count makes the ratio a lower bound" {
     explored: 12,
     exhaustive: false,
     exhausted: false,
-    blind: Some({ explored: 40, bounded: false, rendered: "40" }),
+    clockless: Some({ explored: 40, bounded: false, rendered: "40" }),
     naive: Some({ explored: 4096, bounded: true, rendered: ">= 4096" }),
     reduction_tenths: Some(3413),
     steps: 8,

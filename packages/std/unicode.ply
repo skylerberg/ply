@@ -76,7 +76,7 @@ type DecompositionMapping = { compatibility: Bool, to: List<Int> }
 
 /// A parsed line of the table: its run, class and quick checks, and its decomposition step if it
 /// has one.
-type Entry = { first: Int, last: Int, bits: Int, step: Option<DecompositionMapping> }
+type Entry = { first: Int, last: Int, bits: Int, decomposition: Option<DecompositionMapping> }
 
 fn entry(run: Run) -> Entry / {abort.raise} = {
   let field = |i: Int| match run.fields.at(i) { Some(text) -> text, None -> b"" };
@@ -93,7 +93,7 @@ fn entry(run: Run) -> Entry / {abort.raise} = {
     first: run.first,
     last: run.last,
     bits: class | quick,
-    step: if mapping.len() == 0 { None } else if mapping.starts_with(b"~") {
+    decomposition: if mapping.len() == 0 { None } else if mapping.starts_with(b"~") {
       Some({ compatibility: true, to: ucd::code_points(mapping.slice(1, mapping.len())) })
     } else { Some({ compatibility: false, to: ucd::code_points(mapping) }) },
   }
@@ -125,7 +125,7 @@ type NormalizationState = { valued: List<ValueRun>, gathering: SequencePool, pai
 fn normalization_table_of(runs: List<Run>) -> NormalizationTable / {abort.raise} = {
   let entries = runs.map(entry);
   let steps = entries.fold(Map::new(), |all: Map<Int, DecompositionMapping>, e: Entry|
-    match e.step {
+    match e.decomposition {
       None -> all,
       Some(step) ->
         range(e.first, e.last + 1).fold(all, |table: Map<Int, DecompositionMapping>, cp: Int|
@@ -134,7 +134,7 @@ fn normalization_table_of(runs: List<Run>) -> NormalizationTable / {abort.raise}
   let made = entries.fold(
     { valued: [], gathering: ucd::empty_pool(), pairs: Map::new() },
     |m: NormalizationState, e: Entry|
-      match e.step {
+      match e.decomposition {
         None ->
           {
             valued: m.valued.push({ first: e.first, last: e.last, value: e.bits }),
@@ -458,11 +458,11 @@ fn case_bit(letter: Int) -> Int / {abort.raise} =
   }
 
 /// The table while it is being built.
-type CasingState = { valued: List<ValueRun>, gathering: SequencePool, rows: List<Int> }
+type CasingState = { valued: List<ValueRun>, gathering: SequencePool, mapping_positions: List<Int> }
 
 fn casing_of(runs: List<Run>) -> Casing / {abort.raise} = {
   let made = runs.fold(
-    { valued: [], gathering: ucd::empty_pool(), rows: [0] },
+    { valued: [], gathering: ucd::empty_pool(), mapping_positions: [0] },
     |m: CasingState, run: Run| {
       let field = |i: Int| match run.fields.at(i) { Some(text) -> text, None -> b"" };
       let flags = range(0, field(5).len()).fold(0, |bits: Int, i: Int|
@@ -479,17 +479,18 @@ fn casing_of(runs: List<Run>) -> Casing / {abort.raise} = {
             first: run.first,
             last: run.last,
             value: ucd::parse_offset(field(0)) | flags
-              | (if row == 0 { 0 } else { m.rows.len() << 25 }),
+              | (if row == 0 { 0 } else { m.mapping_positions.len() << 25 }),
           }),
           gathering: upper.gathering,
-          rows: if row == 0 { m.rows } else { m.rows.push(row) },
+          mapping_positions: if row == 0 { m.mapping_positions }
+          else { m.mapping_positions.push(row) },
         }
       }
     },
   );
   {
     words: ucd::table_of(made.valued, 0),
-    rows: Array::of_list(made.rows),
+    rows: Array::of_list(made.mapping_positions),
     points: Array::of_list(made.gathering.points),
   }
 }
@@ -534,10 +535,10 @@ fn append_mapping(
 // --- The context around a character -----------------------------------------------
 
 /// A text as its code points, with the table the context conditions use.
-type CasingContext = { code_points: Array<Int>, held: Casing }
+type CasingContext = { code_points: Array<Int>, casing: Casing }
 
 fn has_flag(around: CasingContext, cp: Int, flag: Int) -> Bool =
-  ucd::lookup(around.held.words, cp) & flag != 0
+  ucd::lookup(around.casing.words, cp) & flag != 0
 
 /// Whether a cased letter is the first thing at or before `i` that is not case-ignorable.
 fn cased_before(around: CasingContext, i: Int) -> Bool =
@@ -611,11 +612,11 @@ fn append_lowercase(
 ) -> List<Int> =
   if cp == 0x3A3 { out.push(if final_sigma(around, i) { 0x3C2 } else { 0x3C3 }) } else {
     match tailoring {
-      Untailored -> append_mapping(around.held, out, cp, lowercase_shift(), Char::to_lowercase),
+      Untailored -> append_mapping(around.casing, out, cp, lowercase_shift(), Char::to_lowercase),
       Turkic -> if cp == 0x130 { out.push(0x69) }
       else if cp == 0x307 && dotted_before(around, i - 1, true) { out }
       else if cp == 0x49 && !above_after(around, i + 1, true) { out.push(0x131) }
-      else { append_mapping(around.held, out, cp, lowercase_shift(), Char::to_lowercase) },
+      else { append_mapping(around.casing, out, cp, lowercase_shift(), Char::to_lowercase) },
       Lithuanian -> append_lithuanian_lowercase(around, out, i, cp),
     }
   }
@@ -634,7 +635,7 @@ fn append_lithuanian_lowercase(
     0xCC -> out.push(0x69).push(0x307).push(0x300),
     0xCD -> out.push(0x69).push(0x307).push(0x301),
     0x128 -> out.push(0x69).push(0x307).push(0x303),
-    _ -> append_mapping(around.held, out, cp, lowercase_shift(), Char::to_lowercase),
+    _ -> append_mapping(around.casing, out, cp, lowercase_shift(), Char::to_lowercase),
   }
 
 /// The uppercase of `cp`, or its titlecase where `shift` and `simple` are the titlecase's.
@@ -649,7 +650,7 @@ fn append_uppercase(
 ) -> List<Int> =
   if tailoring == Turkic && cp == 0x69 { out.push(0x130) }
   else if tailoring == Lithuanian && cp == 0x307 && dotted_before(around, i - 1, false) { out }
-  else { append_mapping(around.held, out, cp, shift, simple) }
+  else { append_mapping(around.casing, out, cp, shift, simple) }
 
 /// `text` with each code point mapped by `each`, which is passed the output so far, the position,
 /// and the code point there.
@@ -657,7 +658,7 @@ fn map_code_points(
   text: String,
   each: (CasingContext, List<Int>, Int, Int) -> List<Int>,
 ) -> String = {
-  let around = { code_points: Array::of_list(text.chars().map(Int::of_char)), held: casing() };
+  let around = { code_points: Array::of_list(text.chars().map(Int::of_char)), casing: casing() };
   text_of(
     range(0, around.code_points.len()).fold([], |out: List<Int>, i: Int|
       match around.code_points.at(i) { Some(cp) -> each(around, out, i, cp), None -> out }),
@@ -690,7 +691,7 @@ pub fn uppercase(text: String, tailoring: Tailoring = Untailored) -> String =
 /// in lowercase, and anything before it unchanged. Title a text of several words one word at a
 /// time.
 pub fn titlecase(text: String, tailoring: Tailoring = Untailored) -> String = {
-  let around = { code_points: Array::of_list(text.chars().map(Int::of_char)), held: casing() };
+  let around = { code_points: Array::of_list(text.chars().map(Int::of_char)), casing: casing() };
   text_of(
     range(0, around.code_points.len()).fold(
       { out: [], begun: false },
@@ -767,7 +768,7 @@ fn turkic_folded(decomposed: String) -> String =
   map_code_points(decomposed, |around: CasingContext, out: List<Int>, i: Int, cp: Int|
     if cp == 0x307 && dotted_before(around, i - 1, true) { out }
     else if cp == 0x49 && above_after(around, i + 1, true) { out.push(0x69) }
-    else { append_fold(around.held, out, cp, true) })
+    else { append_fold(around.casing, out, cp, true) })
 
 /// What `caseless` compares: `text` decomposed, folded and decomposed again, as the standard
 /// defines a canonical caseless match. Two texts match case-insensitively exactly when their keys

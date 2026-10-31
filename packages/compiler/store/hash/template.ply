@@ -225,7 +225,7 @@ pub type EmittedCode = {
   tokens: List<Bytes>,
   builtins: List<Bytes>,
   calls: List<Bytes>,
-  lifts: List<Bytes>,
+  insert_calls: List<Bytes>,
 }
 
 pub fn emitted_code() -> EmittedCode =
@@ -247,7 +247,7 @@ pub fn emitted_code() -> EmittedCode =
       b"concat_all",
     ],
     calls: [b"List::at", b"List::push", b"Map::entries"],
-    lifts: [b"Map::insert"],
+    insert_calls: [b"Map::insert"],
   }
 
 pub fn emitted_calls_for(name: Bytes) -> List<Bytes> =
@@ -259,7 +259,8 @@ pub fn marshalling_calls_for(module: Bytes, name: Bytes) -> List<Bytes> =
   if !container_named(name) { [] } else { marshalling_calls(module) }
 
 pub fn marshalling_calls(module: Bytes) -> List<Bytes> =
-  if module == prelude_module() { [] } else { emitted_code().calls.concat(emitted_code().lifts) }
+  if module == prelude_module() { [] }
+  else { emitted_code().calls.concat(emitted_code().insert_calls) }
 
 fn module_name(encoder: Encoder) -> Bytes =
   match encoder.index.modules.at(encoder.module) { Some(found) -> found.name, None -> b"" }
@@ -334,7 +335,7 @@ fn effect_of(encoder: Encoder, qname: QName) -> EffectReference<Int, EffectSlot>
     Some(node) ->
       Declared(node, {
         node: node,
-        sketch: match encoder.index.effect_sketches.get(node) {
+        template_bytes: match encoder.index.effect_sketches.get(node) {
           Some(sketch) -> sketch,
           None -> b"",
         },
@@ -354,12 +355,12 @@ fn optional_label(encoder: Encoder, ident: Option<Identifier>) -> Option<Label> 
 fn clause_label(clause: HandleClause) -> Option<Identifier> =
   match clause.label_binder {
     Some(binder) -> Some({ name: b"*".concat(binder.name), span: clause.span }),
-    None -> if clause.every_label { Some({ name: b"*", span: clause.span }) }
+    None -> if clause.wildcard_label { Some({ name: b"*", span: clause.span }) }
     else { clause.resource },
   }
 
 fn effect_label(encoded_effect: EffectExpression) -> Option<Identifier> =
-  if encoded_effect.every { Some({ name: b"*", span: encoded_effect.span }) }
+  if encoded_effect.resource_wildcard { Some({ name: b"*", span: encoded_effect.span }) }
   else { encoded_effect.resource }
 
 type ResolvedTypeName = { name: TypeName<Int>, written: List<Int> }
@@ -506,8 +507,8 @@ pub fn blank_encoding(encoded_effect: Effect<Int, EffectSlot>) -> Bytes / {abort
 
 pub fn effect_tie_breaker(encoded_effect: Effect<Int, EffectSlot>) -> Bytes =
   match encoded_effect {
-    Moded(Declared(_, slot), _, _, _) -> slot.sketch,
-    OfOperation(Declared(_, slot), _, _, _) -> slot.sketch,
+    Moded(Declared(_, slot), _, _, _) -> slot.template_bytes,
+    OfOperation(Declared(_, slot), _, _, _) -> slot.template_bytes,
     _ -> b"",
   }
 
@@ -661,7 +662,7 @@ fn callees(
   let site = { owner: encoder.owner, site: at.site };
   let note = match encoder.choices {
     Some(chose) -> CallNote(Known(choice_at(chose, site))),
-    None -> if names { CallNote(Pending(site)) } else { CallNote(Known({ named: [] })) },
+    None -> if names { CallNote(Pending(site)) } else { CallNote(Known({ targets: [] })) },
   };
   match member_of(name.name) {
     Some(member) ->
@@ -697,12 +698,13 @@ fn callees(
 pub fn called_at(sites: List<MemberSite>) -> Map<CallSite, Choice> =
   sites.fold(Map::new(), |acc: Map<CallSite, Choice>, site: MemberSite|
     match site.callee {
-      CallsFunction(_) -> acc.insert({ owner: site.owner, site: site.site }, { named: site.named }),
+      CallsFunction(_) ->
+        acc.insert({ owner: site.owner, site: site.site }, { targets: site.named }),
       _ -> acc,
     })
 
 pub fn choice_at(chose: Map<CallSite, Choice>, site: CallSite) -> Choice =
-  match chose.get(site) { Some(c) -> c, None -> { named: [] } }
+  match chose.get(site) { Some(c) -> c, None -> { targets: [] } }
 
 fn on_value(
   encoder: Encoder,
@@ -1244,7 +1246,7 @@ fn type_form(
   let items = inner.index.items.get(inner.module);
   {
     generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
-    over: generics.effects.len() > 0 || generics.labels.len() > 0,
+    has_effect_generics: generics.effects.len() > 0 || generics.labels.len() > 0,
     constraints: constraints(inner, definition.constraints),
     body: match definition.body {
       AliasBody(aliased) -> Alias(type_template(inner, aliased)),
@@ -1263,7 +1265,7 @@ fn type_form(
       Some(stated) ->
         stated.filter(|instance: InstanceDefinition| instance.kind != HostInstance).map(
           |instance: InstanceDefinition|
-            { kind: instance.kind, by: value_of(inner, unqualified(instance.by)) },
+            { kind: instance.kind, by: value_of(inner, unqualified(instance.function)) },
         ),
     },
     numerics: match items.numerics.get(definition.name.name) {
@@ -1273,7 +1275,7 @@ fn type_form(
           match numeric_by(arithmetic, operation) {
             None -> acc,
             Some(function) ->
-              acc.push({ operation: operation, by: value_of(inner, unqualified(function)) }),
+              acc.push({ operator: operation, function: value_of(inner, unqualified(function)) }),
           }),
     },
   }
@@ -1290,12 +1292,20 @@ fn effect_form(
       definition.operations.map(|operation: OpDefinition| operation_form(encoder, operation)),
       |operation: Operation<Int, EffectSlot>| operation.name,
     ),
-    served: match encoder.index.items.get(encoder.module).instances.get(definition.name.name) {
+    host_function: match encoder.index.items.get(encoder.module).instances.get(
+        definition.name.name,
+      ) {
       None -> None,
       Some(stated) ->
         stated.fold(None, |found: Option<TemplateValue>, instance: InstanceDefinition|
           if instance.kind != HostInstance { found } else {
-            Some(value_of(encoder, { module: None, name: instance.by, span: instance.by.span }))
+            Some(
+              value_of(encoder, {
+                module: None,
+                name: instance.function,
+                span: instance.function.span,
+              }),
+            )
           }),
     },
   }

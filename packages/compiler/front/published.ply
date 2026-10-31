@@ -71,7 +71,7 @@ pub fn encode_rows(r: Rows) -> Bytes / {abort.raise} = {
   let h = intern_types(r.definitions.map(|row: KnownDefinitionRow| row.scheme.ty));
   bin::encode(
     {
-      types: h.held,
+      types: h.labels,
       at: h.at,
       rows: {
         ..r,
@@ -150,7 +150,7 @@ pub fn facts_read(
     |acc: Map<Bytes, Bytes>, row: KnownDefinitionRow| acc.insert(row.name, row.facts),
   );
   let tests = rows.tests.fold(Map::new(), |acc: Map<Bytes, Bytes>, row: KnownTestRow|
-    acc.insert(row.owner, row.facts));
+    acc.insert(row.owner, row.body_facts));
   let loose = w.law_facts.fold(
     { ..no_body_facts(), types: rows.types },
     |acc: BodyFacts, l: { owner: Bytes, facts: BodyFacts }| {
@@ -501,8 +501,8 @@ pub fn hashed_closure(
       let hashed = hashed_and_unused(resolved.index, fixed, resolved.tables.module_packages);
       Ok({
         modules: x.modules,
-        r: x.r,
-        unimported: unimported_in(x.modules, x.r, unimported),
+        r: x.resolution,
+        unimported: unimported_in(x.modules, x.resolution, unimported),
         index: resolved.index,
         hashes: hashed.hashes,
         unused: hashed.unused.filter(|diagnostic: Diagnostic|
@@ -554,15 +554,15 @@ pub fn resolved_closure(
         tables.module_packages,
         tables.std,
         tables.compiler,
-        tables.shipped,
+        tables.other_shipped_package,
       ) {
       ResolveFailed(ds) -> Err(ds.map(outside_every_module)),
       ResolveSucceeded(resolved) -> {
         let x = match checked {
-          Some(_) -> { ..resolved, r: make_all_visible(resolved.r) },
+          Some(_) -> { ..resolved, resolution: make_all_visible(resolved.resolution) },
           None -> resolved,
         };
-        let built = build_index(x.modules, x.r);
+        let built = build_index(x.modules, x.resolution);
         if built.diagnostics.len() > 0 { Err(built.diagnostics.map(outside_every_module)) }
         else { Ok({ program: x, tables: tables, index: built.index }) }
       },
@@ -577,7 +577,7 @@ pub fn checked_closure(
 ) -> AnalysisOutcome / {abort.raise} = {
   let out = check_output_with(h.r, h.modules, {
     ..cache_from_rows(rows, h.root_count),
-    walks: walks,
+    body_checking: walks,
   });
   let checked: CheckOutput = out.checked;
   if !checked.ok { Rejected(checked.diagnostics.map(outside_every_module)) } else {
@@ -602,7 +602,7 @@ pub fn checked_closure(
       uses: h.uses,
       manifest: h.closure.packages.get(0).manifest,
       packages: h.packages,
-      pins: pins_of(h.closure, h.embeds),
+      locked_packages: pins_of(h.closure, h.embeds),
       module_packages: h.module_packages,
       stub_cuts: h.cuts,
       embeds: h.embeds,
@@ -731,7 +731,7 @@ pub fn runtime_dump(d: Dump) -> Dump =
     bodies: [],
     embeds: [],
     rows: no_rows(),
-    walked: b"",
+    inferred_facts: b"",
   }
 
 type ReachSearch = { seen: Map<Bytes, Bool>, frontier: List<Bytes> }
@@ -815,13 +815,18 @@ pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
         bodies: [],
         embeds: [],
         rows: no_rows(),
-        walked: b"",
+        inferred_facts: b"",
         derived: [],
       },
     Analysed(w) -> view_dump(checked_program_of(w), None),
   }
 
-pub type BuiltinRow = { name: Bytes, scheme: Scheme, params: List<Bytes>, witnesses: Int }
+pub type BuiltinRow = {
+  name: Bytes,
+  scheme: Scheme,
+  params: List<Bytes>,
+  constraint_parameters: Int,
+}
 
 pub fn builtin_rows() -> List<BuiltinRow> / {abort.raise} =
   builtins().filter(|b: Builtin| !b.body).map(|b: Builtin| row_of(b.name, b))
@@ -838,7 +843,7 @@ fn row_of(name: Bytes, b: Builtin) -> BuiltinRow =
     name: name,
     scheme: b.scheme,
     params: b.params.map(|p: ParameterMode| p.name),
-    witnesses: witness_params(b.constraints).len(),
+    constraint_parameters: witness_params(b.constraints).len(),
   }
 
 pub type Claim =
@@ -1246,7 +1251,7 @@ pub fn claims(
       module_packages: module_packages,
       std: shipped - 2,
       compiler: shipped - 1,
-      shipped: shipped,
+      other_shipped_package: shipped,
     }
   };
   match resolve_packaged(
@@ -1255,10 +1260,10 @@ pub fn claims(
       packaged.module_packages,
       packaged.std,
       packaged.compiler,
-      packaged.shipped,
+      packaged.other_shipped_package,
     ) {
     ResolveFailed(_) -> panic("a program the front end checked does not resolve"),
-    ResolveSucceeded(x) -> match elaborate(x.r, x.modules) {
+    ResolveSucceeded(x) -> match elaborate(x.resolution, x.modules) {
       None -> panic("a program the front end checked does not check"),
       Some(e) ->
         claims_of_modules(

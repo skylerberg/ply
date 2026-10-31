@@ -105,46 +105,46 @@ fn sizes<a>(script: List<Edit<a>>) -> { old: Int, new: Int } =
       Insert(xs) -> { old: n.old, new: n.new + xs.len() },
     })
 
-type TidyState<a> = { keep: List<a>, gone: List<a>, come: List<a>, out: List<Edit<a>> }
+type TidyState<a> = { keep: List<a>, deleted: List<a>, come: List<a>, out: List<Edit<a>> }
 
 /// A script's runs in the form `diff` returns.
 fn tidy<a>(script: List<Edit<a>>) -> List<Edit<a>> =
   flush_keep(
     flush_change(
-      script.fold({ keep: [], gone: [], come: [], out: [] }, |t: TidyState<a>, e: Edit<a>|
+      script.fold({ keep: [], deleted: [], come: [], out: [] }, |t: TidyState<a>, e: Edit<a>|
         match e {
           Keep(xs) -> if xs.len() == 0 { t } else {
-            let { keep, gone: removed_entry, come: added_entry, out } = flush_change(t);
-            { keep: joined(keep, xs), gone: removed_entry, come: added_entry, out: out }
+            let { keep, deleted: removed_entry, come: added_entry, out } = flush_change(t);
+            { keep: joined(keep, xs), deleted: removed_entry, come: added_entry, out: out }
           },
           Delete(xs) -> if xs.len() == 0 { t } else {
-            let { keep, gone: removed_entry, come: added_entry, out } = flush_keep(t);
-            { keep: keep, gone: joined(removed_entry, xs), come: added_entry, out: out }
+            let { keep, deleted: removed_entry, come: added_entry, out } = flush_keep(t);
+            { keep: keep, deleted: joined(removed_entry, xs), come: added_entry, out: out }
           },
           Insert(xs) -> if xs.len() == 0 { t } else {
-            let { keep, gone: removed_entry, come: added_entry, out } = flush_keep(t);
-            { keep: keep, gone: removed_entry, come: joined(added_entry, xs), out: out }
+            let { keep, deleted: removed_entry, come: added_entry, out } = flush_keep(t);
+            { keep: keep, deleted: removed_entry, come: joined(added_entry, xs), out: out }
           },
         }),
     ),
   ).out
 
 fn flush_change<a>(t: TidyState<a>) -> TidyState<a> = {
-  let { keep, gone: removed_entry, come: added_entry, out } = t;
+  let { keep, deleted: removed_entry, come: added_entry, out } = t;
   let cut = if removed_entry.len() == 0 { out } else { out.push(Delete(removed_entry)) };
   {
     keep: keep,
-    gone: [],
+    deleted: [],
     come: [],
     out: if added_entry.len() == 0 { cut } else { cut.push(Insert(added_entry)) },
   }
 }
 
 fn flush_keep<a>(t: TidyState<a>) -> TidyState<a> = {
-  let { keep, gone: removed_entry, come: added_entry, out } = t;
+  let { keep, deleted: removed_entry, come: added_entry, out } = t;
   {
     keep: [],
-    gone: removed_entry,
+    deleted: removed_entry,
     come: added_entry,
     out: if keep.len() == 0 { out } else { out.push(Keep(keep)) },
   }
@@ -371,15 +371,15 @@ pub type MergeChunk<a> =
 pub type Sides<a> = new { base: List<a>, ours: List<a>, theirs: List<a> }
 
 /// A stretch of the base one side replaced: where, how many elements, and with what.
-type Swap<a> = { at: Int, gone: Int, come: List<a>, ours: Bool }
+type Swap<a> = { at: Int, removed: Int, added: List<a>, ours: Bool }
 
-type SwapState<a> = { i: Int, held: Option<Swap<a>>, out: List<Swap<a>> }
+type SwapState<a> = { i: Int, pending: Option<Swap<a>>, out: List<Swap<a>> }
 
 type MergeState<a> = {
   pos: Int,
   clean: List<a>,
   out: List<MergeChunk<a>>,
-  open: Bool,
+  group_open: Bool,
   lo: Int,
   hi: Int,
   mine: List<Swap<a>>,
@@ -401,19 +401,20 @@ pub fn merge<a>(
   let all = swaps(diff(base, ours, limit), true).concat(
     swaps(diff(base, theirs, limit), false),
   ).sort_by(|x: Swap<a>, y: Swap<a>| x.at <= y.at);
-  let { pos, clean: calm, out, open: _, lo: _, hi: _, mine: _, yours: _ } = flush_group(
+  let { pos, clean: calm, out, group_open: _, lo: _, hi: _, mine: _, yours: _ } = flush_group(
     base,
     all.fold(
-      { pos: 0, clean: [], out: [], open: false, lo: 0, hi: 0, mine: [], yours: [] },
+      { pos: 0, clean: [], out: [], group_open: false, lo: 0, hi: 0, mine: [], yours: [] },
       |g: MergeState<a>, s: Swap<a>| {
-        let { pos, clean: calm, out, open, lo, hi, mine, yours } = if g.open && s.at <= g.hi { g }
+        let { pos, clean: calm, out, group_open: open, lo, hi, mine, yours } = if g.group_open
+            && s.at <= g.hi { g }
         else { flush_group(base, g) };
-        let end = s.at + s.gone;
+        let end = s.at + s.removed;
         {
           pos: pos,
           clean: calm,
           out: out,
-          open: true,
+          group_open: true,
           lo: if open { lo } else { s.at },
           hi: if open && hi > end { hi } else { end },
           mine: if s.ours { mine.push(s) } else { mine },
@@ -432,12 +433,21 @@ pub fn merge<a>(
 fn flush_group<a>(base: List<a>, g: MergeState<a>) -> MergeState<a>
   where derivable(eq, a)
 =
-  if !g.open { g } else {
-    let { pos, clean: calm, out, open: _, lo, hi, mine, yours } = g;
+  if !g.group_open { g } else {
+    let { pos, clean: calm, out, group_open: _, lo, hi, mine, yours } = g;
     let led = joined(calm, slice(base, pos, lo - pos));
     let ours = side(base, lo, hi, mine);
     let theirs = side(base, lo, hi, yours);
-    let clear = { pos: hi, clean: [], out: out, open: false, lo: 0, hi: 0, mine: [], yours: [] };
+    let clear = {
+      pos: hi,
+      clean: [],
+      out: out,
+      group_open: false,
+      lo: 0,
+      hi: 0,
+      mine: [],
+      yours: [],
+    };
     if yours.len() == 0 || ours == theirs { { ..clear, clean: joined(led, ours) } }
     else if mine.len() == 0 { { ..clear, clean: joined(led, theirs) } } else {
       let resolved = if led.len() == 0 { out } else { out.push(Resolved(led)) };
@@ -454,28 +464,28 @@ fn flush_group<a>(base: List<a>, g: MergeState<a>) -> MergeState<a>
 fn side<a>(base: List<a>, lo: Int, hi: Int, swaps: List<Swap<a>>) -> List<a> = {
   let { at, out } = swaps.fold({ at: lo, out: [] }, |s: { at: Int, out: List<a> }, w: Swap<a>| {
     let { at, out } = s;
-    { at: w.at + w.gone, out: out.concat(slice(base, at, w.at - at)).concat(w.come) }
+    { at: w.at + w.removed, out: out.concat(slice(base, at, w.at - at)).concat(w.added) }
   });
   out.concat(slice(base, at, hi - at))
 }
 
 /// A script's changes as stretches of its first list replaced.
 fn swaps<a>(script: List<Edit<a>>, ours: Bool) -> List<Swap<a>> = {
-  let { i: _, held, out } = tidy(script).fold(
-    { i: 0, held: None, out: [] },
+  let { i: _, pending: held, out } = tidy(script).fold(
+    { i: 0, pending: None, out: [] },
     |s: SwapState<a>, e: Edit<a>| {
-      let { i, held, out } = s;
+      let { i, pending: held, out } = s;
       match e {
-        Keep(xs) -> { i: i + xs.len(), held: None, out: with_pending(out, held) },
+        Keep(xs) -> { i: i + xs.len(), pending: None, out: with_pending(out, held) },
         Delete(xs) ->
           {
             i: i + xs.len(),
-            held: Some({ at: i, gone: xs.len(), come: [], ours: ours }),
+            pending: Some({ at: i, removed: xs.len(), added: [], ours: ours }),
             out: with_pending(out, held),
           },
         Insert(xs) -> match held {
-          Some(w) -> { i: i, held: Some({ ..w, come: joined(w.come, xs) }), out: out },
-          None -> { i: i, held: Some({ at: i, gone: 0, come: xs, ours: ours }), out: out },
+          Some(w) -> { i: i, pending: Some({ ..w, added: joined(w.added, xs) }), out: out },
+          None -> { i: i, pending: Some({ at: i, removed: 0, added: xs, ours: ours }), out: out },
         },
       }
     },
@@ -979,11 +989,11 @@ fn item_differences(
     { shift: 0, out: [] },
     |s: { shift: Int, out: List<Difference> }, w: Swap<Value>| {
       let { shift, out } = s;
-      let most = if w.gone > w.come.len() { w.gone } else { w.come.len() };
+      let most = if w.removed > w.added.len() { w.removed } else { w.added.len() };
       {
-        shift: shift + w.come.len() - w.gone,
+        shift: shift + w.added.len() - w.removed,
         out: range(0, most).fold(out, |acc: List<Difference>, k: Int|
-          match ((if k < w.gone { old.at(w.at + k) } else { None }, w.come.at(k))) {
+          match ((if k < w.removed { old.at(w.at + k) } else { None }, w.added.at(k))) {
             (Some(x), Some(y)) ->
               acc.concat(value_differences(x, y, path.push(AtItem(w.at + k)), remaining)),
             (Some(x), None) -> acc.push(difference_at(path, AtItem(w.at + k), Removed(x))),
@@ -1087,7 +1097,7 @@ type Side = {
   n: Int,
   m: Int,
   delta: Int,
-  reach: Int,
+  max_diagonal: Int,
 }
 
 /// A frontier, and the point a search stopped at; `x` is negative if it has not stopped.
@@ -1281,7 +1291,7 @@ reuse fn search<a>(
         n: n,
         m: m,
         delta: n - m,
-        reach: if odd { d - 1 } else { 0 - 1 },
+        max_diagonal: if odd { d - 1 } else { 0 - 1 },
       },
       d,
       0 - d,
@@ -1300,7 +1310,7 @@ reuse fn search<a>(
           n: n,
           m: m,
           delta: n - m,
-          reach: if odd { 0 - 1 } else { d },
+          max_diagonal: if odd { 0 - 1 } else { d },
         },
         d,
         0 - d,
@@ -1343,9 +1353,9 @@ reuse fn sweep<a>(
       let x = from
         + run(xs, ys, s.origin_a + s.step * from, s.origin_b + s.step * y, s.step, remaining, 0);
       let across = s.delta - k;
-      if across >= 0 - s.reach && across <= s.reach && x + v.get(s.other + across) >= s.n {
-        { v: v, x: x, y: x - k }
-      } else { sweep(v.set(s.base + k, x), xs, ys, s, d, k + 2) }
+      if across >= 0 - s.max_diagonal && across <= s.max_diagonal
+          && x + v.get(s.other + across) >= s.n { { v: v, x: x, y: x - k } }
+      else { sweep(v.set(s.base + k, x), xs, ys, s, d, k + 2) }
     }
   }
 

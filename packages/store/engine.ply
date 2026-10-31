@@ -55,7 +55,7 @@ pub type Store = {
   schema: Bytes,
   manifest: Manifest,
   rows: List<Bytes>,
-  lost: List<Bytes>,
+  unreadable_segments: List<Bytes>,
   puts: Map<Bytes, Bytes>,
   deleted: Map<Bytes, Bool>,
   warnings: List<Warning>,
@@ -78,7 +78,7 @@ fn add_warning(ws: List<Warning>, w: Warning) -> List<Warning> =
 
 pub fn messages(ws: List<Warning>) -> List<String> = ws.map(|w: Warning| w.message)
 
-type SegmentRows = { rows: List<Bytes>, lost: List<Bytes> }
+type SegmentRows = { rows: List<Bytes>, unreadable_segments: List<Bytes> }
 
 /// Each segment's rows of `m`, taken from `cached_rows` where a run read them already: a segment whose
 /// rows do not read holds nothing a run can find, and is named among the lost.
@@ -87,17 +87,21 @@ fn read_rows<[r]>(
   m: Manifest,
   cached_rows: Map<Bytes, Bytes>,
 ) -> SegmentRows / {fs.read[r], abort.raise} =
-  m.segments.fold({ rows: [], lost: [] }, |acc: SegmentRows, seg: Segment|
+  m.segments.fold({ rows: [], unreadable_segments: [] }, |acc: SegmentRows, seg: Segment|
     match cached_rows.get(seg.token) {
-      Some(b) -> { rows: acc.rows.push(b), lost: acc.lost },
+      Some(b) -> { rows: acc.rows.push(b), unreadable_segments: acc.unreadable_segments },
       None -> match segments::table_rows[r](dir, seg, rows_table()) {
-        Some(b) -> { rows: acc.rows.push(b), lost: acc.lost },
-        None -> { rows: acc.rows.push(b""), lost: acc.lost.push(seg.token) },
+        Some(b) -> { rows: acc.rows.push(b), unreadable_segments: acc.unreadable_segments },
+        None ->
+          {
+            rows: acc.rows.push(b""),
+            unreadable_segments: acc.unreadable_segments.push(seg.token),
+          },
       },
     })
 
 fn warn_lost_segments(store: Store) -> Store =
-  if store.lost.len() == 0 { store } else {
+  if store.unreadable_segments.len() == 0 { store } else {
     warn(store, Corrupt, "a part of the store does not read; its entries are treated as absent")
   }
 
@@ -111,7 +115,7 @@ pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise
     schema: shapes,
     manifest: m,
     rows: read.rows,
-    lost: read.lost,
+    unreadable_segments: read.unreadable_segments,
     puts: Map::new(),
     deleted: Map::new(),
     warnings: [],
@@ -274,7 +278,7 @@ fn warn_not_flushed(store: Store, reason: String) -> Store =
 fn with_manifest<[r]>(store: Store, m: Manifest) -> Store / {fs.read[r], abort.raise} = {
   let cached_rows = range(0, store.rows.len()).fold(Map::new(), |acc: Map<Bytes, Bytes>, i: Int| {
     let token = store.manifest.segments.get(i).token;
-    if store.lost.fold(false, |any: Bool, t: Bytes| any || t == token) { acc }
+    if store.unreadable_segments.fold(false, |any: Bool, t: Bytes| any || t == token) { acc }
     else { acc.insert(token, store.rows.get(i)) }
   });
   let read = read_rows[r](store.dir, m, cached_rows);
@@ -282,7 +286,7 @@ fn with_manifest<[r]>(store: Store, m: Manifest) -> Store / {fs.read[r], abort.r
     ..store,
     manifest: m,
     rows: read.rows,
-    lost: read.lost,
+    unreadable_segments: read.unreadable_segments,
     puts: Map::new(),
     deleted: Map::new(),
   })
@@ -348,7 +352,13 @@ fn write_segment<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.writ
   };
   match finish_segment[r](store, token, segment) {
     None -> warn_not_flushed(store, "the store's data could not be written"),
-    Some(seg) -> match segments::commit[r](store.dir, store.schema, seg, store.lost, true) {
+    Some(seg) -> match segments::commit[r](
+        store.dir,
+        store.schema,
+        seg,
+        store.unreadable_segments,
+        true,
+      ) {
       Committed(m) -> clean_up[r](with_manifest[r](store, m), run),
       LockHeld -> {
         remove_segment[r](store, token);

@@ -176,7 +176,7 @@ fn group_printed(
     site: None,
     arm: None,
     looping: None,
-    landing: None,
+    handler_jump: None,
     group: None,
     unwinds: [],
     epilogue: b"",
@@ -360,7 +360,7 @@ fn body_printed(
     site: sited,
     arm: None,
     looping: None,
-    landing: match f.links.pending { Some(_) -> Some(b"goto ply_pending;"), None -> None },
+    handler_jump: match f.links.pending { Some(_) -> Some(b"goto ply_pending;"), None -> None },
     group: None,
     unwinds: [],
     epilogue: return_epilogue(f),
@@ -430,7 +430,7 @@ fn needs_stack_check(f: Fn) -> Bool =
   !restarts(f.body) && (match f.key { Generated(_, _) -> true, _ -> calls_in(f.body) })
 
 fn failure_target(u: BodyContext) -> Bytes =
-  match u.landing { Some(j) -> j, None -> failing_return(u.result) }
+  match u.handler_jump { Some(j) -> j, None -> failing_return(u.result) }
 
 fn exiting(
   p: InstructionContext,
@@ -440,8 +440,12 @@ fn exiting(
   value: Rvalue,
 ) -> Printing / {abort.raise} = {
   let x = failure_exit_through(pr, p.u.unwinds, unwind, failure_target(p.u));
-  let l = site_linked({ ..p, leave: x.leave }, x.printing, unwind, value);
-  let after = unlinked(value_printed({ ..p, leave: l.leave }, l.printing, into, value), p.depth, l);
+  let l = site_linked({ ..p, exit_statement: x.leave }, x.printing, unwind, value);
+  let after = unlinked(
+    value_printed({ ..p, exit_statement: l.leave }, l.printing, into, value),
+    p.depth,
+    l,
+  );
   if x.printing.tails.all.len() == pr.tails.all.len()
       || range(pr.out.len(), after.out.len()).any(|i: Int|
         match after.out.at(i) { Some(Text(t)) -> t.index_of(x.leave) != None, _ -> false }) {
@@ -449,18 +453,18 @@ fn exiting(
   } else { { ..after, tails: pr.tails } }
 }
 
-type BlockState = { printing: Printing, u: BodyContext, outer: List<BodyContext> }
+type BlockState = { printing: Printing, context: BodyContext, outer: List<BodyContext> }
 
 fn with_cleanup_scope(s: BlockState, held: Option<List<Unwinding>>) -> BlockState =
   match held {
     Some(xs) -> {
       let id = |x: Unwinding| match operand_var(x.arg) { Some(v) -> v.id, None -> -1 };
       let ids = xs.map(id);
-      let around = s.u.unwinds.filter(|x: Unwinding| !ids.contains(id(x)));
-      { ..s, u: { ..s.u, unwinds: xs.concat(around) }, outer: s.outer.push(s.u) }
+      let around = s.context.unwinds.filter(|x: Unwinding| !ids.contains(id(x)));
+      { ..s, context: { ..s.context, unwinds: xs.concat(around) }, outer: s.outer.push(s.context) }
     },
     None -> match s.outer.at(s.outer.len() - 1) {
-      Some(o) -> { ..s, u: o, outer: s.outer.take(s.outer.len() - 1) },
+      Some(o) -> { ..s, context: o, outer: s.outer.take(s.outer.len() - 1) },
       None -> s,
     },
   }
@@ -470,20 +474,20 @@ fn with_site_scope(s: BlockState, borrowed: Option<SiteOrigin>) -> BlockState =
     Some(l) ->
       {
         ..s,
-        u: { ..s.u, site: Some(LambdaOwner(l.root)), base: l.base },
-        outer: s.outer.push(s.u),
+        context: { ..s.context, site: Some(LambdaOwner(l.root)), base: l.base },
+        outer: s.outer.push(s.context),
       },
     None -> match s.outer.at(s.outer.len() - 1) {
-      Some(o) -> { ..s, u: o, outer: s.outer.take(s.outer.len() - 1) },
+      Some(o) -> { ..s, context: o, outer: s.outer.take(s.outer.len() - 1) },
       None -> s,
     },
   }
 
 fn printed(home: BodyContext, pr: Printing, b: Block, depth: Int) -> Printing / {abort.raise} =
-  b.fold({ printing: pr, u: home, outer: [] }, |sites: BlockState, i: Inst| {
-    let u = sites.u;
+  b.fold({ printing: pr, context: home, outer: [] }, |sites: BlockState, i: Inst| {
+    let u = sites.context;
     let acc = sites.printing;
-    let p = { u: u, at: span_between(0, 0), leave: failure_target(u), depth: depth };
+    let p = { u: u, at: span_between(0, 0), exit_statement: failure_target(u), depth: depth };
     let inner = depth + 1;
     match i {
       SiteScope(borrowed) -> with_site_scope(sites, borrowed),
@@ -570,7 +574,7 @@ fn printed(home: BodyContext, pr: Printing, b: Block, depth: Int) -> Printing / 
             },
             Fail(x) -> {
               let out = failure_exit_through(acc, x.resource, x.unwind, failure_target(u));
-              failed({ ..p, at: x.at, leave: out.leave }, out.printing, x.reason)
+              failed({ ..p, at: x.at, exit_statement: out.leave }, out.printing, x.reason)
             },
             Loop(lp) -> {
               let l = label(acc);
@@ -633,15 +637,15 @@ fn printed(home: BodyContext, pr: Printing, b: Block, depth: Int) -> Printing / 
               let l = label(acc);
               let x = failure_exit_through(l.printing, u.unwinds, h.unwind, failure_target(u));
               let f = handle_linked(
-                { ..p, leave: x.leave },
+                { ..p, exit_statement: x.leave },
                 x.printing,
                 l.n,
                 h.body,
                 h.site,
                 h.unwind,
               );
-              let hp = { ..p, leave: f.leave };
-              let inside = { ..u, landing: Some(landing_jump(l.n)), unwinds: [] };
+              let hp = { ..p, exit_statement: f.leave };
+              let inside = { ..u, handler_jump: Some(landing_jump(l.n)), unwinds: [] };
               let opened = handle_opened(hp, f.printing, l.n, h.args, h.uses, h.site, h.result);
               unlinked(
                 handle_closed(
@@ -920,8 +924,8 @@ fn restart_printed(
     params: [n, acc],
     convention: {
       params: [
-        { handed: OwnedParam, representation: AsInt },
-        { handed: OwnedParam, representation: AsInt },
+        { ownership: OwnedParam, representation: AsInt },
+        { ownership: OwnedParam, representation: AsInt },
       ],
       result: AsInt,
       destination_passing: false,
@@ -1086,7 +1090,7 @@ test "a tail group is one function switching on its member's place, each arm ope
   let n = { id: 1, ty: int, representation: AsInt };
   let m = { id: 2, ty: int, representation: AsInt };
   let conv = {
-    params: [{ handed: OwnedParam, representation: AsInt }],
+    params: [{ ownership: OwnedParam, representation: AsInt }],
     result: AsInt,
     destination_passing: false,
     returned: OwnedResult,
@@ -1098,7 +1102,7 @@ test "a tail group is one function switching on its member's place, each arm ope
         kind: Metered,
         params: [which],
         convention: {
-          params: [{ handed: OwnedParam, representation: AsInt }],
+          params: [{ ownership: OwnedParam, representation: AsInt }],
           result: AsWord,
           destination_passing: false,
           returned: OwnedResult,
@@ -1157,7 +1161,7 @@ test "a closure's function follows its root's, and its body numbers its temporar
     kind: Metered,
     params: [x],
     convention: {
-      params: [{ handed: OwnedParam, representation: AsInt }],
+      params: [{ ownership: OwnedParam, representation: AsInt }],
       result: AsInt,
       destination_passing: false,
       returned: OwnedResult,
@@ -1199,7 +1203,7 @@ test "a plain root never probes the stack; a drop root nests through the release
       kind: Plain,
       params: [o],
       convention: {
-        params: [{ handed: OwnedParam, representation: AsWord }],
+        params: [{ ownership: OwnedParam, representation: AsWord }],
         result: AsWord,
         destination_passing: false,
         returned: OwnedResult,
@@ -1325,7 +1329,7 @@ test "a field taken moves out of a block held only here, in place in another or 
   let f = {
     ..int_root([block], [Let({ var: field, value: Take({ of: block, path: FieldPath({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(IntOperand(0))]),
     convention: {
-      params: [{ handed: OwnedParam, representation: AsWord }],
+      params: [{ ownership: OwnedParam, representation: AsWord }],
       result: AsWord,
       destination_passing: false,
       returned: OwnedResult,

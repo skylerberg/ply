@@ -523,7 +523,7 @@ pub type MemListener = {
 /// A connection in a fake. `script` is what the far end does next. `may_send_more` means the far end may
 /// send more than the script contains, which is true while it is the program's own and open.
 /// `gone` means it will accept nothing more. `sent` is everything this end sent except
-/// credentials, which `sealed` stores as `send_secret` framed them. `unheard` is what no `Expects`
+/// credentials, which `sent_secrets` stores as `send_secret` framed them. `unheard` is what no `Expects`
 /// has matched yet, and `deadlines` is the deadline each read was given, in order.
 pub type MemConn = {
   label: Option<String>,
@@ -535,33 +535,33 @@ pub type MemConn = {
   gone: Bool,
   ended: Bool,
   sent: Bytes,
-  sealed: List<Secret<Bytes>>,
+  sent_secrets: List<Secret<Bytes>>,
   unheard: Bytes,
   deadlines: List<Int>,
-  secured: Option<String>,
+  tls_name: Option<String>,
   /// The application protocol the connection's handshake agreed on, if it agreed on one.
   negotiated: Option<String>,
   options: List<SocketOption>,
   credentials: Option<PeerCredentials>,
   /// Whether `accept` returned the connection, and the certificate its client presents, if any.
   accepted: Bool,
-  presented: Option<Bytes>,
+  client_certificate: Option<Bytes>,
 }
 
-/// One network, as a value. `short` is the most bytes one `recv` or `send` moves, or zero for as
+/// One network, as a value. `chunk_limit` is the most bytes one `recv` or `send` moves, or zero for as
 /// many as requested. `closed` is each handle `close` released, in order.
 pub type MemNet = {
   next: Int,
   port: Int,
   listeners: Map<Int, MemListener>,
   conns: Map<Int, MemConn>,
-  reaches: Map<String, Endpoint>,
+  endpoints: Map<String, Endpoint>,
   callers: List<Caller>,
   names: dns::Table,
   credentials: List<String>,
   /// The certificate (DER) a far end secured under each name presents.
   leaves: Map<String, Bytes>,
-  short: Int,
+  chunk_limit: Int,
   closed: List<Int>,
 }
 
@@ -575,12 +575,12 @@ pub fn mem_empty() -> MemNet =
     port: 49152,
     listeners: Map::new(),
     conns: Map::new(),
-    reaches: Map::new(),
+    endpoints: Map::new(),
     callers: [],
     names: dns::table(),
     credentials: [],
     leaves: Map::new(),
-    short: 0,
+    chunk_limit: 0,
     closed: [],
   }
 
@@ -592,11 +592,11 @@ pub fn mem_server_certificate(n: MemNet, name: String, der: Bytes) -> MemNet =
 /// The network with a peer at `at` that serves each connection with the next of `scripts`, and
 /// refuses connections once its scripts run out.
 pub fn mem_serving(n: MemNet, at: SocketAddress, scripts: List<List<Step>>) -> MemNet =
-  { ..n, reaches: n.reaches.insert(ip::render_socket(at), Serving(scripts)) }
+  { ..n, endpoints: n.endpoints.insert(ip::render_socket(at), Serving(scripts)) }
 
 /// The network with every connection to `at` failing with `reason`.
 pub fn mem_failing(n: MemNet, at: SocketAddress, reason: Error) -> MemNet =
-  { ..n, reaches: n.reaches.insert(ip::render_socket(at), Failing(reason)) }
+  { ..n, endpoints: n.endpoints.insert(ip::render_socket(at), Failing(reason)) }
 
 /// The network with a peer on the Unix socket at `path` under `root`.
 pub fn mem_serving_unix(
@@ -604,7 +604,7 @@ pub fn mem_serving_unix(
   root: String,
   path: String,
   scripts: List<List<Step>>,
-) -> MemNet = { ..n, reaches: n.reaches.insert(unix_key(root, path), Serving(scripts)) }
+) -> MemNet = { ..n, endpoints: n.endpoints.insert(unix_key(root, path), Serving(scripts)) }
 
 /// The network with one more client for `accept` to return, connecting from `from` and running
 /// `script`.
@@ -659,7 +659,7 @@ pub fn mem_credential(n: MemNet, name: String) -> MemNet =
 
 /// The network moving at most `most` bytes in each `recv` and `send` from here on, and as many as
 /// requested when `most` is zero: the short reads and partial writes a real socket produces.
-pub fn mem_chunk_limit(n: MemNet, most: Int) -> MemNet = { ..n, short: most }
+pub fn mem_chunk_limit(n: MemNet, most: Int) -> MemNet = { ..n, chunk_limit: most }
 
 /// Everything the program sent on `conn` except credentials, whether or not it is still open.
 pub fn mem_sent(n: MemNet, conn: Int) -> Bytes =
@@ -668,7 +668,7 @@ pub fn mem_sent(n: MemNet, conn: Int) -> Bytes =
 /// Each credential the program sent on `conn` by `send_secret`, in its frame and in order, sealed,
 /// for a test to compare whole with the one it expects.
 pub fn mem_sent_secrets(n: MemNet, conn: Int) -> List<Secret<Bytes>> =
-  match n.conns.get(conn) { Some(c) -> c.sealed, None -> [] }
+  match n.conns.get(conn) { Some(c) -> c.sent_secrets, None -> [] }
 
 /// What `conn`'s far end has yet to do: empty when the program has run its script to the end.
 pub fn mem_remaining_script(n: MemNet, conn: Int) -> List<Step> =
@@ -681,7 +681,7 @@ pub fn mem_deadlines(n: MemNet, conn: Int) -> List<Int> =
 
 /// The name or credential `conn` was secured as, or `None` for plaintext.
 pub fn mem_secured(n: MemNet, conn: Int) -> Option<String> =
-  match n.conns.get(conn) { Some(c) -> c.secured, None -> None }
+  match n.conns.get(conn) { Some(c) -> c.tls_name, None -> None }
 
 fn unix_key(root: String, path: String) -> String = "unix:" ++ root ++ "/" ++ path
 
@@ -821,15 +821,15 @@ fn new_conn(
     gone: false,
     ended: false,
     sent: b"",
-    sealed: [],
+    sent_secrets: [],
     unheard: b"",
     deadlines: [],
-    secured: None,
+    tls_name: None,
     negotiated: None,
     options: [NoDelay(true)],
     credentials: None,
     accepted: false,
-    presented: None,
+    client_certificate: None,
   }
 
 /// The listener bound at `key`, if the program has one there.
@@ -849,7 +849,7 @@ fn bind(
   let assigned = if port == 0 { n.port } else { port };
   let at = ip::socket_at(address, assigned);
   let key = ip::render_socket(at);
-  if bound_at(n, key) != None || n.reaches.contains(key) { { net: n, result: Err(AddressInUse) } }
+  if bound_at(n, key) != None || n.endpoints.contains(key) { { net: n, result: Err(AddressInUse) } }
   else {
     let l: MemListener = {
       label: label,
@@ -930,7 +930,7 @@ pub fn mem_listen_unix(
   path: String,
 ) -> StepResult<Result<Int, Error>> = {
   let key = unix_key(root, path);
-  if bound_at(n, key) != None || n.reaches.contains(key) { { net: n, result: Err(AddressInUse) } }
+  if bound_at(n, key) != None || n.endpoints.contains(key) { { net: n, result: Err(AddressInUse) } }
   else {
     let l: MemListener = { label: label, at: None, key: key, tls: None, waiting: [], options: [] };
     { net: { ..n, next: n.next + 1, listeners: n.listeners.insert(n.next, l) }, result: Ok(n.next) }
@@ -961,9 +961,9 @@ fn opened(
         ..accepted,
         joined: Some(n.next),
         may_send_more: true,
-        secured: l.tls,
+        tls_name: l.tls,
         accepted: true,
-        presented: presented_by(n, options),
+        client_certificate: presented_by(n, options),
       };
       {
         net: {
@@ -982,14 +982,14 @@ fn opened(
         result: Ok(n.next),
       }
     },
-    None -> match n.reaches.get(key) {
+    None -> match n.endpoints.get(key) {
       Some(Serving([script, ..rest])) ->
         {
           net: {
             ..after,
             next: n.next + 1,
             conns: n.conns.insert(n.next, { ..mine, script: script }),
-            reaches: n.reaches.insert(key, Serving(rest)),
+            endpoints: n.endpoints.insert(key, Serving(rest)),
           },
           result: Ok(n.next),
         },
@@ -1079,7 +1079,7 @@ pub fn mem_connect_tls(
         {
           net: with_conn(connect_first_address.net, id, {
             ..c,
-            secured: Some(host),
+            tls_name: Some(host),
             negotiated: Some("http/1.1"),
           }),
           result: Some(id),
@@ -1104,10 +1104,10 @@ pub fn mem_accept(n: MemNet, label: String, listener: Int) -> StepResult<Int> / 
         let fresh = new_conn(l.at, caller.from, caller.script);
         let c = {
           ..fresh,
-          secured: l.tls,
+          tls_name: l.tls,
           credentials: caller.credentials,
           accepted: true,
-          presented: caller.certificate,
+          client_certificate: caller.certificate,
         };
         {
           net: { ..n, next: n.next + 1, callers: rest, conns: n.conns.insert(n.next, c) },
@@ -1131,7 +1131,7 @@ pub fn mem_recv(
   let wanted = checked_read_size(max);
   let asked = advance_script(conn_of(n, label, conn));
   let c = { ..asked, deadlines: asked.deadlines.push(timeout_ms) };
-  let most = if n.short > 0 { min(wanted, n.short) } else { wanted };
+  let most = if n.chunk_limit > 0 { min(wanted, n.chunk_limit) } else { wanted };
   match c.script {
     [] -> { net: with_conn(n, conn, c), result: if c.may_send_more { None } else { Some(b"") } },
     [Sends(bytes), ..rest] -> if bytes.len() > most {
@@ -1164,7 +1164,8 @@ pub fn mem_send(
     match c.script {
       [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: None },
       _ -> {
-        let size = if n.short > 0 { min(payload.len(), n.short) } else { payload.len() };
+        let size = if n.chunk_limit > 0 { min(payload.len(), n.chunk_limit) }
+        else { payload.len() };
         let part = payload.slice(0, size);
         let mine = advance_script({
           ..c,
@@ -1220,7 +1221,7 @@ pub fn mem_send_secret(
         ++ ": nothing in Ply opens it",
     )
   } else {
-    let kept = { ..c, sealed: c.sealed.push(framed) };
+    let kept = { ..c, sent_secrets: c.sent_secrets.push(framed) };
     match c.script {
       [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), result: false },
       [Expects(expected), ..] ->
@@ -1307,7 +1308,7 @@ fn upgraded(
   let c = advance_script(conn_of(n, label, conn));
   let secured = |rest: List<Step>| {
     {
-      net: with_conn(n, conn, { ..c, script: rest, secured: Some(who), negotiated: alpn.at(0) }),
+      net: with_conn(n, conn, { ..c, script: rest, tls_name: Some(who), negotiated: alpn.at(0) }),
       result: Ok({ protocol: alpn.at(0) }),
     }
   };
@@ -1328,7 +1329,7 @@ fn upgraded(
       result: Err(reason),
     }
   };
-  if c.secured != None {
+  if c.tls_name != None {
     panic(
       "`net." ++ operation ++ "` cannot secure socket " ++ conn.to_string()
         ++ ": it is already TLS",
@@ -1383,7 +1384,7 @@ pub fn mem_handshake(
   conn: Int,
 ) -> StepResult<Option<Int>> / {abort.raise} = {
   let c = conn_of(n, label, conn);
-  { net: with_conn(n, conn, c), result: if c.secured == None { None } else { Some(0) } }
+  { net: with_conn(n, conn, c), result: if c.tls_name == None { None } else { Some(0) } }
 }
 
 /// Which setting an option is, whatever it sets it to.
@@ -1425,7 +1426,7 @@ pub fn mem_set_option(
       let set = with_conn(n, socket, { ..c, options: with_option(c.options, option) });
       let presenting = match ((c.accepted, c.joined)) {
         (false, Some(peer)) -> match set.conns.get(peer) {
-          Some(p) -> with_conn(set, peer, { ..p, presented: presented_by(n, [option]) }),
+          Some(p) -> with_conn(set, peer, { ..p, client_certificate: presented_by(n, [option]) }),
           None -> set,
         },
         _ -> set,
@@ -1489,8 +1490,8 @@ pub fn mem_peer_certificate(n: MemNet, label: String, conn: Int) -> Option<Bytes
   match n.conns.get(conn) {
     Some(_) -> {
       let c = conn_of(n, label, conn);
-      match c.secured {
-        Some(name) -> if c.accepted { c.presented } else { n.leaves.get(name) },
+      match c.tls_name {
+        Some(name) -> if c.accepted { c.client_certificate } else { n.leaves.get(name) },
         None -> None,
       }
     },

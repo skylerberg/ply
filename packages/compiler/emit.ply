@@ -101,7 +101,7 @@ pub type LoweredProgram = {
   stated: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
   borrowed: Map<RootName, List<Int>>,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership_signatures: Map<RootName, OwnershipSignature>,
 }
 
 pub fn emit_program(
@@ -134,7 +134,11 @@ pub fn emit_program(
   )
 
 pub fn emitted_program(w: LoweredProgram) -> List<EmittedRoot> / {abort.raise} = {
-  let resolved = infer_signatures(inference_targets_of(w.borrowed, w.roots), w.handed, w.borrowed);
+  let resolved = infer_signatures(
+    inference_targets_of(w.borrowed, w.roots),
+    w.ownership_signatures,
+    w.borrowed,
+  );
   roots_emitted(w.roots, resolved, w.stated, w.constructors, 0, w.roots.len(), 64)
 }
 
@@ -166,7 +170,7 @@ fn root_emitted(
 ) -> EmittedRoot / {abort.raise} = {
   let l = inferred_fn(f, resolved);
   let e = with_instance_calls(stated, tags_in(l.form), emitted_of(l.form, constructors));
-  { ..e, tables: { ..e.tables, handings: l.handings, assumed: l.assumed, group: l.group } }
+  { ..e, tables: { ..e.tables, handings: l.own_signatures, assumed: l.assumed, group: l.group } }
 }
 
 fn lowered_program(
@@ -196,11 +200,11 @@ pub type Scope = {
   schemes: Map<Bytes, Scheme>,
   owned: Map<Bytes, BodyFacts>,
   reading: Map<Bytes, Bool>,
-  stated: Map<Bytes, List<Bytes>>,
+  declared_operations: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
   builtins: List<Bytes>,
   machine: Map<Bytes, MachineCall>,
-  release: Bool,
+  release_build: Bool,
   declared: Map<Bytes, Scheme>,
   borrowed: Map<RootName, List<Int>>,
   hosts: Map<Bytes, HostHandler>,
@@ -256,7 +260,7 @@ pub fn scope_of(
       module_packages: module_packages,
       std: packages.len() - 2,
       compiler: packages.len() - 1,
-      shipped: packages.len(),
+      other_shipped_package: packages.len(),
     }
   };
   let x = match resolve_packaged(
@@ -265,7 +269,7 @@ pub fn scope_of(
       packaged.module_packages,
       packaged.std,
       packaged.compiler,
-      packaged.shipped,
+      packaged.other_shipped_package,
     ) {
     ResolveFailed(diagnostics) -> unread(diagnostics_text(diagnostics)),
     ResolveSucceeded(x) -> x,
@@ -293,7 +297,7 @@ pub fn scope_of(
   let members = facts.members.fold(Map::new(), |acc: Map<Int, List<MemberSite>>, s: MemberSite|
     acc.insert(s.module, List::push(match acc.get(s.module) { Some(xs) -> xs, None -> [] }, s)));
   let natives = parsed_natives(modules);
-  let declared = declared_effects(x.r, published_operations(effects));
+  let declared = declared_effects(x.resolution, published_operations(effects));
   {
     modules: modules,
     places: range(0, modules.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
@@ -303,7 +307,7 @@ pub fn scope_of(
       {
         here: definitions_of(m.name),
         imports: resolved_imports(
-          x.r,
+          x.resolution,
           i,
           modules,
           m.module,
@@ -315,11 +319,11 @@ pub fn scope_of(
         effects: declared,
       }
     }),
-    resolved: x.r,
+    resolved: x.resolution,
     schemes: schemes,
     owned: facts_by_owner(facts),
     reading: reading,
-    stated: stated_by_tag(modules),
+    declared_operations: stated_by_tag(modules),
     constructors: {
       ..constructors,
       keyed: keyed_tags(modules).fold(constructors.keyed, |acc: List<Bytes>, k: Bytes|
@@ -327,7 +331,7 @@ pub fn scope_of(
     },
     builtins: natives.map(|e: Extern| e.name),
     machine: machine_calls(natives),
-    release: release,
+    release_build: release,
     declared: declared_schemes(),
     borrowed: program.fold(
       Map::new(),
@@ -356,12 +360,13 @@ fn host_handlers(
       match item {
         InstanceItem(d) -> if d.kind != HostInstance { held } else {
           let served = qualify(m.name, d.target.name);
-          match definitions_of(m.name).find(|definition: Definition| definition.name == d.by.name) {
+          match definitions_of(m.name).find(|definition: Definition|
+              definition.name == d.function.name) {
             None ->
               unread(
                 Bytes::concat_all([
                   b"the host handler `",
-                  d.by.name,
+                  d.function.name,
                   b"` of `",
                   served,
                   b"` is no definition",
@@ -369,7 +374,7 @@ fn host_handlers(
               ),
             Some(definition) ->
               held.insert(served, {
-                call: qualify(m.name, d.by.name),
+                call: qualify(m.name, d.function.name),
                 import: { name: served, module: m.name, definitions: [definition], whole: true },
               }),
           }
@@ -443,10 +448,10 @@ pub fn lowered_in(
     match s.modules.at(i) { Some(m) -> lowered.contains(m.name), None -> false });
   {
     roots: modules_formed(forming, lowering, 0, lowering.len(), 64),
-    stated: s.stated,
+    stated: s.declared_operations,
     constructors: s.constructors,
     borrowed: s.borrowed,
-    handed: handed,
+    ownership_signatures: handed,
   }
 }
 
@@ -485,14 +490,14 @@ fn module_at_formed(f: FormInputs, i: Int) -> List<Fn> / {abort.raise} =
         m.module,
         {
           module: m.name,
-          here: tab.here,
+          definitions: tab.here,
           imports: tab.imports,
           constructors: f.scope.constructors,
           builtins: f.scope.builtins,
           declared: f.scope.declared,
           machine: f.scope.machine,
           effects: tab.effects,
-          release: f.scope.release,
+          release_build: f.scope.release_build,
         },
         f,
         f.written.filter(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
@@ -542,7 +547,7 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
           nth: 0,
           code: first,
           module: m.name,
-          here: tab.here,
+          module_definitions: tab.here,
           imports: tab.imports,
           effects: tab.effects,
           base: base,
@@ -614,7 +619,7 @@ fn keyed_tags(modules: List<ParsedModule>) -> List<Bytes> =
     m.module.items.fold(acc, |a: List<Bytes>, item: Item|
       match item {
         InstanceItem(d) -> if d.kind != KeyInstance { a }
-        else { a.concat(with_stated(m, Map::new(), d.target.name, [d.by.name]).keys()) },
+        else { a.concat(with_stated(m, Map::new(), d.target.name, [d.function.name]).keys()) },
         _ -> a,
       }))
 
@@ -623,7 +628,7 @@ fn stated_by_tag(modules: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
     m.module.items.fold(acc, |a: Map<Bytes, List<Bytes>>, item: Item|
       match item {
         InstanceItem(d) -> if d.kind == InvariantInstance || d.kind == HostInstance { a }
-        else { with_stated(m, a, d.target.name, [d.by.name]) },
+        else { with_stated(m, a, d.target.name, [d.function.name]) },
         NumericItem(d) ->
           with_stated(m, a, d.target.name, d.operations.map(|x: NumericOp| x.by.name)),
         _ -> a,
@@ -711,7 +716,7 @@ fn module_formed(
   written_roots: List<{ key: RootKey, op: TypeOp, ty: Type }>,
 ) -> List<Fn> / {abort.raise} = {
   let module = s.module;
-  let here = s.here;
+  let here = s.definitions;
   let definitions = module_tree.items.fold(Map::new(), |m: Map<Bytes, FnDefinition>, item: Item|
     match item { FunctionItem(d) -> m.insert(qualify(module, d.name.name), d), _ -> m });
   let order = module_tree.items.fold(Map::new(), |m: Map<Bytes, Int>, item: Item|
@@ -732,11 +737,17 @@ fn module_formed(
     ),
   );
   walked.concat(
-    written_at_once({ s: s, items: module_tree.items }, written_roots, 0, written_roots.len(), 64),
+    written_at_once(
+      { module_context: s, items: module_tree.items },
+      written_roots,
+      0,
+      written_roots.len(),
+      64,
+    ),
   )
 }
 
-type WrittenFormInputs = { s: ModuleContext, items: List<Item> }
+type WrittenFormInputs = { module_context: ModuleContext, items: List<Item> }
 
 fn written_at_once(
   x: WrittenFormInputs,
@@ -760,9 +771,9 @@ fn written_formed(
   w: { key: RootKey, op: TypeOp, ty: Type },
 ) -> List<Fn> / {abort.raise} =
   naming(root_text(root_name(w.key)), || {
-    let s = x.s;
+    let s = x.module_context;
     let module = s.module;
-    let here = s.here;
+    let here = s.definitions;
     let module_tree = { items: x.items };
     let reached = || {
       let unreached = emitted_code().calls.filter(|n: Bytes|
@@ -778,7 +789,14 @@ fn written_formed(
       }
     };
     let written_root = |key: RootKey, e: GeneratedRoot|
-      root_from_code({ ..s, here: here.concat(e.here) }, 0, key, e.params, e.code, e.performs);
+      root_from_code(
+        { ..s, definitions: here.concat(e.definitions) },
+        0,
+        key,
+        e.params,
+        e.code,
+        e.performs,
+      );
     let r = { key: w.key, op: op_name(w.op), ty: w.ty };
     let reflective = match w.op { Reflect -> true, Show -> true, Digest -> true, _ -> false };
     let contained = match w.op {
@@ -911,7 +929,7 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
   let reading = f.scope.reading;
   let definitions = x.definitions;
   let order = x.order;
-  let here = s.here;
+  let here = s.definitions;
   let module_tree = x.module_tree;
   let written_roots = x.written_roots;
   let recorded_of = |owner: Bytes| recorded_annotations(f.scope.owned, owner);
@@ -998,7 +1016,7 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
       };
       let ran = {
         ..s,
-        here: s.here.push(
+        definitions: s.definitions.push(
           called_definition(module, tested, ps.map(param_type), unit_type(), performs, false),
         ),
       };
@@ -1177,13 +1195,13 @@ fn with_entry(
             f.effects,
             hosted.map(|h: { effect: Bytes, hosting: HostHandler }|
               { call: h.hosting.call, effect: h.effect, adds: added_by(h.hosting) }),
-            pure: s.here.any(|d: Definition| d.root == called.callee && d.pure),
+            pure: s.definitions.any(|d: Definition| d.root == called.callee && d.pure),
           );
           out.push(
             root_from_code(
               {
                 ..s,
-                here: s.here.concat(e.here),
+                definitions: s.definitions.concat(e.definitions),
                 imports: s.imports.concat(
                   hosted.map(|h: { effect: Bytes, hosting: HostHandler }| h.hosting.import),
                 ),

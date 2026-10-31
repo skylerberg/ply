@@ -1849,7 +1849,7 @@ pub type OutsideLink =
 /// How a tree is copied: what to do where the destination contains something, what to do with a
 /// link that would point out of the destination's root, and the most entries and file bytes the
 /// tree may contain (`LimitExceeded` past either, before anything is copied).
-pub type CopyOptions = { existing: Existing, outside: OutsideLink, entries: Int, bytes: Int }
+pub type CopyOptions = { existing: Existing, outside_link: OutsideLink, entries: Int, bytes: Int }
 
 /// What a copy passes its fold after each entry: the entry's path under the destination, its kind
 /// and a file's size, and the entries and bytes copied so far, including this one.
@@ -1871,15 +1871,26 @@ pub type CopyResult<a> = {
 type CopyState<a> = {
   done: CopyResult<a>,
   dirs: List<ScanEntry>,
-  firsts: Map<Int, { device: Int, path: String }>,
+  first_copies: Map<Int, { device: Int, path: String }>,
 }
 
 /// What a copy found before it began: the two trees' paths, the source's entries by their paths
 /// beneath it, starting with its own, and what the destination contains at each of those paths.
-type CopyPlan = { source: String, dest: String, entries: List<ScanEntry>, held: Map<String, Kind> }
+type CopyPlan = {
+  source: String,
+  dest: String,
+  entries: List<ScanEntry>,
+  destination_kinds: Map<String, Kind>,
+}
 
 /// What placing an entry left to do: nothing, or a file's bytes to copy to `to` from `from`.
-type PreparedEntry<a> = { copy: CopyState<a>, from: String, to: String, bytes: Bool, skipped: Bool }
+type PreparedEntry<a> = {
+  copy: CopyState<a>,
+  from: String,
+  to: String,
+  needs_bytes: Bool,
+  skipped: Bool,
+}
 
 /// Copies the tree at `from` to `to`, both under the root `l`: directories, files with their
 /// bytes, modes and modification times (to the millisecond, and none before the epoch), links as
@@ -1906,8 +1917,9 @@ pub fn copy_tree<a, [l] | e>(
       let p = placed[l, l](found, how, c, entry);
       if p.skipped { p.copy } else {
         apply_step(
-          if p.bytes { finish_file_copy[l](p.copy, p.to, entry.stat, fs.copy[l](p.from, p.to)) }
-          else { p.copy },
+          if p.needs_bytes {
+            finish_file_copy[l](p.copy, p.to, entry.stat, fs.copy[l](p.from, p.to))
+          } else { p.copy },
           p.to,
           entry.stat,
           step,
@@ -1934,7 +1946,7 @@ pub fn copy_tree_across<a, [s], [d] | e>(
       let p = placed[s, d](found, how, c, entry);
       if p.skipped { p.copy } else {
         apply_step(
-          if p.bytes {
+          if p.needs_bytes {
             finish_file_copy[d](
               p.copy,
               p.to,
@@ -2011,7 +2023,7 @@ fn empty_copy<a>(init: a) -> CopyState<a> =
   {
     done: { value: init, entries: 0, bytes: 0, skipped: [], stopped: false },
     dirs: [],
-    firsts: Map::new(),
+    first_copies: Map::new(),
   }
 
 /// What a copy of `from` to `to` must copy and what is already where it goes, with the destination
@@ -2056,7 +2068,7 @@ fn plan_copy<[s], [d]>(
       },
     },
   };
-  { source: source, dest: dest, entries: entries, held: held }
+  { source: source, dest: dest, entries: entries, destination_kinds: held }
 }
 
 /// Places one entry of a copy at its destination, except for a file's bytes: what was there is
@@ -2070,9 +2082,9 @@ fn placed<a, [s], [d]>(
 ) -> PreparedEntry<a> / {fs.read_link[s], fs.remove[d], fs.create_dir[d], fs.symlink[d], fs.link[d], files.fail} = {
   let src = below(found.source, entry.path);
   let destination = below(found.dest, entry.path);
-  let before = found.held.get(entry.path);
+  let before = found.destination_kinds.get(entry.path);
   let done = |copy: CopyState<a>|
-    { copy: copy, from: src, to: destination, bytes: false, skipped: false };
+    { copy: copy, from: src, to: destination, needs_bytes: false, skipped: false };
   match before {
     None -> (),
     Some(kind) -> if kind != Dir {
@@ -2088,7 +2100,7 @@ fn placed<a, [s], [d]>(
     Symlink -> match fs.read_link[s](src) {
       None -> files.fail(src, NotFound),
       Some(target) -> if resolve_target(segments(parent_of(destination)), target) == None {
-        match how.outside {
+        match how.outside_link {
           RejectLink -> files.fail(destination, CrossesRoot),
           SkipLink ->
             {
@@ -2099,9 +2111,10 @@ fn placed<a, [s], [d]>(
       } else if fs.symlink[d](destination, target) { done(c) }
       else { files.fail(destination, operation_failed("symlink")) },
     },
-    _ -> match c.firsts.get(entry.stat.id) {
-      None -> { ..done(c), bytes: true },
-      Some(first) -> if first.device != entry.stat.device { { ..done(c), bytes: true } } else {
+    _ -> match c.first_copies.get(entry.stat.id) {
+      None -> { ..done(c), needs_bytes: true },
+      Some(first) -> if first.device != entry.stat.device { { ..done(c), needs_bytes: true } }
+      else {
         match fs.link[d](destination, first.path) {
           Ok(_) -> done(c),
           Err(reason) -> files.fail(destination, reason),
@@ -2122,8 +2135,12 @@ fn finish_file_copy<a, [d]>(
   if !written { files.fail(destination, operation_failed("copy")) }
   else if !fs.set_modified[d](destination, stamp_ms(found)) {
     files.fail(destination, operation_failed("set_modified"))
-  } else if found.links < 2 { c }
-  else { { ..c, firsts: c.firsts.insert(found.id, { device: found.device, path: destination }) } }
+  } else if found.links < 2 { c } else {
+    {
+      ..c,
+      first_copies: c.first_copies.insert(found.id, { device: found.device, path: destination }),
+    }
+  }
 
 /// The copy after its fold is called with the entry at `destination`.
 fn apply_step<a | e>(
@@ -3531,7 +3548,7 @@ test "a temporary file a dead run left behind is in no later write's way" {
 }
 
 fn within(entries: Int, bytes: Int) -> CopyOptions =
-  { existing: Reject, outside: RejectLink, entries: entries, bytes: bytes }
+  { existing: Reject, outside_link: RejectLink, entries: entries, bytes: bytes }
 
 /// A tree with a file of each mode, a directory in a directory, an empty one, a link and a file
 /// with two names.
@@ -3642,7 +3659,8 @@ test "a link that would point out of the root it is copied to is rejected, or le
     "src/up",
     "../sib",
   ).fs;
-  let how = |outside: OutsideLink| { existing: Merge, outside: outside, entries: 100, bytes: 1000 };
+  let how = |outside: OutsideLink|
+    { existing: Merge, outside_link: outside, entries: 100, bytes: 1000 };
   assert_eq(copy_tried(tree, "src", "", how(RejectLink)).value, Err(("up", CrossesRoot)));
   let skipped = copy_tried(tree, "src", "", how(SkipLink));
   assert_eq(skipped.value, Ok({ value: 2, entries: 2, bytes: 1, skipped: ["up"], stopped: false }));

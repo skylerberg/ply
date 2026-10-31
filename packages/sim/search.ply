@@ -11,9 +11,9 @@ import std.list
 /// Whether two steps of different tasks are ordered by what they touch, or always.
 pub type Dependence = | Exact | EveryPair
 
-/// What a search run beside the pruned one explored; `bounded` when a spent budget or a failure
+/// What a search run beside the pruned one explored; `stopped_early` when a spent budget or a failure
 /// stopped it short of its frontier, so the count is a lower bound.
-pub type Cost = { explored: Int, bounded: Bool }
+pub type Cost = { explored: Int, stopped_early: Bool }
 
 pub type RaceSite = {
   task: Int,
@@ -23,7 +23,7 @@ pub type RaceSite = {
 }
 
 /// Two steps whose reordering at scheduling point `at` turned a pass into a failure.
-pub type Race = { left: RaceSite, right: RaceSite, at: Int }
+pub type Race = { left: RaceSite, right: RaceSite, scheduling_point: Int }
 
 /// `exhaustive` when every interleaving ran, up to reordering steps that do not conflict;
 /// `exhausted` when the budget was spent; `virtual_time` the last interleaving's.
@@ -32,7 +32,7 @@ pub type Exploration = {
   exhaustive: Bool,
   exhausted: Bool,
   naive: Option<Cost>,
-  blind: Option<Cost>,
+  no_clocks: Option<Cost>,
   steps: Int,
   virtual_time: Int,
   failure: Option<Seed>,
@@ -73,7 +73,7 @@ fn no_exploration() -> Exploration =
     exhaustive: false,
     exhausted: false,
     naive: None,
-    blind: None,
+    no_clocks: None,
     steps: 0,
     virtual_time: 0,
     failure: None,
@@ -140,7 +140,7 @@ pub fn measure_with_state<f, s | e>(
     let naive = naived.explored;
     let costed = {
       ..explored.exploration,
-      blind: Some(cost_of(blind)),
+      no_clocks: Some(cost_of(blind)),
       naive: Some(cost_of(naive)),
     };
     let skipped = [
@@ -175,10 +175,10 @@ pub fn measure_with_state<f, s | e>(
 }
 
 fn without_clocks<f>(i: Interleaving<f>) -> Interleaving<f> =
-  { ..i, steps: i.steps.map(|s: Step| { ..s, stamp: [] }) }
+  { ..i, steps: i.steps.map(|s: Step| { ..s, vector_clock: [] }) }
 
 fn cost_of<f>(m: SearchResult<f>) -> Cost =
-  { explored: m.exploration.explored, bounded: m.exploration.exhausted || !passed(m) }
+  { explored: m.exploration.explored, stopped_early: m.exploration.exhausted || !passed(m) }
 
 // --- One seed per root ------------------------------------------------------
 
@@ -412,7 +412,7 @@ fn queue_backtracks<f, s>(
     |acc: SearchState<f, s>, at: Int, tasks: Map<Int, Option<Int>>| {
       let prefix = choices.take(at);
       let key = key_of(prefix);
-      let enabled = match trace.at(at) { Some(s) -> s.enabled, None -> [] };
+      let enabled = match trace.at(at) { Some(s) -> s.runnable, None -> [] };
       tasks.fold(acc, |inner: SearchState<f, s>, task: Int, against: Option<Int>|
         match enabled.index_of(task) {
           None -> inner,
@@ -455,10 +455,10 @@ pub fn backtracks(steps: List<Step>, dependence: Dependence) -> Map<Int, Map<Int
               else if !dependent(dependence, earlier, later) { acc }
               else if dependence == Exact && happens_before(earlier, later) { acc } else {
                 let at = match acc.get(j) { Some(m) -> m, None -> Map::new() };
-                let marked = if earlier.enabled.index_of(later.task) != None {
+                let marked = if earlier.runnable.index_of(later.task) != None {
                   record_backtrack(at, later.task, Some(i))
                 } else {
-                  earlier.enabled.fold(at, |m: Map<Int, Option<Int>>, t: Int|
+                  earlier.runnable.fold(at, |m: Map<Int, Option<Int>>, t: Int|
                     record_backtrack(m, t, None))
                 };
                 acc.insert(j, marked)
@@ -485,7 +485,7 @@ fn race_of(b: Branch) -> Option<Race> =
     None -> None,
     Some(against) -> match ((b.trace.at(b.at), b.trace.at(against))) {
       (Some(left), Some(right)) -> match ((race_site(left, right), race_site(right, left))) {
-        (Some(l), Some(r)) -> Some({ left: l, right: r, at: b.at }),
+        (Some(l), Some(r)) -> Some({ left: l, right: r, scheduling_point: b.at }),
         _ -> None,
       },
       _ -> None,
@@ -521,17 +521,17 @@ fn check_recording<f>(seed: Seed, steps: List<Step>) -> Option<Cause<f>> =
       Some(_) -> found,
       None -> match steps.at(i) {
         None -> None,
-        Some(step) -> if step.enabled.len() > 65535 {
+        Some(step) -> if step.runnable.len() > 65535 {
           Some(
             InvalidRecording({
               seed: seed,
               span: step.site.span,
               what: "scheduling point " ++ i.to_string() ++ " offered "
-                ++ step.enabled.len().to_string()
+                ++ step.runnable.len().to_string()
                 ++ " enabled tasks, and a seed's choice sequence cannot name more than 65535",
             }),
           )
-        } else if step.enabled.at(step.choice) == Some(step.task) { None } else {
+        } else if step.runnable.at(step.choice) == Some(step.task) { None } else {
           Some(
             InvalidRecording({
               seed: seed,
@@ -540,7 +540,7 @@ fn check_recording<f>(seed: Seed, steps: List<Step>) -> Option<Cause<f>> =
                 ++ " as choice "
                 ++ step.choice.to_string()
                 ++ ", which its enabled set "
-                ++ tasks_text(step.enabled)
+                ++ tasks_text(step.runnable)
                 ++ " does not offer",
             }),
           )
@@ -566,16 +566,16 @@ fn check_replay<f>(seed: Seed, b: Branch, steps: List<Step>) -> Option<Cause<f>>
                   ++ point.to_string(),
               }),
             ),
-          Some(actual) -> if actual.enabled != expected.enabled {
+          Some(actual) -> if actual.runnable != expected.runnable {
             Some(
               Diverged({
                 seed: seed,
                 span: expected.site.span,
                 what: "at scheduling point " ++ point.to_string()
                   ++ " the recorded enabled set was "
-                  ++ tasks_text(expected.enabled)
+                  ++ tasks_text(expected.runnable)
                   ++ " and the replay offered "
-                  ++ tasks_text(actual.enabled),
+                  ++ tasks_text(actual.runnable),
               }),
             )
           } else {

@@ -65,7 +65,7 @@ type Bind = { slot: Int, owner: Owner }
 
 type PassedArgument = { callee: Int, param: Int, owner: Owner }
 
-type RawSite = { span: Span, op: Bytes, owner: Owner }
+type RawSite = { span: Span, builtin_name: Bytes, owner: Owner }
 
 type ReturnRead = { callee: Int, ret: ReturnOwnership }
 
@@ -77,7 +77,7 @@ type CostState = {
   demands: List<PassedArgument>,
   escaped: List<Int>,
   reads: List<ReturnRead>,
-  looked: List<NameLookup>,
+  lookups: List<NameLookup>,
 }
 
 type CachedLookup = { name: Bytes, bound: Option<Bytes>, definition: Bool }
@@ -101,7 +101,7 @@ type CachedBody = {
   definition: Option<Bytes>,
   arity: Int,
   reuse: Option<Span>,
-  looked: List<CachedLookup>,
+  lookups: List<CachedLookup>,
   walks: List<CachedWalk>,
 }
 
@@ -127,21 +127,21 @@ type Args = { state: CostState, owners: List<Owner> }
 
 type Definition = {
   name: Bytes,
-  module: Int,
+  module_index: Int,
   module_name: Bytes,
   params: List<Bytes>,
   arity: Int,
   own: Bool,
-  says: Option<{ ret: ReturnOwnership, span: Span }>,
+  declared_return: Option<{ ret: ReturnOwnership, span: Span }>,
 }
 
 type Body = {
-  kind: Bytes,
+  item_kind: Bytes,
   module: Int,
   module_name: Bytes,
   name: Bytes,
   label: Bytes,
-  definition: Int,
+  definition_index: Int,
   arity: Int,
   span: Span,
   code: Option<Code>,
@@ -149,16 +149,16 @@ type Body = {
   lowered: Bool,
   reuse: Option<Span>,
   looked: List<CachedLookup>,
-  kept: List<WalkResult>,
+  cached_walks: List<WalkResult>,
 }
 
 type WalkResult = {
   sites: List<RawSite>,
   demands: List<PassedArgument>,
-  escaped: List<Int>,
+  used_as_values: List<Int>,
   ret: Owner,
   reads: List<ReturnRead>,
-  looked: List<NameLookup>,
+  lookups: List<NameLookup>,
 }
 
 type Program = {
@@ -200,7 +200,7 @@ fn rebind(state: CostState, slot: Int, owner: Owner) -> CostState =
   }
 
 fn add_site(state: CostState, span: Span, op: Bytes, owner: Owner) -> CostState =
-  { ..state, sites: state.sites.push({ span: span, op: op, owner: owner }) }
+  { ..state, sites: state.sites.push({ span: span, builtin_name: op, owner: owner }) }
 
 fn add_demand(state: CostState, d: PassedArgument) -> CostState =
   { ..state, demands: state.demands.push(d) }
@@ -210,7 +210,7 @@ fn add_escaped(state: CostState, d: Int) -> CostState = { ..state, escaped: stat
 fn look(state: CostState, name: Bytes, found: Bound) -> CostState =
   {
     ..state,
-    looked: state.looked.push({ name: name, bound: found.bound, definition: found.definition }),
+    lookups: state.lookups.push({ name: name, bound: found.bound, definition: found.definition }),
   }
 
 fn with_chain(state: CostState, chain: List<Bind>) -> CostState = { ..state, chain: chain }
@@ -773,7 +773,7 @@ fn start_tables(definitions: List<Definition>) -> Tables =
     params: definitions.map(|d: Definition| range(0, d.arity).map(|_: Int| SoleParam)),
     rets: definitions.map(|d: Definition|
       if d.own { FreshReturn } else {
-        match d.says {
+        match d.declared_return {
           Some(x) -> x.ret,
           None ->
             UnsureReturn({
@@ -794,29 +794,29 @@ fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} =
       {
         sites: [],
         demands: [],
-        escaped: [],
+        used_as_values: [],
         ret: unknown(CallResult, b"the value a call returned, which the callee may also keep"),
         reads: [],
-        looked: [],
+        lookups: [],
       },
     Some(c) -> {
       let chain = range(0, b.arity).map(|k: Int|
-        { slot: k, owner: if b.definition < 0 { FreshOwner } else { ParamOwner(k) } });
+        { slot: k, owner: if b.definition_index < 0 { FreshOwner } else { ParamOwner(k) } });
       let w = walk({ ..env, moves: b.moves }, c, {
         chain: chain,
         sites: [],
         demands: [],
         escaped: [],
         reads: [],
-        looked: [],
+        lookups: [],
       });
       {
         sites: w.state.sites,
         demands: w.state.demands,
-        escaped: w.state.escaped,
+        used_as_values: w.state.escaped,
         ret: w.owner,
         reads: w.state.reads,
-        looked: w.state.looked,
+        lookups: w.state.lookups,
       }
     },
   }
@@ -825,7 +825,7 @@ fn resolve(program: Program, found: List<WalkResult>, tables: Tables) -> Tables 
   range(0, program.bodies.len()).fold(start_tables(program.definitions), |acc: Tables, i: Int| {
     let b: Body = program.bodies.get(i);
     let f: WalkResult = found.get(i);
-    let escaped = f.escaped.fold(acc, |s: Tables, d: Int|
+    let escaped = f.used_as_values.fold(acc, |s: Tables, d: Int|
       combine_all_params(
         s,
         d,
@@ -841,23 +841,29 @@ fn resolve(program: Program, found: List<WalkResult>, tables: Tables) -> Tables 
         }),
       ));
     let demanded = f.demands.fold(escaped, |s: Tables, dm: PassedArgument|
-      combine_param(s, dm.callee, dm.param, interpret(dm.owner, b.definition, tables, b.label)));
-    if b.definition < 0 { demanded } else { with_return(demanded, b.definition, return_of(f.ret)) }
+      combine_param(
+        s,
+        dm.callee,
+        dm.param,
+        interpret(dm.owner, b.definition_index, tables, b.label),
+      ));
+    if b.definition_index < 0 { demanded }
+    else { with_return(demanded, b.definition_index, return_of(f.ret)) }
   })
 
 fn no_walk_result() -> WalkResult =
-  { sites: [], demands: [], escaped: [], ret: FreshOwner, reads: [], looked: [] }
+  { sites: [], demands: [], used_as_values: [], ret: FreshOwner, reads: [], lookups: [] }
 
 type WalkSource = | Unchanged | MadeThisRun(Int) | Cached(Int) | NeedsWalk
 
 type Run = {
   prog: Program,
   found: List<WalkResult>,
-  took: List<List<Int>>,
+  used_cached: List<List<Int>>,
   made: List<List<WalkResult>>,
-  whole: Option<WholeProgram>,
+  whole_program: Option<WholeProgram>,
   fresh: Map<Int, Bool>,
-  lowered: Int,
+  lowered_count: Int,
   failed: Bool,
 }
 
@@ -886,7 +892,7 @@ fn evaluate(p: CostInput, run: Run, which: (Int) -> Bool, tables: Tables) -> Run
       if !which(i) { Unchanged } else {
         match first_valid(run.made.get(i), tables.rets) {
           Some(j) -> MadeThisRun(j),
-          None -> match first_valid(run.prog.bodies.get(i).kept, tables.rets) {
+          None -> match first_valid(run.prog.bodies.get(i).cached_walks, tables.rets) {
             Some(j) -> Cached(j),
             None -> NeedsWalk,
           },
@@ -918,11 +924,11 @@ fn evaluate(p: CostInput, run: Run, which: (Int) -> Bool, tables: Tables) -> Run
           match tried.get(i) {
             Unchanged -> ready.found.get(i),
             MadeThisRun(j) -> ready.made.get(i).get(j),
-            Cached(j) -> ready.prog.bodies.get(i).kept.get(j),
+            Cached(j) -> ready.prog.bodies.get(i).cached_walks.get(j),
             NeedsWalk -> walked(i),
           }),
-        took: range(0, n).map(|i: Int| {
-          let took: List<Int> = ready.took.get(i);
+        used_cached: range(0, n).map(|i: Int| {
+          let took: List<Int> = ready.used_cached.get(i);
           match tried.get(i) {
             Cached(j) -> if took.contains(j) { took } else { took.push(j) },
             _ -> took,
@@ -955,7 +961,7 @@ fn walks_at_once(x: WalkBatch, lo: Int, hi: Int, room: Int) -> List<WalkResult> 
   }
 
 fn relowered(p: CostInput, run: Run, modules: List<Int>) -> Run / {abort.raise} =
-  match lower(p, run.whole, modules, run.prog.index) {
+  match lower(p, run.whole_program, modules, run.prog.index) {
     None -> { ..run, failed: true },
     Some(l) -> {
       let made = range(0, modules.len()).fold(Map::new(), |acc: Map<Int, List<Body>>, k: Int|
@@ -968,7 +974,7 @@ fn relowered(p: CostInput, run: Run, modules: List<Int>) -> Run / {abort.raise} 
             Some(lowered) -> {
               let k = match acc.seen.get(b.module) { Some(x) -> x, None -> 0 };
               match lowered.at(k) {
-                Some(m) -> if m.label != b.label || m.kind != b.kind {
+                Some(m) -> if m.label != b.label || m.item_kind != b.item_kind {
                   panic("a module whose key stands lowered to other bodies than it kept")
                 } else {
                   {
@@ -990,8 +996,8 @@ fn relowered(p: CostInput, run: Run, modules: List<Int>) -> Run / {abort.raise} 
       {
         ..run,
         prog: { ..run.prog, r: prefer_whole(l.whole, run.prog.r), bodies: placed.bodies },
-        whole: l.whole,
-        lowered: run.lowered + modules.len(),
+        whole_program: l.whole,
+        lowered_count: run.lowered_count + modules.len(),
       }
     },
   }
@@ -1048,12 +1054,12 @@ pub type Site = {
 }
 
 pub type Costed = {
-  kind: Bytes,
+  item_kind: Bytes,
   module: Int,
   module_name: Bytes,
   name: Bytes,
   label: Bytes,
-  reuse: Option<Span>,
+  reuse_keyword: Option<Span>,
   sites: List<Site>,
 }
 
@@ -1063,11 +1069,16 @@ pub type Unkept = {
   name: Bytes,
   start: Int,
   end: Int,
-  said: Bytes,
-  results: Bytes,
+  declared: Bytes,
+  actual: Bytes,
 }
 
-pub type Report = { ok: Bool, rounds: Int, definitions: List<Costed>, unkept: List<Unkept> }
+pub type Report = {
+  ok: Bool,
+  rounds: Int,
+  definitions: List<Costed>,
+  return_mismatches: List<Unkept>,
+}
 
 derive bin for Site
 derive bin for Costed
@@ -1079,7 +1090,7 @@ fn finish(raw: RawSite, definition: Int, tables: Tables) -> Site = {
     {
       start: raw.span.start,
       end: raw.span.end,
-      op: raw.op,
+      op: raw.builtin_name,
       verdict: verdict,
       reason: reason,
       suggestion: suggestion_for(cause),
@@ -1091,9 +1102,9 @@ fn finish(raw: RawSite, definition: Int, tables: Tables) -> Site = {
         b"reuses",
         Bytes::concat_all([
           b"the ",
-          container_name(raw.op),
+          container_name(raw.builtin_name),
           b" reaches `",
-          raw.op,
+          raw.builtin_name,
           b"` at one owner",
         ]),
         None,
@@ -1104,7 +1115,7 @@ fn finish(raw: RawSite, definition: Int, tables: Tables) -> Site = {
     ParamOwner(k) -> {
       let head = Bytes::concat_all([
         b"the ",
-        container_name(raw.op),
+        container_name(raw.builtin_name),
         b" is parameter ",
         ascii_of_int(k),
       ]);
@@ -1172,12 +1183,12 @@ fn module_bodies(
     let moves = root_moves(s, ir.root);
     let body = |kind: Bytes, name: Bytes, label: Bytes, definition: Int, span: Span, reuse: Option<Span>|
       {
-        kind: kind,
+        item_kind: kind,
         module: i,
         module_name: m,
         name: name,
         label: label,
-        definition: definition,
+        definition_index: definition,
         arity: ir.root.params.len(),
         span: span,
         code: Some(ir.root.code),
@@ -1185,7 +1196,7 @@ fn module_bodies(
         lowered: true,
         reuse: reuse,
         looked: [],
-        kept: [],
+        cached_walks: [],
       };
     match ir.item {
       FunctionItem(d) ->
@@ -1236,12 +1247,12 @@ fn definition_of_fn(
   let params = witnesses.concat(definition.params.map(|param: Param| param.name.name));
   {
     name: qualify(module, definition.name.name),
-    module: i,
+    module_index: i,
     module_name: module,
     params: params,
     arity: params.len(),
     own: own,
-    says: match definition.returns {
+    declared_return: match definition.returns {
       None -> None,
       Some(ReturnsFresh(sp)) -> Some({ ret: FreshReturn, span: sp }),
       Some(ReturnsParam(x)) ->
@@ -1279,19 +1290,19 @@ fn return_text(d: Definition, r: ReturnOwnership) -> Bytes =
 fn return_mismatches_of(program: Program, tables: Tables) -> List<Unkept> / {abort.raise} =
   range(0, program.definitions.len()).fold([], |acc: List<Unkept>, i: Int| {
     let d: Definition = program.definitions.get(i);
-    match d.says {
+    match d.declared_return {
       None -> acc,
       Some(x) -> if !d.own { acc } else {
         match tables.rets.at(i) {
           Some(got) -> if !violates(x.ret, got) { acc } else {
             acc.push({
-              module: d.module,
+              module: d.module_index,
               module_name: d.module_name,
               name: d.name,
               start: x.span.start,
               end: x.span.end,
-              said: return_text(d, x.ret),
-              results: return_text(d, got),
+              declared: return_text(d, x.ret),
+              actual: return_text(d, got),
             })
           },
           None -> acc,
@@ -1302,15 +1313,10 @@ fn return_mismatches_of(program: Program, tables: Tables) -> List<Unkept> / {abo
 
 fn builtin_names() -> List<Bytes> / {abort.raise} = builtins().map(|b: Builtin| b.name)
 
-pub type CostInput = { analysis: Analysis, sources: List<Bytes>, rows: Rows, walked: InferredFacts }
+pub type CostInput = { analysis: Analysis, sources: List<Bytes>, rows: Rows, facts: InferredFacts }
 
 pub fn cost_input_of(analysis: Analysis, sources: List<Bytes>) -> CostInput / {abort.raise} =
-  {
-    analysis: analysis,
-    sources: sources,
-    rows: rows_of(analysis),
-    walked: inferred_facts(analysis),
-  }
+  { analysis: analysis, sources: sources, rows: rows_of(analysis), facts: inferred_facts(analysis) }
 
 fn own_module(a: Analysis, i: Int) -> Bool =
   match a.module_packages.at(i) { Some(k) -> k == 0, None -> true }
@@ -1384,7 +1390,7 @@ fn whole_program_of(p: CostInput) -> Option<WholeProgram> / {abort.raise} = {
         parsed.map(|x: Parsed| { name: x.name, module: x.module, derived: x.derived }),
       ) {
       ResolveFailed(_) -> None,
-      ResolveSucceeded(x) -> Some({ modules: x.modules, r: x.r }),
+      ResolveSucceeded(x) -> Some({ modules: x.modules, r: x.resolution }),
     }
   }
 }
@@ -1397,7 +1403,7 @@ fn resolved_as(a: Analysis, modules: List<ParsedModule>) -> ResolveOutcome / {ab
       module_packages: a.module_packages,
       std: shipped - 2,
       compiler: shipped - 1,
-      shipped: shipped,
+      other_shipped_package: shipped,
     }
   };
   resolve_packaged(
@@ -1406,7 +1412,7 @@ fn resolved_as(a: Analysis, modules: List<ParsedModule>) -> ResolveOutcome / {ab
     packaged.module_packages,
     packaged.std,
     packaged.compiler,
-    packaged.shipped,
+    packaged.other_shipped_package,
   )
 }
 
@@ -1457,7 +1463,7 @@ fn lower(
         match module_contexts_in(
             resolved,
             p.rows,
-            p.walked,
+            p.facts,
             read.modules,
             wanted,
             |i: Int, s: ModuleContext, roots: List<ItemRoot>|
@@ -1485,7 +1491,7 @@ fn found_of(index: Map<Bytes, Int>, w: CachedWalk) -> Option<WalkResult> = {
     match ((acc, index.get(name))) { (Some(xs), Some(d)) -> Some(xs.push(d)), _ -> None });
   match ((reads, demands, escaped)) {
     (Some(r), Some(d), Some(e)) ->
-      Some({ sites: w.sites, demands: d, escaped: e, ret: w.ret, reads: r, looked: [] }),
+      Some({ sites: w.sites, demands: d, used_as_values: e, ret: w.ret, reads: r, lookups: [] }),
     _ -> None,
   }
 }
@@ -1495,23 +1501,23 @@ fn cached_body(prog: Program, i: Int, module_name: Bytes, k: CachedBody) -> Opti
   match definition {
     None -> None,
     Some(d) -> {
-      let stands = k.looked.fold(true, |acc: Bool, l: CachedLookup|
+      let stands = k.lookups.fold(true, |acc: Bool, l: CachedLookup|
         acc && (match l.bound { None -> true, Some(q) -> prog.index.contains(q) == l.definition }));
       Some({
-        kind: k.kind,
+        item_kind: k.kind,
         module: i,
         module_name: module_name,
         name: k.name,
         label: k.label,
-        definition: d,
+        definition_index: d,
         arity: k.arity,
         span: dummy_span(),
         code: None,
         moves: no_moves(),
         lowered: false,
         reuse: k.reuse,
-        looked: k.looked,
-        kept: if !stands { [] } else {
+        looked: k.lookups,
+        cached_walks: if !stands { [] } else {
           k.walks.fold([], |acc: List<WalkResult>, w: CachedWalk|
             match found_of(prog.index, w) { Some(f) -> acc.push(f), None -> acc })
         },
@@ -1546,17 +1552,17 @@ fn failed_run(prog: Program) -> Run =
   {
     prog: prog,
     found: [],
-    took: [],
+    used_cached: [],
     made: [],
-    whole: None,
+    whole_program: None,
     fresh: Map::new(),
-    lowered: 0,
+    lowered_count: 0,
     failed: true,
   }
 
 fn initial_run(p: CostInput, kept: List<Option<Bytes>>) -> Run / {abort.raise} = {
   let a = p.analysis;
-  let definitions = definitions_of(a, p.walked);
+  let definitions = definitions_of(a, p.facts);
   let base = {
     r: a.r,
     index: range(0, definitions.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
@@ -1590,11 +1596,11 @@ fn initial_run(p: CostInput, kept: List<Option<Bytes>>) -> Run / {abort.raise} =
       {
         prog: { ..base, r: prefer_whole(l.whole, base.r), bodies: bodies },
         found: bodies.map(|_: Body| no_walk_result()),
-        took: bodies.map(|_: Body| none),
+        used_cached: bodies.map(|_: Body| none),
         made: bodies.map(|_: Body| unmade),
-        whole: l.whole,
+        whole_program: l.whole,
         fresh: missed.fold(Map::new(), |acc: Map<Int, Bool>, i: Int| acc.insert(i, true)),
-        lowered: missed.len(),
+        lowered_count: missed.len(),
         failed: false,
       }
     },
@@ -1608,13 +1614,13 @@ fn to_cached_walk(prog: Program, f: WalkResult) -> CachedWalk / {abort.raise} = 
     sites: f.sites,
     demands: f.demands.map(|x: PassedArgument|
       { callee: name(x.callee), param: x.param, owner: x.owner }),
-    escaped: f.escaped.map(|d: Int| name(d)),
+    escaped: f.used_as_values.map(|d: Int| name(d)),
     ret: f.ret,
   }
 }
 
 fn looked_of(f: WalkResult) -> List<CachedLookup> =
-  f.looked.fold(Map::new(), |acc: Map<Bytes, CachedLookup>, l: NameLookup|
+  f.lookups.fold(Map::new(), |acc: Map<Bytes, CachedLookup>, l: NameLookup|
     acc.insert(l.name, { name: l.name, bound: l.bound, definition: l.definition != None })).fold(
     [],
     |acc: List<CachedLookup>, _: Bytes, l: CachedLookup| acc.push(l),
@@ -1624,15 +1630,16 @@ fn to_cached_body(run: Run, i: Int) -> CachedBody / {abort.raise} = {
   let b: Body = run.prog.bodies.get(i);
   let made: List<WalkResult> = run.made.get(i);
   {
-    kind: b.kind,
+    kind: b.item_kind,
     name: b.name,
     label: b.label,
-    definition: if b.definition < 0 { None }
-    else { Some(run.prog.definitions.get(b.definition).name) },
+    definition: if b.definition_index < 0 { None }
+    else { Some(run.prog.definitions.get(b.definition_index).name) },
     arity: b.arity,
     reuse: b.reuse,
-    looked: match made.at(0) { Some(f) -> looked_of(f), None -> b.looked },
-    walks: run.took.get(i).map(|j: Int| to_cached_walk(run.prog, b.kept.get(j))).concat(
+    lookups: match made.at(0) { Some(f) -> looked_of(f), None -> b.looked },
+    walks: run.used_cached.get(i).map(|j: Int|
+      to_cached_walk(run.prog, b.cached_walks.get(j))).concat(
       made.map(|f: WalkResult| to_cached_walk(run.prog, f)),
     ),
   }
@@ -1655,7 +1662,8 @@ fn cache_entries(run: Run, n: Int) -> List<Option<Bytes>> / {abort.raise} = {
     let xs = match by_module.get(m) { Some(xs) -> xs, None -> [] };
     let moved = run.fresh.contains(m)
       || xs.fold(false, |acc: Bool, i: Int|
-        acc || run.made.get(i).len() > 0 || run.took.get(i).len() < prog.bodies.get(i).kept.len());
+        acc || run.made.get(i).len() > 0
+          || run.used_cached.get(i).len() < prog.bodies.get(i).cached_walks.len());
     let own = xs.fold(true, |acc: Bool, i: Int|
       acc
         && run.made.get(i).fold(true, |ok: Bool, f: WalkResult|
@@ -1676,28 +1684,33 @@ fn report_of(run: Run, tables: Tables, rounds: Int) -> Report / {abort.raise} = 
       let f: WalkResult = run.found.get(i);
       if f.sites.len() == 0 { acc } else {
         acc.push({
-          kind: b.kind,
+          item_kind: b.item_kind,
           module: b.module,
           module_name: b.module_name,
           name: b.name,
           label: b.label,
-          reuse: b.reuse,
-          sites: f.sites.map(|raw: RawSite| finish(raw, b.definition, tables)),
+          reuse_keyword: b.reuse,
+          sites: f.sites.map(|raw: RawSite| finish(raw, b.definition_index, tables)),
         })
       }
     }),
-    unkept: return_mismatches_of(prog, tables),
+    return_mismatches: return_mismatches_of(prog, tables),
   }
 }
 
-pub type Costing = { report: Report, kept: List<Option<Bytes>>, walked: Int, lowered: Int }
+pub type Costing = {
+  report: Report,
+  cached: List<Option<Bytes>>,
+  walked_modules: Int,
+  lowered: Int,
+}
 
 pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
   let n = p.analysis.modules.len();
   let rejected = {
-    report: { ok: false, rounds: 0, definitions: [], unkept: [] },
-    kept: range(0, n).map(|_: Int| None),
-    walked: 0,
+    report: { ok: false, rounds: 0, definitions: [], return_mismatches: [] },
+    cached: range(0, n).map(|_: Int| None),
+    walked_modules: 0,
     lowered: 0,
   };
   let start = initial_run(p, kept);
@@ -1708,10 +1721,10 @@ pub fn costs(p: CostInput, kept: List<Option<Bytes>> = []) -> Costing / {abort.r
     if resolved.run.failed { rejected } else {
       {
         report: report_of(resolved.run, resolved.tables, resolved.rounds),
-        kept: cache_entries(resolved.run, n),
-        walked: resolved.run.made.fold(0, |acc: Int, xs: List<WalkResult>|
+        cached: cache_entries(resolved.run, n),
+        walked_modules: resolved.run.made.fold(0, |acc: Int, xs: List<WalkResult>|
           if xs.len() > 0 { acc + 1 } else { acc }),
-        lowered: resolved.run.lowered,
+        lowered: resolved.run.lowered_count,
       }
     }
   }
@@ -1728,10 +1741,10 @@ pub fn cost_keys(p: CostInput, identity: Bytes) -> List<Bytes> / {abort.raise} =
     |acc: Map<Bytes, Bytes>, r: KnownDefinitionRow| acc.insert(r.name, blake3(r.facts)),
   );
   let tests = p.rows.tests.fold(Map::new(), |acc: Map<Bytes, Bytes>, r: KnownTestRow|
-    acc.insert(r.owner, blake3(r.facts)));
+    acc.insert(r.owner, blake3(r.body_facts)));
   let embeds = embeds_by_module(a.embeds);
-  let loose = laws_by_module(p.walked, a.modules);
-  let orders = orders_by_module(p.walked, a.modules);
+  let loose = laws_by_module(p.facts, a.modules);
+  let orders = orders_by_module(p.facts, a.modules);
   let head = Bytes::concat_all([
     b"ply.costs.module.1\x00",
     hex(bin::shape_digest(cached_module_bin())),
@@ -1902,8 +1915,8 @@ test "an update comes back with its place, its verdict, why, and the edit that w
   assert(r.ok);
   assert_eq(r.definitions.len(), 1);
   let d = r.definitions.get(0);
-  assert_eq([d.kind, d.module_name, d.name], [b"fn", b"m", b"grow"]);
-  assert_eq(d.reuse, Some(span_between(0, 5)));
+  assert_eq([d.item_kind, d.module_name, d.name], [b"fn", b"m", b"grow"]);
+  assert_eq(d.reuse_keyword, Some(span_between(0, 5)));
   assert_eq(d.sites.len(), 1);
   let s = d.sites.get(0);
   assert_eq(src.slice(s.start, s.end), b"xs.push(n)");
@@ -1996,11 +2009,11 @@ test "a `returns` clause is shown of its body, and one the body does not keep is
   ]);
   let r = reported([b"m"], [src]);
   assert(r.ok);
-  assert_eq(r.unkept.map(|u: Unkept| (u.name, u.said, u.results)), [
+  assert_eq(r.return_mismatches.map(|u: Unkept| (u.name, u.declared, u.actual)), [
     (b"m.pick", b"its parameter `ys`", b"its parameter `xs`"),
     (b"m.folded", b"fresh", b"`List::fold` returns whatever its callback returned"),
   ]);
-  assert_eq(src.slice(r.unkept.get(0).start, r.unkept.get(0).end), b"ys")
+  assert_eq(src.slice(r.return_mismatches.get(0).start, r.return_mismatches.get(0).end), b"ys")
 }
 
 test "a function a builtin calls back is handed what its entry says, and a fold returns what its callback returned" {
@@ -2018,7 +2031,7 @@ test "a function a builtin calls back is handed what its entry says, and a fold 
     b"copies",
     b"an element the list being walked still holds",
   ]);
-  assert_eq(r.unkept.map(|u: Unkept| (u.name, u.results)), [
+  assert_eq(r.return_mismatches.map(|u: Unkept| (u.name, u.actual)), [
     (b"m.values", b"`Map::fold` returns whatever its callback returned"),
   ])
 }
@@ -2032,7 +2045,7 @@ test "another package's definition returns what its `returns` clause says, its b
   let r = reported([b"app", b"lib.more"], [app, lib], [0, 1]);
   assert(r.ok);
   assert_eq(verdicts(r), [b"grow reuses", b"other unknown"]);
-  assert_eq(r.unkept, [])
+  assert_eq(r.return_mismatches, [])
 }
 
 fn costed_over(
@@ -2044,7 +2057,7 @@ fn costed_over(
   {
     costing: c,
     store: range(0, keys.len()).fold(store, |acc: Map<Bytes, Bytes>, i: Int|
-      match c.kept.at(i) { Some(Some(bytes)) -> acc.insert(keys.get(i), bytes), _ -> acc }),
+      match c.cached.at(i) { Some(Some(bytes)) -> acc.insert(keys.get(i), bytes), _ -> acc }),
   }
 }
 
@@ -2064,19 +2077,21 @@ fn made_shared() -> Bytes =
 
 test "a run that takes what earlier runs walked returns what a run from nothing returns, and walks only what moved" {
   let first = costed_over(Map::new(), three_module_program(made_fresh()));
-  assert(first.costing.walked > 0 && first.costing.lowered > 0);
+  assert(first.costing.walked_modules > 0 && first.costing.lowered > 0);
   let again = costed_over(first.store, three_module_program(made_fresh()));
   assert_eq(again.costing.report, first.costing.report);
-  assert_eq([again.costing.walked, again.costing.lowered], [0, 0]);
+  assert_eq([again.costing.walked_modules, again.costing.lowered], [0, 0]);
   let shared = three_module_program(made_shared());
   let moved = costed_over(again.store, shared);
   assert_eq(moved.costing.report, costs(shared).report);
   assert_eq(verdicts(moved.costing.report), [b"grow copies", b"hold reuses", b"solo reuses"]);
-  assert(moved.costing.walked > 0 && moved.costing.walked < first.costing.walked);
+  assert(
+    moved.costing.walked_modules > 0 && moved.costing.walked_modules < first.costing.walked_modules,
+  );
   assert(moved.costing.lowered < first.costing.lowered);
   let back = costed_over(moved.store, three_module_program(made_fresh()));
   assert_eq(back.costing.report, first.costing.report);
-  assert_eq([back.costing.walked, back.costing.lowered], [0, 0])
+  assert_eq([back.costing.walked_modules, back.costing.lowered], [0, 0])
 }
 
 fn std_cost_input(user: List<Source>, shipped: List<Source>) -> CostInput / {abort.raise} = {
@@ -2108,7 +2123,12 @@ fn as_stub(whole: CostInput, name: Bytes) -> CostInput / {abort.raise} = {
     ResolveSucceeded(x) ->
       {
         ..whole,
-        analysis: { ..a, modules: x.modules, r: x.r, stub_cuts: Map::new().insert(name, cuts) },
+        analysis: {
+          ..a,
+          modules: x.modules,
+          r: x.resolution,
+          stub_cuts: Map::new().insert(name, cuts),
+        },
       },
   }
 }
@@ -2132,7 +2152,7 @@ test "a module read as its stub is lowered from its source, and walked as a whol
   assert_eq(costs(stubbed_b).report, costs(shared).report);
   let moved = costed_over(first.store, stubbed_b);
   assert_eq(moved.costing.report, costs(shared).report);
-  assert_eq([moved.costing.walked, moved.costing.lowered], [3, 2]);
+  assert_eq([moved.costing.walked_modules, moved.costing.lowered], [3, 2]);
   let key = cost_keys(shared, b"checker").get(1);
   assert_eq(moved.store.get(key), costed_over(first.store, shared).store.get(key))
 }
@@ -2152,11 +2172,11 @@ test "a kept walk is not taken once what a name its body looks up is bound to st
     bodies: kept.bodies.map(|k: CachedBody|
       {
         ..k,
-        looked: k.looked.map(|l: CachedLookup|
+        lookups: k.lookups.map(|l: CachedLookup|
           if l.name == b"a.mk" { { ..l, definition: false } } else { l }),
       }),
   };
   let again = costed_over(first.store.insert(key, bin::encode(renamed, cached_module_bin())), p);
   assert_eq(again.costing.report, first.costing.report);
-  assert_eq([again.costing.walked, again.costing.lowered], [1, 1])
+  assert_eq([again.costing.walked_modules, again.costing.lowered], [1, 1])
 }

@@ -22,20 +22,20 @@ import compiler.emit.lower.module_context (ModuleContext)
 import compiler.emit.lower.base (Context, Lowering, EvidenceWord, bound_as, static_added)
 
 pub type EvidenceParameters = {
-  own: List<EffectsEvidence>,
+  declared: List<EffectsEvidence>,
   labels: Int,
   hidden: Int,
   unfilled: Bool,
 }
 
 pub fn evidence_parameters(s: ModuleContext, key: RootKey) -> EvidenceParameters / {abort.raise} =
-  match s.here.fold(None, |acc: Option<Scheme>, d: Definition|
+  match s.definitions.fold(None, |acc: Option<Scheme>, d: Definition|
       if d.root == unspecialised(key) { d.scheme } else { acc }) {
-    None -> { own: [], labels: 0, hidden: 0, unfilled: false },
+    None -> { declared: [], labels: 0, hidden: 0, unfilled: false },
     Some(sc) -> {
       let effect_evidence = key_effects(key);
       {
-        own: effects_evidence(declared_effects(sc), effect_evidence, sc.label_variables.len()),
+        declared: effects_evidence(declared_effects(sc), effect_evidence, sc.label_variables.len()),
         labels: sc.label_variables.len(),
         hidden: passed_label_count(effect_evidence),
         unfilled: sc.effect_variables.len() > effect_evidence.len(),
@@ -50,15 +50,15 @@ pub fn with_evidence_parameters(c: Convention, hidden: Int, words: Int) -> Conve
   {
     ..c,
     params: c.params.concat(
-      more.map(|r: Representation| { handed: BorrowedParam, representation: r }),
+      more.map(|r: Representation| { ownership: BorrowedParam, representation: r }),
     ),
   }
 }
 
 pub fn evidence_parameter_types(h: EvidenceParameters) -> List<Type> =
-  range(0, h.hidden).map(|_: Int| int_type()).concat(if h.own.len() <= max_evidence_params() {
-    h.own.map(|_: EffectsEvidence| evidence_type())
-  } else { [evidence_array_of(h.own.len())] })
+  range(0, h.hidden).map(|_: Int| int_type()).concat(if h.declared.len() <= max_evidence_params() {
+    h.declared.map(|_: EffectsEvidence| evidence_type())
+  } else { [evidence_array_of(h.declared.len())] })
 
 pub fn enter_root_body(
   context: Context,
@@ -67,7 +67,12 @@ pub fn enter_root_body(
   declared: Int,
   h: EvidenceParameters,
 ) -> { context: Context, st: Lowering } = {
-  let read = read_evidence_words(st, params.drop(declared + h.hidden), h.own, context.body.span);
+  let read = read_evidence_words(
+    st,
+    params.drop(declared + h.hidden),
+    h.declared,
+    context.body.span,
+  );
   {
     context: {
       ..context,
@@ -75,7 +80,7 @@ pub fn enter_root_body(
       label_values: labels_among(params.take(declared), h.labels).concat(
         params.drop(declared).take(h.hidden),
       ).map(|v: Var| Some(VarOperand(v))),
-      handed: params.drop(declared).map(VarOperand),
+      evidence_arguments: params.drop(declared).map(VarOperand),
     },
     st: read.st,
   }
@@ -112,7 +117,7 @@ pub fn entry_body_start(
             words: acc.words.push({
               evidence: { effect: e, resource: AnyResource },
               word: w.arg,
-              through: false,
+              inherited: false,
               handled: false,
             }),
           }
@@ -163,7 +168,7 @@ pub fn read_evidence_words(
           acc.push({
             evidence: o.evidence,
             word: match read.words.at(i) { Some(a) -> a, None -> ZeroOperand(AsImmediate) },
-            through: o.through,
+            inherited: o.from_variable,
             handled: false,
           }),
         None -> acc,
@@ -254,10 +259,10 @@ pub fn evidence_for(context: Context, wanted: List<EffectsEvidence>) -> List<Arg
   wanted.fold(
     { out: [], seen: [] },
     |acc: { out: List<Arg>, seen: List<Evidence> }, w: EffectsEvidence|
-      if w.through {
+      if w.from_variable {
         let n = acc.seen.filter(|e: Evidence| e == w.evidence).len();
         let alike = context.words.filter(|x: EvidenceWord|
-          x.through && !x.handled && x.evidence == w.evidence);
+          x.inherited && !x.handled && x.evidence == w.evidence);
         {
           out: acc.out.push(match alike.at(n) {
             Some(x) -> x.word,
@@ -270,7 +275,7 @@ pub fn evidence_for(context: Context, wanted: List<EffectsEvidence>) -> List<Arg
           ..acc,
           out: acc.out.push(
             match context.words.find(|x: EvidenceWord|
-                !x.through && covers(x.evidence, w.evidence)) {
+                !x.inherited && covers(x.evidence, w.evidence)) {
               Some(x) -> x.word,
               None -> ZeroOperand(AsImmediate),
             },
@@ -280,9 +285,9 @@ pub fn evidence_for(context: Context, wanted: List<EffectsEvidence>) -> List<Arg
   ).out
 
 pub fn covering_evidence_word(context: Context, e: Evidence) -> Arg =
-  match context.words.find(|x: EvidenceWord| !x.through && covers(x.evidence, e)) {
+  match context.words.find(|x: EvidenceWord| !x.inherited && covers(x.evidence, e)) {
     Some(x) -> x.word,
-    None -> match context.words.find(|x: EvidenceWord| x.through && covers(x.evidence, e)) {
+    None -> match context.words.find(|x: EvidenceWord| x.inherited && covers(x.evidence, e)) {
       Some(x) -> x.word,
       None -> ZeroOperand(AsImmediate),
     },
@@ -349,7 +354,7 @@ pub fn scheme_evidence_arguments(
                   effect: a.effect,
                   resource: resolve_label_resource(context, labels, a.resource),
                 },
-                through: false,
+                from_variable: false,
               },
             })
           }
@@ -416,7 +421,7 @@ pub fn captured_evidence_for(
     words: range(0, own.len()).fold([], |acc: List<EvidenceWord>, k: Int|
       match ((own.at(k), words.args.at(k))) {
         (Some(o), Some(w)) ->
-          acc.push({ evidence: o.evidence, word: w, through: o.through, handled: false }),
+          acc.push({ evidence: o.evidence, word: w, inherited: o.from_variable, handled: false }),
         _ -> acc,
       }),
   }

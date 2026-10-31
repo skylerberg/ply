@@ -453,7 +453,7 @@ fn small_number(src: Bytes, bit: Int) -> Int / {abort.raise} =
 
 /// How one of a meta-block's three categories is divided into blocks: how many block types it
 /// has, the codes a block switch is read with, its starting state, and the bit after all of that.
-type Blocks = { types: Int, kinds: Array<Int>, counts: Array<Int>, state: Int, bit: Int }
+type Blocks = { type_count: Int, kinds: Array<Int>, counts: Array<Int>, state: Int, bit: Int }
 
 /// The count that a block count code and its extra bits give, and the bit after them.
 fn read_block_count(
@@ -473,7 +473,7 @@ fn blocks(src: Bytes, bit: Int, end: Int, base: Int) -> Blocks / {brotli.fail, a
   let at = bit + (n & 255);
   if types < 2 {
     {
-      types: 1,
+      type_count: 1,
       kinds: Array::new(1, 0),
       counts: Array::new(1, 0),
       state: 16777216 << 16 | 256,
@@ -484,7 +484,7 @@ fn blocks(src: Bytes, bit: Int, end: Int, base: Int) -> Blocks / {brotli.fail, a
     let counts = prefix_code(src, kinds.bit, end, 26, base);
     let opening = read_block_count(src, counts.bit, counts.table);
     {
-      types: types,
+      type_count: types,
       kinds: kinds.table,
       counts: counts.table,
       state: opening.count << 16 | 256,
@@ -509,7 +509,7 @@ fn read_block_switch(
   let next = read_block_count(src, bit + (e & 15), b.counts);
   {
     state: next.count << 16 | (state & 255) << 8
-      | (if kind >= b.types { kind - b.types } else { kind }),
+      | (if kind >= b.type_count { kind - b.type_count } else { kind }),
     bit: next.bit,
   }
 }
@@ -675,7 +675,7 @@ type MetaBlockCodes = {
   command_trees: Array<Array<Int>>,
   distance_trees: Array<Array<Int>>,
   postfix: Int,
-  direct: Int,
+  direct_distance_codes: Int,
 }
 
 type MetaBlockCodesResult = { meta: MetaBlockCodes, bit: Int }
@@ -694,16 +694,18 @@ fn read_meta_block_codes(
   let at = distances.bit;
   let postfix = src.bits_at(at, 2);
   let direct = src.bits_at(at + 2, 4) << postfix;
-  let after = at + 6 + 2 * literal_blocks.types;
+  let after = at + 6 + 2 * literal_blocks.type_count;
   let modes = if after > end { fail_at_bit(base, after, end, Truncated) } else {
-    Array::of_list(range(0, literal_blocks.types).map(|i: Int| src.bits_at(at + 6 + 2 * i, 2) << 9))
+    Array::of_list(
+      range(0, literal_blocks.type_count).map(|i: Int| src.bits_at(at + 6 + 2 * i, 2) << 9),
+    )
   };
   let literal_count = small_number(src, after);
   let literal_map = context_map(
     src,
     after + (literal_count & 255),
     end,
-    64 * literal_blocks.types,
+    64 * literal_blocks.type_count,
     (literal_count >>> 8) + 1,
     base,
   );
@@ -712,7 +714,7 @@ fn read_meta_block_codes(
     src,
     literal_map.bit + (distance_count & 255),
     end,
-    4 * distances.types,
+    4 * distances.type_count,
     (distance_count >>> 8) + 1,
     base,
   );
@@ -725,7 +727,15 @@ fn read_meta_block_codes(
     [],
     base,
   );
-  let command_trees = tree_group(src, literal_trees.bit, end, 704, command_blocks.types, [], base);
+  let command_trees = tree_group(
+    src,
+    literal_trees.bit,
+    end,
+    704,
+    command_blocks.type_count,
+    [],
+    base,
+  );
   let distance_trees = tree_group(
     src,
     command_trees.bit,
@@ -748,7 +758,7 @@ fn read_meta_block_codes(
         command_trees: command_trees.trees,
         distance_trees: distance_trees.trees,
         postfix: postfix,
-        direct: direct,
+        direct_distance_codes: direct,
       },
       bit: distance_trees.bit,
     }
@@ -967,7 +977,7 @@ fn copied(
     let e = lookup_code(tree, src.bits_at(turned.bit, 16));
     let code = e >>> 4;
     let at = turned.bit + (e & 15);
-    let rest = code - m.direct - 16;
+    let rest = code - m.direct_distance_codes - 16;
     let width = if rest < 0 { 0 } else { 1 + (rest >>> m.postfix + 1) };
     if at + width > end { { ..s, insert: 0, copy: copy, starved: true } } else {
       let d0 = s.last_two_distances & 0x1FF_FFFF;
@@ -983,7 +993,9 @@ fn copied(
         if code & 1 == 0 { from - off } else { from + off }
       } else if rest < 0 { code - 15 } else {
         let start = (2 + (rest >>> m.postfix & 1) << width) - 4;
-        (start + src.bits_at(at, width) << m.postfix) + (rest & (1 << m.postfix) - 1) + m.direct + 1
+        (start + src.bits_at(at, width) << m.postfix) + (rest & (1 << m.postfix) - 1)
+          + m.direct_distance_codes
+          + 1
       };
       placed_copy(
         end,
@@ -1070,7 +1082,7 @@ type MetaBlockHeader = { kind: Int, last: Bool, length: Int, bit: Int, meta: Met
 
 const fn no_blocks() -> Blocks =
   {
-    types: 1,
+    type_count: 1,
     kinds: Array::new(1, 0),
     counts: Array::new(1, 0),
     state: 16777216 << 16 | 256,
@@ -1089,7 +1101,7 @@ const fn no_meta_block_codes() -> MetaBlockCodes =
     command_trees: Array::new(1, Array::new(1, 0)),
     distance_trees: Array::new(1, Array::new(1, 0)),
     postfix: 0,
-    direct: 0,
+    direct_distance_codes: 0,
   }
 
 /// The bit where the byte containing `bit` ends. The bits in between must be zeros.
@@ -1169,7 +1181,7 @@ type Core = {
   bit: Int,
   base: Int,
   sent: Int,
-  cut: Int,
+  dropped_history_bytes: Int,
   phase: Int,
   need: Int,
   window: Int,
@@ -1179,7 +1191,7 @@ type Core = {
   commands: Int,
   distances: Int,
   last_two_distances: Int,
-  far: Int,
+  earlier_two_distances: Int,
   insert: Int,
   copy: Int,
   meta: MetaBlockCodes,
@@ -1205,7 +1217,7 @@ fn decoder(limits: Limits, input: Bytes) -> Decoder =
       bit: 0,
       base: 0,
       sent: 0,
-      cut: 0,
+      dropped_history_bytes: 0,
       phase: 0,
       need: 0,
       window: 0,
@@ -1215,7 +1227,7 @@ fn decoder(limits: Limits, input: Bytes) -> Decoder =
       commands: 0,
       distances: 0,
       last_two_distances: 4 | 11 << 25,
-      far: 15 | 16 << 25,
+      earlier_two_distances: 15 | 16 << 25,
       insert: 0,
       copy: 0,
       meta: no_meta_block_codes(),
@@ -1259,7 +1271,7 @@ fn after_block(
 fn block_start(d: Decoder) -> Decoder / {brotli.fail, abort.raise} = {
   let core = d.core;
   let end = 8 * d.input.len() - 256;
-  let room = core.limits.output - core.cut - d.history.len();
+  let room = core.limits.output - core.dropped_history_bytes - d.history.len();
   let read: Result<MetaBlockHeader, Error> = try {
     header(d.input, core.bit, end, room, core.base)
   };
@@ -1328,14 +1340,14 @@ fn read_commands(d: Decoder, goal: Int) -> Decoder / {brotli.fail, abort.raise} 
       commands: core.commands,
       distances: core.distances,
       last_two_distances: core.last_two_distances,
-      far: core.far,
+      far: core.earlier_two_distances,
       left: core.left,
       insert: core.insert,
       copy: core.copy,
       starved: false,
     },
     core.meta,
-    Array::of_list([core.cut, core.window, core.base]),
+    Array::of_list([core.dropped_history_bytes, core.window, core.base]),
     core.sent + goal,
     core.left + end - core.bit + 8,
   );
@@ -1354,7 +1366,7 @@ fn read_commands(d: Decoder, goal: Int) -> Decoder / {brotli.fail, abort.raise} 
       commands: s.commands,
       distances: s.distances,
       last_two_distances: s.last_two_distances,
-      far: s.far,
+      earlier_two_distances: s.far,
       insert: s.insert,
       copy: s.copy,
     },
@@ -1436,7 +1448,7 @@ fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
       next: {
         input: d.input,
         history: d.history.slice(dead, n),
-        core: { ..core, sent: n - dead, cut: core.cut + dead },
+        core: { ..core, sent: n - dead, dropped_history_bytes: core.dropped_history_bytes + dead },
       },
     }
   } else { { out: out, next: { ..d, core: { ..core, sent: n } } } }
@@ -2332,7 +2344,7 @@ test "a stream is read in a history its window bounds, however long it is and wh
     { d: decoder(large_limits(), b""), most: 0 },
     |at: { d: Decoder, most: Int }, chunk: Bytes| largest_history(fed(at.d, chunk), at.most, 1000),
   );
-  assert_eq(read.d.core.cut + read.d.history.len(), 340000);
+  assert_eq(read.d.core.dropped_history_bytes + read.d.history.len(), 340000);
   assert(read.most < 140000, Some(read.most.to_string()));
   // What `brotli -q 5 -w 10` wrote of 300000 zeros: one copy of nearly all of them.
   let zeros = Bytes::of_hex(
@@ -2340,7 +2352,7 @@ test "a stream is read in a history its window bounds, however long it is and wh
   );
   assert(decompress(zeros, large_limits()) == b"\x00".cycle(300000));
   let copied = largest_history(fed(decoder(large_limits(), b""), zeros), 0, 1000);
-  assert_eq(copied.d.core.cut + copied.d.history.len(), 300000);
+  assert_eq(copied.d.core.dropped_history_bytes + copied.d.history.len(), 300000);
   assert(copied.most < 140000, Some(copied.most.to_string()))
 }
 

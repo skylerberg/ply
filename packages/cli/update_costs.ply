@@ -39,7 +39,10 @@ pub fn costs_of(
   analysis: Analysis,
 ) -> Costing / {cost_checker.report, abort.raise} = {
   let sources = range(0, analysis.modules.len()).map(|i: Int|
-    match program.places.at(i) { Some(example_sources) -> example_sources.text, None -> b"" });
+    match program.source_texts.at(i) {
+      Some(example_sources) -> example_sources.text,
+      None -> b"",
+    });
   let c = cost_checker.report(cost_input_of(analysis, sources));
   {
     ..c,
@@ -60,7 +63,7 @@ pub fn reuse_violations(
       Ok(w) -> {
         let r = costs_of(program, w).report;
         if !r.ok { [unresolved()] } else {
-          r.unkept.fold(report_reuse_violations(r), |acc: List<Diagnostic>, u: Unkept|
+          r.return_mismatches.fold(report_reuse_violations(r), |acc: List<Diagnostic>, u: Unkept|
             acc.push(broken_returns_clause(u)))
         }
       },
@@ -191,7 +194,7 @@ pub fn with_cost_cache<a | e>(
           None -> None,
         };
         match kept {
-          Some(r) -> { report: r, kept: [], walked: 0, lowered: 0 },
+          Some(r) -> { report: r, cached: [], walked_modules: 0, lowered: 0 },
           None -> {
             let keys = cost_keys(p, identity);
             let c = costs(
@@ -200,12 +203,12 @@ pub fn with_cost_cache<a | e>(
             );
             record_store.put[reports](
               range(0, keys.len()).fold([], |acc: List<Record>, i: Int|
-                match ((c.kept.at(i), keys.at(i))) {
+                match ((c.cached.at(i), keys.at(i))) {
                   (Some(Some(bytes)), Some(k)) -> acc.push({ key: k, bytes: bytes }),
                   _ -> acc,
                 }).push({ key: key, bytes: bin::encode(c.report, report_bin()) }),
             );
-            { ..c, kept: [] }
+            { ..c, cached: [] }
           },
         }
       })
@@ -227,9 +230,9 @@ fn broken_returns_clause(u: Unkept) -> Diagnostic =
       b"`",
       u.name,
       b"` says it returns ",
-      u.said,
+      u.declared,
       b", and its body returns ",
-      u.results,
+      u.actual,
     ]),
     b"the clause",
     [
@@ -272,7 +275,7 @@ fn tally(d: Costed) -> String =
   )
 
 fn kind_of(d: Costed) -> String =
-  if d.kind == b"test" { " (test)" } else if d.kind == b"law" { " (law)" } else { "" }
+  if d.item_kind == b"test" { " (test)" } else if d.item_kind == b"law" { " (law)" } else { "" }
 
 fn colored_verdict(style: Style, verdict: Bytes) -> String =
   if verdict == b"reuses" { green(style, "reuses ") }
@@ -386,7 +389,7 @@ fn reuse_violation(d: Costed, promise: Span, site: Site) -> Diagnostic = {
 
 pub fn report_reuse_violations(report: Report) -> List<Diagnostic> =
   report.definitions.fold([], |acc: List<Diagnostic>, d: Costed|
-    match d.reuse {
+    match d.reuse_keyword {
       None -> acc,
       Some(promise) ->
         d.sites.fold(acc, |diagnostics: List<Diagnostic>, site: Site|
@@ -443,12 +446,12 @@ fn site(verdict: Bytes, reason: Bytes, fix: Bytes, param: Int) -> Site =
 
 fn costed(kind: Bytes, sites: List<Site>, reuse: Option<Span>) -> Costed =
   {
-    kind: kind,
+    item_kind: kind,
     module: 0,
     module_name: b"m",
     name: b"grow",
     label: b"m.grow",
-    reuse: reuse,
+    reuse_keyword: reuse,
     sites: sites,
   }
 
@@ -473,7 +476,12 @@ test "a definition's tally names only the verdicts it has, in one order" {
 
 test "a program that updates nothing is told so on one line" {
   assert_eq(
-    report_lines(plain(), example_sources(), { ok: true, rounds: 1, definitions: [], unkept: [] }),
+    report_lines(plain(), example_sources(), {
+      ok: true,
+      rounds: 1,
+      definitions: [],
+      return_mismatches: [],
+    }),
     ["", "   no updates: nothing to cost"],
   )
 }
@@ -483,7 +491,7 @@ test "a site is placed by its file's base name and the verdict column does not m
     ok: true,
     rounds: 2,
     definitions: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)],
-    unkept: [],
+    return_mismatches: [],
   };
   assert_eq(report_lines(plain(), example_sources(), r), [
     "",
@@ -502,14 +510,14 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     ok: true,
     rounds: 1,
     definitions: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)],
-    unkept: [],
+    return_mismatches: [],
   };
   assert_eq(report_reuse_violations(kept), []);
   let caller: Report = {
     ok: true,
     rounds: 1,
     definitions: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)],
-    unkept: [],
+    return_mismatches: [],
   };
   assert_eq(report_reuse_violations(caller), []);
   let broken: Report = {
@@ -518,7 +526,7 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     definitions: [
       costed(b"fn", [site(b"copies", b"read again", b"`Map::update`", 0 - 1)], promise),
     ],
-    unkept: [],
+    return_mismatches: [],
   };
   let raised = report_reuse_violations(broken);
   assert_eq(raised.len(), 1);
@@ -534,7 +542,7 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     ok: true,
     rounds: 1,
     definitions: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)],
-    unkept: [],
+    return_mismatches: [],
   };
   assert_eq(report_reuse_violations(hopeless).map(|x: Diagnostic| x.message), [
     b"`grow` is a `reuse fn`, and this `List::push` cannot be shown to reuse its list: a call",
@@ -545,7 +553,7 @@ test "a `reuse fn` is rejected for a copy its own body causes and for nothing el
     definitions: [
       costed(b"fn", [{ ..site(b"copies", b"read again", b"", 0 - 1), op: b"Array::set" }], promise),
     ],
-    unkept: [],
+    return_mismatches: [],
   };
   assert_eq(report_reuse_violations(array).map(|x: Diagnostic| x.message), [
     b"`grow` is a `reuse fn`, and this `Array::set` copies its array: read again",
@@ -557,7 +565,7 @@ test "a definition with no promise is costed and never rejected" {
     ok: true,
     rounds: 1,
     definitions: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)],
-    unkept: [],
+    return_mismatches: [],
   };
   assert_eq(report_reuse_violations(r), [])
 }
@@ -569,8 +577,8 @@ test "a `returns` clause its body does not keep is rejected where it is written"
     name: b"m.pick",
     start: 40,
     end: 42,
-    said: b"its parameter `ys`",
-    results: b"its parameter `xs`",
+    declared: b"its parameter `ys`",
+    actual: b"its parameter `xs`",
   });
   assert_eq(d.code, b"E0148");
   assert_eq(

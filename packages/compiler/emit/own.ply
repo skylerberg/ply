@@ -43,9 +43,9 @@ import compiler.emit.verify (ownership_fault, stack_captures, payload_of, can_ta
 type Ownership = | OwnsCount | BorrowsFrom(List<Int>)
 
 type Facts = {
-  held: Map<Int, Ownership>,
+  ownership: Map<Int, Ownership>,
   vars: Map<Int, Var>,
-  gets: Map<Int, { of: Int, path: Path }>,
+  field_sources: Map<Int, { of: Int, path: Path }>,
   direct: Map<Int, List<Int>>,
   made: Map<Int, Bool>,
   next: Int,
@@ -59,9 +59,9 @@ type Facts = {
 type Live = Map<Int, Var>
 
 type Exits = {
-  looped: Option<Live>,
-  miss: Live,
-  landing: Live,
+  loop_live: Option<Live>,
+  next_arm_live: Live,
+  unwind_live: Live,
   known: Map<Int, Bytes>,
   restart: List<ParamOwnership>,
   enters: List<List<ParamOwnership>>,
@@ -91,9 +91,9 @@ pub fn insert_reference_counts(given: Fn) -> Fn = {
   let f = take_fields(built_in_place({ ..given, body: drop_unread_conversions(given.body) }));
   let facts = facts_of(f);
   let top = {
-    looped: None,
-    miss: Map::new(),
-    landing: Map::new(),
+    loop_live: None,
+    next_arm_live: Map::new(),
+    unwind_live: Map::new(),
     known: Map::new(),
     restart: param_ownerships(f.convention),
     enters: f.members.map(|m: Member| param_ownerships(m.convention)),
@@ -218,8 +218,8 @@ fn counted_block(
 
 type FieldReadScan = {
   gets: List<{ var: Var, of: Var, path: Path, pass: Int }>,
-  whole: Map<Int, Bool>,
-  handed: Map<Int, Bool>,
+  used_whole: Map<Int, Bool>,
+  taken: Map<Int, Bool>,
   bound: Map<Int, Int>,
   reads: Map<Int, Map<Path, Int>>,
   passed: Map<Int, List<{ id: Int, path: Path }>>,
@@ -436,8 +436,8 @@ fn take_fields(f: Fn) -> Fn = {
   let s = scan_field_reads(
     {
       gets: [],
-      whole: Map::new(),
-      handed: Map::new(),
+      used_whole: Map::new(),
+      taken: Map::new(),
       bound: start,
       reads: Map::new(),
       passed: Map::new(),
@@ -453,9 +453,9 @@ fn take_fields(f: Fn) -> Fn = {
           && payload_of(Get({ of: g.of, path: g.path }), g.var) == None
           && is_counted_word(g.var.representation)
           && !is_inline_record(g.of, g.path, g.var)
-          && !s.whole.contains(g.of.id)
+          && !s.used_whole.contains(g.of.id)
           && !s.unwritten.contains(g.var.id)
-          && s.handed.contains(g.var.id)
+          && s.taken.contains(g.var.id)
           && (match s.reads.get(g.of.id) { Some(ps) -> ps.get(g.path), None -> None }) == Some(1) {
         m.insert(g.var.id, g.of)
       } else { m },
@@ -556,7 +556,7 @@ fn scan_field_reads(s: FieldReadScan, b: Block, pass: Int) -> FieldReadScan =
             },
           Update(u) -> {
             let sets = used_in(acc, takes_except_records(u.sets.map(|x: FieldWrite| x.arg)));
-            updated_past({ ..sets, handed: sets.handed.insert(u.of.id, true) }, u)
+            updated_past({ ..sets, taken: sets.taken.insert(u.of.id, true) }, u)
           },
           _ -> used_in(acc, operands(l.value)),
         };
@@ -621,8 +621,8 @@ fn used_in(s: FieldReadScan, ops: List<Operand>) -> FieldReadScan =
       Some(v) ->
         {
           ..acc,
-          whole: acc.whole.insert(v.id, true),
-          handed: if o.takes { acc.handed.insert(v.id, true) } else { acc.handed },
+          used_whole: acc.used_whole.insert(v.id, true),
+          taken: if o.takes { acc.taken.insert(v.id, true) } else { acc.taken },
         },
       None -> acc,
     })
@@ -664,9 +664,9 @@ fn with_takes(b: Block, with_reuse_candidate: Map<Int, Bool>) -> Block =
 
 fn facts_of(f: Fn) -> Facts = {
   let empty = {
-    held: Map::new(),
+    ownership: Map::new(),
     vars: Map::new(),
-    gets: Map::new(),
+    field_sources: Map::new(),
     direct: Map::new(),
     made: Map::new(),
     next: 0,
@@ -677,7 +677,7 @@ fn facts_of(f: Fn) -> Facts = {
     immortal: uncounted_variables(f),
   };
   let first = collect_definitions(params_defined(f, empty), f.body);
-  let got = first.gets.fold(
+  let got = first.field_sources.fold(
     Map::new(),
     |m: Map<Int, List<Int>>, id: Int, g: { of: Int, path: Path }| read_by(m, g.of, id),
   );
@@ -709,7 +709,7 @@ fn facts_of(f: Fn) -> Facts = {
         None -> acc,
       },
   );
-  let direct = first.gets.fold(
+  let direct = first.field_sources.fold(
     Map::new(),
     |m: Map<Int, Var>, id: Int, g: { of: Int, path: Path }|
       match words.opened.get(g.of) {
@@ -746,7 +746,7 @@ fn facts_of(f: Fn) -> Facts = {
   let scan_promotions = find_made_owned(joined, f.body);
   {
     ..joined,
-    held: scan_promotions.fold(joined.held, |h: Map<Int, Ownership>, id: Int, _: Bool|
+    ownership: scan_promotions.fold(joined.ownership, |h: Map<Int, Ownership>, id: Int, _: Bool|
       h.insert(id, OwnsCount)),
     promoted: scan_promotions,
   }
@@ -836,7 +836,7 @@ fn join_ownership(
         {
           fx: {
             ..first.fx,
-            held: first.fx.held.insert(j, match bases {
+            ownership: first.fx.ownership.insert(j, match bases {
               Some(xs) -> BorrowsFrom(xs),
               None -> OwnsCount,
             }),
@@ -1009,7 +1009,7 @@ fn passed_at(
     up: used.fold(r.up, |u: Map<Int, Bool>, o: Operand|
       match operand_var(o.arg) {
         Some(v) -> if points_into(v.representation) { u } else {
-          match facts.held.get(v.id) {
+          match facts.ownership.get(v.id) {
             Some(BorrowsFrom(bs)) -> if flattened(facts, bs).any(|x: Int| r.gone.contains(x)) {
               u.insert(v.id, true)
             } else { u },
@@ -1062,7 +1062,7 @@ fn leaves_only(
 ) -> Bool = {
   let parts = parts_of(s.representation);
   let leaf = |id: Int|
-    match facts.gets.get(id) {
+    match facts.field_sources.get(id) {
       Some(g) -> match g.path {
         LeafPath(k) ->
           k >= 0
@@ -1093,7 +1093,7 @@ fn parts_typed(s: Var, read: Map<Int, Type>) -> List<Type> = {
 
 fn word_types(facts: Facts, got: Map<Int, List<Int>>, s: Int) -> Map<Int, Type> =
   reads_of(got, s).fold(Map::new(), |m: Map<Int, Type>, id: Int|
-    match facts.gets.get(id) {
+    match facts.field_sources.get(id) {
       Some(g) -> match g.path {
         LeafPath(k) -> match facts.vars.get(id) { Some(v) -> m.insert(k, v.ty), None -> m },
         _ -> m,
@@ -1104,15 +1104,15 @@ fn word_types(facts: Facts, got: Map<Int, List<Int>>, s: Int) -> Map<Int, Type> 
 fn defined(facts: Facts, v: Var, h: Ownership) -> Facts =
   {
     ..facts,
-    held: if is_refcounted(v.representation) || points_into(v.representation) {
-      facts.held.insert(v.id, h)
-    } else { facts.held },
+    ownership: if is_refcounted(v.representation) || points_into(v.representation) {
+      facts.ownership.insert(v.id, h)
+    } else { facts.ownership },
     vars: facts.vars.insert(v.id, v),
     next: if v.id >= facts.next { v.id + 1 } else { facts.next },
   }
 
 fn define_unowned(facts: Facts, v: Var) -> Facts =
-  { ..defined(facts, v, OwnsCount), held: facts.held }
+  { ..defined(facts, v, OwnsCount), ownership: facts.ownership }
 
 fn collect_definitions(facts: Facts, b: Block) -> Facts =
   b.fold(facts, |acc: Facts, i: Inst|
@@ -1156,7 +1156,10 @@ fn collect_definitions(facts: Facts, b: Block) -> Facts =
           };
           match l.value {
             Get(g) ->
-              { ..traced, gets: traced.gets.insert(l.var.id, { of: g.of.id, path: g.path }) },
+              {
+                ..traced,
+                field_sources: traced.field_sources.insert(l.var.id, { of: g.of.id, path: g.path }),
+              },
             _ -> traced,
           }
         },
@@ -1190,7 +1193,7 @@ fn collect_definitions(facts: Facts, b: Block) -> Facts =
 
 fn base_of(facts: Facts, v: Var) -> List<Int> = {
   let x = match facts.alias.get(v.id) { Some(w) -> w, None -> v };
-  match facts.held.get(x.id) {
+  match facts.ownership.get(x.id) {
     Some(OwnsCount) -> [x.id],
     Some(BorrowsFrom(bs)) -> flattened(facts, bs),
     None -> [],
@@ -1198,7 +1201,10 @@ fn base_of(facts: Facts, v: Var) -> List<Int> = {
 }
 
 fn ownership_through_alias(facts: Facts, v: Var) -> Option<Ownership> =
-  match facts.alias.get(v.id) { Some(t) -> facts.held.get(t.id), None -> facts.held.get(v.id) }
+  match facts.alias.get(v.id) {
+    Some(t) -> facts.ownership.get(t.id),
+    None -> facts.ownership.get(v.id),
+  }
 
 fn aliased(direct: Map<Int, Var>, v: Var, depth: Int) -> Var =
   if depth <= 0 { v }
@@ -1206,10 +1212,10 @@ fn aliased(direct: Map<Int, Var>, v: Var, depth: Int) -> Var =
 
 fn flattened(facts: Facts, bs: List<Int>) -> List<Int> =
   bs.fold([], |acc: List<Int>, b: Int|
-    ints_joined(acc, match facts.held.get(b) { Some(BorrowsFrom(cs)) -> cs, _ -> [b] }))
+    ints_joined(acc, match facts.ownership.get(b) { Some(BorrowsFrom(cs)) -> cs, _ -> [b] }))
 
 fn base_variables(facts: Facts, v: Var) -> List<Var> =
-  match facts.held.get(v.id) {
+  match facts.ownership.get(v.id) {
     Some(BorrowsFrom(bs)) ->
       flattened(facts, bs).fold([], |vs: List<Var>, b: Int|
         match facts.vars.get(b) { Some(x) -> vs.push(x), None -> vs }),
@@ -1220,7 +1226,7 @@ fn ints_joined(a: List<Int>, b: List<Int>) -> List<Int> =
   b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
 
 fn owns(facts: Facts, v: Var) -> Bool =
-  is_refcounted(v.representation) && facts.held.get(v.id) == Some(OwnsCount)
+  is_refcounted(v.representation) && facts.ownership.get(v.id) == Some(OwnsCount)
 
 fn resolved(facts: Facts, v: Var) -> List<Var> =
   match facts.stacks.get(v.id) {
@@ -1407,7 +1413,7 @@ fn walk_backward(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Bac
           let arms = m.arms.fold_right(
             { blocks: [], entry: rest.live, next: rest.next },
             |a: Block, s: { blocks: List<Block>, entry: Live, next: Int }| {
-              let w = walk_backward(facts, { ..ex, miss: s.entry }, a, acc.live, s.next);
+              let w = walk_backward(facts, { ..ex, next_arm_live: s.entry }, a, acc.live, s.next);
               { blocks: s.blocks.push(w.rev.reverse()), entry: w.live, next: w.next }
             },
           );
@@ -1425,7 +1431,7 @@ fn walk_backward(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Bac
             match facts.opened.get(s.id) { Some(x) -> ws.concat(x), None -> ws });
           let inner = outer_reads(facts, l.body, vars.concat(words));
           let carry_token = Map::merge(acc.live.remove(l.result.id), inner);
-          let k = { ..ex, looped: Some(carry_token), miss: Map::new() };
+          let k = { ..ex, loop_live: Some(carry_token), next_arm_live: Map::new() };
           let e = counted_block(facts, k, vars, l.body, carry_token, acc.next);
           let p = planned(facts, all_taken(carried_inits(l.state)), carry_token);
           let gone = inner.values().filter(|v: Var| owns(facts, v) && !acc.live.contains(v.id));
@@ -1446,14 +1452,14 @@ fn walk_backward(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Bac
           );
           let inner = Map::merge(outer_reads(facts, h.body, [h.result]), borrowed);
           let across = Map::merge(acc.live.remove(h.result.id), inner);
-          let k = { ..ex, looped: None, miss: Map::new(), landing: across };
+          let k = { ..ex, loop_live: None, next_arm_live: Map::new(), unwind_live: across };
           let ends = if h.site.ret == None { across.insert(h.result.id, h.result) } else { across };
           let body = walk_backward(facts, k, h.body, ends, acc.next);
           let e = release_unused(facts, k, body, across);
           let p = planned(facts, ops, across);
           let gone = inner.values().filter(|v: Var| owns(facts, v) && !acc.live.contains(v.id));
           let unwind = across.values().filter(|v: Var|
-            owns(facts, v) && !ex.landing.contains(v.id));
+            owns(facts, v) && !ex.unwind_live.contains(v.id));
           with_counts(
             ex,
             { ..acc, next: e.next },
@@ -1492,8 +1498,10 @@ fn walk_backward(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Bac
             Map::new(),
           ),
         Fail(x) -> {
-          let live = x.resource.fold(ex.landing, |l: Live, u: Unwinding| arg_live(facts, l, u.arg));
-          let unwind = live.values().filter(|v: Var| owns(facts, v) && !ex.landing.contains(v.id));
+          let live = x.resource.fold(ex.unwind_live, |l: Live, u: Unwinding|
+            arg_live(facts, l, u.arg));
+          let unwind = live.values().filter(|v: Var|
+            owns(facts, v) && !ex.unwind_live.contains(v.id));
           {
             ..acc,
             rev: acc.rev.push(Fail({ ..x, unwind: unwind })),
@@ -1501,7 +1509,7 @@ fn walk_backward(facts: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Bac
             reuse_candidates: [],
           }
         },
-        Miss -> { ..acc, rev: acc.rev.push(i), live: ex.miss, reuse_candidates: [] },
+        Miss -> { ..acc, rev: acc.rev.push(i), live: ex.next_arm_live, reuse_candidates: [] },
         _ -> { ..acc, rev: acc.rev.push(i) },
       },
   )
@@ -1516,7 +1524,7 @@ fn known_at(known: Map<Int, Bytes>, on: Var, tested: Test, when: Int) -> Map<Int
     _ -> known,
   }
 
-fn looped_live(ex: Exits) -> Live = match ex.looped { Some(l) -> l, None -> Map::new() }
+fn looped_live(ex: Exits) -> Live = match ex.loop_live { Some(l) -> l, None -> Map::new() }
 
 fn dead_result(facts: Facts, live: Live, result: Var) -> List<Var> =
   if owns(facts, result) && !live.contains(result.id) { [result] } else { [] }
@@ -1645,7 +1653,7 @@ fn with_increment(p: Plan, v: Var, n: Int) -> Plan =
   if n > 0 { { ..p, incs: p.incs.push(Inc({ var: v, n: n })) } } else { p }
 
 fn variables_to_unwind(facts: Facts, ex: Exits, after: Live, dying: List<Var>) -> List<Var> =
-  after.values().concat(dying).filter(|v: Var| owns(facts, v) && !ex.landing.contains(v.id))
+  after.values().concat(dying).filter(|v: Var| owns(facts, v) && !ex.unwind_live.contains(v.id))
 
 fn with_counts(
   ex: Exits,
@@ -2115,7 +2123,7 @@ test "a function value applied is passed borrowed to the call, held across each 
       f: VarOperand(f),
       args: [VarOperand(arg)],
       convention: {
-        params: [{ handed: OwnedParam, representation: AsWord }],
+        params: [{ ownership: OwnedParam, representation: AsWord }],
         result: AsWord,
         destination_passing: false,
         returned: OwnedResult,

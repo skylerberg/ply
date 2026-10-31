@@ -503,7 +503,7 @@ pub fn check_bodies(
     ),
   };
   let done: Checker = { ..walked.checker, own_functions: Map::new() };
-  match checker.known.walks {
+  match checker.known.body_checking {
     CheckOnly(_) -> done,
     _ ->
       graph::components({ out: out }).fold(done, |c: Checker, comp: List<Int>|
@@ -521,20 +521,20 @@ pub fn check_bodies(
 }
 
 fn checks_body(checker: Checker, name: Bytes) -> Bool =
-  match checker.known.walks {
+  match checker.known.body_checking {
     CheckEvery -> true,
     CheckOnly(names) -> names.contains(name),
     ReuseBodies(_, _) -> false,
   }
 
 fn reused_body(checker: Checker, name: Bytes) -> Option<ReusedBody> =
-  match checker.known.walks { ReuseBodies(bodies, _) -> bodies.get(name), _ -> None }
+  match checker.known.body_checking { ReuseBodies(bodies, _) -> bodies.get(name), _ -> None }
 
 fn checked_body_of(name: Bytes, labels: List<Int>, body: ClosedBody) -> CheckedBody =
   {
     name: name,
     listed: positional_effects(body.effects.listed, labels),
-    through: body.effects.variable != None,
+    has_effect_variable: body.effects.variable != None,
     performs: body.performs.map(|s: PerformSite|
       { ..s, entry: List::at_or(positional_effects([s.entry], labels), 0, s.entry) }),
     repeated: body.repeated,
@@ -543,7 +543,7 @@ fn checked_body_of(name: Bytes, labels: List<Int>, body: ClosedBody) -> CheckedB
     calls: body.calls,
     stated: body.stated,
     tags: body.tags,
-    fills: body.fills,
+    instantiations: body.fills,
     names: body.names,
   }
 
@@ -670,7 +670,7 @@ fn instance_functions_of(parsed: ParsedModule) -> Map<Bytes, InstanceFunctions> 
   parsed.module.items.fold(Map::new(), |acc: Map<Bytes, InstanceFunctions>, item: Item|
     match item {
       InstanceItem(definition) -> {
-        let by = Some(qualify(parsed.name, definition.by.name));
+        let by = Some(qualify(parsed.name, definition.function.name));
         let was = of(acc, definition.target);
         let at = qualify(parsed.name, definition.target.name);
         match definition.kind {
@@ -896,7 +896,8 @@ fn bind_signature(
       performed: [],
       scaling: [],
       repeats: [],
-      bounded: s.sig.bounded.map(|a: Effect| resolve_effect(bound.substitution, a)),
+      promised_bounded: s.sig.promised_bounded.map(|a: Effect|
+        resolve_effect(bound.substitution, a)),
       variable_bounded: s.sig.variable_bounded,
       ending: Terminates,
       summary: unknown_summary(),
@@ -971,7 +972,7 @@ fn reused_function(
       };
       let effects = {
         ..effects_of_cached(recorded, effects),
-        variable: if kept.body.through {
+        variable: if kept.body.has_effect_variable {
           resolve_effects_in(recorded, sig.published_effects).variable
         } else { None },
       };
@@ -988,7 +989,7 @@ fn reused_function(
           calls: kept.body.calls,
           stated: kept.body.stated,
           tags: kept.body.tags,
-          fills: kept.body.fills,
+          fills: kept.body.instantiations,
           names: kept.body.names,
         },
       }
@@ -1012,7 +1013,7 @@ fn checked_or_cached(
     Some(rows) -> match ((
         effects_with_label_variables(rows.effects, member.labels),
         effects_with_label_variables(rows.performed, member.labels),
-        effects_with_label_variables(rows.scaling, member.labels),
+        effects_with_label_variables(rows.unbounded_effects, member.labels),
       )) {
       (Some(effects), Some(performed), Some(scaling)) -> {
         let u = unify_effects(checker.substitution, checker.fresh, sig.published_effects, {
@@ -1027,9 +1028,9 @@ fn checked_or_cached(
               checker: c,
               effects: effects_of_cached(c, performed),
               count: {
-                scaling: effects_of_cached(c, scaling).listed,
+                repeated_effects: effects_of_cached(c, scaling).listed,
                 sites: [],
-                repeats: rows.repeats,
+                repeats: rows.repeated_parameters,
                 variable_over: None,
                 recursed: None,
                 raises: rows.raises,
@@ -1048,7 +1049,7 @@ fn checked_or_cached(
         seeded: x.checker.seeded.push(name),
         cached: x.checker.cached.push({
           name: name,
-          facts: match handed { Some(rows) -> rows.facts, None -> b"" },
+          facts: match handed { Some(rows) -> rows.ownership_facts, None -> b"" },
         }),
       };
       let p = record_function(recorded, parsed, definition, name, sig, x.effects);
@@ -1124,8 +1125,8 @@ fn checked_or_cached(
             {
               params: range(0, held.len()).filter(|i: Int| held.get(i).contains(v)),
               variable: published.variable == Some(v),
-              over: r.over,
-              maybe: r.maybe,
+              iteration_span: r.over,
+              pending_iterations: r.pending_iterations,
             }
           }),
           raise_notes: o.raise_notes,
@@ -1138,16 +1139,16 @@ fn checked_or_cached(
               rejection: error_at(
                 b"E0152",
                 c.module,
-                u.t.tag.span,
+                u.literal.tag.span,
                 Bytes::concat_all([
                   b"`",
-                  u.t.tag.name,
+                  u.literal.tag.name,
                   b"::",
                   u.callee.name.name,
                   b"` is in a recursion with what holds the literal",
                 ]),
                 b"a tag is whole before a literal of it is checked",
-                [tag_rule(u.t)],
+                [tag_rule(u.literal)],
               ),
             }),
           fills: o.fills.map(|f: GroupInstantiation|
@@ -1262,8 +1263,8 @@ fn check_body_ownership(
           },
         opened: |t: Type|
           match resolve(checker, t) {
-            NamedType(c) -> checker.released.contains(c.name),
-            NominalType(n) -> checker.released.contains(n.name),
+            NamedType(c) -> checker.release_functions.contains(c.name),
+            NominalType(n) -> checker.release_functions.contains(n.name),
             _ -> false,
           },
       };
@@ -1279,7 +1280,7 @@ fn check_body_ownership(
                   module: checker.module,
                   owner: j.owner,
                   at: r.at.site,
-                  release: { held: r.held, place: r.place },
+                  release: { holder: r.holder, place: r.place },
                 }),
             ),
           },
@@ -1288,9 +1289,9 @@ fn check_body_ownership(
         {
           checker: check_lambda_release_effects(
             check_resource_copies(rejected, b, j.resource),
-            o.held,
+            o.owned_values,
           ),
-          held: o.held.filter(|x: ownership::OwnedValue| x.effects == None),
+          held: o.owned_values.filter(|x: ownership::OwnedValue| x.effects == None),
         }
       }
     },
@@ -1477,7 +1478,7 @@ fn record_function(
   let g: Generalization = generalize(c.substitution, c.env, fn_type);
   let sc: Scheme = split_labels(g.scheme, definition, sig);
   let effects = if overran { body_effects } else { resolve_effects_in(c, sig.published_effects) };
-  let bounded = sig.bounded.map(|a: Effect| resolve_effect(c.substitution, a));
+  let bounded = sig.promised_bounded.map(|a: Effect| resolve_effect(c.substitution, a));
   let bound: Checker = { ..c, env: env_bind_global(g.env, name, sc), type_params: sig.type_params };
   let constraints = definition_constraints(bound, definition, sc);
   let ordered: Checker = witness_order(bound, definition, sc);
@@ -1497,7 +1498,7 @@ fn record_function(
         performed: body_effects.listed,
         scaling: [],
         repeats: [],
-        bounded: bounded,
+        promised_bounded: bounded,
         variable_bounded: sig.variable_bounded,
         ending: Terminates,
         summary: unknown_summary(),
@@ -1526,7 +1527,7 @@ fn body_of_signature(
     count: None,
     params: sig.params.map(|ty: Type| resolve(checker, ty)),
     variable: published.variable,
-    bounded: sig.bounded.map(|a: Effect| {
+    promised_bounded: sig.promised_bounded.map(|a: Effect| {
       let entry = resolve_effect(checker.substitution, a);
       { entry: entry, written: written_effect_text(checker, entry) }
     }),
@@ -1621,7 +1622,7 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
       resolve: named,
       binders: definitions.map(|d: FnDefinition|
         item_binders(tagged.resolved, tagged.module, FunctionItem(d))),
-      stated: |slot: Int, span: Span|
+      implicit_callees: |slot: Int, span: Span|
         match stated.at(slot) {
           Some(s) -> match s.get(span.site) { Some(cs) -> cs, None -> [] },
           None -> [],
@@ -1665,9 +1666,9 @@ fn finish_group(checker: Checker, m: ModuleFunctions, comp: List<Int>) -> Checke
         let counted = if c.module >= c.known.root { bodies.get(slot).written } else {
           {
             scaling: info.effects.fold([], |acc: List<Effect>, w: Effect|
-              if count.scaling.fold(false, |b: Bool, a: Effect| b || effects_cover([w], a)) {
-                acc.push(w)
-              } else { acc }),
+              if count.repeated_effects.fold(false, |b: Bool, a: Effect|
+                  b || effects_cover([w], a)) { acc.push(w) }
+              else { acc }),
             repeats: count.repeats,
           }
         };
@@ -1805,7 +1806,7 @@ fn check_fn_body(
     label_params: signature.label_params,
     performs: [],
     over: None,
-    maybe: [],
+    pending_iterations: [],
     repeated_variables: [],
     recursed: None,
     refs: [],
@@ -1897,7 +1898,7 @@ fn check_fn_body(
       label_params: Map::new(),
       assumed: [],
       over: None,
-      maybe: [],
+      pending_iterations: [],
       repeated_variables: [],
       guards: guards::no_guards(),
       raise_notes: [],
@@ -1954,18 +1955,27 @@ fn body_effect_count(
   let view: Checker = {
     ..checker,
     performs: body.performs.map(|site: PerformSite|
-      { ..site, over: iteration(checker, site.entry, site.over, site.maybe), maybe: [] }),
+      {
+        ..site,
+        iteration_span: iteration(
+          checker,
+          site.entry,
+          site.iteration_span,
+          site.pending_iterations,
+        ),
+        pending_iterations: [],
+      }),
     raise_notes: body.raise_notes,
     recursed: again,
   };
   let repeated = body.repeated.fold([], |acc: List<RepeatedEffects>, r: RepeatedEffects|
-    match iteration(checker, no_effect(), r.over, r.maybe) {
-      Some(o) -> acc.push({ ..r, over: Some(o), maybe: [] }),
+    match iteration(checker, no_effect(), r.iteration_span, r.pending_iterations) {
+      Some(o) -> acc.push({ ..r, iteration_span: Some(o), pending_iterations: [] }),
       None -> acc,
     });
   let counted = counts_of(view, body.params, body.variable != None, body.effects, repeated);
   {
-    scaling: counted.scaling.map(|site: PerformSite| site.entry),
+    repeated_effects: counted.scaling.map(|site: PerformSite| site.entry),
     sites: counted.scaling,
     repeats: counted.repeats,
     variable_over: counted.variable_over,
@@ -2052,18 +2062,18 @@ fn counts_of(
               module: checker.module,
               span: again,
               source: DirectPerform,
-              over: None,
-              maybe: [],
+              iteration_span: None,
+              pending_iterations: [],
             },
         };
-        acc.push({ ..s, over: Some(again) })
+        acc.push({ ..s, iteration_span: Some(again) })
       }),
     None ->
       effects.listed.fold([], |acc: List<PerformSite>, entry: Effect|
         match sites.fold(None, |found: Option<PerformSite>, s: PerformSite|
             match found {
               Some(_) -> found,
-              None -> if s.entry == entry && s.over != None { Some(s) } else { None },
+              None -> if s.entry == entry && s.iteration_span != None { Some(s) } else { None },
             }) {
           Some(s) -> acc.push(s),
           None -> acc,
@@ -2084,7 +2094,10 @@ fn counts_of(
       Some(again) -> Some(again),
       None ->
         repeated.fold(None, |found: Option<Span>, r: RepeatedEffects|
-          match found { Some(_) -> found, None -> if r.variable { r.over } else { None } }),
+          match found {
+            Some(_) -> found,
+            None -> if r.variable { r.iteration_span } else { None },
+          }),
     }
   };
   { scaling: scaling, repeats: repeats, variable_over: variable_over }
@@ -2095,7 +2108,7 @@ fn check_bounded_promises(
   body: ClosedBody,
   count: Count,
 ) -> Checker / {abort.raise} = {
-  let effects: Checker = body.bounded.fold(
+  let effects: Checker = body.promised_bounded.fold(
     checker,
     |c: Checker, w: { entry: Effect, written: Bytes }|
       match count.sites.fold(None, |found: Option<PerformSite>, s: PerformSite|
@@ -2122,8 +2135,8 @@ fn check_bounded_promises(
             module: effects.module,
             span: over,
             source: PerformViaArguments,
-            over: Some(over),
-            maybe: [],
+            iteration_span: Some(over),
+            pending_iterations: [],
           },
           count.recursed,
         ),
@@ -2157,9 +2170,9 @@ fn report_exceeds_bound(
   site: PerformSite,
   recursed: Option<Span>,
 ) -> Checker / {abort.raise} = {
-  let again = site.over != None && site.over == recursed;
+  let again = site.iteration_span != None && site.iteration_span == recursed;
   let here = if again { b"performed here, and again at each call back into its own group" }
-  else if site.over != Some(site.span) { b"performed here" } else {
+  else if site.iteration_span != Some(site.span) { b"performed here" } else {
     match site.source {
       PerformViaCall(name) ->
         Bytes::concat_all([
@@ -2169,7 +2182,7 @@ fn report_exceeds_bound(
       _ -> b"performed once for each element this iterates over",
     }
   };
-  let iteration = match site.over {
+  let iteration = match site.iteration_span {
     Some(o) -> if o == site.span || again { [] }
     else { [label_at(site.module, o, false, b"once for each element this iterates over")] },
     None -> [],
@@ -3610,7 +3623,10 @@ fn check_law(
   let closed: Checker = { ..c3, env: env_pop(c3.env) };
   let shown = |i: Int|
     match definition.of {
-      Some(u) -> match u.shown.at(i) { Some(n) -> n, None -> definition.binders.get(i).name.name },
+      Some(u) -> match u.argument_names.at(i) {
+        Some(n) -> n,
+        None -> definition.binders.get(i).name.name,
+      },
       None -> definition.binders.get(i).name.name,
     };
   let popped: Checker = match definition.of {

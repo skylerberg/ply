@@ -157,7 +157,7 @@ pub type Op = | Put(Bytes, Bytes) | Delete(Bytes)
 
 /// Where a value is stored: the batch that wrote it, its segment, its offset and length there,
 /// and the first eight bytes of its BLAKE3.
-pub type Slot = { version: Int, segment: Int, at: Int, len: Int, sum: Bytes }
+pub type Slot = { version: Int, segment: Int, at: Int, len: Int, checksum: Bytes }
 
 /// An open store, as one commit left it. `sequence` is the number of the last batch, `base` and
 /// `active` are its first and last segments, `end` is the active segment's length, and `synced` is
@@ -327,7 +327,7 @@ fn apply_frame(
                 segment: number,
                 at: at + valued,
                 len: after - valued,
-                sum: checksum(body.slice(valued, after)),
+                checksum: checksum(body.slice(valued, after)),
               };
               Continue({
                 made: {
@@ -372,7 +372,7 @@ fn is_whole_frame(held: Bytes, p: Int, at: Int, limits: Limits) -> Bool / {abort
 /// The state of a pass through a segment's frames: what they build, the offset of the next frame,
 /// the bytes buffered from there, the file's length, whether the bytes at that offset are not a
 /// frame, and whether the last frame read has no records.
-type SegmentScan = { made: ReadState, at: Int, held: Bytes, size: Int, bad: Bool, closed: Bool }
+type SegmentScan = { made: ReadState, at: Int, buffered: Bytes, size: Int, bad: Bool, closed: Bool }
 
 /// Reads the frames of the segment at `path` from its header on, a piece of the file at a time,
 /// and stops at its end or at the first bytes that are not a frame. `kept` means the segment is a
@@ -387,19 +387,19 @@ fn scan_segment<[l]>(
   is_base: Bool,
 ) -> SegmentScan / {fs.read_at[l], key_value.fail, abort.raise} =
   iterate(
-    { made: start, at: header_size(), held: b"", size: size, bad: false, closed: false },
+    { made: start, at: header_size(), buffered: b"", size: size, bad: false, closed: false },
     size *| 2 +| 16,
     |w: SegmentScan| {
-      let have = w.held.len();
+      let have = w.buffered.len();
       let headed = have >= head_size();
-      let wanted = if !headed { head_size() } else { head_size() + read_u32(w.held, 4) };
+      let wanted = if !headed { head_size() } else { head_size() + read_u32(w.buffered, 4) };
       let ended = w.at + have >= w.size;
       if ended && have == 0 { Stop(w) }
       else if headed
-          && (!w.held.starts_with(frame_magic()) || read_u32(w.held, 4) > longest_body(limits)) {
-        Stop({ ..w, bad: true })
-      } else if have >= wanted {
-        if !is_whole_frame(w.held, 0, w.at, limits) { Stop({ ..w, bad: true }) } else {
+          && (!w.buffered.starts_with(frame_magic())
+          || read_u32(w.buffered, 4) > longest_body(limits)) { Stop({ ..w, bad: true }) }
+      else if have >= wanted {
+        if !is_whole_frame(w.buffered, 0, w.at, limits) { Stop({ ..w, bad: true }) } else {
           Continue({
             ..w,
             made: apply_frame(
@@ -407,11 +407,11 @@ fn scan_segment<[l]>(
               name,
               number,
               w.at + head_size(),
-              w.held.slice(head_size(), wanted),
+              w.buffered.slice(head_size(), wanted),
               is_base,
             ),
             at: w.at + wanted,
-            held: w.held.slice(wanted, have),
+            buffered: w.buffered.slice(wanted, have),
             closed: wanted == head_size() + body_head_size(),
           })
         }
@@ -421,7 +421,7 @@ fn scan_segment<[l]>(
         match fs.read_at[l](path, from, most) {
           None -> fail(Failed(path, fs::operation_failed("read_at"))),
           Some(more) -> if more.len() == 0 { Continue({ ..w, size: from }) }
-          else { Continue({ ..w, held: w.held.concat(more) }) },
+          else { Continue({ ..w, buffered: w.buffered.concat(more) }) },
         }
       }
     },
@@ -458,7 +458,7 @@ fn has_synced_frame_after(tail: Bytes, bad: Int, limits: Limits) -> Bool / {abor
     })
 
 /// A segment's header, checked to belong to this store: its number, its shape and this format.
-type Header = { base: Bool, before: Int }
+type Header = { is_base: Bool, before: Int }
 
 fn header_of<[l]>(
   dir: String,
@@ -473,7 +473,7 @@ fn header_of<[l]>(
     } else if read_u32(head, 8) != format_version() { fail(OtherFormat(read_u32(head, 8))) }
     else if read_u64(head, 16) != number { fail(Corrupt(name, 16)) }
     else if head.slice(32, 64) != shape { fail(OtherShape) }
-    else { { base: read_u32(head, 12) & 1 == 1, before: read_u64(head, 24) } },
+    else { { is_base: read_u32(head, 12) & 1 == 1, before: read_u64(head, 24) } },
   }
 }
 
@@ -487,7 +487,7 @@ fn hint_entry(key: Bytes, slot: Option<Slot>) -> Bytes =
         u64_le(s.version),
         u64_le(s.at),
         u32_le(s.len),
-        s.sum,
+        s.checksum,
         u32_le(key.len()),
         key,
       ]),
@@ -556,7 +556,7 @@ fn apply_hint(
                   segment: number,
                   at: read_u64(hint, r.p + 9),
                   len: read_u32(hint, r.p + 17),
-                  sum: hint.slice(r.p + 21, r.p + 29),
+                  checksum: hint.slice(r.p + 21, r.p + 29),
                 })
               },
               left: r.left - 1,
@@ -758,7 +758,7 @@ fn recover<[l]>(
     Some(top) -> {
       let lowest = logs.at(0).expect("the lowest segment");
       let base = iterate(top, top + 1, |n: Int|
-        if header_of[l](dir, n, shape).base || n == 1 { Stop(n) }
+        if header_of[l](dir, n, shape).is_base || n == 1 { Stop(n) }
         else if n > lowest { Continue(n - 1) }
         else { fail(Missing(log_name(n - 1))) });
       names.fold((), |_: Unit, name: String| {
@@ -776,7 +776,7 @@ fn recover<[l]>(
         touched: Map::new(),
         weight: 0,
       };
-      let whole = based.base && top == base;
+      let whole = based.is_base && top == base;
       let segment_full = range(base, if whole { top + 1 } else { top }).fold(
         start,
         |state: ReadState, n: Int|
@@ -784,7 +784,7 @@ fn recover<[l]>(
             fail(Corrupt(log_name(n), 24))
           } else {
             renew_lock[l](dir, token, b"", b"");
-            read_full_segment[l](dir, n, limits, state, n == base && based.base)
+            read_full_segment[l](dir, n, limits, state, n == base && based.is_base)
           },
       );
       if whole {
@@ -903,7 +903,7 @@ fn value_at<[l]>(dir: String, slot: Slot) -> Bytes / {fs.read_at[l], key_value.f
   let name = log_name(slot.segment);
   match fs.read_at[l](join(dir, name), slot.at, slot.len) {
     None -> fail(Missing(name)),
-    Some(bytes) -> if bytes.len() != slot.len || checksum(bytes) != slot.sum {
+    Some(bytes) -> if bytes.len() != slot.len || checksum(bytes) != slot.checksum {
       fail(Corrupt(name, slot.at))
     } else { bytes },
   }
@@ -1191,7 +1191,7 @@ type CompactionState = {
   size: Int,
   at: Int,
   index: Map<Bytes, Slot>,
-  since: Int,
+  since_renewal: Int,
 }
 
 /// How much a compaction copies between renewals of its lock, where each value counts as one plus
@@ -1223,10 +1223,10 @@ fn flush_frame<[l]>(
               segment: number,
               at: p.at + head_size() + log_position.within,
               len: log_position.len,
-              sum: log_position.sum,
+              checksum: log_position.sum,
             }),
         ),
-        since: p.since,
+        since_renewal: p.since_renewal,
       }
     }
   }
@@ -1255,7 +1255,7 @@ fn rewrite_as_base<[l]>(
           size: body_head_size(),
           at: header_size(),
           index: Map::new(),
-          since: 0,
+          since_renewal: 0,
         },
         |p: CompactionState, key: Bytes, slot: Slot| {
           let value = value_at[l](s.dir, slot);
@@ -1263,7 +1263,7 @@ fn rewrite_as_base<[l]>(
           let room = if p.weight > 0 && p.weight + weight > s.limits.batch {
             flush_frame[l](p, number, path, sink)
           } else { p };
-          let due = room.since >= renew_interval();
+          let due = room.since_renewal >= renew_interval();
           if due { renew_lock[l](s.dir, s.token, here, here) } else { () };
           {
             ..room,
@@ -1274,10 +1274,10 @@ fn rewrite_as_base<[l]>(
               version: slot.version,
               within: room.size + 17 + key.len(),
               len: slot.len,
-              sum: slot.sum,
+              sum: slot.checksum,
             }),
             size: room.size + 17 + weight,
-            since: (if due { 0 } else { room.since }) + 1 + slot.len / 0x4000,
+            since_renewal: (if due { 0 } else { room.since_renewal }) + 1 + slot.len / 0x4000,
           }
         },
       );
@@ -2070,7 +2070,11 @@ test "a frame written past another writer's fails as stale, and is not a batch t
 }
 
 /// What happened to a store whose lock a rival requested.
-type LockTakeoverOutcome = { packed: Option<Error>, taken: Bool, idle: Option<Error> }
+type LockTakeoverOutcome = {
+  compaction_error: Option<Error>,
+  taken: Bool,
+  late_commit_error: Option<Error>,
+}
 
 /// The rival `with_rival` runs.
 effect contender {
@@ -2173,7 +2177,8 @@ fn lock_takeover_outcome(read_ms: Int) -> MemResult<LockTakeoverOutcome> / {abor
             put[d](s, Bytes::of_string(i.to_string()), b"value", Fast))
         };
         match filled {
-          Err(rejection) -> { packed: Some(rejection), taken: false, idle: None },
+          Err(rejection) ->
+            { compaction_error: Some(rejection), taken: false, late_commit_error: None },
           Ok(segment_full) -> {
             let packed: Result<Store, Error> = try[key_value.fail] { compact[d](segment_full) };
             let taken = contender.taken();
@@ -2181,21 +2186,29 @@ fn lock_takeover_outcome(read_ms: Int) -> MemResult<LockTakeoverOutcome> / {abor
             let idle: Result<Store, Error> = try[key_value.fail] {
               put[d](match packed { Ok(s) -> s, Err(_) -> segment_full }, b"late", b"l", Fast)
             };
-            { packed: error_of(packed), taken: taken, idle: error_of(idle) }
+            { compaction_error: error_of(packed), taken: taken, late_commit_error: error_of(idle) }
           },
         }
       })).value)
 
 test "a lock renewed as a compaction copies is never old enough to take, and a store that sat idle past the age has lost it and writes nothing" {
   let is_base = lock_takeover_outcome(400);
-  assert_eq(is_base.value, { packed: None, taken: false, idle: Some(LockLost) });
+  assert_eq(is_base.value, {
+    compaction_error: None,
+    taken: false,
+    late_commit_error: Some(LockLost),
+  });
   assert_eq(
     fs::listed_names(mem_list(is_base.tree, "db")),
     Some(["00000001.log", "00000002.hint", "00000002.log", "00000003.log", "lock"]),
   );
   assert_eq(mem_size(is_base.tree, "db/00000003.log"), Some(64));
   let slow = lock_takeover_outcome(600);
-  assert_eq(slow.value, { packed: Some(LockLost), taken: true, idle: Some(LockLost) });
+  assert_eq(slow.value, {
+    compaction_error: Some(LockLost),
+    taken: true,
+    late_commit_error: Some(LockLost),
+  });
   assert_eq(fs::listed_names(mem_list(slow.tree, "db")), Some(["00000001.log", "lock"]));
   assert_eq(mem_read(slow.tree, "db/lock"), Some(b"a rival's token, and its place"))
 }
