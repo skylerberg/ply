@@ -206,12 +206,7 @@ impl RunOutcome {
     }
 }
 
-pub fn run(
-    program: Program,
-    root: &Path,
-    argv: Vec<String>,
-    count: Option<crate::count::Asked>,
-) -> RunOutcome {
+pub fn run(program: Program, root: &Path, argv: Vec<String>) -> RunOutcome {
     ply_compiled::c::sweep::once();
     ply_privileged::binder::install();
     let definitions = program.definitions;
@@ -228,24 +223,7 @@ pub fn run(
     let work = std::thread::Builder::new()
         .name("ply".to_string())
         .stack_size(ply_compiled::rt::PROGRAM_STACK)
-        .spawn(move || {
-            let launch = || entered(&entry, &grants);
-            match count {
-                Some(asked) => {
-                    let (launched, counted, sites) =
-                        crate::count::count_allocations_sampled(launch, asked.every());
-                    if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
-                    {
-                        eprintln!(
-                            "the allocation count could not be written to {}: {e}",
-                            asked.path.display()
-                        );
-                    }
-                    launched
-                }
-                None => launch(),
-            }
-        });
+        .spawn(move || entered(&entry, &grants));
     match work {
         Ok(thread) => match thread.join() {
             Ok(launched) => {
@@ -329,4 +307,3 @@ fn placed(d: &Diagnostic, opened: &Opened) -> String {
 }
 
 pub mod code;
-pub mod count;

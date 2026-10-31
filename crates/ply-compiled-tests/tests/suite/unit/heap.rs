@@ -101,7 +101,6 @@ fn the_block_of_a_freed_native_object_is_reused_for_the_next_native_object() {
         "a dead native object's block is the next native object's"
     );
     assert_eq!(&*held_by(again), "second");
-    assert_eq!(ctx.heap.recycled(), 1);
     assert_eq!(ctx.heap.natives(), 1);
 }
 

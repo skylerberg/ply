@@ -24,7 +24,6 @@ fn a_freed_block_is_reused_by_the_next_allocation_of_the_same_size_class_but_not
     unsafe { b.give(first, 48) };
     assert_ne!(b.take(64), first);
     assert_eq!(b.take(48), first);
-    assert_eq!(b.reused(), 1);
     unsafe { b.give(other, 64) };
 }
 

@@ -135,6 +135,18 @@ impl Ctx {
         self.refusing(native, what, work, move || job().map_err(Failure::Said))
     }
 
+    fn queued(
+        &mut self,
+        native: &'static str,
+        what: &'static str,
+        work: Work,
+        job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+    ) -> I64 {
+        self.ticketed(native, what, work, false, move || {
+            job().map_err(Failure::Said)
+        })
+    }
+
     fn refusing(
         &mut self,
         native: &'static str,
@@ -142,8 +154,19 @@ impl Ctx {
         work: Work,
         job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
     ) -> I64 {
-        let span = self.site();
         let here = work != Work::Waiting && crate::tasks::running_unseeded_task(self).is_none();
+        self.ticketed(native, what, work, here, job)
+    }
+
+    fn ticketed(
+        &mut self,
+        native: &'static str,
+        what: &'static str,
+        work: Work,
+        here: bool,
+        job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
+    ) -> I64 {
+        let span = self.site();
         let runtime = self.host_runtime();
         let submitted = ply_host::registry::run_of(&*runtime).and_then(|run| {
             if here {

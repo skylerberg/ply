@@ -32,10 +32,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
             rt_toolchain_bodies as unsafe extern "C" fn(_) -> _,
         ),
         runtime_native(
-            "toolchain_jobs",
-            rt_toolchain_jobs as unsafe extern "C" fn(_) -> _,
-        ),
-        runtime_native(
             "toolchain_holds",
             rt_toolchain_holds as unsafe extern "C" fn(_, _, _) -> _,
         ),
@@ -253,28 +249,21 @@ pub unsafe extern "C" fn rt_compilers_started(
                 let reason = format!("no `{label}` is installed");
                 return c.given([&[0u8][..], reason.as_bytes()].concat());
             };
-            let child = Command::new(&program)
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn();
-            let child = match child {
-                Ok(child) => child,
-                Err(e) => {
-                    let reason = format!("`{}`: {e}", program.display());
-                    return c.given([&[0u8][..], reason.as_bytes()].concat());
-                }
-            };
-            let ticket = c.submitted(
+            let ticket = c.queued(
                 "compilers_started",
                 "a compiler",
-                Work::Waiting,
+                Work::Computing,
                 move || {
-                    Ok(match child.wait_with_output() {
+                    let ran = Command::new(&program)
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .output();
+                    Ok(match ran {
                         Ok(out) if out.status.success() => vec![0],
                         Ok(out) => found(Some(out.stderr)),
-                        Err(e) => found(Some(e.to_string().into_bytes())),
+                        Err(e) => found(Some(format!("`{}`: {e}", program.display()).into_bytes())),
                     })
                 },
             );
@@ -302,12 +291,6 @@ pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
 pub unsafe extern "C" fn rt_toolchain_bodies(ctx: *mut Ctx) -> TakenBytes {
     run_if_toolchain_allowed(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::bodies_dir().display().to_string().into_bytes())
-    })
-}
-
-pub unsafe extern "C" fn rt_toolchain_jobs(ctx: *mut Ctx) -> I64 {
-    run_if_toolchain_allowed(ctx, "toolchain_jobs", Deterministic, I64(1), |_| {
-        I64(std::thread::available_parallelism().map_or(1, |n| n.get()) as i64)
     })
 }
 

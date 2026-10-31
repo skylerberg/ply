@@ -196,13 +196,12 @@ unsafe fn unlink(list: &mut *mut Page, page: *mut Page) {
 }
 
 #[inline]
-unsafe fn pop(page: *mut Page, reused: &mut usize) -> *mut u8 {
+unsafe fn pop(page: *mut Page) -> *mut u8 {
     unsafe {
         let block = (*page).free;
         if !block.is_null() {
             (*page).free = *link(block);
             (*page).live += 1;
-            *reused += 1;
             return block;
         }
         let block = (*page).fresh;
@@ -332,7 +331,7 @@ impl Blocks {
             let class = class_of(bytes);
             let page = self.filling.pages[class];
             if !page.is_null() {
-                let block = pop(page, &mut self.filling.reused);
+                let block = pop(page);
                 if !block.is_null() {
                     return block;
                 }
@@ -354,7 +353,7 @@ impl Blocks {
                     push(&mut self.filling.pages[class], page);
                     continue;
                 }
-                let block = pop(page, &mut self.filling.reused);
+                let block = pop(page);
                 if !block.is_null() {
                     return block;
                 }
@@ -571,10 +570,6 @@ impl Blocks {
         self.segments.len() * SEGMENT
     }
 
-    pub fn reused(&self) -> usize {
-        self.filling.reused
-    }
-
     pub fn adopt(&mut self, mut other: Blocks) {
         unsafe {
             other.segments.retain(|&address| {
@@ -608,7 +603,6 @@ impl Blocks {
             other.quiet();
             self.segments.append(&mut other.segments);
             self.large.append(&mut other.large);
-            self.filling.reused += other.filling.reused;
             self.reclaim_remote_frees(other.name());
         }
     }
@@ -642,7 +636,6 @@ impl Blocks {
             });
             *self.returned = Returned::default();
             self.filling.pages = [null_mut(); CLASSES];
-            self.filling.reused = 0;
             self.spare = null_mut();
             self.spare_page_count = 0;
             self.clean = null_mut();

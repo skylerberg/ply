@@ -5,7 +5,7 @@ pub(super) static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
-    pub(super) last_entry: usize,
+    pub(crate) entry: u64,
     pub stack_floor: std::sync::atomic::AtomicUsize,
     pub site_root: i64,
     pub site_start: i64,
@@ -37,7 +37,6 @@ pub struct Ctx {
     pub performed: Vec<Effect>,
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
-    pub(crate) entry: u64,
     pub(crate) binding: Arc<ply_core::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_core::HostRuntime>>,
     pub(crate) runtime_factory: ply_core::RuntimeFactory,
@@ -139,7 +138,6 @@ impl Ctx {
             deadline: None,
             time_budget_ms: 0,
             heap,
-            last_entry: 0,
             tables,
             diagnostic: None,
             stacks: vec![Vec::new()],
@@ -284,7 +282,7 @@ impl Ctx {
         self.release_later.clear();
         self.marshallings.clear();
         self.taken.clear();
-        if self.heap.allocated() != 0 {
+        if self.heap.held() != 0 {
             self.end();
         }
         self.detached.clear();
@@ -350,25 +348,6 @@ impl Ctx {
             "an entry ended with a release still running or waiting"
         );
         self.restore_thread_state();
-        self.last_entry = self.heap.allocated();
-        if std::env::var("PLY_C_PHASES").is_ok() {
-            eprintln!(
-                "entry: {} objects allocated, {} recycled, {}MB held, {} stacks grown",
-                self.heap.allocated(),
-                self.heap.recycled(),
-                self.held() / 1_000_000,
-                self.grown
-            );
-            let live = self.census();
-            if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
-                for (size, n, bytes) in live.into_iter().take(24) {
-                    eprintln!(
-                        "  live at end: blocks of {size} bytes past the header: {n}, {}MB",
-                        bytes / 1_000_000
-                    );
-                }
-            }
-        }
         self.heap.end();
         if std::mem::take(&mut self.pooled) {
             crate::parallel::workers_ended(self.id.0);

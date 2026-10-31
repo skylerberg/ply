@@ -462,6 +462,10 @@ lexical() {
   }'
 }
 
+cmd_c_compiler() {
+  if [[ ${PLY_CI_COLD:-} == true ]]; then echo cc; else echo clang; fi
+}
+
 toolchain_inputs() {
   local scope=${1:-all} all prev dir rel file target
   all=$({
@@ -1019,6 +1023,7 @@ case "${1:-}" in
     cmd_actions
     ;;
   toolchain-inputs) toolchain_inputs "${2:-all}" ;;
+  c-compiler) cmd_c_compiler ;;
   work) role "${2:?a role}" ;;
   store-paths) cmd_store_paths ;;
   ply-trees) cmd_ply_trees ;;
@@ -1033,7 +1038,7 @@ case "${1:-}" in
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) nightly_of "${2:?a role}" | paste -sd ' ' - ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2
     ;;
 esac

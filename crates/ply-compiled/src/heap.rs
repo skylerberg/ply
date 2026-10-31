@@ -413,7 +413,6 @@ impl Heap {
             self.natives.push(o);
         }
         self.deferred_frees.extend(other.deferred_frees.drain(..));
-        self.alloc.count += other.alloc.count;
     }
 
     pub(crate) fn swap_blocks(&mut self, blocks: Blocks) -> Blocks {
@@ -444,16 +443,8 @@ impl Heap {
         self.blocks.held()
     }
 
-    pub fn allocated(&self) -> usize {
-        self.alloc.count
-    }
-
     pub(crate) fn program_live_block_count(&self) -> usize {
         program_live_block_count_in(&self.blocks)
-    }
-
-    pub fn recycled(&self) -> usize {
-        self.blocks.reused()
     }
 
     pub fn natives(&self) -> usize {
@@ -495,9 +486,6 @@ impl Heap {
                 made_by_scheduler: self.scheduling,
             })
         };
-        if !self.scheduling {
-            self.alloc.count += 1;
-        }
         p
     }
 
@@ -518,7 +506,6 @@ impl Heap {
         }
         self.drop_natives();
         self.blocks.reset();
-        self.alloc.count = 0;
         self.deferred_frees.clear();
     }
 }

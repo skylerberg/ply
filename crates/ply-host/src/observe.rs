@@ -151,12 +151,6 @@ pub fn report_at_exit() {
     }
 }
 
-pub fn process_wrote(path: &Path) {
-    if let Some(recorder) = PROCESS.get() {
-        recorder.wrote(path);
-    }
-}
-
 impl Recorder {
     fn observed(&self) -> MutexGuard<'_, Observations> {
         self.observed.lock().unwrap_or_else(|e| e.into_inner())

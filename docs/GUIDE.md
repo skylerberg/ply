@@ -1780,17 +1780,9 @@ definition does not count.
 `--json` gives each failure's diagnostic, outside effects, changes and the command that runs it
 again, plus the diffs.
 
-### 10.6 Coverage and mutation testing
+### 10.6 Coverage
 
 `--coverage` reports which tests use each definition, and which definitions no test uses.
-
-`--mutate [DEF]` runs after a passing run. It changes each definition, or only `DEF`, one operator
-or literal at a time (`+` to `-`, `<` to `<=`, `==` to `!=`, `true` to `false`, an integer literal
-to that integer plus one such as `3` to `4`, and so on). For each change, it runs the tests that use
-the definition. A change is a *survivor* when every one of those tests still passes with the change
-applied, which means no test detected it. `ply test` reports each survivor with its location and the
-tests that passed despite it. Any survivor makes the run fail. `--mutate-budget N` (default 64)
-limits how many changes are tried.
 
 ## 11. Specifications and proofs
 
@@ -2492,7 +2484,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | --- | --- |
 | `ply new PATH` | `--name NAME`, `--lib` |
 | `ply check [path]` | `--types` (each definition's type and effects), `--costs` (where an update to a value copies it instead of changing it in place, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-dependencies`, host and simulation flags |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage` |
 | `ply run [path] [-- ARGS]` | `--seed`, `--timeout`, `--profile`, `--explain`, `--require-signer KEY`, and the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown. `ARGS` is what `process.args` returns. A `.plyx` path runs a built program. |
 | `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--prove-budget`, `--timeout`, simulation flags |
@@ -2605,16 +2597,6 @@ file.
 its byte range. `ply replace NAME --with FILE` replaces exactly that range with a formatted
 definition of the same kind and name, leaving the rest of the file alone. It writes nothing unless
 the program still checks and no other definition's name or hash changes (`E0128`).
-
-### 17.8 Measuring allocation
-
-The runtime of every Ply program, `ply` included, reads these flags and removes them before the
-program sees its arguments:
-
-- `--count-allocations=PATH` writes how many objects and bytes the program allocated.
-- `--count-allocation-sites=PATH` also writes where allocations came from. The sites are a sample,
-  not every allocation.
-- `--count-allocation-sites-exact=PATH` records every allocation's site: exact, and slower.
 
 ## 18. Diagnostics
 

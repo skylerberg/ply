@@ -3,9 +3,6 @@
 use ply_compiled::c::descriptor::Descriptor;
 use std::ffi::{c_char, c_int};
 
-#[global_allocator]
-static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
-
 const PANICKED: c_int = 101;
 
 #[unsafe(no_mangle)]
@@ -46,16 +43,9 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
             return 1;
         }
     };
-    let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    let count = match ply_launcher::count::flag(&mut argv) {
-        Ok(count) => count,
-        Err(reason) => {
-            eprintln!("ply: {reason}");
-            return 2;
-        }
-    };
+    let argv: Vec<String> = std::env::args().skip(1).collect();
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let launched = ply_launcher::run(program, &root, argv, count);
+    let launched = ply_launcher::run(program, &root, argv);
     for warning in launched.warnings {
         eprintln!("{warning}");
     }
