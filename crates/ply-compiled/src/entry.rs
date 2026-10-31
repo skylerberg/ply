@@ -329,10 +329,14 @@ pub fn enter(
 /// may nest does not hang on what its caller left of its own stack: `None` where no thread could be
 /// made or the work unwound.
 pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T> {
+    let branch = crate::parallel::thread_branch();
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(crate::rt::PROGRAM_STACK)
-            .spawn_scoped(scope, enter)
+            .spawn_scoped(scope, move || {
+                crate::parallel::inherit_branch(branch);
+                enter()
+            })
             .ok()?
             .join()
             .ok()

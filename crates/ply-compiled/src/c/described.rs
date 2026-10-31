@@ -70,6 +70,8 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("hold.held", crate::rt::SCOPED_VALUE),
         ("closure.descriptor", heap::CLOSURE_CODE),
         ("failed.target", crate::rt::FAILED_TARGET as usize),
+        ("evidence.one_slot", crate::rt::EVIDENCE_ONE_SLOT as usize),
+        ("evidence.shared", crate::rt::EVIDENCE_SHARED as usize),
         ("failed.pending", crate::rt::FAILED_PENDING as usize),
         ("unwinding.words", crate::rt::UNWINDING_WORDS),
         ("instance.head", crate::detached::INSTANCE_HEAD),

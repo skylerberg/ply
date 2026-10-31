@@ -982,8 +982,11 @@ whenever that cannot change the result. The checker allows a block only when no 
 another reads or writes (`E0309`, §7.2), so a block is as deterministic as its branches.
 
 - If several branches fail, the leftmost failure is the block's.
-- Branches whose operations could go to a `handle` around the block, or to a `simulate` block,
-  run one after another, with the same result.
+- Branches may perform operations that a `handle` around the block handles, and still run at the
+  same time, when that `handle` has no `var` and each clause reached returns without `resume`,
+  captures nothing and performs only through handlers of the same kind. Host handlers are written
+  this way. Under any other `handle`, or under a `simulate` block, the branches run one after
+  another, with the same result.
 - A branch may not spawn a task or open a `simulate` block (`E0309`), and may not use `?`.
 
 `std.parallel` splits a list across nested blocks.
