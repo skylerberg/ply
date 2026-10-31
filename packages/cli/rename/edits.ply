@@ -12,7 +12,7 @@ import compiler.check.member (MemberTarget, CallsFunction)
 import compiler.syntax.lexer (lex, Token, Comment, Identifier)
 import compiler.syntax.items (Module, ImportDeclaration, ModuleAlias, member_of, member_name)
 import compiler.syntax.parsing (is_synthetic_site)
-import rename.lines (Moved, MemberLine, Renames, field_name, joined, renamed, shown)
+import rename.lines (LocalLine, Moved, MemberLine, Renames, field_name, joined, renamed, shown)
 import rename.strings (line_at)
 import rename.programs (Entry, Library, Loaded, Read, DefinitionKey, Record, PlainRecord,
                         NewRecordType, DeclaredRecord, plain_record, root_relative, key_of,
@@ -68,7 +68,40 @@ pub type Renaming = {
   declared_records: Map<Bytes, Record>,
   modules: Map<String, ModuleMove>,
   declared: Map<DefinitionKey, String>,
+  locals: Map<String, Map<Int, Bytes>>,
+  parameters: Map<Bytes, Map<Bytes, Bytes>>,
   rejections: List<Failure>,
+}
+
+pub type LocalBinder = { owner: Bytes, site: Int, first: Bool }
+
+pub fn local_binders(r: Read, line: LocalLine) -> List<LocalBinder> / {abort.raise} =
+  r.entries.fold([], |found: List<LocalBinder>, e: Entry| {
+    let binders = e.names.references.filter(|x: Reference|
+      x.name == line.old && x.target == Local(x.identifier_id)
+        && !is_synthetic_site(x.identifier_id));
+    range(0, binders.len()).fold(found, |all: List<LocalBinder>, k: Int|
+      if line_at(r.file.text, binders.get(k).start) != line.line { all }
+      else { all.push({ owner: e.owner, site: binders.get(k).identifier_id, first: k == 0 }) })
+  })
+
+fn with_local_lines(rn: Renaming, r: Read) -> Renaming / {abort.raise} = {
+  let path = displayed(r.file.at);
+  rn.renames.locals.filter(|line: LocalLine| line.file == path).fold(
+    rn,
+    |named: Renaming, line: LocalLine|
+      local_binders(r, line).fold(named, |done: Renaming, b: LocalBinder| {
+        let sites = done.locals.get(path).unwrap_or(Map::new());
+        let parameters = done.parameters.get(b.owner).unwrap_or(Map::new());
+        {
+          ..done,
+          locals: done.locals.insert(path, sites.insert(b.site, line.new)),
+          parameters: if b.first {
+            done.parameters.insert(b.owner, parameters.insert(line.old, line.new))
+          } else { done.parameters },
+        }
+      }),
+  )
 }
 
 fn simple_name(renames: Renames, file: String, name: Bytes) -> Bytes / {abort.raise} =
@@ -291,6 +324,8 @@ pub fn renaming_of(
             m.insert(qualify(r.name, d.name), d.record)))),
       modules: Map::new(),
       declared: Map::new(),
+      locals: Map::new(),
+      parameters: Map::new(),
       rejections: [],
     },
     |accumulator: Renaming, l: Loaded|
@@ -300,10 +335,13 @@ pub fn renaming_of(
           with_operations(with_definitions(rn, r, declarations), r, declarations),
           r,
         );
-        match package_of(r.file.at, libraries) {
-          Some(package) -> with_move(named, r, package),
-          None -> named,
-        }
+        with_local_lines(
+          match package_of(r.file.at, libraries) {
+            Some(package) -> with_move(named, r, package),
+            None -> named,
+          },
+          r,
+        )
       }),
   )
 
@@ -406,7 +444,12 @@ pub fn shared_names(rn: Renaming, loads: List<Loaded>) -> List<SharedName> / {ab
 
 fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abort.raise} =
   match x.target {
-    Local(_) -> simple_name(rn.renames, displayed(r.file.at), x.name),
+    Local(binder) -> match rn.locals.get(displayed(r.file.at)).and_then(
+        |sites: Map<Int, Bytes>| sites.get(binder),
+      ) {
+      Some(new) -> new,
+      None -> simple_name(rn.renames, displayed(r.file.at), x.name),
+    },
     Definition(d) -> definition_new(rn, l, d.namespace, d.qualified, x.name),
     Operation(o) -> match key_of(l, o.effect).and_then(|k: DefinitionKey| rn.operations.get(k)) {
       Some(ops) -> ops.get(o.name).unwrap_or(x.name),
@@ -466,10 +509,15 @@ fn member_new(rn: Renaming, l: Loaded, r: Read, owner: Bytes, m: Member) -> Byte
         Some(_) -> None,
         None -> match a.callee { Definition(d) -> Some(d.qualified), _ -> None },
       };
-      match callee.and_then(|c: Bytes| key_of(l, c)).and_then(|k: DefinitionKey|
-          rn.declared.get(k)) {
-        Some(file) -> simple_name(rn.renames, file, m.name),
-        None -> m.name,
+      match callee.and_then(|c: Bytes| rn.parameters.get(c)).and_then(
+          |names: Map<Bytes, Bytes>| names.get(m.name),
+        ) {
+        Some(new) -> new,
+        None -> match callee.and_then(|c: Bytes| key_of(l, c)).and_then(|k: DefinitionKey|
+            rn.declared.get(k)) {
+          Some(file) -> simple_name(rn.renames, file, m.name),
+          None -> m.name,
+        },
       }
     },
   }

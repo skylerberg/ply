@@ -5,7 +5,8 @@ import library
 import std.path (normalize)
 import walk (Failure)
 import sources
-import program (ParsedSources, load_program, program_view, resolution_of)
+import program (ParsedSources, Program, load_program, program_view, renamed_resolution,
+                resolution_of, unchecked_program)
 import diagnostic (errors_text)
 import builder (builder)
 import std.random (entropy)
@@ -375,9 +376,57 @@ fn under(at: RootedPath, root: RootedPath) -> Bool =
     && (root.path == "" || root.path == "." || at.path == root.path
     || at.path.starts_with(root.path ++ "/"))
 
+type ProgramLoad = {
+  program: Program,
+  resolved: Result<ResolvedProgram, List<Diagnostic>>,
+  parses: ParsedSources,
+  calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
+  owner_records: Map<Bytes, Map<Int, Record>>,
+}
+
+fn checked_load(
+  path: ResolvedPath,
+  parses: ParsedSources,
+) -> ProgramLoad / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let program = load_program([path], false);
+  let resolution = resolution_of(program, parses);
+  let load = {
+    program: program,
+    resolved: resolution.resolved,
+    parses: resolution.parses,
+    calls: Map::new(),
+    owner_records: Map::new(),
+  };
+  match ((resolution.resolved, program_view(program))) {
+    (Err(_), _) -> load,
+    (_, None) -> { ..load, resolved: Err(program.diagnostics) },
+    (Ok(_), Some(view)) ->
+      { ..load, calls: calls_by_module(view), owner_records: records_by_owner(view) },
+  }
+}
+
+fn unchecked_load(
+  path: ResolvedPath,
+  parses: ParsedSources,
+) -> ProgramLoad / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges} = {
+  let program = unchecked_program([path]);
+  let resolution = renamed_resolution([path], program.shipping, parses);
+  {
+    program: program,
+    resolved: match resolution.resolved {
+      Ok(resolved) -> Ok(resolved),
+      Err(u) -> Err(u.diagnostics),
+    },
+    parses: resolution.parses,
+    calls: Map::new(),
+    owner_records: Map::new(),
+  }
+}
+
 pub fn loads_of(
   given: List<ResolvedPath>,
   pwd: String,
+  checked: Bool,
 ) -> { loads: List<Loaded>, failures: List<Failure> } / {fs.resolved_kind[abs], shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let roots = given.map(rooted);
   let done = given.fold(
@@ -387,23 +436,20 @@ pub fn loads_of(
       if accumulator.loads.any(|l: Loaded| l.files.any(|f: RootedPath| under(f, root))) {
         accumulator
       } else {
-        let program = load_program([path], false);
+        let load = if checked { checked_load(path, accumulator.parses) }
+        else { unchecked_load(path, accumulator.parses) };
+        let program = load.program;
         let library_files = shipped_files(path);
-        let resolution = resolution_of(program, accumulator.parses);
-        let rejected = |ds: List<Diagnostic>|
-          {
-            ..accumulator,
-            failures: accumulator.failures.push({
-              path: displayed(root),
-              reason: "does not check: " ++ errors_text(ds),
-            }),
-          };
-        match ((resolution.resolved, program_view(program))) {
-          (Err(ds), _) -> rejected(ds),
-          (_, None) -> rejected(program.diagnostics),
-          (Ok(resolved), Some(view)) -> {
-            let calls = calls_by_module(view);
-            let owner_records = records_by_owner(view);
+        match load.resolved {
+          Err(ds) ->
+            {
+              ..accumulator,
+              failures: accumulator.failures.push({
+                path: displayed(root),
+                reason: "does not check: " ++ errors_text(ds),
+              }),
+            },
+          Ok(resolved) -> {
             let read_before = accumulator.loads.fold(
               Map::new(),
               |m: Map<String, Bool>, l: Loaded|
@@ -427,7 +473,7 @@ pub fn loads_of(
                     && !read_before.contains(absolute(pwd, f.at))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, calls, owner_records, f) {
+                    match read_of(resolved, load.calls, load.owner_records, f) {
                       Some(r) -> reads.push(r),
                       None -> reads,
                     },
@@ -436,14 +482,14 @@ pub fn loads_of(
                   !roots.any(|r: RootedPath| under(f.at, r))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, calls, owner_records, f) {
+                    match read_of(resolved, load.calls, load.owner_records, f) {
                       Some(r) -> reads.push(r),
                       None -> reads,
                     },
                 ),
               }),
               failures: accumulator.failures,
-              parses: resolution.parses,
+              parses: load.parses,
             }
           },
         }

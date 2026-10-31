@@ -2565,7 +2565,14 @@ A line of a rename map can rename only some of the names that share its old name
 | `packages/cli/build.ply Made BuildOutput` | only what that file declares under the name, and its uses |
 | `packages/std/fs.ply fs.read_file load_file` | one operation of an effect the file declares |
 | `packages/shop/order.ply Order.held quantity` | one field of a record type the file declares |
+| `packages/shop/order.ply:40 held quantity` | the parameter or local declared on line 40, its uses, and the named arguments of a parameter |
 | `.held cached` | the record field `held`, renamed to `cached` in every record that has it |
+| `packages/app/old_name.ply new_name` | a module: the file moves, and imports follow |
+| `packages/compiler/emit/old/ new` | a directory of modules |
+
+A rename type-checks the program, because the types say which record a field belongs to and which
+function a call on a value means. A map of only parameter and local lines needs no types, so it
+skips the type check and runs on a program that does not check.
 
 Records are structural: two record types with the same field names are the same type. A record type
 declared with `new` is not structural. Because a structural record type has no identity beyond its
@@ -2573,8 +2580,6 @@ field names, `ply rename` identifies a record by its field names. A rename of a 
 every record that has the same field names: literals, reads, updates, patterns and written record
 types. When two declared types have the same field names, the rename map must rename the field in
 both. For a record type declared with `new`, `ply rename` renames the field only in that type.
-| `packages/app/old_name.ply new_name` | a module: the file moves, and imports follow |
-| `packages/compiler/emit/old/ new` | a directory of modules |
 
 `--words` renames words inside names instead: `ty type` changes `ty_vars` to `type_vars` and `TyCon`
 to `TypeCon`. A name inside backticks in a comment is renamed too. A string is renamed when its
